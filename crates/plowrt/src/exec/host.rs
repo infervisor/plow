@@ -60,6 +60,9 @@ pub struct HostExecutor {
     /// Completed pipelined decode tokens: slot and token.
     #[cfg(feature = "cuda")]
     pub pipe_tokens: Vec<(usize, u32)>,
+    /// Measured ride-or-step costs of this engine's prefill launches (`sched::ride`).
+    #[cfg(feature = "cuda")]
+    pub ride: crate::sched::ride::RideCost,
     /// Input text a TOKENIZE packet encodes into `token_ids` (when the host owns
     /// tokenization). Empty for the `--net` path (input is already `tokens`).
     pub input_text: Option<String>,

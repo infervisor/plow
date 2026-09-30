@@ -565,6 +565,7 @@ latent cache, not to this dense head-major cache.
 | `PLOW_VMM_BLOCK_MIB` | 2 | Physical block size, the prefix match granularity |
 | `PLOW_KV_POOL_MIB` | 512 | Block pool cap; 0 disables |
 | `PLOW_VMM_DEFERRED_RECLAIM` | on | Background unmapping, keeping column 0 mapped |
+| `PLOW_VMM_STALE_RESERVE` | on | CUDA: the reclaimer keeps a retired window's private blocks mapped for the slot's next occupant, within the `PLOW_KV_POOL_MIB` cap; a failed create unmaps one before an OOM |
 | `PLOW_VMM_CACHE_MEMORY_UTILIZATION` | 0.05 | Prefix cache soft cap as a fraction of device memory (4 GiB on an 80 GiB H100) |
 | `PLOW_VMM_CACHE_MIB` | unset | Explicit soft cap in MiB; overrides the fraction above. `0` = OOM-driven eviction only |
 | `PLOW_VMM_CACHE_MIN_FREE_MIB` | unset = 4% of device | Keep cached prefixes until free device memory would drop below this; `0` rolls back to the byte budget as the only trim trigger |

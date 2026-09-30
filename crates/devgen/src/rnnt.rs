@@ -408,6 +408,7 @@ impl RnntPackets {
             return Err("RNNT frame transform stages are empty".into());
         }
         let pipeline = PacketPipeline {
+            strings: Default::default(),
             name: "transcribe".into(),
             driver: "rnnt.greedy.v1".into(),
             programs,

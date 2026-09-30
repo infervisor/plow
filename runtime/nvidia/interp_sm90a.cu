@@ -38,6 +38,14 @@
 #define plow_sm120_sched plow_sm90a_sched
 #define plow_sm120_skeleton plow_sm90a_skeleton
 #define plow_sm120_launch plow_sm90a_launch
+#define plow_sm120_light plow_sm90a_light
+#define plow_sm120_light_attn plow_sm90a_light_attn
+#define plow_sm120_light_tail plow_sm90a_light_tail
+#define plow_sm120_light_capmax plow_sm90a_light_capmax
+#define plow_sm120_light_attn_s plow_sm90a_light_attn_s
+#define plow_sm120_light_head plow_sm90a_light_head
+#define plow_sm120_light_flash plow_sm90a_light_flash
+#define plow_sm120_light_pf plow_sm90a_light_pf
 
 #include "interp_sm120.cu"
 

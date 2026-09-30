@@ -69,6 +69,7 @@ async fn request(state: &Arc<AppState>, slug: &str, ids: Vec<u32>) -> (String, O
         gen,
         arrived: std::time::Instant::now(),
         respond: tx,
+        opts: Default::default(),
     })
     .map_err(|_| ())
     .expect("submit");

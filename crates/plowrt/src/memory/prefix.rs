@@ -87,6 +87,8 @@ struct Node {
     refs: u32,
     /// Monotonic tick of last use, for LRU eviction among zero-ref nodes.
     last_used: u64,
+    /// A session holds this block until then: eviction takes every unpinned leaf first.
+    pinned_until: Option<std::time::Instant>,
     /// Unlinked by `evict_lru`. Node ids are indices held by sibling `children`
     /// maps, so an evicted node cannot be removed from `nodes` — it is tombstoned
     /// instead. Without this flag a tombstone still looks like a zero-ref leaf and
@@ -338,6 +340,7 @@ impl PrefixCache {
                 block_idx: i as u32,
                 refs: 1,
                 last_used: tick,
+                pinned_until: None,
                 evicted: false,
             });
             match cur {
@@ -351,6 +354,25 @@ impl PrefixCache {
             cur = Some(id);
         }
         hashes.len()
+    }
+
+    /// Pin the cached path of `hashes` (verified against `tokens`) until `until`: a pinned leaf is
+    /// evicted only once no unpinned one is left, so a pin orders eviction and never refuses it.
+    pub fn pin(&mut self, hashes: &[BlockHash], tokens: &[u32], until: std::time::Instant) {
+        let mut cur: Option<NodeId> = None;
+        for (i, h) in hashes.iter().enumerate() {
+            let next = match cur {
+                None => self.roots.get(h).copied(),
+                Some(p) => self.nodes[p as usize].children.get(h).copied(),
+            };
+            let Some(n) = next else { return };
+            if self.block_slice(tokens, i) != Some(&self.nodes[n as usize].tokens) {
+                return;
+            }
+            let e = &mut self.nodes[n as usize];
+            e.pinned_until = Some(e.pinned_until.map_or(until, |t| t.max(until)));
+            cur = Some(n);
+        }
     }
 
     /// Drop one reference along the matched path of `hashes` (its first `blocks`
@@ -381,12 +403,13 @@ impl PrefixCache {
     /// "returns wrong KV, produces fluent wrong text" failure this cache must
     /// never have.
     pub fn evict_lru(&mut self) -> Option<(u32, u32)> {
+        let now = std::time::Instant::now();
         let victim = self
             .nodes
             .iter()
             .enumerate()
             .filter(|(_, n)| !n.evicted && n.refs == 0 && n.children.is_empty())
-            .min_by_key(|(_, n)| n.last_used)
+            .min_by_key(|(_, n)| (n.pinned_until.is_some_and(|t| t > now), n.last_used))
             .map(|(i, _)| i as NodeId)?;
 
         // Unlink from the parent (or the root map) so no path can reach it again.
@@ -599,6 +622,26 @@ mod tests {
             None,
             "an evicted node must not be evicted again"
         );
+    }
+
+    #[test]
+    fn a_pinned_path_is_evicted_after_every_unpinned_leaf_and_only_then() {
+        let mut c = cache();
+        c.insert(&[1], &toks(&[1]), 0, 0);
+        c.insert(&[2], &toks(&[2]), 1, 0);
+        c.release(&[1], 1);
+        c.release(&[2], 1);
+        // Block 1 is older (the LRU pick) but a session pins it.
+        c.pin(&[1], &toks(&[1]), std::time::Instant::now() + std::time::Duration::from_secs(60));
+        assert_eq!(c.evict_lru(), Some((1, 0)), "the unpinned leaf goes first");
+        assert_eq!(c.evict_lru(), Some((0, 0)), "a pin orders eviction, it never refuses it");
+        // An expired pin is no pin.
+        c.insert(&[3], &toks(&[3]), 2, 0);
+        c.insert(&[4], &toks(&[4]), 3, 0);
+        c.release(&[3], 1);
+        c.release(&[4], 1);
+        c.pin(&[3], &toks(&[3]), std::time::Instant::now());
+        assert_eq!(c.evict_lru(), Some((2, 0)));
     }
 
     #[test]

@@ -86,6 +86,9 @@ pub mod pipeline;
 mod projection_rewrite;
 mod rewrite_lower;
 pub mod rnnt;
+pub mod tts;
+pub mod codec;
+pub mod s3gen;
 pub mod tune_demand;
 pub mod segment_resource;
 
@@ -192,6 +195,37 @@ pub(crate) fn fa_gf_full() -> u32 {
         .fa_gf_full
         .filter(|v| matches!(v, 1 | 2 | 4 | 8 | 16))
         .unwrap_or(FA_GF_FULL)
+}
+
+/// GF for a GQA group the power-of-two GFs do not divide: the whole group when it fits one work
+/// item (the decode kernel allows GF <= warps), else no fusion.
+pub(crate) fn odd_group_gf(gqa: u32) -> u32 {
+    if gqa <= 8 {
+        gqa
+    } else {
+        1
+    }
+}
+
+/// NVIDIA dense decode with no FLASH_MERGE packet: the hd128 row-group flash body
+/// (`fa_decode_rg_item`, op_attention.cuh) normalizes in its own fold at one split and merges on
+/// the last-arriving split otherwise, through the `mrgc` counters. Per packet, not per rung: the
+/// decode ladder requires every rung's instruction list to match.
+pub(crate) fn nv_decode_merge_fold(c: &Cfg, fp8_kv: bool) -> bool {
+    // hd256/512 ride the row-group body only on the E-series objects (manifest `fa_rg_wide`).
+    let wide = emit_config::active().nv_fa_fold_wide
+        && c.ple > 0
+        && matches!(c.hd_full, 256 | 512)
+        && matches!(c.hd_slide, 256 | 512);
+    !emit_is_amd()
+        && !emit_is_apple()
+        && c.tp == 1
+        && !fp8_kv
+        && ((c.hd_full == 128 && c.hd_slide == 128 && emit_config::active().nv_fa_fold) || wide)
+        && c.kvh_full == c.kvh_slide
+        && c.kvh_full > 0
+        && c.heads % c.kvh_full == 0
+        && (2..=4).contains(&(c.heads / c.kvh_full))
 }
 
 pub(crate) fn attention_decode_ns(
@@ -1802,6 +1836,9 @@ struct Tn {
     ids: u32,
     encoder_overlay: u32,
     encoder_overlay_index: u32,
+    // Chatterbox T3 decode: per-slot speech start and the learned speech-position table.
+    pos_base: u32,
+    speech_pos: u32,
     pos: u32,
     kvlen: u32,
     cos_s: u32,
@@ -1834,6 +1871,10 @@ struct Tn {
     // One shared tensor across layers for the same serial-chain reason. TENSOR_NONE unless the
     // fold is enabled, so every other blob stays byte-identical.
     mrgc: u32,
+    // Split-KV workspace of the sm_90a v3 flash prefill (PLOW_NV_FA_V3_SPLITKV): per slot a u32
+    // counter, 128 rows of (m, l) and 128 x hd_max f32 of O; n_cu slots. Zeroed at load and
+    // self-cleaning like `mrgc`. Carried in the fused prefill flash's t1 (mlpart, unused there).
+    fa_ws: u32,
     hn: u32,
     // Gemma-4 E-series per-layer inputs (TENSOR_NONE elsewhere): the packed embedding table
     // [vocab][L*P], the context projection [L*P][H] and its norm gamma [P]; activations
@@ -1844,6 +1885,11 @@ struct Tn {
     ple_raw: u32,
     ple_pp: u32,
     ple: u32,
+    // NVIDIA has no op-155 arm: the block runs as Gemv/GluStrided/Gemv/NormResidual(Norm) through
+    // gate `[rows][P]`, gated input `[rows][P]` and projection `[rows][H]`.
+    ple_g: u32,
+    ple_a: u32,
+    ple_y: u32,
     qg: u32,
     kg: u32,
     vg: u32,
@@ -2128,6 +2174,19 @@ fn declare(
         } else {
             TENSOR_NONE
         },
+        pos_base: if c.speech_pos_rows > 0 {
+            b.tensor("in.pos_base", dbatch as u64 * I32)
+        } else {
+            TENSOR_NONE
+        },
+        speech_pos: if c.speech_pos_rows > 0 {
+            b.tensor(
+                &format!("{}speech_pos_emb.weight", c.prefix),
+                u64::from(c.speech_pos_rows) * u64::from(c.hidden) * BF16,
+            )
+        } else {
+            TENSOR_NONE
+        },
         pos: b.tensor("in.pos", ctx as u64 * I32),
         // BATCH>1 (serving pending #4): one KV length per sequence. dbatch==1 => I32, identical.
         kvlen: b.tensor("in.kvlen", dbatch as u64 * I32),
@@ -2215,6 +2274,21 @@ fn declare(
         } else {
             TENSOR_NONE
         },
+        fa_ws: if emit_config::active().nv_fa_split_prefill
+            && emit_config::active().tma_gemm
+            && !emit_is_amd()
+            && !emit_is_apple()
+            && c.tp == 1
+            && !fp8_kv
+            && matches!(c.hd_full, 256 | 512)
+            && matches!(c.hd_slide, 256 | 512)
+        {
+            let slots = b.n_cu() as u64;
+            let hd_max = c.hd_full.max(c.hd_slide) as u64;
+            ac(b, "fa_ws", slots * (1 + 128 * 2 + 128 * hd_max) * 4)
+        } else {
+            TENSOR_NONE
+        },
         hn: ac(b, "hn", (rows * c.hidden) as u64 * BF16),
         ple_tab: if c.ple > 0 {
             b.tensor(
@@ -2252,6 +2326,21 @@ fn declare(
         },
         ple: if c.ple > 0 {
             ac(b, "ple", (rows * c.layers * c.ple) as u64 * BF16)
+        } else {
+            TENSOR_NONE
+        },
+        ple_g: if ple_split_on(c) {
+            ac(b, "ple_g", (rows * c.ple) as u64 * BF16)
+        } else {
+            TENSOR_NONE
+        },
+        ple_a: if ple_split_on(c) {
+            ac(b, "ple_a", (rows * c.ple) as u64 * BF16)
+        } else {
+            TENSOR_NONE
+        },
+        ple_y: if ple_split_on(c) {
+            ac(b, "ple_y", (rows * c.hidden) as u64 * BF16)
         } else {
             TENSOR_NONE
         },
@@ -4010,6 +4099,11 @@ fn emit_phase(
             ]);
             d.i[..4].copy_from_slice(&[t, c.hidden, c.vocab, c.encoder_overlay_rows]);
         })
+    } else if decode && c.speech_pos_rows > 0 {
+        b.emit(DevOp::EmbedPosBf16, rows.clone(), &[], |d| {
+            d.t[..6].copy_from_slice(&[n.x, n.emb, n.ids, n.speech_pos, n.pos, n.pos_base]);
+            d.i[..4].copy_from_slice(&[t, c.hidden, c.vocab, c.speech_pos_rows]);
+        })
     } else {
         b.emit(DevOp::Embed, rows.clone(), &[], |d| {
             d.t[0] = n.x;
@@ -4418,6 +4512,9 @@ fn emit_phase(
     let seam_fused = |b: &Builder, gamma: u32| -> bool {
         if fuse_norm {
             rewrite_lower::fused(b, rewrite_lower::Lowering::AddNorm, gamma).unwrap_or(true)
+        } else if gfuse && !gemv_family && gamma == n.fin {
+            // The packed terminal (plowrt packed_terminal::layout) starts at the final RmsNorm.
+            false
         } else if gfuse {
             rewrite_lower::fused(b, rewrite_lower::Lowering::NormResidualNorm, gamma)
                 .unwrap_or(gemv_family || emit_config::active().pf_gfuse)
@@ -4452,6 +4549,17 @@ fn emit_phase(
     // (b tensor, gamma_b, gamma_n, layer_scale) of a skipped NRN2, consumed by the next
     // iteration's q/k/v emission. Crosses loop iterations by construction.
     let mut nrn_pending: Option<(u32, u32, u32, f32)> = None;
+    // First layer of the trailing KV-shared run: a prefill program marks where its row-local
+    // tail begins (plow_asset::kv_shared_tail).
+    let shared_tail_start = (!block_mode && !hj && tp == 1 && block.end == c.layers as usize)
+        .then(|| {
+            (0..c.layers as usize)
+                .rev()
+                .take_while(|&l| c.kv_is_shared(l))
+                .last()
+        })
+        .flatten()
+        .filter(|&l| l > 0 && block.contains(&l));
 
     for l in block.clone() {
         let full = c.is_full[l];
@@ -4506,7 +4614,7 @@ fn emit_phase(
             && !shared
             && !fp8
             && !mx4
-            && !emit_config::active().decode_cublaslt
+            && !emit_config::active().decode_cublaslt_at(t)
             && !emit_config::active().decode_native_tc
             && !affine_q4
             && gemv_fused_input_fits(amd, t, c.hidden)
@@ -4558,7 +4666,15 @@ fn emit_phase(
         let gf = if gqa < 2 {
             1
         } else if full {
-            fa_gf_full().min(gqa)
+            // A group the configured GF does not divide (Llama-3.2-3B / Veena: 24 heads over 8
+            // KV heads = 3) fuses WHOLE: one work item reads each KV row once for all its heads.
+            // The manifest pairs the object's hd128 arm at the same PLOW_NV_FA_GF.
+            let g = fa_gf_full().min(gqa);
+            if gqa % g == 0 {
+                g
+            } else {
+                odd_group_gf(gqa)
+            }
         } else {
             2.min(gqa)
         };
@@ -4748,6 +4864,22 @@ fn emit_phase(
         } else {
             ns
         };
+        // Row-group flash + merge fold (nv_decode_merge_fold): about one work item per SM, at
+        // most 8 splits. H100 Veena ctx 1024 measured best at ns 6-8/8/4/2/1 for B=1/2/4/8/16.
+        let nv_fold = gemv_family && !amd && n.mrgc != TENSOR_NONE;
+        // hd256/512 (E4B h100, standalone fold sweep, B=1..32): the fold tail merges up to 33
+        // splits for less than a split's KV costs; best at one wave, 16 splits of a 512-row
+        // window, 33 of a full layer (hd512 B=1 ctx 4096 ns 8/16/33: 43.8/26.7/20.0 us).
+        let ns_cap = match hd {
+            256 | 512 if win > 0 => 16,
+            256 | 512 => 33,
+            _ => 8,
+        };
+        let ns = if nv_fold {
+            (n_cu / (t * (heads / gf))).clamp(1, ns_cap)
+        } else {
+            ns
+        };
         // PLOW_NS_ABS pins nsplit directly. MEASURED on Qwen3-4B (all-global, GQA 4, MI350X):
         // the default mul=2 (ns=16) OVER-SPLITS flash_decode — each split's fixed overhead (Q
         // re-staging + the flash_merge partial + its barriers) dominates the tiny per-split KV
@@ -4804,6 +4936,9 @@ fn emit_phase(
             rec(cn);
             cn
         };
+        if shared_tail_start == Some(l) {
+            b.mark_shared_tail();
+        }
         let (qkv_src, qkv_g) = (n.hn, TENSOR_NONE);
 
         // q, k and v are INDEPENDENT. Running all three on all 256 CUs makes them serialise
@@ -5147,6 +5282,11 @@ fn emit_phase(
             && ns < (1 << 12)
             && heads < (1 << 16)
             && emit_config::active().fuse_hnr;
+        // Every model this dense emitter serves (Gemma, Llama, Qwen, Chatterbox T3) rotates
+        // NeoX-style (rotate_half). HEADNORM_ROPE's legacy pairing is GPT-J interleaved at hd 64
+        // (GLM/Kimi k_rope, emitted elsewhere), so hd 64 must force the half split. The AMD
+        // interpreter has no half-split hd64 arm yet, so its packets do not claim one.
+        let rope_pair = if hd == 64 && !amd { packet::dev::ROPE_PAIR_HALF } else { 0 };
         let c_qn = if fuse_hnr {
             0 // no packet: the fold computes q's norm+rope in flash's staging
         } else {
@@ -5166,6 +5306,7 @@ fn emit_phase(
                     d.i[2] = hd;
                     d.i[3] = 0;
                     d.i[4] = qk_skip;
+                    d.i[5] = rope_pair;
                     d.f[0] = c.eps;
                 },
             )
@@ -5211,6 +5352,7 @@ fn emit_phase(
                 d.i[2] = hd;
                 d.i[3] = 0;
                 d.i[4] = qk_skip;
+                d.i[5] = rope_pair;
                 d.f[0] = c.eps;
                 // j0 = the KV cache's row stride (the RING size on a sliding layer); j1 = the row
                 // mask. The write lands in the HEAD-MAJOR cache so flash can stream a head
@@ -5336,6 +5478,8 @@ fn emit_phase(
         // epilogue and the packet's own coarse completion signal covers the merge, so o_proj
         // just re-points its dep at the flash op with no threshold change.
         let fuse_merge = fuse_hnr && n.mrgc != TENSOR_NONE;
+        // See nv_decode_merge_fold: flash writes `n.at` itself, j[1] = at | mrgc << 16.
+        let dec_fused = nv_fold;
         let c_fa = if fuse_hnr {
             // NRF fold packet: flash depends on the three RAW projections directly (the hnr
             // level is gone). Operands per the exec's unpacking map; kv_rows gets nothing —
@@ -5468,6 +5612,10 @@ fn emit_phase(
                 if t > 1 {
                     d.j[0] = t * kvh * kvr;
                 }
+                if dec_fused {
+                    assert!(n.at < (1 << 16) && n.mrgc < (1 << 16), "fold handles overflow j[1]");
+                    d.j[1] = n.at | (n.mrgc << 16);
+                }
             })
         } else {
             let fa_op = if fp8_kv {
@@ -5508,6 +5656,9 @@ fn emit_phase(
                 d.t[7] = n.vcs[l]; // fp8-KV per-row scales (NONE in bf16 mode)
                 if let Some(h) = fa_tm {
                     d.t[7] = h;
+                    if fused && n.fa_ws != TENSOR_NONE {
+                        d.t[1] = n.fa_ws;
+                    }
                 }
                 // Fused epilogue: t[5] is the final bf16 attention output (n.at). When !fused
                 // it stays NONE and flash_prefill writes the f32 partial for d_flash_merge.
@@ -5536,7 +5687,7 @@ fn emit_phase(
         // When fused, flash_prefill already wrote the normalized bf16 to n.at, so there is no
         // FlashMerge op and o_proj depends on the flash op directly. Coarse: n.at row r needs
         // every head of its q-tile, which is spread across the flash workgroups.
-        let attn_deps = if fused || fuse_merge {
+        let attn_deps = if fused || fuse_merge || dec_fused {
             vec![c_fa]
         } else {
             // L1: fold a D-chunk axis into the merge's work id so it can occupy more than
@@ -5750,7 +5901,7 @@ fn emit_phase(
         let glu_fused = !affine_q4
             && gemv_family
             && gemv_fused_input_fits(amd, t, c.hidden)
-            && !emit_config::active().decode_cublaslt
+            && !emit_config::active().decode_cublaslt_at(t)
             && !emit_config::active().decode_native_tc;
         let gemma4_glu_role = !gemv_family
             && emit_config::active().gemma4_sm90_gemm_glu_role
@@ -6563,6 +6714,57 @@ fn emit_phase(
         // fold the next layer's input norm in (decode), TENSOR_NONE leaves it to a RmsNorm packet.
         let ple_block =
             |b: &mut Builder, cus: Vec<u32>, nrows: u32, dep: u32, hn_out: u32, gnext: u32| -> u32 {
+                if ple_split_on(c) {
+                    assert!(
+                        !fp8 && !mx4 && !affine_q4,
+                        "E-series per-layer input split: bf16 weights only"
+                    );
+                    let none = TENSOR_NONE;
+                    let (h, p) = (c.hidden, c.ple);
+                    let cg = proj(
+                        b, n.ple_g, n.x, w.plg, none, none, none, none, none, nrows, p, h, none,
+                        all.clone(), &[dep, c_ple],
+                    );
+                    let ca = b.emit(DevOp::GluStrided, (0..nrows.min(n_cu).max(1)).collect(), &[cg], |d| {
+                        d.t[0] = n.ple_a;
+                        d.t[1] = n.ple_g;
+                        d.t[2] = n.ple;
+                        d.i[0] = nrows;
+                        d.i[1] = p;
+                        d.i[2] = l as u32 * p;
+                        d.i[3] = c.layers * p;
+                        d.i[4] = 0;
+                    });
+                    let cy = proj(
+                        b, n.ple_y, n.ple_a, w.plp, none, none, none, none, none, nrows, h, p, none,
+                        all.clone(), &[ca],
+                    );
+                    return if hn_out != TENSOR_NONE {
+                        b.emit(DevOp::NormResidualNorm, cus, &[cy], |d| {
+                            d.t[0] = hn_out;
+                            d.t[1] = n.x;
+                            d.t[2] = n.x;
+                            d.t[3] = n.ple_y;
+                            d.t[4] = w.g_pl;
+                            d.t[5] = gnext;
+                            d.i[0] = nrows;
+                            d.i[1] = h;
+                            d.f[0] = c.eps;
+                            d.f[1] = ls[l];
+                        })
+                    } else {
+                        b.emit(DevOp::NormResidual, cus, &[cy], |d| {
+                            d.t[0] = n.x;
+                            d.t[1] = n.x;
+                            d.t[2] = n.ple_y;
+                            d.t[3] = w.g_pl;
+                            d.i[0] = nrows;
+                            d.i[1] = h;
+                            d.f[0] = c.eps;
+                            d.f[1] = ls[l];
+                        })
+                    };
+                }
                 b.emit(DevOp::PerLayerInput, cus, &[dep, c_ple], |d| {
                     d.t[0] = n.x;
                     d.t[1] = w.plg;
@@ -7073,6 +7275,11 @@ pub struct WholeGraphFusionDecisions {
     /// `PLOW_EMIT_REWRITE`: the egglog rewrite's fused sites over the complete graph. Ignored
     /// with the knob off.
     pub rewrite_sites: Option<RewriteSites>,
+    /// `PLOW_EMIT_REWRITE` for `codec.pkt` (`PLOW_TTS_CODEC_DIR`): the fused sites of the codec
+    /// export's own graph. `None` keeps `codec`'s hand fusions.
+    pub codec_sites: Option<RewriteSites>,
+    /// The same for `s3gen.pkt` (`PLOW_TTS_VOCODER_DIR`).
+    pub vocoder_sites: Option<RewriteSites>,
 }
 
 /// Fused kind → the checkpoint weight names anchoring its instances (`rewrite::FusedSites`).
@@ -7096,6 +7303,17 @@ static WHOLE_GRAPH_FUSIONS: std::sync::atomic::AtomicPtr<WholeGraphFusionDecisio
 fn install_whole_graph_fusions(decisions: WholeGraphFusionDecisions) {
     let ptr = Box::into_raw(Box::new(decisions));
     WHOLE_GRAPH_FUSIONS.store(ptr, std::sync::atomic::Ordering::Release);
+}
+
+/// `(codec, vocoder)` fused sites of [`WholeGraphFusionDecisions`], once installed.
+fn whole_graph_audio_sites() -> (Option<&'static RewriteSites>, Option<&'static RewriteSites>) {
+    let ptr = WHOLE_GRAPH_FUSIONS.load(std::sync::atomic::Ordering::Acquire);
+    if ptr.is_null() {
+        return (None, None);
+    }
+    // SAFETY: as `whole_graph_parallel_linear2`: installed once per compile, never freed.
+    let decisions: &'static WholeGraphFusionDecisions = unsafe { &*ptr };
+    (decisions.codec_sites.as_ref(), decisions.vocoder_sites.as_ref())
 }
 
 pub(crate) fn whole_graph_parallel_linear2(n0: u32, n1_local: u32, k: u32) -> bool {
@@ -7179,6 +7397,112 @@ pub(crate) fn write_lean_receipts(packet: &std::path::Path, lean: &LeanReport) {
     let path = packet.with_file_name(PACKET_CHECKS_FILE);
     std::fs::write(&path, serde_json::to_vec(&receipts).expect("serialize compiler checks"))
         .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+}
+
+/// Batch runner for sidecar-packet obligations: `(checkpoint, payload)` requests in, the
+/// certificates (as JSON) and the verifier digest out. `Ok(None)` = verifier not runnable.
+pub type SidecarVerifier = Box<
+    dyn Fn(&[(&'static str, serde_json::Value)]) -> Result<Option<(Vec<serde_json::Value>, String)>, String>
+        + Send,
+>;
+
+static SIDECAR_VERIFIER: std::sync::Mutex<Option<SidecarVerifier>> = std::sync::Mutex::new(None);
+
+/// Checkpoint D (logical tensor effects) for every sidecar packet (`encoder.pkt`, `codec.pkt`,
+/// `s3gen.pkt`) emitted later in this process. Not installed = those packets are not checked.
+pub fn install_sidecar_verifier(verify: SidecarVerifier) {
+    *SIDECAR_VERIFIER.lock().unwrap_or_else(|e| e.into_inner()) = Some(verify);
+}
+
+/// The sidecar's logical-effect obligations (one Lean check per distinct obligation), verified
+/// BEFORE its blob is written (a rejection aborts emission), then the blob and
+/// `<stem>.lean-checks.json`.
+fn write_sidecar_packet(
+    path: &std::path::Path,
+    model: &packet::devbuild::Model,
+    sections: &[packet::devbuild::SectionData],
+) {
+    use plow_asset::certificates::{request_sha256, CompileCheckReceipt, SemanticScope, SidecarCheckReceipts};
+    let name = path.display();
+    let mut requests: Vec<(&'static str, serde_json::Value)> = Vec::new();
+    let mut digests = std::collections::HashMap::new();
+    let mut program_checks = Vec::new();
+    let mut first_program = Vec::new();
+    plow_asset::program::with_model(model, |packet| {
+        for program in 0..packet.programs.len() {
+            match plow_asset::logical_effects::obligation(packet, program) {
+                Ok(request) => {
+                    let digest = request_sha256(&request).expect("request digest");
+                    let index = *digests.entry(digest).or_insert_with(|| {
+                        requests.push(("D", request));
+                        first_program.push(program);
+                        requests.len() - 1
+                    });
+                    program_checks.push(Some(index));
+                }
+                Err(reason) => {
+                    eprintln!("  {name}: program {program} logical effects NOT checked: {reason}");
+                    program_checks.push(None);
+                }
+            }
+        }
+    });
+    let verdict = match SIDECAR_VERIFIER.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+        None => Err("no sidecar verifier installed"),
+        Some(verify) => match verify(&requests) {
+            Ok(Some(result)) => Ok(result),
+            Ok(None) => Err("verifier not runnable"),
+            Err(error) => panic!("{name}: logical effects batch failed: {error}"),
+        },
+    };
+    let checks_path = plow_asset::certificates::sidecar_checks_file(path);
+    let receipts = match verdict {
+        Err(reason) => {
+            eprintln!("  {name}: Lean checks skipped ({reason}); not verified");
+            None
+        }
+        Ok((certs, verifier_sha256)) => {
+            assert_eq!(certs.len(), requests.len(), "{name}: certificate count");
+            let mut checks = Vec::new();
+            for ((cert, (checkpoint, request)), program) in certs.into_iter().zip(requests).zip(first_program) {
+                if cert.get("ok").and_then(serde_json::Value::as_bool) != Some(true) {
+                    panic!("{name}: program {program}: logical tensor effects REJECTED: {}",
+                        cert.get("reason").and_then(serde_json::Value::as_str).unwrap_or(""));
+                }
+                checks.push(CompileCheckReceipt {
+                    program: Some(program),
+                    scope: SemanticScope::LogicalTensorEffects,
+                    checkpoint: checkpoint.into(),
+                    request_sha256: request_sha256(&request).expect("request digest"),
+                    verifier_sha256: verifier_sha256.clone(),
+                    request,
+                    response: cert,
+                });
+            }
+            eprintln!("  {name}: logical tensor effects Lean-checked for {} of {} programs ({} distinct)",
+                program_checks.iter().flatten().count(), program_checks.len(), checks.len());
+            Some((checks, program_checks))
+        }
+    };
+    let blob = model.to_blob_v6(sections);
+    std::fs::write(path, &blob).unwrap_or_else(|error| panic!("{name}: {error}"));
+    let Some((checks, program_checks)) = receipts else {
+        // A stale file would describe an older blob.
+        let _ = std::fs::remove_file(&checks_path);
+        return;
+    };
+    let compiler = std::fs::read(std::env::current_exe().expect("compiler executable path"))
+        .expect("read compiler executable for check binding");
+    let receipts = SidecarCheckReceipts {
+        schema: 1,
+        packet_sha256: plow_asset::decode_objects::image_sha256(&blob),
+        compiler_sha256: plow_asset::decode_objects::image_sha256(&compiler),
+        checks,
+        program_checks,
+    };
+    receipts.validate_packet(&blob).expect("sidecar check receipt binding");
+    std::fs::write(&checks_path, serde_json::to_vec(&receipts).expect("serialize sidecar checks"))
+        .unwrap_or_else(|error| panic!("{}: {error}", checks_path.display()));
 }
 
 /// Read-only verification hook for [`run_verified`], called with the finished
@@ -7437,13 +7761,14 @@ impl<'a> DenseGqaEmitter<'a> {
         // [MERGE-FOLD] opt-in (PLOW_FUSE_MERGE=1) and rides the NRF packet's spare bits, so it
         // additionally requires the hnr fold's per-layer gates at emit time — this flag only
         // declares the counter tensor. Same arch scoping as nrn_fold (gfx942, measured there).
-        let merge_fold = amd
+        let merge_fold = (amd
             && amd_target::active().1 == hwspec::IsaLevel::Gfx942
             && fp8
             && c.arch.is_gemma()
             && !c.moe
             && emit_config::active().fuse_hnr
-            && emit_config::active().fuse_merge;
+            && emit_config::active().fuse_merge)
+            || nv_decode_merge_fold(c, fp8_kv);
         let tn = declare(
             &mut tb,
             c,
@@ -7704,7 +8029,7 @@ fn emit_capabilities(model_type: &str) -> EmitCapabilities {
         gemma,
         dense_packet_contracts: dense,
         decode_objects: dense || model_type == "qwen3_5",
-        cublaslt_decode: gemma || model_type == "qwen3_5",
+        cublaslt_decode: gemma || matches!(model_type, "llama" | "qwen3_5"),
         decode_ladder: dense || model_type == "gpt_oss",
         packed_prefill_siblings: matches!(model_type, "glm_moe_dsa" | "glm5_next"),
         glm: matches!(model_type, "glm_moe_dsa" | "glm5_next"),
@@ -8132,12 +8457,12 @@ pub fn run_verified(args: EmitArgs, verify: Option<VerifyHook>) {
     }
     if emit_config::active().prefill_cublaslt {
         assert!(
-            model_type.starts_with("gemma4")
+            (model_type.starts_with("gemma4") || model_type == "llama" || model_type == "qwen3_asr")
                 && arch == "sm_90a"
                 && tp == 1
                 && !emit_config::active().any_fp8_weights()
                 && !emit_config::active().mxfp4,
-            "cuBLASLt prefill emission requires Gemma 4 BF16 on single-GPU SM90"
+            "cuBLASLt prefill emission requires Gemma 4, Llama or Qwen3-ASR BF16 on single-GPU SM90"
         );
     }
     if emit_config::active().gemma4_sm90_gemm_glu_role {
@@ -9463,6 +9788,7 @@ fn emit_dense_gqa(
         && (!amd || std::env::var_os("PLOW_L2_PLACE_PREFILL").is_some());
     let mut progs = Vec::new();
     let mut tlist = Vec::new();
+    let mut shared_tail_marks: Vec<Option<u32>> = Vec::new();
     let mut hetero_progs: Vec<hetero::ProgPlan> = Vec::new();
     let mut channel_progs = Vec::new();
     let packed_prefill = amd
@@ -9556,6 +9882,7 @@ fn emit_dense_gqa(
                 segments: coll.segments,
             });
         }
+        shared_tail_marks.push(b.shared_tail_mark());
         progs.push(b.finish());
         tlist.push(if packed {
             packet::devbuild::packed_prefill_program_t(t)
@@ -9617,6 +9944,7 @@ fn emit_dense_gqa(
             &mut scratch
         };
         emitter.emit_decode(&mut bd, rb, dmode, sink);
+        shared_tail_marks.push(bd.shared_tail_mark());
         progs.push(bd.finish());
         tlist.push(rb);
     }
@@ -9681,7 +10009,34 @@ fn emit_dense_gqa(
             .expect("dense decode projection segments"),
         );
     }
-    if c.encoder_overlay_rows > 0 && !block_mode {
+    if c.speech_pos_rows > 0 && !block_mode {
+        m.tensors.extend(tts::t3_host_tables(&dir, c.hidden).unwrap_or_else(|e| panic!("T3 host tables: {e}")));
+        sections.push(
+            tts::t3_pipeline_section(
+                &m,
+                pipeline::CausalPipelineSpec {
+                    name: "speech",
+                    max_context: ctx,
+                    hidden: c.hidden,
+                    decode_capacity: dbatch,
+                    overlay_rows: c.encoder_overlay_rows,
+                    ordered_dispatch: false,
+                    tensors: pipeline::CausalPipelineTensors {
+                        tokens: emitter.tn.ids,
+                        positions: emitter.tn.pos,
+                        kv_lengths: emitter.tn.kvlen,
+                        overlay: Some(emitter.tn.encoder_overlay),
+                        overlay_index: Some(emitter.tn.encoder_overlay_index),
+                    },
+                },
+                emitter.tn.pos_base,
+                &c.speech_params,
+                &dir,
+            )
+            .unwrap_or_else(|error| panic!("T3 speech packet pipeline: {error}")),
+        );
+        sections.extend(tts::t3_text_tables_section(&dir).unwrap_or_else(|e| panic!("T3 text tables: {e}")));
+    } else if c.encoder_overlay_rows > 0 && !block_mode {
         sections.push(
             pipeline::causal_pipeline_section(
                 &m,
@@ -9701,7 +10056,37 @@ fn emit_dense_gqa(
                     },
                 },
             )
+            .and_then(|mut section| {
+                let (parameters, strings) = asr::qwen::audio_lm_contract(&dir)?;
+                asr::qwen::extend_pipeline_section(&mut section, &parameters, &strings)?;
+                Ok(section)
+            })
             .unwrap_or_else(|error| panic!("causal packet pipeline: {error}")),
+        );
+    } else if let Some(name) = ecfg.tts_profile.as_deref().filter(|_| !block_mode) {
+        let profile = tts::profile(name).unwrap_or_else(|e| panic!("{e}"));
+        sections.push(
+            tts::speech_pipeline_section(
+                &m,
+                pipeline::CausalPipelineSpec {
+                    name: "speech",
+                    max_context: ctx,
+                    hidden: c.hidden,
+                    decode_capacity: dbatch,
+                    overlay_rows: 0,
+                    ordered_dispatch: false,
+                    tensors: pipeline::CausalPipelineTensors {
+                        tokens: emitter.tn.ids,
+                        positions: emitter.tn.pos,
+                        kv_lengths: emitter.tn.kvlen,
+                        overlay: None,
+                        overlay_index: None,
+                    },
+                },
+                profile,
+                c.vocab,
+            )
+            .unwrap_or_else(|error| panic!("speech packet pipeline: {error}")),
         );
     }
     if ecfg.gemv_decode_role {
@@ -9932,6 +10317,9 @@ fn emit_dense_gqa(
         }
         let manifest = plow_asset::program::with_model(&m, |p| -> Result<_, String> {
             let live = plow_asset::live_kv::emit(p)?;
+            if !ecfg.packed_prefill_small_hd && live.caches.iter().any(|c| c.hd <= 128) {
+                return Err("hd64/hd128 attention packs only with PLOW_EMIT_PACKED_PREFILL_SMALL_HD".into());
+            }
             let request = plow_asset::packed_prefill::Manifest {
                 version: live.version,
                 max_request_rows: ecfg.max_request_chunk,
@@ -9966,6 +10354,17 @@ fn emit_dense_gqa(
                 eprintln!("  packed prefill not selected: {error}");
             }
             Err(error) => panic!("packed request contract: {error}"),
+        }
+    }
+    if packed_prefill_emitted {
+        let first_shared = (0..c.layers as usize)
+            .rev()
+            .take_while(|&l| c.kv_is_shared(l))
+            .last();
+        if let Some(section) =
+            first_shared.and_then(|l| kv_shared_tail_section(&m, &shared_tail_marks, l as u32))
+        {
+            sections.push(section);
         }
     }
     if projection_bindings.is_some() || packed_prefill_emitted {
@@ -10121,6 +10520,7 @@ fn emit_dense_gqa(
     check_cpu_or_metal_opcode_coverage(
         &m,
         arch == "metal3" || (arch.is_empty() && gpu.is_empty()),
+        arch.starts_with("sm_"),
     );
     check_group_routing_supported(&m, amd, &arch);
     warn_arch_gpu_vendor_mismatch(&arch, &gpu);
@@ -10130,10 +10530,28 @@ fn emit_dense_gqa(
         hetero_channel::plan(&m, channels, weights, channel_progs)
             .unwrap_or_else(|e| panic!("{e}"))
     });
-    let audio_blob = (c.encoder_overlay_rows > 0 && !block_mode).then(|| {
-        let mut encoder = asr::qwen::lower_audio_encoder(3000, n_cu)
-            .unwrap_or_else(|error| panic!("Qwen audio packet lowering: {error}"));
-        for capacity in [400, 800, 1200, 1600, 2000] {
+    let audio_blob = (c.encoder_overlay_rows > 0 && c.speech_pos_rows == 0 && !block_mode).then(|| {
+        // Single-utterance buckets (forward.v1); on CUDA also packed buckets (chunks of several
+        // utterances, each attending in its own windows and splitting K as its single bucket
+        // would), the largest sizing every shared tensor.
+        let (packed, single): (&[u32], &[u32]) = if arch.starts_with("sm_") {
+            (&[192, 160, 128, 96, 80, 64, 48, 40, 32, 24, 16, 12, 8, 4], &[3000, 400, 800, 1200, 1600, 2000])
+        } else {
+            (&[], &[400, 800, 1200, 1600, 2000])
+        };
+        let mut encoder = match packed.first() {
+            Some(&chunks) => asr::qwen::lower_packed_audio_encoder(chunks, n_cu),
+            None => asr::qwen::lower_audio_encoder(3000, n_cu),
+        }
+        .unwrap_or_else(|error| panic!("Qwen audio packet lowering: {error}"));
+        for chunks in packed.iter().skip(1) {
+            let bucket = asr::qwen::lower_packed_audio_encoder(*chunks, n_cu)
+                .unwrap_or_else(|error| panic!("Qwen audio packet lowering: {error}"));
+            encoder
+                .merge_capacity(bucket)
+                .unwrap_or_else(|error| panic!("Qwen audio packet capacity: {error}"));
+        }
+        for &capacity in single {
             let bucket = asr::qwen::lower_audio_encoder(capacity, n_cu)
                 .unwrap_or_else(|error| panic!("Qwen audio packet lowering: {error}"));
             encoder
@@ -10144,15 +10562,32 @@ fn emit_dense_gqa(
         encoder
             .embed_checkpoint(&dir)
             .unwrap_or_else(|error| panic!("Qwen audio packet weights: {error}"));
+        encoder.embed_frontend(
+            asr::qwen::whisper_frontend(&dir).unwrap_or_else(|error| panic!("Qwen audio frontend: {error}")),
+        );
         let section = encoder
-            .pipeline_section(3000)
+            .pipeline_section(packed.first().map_or(3000, |chunks| chunks * 100))
             .unwrap_or_else(|error| panic!("Qwen audio packet metadata: {error}"));
-        encoder.prefix.model.to_blob_v6(&[section])
+        (encoder.prefix.model, section)
     });
     std::fs::write(&out, blob).unwrap();
-    if let Some(blob) = audio_blob {
+    if let Some(dir) = ecfg.tts_codec.as_deref().filter(|_| !block_mode) {
+        let sites = whole_graph_audio_sites().0;
+        let (model, section) = codec::lower_snac(dir, n_cu, m.target, sites).unwrap_or_else(|error| panic!("codec packet: {error}"));
+        let path = std::path::Path::new(&out).with_file_name("codec.pkt");
+        write_sidecar_packet(&path, &model, &[section]);
+        eprintln!("  codec packet -> {}", path.display());
+    }
+    if let Some(dir) = ecfg.tts_vocoder.as_deref().filter(|_| !block_mode) {
+        let sites = whole_graph_audio_sites().1;
+        let (model, section) = s3gen::lower_s3gen(dir, n_cu, m.target, sites).unwrap_or_else(|error| panic!("s3gen packet: {error}"));
+        let path = std::path::Path::new(&out).with_file_name(s3gen::PACKET);
+        write_sidecar_packet(&path, &model, &[section]);
+        eprintln!("  s3gen packet -> {}", path.display());
+    }
+    if let Some((model, section)) = audio_blob {
         let path = std::path::Path::new(&out).with_file_name("encoder.pkt");
-        std::fs::write(&path, blob).unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+        write_sidecar_packet(&path, &model, &[section]);
         eprintln!("  audio encoder packet -> {}", path.display());
     }
     if let Some(plan) = channel_plan {
@@ -10264,6 +10699,11 @@ fn split2(n: u32, a: u32, b: u32) -> (Vec<u32>, Vec<u32>) {
 /// probe; the GLM twin `PLOW_GLM_GEMV_WG` measured −1.4 ms at cap 152 on gfx942). Unset ⇒
 /// byte-identical. Applied at the decode call sites only — prefill GEMM splitting is
 /// tile-based and must not see it.
+/// Gemma-4 E-series per-layer input block as generic ops (NVIDIA: no op-155 arm).
+fn ple_split_on(c: &Cfg) -> bool {
+    c.ple > 0 && !emit_is_amd() && !emit_is_apple()
+}
+
 fn gemv_wg_env() -> Option<u32> {
     emit_config::active().gemv_wg.filter(|&c| c > 0)
 }
@@ -10346,18 +10786,22 @@ pub mod fp8_m1_role;
 /// Opcodes only the Metal interpreter (and the CPU golden tier) implement. Refused at emit for
 /// any other GPU target, so an E-series blob cannot reach a CUDA/HIP interpreter's
 /// `default: __trap()`.
-fn check_cpu_or_metal_opcode_coverage(m: &Model, supported: bool) {
+fn check_cpu_or_metal_opcode_coverage(m: &Model, supported: bool, cuda: bool) {
     if supported {
         return;
     }
-    const CPU_OR_METAL_ONLY: [DevOp; 4] = [
+    // The CUDA interpreter carries the embedding-overlay handoff (op 179) too.
+    let cuda_ok = |op: DevOp| cuda && matches!(op, DevOp::EmbedOverlayBf16 | DevOp::GluStrided);
+    const CPU_OR_METAL_ONLY: [DevOp; 5] = [
         DevOp::PerLayerInput,
+        DevOp::GluStrided,
         DevOp::GemvAffineQ4,
         DevOp::GemmAffineQ4,
         DevOp::EmbedOverlayBf16,
     ];
     let bad: Vec<&'static str> = CPU_OR_METAL_ONLY
         .iter()
+        .filter(|op| !cuda_ok(**op))
         .filter(|op| {
             m.progs
                 .iter()
@@ -10370,4 +10814,86 @@ fn check_cpu_or_metal_opcode_coverage(m: &Model, supported: bool) {
         "this packet carries opcode(s) only the CPU and Apple (metal3) interpreters currently \
          implement: {bad:?}; emit with --gpu <apple part> or a CPU target"
     );
+}
+
+/// The `kv_shared_tail` section for a packed-prefill packet whose every prefill program marked
+/// its KV-shared tail and carries the same per-row activations across the boundary. `None`
+/// (with a note) otherwise: the runtime then runs whole programs.
+fn kv_shared_tail_section(
+    m: &packet::devbuild::Model,
+    marks: &[Option<u32>],
+    first_layer: u32,
+) -> Option<packet::devbuild::SectionData> {
+    let prefill = packet::devbuild::decode_rung_lo(&m.prog_t);
+    if prefill == 0
+        || marks.len() != m.progs.len()
+        || marks[..prefill].iter().any(Option::is_none)
+    {
+        return None;
+    }
+    // Decode rungs that carry the same boundary let the runtime run the tail as a decode step.
+    let decode_boundaries: Vec<u32> = marks[prefill..]
+        .iter()
+        .map(|&mark| mark.unwrap_or(0))
+        .collect();
+    let max_rows = m.prog_t[..prefill]
+        .iter()
+        .map(|&t| packet::devbuild::program_rows(t))
+        .max()?;
+    let activation = |h: u16| {
+        m.tensors
+            .get(h as usize)
+            .is_some_and(|t| t.name.starts_with("act.") && t.init.is_none())
+    };
+    let mut carried: Option<Vec<u16>> = None;
+    let mut boundaries = Vec::with_capacity(prefill);
+    for (program, mark) in m.progs[..prefill].iter().zip(marks) {
+        let boundary = mark.unwrap() as usize;
+        if boundary == 0 || boundary >= program.insts.len() {
+            return None;
+        }
+        let insts: Vec<_> = program.insts.iter().map(|d| d.pack()).collect();
+        let set = plow_asset::kv_shared_tail::carried_reads(&insts, boundary, activation);
+        if carried.as_ref().is_some_and(|c| *c != set) {
+            eprintln!("  kv-shared tail not emitted: carried activations differ across buckets");
+            return None;
+        }
+        carried = Some(set);
+        boundaries.push(boundary as u32);
+    }
+    let carried = carried?
+        .into_iter()
+        .map(|h| {
+            let bytes = m.tensors[h as usize].bytes;
+            (bytes % u64::from(max_rows) == 0).then(|| plow_asset::kv_shared_tail::Carried {
+                tensor: h,
+                row_bytes: (bytes / u64::from(max_rows)) as u32,
+            })
+        })
+        .collect::<Option<Vec<_>>>()?;
+    let manifest = plow_asset::kv_shared_tail::Manifest {
+        version: plow_asset::kv_shared_tail::VERSION,
+        first_layer,
+        boundaries,
+        decode_boundaries,
+        carried,
+    };
+    if let Err(error) = manifest.validate(prefill) {
+        eprintln!("  kv-shared tail not emitted: {error}");
+        return None;
+    }
+    eprintln!(
+        "  kv-shared tail from layer {}: carried {:?}",
+        manifest.first_layer,
+        manifest
+            .carried
+            .iter()
+            .map(|c| (m.tensors[c.tensor as usize].name.as_str(), c.row_bytes))
+            .collect::<Vec<_>>()
+    );
+    Some(packet::devbuild::SectionData {
+        kind: packet::devbuild::SECT_METADATA,
+        name: plow_asset::kv_shared_tail::SECTION.into(),
+        data: serde_json::to_vec(&manifest).unwrap(),
+    })
 }

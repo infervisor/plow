@@ -85,6 +85,8 @@ impl FusionCoverage {
             tp,
             parallel_linear2,
             rewrite_sites: None,
+            codec_sites: None,
+            vocoder_sites: None,
         }
     }
 

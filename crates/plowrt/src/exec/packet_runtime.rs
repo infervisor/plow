@@ -27,6 +27,25 @@ pub trait PacketRuntime: Send {
     fn tensor(&self, name: &str) -> Option<PacketTensor>;
     fn write_tensor(&mut self, tensor: PacketTensor, bytes: &[u8]) -> Result<()>;
     fn read_tensor(&self, tensor: PacketTensor, bytes: &mut [u8]) -> Result<()>;
+    /// Write `bytes` at byte `offset` of `tensor`; the rest keeps its contents.
+    fn write_tensor_at(&mut self, tensor: PacketTensor, offset: usize, bytes: &[u8]) -> Result<()> {
+        let mut all = vec![0; tensor.bytes];
+        self.read_tensor(tensor, &mut all)?;
+        all.get_mut(offset..offset.saturating_add(bytes.len()))
+            .ok_or_else(|| RuntimeError::Device("packet tensor write is outside its bounds".into()))?
+            .copy_from_slice(bytes);
+        self.write_tensor(tensor, &all)
+    }
+    /// Read `bytes.len()` bytes from byte `offset` of `tensor`.
+    fn read_tensor_at(&self, tensor: PacketTensor, offset: usize, bytes: &mut [u8]) -> Result<()> {
+        let mut all = vec![0; tensor.bytes];
+        self.read_tensor(tensor, &mut all)?;
+        bytes.copy_from_slice(
+            all.get(offset..offset.saturating_add(bytes.len()))
+                .ok_or_else(|| RuntimeError::Device("packet tensor read is outside its bounds".into()))?,
+        );
+        Ok(())
+    }
     fn copy_tensor(
         &mut self,
         source: PacketTensor,
@@ -55,6 +74,7 @@ pub struct BoundPacketPipeline {
     programs: BTreeMap<String, usize>,
     tensors: BTreeMap<String, PacketTensor>,
     parameters: BTreeMap<String, u64>,
+    strings: BTreeMap<String, String>,
 }
 
 pub struct LoadedPacketRuntime {
@@ -97,6 +117,18 @@ impl ForwardPacket {
             input,
             output,
         })
+    }
+
+    pub fn pipeline(&self) -> &BoundPacketPipeline {
+        &self.pipeline
+    }
+
+    pub fn runtime(&self) -> &dyn PacketRuntime {
+        self.runtime.as_ref()
+    }
+
+    pub fn runtime_mut(&mut self) -> &mut dyn PacketRuntime {
+        self.runtime.as_mut()
     }
 
     pub fn backend(&self) -> &'static str {
@@ -201,7 +233,11 @@ pub fn load_packet_runtime(path: &Path, requested: &str) -> Result<LoadedPacketR
         {
             return load_packet_runtime(path, "cpu");
         }
-        #[cfg(not(any(feature = "cpu", all(feature = "metal", target_os = "macos"))))]
+        #[cfg(all(feature = "cuda", not(feature = "cpu"), not(all(feature = "metal", target_os = "macos"))))]
+        {
+            return load_packet_runtime(path, "cuda");
+        }
+        #[cfg(not(any(feature = "cpu", feature = "cuda", all(feature = "metal", target_os = "macos"))))]
         {
             return Err(RuntimeError::Rejected(
                 "no packet execution backend is compiled in".into(),
@@ -219,6 +255,11 @@ pub fn load_packet_runtime(path: &Path, requested: &str) -> Result<LoadedPacketR
                 )?),
             })
         }
+        #[cfg(feature = "cuda")]
+        "cuda" => Ok(LoadedPacketRuntime {
+            backend: "cuda",
+            runtime: Box::new(crate::exec::gpu::packet_exec::CudaPacketRuntime::load(path, 0)?),
+        }),
         #[cfg(all(feature = "metal", target_os = "macos"))]
         "metal" => Ok(LoadedPacketRuntime {
             backend: "metal",
@@ -333,13 +374,29 @@ impl PacketAsset {
                 .collect(),
             tensors,
             parameters: pipeline.parameters.clone(),
+            strings: pipeline.strings.clone(),
         })
     }
 }
 
 impl BoundPacketPipeline {
+    pub fn string(&self, name: &str) -> Result<&str> {
+        self.strings.get(name).map(String::as_str).ok_or_else(|| {
+            RuntimeError::Rejected(format!("packet pipeline string {name:?} is missing"))
+        })
+    }
+
+    pub fn optional_string(&self, name: &str) -> Option<&str> {
+        self.strings.get(name).map(String::as_str)
+    }
+
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// Every program role and its program index.
+    pub fn programs(&self) -> impl Iterator<Item = (&str, usize)> {
+        self.programs.iter().map(|(role, &program)| (role.as_str(), program))
     }
 
     pub fn driver(&self) -> &str {
@@ -627,6 +684,7 @@ mod tests {
         let metadata = PacketPipelines {
             version: VERSION,
             pipelines: vec![PacketPipeline {
+                strings: Default::default(),
                 name: "infer".into(),
                 driver: "feedforward.v1".into(),
                 programs: BTreeMap::from([

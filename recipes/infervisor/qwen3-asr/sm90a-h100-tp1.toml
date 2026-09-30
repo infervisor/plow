@@ -1,0 +1,79 @@
+# Qwen3-ASR-1.7B on H100: audio encoder lowered to encoder.pkt (generic FP32 speech ops on the
+# speech interpreter object; Whisper log-mel frontend parameters + filterbank embedded) and the
+# Qwen3 decoder as a causal.v1 packet with the audio-LM contract (prompt layout, markers,
+# languages, stop ids) as packet strings/parameters.
+#
+#   PLOW_CAMPAIGN_NO_NIX=1 (this box only) \
+#   python3 scripts/campaign/campaign.py build recipes/infervisor/qwen3-asr/sm90a-h100-tp1.toml --out <fresh dir>
+#
+# Gate: WER on the 73-clip LibriSpeech dummy set (scripts/asr/nvidia/get_audio.py) = 3.913%
+# (vLLM reference scripts/asr/nvidia/ref_bench.py: 3.913%).
+
+schema = "plow.recipe.v1"
+namespace = "infervisor"
+name = "qwen3-asr"
+label = "sm90a-h100-tp1"
+plow_git = "1972fa37ac7a6f632cd5ece0b32fe37ab76eec75"
+network = "qwen3"
+doc = "docs/runtime/tts.md"
+tracker = "docs/runtime/h100-speech-recipes.md"
+
+[target]
+vendor = "nvidia"
+isa = "sm_90a"
+sku = "H100 SXM5"
+units = 132
+num_gpus = 1
+parallel = "tp"
+
+[checkpoint]
+source = "hf:Qwen/Qwen3-ASR-1.7B"
+revision = "7278e1e70fe206f11671096ffdd38061171dd6e5"
+
+[cell]
+name = "qwen3-asr-h100"
+hf_dir = "{hf:Qwen/Qwen3-ASR-1.7B@7278e1e70fe206f11671096ffdd38061171dd6e5}"
+gpu = "h100"
+arch = "sm_90a"
+n_cu = 132
+n_gpu = 1
+max_ctx = 2048
+
+[emit]
+emit = "devblob+cubin"
+# The OpenAI `model` id plowrt serves the bundle under (weights.json served_name).
+args = ["--served-name", "qwen3-asr"]
+[emit.env]
+PLOW_VERIFY_BIN = "{repo}/lean-plow/.lake/build/bin/plow_verify"
+# Speech-shaped rungs: prefill rows = audio rows (13 per second) + prompt (~60-420), so
+# 128/256/384/512; decode 1..16. Encoder buckets 400..3000 frames come from the lowering.
+PLOW_MAX_CHUNK = "512"
+PLOW_PF_LADDER_APPEND = "256,384"
+# Decode ladder: rungs past 32 run the one-pass wide GEMV (`_gw` object); 48/96 pay 5-13% over
+# rounding up to 64/128 (Veena step_bench ctx 1024: 8.21 vs 9.08, 11.56 vs 13.28 ms), 3/6/12/24 < 3%.
+PLOW_DECODE_BATCH_LADDER = "1,2,4,8,16,32,48,64,96,128"
+PLOW_EMIT_PREFILL_CUBLASLT = "1"
+PLOW_NO_GLU_FUSE = "1"
+# One-row decode rung on the gemv_k8 walk: step_bench ctx 128 B=1 2.105 -> 2.005 ms, B=2/4 -50 us.
+PLOW_NV_GEMV_K8_B1 = "1"
+# hd128 row-group flash decode with merge fold (gated here; changes attention sum order).
+PLOW_NV_FA_FOLD = "1"
+# Opt-ins measured on this model: packed prefill at hd64/hd128, and the dense hd <= 128 decode
+# tuning (gemv_k8 + L2 prefetch, tensor-core decode scores, classic B=1 GEMVs below K 3840).
+PLOW_EMIT_PACKED_PREFILL_SMALL_HD = "1"
+PLOW_NV_DENSE_TUNE = "1"
+
+[bench]
+kind = "asr"
+client = "crates/plowrt/examples/asr/packet_dataset.rs"
+manifest = "scripts/asr/nvidia/get_audio.py"
+reference = "scripts/asr/nvidia/ref_bench.py"
+
+# `campaign.py gate <recipe> --assets <dir> --out <dir>`. ASR_MANIFEST: the 73-clip set
+# (scripts/asr/nvidia/get_audio.py). WER 3.913% (= the vLLM reference) at conc 1 and 16.
+[gates]
+python = "{env:PYREF}"
+[gates.asr_wer]
+manifest = "{env:ASR_MANIFEST}"
+conc = "1,16"
+wer_max = 0.045

@@ -223,6 +223,34 @@ def checkD (payload : Json) : IO Certificate := do
         match parsed with
         | .error msg => return reject "D" s!"address witness parse error: {msg}"
         | .ok paths => pure (some paths)
+    -- `address_trees`: parent-pointer certificates, one per source (`treeBefore`).
+    let addressTrees : Option (Array (Option (Array (Option Nat)))) ←
+      match payload.getObjVal? "address_trees" with
+      | .error _ => pure none
+      | .ok trees =>
+        let parsed : Except String (Array (Option (Array (Option Nat)))) := do
+          let raw ← Lean.fromJson? (α := List Json) trees
+          let mut out : Array (Option (Array (Option Nat))) := Array.mkArray d.taskGraph.n none
+          for tree in raw do
+            let source ← tree.getObjValAs? Nat "source"
+            if source ≥ d.taskGraph.n then throw "address_trees.source out of range"
+            let parent ← tree.getObjValAs? (Array (Option Nat)) "parent"
+            if parent.size != d.taskGraph.n then throw "address_trees.parent length"
+            out := out.set! source (some parent)
+          return out
+        match parsed with
+        | .error msg => return reject "D" s!"address tree parse error: {msg}"
+        | .ok trees => pure (some trees)
+    if addressPaths.isSome && addressTrees.isSome then
+      return reject "D" "address_paths and address_trees are exclusive"
+    let witness : Option (Witness d.protocol) :=
+      match addressPaths, addressTrees with
+      | some paths, _ => some (Witness.ofPaths d.protocol paths)
+      | none, some trees => some (Witness.ofTrees d.protocol trees)
+      | none, none => none
+    -- Trees carry no explicit paths: overlapping address-map entries then need a witness the
+    -- reference checker cannot find, so they are rejected (the tree scope has disjoint entries).
+    let addressPaths := if addressTrees.isSome then some [] else addressPaths
     -- FastCheckD is an early rejection filter, not a proof-backed acceptance path.
     match ← FastCheckD.run (if addressPaths.isSome then { d with entries := [] } else d) with
     | .error msg => return reject "D" s!"ordering-graph check failed: {msg}"
@@ -238,10 +266,10 @@ def checkD (payload : Json) : IO Certificate := do
       else
         let mut notes := s!"proven verifyAddressMap accepted {d.entries.length} entries (strict); supplied graph/address scope only"
         if let .ok effects := payload.getObjVal? "memory_effects" then
-          match addressPaths with
-          | none => return reject "D" "memory effects require explicit address_paths"
-          | some paths =>
-            match Effects.run d paths effects with
+          match witness with
+          | none => return reject "D" "memory effects require explicit address_paths or address_trees"
+          | some w =>
+            match Effects.run d w effects with
             | .error msg => return reject "D" s!"memory effects rejected: {msg}"
             | .ok scope => notes := notes ++ "; " ++ scope
         return ok "D" notes

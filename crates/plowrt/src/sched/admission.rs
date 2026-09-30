@@ -174,12 +174,82 @@ pub enum Denied {
     ExceedsWholeBudget { want: u64, max_rows: u64 },
     /// Live sequences hold the KV today. Retryable.
     KvBudgetFull { want: u64 },
+    /// The stage this model's output feeds is behind. Retryable.
+    DownstreamFull,
 }
 
 impl Denied {
     /// Whether the caller should keep the request queued rather than answer its stream.
     pub fn is_retryable(self) -> bool {
-        matches!(self, Denied::KvBudgetFull { .. })
+        matches!(self, Denied::KvBudgetFull { .. } | Denied::DownstreamFull)
+    }
+}
+
+/// Backlog of the stage a model's output feeds (a codec, a vocoder): work handed to it and not yet
+/// finished. The model's mux seats a new request only while the backlog is under the limit, so an
+/// LM cannot race ahead of the stage that turns its tokens into audio. Limit 0 = unlimited.
+#[derive(Debug, Default)]
+pub struct DownstreamCredit {
+    backlog: std::sync::atomic::AtomicUsize,
+    limit: std::sync::atomic::AtomicUsize,
+    /// The stage is rendering latency-critical work and wants the device: the model's
+    /// dispatcher holds its next tick until this clears.
+    urgent: std::sync::atomic::AtomicBool,
+    released: tokio::sync::Notify,
+    /// The serving model's device turn under `--co-sched deadline`: the stage's launches take it.
+    turn: std::sync::OnceLock<std::sync::Arc<crate::serve::cosched::DeviceTurn>>,
+}
+
+/// One unit of downstream backlog, returned on drop.
+pub struct DownstreamWork(std::sync::Arc<DownstreamCredit>);
+
+impl Drop for DownstreamWork {
+    fn drop(&mut self) {
+        self.0.backlog.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        self.0.released.notify_one();
+    }
+}
+
+impl DownstreamCredit {
+    pub fn set_limit(&self, limit: usize) {
+        self.limit.store(limit, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn full(&self) -> bool {
+        let limit = self.limit.load(std::sync::atomic::Ordering::Relaxed);
+        limit != 0 && self.backlog.load(std::sync::atomic::Ordering::Relaxed) >= limit
+    }
+
+    pub fn work(self: &std::sync::Arc<Self>) -> DownstreamWork {
+        self.backlog.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        DownstreamWork(std::sync::Arc::clone(self))
+    }
+
+    pub fn set_urgent(&self, urgent: bool) {
+        self.urgent.store(urgent, std::sync::atomic::Ordering::Release);
+        if !urgent {
+            self.released.notify_one();
+        }
+    }
+
+    pub fn urgent(&self) -> bool {
+        self.urgent.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    pub fn set_device_turn(&self, turn: std::sync::Arc<crate::serve::cosched::DeviceTurn>) {
+        if turn.mode() == crate::serve::cosched::CoSched::Deadline {
+            let _ = self.turn.set(turn);
+        }
+    }
+
+    /// The device turn the stage's launches take, under `--co-sched deadline` only.
+    pub fn device_turn(&self) -> Option<&std::sync::Arc<crate::serve::cosched::DeviceTurn>> {
+        self.turn.get()
+    }
+
+    /// Resolves when some backlog finishes or urgency clears.
+    pub async fn released(&self) {
+        self.released.notified().await
     }
 }
 
@@ -193,7 +263,7 @@ pub fn reserved_kv_rows(prompt_tokens: usize, max_tokens: usize, generated_token
 }
 
 /// THE seat decision, in one place and in this order: liveness, then a slot, then the whole-device
-/// bound, then what live sequences already hold.
+/// bound, then the downstream stage's backlog, then what live sequences already hold.
 ///
 /// Pure — no metrics, no streams, no allocation — so the order of the checks reads in one screen
 /// and is testable without an engine. The caller supplies `free_slot` (the first idle index inside
@@ -205,18 +275,20 @@ pub fn seat(
     want_rows: u64,
     committed_rows: impl IntoIterator<Item = u64>,
     budget: Option<KvBudget>,
+    downstream_full: bool,
 ) -> Result<usize, Denied> {
     if engine_dead {
         return Err(Denied::EngineDead);
     }
     let slot = free_slot.ok_or(Denied::NoFreeSlot)?;
+    if budget.is_some_and(|b| !b.fits_requests([want_rows])) {
+        let max_rows = budget.map_or(0, |b| b.max_rows());
+        return Err(Denied::ExceedsWholeBudget { want: want_rows, max_rows });
+    }
+    if downstream_full {
+        return Err(Denied::DownstreamFull);
+    }
     if let Some(budget) = budget {
-        if !budget.fits_requests([want_rows]) {
-            return Err(Denied::ExceedsWholeBudget {
-                want: want_rows,
-                max_rows: budget.max_rows(),
-            });
-        }
         if !budget.fits_requests(committed_rows.into_iter().chain(std::iter::once(want_rows))) {
             return Err(Denied::KvBudgetFull { want: want_rows });
         }
@@ -336,7 +408,7 @@ impl KvBudget {
 
 #[cfg(test)]
 mod seat_tests {
-    use super::{seat, Denied, KvBudget};
+    use super::{seat, Denied, DownstreamCredit, KvBudget};
 
     fn glm_budget() -> KvBudget {
         let free = (55.58984375f64 * (1u64 << 30) as f64) as u64;
@@ -354,9 +426,9 @@ mod seat_tests {
     /// rather than a misleading 429.
     #[test]
     fn liveness_is_decided_before_capacity() {
-        assert_eq!(seat(true, None, 1, [], None), Err(Denied::EngineDead));
-        assert_eq!(seat(false, None, 1, [], None), Err(Denied::NoFreeSlot));
-        assert_eq!(seat(false, Some(3), 1, [], None), Ok(3));
+        assert_eq!(seat(true, None, 1, [], None, false), Err(Denied::EngineDead));
+        assert_eq!(seat(false, None, 1, [], None, false), Err(Denied::NoFreeSlot));
+        assert_eq!(seat(false, Some(3), 1, [], None, false), Ok(3));
     }
 
     /// A request larger than the whole device is terminal, not retryable: deferring it would
@@ -365,7 +437,7 @@ mod seat_tests {
     fn a_request_over_the_whole_budget_is_terminal_not_queued() {
         let b = glm_budget();
         let max = b.max_rows();
-        let err = seat(false, Some(0), max + 1, [], Some(b)).unwrap_err();
+        let err = seat(false, Some(0), max + 1, [], Some(b), false).unwrap_err();
         assert!(matches!(err, Denied::ExceedsWholeBudget { .. }));
         assert!(!err.is_retryable());
     }
@@ -375,18 +447,37 @@ mod seat_tests {
     #[test]
     fn live_sequences_push_a_fitting_request_back_onto_the_queue() {
         let b = glm_budget();
-        assert_eq!(seat(false, Some(0), 70_700, [], Some(b)), Ok(0));
-        let err = seat(false, Some(0), 70_700, [70_700; 12], Some(b)).unwrap_err();
+        assert_eq!(seat(false, Some(0), 70_700, [], Some(b), false), Ok(0));
+        let err = seat(false, Some(0), 70_700, [70_700; 12], Some(b), false).unwrap_err();
         assert_eq!(err, Denied::KvBudgetFull { want: 70_700 });
         assert!(err.is_retryable());
         // 11 already seated leaves room for the twelfth.
-        assert_eq!(seat(false, Some(0), 70_700, [70_700; 11], Some(b)), Ok(0));
+        assert_eq!(seat(false, Some(0), 70_700, [70_700; 11], Some(b), false), Ok(0));
+    }
+
+    /// A behind downstream stage queues the request; a request that can never fit is still
+    /// answered first.
+    #[test]
+    fn a_full_downstream_is_retryable_and_follows_the_whole_budget() {
+        let err = seat(false, Some(0), 1, [], None, true).unwrap_err();
+        assert_eq!(err, Denied::DownstreamFull);
+        assert!(err.is_retryable());
+        let b = glm_budget();
+        let err = seat(false, Some(0), b.max_rows() + 1, [], Some(b), true).unwrap_err();
+        assert!(matches!(err, Denied::ExceedsWholeBudget { .. }));
+        let credit = std::sync::Arc::new(DownstreamCredit::default());
+        let w = credit.work();
+        assert!(!credit.full(), "limit 0 is unlimited");
+        credit.set_limit(1);
+        assert!(credit.full());
+        drop(w);
+        assert!(!credit.full());
     }
 
     /// Without a budget the seat decision is slots alone — the pre-KV-admission behaviour.
     #[test]
     fn no_budget_means_slots_alone() {
-        assert_eq!(seat(false, Some(0), u64::MAX, [u64::MAX; 4], None), Ok(0));
+        assert_eq!(seat(false, Some(0), u64::MAX, [u64::MAX; 4], None, false), Ok(0));
     }
 }
 

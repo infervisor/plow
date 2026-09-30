@@ -49,6 +49,11 @@ struct Cli {
     #[arg(long, conflicts_with_all = ["model", "net"])]
     hf_dir: Option<PathBuf>,
 
+    /// The `model` id `plowrt serve` registers the bundle under (written to `weights.json`).
+    /// Default: the HF repo id when `--hf-dir` is a hub-cache snapshot, else the network slug.
+    #[arg(long)]
+    served_name: Option<String>,
+
     /// Bucket preset: quick (2×2), default (3×3), serve (5×5 crossed), longctx (3×4).
     /// Overrides --batch and --seq when provided.
     #[arg(long, value_enum)]
@@ -979,6 +984,30 @@ fn rewrite_sites(
     resolve_rewrite_sites(sites, explicit)
 }
 
+/// [`rewrite_sites`] for an audio network export directory (`PLOW_TTS_CODEC_DIR`,
+/// `PLOW_TTS_VOCODER_DIR`), or `None` without one.
+fn audio_rewrite_sites(
+    dir: Option<&std::path::Path>,
+    explicit: bool,
+) -> Result<Option<devgen::RewriteSites>, String> {
+    let Some(dir) = dir else { return Ok(None) };
+    let sites = std::fs::read_to_string(dir.join("config.json"))
+        .map_err(|e| rewrite::SitesError::Unavailable(format!("{}: {e}", dir.display())))
+        .and_then(|json| rewrite::fused_sites_for_codec_config(&json));
+    match sites {
+        Ok(sites) => {
+            info!(
+                network = %dir.display(),
+                kinds = sites.len(),
+                sites = sites.values().map(|w| w.len()).sum::<usize>(),
+                "PLOW_EMIT_REWRITE: devgen lowers the audio network's extracted fused graph"
+            );
+            Ok(Some(sites))
+        }
+        Err(e) => resolve_rewrite_sites(Err(e), explicit),
+    }
+}
+
 /// A default-on knob cannot refuse an emit: a missing rewrite falls back to the hand fusions
 /// unless `PLOW_EMIT_REWRITE=1` was set explicitly.
 fn resolve_rewrite_sites(
@@ -1086,6 +1115,22 @@ fn devblob_verify_hook(
     nvidia_target: bool,
 ) -> Result<devgen::VerifyHook, Box<dyn std::error::Error>> {
     use lean_verify::checkpoints::schedule as lv;
+    if do_verify {
+        devgen::install_sidecar_verifier(Box::new(|requests| {
+            match lean_verify::call_batch_bound(requests) {
+                Ok((certs, verifier_sha256)) => Ok(Some((
+                    certs.iter().map(serde_json::to_value).collect::<Result<_, _>>()
+                        .map_err(|error| error.to_string())?,
+                    verifier_sha256,
+                ))),
+                Err(e) if e.is_binary_unusable() => {
+                    warn!(error = %e, "sidecar lean checks skipped: verifier not runnable");
+                    Ok(None)
+                }
+                Err(e) => Err(e.to_string()),
+            }
+        }));
+    }
     Ok(Box::new(move |m: &packet::devbuild::Model| {
         let mut rep = devgen::LeanReport::default();
         if do_oracle {
@@ -1709,6 +1754,12 @@ fn run_devblob(cli: &Cli) -> Result<PathBuf, Box<dyn std::error::Error>> {
     if cli.emit_cfg.emit_rewrite {
         let explicit = devgen::emit_config::explicitly_set("emit_rewrite");
         whole_graph_fusions.rewrite_sites = rewrite_sites(&dir, explicit)?;
+        // The audio networks emitted beside the LM (`codec.pkt`, `s3gen.pkt`) lower their own
+        // exports' graphs the same way.
+        whole_graph_fusions.codec_sites =
+            audio_rewrite_sites(cli.emit_cfg.tts_codec.as_deref(), explicit)?;
+        whole_graph_fusions.vocoder_sites =
+            audio_rewrite_sites(cli.emit_cfg.tts_vocoder.as_deref(), explicit)?;
     }
 
     // The Lean gates on the devblob path. BOTH ARE ON BY DEFAULT (disable with
@@ -1871,7 +1922,13 @@ fn run_devblob(cli: &Cli) -> Result<PathBuf, Box<dyn std::error::Error>> {
     // the CLI's idea of what was emitted, which is the drift this whole change
     // exists to remove.
     if cli.emit() == EmitKind::DevblobCubin {
-        build_cubin_from_manifest(&pkt, &cli.arch, cli.segmented)?;
+        let t3 = cli.hf_dir.as_deref().is_some_and(|dir| {
+            std::fs::read(dir.join("config.json"))
+                .ok()
+                .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+                .is_some_and(|v| v.get("chatterbox_t3").is_some())
+        });
+        build_cubin_from_manifest(&pkt, &cli.arch, cli.segmented, cli.emit_cfg.tts_profile.is_some(), t3)?;
     }
 
     // Bare-blob mode (`--out foo.pkt`) stops here: no manifest, exactly the
@@ -1883,6 +1940,7 @@ fn run_devblob(cli: &Cli) -> Result<PathBuf, Box<dyn std::error::Error>> {
         // the hand-written stub the build scripts used to emit.
         let manifest = plow_asset::Manifest {
             network: slug.clone(),
+            served_name: cli.served_name.clone().or_else(|| plowc::hf_config::hub_repo_id(&dir)),
             gpu: cli.gpu.clone(),
             num_gpus: cli.num_gpus,
             parallel: format!("{:?}", cli.parallel).to_lowercase(),
@@ -1964,6 +2022,8 @@ fn build_cubin_from_manifest(
     pkt: &std::path::Path,
     arch: &str,
     segmented: bool,
+    speech: bool,
+    t3: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mpath = pkt.with_file_name("build.json");
     let man: serde_json::Value = serde_json::from_slice(
@@ -1971,7 +2031,10 @@ fn build_cubin_from_manifest(
             .map_err(|e| format!("--emit devblob+cubin: cannot read {}: {e}", mpath.display()))?,
     )?;
 
-    let nvcc = std::path::Path::new("/usr/local/cuda/bin/nvcc");
+    // The dev shell exports PLOW_NVCC (nix toolkit); /usr/local/cuda is the non-nix default.
+    let nvcc = std::env::var_os("PLOW_NVCC")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/usr/local/cuda/bin/nvcc"));
     if !nvcc.exists() {
         return Err(format!(
             "--emit devblob+cubin needs a CUDA toolkit: {} not found. The packet and \
@@ -2038,10 +2101,18 @@ fn build_cubin_from_manifest(
     if routed_decode_required(&man) {
         args.push("-DPLOW_CUBIN_ROUTED_DECODE=ON".into());
     }
+    if man.pointer("/tuning/gemv_wide").is_some() {
+        args.push("-DPLOW_CUBIN_GEMV_WIDE=ON".into());
+    }
     if segmented || manifest_requires_segmented_prefill(&man) {
         args.push("-DPLOW_SM120_CUBIN_SEG=ON".into());
     }
-    let mut extra = Vec::new();
+    // A required hd128 GQA grouping is correctness (the kernel traps on GF not dividing gqa).
+    let mut extra: Vec<String> = req
+        .iter()
+        .filter(|d| d.starts_with("PLOW_NV_FA_GF="))
+        .map(|d| format!("-D{d}"))
+        .collect();
     for d in &rec {
         match d.split_once('=') {
             Some(("PLOW_NV_FA_GF_FULL", v)) => args.push(format!("-DPLOW_NV_FA_GF_FULL={v}")),
@@ -2052,6 +2123,16 @@ fn build_cubin_from_manifest(
         args.push(format!("-DPLOW_EXTRA_DEFINES={}", extra.join(" ")));
     }
     args.push(format!("-DPLOW_CUBIN_ARCH={arch}"));
+    args.push(format!("-DPLOW_CUBIN_NVCC={}", nvcc.display()));
+    // The codec is a packet (codec.pkt); no native codec object is shipped.
+    let _ = speech;
+    args.push("-DPLOW_TTS_SNAC=OFF".into());
+    // The vocoder is a packet (s3gen.pkt); no native vocoder object is shipped.
+    let _ = t3;
+    args.push("-DPLOW_TTS_S3GEN=OFF".into());
+    // An ASR packet's audio encoder runs the FP32 speech arms, which only the _speech object has.
+    let asr = ["encoder.pkt", "codec.pkt", "s3gen.pkt"].iter().any(|f| pkt.with_file_name(f).is_file());
+    args.push(format!("-DPLOW_CUBIN_SPEECH={}", if asr { "ON" } else { "OFF" }));
 
     let out_dir = pkt.parent().map(PathBuf::from).unwrap_or_default();
     let config = pkt.with_file_name("plow_config.h");

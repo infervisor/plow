@@ -1095,7 +1095,7 @@ impl QwenAudioEncoder {
             rows: chunks * 480 * f,
             columns: time,
         });
-        let rows = crate::asr::qwen_audio_rows(mel.frames);
+        let rows = 13 * (mel.frames / 100) + (mel.frames % 100).div_ceil(8);
         let packed = self.buffer(rows * 7680)?;
         self.dispatch(
             &cb,

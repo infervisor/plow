@@ -125,6 +125,10 @@ impl GpuEngine {
         capability: (u32, u32),
         granularity: u64,
     ) -> Option<VmmPrefixLayout> {
+        // Overlay rows (audio, voice conditioning) are not keyed by the prompt ids.
+        if blob.tensors.iter().any(|t| t.name == "in.encoder_overlay") {
+            return None;
+        }
         let requested = config.nv_vmm_prefix();
         if requested == Some(false)
             || (requested.is_none()
@@ -154,7 +158,9 @@ impl GpuEngine {
                 && g.elem_slide == 2
                 && g.hd_full == 512
                 && g.hd_slide == 256
-                && g.window == 1024
+                // 512: Gemma-4 E4B (KV-shared layers read their source's rings); cached and
+                // cold prompts give identical logprobs (docs/runtime/gemma4-e4b-h100.md).
+                && matches!(g.window, 512 | 1024)
                 && !layout.slide.is_empty()
                 && recurrent_state_layout(&blob.tensors, g.batch as usize)
                     .ok()?
@@ -377,6 +383,9 @@ impl GpuEngine {
                     kv.enable_block_pool(crate::memory::vmm::kv_pool_cap());
                     if rt.vmm_deferred_reclaim() {
                         kv.enable_deferred_reclaim();
+                        if rt.vmm_stale_reserve() {
+                            kv.enable_stale_reserve();
+                        }
                     }
                     if rt.vmm_publish_shared() {
                         kv.enable_shared_publish();
@@ -712,6 +721,9 @@ impl GpuEngine {
         if p_a == 0 {
             tracing::info!(slot = b, p_a, "vmm_publish skipped: p_a == 0");
             return;
+        }
+        if self.session_pin[b].is_some() {
+            v.kv.note_session(b, toks);
         }
         let step = crate::config::RuntimeConfig::get()
             .amd_prefix_fine_rows()

@@ -18,6 +18,8 @@ pub(super) struct PackedTerminal {
     insts: [Vec<DevInst64>; 2],
     stage: usize,
     host_ids: PinnedHost,
+    /// The next launch's ids and logits are already in place (the KV-shared tail ran the head).
+    skip: bool,
 }
 
 fn layout(insts: &[DevInst64], rows: u32, logits: usize, ids: usize) -> Option<[DevInst64; 5]> {
@@ -70,7 +72,7 @@ fn layout(insts: &[DevInst64], rows: u32, logits: usize, ids: usize) -> Option<[
     Some(tail)
 }
 
-fn chain(insts: Vec<DevInst64>, grid: u32, rows: u32) -> plow_asset::aux_program::Program {
+pub(super) fn chain(insts: Vec<DevInst64>, grid: u32, rows: u32) -> plow_asset::aux_program::Program {
     let mut per_cu = vec![Vec::new(); grid as usize];
     let mut queue = Vec::new();
     let mut waits = Vec::new();
@@ -268,6 +270,7 @@ impl PackedTerminal {
             _tables: tables,
             host_rows: [Vec::with_capacity(capacity), Vec::with_capacity(capacity)],
             host_ids: e.be.host_alloc_pinned(capacity * 4)?,
+            skip: false,
         }))
     }
 
@@ -288,8 +291,12 @@ impl PackedTerminal {
         i
     }
 
+    pub(super) fn skip_next(&mut self) {
+        self.skip = true;
+    }
+
     pub(super) fn launch(&mut self, e: &GpuEngine, live: usize, i: usize) -> Result<()> {
-        if self.host_rows[i].is_empty() {
+        if std::mem::take(&mut self.skip) || self.host_rows[i].is_empty() {
             return Ok(());
         }
         if self.host_rows[i].len() > self.capacity
@@ -337,6 +344,11 @@ impl PackedTerminal {
             return Ok(());
         }
         self.launch(e, live, i)?;
+        self.read(e, i)
+    }
+
+    /// Read the launched terminal's ids back (after anything else enqueued behind it) and wait.
+    fn read(&mut self, e: &GpuEngine, i: usize) -> Result<()> {
         let output_bytes = self.host_rows[i].len() * 4;
         let read = (|| {
             // SAFETY: the pinned slab lives on self past the synchronize below.
@@ -379,6 +391,29 @@ impl PackedTerminal {
             return Ok(self.ids(0));
         }
         self.run(e, live, i)?;
+        Ok(self.ids(rows.len()))
+    }
+
+    /// [`Self::run_rows`] with `plow_sample` drawing each row's token from its logits row on
+    /// the device (`specs[r]` for sample row r) before the ids are read.
+    pub(super) fn run_rows_sampled(
+        &mut self,
+        e: &mut GpuEngine,
+        rows: &[u32],
+        live: usize,
+        specs: &[DevSample],
+    ) -> Result<&[u32]> {
+        let i = self.stage_rows(rows);
+        if rows.is_empty() {
+            e.be.stream_synchronize(&e.stream)?;
+            return Ok(self.ids(0));
+        }
+        self.launch(e, live, i)?;
+        if let Err(error) = e.launch_sampler_rows(specs) {
+            let _ = e.be.stream_synchronize(&e.stream);
+            return Err(error);
+        }
+        self.read(e, i)?;
         Ok(self.ids(rows.len()))
     }
 }

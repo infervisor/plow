@@ -139,7 +139,8 @@ the eos set came from the `config.json` fallback rather than `generation_config.
 - `messages[].content` may be `null`, so an assistant tool-call turn can be replayed.
 - Malformed JSON returns the envelope, not axum's plain-text rejection.
 - **Refused rather than silently dropped**: `n != 1`, `tools`, `tool_choice`, `functions`,
-  `function_call`, `response_format`, `logprobs`, `top_logprobs`, `echo`, `suffix`, `best_of`.
+  `function_call`, `response_format`, `echo`, `suffix`, `best_of`. (`logprobs` / `top_logprobs`
+  were on this list; they are served on the CUDA engine since 2026-09-27, see below.)
   A silently dropped `tools` is a confidently wrong answer that scores as success.
 - `/health` added alongside `/healthz`; `/tokenize` reports `count`; model cards carry
   `created`; request ids are seeded per process instead of starting at zero; CUDA reads the
@@ -316,8 +317,12 @@ assistant turn.
   template keys the speaker off `message.get('name')`, and every family renders an assistant
   turn that carried a tool call as an empty one. Latent while `tools` is refused at the API
   boundary; it is the thing to fix first when tool calling lands.
-- **`logprobs` is refused, not served.** vLLM serves it and lm-eval-harness needs it; this is
-  the blocker for evaluation parity.
+- **`logprobs` is served on the CUDA engine only** (chat `logprobs`/`top_logprobs`, completions
+  `logprobs` 0..=20, plus vLLM's `logprobs_mode` `raw_logprobs`|`raw_logits` per request and
+  `return_tokens_as_token_ids`); other backends refuse it with 400. Values are the raw model
+  distribution after the checkpoint's final-logit softcap. A request that asks for them samples on
+  the host (one logits-row download per token) and leaves the device multi-step quantum.
+  `echo`/prompt logprobs are still refused. Contract and parity: `docs/runtime/gemma4-e4b-h100.md`.
 - **No `/v1/embeddings`.**
 - **No auth and no CORS** on the router. The body-size limit and the admin listener's 0600 UDS
   are the only access controls; a request timeout is deliberately absent, because a blanket one

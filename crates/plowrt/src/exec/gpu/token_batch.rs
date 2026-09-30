@@ -62,7 +62,18 @@ impl CudaTokenBatch {
             && e.packed_prefill.is_some()
             && e.has_packed_terminal()
             && e.recurrent.is_none()
-            && e.mixed_step.is_none())
+            && e.mixed_step.is_none()
+            // Host rows spliced by launch row (overlay) or a decode-only embedding (position
+            // base): the batch embeds decode rows through the prefill program, in its own order.
+            && e.handle_of("in.encoder_overlay").is_none()
+            && e.handle_of("in.pos_base").is_none()
+            // Decode rows ride as one-row requests of the packed prefill attention, which is
+            // qualified only on the hd256/512 attention arms. At hd128 (Veena, H100, c64) its
+            // ticks carried ~77 one-row requests and served 27.1 audio s/s against 33.8 for
+            // packed prefill plus the ordinary decode launch.
+            && e.prefill.iter().all(|b| {
+                b.flash_sites.iter().all(|&pc| matches!(b.h_inst[pc].i[6], 256 | 512))
+            }))
         .then(|| Self {
             staging: TokenBatchStaging::with_capacity(e.pf_max_rows(), e.batch),
             fired: false,
@@ -84,7 +95,19 @@ impl GpuEngine {
         requests: &[Request<'_>],
         output: &mut Vec<(u32, u32)>,
     ) -> Result<()> {
-        self.token_batch_step_inner(requests, output, false)
+        self.token_batch_step_inner(requests, output, false, None)
+    }
+
+    /// As [`Self::token_batch_step`], with `spec(slot)` rows drawn on the device by `plow_sample`
+    /// from their logits rows instead of returning the argmax. A row whose spec is `None` keeps
+    /// the argmax; with no sampler loaded every row does.
+    pub fn token_batch_step_sampled(
+        &mut self,
+        requests: &[Request<'_>],
+        output: &mut Vec<(u32, u32)>,
+        spec: &dyn Fn(u32) -> Option<DevSample>,
+    ) -> Result<()> {
+        self.token_batch_step_inner(requests, output, false, Some(spec))
     }
 
     /// As [`Self::token_batch_step`], but parked behind the decode pipeline's event instead of
@@ -96,7 +119,7 @@ impl GpuEngine {
         requests: &[Request<'_>],
         output: &mut Vec<(u32, u32)>,
     ) -> Result<()> {
-        self.token_batch_step_inner(requests, output, true)
+        self.token_batch_step_inner(requests, output, true, None)
     }
 
     fn token_batch_step_inner(
@@ -104,6 +127,7 @@ impl GpuEngine {
         requests: &[Request<'_>],
         output: &mut Vec<(u32, u32)>,
         pipelined: bool,
+        spec: Option<&dyn Fn(u32) -> Option<DevSample>>,
     ) -> Result<()> {
         output.clear();
         let mut state = self.token_batch.take().ok_or_else(|| {
@@ -205,6 +229,15 @@ impl GpuEngine {
                     carry: decode_slots.contains(&owner.slot),
                 })
                 .collect();
+            let specs: Option<smallvec::SmallVec<[DevSample; 32]>> =
+                spec.filter(|_| !pipelined && self.sampler.is_some()).and_then(|spec| {
+                    let specs: smallvec::SmallVec<[DevSample; 32]> = plan
+                        .sample_owners
+                        .iter()
+                        .map(|owner| spec(owner.slot).unwrap_or_else(DevSample::greedy))
+                        .collect();
+                    specs.iter().any(|s| s.temp > 0.0).then_some(specs)
+                });
             let completed: smallvec::SmallVec<[_; 16]> = plan
                 .pending
                 .iter()
@@ -245,12 +278,25 @@ impl GpuEngine {
             // behind the flag rather than running on every decode step.
             let timed = RuntimeConfig::get().nv.step_time;
             let t_enq = timed.then(std::time::Instant::now);
-            if pipelined {
-                self.packed_token_body_enqueue_device(&chunks, &device_ids)?;
+            // KV-shared tail: the body stops at the tail boundary and the tail runs the sampled
+            // rows alone, which the terminal then finds at rows 0..n.
+            let tail_rows = self.shared_tail_rows(&chunks, &sample_rows);
+            self.pf_seg_prefix = tail_rows.is_some();
+            let body = if pipelined {
+                self.packed_token_body_enqueue_device(&chunks, &device_ids)
             } else {
-                self.packed_token_body_enqueue(&chunks)?;
-            }
+                self.packed_token_body_enqueue(&chunks)
+            };
+            self.pf_seg_prefix = false;
+            body?;
             body_enqueued = true;
+            let (sample_rows, real_rows) = match &tail_rows {
+                Some(rows) => {
+                    self.shared_tail_enqueue(rows, real_rows)?;
+                    ((0..rows.len() as u32).collect(), rows.len())
+                }
+                None => (sample_rows, real_rows),
+            };
             let enqueue_ns = t_enq.map_or(0, |t| t.elapsed().as_nanos() as u64);
             let mut terminal = self
                 .packed_terminal
@@ -268,8 +314,10 @@ impl GpuEngine {
                     }
                 })
             } else {
-                terminal
-                    .run_rows(self, &sample_rows, real_rows)
+                match &specs {
+                    Some(specs) => terminal.run_rows_sampled(self, &sample_rows, real_rows, specs),
+                    None => terminal.run_rows(self, &sample_rows, real_rows),
+                }
                     .and_then(|ids| {
                         state
                             .staging

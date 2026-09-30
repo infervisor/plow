@@ -25,7 +25,12 @@ pub enum StreamChunk {
     /// One newly-produced token, plus the incremental decoded string delta
     /// (may be empty when the tokenizer's decode of the running id vec did
     /// not yield a new visible segment, e.g. a partial UTF-8 sequence).
-    Token { id: u32, text: String },
+    /// `logprobs` is set when the request asked for them (OpenAI `logprobs`).
+    Token {
+        id: u32,
+        text: String,
+        logprobs: Option<Box<crate::text::logprobs::TokenLogprobs>>,
+    },
     /// Terminal event: stop condition met. `executed` is the aggregate packet
     /// count for the whole request (feeds observability, not the wire).
     Done {

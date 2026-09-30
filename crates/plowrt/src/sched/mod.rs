@@ -14,6 +14,7 @@ pub mod kv_budget;
 pub mod mdq;
 pub mod multistep;
 pub mod prefill;
+pub mod ride;
 pub mod rungs;
 pub mod slo;
 pub mod step;

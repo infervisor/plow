@@ -51,6 +51,12 @@ inductive Op
   /-- Attention op — schematic representation, keeps `q`, `k`, `v` as
       separate operands. -/
   | Attention  (q k v : Op)
+  /-- 1-D convolution or transposed convolution; `cfg` carries which, and its geometry. -/
+  | Conv1d     (x w b : Op) (cfg : String)
+  /-- The bias operand of a biasless `Conv1d`. -/
+  | NoBias
+  /-- Parameterized activation (snake with its per-channel alpha). -/
+  | ActP       (kind : String) (x p : Op)
   -- Fused variants (definitionally = the unfused composition via `expand`).
   | FusedNormLinear         (x w wl : Op) (eps : Nat)
   | FusedZeroCenteredNormLinear (x w wl : Op) (eps : Nat)
@@ -90,6 +96,15 @@ inductive Op
       (a b snapshots normWeight projWeight : Op) (maxSnapshots : Nat)
   | FusedMaterializedResidual3Block
       (pre a b snapshots normWeight projWeight : Op) (maxSnapshots : Nat)
+  | FusedLayerNormLinearBiasAct (x w b wl bl : Op) (eps : Nat) (kind : String)
+  | FusedLinearBiasResidual (x w b r : Op)
+  | FusedActConv1d          (kind : String) (x w b : Op) (cfg : String)
+  | FusedParamActConv1d     (kind : String) (x p w b : Op) (cfg : String)
+  | FusedConv1dAct          (x w b : Op) (cfg kind : String)
+  | FusedConv1dResidual     (x w b : Op) (cfg : String) (r : Op)
+  | FusedActConv1dResidual  (kind : String) (x w b : Op) (cfg : String) (r : Op)
+  | FusedParamActConv1dResidual (kind : String) (x p w b : Op) (cfg : String) (r : Op)
+  | FusedParamActConv1dAct  (kind : String) (x p w b : Op) (cfg outKind : String)
   deriving Repr
 
 /-! ## Denotational lens — every fused op unfolds to its unfused composition. -/
@@ -170,6 +185,27 @@ def expand : Op → Op
       Op.BlockResidual
         (Op.Ew "add" (expand pre) (Op.Ew "add" (expand a) (expand b)))
         (expand snapshots) (expand nw) (expand pw) maxSnapshots
+  | Op.FusedLayerNormLinearBiasAct x w b wl bl eps kind =>
+      Op.Act kind
+        (Op.LinearBias (Op.LayerNorm (expand x) (expand w) (expand b) eps) (expand wl) (expand bl))
+  | Op.FusedLinearBiasResidual x w b r =>
+      Op.Ew "add" (expand r) (Op.LinearBias (expand x) (expand w) (expand b))
+  | Op.FusedActConv1d kind x w b cfg =>
+      Op.Conv1d (Op.Act kind (expand x)) (expand w) (expand b) cfg
+  | Op.FusedParamActConv1d kind x p w b cfg =>
+      Op.Conv1d (Op.ActP kind (expand x) (expand p)) (expand w) (expand b) cfg
+  | Op.FusedConv1dAct x w b cfg kind =>
+      Op.Act kind (Op.Conv1d (expand x) (expand w) (expand b) cfg)
+  | Op.FusedConv1dResidual x w b cfg r =>
+      Op.Ew "add" (expand r) (Op.Conv1d (expand x) (expand w) (expand b) cfg)
+  | Op.FusedActConv1dResidual kind x w b cfg r =>
+      Op.Ew "add" (expand r) (Op.Conv1d (Op.Act kind (expand x)) (expand w) (expand b) cfg)
+  | Op.FusedParamActConv1dResidual kind x p w b cfg r =>
+      Op.Ew "add" (expand r)
+        (Op.Conv1d (Op.ActP kind (expand x) (expand p)) (expand w) (expand b) cfg)
+  | Op.FusedParamActConv1dAct kind x p w b cfg outKind =>
+      Op.Act outKind
+        (Op.Conv1d (Op.ActP kind (expand x) (expand p)) (expand w) (expand b) cfg)
   -- Base ops → structural recursion.
   | Op.RmsNorm x w eps => Op.RmsNorm (expand x) (expand w) eps
   | Op.ZeroCenteredRmsNorm x w eps => Op.ZeroCenteredRmsNorm (expand x) (expand w) eps
@@ -187,6 +223,9 @@ def expand : Op → Op
   | Op.Conv3dBias x w b s p => Op.Conv3dBias (expand x) (expand w) (expand b) s p
   | Op.Embedding ids t => Op.Embedding (expand ids) (expand t)
   | Op.Attention q k v => Op.Attention (expand q) (expand k) (expand v)
+  | Op.Conv1d x w b cfg => Op.Conv1d (expand x) (expand w) (expand b) cfg
+  | Op.NoBias => Op.NoBias
+  | Op.ActP k x p => Op.ActP k (expand x) (expand p)
   | Op.SnapNil => Op.SnapNil
   | Op.SnapCons snapshot rest => Op.SnapCons (expand snapshot) (expand rest)
   | Op.BlockResidual prefixValue snapshots nw pw maxSnapshots =>
@@ -368,6 +407,57 @@ theorem rule_materialized_residual3_block_fuse
         (Op.Ew "add" (expand pre) (Op.Ew "add" (expand a) (expand b)))
         (expand snapshots) (expand nw) (expand pw) maxSnapshots := rfl
 
+/-- `layernorm-linearbias-act-fuse` -/
+theorem rule_layernorm_linearbias_act_fuse (x w b wl bl : Op) (eps : Nat) (k : String) :
+    expand (Op.FusedLayerNormLinearBiasAct x w b wl bl eps k) =
+      Op.Act k
+        (Op.LinearBias (Op.LayerNorm (expand x) (expand w) (expand b) eps)
+          (expand wl) (expand bl)) := rfl
+
+/-- `linearbias-residual-fuse`: the residual is the first add operand. -/
+theorem rule_linearbias_residual_fuse (x w b r : Op) :
+    expand (Op.FusedLinearBiasResidual x w b r) =
+      Op.Ew "add" (expand r) (Op.LinearBias (expand x) (expand w) (expand b)) := rfl
+
+/-- `act-conv1d-fuse` -/
+theorem rule_act_conv1d_fuse (k : String) (x w b : Op) (cfg : String) :
+    expand (Op.FusedActConv1d k x w b cfg) =
+      Op.Conv1d (Op.Act k (expand x)) (expand w) (expand b) cfg := rfl
+
+/-- `param-act-conv1d-fuse` -/
+theorem rule_param_act_conv1d_fuse (k : String) (x p w b : Op) (cfg : String) :
+    expand (Op.FusedParamActConv1d k x p w b cfg) =
+      Op.Conv1d (Op.ActP k (expand x) (expand p)) (expand w) (expand b) cfg := rfl
+
+/-- `conv1d-act-fuse` -/
+theorem rule_conv1d_act_fuse (x w b : Op) (cfg k : String) :
+    expand (Op.FusedConv1dAct x w b cfg k) =
+      Op.Act k (Op.Conv1d (expand x) (expand w) (expand b) cfg) := rfl
+
+/-- `conv1d-residual-fuse` -/
+theorem rule_conv1d_residual_fuse (x w b : Op) (cfg : String) (r : Op) :
+    expand (Op.FusedConv1dResidual x w b cfg r) =
+      Op.Ew "add" (expand r) (Op.Conv1d (expand x) (expand w) (expand b) cfg) := rfl
+
+/-- `act-conv1d-residual-fuse` -/
+theorem rule_act_conv1d_residual_fuse (k : String) (x w b : Op) (cfg : String) (r : Op) :
+    expand (Op.FusedActConv1dResidual k x w b cfg r) =
+      Op.Ew "add" (expand r)
+        (Op.Conv1d (Op.Act k (expand x)) (expand w) (expand b) cfg) := rfl
+
+/-- `param-act-conv1d-residual-fuse` -/
+theorem rule_param_act_conv1d_residual_fuse
+    (k : String) (x p w b : Op) (cfg : String) (r : Op) :
+    expand (Op.FusedParamActConv1dResidual k x p w b cfg r) =
+      Op.Ew "add" (expand r)
+        (Op.Conv1d (Op.ActP k (expand x) (expand p)) (expand w) (expand b) cfg) := rfl
+
+/-- `param-act-conv1d-act-fuse` -/
+theorem rule_param_act_conv1d_act_fuse (k : String) (x p w b : Op) (cfg k2 : String) :
+    expand (Op.FusedParamActConv1dAct k x p w b cfg k2) =
+      Op.Act k2
+        (Op.Conv1d (Op.ActP k (expand x) (expand p)) (expand w) (expand b) cfg) := rfl
+
 /-- Side result that the fused runtime operation must continue to materialize. -/
 def materializedResidual : Op → Option Op
   | Op.FusedMaterializedResidualBlock a b _ _ _ _ =>
@@ -423,7 +513,16 @@ def soundRules : List String :=
    "rmsnorm-silu-gate-fuse",
    "packed-attn-gate-fuse",
    "materialized-residual-block-fuse",
-   "materialized-residual3-block-fuse"]
+   "materialized-residual3-block-fuse",
+   "layernorm-linearbias-act-fuse",
+   "act-conv1d-fuse",
+   "param-act-conv1d-fuse",
+   "conv1d-act-fuse",
+   "conv1d-residual-fuse",
+   "act-conv1d-residual-fuse",
+   "param-act-conv1d-residual-fuse",
+   "param-act-conv1d-act-fuse",
+   "linearbias-residual-fuse"]
 
 /-- Whether a rule name is in the sound-rules table. -/
 def isSoundRule (name : String) : Bool :=

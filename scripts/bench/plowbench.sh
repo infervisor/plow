@@ -143,6 +143,11 @@ pb_is_amd() {
 }
 
 pb_require_nix() {
+    # A box without nix (PLOW_CAMPAIGN_NO_NIX=1, as campaign.py) runs in a hand-built shell instead.
+    if [ "${PLOW_CAMPAIGN_NO_NIX:-0}" = 1 ]; then
+        pb_ok "PLOW_CAMPAIGN_NO_NIX=1: hand-built shell (CUDA_PATH=${CUDA_PATH:-unset})"
+        return 0
+    fi
     if [ -z "${ROCM_PATH:-}" ]; then
         pb_bad "not inside 'nix develop' (ROCM_PATH unset) — build and serve tasks need it"
         return 1
@@ -410,13 +415,18 @@ pb_bench() {
     local lib="${PB_VLLM_ROCM_LIB:-/opt/rocm/core-7.14/lib}"
     local tokz="${PB_TOKENIZER:-zai-org/GLM-5.3}"
     PB_ARM_N=$((PB_ARM_N + 1))
+    # One seed per cell unless PB_SEED pins it. With range ratio 0 a shared seed makes each cell's
+    # first prompts the previous cell's (and a shorter ISL a prefix of a longer one), so a server
+    # with a large prefix cache (vLLM APC) skips prefill the other side computes: E4B c64/c128
+    # served ~50% cached prompts on vLLM, ~0% on plow.
+    local seed="${PB_SEED:-$((8193 + conc * 131 + isl * 7 + osl))}"
     mkdir -p "$res"
     echo "$PB_ARM_N" > "$res/$tag.armorder"
     timeout --foreground --kill-after=10s -s TERM "${PB_BENCH_TIMEOUT:-3000}" env VLLM_ROCM_LIB="$lib" "$v" \
         -m vllm.entrypoints.cli.main bench serve \
         --backend vllm --host 127.0.0.1 --port "$PB_SERVER_PORT" --model "$model" \
         --tokenizer "$tokz" --trust-remote-code --dataset-name random \
-        --seed "${PB_SEED:-8193}" --num-prompts "$np" \
+        --seed "$seed" --num-prompts "$np" \
         --random-input-len "$isl" --random-output-len "$osl" --random-range-ratio 0 \
         --max-concurrency "$conc" --request-rate "${PB_RATE:-inf}" --ignore-eos \
         --percentile-metrics ttft,tpot,itl,e2el --save-result --save-detailed \
@@ -425,6 +435,30 @@ pb_bench() {
     local rc=$?
     [ $rc -eq 0 ] || echo "   arm $tag: bench exited $rc (see $res/$tag.bench.log)"
     return $rc
+}
+
+# pb_cell <resdir> <tag> <model> <conc> <nprompts> <isl> <osl> [extra...] — pb_bench bracketed by
+# CELL_BEGIN/CELL_END wall-clock markers in <resdir>/cells.log, which vllm_metrics.py (reference
+# engine steps, prefix-cache hits) and waterfall.py (plow PACKLOG segments) split the run by.
+pb_cell() {
+    local res="$1" tag="$2" rc
+    mkdir -p "$res"
+    echo "CELL_BEGIN $tag $(date +%s.%N)" >> "$res/cells.log"
+    pb_bench "$@"; rc=$?
+    echo "CELL_END $tag $(date +%s.%N)" >> "$res/cells.log"
+    return $rc
+}
+
+# pb_metrics_start <resdir> / pb_metrics_stop — poll a vLLM/SGLang-style /metrics every 50 ms into
+# <resdir>/metrics.tsv for the whole session (scripts/bench/vllm_metrics.py).
+pb_metrics_start() {
+    python3 "$(dirname "${BASH_SOURCE[0]}")/vllm_metrics.py" poll "$PB_SERVER_PORT" "$1/metrics.tsv" &
+    PB_METRICS_PID=$!
+}
+pb_metrics_stop() {
+    [ -n "${PB_METRICS_PID:-}" ] || return 0
+    kill "$PB_METRICS_PID" 2>/dev/null; wait "$PB_METRICS_PID" 2>/dev/null
+    PB_METRICS_PID=
 }
 
 # pb_result <resdir> <tag> — print the result JSON path, wherever the client decided to put it.

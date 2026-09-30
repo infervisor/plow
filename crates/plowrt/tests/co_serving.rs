@@ -69,6 +69,7 @@ fn submit(m: &ModelMux, prompt: u32, n: usize) -> stream::ChunkReceiver {
         },
         arrived: Instant::now(),
         respond: tx,
+        opts: Default::default(),
     })
     .unwrap_or_else(|_| panic!("submit failed"));
     rx

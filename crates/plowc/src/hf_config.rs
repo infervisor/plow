@@ -245,6 +245,16 @@ pub fn synthesize_from_json(json: &str, name: String) -> Result<NetConfig, Strin
 }
 
 /// Derive a URL-safe slug from a directory path.
+/// `org/name` of a Hugging Face hub-cache snapshot (`.../models--org--name/snapshots/<rev>`).
+pub fn hub_repo_id(dir: &Path) -> Option<String> {
+    let snapshots = dir.parent()?;
+    if snapshots.file_name()? != "snapshots" {
+        return None;
+    }
+    let repo = snapshots.parent()?.file_name()?.to_str()?.strip_prefix("models--")?;
+    Some(repo.replacen("--", "/", 1))
+}
+
 pub fn dir_slug(dir: &Path) -> String {
     dir.file_name()
         .map(|n| n.to_string_lossy().to_lowercase())
@@ -2470,5 +2480,15 @@ mod tests {
         assert!(plan.ops.iter().any(|o| o.name == "q_a_proj_L0"));
         assert!(plan.ops.iter().any(|o| o.name == "moe_gate_up_L3"));
         assert!(plan.ops.iter().any(|o| o.name == "lm_head"));
+    }
+
+    #[test]
+    fn hub_repo_id_from_hub_snapshot_only() {
+        use std::path::Path;
+        assert_eq!(
+            hub_repo_id(Path::new("/hf/hub/models--Qwen--Qwen3-ASR-1.7B/snapshots/7278e1e")).as_deref(),
+            Some("Qwen/Qwen3-ASR-1.7B")
+        );
+        assert_eq!(hub_repo_id(Path::new("/work/prep/t3")), None);
     }
 }

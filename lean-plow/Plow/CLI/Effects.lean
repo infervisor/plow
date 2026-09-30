@@ -50,7 +50,7 @@ def checkCompletionCounters {tg : TaskGraph} (p : CounterProtocol tg)
     decide (counter ∈ fences) && decide (0 < producers.length) &&
     decide (p.threshold counter = producers.length))
 
-def run (d : Payload.Deserialized) (paths : List (PathWitness d.taskGraph))
+def run (d : Payload.Deserialized) (w : Witness d.protocol)
     (j : Json) : Except String String := do
   let schema ← j.getObjValAs? Nat "schema"
   if schema != 1 then throw "unsupported memory effects schema"
@@ -69,14 +69,14 @@ def run (d : Payload.Deserialized) (paths : List (PathWitness d.taskGraph))
     for b in leases do
       if !sameGeneration a b && a.pool == b.pool && a.allocation == b.allocation then
         if a.generation < b.generation then
-          if !witnessedBefore d.protocol paths a.retire b.acquire then
+          if !w.before a.retire b.acquire then
             throw "allocation generation reused before prior retirement"
-        else if !witnessedBefore d.protocol paths b.retire a.acquire then
+        else if !w.before b.retire a.acquire then
           throw "allocation generation reused before prior retirement"
-  if !checkRetirements d.protocol paths leases then throw "acquire/cancellation is not ordered before retirement"
-  if !checkAccesses d.protocol paths leases accesses then throw "access has stale generation, wrong owner, bounds or lifetime"
-  if !checkReuse d.protocol paths leases then throw "overlapping allocation reuse is not retired"
-  if !checkConflicts d.protocol paths accesses then throw "RAW/WAR/WAW conflict is not completion-ordered"
+  if !checkRetirements d.protocol w leases then throw "acquire/cancellation is not ordered before retirement"
+  if !checkAccesses d.protocol w leases accesses then throw "access has stale generation, wrong owner, bounds or lifetime"
+  if !checkReuse d.protocol w leases then throw "overlapping allocation reuse is not retired"
+  if !checkConflicts d.protocol w accesses then throw "RAW/WAR/WAW conflict is not completion-ordered"
   return s!"{accesses.length} supplied effects/{leases.length} leases checked by checkConflicts_sound, checkAccesses_sound, checkReuse_sound, cancellation_retired; kernel effect completeness and fence implementation are external obligations"
 
 end Plow.CLI.Effects

@@ -80,15 +80,33 @@ mod decode_object;
 use decode_object::{BoundDecodeObject, DecodeModule};
 mod decode_rung;
 mod mixed_step;
+pub mod packet_exec;
 mod moe_lt;
 mod native_decode;
 mod packed_terminal;
+mod segment_gates;
+mod shared_tail;
 mod token_batch;
 use cublaslt::{CublasLtDecodeRoute, LibraryRoute};
 use decode_rung::{
     decode_rung_index, decode_selection, effective_decode_widths, validate_cublaslt_ladder,
     validate_decode_ladder, validate_moe_lt_ladder, DecodeRung, DecodeSelection,
 };
+
+/// Whether the packet's full caches can be VMM-mapped block by block: a cache head smaller than
+/// one granule cannot, and such a KV is small enough to keep resident.
+pub(crate) fn live_kv_mappable(
+    blob: &DevBlob,
+    manifest: Option<&plow_asset::live_kv::Manifest>,
+    granularity: u64,
+) -> bool {
+    let layout = match manifest {
+        Some(m) => crate::memory::vmm::LiveKvLayout::from_manifest(blob, m),
+        None => crate::memory::vmm::LiveKvLayout::from_blob(blob),
+    };
+    let hint = u64::from(RuntimeConfig::get().vmm_block_mib()) << 20;
+    layout.is_ok_and(|layout| layout.geometry.block_bytes(granularity, hint).is_ok())
+}
 
 pub(crate) fn live_rings_for_capacity(
     configured: bool,
@@ -1684,6 +1702,8 @@ struct SegPf {
     /// Exact packed BF16 HD256/GQA2 local attention. Class-3 segments launch here.
     fa256_gqa2: Option<(KernelFn, u32, u32)>,
     class_policy: crate::asset::devblob::SegmentClassPolicy,
+    /// Both objects skip padding rows whose slot is -1 (`PLOW_NV_MASKED_PADDING`).
+    masked_padding: bool,
     _m_flash: Module,
     _m_gemm: Module,
     _m_fa512: Option<Module>,
@@ -1869,6 +1889,8 @@ struct PrefillBucket {
     qwen_segments: Vec<Option<DevInst64>>,
     packet_segment_roles: Vec<u8>,
     cublaslt_segments: Vec<Option<CublasLtDecodeRoute>>,
+    /// `PLOW_PREFILL_LIGHT`: lone norm / residual / GLU segments as light launches.
+    light_segments: Vec<Option<cublaslt::LightRoute>>,
     /// `PLOW_MOE_PF_LT`: grouped-expert segments served by cuBLASLt grouped matmuls.
     moe_lt_segments: Vec<Option<moe_lt::MoeLtRoute>>,
     /// `PLOW_PF_ATTN_GEMM`: `FlashPrefill` segments served by the vendor-GEMM route.
@@ -2184,6 +2206,8 @@ pub struct GpuEngine {
     routed_decode: Option<Arc<moe_lt::RoutedDecode>>,
     /// Keeps the routed decode object loaded for the rung graphs that captured it.
     _routed_object: Option<Arc<moe_lt::RoutedDecode>>,
+    /// The `_gw` object the widest chain launches instead of `f` (8 rows and up).
+    gemv_wide: Option<Arc<decode_object::BoundDecodeObject>>,
     /// T35 (PLOW_PF_SEG_GRAPH=1): cached instantiated segment-chain graphs, keyed by
     /// (bucket, slot-tensor-base, segment range) — one cuGraphLaunch replaces ~480 kernel
     /// submits. A routed bucket's launches run the ranges between its attention segments.
@@ -2306,6 +2330,14 @@ pub struct GpuEngine {
     /// Per-slot rows served from the prefix cache by the current sequence's
     /// attach (0 = cold). Feeds per-request `usage.cached_tokens`.
     vmm_attached: Vec<u32>,
+    /// Cache rows the next `begin_slot` keeps (a retained session prefix); 0 = start cold.
+    resume_rows: Vec<u32>,
+    /// Smallest `stride - window` over the packet's sliding caches (rings of `stride` rows): a
+    /// retained prefix of `rows` is intact only while the sequence stopped within this many rows
+    /// past it (the VMM prefix cache's `publish_boundary` rule). None: no sliding cache.
+    resume_ring_slack: Option<u32>,
+    /// A session sequence's retire pins its published prefix in the VMM cache for this long.
+    session_pin: Vec<Option<std::time::Duration>>,
     vmm_active: Vec<bool>,
     packed_admission: Vec<PackedAdmission>,
     kv_admission_epoch: u64,
@@ -2345,12 +2377,22 @@ pub struct GpuEngine {
     prefill_turn: usize,
     packed_prefill: Option<plow_asset::packed_prefill::Manifest>,
     packed_terminal: Option<packed_terminal::PackedTerminal>,
+    /// KV-shared tail runner (`plow_asset::kv_shared_tail`) for the token-batch route.
+    shared_tail: Option<shared_tail::SharedTail>,
+    /// Restricts the next `launch_prefill_chain` to these segments.
+    pf_seg_window: Option<std::ops::Range<usize>>,
+    /// The next packed body stops at its bucket's KV-shared tail boundary.
+    pf_seg_prefix: bool,
+    /// `PLOW_PF_ENTRY_TRACE`: per-(segment, block) stamps of a `-DPLOW_NV_ENTRY_TRACE=1` object.
+    entry_trace: Option<DeviceMem>,
     attention_gemm: Option<attention_gemm::AttentionGemm>,
     /// Request table of the prefill launch being enqueued, for `attention_gemm`.
     attention_requests: Vec<attention_gemm::Request>,
     mixed_step: Option<mixed_step::MixedCudaStep>,
     token_batch: Option<token_batch::CudaTokenBatch>,
     kv_admission: Option<crate::sched::admission::KvBudget>,
+    /// Bytes of every batch-major `kv.*` tensor one cache row takes (static per-slot KV).
+    kv_row_bytes: u64,
     slot_generations: Vec<u32>,
 }
 
@@ -3153,20 +3195,69 @@ impl DevSample {
     }
 }
 
+/// Uniform draws per row the sampler slab holds: the widest sampled multi-step quantum.
+const SAMPLE_RNG_STEPS: usize = 64;
+
+/// `plow_logprob_stats` output floats at the widest `top_logprobs`.
+pub const LOGPROB_STATS_MAX: usize = 3 + 2 * crate::text::logprobs::MAX_TOP_LOGPROBS as usize;
+
 /// Device sampler state: the `plow_sample` kernel + its per-slot parameter and
 /// scratch buffers, all sized to the engine batch × vocab at load.
 struct Sampler {
     f: KernelFn,
     _module: Module,
-    /// Pinned staging for the 5 per-slot param arrays `[temp|topk|topp|minp|rng]`
-    /// (each `batch` wide) — one async H2D per step.
+    /// Pinned staging for the per-slot param arrays `[temp|topk|topp|minp|rng]`
+    /// (each `batch` wide) — one async H2D per step. `rng` extends to
+    /// `[SAMPLE_RNG_STEPS][batch]`: a sampled multi-step quantum draws step k from row k.
     params: PinnedHost,
     /// Device copies of the 5 param arrays (contiguous, same layout as `params`).
     d_params: DeviceMem,
     /// `[batch][vocab]` f32 softmax-weight scratch the kernel reuses each pass.
     d_escratch: DeviceMem,
+    /// Block width the object was built for (`plow_sample_threads`; absent on older objects => 256).
+    threads: u32,
     #[allow(dead_code)]
     batch: usize,
+    /// `plow_sample_cfg` (absent on older objects: CFG pairs keep the host draw).
+    f_cfg: Option<KernelFn>,
+    /// `plow_logprob_stats` and its `[3 + 2 * MAX_TOP_LOGPROBS]` f32 output (absent on older
+    /// objects: logprob rows download the whole logits row).
+    lp: Option<(KernelFn, DeviceMem)>,
+    /// `plow_logprob_stats_rows` (absent on older objects: one `lp` launch per row).
+    lp_rows: Option<LpRows>,
+    /// Guided-draw buffers, allocated on the first CFG pair.
+    cfg: Option<CfgSlab>,
+    /// Steps of guided draws staged by [`GpuEngine::stage_cfg`] for the next decode call.
+    cfg_staged: usize,
+}
+
+/// Batched logprob statistics: `[batch][3]` u32 requests (row, token, k) in, `[batch]
+/// [LOGPROB_STATS_MAX]` f32 out, both staged through pinned memory.
+struct LpRows {
+    f: KernelFn,
+    req: PinnedHost,
+    d_req: DeviceMem,
+    out: PinnedHost,
+    d_out: DeviceMem,
+}
+
+/// `plow_sample_cfg` inputs: `[6][batch]` f32 params (flag, weight, penalty, temperature, top_p,
+/// min_p) then `[SAMPLE_RNG_STEPS][batch]` uniforms, and the `[batch][vocab]` u32 history counts.
+struct CfgSlab {
+    host: PinnedHost,
+    dev: DeviceMem,
+    counts: DeviceMem,
+}
+
+/// One CFG owner's guided sampling chain (the device form of `text::sample::CfgParams`;
+/// `temp <= 0` = greedy).
+#[derive(Clone, Copy, Debug)]
+pub struct DevCfg {
+    pub weight: f32,
+    pub penalty: f32,
+    pub temp: f32,
+    pub top_p: f32,
+    pub min_p: f32,
 }
 
 /// Bounded device multi-step state (plan stage 5: `PLOW_MULTISTEP=K`). The
@@ -3189,6 +3280,8 @@ struct MultiStep {
     /// `[batch]` i32 active-row flags (device) + pinned staging.
     d_fed: DeviceMem,
     fed_host: PinnedHost,
+    /// Per-step completion events (alternating) for a quantum that may be cut short.
+    step_done: [CudaEvent; 2],
 }
 
 /// Lookahead-1 decode pipeline (`PLOW_DECODE_PIPELINE`). A queued step is [counter reset ->
@@ -3378,6 +3471,13 @@ impl GpuEngine {
                     .map_err(|e| RuntimeError::Rejected(format!("packed prefill metadata: {e}")))
             })
             .transpose()?;
+        let kv_shared_tail_metadata = blob
+            .reserved_metadata(&raw, plow_asset::kv_shared_tail::SECTION)?
+            .map(|bytes| {
+                serde_json::from_slice::<plow_asset::kv_shared_tail::Manifest>(bytes)
+                    .map_err(|e| RuntimeError::Rejected(format!("kv-shared tail metadata: {e}")))
+            })
+            .transpose()?;
         let config = RuntimeConfig::get();
         let mut packet_max_ctx = blob
             .tensors
@@ -3385,7 +3485,7 @@ impl GpuEngine {
             .find(|t| t.name == "in.pos")
             .map(|t| (t.bytes / 4) as usize)
             .unwrap_or(0);
-        if let Some(want) = config.live_ctx() {
+        if let Some(want) = config.live_ctx_for(assets_dir) {
             if want as usize > packet_max_ctx {
                 if !config.nv_vmm_live() && config.nv_vmm_prefix() != Some(true) {
                     return Err(RuntimeError::Rejected(
@@ -3587,10 +3687,16 @@ impl GpuEngine {
         let kv_maps = kv_tensor_maps(&blob.tensors, &blob.gen, blob.decode_prog()?.t as usize)?;
         let recurrent = recurrent_state_layout(&blob.tensors, blob.decode_prog()?.t as usize)?;
         let configured_multistep = RuntimeConfig::get().multistep();
+        // A ladder routing only its wide rungs keeps multistep: those rungs launch their captured
+        // graphs from the quantum loop, as the MoE-routed rungs do.
+        let cublaslt_every_rung = cublaslt_enabled
+            && (blob.progs.len() - blob.decode_progs().len()..blob.progs.len()).all(|index| {
+                segment_roles.as_ref().is_some_and(|roles| roles.program(index).is_some())
+            });
         let multistep_disabled_by_decode = decode_objects.is_some()
             || prepared_contexts.is_some()
             || !decode_packet_roles.is_empty()
-            || cublaslt_enabled
+            || cublaslt_every_rung
             || recurrent.is_some();
         let effective_multistep = if multistep_disabled_by_decode {
             if configured_multistep > 1 {
@@ -3720,9 +3826,9 @@ impl GpuEngine {
                         .module_global_u32(&module, "plow_arena_bytes")?
                         .unwrap_or(12352),
                 };
-                if smem > 48 * 1024 {
-                    be.set_max_dynamic_smem(f, smem)?;
-                }
+                // Static + dynamic above 48 KiB needs the opt-in even when the dynamic part
+                // alone is under it (wide GV_MM_MAX objects carry ~40 KiB of static smem).
+                be.set_max_dynamic_smem(f, smem)?;
                 let occ = be.occupancy_blocks_per_sm(f, BLOCK, smem as usize)?;
                 let grid = decode_object::initial_grid(
                     decode_objects.as_ref(),
@@ -3843,7 +3949,7 @@ impl GpuEngine {
         let mut vmm = {
             let run = || {
                 let config = RuntimeConfig::get();
-                let live = config.nv_live_kv_enabled(
+                let mut live = config.nv_live_kv_enabled(
                     packed_prefill.is_some(),
                     live_kv_manifest.as_ref().is_some_and(|manifest| {
                         manifest.caches.iter().any(|cache| cache.window == 0)
@@ -3851,7 +3957,14 @@ impl GpuEngine {
                     prefix_requested,
                 );
                 if live && !config.nv_vmm_live() {
-                    tracing::info!("live KV allocation enabled by packet metadata");
+                    let mappable = crate::memory::vmm::VmmOps::granularity(be.as_ref())
+                        .is_ok_and(|gran| live_kv_mappable(&blob, live_kv_manifest.as_ref(), gran));
+                    if mappable {
+                        tracing::info!("live KV allocation enabled by packet metadata");
+                    } else {
+                        tracing::info!("live KV allocation off: cache head below one VMM granule");
+                        live = false;
+                    }
                 }
                 let configured_rings = config.nv_vmm_live_rings();
                 let rings = live_rings_for_capacity(
@@ -4690,8 +4803,80 @@ impl GpuEngine {
         } else {
             0
         };
+        let light_functions = if cublaslt_enabled {
+            cublaslt::light_functions(
+                &be,
+                &module,
+                profile.decode_file.trim_end_matches(".cubin"),
+                smem,
+            )?
+        } else {
+            None
+        };
+        let main_light = light_functions
+            .as_ref()
+            .map_or_else(Vec::new, |f| cublaslt::light_segments(g, &cublaslt_segments, f));
+        let main_fusions = cublaslt::qkv_fusions(g, &cublaslt_segments, &devp, &main_light);
+        // Every routed rung's width, when the widest rung's Lt algorithms are pinned for all of
+        // them (PLOW_LT_RUNG_ALGOS off).
+        let lt_rows: Vec<u32> = if crate::config::RuntimeConfig::get().nv.lt_rung_algos {
+            Vec::new()
+        } else {
+            let first = blob.progs.len() - blob.decode_progs().len();
+            blob.decode_progs()
+                .iter()
+                .enumerate()
+                .filter(|&(index, _)| {
+                    segment_roles
+                        .as_ref()
+                        .and_then(|r| r.program(first + index))
+                        .is_some_and(|p| {
+                            p.roles.iter().copied().any(plow_asset::segment_roles::is_projection)
+                        })
+                })
+                .map(|(_, p)| packet::devbuild::program_rows(p.t))
+                .collect()
+        };
+        // The widest routed rung's unaligned lm_head sizes the head scratch.
+        let head_kernel = match (
+            light_functions.as_ref().and_then(|f| f.head),
+            cublaslt_segments
+                .iter()
+                .flatten()
+                .filter(|s| s.n % 16 != 0)
+                .map(|s| u64::from(s.m) * u64::from(s.n & !15) * 2)
+                .max(),
+        ) {
+            (Some(function), Some(bytes)) => {
+                let rows = u64::from(plow_asset::segment_roles::CUBLASLT_DECODE_MAX_ROWS);
+                let amax = be.alloc(0, rows * 12)?;
+                be.memset_d8(amax.base, 0, (rows * 12) as usize)?;
+                Some(cublaslt::HeadKernel {
+                    be: Arc::clone(&be),
+                    function,
+                    scratch: Arc::new(be.alloc(0, bytes)?),
+                    amax: Some(Arc::new(amax)),
+                })
+            }
+            _ => None,
+        };
+        let main_folds = match &cublaslt {
+            Some(lt) => cublaslt::argmax_folds(g, &cublaslt_segments, &devp, lt, head_kernel.as_ref()),
+            None => Vec::new(),
+        };
+        let qkv_scratch = match main_fusions.iter().map(|f| f.n_total).max() {
+            Some(n) => Some(Arc::new(be.alloc(
+                0,
+                u64::from(plow_asset::segment_roles::CUBLASLT_DECODE_MAX_ROWS) * u64::from(n) * 2,
+            )?)),
+            None => None,
+        };
         let ordered_waits = if cublaslt_enabled {
-            Some(cublaslt::ordered_waits(g, &cublaslt_segments, &[])?)
+            Some(cublaslt::ordered_waits(
+                g,
+                &cublaslt_segments,
+                &[cublaslt::light_instructions(&main_light), cublaslt::fold_instructions(&main_folds)].concat(),
+            )?)
         } else if moe_lt_routed {
             let none = vec![None; moe_lt_segments.len()];
             Some(cublaslt::ordered_waits_for(
@@ -4702,13 +4887,20 @@ impl GpuEngine {
         } else {
             None
         };
-        let cublaslt_decode = if let Some(lt) = &cublaslt {
+        let mut cublaslt_decode = if let Some(lt) = &cublaslt {
             cublaslt::library_routes(cublaslt::prepare_routes(
                 lt,
                 cublaslt_segments,
                 &mut insts,
                 &devp,
                 None,
+                crate::config::RuntimeConfig::get().nv.lt_pair,
+                true,
+                &main_fusions,
+                qkv_scratch.as_deref(),
+                head_kernel.as_ref(),
+                &main_folds,
+                &lt_rows,
             )?)
         } else if moe_lt_routed {
             let routes = moe_lt::decode_routes(
@@ -4789,6 +4981,20 @@ impl GpuEngine {
             n_prefill_rows: 0,
             token_batch: 0,
         };
+        if let Some(functions) = &light_functions {
+            cublaslt::add_light_routes(
+                &mut cublaslt_decode,
+                &be,
+                functions,
+                kernarg,
+                g,
+                &main_light,
+                &main_fusions,
+                qkv_scratch.as_ref(),
+                &main_folds,
+                &devp,
+            );
+        }
 
         let stream = be.stream_create()?;
         // An explicit --nv-smem speaks for every rung; an object without the symbol has one claim.
@@ -4798,27 +5004,70 @@ impl GpuEngine {
                 .module_global_u32(&module, "plow_arena_bytes_narrow")?
                 .map_or(smem, |narrow| narrow.min(smem)),
         };
+        // Rungs of 8 rows and up launch the `_gw` sibling object; those wider than GV_MM_MAX
+        // with its full claim (the wide-GEMV ring). At 2/4 rows the two objects are within ~1%
+        // either way (Chatterbox's CFG pair is 1% faster on the ordinary one).
+        let gemv_wide = match gemv_mm_cap {
+            Some(cap) if decode_objects.is_none() && nv_config.cubin.is_none() && nv_config.kernel.is_none() => {
+                decode_object::load_gemv_wide(
+                    &be,
+                    assets_dir,
+                    profile.decode_file.trim_end_matches(".cubin"),
+                    &module,
+                    grid,
+                )?
+                .map(|object| (cap as usize, object))
+            }
+            _ => None,
+        };
+        let wide_object = |rows: usize| {
+            gemv_wide.as_ref().filter(|_| rows >= 8).map(|(cap, (narrow, full))| {
+                Arc::clone(if rows > *cap { full } else { narrow })
+            })
+        };
         let decode_rungs = if select_decode_rungs {
             blob.decode_progs()[..blob.decode_progs().len() - 1]
                 .iter()
                 .enumerate()
                 .map(|(index, g)| {
-                    let mut rung = if let Some(lt) = &cublaslt {
-                        let roles = &segment_roles
-                            .as_ref()
-                            .unwrap()
-                            .program(blob.progs.len() - blob.decode_progs().len() + index)
-                            .unwrap()
-                            .roles;
+                    let program = blob.progs.len() - blob.decode_progs().len() + index;
+                    let projection_roles = segment_roles
+                        .as_ref()
+                        .and_then(|r| r.program(program))
+                        .map(|p| &p.roles)
+                        .filter(|roles| {
+                            roles.iter().copied().any(plow_asset::segment_roles::is_projection)
+                        });
+                    let mut rung = if let (Some(lt), Some(roles)) = (&cublaslt, projection_roles) {
                         let segments = cublaslt::decode_segments(g, &blob.tensors, roles)?;
-                        let waits = cublaslt::ordered_waits(g, &segments, &[])?;
+                        let light = light_functions
+                            .as_ref()
+                            .map_or_else(Vec::new, |f| cublaslt::light_segments(g, &segments, f));
+                        let folds = cublaslt::argmax_folds(g, &segments, &devp, lt, head_kernel.as_ref());
+                        let waits = cublaslt::ordered_waits(
+                            g,
+                            &segments,
+                            &[cublaslt::light_instructions(&light), cublaslt::fold_instructions(&folds)].concat(),
+                        )?;
                         let mut insts = g.insts.clone();
+                        let fusions = if qkv_scratch.is_some() {
+                            cublaslt::qkv_fusions(g, &segments, &devp, &light)
+                        } else {
+                            Vec::new()
+                        };
                         let routes = cublaslt::prepare_routes(
                             lt,
                             segments,
                             &mut insts,
                             &devp,
                             Some(&cublaslt_decode),
+                            crate::config::RuntimeConfig::get().nv.lt_pair,
+                            true,
+                            &fusions,
+                            qkv_scratch.as_deref(),
+                            head_kernel.as_ref(),
+                            &folds,
+                            &[],
                         )?;
                         let mut rung = DecodeRung::upload_with_insts(
                             &be,
@@ -4828,14 +5077,32 @@ impl GpuEngine {
                             &waits,
                             &g.gq_seg_ofs,
                         )?;
+                        // The interpreter windows run the rung's own object (the `_gw` arms).
+                        let (function, smem) = wide_object(g.t as usize)
+                            .map_or((f, smem), |object| (object.function, object.smem));
+                        let mut routes = cublaslt::library_routes(routes);
+                        if let Some(functions) = &light_functions {
+                            cublaslt::add_light_routes(
+                                &mut routes,
+                                &be,
+                                functions,
+                                rung.kernarg,
+                                g,
+                                &light,
+                                &fusions,
+                                qkv_scratch.as_ref(),
+                                &folds,
+                                &devp,
+                            );
+                        }
                         rung.library = Some(cublaslt::CublasLtDecodeGraph::capture(
                             &be,
                             &stream,
                             rung.kernarg,
-                            f,
+                            function,
                             grid,
                             smem,
-                            cublaslt::library_routes(routes),
+                            routes,
                         )?);
                         rung
                     } else if let Some(roles) = segment_roles
@@ -4909,6 +5176,7 @@ impl GpuEngine {
                     } else {
                         DecodeRung::upload(&be, g, kernarg)?
                     };
+                    rung.object = wide_object(rung.rows);
                     if let (Some(metadata), Some(objects)) = (&decode_objects, &bound_objects) {
                         rung.object = Some(Arc::clone(&objects[&metadata.programs[index].object]));
                         tracing::info!(
@@ -5158,6 +5426,7 @@ impl GpuEngine {
                 packed_prefill.as_ref(),
                 cublaslt_prefill.as_ref(),
                 moe_lt_decode.clone(),
+                light_functions.as_ref().and_then(|f| f.prefill),
             ) {
                 Ok((f_pf, smem_pf, module_pf, buckets, seg_pf, grid_pf)) => {
                     tracing::info!(
@@ -5931,6 +6200,12 @@ impl GpuEngine {
                 })
             });
 
+        let resume_ring_slack = live_kv_manifest
+            .clone()
+            .or_else(|| blob.with_packet_view(plow_asset::live_kv::emit).ok())
+            .and_then(|m| {
+                m.caches.iter().filter(|c| c.window > 0).map(|c| c.stride.saturating_sub(c.window)).min()
+            });
         let mut engine = GpuEngine {
             be,
             f,
@@ -5951,6 +6226,7 @@ impl GpuEngine {
             moe_lt_decode: moe_lt_routed,
             routed_decode: routed_widest,
             _routed_object: routed_decode,
+            gemv_wide: wide_object(blob.decode_progs().last().map_or(1, |g| g.t as usize)),
             decode_packet_roles,
             seg_graphs: std::collections::HashMap::new(),
             smem_pf,
@@ -6000,6 +6276,9 @@ impl GpuEngine {
             batch,
             pos: vec![0; batch],
             vmm_attached: vec![0; batch],
+            resume_rows: vec![0; batch],
+            resume_ring_slack,
+            session_pin: vec![None; batch],
             vmm_active: vec![false; batch],
             packed_admission: vec![PackedAdmission::Pending; batch],
             kv_admission_epoch: 0,
@@ -6017,14 +6296,28 @@ impl GpuEngine {
             prefill_turn: 0,
             packed_prefill,
             packed_terminal: None,
+            shared_tail: None,
+            pf_seg_window: None,
+            pf_seg_prefix: false,
+            entry_trace: None,
             attention_gemm,
             attention_requests: Vec::new(),
             mixed_step,
             token_batch: None,
             kv_admission,
+            kv_row_bytes: blob
+                .tensors
+                .iter()
+                .filter(|t| t.name.starts_with("kv."))
+                .map(|t| t.bytes)
+                .sum::<u64>()
+                .checked_div(batch as u64 * (blob.tensors[t_pos].bytes / 4))
+                .unwrap_or(0),
             slot_generations: vec![0; batch],
         };
         engine.packed_terminal = packed_terminal::PackedTerminal::load(&engine)?;
+        engine.shared_tail =
+            shared_tail::SharedTail::load(&engine, &blob, kv_shared_tail_metadata.as_ref())?;
         engine.token_batch = token_batch::CudaTokenBatch::load(&engine);
         if config.token_batch {
             tracing::info!(
@@ -6230,17 +6523,40 @@ impl GpuEngine {
             .clone()
             .unwrap_or_else(|| "plow_sample".into());
         let f = be.get_function(&module, &kname)?;
-        let params = be.host_alloc_pinned(5 * batch * 4)?;
-        let d_params = be.alloc(0, (5 * batch * 4) as u64)?;
+        let threads = be.module_global_u32(&module, "plow_sample_threads")?.unwrap_or(256);
+        let slab = (4 + SAMPLE_RNG_STEPS) * batch * 4;
+        let params = be.host_alloc_pinned(slab)?;
+        let d_params = be.alloc(0, slab as u64)?;
         let d_escratch = be.alloc(0, (batch * vocab * 4) as u64)?;
-        tracing::info!(cubin = %cubin.display(), "device sampler enabled (PLOW_DEV_SAMPLE=1)");
+        let f_cfg = be.get_function(&module, "plow_sample_cfg").ok();
+        let lp = match be.get_function(&module, "plow_logprob_stats") {
+            Ok(f) => Some((f, be.alloc(0, (LOGPROB_STATS_MAX * 4) as u64)?)),
+            Err(_) => None,
+        };
+        let lp_rows = match be.get_function(&module, "plow_logprob_stats_rows") {
+            Ok(f) => Some(LpRows {
+                f,
+                req: be.host_alloc_pinned(batch * 3 * 4)?,
+                d_req: be.alloc(0, (batch * 3 * 4) as u64)?,
+                out: be.host_alloc_pinned(batch * LOGPROB_STATS_MAX * 4)?,
+                d_out: be.alloc(0, (batch * LOGPROB_STATS_MAX * 4) as u64)?,
+            }),
+            Err(_) => None,
+        };
+        tracing::info!(cubin = %cubin.display(), cfg = f_cfg.is_some(), "device sampler enabled (PLOW_DEV_SAMPLE=1)");
         Ok(Some(Sampler {
             f,
             _module: module,
             params,
             d_params,
             d_escratch,
+            threads,
             batch,
+            f_cfg,
+            lp,
+            lp_rows,
+            cfg: None,
+            cfg_staged: 0,
         }))
     }
 
@@ -6317,6 +6633,7 @@ impl GpuEngine {
             ring_host,
             d_fed,
             fed_host,
+            step_done: [be.event_create(false)?, be.event_create(false)?],
         }))
     }
 
@@ -6332,6 +6649,10 @@ impl GpuEngine {
     /// drives (the compiled `PLOW_DECODE_BATCH`).
     pub fn batch(&self) -> usize {
         self.batch
+    }
+
+    pub fn kv_row_bytes(&self) -> u64 {
+        self.kv_row_bytes
     }
 
     pub fn kv_admission(&self) -> Option<crate::sched::admission::KvBudget> {
@@ -6372,6 +6693,7 @@ impl GpuEngine {
     /// reset — `in.kvlen` bounds what the attention reads, so rewinding
     /// `pos[b]` to 0 makes the slot's old cache rows unreachable.
     pub fn begin_slot(&mut self, b: usize, total: usize) -> Result<()> {
+        let keep = self.resume_rows.get_mut(b).map_or(0, std::mem::take);
         if b >= self.batch {
             return Err(RuntimeError::Rejected(format!(
                 "slot {b} out of range (engine batch {})",
@@ -6407,7 +6729,8 @@ impl GpuEngine {
         if crate::config::RuntimeConfig::get().prefix_cache_output() {
             self.vmm_publish(b, self.pos[b]);
         }
-        self.pos[b] = 0;
+        self.pos[b] = keep;
+        self.session_pin[b] = None;
         self.vmm_attached[b] = 0;
         if let Some(v) = &self.vmm {
             self.vmm_active[b] = true;
@@ -6419,6 +6742,49 @@ impl GpuEngine {
             }
         }
         Ok(())
+    }
+
+    /// Bench-only: move slot `b` back to position `len` (at most its current one), keeping the
+    /// cache rows below it, so repeated timed steps read the same kv length.
+    pub fn rewind_slot(&mut self, b: usize, len: usize) -> Result<()> {
+        if self.recurrent.is_some() || len > self.pos[b] as usize {
+            return Err(RuntimeError::Rejected("rewind_slot: unsupported slot state".into()));
+        }
+        // VMM rows below the old position stay mapped; only the prefix history shrinks with it.
+        self.seq_tokens[b].truncate(len);
+        self.pos[b] = len as _;
+        Ok(())
+    }
+
+    /// Whether a finished sequence's cache rows survive in its slot until the next `begin_slot`:
+    /// static per-slot KV (no VMM mappings to drop, no recurrent state to reset).
+    pub fn slot_resume_supported(&self) -> bool {
+        self.vmm.is_none() && self.recurrent.is_none()
+    }
+
+    /// Make the next `begin_slot(b, ..)` keep slot `b`'s first `rows` cache rows (a retained
+    /// session prefix) and start its sequence there. Refused (the sequence starts cold) unless the
+    /// slot still holds that many rows.
+    pub fn resume_slot(&mut self, b: usize, rows: usize) -> bool {
+        let ok = self.slot_resume_supported()
+            && b < self.batch
+            && rows <= self.pos[b] as usize
+            && rows < self.max_ctx
+            && self.resume_ring_slack.is_none_or(|s| self.pos[b] as usize - rows <= s as usize)
+            && self.pipe.as_ref().is_none_or(|p| !p.holds(b));
+        if let Some(r) = self.resume_rows.get_mut(b) {
+            *r = if ok { rows as u32 } else { 0 };
+        }
+        ok
+    }
+
+    /// Slot `b`'s current sequence belongs to a session: when it retires, its published prefix
+    /// (prompt and, with `PLOW_PREFIX_CACHE_OUTPUT`, output blocks) is pinned for `ttl` in the VMM
+    /// prefix cache, evicted only after every unpinned block.
+    pub fn hold_session_prefix(&mut self, b: usize, ttl: std::time::Duration) {
+        if self.vmm_prefix_enabled() && b < self.batch {
+            self.session_pin[b] = Some(ttl);
+        }
     }
 
     pub fn retire_slot(&mut self, b: usize, cache_output: bool) {
@@ -6436,6 +6802,9 @@ impl GpuEngine {
         }
         if cache_output && crate::config::RuntimeConfig::get().prefix_cache_output() {
             self.vmm_publish(b, self.pos[b]);
+        }
+        if let (Some(ttl), Some(v)) = (self.session_pin[b].take(), self.vmm.as_ref()) {
+            v.kv.pin_prefix(&self.seq_tokens[b], std::time::Instant::now() + ttl);
         }
         self.pos[b] = 0;
         self.vmm_attached[b] = 0;
@@ -6507,14 +6876,25 @@ impl GpuEngine {
                 }
             }
         }
+        let host_t = pf_packlog_on().then(std::time::Instant::now);
+        let mut marks = [0u64; 3];
         let started = (|| {
             self.begin_slot(b, total)?;
+            if let Some(t) = host_t {
+                marks[0] = t.elapsed().as_nanos() as u64;
+            }
             let frontier = self.attach_prompt(b, prompt)?;
+            if let Some(t) = host_t {
+                marks[1] = t.elapsed().as_nanos() as u64;
+            }
             if let Some(v) = self.vmm.as_ref().filter(|v| v.kv.prefix_reuse()) {
                 // Wider decode rungs write idle rows too. Reserve those before
                 // one request can consume their remaining physical pages.
                 for slot in 0..self.batch {
                     v.kv.ensure_rows(slot, 1)?;
+                }
+                if let Some(t) = host_t {
+                    marks[2] = t.elapsed().as_nanos() as u64;
                 }
                 let margin = (v.kv.block_rows() as usize).max(self.pf_max_rows());
                 let rows = total.saturating_add(margin).min(self.max_ctx);
@@ -6522,6 +6902,18 @@ impl GpuEngine {
             }
             Ok(frontier)
         })();
+        if let Some(t) = host_t {
+            let us = |ns: u64| ns as f64 / 1e3;
+            let end = t.elapsed().as_nanos() as u64;
+            eprintln!(
+                "PACKLOG ADMIT slot={} begin_us={:.0} attach_us={:.0} ensure_all_us={:.0} ensure_rows_us={:.0}",
+                b,
+                us(marks[0]),
+                us(marks[1].saturating_sub(marks[0])),
+                us(marks[2].saturating_sub(marks[1])),
+                us(end.saturating_sub(marks[2].max(marks[1])))
+            );
+        }
         match started {
             Ok(frontier) => {
                 self.packed_admission[b] = PackedAdmission::Ready;
@@ -6663,6 +7055,7 @@ impl GpuEngine {
         toks: &mut Vec<u32>,
     ) -> Result<()> {
         toks.clear();
+        let cfg_steps = self.take_cfg_staged();
         if feeds.is_empty() {
             return Ok(());
         }
@@ -6815,11 +7208,11 @@ impl GpuEngine {
                     rng[b] = specs[b].rng01;
                 }
             }
-            let (sf, sdp, ses) = (smp.f, smp.d_params.base, smp.d_escratch.base);
+            let (sf, sdp, ses, sthreads) = (smp.f, smp.d_params.base, smp.d_escratch.base, smp.threads);
             // SAFETY: pinned slab lives on self past the synchronize.
             unsafe {
                 self.be
-                    .memcpy_htod_async(sdp, smp.params.as_slice(), &self.stream)?;
+                    .memcpy_htod_async(sdp, &smp.params.as_slice()[..5 * bsz * 4], &self.stream)?;
             }
             let dp = |k: u64| sdp + k * (bsz * 4) as u64;
             let mut a_logits = self.devp[self.t_logits].base;
@@ -6840,7 +7233,10 @@ impl GpuEngine {
                 &mut a_b as *mut u32 as *mut std::ffi::c_void,
             ];
             self.be
-                .launch_kernel(sf, bsz as u32, 256, 0, &mut a, Some(&self.stream))?;
+                .launch_kernel(sf, bsz as u32, sthreads, 0, &mut a, Some(&self.stream))?;
+        }
+        if cfg_steps > 0 {
+            self.launch_cfg(0)?;
         }
 
         // Token readback: `in.ids` (rewritten by `ARGMAX_FIN`, or by the
@@ -7152,7 +7548,8 @@ impl GpuEngine {
     }
 
     /// Bounded device multi-step decode (plan stage 5; `PLOW_MULTISTEP=K`).
-    /// GREEDY only. Runs a K-token quantum for every fed row with ONE host
+    /// Greedy here; [`Self::multi_step_sampled_at_most`] adds device sampling.
+    /// Runs a K-token quantum for every fed row with ONE host
     /// sync: the host uploads ids/pos/kvlen ONCE, then enqueues
     /// `[memset → decode → advance] × K` on the stream — the `plow_advance`
     /// kernel advances each row's device-owned pos/kvlen and appends its token
@@ -7171,7 +7568,35 @@ impl GpuEngine {
         requested: usize,
         out: &mut Vec<u32>,
     ) -> Result<usize> {
+        self.multi_step_sampled_at_most(feeds, requested, None, None, out)
+    }
+
+    /// Whether a quantum can sample on the device (sampler loaded).
+    pub fn multistep_sampling(&self) -> bool {
+        self.sampler.is_some() && self.multistep.is_some()
+    }
+
+    /// [`Self::multi_step_at_most`] with device sampling: `sample = (specs, rng)` where `specs`
+    /// is batch-wide ([`Self::step_slots_sampled`]'s contract; `rng01` ignored) and `rng(slot,
+    /// k)` is the uniform for the row's k-th token of this quantum. `plow_sample` runs between
+    /// each decode and `plow_advance`, so the sampled token is what advance appends and feeds.
+    ///
+    /// `cut`: polled after each step retires (the next one already queued, so the device never
+    /// waits on it); `true` ends the quantum there. A CFG quantum is not cut.
+    pub fn multi_step_sampled_at_most(
+        &mut self,
+        feeds: &[(usize, u32)],
+        requested: usize,
+        sample: Option<(&[DevSample], &dyn Fn(usize, usize) -> f32)>,
+        cut: Option<&dyn Fn() -> bool>,
+        out: &mut Vec<u32>,
+    ) -> Result<usize> {
         out.clear();
+        let cfg_steps = self.take_cfg_staged();
+        let sample = sample.filter(|(specs, _)| specs.iter().any(|s| s.temp > 0.0));
+        if sample.is_some() && self.sampler.is_none() {
+            return Err(RuntimeError::Rejected("sampled multi-step needs the device sampler".into()));
+        }
         let Some(ms) = self.multistep.as_ref() else {
             return Err(RuntimeError::Rejected("multi-step not enabled".into()));
         };
@@ -7180,8 +7605,8 @@ impl GpuEngine {
             feeds.iter().map(|&(slot, _)| slot),
             &self.pos,
             self.max_ctx,
-            requested,
-            ms.quantum,
+            if cfg_steps > 0 { requested.min(cfg_steps) } else { requested },
+            if sample.is_some() { ms.quantum.min(SAMPLE_RNG_STEPS) } else { ms.quantum },
         )
         .map_err(|error| RuntimeError::Rejected(error.to_string()))?;
         if k == 0 {
@@ -7254,11 +7679,76 @@ impl GpuEngine {
             )?;
         }
 
-        // Enqueue [memset → decode → advance] × K on the stream — no sync.
+        // Sampled quantum: params and all K rows of uniforms go up once.
+        let sampler_args = if let Some((specs, rng)) = sample {
+            debug_assert_eq!(specs.len(), bsz, "specs must be batch-wide");
+            let smp = self.sampler.as_mut().expect("checked");
+            {
+                let raw = smp.params.as_mut_slice();
+                let (s_temp, r) = raw.split_at_mut(bsz * 4);
+                let (s_topk, r) = r.split_at_mut(bsz * 4);
+                let (s_topp, r) = r.split_at_mut(bsz * 4);
+                let (s_minp, s_rng) = r.split_at_mut(bsz * 4);
+                let temp: &mut [f32] = bytemuck::cast_slice_mut(s_temp);
+                let topk: &mut [i32] = bytemuck::cast_slice_mut(s_topk);
+                let topp: &mut [f32] = bytemuck::cast_slice_mut(s_topp);
+                let minp: &mut [f32] = bytemuck::cast_slice_mut(s_minp);
+                let rngs: &mut [f32] = bytemuck::cast_slice_mut(&mut s_rng[..k * bsz * 4]);
+                for b in 0..bsz {
+                    temp[b] = specs[b].temp;
+                    topk[b] = specs[b].top_k;
+                    topp[b] = specs[b].top_p;
+                    minp[b] = specs[b].min_p;
+                    for step in 0..k {
+                        rngs[step * bsz + b] = if specs[b].temp > 0.0 { rng(b, step) } else { 0.0 };
+                    }
+                }
+            }
+            // SAFETY: pinned slab lives on self past the synchronize.
+            unsafe {
+                self.be.memcpy_htod_async(
+                    smp.d_params.base,
+                    &smp.params.as_slice()[..(4 + k) * bsz * 4],
+                    &self.stream,
+                )?;
+            }
+            Some((smp.f, smp.d_params.base, smp.d_escratch.base, smp.threads))
+        } else {
+            None
+        };
+
+        // Enqueue [memset → decode → (sample) → advance] × K on the stream — no sync.
         let advance_grid = (bsz as u32).div_ceil(256);
+        let cut = cut.filter(|_| cfg_steps == 0 && k > 1);
+        let mut done = k;
         for step in 0..k {
             self.reset_selected_decode_counters(rung)?;
             self.launch_selected_decode(rung)?;
+            if let Some((sf, sdp, ses, sthreads)) = sampler_args {
+                let dp = |j: u64| sdp + j * (bsz * 4) as u64;
+                let mut a_logits = self.devp[self.t_logits].base;
+                let mut a_ids = self.devp[self.t_ids].base;
+                let (mut a_temp, mut a_topk, mut a_topp, mut a_minp) = (dp(0), dp(1), dp(2), dp(3));
+                let (mut a_rng, mut a_es) = (dp(4 + step as u64), ses);
+                let (mut a_v, mut a_b) = (self.vocab as u32, bsz as u32);
+                let mut a = [
+                    &mut a_logits as *mut u64 as *mut std::ffi::c_void,
+                    &mut a_ids as *mut u64 as *mut std::ffi::c_void,
+                    &mut a_temp as *mut u64 as *mut std::ffi::c_void,
+                    &mut a_topk as *mut u64 as *mut std::ffi::c_void,
+                    &mut a_topp as *mut u64 as *mut std::ffi::c_void,
+                    &mut a_minp as *mut u64 as *mut std::ffi::c_void,
+                    &mut a_rng as *mut u64 as *mut std::ffi::c_void,
+                    &mut a_es as *mut u64 as *mut std::ffi::c_void,
+                    &mut a_v as *mut u32 as *mut std::ffi::c_void,
+                    &mut a_b as *mut u32 as *mut std::ffi::c_void,
+                ];
+                self.be
+                    .launch_kernel(sf, bsz as u32, sthreads, 0, &mut a, Some(&self.stream))?;
+            }
+            if cfg_steps > 0 {
+                self.launch_cfg(step)?;
+            }
             let mut a_ids = self.devp[self.t_ids].base;
             let mut a_pos = self.devp[self.t_pos].base;
             let mut a_kvl = self.devp[self.t_kvlen].base;
@@ -7277,7 +7767,20 @@ impl GpuEngine {
             ];
             self.be
                 .launch_kernel(f_adv, advance_grid, 256, 0, &mut a, Some(&self.stream))?;
+            if let Some(cut) = cut {
+                let ms = self.multistep.as_ref().expect("checked");
+                self.be.event_record(&ms.step_done[step % 2], &self.stream)?;
+                if step >= 1 && step + 1 < k {
+                    self.be.event_synchronize(&ms.step_done[(step - 1) % 2])?;
+                    if cut() {
+                        done = step + 1;
+                        break;
+                    }
+                }
+            }
         }
+        let k_ring = k;
+        let k = done;
 
         // One D2H of the whole ring, then the single sync.
         // SAFETY: ring_host lives on self past the synchronize.
@@ -7309,7 +7812,7 @@ impl GpuEngine {
             out.reserve(feeds.len() * k);
             for &(b, _) in feeds {
                 for step in 0..k {
-                    out.push(ring[b * k + step] as u32);
+                    out.push(ring[b * k_ring + step] as u32);
                 }
             }
         }
@@ -7758,6 +8261,185 @@ impl GpuEngine {
         self.sampler.is_some()
     }
 
+    /// Whether CFG pairs (conditional row b, unconditional row b + 1) can draw on the device.
+    pub fn cfg_sampling(&self) -> bool {
+        self.sampler.as_ref().is_some_and(|s| s.f_cfg.is_some())
+    }
+
+    fn cfg_slab(&mut self) -> Result<&mut CfgSlab> {
+        let (bsz, vocab) = (self.batch, self.vocab);
+        let smp = self
+            .sampler
+            .as_mut()
+            .filter(|s| s.f_cfg.is_some())
+            .ok_or_else(|| RuntimeError::Rejected("no device CFG sampler".into()))?;
+        if smp.cfg.is_none() {
+            let bytes = (6 + SAMPLE_RNG_STEPS) * bsz * 4;
+            smp.cfg = Some(CfgSlab {
+                host: self.be.host_alloc_pinned(bytes)?,
+                dev: self.be.alloc(0, bytes as u64)?,
+                counts: self.be.alloc(0, (bsz * vocab * 4) as u64)?,
+            });
+        }
+        Ok(smp.cfg.as_mut().expect("allocated"))
+    }
+
+    /// Reset CFG owner `slot`'s device penalty history to the occurrence counts of `history`.
+    pub fn cfg_seed_history(&mut self, slot: usize, history: impl IntoIterator<Item = u32>) -> Result<()> {
+        let vocab = self.vocab;
+        if slot >= self.batch {
+            return Err(RuntimeError::Rejected(format!("CFG slot {slot} out of range")));
+        }
+        let mut row = vec![0u32; vocab];
+        for t in history {
+            if let Some(c) = row.get_mut(t as usize) {
+                *c += 1;
+            }
+        }
+        let base = self.cfg_slab()?.counts.base + (slot * vocab * 4) as u64;
+        self.be.memcpy_htod(base, bytemuck::cast_slice(&row))?;
+        self.be.synchronize()
+    }
+
+    /// Stage guided draws for the next [`Self::step_slots_sampled`] (`steps == 1`) or
+    /// [`Self::multi_step_sampled_at_most`] (up to `steps` tokens): `rows` are the CFG owners, and
+    /// `draws[r * steps + k]` is owner `r`'s uniform for its k-th token. After the decode (and
+    /// `plow_sample`), `plow_sample_cfg` writes each owner's token to both members' `in.ids`.
+    pub fn stage_cfg(&mut self, rows: &[(usize, DevCfg)], draws: &[f32], steps: usize) -> Result<()> {
+        let bsz = self.batch;
+        if steps == 0 || steps > SAMPLE_RNG_STEPS || draws.len() != rows.len() * steps {
+            return Err(RuntimeError::Rejected("stage_cfg: bad draw extent".into()));
+        }
+        if rows.iter().any(|&(b, _)| b + 1 >= bsz) {
+            return Err(RuntimeError::Rejected("stage_cfg: CFG owner without a partner row".into()));
+        }
+        self.cfg_slab()?;
+        let smp = self.sampler.as_mut().expect("cfg_slab checked");
+        let slab = smp.cfg.as_mut().expect("allocated");
+        let raw: &mut [f32] = bytemuck::cast_slice_mut(slab.host.as_mut_slice());
+        let (prm, rng) = raw.split_at_mut(6 * bsz);
+        prm[..bsz].fill(0.0);
+        for (r, &(b, c)) in rows.iter().enumerate() {
+            for (j, v) in [1.0, c.weight, c.penalty, c.temp, c.top_p, c.min_p].into_iter().enumerate() {
+                prm[j * bsz + b] = v;
+            }
+            for k in 0..steps {
+                rng[k * bsz + b] = draws[r * steps + k];
+            }
+        }
+        let n = (6 + steps) * bsz * 4;
+        // SAFETY: the pinned slab lives on self past the step's synchronize.
+        unsafe {
+            self.be.memcpy_htod_async(slab.dev.base, &slab.host.as_slice()[..n], &self.stream)?;
+        }
+        smp.cfg_staged = steps;
+        Ok(())
+    }
+
+    /// Enqueue `plow_sample` over the first `specs.len()` rows of `act.logits`, overwriting those
+    /// `in.ids` entries (the compact terminal's layout: sample row r at logits row r). The caller
+    /// reads `in.ids` back after it, on the same stream.
+    pub(crate) fn launch_sampler_rows(&mut self, specs: &[DevSample]) -> Result<()> {
+        let bsz = self.batch;
+        let rows = specs.len();
+        let Some(smp) = self.sampler.as_mut() else {
+            return Err(RuntimeError::Rejected("device sampler not loaded".into()));
+        };
+        if rows == 0 || rows > bsz {
+            return Err(RuntimeError::Rejected(format!("sampler rows {rows} outside 1..={bsz}")));
+        }
+        {
+            let raw = smp.params.as_mut_slice();
+            let (s_temp, r) = raw.split_at_mut(bsz * 4);
+            let (s_topk, r) = r.split_at_mut(bsz * 4);
+            let (s_topp, r) = r.split_at_mut(bsz * 4);
+            let (s_minp, s_rng) = r.split_at_mut(bsz * 4);
+            let temp: &mut [f32] = bytemuck::cast_slice_mut(s_temp);
+            let topk: &mut [i32] = bytemuck::cast_slice_mut(s_topk);
+            let topp: &mut [f32] = bytemuck::cast_slice_mut(s_topp);
+            let minp: &mut [f32] = bytemuck::cast_slice_mut(s_minp);
+            let rng: &mut [f32] = bytemuck::cast_slice_mut(s_rng);
+            for (b, s) in specs.iter().enumerate() {
+                temp[b] = s.temp;
+                topk[b] = s.top_k;
+                topp[b] = s.top_p;
+                minp[b] = s.min_p;
+                rng[b] = s.rng01;
+            }
+        }
+        let (sf, sdp, ses, sthreads) = (smp.f, smp.d_params.base, smp.d_escratch.base, smp.threads);
+        // SAFETY: the pinned slab lives on self; every caller synchronizes the stream before the
+        // slab is written again.
+        unsafe {
+            self.be
+                .memcpy_htod_async(sdp, &smp.params.as_slice()[..5 * bsz * 4], &self.stream)?;
+        }
+        let dp = |k: u64| sdp + k * (bsz * 4) as u64;
+        let mut a_logits = self.devp[self.t_logits].base;
+        let mut a_ids = self.devp[self.t_ids].base;
+        let (mut a_temp, mut a_topk, mut a_topp) = (dp(0), dp(1), dp(2));
+        let (mut a_minp, mut a_rng, mut a_es) = (dp(3), dp(4), ses);
+        let (mut a_v, mut a_b) = (self.vocab as u32, rows as u32);
+        let mut a = [
+            &mut a_logits as *mut u64 as *mut std::ffi::c_void,
+            &mut a_ids as *mut u64 as *mut std::ffi::c_void,
+            &mut a_temp as *mut u64 as *mut std::ffi::c_void,
+            &mut a_topk as *mut u64 as *mut std::ffi::c_void,
+            &mut a_topp as *mut u64 as *mut std::ffi::c_void,
+            &mut a_minp as *mut u64 as *mut std::ffi::c_void,
+            &mut a_rng as *mut u64 as *mut std::ffi::c_void,
+            &mut a_es as *mut u64 as *mut std::ffi::c_void,
+            &mut a_v as *mut u32 as *mut std::ffi::c_void,
+            &mut a_b as *mut u32 as *mut std::ffi::c_void,
+        ];
+        self.be
+            .launch_kernel(sf, rows as u32, sthreads, 0, &mut a, Some(&self.stream))
+    }
+
+    /// Draw rows `0..specs.len()` of `act.logits` on the device and wait for the tokens.
+    pub fn sample_rows_on_device(&mut self, specs: &[DevSample], out: &mut [u32]) -> Result<()> {
+        self.launch_sampler_rows(specs)?;
+        self.be.stream_synchronize(&self.stream)?;
+        let mut raw = vec![0u8; specs.len() * 4];
+        self.be.download(&self.devp[self.t_ids], 0, &mut raw)?;
+        for (o, c) in out.iter_mut().zip(raw.chunks_exact(4)) {
+            *o = u32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+        }
+        Ok(())
+    }
+
+    /// Steps of guided draws staged for this decode call (consumed: the next call stages anew).
+    fn take_cfg_staged(&mut self) -> usize {
+        self.sampler.as_mut().map_or(0, |s| std::mem::take(&mut s.cfg_staged))
+    }
+
+    /// Launch the staged guided draw for quantum step `step`.
+    fn launch_cfg(&mut self, step: usize) -> Result<()> {
+        let bsz = self.batch;
+        let smp = self.sampler.as_ref().expect("staged");
+        let (Some(f), Some(slab)) = (smp.f_cfg, smp.cfg.as_ref()) else {
+            return Err(RuntimeError::Rejected("CFG draw staged without the device CFG sampler".into()));
+        };
+        let mut a_logits = self.devp[self.t_logits].base;
+        let mut a_ids = self.devp[self.t_ids].base;
+        let mut a_prm = slab.dev.base;
+        let mut a_rng = slab.dev.base + ((6 + step) * bsz * 4) as u64;
+        let mut a_cnt = slab.counts.base;
+        let mut a_es = smp.d_escratch.base;
+        let (mut a_v, mut a_b) = (self.vocab as u32, bsz as u32);
+        let mut a = [
+            &mut a_logits as *mut u64 as *mut std::ffi::c_void,
+            &mut a_ids as *mut u64 as *mut std::ffi::c_void,
+            &mut a_prm as *mut u64 as *mut std::ffi::c_void,
+            &mut a_rng as *mut u64 as *mut std::ffi::c_void,
+            &mut a_cnt as *mut u64 as *mut std::ffi::c_void,
+            &mut a_es as *mut u64 as *mut std::ffi::c_void,
+            &mut a_v as *mut u32 as *mut std::ffi::c_void,
+            &mut a_b as *mut u32 as *mut std::ffi::c_void,
+        ];
+        self.be.launch_kernel(f, bsz as u32, smp.threads, 0, &mut a, Some(&self.stream))
+    }
+
     /// Whether packet-selected or legacy opt-in cross-request prefill is active.
     /// The mux routes all prefill through [`Self::prefill_batched`] and takes
     /// each request's first token from a decode step of its last prompt token.
@@ -7852,6 +8534,7 @@ impl GpuEngine {
         packed: Option<&plow_asset::packed_prefill::Manifest>,
         cublaslt_backend: Option<&cublaslt::ProjectionBackend>,
         moe_lt_shared: Option<Arc<moe_lt::MoeLt>>,
+        light_pf: Option<KernelFn>,
     ) -> Result<(KernelFn, u32, Module, Vec<PrefillBucket>, Option<SegPf>, u32)> {
         let packed_requests = packed.is_some();
         let mut inferred_policy = crate::asset::devblob::SegmentClassPolicy::default();
@@ -8096,6 +8779,12 @@ impl GpuEngine {
                     // context, dead engine, every request 503. Refuse the mismatch here, the
                     // way a missing object is already refused. Absent symbol = older cubin,
                     // unconstrained (same convention as plow_arena_bytes).
+                    if inferred_policy.fa512_mode == 2
+                        && hd256_capability == Some(0)
+                        && config.nv.pf_seg_fa512.is_none()
+                    {
+                        inferred_policy.fa512_mode = 1;
+                    }
                     if inferred_policy.fa512_mode == 2 && hd256_capability == Some(0) {
                         return Err(RuntimeError::Device(format!(
                             "PLOW_PF_SEG_FA512=all classes hd256 flash onto {fa_file}, but that \
@@ -8178,7 +8867,11 @@ impl GpuEngine {
                 if fa256_gqa2.is_none() {
                     inferred_policy.fa256_gqa2 = false;
                 }
+                let masked = plow_asset::packed_prefill::MASKED_PADDING_CAPABILITY;
+                let masked_padding = be.module_global_u32(&m1, masked)? == Some(1)
+                    && be.module_global_u32(&m2, masked)? == Some(1);
                 let mut sp = SegPf {
+                    masked_padding,
                     f_flash: f1,
                     smem_flash: s1,
                     grid_flash: g1,
@@ -8467,6 +9160,32 @@ impl GpuEngine {
             } else {
                 Vec::new()
             };
+            // Lone norm / residual / GLU segments of the Lt-routed buckets: light launches.
+            let light_segments = match light_pf {
+                Some(_) if !projection_segments.is_empty() && seg_mode && qwen_segments.is_empty() => {
+                    let library: Vec<Option<usize>> = (0..g.gq_seg_ofs.len().saturating_sub(1))
+                        .map(|seg| {
+                            projection_segments
+                                .get(seg)
+                                .copied()
+                                .flatten()
+                                .map(|p| p.instruction)
+                                .or(attention_gemm_segments
+                                    .get(seg)
+                                    .copied()
+                                    .flatten()
+                                    .map(|site| site.instruction))
+                        })
+                        .collect();
+                    cublaslt::prefill_light_segments(g, &library)
+                }
+                _ => Vec::new(),
+            };
+            let light_instructions: Vec<(usize, usize)> = light_segments
+                .iter()
+                .flat_map(|(seg, insts)| insts.iter().map(move |&i| (*seg, i)))
+                .chain(moe_instructions.iter().copied())
+                .collect();
             let cublaslt_waits = if projection_segments.is_empty()
                 && moe_instructions.is_empty()
                 && attention_gemm_segments.iter().all(Option::is_none)
@@ -8491,7 +9210,7 @@ impl GpuEngine {
                                 .map(|site| site.instruction))
                     })
                     .collect();
-                Some(cublaslt::ordered_waits_for(g, &library, &moe_instructions)?)
+                Some(cublaslt::ordered_waits_for(g, &library, &light_instructions)?)
             };
             let cublaslt_segments = if projection_segments.is_empty() {
                 Vec::new()
@@ -8506,6 +9225,13 @@ impl GpuEngine {
                     &mut h_inst,
                     devp,
                     None,
+                    config.nv.lt_pair,
+                    false,
+                    &[],
+                    None,
+                    None,
+                    &[],
+                    &[],
                 )?
             };
             let mut moe_lt_segments = Vec::new();
@@ -8543,15 +9269,31 @@ impl GpuEngine {
                     "MoE prefill experts routed to cuBLASLt grouped matmuls"
                 );
             }
+            let waits = cublaslt_waits.as_deref().unwrap_or(&g.waits);
+            // Every launch path of a multi-segment bucket runs its segments as ordered launches.
+            let gates = (config.nv.pf_segment_gates
+                && seg_mode
+                && seg_class.len() > 1
+                && qwen_segments.is_empty())
+            .then(|| segment_gates::segment_local(g, waits))
+            .flatten();
+            if let Some(gates) = &gates {
+                tracing::debug!(
+                    bucket = g.t,
+                    dropped_waits = gates.dropped_waits,
+                    dropped_succs = gates.dropped_succs,
+                    "prefill gates across segment boundaries dropped"
+                );
+            }
             let d_inst = upload_pod(pod_bytes(&h_inst))?;
-            let d_stream = upload_pod(pod_bytes(&g.stream))?;
+            let d_stream =
+                upload_pod(pod_bytes(gates.as_ref().map_or(&g.stream, |x| &x.stream)))?;
             let d_sofs = upload_pod(pod_bytes(&g.stream_ofs))?;
             let d_slen = upload_pod(pod_bytes(&g.stream_len))?;
-            let d_waits = upload_pod(pod_bytes(
-                cublaslt_waits.as_deref().unwrap_or(&g.waits),
-            ))?;
-            let d_succs = upload_pod(pod_bytes(&g.succs))?;
-            let d_gq_stream = upload_pod(pod_bytes(&g.gq_stream))?;
+            let d_waits = upload_pod(pod_bytes(gates.as_ref().map_or(waits, |x| &x.waits)))?;
+            let d_succs = upload_pod(pod_bytes(gates.as_ref().map_or(&g.succs, |x| &x.succs)))?;
+            let d_gq_stream =
+                upload_pod(pod_bytes(gates.as_ref().map_or(&g.gq_stream, |x| &x.gq_stream)))?;
             let d_gq_seg = upload_pod(pod_bytes(&g.gq_seg_ofs))?;
             // Combined counter/cursor slab (plan: counter improvements #1):
             // the bucket's own GQ cursor sits at its counter block's tail, so
@@ -8657,6 +9399,18 @@ impl GpuEngine {
                 }
             }
 
+            let mut light_routes: Vec<Option<cublaslt::LightRoute>> = Vec::new();
+            if let Some(function) = light_pf {
+                for (seg, insts) in &light_segments {
+                    if light_routes.len() <= *seg {
+                        light_routes.resize_with(seg + 1, || None);
+                    }
+                    light_routes[*seg] = Some(cublaslt::prefill_light_route(be, function, kernarg, g, insts));
+                }
+            }
+            if !light_segments.is_empty() {
+                tracing::info!(bucket = g.t, segments = light_segments.len(), "prefill light segments");
+            }
             buckets.push(PrefillBucket {
                 t: g.t,
                 seg_class: seg_class.clone(),
@@ -8666,6 +9420,7 @@ impl GpuEngine {
                 qwen_segments,
                 packet_segment_roles,
                 cublaslt_segments,
+                light_segments: light_routes,
                 moe_lt_segments,
                 attention_gemm_segments,
                 kernarg,
@@ -9254,6 +10009,10 @@ impl GpuEngine {
     fn warm_seg_graphs(&mut self, bi: usize, arg: &DevProgram) -> Result<()> {
         let segments = self.prefill[bi].seg_class.len();
         self.ensure_seg_graph(bi, arg, 0..segments)?;
+        if let Some(boundary) = self.shared_tail.as_ref().map(|t| t.boundary_segment(bi)) {
+            self.ensure_seg_graph(bi, arg, 0..boundary)?;
+            self.ensure_seg_graph(bi, arg, boundary..segments)?;
+        }
         if self.attention_gemm.is_some() {
             for (start, end) in self.seg_graph_pieces(bi) {
                 self.ensure_seg_graph(bi, arg, start..end)?;
@@ -9317,7 +10076,19 @@ impl GpuEngine {
             return Ok(());
         }
         let seg_class = self.prefill[bi].seg_class[range.clone()].to_vec();
+        let mut arg = *arg;
+        if crate::config::RuntimeConfig::get().nv.pf_entry_trace {
+            if self.entry_trace.is_none() {
+                let segments = self.prefill.iter().map(|b| b.seg_class.len()).max().unwrap_or(1);
+                let mem = self.be.alloc(0, segments as u64 * 528 * 64)?;
+                self.be.memset_d8(mem.base, 0, mem.len as usize)?;
+                self.entry_trace = Some(mem);
+            }
+            arg.trace = self.entry_trace.as_ref().expect("allocated").base;
+        }
+        let arg = &arg;
         let has_external = self.prefill[bi].cublaslt_segments.iter().any(Option::is_some)
+            || self.prefill[bi].light_segments.iter().any(Option::is_some)
             || self.prefill[bi].moe_lt_segments.iter().any(Option::is_some)
             || self.prefill[bi]
                 .packet_segment_roles
@@ -9332,16 +10103,28 @@ impl GpuEngine {
                 });
         let g = if has_external {
             let capture_stream = self.be.stream_create()?;
-            let untouched: Vec<_> = self.prefill[bi]
+            let mut untouched: Vec<_> = self.prefill[bi]
                 .moe_lt_segments
                 .iter()
                 .flatten()
                 .flat_map(moe_lt::MoeLtRoute::glue)
                 .collect();
+            // Interpreter segments never touch cuBLASLt's workspace, so the workspace memset a
+            // library call captures may run beside the segment that precedes it.
+            for (seg, &class) in seg_class.iter().enumerate() {
+                let (function, ..) = self.prefill_segment_kernel(bi, seg + range.start, class, false)?;
+                if !untouched.contains(&function) {
+                    untouched.push(function);
+                }
+            }
             self.be.graph_capture_hoisting(&capture_stream, &untouched, || {
                 for (seg, &class) in seg_class.iter().enumerate() {
                     let seg = seg + range.start;
                     if let Some(Some(route)) = self.prefill[bi].cublaslt_segments.get(seg) {
+                        route.run(&capture_stream)?;
+                        continue;
+                    }
+                    if let Some(Some(route)) = self.prefill[bi].light_segments.get(seg) {
                         route.run(&capture_stream)?;
                         continue;
                     }
@@ -9410,6 +10193,64 @@ impl GpuEngine {
             bucket = bi,
             "seg graph built"
         );
+        Ok(())
+    }
+
+    /// Summarize and clear the `PLOW_PF_ENTRY_TRACE` stamps of the chain just launched: per
+    /// interpreter segment, the launch span and the median of each entry stage over its blocks.
+    fn log_entry_trace(&mut self, bi: usize) -> Result<()> {
+        let Some(mem) = &self.entry_trace else {
+            return Ok(());
+        };
+        self.be.stream_synchronize(&self.stream)?;
+        let mut raw = vec![0u8; mem.len as usize];
+        self.be.download(mem, 0, &mut raw)?;
+        let words: Vec<u64> = raw
+            .chunks_exact(8)
+            .map(|c| u64::from_le_bytes(c.try_into().expect("8 bytes")))
+            .collect();
+        let segments = self.prefill[bi].seg_class.len();
+        let blocks = 528;
+        let mut lines = Vec::new();
+        for seg in 0..segments {
+            let recs: Vec<&[u64]> = (0..blocks)
+                .map(|b| &words[(seg * blocks + b) * 8..(seg * blocks + b + 1) * 8])
+                .filter(|r| r[0] != 0 && r[6] != 0)
+                .collect();
+            if recs.is_empty() {
+                continue;
+            }
+            let start = recs.iter().map(|r| r[0]).min().unwrap_or(0);
+            let end = recs.iter().map(|r| r[6]).max().unwrap_or(0);
+            let median = |a: usize, b: usize| {
+                let mut v: Vec<u64> = recs
+                    .iter()
+                    .filter(|r| r[a] != 0 && r[b] != 0)
+                    .map(|r| r[b].saturating_sub(r[a]))
+                    .collect();
+                v.sort_unstable();
+                v.get(v.len() / 2).copied().unwrap_or(0)
+            };
+            let last_start = recs.iter().map(|r| r[0]).max().unwrap_or(0) - start;
+            let worked = recs.iter().filter(|r| r[5] != 0).count();
+            lines.push(format!(
+                "seg {seg} op {} waits {} blocks {}/{} span {} ramp {} wait {} claim {} ent {} gate {} body {} exit {}",
+                recs[0][7] & 0xffff,
+                recs[0][7] >> 32,
+                worked,
+                recs.len(),
+                end - start,
+                last_start,
+                median(0, 1),
+                median(1, 2),
+                median(2, 3),
+                median(3, 4),
+                median(4, 5),
+                median(5, 6),
+            ));
+        }
+        self.be.memset_d8(mem.base, 0, mem.len as usize)?;
+        tracing::info!(bucket = bi, "entry trace (ns)\n{}", lines.join("\n"));
         Ok(())
     }
 
@@ -9520,7 +10361,9 @@ impl GpuEngine {
             let mut routed_index = 0;
             if !seg_time_probe && !fat_only_probe && rt.nv.pf_seg_graph {
                 let tensors = arg.tensors as u64;
-                let pieces = if routed {
+                let pieces = if let Some(window) = self.pf_seg_window.clone() {
+                    vec![(window.start, window.end)]
+                } else if routed {
                     self.seg_graph_pieces(bi)
                 } else {
                     vec![(0, seg_class.len())]
@@ -9536,6 +10379,9 @@ impl GpuEngine {
                 }
                 let rest = next..seg_class.len();
                 self.run_routed_segments(bi, rest, grouped, rows, &mut routed_index)?;
+                if rt.nv.pf_entry_trace {
+                    self.log_entry_trace(bi)?;
+                }
                 if synchronize {
                 if let Err(e) = self.be.stream_synchronize(&self.stream) {
                     tracing::warn!(
@@ -9575,7 +10421,11 @@ impl GpuEngine {
             // price the cooperative-launch overhead (241 fat launches/chunk).
             let noncoop = rt.nv.pf_seg_noncoop;
             let mut evs: Vec<(usize, u8, CudaEvent, CudaEvent)> = Vec::new();
+            let window = self.pf_seg_window.clone().unwrap_or(0..seg_class.len());
             for (seg, &cls) in seg_class.iter().enumerate() {
+                if !window.contains(&seg) {
+                    continue;
+                }
                 if let (true, Some(Some(site)), Some(route)) = (
                     routed,
                     self.prefill[bi].attention_gemm_segments.get(seg),
@@ -9599,6 +10449,10 @@ impl GpuEngine {
                         self.be.event_record(&e1, &self.stream)?;
                         evs.push((seg, cls, e0, e1));
                     }
+                    continue;
+                }
+                if let Some(Some(route)) = self.prefill[bi].light_segments.get(seg) {
+                    route.run(&self.stream)?;
                     continue;
                 }
                 if let Some(Some(route)) = self.prefill[bi].cublaslt_segments.get(seg) {
@@ -9912,10 +10766,14 @@ impl GpuEngine {
         self.packed_token_body(&chunks)?;
         for r in reqs {
             self.pos[r.slot] = (r.c0 + r.len) as u32;
-            if self.vmm_prefix_enabled() && r.c0 + r.len + 1 >= r.prompt.len() {
+            // The history follows every chunk: the prompt's next chunk may ride a token batch,
+            // which checks its frontier against it.
+            if self.vmm_prefix_enabled() {
                 let end = r.c0 + r.len;
                 self.seq_tokens[r.slot].clear();
                 self.seq_tokens[r.slot].extend_from_slice(&r.prompt[..end]);
+            }
+            if self.vmm_prefix_enabled() && r.c0 + r.len + 1 >= r.prompt.len() {
                 self.vmm_publish(r.slot, r.prompt.len().saturating_sub(1) as u32);
                 self.vmm_prefill_done(r.slot);
             }
@@ -9991,10 +10849,16 @@ impl GpuEngine {
                     &self.pos,
                     bucket.t as usize,
                     self.max_ctx,
+                    // Padding rows mask to slot -1 only on objects that skip them; otherwise
+                    // they continue the last request's rows (its own later writes cover them).
                     self.packed_prefill
                         .as_ref()
                         .and_then(|p| p.max_request_rows)
-                        .or(Some(self.pf_max_rows() as u32)),
+                        .or(self
+                            .seg_pf
+                            .as_ref()
+                            .is_some_and(|sp| sp.masked_padding)
+                            .then(|| self.pf_max_rows() as u32)),
                 )
                 .map_err(RuntimeError::Rejected)?,
             )
@@ -10200,7 +11064,12 @@ impl GpuEngine {
             self.be
                 .memset_d8_async(ctr_base, 0, ctr_bytes, &self.stream)?;
             if self.packed_prefill.is_some() {
-                self.launch_prefill_chain(
+                self.pf_seg_window = self
+                    .shared_tail
+                    .as_ref()
+                    .filter(|_| self.pf_seg_prefix)
+                    .map(|tail| 0..tail.boundary_segment(bi));
+                let chain = self.launch_prefill_chain(
                     bi,
                     arg,
                     f_pf,
@@ -10209,7 +11078,9 @@ impl GpuEngine {
                     total,
                     tc,
                     synchronize,
-                )
+                );
+                self.pf_seg_window = None;
+                chain
             } else {
                 let mut params = [&mut arg as *mut DevProgram as *mut std::ffi::c_void];
                 self.be.launch_cooperative(
@@ -10279,6 +11150,101 @@ impl GpuEngine {
     /// Used when the request wants stochastic sampling; the greedy path
     /// consumes the device argmax without ever moving the row. Prefill writes
     /// its logits to row 0 regardless of the slot (lm_head M == 1).
+    /// OpenAI logprobs of logits row `b` on device (`plow_logprob_stats`): `out[..3 + 2k]` =
+    /// `[logsumexp, row[tok], inexact, top-k ids (u32 bits), their logits]`. `Ok(false)` when the
+    /// sampler object has no such kernel.
+    pub fn logprob_stats(&mut self, b: usize, tok: u32, k: u32, out: &mut [f32; LOGPROB_STATS_MAX]) -> Result<bool> {
+        let Some((f, dev, threads)) = self.sampler.as_ref().and_then(|s| s.lp.as_ref().map(|(f, d)| (*f, d.base, s.threads)))
+        else {
+            return Ok(false);
+        };
+        if b >= self.batch || tok as usize >= self.vocab || 3 + 2 * k as usize > LOGPROB_STATS_MAX {
+            return Err(RuntimeError::Rejected(format!("logprob_stats: row {b} tok {tok} k {k} out of range")));
+        }
+        let mut a_logits = self.devp[self.t_logits].base;
+        let mut a_out = dev;
+        let (mut a_row, mut a_tok, mut a_v, mut a_k) = (b as u32, tok, self.vocab as u32, k);
+        let mut a = [
+            &mut a_logits as *mut u64 as *mut std::ffi::c_void,
+            &mut a_out as *mut u64 as *mut std::ffi::c_void,
+            &mut a_row as *mut u32 as *mut std::ffi::c_void,
+            &mut a_tok as *mut u32 as *mut std::ffi::c_void,
+            &mut a_v as *mut u32 as *mut std::ffi::c_void,
+            &mut a_k as *mut u32 as *mut std::ffi::c_void,
+        ];
+        self.be.launch_kernel(f, 1, threads, 0, &mut a, Some(&self.stream))?;
+        self.be.stream_synchronize(&self.stream)?;
+        let n = 3 + 2 * k as usize;
+        let mut raw = [0u8; LOGPROB_STATS_MAX * 4];
+        self.be.memcpy_dtoh(&mut raw[..n * 4], dev)?;
+        for (o, c) in out.iter_mut().zip(raw[..n * 4].chunks_exact(4)) {
+            *o = f32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+        }
+        Ok(true)
+    }
+
+    /// [`Self::logprob_stats`] for every request of a step in one launch and one readback:
+    /// `reqs[i] = (logits row, token, k)`, `out[i]` its statistics. `Ok(false)` when the sampler
+    /// object has no `plow_logprob_stats_rows`.
+    pub fn logprob_stats_rows(
+        &mut self,
+        reqs: &[(u32, u32, u32)],
+        out: &mut Vec<[f32; LOGPROB_STATS_MAX]>,
+    ) -> Result<bool> {
+        out.clear();
+        let (batch, vocab) = (self.batch, self.vocab);
+        let Some((threads, lp)) = self.sampler.as_mut().and_then(|s| Some((s.threads, s.lp_rows.as_mut()?)))
+        else {
+            return Ok(false);
+        };
+        if reqs.is_empty() {
+            return Ok(true);
+        }
+        if reqs.len() > batch
+            || reqs.iter().any(|&(row, tok, k)| {
+                row as usize >= batch || tok as usize >= vocab || 3 + 2 * k as usize > LOGPROB_STATS_MAX
+            })
+        {
+            return Err(RuntimeError::Rejected("logprob_stats_rows: request out of range".into()));
+        }
+        let n = reqs.len();
+        {
+            let req: &mut [u32] = bytemuck::cast_slice_mut(&mut lp.req.as_mut_slice()[..n * 12]);
+            for (dst, &(row, tok, k)) in req.chunks_exact_mut(3).zip(reqs) {
+                dst.copy_from_slice(&[row, tok, k]);
+            }
+        }
+        let mut a_logits = self.devp[self.t_logits].base;
+        let (mut a_out, mut a_req, mut a_ids) = (lp.d_out.base, lp.d_req.base, 0u64);
+        let (mut a_v, mut a_stride) = (vocab as u32, LOGPROB_STATS_MAX as u32);
+        let mut a = [
+            &mut a_logits as *mut u64 as *mut std::ffi::c_void,
+            &mut a_out as *mut u64 as *mut std::ffi::c_void,
+            &mut a_req as *mut u64 as *mut std::ffi::c_void,
+            &mut a_ids as *mut u64 as *mut std::ffi::c_void,
+            &mut a_v as *mut u32 as *mut std::ffi::c_void,
+            &mut a_stride as *mut u32 as *mut std::ffi::c_void,
+        ];
+        // SAFETY: both pinned slabs live on self past the synchronize below.
+        unsafe {
+            self.be.memcpy_htod_async(lp.d_req.base, &lp.req.as_slice()[..n * 12], &self.stream)?;
+            self.be.launch_kernel(lp.f, n as u32, threads, 0, &mut a, Some(&self.stream))?;
+            self.be.memcpy_dtoh_async(
+                &mut lp.out.as_mut_slice()[..n * LOGPROB_STATS_MAX * 4],
+                lp.d_out.base,
+                &self.stream,
+            )?;
+        }
+        self.be.stream_synchronize(&self.stream)?;
+        let got: &[f32] = bytemuck::cast_slice(&lp.out.as_slice()[..n * LOGPROB_STATS_MAX * 4]);
+        out.extend(got.chunks_exact(LOGPROB_STATS_MAX).map(|c| {
+            let mut row = [0f32; LOGPROB_STATS_MAX];
+            row.copy_from_slice(c);
+            row
+        }));
+        Ok(true)
+    }
+
     pub fn logits_row(&mut self, b: usize, out: &mut Vec<f32>) -> Result<()> {
         if b >= self.batch {
             return Err(RuntimeError::Rejected(format!(
@@ -10327,6 +11293,26 @@ impl GpuEngine {
             )));
         }
         self.be.download(&self.devp[i], offset, dst)
+    }
+
+    /// Write raw bytes into a named tensor at `offset` (host-owned pipeline inputs: embedding
+    /// overlay rows, per-slot scalars). Synchronous with respect to the engine stream.
+    pub fn write_tensor(&mut self, name: &str, offset: u64, src: &[u8]) -> Result<()> {
+        let i = self.handle_of(name).ok_or_else(|| {
+            RuntimeError::Rejected(format!("no tensor named {name:?} in the blob"))
+        })?;
+        let end = offset
+            .checked_add(src.len() as u64)
+            .ok_or_else(|| RuntimeError::Rejected("tensor write range overflow".into()))?;
+        if end > self.devp[i].len {
+            return Err(RuntimeError::Rejected(format!(
+                "write_tensor {name}: range {offset}..{end} exceeds {} bytes",
+                self.devp[i].len
+            )));
+        }
+        self.be.upload(&self.devp[i], offset, src)?;
+        // Pageable H2D can return before DMA completes; kernels use a nonblocking stream.
+        self.be.synchronize()
     }
 
     /// Byte size of a named tensor's device allocation.
@@ -10411,6 +11397,15 @@ impl GpuEngine {
         // Pageable H2D can return before DMA completes; kernels use a nonblocking stream.
         self.be.synchronize()?;
         Ok(())
+    }
+
+    /// Skip every decode instruction at or past `limit` (profiling by instruction caps: the
+    /// marginal step time of instruction i is time(limit = i + 1) - time(limit = i)).
+    pub fn set_debug_max_inst(&self, limit: u32) -> Result<bool> {
+        if let Some(gw) = &self.gemv_wide {
+            self.be.module_global_set_u32(gw.module(), "plow_debug_max_inst_gw", limit)?;
+        }
+        self.be.module_global_set_u32(&self.module, "plow_debug_max_inst", limit)
     }
 
     /// Reset the PLOW_NV_TRACE packet counter so [`Self::trace_summary`]
@@ -10742,6 +11737,9 @@ mod recurrent_tests;
 
 #[cfg(test)]
 mod qwen_tests;
+
+#[cfg(test)]
+mod logprob_rows_tests;
 
 #[cfg(test)]
 #[test]

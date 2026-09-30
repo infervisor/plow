@@ -88,6 +88,18 @@ def unfold (head : String) (args : List Term) : Term :=
       .node "BlockResidual" [ew "add" a b,s,nw,pw,max]
   | "FusedMaterializedResidual3Block", [pre,a,b,s,nw,pw,max] =>
       .node "BlockResidual" [ew "add" pre (ew "add" a b),s,nw,pw,max]
+  | "FusedActConv1d", [k,x,w,b,c] => .node "Conv1d" [act k x,w,b,c]
+  | "FusedParamActConv1d", [k,x,p,w,b,c] => .node "Conv1d" [.node "ActP" [k,x,p],w,b,c]
+  | "FusedConv1dAct", [x,w,b,c,k] => act k (.node "Conv1d" [x,w,b,c])
+  | "FusedConv1dResidual", [x,w,b,c,r] => ew "add" r (.node "Conv1d" [x,w,b,c])
+  | "FusedActConv1dResidual", [k,x,w,b,c,r] => ew "add" r (.node "Conv1d" [act k x,w,b,c])
+  | "FusedParamActConv1dResidual", [k,x,p,w,b,c,r] =>
+      ew "add" r (.node "Conv1d" [.node "ActP" [k,x,p],w,b,c])
+  | "FusedParamActConv1dAct", [k,x,p,w,b,c,k2] =>
+      act k2 (.node "Conv1d" [.node "ActP" [k,x,p],w,b,c])
+  | "FusedLinearBiasResidual", [x,w,b,n,r] => ew "add" r (.node "LinearBias" [x,w,b,n])
+  | "FusedLayerNormLinearBiasAct", [x,w,b,wl,bl,e,n,k] =>
+      act k (.node "LinearBias" [.node "LayerNorm" [x,w,b,e],wl,bl,n])
   | _, _ => .node head args
 
 def normalize : Nat → Term → Term

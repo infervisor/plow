@@ -50,6 +50,9 @@ type CUcontext = *mut c_void;
 type CUmodule = *mut c_void;
 type CUfunction = *mut c_void;
 type CUstream = *mut c_void;
+
+/// Device global an object exports when its kernels begin with `griddepcontrol.wait`.
+pub const PDL_WAIT_MARKER: &str = "plow_pdl_wait_1";
 type CUevent = *mut c_void;
 
 #[repr(C)]
@@ -162,6 +165,25 @@ struct CUmemAllocationProp {
     alloc_flags: [u8; 8],
 }
 
+/// `CUlaunchAttribute` (cuda.h): id, 4 pad bytes, a 64-byte value union.
+#[repr(C)]
+struct CUlaunchAttribute {
+    id: i32,
+    pad: [u8; 4],
+    value: [u8; 64],
+}
+
+/// `CUlaunchConfig` (cuda.h).
+#[repr(C)]
+struct CUlaunchConfig {
+    grid: [u32; 3],
+    block: [u32; 3],
+    shared_mem_bytes: u32,
+    stream: CUstream,
+    attrs: *mut CUlaunchAttribute,
+    num_attrs: u32,
+}
+
 /// `CUmemAccessDesc` (cuda.h) — `{ CUmemLocation location; CUmemAccess_flags flags; }`.
 #[repr(C)]
 struct CUmemAccessDesc {
@@ -227,6 +249,8 @@ driver_api! {
     cuMemFreeHost: fn(*mut c_void) -> CUresult,
     cuLaunchCooperativeKernel:
         fn(CUfunction, u32, u32, u32, u32, u32, u32, u32, CUstream, *mut *mut c_void) -> CUresult,
+    cuLaunchKernelEx: fn(*const CUlaunchConfig, CUfunction, *mut *mut c_void, *mut *mut c_void) -> CUresult,
+    cuFuncGetModule: fn(*mut CUmodule, CUfunction) -> CUresult,
     cuLaunchKernel:
         fn(CUfunction, u32, u32, u32, u32, u32, u32, u32, CUstream, *mut *mut c_void, *mut *mut c_void) -> CUresult,
     // VMM surface (probed by
@@ -354,7 +378,7 @@ unsafe impl Send for GraphExec {}
 unsafe impl Sync for GraphExec {}
 
 /// A loaded-kernel handle (a `CUfunction`, valid for the module's lifetime).
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct KernelFn(usize);
 
 /// The freer every owned [`DeviceMem`] carries ([`crate::device::DeviceFree`]).
@@ -1232,6 +1256,73 @@ impl CudaBackend {
             },
             "cuLaunchCooperativeKernel",
         )
+    }
+
+    /// [`Self::launch_cooperative`] with programmatic stream serialization when `pdl`: the
+    /// kernel may start while its stream predecessor drains, so it MUST execute
+    /// `griddepcontrol.wait` (`plow_pdl_wait()` in sm120_common.cuh) before reading anything the
+    /// predecessor writes, and its object exports [`PDL_WAIT_MARKER`] (see
+    /// [`Self::function_waits_on_pdl`]). Captured into a graph it becomes a programmatic edge.
+    pub fn launch_cooperative_pdl(
+        &self,
+        f: KernelFn,
+        grid: u32,
+        block: u32,
+        smem_bytes: u32,
+        params: &mut [*mut c_void],
+        stream: Option<&CudaStream>,
+        pdl: bool,
+    ) -> Result<()> {
+        if !pdl {
+            return self.launch_cooperative(f, grid, block, smem_bytes, params, stream);
+        }
+        self.bind()?;
+        // CU_LAUNCH_ATTRIBUTE_COOPERATIVE = 2, _PROGRAMMATIC_STREAM_SERIALIZATION = 5; both
+        // values are an int at offset 0.
+        let attr = |id: i32| {
+            let mut value = [0u8; 64];
+            value[..4].copy_from_slice(&1i32.to_ne_bytes());
+            CUlaunchAttribute { id, pad: [0; 4], value }
+        };
+        let mut attrs = [attr(2), attr(5)];
+        let config = CUlaunchConfig {
+            grid: [grid, 1, 1],
+            block: [block, 1, 1],
+            shared_mem_bytes: smem_bytes,
+            stream: stream.map_or(std::ptr::null_mut(), |s| s.raw as CUstream),
+            attrs: attrs.as_mut_ptr(),
+            num_attrs: attrs.len() as u32,
+        };
+        // SAFETY: config/attrs/params live for the call; the driver copies arguments out.
+        self.check(
+            unsafe {
+                (self.api.cuLaunchKernelEx)(
+                    &config,
+                    f.0 as CUfunction,
+                    params.as_mut_ptr(),
+                    std::ptr::null_mut(),
+                )
+            },
+            "cuLaunchKernelEx",
+        )
+    }
+
+    /// Whether `f`'s object exports [`PDL_WAIT_MARKER`], i.e. every kernel in it runs
+    /// `griddepcontrol.wait` before touching predecessor output.
+    pub fn function_waits_on_pdl(&self, f: KernelFn) -> Result<bool> {
+        self.bind()?;
+        let mut module: CUmodule = std::ptr::null_mut();
+        // SAFETY: f is a live function handle; outputs are valid locals.
+        self.check(
+            unsafe { (self.api.cuFuncGetModule)(&mut module, f.0 as CUfunction) },
+            "cuFuncGetModule",
+        )?;
+        let name = std::ffi::CString::new(PDL_WAIT_MARKER).expect("no NUL");
+        let (mut ptr, mut bytes): (CUdeviceptr, usize) = (0, 0);
+        let rc = unsafe {
+            (self.api.cuModuleGetGlobal_v2)(&mut ptr, &mut bytes, module, name.as_ptr())
+        };
+        Ok(rc == 0)
     }
 
     /// Ordinary (non-cooperative) kernel launch on `stream` (`None` = default

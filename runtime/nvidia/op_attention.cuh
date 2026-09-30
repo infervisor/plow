@@ -159,10 +159,12 @@ __device__ __forceinline__ float __fa_ex2(float x) {
 #define PLOW_NV_FA_MMAQK_DEPTH 8
 #endif
 /* Bit 0: hd256. Bit 1: hd512, where it replaces the staged-K score of PLOW_NV_FA_TC_GQA8_HD512
- * (whose P.V stays). */
+ * (whose P.V stays). Bit 2: hd64/hd128 with GF 2..8 (the per-thread score row there is 32
+ * scattered sectors per warp load; at GF 1 seven eighths of the mma is padding). */
 #define FA_DEC_MMAQK(D, GF)                                                                    \
-    (((((PLOW_NV_FA_MMAQK) & 1) && (D) == 256) || (((PLOW_NV_FA_MMAQK) & 2) && (D) == 512)) && \
-     ((GF) == 2 || (GF) == 4 || (GF) == 8 || (GF) == 16))
+    ((((((PLOW_NV_FA_MMAQK) & 1) && (D) == 256) || (((PLOW_NV_FA_MMAQK) & 2) && (D) == 512)) && \
+      ((GF) == 2 || (GF) == 4 || (GF) == 8 || (GF) == 16)) ||                                  \
+     (((PLOW_NV_FA_MMAQK) & 4) && (D) <= 128 && (D) % 32 == 0 && (GF) >= 2 && (GF) <= 8))
 /* Rows per stage of the TC P.V ring. The staged-K score walks 64-row stages, so 64 there; with
  * the mma score (bit 1) the ring only feeds P.V and 32 halves the claim (hd512/GF8 154 -> 91 KiB),
  * which the dense 12B pays for in L1: p12m B=1/4/16 ctx 1024 10.663/11.204/13.384 -> 10.591/
@@ -178,10 +180,25 @@ template <int V> struct fa_depth { static constexpr int v = V; };
     (PLOW_NV_FA_SPART && (D) >= 256 && ((GF) == 2 || (GF) == 4 || (GF) == 8) &&               \
      !FA_DEC_TC_GQA8(D, GF) && !FA_DEC_MMAQK(D, GF))
 #define FA_DEC_SPART_NP(GF) (64 / (GF))
-#define FA_DEC_SMEM_FLOATS(D, GF)                                                              \
+#define FA_DEC_SMEM_FLOATS0(D, GF)                                                             \
     (FA_DEC_BASE_SMEM_FLOATS(D, GF) +                                                         \
      (FA_DEC_TC_GQA8(D, GF) ? ((FA_DEC_MMAQK(D, GF) ? 0 : 16) + 2 * PLOW_NV_FA_TC_RING_ROWS) * ((D) + 8) / 2 : 0) +   \
      (FA_DEC_SPART(D, GF) ? FA_DEC_TILE * 64 : 0))
+/* The staged row-group body (PLOW_NV_FA_RGT) claims its rings on the arms that take it. */
+#define FA_DEC_RGT_TAKES(D, GF)                                                                \
+    (PLOW_NV_FA_RGT && PLOW_NV_FA_RG && ((D) == 128 || (PLOW_NV_FA_RG_WIDE && ((D) == 256 || (D) == 512))) && \
+     (GF) >= 2 && (GF) <= 4)
+#define FA_DEC_RGM_TAKES(D, GF)                                                                \
+    (PLOW_NV_FA_RGM && PLOW_NV_FA_RG && ((D) == 128 || (PLOW_NV_FA_RG_WIDE && (D) == 256)) &&     \
+     (GF) >= 2 && (GF) <= 4)
+#define FA_DEC_SMEM_FLOATS1(D, GF)                                                             \
+    (FA_DEC_RGT_TAKES(D, GF) && FA_RGT_SMEM_FLOATS(D) > FA_DEC_SMEM_FLOATS0(D, GF)            \
+         ? FA_RGT_SMEM_FLOATS(D)                                                               \
+         : FA_DEC_SMEM_FLOATS0(D, GF))
+#define FA_DEC_SMEM_FLOATS(D, GF)                                                              \
+    (FA_DEC_RGM_TAKES(D, GF) && FA_RGM_SMEM_FLOATS(D) > FA_DEC_SMEM_FLOATS1(D, GF)            \
+         ? FA_RGM_SMEM_FLOATS(D)                                                               \
+         : FA_DEC_SMEM_FLOATS1(D, GF))
 
 /* V rows in flight per thread. A fused row feeds GF accumulators, so arithmetic per load
  * grows with GF and the unroll can shrink before the 255-register cliff. */
@@ -703,13 +720,970 @@ __device__ __forceinline__ void fa_decode_qk_mma(float* scores, const __nv_bfloa
             if (8u * hs + 2u * t < (unsigned)GF) {
                 float* s0 = scores + (8u * hs + 2u * t) * FA_DEC_TILE;
                 float* s1 = s0 + FA_DEC_TILE;
-                if (r0 < rmax) { s0[r0] = acc[hs][0] * sc; s1[r0] = acc[hs][1] * sc; }
-                if (r1 < rmax) { s0[r1] = acc[hs][2] * sc; s1[r1] = acc[hs][3] * sc; }
+                /* Odd GF: head 2t+1 == GF is past the score rows. */
+                const bool h1 = 8u * hs + 2u * t + 1u < (unsigned)GF;
+                if (r0 < rmax) { s0[r0] = acc[hs][0] * sc; if (h1) s1[r0] = acc[hs][1] * sc; }
+                if (r1 < rmax) { s0[r1] = acc[hs][2] * sc; if (h1) s1[r1] = acc[hs][3] * sc; }
             }
     }
 }
 #endif
 
+/* Last-arriving split of a merge-folded decode item: out[g][:] = sum_s w[g][s] O_s / L_g. The
+ * weights are computed once into smem; each thread then walks its float4 columns over the splits
+ * with 8 loads in flight (a per-output loop over L2 loads serializes nsplit round trips). */
+template <int D, int GF>
+__device__ __noinline__ void fa_fold_tail(__nv_bfloat16* __restrict__ out,
+                                             const float* __restrict__ Opart,
+                                             const float* __restrict__ mlpart, size_t row0,
+                                             unsigned nsplit, float* sm) {
+    const unsigned tid = threadIdx.x;
+    float* wts = sm;               /* [GF][nsplit] */
+    float* inv = sm + GF * nsplit; /* [GF] */
+    if (tid < 32u * GF) {
+        const unsigned g = tid >> 5, lane = tid & 31u;
+        const float2* ml = (const float2*)mlpart + (row0 + g) * nsplit;
+        float M = FA_NEG_INF;
+        for (unsigned s = lane; s < nsplit; s += 32u) M = fmaxf(M, __ldcg(ml + s).x);
+        M = warp_max32(M);
+        float L = 0.0f;
+        for (unsigned s = lane; s < nsplit; s += 32u) {
+            const float2 v = __ldcg(ml + s);
+            const float w = FA_EXP(v.x - M);
+            wts[g * nsplit + s] = w;
+            L = fmaf(v.y, w, L);
+        }
+        L = warp_sum32(L);
+        if (lane == 0) inv[g] = L > 0.0f ? 1.0f / L : 0.0f;
+    }
+    __syncthreads();
+    for (unsigned i = tid; i < GF * (unsigned)D / 4u; i += PLOW_NV_THREADS) {
+        const unsigned g = i / (D / 4u), d4 = i % (D / 4u);
+        const float4* op = (const float4*)(Opart + (row0 + g) * nsplit * D) + d4;
+        const float* w = wts + g * nsplit;
+        float4 acc = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+#pragma unroll 8
+        for (unsigned s = 0; s < nsplit; s++) {
+            const float4 v = __ldcg(op + (size_t)s * (D / 4u));
+            acc.x = fmaf(v.x, w[s], acc.x);
+            acc.y = fmaf(v.y, w[s], acc.y);
+            acc.z = fmaf(v.z, w[s], acc.z);
+            acc.w = fmaf(v.w, w[s], acc.w);
+        }
+        const float il = inv[g];
+        __nv_bfloat162* o2 = (__nv_bfloat162*)(out + (row0 + g) * D) + 2u * d4;
+        o2[0] = __floats2bfloat162_rn(acc.x * il, acc.y * il);
+        o2[1] = __floats2bfloat162_rn(acc.z * il, acc.w * il);
+    }
+}
+
+/* hd128 GQA decode item, row-group body (GF 2..4: Veena GF3, Qwen3 GF2). The tile body pays ~6
+ * block barriers per 256-row tile and streams K, then V, with nothing overlapping them: measured
+ * H100 Veena ctx 1024, 20-29 us per layer at B=2..8 against a 10 us KV floor. Here D/8 lanes own
+ * one row (16 B each; a warp load is two contiguous rows), K and V of U rows are issued together,
+ * each lane group keeps its own online softmax for the GF heads, and the NGRP group states fold
+ * once per item through smem. Sum order differs from the tile body.
+ * `out` != null: no FLASH_MERGE follows. At nsplit == 1 the fold normalizes into `out`; otherwise
+ * every split publishes its partial and bumps `ctr` (this (b, head-group)'s counter), and the
+ * last arrival merges into `out` and re-zeroes the counter (zeroed once at load). The next
+ * token's flash on this layer sits behind this packet's consumers, so the reset cannot race. */
+#ifndef PLOW_NV_FA_RG
+#define PLOW_NV_FA_RG 0  /* manifest `fa_rg` (PLOW_NV_FA_FOLD / E-series fa_rg_wide) */
+#endif
+#ifndef PLOW_NV_FA_RG_U
+#define PLOW_NV_FA_RG_U 4
+#endif
+/* The row-group body on hd256 / hd512 too (a warp per row). */
+#ifndef PLOW_NV_FA_RG_WIDE
+#define PLOW_NV_FA_RG_WIDE 0
+#endif
+template <int D, int GF>
+__device__ __forceinline__ void fa_decode_rg_item(
+    float* __restrict__ Opart, float* __restrict__ mlpart, __nv_bfloat16* __restrict__ out,
+    const __nv_bfloat16* __restrict__ Q, const __nv_bfloat16* __restrict__ kbase,
+    const __nv_bfloat16* __restrict__ vbase, unsigned b, unsigned n_head, unsigned h0,
+    unsigned nsplit, unsigned sp, unsigned lo, unsigned hi, unsigned kv_mask, float scale,
+    float* lds, unsigned* __restrict__ ctr) {
+    /* D > 256: a warp owns a row and each lane NCH 8-element chunks, 256 elements apart. */
+    constexpr unsigned NCH = D > 256 ? D / 256 : 1;
+    constexpr unsigned LPR = D / (8 * NCH), GPW = 32u / LPR, NGRP = PLOW_NV_WARPS * GPW;
+    constexpr int U = D > 256 ? (PLOW_NV_FA_RG_U > 2 ? 2 : PLOW_NV_FA_RG_U) : PLOW_NV_FA_RG_U;
+    constexpr int E = 8 * NCH;
+    const unsigned tid = threadIdx.x, lane = tid & 31u, warp = tid >> 5;
+    const unsigned sub = lane % LPR, grp = warp * GPW + lane / LPR;
+    float qf[GF][E], m[GF], l[GF], o[GF][E];
+#pragma unroll
+    for (int g = 0; g < GF; g++) {
+#pragma unroll
+        for (int c = 0; c < (int)NCH; c++) {
+            const bf16v8 q8 = ld_glob8(Q + ((size_t)b * n_head + h0 + g) * D + c * LPR * 8u + sub * 8u);
+#pragma unroll
+            for (int i = 0; i < 8; i++) {
+                qf[g][c * 8 + i] = __bfloat162float(q8.x[i]) * FA_SCALE(scale);
+                o[g][c * 8 + i] = 0.0f;
+            }
+        }
+        m[g] = FA_NEG_INF;
+        l[g] = 0.0f;
+    }
+    /* Block-uniform trip count: the lane reductions are full-warp shuffles. */
+    for (unsigned base = lo; base < hi; base += NGRP * U) {
+        const unsigned r0 = base + grp;
+        bf16v8 k8[U][NCH], v8[U][NCH];
+#pragma unroll
+        for (int u = 0; u < U; u++) {
+            const unsigned r = min(r0 + NGRP * (unsigned)u, hi - 1u);
+#pragma unroll
+            for (int c = 0; c < (int)NCH; c++) {
+                const size_t off = (size_t)(r & kv_mask) * D + c * LPR * 8u + sub * 8u;
+                k8[u][c] = ld_glob8_cs(kbase + off);
+                v8[u][c] = ld_glob8_cs(vbase + off);
+            }
+        }
+        float sc[GF][U];
+#pragma unroll
+        for (int u = 0; u < U; u++)
+#pragma unroll
+            for (int g = 0; g < GF; g++) {
+                float d = 0.0f;
+#pragma unroll
+                for (int c = 0; c < (int)NCH; c++)
+#pragma unroll
+                    for (int i = 0; i < 8; i++)
+                        d = fmaf(__bfloat162float(k8[u][c].x[i]), qf[g][c * 8 + i], d);
+#pragma unroll
+                for (unsigned s = LPR / 2; s > 0; s >>= 1) d += __shfl_xor_sync(0xffffffffu, d, s, 32);
+                sc[g][u] = r0 + NGRP * (unsigned)u < hi ? d : FA_NEG_INF;
+            }
+#pragma unroll
+        for (int g = 0; g < GF; g++) {
+            float mx = m[g];
+#pragma unroll
+            for (int u = 0; u < U; u++) mx = fmaxf(mx, sc[g][u]);
+            /* A group with no live row yet keeps mx = NEG_INF (finite): shift by 0 so the dead
+             * rows' weights are ex2(NEG_INF) = 0, not ex2(0) = 1. */
+            const float mref = mx > FA_NEG_INF ? mx : 0.0f;
+            const float corr = FA_EXP(m[g] - mref);
+            l[g] *= corr;
+#pragma unroll
+            for (int i = 0; i < E; i++) o[g][i] *= corr;
+#pragma unroll
+            for (int u = 0; u < U; u++) {
+                const float p = FA_EXP(sc[g][u] - mref);
+                l[g] += p;
+#pragma unroll
+                for (int c = 0; c < (int)NCH; c++)
+#pragma unroll
+                    for (int i = 0; i < 8; i++)
+                        o[g][c * 8 + i] = fmaf(p, __bfloat162float(v8[u][c].x[i]), o[g][c * 8 + i]);
+            }
+            m[g] = mx;
+        }
+    }
+    float* go = lds;              /* [NGRP][D] */
+    float* gm = lds + NGRP * D;   /* [NGRP] */
+    float* gl = gm + NGRP;        /* [NGRP] */
+#pragma unroll
+    for (int g = 0; g < GF; g++) {
+        __syncthreads(); /* the previous head's (or item's) fold has read go/gm/gl */
+#pragma unroll
+        for (int c = 0; c < (int)NCH; c++)
+#pragma unroll
+            for (int i = 0; i < 8; i++) go[grp * D + c * LPR * 8u + sub * 8u + i] = o[g][c * 8 + i];
+        if (sub == 0) { gm[grp] = m[g]; gl[grp] = l[g]; }
+        __syncthreads();
+        const size_t row = (size_t)b * n_head + h0 + g;
+        for (unsigned d = tid; d < (unsigned)D; d += PLOW_NV_THREADS) {
+            float M = FA_NEG_INF;
+#pragma unroll
+            for (unsigned j = 0; j < NGRP; j++) M = fmaxf(M, gm[j]);
+            float acc = 0.0f, L = 0.0f;
+#pragma unroll
+            for (unsigned j = 0; j < NGRP; j++) {
+                const float w = FA_EXP(gm[j] - M);
+                acc = fmaf(go[j * D + d], w, acc);
+                L = fmaf(gl[j], w, L);
+            }
+            if (out && nsplit == 1) {
+                out[row * D + d] = __float2bfloat16(L > 0.0f ? acc / L : 0.0f);
+            } else {
+                Opart[(row * nsplit + sp) * D + d] = acc;
+                if (d == 0) {
+                    mlpart[(row * nsplit + sp) * 2] = M;
+                    mlpart[(row * nsplit + sp) * 2 + 1] = L;
+                }
+            }
+        }
+    }
+    if (!out || nsplit == 1) return;
+    /* The interpreter's own signal pattern: the barrier publishes the block's partial stores to
+     * thread 0, whose device fence then releases them ahead of the bump (and acquires after). */
+    __syncthreads();
+    unsigned* arrived = (unsigned*)gl;
+    if (tid == 0) {
+        __threadfence();
+        arrived[0] = atomicAdd(ctr, 1u);
+        __threadfence();
+    }
+    __syncthreads();
+    if (arrived[0] != nsplit - 1u) return;
+    const size_t row0 = (size_t)b * n_head + h0;
+    if constexpr (D >= 256) {
+        fa_fold_tail<D, GF>(out, Opart, mlpart, row0, nsplit, go);
+    } else {
+        /* Every (m, l) once into smem, all in flight together: a per-thread loop over L2 loads
+         * here serializes nsplit round trips and cost the B=1 step more than the FLASH_MERGE it
+         * replaces. */
+        float2* mls = (float2*)go; /* [GF][nsplit] */
+        for (unsigned i = tid; i < GF * nsplit; i += PLOW_NV_THREADS)
+            mls[i] = __ldcg((const float2*)mlpart + row0 * nsplit + i);
+        __syncthreads();
+        for (unsigned i = tid; i < GF * (unsigned)D; i += PLOW_NV_THREADS) {
+            const unsigned g = i / D, d = i % D;
+            const float2* m2 = mls + g * nsplit;
+            float M = FA_NEG_INF;
+            for (unsigned s = 0; s < nsplit; s++) M = fmaxf(M, m2[s].x);
+            const float* op = Opart + (row0 + g) * nsplit * D + d;
+            float acc = 0.0f, L = 0.0f;
+#pragma unroll 4
+            for (unsigned s = 0; s < nsplit; s++) {
+                const float w = FA_EXP(m2[s].x - M);
+                acc = fmaf(__ldcg(op + (size_t)s * D), w, acc);
+                L = fmaf(m2[s].y, w, L);
+            }
+            out[(row0 + g) * D + d] = __float2bfloat16(L > 0.0f ? acc / L : 0.0f);
+        }
+    }
+    if (tid == 0) atomicExch(ctr, 0u);
+}
+
+
+
+/* Streamed row-group decode (PLOW_DECODE_LIGHT_FLASH): fa_decode_rg_item's lane map, U-row
+ * online softmax and group fold, bit for bit, with K/V (and each item's q rows) fed through a smem
+ * ring by one producer warp. The register body holds ~32 KiB in flight per SM and drains at every
+ * item boundary; here the producer streams the block's whole item sequence ahead (NST stages of
+ * FA_ST_TR K rows + FA_ST_TR V rows + the item's GF q rows), so short items are not latency-bound.
+ * Needs nsplit 1, no window, no ring wrap, and a merge-folded output. Block = FA_ST_THREADS. */
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 900
+#ifndef PLOW_NV_FA_ST_STAGES
+#define PLOW_NV_FA_ST_STAGES 4
+#endif
+#define FA_ST_TR (16u * (unsigned)PLOW_NV_FA_RG_U)
+#define FA_ST_THREADS (PLOW_NV_THREADS + 32u)
+#define FA_ST_Q_OFF(D) (2u * FA_ST_TR * (unsigned)(D) * 2u)
+#define FA_ST_STAGE_BYTES(D) (FA_ST_Q_OFF(D) + 4u * (unsigned)(D) * 2u) /* q slot: GF <= 4 rows */
+#define FA_ST_FOLD_OFF(D) ((unsigned)PLOW_NV_FA_ST_STAGES * FA_ST_STAGE_BYTES(D))
+#define FA_ST_BAR_OFF(D) (FA_ST_FOLD_OFF(D) + (16u * (unsigned)(D) + 32u) * 4u)
+#define FA_ST_SMEM_BYTES(D) (FA_ST_BAR_OFF(D) + 16u * (unsigned)PLOW_NV_FA_ST_STAGES)
+
+__device__ __forceinline__ void fa_st_wait(unsigned bar, unsigned parity) {
+    asm volatile("{\n\t.reg .pred P%=;\n"
+                 "LAB%=:\n\tmbarrier.try_wait.parity.shared::cta.b64 P%=, [%0], %1;\n"
+                 "\t@!P%= bra LAB%=;\n\t}\n" ::"r"(bar), "r"(parity) : "memory");
+}
+__device__ __forceinline__ void fa_st_bulk(unsigned dst, const void* src, unsigned bytes, unsigned bar) {
+    asm volatile("cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];\n"
+                 ::"r"(dst), "l"(src), "r"(bytes), "r"(bar) : "memory");
+}
+
+/* The layer's HeadNormRope folded in (skip_norm, no gamma, half-split rope, hd128, n_batch_kv
+ * rows): the producer ropes the item's q rows into the ring and the new k row into the cache, and
+ * copies the new v row, before it streams the item. Same fp32 expressions as d_headnorm_rope.
+ * `pos` null = no fold (the q rows are bulk-copied from Q). Row r of q / k / v is at
+ * `x + r * x_row + head * 128`; the new rows land at cache row pos[b]. */
+struct FaStHnr {
+    const __nv_bfloat16 *qx, *kx, *vx;
+    unsigned q_row, k_row, v_row;
+    const float *cosb, *sinb;
+    const int* pos;
+};
+
+template <int D, int GF>
+__device__ void d_flash_decode_stream(__nv_bfloat16* __restrict__ out, const __nv_bfloat16* __restrict__ Q,
+                                      __nv_bfloat16* __restrict__ K, __nv_bfloat16* __restrict__ V,
+                                      const int* __restrict__ kv_len,
+                                      const int* __restrict__ decode_slot, unsigned n_batch,
+                                      unsigned n_head, unsigned n_kv_head, unsigned kv_stride,
+                                      float scale, unsigned slice, unsigned nblk,
+                                      unsigned char* smem, FaStHnr hnr = {}) {
+    constexpr unsigned LPR = D / 8, GPW = 32u / LPR, NGRP = PLOW_NV_WARPS * GPW;
+    constexpr int U = PLOW_NV_FA_RG_U;
+    constexpr unsigned NST = PLOW_NV_FA_ST_STAGES, TR = FA_ST_TR;
+    static_assert(D == 128 && NGRP == 16 && NGRP * U == TR && GF <= 4, "streamed decode: hd128 row groups");
+    const unsigned tid = threadIdx.x, lane = tid & 31u, warp = tid >> 5;
+    const unsigned gqa = n_head / n_kv_head, n_grp = n_head / GF, n_work = n_batch * n_grp;
+    const unsigned sbase = (unsigned)__cvta_generic_to_shared(smem);
+    const unsigned full = sbase + FA_ST_BAR_OFF(D), empty = full + 8u * NST;
+    if (tid == 0) {
+#pragma unroll
+        for (unsigned s = 0; s < NST; s++) {
+            asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;\n" ::"r"(full + 8u * s));
+            asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;\n" ::"r"(empty + 8u * s), "r"(PLOW_NV_WARPS));
+        }
+        asm volatile("fence.mbarrier_init.release.cluster;\n" ::: "memory");
+    }
+    __syncthreads();
+    if (warp == PLOW_NV_WARPS) {
+        /* chunk = 8 elements; lane l ropes chunk l of heads (0,1), then of (2, new k), then v */
+        const unsigned sub = lane & 15u;
+        unsigned t = 0;
+        for (unsigned w = slice; w < n_work; w += nblk) {
+            const unsigned b = w / n_grp, h0 = (w % n_grp) * GF, hkv = h0 / gqa;
+            const size_t slot = decode_slot ? (size_t)decode_slot[b] : (size_t)b;
+            const unsigned len = (unsigned)kv_len[b];
+            const size_t kv0 = (slot * n_kv_head + hkv) * (size_t)kv_stride * D;
+            bf16v8 q8[2];
+            if (hnr.pos) {
+                if (GF > 3) __trap();
+                const unsigned p = (unsigned)hnr.pos[b];
+                const unsigned j = (lane & 7u) * 8u;
+                const float4 c0 = *(const float4*)(hnr.cosb + (size_t)p * 64u + j);
+                const float4 c1 = *(const float4*)(hnr.cosb + (size_t)p * 64u + j + 4u);
+                const float4 s0 = *(const float4*)(hnr.sinb + (size_t)p * 64u + j);
+                const float4 s1 = *(const float4*)(hnr.sinb + (size_t)p * 64u + j + 4u);
+                const float c[8] = {c0.x, c0.y, c0.z, c0.w, c1.x, c1.y, c1.z, c1.w};
+                const float sn[8] = {s0.x, s0.y, s0.z, s0.w, s1.x, s1.y, s1.z, s1.w};
+                const __nv_bfloat16* qrow = hnr.qx + (size_t)b * hnr.q_row + h0 * D;
+                const bf16v8 x0 = ld_glob8(qrow + lane * 8u); /* heads h0, h0+1 */
+                const bf16v8 x1 = lane < 16u ? ld_glob8(qrow + 2u * D + sub * 8u)
+                                             : ld_glob8(hnr.kx + (size_t)b * hnr.k_row + hkv * D + sub * 8u);
+                const bf16v8 xv = ld_glob8(hnr.vx + (size_t)b * hnr.v_row + hkv * D + (lane & 15u) * 8u);
+#pragma unroll
+                for (int r = 0; r < 2; r++) {
+                    const bf16v8& x = r ? x1 : x0;
+#pragma unroll
+                    for (int i = 0; i < 8; i++) {
+                        const float v = __bfloat162float(x.x[i]);
+                        const float partner = __shfl_xor_sync(0xffffffffu, v, 8, 32);
+                        q8[r].x[i] = __float2bfloat16(sub < 8u ? (v * c[i] - partner * sn[i])
+                                                               : (v * c[i] + partner * sn[i]));
+                    }
+                }
+                /* new cache rows at pos[b]: k from lanes 16-31 of round 1, v copied by 0-15 */
+                __nv_bfloat16* dst = lane < 16u ? V : K;
+                *(uint4*)(dst + kv0 + (size_t)p * D + sub * 8u) = lane < 16u ? *(const uint4*)&xv : *(const uint4*)&q8[1];
+                asm volatile("fence.proxy.async.global;\n" ::: "memory");
+            }
+            for (unsigned r0 = 0; r0 < len; r0 += TR, t++) {
+                const unsigned s = t % NST;
+                if (t >= NST) fa_st_wait(empty + 8u * s, ((t / NST) - 1u) & 1u);
+                const unsigned dst = sbase + s * FA_ST_STAGE_BYTES(D);
+                const unsigned qbytes = r0 == 0 && !hnr.pos ? GF * (unsigned)D * 2u : 0u;
+                if (r0 == 0 && hnr.pos) {
+                    __nv_bfloat16* qs = (__nv_bfloat16*)(smem + s * FA_ST_STAGE_BYTES(D) + FA_ST_Q_OFF(D));
+                    *(uint4*)(qs + lane * 8u) = *(const uint4*)&q8[0];
+                    if (GF > 2 && lane < 16u) *(uint4*)(qs + 2u * D + sub * 8u) = *(const uint4*)&q8[1];
+                }
+                __syncwarp();
+                if (lane == 0) {
+                    const unsigned bytes = min(TR, len - r0) * (unsigned)D * 2u;
+                    asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;\n"
+                                 ::"r"(full + 8u * s), "r"(2u * bytes + qbytes) : "memory");
+                    fa_st_bulk(dst, K + kv0 + (size_t)r0 * D, bytes, full + 8u * s);
+                    fa_st_bulk(dst + TR * D * 2u, V + kv0 + (size_t)r0 * D, bytes, full + 8u * s);
+                    if (qbytes)
+                        fa_st_bulk(dst + FA_ST_Q_OFF(D), Q + ((size_t)b * n_head + h0) * D, qbytes, full + 8u * s);
+                }
+            }
+        }
+        return;
+    }
+    const unsigned sub = lane % LPR, grp = warp * GPW + lane / LPR;
+    float* go = (float*)(smem + FA_ST_FOLD_OFF(D)); /* [NGRP][D] */
+    float* gm = go + NGRP * D;
+    float* gl = gm + NGRP;
+    unsigned t = 0;
+    for (unsigned w = slice; w < n_work; w += nblk) {
+        const unsigned b = w / n_grp, h0 = (w % n_grp) * GF;
+        const unsigned hi = (unsigned)kv_len[b];
+        float qf[GF][8], m[GF], l[GF], o[GF][8];
+        if (hi) fa_st_wait(full + 8u * (t % NST), (t / NST) & 1u);
+        const __nv_bfloat16* qs = (const __nv_bfloat16*)(smem + (t % NST) * FA_ST_STAGE_BYTES(D) + FA_ST_Q_OFF(D));
+#pragma unroll
+        for (int g = 0; g < GF; g++) {
+            const bf16v8 q8 = hi ? ld_smem8(qs + g * D + sub * 8u) : bf16v8{};
+#pragma unroll
+            for (int i = 0; i < 8; i++) {
+                qf[g][i] = __bfloat162float(q8.x[i]) * FA_SCALE(scale);
+                o[g][i] = 0.0f;
+            }
+            m[g] = FA_NEG_INF;
+            l[g] = 0.0f;
+        }
+        for (unsigned base = 0; base < hi; base += TR, t++) {
+            const unsigned s = t % NST;
+            fa_st_wait(full + 8u * s, (t / NST) & 1u);
+            const __nv_bfloat16* kt = (const __nv_bfloat16*)(smem + s * FA_ST_STAGE_BYTES(D));
+            const __nv_bfloat16* vt = kt + TR * D;
+            const unsigned r0 = base + grp;
+            bf16v8 k8[U], v8[U];
+#pragma unroll
+            for (int u = 0; u < U; u++) {
+                const unsigned r = min(r0 + NGRP * (unsigned)u, hi - 1u) - base;
+                k8[u] = ld_smem8(kt + r * D + sub * 8u);
+                v8[u] = ld_smem8(vt + r * D + sub * 8u);
+            }
+            __syncwarp();
+            if (lane == 0) asm volatile("mbarrier.arrive.shared::cta.b64 _, [%0];\n" ::"r"(empty + 8u * s) : "memory");
+            float sc[GF][U];
+#pragma unroll
+            for (int u = 0; u < U; u++)
+#pragma unroll
+                for (int g = 0; g < GF; g++) {
+                    float d = 0.0f;
+#pragma unroll
+                    for (int i = 0; i < 8; i++) d = fmaf(__bfloat162float(k8[u].x[i]), qf[g][i], d);
+#pragma unroll
+                    for (unsigned sh = LPR / 2; sh > 0; sh >>= 1) d += __shfl_xor_sync(0xffffffffu, d, sh, 32);
+                    sc[g][u] = r0 + NGRP * (unsigned)u < hi ? d : FA_NEG_INF;
+                }
+#pragma unroll
+            for (int g = 0; g < GF; g++) {
+                float mx = m[g];
+#pragma unroll
+                for (int u = 0; u < U; u++) mx = fmaxf(mx, sc[g][u]);
+                const float mref = mx > FA_NEG_INF ? mx : 0.0f;
+                const float corr = FA_EXP(m[g] - mref);
+                l[g] *= corr;
+#pragma unroll
+                for (int i = 0; i < 8; i++) o[g][i] *= corr;
+#pragma unroll
+                for (int u = 0; u < U; u++) {
+                    const float p = FA_EXP(sc[g][u] - mref);
+                    l[g] += p;
+#pragma unroll
+                    for (int i = 0; i < 8; i++) o[g][i] = fmaf(p, __bfloat162float(v8[u].x[i]), o[g][i]);
+                }
+                m[g] = mx;
+            }
+        }
+#pragma unroll
+        for (int g = 0; g < GF; g++) {
+            asm volatile("bar.sync 1, %0;\n" ::"r"(PLOW_NV_THREADS) : "memory");
+#pragma unroll
+            for (int i = 0; i < 8; i++) go[grp * D + sub * 8u + i] = o[g][i];
+            if (sub == 0) { gm[grp] = m[g]; gl[grp] = l[g]; }
+            asm volatile("bar.sync 1, %0;\n" ::"r"(PLOW_NV_THREADS) : "memory");
+            const size_t row = (size_t)b * n_head + h0 + g;
+            for (unsigned d = tid; d < (unsigned)D; d += PLOW_NV_THREADS) {
+                float M = FA_NEG_INF;
+#pragma unroll
+                for (unsigned j = 0; j < NGRP; j++) M = fmaxf(M, gm[j]);
+                float acc = 0.0f, L = 0.0f;
+#pragma unroll
+                for (unsigned j = 0; j < NGRP; j++) {
+                    const float wj = FA_EXP(gm[j] - M);
+                    acc = fmaf(go[j * D + d], wj, acc);
+                    L = fmaf(gl[j], wj, L);
+                }
+                out[row * D + d] = __float2bfloat16(L > 0.0f ? acc / L : 0.0f);
+            }
+        }
+    }
+}
+#endif
+
+/* Row-group decode with the K/V rows staged through smem by the bulk-copy engine (sm_90+,
+ * PLOW_NV_FA_RGT). Same lane map, per-group online softmax and fold as fa_decode_rg_item; what
+ * changes is how the rows arrive. The register body keeps U rows per warp in flight and nothing
+ * while it computes, ~32 KiB per SM, about half the loaded-latency x bandwidth product, so it
+ * streams at ~50% of HBM. Here each warp owns a contiguous chunk of the item's rows and a private
+ * ring of NSTG stages (GPW*U rows of K and of V, 2 KiB each at every head dim), refilled by its
+ * lane 0 with cp.async.bulk as soon as the warp has read a stage: 8 x NSTG x 4 KiB in flight per
+ * SM, no block barrier inside an item, and no K/V registers held across the dot products. Rows are
+ * contiguous in the head-major ring, so a stage is one copy (two where it wraps kv_mask). Rows
+ * past `hi` in the last stage are never copied: their scores are masked and their V rows zeroed.
+ * The sum order differs from the register body (contiguous chunks instead of interleaved rows). */
+#ifndef PLOW_NV_FA_RGT
+#define PLOW_NV_FA_RGT 0
+#endif
+#ifndef PLOW_NV_FA_RGM
+#define PLOW_NV_FA_RGM 0
+#endif
+#ifndef PLOW_NV_FA_RGT_STAGES
+#define PLOW_NV_FA_RGT_STAGES 4
+#endif
+/* 8-element chunks per lane at hd <= 256 (hd512 always 2): 2 halves the lanes per row, so the
+ * dot-product reductions take one shuffle step less and serve twice the rows per step. */
+#ifndef PLOW_NV_FA_RGT_NCH
+#define PLOW_NV_FA_RGT_NCH 1
+#endif
+#define FA_RGT_NCH(D) ((D) > 256 ? 2u : (unsigned)PLOW_NV_FA_RGT_NCH)
+#define FA_RGT_STAGE_BYTES 4096u /* 2 KiB K + 2 KiB V */
+#define FA_RGT_FOLD_FLOATS(D) ((unsigned)(PLOW_NV_WARPS * 32u / ((D) / (8u * FA_RGT_NCH(D))) * ((D) + 2u)))
+/* fold area (rounded to 128 B), then the rings, then one mbarrier per (warp, stage). */
+#define FA_RGT_RING_OFF(D) (((FA_RGT_FOLD_FLOATS(D) + 31u) / 32u) * 32u)
+#define FA_RGT_SMEM_FLOATS(D)                                                                      \
+    (FA_RGT_RING_OFF(D) + PLOW_NV_WARPS * PLOW_NV_FA_RGT_STAGES * (FA_RGT_STAGE_BYTES / 4u) +      \
+     PLOW_NV_WARPS * PLOW_NV_FA_RGT_STAGES * 2u)
+
+#if PLOW_NV_FA_RGT || PLOW_NV_FA_RGM
+__device__ __forceinline__ void fa_rgt_bulk(unsigned dst, const void* src, unsigned bytes, unsigned bar) {
+    asm volatile("cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];\n"
+                 ::"r"(dst), "l"(src), "r"(bytes), "r"(bar) : "memory");
+}
+__device__ __forceinline__ void fa_rgt_wait(unsigned bar, unsigned parity) {
+    asm volatile("{\n\t.reg .pred P%=;\n"
+                 "LAB%=:\n\tmbarrier.try_wait.parity.shared::cta.b64 P%=, [%0], %1;\n"
+                 "\t@!P%= bra LAB%=;\n\t}\n" ::"r"(bar), "r"(parity) : "memory");
+}
+#endif
+#if PLOW_NV_FA_RGT
+
+/* Per-op setup: every warp's barriers are (re)initialised, since the arena is shared with the
+ * other ops of the program. Returns this warp's ring / barrier smem addresses. */
+template <int D>
+__device__ __forceinline__ void fa_rgt_init(float* lds, unsigned& ring, unsigned& bars) {
+    const unsigned warp = threadIdx.x >> 5, lane = threadIdx.x & 31u;
+    const unsigned base = (unsigned)__cvta_generic_to_shared(lds);
+    ring = base + FA_RGT_RING_OFF(D) * 4u + warp * PLOW_NV_FA_RGT_STAGES * FA_RGT_STAGE_BYTES;
+    bars = base + (FA_RGT_RING_OFF(D) + PLOW_NV_WARPS * PLOW_NV_FA_RGT_STAGES * (FA_RGT_STAGE_BYTES / 4u)) * 4u +
+           warp * PLOW_NV_FA_RGT_STAGES * 8u;
+    __syncthreads(); /* the previous op's reads of this arena are done */
+    if (lane == 0) {
+#pragma unroll
+        for (int s = 0; s < PLOW_NV_FA_RGT_STAGES; s++)
+            asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;\n" ::"r"(bars + 8u * s));
+        asm volatile("fence.mbarrier_init.release.cluster;\n" ::: "memory");
+        asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+    }
+    __syncwarp();
+}
+
+/* noinline: its own register allocation, not the megakernel's merged pressure. */
+template <int D, int GF>
+__device__ __noinline__ void fa_decode_rgt_item(
+    float* __restrict__ Opart, float* __restrict__ mlpart, __nv_bfloat16* __restrict__ out,
+    const __nv_bfloat16* __restrict__ Q, const __nv_bfloat16* __restrict__ kbase,
+    const __nv_bfloat16* __restrict__ vbase, unsigned b, unsigned n_head, unsigned h0,
+    unsigned nsplit, unsigned sp, unsigned lo, unsigned hi, unsigned kv_mask, float scale,
+    float* lds, unsigned* __restrict__ ctr, unsigned ring, unsigned bars, unsigned& seq) {
+    constexpr unsigned NCH = FA_RGT_NCH(D);
+    constexpr unsigned LPR = D / (8 * NCH), GPW = 32u / LPR, NGRP = PLOW_NV_WARPS * GPW;
+    constexpr unsigned RS = FA_RGT_STAGE_BYTES / 2u / (2u * D); /* rows per stage */
+    constexpr unsigned U = RS / GPW;                             /* rows per group per stage */
+    constexpr unsigned NSTG = PLOW_NV_FA_RGT_STAGES;
+    constexpr int E = 8 * NCH;
+    static_assert(RS % GPW == 0 && U >= 1, "stage rows");
+    const unsigned tid = threadIdx.x, lane = tid & 31u, warp = tid >> 5;
+    const unsigned sub = lane % LPR, gw = lane / LPR, grp = warp * GPW + gw;
+    float qf[GF][E], m[GF], l[GF], o[GF][E];
+#pragma unroll
+    for (int g = 0; g < GF; g++) {
+#pragma unroll
+        for (int c = 0; c < (int)NCH; c++) {
+            const bf16v8 q8 = ld_glob8(Q + ((size_t)b * n_head + h0 + g) * D + c * LPR * 8u + sub * 8u);
+#pragma unroll
+            for (int i = 0; i < 8; i++) {
+                qf[g][c * 8 + i] = __bfloat162float(q8.x[i]) * FA_SCALE(scale);
+                o[g][c * 8 + i] = 0.0f;
+            }
+        }
+        m[g] = FA_NEG_INF;
+        l[g] = 0.0f;
+    }
+    /* This warp's rows: a contiguous chunk, a whole number of stages long. */
+    const unsigned n = hi > lo ? hi - lo : 0u; /* a split past a short context has no rows */
+    const unsigned cw = ((n + PLOW_NV_WARPS - 1u) / PLOW_NV_WARPS + RS - 1u) / RS * RS;
+    const unsigned wlo = min(lo + warp * cw, hi), whi = min(wlo + cw, hi);
+    const unsigned nst = (whi - wlo + RS - 1u) / RS;
+    auto issue = [&](unsigned j) {
+        const unsigned s = (seq + j) % NSTG;
+        const unsigned r0 = wlo + j * RS, nr = min(RS, whi - r0);
+        const unsigned kd = ring + s * FA_RGT_STAGE_BYTES, vd = kd + FA_RGT_STAGE_BYTES / 2u;
+        const unsigned bar = bars + 8u * s;
+        asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;\n" ::"r"(bar),
+                     "r"(2u * nr * D * 2u) : "memory");
+        const unsigned p0 = r0 & kv_mask;
+        const unsigned n1 = (kv_mask != 0xFFFFFFFFu && p0 + nr > kv_mask + 1u) ? kv_mask + 1u - p0 : nr;
+        fa_rgt_bulk(kd, kbase + (size_t)p0 * D, n1 * D * 2u, bar);
+        fa_rgt_bulk(vd, vbase + (size_t)p0 * D, n1 * D * 2u, bar);
+        if (n1 < nr) {
+            fa_rgt_bulk(kd + n1 * D * 2u, kbase, (nr - n1) * D * 2u, bar);
+            fa_rgt_bulk(vd + n1 * D * 2u, vbase, (nr - n1) * D * 2u, bar);
+        }
+    };
+    if (lane == 0)
+        for (unsigned j = 0; j < min(nst, NSTG); j++) issue(j);
+    const __nv_bfloat16* const stg = (const __nv_bfloat16*)(lds + FA_RGT_RING_OFF(D)) +
+                                     (size_t)warp * NSTG * (FA_RGT_STAGE_BYTES / 2u);
+    for (unsigned j = 0; j < nst; j++) {
+        const unsigned s = (seq + j) % NSTG;
+        fa_rgt_wait(bars + 8u * s, ((seq + j) / NSTG) & 1u);
+        const unsigned r0 = wlo + j * RS, nr = min(RS, whi - r0);
+        const __nv_bfloat16* ks = stg + (size_t)s * (FA_RGT_STAGE_BYTES / 2u);
+        __nv_bfloat16* vs = (__nv_bfloat16*)ks + FA_RGT_STAGE_BYTES / 4u;
+        if (nr < RS) {
+            /* Rows never copied hold stale smem (possibly NaN): P is 0 there, 0 * NaN is not. */
+            for (unsigned i = lane; i < (RS - nr) * D / 8u; i += 32u)
+                *(uint4*)(vs + nr * D + i * 8u) = make_uint4(0, 0, 0, 0);
+            __syncwarp();
+        }
+        float sc[GF][U];
+#pragma unroll
+        for (int u = 0; u < (int)U; u++) {
+            const unsigned rr = gw * U + (unsigned)u;
+            bf16v8 k8[NCH];
+#pragma unroll
+            for (int c = 0; c < (int)NCH; c++) k8[c] = ld_smem8(ks + rr * D + c * LPR * 8u + sub * 8u);
+#pragma unroll
+            for (int g = 0; g < GF; g++) {
+                float d = 0.0f;
+#pragma unroll
+                for (int c = 0; c < (int)NCH; c++)
+#pragma unroll
+                    for (int i = 0; i < 8; i++)
+                        d = fmaf(__bfloat162float(k8[c].x[i]), qf[g][c * 8 + i], d);
+#pragma unroll
+                for (unsigned o2 = LPR / 2; o2 > 0; o2 >>= 1) d += __shfl_xor_sync(0xffffffffu, d, o2, 32);
+                sc[g][u] = rr < nr ? d : FA_NEG_INF;
+            }
+        }
+#pragma unroll
+        for (int g = 0; g < GF; g++) {
+            float mx = m[g];
+#pragma unroll
+            for (int u = 0; u < (int)U; u++) mx = fmaxf(mx, sc[g][u]);
+            const float mref = mx > FA_NEG_INF ? mx : 0.0f;
+            const float corr = FA_EXP(m[g] - mref);
+            l[g] *= corr;
+#pragma unroll
+            for (int i = 0; i < E; i++) o[g][i] *= corr;
+            m[g] = mx;
+        }
+#pragma unroll
+        for (int u = 0; u < (int)U; u++) {
+            const unsigned rr = gw * U + (unsigned)u;
+            bf16v8 v8[NCH];
+#pragma unroll
+            for (int c = 0; c < (int)NCH; c++) v8[c] = ld_smem8(vs + rr * D + c * LPR * 8u + sub * 8u);
+#pragma unroll
+            for (int g = 0; g < GF; g++) {
+                const float mref = m[g] > FA_NEG_INF ? m[g] : 0.0f;
+                const float p = FA_EXP(sc[g][u] - mref);
+                l[g] += p;
+#pragma unroll
+                for (int c = 0; c < (int)NCH; c++)
+#pragma unroll
+                    for (int i = 0; i < 8; i++)
+                        o[g][c * 8 + i] = fmaf(p, __bfloat162float(v8[c].x[i]), o[g][c * 8 + i]);
+            }
+        }
+        __syncwarp();
+        if (lane == 0 && j + NSTG < nst) {
+            asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+            issue(j + NSTG);
+        }
+    }
+    seq += nst;
+    /* Fold: identical to fa_decode_rg_item. */
+    float* go = lds;
+    float* gm = lds + NGRP * D;
+    float* gl = gm + NGRP;
+#pragma unroll
+    for (int g = 0; g < GF; g++) {
+        __syncthreads();
+#pragma unroll
+        for (int c = 0; c < (int)NCH; c++)
+#pragma unroll
+            for (int i = 0; i < 8; i++) go[grp * D + c * LPR * 8u + sub * 8u + i] = o[g][c * 8 + i];
+        if (sub == 0) { gm[grp] = m[g]; gl[grp] = l[g]; }
+        __syncthreads();
+        const size_t row = (size_t)b * n_head + h0 + g;
+        for (unsigned d = tid; d < (unsigned)D; d += PLOW_NV_THREADS) {
+            float M = FA_NEG_INF;
+#pragma unroll
+            for (unsigned j = 0; j < NGRP; j++) M = fmaxf(M, gm[j]);
+            float acc = 0.0f, L = 0.0f;
+#pragma unroll
+            for (unsigned j = 0; j < NGRP; j++) {
+                const float w = FA_EXP(gm[j] - M);
+                acc = fmaf(go[j * D + d], w, acc);
+                L = fmaf(gl[j], w, L);
+            }
+            if (out && nsplit == 1) {
+                out[row * D + d] = __float2bfloat16(L > 0.0f ? acc / L : 0.0f);
+            } else {
+                Opart[(row * nsplit + sp) * D + d] = acc;
+                if (d == 0) {
+                    mlpart[(row * nsplit + sp) * 2] = M;
+                    mlpart[(row * nsplit + sp) * 2 + 1] = L;
+                }
+            }
+        }
+    }
+    if (!out || nsplit == 1) return;
+    __syncthreads();
+    unsigned* arrived = (unsigned*)gl;
+    if (tid == 0) {
+        __threadfence();
+        arrived[0] = atomicAdd(ctr, 1u);
+        __threadfence();
+    }
+    __syncthreads();
+    if (arrived[0] != nsplit - 1u) return;
+    fa_fold_tail<D, GF>(out, Opart, mlpart, (size_t)b * n_head + h0, nsplit, go);
+    if (tid == 0) atomicExch(ctr, 0u);
+}
+#endif /* PLOW_NV_FA_RGT */
+
+/* Tensor-core decode item (PLOW_NV_FA_RGM; hd <= 256, GF <= 8). The CUDA-core row-group bodies
+ * are issue-bound at hd256: ~160 warp instructions per KV row (GF x 5-step shuffle reductions,
+ * per-head exps, bf16 converts), ~82 cycles per row per SM against a ~70-cycle HBM budget with
+ * every SM busy. Here a warp streams its contiguous chunk of the item's rows in 8-row stages
+ * through a private ring (one cp.async.bulk per row, rows padded 16 B so ldmatrix is conflict
+ * free) and does both products on mma.sync:
+ *   S[head][row]  = Q . K^T      m16n8k16, A = Q (heads 0..GF-1 of 16), B = K via ldmatrix
+ *   O^T[d][head] += V^T . P^T    m16n8k8,  A = V via ldmatrix.trans, B = P packed from S's
+ *                                           accumulator fragment as is (same lane layout)
+ * so O^T costs hd/16 x 4 f32 per lane. P is rounded to bf16 for the second product (as the
+ * prefill bodies do); scores, m, l and O stay f32. Same (Opart, mlpart) / fold contract. */
+/* Stages per warp ring: ~128 KiB in flight per SM either way (4 x 4.3 KiB at hd128, 2 x 8.4 KiB at
+ * hd256); a third hd256 stage does not fit next to the interpreter's static smem. */
+#ifndef PLOW_NV_FA_RGM_STAGES
+#define FA_RGM_NSTG(D) ((D) <= 128 ? 4u : 2u)
+#else
+#define FA_RGM_NSTG(D) ((unsigned)PLOW_NV_FA_RGM_STAGES)
+#endif
+#define FA_RGM_RB(D) ((unsigned)(D) * 2u + 16u)          /* padded smem row bytes */
+#define FA_RGM_STAGE_BYTES(D) (16u * FA_RGM_RB(D))        /* 8 K rows + 8 V rows */
+#define FA_RGM_FOLD_FLOATS(D) (((PLOW_NV_WARPS * ((D) + 2u)) + 31u) / 32u * 32u)
+#define FA_RGM_SMEM_FLOATS(D)                                                                      \
+    (FA_RGM_FOLD_FLOATS(D) + PLOW_NV_WARPS * FA_RGM_NSTG(D) * FA_RGM_STAGE_BYTES(D) / 4u +         \
+     PLOW_NV_WARPS * FA_RGM_NSTG(D) * 2u)
+
+#if PLOW_NV_FA_RGM
+template <int D>
+__device__ __forceinline__ void fa_rgm_init(float* lds, unsigned& ring, unsigned& bars) {
+    const unsigned warp = threadIdx.x >> 5, lane = threadIdx.x & 31u;
+    const unsigned base = (unsigned)__cvta_generic_to_shared(lds);
+    ring = base + FA_RGM_FOLD_FLOATS(D) * 4u + warp * FA_RGM_NSTG(D) * FA_RGM_STAGE_BYTES(D);
+    bars = base + FA_RGM_FOLD_FLOATS(D) * 4u +
+           PLOW_NV_WARPS * FA_RGM_NSTG(D) * FA_RGM_STAGE_BYTES(D) + warp * FA_RGM_NSTG(D) * 8u;
+    __syncthreads();
+    if (lane == 0) {
+#pragma unroll
+        for (int s = 0; s < FA_RGM_NSTG(D); s++)
+            asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;\n" ::"r"(bars + 8u * s));
+        asm volatile("fence.mbarrier_init.release.cluster;\n" ::: "memory");
+        asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+    }
+    __syncwarp();
+}
+
+__device__ __forceinline__ void fa_rgm_ldsm4(unsigned (&r)[4], unsigned addr) {
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(addr));
+}
+__device__ __forceinline__ void fa_rgm_ldsm4t(unsigned (&r)[4], unsigned addr) {
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(addr));
+}
+__device__ __forceinline__ void fa_rgm_mma16(float (&c)[4], unsigned a0, unsigned a2, unsigned b0,
+                                             unsigned b1) {
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+                 "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+                 : "r"(a0), "r"(0u), "r"(a2), "r"(0u), "r"(b0), "r"(b1));
+}
+__device__ __forceinline__ void fa_rgm_mma8(float (&c)[4], unsigned a0, unsigned a1, unsigned b0) {
+    asm volatile("mma.sync.aligned.m16n8k8.row.col.f32.bf16.bf16.f32 "
+                 "{%0,%1,%2,%3}, {%4,%5}, {%6}, {%0,%1,%2,%3};\n"
+                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+                 : "r"(a0), "r"(a1), "r"(b0));
+}
+
+/* noinline: its own register allocation, not the megakernel's merged pressure. */
+template <int D, int GF>
+__device__ __noinline__ void fa_decode_rgm_item(
+    float* __restrict__ Opart, float* __restrict__ mlpart, __nv_bfloat16* __restrict__ out,
+    const __nv_bfloat16* __restrict__ Q, const __nv_bfloat16* __restrict__ kbase,
+    const __nv_bfloat16* __restrict__ vbase, unsigned b, unsigned n_head, unsigned h0,
+    unsigned nsplit, unsigned sp, unsigned lo, unsigned hi, unsigned kv_mask, float scale,
+    float* lds, unsigned* __restrict__ ctr, unsigned ring, unsigned bars, unsigned& seq,
+    const __nv_bfloat16* __restrict__ nkbase, const __nv_bfloat16* __restrict__ nvbase,
+    unsigned nlo, unsigned nhi, unsigned& pre) {
+    static_assert(D == 128 || D == 256, "rgm: hd128 / hd256");
+    static_assert(GF >= 1 && GF <= 8, "rgm: heads are the 8 real rows of the m16 tile");
+    constexpr unsigned RB = FA_RGM_RB(D), SB = FA_RGM_STAGE_BYTES(D), NSTG = FA_RGM_NSTG(D);
+    constexpr int KS = D / 16, MT = D / 16;
+    const unsigned tid = threadIdx.x, lane = tid & 31u, warp = tid >> 5;
+    const unsigned gid = lane >> 2, tig = lane & 3u;
+    /* Q A-fragments (rows 8..15 are the zero registers of the mma). */
+    uint32_t qa[KS][2];
+#pragma unroll
+    for (int k = 0; k < KS; k++) {
+        if (gid < (unsigned)GF) {
+            const uint32_t* qr = (const uint32_t*)(Q + ((size_t)b * n_head + h0 + gid) * D + k * 16);
+            qa[k][0] = qr[tig];
+            qa[k][1] = qr[4 + tig];
+        } else {
+            qa[k][0] = 0u;
+            qa[k][1] = 0u;
+        }
+    }
+    const float ls = FA_SCALE(scale);
+    float o[MT][4];
+#pragma unroll
+    for (int t = 0; t < MT; t++) o[t][0] = o[t][1] = o[t][2] = o[t][3] = 0.0f;
+    float m = FA_NEG_INF, l = 0.0f; /* head gid; l is this lane's partial */
+
+    /* This warp's rows of this item and of the block's next item (nhi == nlo: none). The ring
+     * runs on across items: stages of the next item are issued as soon as slots free up, so its
+     * first rows are in flight while this item folds. `pre` = next item stages already issued. */
+    auto chunk = [&](unsigned a, unsigned z, unsigned& wa, unsigned& wz) {
+        if (z <= a) { /* a split past a short context has no rows */
+            wa = wz = a;
+            return;
+        }
+        const unsigned cw = ((z - a + PLOW_NV_WARPS - 1u) / PLOW_NV_WARPS + 7u) / 8u * 8u;
+        wa = min(a + warp * cw, z);
+        wz = min(wa + cw, z);
+    };
+    unsigned wlo, whi, nwlo, nwhi;
+    chunk(lo, hi, wlo, whi);
+    chunk(nlo, nhi, nwlo, nwhi);
+    const unsigned nst = (whi - wlo + 7u) / 8u, nst_n = (nwhi - nwlo + 7u) / 8u;
+    auto issue = [&](unsigned k) {
+        const bool cur = k < nst;
+        const unsigned j = cur ? k : k - nst;
+        const unsigned s = (seq + k) % NSTG;
+        const unsigned r0 = (cur ? wlo : nwlo) + j * 8u, nr = min(8u, (cur ? whi : nwhi) - r0);
+        const unsigned bar = bars + 8u * s;
+        if (lane == 0)
+            asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;\n" ::"r"(bar),
+                         "r"(2u * nr * D * 2u) : "memory");
+        __syncwarp();
+        if (lane < 2u * nr) {
+            const unsigned r = lane >> 1, v = lane & 1u;
+            const size_t src = (size_t)((r0 + r) & kv_mask) * D;
+            const __nv_bfloat16* base = cur ? (v ? vbase : kbase) : (v ? nvbase : nkbase);
+            fa_rgt_bulk(ring + s * SB + (v * 8u + r) * RB, base + src, D * 2u, bar);
+        }
+    };
+    unsigned issued = pre;
+    auto top_up = [&](unsigned consumed) {
+        if (issued >= consumed + NSTG || issued >= nst + nst_n) return;
+        asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+        __syncwarp();
+        while (issued < consumed + NSTG && issued < nst + nst_n) issue(issued++);
+    };
+    top_up(0);
+    for (unsigned j = 0; j < nst; j++) {
+        const unsigned s = (seq + j) % NSTG;
+        fa_rgt_wait(bars + 8u * s, ((seq + j) / NSTG) & 1u);
+        const unsigned r0 = wlo + j * 8u, nr = min(8u, whi - r0);
+        const unsigned ks = ring + s * SB, vs = ks + 8u * RB;
+        if (nr < 8u) {
+            /* Rows never copied hold stale smem (possibly NaN): P is 0 there, 0 * NaN is not. */
+            for (unsigned i = lane; i < (8u - nr) * (D / 8u); i += 32u) {
+                const unsigned r = nr + i / (D / 8u), c = i % (D / 8u);
+                asm volatile("st.shared.v4.u32 [%0], {%1,%1,%1,%1};\n" ::"r"(vs + r * RB + c * 16u), "r"(0u)
+                             : "memory");
+            }
+            __syncwarp();
+        }
+        /* S = Q . K^T: two accumulators halve the dependent mma chain. */
+        float sa[4] = {0.0f, 0.0f, 0.0f, 0.0f}, sb[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+#pragma unroll
+        for (int kk = 0; kk < KS / 2; kk++) {
+            unsigned kb[4];
+            fa_rgm_ldsm4(kb, ks + (lane & 7u) * RB + (unsigned)(kk * 32 + (lane >> 3) * 8) * 2u);
+            fa_rgm_mma16(sa, qa[2 * kk][0], qa[2 * kk][1], kb[0], kb[1]);
+            fa_rgm_mma16(sb, qa[2 * kk + 1][0], qa[2 * kk + 1][1], kb[2], kb[3]);
+        }
+        float s0 = (2u * tig < nr) ? (sa[0] + sb[0]) * ls : FA_NEG_INF;
+        float s1 = (2u * tig + 1u < nr) ? (sa[1] + sb[1]) * ls : FA_NEG_INF;
+        float mx = fmaxf(s0, s1);
+        mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, 1));
+        mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, 2));
+        const float mn = fmaxf(m, mx);
+        const float mref = mn > FA_NEG_INF ? mn : 0.0f;
+        const float corr = FA_EXP(m - mref);
+        const float p0 = FA_EXP(s0 - mref), p1 = FA_EXP(s1 - mref);
+        m = mn;
+        l = l * corr + p0 + p1;
+        /* O^T rows are d, columns are heads 2 tig, 2 tig + 1: their corrections live in lanes
+         * 8 tig (head 2 tig) and 8 tig + 4 (head 2 tig + 1). */
+        const float ce = __shfl_sync(0xffffffffu, corr, 8u * tig);
+        const float co = __shfl_sync(0xffffffffu, corr, 8u * tig + 4u);
+        __nv_bfloat162 pp = __floats2bfloat162_rn(p0, p1);
+        const unsigned pb = *reinterpret_cast<unsigned*>(&pp);
+#pragma unroll
+        for (int t = 0; t < MT; t++) {
+            o[t][0] *= ce;
+            o[t][1] *= co;
+            o[t][2] *= ce;
+            o[t][3] *= co;
+        }
+#pragma unroll
+        for (int mm = 0; mm < MT / 2; mm++) {
+            unsigned va[4];
+            fa_rgm_ldsm4t(va, vs + (lane & 7u) * RB + (unsigned)(mm * 32 + (lane >> 3) * 8) * 2u);
+            fa_rgm_mma8(o[2 * mm], va[0], va[1], pb);
+            fa_rgm_mma8(o[2 * mm + 1], va[2], va[3], pb);
+        }
+        top_up(j + 1);
+    }
+    seq += nst;
+    pre = issued - nst;
+    l += __shfl_xor_sync(0xffffffffu, l, 1);
+    l += __shfl_xor_sync(0xffffffffu, l, 2);
+    /* Fold the 8 warps (one group each) per head, as fa_decode_rg_item does. */
+    float* go = lds;                 /* [8][D] */
+    float* gm = lds + PLOW_NV_WARPS * D;
+    float* gl = gm + PLOW_NV_WARPS;
+#pragma unroll
+    for (int g = 0; g < GF; g++) {
+        const float mg = __shfl_sync(0xffffffffu, m, 4u * g), lg = __shfl_sync(0xffffffffu, l, 4u * g);
+        __syncthreads();
+        if (tig == (unsigned)g / 2u) {
+#pragma unroll
+            for (int t = 0; t < MT; t++) {
+                go[warp * D + t * 16 + gid] = o[t][g & 1];
+                go[warp * D + t * 16 + gid + 8] = o[t][2 + (g & 1)];
+            }
+        }
+        if (lane == 0) { gm[warp] = mg; gl[warp] = lg; }
+        __syncthreads();
+        const size_t row = (size_t)b * n_head + h0 + g;
+        for (unsigned d = tid; d < (unsigned)D; d += PLOW_NV_THREADS) {
+            float M = FA_NEG_INF;
+#pragma unroll
+            for (unsigned w = 0; w < PLOW_NV_WARPS; w++) M = fmaxf(M, gm[w]);
+            float acc = 0.0f, L = 0.0f;
+#pragma unroll
+            for (unsigned w = 0; w < PLOW_NV_WARPS; w++) {
+                const float wt = FA_EXP(gm[w] - M);
+                acc = fmaf(go[w * D + d], wt, acc);
+                L = fmaf(gl[w], wt, L);
+            }
+            if (out && nsplit == 1) {
+                out[row * D + d] = __float2bfloat16(L > 0.0f ? acc / L : 0.0f);
+            } else {
+                Opart[(row * nsplit + sp) * D + d] = acc;
+                if (d == 0) {
+                    mlpart[(row * nsplit + sp) * 2] = M;
+                    mlpart[(row * nsplit + sp) * 2 + 1] = L;
+                }
+            }
+        }
+    }
+    if (!out || nsplit == 1) return;
+    __syncthreads();
+    unsigned* arrived = (unsigned*)gl;
+    if (tid == 0) {
+        __threadfence();
+        arrived[0] = atomicAdd(ctr, 1u);
+        __threadfence();
+    }
+    __syncthreads();
+    if (arrived[0] != nsplit - 1u) return;
+    fa_fold_tail<D, GF>(out, Opart, mlpart, (size_t)b * n_head + h0, nsplit, go);
+    if (tid == 0) atomicExch(ctr, 0u);
+}
+#endif /* PLOW_NV_FA_RGM */
 
 
 /* Persistent-grid body: this block runs work items `slice, slice+nblk, ...`.
@@ -724,7 +1698,99 @@ __device__ __forceinline__ void fa_decode_qk_mma(float* scores, const __nv_bfloa
 #ifndef PLOW_NV_KVBOUNDS
 #define PLOW_NV_KVBOUNDS 0
 #endif
-template <int D, int GF, bool FP8KV = false, bool SZKV = false, bool SLOTMAP = false>
+/* hd64, one query head per KV head (GF 1: Chatterbox T3). The tile body's per-thread K row is 8
+ * dependent-address 16 B loads 128 B apart per lane, and every 256-row tile pays ~8 block
+ * barriers for the softmax, so a <=256-row split item is barrier/latency bound (T3 B=128 ctx 800:
+ * FlashDecode 1.93 TB/s, 58% of the step). Here 8 lanes own one row (16 B each: a warp load is 4
+ * whole contiguous rows, K and V issued together), every 8-lane group runs its own online softmax
+ * over rows g, g+32, ... of the item, and the 32 group states fold once per item through smem.
+ * Same (Opart, mlpart) contract as the tile body; the sum order differs (not bit-identical). */
+#ifndef PLOW_NV_FA_D64W
+#define PLOW_NV_FA_D64W 1
+#endif
+__device__ __forceinline__ void fa_decode_d64_item(float* __restrict__ op, float* __restrict__ ml,
+                                                   const __nv_bfloat16* __restrict__ q,
+                                                   const __nv_bfloat16* __restrict__ kbase,
+                                                   const __nv_bfloat16* __restrict__ vbase,
+                                                   unsigned lo, unsigned hi, unsigned kv_mask,
+                                                   float scale, float* lds) {
+    constexpr int U = 4; /* rows per group in flight; 8 measured no better (T3 B=2..128) */
+    const unsigned tid = threadIdx.x, lane = tid & 31u, warp = tid >> 5;
+    const unsigned sub = lane & 7u, grp = warp * 4u + (lane >> 3); /* 32 groups of 8 lanes */
+    float qf[8];
+    {
+        const bf16v8 q8 = ld_glob8(q + sub * 8u);
+#pragma unroll
+        for (int i = 0; i < 8; i++) qf[i] = __bfloat162float(q8.x[i]) * FA_SCALE(scale);
+    }
+    float m = FA_NEG_INF, l = 0.0f, o[8];
+#pragma unroll
+    for (int i = 0; i < 8; i++) o[i] = 0.0f;
+    /* Group g takes rows lo + g + 32*j: a warp's 4 groups read 4 consecutive rows (512 B). The
+     * trip count is block-uniform: the lane reductions below are full-warp shuffles. */
+    for (unsigned base = lo; base < hi; base += 32u * U) {
+        const unsigned r0 = base + grp;
+        bf16v8 k8[U], v8[U];
+#pragma unroll
+        for (int u = 0; u < U; u++) {
+            const unsigned r = min(r0 + 32u * (unsigned)u, hi - 1u);
+            const size_t off = (size_t)(r & kv_mask) * 64u + sub * 8u;
+            k8[u] = ld_glob8_cs(kbase + off);
+            v8[u] = ld_glob8_cs(vbase + off);
+        }
+        float sc[U];
+        float mx = m;
+#pragma unroll
+        for (int u = 0; u < U; u++) {
+            float d = 0.0f;
+#pragma unroll
+            for (int i = 0; i < 8; i++) d = fmaf(__bfloat162float(k8[u].x[i]), qf[i], d);
+            d += __shfl_xor_sync(0xffffffffu, d, 1, 32);
+            d += __shfl_xor_sync(0xffffffffu, d, 2, 32);
+            d += __shfl_xor_sync(0xffffffffu, d, 4, 32);
+            sc[u] = d;
+            if (r0 + 32u * (unsigned)u < hi) mx = fmaxf(mx, d);
+        }
+        const float corr = FA_EXP(m - mx);
+        l *= corr;
+#pragma unroll
+        for (int i = 0; i < 8; i++) o[i] *= corr;
+#pragma unroll
+        for (int u = 0; u < U; u++) {
+            const float pw = r0 + 32u * (unsigned)u < hi ? FA_EXP(sc[u] - mx) : 0.0f;
+            l += pw;
+#pragma unroll
+            for (int i = 0; i < 8; i++) o[i] = fmaf(pw, __bfloat162float(v8[u].x[i]), o[i]);
+        }
+        m = mx;
+    }
+    float* go = lds;              /* [32][64] */
+    float* gm = lds + 32 * 64;    /* [32] */
+    float* gl = gm + 32;          /* [32] */
+    __syncthreads(); /* the previous item's fold has read go/gm/gl */
+#pragma unroll
+    for (int i = 0; i < 8; i++) go[grp * 64u + sub * 8u + i] = o[i];
+    if (sub == 0) { gm[grp] = m; gl[grp] = l; }
+    __syncthreads();
+    if (tid < 64u) {
+        float M = FA_NEG_INF;
+#pragma unroll 8
+        for (int g = 0; g < 32; g++) M = fmaxf(M, gm[g]);
+        float acc = 0.0f, L = 0.0f;
+#pragma unroll 8
+        for (int g = 0; g < 32; g++) {
+            const float w = FA_EXP(gm[g] - M);
+            acc = fmaf(go[g * 64 + tid], w, acc);
+            L = fmaf(gl[g], w, L);
+        }
+        op[tid] = acc;
+        if (tid == 0) { ml[0] = M; ml[1] = L; }
+    }
+}
+
+/* CLONE != 0: a separate instantiation for a second caller (a light kernel), so the
+ * interpreter's copy keeps its single-caller inlining and registers. */
+template <int D, int GF, bool FP8KV = false, bool SZKV = false, bool SLOTMAP = false, int CLONE = 0>
 __device__ void d_flash_decode(float* __restrict__ Opart, float* __restrict__ mlpart,
                                const __nv_bfloat16* __restrict__ Q,
                                const __nv_bfloat16* __restrict__ K,
@@ -735,7 +1801,14 @@ __device__ void d_flash_decode(float* __restrict__ Opart, float* __restrict__ ml
                                unsigned nblk, float* lds, unsigned kv_cap = 0,
                                const float* __restrict__ k_scale = nullptr,
                                const float* __restrict__ v_scale = nullptr,
-                               const int* __restrict__ decode_slot = nullptr) {
+                               const int* __restrict__ decode_slot = nullptr,
+                               __nv_bfloat16* __restrict__ out = nullptr,
+                               unsigned* __restrict__ merge_ctr = nullptr) {
+    constexpr bool RG = PLOW_NV_FA_RG && (D == 128 || (PLOW_NV_FA_RG_WIDE && (D == 256 || D == 512))) &&
+                        GF >= 2 && GF <= 4 && !FP8KV && !SZKV;
+    if constexpr (!RG) {
+        if (out) __trap(); /* a merge-folded packet needs the row-group body */
+    }
     /* A work item carries GF CONSECUTIVE query heads sharing one KV head (needs GF | gqa).
      * Indexing by head-GROUP, not by kv_head, is what makes GF < gqa correct. */
     static_assert(GF <= (int)PLOW_NV_WARPS || (PLOW_NV_FA_GF16_BENCH && GF == 16), "unsupported decode GQA grouping");
@@ -756,6 +1829,17 @@ __device__ void d_flash_decode(float* __restrict__ Opart, float* __restrict__ ml
     const unsigned dbase = (tid % NDT) * 8;
     const unsigned grp = tid / NDT;
 
+#if PLOW_NV_FA_RGT || PLOW_NV_FA_RGM
+    unsigned rgt_ring = 0, rgt_bars = 0, rgt_seq = 0, rgt_pre = 0;
+#endif
+    if constexpr (RG) {
+#if PLOW_NV_FA_RGM
+        if constexpr (D <= 256) fa_rgm_init<D>(lds, rgt_ring, rgt_bars);
+#endif
+#if PLOW_NV_FA_RGT
+        if constexpr (!PLOW_NV_FA_RGM || D > 256) fa_rgt_init<D>(lds, rgt_ring, rgt_bars);
+#endif
+    }
     for (unsigned w = slice; w < n_work; w += nblk) {
         const unsigned sp = w % nsplit;
         const unsigned hg = (w / nsplit) % n_grp;
@@ -795,6 +1879,52 @@ __device__ void d_flash_decode(float* __restrict__ Opart, float* __restrict__ ml
         const size_t kv_batch = slot;
         const __nv_bfloat16* kbase = K + (kv_batch * n_kv_head + hkv) * (size_t)kv_stride * D;
         const __nv_bfloat16* vbase = V + (kv_batch * n_kv_head + hkv) * (size_t)kv_stride * D;
+        if constexpr (PLOW_NV_FA_D64W && D == 64 && GF == 1 && !FP8KV && !SZKV) {
+            const size_t oi = (size_t)(b * n_head + h0) * nsplit + sp;
+            fa_decode_d64_item(Opart + oi * D, mlpart + oi * 2, Q + ((size_t)b * n_head + h0) * D,
+                               kbase, vbase, lo, hi, kv_mask, scale, lds);
+            continue;
+        }
+        if constexpr (RG) {
+#if PLOW_NV_FA_RGM
+            if constexpr (D <= 256) {
+                /* The block's next item, for the ring to prefetch (same formulas as above). */
+                const __nv_bfloat16 *nkb = kbase, *nvb = vbase;
+                unsigned nlo = 0, nhi = 0;
+                if (w + nblk < n_work) {
+                    const unsigned w2 = w + nblk, sp2 = w2 % nsplit, hg2 = (w2 / nsplit) % n_grp;
+                    const unsigned b2 = w2 / (nsplit * n_grp);
+                    unsigned slot2 = b2;
+                    if constexpr (SLOTMAP) slot2 = (unsigned)max(decode_slot[b2], 0);
+                    const unsigned len2 = (unsigned)kv_len[b2];
+                    const unsigned first2 = (window && len2 > window) ? (len2 - window) : 0u;
+                    const unsigned per2 = (len2 - first2 + nsplit - 1) / nsplit;
+                    nlo = first2 + sp2 * per2;
+                    nhi = (nlo + per2 < len2) ? (nlo + per2) : len2;
+                    if (nhi < nlo) nhi = nlo;
+                    const size_t kvo = ((size_t)slot2 * n_kv_head + (hg2 * GF) / gqa) * (size_t)kv_stride * D;
+                    nkb = K + kvo;
+                    nvb = V + kvo;
+                }
+                fa_decode_rgm_item<D, GF>(Opart, mlpart, out, Q, kbase, vbase, b, n_head, h0,
+                                          nsplit, sp, lo, hi, kv_mask, scale, lds,
+                                          merge_ctr ? merge_ctr + b * n_grp + hg : nullptr,
+                                          rgt_ring, rgt_bars, rgt_seq, nkb, nvb, nlo, nhi, rgt_pre);
+                continue;
+            }
+#endif
+#if PLOW_NV_FA_RGT
+            fa_decode_rgt_item<D, GF>(Opart, mlpart, out, Q, kbase, vbase, b, n_head, h0, nsplit,
+                                      sp, lo, hi, kv_mask, scale, lds,
+                                      merge_ctr ? merge_ctr + b * n_grp + hg : nullptr, rgt_ring,
+                                      rgt_bars, rgt_seq);
+#else
+            fa_decode_rg_item<D, GF>(Opart, mlpart, out, Q, kbase, vbase, b, n_head, h0, nsplit,
+                                     sp, lo, hi, kv_mask, scale, lds,
+                                     merge_ctr ? merge_ctr + b * n_grp + hg : nullptr);
+#endif
+            continue;
+        }
         /* FP8 KV: the cache is uint8 e4m3 (1 byte/elem, HALF the bytes) + a PER-ROW f32 scale, in
          * the SAME head-major RING layout. These byte bases and the per-(kv_head) scale slice are
          * unused on the bf16 instantiation (FP8KV=false compiles them out). */
@@ -1297,6 +2427,31 @@ __device__ void d_flash_decode(float* __restrict__ Opart, float* __restrict__ ml
                         }
                 }
             }
+            if constexpr (!FP8KV && !SZKV) {
+                /* The ragged last batch (at most VU-1 rows) with its loads still in flight: a
+                 * row past rmax re-reads the tile's last live row (in bounds, finite) at weight
+                 * 0 and adds exactly +0, so the sum is unchanged. The one-row loop below kept a
+                 * single load in flight; at hd64 GF1 a <=224-row split item is ALL tail. */
+                if (r < rmax) {
+                    bf16v8 vv[VU];
+#pragma unroll
+                    for (int c = 0; c < VU; c++) {
+                        const unsigned rc = min(r + (unsigned)c * NG, rmax - 1u);
+                        vv[c] = ld_glob8_cs(vbase + (size_t)((kv0 + rc) & kv_mask) * D + dbase);
+                    }
+#pragma unroll
+                    for (int c = 0; c < VU; c++)
+#pragma unroll
+                        for (int g = 0; g < GF; g++) {
+                            const unsigned rc = r + (unsigned)c * NG;
+                            const float pw = rc < rmax ? Ssm[g * FA_DEC_TILE + rc] : 0.0f;
+#pragma unroll
+                            for (int u = 0; u < 8; u++)
+                                oacc[g][u] = fmaf(pw, __bfloat162float(vv[c].x[u]), oacc[g][u]);
+                        }
+                    r = rmax;
+                }
+            }
             for (; r < rmax; r += NG) {
                 const unsigned rr = (kv0 + r) & kv_mask;
                 bf16v8 v;
@@ -1376,16 +2531,16 @@ __device__ void d_flash_decode(float* __restrict__ Opart, float* __restrict__ ml
     }
 }
 
-template <int D, int GF>
+template <int D, int GF, int CLONE = 0>
 __device__ __noinline__ void d_flash_decode_slots(
     float* Opart, float* mlpart, const __nv_bfloat16* Q, const __nv_bfloat16* K,
     const __nv_bfloat16* V, const int* kv_len, unsigned n_batch, unsigned n_head,
     unsigned n_kv_head, unsigned kv_stride, unsigned window, float scale, unsigned nsplit,
     unsigned kv_mask, unsigned slice, unsigned nblk, float* lds, unsigned kv_cap,
-    const int* decode_slot) {
-    d_flash_decode<D, GF, false, false, true>(
+    const int* decode_slot, __nv_bfloat16* out = nullptr, unsigned* merge_ctr = nullptr) {
+    d_flash_decode<D, GF, false, false, true, CLONE>(
         Opart, mlpart, Q, K, V, kv_len, n_batch, n_head, n_kv_head, kv_stride, window, scale,
-        nsplit, kv_mask, slice, nblk, lds, kv_cap, nullptr, nullptr, decode_slot);
+        nsplit, kv_mask, slice, nblk, lds, kv_cap, nullptr, nullptr, decode_slot, out, merge_ctr);
 }
 
 /* Combine the split partials: standard online-softmax merge, work unit = (batch, head).
@@ -1702,6 +2857,7 @@ __device__ void d_flash_merge(__nv_bfloat16* __restrict__ O, const float* __rest
  * fp8-KV arm, and every sm_120a build — is untouched and byte-identical. */
 #if defined(PLOW_NV_HOPPER)
 #include "op_attention_sm90.cuh"
+#include "op_attention_sm90_v3.cuh"
 /* Single-stage BF16 WGMMA never dispatches the legacy layout. */
 #define FA_PRE_SMEM_FLOATS(HD, BQ, BKV)                                                             \
     (FA_SM90_WG_ELIGIBLE(HD, BQ, BKV) && PLOW_NV_FA_PIPE                                            \
@@ -3622,6 +4778,25 @@ __device__ void d_flash_prefill(float* __restrict__ Opart, float* __restrict__ m
     /* sm_90a FORK first: when the wgmma arm claims the shape (always for <256,64,32>; for
      * <512,64,16> under PLOW_NV_FA512_WG) it beats the px4 mma.sync arm below. */
     if constexpr (FA_SM90_WG_ELIGIBLE(HD, BQ, BKV)) {
+#if PLOW_NV_FA_V3
+        /* v3 needs the TMA K/V maps and the fused (nsplit 1) epilogue; anything else keeps
+         * the shipped body. */
+        if constexpr (HD == 256 || HD == 512) {
+            if (nsplit == 1 && O && mapkv) {
+                /* fused: mlpart carries the split-KV workspace (devgen `fa_ws`) */
+                d_flash_prefill_sm90_v3<HD>(Q, O, seq_q, seq_kv, n_head, n_kv_head, q_pos0, window,
+                                            kv_stride, kv_mask, scale, slice, nblk, lds, req,
+                                            mapkv, mlpart);
+                return;
+            }
+#if PLOW_NV_FA_V3 >= 2
+            /* v3-only object: the shipped bodies are not compiled in. */
+            __trap();
+            return;
+#endif
+        }
+        if constexpr (!(PLOW_NV_FA_V3 >= 2 && (HD == 256 || HD == 512)))
+#endif
         d_flash_prefill_sm90<HD, BQ, BKV>(Opart, mlpart, Q, K, V, O, seq_q, seq_kv, n_head,
                                           n_kv_head, q_pos0, window, nsplit, kv_stride, kv_mask,
                                           scale, slice, nblk, lds, req, mapkv);
@@ -4042,6 +5217,28 @@ __device__ void d_flash_prefill_mux(const int* __restrict__ req, float* __restri
             }
         }
 #endif
+#if PLOW_NV_FA_PIPE
+        /* hd128: ONE varlen pass over every request's (q tile, head) items (the stage-2 body,
+         * per-item math identical to the serial loop below) instead of R serial passes that
+         * each fill 2 x n_head of the grid's blocks (Veena 4 x 128-row prompts: 62 us). */
+        if constexpr (HD == 128) {
+            if (O && nsplit == 1) {
+#if defined(PLOW_NV_PACKED_FA_TMA) && PLOW_NV_PACKED_FA_TMA
+                const void* packed_maps = mapkv;
+#else
+                const void* packed_maps = nullptr;
+#endif
+                d_flash_prefill<HD,BQ,BKV>(Opart,mlpart,Q,K,V,O,seq_q,seq_kv,
+                    n_head,n_kv_head,q_pos0,window,nsplit,kv_stride,kv_mask,
+                    scale,slice,nblk,lds,req,packed_maps);
+                const unsigned real=req[1+4*(count-1)]+req[2+4*(count-1)];
+                const size_t begin=(size_t)real*n_head*HD, end=(size_t)seq_q*n_head*HD;
+                for (size_t i=begin+(size_t)slice*blockDim.x+threadIdx.x;i<end;i+=(size_t)nblk*blockDim.x)
+                    O[i]=__float2bfloat16(0.0f);
+                return;
+            }
+        }
+#endif
         for (unsigned r=0; r<count; ++r) {
             const unsigned q0=req[1+4*r], qlen=req[2+4*r], slot=req[3+4*r], kvlen=req[4+4*r];
             const size_t qoff=(size_t)q0*n_head*HD;
@@ -4099,7 +5296,12 @@ __device__ void d_flash_prefill_mux(const int* __restrict__ req, float* __restri
             }
             d_flash_prefill<HD, BQ, BKV>(Opart, mlpart, Q + qoff, K + kvoff, V + kvoff,
                                          O ? O + qoff : O, sq, skv, n_head, n_kv_head, qp0, window,
-                                         ns, kv_stride, kv_mask, scale, slice, nblk, lds);
+                                         ns, kv_stride, kv_mask, scale, slice, nblk, lds
+#if PLOW_NV_FA_V3
+                                         /* the single-request map covers the whole cache */
+                                         , nullptr, req ? nullptr : mapkv
+#endif
+            );
         }
     }
 }

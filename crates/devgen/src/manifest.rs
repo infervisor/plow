@@ -332,6 +332,8 @@ struct Shapes {
     gqa: u32,
     /// KV heads on the full-attention sites — the `GF_FULL = gqa` rule's guard.
     full_kv_heads: u32,
+    /// `n_head / n_kv_head` over the hd256 decode sites (0 = none, or they disagree).
+    gqa_hd256: u32,
     /// Decode batch: `n_batch` on the decode program's flash sites.
     decode_batch: u32,
     /// `I_moe` on the Gemma decode expert-down sites (`i[2]`); 0 when the packet has none.
@@ -449,6 +451,8 @@ struct Shapes {
     /// Opcode names present, for the encoding-aware corrections below. Kept as names because that
     /// is what `features` keys on, and the two must not disagree.
     ops_present: BTreeSet<String>,
+    /// Slots of the v3 prefill split-KV workspace a fused flash prefill carries in t1 (0 = none).
+    fa_ws_slots: u32,
 }
 
 /// Was this opcode emitted anywhere in the packet?
@@ -512,10 +516,17 @@ fn shapes(m: &Model) -> Shapes {
                             s.gqa = nh / kvh;
                             s.full_kv_heads = kvh;
                         }
+                        if hd == 256 && kvh > 0 {
+                            let g = nh / kvh;
+                            s.gqa_hd256 = if s.gqa_hd256 == 0 || s.gqa_hd256 == g { g } else { u32::MAX };
+                        }
                     }
                 }
                 // `… i2=n_head i3=n_kv_head … i6=hd`
                 DevOp::FlashPrefill | DevOp::FlashPrefillFp8 => {
+                    if m.tensors.get(inst.t[1] as usize).is_some_and(|t| t.name == "act.fa_ws") {
+                        s.fa_ws_slots = m.n_cu;
+                    }
                     s.hd.insert(inst.i[6]);
                     s.kv_heads.insert(inst.i[3]);
                     s.kv_dtype
@@ -1014,7 +1025,25 @@ fn encoding_features(f: &mut Map<String, Value>, s: &Shapes) {
 ///   arm needs `I_moe % (32 / sg * 8) == 0` and silently falls back otherwise, hence the guard.
 fn tuning(s: &Shapes, arch: &str) -> Map<String, Value> {
     let mut t = Map::new();
-    t.insert("gv_mm_max".into(), json!(next_pow2(s.decode_batch.max(1))));
+    // Capped at 32: wider arms exceed the 48 KiB static shared memory of the interpreter entry
+    // (GV_MM_MAX=128 is 0x19610 bytes); rungs above it walk ceil(B / 32) weight passes.
+    // AMD objects size their GEMV walk from PLOW_GEMV_MM, not GV_MM_MAX: uncapped there.
+    let gv_mm_max = next_pow2(s.decode_batch.max(1));
+    let gv_mm_max = if arch.starts_with("gfx") { gv_mm_max } else { gv_mm_max.min(32) };
+    t.insert("gv_mm_max".into(), json!(gv_mm_max));
+    // * `fa_rg`: hd128 decode on the row-group flash body, which the merge fold requires
+    //   (nv_decode_merge_fold; PLOW_NV_FA_FOLD opt-in).
+    if arch.starts_with("sm_")
+        && s.hd.contains(&128)
+        && s.hd.iter().all(|&h| h <= 128)
+        && crate::emit_config::active().nv_fa_fold
+    {
+        t.insert("fa_rg".into(), json!(1));
+    }
+    // * `fa_v3_splitkv`: the fused v3 flash prefill carries the split-KV workspace (`fa_ws`).
+    if s.fa_ws_slots > 0 {
+        t.insert("fa_v3_splitkv".into(), json!(s.fa_ws_slots));
+    }
     // TILE PROVENANCE. Written because its absence made a real regression unauditable: for
     // several days every AMD compile selected GEMM tiles from the ANALYTICAL MODEL (both tuning
     // cells were wholly stale against the current build digest) and nothing in the emitted
@@ -1055,13 +1084,92 @@ fn tuning(s: &Shapes, arch: &str) -> Map<String, Value> {
     // * `gemv_mma_b1`: a DENSE packet also walks its B=1 GEMVs on the tensor cores, which drops the
     //   classic B=1 kernels altogether: 12B 12.60/13.01/13.59 -> 11.93/12.60/13.16. The MoE 26B
     //   keeps its xreg kernels (B=1 5.66 vs 6.10 on the walk: its dense GEMVs are small).
+    // PLOW_NV_DENSE_TUNE: the hd <= 128 dense decode arms below (MoE packets, GPT-OSS included,
+    // never take them).
+    let dense_tune = sm90a
+        && crate::emit_config::active().nv_dense_tune
+        && s.hd.iter().all(|&h| h <= 128)
+        && !s.ops_present.iter().any(|op| op.starts_with("Moe"));
     if sm90a && !s.decode_gemv_k.is_empty() {
         t.insert("xreg_k".into(), json!(s.decode_gemv_k.iter().collect::<Vec<_>>()));
         if s.moe_down_inter == 0 && s.decode_batch >= 2 && s.decode_gemv_k.iter().all(|k| k % 32 == 0) {
-            t.insert("gemv_mma_b1".into(), json!(1));
+            // Small dense GEMVs keep the classic B=1 kernels, as the MoE 26B does: Veena
+            // (Llama-3.2-3B, K 3072/8192) on h200 B=1 3.106 -> 2.979 ms with the walk off.
+            // The E-series (`GluStrided`) measured the same way.
+            let classic_b1 = dense_tune || s.ops_present.contains(&op_name(DevOp::GluStrided));
+            if !classic_b1 || s.decode_gemv_k.iter().min().is_some_and(|&k| k >= 3840) {
+                t.insert("gemv_mma_b1".into(), json!(1));
+            }
             // * `gemv_mma_pair`: its single-stream walks (down, o_proj, lm_head) take two row blocks
             //   per k-step (op_gemv_mma.cuh): 12B B=1/4/16 10.99/11.70/14.25 -> 10.92/11.60/13.94.
             t.insert("gemv_mma_pair".into(), json!(1));
+        }
+        // * `gemv_k8`: rungs 2..32 run the tensor-core K-split walk (op_gemv_k8_sm90.cuh), weight
+        //   rows as the mma M. Veena (Llama-3.2-3B) ctx 1024 B=1/2/4/8/16/32 3.44/3.86/3.96/4.09/
+        //   4.45/5.83 -> 3.47/3.46/3.53/3.75/4.18/5.49 ms; Qwen3-ASR 1.7B 2.22/2.51/2.69/2.85/3.15/
+        //   4.29 -> 2.24/2.32/2.41/2.57/2.90/3.96. Measured on hd <= 128 dense packets, and on the
+        //   Gemma-4 E-series (per-layer inputs: `GluStrided`, hd256/512): E4B h100 ctx 1024
+        //   B=1/2/8/16/32 6.87/6.82/7.40/8.50/10.22 -> 6.93/6.25/6.82/7.97/9.65 ms, B>=48 unchanged.
+        //   The other hd256/512 packets are unmeasured and keep the classic walk.
+        let k8_small_hd = dense_tune;
+        let k8_ple = s.ops_present.contains(&op_name(DevOp::GluStrided)) && s.hd.iter().all(|&h| h <= 512);
+        if s.moe_down_inter == 0
+            && !s.moe_dec_group
+            && s.decode_batch >= 2
+            && (k8_small_hd || k8_ple)
+            && s.decode_gemv_k.iter().all(|k| k % 32 == 0)
+        {
+            t.insert("gemv_k8".into(), json!(1));
+            // E4B B=1 takes the walk too (M=1 is in its contract): 6.93 -> 6.22 ms.
+            // `gemv_k8_unb1`: two k32 steps in flight on the one-tile (M <= 8) arm instead of
+            // 12 / (1|2): E4B B=1/4/8 6.14/6.30/6.62 -> 5.82/6.02/6.36 ms (3 and 6: +0.2-0.3).
+            // `gemv_k8_max_gw`: the _gw object's walk takes M <= 64 (8 tiles) instead of the
+            // two-pass mma walk: B=48/64 11.66/11.98 -> 10.99/11.79 ms, B=32/128 unchanged.
+            // `gemv_k8_unb`: 16 k32 load batches (not 12) on the 2..8-tile arms: B=16/32
+            // 6.95/8.67 -> 6.77/8.60 ms; 24 loses (8.82 at B=32).
+            if k8_ple && !k8_small_hd {
+                t.insert("gemv_k8_min".into(), json!(1));
+                t.insert("gemv_k8_unb1".into(), json!(2));
+                t.insert("gemv_k8_unb".into(), json!(16));
+                t.insert("gemv_k8_max_gw".into(), json!(64));
+            }
+            // PLOW_NV_GEMV_K8_B1 (hd <= 128): Qwen3-ASR 1.7B ctx 128 B=1/2/4/8/16 2.105/2.086/2.100/
+            // 2.204/2.327 -> 2.005/2.042/2.042/2.188/2.325 ms, token digests unchanged.
+            if k8_small_hd && crate::emit_config::active().nv_gemv_k8_b1 {
+                t.insert("gemv_k8_min".into(), json!(1));
+                t.insert("gemv_k8_unb1".into(), json!(2));
+            }
+        }
+        // * `fa_rg_wide`: hd256/512 flash decode on the row-group body (a warp per row, K and V
+        //   of 4 rows in flight) instead of the tile body. E4B h100 ctx 1024 B=1/8/32/64/128
+        //   6.22/6.83/9.61/12.63/17.75 -> 6.15/6.63/9.05/11.98/16.42 ms. E-series only (measured).
+        if k8_ple && !k8_small_hd {
+            t.insert("fa_rg".into(), json!(1));
+            t.insert("fa_rg_wide".into(), json!(1));
+        }
+        // * `fa_rgm`: hd128 row-group flash decode on the mma.sync item fed by per-warp bulk-copy
+        //   rings (PLOW_NV_FA_RGM).
+        if s.hd.iter().all(|&h| h <= 128) && s.hd.contains(&128) && crate::emit_config::active().nv_fa_mma_hd128 {
+            t.insert("fa_rg".into(), json!(1));
+            t.insert("fa_rgm".into(), json!(1));
+        }
+        if t.contains_key("gemv_k8") && k8_small_hd {
+            // * `gemv_l2pf`: a decode GEMV block waiting on its gate first has the TMA unit pull
+            //   64 KiB of its weight share into L2 (interp_sm120.cu PLOW_NV_GEMV_L2PF_BYTES). Veena
+            //   B=1/2/4/8/16/32 3.46/3.44/3.52/3.74/4.14/5.48 -> 3.42/3.27/3.36/3.58/4.02/5.41 ms;
+            //   32 KiB 3.40/3.32/3.41/3.63, 128 KiB 3.48/3.31/3.40/3.58, 256 KiB 3.68/3.40/3.42/3.60.
+            //   E4B: B=1 +0.25 ms and B>=64 +0.2 ms, so hd <= 128 only.
+            t.insert("gemv_l2pf".into(), json!(65536));
+        }
+        // * `gemv_wide`: rungs past GV_MM_MAX stream the weights once on wgmma
+        //   (op_gemv_wide_sm90.cuh) instead of ceil(B / 32) mma.sync passes. Its split-K tiles are
+        //   written by other blocks than their owner, so only dense packets (coarse gates) take it.
+        if s.moe_down_inter == 0
+            && !s.moe_dec_group
+            && s.decode_batch > 32
+            && s.decode_gemv_k.iter().all(|k| k % 64 == 0)
+        {
+            t.insert("gemv_wide".into(), json!(1));
         }
     }
     // * `fa_spart`: decode attention parks its score partials in smem (op_attention.cuh,
@@ -1082,6 +1190,11 @@ fn tuning(s: &Shapes, arch: &str) -> Map<String, Value> {
     } else if sm90a && s.moe_down_inter > 0 && s.decode_batch >= 8 {
         t.insert("fa_rb256".into(), json!(4));
     }
+    // * `gf256`: sliding (hd256) decode reads each KV row once for 4 query heads instead of twice
+    //   at GF 2 when every hd256 site has a GQA-4 group (Gemma-4 E4B: 8 q / 2 kv heads).
+    if sm90a && s.gqa_hd256 != u32::MAX && s.gqa_hd256 % 4 == 0 && s.gqa_hd256 > 0 {
+        t.insert("gf256".into(), json!(4));
+    }
     if s.full_kv_heads == 1 && s.gqa > 0 {
         // The template is instantiated at 1|2|4|8; 16 (the whole Gemma-4-12B group, one K/V
         // stream for all 16 heads) only when the emit asks for it, on the wide-reduction arm.
@@ -1096,8 +1209,16 @@ fn tuning(s: &Shapes, arch: &str) -> Map<String, Value> {
     }
     // * `fa_mmaqk`: the emit's PLOW_FA_MMAQK, opt-in. Object-paired (the score arm and its smem
     //   claim change), so it rides in `tuning` and the pairing hash.
-    if let Some(v) = crate::emit_config::active().fa_mmaqk.filter(|v| *v != 0) {
-        t.insert("fa_mmaqk".into(), json!(v));
+    // An explicit PLOW_FA_MMAQK=0 is off, not "unset".
+    if let Some(v) = crate::emit_config::active().fa_mmaqk {
+        if v != 0 {
+            t.insert("fa_mmaqk".into(), json!(v));
+        }
+    } else if dense_tune && s.gqa >= 2 {
+        // * `fa_mmaqk` bit 2: hd64/hd128 decode scores on the tensor cores. h100 step_bench ms at
+        //   B=1/8/32 ctx 1024, Veena (hd128, GQA 3): 3.648/4.858/6.881 -> 3.514/4.513/6.405;
+        //   ctx 1900: 3.770/5.415/8.171 -> 3.615/4.978/7.518.
+        t.insert("fa_mmaqk".into(), json!(4));
     }
     t
 }
@@ -1232,6 +1353,10 @@ fn backend_nvcc(f: &Map<String, Value>, t: &Map<String, Value>, s: &Shapes) -> V
     if on("qwen_gdn") {
         req.push("PLOW_NV_QWEN_GDN=1".into());
         req.push("PLOW_NV_FA_GF=2".into());
+    } else if s.hd.iter().all(|&h| h <= 128) && s.gqa > 1 && s.gqa % 4 != 0 {
+        // The hd128 flash-decode arm defaults to GF 4 and traps unless GF | gqa.
+        let gf = if s.gqa % 2 == 0 { 2 } else { crate::odd_group_gf(s.gqa) };
+        req.push(format!("PLOW_NV_FA_GF={gf}"));
     }
     if on("w8a8") {
         req.push("PLOW_NV_W8A8=1".into());
@@ -2793,6 +2918,11 @@ pub fn config_header(manifest: &Value) -> String {
                 out.push_str("#ifndef PLOW_NV_GEMV_MMA\n#define PLOW_NV_GEMV_MMA 1\n#endif\n");
             }
         }
+        if let Some(v) = t.get("gf256").and_then(Value::as_u64) {
+            out.push_str(&format!(
+                "#ifndef PLOW_NV_FA_GF_HD256\n#define PLOW_NV_FA_GF_HD256 {v}\n#endif\n"
+            ));
+        }
         if let Some(v) = t.get("gf_full").and_then(Value::as_u64) {
             out.push_str(&format!(
                 "#ifndef PLOW_NV_FA_GF_FULL\n#define PLOW_NV_FA_GF_FULL {v}\n#endif\n\
@@ -2827,6 +2957,51 @@ pub fn config_header(manifest: &Value) -> String {
             }
             if t.get("gemv_mma_pair").is_some() {
                 out.push_str("#ifndef PLOW_NV_GEMV_MMA_PAIR\n#define PLOW_NV_GEMV_MMA_PAIR 1\n#endif\n");
+            }
+            if t.get("gemv_wide").is_some() {
+                out.push_str("#ifndef PLOW_NV_GEMV_WIDE\n#define PLOW_NV_GEMV_WIDE 1\n#endif\n");
+            }
+            if t.get("gemv_k8").is_some() {
+                out.push_str("#ifndef PLOW_NV_GEMV_K8\n#define PLOW_NV_GEMV_K8 1\n#endif\n");
+            }
+            if t.get("fa_rg").is_some() {
+                out.push_str("#ifndef PLOW_NV_FA_RG\n#define PLOW_NV_FA_RG 1\n#endif\n");
+            }
+            if t.get("fa_rg_wide").is_some() {
+                out.push_str("#ifndef PLOW_NV_FA_RG_WIDE\n#define PLOW_NV_FA_RG_WIDE 1\n#endif\n");
+            }
+            if let Some(v) = t.get("fa_v3_splitkv").and_then(Value::as_u64) {
+                out.push_str(&format!(
+                    "#ifndef PLOW_NV_FA_V3_SPLITKV\n#define PLOW_NV_FA_V3_SPLITKV {v}\n#endif\n"
+                ));
+            }
+            if t.get("fa_rgm").is_some() {
+                out.push_str("#ifndef PLOW_NV_FA_RGM\n#define PLOW_NV_FA_RGM 1\n#endif\n");
+            }
+            if let Some(v) = t.get("gemv_k8_min").and_then(Value::as_u64) {
+                out.push_str(&format!(
+                    "#ifndef PLOW_NV_GEMV_K8_MIN\n#define PLOW_NV_GEMV_K8_MIN {v}\n#endif\n"
+                ));
+            }
+            if let Some(v) = t.get("gemv_k8_unb").and_then(Value::as_u64) {
+                out.push_str(&format!(
+                    "#ifndef PLOW_NV_GEMV_K8_UNB\n#define PLOW_NV_GEMV_K8_UNB {v}\n#endif\n"
+                ));
+            }
+            if let Some(v) = t.get("gemv_k8_unb1").and_then(Value::as_u64) {
+                out.push_str(&format!(
+                    "#ifndef PLOW_NV_GEMV_K8_UNB1\n#define PLOW_NV_GEMV_K8_UNB1 {v}\n#endif\n"
+                ));
+            }
+            if let Some(v) = t.get("gemv_k8_max_gw").and_then(Value::as_u64) {
+                out.push_str(&format!(
+                    "#ifndef PLOW_NV_GEMV_K8_MAX_GW\n#define PLOW_NV_GEMV_K8_MAX_GW {v}\n#endif\n"
+                ));
+            }
+            if let Some(v) = t.get("gemv_l2pf").and_then(Value::as_u64) {
+                out.push_str(&format!(
+                    "#ifndef PLOW_NV_GEMV_L2PF_BYTES\n#define PLOW_NV_GEMV_L2PF_BYTES {v}u\n#endif\n"
+                ));
             }
             if t.get("fa_tc_hd512").is_some() {
                 out.push_str(

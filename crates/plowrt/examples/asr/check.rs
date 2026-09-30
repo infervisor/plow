@@ -75,7 +75,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let tokenizer = plowrt::text::tokenizer::load_tokenizer(checkpoint);
     let input: serde_json::Value =
         serde_json::from_slice(&std::fs::read(reference.join("input.json"))?)?;
-    let rows = plowrt::asr::qwen_audio_rows(features.frames);
+    let rows = 13 * (features.frames / 100) + (features.frames % 100).div_ceil(8);
     let prompt = input["prompt"]
         .as_str()
         .unwrap()
@@ -284,7 +284,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .is_some_and(|s| s == "model" || s == "model-tiled" || s == "model-device")
     {
         let blob = args.get(5).ok_or("model check requires BLOB")?;
-        let mut engine = plowrt::asr::qwen::QwenAsr::load(std::path::Path::new(blob), checkpoint)?;
+        let mut engine = plowrt::asr::audio_lm::AudioLmAsr::load(std::path::Path::new(blob), checkpoint)?;
         if args[4] == "model-tiled" {
             engine.set_tiled_linear(true);
         }

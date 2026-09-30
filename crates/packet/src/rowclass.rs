@@ -92,9 +92,9 @@ pub fn class_of(op: DevOp) -> RowClass {
         // elementwise, quantization, argmax, the collectives, and the whole MoE routing /
         // grouping / combine chain, whose row maps are built from the batch it is given.
         Nop | RmsNorm | RowRms | Residual | Sum4Bf16 | Glu | SituGlu | SoftCap | LayerNorm | NormResidual
-        | AddNorm | NormResidualNorm | PerLayerInput | QuantFp8 | ZeroF32 | CastF32Bf16
+        | AddNorm | NormResidualNorm | PerLayerInput | GluStrided | QuantFp8 | ZeroF32 | CastF32Bf16
         | MlaOutGate | KdaGatedNorm | QwenGatedNorm | QwenQGateSplit | QwenSigmoidGate
-        | QwenRmsNorm | LayerNormF32 | ScaledAddF32 | GluF32 | EmbedF16F32 | EmbedOverlayBf16
+        | QwenRmsNorm | LayerNormF32 | ScaledAddF32 | GluF32 | EmbedF16F32 | EmbedOverlayBf16 | EmbedPosBf16
         | LstmCellF32 | ReluF32 | BroadcastAddF32 | QuantFp8Block128 => RowClass::A,
         // `Embed` gathers rows of the EMBEDDING TABLE by token id — one id per row, no
         // position, no cross-row coupling. It is not a hidden-row gather; `RowGather` is.
@@ -203,6 +203,13 @@ pub fn class_of(op: DevOp) -> RowClass {
         // Attention couples rows within one sequence. Packed request spans require per-span
         // execution until the op gains an explicit span descriptor.
         RelativeAttentionF32 | GroupedAttentionF32 | CausalDepthwiseConv1dF32 => RowClass::C,
+        // The generic signal ops derive a row's item and position from its index (`rows_per_item`,
+        // strides, `[batch][rows]` geometry); only the pure elementwise one is row-agnostic.
+        GatherRowsF32 | CopyColsF32 | Conv1dF32 | ConvTranspose1dF32 | BinaryF32 | CumSumF64
+        | RandF32 | AttentionF32 => RowClass::C,
+        // Per-row statistics: row-agnostic like LayerNormF32.
+        RowStatsF32 => RowClass::A,
+        UnaryF32 => RowClass::A,
 
         // ---- D: per-sequence carried state -------------------------------------------------
         // Operand shapes with no request axis at all: `state`/`outstate` `[1, HV, V, K]`,

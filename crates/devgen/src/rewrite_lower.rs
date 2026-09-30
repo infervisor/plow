@@ -24,6 +24,12 @@ pub(crate) enum Lowering {
     NormRope,
     /// `Residual3Norm`: 3-way residual combine + norm (MoE block boundary).
     Residual3Norm,
+    /// `Conv1dF32` / `ConvTranspose1dF32` input activation (codec and vocoder convolutions).
+    ConvInputAct,
+    /// `Conv1dF32` / `ConvTranspose1dF32` output activation; a linear is a 1x1 conv there.
+    ConvOutputAct,
+    /// `Conv1dF32` / `ConvTranspose1dF32` `residual`.
+    ConvResidual,
 }
 
 impl Lowering {
@@ -44,6 +50,26 @@ impl Lowering {
                 "FusedNormRopeScale",
             ],
             Lowering::Residual3Norm => &["FusedResidual3Norm"],
+            Lowering::ConvInputAct => &[
+                "FusedActConv1d",
+                "FusedParamActConv1d",
+                "FusedActConv1dResidual",
+                "FusedParamActConv1dResidual",
+                "FusedParamActConv1dAct",
+            ],
+            Lowering::ConvOutputAct => &[
+                "FusedConv1dAct",
+                "FusedParamActConv1dAct",
+                "FusedLinearAct",
+                "FusedLinearBiasAct",
+                "FusedLayerNormLinearBiasAct",
+            ],
+            Lowering::ConvResidual => &[
+                "FusedConv1dResidual",
+                "FusedActConv1dResidual",
+                "FusedParamActConv1dResidual",
+                "FusedLinearBiasResidual",
+            ],
         }
     }
 
@@ -71,6 +97,83 @@ impl Lowering {
                 "rmsnorm-rope-scale-fuse",
             ],
             Lowering::Residual3Norm => &["residual3-rmsnorm-fuse"],
+            Lowering::ConvInputAct => &[
+                "act-conv1d-fuse",
+                "param-act-conv1d-fuse",
+                "act-conv1d-residual-fuse",
+                "param-act-conv1d-residual-fuse",
+                "param-act-conv1d-act-fuse",
+            ],
+            Lowering::ConvOutputAct => &[
+                "conv1d-act-fuse",
+                "param-act-conv1d-act-fuse",
+                "linear-act-fuse",
+                "linearbias-act-fuse",
+                "layernorm-linearbias-act-fuse",
+            ],
+            Lowering::ConvResidual => &[
+                "conv1d-residual-fuse",
+                "act-conv1d-residual-fuse",
+                "param-act-conv1d-residual-fuse",
+                "linearbias-residual-fuse",
+            ],
+        }
+    }
+}
+
+/// The fusion decisions of one audio network (`codec.pkt`, `s3gen.pkt`): the fused sites of its
+/// own graph (`rewrite::fused_sites_for_codec_config`), keyed by the export's tensor names (the
+/// packet's `w.`-prefixed ones minus the prefix). Without sites (`PLOW_EMIT_REWRITE=0`, a direct
+/// devgen caller, no rewrite for the export) every query answers the lowering's hand choice.
+#[derive(Clone, Copy)]
+pub(crate) struct ConvFusions<'a>(pub(crate) Option<&'a RewriteSites>);
+
+/// Where an activation between a producing and a consuming convolution runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ActAt {
+    ProducerOutput,
+    ConsumerInput,
+    /// Its own `UnaryF32` pass.
+    Separate,
+}
+
+impl ConvFusions<'_> {
+    fn has(self, lowering: Lowering, weight: &str) -> Option<bool> {
+        let weight = weight.strip_prefix("w.").unwrap_or(weight);
+        self.0.map(|sites| lowered(sites, lowering, weight))
+    }
+
+    /// Whether the conv on `weight` (kernel `kernel`) applies its input activation itself.
+    ///
+    /// Cost-model override: a pointwise conv is a plain GEMM that applies a fused input
+    /// activation to its A tile once per output-column tile, so a wide one recomputes it several
+    /// times; a separate pass computes it once and is measured faster on SNAC's pointwise convs.
+    /// Pointwise convs therefore never fuse their input activation, whatever the rewrite says.
+    pub(crate) fn input_act(self, weight: &str, kernel: u32, hand: bool) -> bool {
+        kernel != 1 && self.has(Lowering::ConvInputAct, weight).unwrap_or(hand)
+    }
+
+    pub(crate) fn output_act(self, weight: &str, hand: bool) -> bool {
+        self.has(Lowering::ConvOutputAct, weight).unwrap_or(hand)
+    }
+
+    pub(crate) fn residual(self, weight: &str, hand: bool) -> bool {
+        self.has(Lowering::ConvResidual, weight).unwrap_or(hand)
+    }
+
+    /// An activation between two convolutions: the rewrite fuses it into one of them (the two
+    /// forms tie at extraction, see rules.egg), and a consumer placement still passes
+    /// [`Self::input_act`]'s cost model.
+    pub(crate) fn between(self, producer: &str, consumer: &str, consumer_kernel: u32, hand: ActAt) -> ActAt {
+        if self.0.is_none() {
+            return hand;
+        }
+        if self.output_act(producer, false) {
+            ActAt::ProducerOutput
+        } else if self.input_act(consumer, consumer_kernel, false) {
+            ActAt::ConsumerInput
+        } else {
+            ActAt::Separate
         }
     }
 }
@@ -162,6 +265,9 @@ mod tests {
             Lowering::GatedMlp,
             Lowering::NormRope,
             Lowering::Residual3Norm,
+            Lowering::ConvInputAct,
+            Lowering::ConvOutputAct,
+            Lowering::ConvResidual,
         ] {
             for kind in lowering.kinds() {
                 assert!(
@@ -170,6 +276,28 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn conv_fusions_follow_sites_under_the_pointwise_override() {
+        let s = sites(&[
+            ("FusedParamActConv1d", &["blk0.up.w"]),
+            ("FusedParamActConv1dResidual", &["blk0.ru0.pw.w"]),
+            ("FusedConv1dAct", &["hift.pre.w"]),
+        ]);
+        let f = ConvFusions(Some(&s));
+        assert!(f.input_act("w.blk0.up.w", 16, false));
+        assert!(!f.input_act("w.blk0.ru0.pw.w", 1, true), "pointwise input activation stays a pass");
+        assert!(f.residual("w.blk0.ru0.pw.w", false));
+        assert!(!f.residual("w.blk0.up.w", true));
+        assert_eq!(
+            f.between("w.hift.pre.w", "w.hift.up0.w", 16, ActAt::ConsumerInput),
+            ActAt::ProducerOutput
+        );
+        assert_eq!(f.between("w.a.w", "w.b.w", 3, ActAt::ConsumerInput), ActAt::Separate);
+        let hand = ConvFusions(None);
+        assert!(hand.residual("w.a.w", true) && !hand.output_act("w.a.w", false));
+        assert_eq!(hand.between("w.a.w", "w.b.w", 3, ActAt::ConsumerInput), ActAt::ConsumerInput);
     }
 
     #[test]

@@ -6,7 +6,9 @@ use plow_asset::segment_roles::{
 };
 
 pub(crate) fn apply(model: &mut Model) -> Result<SectionData, String> {
-    apply_projections(model, false)
+    let config = crate::emit_config::active();
+    let min_rows = config.decode_cublaslt_min_rows.unwrap_or(1);
+    apply_projections(model, config.decode_cublaslt_head, min_rows)
 }
 
 pub(crate) fn apply_prefill(
@@ -325,9 +327,12 @@ fn prefill_eligible(model: &Model, op: &packet::dev::DevInst, rows: u32, profile
     })
 }
 
-fn apply_projections(model: &mut Model, head: bool) -> Result<SectionData, String> {
+fn apply_projections(model: &mut Model, head: bool, min_rows: u32) -> Result<SectionData, String> {
     let mut programs = Vec::new();
     for index in packet::devbuild::decode_rung_lo(&model.prog_t)..model.progs.len() {
+        if packet::devbuild::program_rows(model.prog_t[index]) < min_rows {
+            continue;
+        }
         let roles = apply_program(model, index, head)?;
         programs.push(serde_json::json!({"index": index, "roles": roles}));
     }
@@ -370,7 +375,7 @@ pub(crate) fn apply_native(
     {
         return Err("native decode object has no B32 capability".into());
     }
-    let mut section = apply_projections(model, true)?;
+    let mut section = apply_projections(model, true, 1)?;
     let mut roles = plow_asset::segment_roles::SegmentRoles::from_bytes(&section.data)?;
     for p in &mut roles.programs {
         for role in &mut p.roles {
@@ -412,6 +417,8 @@ fn apply_program(model: &mut Model, index: usize, head: bool) -> Result<Vec<u8>,
     }
     let mut builder = Builder::new(model.n_cu);
     builder.force_uniseg();
+    // The runtime's library segments need an instruction-major queue.
+    builder.set_gq_order_asap(false);
     builder.adopt_tensors(model.tensors.clone());
     let mut projections = Vec::new();
     for (pc, inst) in old.insts.iter().enumerate() {
@@ -419,10 +426,12 @@ fn apply_program(model: &mut Model, index: usize, head: bool) -> Result<Vec<u8>,
             let name = &model.tensors[inst.t[2] as usize].name;
             name.contains(".layers.")
                 || (head
-                    && (name.ends_with("lm_head.weight") || name.ends_with("embed_tokens.weight")))
+                    && (name.ends_with("lm_head.weight")
+                        || name.ends_with("embed_tokens.weight")
+                        || name.ends_with("per_layer_model_projection.weight")))
         };
         if selected
-            && (!(1..=32).contains(&inst.i[0])
+            && (!(1..=plow_asset::segment_roles::CUBLASLT_DECODE_MAX_ROWS).contains(&inst.i[0])
                 || inst.i[0] != model.prog_t[index]
                 || inst.i[1] == 0
                 || inst.i[2] == 0
@@ -606,6 +615,17 @@ mod tests {
     }
 
     #[test]
+    fn routes_only_the_wide_rungs() {
+        let mut m = model_rows(&[128, 8, 64]);
+        let narrow = m.progs[1].to_blob();
+        let metadata = apply_projections(&mut m, false, 16).unwrap();
+        let roles = plow_asset::segment_roles::SegmentRoles::from_bytes(&metadata.data).unwrap();
+        assert_eq!(roles.programs.len(), 1);
+        assert_eq!(roles.programs[0].index, 2);
+        assert_eq!(m.progs[1].to_blob(), narrow);
+    }
+
+    #[test]
     fn isolates_body_projection_without_changing_math_or_dependencies() {
         let mut m = model();
         let prefill = m.progs[0].to_blob();
@@ -731,24 +751,23 @@ mod tests {
             .map(|program| program.insts.iter().map(|op| op.pack()).collect::<Vec<_>>())
             .collect();
         let mut sections = Vec::new();
-        // 8, not 6, since cb5c0719 ("cuda gemm: route measured wide prefill cells") widened the
-        // policy: CUBLASLT_PREFILL_WIDE_ROWS x CUBLASLT_PREFILL_GEMMA4_SHAPES now qualify on top
-        // of the two original (n, k) pairs, so this fixture isolates two more ops.
+        // 8 since cb5c0719 ("cuda gemm: route measured wide prefill cells") widened the policy
+        // with CUBLASLT_PREFILL_WIDE_ROWS; 10 since CUBLASLT_PREFILL_SPEECH_ROWS added the 64 rung.
         assert_eq!(
             apply_prefill(&mut model, &mut sections, "sm_90a").unwrap(),
-            8
+            10
         );
         assert_eq!(model.progs[6].to_blob(), decode);
         assert_eq!(sections.len(), 1);
         let metadata = SegmentRoles::from_bytes(&sections[0].data).unwrap();
-        // Four programs, not three: the fixture's rungs are [1, 64, 128, 256, 512, 1024, 1], and
-        // since cb5c0719 the 1024 rung qualifies through CUBLASLT_PREFILL_WIDE_ROWS as well as
-        // the three narrow ones through CUBLASLT_PREFILL_ROWS. Both of the fixture's shapes,
+        // Five programs: the fixture's rungs are [1, 64, 128, 256, 512, 1024, 1]; 64 qualifies
+        // through CUBLASLT_PREFILL_SPEECH_ROWS, 1024 through CUBLASLT_PREFILL_WIDE_ROWS and the
+        // three narrow ones through CUBLASLT_PREFILL_ROWS. Both of the fixture's shapes,
         // (3840, 15360) and (3840, 8192), are in CUBLASLT_PREFILL_GEMMA4_SHAPES.
-        assert_eq!(metadata.programs.len(), 4);
+        assert_eq!(metadata.programs.len(), 5);
         for roles in &metadata.programs {
             let index = roles.index;
-            assert!(matches!(model.prog_t[index], 128 | 256 | 512 | 1024));
+            assert!(matches!(model.prog_t[index], 64 | 128 | 256 | 512 | 1024));
             assert_eq!(
                 roles.roles.iter().filter(|&&role| role == CUBLASLT).count(),
                 2

@@ -4,9 +4,9 @@ use crate::exec::apple::{asr::QwenAudioEncoder, DecodeTuning, MetalEngine};
 use crate::exec::packet_runtime::{BoundPacketPipeline, PacketAsset};
 use crate::{Result, RuntimeError};
 
-use super::{PacketAudioEncoder, QwenAsr, QwenDecode, QwenExecution, QwenPrefill, QwenPrefilled};
+use super::{PacketAudioEncoder, AudioLmAsr, AudioLmDecode, AudioLmExecution, AudioLmPrefill, AudioLmPrefilled};
 
-struct MetalQwenExecution {
+struct MetalAudioLmExecution {
     encoder: Option<QwenAudioEncoder>,
     packet_encoder: Option<PacketAudioEncoder>,
     decoder: MetalEngine,
@@ -20,7 +20,7 @@ struct MetalQwenExecution {
     token_ids: Vec<u32>,
 }
 
-impl MetalQwenExecution {
+impl MetalAudioLmExecution {
     fn load(blob: &Path, checkpoint: &Path, hidden: usize) -> Result<Self> {
         let mut decoder = MetalEngine::load_with_decode_tuning(
             blob,
@@ -117,7 +117,7 @@ impl MetalQwenExecution {
     }
 }
 
-impl QwenExecution for MetalQwenExecution {
+impl AudioLmExecution for MetalAudioLmExecution {
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
         self
     }
@@ -130,7 +130,7 @@ impl QwenExecution for MetalQwenExecution {
         self.max_context
     }
 
-    fn prefill(&mut self, slot: usize, input: QwenPrefill<'_>) -> Result<QwenPrefilled> {
+    fn prefill(&mut self, slot: usize, input: AudioLmPrefill<'_>) -> Result<AudioLmPrefilled> {
         let encoder_started = std::time::Instant::now();
         let packet_audio = self
             .packet_encoder
@@ -239,7 +239,7 @@ impl QwenExecution for MetalQwenExecution {
                 &audio,
             )?
         };
-        Ok(QwenPrefilled {
+        Ok(AudioLmPrefilled {
             token,
             encoder_ms,
             prefill_ms: prefill_started.elapsed().as_secs_f64() * 1000.0,
@@ -252,7 +252,7 @@ impl QwenExecution for MetalQwenExecution {
         kv_lengths: &[u32],
         token_ids: &[u32],
         occupied_rows: usize,
-    ) -> Result<QwenDecode> {
+    ) -> Result<AudioLmDecode> {
         let batch = self.batch_capacity();
         if positions.len() != kv_lengths.len()
             || positions.len() != token_ids.len()
@@ -286,7 +286,7 @@ impl QwenExecution for MetalQwenExecution {
             )?
         };
         tokens.truncate(positions.len());
-        Ok(QwenDecode {
+        Ok(AudioLmDecode {
             tokens,
             launched_rows,
         })
@@ -297,7 +297,7 @@ fn prefill_host_audio(
     decoder: &mut MetalEngine,
     embedding_handle: usize,
     slot: usize,
-    input: &QwenPrefill<'_>,
+    input: &AudioLmPrefill<'_>,
     audio: &[f32],
 ) -> Result<u32> {
     let embedding_elements = input
@@ -342,18 +342,18 @@ pub(super) fn load_execution(
     blob: &Path,
     checkpoint: &Path,
     hidden: usize,
-) -> Result<Box<dyn QwenExecution>> {
-    Ok(Box::new(MetalQwenExecution::load(
+) -> Result<Box<dyn AudioLmExecution>> {
+    Ok(Box::new(MetalAudioLmExecution::load(
         blob, checkpoint, hidden,
     )?))
 }
 
-impl QwenAsr {
-    fn metal_execution(&mut self) -> &mut MetalQwenExecution {
+impl AudioLmAsr {
+    fn metal_execution(&mut self) -> &mut MetalAudioLmExecution {
         self.execution
             .as_any_mut()
-            .downcast_mut::<MetalQwenExecution>()
-            .expect("QwenAsr::load installed the Metal executor")
+            .downcast_mut::<MetalAudioLmExecution>()
+            .expect("AudioLmAsr::load installed the Metal executor")
     }
 
     pub fn set_large_linear(&mut self, enabled: bool) -> Result<()> {
@@ -433,7 +433,7 @@ mod tests {
         let blob = std::env::var("PLOW_TEST_BLOB").unwrap();
         let checkpoint = std::env::var("PLOW_TEST_CHECKPOINT").unwrap();
         let audio_dir = std::env::var("PLOW_TEST_AUDIO_DIR").unwrap();
-        let mut engine = QwenAsr::load(Path::new(&blob), Path::new(&checkpoint)).unwrap();
+        let mut engine = AudioLmAsr::load(Path::new(&blob), Path::new(&checkpoint)).unwrap();
         let cancel = AtomicBool::new(false);
         for name in ["short", "english16", "chinese16"] {
             let wav = std::fs::read(Path::new(&audio_dir).join(format!("{name}.wav"))).unwrap();

@@ -1,0 +1,99 @@
+# Chatterbox (ResembleAI/chatterbox, English) on H100: the T3 guided speech LM
+# (tts.guided_lm.v1: CFG pairs, prompt tables and voices as in.prompt.* packet tensors, text
+# rules as packet strings) + S3Gen lowered to s3gen.pkt (conformer encoder, 10 CFG Euler steps,
+# HiFT vocoder). Every stage is a plowc packet.
+#
+#   PLOW_CAMPAIGN_NO_NIX=1 (this box only) CBX_PY=<python with chatterbox-tts 0.1.7> \
+#   python3 scripts/campaign/campaign.py build recipes/infervisor/chatterbox/sm90a-h100-tp1.toml --out <fresh dir>
+#
+# Gates: T3 last-prefill logits vs fp32 (crates/plowrt/examples/t3_check.rs), s3gen mel rel-L2 vs
+# torch (scripts/tts/s3gen_packet_check.py, ~1e-6), Whisper CER (median 0.000).
+
+schema = "plow.recipe.v1"
+namespace = "infervisor"
+name = "chatterbox"
+label = "sm90a-h100-tp1"
+plow_git = "1972fa37ac7a6f632cd5ece0b32fe37ab76eec75"
+network = "llama"
+doc = "docs/runtime/tts.md"
+tracker = "docs/runtime/h100-speech-recipes.md"
+
+[target]
+vendor = "nvidia"
+isa = "sm_90a"
+sku = "H100 SXM5"
+units = 132
+num_gpus = 1
+parallel = "tp"
+
+[checkpoint]
+source = "hf:ResembleAI/chatterbox"
+revision = "5bb1f6ee58e50c3b8d408bc82a6d3740c2db6e18"
+
+[cell]
+name = "chatterbox-h100"
+# The Llama-shaped T3 checkpoint + voice rows the first prep step writes.
+hf_dir = "{out}/prep/t3"
+gpu = "h100"
+arch = "sm_90a"
+n_cu = 132
+n_gpu = 1
+max_ctx = 2048
+
+[[prep]]
+name = "t3-checkpoint"
+script = "scripts/tts/chatterbox_prep.py"
+python = "{env:CBX_PY}"
+args = ["{out}/prep/t3"]
+env = { PYTHONPATH = "" }
+
+[[prep]]
+name = "s3gen-export"
+script = "scripts/tts/s3gen_export.py"
+python = "{env:CBX_PY}"
+args = ["{out}/prep/s3gen"]
+env = { PYTHONPATH = "" }
+
+[emit]
+emit = "devblob+cubin"
+# The OpenAI `model` id plowrt serves the bundle under (weights.json served_name).
+args = ["--served-name", "chatterbox"]
+[emit.env]
+PLOW_TTS_VOCODER_DIR = "{out}/prep/s3gen"
+PLOW_VERIFY_BIN = "{repo}/lean-plow/.lake/build/bin/plow_verify"
+# Speech-shaped rungs: prefill rows = voice rows + text + 2 (~200-350), so 128/256/384/512;
+# decode 1..32 slots = 16 concurrent requests as CFG pairs.
+# Decode ladder: rungs past 32 run the one-pass wide GEMV (`_gw` object); 48/96 pay 5-13% over
+# rounding up to 64/128 (Veena step_bench ctx 1024: 8.21 vs 9.08, 11.56 vs 13.28 ms), 3/6/12/24 < 3%.
+PLOW_MAX_CHUNK = "512"
+PLOW_PF_LADDER_APPEND = "256,384"
+PLOW_DECODE_BATCH_LADDER = "1,2,4,8,16,32,48,64,96,128"
+PLOW_EMIT_PREFILL_CUBLASLT = "1"
+PLOW_NO_GLU_FUSE = "1"
+# One k+v HeadNormRope packet per layer (token-identical): T3 decode step, step_bench H100,
+# B=1/2/32/128 ctx 1000: 1.557/1.690/3.461/10.018 -> 1.531/1.649/3.377/9.917 ms.
+PLOW_FUSE_KV_HNR = "1"
+# Opt-ins measured on this model: packed prefill at hd64/hd128, and the dense hd <= 128 decode
+# tuning (gemv_k8 + L2 prefetch, tensor-core decode scores, classic B=1 GEMVs below K 3840).
+PLOW_EMIT_PACKED_PREFILL_SMALL_HD = "1"
+PLOW_NV_DENSE_TUNE = "1"
+
+[bench]
+kind = "speech"
+client = "scripts/tts/tts_bench.py"
+arms = ["--conc 1 --stream --wav --n 16 --prompt-set chatterbox --voice default", "--conc 1 --n 16 --prompt-set chatterbox --voice default --tag full_c1", "--conc 8 --stream --n 32 --prompt-set chatterbox --voice default", "--conc 8 --n 32 --prompt-set chatterbox --voice default --tag full_c8"]
+reference = "scripts/tts/chatterbox_ref.py"
+
+# `campaign.py gate <recipe> --assets <dir> --out <dir>`. PYREF: Whisper CER (median 0.000, n=32);
+# CBX_PY: chatterbox-tts for the S3Gen reference (mel rel-L2 ~1e-6). packet_run: cargo build
+# --release -p plowrt --features cuda --example packet_run.
+[gates]
+python = "{env:PYREF}"
+[gates.tts_cer]
+arms = ["--conc 1 --stream --wav --n 16 --prompt-set chatterbox --voice default", "--conc 8 --stream --wav --n 16 --prompt-set chatterbox --voice default"]
+cer_median_max = 0.05
+[gates.s3gen_rel_l2]
+python = "{env:CBX_PY}"
+env = { PYTHONPATH = "" }
+rel_l2_max = 1e-3
+timeout_s = 1800

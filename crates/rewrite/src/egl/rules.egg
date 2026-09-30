@@ -159,6 +159,13 @@
 (rewrite (Act ?k (LinearBias ?x ?w ?b ?out))
          (FusedLinearBiasAct ?x ?w ?b ?out ?k))
 
+; layernorm-linearbias-act-fuse: a pre-norm FFN up projection, LN → biased Linear → act.
+; Without it `layernorm-linearbias-fuse` and `linearbias-act-fuse` tie (2 e-nodes each) and
+; extraction may keep the activation as a separate op; the 3 → 1 form carries both.
+; rule: layernorm-linearbias-act-fuse
+(rewrite (Act ?k (LinearBias (LayerNorm ?x ?w ?b ?eps) ?wl ?bl ?out))
+         (FusedLayerNormLinearBiasAct ?x ?w ?b ?wl ?bl ?eps ?out ?k))
+
 ; === Embedding + Scale fusion (Gemma embedding normalizer) ===
 
 ; rule: embedding-scale-fuse
@@ -223,3 +230,50 @@
 ; rule: materialized-residual3-block-fuse
 (rewrite (BlockResidual (Ew "add" ?pre (Ew "add" ?a ?b)) ?snaps ?nw ?pw ?max)
          (FusedMaterializedResidual3Block ?pre ?a ?b ?snaps ?nw ?pw ?max))
+
+; === Conv1d prologue / epilogue fusions (audio codecs, vocoders) ===
+;
+; `Conv1d` covers Conv1d and ConvTranspose1d (the config token says which). Every target is a
+; generic op epilogue: an input activation applied to each tap as it is read, an output
+; activation on the accumulator, and a residual added after it (devgen: `Conv1dF32` /
+; `ConvTranspose1dF32` input/output activation and `residual`). The residual is matched as the
+; FIRST add operand, `r + conv(x)`, the order the graph builders emit.
+;
+; An activation between two convolutions matches both act-conv1d-fuse (next conv's input) and
+; conv1d-act-fuse (previous conv's output) at equal tree cost; the extracted graph fuses it into
+; exactly one of them and the lowering picks where it runs.
+
+; rule: act-conv1d-fuse
+(rewrite (Conv1d (Act ?k ?x) ?w ?b ?cfg)
+         (FusedActConv1d ?k ?x ?w ?b ?cfg))
+
+; Snake: the per-channel alpha stays an operand.
+; rule: param-act-conv1d-fuse
+(rewrite (Conv1d (ActP ?k ?x ?p) ?w ?b ?cfg)
+         (FusedParamActConv1d ?k ?x ?p ?w ?b ?cfg))
+
+; rule: conv1d-act-fuse
+(rewrite (Act ?k (Conv1d ?x ?w ?b ?cfg))
+         (FusedConv1dAct ?x ?w ?b ?cfg ?k))
+
+; rule: conv1d-residual-fuse
+(rewrite (Ew "add" ?r (Conv1d ?x ?w ?b ?cfg))
+         (FusedConv1dResidual ?x ?w ?b ?cfg ?r))
+
+; rule: act-conv1d-residual-fuse
+(rewrite (Ew "add" ?r (Conv1d (Act ?k ?x) ?w ?b ?cfg))
+         (FusedActConv1dResidual ?k ?x ?w ?b ?cfg ?r))
+
+; rule: param-act-conv1d-residual-fuse
+(rewrite (Ew "add" ?r (Conv1d (ActP ?k ?x ?p) ?w ?b ?cfg))
+         (FusedParamActConv1dResidual ?k ?x ?p ?w ?b ?cfg ?r))
+
+; rule: param-act-conv1d-act-fuse
+(rewrite (Act ?k2 (Conv1d (ActP ?k ?x ?p) ?w ?b ?cfg))
+         (FusedParamActConv1dAct ?k ?x ?p ?w ?b ?cfg ?k2))
+
+; linearbias-residual-fuse: the residual add of a biased projection (conformer / transformer
+; attention output and FFN down projections) into its epilogue.
+; rule: linearbias-residual-fuse
+(rewrite (Ew "add" ?r (LinearBias ?x ?w ?b ?out))
+         (FusedLinearBiasResidual ?x ?w ?b ?out ?r))

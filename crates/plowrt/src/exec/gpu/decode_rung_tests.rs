@@ -177,7 +177,7 @@ fn cublaslt_ladder_requires_complete_equivalent_roles_and_dependencies() {
     assert!(validate_cublaslt_ladder(&blob, &metadata)
         .unwrap_err()
         .to_string()
-        .contains("every decode width"));
+        .contains("every rung above the first routed one"));
     metadata.programs.insert(1, removed);
     metadata.programs[1].roles[1] = plow_asset::segment_roles::INTERPRETER;
     assert!(validate_cublaslt_ladder(&blob, &metadata)
