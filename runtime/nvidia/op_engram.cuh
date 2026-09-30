@@ -87,6 +87,7 @@ __device__ void d_engram_embed(__nv_bfloat16* __restrict__ out, const unsigned c
     }
 }
 
+#if !PLOW_NV_SPEECH /* the speech object has its own op 173 (op_speech_f32.cuh) */
 /* op 173: ids[r] = argmax_c x[r][c] over f32, lowest index on ties. One CTA per row. */
 __device__ void d_argmax_f32(unsigned* __restrict__ ids, const float* __restrict__ x, unsigned rows, unsigned width, unsigned slice,
                              unsigned nblk, float* part) {
@@ -115,3 +116,4 @@ __device__ void d_argmax_f32(unsigned* __restrict__ ids, const float* __restrict
         __syncthreads();
     }
 }
+#endif

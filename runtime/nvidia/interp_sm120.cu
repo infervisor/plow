@@ -1453,9 +1453,11 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
         d_engram_gate((__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1), (const __nv_bfloat16*)TEN(2), (const __nv_bfloat16*)TEN(3),
                       (const unsigned char*)TEN(4), in->i[0], in->i[1], in->i[2], in->fj[0].f, slice, nblk, arena);
         break;
+#if !PLOW_NV_SPEECH /* the speech object runs ops 173 and 180 in d_speech_f32 */
     case PLOW_DOP_ARGMAX_F32:
         d_argmax_f32((unsigned*)TEN(0), (const float*)TEN(1), in->i[0], in->i[1], slice, nblk, arena);
         break;
+#endif
     case PLOW_DOP_ACT_QUANT_MX:
         d_act_quant_mx((uint16_t*)TEN(0), (const uint16_t*)TEN(1), in->i[0], in->i[1], slice, nblk, (uint8_t*)TEN(2));
         break;
@@ -1470,10 +1472,12 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
         d_gemv_f32((float*)TEN(0), (const __nv_bfloat16*)TEN(1), (const float*)TEN(2), in->i[0], in->i[1], in->i[2], slice, nblk, arena,
                    PLOW_NV_ARENA_FLOATS, (unsigned char*)TEN(3), in->i[3], in->i[4]);
         break;
+#if !PLOW_NV_SPEECH
     case PLOW_DOP_GEMM_F32:
         d_gemm_f32((float*)TEN(0), (const __nv_bfloat16*)TEN(1), (const __nv_bfloat16*)TEN(2), in->i[0], in->i[1], in->i[2], slice, nblk,
                    arena, PLOW_NV_ARENA_FLOATS, (unsigned char*)TEN(3), in->i[3]);
         break;
+#endif
     case PLOW_DOP_HYPER_CONN_POST:
         d_hyperconn_post((__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1), (const __nv_bfloat16*)TEN(2),
                          (const float*)TEN(3), (const float*)TEN(4), in->i[0], in->i[1], in->i[2], in->i[3], slice, nblk);
