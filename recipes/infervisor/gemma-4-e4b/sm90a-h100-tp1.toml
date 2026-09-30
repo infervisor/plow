@@ -12,9 +12,10 @@ schema = "plow.recipe.v1"
 namespace = "infervisor"
 name = "gemma-4-e4b"
 label = "sm90a-h100-tp1"
+plow_git = "1972fa37ac7a6f632cd5ece0b32fe37ab76eec75"
 network = "gemma4"
 doc = "docs/runtime/gemma4-e4b-h100.md"
-tracker = "plans/tts-veena-chatterbox-h200-tracker.md"
+tracker = "docs/runtime/h100-speech-recipes.md"
 
 [target]
 vendor = "nvidia"
@@ -26,10 +27,11 @@ parallel = "tp"
 
 [checkpoint]
 source = "hf:google/gemma-4-E4B-it"
+revision = "ee0ef6023621cff504d758262d4e04895a5af4a2"
 
 [cell]
 name = "gemma-4-e4b-h100"
-hf_dir = "{hf:google/gemma-4-E4B-it}"
+hf_dir = "{hf:google/gemma-4-E4B-it@ee0ef6023621cff504d758262d4e04895a5af4a2}"
 gpu = "h100"
 arch = "sm_90a"
 n_cu = 132
@@ -97,6 +99,6 @@ kind = "chat"
 [gates]
 python = "{env:PYREF}"
 [gates.llm_logit_parity]
-hf_dir = "{hf:google/gemma-4-E4B-it}"
+hf_dir = "{hf:google/gemma-4-E4B-it@ee0ef6023621cff504d758262d4e04895a5af4a2}"
 top1_min = 0.98
 kl_mean_max = 2e-3

@@ -13,9 +13,10 @@ schema = "plow.recipe.v1"
 namespace = "infervisor"
 name = "qwen3-asr"
 label = "sm90a-h100-tp1"
+plow_git = "1972fa37ac7a6f632cd5ece0b32fe37ab76eec75"
 network = "qwen3"
 doc = "docs/runtime/tts.md"
-tracker = "plans/tts-veena-chatterbox-h200-tracker.md"
+tracker = "docs/runtime/h100-speech-recipes.md"
 
 [target]
 vendor = "nvidia"
@@ -27,10 +28,11 @@ parallel = "tp"
 
 [checkpoint]
 source = "hf:Qwen/Qwen3-ASR-1.7B"
+revision = "7278e1e70fe206f11671096ffdd38061171dd6e5"
 
 [cell]
 name = "qwen3-asr-h100"
-hf_dir = "{hf:Qwen/Qwen3-ASR-1.7B}"
+hf_dir = "{hf:Qwen/Qwen3-ASR-1.7B@7278e1e70fe206f11671096ffdd38061171dd6e5}"
 gpu = "h100"
 arch = "sm_90a"
 n_cu = 132

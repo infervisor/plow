@@ -421,12 +421,16 @@ def nix(cmd: list[str]) -> list[str]:
 
 def expand(value: str, out: Path) -> str:
     """Recipe placeholders: `{out}` (the build dir), `{repo}`, `{env:VAR}`, `{hf:org/name}` (the
-    snapshot of a Hugging Face repo in $HF_HUB_CACHE / $HF_HOME/hub)."""
-    def hf(repo: str) -> str:
+    snapshot of a Hugging Face repo in $HF_HUB_CACHE / $HF_HOME/hub), `{hf:org/name@rev}` (that
+    exact snapshot)."""
+    def hf(ref: str) -> str:
+        repo, _, rev = ref.partition("@")
         hub = os.environ.get("HF_HUB_CACHE") or os.path.join(os.environ.get("HF_HOME", os.path.expanduser("~/.cache/huggingface")), "hub")
-        snaps = sorted(Path(hub, "models--" + repo.replace("/", "--"), "snapshots").glob("*"))
+        snaps = sorted(Path(hub, "models--" + repo.replace("/", "--"), "snapshots").glob(rev or "*"))
         if not snaps:
-            die(f"hf:{repo} is not in {hub}; download it first")
+            want = f"{repo} revision {rev}" if rev else repo
+            die(f"hf:{want} is not in {hub}; download it first "
+                f"(huggingface-cli download {repo}{' --revision ' + rev if rev else ''})")
         return str(snaps[-1])
     def sub(m: "re.Match") -> str:
         key = m.group(1)

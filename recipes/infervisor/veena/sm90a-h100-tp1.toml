@@ -12,9 +12,10 @@ schema = "plow.recipe.v1"
 namespace = "infervisor"
 name = "veena"
 label = "sm90a-h100-tp1"
+plow_git = "1972fa37ac7a6f632cd5ece0b32fe37ab76eec75"
 network = "llama"
 doc = "docs/runtime/tts.md"
-tracker = "plans/tts-veena-chatterbox-h200-tracker.md"
+tracker = "docs/runtime/h100-speech-recipes.md"
 
 [target]
 vendor = "nvidia"
@@ -26,11 +27,13 @@ parallel = "tp"
 
 [checkpoint]
 source = "hf:maya-research/Veena"
+revision = "8b770f9e69e6b35ef320d4cd70a99a4ab6dd022f"
 codec = "hf:hubertsiuzdak/snac_24khz"
+codec_revision = "d73ad176a12188fcf4f360ba3bf2c2fbbe8f58ec"
 
 [cell]
 name = "veena-h100"
-hf_dir = "{hf:maya-research/Veena}"
+hf_dir = "{hf:maya-research/Veena@8b770f9e69e6b35ef320d4cd70a99a4ab6dd022f}"
 gpu = "h100"
 arch = "sm_90a"
 n_cu = 132
@@ -78,7 +81,8 @@ PLOW_NV_DENSE_TUNE = "1"
 # read-out and streaming with the next step (greedy c64/c128 +3-5%, c1 TPOT and CER unchanged);
 # --lt-rung-algos times cuBLASLt algorithms per rung (step_bench B=32..64 -3..-5%, digests equal).
 [serve]
-extra_args = "--multistep-adaptive --decode-pipeline --lt-rung-algos"
+# Env, not flags, so every launcher (campaign serve/gate, plowbench.sh probes) applies it.
+env = { PLOW_MULTISTEP_ADAPTIVE = "true", PLOW_DECODE_PIPELINE = "true", PLOW_LT_RUNG_ALGOS = "true" }
 
 [bench]
 kind = "speech"
