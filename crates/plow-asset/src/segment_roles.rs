@@ -26,7 +26,16 @@ pub const MOE_PREFILL_CUBLASLT: u8 = 16;
 /// (`PLOW_GEMMA_MOE_DEC_GROUP`), which the CUDA runtime may serve with cuBLASLt grouped matmuls
 /// (`PLOW_MOE_DEC_LT`). Without the runtime knob the rung runs in the interpreter unchanged.
 pub const MOE_DECODE_CUBLASLT: u8 = 17;
-pub const MAX_ROLE: u8 = MOE_DECODE_CUBLASLT;
+/// DeepSeek-V4.1 prefill: one `GemmFp8Mx` (op 210) per segment on the sm_90a wgmma object
+/// `interp_sm90a_pfgemm_fp8mx.cubin`.
+pub const FP8MX_PREFILL_GEMM: u8 = 18;
+/// DeepSeek-V4.1 prefill: one `MoeGroupGluPf` or `MoeGroupDownPf` (MXFP4 experts, W4A8) per
+/// segment on `interp_sm90a_pfmoe_fp4.cubin`.
+pub const FP4_PREFILL_MOE: u8 = 19;
+/// DeepSeek-V4.1 prefill: one NoPE `FlashMlaPrefill` or `IndexScorePf` per segment on
+/// `interp_sm90a_pfflash_v41.cubin` (wgmma sparse attention + indexer score).
+pub const PFFLASH_V41: u8 = 20;
+pub const MAX_ROLE: u8 = PFFLASH_V41;
 
 pub fn is_projection(role: u8) -> bool {
     matches!(role, CUBLASLT | NATIVE_DECODE_TC)
@@ -134,6 +143,9 @@ pub const PREFILL_ATTENTION_HD256_BKV32_ABI: &str = "attention_sm90_hd256_bkv32_
 pub const PREFILL_ATTENTION_HD256_GQA2_BKV32_ABI: &str =
     "attention_sm90_hd256_gqa2_bkv32_v2";
 pub const MXFP4_MOE_ABI: &str = "mxfp4_moe_sm90_v1";
+pub const FP8MX_PREFILL_GEMM_ABI: &str = "pfgemm_fp8mx_sm90_v1";
+pub const FP4_PREFILL_MOE_ABI: &str = "pfmoe_fp4_sm90_v1";
+pub const PFFLASH_V41_ABI: &str = "pfflash_v41_sm90_v1";
 pub const W8A16_PREFILL_M1_ABI: &str = "w8a16_prefill_m1_sm90_v1";
 pub const BF16_PREFILL_GEMM_GLU_GEMMA4_ABI: &str = "gemm_glu_sm90_gemma4_4k8k_v1";
 pub const W8A8_PREFILL_GEMM_GLU_GEMMA4_ABI: &str =
@@ -156,6 +168,9 @@ pub fn requires_object(role: u8) -> bool {
             | W8A8_PREFILL_GEMM_GLU_GEMMA4
             | PREFILL_ATTENTION_HD256_GQA2_BKV32
             | PREFILL_ATTENTION_HD512_PX4_BQ64
+            | FP8MX_PREFILL_GEMM
+            | FP4_PREFILL_MOE
+            | PFFLASH_V41
     )
 }
 
@@ -252,6 +267,9 @@ impl SegmentRoles {
                     PREFILL_ATTENTION_HD256_GQA2_BKV32_ABI
                 }
                 PREFILL_ATTENTION_HD512_PX4_BQ64 => PREFILL_ATTENTION_HD512_PX4_BQ64_ABI,
+                FP8MX_PREFILL_GEMM => FP8MX_PREFILL_GEMM_ABI,
+                FP4_PREFILL_MOE => FP4_PREFILL_MOE_ABI,
+                PFFLASH_V41 => PFFLASH_V41_ABI,
                 _ => return Err("invalid packet segment object role".into()),
             };
             let valid_hash = |hash: Option<&str>| {
@@ -346,6 +364,9 @@ impl SegmentRoles {
                         | W8A16_PREFILL_M1
                         | BF16_PREFILL_GEMM_GLU_GEMMA4
                         | W8A8_PREFILL_GEMM_GLU_GEMMA4
+                        | FP8MX_PREFILL_GEMM
+                        | FP4_PREFILL_MOE
+                        | PFFLASH_V41
                 )
                     && (!valid_hash(object.sha256.as_deref())
                         || object.promote_k512.is_some()
@@ -363,6 +384,9 @@ impl SegmentRoles {
                         | W8A8_PREFILL_GEMM_GLU_GEMMA4
                         | PREFILL_ATTENTION_HD256_GQA2_BKV32
                         | PREFILL_ATTENTION_HD512_PX4_BQ64
+                        | FP8MX_PREFILL_GEMM
+                        | FP4_PREFILL_MOE
+                        | PFFLASH_V41
                 ) && (object.sha256.is_some()
                     || object.promote_k512.is_some()
                     || object.attention.is_some()))

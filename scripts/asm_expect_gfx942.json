@@ -280,11 +280,23 @@
   "matches no kernel does not fail, so if a later compiler inlines the body again this row",
   "stops asserting the shape and has to be re-homed onto plow_interp_flash."
  ],
+ "_v_perm_note": [
+  "THE v_perm_b32 ASSERTION IS ON THE FP8-KV BODY, NOT ON THE INTERPRETER ENTRY POINT, for",
+  "exactly the reason the 16x16x16 note above gives. Those v_perm_b32 are the e4m3 -> bf16",
+  "unpack; whether they land in plow_interp_flash or in the plow_exec it tail-calls is an",
+  "inliner cost decision, and PRUNING AN UNRELATED OP FROM THE INVENTORY flips it: dropping",
+  "op 55 moved all 192 of them out of the entry and into _ZL9plow_exec, same count, same work,",
+  "and the row failed on an object whose arithmetic had not changed. d_flash_prefill<512,",
+  "FP8KV=true> is the only d_flash_prefill instantiation in this object and carries the unpack",
+  "in both builds, so keying on it follows the code."
+ ],
  "interp_flash_fp8kv": {
-  "plow_interp_flash": {
+  "d_flash_prefill": {
    "require_min": {
     "v_perm_b32": 1
-   },
+   }
+  },
+  "plow_interp_flash": {
    "no_scratch": true,
    "forbid": [
     "v_mfma_f32_32x32x64_f8f6f4",

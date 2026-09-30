@@ -196,7 +196,16 @@ fn recover_tp(progs: &[DevProg]) -> Option<DevTp> {
     let (mut n_gpu, mut hidden, mut slot_bytes) = (0u32, 0u32, 0u64);
     for p in progs {
         for d in &p.insts {
-            if d.op != DevOp::XReduce as u16 && d.op != DevOp::XReduceTwoShot as u16 {
+            // XReduceScatter counts too, and a fully sequence-parallel program is why: when BOTH
+            // of a layer's seams scatter and the gathers are `XAllGather`, an all-reduce never
+            // appears and the blob read as single-GPU -- "this packet carries no collective" on a
+            // packet whose every seam is a collective. Its `i[0]=elems i[1]=tp i[2]=slot` mean
+            // exactly what XReduce's do. XAllGather does NOT: its `i[0..2]` are per-array element
+            // counts and `tp` is `i[4]`, so it stays out of this scan.
+            if d.op != DevOp::XReduce as u16
+                && d.op != DevOp::XReduceTwoShot as u16
+                && d.op != DevOp::XReduceScatter as u16
+            {
                 continue;
             }
             n_gpu = n_gpu.max(d.i[1]);

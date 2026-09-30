@@ -1,7 +1,9 @@
 //! A self-contained packet (weights embedded, no language-model step protocol) on the CUDA
 //! interpreter: the `PacketRuntime` for forward pipelines such as the Qwen3-ASR audio encoder.
-//! Every program runs as one cooperative launch per global-queue segment of the speech object
-//! (`interp_sm90a_speech.cubin`, the interpreter with the FP32 speech arms).
+//! Every program runs as one cooperative launch per global-queue segment of one object -- by
+//! default the speech object (`interp_sm90a_speech.cubin`, the interpreter with the FP32 speech
+//! arms); [`CudaPacketRuntime::load_object`] names another, e.g. a segment role object for a
+//! single-opcode check.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -33,6 +35,7 @@ pub struct CudaPacketRuntime {
     module: Module,
     function: KernelFn,
     grid: u32,
+    block: u32,
     smem: u32,
     names: Vec<String>,
     tensors: Vec<DeviceMem>,
@@ -58,24 +61,29 @@ impl CudaPacketRuntime {
     }
 
     pub fn load_on(be: Arc<CudaBackend>, path: &Path) -> Result<Self> {
+        let object = path.parent().unwrap_or(Path::new(".")).join(OBJECT);
+        Self::load_object(be, path, &object, SYMBOL, BLOCK, "plow_arena_bytes_speech")
+    }
+
+    /// Load `path` to run on `object`'s kernel `symbol` at `block` threads, its dynamic shared
+    /// memory read from the object's `arena_symbol` global.
+    pub fn load_object(be: Arc<CudaBackend>, path: &Path, object: &Path, symbol: &str, block: u32, arena_symbol: &str) -> Result<Self> {
         let raw = std::fs::read(path).map_err(|source| RuntimeError::Io { path: path.to_path_buf(), source })?;
         let blob = DevBlob::parse(&raw)?;
         if !blob.gen.is_empty() || blob.tp.is_some() {
             return Err(RuntimeError::Rejected(format!("{}: generated tensors or TP are not supported by the CUDA packet runtime", path.display())));
         }
-        let dir = path.parent().unwrap_or(Path::new("."));
-        let object = dir.join(OBJECT);
-        let image = std::fs::read(&object).map_err(|source| RuntimeError::Io { path: object.clone(), source })?;
+        let image = std::fs::read(object).map_err(|source| RuntimeError::Io { path: object.to_path_buf(), source })?;
         let module = be.module_load(&image)?;
-        let function = be.get_function(&module, SYMBOL)?;
-        let smem = be.module_global_u32(&module, "plow_arena_bytes_speech")?.unwrap_or(49152);
+        let function = be.get_function(&module, symbol)?;
+        let smem = be.module_global_u32(&module, arena_symbol)?.unwrap_or(49152);
         if let Some(limit) = crate::config::RuntimeConfig::debug_max_inst() {
             if be.module_global_set_u32(&module, "plow_debug_max_inst_speech", limit)? {
                 tracing::warn!(limit, "packet runtime: instructions at or past the limit are skipped");
             }
         }
         be.set_max_dynamic_smem(function, smem)?;
-        let capacity = be.occupancy_blocks_per_sm(function, BLOCK, smem as usize)? * be.sm_count();
+        let capacity = be.occupancy_blocks_per_sm(function, block, smem as usize)? * be.sm_count();
         if blob.n_cu == 0 || blob.n_cu > capacity {
             return Err(RuntimeError::Rejected(format!("{}: n_cu {} exceeds cooperative capacity {capacity}", path.display(), blob.n_cu)));
         }
@@ -174,6 +182,7 @@ impl CudaPacketRuntime {
             module,
             function,
             grid: blob.n_cu,
+            block,
             smem,
             names: blob.tensors.iter().map(|t| t.name.clone()).collect(),
             tensors,
@@ -216,7 +225,7 @@ impl CudaPacketRuntime {
                 arg.gq_seg_ofs += (seg * 4) as u64;
                 arg.gq_cursor += (seg * CTR_STRIDE as usize * 4) as u64;
                 let mut params = [&mut arg as *mut DevProgram as *mut std::ffi::c_void];
-                self.be.launch_cooperative(self.function, self.grid, BLOCK, self.smem, &mut params, Some(&self.stream))?;
+                self.be.launch_cooperative(self.function, self.grid, self.block, self.smem, &mut params, Some(&self.stream))?;
             }
         }
         Ok(())

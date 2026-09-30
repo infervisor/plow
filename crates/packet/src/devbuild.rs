@@ -323,6 +323,7 @@ struct Op {
     deps: Vec<Dep>,
     counter: u32,   // the coarse counter this op bumps
     work: Vec<u32>, // per-slice cost, from the cost model. See `select_granularity`.
+    gq_delay: u32,  // added to its ASAP rank: see `Builder::defer_gq`
 }
 
 /// Dependency graph for one complete emitted program. Fusion discovery runs on this graph only
@@ -425,11 +426,17 @@ pub struct Builder {
     uniseg_forced: bool,
     /// See [`Builder::host_join`].
     cur_join: u32,
+    /// See [`Builder::ignore_isolate`].
+    isolate_ignored: bool,
+    /// See [`Builder::memo`].
+    memo: std::collections::HashMap<String, Vec<u32>>,
     /// See [`Builder::set_gq_order_asap`]. Default on; `PLOW_GQ_ORDER=emit` restores emit order.
     gq_order_asap: bool,
     /// See [`Builder::set_gq_order_seg`]. Default on; `PLOW_GQ_ORDER=asap` keeps program-wide
     /// ranks and `=emit` keeps emit order.
     gq_order_seg: bool,
+    /// See [`Builder::set_gq_order_critical`]. Off unless an emitter asks for it.
+    gq_order_crit: bool,
     /// Split descriptor-consuming prefill families into independent wave classes.
     /// Callers must enable this only for prefill programs.
     packed_prefill_segments: bool,
@@ -697,8 +704,11 @@ impl Builder {
             uniseg_denied: false,
             uniseg_forced: false,
             cur_join: 0,
+            isolate_ignored: false,
+            memo: std::collections::HashMap::new(),
             gq_order_asap: knobs.gq_order.as_deref() != Some("emit"),
             gq_order_seg: !matches!(knobs.gq_order.as_deref(), Some("emit") | Some("asap")),
+            gq_order_crit: false,
             packed_prefill_segments: false,
             rowsplit_arm: None,
             token_batch_band: None,
@@ -807,6 +817,51 @@ impl Builder {
         self.gq_order_seg = on;
     }
 
+    /// Order the queue by a critical-path list schedule instead of ASAP levels: among the ops whose
+    /// producers are already placed, the one with the longest chain of consumers below it goes
+    /// first (ties keep emit order). For programs whose narrow chains (few-slice ops) would
+    /// otherwise queue behind a wide independent op of the same ASAP level: V4.1 decode's
+    /// compressor step -> index key -> norm -> append chain waited ~8 us behind the indexer's
+    /// `wq_b` GEMV. Still topological, so the queue's deadlock-freedom argument holds.
+    pub fn set_gq_order_critical(&mut self, on: bool) {
+        self.gq_order_crit = on;
+    }
+
+    /// Queue position per op under [`Builder::set_gq_order_critical`].
+    fn gq_crit_ranks(&self) -> Vec<u32> {
+        let n = self.ops.len();
+        let mut succ: Vec<Vec<usize>> = vec![Vec::new(); n];
+        let mut indeg = vec![0u32; n];
+        for i in 0..n {
+            for d in &self.ops[i].deps {
+                let p = d.producer() as usize;
+                if p < i {
+                    succ[p].push(i);
+                    indeg[i] += 1;
+                }
+            }
+        }
+        let mut bl = vec![0u32; n];
+        for i in (0..n).rev() {
+            bl[i] = 1 + succ[i].iter().map(|&s| bl[s]).max().unwrap_or(0);
+        }
+        let mut ready: std::collections::BinaryHeap<(u32, std::cmp::Reverse<usize>)> =
+            (0..n).filter(|&i| indeg[i] == 0).map(|i| (bl[i], std::cmp::Reverse(i))).collect();
+        let mut rank = vec![0u32; n];
+        let mut k = 0u32;
+        while let Some((_, std::cmp::Reverse(i))) = ready.pop() {
+            rank[i] = k;
+            k += 1;
+            for &s in &succ[i] {
+                indeg[s] -= 1;
+                if indeg[s] == 0 {
+                    ready.push((bl[s], std::cmp::Reverse(s)));
+                }
+            }
+        }
+        rank
+    }
+
     /// Earliest-start rank per op. With `seg_of`, a producer in an earlier segment contributes
     /// start 0 (see [`Builder::set_gq_order_seg`]).
     fn gq_asap_ranks(&self, seg_of: Option<&[u16]>) -> Vec<u32> {
@@ -820,7 +875,7 @@ impl Builder {
                     s = s.max(start[p] + cost);
                 }
             }
-            start[i] = s;
+            start[i] = s + self.ops[i].gq_delay;
         }
         start
     }
@@ -1003,12 +1058,22 @@ impl Builder {
         self.shared_tail_mark
     }
 
+    /// The instruction op `counter` emitted.
+    pub fn inst(&self, counter: u32) -> &DevInst {
+        &self.ops[counter as usize].inst
+    }
+
     /// The declared name of handle `h`.
     pub fn tensor_name(&self, h: u32) -> &str {
         &self.tensors[h as usize].name
     }
 
-    /// The declared byte size of handle `h`.
+    /// The declared size of handle `h`, in bytes.
+    ///
+    /// For emitters that want to check an operand against the shape they are about to pass in
+    /// `i[]`. A weight declared at one size and read at another is the silent-wrongness case: the
+    /// kernel reads whatever is at the handle, so a full-size tensor read with a per-rank N gives
+    /// every rank the FIRST shard of the weight instead of its own, with no fault anywhere.
     pub fn tensor_bytes(&self, h: u32) -> u64 {
         self.tensors[h as usize].bytes
     }
@@ -1090,9 +1155,85 @@ impl Builder {
         self.cur_join += 1;
     }
 
+    /// Push an op `ranks` later in the ASAP claim order (`set_gq_order_asap`) without adding a
+    /// dependency: for work whose consumer is far off, so a short chain that is ready at the
+    /// same rank claims the grid first. The order stays topological (a consumer still ranks
+    /// above every producer).
+    pub fn defer_gq(&mut self, counter: u32, ranks: u32) {
+        self.ops[counter as usize].gq_delay += ranks;
+    }
+
+    /// Amend an emitted op's immediates and optionally re-place it (coarse deps only) on `cus`: for
+    /// a caller that fuses a neighbouring op into one a shared emit helper produced.
+    pub fn amend(&mut self, counter: u32, cus: Option<Vec<u32>>, f: impl FnOnce(&mut DevInst)) {
+        let op = &mut self.ops[counter as usize];
+        if let Some(cus) = cus {
+            assert!(op.deps.iter().all(|d| matches!(d, Dep::Coarse(_))));
+            op.inst.blocks = cus.len() as u16;
+            op.work = vec![1; cus.len()];
+            op.cus = cus;
+        }
+        f(&mut op.inst);
+    }
+
+    /// Replace an emitted op's dependencies with coarse ones on `deps` (all emitted before it).
+    pub fn rewire(&mut self, counter: u32, deps: &[u32]) {
+        assert!(deps.iter().all(|&d| d < counter));
+        self.ops[counter as usize].deps = deps.iter().map(|&c| Dep::Coarse(c)).collect();
+    }
+
+    /// A second instance of an emitted op (coarse deps only), on the same CUs and deps, amended
+    /// by `f`.
+    pub fn fork_op(&mut self, counter: u32, f: impl FnOnce(&mut DevInst)) -> u32 {
+        let src = &self.ops[counter as usize];
+        let deps = src
+            .deps
+            .iter()
+            .map(|d| match d {
+                Dep::Coarse(c) => Dep::Coarse(*c),
+                _ => panic!("fork_op: coarse deps only"),
+            })
+            .collect();
+        let (mut inst, cus) = (src.inst, src.cus.clone());
+        f(&mut inst);
+        let c = self.ops.len() as u32;
+        self.ops.push(Op {
+            inst,
+            isolated: false,
+            keep_single_grid: false,
+            join: self.cur_join,
+            work: vec![1; cus.len()],
+            cus,
+            deps,
+            counter: c,
+            gq_delay: 0,
+        });
+        c
+    }
+
     /// Preserve an operation as its own segment without dropping dependency edges.
     pub fn isolate(&mut self, counter: u32) {
-        self.ops[counter as usize].isolated = true;
+        self.ops[counter as usize].isolated |= !self.isolate_ignored;
+    }
+
+    /// Amend already-emitted instructions: an operand a shared emit helper does not take, bound by
+    /// the one caller that needs it.
+    pub fn for_each_inst_mut(&mut self, mut f: impl FnMut(&mut DevInst)) {
+        for op in &mut self.ops {
+            f(&mut op.inst);
+        }
+    }
+
+    /// Make [`Builder::isolate`] a no-op: a single-launch program (a decode rung on the one
+    /// interpreter object) reuses emitters that isolate ops for prefill role objects.
+    pub fn ignore_isolate(&mut self) {
+        self.isolate_ignored = true;
+    }
+
+    /// Emitter-owned memo of handles within this program, for reusing a derived value (e.g. a
+    /// quantized copy) whose key fully determines it.
+    pub fn memo(&mut self) -> &mut std::collections::HashMap<String, Vec<u32>> {
+        &mut self.memo
     }
 
     pub fn set_decode_mla_bf16_segments(&mut self) {
@@ -1178,6 +1319,7 @@ impl Builder {
             deps,
             counter,
             work,
+            gq_delay: 0,
         });
         counter
     }
@@ -1727,6 +1869,36 @@ impl Builder {
         i as u32
     }
 
+    /// Why no chain qualified. The bare assert named the shape it wanted and nothing about what
+    /// the graph actually had, which is the difference between a five-minute answer and a bisect.
+    fn ep_ineligibility_report(&self, degree: u32) -> String {
+        let mut out = String::new();
+        for op in self.ops.iter() {
+            let g = &op.inst;
+            if g.op != DevOp::MoeGroupGluPf as u16 {
+                continue;
+            }
+            let full_i = g.i[0].checked_mul(degree);
+            out.push_str(&format!(
+                "\n  MoeGroupGluPf enc=i[3]={} (EP needs 2=MXFP4), ep=i[6]={} (needs 0), \
+                 imoe=i[0]={} hidden=i[1]={} n_exp=i[2]={}; full_i={:?} (needs %128==0), \
+                 hidden%128={}, n_exp>=degree: {}",
+                g.i[3],
+                g.i[6],
+                g.i[0],
+                g.i[1],
+                g.i[2],
+                full_i,
+                g.i[1] % 128,
+                g.i[2] >= degree,
+            ));
+        }
+        if out.is_empty() {
+            out.push_str("\n  the graph emits no MoeGroupGluPf at all");
+        }
+        out
+    }
+
     fn rewrite_replicated_moe_prefill_ep(&mut self, degree: u32) -> usize {
         assert!(degree > 1, "EP degree must exceed one");
         let mut chains = Vec::new();
@@ -1756,7 +1928,11 @@ impl Builder {
                 c.op == DevOp::MoeCombinePf as u16
                     && c.t[3] == d.t[0]
                     && c.i[0] == d.i[0]
-                    && c.i[1] == 16
+                    // i[1] is the combine's top_k. This used to require == 16, which is Kimi-K3's
+                    // top_k and not a property of the rewrite: DeepSeek-V4.1 routes top-6 and was
+                    // silently ineligible. What the rewrite actually needs is a real per-slot
+                    // combine (k > 1) whose k agrees with the align's, which is checked below.
+                    && c.i[1] > 1
                     && c.i[2] != 0
                     && c.i[3..].iter().all(|&v| v == 0)
             }) else {
@@ -1784,7 +1960,9 @@ impl Builder {
                         && a.t[0] == g.t[4]
                         && a.i[0] == self.ops[combine].inst.i[2]
                         && a.i[1] == g.i[2]
-                        && a.i[2] == 16)
+                        // ...and the align's top_k must be the combine's, rather than both being
+                        // required to be the literal 16.
+                        && a.i[2] == self.ops[combine].inst.i[1])
                         .then_some(i)
                 })
                 .collect();
@@ -1876,13 +2054,31 @@ impl Builder {
         chains.len()
     }
 
+    /// Drop every op after the first `n`, for BISECTION.
+    ///
+    /// A diagnostic, and the only sound direction to cut: dependencies point BACKWARDS, so no
+    /// surviving op can reference one this drops, and `finish` then computes waits and successors
+    /// over the remaining prefix exactly as if the emitter had stopped there. Cutting anywhere
+    /// but the tail would leave a dangling counter.
+    ///
+    /// Exists because a per-op cost on real hardware cannot be had any other way on this stack:
+    /// the interpreter is a MEGAKERNEL, so one launch covers the whole layer and a kernel-level
+    /// profiler reports one number for 34 ops. Emitting prefixes and differencing their run times
+    /// is the profiler.
+    pub fn truncate_ops(&mut self, n: usize) {
+        if n < self.ops.len() {
+            self.ops.truncate(n);
+        }
+    }
+
     pub fn finish(mut self) -> Program {
         let knobs = knobs();
         if let Some(degree) = self.moe_prefill_ep_degree {
             let rewritten = self.rewrite_replicated_moe_prefill_ep(degree);
             assert!(
                 rewritten != 0,
-                "replicated MoE EP requested at degree {degree}, but the complete graph has no eligible MXFP4 align/GLU/down/combine -> TP-reduction boundary"
+                "replicated MoE EP requested at degree {degree}, but the complete graph has no eligible MXFP4 align/GLU/down/combine -> TP-reduction boundary.{}",
+                self.ep_ineligibility_report(degree)
             );
             eprintln!("  whole-graph placement: {rewritten} routed-MoE boundaries use EP{degree}");
         }
@@ -2222,8 +2418,18 @@ impl Builder {
             .ops
             .iter()
             .any(|op| op.inst.op == DevOp::FlashMlaPrefillFp8 as u16 && op.inst.j[1] != 0);
+        // A GATHERED op 51 -- t[7] = the per-pack union table -- has an arm on the FOUR-WAVE
+        // object only; the 8-wave interpreter traps on it by design rather than attend the full
+        // causal range of a model trained sparse. So the routing is a property of the PACKET and
+        // not of a knob: emitting one of these without V2 segmentation cannot produce a program
+        // that runs at all.
+        let mla_gather_union = self
+            .ops
+            .iter()
+            .any(|op| op.inst.op == DevOp::FlashMlaPrefill as u16 && op.inst.t[7] != TENSOR_NONE);
         let mla_v2 = !uniseg
             && (split_mla
+                || mla_gather_union
                 || match knobs.mla_pf_v2 {
                     Some(explicit) => explicit,
                     // A placed packet is an AMD production artifact. Isolating a pure MLA flash
@@ -2955,7 +3161,9 @@ impl Builder {
         // op-major order within each window; cross-window deps remain counter-gated.
         // With `gq_order_asap`, each window is ordered by earliest-start rank instead (see
         // `set_gq_order_asap`); ties keep op-major order and the order stays topological.
-        let asap = if self.gq_order_asap {
+        let asap = if self.gq_order_crit {
+            Some(self.gq_crit_ranks())
+        } else if self.gq_order_asap {
             Some(self.gq_asap_ranks(self.gq_order_seg.then_some(&seg_of[..])))
         } else {
             None

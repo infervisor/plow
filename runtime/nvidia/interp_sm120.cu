@@ -223,6 +223,17 @@ extern "C" __device__ unsigned plow_pdl_wait_1 = 1;
 #endif
 #endif
 
+#if PLOW_NV_TRACE
+/* In-op probe stamps (%globaltimer ns) for trace builds: g_probe[0] counts block 0's probed
+ * invocations, each owning 32 slots from 1 + 32 * n. */
+__device__ unsigned long long g_probe[4096];
+__device__ __forceinline__ void plow_probe(unsigned i) {
+    unsigned long long t;
+    asm volatile("mov.u64 %0, %globaltimer;" : "=l"(t));
+    if (i < 4096u) g_probe[i] = t;
+}
+__device__ __forceinline__ unsigned plow_probe_begin() { return 1u + 32u * (unsigned)atomicAdd(&g_probe[0], 1ull); }
+#endif
 #include "op_attention.cuh" /* validated: d_flash_decode / d_flash_merge (harvested) */
 #if PLOW_NV_PACKED_REQUEST && defined(PLOW_PACKET_HAS_PACKED_PREFILL_TOPOLOGY) && !PLOW_PACKET_HAS_PACKED_PREFILL_TOPOLOGY
 #error "packed-request object requires packed-prefill packet topology"
@@ -258,6 +269,28 @@ extern "C" __device__ __constant__ unsigned plow_pf_fp8_request_abi = 1;
 #define PLOW_NV_PREFILL 0
 #endif
 #include "op_norm.cuh"
+#include "../common/op_act_quant_mx.h" /* DeepSeek-V4.1 act fake quant (op 212) */
+#if !defined(PLOW_CONFIG) || PLOW_HAS_XREDUCE || PLOW_HAS_XREDUCE2
+#define NV_COLLECTIVES 1
+#include "op_collective.cuh" /* TP all-reduce (ops 24, 29) */
+#endif
+#include "op_hyperconn.cuh" /* mHC pre/post (ops 128/129) */
+#include "op_gemm_f32.cuh" /* fp32-output projections (ops 135/180) */
+#include "op_gemv_fp8mx.cuh" /* V4.1 block-fp8 [32,32] projections at decode rows (op 210) */
+#include "op_engram.cuh"     /* V4.1 Engram (ops 208/209) + f32 argmax (op 173) */
+#include "op_sparse_attn_decode.cuh" /* V4.1 batched decode attention (ops 213/214) */
+#include "op_index_decode.cuh"       /* V4.1 batched decode indexer (ops 216/217) */
+#if defined(PLOW_NV_HOPPER) && !PLOW_NV_PREFILL && defined(PLOW_HAS_MOE_GROUP_GLU_PF) && PLOW_HAS_MOE_GROUP_GLU_PF
+#define PLOW_NV_MOE_DEC_V41 1
+#include "op_moe_decode_v41.cuh" /* V4.1 routed experts at decode rows (ops 85/86 decode arms) */
+#else
+#define PLOW_NV_MOE_DEC_V41 0
+#endif
+#include "op_compress.cuh" /* V4.1 KV compressor tail (ops 206/207/211) */
+#if PLOW_NV_PREFILL
+#include "op_index_pf.cuh" /* DSA sparse-prefill indexer (ops 117-119) */
+#include "op_v41_flash.cuh" /* V4.1 sparse attention (op 51, NoPE) */
+#endif
 #include "op_gemm.cuh"
 #if defined(PLOW_NV_HOPPER) && !PLOW_NV_PREFILL
 #include "op_gemv_k8_sm90.cuh"
@@ -481,6 +514,21 @@ __device__ unsigned      g_tr_wait[PLOW_TRACE_MAX];
 __device__ unsigned long long g_tr_gate[PLOW_TRACE_MAX];
 __device__ unsigned long long g_tr_body[PLOW_TRACE_MAX];
 __device__ unsigned long long g_tr_sig[PLOW_TRACE_MAX];
+/* Per-instruction wall span over ALL blocks (%globaltimer ns): g_sp_lo holds ~min(body start),
+ * g_sp_hi max(body end), so both are zero-initialised and updated by atomicMax. */
+#define PLOW_SPAN_MAX 1024
+__device__ unsigned long long g_sp_lo[PLOW_SPAN_MAX];
+__device__ unsigned long long g_sp_hi[PLOW_SPAN_MAX];
+/* Per (inst, block) [claim | gate pass | body end] for the first PLOW_BK_INSTS insts: separates a
+ * slow body from a staggered start. A block keeps its first claim/gate and its last end. */
+#define PLOW_BK_INSTS 128
+#define PLOW_BK_BLOCKS 256
+__device__ unsigned long long g_bk[3][PLOW_BK_INSTS][PLOW_BK_BLOCKS];
+__device__ __forceinline__ unsigned long long plow_gtimer() {
+    unsigned long long t;
+    asm volatile("mov.u64 %0, %globaltimer;" : "=l"(t));
+    return t;
+}
 #endif
 #if !PLOW_NV_PTXSYNC
 /* Release before signal / acquire after the gate — one device-scope fence, exactly where
@@ -1006,7 +1054,25 @@ __device__ __forceinline__ PlowStreamEnt ld_stream_ent(const PlowStreamEnt* p) {
 #ifndef PLOW_NV_ARENA_MIN_BYTES
 #define PLOW_NV_ARENA_MIN_BYTES 0
 #endif
+#if PLOW_NV_PREFILL && (!defined(PLOW_CONFIG) || PLOW_HAS_FLASH_MLA_PREFILL)
+/* DeepSeek-V4.1's sparse flash (op_v41_flash.cuh) claims its own staging; floats. */
+#define PLOW_NV_KERNEL_ARENA                                                                   \
+    (PLOW_NV_FA_ARENA > PLOW_NV_FP8_M1_ARENA                                                   \
+         ? (PLOW_NV_FA_ARENA > (plow_v41fa::SMEM_BYTES + 3u) / 4u ? PLOW_NV_FA_ARENA : (plow_v41fa::SMEM_BYTES + 3u) / 4u) \
+         : (PLOW_NV_FP8_M1_ARENA > (plow_v41fa::SMEM_BYTES + 3u) / 4u ? PLOW_NV_FP8_M1_ARENA : (plow_v41fa::SMEM_BYTES + 3u) / 4u))
+#elif !PLOW_NV_PREFILL && ((defined(PLOW_HAS_SPARSE_ATTN_DECODE) && PLOW_HAS_SPARSE_ATTN_DECODE) || PLOW_NV_MOE_DEC_V41)
+/* DeepSeek-V4.1 decode: batched attention (op_sparse_attn_decode.cuh) stages Q + KV tiles + idx; the
+ * routed experts (op_moe_decode_v41.cuh) a bulk-copy ring per warp, sized here for E <= 384. */
+#if PLOW_NV_MOE_DEC_V41
+#define PLOW_NV_MOE_DEC_BYTES (unsigned)moe_decode_v41_smem_bytes(384u, PLOW_NV_WARPS)
+#else
+#define PLOW_NV_MOE_DEC_BYTES 0u
+#endif
+#define PLOW_NV_KERNEL_ARENA \
+    (((plow_sad::SMEM_BYTES > PLOW_NV_MOE_DEC_BYTES ? plow_sad::SMEM_BYTES : PLOW_NV_MOE_DEC_BYTES) + 3u) / 4u)
+#else
 #define PLOW_NV_KERNEL_ARENA (PLOW_NV_FA_ARENA > PLOW_NV_FP8_M1_ARENA ? PLOW_NV_FA_ARENA : PLOW_NV_FP8_M1_ARENA)
+#endif
 #define PLOW_NV_OP_ARENA (PLOW_NV_KERNEL_ARENA > (PLOW_NV_ARENA_MIN_BYTES + 3u) / 4u ? PLOW_NV_KERNEL_ARENA : (PLOW_NV_ARENA_MIN_BYTES + 3u) / 4u)
 #define PLOW_NV_BASE_ARENA_FLOATS                                                              \
     (PLOW_NV_OP_ARENA > 2 * (int)PLOW_NV_WARPS ? PLOW_NV_OP_ARENA : 2 * (int)PLOW_NV_WARPS)
@@ -1352,7 +1418,173 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
                   nblk);
         break;
 #endif
+#if !PLOW_NV_QWEN_GDN
+    case PLOW_DOP_QWEN_HEADNORM_ROPE:
+        /* interleaved, no norm, row-major out: DeepSeek-V4.1's interior rope */
+        if (!(in->i[2] >> 31) || in->i[5] || in->i[4] || TEN(2) || TEN(6) || !TEN(5) || (in->i[2] & 0x7fffffffu) % 2u) __trap();
+        d_rope_interleaved_rows((__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1), (const float*)TEN(3), (const float*)TEN(4),
+                                (const int*)TEN(5), in->i[0], in->i[1], in->i[2] & 0x7fffffffu, in->i[3], in->i[7], slice, nblk);
+        break;
+#endif
+    case PLOW_DOP_GEMM_FP8_MX: {
+        /* decode rows only; prefill runs op 210 on the sm_90a role object */
+        const unsigned groups = in->i[3] ? in->i[3] : 1u, ldx = groups * in->i[2];
+        /* i6: 0 = bf16 x, 1 = e4m3 x + t4 scales, 2 = bf16 x quantized in the op (ActQuantMx numerics),
+         * 3 = as 2 on Glu(x = gate, t4 = up, i7 = act, f1 = limit) */
+        if (in->i[0] > plow_gv8::MAX_T || in->i[1] % 32u || in->i[2] % 32u || in->i[6] > 3u || (in->i[6] & 1u && !TEN(4)) ||
+            PLOW_NV_ARENA_FLOATS < plow_gv8::arena_floats(2))
+            __trap();
+        const unsigned esz = in->i[6] == 1u ? 1u : 2u;
+        d_gemv_fp8mx((__nv_bfloat16*)TEN(0) + (size_t)in->i[5] * groups * in->i[1],
+                     (const uint8_t*)TEN(1) + (size_t)in->i[4] * ldx * esz,
+                     in->i[6] == 1u ? (const uint8_t*)TEN(4) + (size_t)in->i[4] * (ldx / 32u) : nullptr, (const uint8_t*)TEN(2),
+                     (const uint8_t*)TEN(3), in->i[0], in->i[1], in->i[2], groups, in->i[6], slice, nblk, arena,
+                     PLOW_NV_ARENA_FLOATS, in->i[6] == 3u ? (const __nv_bfloat16*)TEN(4) + (size_t)in->i[4] * ldx : nullptr,
+                     in->i[7], in->fj[1].f);
+        break;
+    }
+    case PLOW_DOP_ENGRAM_EMBED:
+        /* i4 = TENSOR_NONE derives the shard base from the rank; the CUDA engine is rank 0 (a
+         * host-mapped table is whole, part_rows = all of it) */
+        d_engram_embed((__nv_bfloat16*)TEN(0), (const unsigned char*)TEN(1), (const unsigned char*)TEN(2), (const int*)TEN(3), in->i[0],
+                       in->i[1], in->i[2], in->i[3], in->i[4] == PLOW_TENSOR_NONE ? 0u : in->i[4], in->i[5], slice, nblk);
+        break;
+    case PLOW_DOP_ENGRAM_GATE:
+        d_engram_gate((__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1), (const __nv_bfloat16*)TEN(2), (const __nv_bfloat16*)TEN(3),
+                      (const unsigned char*)TEN(4), in->i[0], in->i[1], in->i[2], in->fj[0].f, slice, nblk, arena);
+        break;
+#if !PLOW_NV_SPEECH /* the speech object runs ops 173 and 180 in d_speech_f32 */
+    case PLOW_DOP_ARGMAX_F32:
+        d_argmax_f32((unsigned*)TEN(0), (const float*)TEN(1), in->i[0], in->i[1], slice, nblk, arena);
+        break;
+#endif
+    case PLOW_DOP_ACT_QUANT_MX:
+        d_act_quant_mx((uint16_t*)TEN(0), (const uint16_t*)TEN(1), in->i[0], in->i[1], slice, nblk, (uint8_t*)TEN(2));
+        break;
+    case PLOW_DOP_HYPER_CONN_PRE:
+        d_hyperconn_pre((float*)TEN(0), (float*)TEN(1), (__nv_bfloat16*)TEN(2), (const float*)TEN(3),
+                        (const __nv_bfloat16*)TEN(4), (const float*)TEN(5), (const float*)TEN(6), in->i[0], in->i[1],
+                        in->i[2], in->i[3], in->fj[0].f, in->fj[1].f, slice, nblk, (float*)TEN(7), in->i[4], in->i[5], in->i[6],
+                        arena, PLOW_NV_ARENA_FLOATS, in->fj[2].u,
+                        in->fj[2].u & 1u ? (const __nv_bfloat16*)T[in->i[7]] : nullptr);
+        break;
+    case PLOW_DOP_GEMV_F32:
+        d_gemv_f32((float*)TEN(0), (const __nv_bfloat16*)TEN(1), (const float*)TEN(2), in->i[0], in->i[1], in->i[2], slice, nblk, arena,
+                   PLOW_NV_ARENA_FLOATS, (unsigned char*)TEN(3), in->i[3], in->i[4]);
+        break;
+#if !PLOW_NV_SPEECH
+    case PLOW_DOP_GEMM_F32:
+        d_gemm_f32((float*)TEN(0), (const __nv_bfloat16*)TEN(1), (const __nv_bfloat16*)TEN(2), in->i[0], in->i[1], in->i[2], slice, nblk,
+                   arena, PLOW_NV_ARENA_FLOATS, (unsigned char*)TEN(3), in->i[3]);
+        break;
+#endif
+    case PLOW_DOP_HYPER_CONN_POST:
+        d_hyperconn_post((__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1), (const __nv_bfloat16*)TEN(2),
+                         (const float*)TEN(3), (const float*)TEN(4), in->i[0], in->i[1], in->i[2], in->i[3], slice, nblk);
+        break;
+    case PLOW_DOP_COMPRESS_POOL:
+        if (in->i[7] != 2u) __trap(); /* V4's rope/quant and Hadamard epilogues: not ported */
+        if (in->i[5] == 4u) /* f32 kv/score (DeepSeek-V4.1's fp32 compressor projections) */
+            d_compress_pool_norm<float>((__nv_bfloat16*)TEN(0), (const float*)TEN(1), (const float*)TEN(2), (const float*)TEN(3),
+                                        (const __nv_bfloat16*)TEN(4), in->i[0], in->i[1], in->i[2], in->i[3], in->fj[0].f, in->i[6],
+                                        slice, nblk, arena, PLOW_NV_ARENA_FLOATS, (const int*)TEN(7));
+        else
+            d_compress_pool_norm<__nv_bfloat16>((__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1), (const __nv_bfloat16*)TEN(2),
+                                                (const float*)TEN(3), (const __nv_bfloat16*)TEN(4), in->i[0], in->i[1], in->i[2],
+                                                in->i[3], in->fj[0].f, in->i[6], slice, nblk, arena, PLOW_NV_ARENA_FLOATS,
+                                                (const int*)TEN(7));
+        break;
+    case PLOW_DOP_COMPRESS_ROPE_QUANT:
+        d_compress_rope_quant((__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1), (const float*)TEN(2), (const float*)TEN(3), in->i[0],
+                              in->i[1], in->i[2], in->i[3], in->i[4], in->i[5], in->i[6], slice, nblk, (const int*)TEN(4),
+                              in->i[7] ? in->i[7] : 1u, in->fj[2].u >> 31, in->fj[1].u, in->fj[2].u & 0x3fffffffu,
+                              (const int*)TEN(5), (in->fj[2].u >> 30) & 1u);
+        break;
+    case PLOW_DOP_SPARSE_ATTN_DECODE:
+        if (PLOW_NV_ARENA_FLOATS * sizeof(float) < plow_sad::SMEM_BYTES || in->i[1] % 16u || in->i[4] + in->i[2] > plow_sad::MAX_ROWS) __trap();
+        d_sparse_attn_decode((__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1), (const __nv_bfloat16*)TEN(2), (const __nv_bfloat16*)TEN(3),
+                             (const int*)TEN(4), (const int*)TEN(5), (const float*)TEN(6), (float*)TEN(7), in->i[0], in->i[1], in->i[2],
+                             in->i[3], in->i[4], in->i[5], in->fj[0].f, slice, nblk, (unsigned char*)arena);
+        break;
+    case PLOW_DOP_SPARSE_ATTN_MERGE:
+        d_sparse_attn_merge((__nv_bfloat16*)TEN(0), (const float*)TEN(1), (const float*)TEN(2), in->i[0], in->i[1], in->i[2], slice, nblk);
+        break;
+    case PLOW_DOP_COMPRESS_DECODE_STEP:
+        if (in->i[2] + 32u > PLOW_NV_ARENA_FLOATS) __trap();
+        d_compress_decode_step((__nv_bfloat16*)TEN(0), (float*)TEN(1), (float*)TEN(2), (const float*)TEN(3), (const float*)TEN(4),
+                               (const __nv_bfloat16*)TEN(5), (const int*)TEN(6), in->i[0], in->i[1], in->i[2], in->fj[0].f, slice, nblk, arena,
+                               in->i[3]);
+        break;
+    case PLOW_DOP_INDEX_SCORE_DECODE:
+        d_index_score_decode((float*)TEN(0), (const __nv_bfloat16*)TEN(1), (const __nv_bfloat16*)TEN(2), in->fj[0].f,
+                             (const __nv_bfloat16*)TEN(3), (const int*)TEN(4), in->i[0], in->i[1], in->i[2], in->i[3], slice, nblk);
+        break;
+    case PLOW_DOP_INDEX_SELECT_DECODE:
+        d_index_select_decode((int*)TEN(0), (const float*)TEN(1), (const int*)TEN(2), in->i[0], in->i[1], in->i[2], slice, nblk,
+                              (unsigned*)arena, PLOW_NV_ARENA_FLOATS);
+        break;
+    case PLOW_DOP_ROPE_INVERSE_O:
+        d_rope_inverse_o((__nv_bfloat16*)TEN(0), (const float*)TEN(1), (const float*)TEN(2), in->i[0], in->i[1], in->i[2], in->i[3],
+                         in->i[4], slice, nblk, (const int*)TEN(3), in->i[5]);
+        break;
+#if PLOW_NV_PREFILL
+    case PLOW_DOP_INDEX_SCORE_PF:
+        d_index_score_pf((float*)TEN(0), (const __nv_bfloat16*)TEN(1), (const __nv_bfloat16*)TEN(2), (const __nv_bfloat16*)TEN(3),
+                         (const int*)TEN(4), in->i[0], in->i[1], in->i[2], in->i[3], in->i[4] ? in->i[4] : 1u, in->fj[0].f, slice, nblk,
+                         arena, PLOW_NV_ARENA_FLOATS);
+        break;
+    case PLOW_DOP_INDEX_SELECT_PF:
+        d_index_select_pf((int*)TEN(0), (const float*)TEN(1), (const int*)TEN(2), in->i[0], in->i[1], in->i[2],
+                          in->i[3] ? in->i[3] : 1u, slice, nblk, (unsigned*)arena);
+        break;
+    case PLOW_DOP_FLASH_MLA_PREFILL:
+        if (!(in->i[3] >> 31) || in->i[0] != 1u || (TEN(5) && TEN(5) != TEN(4))) __trap(); /* NoPE, one sequence, K = V */
+        d_v41_sparse_flash((float*)TEN(0), (float*)TEN(1), (const __nv_bfloat16*)TEN(2), (const __nv_bfloat16*)TEN(4), (const int*)TEN(6),
+                           (const unsigned char*)TEN(7), in->i[1], in->i[3] & 0x7fffffffu, in->i[4], in->i[5], in->i[6], in->i[7],
+                           in->fj[0].f, slice, nblk, arena, PLOW_NV_ARENA_FLOATS);
+        break;
+    case PLOW_DOP_INDEX_UNION_PF:
+        d_index_union_pf((unsigned char*)TEN(0), (unsigned long long*)TEN(1), (const int*)TEN(2), (const int*)TEN(3), in->i[0],
+                         in->i[1], in->i[2], in->i[3], in->i[4], in->i[5], slice, nblk, (unsigned*)arena);
+        break;
+#endif
 #endif /* !PLOW_NV_GEMM_ONLY (norms) */
+
+#if PLOW_NV_MOE_DEC_V41
+    /* Routed experts at decode rows: the prefill role's MXFP4 operands (i3 = 2). GLU t6 = split-K
+     * scratch, its counters (zeroed, left zero) after moe_glu_decode_v41_scratch_floats floats. */
+    case PLOW_DOP_MOE_GROUP_GLU_PF:
+        if (in->i[3] != 2u || PLOW_NV_ARENA_FLOATS * sizeof(float) < moe_decode_v41_smem_bytes(in->i[2], PLOW_NV_WARPS) || !TEN(6))
+            __trap();
+        d_moe_glu_decode_v41((__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1), (const unsigned long long*)TEN(2),
+                             (const unsigned long long*)TEN(3), (const int*)TEN(4), (const unsigned*)TEN(5), (const float*)TEN(7),
+                             in->i[0], in->i[1], in->i[2], in->i[5], in->fj[1].f, (float*)TEN(6),
+                             (unsigned*)((float*)TEN(6) + moe_glu_decode_v41_scratch_floats(nblk, PLOW_NV_WARPS)), slice, nblk,
+                             (unsigned char*)arena);
+        break;
+    case PLOW_DOP_MOE_GROUP_DOWN_PF:
+        if (in->i[3] != 2u || in->i[1] > 64u * plow_mdv::DOWN_NSUB || PLOW_NV_ARENA_FLOATS * sizeof(float) < moe_decode_v41_smem_bytes(in->i[2], PLOW_NV_WARPS)) __trap();
+        d_moe_down_decode_v41((float*)TEN(0), (const __nv_bfloat16*)TEN(1), (const unsigned long long*)TEN(2),
+                              (const unsigned long long*)TEN(3), (const int*)TEN(4), (const unsigned*)TEN(6), (const float*)TEN(7),
+                              in->i[0], in->i[1], in->i[2], slice, nblk, (unsigned char*)arena);
+        break;
+#endif
+#if !PLOW_NV_PREFILL && defined(PLOW_NV_HOPPER) && defined(PLOW_HAS_GEMM) && PLOW_HAS_GEMM
+    /* Decode-rung bf16 projections with no GEMV op of their own (V4.1 indexer wk / weights_proj).
+     * M <= 8: warp-per-output GEMV (one wgmma tile would put all of K on one block). Larger rungs:
+     * the prefill wgmma body at rows = rung batch. Mapless only; the wgmma needs its full arena. */
+    case PLOW_DOP_GEMM:
+        if (in->i[6] || in->i[7]) __trap();
+        if (in->i[0] <= 8u) {
+            d_gemv((__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1), (const __nv_bfloat16*)TEN(2), in->i[0], in->i[1],
+                   in->i[2], slice, nblk);
+            break;
+        }
+        if (PLOW_NV_ARENA_FLOATS * sizeof(float) < PGM90_ARENA * sizeof(__nv_bfloat16)) __trap();
+        d_gemm_sm90((__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1), (const __nv_bfloat16*)TEN(2), in->i[0], in->i[1],
+                    in->i[2], in->i[4], slice, nblk, (__nv_bfloat16*)arena);
+        break;
+#endif
 
 #if PLOW_NV_PREFILL
     /* ---- PREFILL tiled GEMM (q/k/v/o/down/lm_head; one body, three tile opcodes) ----
@@ -1923,7 +2155,7 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
     /* ---- pointwise ---- */
     case PLOW_DOP_EMBED:
         d_embed((__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1), (const int*)TEN(2),
-                in->i[0], in->i[1], in->fj[0].f, slice, nblk);
+                in->i[0], in->i[1], in->fj[0].f, slice, nblk, in->i[2] ? in->i[2] : 1u);
         break;
 
     case PLOW_DOP_EMBED_OVERLAY_BF16:
@@ -1987,7 +2219,7 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
 
     case PLOW_DOP_GLU:
         d_glu((__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1), (const __nv_bfloat16*)TEN(2),
-              in->i[0], in->i[1], slice, nblk);
+              in->i[0], in->i[1], slice, nblk, in->fj[1].f);
         break;
 
     case PLOW_DOP_GLU_STRIDED:
@@ -2621,7 +2853,18 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
 #if !PLOW_NV_GEMM_ONLY
 #if PLOW_NV_MOE_COMMON && PLOW_HAS_MOE_ROUTER_TOPK_PF
     case PLOW_DOP_MOE_ROUTER_TOPK_PF:
-        if (TEN(2) || in->i[0] || in->i[6] > 1u || in->i[7]) { __trap(); break; }
+        if (TEN(2) || in->i[0] || in->i[6] > 1u || in->i[7] > 1u || in->i[5] || (in->i[3] & 16u)) { __trap(); break; }
+        if ((in->i[3] & 33u) && in->i[4] <= nblk && in->i[1] <= 2u * blockDim.x && in->i[2] <= 16u &&
+            (blockDim.x >> 5) * in->i[2] <= 64u) {
+            d_moe_router_topk_pf_block((unsigned char*)TEN(0), TEN(1), (in->i[3] & 4u) ? (const float*)TEN(3) : nullptr, in->i[1],
+                                       in->i[2], in->i[3], in->fj[0].f, in->i[4], slice, nblk, (uint32_t*)arena);
+            break;
+        }
+        if (in->i[3] & 40u) {
+            d_moe_router_topk_pf_warp((unsigned char*)TEN(0), TEN(1), (in->i[3] & 4u) ? (const float*)TEN(3) : nullptr, in->i[1],
+                                      in->i[2], in->i[3], in->fj[0].f, in->i[4], slice, nblk);
+            break;
+        }
         d_moe_router_topk_pf_nv((unsigned char*)TEN(0), (const __nv_bfloat16*)TEN(1),
                                 (in->i[3] & 4u) ? (const float*)TEN(3) : nullptr,
                                 in->i[1], in->i[2], in->i[3], in->fj[0].f, in->i[4], slice,
@@ -2630,7 +2873,18 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
 #endif
 #if PLOW_NV_MOE_COMMON && PLOW_HAS_MOE_ALIGN_PF
     case PLOW_DOP_MOE_ALIGN_PF:
-        if (in->i[3] || in->i[4]) { __trap(); break; }
+        if (in->i[5] > 1u) { __trap(); break; } /* expert parallel: not ported */
+        if (in->i[3]) {
+            d_moe_align_pf_phased((int*)TEN(0), (const unsigned char*)TEN(1), (unsigned*)TEN(2), (unsigned*)TEN(3), (float*)TEN(4),
+                                  in->i[0], in->i[1], in->i[2], in->i[3], in->i[4] ? in->i[4] : nblk, slice, nblk, (unsigned*)arena);
+            break;
+        }
+        if (in->i[4]) { __trap(); break; }
+        if (in->i[0] * in->i[2] <= 1024u && (in->i[1] + in->i[0] * in->i[2] + blockDim.x) * 4u <= PLOW_NV_ARENA_FLOATS * sizeof(float)) {
+            d_moe_align_pf_small((int*)TEN(0), (const unsigned char*)TEN(1), (unsigned*)TEN(2), (unsigned*)TEN(3), (float*)TEN(4),
+                                 in->i[0], in->i[1], in->i[2], slice, (unsigned*)arena);
+            break;
+        }
         d_moe_align_pf_nv((int*)TEN(0), (const unsigned char*)TEN(1), (unsigned*)TEN(2),
                           (unsigned*)TEN(3), (float*)TEN(4), in->i[0], in->i[1], in->i[2],
                           slice);
@@ -2705,6 +2959,11 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
         else if (in->i[3] == 256)
             d_flash_merge<256>((__nv_bfloat16*)TEN(0), (const float*)TEN(1),
                                (const float*)TEN(2), in->i[0], in->i[1], in->i[2], slice, nblk PLOW_PF_REQ_ARG);
+#if PLOW_NV_PREFILL
+        else if (in->i[3] == 512 && TEN(3))
+            d_v41_flash_merge((__nv_bfloat16*)TEN(0), (const float*)TEN(1), (const float*)TEN(2), TEN(3), in->i[4] == 1u, in->i[0], in->i[1],
+                              in->i[2], slice, nblk);
+#endif
         else if (in->i[3] == 512)
             d_flash_merge<512>((__nv_bfloat16*)TEN(0), (const float*)TEN(1),
                                (const float*)TEN(2), in->i[0], in->i[1], in->i[2], slice, nblk PLOW_PF_REQ_ARG);
@@ -3507,10 +3766,16 @@ __global__ __launch_bounds__(PLOW_NV_THREADS, PLOW_NV_MINBLK) void PLOW_SYM(inte
         if (wait_len && threadIdx.x == 0)
             plow_gemv_l2pf(in, prog.tensors, e.slice, in->blocks ? in->blocks : nblk_grid);
 #endif
+#if !PLOW_NV_PREFILL
+        if (wait_len && in->op == PLOW_DOP_GEMV_F32 && in->i[4] == 1u && e.slice < in->i[3])
+            d_gemv_f32_kpart_pf((const float*)prog.tensors[in->t[2]], in->i[1], in->i[2], in->i[3], e.slice);
+#endif
 #if PLOW_NV_TRACE
         const bool tr = (blockIdx.x == 0 && threadIdx.x == 0 && g_tr_n < PLOW_TRACE_MAX);
         long long t_gate0 = 0, t_gate1 = 0, t_body1 = 0;
         if (tr) t_gate0 = clock64();
+        const bool bk = threadIdx.x == 0 && e.inst < PLOW_BK_INSTS && blockIdx.x < PLOW_BK_BLOCKS;
+        if (bk && !g_bk[0][e.inst][blockIdx.x]) g_bk[0][e.inst][blockIdx.x] = plow_gtimer();
 #endif
         /* Gate: one thread per counter, polled concurrently. */
         for (unsigned w = threadIdx.x; w < wait_len; w += blockDim.x) {
@@ -3531,6 +3796,8 @@ __global__ __launch_bounds__(PLOW_NV_THREADS, PLOW_NV_MINBLK) void PLOW_SYM(inte
 #endif
 #if PLOW_NV_TRACE
         if (tr) t_gate1 = clock64();
+        if (threadIdx.x == 0 && e.inst < PLOW_SPAN_MAX) atomicMax(&g_sp_lo[e.inst], ~plow_gtimer());
+        if (bk && !g_bk[1][e.inst][blockIdx.x]) g_bk[1][e.inst][blockIdx.x] = plow_gtimer();
 #endif
 
 #if PLOW_NV_PTXSYNC == 1 || PLOW_NV_PTXSYNC == 3
@@ -3557,6 +3824,25 @@ __global__ __launch_bounds__(PLOW_NV_THREADS, PLOW_NV_MINBLK) void PLOW_SYM(inte
         (void)nblk_grid;
 #else
         if (e.inst < PLOW_SYM(plow_debug_max_inst)) {
+#ifdef NV_COLLECTIVES
+            /* the collectives need the program's peer fields, which plow_exec does not see */
+            if (in->op == PLOW_DOP_XREDUCE2 || in->op == PLOW_DOP_XREDUCE) {
+                const bool two = in->op == PLOW_DOP_XREDUCE2;
+                if (prog.n_gpu < 2 || in->i[1] != prog.n_gpu || in->t[1] != PLOW_TENSOR_NONE ||
+                    (two ? (in->i[6] | in->i[7]) : (in->i[4] | in->i[5] | in->i[6])))
+                    __trap();
+                const unsigned nb = in->blocks ? in->blocks : nblk_grid;
+                if (two)
+                    d_xreduce_twoshot_nv(prog, (__nv_bfloat16*)prog.tensors[in->t[0]] + in->i[5], in->i[0], in->i[2] + in->i[5] * 2u,
+                                         in->i[3], in->i[4], e.slice, nb);
+                else
+                    d_xreduce_nv(prog, (__nv_bfloat16*)prog.tensors[in->t[0]], in->i[0], in->i[2], in->i[3], e.slice, nb);
+            } else if (in->op == PLOW_DOP_XARGMAX_FIN) {
+                if (prog.n_gpu < 2) __trap();
+                d_xargmax_fin_nv(prog, (int*)prog.tensors[in->t[0]], (const unsigned long long*)prog.tensors[in->t[1]], in->i[0],
+                                 in->i[1], in->i[2], in->i[3], in->i[4], e.slice);
+            } else
+#endif
             plow_exec(in, prog.tensors, e.slice, in->blocks ? in->blocks : nblk_grid, arena
 #if PLOW_MIXED_STEP
                       , &prog
@@ -3574,6 +3860,8 @@ __global__ __launch_bounds__(PLOW_NV_THREADS, PLOW_NV_MINBLK) void PLOW_SYM(inte
 #endif
 #if PLOW_NV_TRACE
         if (tr) t_body1 = clock64();
+        if (threadIdx.x == 0 && e.inst < PLOW_SPAN_MAX) atomicMax(&g_sp_hi[e.inst], plow_gtimer());
+        if (bk) g_bk[2][e.inst][blockIdx.x] = plow_gtimer();
 #endif
 
 #if PLOW_NV_PTXSYNC != 1 && PLOW_NV_PTXSYNC != 3

@@ -3178,6 +3178,322 @@ static __device__ void d_moe_router_topk_pf_nv(
     }
 }
 
+/* The router for f32 logits / sqrt-softplus scoring (flags 8 / 32, DeepSeek-V4.1: model.py Gate):
+ * one WARP per token, n_exp <= 512 held 16 per lane. score = sqrt(softplus(l)) (32), sigmoid (1)
+ * or softmax; selection by k rounds of warp argmax over the key (score + bias, lowest index on
+ * ties); gate = the unbiased score, normalised over the k when flag 2, times route_scale. */
+static __device__ void d_moe_router_topk_pf_warp(unsigned char* table, const void* logit, const float* bias, unsigned E,
+                                                 unsigned ksel, unsigned flags, float route_scale, unsigned T, unsigned slice,
+                                                 unsigned nblk) {
+    if (ksel > 16u || E == 0u || E > 512u) { if (threadIdx.x == 0) __trap(); return; }
+    const unsigned lane = threadIdx.x & 31u, warps = blockDim.x >> 5;
+    for (unsigned tok = slice * warps + (threadIdx.x >> 5); tok < T; tok += nblk * warps) {
+        float sc[16];
+        float mx = -INFINITY;
+#pragma unroll
+        for (unsigned q = 0; q < 16u; q++) {
+            const unsigned e = lane + q * 32u;
+            float l = -INFINITY;
+            if (e < E)
+                l = (flags & 8u) ? static_cast<const float*>(logit)[(size_t)tok * E + e]
+                                 : __bfloat162float(static_cast<const bf16*>(logit)[(size_t)tok * E + e]);
+            sc[q] = l;
+            mx = fmaxf(mx, l);
+        }
+        if (!(flags & 33u)) {  // softmax
+#pragma unroll
+            for (int o = 16; o > 0; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, o));
+            float sum = 0.f;
+#pragma unroll
+            for (unsigned q = 0; q < 16u; q++) {
+                sc[q] = lane + q * 32u < E ? expf(sc[q] - mx) : 0.f;
+                sum += sc[q];
+            }
+#pragma unroll
+            for (int o = 16; o > 0; o >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, o);
+#pragma unroll
+            for (unsigned q = 0; q < 16u; q++) sc[q] /= sum;
+        }
+        /* key = order-preserving u32 of score + bias; a round takes the warp max key (redux), then the
+         * lowest expert index holding it (redux) -- the u64 (key, -index) order, without shuffles */
+        uint32_t key[16];
+#pragma unroll
+        for (unsigned q = 0; q < 16u; q++) {
+            const unsigned e = lane + q * 32u;
+            if (e >= E) {
+                key[q] = 0u;
+                continue;
+            }
+            const float l = sc[q];
+            if (flags & 32u) sc[q] = sqrtf(log1pf(expf(-fabsf(l))) + fmaxf(l, 0.f));
+            else if (flags & 1u) sc[q] = 1.f / (1.f + expf(-l));
+            const float v = sc[q] + (bias ? bias[e] : 0.f);
+            const uint32_t b = __float_as_uint(v);
+            key[q] = (b & 0x80000000u) ? ~b : (b | 0x80000000u);
+        }
+        unsigned sel[16];
+        float gate[16], sum = 0.f;
+#pragma unroll
+        for (unsigned j = 0; j < 16u; j++) {
+            if (j >= ksel) break;
+            uint32_t kb = 0u;
+            unsigned qb = 0u;
+#pragma unroll
+            for (unsigned q = 0; q < 16u; q++)
+                if (key[q] > kb) kb = key[q], qb = q;
+            const uint32_t km = __reduce_max_sync(0xffffffffu, kb);
+            const unsigned e = __reduce_min_sync(0xffffffffu, kb == km && km ? lane + qb * 32u : 0xffffffffu);
+            float g = 0.f;
+            if (e == lane + qb * 32u) {
+#pragma unroll
+                for (unsigned q = 0; q < 16u; q++)
+                    if (q == qb) g = sc[q], key[q] = 0u;
+            }
+            g = __shfl_sync(0xffffffffu, g, e & 31u);
+            sel[j] = e;
+            gate[j] = g;
+            sum += g;
+        }
+        if (lane == 0) {
+            unsigned char* trow = table + (size_t)tok * ksel * 8u;
+#pragma unroll
+            for (unsigned j = 0; j < 16u; j++) {
+                if (j >= ksel) break;
+                float g = gate[j];
+                if ((flags & 2u) && sum != 0.f) g /= sum;
+                *(unsigned*)(trow + (size_t)j * 8u) = sel[j];
+                *(float*)(trow + (size_t)j * 8u + 4u) = g * route_scale;
+            }
+        }
+    }
+}
+
+/* The same router (sigmoid / sqrt-softplus scoring only) with one BLOCK per token, for T <= nblk: a
+ * thread scores <= 2 experts, each warp takes its top k by redux rounds, warp 0 merges the warps' k
+ * candidates the same way. The serial chain is ~k rounds over 2 slots instead of 16. sm: 48 u32 per
+ * warp. */
+static __device__ void d_moe_router_topk_pf_block(unsigned char* table, const void* logit, const float* bias, unsigned E, unsigned ksel,
+                                                  unsigned flags, float route_scale, unsigned T, unsigned slice, unsigned nblk,
+                                                  uint32_t* sm) {
+    const unsigned tid = threadIdx.x, lane = tid & 31u, wid = tid >> 5, warps = blockDim.x >> 5, nc = warps * ksel;
+    for (unsigned tok = slice; tok < T; tok += nblk) {
+        uint32_t key[2];
+        float sc[2];
+#pragma unroll
+        for (unsigned q = 0; q < 2u; q++) {
+            const unsigned e = tid + q * blockDim.x;
+            key[q] = 0u;
+            sc[q] = 0.f;
+            if (e >= E) continue;
+            const float l = (flags & 8u) ? static_cast<const float*>(logit)[(size_t)tok * E + e]
+                                         : __bfloat162float(static_cast<const bf16*>(logit)[(size_t)tok * E + e]);
+            sc[q] = (flags & 32u) ? sqrtf(log1pf(expf(-fabsf(l))) + fmaxf(l, 0.f)) : 1.f / (1.f + expf(-l));
+            const uint32_t b = __float_as_uint(sc[q] + (bias ? bias[e] : 0.f));
+            key[q] = (b & 0x80000000u) ? ~b : (b | 0x80000000u);
+        }
+        for (unsigned j = 0; j < ksel; j++) {
+            const unsigned qb = key[1] > key[0] ? 1u : 0u;
+            const uint32_t kb = qb ? key[1] : key[0];
+            const uint32_t km = __reduce_max_sync(0xffffffffu, kb);
+            const unsigned e = __reduce_min_sync(0xffffffffu, kb == km && km ? tid + qb * blockDim.x : 0xffffffffu);
+            float g = 0.f;
+            if (km && e == tid + qb * blockDim.x) {
+                g = sc[qb];
+                key[qb] = 0u;
+            }
+            g = __shfl_sync(0xffffffffu, g, (e % blockDim.x) & 31u);
+            if (lane == 0) {
+                sm[(wid * 16u + j) * 3u] = km;
+                sm[(wid * 16u + j) * 3u + 1u] = e;
+                sm[(wid * 16u + j) * 3u + 2u] = __float_as_uint(g);
+            }
+        }
+        __syncthreads();
+        if (wid == 0) {
+            uint32_t ck[2], ci[2];
+            float cg[2];
+#pragma unroll
+            for (unsigned r = 0; r < 2u; r++) {
+                const unsigned c = lane + 32u * r, at = ((c / ksel) * 16u + c % ksel) * 3u;
+                ck[r] = c < nc ? sm[at] : 0u;
+                ci[r] = c < nc ? sm[at + 1u] : 0xffffffffu;
+                cg[r] = c < nc ? __uint_as_float(sm[at + 2u]) : 0.f;
+            }
+            unsigned sel = 0;
+            float gate = 0.f, sum = 0.f;
+            for (unsigned j = 0; j < ksel; j++) {
+                const unsigned rb = ck[1] > ck[0] || (ck[1] == ck[0] && ci[1] < ci[0]) ? 1u : 0u;
+                const uint32_t kb = rb ? ck[1] : ck[0];
+                const uint32_t km = __reduce_max_sync(0xffffffffu, kb);
+                const unsigned e = __reduce_min_sync(0xffffffffu, kb == km && km ? (rb ? ci[1] : ci[0]) : 0xffffffffu);
+                const bool own = km && kb == km && (rb ? ci[1] : ci[0]) == e;
+                const unsigned src = __ffs(__ballot_sync(0xffffffffu, own)) - 1u;
+                float g = own ? (rb ? cg[1] : cg[0]) : 0.f;
+                if (own) ck[rb] = 0u;
+                g = __shfl_sync(0xffffffffu, g, src & 31u);
+                if (lane == j) sel = e, gate = g;
+                sum += g;
+            }
+            if (lane < ksel) {
+                if ((flags & 2u) && sum != 0.f) gate /= sum;
+                unsigned char* at = table + ((size_t)tok * ksel + lane) * 8u;
+                *(unsigned*)at = sel;
+                *(float*)(at + 4u) = gate * route_scale;
+            }
+        }
+        __syncthreads();
+    }
+}
+
+constexpr unsigned kNvMpfBm = 64u; /* rows per expert tile in the align meta */
+/* The multi-packet align (i3 = phase 1..4, i4 = npart; runtime/amd/op_moe.h d_moe_align_pf): the
+ * packet boundary is the grid barrier. meta = rowoff[E] | mcnt[E] | tilep[E+1] | partial[npart][E].
+ *   1: per-part expert histogram of its slot range   2: (one CTA) exclusive scan over parts per
+ *   expert, tile prefix   3: every padded row -> UNUSED   4: scatter each part's slots in slot
+ *   order, so the row arrays are deterministic. arena: E u32. */
+static __device__ void d_moe_align_pf_phased(int* meta, const unsigned char* table, unsigned* row_token, unsigned* row_partidx,
+                                             float* row_gate, unsigned T, unsigned E, unsigned ksel, unsigned phase, unsigned npart,
+                                             unsigned slice, unsigned nblk, unsigned* cnt) {
+    const unsigned tid = threadIdx.x, nslot = T * ksel;
+    int* rowoff = meta;
+    int* mcnt = meta + E;
+    int* tilep = meta + 2u * E;
+    unsigned* partial = reinterpret_cast<unsigned*>(meta + 3u * E + 1u);
+    auto expert = [&](unsigned s) { return table ? *(const unsigned*)(table + (size_t)s * 8u) : 0u; };
+    if (phase == 1u || phase == 4u) {
+        for (unsigned part = slice; part < npart; part += nblk) {
+            const unsigned first = (unsigned)(((unsigned long long)nslot * part) / npart);
+            const unsigned last = (unsigned)(((unsigned long long)nslot * (part + 1u)) / npart);
+            for (unsigned e = tid; e < E; e += blockDim.x) cnt[e] = phase == 1u ? 0u : (unsigned)rowoff[e] + partial[(size_t)part * E + e];
+            __syncthreads();
+            if (phase == 1u) {
+                for (unsigned s = first + tid; s < last; s += blockDim.x) {
+                    const unsigned e = expert(s);
+                    if (e < E) atomicAdd(&cnt[e], 1u);
+                }
+                __syncthreads();
+                for (unsigned e = tid; e < E; e += blockDim.x) partial[(size_t)part * E + e] = cnt[e];
+            } else if (tid < 32u) {  // one warp walks the range in slot order
+                for (unsigned base = first; base < last; base += 32u) {
+                    const unsigned s = base + tid;
+                    const unsigned e = s < last ? expert(s) : ~0u;
+                    const unsigned peers = __match_any_sync(0xffffffffu, e);
+                    const unsigned leader = __ffs(peers) - 1u, rank = __popc(peers & ((1u << tid) - 1u));
+                    unsigned pos0 = 0;
+                    if (tid == leader && e < E) {
+                        pos0 = cnt[e];
+                        cnt[e] = pos0 + __popc(peers);
+                    }
+                    pos0 = __shfl_sync(0xffffffffu, pos0, leader);
+                    if (e < E) {
+                        const unsigned pos = pos0 + rank;
+                        row_token[pos] = s / ksel;
+                        row_partidx[pos] = s;
+                        row_gate[pos] = table ? *(const float*)(table + (size_t)s * 8u + 4u) : 1.0f;
+                    }
+                }
+            }
+            __syncthreads();
+        }
+        return;
+    }
+    if (phase == 2u) {
+        if (slice != 0u) return;
+        const unsigned chunk = (E + blockDim.x - 1u) / blockDim.x, b0 = min(tid * chunk, E), b1 = min(b0 + chunk, E);
+        unsigned tiles = 0;
+        for (unsigned e = b0; e < b1; e++) {
+            unsigned total = 0;
+            for (unsigned p = 0; p < npart; p++) {
+                const size_t at = (size_t)p * E + e;
+                const unsigned c = partial[at];
+                partial[at] = total;
+                total += c;
+            }
+            mcnt[e] = (int)total;
+            tiles += (total + kNvMpfBm - 1u) / kNvMpfBm;
+        }
+        cnt[tid] = tiles;
+        __syncthreads();
+        for (unsigned off = 1u; off < blockDim.x; off <<= 1u) {
+            const unsigned add = tid >= off ? cnt[tid - off] : 0u;
+            __syncthreads();
+            cnt[tid] += add;
+            __syncthreads();
+        }
+        unsigned tp = tid ? cnt[tid - 1u] : 0u;
+        for (unsigned e = b0; e < b1; e++) {
+            tilep[e] = (int)tp;
+            rowoff[e] = (int)(tp * kNvMpfBm);
+            tp += ((unsigned)mcnt[e] + kNvMpfBm - 1u) / kNvMpfBm;
+        }
+        if (tid == blockDim.x - 1u) tilep[E] = (int)cnt[tid];
+        __syncthreads();
+        return;
+    }
+    const unsigned total_pad = (unsigned)tilep[E] * kNvMpfBm;
+    for (unsigned r = slice * blockDim.x + tid; r < total_pad; r += nblk * blockDim.x) {
+        row_token[r] = PLOW_EXPERT_UNUSED;
+        row_partidx[r] = PLOW_EXPERT_UNUSED;
+        row_gate[r] = 0.0f;
+    }
+}
+
+/* d_moe_align_pf_nv's result (same slot order within an expert) with the whole block, for decode-size
+ * slot counts: rank of a slot = earlier slots with its expert. sm: E + T*ksel + blockDim u32. */
+static __device__ void d_moe_align_pf_small(int* meta, const unsigned char* table, unsigned* row_token, unsigned* row_partidx,
+                                            float* row_gate, unsigned T, unsigned E, unsigned ksel, unsigned slice, unsigned* sm) {
+    if (slice != 0u) return;
+    const unsigned tid = threadIdx.x, nt = blockDim.x, nslot = T * ksel;
+    unsigned* cnt = sm;
+    unsigned* ids = sm + E;
+    unsigned* scan = ids + nslot;
+    for (unsigned e = tid; e < E; e += nt) cnt[e] = 0u;
+    for (unsigned s = tid; s < nslot; s += nt) ids[s] = table ? *(const unsigned*)(table + (size_t)s * 8u) : 0u;
+    __syncthreads();
+    for (unsigned s = tid; s < nslot; s += nt)
+        if (ids[s] < E) atomicAdd(&cnt[ids[s]], 1u);
+    __syncthreads();
+    const unsigned chunk = (E + nt - 1u) / nt, b0 = min(tid * chunk, E), b1 = min(b0 + chunk, E);
+    unsigned tiles = 0;
+    for (unsigned e = b0; e < b1; e++) tiles += (cnt[e] + kNvMpfBm - 1u) / kNvMpfBm;
+    scan[tid] = tiles;
+    __syncthreads();
+    for (unsigned off = 1u; off < nt; off <<= 1u) {
+        const unsigned add = tid >= off ? scan[tid - off] : 0u;
+        __syncthreads();
+        scan[tid] += add;
+        __syncthreads();
+    }
+    unsigned tp = scan[tid] - tiles;
+    for (unsigned e = b0; e < b1; e++) {
+        meta[E + e] = (int)cnt[e];
+        meta[2u * E + e] = (int)tp;
+        meta[e] = (int)(tp * kNvMpfBm);
+        const unsigned nt_e = (cnt[e] + kNvMpfBm - 1u) / kNvMpfBm;
+        cnt[e] = tp * kNvMpfBm;  // now the expert's row offset
+        tp += nt_e;
+    }
+    if (tid == nt - 1u) meta[3u * E] = (int)scan[tid];
+    const unsigned total_pad = scan[nt - 1u] * kNvMpfBm;
+    __syncthreads();
+    for (unsigned r = tid; r < total_pad; r += nt) {
+        row_token[r] = PLOW_EXPERT_UNUSED;
+        row_partidx[r] = PLOW_EXPERT_UNUSED;
+        row_gate[r] = 0.0f;
+    }
+    __syncthreads();
+    for (unsigned s = tid; s < nslot; s += nt) {
+        const unsigned e = ids[s];
+        if (e >= E) continue;
+        unsigned rank = 0;
+        for (unsigned s2 = 0; s2 < s; s2++) rank += ids[s2] == e;
+        const unsigned at = cnt[e] + rank;
+        row_token[at] = s / ksel;
+        row_partidx[at] = s;
+        row_gate[at] = table ? *(const float*)(table + (size_t)s * 8u + 4u) : 1.0f;
+    }
+}
+
 static __device__ void d_moe_align_pf_nv(
     int* meta, const unsigned char* table, unsigned* row_token, unsigned* row_partidx,
     float* row_gate, unsigned T, unsigned E, unsigned ksel, unsigned slice) {
@@ -3265,7 +3581,43 @@ static __device__ void d_moe_down_mx_pf(
 static __device__ void d_moe_combine_pf_nv(
     bf16* out, const bf16* residual, const bf16* shared, const float* part,
     unsigned H, unsigned ksel, unsigned T, unsigned slice, unsigned nblk) {
-    const size_t total = (size_t)(T ? T : 1u) * H;
+    const unsigned rows = T ? T : 1u;
+    if (H % 8u == 0u) {
+        /* 8 columns per thread: 16 B bf16 and 2 x 16 B f32 per slot, 32-bit index math */
+        const unsigned h8 = H / 8u;
+        for (unsigned c = slice * blockDim.x + threadIdx.x; c < rows * h8; c += nblk * blockDim.x) {
+            const unsigned tok = c / h8, h = (c - tok * h8) * 8u;
+            const size_t i = (size_t)tok * H + h;
+            float v[8] = {};
+            auto add_bf8 = [&](const bf16* src) {
+                const uint4 u = *reinterpret_cast<const uint4*>(src + i);
+                const uint32_t w[4] = {u.x, u.y, u.z, u.w};
+#pragma unroll
+                for (int q = 0; q < 4; q++) {
+                    v[2 * q] += __uint_as_float(w[q] << 16);
+                    v[2 * q + 1] += __uint_as_float(w[q] & 0xffff0000u);
+                }
+            };
+            if (residual) add_bf8(residual);
+            if (shared) add_bf8(shared);
+            const float* p = part + (size_t)tok * ksel * H + h;
+            for (unsigned j = 0; j < ksel; j++) {
+                const float4 a = *reinterpret_cast<const float4*>(p + (size_t)j * H);
+                const float4 b = *reinterpret_cast<const float4*>(p + (size_t)j * H + 4);
+                v[0] += a.x; v[1] += a.y; v[2] += a.z; v[3] += a.w;
+                v[4] += b.x; v[5] += b.y; v[6] += b.z; v[7] += b.w;
+            }
+            uint32_t o[4];
+#pragma unroll
+            for (int q = 0; q < 4; q++) {
+                const __nv_bfloat162 pr = __floats2bfloat162_rn(v[2 * q], v[2 * q + 1]);
+                o[q] = *reinterpret_cast<const uint32_t*>(&pr);
+            }
+            *reinterpret_cast<uint4*>(out + i) = make_uint4(o[0], o[1], o[2], o[3]);
+        }
+        return;
+    }
+    const size_t total = (size_t)rows * H;
     for (size_t i = (size_t)slice * blockDim.x + threadIdx.x; i < total;
          i += (size_t)nblk * blockDim.x) {
         const unsigned tok = (unsigned)(i / H), h = (unsigned)(i - (size_t)tok * H);
