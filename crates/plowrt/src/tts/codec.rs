@@ -221,7 +221,7 @@ impl Codec {
 
 fn bind(path: &Path) -> Result<Bound, String> {
     let e = |x: crate::RuntimeError| x.to_string();
-    let loaded = load_packet_runtime(path, "cuda").map_err(e)?;
+    let loaded = load_packet_runtime(path, "auto").map_err(e)?;
     let runtime = loaded.runtime;
     let asset = PacketAsset::load(path).map_err(e)?;
     let pipeline = asset.bind_driver(DRIVER, runtime.as_ref()).map_err(e)?;

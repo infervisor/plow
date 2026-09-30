@@ -140,7 +140,7 @@ impl HeadPool {
         let bytes = std::fs::read(twin).map_err(|e| {
             RuntimeError::Device(format!("CPU twin {}: {e}", twin.display()))
         })?;
-        let blob = crate::asset::devblob::DevBlob::parse(&bytes)?;
+        let blob = crate::asset::devblob::DevBlob::parse_l2(&bytes, true)?;
         let names: Vec<String> = blob.tensors.iter().map(|t| t.name.clone()).collect();
         let mut pools = Vec::new();
         let mut head_majors = Vec::new();

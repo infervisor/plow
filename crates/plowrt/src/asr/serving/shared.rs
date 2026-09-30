@@ -113,7 +113,7 @@ impl SharedAsr {
         let checkpoint = dir.join("checkpoint");
         let checkpoint = if checkpoint.is_dir() { checkpoint } else { dir.to_path_buf() };
         let prompt = AudioLmPrompt::load(&dir.join("model.pkt"), &checkpoint)?;
-        let mut encoder = PacketAudioEncoder::load(&dir.join("encoder.pkt"), "cuda")?;
+        let mut encoder = PacketAudioEncoder::load(&dir.join("encoder.pkt"), "auto")?;
         let warm = Instant::now();
         encoder.warm()?;
         tracing::info!(ms = warm.elapsed().as_millis() as u64, packed_chunks = encoder.max_packed_chunks(), "asr: encoder graphs warmed");
@@ -458,6 +458,7 @@ pub(super) async fn route(
     model: &str,
 ) -> std::result::Result<(Route, FinalizationPolicy), Response> {
     let slug = state.registry.resolve(model).unwrap_or_else(|| model.to_owned());
+    #[cfg(feature = "cuda")]
     if let Some(mgr) = state.manager_for(&slug) {
         if mgr.manages(&slug) {
             if let Err(e) = mgr.ensure_resident(&slug).await {

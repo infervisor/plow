@@ -281,7 +281,7 @@ impl PacketAsset {
     }
 
     pub fn from_bytes(image: &[u8]) -> Result<Self> {
-        let blob = crate::asset::devblob::DevBlob::parse(image)?;
+        let blob = crate::asset::devblob::DevBlob::parse_l2(image, true)?;
         let raw = blob
             .reserved_metadata(image, SECTION)?
             .ok_or_else(|| RuntimeError::Rejected(format!("packet is missing {SECTION}")))?;

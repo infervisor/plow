@@ -6,14 +6,13 @@
 //! served engine's continuous-batching mux like any causal model; the codes it emits are decoded
 //! by the codec stage the contract names ([`codec`]). See docs/arch/24-tts-pipelines.md.
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "hsa"))]
 pub mod codec;
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "hsa"))]
 pub mod serving;
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "hsa"))]
 pub mod guided_lm;
-#[cfg(feature = "cuda")]
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "hsa"))]
 pub mod guided_speech;
 
 use std::path::Path;
