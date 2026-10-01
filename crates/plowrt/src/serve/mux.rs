@@ -189,8 +189,7 @@ pub struct MuxConfig {
     /// Maximum requests waiting outside the engine slot table. `0` derives a
     /// bound of four full engine batches.
     pub max_queued_requests: usize,
-    /// Skip or end the cold-start hold once nothing else is queued or tokenizing
-    /// (`PLOW_IDLE_DISPATCH`).
+    /// Skip or end the cold-start hold once nothing else is queued or tokenizing.
     pub idle_dispatch: bool,
 }
 
@@ -202,7 +201,7 @@ impl Default for MuxConfig {
             multi_step: true,
             queue_depth: 0,
             max_queued_requests: 0,
-            idle_dispatch: crate::config::RuntimeConfig::get().idle_dispatch,
+            idle_dispatch: true,
         }
     }
 }
@@ -692,8 +691,7 @@ pub fn spawn(
     #[cfg(not(any(feature = "cuda", feature = "hsa", feature = "cpu")))]
     let rung_widths: Option<Box<[u32]>> = None;
     let (capacity, rung_widths) = {
-        let honor = crate::serve::policy::honor_max_rung();
-        let max_rung = honor.then(|| crate::config::RuntimeConfig::get().decode_max_rung).flatten();
+        let max_rung = crate::config::RuntimeConfig::get().decode_max_rung;
         let min_rung = crate::config::RuntimeConfig::get().amd.decode_min_rung;
         if max_rung.is_some() || min_rung.is_some() {
             if let Some(widths) = rung_widths {
@@ -721,7 +719,7 @@ pub fn spawn(
             .and_then(|widths| match DecodeRungs::new(widths, capacity) {
                 Ok(rungs) if rungs.len() > 1 => Some(
                     RungController::new(rungs)
-                        .with_fast_probe(crate::config::RuntimeConfig::get().rung_fast_probe),
+                        .with_fast_probe(crate::serve::policy::fast_probe()),
                 ),
                 Ok(_) => None,
                 Err(err) => {
@@ -821,13 +819,12 @@ pub fn spawn(
         }
     });
 
-    // `PLOW_MUX_INLINE_TICK`: a GPU model's dispatcher gets its own OS thread and runs each tick
-    // inline, so a tick costs no engine-thread wake and no tokio-worker wake on return. Nothing
-    // else changes: the loop below already waits for every tick before touching the queue.
+    // A GPU model's dispatcher gets its own OS thread and runs each tick inline, so a tick costs
+    // no engine-thread wake and no tokio-worker wake on return (26B-A4B H100: handoff 50-87 ->
+    // 0.3 us per tick). Nothing else changes: the loop below already waits for every tick before
+    // touching the queue.
     #[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu"))]
-    let inline_tick = state.gpu_engine(&slug).is_some_and(|engine| {
-        crate::config::RuntimeConfig::get().mux_inline_tick(engine.lock().is_gpu())
-    });
+    let inline_tick = state.gpu_engine(&slug).is_some_and(|engine| engine.lock().is_gpu());
     #[cfg(not(any(feature = "cuda", feature = "hsa", feature = "cpu")))]
     let inline_tick = false;
     let dispatcher_name = format!("plow-mux-{slug}");
@@ -1037,9 +1034,7 @@ pub fn spawn(
                     .store(occupied_extent as u64, Ordering::Relaxed);
                 crate::serve::policy::observe(occupied_extent, waiting.len());
                 if let Some(rc) = rung_controller.as_mut() {
-                    rc.set_fast_probe(crate::serve::policy::fast_probe(
-                        crate::config::RuntimeConfig::get().rung_fast_probe,
-                    ));
+                    rc.set_fast_probe(crate::serve::policy::fast_probe());
                 }
                 if admission != before {
                     Metrics::inc(&metrics.decode_rung_switches);
@@ -1287,24 +1282,19 @@ pub fn spawn(
                 1
             } else if cfg.multi_step {
                 #[cfg(any(feature = "cuda", feature = "hsa"))]
-                let device_quantum = crate::config::RuntimeConfig::get().multistep();
+                let device_quantum = crate::serve::policy::decode_k(false, token_group);
                 #[cfg(not(any(feature = "cuda", feature = "hsa")))]
                 let device_quantum = 0;
-                #[cfg(any(feature = "cuda", feature = "hsa"))]
-                let adaptive = crate::config::RuntimeConfig::get().nv.multistep_adaptive;
-                #[cfg(not(any(feature = "cuda", feature = "hsa")))]
-                let adaptive = false;
 
                 if device_quantum > 1
-                    && adaptive
                     && (freed_last_tick
                         || !waiting.is_empty()
                         || slots.iter().flatten().any(|s| s.step == 0))
                 {
-                    // PLOW_MULTISTEP_ADAPTIVE: prefill is pending, so the next chunk must not
-                    // wait behind a K-step quantum. A slot freed last tick counts: its
-                    // successor is usually a round trip away, and a K-step quantum here lets
-                    // the next completion land in the same wave (two prefills back to back).
+                    // Prefill is pending, so the next chunk must not wait behind a K-step
+                    // quantum. A slot freed last tick counts: its successor is usually a round
+                    // trip away, and a K-step quantum here lets the next completion land in the
+                    // same wave (two prefills back to back). 15000/C4 TTFT 1099 -> 627 ms.
                     1
                 } else if device_quantum > 1 {
                     group_aligned(device_quantum.max(MultiStep::for_batch(live as i64).steps), token_group)
@@ -1621,12 +1611,12 @@ fn queue_aging_ms(slo_ms: f64) -> f64 {
     (slo_ms.max(0.0) * AGING_SLO_MULTIPLE).max(AGING_FLOOR_MS)
 }
 
-/// Wait after which a queued request is shed: `PLOW_QUEUE_TTL_MS` when set, else derived.
+/// Wait after which a queued request is shed: never under the throughput class, else derived.
 #[inline]
 fn queue_ttl_ms(slo_ms: f64) -> f64 {
     queue_ttl_with(
         slo_ms,
-        crate::serve::policy::queue_ttl_ms(crate::config::RuntimeConfig::get().queue_ttl_ms),
+        crate::serve::policy::queue_ttl_ms(),
     )
 }
 
@@ -2310,15 +2300,8 @@ fn run_one_tick(
 
             // Whether this tick does any prefill work — reported to the dispatcher
             // so prefill tick durations never enter the decode-service EWMA.
-            //
-            // A row the pipe owes a token has already sampled (only sampling rows are parked), so
-            // it is waiting for a readback, not for prefill. Counting it here would be a
-            // liveness hole: its `step` stays 0 until that token is read, `gpu_decode_feeds`
-            // gathers only `step > 0` rows, and with no other live row `feeds` is empty, so
-            // neither the decode path nor the drain below runs and nothing ever completes the
-            // step holding its token.
-            let did_prefill = (0..cap.min(slots.len()))
-                .any(|i| slots[i].as_ref().is_some_and(|s| s.step == 0) && !e.pipe_owes(i));
+            let did_prefill =
+                (0..cap.min(slots.len())).any(|i| slots[i].as_ref().is_some_and(|s| s.step == 0));
 
             // Decode feeds, gathered BEFORE the prefill pass so a slot prefilled
             // this tick (which just produced its first token) doesn't also step.
@@ -2333,24 +2316,11 @@ fn run_one_tick(
                 feeds.clear();
             }
 
-            // A pipelined mixed launch takes its decode rows' tokens from the device, so a
-            // prefill tick no longer has to read the in-flight step out first.
-            // The pipe reads each launch's argmax a tick later, so a prompt that samples its first
-            // token keeps the synchronous launch (where it is drawn on the device).
-            let pipe_prefill = e.pipe_prefill_enabled()
-                && e.pf_batch_enabled()
-                && !e.pipe_full()
-                && (feeds.is_empty() || gpu_pipe_rows(&feeds, &slots))
-                && slots.iter().take(cap).flatten().all(|s| {
-                    s.step != 0 || (gpu_argmax_eligible(&s.gen.params) && s.cfg.is_none())
-                });
             // A pipelined decode step may still be in flight from the previous tick. Anything
-            // but its exact continuation (prefill the pipe cannot carry, a changed row set, a row
-            // the device cannot sample) completes it first, streams its tokens, and re-gathers.
+            // but its exact continuation (a prefill, a changed row set, a row the device cannot
+            // sample) completes it first, streams its tokens, and re-gathers.
             if e.pipe_busy()
-                && ((did_prefill && !pipe_prefill)
-                    || (!did_prefill
-                        && (!e.pipe_covers(&feeds) || !gpu_pipe_rows(&feeds, &slots))))
+                && (did_prefill || !e.pipe_covers(&feeds) || !gpu_pipe_rows(&feeds, &slots))
             {
                 let mut done = std::mem::take(&mut obs.host.pipe_tokens);
                 match e.pipe_drain(&mut done) {
@@ -2601,7 +2571,7 @@ fn run_one_tick(
                 }
                 if let Some(f) = gpu_prefill_batched_pass(
                     &mut *e, &mut slots, cap, &arena, feeds.is_empty(), co_scheduled, &mut completed,
-                    &mut feeds, &mut obs.host.token_batch_tokens, pipe_prefill, &mut dev_sampled,
+                    &mut feeds, &mut obs.host.token_batch_tokens, &mut dev_sampled,
                     &mut obs.host.ride,
                 ) {
                     if tick_fault.is_none() {
@@ -2673,37 +2643,6 @@ fn run_one_tick(
                     );
                 }
                 obs.host.prefill_tokens = completed;
-                // Pipelined, this tick's launch is parked behind the one before it: read that
-                // older step out now, so the host stays exactly one step behind the device.
-                if pipe_prefill {
-                    let mut done = std::mem::take(&mut obs.host.pipe_tokens);
-                    match e.pipe_reap(&mut done) {
-                        Ok(()) => {
-                            for &(i, token) in &done {
-                                if slots[i].is_some() {
-                                    disconnected[i] |= gpu_emit_slot_token(
-                                        &mut slots[i],
-                                        &arena,
-                                        bundle,
-                                        token,
-                                        &mut tokens_this_tick,
-                                        stop.as_slice(),
-                                    );
-                                }
-                            }
-                        }
-                        Err(err) => {
-                            tracing::warn!(
-                                error = %err,
-                                error_code = ?err.device_code(),
-                                fatal = err.is_fatal(),
-                                "gpu: pipelined mixed step failed"
-                            );
-                            note_fault(&mut tick_fault, &err);
-                        }
-                    }
-                    obs.host.pipe_tokens = done;
-                }
                 if !compact {
                     for i in 0..slots.len().min(cap) {
                         let Some(s) = slots[i].as_ref() else { continue };
@@ -2884,8 +2823,6 @@ fn run_one_tick(
                 // Device-sampleable rows ride the quantum too when the sampler is loaded:
                 // `plow_sample` runs between each decode and advance.
                 let sampled_multi = e.multistep_sampling();
-                // CFG pairs draw on the device (`plow_sample_cfg`), so they can ride the quantum.
-                let cfg_dev = gpu_cfg_device(e) && crate::config::RuntimeConfig::get().nv.cfg_multistep;
                 let use_multi = !use_pipe
                     && steps > 1
                     && e.multistep_quantum().is_some()
@@ -2893,8 +2830,11 @@ fn run_one_tick(
                         slots[i]
                             .as_ref()
                             .map(|s| {
+                                // A CFG pair rides one step per tick: K=8 vs 1 lost Chatterbox c16
+                                // 17.25 vs 18.75 aps (the quantum overshoots the stop and delays
+                                // prefill and first-chunk renders).
                                 if s.cfg.is_some() {
-                                    return sampled_multi && cfg_dev;
+                                    return false;
                                 }
                                 !s.plain_decode()
                                     && (gpu_argmax_eligible(&s.gen.params)
@@ -3251,9 +3191,6 @@ fn run_one_tick(
             // The separate prefill/decode fallback runs sequentially because it
             // shares input/activation buffers. The parked-row mask prevents a
             // mid-prefill KDA state from advancing during the decode dispatch.
-            //
-            // `--pf-no-interleave` / `PLOW_PF_NO_INTERLEAVE=1` restores the old
-            // prefill-only tick.
             let mut did_prefill = false;
             let _tick = crate::obs::tick::begin();
             let rt = crate::config::RuntimeConfig::get();
@@ -3261,7 +3198,6 @@ fn run_one_tick(
             let slo_on = slo_targets.active();
             let slo_t0 = slo_on.then(Instant::now);
             let mut slo_pf_ms = 0.0f64;
-            let no_interleave = rt.pf_no_interleave;
             let decode_rows = slots[..b.min(slots.len())]
                 .iter()
                 .filter(|slot| slot.as_ref().is_some_and(|slot| slot.step > 0))
@@ -3269,12 +3205,10 @@ fn run_one_tick(
             let has_decode = decode_rows > 0;
             let tick_max = amd_prefill_tick_cap(
                 has_decode || co_scheduled,
-                no_interleave && !co_scheduled,
                 rt.pf_defer_decode && !co_scheduled,
                 rt.pf_interleave_amd(),
             );
-            if rt.pf_batch_amd()
-                && slots[..b.min(slots.len())]
+            if slots[..b.min(slots.len())]
                     .iter()
                     .flatten()
                     .filter(|slot| slot.step == 0)
@@ -3311,7 +3245,7 @@ fn run_one_tick(
                     .enumerate()
                     .take(b)
                     .filter_map(|(i, slot)| {
-                        if no_interleave || rt.pf_defer_decode {
+                        if rt.pf_defer_decode {
                             return None;
                         }
                         let slot = slot.as_ref()?;
@@ -3391,8 +3325,7 @@ fn run_one_tick(
             //  * A member may consume its prompt to the end. `token_batch_prefill_rows` does
             //    not hold the last token back, and the sampled ids for prompts that finish
             //    here follow the decode feeds in `output`.
-            if !no_interleave
-                && !rt.pf_defer_decode
+            if !rt.pf_defer_decode
                 && !slo_on
                 && e.token_batch_rows(1, 0, 1).is_some()
             {
@@ -3507,13 +3440,9 @@ fn run_one_tick(
                     // top of it. Decode rows do not make a lone prefill a packed-prefill step:
                     // at 70K/C20, fusing decode with one full 8192-row member was 4.5% slower
                     // than the ordinary independent paths.
-                    //
-                    // `--amd-token-batch-solo` restores the unconditional form, which is what
-                    // the first campaign measured; it exists so the policy stays falsifiable.
-                    if feeds.len() + completing > 0
-                        && (pack.len() >= 2
-                            || crate::config::RuntimeConfig::get().amd.token_batch_solo)
-                    {
+                    // A lone member measured -3.5% tok/s and -35% TTFT at 512 input (Gemma-4
+                    // 31B, C1): it runs a far wider rung with nothing to pack it with.
+                    if feeds.len() + completing > 0 && pack.len() >= 2 {
                         chosen = Some((rows, pack));
                         break;
                     }
@@ -3649,7 +3578,6 @@ fn run_one_tick(
                 }
             }
             if has_decode
-                && !no_interleave
                 && !rt.pf_defer_decode
                 && !slo_on
                 && e.mixed_step_rows(decode_rows, 1).is_some()
@@ -3789,7 +3717,7 @@ fn run_one_tick(
             // single span one `prefill_chunked_at_most`, and the decodes are the batched
             // dispatch below. What the engine cannot run it refuses by name; the plan is never
             // narrowed here.
-            let pf_batch = rt.pf_batch_amd();
+            let pf_batch = true;
             let cap = b.min(slots.len()).min(u128::BITS as usize);
             let backend = e.step_backend();
             let now = Instant::now();
@@ -4037,9 +3965,6 @@ fn run_one_tick(
                     did_prefill = true;
                 }
             }
-            if did_prefill && no_interleave {
-                return (slots, bufs, obs, tokens_this_tick, true, tick_fault, None);
-            }
             if did_prefill {
                 let prefill_remains = slots[..b.min(slots.len())]
                     .iter()
@@ -4094,7 +4019,7 @@ fn run_one_tick(
             let requested = amd_multistep_requested(
                 remaining,
                 multi_step,
-                crate::config::RuntimeConfig::get().multistep() as usize,
+                crate::serve::policy::decode_k(true, 1) as usize,
             );
             let multi = e.multistep_quantum(&feeds, requested);
             let mut deferred = std::mem::take(&mut obs.host.slot_tokens);
@@ -4449,13 +4374,10 @@ fn service_sample(ms: f64, did_prefill: bool) -> Option<f64> {
     (ms > 0.0 && !did_prefill).then_some(ms)
 }
 
-/// The serve-layer interleave bound: max prefill-chunk rows per tick while
-/// other slots are mid-decode. `PLOW_PF_INTERLEAVE` overrides (rows; `0` =
-/// whole prompt in one tick, the pre-interleave behavior). Read once.
-/// Reads `RuntimeConfig::get().nv.pf_chunk_cost`: a launch's fixed cost, in rows.
+/// A prefill launch's fixed cost, in rows.
 #[cfg(feature = "cuda")]
 fn pf_chunk_cost_rows() -> usize {
-    crate::config::RuntimeConfig::get().nv.pf_chunk_cost
+    crate::exec::gpu::PF_CHUNK_COST_ROWS
 }
 
 /// Reads `RuntimeConfig::get().pf_interleave_rows()`.
@@ -4464,7 +4386,7 @@ fn pf_interleave_rows() -> usize {
     crate::config::RuntimeConfig::get().pf_interleave_rows()
 }
 
-/// Prefill rows for one launch, from the queue (`PLOW_PF_INTERLEAVE_ADAPTIVE`).
+/// Prefill rows for one launch, from the queue (the latency objective's packing).
 ///
 /// `rows` are the waiting prompts' offered rows, oldest first. A launch costs a fixed
 /// `chunk_cost` rows of time plus its rows, and every prompt packed into it finishes when the
@@ -4553,13 +4475,8 @@ fn gpu_prefill_should_yield(has_feeds: bool, defer_decode: bool, slot: Option<&S
 }
 
 #[cfg(any(feature = "hsa", feature = "cpu"))]
-fn amd_prefill_tick_cap(
-    has_decode: bool,
-    no_interleave: bool,
-    defer_decode: bool,
-    interleave: u32,
-) -> u32 {
-    if !has_decode || no_interleave || defer_decode || interleave == 0 {
+fn amd_prefill_tick_cap(has_decode: bool, defer_decode: bool, interleave: u32) -> u32 {
+    if !has_decode || defer_decode || interleave == 0 {
         u32::MAX
     } else {
         interleave
@@ -4829,8 +4746,7 @@ fn arrival_key(arrived: Instant, now: Instant) -> u64 {
 /// is shared by up to `R ≈ budget/C` requests instead of monopolized by the
 /// first big prompt. `0` = uncapped = today's byte-identical behaviour (the A/B
 /// canary; packing is numerics-neutral, so C only changes which requests share
-/// a launch, never any request's tokens). Read once. Default `0` (off) — this
-/// is opt-in alongside `PLOW_PF_BATCH=1`, matching the rest of the PX-1 knobs.
+/// a launch, never any request's tokens). Default `0` (off), an expert override.
 /// Unset and `0` both mean uncapped, so the default IS the zero sentinel.
 /// Reads `RuntimeConfig::get().pf_chunk_rows()`.
 #[cfg(feature = "cuda")]
@@ -4853,7 +4769,6 @@ fn gpu_prefill_batched_pass(
     completed: &mut Vec<(usize, u32)>,
     feeds: &mut Vec<(usize, u32)>,
     unified_output: &mut Vec<(u32, u32)>,
-    pipelined: bool,
     dev_sampled: &mut bool,
     ride: &mut crate::sched::ride::RideCost,
 ) -> Option<crate::DeviceErrorInfo> {
@@ -4862,32 +4777,12 @@ fn gpu_prefill_batched_pass(
     completed.clear();
     *dev_sampled = false;
     let compact = e.has_packed_terminal();
-    let mut unified =
-        e.token_batch_enabled() && !crate::config::RuntimeConfig::get().pf_no_interleave;
+    let mut unified = e.token_batch_enabled();
     // Whether this tick's decode rows may still leave the launch for their own step
     // (`sched::ride`): decided once, when the launch's bucket is known.
-    let mut ride_open = unified
-        && !pipelined
-        && !feeds.is_empty()
-        && !crate::config::RuntimeConfig::get().ride_fixed;
+    let mut ride_open = unified && !feeds.is_empty();
     let withheld = usize::from(!compact);
-    // Pipelined, a prompt whose first token is still on the device can decode from it: the row
-    // joins the next launch instead of idling one while the host reads that token back.
-    let pending_first: smallvec::SmallVec<[usize; 8]> = if pipelined && e.pipe_first_token_rows() {
-        (0..cap.min(slots.len()))
-            .filter(|&i| {
-                e.pipe_owes(i)
-                    && slots[i].as_ref().is_some_and(|s| {
-                        s.step == 0
-                            && s.pf_pos + withheld >= s.prompt_ids.len()
-                            && !s.respond.is_closed()
-                    })
-            })
-            .collect()
-    } else {
-        Default::default()
-    };
-    let mut decode_rows = if unified { feeds.len() + pending_first.len() } else { 0 };
+    let mut decode_rows = if unified { feeds.len() } else { 0 };
     let mut tick_fault: Option<crate::DeviceErrorInfo> = None;
     let budget_max = e.pf_max_rows();
     if budget_max == 0 {
@@ -4911,9 +4806,7 @@ fn gpu_prefill_batched_pass(
     // Bound each candidate before fair sharing. Short requests return unused
     // rows to later candidates in the same launch.
     let chunk_cap = pf_chunk_rows().min(e.pf_request_max_rows());
-    let adaptive = crate::serve::policy::adaptive_packing(
-        crate::config::RuntimeConfig::get().pf_interleave_adaptive,
-    );
+    let adaptive = crate::serve::policy::adaptive_packing();
     loop {
         let host_t = packlog::on().then(Instant::now);
         for (i, slot) in slots.iter_mut().enumerate().take(cap) {
@@ -5042,21 +4935,11 @@ fn gpu_prefill_batched_pass(
             bucket
         }
         .min(per_launch);
-        let pf_batch_cfg = crate::config::RuntimeConfig::get().pf_batch;
-        let is_fair =
-            crate::config::RuntimeConfig::get().pf_span_policy.as_deref() == Some("fair");
-        let packing_enabled = pf_batch_cfg.unwrap_or_else(|| {
-            if is_fair {
-                candidates.first().map(|c| c.span.n_rows < 1024).unwrap_or(true)
-            } else {
-                true
-            }
-        });
         let step = crate::sched::step::plan(
             e.step_backend(),
             crate::sched::step::Tick {
                 cap_rows: u32::try_from(per_launch).unwrap_or(u32::MAX),
-                packing: packing_enabled,
+                packing: true,
                 rotate: false,
                 turn: e.prefill_turn(),
                 slots: cap.min(slots.len()),
@@ -5087,7 +4970,7 @@ fn gpu_prefill_batched_pass(
                 t.elapsed().as_secs_f64() * 1e6
             );
         }
-        let riders = if unified { feeds.len() + pending_first.len() } else { 0 };
+        let riders = if unified { feeds.len() } else { 0 };
         let launch_bucket = e.pf_pack_budget(pack.iter().map(|p| p.2).sum::<usize>() + riders);
         let t_launch = Instant::now();
         let res = if unified {
@@ -5121,29 +5004,8 @@ fn gpu_prefill_batched_pass(
                     selection: Selection::default(),
                 })
             });
-            // One placeholder token per device-sourced row: the launch overwrites it with the
-            // sample the previous launch left in `d_last`.
-            const DEVICE_TOKEN: [u32; 1] = [0];
-            let first = pending_first.iter().filter_map(|&i| {
-                let slot = slots[i].as_ref()?;
-                Some(Request {
-                    id: i as u32,
-                    slot: i as u32,
-                    state_slot: i as u32,
-                    generation: e.slot_generation(i)?,
-                    phase: Phase::Decode,
-                    tokens: &DEVICE_TOKEN,
-                    prompt_len: slot.prompt_ids.len() as u32,
-                    selection: Selection::default(),
-                })
-            });
-            let requests: smallvec::SmallVec<[_; 16]> =
-                decode.chain(first).chain(prefill).collect();
-            // Pipelined, this launch reports no token: its samples — including a prompt's first
-            // token — are read back on a later tick, and `completed` stays empty.
-            let result = if pipelined {
-                e.token_batch_step_pipelined(&requests, unified_output)
-            } else if e.dev_sample_enabled() {
+            let requests: smallvec::SmallVec<[_; 16]> = decode.chain(prefill).collect();
+            let result = if e.dev_sample_enabled() {
                 // Stochastic rows draw on the device: a host draw downloads the row's 512 KiB of
                 // logits and walks the vocabulary once per row, serially, inside the tick.
                 *dev_sampled = true;
@@ -5207,7 +5069,7 @@ fn gpu_prefill_batched_pass(
                     Ok(())
                 })
         };
-        if res.is_ok() && !pipelined {
+        if res.is_ok() {
             ride.observe_launch(launch_bucket, riders, t_launch.elapsed().as_secs_f64() * 1e3);
         }
         match res {
@@ -5223,7 +5085,7 @@ fn gpu_prefill_batched_pass(
                     .as_ref()
                     .map(|s| s.pf_pos + withheld >= s.prompt_ids.len())
                     .unwrap_or(true);
-                if is_fair || last_finished {
+                if last_finished {
                     e.advance_prefill_turn(last_slot);
                 }
             }
@@ -7481,11 +7343,10 @@ mod tests {
     #[cfg(any(feature = "hsa", feature = "cpu"))]
     #[test]
     fn amd_prefill_scheduler_controls_are_bounded() {
-        assert_eq!(amd_prefill_tick_cap(false, false, false, 2048), u32::MAX);
-        assert_eq!(amd_prefill_tick_cap(true, true, false, 2048), u32::MAX);
-        assert_eq!(amd_prefill_tick_cap(true, false, false, 0), u32::MAX);
-        assert_eq!(amd_prefill_tick_cap(true, false, true, 2048), u32::MAX);
-        assert_eq!(amd_prefill_tick_cap(true, false, false, 2048), 2048);
+        assert_eq!(amd_prefill_tick_cap(false, false, 2048), u32::MAX);
+        assert_eq!(amd_prefill_tick_cap(true, false, 0), u32::MAX);
+        assert_eq!(amd_prefill_tick_cap(true, true, 2048), u32::MAX);
+        assert_eq!(amd_prefill_tick_cap(true, false, 2048), 2048);
         assert!(amd_defer_decode(true, true));
         assert!(!amd_defer_decode(true, false));
         assert!(!amd_defer_decode(false, true));

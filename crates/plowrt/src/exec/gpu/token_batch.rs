@@ -95,7 +95,7 @@ impl GpuEngine {
         requests: &[Request<'_>],
         output: &mut Vec<(u32, u32)>,
     ) -> Result<()> {
-        self.token_batch_step_inner(requests, output, false, None)
+        self.token_batch_step_inner(requests, output, None)
     }
 
     /// As [`Self::token_batch_step`], with `spec(slot)` rows drawn on the device by `plow_sample`
@@ -107,26 +107,13 @@ impl GpuEngine {
         output: &mut Vec<(u32, u32)>,
         spec: &dyn Fn(u32) -> Option<DevSample>,
     ) -> Result<()> {
-        self.token_batch_step_inner(requests, output, false, Some(spec))
-    }
-
-    /// As [`Self::token_batch_step`], but parked behind the decode pipeline's event instead of
-    /// waited on. Decode rows take their input token from the device (the previous launch sampled
-    /// it and nobody has read it), and this launch's samples — a prompt's first token included —
-    /// are read back on a later tick, so the host never blocks between launches.
-    pub fn token_batch_step_pipelined(
-        &mut self,
-        requests: &[Request<'_>],
-        output: &mut Vec<(u32, u32)>,
-    ) -> Result<()> {
-        self.token_batch_step_inner(requests, output, true, None)
+        self.token_batch_step_inner(requests, output, Some(spec))
     }
 
     fn token_batch_step_inner(
         &mut self,
         requests: &[Request<'_>],
         output: &mut Vec<(u32, u32)>,
-        pipelined: bool,
         spec: Option<&dyn Fn(u32) -> Option<DevSample>>,
     ) -> Result<()> {
         output.clear();
@@ -194,43 +181,11 @@ impl GpuEngine {
                 })
                 .collect();
             // Owned copies of what this step needs after the plan's borrow ends.
-            let phases: smallvec::SmallVec<[Phase; 16]> = plan.phases.iter().copied().collect();
             let sample_rows: smallvec::SmallVec<[u32; 32]> =
                 plan.sample_input_rows.iter().copied().collect();
             let real_rows = plan.real_rows as usize;
-            // Rows whose input token is on the device, by packed row offset and slot.
-            let mut device_ids: smallvec::SmallVec<[(u32, u32); 16]> = Default::default();
-            if pipelined {
-                let mut row = 0u32;
-                for (chunk, phase) in chunks.iter().zip(&phases) {
-                    // Only a row whose newest token the pipe still owes: for any other row the
-                    // host's token is the authoritative one and `d_last` is stale.
-                    if *phase == Phase::Decode && self.pipe_owes(chunk.slot) {
-                        device_ids.push((row, chunk.slot as u32));
-                    }
-                    row += chunk.tokens.len() as u32;
-                }
-            }
-            // The terminal's sample order, with each row's kind: a decode row carries the token
-            // it consumed into the prefix history when this step is read. `carry` is the row's
-            // KIND, not where its input came from -- a decode row the host staged (the pipe owed
-            // it nothing) still consumed a token and still has to match `pipe_covers`.
-            let decode_slots: smallvec::SmallVec<[u32; 32]> = chunks
-                .iter()
-                .zip(&phases)
-                .filter(|(_, phase)| **phase == Phase::Decode)
-                .map(|(chunk, _)| chunk.slot as u32)
-                .collect();
-            let pipe_rows: smallvec::SmallVec<[super::PipeRow; 32]> = plan
-                .sample_owners
-                .iter()
-                .map(|owner| super::PipeRow {
-                    slot: owner.slot as usize,
-                    carry: decode_slots.contains(&owner.slot),
-                })
-                .collect();
             let specs: Option<smallvec::SmallVec<[DevSample; 32]>> =
-                spec.filter(|_| !pipelined && self.sampler.is_some()).and_then(|spec| {
+                spec.filter(|_| self.sampler.is_some()).and_then(|spec| {
                     let specs: smallvec::SmallVec<[DevSample; 32]> = plan
                         .sample_owners
                         .iter()
@@ -282,11 +237,7 @@ impl GpuEngine {
             // rows alone, which the terminal then finds at rows 0..n.
             let tail_rows = self.shared_tail_rows(&chunks, &sample_rows);
             self.pf_seg_prefix = tail_rows.is_some();
-            let body = if pipelined {
-                self.packed_token_body_enqueue_device(&chunks, &device_ids)
-            } else {
-                self.packed_token_body_enqueue(&chunks)
-            };
+            let body = self.packed_token_body_enqueue(&chunks);
             self.pf_seg_prefix = false;
             body?;
             body_enqueued = true;
@@ -303,28 +254,16 @@ impl GpuEngine {
                 .take()
                 .expect("capability checked at load");
             let t_term = timed.then(std::time::Instant::now);
-            let sampled = if pipelined {
-                terminal.launch_rows(self, &sample_rows, real_rows).and_then(|()| {
-                    if pipe_rows.is_empty() {
-                        // A chunk that finished no prompt and carried no decode row samples
-                        // nothing: there is no token to wait for and nothing to park.
-                        Ok(())
-                    } else {
-                        self.pipe_enqueue_mixed(&pipe_rows)
-                    }
-                })
-            } else {
-                match &specs {
-                    Some(specs) => terminal.run_rows_sampled(self, &sample_rows, real_rows, specs),
-                    None => terminal.run_rows(self, &sample_rows, real_rows),
-                }
-                    .and_then(|ids| {
-                        state
-                            .staging
-                            .deliver(ids, output)
-                            .map_err(|error| RuntimeError::Rejected(error.to_string()))
-                    })
-            };
+            let sampled = match &specs {
+                Some(specs) => terminal.run_rows_sampled(self, &sample_rows, real_rows, specs),
+                None => terminal.run_rows(self, &sample_rows, real_rows),
+            }
+            .and_then(|ids| {
+                state
+                    .staging
+                    .deliver(ids, output)
+                    .map_err(|error| RuntimeError::Rejected(error.to_string()))
+            });
             let terminal_ns = t_term.map_or(0, |t| t.elapsed().as_nanos() as u64);
             self.packed_terminal = Some(terminal);
             sampled?;
@@ -337,15 +276,7 @@ impl GpuEngine {
                 .commit_after_device_success(&mut self.pos, &self.slot_generations)
                 .map_err(|error| RuntimeError::Rejected(error.to_string()))?;
             if self.vmm_prefix_enabled() {
-                for (chunk, phase) in chunks.iter().zip(&phases) {
-                    // A pipelined decode row's input token is the previous launch's sample, which
-                    // the host has not read; the pipe appends it when that token arrives.
-                    if pipelined
-                        && *phase == Phase::Decode
-                        && device_ids.iter().any(|&(_, slot)| slot as usize == chunk.slot)
-                    {
-                        continue;
-                    }
+                for chunk in &chunks {
                     self.seq_tokens[chunk.slot].extend_from_slice(chunk.tokens);
                 }
                 for slot in completed {
@@ -383,9 +314,6 @@ impl GpuEngine {
         if result.is_err() {
             if body_enqueued {
                 let _ = self.be.stream_synchronize(&self.stream);
-            }
-            if pipelined {
-                self.pipe_abandon();
             }
             state.staging.discard();
             output.clear();

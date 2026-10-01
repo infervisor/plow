@@ -9,7 +9,7 @@ LLM of the voice-agent server, next to Qwen3-ASR and Chatterbox ([tts.md](tts.md
 ```sh
 # no nix: PLOW_CAMPAIGN_NO_NIX=1, CARGO_TARGET_DIR holding a release plowc, PLOW_NVCC (+ NVCC_PREPEND_FLAGS)
 python3 scripts/campaign/campaign.py build recipes/infervisor/gemma-4-e4b/sm90a-h100-tp1.toml --out $OUT
-PLOW_HSACO=$OUT/assets plowrt serve --assets $OUT/assets --multistep-adaptive
+PLOW_HSACO=$OUT/assets plowrt serve --assets $OUT/assets
 ```
 
 The recipe runs base emit -> `scripts/build_sm90a_gemma4_segments.sh` -> role emit and keeps only

@@ -527,7 +527,7 @@ impl AppState {
     /// Install the per-group residency managers (once, at startup).
     #[cfg(feature = "cuda")]
     pub fn install_managers(&self, m: Vec<Arc<manager::ModelManager>>) {
-        self.install_device_turns(m.len());
+        self.install_device_turns(m.len(), true);
         let _ = self.managers.set(m);
     }
 
@@ -545,10 +545,12 @@ impl AppState {
     /// cooperative-launch refusal to catch the resulting CU oversubscription.
     /// The CPU engine gives every model its own worker pool, so turns bound
     /// thread contention there.
-    pub fn install_device_turns(&self, groups: usize) {
+    pub fn install_device_turns(&self, groups: usize, cuda: bool) {
         self.turns.get_or_init(|| {
+            let mode = policy::co_sched(self.registry.slugs().len(), !cuda);
+            policy::set_co_sched(mode);
             let turns = (0..groups.max(1))
-                .map(|_| Arc::new(cosched::DeviceTurn::from_config()))
+                .map(|_| Arc::new(cosched::DeviceTurn::serving(mode)))
                 .collect::<Vec<_>>();
             if let Some(first) = turns.first() {
                 tracing::info!(

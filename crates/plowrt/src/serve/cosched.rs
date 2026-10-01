@@ -204,14 +204,11 @@ impl DeviceTurn {
         }
     }
 
-    /// Build a turn from `--co-sched` / `--co-sched-quantum`.
-    ///
-    /// A bad mode is refused loudly rather than falling back in silence: a
-    /// misspelled scheduler that quietly served `free` would look exactly like
-    /// a round-robin that does not work.
-    pub fn from_config() -> DeviceTurn {
-        let cfg = crate::config::RuntimeConfig::get();
-        DeviceTurn::new(cfg.co_sched, cfg.co_sched_quantum)
+    /// A turn in `mode` with the serving quantum: consecutive ticks one model keeps the device.
+    /// Not 1: models with different dynamic shared-memory requests force an SM carveout
+    /// reconfiguration on every alternation (~150-300us).
+    pub fn serving(mode: CoSched) -> DeviceTurn {
+        DeviceTurn::new(mode, 4)
     }
 
     pub fn mode(&self) -> CoSched {

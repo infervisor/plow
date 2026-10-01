@@ -16,16 +16,8 @@ fn pf_packlog_on() -> bool {
     RuntimeConfig::get().pf_packlog
 }
 
-/// Covering bucket-pick policy. Reads `RuntimeConfig::get().nv.pf_cover`.
-fn pf_cover_on() -> bool {
-    RuntimeConfig::get().nv.pf_cover
-}
-
-/// Fixed cost of ONE prefill launch, in padded-row equivalents.
-/// Reads `RuntimeConfig::get().nv.pf_chunk_cost`.
-fn pf_chunk_cost_rows() -> usize {
-    RuntimeConfig::get().nv.pf_chunk_cost
-}
+/// Fixed cost of ONE prefill launch, in padded-row equivalents (measured on sm_120 / gemma-4-12B).
+pub(crate) const PF_CHUNK_COST_ROWS: usize = 512;
 
 use crate::asset::devblob::{DevBlob, DevProg};
 use crate::device::cuda::{CudaBackend, CudaEvent, CudaStream, KernelFn, PinnedHost};
@@ -3128,7 +3120,7 @@ impl StepTiming {
     }
 }
 
-/// PX-1 cross-request batched prefill state (`PLOW_PF_BATCH=1`). The two
+/// Cross-request packed prefill state, from the packet's packed-prefill manifest. The two
 /// device buffers are appended to the tensor table PAST the blob's handles:
 /// the kernel sees them only where the host patches `t[6]` on prefill sites.
 struct PfBatch {
@@ -3587,7 +3579,7 @@ impl GpuEngine {
             && !config.fusion
             && prefix_layout.is_some()
             && packed_prefill_metadata.is_some();
-        let packed_prefix = prefix_requested && (config.pf_batch_cuda() || unified_packed);
+        let packed_prefix = prefix_requested && unified_packed;
         if packed_prefix && (prefix_layout.is_none() || packed_prefill_metadata.is_none()) {
             return Err(RuntimeError::Rejected(
                 "packed prefix reuse requires compiled packed-prefill metadata and a valid VMM layout"
@@ -3609,14 +3601,13 @@ impl GpuEngine {
             if packed_prefill_metadata.is_some() {
                 // A packed launch writes several slots' KV rows at once, so every
                 // row must be VMM-mapped before launch; only the unified token-batch
-                // route (PLOW_TOKEN_BATCH=1, PLOW_FUSION=0) or explicit PLOW_PF_BATCH=1
-                // plans that admission from the packed metadata.
+                // route (PLOW_TOKEN_BATCH=1, PLOW_FUSION=0) plans that admission from the
+                // packed metadata.
                 tracing::info!(
                     token_batch = config.token_batch,
                     fusion = config.fusion,
-                    pf_batch = config.pf_batch_cuda(),
                     "packed prefill disabled: prefix reuse needs pre-launch KV admission, \
-                     which only unified token batching or PLOW_PF_BATCH=1 provides"
+                     which only unified token batching provides"
                 );
             }
             None
@@ -3686,7 +3677,7 @@ impl GpuEngine {
             .filter(|_| moe_lt_decode_roles);
         let kv_maps = kv_tensor_maps(&blob.tensors, &blob.gen, blob.decode_prog()?.t as usize)?;
         let recurrent = recurrent_state_layout(&blob.tensors, blob.decode_prog()?.t as usize)?;
-        let configured_multistep = RuntimeConfig::get().multistep();
+        let configured_multistep = crate::serve::policy::decode_k_capacity();
         // A ladder routing only its wide rungs keeps multistep: those rungs launch their captured
         // graphs from the quantum loop, as the MoE-routed rungs do.
         let cublaslt_every_rung = cublaslt_enabled
@@ -4519,12 +4510,11 @@ impl GpuEngine {
         }
 
         // ---- Cross-request prefill buffers ----
-        // A validated packet manifest owns packet-declared tables. Legacy
-        // packets retain the explicit runtime opt-in and appended tables.
+        // A validated packet manifest owns packet-declared tables; a packet without one does not
+        // pack prefill.
         let t_decode = std::time::Instant::now();
         let decode_t0 = load_tim.as_ref().map(|t| t.ms_since_t0()).unwrap_or(0.0);
         let sys_decode = std::time::SystemTime::now();
-        let pf_batch_env = crate::config::RuntimeConfig::get().pf_batch_cuda();
         let pf_max_t_blob = blob
             .prefill_progs()
             .iter()
@@ -4532,19 +4522,12 @@ impl GpuEngine {
             .max()
             .unwrap_or(0);
         let dbatch_blob = blob.decode_prog().map(|g| g.t as usize).unwrap_or(1);
-        let pf_batch_requested = packed_prefill.is_some() || pf_batch_env;
-        let pf_bufs = if let Some(p) = &packed_prefill {
-            Some((
+        let pf_bufs = match &packed_prefill {
+            Some(p) => Some((
                 devp[p.slot as usize].subview(0, devp[p.slot as usize].len)?,
                 devp[p.request as usize].subview(0, devp[p.request as usize].len)?,
-            ))
-        } else if pf_batch_requested && pf_max_t_blob > 0 {
-            Some((
-                be.alloc(0, (pf_max_t_blob * 4) as u64)?,
-                be.alloc(0, ((1 + 4 * dbatch_blob) * 4) as u64)?,
-            ))
-        } else {
-            None
+            )),
+            None => None,
         };
 
         // ---- GEN_TMAP_BF16 re-encode (sm_90a TMA prefill GEMM) ----
@@ -5972,90 +5955,34 @@ impl GpuEngine {
         };
 
         // ---- Cross-request prefill mode (finalized once the prefill object is up) ----
-        // A validated manifest selects its packet-defined chain without a
-        // runtime knob. The legacy prototype retains its old opt-in/fallback.
+        // A validated manifest selects its packet-defined chain without a runtime knob.
         let pf_batch: Option<PfBatch> = match (pf_bufs, pf_handles) {
             (Some((d_slot, d_req)), Some((h_slot, h_req)))
                 if f_pf.is_some() && !prefill.is_empty() =>
             {
-                if packed_prefill.is_some() {
-                    if (vmm.as_ref().is_some_and(|v| v.kv.prefix_reuse()) && !packed_prefix)
-                        || recurrent.is_some()
-                        || prefill.iter().any(|b| {
-                            b.seg_class.len() < 2 || b.qwen_segments.iter().any(Option::is_some)
-                        })
-                    {
-                        return Err(RuntimeError::Rejected("packed requests require complete direct-KV segmented chains and a compatible prefix layout".into()));
-                    }
-                    Some(PfBatch {
-                        d_slot,
-                        d_req,
-                        h_slot,
-                        h_req,
-                        at_sites: Vec::new(),
-                        slot_buf: vec![0; pf_max_t_blob],
-                        req_buf: Vec::with_capacity(1 + 4 * dbatch_blob),
-                        kvlen_buf: vec![0],
+                if (vmm.as_ref().is_some_and(|v| v.kv.prefix_reuse()) && !packed_prefix)
+                    || recurrent.is_some()
+                    || prefill.iter().any(|b| {
+                        b.seg_class.len() < 2 || b.qwen_segments.iter().any(Option::is_some)
                     })
-                } else if vmm.is_some() {
-                    tracing::warn!("PLOW_PF_BATCH=1 ignored: incompatible with VMM KV allocation");
-                    None
-                } else {
-                    let fused = prefill.iter().find(|b| {
-                        // `!b.fp8_kv`: the fp8 flash arm reads t6/t7 as the k/v
-                        // scales, so the batched patch (t6 = request table) would
-                        // hand it garbage. The kernel has no fp8 mux arm either.
-                        !b.fp8_kv
-                            && !b.flash_sites.is_empty()
-                            && b.flash_sites.iter().all(|&ix| {
-                                b.h_inst[ix].i[7] == 1 && b.h_inst[ix].t[5] != TENSOR_NONE16
-                            })
-                    });
-                    if fused.is_none() && prefill.iter().any(|b| b.fp8_kv) {
-                        tracing::warn!(
-                            "PLOW_PF_BATCH=1 ignored: fp8-KV packets have no batched prefill arm"
-                        );
-                    }
-                    match fused {
-                        Some(b) => {
-                            let at_sites: Vec<(u32, u32)> = b
-                                .flash_sites
-                                .iter()
-                                .map(|&ix| (b.h_inst[ix].t[5] as u32, b.h_inst[ix].i[6]))
-                                .collect();
-                            tracing::info!(
-                                fused_bucket_t = b.t,
-                                flash_sites = at_sites.len(),
-                                "PX-1 cross-request batched prefill enabled (PLOW_PF_BATCH=1)"
-                            );
-                            Some(PfBatch {
-                                d_slot,
-                                d_req,
-                                h_slot,
-                                h_req,
-                                at_sites,
-                                slot_buf: vec![0; pf_max_t_blob],
-                                req_buf: Vec::with_capacity(1 + 4 * dbatch_blob),
-                                kvlen_buf: vec![0],
-                            })
-                        }
-                        None => {
-                            tracing::warn!(
-                                "PLOW_PF_BATCH=1 ignored: no fused (nsplit==1) prefill bucket"
-                            );
-                            None
-                        }
-                    }
+                {
+                    return Err(RuntimeError::Rejected("packed requests require complete direct-KV segmented chains and a compatible prefix layout".into()));
                 }
+                Some(PfBatch {
+                    d_slot,
+                    d_req,
+                    h_slot,
+                    h_req,
+                    at_sites: Vec::new(),
+                    slot_buf: vec![0; pf_max_t_blob],
+                    req_buf: Vec::with_capacity(1 + 4 * dbatch_blob),
+                    kvlen_buf: vec![0],
+                })
             }
-            (Some(_), _) if packed_prefill.is_some() => {
+            (Some(_), _) => {
                 return Err(RuntimeError::Rejected(
                     "packed prefill manifest requires a loaded prefill object and buckets".into(),
                 ));
-            }
-            (Some(_), _) => {
-                tracing::warn!("PLOW_PF_BATCH=1 ignored: prefill object not loaded");
-                None
             }
             _ => None,
         };
@@ -6130,7 +6057,8 @@ impl GpuEngine {
         // legacy cubin still host-patches i[3] each step, so multi-step is off.
         let dyn_kvrow = batch > 1 || kvrow.is_empty();
         // The lookahead pipeline needs exactly what the K-step quantum needs, and replaces it.
-        let pipeline = RuntimeConfig::get().nv.decode_pipeline && !multistep_disabled_by_decode;
+        let pipeline =
+            RuntimeConfig::get().nv.decode_pipeline != Some(false) && !multistep_disabled_by_decode;
         let multistep_k = if pipeline { effective_multistep.max(2) } else { effective_multistep };
         let multistep =
             Self::multistep_bringup(&be, assets_dir, batch, dyn_kvrow, multistep_k, !pipeline)
@@ -6140,7 +6068,7 @@ impl GpuEngine {
                 });
         let pipe = match (&multistep, pipeline) {
             (Some(_), true) => {
-                tracing::info!("lookahead decode pipeline enabled (PLOW_DECODE_PIPELINE)");
+                tracing::info!("lookahead decode pipeline enabled");
                 Some(DecodePipe::new(&be, batch)?)
             }
             _ => None,
@@ -7866,22 +7794,6 @@ impl GpuEngine {
         })
     }
 
-    /// Whether a mixed launch may be enqueued behind the in-flight step (`PLOW_PIPE_PREFILL`).
-    /// The mixed launch takes its decode rows' tokens from `d_last`, so the host never waits for
-    /// the previous step before submitting the next one.
-    pub fn pipe_prefill_enabled(&self) -> bool {
-        self.pipe.is_some()
-            && self.timing.is_none()
-            && self.token_batch_enabled()
-            && RuntimeConfig::get().nv.pipe_prefill > 0
-    }
-
-    /// Whether a prompt whose first token is still on the device may decode from it
-    /// (`PLOW_PIPE_PREFILL=2`) instead of waiting a launch for the host to read that token.
-    pub fn pipe_first_token_rows(&self) -> bool {
-        self.pipe_prefill_enabled() && RuntimeConfig::get().nv.pipe_prefill >= 2
-    }
-
     /// One pipelined decode tick: enqueue the next step, then wait for the one in flight.
     /// With nothing in flight the first step starts from the host's `feeds`; otherwise `feeds`
     /// must be the in-flight rows ([`Self::pipe_covers`]) and their tokens are already on the
@@ -7925,47 +7837,6 @@ impl GpuEngine {
             self.pipe_enqueue(feeds, upload)?;
         }
         self.pipe_complete(out)
-    }
-
-    /// Whether the pipe still owes `slot` a token, i.e. `d_last[slot]` holds a sample the host
-    /// has not read. Only such a row may take its next input from the device.
-    pub fn pipe_owes(&self, slot: usize) -> bool {
-        self.pipe.as_ref().is_some_and(|p| p.holds(slot))
-    }
-
-    /// Drop every queued step after a failed launch. Slots retired while the queue held them are
-    /// retired now: no device work will read them again.
-    pub(super) fn pipe_abandon(&mut self) {
-        let retired: smallvec::SmallVec<[(usize, bool); 8]> = match self.pipe.as_mut() {
-            Some(pipe) => {
-                pipe.queue.clear();
-                pipe.retire
-                    .iter_mut()
-                    .enumerate()
-                    .filter_map(|(b, r)| r.take().map(|c| (b, c)))
-                    .collect()
-            }
-            None => Default::default(),
-        };
-        for (b, cache_output) in retired {
-            self.retire_slot(b, cache_output);
-        }
-    }
-
-    /// Whether both pinned readback buffers are in flight, so nothing more may be enqueued
-    /// until the oldest step is read.
-    pub fn pipe_full(&self) -> bool {
-        self.pipe.as_ref().is_some_and(|p| p.queue.len() >= 2)
-    }
-
-    /// Read out the oldest queued step once a second one is in flight behind it: the lookahead-1
-    /// steady state a run of prefill ticks would otherwise grow past. `out` receives its tokens.
-    pub fn pipe_reap(&mut self, out: &mut Vec<(usize, u32)>) -> Result<()> {
-        out.clear();
-        if self.pipe_full() {
-            self.pipe_complete(out)?;
-        }
-        Ok(())
     }
 
     /// Complete every queued pipelined step; `out` receives their `(slot, token)` in order.
@@ -8144,46 +8015,6 @@ impl GpuEngine {
                 v.kv.advise(b, self.pos[b]);
             }
         }
-        Ok(())
-    }
-
-    /// Park a mixed launch's samples: scatter them into `d_last` so the next launch feeds them
-    /// back without the host, copy the compact block into this buffer's pinned slab, and record
-    /// the event a later tick waits on. `rows` is the sample order the terminal wrote.
-    fn pipe_enqueue_mixed(&mut self, rows: &[PipeRow]) -> Result<()> {
-        let ids_base = self.devp[self.t_ids].base;
-        let (buf, d_last) = {
-            let pipe = self.pipe.as_mut().expect("pipe");
-            let buf = pipe.next;
-            pipe.next ^= 1;
-            (buf, pipe.d_last.base)
-        };
-        for (j, row) in rows.iter().enumerate() {
-            self.be.memcpy_dtod_async(
-                d_last + (row.slot * 4) as u64,
-                ids_base + (j * 4) as u64,
-                4,
-                &self.stream,
-            )?;
-        }
-        // SAFETY: at most two steps are queued, so this buffer's previous step has completed and
-        // been read; the slab lives on self past this step's event.
-        unsafe {
-            let bytes = rows.len() * 4;
-            let pipe = self.pipe.as_mut().expect("pipe");
-            self.be.memcpy_dtoh_async(
-                &mut pipe.ids_host[buf].as_mut_slice()[..bytes],
-                ids_base,
-                &self.stream,
-            )?;
-        }
-        let pipe = self.pipe.as_mut().expect("pipe");
-        self.be.event_record(&pipe.done[buf], &self.stream)?;
-        pipe.queue.push_back(PipeStep {
-            buf,
-            rows: rows.iter().copied().collect(),
-            compact: true,
-        });
         Ok(())
     }
 
@@ -8502,16 +8333,12 @@ impl GpuEngine {
     /// is a bucket-cost decision this engine keeps, so it is handed to the planner as the
     /// tick cap rather than re-derived there.
     pub fn step_backend(&self) -> crate::sched::step::Backend {
-        let policy = match crate::config::RuntimeConfig::get().pf_span_policy.as_deref() {
-            Some("fair") => crate::sched::prefill::SpanPolicy::FairSplit,
-            _ => crate::sched::prefill::SpanPolicy::Greedy,
-        };
         crate::sched::step::Backend {
             step_budget: u32::try_from(self.pf_max_rows()).unwrap_or(u32::MAX),
             packing: true,
             split_spans: true,
             decode_rows_join_prefill: false,
-            span_policy: Some(policy),
+            span_policy: Some(crate::sched::prefill::SpanPolicy::Greedy),
         }
     }
 
@@ -9557,7 +9384,7 @@ impl GpuEngine {
         // never launch against them.
         if self.pf_batch.is_some() && self.packed_prefill.is_none() {
             return Err(RuntimeError::Rejected(
-                "PLOW_PF_BATCH=1: serialized prefill_chunk disabled — use prefill_batched".into(),
+                "packed prefill: serialized prefill_chunk disabled — use prefill_batched".into(),
             ));
         }
         if b >= self.batch {
@@ -9641,35 +9468,17 @@ impl GpuEngine {
     ///
     /// A 4137-row prompt runs `[4096, 128]` = 4224 padded rows; a 4500-row pack
     /// still takes `[4096, …]` rather than the ~45%-padded single `[8192]`.
-    /// `PLOW_PF_COVER=1` restores the covering pick (A/B control / exact parity
-    /// with harness trajectories, which chunk the covering way);
-    /// `PLOW_PF_CHUNK_COST=0` recovers the pure-minimum-padding objective.
     fn pick_prefill_bucket(&self, rem: usize, cap: usize) -> usize {
         let allowed = |t: usize| t <= cap;
         // Fall back to the smallest bucket when the cap is under every rung.
         let smallest = 0usize; // buckets are sorted by t
-        if pf_cover_on() {
-            // Old policy: smallest allowed bucket >= rem, else largest allowed.
-            let mut pick = smallest;
-            for (i, bkt) in self.prefill.iter().enumerate() {
-                let t = bkt.t as usize;
-                if i > 0 && !allowed(t) {
-                    break;
-                }
-                pick = i;
-                if t >= rem {
-                    break;
-                }
-            }
-            return pick;
-        }
         // Cost-aware pick: minimize `padded_rows + CHUNK_COST × launches`.
         //
         // Minimizing padded rows ALONE cascades a just-under-rung tail into a
         // pile of tiny launches — 8190 rows ran [4096,2048,1024,512,128×4], 8
         // launches, measured 28% SLOWER than an 8390-row prompt's [8192,128,128]
         // (1434 ms vs 1117 ms: 200 MORE tokens finished 317 ms sooner). Charging
-        // each launch `pf_chunk_cost_rows()` makes the 2-row-padded 8192 cover
+        // each launch `PF_CHUNK_COST_ROWS` makes the 2-row-padded 8192 cover
         // win, which is what the hardware actually prefers.
         let n_allowed = self
             .prefill
@@ -9688,7 +9497,7 @@ impl GpuEngine {
         // state on it bounds the table at `top_rung / smallest_rung` entries
         // (64 for the shipped 128…8192 ladder).
         let unit = (self.prefill[smallest].t as usize).max(1);
-        let chunk_cost = pf_chunk_cost_rows();
+        let chunk_cost = PF_CHUNK_COST_ROWS;
         let goal = rem.div_ceil(unit);
         // best[s] = (cost of consuming s units, first rung of that plan)
         let mut best = vec![(usize::MAX, smallest); goal + 1];
@@ -10789,17 +10598,6 @@ impl GpuEngine {
         self.packed_token_body_inner(reqs, false, &[])
     }
 
-    /// As [`Self::packed_token_body_enqueue`], with `device_ids` rows taking their input token
-    /// from `d_last` instead of the host staging: the previous launch sampled those tokens and
-    /// the host has not read them yet.
-    fn packed_token_body_enqueue_device(
-        &mut self,
-        reqs: &[PackedTokenReq<'_>],
-        device_ids: &[(u32, u32)],
-    ) -> Result<()> {
-        self.packed_token_body_inner(reqs, false, device_ids)
-    }
-
     fn packed_token_body_inner(
         &mut self,
         reqs: &[PackedTokenReq<'_>],
@@ -10819,7 +10617,7 @@ impl GpuEngine {
             return Err(RuntimeError::Rejected("prefill object not loaded".into()));
         };
         if self.pf_batch.is_none() {
-            return Err(RuntimeError::Rejected("PLOW_PF_BATCH not enabled".into()));
+            return Err(RuntimeError::Rejected("packed prefill not enabled".into()));
         }
         if reqs.is_empty() {
             return Ok(());
@@ -10910,19 +10708,6 @@ impl GpuEngine {
                     "pf-batch: pack of {total} rows exceeds the largest bucket"
                 ))
             })?;
-        // The batched path single-launches the plain `_pf` object, whose gq window
-        // is segment 0 only. A wave-class-segmented bucket (SegPf loaded) would run
-        // its first segment and silently skip every op after it — stale KV, garbage
-        // logits, launch reports success. Refuse instead: the two features are
-        // mutually exclusive until the batched path learns the segment chain.
-        if self.packed_prefill.is_none() && !self.prefill[bi].seg_class.is_empty() {
-            return Err(RuntimeError::Rejected(
-                "PLOW_PF_BATCH with a wave-class-segmented prefill program \
-                 (PLOW_PF_SEG_DIR): the batched path launches segment 0 only — \
-                 unset one of the two"
-                    .into(),
-            ));
-        }
         if let (Some(plan), Some(v)) = (&request_plan, &mut self.vmm) {
             for &(slot, end) in &plan.mapped_ends {
                 if let Some(rings) = &mut v.rings {
