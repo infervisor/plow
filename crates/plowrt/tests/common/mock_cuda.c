@@ -35,6 +35,15 @@ int cuMemHostAlloc(void) { return 0; }
 int cuMemFreeHost(void) { return 0; }
 int cuLaunchCooperativeKernel(void) { return 0; }
 int cuLaunchKernel(void) { return 0; }
+int cuLaunchKernelEx(void) { return 0; }
+int cuFuncGetModule(void) { return 0; }
+int cuGraphRemoveDependencies_v2(void) { return 0; }
+int cuGraphNodeGetType(void) { return 0; }
+int cuGraphNodeGetDependentNodes_v2(void) { return 0; }
+int cuGraphNodeGetDependencies_v2(void) { return 0; }
+int cuGraphKernelNodeGetParams_v2(void) { return 0; }
+int cuGraphGetNodes(void) { return 0; }
+int cuGraphAddDependencies_v2(void) { return 0; }
 int cuMemGetAllocationGranularity(void) { return 0; }
 int cuMemAddressReserve(void) { return 0; }
 int cuMemAddressFree(void) { return 0; }

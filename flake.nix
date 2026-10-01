@@ -445,6 +445,17 @@
               suffix = "-static";
             }
           );
+
+          # Cross-built from x86_64-linux; tests can't run on the build host.
+          plowrt-aarch64 = pkgs.pkgsCross.aarch64-multiplatform.rustPlatform.buildRustPackage {
+            pname = "plowrt-aarch64";
+            version = cargoVersion;
+            inherit src cargoLock;
+            buildFeatures = [ "cuda" "hsa" ];
+            cargoBuildFlags = [ "--package" "plowrt" ];
+            doCheck = false;
+            postInstall = "mv $out/bin/plowrt $out/bin/plowrt-aarch64";
+          };
         }));
 
       apps = forAll (system: {
