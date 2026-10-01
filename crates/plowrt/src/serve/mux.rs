@@ -5917,14 +5917,12 @@ fn gpu_argmax_eligible(params: &crate::text::sample::SamplingParams) -> bool {
 
 /// §HOSTT: close a timed decode engine call and open its emit loop (`tokens` = the tick's count
 /// so far).
-#[cfg(any(feature = "cuda", feature = "hsa"))]
 fn host_engine_call(t_call: Option<Instant>, rows: usize, tokens: usize) -> Option<(Instant, usize)> {
     let t = t_call?;
     crate::obs::host::engine_call(t.elapsed().as_nanos() as u64, rows);
     Some((Instant::now(), tokens))
 }
 
-#[cfg(any(feature = "cuda", feature = "hsa"))]
 fn host_emit_done(t_emit: Option<(Instant, usize)>, tokens: usize) {
     if let Some((t, before)) = t_emit {
         crate::obs::host::emit(t.elapsed().as_nanos() as u64, tokens - before);

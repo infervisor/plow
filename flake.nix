@@ -262,6 +262,49 @@
         rec {
           default = plowrt;
 
+          # --- version bump ---------------------------------------------------
+          #   nix run .#bump            0.1.1 -> 0.1.2
+          #   nix run .#bump -- 1.0.0   exactly 1.0.0
+          # Run from the repo root: workspace version in Cargo.toml, the
+          # workspace crates' Cargo.lock entries.
+          bump = pkgs.writeShellApplication {
+            name = "plow-bump";
+            runtimeInputs = [ pkgs.coreutils pkgs.gnused pkgs.gawk pkgs.gnugrep ];
+            text = ''
+              die() { echo "bump: $*" >&2; exit 1; }
+
+              [ -f Cargo.lock ] && [ -f Cargo.toml ] || die "run this from the plow repo root"
+              [ "$#" -le 1 ] || die "usage: nix run .#bump [-- X.Y.Z]"
+
+              semver() { [[ "$1" =~ ^(0|[1-9][0-9]{0,8})\.(0|[1-9][0-9]{0,8})\.(0|[1-9][0-9]{0,8})$ ]]; }
+
+              current="$(sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\(.*\)"$/\1/p' Cargo.toml)"
+              semver "$current" || die "Cargo.toml workspace version is not X.Y.Z (found '$current')"
+
+              IFS=. read -r major minor patch <<<"$current"
+              if [ "$#" -eq 0 ]; then
+                next="$major.$minor.$((patch + 1))"
+              else
+                next="$1"
+                semver "$next" || die "'$next' is not MAJOR.MINOR.PATCH"
+              fi
+
+              names=()
+              for m in $(sed -n '/^members/,/^]/p' Cargo.toml | grep -o '"[^"]*"' | tr -d '"'); do
+                names+=("$(sed -n 's/^name = "\(.*\)"$/\1/p' "$m/Cargo.toml" | head -n1)")
+              done
+
+              sed -i "0,/^version = \"$current\"$/s//version = \"$next\"/" Cargo.toml
+              awk -v names=" ''${names[*]} " -v from="$current" -v to="$next" '
+                /^name = "/ { n = $3; gsub(/"/, "", n); pending = index(names, " " n " ") > 0 }
+                pending && $0 == "version = \"" from "\"" { $0 = "version = \"" to "\""; pending = 0 }
+                { print }
+              ' Cargo.lock > Cargo.lock.new && mv Cargo.lock.new Cargo.lock
+
+              echo "plow $current -> $next"
+            '';
+          };
+
           # --- compiler -------------------------------------------------------
           # Pure Rust, thanks to the rustls TLS stack (the workspace pins hf-hub
           # with `default-features = false`, so no native-tls → no openssl-sys).
@@ -402,7 +445,29 @@
               suffix = "-static";
             }
           );
+
+          # Cross-built from x86_64-linux; tests can't run on the build host.
+          plowrt-aarch64 = pkgs.pkgsCross.aarch64-multiplatform.rustPlatform.buildRustPackage {
+            pname = "plowrt-aarch64";
+            version = cargoVersion;
+            inherit src cargoLock;
+            buildFeatures = [ "cuda" "hsa" ];
+            cargoBuildFlags = [ "--package" "plowrt" ];
+            doCheck = false;
+            postInstall = "mv $out/bin/plowrt $out/bin/plowrt-aarch64";
+          };
         }));
+
+      apps = forAll (system: {
+        default = {
+          type = "app";
+          program = "${self.packages.${system}.plowrt}/bin/plowrt";
+        };
+        bump = {
+          type = "app";
+          program = "${self.packages.${system}.bump}/bin/plow-bump";
+        };
+      });
 
       # `nix flake check`: compiler + runtime everywhere; the C core (whose ctest
       # suite runs as part of its build) on Linux. The interp flavours are `nix
