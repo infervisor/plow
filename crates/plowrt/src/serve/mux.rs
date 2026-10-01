@@ -4169,12 +4169,21 @@ fn run_one_tick(
                 .map(|slot| slot.gen.max_tokens.saturating_sub(slot.out_ids.len()))
                 .min()
                 .unwrap_or(1);
-            let requested = amd_multistep_requested(
-                remaining,
-                multi_step,
-                crate::config::RuntimeConfig::get().multistep() as usize,
-            );
-            let multi = e.multistep_quantum(&feeds, requested);
+            let has_cfg = feeds.iter().any(|&(i, _)| slots[i].as_ref().is_some_and(|s| s.cfg.is_some()));
+            let requested = if has_cfg {
+                1
+            } else {
+                amd_multistep_requested(
+                    remaining,
+                    multi_step,
+                    crate::config::RuntimeConfig::get().multistep() as usize,
+                )
+            };
+            let multi = if has_cfg {
+                None
+            } else {
+                e.multistep_quantum(&feeds, requested)
+            };
             let mut deferred = std::mem::take(&mut obs.host.slot_tokens);
             let t_dec = (crate::obs::tick::on() || slo_on).then(Instant::now);
             let t_call = crate::obs::host::on().then(Instant::now);
@@ -4183,6 +4192,9 @@ fn run_one_tick(
                 let t_emit = host_engine_call(t_call, feeds.len(), tokens_this_tick);
                 let res = call_res.and_then(|quantum| {
                     for &(i, _) in &feeds {
+                        if slots[i].is_none() {
+                            continue;
+                        }
                         for step in 0..quantum {
                             if slots[i].is_none() {
                                 break;
