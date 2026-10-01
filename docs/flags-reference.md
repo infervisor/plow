@@ -983,8 +983,8 @@ checkpoint location, because the weights a bundle needs are the same weights
 decision a deployment makes. Every mechanism below is derived from it, the packet's capabilities,
 the backend and the layout (`crates/plowrt/src/serve/policy.rs`); a mechanism a packet or backend
 cannot run is off by capability, not by a knob. `auto` applies the latency rules while the live
-decode width is at most 4 with an empty queue and the throughput rules from 8 rows or any queue,
-with a 200-tick dwell. Startup decisions (decode rung ladder, KV admission) take the throughput
+decode width is at most 4 with an empty queue and the throughput rules from 8 rows or any queue:
+it enters throughput at once and returns to latency after 2 s of a narrow window. Startup decisions (decode rung ladder, KV admission) take the throughput
 side under `auto`.
 
 | mechanism | latency | throughput | capability gate |

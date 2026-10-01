@@ -13,8 +13,9 @@
 //! rung ladder, KV admission) cannot follow a per-tick class; they take the throughput side under
 //! `auto`, so capacity is reserved for every slot.
 
-use std::sync::atomic::{AtomicU32, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::OnceLock;
+use std::time::Instant;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum Objective {
@@ -60,10 +61,14 @@ pub enum Class {
 /// profiles, so the band sits between them and a C8 workload does not oscillate.
 const WIDE_ENTER: usize = 8;
 const WIDE_LEAVE: usize = 4;
-/// Ticks a class must hold before it may change again. A decode tick is ~10-15 ms here, so this
-/// is ~2-3 s of dwell: long enough that a burst does not flip the class twice inside one
-/// request's decode, short enough to follow a real load change.
-const DWELL_TICKS: u32 = 200;
+/// How long the window must stay narrow before throughput hands back to latency: long enough
+/// that a burst's tail does not flip the class twice inside one request's decode. Entering
+/// throughput is immediate — latency rules under load cost E4B c64/c128 15-20% tok/s and up to
+/// 15x TTFT (queue-sized packing serialises a burst), while throughput rules at low load cost
+/// little. Wall time, not ticks: an idle server runs no ticks, and a tick-counted dwell held a
+/// fresh burst on the latency rules for its first 200 ticks.
+const CALM_MS: u64 = 2000;
+const NOT_CALM: u64 = u64::MAX;
 
 /// Throughput decode quantum: E4B and Veena serve their best c64/c128 at K = 8 with the
 /// single-step rule below (`docs/runtime/gemma4-e4b-h100.md`, `docs/runtime/tts.md`).
@@ -73,24 +78,24 @@ pub const THROUGHPUT_K: u32 = 8;
 const AMD_LATENCY_K: u32 = 4;
 
 static CLASS: AtomicU8 = AtomicU8::new(0);
-static DWELL: AtomicU32 = AtomicU32::new(0);
+/// When the window last became narrow (ms since `EPOCH`), or `NOT_CALM`.
+static CALM_SINCE: AtomicU64 = AtomicU64::new(NOT_CALM);
+static EPOCH: OnceLock<Instant> = OnceLock::new();
 
-/// The whole decision, as a pure function of the state and one tick's signals: the class in
-/// force afterwards and the dwell that goes with it.
-fn decide(current: Class, dwell: u32, width: usize, queued: usize) -> (Class, u32) {
-    let want = if width >= WIDE_ENTER || queued > 0 {
-        Class::HighConcurrency
-    } else if width <= WIDE_LEAVE {
-        Class::Realtime
+/// The whole decision, as a pure function of the state and one tick's signals at `now` ms: the
+/// class in force afterwards and the calm start that goes with it.
+fn decide(current: Class, calm_since: u64, now: u64, width: usize, queued: usize) -> (Class, u64) {
+    if width >= WIDE_ENTER || queued > 0 {
+        (Class::HighConcurrency, NOT_CALM)
+    } else if width <= WIDE_LEAVE && current == Class::HighConcurrency {
+        let since = if calm_since == NOT_CALM { now } else { calm_since };
+        if now.saturating_sub(since) >= CALM_MS {
+            (Class::Realtime, NOT_CALM)
+        } else {
+            (current, since)
+        }
     } else {
-        current
-    };
-    // The class changes only after the current one has held for the dwell, so a single wide tick
-    // in a latency workload — or one idle tick in a busy one — cannot move it.
-    if want == current || dwell < DWELL_TICKS {
-        (current, dwell.saturating_add(1))
-    } else {
-        (want, 0)
+        (current, NOT_CALM)
     }
 }
 
@@ -117,8 +122,9 @@ pub fn observe(width: usize, queued: usize) {
         return;
     }
     let current = class_for(Objective::Auto, CLASS.load(Ordering::Relaxed));
-    let (next, dwell) = decide(current, DWELL.load(Ordering::Relaxed), width, queued);
-    DWELL.store(dwell, Ordering::Relaxed);
+    let now = EPOCH.get_or_init(Instant::now).elapsed().as_millis() as u64;
+    let (next, calm) = decide(current, CALM_SINCE.load(Ordering::Relaxed), now, width, queued);
+    CALM_SINCE.store(calm, Ordering::Relaxed);
     if next != current {
         CLASS.store(u8::from(next == Class::HighConcurrency), Ordering::Relaxed);
         tracing::info!(from = ?current, to = ?next, width, queued, "serve objective: class switched");
@@ -200,27 +206,31 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_single_tick_never_moves_the_class() {
-        let (c, d) = decide(Class::Realtime, DWELL_TICKS, 16, 0);
-        assert_eq!((c, d), (Class::HighConcurrency, 0), "wide, and the dwell has run");
-        let (c, _) = decide(Class::Realtime, DWELL_TICKS - 1, 16, 0);
-        assert_eq!(c, Class::Realtime, "wide, but the class has not held long enough");
+    fn load_enters_throughput_at_once() {
+        for (width, queued) in [(WIDE_ENTER, 0), (1, 3)] {
+            let (c, calm) = decide(Class::Realtime, NOT_CALM, 10, width, queued);
+            assert_eq!((c, calm), (Class::HighConcurrency, NOT_CALM));
+        }
+    }
+
+    #[test]
+    fn throughput_leaves_only_after_the_window_stays_narrow() {
+        let (c, calm) = decide(Class::HighConcurrency, NOT_CALM, 1_000, 2, 0);
+        assert_eq!((c, calm), (Class::HighConcurrency, 1_000), "calm starts");
+        let (c, _) = decide(Class::HighConcurrency, calm, 1_000 + CALM_MS - 1, 2, 0);
+        assert_eq!(c, Class::HighConcurrency, "not calm for long enough");
+        let (c, _) = decide(Class::HighConcurrency, calm, 1_000 + CALM_MS, 2, 0);
+        assert_eq!(c, Class::Realtime);
+        let (c, calm) = decide(Class::HighConcurrency, calm, 1_500, 16, 0);
+        assert_eq!((c, calm), (Class::HighConcurrency, NOT_CALM), "a wide tick resets calm");
     }
 
     #[test]
     fn the_band_holds_a_mid_width_workload_where_it_was() {
         for from in [Class::Realtime, Class::HighConcurrency] {
-            let (c, _) = decide(from, DWELL_TICKS, 6, 0);
+            let (c, _) = decide(from, 0, 10 * CALM_MS, 6, 0);
             assert_eq!(c, from, "6 rows is inside [{WIDE_LEAVE}, {WIDE_ENTER})");
         }
-        assert_eq!(decide(Class::HighConcurrency, DWELL_TICKS, 2, 0).0, Class::Realtime);
-        assert_eq!(decide(Class::Realtime, DWELL_TICKS, 1, 3).0, Class::HighConcurrency, "queued");
-    }
-
-    #[test]
-    fn dwell_accumulates_while_the_class_is_stable() {
-        let (_, d) = decide(Class::Realtime, 7, 1, 0);
-        assert_eq!(d, 8);
     }
 
     #[test]
