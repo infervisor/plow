@@ -28,10 +28,25 @@ use plowrt::serve::mux::{self, MuxConfig};
 use plowrt::serve::{app, AppState};
 
 #[derive(Parser)]
-#[command(name = "plowrt", about = "plow host runtime")]
+#[command(
+    name = "plowrt",
+    about = "plow host runtime",
+    version,
+    disable_version_flag = true
+)]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
+
+    /// Print version information
+    #[arg(
+        short = 'v',
+        short_alias = 'V',
+        long = "version",
+        action = clap::ArgAction::Version,
+        help = "Print version information (-v, -V, --version)"
+    )]
+    version: Option<bool>,
 
     /// Runtime configuration knobs (memory, scheduling, backend-specific).
     /// Each field also reads its `PLOW_*` env var as a fallback.
