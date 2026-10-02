@@ -22,6 +22,7 @@ const UNSET: Default = Default::Static(Val::Unset);
 
 const OPT_IN: Status = Status::OptIn;
 const DIAG: Status = Status::Diagnostic;
+const REMOVED: Status = Status::Removed;
 const PREFIX_CACHE_CANDIDATE: Status = Status::Candidate {
     evidence: &[
         "review log #83: attach-verify4, 0/0 mismatches over 63 attaches; opt-in, unset by default",
@@ -87,23 +88,6 @@ const STALE_RESERVE_QUALIFIED: Status = Status::Qualified {
 };
 const PROMOTED: Status = Status::Qualified {
     evidence: &["docs/flags-reference.md: a promoted default; `=false` is the rollback"],
-};
-/// Unset = the cost-aware DP cover, which minimises `padded_rows + PLOW_PF_CHUNK_COST * launches`
-/// over the packet's existing rungs; `=1` restores the covering pick (smallest single rung that
-/// covers the row count).
-const PF_COVER_QUALIFIED: Status = Status::Qualified {
-    evidence: &[
-        "perf-certs/rt.pf_cover.json (12B H100 ladder16k, ABAB, coherence gate PASS every arm): 15000/C1 TTFT 737.256 -> 703.364 ms against a 7.169 ms floor, prefill padding 10.59% -> 1.58%, tpot_ms 10.541 -> 10.538 within a 0.007 floor",
-        "the same certificate records 8192/C1 as NEUTRAL with evidence: 8192 is itself a prefill bucket, so the covering pick and the DP cover both emit one exact-fit launch and there is no padding to remove",
-        "docs/flags-reference.md: `=1` is the rollback",
-    ],
-};
-/// Unset = on for a CUDA engine; AMD and CPU engines keep the engine thread.
-const INLINE_TICK_QUALIFIED: Status = Status::Qualified {
-    evidence: &[
-        "0b88ef14 (26B-A4B H100, ctl/inline/ctl2/inline2): dispatcher-engine handoff 50-87 -> 0.3 us per tick, 128/C1 TPOT 5.66 -> 5.61 ms, C16 15.53 -> 15.42 ms, TTFT unchanged, coherence gate PASS every arm",
-        "docs/flags-reference.md: `=0` is the rollback",
-    ],
 };
 /// Unset = split encode for a metaspace one-word BPE only (`text/tokenizer.rs`
 /// `metaspace_bpe_split_safe`), where it is exact; every other tokenizer stays serial.
@@ -403,6 +387,24 @@ pub fn check_knobs(knobs: &Value, rt: &RuntimeConfig) -> std::result::Result<(),
     ))
 }
 
+/// Warn about each retired knob still set in the environment: it no longer does anything, and
+/// `--objective` decides what it used to.
+pub fn warn_removed_env() {
+    for name in RAW_ENV
+        .iter()
+        .filter(|k| k.status == Status::Removed)
+        .filter_map(|k| k.env)
+    {
+        if std::env::var_os(name).is_some() {
+            tracing::warn!(
+                knob = name,
+                "removed knob is set and ignored: scheduling follows --objective \
+                 (docs/flags-reference.md, \"Serving objective\")"
+            );
+        }
+    }
+}
+
 #[rustfmt::skip]
 pub const RUNTIME: &[KnobSpec] = &[
     KnobSpec::new("rt.rt_checkpoint", Some("PLOW_CHECKPOINT"), Layer::Runtime, Domain::Str, UNSET, OPT_IN),
@@ -420,15 +422,22 @@ pub const RUNTIME: &[KnobSpec] = &[
     KnobSpec::new("rt.bf16_m4", Some("PLOW_METAL_BF16_M4"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("rt.bf16_m8", Some("PLOW_METAL_BF16_M8"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("rt.affine_q4_dir", Some("PLOW_AFFINE_Q4_DIR"), Layer::Runtime, Domain::Str, UNSET, OPT_IN),
-    KnobSpec::new("rt.token_batch", Some("PLOW_TOKEN_BATCH"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
+    KnobSpec::new("rt.token_batch", Some("PLOW_TOKEN_BATCH"), Layer::Runtime, Domain::Bool, ON, DIAG),
     KnobSpec::new("rt.prefix_cache", Some("PLOW_PREFIX_CACHE"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
-    KnobSpec::new("rt.idle_dispatch", Some("PLOW_IDLE_DISPATCH"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
     KnobSpec::new("rt.tts_first_lookahead", Some("PLOW_TTS_FIRST_LOOKAHEAD"), Layer::Runtime, USIZE, Default::Static(Val::Nat(1)), OPT_IN),
-    KnobSpec::new("rt.tts_turn_batch", Some("PLOW_TTS_TURN_BATCH"), Layer::Runtime, USIZE, Default::Static(Val::Nat(16)), OPT_IN),
-    KnobSpec::new("rt.asr_partial_duty", Some("PLOW_ASR_PARTIAL_DUTY"), Layer::Runtime, Domain::Str, Default::Static(Val::Str("0.5")), OPT_IN),
+    KnobSpec::new("rt.tts_turn_batch", Some("PLOW_TTS_TURN_BATCH"), Layer::Runtime, USIZE, Default::Static(Val::Nat(16)), DIAG),
+    KnobSpec::new("rt.render_yield_margin_ms", Some("PLOW_RENDER_YIELD_MARGIN_MS"), Layer::Runtime, USIZE, Default::Static(Val::Nat(5)), DIAG),
+    KnobSpec::new("rt.overload", Some("PLOW_OVERLOAD"), Layer::Runtime, Domain::Bool, UNSET, DIAG),
+    KnobSpec::new("rt.overload_window_ms", Some("PLOW_OVERLOAD_WINDOW_MS"), Layer::Runtime, USIZE, Default::Static(Val::Nat(5000)), DIAG),
+    KnobSpec::new("rt.overload_miss", Some("PLOW_OVERLOAD_MISS"), Layer::Runtime, Domain::Str, Default::Static(Val::Str("0.05,0.1,0.2")), DIAG),
+    KnobSpec::new("rt.asr_partial_duty", Some("PLOW_ASR_PARTIAL_DUTY"), Layer::Runtime, Domain::Str, Default::Static(Val::Str("0.5")), DIAG),
     KnobSpec::new("rt.session_ttl_ms", Some("PLOW_SESSION_TTL_MS"), Layer::Runtime, USIZE, Default::Static(Val::Nat(60_000)), OPT_IN),
     KnobSpec::new("rt.session_max", Some("PLOW_SESSION_MAX"), Layer::Runtime, USIZE, Default::Static(Val::Nat(0)), OPT_IN),
     KnobSpec::new("rt.session_slack", Some("PLOW_SESSION_SLACK"), Layer::Runtime, USIZE, Default::Static(Val::Nat(0)), OPT_IN),
+    KnobSpec::new("rt.turn_budget_ms", Some("PLOW_TURN_BUDGET_MS"), Layer::Runtime, USIZE, Default::Static(Val::Nat(1500)), OPT_IN),
+    KnobSpec::new("rt.turn_asr_final_ms", Some("PLOW_TURN_ASR_FINAL_MS"), Layer::Runtime, USIZE, Default::Static(Val::Nat(500)), OPT_IN),
+    KnobSpec::new("rt.turn_llm_ttft_ms", Some("PLOW_TURN_LLM_TTFT_MS"), Layer::Runtime, USIZE, Default::Static(Val::Nat(800)), OPT_IN),
+    KnobSpec::new("rt.turn_tts_ttfa_ms", Some("PLOW_TURN_TTS_TTFA_MS"), Layer::Runtime, USIZE, Default::Static(Val::Nat(800)), OPT_IN),
     KnobSpec::new("rt.encode_fast", Some("PLOW_ENCODE_FAST"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
     KnobSpec::new("rt.encode_threads", Some("PLOW_ENCODE_THREADS"), Layer::Runtime, U32, UNSET, ONE_WORD_ENCODE_QUALIFIED),
     KnobSpec::new("rt.encode_split_min", Some("PLOW_ENCODE_SPLIT_MIN"), Layer::Runtime, U32, UNSET, ONE_WORD_ENCODE_QUALIFIED),
@@ -442,21 +451,12 @@ pub const RUNTIME: &[KnobSpec] = &[
     KnobSpec::new("rt.vmm_cache_mib", Some("PLOW_VMM_CACHE_MIB"), Layer::Runtime, U32, UNSET, OPT_IN),
     KnobSpec::new("rt.vmm_block_mib", Some("PLOW_VMM_BLOCK_MIB"), Layer::Runtime, U32, Default::Static(Val::Nat(2)), OPT_IN),
     KnobSpec::new("rt.weight_vmm", Some("PLOW_WEIGHT_VMM"), Layer::Runtime, Domain::Bool, UNSET, OPT_IN),
-    KnobSpec::new("rt.pf_batch", Some("PLOW_PF_BATCH"), Layer::Runtime, Domain::Bool, UNSET, OPT_IN),
-    KnobSpec::new("rt.pf_interleave", Some("PLOW_PF_INTERLEAVE"), Layer::Runtime, U32, UNSET, OPT_IN),
-    KnobSpec::new("rt.pf_interleave_adaptive", Some("PLOW_PF_INTERLEAVE_ADAPTIVE"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
-    KnobSpec::new("rt.rung_fast_probe", Some("PLOW_RUNG_FAST_PROBE"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
-    KnobSpec::new("rt.mux_inline_tick", Some("PLOW_MUX_INLINE_TICK"), Layer::Runtime, Domain::Bool, UNSET, INLINE_TICK_QUALIFIED),
-    KnobSpec::new("rt.pf_chunk", Some("PLOW_PF_CHUNK"), Layer::Runtime, U32, Default::Static(Val::Nat(0)), OPT_IN),
-    KnobSpec::new("rt.pf_no_chunk", Some("PLOW_PF_NO_CHUNK"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
-    KnobSpec::new("rt.pf_no_interleave", Some("PLOW_PF_NO_INTERLEAVE"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
-    KnobSpec::new("rt.ride_fixed", Some("PLOW_RIDE_FIXED"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
-    KnobSpec::new("rt.pf_defer_decode", Some("PLOW_PF_DEFER_DECODE"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
-    KnobSpec::new("rt.serve_policy", Some("PLOW_SERVE_POLICY"), Layer::Runtime, Domain::Str, UNSET, OPT_IN),
-    KnobSpec::new("rt.pf_span_policy", Some("PLOW_PF_SPAN_POLICY"), Layer::Runtime, Domain::Str, UNSET, OPT_IN),
+    KnobSpec::new("rt.objective", Some("PLOW_OBJECTIVE"), Layer::Runtime, Domain::Str, Default::Static(Val::Str("auto")), OPT_IN),
+    KnobSpec::new("rt.pf_interleave", Some("PLOW_PF_INTERLEAVE"), Layer::Runtime, U32, UNSET, DIAG),
+    KnobSpec::new("rt.pf_chunk", Some("PLOW_PF_CHUNK"), Layer::Runtime, U32, Default::Static(Val::Nat(0)), DIAG),
+    KnobSpec::new("rt.pf_defer_decode", Some("PLOW_PF_DEFER_DECODE"), Layer::Runtime, Domain::Bool, OFF, DIAG),
     KnobSpec::new("rt.rt_max_ctx", Some("PLOW_RT_MAX_CTX"), Layer::Runtime, USIZE, UNSET, OPT_IN),
     KnobSpec::new("rt.tbt_slo_ms", Some("PLOW_TBT_SLO_MS"), Layer::Runtime, Domain::Str, UNSET, OPT_IN),
-    KnobSpec::new("rt.queue_ttl_ms", Some("PLOW_QUEUE_TTL_MS"), Layer::Runtime, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("rt.ttft_slo_ms", Some("PLOW_TTFT_SLO_MS"), Layer::Runtime, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("rt.slab_keep", Some("PLOW_SLAB_KEEP"), Layer::Runtime, Domain::Bool, UNSET, OPT_IN),
     KnobSpec::new("rt.dstep_every", Some("PLOW_DSTEP_EVERY"), Layer::Runtime, U32, UNSET, OPT_IN),
@@ -464,8 +464,8 @@ pub const RUNTIME: &[KnobSpec] = &[
     KnobSpec::new("rt.devices", Some("PLOW_DEVICES"), Layer::Runtime, U32, UNSET, OPT_IN),
     KnobSpec::new("rt.place", Some("PLOW_PLACE"), Layer::Runtime, Domain::Str, Default::Static(Val::Str("spread")), OPT_IN),
     KnobSpec::new("rt.pin", Some("PLOW_PIN"), Layer::Runtime, Domain::Str, UNSET, OPT_IN),
-    KnobSpec::new("rt.co_sched", Some("PLOW_CO_SCHED"), Layer::Runtime, Domain::Str, Default::Static(Val::Str("free")), OPT_IN),
-    KnobSpec::new("rt.co_sched_quantum", Some("PLOW_CO_SCHED_QUANTUM"), Layer::Runtime, U32, Default::Static(Val::Nat(4)), OPT_IN),
+    KnobSpec::new("rt.co_sched", Some("PLOW_CO_SCHED"), Layer::Runtime, Domain::Str, UNSET, DIAG),
+    KnobSpec::new("rt.cosched_max_wait_ms", Some("PLOW_COSCHED_MAX_WAIT_MS"), Layer::Runtime, U32, UNSET, DIAG),
     KnobSpec::new("rt.models_root", Some("PLOW_MODELS_ROOT"), Layer::Runtime, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("rt.preload", Some("PLOW_PRELOAD"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
     KnobSpec::new("rt.kv_pool_mib", Some("PLOW_KV_POOL_MIB"), Layer::Runtime, USIZE, Default::Static(Val::Nat(512)), OPT_IN),
@@ -483,13 +483,10 @@ pub const RUNTIME: &[KnobSpec] = &[
     KnobSpec::new("rt.dstep_log", Some("PLOW_DSTEP_LOG"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("rt.pf_packlog", Some("PLOW_PF_PACKLOG"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("rt.load_profile", Some("PLOW_LOAD_PROFILE"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
-    KnobSpec::new("rt.multistep", Some("PLOW_MULTISTEP"), Layer::Runtime, U32, Default::Static(Val::Nat(8)), OPT_IN),
-    KnobSpec::new("rt.multistep_adaptive", Some("PLOW_MULTISTEP_ADAPTIVE"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
+    KnobSpec::new("rt.multistep", Some("PLOW_MULTISTEP"), Layer::Runtime, U32, UNSET, DIAG),
     KnobSpec::new("rt.tts_stream_windows", Some("PLOW_TTS_STREAM_WINDOWS"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
-    KnobSpec::new("rt.cfg_device", Some("PLOW_CFG_DEVICE"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
-    KnobSpec::new("rt.cfg_multistep", Some("PLOW_CFG_MULTISTEP"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
-    KnobSpec::new("rt.decode_pipeline", Some("PLOW_DECODE_PIPELINE"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
-    KnobSpec::new("rt.pipe_prefill", Some("PLOW_PIPE_PREFILL"), Layer::Runtime, U32, Default::Static(Val::Nat(0)), OPT_IN),
+    KnobSpec::new("rt.cfg_device", Some("PLOW_CFG_DEVICE"), Layer::Runtime, Domain::Bool, OFF, DIAG),
+    KnobSpec::new("rt.decode_pipeline", Some("PLOW_DECODE_PIPELINE"), Layer::Runtime, Domain::Bool, UNSET, DIAG),
     KnobSpec::new("rt.vmm_prefix", Some("PLOW_VMM_PREFIX"), Layer::Runtime, Domain::Bool, UNSET, OPT_IN),
     KnobSpec::new("rt.vmm_live", Some("PLOW_VMM_LIVE"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("rt.vmm_live_rings", Some("PLOW_VMM_LIVE_RINGS"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
@@ -519,16 +516,14 @@ pub const RUNTIME: &[KnobSpec] = &[
     KnobSpec::new("rt.vram_budget_mib", Some("PLOW_VRAM_BUDGET_MIB"), Layer::Runtime, USIZE, UNSET, OPT_IN),
     KnobSpec::new("rt.step_time", Some("PLOW_STEP_TIME"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("rt.l2_place_dispatch", Some("PLOW_L2_PLACE_DISPATCH"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
-    KnobSpec::new("rt.pf_cover", Some("PLOW_PF_COVER"), Layer::Runtime, Domain::Bool, OFF, PF_COVER_QUALIFIED),
-    KnobSpec::new("rt.pf_chunk_cost", Some("PLOW_PF_CHUNK_COST"), Layer::Runtime, USIZE, Default::Static(Val::Nat(512)), OPT_IN),
     KnobSpec::new("rt.pf_seg_dir", Some("PLOW_PF_SEG_DIR"), Layer::Runtime, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("rt.pf_seg_gemm_small", Some("PLOW_PF_SEG_GEMM_SMALL"), Layer::Runtime, Domain::Str, UNSET, OPT_IN).with(C_PF_SEG_GEMM_SMALL),
     KnobSpec::new("rt.pf_seg_pure", Some("PLOW_PF_SEG_PURE"), Layer::Runtime, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("rt.pf_seg_fa512", Some("PLOW_PF_SEG_FA512"), Layer::Runtime, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("rt.pf_seg_fa256_gqa2", Some("PLOW_PF_SEG_FA256_GQA2"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("rt.pf_seg_graph", Some("PLOW_PF_SEG_GRAPH"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
-    KnobSpec::new("rt.pf_shared_tail", Some("PLOW_PF_SHARED_TAIL"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
-    KnobSpec::new("rt.pf_segment_gates", Some("PLOW_PF_SEGMENT_GATES"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
+    KnobSpec::new("rt.pf_shared_tail", Some("PLOW_PF_SHARED_TAIL"), Layer::Runtime, Domain::Bool, ON, DIAG),
+    KnobSpec::new("rt.pf_segment_gates", Some("PLOW_PF_SEGMENT_GATES"), Layer::Runtime, Domain::Bool, ON, DIAG),
     KnobSpec::new("rt.pf_entry_trace", Some("PLOW_PF_ENTRY_TRACE"), Layer::Runtime, Domain::Bool, OFF, DIAG),
     KnobSpec::new("rt.pf_seg_v2", Some("PLOW_PF_SEG_V2"), Layer::Runtime, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("rt.pf_attn_gemm", Some("PLOW_PF_ATTN_GEMM"), Layer::Runtime, Domain::Bool, UNSET, PF_ATTN_GEMM_AUTO),
@@ -545,7 +540,7 @@ pub const RUNTIME: &[KnobSpec] = &[
     KnobSpec::new("rt.pf_seg_eqsmem", Some("PLOW_PF_SEG_EQSMEM"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("rt.ctr_dbuf", Some("PLOW_CTR_DBUF"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
     KnobSpec::new("rt.state_clear_device", Some("PLOW_STATE_CLEAR_DEVICE"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
-    KnobSpec::new("rt.packed_prefill_route", Some("PLOW_PACKED_PREFILL_ROUTE"), Layer::Runtime, Domain::Bool, UNSET, OPT_IN),
+    KnobSpec::new("rt.packed_prefill_route", Some("PLOW_PACKED_PREFILL_ROUTE"), Layer::Runtime, Domain::Bool, UNSET, DIAG),
     KnobSpec::new("rt.kda_family_route", Some("PLOW_KDA_FAMILY_ROUTE"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
     KnobSpec::new("rt.global_queue", Some("PLOW_GLOBAL_QUEUE"), Layer::Runtime, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("rt.static_sched", Some("PLOW_STATIC"), Layer::Runtime, Domain::Str, UNSET, OPT_IN),
@@ -581,19 +576,18 @@ pub const RUNTIME: &[KnobSpec] = &[
     KnobSpec::new("rt.tp_prefill_audit_pinned", Some("PLOW_TP_PREFILL_AUDIT_PINNED"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
     KnobSpec::new("rt.launch_rows", Some("PLOW_LAUNCH_ROWS"), Layer::Runtime, U32, UNSET, OPT_IN),
     KnobSpec::new("rt.token_batch_rows", Some("PLOW_TOKEN_BATCH_ROWS"), Layer::Runtime, U32, UNSET, OPT_IN),
-    KnobSpec::new("rt.token_batch_solo", Some("PLOW_TOKEN_BATCH_SOLO"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
-    KnobSpec::new("rt.decode_min_rung", Some("PLOW_AMD_DECODE_MIN_RUNG"), Layer::Runtime, U32, UNSET, OPT_IN).scoped(DECODE_MIN_RUNG_SCOPE),
+    KnobSpec::new("rt.decode_min_rung", Some("PLOW_DECODE_MIN_RUNG"), Layer::Runtime, U32, UNSET, DIAG).scoped(DECODE_MIN_RUNG_SCOPE),
     KnobSpec::new("rt.tail_sparse_ctx", Some("PLOW_AMD_TAIL_SPARSE_CTX"), Layer::Runtime, U32, UNSET, OPT_IN).scoped(TAIL_SPARSE_SCOPE),
     KnobSpec::new("rt.tail_sparse_min_pairs", Some("PLOW_AMD_TAIL_SPARSE_MIN_PAIRS"), Layer::Runtime, U32, UNSET, OPT_IN).scoped(TAIL_SPARSE_SCOPE),
     KnobSpec::new("rt.token_batch_wide_tiles", Some("PLOW_TOKEN_BATCH_WIDE"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
-    KnobSpec::new("rt.ragged_chunk", Some("PLOW_RAGGED_CHUNK"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
-    KnobSpec::new("rt.ragged_seams", Some("PLOW_AMD_RAGGED_SEAMS"), Layer::Runtime, Domain::Bool, UNSET, OPT_IN),
+    KnobSpec::new("rt.ragged_chunk", Some("PLOW_RAGGED_CHUNK"), Layer::Runtime, Domain::Bool, ON, DIAG),
+    KnobSpec::new("rt.ragged_seams", Some("PLOW_AMD_RAGGED_SEAMS"), Layer::Runtime, Domain::Bool, UNSET, DIAG),
     KnobSpec::new("rt.mla_ns_live", Some("PLOW_MLA_NS_LIVE"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("rt.mla_bf16_metadata_hoist", Some("PLOW_MLA_BF16_METADATA_HOIST"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("rt.nv_ns_live", Some("PLOW_NV_NS_LIVE"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("rt.amd_decode_dense_exact", Some("PLOW_AMD_DECODE_DENSE_EXACT"), Layer::Runtime, Domain::Bool, OFF, OPT_IN).scoped(DECODE_DENSE_EXACT_SCOPE),
     KnobSpec::new("rt.glm_rowband", Some("PLOW_GLM_ROWBAND"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
-    KnobSpec::new("rt.decode_max_rung", Some("PLOW_DECODE_MAX_RUNG"), Layer::Runtime, U32, UNSET, OPT_IN),
+    KnobSpec::new("rt.decode_max_rung", Some("PLOW_DECODE_MAX_RUNG"), Layer::Runtime, U32, UNSET, DIAG),
     KnobSpec::new("rt.rt_hsaco", Some("PLOW_HSACO"), Layer::Runtime, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("rt.fp8_dir", Some("PLOW_FP8_DIR"), Layer::Runtime, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("rt.trace_raw", Some("PLOW_TRACE_RAW"), Layer::Runtime, Domain::Str, UNSET, OPT_IN),
@@ -644,6 +638,25 @@ pub const RUNTIME: &[KnobSpec] = &[
 
 #[rustfmt::skip]
 pub const RAW_ENV: &[KnobSpec] = &[
+    KnobSpec::new("env.PLOW_AMD_DECODE_MIN_RUNG", Some("PLOW_AMD_DECODE_MIN_RUNG"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
+    KnobSpec::new("env.PLOW_CFG_MULTISTEP", Some("PLOW_CFG_MULTISTEP"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
+    KnobSpec::new("env.PLOW_CO_SCHED_QUANTUM", Some("PLOW_CO_SCHED_QUANTUM"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
+    KnobSpec::new("env.PLOW_IDLE_DISPATCH", Some("PLOW_IDLE_DISPATCH"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
+    KnobSpec::new("env.PLOW_MULTISTEP_ADAPTIVE", Some("PLOW_MULTISTEP_ADAPTIVE"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
+    KnobSpec::new("env.PLOW_MUX_INLINE_TICK", Some("PLOW_MUX_INLINE_TICK"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
+    KnobSpec::new("env.PLOW_PF_BATCH", Some("PLOW_PF_BATCH"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
+    KnobSpec::new("env.PLOW_PF_CHUNK_COST", Some("PLOW_PF_CHUNK_COST"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
+    KnobSpec::new("env.PLOW_PF_COVER", Some("PLOW_PF_COVER"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
+    KnobSpec::new("env.PLOW_PF_INTERLEAVE_ADAPTIVE", Some("PLOW_PF_INTERLEAVE_ADAPTIVE"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
+    KnobSpec::new("env.PLOW_PF_NO_CHUNK", Some("PLOW_PF_NO_CHUNK"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
+    KnobSpec::new("env.PLOW_PF_NO_INTERLEAVE", Some("PLOW_PF_NO_INTERLEAVE"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
+    KnobSpec::new("env.PLOW_PF_SPAN_POLICY", Some("PLOW_PF_SPAN_POLICY"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
+    KnobSpec::new("env.PLOW_PIPE_PREFILL", Some("PLOW_PIPE_PREFILL"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
+    KnobSpec::new("env.PLOW_QUEUE_TTL_MS", Some("PLOW_QUEUE_TTL_MS"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
+    KnobSpec::new("env.PLOW_RIDE_FIXED", Some("PLOW_RIDE_FIXED"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
+    KnobSpec::new("env.PLOW_RUNG_FAST_PROBE", Some("PLOW_RUNG_FAST_PROBE"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
+    KnobSpec::new("env.PLOW_SERVE_POLICY", Some("PLOW_SERVE_POLICY"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
+    KnobSpec::new("env.PLOW_TOKEN_BATCH_SOLO", Some("PLOW_TOKEN_BATCH_SOLO"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
     KnobSpec::new("env.PLOW_DEBUG_MAX_INST", Some("PLOW_DEBUG_MAX_INST"), Layer::RawEnv, Domain::Str, UNSET, DIAG),
     KnobSpec::new("env.PLOW_DEV_SAMPLE", Some("PLOW_DEV_SAMPLE"), Layer::RawEnv, Domain::Str, UNSET, DIAG),
     KnobSpec::new("env.PLOW_DSA_VERIFY_CKPT", Some("PLOW_DSA_VERIFY_CKPT"), Layer::RawEnv, Domain::Str, UNSET, DIAG),
@@ -781,12 +794,39 @@ mod tests {
             "raw env reads with no RAW_ENV spec: {unregistered:#?}"
         );
         for k in RAW_ENV {
-            assert!(
-                read.iter().any(|r| r == k.name()),
-                "{} is read nowhere",
-                k.id
-            );
+            let is_read = read.iter().any(|r| r == k.name());
+            if k.status == Status::Removed {
+                assert!(!is_read, "{} is Removed but still read", k.id);
+            } else {
+                assert!(is_read, "{} is read nowhere", k.id);
+            }
         }
+    }
+
+    /// A recipe or launcher that still sets a removed knob silently loses the setting it was
+    /// measured with; migrate it to `PLOW_OBJECTIVE` (or an expert override) instead.
+    #[test]
+    fn recipes_and_launchers_set_no_removed_knob() {
+        let removed: Vec<&str> = RAW_ENV
+            .iter()
+            .filter(|k| k.status == Status::Removed)
+            .filter_map(|k| k.env)
+            .collect();
+        let mut sources = Vec::new();
+        for dir in ["recipes", "scripts"] {
+            files(&root().join(dir), None, &mut sources);
+        }
+        assert!(!sources.is_empty(), "recipes and scripts not found");
+        let stale: Vec<String> = sources
+            .iter()
+            .flat_map(|(path, text)| {
+                text.lines()
+                    .flat_map(plow_tokens)
+                    .filter(|t| removed.contains(t))
+                    .map(move |t| format!("{}: {t}", path.display()))
+            })
+            .collect();
+        assert!(stale.is_empty(), "removed knobs still set: {stale:#?}");
     }
 
     #[test]

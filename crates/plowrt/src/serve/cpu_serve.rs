@@ -345,7 +345,7 @@ impl SeqEngine for CpuServe {
         prompt: &[u32],
         tick_max_bucket: u32,
     ) -> Result<Option<u32>> {
-        let cap = if crate::config::RuntimeConfig::get().co_sched == super::cosched::CoSched::Rr {
+        let cap = if crate::serve::policy::installed_co_sched() == super::cosched::CoSched::Rr {
             tick_max_bucket.min(if self.pf_chunk == 0 {
                 u32::MAX
             } else {

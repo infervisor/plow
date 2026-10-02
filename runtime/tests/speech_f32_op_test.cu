@@ -141,13 +141,16 @@ enum Mode { FP32, BF16, INT, F64 };
 /* flips: BF16 elements allowed past 1 ulp. A bf16-rounded GELU amplifies a one-ulp flip of its
  * rounded input (an fp32 summation-order effect) to several output ulps; the FFMA and tensor-core
  * GEMMs both show 3e-6..3e-5 of elements so at K = 1024..4320 (the budget is 5e-5). */
+/* pre: a GPU instruction run first (preparing an input); ref: the golden's instruction (c.in). */
 static void run(const char* name, Case& c, golden_fn golden, std::vector<unsigned> outs, Mode mode,
-                double tol = 1e-5, size_t flips = 0) {
+                double tol = 1e-5, size_t flips = 0, const PlowDevInst* pre = nullptr,
+                const PlowDevInst* ref_in = nullptr) {
     c.upload();
     std::vector<void*> th;
     for (auto& h : c.host) th.push_back(h.data());
-    golden(&c.in, 0, 1, th.data(), nullptr);
+    golden(ref_in ? ref_in : &c.in, 0, 1, th.data(), nullptr);
     void** td = upload_table(c.dev);
+    if (pre) k_speech<<<g_nblk, 256, kSmem>>>(*pre, td);
     k_speech<<<g_nblk, 256, kSmem>>>(c.in, td);
     CK(cudaGetLastError());
     CK(cudaDeviceSynchronize());
@@ -967,6 +970,40 @@ static void t_attention_prefix(const char* name, unsigned batch, unsigned rows, 
     run(name, c, g_attention_f32, {o}, FP32, 2e-5);
 }
 
+#if defined(PLOW_NV_HOPPER)
+/* t_attention_prefix with the prefix formatted on the GPU (CopyColsF32 format mode) and read by
+ * sp_attention_h16 (flags bit 4), against the golden on the f32 prefix. */
+static void t_attention_prefix_h16(const char* name, unsigned batch, unsigned rows, unsigned pre, unsigned blocks,
+                                   std::vector<uint32_t> index, std::vector<uint32_t> lengths) {
+    Case c;
+    const unsigned heads = 8, hw = 64, width = heads * hw, stride = 3 * width, npt = (pre + SPH_KT - 1) / SPH_KT;
+    unsigned o = c.out((size_t)batch * rows * width);
+    unsigned qkv = c.f32((size_t)batch * rows * stride, 1.f);
+    unsigned pf = c.f32((size_t)blocks * pre * 2 * width, 1.f);
+    unsigned fm = c.out((size_t)blocks * heads * npt * SPH_XS);
+    unsigned ix = c.u32(index);
+    unsigned l = lengths.empty() ? PLOW_TENSOR_NONE : c.u32(lengths);
+    PlowDevInst f;
+    memset(&f, 0, sizeof(f));
+    for (auto& x : f.t) x = PLOW_TENSOR_NONE;
+    f.op = PLOW_DOP_COPY_COLS_F32;
+    f.t[0] = fm; f.t[1] = pf;
+    f.i[0] = blocks; f.i[1] = pre; f.i[2] = 2 * width; f.i[3] = 2 * width; f.i[7] = 1;
+    f.fj[1].u = pre * 2 * width; f.fj[2].u = heads * npt * SPH_XS;
+    c.in.op = PLOW_DOP_ATTENTION_F32;
+    c.in.t[0] = o; c.in.t[1] = qkv; c.in.t[2] = qkv; c.in.t[3] = qkv; c.in.t[4] = l; c.in.t[5] = PLOW_TENSOR_NONE;
+    c.in.t[6] = pf; c.in.t[7] = ix;
+    c.in.i[0] = batch; c.in.i[1] = rows; c.in.i[2] = rows; c.in.i[3] = heads; c.in.i[4] = hw;
+    c.in.i[5] = stride; c.in.i[6] = 2u; c.in.i[7] = pre;
+    c.in.fj[0].f = 0.125f;
+    c.in.fj[1].u = width; c.in.fj[2].u = 2 * width;
+    const PlowDevInst ref = c.in;
+    c.in.i[6] = 2u | 16u;
+    c.in.t[6] = fm;
+    run(name, c, g_attention_f32, {o}, FP32, 2e-5, 0, &f, &ref);
+}
+#endif
+
 /* Time-major encoder attention: batch 1, items * hpi heads, bias a relative-position table
  * [t][heads][2t - 1], key lengths per item (group of hpi heads). */
 static void t_attention_rel(const char* name, unsigned items, unsigned t, unsigned hpi, std::vector<uint32_t> lengths) {
@@ -983,9 +1020,11 @@ static void t_attention_rel(const char* name, unsigned items, unsigned t, unsign
     run(name, c, g_attention_f32, {o}, FP32, 2e-5);
 }
 
-static void bench(const char* name, Case& c, double flops, double bytes, int reps = 20) {
+static void bench(const char* name, Case& c, double flops, double bytes, int reps = 20,
+                  const PlowDevInst* pre = nullptr) {
     c.upload();
     void** td = upload_table(c.dev);
+    if (pre) k_speech<<<g_nblk, 256, kSmem>>>(*pre, td);
     for (int i = 0; i < 2; i++) k_speech<<<g_nblk, 256, kSmem>>>(c.in, td);
     CK(cudaGetLastError());
     cudaEvent_t e0, e1;
@@ -1175,6 +1214,25 @@ int main(int argc, char** argv) {
             char name[80];
             snprintf(name, sizeof(name), "CFM AttentionF32 tc b64 q%u kv%u+306", rows, rows);
             bench(name, c, 4.0 * batch * heads * hw * rows * (rows + pre), 0);
+#if defined(PLOW_NV_HOPPER)
+            /* the same with the prefix pre-formatted (sp_attention_h16) */
+            const unsigned npt = (pre + SPH_KT - 1) / SPH_KT;
+            Case h;
+            h.in = c.in;
+            for (auto& hb : c.host) h.host.push_back(hb);
+            const unsigned fm = h.out((size_t)2 * heads * npt * SPH_XS);
+            PlowDevInst f;
+            memset(&f, 0, sizeof(f));
+            for (auto& x : f.t) x = PLOW_TENSOR_NONE;
+            f.op = PLOW_DOP_COPY_COLS_F32;
+            f.t[0] = fm; f.t[1] = pf;
+            f.i[0] = 2; f.i[1] = pre; f.i[2] = 2 * width; f.i[3] = 2 * width; f.i[7] = 1;
+            f.fj[1].u = pre * 2 * width; f.fj[2].u = heads * npt * SPH_XS;
+            h.in.i[6] = 2u | 16u;
+            h.in.t[6] = fm;
+            snprintf(name, sizeof(name), "CFM AttentionF32 h16 b64 q%u kv%u+306", rows, rows);
+            bench(name, h, 4.0 * batch * heads * hw * rows * (rows + pre), 0, 20, &f);
+#endif
         }
         return 0;
     }
@@ -1476,6 +1534,12 @@ int main(int argc, char** argv) {
     t_dense("DenseGemmF32 tc-3xtf32 f32w 300x520x700", 300, 520, 700, 16, 0, 0, 0, 0, true);
     t_dense("DenseGemmF32 tc-3xtf32 f32w splitk 50x130x2000", 50, 130, 2000, 16, 1, 2, 0, 0, true, true);
     t_dense("DenseGemmF32 tc-3xtf32 onehot", 45, 67, 33, 16, 0, 0, 35, 34, false);
+    /* last: keeps the earlier cases' random data */
+#if defined(PLOW_NV_HOPPER)
+    t_attention_prefix_h16("AttentionF32 h16 prefix 306+72 lengths", 4, 72, 306, 2, {0, 1, 0, 1}, {378, 350, 320, 306});
+    t_attention_prefix_h16("AttentionF32 h16 prefix 306+136", 2, 136, 306, 2, {1, 0}, {});
+    t_attention_prefix_h16("AttentionF32 h16 prefix 300+264 lengths", 3, 264, 300, 3, {2, 0, 1}, {564, 400, 300});
+#endif
 
     if (argc > 1 && !strcmp(argv[1], "--bench")) {
         bench_signal();

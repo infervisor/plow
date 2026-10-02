@@ -49,7 +49,7 @@ fn device_turns_are_available_without_a_gpu_backend() {
     // Nothing installed yet: no turn to take.
     assert!(state.device_turn("state-model").is_none());
 
-    state.install_device_turns(1);
+    state.install_device_turns(1, false);
     assert!(
         state.device_turn("state-model").is_some(),
         "a CPU serve got no co-tenant turn — the mechanism was compiled out"
@@ -64,7 +64,7 @@ fn device_turns_are_available_without_a_gpu_backend() {
 #[test]
 fn slug_group_mapping_works_without_a_gpu_backend() {
     let state = make_state();
-    state.install_device_turns(2);
+    state.install_device_turns(2, false);
     assert_eq!(state.slug_group("state-model"), None);
     state.set_slug_group("state-model", 1);
     assert_eq!(state.slug_group("state-model"), Some(1));

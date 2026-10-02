@@ -724,6 +724,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     RuntimeConfig::init(cli.rt_cfg);
+    plowrt::knob_spec::warn_removed_env();
     match cli.cmd {
         #[cfg(any(
             all(feature = "cpu", feature = "gguf"),
@@ -3447,7 +3448,7 @@ async fn bringup_runtime(
             state.install_managers(managers.clone());
             // One co-tenant turn per group, installed before `load_initial`
             // spawns the first dispatcher — a mux resolves its turn at spawn.
-            state.install_device_turns(layout.groups.len());
+            state.install_device_turns(layout.groups.len(), true);
             // Load each group's initial residents. Sequential: the loads are
             // H2D-bound and share host bandwidth, so overlapping them buys
             // little while making a failure harder to attribute.
@@ -3487,7 +3488,9 @@ async fn bringup_runtime(
                 co_resident += 1;
             }
         }
-        if co_resident > 1 && cfg.co_sched != plowrt::serve::cosched::CoSched::Rr {
+        if co_resident > 1
+            && cfg.co_sched.is_some_and(|mode| mode != plowrt::serve::cosched::CoSched::Rr)
+        {
             return Err("AMD co-resident models require --co-sched rr; separate HSA queues do not guarantee whole-grid residency".into());
         }
         for slug in slugs {
@@ -3607,7 +3610,7 @@ async fn bringup_runtime(
     // on one card is a shape that already exists — and HSA has no
     // cooperative-launch refusal to turn the resulting CU oversubscription into
     // an error rather than a hang.
-    state.install_device_turns(1);
+    state.install_device_turns(1, false);
 
     // Spawn a per-model dispatcher: bucket-mux + arrival-rate batch formation.
     // Each dispatcher owns a Sender clone via AppState::mux(slug). Managed

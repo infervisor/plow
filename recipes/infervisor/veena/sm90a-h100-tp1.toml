@@ -77,12 +77,13 @@ PLOW_FUSE_KV_HNR = "1"
 PLOW_EMIT_PACKED_PREFILL_SMALL_HD = "1"
 PLOW_NV_DENSE_TUNE = "1"
 
-# Served flags (campaign serve/bench/gate). The lookahead-1 decode pipeline overlaps the host's
-# read-out and streaming with the next step (greedy c64/c128 +3-5%, c1 TPOT and CER unchanged);
-# --lt-rung-algos times cuBLASLt algorithms per rung (step_bench B=32..64 -3..-5%, digests equal).
+# Served flags (campaign serve/bench/gate). Scheduling follows the default `auto` objective: the
+# lookahead-1 decode pipeline (greedy c64/c128 +3-5%, c1 TPOT and CER unchanged), adaptive
+# multistep, and a one-frame (7-code) quantum at low load. --lt-rung-algos times cuBLASLt
+# algorithms per rung (step_bench B=32..64 -3..-5%, digests equal).
 [serve]
 # Env, not flags, so every launcher (campaign serve/gate, plowbench.sh probes) applies it.
-env = { PLOW_MULTISTEP_ADAPTIVE = "true", PLOW_DECODE_PIPELINE = "true", PLOW_LT_RUNG_ALGOS = "true" }
+env = { PLOW_LT_RUNG_ALGOS = "true" }
 
 [bench]
 kind = "speech"

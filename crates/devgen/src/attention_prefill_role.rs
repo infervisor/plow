@@ -75,12 +75,8 @@ enum Kind {
     Hd256Gqa2Bkv32,
     Hd512,
     Hd512Px4Bq64,
-}
-
-impl Kind {
-    fn is_hd512(self) -> bool {
-        matches!(self, Self::Hd512 | Self::Hd512Px4Bq64)
-    }
+    /// A generated-kernel catalog entry (`gen_kernels.rs`).
+    Generated,
 }
 
 pub struct Selection {
@@ -90,6 +86,17 @@ pub struct Selection {
     query_tile: u32,
     kv_tile: u32,
     kind: Kind,
+    generated: Option<Generated>,
+}
+
+/// A generated-kernel catalog selection (`gen_kernels.rs`).
+pub(crate) struct Generated {
+    pub role: u8,
+    pub abi: String,
+    pub attention: AttentionCapability,
+    pub window: u32,
+    pub ring_kv: bool,
+    pub pair_heads: bool,
 }
 
 struct Hd256Qualification {
@@ -98,7 +105,7 @@ struct Hd256Qualification {
     sha256: String,
 }
 
-fn validate_hardware_resources(
+pub(crate) fn validate_hardware_resources(
     gpu: &str,
     profile: &str,
     block_threads: u32,
@@ -331,6 +338,7 @@ impl Selection {
             query_tile,
             kv_tile,
             kind: Kind::Hd512,
+            generated: None,
         }
     }
 
@@ -342,6 +350,7 @@ impl Selection {
             query_tile: 64,
             kv_tile: 32,
             kind: Kind::Hd256Bkv32,
+            generated: None,
         }
     }
 
@@ -353,6 +362,7 @@ impl Selection {
             query_tile: 64,
             kv_tile: 32,
             kind: Kind::Hd256Gqa2Bkv32,
+            generated: None,
         }
     }
 
@@ -364,15 +374,40 @@ impl Selection {
             query_tile: 64,
             kv_tile: 16,
             kind: Kind::Hd512Px4Bq64,
+            generated: None,
         }
     }
 
+    pub(crate) fn generated(file: String, image: &[u8], generated: Generated) -> Self {
+        Self {
+            file,
+            sha256: plow_asset::decode_objects::image_sha256(image),
+            requires_fused_output: true,
+            query_tile: generated.attention.query_tile,
+            kv_tile: generated.attention.kv_tile,
+            kind: Kind::Generated,
+            generated: Some(generated),
+        }
+    }
+
+    fn head_dim(&self) -> u32 {
+        match (&self.kind, &self.generated) {
+            (Kind::Hd256Bkv32 | Kind::Hd256Gqa2Bkv32, _) => 256,
+            (Kind::Hd512 | Kind::Hd512Px4Bq64, _) => 512,
+            (Kind::Generated, generated) => generated.as_ref().map_or(0, |g| g.attention.head_dim),
+        }
+    }
+
+    fn is_hd512(&self) -> bool {
+        self.head_dim() == 512
+    }
     fn role(&self) -> u8 {
         match self.kind {
             Kind::Hd256Bkv32 => PREFILL_ATTENTION_HD256_BKV32,
             Kind::Hd256Gqa2Bkv32 => PREFILL_ATTENTION_HD256_GQA2_BKV32,
             Kind::Hd512 => PREFILL_ATTENTION_HD512_WG32,
             Kind::Hd512Px4Bq64 => PREFILL_ATTENTION_HD512_PX4_BQ64,
+            Kind::Generated => self.generated.as_ref().map_or(0, |g| g.role),
         }
     }
 }
@@ -439,6 +474,19 @@ fn eligible_for(op: &packet::dev::DevInst, n_cu: u16, selection: &Selection) -> 
                 // the paired object traps on any split count but one
                 && (selection.kind != Kind::Hd256Gqa2Bkv32 || op.i[7] == 1)
         }
+        // The wrapper traps outside this contract (gen_flash_prefill.cu).
+        Kind::Generated => selection.generated.as_ref().is_some_and(|g| {
+            op.op == DevOp::FlashPrefill as u16
+                && op.blocks == n_cu
+                && op.i[..4].iter().all(|&v| v > 0)
+                && op.i[2] % op.i[3] == 0
+                && op.i[6] == g.attention.head_dim
+                && crate::gen_kernels::heads_and_window_match(op, g.window, g.pair_heads)
+                && op.i[7] == 1
+                && op.t[6] == TENSOR_NONE
+                && (g.ring_kv || op.j[1] == u32::MAX)
+                && op.f[0].is_finite()
+        }),
     }
 }
 
@@ -484,9 +532,38 @@ pub(crate) fn apply_output_object(
         .iter()
         .flat_map(|program| &program.insts)
         .any(packet::dev::DevInst::is_hd256_gqa2_sliding_prefill);
+    // Programs whose attention at a head width a generated catalog role already took
+    // (gen_kernels.rs runs first); the hand-written roles keep the rest.
+    let generated = |head_dim: u32| -> BTreeSet<usize> {
+        sections
+            .iter()
+            .filter(|section| section.name == SECTION)
+            .filter_map(|section| SegmentRoles::from_bytes(&section.data).ok())
+            .flat_map(|roles| {
+                let taken: BTreeSet<u8> = roles
+                    .objects
+                    .iter()
+                    .filter(|(&id, object)| {
+                        plow_asset::segment_roles::is_generated(id)
+                            && object.attention.as_ref().is_some_and(|a| a.head_dim == head_dim)
+                    })
+                    .map(|(&id, _)| id)
+                    .collect();
+                roles
+                    .programs
+                    .into_iter()
+                    .filter(move |program| program.roles.iter().any(|role| taken.contains(role)))
+                    .map(|program| program.index)
+            })
+            .collect()
+    };
+    let generated_hd256 = generated(256);
+    let generated_programs = generated(512);
     let has_hd512 = model.progs[..prefill_count]
         .iter()
-        .flat_map(|program| &program.insts)
+        .enumerate()
+        .filter(|(index, _)| !generated_programs.contains(index))
+        .flat_map(|(_, program)| &program.insts)
         .any(is_hd512_attention);
     let mut applied = false;
     let directory = output.parent().unwrap_or_else(|| Path::new("."));
@@ -563,27 +640,31 @@ pub(crate) fn apply_output_object(
             .iter()
             .enumerate()
             .filter(|(index, program)| {
-                gqa2_rung(
-                    model.prog_t[*index],
-                    crate::emit_config::active().gemma4_sm90_hd256_gqa2_wide,
-                ) && program
-                    .insts
-                    .iter()
-                    .any(packet::dev::DevInst::is_hd256_gqa2_sliding_prefill)
+                !generated_hd256.contains(index)
+                    && gqa2_rung(
+                        model.prog_t[*index],
+                        crate::emit_config::active().gemma4_sm90_hd256_gqa2_wide,
+                    )
+                    && program
+                        .insts
+                        .iter()
+                        .any(packet::dev::DevInst::is_hd256_gqa2_sliding_prefill)
             })
             .map(|(index, _)| index)
             .collect::<BTreeSet<_>>();
-        if programs.is_empty() {
+        if programs.is_empty() && generated_hd256.is_empty() {
             return Err("packet has no M4096/M8192 paired HD256/GQA2 attention rungs".into());
         }
-        apply(
-            model,
-            sections,
-            &Selection::hd256_gqa2_bkv32(&image),
-            profile,
-            Some(&programs),
-        )?;
-        applied = true;
+        if !programs.is_empty() {
+            apply(
+                model,
+                sections,
+                &Selection::hd256_gqa2_bkv32(&image),
+                profile,
+                Some(&programs),
+            )?;
+            applied = true;
+        }
     }
     if has_hd256 && !gqa2_role {
         let qualification = if let (Some(root), Some(spec)) =
@@ -600,9 +681,12 @@ pub(crate) fn apply_output_object(
         } else {
             None
         };
-        if let Some(qualification) = qualification {
-            apply_qualified_hd256(model, sections, profile, gpu, directory, &qualification)?;
-            applied = true;
+        if let Some(mut qualification) = qualification {
+            qualification.programs.retain(|index| !generated_hd256.contains(index));
+            if !qualification.programs.is_empty() {
+                apply_qualified_hd256(model, sections, profile, gpu, directory, &qualification)?;
+                applied = true;
+            }
         }
     }
     if !has_hd512 || hd512_px4_bq64_role {
@@ -660,17 +744,20 @@ pub(crate) fn apply_output_object(
         ));
     }
     validate_hardware_resources(gpu, profile, expected[5].1, expected[4].1, expected[6].1)?;
+    let remaining = (0..prefill_count)
+        .filter(|index| !generated_programs.contains(index))
+        .collect::<BTreeSet<_>>();
     apply(
         model,
         sections,
         &Selection::from_image(OBJECT_FILE.into(), &image, wgmma),
         profile,
-        None,
+        (!generated_programs.is_empty()).then_some(&remaining),
     )?;
     Ok(true)
 }
 
-fn apply(
+pub(crate) fn apply(
     model: &mut Model,
     sections: &mut Vec<SectionData>,
     selection: &Selection,
@@ -685,6 +772,7 @@ fn apply(
             }
             Kind::Hd512 => "HD512 WG32 prefill attention role requires sm90a".into(),
             Kind::Hd512Px4Bq64 => "HD512 px4 BQ64 prefill attention role requires sm90a".into(),
+            Kind::Generated => "generated prefill attention role requires sm90a".into(),
         });
     }
     let attention = match selection.kind {
@@ -698,6 +786,9 @@ fn apply(
         },
         Kind::Hd512 => capability(selection.query_tile, selection.kv_tile),
         Kind::Hd512Px4Bq64 => px4_bq64_capability(),
+        Kind::Generated => {
+            selection.generated.as_ref().ok_or("generated selection")?.attention.clone()
+        }
     };
     let role = selection.role();
     let object = SegmentObject {
@@ -706,6 +797,7 @@ fn apply(
             Kind::Hd256Gqa2Bkv32 => PREFILL_ATTENTION_HD256_GQA2_BKV32_ABI,
             Kind::Hd512 => PREFILL_ATTENTION_HD512_WG32_ABI,
             Kind::Hd512Px4Bq64 => PREFILL_ATTENTION_HD512_PX4_BQ64_ABI,
+            Kind::Generated => &selection.generated.as_ref().ok_or("generated selection")?.abi,
         }
         .into(),
         file: selection.file.clone(),
@@ -742,6 +834,7 @@ fn apply(
             }
             Kind::Hd512 => "HD512 prefill attention role already declared".into(),
             Kind::Hd512Px4Bq64 => "HD512 px4 BQ64 role already declared".into(),
+            Kind::Generated => "generated prefill attention role already declared".into(),
         });
     }
 
@@ -765,16 +858,14 @@ fn apply(
             .insts
             .iter()
             .map(|op| {
-                let output_head_dim = match selection.kind {
-                    Kind::Hd256Bkv32 | Kind::Hd256Gqa2Bkv32 => 256,
-                    Kind::Hd512 | Kind::Hd512Px4Bq64 => 512,
-                };
+                let output_head_dim = u64::from(selection.head_dim());
                 eligible_for(op, n_cu, selection)
                     && (!selection.requires_fused_output
                         || (op.t[5] != TENSOR_NONE && op.i[7] == 1))
-                    && tensor_bytes
-                        .get(op.t[7] as usize)
-                        .is_some_and(|&bytes| bytes == 256)
+                    && (selection.kind == Kind::Generated
+                        || tensor_bytes
+                            .get(op.t[7] as usize)
+                            .is_some_and(|&bytes| bytes == 256))
                     && (op.t[5] == TENSOR_NONE
                         || (op.t[..5].iter().all(|&tensor| tensor != op.t[5])
                             && u64::from(op.i[0])
@@ -799,7 +890,7 @@ fn apply(
             .iter()
             .filter(|op| op.op == DevOp::FlashMerge as u16 && op.i[3] == 512)
             .count();
-        if selection.kind.is_hd512() && unfused_flash != full_merge {
+        if selection.is_hd512() && unfused_flash != full_merge {
             return Err(format!(
                 "incompatible HD512 prefill attention pairing in program {index}"
             ));
@@ -811,7 +902,11 @@ fn apply(
                 .zip(&eligible)
                 .enumerate()
                 .find(|(_, (op, selected))| {
-                    (!selection.kind.is_hd512() || is_hd512_attention(op))
+                    (if selection.kind == Kind::Generated {
+                        op.op == DevOp::FlashPrefill as u16 && op.i[6] == selection.head_dim()
+                    } else {
+                        !selection.is_hd512() || is_hd512_attention(op)
+                    })
                         && (!matches!(selection.kind, Kind::Hd256Bkv32 | Kind::Hd256Gqa2Bkv32)
                             || op.is_hd256_gqa2_sliding_prefill())
                         && if op.op == DevOp::FlashPrefill as u16 {
@@ -827,6 +922,7 @@ fn apply(
                     Kind::Hd256Bkv32 => "HD256 BKV32",
                     Kind::Hd256Gqa2Bkv32 => "paired HD256/GQA2 BKV32",
                     Kind::Hd512 | Kind::Hd512Px4Bq64 => "HD512",
+                    Kind::Generated => "generated",
                 },
                 op.blocks,
                 op.i,
@@ -846,6 +942,7 @@ fn apply(
                 Kind::Hd512 | Kind::Hd512Px4Bq64 => {
                     "HD512 role requires a plain prefill program".into()
                 }
+                Kind::Generated => "generated role requires a plain prefill program".into(),
             });
         }
         let prior_position = metadata
@@ -923,6 +1020,9 @@ fn apply(
                         Kind::Hd512 | Kind::Hd512Px4Bq64 => {
                             "HD512 role instruction is not contiguous in the queue".into()
                         }
+                        Kind::Generated => {
+                            "generated role instruction is not contiguous in the queue".into()
+                        }
                     });
                 }
             } else {
@@ -951,6 +1051,7 @@ fn apply(
             Kind::Hd512 | Kind::Hd512Px4Bq64 => {
                 "packet has no compatible HD512 prefill attention segments".into()
             }
+            Kind::Generated => "packet has no compatible generated attention segments".into(),
         });
     }
     metadata.objects.insert(role, object);

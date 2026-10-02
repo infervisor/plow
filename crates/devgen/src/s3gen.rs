@@ -23,7 +23,7 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
 
 use crate::pipeline::{
-    Activation, AttentionF32Stage, AttentionPrefix, BinaryF32Stage, BinaryOp, Conv1dF32Stage, CopyColsF32Stage, CumSumF64Stage,
+    h16_prefix_floats, Activation, AttentionF32Stage, AttentionPrefix, BinaryF32Stage, BinaryOp, Conv1dF32Stage, CopyColsF32Stage, CumSumF64Stage,
     Emitted, GatherRowsF32Stage, LayerNormRowsF32Stage, PacketPrefix, PadMode, RandCoord, RandF32Stage,
     StageProgram, TensorRef, UnaryF32Stage,
 };
@@ -93,6 +93,8 @@ struct Config {
     voiced_threshold: f32,
     trim: u32,
     audio_limit: f32,
+    /// Voice caches pre-formatted for the 3xFP16 cached attention (`PLOW_EMIT_S3GEN_ATTN_H16`).
+    attn_h16: bool,
 }
 
 impl Config {
@@ -140,6 +142,7 @@ impl Config {
             voiced_threshold: f("voiced_threshold")?,
             trim: u(v, "trim")?,
             audio_limit: f("audio_limit")?,
+            attn_h16: false,
         })
     }
 
@@ -177,8 +180,14 @@ fn length_scales(cfg: &Config) -> [(u32, u32); 7] {
 
 /// `s3gen.pkt` (model + pipeline section) for the S3Gen export in `dir` (scripts/tts/s3gen_export.py), with the rewrite's
 /// fused sites of that export's graph when plowc extracted them.
-pub fn lower_s3gen(dir: &std::path::Path, n_cu: u32, target: u32, sites: Option<&RewriteSites>) -> Result<(packet::devbuild::Model, packet::devbuild::SectionData), String> {
-    let cfg = Config::parse(
+pub fn lower_s3gen(
+    dir: &std::path::Path,
+    n_cu: u32,
+    target: u32,
+    sites: Option<&RewriteSites>,
+    attn_h16: bool,
+) -> Result<(packet::devbuild::Model, packet::devbuild::SectionData), String> {
+    let mut cfg = Config::parse(
         &serde_json::from_slice(&std::fs::read(dir.join("config.json")).map_err(|e| format!("{}: {e}", dir.display()))?)
             .map_err(|e| format!("s3gen config: {e}"))?,
     )?;
@@ -193,6 +202,7 @@ pub fn lower_s3gen(dir: &std::path::Path, n_cu: u32, target: u32, sites: Option<
     {
         return Err("unsupported S3Gen export".into());
     }
+    cfg.attn_h16 = attn_h16;
     let caps: Vec<(u32, u32)> = S3GEN_CAPACITIES.iter().copied().filter(|&(_, n)| n <= cfg.max_tokens).collect();
     let cached: Vec<(u32, u32)> = S3GEN_CACHED_CAPACITIES.iter().copied().filter(|&(_, n)| n <= cfg.max_tokens).collect();
     let bmax = caps.iter().chain(&cached).map(|c| c.0).max().ok_or("no S3Gen capacity fits max_tokens")?;
@@ -560,6 +570,24 @@ impl<'s> Ops<'s> {
                 out_item_stride: dst.0,
                 out_stride: dst.1,
                 out_offset: dst.2,
+            })
+        })
+    }
+
+    /// [`StageProgram::format_prefix_h16`]: `dst` = (block stride, first block offset).
+    fn format_prefix(&mut self, x: u32, out: &str, dims: (u32, u32, u32), src: (u32, u32, u32), dst: (u32, u32)) -> Result<u32, String> {
+        self.op(&[x], out, |p, output, deps| {
+            p.format_prefix_h16(x, deps, CopyColsF32Stage {
+                output,
+                items: dims.0,
+                rows: dims.1,
+                cols: dims.2,
+                in_item_stride: src.0,
+                in_stride: src.1,
+                in_offset: src.2,
+                out_item_stride: dst.0,
+                out_stride: 0,
+                out_offset: dst.1,
             })
         })
     }
@@ -949,8 +977,13 @@ impl Lowering<'_> {
         let cache = kv_cache(step, k);
         if let Mode::Prefill(v) = self.mode {
             // Both guidance halves' cached prompt rows (K | V columns) into blocks 2v, 2v + 1.
-            let row = pp * 2 * inner;
-            o.copy(qkv, &cache, (2, pp, 2 * inner), (t1 * 3 * inner, 3 * inner, inner), (row, 2 * inner, 2 * v * row))?;
+            if self.cfg.attn_h16 {
+                let block = u32::try_from(h16_prefix_floats(HEADS, pp)).map_err(|_| "s3gen voice cache overflows")?;
+                o.format_prefix(qkv, &cache, (2, pp, 2 * inner), (t1 * 3 * inner, 3 * inner, inner), (block, 2 * v * block))?;
+            } else {
+                let row = pp * 2 * inner;
+                o.copy(qkv, &cache, (2, pp, 2 * inner), (t1 * 3 * inner, 3 * inner, inner), (row, 2 * inner, 2 * v * row))?;
+            }
         }
         if self.mode == Mode::Cached {
             // Keys: the voice's cached prompt rows (block kvidx[item]), then the item's own.
@@ -973,7 +1006,7 @@ impl Lowering<'_> {
                     bias_head_stride: 0,
                     relative: false,
                     key_length_heads: 0,
-                    prefix: Some(AttentionPrefix { table, index: idx, blocks: nv2, rows: pp }),
+                    prefix: Some(AttentionPrefix { table, index: idx, blocks: nv2, rows: pp, h16: self.cfg.attn_h16 }),
                 })
             })?;
             return self.tblock_tail(o, &p, att, h, &hn, r);
