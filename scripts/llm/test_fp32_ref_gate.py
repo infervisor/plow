@@ -53,19 +53,24 @@ class KlTests(unittest.TestCase):
 class TeacherForceTests(unittest.TestCase):
     def test_exact_stack_one_request(self):
         cont = [5, 6, 7, 8]
-        free, _, pos, n = g.teacher_force(stack(lambda h: h[-1] + 1), [4], cont)
+        free, _, pos, n, _e = g.teacher_force(stack(lambda h: h[-1] + 1), [4], cont)
         self.assertEqual((free, n, sorted(pos)), (cont, 1, [0, 1, 2, 3]))
 
     def test_flip_restarts_on_reference_history(self):
         cont = [5, 6, 7, 8]
         # Disagrees only after history [4, 5]: emits 99 where the reference has 6.
         complete = stack(lambda h: 99 if h == [4, 5] else h[-1] + 1)
-        free, _, pos, n = g.teacher_force(complete, [4], cont)
+        free, _, pos, n, _e = g.teacher_force(complete, [4], cont)
         self.assertEqual(n, 2)
         self.assertEqual(free, [5, 99, 100, 101])
         self.assertEqual(sorted(pos), [0, 1, 2, 3])
         self.assertEqual(pos[1][0][0], 99)  # the flip position is scored on the exact history
         self.assertEqual(pos[2][0][0], 7)   # and the next one after restarting on the reference
+
+    def test_empty_reply_retried_and_counted(self):
+        replies = iter([([], [], ""), ([1, 2], [dist((1, 1.0)), dist((2, 1.0))], "")])
+        free, _, pos, n, empty = g.teacher_force(lambda ids, n: next(replies), [0], [1, 2])
+        self.assertEqual((free, sorted(pos), n, empty), ([1, 2], [0, 1], 2, 1))
 
     def test_short_reply_restarts(self):
         calls = []
@@ -73,7 +78,7 @@ class TeacherForceTests(unittest.TestCase):
             calls.append(len(ids))
             t = ids[-1] + 1
             return [t], [dist((t, 1.0))], ""
-        free, _, pos, n = g.teacher_force(complete, [0], [1, 2, 3])
+        free, _, pos, n, _e = g.teacher_force(complete, [0], [1, 2, 3])
         self.assertEqual((n, calls, sorted(pos)), (3, [1, 2, 3], [0, 1, 2]))
 
 
