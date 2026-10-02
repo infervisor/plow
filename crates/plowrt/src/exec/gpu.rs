@@ -623,27 +623,33 @@ fn prefill_moe_lt_capacity(blob: &DevBlob, roles: Option<&SegmentRoles>) -> u32 
         .unwrap_or(0)
 }
 
-/// Bytes the KV admission budget charges one row, and the block a request's rows round up to
-/// (`None`: linear). `None` for flat KV, which backs every slot at load and has no budget.
+/// Bytes the KV admission budget charges one row, the block a request's rows round up to
+/// (`None`: linear), and the fixed bytes each request commits (prefix-mode live rings). `None`
+/// for flat KV, which backs every slot at load and has no budget.
 fn kv_row_charge(
     vmm: Option<&VmmServe>,
     blob: &DevBlob,
     max_ctx: usize,
     batch: usize,
-) -> Option<(u64, Option<u64>)> {
+) -> Option<(u64, Option<u64>, u64)> {
     let vmm = vmm?;
+    let request_bytes = match &vmm.rings {
+        Some(rings) if vmm.kv.prefix_reuse() => Some(rings.slot_charge()),
+        Some(_) => None,
+        None => Some(0),
+    };
     // The budget is what is free AFTER the sliding rings were cudaMalloc'd, so a row may only be
     // charged for what will still be MAPPED for it: the full-attention head windows, a block at a
     // time. Charging every row the ring bytes as well (total KV / rows) cost Gemma-4-26B 122880
     // B/token against a real 20480, admitted ~10 of 16 requests at 4096 tokens, and the other 6
     // waited out a whole generation: TTFT 3-4.5 s at C16. With live rings every cache maps
     // lazily and the average stays the honest bound.
-    if vmm.rings.is_none() {
+    if let Some(request_bytes) = request_bytes {
         let geo = vmm.kv.geometry();
         let per_token = geo.full_layers.len() as u64 * 2 * geo.kvh_full as u64 * geo.row_bytes();
         let block_rows = vmm.kv.block_rows() as u64;
         if per_token > 0 && block_rows > 0 {
-            return Some((per_token, Some(block_rows)));
+            return Some((per_token, Some(block_rows), request_bytes));
         }
     }
     let kv_bytes: u64 = blob
@@ -653,7 +659,7 @@ fn kv_row_charge(
         .map(|t| t.bytes)
         .sum();
     let rows = (max_ctx as u64).checked_mul(batch as u64)?;
-    Some((kv_bytes.checked_div(rows).filter(|&b| b > 0)?, None))
+    Some((kv_bytes.checked_div(rows).filter(|&b| b > 0)?, None, 0))
 }
 
 /// `PLOW_PF_ATTN_GEMM` unset: the route's scratch comes out of the KV admission budget (sampled
@@ -668,17 +674,18 @@ fn attention_route_fits_kv(
     batch: usize,
     scratch: u64,
 ) -> bool {
-    let Some((per_token, block_rows)) = kv_row_charge(vmm, blob, max_ctx, batch) else {
+    let Some((per_token, block_rows, request_bytes)) = kv_row_charge(vmm, blob, max_ctx, batch)
+    else {
         return true;
     };
-    let Ok((free, _)) = be.mem_info() else {
+    let Ok((free, total)) = be.mem_info() else {
         return false;
     };
     let config = RuntimeConfig::get();
     let live = config.decode_max_rung.map_or(batch, |rung| batch.min(rung as usize)) as u64;
     let request = (max_ctx as u64).next_multiple_of(block_rows.unwrap_or(1));
-    let need = live * request * per_token;
-    let budget = (free.saturating_sub(scratch) as f64 * config.kv_admit_headroom()) as u64;
+    let need = live * (request * per_token + request_bytes);
+    let budget = config.kv_admit_budget(free.saturating_sub(scratch), total);
     let fits = budget >= need;
     tracing::info!(
         fits,
@@ -4031,9 +4038,10 @@ impl GpuEngine {
                         "live ring allocation enabled for capacity-tier KV"
                     );
                 }
-                if rings && !live {
+                let prefix_rings = !live && prefix_layout.is_some() && configured_rings == Some(true);
+                if rings && !live && !prefix_rings {
                     return Err(RuntimeError::Rejected(
-                        "live rings require PLOW_VMM_LIVE=1".into(),
+                        "live rings require PLOW_VMM_LIVE=1 or the VMM prefix layout".into(),
                     ));
                 }
                 if live {
@@ -4044,7 +4052,7 @@ impl GpuEngine {
                     }
                     Self::vmm_live_bringup(&be, &blob, rings, live_kv_manifest.as_ref()).map(Some)
                 } else {
-                    Ok(Self::vmm_bringup(&be, &blob, prefix_layout))
+                    Self::vmm_bringup(&be, &blob, prefix_layout, prefix_rings)
                 }
             };
             if let Some(tm) = load_tim.as_mut() {
@@ -6195,21 +6203,21 @@ impl GpuEngine {
         let kv_admission = be
             .mem_info()
             .ok()
-            .map(|(free, _total)| free)
-            .and_then(|free| {
-                let (per_token, block_rows) =
+            .and_then(|(free, total)| {
+                let (per_token, block_rows, request_bytes) =
                     kv_row_charge(vmm.as_ref(), &blob, max_ctx, batch)?;
-                let budget = (free as f64 * crate::config::RuntimeConfig::get().kv_admit_headroom())
-                    as u64;
+                let budget = crate::config::RuntimeConfig::get().kv_admit_budget(free, total);
                 tracing::info!(
                     per_token,
                     block_rows,
+                    request_mib = request_bytes >> 20,
                     free_gib = free as f64 / (1u64 << 30) as f64,
                     budget_gib = budget as f64 / (1u64 << 30) as f64,
                     max_rows = budget / per_token,
                     "CUDA KV admission budget"
                 );
-                let linear = crate::sched::admission::KvBudget::linear(per_token, budget);
+                let linear = crate::sched::admission::KvBudget::linear(per_token, budget)
+                    .with_request_bytes(request_bytes);
                 Some(match block_rows {
                     Some(block_rows) => linear
                         .with_block_groups(&[(block_rows, block_rows.saturating_mul(per_token))])

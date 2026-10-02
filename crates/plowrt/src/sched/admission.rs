@@ -310,6 +310,8 @@ pub struct KvBudget {
     pub budget_bytes: u64,
     pub block_groups: [KvBlockGroup; MAX_KV_BLOCK_GROUPS],
     pub block_group_count: u8,
+    /// Committed once per sequence whatever its length (a live sliding ring).
+    pub request_bytes: u64,
 }
 
 impl KvBudget {
@@ -319,7 +321,13 @@ impl KvBudget {
             budget_bytes,
             block_groups: [KvBlockGroup::default(); MAX_KV_BLOCK_GROUPS],
             block_group_count: 0,
+            request_bytes: 0,
         }
+    }
+
+    pub fn with_request_bytes(mut self, request_bytes: u64) -> Self {
+        self.request_bytes = request_bytes;
+        self
     }
 
     pub fn with_block_groups(mut self, groups: &[(u64, u64)]) -> Option<Self> {
@@ -339,14 +347,16 @@ impl KvBudget {
         Some(self)
     }
 
+    /// Bytes one sequence of `rows` rows commits.
     #[inline]
     pub fn bytes_for_rows(&self, rows: u64) -> u64 {
+        let fixed = if rows == 0 { 0 } else { self.request_bytes };
         if self.block_group_count == 0 {
-            return rows.saturating_mul(self.bytes_per_token);
+            return rows.saturating_mul(self.bytes_per_token).saturating_add(fixed);
         }
         self.block_groups[..self.block_group_count as usize]
             .iter()
-            .fold(0u64, |total, group| {
+            .fold(fixed, |total, group| {
                 // Charge every block the sequence will physically map. There is no per-sequence
                 // prepaid block to credit back: `SharedPrefix::new` reserves VA only and leaves
                 // every frontier at 0, and `free` is sampled after it, so the budget already
@@ -375,7 +385,7 @@ impl KvBudget {
     /// Saturating throughout: a budget this large only overflows if the geometry is nonsense,
     /// and refusing every request would be a worse failure than admitting one.
     pub fn fits(&self, committed_rows: u64, want_rows: u64) -> bool {
-        if self.block_group_count != 0 {
+        if self.block_group_count != 0 || self.request_bytes != 0 {
             return self.fits_requests([committed_rows, want_rows]);
         }
         committed_rows
@@ -386,7 +396,7 @@ impl KvBudget {
 
     /// Rows the budget can back in total. For logs and for the "cannot ever fit" case.
     pub fn max_rows(&self) -> u64 {
-        if self.block_group_count != 0 {
+        if self.block_group_count != 0 || self.request_bytes != 0 {
             let mut lo = 0u64;
             let mut hi = 1u64;
             while self.bytes_for_rows(hi) <= self.budget_bytes && hi < u64::MAX / 2 {
@@ -550,6 +560,23 @@ mod kv_budget_tests {
         assert!(b.fits_requests([4_097, 1]));
         // 2 + 2 blocks. Rounding the sum instead (8,194 rows -> 3 blocks) would have admitted it.
         assert!(!b.fits_requests([4_097, 4_097]));
+    }
+
+    /// Gemma-4 12B FP8 KV on an H100, live rings: a 320 MiB sliding ring per sequence plus 8 KiB
+    /// per full-attention row in 4096-row blocks.
+    #[test]
+    fn request_bytes_are_charged_once_per_sequence() {
+        let ring = 320 << 20;
+        let b = KvBudget::linear(8_192, 45 << 30)
+            .with_request_bytes(ring)
+            .with_block_groups(&[(4_096, 32 << 20)])
+            .unwrap();
+        assert_eq!(b.bytes_for_rows(0), 0);
+        assert_eq!(b.bytes_for_rows(15_128), ring + 4 * (32 << 20));
+        // 448 MiB per 15K sequence: 102 fit in 45 GiB, where the rows alone would back 360.
+        assert!(b.fits_requests(std::iter::repeat_n(15_128, 102)));
+        assert!(!b.fits_requests(std::iter::repeat_n(15_128, 103)));
+        assert!(b.fits(4_096, 4_096) && !KvBudget::linear(1, ring).with_request_bytes(ring).fits(1, 1));
     }
 }
 
