@@ -660,15 +660,15 @@ impl GpuEngine {
         Ok(self.pos[b] as usize)
     }
 
-    fn publish_boundary(&self, b: usize, p_a: u32) {
+    fn publish_boundary(&self, b: usize, p_a: u32) -> bool {
         let Some(v) = self.vmm.as_ref().filter(|v| v.kv.prefix_reuse()) else {
-            return;
+            return false;
         };
         let rows = self.pos[b];
         let toks = &self.seq_tokens[b];
         let g = v.kv.geometry();
         if rows == 0 || toks.len() != rows as usize || p_a == 0 {
-            return;
+            return false;
         }
         if !v.slide.is_empty() && rows - p_a > v.ring as u32 - g.window {
             tracing::info!(
@@ -681,15 +681,17 @@ impl GpuEngine {
                 diff = rows - p_a,
                 "vmm: publish_boundary skipped: ring overflow"
             );
-            return;
+            return false;
         }
         let snap_bytes = self.vmm_snap_bytes(p_a);
         if let Err(e) = v.kv.publish_at(b, toks, p_a, snap_bytes, |dst| {
             self.vmm_snap_copy(b, p_a, dst, true)
         }) {
             tracing::info!(error = %e, slot = b, p_a, "vmm: publish_boundary skipped");
+            false
         } else {
             tracing::info!(slot = b, p_a, snap_bytes, "vmm: published successfully");
+            true
         }
     }
 
@@ -735,7 +737,12 @@ impl GpuEngine {
             self.publish_boundary(b, p);
             p += step;
         }
-        self.publish_boundary(b, p_a);
+        if self.publish_boundary(b, p_a) && self.session_pin[b].is_some() {
+            let freed = v.kv.retire_superseded(toks, p_a);
+            if freed > 0 {
+                tracing::debug!(slot = b, p_a, freed, "vmm: session retired superseded snapshots");
+            }
+        }
     }
 
     /// Slot `b`'s prompt is prefilled and its prompt-end publish has run.

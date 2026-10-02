@@ -838,6 +838,10 @@ struct Snap {
     last_used: u64,
     referenced: bool,
     reusable_prompt: bool,
+    /// Attaches served; a session's own boundary is attached at most once (its next turn).
+    attaches: u32,
+    /// Published by a session's sequence ([`VmmKv::note_session`]).
+    session: bool,
 }
 
 struct Inner {
@@ -913,6 +917,8 @@ struct Inner {
     /// is being prefilled and its whole-block boundaries are about to be published
     /// ([`VmmKv::inflight_prefix`]).
     prefilling: Vec<bool>,
+    /// `seq` holds a session ([`VmmKv::note_session`]) until its next `begin_seq`.
+    session: Vec<bool>,
     /// Bytes of zero-ref blocks handed to the reclaimer thread ([`Job::Release`]) so far:
     /// released, but not yet visible to [`VmmOps::free_bytes`] (`trim_cache`).
     release_queued: u64,
@@ -1099,6 +1105,7 @@ impl VmmKv {
                 lead: vec![None; batch],
                 lead_seen: FxHashMap::default(),
                 prefilling: vec![false; batch],
+                session: vec![false; batch],
                 release_queued: 0,
             }),
             frontier: (0..batch).map(|_| AtomicU32::new(0)).collect(),
@@ -1316,15 +1323,66 @@ impl VmmKv {
     /// `seq` holds a session (`X-Session-Id`): its next turn extends these tokens, so its
     /// tailed boundaries publish on the first sighting ([`Self::enable_shared_publish`]).
     pub fn note_session(&self, seq: usize, tokens: &[u32]) {
+        let mut inner = self.shared.inner.lock();
+        inner.session[seq] = true;
         if !self.shared_publish || tokens.len() < LEAD_ROWS {
             return;
         }
-        let mut inner = self.shared.inner.lock();
         note_lead(&mut inner, seq, tokens);
         if let Some(key) = inner.lead[seq] {
             let seen = inner.lead_seen.entry(key).or_insert(0);
             *seen = (*seen).max(2);
         }
+    }
+
+    /// A session just published `tokens[..rows]`: its next turn attaches there (attach takes
+    /// the longest boundary), so its idle snapshots strictly below it on this chain are dead
+    /// weight. Free the tailed ones and the whole-block ones no request ever attached to
+    /// (a referenced block boundary is a proven shared prefix and stays). Shared KV blocks
+    /// are untouched. Without this a 10-turn session retains ~2 sliding-window snapshots per
+    /// turn plus one per block, and at high session counts LRU evicts every session's
+    /// boundary before its next turn. Returns the bytes freed.
+    pub fn retire_superseded(&self, tokens: &[u32], rows: u32) -> u64 {
+        if !self.prefix_reuse || rows as usize > tokens.len() {
+            return 0;
+        }
+        let s = &self.shared;
+        let br = s.block_rows as usize;
+        let chain = &tokens[..rows as usize];
+        let hashes = hash_blocks(chain, s.block_rows);
+        let mut inner = s.inner.lock();
+        let m = inner.cache.lookup(&hashes, &chain[..hashes.len() * br]);
+        inner.cache.release(&hashes, m.blocks);
+        let mut dead = Vec::new();
+        for blocks in 0..=m.blocks {
+            let node = blocks.checked_sub(1).map(|i| m.placed[i]);
+            let start = blocks * br;
+            if let Some(list) = inner.published.get_mut(&node) {
+                let mut i = 0;
+                while i < list.len() {
+                    let snap = &list[i];
+                    let superseded = snap.users == 0
+                        && snap.session
+                        && snap.attaches <= 1
+                        && snap.rows < rows
+                        && chain.get(start..snap.rows as usize) == Some(snap.tail.as_slice());
+                    if superseded {
+                        dead.push(list.swap_remove(i));
+                    } else {
+                        i += 1;
+                    }
+                }
+                if list.is_empty() {
+                    inner.published.remove(&node);
+                }
+            }
+        }
+        let mut freed = 0;
+        for snap in dead {
+            freed += snap.bytes;
+            free_snapshot(s, &mut inner, snap);
+        }
+        freed
     }
 
     /// The request in `seq` finished: queue its [`Job::CopyOut`] ([`Self::enable_release_retire`]).
@@ -1435,6 +1493,7 @@ impl VmmKv {
         release_prefix_hold(&mut inner, seq);
         inner.lead[seq] = None;
         inner.prefilling[seq] = false;
+        inner.session[seq] = false;
         let before = inner.stats;
         let t0 = std::time::Instant::now();
         let unmapped = if inner.jobs.is_some() {
@@ -1555,6 +1614,7 @@ impl VmmKv {
         snap.last_used = tick;
         snap.referenced = true;
         snap.reusable_prompt = true;
+        snap.attaches += 1;
         let attach = Attach { rows, snap_va: snap.va, snap_bytes: snap.bytes, segments: Vec::new() };
 
         // COMMIT the whole attach under the lock — slot table, refcounts,
@@ -2100,6 +2160,8 @@ impl VmmKv {
                 last_used: 0,
                 referenced: false,
                 reusable_prompt: false,
+                attaches: 0,
+                session: false,
             });
             // Counts toward the same budget whole blocks and boundary snapshots do, so
             // `trim_cache` (both the static `cache_cap` and pressure-eviction branches) sees
@@ -2202,6 +2264,7 @@ fn publish_locked(
         rows => rows,
     };
     let reusable_prompt = (rows as usize) < prompt_rows;
+    let session = inner.session[seq];
     let tail = &tokens[n_pub * s.block_rows as usize..rows as usize];
 
     let m = inner.cache.lookup(&hashes, tokens);
@@ -2291,7 +2354,7 @@ fn publish_locked(
         .and_then(|list| list.iter_mut().find(|snap| snap.rows == rows && snap.tail == tail))
     {
         snap.last_used = tick;
-        snap.reusable_prompt |= reusable_prompt;
+        snap.reusable_prompt |= reusable_prompt || session;
         snapshot
     } else {
         let va = snapshot.expect("preflight cannot commit a missing snapshot");
@@ -2303,7 +2366,11 @@ fn publish_locked(
             users: 0,
             last_used: tick,
             referenced: false,
-            reusable_prompt,
+            // A session's output boundary is its next turn's attach point, not a
+            // replay-only snapshot to reclaim first (`evict_one`).
+            reusable_prompt: reusable_prompt || session,
+            attaches: 0,
+            session,
         });
         inner.stats.snapshot_bytes += snap_bytes;
         inner.stats.cache_bytes += snap_bytes;
@@ -4496,6 +4563,35 @@ mod tests {
         p.begin_seq(0);
         p.ensure_rows(1, 1).unwrap();
         assert_eq!(p.try_attach(1, &pr).unwrap().expect("session tail published").rows, 20);
+    }
+
+    /// A session keeps only its newest boundary: publishing it frees the session's earlier
+    /// idle snapshots on the chain; a non-session snapshot on the chain stays.
+    #[test]
+    fn session_retires_superseded_snapshots() {
+        let ops = Arc::new(MockVmm::default());
+        let p = uniform_pool(ops.clone());
+        let pr = prompt(30);
+        assert!(p.try_attach(0, &pr).unwrap().is_none());
+        p.ensure_rows(0, 30).unwrap();
+        p.publish_at(0, &pr, 12, 4, |_| Ok(())).unwrap();
+        p.begin_seq(0);
+        p.ensure_rows(1, 1).unwrap();
+        assert_eq!(p.try_attach(1, &pr).unwrap().expect("shared lead").rows, 12);
+        p.finish_attach(1);
+        p.ensure_rows(1, 30).unwrap();
+        p.note_session(1, &pr);
+        p.publish_at(1, &pr, 20, 4, |_| Ok(())).unwrap();
+        p.publish_at(1, &pr, 28, 4, |_| Ok(())).unwrap();
+        assert_eq!(p.stats().snapshot_bytes, 12);
+        assert_eq!(p.retire_superseded(&pr, 28), 4, "only the session's 20-row boundary");
+        assert_eq!(p.stats().snapshot_bytes, 8);
+        p.begin_seq(1);
+        p.ensure_rows(0, 1).unwrap();
+        assert_eq!(p.try_attach(0, &pr[..26]).unwrap().expect("shared lead stays").rows, 12);
+        p.begin_seq(0);
+        p.ensure_rows(0, 1).unwrap();
+        assert_eq!(p.try_attach(0, &pr).unwrap().expect("newest boundary").rows, 28);
     }
 
     /// A whole-block boundary has no tail: it is what the second request sharing a prefix
