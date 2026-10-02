@@ -229,13 +229,15 @@ pub fn load_packet_runtime(path: &Path, requested: &str) -> Result<LoadedPacketR
                 runtime: Box::new(crate::exec::apple::MetalEngine::load_packet(path)?),
             });
         }
-        #[cfg(all(feature = "cpu", not(all(feature = "metal", target_os = "macos"))))]
+        #[cfg(feature = "cuda")]
+        {
+            if let Ok(loaded) = load_packet_runtime(path, "cuda") {
+                return Ok(loaded);
+            }
+        }
+        #[cfg(feature = "cpu")]
         {
             return load_packet_runtime(path, "cpu");
-        }
-        #[cfg(all(feature = "cuda", not(feature = "cpu"), not(all(feature = "metal", target_os = "macos"))))]
-        {
-            return load_packet_runtime(path, "cuda");
         }
         #[cfg(not(any(feature = "cpu", feature = "cuda", all(feature = "metal", target_os = "macos"))))]
         {
