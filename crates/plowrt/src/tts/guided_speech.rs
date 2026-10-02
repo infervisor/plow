@@ -645,6 +645,7 @@ impl GuidedSpeech {
                 raw_tokens: true,
                 session,
                 turn: request.turn_key.clone(),
+                continuing: false,
                 speech: Some(Box::new(SpeechJob {
                     overlay: cond,
                     overlay_pos,

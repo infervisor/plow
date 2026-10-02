@@ -233,6 +233,9 @@ pub struct JobOpts {
     pub session: Option<Box<SessionTicket>>,
     /// The voice turn this request serves ([`crate::serve::turns`]).
     pub turn: Option<crate::serve::turns::TurnKey>,
+    /// A later turn of a session that already had one: seated ahead of requests opening a
+    /// session, until either has waited [`crate::serve::cosched::max_wait`].
+    pub continuing: bool,
 }
 
 /// Queue priority. Orders the waiting queue and serial prefill, and scales the queue TTL.
@@ -1155,6 +1158,7 @@ pub fn spawn(
                 capacity
             };
 
+            let mut queued_behind = false;
             // Non-blocking drain: fill every idle slot the queue can serve.
             // A short hold when we still have empty slots and no live work
             // yet keeps us from waking up on a single arrival amid a burst.
@@ -1211,18 +1215,25 @@ pub fn spawn(
                                 match msg {
                                     MuxMsg::Job(job, arrived) => {
                                         note_arrival(job.arrived, &mut load, &metrics);
-                                        if let Some(j) = admit_session(
-                                            &mut slots,
-                                            admission_limit,
-                                            job,
-                                            arrived,
-                                            arena.as_ref(),
-                                            &metrics,
-                                            &health,
-                                            kv_budget,
-                                            downstream.full(),
-                                            &mut retention,
-                                        ) {
+                                        // Behind anything already waiting: `drain_waiting` orders it.
+                                        let held = if waiting.is_empty() {
+                                            admit_session(
+                                                &mut slots,
+                                                admission_limit,
+                                                job,
+                                                arrived,
+                                                arena.as_ref(),
+                                                &metrics,
+                                                &health,
+                                                kv_budget,
+                                                downstream.full(),
+                                                &mut retention,
+                                            )
+                                        } else {
+                                            queued_behind = true;
+                                            Some((job, arrived))
+                                        };
+                                        if let Some(j) = held {
                                             Metrics::inc(&metrics.queued_requests);
                                             waiting.push_back(j);
                                         }
@@ -1256,18 +1267,24 @@ pub fn spawn(
                             match msg {
                                 MuxMsg::Job(job, arrived) => {
                                     note_arrival(job.arrived, &mut load, &metrics);
-                                    if let Some(j) = admit_session(
-                                        &mut slots,
-                                        admission_limit,
-                                        job,
-                                        arrived,
-                                        arena.as_ref(),
-                                        &metrics,
-                                        &health,
-                                        kv_budget,
-                                        downstream.full(),
-                                        &mut retention,
-                                    ) {
+                                    let held = if waiting.is_empty() {
+                                        admit_session(
+                                            &mut slots,
+                                            admission_limit,
+                                            job,
+                                            arrived,
+                                            arena.as_ref(),
+                                            &metrics,
+                                            &health,
+                                            kv_budget,
+                                            downstream.full(),
+                                            &mut retention,
+                                        )
+                                    } else {
+                                        queued_behind = true;
+                                        Some((job, arrived))
+                                    };
+                                    if let Some(j) = held {
                                         Metrics::inc(&metrics.queued_requests);
                                         waiting.push_back(j);
                                     }
@@ -1282,6 +1299,23 @@ pub fn spawn(
                         Err(_) => break,
                     }
                 }
+            }
+            // An arrival never takes a slot ahead of an older waiter: it joined the queue, which
+            // is drained again in its seat order.
+            if std::mem::take(&mut queued_behind) {
+                drain_waiting_session(
+                    &mut waiting,
+                    &mut slots,
+                    admission_limit,
+                    Instant::now(),
+                    cfg.slo_ms,
+                    arena.as_ref(),
+                    &metrics,
+                    &health,
+                    kv_budget,
+                    downstream.full(),
+                    &mut retention,
+                );
             }
             // A full slot table leaves arrivals in the channel in arrival order; in `waiting`,
             // `drain_waiting` seats them by class as slots free.
@@ -1764,6 +1798,21 @@ fn queue_verdict(closed: bool, waited_ms: f64, slo_ms: f64, class: JobClass) -> 
     }
 }
 
+/// Seat order of a queued request: class first; within a class, every request that has waited
+/// `bound` oldest first, then continuing session turns, then requests opening a session, each by
+/// arrival. A continuing turn overtakes a new session by at most `bound`.
+#[inline]
+fn seat_order(class: JobClass, continuing: bool, arrived: Instant, now: Instant, bound: std::time::Duration) -> (JobClass, u8, Instant) {
+    let tier = if now.saturating_duration_since(arrived) >= bound {
+        0
+    } else if continuing {
+        1
+    } else {
+        2
+    };
+    (class, tier, arrived)
+}
+
 #[inline]
 fn waited_ms(now: Instant, arrived: Instant) -> f64 {
     now.saturating_duration_since(arrived).as_secs_f64() * 1e3
@@ -1852,9 +1901,11 @@ fn drain_waiting_session(
         }
     });
 
-    // Class order, arrival order within a class (a stable sort of an arrival-ordered queue).
-    if waiting.iter().any(|(job, _)| job.opts.class != JobClass::Normal) {
-        waiting.make_contiguous().sort_by_key(|(job, _)| job.opts.class);
+    let bound = crate::serve::cosched::max_wait();
+    let order = |(job, arrived): &(Job, Instant)| seat_order(job.opts.class, job.opts.continuing, *arrived, now, bound);
+    let queue = waiting.make_contiguous();
+    if !queue.is_sorted_by_key(order) {
+        queue.sort_by_key(order);
     }
     let aging = queue_aging_ms(slo_ms);
     let mut still: std::collections::VecDeque<(Job, Instant)> =
@@ -2488,7 +2539,10 @@ fn run_one_tick(
                     let prefill_capacity = rows as usize - feeds.len();
                     let mut pack = Vec::<(usize, usize, usize)>::new();
                     let mut remaining = prefill_capacity;
-                    for i in 0..slots.len().min(cap) {
+                    let mut oldest_first: smallvec::SmallVec<[usize; 64]> =
+                        (0..slots.len().min(cap)).filter(|&i| slots[i].is_some()).collect();
+                    oldest_first.sort_unstable_by_key(|&i| slots[i].as_ref().map(|s| s.arrived));
+                    for i in oldest_first {
                         if remaining == 0 {
                             break;
                         }
@@ -5051,7 +5105,7 @@ fn gpu_prefill_batched_pass(
             crate::sched::step::Tick {
                 cap_rows: u32::try_from(per_launch).unwrap_or(u32::MAX),
                 packing: true,
-                rotate: false,
+                rotate: crate::config::RuntimeConfig::get().pf_rotate(),
                 turn: e.prefill_turn(),
                 slots: cap.min(slots.len()),
             },
@@ -6947,7 +7001,42 @@ mod tests {
         assert_eq!(slots[0].as_ref().unwrap().prompt_ids.len(), 20);
         assert!(matches!(rx_b.try_recv(), Ok(StreamChunk::Err(_))));
         let left: Vec<_> = waiting.iter().map(|(j, _)| j.prompt_ids.len()).collect();
-        assert_eq!(left, [10, 40]);
+        assert_eq!(left, [40, 10], "oldest first within a class");
+    }
+
+    /// A continuing session turn takes the slot ahead of a session opening, but only until the
+    /// opening request has waited the bound; past it, arrival order decides.
+    #[test]
+    fn continuing_turns_go_first_within_the_wait_bound() {
+        let now = Instant::now();
+        let bound = crate::serve::cosched::max_wait();
+        let seat = |opening_waited: std::time::Duration| {
+            let metrics = Arc::new(Metrics::default());
+            let mut slots: Vec<Option<Slot>> = std::iter::repeat_with(|| None).take(1).collect();
+            let (opening, _rx_o) = queued_job(10, now - opening_waited);
+            let ((mut next, t), _rx_c) = queued_job(20, now);
+            next.opts.continuing = true;
+            let mut waiting: std::collections::VecDeque<_> = [opening, (next, t)].into();
+            metrics.queued_requests.store(2, Ordering::Relaxed);
+            drain_waiting(
+                &mut waiting, &mut slots, 1, now, 250.0, None, &metrics, &EngineHealth::Healthy, None,
+                false,
+            );
+            slots[0].as_ref().unwrap().prompt_ids.len()
+        };
+        assert_eq!(seat(bound / 2), 20, "the continuing turn overtakes a young opening");
+        assert_eq!(seat(bound + std::time::Duration::from_millis(1)), 10, "never past the bound");
+
+        let o = |continuing, ago_ms| {
+            seat_order(JobClass::Normal, continuing, now - std::time::Duration::from_millis(ago_ms), now, bound)
+        };
+        let aged = bound.as_millis() as u64 + 10;
+        assert!(o(false, aged + 5) < o(false, aged), "aged requests are oldest first");
+        assert!(o(false, aged) < o(true, 0));
+        assert!(o(true, 0) < o(false, 500));
+        assert!(o(false, 500) < o(false, 100));
+        let critical = seat_order(JobClass::Critical, false, now, now, bound);
+        assert!(critical < o(false, aged), "class still comes first");
     }
 
     fn cfg_job(prompt: usize) -> ((Job, Instant), crate::serve::stream::ChunkReceiver) {
