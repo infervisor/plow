@@ -6,6 +6,7 @@ pub mod chat;
 pub mod completion;
 pub mod config;
 pub mod cosched;
+pub mod deadlines;
 #[cfg(feature = "cpu")]
 pub mod cpu_serve;
 /// The loaded device engine behind a slug, as one type over both backends —
@@ -24,6 +25,7 @@ pub mod logprobs;
 pub mod models;
 pub mod mux;
 pub mod openai;
+pub mod overload;
 pub mod placement;
 pub mod reasoning;
 pub mod stream;
@@ -32,6 +34,7 @@ pub mod session;
 mod step_lowering_tests;
 pub mod template;
 pub mod tokenize;
+pub mod turns;
 
 use std::sync::Arc;
 
@@ -935,6 +938,7 @@ pub fn app(state: Arc<AppState>) -> Router {
         .route("/healthz", get(healthz))
         .route("/metrics", get(metrics_handler))
         .route("/trace", get(trace_handler))
+        .route("/v1/turns/:session", get(turns::session_turns))
         .layer(axum::extract::DefaultBodyLimit::max(MAX_BODY_BYTES))
         .with_state(Arc::clone(&state));
     #[cfg(feature = "cuda")]

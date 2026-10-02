@@ -60,6 +60,12 @@ clap = { version = "4", features = ["derive", "env"] }
 futures = "0.3"
 hound = "3.5"
 rustfft = "6"
+# Ids the server mints (request, session, turn, span; `serve::session`): sortable 64-bit, tagged.
+svid = { version = "0.5.4", default-features = false, features = ["bits-high-rand"] }
+# The voice turn table (`serve::turns`): TTL + size-bounded concurrent cache.
+svcache = "0.1.1"
+# The random half of a minted W3C trace id; already in the lock through svid.
+rand = "0.9"
 
 # Optional: real tokenizer + checkpoint reader. Off by default so the skeleton
 # builds fast and offline; a byte-fallback tokenizer stands in when absent.
@@ -141,6 +147,10 @@ gguf = ["dep:gguf-rs-lib"]
 # In-process adapter for NVIDIA NeMo-Speech's stable ASR C ABI. The selected
 # runtime library supplies its own CPU/CUDA/Metal kernels at deployment time.
 nemo-asr = ["dep:libloading", "gguf"]
+
+[lints.rust]
+# `#[derive(svid::Svid)]` expands svid's own optional features as `cfg(feature = ...)` here.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("serde", "diesel", "ts", "autosurgeon", "strum"))'] }
 
 [dev-dependencies]
 tokio-tungstenite = "0.24"

@@ -111,6 +111,25 @@ pub struct RuntimeConfig {
     #[arg(long = "tts-turn-batch", env = "PLOW_TTS_TURN_BATCH", hide = true, default_value_t = 16, global = true)]
     pub tts_turn_batch: usize,
 
+    /// Under `--co-sched deadline`, a vocoder render yields the device between CFM steps to a
+    /// waiter whose slack is more than this many ms below the render's own.
+    #[arg(long = "render-yield-margin-ms", env = "PLOW_RENDER_YIELD_MARGIN_MS", hide = true, default_value_t = 5, global = true)]
+    pub render_yield_margin_ms: u64,
+
+    /// Overload control (`serve::overload`): degrade, then shed new sessions with 429, on
+    /// sustained deadline misses. Unset = on under `--co-sched deadline` only.
+    #[arg(long = "overload", env = "PLOW_OVERLOAD", value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", hide = true, global = true)]
+    pub overload: Option<bool>,
+
+    /// Overload control's sliding window of deadline outcomes, ms.
+    #[arg(long = "overload-window-ms", env = "PLOW_OVERLOAD_WINDOW_MS", hide = true, default_value_t = 5000, global = true)]
+    pub overload_window_ms: u64,
+
+    /// Missed-deadline fractions entering overload levels 1, 2 and 3 (comma-separated); a level
+    /// is left below half its entry fraction.
+    #[arg(long = "overload-miss", env = "PLOW_OVERLOAD_MISS", hide = true, default_value = "0.05,0.1,0.2", global = true)]
+    pub overload_miss: String,
+
     /// Streams of a guided speech model render windows (new tokens + left context) on the
     /// vocoder packet's cached-prompt capacities when it has them; off: every chunk re-renders
     /// the stream's whole prefix with the prompt.
@@ -133,6 +152,20 @@ pub struct RuntimeConfig {
     /// least recently used retained slot below it.
     #[arg(long = "session-slack", env = "PLOW_SESSION_SLACK", default_value_t = 0, global = true)]
     pub session_slack: usize,
+
+    /// Voice turn budget, ms: end of user speech to first agent audio, when the client sends no
+    /// `X-Turn-Budget-Ms` (`serve::turns`).
+    #[arg(long = "turn-budget-ms", env = "PLOW_TURN_BUDGET_MS", default_value_t = 1500, global = true)]
+    pub turn_budget_ms: u64,
+
+    /// Stage targets, ms, for `Server-Timing` slack and `plowrt_deadline_slack_seconds`: ASR final
+    /// transcript, LLM first token, TTS first audio, each from its own request's arrival.
+    #[arg(long = "turn-asr-final-ms", env = "PLOW_TURN_ASR_FINAL_MS", default_value_t = 500, global = true)]
+    pub turn_asr_final_ms: u64,
+    #[arg(long = "turn-llm-ttft-ms", env = "PLOW_TURN_LLM_TTFT_MS", default_value_t = 800, global = true)]
+    pub turn_llm_ttft_ms: u64,
+    #[arg(long = "turn-tts-ttfa-ms", env = "PLOW_TURN_TTS_TTFA_MS", default_value_t = 800, global = true)]
+    pub turn_tts_ttfa_ms: u64,
 
     /// Tokenize prompts without computing offsets (same ids).
     #[arg(long = "encode-fast", env = "PLOW_ENCODE_FAST", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
@@ -309,6 +342,11 @@ pub struct RuntimeConfig {
     /// derived from the objective and backend (`serve::policy::co_sched`).
     #[arg(long = "co-sched", env = "PLOW_CO_SCHED", hide = true, global = true)]
     pub co_sched: Option<crate::serve::cosched::CoSched>,
+
+    /// Expert: `--co-sched deadline` starvation bound, ms: a model waiting this long for the
+    /// device is due now. Unset = `serve::cosched::MAX_WAIT` (2000).
+    #[arg(long = "cosched-max-wait-ms", env = "PLOW_COSCHED_MAX_WAIT_MS", hide = true, global = true)]
+    pub cosched_max_wait_ms: Option<u32>,
 
     /// Directories under which `POST /v1/models/load` may take an assets dir.
     /// Repeatable; `PLOW_MODELS_ROOT` takes a `:`-separated list.

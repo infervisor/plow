@@ -145,6 +145,9 @@ impl SamplingFields {
 pub struct ChatRequest {
     pub model: String,
     pub messages: Vec<Message>,
+    /// `session_id` / `prompt_cache_key` / `metadata` / `trace` ([`crate::serve::session::RequestIds::apply_body`]).
+    #[serde(flatten)]
+    pub route: crate::serve::session::RouteFields,
     #[serde(default)]
     pub stream: bool,
     /// OpenAI renamed this field to `max_completion_tokens` for chat
@@ -240,6 +243,8 @@ impl StopSpec {
 #[derive(Clone, Debug, Deserialize)]
 pub struct CompletionRequest {
     pub model: String,
+    #[serde(flatten)]
+    pub route: crate::serve::session::RouteFields,
     /// OpenAI allows `str | [str] | [int] | [[int]]`. A bare `String` here made
     /// `client.completions.create(prompt=[...])` fail with a 422 before any
     /// handler ran, so accept the array forms and refuse BATCHES explicitly.

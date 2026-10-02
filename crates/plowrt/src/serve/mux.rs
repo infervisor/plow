@@ -231,6 +231,8 @@ pub struct JobOpts {
     pub speech: Option<Box<SpeechJob>>,
     /// `X-Session-Id`: resume the session's retained rows, and retain this request's.
     pub session: Option<Box<SessionTicket>>,
+    /// The voice turn this request serves ([`crate::serve::turns`]).
+    pub turn: Option<crate::serve::turns::TurnKey>,
 }
 
 /// Queue priority. Orders the waiting queue and serial prefill, and scales the queue TTL.
@@ -264,7 +266,7 @@ impl JobClass {
 /// measured nothing at c1-c32: adaptive multistep already runs single steps while one is likely.)
 #[cfg(feature = "cuda")]
 struct QuantumCut {
-    turn: Option<(Arc<crate::serve::cosched::DeviceTurn>, crate::serve::cosched::Urgency)>,
+    turn: Option<(Arc<crate::serve::cosched::DeviceTurn>, crate::serve::cosched::Due)>,
 }
 #[cfg(not(feature = "cuda"))]
 struct QuantumCut;
@@ -272,7 +274,7 @@ struct QuantumCut;
 #[cfg(feature = "cuda")]
 impl QuantumCut {
     fn fire(&self) -> bool {
-        self.turn.as_ref().is_some_and(|(dt, mine)| dt.outranked(*mine))
+        self.turn.as_ref().is_some_and(|(dt, mine)| dt.outranked_due(*mine))
     }
 }
 
@@ -284,28 +286,107 @@ const CRITICAL_SPAN: std::time::Duration = std::time::Duration::from_millis(1000
 /// first chunks. Past both this and [`CRITICAL_SPAN`] it is throughput.
 const CRITICAL_TOKENS: usize = 48;
 
-/// The most urgent work this model holds, for [`crate::serve::cosched::CoSched::Deadline`]: an
-/// ASR final first; then a prompt still owed its first token, or a speech stream's start, is a
-/// deadline; decode is throughput; bulk-only work (partial transcripts) waits.
-fn turn_urgency(slots: &[Option<Slot>], waiting: &std::collections::VecDeque<(Job, Instant)>) -> crate::serve::cosched::Urgency {
+/// The class of one job's work, for [`crate::serve::cosched::CoSched::Deadline`] outside a voice
+/// turn: an ASR final first; then a prompt still owed its first token, or a speech stream's start,
+/// is a deadline; decode is throughput; bulk work (partial transcripts) waits.
+fn job_urgency(class: JobClass, step: usize, arrived: Instant, now: Instant) -> crate::serve::cosched::Urgency {
     use crate::serve::cosched::Urgency;
-    let now = Instant::now();
-    let live = slots.iter().flatten().map(|s| (s.class, s.step, s.arrived));
-    let queued = waiting.iter().map(|(j, _)| (j.opts.class, 0, j.arrived));
-    live.chain(queued).fold(Urgency::Bulk, |best, (class, step, arrived)| {
-        let u = match class {
-            JobClass::Bulk => Urgency::Bulk,
-            JobClass::Final => Urgency::Final,
-            _ if step == 0 => Urgency::Deadline,
-            JobClass::Critical
-                if step < CRITICAL_TOKENS || now.saturating_duration_since(arrived) < CRITICAL_SPAN =>
-            {
-                Urgency::Deadline
-            }
-            _ => Urgency::Normal,
-        };
-        best.min(u)
-    })
+    match class {
+        JobClass::Bulk => Urgency::Bulk,
+        JobClass::Final => Urgency::Final,
+        _ if step == 0 => Urgency::Deadline,
+        JobClass::Critical if step < CRITICAL_TOKENS || now.saturating_duration_since(arrived) < CRITICAL_SPAN => {
+            Urgency::Deadline
+        }
+        _ => Urgency::Normal,
+    }
+}
+
+/// When this model's next tick is due on the device ([`crate::serve::cosched::CoSched::Deadline`]):
+/// the best-ranked job ([`crate::serve::cosched::Due::rank`]). Jobs outside a voice turn keep the class deadline (the most urgent class,
+/// anchored at the oldest first output or ASR final of that class; ongoing work from now). Turn
+/// jobs take their stage deadline ([`crate::serve::deadlines`]) from the times cached at
+/// admission; a queued turn job looks its turn up, the first [`QUEUED_TURN_LOOKUPS`] only (the
+/// queue head is all the next tick can admit). Costs come from [`crate::sched::cost`] for
+/// `model`, this model's cost-model id.
+fn tick_due(
+    slots: &[Option<Slot>],
+    waiting: &std::collections::VecDeque<(Job, Instant)>,
+    model: usize,
+    now: Instant,
+) -> crate::serve::cosched::Due {
+    use crate::sched::cost::{estimate_id, Op};
+    use crate::serve::cosched::{Due, Urgency};
+    let width = slots.iter().flatten().count();
+    let tick = estimate_id(model, Op::DecodeTick { width });
+    let legacy = || {
+        let live = slots.iter().flatten().filter(|s| s.turn.is_none()).map(|s| (s.class, s.step, s.arrived));
+        live.chain(waiting.iter().filter(|(j, _)| j.opts.turn.is_none()).map(|(j, _)| (j.opts.class, 0, j.arrived)))
+    };
+    let mut best = legacy().map(|(class, step, arrived)| job_urgency(class, step, arrived, now)).min().map(|u| {
+        let since = legacy()
+            .filter(|&(class, step, arrived)| (step == 0 || class == JobClass::Final) && job_urgency(class, step, arrived, now) == u)
+            .map(|(_, _, arrived)| arrived)
+            .fold(now, Instant::min);
+        Due { cost: tick, ..Due::from_urgency(u, since) }
+    });
+    let mut ests = None;
+    let raw_first = |raw_tokens: bool, speech: Option<&SpeechJob>| {
+        raw_tokens.then(|| speech.map_or(0, |sp| sp.first_tokens)).map(|n| if n == 0 { CRITICAL_TOKENS } else { n })
+    };
+    let mut tighter = |class: JobClass, raw_first: Option<usize>, step: usize, rows: usize, arrived: Instant, t: &crate::serve::turns::TurnTimes| {
+        let e = ests.get_or_insert_with(crate::serve::deadlines::ests);
+        let prefill = if rows > 0 { estimate_id(model, Op::Prefill { rows }) } else { std::time::Duration::ZERO };
+        let d = turn_job_due(model, class, raw_first, step, prefill, tick, arrived, t, e, now);
+        if best.is_none_or(|b| d.rank(now) < b.rank(now)) {
+            best = Some(d);
+        }
+    };
+    for s in slots.iter().flatten() {
+        if let Some(t) = &s.turn {
+            let rows = if s.step == 0 { s.prompt_ids.len().saturating_sub(s.pf_pos) } else { 0 };
+            tighter(s.class, raw_first(s.raw_tokens, s.speech.as_deref()), s.step, rows, s.arrived, t);
+        }
+    }
+    for (j, _) in waiting.iter().filter(|(j, _)| j.opts.turn.is_some()).take(QUEUED_TURN_LOOKUPS) {
+        if let Some(t) = j.opts.turn.as_ref().and_then(|k| crate::serve::turns::table().times(k)) {
+            tighter(j.opts.class, raw_first(j.opts.raw_tokens, j.opts.speech.as_deref()), 0, j.prompt_ids.len(), j.arrived, &t);
+        }
+    }
+    best.unwrap_or_else(|| Due { cost: tick, ..Due::from_urgency(Urgency::Bulk, now) })
+}
+
+/// Queued turn jobs [`tick_due`] looks up per tick.
+const QUEUED_TURN_LOOKUPS: usize = 2;
+
+/// One turn job's stage and `Due`, without model names: an ASR final or partial by class, a
+/// speech LM (raw-token stream, `raw_first`: tokens to its first audio) by its first chunk, else
+/// an LLM prompt or its decode.
+#[allow(clippy::too_many_arguments)]
+fn turn_job_due(
+    model: usize,
+    class: JobClass,
+    raw_first: Option<usize>,
+    step: usize,
+    prefill: std::time::Duration,
+    tick: std::time::Duration,
+    arrived: Instant,
+    t: &crate::serve::turns::TurnTimes,
+    e: &crate::serve::deadlines::Ests,
+    now: Instant,
+) -> crate::serve::cosched::Due {
+    use crate::serve::deadlines::{claim_stage, partial, stage_cost, stage_due};
+    use crate::serve::turns::Stage;
+    let (stage, since) = match class {
+        JobClass::Bulk => return partial(arrived, stage_cost(Stage::AsrFinal, prefill, tick, e)),
+        JobClass::Final => (Stage::AsrFinal, arrived),
+        _ if raw_first.is_some_and(|n| step < n) => (Stage::TtsFirst, arrived),
+        _ if raw_first.is_some() => (Stage::TtsStream, now),
+        _ if step == 0 => (Stage::LlmFirst, arrived),
+        _ => (Stage::LlmDecode, now),
+    };
+    claim_stage(stage, model);
+    stage_due(stage, t, e, stage_cost(stage, prefill, tick, e), since)
 }
 
 /// How long a raw-token consumer may hold its slot parked before the request is cut.
@@ -333,6 +414,9 @@ pub struct SpeechJob {
     /// Classifier-free guidance: the request also runs unconditionally on the partner slot
     /// (owner + 1), and each token is drawn from the combined logits on the host.
     pub cfg: Option<CfgJob>,
+    /// A voice turn's stream: tokens its first audio renders from. Its ticks are the turn's first
+    /// audio until then and stream decode after, so the first render outranks them (0: unknown).
+    pub first_tokens: usize,
 }
 
 /// The unconditional member of a CFG pair and the guided sampling chain.
@@ -368,6 +452,9 @@ pub struct ModelMux {
     /// from the message channel (see [`ModelMux::preempt`]).
     preempt: Arc<std::sync::atomic::AtomicBool>,
     preempt_notify: Arc<tokio::sync::Notify>,
+    /// A non-bulk job was sent: a dispatcher waiting for its device turn (`--co-sched deadline`)
+    /// re-queues with its new most urgent work instead of the `Due` it queued with.
+    arrival_notify: Arc<tokio::sync::Notify>,
     /// Requests past model lookup whose job is not on `tx` yet (still tokenizing).
     ingress: Arc<std::sync::atomic::AtomicUsize>,
 }
@@ -494,8 +581,14 @@ impl ModelMux {
         Metrics::inc(&self.metrics.queued_requests);
         // Released before the send: a dispatcher that dequeues this job must not see it as a peer.
         drop(ingress);
+        let urgent = job.opts.class != JobClass::Bulk;
         match self.tx.try_send(MuxMsg::Job(job, arrived)) {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                if urgent {
+                    self.arrival_notify.notify_one();
+                }
+                Ok(())
+            }
             Err(mpsc::error::TrySendError::Full(MuxMsg::Job(job, _))) => {
                 self.metrics.queued_requests.fetch_sub(1, Ordering::Relaxed);
                 Metrics::inc(&self.metrics.rejected);
@@ -517,6 +610,7 @@ impl ModelMux {
         self.metrics.serving.max_tokens.tokens(job.gen.max_tokens);
         Metrics::inc(&self.metrics.queued_requests);
         let arrived = job.arrived;
+        let urgent = job.opts.class != JobClass::Bulk;
         self.tx.send(MuxMsg::Job(job, arrived)).await.map_err(|mpsc::error::SendError(msg)| {
             self.metrics.queued_requests.fetch_sub(1, Ordering::Relaxed);
             Metrics::inc(&self.metrics.rejected);
@@ -524,7 +618,11 @@ impl ModelMux {
                 MuxMsg::Job(job, _) => SubmitError::Closed(job),
                 MuxMsg::Drain(_) => unreachable!("sent a job"),
             }
-        })
+        })?;
+        if urgent {
+            self.arrival_notify.notify_one();
+        }
+        Ok(())
     }
 
     /// Initiate graceful drain: no new requests accepted, all live slots run to
@@ -596,6 +694,8 @@ struct Slot {
     stop_pending: String,
     class: JobClass,
     raw_tokens: bool,
+    /// The voice turn's times, looked up once at admission ([`tick_due`]).
+    turn: Option<crate::serve::turns::TurnTimes>,
     speech: Option<Box<SpeechJob>>,
     /// Set on the owner of a CFG pair; its partner slot (owner + 1) stays `None` in the table
     /// and is reserved while the owner lives (see [`slot_free`]).
@@ -664,6 +764,8 @@ pub fn spawn(
     let preempt_seen = Arc::clone(&preempt_flag);
     let preempt_notify = Arc::new(tokio::sync::Notify::new());
     let preempt_wake = Arc::clone(&preempt_notify);
+    let arrival_notify = Arc::new(tokio::sync::Notify::new());
+    let arrival_wake = Arc::clone(&arrival_notify);
     let ingress = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let ingress_seen = Arc::clone(&ingress);
     let metrics = state.model_metrics(&slug);
@@ -878,6 +980,7 @@ pub fn spawn(
         // model parks, so an idle model never sits on a device its co-tenant is
         // waiting for.
         let mut turn = crate::serve::cosched::Turn::default();
+        let cost_id = crate::sched::cost::id(&slug);
         #[cfg(not(any(feature = "cuda", feature = "hsa", feature = "cpu")))]
         let has_gpu = false;
         // Dedicated engine/submission thread for GPU models: every tick runs
@@ -1274,10 +1377,13 @@ pub fn spawn(
             // One tick: advance every live slot by N tokens (multi-step).
             // Handed to the blocking pool so the dispatcher task stays hot
             // for arrivals.
-            let urgency = turn_urgency(&slots, &waiting);
+            let due = tick_due(&slots, &waiting, cost_id, Instant::now());
             // A co-tenant with more urgent work is waiting for the device: a K-step quantum
-            // here would hold it for all K.
-            let outranked = device_turn.as_ref().is_some_and(|dt| dt.outranked(urgency));
+            // here would hold it for all K. Under overload, voice turns already ahead of their
+            // deadlines give the device back sooner too.
+            let outranked = device_turn.as_ref().is_some_and(|dt| dt.outranked_due(due))
+                || (crate::serve::deadlines::ahead_under_overload(due, Instant::now())
+                    && slots.iter().flatten().any(|s| s.turn.is_some()));
             let steps = if outranked {
                 1
             } else if cfg.multi_step {
@@ -1309,7 +1415,7 @@ pub fn spawn(
                 turn: device_turn
                     .clone()
                     .filter(|dt| dt.mode() == crate::serve::cosched::CoSched::Deadline)
-                    .map(|dt| (dt, urgency)),
+                    .map(|dt| (dt, due)),
             };
             #[cfg(not(feature = "cuda"))]
             let quantum_cut = QuantumCut;
@@ -1342,13 +1448,15 @@ pub fn spawn(
                 tokio::select! {
                     biased;
                     _ = preempt_wake.notified() => continue,
-                    _ = turn.take_at(dt, urgency) => {}
+                    _ = turn.take_due(dt, due) => {}
+                    _ = arrival_wake.notified(), if dt.mode() == crate::serve::cosched::CoSched::Deadline => continue,
                 }
             }
             if preempt_seen.load(Ordering::Acquire) {
                 continue;
             }
             let co_scheduled = device_turn.as_ref().is_some_and(|dt| dt.ordered());
+            let pf_rows: usize = slots.iter().flatten().filter(|s| s.step == 0).map(|s| s.prompt_ids.len().saturating_sub(s.pf_pos)).sum();
             let taken_slots = std::mem::take(&mut slots);
             let taken_obs = obs.take().unwrap_or_else(|| {
                 let mut obs = RunObserver::new(state.record_trace, indirection_size);
@@ -1437,6 +1545,7 @@ pub fn spawn(
                     if tick_fault.is_some() {
                         Metrics::inc(&metrics.serving.tick_errors);
                     }
+                    crate::sched::cost::record_id(cost_id, if did_prefill { crate::sched::cost::Op::Prefill { rows: pf_rows.min(crate::config::RuntimeConfig::get().pf_chunk_rows()) } } else { crate::sched::cost::Op::DecodeTick { width: live } }, service);
                     let sample = service_sample(ms, did_prefill);
                     if let Some(sample) = sample {
                         load.service_ms.update(sample);
@@ -1548,6 +1657,7 @@ pub fn spawn(
         metrics: handle_metrics,
         preempt: preempt_flag,
         preempt_notify,
+        arrival_notify,
         ingress,
     }
 }
@@ -2014,6 +2124,7 @@ fn admit_session(
         kv,
         class: job.opts.class,
         raw_tokens: job.opts.raw_tokens,
+        turn: job.opts.turn.as_ref().and_then(|k| crate::serve::turns::table().times(k)),
         cfg: pair.then(|| {
             Box::new(CfgRun {
                 rng: job.opts.speech.as_ref().and_then(|s| s.cfg.as_ref()?.seed).map(crate::text::sample::SplitMix::new),
@@ -6510,6 +6621,7 @@ mod tests {
             metrics: Arc::clone(&metrics),
             preempt: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             preempt_notify: Arc::new(tokio::sync::Notify::new()),
+            arrival_notify: Arc::new(tokio::sync::Notify::new()),
             ingress: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         };
 
@@ -7206,6 +7318,7 @@ mod tests {
                 stop_pending: String::new(),
                 class: JobClass::Normal,
                 raw_tokens: false,
+                turn: None,
                 speech: None,
                 cfg: None,
                 held: Vec::new(),
@@ -7217,6 +7330,54 @@ mod tests {
             }),
             rx,
         )
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn tick_due_takes_turn_deadlines_and_keeps_classes_without_turns() {
+        use crate::serve::cosched::{Due, Urgency};
+        let model = crate::sched::cost::id("mux-test-tick-due");
+        let waiting = std::collections::VecDeque::new();
+        let (mut prompt, _rx) = prefill_test_slot();
+        let (mut fin, _rx2) = prefill_test_slot();
+        let now = Instant::now();
+        let arrived = prompt.as_ref().unwrap().arrived;
+        fin.as_mut().unwrap().class = JobClass::Final;
+        // No turns: the class mapping, anchored at the oldest job of the winning class.
+        let slots = vec![prompt.take(), None];
+        assert_eq!(tick_due(&slots, &waiting, model, now).deadline, Due::from_urgency(Urgency::Deadline, arrived).deadline);
+        let mut slots = slots;
+        slots[1] = fin;
+        assert_eq!(tick_due(&slots, &waiting, model, now).deadline, Due::from_urgency(Urgency::Final, slots[1].as_ref().unwrap().arrived).deadline);
+        // A prompt whose turn ended speech 1.4 s ago is tighter than a fresh ASR final.
+        let speech_end = now.checked_sub(std::time::Duration::from_millis(1400)).unwrap();
+        slots[0].as_mut().unwrap().turn =
+            Some(crate::serve::turns::TurnTimes { speech_end: Some(speech_end), budget: std::time::Duration::from_millis(1500), ..Default::default() });
+        let d = tick_due(&slots, &waiting, model, now);
+        assert!(d.deadline <= speech_end + std::time::Duration::from_millis(1500));
+        assert!(d.slack(now) < Due::from_urgency(Urgency::Final, now).slack(now));
+        // The same turn with time to spare yields to the final.
+        slots[0].as_mut().unwrap().turn.as_mut().unwrap().speech_end = Some(now);
+        let d = tick_due(&slots, &waiting, model, now);
+        assert_eq!(d.deadline, Due::from_urgency(Urgency::Final, slots[1].as_ref().unwrap().arrived).deadline);
+    }
+
+    /// A turn's speech stream is its first audio only until the tokens that audio renders from;
+    /// after them its ticks are stream decode, behind the first render.
+    #[test]
+    fn a_speech_stream_is_first_audio_until_its_first_tokens() {
+        use crate::serve::cosched::Band;
+        let (model, now) = (crate::sched::cost::id("mux-test-first-tokens"), Instant::now());
+        let t = crate::serve::turns::TurnTimes { speech_end: Some(now), ..Default::default() };
+        let e = crate::serve::deadlines::Ests::default();
+        let zero = std::time::Duration::ZERO;
+        let band = |first: Option<usize>, step| turn_job_due(model, JobClass::Critical, first, step, zero, zero, now, &t, &e, now).band;
+        assert_eq!(band(Some(20), 19), Band::First);
+        assert_eq!(band(Some(20), 20), Band::Stream);
+        assert_eq!(band(None, 0), Band::First, "an LLM prompt");
+        assert_eq!(band(None, 1), Band::Stream, "LLM decode");
+        let asr = turn_job_due(model, JobClass::Final, Some(CRITICAL_TOKENS), 3, zero, zero, now, &t, &e, now);
+        assert_eq!(asr.band, Band::Final, "an ASR final, every step");
     }
 
     #[cfg(feature = "cuda")]
