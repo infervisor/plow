@@ -5,8 +5,9 @@ rediscovered the same environment failures, and burned leased GPU time doing it.
 tool surface an agent should reach for FIRST, so that does not keep happening.
 
 **The rule: look here before writing a probe. If a tool below does the job, use it. If it almost
-does the job, extend it and keep the extension.** A new one-off script in a scratch directory is
-the last resort, not the first move.
+does the job, extend it and keep the extension.** Experiments belong in existing `scripts/bench`,
+`scripts/campaign` or `perf-data` workflows; put their output in scratch outside the repo. Add a
+new script only for a reusable capability the existing tools cannot express.
 
 ---
 
@@ -42,25 +43,85 @@ scripts** — they do not all agree today. `plowbench.sh` uses `$PB_VLLM`;
 `$WT/.venv-vllm028/bin/python`; `bench_plowrt_serve.sh` and `bench_vllm_chat.sh` run the client
 from a `rocm/vllm` **Docker image** unless `VLLM_VENV` is set. Pin one and say which.
 
-**Every GPU process goes through the queue**, never a raw `gpulease` and never a bare run.
+**Every GPU process goes through the queue**, never a raw `gpulease` and never a bare run. On the
+Gemma/H100 campaign use `scripts/bench/gpuq.py`; the external `submit.sh` queue in §8 is a separate
+lab workflow. A script that leases internally is not safe to run inside either queue unchanged.
+Put every required `PLOW_*` setting in the queued command (for example, `env PLOW_FOO=1 ...`);
+the persistent queue runner removes inherited `PLOW_*` values before starting each job.
 
 ---
 
 ## Campaign playbook (any model, any GPU)
 
-Order of operations. Each step has a tool; do not write a probe for it.
+Order of operations. Each step has a tool; do not write a probe for it. Complete the per-rung
+gate before the full-model accuracy and serving stages, then repeat that gate for affected rungs
+after a kernel change. Existing serving evidence can prioritize work but cannot replace the gate.
 
 | # | step | tool |
 |---|---|---|
 | 1 | preflight (CPU) | `plowbench-doctor.sh <assets> <objdir> <plowrt> <arch>`: env, hazards, binaries, packet, objects, lease, disk, **stale harness/recipe copies vs HEAD** |
 | 2 | build from the recipe | `campaign.py build recipes/<ns>/<model>/<cell>.toml --out <fresh dir>` |
-| 3 | accuracy gates | `campaign.py gate <recipe> --assets <out>/assets --out <dir>` runs the recipe's `[gates]` in one lease (logit parity top1/KL, ASR WER, TTS CER per language, S3Gen rel-L2); `--score-only` re-scores, `--dry-run` prints `run.sh` |
-| 4 | baseline grid vs the reference | `scripts/bench/llm_grid.sh plow\|vllm <res>` (same client, unique prompts per cell and repeat, greedy + sampled, 2 repeats, prefill-only and decode-only cells, vLLM `/metrics`, plow PACKLOG); speech: `tts_bench.py`, `served_bench.py`; voice: `scripts/voice/serve_voice_agent.sh calls` |
-| 5 | audit waterfall | `scripts/bench/waterfall.py <res>/plow <res>/vllm`: grid with spread, reference prefix-cache hits (fails > 5%), wall ms/request split (mixed, prefill-only, decode, host gap, idle, padding, riders), decode ms/step side by side. `vllm_metrics.py cells`, `packlog_audit.py`, `nsys_busy.py` are its parts |
-| 6 | matched decode + roofline | `scripts/bench/step_grid.sh <assets> <out>` (step_bench B × ctx + per-instruction sweeps), then `scripts/bench/op_roof.py <out>/disasm.txt --ctx N --sweep B=<jsonl>` (bytes, FLOPs, floor, measured, % roof per op; `--segtime` for prefill; no measurement = floor per rung). GLM/MLA/MoE: `scripts/campaign/op_roofline.py` |
+| 3 | per-rung accuracy, resources + measured roofline | `scripts/bench/step_grid.sh <assets> <out>` (step_bench B × ctx; instruction-cap sweeps for native decode only), then `scripts/bench/op_roof.py <out>/disasm.txt --ctx N --sweep B=<jsonl>` (bytes, FLOPs, floor, measured, % roof per op). Library-routed decode needs `op_roof.py --nsys` with JSON disassembly and a measured CUDA trace; prefill CUDA graphs use `--nsys-correlation <id>` for exact packet-segment mapping, while `--segtime` covers per-chunk prefill diagnostics. No measurement = floor only. Use block/route harnesses below for other kernels; GLM/MLA/MoE: `scripts/campaign/op_roofline.py` |
+| 4 | full-model accuracy gates | `campaign.py gate <recipe> --assets <out>/assets --out <dir>` runs the recipe's `[gates]` in one lease (logit parity top1/KL, ASR WER, TTS CER per language, S3Gen rel-L2); `--score-only` re-scores, `--dry-run` prints `run.sh` |
+| 5 | serving grid vs the reference | `scripts/bench/llm_grid.sh plow\|vllm <res>` (same client, unique prompts per cell and repeat, greedy + sampled, 2 repeats, prefill-only and decode-only cells, vLLM `/metrics`, plow PACKLOG); speech: `tts_bench.py`, `served_bench.py`; voice: `scripts/voice/serve_voice_agent.sh calls` |
+| 6 | audit waterfall | `scripts/bench/waterfall.py <res>/plow <res>/vllm`: grid with spread, reference prefix-cache hits (fails > 5%), wall ms/request split (mixed, prefill-only, decode, host gap, idle, padding, riders), decode ms/step side by side. `vllm_metrics.py cells`, `packlog_audit.py`, `nsys_busy.py` are its parts |
 | 7 | fix, one variable | kernel/runtime change in your own detached worktree |
 | 8 | verify the patch | `scripts/campaign/verify_patch.sh <patch>`: applies to HEAD in a private index, archives `git write-tree`, builds bins/examples/tests, plowrt lib (cuda+hsa), knob tests, plow-asset + packet tests, py_compile / `bash -n` / TOML of touched scripts |
-| 9 | re-measure | the same grid and gates; A/B scoring as in §7 |
+| 9 | re-measure | repeat steps 3–6 for affected rungs and the selected full model; A/B scoring as in §7 |
+
+### Per-rung gate and recipe selection
+
+For every affected prefill bucket and decode batch/context rung, use the existing kernel harness
+(`step_grid.sh` + `op_roof.py` for dense decode; `campaign.py block-roofline`, `block-bench` and
+`block-ab` where applicable; `gemma4_route_matrix.sh` for native-vs-cuBLASLt projection shapes)
+before a full-model performance run. The route-matrix script's build stage uses `quiets.sh` and
+its run stage submits through `gpuq.py`; use those stages rather than launching the executable directly. Match the production
+cubin build command and flags, including rung-specific defines. Measure on the target GPU with
+repeated, uncontended timings;
+use a measured bandwidth/compute ceiling when available. A datasheet floor or unmeasured
+`op_roof.py` row is a hypothesis, not roofline attainment. Record achieved fraction and investigate
+material unexplained gaps before promotion; do not invent a universal percent threshold.
+
+Check kernel outputs against the appropriate reference on representative and boundary inputs,
+including quantization scales where used. Inspect registers, spills/local memory, stack and shared
+memory in the built object; confirm the object and launch geometry are the ones the packet uses.
+Compare native Plow and segmented cuBLASLt under the same shape, precision, input and timing
+protocol; select only the fastest correct route for each rung. Validate the chosen route in an
+isolated block, including ragged rungs, before full-model accuracy and matched serving. An
+unmeasured rung or a correctness/resource failure keeps the candidate experimental.
+
+Store tuning evidence with source and object SHA256s, exact compiler/cubin flags, launch geometry,
+device/compiler versions, shape/precision and correctness results. A Git commit is useful
+traceability, but evidence remains valid across commits if these effective inputs match; changed
+inputs require revalidation. Do not reject a valid kernel measurement solely because HEAD moved.
+
+Maintain **one canonical production TOML per model/GPU/precision campaign** in
+`recipes/infervisor`, updating it in place as each rung qualifies. It must express the actual
+per-rung object/compile choice and runtime settings; a comment or ignored metadata field is not a
+reproducible recipe. Keep trial TOMLs in `scripts/campaign/recipes` or outside-repo scratch until
+qualified. Do not create a second production variant to record an experiment.
+
+Scheduling is not a recipe choice: recipes (production and trial) leave `PLOW_OBJECTIVE` at the
+default `auto`, which runs the latency rules at narrow width and switches to throughput at 8 rows
+or any queue (`docs/flags-reference.md`). Pin it only as a deliberate, commented override in a
+profile's `serve_env`; expert overrides such as `PLOW_MULTISTEP` or `PLOW_DECODE_MAX_RUNG` stay
+where a cell measured them.
+
+### Campaign result placement
+
+Use one designated `comparison.csv` per campaign for matched serving results and a neighboring
+`comparison.md` for qualified wins and concise provenance. Put raw client/server logs, JSON,
+captures, profiler traces, generated HTML, temporary CSVs and full manifests in named scratch
+outside the repo; link or hash the evidence from the summary. Never put raw benchmark data in
+arbitrary repo directories, including `docs/`, `scripts/` and `perf-data/`. Curated, validated
+tuning summaries can live in an established campaign area, with raw evidence kept in scratch.
+Use `campaign.py bench/compare`, `llm_grid.sh`, `waterfall.py` and the existing
+`serving_comparison.py` when present in the campaign branch. Keep the same client, model/weights,
+quantization, traffic, concurrency, GPU count and cache policy on both serving arms; record
+throughput, throughput/GPU, TTFT P99, TPOT P99, peak memory and output correctness. Render in
+scratch and append the vetted rows to the sole campaign CSV rather than committing each tool's
+generated result tree. Compare prefix-cache token-hit rates with token-hit rates and request-hit
+rates with request-hit rates; the two denominators can differ sharply on shared short prefixes.
 
 Pitfalls this playbook exists for:
 
@@ -75,8 +136,9 @@ Pitfalls this playbook exists for:
   reference's decode-only phase), not TPOT across different batch compositions.
 * **Shared worktree.** Never checkout/stash/reset it; its copies can be stale vs HEAD (the doctor
   warns). Work in `git worktree add --detach <dir> HEAD`, own `CARGO_TARGET_DIR`, deliver patches.
-* **Lease hygiene.** Wrap every GPU command in `timeout` inside the lease and keep leases short: the
-  queue has no FIFO, other agents wait. `gpulease` has no `--help`: `gpulease --help` takes a lease.
+* **Lease hygiene.** Wrap every GPU command in `timeout` inside the lease and keep leases short:
+  other agents wait, and the external queue has no FIFO. `gpulease` has no `--help`:
+  `gpulease --help` takes a lease.
 * **No nix.** On a hand-built box set `PLOW_CAMPAIGN_NO_NIX=1` (campaign.py, the doctor,
   verify_patch.sh) instead of faking `ROCM_PATH`.
 
@@ -198,7 +260,8 @@ These change what is measured and are easy to leave set from a previous probe. `
 |---|---|
 | `PLOW_PREFILL_SEG_TIMING=1` | **disables segment-major** and forces an all-rank drain per segment — about 3.7x inflation. Its totals are attribution shares, never latency. One rung-width experiment was scored and written up before anyone noticed only one arm had it. |
 | `PLOW_TUNEDB` | selects measured GEMM tiles. Measured tiles are **slower** at every rung (5-8 ms); the store must not reach a shipping packet. |
-| `PLOW_AMD_DECODE_MIN_RUNG` | picks the decode program. Default 8 is the measured optimum (41.19 ms vs 50.55 at rung 1, re-measured 2026-09-15). |
+| `PLOW_DECODE_MIN_RUNG` | picks the decode program. Default 8 is the measured optimum (41.19 ms vs 50.55 at rung 1, re-measured 2026-09-15). |
+| `PLOW_OBJECTIVE` | pins `latency` or `throughput` scheduling (decode quantum, prefill packing, queue TTL, rung fast probe). Recipes and production leave it at the default `auto`, which switches per tick. |
 | `PLOW_HSACO_LOWRUNG` | swaps a different object tier for narrow rungs. |
 | `PLOW_GLM_ROWBAND`, `PLOW_TICK_LOG` | fine, but both arms of an A/B must agree on them. |
 
@@ -225,7 +288,7 @@ report it.
 
 ---
 
-## 8. The GPU queue
+## 8. The external GPU queue (lab workflow)
 
 Submit; do not lease directly.
 

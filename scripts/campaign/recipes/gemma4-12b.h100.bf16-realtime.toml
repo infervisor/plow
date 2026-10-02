@@ -66,13 +66,13 @@ gate_prompt = "<bos><start_of_turn>user\nWhat is the capital of France? Answer i
 [bench.profiles.realtime]
 in_lens = "128 1024 4096"
 concs = "1 4"
-serve_env = { PLOW_OBJECTIVE = "latency", PLOW_DECODE_MAX_RUNG = "4" }
+serve_env = { PLOW_DECODE_MAX_RUNG = "4" }
 
 [bench.profiles.high_concurrency]
 in_lens = "128 1024 4096"
 concs = "16 32"
 nprompt = 32
-serve_env = { PLOW_OBJECTIVE = "throughput", PLOW_DECODE_MAX_RUNG = "16", PLOW_DECODE_MIN_RUNG = "16" }
+serve_env = { PLOW_DECODE_MAX_RUNG = "16", PLOW_DECODE_MIN_RUNG = "16" }
 
 [bench.profiles.long_context]
 in_lens = "8192 15000"

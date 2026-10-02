@@ -54,6 +54,7 @@
 #include <cuda_bf16.h>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <cmath>
 #include <cstdint>
 #include <vector>
@@ -112,16 +113,16 @@ template <int GF>
 __global__ void decode_launch(float* Opart, float* mlpart, const __nv_bfloat16* Q,
                               const __nv_bfloat16* K, const __nv_bfloat16* V, const int* kv_len,
                               unsigned n_head, unsigned n_kv_head, unsigned kv_stride,
-                              unsigned window, float scale, unsigned nsplit, unsigned kv_mask) {
+                              unsigned window, float scale, unsigned nsplit, unsigned kv_mask, unsigned batch) {
     extern __shared__ float lds[];
-    d_flash_decode<D, GF>(Opart, mlpart, Q, K, V, kv_len, /*n_batch*/ 1, n_head, n_kv_head,
+    d_flash_decode<D, GF>(Opart, mlpart, Q, K, V, kv_len, batch, n_head, n_kv_head,
                           kv_stride, window, scale, nsplit, kv_mask, /*slice*/ blockIdx.x,
                           /*nblk*/ gridDim.x, lds, 0);
 }
 
 __global__ void merge_launch(__nv_bfloat16* O, const float* Opart, const float* mlpart,
-                             unsigned n_head, unsigned nsplit) {
-    d_flash_merge<D>(O, Opart, mlpart, 1, n_head, nsplit, blockIdx.x, gridDim.x);
+                             unsigned n_head, unsigned nsplit, unsigned batch) {
+    d_flash_merge<D>(O, Opart, mlpart, batch, n_head, nsplit, blockIdx.x, gridDim.x);
 }
 
 /* ---- streaming ceiling: pure grid-stride 128-bit read over a buffer far larger than L2 ------- */
@@ -137,7 +138,7 @@ __global__ void stream_read(const float4* __restrict__ p, size_t n, float* sink)
 
 typedef void (*DecKern)(float*, float*, const __nv_bfloat16*, const __nv_bfloat16*,
                         const __nv_bfloat16*, const int*, unsigned, unsigned, unsigned, unsigned,
-                        float, unsigned, unsigned);
+                        float, unsigned, unsigned, unsigned);
 
 static DecKern dec_kern(int gf) {
     return gf == 2 ? (DecKern)decode_launch<2>
@@ -154,7 +155,7 @@ static __nv_bfloat16 rbf() { return __float2bfloat16((float)rand() / RAND_MAX * 
 
 /* ---- per-context device state + f32 CPU oracle ----------------------------------------------- */
 struct CtxBuf {
-    int ctx = 0, nrep = 1;
+    int ctx = 0, nrep = 1, batch = 1;
     int stride = 0;
     unsigned mask = 0xffffffffu;
     size_t kvelem = 0, kvbytes = 0, wset = 0;
@@ -162,11 +163,12 @@ struct CtxBuf {
     int* dLen = nullptr;
     std::vector<float> ref;
 
-    void init(int c) {
+    void init(int c, int b = 1) {
         ctx = c;
+        batch = b;
         stride = RING ? RING : ctx;
         mask = RING ? unsigned(RING - 1) : 0xffffffffu;
-        kvelem = (size_t)KVH * stride * D;
+        kvelem = (size_t)batch * KVH * stride * D;
         kvbytes = kvelem * 2;
         wset = 2 * kvbytes;
         if constexpr (PLOW_FA_BENCH_SHORT_BURST) {
@@ -179,11 +181,11 @@ struct CtxBuf {
             nrep = std::max(1, std::min(16, nrep));
         }
 
-        std::vector<__nv_bfloat16> hQ((size_t)NH * D), hK(kvelem), hV(kvelem);
+        std::vector<__nv_bfloat16> hQ((size_t)batch * NH * D), hK(kvelem), hV(kvelem);
         for (auto& x : hQ) x = rbf();
         for (auto& x : hK) x = rbf();
         for (auto& x : hV) x = rbf();
-        int hlen = ctx;
+        std::vector<int> hlen(batch, ctx);
 
         CK(cudaMalloc(&dQ, hQ.size() * 2));
         CK(cudaMalloc(&dK, kvbytes * nrep));
@@ -195,16 +197,16 @@ struct CtxBuf {
             CK(cudaMemcpy(dK + r * kvelem, dK, kvbytes, cudaMemcpyDeviceToDevice));
             CK(cudaMemcpy(dV + r * kvelem, dV, kvbytes, cudaMemcpyDeviceToDevice));
         }
-        CK(cudaMalloc(&dLen, 4));
-        CK(cudaMemcpy(dLen, &hlen, 4, cudaMemcpyHostToDevice));
-        CK(cudaMalloc(&dO, (size_t)NH * D * 2));
+        CK(cudaMalloc(&dLen, batch * sizeof(int)));
+        CK(cudaMemcpy(dLen, hlen.data(), batch * sizeof(int), cudaMemcpyHostToDevice));
+        CK(cudaMalloc(&dO, (size_t)batch * NH * D * 2));
 
-        ref.assign((size_t)NH * D, 0.f);
+        ref.assign((size_t)batch * NH * D, 0.f);
         const int qpos = ctx - 1;
         const int first = WINDOW && ctx > WINDOW ? ctx - WINDOW : 0;
         std::vector<float> sc(ctx - first);
-        for (int h = 0; h < NH; h++) {
-            const int hkv = h / (NH / KVH);
+        for (int h = 0; h < batch * NH; h++) {
+            const int hkv = (h / NH) * KVH + (h % NH) / (NH / KVH);
             float m = -1e30f;
             for (int r = first; r <= qpos; r++) {
                 float d = 0;
@@ -245,24 +247,24 @@ static Cell bench(CtxBuf& c, int GF, int nsplit, int NCU, const char* dump = nul
         CK(cudaFuncSetAttribute((void*)kern, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
 
     float *dOp, *dMl;
-    CK(cudaMalloc(&dOp, (size_t)NH * nsplit * D * 4));
-    CK(cudaMalloc(&dMl, (size_t)NH * nsplit * 2 * 4));
+    CK(cudaMalloc(&dOp, (size_t)c.batch * NH * nsplit * D * 4));
+    CK(cudaMalloc(&dMl, (size_t)c.batch * NH * nsplit * 2 * 4));
 
     auto run = [&](int rep) {
         kern<<<NCU, 256, smem>>>(dOp, dMl, c.dQ, c.dK + (size_t)rep * c.kvelem,
                                  c.dV + (size_t)rep * c.kvelem, c.dLen, NH, KVH,
                                  (unsigned)c.stride, (unsigned)WINDOW, SCALE,
-                                 (unsigned)nsplit, c.mask);
-        merge_launch<<<NCU, 256>>>(c.dO, dOp, dMl, NH, (unsigned)nsplit);
+                                 (unsigned)nsplit, c.mask, c.batch);
+        merge_launch<<<NCU, 256>>>(c.dO, dOp, dMl, NH, (unsigned)nsplit, c.batch);
     };
 
     run(0);
     CK(cudaGetLastError());
     CK(cudaDeviceSynchronize());
-    std::vector<__nv_bfloat16> hO((size_t)NH * D);
+    std::vector<__nv_bfloat16> hO((size_t)c.batch * NH * D);
     CK(cudaMemcpy(hO.data(), c.dO, hO.size() * 2, cudaMemcpyDeviceToHost));
     if (dump) {
-        std::vector<float> op((size_t)NH * nsplit * D), ml((size_t)NH * nsplit * 2);
+        std::vector<float> op((size_t)c.batch * NH * nsplit * D), ml((size_t)c.batch * NH * nsplit * 2);
         CK(cudaMemcpy(op.data(), dOp, op.size() * sizeof(float), cudaMemcpyDeviceToHost));
         CK(cudaMemcpy(ml.data(), dMl, ml.size() * sizeof(float), cudaMemcpyDeviceToHost));
         FILE* f = fopen(dump, "wb");
@@ -347,7 +349,7 @@ static Cell bench(CtxBuf& c, int GF, int nsplit, int NCU, const char* dump = nul
 
 int main(int argc, char** argv) {
     unsigned seed = 1234;
-    if (argc == 7) seed = (unsigned)strtoul(argv[6], nullptr, 10);
+    if (argc >= 7) seed = (unsigned)strtoul(argv[6], nullptr, 10);
     srand(seed);
 
     cudaDeviceProp prop;
@@ -360,26 +362,29 @@ int main(int argc, char** argv) {
     printf("attention: D=%d NH=%d KVH=%d scale=%.9g QREG=%d seed=%u\n",
            D, NH, KVH, SCALE, PLOW_NV_FA_QREG, seed);
 
-    if (argc != 1) {
-        if (argc != 6 && argc != 7) {
-            fprintf(stderr, "usage: %s [context gf nsplit trials dump [seed]]\n", argv[0]);
+    const bool bandwidth_only = argc == 2 && std::strcmp(argv[1], "--bandwidth-only") == 0;
+    if (argc != 1 && !bandwidth_only) {
+        if (argc < 6 || argc > 9) {
+            fprintf(stderr, "usage: %s [--bandwidth-only | context gf nsplit trials dump [seed [batch [grid_multiple]]]]\n", argv[0]);
             return 2;
         }
         const int ctx = atoi(argv[1]), gf = atoi(argv[2]);
         const int ns = atoi(argv[3]), trials = atoi(argv[4]);
-        if (ctx <= 0 || ns <= 0 || trials <= 0 || (gf != 2 && gf != 4 && gf != 8) ||
-            NH % KVH || (NH / KVH) % gf) {
+        const int batch = argc >= 8 ? atoi(argv[7]) : 1;
+        const int grid_multiple = argc >= 9 ? atoi(argv[8]) : 1;
+        if (ctx <= 0 || batch <= 0 || ns <= 0 || trials <= 0 || (gf != 2 && gf != 4 && gf != 8) ||
+            grid_multiple < 1 || grid_multiple > 8 || NH % KVH || (NH / KVH) % gf) {
             fprintf(stderr, "invalid attention shape or sweep arguments\n");
             return 2;
         }
         CtxBuf c;
-        c.init(ctx);
+        c.init(ctx, batch);
         int fails = 0;
         for (int trial = 0; trial < trials; trial++) {
-            Cell r = bench(c, gf, ns, NCU, trial == 0 ? argv[5] : nullptr);
-            printf("D=%d NH=%d KVH=%d window=%d ring=%d seed=%u ctx=%d gf=%d ns=%d trial=%d "
-                   "cold_ms=%.6f hot_ms=%.6f relL2=%.9g %s\n", D, NH, KVH,
-                   WINDOW, RING, seed, ctx, gf, ns, trial, r.cold, r.hot, r.rel,
+            Cell r = bench(c, gf, ns, NCU * grid_multiple, trial == 0 ? argv[5] : nullptr);
+            printf("D=%d NH=%d KVH=%d window=%d ring=%d seed=%u ctx=%d batch=%d gf=%d ns=%d trial=%d "
+                   "grid=%d cold_ms=%.6f hot_ms=%.6f relL2=%.9g %s\n", D, NH, KVH,
+                   WINDOW, RING, seed, ctx, batch, gf, ns, trial, NCU * grid_multiple, r.cold, r.hot, r.rel,
                    r.ok ? "PASS" : "FAIL");
             fails += !r.ok;
         }
@@ -429,6 +434,8 @@ int main(int argc, char** argv) {
         CK(cudaFree(dBuf));
         CK(cudaFree(dSink));
     }
+
+    if (bandwidth_only) return 0;
 
     const int ctxs[] = {8192, 16384, 32768, 65536, 131072};
     const int NCTX = (int)(sizeof(ctxs) / sizeof(int));

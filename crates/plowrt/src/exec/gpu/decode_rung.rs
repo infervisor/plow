@@ -207,6 +207,14 @@ fn validate_decode_ladder_impl(blob: &DevBlob, segmented: bool, routed: &[bool])
             d.blocks = 0;
             match DevOp::from_u16(d.op) {
                 Some(DevOp::Nop) => {}
+                Some(DevOp::QuantFp8 | DevOp::GemmFp8 | DevOp::GemmMedFp8 | DevOp::GemmSmallFp8)
+                    if routed.get(index).copied().unwrap_or(false) =>
+                {
+                    if d.i[0] != g.t {
+                        return Err(reject("FP8 instruction rows disagree with rung width"));
+                    }
+                    d.i[0] = 1;
+                }
                 Some(DevOp::Residual | DevOp::Glu | DevOp::SoftCap) => {
                     if d.i[0] == 0 || d.i[0] % g.t != 0 {
                         return Err(reject("invalid elementwise row extent"));
@@ -251,6 +259,8 @@ fn validate_decode_ladder_impl(blob: &DevBlob, segmented: bool, routed: &[bool])
                     | DevOp::MoeRouterGemmaTopk
                     | DevOp::MoeExpertGluNormGemma
                     | DevOp::MoeExpertDownGemma
+                    | DevOp::MoeExpertGluGemmaFp8
+                    | DevOp::MoeExpertDownGemmaFp8
                     | DevOp::MoeCombineNormGemma
                     | DevOp::MoeCombineResidNormGemma),
                 ) => {

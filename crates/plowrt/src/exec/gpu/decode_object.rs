@@ -170,13 +170,22 @@ pub(super) fn load_gemv_wide(
     be: &Arc<CudaBackend>,
     assets: &Path,
     stem: &str,
+    rows64: bool,
     main: &Module,
     grid: u32,
 ) -> Result<Option<(Arc<BoundDecodeObject>, Arc<BoundDecodeObject>)>> {
-    let file = format!("{stem}_gw.cubin");
+    let kv_abi = be.module_global_u32(main, "plow_fp8_kv_abi")?;
+    let file = format!(
+        "{stem}_gw{}{}.cubin",
+        if rows64 { "64" } else { "" },
+        if kv_abi == Some(1) { "_fp8kv" } else { "" }
+    );
     let Ok(image) = std::fs::read(assets.join(&file)) else {
         return Ok(None);
     };
+    if cubin::global_u32(&image, "plow_fp8_kv_abi") != kv_abi {
+        return Err(reject(&format!("{file}: FP8 KV capability differs from the decode object")));
+    }
     let module = DecodeModule::load(be, &image)?;
     let function = be.get_function(&module, &format!("_Z{}{stem}_gw11PlowProgram", stem.len() + 3))?;
     GpuEngine::check_packet_pairing_suffix(be, &module, assets, "_gw")?;
@@ -193,7 +202,7 @@ pub(super) fn load_gemv_wide(
     if be.occupancy_blocks_per_sm(function, BLOCK, smem as usize)? * be.sm_count() < grid {
         return Err(reject(&format!("{file}: cannot hold the decode grid {grid}")));
     }
-    tracing::info!(smem, narrow, "batched-rung decode object loaded");
+    tracing::info!(file, smem, narrow, "batched-rung decode object loaded");
     let object = |smem| {
         Arc::new(BoundDecodeObject { function, grid, block: BLOCK, smem, _module: Arc::clone(&module) })
     };

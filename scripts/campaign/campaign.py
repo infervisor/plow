@@ -273,8 +273,9 @@ def cmd_block_ab(a: argparse.Namespace) -> None:
     print(f"queued {record['job']}; results: {out}")
 
 
-def git(*args: str) -> str:
-    return subprocess.run(["git", *args], cwd=REPO, capture_output=True, text=True).stdout.strip()
+def git(*args: str, raw: bool = False) -> str:
+    output = subprocess.run(["git", *args], cwd=REPO, capture_output=True, text=True).stdout
+    return output if raw else output.strip()
 
 
 def cmd_serve_bench(a: argparse.Namespace) -> None:
@@ -457,7 +458,11 @@ def env_with(base: dict, extra: dict) -> dict:
 
 # ---------------------------------------------------------------- build
 def cmd_build(a: argparse.Namespace) -> None:
-    r = load(a.recipe)
+    recipe_bytes = Path(a.recipe).read_bytes()
+    r = tomllib.loads(recipe_bytes.decode("utf-8"))
+    for key in ("cell", "emit", "bench"):
+        if key not in r:
+            die(f"{a.recipe}: missing [{key}]")
     cell, emit = r["cell"], r["emit"]
     if getattr(a, "hf_dir", None):
         cell["hf_dir"] = a.hf_dir
@@ -465,6 +470,16 @@ def cmd_build(a: argparse.Namespace) -> None:
     if out.exists() and any(out.iterdir()):
         die(f"{out} exists and is not empty; a build is reproducible only into a fresh dir")
     out.mkdir(parents=True, exist_ok=True)
+    (out / "recipe.toml").write_bytes(recipe_bytes)
+    def source_state(name):
+        diff = out / f"source-{name}.diff"
+        diff.write_text(git("diff", "--binary", "HEAD", raw=True))
+        return {"commit": git("rev-parse", "HEAD"),
+                "status": git("status", "--porcelain"), "tracked_diff_sha256": sha(diff)}
+    source_start = source_state("start")
+    lock = REPO / "flake.lock"
+    if lock.is_file():
+        shutil.copy2(lock, out / "flake.lock")
     log = out / "build.log"
     cell["hf_dir"] = expand(cell["hf_dir"], out)
     emit = dict(emit, env={k: expand(v, out) for k, v in emit.get("env", {}).items()},
@@ -480,6 +495,7 @@ def cmd_build(a: argparse.Namespace) -> None:
     plowc = Path(os.environ.get("CARGO_TARGET_DIR", REPO / "target")) / "release" / "plowc"
     if not plowc.exists():
         die("target/release/plowc missing: nix develop -c cargo build -p plowc --release")
+    compiler_start = sha(plowc)
 
     base_args = [
         str(plowc),
@@ -511,7 +527,7 @@ def cmd_build(a: argparse.Namespace) -> None:
             oenv = env_with(os.environ, objects.get("env", {}))
             oenv.update(object_overrides)
             oenv["PLOW_CUBIN_CONFIG"] = str(base_dir / "plow_config.h")
-            if run(["bash", str(REPO / objects["script"]), str(base_dir), str(obj_dir)], oenv, log):
+            if run(["bash", "-x", str(REPO / objects["script"]), str(base_dir), str(obj_dir)], oenv, log):
                 die("object build failed; see build.log")
         assets = out / "assets"
         assets.mkdir()
@@ -521,6 +537,18 @@ def cmd_build(a: argparse.Namespace) -> None:
         # CLI overrides win over the recipe's role env too, so an A/B can switch a role off.
         if run(nix([*base_args, "--out", str(assets)]), env_with(env_with(common, roles.get("env", {})), overrides), log):
             die("role emit failed; see build.log")
+        # A role emit that moves the packet hash (the 12B W8A8 GLU role does) leaves the segment
+        # objects specialised for the BASE packet, and plowrt refuses them ("packet/interpreter
+        # MISMATCH"). Rebuild them against the final config; the base set stays for the record.
+        final_cfg = assets / "plow_config.h"
+        if objects and final_cfg.read_bytes() != (base_dir / "plow_config.h").read_bytes():
+            print("== objects (final packet config differs from base: rebuilding)", file=sys.stderr)
+            obj_dir.rename(out / "objects-base")
+            oenv = env_with(os.environ, objects.get("env", {}))
+            oenv.update(object_overrides)
+            oenv["PLOW_CUBIN_CONFIG"] = str(final_cfg)
+            if run(["bash", "-x", str(REPO / objects["script"]), str(assets), str(obj_dir)], oenv, log):
+                die("final object build failed; see build.log")
         # The role emit rebuilds its own cmake cubins (e.g. *_pfpackedseg); the recipe's object wins.
         for f in objects.get("role_files", []) if objects else []:
             (assets / f).write_bytes((obj_dir / f).read_bytes())
@@ -545,15 +573,35 @@ def cmd_build(a: argparse.Namespace) -> None:
             link.unlink()
         link.symlink_to(ck)
 
+    source_end = source_state("end")
+    compiler_end = sha(plowc)
     rec = {
         "recipe": str(Path(a.recipe).resolve()),
-        "recipe_sha256": sha(Path(a.recipe)),
-        "compiler_sha256": sha(plowc),
+        "recipe_sha256": sha(out / "recipe.toml"),
+        "recipe_snapshot": "recipe.toml",
+        "compiler_sha256": compiler_start,
+        "build_provenance": {
+            "source_start": source_start, "source_end": source_end,
+            "source_state_changed": source_start != source_end,
+            "compiler_end_sha256": compiler_end,
+            "compiler_changed": compiler_start != compiler_end,
+        },
+        "compilation": {
+            "log": "build.log",
+            "log_sha256": sha(log) if log.exists() else None,
+            "flake_lock_sha256": sha(out / "flake.lock") if (out / "flake.lock").exists() else None,
+            "toolchain_env": {k: os.environ[k] for k in
+                              ("PLOW_NVCC", "PLOW_NVCC_PATH", "NVCC_PREPEND_FLAGS", "NVCC_APPEND_FLAGS")
+                              if k in os.environ},
+            "emit_env": {**emit.get("env", {}), **overrides},
+            "role_env": {**(roles or {}).get("env", {}), **overrides},
+            "object_env": {**(objects or {}).get("env", {}), **object_overrides},
+        },
         "cell": cell,
         "overrides": overrides,
         "object_overrides": object_overrides,
-        "commit": git("rev-parse", "HEAD"),
-        "dirty": bool(git("status", "--porcelain")),
+        "commit": source_start["commit"],
+        "dirty": bool(source_start["status"]),
         "nix": os.environ.get("PLOW_CAMPAIGN_NO_NIX") != "1",
         "prep": [s.get("name") for s in r.get("prep", [])],
         "utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -648,6 +696,7 @@ def cmd_bench(a: argparse.Namespace) -> None:
         "LOG": str(out / "server.log"),
         "SERVE_EXTRA_ARGS": serve.get("extra_args", ""),
         "DATASET_ARGS": getattr(a, "dataset_args", None) or bench.get("dataset_args", ""),
+        "PREFIX_PCT": str(getattr(a, "prefix_pct", None) or bench.get("prefix_pct", 0)),
     })
     (out / "hf-home").mkdir(exist_ok=True)
     model_id = bench.get("model_id") or json.loads((assets / "build.json").read_text()).get("slug") or cell["revision"]
@@ -667,7 +716,7 @@ def cmd_bench(a: argparse.Namespace) -> None:
     # no compile overlaps a measurement; quietx.sh gates new builds while this session waits.
     quiet = [str(REPO / "scripts" / "bench" / "quietx.sh"), a.quiet_lock] if getattr(a, "quiet_lock", None) else []
     lines.append("exec " + " ".join(shlex.quote(x) for x in [*quiet,
-        str(BENCH), str(assets), str(bench.get("port", 8765)), model_id, bench["tokenizer"], str(bench.get("ready_s", 1200))]))
+        str(BENCH), str(assets), str(bench.get("port", 8765)), model_id, expand(bench["tokenizer"], out), str(bench.get("ready_s", 1200))]))
     wrapper.write_text("\n".join(lines) + "\n")
     wrapper.chmod(0o755)
     cmd = [str(GPULEASE), "-n", str(cell.get("n_gpu", 1)), label, str(wrapper)]
@@ -696,7 +745,7 @@ def cmd_bench(a: argparse.Namespace) -> None:
         "gpu": gpu_header(),
         "contended": "CONTENDED" in text,
         "gate": "coherence gate: PASS" in text,
-        "protocol": {k: env[k] for k in ("IN_LENS", "CONCS", "NPROMPT", "OUTLEN", "BENCH_BACKEND", "BENCH_EXTRA_ARGS", "DATASET_ARGS")},
+        "protocol": {k: env[k] for k in ("IN_LENS", "CONCS", "NPROMPT", "OUTLEN", "BENCH_BACKEND", "BENCH_EXTRA_ARGS", "DATASET_ARGS", "PREFIX_PCT")},
         "quiet_lock": getattr(a, "quiet_lock", None),
         "serve_env": serve.get("env", {}),
         "overrides": overrides,
@@ -1426,6 +1475,7 @@ def main() -> None:
     n = sp.add_parser("bench"); n.add_argument("recipe"); n.add_argument("--assets", required=True); n.add_argument("--out", required=True)
     n.add_argument("--concs"); n.add_argument("--in-lens"); n.add_argument("--label"); n.add_argument("--reference")
     n.add_argument("--nprompt", type=int, help="prompts per cell, overriding the recipe/profile")
+    n.add_argument("--prefix-pct", type=int, help="percent of each input_len shared as a prefix by every request (see PREFIX_PCT); recorded")
     n.add_argument("--dataset-args", help="replaces the client's random-dataset block (see bench_plowrt_serve.sh DATASET_ARGS); recorded")
     n.add_argument("--quiet-lock", metavar="FILE", help="hold this lock exclusively for the bench session, inside the GPU lease (scripts/bench/quietx.sh; builds take it shared via quiets.sh)")
     n.add_argument("--env", action="append", metavar="K=V", help="one-variable override for the server env; recorded")

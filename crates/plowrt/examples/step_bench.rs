@@ -5,16 +5,28 @@
 //! (`prefill_slot` to build ctx, then one `step_slots` per token).
 //!
 //! Usage:
-//!   step_bench <assets_dir> [slots] [ctx] [steps] [--same] [--warmup N] [--multistep]
-//!              [--dump-tensors name,name --dump-dir dir]
+//!   step_bench <assets_dir> [slots] [ctx] [steps] [--same] [--warmup N] [--multistep] [--packed-prefill]
+//!              [--dump-tensors name,name --dump-dir dir | --dump-prefill-logits dir]
+//!              [--max-inst N | --max-segments N]
 //! `--same` feeds every slot the SAME prompt and reports how many slots' greedy
-//! streams agree with slot 0 (a within-batch consistency check). `--dump-tensors`
+//! streams agree with slot 0 (a within-batch consistency check). `--packed-prefill`
+//! initializes prompts through packed request chunks and the compact terminal.
+//! `--dump-tensors`
 //! writes the named tensors raw after the last step (block_run's format), which
-//! with `PLOW_DEBUG_MAX_INST` truncation gives per-layer activations. `--multistep` times the
+//! with `--max-inst N`, one step and zero warmup gives partial decode activations.
+//! Instruction caps require native decode routes. `--multistep` times the
 //! engine's device multi-step quanta (`PLOW_MULTISTEP=K`) instead of single steps; the digest
 //! covers the same tokens in the same order, so it compares directly with a single-step run.
 //! Env: PLOW_CHECKPOINT (default <assets>/checkpoint), PLOW_STEP_TIME=1 for
 //! the engine's host-op breakdown.
+
+#[cfg(any(feature = "cuda", test))]
+fn record_inputs(histories: &mut [Vec<u32>], last: &[u32], outputs: &[u32], steps: usize) {
+    for (row, history) in histories.iter_mut().enumerate() {
+        history.push(last[row]);
+        history.extend_from_slice(&outputs[row * steps..(row + 1) * steps - 1]);
+    }
+}
 
 #[cfg(not(feature = "cuda"))]
 fn main() {
@@ -43,12 +55,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let steps: usize = args.next().map(|v| v.parse()).transpose()?.unwrap_or(128);
     let mut same = false;
     let mut multistep = false;
+    let mut packed_prefill = false;
     let mut warmup = 16usize;
     let mut sweep: Option<(u32, u32)> = None;
+    let mut max_inst: Option<u32> = None;
+    let mut max_segments: Option<usize> = None;
+    let mut prefill_logits_dir = None::<std::path::PathBuf>;
     let (mut dump_names, mut dump_dir) = (None::<String>, None::<String>);
     while let Some(a) = args.next() {
         match a.as_str() {
+            "--max-segments" => max_segments = Some(args.next().ok_or("--max-segments N")?.parse()?),
+            "--max-inst" => max_inst = Some(args.next().ok_or("--max-inst N")?.parse()?),
             "--same" => same = true,
+            "--packed-prefill" => packed_prefill = true,
             "--multistep" => multistep = true,
             "--warmup" => warmup = args.next().ok_or("--warmup N")?.parse()?,
             // `--sweep LO..HI`: time decode steps with instruction caps LO..=HI in this process.
@@ -59,6 +78,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             "--dump-tensors" => dump_names = Some(args.next().ok_or("--dump-tensors a,b")?),
             "--dump-dir" => dump_dir = Some(args.next().ok_or("--dump-dir d")?),
+            "--dump-prefill-logits" => {
+                prefill_logits_dir = Some(args.next().ok_or("--dump-prefill-logits dir")?.into())
+            }
             other => return Err(format!("unknown argument {other}").into()),
         }
     }
@@ -68,12 +90,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         _ => return Err("--dump-tensors and --dump-dir must be provided together".into()),
     };
 
+    if max_inst.is_some() && max_segments.is_some() {
+        return Err("choose --max-inst or --max-segments".into());
+    }
+    let partial = max_inst.is_some() || max_segments.is_some();
+    if prefill_logits_dir.is_some() && (partial || dumps.is_some() || sweep.is_some() || multistep) {
+        return Err("--dump-prefill-logits captures prefill only".into());
+    }
+    if partial
+        && (steps != 1 || warmup != 0 || multistep || sweep.is_some() || dumps.is_none())
+    {
+        return Err("partial capture requires one step, --warmup 0, tensor dumps, and no sweep/multistep".into());
+    }
+
     let ckpt = std::env::var("PLOW_CHECKPOINT")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|_| assets.join("checkpoint"));
     let be = Arc::new(plowrt::device::cuda::CudaBackend::new(0)?);
     let mut e = plowrt::exec::gpu::GpuEngine::load(be, &assets, &ckpt)?;
     let slots = want_slots.min(e.batch());
+    if prefill_logits_dir.is_some() && (packed_prefill || !e.has_prefill()) {
+        return Err("prefill logit capture requires ordinary GPU prefill".into());
+    }
+    if max_segments.is_some() && slots != e.batch() {
+        return Err("--max-segments requires the widest decode rung".into());
+    }
     println!(
         "engine batch={} vocab={} max_ctx={} prefill={} -> slots={slots} ctx={ctx} steps={steps}",
         e.batch(),
@@ -87,23 +128,105 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // keeps the historical prompt, so B=1 numbers are unchanged). `--same` gives every slot
     // slot 0's prompt on purpose.
     let mut last = vec![0u32; slots];
-    for b in 0..slots {
+    let mut histories = dumps.as_ref().map(|_| vec![Vec::new(); slots]);
+    let mut prefill_cases = Vec::new();
+    let mut prefill_raw = prefill_logits_dir
+        .as_ref()
+        .map(|dir| {
+            std::fs::create_dir(dir)?;
+            Ok::<_, Box<dyn std::error::Error>>(vec![0u8; e.vocab() * 2])
+        })
+        .transpose()?;
+    let prompt_for = |b: usize| -> Vec<u32> {
         let bb = if same { 0 } else { b as u32 };
-        let prompt: Vec<u32> = (0..ctx as u32)
-            .map(|i| 100 + ((i + 131 * bb) % 1000))
-            .collect();
-        e.begin_slot(b, ctx + steps + 1)?;
+        (0..ctx as u32).map(|i| 100 + ((i + 131 * bb) % 1000)).collect()
+    };
+    if packed_prefill {
+        use plowrt::exec::gpu::PfBatchReq;
+        if slots == 0 || ctx == 0 || !e.pf_batch_enabled() || !e.has_packed_terminal() {
+            return Err("--packed-prefill requires nonempty prompts, packed prefill and compact terminal".into());
+        }
+        let prompts: Vec<_> = (0..slots).map(prompt_for).collect();
+        for b in 0..slots {
+            e.begin_slot(b, ctx + steps + 1)?;
+            if let Some(histories) = &mut histories {
+                histories[b] = prompts[b].clone();
+            }
+        }
+        let chunk = e.pf_request_max_rows().min(e.pf_max_rows());
+        if chunk == 0 {
+            return Err("packed prefill has no chunk capacity".into());
+        }
+        let width = e.pf_max_rows() / chunk;
+        let mut completed = Vec::new();
         let t0 = Instant::now();
-        last[b] = if e.has_prefill() {
-            e.prefill_slot(b, &prompt)?
-        } else {
-            let mut toks = Vec::new();
-            e.consume_prompt(b, &prompt, &mut toks)?
-        };
-        println!(
-            "slot {b}: prompt consumed in {:.4} s",
-            t0.elapsed().as_secs_f64()
-        );
+        for c0 in (0..ctx).step_by(chunk) {
+            let len = chunk.min(ctx - c0);
+            for first in (0..slots).step_by(width) {
+                let end = (first + width).min(slots);
+                let requests: Vec<_> = (first..end).map(|slot| PfBatchReq {
+                    slot, prompt: &prompts[slot], c0, len,
+                }).collect();
+                println!("packed prefill: prefix={c0} chunk_rows={len} requests={} rows={}",
+                         requests.len(), requests.len() * len);
+                e.prefill_batched_complete(&requests, &mut completed)?;
+                if c0 + len == ctx && completed.len() != requests.len() {
+                    return Err("packed prefill did not complete every request".into());
+                }
+                for &(slot, token) in &completed {
+                    last[slot] = token;
+                }
+            }
+        }
+        println!("packed prompts consumed in {:.4} s", t0.elapsed().as_secs_f64());
+    } else {
+        for b in 0..slots {
+            let prompt = prompt_for(b);
+            if let Some(histories) = &mut histories {
+                histories[b] = prompt.clone();
+            }
+            e.begin_slot(b, ctx + steps + 1)?;
+            let t0 = Instant::now();
+            last[b] = if e.has_prefill() {
+                e.prefill_slot(b, &prompt)?
+            } else {
+                let mut toks = Vec::new();
+                e.consume_prompt(b, &prompt, &mut toks)?
+            };
+            if let (Some(dir), Some(raw)) = (&prefill_logits_dir, &mut prefill_raw) {
+                e.read_tensor_range("act.logits", 0, raw)?;
+                let file = format!("prefill-s{b:03}.bin");
+                std::fs::write(dir.join(&file), raw)?;
+                let prompt_bytes: Vec<u8> = prompt.iter().flat_map(|id| id.to_le_bytes()).collect();
+                prefill_cases.push(serde_json::json!({
+                    "id": format!("prefill-s{b:03}"), "file": file, "dtype": "bf16",
+                    "prompt_token_ids": prompt, "prompt_len": ctx,
+                    "prompt_sha256_u32le": plow_asset::knob::sha256_hex(&prompt_bytes),
+                    "sampled_token_id": last[b], "generation_step": 0,
+                    "execution_phase": "prefill_output",
+                }));
+            }
+            println!(
+                "slot {b}: prompt consumed in {:.4} s",
+                t0.elapsed().as_secs_f64()
+            );
+        }
+    }
+    if let Some(dir) = &prefill_logits_dir {
+        std::fs::write(dir.join("manifest.json"), serde_json::to_vec_pretty(&serde_json::json!({
+            "schema": 1, "producer": "plow-step-bench-prefill", "name": "step-bench-prefill",
+            "vocab_size": e.vocab(), "cases": prefill_cases,
+        }))?)?;
+        return Ok(());
+    }
+
+    if let Some(segments) = max_segments {
+        e.capture_debug_decode_prefix(segments)?;
+    }
+    if let Some(cap) = max_inst {
+        if !e.set_debug_max_inst(cap, slots)? {
+            return Err("decode object has no instruction-cap global".into());
+        }
     }
 
     // Warmup (repo convention: discard 16), then timed steps.
@@ -113,13 +236,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut toks = Vec::new();
     for _ in 0..warmup {
         e.step_slots(&feeds_of(&last), &mut toks)?;
+        if let Some(histories) = &mut histories {
+            record_inputs(histories, &last, &toks, 1);
+        }
         last.copy_from_slice(&toks);
     }
     if let Some((lo, hi)) = sweep {
         let base_pos: Vec<usize> = (0..slots).map(|_| ctx + warmup).collect();
         let base_last = last.clone();
         for cap in (lo..=hi).chain([u32::MAX]) {
-            e.set_debug_max_inst(cap)?;
+            e.set_debug_max_inst(cap, slots)?;
             // Same kv length at every cap: a drifting position biases each delta by the
             // attention's per-token cost.
             for (b, &p) in base_pos.iter().enumerate() {
@@ -157,6 +283,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // Fed row r is slot r; `toks` is row-major, K tokens per row.
             let k = e.multi_step_at_most(&feeds_of(&last), steps - done, &mut toks)?;
             let per = t0.elapsed().as_secs_f64() * 1e3 / k as f64;
+            if let Some(histories) = &mut histories {
+                record_inputs(histories, &last, &toks, k);
+            }
             for step in 0..k {
                 ms.push(per);
                 for (b, stream) in streams.iter_mut().enumerate() {
@@ -173,6 +302,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         e.step_slots(&feeds_of(&last), &mut toks)?;
         ms.push(t0.elapsed().as_secs_f64() * 1e3);
+        if let Some(histories) = &mut histories {
+            record_inputs(histories, &last, &toks, 1);
+        }
         last.copy_from_slice(&toks);
         for (b, &t) in toks.iter().enumerate() {
             digest = (digest ^ t as u64).wrapping_mul(0x100000001b3);
@@ -180,8 +312,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         done += 1;
     }
-    println!("TOK_STREAM slots={slots} ctx={ctx} fnv={digest:016x} slot0={:?}", streams[0]);
-    if same {
+    if !partial {
+        println!("TOK_STREAM slots={slots} ctx={ctx} fnv={digest:016x} slot0={:?}", streams[0]);
+    }
+    if same && !partial {
         let agree = streams.iter().filter(|s| **s == streams[0]).count();
         println!("SLOTS_AGREE {agree}/{slots} (identical prompts on every slot)");
         for (b, s) in streams.iter().enumerate().skip(1) {
@@ -198,8 +332,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         0.0
     };
+    let measurement = if partial { "PARTIAL_STEP" } else { "RAW_STEP" };
     println!(
-        "RAW_STEP slots={slots} ctx={ctx} n={} mean_ms={mean:.3} median_ms={median:.3} \
+        "{measurement} slots={slots} ctx={ctx} n={} mean_ms={mean:.3} median_ms={median:.3} \
          sd_ms={sd:.3} min_ms={:.3} max_ms={:.3} per_user_tok_s={:.1} aggregate_tok_s={:.1}",
         ms.len(),
         ms[0],
@@ -224,8 +359,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::fs::write(
             dir.join("manifest.json"),
             serde_json::to_vec_pretty(&serde_json::json!({
-                "scope": "raw complete allocations after the last decode step",
-                "slots": slots, "ctx": ctx, "steps": steps, "tensors": rows,
+                "scope": if partial { "raw allocations after partial decode; outputs may be stale" }
+                    else { "raw complete allocations after the last decode step" },
+                "max_inst": max_inst, "max_segments": max_segments,
+                "slots": slots, "ctx": ctx, "steps": steps, "warmup": warmup,
+                "packed_prefill": packed_prefill,
+                "token_histories": histories,
+                "sampled_token_ids": if !partial { Some(last) } else { None },
+                "tensors": rows,
             }))?,
         )?;
         println!("  wrote raw tensor dumps to {}", dir.display());
@@ -237,4 +378,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("{profile}");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::record_inputs;
+
+    #[test]
+    fn histories_include_inputs_but_exclude_the_final_sample() {
+        let prompts = vec![vec![10, 11], vec![20, 21]];
+        let mut single = prompts.clone();
+        record_inputs(&mut single, &[12, 22], &[13, 23], 1);
+        record_inputs(&mut single, &[13, 23], &[14, 24], 1);
+        record_inputs(&mut single, &[14, 24], &[15, 25], 1);
+        let mut multi = prompts;
+        record_inputs(&mut multi, &[12, 22], &[13, 14, 15, 23, 24, 25], 3);
+        assert_eq!(single, multi);
+        assert_eq!(
+            single,
+            vec![vec![10, 11, 12, 13, 14], vec![20, 21, 22, 23, 24]]
+        );
+    }
 }

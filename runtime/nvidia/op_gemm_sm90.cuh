@@ -1229,7 +1229,10 @@ static __device__ void d_quant_fp8_ws384(uint8_t* __restrict__ xq, __nv_bfloat16
 #pragma unroll
                     for (int j = 0; j < 8; j++) {
                         const float g = __bfloat162float(vg.x[j]);
-                        const float a = (act == PLOW_ACT_SILU_) ? act_silu(g) : act_gelu_tanh(g);
+                        float a = (act == PLOW_ACT_SILU_) ? act_silu(g) : act_gelu_tanh_pf(g);
+#if defined(PLOW_NV_GEMMA) && PLOW_NV_GEMMA && defined(PLOW_NV_GEMMA_GLU_BF16) && PLOW_NV_GEMMA_GLU_BF16
+                        if (act != PLOW_ACT_SILU_) a = __bfloat162float(__float2bfloat16(a));
+#endif
                         vo.x[j] = __float2bfloat16(a * __bfloat162float(vu.x[j]));
                         amax = fmaxf(amax, fabsf(__bfloat162float(vo.x[j])));
                     }
@@ -1238,7 +1241,10 @@ static __device__ void d_quant_fp8_ws384(uint8_t* __restrict__ xq, __nv_bfloat16
             } else {
                 for (unsigned kk = lane; kk < K; kk += 32u) {
                     const float g = __bfloat162float(gate[row + kk]);
-                    const float a = (act == PLOW_ACT_SILU_) ? act_silu(g) : act_gelu_tanh(g);
+                    float a = (act == PLOW_ACT_SILU_) ? act_silu(g) : act_gelu_tanh(g);
+#if defined(PLOW_NV_GEMMA) && PLOW_NV_GEMMA && defined(PLOW_NV_GEMMA_GLU_BF16) && PLOW_NV_GEMMA_GLU_BF16
+                    if (act != PLOW_ACT_SILU_) a = __bfloat162float(__float2bfloat16(a));
+#endif
                     const __nv_bfloat16 fb = __float2bfloat16(a * __bfloat162float(up[row + kk]));
                     x[row + kk] = fb;
                     amax = fmaxf(amax, fabsf(__bfloat162float(fb)));
@@ -1664,6 +1670,12 @@ static __device__ void d_gemm_glu_sm90_tma_ws384_gemma4_role(
 }
 
 #if PLOW_NV_W8A8
+#ifndef PLOW_NV_GEMMA4_GLU_FP8_PROMOTE
+#define PLOW_NV_GEMMA4_GLU_FP8_PROMOTE 0
+#endif
+#ifndef PLOW_NV_GEMMA4_GLU_FP8_PROMOTE_STAGES
+#define PLOW_NV_GEMMA4_GLU_FP8_PROMOTE_STAGES 1
+#endif
 #define PGM90_GEMMA4_GLU_W8A8_BK 128
 #define PGM90_GEMMA4_GLU_W8A8_TILE_BYTES \
     (PGM90_GEMMA4_GLU_BM * PGM90_GEMMA4_GLU_W8A8_BK)
@@ -1754,6 +1766,54 @@ static __device__ void d_gemm_glu_w8a8_sm90_tma_ws384_gemma4_role(
             const int tn = tni * PGM90_GEMMA4_GLU_BN;
             float gate[PGM90_GEMMA4_GLU_BN / 2];
             float up[PGM90_GEMMA4_GLU_BN / 2];
+#if PLOW_NV_GEMMA4_GLU_FP8_PROMOTE
+            float partial[PGM90_GEMMA4_GLU_BN / 2];
+#pragma unroll
+            for (int i = 0; i < PGM90_GEMMA4_GLU_BN / 2; ++i) {
+                gate[i] = 0.f;
+                up[i] = 0.f;
+            }
+#endif
+#if PLOW_NV_GEMMA4_GLU_FP8_PROMOTE
+            constexpr int GROUP = PLOW_NV_GEMMA4_GLU_FP8_PROMOTE_STAGES;
+            static_assert(GROUP >= 1 && GROUP < PGM90_GEMMA4_GLU_STAGES && KSTEPS % GROUP == 0,
+                          "GLU promotion group must fit the ring and divide K steps");
+            for (int ks = 0; ks < KSTEPS; ks += GROUP, step += GROUP) {
+#pragma unroll
+                for (int j = 0; j < GROUP; ++j)
+                    sm90_mbar_wait(full + (step + j) % PGM90_GEMMA4_GLU_STAGES,
+                                   ((step + j) / PGM90_GEMMA4_GLU_STAGES) & 1);
+                // Reuse one partial accumulator to keep both FP32 sums within the register budget.
+#pragma unroll
+                for (int matrix = 0; matrix < 2; ++matrix) {
+                    sm90_wg_fence();
+#pragma unroll
+                    for (int j = 0; j < GROUP; ++j) {
+                        const int stage = (step + j) % PGM90_GEMMA4_GLU_STAGES;
+                        const uint8_t* a = as + stage * PGM90_GEMMA4_GLU_W8A8_TILE_BYTES +
+                            consumer * 64 * PGM90_GEMMA4_GLU_W8A8_BK;
+                        const uint8_t* w = (matrix == 0 ? gs : us) +
+                            stage * PGM90_GEMMA4_GLU_W8A8_TILE_BYTES;
+#pragma unroll
+                        for (int sub = 0; sub < 4; ++sub)
+                            wgmma_m64n128k32(partial, sm90_desc(a + sub * 32),
+                                             sm90_desc(w + sub * 32), j != 0 || sub != 0);
+                    }
+                    sm90_wg_commit();
+                    sm90_wg_wait<0>();
+#pragma unroll
+                    for (int i = 0; i < PGM90_GEMMA4_GLU_BN / 2; ++i) {
+                        if (matrix == 0) gate[i] += partial[i];
+                        else up[i] += partial[i];
+                    }
+                }
+                if (local_tid == 0) {
+#pragma unroll
+                    for (int j = 0; j < GROUP; ++j)
+                        sm90_mbar_arrive(empty + (step + j) % PGM90_GEMMA4_GLU_STAGES);
+                }
+            }
+#else
             int previous = -1;
             for (int ks = 0; ks < KSTEPS; ++ks, ++step) {
                 const int stage = step % PGM90_GEMMA4_GLU_STAGES;
@@ -1778,6 +1838,7 @@ static __device__ void d_gemm_glu_w8a8_sm90_tma_ws384_gemma4_role(
             }
             sm90_wg_wait<0>();
             if (previous >= 0 && local_tid == 0) sm90_mbar_arrive(empty + previous);
+#endif
 
             const int r0 = tm + consumer * 64 + warp * 16 + (lane >> 2);
             const int c0 = tn + 2 * (lane & 3);

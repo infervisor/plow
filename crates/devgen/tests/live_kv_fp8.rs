@@ -160,6 +160,8 @@ fn packed_contract(p: &plow_asset::program::Packet<'_>, live: &plow_asset::live_
     let manifest = Manifest {
         version: live.version,
         max_request_rows: None,
+        stage_rows: None,
+        stages: Vec::new(),
         slot,
         request,
         maps,

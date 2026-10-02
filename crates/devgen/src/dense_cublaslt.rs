@@ -288,6 +288,22 @@ fn isolate_segments(
 }
 
 fn prefill_eligible(model: &Model, op: &packet::dev::DevInst, rows: u32, profile: &str) -> bool {
+    if matches!(DevOp::from_u16(op.op), Some(DevOp::GemmFp8 | DevOp::GemmMedFp8 | DevOp::GemmSmallFp8)) {
+        let rows = packet::devbuild::program_rows(rows);
+        return op.blocks > 0
+            && op.i[0] == rows
+            && plow_asset::segment_roles::cublaslt_prefill_fp8(profile, rows, op.i[1], op.i[2])
+            && op.i[3..6].iter().all(|&value| value == 0)
+            && op.t[5..].iter().all(|&tensor| tensor == packet::dev::TENSOR_NONE)
+            && op.t[..5].iter().copied().collect::<std::collections::BTreeSet<_>>().len() == 5
+            && [
+                (op.t[0], u64::from(rows) * u64::from(op.i[1]) * 2),
+                (op.t[1], u64::from(rows) * u64::from(op.i[2])),
+                (op.t[2], u64::from(op.i[1]) * u64::from(op.i[2])),
+                (op.t[3], u64::from(rows) * 4),
+                (op.t[4], u64::from(op.i[1]) * 4),
+            ].into_iter().all(|(handle, bytes)| model.tensors.get(handle as usize).is_some_and(|tensor| tensor.bytes >= bytes));
+    }
     if !matches!(
         DevOp::from_u16(op.op),
         Some(DevOp::Gemm | DevOp::GemmMed | DevOp::GemmSmall)
@@ -422,7 +438,8 @@ fn apply_program(model: &mut Model, index: usize, head: bool) -> Result<Vec<u8>,
     builder.adopt_tensors(model.tensors.clone());
     let mut projections = Vec::new();
     for (pc, inst) in old.insts.iter().enumerate() {
-        let selected = inst.op == DevOp::Gemv as u16 && {
+        let fp8 = matches!(DevOp::from_u16(inst.op), Some(DevOp::GemmFp8));
+        let selected = (inst.op == DevOp::Gemv as u16 || fp8) && {
             let name = &model.tensors[inst.t[2] as usize].name;
             name.contains(".layers.")
                 || (head
@@ -435,9 +452,11 @@ fn apply_program(model: &mut Model, index: usize, head: bool) -> Result<Vec<u8>,
                 || inst.i[0] != model.prog_t[index]
                 || inst.i[1] == 0
                 || inst.i[2] == 0
-                || inst.i[3..].iter().any(|&v| v != 0))
+                || inst.i[3..].iter().any(|&v| v != 0)
+                || (fp8 && (inst.t[..5].contains(&packet::dev::TENSOR_NONE)
+                    || inst.t[3] == inst.t[4])))
         {
-            return Err("cuBLASLt requires ordinary BF16 projection operands".into());
+            return Err("cuBLASLt requires ordinary BF16 or scaled FP8 projection operands".into());
         }
         let deps: Vec<_> = dependencies[pc].iter().map(|&d| d as u32).collect();
         let counter = builder.emit(
@@ -509,7 +528,8 @@ pub(crate) fn packetize_algo_table(
     for index in 0..packet::devbuild::decode_rung_lo(&model.prog_t) {
         let rows = model.prog_t[index];
         for op in &model.progs[index].insts {
-            if prefill_eligible(model, op, rows, profile) {
+            if matches!(DevOp::from_u16(op.op), Some(DevOp::Gemm | DevOp::GemmMed | DevOp::GemmSmall))
+                && prefill_eligible(model, op, rows, profile) {
                 shapes.insert((op.i[0], op.i[1], op.i[2]));
             }
         }
@@ -612,6 +632,37 @@ mod tests {
             tensor.bytes = extent;
         }
         model
+    }
+
+    #[test]
+    fn fp8_prefill_requires_both_scale_vectors_and_keeps_native_down() {
+        let mut model = prefill_model();
+        for _ in 0..2 {
+            let mut tensor = model.tensors[0].clone();
+            tensor.bytes = 15360 * 4;
+            model.tensors.push(tensor);
+        }
+        let scale = model.tensors.len() as u32 - 2;
+        let mut op = model.progs[2].insts[1].clone();
+        op.op = DevOp::GemmFp8 as u16;
+        op.t[3] = scale;
+        op.t[4] = scale + 1;
+        assert!(prefill_eligible(&model, &op, 128, "sm90a"));
+        assert!(prefill_eligible(
+            &model,
+            &op,
+            packet::devbuild::packed_prefill_program_t(128),
+            "sm90a"
+        ));
+        op.t[3] = packet::dev::TENSOR_NONE;
+        assert!(!prefill_eligible(&model, &op, 128, "sm90a"));
+        op.t[3] = scale;
+        op.i[0] = 2048;
+        assert!(!prefill_eligible(&model, &op, 2048, "sm90a"));
+        op.i[0] = 1024;
+        assert!(prefill_eligible(&model, &op, 1024, "sm90a"));
+        model.tensors[scale as usize].bytes = 1024 * 4 - 1;
+        assert!(!prefill_eligible(&model, &op, 1024, "sm90a"));
     }
 
     #[test]

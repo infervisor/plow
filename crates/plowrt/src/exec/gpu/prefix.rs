@@ -134,7 +134,7 @@ impl GpuEngine {
             || (requested.is_none()
                 && (capability != (9, 0)
                     || config.nv_vmm_live()
-                    || config.nv_vmm_live_rings()
+                    || config.nv_vmm_live_rings() == Some(true)
                     || blob.tp.is_some()
                     || blob.sections.iter().any(|section| {
                         matches!(

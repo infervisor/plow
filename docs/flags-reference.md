@@ -912,6 +912,10 @@ object, `PLOW_BUILD_PFATTN_KV64=0`, `PLOW_BUILD_PFATTN_QK_UNROLL=4`), `PLOW_BUIL
 `PLOW_BUILD_FATLITE_MOE` follows the packet (on when it carries the grouped Gemma MoE prefill
 bodies, which no other object implements). `PLOW_BUILD_PFATTN_HD512_PX4_BQ64` stays opt-in: that
 object hardcodes one full-attention KV head. Each `=0` is the rollback.
+`PLOW_BUILD_FP8KV_FA=1` builds the separate packed FP8-KV attention object
+`interp_sm90a_pfpackedfa_fp8kv.cubin` with both head shapes and `PLOW_NV_FA_PIPE=1`.
+It requires a packet with FP8 FlashPrefill and no BF16 FlashPrefill; test it with
+`PLOW_PF_SEG_FA512=all` before including it in a serving recipe.
 
 Ablation-only `PLOW_BUILD_*` switches, default off, leave them off unless
 reproducing a specific finding: `FA_ROPE`, `FA_WGITEM`, `FP8KV`, `GEMM_OCC1`,

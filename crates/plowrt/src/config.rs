@@ -748,9 +748,9 @@ pub struct NvidiaRuntimeConfig {
     #[arg(long = "vmm-live", env = "PLOW_VMM_LIVE", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub vmm_live: bool,
 
-    /// Retain whole sliding-ring slots on first use; requires live KV without prefix reuse.
-    #[arg(long = "vmm-live-rings", env = "PLOW_VMM_LIVE_RINGS", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
-    pub vmm_live_rings: bool,
+    /// Allocate sliding rings per live slot. Unset selects by capacity; false preallocates them.
+    #[arg(long = "vmm-live-rings", env = "PLOW_VMM_LIVE_RINGS", value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub vmm_live_rings: Option<bool>,
 
     /// Track NV dense decode KV-split count from the LIVE `kv_len` instead of
     /// the `max_ctx` the emitter baked it from (NVIDIA twin of `PLOW_MLA_NS_LIVE`).
@@ -1675,10 +1675,10 @@ impl RuntimeConfig {
     }
 
     #[cfg(feature = "cuda")]
-    pub(crate) fn nv_vmm_live_rings(&self) -> bool {
+    pub(crate) fn nv_vmm_live_rings(&self) -> Option<bool> {
         select_compat(
             self.nv.vmm_live_rings,
-            Self::env_bool("PLOW_VMM_LIVE_RINGS"),
+            Self::env_bool("PLOW_VMM_LIVE_RINGS").map(Some),
             !Self::is_initialized(),
         )
     }
@@ -2404,20 +2404,29 @@ mod tests {
         let config = super::NvidiaRuntimeConfig::from_arg_matches(&matches).unwrap();
         assert!(config.vmm_live);
         assert_eq!(config.vmm_prefix, Some(false));
-        assert!(!config.vmm_live_rings);
+        assert_eq!(config.vmm_live_rings, None);
         let command = super::NvidiaRuntimeConfig::augment_args(clap::Command::new("test"));
         let arg = command
             .get_arguments()
             .find(|arg| arg.get_id() == "vmm_live_rings")
             .unwrap();
-        assert_eq!(arg.get_default_values(), ["false"]);
+        assert!(arg.get_default_values().is_empty());
         let matches = command
             .try_get_matches_from(["test", "--vmm-live=true", "--vmm-live-rings=true"])
             .unwrap();
-        assert!(
+        assert_eq!(
             super::NvidiaRuntimeConfig::from_arg_matches(&matches)
                 .unwrap()
-                .vmm_live_rings
+                .vmm_live_rings,
+            Some(true)
+        );
+        let command = super::NvidiaRuntimeConfig::augment_args(clap::Command::new("test"));
+        let matches = command
+            .try_get_matches_from(["test", "--vmm-live-rings=false"])
+            .unwrap();
+        assert_eq!(
+            super::NvidiaRuntimeConfig::from_arg_matches(&matches).unwrap().vmm_live_rings,
+            Some(false)
         );
     }
 

@@ -1278,9 +1278,13 @@ pub struct EmitConfig {
     #[arg(long = "emit-decode-cublaslt-head", env = "PLOW_EMIT_DECODE_CUBLASLT_HEAD", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub decode_cublaslt_head: bool,
 
-    /// Emit the measured SM90 BF16 prefill projections as packet-declared cuBLASLt segments.
+    /// Emit measured SM90 BF16 or Gemma-4 W8A8 prefill projections as cuBLASLt segments.
     #[arg(long = "emit-prefill-cublaslt", env = "PLOW_EMIT_PREFILL_CUBLASLT", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub prefill_cublaslt: bool,
+
+    /// Compile the SM90 wide decode object with the 64-row W8A16 tensor-core arm.
+    #[arg(long = "fp8-decode-tc64", env = "PLOW_FP8_DECODE_TC64", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub fp8_decode_tc64: bool,
 
     /// Isolate each layer's grouped MoE prefill GLU + DOWN pair as a packet-declared library
     /// segment, which the CUDA runtime serves with cuBLASLt grouped matmuls under
@@ -1682,6 +1686,7 @@ impl EmitConfig {
             decode_cublaslt_min_rows: env_u32("PLOW_EMIT_DECODE_CUBLASLT_MIN_ROWS"),
             decode_cublaslt_head: env_bool("PLOW_EMIT_DECODE_CUBLASLT_HEAD"),
             prefill_cublaslt: env_bool("PLOW_EMIT_PREFILL_CUBLASLT"),
+            fp8_decode_tc64: env_bool("PLOW_FP8_DECODE_TC64"),
             moe_pf_lt: env_bool("PLOW_EMIT_MOE_PF_LT"),
             moe_dec_lt: env_bool("PLOW_EMIT_MOE_DEC_LT"),
             gemma_gemm_lt: env_bool("PLOW_GEMMA_GEMM_LT"),

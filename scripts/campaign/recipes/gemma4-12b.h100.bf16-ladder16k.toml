@@ -127,7 +127,7 @@ nprompt = 32
 # TTFT and TPOT level to 0.1 %. 128/C4 p99 ITL 42.4 -> 11.3 and TTFT 40.5 -> 36.9; 15000/C4 TTFT
 # 1439 -> 1180 ms for TPOT 22.29 -> 24.08 (E2E 1.079 -> 1.071 x vLLM). C4 at 1024-8192 in is
 # unchanged: there p99 ITL is prefill interference, not the wave.
-serve_env = { PLOW_OBJECTIVE = "latency", PLOW_DECODE_MAX_RUNG = "4" }
+serve_env = { PLOW_DECODE_MAX_RUNG = "4" }
 
 [bench.profiles.high_concurrency]
 in_lens = "128 1024 4096 8192 15000"
@@ -138,7 +138,7 @@ nprompt = 64
 # 74.9 ms, p99 ITL 98.5 -> 14.4, 1164 -> 1204 tok/s, TPOT 12.55 -> 12.71; 1024 / 4096 in level.
 # FAST_PROBE: a cold backlog tries the widest rung after one sample instead of four. C16, p12r,
 # 64 prompts (agent/pack-fairness): 128 in P99 TTFT 170 -> 150 ms, mean / tok/s level, 1024 / 4096 level.
-serve_env = { PLOW_OBJECTIVE = "throughput", PLOW_MULTISTEP = "0", PLOW_DECODE_MAX_RUNG = "16" }
+serve_env = { PLOW_MULTISTEP = "0", PLOW_DECODE_MAX_RUNG = "16" }
 
 [reference]
 csv = "perf-data/campaign/gemma4-12b.h100.reference-vllm028-bf16.csv"
