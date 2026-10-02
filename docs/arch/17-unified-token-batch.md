@@ -24,6 +24,15 @@ precedence. There are **two** executors, with two different gates:
   carries packed-prefill metadata and a packed terminal, and the engine has no recurrent state
   and no mixed step. `GpuEngine::token_batch_step` and `token_batch_step_pipelined` are its
   entry points. **The default therefore does enable token batching on H100.**
+  Decode rows riding a launch (the leading single-row `Phase::Decode` spans) use **split
+  attention** (`exec/gpu/riders.rs`, default on, `PLOW_TB_SPLIT_ATTN=0` is the rollback): the
+  launch's prefill FlashAttention gets a request table without them, and after each attention
+  segment the decode object's `plow_<arch>_rider_flash{256,512}` (split-KV flash decode over a
+  slot map) and `plow_<arch>_rider_merge` write their output rows. Before, each rider was a
+  one-row request of the prefill FA (the hd512 role runs requests serially across the whole
+  grid), 0.53-0.87 ms per rider on Gemma-4-12B — about a standalone decode row, so riding
+  bought nothing. It arms per bucket when the decode object carries the kernels and every
+  attention site matches the widest decode rung's cache, window, ring and scale.
 
 Tensor parallelism and unsupported programs use ordinary execution. The ring-aware snapshot
 prefix cache composes with this route.
