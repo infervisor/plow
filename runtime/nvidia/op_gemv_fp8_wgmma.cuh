@@ -1,9 +1,15 @@
 #pragma once
 
-#define PLOW_NV_FP8_DECODE_WGMMA_ARENA_BYTES 70720u
+#define PLOW_NV_FP8_DECODE_WGMMA_ARENA_BYTES 83200u
 
+/* Narrowest rung that takes the W8A8 tensor-core walk. Rows below 8 run the Rows=8 instance with
+ * zero-padded x rows (the stage already zero-fills m >= M). */
+#ifndef PLOW_NV_FP8_DECODE_WGMMA_MIN
+#define PLOW_NV_FP8_DECODE_WGMMA_MIN 8
+#endif
 __device__ __forceinline__ bool gemv_fp8_wgmma_supported(unsigned M, unsigned K) {
-    return (M == 8 || M == 16) && K && !(K % 16) && blockDim.x == 256;
+    return M >= PLOW_NV_FP8_DECODE_WGMMA_MIN && M <= 64 && K && !(K % 16) &&
+           blockDim.x == 256;
 }
 
 template <unsigned Rows>
@@ -15,14 +21,37 @@ __device__ __forceinline__ void gemv_fp8_wgmma_mma(float (&acc)[Rows / 2],
             "{%0,%1,%2,%3}, %4, %5, p, 1, 1; }"
             : "+f"(acc[0]), "+f"(acc[1]), "+f"(acc[2]), "+f"(acc[3])
             : "l"(weights), "l"(inputs), "r"(accumulate));
-    } else {
-        static_assert(Rows == 16);
+    } else if constexpr (Rows == 16) {
         asm volatile("{ .reg .pred p; setp.ne.b32 p, %10, 0;\n"
             "wgmma.mma_async.sync.aligned.m64n16k32.f32.e4m3.e4m3 "
             "{%0,%1,%2,%3,%4,%5,%6,%7}, %8, %9, p, 1, 1; }"
             : "+f"(acc[0]), "+f"(acc[1]), "+f"(acc[2]), "+f"(acc[3]),
               "+f"(acc[4]), "+f"(acc[5]), "+f"(acc[6]), "+f"(acc[7])
             : "l"(weights), "l"(inputs), "r"(accumulate));
+    } else if constexpr (Rows == 32) {
+        asm volatile("{ .reg .pred p; setp.ne.b32 p, %18, 0;\n"
+            "wgmma.mma_async.sync.aligned.m64n32k32.f32.e4m3.e4m3 "
+            "{%0,%1,%2,%3,%4,%5,%6,%7,%8,%9,%10,%11,%12,%13,%14,%15}, %16, %17, p, 1, 1; }"
+            : "+f"(acc[0]), "+f"(acc[1]), "+f"(acc[2]), "+f"(acc[3]),
+              "+f"(acc[4]), "+f"(acc[5]), "+f"(acc[6]), "+f"(acc[7]),
+              "+f"(acc[8]), "+f"(acc[9]), "+f"(acc[10]), "+f"(acc[11]),
+              "+f"(acc[12]), "+f"(acc[13]), "+f"(acc[14]), "+f"(acc[15])
+            : "l"(weights), "l"(inputs), "r"(accumulate));
+    } else if constexpr (Rows == 64) {
+        asm volatile("{ .reg .pred p; setp.ne.b32 p, %34, 0;\n"
+            "wgmma.mma_async.sync.aligned.m64n64k32.f32.e4m3.e4m3 "
+            "{%0,%1,%2,%3,%4,%5,%6,%7,%8,%9,%10,%11,%12,%13,%14,%15,%16,%17,%18,%19,%20,%21,%22,%23,%24,%25,%26,%27,%28,%29,%30,%31}, %32, %33, p, 1, 1; }"
+            : "+f"(acc[0]), "+f"(acc[1]), "+f"(acc[2]), "+f"(acc[3]),
+              "+f"(acc[4]), "+f"(acc[5]), "+f"(acc[6]), "+f"(acc[7]),
+              "+f"(acc[8]), "+f"(acc[9]), "+f"(acc[10]), "+f"(acc[11]),
+              "+f"(acc[12]), "+f"(acc[13]), "+f"(acc[14]), "+f"(acc[15]),
+              "+f"(acc[16]), "+f"(acc[17]), "+f"(acc[18]), "+f"(acc[19]),
+              "+f"(acc[20]), "+f"(acc[21]), "+f"(acc[22]), "+f"(acc[23]),
+              "+f"(acc[24]), "+f"(acc[25]), "+f"(acc[26]), "+f"(acc[27]),
+              "+f"(acc[28]), "+f"(acc[29]), "+f"(acc[30]), "+f"(acc[31])
+            : "l"(weights), "l"(inputs), "r"(accumulate));
+    } else {
+        static_assert(Rows == 8 || Rows == 16 || Rows == 32 || Rows == 64);
     }
 }
 
@@ -40,6 +69,7 @@ static __device__ void d_gemv_fp8_wgmma(
     constexpr unsigned input_offset = weight_bytes * (Glu ? 2 : 1);
     constexpr unsigned stage_bytes = input_offset + Rows * 128;
     constexpr unsigned Acc = Rows / 2;
+    static_assert(2 * stage_bytes + Rows * sizeof(float) + 1024 <= PLOW_NV_FP8_DECODE_WGMMA_ARENA_BYTES);
     auto* scales = reinterpret_cast<float*>(base + 2 * stage_bytes);
     const unsigned tid = threadIdx.x, group = tid / 128, lane = tid & 31, warp = (tid / 32) & 3;
     for (unsigned row = tid / 32; row < M; row += 8) {

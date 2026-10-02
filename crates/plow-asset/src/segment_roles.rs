@@ -40,10 +40,15 @@ pub const CUBLASLT_PREFILL_ROWS: [u32; 3] = [128, 256, 512];
 /// N+1 rows. Left out, such a rung ran every projection on the native GEMM object. Measured on
 /// h100-sxm5 2026-09-21: 12B C1 TTFT at 1024 in 47.22 -> 46.82 ms on the 1088 rung; 1152 (26B and
 /// 12B) and 4160 neutral.
+/// 2176 is 2048+128, the same BOS-swallowing step as 1152 and 4224: without it a 2048-token
+/// prompt has no qualified rung and every projection at that rung reverts to the native GEMM
+/// object (Gemm segments 206 -> 121 in build.json).
+pub const CUBLASLT_PREFILL_WIDE_ROWS: [u32; 13] = [
+    1024, 1088, 1152, 2048, 2176, 4096, 4160, 4224, 8192, 8320, 12288, 12416, 16384,
+];
 /// Short-prompt speech rungs (`PLOW_PF_LADDER_APPEND`): codec-LM prompts are ~20-60 rows, guided
 /// speech-LM prefills (voice rows + text) and audio-LM prefills (audio rows + prompt) ~150-420.
 pub const CUBLASLT_PREFILL_SPEECH_ROWS: [u32; 2] = [64, 384];
-pub const CUBLASLT_PREFILL_WIDE_ROWS: [u32; 12] = [1024, 1088, 1152, 2048, 4096, 4160, 4224, 8192, 8320, 12288, 12416, 16384];
 pub const CUBLASLT_PREFILL_GEMMA4_SHAPES: [(u32, u32); 8] = [
     (15360, 3840),
     (2048, 3840),
@@ -107,6 +112,15 @@ pub const CUBLASLT_PREFILL_LLAMA_TTS_SHAPES: [(u32, u32); 7] = [
 /// Qwen3-1.7B decoder (Qwen3-ASR thinker: hidden 2048, 16/8 heads x 128, inter 6144): q/o, k/v,
 /// unfused gate/up, down.
 pub const CUBLASLT_PREFILL_QWEN3_1_7B_SHAPES: [(u32, u32); 4] = [(2048, 2048), (1024, 2048), (6144, 2048), (2048, 6144)];
+
+pub fn cublaslt_prefill_fp8(profile: &str, m: u32, n: u32, k: u32) -> bool {
+    matches!(profile, "sm90a" | "sm_90a")
+        && [64, 128, 256, 512, 1024, 1088, 1152, 2048, 2112, 2176, 4096, 4160, 4224, 8192].contains(&m)
+        && CUBLASLT_PREFILL_GEMMA4_SHAPES.contains(&(n, k))
+        && !((n, k) == (3840, 15360) && (m == 1088 || m >= 2048))
+        && !(m == 4160 && [(2048, 3840), (3840, 8192)].contains(&(n, k)))
+        && !(m == 2112 && [(3840, 4096), (3840, 8192)].contains(&(n, k)))
+}
 
 pub fn cublaslt_prefill_bf16(profile: &str, m: u32, n: u32, k: u32) -> bool {
     // At M <= 512 the small set is the down projection (3840, 15360), the o projection
@@ -397,6 +411,20 @@ impl SegmentRoles {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn fp8_padded_rungs_keep_native_losses_and_near_ties() {
+        for m in [64, 1088, 1152, 2112, 2176, 4160, 4224] {
+            for (n, k) in super::CUBLASLT_PREFILL_GEMMA4_SHAPES {
+                let native = (n, k) == (3840, 15360) && (m == 1088 || m >= 2048)
+                    || m == 4160 && [(2048, 3840), (3840, 8192)].contains(&(n, k))
+                    || m == 2112 && [(3840, 4096), (3840, 8192)].contains(&(n, k));
+                assert_eq!(super::cublaslt_prefill_fp8("sm90a", m, n, k), !native);
+            }
+        }
+        assert!(!super::cublaslt_prefill_fp8("sm120", 1152, 4096, 3840));
+        assert!(!super::cublaslt_prefill_fp8("sm90a", 1216, 4096, 3840));
+    }
+
     use super::*;
     #[test]
     fn cublaslt_prefill_policy_is_exactly_the_measured_sm90_bf16_cells() {

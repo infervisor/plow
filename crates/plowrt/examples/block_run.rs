@@ -9,7 +9,8 @@
 //!                              [--iters 100] [--warmup 10] [--prefill-iters 10]
 //!                              [--pf-chunk N] [--pf-cap ROWS]
 //!   block_run <asset-dir> mixed-check --rows 128 --decode 1
-//!   block_run <asset-dir> packed-check
+//!   block_run <asset-dir> packed-check [--requests 16 --query-rows 128 --kv-base 4096]
+//!                                      [--dump-dir dir] [--dump-tensors name,name]
 //!
 //! `check` feeds a hidden-state into `act.x` (an .npy or a seeded synthetic),
 //! launches one prefill bucket, reads `act.x` back, and prints shape / min /
@@ -208,7 +209,7 @@ mod cuda {
                 bench(&mut e, hidden, &flag)
             }
             "mixed-check" => mixed_check(&mut e, &desc, hidden, &out_name, &flag),
-            "packed-check" => packed_check(&mut e, &desc, hidden, &out_name),
+            "packed-check" => packed_check(&mut e, &desc, hidden, &out_name, &flag),
             other => Err(format!("unknown verb {other:?} (check|bench|mixed-check)").into()),
         }
     }
@@ -218,24 +219,43 @@ mod cuda {
         desc: &plow_asset::BlockDescriptor,
         hidden: usize,
         out_name: &str,
+        flag: &dyn Fn(&str) -> Option<String>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         use plowrt::exec::gpu::PfBatchReq;
 
-        let slots = [3usize, 15];
-        let starts = [31usize, 95];
-        let rows = [33usize, 31];
+        let (slots, starts, rows) = if let Some(count) = flag("--requests") {
+            let count: usize = count.parse()?;
+            let query_rows: usize = flag("--query-rows")
+                .ok_or("packed-check --requests needs --query-rows")?
+                .parse()?;
+            let kv_base: usize = flag("--kv-base")
+                .ok_or("packed-check --requests needs --kv-base")?
+                .parse()?;
+            if !(1..=16).contains(&count) || query_rows == 0 || kv_base < query_rows {
+                return Err(
+                    "packed-check needs 1..16 requests and kv-base >= query-rows > 0".into(),
+                );
+            }
+            let slots = (0..count).map(|r| 3 + 8 * r).collect::<Vec<_>>();
+            let starts = (0..count)
+                .map(|r| kv_base + 64 * r - query_rows)
+                .collect::<Vec<_>>();
+            (slots, starts, vec![query_rows; count])
+        } else {
+            (vec![3usize, 15], vec![31usize, 95], vec![33usize, 31])
+        };
         if !e.pf_batch_enabled()
-            || e.batch() <= slots[1]
-            || e.max_ctx() < starts[1] + rows[1]
+            || e.batch() <= *slots.last().unwrap()
+            || e.max_ctx() < starts.last().unwrap() + rows.last().unwrap()
             || e.pf_max_rows() < rows.iter().sum()
         {
-            return Err("packed-check asset lacks B16 packed-prefill capacity".into());
+            return Err("packed-check asset lacks requested packed-prefill capacity".into());
         }
         let prompts: Vec<Vec<u32>> = starts
             .iter()
-            .zip(rows)
+            .zip(rows.iter())
             .enumerate()
-            .map(|(request, (&start, rows))| {
+            .map(|(request, (&start, &rows))| {
                 (0..start + rows + 1)
                     .map(|position| 100 + ((position * 17 + request * 101) % 1000) as u32)
                     .collect()
@@ -246,13 +266,18 @@ mod cuda {
         let prepare = |e: &mut plowrt::exec::gpu::GpuEngine| {
             for request in 0..slots.len() {
                 e.begin_slot(slots[request], prompts[request].len() + 1)?;
-                e.upload_activation("act.x", &synth(starts[request], hidden))?;
-                e.prefill_batched(&[PfBatchReq {
-                    slot: slots[request],
-                    prompt: &prompts[request],
-                    c0: 0,
-                    len: starts[request],
-                }])?;
+                let mut c0 = 0;
+                while c0 < starts[request] {
+                    let len = (starts[request] - c0).min(e.pf_max_rows()).min(1024);
+                    e.upload_activation("act.x", &synth(len, hidden))?;
+                    e.prefill_batched(&[PfBatchReq {
+                        slot: slots[request],
+                        prompt: &prompts[request],
+                        c0,
+                        len,
+                    }])?;
+                    c0 += len;
+                }
             }
             Ok::<_, plowrt::RuntimeError>(())
         };
@@ -260,22 +285,42 @@ mod cuda {
         prepare(e)?;
         let mut reference = Vec::new();
         let mut row0 = 0;
+        let mut serial_ms = 0.0;
         for request in 0..slots.len() {
             let row1 = row0 + rows[request];
             e.upload_activation("act.x", &inputs[row0 * hidden..row1 * hidden])?;
+            let started = Instant::now();
             e.prefill_batched(&[PfBatchReq {
                 slot: slots[request],
                 prompt: &prompts[request],
                 c0: starts[request],
                 len: rows[request],
             }])?;
+            serial_ms += started.elapsed().as_secs_f64() * 1e3;
             reference.push(e.download_activation(out_name)?[..rows[request] * hidden].to_vec());
+            if request == 0 {
+                dump_packed_stages(e, flag, "serial")?;
+            }
             row0 = row1;
         }
         let ranges: Vec<_> = (0..slots.len())
             .map(|request| (slots[request], starts[request], rows[request]))
             .collect();
         let reference_kv = snapshot_kv_requests(e, desc, &ranges)?;
+        if let Some(dir) = flag("--dump-dir") {
+            let dir = Path::new(&dir);
+            std::fs::create_dir_all(dir)?;
+            let serial: Vec<f32> = reference
+                .iter()
+                .flat_map(|rows| rows.iter().copied())
+                .collect();
+            npy::write_f32(
+                &dir.join("serial-activation.npy"),
+                &[rows.iter().sum(), hidden],
+                &serial,
+            )?;
+            std::fs::write(dir.join("serial-kv.bin"), &reference_kv)?;
+        }
 
         prepare(e)?;
         e.upload_activation("act.x", &inputs)?;
@@ -287,9 +332,28 @@ mod cuda {
                 len: rows[request],
             })
             .collect();
+        let started = Instant::now();
         e.prefill_batched(&requests)?;
+        let packed_ms = started.elapsed().as_secs_f64() * 1e3;
         let packed = e.download_activation(out_name)?;
+        dump_packed_stages(e, flag, "packed")?;
+        let packed_kv = snapshot_kv_requests(e, desc, &ranges)?;
+        if let Some(dir) = flag("--dump-dir") {
+            let dir = Path::new(&dir);
+            std::fs::create_dir_all(dir)?;
+            npy::write_f32(
+                &dir.join("packed-activation.npy"),
+                &[rows.iter().sum(), hidden],
+                &packed[..rows.iter().sum::<usize>() * hidden],
+            )?;
+            std::fs::write(dir.join("packed-kv.bin"), &packed_kv)?;
+        }
+        println!(
+            "packed-check timing: requests={} query_rows={} kv_base={} serial_ms={serial_ms:.4} packed_ms={packed_ms:.4}",
+            slots.len(), rows.iter().sum::<usize>(), starts[0] + rows[0]
+        );
         let mut row0 = 0;
+        compare_kv(e, desc, "packed sparse-slot KV", &packed_kv, &reference_kv)?;
         for (request, expected) in reference.iter().enumerate() {
             let row1 = row0 + rows[request];
             compare_f32(
@@ -301,16 +365,35 @@ mod cuda {
             )?;
             row0 = row1;
         }
-        compare_bf16(
-            "packed sparse-slot KV",
-            &snapshot_kv_requests(e, desc, &ranges)?,
-            &reference_kv,
-            6.0e-3,
-            5.0e-2,
-        )?;
-        println!(
-            "packed-check: sparse slots 3/15, absolute starts 31/95, ragged rows 33/31 parity=PASS"
-        );
+        println!("packed-check: requests={} query_rows={} kv_base={} serial_ms={serial_ms:.4} packed_ms={packed_ms:.4} parity=PASS",
+            slots.len(), rows.iter().sum::<usize>(), starts[0] + rows[0]);
+        Ok(())
+    }
+
+    fn dump_packed_stages(
+        e: &plowrt::exec::gpu::GpuEngine,
+        flag: &dyn Fn(&str) -> Option<String>,
+        label: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let Some(names) = flag("--dump-tensors") else {
+            return Ok(());
+        };
+        let dir = PathBuf::from(flag("--dump-dir").ok_or("--dump-tensors needs --dump-dir")?);
+        std::fs::create_dir_all(&dir)?;
+        for name in names
+            .split(',')
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+        {
+            let size = usize::try_from(
+                e.tensor_bytes(name)
+                    .ok_or_else(|| format!("unknown stage tensor {name:?}"))?,
+            )?;
+            let mut data = vec![0u8; size];
+            e.read_tensor_range(name, 0, &mut data)?;
+            let filename = format!("{label}-{}.bin", name.replace('/', "_").replace('.', "_"));
+            std::fs::write(dir.join(filename), data)?;
+        }
         Ok(())
     }
 
@@ -416,12 +499,12 @@ mod cuda {
                 6.0e-3,
                 7.5e-2,
             )?;
-            compare_bf16(
+            compare_kv(
+                e,
+                desc,
                 &format!("span {span} written KV"),
                 &mixed_kv[span],
                 &reference_kv,
-                6.0e-3,
-                5.0e-2,
             )?;
         }
         println!(
@@ -456,26 +539,51 @@ mod cuda {
     ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
         let heads = usize::try_from(desc.dims.kv_heads.ok_or("block has no KV-head count")?)?;
         let head_dim = usize::try_from(desc.dims.head_dim.ok_or("block has no head dimension")?)?;
-        let row_bytes = head_dim.checked_mul(2).ok_or("KV row size overflow")?;
         let mut out = Vec::new();
         for state in &desc.carried_state {
             if state.role != "kv" {
                 continue;
             }
             for name in &state.tensors {
-                let tensor_bytes = e
-                    .tensor_bytes(name)
-                    .ok_or_else(|| format!("missing carried-state tensor {name:?}"))?;
-                let slot_bytes = tensor_bytes / e.batch() as u64;
-                let head_bytes = slot_bytes / heads as u64;
-                for &(slot, position, written_rows) in ranges {
-                    for head in 0..heads {
-                        let offset = slot as u64 * slot_bytes
-                            + head as u64 * head_bytes
-                            + position as u64 * row_bytes as u64;
-                        let begin = out.len();
-                        out.resize(begin + written_rows * row_bytes, 0);
-                        e.read_tensor_range(name, offset, &mut out[begin..])?;
+                let scale_name = format!("{name}_scale");
+                let fp8 = e.tensor_bytes(&scale_name).is_some();
+                let kv_row_bytes = head_dim
+                    .checked_mul(if fp8 { 1 } else { 2 })
+                    .ok_or("KV row size overflow")?;
+                for (tensor, row_bytes) in [(name.as_str(), kv_row_bytes), (&scale_name, 4)] {
+                    if tensor == scale_name.as_str() && !fp8 {
+                        continue;
+                    }
+                    let tensor_bytes = e
+                        .tensor_bytes(tensor)
+                        .ok_or_else(|| format!("missing carried-state tensor {tensor:?}"))?;
+                    let slot_bytes = tensor_bytes / e.batch() as u64;
+                    let head_bytes = slot_bytes / heads as u64;
+                    let row_bytes = row_bytes as u64;
+                    if head_bytes % row_bytes != 0 || head_bytes == 0 {
+                        return Err(format!("invalid KV head stride for {tensor}").into());
+                    }
+                    let capacity = head_bytes / row_bytes;
+                    for &(slot, position, written_rows) in ranges {
+                        if written_rows as u64 > capacity {
+                            return Err("KV snapshot range exceeds physical ring capacity".into());
+                        }
+                        for head in 0..heads {
+                            let mut absolute = position as u64;
+                            let mut remaining = written_rows as u64;
+                            while remaining != 0 {
+                                let physical = absolute % capacity;
+                                let take = remaining.min(capacity - physical);
+                                let offset = slot as u64 * slot_bytes
+                                    + head as u64 * head_bytes
+                                    + physical * row_bytes;
+                                let begin = out.len();
+                                out.resize(begin + (take * row_bytes) as usize, 0);
+                                e.read_tensor_range(tensor, offset, &mut out[begin..])?;
+                                absolute += take;
+                                remaining -= take;
+                            }
+                        }
                     }
                 }
             }
@@ -484,6 +592,31 @@ mod cuda {
             return Err("block descriptor has no KV carried state".into());
         }
         Ok(out)
+    }
+
+    fn compare_kv(
+        e: &plowrt::exec::gpu::GpuEngine,
+        desc: &plow_asset::BlockDescriptor,
+        what: &str,
+        got: &[u8],
+        reference: &[u8],
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let fp8 = desc.carried_state.iter().any(|state| {
+            state.role == "kv"
+                && state
+                    .tensors
+                    .iter()
+                    .any(|name| e.tensor_bytes(&format!("{name}_scale")).is_some())
+        });
+        if fp8 {
+            if got != reference {
+                return Err(format!("{what}: FP8 KV or scale bytes differ").into());
+            }
+            println!("  {what}: {} FP8 KV and scale bytes exact", got.len());
+            Ok(())
+        } else {
+            compare_bf16(what, got, reference, 6.0e-3, 5.0e-2)
+        }
     }
 
     fn compare_f32(
@@ -821,8 +954,8 @@ mod cuda {
                     "latency_us_median": (median * 100.0).round() / 100.0,
                     "latency_us_p95": (p95 * 100.0).round() / 100.0,
                     "tok_s": (tok_s * 10.0).round() / 10.0,
-                    "prefill_ms_median": (pf_med * 1000.0).round() / 1000.0,
-                    "prefill_ms_p95": (pf_p95 * 1000.0).round() / 1000.0,
+                    "prefill_ms_median": pf_med,
+                    "prefill_ms_p95": pf_p95,
                     "prefill_tok_s": (pf_tok_s * 10.0).round() / 10.0,
                 }));
             }

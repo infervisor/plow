@@ -492,7 +492,7 @@ pub const RUNTIME: &[KnobSpec] = &[
     KnobSpec::new("rt.pipe_prefill", Some("PLOW_PIPE_PREFILL"), Layer::Runtime, U32, Default::Static(Val::Nat(0)), OPT_IN),
     KnobSpec::new("rt.vmm_prefix", Some("PLOW_VMM_PREFIX"), Layer::Runtime, Domain::Bool, UNSET, OPT_IN),
     KnobSpec::new("rt.vmm_live", Some("PLOW_VMM_LIVE"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
-    KnobSpec::new("rt.vmm_live_rings", Some("PLOW_VMM_LIVE_RINGS"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
+    KnobSpec::new("rt.vmm_live_rings", Some("PLOW_VMM_LIVE_RINGS"), Layer::Runtime, Domain::Bool, UNSET, OPT_IN),
     KnobSpec::new("rt.upload_direct", Some("PLOW_UPLOAD_DIRECT"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
     KnobSpec::new("rt.cubin", Some("PLOW_NV_CUBIN"), Layer::Runtime, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("rt.cubin_pf", Some("PLOW_NV_CUBIN_PF"), Layer::Runtime, Domain::Str, UNSET, OPT_IN),

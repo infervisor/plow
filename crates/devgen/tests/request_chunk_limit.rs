@@ -32,6 +32,7 @@ fn aggregate_ladders_keep_request_sized_rings_and_require_masked_objects() {
         ("sm_90a", "1024", Some("--fp8-kv"), false, true),
         ("sm_90a", "1024", Some("--fp8-kv"), true, true),
         ("sm_90a", "1024", Some("--fp8"), false, false),
+        ("sm_90a", "1024", Some("--w8a8"), false, true),
     ] {
         let mut argv = vec!["test", "--emit-max-request-chunk", limit];
         argv.extend(precision);

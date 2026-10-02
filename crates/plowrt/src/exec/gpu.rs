@@ -109,16 +109,17 @@ pub(crate) fn live_kv_mappable(
 }
 
 pub(crate) fn live_rings_for_capacity(
-    configured: bool,
+    configured: Option<bool>,
     live: bool,
     max_ctx: Option<u32>,
     batch: Option<u32>,
 ) -> bool {
     // Gemma's flat sliding rings reach 40 GiB at B64; 128K B16 reaches 42 GiB total KV.
-    configured
-        || (live
+    configured.unwrap_or(
+        live
             && (max_ctx.is_some_and(|ctx| ctx >= 131_072)
-                || batch.is_some_and(|batch| batch >= 64)))
+                || batch.is_some_and(|batch| batch >= 64)),
+    )
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -212,6 +213,7 @@ fn interp_candidate(
     profile: &InterpreterProfile,
     want_sm: u32,
     role: Role,
+    fp8_kv: bool,
 ) -> std::result::Result<String, String> {
     let Some(info) = cubin::inspect(image) else {
         return Err("not an ELF cubin".into());
@@ -224,6 +226,9 @@ fn interp_candidate(
     }
     if info.sm != want_sm {
         return Err(format!("built for sm_{}, device is sm_{want_sm}", info.sm));
+    }
+    if cubin::global_u32(image, "plow_fp8_kv_abi") != fp8_kv.then_some(1) {
+        return Err("FP8 KV object capability does not match packet".into());
     }
     match info.interp_entry(role) {
         Some(sym) => Ok(sym.to_string()),
@@ -242,6 +247,7 @@ fn embedded_interp_image(
     profile: &InterpreterProfile,
     want_sm: u32,
     role: Role,
+    fp8_kv: bool,
     rejected: &mut Vec<String>,
 ) -> Option<InterpImage> {
     for s in blob
@@ -252,7 +258,7 @@ fn embedded_interp_image(
         let Some(data) = raw.get(s.offset..s.offset + s.size) else {
             continue;
         };
-        match interp_candidate(data, profile, want_sm, role) {
+        match interp_candidate(data, profile, want_sm, role, fp8_kv) {
             Ok(entry) => {
                 return Some(InterpImage {
                     image: data.to_vec(),
@@ -271,6 +277,7 @@ fn filesystem_interp_image(
     profile: &InterpreterProfile,
     want_sm: u32,
     role: Role,
+    fp8_kv: bool,
     rejected: &mut Vec<String>,
 ) -> Option<InterpImage> {
     let mut paths = vec![assets_dir.join(profile.file(role))];
@@ -291,7 +298,7 @@ fn filesystem_interp_image(
             .unwrap_or_default()
             .to_string_lossy()
             .into_owned();
-        match interp_candidate(&image, profile, want_sm, role) {
+        match interp_candidate(&image, profile, want_sm, role, fp8_kv) {
             Ok(entry) => {
                 return Some(InterpImage {
                     image,
@@ -334,11 +341,17 @@ fn resolve_interp_image(
     want_sm: u32,
     role: Role,
 ) -> Result<Option<InterpImage>> {
+    let fp8_kv = blob.progs.iter().flat_map(|p| &p.insts).any(|inst| {
+        matches!(
+            DevOp::from_u16(inst.op),
+            Some(DevOp::HeadNormRopeFp8 | DevOp::FlashDecodeFp8 | DevOp::FlashPrefillFp8)
+        )
+    });
     // Accept an image iff it is a cubin for THIS device carrying THIS role.
     // `None` from `inspect` means unparseable, not "no entry" — a hand-built
     // object with a stripped symbol table still loads under the profile's
     // expected symbol, which is what the pre-discovery loader always did.
-    let judge = |image: &[u8]| interp_candidate(image, profile, want_sm, role);
+    let judge = |image: &[u8]| interp_candidate(image, profile, want_sm, role, fp8_kv);
 
     // 1. Operator override: forced, and loud when wrong. The CLI flag is read
     // as well as the env var — declaring `--nv-cubin` and then consulting only
@@ -371,13 +384,16 @@ fn resolve_interp_image(
     // 2. Embedded sections. The section NAME is not load-bearing: `plowc
     //    --embed-cubin` labels every image `interp_sm120` regardless of the arch
     //    it just compiled, so only the content can decide.
-    if let Some(image) = embedded_interp_image(blob, raw, profile, want_sm, role, &mut rejected) {
+    if let Some(image) =
+        embedded_interp_image(blob, raw, profile, want_sm, role, fp8_kv, &mut rejected)
+    {
         return Ok(Some(image));
     }
 
     // 3. The assets dir — the profile's expected name first, then everything
     //    else that looks like a cubin, so a misnamed bundle still serves.
-    if let Some(image) = filesystem_interp_image(assets_dir, profile, want_sm, role, &mut rejected)
+    if let Some(image) =
+        filesystem_interp_image(assets_dir, profile, want_sm, role, fp8_kv, &mut rejected)
     {
         return Ok(Some(image));
     }
@@ -1688,6 +1704,7 @@ fn hd512_prefill_segments_have_role(program: &DevProg, roles: &[u8]) -> bool {
 
 struct SegPf {
     f_flash: KernelFn,
+    glu_quant_cached: Option<KernelFn>,
     smem_flash: u32,
     grid_flash: u32,
     f_gemm: KernelFn,
@@ -2206,8 +2223,9 @@ pub struct GpuEngine {
     routed_decode: Option<Arc<moe_lt::RoutedDecode>>,
     /// Keeps the routed decode object loaded for the rung graphs that captured it.
     _routed_object: Option<Arc<moe_lt::RoutedDecode>>,
-    /// The `_gw` object the widest chain launches instead of `f` (8 rows and up).
+    /// Wide-rung object selected for the widest decode chain.
     gemv_wide: Option<Arc<decode_object::BoundDecodeObject>>,
+    gemv_wide_modules: [Option<Arc<decode_object::BoundDecodeObject>>; 2],
     /// T35 (PLOW_PF_SEG_GRAPH=1): cached instantiated segment-chain graphs, keyed by
     /// (bucket, slot-tensor-base, segment range) — one cuGraphLaunch replaces ~480 kernel
     /// submits. A routed bucket's launches run the ranges between its attention segments.
@@ -3973,7 +3991,7 @@ impl GpuEngine {
                     live_kv_manifest.as_ref().map(|manifest| manifest.max_ctx),
                     live_kv_manifest.as_ref().map(|manifest| manifest.batch),
                 );
-                if rings && !configured_rings {
+                if rings && configured_rings.is_none() {
                     tracing::info!(
                         max_ctx = live_kv_manifest.as_ref().map(|manifest| manifest.max_ctx),
                         batch = live_kv_manifest.as_ref().map(|manifest| manifest.batch),
@@ -5013,6 +5031,7 @@ impl GpuEngine {
                     &be,
                     assets_dir,
                     profile.decode_file.trim_end_matches(".cubin"),
+                    false,
                     &module,
                     grid,
                 )?
@@ -5020,7 +5039,24 @@ impl GpuEngine {
             }
             _ => None,
         };
+        let gemv_wide64 = if gemv_wide.is_some() && blob.decode_progs().iter().any(|g| g.t == 64) {
+            decode_object::load_gemv_wide(
+                &be,
+                assets_dir,
+                profile.decode_file.trim_end_matches(".cubin"),
+                true,
+                &module,
+                grid,
+            )?
+        } else {
+            None
+        };
         let wide_object = |rows: usize| {
+            if rows == 64 {
+                if let Some((_, full)) = &gemv_wide64 {
+                    return Some(Arc::clone(full));
+                }
+            }
             gemv_wide.as_ref().filter(|_| rows >= 8).map(|(cap, (narrow, full))| {
                 Arc::clone(if rows > *cap { full } else { narrow })
             })
@@ -6227,6 +6263,10 @@ impl GpuEngine {
             routed_decode: routed_widest,
             _routed_object: routed_decode,
             gemv_wide: wide_object(blob.decode_progs().last().map_or(1, |g| g.t as usize)),
+            gemv_wide_modules: [
+                gemv_wide.as_ref().map(|(_, (_, full))| Arc::clone(full)),
+                gemv_wide64.as_ref().map(|(_, full)| Arc::clone(full)),
+            ],
             decode_packet_roles,
             seg_graphs: std::collections::HashMap::new(),
             smem_pf,
@@ -8870,7 +8910,17 @@ impl GpuEngine {
                 let masked = plow_asset::packed_prefill::MASKED_PADDING_CAPABILITY;
                 let masked_padding = be.module_global_u32(&m1, masked)? == Some(1)
                     && be.module_global_u32(&m2, masked)? == Some(1);
+                let glu_quant_cached = if be.module_global_u32(
+                    &m1,
+                    &format!("plow_glu_quant_cache_abi{seg_global_suffix}"),
+                )? == Some(1)
+                {
+                    Some(be.get_function(&m1, &format!("plow_glu_quant_cached{seg_global_suffix}"))?)
+                } else {
+                    None
+                };
                 let mut sp = SegPf {
+                    glu_quant_cached,
                     masked_padding,
                     f_flash: f1,
                     smem_flash: s1,
@@ -9181,21 +9231,38 @@ impl GpuEngine {
                 }
                 _ => Vec::new(),
             };
+            let cached_quant_function = seg_pf.as_ref().and_then(|sp| sp.glu_quant_cached);
+            let cached_quant_segments =
+                if cached_quant_function.is_some() && seg_mode && qwen_segments.is_empty() {
+                    cublaslt::prefill_glu_quant_segments(g)
+                        .into_iter()
+                        .filter(|(seg, _)| packet_role_index(&packet_segment_roles, *seg).is_none())
+                        .collect::<Vec<_>>()
+                } else {
+                    Vec::new()
+                };
             let light_instructions: Vec<(usize, usize)> = light_segments
                 .iter()
                 .flat_map(|(seg, insts)| insts.iter().map(move |&i| (*seg, i)))
+                .chain(
+                    cached_quant_segments
+                        .iter()
+                        .flat_map(|(seg, insts)| insts.iter().map(move |&i| (*seg, i))),
+                )
                 .chain(moe_instructions.iter().copied())
                 .collect();
             let cublaslt_waits = if projection_segments.is_empty()
+                && cached_quant_segments.is_empty()
                 && moe_instructions.is_empty()
                 && attention_gemm_segments.iter().all(Option::is_none)
             {
                 None
-            } else if projection_segments.is_empty() {
-                let none = vec![None; g.gq_seg_ofs.len().saturating_sub(1)];
-                Some(cublaslt::ordered_waits(g, &none, &moe_instructions)?)
             } else {
                 // Library launches do not signal counters: their consumers rely on stream order.
+                // This must cover the attention-GEMM sites even with no Lt projections: naming
+                // none of them leaves their consumers waiting on a counter a library launch never
+                // signals, and the prefill spins forever holding the GPU. That is reachable only
+                // as (native dense) x (t >= pf_attn_gemm_min_rows), which is why it survived.
                 let library: Vec<Option<usize>> = (0..g.gq_seg_ofs.len().saturating_sub(1))
                     .map(|seg| {
                         projection_segments
@@ -9406,6 +9473,23 @@ impl GpuEngine {
                         light_routes.resize_with(seg + 1, || None);
                     }
                     light_routes[*seg] = Some(cublaslt::prefill_light_route(be, function, kernarg, g, insts));
+                }
+            }
+            if let Some(function) = cached_quant_function {
+                for (seg, insts) in &cached_quant_segments {
+                    if light_routes.len() <= *seg {
+                        light_routes.resize_with(seg + 1, || None);
+                    }
+                    light_routes[*seg] = Some(cublaslt::prefill_light_route(
+                        be, function, kernarg, g, insts,
+                    ));
+                }
+                if !cached_quant_segments.is_empty() {
+                    tracing::info!(
+                        bucket = g.t,
+                        segments = cached_quant_segments.len(),
+                        "prefill cached GLU quant routes"
+                    );
                 }
             }
             if !light_segments.is_empty() {
@@ -10452,7 +10536,16 @@ impl GpuEngine {
                     continue;
                 }
                 if let Some(Some(route)) = self.prefill[bi].light_segments.get(seg) {
-                    route.run(&self.stream)?;
+                    if seg_time {
+                        let e0 = self.be.event_create(true)?;
+                        let e1 = self.be.event_create(true)?;
+                        self.be.event_record(&e0, &self.stream)?;
+                        route.run(&self.stream)?;
+                        self.be.event_record(&e1, &self.stream)?;
+                        evs.push((seg, cls, e0, e1));
+                    } else {
+                        route.run(&self.stream)?;
+                    }
                     continue;
                 }
                 if let Some(Some(route)) = self.prefill[bi].cublaslt_segments.get(seg) {
@@ -11401,8 +11494,34 @@ impl GpuEngine {
 
     /// Skip every decode instruction at or past `limit` (profiling by instruction caps: the
     /// marginal step time of instruction i is time(limit = i + 1) - time(limit = i)).
-    pub fn set_debug_max_inst(&self, limit: u32) -> Result<bool> {
-        if let Some(gw) = &self.gemv_wide {
+    /// `active_slots` describes occupied slots 0..active_slots in the benchmark.
+    pub fn set_debug_max_inst(&self, limit: u32, active_slots: usize) -> Result<bool> {
+        if active_slots == 0 || active_slots > self.batch() {
+            return Err(RuntimeError::Rejected("invalid instruction-cap active slot count".into()));
+        }
+        if limit != u32::MAX && self.decode_contexts.is_some() {
+            return Err(RuntimeError::Rejected(
+                "instruction caps do not cover context-specific decode objects".into(),
+            ));
+        }
+        // External routes do not consult the interpreter's instruction-cap global.
+        let rung = self.decode_rung(active_slots - 1);
+        if limit != u32::MAX
+            && rung.map_or_else(
+                || {
+                    self.cublaslt_decode.iter().any(Option::is_some)
+                        || self.moe_lt_decode
+                        || self.routed_decode.is_some()
+                },
+                |index| self.decode_rungs[index].library.is_some(),
+            )
+        {
+            return Err(RuntimeError::Rejected(
+                "instruction caps cannot profile library-routed decode; use segment kernel timing"
+                    .into(),
+            ));
+        }
+        for gw in self.gemv_wide_modules.iter().flatten() {
             self.be.module_global_set_u32(gw.module(), "plow_debug_max_inst_gw", limit)?;
         }
         self.be.module_global_set_u32(&self.module, "plow_debug_max_inst", limit)

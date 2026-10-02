@@ -360,7 +360,7 @@ def globals_u32(path):
     secs = _sections(path)
     words, bss = {}, set()
     for idx, name in secs.items():
-        if name not in (".data", ".rodata"):
+        if name not in (".data", ".rodata", ".nv.global.init"):
             continue
         for line in _run([tool("llvm-readelf"), f"-x{name}", path],
                          f"readelf -x {name} {path}").splitlines():
@@ -372,9 +372,9 @@ def globals_u32(path):
             for i in range(0, len(blob) - 7, 8):
                 # llvm-readelf prints target-endian bytes in order; AMDGCN is little-endian.
                 b = blob[i:i + 8]
-                words[addr + i // 2] = int.from_bytes(bytes.fromhex(b), "little")
+                words[idx, addr + i // 2] = int.from_bytes(bytes.fromhex(b), "little")
     for idx, name in secs.items():
-        if name == ".bss":
+        if name in (".bss", ".nv.global"):
             bss.add(idx)
     got = {}
     for value, size, typ, ndx, name in _symtab(path):
@@ -382,8 +382,8 @@ def globals_u32(path):
             continue
         if ndx in bss:
             got[name] = 0
-        elif value in words:
-            got[name] = words[value]
+        elif (ndx, value) in words:
+            got[name] = words[ndx, value]
     return got
 
 

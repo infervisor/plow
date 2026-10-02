@@ -218,6 +218,117 @@ impl Lt {
         self.plan_impl(m, n, k, weight, template, None, rows)
     }
 
+    pub(crate) fn fp8_plan(
+        self: &Arc<Self>,
+        m: u32,
+        n: u32,
+        k: u32,
+        weight_scale: u64,
+        input_scale: u64,
+    ) -> Result<Arc<Plan>> {
+        self.be.bind()?;
+        let mut plan = Plan {
+            lt: self.clone(),
+            shape: (m, n, k),
+            desc: 0,
+            w: 0,
+            a: 0,
+            c: 0,
+            algo: Algo::default(),
+        };
+        let mut raw = std::ptr::null_mut();
+        // CUDA 12.9: E4M3=28, BF16=14, OUTER_VEC_32F=3. A is W^T, B is X.
+        // SAFETY: CUDA C ABI; Plan owns descriptors and the route retains the scale buffers.
+        unsafe {
+            check(
+                (self.api.cublasLtMatmulDescCreate)(&mut raw, 68, 0),
+                "FP8 Lt descriptor",
+            )?;
+            plan.desc = raw as usize;
+            for (attr, value) in [(3, 1i32), (31, 3), (32, 3)] {
+                check(
+                    (self.api.cublasLtMatmulDescSetAttribute)(
+                        raw,
+                        attr,
+                        &value as *const _ as *const c_void,
+                        size_of::<i32>(),
+                    ),
+                    "FP8 Lt mode",
+                )?;
+            }
+            for (attr, value) in [(17, weight_scale), (18, input_scale)] {
+                check(
+                    (self.api.cublasLtMatmulDescSetAttribute)(
+                        raw,
+                        attr,
+                        &value as *const _ as *const c_void,
+                        size_of::<u64>(),
+                    ),
+                    "FP8 Lt scale",
+                )?;
+            }
+            for (dst, dtype, rows, cols, ld) in [
+                (&mut plan.w, 28, k as u64, n as u64, k as i64),
+                (&mut plan.a, 28, k as u64, m as u64, k as i64),
+                (&mut plan.c, 14, n as u64, m as u64, n as i64),
+            ] {
+                raw = std::ptr::null_mut();
+                check(
+                    (self.api.cublasLtMatrixLayoutCreate)(&mut raw, dtype, rows, cols, ld),
+                    "FP8 Lt layout",
+                )?;
+                *dst = raw as usize;
+            }
+            let mut pref = std::ptr::null_mut();
+            check(
+                (self.api.cublasLtMatmulPreferenceCreate)(&mut pref),
+                "FP8 Lt preference",
+            )?;
+            let result = (|| {
+                let bytes = self.workspace.len as usize;
+                check(
+                    (self.api.cublasLtMatmulPreferenceSetAttribute)(
+                        pref,
+                        1,
+                        &bytes as *const _ as *const c_void,
+                        size_of::<usize>(),
+                    ),
+                    "FP8 Lt workspace",
+                )?;
+                let mut results = [Heuristic::default(); 32];
+                let mut count = 0;
+                check(
+                    (self.api.cublasLtMatmulAlgoGetHeuristic)(
+                        self.handle as Handle,
+                        plan.desc as Handle,
+                        plan.w as Handle,
+                        plan.a as Handle,
+                        plan.c as Handle,
+                        plan.c as Handle,
+                        pref,
+                        results.len() as i32,
+                        results.as_mut_ptr(),
+                        &mut count,
+                    ),
+                    "FP8 Lt heuristic",
+                )?;
+                plan.algo = results
+                    .get(..count as usize)
+                    .unwrap_or(&[])
+                    .iter()
+                    .find(|r| r.state == 0 && r.workspace <= bytes)
+                    .ok_or_else(|| {
+                        RuntimeError::Device("no supported FP8 vector-scale cuBLASLt algorithm".into())
+                    })?
+                    .algo;
+                Ok(())
+            })();
+            (self.api.cublasLtMatmulPreferenceDestroy)(pref);
+            result?;
+        }
+        Ok(Arc::new(plan))
+    }
+
     /// Two same-shape projections of one input as a strided batch of 2 (input batch stride 0):
     /// `weight`/`output` are batch 0, `pair` gives batch 1's element offsets.
     pub(crate) fn pair_plan(
@@ -1214,6 +1325,65 @@ impl Drop for Plan {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires a leased SM90 GPU and cuBLASLt 12.9 or newer"]
+    fn fp8_vector_scales_follow_rows_channels_and_plan_identity() -> Result<()> {
+        let be = Arc::new(CudaBackend::new(0)?);
+        let lt = Lt::load(&be)?;
+        let stream = be.stream_create()?;
+        let (m, n, k) = (128usize, 512usize, 3840usize);
+        let input = be.alloc(0, (m * k) as u64)?;
+        let weight = be.alloc(0, (n * k) as u64)?;
+        let output = be.alloc(0, (m * n * 2) as u64)?;
+        let xs = be.alloc(0, (m * 4) as u64)?;
+        let ws = be.alloc(0, (n * 4) as u64)?;
+        let ws2 = be.alloc(0, (n * 4) as u64)?;
+        let x: Vec<u8> = (0..m * k)
+            .map(|i| if (i / k) % 2 == 0 { 0x38 } else { 0x40 })
+            .collect();
+        let w: Vec<u8> = (0..n * k)
+            .map(|i| if (i / k) % 2 == 0 { 0x38 } else { 0xb8 })
+            .collect();
+        let scales: Vec<f32> = (0..n).map(|i| (1 + i % 4) as f32 / 8.0).collect();
+        let scales2: Vec<f32> = scales.iter().map(|s| s * 2.0).collect();
+        be.upload(&input, 0, &x)?;
+        be.upload(&weight, 0, &w)?;
+        be.upload(&ws, 0, bytemuck::cast_slice(&scales))?;
+        be.upload(&ws2, 0, bytemuck::cast_slice(&scales2))?;
+        let first = lt.fp8_plan(m as u32, n as u32, k as u32, ws.base, xs.base)?;
+        let second = lt.fp8_plan(m as u32, n as u32, k as u32, ws2.base, xs.base)?;
+        for iteration in 1..=2 {
+            let xscales: Vec<f32> = (0..m)
+                .map(|i| (1 + i % 8) as f32 * iteration as f32 / 16.0)
+                .collect();
+            be.upload(&xs, 0, bytemuck::cast_slice(&xscales))?;
+            be.synchronize()?;
+            for (plan, multiplier) in [(&first, 1.0), (&second, 2.0), (&first, 1.0)] {
+                plan.run(input.base, weight.base, output.base, &stream)?;
+                be.synchronize()?;
+                let mut values = vec![0u16; m * n];
+                be.download(&output, 0, bytemuck::cast_slice_mut(&mut values))?;
+                for row in 0..m {
+                    for col in 0..n {
+                        let expected = k as f32
+                            * if row % 2 == 0 { 1.0 } else { 2.0 }
+                            * if col % 2 == 0 { 1.0 } else { -1.0 }
+                            * xscales[row]
+                            * scales[col]
+                            * multiplier;
+                        let actual = f32::from_bits(u32::from(values[row * n + col]) << 16);
+                        assert!(
+                            (actual - expected).abs() <= expected.abs() / 256.0,
+                            "row={row} col={col} actual={actual} expected={expected}"
+                        );
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     #[test]
     fn cuda_header_layout() {
         assert_eq!(size_of::<Algo>(), 64);

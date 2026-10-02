@@ -89,7 +89,9 @@ static void test(unsigned nh, unsigned nkv, unsigned len, unsigned nsplit){
     std::vector<unsigned short> got(nh*D); CK(cudaMemcpy(got.data(),dO,(size_t)nh*D*2,cudaMemcpyDeviceToHost));
     double num=0,den=0; for(size_t i=0;i<(size_t)nh*D;i++){ float g=__bfloat162float(*(bf16*)&got[i]); double d=g-ref[i]; num+=d*d; den+=ref[i]*ref[i]; }
     double relL2=den>0?sqrt(num/den):0;
-#ifdef PLOW_FP8_FAST
+#ifdef PLOW_FP8_LD16
+    const char* arm="LD16(f32)";
+#elif defined(PLOW_FP8_FAST)
     const char* arm="FAST(f32)";
 #else
     const char* arm="shipped(bf16rt)";
@@ -107,6 +109,9 @@ int main(){
     test<512,4>(16,2,777,8);
     test<512,2>(4,1,200,4);
     test<256,2>(4,2,150,4);    /* sliding geometry sanity */
+    test<256,2>(16,8,1024,1); /* 12B sliding attention, eight KV heads */
+    test<512,8>(16,1,512,1);  /* 12B full attention, B64 packet fusion and split */
+    test<512,8>(16,1,777,4);
     printf(g_fail?"\nRESULT: FAIL\n":"\nRESULT: PASS\n");
     return g_fail;
 }

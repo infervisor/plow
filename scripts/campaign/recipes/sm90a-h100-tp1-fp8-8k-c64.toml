@@ -1,0 +1,133 @@
+# Gemma 4 12B FP8, H100 SXM 80 GB. Production qualification is still running.
+# Re-key the hub checkpoint without requantization; set GEMMA12B_CHECKPOINT to that directory.
+# Build inside Nix with scripts/campaign/campaign.py; its record binds overrides and object hashes.
+# GPU qualification goes through gpuq/gpulease. Do not publish as validated before matched gates pass.
+#
+# Decode rungs 1/2/4: ordinary cubin; 8/16/32: _gw; 64: _gw64.
+# _gw64 alone sets PLOW_FP8TC_U8=2 and PLOW_FP8TC_U8G=2; _gw keeps defaults=1.
+# PLOW_FP8_DECODE_TC64 enables CMake PLOW_CUBIN_FP8_TC64_DEPTH2 at the pinned compiler.
+# Matched packet tests: B64 step time -4.19% (ctx128), -2.80% (ctx1024); token digests equal.
+# B32 within 0.04%; full serving and broader quality qualification remain pending.
+# PLOW_FP8_DECODE_TC64 writes PLOW_NV_FP8_DECODE_TC64=1 ONLY under PLOW_NV_GW_OBJECT.
+# WGMMA decode stays off. Narrow cubin flags and its shared-memory claim stay unchanged.
+# Prefill Lt: measured shapes at 64/128/256/512/1024/1088/1152/2048/2112/4096/4160/4224/8192.
+# Native: down at 1088 or >=2048; local K/V and global O at 4160; unmeasured rungs.
+# Rung 2112 fits two 1024-row chunks plus 64 riders; native down/local O/global O.
+# Fused GLU and attention retain their explicit role objects below.
+# BF16 KV: 64 slots, 8K context, 1024-row request chunks. C128 queues behind the 64 slots.
+# Cache-off comparisons qualify this variant first; 20%/80% token-reuse workloads remain required.
+
+schema = "plow.recipe.v1"
+namespace = "infervisor"
+name = "gemma-4-12b"
+label = "sm90a-h100-tp1-fp8-8k-c64"
+status = "emits"
+plow_git = "6e2e0eb4bbb1c57c5126de5d5b3414f7e6dd4bb3"
+network = "gemma4"
+
+[target]
+vendor = "nvidia"
+isa = "sm_90a"
+sku = "H100 SXM5"
+units = 132
+num_gpus = 1
+parallel = "tp"
+max_ctx = 8192
+toolchain = "cuda-12.9-nix"
+
+[checkpoint]
+source = "gemma-4-12b-it-fp8"
+layout = "plow-fp8-hub-rekey"
+
+[cell]
+name = "gemma4-12b.h100.fp8-8k-c64"
+model = "gemma-4-12b-it-fp8 (compressed-tensors, re-keyed)"
+revision = "local"
+hf_dir = "{env:GEMMA12B_CHECKPOINT}"
+gpu = "H100 SXM5"
+arch = "sm_90a"
+n_cu = 132
+max_ctx = 8192
+precision = "w8a8"
+
+[emit]
+args = ["--segmented"]
+[emit.env]
+PLOW_FP8 = "1"
+PLOW_W8A8 = "1"
+PLOW_EMIT_PACKED_PREFILL = "1"     # default-on only for BF16 Hopper; the roles need the metadata
+PLOW_SEG_PURE_GEMM = "fp8"
+PLOW_SEG_FA512 = "1"               # [FP8-TAX] GEMMA4_SEG_FA512_DEFAULT is bf16-gated
+PLOW_SEG_FA256_GQA2 = "1"          # [FP8-TAX] GEMMA4_SEG_FA256_GQA2_DEFAULT is bf16-gated
+PLOW_TMA_GEMM = "1"
+PLOW_MAX_CHUNK = "4096"
+PLOW_MAX_REQUEST_CHUNK = "1024"
+PLOW_SLIDING_NS_CAP = "1"
+PLOW_SLIDING_NS_GRID = "1"
+PLOW_ATTENTION_DECODE_BALANCE_GF = "4"
+PLOW_NS_FULL_ABS = "66"
+PLOW_FA_MMAQK = "3"
+PLOW_DECODE_BATCH_LADDER = "1,2,4,8,16,32,64"
+PLOW_FP8_DECODE_TC64 = "1"
+PLOW_EMIT_PREFILL_CUBLASLT = "1"
+PLOW_PF_LADDER_APPEND = "256,1088,1152,2112,4160,4224"
+PLOW_FUSE_ARGMAX = "1"
+
+[objects]
+script = "scripts/build_sm90a_gemma4_segments.sh"
+role_files = [
+  "interp_sm90a_pfattn_hd512_px4_bq64.cubin",
+  "interp_sm90a_pfattn_hd256_gqa2_bkv32.cubin",
+  "interp_sm90a_pfattn_hd256_bkv32.cubin",
+  "interp_sm90a_pfgemm_glu_w8a8_gemma4.cubin",
+]
+[objects.env]
+PLOW_BUILD_W8A8 = "1"
+PLOW_BUILD_FA_GQA2_PAIR = "1"
+PLOW_BUILD_PFATTN_HD256_BKV32 = "1"
+PLOW_BUILD_PFATTN_HD256_GQA2_BKV32 = "1"
+PLOW_BUILD_PFATTN_HD512_PX4_BQ64 = "1"
+
+[emit_roles.env]
+PLOW_GEMMA4_SM90_W8A8_GEMM_GLU_ROLE = "1"
+PLOW_GEMMA4_SM90_HD512_PX4_BQ64_ROLE = "1"
+PLOW_GEMMA4_SM90_HD256_GQA2_ROLE = "1"
+
+[serve.env]
+PLOW_PREFIX_CACHE = "0"
+PLOW_PF_SEG_PURE = "fp8"
+PLOW_PF_SEG_FA512 = "1"
+PLOW_PF_INTERLEAVE = "0"
+PLOW_VMM_LIVE_RINGS = "0"
+PLOW_MULTISTEP = "0"
+PLOW_DECODE_MAX_RUNG = "64"
+PLOW_TOKEN_BATCH = "1"
+PLOW_QUEUE_TTL_MS = "0"
+PLOW_RUNG_FAST_PROBE = "1"
+
+[bench]
+backend = "openai"
+in_lens = "128 1024 4096"
+concs = "1"
+nprompt = 32
+outlen = 128
+warmups = 2
+seed = 42
+tokenizer = "{env:GEMMA12B_CHECKPOINT}"
+model_id = "checkpoint"
+gate_prompt = "<bos><|turn>user\nWhat is the capital of France? Answer in one short sentence.<turn|>\n<|turn>model\n<|channel>thought\n<channel|>"
+
+[bench.profiles.realtime]
+in_lens = "128 1024 4096 7000"
+concs = "1 4"
+nprompt = 32
+serve_env = { PLOW_DECODE_MAX_RUNG = "4" }
+
+[bench.profiles.high_concurrency]
+in_lens = "128 1024 4096 7000"
+concs = "16 32 64 128"
+nprompt = 384
+serve_env = { PLOW_DECODE_MAX_RUNG = "64" }
+
+[reference]
+csv = "perf-data/campaign/gemma4-12b.h100.reference-vllm028-fp8.csv"

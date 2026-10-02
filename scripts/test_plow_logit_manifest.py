@@ -5,7 +5,59 @@ import argparse
 import unittest
 from unittest.mock import patch
 
-from plow_logit_manifest import assemble_replicated_row, assemble_sharded_row, batched_cases, main
+from plow_logit_manifest import assemble_replicated_row, assemble_sharded_row, batched_cases, main, step_cases
+
+
+class StepLogitTests(unittest.TestCase):
+    def capture(self, root):
+        (root / "logits.bin").write_bytes(b"\x00\x3f" * 12)
+        p = root / "manifest.json"
+        p.write_text(json.dumps(dict(slots=2, ctx=1, warmup=0, steps=1,
+            token_histories=[[1, 2], [2, 3]], sampled_token_ids=[0, 1],
+            tensors=[dict(name="act.logits", file="logits.bin", bytes=24)])))
+        return p
+
+    def test_active_rows_and_exact_histories(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            rows = step_cases(self.capture(root), "test", 4)
+            self.assertEqual(len(rows), 2)
+            self.assertEqual(rows[1]["prompt_token_ids"], [2, 3])
+            self.assertEqual(rows[1]["sampled_token_id"], 1)
+            self.assertEqual(Path(rows[0]["file"]).read_bytes(), b"\x00\x3f" * 4)
+
+    def test_reject_instruction_capped_dump(self):
+        with tempfile.TemporaryDirectory() as directory:
+            p = self.capture(Path(directory))
+            d = json.loads(p.read_text())
+            d["max_inst"] = 10
+            d["sampled_token_ids"] = None
+            p.write_text(json.dumps(d))
+            with self.assertRaisesRegex(ValueError, "partial decode"):
+                step_cases(p, "test", 4)
+
+    def test_reject_segment_capped_dump(self):
+        with tempfile.TemporaryDirectory() as directory:
+            p = self.capture(Path(directory))
+            d = json.loads(p.read_text())
+            d["max_segments"] = 4
+            p.write_text(json.dumps(d))
+            with self.assertRaisesRegex(ValueError, "partial decode"):
+                step_cases(p, "test", 4)
+
+    def test_reject_missing_history(self):
+        with tempfile.TemporaryDirectory() as directory:
+            p = self.capture(Path(directory))
+            d = json.loads(p.read_text()); d["token_histories"][0] = [1]
+            p.write_text(json.dumps(d))
+            with self.assertRaises(ValueError): step_cases(p, "test", 4)
+
+    def test_reject_partial_or_nonfinite_allocation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); p = self.capture(root)
+            for raw in [b"\x00" * 23, b"\xc0\x7f" + b"\x00" * 22]:
+                (root / "logits.bin").write_bytes(raw)
+                with self.assertRaises(ValueError): step_cases(p, "test", 4)
 
 
 class ShardedLogitTests(unittest.TestCase):

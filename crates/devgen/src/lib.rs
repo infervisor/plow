@@ -3974,6 +3974,7 @@ fn emit_phase(
     // the `hn_dep` closure below already binds a `gemv: u32` parameter that would shadow it.)
     let decode = mode.decode_shape();
     let gemv_family = mode.gemv();
+    let fp8_lt_decode = gemv_family && fp8 && emit_config::active().decode_cublaslt_at(t);
     // The mixed AMD object has one GEMM tile, shared with its four-wave attention body.
     // MXFP4 dense decode (PLOW_MXFP4=1): q/k/v/o/down through GemvMxfp4 (91), gate|up through
     // GemvGluMxfp4 (92). Exclusive with the fp8 axis.
@@ -4281,7 +4282,7 @@ fn emit_phase(
         } else {
             n_cu
         };
-        if gemv_family && fp8 {
+        if gemv_family && fp8 && !fp8_lt_decode {
             return b.emit(DevOp::GemvFp8, gemv_wg_cap(cus), deps, |d| {
                 d.t[0] = out;
                 d.t[1] = a;
@@ -4343,12 +4344,15 @@ fn emit_phase(
         // largest tile on exactly the fp8 shapes they were added for. Asking the selector for
         // the encoding also lets the answer DIFFER from bf16's, which is the point of making
         // precision an input.
-        if !gemv_family && fp8 {
-            let op = pick_tile(m, nn, k, budget, kernelcaps::QuantScheme::W8A8);
+        if (!gemv_family || fp8_lt_decode) && fp8 {
+            let op = if fp8_lt_decode { DevOp::GemmFp8 } else {
+                pick_tile(m, nn, k, budget, kernelcaps::QuantScheme::W8A8)
+            };
             // sm_90a TMA (see `tmap` above): w8a8 only — both operands are e4m3 tensors
             // the TMA e4m3 maps can describe. The w8a16 body keeps cp.async (its A is
             // bf16 and its weight is dequanted in-kernel; no TMA arm exists for it).
             let tm8 = (tma_gemm
+                && !fp8_lt_decode
                 && w8a8
                 && matches!(op, DevOp::GemmFp8 | DevOp::GemmMedFp8 | DevOp::GemmSmallFp8))
             .then(|| (tmap8(xq, m, k), tmap8(w8, nn, k)));
@@ -4533,6 +4537,7 @@ fn emit_phase(
     // fold (AMD + fp8 + dense Gemma + env), and the shape bounds mirror the kernel's `fits`
     // preconditions, which the kernel re-checks and TRAPS on rather than staging garbage.
     let fuse_nrn = gemv_family
+        && !fp8_lt_decode
         && gfuse
         && (if amd { fp8 } else { true })
         && c.ple == 0
@@ -6978,7 +6983,10 @@ fn emit_phase(
     // Argmax packets. Greedy B=1 decode on the bf16 head only (fp8 head keeps the classic path).
     // In a multi-rung decode ladder, all rungs must share the same instruction sequence shape,
     // so GemvArgmax is prohibited under ladders.
+    let lt_head = emit_config::active().decode_cublaslt_at(t)
+        && emit_config::active().decode_cublaslt_head;
     let fuse_am = fuse_argmax_on()
+        && !lt_head
         && decode
         && gemv_family
         && !fp8_head
@@ -7925,7 +7933,7 @@ impl DevblobEmitter for DenseGqaEmitter<'_> {
         );
     }
     fn emit_decode(&self, b: &mut Builder, dbatch: u32, dmode: Mode, kv_rows: &mut Vec<u32>) {
-        // Decode passes w8a8=false, exactly as the historical call site did.
+        let w8a8 = self.fp8 && emit_config::active().decode_cublaslt_at(dbatch);
         emit_phase(
             b,
             self.c,
@@ -7937,7 +7945,7 @@ impl DevblobEmitter for DenseGqaEmitter<'_> {
             self.n_cu,
             kv_rows,
             self.fp8,
-            false,
+            w8a8,
             self.fp8_kv,
             self.fp8_kv_full,
             self.block.clone(),
@@ -8405,10 +8413,10 @@ pub fn run_verified(args: EmitArgs, verify: Option<VerifyHook>) {
     if emit_config::active().max_request_chunk.is_some() {
         assert!(
             model_type.starts_with("gemma4") && arch == "sm_90a" && tp == 1
-                && !emit_config::active().any_fp8_weights()
+                && (!emit_config::active().any_fp8_weights() || emit_config::active().w8a8)
                 && !emit_config::active().mxfp4
                 && emit_config::active().packed_prefill_metadata_on(),
-            "request chunk limits require packed Gemma 4 BF16 weights on SM90 TP1"
+            "request chunk limits require packed Gemma 4 BF16 or W8A8 weights on SM90 TP1"
         );
     }
 
@@ -8460,9 +8468,10 @@ pub fn run_verified(args: EmitArgs, verify: Option<VerifyHook>) {
             (model_type.starts_with("gemma4") || model_type == "llama" || model_type == "qwen3_asr")
                 && arch == "sm_90a"
                 && tp == 1
-                && !emit_config::active().any_fp8_weights()
+                && (!emit_config::active().any_fp8_weights()
+                    || (model_type.starts_with("gemma4") && emit_config::active().w8a8))
                 && !emit_config::active().mxfp4,
-            "cuBLASLt prefill emission requires Gemma 4, Llama or Qwen3-ASR BF16 on single-GPU SM90"
+            "cuBLASLt prefill emission requires Gemma 4 W8A8 or supported BF16 on single-GPU SM90"
         );
     }
     if emit_config::active().gemma4_sm90_gemm_glu_role {
@@ -9997,8 +10006,8 @@ fn emit_dense_gqa(
     let mut sections = Vec::new();
     if ecfg.decode_cublaslt || ecfg.decode_native_tc {
         assert!(
-            !fp8 && !c.moe && !amd,
-            "Gemma cuBLASLt decode requires dense BF16 CUDA"
+            !c.moe && !amd && (!fp8 || (c.arch == Arch::Gemma4 && ecfg.w8a8 && !ecfg.decode_native_tc)),
+            "Gemma cuBLASLt decode requires dense BF16 or Gemma 4 W8A8 CUDA"
         );
         sections.push(
             if ecfg.decode_native_tc {

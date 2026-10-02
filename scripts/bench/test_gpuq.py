@@ -25,19 +25,23 @@ class QueueTests(unittest.TestCase):
                 launch.assert_not_called()
             self.assertEqual(json.loads((root / "1.json").read_text())["state"], "queued")
 
-    def test_fifo_records_failed_lease_without_promoting_result(self):
+    def test_long_jobs_drain_fifo_and_record_failed_lease(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             for number in (2, 1):
                 gpuq.save(root / f"{number}.json", dict(state="queued", ngpu=1, label=str(number), command=["true"], cwd=directory))
             with patch.object(gpuq.os, "access", return_value=True), \
-                 patch.object(gpuq.time, "monotonic", side_effect=[0, 1, 1, 2, 2, 2000]), \
+                 patch.object(gpuq.time, "monotonic", side_effect=[0, 1, 1, 2001, 2002, 2002, 4002, 6003]), \
                  patch.object(gpuq.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "GPU: no foreign compute procs\n")), \
+                 patch.dict(gpuq.os.environ, {"PLOW_MULTISTEP": "8", "PATH": "/nix/bin"}), \
                  patch.object(gpuq.subprocess, "Popen") as launch:
                 launch.return_value.pid = 123
                 launch.return_value.wait.side_effect = [76, 0]
                 gpuq.work(root)
                 self.assertEqual([call.args[0][3] for call in launch.call_args_list], ["1", "2"])
+                self.assertTrue(all("PLOW_MULTISTEP" not in call.kwargs["env"]
+                                    and call.kwargs["env"]["PATH"] == "/nix/bin"
+                                    for call in launch.call_args_list))
             self.assertEqual(json.loads((root / "1.json").read_text())["state"], "failed")
             self.assertEqual(json.loads((root / "2.json").read_text())["state"], "done")
 

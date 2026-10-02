@@ -87,6 +87,9 @@ static const Shape SHAPES[] = {
     {"down",3840,15360,0}, {"local_q",4096,3840,0},
     {"local_o",3840,4096,0}, {"global_q",8192,3840,0},
     {"global_k_or_v",512,3840,0}, {"global_o",3840,8192,0},
+#ifdef PLOW_BENCH_GEMMA4_HEAD
+    {"g12_lmhead",262144,3840,0},
+#endif
 #ifdef PLOW_BENCH_GEMMA4_26B
     /* segment_roles::CUBLASLT_PREFILL_GEMMA4_26B_SHAPES — Gemma-4-26B-A4B dense projections
      * (hidden 2816, dense inter 2112). The routed-expert GEMMs are MoE ops, not here. */
@@ -628,6 +631,36 @@ static float* dev_f32(size_t n, float base, float step) {
     return d;
 }
 
+#if PLOW_NV_FP8_DECODE_TC64
+__global__ void k_decode_tc64(bf16* y, const bf16* x, const uint8_t* w, const float* scale,
+                             unsigned M, unsigned N, unsigned K) {
+    extern __shared__ float reduction[];
+    for (unsigned row = 0; row < M; row += 64) {
+        d_gemv_fp8_tc8<false>(y + (size_t)row * N, x + (size_t)row * K,
+                              w, nullptr, scale, nullptr, min(64u, M - row), N, K,
+                              blockIdx.x, gridDim.x, reduction);
+        __syncthreads();
+    }
+}
+__global__ void k_decode_glu_tc64(bf16* y, const bf16* x, const uint8_t* w, const uint8_t* u,
+                                 const float* scale, unsigned M, unsigned N, unsigned K) {
+    extern __shared__ float reduction[];
+    for (unsigned row = 0; row < M; row += 64) {
+        d_gemv_fp8_tc8<true>(y + (size_t)row * N, x + (size_t)row * K,
+                             w, u, scale, scale, min(64u, M - row), N, K,
+                             blockIdx.x, gridDim.x, reduction);
+        __syncthreads();
+    }
+}
+__global__ void k_decode_glu(bf16* gate, const bf16* up, size_t count) {
+    for (size_t i = blockIdx.x * blockDim.x + threadIdx.x; i < count; i += gridDim.x * blockDim.x)
+        gate[i] = __float2bfloat16_rn(act_gelu_tanh(__bfloat162float(gate[i])) * __bfloat162float(up[i]));
+}
+__global__ void k_decode_quant(uint8_t* q, bf16* x, float* scale, unsigned M, unsigned K) {
+    d_quant_fp8(q, x, scale, M, K, blockIdx.x, gridDim.x);
+}
+#endif
+
 static void bench_w8a8(unsigned M) {
     cublasLtHandle_t lt; LTK(cublasLtCreate(&lt));
     size_t wsz = 256 * 1024 * 1024; void* ws; CK(cudaMalloc(&ws, wsz));
@@ -654,6 +687,15 @@ static void bench_w8a8(unsigned M) {
         float* asc = dev_f32(M, 1.f / 448.f, 0.07f);
         float* wsc = dev_f32(s.N, 1.f / 448.f, 0.23f);
         float* sca1 = dev_f32(1, 1.f / 448.f, 0.f);
+#if PLOW_NV_FP8_DECODE_TC64
+        if (M != 64 && M != 128) { fprintf(stderr, "TC64 comparison requires M=64 or128\n"); exit(2); }
+        printf("decode protocol %s M=%u tc64_passes=%u (multi-pass is a benchmark prototype)\n",
+               s.name, M, M / 64);
+        bf16* decode_x = dev_bf16((size_t)M * s.K);
+        auto quantize = [&] { k_decode_quant<<<M, 256>>>(A, decode_x, asc, M, s.K); };
+        quantize();
+        CK(cudaFuncSetAttribute(k_decode_tc64, cudaFuncAttributeMaxDynamicSharedMemorySize, 65536));
+#endif
         bf16 *D, *cp_alloc;
         CK(cudaMalloc(&D, (size_t)M * s.N * sizeof(bf16)));
         CK(cudaMalloc(&cp_alloc, ((size_t)M * s.N + 16) * sizeof(bf16)));
@@ -823,6 +865,81 @@ static void bench_w8a8(unsigned M) {
             printf("%-13s %6u %6u %6u %9.5f %8.1f w8a8_lt_scalar  vec/scalar=%.4f\n",
                    s.name, M, s.N, s.K, sms, fl / (sms * 1e-3) / 1e12,
                    arms[0].have ? vms / sms : 0.f);
+
+#if PLOW_NV_FP8_DECODE_TC64
+        if (!arms[0].have) { fprintf(stderr, "TC64 comparison needs vector Lt\n"); exit(3); }
+        auto tc64 = [&](int i) {
+            k_decode_tc64<<<prop.multiProcessorCount, 256, 65536>>>(cp, decode_x, Bv[i % nrep],
+                                                                  wsc, M, s.N, s.K);
+        };
+        auto quant_lt = [&](int i) { quantize(); LTK(run_lt(0, i)); };
+        tc64(0); quant_lt(0);
+        CK(cudaDeviceSynchronize());
+        std::vector<bf16> tc((size_t)M * s.N), lv(tc.size());
+        CK(cudaMemcpy(tc.data(), cp, tc.size() * sizeof(bf16), cudaMemcpyDeviceToHost));
+        CK(cudaMemcpy(lv.data(), D, lv.size() * sizeof(bf16), cudaMemcpyDeviceToHost));
+        double err2 = 0, ref2 = 0;
+        for (size_t i = 0; i < tc.size(); ++i) {
+            const double a = __bfloat162float(tc[i]), b = __bfloat162float(lv[i]);
+            if (!std::isfinite(a) || !std::isfinite(b)) { fprintf(stderr, "nonfinite decode output\n"); exit(3); }
+            err2 += (a-b)*(a-b); ref2 += a*a;
+        }
+        const double rel = std::sqrt(err2 / std::max(ref2, 1e-30));
+        printf("decode correctness %s M=%u tc64_vs_quant_lt_relL2=%.6g\n", s.name, M, rel);
+        if (rel > 0.06) { fprintf(stderr, "decode numerical gate failed\n"); exit(3); }
+        float tr[rounds], qr[rounds];
+        for (int i = 0; i < WARM; ++i) { tc64(i); quant_lt(i); }
+        CK(cudaDeviceSynchronize());
+        for (int r = 0; r < rounds; ++r) {
+            if (r & 1) { tr[r] = time_body(tc64); qr[r] = time_body(quant_lt); }
+            else { qr[r] = time_body(quant_lt); tr[r] = time_body(tc64); }
+        }
+        const float tms = med(tr), qms = med(qr);
+        printf("decode %s M=%u blocks=%d tc64_ms=%.6f quant_lt_ms=%.6f tc64/lt=%.4f tc64_range=%.6f:%.6f lt_range=%.6f:%.6f\n",
+               s.name, M, prop.multiProcessorCount, tms, qms, tms/qms,
+               tr[0], tr[rounds-1], qr[0], qr[rounds-1]);
+        if (strcmp(s.name, "gate_or_up") == 0) {
+            bf16* up; CK(cudaMalloc(&up, (size_t)M * s.N * sizeof(bf16)));
+            CK(cudaFuncSetAttribute(k_decode_glu_tc64, cudaFuncAttributeMaxDynamicSharedMemorySize, 65536));
+            auto fused_tc = [&](int i) {
+                k_decode_glu_tc64<<<prop.multiProcessorCount, 256, 65536>>>(
+                    cp, decode_x, Bv[i % nrep], Bv[(i + 1) % nrep], wsc, M, s.N, s.K);
+            };
+            auto fused_lt = [&](int i) {
+                quant_lt(i);
+                LTK(cublasLtMatmul(lt, arms[0].op, &alpha, Bv[(i + 1) % nrep], la, A, lb,
+                                  &beta, up, ld, up, ld, &arms[0].heur.algo, ws, wsz, 0));
+                k_decode_glu<<<prop.multiProcessorCount, 256>>>(D, up, (size_t)M * s.N);
+            };
+            fused_tc(0); fused_lt(0); CK(cudaDeviceSynchronize());
+            CK(cudaMemcpy(tc.data(), cp, tc.size() * sizeof(bf16), cudaMemcpyDeviceToHost));
+            CK(cudaMemcpy(lv.data(), D, lv.size() * sizeof(bf16), cudaMemcpyDeviceToHost));
+            err2 = ref2 = 0;
+            for (size_t i = 0; i < tc.size(); ++i) {
+                const double a = __bfloat162float(tc[i]), b = __bfloat162float(lv[i]);
+                if (!std::isfinite(a) || !std::isfinite(b)) { fprintf(stderr, "nonfinite fused output\n"); exit(3); }
+                err2 += (a-b)*(a-b); ref2 += a*a;
+            }
+            const double fused_rel = std::sqrt(err2 / std::max(ref2, 1e-30));
+            printf("fused correctness gate_up M=%u tc64_vs_quant_lt_relL2=%.6g\n", M, fused_rel);
+            if (fused_rel > 0.06) { fprintf(stderr, "fused numerical gate failed\n"); exit(3); }
+            uint16_t guards[16];
+            CK(cudaMemcpy(guards, cp_alloc, 8 * sizeof(bf16), cudaMemcpyDeviceToHost));
+            CK(cudaMemcpy(guards + 8, cp + (size_t)M * s.N, 8 * sizeof(bf16), cudaMemcpyDeviceToHost));
+            for (auto g : guards) if (g != 0xa5a5) { fprintf(stderr, "fused output guard overwritten\n"); exit(3); }
+            for (int i = 0; i < WARM; ++i) { fused_tc(i); fused_lt(i); }
+            CK(cudaDeviceSynchronize());
+            for (int r = 0; r < rounds; ++r) {
+                if (r & 1) { tr[r] = time_body(fused_tc); qr[r] = time_body(fused_lt); }
+                else { qr[r] = time_body(fused_lt); tr[r] = time_body(fused_tc); }
+            }
+            const float ft = med(tr), fq = med(qr);
+            printf("fused gate_up M=%u blocks=%d tc64_ms=%.6f quant_lt_glu_ms=%.6f tc64/lt=%.4f tc64_range=%.6f:%.6f lt_range=%.6f:%.6f\n",
+                   M, prop.multiProcessorCount, ft, fq, ft/fq, tr[0], tr[rounds-1], qr[0], qr[rounds-1]);
+            CK(cudaFree(up));
+        }
+        CK(cudaFree(decode_x));
+#endif
 
         cudaEventDestroy(e0); cudaEventDestroy(e1);
         for (int a = 0; a < 2; a++) if (arms[a].op) cublasLtMatmulDescDestroy(arms[a].op);

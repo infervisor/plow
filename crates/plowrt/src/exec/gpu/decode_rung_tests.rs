@@ -169,6 +169,27 @@ fn cublaslt_fixture() -> (DevBlob, SegmentRoles) {
 }
 
 #[test]
+fn fp8_cublaslt_ladder_normalizes_rows_and_rejects_wrong_extent() {
+    for op in [DevOp::GemmFp8, DevOp::GemmMedFp8, DevOp::GemmSmallFp8] {
+        let (mut blob, metadata) = cublaslt_fixture();
+        for name in ["activation.scale", "weight.scale"] {
+            blob.tensors.push(DevTensor {
+                name: name.into(),
+                bytes: 16 * 4,
+                init: None,
+            });
+        }
+        for g in &mut blob.progs {
+            g.insts[4].op = op as u16;
+            g.insts[4].t[3..5].copy_from_slice(&[11, 12]);
+        }
+        assert!(validate_cublaslt_ladder(&blob, &metadata).unwrap());
+        blob.progs[1].insts[4].i[0] += 1;
+        assert!(validate_cublaslt_ladder(&blob, &metadata).is_err());
+    }
+}
+
+#[test]
 fn cublaslt_ladder_requires_complete_equivalent_roles_and_dependencies() {
     let (blob, mut metadata) = cublaslt_fixture();
     assert!(validate_cublaslt_ladder(&blob, &metadata).unwrap());

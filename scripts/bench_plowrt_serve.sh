@@ -26,6 +26,8 @@
 #   DATASET_ARGS  replaces the client's dataset block (`--dataset-name random --random-input-len $L
 #                --random-output-len $OUTLEN --random-range-ratio 0`), e.g. a prefix_repetition workload;
 #                the IN_LENS loop value then only labels the row
+#   PREFIX_PCT    percent of each input_len sent as a prefix shared by every request of a cell
+#                 (--random-prefix-len); total input stays input_len. Default 0.
 #   MEM_SAMPLE_MS  GPU memory sampling period per cell, printed as `peak_mem_mib,<in>,<c>,<MiB>`
 #                  lines (default 1000; 0 = off)
 set -euo pipefail
@@ -167,7 +169,8 @@ for L in $IN_LENS; do
     read -r -a WARM_ARGS <<< "$WARM"
     blog="$OUTDIR/in${L}_c${C}.log"
     if [ -n "${DATASET_ARGS:-}" ]; then read -r -a DATASET_ARGV <<< "$DATASET_ARGS"; else
-      DATASET_ARGV=(--dataset-name random --random-input-len "$L" --random-output-len "$OUTLEN" --random-range-ratio 0); fi
+      PFX=$(( L * ${PREFIX_PCT:-0} / 100 ))
+      DATASET_ARGV=(--dataset-name random --random-prefix-len "$PFX" --random-input-len "$(( L - PFX ))" --random-output-len "$OUTLEN" --random-range-ratio 0); fi
     # Peak GPU memory of the server's processes over this cell (NVIDIA only). Both engines
     # preallocate their pools, so this is the configured footprint plus any transient workspace.
     memlog="$OUTDIR/in${L}_c${C}.mem"; mempid=

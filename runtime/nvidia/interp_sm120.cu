@@ -579,6 +579,9 @@ __device__ __forceinline__ PlowStreamEnt ld_stream_ent(const PlowStreamEnt* p) {
  * activation quant (QUANT_FP8 op). Default 0 keeps T6's w8a16 dequant path as the A/B control:
  * the SAME opcodes then read t1=A as bf16 and take only w_scale. Only the prefill object carries
  * these; QUANT_FP8 is needed by the w8a8 path (activation half) so it lives behind the flag too. */
+#ifndef PLOW_NV_FP8_LT_DECODE
+#define PLOW_NV_FP8_LT_DECODE 0
+#endif
 #ifndef PLOW_NV_W8A8
 #define PLOW_NV_W8A8 0
 #endif
@@ -592,6 +595,9 @@ __device__ __forceinline__ PlowStreamEnt ld_stream_ent(const PlowStreamEnt* p) {
  * opcodes are handled; q's norm stays plain HEADNORM_ROPE (q is not cached). */
 #ifndef PLOW_FP8_KV
 #define PLOW_FP8_KV 0
+#endif
+#if PLOW_FP8_KV
+extern "C" __device__ __constant__ unsigned plow_fp8_kv_abi = 1;
 #endif
 
 /* ---- SEGMENTED DISPATCH (PLOW_NV_SEGMENTS=1, T9c) ----------------------------------------
@@ -1022,14 +1028,13 @@ static_assert(PLOW_NV_GEMV_STAGING_BYTES <= PLOW_NV_BASE_ARENA_FLOATS * sizeof(f
 #else
 #define PLOW_NV_M16_ARENA_FLOATS 0u
 #endif
+#if PLOW_NV_FP8_DECODE_WGMMA_ACTIVE
+#define PLOW_NV_FP8_DECODE_WGMMA_ARENA_FLOATS ((PLOW_NV_FP8_DECODE_WGMMA_ARENA_BYTES + 3u) / 4u)
+#else
+#define PLOW_NV_FP8_DECODE_WGMMA_ARENA_FLOATS 0u
+#endif
 #if PLOW_NV_GEMV512_ROLE
 #define PLOW_NV_ARENA_FLOATS 16384u
-#elif PLOW_NV_FP8_DECODE_WGMMA_ACTIVE
-#define PLOW_NV_FP8_DECODE_WGMMA_ARENA_FLOATS ((PLOW_NV_FP8_DECODE_WGMMA_ARENA_BYTES + 3u) / 4u)
-#define PLOW_NV_NON_FP8_ARENA_FLOATS \
-    (PLOW_NV_BASE_ARENA_FLOATS > PLOW_NV_M16_ARENA_FLOATS ? PLOW_NV_BASE_ARENA_FLOATS : PLOW_NV_M16_ARENA_FLOATS)
-#define PLOW_NV_ARENA_FLOATS \
-    (PLOW_NV_NON_FP8_ARENA_FLOATS > PLOW_NV_FP8_DECODE_WGMMA_ARENA_FLOATS ? PLOW_NV_NON_FP8_ARENA_FLOATS : PLOW_NV_FP8_DECODE_WGMMA_ARENA_FLOATS)
 #else
 /* The grouped-MoE ring joins the LAUNCH claim only. Folded into the base arena it would also
  * raise PLOW_NV_GEMV_STAGING_BYTES, which moves the wide rungs' GEMVs onto the staged arm. */
@@ -1051,8 +1056,10 @@ static_assert(PLOW_NV_GEMV_STAGING_BYTES <= PLOW_NV_BASE_ARENA_FLOATS * sizeof(f
 #else
 #define PLOW_NV_K8_ARENA_FLOATS 0u
 #endif
-#define PLOW_NV_ARENA_FLOATS00                                                                \
+#define PLOW_NV_NON_FP8_ARENA_FLOATS                                                          \
     (PLOW_NV_BASE_ARENA_FLOATS > PLOW_NV_M16_ARENA_FLOATS ? PLOW_NV_BASE_ARENA_FLOATS : PLOW_NV_M16_ARENA_FLOATS)
+#define PLOW_NV_ARENA_FLOATS00                                                                \
+    (PLOW_NV_NON_FP8_ARENA_FLOATS > PLOW_NV_FP8_DECODE_WGMMA_ARENA_FLOATS ? PLOW_NV_NON_FP8_ARENA_FLOATS : PLOW_NV_FP8_DECODE_WGMMA_ARENA_FLOATS)
 #define PLOW_NV_ARENA_FLOATS0                                                                 \
     (PLOW_NV_ARENA_FLOATS00 > PLOW_NV_K8_ARENA_FLOATS ? PLOW_NV_ARENA_FLOATS00 : PLOW_NV_K8_ARENA_FLOATS)
 #if PLOW_NV_SPEECH
@@ -1064,6 +1071,10 @@ static_assert(PLOW_NV_GEMV_STAGING_BYTES <= PLOW_NV_BASE_ARENA_FLOATS * sizeof(f
 #define PLOW_NV_ARENA_FLOATS                                                                  \
     (PLOW_NV_ARENA_FLOATS0 > PLOW_NV_MOE_GROUP_ARENA ? PLOW_NV_ARENA_FLOATS0 : PLOW_NV_MOE_GROUP_ARENA)
 #endif
+#endif
+#if PLOW_NV_FP8_DECODE_TC_ACTIVE
+static_assert(PLOW_NV_ARENA_FLOATS * sizeof(float) >= PLOW_FP8TC_ARENA_BYTES,
+              "FP8 decode tensor-core GEMV reduces its K split through the arena");
 #endif
 #if PLOW_NV_FP8_DECODE_WGMMA_ACTIVE
 static_assert(PLOW_NV_ARENA_FLOATS * sizeof(float) >= PLOW_NV_FP8_DECODE_WGMMA_ARENA_BYTES,
@@ -1597,6 +1608,7 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
      * t6 (NONE on every legacy bf16 packet; host-patched in PX-1 batched-prefill mode) is the
      * packed chunk's request table — see d_flash_prefill_mux. */
 #if !PLOW_NV_SEG_GEMM && !PLOW_NV_FATLITE /* lean GEMM + FATLITE objects never run flash */
+#if !defined(PLOW_HAS_FLASH_PREFILL) || PLOW_HAS_FLASH_PREFILL
 #if PLOW_MIXED_STEP
     case PLOW_DOP_FLASH_PREFILL:
 #if !PLOW_NV_FA_ONLY
@@ -1699,6 +1711,7 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
 #endif
         break;
 #endif
+#endif /* PLOW_HAS_FLASH_PREFILL */
 
 #if PLOW_FP8_KV
 #if PLOW_NV_PACKED_REQUEST
@@ -2030,12 +2043,21 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
 #endif /* !PLOW_NV_GEMM_ONLY (pointwise + lm_head GEMV) */
 
 #if !PLOW_NV_PREFILL || PLOW_MIXED_STEP
+#if PLOW_NV_FP8_LT_DECODE && !PLOW_NV_PREFILL
+    case PLOW_DOP_QUANT_FP8:
+        d_quant_fp8((uint8_t*)TEN(0), (__nv_bfloat16*)TEN(1), (float*)TEN(2),
+            in->i[0], in->i[1], slice, nblk, (const __nv_bfloat16*)TEN(3),
+            (const __nv_bfloat16*)TEN(4), in->i[2], arena);
+        break;
+#endif
 #if defined(PLOW_NV_HOPPER) && defined(PLOW_NV_FP8_M1) && PLOW_NV_FP8_M1 && PLOW_NV_QUANT_FP8_VLLM
+#if !PLOW_NV_FP8_LT_DECODE
     case PLOW_DOP_QUANT_FP8:
         if (in->i[0] != 1) { __trap(); break; }
         d_quant_fp8((uint8_t*)TEN(0), (__nv_bfloat16*)TEN(1), (float*)TEN(2),
             in->i[0], in->i[1], slice, nblk);
         break;
+#endif
     case PLOW_DOP_GEMM_FP8:
     case PLOW_DOP_GEMM_MED_FP8:
     case PLOW_DOP_GEMM_SMALL_FP8:
@@ -2374,6 +2396,9 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
         if (in->i[2] <= PLOW_NV_GEMV_STAGING_BYTES / 2u
 #if PLOW_NV_FP8_DECODE_WGMMA_ACTIVE
             || gemv_fp8_wgmma_supported(in->i[0], in->i[2])
+#endif
+#if PLOW_NV_FP8_DECODE_TC_ACTIVE
+            || gemv_fp8_tc_supported(in->i[0], in->i[2])
 #endif
         )
             d_gemv_fp8((__nv_bfloat16*)TEN(0),
@@ -2818,7 +2843,8 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
                                     (const unsigned char*)TEN(2) + (size_t)soff * 8u,
                                     (const unsigned long long*)TEN(3),
                                     (const unsigned long long*)TEN(4), in->i[0], in->i[1],
-                                    in->i[2], in->i[3], slice, nblk, PLOW_NROW(in->i[5]));
+                                    in->i[2], in->i[3], slice, nblk, PLOW_NROW(in->i[5]),
+                                    (float*)arena);
         break;
     }
 #endif
@@ -3263,6 +3289,27 @@ __device__ __forceinline__ void plow_gemv_prefetch(const PlowDevInst* in, void* 
     }
 }
 #endif
+#if PLOW_FP8TC_PF && PLOW_NV_FP8_DECODE_TC_ACTIVE
+__device__ __forceinline__ void plow_fp8tc_prefetch(const PlowDevInst* in, void* const* T,
+                                                    unsigned slice, unsigned nblk) {
+    auto W = [&](int k) { return (const uint8_t*)T[in->t[k]]; };
+    switch (in->op) {
+#if PLOW_HAS_GEMV_FP8
+    case PLOW_DOP_GEMV_FP8:
+        if (gemv_fp8_tc_supported(in->i[0], in->i[2])) fp8tc_pf(W(2), nullptr, in->i[1], in->i[2], slice, nblk);
+        break;
+#endif
+#if PLOW_HAS_GEMV_GLU_FP8
+    case PLOW_DOP_GEMV_GLU_FP8:
+        if (gemv_fp8_tc_supported(in->i[0], in->i[2]) && in->i[5] == PLOW_ACT_GELU_TANH_)
+            fp8tc_pf(W(2), W(5), in->i[1], in->i[2], slice, nblk);
+        break;
+#endif
+    default:
+        break;
+    }
+}
+#endif
 /* PRE-GATE L2 WEIGHT PREFETCH for the decode GEMVs. Weights do not depend on the gate, so a
  * block about to wait on its producers first asks the TMA unit to pull its share of the op's
  * weight bytes into L2 (one cp.async.bulk.prefetch per contiguous span): the body then starts
@@ -3503,6 +3550,9 @@ __global__ __launch_bounds__(PLOW_NV_THREADS, PLOW_NV_MINBLK) void PLOW_SYM(inte
 #if PLOW_GEMV_PREFETCH && !PLOW_NV_PREFILL && PLOW_NV_GEMV_MMA
         if (wait_len) plow_gemv_prefetch(in, prog.tensors, e.slice, in->blocks ? in->blocks : nblk_grid);
 #endif
+#if PLOW_FP8TC_PF && PLOW_NV_FP8_DECODE_TC_ACTIVE
+        if (wait_len) plow_fp8tc_prefetch(in, prog.tensors, e.slice, in->blocks ? in->blocks : nblk_grid);
+#endif
 #if PLOW_NV_GEMV_L2PF_BYTES && !PLOW_NV_PREFILL && defined(PLOW_NV_HOPPER)
         if (wait_len && threadIdx.x == 0)
             plow_gemv_l2pf(in, prog.tensors, e.slice, in->blocks ? in->blocks : nblk_grid);
@@ -3615,6 +3665,12 @@ __global__ __launch_bounds__(PLOW_NV_THREADS, PLOW_NV_MINBLK) void PLOW_SYM(inte
 #if PLOW_NV_GEMMA
 /* ABI 2 (Gemma objects): the host passes the instruction and its resolved tensor pointers by
  * value, so a launch starts on its operands instead of two dependent loads (insts, tensors). */
+#ifndef PLOW_NV_LIGHT_FP8_ATTN
+#define PLOW_NV_LIGHT_FP8_ATTN 0
+#endif
+#if PLOW_NV_LIGHT_FP8_ATTN && PLOW_NV_GEMMA && PLOW_NV_W8A8
+extern "C" __device__ unsigned PLOW_SYM(plow_light_fp8_attn) = 1;
+#endif
 struct PlowLightOp {
     PlowDevInst d;
     void* t[8];
@@ -3626,6 +3682,89 @@ struct PlowLightSpan {
     unsigned fused;    /* op[0..count-1) HeadNormRope feeding op[count-1] FlashDecode, in one launch */
     PlowLightOp op[4];
 };
+#if PLOW_NV_GEMMA && PLOW_NV_W8A8 && PLOW_NV_THREADS == 256
+extern "C" __global__ void __launch_bounds__(PLOW_NV_THREADS)
+    PLOW_SYM(plow_sm120_light_norm_quant)(const __grid_constant__ PlowLightSpan a) {
+    __shared__ float part[32];
+    const PlowLightOp& n = a.op[0];
+    const PlowLightOp& q = a.op[1];
+    const unsigned row = blockIdx.x;
+    const size_t base = (size_t)row * 3840u;
+    const __nv_bfloat16* a_in = (const __nv_bfloat16*)n.t[2];
+    const __nv_bfloat16* b = (const __nv_bfloat16*)n.t[3];
+    const __nv_bfloat16* gb = (const __nv_bfloat16*)n.t[4];
+    const __nv_bfloat16* gn = (const __nv_bfloat16*)n.t[5];
+    __nv_bfloat16* resid = (__nv_bfloat16*)n.t[1];
+    __nv_bfloat16* out = (__nv_bfloat16*)n.t[0];
+    uint8_t* xq = (uint8_t*)q.t[0];
+    float* ascale = (float*)q.t[2];
+    bf16v8 av[2], bv[2], wb[2], wn[2], rv[2], no[2];
+#pragma unroll
+    for (int c = 0; c < 2; c++) {
+        const unsigned i = (threadIdx.x + (unsigned)c * 256u) * 8u;
+        av[c] = bf16v8_zero();
+        bv[c] = bf16v8_zero();
+        wb[c] = bf16v8_zero();
+        wn[c] = bf16v8_zero();
+        if (i < 3840u) {
+            av[c] = ld_glob8(a_in + base + i);
+            bv[c] = ld_glob8(b + base + i);
+            if (gb) wb[c] = ld_glob8(gb + i);
+            if (gn) wn[c] = ld_glob8(gn + i);
+        }
+    }
+    float ssb = 0.0f;
+#pragma unroll
+    for (int c = 0; c < 2; c++)
+#pragma unroll
+        for (int j = 0; j < 8; j++) {
+            const float f = __bfloat162float(bv[c].x[j]);
+            ssb += f * f;
+        }
+    const float invb = rsqrtf(block_sum(ssb, part) / 3840.0f + n.d.fj[0].f);
+    float ssr = 0.0f;
+#pragma unroll
+    for (int c = 0; c < 2; c++) {
+#pragma unroll
+        for (int j = 0; j < 8; j++) {
+            const float g = gb ? norm_weight(__bfloat162float(wb[c].x[j])) : 1.0f;
+            const float f = (__bfloat162float(av[c].x[j]) +
+                             gemma_postnorm_round(__bfloat162float(bv[c].x[j]) * invb * g)) *
+                            n.d.fj[1].f;
+            rv[c].x[j] = __float2bfloat16(f);
+            const float rf = __bfloat162float(rv[c].x[j]);
+            ssr += rf * rf;
+        }
+    }
+    const float invr = rsqrtf(block_sum(ssr, part) / 3840.0f + n.d.fj[0].f);
+    float amax = 0.0f;
+#pragma unroll
+    for (int c = 0; c < 2; c++)
+#pragma unroll
+        for (int j = 0; j < 8; j++) {
+            const float g = gn ? norm_weight(__bfloat162float(wn[c].x[j])) : 1.0f;
+            no[c].x[j] = __float2bfloat16(__bfloat162float(rv[c].x[j]) * invr * g);
+            amax = fmaxf(amax, fabsf(__bfloat162float(no[c].x[j])));
+        }
+    const float as = fmaxf(block_max(amax, part) * (1.0f / 448.0f), 1e-12f);
+    const float inv = 1.0f / as;
+    if (threadIdx.x == 0) ascale[row] = as;
+#pragma unroll
+    for (int c = 0; c < 2; c++) {
+        const unsigned i = (threadIdx.x + (unsigned)c * 256u) * 8u;
+        if (i >= 3840u) continue;
+        st_glob8(resid + base + i, rv[c]);
+        st_glob8(out + base + i, no[c]);
+        uint2 q8;
+        unsigned short* q2 = (unsigned short*)&q8;
+#pragma unroll
+        for (int j = 0; j < 4; j++)
+            q2[j] = pack_fp8_e4m3(__bfloat162float(no[c].x[2 * j]) * inv,
+                                   __bfloat162float(no[c].x[2 * j + 1]) * inv);
+        *(uint2*)(xq + base + i) = q8;
+    }
+}
+#endif
 extern "C" __global__ void __launch_bounds__(PLOW_NV_THREADS)
     PLOW_SYM(plow_sm120_light)(const __grid_constant__ PlowLightOp a) {
     __shared__ float part[32];
@@ -3668,6 +3807,23 @@ extern "C" __global__ void __launch_bounds__(PLOW_NV_THREADS) PLOW_SYM(plow_sm12
                              (const __nv_bfloat16*)LIGHT_TEN(4), (const __nv_bfloat16*)LIGHT_TEN(5), in->i[0],
                              in->i[1], in->fj[0].f, in->fj[1].f, slice, nblk, part);
         break;
+#if PLOW_NV_LIGHT_FP8_ATTN && PLOW_NV_W8A8
+    case PLOW_DOP_QUANT_FP8:
+        d_quant_fp8((uint8_t*)LIGHT_TEN(0), (__nv_bfloat16*)LIGHT_TEN(1),
+                    (float*)LIGHT_TEN(2), in->i[0], in->i[1], slice, nblk,
+                    nullptr, nullptr, 0, part);
+        break;
+    case PLOW_DOP_FLASH_MERGE:
+        if (in->i[3] == 256)
+            d_flash_merge<256>((__nv_bfloat16*)LIGHT_TEN(0), (const float*)LIGHT_TEN(1),
+                               (const float*)LIGHT_TEN(2), in->i[0], in->i[1], in->i[2], slice, nblk);
+        else if (in->i[3] == 512)
+            d_flash_merge<512>((__nv_bfloat16*)LIGHT_TEN(0), (const float*)LIGHT_TEN(1),
+                               (const float*)LIGHT_TEN(2), in->i[0], in->i[1], in->i[2], slice, nblk);
+        else
+            __trap();
+        break;
+#endif
     case PLOW_DOP_GLU_STRIDED:
         d_glu_strided((__nv_bfloat16*)LIGHT_TEN(0), (const __nv_bfloat16*)LIGHT_TEN(1),
                       (const __nv_bfloat16*)LIGHT_TEN(2), in->i[0], in->i[1], in->i[2], in->i[3], in->i[4],
@@ -4053,6 +4209,23 @@ __device__ __forceinline__ void light_attn_gemma(const PlowLightSpan& a, float* 
                         in->fj[0].f, in->i[3], in->fj[1].u, in->fj[2].u, in->i[4], slice, nblk,   \
                         in->i[6], nullptr, in->i[7] ? (__nv_bfloat16*)LIGHT_TEN(6) : nullptr,     \
                         in->i[7] ? (const __nv_bfloat16*)LIGHT_TEN(7) : nullptr, x_row)
+#if PLOW_NV_LIGHT_FP8_ATTN && PLOW_FP8_KV
+#define LIGHT_HNR_FP8(DD)                                                                    \
+    d_headnorm_rope_fp8<DD>((uint8_t*)LIGHT_TEN(0), (float*)LIGHT_TEN(6), x,                    \
+                            (const __nv_bfloat16*)LIGHT_TEN(2), (const float*)LIGHT_TEN(3),    \
+                            (const float*)LIGHT_TEN(4), (const int*)LIGHT_TEN(5), in->i[0],   \
+                            in->i[1], in->fj[0].f, in->i[3], in->fj[1].u, in->fj[2].u,         \
+                            in->i[4], slice, nblk, in->i[6])
+#define LIGHT_FLASH_FP8(DD, GG)                                                              \
+    d_flash_decode<DD, GG, true>((float*)LIGHT_TEN(0), (float*)LIGHT_TEN(1),                    \
+                                 (const __nv_bfloat16*)LIGHT_TEN(2),                           \
+                                 (const __nv_bfloat16*)LIGHT_TEN(3),                           \
+                                 (const __nv_bfloat16*)LIGHT_TEN(4), (const int*)LIGHT_TEN(5), \
+                                 in->i[0], in->i[1], in->i[2], in->i[3], in->i[4],             \
+                                 in->fj[0].f, in->i[5], in->i[7], slice, nblk, arena,           \
+                                 in->fj[1].u, (const float*)LIGHT_TEN(6),                      \
+                                 (const float*)LIGHT_TEN(7))
+#endif
 #define LIGHT_FLASH(DD, GG)                                                                  \
     do {                                                                                     \
         __nv_bfloat16* const fold_out = (__nv_bfloat16*)a.op[i].fold[0];                    \
@@ -4072,7 +4245,11 @@ __device__ __forceinline__ void light_attn_gemma(const PlowLightSpan& a, float* 
                 in->fj[0].f, in->i[5], in->i[7], slice, nblk, arena, in->fj[1].u, nullptr,   \
                 nullptr, nullptr, fold_out, fold_ctr);                                       \
     } while (0)
-        const unsigned gqa = in->op == PLOW_DOP_FLASH_DECODE ? in->i[1] / in->i[2] : 0;
+        const unsigned gqa = (in->op == PLOW_DOP_FLASH_DECODE
+#if PLOW_FP8_KV
+                              || in->op == PLOW_DOP_FLASH_DECODE_FP8
+#endif
+                             ) ? in->i[1] / in->i[2] : 0;
         const __nv_bfloat16* x = (const __nv_bfloat16*)LIGHT_TEN(1);
         const unsigned x_row = a.x_row[i];
         if (in->op == PLOW_DOP_HEADNORM_ROPE && in->i[2] == 256 && in->i[5] == 0) {
@@ -4085,9 +4262,23 @@ __device__ __forceinline__ void light_attn_gemma(const PlowLightSpan& a, float* 
             LIGHT_HNR(512);
         } else if (in->op == PLOW_DOP_FLASH_DECODE && in->i[6] == 512 && gqa % PLOW_NV_FA_GF_FULL == 0) {
             LIGHT_FLASH(512, PLOW_NV_FA_GF_FULL);
+#if PLOW_NV_LIGHT_FP8_ATTN && PLOW_FP8_KV
+        } else if (in->op == PLOW_DOP_HEADNORM_ROPE_FP8 && in->i[2] == 256 && in->i[5] == 0) {
+            LIGHT_HNR_FP8(256);
+        } else if (in->op == PLOW_DOP_FLASH_DECODE_FP8 && in->i[6] == 256 && gqa % 2u == 0) {
+            LIGHT_FLASH_FP8(256, 2);
+        } else if (in->op == PLOW_DOP_HEADNORM_ROPE_FP8 && in->i[2] == 512 && in->i[5] == 0) {
+            LIGHT_HNR_FP8(512);
+        } else if (in->op == PLOW_DOP_FLASH_DECODE_FP8 && in->i[6] == 512 && gqa % PLOW_NV_FA_GF_FULL == 0) {
+            LIGHT_FLASH_FP8(512, PLOW_NV_FA_GF_FULL);
+#endif
         } else {
             __trap();
         }
+#if PLOW_NV_LIGHT_FP8_ATTN && PLOW_FP8_KV
+#undef LIGHT_FLASH_FP8
+#undef LIGHT_HNR_FP8
+#endif
 #undef LIGHT_FLASH
 #undef LIGHT_HNR
 #undef LIGHT_TEN
@@ -4103,6 +4294,26 @@ extern "C" __global__ void __launch_bounds__(PLOW_NV_THREADS, 2)
     extern __shared__ float arena[];
     light_attn_gemma<false>(a, arena);
 }
+#if PLOW_NV_LIGHT_FP8_ATTN && PLOW_FP8_KV
+extern "C" __global__ void __launch_bounds__(PLOW_NV_THREADS, 2)
+    PLOW_SYM(plow_sm120_light_fp8_flash256)(const __grid_constant__ PlowLightSpan a) {
+    const PlowDevInst* in = &a.op[0].d;
+    if (a.count != 1 || a.fused || in->op != PLOW_DOP_FLASH_DECODE_FP8 || in->i[6] != 256)
+        __trap();
+    const unsigned nblk = in->blocks ? in->blocks : gridDim.x;
+    if (blockIdx.x >= nblk) return;
+    extern __shared__ float arena[];
+    d_flash_decode<256, 2, true>(
+        (float*)a.op[0].t[0], (float*)a.op[0].t[1],
+        (const __nv_bfloat16*)a.op[0].t[2], (const __nv_bfloat16*)a.op[0].t[3],
+        (const __nv_bfloat16*)a.op[0].t[4], (const int*)a.op[0].t[5],
+        in->i[0], in->i[1], in->i[2], in->i[3], in->i[4], in->fj[0].f,
+        in->i[5], in->i[7], blockIdx.x, nblk, arena, in->fj[1].u,
+        (const float*)a.op[0].t[6], (const float*)a.op[0].t[7]);
+}
+extern "C" __device__ unsigned PLOW_SYM(plow_light_fp8_flash256_smem) =
+    FA_DEC_SMEM_FLOATS(256, 2) * sizeof(float);
+#endif
 extern "C" __device__ unsigned PLOW_SYM(plow_light_attn_hd) = 256;
 extern "C" __device__ unsigned PLOW_SYM(plow_light_attn_hd2) = 512;
 #endif
@@ -4205,3 +4416,16 @@ extern "C" int PLOW_SYM(plow_sm120_launch)(PlowProgram* prog, int grid, cudaStre
 #endif
     return rc;
 }
+
+#if defined(PLOW_NV_GLU_QUANT_CACHE) && PLOW_NV_GLU_QUANT_CACHE && PLOW_NV_PREFILL && PLOW_NV_SEGMENTS && PLOW_NV_THREADS == 256
+extern "C" __device__ unsigned PLOW_SYM(plow_glu_quant_cache_abi) = 1;
+extern "C" __global__ void __launch_bounds__(256, 2) PLOW_SYM(plow_glu_quant_cached)(PlowProgram prog,
+                                                                                 unsigned inst) {
+    __shared__ float part[8];
+    const PlowDevInst* in = prog.insts + inst;
+    void* const* t = prog.tensors;
+    d_glu_quant_fp8_cached((__nv_bfloat16*)t[in->t[1]], (uint8_t*)t[in->t[0]],
+                            (float*)t[in->t[2]], (const __nv_bfloat16*)t[in->t[3]],
+                            (const __nv_bfloat16*)t[in->t[4]], in->i[0], blockIdx.x, gridDim.x, part);
+}
+#endif
