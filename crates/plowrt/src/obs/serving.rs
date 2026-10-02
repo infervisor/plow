@@ -34,6 +34,11 @@ impl Histogram {
         self.observe(value as u64, TOKENS);
     }
 
+    /// A latency histogram in seconds.
+    pub fn write_seconds(&self, out: &mut String, name: &str, labels: &str) {
+        self.write(out, name, labels, LATENCY, 1e6);
+    }
+
     fn write(&self, out: &mut String, name: &str, labels: &str, bounds: &[u64], scale: f64) {
         let mut count = 0;
         for (i, bin) in self.bins.iter().enumerate() {
@@ -98,6 +103,8 @@ pub struct ServingMetrics {
     pub tick_tokens: Histogram,
     pub tick_batch: Histogram,
     pub run_packets: Histogram,
+    /// Time to first output per turn stage (`serve::turns::Kind`: ASR final, LLM TTFT, TTS TTFA).
+    pub turn_stage: [Histogram; 3],
 }
 
 pub fn escape_label(value: &str) -> String {
@@ -112,6 +119,11 @@ pub fn family(out: &mut String, name: &str, kind: &str, help: &str) {
 }
 
 impl ServingMetrics {
+    /// The model's cumulative tick time, µs: the device time its dispatcher has spent ticking.
+    pub fn device_us(&self) -> u64 {
+        self.ticks.iter().map(|h| h.sum.load(Relaxed)).sum()
+    }
+
     pub fn write(out: &mut String, models: &[(String, Arc<Metrics>, bool)]) {
         let labels: Vec<String> = models
             .iter()
@@ -407,6 +419,22 @@ impl ServingMetrics {
                 );
             }
         }
+        family(
+            out,
+            "plowrt_turn_stage_seconds",
+            "histogram",
+            "Stage start through its first output: ASR final transcript, LLM first token, TTS first audio.",
+        );
+        for ((_, m, _), labels) in models.iter().zip(&labels) {
+            for (stage, h) in ["asr_final", "llm_ttft", "tts_ttfa"].iter().zip(&m.serving.turn_stage) {
+                if h.bins.iter().any(|b| b.load(Relaxed) > 0) {
+                    h.write_seconds(out, "plowrt_turn_stage_seconds", &format!("{labels},stage=\"{stage}\""));
+                }
+            }
+        }
+        crate::serve::turns::write_metrics(out);
+        family(out, "plowrt_overload_level", "gauge", "Overload level: 0 normal, 1 ASR partials stretched, 2 TTS render-ahead capped, 3 new sessions shed.");
+        let _ = writeln!(out, "plowrt_overload_level {}", crate::serve::overload::level());
     }
 }
 

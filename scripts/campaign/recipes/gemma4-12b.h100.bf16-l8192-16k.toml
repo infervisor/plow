@@ -116,7 +116,7 @@ gate_prompt = "<bos><start_of_turn>user\nWhat is the capital of France? Answer i
 in_lens = "128 1024 4096 8192 15000"
 concs = "1 4"
 nprompt = 32
-# Queue-driven prefill packing (PLOW_PF_INTERLEAVE_ADAPTIVE): four 1024-row prompts arriving together no
+# Queue-driven prefill packing (the latency objective): four 1024-row prompts arriving together no
 # longer share one 172 ms launch; the oldest runs whole and later ones join only while that is cheaper.
 # Measured p12p, 16 prompts, off -> on: 1024 in TTFT 167.0 -> 107.7 ms (vLLM 0.28: 130.6), TPOT 11.93 -> 12.32;
 # 128 / 4096 / 15000 in level (40.5 / 363 / 1712 -> 40.1 / 359 / 1711).
@@ -125,7 +125,7 @@ nprompt = 32
 # literally 0.000, while TTFT and TPOT are untouched. MEASURED on this packet at C1:
 # p99 ITL 41.87 / 42.15 / 42.35 / 42.56 / 42.87 ms against a 10.45..10.65 TPOT (ratio 4.02),
 # versus vLLM 0.28 the same session at 11.46 / 11.56 / 11.57 / 11.58 / 11.60.
-serve_env = { PLOW_MULTISTEP = "0", PLOW_DECODE_PIPELINE = "1", PLOW_DECODE_MAX_RUNG = "4", PLOW_PF_INTERLEAVE = "0", PLOW_PF_INTERLEAVE_ADAPTIVE = "1" }
+serve_env = { PLOW_DECODE_MAX_RUNG = "4" }
 
 [bench.profiles.high_concurrency]
 in_lens = "128 1024 4096 8192 15000"
@@ -136,7 +136,7 @@ nprompt = 64
 # 74.9 ms, p99 ITL 98.5 -> 14.4, 1164 -> 1204 tok/s, TPOT 12.55 -> 12.71; 1024 / 4096 in level.
 # FAST_PROBE: a cold backlog tries the widest rung after one sample instead of four. C16, p12r,
 # 64 prompts (agent/pack-fairness): 128 in P99 TTFT 170 -> 150 ms, mean / tok/s level, 1024 / 4096 level.
-serve_env = { PLOW_MULTISTEP = "0", PLOW_DECODE_MAX_RUNG = "16", PLOW_PF_INTERLEAVE = "0", PLOW_TOKEN_BATCH = "1", PLOW_QUEUE_TTL_MS = "0", PLOW_RUNG_FAST_PROBE = "1" }
+serve_env = { PLOW_MULTISTEP = "0", PLOW_DECODE_MAX_RUNG = "16" }
 
 [reference]
 csv = "perf-data/campaign/gemma4-12b.h100.reference-vllm028-bf16.csv"

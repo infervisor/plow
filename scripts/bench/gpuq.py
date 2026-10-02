@@ -49,13 +49,16 @@ def work(root):
             job.update(state="running", runner_pid=os.getpid(), started=time.time())
             save(path, job)
             with (root / (path.stem + ".log")).open("ab") as log:
+                # The runner outlives submitters; a later job must not inherit the first job's Plow knobs.
+                child_env = {key: value for key, value in os.environ.items() if not key.startswith("PLOW_")}
                 child = subprocess.Popen([str(LEASE), "-n", str(job["ngpu"]), job["label"], *job["command"]],
-                                         cwd=job["cwd"], stdout=log, stderr=subprocess.STDOUT)
+                                         cwd=job["cwd"], env=child_env, stdout=log, stderr=subprocess.STDOUT)
                 job["pid"] = child.pid
                 save(path, job)
                 rc = child.wait()
             job.update(state="done" if rc == 0 else "failed", rc=rc, finished=time.time())
             save(path, job)
+            idle = time.monotonic()
 
 
 def main():

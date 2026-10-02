@@ -2,6 +2,8 @@
 
 pub mod admission;
 pub mod batching;
+/// Online device-cost EWMA per (model, op, size bucket) for turn deadlines.
+pub mod cost;
 /// Queue-driven CPU prefill: whether a waiting request's prompt head runs on
 /// the host, how long it may be, and when contention disarms the pool.
 // Allowed dead until the head pool drives it.

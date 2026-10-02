@@ -292,7 +292,7 @@ c64 lost 10.6%. The shipped rule gates only the reclaimer's decision.
 
 ```sh
 # unique prompts per cell (audit_2); PACKLOG accounting (audit_3)
-PLOW_PF_PACKLOG=1 plowrt serve --assets $E4B --multistep-adaptive ...
+PLOW_PF_PACKLOG=1 plowrt serve --assets $E4B ...
 python3 scripts/bench/packlog_audit.py server.log          # per cell: ticks, steps, riders, padding, occupancy
 step_bench $E4B 64 1024 10 --warmup 4 --sweep 0..604        # per-op decode cost (VMM KV now supported)
 plowrt disasm $E4B --program 1                               # op names for the sweep

@@ -85,16 +85,12 @@ pub struct RuntimeConfig {
     /// Select unified token batching when the backend, model and object support it.
     /// Unsupported configurations use ordinary execution; --fusion takes precedence.
     /// Disable with --token-batch=false or PLOW_TOKEN_BATCH=0.
-    #[arg(long = "token-batch", env = "PLOW_TOKEN_BATCH", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    #[arg(long = "token-batch", env = "PLOW_TOKEN_BATCH", hide = true, default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub token_batch: bool,
 
     /// Prefix reuse on compatible AMD and NVIDIA assets.
     #[arg(long = "prefix-cache", env = "PLOW_PREFIX_CACHE", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub prefix_cache: bool,
-
-    /// Skip the cold-start batch-formation hold when no other request is queued or tokenizing.
-    #[arg(long = "idle-dispatch", env = "PLOW_IDLE_DISPATCH", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
-    pub idle_dispatch: bool,
 
     /// Frames of right context a speech stream's FIRST audio waits for (later windows keep the
     /// codec's own lookahead): Veena needs one frame fewer before it speaks. Capped by the codec's.
@@ -105,15 +101,34 @@ pub struct RuntimeConfig {
     /// after a partial that took `t`, the session's appends answer the previous partial's text
     /// until `t * (1 / duty - 1)` has passed. Idle, partials take far less than the 1 s append
     /// cadence and all run; loaded, they stop crowding out finals. 1 = every append transcribes.
-    #[arg(long = "asr-partial-duty", env = "PLOW_ASR_PARTIAL_DUTY", default_value_t = 0.5, global = true)]
+    #[arg(long = "asr-partial-duty", env = "PLOW_ASR_PARTIAL_DUTY", hide = true, default_value_t = 0.5, global = true)]
     pub asr_partial_duty: f64,
 
     /// Under `--co-sched deadline`, most streams one vocoder render launch takes (0 = the packet's
     /// largest capacity). A launch is one cooperative grid that holds the device to its end (1.4 s
     /// at 64 streams, 0.45 s at 16), so this bounds how long ASR finals and prompts wait behind
     /// speech.
-    #[arg(long = "tts-turn-batch", env = "PLOW_TTS_TURN_BATCH", default_value_t = 16, global = true)]
+    #[arg(long = "tts-turn-batch", env = "PLOW_TTS_TURN_BATCH", hide = true, default_value_t = 16, global = true)]
     pub tts_turn_batch: usize,
+
+    /// Under `--co-sched deadline`, a vocoder render yields the device between CFM steps to a
+    /// waiter whose slack is more than this many ms below the render's own.
+    #[arg(long = "render-yield-margin-ms", env = "PLOW_RENDER_YIELD_MARGIN_MS", hide = true, default_value_t = 5, global = true)]
+    pub render_yield_margin_ms: u64,
+
+    /// Overload control (`serve::overload`): degrade, then shed new sessions with 429, on
+    /// sustained deadline misses. Unset = on under `--co-sched deadline` only.
+    #[arg(long = "overload", env = "PLOW_OVERLOAD", value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", hide = true, global = true)]
+    pub overload: Option<bool>,
+
+    /// Overload control's sliding window of deadline outcomes, ms.
+    #[arg(long = "overload-window-ms", env = "PLOW_OVERLOAD_WINDOW_MS", hide = true, default_value_t = 5000, global = true)]
+    pub overload_window_ms: u64,
+
+    /// Missed-deadline fractions entering overload levels 1, 2 and 3 (comma-separated); a level
+    /// is left below half its entry fraction.
+    #[arg(long = "overload-miss", env = "PLOW_OVERLOAD_MISS", hide = true, default_value = "0.05,0.1,0.2", global = true)]
+    pub overload_miss: String,
 
     /// Streams of a guided speech model render windows (new tokens + left context) on the
     /// vocoder packet's cached-prompt capacities when it has them; off: every chunk re-renders
@@ -137,6 +152,20 @@ pub struct RuntimeConfig {
     /// least recently used retained slot below it.
     #[arg(long = "session-slack", env = "PLOW_SESSION_SLACK", default_value_t = 0, global = true)]
     pub session_slack: usize,
+
+    /// Voice turn budget, ms: end of user speech to first agent audio, when the client sends no
+    /// `X-Turn-Budget-Ms` (`serve::turns`).
+    #[arg(long = "turn-budget-ms", env = "PLOW_TURN_BUDGET_MS", default_value_t = 1500, global = true)]
+    pub turn_budget_ms: u64,
+
+    /// Stage targets, ms, for `Server-Timing` slack and `plowrt_deadline_slack_seconds`: ASR final
+    /// transcript, LLM first token, TTS first audio, each from its own request's arrival.
+    #[arg(long = "turn-asr-final-ms", env = "PLOW_TURN_ASR_FINAL_MS", default_value_t = 500, global = true)]
+    pub turn_asr_final_ms: u64,
+    #[arg(long = "turn-llm-ttft-ms", env = "PLOW_TURN_LLM_TTFT_MS", default_value_t = 800, global = true)]
+    pub turn_llm_ttft_ms: u64,
+    #[arg(long = "turn-tts-ttfa-ms", env = "PLOW_TURN_TTS_TTFA_MS", default_value_t = 800, global = true)]
+    pub turn_tts_ttfa_ms: u64,
 
     /// Tokenize prompts without computing offsets (same ids).
     #[arg(long = "encode-fast", env = "PLOW_ENCODE_FAST", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
@@ -211,61 +240,31 @@ pub struct RuntimeConfig {
     #[arg(long = "weight-vmm", env = "PLOW_WEIGHT_VMM", value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub weight_vmm: Option<bool>,
 
-    /// Cross-request prefill scheduling. CUDA packs chunks into one launch (unset = off). AMD
-    /// co-packs compatible mid-prefill spans into one compiled rung (unset = on; programs the
-    /// packed route refuses stay isolated). An explicit `=1` also rotates isolated admission
-    /// across slots instead of oldest-first.
-    #[arg(long = "pf-batch", env = "PLOW_PF_BATCH", value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
-    pub pf_batch: Option<bool>,
+    /// Serving objective: `latency`, `throughput`, or `auto` (per tick, from live decode width
+    /// and queue depth). Every scheduling mechanism is derived from it (`serve::policy`).
+    #[arg(long = "objective", env = "PLOW_OBJECTIVE", default_value = "auto", global = true)]
+    pub objective: crate::serve::policy::Objective,
 
-    /// Step token budget — prefill rows admitted per tick before decode runs.
-    /// Unset: CUDA 2048; AMD the widest compiled prefill rung. 0 = uncapped.
-    #[arg(long = "pf-interleave", env = "PLOW_PF_INTERLEAVE", global = true)]
+    /// Expert: prefill rows admitted per tick while requests decode. Unset or 0 = the widest
+    /// compiled prefill launch.
+    #[arg(long = "pf-interleave", env = "PLOW_PF_INTERLEAVE", hide = true, global = true)]
     pub pf_interleave: Option<u32>,
 
-    /// Size each prefill launch from the queue: the oldest prompt whole, and later prompts join
-    /// only while the delay to those already packed is under the launches the rest save
-    /// (`PLOW_PF_CHUNK_COST` rows each). CUDA packed prefill only.
-    #[arg(long = "pf-interleave-adaptive", env = "PLOW_PF_INTERLEAVE_ADAPTIVE", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
-    pub pf_interleave_adaptive: bool,
-
-    /// Per-request prefill chunk-row cap. 0 = off.
+    /// Expert: per-request prefill chunk-row cap; AMD also rotates isolated admission across
+    /// slots under it. 0 = off.
     #[arg(
         long = "pf-chunk",
         env = "PLOW_PF_CHUNK",
         default_value_t = 0,
+        hide = true,
         global = true
     )]
     pub pf_chunk: u32,
 
-    /// Disable chunked prefill (whole-prompt-per-tick).
-    #[arg(long = "pf-no-chunk", env = "PLOW_PF_NO_CHUNK", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
-    pub pf_no_chunk: bool,
-
-    /// Disable prefill/decode interleave (prefill-only tick).
-    #[arg(long = "pf-no-interleave", env = "PLOW_PF_NO_INTERLEAVE", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
-    pub pf_no_interleave: bool,
-
-    /// Always ride decode rows in the prefill launch (the pre-`sched::ride` behaviour) instead of
-    /// choosing per launch from measured costs.
-    #[arg(long = "ride-fixed", env = "PLOW_RIDE_FIXED", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
-    pub ride_fixed: bool,
-
-    /// Throughput mode: run prefill chains to completion, skip decode until all
-    /// prompts are resident. Trades streaming latency for aggregate tok/s.
-    #[arg(long = "pf-defer-decode", env = "PLOW_PF_DEFER_DECODE", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    /// Expert: run prefill chains to completion, skip decode until all prompts are resident.
+    /// Trades streaming latency for aggregate tok/s (CUDA 8x127k +7.1%, Veena c128 -3%).
+    #[arg(long = "pf-defer-decode", env = "PLOW_PF_DEFER_DECODE", hide = true, default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub pf_defer_decode: bool,
-
-    /// Prefill cross-request span allocation policy: "greedy" (completion priority, lowest TTFT)
-    /// or "fair" (fair-split rows across all concurrent requests).
-    /// Serving profile selection. `auto` picks the campaign's realtime/high_concurrency knob
-    /// set per tick from live decode width and queue depth (hysteresis band + dwell, one log line
-    /// per switch); unset pins whatever the flags say, which is what certs and campaign cells run.
-    #[arg(long = "serve-policy", env = "PLOW_SERVE_POLICY", value_parser = clap::builder::PossibleValuesParser::new(["pinned", "auto"]), global = true)]
-    pub serve_policy: Option<String>,
-
-    #[arg(long = "pf-span-policy", env = "PLOW_PF_SPAN_POLICY", value_parser = clap::builder::PossibleValuesParser::new(["greedy", "fair"]), global = true)]
-    pub pf_span_policy: Option<String>,
 
     /// Runtime max context override. If set, limits or configures the maximum sequence length at runtime.
     /// If unset, defaults to the context length declared by the packet.
@@ -274,16 +273,9 @@ pub struct RuntimeConfig {
 
     /// AMD inter-token (TBT) target, ms. While requests decode, each tick takes the largest
     /// prefill it can while the predicted tick stays at or under this value; decode rows always
-    /// run. Unset = the throughput schedule (`PLOW_PF_INTERLEAVE`), unchanged.
+    /// run. Unset = the objective's schedule.
     #[arg(long = "tbt-slo-ms", env = "PLOW_TBT_SLO_MS", global = true)]
     pub tbt_slo_ms: Option<f64>,
-
-    /// How long a request may wait for a slot before it is answered 429, ms. Unset = the
-    /// mux's derived TTL (`--slo-ms` x 40, at least 30 s); `0` = never shed a waiting request.
-    /// At 70k context a queued request waits for a whole generation of live sequences to
-    /// retire, which is minutes, not seconds.
-    #[arg(long = "queue-ttl-ms", env = "PLOW_QUEUE_TTL_MS", global = true)]
-    pub queue_ttl_ms: Option<f64>,
 
     /// AMD time-to-first-token target, ms. Prefill candidates are ordered by deadline slack
     /// (EDF), prompts finishing this tick first, requests that can no longer make it last.
@@ -345,30 +337,16 @@ pub struct RuntimeConfig {
     #[arg(long = "pin", env = "PLOW_PIN", value_delimiter = ',', global = true)]
     pub pin: Vec<String>,
 
-    /// How co-resident models take a shared GPU: `free` (private streams, the
-    /// driver admits whoever is ready — fastest, and the default), `rr`
-    /// (round-robin turns, which bounds starvation and makes the interleaving
-    /// reproducible at the cost of overlap) or `deadline` (turns by urgency: an
-    /// ASR final, a speech stream's start or a prompt owed its first token go
-    /// ahead of decode, decode ahead of partial transcripts; see `serve::cosched`).
-    #[arg(
-        long = "co-sched",
-        env = "PLOW_CO_SCHED",
-        default_value = "free",
-        global = true
-    )]
-    pub co_sched: crate::serve::cosched::CoSched,
+    /// Expert: how co-resident models take a shared GPU: `free` (private streams), `rr`
+    /// (round-robin turns) or `deadline` (turns by urgency, see `serve::cosched`). Unset =
+    /// derived from the objective and backend (`serve::policy::co_sched`).
+    #[arg(long = "co-sched", env = "PLOW_CO_SCHED", hide = true, global = true)]
+    pub co_sched: Option<crate::serve::cosched::CoSched>,
 
-    /// Consecutive ticks one model keeps the device under `--co-sched rr`.
-    /// Not 1 by default: models with different dynamic shared-memory requests
-    /// force an SM carveout reconfiguration on every alternation (~150-300us).
-    #[arg(
-        long = "co-sched-quantum",
-        env = "PLOW_CO_SCHED_QUANTUM",
-        default_value_t = 4,
-        global = true
-    )]
-    pub co_sched_quantum: u32,
+    /// Expert: `--co-sched deadline` starvation bound, ms: a model waiting this long for the
+    /// device is due now. Unset = `serve::cosched::MAX_WAIT` (2000).
+    #[arg(long = "cosched-max-wait-ms", env = "PLOW_COSCHED_MAX_WAIT_MS", hide = true, global = true)]
+    pub cosched_max_wait_ms: Option<u32>,
 
     /// Directories under which `POST /v1/models/load` may take an assets dir.
     /// Repeatable; `PLOW_MODELS_ROOT` takes a `:`-separated list.
@@ -452,20 +430,9 @@ pub struct RuntimeConfig {
     /// carries the siblings costs only their program records.
     #[arg(long = "glm-rowband", env = "PLOW_GLM_ROWBAND", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub glm_rowband: bool,
-    /// Widest decode rung a serving engine admits (`PLOW_DECODE_MAX_RUNG`); unset = no ceiling.
-    #[arg(long = "decode-max-rung", env = "PLOW_DECODE_MAX_RUNG", global = true)]
+    /// Expert: widest decode rung a serving engine admits; unset = no ceiling.
+    #[arg(long = "decode-max-rung", env = "PLOW_DECODE_MAX_RUNG", hide = true, global = true)]
     pub decode_max_rung: Option<u32>,
-    /// A cold backlog probes the widest decode rung after one penultimate sample instead of
-    /// four (`PLOW_RUNG_FAST_PROBE`): the rest of a fresh server's first burst no longer waits
-    /// out four decode-only ticks before it is admitted.
-    #[arg(long = "rung-fast-probe", env = "PLOW_RUNG_FAST_PROBE", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
-    pub rung_fast_probe: bool,
-    /// Run a GPU model's mux dispatcher on its own OS thread and execute each tick inline
-    /// (`PLOW_MUX_INLINE_TICK`), instead of handing every tick to the engine thread and awaiting
-    /// it from a tokio worker. Removes two cross-thread wakes from every decode tick. Unset: on
-    /// for a CUDA engine, off for the others; `=0` is the rollback.
-    #[arg(long = "mux-inline-tick", env = "PLOW_MUX_INLINE_TICK", value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
-    pub mux_inline_tick: Option<bool>,
 
     // ──────────────────────────────────────────────────────────────────────────
     // Diagnostic / observability (shared, off by default)
@@ -752,21 +719,10 @@ pub struct CpuRuntimeConfig {
 #[derive(Args, Debug, Clone)]
 #[command(next_help_heading = "Scheduling and NVIDIA runtime")]
 pub struct NvidiaRuntimeConfig {
-    /// Bounded device multi-step decode (steps per launch, 2..64). 0/1 = single-step.
-    #[arg(
-        long = "multistep",
-        env = "PLOW_MULTISTEP",
-        default_value_t = 8,
-        global = true
-    )]
-    pub multistep: u32,
-
-    /// Adaptive multistep (CUDA): a tick runs single-step while an admitted request still has
-    /// prefill left, one waits for admission, or a slot was freed by the previous tick, and the
-    /// full `--multistep` quantum once every live request is in pure decode — so prefill chunks
-    /// are not delayed behind K-step quanta and completions do not batch into arrival waves.
-    #[arg(long = "multistep-adaptive", env = "PLOW_MULTISTEP_ADAPTIVE", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
-    pub multistep_adaptive: bool,
+    /// Expert: decode steps per host sync (2..64; 0/1 = single-step). Unset = derived from the
+    /// objective (`serve::policy::decode_k`).
+    #[arg(long = "multistep", env = "PLOW_MULTISTEP", hide = true, global = true)]
+    pub multistep: Option<u32>,
 
     /// CFG pairs draw on the device (`plow_sample_cfg` in the sampler object) instead of from
     /// the host's copy of both logits rows. Off by default: Chatterbox served on H100 (T3 sharing
@@ -774,30 +730,15 @@ pub struct NvidiaRuntimeConfig {
     /// means of two runs): the host draw's per-step gap paced T3, and without it utterances
     /// close in a trickle, so renders batch smaller (2.6 vs 3.1 per launch) and cost 10% more per
     /// token. c1: T3 unchanged (0.5% faster), host share 12-18% -> 0.1% at c16..c64.
-    #[arg(long = "cfg-device", env = "PLOW_CFG_DEVICE", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    #[arg(long = "cfg-device", env = "PLOW_CFG_DEVICE", hide = true, default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub cfg_device: bool,
-
-    /// With `--cfg-device`, CFG pairs also ride the `--multistep` quantum. Off: one step per tick
-    /// — measured Chatterbox served, H100: K=8 vs 1 c16 17.25 vs 18.75 aps, c1 T3 1.634 vs 1.606
-    /// ms/token (a quantum overshoots the stop and delays prefill and first-chunk renders).
-    #[arg(long = "cfg-multistep", env = "PLOW_CFG_MULTISTEP", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
-    pub cfg_multistep: bool,
 
     /// Lookahead-1 decode pipeline (CUDA): the next decode step is enqueued before the host waits
     /// on the current one, so streaming, stop checks and scheduling overlap the device step and
-    /// every token streams as it is produced. Takes over from the K-step `--multistep` quantum
-    /// where that could run (greedy rows, device-owned positions).
-    #[arg(long = "decode-pipeline", env = "PLOW_DECODE_PIPELINE", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
-    pub decode_pipeline: bool,
-
-    /// With the decode pipeline on, enqueue the mixed prefill/decode launch behind the
-    /// in-flight step instead of reading that step out first: its decode rows take their input
-    /// tokens from the device, and its own samples — a prompt's first token included — are read
-    /// back a tick later, so the host never waits between launches.
-    /// `0` off, `1` park the mixed launch and source its decode rows from the device, `2` also
-    /// admit a just-prefilled row to the next launch on its device-resident first token.
-    #[arg(long = "pipe-prefill", env = "PLOW_PIPE_PREFILL", default_value_t = 0, value_parser = clap::value_parser!(u32).range(0..=2), global = true)]
-    pub pipe_prefill: u32,
+    /// every token streams as it is produced. On wherever the decode mode supports it; `=0` is
+    /// the diagnostic rollback.
+    #[arg(long = "decode-pipeline", env = "PLOW_DECODE_PIPELINE", hide = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub decode_pipeline: Option<bool>,
 
     /// VMM prefix reuse. Automatically enabled for eligible Hopper hybrid BF16-KV packets.
     #[arg(long = "vmm-prefix", env = "PLOW_VMM_PREFIX", value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
@@ -807,9 +748,9 @@ pub struct NvidiaRuntimeConfig {
     #[arg(long = "vmm-live", env = "PLOW_VMM_LIVE", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub vmm_live: bool,
 
-    /// Retain whole sliding-ring slots on first use; requires live KV without prefix reuse.
-    #[arg(long = "vmm-live-rings", env = "PLOW_VMM_LIVE_RINGS", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
-    pub vmm_live_rings: bool,
+    /// Allocate sliding rings per live slot. Unset selects by capacity; false preallocates them.
+    #[arg(long = "vmm-live-rings", env = "PLOW_VMM_LIVE_RINGS", value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub vmm_live_rings: Option<bool>,
 
     /// Track NV dense decode KV-split count from the LIVE `kv_len` instead of
     /// the `max_ctx` the emitter baked it from (NVIDIA twin of `PLOW_MLA_NS_LIVE`).
@@ -885,22 +826,6 @@ pub struct NvidiaRuntimeConfig {
     #[arg(long = "l2-place-dispatch", env = "PLOW_L2_PLACE_DISPATCH", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub l2_place_dispatch: bool,
 
-    /// Restore the covering bucket-pick policy for prefill chunking. Off by default: the
-    /// cost-aware DP cover composes existing rungs and cut 15000/C1 TTFT 737.3 -> 703.4 ms with
-    /// prefill padding 10.59% -> 1.58% and TPOT unchanged (perf-certs/rt.pf_cover.json).
-    #[arg(long = "pf-cover", env = "PLOW_PF_COVER", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
-    pub pf_cover: bool,
-
-    /// Fixed cost of ONE prefill launch, in padded-row equivalents. 0 = old
-    /// pure-minimum-padding policy. Default 512 (measured on sm_120 / gemma-4-12B).
-    #[arg(
-        long = "pf-chunk-cost",
-        env = "PLOW_PF_CHUNK_COST",
-        default_value_t = 512,
-        global = true
-    )]
-    pub pf_chunk_cost: usize,
-
     // ──────────────────────────────────────────────────────────────────────────
     // Segmented prefill (sm_90a T9c..T35 campaign; see
     // perf-data/gemma12b-gh200-prefill-campaign.md)
@@ -940,12 +865,12 @@ pub struct NvidiaRuntimeConfig {
 
     /// Packed prefill runs a KV-shared model's trailing KV-shared layers for the sampled rows
     /// only (`plow_asset::kv_shared_tail`); `false` runs every row through every layer.
-    #[arg(long = "pf-shared-tail", env = "PLOW_PF_SHARED_TAIL", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    #[arg(long = "pf-shared-tail", env = "PLOW_PF_SHARED_TAIL", hide = true, default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub pf_shared_tail: bool,
 
     /// Multi-segment prefill buckets drop the waits and counter bumps a segment launch boundary
     /// already orders (`exec::gpu::segment_gates`).
-    #[arg(long = "pf-segment-gates", env = "PLOW_PF_SEGMENT_GATES", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    #[arg(long = "pf-segment-gates", env = "PLOW_PF_SEGMENT_GATES", hide = true, default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub pf_segment_gates: bool,
 
     /// Diagnostic: with a `-DPLOW_NV_ENTRY_TRACE=1` light object, log per-segment entry-stage
@@ -1111,22 +1036,18 @@ impl NvidiaRuntimeConfig {
 }
 
 impl RuntimeConfig {
-    /// CUDA prefill interleave rows with "zero = unbounded" semantics.
-    /// Unset → 2048; 0 → `usize::MAX` (no bound), else the configured value.
+    /// CUDA prefill rows per tick: `usize::MAX` (the widest launch) unless `--pf-interleave` pins
+    /// a nonzero cap.
     pub fn pf_interleave_rows(&self) -> usize {
-        match self.pf_interleave.unwrap_or(2048) {
+        match self.pf_interleave.unwrap_or(0) {
             0 => usize::MAX,
             rows => rows as usize,
         }
     }
 
-    /// Inline mux tick (`PLOW_MUX_INLINE_TICK`) for an engine of this backend.
-    pub fn mux_inline_tick(&self, cuda: bool) -> bool {
-        self.mux_inline_tick.unwrap_or(cuda)
-    }
-
-    /// AMD per-tick prefill row cap. Unset → 0, which `serve::mux::amd_prefill_tick_cap`
-    /// reads as uncapped: one tick may admit up to the widest compiled prefill rung.
+    /// AMD per-tick prefill row cap. `0`, the default, is read by
+    /// `serve::mux::amd_prefill_tick_cap` as uncapped: one tick may admit up to the widest
+    /// compiled prefill rung.
     pub fn pf_interleave_amd(&self) -> u32 {
         self.pf_interleave.unwrap_or(0)
     }
@@ -1172,20 +1093,11 @@ impl RuntimeConfig {
         self.amd.decode_min_rung.unwrap_or(8).max(1) as usize
     }
 
-    /// Cross-request prefill packing on CUDA: off unless asked.
-    pub fn pf_batch_cuda(&self) -> bool {
-        self.pf_batch.unwrap_or(false)
-    }
-
-    /// Cross-request prefill packing on AMD: on unless `PLOW_PF_BATCH=0`.
-    pub fn pf_batch_amd(&self) -> bool {
-        self.pf_batch.unwrap_or(true)
-    }
-
-    /// Rotate AMD isolated admission across slots instead of serving the oldest request
-    /// first. Only an explicit `PLOW_PF_BATCH=1` asks for it; the default is FCFS.
+    /// Rotate AMD isolated admission across slots instead of serving the oldest request first.
+    /// Only a per-request chunk cap makes rotation meaningful: each turn is one chunk, so the
+    /// concurrent prompts share prefill fairly. Without one, admission is FCFS.
     pub fn pf_rotate(&self) -> bool {
-        self.pf_batch == Some(true)
+        self.pf_chunk != 0
     }
 
     /// Per-request prefill chunk-row cap with "zero = unbounded" semantics.
@@ -1221,12 +1133,12 @@ pub struct AmdRuntimeConfig {
     /// This flag does NOT gate dense/GQA co-packing, which needs no family object: the dense
     /// consumers are compiled into the ordinary prefill and flash objects
     /// (`PLOW_PACKED_PREFILL_DENSE_CONSUMERS=1` in `scripts/build_gfx942.sh`) and route through
-    /// the same interpreter. Dense co-packing needs only `--pf-batch`, two concurrent prefills,
+    /// the same interpreter. Dense co-packing needs only two concurrent prefills
     /// and — the binding constraint in practice — a prefill chunk small enough that at least two
     /// of them fit in one compiled prefill rung. It works at TP1 and under TP alike; the TP
     /// engine has its own all-rank `prefill_packed_chunk`. See
     /// `docs/amd/gemma4-31b-mi300x.md`, "Dense packed prefill is unreachable at chunk 8192".
-    #[arg(long = "amd-packed-prefill-route", env = "PLOW_PACKED_PREFILL_ROUTE", value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    #[arg(long = "amd-packed-prefill-route", env = "PLOW_PACKED_PREFILL_ROUTE", hide = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub packed_prefill_route: Option<bool>,
 
     /// Spill-isolated KDA-family object for ordinary prefill segments. Set false to disable.
@@ -1440,20 +1352,9 @@ pub struct AmdRuntimeConfig {
     )]
     pub token_batch_rows: Option<u32>,
 
-    /// Unified token batch: admit a step with only ONE participant.
-    ///
-    /// Off by default. A prompt admitted alone runs a `nsplit == 1` rung far wider than the one
-    /// the ordinary route would pick for it, and there is nothing to pack it with — measured on
-    /// Gemma-4 31B at concurrency 1, -3.5% throughput and -35% TTFT at 512 input, -10.5% and
-    /// -48.8% at 2048. The ordinary route already samples a completing prompt's last row in its
-    /// own prefill program with no extra pass, so there is nothing to win there either. Kept as
-    /// a flag so the policy stays falsifiable.
-    #[arg(long = "amd-token-batch-solo", env = "PLOW_TOKEN_BATCH_SOLO", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
-    pub token_batch_solo: bool,
-
-    /// Narrowest decode rung a TP engine selects (`PLOW_AMD_DECODE_MIN_RUNG`); `1` = no floor. Read through
-    /// `RuntimeConfig::amd_decode_min_rung`, which supplies the default.
-    #[arg(long = "amd-decode-min-rung", env = "PLOW_AMD_DECODE_MIN_RUNG", global = true)]
+    /// Expert: narrowest decode rung a serving engine admits; `1` = no floor. A TP engine reads
+    /// it through `RuntimeConfig::amd_decode_min_rung`, which supplies its default of 8.
+    #[arg(long = "decode-min-rung", env = "PLOW_DECODE_MIN_RUNG", hide = true, global = true)]
     pub decode_min_rung: Option<u32>,
 
     /// Prior-context floor (rows) above which a request's DENSE final chunk is planned into
@@ -1515,7 +1416,7 @@ pub struct AmdRuntimeConfig {
     /// (`GpuEngine::patch_moe_rows`): the Gemma MoE prefill row operands follow the
     /// launch's real rows while the dense ops keep the bucket width, because their
     /// cuBLASLt plans are shape-static. Bucket choice is unchanged there.
-    #[arg(long = "amd-ragged-chunk", env = "PLOW_RAGGED_CHUNK", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    #[arg(long = "amd-ragged-chunk", env = "PLOW_RAGGED_CHUNK", hide = true, default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub ragged_chunk: bool,
 
     /// Size a ragged chunk's sequence-parallel seams (`PLOW_GLM_SEQ_PAR`) by its live rows
@@ -1523,7 +1424,7 @@ pub struct AmdRuntimeConfig {
     /// reduce-scatter / all-gather move `tp * band` rows, and the band views are rebound per
     /// chunk. Only acts under `PLOW_RAGGED_CHUNK` on a packet that carries the seams. Read through
     /// `RuntimeConfig::amd_ragged_seams`, which supplies the default (on); `=0` is the rollback.
-    #[arg(long = "amd-ragged-seams", env = "PLOW_AMD_RAGGED_SEAMS", value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    #[arg(long = "amd-ragged-seams", env = "PLOW_AMD_RAGGED_SEAMS", hide = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub ragged_seams: Option<bool>,
 
     /// Track the MLA decode's KV-split count from the LIVE `kv_len` instead of
@@ -1774,10 +1675,10 @@ impl RuntimeConfig {
     }
 
     #[cfg(feature = "cuda")]
-    pub(crate) fn nv_vmm_live_rings(&self) -> bool {
+    pub(crate) fn nv_vmm_live_rings(&self) -> Option<bool> {
         select_compat(
             self.nv.vmm_live_rings,
-            Self::env_bool("PLOW_VMM_LIVE_RINGS"),
+            Self::env_bool("PLOW_VMM_LIVE_RINGS").map(Some),
             !Self::is_initialized(),
         )
     }
@@ -1943,24 +1844,6 @@ impl RuntimeConfig {
         } else {
             self.amd_prefix_fine_rows
         }
-    }
-
-    /// `--multistep` / `PLOW_MULTISTEP`, the nominal decode quantum.
-    ///
-    /// Homed under `nv` only because that is where the flag was first declared; the knob spec
-    /// has always called it `rt.multistep`, and both the NVIDIA device-multistep object and the
-    /// AMD deferred-read quantum are driven by it. Read it through here — the AMD tick used to
-    /// reach into `self.nv.multistep` directly and so missed the env-compat path entirely.
-    ///
-    /// Gated to match its `run_one_tick` caller (`cfg(any(cuda, hsa, cpu))`): the CPU/Metal
-    /// tick reads the same nominal quantum, so the `cpu` build needs this method too.
-    #[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu"))]
-    pub(crate) fn multistep(&self) -> u32 {
-        select_compat(
-            self.nv.multistep,
-            Self::env_parse("PLOW_MULTISTEP"),
-            !Self::is_initialized(),
-        )
     }
 
     #[cfg(feature = "cuda")]
@@ -2154,20 +2037,17 @@ mod tests {
             super::RuntimeConfig::from_arg_matches(&matches).unwrap()
         };
         let unset = parse(&["test"]);
-        assert!(unset.mux_inline_tick(true) && !unset.mux_inline_tick(false));
         assert_eq!(unset.nv.pf_attn_gemm, None);
         assert_eq!(unset.nv.moe_pf_lt_min_rows(), Some(1));
         assert_eq!(unset.nv.moe_dec_lt_min_rows(Some(4)), Some(4));
         assert_eq!(unset.nv.moe_dec_lt_min_rows(None), None);
-        let pinned = parse(&["test", "--mux-inline-tick", "--moe-pf-lt=1", "--moe-dec-lt=4"]);
-        assert!(pinned.mux_inline_tick(true));
+        let pinned = parse(&["test", "--moe-pf-lt=1", "--moe-dec-lt=4"]);
         assert_eq!(pinned.nv.moe_pf_lt_min_rows(), unset.nv.moe_pf_lt_min_rows());
         assert_eq!(
             pinned.nv.moe_dec_lt_min_rows(Some(4)),
             unset.nv.moe_dec_lt_min_rows(Some(4))
         );
-        let off = parse(&["test", "--mux-inline-tick=0", "--moe-pf-lt=0", "--moe-dec-lt=0"]);
-        assert!(!off.mux_inline_tick(true));
+        let off = parse(&["test", "--moe-pf-lt=0", "--moe-dec-lt=0"]);
         assert_eq!(off.nv.moe_pf_lt_min_rows(), None);
         assert_eq!(off.nv.moe_dec_lt_min_rows(Some(4)), None);
     }
@@ -2327,14 +2207,13 @@ mod tests {
             &command.clone().try_get_matches_from(["test"]).unwrap(),
         )
         .unwrap();
-        assert!(defaults.prefix_cache && defaults.token_batch && defaults.pf_batch_amd());
-        assert!(!defaults.fusion);
-        assert!(
-            !defaults.pf_no_chunk && !defaults.pf_no_interleave && !defaults.pf_defer_decode
-        );
+        assert!(defaults.prefix_cache && defaults.token_batch);
+        assert!(!defaults.fusion && !defaults.pf_defer_decode);
         assert!(!defaults.pf_rotate());
+        assert_eq!(defaults.objective, crate::serve::policy::Objective::Auto);
+        assert_eq!((defaults.nv.multistep, defaults.nv.decode_pipeline, defaults.co_sched), (None, None, None));
         assert_eq!(defaults.amd.packed_prefill_route, None);
-        assert!(!defaults.amd.token_batch_solo && !defaults.amd.token_batch_wide_tiles);
+        assert!(!defaults.amd.token_batch_wide_tiles);
 
         let matches = command
             .try_get_matches_from([
@@ -2360,9 +2239,9 @@ mod tests {
         let command = super::RuntimeConfig::augment_args(clap::Command::new("test"));
         for (args, want) in [
             (&["test"][..], 8),
-            (&["test", "--amd-decode-min-rung=1"][..], 1),
-            (&["test", "--amd-decode-min-rung=0"][..], 1),
-            (&["test", "--amd-decode-min-rung=16"][..], 16),
+            (&["test", "--decode-min-rung=1"][..], 1),
+            (&["test", "--decode-min-rung=0"][..], 1),
+            (&["test", "--decode-min-rung=16"][..], 16),
         ] {
             let matches = command.clone().try_get_matches_from(args).unwrap();
             let cfg = super::RuntimeConfig::from_arg_matches(&matches).unwrap();
@@ -2525,20 +2404,29 @@ mod tests {
         let config = super::NvidiaRuntimeConfig::from_arg_matches(&matches).unwrap();
         assert!(config.vmm_live);
         assert_eq!(config.vmm_prefix, Some(false));
-        assert!(!config.vmm_live_rings);
+        assert_eq!(config.vmm_live_rings, None);
         let command = super::NvidiaRuntimeConfig::augment_args(clap::Command::new("test"));
         let arg = command
             .get_arguments()
             .find(|arg| arg.get_id() == "vmm_live_rings")
             .unwrap();
-        assert_eq!(arg.get_default_values(), ["false"]);
+        assert!(arg.get_default_values().is_empty());
         let matches = command
             .try_get_matches_from(["test", "--vmm-live=true", "--vmm-live-rings=true"])
             .unwrap();
-        assert!(
+        assert_eq!(
             super::NvidiaRuntimeConfig::from_arg_matches(&matches)
                 .unwrap()
-                .vmm_live_rings
+                .vmm_live_rings,
+            Some(true)
+        );
+        let command = super::NvidiaRuntimeConfig::augment_args(clap::Command::new("test"));
+        let matches = command
+            .try_get_matches_from(["test", "--vmm-live-rings=false"])
+            .unwrap();
+        assert_eq!(
+            super::NvidiaRuntimeConfig::from_arg_matches(&matches).unwrap().vmm_live_rings,
+            Some(false)
         );
     }
 
@@ -2579,7 +2467,7 @@ mod tests {
     }
 
     #[test]
-    fn packed_prefill_route_and_pf_batch_default_to_auto_with_explicit_rollback() {
+    fn packed_prefill_route_defaults_to_auto_and_prefill_budget_to_the_widest_launch() {
         use clap::{Args, FromArgMatches};
 
         // UNSET IS AUTOMATIC, NOT OFF. The route follows the packet: `exec/amd.rs` arms it when
@@ -2626,31 +2514,22 @@ mod tests {
             .expect("KDA family route argument");
         assert_eq!(arg.get_default_values(), ["true"]);
 
-        // `--pf-batch` is the shared mux half: unset resolves per vendor (AMD on, CUDA off),
-        // an explicit `=1` additionally rotates isolated admission, `=0` is the rollback.
+        // Admission rotates only under a per-request chunk cap.
         let shared = super::RuntimeConfig::augment_args(clap::Command::new("test"));
-        let arg = shared
-            .get_arguments()
-            .find(|arg| arg.get_id() == "pf_batch")
-            .expect("pf-batch argument");
-        assert!(arg.get_default_values().is_empty());
         let cfg = |args: &[&str]| {
             let matches = shared
                 .clone()
                 .try_get_matches_from(args)
-                .expect("pf-batch args");
+                .expect("runtime args");
             super::RuntimeConfig::from_arg_matches(&matches).expect("runtime config")
         };
         let unset = cfg(&["test"]);
-        assert!(unset.pf_batch_amd() && !unset.pf_batch_cuda() && !unset.pf_rotate());
-        let on = cfg(&["test", "--pf-batch=true"]);
-        assert!(on.pf_batch_amd() && on.pf_batch_cuda() && on.pf_rotate());
-        let off = cfg(&["test", "--pf-batch=false"]);
-        assert!(!off.pf_batch_amd() && !off.pf_batch_cuda() && !off.pf_rotate());
+        assert!(!unset.pf_rotate());
+        assert!(cfg(&["test", "--pf-chunk=8192"]).pf_rotate());
 
-        // The step budget: unset is the vendor default (CUDA 2048 rows, AMD uncapped = the
-        // widest compiled rung); an explicit value clamps both.
-        assert_eq!(unset.pf_interleave_rows(), 2048);
+        // The step budget: unset is the widest launch on both vendors; an explicit value clamps
+        // both.
+        assert_eq!(unset.pf_interleave_rows(), usize::MAX);
         assert_eq!(unset.pf_interleave_amd(), 0);
         let capped = cfg(&["test", "--pf-interleave=512"]);
         assert_eq!(capped.pf_interleave_rows(), 512);

@@ -811,7 +811,7 @@ mod amd_serve {
         slot_generation: Vec<u32>,
         /// CHUNKED PREFILL cursor per slot. `Some` means this slot is mid-prefill: the mux has
         /// run some of its chunks and will run one more per tick, letting every other slot decode
-        /// in between. `PLOW_PF_NO_CHUNK=1` restores whole-prompt-per-tick.
+        /// in between.
         pf: Vec<Option<PfCursor>>,
         chunk_prefill: bool,
         /// Maximum compiled prefill rung selected per tick. `u32::MAX` = packet ladder cap.
@@ -1465,7 +1465,6 @@ mod amd_serve {
                 batch,
                 decode_rungs = ?decode_rungs,
                 decode_only = !has_prefill,
-                pf_batch = crate::config::RuntimeConfig::get().pf_batch_amd(),
                 pf_rotate = crate::config::RuntimeConfig::get().pf_rotate(),
                 pf_chunk = crate::config::RuntimeConfig::get().pf_chunk,
                 pf_interleave = crate::config::RuntimeConfig::get().pf_interleave_amd(),
@@ -1478,12 +1477,8 @@ mod amd_serve {
                 && ranks.prefix_cache_capable() && has_prefill;
             tracing::info!(requested = crate::config::RuntimeConfig::get().prefix_cache,
                 selected = prefix_cache, "AMD prefix cache selection");
-            let chunk_prefill = !crate::config::RuntimeConfig::get().pf_no_chunk;
             let token_batch_tp = match &ranks {
-                Ranks::Tp(g)
-                    if crate::config::RuntimeConfig::get().token_batch
-                        && chunk_prefill
-                        && has_prefill =>
+                Ranks::Tp(g) if crate::config::RuntimeConfig::get().token_batch && has_prefill =>
                 {
                     let bodies = g.token_batch_bodies();
                     let any_body = g.rank(0).has_token_batch_bodies();
@@ -1540,7 +1535,7 @@ mod amd_serve {
                 cached_rows: vec![0; batch],
                 slot_generation: vec![0; batch],
                 pf: (0..batch).map(|_| None).collect(),
-                chunk_prefill: !crate::config::RuntimeConfig::get().pf_no_chunk,
+                chunk_prefill: true,
                 prefill_chunk_rows: match crate::config::RuntimeConfig::get().pf_chunk {
                     0 => u32::MAX,
                     rows => rows,

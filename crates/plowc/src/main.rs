@@ -2104,6 +2104,9 @@ fn build_cubin_from_manifest(
     if man.pointer("/tuning/gemv_wide").is_some() {
         args.push("-DPLOW_CUBIN_GEMV_WIDE=ON".into());
     }
+    if man.pointer("/tuning/fp8_decode_tc64").and_then(serde_json::Value::as_bool) == Some(true) {
+        args.push("-DPLOW_CUBIN_FP8_TC64_DEPTH2=ON".into());
+    }
     if segmented || manifest_requires_segmented_prefill(&man) {
         args.push("-DPLOW_SM120_CUBIN_SEG=ON".into());
     }
@@ -2161,6 +2164,7 @@ fn build_cubin_from_manifest(
     let status = std::process::Command::new("cmake")
         .arg("--build")
         .arg(&build_dir)
+        .arg("--verbose")
         .arg("--target")
         .arg("sm120_cubins")
         .status()?;

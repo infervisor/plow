@@ -80,16 +80,16 @@ PLOW_BUILD_FA_V3_PACK = "1"
 
 [emit_roles.env]
 
-# Voice-agent turns (X-Session-Id, cached prefix + short suffix): unified token batching (the
-# default) with adaptive multistep; 64 calls x 6 turns later-turn TTFT p50 39 ms vs 143 ms with
-# PLOW_TOKEN_BATCH=0. Cold 1000-token prompts: 2719 out tok/s at c64, 3555 at c200 (sampled
-# rows draw on the device; decode rows ride a prefill launch only while that is cheaper than a
-# step, `sched::ride`). docs/runtime/gemma4-e4b-h100.md.
-# Served: the lookahead-1 decode pipeline (c64/c128 tok/s +1/+3%) and per-rung cuBLASLt
-# algorithms (step_bench B=48/64 7.29/7.52 -> 7.13/7.41 ms; the chosen algorithm, and so the
-# B<128 rung digests, can differ between loads).
+# Voice-agent turns (X-Session-Id, cached prefix + short suffix): unified token batching with
+# adaptive multistep, both derived by the default `auto` objective; 64 calls x 6 turns later-turn
+# TTFT p50 39 ms vs 143 ms with PLOW_TOKEN_BATCH=0. Cold 1000-token prompts: 2719 out tok/s at
+# c64, 3555 at c200 (sampled rows draw on the device; decode rows ride a prefill launch only while
+# that is cheaper than a step, `sched::ride`). The lookahead-1 decode pipeline is on wherever the
+# decode mode allows it (c64/c128 tok/s +1/+3%). docs/runtime/gemma4-e4b-h100.md.
+# Served: per-rung cuBLASLt algorithms (step_bench B=48/64 7.29/7.52 -> 7.13/7.41 ms; the chosen
+# algorithm, and so the B<128 rung digests, can differ between loads).
 [serve]
-env = { PLOW_MULTISTEP_ADAPTIVE = "true", PLOW_DECODE_PIPELINE = "true", PLOW_LT_RUNG_ALGOS = "true" }
+env = { PLOW_LT_RUNG_ALGOS = "true" }
 
 [bench]
 kind = "chat"

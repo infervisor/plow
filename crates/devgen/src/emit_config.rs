@@ -301,6 +301,10 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_NV_DENSE_TUNE", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub nv_dense_tune: bool,
 
+    /// S3Gen voice caches pre-formatted for the 3xFP16 cached attention (sm_90 speech object).
+    #[arg(long, env = "PLOW_EMIT_S3GEN_ATTN_H16", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub s3gen_attn_h16: bool,
+
     /// Packed prefill for hd64/hd128 attention (the live-KV and packed contracts accept them).
     #[arg(long, env = "PLOW_EMIT_PACKED_PREFILL_SMALL_HD", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub packed_prefill_small_hd: bool,
@@ -1230,6 +1234,11 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_GEMMA4_SM90_HD512_PX4_BQ64_ROLE", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub gemma4_sm90_hd512_px4_bq64_role: bool,
 
+    /// Generated-kernel catalog entries to emit as role objects, comma-separated (e.g.
+    /// "attn_pf_hd512"); each binds the packet ops matching its signature (`gen_kernels.rs`).
+    #[arg(long = "emit-gen-kernels", env = "PLOW_EMIT_GEN_KERNELS")]
+    pub gen_kernels: Option<String>,
+
     /// Select the packet-declared native FP8 prefill GEMM role.
     #[arg(long, env = "PLOW_FP8_PF_GEMM_ROLE", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub fp8_pf_gemm_role: bool,
@@ -1269,9 +1278,13 @@ pub struct EmitConfig {
     #[arg(long = "emit-decode-cublaslt-head", env = "PLOW_EMIT_DECODE_CUBLASLT_HEAD", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub decode_cublaslt_head: bool,
 
-    /// Emit the measured SM90 BF16 prefill projections as packet-declared cuBLASLt segments.
+    /// Emit measured SM90 BF16 or Gemma-4 W8A8 prefill projections as cuBLASLt segments.
     #[arg(long = "emit-prefill-cublaslt", env = "PLOW_EMIT_PREFILL_CUBLASLT", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub prefill_cublaslt: bool,
+
+    /// Compile the SM90 wide decode object with the 64-row W8A16 tensor-core arm.
+    #[arg(long = "fp8-decode-tc64", env = "PLOW_FP8_DECODE_TC64", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub fp8_decode_tc64: bool,
 
     /// Isolate each layer's grouped MoE prefill GLU + DOWN pair as a packet-declared library
     /// segment, which the CUDA runtime serves with cuBLASLt grouped matmuls under
@@ -1462,6 +1475,7 @@ impl EmitConfig {
             nv_fa_fold: env_bool("PLOW_NV_FA_FOLD"),
             nv_dense_tune: env_bool("PLOW_NV_DENSE_TUNE"),
             packed_prefill_small_hd: env_bool("PLOW_EMIT_PACKED_PREFILL_SMALL_HD"),
+            s3gen_attn_h16: env_bool("PLOW_EMIT_S3GEN_ATTN_H16"),
             nv_fa_mma_hd128: env_bool("PLOW_NV_FA_MMA_HD128"),
             nv_gemv_k8_b1: env_bool("PLOW_NV_GEMV_K8_B1"),
             nv_fa_split_prefill: env_bool_default_true("PLOW_NV_FA_SPLIT_PREFILL"),
@@ -1658,6 +1672,7 @@ impl EmitConfig {
             gemma4_sm90_hd256_gqa2_role: env_bool("PLOW_GEMMA4_SM90_HD256_GQA2_ROLE"),
             gemma4_sm90_hd256_gqa2_wide: env_bool("PLOW_GEMMA4_SM90_HD256_GQA2_WIDE"),
             gemma4_sm90_hd512_px4_bq64_role: env_bool("PLOW_GEMMA4_SM90_HD512_PX4_BQ64_ROLE"),
+            gen_kernels: env_str("PLOW_EMIT_GEN_KERNELS"),
             fp8_pf_gemm_role: env_bool("PLOW_FP8_PF_GEMM_ROLE"),
             fp8_pf_isolate: env_bool("PLOW_QWEN_FP8_PF_ISOLATE"),
             attention_pf_role: env_bool("PLOW_ATTENTION_PF_ROLE"),
@@ -1671,6 +1686,7 @@ impl EmitConfig {
             decode_cublaslt_min_rows: env_u32("PLOW_EMIT_DECODE_CUBLASLT_MIN_ROWS"),
             decode_cublaslt_head: env_bool("PLOW_EMIT_DECODE_CUBLASLT_HEAD"),
             prefill_cublaslt: env_bool("PLOW_EMIT_PREFILL_CUBLASLT"),
+            fp8_decode_tc64: env_bool("PLOW_FP8_DECODE_TC64"),
             moe_pf_lt: env_bool("PLOW_EMIT_MOE_PF_LT"),
             moe_dec_lt: env_bool("PLOW_EMIT_MOE_DEC_LT"),
             gemma_gemm_lt: env_bool("PLOW_GEMMA_GEMM_LT"),

@@ -6,6 +6,12 @@ if [ "$gemma_base" = "$gemma_out" ]; then
   echo 'Use a separate output directory for the candidate objects.' >&2
   exit 2
 fi
+# Toolchain selection as in build_sm90a_cubin.sh: PLOW_NVCC, PLOW_NVCC_PATH, NVCC_*_FLAGS.
+gemma_nvcc="${PLOW_NVCC:-/usr/local/cuda/bin/nvcc}"
+gemma_cuda_bin="$(dirname "$gemma_nvcc")"
+gemma_nvenv=(env -i PATH="${PLOW_NVCC_PATH:-$gemma_cuda_bin:/usr/bin:/bin}")
+[ -n "${NVCC_PREPEND_FLAGS:-}" ] && gemma_nvenv+=(NVCC_PREPEND_FLAGS="$NVCC_PREPEND_FLAGS")
+[ -n "${NVCC_APPEND_FLAGS:-}" ] && gemma_nvenv+=(NVCC_APPEND_FLAGS="$NVCC_APPEND_FLAGS")
 gemma_required=(interp_sm90a.cubin interp_sm90a_pf.cubin interp_sm90a_pfseg.cubin)
 # Packed-request objects exist only for a packet that HAS packed-prefill topology. A Gemma MoE FP8
 # packet legitimately has none (PLOW_EMIT_PACKED_PREFILL panics for it at devgen lib.rs:9774), so
@@ -25,12 +31,15 @@ for gemma_file in "${gemma_required[@]}"; do
     exit 2
   }
 done
-# PLOW_NVCC (default /usr/local/cuda/bin/nvcc) picks the toolkit; NVCC_PREPEND_FLAGS (a host
-# compiler, e.g. `-ccbin g++-14`) survives the scrubbed environment.
-gemma_cuda_bin=$(dirname -- "${PLOW_NVCC:-/usr/local/cuda/bin/nvcc}")
-gemma_nvcc=(env -i PATH="$gemma_cuda_bin:/usr/bin:/bin")
-if [ -n "${NVCC_PREPEND_FLAGS:-}" ]; then gemma_nvcc+=(NVCC_PREPEND_FLAGS="$NVCC_PREPEND_FLAGS"); fi
-gemma_nvcc+=("$gemma_cuda_bin/nvcc")
+if [ "${PLOW_BUILD_FP8KV_FA:-0}" = 1 ]; then
+  if [ "$gemma_has_packed" != 1 ] || [ -z "${PLOW_CUBIN_CONFIG:-}" ] ||
+     ! grep -qx '#define PLOW_PACKET_HAS_FLASH_PREFILL 0' "$PLOW_CUBIN_CONFIG" ||
+     ! grep -qx '#define PLOW_PACKET_HAS_FLASH_PREFILL_FP8 1' "$PLOW_CUBIN_CONFIG" ||
+     [ ! -f "$gemma_base/interp_sm90a_pfpackedseg_fp8kv.cubin" ]; then
+    echo 'PLOW_BUILD_FP8KV_FA requires a packed FP8-KV packet with no BF16 FlashPrefill.' >&2
+    exit 2
+  fi
+fi
 mkdir -p "$gemma_out"
 cp "$gemma_base"/*.cubin "$gemma_out/"
 gemma_config_flags=()
@@ -118,26 +127,45 @@ for gemma_packed in 0 1; do
         -DPLOW_NV_FA_V3_PACK="${PLOW_BUILD_FA_V3_PACK:-0}"
       )
     fi
-    "${gemma_nvcc[@]}" \
+    "${gemma_nvenv[@]}" "$gemma_nvcc" \
       "${gemma_flags[@]}" "${gemma_config_flags[@]}" "${gemma_role_flags[@]}" "${gemma_padding_flags[@]}" -DPLOW_NV_PACKED_REQUEST="$gemma_packed" \
       -o "$gemma_out/interp_sm90a_$gemma_prefix$gemma_role.cubin" runtime/nvidia/interp_sm90a.cu
   done
   # A packet config binds the packed light object to that packet even when its
   # implementation flags are unchanged.
   if [ "$gemma_packed" = 1 ] && { [ -n "${PLOW_CUBIN_CONFIG:-}" ] || [ "$gemma_fatlite" = 1 ] || [ "$gemma_masked" = 1 ]; }; then
-    "${gemma_nvcc[@]}" \
+    "${gemma_nvenv[@]}" "$gemma_nvcc" \
       "${gemma_flags[@]}" "${gemma_config_flags[@]}" "${gemma_padding_flags[@]}" -DPLOW_NV_PACKED_REQUEST=1 \
       -DPLOW_NV_FATLITE="$gemma_fatlite" \
       -DPLOW_NV_FATLITE_MOE="$gemma_fatlite_moe" -DPGM90_TMA_STAGES=3 \
       -o "$gemma_out/interp_sm90a_pfpackedseg.cubin" runtime/nvidia/interp_sm90a.cu
   fi
 done
+if [ "${PLOW_BUILD_FP8KV_FA:-0}" = 1 ]; then
+  "${gemma_nvenv[@]}" "$gemma_nvcc" \
+    "${gemma_flags[@]}" "${gemma_config_flags[@]}" \
+    -DPLOW_NV_FA_ONLY=1 -DPLOW_NV_FA_ONLY_HD256=1 \
+    -DPLOW_NV_FA_ONLY_HD256_ONLY=0 -DPLOW_NV_FA512_WG=0 \
+    -DPLOW_NV_FA512_BKV=32 -DPLOW_NV_PACKED_FA_WGMMA=0 \
+    -DPLOW_NV_PACKED_FA_TMA=0 -DPLOW_NV_FA_V3=0 -DPLOW_NV_FA_V3_PACK=0 \
+    -DPLOW_NV_MASKED_PADDING=1 -DPLOW_NV_PACKED_REQUEST=1 \
+    -DPLOW_FP8_KV=1 -DPLOW_NV_FA_PIPE=1 \
+    -o "$gemma_out/interp_sm90a_pfpackedfa_fp8kv.cubin" runtime/nvidia/interp_sm90a.cu
+  gemma_fp8_fa_symbols=$("$gemma_cuda_bin/cuobjdump" -symbols \
+    "$gemma_out/interp_sm90a_pfpackedfa_fp8kv.cubin")
+  for gemma_symbol in plow_fp8_kv_abi plow_fa_hd256_pfpackedfa plow_fa_hd512_pfpackedfa; do
+    grep -q "$gemma_symbol" <<<"$gemma_fp8_fa_symbols" || {
+      echo "missing packed FP8 attention symbol: $gemma_symbol" >&2
+      exit 1
+    }
+  done
+fi
 if [ "${PLOW_BUILD_FA_GQA2_PAIR:-$gemma_bf16}" = 1 ] && [ "$gemma_has_packed" = 1 ]; then
   gemma_gqa2_padding_flags=()
   if [ "$gemma_masked_def" = 1 ]; then
     gemma_gqa2_padding_flags=(-DPLOW_NV_MASKED_PADDING=1)
   fi
-  "${gemma_nvcc[@]}" \
+  "${gemma_nvenv[@]}" "$gemma_nvcc" \
     "${gemma_flags[@]}" "${gemma_config_flags[@]}" "${gemma_gqa2_padding_flags[@]}" -DPLOW_NV_PACKED_REQUEST=1 \
     -DPLOW_NV_FA_ONLY=1 -DPLOW_NV_FA_ONLY_HD256=1 \
     -DPLOW_NV_FA_ONLY_HD256_EXACT=1 -DPLOW_NV_FA_WGITEM=1 \
@@ -149,7 +177,7 @@ if [ "${PLOW_BUILD_FA_GQA2_PAIR:-$gemma_bf16}" = 1 ] && [ "$gemma_has_packed" = 
     "$gemma_out/interp_sm90a_pfpackedfa256_gqa2.cubin" | \
     grep -q plow_attention_sm90_hd256_gqa2_abi
 fi
-"${gemma_nvcc[@]}" \
+"${gemma_nvenv[@]}" "$gemma_nvcc" \
   -std=c++17 -arch=sm_90a -O3 -cubin -Xptxas=-v \
   -I runtime/common -I runtime/nvidia \
   -o "$gemma_out/interp_sm90a_pfgemm_w8a16_m1.cubin" \
@@ -157,7 +185,7 @@ fi
 "$gemma_cuda_bin/cuobjdump" -symbols "$gemma_out/interp_sm90a_pfgemm_w8a16_m1.cubin" | \
   grep -q plow_sm90a_pfgemm_w8a16_m1
 # Causal softmax of the vendor-GEMM attention route (PLOW_PF_ATTN_GEMM): its presence turns the route on, KV budget permitting.
-"${gemma_nvcc[@]}" \
+"${gemma_nvenv[@]}" "$gemma_nvcc" \
   -std=c++17 -arch=sm_90a -O3 -cubin -Xptxas=-v \
   -I runtime/common -I runtime/nvidia \
   -o "$gemma_out/attn_softmax_sm90a.cubin" \
@@ -165,7 +193,7 @@ fi
 "$gemma_cuda_bin/cuobjdump" -symbols "$gemma_out/attn_softmax_sm90a.cubin" | \
   grep -q plow_attn_softmax_abi
 gemma_glu_log=$(mktemp)
-if ! "${gemma_nvcc[@]}" \
+if ! "${gemma_nvenv[@]}" "$gemma_nvcc" \
   -std=c++17 -arch=sm_90a -O3 -cubin -Xptxas=-v \
   -I runtime/common -I runtime/nvidia \
   -o "$gemma_out/interp_sm90a_pfgemm_glu_gemma4.cubin" \
@@ -204,7 +232,7 @@ for gemma_glu_symbol in \
   }
 done
 gemma_w8a8_glu_log=$(mktemp)
-if ! "${gemma_nvcc[@]}" \
+if ! "${gemma_nvenv[@]}" "$gemma_nvcc" \
   -std=c++17 -arch=sm_90a -O3 -cubin -Xptxas=-v \
   -I runtime/common -I runtime/nvidia \
   -o "$gemma_out/interp_sm90a_pfgemm_glu_w8a8_gemma4.cubin" \
@@ -246,21 +274,22 @@ for gemma_w8a8_glu_symbol in \
   }
 done
 if [ "${PLOW_BUILD_PFATTN_HD256_BKV64:-0}" = 1 ]; then
-  "${gemma_nvcc[@]}" \
+  "${gemma_nvenv[@]}" "$gemma_nvcc" \
     -std=c++17 -arch=sm_90a -O3 -cubin -Xptxas=-v -I runtime/common -I runtime/nvidia \
     -o "$gemma_out/interp_sm90a_pfattn_hd256_bkv64.cubin" \
     runtime/nvidia/interp_sm90a_pfattn_hd256_bkv64.cu
 fi
 if [ "${PLOW_BUILD_PFATTN_HD256_BKV32:-$gemma_bf16}" = 1 ]; then
-  "${gemma_nvcc[@]}" \
+  "${gemma_nvenv[@]}" "$gemma_nvcc" \
     -std=c++17 -arch=sm_90a -O3 -cubin -Xptxas=-v -I runtime/common -I runtime/nvidia \
     -o "$gemma_out/interp_sm90a_pfattn_hd256_bkv32.cubin" \
     runtime/nvidia/interp_sm90a_pfattn_hd256_bkv32.cu
 fi
 if [ "${PLOW_BUILD_PFATTN_HD256_GQA2_BKV32:-$gemma_bf16}" = 1 ]; then
   gemma_gqa2_log=$(mktemp)
-  "${gemma_nvcc[@]}" \
+  "${gemma_nvenv[@]}" "$gemma_nvcc" \
     -std=c++17 -arch=sm_90a -O3 -cubin -Xptxas=-v -I runtime/common -I runtime/nvidia \
+    -DPLOW_NV_GQA2_ROLE_BKV="${PLOW_BUILD_PFATTN_GQA2_BKV:-32}" \
     -o "$gemma_out/interp_sm90a_pfattn_hd256_gqa2_bkv32.cubin" \
     runtime/nvidia/interp_sm90a_pfattn_hd256_gqa2_bkv32.cu 2> >(tee "$gemma_gqa2_log" >&2)
   if grep -Eq '[1-9][0-9]* bytes (stack frame|spill stores|spill loads)' "$gemma_gqa2_log"; then
@@ -292,7 +321,7 @@ if [ "$gemma_masked" = 1 ]; then
     echo 'BQ32/BKV16 px4 requires PLOW_BUILD_PFATTN_KV16=0 and PLOW_BUILD_PFATTN_KV64=0.' >&2
     exit 1
   fi
-  "${gemma_nvcc[@]}" \
+  "${gemma_nvenv[@]}" "$gemma_nvcc" \
     -std=c++17 -arch=sm_90a -O3 -cubin -Xptxas=-v -I runtime/common -I runtime/nvidia \
     -DPLOW_NV_FA512_WG="$pfattn_wg" -DPLOW_NV_FA_GF=2 -DPLOW_NV_FA_WPR=1 \
     -DPLOW_NV_FA_TMA="$pfattn_tma" \
@@ -306,7 +335,7 @@ if [ "$gemma_masked" = 1 ]; then
     runtime/nvidia/interp_sm90a_pfattn_hd512.cu
 fi
 if [ "${PLOW_BUILD_PFATTN_HD512_PX4_BQ64:-0}" = 1 ]; then
-  "${gemma_nvcc[@]}" \
+  "${gemma_nvenv[@]}" "$gemma_nvcc" \
     -std=c++17 -arch=sm_90a -O3 -cubin -Xptxas=-v -I runtime/common -I runtime/nvidia \
     -DPLOW_NV_FA512_PX4_BQ64=1 -DPLOW_NV_FA512_WG=0 -DPLOW_NV_FA_TMA=1 \
     -DPLOW_NV_FA_TMA_ROW_WARP=1 -DPLOW_NV_FA_TMA_DESC=1 -DPLOW_NV_FA_SCORE_SWIZZLE=1 \
@@ -315,11 +344,17 @@ if [ "${PLOW_BUILD_PFATTN_HD512_PX4_BQ64:-0}" = 1 ]; then
     -o "$gemma_out/interp_sm90a_pfattn_hd512_px4_bq64.cubin" \
     runtime/nvidia/interp_sm90a_pfattn_hd512.cu
 fi
+# Generated-kernel catalog role objects (emit PLOW_EMIT_GEN_KERNELS), comma-separated entries,
+# rebuilt from the checked-in tuning table; needs a Python with TileLang (PYREF).
+if [ -n "${PLOW_BUILD_GEN_KERNELS:-}" ]; then
+  "${PYREF:-python3}" scripts/gen_kernels/build_catalog.py build "$gemma_out" \
+    --entries "$PLOW_BUILD_GEN_KERNELS"
+fi
 # Glue kernels of the cuBLASLt grouped-GEMM MoE prefill route (PLOW_MOE_PF_LT): only for a packet
 # that carries the grouped expert GEMMs.
 if [ -n "${PLOW_CUBIN_CONFIG:-}" ] &&
    grep -qx '#define PLOW_PACKET_HAS_MOE_GROUP_GLU_GEMMA_PF 1' "$PLOW_CUBIN_CONFIG"; then
-  "${gemma_nvcc[@]}" \
+  "${gemma_nvenv[@]}" "$gemma_nvcc" \
     -std=c++17 -arch=sm_90a -O3 -cubin -Xptxas=-v -I runtime/common -I runtime/nvidia \
     -o "$gemma_out/interp_sm90a_moe_lt.cubin" runtime/nvidia/moe_lt_sm90.cu
 fi

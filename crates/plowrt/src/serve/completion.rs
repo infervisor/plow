@@ -45,12 +45,18 @@ pub async fn completions(
     headers: axum::http::HeaderMap,
     req: Result<Json<CompletionRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
-    let ids = match crate::serve::session::RequestIds::from_headers(&headers) {
+    let mut ids = match crate::serve::session::RequestIds::from_headers(&headers) {
         Ok(ids) => ids,
         Err(e) => {
             return crate::serve::api_error(axum::http::StatusCode::BAD_REQUEST, e, "invalid_request_error", Some("invalid_value"), None)
         }
     };
+    if let Err(e) = req.as_ref().map_or(Ok(()), |Json(r)| ids.apply_body(&r.route)) {
+        return crate::serve::api_error(axum::http::StatusCode::BAD_REQUEST, e, "invalid_request_error", Some("invalid_value"), Some("session_id".into()));
+    }
+    if let Some(r) = crate::serve::overload::gate(&ids) {
+        return r;
+    }
     let mut response = completions_with(state, req, &ids).await;
     ids.stamp(&mut response);
     response
@@ -293,6 +299,14 @@ async fn completions_with(
             None,
         );
     };
+    let mut run = crate::serve::turns::StageRun::start(
+        ids,
+        crate::serve::turns::Kind::Llm,
+        &req.model,
+        Some(state.model_metrics(&req.model)),
+        t_arrive,
+        true,
+    );
     let (report, report_rx) = ids.report();
     let session = ids.session.as_ref().and_then(|_| ids.ticket(crate::serve::session::row_keys(&prompt_ids, &[], &[]), report));
     let job = crate::serve::mux::Job {
@@ -302,6 +316,7 @@ async fn completions_with(
         respond: tx,
         opts: crate::serve::mux::JobOpts {
             session,
+            turn: run.key(),
             ..Default::default()
         },
     };
@@ -332,8 +347,10 @@ async fn completions_with(
     let id = request_id();
     let created = now_secs();
     let cache = crate::serve::session::CacheOutcome::received(report_rx).await;
+    run.admitted(cache.and_then(|c| c.at));
     let mut response = if req.stream {
         let include_usage = req.stream_options.map(|o| o.include_usage).unwrap_or(false);
+        let stamped = run.headers();
         let sse = sse_response(
             id,
             requested_model.clone(),
@@ -343,10 +360,13 @@ async fn completions_with(
             n_prompt,
             created,
             lp_fmt,
+            run,
         );
-        crate::serve::session::hold_until_sent(sse.into_response(), in_flight)
+        let mut response = crate::serve::session::hold_until_sent(sse.into_response(), in_flight);
+        response.headers_mut().extend(stamped);
+        response
     } else {
-        buffer_and_reply(id, requested_model, rx, response_prompt_ids, created, lp_fmt).await
+        buffer_and_reply(id, requested_model, rx, response_prompt_ids, created, lp_fmt, run).await
     };
     if let Some(cache) = cache {
         cache.stamp(&mut response);
@@ -361,6 +381,7 @@ async fn buffer_and_reply(
     prompt_token_ids: Option<Vec<u32>>,
     created: u64,
     lp_fmt: Option<crate::serve::logprobs::TokenText>,
+    mut run: crate::serve::turns::StageRun,
 ) -> Response {
     let mut text = String::new();
     let mut lps = crate::serve::logprobs::CompletionLogprobs::default();
@@ -370,6 +391,7 @@ async fn buffer_and_reply(
     while let Some(chunk) = rx.recv().await {
         match chunk {
             StreamChunk::Token { id, text: delta, logprobs } => {
+                run.first();
                 if let (Some(fmt), Some(lp)) = (&lp_fmt, &logprobs) {
                     lps.push(fmt, id, lp, text.len());
                 }
@@ -401,7 +423,8 @@ async fn buffer_and_reply(
             None,
         );
     };
-    Json(CompletionResponse {
+    run.done();
+    let mut response = Json(CompletionResponse {
         id: request_id,
         object: "text_completion",
         created,
@@ -421,7 +444,9 @@ async fn buffer_and_reply(
             completion: completion_token_ids,
         }),
     })
-    .into_response()
+    .into_response();
+    run.stamp(&mut response);
+    response
 }
 
 fn sse_response(
@@ -433,6 +458,7 @@ fn sse_response(
     n_prompt: usize,
     created: u64,
     lp_fmt: Option<crate::serve::logprobs::TokenText>,
+    run: crate::serve::turns::StageRun,
 ) -> Sse<impl Stream<Item = Result<Event, std::convert::Infallible>>> {
     struct SseState {
         rx: stream_mod::ChunkReceiver,
@@ -441,6 +467,7 @@ fn sse_response(
         first: bool,
         done: bool,
         pending: std::collections::VecDeque<Event>,
+        run: crate::serve::turns::StageRun,
     }
     let body = stream::unfold(
         SseState {
@@ -449,6 +476,7 @@ fn sse_response(
             first: true,
             done: false,
             pending: std::collections::VecDeque::new(),
+            run,
         },
         move |mut st| {
             let model = model.clone();
@@ -481,6 +509,7 @@ fn sse_response(
                         st.offset += text.len();
                         if st.first {
                             st.first = false;
+                            st.run.first();
                             crate::obs::ttft::dump(t_arrive.elapsed().as_nanos() as u64, n_prompt);
                             crate::obs::pfx::report();
                             if crate::obs::host::on() {
@@ -555,6 +584,8 @@ fn sse_response(
                         .push_back(Event::default().data(stream_mod::chunk_data(&usage_frame)));
                 }
                 if terminate {
+                    st.run.done();
+                    st.pending.push_back(st.run.sse_comment());
                     st.pending
                         .push_back(Event::default().data(stream_mod::DONE));
                 }
@@ -592,9 +623,14 @@ mod tests {
             "ignore_eos": true,
             "stream_options": {"include_usage": true},
             "return_token_ids": true,
-            "best_of": 1
+            "best_of": 1,
+            "session_id": "s",
+            "metadata": {"turn_id": "t"}
         }))
         .unwrap();
+        assert_eq!(req.route.session_id.as_deref(), Some("s"));
+        assert!(req.route.metadata.as_ref().is_some_and(|m| m["turn_id"] == "t"));
+        assert_eq!(req.sampling.temperature, Some(0.0));
         assert!(matches!(&req.prompt, PromptSpec::Text(t) if t == "raw prompt"));
         assert_eq!(req.max_tokens, Some(1024));
         assert_eq!(req.ignore_eos, Some(true));

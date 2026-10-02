@@ -79,6 +79,37 @@ fn prefill_images() -> (InterpreterProfile, Vec<u8>, Vec<u8>) {
 }
 
 #[test]
+fn rejects_decode_object_with_wrong_kv_precision() {
+    let profile = interpreter_profile((9, 0)).unwrap();
+    let bf16 = cubin::synthetic_elf(profile.decode_symbol, &[], 90);
+    let fp8 = cubin::synthetic_elf(profile.decode_symbol, &[("plow_fp8_kv_abi", 1)], 90);
+    assert!(interp_candidate(&bf16, &profile, 90, Role::Decode, true).is_err());
+    assert!(interp_candidate(&fp8, &profile, 90, Role::Decode, false).is_err());
+    assert!(interp_candidate(&fp8, &profile, 90, Role::Decode, true).is_ok());
+}
+
+#[test]
+fn discovers_fp8_decode_after_generic_profile_file() {
+    let profile = interpreter_profile((9, 0)).unwrap();
+    let bf16 = cubin::synthetic_elf(profile.decode_symbol, &[], 90);
+    let fp8 = cubin::synthetic_elf(profile.decode_symbol, &[("plow_fp8_kv_abi", 1)], 90);
+    let dir = std::env::temp_dir().join(format!(
+        "plow-fp8-kv-discovery-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join(profile.decode_file), bf16).unwrap();
+    std::fs::write(dir.join("interp_sm90a_fp8kv.cubin"), &fp8).unwrap();
+    let mut rejected = Vec::new();
+    let selected =
+        filesystem_interp_image(&dir, &profile, 90, Role::Decode, true, &mut rejected).unwrap();
+    std::fs::remove_dir_all(&dir).unwrap();
+    assert_eq!(selected.image, fp8);
+    assert_eq!(selected.source, "interp_sm90a_fp8kv.cubin");
+    assert!(rejected[0].contains("FP8 KV object capability"));
+}
+
+#[test]
 fn selects_native_hopper_for_h100_and_h200() {
     let p = interpreter_profile((9, 0)).unwrap();
     assert_eq!(p.tag, "sm90a");
@@ -99,10 +130,10 @@ fn preserves_sm120_profile_and_rejects_unknown_arches() {
 fn auxiliary_mixed_object_cannot_win_ordinary_prefill_discovery() {
     let (profile, ordinary, mixed) = prefill_images();
     assert_eq!(
-        interp_candidate(&ordinary, &profile, 90, Role::Prefill).unwrap(),
+        interp_candidate(&ordinary, &profile, 90, Role::Prefill, false).unwrap(),
         profile.prefill_symbol
     );
-    assert!(interp_candidate(&mixed, &profile, 90, Role::Prefill)
+    assert!(interp_candidate(&mixed, &profile, 90, Role::Prefill, false)
         .unwrap_err()
         .contains("mixed-step auxiliary object"));
 }
@@ -119,10 +150,10 @@ fn auxiliary_packed_object_cannot_win_ordinary_prefill_discovery() {
         90,
     );
     assert_eq!(
-        interp_candidate(&ordinary, &profile, 90, Role::Prefill).unwrap(),
+        interp_candidate(&ordinary, &profile, 90, Role::Prefill, false).unwrap(),
         profile.prefill_symbol
     );
-    assert!(interp_candidate(&packed, &profile, 90, Role::Prefill)
+    assert!(interp_candidate(&packed, &profile, 90, Role::Prefill, false)
         .unwrap_err()
         .contains("packed-prefill auxiliary object"));
 }
@@ -162,7 +193,7 @@ fn embedded_mixed_object_is_skipped_for_ordinary_prefill() {
     };
     let mut rejected = Vec::new();
     let selected =
-        embedded_interp_image(&blob, &raw, &profile, 90, Role::Prefill, &mut rejected).unwrap();
+        embedded_interp_image(&blob, &raw, &profile, 90, Role::Prefill, false, &mut rejected).unwrap();
     assert_eq!(selected.image, ordinary);
     assert_eq!(selected.source, "embedded section 'ordinary'");
     assert!(rejected[0].contains("mixed-step auxiliary object"));
@@ -185,7 +216,7 @@ fn filesystem_mixed_object_is_skipped_for_ordinary_prefill() {
 
     let mut rejected = Vec::new();
     let selected =
-        filesystem_interp_image(&dir, &profile, 90, Role::Prefill, &mut rejected).unwrap();
+        filesystem_interp_image(&dir, &profile, 90, Role::Prefill, false, &mut rejected).unwrap();
     std::fs::remove_dir_all(&dir).unwrap();
     assert_eq!(selected.image, ordinary);
     assert_eq!(selected.source, "ordinary.cubin");

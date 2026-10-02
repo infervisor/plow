@@ -18,6 +18,7 @@ Two prompt modes, because they measure different things:
   agreement number then measures which degenerate attractor each arm fell into.
 """
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import json
 import statistics
@@ -67,56 +68,68 @@ def post(url, path, body, timeout=900):
 
 
 def cmd_capture(args):
+    if args.concurrency < 1:
+        sys.exit("concurrency must be positive")
     exact = args.mode == "raw"
     prompts = build_prompts(args.tokenizer, args.corpus, args.lengths,
                             args.per_length, exact)
     model = json.load(urllib.request.urlopen(args.url + "/v1/models"))["data"][0]["id"]
-    with open(args.out, "w") as log:
-        for prompt in prompts:
-            if exact:
-                result = post(args.url, "/v1/completions",
-                              {"model": model, "prompt": prompt["text"],
-                               "add_special_tokens": False, "temperature": 0,
-                               "max_tokens": args.max_tokens, "ignore_eos": True,
-                               "stream": False})
-                text = result["choices"][0]["text"]
-            else:
-                result = post(args.url, "/v1/chat/completions",
-                              {"model": model, "temperature": 0,
-                               "max_tokens": args.max_tokens, "stream": False,
-                               "messages": [{"role": "user",
-                                             "content": prompt["text"] + QUESTION}]})
-                text = result["choices"][0]["message"]["content"]
-            usage = result["usage"]
-            if exact:
-                assert usage["prompt_tokens"] == prompt["length"], (prompt["length"], usage)
-                assert usage["completion_tokens"] == args.max_tokens, usage
-            record = {"label": args.label, "model": model, "mode": args.mode,
-                      "length": prompt["length"], "index": prompt["index"],
-                      "prompt_sha256": prompt["sha256"], "completion": text,
-                      "usage": usage}
+    def capture(prompt):
+        if exact:
+            result = post(args.url, "/v1/completions",
+                          {"model": model, "prompt": prompt["text"],
+                           "add_special_tokens": False, "temperature": 0,
+                           "max_tokens": args.max_tokens, "ignore_eos": True,
+                           "stream": False})
+            text = result["choices"][0]["text"]
+        else:
+            result = post(args.url, "/v1/chat/completions",
+                          {"model": model, "temperature": 0,
+                           "max_tokens": args.max_tokens, "stream": False,
+                           "messages": [{"role": "user",
+                                         "content": prompt["text"] + QUESTION}]})
+            text = result["choices"][0]["message"]["content"]
+        usage = result["usage"]
+        if exact:
+            assert usage["prompt_tokens"] == prompt["length"], (prompt["length"], usage)
+            assert usage["completion_tokens"] == args.max_tokens, usage
+        record = {"label": args.label, "model": model, "mode": args.mode,
+                  "length": prompt["length"], "index": prompt["index"],
+                  "prompt_sha256": prompt["sha256"], "completion": text,
+                  "usage": usage}
+        return record
+
+    with ThreadPoolExecutor(max_workers=args.concurrency) as pool, open(args.out, "w") as log:
+        for record in pool.map(capture, prompts):
             log.write(json.dumps(record) + "\n")
             log.flush()
-            print(f"{args.label} len={prompt['length']} i={prompt['index']} "
+            usage = record["usage"]
+            print(f"{args.label} len={record['length']} i={record['index']} "
                   f"prompt_tokens={usage['prompt_tokens']} "
                   f"completion_tokens={usage['completion_tokens']}", flush=True)
 
 
 def cmd_compare(args):
-    tok = Tokenizer.from_file(args.tokenizer)
     def load(path):
         rows = {}
-        for line in open(path):
-            r = json.loads(line)
-            rows[(r["length"], r["index"])] = r
+        with open(path) as capture:
+            for line in capture:
+                r = json.loads(line)
+                key = (r["length"], r["index"])
+                if key in rows:
+                    sys.exit(f"duplicate prompt {key} in {path}")
+                rows[key] = r
         return rows
     left, right = load(args.left), load(args.right)
-    shared = sorted(set(left) & set(right))
-    if not shared:
-        sys.exit("captures share no prompts")
+    if set(left) != set(right):
+        sys.exit(f"capture prompt sets differ: left-only={sorted(set(left) - set(right))}, "
+                 f"right-only={sorted(set(right) - set(left))}")
+    if not left:
+        sys.exit("captures contain no prompts")
+    tok = Tokenizer.from_file(args.tokenizer)
     per_length = {}
     rows = []
-    for key in shared:
+    for key in sorted(left):
         a, b = left[key], right[key]
         assert a["prompt_sha256"] == b["prompt_sha256"], key
         assert a["usage"]["prompt_tokens"] == b["usage"]["prompt_tokens"], key
@@ -169,6 +182,7 @@ def main():
     cap.add_argument("--lengths", type=int, nargs="+", default=[128, 512, 2048, 8192])
     cap.add_argument("--per-length", type=int, default=3)
     cap.add_argument("--max-tokens", type=int, default=64)
+    cap.add_argument("--concurrency", type=int, default=1)
     cap.add_argument("--mode", choices=("chat", "raw"), default="chat")
     cap.set_defaults(func=cmd_capture)
 
