@@ -21,6 +21,7 @@ from __future__ import annotations
 import argparse
 import csv
 import hashlib
+import importlib.util
 import json
 import re
 import os
@@ -1217,9 +1218,14 @@ def cmd_sweep(a: argparse.Namespace) -> None:
 #   asr_wer           /v1/audio/transcriptions over a manifest (served_bench.py): wer_max
 #   tts_cer           tts_bench.py --wav arms, Whisper round trip (asr_check.py): cer_median_max, cer_lang_max
 #   s3gen_rel_l2      s3gen.pkt vs torch (s3gen_packet_check.py, packet_run): rel_l2_max
+#   llm_fp32_ref      plow AND vLLM vs a cached FP32 reference (scripts/llm/fp32_ref_gate.py); plow must
+#                     stay within vLLM's distance to FP32. `reference` (ref.json), then `vllm_capture` (cached)
+#                     or `vllm_hf` [+ `vllm_args`, `vllm_python`] to capture vLLM in the same lease:
+#                     kl_ratio_max, kl_slack_max, top1_drop_max, cont_drop_max, needle_drop_max,
+#                     needle_min, tie_margin (docs/bringup/agent-tools.md §5)
 # Each may set `python` (default [gates].python, else python3), `args` (extra client args) and
 # `timeout_s`. Placeholders as in `build`, plus {assets}, {target} (cargo target dir) and {out}.
-GATE_KINDS = ("llm_logit_parity", "asr_wer", "tts_cer", "s3gen_rel_l2")
+GATE_KINDS = ("llm_logit_parity", "llm_fp32_ref", "asr_wer", "tts_cer", "s3gen_rel_l2")
 
 
 def gate_steps(kind: str, g: dict, py: str, out: Path, assets: Path) -> tuple[list[str], list[str]]:
@@ -1233,6 +1239,22 @@ def gate_steps(kind: str, g: dict, py: str, out: Path, assets: Path) -> tuple[li
         return ([f"{q(py)} {sc('scripts/llm/gemma_logit_parity.py')} plow \"$PB_SERVER_PORT\" {hf} {d}/plow.json > {d}/plow.log 2>&1"],
                 [f"{q(py)} {sc('scripts/llm/gemma_logit_parity.py')} hf {hf} {d}/plow.json {d}/hf.json > {d}/hf.log 2>&1",
                  f"{q(py)} {sc('scripts/llm/gemma_logit_parity.py')} report {d}/plow.json {d}/hf.json > {d}/parity.md 2>&1"])
+    if kind == "llm_fp32_ref":
+        cap = lambda arm: (f"{q(py)} {sc('scripts/llm/fp32_ref_gate.py')} capture --url \"http://127.0.0.1:$PB_SERVER_PORT\" "
+                           f"--ref {q(g['reference'])} --arm {arm} --concurrency {int(g.get('concurrency', 16))} "
+                           f"--out {d}/{arm}.json > {d}/{arm}.log 2>&1")
+        down = []
+        if not g.get("vllm_capture"):
+            if not g.get("vllm_hf"):
+                die("[gates.llm_fp32_ref] needs vllm_capture (cached) or vllm_hf (capture in this lease)")
+            vpy = q(g.get("vllm_python") or py)
+            vargs = " ".join(q(v) for v in shlex.split(g.get("vllm_args", "")))
+            # Own subshell server after plow stopped; the exported PLOW_* are inert for vLLM.
+            down = [f"( PB_SERVER_PORT=$(pb_free_port); PB_SERVER_LOG={d}/vllm-server.log; "
+                    f"env -u LD_LIBRARY_PATH {vpy} -m vllm.entrypoints.cli.main serve {q(g['vllm_hf'])} "
+                    f"--port \"$PB_SERVER_PORT\" {vargs} > \"$PB_SERVER_LOG\" 2>&1 & PB_SERVER_PID=$!; "
+                    f"trap pb_serve_stop EXIT; pb_serve_wait {int(g.get('vllm_ready_s', 900))} && {cap('vllm')} )"]
+        return [cap("plow")], down
     if kind == "asr_wer":
         return ([f"{q(py)} {sc('scripts/asr/nvidia/served_bench.py')} --url \"http://127.0.0.1:$PB_SERVER_PORT\" "
                  f"--model \"$MODEL\" --manifest {q(g['manifest'])} --conc {q(str(g.get('conc', '1,16')))} {args} "
@@ -1254,6 +1276,13 @@ def gate_steps(kind: str, g: dict, py: str, out: Path, assets: Path) -> tuple[li
     die(f"unknown gate kind {kind}")
 
 
+def fp32_ref_module():
+    spec = importlib.util.spec_from_file_location("fp32_ref_gate", REPO / "scripts/llm/fp32_ref_gate.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
 def gate_score(kind: str, g: dict, d: Path) -> dict:
     """{metric: value, ..., "pass": bool, "why": [...]} from the files gate_steps wrote."""
     txt = lambda name: (d / name).read_text(errors="replace") if (d / name).is_file() else ""
@@ -1269,6 +1298,19 @@ def gate_score(kind: str, g: dict, d: Path) -> dict:
         lim("top1", float(m[3]), "top1_min", upper=False)
         lim("kl_mean", float(m[4]), "kl_mean_max")
         lim("kl_max", float(m[5]), "kl_max_max")
+    elif kind == "llm_fp32_ref":
+        mod = fp32_ref_module()
+        caps = [d / "plow.json", Path(g.get("vllm_capture") or d / "vllm.json")]
+        absent = [str(p) for p in [Path(g["reference"]), *caps] if not p.is_file()]
+        if absent:
+            return {"pass": False, "why": [f"missing {', '.join(absent)} (see plow.log / vllm.log)"]}
+        ref = mod.load_ref(g["reference"])
+        th = dict(mod.DEFAULTS, **{k: g[k] for k in mod.DEFAULTS if k in g})
+        cand, vllm = (mod.score(ref, json.loads(p.read_text()), th["tie_margin"]) for p in caps)
+        why += mod.verdict(cand, vllm, th)
+        for m in ("kl_mean", "kl_p99", "top1_decisive", "cont_frac", "needle_acc"):
+            res[m], res["vllm_" + m] = cand.get(m), vllm.get(m)
+        (d / "fp32_ref.md").write_text(mod.table({"plow": cand, "vllm": vllm}) + "\n")
     elif kind == "asr_wer":
         rows = [json.loads(ln) for ln in txt("served.jsonl").splitlines() if ln.startswith("{")]
         if not rows:

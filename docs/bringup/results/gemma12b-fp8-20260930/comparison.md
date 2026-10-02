@@ -61,3 +61,34 @@ Detailed manifests, JSON, HTML, logs and kernel audits are archived outside the 
 `/opt/dlami/nvme/tmp/gemma12b-main-20260930/repo-evidence-archive-327413c3`
 
 The archive manifest records SHA256s for every moved file. Live artifacts stay in the campaign scratch directory. Append future serving measurements to this CSV and record qualified wins here.
+
+## 128 slots at 16K context (live rings, byte admission)
+
+Not a win. The 16K/B128 BF16-KV packet that ran out of VRAM at load now loads and serves: each 640 MiB sliding ring is committed only while a request owns its slot (`PLOW_VMM_LIVE_RINGS=1` under `PLOW_VMM_PREFIX=1`; idle decode rows write one shared scratch unit), and the mux admits requests by bytes under `PLOW_KV_MEM_UTIL=0.9`. That admits 71-78 requests at 4K and 64 at 15K, against 64 slots on the current packet. Serving is prefill-bound at both lengths, so the extra live requests do not raise output tok/s.
+
+Setup: one H100, greedy, OSL 128, 3×c prompts per cell, same vLLM 0.28 client, Plow runtime `6f3fe2d5` (the margin row uses `da8b526d`). 64-slot = `glu-quant-wpr/full-model` packet with prefix cache off. 128-slot = `production-16k128-lt` packet with prefix cache on and `PLOW_PF_ATTN_GEMM=1`. Values are the mean of two repeats unless marked r1.
+
+| ISL | c | packet | out tok/s | TTFT p50 / p99 s | TPOT p50 / p99 ms | peak GiB | max live |
+|---:|---:|---|---:|---:|---:|---:|---:|
+| 4096 | 64 | 64-slot | 617 | 1.2 / 9.9 | 92 / 99 | 63.3 | 64 |
+| 4096 | 64 | 128-slot | 555 | 1.4 / 10.9 | 98 / 111 | 71.8 | 64 |
+| 4096 | 128 | 64-slot | 616 | 14.3 / 22.4 | 96 / 102 | 63.3 | 64 |
+| 4096 | 128 | 128-slot | 557 | 13.1 / 25.0 | 129 / 136 | 78.2 | 78 |
+| 4096 | 128 | 128-slot, margin charged | 547 | 14.7 / 25.0 | 118 / 126 | 73.0 | 71 |
+| 15000 | 64 | 64-slot | 189 | 22.4 / 40.3 | 158 / 164 | 64.3 | 64 |
+| 15000 | 64 | 128-slot (r1) | 186 | 20.4 / 42.1 | 176 / 179 | 73.7 | 64 |
+| 15000 | 128 | 64-slot | 195 | 61.4 / 80.0 | 172 / 174 | 65.5 | 64 |
+| 15000 | 128 | 128-slot (r1) | 189 | 63.0 / 82.6 | 176 / 179 | 73.7 | 64 |
+| agentic16k | 64 | 128-slot | 301 | 5.9 / 21.7 | 178 / 186 | | |
+| agentic16k | 128 | 128-slot | 290 | 27.8 / 67.0 | 180 / 192 | | |
+| agentic16k | 128 | 64-slot, prefix cache on | 307 | 28.8 / 64.6 | 171 / 179 | | |
+
+The agentic rows use `llm_grid.sh --agentic`, one repeat, with 0-5% prefix hits. A retained 16K session costs about 564 MiB on BF16 KV: a 320 MiB sliding snapshot plus 244 MiB of full-attention blocks.
+
+Memory per request: 640 MiB of sliding ring, plus 16 KiB per full-attention row in 2048-row blocks, plus the admission margin (one prefill bucket, 96 MiB). A 4K request costs about 800 MiB and a 16K request about 960 MiB. The KV budget after load is 56 GiB. The row without the margin charge peaked at 78-80 GiB because admission maps one widest prefill bucket past each request; charging that margin brings the peak to 73 GiB. Prefix-cache snapshots still sit outside the budget.
+
+FP8 KV (`sm90a-h100-tp1-fp8kv-16k-c128-rq1k-live`) would fit 128 × 16K: 320 MiB ring + 8 KiB per row, or about 512 MiB per 16K slot. It cannot serve at 4K yet. Its packed prefill attention costs about 55 ms per riding decode row: a 2112-row pack with 62 riders takes 3.8 s, against 0.17 s for 4096 rows with 63 riders on BF16 KV. `PLOW_TOKEN_BATCH=0` is refused for FP8-KV segmented prefill.
+
+Gates on the 128-slot packets: cached and cold prompts of 0.9K, 3.4K and 8.5K tokens give the same 48 greedy tokens, including with 32 concurrent sharers. Max |Δlogprob| is 0.33 on BF16 KV and 0.12 on FP8 KV; the logprobs are not byte-identical. A raw-prompt 16K needle (3 items × 3 depths × 10) scores 47/90 on BF16 and 41/90 on FP8. Its failures are deterministic by item and depth, so the raw-prompt probe needs the 64-slot baseline before it can count as a gate.
+
+Raw cells and logs: `/opt/dlami/nvme/lava-tts/cap128/serve`.

@@ -63,7 +63,7 @@ after a kernel change. Existing serving evidence can prioritize work but cannot 
 | 2 | build from the recipe | `campaign.py build recipes/<ns>/<model>/<cell>.toml --out <fresh dir>` |
 | 3 | per-rung accuracy, resources + measured roofline | `scripts/bench/step_grid.sh <assets> <out>` (step_bench B × ctx; instruction-cap sweeps for native decode only), then `scripts/bench/op_roof.py <out>/disasm.txt --ctx N --sweep B=<jsonl>` (bytes, FLOPs, floor, measured, % roof per op). Library-routed decode needs `op_roof.py --nsys` with JSON disassembly and a measured CUDA trace; prefill CUDA graphs use `--nsys-correlation <id>` for exact packet-segment mapping, while `--segtime` covers per-chunk prefill diagnostics. No measurement = floor only. Use block/route harnesses below for other kernels; GLM/MLA/MoE: `scripts/campaign/op_roofline.py` |
 | 4 | full-model accuracy gates | `campaign.py gate <recipe> --assets <out>/assets --out <dir>` runs the recipe's `[gates]` in one lease (logit parity top1/KL, ASR WER, TTS CER per language, S3Gen rel-L2); `--score-only` re-scores, `--dry-run` prints `run.sh` |
-| 5 | serving grid vs the reference | `scripts/bench/llm_grid.sh plow\|vllm <res>` (same client, unique prompts per cell and repeat, greedy + sampled, 2 repeats, prefill-only and decode-only cells, vLLM `/metrics`, plow PACKLOG); speech: `tts_bench.py`, `served_bench.py`; voice: `scripts/voice/serve_voice_agent.sh calls` |
+| 5 | serving grid vs the reference | `scripts/bench/llm_grid.sh plow\|vllm <res>` (same client, unique prompts per cell and repeat, greedy + sampled, 2 repeats, prefill-only and decode-only cells, vLLM `/metrics`, plow PACKLOG); agentic multi-turn with prefix caching on both sides: `llm_grid.sh plow\|vllm <res> --agentic` (`agentic_turns.py`, c32/64/128 x 10 turns to ~16K); speech: `tts_bench.py`, `served_bench.py`; voice: `scripts/voice/serve_voice_agent.sh calls` |
 | 6 | audit waterfall | `scripts/bench/waterfall.py <res>/plow <res>/vllm`: grid with spread, reference prefix-cache hits (fails > 5%), wall ms/request split (mixed, prefill-only, decode, host gap, idle, padding, riders), decode ms/step side by side. `vllm_metrics.py cells`, `packlog_audit.py`, `nsys_busy.py` are its parts |
 | 7 | fix, one variable | kernel/runtime change in your own detached worktree |
 | 8 | verify the patch | `scripts/campaign/verify_patch.sh <patch>`: applies to HEAD in a private index, archives `git write-tree`, builds bins/examples/tests, plowrt lib (cuda+hsa), knob tests, plow-asset + packet tests, py_compile / `bash -n` / TOML of touched scripts |
@@ -246,6 +246,40 @@ the packet a bring-up artifact and `freeze_serving_set.sh` will refuse it.
 | `scripts/asm_audit.py` + `scripts/asm_expect_gfx942*.json` | assembly expectations for shipped objects. |
 
 A perf change that is not bit-identical needs a numerics gate, not just a faster number.
+
+**Cross-stack quality is gated against FP32, not against vLLM's bits** (`scripts/llm/fp32_ref_gate.py`,
+`campaign.py gate` kind `llm_fp32_ref`). Two FP8 stacks never agree bit for bit, and near-tie
+flips fail any exact-match gate (vLLM's repeat floor is 0). Instead an independent FP32 reference
+(the served FP8 checkpoint dequantized to FP32 weights, FP32 activations, TF32 off, exact chunked
+attention) scores both stacks on one fixed token-id prompt set, and Plow must stay within vLLM's
+distance to FP32:
+
+| metric (vs FP32) | definition | pass if Plow ... (default) |
+|---|---|---|
+| `kl_mean`, `kl_p99` | KL(FP32 ‖ stack) per teacher-forced position, FP32 top-20 + remainder bucket (stack's 20th logprob for a missing token) | ≤ vLLM × `kl_ratio_max` (1.25) + `kl_slack_max` (0.002) |
+| `top1_decisive` | top-1 agreement where the FP32 top-1/top-2 margin > `tie_margin` (1.0 nat) | ≥ vLLM − `top1_drop_max` (0.01) |
+| `cont_frac` | stack's own greedy continuation: tokens matching FP32 before the first divergence / reference length | ≥ vLLM − `cont_drop_max` (0.05) |
+| `needle_acc` | needle answer contained in the greedy continuation | ≥ vLLM − `needle_drop_max` (0) and ≥ `needle_min` (0.9) |
+
+Any missing scored position fails. Capture is teacher-forced through `/v1/completions` (token-id
+prompt, greedy, `logprobs: 20`): each request starts at prompt + FP32 continuation[:k]; positions up
+to and including the first disagreement have the exact FP32 history, the next request restarts one
+past it (1 + flips requests per case). Prompt set (`prompts`): natural text at 128/1K/4K/8K/15.9K
+tokens from two Gutenberg books, repo docs and repo Rust; eight chat-template agentic samples
+(tools, tool calls/results, multi-turn, 54 to 15.3K tokens); 18 chat needles (4K and 15.9K, depths
+0.1/0.5/0.9). Build once, cache with sha256s, gate many times:
+
+```bash
+P=scripts/llm/fp32_ref_gate.py; HF=<hub gemma-4-12b-it-fp8 dir>
+python3 $P prompts --hf $HF --corpus pride=pg1342.txt beagle=pg944.txt docs=repo-docs.md code=repo-code.rs --out prompts.json
+gpulease -n 1 fp32-ref timeout 5400 python3 $P reference --hf $HF --prompts prompts.json --out ref.json  # ~50 GB VRAM
+# recipe: [gates.llm_fp32_ref] reference = ".../ref.json", vllm_hf = $HF, vllm_args = "<matched vLLM serve flags>"
+#         (or vllm_capture = a cached vllm.json against the same ref.json); thresholds as above
+campaign.py gate <recipe> --assets <assets> --out <dir> [--only llm_fp32_ref] [--score-only]
+python3 $P gate --ref ref.json --cand <dir>/llm_fp32_ref/plow.json --peer <dir>/llm_fp32_ref/vllm.json
+```
+
+Unit tests: `cd scripts/llm && python3 -m unittest test_fp32_ref_gate`.
 
 ---
 

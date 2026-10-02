@@ -25,6 +25,10 @@
 # Add --needle for exact-length retrieval; NEEDLE_LENGTHS ("128,1024,4096,7000").
 # NEEDLE_CONCURRENCY/NEEDLE_REPEATS (1), NEEDLE_MAX_TOKENS (32), NEEDLE_IGNORE_EOS (unset).
 # NEEDLE_CHAT_TEMPLATE_HF optionally supplies the local checkpoint's instruction template.
+# Add --agentic for the agentic16k profile (scripts/bench/agentic_turns.py): AGENTIC_CONCS
+# (32 64 128) concurrent sessions x AGENTIC_TURNS (10), history growing to AGENTIC_TARGET (15600)
+# tokens, AGENTIC_MAX_TOKENS (128) per reply, AGENTIC_API (chat), REPS repeats, greedy + SAMPLED.
+# Prefix caching stays ON on both sides (vLLM APC default; plow X-Session-Id + prefix cache).
 set -u
 # Bash otherwise reads later commands from a file that a long campaign may edit.
 if [ -n "${BASH_SOURCE[0]:-}" ]; then
@@ -33,10 +37,11 @@ if [ -n "${BASH_SOURCE[0]:-}" ]; then
 fi
 HERE=$(cd "$(dirname "$0")/../.." && pwd)
 source "$HERE/scripts/bench/plowbench.sh"
-case "${1:-}" in plow|vllm) ;; *) sed -n '2,23p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;; esac
+case "${1:-}" in plow|vllm) ;; *) sed -n '2,27p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;; esac
 SIDE=$1 RES=${2:?resdir}
-if [ "$#" -gt 2 ] && ! { { [ "$3" = --quality ] && [ "$#" -ge 4 ]; } || { [ "$3" = --needle ] && [ "$#" -eq 3 ]; }; }; then
-    echo 'usage: llm_grid.sh plow|vllm resdir [--quality corpus files... | --needle]' >&2
+if [ "$#" -gt 2 ] && ! { { [ "$3" = --quality ] && [ "$#" -ge 4 ]; } || { [ "$3" = --needle ] && [ "$#" -eq 3 ]; } \
+        || { [ "$3" = --agentic ] && [ "$#" -eq 3 ]; }; }; then
+    echo 'usage: llm_grid.sh plow|vllm resdir [--quality corpus files... | --needle | --agentic]' >&2
     exit 2
 fi
 : "${PYREF:?python with vllm}" "${HF:?checkpoint dir}"
@@ -93,6 +98,36 @@ MODEL=$(pb_model_id)
 export PB_VLLM=$PYREF PB_TOKENIZER=$HF
 pb_metrics_start "$RES"
 : > "$RES/cells.log"
+if [ "${3:-}" = --agentic ]; then
+    # Distinct seed per (mode, sessions, repeat): no cell replays another's sessions or system prompt.
+    agentic() { # tag mode c rep [client args...]
+        local tag=$1 mode=$2 c=$3 rep=$4; shift 4
+        echo "CELL_BEGIN $tag $(date +%s.%N)" >> "$RES/cells.log"
+        "$PYREF" "$HERE/scripts/bench/agentic_turns.py" --url "http://127.0.0.1:$PB_SERVER_PORT" \
+            --model "$MODEL" --tokenizer "$HF" --sessions "$c" --turns "${AGENTIC_TURNS:-10}" \
+            --target-tokens "${AGENTIC_TARGET:-15600}" --max-tokens "${AGENTIC_MAX_TOKENS:-128}" \
+            --api "${AGENTIC_API:-chat}" --seed $(( 7001 + mode * 1000003 + c * 131 + rep * 7919 )) \
+            --out "$RES/$tag.json" "$@" > "$RES/$tag.log" 2>&1
+        echo "CELL_END $tag $(date +%s.%N)" >> "$RES/cells.log"
+        tail -1 "$RES/$tag.log" | sed "s/^/$tag /"
+    }
+    # Unrecorded warm-up (own seed), so the first cell does not pay first-touch costs.
+    "$PYREF" "$HERE/scripts/bench/agentic_turns.py" --url "http://127.0.0.1:$PB_SERVER_PORT" --model "$MODEL" \
+        --tokenizer "$HF" --sessions 16 --turns 3 --target-tokens "${AGENTIC_TARGET:-15600}" \
+        --max-tokens "${AGENTIC_MAX_TOKENS:-128}" --api "${AGENTIC_API:-chat}" --seed 1 --temperature 0 \
+        --out "$RES/warmup.json" > "$RES/warmup.log" 2>&1
+    for rep in $(seq 1 "$REPS"); do
+        for c in ${AGENTIC_CONCS:-32 64 128}; do
+            agentic "a$c.g.r$rep" 1 "$c" "$rep" --temperature 0
+            # shellcheck disable=SC2086
+            [ -n "$SAMPLED" ] && agentic "a$c.s.r$rep" 2 "$c" "$rep" $SAMPLED
+        done
+    done
+    pb_metrics_stop
+    python3 "$HERE/scripts/bench/vllm_metrics.py" cells "$RES" --cache-only --max-prefix-hit 1 > "$RES/cache.json"
+    [ "$SIDE" = plow ] && python3 "$HERE/scripts/bench/packlog_audit.py" "$PB_SERVER_LOG" > "$RES/packlog.txt"
+    exit 0
+fi
 # Distinct seed per (kind, conc, isl, osl, repeat): no cell's prompts are a prefix of another's.
 cell() { # tag kind conc np isl osl rep [client args...]
     local tag=$1 kind=$2 c=$3 np=$4 isl=$5 osl=$6 rep=$7; shift 7

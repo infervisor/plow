@@ -324,6 +324,7 @@ impl SharedAsr {
                 raw_tokens: true,
                 session,
                 turn: opts.ids.as_ref().and_then(|i| i.turn_key.clone()),
+                continuing: false,
                 speech: Some(Box::new(SpeechJob { overlay, overlay_pos, pos_base: None, cfg: None, first_tokens: 0 })),
             },
         };
