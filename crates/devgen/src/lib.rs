@@ -10580,7 +10580,7 @@ fn emit_dense_gqa(
     }
     if let Some(dir) = ecfg.tts_vocoder.as_deref().filter(|_| !block_mode) {
         let sites = whole_graph_audio_sites().1;
-        let (model, section) = s3gen::lower_s3gen(dir, n_cu, m.target, sites).unwrap_or_else(|error| panic!("s3gen packet: {error}"));
+        let (model, section) = s3gen::lower_s3gen(dir, n_cu, m.target, sites, ecfg.s3gen_attn_h16).unwrap_or_else(|error| panic!("s3gen packet: {error}"));
         let path = std::path::Path::new(&out).with_file_name(s3gen::PACKET);
         write_sidecar_packet(&path, &model, &[section]);
         eprintln!("  s3gen packet -> {}", path.display());

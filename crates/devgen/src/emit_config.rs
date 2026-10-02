@@ -301,6 +301,10 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_NV_DENSE_TUNE", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub nv_dense_tune: bool,
 
+    /// S3Gen voice caches pre-formatted for the 3xFP16 cached attention (sm_90 speech object).
+    #[arg(long, env = "PLOW_EMIT_S3GEN_ATTN_H16", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub s3gen_attn_h16: bool,
+
     /// Packed prefill for hd64/hd128 attention (the live-KV and packed contracts accept them).
     #[arg(long, env = "PLOW_EMIT_PACKED_PREFILL_SMALL_HD", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub packed_prefill_small_hd: bool,
@@ -1462,6 +1466,7 @@ impl EmitConfig {
             nv_fa_fold: env_bool("PLOW_NV_FA_FOLD"),
             nv_dense_tune: env_bool("PLOW_NV_DENSE_TUNE"),
             packed_prefill_small_hd: env_bool("PLOW_EMIT_PACKED_PREFILL_SMALL_HD"),
+            s3gen_attn_h16: env_bool("PLOW_EMIT_S3GEN_ATTN_H16"),
             nv_fa_mma_hd128: env_bool("PLOW_NV_FA_MMA_HD128"),
             nv_gemv_k8_b1: env_bool("PLOW_NV_GEMV_K8_B1"),
             nv_fa_split_prefill: env_bool_default_true("PLOW_NV_FA_SPLIT_PREFILL"),
