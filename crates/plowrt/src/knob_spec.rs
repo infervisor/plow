@@ -441,7 +441,7 @@ pub const RUNTIME: &[KnobSpec] = &[
     KnobSpec::new("rt.encode_fast", Some("PLOW_ENCODE_FAST"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
     KnobSpec::new("rt.encode_threads", Some("PLOW_ENCODE_THREADS"), Layer::Runtime, U32, UNSET, ONE_WORD_ENCODE_QUALIFIED),
     KnobSpec::new("rt.encode_split_min", Some("PLOW_ENCODE_SPLIT_MIN"), Layer::Runtime, U32, UNSET, ONE_WORD_ENCODE_QUALIFIED),
-    KnobSpec::new("rt.vmm_cache_memory_utilization", Some("PLOW_VMM_CACHE_MEMORY_UTILIZATION"), Layer::Runtime, Domain::Str, Default::Static(Val::Str("0.05")), OPT_IN),
+    KnobSpec::new("rt.vmm_cache_memory_utilization", Some("PLOW_VMM_CACHE_MEMORY_UTILIZATION"), Layer::Runtime, Domain::Str, Default::Static(Val::Str("0")), OPT_IN),
     KnobSpec::new("rt.vmm_cache_min_free_mib", Some("PLOW_VMM_CACHE_MIN_FREE_MIB"), Layer::Runtime, U32, UNSET, PRESSURE_EVICTION_DEFAULT),
     KnobSpec::new("rt.kv_admit_headroom", Some("PLOW_KV_ADMIT_HEADROOM"), Layer::Runtime, Domain::Str, Default::Static(Val::Str("0.9")), KV_ADMIT_DEFAULT),
     KnobSpec::new("rt.amd_prefix_fine_rows", Some("PLOW_AMD_PREFIX_FINE_ROWS"), Layer::Runtime, U32, UNSET, PREFIX_CACHE_CANDIDATE),

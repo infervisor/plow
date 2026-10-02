@@ -185,15 +185,15 @@ pub struct RuntimeConfig {
     #[arg(long = "encode-split-min", env = "PLOW_ENCODE_SPLIT_MIN", global = true)]
     pub encode_split_min: Option<u32>,
 
-    /// Soft cap on prefix blocks and boundary snapshots as a fraction of the device's
-    /// memory, 0..=1 — the unit vLLM's `--gpu-memory-utilization` uses, scoped here to
-    /// the prefix cache. A fixed byte count is the wrong unit: 4 GiB is 5% of an H100
-    /// and 2% of an MI300X, and the model decides what is left over. 0 = OOM-driven
-    /// eviction only. `--vmm-cache-mib` overrides it with an explicit size.
+    /// Optional soft cap on prefix blocks and boundary snapshots as a fraction of the device's
+    /// memory, 0..=1 — the unit vLLM's `--gpu-memory-utilization` uses, scoped here to the
+    /// prefix cache. Default 0: no static cap; the cache grows into free memory and pressure
+    /// eviction (`--vmm-cache-min-free-mib`) or allocation OOM evicts it, as vLLM's prefix
+    /// cache uses every free KV block. `--vmm-cache-mib` sets an explicit size.
     #[arg(
         long = "vmm-cache-memory-utilization",
         env = "PLOW_VMM_CACHE_MEMORY_UTILIZATION",
-        default_value_t = 0.05,
+        default_value_t = 0.0,
         value_parser = clap::value_parser!(f64),
         global = true
     )]
@@ -1803,7 +1803,10 @@ impl RuntimeConfig {
                     Some(free) => {
                         let vllm =
                             (device_bytes as f64 * Self::VMM_CACHE_MIN_FREE_FRACTION_LOADED) as u64;
-                        if free.saturating_sub(vllm) >= self.prefix_cache_cap_bytes(device_bytes) {
+                        let room = self.prefix_cache_cap_bytes(device_bytes).max(
+                            (device_bytes as f64 * Self::VMM_CACHE_MIN_ROOM_FRACTION) as u64,
+                        );
+                        if free.saturating_sub(vllm) >= room {
                             vllm.min(free / 2)
                         } else {
                             free / 8
@@ -1825,6 +1828,11 @@ impl RuntimeConfig {
         )
         .clamp(0.0, 1.0)
     }
+
+    /// Cache room, as a fraction of the device, that free-after-load must hold beside vLLM's 10%
+    /// headroom before the pressure floor is the 10%; below it (Gemma-4-26B on an 80 GiB H100) the
+    /// floor is an eighth of free-after-load so the shared checkpoints stay cached.
+    const VMM_CACHE_MIN_ROOM_FRACTION: f64 = 0.05;
 
     /// Fraction of device memory the prefix cache keeps free by default. 4% is ~7.7 GiB on a
     /// 192 GiB MI300X: above the largest transient the 8192 prefill rung takes, and small
@@ -2267,20 +2275,21 @@ mod tests {
             .get_arguments()
             .find(|arg| arg.get_id() == "vmm_cache_memory_utilization")
             .unwrap();
-        assert_eq!(fraction.get_default_values(), ["0.05"]);
-        // The default scales with the device: 5% of an 80 GiB H100 is the 4 GiB the
-        // campaign qualified; an MI300X gets 9.6 GiB; an unknown size keeps 4 GiB.
+        assert_eq!(fraction.get_default_values(), ["0"]);
+        // No static cap by default: the cache grows until pressure or OOM evicts it.
         let matches = command.clone().try_get_matches_from(["test"]).unwrap();
+        let config = super::RuntimeConfig::from_arg_matches(&matches).unwrap();
+        assert_eq!(config.prefix_cache_cap_bytes(80 << 30), 0);
+        assert_eq!(config.prefix_cache_cap_bytes(0), 0);
+        // An explicit fraction scales with the device; an unknown size keeps 4 GiB.
+        let matches = command
+            .clone()
+            .try_get_matches_from(["test", "--vmm-cache-memory-utilization=0.05"])
+            .unwrap();
         let config = super::RuntimeConfig::from_arg_matches(&matches).unwrap();
         assert_eq!(config.prefix_cache_cap_bytes(80 << 30), 4096 << 20);
         assert_eq!(config.prefix_cache_cap_bytes(192 << 30), 9830 << 20);
         assert_eq!(config.prefix_cache_cap_bytes(0), 4096 << 20);
-        let matches = command
-            .clone()
-            .try_get_matches_from(["test", "--vmm-cache-memory-utilization=0"])
-            .unwrap();
-        let config = super::RuntimeConfig::from_arg_matches(&matches).unwrap();
-        assert_eq!(config.prefix_cache_cap_bytes(80 << 30), 0);
         for (flag, expected) in [("--vmm-prefix", true), ("--vmm-prefix=false", false)] {
             let matches = command
                 .clone()
