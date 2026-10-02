@@ -150,11 +150,13 @@ impl GpuEngine {
         let layout = Self::vmm_prefix_layout(blob, checkpoint_dir)?;
         if requested.is_none() {
             // Auto-selection is an allowlist of the geometry the sliding-ring
-            // snapshot path was qualified on (Gemma 4 hybrid BF16 KV), not a
+            // snapshot path was qualified on (Gemma 4 hybrid KV), not a
             // capability probe; other layouts need an explicit PLOW_VMM_PREFIX=1.
+            // FP8 KV (elem 1, per-token-head scales in the snapshot): Gemma-4 12B,
+            // cached and cold multi-turn sessions give the same greedy tokens.
             let g = &layout.geo;
-            let qualified = g.elem == 2
-                && g.elem_slide == 2
+            let qualified = matches!(g.elem, 1 | 2)
+                && matches!(g.elem_slide, 1 | 2)
                 && g.hd_full == 512
                 && g.hd_slide == 256
                 // 512: Gemma-4 E4B (KV-shared layers read their source's rings); cached and
@@ -170,7 +172,8 @@ impl GpuEngine {
                 hd_slide = g.hd_slide,
                 window = g.window,
                 kv_elem = g.elem,
-                "vmm prefix auto-selection (qualified Hopper hybrid BF16-KV geometry; \
+                kv_elem_slide = g.elem_slide,
+                "vmm prefix auto-selection (qualified Hopper hybrid BF16/FP8-KV geometry; \
                  PLOW_PREFIX_CACHE=0 or PLOW_VMM_PREFIX=0 disables, =1 forces)"
             );
             if !qualified {

@@ -142,7 +142,10 @@ fn automatic_prefix_selection_requires_compatible_execution_and_valid_kv_layout(
     blob.tensors[4].bytes /= 2;
     blob.tensors.push(tensor("kv.1.k_scale", 4096 * 4));
     blob.tensors.push(tensor("kv.1.v_scale", 4096 * 4));
-    assert!(!selected(&blob, &cfg, (9, 0), 2 << 20));
+    assert!(selected(&blob, &cfg, (9, 0), 2 << 20), "fp8 full-layer KV is auto-qualified");
+    blob.tensors.pop();
+    assert!(!selected(&blob, &cfg, (9, 0), 2 << 20), "half a scale pair is geometry drift");
+    blob.tensors.push(tensor("kv.1.v_scale", 4096 * 4));
     cfg.nv.vmm_prefix = Some(true);
     assert!(selected(&blob, &cfg, (9, 0), 2 << 20));
     let mut geometry: serde_json::Value =
