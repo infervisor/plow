@@ -105,6 +105,7 @@ role_files = [
   "interp_sm90a_pfattn_hd512.cubin",
   "interp_sm90a_pfattn_hd256_gqa2_bkv32.cubin",
   "interp_sm90a_pfattn_hd256_bkv32.cubin",
+  "gen_sm90a_attn_pf_hd256_sliding.cubin",
 ]
 [objects.env]
 # FATLITE strips the native GEMM / GLU / flash arms the fat object never runs here (Lt, the GEMM
@@ -131,10 +132,13 @@ PLOW_BUILD_PFATTN_WG = "1"
 PLOW_BUILD_PFATTN_KV16 = "0"
 PLOW_BUILD_PFATTN_KV64 = "0"
 PLOW_BUILD_PFATTN_QK_UNROLL = "4"
+PLOW_BUILD_GEN_KERNELS = "attn_pf_hd256_sliding"
 
 [emit_roles.env]
 PLOW_GEMMA4_SM90_HD256_GQA2_ROLE = "1"
 PLOW_GEMMA4_SM90_HD512_PX4_BQ64_ROLE = "0"
+# Same hd256 sliding signature as the 12B (16/8, window 1024); see the 12B recipe.
+PLOW_EMIT_GEN_KERNELS = "attn_pf_hd256_sliding"
 
 [serve.env]
 PLOW_MOE_DEC_LT = "4"

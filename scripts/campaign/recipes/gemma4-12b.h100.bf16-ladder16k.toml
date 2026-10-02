@@ -57,15 +57,20 @@ role_files = [
   "interp_sm90a_pfattn_hd256_gqa2_bkv32.cubin",
   "interp_sm90a_pfattn_hd256_bkv32.cubin",
   "interp_sm90a_pfgemm_glu_gemma4.cubin",
+  "gen_sm90a_attn_pf_hd256_sliding.cubin",
 ]
 [objects.env]
 # The px4 BQ64 hd512 object hardcodes n_kv_head=1 (the 12B's full-attention geometry). The rest
 # of the BF16 object set is the script's default.
 PLOW_BUILD_PFATTN_HD512_PX4_BQ64 = "1"
+PLOW_BUILD_GEN_KERNELS = "attn_pf_hd256_sliding"
 
 [emit_roles.env]
 PLOW_GEMMA4_SM90_HD256_GQA2_ROLE = "1"
 PLOW_GEMMA4_SM90_HD512_PX4_BQ64_ROLE = "0"
+# Generated hd256 sliding prefill (docs/runtime/kernel-generators.md) takes the sliding sites on
+# rungs >= 1024 rows from role 14: C1 TTFT 1024 -7.6%, 4096/8192 -4.3%, logit top1 0.982.
+PLOW_EMIT_GEN_KERNELS = "attn_pf_hd256_sliding"
 
 [serve.env]
 # The matched ladder runs cache-off (vLLM --no-enable-prefix-caching; vllm-bench random prompts
