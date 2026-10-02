@@ -1,20 +1,17 @@
-# Experimental 16K/128-slot FP8-KV candidate (per-token-head FP8 KV, vLLM's format); not qualified.
-# KV is sized by admitted requests, not slots: full-attention rows map in 4096-row VMM blocks as
-# requests reserve them, and each 2048-row sliding ring (request chunk 1024) is committed only
-# while a request owns its slot (PLOW_VMM_LIVE_RINGS=1 under PLOW_VMM_PREFIX=1; idle decode rows
-# write shared scratch). The mux admits by bytes: 320 MiB ring + 8 KiB/row per request, capped at
-# 90% of the device (PLOW_KV_MEM_UTIL, vLLM's --gpu-memory-utilization default).
-# FP8 is what fits: BF16 rings alone are 640 MiB/slot (80 GiB at 128 slots).
-# NOT servable at 4K+ yet: the FP8-KV packed prefill attention costs ~55 ms per riding decode row at
-# 4K context (2112-row pack + 62 riders = 3.8 s vs 0.17 s for 4096 rows + 63 riders on BF16 KV), and
-# PLOW_TOKEN_BATCH=0 is refused for FP8-KV segmented prefill. Short-context serving only.
-# Decode cubin: cuBLASLt head, light FP8 attention with 16-byte loads and direct value conversion.
+# Experimental 16K/128-slot BF16-KV candidate (FP8 weights); not qualified. Loads and serves where the
+# flat-ring packet ran out of VRAM at load: each 640 MiB sliding ring (2048 rows) is committed only
+# while a request owns its slot (PLOW_VMM_LIVE_RINGS=1 under PLOW_VMM_PREFIX=1), full-attention rows
+# map in 2048-row blocks, and the mux admits by bytes (ring + admission margin + 16 KiB/row) under
+# PLOW_KV_MEM_UTIL. Measured: ~71-78 live at 4K, 64 at 15K; output tok/s within 10% of the 64-slot
+# packet (prefill-bound), not above it.
+# PLOW_PF_ATTN_GEMM=1: its full-context-for-every-slot gate can never pass at 128 slots and the native
+# FlashPrefill fallback cost 2.5x serving throughput at 4K.
 schema = "plow.recipe.v1"
 namespace = "infervisor"
 name = "gemma-4-12b"
-label = "sm90a-h100-tp1-fp8kv-16k-c128-rq1k-live"
+label = "sm90a-h100-tp1-fp8-16k-c128-rq1k-live"
 status = "emits"
-plow_git = "2f7ba443b2dc018952a049649a1e14ef5118deb7"
+plow_git = "9d67da85b9fa8c2cec1dfde12533a67f0ba469c2"
 network = "gemma4"
 
 [target]
@@ -32,7 +29,7 @@ source = "gemma-4-12b-it-fp8"
 layout = "plow-fp8-hub-rekey"
 
 [cell]
-name = "gemma4-12b.h100.fp8kv-16k-c128-rq1k-live"
+name = "gemma4-12b.h100.fp8-16k-c128-rq1k-live"
 model = "gemma-4-12b-it-fp8 (compressed-tensors, re-keyed)"
 revision = "local"
 hf_dir = "{env:GEMMA12B_CHECKPOINT}"
@@ -46,10 +43,9 @@ precision = "w8a8"
 args = ["--segmented"]
 [emit.env]
 PLOW_GLU_QUANT_FUSE = "1"
-NVCC_APPEND_FLAGS = "-DPLOW_NV_GLU_QUANT_CACHE=1 -DPLOW_NV_GLU_QUANT_WPR=1 -DPLOW_NV_LIGHT_FP8_ATTN=1 -DPLOW_FP8_LD16=1 -DPLOW_FP8_FAST=1"
+NVCC_APPEND_FLAGS = "-DPLOW_NV_GLU_QUANT_CACHE=1 -DPLOW_NV_GLU_QUANT_WPR=1"
 PLOW_FP8 = "1"
 PLOW_W8A8 = "1"
-PLOW_FP8_KV = "1"
 PLOW_EMIT_PACKED_PREFILL = "1"     # default-on only for BF16 Hopper; the roles need the metadata
 PLOW_SEG_PURE_GEMM = "fp8"
 PLOW_SEG_FA512 = "1"               # [FP8-TAX] GEMMA4_SEG_FA512_DEFAULT is bf16-gated
@@ -72,29 +68,34 @@ PLOW_FUSE_ARGMAX = "1"
 
 [objects]
 script = "scripts/build_sm90a_gemma4_segments.sh"
-role_files = []
+role_files = [
+  "interp_sm90a_pfattn_hd512_px4_bq64.cubin",
+  "interp_sm90a_pfattn_hd256_gqa2_bkv32.cubin",
+  "interp_sm90a_pfattn_hd256_bkv32.cubin",
+]
 [objects.env]
 PLOW_BUILD_FATLITE = "1"
 NVCC_APPEND_FLAGS = "-DPLOW_NV_GLU_QUANT_CACHE=1 -DPLOW_NV_GLU_QUANT_WPR=1"
 PLOW_BUILD_W8A8 = "1"
-PLOW_BUILD_FA_GQA2_PAIR = "0"
-PLOW_BUILD_PFATTN_HD256_BKV32 = "0"
-PLOW_BUILD_PFATTN_HD256_GQA2_BKV32 = "0"
-PLOW_BUILD_PFATTN_HD512_PX4_BQ64 = "0"
+PLOW_BUILD_FA_GQA2_PAIR = "1"
+PLOW_BUILD_PFATTN_HD256_BKV32 = "1"
+PLOW_BUILD_PFATTN_HD256_GQA2_BKV32 = "1"
+PLOW_BUILD_PFATTN_HD512_PX4_BQ64 = "1"
 
 [emit_roles.env]
 PLOW_GEMMA4_SM90_W8A8_GEMM_GLU_ROLE = "0"
-PLOW_GEMMA4_SM90_HD512_PX4_BQ64_ROLE = "0"
-PLOW_GEMMA4_SM90_HD256_GQA2_ROLE = "0"
+PLOW_GEMMA4_SM90_HD512_PX4_BQ64_ROLE = "1"
+PLOW_GEMMA4_SM90_HD256_GQA2_ROLE = "1"
 
 [serve.env]
 PLOW_PREFIX_CACHE = "1"
 PLOW_VMM_PREFIX = "1"
 PLOW_PF_SEG_PURE = "fp8"
 PLOW_PF_SEG_FA512 = "1"
-PLOW_PF_INTERLEAVE = "2048"
+PLOW_PF_INTERLEAVE = "0"
 PLOW_VMM_LIVE_RINGS = "1"
 PLOW_KV_MEM_UTIL = "0.9"
+PLOW_PF_ATTN_GEMM = "1"
 PLOW_MULTISTEP = "0"
 PLOW_DECODE_MAX_RUNG = "128"
 PLOW_TOKEN_BATCH = "1"
