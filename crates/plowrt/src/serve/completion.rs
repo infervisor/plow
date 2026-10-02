@@ -317,6 +317,7 @@ async fn completions_with(
         opts: crate::serve::mux::JobOpts {
             session,
             turn: run.key(),
+            continuing: run.continuing(),
             ..Default::default()
         },
     };

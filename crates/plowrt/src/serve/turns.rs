@@ -221,6 +221,8 @@ pub struct Joined {
     pub trace_id: u128,
     pub speech_end: Instant,
     pub budget: Duration,
+    /// The session had a turn before this request joined: it continues a session, not opens one.
+    pub continuing: bool,
 }
 
 impl TurnTable {
@@ -291,6 +293,7 @@ impl TurnTable {
         let e = self.entry(session).unwrap_or_else(|| SessionEntry { session: session.clone(), turns: Default::default() });
         let joined = {
             let mut st = e.turns.lock();
+            let continuing = !st.turns.is_empty();
             let new_turn = |id: Arc<str>, svid: i64| Turn {
                 id,
                 trace_id: trace.unwrap_or_else(|| minted::trace_id(svid)),
@@ -343,7 +346,7 @@ impl TurnTable {
                 t.playback = playback;
             }
             t.stages[kind.index()] = StageTiming { arrived: Some(at), ..Default::default() };
-            Joined { key: TurnKey { session: session.clone(), turn: id }, trace_id: t.trace_id, speech_end: t.speech_end, budget: t.budget }
+            Joined { key: TurnKey { session: session.clone(), turn: id }, trace_id: t.trace_id, speech_end: t.speech_end, budget: t.budget, continuing }
         };
         self.sessions.insert(e);
         joined
@@ -529,6 +532,10 @@ impl StageRun {
 
     pub fn key(&self) -> Option<TurnKey> {
         self.joined.as_ref().map(|j| j.key.clone())
+    }
+
+    pub fn continuing(&self) -> bool {
+        self.joined.as_ref().is_some_and(|j| j.continuing)
     }
 
     fn device_now(&self) -> u64 {

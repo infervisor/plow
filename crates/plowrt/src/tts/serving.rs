@@ -397,6 +397,7 @@ async fn speech_with(
         speech: None,
         session: ids.session.as_ref().and_then(|_| ids.ticket(crate::serve::session::row_keys(&prompt_ids, &[], &[]), report)),
         turn: ids.turn_key.clone(),
+        continuing: false,
     };
     let job = crate::serve::mux::Job { prompt_ids, gen, arrived: Instant::now(), respond: tx, opts };
     if let Err(err) = mux.submit_arrived(job, t_arrive, Some(mux.ingress())) {
