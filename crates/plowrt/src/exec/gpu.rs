@@ -633,21 +633,34 @@ fn kv_row_charge(
     batch: usize,
 ) -> Option<(u64, Option<u64>, u64)> {
     let vmm = vmm?;
-    let request_bytes = match &vmm.rings {
-        Some(rings) if vmm.kv.prefix_reuse() => Some(rings.slot_charge()),
-        Some(_) => None,
-        None => Some(0),
-    };
     // The budget is what is free AFTER the sliding rings were cudaMalloc'd, so a row may only be
     // charged for what will still be MAPPED for it: the full-attention head windows, a block at a
     // time. Charging every row the ring bytes as well (total KV / rows) cost Gemma-4-26B 122880
     // B/token against a real 20480, admitted ~10 of 16 requests at 4096 tokens, and the other 6
     // waited out a whole generation: TTFT 3-4.5 s at C16. With live rings every cache maps
     // lazily and the average stays the honest bound.
+    let geo = vmm.kv.geometry();
+    let per_token = geo.full_layers.len() as u64 * 2 * geo.kvh_full as u64 * geo.row_bytes();
+    let block_rows = vmm.kv.block_rows() as u64;
+    let request_bytes = match &vmm.rings {
+        // Prefix admission maps `max(block, widest prefill bucket)` rows past the request
+        // (`admit_packed_slot`); with the ring committed per request, charge both, so a budget
+        // capped by `PLOW_KV_MEM_UTIL` bounds what admission actually maps.
+        Some(rings) if vmm.kv.prefix_reuse() => {
+            let pf_rows = blob
+                .progs
+                .iter()
+                .filter(|g| g.role.is_prefill_side())
+                .map(|g| g.t as u64)
+                .max()
+                .unwrap_or(0);
+            let margin_blocks = pf_rows.max(block_rows).div_ceil(block_rows.max(1));
+            Some(rings.slot_charge() + margin_blocks * block_rows * per_token)
+        }
+        Some(_) => None,
+        None => Some(0),
+    };
     if let Some(request_bytes) = request_bytes {
-        let geo = vmm.kv.geometry();
-        let per_token = geo.full_layers.len() as u64 * 2 * geo.kvh_full as u64 * geo.row_bytes();
-        let block_rows = vmm.kv.block_rows() as u64;
         if per_token > 0 && block_rows > 0 {
             return Some((per_token, Some(block_rows), request_bytes));
         }
