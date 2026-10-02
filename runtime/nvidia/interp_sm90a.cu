@@ -48,6 +48,9 @@
 #define plow_sm120_light_head plow_sm90a_light_head
 #define plow_sm120_light_flash plow_sm90a_light_flash
 #define plow_sm120_light_pf plow_sm90a_light_pf
+#define plow_sm120_rider_flash256 plow_sm90a_rider_flash256
+#define plow_sm120_rider_flash512 plow_sm90a_rider_flash512
+#define plow_sm120_rider_merge plow_sm90a_rider_merge
 
 #include "interp_sm120.cu"
 

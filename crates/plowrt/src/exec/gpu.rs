@@ -76,6 +76,7 @@ pub mod packet_exec;
 mod moe_lt;
 mod native_decode;
 mod packed_terminal;
+mod riders;
 mod segment_gates;
 mod shared_tail;
 mod token_batch;
@@ -2442,6 +2443,10 @@ pub struct GpuEngine {
     attention_requests: Vec<attention_gemm::Request>,
     mixed_step: Option<mixed_step::MixedCudaStep>,
     token_batch: Option<token_batch::CudaTokenBatch>,
+    /// Split attention for decode rows riding a packed prefill launch (`riders.rs`).
+    riders: Option<riders::Riders>,
+    /// Leading single-row decode requests of the next packed body that ride it as riders.
+    pf_riders: usize,
     kv_admission: Option<crate::sched::admission::KvBudget>,
     /// Bytes of every batch-major `kv.*` tensor one cache row takes (static per-slot KV).
     kv_row_bytes: u64,
@@ -6326,6 +6331,8 @@ impl GpuEngine {
             attention_requests: Vec::new(),
             mixed_step,
             token_batch: None,
+            riders: None,
+            pf_riders: 0,
             kv_admission,
             kv_row_bytes: blob
                 .tensors
@@ -6341,6 +6348,9 @@ impl GpuEngine {
         engine.shared_tail =
             shared_tail::SharedTail::load(&engine, &blob, kv_shared_tail_metadata.as_ref())?;
         engine.token_batch = token_batch::CudaTokenBatch::load(&engine);
+        if engine.token_batch.is_some() {
+            engine.riders = riders::Riders::load(&engine, &blob)?;
+        }
         if config.token_batch {
             tracing::info!(
                 route = "unified-token-batch",
@@ -10275,6 +10285,21 @@ impl GpuEngine {
         // cuLaunchCooperativeKernel snapshots the param buffer at enqueue, so mutating
         // `arg.cur_seg` between launches is sound.
         let seg_class = self.prefill[bi].seg_class.clone();
+        // Rows armed by `Riders::arm` attend only through the segmented chains below.
+        let riding = self.riders.as_ref().is_some_and(|r| r.rows() > 0);
+        if riding
+            && (!self.prefill[bi].qwen_segments.is_empty()
+                || !uses_segmented_prefill(
+                    self.seg_pf.is_some(),
+                    false,
+                    seg_class.len(),
+                    &self.prefill[bi].packet_segment_roles,
+                ))
+        {
+            return Err(RuntimeError::Rejected(
+                "token-batch riders need a segmented prefill chain".into(),
+            ));
+        }
         // len 1 = a force_uniseg small bucket: ONE launch on the full fat _pf object beats
         // ~480 segment launches (T18) — take the single-launch path below.
         if !self.prefill[bi].qwen_segments.is_empty() {
@@ -10367,6 +10392,8 @@ impl GpuEngine {
                     vec![(window.start, window.end)]
                 } else if routed {
                     self.seg_graph_pieces(bi)
+                } else if riding {
+                    self.riders.as_ref().expect("riding").pieces(bi, seg_class.len())
                 } else {
                     vec![(0, seg_class.len())]
                 };
@@ -10377,6 +10404,10 @@ impl GpuEngine {
                     self.ensure_seg_graph(bi, &arg, start..end)?;
                     let graph = self.seg_graphs.get(&(bi, tensors, start, end)).expect("built");
                     self.be.graph_launch(graph, &self.stream)?;
+                    if riding {
+                        let riders = self.riders.as_ref().expect("riding");
+                        riders.launch_after(&self.be, bi, end, &self.stream)?;
+                    }
                     next = end;
                 }
                 let rest = next..seg_class.len();
@@ -10425,6 +10456,10 @@ impl GpuEngine {
             let mut evs: Vec<(usize, u8, CudaEvent, CudaEvent)> = Vec::new();
             let window = self.pf_seg_window.clone().unwrap_or(0..seg_class.len());
             for (seg, &cls) in seg_class.iter().enumerate() {
+                if riding {
+                    let riders = self.riders.as_ref().expect("riding");
+                    riders.launch_after(&self.be, bi, seg, &self.stream)?;
+                }
                 if !window.contains(&seg) {
                     continue;
                 }
@@ -10922,6 +10957,19 @@ impl GpuEngine {
         // Packed rows are contiguous from row 0, so the first `total` rows are the real ones.
         self.patch_moe_rows(bi, total as u32)?;
         let tc = self.prefill[bi].t as usize;
+        let riding = std::mem::take(&mut self.pf_riders);
+        let riding = if riding > 0
+            && riding < reqs.len()
+            && request_plan.is_some()
+            && !self.pf_seg_prefix
+            && self.riders.as_ref().is_some_and(|r| r.serves(bi))
+            && self.prefill[bi].attention_gemm_segments.iter().all(Option::is_none)
+            && reqs[..riding].iter().all(|r| r.tokens.len() == 1)
+        {
+            riding
+        } else {
+            0
+        };
 
         // Stage ids/pos/slot rows + the request table, then upload. `pf_batch`
         // is taken out for the duration so `self` stays borrowable.
@@ -10967,6 +11015,18 @@ impl GpuEngine {
                 self.pf_pos.copy_from_slice(&plan.positions);
                 pb.slot_buf.copy_from_slice(&plan.slots);
                 pb.req_buf.clone_from(&plan.table);
+                // Riders leave the prefill attention's request table; they attend in `riders`.
+                if riding > 0 {
+                    pb.req_buf.drain(1..1 + 4 * riding);
+                    pb.req_buf[0] -= riding as i32;
+                }
+            }
+            if let Some(riders) = self.riders.as_mut() {
+                riders.arm(
+                    &self.be,
+                    reqs[..riding].iter().map(|r| (r.slot, (r.c0 + 1) as u32)),
+                    &self.stream,
+                )?;
             }
             // SAFETY: pf_ids, pf_pos live on self past the stream_synchronize;
             // pb's Vec allocations are put back into self.pf_batch below before
@@ -11028,6 +11088,9 @@ impl GpuEngine {
         })();
         self.pf_batch = Some(pb);
         if let Err(error) = staged {
+            if let Some(riders) = self.riders.as_mut() {
+                riders.disarm();
+            }
             let _ = self.be.stream_synchronize(&self.stream);
             return Err(error);
         }
@@ -11067,6 +11130,9 @@ impl GpuEngine {
                     synchronize,
                 );
                 self.pf_seg_window = None;
+                if let Some(riders) = self.riders.as_mut() {
+                    riders.disarm();
+                }
                 chain
             } else {
                 let mut params = [&mut arg as *mut DevProgram as *mut std::ffi::c_void];
