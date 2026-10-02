@@ -8,14 +8,47 @@ use packet::dev::{DevInst, DevOp};
 use packet::devbuild::{Model, SectionData};
 use plow_asset::segment_roles::{
     AttentionCapability, GeneratedAbi, GENERATED_FIRST, GENERATED_FLASH_PREFILL_ABI,
+    GENERATED_FLASH_PREFILL_FP8KV_ABI,
 };
 use std::collections::BTreeSet;
 use std::path::Path;
+
+/// KV cache encoding an entry reads; part of the op signature (the packet op differs:
+/// `FlashPrefill` vs `FlashPrefillFp8`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum KvDtype {
+    Bf16,
+    /// OCP e4m3 with one f32 scale per (position, KV head) row.
+    Fp8,
+}
+
+impl KvDtype {
+    pub(crate) fn op(self) -> DevOp {
+        match self {
+            KvDtype::Bf16 => DevOp::FlashPrefill,
+            KvDtype::Fp8 => DevOp::FlashPrefillFp8,
+        }
+    }
+    fn abi_family(self) -> &'static str {
+        match self {
+            KvDtype::Bf16 => GENERATED_FLASH_PREFILL_ABI,
+            KvDtype::Fp8 => GENERATED_FLASH_PREFILL_FP8KV_ABI,
+        }
+    }
+    /// The object's `plow_gen_flash_prefill_abi`.
+    fn object_abi(self) -> u32 {
+        match self {
+            KvDtype::Bf16 => 1,
+            KvDtype::Fp8 => 2,
+        }
+    }
+}
 
 pub(crate) struct Entry {
     pub name: &'static str,
     pub role: u8,
     pub file: &'static str,
+    pub kv: KvDtype,
     /// Causal flash prefill over one head width.
     pub head_dim: u32,
     /// Sliding window (`FlashPrefill` i[5]); 0 = global attention, `ANY_SLIDING` = any nonzero
@@ -30,11 +63,12 @@ pub(crate) struct Entry {
 }
 
 /// Mirrors the build_catalog.py entries; a new entry takes the next generated role ID.
-pub(crate) const CATALOG: [Entry; 2] = [
+pub(crate) const CATALOG: [Entry; 3] = [
     Entry {
         name: "attn_pf_hd512",
         role: GENERATED_FIRST,
         file: "gen_sm90a_attn_pf_hd512.cubin",
+        kv: KvDtype::Bf16,
         head_dim: 512,
         window: 0,
         ring_kv: false,
@@ -45,11 +79,23 @@ pub(crate) const CATALOG: [Entry; 2] = [
         name: "attn_pf_hd256_sliding",
         role: GENERATED_FIRST + 1,
         file: "gen_sm90a_attn_pf_hd256_sliding.cubin",
+        kv: KvDtype::Bf16,
         head_dim: 256,
         window: ANY_SLIDING,
         ring_kv: true,
         pair_heads: true,
         min_rows: 1024,
+    },
+    Entry {
+        name: "attn_pf_hd256_sliding_fp8kv",
+        role: GENERATED_FIRST + 2,
+        file: "gen_sm90a_attn_pf_hd256_sliding_fp8kv.cubin",
+        kv: KvDtype::Fp8,
+        head_dim: 256,
+        window: ANY_SLIDING,
+        ring_kv: true,
+        pair_heads: true,
+        min_rows: 128,
     },
 ];
 
@@ -88,7 +134,7 @@ impl Entry {
     /// The packet op signature: causal one-split fused flash prefill at this head width and
     /// window. Heads, KV heads and the ring size are runtime operands.
     pub(crate) fn matches(&self, op: &DevInst) -> bool {
-        op.op == DevOp::FlashPrefill as u16
+        op.op == self.kv.op() as u16
             && op.i[6] == self.head_dim
             && heads_and_window_match(op, self.window, self.pair_heads)
             && op.i[7] == 1
@@ -113,7 +159,7 @@ impl Entry {
         if profile != "sm90a"
             || info.sm != 90
             || !info.entries.iter().any(|entry| entry == ENTRY_SYMBOL)
-            || global("plow_gen_flash_prefill_abi") != Some(1)
+            || global("plow_gen_flash_prefill_abi") != Some(self.kv.object_abi())
             || global("plow_attention_head_dim") != Some(self.head_dim)
             || global("plow_pf_request_abi") != Some(2)
         {
@@ -125,7 +171,7 @@ impl Entry {
         }
         attention_prefill_role::validate_hardware_resources(gpu, profile, block, warps, smem)?;
         let abi = GeneratedAbi {
-            family: GENERATED_FLASH_PREFILL_ABI.into(),
+            family: self.kv.abi_family().into(),
             entry: self.name.into(),
             block,
             smem,
@@ -148,6 +194,7 @@ impl Entry {
                 window: self.window,
                 ring_kv: self.ring_kv,
                 pair_heads: self.pair_heads,
+                kv: self.kv,
             },
         ))
     }
@@ -235,6 +282,25 @@ mod tests {
         op.i[2] = 8;
         op.i[7] = 2;
         assert!(!entry.matches(&op));
+    }
+
+    #[test]
+    fn kv_dtype_is_part_of_the_signature() {
+        let entry = |name| CATALOG.iter().find(|e| e.name == name).unwrap();
+        let (bf16, fp8) = (entry("attn_pf_hd256_sliding"), entry("attn_pf_hd256_sliding_fp8kv"));
+        let mut op = DevInst {
+            op: DevOp::FlashPrefill as u16,
+            ..Default::default()
+        };
+        op.i = [4096, 4096, 16, 8, 0, 1024, 256, 1];
+        op.j[1] = 2047;
+        assert!(bf16.matches(&op) && !fp8.matches(&op));
+        op.op = DevOp::FlashPrefillFp8 as u16;
+        assert!(!bf16.matches(&op) && fp8.matches(&op));
+        // No entry claims FP8-KV global attention.
+        op.i[5] = 0;
+        op.i[6] = 512;
+        assert!(CATALOG.iter().all(|e| !e.matches(&op)));
     }
 
     #[test]

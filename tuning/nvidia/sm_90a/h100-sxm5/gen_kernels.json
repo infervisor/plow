@@ -565,6 +565,211 @@
    },
    "spill_bytes": 0
   },
+  "attn_pf_hd256_sliding_fp8kv": {
+   "body_sha256": "cd4b3b046c16d6cdefeec17119e42669dc1b216bb5a2b2196fa298faef098351",
+   "classes": {
+    "h16kv8_w1024_rows1024": {
+     "best": {
+      "bn": 64,
+      "kstages": 2,
+      "preg": 72,
+      "vstages": 2
+     },
+     "measured": [
+      {
+       "config": {
+        "bn": 64,
+        "kstages": 2,
+        "preg": 64,
+        "vstages": 2
+       },
+       "floor_us": 8.7,
+       "rel_l2": 0.00231,
+       "tflops": 128,
+       "us": 67.0
+      },
+      {
+       "config": {
+        "bn": 64,
+        "kstages": 2,
+        "preg": 72,
+        "vstages": 2
+       },
+       "floor_us": 8.7,
+       "rel_l2": 0.00231,
+       "tflops": 134,
+       "us": 64.1
+      }
+     ]
+    },
+    "h16kv8_w1024_rows4096": {
+     "best": {
+      "bn": 64,
+      "kstages": 2,
+      "preg": 72,
+      "vstages": 2
+     },
+     "measured": [
+      {
+       "config": {
+        "bn": 64,
+        "kstages": 2,
+        "preg": 64,
+        "vstages": 2
+       },
+       "floor_us": 60.8,
+       "rel_l2": 0.00228,
+       "tflops": 241,
+       "us": 249.3
+      },
+      {
+       "config": {
+        "bn": 64,
+        "kstages": 2,
+        "preg": 72,
+        "vstages": 2
+       },
+       "floor_us": 60.8,
+       "rel_l2": 0.00228,
+       "tflops": 251,
+       "us": 240.0
+      }
+     ]
+    },
+    "h16kv8_w1024_rows8192": {
+     "best": {
+      "bn": 64,
+      "kstages": 2,
+      "preg": 72,
+      "vstages": 2
+     },
+     "measured": [
+      {
+       "config": {
+        "bn": 64,
+        "kstages": 2,
+        "preg": 64,
+        "vstages": 2
+       },
+       "floor_us": 130.3,
+       "rel_l2": 0.00231,
+       "tflops": 265,
+       "us": 485.8
+      },
+      {
+       "config": {
+        "bn": 64,
+        "kstages": 2,
+        "preg": 72,
+        "vstages": 2
+       },
+       "floor_us": 130.3,
+       "rel_l2": 0.00231,
+       "tflops": 277,
+       "us": 465.9
+      }
+     ]
+    },
+    "h8kv2_w512_rows1000": {
+     "best": {
+      "bn": 64,
+      "kstages": 2,
+      "preg": 72,
+      "vstages": 2
+     },
+     "measured": [
+      {
+       "config": {
+        "bn": 64,
+        "kstages": 2,
+        "preg": 64,
+        "vstages": 2
+       },
+       "floor_us": 3.2,
+       "rel_l2": 0.00221,
+       "tflops": 75,
+       "us": 41.4
+      },
+      {
+       "config": {
+        "bn": 64,
+        "kstages": 2,
+        "preg": 72,
+        "vstages": 2
+       },
+       "floor_us": 3.2,
+       "rel_l2": 0.00221,
+       "tflops": 78,
+       "us": 40.1
+      }
+     ]
+    },
+    "h8kv2_w512_rows2000": {
+     "best": {
+      "bn": 64,
+      "kstages": 2,
+      "preg": 64,
+      "vstages": 2
+     },
+     "measured": [
+      {
+       "config": {
+        "bn": 64,
+        "kstages": 2,
+        "preg": 64,
+        "vstages": 2
+       },
+       "floor_us": 7.4,
+       "rel_l2": 0.00239,
+       "tflops": 164,
+       "us": 44.5
+      },
+      {
+       "config": {
+        "bn": 64,
+        "kstages": 2,
+        "preg": 72,
+        "vstages": 2
+       },
+       "floor_us": 7.4,
+       "rel_l2": 0.00239,
+       "tflops": 164,
+       "us": 44.6
+      }
+     ]
+    }
+   },
+   "config": {
+    "bn": 64,
+    "kstages": 2,
+    "preg": 72,
+    "vstages": 2
+   },
+   "object": "gen_sm90a_attn_pf_hd256_sliding_fp8kv.cubin",
+   "packed_check": {
+    "finite": true,
+    "rel_l2": 0.00233,
+    "tail_zero": true
+   },
+   "selection": "min total us over classes",
+   "signature": {
+    "arch": "sm_90a",
+    "dtype": "bf16",
+    "gqa": [
+     2,
+     16
+    ],
+    "gqa_even": true,
+    "head_dim": 256,
+    "kv_dtype": "fp8_e4m3_rowscale",
+    "mask": "causal",
+    "op": "flash_prefill",
+    "ring_kv": true,
+    "window": 1024,
+    "window_any": true
+   },
+   "spill_bytes": 0
+  },
   "attn_pf_hd512": {
    "body_sha256": "991550c75afe635f191c81d0c95bc2444a8958d74a429adf7f4c59cc5f77ccd0",
    "classes": {

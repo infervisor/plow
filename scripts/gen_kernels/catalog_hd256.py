@@ -24,4 +24,15 @@ ENTRIES = {
         "tune": _mod.tune_row,
         "classes": [(h, kv, rows) for h, kv, w, rows in _mod.CLASSES if w == 1024],
     },
+    # The FlashPrefillFp8 twin: e4m3 K/V with one f32 scale per (position, KV head) row
+    # (crates/devgen/src/gen_kernels.rs KvDtype::Fp8). Same schedule; no tensor maps.
+    "attn_pf_hd256_sliding_fp8kv": {
+        "signature": {"op": "flash_prefill", "head_dim": 256, "mask": "causal", "window": 1024,
+                      "window_any": True, "gqa": [2, 16], "gqa_even": True, "ring_kv": True,
+                      "dtype": "bf16", "kv_dtype": "fp8_e4m3_rowscale", "arch": "sm_90a"},
+        "object": "gen_sm90a_attn_pf_hd256_sliding_fp8kv.cubin",
+        "build": lambda cfg, out: _mod.catalog_build(cfg, out, fp8=True),
+        "tune": lambda: _mod.tune_row(fp8=True),
+        "classes": [(h, kv, rows) for h, kv, w, rows in _mod.CLASSES if w == 1024],
+    },
 }

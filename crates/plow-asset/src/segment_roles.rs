@@ -40,6 +40,10 @@ pub fn is_generated(role: u8) -> bool {
 /// ABI of a generated flash-prefill role object: one persistent CTA per packet block, a
 /// host-marshaled direct entry plus the packet entry, packed requests, successor counters.
 pub const GENERATED_FLASH_PREFILL_ABI: &str = "gen_flash_prefill_v1";
+/// The FP8-KV twin (`FlashPrefillFp8`: e4m3 K/V, one f32 scale per row): the same direct ABI
+/// with the k/v scale vectors in the partial-output slots, and the packed request table taken
+/// from the op's i[4] handle.
+pub const GENERATED_FLASH_PREFILL_FP8KV_ABI: &str = "gen_flash_prefill_fp8kv_v1";
 
 /// `<family>:<catalog entry>:block=<threads>:smem=<dynamic bytes>`; the grid is the packet grid.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -62,7 +66,8 @@ impl GeneratedAbi {
                 .bytes()
                 .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_');
         (parts.next().is_none()
-            && family == GENERATED_FLASH_PREFILL_ABI
+            && (family == GENERATED_FLASH_PREFILL_ABI
+                || family == GENERATED_FLASH_PREFILL_FP8KV_ABI)
             && valid_entry
             && block > 0
             && block % 32 == 0
@@ -71,6 +76,10 @@ impl GeneratedAbi {
     }
     pub fn format(&self) -> String {
         format!("{}:{}:block={}:smem={}", self.family, self.entry, self.block, self.smem)
+    }
+    /// Whether the object reads an e4m3 KV cache (`FlashPrefillFp8`).
+    pub fn fp8_kv(&self) -> bool {
+        self.family == GENERATED_FLASH_PREFILL_FP8KV_ABI
     }
 }
 
@@ -697,6 +706,14 @@ mod tests {
         SegmentRoles::from_bytes(raw.as_bytes()).unwrap();
         let last = raw.replace("\"18\"", "\"25\"").replace("0,18,0", "0,25,0");
         SegmentRoles::from_bytes(last.as_bytes()).unwrap();
+        let fp8 = raw.replace(GENERATED_FLASH_PREFILL_ABI, GENERATED_FLASH_PREFILL_FP8KV_ABI);
+        SegmentRoles::from_bytes(fp8.as_bytes()).unwrap();
+        let fp8_abi = GeneratedAbi {
+            family: GENERATED_FLASH_PREFILL_FP8KV_ABI.into(),
+            ..abi.clone()
+        };
+        assert!(GeneratedAbi::parse(&fp8_abi.format()).is_some_and(|abi| abi.fp8_kv()));
+        assert!(!abi.fp8_kv());
         for bad in [
             raw.replace(&"a".repeat(64), "bad"),
             raw.replace("\"warps\":8", "\"warps\":4"),
