@@ -60,8 +60,9 @@ clap = { version = "4", features = ["derive", "env"] }
 futures = "0.3"
 hound = "3.5"
 rustfft = "6"
-# Ids the server mints (request, session, turn, span; `serve::session`): sortable 64-bit, tagged.
-svid = { version = "0.5.4", default-features = false, features = ["bits-high-rand"] }
+# Ids the server mints (request, session, turn; `serve::session`): sortable 64-bit, tagged; W3C
+# traceparent parsing and span ids. Not `monotonic`: minted session ids must not be guessable.
+svid = { version = "0.6.0", default-features = false, features = ["bits-high-rand"] }
 # The voice turn table (`serve::turns`): TTL + size-bounded concurrent cache.
 svcache = "0.1.1"
 # The random half of a minted W3C trace id; already in the lock through svid.

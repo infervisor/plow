@@ -37,23 +37,8 @@ pub struct TraceParent {
 impl TraceParent {
     /// `version-traceid-parentid-flags`, lowercase hex. Invalid → `None` (W3C: restart the trace).
     pub fn parse(value: &str) -> Option<Self> {
-        let v = value.trim();
-        let b = v.as_bytes();
-        let hex = |s: &str| s.bytes().all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c));
-        if b.len() < 55 || b[2] != b'-' || b[35] != b'-' || b[52] != b'-' || !hex(&v[..2]) || &v[..2] == "ff" {
-            return None;
-        }
-        // Version 00 is exactly 55 bytes; a later version may append fields after a '-'.
-        if (&v[..2] == "00" && b.len() != 55) || (b.len() > 55 && b[55] != b'-') {
-            return None;
-        }
-        let (t, p, f) = (&v[3..35], &v[36..52], &v[53..55]);
-        if !(hex(t) && hex(p) && hex(f)) {
-            return None;
-        }
-        let trace_id = u128::from_str_radix(t, 16).ok().filter(|&x| x != 0)?;
-        let parent = u64::from_str_radix(p, 16).ok().filter(|&x| x != 0)?;
-        Some(Self { trace_id, parent, flags: u8::from_str_radix(f, 16).ok()? })
+        let tc = svid::TraceContext::parse(value.trim()).ok()?;
+        Some(Self { trace_id: tc.trace_id.as_u128(), parent: tc.parent_id.as_u64(), flags: tc.flags })
     }
 
     /// OpenRouter's body `trace` object: `trace_id` (32 hex) and `parent_span_id` (16 hex).
@@ -340,7 +325,6 @@ pub mod minted {
         RequestId = 1,
         SessionId = 2,
         TurnId = 3,
-        SpanId = 4,
     }
 
     fn registry() -> &'static IdRegistry {
@@ -362,9 +346,9 @@ pub mod minted {
         (id.to_i64(), id.to_str())
     }
 
-    /// A W3C span id: the svid's 64 bits (never zero).
+    /// A W3C span id: 64 CSPRNG bits, never zero.
     pub fn span() -> u64 {
-        registry().span_id.generate_id().to_i64() as u64
+        svid::SpanId64::generate().as_u64()
     }
 
     /// A W3C trace id: a turn svid (sorts by time) over 64 CSPRNG bits.

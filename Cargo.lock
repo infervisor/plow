@@ -3847,9 +3847,9 @@ dependencies = [
 
 [[package]]
 name = "svid"
-version = "0.5.4"
+version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "323c8ade71acc875bba34e9e752474aff4ca5a0da29c005cd4de27ae5a28c863"
+checksum = "ce5097fd45d32719639da29be988cf139b3bb5f36250646b571b3b1f3e1254a1"
 dependencies = [
  "bs58",
  "getrandom 0.3.4",
@@ -3861,9 +3861,9 @@ dependencies = [
 
 [[package]]
 name = "svid-macros"
-version = "0.5.4"
+version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bd80cc7c1cfd5352777fdcaed8b8ad893738072b96f0ccc682b9bdc834380fcd"
+checksum = "3bba4ea70934dbd994294c280256911b4180aeeb1e46f9f94da2e868ee833c0c"
 dependencies = [
  "heck 0.5.0",
  "proc-macro2",
