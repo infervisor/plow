@@ -68,8 +68,9 @@ fn band(d: &DevInst64, slot: usize) -> Option<Band> {
             .then_some(Band { stride, lo: offset, hi })
     };
     match (DevOp::from_u16(d.op)?, slot) {
-        // out[b*j1 + r*i5 + i6 + c], x[b*j0 + r*i3 + i4 + c], c < i2.
-        (DevOp::CopyColsF32, 0) => make(d.i[5], d.i[6], d.i[2], d.fj[2]),
+        // out[b*j1 + r*i5 + i6 + c], x[b*j0 + r*i3 + i4 + c], c < i2 (the prefix format, i7
+        // bit 0, writes whole item blocks).
+        (DevOp::CopyColsF32, 0) if d.i[7] & 1 == 0 => make(d.i[5], d.i[6], d.i[2], d.fj[2]),
         (DevOp::CopyColsF32, 1) => make(d.i[3], d.i[4], d.i[2], d.fj[1]),
         // out[r*(j0 or width) + j1 + c], c < width.
         (DevOp::GatherRowsF32, 0) => {

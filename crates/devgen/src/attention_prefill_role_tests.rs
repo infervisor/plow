@@ -712,3 +712,56 @@ fn hd256_gqa2_wide_admits_only_whole_tile_rungs_above_4096() {
         assert!(!gqa2_rung(rows, true));
     }
 }
+
+#[test]
+fn generated_entry_binds_matching_wide_rungs_and_leaves_short_ones() {
+    let directory = output_dir("generated");
+    let output = directory.join("model.pkt");
+    let globals = [
+        ("plow_gen_flash_prefill_abi", 1),
+        ("plow_gen_block", 256),
+        ("plow_gen_arena_bytes", 206_848),
+        ("plow_attention_head_dim", 512),
+        ("plow_attention_query_tile", 64),
+        ("plow_attention_kv_tile", 64),
+        ("plow_attention_warps", 8),
+        ("plow_pf_request_abi", 2),
+    ];
+    let image =
+        plow_asset::cubin::synthetic_elf(crate::gen_kernels::ENTRY_SYMBOL, &globals, 90);
+    std::fs::write(directory.join(crate::gen_kernels::CATALOG[0].file), image).unwrap();
+    let wide = |rows: u32| {
+        let mut model = fixture(512, false, true);
+        model.prog_t[0] = rows;
+        let flash = &mut model.progs[0].insts[1];
+        flash.i[0] = rows;
+        flash.i[1] = rows;
+        flash.i[2] = 16;
+        flash.i[3] = 1;
+        model.tensors[flash.t[5] as usize].bytes = u64::from(rows) * 16 * 512 * 2;
+        model
+    };
+    let apply = |model: &mut Model, sections: &mut Vec<SectionData>, px4: bool| {
+        crate::gen_kernels::apply_output_objects(
+            model, sections, "sm_90a", &output, "h100", true, "attn_pf_hd512", px4,
+        )
+    };
+    let mut model = wide(4096);
+    let mut sections = Vec::new();
+    apply(&mut model, &mut sections, false).unwrap();
+    let roles = SegmentRoles::from_bytes(&sections[0].data).unwrap();
+    assert_eq!(roles.programs[0].roles, [0, 18, 0]);
+    let object = &roles.objects[&18];
+    let abi = plow_asset::segment_roles::GeneratedAbi::parse(&object.abi).unwrap();
+    assert_eq!((abi.entry.as_str(), abi.block, abi.smem), ("attn_pf_hd512", 256, 206_848));
+    assert_eq!(object.attention.as_ref().unwrap().kv_tile, 64);
+    // The hand-written HD512 role sees no program left to bind.
+    assert!(!apply_output_object(
+        &mut model, &mut sections, "sm90a", &output, "h100", 8192, true, None, false, false,
+    )
+    .unwrap());
+    // Below the smallest tuned shape class, and against the px4 role, nothing is bound.
+    assert!(apply(&mut wide(512), &mut Vec::new(), false).is_err());
+    assert!(apply(&mut wide(4096), &mut Vec::new(), true).is_err());
+    std::fs::remove_dir_all(directory).unwrap();
+}

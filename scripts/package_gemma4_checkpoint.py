@@ -86,7 +86,6 @@ export PLOW_PREFIX_CACHE=1
 export PLOW_VMM_LIVE=0
 export PLOW_VMM_LIVE_RINGS=0
 export PLOW_VMM_CACHE_MIB=4096
-export PLOW_PF_BATCH=0
 export PLOW_MULTISTEP=0
 export PLOW_TOKEN_BATCH=1
 exec "$checkpoint_root/lib/ld-linux-x86-64.so.2" \\

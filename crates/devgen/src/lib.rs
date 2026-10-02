@@ -51,6 +51,7 @@ pub mod cost_inputs;
 pub mod gemm_policy;
 use checkpoint::{layer_scalars, validate_coverage};
 mod attention_prefill_role;
+mod gen_kernels;
 mod gemma4_gemm_glu_role;
 mod gemma4_w8a8_gemm_glu_role;
 mod w8a16_prefill_role;
@@ -10404,6 +10405,19 @@ fn emit_dense_gqa(
         .unwrap_or_else(|error| panic!("native W8A16 M1 object: {error}"));
     }
     let tunedb_root = ecfg.tunedb_root();
+    if let Some(list) = ecfg.gen_kernels.as_deref() {
+        gen_kernels::apply_output_objects(
+            &mut m,
+            &mut sections,
+            &arch,
+            std::path::Path::new(&out),
+            &gpu,
+            packed_prefill_emitted,
+            list,
+            ecfg.gemma4_sm90_hd512_px4_bq64_role,
+        )
+        .unwrap_or_else(|error| panic!("generated kernels: {error}"));
+    }
     attention_prefill_role::apply_output_object(
         &mut m,
         &mut sections,
@@ -10580,7 +10594,7 @@ fn emit_dense_gqa(
     }
     if let Some(dir) = ecfg.tts_vocoder.as_deref().filter(|_| !block_mode) {
         let sites = whole_graph_audio_sites().1;
-        let (model, section) = s3gen::lower_s3gen(dir, n_cu, m.target, sites).unwrap_or_else(|error| panic!("s3gen packet: {error}"));
+        let (model, section) = s3gen::lower_s3gen(dir, n_cu, m.target, sites, ecfg.s3gen_attn_h16).unwrap_or_else(|error| panic!("s3gen packet: {error}"));
         let path = std::path::Path::new(&out).with_file_name(s3gen::PACKET);
         write_sidecar_packet(&path, &model, &[section]);
         eprintln!("  s3gen packet -> {}", path.display());

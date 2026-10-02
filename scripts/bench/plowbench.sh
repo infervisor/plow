@@ -61,7 +61,7 @@ glm_lt_gfx942.elf"
 PB_HAZARD_ENV="PLOW_PREFILL_SEG_TIMING:disables segment-major, ~3.7x inflation, not a latency number
 PLOW_TUNEDB:selects measured GEMM tiles; measured tiles are SLOWER at every rung (5-8 ms)
 PLOW_HSACO_LOWRUNG:swaps in a different object tier for the narrow rungs
-PLOW_AMD_DECODE_MIN_RUNG:changes which decode program runs; default 8 is the measured optimum
+PLOW_DECODE_MIN_RUNG:changes which decode program runs; default 8 is the measured optimum
 PLOW_GLM_ROWBAND:the row-band serve gate; arms must agree on it
 PLOW_TICK_LOG:adds per-tick logging; fine for instrumented arms, not for a clean number"
 

@@ -74,6 +74,8 @@ PLOW_FUSE_KV_HNR = "1"
 # tuning (gemv_k8 + L2 prefetch, tensor-core decode scores, classic B=1 GEMVs below K 3840).
 PLOW_EMIT_PACKED_PREFILL_SMALL_HD = "1"
 PLOW_NV_DENSE_TUNE = "1"
+# S3Gen cached attention on 3xFP16 with pre-formatted voice caches (sm_90 speech object).
+PLOW_EMIT_S3GEN_ATTN_H16 = "1"
 
 [bench]
 kind = "speech"

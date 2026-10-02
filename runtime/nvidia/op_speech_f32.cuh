@@ -2265,7 +2265,20 @@ static __device__ __noinline__ void d_gather_rows_f32(const PlowDevInst* in, voi
 }
 
 /* CopyColsF32 (196). */
+#if defined(PLOW_NV_HOPPER)
+static __device__ __noinline__ void d_prefix_format_h16(const PlowDevInst* in, void* const* T, unsigned slice,
+                                                        unsigned nblk);
+#endif
 static __device__ __noinline__ void d_copy_cols_f32(const PlowDevInst* in, void* const* T, unsigned slice, unsigned nblk) {
+    /* i7 bit 0: format an attention prefix for sp_attention_h16 */
+    if (in->i[7] & 1u) {
+#if defined(PLOW_NV_HOPPER)
+        d_prefix_format_h16(in, T, slice, nblk);
+#else
+        __trap();
+#endif
+        return;
+    }
     float* out = (float*)SP_TEN(0);
     const float* x = (const float*)SP_TEN(1);
     const unsigned items = in->i[0], rows = in->i[1], cols = in->i[2];
@@ -4049,9 +4062,418 @@ static __device__ __noinline__ void sp_attention_tc64p(const PlowDevInst* in, vo
     }
 }
 
+#if defined(PLOW_NV_HOPPER)
+/* ---- AttentionF32 with a pre-formatted key prefix (flags bit 4, sm_90): 3xFP16 ----
+ * Operands are split hi/lo in fp16 (11 + 11 significant bits, as 3xTF32) for m16n8k16 MMAs, which
+ * run at twice the tf32 rate. Each K row, each 16-key x 8-column V block and each Q row is scaled
+ * by a power of two that puts its max |x| in [128, 256), so lo stays a normal fp16 where it
+ * matters; the scales come back out exactly (scores per row and key, P.V per tile and column
+ * block). P (<= 256 under the lazy rescale below) is split unscaled.
+ * K/V go through a ring of SPH_NS stages of SPH_KT keys per head, in MMA-fragment order:
+ *   K: (8-key block j, 16-column block cb) -> uint4 {b0 hi, b1 hi, b0 lo, b1 lo} per lane, lane
+ *      slot ^ cb;
+ *   V: 8-column block n -> uint4 {b0 hi, b0 lo, b1 hi, b1 lo} per lane, lane slot ^ (n & 1) * 4;
+ *   then SPH_KT key inverse scales and 8 V-block inverse scales: SPH_XS floats per head.
+ * The prefix (t6) is already in that layout ([block][head][tile][SPH_XS], rows past i7 zero; the
+ * CopyColsF32 format mode writes it) and lands by one bulk copy per head; the item's own keys start
+ * at the next tile and are split here, each thread staging the next tile's share from registers
+ * loaded an iteration earlier. Stage handoffs are mbarriers (one arrival per warp), so warps drift
+ * apart instead of meeting at a block barrier every tile. One block per run of 8 16-row query
+ * tiles of an item (at most SPH_HS heads); requires >= 4 tiles per head (devgen). */
+#define SPH_KT 16
+#define SPH_NS 3
+#define SPH_XS (2 * SPH_KT * 64 + SPH_KT + 8)
+static_assert(SPH_NS * 3 * SPH_XS + 4 * SPH_NS <= SP_ARENA_FLOATS, "h16 attention stages");
+__device__ __forceinline__ void sp_mma_f16(float (&d)[4], const unsigned (&a)[4], unsigned b0, unsigned b1) {
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, "
+                 "{%0,%1,%2,%3};\n"
+                 : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+}
+/* d = a.b (zero accumulator) */
+__device__ __forceinline__ void sp_mma_f16_z(float (&d)[4], const unsigned (&a)[4], unsigned b0, unsigned b1) {
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, "
+                 "{%10,%10,%10,%10};\n"
+                 : "=f"(d[0]), "=f"(d[1]), "=f"(d[2]), "=f"(d[3])
+                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1), "f"(0.f));
+}
+/* (x0, x1) -> fp16x2 hi and lo, x = hi + lo to 22 bits. */
+__device__ __forceinline__ void sp_split_h2(float x0, float x1, unsigned& hi, unsigned& lo) {
+    const __half2 h = __floats2half2_rn(x0, x1);
+    const float2 hf = __half22float2(h);
+    const __half2 l = __floats2half2_rn(x0 - hf.x, x1 - hf.y);
+    hi = *(const unsigned*)&h;
+    lo = *(const unsigned*)&l;
+}
+/* 2^(7 - e) for max |x| = m of exponent e (1 for m == 0): the scaled max lies in [128, 256). */
+__device__ __forceinline__ float sp_pow2_scale(float m) {
+    const int e = (int)((__float_as_uint(m) >> 23) & 0xffu) - 127;
+    return m == 0.f ? 1.f : __uint_as_float((unsigned)(127 + 7 - max(min(e, 100), -100)) << 23);
+}
+/* Splits and stores one 16-float group of a head's stage (Xh). w < SPH_KT * 4: K row w / 4,
+ * columns 16 * (w % 4)..; else V half-group v = w - SPH_KT * 4: keys 2t, 2t + 1 (+ 8 * (v % 2)),
+ * t = (v / 2) % 4, of column block n = v / 8. The K row's 4 lanes and the V block's 8 lanes are
+ * consecutive lanes of one warp (they agree on the scale). */
+template <typename F>
+__device__ __forceinline__ void sp_h16_store_group(F* Xh, unsigned w, const float (&x)[16]) {
+    float m = 0.f;
+#pragma unroll
+    for (int q = 0; q < 16; q++) m = fmaxf(m, fabsf(x[q]));
+    if (w < SPH_KT * 4) {
+        m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, 1));
+        m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, 2));
+        const float f = sp_pow2_scale(m);
+        const unsigned rr = w / 4, cb = w % 4, j = rr / 8, gg = rr % 8;
+        uint4* d = (uint4*)Xh + (j * 4 + cb) * 32;
+#pragma unroll
+        for (int q = 0; q < 4; q++) {
+            /* lane (gg, q): columns 2q, 2q + 1 (b0) and 2q + 8, 2q + 9 (b1) */
+            unsigned h0, l0, h1, l1;
+            sp_split_h2(x[2 * q] * f, x[2 * q + 1] * f, h0, l0);
+            sp_split_h2(x[2 * q + 8] * f, x[2 * q + 9] * f, h1, l1);
+            d[(gg * 4 + q) ^ cb] = make_uint4(h0, h1, l0, l1);
+        }
+        if (cb == 0) Xh[2 * SPH_KT * 64 + rr] = 1.f / f;
+    } else {
+        const unsigned v = w - SPH_KT * 4, half = v % 2, tt = (v / 2) % 4, n = v / 8;
+        m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, 1));
+        m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, 2));
+        m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, 4));
+        const float f = sp_pow2_scale(m);
+        unsigned* d = (unsigned*)Xh + SPH_KT * 64 + n * 32 * 4;
+#pragma unroll
+        for (int q = 0; q < 8; q++) {
+            /* lane (q, tt): keys 2tt, 2tt + 1 (+ 8 * half) of column n * 8 + q */
+            unsigned h, l;
+            sp_split_h2(x[q] * f, x[8 + q] * f, h, l);
+            *(uint2*)(d + ((q * 4 + tt) ^ ((n & 1u) << 2)) * 4 + half * 2) = make_uint2(h, l);
+        }
+        if (half == 0 && tt == 0) Xh[2 * SPH_KT * 64 + SPH_KT + n] = 1.f / f;
+    }
+}
+
+/* CopyColsF32 format mode (i7 bit 0): items x rows x (K | V) columns, heads = cols / 128, into
+ * the prefix layout above: item i's block at out + i * fj2 + i6, [head][tile][SPH_XS]. */
+static __device__ __noinline__ void d_prefix_format_h16(const PlowDevInst* in, void* const* T, unsigned slice,
+                                                        unsigned nblk) {
+    float* out = (float*)SP_TEN(0);
+    const float* x = (const float*)SP_TEN(1);
+    const unsigned items = in->i[0], rows = in->i[1], heads = in->i[2] / 128u, width = heads * 64u;
+    const unsigned npt = (rows + SPH_KT - 1) / SPH_KT, units = items * heads * npt;
+    const unsigned w = threadIdx.x % 128u;
+    /* two units per pass, one per 128-thread half */
+    for (unsigned u = slice * 2u + threadIdx.x / 128u; u < units; u += nblk * 2u) {
+        const unsigned pt = u % npt, hh = (u / npt) % heads, item = u / (npt * heads), k0 = pt * SPH_KT;
+        const float* src = x + (size_t)item * in->fj[1].u + in->i[4] + hh * 64u;
+        float v[16];
+#pragma unroll
+        for (int q = 0; q < 16; q++) v[q] = 0.f;
+        if (w < SPH_KT * 4) {
+            const unsigned kj = k0 + w / 4;
+            if (kj < rows)
+#pragma unroll
+                for (int q = 0; q < 16; q++) v[q] = src[(size_t)kj * in->i[3] + (w % 4) * 16 + q];
+        } else {
+            const unsigned vv = w - SPH_KT * 4, half = vv % 2, tt = (vv / 2) % 4, n = vv / 8;
+#pragma unroll
+            for (int s2 = 0; s2 < 2; s2++) {
+                const unsigned kj = k0 + half * 8 + 2 * tt + s2;
+                if (kj < rows)
+#pragma unroll
+                    for (int q = 0; q < 8; q++) v[s2 * 8 + q] = src[(size_t)kj * in->i[3] + width + n * 8 + q];
+            }
+        }
+        sp_h16_store_group(out + (size_t)item * in->fj[2].u + in->i[6] + ((size_t)hh * npt + pt) * SPH_XS, w, v);
+    }
+}
+
+template <int HS>
+static __device__ __noinline__ void sp_attention_h16(const PlowDevInst* in, void* const* T, unsigned slice,
+                                                     unsigned nblk) {
+    float* const arena = sp_smem;
+    constexpr int KT = SPH_KT, NS = SPH_NS, HW = 64, NJ = KT / 8, XS = SPH_XS, KW = KT * 64;
+    constexpr int GH = KT * 8, G = HS * GH; /* 16-float staging groups per head, per stage */
+    constexpr int GI = (G + PLOW_NV_THREADS - 1) / PLOW_NV_THREADS;
+    uint64_t* full = (uint64_t*)(arena + ((NS * HS * XS + 1) & ~1));
+    uint64_t* empty = full + NS;
+    float* out = (float*)SP_TEN(0);
+    const float* query = (const float*)SP_TEN(1);
+    const float* key = (const float*)SP_TEN(2);
+    const float* value = (const float*)SP_TEN(3);
+    const unsigned* lengths = (const unsigned*)SP_TEN(4);
+    const float* pfmt = (const float*)SP_TEN(6);
+    const unsigned* pidx = (const unsigned*)SP_TEN(7);
+    const unsigned batch = in->i[0], q_rows = in->i[1], kv_rows = in->i[2], heads = in->i[3], pre = in->i[7];
+    const unsigned width = heads * HW, stride = in->i[5] ? in->i[5] : width;
+    const unsigned k_col0 = in->fj[1].u, v_col0 = in->fj[2].u;
+    const float scale = in->fj[0].f * 1.4426950408889634f;
+    const unsigned tid = threadIdx.x, lane = tid & 31u, warp = tid >> 5, g = lane >> 2, t = lane & 3u;
+    const unsigned n16 = (q_rows + 15u) / 16u, tiles = heads * n16, runs = (tiles + 7u) / 8u;
+    /* key position: prefix rows below kpre (valid below pre), then own row kpos - kpre */
+    const unsigned npt = (pre + KT - 1) / KT, kpre = npt * KT;
+    if (tid == 0)
+        for (int s = 0; s < NS; s++) {
+            sm90_mbar_init(full + s, PLOW_NV_WARPS);
+            sm90_mbar_init(empty + s, PLOW_NV_WARPS);
+        }
+    __syncthreads();
+    unsigned c = 0; /* ring position of the item's tile 0 */
+    for (unsigned item = slice; item < batch * runs; item += nblk) {
+        const unsigned b = item / runs, u0 = (item % runs) * 8u, u = u0 + warp;
+        const bool live = u < tiles;
+        const unsigned h0 = u0 / n16, nh = min(u0 + 7u, tiles - 1u) / n16 - h0 + 1u;
+        const unsigned h = live ? u / n16 : h0, q0 = live ? (u % n16) * 16u : 0u;
+        const unsigned klen = lengths && lengths[b] < pre + kv_rows ? lengths[b] : pre + kv_rows;
+        const unsigned own = klen > pre ? klen - pre : 0u, nkt = (kpre + own + KT - 1) / KT;
+        const unsigned ra = q0 + g, rb = ra + 8u;
+        auto load = [&](unsigned kt, float4 (&xr)[GI][4]) {
+            if (kt < npt) return;
+            const unsigned o0 = (kt - npt) * KT;
+#pragma unroll
+            for (int i = 0; i < GI; i++) {
+                const unsigned e = tid + i * PLOW_NV_THREADS, hs = e / GH, w = e % GH;
+#pragma unroll
+                for (int q = 0; q < 4; q++) xr[i][q] = make_float4(0.f, 0.f, 0.f, 0.f);
+                if (e >= G || hs >= nh) continue;
+                const size_t base = (size_t)b * kv_rows * stride + (h0 + hs) * HW;
+                if (w < KT * 4) {
+                    const unsigned r = o0 + w / 4;
+                    if (r < own) {
+                        const float* p = key + base + (size_t)r * stride + k_col0 + (w % 4) * 16;
+#pragma unroll
+                        for (int q = 0; q < 4; q++) xr[i][q] = __ldg((const float4*)(p + 4 * q));
+                    }
+                } else {
+                    const unsigned v = w - KT * 4, half = v % 2, tt = (v / 2) % 4, n = v / 8;
+#pragma unroll
+                    for (int s2 = 0; s2 < 2; s2++) {
+                        const unsigned r = o0 + half * 8 + 2 * tt + s2;
+                        if (r < own) {
+                            const float* p = value + base + (size_t)r * stride + v_col0 + n * 8;
+                            xr[i][2 * s2] = __ldg((const float4*)p);
+                            xr[i][2 * s2 + 1] = __ldg((const float4*)(p + 4));
+                        }
+                    }
+                }
+            }
+        };
+        /* Stage tile r - c at ring position r once its previous use is consumed. */
+        auto store = [&](unsigned r, const float4 (&xr)[GI][4]) {
+            const unsigned s = r % NS, kt = r - c;
+            float* X = arena + s * HS * XS;
+            if (kt < npt) {
+                /* prefix tile: one bulk copy per head, completion counted in bytes */
+                if (tid == 0) {
+                    if (r >= NS) sm90_mbar_wait(empty + s, (r / NS - 1) & 1u);
+                    const float* src0 = pfmt + ((size_t)pidx[b] * heads * npt + kt) * XS;
+                    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+                    sm90_mbar_expect(full + s, (int)(nh * XS * 4u));
+                    for (unsigned hs = 0; hs < nh; hs++)
+                        asm volatile("cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];"
+                                     ::"r"(sm90_su32(X + hs * XS)), "l"(src0 + (size_t)(h0 + hs) * npt * XS),
+                                     "r"(XS * 4u), "r"(sm90_su32(full + s))
+                                     : "memory");
+                } else if (lane == 0) {
+                    sm90_mbar_arrive(full + s);
+                }
+                return;
+            }
+            if (r >= NS) sm90_mbar_wait(empty + s, (r / NS - 1) & 1u);
+#pragma unroll
+            for (int i = 0; i < GI; i++) {
+                const unsigned e = tid + i * PLOW_NV_THREADS, hs = e / GH, w = e % GH;
+                if (e >= G) continue;
+                const float x[16] = {xr[i][0].x, xr[i][0].y, xr[i][0].z, xr[i][0].w, xr[i][1].x, xr[i][1].y,
+                                     xr[i][1].z, xr[i][1].w, xr[i][2].x, xr[i][2].y, xr[i][2].z, xr[i][2].w,
+                                     xr[i][3].x, xr[i][3].y, xr[i][3].z, xr[i][3].w};
+                sp_h16_store_group(X + hs * XS, w, x);
+            }
+            __syncwarp();
+            if (lane == 0) sm90_mbar_arrive(full + s);
+        };
+        /* Q: per-row scale; A fragments of 16-column block kb: a0 row g columns 2t.., a1 row g + 8,
+         * a2 row g columns 2t + 8.., a3 row g + 8. */
+        unsigned qh[4][4], ql[4][4];
+        float qinv[2];
+        {
+            float x[2][16];
+            const bool oa = live && ra < q_rows, ob = live && rb < q_rows;
+            const float* qa = query + ((size_t)b * q_rows + ra) * stride + h * HW + 2 * t;
+            const float* qb = query + ((size_t)b * q_rows + rb) * stride + h * HW + 2 * t;
+#pragma unroll
+            for (int kb = 0; kb < 4; kb++) {
+                const float2 a0 = oa ? __ldg((const float2*)(qa + kb * 16)) : make_float2(0.f, 0.f);
+                const float2 a2 = oa ? __ldg((const float2*)(qa + kb * 16 + 8)) : make_float2(0.f, 0.f);
+                const float2 b0 = ob ? __ldg((const float2*)(qb + kb * 16)) : make_float2(0.f, 0.f);
+                const float2 b2 = ob ? __ldg((const float2*)(qb + kb * 16 + 8)) : make_float2(0.f, 0.f);
+                x[0][kb * 4 + 0] = a0.x; x[0][kb * 4 + 1] = a0.y; x[0][kb * 4 + 2] = a2.x; x[0][kb * 4 + 3] = a2.y;
+                x[1][kb * 4 + 0] = b0.x; x[1][kb * 4 + 1] = b0.y; x[1][kb * 4 + 2] = b2.x; x[1][kb * 4 + 3] = b2.y;
+            }
+            float f[2];
+#pragma unroll
+            for (int i = 0; i < 2; i++) {
+                float m = 0.f;
+#pragma unroll
+                for (int q = 0; q < 16; q++) m = fmaxf(m, fabsf(x[i][q]));
+                m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, 1));
+                m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, 2));
+                f[i] = sp_pow2_scale(m);
+                qinv[i] = scale / f[i];
+            }
+#pragma unroll
+            for (int kb = 0; kb < 4; kb++) {
+                sp_split_h2(x[0][kb * 4] * f[0], x[0][kb * 4 + 1] * f[0], qh[kb][0], ql[kb][0]);
+                sp_split_h2(x[1][kb * 4] * f[1], x[1][kb * 4 + 1] * f[1], qh[kb][1], ql[kb][1]);
+                sp_split_h2(x[0][kb * 4 + 2] * f[0], x[0][kb * 4 + 3] * f[0], qh[kb][2], ql[kb][2]);
+                sp_split_h2(x[1][kb * 4 + 2] * f[1], x[1][kb * 4 + 3] * f[1], qh[kb][3], ql[kb][3]);
+            }
+        }
+        float o[8][4], mrow[2] = {-INFINITY, -INFINITY}, lrow[2] = {0.f, 0.f};
+#pragma unroll
+        for (int n = 0; n < 8; n++)
+#pragma unroll
+            for (int q = 0; q < 4; q++) o[n][q] = 0.f;
+        float4 xa[GI][4], xb[GI][4];
+        for (unsigned kt = 0; kt + 1 < NS && kt < nkt; kt++) {
+            load(kt, xa);
+            store(c + kt, xa);
+        }
+        if (NS - 1 < nkt) load(NS - 1, xa);
+        /* cur holds tile kt + NS - 1 (loaded an iteration ago); tile kt + NS goes into nxt. */
+        auto step = [&](unsigned kt, float4 (&cur)[GI][4], float4 (&nxt)[GI][4]) {
+            const unsigned r = c + kt, s = r % NS;
+            if (kt + NS < nkt) load(kt + NS, nxt);
+            sm90_mbar_wait(full + s, (r / NS) & 1u);
+            if (live) {
+                const float* Xh = arena + s * HS * XS + (h - h0) * XS;
+                const uint4* Kx = (const uint4*)Xh;
+                const uint4* Vx = (const uint4*)(Xh + KW);
+                const unsigned k0 = kt * KT, klim = kt < npt ? pre : kpre + own;
+                /* three accumulator sets (hi.hi, hi.lo, lo.hi): independent MMA chains */
+                float sq[3][NJ][4];
+#pragma unroll
+                for (int kb = 0; kb < 4; kb++)
+#pragma unroll
+                    for (int j = 0; j < NJ; j++) {
+                        const uint4 kv = Kx[(j * 4 + kb) * 32 + (lane ^ kb)];
+                        if (kb == 0) {
+                            sp_mma_f16_z(sq[2][j], ql[kb], kv.x, kv.y);
+                            sp_mma_f16_z(sq[1][j], qh[kb], kv.z, kv.w);
+                            sp_mma_f16_z(sq[0][j], qh[kb], kv.x, kv.y);
+                        } else {
+                            sp_mma_f16(sq[2][j], ql[kb], kv.x, kv.y);
+                            sp_mma_f16(sq[1][j], qh[kb], kv.z, kv.w);
+                            sp_mma_f16(sq[0][j], qh[kb], kv.x, kv.y);
+                        }
+                    }
+                const bool kfull = k0 + KT <= klim;
+                float sc[NJ][4];
+                float lm[2] = {-INFINITY, -INFINITY};
+#pragma unroll
+                for (int j = 0; j < NJ; j++) {
+                    const float2 kinv = *(const float2*)(Xh + 2 * KW + j * 8 + 2 * t);
+#pragma unroll
+                    for (int q = 0; q < 4; q++) {
+                        const float v0 = sq[0][j][q] + (sq[1][j][q] + sq[2][j][q]);
+                        const unsigned kj = k0 + j * 8 + 2 * t + (q & 1);
+                        const float v =
+                            (kfull || kj < klim) ? v0 * (qinv[q >> 1] * (q & 1 ? kinv.y : kinv.x)) : -INFINITY;
+                        sc[j][q] = v;
+                        lm[q >> 1] = fmaxf(lm[q >> 1], v);
+                    }
+                }
+                /* Lazy rescale: p = 2^(s - mrow) with mrow the row max at the last rescale; o and
+                 * the per-thread row sums are rescaled only when a score passes mrow + 8. The
+                 * shift cancels in the normalization. */
+                if (__any_sync(0xffffffffu, lm[0] > mrow[0] + 8.f || lm[1] > mrow[1] + 8.f)) {
+#pragma unroll
+                    for (int i = 0; i < 2; i++) {
+                        lm[i] = fmaxf(lm[i], __shfl_xor_sync(0xffffffffu, lm[i], 1));
+                        lm[i] = fmaxf(lm[i], __shfl_xor_sync(0xffffffffu, lm[i], 2));
+                        if (lm[i] > mrow[i] + 8.f) {
+                            const float corr = mrow[i] == -INFINITY ? 0.f : exp2f(mrow[i] - lm[i]);
+                            mrow[i] = lm[i];
+                            lrow[i] *= corr;
+#pragma unroll
+                            for (int n = 0; n < 8; n++) {
+                                o[n][2 * i] *= corr;
+                                o[n][2 * i + 1] *= corr;
+                            }
+                        }
+                    }
+                }
+#pragma unroll
+                for (int j = 0; j < NJ; j++)
+#pragma unroll
+                    for (int q = 0; q < 4; q++) {
+                        const float p = exp2f(sc[j][q] - mrow[q >> 1]);
+                        sc[j][q] = p;
+                        lrow[q >> 1] += p;
+                    }
+                unsigned ah[4], al[4];
+                sp_split_h2(sc[0][0], sc[0][1], ah[0], al[0]);
+                sp_split_h2(sc[0][2], sc[0][3], ah[1], al[1]);
+                sp_split_h2(sc[1][0], sc[1][1], ah[2], al[2]);
+                sp_split_h2(sc[1][2], sc[1][3], ah[3], al[3]);
+                const float4 vi0 = *(const float4*)(Xh + 2 * KW + KT);
+                const float4 vi1 = *(const float4*)(Xh + 2 * KW + KT + 4);
+                const float vinv[8] = {vi0.x, vi0.y, vi0.z, vi0.w, vi1.x, vi1.y, vi1.z, vi1.w};
+#pragma unroll
+                for (int n = 0; n < 8; n++) {
+                    const uint4 vv = Vx[n * 32 + (lane ^ ((n & 1) << 2))];
+                    float pv[2][4];
+                    sp_mma_f16_z(pv[1], al, vv.x, vv.z);
+                    sp_mma_f16(pv[1], ah, vv.y, vv.w);
+                    sp_mma_f16_z(pv[0], ah, vv.x, vv.z);
+#pragma unroll
+                    for (int q = 0; q < 4; q++) o[n][q] = fmaf(pv[0][q] + pv[1][q], vinv[n], o[n][q]);
+                }
+            }
+            __syncwarp();
+            if (lane == 0) sm90_mbar_arrive(empty + s);
+            if (kt + NS - 1 < nkt) store(r + NS - 1, cur);
+        };
+        for (unsigned kt = 0; kt < nkt; kt += 2) {
+            step(kt, xa, xb);
+            if (kt + 1 < nkt) step(kt + 1, xb, xa);
+        }
+        c += nkt;
+        if (!live) continue;
+#pragma unroll
+        for (int i = 0; i < 2; i++) {
+            lrow[i] += __shfl_xor_sync(0xffffffffu, lrow[i], 1);
+            lrow[i] += __shfl_xor_sync(0xffffffffu, lrow[i], 2);
+            const unsigned r = i ? rb : ra;
+            if (r >= q_rows) continue;
+            const float inv = lrow[i] > 0.f ? 1.0f / lrow[i] : 0.f;
+            float* orow = out + ((size_t)b * q_rows + r) * width + h * HW;
+#pragma unroll
+            for (int n = 0; n < 8; n++)
+                *(float2*)(orow + n * 8 + 2 * t) = make_float2(o[n][2 * i] * inv, o[n][2 * i + 1] * inv);
+        }
+    }
+    __syncthreads();
+    if (tid == 0)
+        for (int s = 0; s < NS; s++) {
+            sm90_mbar_inval(full + s);
+            sm90_mbar_inval(empty + s);
+        }
+}
+#endif
+
 static __device__ __noinline__ void d_attention_f32(const PlowDevInst* in, void* const* T, unsigned slice, unsigned nblk,
                                        float* arena) {
     arena = sp_smem;
+    /* flags bit 4: the prefix is pre-formatted (sp_attention_h16) */
+    if (in->i[6] & 16u) {
+#if defined(PLOW_NV_HOPPER)
+        if ((in->i[1] + 15u) / 16u >= 7u) sp_attention_h16<2>(in, T, slice, nblk);
+        else sp_attention_h16<3>(in, T, slice, nblk);
+#else
+        __trap();
+#endif
+        return;
+    }
     const unsigned stride = in->i[5] ? in->i[5] : in->i[3] * in->i[4];
     const bool vec = stride % 4u == 0 && in->fj[1].u % 4u == 0 && in->fj[2].u % 4u == 0 &&
                      sp_aligned(SP_TEN(1), 16) && sp_aligned(SP_TEN(2), 16) && sp_aligned(SP_TEN(3), 16) &&

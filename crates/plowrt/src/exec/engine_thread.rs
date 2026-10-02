@@ -81,7 +81,7 @@ pub(crate) fn pin_serving() {
 }
 
 /// Run `f` on the calling thread with [`EngineThread::run`]'s panic contract. The caller is a
-/// dispatcher that owns its OS thread (`PLOW_MUX_INLINE_TICK`), so the tick needs no hop.
+/// dispatcher that owns its OS thread (every GPU engine's), so the tick needs no hop.
 pub fn run_inline<T>(f: impl FnOnce() -> T) -> std::result::Result<T, String> {
     std::panic::catch_unwind(AssertUnwindSafe(f)).map_err(|p| panic_message(p.as_ref()))
 }
