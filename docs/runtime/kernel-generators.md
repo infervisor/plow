@@ -163,6 +163,98 @@ Single-pass is ruled out:
   - K3 routed DOWN: no FP4 MFMA on gfx942.
   - Decode: launch and protocol bound.
 
+## Generated-kernel catalog (pilot A, 2026-10-02)
+
+Generated kernels ship as packet role objects keyed by op signature, never by model name.
+
+- **Table:** `tuning/nvidia/sm_90a/h100-sxm5/gen_kernels.json`. Each entry records its
+  signature, the chosen config, the generated body's sha256, the generator version, and, per
+  shape class, every config's µs and rel-L2 vs an fp32 reference.
+- **Build:** `scripts/gen_kernels/build_catalog.py build OUT --entries a,b` regenerates the
+  tuned config with TileLang and compiles it with nvcc into the wrapper
+  `runtime/nvidia/gen_flash_prefill.cu`. It needs no GPU. It fails on generator drift, i.e.
+  when the body digest differs from the table. `tune` (GPU, under `gpulease`) is the only
+  command that rewrites the table; `bench` measures built objects.
+  - The objects script runs `build` when `PLOW_BUILD_GEN_KERNELS` lists entries.
+  - The recipe lists the cubin in `role_files`.
+  - The role emit sets `PLOW_EMIT_GEN_KERNELS` to the same list.
+- **Roles:** IDs 18..=25, one per entry. The ABI is
+  `gen_flash_prefill_v1:<entry>:block=<n>:smem=<bytes>`, plus a sha256 pin and the attention
+  capability. The grid is the packet grid: one persistent CTA per SM.
+  - The wrapper owns the packed request table, the KV slot layout, padded-row zeroing and
+    successor counters.
+  - plowrt loads every entry through one path (`exec/gpu/gen_role.rs`), using the 128-byte
+    direct ABI when requests are packed and the packet entry otherwise.
+  - The vendor-GEMM attention route skips segments that carry a generated role.
+- **Devgen:** `gen_kernels.rs` binds prefill ops matching an entry's head width and window on
+  rungs of at least `min_rows`, before the hand-written roles 6/14/15 run. Those roles skip
+  what a generated entry took.
+- **Default off:** the 12B emit with the knob unset is byte-identical to HEAD (model.pkt sha256
+  `b4ac7a1d…` from HEAD plowc, the worktree plowc and the campaign build alike).
+
+### attn_pf_hd512 (TileLang BM64 BN64, 1 stage, 256 threads, cp.async; TMA/WS off)
+
+Standalone, 12B heads 16/1, one request, packet-shaped buffers. Times in µs.
+
+| rows | floor | px4 role 15 | generated | rel-L2 (gen / px4) |
+|---|---|---|---|---|
+| 1024 | 17.4 | 245.8 | **86.3** | 2.2e-4 / 2.2e-4 |
+| 4096 | 278 | 2405 | **906** | 1.3e-4 / 1.3e-4 |
+| 8192 | 1112 | 9210 | **3334** | 8.1e-5 / 8.1e-5 |
+
+- A packed check covers three chunked requests over three slots with a zeroed tail: rel-L2
+  2.6e-4.
+- The sweep tried BN 16/32/64 and 1-3 stages. BN64 with 1 stage won every class. The
+  table-selected object spills 84 B, a cost of the persistent loop.
+- TileLang's own fast path (TMA + warp specialization, about 720 µs at 4K) needs per-request
+  tensor maps (`__grid_constant__` descriptors). That is the next ABI step.
+
+In-model, Gemma-4 12B, realtime profile, C1, ABAB, 2 reps, 32 prompts per cell. TTFT in ms.
+
+| in | off (vendor-GEMM route) | gen | Δ | route off (WG32 role 6) |
+|---|---|---|---|---|
+| 1024 | 45.55 / 45.45 | 45.40 / 45.30 | −0.3% | 46.54 |
+| 4096 | 169.41 / 169.18 | 169.67 / 169.03 | 0.0% | 176.11 |
+| 8192 | 351.23 / 350.66 | 354.12 / 353.99 | +0.9% | 377.16 |
+
+- The production baseline is the vendor-GEMM route (`PLOW_PF_ATTN_GEMM`, on when
+  `attn_softmax_sm90a.cubin` ships), not px4.
+- `PLOW_PF_SEG_TIME` per hd512 site:
+  - First 4096-row chunk: route 0.94 ms vs generated 0.99 ms.
+  - Second chunk (kv 8192): route 2.33 ms vs generated 2.85 ms.
+- The generated object beats the hand-written WG32 role by 3-6% but not the route.
+- Logit gate vs HF bf16 (`gemma_logit_parity.py`; standard prompts mostly below 1024 rows):
+  - Generated: top1 0.9848, KL mean 9.2e-3.
+  - Off: top1 0.9821, KL mean 9.2e-3.
+  - Both meet top1 ≥ 0.98. Both miss the E4B KL bound of 2e-3, which the 12B baseline
+    already misses.
+- Long prompts (1.2K / 4.1K / 8.3K):
+  - Top1 51/52, 64/64, 58/64 for generated vs 51/52, 64/64, 63/64 for off.
+  - All cases: 0.9651 vs 0.9785.
+- Gemma-4 26B-A4B (c1-lean recipe), same protocol. TTFT in ms, off vs gen:
+  - 1024: 37.37 / 37.19 vs 36.97 / 37.00 (−0.8%).
+  - 4096: 101.86 / 101.84 vs 101.63 / 101.62 (−0.2%).
+  - 8192: 207.89 / 207.81 vs 209.08 / 209.16 (+0.6%).
+  - No HF reference loads on the box (the checkpoint index names missing shards). Gen vs off
+    served greedy outputs are identical on 9/9 gate prompts, including the 1933-token one.
+- **Verdict:** the entry stays opt-in. It fails the >5% TTFT rule against the shipped route.
+  The catalog infrastructure ships default off.
+
+### Adding an entry (e.g. `attn_pf_hd256_sliding`)
+
+1. Add `scripts/gen_kernels/catalog_<name>.py` exporting `ENTRIES` (TileLang body builder,
+   signature, object name, sweep, shape classes). build_catalog.py imports every
+   `catalog_*.py`. Body contract:
+   - grid `(ceildiv(qlen, BM), heads)`;
+   - params by name: `Q K V O heads qlen kvlen scale [window kv_mask]`;
+   - K/V are one KV head's rows, with position p at row `p & kv_mask`;
+   - no `blockIdx.z`, `gridDim` or TMA.
+2. Add a row to `CATALOG` in `crates/devgen/src/gen_kernels.rs`: next role ID, object name,
+   head width, window, ring KV, `min_rows`. The row for `attn_pf_hd256_sliding` (role 19,
+   window 1024, ring KV) is already registered.
+3. Run `build_catalog.py tune --entries <name>` under `gpulease -n 1`, then build a packet
+   with the three switches above and gate it.
+
 ## Next pilots (ranked)
 
 **A. hd512 causal prefill, generated role object, replacing role 15.**

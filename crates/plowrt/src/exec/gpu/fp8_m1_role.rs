@@ -66,6 +66,7 @@ pub(super) fn load_fp8_m1_role(
     match loaded {
         Ok((function, smem)) => Ok(PacketRole {
             function,
+            direct_gen: None,
             direct_hd512: None,
             direct_hd256_gqa2: None,
             direct_w8a8_glu: None,

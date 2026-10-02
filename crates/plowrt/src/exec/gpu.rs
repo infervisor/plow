@@ -726,7 +726,8 @@ impl SegmentRoleValidation for SegmentRoles {
                         | plow_asset::segment_roles::PREFILL_ATTENTION_HD256_GQA2_BKV32
                         | plow_asset::segment_roles::BF16_PREFILL_GEMM_GLU_GEMMA4
                         | plow_asset::segment_roles::W8A8_PREFILL_GEMM_GLU_GEMMA4
-                ) {
+                ) || plow_asset::segment_roles::is_generated(role)
+                {
                     let g = &blob.progs[program.index];
                     let pc = g.gq_stream[g.gq_seg_ofs[seg] as usize].inst as usize;
                     if u32::from(g.insts[pc].blocks) != blob.n_cu {
@@ -852,6 +853,8 @@ impl SegmentRoleValidation for SegmentRoles {
 
 struct PacketRole {
     function: KernelFn,
+    /// Generated flash-prefill direct entry and the head width its packet ops must carry.
+    direct_gen: Option<(KernelFn, u32)>,
     direct_hd512: Option<KernelFn>,
     direct_hd256_gqa2: Option<KernelFn>,
     direct_w8a8_glu: Option<KernelFn>,
@@ -923,7 +926,37 @@ struct Gemma4GluW8A8DirectArgs {
 
 const _: () = assert!(std::mem::size_of::<Gemma4GluW8A8DirectArgs>() == 88);
 
+/// `PlowGenFlashPrefill` (runtime/nvidia/gen_flash_prefill.cu).
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct GenFlashPrefillArgs {
+    requests: u64,
+    opart: u64,
+    mlpart: u64,
+    q: u64,
+    k: u64,
+    v: u64,
+    output: u64,
+    mapkv: u64,
+    entries: u64,
+    succs: u64,
+    counters: u64,
+    seq_q: u32,
+    seq_kv: u32,
+    q_pos0: u32,
+    kv_stride: u32,
+    kv_mask: u32,
+    scale: f32,
+    n_head: u32,
+    n_kv_head: u32,
+    window: u32,
+    reserved: u32,
+}
+
+const _: () = assert!(std::mem::size_of::<GenFlashPrefillArgs>() == 128);
+
 enum DirectSegmentArgs {
+    Generated(GenFlashPrefillArgs),
     Hd512(Hd512Px4DirectArgs),
     Hd256Gqa2(Hd256Gqa2DirectArgs),
     Gemma4GluW8A8(Gemma4GluW8A8DirectArgs),
@@ -932,6 +965,7 @@ enum DirectSegmentArgs {
 impl DirectSegmentArgs {
     fn kernel_param(&mut self) -> *mut std::ffi::c_void {
         match self {
+            Self::Generated(args) => args as *mut GenFlashPrefillArgs as *mut std::ffi::c_void,
             Self::Hd512(args) => args as *mut Hd512Px4DirectArgs as *mut std::ffi::c_void,
             Self::Hd256Gqa2(args) => {
                 args as *mut Hd256Gqa2DirectArgs as *mut std::ffi::c_void
@@ -1435,7 +1469,7 @@ fn packet_role_segments(
                         | plow_asset::segment_roles::PREFILL_ATTENTION_HD256_BKV64
                         | plow_asset::segment_roles::PREFILL_ATTENTION_HD256_BKV32
                         | plow_asset::segment_roles::PREFILL_ATTENTION_HD256_GQA2_BKV32
-                )
+                ) || plow_asset::segment_roles::is_generated(role)
             }))
     {
         return Err(RuntimeError::Rejected(
@@ -1565,6 +1599,14 @@ fn packet_role_segments(
                         "FP8 GEMM role requires mapped GEMMs".into(),
                     ));
                 }
+            } else if plow_asset::segment_roles::is_generated(role) {
+                if d.op != DevOp::FlashPrefill as u16 || d.i[7] != 1 || d.t[5] == TENSOR_NONE16 {
+                    return Err(RuntimeError::Rejected(
+                        "generated flash-prefill role requires one-split fused FlashPrefill".into(),
+                    ));
+                }
+                let mapped = d.t[7] != TENSOR_NONE16;
+                validate_attention_role_inst(d, g.t, tensors, d.i[6], mapped, true)?;
             } else if role == plow_asset::segment_roles::PREFILL_ATTENTION {
                 validate_attention_role_inst(d, g.t, tensors, 256, false, false)?;
             } else if matches!(
@@ -1673,7 +1715,7 @@ fn hd512_prefill_segments_have_role(program: &DevProg, roles: &[u8]) -> bool {
                         *role,
                         plow_asset::segment_roles::PREFILL_ATTENTION_HD512_WG32
                             | plow_asset::segment_roles::PREFILL_ATTENTION_HD512_PX4_BQ64
-                    )
+                    ) || plow_asset::segment_roles::is_generated(*role)
                 })
     })
 }
@@ -5528,6 +5570,17 @@ impl GpuEngine {
                     "prefill packet roles require a prefill object".into(),
                 ));
             }
+            if plow_asset::segment_roles::is_generated(id) {
+                packet_roles[id as usize - 1] = Some(load_generated_role(
+                    &be,
+                    assets_dir,
+                    object,
+                    profile.tag,
+                    blob.n_cu,
+                    packed_prefill.as_ref(),
+                )?);
+                continue;
+            }
             if matches!(
                 id,
                 plow_asset::segment_roles::PREFILL_ATTENTION
@@ -5932,6 +5985,7 @@ impl GpuEngine {
             }
             packet_roles[id as usize - 1] = Some(PacketRole {
                 function,
+                direct_gen: None,
                 direct_hd512,
                 direct_hd256_gqa2,
                 direct_w8a8_glu,
@@ -8886,7 +8940,8 @@ impl GpuEngine {
                     plow_asset::segment_roles::PREFILL_ATTENTION_HD512_PX4_BQ64
                         | plow_asset::segment_roles::PREFILL_ATTENTION_HD256_GQA2_BKV32
                         | plow_asset::segment_roles::W8A8_PREFILL_GEMM_GLU_GEMMA4
-                ) {
+                ) && !plow_asset::segment_roles::is_generated(role)
+                {
                     continue;
                 }
                 let [site] = segment_sites[seg].as_slice() else {
@@ -8923,6 +8978,19 @@ impl GpuEngine {
                 {
                     return Err(RuntimeError::Rejected(
                         "HD512 px4 direct role requires exact Gemma-4 geometry".into(),
+                    ));
+                }
+                if plow_asset::segment_roles::is_generated(role)
+                    && (site.1 != DevOp::FlashPrefill as u16
+                        || inst.i[0] != g.t
+                        || inst.t[6] != TENSOR_NONE16
+                        || segment_roles
+                            .and_then(|r| r.objects.get(&role))
+                            .and_then(|object| object.attention.as_ref())
+                            .is_none_or(|a| inst.i[6] != a.head_dim))
+                {
+                    return Err(RuntimeError::Rejected(
+                        "generated direct role requires its catalog geometry".into(),
                     ));
                 }
             }
@@ -8983,7 +9051,15 @@ impl GpuEngine {
                 && seg_class.len() > 1
                 && qwen_segments.is_empty()
             {
-                attention_gemm::sites(g, &blob.tensors, devp, blob.decode_prog()?.t as usize)
+                let mut sites =
+                    attention_gemm::sites(g, &blob.tensors, devp, blob.decode_prog()?.t as usize);
+                // A generated role was selected at emit for exactly these segments.
+                for (site, &role) in sites.iter_mut().zip(&packet_segment_roles) {
+                    if plow_asset::segment_roles::is_generated(role) {
+                        *site = None;
+                    }
+                }
+                sites
             } else {
                 Vec::new()
             };
@@ -9716,7 +9792,8 @@ impl GpuEngine {
         let role = self.packet_roles[index]
             .as_ref()
             .expect("validated packet role object");
-        if role.direct_hd512.is_none()
+        if role.direct_gen.is_none()
+            && role.direct_hd512.is_none()
             && role.direct_hd256_gqa2.is_none()
             && role.direct_w8a8_glu.is_none()
         {
@@ -9728,7 +9805,9 @@ impl GpuEngine {
             ));
         };
         let inst = &self.prefill[bi].h_inst[*pc];
-        if (role.direct_hd512.is_some() || role.direct_hd256_gqa2.is_some())
+        if (role.direct_gen.is_some()
+            || role.direct_hd512.is_some()
+            || role.direct_hd256_gqa2.is_some())
             && inst.t[6] == TENSOR_NONE16
         {
             return Ok(None);
@@ -9742,6 +9821,34 @@ impl GpuEngine {
         let entries = arg.gq_stream
             + u64::from(self.prefill[bi].segment_gq_lo[seg])
                 * std::mem::size_of::<packet::dev::StreamEnt>() as u64;
+        if let Some((function, _)) = role.direct_gen {
+            return Ok(Some((
+                function,
+                DirectSegmentArgs::Generated(GenFlashPrefillArgs {
+                    requests: tensor(inst.t[6])?,
+                    opart: tensor(inst.t[0])?,
+                    mlpart: tensor(inst.t[1])?,
+                    q: tensor(inst.t[2])?,
+                    k: tensor(inst.t[3])?,
+                    v: tensor(inst.t[4])?,
+                    output: tensor(inst.t[5])?,
+                    mapkv: 0,
+                    entries,
+                    succs: arg.succs,
+                    counters: arg.counters,
+                    seq_q: inst.i[0],
+                    seq_kv: inst.i[1],
+                    q_pos0: inst.i[4],
+                    kv_stride: inst.fj[1],
+                    kv_mask: inst.fj[2],
+                    scale: f32::from_bits(inst.fj[0]),
+                    n_head: inst.i[2],
+                    n_kv_head: inst.i[3],
+                    window: inst.i[5],
+                    reserved: 0,
+                }),
+            )));
+        }
         if let Some(function) = role.direct_hd512 {
             return Ok(Some((
                 function,
@@ -11752,6 +11859,8 @@ fn gemma4_glu_role_validates_exact_shapes_maps_and_operands() {
 
 mod fp8_m1_role;
 use fp8_m1_role::{load_fp8_m1_role, validate_fp8_role_checkpoint};
+mod gen_role;
+use gen_role::load_generated_role;
 
 mod attention_gemm;
 mod cublaslt;

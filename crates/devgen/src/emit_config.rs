@@ -1234,6 +1234,11 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_GEMMA4_SM90_HD512_PX4_BQ64_ROLE", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub gemma4_sm90_hd512_px4_bq64_role: bool,
 
+    /// Generated-kernel catalog entries to emit as role objects, comma-separated (e.g.
+    /// "attn_pf_hd512"); each binds the packet ops matching its signature (`gen_kernels.rs`).
+    #[arg(long = "emit-gen-kernels", env = "PLOW_EMIT_GEN_KERNELS")]
+    pub gen_kernels: Option<String>,
+
     /// Select the packet-declared native FP8 prefill GEMM role.
     #[arg(long, env = "PLOW_FP8_PF_GEMM_ROLE", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub fp8_pf_gemm_role: bool,
@@ -1663,6 +1668,7 @@ impl EmitConfig {
             gemma4_sm90_hd256_gqa2_role: env_bool("PLOW_GEMMA4_SM90_HD256_GQA2_ROLE"),
             gemma4_sm90_hd256_gqa2_wide: env_bool("PLOW_GEMMA4_SM90_HD256_GQA2_WIDE"),
             gemma4_sm90_hd512_px4_bq64_role: env_bool("PLOW_GEMMA4_SM90_HD512_PX4_BQ64_ROLE"),
+            gen_kernels: env_str("PLOW_EMIT_GEN_KERNELS"),
             fp8_pf_gemm_role: env_bool("PLOW_FP8_PF_GEMM_ROLE"),
             fp8_pf_isolate: env_bool("PLOW_QWEN_FP8_PF_ISOLATE"),
             attention_pf_role: env_bool("PLOW_ATTENTION_PF_ROLE"),

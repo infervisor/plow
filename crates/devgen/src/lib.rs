@@ -51,6 +51,7 @@ pub mod cost_inputs;
 pub mod gemm_policy;
 use checkpoint::{layer_scalars, validate_coverage};
 mod attention_prefill_role;
+mod gen_kernels;
 mod gemma4_gemm_glu_role;
 mod gemma4_w8a8_gemm_glu_role;
 mod w8a16_prefill_role;
@@ -10404,6 +10405,19 @@ fn emit_dense_gqa(
         .unwrap_or_else(|error| panic!("native W8A16 M1 object: {error}"));
     }
     let tunedb_root = ecfg.tunedb_root();
+    if let Some(list) = ecfg.gen_kernels.as_deref() {
+        gen_kernels::apply_output_objects(
+            &mut m,
+            &mut sections,
+            &arch,
+            std::path::Path::new(&out),
+            &gpu,
+            packed_prefill_emitted,
+            list,
+            ecfg.gemma4_sm90_hd512_px4_bq64_role,
+        )
+        .unwrap_or_else(|error| panic!("generated kernels: {error}"));
+    }
     attention_prefill_role::apply_output_object(
         &mut m,
         &mut sections,

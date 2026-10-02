@@ -26,7 +26,53 @@ pub const MOE_PREFILL_CUBLASLT: u8 = 16;
 /// (`PLOW_GEMMA_MOE_DEC_GROUP`), which the CUDA runtime may serve with cuBLASLt grouped matmuls
 /// (`PLOW_MOE_DEC_LT`). Without the runtime knob the rung runs in the interpreter unchanged.
 pub const MOE_DECODE_CUBLASLT: u8 = 17;
-pub const MAX_ROLE: u8 = MOE_DECODE_CUBLASLT;
+/// Generated-kernel catalog roles (`scripts/gen_kernels/build_catalog.py`, devgen
+/// `gen_kernels.rs`): each catalog entry owns one ID in this range, and its object's ABI string
+/// ([`GeneratedAbi`]) names the entry and its launch geometry.
+pub const GENERATED_FIRST: u8 = 18;
+pub const GENERATED_LAST: u8 = 25;
+pub const MAX_ROLE: u8 = GENERATED_LAST;
+
+pub fn is_generated(role: u8) -> bool {
+    (GENERATED_FIRST..=GENERATED_LAST).contains(&role)
+}
+
+/// ABI of a generated flash-prefill role object: one persistent CTA per packet block, a
+/// host-marshaled direct entry plus the packet entry, packed requests, successor counters.
+pub const GENERATED_FLASH_PREFILL_ABI: &str = "gen_flash_prefill_v1";
+
+/// `<family>:<catalog entry>:block=<threads>:smem=<dynamic bytes>`; the grid is the packet grid.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GeneratedAbi {
+    pub family: String,
+    pub entry: String,
+    pub block: u32,
+    pub smem: u32,
+}
+
+impl GeneratedAbi {
+    pub fn parse(abi: &str) -> Option<Self> {
+        let mut parts = abi.split(':');
+        let family = parts.next()?;
+        let entry = parts.next()?;
+        let block = parts.next()?.strip_prefix("block=")?.parse().ok()?;
+        let smem = parts.next()?.strip_prefix("smem=")?.parse().ok()?;
+        let valid_entry = !entry.is_empty()
+            && entry
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_');
+        (parts.next().is_none()
+            && family == GENERATED_FLASH_PREFILL_ABI
+            && valid_entry
+            && block > 0
+            && block % 32 == 0
+            && smem > 0)
+            .then(|| Self { family: family.into(), entry: entry.into(), block, smem })
+    }
+    pub fn format(&self) -> String {
+        format!("{}:{}:block={}:smem={}", self.family, self.entry, self.block, self.smem)
+    }
+}
 
 pub fn is_projection(role: u8) -> bool {
     matches!(role, CUBLASLT | NATIVE_DECODE_TC)
@@ -156,7 +202,7 @@ pub fn requires_object(role: u8) -> bool {
             | W8A8_PREFILL_GEMM_GLU_GEMMA4
             | PREFILL_ATTENTION_HD256_GQA2_BKV32
             | PREFILL_ATTENTION_HD512_PX4_BQ64
-    )
+    ) || is_generated(role)
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
@@ -194,6 +240,31 @@ pub struct AttentionCapability {
 pub struct ProgramRoles {
     pub index: usize,
     pub roles: Vec<u8>,
+}
+
+fn validate_generated(object: &SegmentObject) -> Result<(), String> {
+    let abi = GeneratedAbi::parse(&object.abi);
+    let valid_hash = object.sha256.as_deref().is_some_and(|s| {
+        s.len() == 64 && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    });
+    if !valid_hash
+        || object.promote_k512.is_some()
+        || object.file.is_empty()
+        || std::path::Path::new(&object.file)
+            .components()
+            .any(|c| !matches!(c, std::path::Component::Normal(_)))
+        || object.attention.as_ref().zip(abi.as_ref()).is_none_or(|(a, abi)| {
+            a.profile != "sm90a"
+                || a.dtype != "bf16"
+                || a.head_dim == 0
+                || a.query_tile == 0
+                || a.kv_tile == 0
+                || a.warps.checked_mul(32) != Some(abi.block)
+        })
+    {
+        return Err("invalid generated packet segment object".into());
+    }
+    Ok(())
 }
 
 fn unique_segment_objects<'de, D: serde::Deserializer<'de>>(
@@ -235,6 +306,10 @@ impl SegmentRoles {
             return Err("unsupported packet segment roles".into());
         }
         for (&id, object) in &self.objects {
+            if is_generated(id) {
+                validate_generated(object)?;
+                continue;
+            }
             let abi = match id {
                 FP8_PREFILL_GEMM => "fp8_gemm_tma128_v1",
                 PREFILL_ATTENTION => "attention_sm90_hd256_v1",
@@ -574,6 +649,38 @@ mod tests {
             raw.replace("\"warps\":8", "\"warps\":4"),
         ] {
             assert!(SegmentRoles::from_bytes(bad.as_bytes()).is_err());
+        }
+    }
+
+    #[test]
+    fn generated_role_requires_abi_geometry_hash_and_capability() {
+        let abi = GeneratedAbi {
+            family: GENERATED_FLASH_PREFILL_ABI.into(),
+            entry: "attn_pf_hd512".into(),
+            block: 256,
+            smem: 206848,
+        };
+        assert_eq!(GeneratedAbi::parse(&abi.format()), Some(abi.clone()));
+        let raw = format!(
+            r#"{{"version":1,"objects":{{"18":{{"abi":"{}","file":"gen.cubin","sha256":"{}","attention":{{"profile":"sm90a","dtype":"bf16","head_dim":512,"query_tile":64,"kv_tile":64,"warps":8}}}}}},"programs":[{{"index":0,"roles":[0,18,0]}}]}}"#,
+            abi.format(),
+            "a".repeat(64)
+        );
+        SegmentRoles::from_bytes(raw.as_bytes()).unwrap();
+        let last = raw.replace("\"18\"", "\"25\"").replace("0,18,0", "0,25,0");
+        SegmentRoles::from_bytes(last.as_bytes()).unwrap();
+        for bad in [
+            raw.replace(&"a".repeat(64), "bad"),
+            raw.replace("\"warps\":8", "\"warps\":4"),
+            raw.replace("block=256", "block=250"),
+            raw.replace(":smem=206848", ""),
+            raw.replace("attn_pf_hd512", "Attn"),
+            raw.replace(GENERATED_FLASH_PREFILL_ABI, "gen_flash_prefill_v0"),
+            raw.replace("\"profile\":\"sm90a\"", "\"profile\":\"sm120\""),
+            raw.replace("gen.cubin", "../gen.cubin"),
+            raw.replace("\"18\"", "\"26\"").replace("0,18,0", "0,26,0"),
+        ] {
+            assert!(SegmentRoles::from_bytes(bad.as_bytes()).is_err(), "{bad}");
         }
     }
 
