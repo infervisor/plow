@@ -29,6 +29,7 @@ class FakeServer:
         self.loop.run_until_complete(site.start())
         self.port = site._server.sockets[0].getsockname()[1]
         self.hits = 0
+        self.fail_from = None
         threading.Thread(target=self.loop.run_forever, daemon=True).start()
 
     async def models(self, request):
@@ -47,6 +48,9 @@ class FakeServer:
         await resp.prepare(request)
         n = body["max_tokens"]
         chat = "messages" in body
+        if self.fail_from is not None and len(self.requests) > self.fail_from:
+            await resp.write(b'data: {"error": {"message": "device fault"}}\n\n')
+            return resp
         for i in range(n):
             piece = f"w{len(self.requests)}_{i} "
             choice = {"delta": {"content": piece}} if chat else {"text": piece}
@@ -119,6 +123,15 @@ class AgenticTurnsTests(unittest.TestCase):
         self.assertLess(abs(last - args.target_tokens) / args.target_tokens, 0.1)
         args.seed = 4
         self.assertNotEqual(agentic_turns.build_sessions(args, sizer)[0], system)
+
+    def test_a_stream_error_is_an_error_and_ends_the_session(self):
+        self.server.fail_from = 6
+        rc, res = self.run_bench()
+        self.assertEqual(rc, 1)
+        o = res["overall"]
+        # 6 good turns, then each of the 3 sessions fails once and stops.
+        self.assertEqual((o["requests"], o["errors"]), (9, 3))
+        self.assertTrue(all("device fault" in r["error"] for r in res["requests"] if r["error"]))
 
     def test_completions_api_and_header_off(self):
         rc, res = self.run_bench("--api", "completions", "--no-session-header")

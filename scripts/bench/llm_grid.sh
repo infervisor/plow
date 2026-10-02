@@ -111,6 +111,11 @@ if [ "${3:-}" = --agentic ]; then
         echo "CELL_END $tag $(date +%s.%N)" >> "$RES/cells.log"
         tail -1 "$RES/$tag.log" | sed "s/^/$tag /"
     }
+    # Unrecorded warm-up (own seed), so the first cell does not pay first-touch costs.
+    "$PYREF" "$HERE/scripts/bench/agentic_turns.py" --url "http://127.0.0.1:$PB_SERVER_PORT" --model "$MODEL" \
+        --tokenizer "$HF" --sessions 16 --turns 3 --target-tokens "${AGENTIC_TARGET:-15600}" \
+        --max-tokens "${AGENTIC_MAX_TOKENS:-128}" --api "${AGENTIC_API:-chat}" --seed 1 --temperature 0 \
+        --out "$RES/warmup.json" > "$RES/warmup.log" 2>&1
     for rep in $(seq 1 "$REPS"); do
         for c in ${AGENTIC_CONCS:-32 64 128}; do
             agentic "a$c.g.r$rep" 1 "$c" "$rep" --temperature 0

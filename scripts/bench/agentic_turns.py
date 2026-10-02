@@ -175,6 +175,8 @@ async def one_turn(http, args, sid, history, system, user):
                 if not line.startswith(b"data:") or line == b"data: [DONE]":
                     continue
                 d = json.loads(line[5:])
+                if d.get("error"):
+                    raise RuntimeError(f"stream error: {json.dumps(d['error'])[:200]}")
                 if d.get("usage"):
                     usage = d["usage"]
                 for c in d.get("choices") or []:
@@ -186,6 +188,9 @@ async def one_turn(http, args, sid, history, system, user):
     e2e = time.perf_counter() - t0
     usage = usage or {}
     n_out = usage.get("completion_tokens") or len(text)
+    # ignore_eos: anything short of max_tokens was cut, not finished.
+    if n_out < args.max_tokens:
+        raise RuntimeError(f"reply cut at {n_out} of {args.max_tokens} tokens")
     details = usage.get("prompt_tokens_details") or {}
     cached = details.get("cached_tokens")
     if cached is None:
