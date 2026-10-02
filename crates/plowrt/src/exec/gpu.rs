@@ -9832,7 +9832,9 @@ impl GpuEngine {
                     k: tensor(inst.t[3])?,
                     v: tensor(inst.t[4])?,
                     output: tensor(inst.t[5])?,
-                    mapkv: 0,
+                    // The op's GEN_TMAP_KV_PAIR (per-slot table when packed), as role 14 gets it;
+                    // an object without a TMA path ignores it.
+                    mapkv: if inst.t[7] == TENSOR_NONE16 { 0 } else { tensor(inst.t[7])? },
                     entries,
                     succs: arg.succs,
                     counters: arg.counters,

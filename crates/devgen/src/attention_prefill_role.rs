@@ -96,6 +96,7 @@ pub(crate) struct Generated {
     pub attention: AttentionCapability,
     pub window: u32,
     pub ring_kv: bool,
+    pub pair_heads: bool,
 }
 
 struct Hd256Qualification {
@@ -480,7 +481,7 @@ fn eligible_for(op: &packet::dev::DevInst, n_cu: u16, selection: &Selection) -> 
                 && op.i[..4].iter().all(|&v| v > 0)
                 && op.i[2] % op.i[3] == 0
                 && op.i[6] == g.attention.head_dim
-                && op.i[5] == g.window
+                && crate::gen_kernels::heads_and_window_match(op, g.window, g.pair_heads)
                 && op.i[7] == 1
                 && op.t[6] == TENSOR_NONE
                 && (g.ring_kv || op.j[1] == u32::MAX)

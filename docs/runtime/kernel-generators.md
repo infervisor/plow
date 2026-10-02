@@ -255,6 +255,61 @@ In-model, Gemma-4 12B, realtime profile, C1, ABAB, 2 reps, 32 prompts per cell. 
 3. Run `build_catalog.py tune --entries <name>` under `gpulease -n 1`, then build a packet
    with the three switches above and gate it.
 
+### attn_pf_hd256_sliding (hand CUDA FA3-style, 384 threads, TMA/cp.async + wgmma)
+
+- Kernel: `runtime/nvidia/gen_attn_pf_hd256_sliding.cu` plus a generated wgmma include
+  (`scripts/gen_kernels/attn_pf_hd256_sliding.py wgmma-inc`). WG0 produces (TMA from the op's
+  GEN_TMAP_KV_PAIR, cp.async when absent). WG1/WG2 each own one head of a GQA pair over 64
+  query rows: QK is SS m64n64k16, PV is RS m64n256k16 with P from registers, QK(t) overlaps
+  PV(t-1). Window, ring mask, packed requests, padded-row zeroing and successor counters are
+  in-kernel. The harness and catalog hooks are in `catalog_hd256.py`.
+- Signature: hd256, any nonzero window (`ANY_SLIDING`), even GQA ratio (`pair_heads`), ring
+  KV, rungs ≥ 1024 rows. One object serves 12B/26B (16/8, w1024) and E4B (8/2, w512).
+  plowrt now passes the op's t7 KV tensor-map pair as `mapkv`; the hd512 object ignores it.
+- Tuned: BN64, K ring 3, V ring 2, producer 56 / consumer 224 regs (sweep in the table).
+
+Standalone, one request, cold buffers, TMA path, µs. rel-L2 vs fp32 is 2.0-2.2e-3 for both
+the generated object and role 14 (bf16 output rounding).
+
+| shape | floor | role 14 | FlashInfer fa3 | generated |
+|---|---|---|---|---|
+| 12B 1024, w1024 | 8.7 | 89.3 | 31.3 | 38.2 |
+| 12B 4096, w1024 | 60.8 | 353 | 143 | 146.8 |
+| 12B 8192, w1024 | 130.3 | 692 | 313 | 272.1 |
+| E4B 1000, w512 | 3.2 | - | 23.2 | 26.7 |
+| E4B 2000, w512 | 7.4 | - | 25.0 | 30.3 |
+
+The harness checks 11 cases in both TMA and cp.async modes: packed with padding, ring wrap,
+window longer than the prompt, linear KV, GQA 4/2, peaky logits. All pass. The packed table
+check gives rel-L2 2.05e-3.
+
+In-model, Gemma-4 12B, realtime profile, C1, ABAB, 2 reps, 32 prompts per cell. TTFT in ms.
+
+| in | off | generated | Δ |
+|---|---|---|---|
+| 1024 | 45.77 / 45.46 | 42.18 / 42.12 | −7.6% |
+| 4096 | 168.90 / 168.18 | 161.38 / 161.15 | −4.3% |
+| 8192 | 351.02 / 349.05 | 334.84 / 334.98 | −4.3% |
+
+- What actually runs in the shipped 12B packet: the vendor-GEMM route takes only the 8 hd512
+  global sites. Sliding sites run role 14 on the 4096 / 8192 / wide rungs and the FA256
+  segment body below that.
+- `PLOW_PF_SEG_TIME` per sliding site (40 per chunk):
+  - 4096-row chunk: role 14 0.395 ms vs generated 0.158 ms.
+  - Second chunk (kv 8192): 0.435 ms vs 0.174 ms.
+  - Sliding attention is about 16 of 168 ms at 4096, so even a free kernel caps the gain near
+    9%.
+- Logit gate vs HF bf16:
+  - Standard prompts: generated top1 0.9821, KL mean 9.3e-3; off top1 0.9872, KL 9.2e-3.
+  - Long prompts (1.2K / 4.1K / 8.3K): top1 51/52, 64/64, 61/64 generated vs 51/52, 64/64,
+    63/64 off. All cases: 0.9785 vs 0.9839.
+  - On the steps before greedy diverges from HF, the generated arm's max |Δlogprob| is equal
+    or lower (long chat0 0.34 vs 0.40, chat2 step 0 0.25 vs 0.44; gate chat4 0.38 vs 0.45).
+    The top1 gap comes from different continuations after divergence.
+- Default-off emit is byte-identical (model.pkt `b4ac7a1d…`).
+- **Verdict:** the entry stays opt-in. It is 2.4x faster than role 14 per site, but 12B TTFT
+  at 4096/8192 improves 4.3%, short of the >5% rule.
+
 ## Next pilots (ranked)
 
 **A. hd512 causal prefill, generated role object, replacing role 15.**

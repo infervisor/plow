@@ -18,10 +18,13 @@ pub(crate) struct Entry {
     pub file: &'static str,
     /// Causal flash prefill over one head width.
     pub head_dim: u32,
-    /// Sliding window (`FlashPrefill` i[5]); 0 = global attention.
+    /// Sliding window (`FlashPrefill` i[5]); 0 = global attention, `ANY_SLIDING` = any nonzero
+    /// window (a runtime operand of the object).
     pub window: u32,
     /// Accepts a KV ring (masked row index); otherwise the op must index KV linearly.
     pub ring_kv: bool,
+    /// The object runs query heads in pairs per KV head: the GQA ratio must be even.
+    pub pair_heads: bool,
     /// Narrowest prefill rung bound: the table's smallest shape class.
     pub min_rows: u32,
 }
@@ -35,6 +38,7 @@ pub(crate) const CATALOG: [Entry; 2] = [
         head_dim: 512,
         window: 0,
         ring_kv: false,
+        pair_heads: false,
         min_rows: 1024,
     },
     Entry {
@@ -42,11 +46,23 @@ pub(crate) const CATALOG: [Entry; 2] = [
         role: GENERATED_FIRST + 1,
         file: "gen_sm90a_attn_pf_hd256_sliding.cubin",
         head_dim: 256,
-        window: 1024,
+        window: ANY_SLIDING,
         ring_kv: true,
+        pair_heads: true,
         min_rows: 1024,
     },
 ];
+
+pub(crate) const ANY_SLIDING: u32 = u32::MAX;
+
+/// Whether an op's window (`FlashPrefill` i[5]) and heads (i[2] / i[3]) fit an entry's.
+pub(crate) fn heads_and_window_match(op: &DevInst, window: u32, pair_heads: bool) -> bool {
+    (if window == ANY_SLIDING {
+        op.i[5] > 0
+    } else {
+        op.i[5] == window
+    }) && (!pair_heads || (op.i[3] > 0 && op.i[2] % (2 * op.i[3]) == 0))
+}
 
 /// The packet entry; plowrt also requires the `_direct` entry it launches with packed requests.
 pub(crate) const ENTRY_SYMBOL: &str = "plow_gen_flash_prefill";
@@ -74,7 +90,7 @@ impl Entry {
     pub(crate) fn matches(&self, op: &DevInst) -> bool {
         op.op == DevOp::FlashPrefill as u16
             && op.i[6] == self.head_dim
-            && op.i[5] == self.window
+            && heads_and_window_match(op, self.window, self.pair_heads)
             && op.i[7] == 1
             && (self.ring_kv || op.j[1] == u32::MAX)
     }
@@ -131,6 +147,7 @@ impl Entry {
                 attention,
                 window: self.window,
                 ring_kv: self.ring_kv,
+                pair_heads: self.pair_heads,
             },
         ))
     }
@@ -194,6 +211,30 @@ mod tests {
         assert_eq!(parse("attn_pf_hd512, attn_pf_hd512,").unwrap().len(), 1);
         assert!(parse("").unwrap().is_empty());
         assert!(matches!(parse("attn_pf_hd999"), Err(e) if e.contains("attn_pf_hd512")));
+    }
+
+    #[test]
+    fn sliding_entry_takes_any_window_and_paired_heads() {
+        let entry = CATALOG.iter().find(|e| e.name == "attn_pf_hd256_sliding").unwrap();
+        let mut op = DevInst {
+            op: DevOp::FlashPrefill as u16,
+            ..Default::default()
+        };
+        // 12B / 26B sliding layers, then E4B's.
+        op.i = [4096, 4096, 16, 8, 0, 1024, 256, 1];
+        op.j[1] = 8191;
+        assert!(entry.matches(&op));
+        op.i[2..6].copy_from_slice(&[8, 2, 0, 512]);
+        assert!(entry.matches(&op));
+        // Global layers, odd GQA ratios and split launches stay with their own roles.
+        op.i[5] = 0;
+        assert!(!entry.matches(&op));
+        op.i[5] = 512;
+        op.i[2] = 6;
+        assert!(!entry.matches(&op));
+        op.i[2] = 8;
+        op.i[7] = 2;
+        assert!(!entry.matches(&op));
     }
 
     #[test]

@@ -465,6 +465,9 @@ def cmd_bench(a):
     drv = Driver()
     table = load_table()
     for name in a.entries:
+        if "build" in ENTRIES[name]:
+            print(f"{name}: custom entry, benched by its own harness (see its catalog module)")
+            continue
         row = table["entries"][name]
         image = (Path(a.objdir) / row["object"]).read_bytes()
         header, arena, _ = generate(name, row["config"])
