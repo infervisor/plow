@@ -947,6 +947,8 @@ struct Snap {
     attaches: u32,
     /// Published by a session's sequence ([`VmmKv::note_session`]).
     session: bool,
+    /// The publishing sequence's prompt rows: `rows >= prompt_rows` is a turn end.
+    prompt_rows: u32,
 }
 
 struct Inner {
@@ -1481,9 +1483,12 @@ impl VmmKv {
                     let common = snap.tail.iter().zip(&chain[start.min(chain.len())..])
                         .take_while(|(a, b)| a == b)
                         .count();
-                    // A never-attached turn end whose last rows differ: the next prompt
-                    // re-rendered the reply to other token ids, so it can never attach.
-                    let stale_turn_end = snap.attaches == 0 && common + TURN_END_SLACK >= snap.tail.len();
+                    // A never-attached turn end whose prompt the chain extends but whose reply
+                    // differs: the next prompt re-rendered the reply to other token ids (and
+                    // dropped generation-prompt rows), so it can never attach.
+                    let end = if snap.rows >= snap.prompt_rows { snap.prompt_rows } else { snap.rows };
+                    let stale_turn_end = snap.attaches == 0
+                        && common + TURN_END_SLACK >= (end as usize).saturating_sub(start);
                     let awaited = snap.tail.is_empty()
                         && blocks > 0
                         && waits.contains(&Some(hashes[blocks - 1]));
@@ -1510,6 +1515,11 @@ impl VmmKv {
             free_snapshot(s, &mut inner, snap);
         }
         freed
+    }
+
+    /// Prompt rows of `seq`'s current sequence (0 before its `try_attach`).
+    pub fn prompt_rows(&self, seq: usize) -> u32 {
+        self.shared.inner.lock().seqs[seq].prompt_rows as u32
     }
 
     /// Rows where `seq`'s prompt stops sharing a recent prompt's prefix (0: none worth a
@@ -2300,6 +2310,7 @@ impl VmmKv {
                 reusable_prompt: false,
                 attaches: 0,
                 session: false,
+                prompt_rows: 0,
             });
             // Counts toward the same budget whole blocks and boundary snapshots do, so
             // `trim_cache` (both the static `cache_cap` and pressure-eviction branches) sees
@@ -2359,8 +2370,9 @@ fn note_lead(inner: &mut Inner, seq: usize, tokens: &[u32]) -> bool {
     inner.lead_seen.get(&key).is_some_and(|&n| n > 1)
 }
 
-/// Trailing rows in which a session's turn-end boundary may differ from the next prompt
-/// (the reply re-tokenized) and still count as superseded ([`VmmKv::retire_superseded`]).
+/// Trailing prompt rows in which a session's turn-end boundary may differ from the next
+/// prompt (re-rendered generation prompt) and still count as superseded
+/// ([`VmmKv::retire_superseded`]); its reply rows may differ entirely.
 const TURN_END_SLACK: usize = 64;
 /// Recent prompts compared for a shared prefix (a system prompt).
 const RECENT_PROMPTS: usize = 32;
@@ -2525,7 +2537,7 @@ fn publish_locked(
         .and_then(|list| list.iter_mut().find(|snap| snap.rows == rows && snap.tail == tail))
     {
         snap.last_used = tick;
-        snap.reusable_prompt |= reusable_prompt || session;
+        snap.reusable_prompt |= reusable_prompt;
         snapshot
     } else {
         let va = snapshot.expect("preflight cannot commit a missing snapshot");
@@ -2537,11 +2549,14 @@ fn publish_locked(
             users: 0,
             last_used: tick,
             referenced: false,
-            // A session's output boundary is its next turn's attach point, not a
-            // replay-only snapshot to reclaim first (`evict_one`).
-            reusable_prompt: reusable_prompt || session,
+            // A session's turn end is reclaimed first like any output boundary until an
+            // attach proves it: a chat template re-renders the reply (Gemma 4 drops the
+            // generation prompt's empty thought channel), so the next prompt usually diverges
+            // before it and attaches to the prompt-end boundary instead.
+            reusable_prompt,
             attaches: 0,
             session,
+            prompt_rows: prompt_rows as u32,
         });
         inner.stats.snapshot_bytes += snap_bytes;
         inner.stats.cache_bytes += snap_bytes;
@@ -3022,7 +3037,10 @@ fn evict_one(s: &Shared, inner: &mut Inner, preserve_hot: bool) -> bool {
         .flat_map(|(&node, snaps)| {
             let checkpoint = node.is_some() && snaps.iter().any(|snap| snap.tail.is_empty());
             let pin = node.is_some_and(|key| pinned.contains(&key));
-            snaps.iter().enumerate().map(move |(i, snap)| (node, i, snap, pin, checkpoint && !snap.tail.is_empty()))
+            // A session's tailed boundary is its next turn's attach point, not a replay.
+            snaps.iter().enumerate().map(move |(i, snap)| {
+                (node, i, snap, pin, checkpoint && !snap.tail.is_empty() && !snap.session)
+            })
         })
         .filter(|(_, _, snap, _, _)| snap.users == 0 && Some(snap.va) != protected)
         .min_by_key(|(_, _, snap, pin, covered)| (snap.attaches >= 2, *pin, !covered, snap.last_used))
@@ -4823,6 +4841,99 @@ mod tests {
         p.publish_at(1, &a, 28, 4, |_| Ok(())).unwrap();
         assert_eq!(p.retire_superseded(&a, 28), 4);
         assert_eq!(p.stats().snapshot_bytes, 4);
+    }
+
+    /// Gemma 4 chat: the next prompt re-renders the reply without the generation prompt's
+    /// thought-channel rows, so it diverges 4 rows before the previous prompt's end. A 128-row
+    /// reply puts the turn end's divergence past `TURN_END_SLACK`; the prompt part decides.
+    #[test]
+    fn session_retires_a_long_re_rendered_turn_end() {
+        let ops = Arc::new(MockVmm::default());
+        let geo = VmmGeometry {
+            full_layers: vec![0, 1],
+            kvh_full: 1,
+            hd_full: 2,
+            slide_layers: vec![],
+            kvh_slide: 1,
+            hd_slide: 2,
+            window: 0,
+            elem: 2,
+            elem_slide: 2,
+            max_ctx: 512,
+            batch: 2,
+        };
+        let p = VmmKv::new(ops, geo, 512, 0).expect("pool");
+        assert_eq!(p.block_rows(), 128);
+        let t1 = prompt(140);
+        assert!(p.try_attach(0, &t1).unwrap().is_none());
+        p.ensure_rows(0, 240).unwrap();
+        p.note_session(0, &t1);
+        p.publish_at(0, &t1, 135, 4, |_| Ok(())).unwrap();
+        let mut end = t1.clone();
+        end.extend((0..100).map(|i| 9000 + i));
+        p.publish_at(0, &end, 240, 4, |_| Ok(())).unwrap();
+        p.begin_seq(0);
+        let mut t2 = t1[..136].to_vec();
+        t2.extend((0..200).map(|i| 7000 + i));
+        p.ensure_rows(1, 1).unwrap();
+        assert_eq!(p.try_attach(1, &t2).unwrap().map(|a| a.rows), Some(135));
+        p.finish_attach(1);
+        p.ensure_rows(1, 336).unwrap();
+        p.note_session(1, &t2);
+        p.publish_at(1, &t2, 320, 4, |_| Ok(())).unwrap();
+        assert_eq!(p.retire_superseded(&t2, 320), 8, "the prompt end and the re-rendered turn end");
+        assert_eq!(p.stats().snapshot_bytes, 4);
+    }
+
+    /// Turn 1 of a session (prompt 13 rows, the last 4 the generation prompt) publishes its
+    /// prompt end and retires the checkpoint inside it, then its turn end. Under pressure the
+    /// never-attached turn end goes first: turn 2 diverges at row 9 and needs the prompt end.
+    #[test]
+    fn session_prompt_end_outlives_its_turn_end_under_pressure() {
+        let p = pool(Arc::new(MockVmm::default()));
+        let t1 = prompt(13);
+        assert!(p.try_attach(0, &t1).unwrap().is_none());
+        p.ensure_rows(0, 15).unwrap();
+        p.note_session(0, &t1);
+        p.publish_at(0, &t1, 8, 48, |_| Ok(())).unwrap();
+        p.publish_at(0, &t1, 9, 48, |_| Ok(())).unwrap();
+        assert_eq!(p.retire_superseded(&t1, 9), 48, "the checkpoint inside the prompt");
+        let mut end = t1.clone();
+        end.extend([500, 501]);
+        p.publish_at(0, &end, 15, 48, |_| Ok(())).unwrap();
+        p.begin_seq(0);
+        {
+            let mut inner = p.shared.inner.lock();
+            assert!(evict_one(&p.shared, &mut inner, true));
+            assert_eq!(inner.stats.snapshot_bytes, 48);
+        }
+        let mut t2 = t1[..9].to_vec();
+        t2.extend([600, 601, 602, 603, 604, 605, 606, 607]);
+        p.ensure_rows(1, 1).unwrap();
+        assert_eq!(p.try_attach(1, &t2).unwrap().map(|a| a.rows), Some(9));
+    }
+
+    /// A session's tailed prompt end is its next turn's attach point: eviction takes the
+    /// older whole-block checkpoint under it first, not the boundary that covers more.
+    #[test]
+    fn session_prompt_end_outlives_the_checkpoint_under_it() {
+        let p = pool(Arc::new(MockVmm::default()));
+        let t1 = prompt(13);
+        assert!(p.try_attach(0, &t1).unwrap().is_none());
+        p.ensure_rows(0, 13).unwrap();
+        p.note_session(0, &t1);
+        p.publish_at(0, &t1, 8, 48, |_| Ok(())).unwrap();
+        p.publish_at(0, &t1, 9, 48, |_| Ok(())).unwrap();
+        p.begin_seq(0);
+        {
+            let mut inner = p.shared.inner.lock();
+            assert!(evict_one(&p.shared, &mut inner, true));
+            assert_eq!(inner.stats.snapshot_bytes, 48);
+        }
+        let mut t2 = t1[..9].to_vec();
+        t2.extend([600, 601, 602, 603, 604, 605, 606, 607]);
+        p.ensure_rows(1, 1).unwrap();
+        assert_eq!(p.try_attach(1, &t2).unwrap().map(|a| a.rows), Some(9));
     }
 
     /// A request waiting on a session's in-flight prompt keeps the whole-block checkpoint it
