@@ -5,9 +5,11 @@
 # write shared scratch). The mux admits by bytes: 320 MiB ring + 8 KiB/row per request, capped at
 # 90% of the device (PLOW_KV_MEM_UTIL, vLLM's --gpu-memory-utilization default).
 # FP8 is what fits: BF16 rings alone are 640 MiB/slot (80 GiB at 128 slots).
-# NOT servable at 4K+ yet: the FP8-KV packed prefill attention costs ~55 ms per riding decode row at
-# 4K context (2112-row pack + 62 riders = 3.8 s vs 0.17 s for 4096 rows + 63 riders on BF16 KV), and
-# PLOW_TOKEN_BATCH=0 is refused for FP8-KV segmented prefill. Short-context serving only.
+# Prefill attention on every rung >= 128 rows runs the generated FP8-KV roles
+# (attn_pf_hd256_sliding_fp8kv, attn_pf_hd512_fp8kv; docs/runtime/kernel-generators.md "Gemma-4
+# 12B FP8 per-rung routes"), which replace the interpreter FP8-KV packed path that cost ~55 ms per
+# riding decode row at 4K. FP32-reference gate PASS on the non-live 16K/128 packet; this live
+# variant still needs its own serving run.
 # Decode cubin: cuBLASLt head, light FP8 attention with 16-byte loads and direct value conversion.
 schema = "plow.recipe.v1"
 namespace = "infervisor"
@@ -72,7 +74,7 @@ PLOW_FUSE_ARGMAX = "1"
 
 [objects]
 script = "scripts/build_sm90a_gemma4_segments.sh"
-role_files = []
+role_files = ["gen_sm90a_attn_pf_hd256_sliding_fp8kv.cubin", "gen_sm90a_attn_pf_hd512_fp8kv.cubin"]
 [objects.env]
 PLOW_BUILD_FATLITE = "1"
 NVCC_APPEND_FLAGS = "-DPLOW_NV_GLU_QUANT_CACHE=1 -DPLOW_NV_GLU_QUANT_WPR=1"
@@ -81,11 +83,13 @@ PLOW_BUILD_FA_GQA2_PAIR = "0"
 PLOW_BUILD_PFATTN_HD256_BKV32 = "0"
 PLOW_BUILD_PFATTN_HD256_GQA2_BKV32 = "0"
 PLOW_BUILD_PFATTN_HD512_PX4_BQ64 = "0"
+PLOW_BUILD_GEN_KERNELS = "attn_pf_hd256_sliding_fp8kv,attn_pf_hd512_fp8kv"
 
 [emit_roles.env]
 PLOW_GEMMA4_SM90_W8A8_GEMM_GLU_ROLE = "0"
 PLOW_GEMMA4_SM90_HD512_PX4_BQ64_ROLE = "0"
 PLOW_GEMMA4_SM90_HD256_GQA2_ROLE = "0"
+PLOW_EMIT_GEN_KERNELS = "attn_pf_hd256_sliding_fp8kv,attn_pf_hd512_fp8kv"
 
 [serve.env]
 PLOW_PREFIX_CACHE = "1"
