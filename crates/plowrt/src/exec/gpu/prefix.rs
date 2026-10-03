@@ -784,9 +784,20 @@ impl GpuEngine {
         let step = crate::config::RuntimeConfig::get()
             .amd_prefix_fine_rows()
             .map_or(v.kv.block_rows(), |step| step.max(32));
+        // A session's turn-end publish leaves the checkpoints inside its prompt alone: its
+        // prompt-end publish retired them (`retire_superseded`), and re-creating one would
+        // outlive the prompt-end boundary in LRU.
+        let floor = if self.session_pin[b].is_some() {
+            let prompt = v.kv.prompt_rows(b);
+            if rows > prompt { prompt } else { 0 }
+        } else {
+            0
+        };
         let mut p = step;
         while p < p_a {
-            self.publish_boundary(b, p);
+            if p > floor {
+                self.publish_boundary(b, p);
+            }
             p += step;
         }
         // Only a prompt-side publish retires: the next turn's prompt re-renders this turn's
