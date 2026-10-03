@@ -397,7 +397,7 @@ async fn speech_with(
         speech: None,
         session: ids.session.as_ref().and_then(|_| ids.ticket(crate::serve::session::row_keys(&prompt_ids, &[], &[]), report)),
         turn: ids.turn_key.clone(),
-        continuing: false,
+        continuing: run.continuing(),
     };
     let job = crate::serve::mux::Job { prompt_ids, gen, arrived: Instant::now(), respond: tx, opts };
     if let Err(err) = mux.submit_arrived(job, t_arrive, Some(mux.ingress())) {
@@ -419,14 +419,20 @@ async fn speech_with(
         if wav {
             let _ = out_tx.try_send(Ok(wav_header(c.sample_rate, u32::MAX)));
         }
-        tokio::spawn(stream_task(Arc::clone(&model), rx, out_tx, seed, t_arrive));
+        let cache = crate::serve::session::CacheOutcome::received(report_rx.take()).await;
+        run.admitted(cache.and_then(|c| c.at));
+        let stamped = run.headers();
+        tokio::spawn(stream_task(Arc::clone(&model), rx, out_tx, seed, t_arrive, run));
         let mut out_rx = out_rx;
         let body = Body::from_stream(futures::stream::poll_fn(move |cx| {
             let _held = &in_flight;
             out_rx.poll_recv(cx)
         }));
         let mut response = ([(header::CONTENT_TYPE, content_type)], body).into_response();
-        run.stamp(&mut response);
+        response.headers_mut().extend(stamped);
+        if let Some(cache) = cache {
+            cache.stamp(&mut response);
+        }
         return response;
     }
     let (codes, n_tokens) = match collect_codes(c, rx).await {
@@ -520,8 +526,10 @@ async fn stream_task(
     out: tokio::sync::mpsc::Sender<Result<Vec<u8>, std::io::Error>>,
     seed: u64,
     t_arrive: Instant,
+    mut run: crate::serve::turns::StageRun,
 ) {
     let c = model.contract.clone();
+    let sr = f64::from(c.sample_rate);
     let (fc, fs) = (c.frame_codes, c.frame_samples);
     let (ftx, mut frx) = tokio::sync::mpsc::unbounded_channel::<Vec<i32>>();
     // The LM drain never waits on the codec.
@@ -566,6 +574,7 @@ async fn stream_task(
                     let mut bytes = Vec::new();
                     pcm16(&pcm[(emitted - s) * fs..(upto - s) * fs], &mut bytes);
                     first.get_or_insert_with(|| t_arrive.elapsed());
+                    run.audio((upto - emitted) * fs, sr);
                     if out.send(Ok(bytes)).await.is_err() {
                         return; // client gone: dropping frx ends the drain, which cancels the slot
                     }
@@ -578,6 +587,7 @@ async fn stream_task(
             break;
         }
     }
+    run.done();
     tracing::info!(
         frames = emitted,
         ttfa_ms = first.map(|d| d.as_secs_f64() * 1e3),

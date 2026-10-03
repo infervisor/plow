@@ -308,8 +308,8 @@ fn job_urgency(class: JobClass, step: usize, arrived: Instant, now: Instant) -> 
 /// When this model's next tick is due on the device ([`crate::serve::cosched::CoSched::Deadline`]):
 /// the best-ranked job ([`crate::serve::cosched::Due::rank`]). Jobs outside a voice turn keep the class deadline (the most urgent class,
 /// anchored at the oldest first output or ASR final of that class; ongoing work from now). Turn
-/// jobs take their stage deadline ([`crate::serve::deadlines`]) from the times cached at
-/// admission; a queued turn job looks its turn up, the first [`QUEUED_TURN_LOOKUPS`] only (the
+/// jobs take their stage deadline ([`crate::serve::deadlines`]) from the slot's turn times
+/// ([`refresh_turns`]); a queued turn job looks its turn up, the first [`QUEUED_TURN_LOOKUPS`] only (the
 /// queue head is all the next tick can admit). Costs come from [`crate::sched::cost`] for
 /// `model`, this model's cost-model id.
 fn tick_due(
@@ -357,6 +357,18 @@ fn tick_due(
         }
     }
     best.unwrap_or_else(|| Due { cost: tick, ..Due::from_urgency(Urgency::Bulk, now) })
+}
+
+/// Re-read the turn times of slots whose turn has no first audio yet: later stages (LLM first
+/// token, TTS first audio) land in the turn table after admission.
+fn refresh_turns(slots: &mut [Option<Slot>]) {
+    for s in slots.iter_mut().flatten() {
+        if s.turn.is_some_and(|t| t.tts_first_audio.is_none()) {
+            if let Some(t) = s.turn_key.as_ref().and_then(|k| crate::serve::turns::table().times(k)) {
+                s.turn = Some(t);
+            }
+        }
+    }
 }
 
 /// Queued turn jobs [`tick_due`] looks up per tick.
@@ -697,8 +709,9 @@ struct Slot {
     stop_pending: String,
     class: JobClass,
     raw_tokens: bool,
-    /// The voice turn's times, looked up once at admission ([`tick_due`]).
+    /// The voice turn's times ([`tick_due`]), refreshed by [`refresh_turns`] until its first audio.
     turn: Option<crate::serve::turns::TurnTimes>,
+    turn_key: Option<crate::serve::turns::TurnKey>,
     speech: Option<Box<SpeechJob>>,
     /// Set on the owner of a CFG pair; its partner slot (owner + 1) stays `None` in the table
     /// and is reserved while the owner lives (see [`slot_free`]).
@@ -1411,6 +1424,7 @@ pub fn spawn(
             // One tick: advance every live slot by N tokens (multi-step).
             // Handed to the blocking pool so the dispatcher task stays hot
             // for arrivals.
+            refresh_turns(&mut slots);
             let due = tick_due(&slots, &waiting, cost_id, Instant::now());
             // A co-tenant with more urgent work is waiting for the device: a K-step quantum
             // here would hold it for all K. Under overload, voice turns already ahead of their
@@ -1579,7 +1593,14 @@ pub fn spawn(
                     if tick_fault.is_some() {
                         Metrics::inc(&metrics.serving.tick_errors);
                     }
-                    crate::sched::cost::record_id(cost_id, if did_prefill { crate::sched::cost::Op::Prefill { rows: pf_rows.min(crate::config::RuntimeConfig::get().pf_chunk_rows()) } } else { crate::sched::cost::Op::DecodeTick { width: live } }, service);
+                    // A decode sample is per step: a K-step quantum is compared against per-token deadlines.
+                    let (op, took) = if did_prefill {
+                        (crate::sched::cost::Op::Prefill { rows: pf_rows.min(crate::config::RuntimeConfig::get().pf_chunk_rows()) }, service)
+                    } else {
+                        let k = decode_progress.as_ref().map_or(steps, |p| p.steps.get() as u32).max(1);
+                        (crate::sched::cost::Op::DecodeTick { width: live }, service / k)
+                    };
+                    crate::sched::cost::record_id(cost_id, op, took);
                     let sample = service_sample(ms, did_prefill);
                     if let Some(sample) = sample {
                         load.service_ms.update(sample);
@@ -2176,6 +2197,7 @@ fn admit_session(
         class: job.opts.class,
         raw_tokens: job.opts.raw_tokens,
         turn: job.opts.turn.as_ref().and_then(|k| crate::serve::turns::table().times(k)),
+        turn_key: job.opts.turn,
         cfg: pair.then(|| {
             Box::new(CfgRun {
                 rng: job.opts.speech.as_ref().and_then(|s| s.cfg.as_ref()?.seed).map(crate::text::sample::SplitMix::new),
@@ -7408,6 +7430,7 @@ mod tests {
                 class: JobClass::Normal,
                 raw_tokens: false,
                 turn: None,
+                turn_key: None,
                 speech: None,
                 cfg: None,
                 held: Vec::new(),
@@ -7449,6 +7472,24 @@ mod tests {
         slots[0].as_mut().unwrap().turn.as_mut().unwrap().speech_end = Some(now);
         let d = tick_due(&slots, &waiting, model, now);
         assert_eq!(d.deadline, Due::from_urgency(Urgency::Final, slots[1].as_ref().unwrap().arrived).deadline);
+    }
+
+    #[test]
+    fn a_live_slot_sees_its_turns_first_audio() {
+        use crate::serve::turns::{table, Kind, Stage};
+        let now = Instant::now();
+        let session: Arc<str> = "mux-test-refresh-turn".into();
+        let key = table().join(&session, None, Kind::Llm, now, None, None, None).key;
+        let (mut slot, _rx) = prefill_test_slot();
+        let s = slot.as_mut().unwrap();
+        s.turn = table().times(&key);
+        s.turn_key = Some(key.clone());
+        let mut slots = vec![slot];
+        refresh_turns(&mut slots);
+        assert!(slots[0].as_ref().unwrap().turn.unwrap().tts_first_audio.is_none());
+        table().stamp(&key, Stage::TtsFirst, now);
+        refresh_turns(&mut slots);
+        assert_eq!(slots[0].as_ref().unwrap().turn.unwrap().tts_first_audio, Some(now));
     }
 
     /// A turn's speech stream is its first audio only until the tokens that audio renders from;

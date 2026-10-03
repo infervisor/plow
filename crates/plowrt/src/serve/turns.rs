@@ -234,6 +234,15 @@ impl TurnTable {
         self.sessions.get_by_id(session.clone())
     }
 
+    /// The session's entry, created atomically so concurrent first requests share one.
+    fn entry_or_new(&self, session: &Arc<str>) -> SessionEntry {
+        self.sessions.get_or_insert_with(
+            session.clone(),
+            || SessionEntry { session: session.clone(), turns: Default::default() },
+            |e| e.clone(),
+        )
+    }
+
     pub fn times(&self, key: &TurnKey) -> Option<TurnTimes> {
         self.entry(&key.session)?.turns.lock().get_mut(&key.turn).map(|t| t.times())
     }
@@ -268,8 +277,7 @@ impl TurnTable {
     /// Track an admitted `session` before its first turn (a call's ASR appends precede it), so
     /// overload never sheds the call's later requests.
     pub fn note_session(&self, session: &Arc<str>) {
-        let e = self.entry(session).unwrap_or_else(|| SessionEntry { session: session.clone(), turns: Default::default() });
-        self.sessions.insert(e);
+        self.sessions.insert(self.entry_or_new(session));
     }
 
     /// The session's turns, oldest first.
@@ -290,7 +298,7 @@ impl TurnTable {
         budget: Option<Duration>,
         playback: Option<Playback>,
     ) -> Joined {
-        let e = self.entry(session).unwrap_or_else(|| SessionEntry { session: session.clone(), turns: Default::default() });
+        let e = self.entry_or_new(session);
         let joined = {
             let mut st = e.turns.lock();
             let continuing = !st.turns.is_empty();
@@ -741,6 +749,25 @@ mod tests {
 
     fn sid(s: &str) -> Arc<str> {
         s.into()
+    }
+
+    #[test]
+    fn concurrent_first_requests_share_the_session() {
+        let t = TurnTable::new();
+        for i in 0..200 {
+            let s = sid(&format!("race-{i}"));
+            let barrier = std::sync::Barrier::new(2);
+            std::thread::scope(|sc| {
+                for turn in ["a", "b"] {
+                    let (t, s, barrier) = (&t, &s, &barrier);
+                    sc.spawn(move || {
+                        barrier.wait();
+                        t.join(s, Some(&sid(turn)), Kind::Llm, Instant::now(), None, None, None);
+                    });
+                }
+            });
+            assert_eq!(t.session(&s).len(), 2, "iteration {i}");
+        }
     }
 
     #[test]

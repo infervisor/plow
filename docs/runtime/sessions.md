@@ -26,14 +26,14 @@ Body fields route like OpenRouter's (first match wins). Response bodies are unch
 
 | field | sources, in precedence order |
 |---|---|
-| session | body `session_id` > `X-Session-Id` > body `prompt_cache_key` |
+| session | body `session_id` > `X-Session-Id` (`prompt_cache_key` is accepted and ignored) |
 | request | `X-Request-Id` |
 | trace | `traceparent` > body `trace.trace_id` + `trace.parent_span_id` (other `trace` keys ignored) |
 | turn | `X-Turn-Id` > body `metadata.turn_id` |
 | budget | `X-Turn-Budget-Ms` > body `metadata.turn_budget_ms` |
 
 Chat, completions and speech take them in the JSON body; transcription uploads take `session_id`,
-`prompt_cache_key`, `turn_id` and `turn_budget_ms` form fields. An invalid body `session_id` is a
+`turn_id` and `turn_budget_ms` form fields. An invalid body `session_id` is a
 400; the other body fields are hints, ignored when invalid.
 
 ### Turns

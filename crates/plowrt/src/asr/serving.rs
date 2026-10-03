@@ -367,9 +367,6 @@ async fn transcription(
         Ok(ids) => ids,
         Err(e) => return failure(StatusCode::BAD_REQUEST, e),
     };
-    if let Some(r) = crate::serve::overload::gate(&ids) {
-        return r;
-    }
     let mut response = transcribe_upload(state, multipart, &mut ids).await;
     ids.stamp(&mut response);
     response
@@ -425,8 +422,7 @@ async fn transcribe_upload(state: Arc<AsrServer>, mut multipart: Multipart, ids:
             fields.insert(name, value);
         }
     }
-    // Form fields as the JSON endpoints' body fallbacks: `session_id` > `X-Session-Id` >
-    // `prompt_cache_key`; `turn_id` / `turn_budget_ms` below their headers.
+    // Form fields as the JSON endpoints' body fallbacks: `session_id` > `X-Session-Id`; `turn_id` / `turn_budget_ms` below their headers.
     let route_fields = crate::serve::session::RouteFields {
         session_id: fields.remove("session_id"),
         prompt_cache_key: fields.remove("prompt_cache_key"),
@@ -440,6 +436,9 @@ async fn transcribe_upload(state: Arc<AsrServer>, mut multipart: Multipart, ids:
     };
     if let Err(e) = ids.apply_body(&route_fields) {
         return failure(StatusCode::BAD_REQUEST, e);
+    }
+    if let Some(r) = crate::serve::overload::gate(ids) {
+        return r;
     }
     let ids = &*ids;
     let Some(model) = fields.get("model").cloned() else {

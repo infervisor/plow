@@ -17,7 +17,7 @@
 //! (that meets them late instead of minimizing them), one already behind is pulled in at most to
 //! half its target.
 //!
-//! Every deadline is capped at `since + MAX_WAIT`, the starvation bound. Work without a turn
+//! Every deadline is capped at `since + max_wait()`, the starvation bound. Work without a turn
 //! keeps today's class mapping ([`Due::from_urgency`]). A `Due`'s cost is the work's own
 //! remaining device time, so its slack is `deadline - now - cost`.
 //!
@@ -28,7 +28,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::sched::cost::{self, Op};
-use crate::serve::cosched::{Band, Due, Urgency, MAX_WAIT};
+use crate::serve::cosched::{max_wait, Band, Due, Urgency};
 use crate::serve::turns::{Kind, Stage, TurnKey, TurnTimes};
 
 /// Turn budget when the turn carries none (`PLOW_TURN_BUDGET_MS` normally fills it).
@@ -143,7 +143,7 @@ pub fn claim_stage(stage: Stage, model: usize) {
 /// [`due`] for a caller holding the turn's times (cached per job) and the estimates; `cost` is
 /// the work's own remaining device time.
 pub fn stage_due(stage: Stage, t: &TurnTimes, e: &Ests, cost: Duration, since: Instant) -> Due {
-    Due { deadline: stage_deadline(stage, t, e, since).min(since + MAX_WAIT), cost, band: urgency(stage).into() }
+    Due { deadline: stage_deadline(stage, t, e, since).min(since + max_wait()), cost, band: urgency(stage).into() }
 }
 
 /// [`stage_due`] for `model`, registering it for the stage.
@@ -179,7 +179,7 @@ pub fn due(stage: Stage, key: Option<&TurnKey>, model: &str, since: Instant, _no
 
 /// A partial transcript pending since `since`: soft, the first work to give up under load.
 pub fn partial(since: Instant, cost: Duration) -> Due {
-    Due { deadline: since + PARTIAL_TARGET.min(MAX_WAIT), cost, band: Band::Bulk }
+    Due { deadline: since + PARTIAL_TARGET.min(max_wait()), cost, band: Band::Bulk }
 }
 
 /// A render of `streams` on the vocoder `model`, registering it as the turns' vocoder.
@@ -272,9 +272,9 @@ mod tests {
         // The starvation bound caps every turn deadline, however long the budget.
         let long = times(t0, 60_000);
         for (stage, id) in [(Stage::AsrFinal, llm), (Stage::LlmFirst, llm), (Stage::LlmDecode, llm), (Stage::TtsFirst, lm), (Stage::TtsStream, lm)] {
-            assert!(turn_due(stage, &long, id, zero, t0).deadline <= t0 + MAX_WAIT, "{stage:?}");
+            assert!(turn_due(stage, &long, id, zero, t0).deadline <= t0 + max_wait(), "{stage:?}");
         }
-        assert!(partial(t0, zero).deadline <= t0 + MAX_WAIT);
+        assert!(partial(t0, zero).deadline <= t0 + max_wait());
     }
 
     #[test]

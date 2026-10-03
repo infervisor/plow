@@ -57,6 +57,7 @@ impl TraceParent {
 pub struct RouteFields {
     #[serde(default)]
     pub session_id: Option<String>,
+    /// Accepted for OpenAI compatibility; never a session: one fixed key is shared by many users.
     #[serde(default)]
     pub prompt_cache_key: Option<String>,
     /// OpenAI `metadata`; `turn_id` and `turn_budget_ms` are read.
@@ -118,8 +119,7 @@ impl RequestIds {
         })
     }
 
-    /// Body fallbacks, OpenRouter precedence: session = body `session_id` > `X-Session-Id` > body
-    /// `prompt_cache_key`; trace = `traceparent` > body `trace`; turn and budget = header > body
+    /// Body fallbacks, OpenRouter precedence: session = body `session_id` > `X-Session-Id`; trace = `traceparent` > body `trace`; turn and budget = header > body
     /// `metadata.turn_id` / `metadata.turn_budget_ms`. An invalid body `session_id` is an error;
     /// the other body fields are hints and are ignored when invalid.
     pub fn apply_body(&mut self, body: &RouteFields) -> Result<(), String> {
@@ -129,8 +129,6 @@ impl RequestIds {
                 return Err(format!("session_id must be 1..={MAX_SESSION_BYTES} visible ASCII characters"));
             }
             self.session = Some(s.into());
-        } else if self.session.is_none() {
-            self.session = body.prompt_cache_key.as_deref().map(str::trim).filter(|k| valid_id(k, MAX_SESSION_BYTES)).map(Into::into);
         }
         if self.trace.is_none() {
             self.trace = body.trace.as_ref().and_then(TraceParent::from_body);
@@ -970,7 +968,7 @@ mod tests {
         assert_eq!(ids.turn.as_deref(), Some("t-hdr"));
         assert_eq!(ids.trace.unwrap().trace_id, 0x4bf92f3577b34da6a3ce929d0e0e4736);
         assert_eq!(ids.budget(), Some(Duration::from_millis(900)));
-        // X-Session-Id > prompt_cache_key; body trace and metadata when no headers.
+        // Body trace and metadata when no headers.
         let mut h2 = HeaderMap::new();
         h2.insert(SESSION_HEADER, HeaderValue::from_static("hdr"));
         let mut ids = RequestIds::from_headers(&h2).unwrap();
@@ -983,10 +981,10 @@ mod tests {
         assert_eq!(ids.turn.as_deref(), Some("3"));
         let t = ids.trace.unwrap();
         assert_eq!((t.trace_id, t.parent), (0x0af7651916cd43dd8448eb211c80319c, 0xb7ad6b7169203331));
-        // prompt_cache_key alone is the session; an invalid body session_id is refused.
+        // prompt_cache_key is no session; an invalid body session_id is refused.
         let mut ids = RequestIds::from_headers(&HeaderMap::new()).unwrap();
         ids.apply_body(&body(serde_json::json!({"prompt_cache_key": "pck"}))).unwrap();
-        assert_eq!(ids.session.as_deref(), Some("pck"));
+        assert_eq!(ids.session, None);
         assert!(ids.apply_body(&body(serde_json::json!({"session_id": "has space"}))).is_err());
         assert!(ids.apply_body(&body(serde_json::json!({"session_id": "x".repeat(257)}))).is_err());
     }
