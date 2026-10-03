@@ -199,9 +199,13 @@ Pitfalls this playbook exists for:
   reference's decode-only phase), not TPOT across different batch compositions.
 * **Shared worktree.** Never checkout/stash/reset it; its copies can be stale vs HEAD (the doctor
   warns). Work in `git worktree add --detach <dir> HEAD`, own `CARGO_TARGET_DIR`, deliver patches.
-* **Lease hygiene.** Wrap every GPU command in `timeout` inside the lease and keep leases short:
-  other agents wait, and the external queue has no FIFO. `gpulease` has no `--help`:
-  `gpulease --help` takes a lease.
+* **Lease hygiene.** `gpulease` serves waiters FIFO (`gpulease --status` lists the queue) and
+  runs the command in its own process group: the whole job tree stops when the command exits or
+  the lease is killed, so kill the `gpulease` process, not its children. A run that holds cards
+  past `GPU_LEASE_MAX_HOLD` (default 7200 s) while someone waits is stopped with rc 124
+  (`PREEMPTED` in the log); a longer job passes `--max-hold <s>` explicitly, ideally with
+  done-marker resume. Still wrap GPU commands in `timeout` and keep leases short.
+  `gpulease --help` is not help: a label without a command is refused (exit 2).
 * **No nix.** On a hand-built box set `PLOW_CAMPAIGN_NO_NIX=1` (campaign.py, the doctor,
   verify_patch.sh) instead of faking `ROCM_PATH`.
 
@@ -243,7 +247,7 @@ should have called:
 ./scripts/glm53_mi300x.sh bench 8 8100 [label]    # client only, no lease (label default "plow")
 ./scripts/glm53_mi300x.sh vllm  8 8200            # vLLM reference server, own lease
 ./scripts/glm53_mi300x.sh smoke 8100              # readiness + coherence — takes a PORT, not a TP
-./scripts/glm53_mi300x.sh stop  [assets-pattern]  # kills the plowrt, not the gpulease wrapper
+./scripts/glm53_mi300x.sh stop  [assets-pattern]  # kills the plowrt (its gpulease wrapper then releases)
 ```
 
 **`smoke` takes the port.** `smoke 8` polls `http://127.0.0.1:8` and hangs; it is the one
