@@ -237,7 +237,16 @@ impl GpuEngine {
             // rows alone, which the terminal then finds at rows 0..n.
             let tail_rows = self.shared_tail_rows(&chunks, &sample_rows);
             self.pf_seg_prefix = tail_rows.is_some();
+            // Leading decode rows ride as split-attention riders (`riders.rs`); a final prefill
+            // chunk of one row is not one, whatever its length.
+            self.pf_riders = plan
+                .phases
+                .iter()
+                .zip(&chunks)
+                .take_while(|(phase, chunk)| **phase == Phase::Decode && chunk.tokens.len() == 1)
+                .count();
             let body = self.packed_token_body_enqueue(&chunks);
+            self.pf_riders = 0;
             self.pf_seg_prefix = false;
             body?;
             body_enqueued = true;
@@ -407,6 +416,9 @@ mod tests {
             &assets.join("checkpoint"),
         )
         .unwrap();
+        // Bit-exact against isolated prefill holds only when decode rows run prefill attention;
+        // split-attention riders are gated against the FP32 reference instead.
+        e.riders = None;
         assert!(e.token_batch_enabled() && e.batch >= 8 && e.vmm_prefix_enabled());
         let slots = [e.batch - 1, e.batch / 2 - 1];
         let mut histories = prompts.clone();

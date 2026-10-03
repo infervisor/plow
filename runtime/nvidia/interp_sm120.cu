@@ -4317,6 +4317,67 @@ extern "C" __device__ unsigned PLOW_SYM(plow_light_fp8_flash256_smem) =
 extern "C" __device__ unsigned PLOW_SYM(plow_light_attn_hd) = 256;
 extern "C" __device__ unsigned PLOW_SYM(plow_light_attn_hd2) = 512;
 #endif
+#if PLOW_NV_GEMMA && !PLOW_NV_LEAN_DECODE && !PLOW_MIXED_STEP
+/* Unified token batch on sm_90a: the decode rows riding a packed prefill launch (rows
+ * [0, rows) of its Q/O) attend through split-KV flash decode over a slot map, then merge into
+ * O, while the launch's prefill attention runs only the prefill requests. Layout `PlowRiderAttn`
+ * is mirrored by exec/gpu/riders.rs. */
+struct PlowRiderAttn {
+    float* opart;                /* [rows][n_head][nsplit][hd] */
+    float* mlpart;               /* [rows][n_head][nsplit][2] */
+    const __nv_bfloat16* q;      /* [rows][n_head][hd] */
+    const void* k;
+    const void* v;
+    const float* k_scale;        /* FP8 KV only */
+    const float* v_scale;
+    const int* kv_len;           /* [rows] */
+    const int* slot;             /* [rows] physical KV slot */
+    __nv_bfloat16* out;          /* [rows][n_head][hd] */
+    const unsigned* dynamic;     /* non-null (a captured launch): rows, nsplit hd256, nsplit hd512 */
+    unsigned rows, n_head, n_kv_head, kv_stride, window, nsplit, kv_mask, hd;
+    float scale;
+    unsigned pad;
+};
+__device__ __forceinline__ unsigned rider_rows(const PlowRiderAttn& a) {
+    return a.dynamic ? a.dynamic[0] : a.rows;
+}
+__device__ __forceinline__ unsigned rider_nsplit(const PlowRiderAttn& a) {
+    return a.dynamic ? a.dynamic[a.hd == 512u ? 2 : 1] : a.nsplit;
+}
+#define PLOW_RIDER_FLASH(DD, GG)                                                             \
+    d_flash_decode<DD, GG, (bool)PLOW_FP8_KV, false, true, 2>(                                  \
+        a.opart, a.mlpart, a.q, (const __nv_bfloat16*)a.k, (const __nv_bfloat16*)a.v, a.kv_len, \
+        rider_rows(a), a.n_head, a.n_kv_head, a.kv_stride, a.window, a.scale, rider_nsplit(a),  \
+        a.kv_mask, blockIdx.x, gridDim.x, arena, 0u, a.k_scale, a.v_scale, a.slot)
+extern "C" __global__ void __launch_bounds__(PLOW_NV_THREADS, 2)
+    PLOW_SYM(plow_sm120_rider_flash256)(const __grid_constant__ PlowRiderAttn a) {
+    extern __shared__ float arena[];
+    if (a.hd != 256u || (a.n_head / a.n_kv_head) % 2u) __trap();
+    PLOW_RIDER_FLASH(256, 2);
+}
+extern "C" __global__ void __launch_bounds__(PLOW_NV_THREADS, 1)
+    PLOW_SYM(plow_sm120_rider_flash512)(const __grid_constant__ PlowRiderAttn a) {
+    extern __shared__ float arena[];
+    if (a.hd != 512u || (a.n_head / a.n_kv_head) % PLOW_NV_FA_GF_FULL) __trap();
+    PLOW_RIDER_FLASH(512, PLOW_NV_FA_GF_FULL);
+}
+#undef PLOW_RIDER_FLASH
+extern "C" __global__ void __launch_bounds__(PLOW_NV_THREADS)
+    PLOW_SYM(plow_sm120_rider_merge)(const __grid_constant__ PlowRiderAttn a) {
+    const unsigned rows = rider_rows(a), nsplit = rider_nsplit(a);
+    if (a.hd == 256u)
+        d_flash_merge<256>(a.out, a.opart, a.mlpart, rows, a.n_head, nsplit, blockIdx.x, gridDim.x);
+    else if (a.hd == 512u)
+        d_flash_merge<512>(a.out, a.opart, a.mlpart, rows, a.n_head, nsplit, blockIdx.x, gridDim.x);
+    else
+        __trap();
+}
+extern "C" __device__ unsigned PLOW_SYM(plow_rider_smem256) = FA_DEC_SMEM_FLOATS(256, 2) * sizeof(float);
+extern "C" __device__ unsigned PLOW_SYM(plow_rider_smem512) =
+    FA_DEC_SMEM_FLOATS(512, PLOW_NV_FA_GF_FULL) * sizeof(float);
+extern "C" __device__ unsigned PLOW_SYM(plow_rider_fp8_kv) = PLOW_FP8_KV;
+extern "C" __device__ unsigned PLOW_SYM(plow_rider_gf512) = PLOW_NV_FA_GF_FULL;
+#endif
 extern "C" __device__ unsigned PLOW_SYM(plow_light_abi) = PLOW_NV_GEMMA ? 2 : 1;
 #endif
 

@@ -61,6 +61,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut max_inst: Option<u32> = None;
     let mut max_segments: Option<usize> = None;
     let mut prefill_logits_dir = None::<std::path::PathBuf>;
+    let mut ride: Option<(usize, Vec<usize>)> = None;
+    let mut ride_dump = None::<std::path::PathBuf>;
     let (mut dump_names, mut dump_dir) = (None::<String>, None::<String>);
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -81,6 +83,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "--dump-prefill-logits" => {
                 prefill_logits_dir = Some(args.next().ok_or("--dump-prefill-logits dir")?.into())
             }
+            "--ride" => {
+                let rows = args.next().ok_or("--ride ROWS W1,W2,..")?.parse()?;
+                let widths = args
+                    .next()
+                    .ok_or("--ride ROWS W1,W2,..")?
+                    .split(',')
+                    .map(str::parse)
+                    .collect::<Result<Vec<usize>, _>>()?;
+                ride = Some((rows, widths));
+            }
+            "--ride-dump" => ride_dump = Some(args.next().ok_or("--ride-dump dir")?.into()),
             other => return Err(format!("unknown argument {other}").into()),
         }
     }
@@ -218,6 +231,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "vocab_size": e.vocab(), "cases": prefill_cases,
         }))?)?;
         return Ok(());
+    }
+
+    if let Some((rows, widths)) = &ride {
+        return ride_bench(&mut e, &last, ctx, steps, *rows, widths, ride_dump.as_deref());
     }
 
     if let Some(segments) = max_segments {
@@ -376,6 +393,155 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // per-opcode gate/body/signal cycle attribution (None on a normal cubin).
     if let Some(profile) = e.trace_summary()? {
         println!("{profile}");
+    }
+    Ok(())
+}
+
+/// `--ride ROWS W1,W2,..`: the unified token batch's per-rider cost. Slots `0..W` (at `ctx`)
+/// ride one packed launch of ROWS fresh prompt rows (intermediate chunks on the slots after the
+/// prefilled ones, nothing sampled) against the same launch alone and a standalone decode step of
+/// `W` rows. Every arm rewinds the slots first, so context and inputs are fixed; arms interleave
+/// per iteration. The riders' logits are compared in process with the standalone step's;
+/// `--ride-dump DIR` also writes both (bf16, `W x vocab`) for cross-run comparison.
+#[cfg(feature = "cuda")]
+fn ride_bench(
+    e: &mut plowrt::exec::gpu::GpuEngine,
+    last: &[u32],
+    ctx: usize,
+    iters: usize,
+    rows: usize,
+    widths: &[usize],
+    dump: Option<&std::path::Path>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use plow_asset::token_batch::{Phase, Request, Selection};
+    use std::time::Instant;
+    let first = last.len();
+    let wmax = *widths.iter().max().ok_or("--ride needs a width")?;
+    let chunk = e.pf_request_max_rows().min(e.pf_max_rows()).min(rows).max(1);
+    let fills: Vec<usize> = (0..rows.div_ceil(chunk)).map(|i| chunk.min(rows - i * chunk)).collect();
+    if !e.token_batch_enabled() || wmax > first || first + fills.len() > e.batch() {
+        return Err("--ride needs the token batch, widths <= slots, slots + prefill requests <= batch".into());
+    }
+    let prompt: Vec<u32> = (0..2 * chunk as u32).map(|i| 1000 + (i * 7919) % 50000).collect();
+    for i in 0..fills.len() {
+        e.begin_slot(first + i, prompt.len() + 1)?;
+    }
+    if let Some(dir) = dump {
+        std::fs::create_dir_all(dir)?;
+    }
+    let reset = |e: &mut plowrt::exec::gpu::GpuEngine| -> Result<(), Box<dyn std::error::Error>> {
+        for b in 0..wmax {
+            e.rewind_slot(b, ctx)?;
+        }
+        for i in 0..fills.len() {
+            e.rewind_slot(first + i, 0)?;
+        }
+        Ok(())
+    };
+    let generations: Vec<u32> =
+        (0..first + fills.len()).map(|s| e.slot_generation(s).expect("slot")).collect();
+    let requests = |w: usize| {
+        let request = |slot: usize, phase, tokens| Request {
+            id: slot as u32,
+            slot: slot as u32,
+            state_slot: slot as u32,
+            generation: generations[slot],
+            phase,
+            tokens,
+            prompt_len: match phase {
+                Phase::Decode => ctx as u32,
+                Phase::Prefill => prompt.len() as u32,
+            },
+            selection: Selection::default(),
+        };
+        (0..w)
+            .map(|b| request(b, Phase::Decode, std::slice::from_ref(&last[b])))
+            .chain(fills.iter().enumerate().map(|(i, &n)| request(first + i, Phase::Prefill, &prompt[..n])))
+            .collect::<Vec<Request<'_>>>()
+    };
+    let feeds: Vec<(usize, u32)> = last.iter().copied().enumerate().collect();
+    let (mut output, mut toks, mut logits) = (Vec::new(), Vec::new(), Vec::new());
+    let median = |v: &mut Vec<f64>| {
+        v.sort_by(f64::total_cmp);
+        v[v.len() / 2]
+    };
+    let bf16 = |v: &[f32]| -> Vec<u8> { v.iter().flat_map(|x| ((x.to_bits() >> 16) as u16).to_le_bytes()).collect() };
+    let (mut pure, warm) = (Vec::new(), 4);
+    for &w in widths {
+        let (mut ride, mut step) = (Vec::new(), Vec::new());
+        for it in 0..warm + iters {
+            reset(e)?;
+            let t = Instant::now();
+            e.token_batch_step(&requests(0), &mut output)?;
+            if it >= warm {
+                pure.push(t.elapsed().as_secs_f64() * 1e3);
+            }
+            reset(e)?;
+            let reqs = requests(w);
+            let t = Instant::now();
+            e.token_batch_step(&reqs, &mut output)?;
+            let ms = t.elapsed().as_secs_f64() * 1e3;
+            let ride_ids: Vec<u32> = output.iter().map(|&(_, t)| t).collect();
+            if output.iter().map(|&(id, _)| id as usize).ne(0..w) {
+                return Err("rider outputs out of order".into());
+            }
+            let mut ride_logits = Vec::with_capacity(if it == warm { w } else { 0 });
+            if it == warm {
+                for r in 0..w {
+                    e.logits_row(r, &mut logits)?;
+                    ride_logits.push(logits.clone());
+                }
+            }
+            reset(e)?;
+            let t = Instant::now();
+            e.step_slots(&feeds[..w], &mut toks)?;
+            let step_ms = t.elapsed().as_secs_f64() * 1e3;
+            if it >= warm {
+                ride.push(ms);
+                step.push(step_ms);
+            }
+            if it == warm {
+                let (mut max_abs, mut kl_max, mut agree) = (0f32, 0f64, 0);
+                let mut raw_ride = Vec::new();
+                let mut raw_step = Vec::new();
+                for (r, rl) in ride_logits.iter().enumerate() {
+                    e.logits_row(r, &mut logits)?;
+                    agree += usize::from(ride_ids[r] == toks[r]);
+                    let lse = |v: &[f32]| {
+                        let m = v.iter().copied().fold(f32::MIN, f32::max) as f64;
+                        m + v.iter().map(|&x| (x as f64 - m).exp()).sum::<f64>().ln()
+                    };
+                    let (lp, lq) = (lse(&logits), lse(rl));
+                    let kl: f64 = logits
+                        .iter()
+                        .zip(rl)
+                        .map(|(&p, &q)| {
+                            let lp_i = p as f64 - lp;
+                            lp_i.exp() * (lp_i - (q as f64 - lq))
+                        })
+                        .sum();
+                    kl_max = kl_max.max(kl);
+                    max_abs = rl.iter().zip(&logits).map(|(a, b)| (a - b).abs()).fold(max_abs, f32::max);
+                    if dump.is_some() {
+                        raw_ride.extend(bf16(rl));
+                        raw_step.extend(bf16(&logits));
+                    }
+                }
+                println!(
+                    "RIDE_VS_STEP w={w} ctx={ctx} top1_agree={agree}/{w} max_kl={kl_max:.3e} max_abs={max_abs:.4} ride_ids={ride_ids:?}"
+                );
+                if let Some(dir) = dump {
+                    std::fs::write(dir.join(format!("ride-w{w}.bf16")), raw_ride)?;
+                    std::fs::write(dir.join(format!("step-w{w}.bf16")), raw_step)?;
+                }
+            }
+        }
+        let (p, r, s) = (median(&mut pure), median(&mut ride), median(&mut step));
+        println!(
+            "RIDE rows={rows} w={w} ctx={ctx} n={iters} pure_ms={p:.3} ride_ms={r:.3} step_ms={s:.3} per_rider_ms={:.4} saved_ms={:.3}",
+            (r - p) / w as f64,
+            p + s - r
+        );
     }
     Ok(())
 }
