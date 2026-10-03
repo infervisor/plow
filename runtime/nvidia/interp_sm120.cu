@@ -4333,15 +4333,22 @@ struct PlowRiderAttn {
     const int* kv_len;           /* [rows] */
     const int* slot;             /* [rows] physical KV slot */
     __nv_bfloat16* out;          /* [rows][n_head][hd] */
+    const unsigned* dynamic;     /* non-null (a captured launch): rows, nsplit hd256, nsplit hd512 */
     unsigned rows, n_head, n_kv_head, kv_stride, window, nsplit, kv_mask, hd;
     float scale;
     unsigned pad;
 };
+__device__ __forceinline__ unsigned rider_rows(const PlowRiderAttn& a) {
+    return a.dynamic ? a.dynamic[0] : a.rows;
+}
+__device__ __forceinline__ unsigned rider_nsplit(const PlowRiderAttn& a) {
+    return a.dynamic ? a.dynamic[a.hd == 512u ? 2 : 1] : a.nsplit;
+}
 #define PLOW_RIDER_FLASH(DD, GG)                                                             \
     d_flash_decode<DD, GG, (bool)PLOW_FP8_KV, false, true, 2>(                                  \
         a.opart, a.mlpart, a.q, (const __nv_bfloat16*)a.k, (const __nv_bfloat16*)a.v, a.kv_len, \
-        a.rows, a.n_head, a.n_kv_head, a.kv_stride, a.window, a.scale, a.nsplit, a.kv_mask,     \
-        blockIdx.x, gridDim.x, arena, 0u, a.k_scale, a.v_scale, a.slot)
+        rider_rows(a), a.n_head, a.n_kv_head, a.kv_stride, a.window, a.scale, rider_nsplit(a),  \
+        a.kv_mask, blockIdx.x, gridDim.x, arena, 0u, a.k_scale, a.v_scale, a.slot)
 extern "C" __global__ void __launch_bounds__(PLOW_NV_THREADS, 2)
     PLOW_SYM(plow_sm120_rider_flash256)(const __grid_constant__ PlowRiderAttn a) {
     extern __shared__ float arena[];
@@ -4357,10 +4364,11 @@ extern "C" __global__ void __launch_bounds__(PLOW_NV_THREADS, 1)
 #undef PLOW_RIDER_FLASH
 extern "C" __global__ void __launch_bounds__(PLOW_NV_THREADS)
     PLOW_SYM(plow_sm120_rider_merge)(const __grid_constant__ PlowRiderAttn a) {
+    const unsigned rows = rider_rows(a), nsplit = rider_nsplit(a);
     if (a.hd == 256u)
-        d_flash_merge<256>(a.out, a.opart, a.mlpart, a.rows, a.n_head, a.nsplit, blockIdx.x, gridDim.x);
+        d_flash_merge<256>(a.out, a.opart, a.mlpart, rows, a.n_head, nsplit, blockIdx.x, gridDim.x);
     else if (a.hd == 512u)
-        d_flash_merge<512>(a.out, a.opart, a.mlpart, a.rows, a.n_head, a.nsplit, blockIdx.x, gridDim.x);
+        d_flash_merge<512>(a.out, a.opart, a.mlpart, rows, a.n_head, nsplit, blockIdx.x, gridDim.x);
     else
         __trap();
 }

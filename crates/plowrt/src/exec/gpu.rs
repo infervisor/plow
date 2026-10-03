@@ -10203,6 +10203,9 @@ impl GpuEngine {
                     route.run(site, &self.attention_requests, rows, &self.stream)?;
                 }
                 *index += 1;
+                if let Some(riders) = self.riders.as_ref().filter(|r| r.rows() > 0) {
+                    riders.launch_after(&self.be, bi, seg + 1, &self.stream)?;
+                }
             }
         }
         Ok(())
@@ -10214,7 +10217,19 @@ impl GpuEngine {
         arg: &DevProgram,
         range: std::ops::Range<usize>,
     ) -> Result<()> {
-        let key = (bi, arg.tensors as u64, range.start, range.end);
+        self.ensure_seg_graph_with(bi, arg, range, false)
+    }
+
+    /// `riders`: the graph also runs the token-batch rider attention after each attention
+    /// segment, sized on the device by the launch's `Riders::arm` (its own cache key).
+    fn ensure_seg_graph_with(
+        &mut self,
+        bi: usize,
+        arg: &DevProgram,
+        range: std::ops::Range<usize>,
+        riders: bool,
+    ) -> Result<()> {
+        let key = (bi, arg.tensors as u64, range.start, range.end | (usize::from(riders) << 31));
         if self.seg_graphs.contains_key(&key) {
             return Ok(());
         }
@@ -10244,7 +10259,7 @@ impl GpuEngine {
                             | plow_asset::segment_roles::W8A8_PREFILL_GEMM_GLU_GEMMA4
                     )
                 });
-        let g = if has_external {
+        let g = if has_external || riders {
             let capture_stream = self.be.stream_create()?;
             let mut untouched: Vec<_> = self.prefill[bi]
                 .moe_lt_segments
@@ -10260,9 +10275,13 @@ impl GpuEngine {
                     untouched.push(function);
                 }
             }
+            let rider_route = self.riders.as_ref().filter(|_| riders);
             self.be.graph_capture_hoisting(&capture_stream, &untouched, || {
                 for (seg, &class) in seg_class.iter().enumerate() {
                     let seg = seg + range.start;
+                    if let Some(r) = rider_route {
+                        r.launch_captured(&self.be, bi, seg, &capture_stream)?;
+                    }
                     if let Some(Some(route)) = self.prefill[bi].cublaslt_segments.get(seg) {
                         route.run(&capture_stream)?;
                         continue;
@@ -10519,8 +10538,25 @@ impl GpuEngine {
             let mut routed_index = 0;
             if !seg_time_probe && !fat_only_probe && rt.nv.pf_seg_graph {
                 let tensors = arg.tensors as u64;
+                if riding && !routed && self.pf_seg_window.is_none() {
+                    let segments = seg_class.len();
+                    self.ensure_seg_graph_with(bi, &arg, 0..segments, true)?;
+                    let key = (bi, tensors, 0, segments | (1 << 31));
+                    let graph = self.seg_graphs.get(&key).expect("built");
+                    self.be.graph_launch(graph, &self.stream)?;
+                    if synchronize {
+                        self.be.stream_synchronize(&self.stream)?;
+                    }
+                    return Ok(());
+                }
                 let pieces = if let Some(window) = self.pf_seg_window.clone() {
                     vec![(window.start, window.end)]
+                } else if routed && riding {
+                    let riders = self.riders.as_ref().expect("riding");
+                    self.seg_graph_pieces(bi)
+                        .into_iter()
+                        .flat_map(|(start, end)| riders.split(bi, start, end))
+                        .collect()
                 } else if routed {
                     self.seg_graph_pieces(bi)
                 } else if riding {
@@ -11094,7 +11130,6 @@ impl GpuEngine {
             && request_plan.is_some()
             && !self.pf_seg_prefix
             && self.riders.as_ref().is_some_and(|r| r.serves(bi))
-            && self.prefill[bi].attention_gemm_segments.iter().all(Option::is_none)
             && reqs[..riding].iter().all(|r| r.tokens.len() == 1)
         {
             riding
@@ -11233,10 +11268,12 @@ impl GpuEngine {
         if self.attention_gemm.is_some() {
             self.attention_requests.clear();
             let mut q0 = 0u32;
-            for r in reqs {
+            for (i, r) in reqs.iter().enumerate() {
                 let len = r.tokens.len() as u32;
-                self.attention_requests
-                    .push([q0, len, r.slot as u32, r.c0 as u32 + len]);
+                if i >= riding {
+                    self.attention_requests
+                        .push([q0, len, r.slot as u32, r.c0 as u32 + len]);
+                }
                 q0 += len;
             }
         }

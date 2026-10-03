@@ -24,6 +24,8 @@ struct RiderArgs {
     kv_len: u64,
     slot: u64,
     out: u64,
+    /// Non-zero: `[rows, nsplit hd256, nsplit hd512]` on the device (a captured launch).
+    dynamic: u64,
     rows: u32,
     n_head: u32,
     n_kv_head: u32,
@@ -43,7 +45,9 @@ struct Site {
     args: RiderArgs,
 }
 
-const NSPLIT_CAP: u64 = 16;
+/// Partials scratch: this many splits per slot at the widest batch; fewer riders split wider.
+const SPLITS_PER_SLOT: u64 = 16;
+const NSPLIT_CAP: u64 = 64;
 
 pub(super) struct Riders {
     flash256: (KernelFn, u32),
@@ -54,7 +58,7 @@ pub(super) struct Riders {
     sites: Vec<Vec<Site>>,
     opart: DeviceMem,
     mlpart: DeviceMem,
-    /// `kv_len[batch]` then `slot[batch]`.
+    /// `kv_len[batch]` then `slot[batch]`, then the captured launches' `[rows, nsplit x 2]`.
     tables: DeviceMem,
     host: Vec<i32>,
     batch: usize,
@@ -187,10 +191,11 @@ impl Riders {
             return Ok(None);
         }
         let batch = e.batch;
-        let partials = batch as u64 * NSPLIT_CAP * max_heads;
+        let partials = batch as u64 * SPLITS_PER_SLOT * max_heads;
         let opart = e.be.alloc(0, partials * max_hd * 4)?;
-        let mlpart = e.be.alloc(0, partials * 2 * 4)?;
-        let tables = e.be.alloc(0, (batch * 2 * 4) as u64)?;
+        // An hd256 site may split twice as wide in the same opart bytes.
+        let mlpart = e.be.alloc(0, partials * (max_hd / 256).max(1) * 2 * 4)?;
+        let tables = e.be.alloc(0, (batch * 2 * 4 + 16) as u64)?;
         tracing::info!(
             route = "token-batch-split-attention",
             ready = true,
@@ -208,7 +213,7 @@ impl Riders {
             opart,
             mlpart,
             tables,
-            host: vec![0; batch * 2],
+            host: vec![0; batch * 2 + 3],
             batch,
             sms: e.be.sm_count().max(1),
             rows: 0,
@@ -248,6 +253,16 @@ impl Riders {
         }
         // SAFETY: `host` lives on `self` and is not resized; pageable copies are staged before
         // the call returns. Both ranges lie inside `tables`.
+        self.rows = n as u32;
+        let split = |hd: u32| {
+            self.sites
+                .iter()
+                .flatten()
+                .find(|s| s.args.hd == hd)
+                .map_or(1, |s| self.nsplit(&s.args) as i32)
+        };
+        let dynamic = [n as i32, split(256), split(512)];
+        self.host[2 * self.batch..].copy_from_slice(&dynamic);
         unsafe {
             be.memcpy_htod_async(self.tables.base, bytemuck::cast_slice(&self.host[..n]), stream)?;
             be.memcpy_htod_async(
@@ -255,8 +270,12 @@ impl Riders {
                 bytemuck::cast_slice(&self.host[self.batch..self.batch + n]),
                 stream,
             )?;
+            be.memcpy_htod_async(
+                self.tables.base + (self.batch * 8) as u64,
+                bytemuck::cast_slice(&self.host[2 * self.batch..]),
+                stream,
+            )?;
         }
-        self.rows = n as u32;
         Ok(())
     }
 
@@ -265,9 +284,60 @@ impl Riders {
         self.max_kv = 0;
     }
 
+    /// Splits per (row, head group) for the armed rows: enough items to fill the device, at
+    /// least one 256-row tile each, within the partials scratch.
+    fn nsplit(&self, a: &RiderArgs) -> u32 {
+        let gf = if a.hd == 256 { 2 } else { self.gf512 };
+        let groups = u64::from(self.rows) * u64::from((a.n_head / gf).max(1));
+        let span = if a.window > 0 { self.max_kv.min(a.window) } else { self.max_kv };
+        let row_bytes = u64::from(self.rows) * u64::from(a.n_head) * u64::from(a.hd) * 4;
+        (4 * u64::from(self.sms))
+            .div_ceil(groups.max(1))
+            .min(u64::from(span.div_ceil(256)).max(1))
+            .min(self.opart.len / row_bytes.max(1))
+            .clamp(1, NSPLIT_CAP) as u32
+    }
+
+    /// As [`Self::launch_after`] for a graph capture: every size is read on the device from the
+    /// launch's `arm`, so one graph serves any rider count.
+    pub(super) fn launch_captured(
+        &self,
+        be: &CudaBackend,
+        bucket: usize,
+        end: usize,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        let Some(site) = self.sites[bucket].iter().find(|s| s.after + 1 == end) else {
+            return Ok(());
+        };
+        let mut args = RiderArgs {
+            opart: self.opart.base,
+            mlpart: self.mlpart.base,
+            kv_len: self.tables.base,
+            slot: self.tables.base + (self.batch * 4) as u64,
+            dynamic: self.tables.base + (self.batch * 8) as u64,
+            ..site.args
+        };
+        let (function, smem) = if site.args.hd == 256 { self.flash256 } else { self.flash512 };
+        let grid = self.sms * 4;
+        let mut params = [&mut args as *mut RiderArgs as *mut std::ffi::c_void];
+        be.launch_kernel(function, grid, BLOCK, smem, &mut params, Some(stream))?;
+        be.launch_kernel(self.merge, grid, BLOCK, 0, &mut params, Some(stream))
+    }
+
     /// The graph pieces of bucket `bucket`'s segments `0..segments`: each ends at a rider site.
     pub(super) fn pieces(&self, bucket: usize, segments: usize) -> Vec<(usize, usize)> {
         split_after(self.sites[bucket].iter().map(|s| s.after), segments)
+    }
+
+    /// Segments `start..end` (a graph piece between routed attention segments) cut after each
+    /// rider site inside it.
+    pub(super) fn split(&self, bucket: usize, start: usize, end: usize) -> Vec<(usize, usize)> {
+        let afters = self.sites[bucket].iter().map(|s| s.after).filter(|&a| a >= start && a + 1 < end);
+        split_after(afters.map(|a| a - start), end - start)
+            .into_iter()
+            .map(|(a, b)| (a + start, b + start))
+            .collect()
     }
 
     /// The rider attention of the site whose segment ends at `end`, if any.
@@ -285,13 +355,7 @@ impl Riders {
         let a = &site.args;
         let gf = if a.hd == 256 { 2 } else { self.gf512 };
         let groups = u64::from(rows) * u64::from((a.n_head / gf).max(1));
-        let span = if a.window > 0 { self.max_kv.min(a.window) } else { self.max_kv };
-        let row_bytes = u64::from(rows) * u64::from(a.n_head) * u64::from(a.hd) * 4;
-        let want = (4 * u64::from(self.sms)).div_ceil(groups.max(1));
-        let nsplit = want
-            .min(u64::from(span.div_ceil(256)).max(1))
-            .min(self.opart.len / row_bytes.max(1))
-            .clamp(1, NSPLIT_CAP) as u32;
+        let nsplit = self.nsplit(a);
         let mut args = RiderArgs {
             opart: self.opart.base,
             mlpart: self.mlpart.base,
@@ -340,6 +404,6 @@ mod tests {
 
     #[test]
     fn rider_args_match_the_device_layout() {
-        assert_eq!(std::mem::size_of::<super::RiderArgs>(), 10 * 8 + 10 * 4);
+        assert_eq!(std::mem::size_of::<super::RiderArgs>(), 11 * 8 + 10 * 4);
     }
 }

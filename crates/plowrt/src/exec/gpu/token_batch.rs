@@ -413,6 +413,9 @@ mod tests {
             &assets.join("checkpoint"),
         )
         .unwrap();
+        // Bit-exact against isolated prefill holds only when decode rows run prefill attention;
+        // split-attention riders are gated against the FP32 reference instead.
+        e.riders = None;
         assert!(e.token_batch_enabled() && e.batch >= 8 && e.vmm_prefix_enabled());
         let slots = [e.batch - 1, e.batch / 2 - 1];
         let mut histories = prompts.clone();
