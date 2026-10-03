@@ -784,9 +784,20 @@ impl GpuEngine {
         let step = crate::config::RuntimeConfig::get()
             .amd_prefix_fine_rows()
             .map_or(v.kv.block_rows(), |step| step.max(32));
+        // A session's turn-end publish leaves the checkpoints inside its prompt alone: its
+        // prompt-end publish retired them (`retire_superseded`), and re-creating one would
+        // outlive the prompt-end boundary in LRU.
+        let floor = if self.session_pin[b].is_some() {
+            let prompt = v.kv.prompt_rows(b);
+            if rows > prompt { prompt } else { 0 }
+        } else {
+            0
+        };
         let mut p = step;
         while p < p_a {
-            self.publish_boundary(b, p);
+            if p > floor {
+                self.publish_boundary(b, p);
+            }
             p += step;
         }
         // Only a prompt-side publish retires: the next turn's prompt re-renders this turn's
@@ -811,6 +822,20 @@ impl GpuEngine {
         if rows > c0 && rows <= self.pos[b] {
             self.publish_boundary(b, rows);
         }
+    }
+
+    /// Longest prefill slice from `c0` that leaves slot `b`'s shared-prefix end publishable:
+    /// the rings hold only `ring - window` rows past a boundary (`publish_boundary`), and a
+    /// request slice may be wider than that.
+    pub fn pf_publish_cap(&self, b: usize, c0: usize) -> usize {
+        let Some(v) = self.vmm.as_ref().filter(|v| v.kv.prefix_reuse() && !v.slide.is_empty()) else {
+            return usize::MAX;
+        };
+        let share = v.kv.share_rows(b) as usize;
+        if share <= c0 {
+            return usize::MAX;
+        }
+        share + (v.ring as usize).saturating_sub(v.kv.geometry().window as usize) - c0
     }
 
     /// Slot `b`'s prompt is prefilled and its prompt-end publish has run.

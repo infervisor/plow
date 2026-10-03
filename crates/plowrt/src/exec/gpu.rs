@@ -2030,6 +2030,11 @@ struct PrefillBucket {
     rope_sites: Vec<usize>,
     /// `FlashPrefill` sites: patch `i[1] = c0+real`, `i[4] = c0`.
     flash_sites: Vec<usize>,
+    /// Packed-prefill stage of each instruction (`packed_prefill::stage_map`); empty when the
+    /// packet does not stage its sliding layers.
+    stage_of: Vec<Option<u16>>,
+    /// Stages this bucket runs (0 = unstaged).
+    stages: usize,
     /// lm_head GEMM sites (`M == 1`): patch `i[4] = real-1`.
     lmhead_sites: Vec<usize>,
     /// MoE RAGGED TAIL: `(inst, i-field)` of the Gemma MoE prefill ops that carry the row count
@@ -3277,6 +3282,8 @@ struct PfBatch {
     slot_buf: Vec<i32>,
     req_buf: Vec<i32>,
     kvlen_buf: Vec<i32>,
+    /// Per stage of a staged packet: its slot mask, then its span table.
+    stage_buf: Vec<Vec<i32>>,
 }
 
 /// One request's chunk inside a PX-1 batched prefill launch: rows
@@ -6144,6 +6151,7 @@ impl GpuEngine {
                     slot_buf: vec![0; pf_max_t_blob],
                     req_buf: Vec::with_capacity(1 + 4 * dbatch_blob),
                     kvlen_buf: vec![0],
+                    stage_buf: Vec::new(),
                 })
             }
             (Some(_), _) => {
@@ -9489,8 +9497,16 @@ impl GpuEngine {
             if !light_segments.is_empty() {
                 tracing::info!(bucket = g.t, segments = light_segments.len(), "prefill light segments");
             }
+            let stage_of = if packed.is_some_and(|p| p.stage_rows.is_some()) {
+                plow_asset::packed_prefill::stage_map(&g.insts)
+            } else {
+                Vec::new()
+            };
+            let stages = stage_of.iter().flatten().map(|&k| usize::from(k) + 1).max().unwrap_or(0);
             buckets.push(PrefillBucket {
                 t: g.t,
+                stage_of,
+                stages,
                 seg_class: seg_class.clone(),
                 segment_sites,
                 segment_gq_lo: g.gq_seg_ofs.iter().copied().take(seg_class.len()).collect(),
@@ -9623,7 +9639,13 @@ impl GpuEngine {
     }
 
     pub fn prefill_chunk(&mut self, b: usize, prompt: &[u32], cap: usize) -> Result<PrefillStep> {
-        let cap = cap.min(self.pf_request_max_rows());
+        // Unpacked, a staged bucket writes every stage at once: hold the chunk to one stage.
+        let cap = cap.min(
+            self.packed_prefill
+                .as_ref()
+                .and_then(|p| p.stage_rows)
+                .map_or_else(|| self.pf_request_max_rows(), |rows| rows as usize),
+        );
         let Some(f_pf) = self.f_pf else {
             return Err(RuntimeError::Rejected("prefill object not loaded".into()));
         };
@@ -10880,11 +10902,9 @@ impl GpuEngine {
             if let Some(terminal) = &self.packed_terminal {
                 terminal.patch_discarded_tail(b, true);
             }
-            for &pc in &b.rope_sites {
-                pack.bind_request(&mut b.h_inst[pc], true);
-            }
-            for &pc in &b.flash_sites {
-                pack.bind_request(&mut b.h_inst[pc], true);
+            for &pc in b.rope_sites.iter().chain(&b.flash_sites) {
+                let stage = b.stage_of.get(pc).copied().flatten();
+                pack.bind_request_stage(&mut b.h_inst[pc], true, stage);
             }
             for &pc in &b.merge_sites {
                 pack.bind_request(&mut b.h_inst[pc], true);
@@ -11186,6 +11206,24 @@ impl GpuEngine {
                     pb.req_buf.drain(1..1 + 4 * riding);
                     pb.req_buf[0] -= riding as i32;
                 }
+                // A staged bucket's sliding layers write and attend stage by stage. Riders write
+                // in stage 0 (one row each) and leave every stage's span table.
+                let stages = self.prefill[bi].stages;
+                if let Some(rows) = self.packed_prefill.as_ref().and_then(|p| p.stage_rows) {
+                    use plow_asset::packed_prefill::{plan_stage, stage_slots};
+                    pb.stage_buf.resize_with(2 * stages, Vec::new);
+                    for k in 0..stages {
+                        let mut table =
+                            plan_stage(plan, k, rows as usize).map_err(RuntimeError::Rejected)?;
+                        if riding > 0 {
+                            table.drain(1..1 + 4 * riding);
+                            table[0] -= riding as i32;
+                        }
+                        pb.stage_buf[2 * k] =
+                            stage_slots(plan, k, rows as usize).map_err(RuntimeError::Rejected)?;
+                        pb.stage_buf[2 * k + 1] = table;
+                    }
+                }
             }
             if let Some(riders) = self.riders.as_mut() {
                 riders.arm(
@@ -11223,6 +11261,27 @@ impl GpuEngine {
                     bytemuck::cast_slice(&pb.kvlen_buf),
                     &self.stream,
                 )?;
+                if request_plan.is_some() {
+                    if let Some(pack) = self.packed_prefill.as_ref() {
+                        for (stage, bufs) in pack
+                            .stages
+                            .iter()
+                            .zip(pb.stage_buf.chunks(2))
+                            .take(self.prefill[bi].stages)
+                        {
+                            self.be.memcpy_htod_async(
+                                self.devp[stage.slot as usize].base,
+                                bytemuck::cast_slice(&bufs[0][..tc]),
+                                &self.stream,
+                            )?;
+                            self.be.memcpy_htod_async(
+                                self.devp[stage.request as usize].base,
+                                bytemuck::cast_slice(&bufs[1]),
+                                &self.stream,
+                            )?;
+                        }
+                    }
+                }
             }
             // Rows whose token only the device knows, overwritten after the staged upload.
             let parked = !synchronize;

@@ -235,6 +235,10 @@ pub struct EmitConfig {
     /// `plan_with_limit` plan has its padding already masked) and objects built with
     /// `PLOW_NV_MASKED_PADDING=1`. `packed_prefill::Manifest::validate` refuses the pairing
     /// otherwise.
+    ///
+    /// Unset = automatic: a packed sliding-window packet whose `max_request_chunk` exceeds the
+    /// window-derived default chunk stages at that default (window 1024 -> 1024 rows, ring 2048).
+    /// `0` = never stage (the ring holds a whole request chunk, the pre-staging layout).
     #[arg(long = "emit-stage-rows", env = "PLOW_STAGE_ROWS")]
     pub stage_rows: Option<u32>,
 
