@@ -403,12 +403,18 @@ impl PrefixCache {
     /// "returns wrong KV, produces fluent wrong text" failure this cache must
     /// never have.
     pub fn evict_lru(&mut self) -> Option<(u32, u32)> {
+        self.evict_lru_where(|_| true)
+    }
+
+    /// [`Self::evict_lru`] restricted to leaves whose `(owner_seq, block_idx)` passes `pick`.
+    pub fn evict_lru_where(&mut self, pick: impl Fn((u32, u32)) -> bool) -> Option<(u32, u32)> {
         let now = std::time::Instant::now();
         let victim = self
             .nodes
             .iter()
             .enumerate()
             .filter(|(_, n)| !n.evicted && n.refs == 0 && n.children.is_empty())
+            .filter(|(_, n)| pick((n.owner_seq, n.block_idx)))
             .min_by_key(|(_, n)| (n.pinned_until.is_some_and(|t| t > now), n.last_used))
             .map(|(i, _)| i as NodeId)?;
 

@@ -640,6 +640,10 @@ pub struct VmmStats {
     pub cache_bytes: u64,
     pub snapshot_bytes: u64,
     pub snapshots_evicted: u64,
+    /// Suffix eviction units (a boundary plus the blocks only it kept attachable) and the
+    /// bytes they freed.
+    pub eviction_units: u64,
+    pub eviction_unit_bytes: u64,
     /// Hash collisions caught by radix token verification — each one was a
     /// would-be wrong-KV serve, downgraded to a miss.
     pub hash_collisions: u64,
@@ -919,6 +923,10 @@ struct Inner {
     prefilling: Vec<bool>,
     /// `seq` holds a session ([`VmmKv::note_session`]) until its next `begin_seq`.
     session: Vec<bool>,
+    /// Recent prompt heads ([`note_share`]).
+    recent: std::collections::VecDeque<Box<[u32]>>,
+    /// Per seq: where its prompt stops matching a recent prompt ([`VmmKv::share_rows`]).
+    share: Vec<u32>,
     /// Bytes of zero-ref blocks handed to the reclaimer thread ([`Job::Release`]) so far:
     /// released, but not yet visible to [`VmmOps::free_bytes`] (`trim_cache`).
     release_queued: u64,
@@ -1106,6 +1114,8 @@ impl VmmKv {
                 lead_seen: FxHashMap::default(),
                 prefilling: vec![false; batch],
                 session: vec![false; batch],
+                recent: std::collections::VecDeque::new(),
+                share: vec![0; batch],
                 release_queued: 0,
             }),
             frontier: (0..batch).map(|_| AtomicU32::new(0)).collect(),
@@ -1385,6 +1395,12 @@ impl VmmKv {
         freed
     }
 
+    /// Rows where `seq`'s prompt stops sharing a recent prompt's prefix (0: none worth a
+    /// boundary). Valid from `try_attach` to the next `begin_seq`.
+    pub fn share_rows(&self, seq: usize) -> u32 {
+        self.shared.inner.lock().share[seq]
+    }
+
     /// The request in `seq` finished: queue its [`Job::CopyOut`] ([`Self::enable_release_retire`]).
     pub fn retire_released(&self, seq: usize) {
         if !self.release_retire {
@@ -1494,6 +1510,7 @@ impl VmmKv {
         inner.lead[seq] = None;
         inner.prefilling[seq] = false;
         inner.session[seq] = false;
+        inner.share[seq] = 0;
         let before = inner.stats;
         let t0 = std::time::Instant::now();
         let unmapped = if inner.jobs.is_some() {
@@ -1576,6 +1593,7 @@ impl VmmKv {
                 }
             }
         }
+        note_share(&mut inner, seq, prompt, chosen.map_or(0, |(_, _, rows)| rows));
         let Some((pick, snap_key, rows)) = chosen else {
             inner.stats.attach_misses += 1;
             inner.cache.release(&hashes, m.blocks);
@@ -2221,6 +2239,35 @@ fn note_lead(inner: &mut Inner, seq: usize, tokens: &[u32]) -> bool {
     inner.lead_seen.get(&key).is_some_and(|&n| n > 1)
 }
 
+/// Recent prompts compared for a shared prefix (a system prompt).
+const RECENT_PROMPTS: usize = 32;
+/// Rows of each recent prompt kept for the comparison.
+const RECENT_ROWS: usize = 16384;
+/// Shortest shared prefix worth a boundary snapshot.
+const SHARE_MIN_ROWS: usize = 256;
+
+/// Record where `prompt` stops matching the longest common prefix with a recent prompt
+/// (32-row aligned): a system prompt seen by two sequences ends there. The engine
+/// publishes that boundary while prefill passes it, so later sequences attach to it.
+fn note_share(inner: &mut Inner, seq: usize, prompt: &[u32], attached: u32) {
+    let common = inner
+        .recent
+        .iter()
+        .map(|r| r.iter().zip(prompt).take_while(|(a, b)| a == b).count())
+        .max()
+        .unwrap_or(0);
+    let rows = common / 32 * 32;
+    inner.share[seq] = if rows >= SHARE_MIN_ROWS && rows < prompt.len() && rows > attached as usize {
+        rows as u32
+    } else {
+        0
+    };
+    if inner.recent.len() == RECENT_PROMPTS {
+        inner.recent.pop_front();
+    }
+    inner.recent.push_back(prompt[..prompt.len().min(RECENT_ROWS)].into());
+}
+
 fn alloc_snapshot(s: &Shared, bytes: u64) -> Result<u64> {
     loop {
         match s.ops.alloc(bytes) {
@@ -2264,7 +2311,8 @@ fn publish_locked(
         rows => rows,
     };
     let reusable_prompt = (rows as usize) < prompt_rows;
-    let session = inner.session[seq];
+    // A shared-prefix end is not the session's own boundary: `retire_superseded` keeps it.
+    let session = inner.session[seq] && rows != inner.share[seq];
     let tail = &tokens[n_pub * s.block_rows as usize..rows as usize];
 
     let m = inner.cache.lookup(&hashes, tokens);
@@ -2794,9 +2842,33 @@ fn evict_one_fine(s: &Shared, inner: &mut Inner) -> bool {
     true
 }
 
-/// Reclaim output snapshots first, then LRU cache entries. `false` when pinned.
+/// A zero-ref leaf block with no snapshot on it: attach needs a snapshot at or below the
+/// matched depth, so no request can use it again. Frees its blocks.
+fn evict_dead_leaf(s: &Shared, inner: &mut Inner) -> bool {
+    let published = &inner.published;
+    let Some(key) = inner.cache.evict_lru_where(|key| !published.contains_key(&Some(key))) else {
+        return false;
+    };
+    if let Some(ids) = inner.node_blocks.remove(&key) {
+        inner.stats.cache_blocks -= ids.len() as u64;
+        inner.stats.cache_bytes -= ids.len() as u64 * s.block_bytes;
+        for id in ids {
+            deref_block(s, inner, id);
+        }
+    }
+    inner.stats.nodes_evicted += 1;
+    true
+}
+
+/// Suffix-first: dead blocks, then output-only snapshots, then the least-recently-used
+/// unshared boundary together with the suffix blocks only it made attachable (back to the
+/// previous usable boundary), shared boundaries last, then whole LRU entries. `false` when
+/// pinned.
 fn evict_one(s: &Shared, inner: &mut Inner, preserve_hot: bool) -> bool {
     if evict_one_fine(s, inner) {
+        return true;
+    }
+    if evict_dead_leaf(s, inner) {
         return true;
     }
     // Output-only boundaries cannot replay the original prompt. Reclaim them
@@ -2817,18 +2889,29 @@ fn evict_one(s: &Shared, inner: &mut Inner, preserve_hot: bool) -> bool {
         .filter(|snap| snap.users == 0 && snap.referenced)
         .max_by_key(|snap| snap.last_used)
         .map(|snap| snap.va);
-    // A boundary inside a block (a prompt's end) matches only its own tail; the whole-block
-    // checkpoint published under the same node matches every continuation. Where both
-    // exist, reclaim the former LRU-first, before a radix leaf takes the whole prefix and
-    // every boundary published under it with it.
+    // One unit: the LRU boundary (a session's newest, after `retire_superseded`) and the
+    // blocks that become dead with it. A boundary inside a block serves only its exact
+    // tail, the whole-block checkpoint under the same node every continuation: that tailed
+    // one goes first. A boundary attached twice or more is a shared prefix (a system
+    // prompt) and goes last.
     if let Some((node, index)) = inner.published.iter()
-        .filter(|(node, snaps)| node.is_some() && snaps.iter().any(|snap| snap.tail.is_empty()))
-        .flat_map(|(&node, snaps)| snaps.iter().enumerate().map(move |(i, snap)| (node, i, snap)))
-        .filter(|(_, _, snap)| snap.users == 0 && !snap.tail.is_empty() && Some(snap.va) != protected)
-        .min_by_key(|(_, _, snap)| snap.last_used)
-        .map(|(node, index, _)| (node, index))
+        .flat_map(|(&node, snaps)| {
+            let checkpoint = node.is_some() && snaps.iter().any(|snap| snap.tail.is_empty());
+            snaps.iter().enumerate().map(move |(i, snap)| (node, i, snap, checkpoint && !snap.tail.is_empty()))
+        })
+        .filter(|(_, _, snap, _)| snap.users == 0 && Some(snap.va) != protected)
+        .min_by_key(|(_, _, snap, covered)| (snap.attaches >= 2, !covered, snap.last_used))
+        .map(|(node, index, _, _)| (node, index))
     {
+        let before = inner.stats.cache_bytes;
         remove_snapshot(s, inner, node, index);
+        let mut blocks = 0;
+        while evict_dead_leaf(s, inner) {
+            blocks += 1;
+        }
+        inner.stats.eviction_units += 1;
+        inner.stats.eviction_unit_bytes += before - inner.stats.cache_bytes;
+        tracing::debug!(freed = before - inner.stats.cache_bytes, blocks, "vmm prefix eviction unit");
         return true;
     }
     let Some(key) = inner.cache.evict_lru() else {
@@ -4594,6 +4677,67 @@ mod tests {
         assert_eq!(p.try_attach(0, &pr).unwrap().expect("newest boundary").rows, 28);
     }
 
+    /// The second prompt sharing a 300-row head with a recent one names the shared end
+    /// (32-row aligned); a short common head names nothing.
+    #[test]
+    fn share_rows_names_where_a_recent_prompt_diverges() {
+        let ops = Arc::new(MockVmm::default());
+        let p = uniform_pool(ops);
+        let head = prompt(300);
+        let with = |tail: u32| -> Vec<u32> { head.iter().copied().chain((0..40).map(|i| tail + i)).collect() };
+        assert!(p.try_attach(0, &with(100_000)).unwrap().is_none());
+        assert_eq!(p.share_rows(0), 0);
+        p.begin_seq(0);
+        assert!(p.try_attach(1, &with(200_000)).unwrap().is_none());
+        assert_eq!(p.share_rows(1), 288);
+        p.begin_seq(1);
+        assert!(p.try_attach(1, &prompt(100)).unwrap().is_none());
+        assert_eq!(p.share_rows(1), 0, "a 100-row common head is below SHARE_MIN_ROWS");
+    }
+
+    /// Two sessions share a system prompt (a boundary at 16 rows). Pressure evicts the
+    /// older session's tail as one unit (its boundary and the block only it kept
+    /// attachable); the shared prefix and the other session's boundary still attach.
+    #[test]
+    fn pressure_evicts_one_session_suffix_and_keeps_the_shared_prefix() {
+        let sys = prompt(16);
+        let mut a = sys.clone();
+        a.extend((0..14).map(|i| 1000 + i));
+        let mut b = sys.clone();
+        b.extend((0..14).map(|i| 2000 + i));
+        let run = |cap: u64| {
+            let ops = Arc::new(MockVmm::default());
+            let mut geo = uniform_pool(ops.clone()).geometry().clone();
+            geo.batch = 2;
+            let p = VmmKv::new(ops, geo, 64, cap).expect("pool");
+            assert!(p.try_attach(0, &a).unwrap().is_none());
+            p.ensure_rows(0, 30).unwrap();
+            p.note_session(0, &a);
+            p.publish_at(0, &a, 16, 4, |_| Ok(())).unwrap();
+            p.publish_at(0, &a, 28, 4, |_| Ok(())).unwrap();
+            p.begin_seq(0);
+            p.ensure_rows(1, 1).unwrap();
+            assert_eq!(p.try_attach(1, &b).unwrap().expect("shared prefix").rows, 16);
+            p.finish_attach(1);
+            p.ensure_rows(1, 30).unwrap();
+            p.note_session(1, &b);
+            p.publish_at(1, &b, 28, 4, |_| Ok(())).unwrap();
+            p.begin_seq(1);
+            p
+        };
+        let full = run(0).stats().cache_bytes;
+        let p = run(full - 1);
+        let s = p.stats();
+        assert_eq!(s.eviction_units, 1);
+        assert!(s.eviction_unit_bytes > 4, "the unit takes the dead block with the boundary");
+        assert_eq!(s.cache_bytes, full - s.eviction_unit_bytes);
+        p.ensure_rows(0, 1).unwrap();
+        assert_eq!(p.try_attach(0, &a).unwrap().expect("shared prefix stays").rows, 16);
+        p.begin_seq(0);
+        p.ensure_rows(0, 1).unwrap();
+        assert_eq!(p.try_attach(0, &b).unwrap().expect("other session stays").rows, 28);
+    }
+
     /// A whole-block boundary has no tail: it is what the second request sharing a prefix
     /// attaches to, so it publishes on the first sighting while the tailed end still waits.
     #[test]
@@ -4843,17 +4987,20 @@ mod tests {
         let mut p = pool_with_cap(ops.clone(), 1 << 20);
         p.enable_deferred_reclaim();
         let a = prompt(17);
-        p.try_attach(0, &a).unwrap();
-        p.ensure_rows(0, 17).unwrap();
-        p.publish(0, &a, 48, |_| Ok(())).unwrap();
-        p.begin_seq(0);
-        p.sync_reclaim(); // the slot's stale columns are unmapped: the cache holds the only refs
-        assert_eq!(p.stats().cache_blocks, 4);
+        let c: Vec<u32> = a.iter().map(|t| t + 1).collect();
+        for (seq, pr) in [(0, &a), (1, &c)] {
+            p.try_attach(seq, pr).unwrap();
+            p.ensure_rows(seq, 17).unwrap();
+            p.publish(seq, pr, 48, |_| Ok(())).unwrap();
+            p.begin_seq(seq);
+        }
+        p.sync_reclaim(); // the slots' stale columns are unmapped: the cache holds the only refs
+        assert_eq!(p.stats().cache_blocks, 8);
         *ops.free_bytes.lock().unwrap() = Some(200);
         p.enable_pressure_eviction(300);
-        p.release_prefix(1); // a trim: the leaf's 2 blocks (128) queued for release + 200 free
-        assert_eq!(p.stats().nodes_evicted, 1);
-        assert_eq!(p.stats().cache_blocks, 2, "the parent block stays cached");
+        p.release_prefix(1); // a trim: one prefix's 4 blocks (256) queued for release + 200 free
+        assert_eq!(p.stats().eviction_units, 1);
+        assert_eq!(p.stats().cache_blocks, 4, "the other prefix stays cached");
     }
 
     #[test]

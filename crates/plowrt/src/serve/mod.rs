@@ -1024,6 +1024,8 @@ async fn metrics_handler(
         ("cache_bytes", "gauge", "Prefix cache bytes."),
         ("snapshot_bytes", "gauge", "Prefix snapshot bytes."),
         ("snapshots_evicted_total", "counter", "Prefix snapshots evicted."),
+        ("eviction_units_total", "counter", "Suffix evictions: a boundary plus the blocks only it kept attachable."),
+        ("eviction_unit_bytes_total", "counter", "Bytes freed by suffix evictions."),
     ] {
         crate::obs::serving::family(&mut out, &format!("plowrt_prefix_{name}"), kind, help);
     }
@@ -1045,7 +1047,9 @@ async fn metrics_handler(
              plowrt_prefix_cache_blocks{{model=\"{slug}\"}} {}\n\
              plowrt_prefix_cache_bytes{{model=\"{slug}\"}} {}\n\
              plowrt_prefix_snapshot_bytes{{model=\"{slug}\"}} {}\n\
-             plowrt_prefix_snapshots_evicted_total{{model=\"{slug}\"}} {}\n",
+             plowrt_prefix_snapshots_evicted_total{{model=\"{slug}\"}} {}\n\
+             plowrt_prefix_eviction_units_total{{model=\"{slug}\"}} {}\n\
+             plowrt_prefix_eviction_unit_bytes_total{{model=\"{slug}\"}} {}\n",
             s.attach_hits,
             s.attach_misses,
             s.tokens_queried,
@@ -1058,6 +1062,8 @@ async fn metrics_handler(
             s.cache_bytes,
             s.snapshot_bytes,
             s.snapshots_evicted,
+            s.eviction_units,
+            s.eviction_unit_bytes,
         );
     }
     ([("content-type", "text/plain; version=0.0.4; charset=utf-8")], out).into_response()

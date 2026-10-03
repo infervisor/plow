@@ -279,6 +279,9 @@ impl GpuEngine {
                 for chunk in &chunks {
                     self.seq_tokens[chunk.slot].extend_from_slice(chunk.tokens);
                 }
+                for chunk in &chunks {
+                    self.vmm_publish_shared(chunk.slot, chunk.c0 as u32);
+                }
                 for slot in completed {
                     self.vmm_publish(slot, self.pos[slot].saturating_sub(1));
                     self.vmm_prefill_done(slot);

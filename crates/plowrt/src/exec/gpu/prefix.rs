@@ -745,6 +745,19 @@ impl GpuEngine {
         }
     }
 
+    /// Publish slot `b`'s shared-prefix end (`VmmKv::share_rows`, e.g. a system prompt
+    /// another sequence also sent) once the prefill chunk that started at `c0` passed it,
+    /// while the rings still hold its window.
+    pub(super) fn vmm_publish_shared(&self, b: usize, c0: u32) {
+        let Some(v) = self.vmm.as_ref().filter(|v| v.kv.prefix_reuse()) else {
+            return;
+        };
+        let rows = v.kv.share_rows(b);
+        if rows > c0 && rows <= self.pos[b] {
+            self.publish_boundary(b, rows);
+        }
+    }
+
     /// Slot `b`'s prompt is prefilled and its prompt-end publish has run.
     pub(super) fn vmm_prefill_done(&self, b: usize) {
         if let Some(v) = self.vmm.as_ref().filter(|v| v.kv.prefix_reuse()) {
