@@ -1371,11 +1371,17 @@ impl VmmKv {
                 let mut i = 0;
                 while i < list.len() {
                     let snap = &list[i];
+                    let common = snap.tail.iter().zip(&chain[start.min(chain.len())..])
+                        .take_while(|(a, b)| a == b)
+                        .count();
+                    // A never-attached turn end whose last rows differ: the next prompt
+                    // re-rendered the reply to other token ids, so it can never attach.
+                    let stale_turn_end = snap.attaches == 0 && common + TURN_END_SLACK >= snap.tail.len();
                     let superseded = snap.users == 0
                         && snap.session
                         && snap.attaches <= 1
                         && snap.rows < rows
-                        && chain.get(start..snap.rows as usize) == Some(snap.tail.as_slice());
+                        && (common == snap.tail.len() || stale_turn_end);
                     if superseded {
                         dead.push(list.swap_remove(i));
                     } else {
@@ -2239,6 +2245,9 @@ fn note_lead(inner: &mut Inner, seq: usize, tokens: &[u32]) -> bool {
     inner.lead_seen.get(&key).is_some_and(|&n| n > 1)
 }
 
+/// Trailing rows in which a session's turn-end boundary may differ from the next prompt
+/// (the reply re-tokenized) and still count as superseded ([`VmmKv::retire_superseded`]).
+const TURN_END_SLACK: usize = 64;
 /// Recent prompts compared for a shared prefix (a system prompt).
 const RECENT_PROMPTS: usize = 32;
 /// Rows of each recent prompt kept for the comparison.
@@ -4675,6 +4684,29 @@ mod tests {
         p.begin_seq(0);
         p.ensure_rows(0, 1).unwrap();
         assert_eq!(p.try_attach(0, &pr).unwrap().expect("newest boundary").rows, 28);
+    }
+
+    /// A never-attached session turn end whose last rows the next prompt re-rendered to other
+    /// ids can never attach; the next prompt-side publish retires it.
+    #[test]
+    fn session_retires_a_re_rendered_turn_end() {
+        let ops = Arc::new(MockVmm::default());
+        let p = uniform_pool(ops.clone());
+        let a = prompt(30);
+        let mut turn_end = a.clone();
+        turn_end[18] += 1;
+        assert!(p.try_attach(0, &turn_end).unwrap().is_none());
+        p.ensure_rows(0, 30).unwrap();
+        p.note_session(0, &turn_end);
+        p.publish_at(0, &turn_end, 20, 4, |_| Ok(())).unwrap();
+        p.begin_seq(0);
+        p.ensure_rows(1, 1).unwrap();
+        assert!(p.try_attach(1, &a).unwrap().is_none(), "the re-rendered prompt cannot attach");
+        p.ensure_rows(1, 30).unwrap();
+        p.note_session(1, &a);
+        p.publish_at(1, &a, 28, 4, |_| Ok(())).unwrap();
+        assert_eq!(p.retire_superseded(&a, 28), 4);
+        assert_eq!(p.stats().snapshot_bytes, 4);
     }
 
     /// The second prompt sharing a 300-row head with a recent one names the shared end
