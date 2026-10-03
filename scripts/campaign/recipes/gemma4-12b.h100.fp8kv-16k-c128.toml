@@ -1,8 +1,8 @@
 # Gemma-4-12B-it FP8 (hub checkpoint, re-keyed), H100 SXM5, FP8 KV, 16K context, 128 decode slots:
 # the per-rung route selection trial. Control = the 16K/128-slot FP8-KV packet this recipe extends
 # (campaign scratch production-16k128-fp8kv/recipe.toml); every difference below is a measured
-# per-rung route choice. Not production-qualified: promotion needs the FP32-reference quality gate
-# (`campaign.py gate`) and matched vLLM serving.
+# per-rung route choice. FP32-reference gate (llm_fp32_ref, peer = cached vLLM 0.28 captures):
+# PASS, KL mean 0.109 vs vLLM 0.128. Matched vLLM serving not yet run.
 #
 # Routes (per-rung evidence: docs/runtime/kernel-generators.md "Gemma-4 12B FP8 per-rung routes"):
 #   prefill projections   cuBLASLt FP8 OUTER_VEC where it wins (segment_roles::cublaslt_prefill_fp8),
@@ -11,7 +11,8 @@
 #   prefill hd256 sliding generated attn_pf_hd256_sliding_fp8kv (FlashPrefillFp8, every rung >= 128)
 #   prefill hd512 global  generated attn_pf_hd512_fp8kv (TileLang, FlashPrefillFp8, every rung >= 128)
 #   decode B=128          cuBLASLt output head, light FP8 attention with 16-byte loads, direct
-#                         V conversion and the segmented FlashDecode grid; B < 128 unchanged
+#                         V conversion and the segmented FlashDecode grid (the light attention
+#                         also serves B < 128: 3-10% faster per step)
 #   decode B 33..128      the 128 rung: the control's 64 rung (TC64 GEMV) measured 139.6 / 146.9 /
 #                         175.0 ms per step at ctx 1K / 4K / 16K against 40.5 / 55.2 / 111.1 ms
 #                         on the 128 rung, so the ladder drops 64 (and with it TC64)
