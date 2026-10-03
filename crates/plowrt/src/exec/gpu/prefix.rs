@@ -813,6 +813,20 @@ impl GpuEngine {
         }
     }
 
+    /// Longest prefill slice from `c0` that leaves slot `b`'s shared-prefix end publishable:
+    /// the rings hold only `ring - window` rows past a boundary (`publish_boundary`), and a
+    /// request slice may be wider than that.
+    pub fn pf_publish_cap(&self, b: usize, c0: usize) -> usize {
+        let Some(v) = self.vmm.as_ref().filter(|v| v.kv.prefix_reuse() && !v.slide.is_empty()) else {
+            return usize::MAX;
+        };
+        let share = v.kv.share_rows(b) as usize;
+        if share <= c0 {
+            return usize::MAX;
+        }
+        share + (v.ring as usize).saturating_sub(v.kv.geometry().window as usize) - c0
+    }
+
     /// Slot `b`'s prompt is prefilled and its prompt-end publish has run.
     pub(super) fn vmm_prefill_done(&self, b: usize) {
         if let Some(v) = self.vmm.as_ref().filter(|v| v.kv.prefix_reuse()) {

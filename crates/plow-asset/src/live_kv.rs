@@ -441,7 +441,7 @@ impl Manifest {
                             if slot == 6 || slot == 7 => {}
                         DevOp::HeadNormRopeFp8 if slot == 6 => {
                             require(
-                                scales.get(&h) == Some(&d.t[0]) && writes.insert(h),
+                                scales.get(&h) == Some(&d.t[0]) && (writes.insert(h) || prefill),
                                 "scale writer contract",
                             )?;
                         }
@@ -510,7 +510,9 @@ impl Manifest {
                                     } else {
                                         d.i[6] == p.rows || (legacy && d.i[6] == 0)
                                     })
-                                    && writes.insert(h),
+                                    // A staged prefill writes each sliding cache once per stage
+                                    // (`packed_prefill::stage_map`, proven in its validate).
+                                    && (writes.insert(h) || prefill),
                                 "cache writer contract",
                             )?;
                         }
