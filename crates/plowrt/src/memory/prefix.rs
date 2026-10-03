@@ -51,7 +51,7 @@
 //! are blitted D2D into the new sequence's head-slots, which skips the prefill
 //! but not the KV storage. `runtime/tests/qwen3_prefix.cu` measures exactly that.
 
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::memory::pool::GrowablePool;
 
@@ -373,6 +373,16 @@ impl PrefixCache {
             e.pinned_until = Some(e.pinned_until.map_or(until, |t| t.max(until)));
             cur = Some(n);
         }
+    }
+
+    /// `(owner_seq, block_idx)` of every live node pinned past now.
+    pub fn pinned(&self) -> FxHashSet<(u32, u32)> {
+        let now = std::time::Instant::now();
+        self.nodes
+            .iter()
+            .filter(|n| !n.evicted && n.pinned_until.is_some_and(|t| t > now))
+            .map(|n| (n.owner_seq, n.block_idx))
+            .collect()
     }
 
     /// Drop one reference along the matched path of `hashes` (its first `blocks`
