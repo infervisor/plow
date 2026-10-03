@@ -789,6 +789,7 @@ impl GpuEngine {
         // those snapshots are transient, and each one's trim evicts another session's boundary.
         // Publish them only for a request waiting on this prefill (`inflight_prefix`).
         let session = self.session_pin[b].is_some();
+        let prompt = v.kv.prompt_rows(b);
         let mut p = step;
         while p < p_a {
             if !session || v.kv.checkpoint_awaited(toks, p) {
@@ -796,14 +797,16 @@ impl GpuEngine {
             }
             p += step;
         }
-        if session && max_rows >= rows && rows < v.kv.prompt_rows(b) {
+        if session && rows < prompt && !v.kv.checkpoint_awaited(toks, p_a) {
             return;
         }
-        // Only a prompt-side publish retires: the next turn's prompt re-renders this turn's
-        // reply, which need not re-tokenize to the generated ids, so the turn-end boundary
-        // may not match it and the prompt-end boundary must survive until then.
+        // Only the prompt-end publish retires (a chunk-end publish also caps `max_rows` below
+        // `rows`): the next turn's prompt re-renders this turn's reply, which need not
+        // re-tokenize to the generated ids, so the turn-end boundary may not match it and the
+        // prompt-end boundary must survive until then.
         let published = self.publish_boundary(b, p_a);
-        if let Some(ttl) = self.session_pin[b].filter(|_| published && max_rows < rows) {
+        let prompt_end = rows == prompt && max_rows < rows;
+        if let Some(ttl) = self.session_pin[b].filter(|_| published && prompt_end) {
             // Pinned now, not at retire: while this turn decodes, other sessions' publishes
             // must not evict it ahead of idle sessions' boundaries.
             v.kv.pin_prefix(&toks[..p_a as usize], std::time::Instant::now() + ttl);
