@@ -303,16 +303,10 @@
  },
  "interp_flash_fp8kv_gq": {
   "plow_interp_flash": {
-   "no_scratch": true,
-   "forbid": [
-    "v_mfma_f32_32x32x64_f8f6f4",
-    "v_mfma_scale_f32_32x32x64_f8f6f4"
-   ]
-  },
-  "plow_exec": {
    "require_min": {
     "v_perm_b32": 1
    },
+   "no_scratch": true,
    "forbid": [
     "v_mfma_f32_32x32x64_f8f6f4",
     "v_mfma_scale_f32_32x32x64_f8f6f4"

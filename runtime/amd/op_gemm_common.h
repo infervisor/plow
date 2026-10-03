@@ -5390,6 +5390,8 @@ __device__ void d_gemv_glu(bf16* C, const bf16* x, const bf16* Wg, const bf16* W
             gemv_glu_rows<1, PLOW_GLU_K4096_UN>(C_, Wg, Wu, M_, N, K, act, slice, nblk, lds, beta, lbeta);
         else if (K == 7168)
             gemv_glu_rows<1, 7>(C_, Wg, Wu, M_, N, K, act, slice, nblk, lds, beta, lbeta);
+        else if (K == 3072)
+            gemv_glu_rows<1, 6>(C_, Wg, Wu, M_, N, K, act, slice, nblk, lds, beta, lbeta);
         else if (K == 2560)
             gemv_glu_rows<1, 5>(C_, Wg, Wu, M_, N, K, act, slice, nblk, lds, beta, lbeta);
         else if (K == 2048)
@@ -5466,6 +5468,8 @@ __device__ void d_gemv_qkvg(bf16* Cq, bf16* Ck, bf16* Cv, bf16* Cg, const bf16* 
             gemv_qkvg_rows<1, 8>(Cq_, Ck_, Cv_, Cg_, Wq, Wk, Wv, Wg, M_, Nq, Nk, Nv, Ng, K, slice, nblk, lds);
         else if (K == 7168)
             gemv_qkvg_rows<1, 7>(Cq_, Ck_, Cv_, Cg_, Wq, Wk, Wv, Wg, M_, Nq, Nk, Nv, Ng, K, slice, nblk, lds);
+        else if (K == 3072)
+            gemv_qkvg_rows<1, 6>(Cq_, Ck_, Cv_, Cg_, Wq, Wk, Wv, Wg, M_, Nq, Nk, Nv, Ng, K, slice, nblk, lds);
         else if (K == 2048)
             gemv_qkvg_rows<1, 4>(Cq_, Ck_, Cv_, Cg_, Wq, Wk, Wv, Wg, M_, Nq, Nk, Nv, Ng, K, slice, nblk, lds);
         else if (K == 1024)
@@ -5558,10 +5562,20 @@ __device__ void d_gemv(bf16* C, const bf16* x, const bf16* W, const float* rms,
             d_gemv_t<1, 8>(C_, x_, W, rms_, gamma, M_, N, K, norm, eps, slice, nblk, lds);
         else if (K == 2560)
             d_gemv_t<1, 5>(C_, x_, W, rms_, gamma, M_, N, K, norm, eps, slice, nblk, lds);
+        else if (K == 3072)
+            d_gemv_t<1, 6>(C_, x_, W, rms_, gamma, M_, N, K, norm, eps, slice, nblk, lds);
         else if (K == 2048)
             d_gemv_t<1, 4>(C_, x_, W, rms_, gamma, M_, N, K, norm, eps, slice, nblk, lds);
         else if (K == 1024)
             d_gemv_t<1, 2>(C_, x_, W, rms_, gamma, M_, N, K, norm, eps, slice, nblk, lds);
+        else if (K == 6144)
+            d_gemv_t<1, 6>(C_, x_, W, rms_, gamma, M_, N, K, norm, eps, slice, nblk, lds);
+        else if (K == 8192)
+            d_gemv_t<1, 8>(C_, x_, W, rms_, gamma, M_, N, K, norm, eps, slice, nblk, lds);
+        else if (K == 10240)
+            d_gemv_t<1, 10>(C_, x_, W, rms_, gamma, M_, N, K, norm, eps, slice, nblk, lds);
+        else if (K == 15360)
+            d_gemv_t<1, 10>(C_, x_, W, rms_, gamma, M_, N, K, norm, eps, slice, nblk, lds);
         else
             d_gemv_t<1>(C_, x_, W, rms_, gamma, M_, N, K, norm, eps, slice, nblk, lds);
     } else {
