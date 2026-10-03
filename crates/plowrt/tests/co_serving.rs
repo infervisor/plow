@@ -16,8 +16,7 @@ fn setup_groups(label: &str, groups: usize) -> (Arc<AppState>, Vec<ModelMux>) {
     static INIT: std::sync::Once = std::sync::Once::new();
     INIT.call_once(|| {
         let mut cfg = plowrt::config::RuntimeConfig::get().clone();
-        cfg.co_sched = plowrt::serve::cosched::CoSched::Rr;
-        cfg.co_sched_quantum = 4;
+        cfg.co_sched = Some(plowrt::serve::cosched::CoSched::Rr);
         plowrt::config::RuntimeConfig::init(cfg);
     });
     let registry = Registry::new();
@@ -32,7 +31,7 @@ fn setup_groups(label: &str, groups: usize) -> (Arc<AppState>, Vec<ModelMux>) {
         registry,
         Arc::new(ExecutorSet::bringup(backend).unwrap()),
     ));
-    state.install_device_turns(groups);
+    state.install_device_turns(groups, false);
     assert!(state.device_turn("a").unwrap().ordered());
     let muxes = state
         .registry

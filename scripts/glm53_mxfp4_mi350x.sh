@@ -49,7 +49,7 @@ if [ "${GLM_RECIPE:-dense}" = dsa ]; then
             PLOW_DSA_PREP=1 PLOW_DSA_IDX_FP8=1 PLOW_DSA_SELECT_V3=1)
 fi
 # The MHA prefill arm traps on kv_len != rows (prefix-cache hits, continuation chunks).
-RUN_ENV=(PLOW_PREFIX_CACHE=0 PLOW_AMD_DECODE_MIN_RUNG=1 PLOW_TP_NO_AUDIT=0 PLOW_TP_AGREE_EVERY=1)
+RUN_ENV=(PLOW_PREFIX_CACHE=0 PLOW_DECODE_MIN_RUNG=1 PLOW_TP_NO_AUDIT=0 PLOW_TP_AGREE_EVERY=1)
 
 cmd="${1:-}"; shift || true
 case "$cmd" in
@@ -87,7 +87,7 @@ validate)
   done
   for spec in "8 8064 128" "1 8064 128"; do
     read -r c i o <<< "$spec"
-    PLOWRT_BIN="$PLOWRT" PB_ALLOW_HAZARD="PLOW_PREFIX_CACHE PLOW_AMD_DECODE_MIN_RUNG" \
+    PLOWRT_BIN="$PLOWRT" PB_ALLOW_HAZARD="PLOW_PREFIX_CACHE PLOW_DECODE_MIN_RUNG" \
       bash "$WT/scripts/bench/glm53-mxfp4-plow.sh" "$out/serve-c${c}_in$i" "$assets" "$obj" "$c" "$i" "$o" \
       > "$out/serve-c${c}_in$i.log" 2>&1 || echo "serve c$c rc=$?"
     grep -hE "Mean TTFT|Mean TPOT|Total token throughput|Failed" "$out/serve-c${c}_in$i"/*.bench.log \

@@ -299,6 +299,15 @@ impl AsrServer {
         map.entry(key).or_default().clone()
     }
 
+    /// The served model's metrics (`plowrt serve` only).
+    fn metrics(&self, _model: &str) -> Option<Arc<crate::obs::Metrics>> {
+        match &self.backend {
+            Backend::Cohort { .. } => None,
+            #[cfg(feature = "cuda")]
+            Backend::Serve(state) => Some(state.model_metrics(_model)),
+        }
+    }
+
     async fn route(&self, model: &str) -> Result<(Route, FinalizationPolicy), Response> {
         match &self.backend {
             Backend::Cohort { model: served, mux, finalization } => {
@@ -354,11 +363,11 @@ async fn transcription(
     headers: axum::http::HeaderMap,
     multipart: Multipart,
 ) -> Response {
-    let ids = match RequestIds::from_headers(&headers) {
+    let mut ids = match RequestIds::from_headers(&headers) {
         Ok(ids) => ids,
         Err(e) => return failure(StatusCode::BAD_REQUEST, e),
     };
-    let mut response = transcribe_upload(state, multipart, &ids).await;
+    let mut response = transcribe_upload(state, multipart, &mut ids).await;
     ids.stamp(&mut response);
     response
 }
@@ -371,7 +380,7 @@ fn form_bool(fields: &std::collections::HashMap<String, String>, name: &str) -> 
     }
 }
 
-async fn transcribe_upload(state: Arc<AsrServer>, mut multipart: Multipart, ids: &RequestIds) -> Response {
+async fn transcribe_upload(state: Arc<AsrServer>, mut multipart: Multipart, ids: &mut RequestIds) -> Response {
     let upload = match state.uploads.clone().try_acquire_owned() {
         Ok(p) => p,
         Err(_) => return failure(StatusCode::TOO_MANY_REQUESTS, "too many ASR uploads"),
@@ -400,7 +409,7 @@ async fn transcribe_upload(state: Arc<AsrServer>, mut multipart: Multipart, ids:
             if !matches!(
                 name.as_str(),
                 "model" | "language" | "prompt" | "response_format" | "temperature" | "stream" | "append" | "final"
-                    | "offset"
+                    | "offset" | "session_id" | "prompt_cache_key" | "turn_id" | "turn_budget_ms"
             ) || fields.contains_key(&name)
             {
                 return failure(StatusCode::BAD_REQUEST, "unknown or duplicate field");
@@ -413,6 +422,25 @@ async fn transcribe_upload(state: Arc<AsrServer>, mut multipart: Multipart, ids:
             fields.insert(name, value);
         }
     }
+    // Form fields as the JSON endpoints' body fallbacks: `session_id` > `X-Session-Id`; `turn_id` / `turn_budget_ms` below their headers.
+    let route_fields = crate::serve::session::RouteFields {
+        session_id: fields.remove("session_id"),
+        prompt_cache_key: fields.remove("prompt_cache_key"),
+        metadata: Some(
+            ["turn_id", "turn_budget_ms"]
+                .into_iter()
+                .filter_map(|k| Some((k.to_owned(), serde_json::Value::String(fields.remove(k)?))))
+                .collect(),
+        ),
+        trace: None,
+    };
+    if let Err(e) = ids.apply_body(&route_fields) {
+        return failure(StatusCode::BAD_REQUEST, e);
+    }
+    if let Some(r) = crate::serve::overload::gate(ids) {
+        return r;
+    }
+    let ids = &*ids;
     let Some(model) = fields.get("model").cloned() else {
         return failure(StatusCode::BAD_REQUEST, "model is required");
     };
@@ -472,8 +500,18 @@ async fn transcribe_upload(state: Arc<AsrServer>, mut multipart: Multipart, ids:
         },
     };
     drop(upload);
+    let finals = !recorded || finish;
+    let mut run = crate::serve::turns::StageRun::start(
+        ids,
+        crate::serve::turns::Kind::Asr,
+        &model,
+        state.metrics(&model),
+        Instant::now(),
+        finals,
+    );
+    let ids = &RequestIds { turn_key: run.key(), ..ids.clone() };
     let (report, report_rx) = ids.report();
-    let mut opts = AsrOpts { final_pass: !recorded || finish, ids: Some(ids.clone()), report, ..Default::default() };
+    let mut opts = AsrOpts { final_pass: finals, ids: Some(ids.clone()), report, ..Default::default() };
     // A session recording: append, then transcribe all of it (partial) or finish it (final).
     let mut recorded_samples = 0;
     let (samples, mut recording) = if recorded {
@@ -537,11 +575,13 @@ async fn transcribe_upload(state: Arc<AsrServer>, mut multipart: Multipart, ids:
             return failure(StatusCode::SERVICE_UNAVAILABLE, "ASR engine unavailable")
         }
     };
-    let finals = !recorded || finish;
     let offset = recorded.then_some(recorded_samples);
     if stream {
         let cache = crate::serve::session::CacheOutcome::received(report_rx).await;
-        let mut response = sse_transcript(work, delta_rx, ids.clone(), finals, offset, cache, (in_flight, cancel, recording));
+        run.admitted(cache.and_then(|c| c.at));
+        let stamped = run.headers();
+        let mut response = sse_transcript(work, delta_rx, ids.clone(), finals, offset, cache, (in_flight, cancel, recording), run);
+        response.headers_mut().extend(stamped);
         if let Some(cache) = cache {
             cache.stamp(&mut response);
         }
@@ -550,11 +590,17 @@ async fn transcribe_upload(state: Arc<AsrServer>, mut multipart: Multipart, ids:
     let started = Instant::now();
     let result = work.await;
     if let (Some(rec), false, Ok(Ok(result))) = (recording.as_mut(), finals, &result) {
-        let duty = crate::config::RuntimeConfig::get().asr_partial_duty.clamp(0.01, 1.0);
+        let duty = crate::config::RuntimeConfig::get().asr_partial_duty.clamp(0.01, 1.0) * if crate::serve::overload::level() >= 1 { 0.5 } else { 1.0 };
         let rest = started.elapsed().mul_f64(1.0 / duty - 1.0);
         rec.partial = Some((result.text.clone(), Instant::now() + rest));
     }
     drop((in_flight, recording));
+    let cache = crate::serve::session::CacheOutcome::received(report_rx).await;
+    run.admitted(cache.and_then(|c| c.at));
+    if matches!(result, Ok(Ok(_))) {
+        run.first();
+        run.done();
+    }
     let mut response = match result {
         Ok(Ok(result)) if format == "text" => result.text.into_response(),
         Ok(Ok(result)) if recorded => Json(json!({"text":result.text,"final":finals,"offset":recorded_samples})).into_response(),
@@ -562,7 +608,8 @@ async fn transcribe_upload(state: Arc<AsrServer>, mut multipart: Multipart, ids:
         Ok(Err(error)) => return runtime_failure(error),
         Err(error) => return failure(StatusCode::SERVICE_UNAVAILABLE, error),
     };
-    if let Some(cache) = crate::serve::session::CacheOutcome::received(report_rx).await {
+    run.stamp(&mut response);
+    if let Some(cache) = cache {
         cache.stamp(&mut response);
     }
     response
@@ -573,6 +620,9 @@ fn transcript_event(kind: &str, ids: &RequestIds, mut body: serde_json::Value) -
     body["request_id"] = ids.request.as_ref().into();
     if let Some(session) = &ids.session {
         body["session_id"] = session.as_ref().into();
+    }
+    if let Some(key) = &ids.turn_key {
+        body["turn_id"] = key.turn.as_ref().into();
     }
     axum::response::sse::Event::default().data(body.to_string())
 }
@@ -592,6 +642,7 @@ fn sse_transcript<H: Send + 'static>(
     offset: Option<usize>,
     cache: Option<crate::serve::session::CacheOutcome>,
     held: H,
+    mut run: crate::serve::turns::StageRun,
 ) -> Response {
     let (tx, mut rx) = mpsc::channel::<axum::response::sse::Event>(64);
     tokio::spawn(async move {
@@ -625,7 +676,10 @@ fn sse_transcript<H: Send + 'static>(
                     done["session_cache"] = cache.status.as_str().into();
                     done["cached_tokens"] = cache.rows.into();
                 }
-                transcript_event("transcript.text.done", &ids, done)
+                run.first();
+                run.done();
+                let _ = tx.send(transcript_event("transcript.text.done", &ids, done)).await;
+                run.sse_comment()
             }
             Ok(Err(error)) => transcript_event("error", &ids, json!({"message": error.to_string()})),
             Err(error) => transcript_event("error", &ids, json!({"message": error.to_string()})),
@@ -645,12 +699,15 @@ async fn upgrade(
         Ok(ids) => ids,
         Err(e) => return failure(StatusCode::BAD_REQUEST, e),
     };
+    if let Some(r) = crate::serve::overload::gate(&ids) {
+        return r;
+    }
     let permit = match state.sessions.clone().try_acquire_owned() {
         Ok(p) => p,
         Err(_) => return failure(StatusCode::TOO_MANY_REQUESTS, "too many ASR sessions"),
     };
     // Each connection is a session: its partials resume the decoder rows the last one retained.
-    ids.session.get_or_insert_with(|| format!("ws-{}", ids.request).into());
+    ids.session.get_or_insert_with(|| crate::serve::session::minted::session().into());
     let echo = ids.clone();
     let mut response = ws
         .max_message_size(65536)
@@ -750,9 +807,9 @@ async fn stream(state: Arc<AsrServer>, mut socket: WebSocket, _permit: OwnedSema
     let partials = start.partials;
     let session = ids.session.clone().unwrap_or_default();
     let windows: Arc<parking_lot::Mutex<WindowCache>> = Default::default();
-    let request = |final_pass| AsrOpts {
+    let request = |final_pass, turn_key: Option<crate::serve::turns::TurnKey>| AsrOpts {
         final_pass,
-        ids: Some(RequestIds { request: RequestIds::generated().request, session: ids.session.clone() }),
+        ids: Some(RequestIds { turn_key, ..ids.with_new_request() }),
         windows: (!final_pass).then(|| windows.clone()),
         deltas: None,
         report: None,
@@ -838,7 +895,15 @@ async fn stream(state: Arc<AsrServer>, mut socket: WebSocket, _permit: OwnedSema
             );
             // The final supersedes an in-flight partial; dropping its receiver cancels it.
             drop(pending.take());
-            let mut work = match route.submit(samples, language, start.prompt, cancel.0.clone(), request(true)) {
+            let mut run = crate::serve::turns::StageRun::start(
+                &ids,
+                crate::serve::turns::Kind::Asr,
+                &start.model,
+                state.metrics(&start.model),
+                Instant::now(),
+                true,
+            );
+            let mut work = match route.submit(samples, language, start.prompt, cancel.0.clone(), request(true, run.key())) {
                 Ok(work) => work,
                 Err(SubmitError::Full) => {
                     send(
@@ -875,11 +940,15 @@ async fn stream(state: Arc<AsrServer>, mut socket: WebSocket, _permit: OwnedSema
             };
             match result {
                 Ok(Ok(result)) => {
+                    run.first();
+                    run.done();
                     send(
                         &mut socket,
                         json!({"type":"final","revision":revision + 1,
                         "text":result.text,"language":result.language,
-                        "stable_prefix_bytes":result.text.len()}),
+                        "stable_prefix_bytes":result.text.len(),
+                        "turn_id":run.turn_id.as_deref(),"traceparent":run.traceparent(),
+                        "server_timing":run.timing().header()}),
                     )
                     .await;
                 }
@@ -899,7 +968,7 @@ async fn stream(state: Arc<AsrServer>, mut socket: WebSocket, _permit: OwnedSema
         if partials && pending.is_none() && samples.len() >= partial_at + PARTIAL_STRIDE {
             partial_at = samples.len();
             // A full queue skips this partial; the next stride retries.
-            pending = route.submit(samples.clone(), language.clone(), start.prompt.clone(), cancel.0.clone(), request(false)).ok();
+            pending = route.submit(samples.clone(), language.clone(), start.prompt.clone(), cancel.0.clone(), request(false, None)).ok();
         }
         let grant = (16000 - samples.len() % 16000)
             .min(max_audio_samples - samples.len())

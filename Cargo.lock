@@ -1356,9 +1356,11 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "899def5c37c4fd7b2664648c28120ecec138e4d395b459e5ca34f9cce2dd77fd"
 dependencies = [
  "cfg-if",
+ "js-sys",
  "libc",
  "r-efi 5.3.0",
  "wasip2",
+ "wasm-bindgen",
 ]
 
 [[package]]
@@ -2858,6 +2860,7 @@ dependencies = [
  "packet",
  "parking_lot",
  "plow-asset",
+ "rand 0.9.4",
  "rayon",
  "rustc-hash",
  "rustfft",
@@ -2865,6 +2868,8 @@ dependencies = [
  "serde",
  "serde_json",
  "smallvec",
+ "svcache",
+ "svid",
  "thiserror 2.0.18",
  "tokenizers 0.23.2",
  "tokio",
@@ -3827,6 +3832,44 @@ name = "subtle"
 version = "2.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
+
+[[package]]
+name = "svcache"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "96adb4b7c62ad958ff44654e404955828d1e526d57ec3804f036b3d53eda7ba0"
+dependencies = [
+ "chrono",
+ "dashmap",
+ "serde",
+ "web-time",
+]
+
+[[package]]
+name = "svid"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ce5097fd45d32719639da29be988cf139b3bb5f36250646b571b3b1f3e1254a1"
+dependencies = [
+ "bs58",
+ "getrandom 0.3.4",
+ "js-sys",
+ "rand 0.9.4",
+ "svid-macros",
+ "wasm-bindgen",
+]
+
+[[package]]
+name = "svid-macros"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3bba4ea70934dbd994294c280256911b4180aeeb1e46f9f94da2e868ee833c0c"
+dependencies = [
+ "heck 0.5.0",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
+]
 
 [[package]]
 name = "syn"

@@ -51,7 +51,7 @@
 //! are blitted D2D into the new sequence's head-slots, which skips the prefill
 //! but not the KV storage. `runtime/tests/qwen3_prefix.cu` measures exactly that.
 
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::memory::pool::GrowablePool;
 
@@ -375,6 +375,16 @@ impl PrefixCache {
         }
     }
 
+    /// `(owner_seq, block_idx)` of every live node pinned past now.
+    pub fn pinned(&self) -> FxHashSet<(u32, u32)> {
+        let now = std::time::Instant::now();
+        self.nodes
+            .iter()
+            .filter(|n| !n.evicted && n.pinned_until.is_some_and(|t| t > now))
+            .map(|n| (n.owner_seq, n.block_idx))
+            .collect()
+    }
+
     /// Drop one reference along the matched path of `hashes` (its first `blocks`
     /// entries). Nodes at zero refs become eligible for eviction.
     pub fn release(&mut self, hashes: &[BlockHash], blocks: usize) {
@@ -403,12 +413,18 @@ impl PrefixCache {
     /// "returns wrong KV, produces fluent wrong text" failure this cache must
     /// never have.
     pub fn evict_lru(&mut self) -> Option<(u32, u32)> {
+        self.evict_lru_where(|_| true)
+    }
+
+    /// [`Self::evict_lru`] restricted to leaves whose `(owner_seq, block_idx)` passes `pick`.
+    pub fn evict_lru_where(&mut self, pick: impl Fn((u32, u32)) -> bool) -> Option<(u32, u32)> {
         let now = std::time::Instant::now();
         let victim = self
             .nodes
             .iter()
             .enumerate()
             .filter(|(_, n)| !n.evicted && n.refs == 0 && n.children.is_empty())
+            .filter(|(_, n)| pick((n.owner_seq, n.block_idx)))
             .min_by_key(|(_, n)| (n.pinned_until.is_some_and(|t| t > now), n.last_used))
             .map(|(i, _)| i as NodeId)?;
 

@@ -9,7 +9,7 @@ LLM of the voice-agent server, next to Qwen3-ASR and Chatterbox ([tts.md](tts.md
 ```sh
 # no nix: PLOW_CAMPAIGN_NO_NIX=1, CARGO_TARGET_DIR holding a release plowc, PLOW_NVCC (+ NVCC_PREPEND_FLAGS)
 python3 scripts/campaign/campaign.py build recipes/infervisor/gemma-4-e4b/sm90a-h100-tp1.toml --out $OUT
-PLOW_HSACO=$OUT/assets plowrt serve --assets $OUT/assets --multistep-adaptive
+PLOW_HSACO=$OUT/assets plowrt serve --assets $OUT/assets
 ```
 
 The recipe runs base emit -> `scripts/build_sm90a_gemma4_segments.sh` -> role emit and keeps only
@@ -509,6 +509,37 @@ are p50/p95 ms (ASR final, LLM TTFT, TTS TTFA) and underrun turns:
 * 200 calls need the TTS render ~6x cheaper. Streaming partials make ASR the next cost (~0.3 s of
   device per turn at 50 calls).
 * E4B is the smallest share: ~64 tokens per turn at low batch.
+
+**Update (2026-10-02, worktree-gen-kernels: serving objective + S3Gen h16).** Chatterbox-MTL alone
+now serves 78 aps at c200, above the ~72 that 200 calls need. `serve_voice_agent.sh calls` against
+repro 834d0b6c (base), two interleaved runs each, p50/p95 ms and underrun turns:
+
+| calls | build | ASR final | LLM TTFT | TTS TTFA | underrun | SLOs |
+|---|---|---|---|---|---|---|
+| 50 | base | 154/385, 196/454 | 91/250, 87/302 | 425/906, 387/817 | 0, 0 | TTFA p95 |
+| 50 | new | 161/405, 169/418 | 54/221, 86/284 | 391/774, 378/700 | 0, 0 | **pass** |
+| 100 | base | 240/542, 227/565 | 113/497, 151/634 | 985/1864, 1012/2276 | 181, 154 | 3 fail |
+| 100 | new | 193/488, 212/543 | 151/968, 148/754 | 1000/2178, 982/1776 | 178, 145 | 3 fail |
+| 200 | base | 326/846, 336/1038 | 780/14126, 783/13776 | 4180/8076, 4365/9194 | 560, 567 | 4 fail |
+| 200 | new | 300/970, 317/929 | 1355/86657, 1490/79453 | 2288/4113, 2346/4370 | 475, 488 | 4 fail |
+
+* 50 calls now pass every SLO. At 200, TTS first audio halves, but the LLM TTFT tail grows
+  (p95 14 s -> 80 s, wall 130 -> 165 s).
+* The tail follows the h16 render, not the objective: the new runtime with `PLOW_OBJECTIVE=latency`
+  keeps it (p95 66 s); with the pre-h16 MTL packet it is 17.8 s. E4B's KV budget is the same
+  18.5 GiB in every run.
+* 200 calls, new build, co-sched mode:
+
+  | co-sched | ASR final | LLM TTFT | TTS TTFA | underrun | wall |
+  |---|---|---|---|---|---|
+  | deadline | 300/970 | 1355/86657 | 2288/4113 | 475 | 166 s |
+  | rr | 1634/3882 | 199/13549 | 3410/6689 | 538 | 116 s |
+  | free | 720/5110 | 5362/112539 | 692/3512 | 5 | 196 s |
+
+* Under `free` the TTS render keeps up with 200 calls (5 of 600 turns underrun), so render
+  capacity is no longer the limit. The device share is: each mode serves one model at the others'
+  expense. 200 calls need a share policy, e.g. render a stream only as far ahead of its playback
+  clock as needed and give the freed turns to first tokens and ASR finals.
 
 ## Kernel work and where the time goes
 

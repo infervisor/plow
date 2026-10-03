@@ -377,12 +377,6 @@ impl PackedTerminal {
         Ok(())
     }
 
-    /// Launch the terminal for `rows` without waiting for it (the pipelined mixed step).
-    pub(super) fn launch_rows(&mut self, e: &GpuEngine, rows: &[u32], live: usize) -> Result<()> {
-        let i = self.stage_rows(rows);
-        self.launch(e, live, i)
-    }
-
     pub(super) fn run_rows(&mut self, e: &GpuEngine, rows: &[u32], live: usize) -> Result<&[u32]> {
         let i = self.stage_rows(rows);
         if rows.is_empty() {

@@ -67,6 +67,12 @@ __device__ __forceinline__ float __fa_ex2(float x) {
 #ifndef PLOW_NV_FA_WPR
 #define PLOW_NV_FA_WPR 0
 #endif
+#ifndef PLOW_NV_FA_WPR_FP8
+#define PLOW_NV_FA_WPR_FP8 0
+#endif
+#if PLOW_NV_FA_WPR_FP8 && !PLOW_NV_FA_WPR
+#error "PLOW_NV_FA_WPR_FP8 requires PLOW_NV_FA_WPR"
+#endif
 /* Skip staging Q into smem and read it from global instead (WPR path only). Q is GF*D bf16 --
  * 1 KiB at GF=2,D=256 -- and L2-resident, while the staging costs a full __syncthreads on
  * EVERY work item. At nsplit=32 an item owns only 32 of the 256 tile rows, so that fixed cost
@@ -2033,9 +2039,9 @@ __device__ void d_flash_decode(float* __restrict__ Opart, float* __restrict__ ml
            * fully coalesced 512 B load (D=512 is two). The dot then costs a warp reduction per
            * query head, which the per-thread form did not need. Threads read their own row's
            * score back out of Ssm so the softmax/PV code below is untouched.
-           * Only the plain bf16 KV layout takes this path; SZ/fp8 KV keep the default body. The K
-           * reduction order changes, so scores are numerically equivalent, not bit-identical. */
-          if constexpr (!SZKV && !FP8KV && D >= 256) {
+           * HD512 FP8 KV takes this path only with PLOW_NV_FA_WPR_FP8; HD256 FP8 and SZKV keep
+           * the default body. The K reduction order changes, so scores are not bit-identical. */
+          if constexpr (!SZKV && (!FP8KV || (PLOW_NV_FA_WPR_FP8 && D == 512 && !FA_DEC_SPART(D, GF))) && D >= 256) {
             constexpr int NC = D / 256; /* 256 = 32 lanes * 8 elems */
             /* Only [0,rmax) of the tile has live rows -- at nsplit=8 a work item owns 128 rows
              * against a 256-row tile, so half the sweep was pure loop+store overhead. Fill the
@@ -2064,10 +2070,17 @@ __device__ void d_flash_decode(float* __restrict__ Opart, float* __restrict__ ml
                      * in-bounds even for a masked or past-the-tile r; only the dot and the
                      * store below are gated. Loading unconditionally keeps all WRB loads
                      * issued back-to-back, which is the entire point of the batch. */
-                    const __nv_bfloat16* krow = kbase + (size_t)(kvr & kv_mask) * D;
 #pragma unroll
-                    for (int c = 0; c < NC; c++)
-                        k8[t][c] = ld_glob8_cs(krow + (unsigned)c * 256u + lane * 8u);
+                    for (int c = 0; c < NC; c++) {
+                        if constexpr (FP8KV) {
+                            const unsigned safe_kvr = kv0 + min(r, rmax - 1u);
+                            const unsigned char* krow = kb8 + (size_t)(safe_kvr & kv_mask) * D;
+                            k8[t][c] = fp8v8_to_bf16v8(ld_glob_fp8v8(krow + (unsigned)c * 256u + lane * 8u));
+                        } else {
+                            const __nv_bfloat16* krow = kbase + (size_t)(kvr & kv_mask) * D;
+                            k8[t][c] = ld_glob8_cs(krow + (unsigned)c * 256u + lane * 8u);
+                        }
+                    }
                 }
 #pragma unroll
                 for (int t = 0; t < WRB; t++) {
@@ -2085,7 +2098,7 @@ __device__ void d_flash_decode(float* __restrict__ Opart, float* __restrict__ ml
 #pragma unroll
                             for (int g = 0; g < GF; g++)
 #if PLOW_NV_FA_QREG
-                                if constexpr (D >= 256 && GF <= 4)
+                                if constexpr (!FP8KV && D >= 256 && GF <= 4)
                                     dt[g] = dot8(k8[t][c], qreg[g][c], dt[g]);
                                 else
 #endif
@@ -2098,8 +2111,10 @@ __device__ void d_flash_decode(float* __restrict__ Opart, float* __restrict__ ml
 #endif
                         }
                         if constexpr (!FA_DEC_SPART(D, GF)) {
+                        float ks = 1.0f;
+                        if constexpr (FP8KV) ks = ksc[(kv0 + r) & kv_mask];
 #pragma unroll
-                        for (int g = 0; g < GF; g++) sr[g] = warp_sum32(dt[g]) * FA_SCALE(scale);
+                        for (int g = 0; g < GF; g++) sr[g] = warp_sum32(dt[g]) * FA_SCALE(scale) * ks;
                         }
                     }
                     if constexpr (FA_DEC_SPART(D, GF)) {
@@ -5306,6 +5321,9 @@ __device__ void d_flash_prefill_mux(const int* __restrict__ req, float* __restri
     }
 }
 
+#ifndef PLOW_NV_FP8_PACKED_VARLEN
+#define PLOW_NV_FP8_PACKED_VARLEN 0
+#endif
 #if PLOW_FP8_KV && PLOW_NV_PACKED_REQUEST
 template <int HD>
 __device__ void d_flash_prefill_fp8_mux(
@@ -5317,6 +5335,39 @@ __device__ void d_flash_prefill_fp8_mux(
     unsigned q_pos0, unsigned window, unsigned nsplit, unsigned kv_stride,
     unsigned kv_mask, float scale, unsigned slice, unsigned nblk, float* lds) {
     const unsigned count = req ? (unsigned)req[0] : 1;
+#if PLOW_NV_FP8_PACKED_VARLEN && (!PLOW_NV_FA_PIPE || PLOW_NV_FA_FP8MMA)
+    if (HD == 256 && req && O && nsplit == 1) {
+        unsigned total = 0;
+        for (unsigned r = 0; r < count; ++r)
+            total += ((unsigned)req[2 + 4*r] + 63) / 64 * n_head;
+        for (unsigned flat = slice; flat < total; flat += nblk) {
+            unsigned base = 0;
+            for (unsigned r = 0; r < count; ++r) {
+                const unsigned q0 = (unsigned)req[1 + 4*r];
+                const unsigned qlen = (unsigned)req[2 + 4*r];
+                const unsigned work = ((qlen + 63) / 64) * n_head;
+                if (flat >= base + work) { base += work; continue; }
+                const unsigned slot = (unsigned)req[3 + 4*r];
+                const unsigned kvlen = (unsigned)req[4 + 4*r];
+                const size_t qoff = (size_t)q0 * n_head * HD;
+                const size_t soff = (size_t)slot * n_kv_head * kv_stride;
+#if PLOW_NV_FA_PIPE && PLOW_NV_FA_FP8MMA
+                d_flash_prefill_px23<256, 64, 32>(
+#else
+                d_flash_prefill<256, 64, 32, true>(
+#endif
+                    Opart + qoff, mlpart + (size_t)q0 * n_head * 2, Q + qoff,
+                    (const __nv_bfloat16*)(K + soff * HD),
+                    (const __nv_bfloat16*)(V + soff * HD), O + qoff,
+                    qlen, kvlen, n_head, n_kv_head, kvlen - qlen, window, 1,
+                    kv_stride, kv_mask, scale, flat - base, total, lds,
+                    k_scale + soff, v_scale + soff);
+                break;
+            }
+            __syncthreads();
+        }
+    } else
+#endif
     for (unsigned r = 0; r < count; ++r) {
         const unsigned q0 = req ? (unsigned)req[1 + 4*r] : 0;
         const unsigned qlen = req ? (unsigned)req[2 + 4*r] : seq_q;

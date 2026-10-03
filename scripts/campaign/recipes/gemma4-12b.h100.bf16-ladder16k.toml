@@ -57,15 +57,20 @@ role_files = [
   "interp_sm90a_pfattn_hd256_gqa2_bkv32.cubin",
   "interp_sm90a_pfattn_hd256_bkv32.cubin",
   "interp_sm90a_pfgemm_glu_gemma4.cubin",
+  "gen_sm90a_attn_pf_hd256_sliding.cubin",
 ]
 [objects.env]
 # The px4 BQ64 hd512 object hardcodes n_kv_head=1 (the 12B's full-attention geometry). The rest
 # of the BF16 object set is the script's default.
 PLOW_BUILD_PFATTN_HD512_PX4_BQ64 = "1"
+PLOW_BUILD_GEN_KERNELS = "attn_pf_hd256_sliding"
 
 [emit_roles.env]
 PLOW_GEMMA4_SM90_HD256_GQA2_ROLE = "1"
 PLOW_GEMMA4_SM90_HD512_PX4_BQ64_ROLE = "0"
+# Generated hd256 sliding prefill (docs/runtime/kernel-generators.md) takes the sliding sites on
+# rungs >= 1024 rows from role 14: C1 TTFT 1024 -7.6%, 4096/8192 -4.3%, logit top1 0.982.
+PLOW_EMIT_GEN_KERNELS = "attn_pf_hd256_sliding"
 
 [serve.env]
 # The matched ladder runs cache-off (vLLM --no-enable-prefix-caching; vllm-bench random prompts
@@ -111,7 +116,7 @@ gate_prompt = "<bos><start_of_turn>user\nWhat is the capital of France? Answer i
 in_lens = "128 1024 4096 8192 15000"
 concs = "1 4"
 nprompt = 32
-# Queue-driven prefill packing (PLOW_PF_INTERLEAVE_ADAPTIVE): four 1024-row prompts arriving together no
+# Queue-driven prefill packing (the latency objective): four 1024-row prompts arriving together no
 # longer share one 172 ms launch; the oldest runs whole and later ones join only while that is cheaper.
 # Measured p12p, 16 prompts, off -> on: 1024 in TTFT 167.0 -> 107.7 ms (vLLM 0.28: 130.6), TPOT 11.93 -> 12.32;
 # 128 / 4096 / 15000 in level (40.5 / 363 / 1712 -> 40.1 / 359 / 1711).
@@ -122,7 +127,7 @@ nprompt = 32
 # TTFT and TPOT level to 0.1 %. 128/C4 p99 ITL 42.4 -> 11.3 and TTFT 40.5 -> 36.9; 15000/C4 TTFT
 # 1439 -> 1180 ms for TPOT 22.29 -> 24.08 (E2E 1.079 -> 1.071 x vLLM). C4 at 1024-8192 in is
 # unchanged: there p99 ITL is prefill interference, not the wave.
-serve_env = { PLOW_MULTISTEP = "0", PLOW_DECODE_PIPELINE = "1", PLOW_DECODE_MAX_RUNG = "4", PLOW_PF_INTERLEAVE = "0", PLOW_PF_INTERLEAVE_ADAPTIVE = "1" }
+serve_env = { PLOW_DECODE_MAX_RUNG = "4" }
 
 [bench.profiles.high_concurrency]
 in_lens = "128 1024 4096 8192 15000"
@@ -133,7 +138,7 @@ nprompt = 64
 # 74.9 ms, p99 ITL 98.5 -> 14.4, 1164 -> 1204 tok/s, TPOT 12.55 -> 12.71; 1024 / 4096 in level.
 # FAST_PROBE: a cold backlog tries the widest rung after one sample instead of four. C16, p12r,
 # 64 prompts (agent/pack-fairness): 128 in P99 TTFT 170 -> 150 ms, mean / tok/s level, 1024 / 4096 level.
-serve_env = { PLOW_MULTISTEP = "0", PLOW_DECODE_MAX_RUNG = "16", PLOW_PF_INTERLEAVE = "0", PLOW_TOKEN_BATCH = "1", PLOW_QUEUE_TTL_MS = "0", PLOW_RUNG_FAST_PROBE = "1" }
+serve_env = { PLOW_MULTISTEP = "0", PLOW_DECODE_MAX_RUNG = "16" }
 
 [reference]
 csv = "perf-data/campaign/gemma4-12b.h100.reference-vllm028-bf16.csv"

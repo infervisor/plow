@@ -145,7 +145,6 @@ fn fp8_live_allocations_match_prefix_reference_across_rungs_and_slot_reuse() {
         ("PLOW_VMM_PREFIX", "1"),
         ("PLOW_PREFIX_CACHE", "1"),
         ("PLOW_TOKEN_BATCH", "0"),
-        ("PLOW_PF_BATCH", "0"),
         ("PLOW_MULTISTEP", "0"),
         ("PLOW_KV_POOL_MIB", "0"),
     ]);
@@ -275,7 +274,6 @@ fn serialized_tma_slot_parity(all_slots_live: bool, lazy_rings: bool) {
         ("PLOW_VMM_LIVE_RINGS", "0"),
         ("PLOW_VMM_PREFIX", "0"),
         ("PLOW_PREFIX_CACHE", "0"),
-        ("PLOW_PF_BATCH", "0"),
         ("PLOW_VMM_BLOCK_MIB", "2"),
         ("PLOW_KV_POOL_MIB", "0"),
     ];
@@ -608,7 +606,6 @@ fn w8a16_m1_role_matches_interpreter_on_real_prompts() {
         ("PLOW_VMM_LIVE", "0"),
         ("PLOW_VMM_PREFIX", "0"),
         ("PLOW_PREFIX_CACHE", "0"),
-        ("PLOW_PF_BATCH", "0"),
         ("PLOW_TOKEN_BATCH", "0"),
         ("PLOW_MULTISTEP", "0"),
         ("PLOW_KV_POOL_MIB", "0"),

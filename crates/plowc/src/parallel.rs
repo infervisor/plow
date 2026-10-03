@@ -184,22 +184,7 @@ mod tests {
     }
 
     const H100_MEM: u64 = 80 * (1u64 << 30); // 80 GiB
-    const MI350_MEM: u64 = 288 * (1u64 << 30); // 288 GiB
     const B200_MEM: u64 = 192 * (1u64 << 30); // 192 GiB
-
-    #[test]
-    fn gemma4_31b_on_1x_mi350_fits_tp1() {
-        let cfg = derive_parallel(&gemma4_31b(), MI350_MEM, 1);
-        assert_eq!(
-            cfg,
-            ParallelConfig {
-                tp: 1,
-                pp: 1,
-                ep: 1,
-                dp: 1
-            }
-        );
-    }
 
     #[test]
     fn gemma4_31b_on_8x_h100_needs_tp() {

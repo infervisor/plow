@@ -45,10 +45,10 @@ pub enum CoSched {
     Free,
     /// Round-robin: one model's tick at a time per device, in arrival order.
     Rr,
-    /// One model's tick at a time, most urgent first ([`Urgency`]): a model holding deadline work
-    /// (an ASR final, a speech stream, a prompt waiting for its first token) takes the device
-    /// ahead of decode throughput, and throughput ahead of revisable partial results. A waiter
-    /// gains one class per [`AGE`] it waits, so nothing starves.
+    /// One model's tick at a time by [`Due::rank`]: first outputs (an ASR final, a prompt waiting
+    /// for its first token, a speech stream's first audio) ahead of decode and stream windows,
+    /// ahead of partials; least slack within a band, and work about to miss (a stream about to
+    /// underrun) ahead of all. A waiter is due by [`MAX_WAIT`] after it queued, so nothing starves.
     Deadline,
 }
 
@@ -95,41 +95,159 @@ pub enum Urgency {
     Bulk = 3,
 }
 
-/// A waiter moves up one [`Urgency`] class per `AGE` waited: bulk work gets the device within
-/// two of them however much deadline work keeps arriving.
-pub const AGE: Duration = Duration::from_millis(100);
+/// The starvation bound: a waiter queued this long is due now whatever its own deadline
+/// (`PLOW_COSCHED_MAX_WAIT_MS` overrides).
+pub const MAX_WAIT: Duration = Duration::from_millis(2000);
 
-/// How long a holder keeps the device while a waiter of its own class is queued. Ticks differ by
+pub(crate) fn max_wait() -> Duration {
+    static WAIT: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+    *WAIT.get_or_init(|| {
+        crate::config::RuntimeConfig::get()
+            .cosched_max_wait_ms
+            .map_or(MAX_WAIT, |ms| Duration::from_millis(ms.max(1) as u64))
+    })
+}
+
+/// How long a holder keeps the device while a waiter of the same slack is queued. Ticks differ by
 /// 20x across models (a 5 ms ASR step, a 100 ms multistep LLM quantum), so the share is time.
 pub const DEADLINE_QUANTUM: Duration = Duration::from_millis(20);
 
+/// Slacks closer than this are a tie (shared by [`DEADLINE_QUANTUM`]); a holder hands over only to
+/// a waiter tighter by more, so near-equal deadlines don't swap the device every tick.
+const YIELD_MARGIN: i64 = DEADLINE_QUANTUM.as_nanos() as i64;
+
+/// Priority band of a [`Due`], most urgent first. Least slack wins only within a band: by slack
+/// alone a decode tick (`last token + TBT`) always beats a first output due hundreds of ms out,
+/// which meets first-output deadlines late instead of minimizing them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Band {
+    /// About to miss ([`URGENT_SLACK`]) or at the starvation bound; assigned by [`Due::rank`].
+    Urgent = 0,
+    /// An ASR final: a few ms of device work upstream of every other stage of its turn.
+    Final = 1,
+    /// A first output on a turn's critical path: LLM first token, TTS first audio.
+    First = 2,
+    /// Decode and stream windows.
+    Stream = 3,
+    /// Revisable work (partial transcripts).
+    Bulk = 4,
+}
+
+impl From<Urgency> for Band {
+    fn from(u: Urgency) -> Band {
+        match u {
+            Urgency::Final => Band::Final,
+            Urgency::Deadline => Band::First,
+            Urgency::Normal => Band::Stream,
+            Urgency::Bulk => Band::Bulk,
+        }
+    }
+}
+
+/// Work with at most this slack, or twice its own cost, ranks [`Band::Urgent`].
+pub const URGENT_SLACK: Duration = Duration::from_millis(30);
+
+/// When work must be done and what it will cost on the device ([`CoSched::Deadline`]).
+#[derive(Clone, Copy, Debug)]
+pub struct Due {
+    pub deadline: Instant,
+    pub cost: Duration,
+    pub band: Band,
+}
+
+impl Due {
+    /// Time to spare after the work's cost, ns; negative once it can no longer make it.
+    pub fn slack(&self, now: Instant) -> i64 {
+        let ahead = match self.deadline.checked_duration_since(now) {
+            Some(d) => d.as_nanos() as i64,
+            None => -(now.duration_since(self.deadline).as_nanos() as i64),
+        };
+        ahead - self.cost.as_nanos() as i64
+    }
+
+    /// `(band, slack)`, lower runs first. Work at or under its urgent slack ranks
+    /// [`Band::Urgent`] and then by slack alone, except [`Band::Bulk`] (its deadline is soft, the
+    /// starvation bound promotes it instead) and [`Band::Final`], which turns urgent only once
+    /// past its deadline.
+    ///
+    /// ASR finals ahead of urgent work measured worse under load: at 200 calls the speech
+    /// pipeline stalled (TTFA p50 5.5-7.3 s vs 1.8 s; LLM TTFT p95 8-12 s vs 2.4-2.8 s), with or
+    /// without partials deferred while finals wait.
+    pub fn rank(&self, now: Instant) -> (Band, i64) {
+        let slack = self.slack(now);
+        let urgent = match self.band {
+            Band::Bulk => i64::MIN,
+            Band::Final => 0,
+            _ => (2 * self.cost).max(URGENT_SLACK).as_nanos() as i64,
+        };
+        (if slack <= urgent { Band::Urgent } else { self.band }, slack)
+    }
+
+    /// Whether `self`, waiting, should take the device from a holder due `mine`: a lower band; or
+    /// the same band and tighter by more than `margin_ns`, or tighter and going negative during
+    /// the holder's next tick (`mine.cost`).
+    pub fn outranks(&self, mine: &Due, now: Instant, margin_ns: i64) -> bool {
+        let ((b, s), (mb, my)) = (self.rank(now), mine.rank(now));
+        b < mb || (b == mb && (s < my.saturating_sub(margin_ns) || (s < my && s < mine.cost.as_nanos() as i64)))
+    }
+
+    /// The class callers' deadlines, for work pending since `since`. Final and Deadline are the
+    /// old classes' budgets (an ASR final's every step; a first token or first audio); Normal is
+    /// the starvation bound itself; Bulk lies past it. The band keeps the class order.
+    pub fn from_urgency(u: Urgency, since: Instant) -> Due {
+        let after = match u {
+            Urgency::Final => Duration::from_millis(100),
+            Urgency::Deadline => Duration::from_millis(300),
+            Urgency::Normal => max_wait(),
+            Urgency::Bulk => 4 * max_wait(),
+        };
+        Due { deadline: since + after, cost: Duration::ZERO, band: u.into() }
+    }
+}
+
 #[derive(Debug)]
 struct Waiter {
-    urgency: Urgency,
+    due: Due,
     since: Instant,
     seq: u64,
     wake: oneshot::Sender<()>,
 }
 
 impl Waiter {
-    fn rank(&self, now: Instant) -> u32 {
-        let aged = (now.saturating_duration_since(self.since).as_millis() / AGE.as_millis()) as u32;
-        (self.urgency as u32).saturating_sub(aged)
+    /// The waiter's `Due`; once it has waited `max_wait`, urgent with its deadline pulled in to
+    /// `since + max_wait`. Only then: capping at enqueue would flatten every deadline past the
+    /// bound into one.
+    fn due(&self, now: Instant, max_wait: Duration) -> Due {
+        let cap = self.since + max_wait;
+        if now >= cap {
+            Due { deadline: self.due.deadline.min(cap), band: Band::Urgent, ..self.due }
+        } else {
+            self.due
+        }
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct PrioState {
     held: bool,
     seq: u64,
+    max_wait: Duration,
     waiters: Vec<Waiter>,
 }
 
 impl PrioState {
+    fn new() -> PrioState {
+        PrioState { held: false, seq: 0, max_wait: max_wait(), waiters: Vec::new() }
+    }
+
+    fn tightest(&self, now: Instant) -> Option<usize> {
+        (0..self.waiters.len()).min_by_key(|&i| (self.waiters[i].due(now, self.max_wait).rank(now), self.waiters[i].seq))
+    }
+
     /// Give the device to the best-ranked waiter, or mark it free.
     fn hand_off(&mut self) {
         let now = Instant::now();
-        while let Some(i) = (0..self.waiters.len()).min_by_key(|&i| (self.waiters[i].rank(now), self.waiters[i].seq)) {
+        while let Some(i) = self.tightest(now) {
             if self.waiters.swap_remove(i).wake.send(()).is_ok() {
                 return;
             }
@@ -137,12 +255,20 @@ impl PrioState {
         self.held = false;
     }
 
-    /// Whether a holder of class `mine`, holding since `since`, should hand the device on.
-    fn should_yield(&self, mine: Urgency, since: Instant, now: Instant) -> bool {
+    fn outranks(&self, w: &Waiter, mine: Due, now: Instant) -> bool {
+        w.due(now, self.max_wait).outranks(&mine, now, YIELD_MARGIN)
+    }
+
+    /// Whether a holder due `mine`, holding since `since`, should hand the device on: outranked,
+    /// or tied (same band, slack within the margin) after a [`DEADLINE_QUANTUM`].
+    fn should_yield(&self, mine: Due, since: Instant, now: Instant) -> bool {
         let quantum_spent = now.saturating_duration_since(since) >= DEADLINE_QUANTUM;
+        let (mb, my) = mine.rank(now);
         self.waiters.iter().any(|w| {
-            let r = w.rank(now);
-            r < mine as u32 || (quantum_spent && r <= mine as u32)
+            self.outranks(w, mine, now) || {
+                let (b, s) = w.due(now, self.max_wait).rank(now);
+                quantum_spent && b == mb && s <= my + YIELD_MARGIN
+            }
         })
     }
 }
@@ -157,7 +283,7 @@ impl Drop for PrioHold {
 }
 
 impl PrioHold {
-    async fn acquire(state: &Arc<parking_lot::Mutex<PrioState>>, urgency: Urgency) -> PrioHold {
+    async fn acquire(state: &Arc<parking_lot::Mutex<PrioState>>, due: Due) -> PrioHold {
         let (seq, rx) = {
             let mut s = state.lock();
             if !s.held && s.waiters.is_empty() {
@@ -167,7 +293,7 @@ impl PrioHold {
             let (wake, rx) = oneshot::channel();
             s.seq += 1;
             let seq = s.seq;
-            s.waiters.push(Waiter { urgency, since: Instant::now(), seq, wake });
+            s.waiters.push(Waiter { due, since: Instant::now(), seq, wake });
             (seq, rx)
         };
         // A cancelled wait (the dispatcher's preempt select) must not strand a hand-off: leave
@@ -200,18 +326,15 @@ impl DeviceTurn {
             // spin the queue; one tick is the smallest meaningful share.
             quantum: quantum.max(1),
             turn: Arc::new(Mutex::new(())),
-            prio: Default::default(),
+            prio: Arc::new(parking_lot::Mutex::new(PrioState::new())),
         }
     }
 
-    /// Build a turn from `--co-sched` / `--co-sched-quantum`.
-    ///
-    /// A bad mode is refused loudly rather than falling back in silence: a
-    /// misspelled scheduler that quietly served `free` would look exactly like
-    /// a round-robin that does not work.
-    pub fn from_config() -> DeviceTurn {
-        let cfg = crate::config::RuntimeConfig::get();
-        DeviceTurn::new(cfg.co_sched, cfg.co_sched_quantum)
+    /// A turn in `mode` with the serving quantum: consecutive ticks one model keeps the device.
+    /// Not 1: models with different dynamic shared-memory requests force an SM carveout
+    /// reconfiguration on every alternation (~150-300us).
+    pub fn serving(mode: CoSched) -> DeviceTurn {
+        DeviceTurn::new(mode, 4)
     }
 
     pub fn mode(&self) -> CoSched {
@@ -227,11 +350,30 @@ impl DeviceTurn {
         self.mode != CoSched::Free
     }
 
-    /// Whether a model of class `mine` is outranked by a waiting co-tenant right now: it should
-    /// keep its next tick short.
+    /// [`Self::outranked_due`] for a model whose most urgent work, starting now, is `mine`.
     pub fn outranked(&self, mine: Urgency) -> bool {
+        self.outranked_due(Due::from_urgency(mine, Instant::now()))
+    }
+
+    /// Whether a model due `mine` is outranked by a waiting co-tenant right now: it should keep
+    /// its next tick short.
+    pub fn outranked_due(&self, mine: Due) -> bool {
+        if self.mode != CoSched::Deadline {
+            return false;
+        }
         let now = Instant::now();
-        self.mode == CoSched::Deadline && self.prio.lock().waiters.iter().any(|w| w.rank(now) < mine as u32)
+        let s = self.prio.lock();
+        s.waiters.iter().any(|w| s.outranks(w, mine, now))
+    }
+
+    /// The best-ranked waiter's `Due` (starvation bound applied), if anyone waits.
+    pub fn tightest_waiter(&self) -> Option<Due> {
+        if self.mode != CoSched::Deadline {
+            return None;
+        }
+        let now = Instant::now();
+        let s = self.prio.lock();
+        s.tightest(now).map(|i| s.waiters[i].due(now, s.max_wait))
     }
 
     /// Take the device turn, waiting behind anyone already queued.
@@ -261,17 +403,22 @@ impl Turn {
         self.take_at(turn, Urgency::Normal).await
     }
 
-    /// [`Self::take`] for a model whose most urgent work is `urgency` ([`CoSched::Deadline`]).
+    /// [`Self::take`] for a model whose most urgent work, starting now, is `urgency`.
     pub async fn take_at(&mut self, turn: &DeviceTurn, urgency: Urgency) {
+        self.take_due(turn, Due::from_urgency(urgency, Instant::now())).await
+    }
+
+    /// [`Self::take`] for a model whose most urgent work is `due` ([`CoSched::Deadline`]).
+    pub async fn take_due(&mut self, turn: &DeviceTurn, due: Due) {
         if turn.mode == CoSched::Deadline {
             if let (Some(hold), Some(since)) = (&self.prio, self.since) {
-                if !hold.0.lock().should_yield(urgency, since, Instant::now()) {
+                if !hold.0.lock().should_yield(due, since, Instant::now()) {
                     self.used += 1;
                     return;
                 }
                 self.release();
             }
-            self.prio = Some(PrioHold::acquire(&turn.prio, urgency).await);
+            self.prio = Some(PrioHold::acquire(&turn.prio, due).await);
             self.since = Some(Instant::now());
             self.used = 1;
             return;
@@ -454,10 +601,13 @@ mod tests {
         assert_eq!(*order.lock(), vec!['d', 'n', 'h']);
     }
 
-    /// Bulk work ages into the deadline class, so a stream of deadline ticks cannot starve it.
+    /// Bulk work is due once it has waited the starvation bound, so a stream of deadline ticks
+    /// cannot starve it.
     #[tokio::test]
     async fn bulk_waiters_age_in() {
+        const BOUND: Duration = Duration::from_millis(50);
         let dt = Arc::new(DeviceTurn::new(CoSched::Deadline, 4));
+        dt.prio.lock().max_wait = BOUND;
         let mut holder = Turn::default();
         holder.take_at(&dt, Urgency::Deadline).await;
         let dt2 = Arc::clone(&dt);
@@ -469,9 +619,216 @@ mod tests {
         while !bulk.is_finished() {
             holder.take_at(&dt, Urgency::Deadline).await;
             tokio::time::sleep(Duration::from_millis(5)).await;
-            assert!(t0.elapsed() < 3 * AGE, "bulk waiter starved");
+            assert!(t0.elapsed() < 6 * BOUND, "bulk waiter starved");
         }
-        assert!(t0.elapsed() >= AGE);
+        assert!(t0.elapsed() >= BOUND);
+    }
+
+    fn queue(s: &mut PrioState, due: Due, since: Instant) {
+        s.seq += 1;
+        let seq = s.seq;
+        s.waiters.push(Waiter { due, since, seq, wake: oneshot::channel().0 });
+    }
+
+    fn due_in(now: Instant, ms: u64, cost_ms: u64) -> Due {
+        Due { deadline: now + Duration::from_millis(ms), cost: Duration::from_millis(cost_ms), band: Band::Stream }
+    }
+
+    fn tightest_seq(s: &PrioState, now: Instant) -> u64 {
+        s.waiters[s.tightest(now).unwrap()].seq
+    }
+
+    #[test]
+    fn slack_counts_cost_and_goes_negative() {
+        let now = Instant::now();
+        assert_eq!(due_in(now, 100, 30).slack(now), 70_000_000);
+        let late = Due { deadline: now, ..due_in(now, 0, 5) };
+        assert_eq!(late.slack(now + Duration::from_millis(10)), -15_000_000);
+    }
+
+    /// Waiters are served least slack first, cost included, whatever order they queued in.
+    #[test]
+    fn least_slack_goes_first_and_ties_keep_arrival_order() {
+        let now = Instant::now();
+        let mut s = PrioState::new();
+        queue(&mut s, due_in(now, 500, 0), now); // 1
+        queue(&mut s, due_in(now, 300, 250), now); // 2: slack 50
+        queue(&mut s, due_in(now, 100, 0), now); // 3: slack 100
+        queue(&mut s, due_in(now, 100, 0), now); // 4: tie with 3
+        let mut order = Vec::new();
+        while let Some(i) = s.tightest(now) {
+            order.push(s.waiters.swap_remove(i).seq);
+        }
+        assert_eq!(order, vec![2, 3, 4, 1]);
+    }
+
+    /// Classes arriving together keep today's order: Final, Deadline, Normal, Bulk.
+    #[test]
+    fn from_urgency_keeps_class_order_for_same_time_arrivals() {
+        let now = Instant::now();
+        let mut s = PrioState::new();
+        for u in [Urgency::Bulk, Urgency::Normal, Urgency::Deadline, Urgency::Final] {
+            queue(&mut s, Due::from_urgency(u, now), now);
+        }
+        let mut order = Vec::new();
+        while let Some(i) = s.tightest(now) {
+            order.push(s.waiters.swap_remove(i).seq);
+        }
+        assert_eq!(order, vec![4, 3, 2, 1]);
+    }
+
+    /// A Normal waiter queued `MAX_WAIT` ago beats a fresh Deadline one; so does Bulk, whose own
+    /// deadline is past the bound, once it has waited the bound, and not before.
+    #[test]
+    fn starvation_bound_makes_old_waiters_due() {
+        let now = Instant::now();
+        let ago = |d: Duration| now.checked_sub(d).unwrap();
+        let mut s = PrioState::new();
+        let old = ago(s.max_wait + Duration::from_millis(10));
+        queue(&mut s, Due::from_urgency(Urgency::Normal, old), old); // 1
+        queue(&mut s, Due::from_urgency(Urgency::Deadline, now), now); // 2
+        assert_eq!(tightest_seq(&s, now), 1);
+
+        let mut s = PrioState::new();
+        let half = ago(s.max_wait / 2);
+        queue(&mut s, Due::from_urgency(Urgency::Bulk, half), half); // 1
+        queue(&mut s, Due::from_urgency(Urgency::Deadline, now), now); // 2
+        assert_eq!(tightest_seq(&s, now), 2);
+        queue(&mut s, Due::from_urgency(Urgency::Bulk, old), old); // 3
+        assert_eq!(tightest_seq(&s, now), 3);
+        assert!(s.waiters[2].due(now, s.max_wait).deadline <= old + s.max_wait);
+    }
+
+    /// The holder yields to a waiter tighter by more than the margin, or to one that would go
+    /// negative during the holder's next tick; a tie waits out the quantum.
+    #[test]
+    fn holder_yield_rule() {
+        let now = Instant::now();
+        let fresh = now;
+        let spent = now.checked_sub(DEADLINE_QUANTUM).unwrap();
+        let mine = due_in(now, 100, 0);
+
+        let mut s = PrioState::new();
+        queue(&mut s, due_in(now, 50, 0), now);
+        assert!(s.should_yield(mine, fresh, now), "tighter by more than the margin");
+
+        let mut s = PrioState::new();
+        queue(&mut s, due_in(now, 90, 0), now);
+        assert!(!s.should_yield(mine, fresh, now), "a tie keeps the device within the quantum");
+        assert!(s.should_yield(mine, spent, now), "a tie hands over after the quantum");
+
+        let mut s = PrioState::new();
+        queue(&mut s, due_in(now, 60, 0), now);
+        assert!(!s.should_yield(due_in(now, 70, 0), fresh, now));
+        // Both urgent (slack under twice the cost): within the band, the slack rule.
+        let mut s = PrioState::new();
+        queue(&mut s, due_in(now, 60, 20), now); // slack 40
+        assert!(s.should_yield(due_in(now, 130, 80), fresh, now), "would go negative during my tick");
+        assert!(!s.should_yield(due_in(now, 110, 80), fresh, now), "the holder is tighter still");
+    }
+
+    fn due_band(now: Instant, ms: u64, cost_ms: u64, band: Band) -> Due {
+        Due { band, ..due_in(now, ms, cost_ms) }
+    }
+
+    /// A first output goes ahead of decode however much tighter the decode's deadline, and a
+    /// holder ticking decode hands the device to it.
+    #[test]
+    fn first_outputs_outrank_decode_whatever_the_slack() {
+        let now = Instant::now();
+        let mut s = PrioState::new();
+        queue(&mut s, due_band(now, 90, 10, Band::Stream), now); // 1: decode, slack 80
+        queue(&mut s, due_band(now, 800, 100, Band::First), now); // 2: TTS first audio, slack 700
+        queue(&mut s, due_band(now, 400, 20, Band::First), now); // 3: LLM first token, slack 380
+        queue(&mut s, due_band(now, 500, 20, Band::Final), now); // 4: ASR final, slack 480
+        queue(&mut s, due_band(now, 60, 5, Band::Bulk), now); // 5: partial, slack 55
+        let mut order = Vec::new();
+        while let Some(i) = s.tightest(now) {
+            order.push(s.waiters.swap_remove(i).seq);
+        }
+        assert_eq!(order, vec![4, 3, 2, 1, 5], "ASR final, first outputs by slack, decode, partial");
+
+        let mut s = PrioState::new();
+        queue(&mut s, due_band(now, 800, 100, Band::First), now);
+        assert!(s.should_yield(due_band(now, 90, 10, Band::Stream), now, now));
+        assert!(!s.should_yield(due_band(now, 500, 20, Band::First), now, now), "tighter first output keeps it");
+        // An ASR final takes the device from a tighter first output (a render boosted to First).
+        let mut s = PrioState::new();
+        queue(&mut s, due_band(now, 500, 20, Band::Final), now);
+        assert!(s.should_yield(due_band(now, 450, 100, Band::First), now, now));
+        assert!(!s.should_yield(due_band(now, 100, 60, Band::First), now, now), "an urgent holder keeps it");
+    }
+
+    /// A stream about to underrun (slack under twice its render) preempts a first output, and so
+    /// does decode that has waited out its TBT; a partial is not promoted by its soft deadline.
+    #[test]
+    fn near_miss_ranks_urgent_over_first_outputs() {
+        let now = Instant::now();
+        let first = due_band(now, 500, 20, Band::First);
+        let stream = due_band(now, 150, 60, Band::Stream); // slack 90 <= 2 * 60
+        assert_eq!(stream.rank(now).0, Band::Urgent);
+        assert_eq!(first.rank(now).0, Band::First);
+        assert!(stream.outranks(&first, now, YIELD_MARGIN));
+        assert!(!first.outranks(&stream, now, YIELD_MARGIN));
+        let mut s = PrioState::new();
+        queue(&mut s, first, now);
+        queue(&mut s, stream, now);
+        assert_eq!(tightest_seq(&s, now), 2);
+
+        let decode = due_band(now, 100, 10, Band::Stream);
+        assert_eq!(decode.rank(now).0, Band::Stream);
+        assert_eq!(decode.rank(now + Duration::from_millis(75)).0, Band::Urgent);
+        let late = due_band(now, 10, 5, Band::Bulk);
+        assert_eq!(late.rank(now + Duration::from_millis(50)).0, Band::Bulk);
+        // A first output past its deadline is urgent too.
+        assert_eq!(first.rank(now + Duration::from_millis(600)).0, Band::Urgent);
+        // Everything late (overload): urgent work by slack alone, an ASR final included.
+        let dry = due_band(now, 0, 300, Band::Stream); // slack -300
+        let final_ = due_band(now, 0, 20, Band::Final); // slack -20
+        assert!(dry.outranks(&final_, now, YIELD_MARGIN) && !final_.outranks(&dry, now, YIELD_MARGIN));
+        // A final turns urgent only past its deadline: until then its band is ahead of the rest.
+        assert_eq!(due_band(now, 50, 40, Band::Final).rank(now).0, Band::Final);
+        assert_eq!(due_band(now, 30, 40, Band::Final).rank(now).0, Band::Urgent);
+    }
+
+    #[test]
+    fn free_and_rr_never_report_waiters() {
+        for mode in [CoSched::Free, CoSched::Rr] {
+            let dt = DeviceTurn::new(mode, 4);
+            queue(&mut dt.prio.lock(), due_in(Instant::now(), 0, 0), Instant::now());
+            assert!(dt.tightest_waiter().is_none());
+            assert!(!dt.outranked_due(due_in(Instant::now(), 1000, 0)));
+        }
+    }
+
+    /// The device goes to the least-slack waiter through real turns, and `tightest_waiter` and
+    /// `outranked_due` see it.
+    #[tokio::test]
+    async fn take_due_serves_least_slack() {
+        let dt = Arc::new(DeviceTurn::new(CoSched::Deadline, 4));
+        let mut holder = Turn::default();
+        let now = Instant::now();
+        holder.take_due(&dt, due_in(now, 5000, 0)).await;
+        let order = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let mut tasks = Vec::new();
+        for ms in [900u64, 200, 600] {
+            let (dt, order) = (Arc::clone(&dt), Arc::clone(&order));
+            tasks.push(tokio::spawn(async move {
+                let mut t = Turn::default();
+                t.take_due(&dt, due_in(now, ms, 0)).await;
+                order.lock().push(ms);
+                t.release();
+            }));
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(dt.tightest_waiter().map(|d| d.deadline), Some(now + Duration::from_millis(200)));
+        assert!(dt.outranked_due(due_in(now, 5000, 0)));
+        assert!(!dt.outranked_due(due_in(now, 100, 0)));
+        holder.release();
+        for t in tasks {
+            t.await.unwrap();
+        }
+        assert_eq!(*order.lock(), vec![200, 600, 900]);
     }
 
     /// A waiter cancelled after the device was handed to it passes the device on.

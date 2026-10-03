@@ -38,7 +38,8 @@ struct Encode {
 /// Finals go first. (The encoder stays off the co-tenant device turn: taking it there made a
 /// final's encode wait out other models' ticks, 52 -> 212 ms p50 at 50 calls, where running
 /// alongside them costs less.)
-fn encode_loop(rx: std::sync::mpsc::Receiver<Encode>, mut encoder: PacketAudioEncoder) {
+/// `cost_id`: the encoder's id in [`crate::sched::cost`]; launches are sized at a 10 ms mel hop.
+fn encode_loop(rx: std::sync::mpsc::Receiver<Encode>, mut encoder: PacketAudioEncoder, cost_id: usize) {
     let max_chunks = encoder.max_packed_chunks();
     let mut pending: std::collections::VecDeque<Encode> = Default::default();
     while let Ok(first) = rx.recv() {
@@ -66,6 +67,7 @@ fn encode_loop(rx: std::sync::mpsc::Receiver<Encode>, mut encoder: PacketAudioEn
                     wall_ms = started.elapsed().as_secs_f64() * 1e3,
                     "asr: single encoder launch"
                 );
+                crate::sched::cost::record_id(cost_id, crate::sched::cost::Op::Encode { audio_ms: job.features.frames as u32 * 10 }, started.elapsed());
                 let _ = job.respond.send(rows);
                 continue;
             }
@@ -81,6 +83,7 @@ fn encode_loop(rx: std::sync::mpsc::Receiver<Encode>, mut encoder: PacketAudioEn
                 wall_ms = started.elapsed().as_secs_f64() * 1e3,
                 "asr: packed encoder launch"
             );
+            crate::sched::cost::record_id(cost_id, crate::sched::cost::Op::Encode { audio_ms: features.iter().map(|f| f.frames as u32 * 10).sum() }, started.elapsed());
             match encoded {
                 Ok(rows) => {
                     for (job, rows) in batch.into_iter().zip(rows) {
@@ -123,9 +126,10 @@ impl SharedAsr {
         let chunking = prompt.chunking();
         let window_frames = encoder.window_rows() / chunking.chunk_frames.div_ceil(chunking.frame_stride) * chunking.chunk_frames;
         let (encode, rx) = std::sync::mpsc::channel::<Encode>();
+        let cost_id = crate::sched::cost::id(&dir.join("encoder.pkt").to_string_lossy());
         std::thread::Builder::new()
             .name("plow-asr-encoder".into())
-            .spawn(move || encode_loop(rx, encoder))
+            .spawn(move || encode_loop(rx, encoder, cost_id))
             .map_err(|e| RuntimeError::Msg(format!("spawn ASR encoder thread: {e}")))?;
         Ok(Self {
             prompt: Arc::new(prompt),
@@ -319,7 +323,9 @@ impl SharedAsr {
                 class: if opts.final_pass { JobClass::Final } else { JobClass::Bulk },
                 raw_tokens: true,
                 session,
-                speech: Some(Box::new(SpeechJob { overlay, overlay_pos, pos_base: None, cfg: None })),
+                turn: opts.ids.as_ref().and_then(|i| i.turn_key.clone()),
+                continuing: false,
+                speech: Some(Box::new(SpeechJob { overlay, overlay_pos, pos_base: None, cfg: None, first_tokens: 0 })),
             },
         };
         mux.submit_wait(job).await.map_err(|e| match e {

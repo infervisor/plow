@@ -36,9 +36,9 @@
 #
 # TWO AXES, because not every knob is a -D. The prefill BUCKET ladder is picked
 # at run time by GpuEngine::pick_prefill_bucket (a padded-row cost model with a
-# per-launch penalty), and its policy knobs — PLOW_PF_COVER, PLOW_PF_CHUNK_COST —
-# are environment, not compile-time. Column 3 sets those, and configs that differ
-# only in env REUSE one cubin build instead of paying 90 s to rebuild it.
+# per-launch penalty), so runtime knobs are environment, not compile-time. Column 3
+# sets those, and configs that differ only in env REUSE one cubin build instead of
+# paying 90 s to rebuild it.
 #
 # NOT TUNABLE HERE: segmented dispatch (PLOW_NV_SEGMENTS / PLOW_NV_SEG_GEMM,
 # the "switch interpreter / wave size" objects). The serve path requires a

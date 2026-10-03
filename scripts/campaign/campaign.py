@@ -5,6 +5,7 @@
     campaign.py serve   <recipe.toml> --assets DIR --profile P [--port N]  # production plowrt serve
     campaign.py bench   <recipe.toml> --assets DIR --out DIR [--concs "1 4"] [--in-lens ...]
     campaign.py compare <results.csv> <reference.csv> [--roofline] [--recipe <recipe.toml>]
+    campaign.py report  --baseline VLLM_RES --infervisor PLOW_RES --gate gates.json --out DIR  # final report
     campaign.py roofline <recipe.toml> [--results results.csv]
     campaign.py loop    <recipe.toml> [--out DIR] [--profile realtime]
     campaign.py sweep   <recipe.toml> --param KNOB --values V1,V2 [--out DIR]
@@ -21,6 +22,7 @@ from __future__ import annotations
 import argparse
 import csv
 import hashlib
+import importlib.util
 import json
 import re
 import os
@@ -273,8 +275,9 @@ def cmd_block_ab(a: argparse.Namespace) -> None:
     print(f"queued {record['job']}; results: {out}")
 
 
-def git(*args: str) -> str:
-    return subprocess.run(["git", *args], cwd=REPO, capture_output=True, text=True).stdout.strip()
+def git(*args: str, raw: bool = False) -> str:
+    output = subprocess.run(["git", *args], cwd=REPO, capture_output=True, text=True).stdout
+    return output if raw else output.strip()
 
 
 def cmd_serve_bench(a: argparse.Namespace) -> None:
@@ -419,15 +422,17 @@ def nix(cmd: list[str]) -> list[str]:
     return ["nix", "develop", "--command", *cmd]
 
 
-def expand(value: str, out: Path) -> str:
+def expand(value: str, out: Path, lenient: bool = False) -> str:
     """Recipe placeholders: `{out}` (the build dir), `{repo}`, `{env:VAR}`, `{hf:org/name}` (the
     snapshot of a Hugging Face repo in $HF_HUB_CACHE / $HF_HOME/hub), `{hf:org/name@rev}` (that
-    exact snapshot)."""
+    exact snapshot). `lenient` leaves an unset `{env:}` or absent `{hf:}` unexpanded."""
     def hf(ref: str) -> str:
         repo, _, rev = ref.partition("@")
         hub = os.environ.get("HF_HUB_CACHE") or os.path.join(os.environ.get("HF_HOME", os.path.expanduser("~/.cache/huggingface")), "hub")
         snaps = sorted(Path(hub, "models--" + repo.replace("/", "--"), "snapshots").glob(rev or "*"))
         if not snaps:
+            if lenient:
+                return "{hf:" + ref + "}"
             want = f"{repo} revision {rev}" if rev else repo
             die(f"hf:{want} is not in {hub}; download it first "
                 f"(huggingface-cli download {repo}{' --revision ' + rev if rev else ''})")
@@ -441,6 +446,8 @@ def expand(value: str, out: Path) -> str:
         if key.startswith("env:"):
             v = os.environ.get(key[4:])
             if v is None:
+                if lenient:
+                    return m.group(0)
                 die(f"recipe needs ${key[4:]}")
             return v
         if key.startswith("hf:"):
@@ -457,7 +464,11 @@ def env_with(base: dict, extra: dict) -> dict:
 
 # ---------------------------------------------------------------- build
 def cmd_build(a: argparse.Namespace) -> None:
-    r = load(a.recipe)
+    recipe_bytes = Path(a.recipe).read_bytes()
+    r = tomllib.loads(recipe_bytes.decode("utf-8"))
+    for key in ("cell", "emit", "bench"):
+        if key not in r:
+            die(f"{a.recipe}: missing [{key}]")
     cell, emit = r["cell"], r["emit"]
     if getattr(a, "hf_dir", None):
         cell["hf_dir"] = a.hf_dir
@@ -465,6 +476,16 @@ def cmd_build(a: argparse.Namespace) -> None:
     if out.exists() and any(out.iterdir()):
         die(f"{out} exists and is not empty; a build is reproducible only into a fresh dir")
     out.mkdir(parents=True, exist_ok=True)
+    (out / "recipe.toml").write_bytes(recipe_bytes)
+    def source_state(name):
+        diff = out / f"source-{name}.diff"
+        diff.write_text(git("diff", "--binary", "HEAD", raw=True))
+        return {"commit": git("rev-parse", "HEAD"),
+                "status": git("status", "--porcelain"), "tracked_diff_sha256": sha(diff)}
+    source_start = source_state("start")
+    lock = REPO / "flake.lock"
+    if lock.is_file():
+        shutil.copy2(lock, out / "flake.lock")
     log = out / "build.log"
     cell["hf_dir"] = expand(cell["hf_dir"], out)
     emit = dict(emit, env={k: expand(v, out) for k, v in emit.get("env", {}).items()},
@@ -480,6 +501,7 @@ def cmd_build(a: argparse.Namespace) -> None:
     plowc = Path(os.environ.get("CARGO_TARGET_DIR", REPO / "target")) / "release" / "plowc"
     if not plowc.exists():
         die("target/release/plowc missing: nix develop -c cargo build -p plowc --release")
+    compiler_start = sha(plowc)
 
     base_args = [
         str(plowc),
@@ -511,7 +533,7 @@ def cmd_build(a: argparse.Namespace) -> None:
             oenv = env_with(os.environ, objects.get("env", {}))
             oenv.update(object_overrides)
             oenv["PLOW_CUBIN_CONFIG"] = str(base_dir / "plow_config.h")
-            if run(["bash", str(REPO / objects["script"]), str(base_dir), str(obj_dir)], oenv, log):
+            if run(["bash", "-x", str(REPO / objects["script"]), str(base_dir), str(obj_dir)], oenv, log):
                 die("object build failed; see build.log")
         assets = out / "assets"
         assets.mkdir()
@@ -521,6 +543,18 @@ def cmd_build(a: argparse.Namespace) -> None:
         # CLI overrides win over the recipe's role env too, so an A/B can switch a role off.
         if run(nix([*base_args, "--out", str(assets)]), env_with(env_with(common, roles.get("env", {})), overrides), log):
             die("role emit failed; see build.log")
+        # A role emit that moves the packet hash (the 12B W8A8 GLU role does) leaves the segment
+        # objects specialised for the BASE packet, and plowrt refuses them ("packet/interpreter
+        # MISMATCH"). Rebuild them against the final config; the base set stays for the record.
+        final_cfg = assets / "plow_config.h"
+        if objects and final_cfg.read_bytes() != (base_dir / "plow_config.h").read_bytes():
+            print("== objects (final packet config differs from base: rebuilding)", file=sys.stderr)
+            obj_dir.rename(out / "objects-base")
+            oenv = env_with(os.environ, objects.get("env", {}))
+            oenv.update(object_overrides)
+            oenv["PLOW_CUBIN_CONFIG"] = str(final_cfg)
+            if run(["bash", "-x", str(REPO / objects["script"]), str(assets), str(obj_dir)], oenv, log):
+                die("final object build failed; see build.log")
         # The role emit rebuilds its own cmake cubins (e.g. *_pfpackedseg); the recipe's object wins.
         for f in objects.get("role_files", []) if objects else []:
             (assets / f).write_bytes((obj_dir / f).read_bytes())
@@ -545,15 +579,35 @@ def cmd_build(a: argparse.Namespace) -> None:
             link.unlink()
         link.symlink_to(ck)
 
+    source_end = source_state("end")
+    compiler_end = sha(plowc)
     rec = {
         "recipe": str(Path(a.recipe).resolve()),
-        "recipe_sha256": sha(Path(a.recipe)),
-        "compiler_sha256": sha(plowc),
+        "recipe_sha256": sha(out / "recipe.toml"),
+        "recipe_snapshot": "recipe.toml",
+        "compiler_sha256": compiler_start,
+        "build_provenance": {
+            "source_start": source_start, "source_end": source_end,
+            "source_state_changed": source_start != source_end,
+            "compiler_end_sha256": compiler_end,
+            "compiler_changed": compiler_start != compiler_end,
+        },
+        "compilation": {
+            "log": "build.log",
+            "log_sha256": sha(log) if log.exists() else None,
+            "flake_lock_sha256": sha(out / "flake.lock") if (out / "flake.lock").exists() else None,
+            "toolchain_env": {k: os.environ[k] for k in
+                              ("PLOW_NVCC", "PLOW_NVCC_PATH", "NVCC_PREPEND_FLAGS", "NVCC_APPEND_FLAGS")
+                              if k in os.environ},
+            "emit_env": {**emit.get("env", {}), **overrides},
+            "role_env": {**(roles or {}).get("env", {}), **overrides},
+            "object_env": {**(objects or {}).get("env", {}), **object_overrides},
+        },
         "cell": cell,
         "overrides": overrides,
         "object_overrides": object_overrides,
-        "commit": git("rev-parse", "HEAD"),
-        "dirty": bool(git("status", "--porcelain")),
+        "commit": source_start["commit"],
+        "dirty": bool(source_start["status"]),
         "nix": os.environ.get("PLOW_CAMPAIGN_NO_NIX") != "1",
         "prep": [s.get("name") for s in r.get("prep", [])],
         "utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -648,6 +702,7 @@ def cmd_bench(a: argparse.Namespace) -> None:
         "LOG": str(out / "server.log"),
         "SERVE_EXTRA_ARGS": serve.get("extra_args", ""),
         "DATASET_ARGS": getattr(a, "dataset_args", None) or bench.get("dataset_args", ""),
+        "PREFIX_PCT": str(a.prefix_pct if getattr(a, "prefix_pct", None) is not None else bench.get("prefix_pct", 0)),
     })
     (out / "hf-home").mkdir(exist_ok=True)
     model_id = bench.get("model_id") or json.loads((assets / "build.json").read_text()).get("slug") or cell["revision"]
@@ -667,7 +722,7 @@ def cmd_bench(a: argparse.Namespace) -> None:
     # no compile overlaps a measurement; quietx.sh gates new builds while this session waits.
     quiet = [str(REPO / "scripts" / "bench" / "quietx.sh"), a.quiet_lock] if getattr(a, "quiet_lock", None) else []
     lines.append("exec " + " ".join(shlex.quote(x) for x in [*quiet,
-        str(BENCH), str(assets), str(bench.get("port", 8765)), model_id, bench["tokenizer"], str(bench.get("ready_s", 1200))]))
+        str(BENCH), str(assets), str(bench.get("port", 8765)), model_id, expand(bench["tokenizer"], out), str(bench.get("ready_s", 1200))]))
     wrapper.write_text("\n".join(lines) + "\n")
     wrapper.chmod(0o755)
     cmd = [str(GPULEASE), "-n", str(cell.get("n_gpu", 1)), label, str(wrapper)]
@@ -696,7 +751,7 @@ def cmd_bench(a: argparse.Namespace) -> None:
         "gpu": gpu_header(),
         "contended": "CONTENDED" in text,
         "gate": "coherence gate: PASS" in text,
-        "protocol": {k: env[k] for k in ("IN_LENS", "CONCS", "NPROMPT", "OUTLEN", "BENCH_BACKEND", "BENCH_EXTRA_ARGS", "DATASET_ARGS")},
+        "protocol": {k: env[k] for k in ("IN_LENS", "CONCS", "NPROMPT", "OUTLEN", "BENCH_BACKEND", "BENCH_EXTRA_ARGS", "DATASET_ARGS", "PREFIX_PCT")},
         "quiet_lock": getattr(a, "quiet_lock", None),
         "serve_env": serve.get("env", {}),
         "overrides": overrides,
@@ -980,6 +1035,8 @@ def compare(res: Path, ref: Path) -> None:
 
 
 def cmd_compare(a: argparse.Namespace) -> None:
+    print("compare is a diagnostic; a final Infervisor-vs-baseline comparison must use `campaign.py report`",
+          file=sys.stderr)
     compare(Path(a.results), Path(a.reference))
     if getattr(a, "roofline", False):
         recipe_path = None
@@ -998,6 +1055,16 @@ def cmd_compare(a: argparse.Namespace) -> None:
             print("\n" + generate_roofline_report(recipe_path, Path(a.results)))
         else:
             print("\n(roofline report: pass --recipe <recipe.toml> or place run-record.json beside results to calculate % roofline achieved)")
+
+
+def cmd_report(a: argparse.Namespace) -> None:
+    """The strict final Infervisor-vs-baseline report (scripts/bench/serving_comparison.py render)."""
+    cmd = [sys.executable, str(REPO / "scripts/bench/serving_comparison.py"), "render", "--baseline", a.baseline,
+           "--infervisor", a.infervisor, "--gate", a.gate, "--out", a.out]
+    for flag in ("cells", "baseline_provenance", "infervisor_provenance"):
+        if getattr(a, flag):
+            cmd += ["--" + flag.replace("_", "-"), getattr(a, flag)]
+    sys.exit(subprocess.run(cmd).returncode)
 
 
 def cmd_roofline(a: argparse.Namespace) -> None:
@@ -1168,9 +1235,14 @@ def cmd_sweep(a: argparse.Namespace) -> None:
 #   asr_wer           /v1/audio/transcriptions over a manifest (served_bench.py): wer_max
 #   tts_cer           tts_bench.py --wav arms, Whisper round trip (asr_check.py): cer_median_max, cer_lang_max
 #   s3gen_rel_l2      s3gen.pkt vs torch (s3gen_packet_check.py, packet_run): rel_l2_max
+#   llm_fp32_ref      plow AND vLLM vs a cached FP32 reference (scripts/llm/fp32_ref_gate.py); plow must
+#                     stay within vLLM's distance to FP32. `reference` (ref.json), then `vllm_capture` (cached)
+#                     or `vllm_hf` [+ `vllm_args`, `vllm_python`] to capture vLLM in the same lease:
+#                     kl_ratio_max, kl_slack_max, top1_drop_max, cont_drop_max, needle_drop_max,
+#                     needle_min, tie_margin (docs/bringup/agent-tools.md §5)
 # Each may set `python` (default [gates].python, else python3), `args` (extra client args) and
 # `timeout_s`. Placeholders as in `build`, plus {assets}, {target} (cargo target dir) and {out}.
-GATE_KINDS = ("llm_logit_parity", "asr_wer", "tts_cer", "s3gen_rel_l2")
+GATE_KINDS = ("llm_logit_parity", "llm_fp32_ref", "asr_wer", "tts_cer", "s3gen_rel_l2")
 
 
 def gate_steps(kind: str, g: dict, py: str, out: Path, assets: Path) -> tuple[list[str], list[str]]:
@@ -1184,6 +1256,22 @@ def gate_steps(kind: str, g: dict, py: str, out: Path, assets: Path) -> tuple[li
         return ([f"{q(py)} {sc('scripts/llm/gemma_logit_parity.py')} plow \"$PB_SERVER_PORT\" {hf} {d}/plow.json > {d}/plow.log 2>&1"],
                 [f"{q(py)} {sc('scripts/llm/gemma_logit_parity.py')} hf {hf} {d}/plow.json {d}/hf.json > {d}/hf.log 2>&1",
                  f"{q(py)} {sc('scripts/llm/gemma_logit_parity.py')} report {d}/plow.json {d}/hf.json > {d}/parity.md 2>&1"])
+    if kind == "llm_fp32_ref":
+        cap = lambda arm: (f"{q(py)} {sc('scripts/llm/fp32_ref_gate.py')} capture --url \"http://127.0.0.1:$PB_SERVER_PORT\" "
+                           f"--ref {q(g['reference'])} --arm {arm} --concurrency {int(g.get('concurrency', 16))} "
+                           f"--out {d}/{arm}.json > {d}/{arm}.log 2>&1")
+        down = []
+        if not g.get("vllm_capture"):
+            if not g.get("vllm_hf"):
+                die("[gates.llm_fp32_ref] needs vllm_capture (cached) or vllm_hf (capture in this lease)")
+            vpy = q(g.get("vllm_python") or py)
+            vargs = " ".join(q(v) for v in shlex.split(g.get("vllm_args", "")))
+            # Own subshell server after plow stopped; the exported PLOW_* are inert for vLLM.
+            down = [f"( PB_SERVER_PORT=$(pb_free_port); PB_SERVER_LOG={d}/vllm-server.log; "
+                    f"env -u LD_LIBRARY_PATH {vpy} -m vllm.entrypoints.cli.main serve {q(g['vllm_hf'])} "
+                    f"--port \"$PB_SERVER_PORT\" {vargs} > \"$PB_SERVER_LOG\" 2>&1 & PB_SERVER_PID=$!; "
+                    f"trap pb_serve_stop EXIT; pb_serve_wait {int(g.get('vllm_ready_s', 900))} && {cap('vllm')} )"]
+        return [cap("plow")], down
     if kind == "asr_wer":
         return ([f"{q(py)} {sc('scripts/asr/nvidia/served_bench.py')} --url \"http://127.0.0.1:$PB_SERVER_PORT\" "
                  f"--model \"$MODEL\" --manifest {q(g['manifest'])} --conc {q(str(g.get('conc', '1,16')))} {args} "
@@ -1205,6 +1293,13 @@ def gate_steps(kind: str, g: dict, py: str, out: Path, assets: Path) -> tuple[li
     die(f"unknown gate kind {kind}")
 
 
+def fp32_ref_module():
+    spec = importlib.util.spec_from_file_location("fp32_ref_gate", REPO / "scripts/llm/fp32_ref_gate.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
 def gate_score(kind: str, g: dict, d: Path) -> dict:
     """{metric: value, ..., "pass": bool, "why": [...]} from the files gate_steps wrote."""
     txt = lambda name: (d / name).read_text(errors="replace") if (d / name).is_file() else ""
@@ -1220,6 +1315,19 @@ def gate_score(kind: str, g: dict, d: Path) -> dict:
         lim("top1", float(m[3]), "top1_min", upper=False)
         lim("kl_mean", float(m[4]), "kl_mean_max")
         lim("kl_max", float(m[5]), "kl_max_max")
+    elif kind == "llm_fp32_ref":
+        mod = fp32_ref_module()
+        caps = [d / "plow.json", Path(g.get("vllm_capture") or d / "vllm.json")]
+        absent = [str(p) for p in [Path(g["reference"]), *caps] if not p.is_file()]
+        if absent:
+            return {"pass": False, "why": [f"missing {', '.join(absent)} (see plow.log / vllm.log)"]}
+        ref = mod.load_ref(g["reference"])
+        th = dict(mod.DEFAULTS, **{k: g[k] for k in mod.DEFAULTS if k in g})
+        cand, vllm = (mod.score(ref, json.loads(p.read_text()), th["tie_margin"]) for p in caps)
+        why += mod.verdict(cand, vllm, th)
+        for m in ("kl_mean", "kl_p99", "top1_decisive", "cont_frac", "needle_acc"):
+            res[m], res["vllm_" + m] = cand.get(m), vllm.get(m)
+        (d / "fp32_ref.md").write_text(mod.table({"plow": cand, "vllm": vllm}) + "\n")
     elif kind == "asr_wer":
         rows = [json.loads(ln) for ln in txt("served.jsonl").splitlines() if ln.startswith("{")]
         if not rows:
@@ -1264,16 +1372,19 @@ def cmd_gate(a: argparse.Namespace) -> None:
     assets = Path(a.assets).resolve()
     out = Path(a.out).resolve()
     target = os.environ.get("CARGO_TARGET_DIR", str(REPO / "target"))
-    def x(v):
-        if a.score_only:  # only the thresholds matter; do not demand the run's env or snapshots
-            return v
-        return expand(str(v).replace("{assets}", str(assets)).replace("{target}", target), out)
+    def x(v):  # score-only does not demand the run's env or snapshots
+        return expand(str(v).replace("{assets}", str(assets)).replace("{target}", target), out, lenient=a.score_only)
     cfg = {k: {kk: ([x(i) for i in vv] if isinstance(vv, list) else x(vv) if isinstance(vv, str) else vv)
                for kk, vv in gates[k].items()} for k in kinds}
+    pkt = assets / "model.pkt"
+    # serving_comparison.py render accepts the gate only for the exact packet the Infervisor arm served,
+    # so the packet hash is the one captured with the run, never the --assets of a later re-score.
+    pkt_rec = out / "packet.sha256"
     if not a.score_only:
-        if not (assets / "model.pkt").exists():
+        if not pkt.exists():
             die(f"{assets}/model.pkt missing")
         out.mkdir(parents=True, exist_ok=True)
+        pkt_rec.write_text(sha(pkt) + "\n")
         serve = dict(r.get("serve", {}))
         env = {k: str(v) for k, v in serve.get("env", {}).items()}
         env.update(dict(kv.split("=", 1) for kv in (a.env or [])))
@@ -1319,8 +1430,14 @@ def cmd_gate(a: argparse.Namespace) -> None:
         print(f"gate run rc={rc}; log {out / 'gate.log'}", file=sys.stderr)
     if not out.is_dir():
         die(f"{out}: no gate run to score")
+    if not pkt_rec.is_file():
+        die(f"{pkt_rec} missing: the gate run did not record its packet; re-run the gate")
+    packet_sha = pkt_rec.read_text().strip()
+    if pkt.is_file() and sha(pkt) != packet_sha:
+        die(f"{pkt} sha256 {sha(pkt)} != {packet_sha} captured in {out}; score with the gate run's --assets")
     scores = {k: gate_score(k, cfg[k], out / k) for k in kinds}
     record = dict(recipe=str(Path(a.recipe).resolve()), recipe_sha256=sha(Path(a.recipe)), assets=str(assets),
+                  packet_sha256=packet_sha,
                   commit=git("rev-parse", "HEAD"), dirty=bool(git("status", "--porcelain")),
                   utc=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), gates=scores,
                   thresholds={k: {kk: v for kk, v in gates[k].items() if kk.endswith(("_min", "_max"))} for k in kinds},
@@ -1426,6 +1543,7 @@ def main() -> None:
     n = sp.add_parser("bench"); n.add_argument("recipe"); n.add_argument("--assets", required=True); n.add_argument("--out", required=True)
     n.add_argument("--concs"); n.add_argument("--in-lens"); n.add_argument("--label"); n.add_argument("--reference")
     n.add_argument("--nprompt", type=int, help="prompts per cell, overriding the recipe/profile")
+    n.add_argument("--prefix-pct", type=int, help="percent of each input_len shared as a prefix by every request (see PREFIX_PCT); recorded")
     n.add_argument("--dataset-args", help="replaces the client's random-dataset block (see bench_plowrt_serve.sh DATASET_ARGS); recorded")
     n.add_argument("--quiet-lock", metavar="FILE", help="hold this lock exclusively for the bench session, inside the GPU lease (scripts/bench/quietx.sh; builds take it shared via quiets.sh)")
     n.add_argument("--env", action="append", metavar="K=V", help="one-variable override for the server env; recorded")
@@ -1447,6 +1565,12 @@ def main() -> None:
     c.add_argument("--roofline", action="store_true", help="display roofline analysis alongside comparison")
     c.add_argument("--recipe", help="optional recipe path to use for roofline geometry")
     c.set_defaults(f=cmd_compare)
+    rp = sp.add_parser("report", help="strict final Infervisor vs baseline report from two llm_grid result dirs")
+    rp.add_argument("--baseline", required=True); rp.add_argument("--infervisor", required=True)
+    rp.add_argument("--gate", required=True, help="gates.json from `gate --only llm_fp32_ref` on the served packet")
+    rp.add_argument("--out", required=True); rp.add_argument("--cells")
+    rp.add_argument("--baseline-provenance"); rp.add_argument("--infervisor-provenance")
+    rp.set_defaults(f=cmd_report)
     rf = sp.add_parser("roofline"); rf.add_argument("recipe"); rf.add_argument("--results"); rf.set_defaults(f=cmd_roofline)
     lp = sp.add_parser("loop"); lp.add_argument("recipe"); lp.add_argument("--out"); lp.add_argument("--profile")
     lp.add_argument("--concs"); lp.add_argument("--in-lens"); lp.add_argument("--label"); lp.add_argument("--reference")

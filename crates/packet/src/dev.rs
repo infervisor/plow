@@ -2114,9 +2114,12 @@ pub enum DevOp {
     /// Strided FP32 block copy (concatenate/slice/broadcast along any axis):
     /// `out[b*out_item_stride + r*out_stride + out_offset + c] = x[b*in_item_stride + r*in_stride
     /// + in_offset + c]` for `b < items, r < rows, c < cols`. Strides are literal element counts;
-    /// zero broadcasts. Offsets are element offsets.
+    /// zero broadcasts. Offsets are element offsets. Flag bit 0 (sm_90): format an attention
+    /// prefix instead (`cols` = K | V of `cols/128` heads of width 64, `rows` keys): item `b` is
+    /// written at `b*out_item_stride + out_offset` as `[head][ceil(rows/16)][2072]` 3xFP16 fragment
+    /// tiles, the layout [`DevOp::AttentionF32`] flag bit 4 reads (`out_stride` unused).
     /// `t0=out t1=x` · `i0=items i1=rows i2=cols i3=in_stride i4=in_offset i5=out_stride
-    /// i6=out_offset` · `j0=in_item_stride j1=out_item_stride`.
+    /// i6=out_offset i7=flags` · `j0=in_item_stride j1=out_item_stride`.
     CopyColsF32 = 196,
     /// Channels-last FP32 1D convolution, torch `Conv1d` semantics:
     /// `out[b][t][o] = post(bias[o] + sum_{k,i} pre(x[b][t*stride + k*dilation - pad_before][g*Cin/groups
@@ -2189,7 +2192,9 @@ pub enum DevOp {
     /// With `prefix` (a cached key prefix), item `b`'s keys are rows `[0, i7)` of block
     /// `prefix_index[b]` of `prefix` (`[blocks][i7][K | V]`, `2*heads*head_width` wide) followed
     /// by its `kv_rows` own rows (key lengths count both; `i7` is the prefix row count; no bias,
-    /// no causal mask).
+    /// no causal mask). Flag bit 4 (sm_90, head_width 64, at least 4 16-row query tiles): the
+    /// prefix is pre-formatted by [`DevOp::CopyColsF32`] flag bit 0 (`[blocks][heads][tiles][2072]`)
+    /// and the attention runs 3xFP16.
     /// `t0=out t1=query t2=key t3=value t4=key_lengths(u32[batch])? t5=bias? t6=prefix?
     /// t7=prefix_index(u32[batch])?` ·
     /// `i0=batch i1=q_rows i2=kv_rows i3=heads i4=head_width i5=in_stride i6=flags

@@ -39,8 +39,33 @@ class RequestBatchTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "order"):
             list(generate_requests(llm, cases, None, 2))
 
+    def test_forced_tokens_use_per_request_sampling_params(self):
+        from vllm_logit_oracle import generate_requests
+        cases = [dict(id="a", prompt_token_ids=[1], forced_next_token_id=7),
+                 dict(id="b", prompt_token_ids=[2], forced_next_token_id=8)]
+        sampling = SimpleNamespace(clone=lambda: SimpleNamespace(allowed_token_ids=None))
+        def generate(prompts, params, use_tqdm):
+            self.assertEqual([p.allowed_token_ids for p in params], [[7], [8]])
+            return [SimpleNamespace(prompt_token_ids=p["prompt_token_ids"]) for p in prompts]
+        rows = list(generate_requests(SimpleNamespace(generate=generate), cases, sampling, 2))
+        self.assertEqual([case for case, _ in rows], cases)
+
 
 class PrecisionInventoryTests(unittest.TestCase):
+    def test_ambiguous_config_attribute_is_skipped(self):
+        import torch
+
+        class HeterogeneousConfig:
+            @property
+            def dtype(self):
+                raise RuntimeError("per-layer field has no global value")
+
+        model = torch.nn.Linear(2, 2, bias=False, device="meta")
+        model.quant_config = HeterogeneousConfig()
+        row = model_precision_inventory(model)
+        nested = row["modules"][""]["attributes"]["quant_config"]
+        self.assertNotIn("dtype", nested["fields"])
+
     def test_loaded_tensors_and_quantization_flags_without_readback(self):
         import torch
 

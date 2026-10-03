@@ -44,7 +44,11 @@ static void launch_w8a8(bf16* y, const uint8_t* x, const uint8_t* w, const uint8
     const float* xs, const float* ws, const float* us, unsigned M, unsigned N, unsigned K,
     unsigned first, unsigned count, unsigned blocks) {
     constexpr unsigned bytes=decode_wgmma_bytes<Rows,Glu>;
-    decode_w8a8<Rows,Glu,Promote,Qkv><<<count,256,bytes>>>(y,x,w,u,xs,ws,us,M,N,K,first,blocks);
+    for (unsigned row = 0; row < M; row += Rows) {
+        decode_w8a8<Rows,Glu,Promote,Qkv><<<count,256,bytes>>>(
+            y + (size_t)row * N, x + (size_t)row * K, w, u, xs + row, ws, us,
+            std::min(Rows, M - row), N, K, first, blocks);
+    }
 }
 
 #ifdef PLOW_FP8_W8A8_PERSISTENT_PROBE
@@ -117,6 +121,10 @@ static void run(unsigned M,unsigned N,unsigned K,unsigned blocks,bool glu,bool e
     launch(2,0,blocks);CHECK(cudaMemcpy(promoted.data(),dy,out.size()*2,cudaMemcpyDeviceToHost));
     cudaEvent_t begin,end;CHECK(cudaEventCreate(&begin));CHECK(cudaEventCreate(&end));
     for(unsigned mode=1;mode<4;++mode){
+        bool tc_oracle = false;
+#if PLOW_NV_FP8_DECODE_TC_ACTIVE && PLOW_NV_FP8_DECODE_TC64
+        tc_oracle = mode == 3 && M >= PLOW_NV_FP8_DECODE_TC && M <= 64 && K % 64 == 0;
+#endif
         const std::vector<unsigned> slices=exact?std::vector<unsigned>{0,blocks/2,blocks-1}:std::vector<unsigned>{0};
         for(unsigned slice:slices){CHECK(cudaMemset(storage,0x5a,(out.size()+128)*2));launch(mode,slice,exact?1:blocks);CHECK(cudaMemcpy(out.data(),dy,out.size()*2,cudaMemcpyDeviceToHost));
             std::vector<bf16> guards(128);CHECK(cudaMemcpy(guards.data(),storage,128,cudaMemcpyDeviceToHost));CHECK(cudaMemcpy(guards.data()+64,dy+out.size(),128,cudaMemcpyDeviceToHost));
@@ -129,12 +137,12 @@ static void run(unsigned M,unsigned N,unsigned K,unsigned blocks,bool glu,bool e
                 float got=__bfloat162float(out[i]),ref=__bfloat162float(control[i]);if(!std::isfinite(got)){fprintf(stderr,"nonfinite\n");exit(2);}
                 promoted_different+=*reinterpret_cast<uint16_t*>(&out[i])!=*reinterpret_cast<uint16_t*>(&promoted[i]);
                 const double delta=got-ref;changed+=delta!=0;diff2+=delta*delta;norm2+=(double)ref*ref;maxabs=std::max(maxabs,std::abs(delta));
-                if(exact||(i*104729%out.size())<257){double gate=0,up=0;for(unsigned k=0;k<K;++k){double a=decode(q[(size_t)m*K+k]);gate+=a*decode(w[(size_t)n*K+k]);if(glu)up+=a*decode(u[(size_t)n*K+k]);}
-                    float g=ws[n]*(xs[m]*(float)gate),r=g;if(glu){float a=.5f*g*(1.f+tanhf(.7978845608028654f*(g+.044715f*g*g*g)));r=a*(us[n]*(xs[m]*(float)up));}
+                if(exact||(i*104729%out.size())<257){double gate=0,up=0;for(unsigned k=0;k<K;++k){double a=tc_oracle?__bfloat162float(x[(size_t)m*K+k]):decode(q[(size_t)m*K+k]);gate+=a*decode(w[(size_t)n*K+k]);if(glu)up+=a*decode(u[(size_t)n*K+k]);}
+                    float input_scale=tc_oracle?1.f:xs[m];float g=ws[n]*(input_scale*(float)gate),r=g;if(glu){float a=.5f*g*(1.f+tanhf(.7978845608028654f*(g+.044715f*g*g*g)));r=a*(us[n]*(input_scale*(float)up));}
                     r=__bfloat162float(__float2bfloat16(r));oracle2+=(double)(got-r)*(got-r);oracle_norm2+=(double)r*r;++samples;}}
             const double relative=std::sqrt(diff2/(norm2+1e-30)),oracle=std::sqrt(oracle2/(oracle_norm2+1e-30));
-            if((exact&&changed)||oracle>(mode==1?.02:.004)||(mode==3&&promoted_different)){fprintf(stderr,"oracle failure mode%u exact%u changed%u promoted_different%u rel%g\n",mode,exact,changed,promoted_different,oracle);exit(2);}
-            printf("check M=%u N=%u K=%u blocks=%u glu=%u qkv=%u mode=%u slice=%u exact=%u quant_bytes_exact=1 quant_scales_exact=1 changed=%u promoted_different=%u bf16_relL2=%.9g max_abs=%.9g quantized_oracle_relL2=%.9g samples=%u PASS\n",M,N,K,blocks,glu,qkv,mode,slice,exact,changed,promoted_different,relative,maxabs,oracle,samples);
+            if((exact&&changed)||oracle>(mode==1?.02:.004)||(mode==3&&!tc_oracle&&promoted_different)){fprintf(stderr,"oracle failure mode%u exact%u changed%u promoted_different%u rel%g\n",mode,exact,changed,promoted_different,oracle);exit(2);}
+            printf("check M=%u N=%u K=%u blocks=%u glu=%u qkv=%u mode=%u slice=%u exact=%u quant_bytes_exact=1 quant_scales_exact=1 changed=%u promoted_different=%u bf16_relL2=%.9g max_abs=%.9g oracle_input=%s oracle_relL2=%.9g samples=%u PASS\n",M,N,K,blocks,glu,qkv,mode,slice,exact,changed,promoted_different,relative,maxabs,tc_oracle?"bf16":"fp8",oracle,samples);
         }
     }
     if(!exact)for(unsigned mode=0;mode<4;++mode)for(unsigned include_quant=0;include_quant<2;++include_quant){if((!mode&&include_quant)||(mode==3&&!include_quant))continue;
@@ -174,7 +182,12 @@ static void check_fallback(unsigned M, unsigned K, bool glu, unsigned act) {
 #endif
 
 int main(int argc,char** argv){
-    if(argc!=1&&(argc!=6||atoi(argv[1])<1||atoi(argv[1])>16||atoi(argv[2])<1||atoi(argv[3])<16||atoi(argv[3])%16||atoi(argv[4])<1||(atoi(argv[5])!=0&&atoi(argv[5])!=1))){fprintf(stderr,"usage: %s [M=1..16 N>0 K=multiple-of-16 blocks>0 glu=0|1]\n",argv[0]);return 1;}
+#ifdef PLOW_FP8_W8A8_PERSISTENT_PROBE
+    constexpr unsigned max_rows = 64;
+#else
+    constexpr unsigned max_rows = 16;
+#endif
+    if(argc!=1&&(argc!=6||atoi(argv[1])<1||(unsigned)atoi(argv[1])>max_rows||atoi(argv[2])<1||atoi(argv[3])<16||atoi(argv[3])%16||atoi(argv[4])<1||(atoi(argv[5])!=0&&atoi(argv[5])!=1))){fprintf(stderr,"usage: %s [M<=max_rows N>0 K=multiple-of-16 blocks>0 glu=0|1]\n",argv[0]);return 1;}
 #define ATTR(R,G,P) CHECK(cudaFuncSetAttribute(decode_w8a8<R,G,P>,cudaFuncAttributeMaxDynamicSharedMemorySize,decode_wgmma_bytes<R,G>))
     ATTR(8,false,false);ATTR(8,false,true);ATTR(8,true,false);ATTR(8,true,true);ATTR(16,false,false);ATTR(16,false,true);ATTR(16,true,false);ATTR(16,true,true);
 #undef ATTR
@@ -193,7 +206,9 @@ int main(int argc,char** argv){
 #ifdef PLOW_FP8_W8A8_PERSISTENT_PROBE
     for(unsigned M:{1u,2u,4u})for(bool glu:{false,true})run(M,71,256,13,glu,true,flush);
     for(unsigned M:{1u,2u,4u,8u,16u})for(bool glu:{false,true})check_fallback(M,136,glu,PLOW_ACT_GELU_TANH_);
-    for(unsigned M:{8u,16u})check_fallback(M,256,true,PLOW_ACT_SILU_);
+    for(unsigned M:{8u,16u,32u,64u})check_fallback(M,256,true,PLOW_ACT_SILU_);
+    for(unsigned M:{17u,31u,32u,33u,63u,64u})for(bool glu:{false,true})run(M,71,256,13,glu,true,flush);
+    for(unsigned M:{32u,64u})for(bool glu:{false,true})run(M,79,272,13,glu,false,flush);
 #endif
     for(unsigned M:{7u,8u,15u,16u})for(bool glu:{false,true})run(M,71,256,13,glu,true,flush);
     run(8,71,272,132,false,true,flush);

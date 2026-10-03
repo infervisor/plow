@@ -38,12 +38,18 @@ pub async fn chat_completions(
     headers: axum::http::HeaderMap,
     req: Result<Json<ChatRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
-    let ids = match crate::serve::session::RequestIds::from_headers(&headers) {
+    let mut ids = match crate::serve::session::RequestIds::from_headers(&headers) {
         Ok(ids) => ids,
         Err(e) => {
             return crate::serve::api_error(axum::http::StatusCode::BAD_REQUEST, e, "invalid_request_error", Some("invalid_value"), None)
         }
     };
+    if let Err(e) = req.as_ref().map_or(Ok(()), |Json(r)| ids.apply_body(&r.route)) {
+        return crate::serve::api_error(axum::http::StatusCode::BAD_REQUEST, e, "invalid_request_error", Some("invalid_value"), Some("session_id".into()));
+    }
+    if let Some(r) = crate::serve::overload::gate(&ids) {
+        return r;
+    }
     let mut response = chat_completions_with(state, req, &ids).await;
     ids.stamp(&mut response);
     response
@@ -379,6 +385,14 @@ async fn chat_completions_with(
             None,
         );
     };
+    let mut run = crate::serve::turns::StageRun::start(
+        ids,
+        crate::serve::turns::Kind::Llm,
+        &req.model,
+        Some(state.model_metrics(&req.model)),
+        t_arrive,
+        true,
+    );
     let (report, report_rx) = ids.report();
     let session = ids.session.as_ref().and_then(|_| ids.ticket(crate::serve::session::row_keys(&prompt_ids, &[], &[]), report));
     let job = crate::serve::mux::Job {
@@ -388,6 +402,8 @@ async fn chat_completions_with(
         respond: tx,
         opts: crate::serve::mux::JobOpts {
             session,
+            turn: run.key(),
+            continuing: run.continuing(),
             ..Default::default()
         },
     };
@@ -419,8 +435,10 @@ async fn chat_completions_with(
     // Stamped ONCE and repeated on every chunk of a stream, as OpenAI does.
     let created = now_secs();
     let cache = crate::serve::session::CacheOutcome::received(report_rx).await;
+    run.admitted(cache.and_then(|c| c.at));
     let mut response = if req.stream {
         let include_usage = req.stream_options.map(|o| o.include_usage).unwrap_or(false);
+        let stamped = run.headers();
         let sse = sse_response(
             request_id,
             requested_model,
@@ -432,8 +450,11 @@ async fn chat_completions_with(
             reasoning_mode,
             reasoning_open,
             lp_fmt,
+            run,
         );
-        crate::serve::session::hold_until_sent(sse.into_response(), in_flight)
+        let mut response = crate::serve::session::hold_until_sent(sse.into_response(), in_flight);
+        response.headers_mut().extend(stamped);
+        response
     } else {
         buffer_and_reply(
             request_id,
@@ -443,6 +464,7 @@ async fn chat_completions_with(
             reasoning_mode,
             reasoning_open,
             lp_fmt,
+            run,
         )
         .await
     };
@@ -687,6 +709,7 @@ async fn buffer_and_reply(
     reasoning_mode: crate::serve::reasoning::ReasoningMode,
     reasoning_open: bool,
     lp_fmt: Option<crate::serve::logprobs::TokenText>,
+    mut run: crate::serve::turns::StageRun,
 ) -> Response {
     let mut text = String::new();
     let mut lp_content = Vec::new();
@@ -710,6 +733,7 @@ async fn buffer_and_reply(
     while let Some(chunk) = rx.recv().await {
         match chunk {
             StreamChunk::Token { id, text: delta, logprobs } => {
+                run.first();
                 if let (Some(fmt), Some(lp)) = (&lp_fmt, &logprobs) {
                     lp_content.push(crate::serve::logprobs::chat_entry(fmt, id, lp));
                 }
@@ -774,7 +798,8 @@ async fn buffer_and_reply(
             });
         }
     }
-    Json(ChatResponse {
+    run.done();
+    let mut response = Json(ChatResponse {
         id: request_id.clone(),
         object: "chat.completion",
         created,
@@ -798,7 +823,9 @@ async fn buffer_and_reply(
         }],
         usage,
     })
-    .into_response()
+    .into_response();
+    run.stamp(&mut response);
+    response
 }
 
 /// Streaming path: one SSE `chat.completion.chunk` frame per produced token,
@@ -832,6 +859,7 @@ fn sse_response(
     reasoning_mode: crate::serve::reasoning::ReasoningMode,
     reasoning_open: bool,
     lp_fmt: Option<crate::serve::logprobs::TokenText>,
+    run: crate::serve::turns::StageRun,
 ) -> Sse<impl Stream<Item = Result<Event, std::convert::Infallible>>> {
 
     // State threaded through the unfold: the receiver, and the tail frames
@@ -846,6 +874,7 @@ fn sse_response(
         /// generation.
         split: crate::serve::reasoning::ReasoningSplit,
         pending: std::collections::VecDeque<Event>,
+        run: crate::serve::turns::StageRun,
     }
     let body = stream::unfold(
         SseState {
@@ -854,6 +883,7 @@ fn sse_response(
             role_pending: true,
             split: crate::serve::reasoning::ReasoningSplit::new(reasoning_mode, reasoning_open),
             pending: std::collections::VecDeque::new(),
+            run,
         },
         move |mut st| {
             let model = model.clone();
@@ -900,6 +930,7 @@ fn sse_response(
                         });
                         // §TTFT: this frame is the one `vllm bench serve` stamps.
                         if role.is_some() {
+                            st.run.first();
                             crate::obs::ttft::dump(t_arrive.elapsed().as_nanos() as u64, n_prompt);
                             crate::obs::pfx::report();
                             if crate::obs::host::on() {
@@ -1016,6 +1047,8 @@ fn sse_response(
                     }
                 };
                 if terminate {
+                    st.run.done();
+                    st.pending.push_back(st.run.sse_comment());
                     st.pending
                         .push_back(Event::default().data(stream_mod::DONE));
                 }

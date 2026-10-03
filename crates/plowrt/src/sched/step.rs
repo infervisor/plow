@@ -13,7 +13,7 @@
 //! [`Backend::split_spans`] = false a chunk wider than what is left waits for the next tick,
 //! which is what keeps a request on the compiled rungs its cursor was planned against.
 
-use super::prefill::{admit, SpanPolicy};
+use super::prefill::{admit, admit_oldest_first, SpanPolicy};
 use packet::dev::PrefillSpan;
 
 /// What a backend declares about the steps it can run. Static per engine.
@@ -52,7 +52,7 @@ pub struct Tick {
     pub cap_rows: u32,
     /// Whether cross-request packing is requested this tick.
     pub packing: bool,
-    /// Rotate admission by slot from `turn` instead of oldest-first.
+    /// Rotate admission (isolated chunks and packs) by slot from `turn` instead of oldest-first.
     pub rotate: bool,
     pub turn: usize,
     /// Slot table capacity.
@@ -146,17 +146,12 @@ pub fn plan(
             } else {
                 SpanPolicy::Whole
             });
-            let mut pack = admit(
-                candidates
-                    .iter()
-                    .filter(|c| c.packable && !taken(advanced, &c.span))
-                    .map(|c| c.span),
-                budget,
-                tick.turn,
-                slots,
-                policy,
-                &program_rows,
-            );
+            let open = candidates.iter().filter(|c| c.packable && !taken(advanced, &c.span));
+            let mut pack = if tick.rotate {
+                admit(open.map(|c| c.span), budget, tick.turn, slots, policy, &program_rows)
+            } else {
+                admit_oldest_first(open.map(|c| (c.arrival, c.span)), budget, slots, policy, &program_rows)
+            };
             if let Some(program) = pack.spans().first().map(|span| span.program) {
                 pack.limit_spans(program_span_limit(program) as usize);
             }
@@ -364,6 +359,27 @@ mod tests {
         let rotating = Tick { rotate: true, turn: 2, slots: 4, ..tick(false) };
         let by_turn = plan(amd(), rotating, [], &candidates, rung_2048, |_| u32::MAX);
         assert_eq!(by_turn.launches[0].spans[0].slot, 2);
+    }
+
+    /// The CUDA pack under a Greedy policy: the oldest request takes the launch whatever its slot
+    /// or the turn pointer, so a request seated behind the pointer does not wait a full rotation.
+    #[test]
+    fn packs_are_oldest_first_unless_rotating() {
+        let backend = Backend {
+            step_budget: 4096,
+            packing: true,
+            split_spans: true,
+            decode_rows_join_prefill: false,
+            span_policy: Some(crate::sched::prefill::SpanPolicy::Greedy),
+        };
+        let candidates: Vec<Candidate> =
+            [(0, 30), (1, 20), (2, 10), (3, 40)].iter().map(|&(s, a)| cand(s, a, 0, 3000, true, true)).collect();
+        let t = Tick { turn: 3, slots: 4, ..tick(true) };
+        let got = plan(backend, t, [], &candidates, |_| Some(4096), |_| u32::MAX);
+        let spans: Vec<(u32, u32)> = got.launches[0].spans.iter().map(|s| (s.slot, s.n_rows)).collect();
+        assert_eq!(spans, [(2, 3000), (1, 1096)]);
+        let rotating = plan(backend, Tick { rotate: true, ..t }, [], &candidates, |_| Some(4096), |_| u32::MAX);
+        assert_eq!(rotating.launches[0].spans[0].slot, 3, "rotation starts at the turn slot");
     }
 
     #[test]

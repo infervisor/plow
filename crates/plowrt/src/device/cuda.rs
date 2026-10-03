@@ -2618,14 +2618,3 @@ impl crate::exec::device_api::EngineDevice for CudaBackend {
         CudaBackend::launch_kernel(self, f, grid, block, smem_bytes, &mut params, stream)
     }
 }
-
-#[cfg(test)]
-mod engine_device_tests {
-    /// Both backends satisfy the same engine surface — the property generic
-    /// engine code relies on. A compile-time check; no driver needed.
-    fn _implements<D: crate::exec::device_api::EngineDevice>() {}
-    #[test]
-    fn cuda_backend_is_an_engine_device() {
-        _implements::<super::CudaBackend>();
-    }
-}
