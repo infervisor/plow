@@ -1010,6 +1010,269 @@
     "window": 0
    },
    "spill_bytes": 84
+  },
+  "attn_pf_hd512_fp8kv": {
+   "body_sha256": "600e9fa8fb6b1fd76d598b55a98f5898cd767922fdd80d787e24893ad46a86d6",
+   "classes": {
+    "h16kv1_rows1024": {
+     "best": {
+      "bm": 64,
+      "bn": 32,
+      "stages": 1,
+      "threads": 256
+     },
+     "measured": [
+      {
+       "config": {
+        "bm": 64,
+        "bn": 32,
+        "stages": 1,
+        "threads": 256
+       },
+       "floor_us": 17.4,
+       "rel_l2": 0.00136,
+       "tflops": 108,
+       "us": 158.6
+      },
+      {
+       "config": {
+        "bm": 64,
+        "bn": 32,
+        "stages": 2,
+        "threads": 256
+       },
+       "floor_us": 17.4,
+       "rel_l2": 0.00136,
+       "tflops": 107,
+       "us": 161.2
+      },
+      {
+       "config": {
+        "bm": 64,
+        "bn": 16,
+        "stages": 2,
+        "threads": 256
+       },
+       "floor_us": 17.4,
+       "rel_l2": 0.00136,
+       "tflops": 88,
+       "us": 196.0
+      },
+      {
+       "config": {
+        "bm": 64,
+        "bn": 16,
+        "stages": 3,
+        "threads": 256
+       },
+       "floor_us": 17.4,
+       "rel_l2": 0.00136,
+       "tflops": 85,
+       "us": 201.4
+      }
+     ]
+    },
+    "h16kv1_rows1024_past14336": {
+     "best": {
+      "bm": 64,
+      "bn": 32,
+      "stages": 1,
+      "threads": 256
+     },
+     "measured": [
+      {
+       "config": {
+        "bm": 64,
+        "bn": 32,
+        "stages": 1,
+        "threads": 256
+       },
+       "floor_us": 503.8,
+       "rel_l2": 0.00235,
+       "tflops": 145,
+       "us": 3443.5
+      },
+      {
+       "config": {
+        "bm": 64,
+        "bn": 32,
+        "stages": 2,
+        "threads": 256
+       },
+       "floor_us": 503.8,
+       "rel_l2": 0.00235,
+       "tflops": 143,
+       "us": 3490.8
+      },
+      {
+       "config": {
+        "bm": 64,
+        "bn": 16,
+        "stages": 2,
+        "threads": 256
+       },
+       "floor_us": 503.8,
+       "rel_l2": 0.00236,
+       "tflops": 113,
+       "us": 4415.1
+      },
+      {
+       "config": {
+        "bm": 64,
+        "bn": 16,
+        "stages": 3,
+        "threads": 256
+       },
+       "floor_us": 503.8,
+       "rel_l2": 0.00236,
+       "tflops": 110,
+       "us": 4530.0
+      }
+     ]
+    },
+    "h16kv1_rows1024_past7168": {
+     "best": {
+      "bm": 64,
+      "bn": 32,
+      "stages": 1,
+      "threads": 256
+     },
+     "measured": [
+      {
+       "config": {
+        "bm": 64,
+        "bn": 32,
+        "stages": 1,
+        "threads": 256
+       },
+       "floor_us": 260.6,
+       "rel_l2": 0.00237,
+       "tflops": 141,
+       "us": 1828.2
+      },
+      {
+       "config": {
+        "bm": 64,
+        "bn": 32,
+        "stages": 2,
+        "threads": 256
+       },
+       "floor_us": 260.6,
+       "rel_l2": 0.00237,
+       "tflops": 141,
+       "us": 1829.2
+      },
+      {
+       "config": {
+        "bm": 64,
+        "bn": 16,
+        "stages": 2,
+        "threads": 256
+       },
+       "floor_us": 260.6,
+       "rel_l2": 0.00237,
+       "tflops": 110,
+       "us": 2344.4
+      },
+      {
+       "config": {
+        "bm": 64,
+        "bn": 16,
+        "stages": 3,
+        "threads": 256
+       },
+       "floor_us": 260.6,
+       "rel_l2": 0.00237,
+       "tflops": 109,
+       "us": 2368.1
+      }
+     ]
+    },
+    "h16kv1_rows4096": {
+     "best": {
+      "bm": 64,
+      "bn": 32,
+      "stages": 1,
+      "threads": 256
+     },
+     "measured": [
+      {
+       "config": {
+        "bm": 64,
+        "bn": 32,
+        "stages": 1,
+        "threads": 256
+       },
+       "floor_us": 278.0,
+       "rel_l2": 0.00123,
+       "tflops": 140,
+       "us": 1962.3
+      },
+      {
+       "config": {
+        "bm": 64,
+        "bn": 32,
+        "stages": 2,
+        "threads": 256
+       },
+       "floor_us": 278.0,
+       "rel_l2": 0.00123,
+       "tflops": 139,
+       "us": 1978.4
+      },
+      {
+       "config": {
+        "bm": 64,
+        "bn": 16,
+        "stages": 2,
+        "threads": 256
+       },
+       "floor_us": 278.0,
+       "rel_l2": 0.00123,
+       "tflops": 111,
+       "us": 2467.5
+      },
+      {
+       "config": {
+        "bm": 64,
+        "bn": 16,
+        "stages": 3,
+        "threads": 256
+       },
+       "floor_us": 278.0,
+       "rel_l2": 0.00123,
+       "tflops": 108,
+       "us": 2543.5
+      }
+     ]
+    }
+   },
+   "config": {
+    "bm": 64,
+    "bn": 32,
+    "stages": 1,
+    "threads": 256
+   },
+   "object": "gen_sm90a_attn_pf_hd512_fp8kv.cubin",
+   "packed_check": {
+    "rel_l2": 0.00191,
+    "tail_zero": true
+   },
+   "selection": "min total us over classes",
+   "signature": {
+    "arch": "sm_90a",
+    "dtype": "bf16",
+    "gqa": [
+     1,
+     16
+    ],
+    "head_dim": 512,
+    "kv_dtype": "fp8_e4m3_rowscale",
+    "mask": "causal",
+    "op": "flash_prefill",
+    "window": 0
+   },
+   "spill_bytes": 0
   }
  },
  "generator": {
