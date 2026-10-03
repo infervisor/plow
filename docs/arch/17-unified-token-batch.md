@@ -30,9 +30,14 @@ precedence. There are **two** executors, with two different gates:
   segment the decode object's `plow_<arch>_rider_flash{256,512}` (split-KV flash decode over a
   slot map) and `plow_<arch>_rider_merge` write their output rows. Before, each rider was a
   one-row request of the prefill FA (the hd512 role runs requests serially across the whole
-  grid), 0.53-0.87 ms per rider on Gemma-4-12B — about a standalone decode row, so riding
-  bought nothing. It arms per bucket when the decode object carries the kernels and every
-  attention site matches the widest decode rung's cache, window, ring and scale.
+  grid), 0.53-0.87 ms per rider on BF16-KV Gemma-4-12B and 54-58 ms on FP8-KV (serial mux).
+  Unrouted buckets capture the rider launches into the bucket graph (sizes read on the device,
+  so one graph serves any rider count); attention-GEMM-routed buckets launch them between graph
+  pieces. Measured on the FP8-KV 16K/128 packet (4000-row launch, 332 ms): 0.28 ms per rider
+  at 4K and 0.65 ms at 15K with 64 riders, ~2.7 ms fixed per launch — the decode attention
+  kernel's own per-row cost, so every ride beats a separate decode step. It arms per bucket
+  when the decode object carries the kernels and every attention site matches the widest
+  decode rung's cache, window, ring and scale.
 
 Tensor parallelism and unsupported programs use ordinary execution. The ring-aware snapshot
 prefix cache composes with this route.
