@@ -1,5 +1,12 @@
 # Gemma-4 12B FP8 comparison
 
+2026-10-03 final comparison (`campaign.py report`, rows `final-compare-20261003-*` in the CSV): still no qualified win.
+
+- Quality: both plow arms pass the FP32-reference gate, at KL mean 0.101 (BF16 KV) and 0.110 (FP8 KV) against vLLM's 0.128.
+- The matched FP8-KV arm (`fold/fp8d-assets`) is at 0.50x / 0.45x output throughput at 4K (c32 / c128), and 0.37x / 0.36x at 15K. Its agentic16k cell was refused, with one repeat at c128.
+- The BF16-KV arm is ahead at 4K (1.58x / 1.53x), at 15K (2.43x / 2.50x), and at agentic c128 (2.17x), but behind at agentic c32/c64 (0.88x / 0.66x). That arm is NOT MATCHED on KV precision.
+- This run's vLLM baseline needs re-validation before any ratio can qualify. It used `--attention-backend TRITON_ATTN` and measured well below the earlier vLLM 0.28 reference: 4K c32 398 vs 783 out tok/s, 15K c32 81 vs 237.
+
 No production-qualified win over vLLM is established. Cross-stack quality is gated against an independent FP32 reference ([below](#fp32-reference-quality-gate)); the current best packet passes it. Internal gains below do not qualify a production recipe.
 
 [All serving measurements](comparison.csv) are consolidated into one CSV. `campaign_source` identifies the original experiment. Existing metrics and qualifications are preserved. Fixed-16K experiments do not replace the best short-context configuration.
