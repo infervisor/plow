@@ -737,7 +737,10 @@ impl GpuEngine {
             self.publish_boundary(b, p);
             p += step;
         }
-        if self.publish_boundary(b, p_a) && self.session_pin[b].is_some() {
+        // Only a prompt-side publish retires: the next turn's prompt re-renders this turn's
+        // reply, which need not re-tokenize to the generated ids, so the turn-end boundary
+        // may not match it and the prompt-end boundary must survive until then.
+        if self.publish_boundary(b, p_a) && self.session_pin[b].is_some() && max_rows < rows {
             let freed = v.kv.retire_superseded(toks, p_a);
             if freed > 0 {
                 tracing::debug!(slot = b, p_a, freed, "vmm: session retired superseded snapshots");

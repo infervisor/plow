@@ -2243,7 +2243,7 @@ fn note_lead(inner: &mut Inner, seq: usize, tokens: &[u32]) -> bool {
 const RECENT_PROMPTS: usize = 32;
 /// Rows of each recent prompt kept for the comparison.
 const RECENT_ROWS: usize = 16384;
-/// Shortest shared prefix worth a boundary snapshot.
+/// Rows a shared prefix must reach past the attached boundary to be worth a snapshot.
 const SHARE_MIN_ROWS: usize = 256;
 
 /// Record where `prompt` stops matching the longest common prefix with a recent prompt
@@ -2257,7 +2257,7 @@ fn note_share(inner: &mut Inner, seq: usize, prompt: &[u32], attached: u32) {
         .max()
         .unwrap_or(0);
     let rows = common / 32 * 32;
-    inner.share[seq] = if rows >= SHARE_MIN_ROWS && rows < prompt.len() && rows > attached as usize {
+    inner.share[seq] = if rows >= attached as usize + SHARE_MIN_ROWS && rows < prompt.len() {
         rows as u32
     } else {
         0
