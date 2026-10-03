@@ -6,6 +6,7 @@ pub mod chat;
 pub mod completion;
 pub mod config;
 pub mod cosched;
+pub mod deadlines;
 #[cfg(feature = "cpu")]
 pub mod cpu_serve;
 /// The loaded device engine behind a slug, as one type over both backends —
@@ -24,6 +25,7 @@ pub mod logprobs;
 pub mod models;
 pub mod mux;
 pub mod openai;
+pub mod overload;
 pub mod placement;
 pub mod reasoning;
 pub mod stream;
@@ -32,6 +34,7 @@ pub mod session;
 mod step_lowering_tests;
 pub mod template;
 pub mod tokenize;
+pub mod turns;
 
 use std::sync::Arc;
 
@@ -527,7 +530,7 @@ impl AppState {
     /// Install the per-group residency managers (once, at startup).
     #[cfg(feature = "cuda")]
     pub fn install_managers(&self, m: Vec<Arc<manager::ModelManager>>) {
-        self.install_device_turns(m.len());
+        self.install_device_turns(m.len(), true);
         let _ = self.managers.set(m);
     }
 
@@ -545,10 +548,12 @@ impl AppState {
     /// cooperative-launch refusal to catch the resulting CU oversubscription.
     /// The CPU engine gives every model its own worker pool, so turns bound
     /// thread contention there.
-    pub fn install_device_turns(&self, groups: usize) {
+    pub fn install_device_turns(&self, groups: usize, cuda: bool) {
         self.turns.get_or_init(|| {
+            let mode = policy::co_sched(self.registry.slugs().len(), !cuda);
+            policy::set_co_sched(mode);
             let turns = (0..groups.max(1))
-                .map(|_| Arc::new(cosched::DeviceTurn::from_config()))
+                .map(|_| Arc::new(cosched::DeviceTurn::serving(mode)))
                 .collect::<Vec<_>>();
             if let Some(first) = turns.first() {
                 tracing::info!(
@@ -933,6 +938,7 @@ pub fn app(state: Arc<AppState>) -> Router {
         .route("/healthz", get(healthz))
         .route("/metrics", get(metrics_handler))
         .route("/trace", get(trace_handler))
+        .route("/v1/turns/:session", get(turns::session_turns))
         .layer(axum::extract::DefaultBodyLimit::max(MAX_BODY_BYTES))
         .with_state(Arc::clone(&state));
     #[cfg(feature = "cuda")]
@@ -1018,6 +1024,8 @@ async fn metrics_handler(
         ("cache_bytes", "gauge", "Prefix cache bytes."),
         ("snapshot_bytes", "gauge", "Prefix snapshot bytes."),
         ("snapshots_evicted_total", "counter", "Prefix snapshots evicted."),
+        ("eviction_units_total", "counter", "Suffix evictions: a boundary plus the blocks only it kept attachable."),
+        ("eviction_unit_bytes_total", "counter", "Bytes freed by suffix evictions."),
     ] {
         crate::obs::serving::family(&mut out, &format!("plowrt_prefix_{name}"), kind, help);
     }
@@ -1039,7 +1047,9 @@ async fn metrics_handler(
              plowrt_prefix_cache_blocks{{model=\"{slug}\"}} {}\n\
              plowrt_prefix_cache_bytes{{model=\"{slug}\"}} {}\n\
              plowrt_prefix_snapshot_bytes{{model=\"{slug}\"}} {}\n\
-             plowrt_prefix_snapshots_evicted_total{{model=\"{slug}\"}} {}\n",
+             plowrt_prefix_snapshots_evicted_total{{model=\"{slug}\"}} {}\n\
+             plowrt_prefix_eviction_units_total{{model=\"{slug}\"}} {}\n\
+             plowrt_prefix_eviction_unit_bytes_total{{model=\"{slug}\"}} {}\n",
             s.attach_hits,
             s.attach_misses,
             s.tokens_queried,
@@ -1052,6 +1062,8 @@ async fn metrics_handler(
             s.cache_bytes,
             s.snapshot_bytes,
             s.snapshots_evicted,
+            s.eviction_units,
+            s.eviction_unit_bytes,
         );
     }
     ([("content-type", "text/plain; version=0.0.4; charset=utf-8")], out).into_response()

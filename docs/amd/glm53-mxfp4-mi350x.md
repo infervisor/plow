@@ -33,7 +33,7 @@ against them. Full chain on a fresh machine (inside `nix develop`, after `cargo 
 
 plowc flags: `--hf-dir <prepped> --gpu mi350 --arch gfx950 --num-gpus 8 --n-cu 256 --max-ctx 16384
 --batch 128 --seq 128,512,1024,2048,4096,8192,16384`. plowrt env: `PLOW_PREFIX_CACHE=0
-PLOW_AMD_DECODE_MIN_RUNG=1 PLOW_TP_NO_AUDIT=0 PLOW_TP_AGREE_EVERY=1`.
+PLOW_TP_NO_AUDIT=0 PLOW_TP_AGREE_EVERY=1`.
 Re-check 2026-09-25: `emit` reproduces v9 byte-identical (sha16 3b8b96fd6339691d); `overlay` reproduces
 every sidecar byte-identical and every symlink target; `objects` reproduces every interpreter .co
 byte-identical and every lean ELF with identical disassembly (a metadata note differs).
@@ -55,7 +55,7 @@ PLOW_MOE_STAGE1_PIPE=1 PLOW_MOE_GLU_KW=1 PLOW_MOE_DOWN_SWEEP_LINE=1 PLOW_MOE_ALI
 Runtime: plowrt from this branch (MHA segment routing, MoE stage-1 token-gather route, ragged
 QuantFp8Block128 row shrink); checkpoint overlay `/opt/models/plow-glm53-mxfp4-prepped-mla-mha-20260925`
 (adds `kv_b_proj.weight_scale_inv`); `PLOW_PREFIX_CACHE=0` (the MHA arm traps on kv_len != rows,
-i.e. prefix-cache hits / continuation chunks); `PLOW_AMD_DECODE_MIN_RUNG=1` for decode below 8 rows.
+i.e. prefix-cache hits / continuation chunks).
 
 ## Kernels by op and dimension (standalone, 1 GPU, TP8 per-rank shapes)
 

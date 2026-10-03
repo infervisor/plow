@@ -455,69 +455,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
-    fn print_chunk_numbers() {
-        let cm = CostModel::new(rtx5090(), DEFAULT_PAGE_BYTES);
-        let hbm = 1792.0e9 / 2.407e9;
-        let l2h = 96 * 1024 * 1024 / 2;
-        let mk = |name: &str, up: GemmShape, down: GemmShape, m: i64| {
-            let (ut, uc) = cm.best_tile(up, SramPolicy::Stream).unwrap();
-            let (_dt, dc) = cm.best_tile(down, SramPolicy::Stream).unwrap();
-            let out = (up.m * up.n) as u64 * 2;
-            let i = ChunkCostIn {
-                producer_cycles: uc,
-                consumer_cycles: dc,
-                gate_cycles: 2000,
-                m_rows: m,
-                bm: ut.bm,
-                out_bytes: out,
-                l2_bytes: l2h,
-                hbm_bytes_per_cycle: hbm,
-            };
-            let (k, cyc) = best_chunk_count(32, &i);
-            let c1 = chunk_prefill_cycles(1, &i);
-            println!(
-                "{name} M={m}: up_tile.bm={} P={uc} C={dc} out={:.1}MiB k*={k} time(k*)={cyc} time(1)={c1} speedup={:.3}x",
-                ut.bm,
-                out as f64 / 1048576.0,
-                c1 as f64 / cyc as f64
-            );
-        };
-        for m in [2048, 8192, 16384] {
-            mk(
-                "12B",
-                GemmShape {
-                    m,
-                    n: 15360,
-                    k: 3840,
-                },
-                GemmShape {
-                    m,
-                    n: 3840,
-                    k: 15360,
-                },
-                m,
-            );
-        }
-        for m in [2048, 8192, 16384] {
-            mk(
-                "31B",
-                GemmShape {
-                    m,
-                    n: 21504,
-                    k: 5376,
-                },
-                GemmShape {
-                    m,
-                    n: 5376,
-                    k: 21504,
-                },
-                m,
-            );
-        }
-    }
-
-    #[test]
     fn wave_tail_zero_when_even() {
         // M=2048, bm=128 ⇒ 16 M-tiles; k∈{2,4,8} divide evenly ⇒ no tail.
         let i = gemma12b_ffn(2048);

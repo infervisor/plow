@@ -161,8 +161,8 @@ impl RungController {
         }
     }
 
-    /// Probe the widest rung after one penultimate sample instead of four
-    /// (`PLOW_RUNG_FAST_PROBE`).
+    /// Probe the widest rung after one penultimate sample instead of four (the throughput
+    /// objective).
     pub fn with_fast_probe(mut self, on: bool) -> Self {
         self.fast_probe = on;
         self

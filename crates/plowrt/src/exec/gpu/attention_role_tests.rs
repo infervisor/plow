@@ -405,6 +405,22 @@ fn accepts_exact_hd512_px4_bq64_resource_contract() {
 }
 
 #[test]
+fn generated_packet_role_takes_any_heads_but_only_fused_flash() {
+    let roles = [0, 0, plow_asset::segment_roles::GENERATED_FIRST, 0, 0];
+    let (mut program, tensors) = hd512_px4_fixture();
+    assert_eq!(packet_role_segments(&program, &roles, &tensors).unwrap(), roles);
+    // Heads are a runtime operand of the generated object.
+    program.insts[2].i[2] = 8;
+    assert_eq!(packet_role_segments(&program, &roles, &tensors).unwrap(), roles);
+    // Window and KV ring mask are matched at emit by the catalog signature.
+    program.insts[2].i[7] = 2;
+    assert!(packet_role_segments(&program, &roles, &tensors).is_err());
+    program.insts[2].i[7] = 1;
+    program.insts[2].t[5] = TENSOR_NONE16;
+    assert!(packet_role_segments(&program, &roles, &tensors).is_err());
+}
+
+#[test]
 fn hd512_px4_bq64_packet_role_rejects_non_gemma_geometry() {
     let roles = [
         0,

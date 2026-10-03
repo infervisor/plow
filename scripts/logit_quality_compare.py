@@ -32,9 +32,20 @@ def load_row(case):
     return np.fromfile(case["file"], dtype="<f4")
 
 
-def metrics(a, b, topk):
+def metrics(a, b, topk, excluded_token_ids=()):
     if len(a) != len(b):
         raise ValueError(f"vocabulary mismatch: candidate={len(a)}, reference={len(b)}")
+    token_ids = np.arange(len(a))
+    excluded = sorted(set(excluded_token_ids))
+    if any(type(i) is not int or i < 0 or i >= len(a) for i in excluded):
+        raise ValueError("suppressed token outside vocabulary")
+    if excluded:
+        for row in (a, b):
+            if row.ndim != 1 or np.isnan(row).any() or np.isposinf(row).any():
+                raise ValueError("only declared suppressed tokens may contain negative infinity")
+        keep = np.ones(len(a), dtype=bool)
+        keep[excluded] = False
+        a, b, token_ids = a[keep], b[keep], token_ids[keep]
     n = len(a)
     if n < 2 or a.ndim != 1 or b.ndim != 1 or not np.isfinite(a).all() or not np.isfinite(b).all():
         raise ValueError("comparison requires finite full-vocabulary vectors")
@@ -50,7 +61,7 @@ def metrics(a, b, topk):
         str(k): len(set(order_a[: min(k, n)]) & set(order_b[: min(k, n)])) / min(k, n)
         for k in topk
     }
-    token_a, token_b = int(order_a[0]), int(order_b[0])
+    token_a, token_b = int(token_ids[order_a[0]]), int(token_ids[order_b[0]])
     gap_a, gap_b = float(a[order_a[0]] - a[order_a[1]]), float(b[order_b[0]] - b[order_b[1]])
     max_abs = float(np.max(np.abs(delta)))
     if token_a == token_b:
@@ -61,6 +72,7 @@ def metrics(a, b, topk):
         classification = "gap-exceeds-max-error"
     return {
         "vocab_compared": n,
+        "excluded_token_ids": excluded,
         "full_row_centered_rel_l2": float(full_rel),
         "reference_head64_centered_rel_l2": float(head_rel),
         "centered_max_abs": max_abs,
@@ -78,7 +90,7 @@ def repeat_checks(meta, repeated, topk):
     for key, cases in repeated.items():
         first = cases[0]
         for case in cases[1:]:
-            row = metrics(load_row(case), load_row(first), topk)
+            row = metrics(load_row(case), load_row(first), topk, meta.get("suppression", {}).get("token_ids", []))
             checks.append(
                 {
                     "first_case": first["id"],
@@ -129,10 +141,13 @@ def main():
     if not topk or min(topk) < 1 or not math.isfinite(args.repeat_floor_multiplier) or args.repeat_floor_multiplier <= 0:
         p.error("top-k and finite repeat-floor multiplier must be positive")
     ref_meta, refs, ref_repeated = load_manifest(args.reference)
+    excluded = ref_meta.get("suppression", {}).get("token_ids", [])
     checks = repeat_checks(ref_meta, ref_repeated, topk)
     floor_sources = [str(args.reference)] if checks else []
     for path in args.repeat_floor_manifest:
         floor_meta, _, floor_repeated = load_manifest(path)
+        if floor_meta.get("suppression", {}).get("token_ids", []) != excluded:
+            raise ValueError("reference repeats must use the same suppression policy")
         extra = repeat_checks(floor_meta, floor_repeated, topk)
         if extra:
             checks.extend(extra)
@@ -171,7 +186,8 @@ def main():
             ref = refs.get(key)
             if ref is None:
                 continue
-            row = metrics(load_row(cand), load_row(ref), topk)
+            row = metrics(load_row(cand), load_row(ref), topk, excluded)
+            row["candidate_sampled_suppressed"] = cand.get("sampled_token_id") in excluded
             row.update(
                 {
                     "candidate_case": cand["id"],
@@ -236,7 +252,10 @@ def main():
             "rows_outside_repeat_floor": outside if floor else None,
             "quality_gate_scope": "all-candidate-exact-teacher-forced-histories",
             "require_same_phase": args.require_same_phase,
+            "reference_suppressed_token_ids": excluded,
+            "candidate_sampled_suppressed_rows": sum(r["candidate_sampled_suppressed"] for r in rows),
             "quality_gate_pass": (outside == 0 and not unmatched and
+                                  not any(r["candidate_sampled_suppressed"] for r in rows) and
                                   (not args.require_same_phase or all(r["same_execution_phase"] for r in rows))) if floor else None,
             "longest_prompt_tokens": max(r["prompt_len"] for r in rows),
             "median_full_row_centered_rel_l2": float(

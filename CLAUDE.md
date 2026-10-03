@@ -23,6 +23,28 @@ environment failures on leased GPUs.
 * New probes `source scripts/bench/plowbench.sh` instead of re-implementing port choice, the
   readiness poll, the bench invocation, or result parsing.
 * Every GPU process goes through the queue, never a raw lease.
+* Final plow-vs-baseline performance comparisons: only `campaign.py report` output, in the strict
+  12-row format of `docs/bringup/agent-tools.md` "Final performance report (strict)".
+
+### Performance campaign evidence and promotion
+
+* Keep raw benchmark logs, JSON, captures, generated reports and temporary CSVs in campaign
+  scratch outside the repo. Do not scatter raw results under `docs/`, `scripts/` or `perf-data/`.
+  Keep one serving-comparison CSV per campaign in its designated results directory; record only
+  qualified wins and their evidence links in `comparison.md`.
+* Before a full-model performance run, measure every affected prefill/decode rung at its actual
+  shape, precision, flags and context. Check output accuracy, object resources (registers, spills,
+  stack and shared memory), and measured time against a calibrated bandwidth/compute roofline.
+  Resolve unexplained gaps; select the fastest correct native Plow kernel or segmented cuBLASLt
+  route per rung, then verify block-level behavior. Full-model accuracy and serving comparisons
+  validate the selected set; they do not replace the rung gates.
+* Maintain one canonical production TOML per model/GPU/precision campaign under
+  `recipes/infervisor`. Update that file in place only for qualified per-rung choices, including
+  the actual compile flags, object route and runtime settings. Keep experimental recipes in the
+  existing `scripts/campaign/recipes` area or scratch, not as extra production TOMLs.
+* Reuse validated tuning evidence across commits when source and object hashes, compiler flags,
+  kernel geometry, hardware and correctness match. Record the commit for traceability, but do not
+  make identical commit hashes a qualification requirement.
 
 ## Core Rules
 

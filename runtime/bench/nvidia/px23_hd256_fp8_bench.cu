@@ -14,6 +14,11 @@
  * Both binaries build the SAME inputs from the same seed and score against the SAME in-bench f32
  * reference kernel, so their error columns and their reference hashes are directly comparable.
  * The reference hash matching across the two binaries is what proves they were fed identical data.
+ * With PLOW_NV_PACKED_REQUEST=1, --packed-only compares one packed launch with per-request
+ * launches for ragged R4 and R16 at short, medium, and long KV positions, then times the
+ * packed launch. Build each arm with
+ * PLOW_NV_FP8_PACKED_VARLEN=0 and =1 to isolate request scheduling.
+ * --packed-cubin PATH also checks and times the packet-matched dedicated interpreter object.
  *
  * THE VACUOUS-GATE TRAP (PX-22 bug 1, which burned an agent on this exact campaign): 0x7f is the
  * E4M3 NaN encoding.  A `rand() & 0x7f` operand fill puts one NaN in every 128 bytes; one NaN
@@ -24,7 +29,11 @@
  *   3. the output hash is asserted != the ZERO-plane hash and != the reference hash of a
  *      DIFFERENT shape, so a degenerate (all-zero / all-NaN / stuck) output cannot pass.
  *
- * Run under perf-data/tools/gpulease.  Build: perf-data/px23_build.sh
+ * Build under nix develop with CUDA 12.9/GCC 14, -gencode arch=compute_90a,code=sm_90a,
+ * -DPLOW_NV_HOPPER=1 -DPLOW_FP8_KV=1 -DPLOW_NV_PACKED_REQUEST=1, plus the PIPE and VARLEN
+ * settings above. Add -lcuda for --packed-cubin and put /usr/lib/x86_64-linux-gnu before the Nix
+ * CUDA stub directory in LD_LIBRARY_PATH when queuing that mode. Run through
+ * scripts/bench/gpuq.py (which leases via gpulease).
  */
 #include <cstdio>
 #include <cstdint>
@@ -32,9 +41,11 @@
 #include <cstring>
 #include <cmath>
 #include <vector>
+#include <cuda.h>
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
+#include "dev_isa.h"
 #include "op_attention.cuh"
 
 #if !defined(PLOW_FP8_KV)
@@ -46,6 +57,16 @@
         cudaError_t e_ = (x);                                                                       \
         if (e_ != cudaSuccess) {                                                                    \
             printf("CUDA ERR %s @%d: %s\n", #x, __LINE__, cudaGetErrorString(e_));                  \
+            exit(1);                                                                                \
+        }                                                                                           \
+    } while (0)
+#define DRV(x)                                                                                      \
+    do {                                                                                            \
+        CUresult e_ = (x);                                                                          \
+        if (e_ != CUDA_SUCCESS) {                                                                   \
+            const char* s_ = nullptr;                                                               \
+            cuGetErrorString(e_, &s_);                                                              \
+            fprintf(stderr, "CUDA DRIVER ERR %s @%d: %s\n", #x, __LINE__, s_ ? s_ : "unknown");  \
             exit(1);                                                                                \
         }                                                                                           \
     } while (0)
@@ -77,6 +98,19 @@ __global__ __launch_bounds__(PLOW_NV_THREADS, 1) void k_arm(
     d_flash_prefill<HD, BQ, BKV, true>(Opart, mlpart, Q, K, V, O, seq_q, seq_kv, n_head, n_kv_head,
                                        q_pos0, window, nsplit, kv_stride, kv_mask, scale,
                                        blockIdx.x, gridDim.x, lds, ksc, vsc);
+}
+#endif
+
+#if PLOW_NV_PACKED_REQUEST
+__global__ __launch_bounds__(PLOW_NV_THREADS, 1) void k_packed(
+    const int* req, float* Opart, float* mlpart, const __nv_bfloat16* Q,
+    const unsigned char* K, const unsigned char* V, __nv_bfloat16* O,
+    const float* ksc, const float* vsc, unsigned seq_q, unsigned n_head,
+    unsigned n_kv_head, unsigned window, unsigned kv_stride, unsigned kv_mask, float scale) {
+    extern __shared__ float lds[];
+    d_flash_prefill_fp8_mux<HD>(req, Opart, mlpart, Q, K, V, O, ksc, vsc,
+                                seq_q, 0, n_head, n_kv_head, 0, window, 1,
+                                kv_stride, kv_mask, scale, blockIdx.x, gridDim.x, lds);
 }
 #endif
 
@@ -172,12 +206,211 @@ struct Shape {
     unsigned seq_q, seq_kv, n_head, n_kv_head, q_pos0, window, nsplit, ring_log2;
 };
 
+#if PLOW_NV_PACKED_REQUEST
+template <class T> static T* upload(const std::vector<T>& host) {
+    T* device;
+    CHK(cudaMalloc(&device, host.size() * sizeof(T)));
+    CHK(cudaMemcpy(device, host.data(), host.size() * sizeof(T), cudaMemcpyHostToDevice));
+    return device;
+}
+
+static int packed_bench(int sms, int smem, const char* cubin) {
+    const unsigned n_head = 16, n_kv_head = 8, ring = 2048, window = 1024;
+    const unsigned kv_mask = ring - 1;
+    CHK(cudaFuncSetAttribute(k_packed, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
+    CUmodule module = nullptr;
+    CUfunction interpreter = nullptr;
+    const unsigned interp_smem = 132160;
+    if (cubin) {
+        DRV(cuModuleLoad(&module, cubin));
+        DRV(cuModuleGetFunction(&interpreter, module, "_Z23interp_sm90a_pfpackedfa11PlowProgram"));
+        DRV(cuFuncSetAttribute(interpreter, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                               interp_smem));
+    }
+    for (unsigned shape = 0; shape < 4; ++shape) {
+        const unsigned count = shape == 0 ? 4 : 16;
+        const unsigned kvbase = shape == 0 ? 0 : shape == 1 ? 256 : shape == 2 ? 4096 : 15000;
+        std::vector<int> req(1 + 4 * count);
+        req[0] = (int)count;
+        unsigned seq_q = 0;
+        for (unsigned r = 0; r < count; ++r) {
+            const unsigned qlen = shape == 0 ? (r == 0 ? 96 : r == 1 ? 128 : r == 2 ? 63 : 31) : 128;
+            const unsigned kvlen = shape == 0 ? (r == 0 ? 192 : r == 1 ? 512 : r == 2 ? 256 : 64)
+                                                : kvbase + 64 * r;
+            req[1 + 4*r] = (int)seq_q;
+            req[2 + 4*r] = (int)qlen;
+            req[3 + 4*r] = (int)r;
+            req[4 + 4*r] = (int)kvlen;
+            seq_q += qlen;
+        }
+        xs = 0xC6A4A7935BD1E995ull + shape;
+        const size_t on = (size_t)seq_q * n_head * HD;
+        const size_t kvn = (size_t)count * n_kv_head * ring * HD;
+        const size_t sn = (size_t)count * n_kv_head * ring;
+        std::vector<__nv_bfloat16> hQ(on);
+        std::vector<unsigned char> hK(kvn), hV(kvn);
+        std::vector<float> hKs(sn), hVs(sn);
+        for (auto& q : hQ) q = __float2bfloat16(((float)(xr() % 2001) - 1000.0f) * 0.002f);
+        for (size_t i = 0; i < kvn; ++i) { hK[i] = rnd_e4m3(); hV[i] = rnd_e4m3(); }
+        for (size_t i = 0; i < sn; ++i) {
+            hKs[i] = 0.004f + (float)(xr() % 100) * 1e-5f;
+            hVs[i] = 0.003f + (float)(xr() % 100) * 1e-5f;
+        }
+        int* dReq;
+        __nv_bfloat16 *dQ, *dPacked, *dSerial;
+        unsigned char *dK, *dV;
+        float *dKs, *dVs, *dOpart, *dml;
+        CHK(cudaMalloc(&dReq, req.size() * sizeof(int)));
+        CHK(cudaMalloc(&dQ, on * 2));
+        CHK(cudaMalloc(&dK, kvn)); CHK(cudaMalloc(&dV, kvn));
+        CHK(cudaMalloc(&dKs, sn * 4)); CHK(cudaMalloc(&dVs, sn * 4));
+        CHK(cudaMalloc(&dPacked, on * 2)); CHK(cudaMalloc(&dSerial, on * 2));
+        CHK(cudaMalloc(&dOpart, on * 4));
+        CHK(cudaMalloc(&dml, (size_t)seq_q * n_head * 2 * 4));
+        CHK(cudaMemcpy(dReq, req.data(), req.size() * sizeof(int), cudaMemcpyHostToDevice));
+        CHK(cudaMemcpy(dQ, hQ.data(), on * 2, cudaMemcpyHostToDevice));
+        CHK(cudaMemcpy(dK, hK.data(), kvn, cudaMemcpyHostToDevice));
+        CHK(cudaMemcpy(dV, hV.data(), kvn, cudaMemcpyHostToDevice));
+        CHK(cudaMemcpy(dKs, hKs.data(), sn * 4, cudaMemcpyHostToDevice));
+        CHK(cudaMemcpy(dVs, hVs.data(), sn * 4, cudaMemcpyHostToDevice));
+        CHK(cudaMemset(dPacked, 0, on * 2));
+        CHK(cudaMemset(dSerial, 0, on * 2));
+        const float scale = 1.0f / sqrtf((float)HD);
+        for (unsigned r = 0; r < count; ++r) {
+            const unsigned q0 = (unsigned)req[1 + 4*r], qlen = (unsigned)req[2 + 4*r];
+            const unsigned slot = (unsigned)req[3 + 4*r], kvlen = (unsigned)req[4 + 4*r];
+            const size_t qoff = (size_t)q0 * n_head * HD;
+            const size_t soff = (size_t)slot * n_kv_head * ring;
+            k_arm<<<sms, PLOW_NV_THREADS, smem>>>(
+                dOpart + qoff, dml + (size_t)q0 * n_head * 2, dQ + qoff,
+                (const __nv_bfloat16*)(dK + soff * HD),
+                (const __nv_bfloat16*)(dV + soff * HD), dSerial + qoff,
+                qlen, kvlen, n_head, n_kv_head, kvlen - qlen, window, 1, ring, kv_mask,
+                scale, dKs + soff, dVs + soff);
+            CHK(cudaGetLastError());
+        }
+        k_packed<<<sms, PLOW_NV_THREADS, smem>>>(
+            dReq, dOpart, dml, dQ, dK, dV, dPacked, dKs, dVs,
+            seq_q, n_head, n_kv_head, window, ring, kv_mask, scale);
+        CHK(cudaDeviceSynchronize());
+        CHK(cudaGetLastError());
+        std::vector<__nv_bfloat16> hPacked(on), hSerial(on);
+        CHK(cudaMemcpy(hPacked.data(), dPacked, on * 2, cudaMemcpyDeviceToHost));
+        CHK(cudaMemcpy(hSerial.data(), dSerial, on * 2, cudaMemcpyDeviceToHost));
+        const size_t nonfinite = nonfinite_bf16(hPacked) + nonfinite_bf16(hSerial);
+        size_t nonzero = 0;
+        for (const auto x : hSerial) nonzero += __bfloat162float(x) != 0.0f;
+        const bool exact = memcmp(hPacked.data(), hSerial.data(), on * 2) == 0;
+        const uint64_t hash = fnv(hPacked.data(), on * 2);
+        if (!exact || nonfinite || nonzero < on / 2) {
+            printf("PACKED shape=%u R=%u C=%u %s FAIL exact=%d nonfinite=%zu nonzero=%zu/%zu\n",
+                   shape, count, kvbase, ARM_NAME, exact, nonfinite, nonzero, on);
+            return 1;
+        }
+        if (interpreter) {
+            PlowDevInst inst{};
+            inst.op = PLOW_DOP_FLASH_PREFILL_FP8;
+            inst.blocks = sms;
+            for (auto& t : inst.t) t = PLOW_TENSOR_NONE;
+            for (unsigned t = 0; t < 8; ++t) inst.t[t] = t;
+            inst.i[0] = seq_q; inst.i[1] = 0; inst.i[2] = n_head; inst.i[3] = n_kv_head;
+            inst.i[4] = 0x80000008u; inst.i[5] = window; inst.i[6] = HD; inst.i[7] = 1;
+            inst.fj[0].f = scale; inst.fj[1].u = ring; inst.fj[2].u = kv_mask;
+            std::vector<PlowStreamEnt> entries(sms);
+            for (unsigned i = 0; i < (unsigned)sms; ++i) entries[i].slice = i;
+            PlowProgram program{};
+            program.insts = upload(std::vector<PlowDevInst>{inst});
+            program.gq_stream = upload(entries);
+            program.gq_seg_ofs = upload(std::vector<uint32_t>{0, (uint32_t)sms});
+            program.gq_cursor = upload(std::vector<uint32_t>(PLOW_CTR_STRIDE));
+            program.tensors = upload(std::vector<void*>{
+                dOpart, dml, dQ, dK, dV, dPacked, dKs, dVs, dReq});
+            program.n_seg = 1;
+            void* args[]{&program};
+            auto launch = [&] {
+                CHK(cudaMemsetAsync(program.gq_cursor, 0, PLOW_CTR_STRIDE * sizeof(uint32_t)));
+                DRV(cuLaunchKernel(interpreter, sms, 1, 1, PLOW_NV_THREADS, 1, 1,
+                                   interp_smem, nullptr, args, nullptr));
+            };
+            CHK(cudaMemset(dPacked, 0, on * 2));
+            launch();
+            CHK(cudaDeviceSynchronize());
+            CHK(cudaMemcpy(hPacked.data(), dPacked, on * 2, cudaMemcpyDeviceToHost));
+            const bool cubin_exact = memcmp(hPacked.data(), hSerial.data(), on * 2) == 0;
+            const size_t cubin_nonfinite = nonfinite_bf16(hPacked);
+            size_t cubin_nonzero = 0;
+            for (auto x : hPacked) cubin_nonzero += __bfloat162float(x) != 0.0f;
+            if (!cubin_exact || cubin_nonfinite || cubin_nonzero < on / 2) {
+                printf("CUBIN shape=%u R=%u C=%u FAIL exact=%d nonfinite=%zu nonzero=%zu/%zu hash=%016llx ref=%016llx\n",
+                       shape, count, kvbase, cubin_exact, cubin_nonfinite, cubin_nonzero, on,
+                       (unsigned long long)fnv(hPacked.data(), on * 2),
+                       (unsigned long long)fnv(hSerial.data(), on * 2));
+                return 1;
+            }
+            cudaEvent_t start, stop;
+            CHK(cudaEventCreate(&start)); CHK(cudaEventCreate(&stop));
+            for (int rep = 0; rep < 3; ++rep) { launch(); CHK(cudaDeviceSynchronize()); }
+            float total_ms = 0;
+            for (int rep = 0; rep < 20; ++rep) {
+                CHK(cudaMemsetAsync(program.gq_cursor, 0, PLOW_CTR_STRIDE * sizeof(uint32_t)));
+                CHK(cudaEventRecord(start));
+                DRV(cuLaunchKernel(interpreter, sms, 1, 1, PLOW_NV_THREADS, 1, 1,
+                                   interp_smem, nullptr, args, nullptr));
+                CHK(cudaEventRecord(stop)); CHK(cudaEventSynchronize(stop));
+                float ms = 0;
+                CHK(cudaEventElapsedTime(&ms, start, stop));
+                total_ms += ms;
+            }
+            printf("CUBIN shape=%u R=%u C=%u rows=%u ms=%.4f hash=%016llx PASS\n",
+                   shape, count, kvbase, seq_q, total_ms / 20,
+                   (unsigned long long)fnv(hPacked.data(), on * 2));
+            CHK(cudaEventDestroy(start)); CHK(cudaEventDestroy(stop));
+            cudaFree((void*)program.insts); cudaFree((void*)program.gq_stream);
+            cudaFree((void*)program.gq_seg_ofs); cudaFree(program.gq_cursor);
+            cudaFree((void*)program.tensors);
+        }
+        cudaEvent_t e0, e1;
+        CHK(cudaEventCreate(&e0)); CHK(cudaEventCreate(&e1));
+        for (int rep = 0; rep < 3; ++rep)
+            k_packed<<<sms, PLOW_NV_THREADS, smem>>>(dReq, dOpart, dml, dQ, dK, dV, dPacked,
+                dKs, dVs, seq_q, n_head, n_kv_head, window, ring, kv_mask, scale);
+        CHK(cudaDeviceSynchronize());
+        CHK(cudaEventRecord(e0));
+        for (int rep = 0; rep < 20; ++rep)
+            k_packed<<<sms, PLOW_NV_THREADS, smem>>>(dReq, dOpart, dml, dQ, dK, dV, dPacked,
+                dKs, dVs, seq_q, n_head, n_kv_head, window, ring, kv_mask, scale);
+        CHK(cudaEventRecord(e1)); CHK(cudaEventSynchronize(e1));
+        float ms = 0;
+        CHK(cudaEventElapsedTime(&ms, e0, e1));
+        printf("PACKED shape=%u R=%u C=%u rows=%u %s varlen=%d ms=%.4f hash=%016llx PASS\n",
+               shape, count, kvbase, seq_q, ARM_NAME, PLOW_NV_FP8_PACKED_VARLEN, ms / 20,
+               (unsigned long long)hash);
+        CHK(cudaEventDestroy(e0)); CHK(cudaEventDestroy(e1));
+        cudaFree(dReq); cudaFree(dQ); cudaFree(dK); cudaFree(dV);
+        cudaFree(dKs); cudaFree(dVs); cudaFree(dPacked); cudaFree(dSerial);
+        cudaFree(dOpart); cudaFree(dml);
+    }
+    if (module) DRV(cuModuleUnload(module));
+    return 0;
+}
+#endif
+
 int main(int argc, char** argv) {
     int do_perf = 1, do_gate = 1;
+    bool packed_only = false;
+    const char* packed_cubin = nullptr;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--gate-only")) do_perf = 0;
         if (!strcmp(argv[i], "--perf-only")) do_gate = 0;
+        if (!strcmp(argv[i], "--packed-only")) packed_only = true;
+        if (!strcmp(argv[i], "--packed-cubin") && i + 1 < argc) {
+            packed_cubin = argv[++i];
+            packed_only = true;
+        }
     }
+#if !PLOW_NV_PACKED_REQUEST
+    if (packed_only) { fputs("--packed-only requires PLOW_NV_PACKED_REQUEST=1\n", stderr); return 2; }
+#endif
     int dev = 0, sms = 0, optin = 0;
     CHK(cudaGetDevice(&dev));
     CHK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev));
@@ -190,6 +423,9 @@ int main(int argc, char** argv) {
     printf("\n");
     if (smem > optin) { printf("FATAL: arena %d > optin %d\n", smem, optin); return 1; }
     CHK(cudaFuncSetAttribute(k_arm, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
+#if PLOW_NV_PACKED_REQUEST
+    if (packed_only) return packed_bench(sms, smem, packed_cubin);
+#endif
 
     /* ---------- correctness gate ---------- */
     /* Real Gemma-4 sliding-layer shape: n_head 16, n_kv_head 8 (gqa 2), hd 256, window 1024. */

@@ -35,6 +35,8 @@ def parse_args():
                    help="override only the RMSNorm IR provider; keep compilation defaults")
     p.add_argument("--language-model-only", action="store_true")
     p.add_argument("--quantization", choices=["fp8"])
+    p.add_argument("--kv-cache-dtype", choices=["auto", "fp8", "fp8_per_token_head"], default="auto")
+    p.add_argument("--attention-backend", choices=["TRITON_ATTN"])
     p.add_argument("--precision-report", action="store_true",
                    help="inventory loaded tensor dtypes and selected quantization paths on every rank")
     return p.parse_args()
@@ -160,7 +162,17 @@ def generate_requests(llm, cases, sampling, batch_size):
         prompts = [{"prompt_token_ids": [int(x) for x in case["prompt_token_ids"]]} for case in batch]
         if any(not prompt["prompt_token_ids"] for prompt in prompts):
             raise ValueError("request batch contains an empty prompt")
-        results = llm.generate(prompts[0] if batch_size == 1 else prompts, sampling, use_tqdm=False)
+        params = sampling
+        if any("forced_next_token_id" in case for case in batch):
+            params = []
+            for case in batch:
+                one = sampling.clone()
+                if "forced_next_token_id" in case:
+                    one.allowed_token_ids = [int(case["forced_next_token_id"])]
+                params.append(one)
+        results = llm.generate(prompts[0] if batch_size == 1 else prompts,
+                               params[0] if isinstance(params, list) and batch_size == 1 else params,
+                               use_tqdm=False)
         if len(results) != len(batch):
             raise ValueError("request batch returned the wrong result count")
         for case, prompt, result in zip(batch, prompts, results):
@@ -240,9 +252,14 @@ def model_precision_inventory(model):
         if isinstance(value, dict):
             return {str(key): describe(item, depth + 1) for key, item in value.items()}
         names = [f.name for f in dataclasses.fields(value)] if dataclasses.is_dataclass(value) else fields
-        return dict(class_name=class_name(value), fields={
-            name: describe(getattr(value, name), depth + 1) for name in names if hasattr(value, name)
-        })
+        values = {}
+        for name in names:
+            try:
+                item = getattr(value, name)
+            except Exception:
+                continue  # A model config may reject ambiguous per-layer global fields.
+            values[name] = describe(item, depth + 1)
+        return dict(class_name=class_name(value), fields=values)
 
     modules = {}
     for name, module in model.named_modules():
@@ -250,9 +267,16 @@ def model_precision_inventory(model):
         tensors.update(module.named_buffers(recurse=False))
         # MLA derived weights and bound caches are not necessarily registered buffers.
         tensors.update({key: value for key, value in vars(module).items() if isinstance(value, torch.Tensor)})
+        attributes = {}
+        for key in fields:
+            try:
+                item = getattr(module, key)
+            except Exception:
+                continue
+            attributes[key] = describe(item)
         modules[name] = dict(class_name=class_name(module), tensors={
             key: tensor(value) for key, value in sorted(tensors.items())
-        }, attributes={key: describe(getattr(module, key)) for key in fields if hasattr(module, key)})
+        }, attributes=attributes)
     return dict(rank=torch.distributed.get_rank() if torch.distributed.is_initialized() else 0,
                 modules=modules, sources=sources)
 
@@ -280,6 +304,8 @@ def main():
     cases = request.get("cases")
     if not isinstance(cases, list) or not cases:
         raise ValueError("cases JSON needs a non-empty `cases` array")
+    if any("forced_next_token_id" in case for case in cases) and args.max_output_tokens < 2:
+        raise ValueError("forced next-token cases need at least two output tokens for decode logits")
     max_len = required_model_length(cases, args.max_output_tokens, args.max_model_len)
     case_ids = [case_id(case["id"]) for case in cases]
     if len(case_ids) != len(set(case_ids)):
@@ -303,6 +329,8 @@ def main():
         logprobs_mode="raw_logits",
         language_model_only=args.language_model_only,
         quantization=args.quantization,
+        kv_cache_dtype=args.kv_cache_dtype,
+        attention_backend=args.attention_backend,
         **engine_overrides(args.disable_cuda_graphs, args.rms_norm_provider, args.precision_report),
     )
     effective_compile = llm.llm_engine.vllm_config.compilation_config
@@ -351,6 +379,9 @@ def main():
         },
         "language_model_only": args.language_model_only,
         "quantization": args.quantization,
+        "kv_cache_dtype": args.kv_cache_dtype,
+        "attention_backend": args.attention_backend,
+        "forced_next_token_scope": "all_generation_steps; raw logits captured before token mask",
         "precision_report": "precision.json" if args.precision_report else None,
         "hf_vocab_size": llm.model_config.hf_text_config.vocab_size,
         "final_logit_softcapping": getattr(llm.model_config.hf_text_config, "final_logit_softcapping", None),
@@ -370,11 +401,15 @@ def main():
             raise ValueError(f"case {cid} has an empty prompt")
         completion = result.outputs[0]
         generated_ids = [int(token) for token in completion.token_ids]
+        forced = raw_case.get("forced_next_token_id")
+        if forced is not None and (not generated_ids or generated_ids[0] != int(forced)):
+            raise RuntimeError(f"case {cid}: forced token was not generated")
         manifest["requests"].append({
             "id": cid,
             "prompt_token_ids": ids,
             "prompt_sha256_u32le": prompt_digest(ids),
             "generated_token_ids": generated_ids,
+            "forced_next_token_id": forced,
             "finish_reason": completion.finish_reason,
             "request_id": result.request_id,
         })

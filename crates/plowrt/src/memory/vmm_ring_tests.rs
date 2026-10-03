@@ -18,6 +18,7 @@ struct Ledger {
     reserved: BTreeMap<u64, u64>,
     handles: BTreeMap<u64, u64>,
     mapped: BTreeMap<u64, (u64, u64, bool)>,
+    multi_map: bool,
 }
 struct Mock(Mutex<Ledger>, u64);
 impl Default for Mock {
@@ -92,10 +93,11 @@ impl VmmOps for Mock {
             .reserved
             .iter()
             .any(|(&p, &n)| va >= p && va + bytes <= p + n));
+        let multi = s.multi_map;
         assert!(!s
             .mapped
             .iter()
-            .any(|(&p, &(n, h, _))| h == handle || (va < p + n && p < va + bytes)));
+            .any(|(&p, &(n, h, _))| (h == handle && !multi) || (va < p + n && p < va + bytes)));
         assert_eq!(s.mapped.insert(va, (bytes, handle, false)), None);
         Ok(())
     }
@@ -473,4 +475,71 @@ fn actual_fp8_packet_scale_slots_share_pages_without_changing_stride() {
         layout.ring_tensors.len(), rings.stats().resident_bytes);
     drop(rings);
     ops.empty();
+}
+
+fn idle_tensors() -> [LiveRingTensor; 2] {
+    [
+        LiveRingTensor {
+            tensor: 3,
+            slot_bytes: 128,
+        },
+        LiveRingTensor {
+            tensor: 8,
+            slot_bytes: 32,
+        },
+    ]
+}
+
+fn all_mapped(ops: &Mock, units: usize) {
+    let s = ops.0.lock().unwrap();
+    assert_eq!(s.mapped.len(), units);
+    assert!(s.mapped.values().all(|m| m.2));
+}
+
+#[test]
+fn idle_backed_rings_map_every_unit_and_charge_only_claimed_slots() {
+    let ops = Arc::new(Mock::default());
+    ops.0.lock().unwrap().multi_map = true;
+    let mut rings = VmmRings::new_idle_backed(ops.clone(), &idle_tensors(), 4).unwrap();
+    // Four 128-byte slot units on the idle handle, the shared 32-byte window committed whole.
+    all_mapped(&ops, 6);
+    assert_eq!(rings.stats().resident_bytes, 128);
+    assert_eq!(rings.slot_charge(), 128);
+
+    let calls = ops.calls();
+    rings.ensure_prefix(4).unwrap();
+    assert_eq!(ops.calls(), calls, "idle rows need no mapping");
+
+    rings.ensure_slot(2).unwrap();
+    all_mapped(&ops, 6);
+    assert_eq!(rings.stats().resident_bytes, 256);
+    let base = rings.tensor_va(3).unwrap();
+    let idle = ops.0.lock().unwrap().mapped[&base].1;
+    assert_ne!(ops.0.lock().unwrap().mapped[&(base + 2 * 128)].1, idle);
+
+    rings.release_slot(2);
+    all_mapped(&ops, 6);
+    assert_eq!(rings.stats().resident_bytes, 128);
+    assert_eq!(ops.0.lock().unwrap().mapped[&(base + 2 * 128)].1, idle);
+    drop(rings);
+    ops.empty();
+}
+
+#[test]
+fn idle_backed_slot_failure_restores_the_idle_mapping() {
+    for stage in [Call::Create, Call::Map, Call::Access] {
+        let ops = Arc::new(Mock::default());
+        ops.0.lock().unwrap().multi_map = true;
+        let mut rings = VmmRings::new_idle_backed(ops.clone(), &idle_tensors(), 4).unwrap();
+        rings.ensure_slot(0).unwrap();
+        let stats = rings.stats();
+        ops.fail(stage, 1);
+        assert!(rings.ensure_slot(1).is_err(), "{stage:?}");
+        assert_eq!(rings.stats(), stats);
+        all_mapped(&ops, 6);
+        rings.ensure_slot(1).unwrap();
+        assert_eq!(rings.stats().resident_bytes, 128 + 2 * 128);
+        drop(rings);
+        ops.empty();
+    }
 }

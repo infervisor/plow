@@ -140,7 +140,8 @@ enum Reply {
 }
 
 enum S3Msg {
-    Open { id: usize, voice: String, seed: u64, reply: Reply },
+    /// `turn`: the voice turn's times, looked up once at submit (render deadlines).
+    Open { id: usize, voice: String, seed: u64, reply: Reply, turn: Option<crate::serve::turns::TurnTimes> },
     Token { id: usize, token: u32 },
     Close { id: usize, t3_ms: f64 },
     /// The LM failed the request.
@@ -157,6 +158,8 @@ pub struct GuidedSpeech {
     render: parking_lot::Mutex<mpsc::Sender<S3Msg>>,
     next_id: AtomicUsize,
     pub sample_rate: u32,
+    /// The vocoder's `stream.first_tokens`.
+    first_tokens: usize,
 }
 
 struct Utterance {
@@ -173,6 +176,8 @@ struct Utterance {
     phase: Vec<f32>,
     /// When the stream's first audio went out (its playback clock).
     started: Option<std::time::Instant>,
+    opened: std::time::Instant,
+    turn: Option<crate::serve::turns::TurnTimes>,
 }
 
 /// One render of an utterance: tokens `[start, end)`; `last` = the utterance's final audio.
@@ -184,9 +189,10 @@ struct Span {
 }
 
 impl Utterance {
-    /// An open stream whose first audio has not been rendered yet.
+    /// A stream whose first audio has not been rendered yet, closed or not: an LM that finishes
+    /// before the first render (light load) leaves the stream as owed its first audio as ever.
     fn first_chunk(&self) -> bool {
-        self.rendered == 0 && self.t3_ms.is_none() && matches!(self.reply, Reply::Stream(_))
+        self.rendered == 0 && matches!(self.reply, Reply::Stream(_))
     }
 
     /// Due for a render: a closed utterance always; an open stream once a chunk has arrived.
@@ -307,7 +313,8 @@ fn initial_phase(seed: u64, harmonics: usize) -> Vec<f32> {
         .collect()
 }
 
-fn render_loop(vocoder: &Codec, base: Schedule, rx: mpsc::Receiver<S3Msg>, credit: &DownstreamCredit) {
+/// `cost_id`: the vocoder's id in [`crate::sched::cost`].
+fn render_loop(vocoder: &Codec, cost_id: usize, base: Schedule, rx: mpsc::Receiver<S3Msg>, credit: &DownstreamCredit) {
     let max_batch = vocoder.max_batch;
     // More live streams than one launch holds: the device is the bottleneck, so a started stream
     // waits for a window filling the widest capacity at the full batch (lowest cost per token).
@@ -315,10 +322,14 @@ fn render_loop(vocoder: &Codec, base: Schedule, rx: mpsc::Receiver<S3Msg>, credi
     let wide = Schedule { chunk: base.chunk.max(full.saturating_sub(base.context + base.hold)), ..base };
     let turn_batch = crate::config::RuntimeConfig::get().tts_turn_batch;
     let launch = if credit.device_turn().is_some() && turn_batch > 0 { turn_batch } else { max_batch };
+    let held: super::codec::HeldTurn = Default::default();
+    if let Some(dt) = credit.device_turn() {
+        vocoder.set_yield(Some(super::codec::turn_yield(Arc::clone(dt), Arc::clone(&held))));
+    }
     let mut live: HashMap<usize, Utterance> = HashMap::new();
     let mut held_since: Option<std::time::Instant> = None;
     let apply = |live: &mut HashMap<usize, Utterance>, m: S3Msg| match m {
-        S3Msg::Open { id, voice, seed, reply } => {
+        S3Msg::Open { id, voice, seed, reply, turn } => {
             live.insert(
                 id,
                 Utterance {
@@ -333,6 +344,8 @@ fn render_loop(vocoder: &Codec, base: Schedule, rx: mpsc::Receiver<S3Msg>, credi
                     tail: Vec::new(),
                     phase: Vec::new(),
                     started: None,
+                    opened: std::time::Instant::now(),
+                    turn,
                 },
             );
         }
@@ -357,6 +370,7 @@ fn render_loop(vocoder: &Codec, base: Schedule, rx: mpsc::Receiver<S3Msg>, credi
     };
     loop {
         let sc = if base.windowed() && live.len() > max_batch { wide } else { base };
+        let sc = if crate::serve::overload::level() >= 2 { Schedule { slack: sc.slack / 2, ..sc } } else { sc };
         if !live.values().any(|u| u.due(&sc)) {
             match rx.recv() {
                 Ok(m) => apply(&mut live, m),
@@ -469,7 +483,35 @@ fn render_loop(vocoder: &Codec, base: Schedule, rx: mpsc::Receiver<S3Msg>, credi
             let now = std::time::Instant::now();
             let due_now = first || due.iter().any(|k| live[k].started.is_some() && live[k].buffered(now, &sc) <= sc.slack);
             let urgency = if due_now { crate::serve::cosched::Urgency::Deadline } else { crate::serve::cosched::Urgency::Normal };
-            futures::executor::block_on(turn.take_at(dt, urgency));
+            // Turn streams: first audio by the turn's end, started ones by their playback clock;
+            // the rest keep the class deadline. Best rank wins.
+            let cost = crate::serve::deadlines::render_cost(cost_id, due.len());
+            let render_due = due
+                .iter()
+                .filter_map(|k| {
+                    let u = &live[k];
+                    let t = u.turn.as_ref()?;
+                    Some(match u.started {
+                        None => crate::serve::deadlines::first_audio(t, u.opened, cost),
+                        Some(_) => crate::serve::deadlines::playback(now, u.buffered(now, &sc), cost),
+                    })
+                })
+                .chain(
+                    due.iter()
+                        .any(|k| live[k].turn.is_none())
+                        .then(|| {
+                            let legacy_now = due.iter().any(|k| {
+                                let u = &live[k];
+                                u.turn.is_none() && (u.first_chunk() || (u.started.is_some() && u.buffered(now, &sc) <= sc.slack))
+                            });
+                            let u = if legacy_now { crate::serve::cosched::Urgency::Deadline } else { crate::serve::cosched::Urgency::Normal };
+                            crate::serve::cosched::Due { cost, ..crate::serve::cosched::Due::from_urgency(u, now) }
+                        }),
+                )
+                .min_by_key(|d| d.rank(now))
+                .unwrap_or_else(|| crate::serve::cosched::Due { cost, ..crate::serve::cosched::Due::from_urgency(urgency, now) });
+            futures::executor::block_on(turn.take_due(dt, super::codec::serial_due(render_due)));
+            *held.lock() = Some((std::mem::take(&mut turn), render_due));
         } else if first && live.len() <= sc.min_batch.max(1) {
             credit.set_urgent(true);
         }
@@ -498,9 +540,13 @@ fn render_loop(vocoder: &Codec, base: Schedule, rx: mpsc::Receiver<S3Msg>, credi
             })
             .collect();
         let results = futures::executor::block_on(futures::future::join_all(renders));
+        if let Some((t, _)) = held.lock().take() {
+            turn = t;
+        }
         drop((guard, turn));
         let ms = t.elapsed().as_secs_f64() * 1e3;
         tracing::debug!(renders = due.len(), tokens = ?spans.iter().map(|s| s.end - s.start).collect::<Vec<_>>(), ms, "vocoder render");
+        crate::sched::cost::record_id(cost_id, crate::sched::cost::Op::Render { streams: due.len() }, t.elapsed());
         for ((k, pcm), span) in due.into_iter().zip(results).zip(spans) {
             match pcm {
                 Err(e) => {
@@ -529,7 +575,7 @@ impl GuidedSpeech {
         let tables = PromptTables::load(assets, c.hidden)?;
         let trim_tail = c.trim_tail_tokens;
         let (s_tx, s_rx) = mpsc::channel::<S3Msg>();
-        let (s_ready_tx, s_ready_rx) = mpsc::channel::<Result<()>>();
+        let (s_ready_tx, s_ready_rx) = mpsc::channel::<Result<usize>>();
         let dir = assets.to_path_buf();
         std::thread::Builder::new()
             .name("plow-tts-render".into())
@@ -543,12 +589,19 @@ impl GuidedSpeech {
                     Ok(sc) => sc,
                     Err(e) => return drop(s_ready_tx.send(Err(RuntimeError::Rejected(e)))),
                 };
-                let _ = s_ready_tx.send(Ok(()));
-                render_loop(&vocoder, sc, s_rx, &credit);
+                let _ = s_ready_tx.send(Ok(sc.first));
+                render_loop(&vocoder, crate::sched::cost::id(&dir.join(VOCODER).to_string_lossy()), sc, s_rx, &credit);
             })
             .map_err(|e| RuntimeError::Device(e.to_string()))?;
-        s_ready_rx.recv().map_err(|e| RuntimeError::Device(e.to_string()))??;
-        Ok(GuidedSpeech { c, tables, render: parking_lot::Mutex::new(s_tx), next_id: AtomicUsize::new(0), sample_rate: 24000 })
+        let first_tokens = s_ready_rx.recv().map_err(|e| RuntimeError::Device(e.to_string()))??;
+        Ok(GuidedSpeech {
+            c,
+            tables,
+            render: parking_lot::Mutex::new(s_tx),
+            next_id: AtomicUsize::new(0),
+            sample_rate: 24000,
+            first_tokens,
+        })
     }
 
     /// The mux job for one request: both CFG members' prefill rows as overlays, the decode
@@ -591,12 +644,16 @@ impl GuidedSpeech {
                 class,
                 raw_tokens: true,
                 session,
+                turn: request.turn_key.clone(),
+                continuing: false,
                 speech: Some(Box::new(SpeechJob {
                     overlay: cond,
                     overlay_pos,
                     // Decode token k takes speech_pos[k + 1]: base = prefill rows - 1.
                     pos_base: Some(n as u32 - 1),
                     cfg: Some(CfgJob { uncond_overlay: uncond, params: c.cfg(), history: vec![c.start_speech], seed: Some(seed) }),
+                    // Streams only: a whole reply's first audio needs every token.
+                    first_tokens: if class == JobClass::Critical { self.first_tokens } else { 0 },
                 })),
             },
         })
@@ -622,7 +679,8 @@ impl GuidedSpeech {
         let job = self.job(&voice, &text, lang, seed, class, respond, ids, report).map_err(|e| e.to_string())?;
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let render = self.render.lock().clone();
-        let _ = render.send(S3Msg::Open { id, voice, seed, reply });
+        let turn = ids.turn_key.as_ref().and_then(|k| crate::serve::turns::table().times(k));
+        let _ = render.send(S3Msg::Open { id, voice, seed, reply, turn });
         if let Err(e) = mux.submit(job) {
             let _ = render.send(S3Msg::Drop { id });
             return Err(match e {
@@ -710,6 +768,8 @@ mod tests {
             tail: Vec::new(),
             phase: Vec::new(),
             started: None,
+            opened: std::time::Instant::now(),
+            turn: None,
         };
         (u, rx)
     }

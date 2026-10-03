@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Describe an ``amd-bench --dump-logits`` run and emit vLLM oracle cases."""
+"""Describe amd-bench or step_bench full-logit dumps on their exact token histories."""
 
 import argparse
 import ast
@@ -122,12 +122,56 @@ def batched_cases(args, text):
     return rows
 
 
+def step_cases(path, name, vocab):
+    data = json.loads(path.read_text())
+    if data.get("max_inst") is not None or data.get("max_segments") is not None:
+        raise ValueError("partial decode dumps are not complete decode logits")
+    batch = data["slots"]
+    histories, sampled = data["token_histories"], data["sampled_token_ids"]
+    if vocab < 1 or batch < 1 or len(histories) != batch or len(sampled) != batch:
+        raise ValueError("invalid step dump vocabulary, batch or history count")
+    if data["steps"] < 1 or data["warmup"] < 0:
+        raise ValueError("step dump needs at least one measured decode step")
+    for ids, token in zip(histories, sampled):
+        if len(ids) != data["ctx"] + data["warmup"] + data["steps"]:
+            raise ValueError("step dump history length disagrees with execution")
+        if any(type(t) is not int or not 0 <= t < vocab for t in [*ids, token]):
+            raise ValueError("step dump token outside vocabulary")
+    tensors = [t for t in data["tensors"] if t["name"] == "act.logits"]
+    if len(tensors) != 1:
+        raise ValueError("step dump must contain exactly one act.logits tensor")
+    tensor = tensors[0]
+    source = path.parent / tensor["file"]
+    raw = source.read_bytes()
+    row_bytes = 2 * vocab
+    if len(raw) != tensor["bytes"] or len(raw) < batch * row_bytes or len(raw) % row_bytes:
+        raise ValueError("step dump is not a complete BF16 vocabulary-row allocation")
+    rows = []
+    for slot, (history, token) in enumerate(zip(histories, sampled)):
+        part = raw[slot * row_bytes:(slot + 1) * row_bytes]
+        bits = array.array("H")
+        bits.frombytes(part)
+        if sys.byteorder != "little":
+            bits.byteswap()
+        if any(value & 0x7F80 == 0x7F80 for value in bits):
+            raise ValueError("nonfinite active step logits")
+        output = path.parent / f"full_logits_{name}_s{slot:03}.bin"
+        output.write_bytes(part)
+        rows.append(dict(id=f"{name}-s{slot:03}", file=str(output.resolve()), dtype="bf16",
+                         prompt_token_ids=history, prompt_len=len(history),
+                         prompt_sha256_u32le=digest(history), sampled_token_id=token,
+                         generation_step=data["warmup"] + data["steps"], execution_phase="decode_output",
+                         sequence_row=slot, batch_size=batch))
+    return rows
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--name", required=True)
-    p.add_argument("--prompt", required=True, type=Path)
-    p.add_argument("--stdout", required=True, type=Path)
-    p.add_argument("--logits-dir", required=True, type=Path)
+    p.add_argument("--prompt", type=Path)
+    p.add_argument("--step-manifest", type=Path, help="step_bench --dump-tensors act.logits manifest")
+    p.add_argument("--stdout", type=Path)
+    p.add_argument("--logits-dir", type=Path)
     p.add_argument("--output", required=True, type=Path)
     p.add_argument("--tp-shards", type=int, default=1,
                    help="assemble logits.rkR.TAG.bin captured with PLOW_DUMP_ACT and PLOW_TRACE_ALLRANKS")
@@ -137,6 +181,18 @@ def main():
     p.add_argument("--batch-size", type=int, default=1,
                    help="assemble amd-bench --batched decode dumps; prompts use semicolon-separated token lists")
     args = p.parse_args()
+    if args.step_manifest:
+        if not re.fullmatch(r"[A-Za-z0-9_.-]+", args.name):
+            p.error("unsafe name")
+        if not args.vocab or args.prompt or args.stdout or args.logits_dir or args.tp_shards != 1 or args.replicated_vocab or args.batch_size != 1:
+            p.error("--step-manifest requires --vocab and cannot be combined with amd-bench capture options")
+        rows = step_cases(args.step_manifest, args.name, args.vocab)
+        args.output.write_text(json.dumps(dict(schema=1, producer="plow-step-bench", name=args.name,
+            vocab_size=args.vocab, cases=rows, source_manifest=str(args.step_manifest.resolve()),
+            source_manifest_sha256=hashlib.sha256(args.step_manifest.read_bytes()).hexdigest()), indent=2) + "\n")
+        return
+    if not all((args.prompt, args.stdout, args.logits_dir)):
+        p.error("amd-bench capture requires --prompt, --stdout and --logits-dir")
     if args.tp_shards < 1 or (args.tp_shards > 1 and not args.replicated_vocab and (not args.vocab or args.vocab % args.tp_shards)):
         p.error("--tp-shards requires a positive divisible --vocab")
     if args.replicated_vocab and (not args.vocab or args.vocab < 1):

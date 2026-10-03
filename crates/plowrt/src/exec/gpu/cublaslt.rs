@@ -193,6 +193,7 @@ pub(super) struct LightX {
 enum LightKind {
     /// The one-instruction `plow_<arch>_light`.
     Single,
+    NormQuant,
     /// `light_attn` over this many instructions.
     Attn(u32),
     /// `light_flash`: the q, k, v HeadNormRope instructions it folds in, or all `!0`.
@@ -278,7 +279,7 @@ impl LightRoute {
             let (mut count, mut hnr) = match launch.kind {
                 LightKind::Attn(n) => (n, [0; 4]),
                 LightKind::Flash(h) => (0, h),
-                LightKind::Single => (0, [0; 4]),
+                LightKind::Single | LightKind::NormQuant => (0, [0; 4]),
             };
             let mut xs = launch.xs;
             let mut params = [
@@ -291,7 +292,7 @@ impl LightRoute {
                 &mut xs as *mut LightX as *mut std::ffi::c_void,
             ];
             let params = match launch.kind {
-                LightKind::Single => &mut params[..2],
+                LightKind::Single | LightKind::NormQuant => &mut params[..2],
                 _ => &mut params[..],
             };
             self.be.launch_kernel(
@@ -310,8 +311,10 @@ impl LightRoute {
 #[derive(Clone, Copy)]
 pub(super) struct LightFunctions {
     single: KernelFn,
+    norm_quant: Option<KernelFn>,
     /// `plow_light_gemma`: the single kernel also runs NormResidual(Norm) and GluStrided.
     gemma: bool,
+    fp8_attn: bool,
     /// `plow_light_abi` 2: instructions and tensor pointers are passed by value.
     direct: bool,
     /// `plow_<arch>_light_tail`: SoftCap / Argmax / ArgmaxFin (light ABI 2).
@@ -322,6 +325,7 @@ pub(super) struct LightFunctions {
     attn: Option<(KernelFn, u32, [u32; 2])>,
     /// `plow_<arch>_light_attn_s`: the hd256 attention alone, two blocks per SM.
     attn_s: Option<KernelFn>,
+    fp8_flash256: Option<(KernelFn, u32)>,
     /// `plow_<arch>_light_head` (unaligned lm_head tail).
     pub(super) head: Option<KernelFn>,
     /// `plow_<arch>_light_flash` (streamed hd128 FlashDecode) and its smem.
@@ -347,6 +351,7 @@ pub(super) fn light_functions(
     }
     let arch = stem.trim_start_matches("interp_");
     let single = be.get_function(module, &format!("plow_{arch}_light"))?;
+    let norm_quant = be.get_function(module, &format!("plow_{arch}_light_norm_quant")).ok();
     let attn = match be.module_global_u32(module, "plow_light_attn_hd")? {
         Some(hd) => {
             let f = be.get_function(module, &format!("plow_{arch}_light_attn"))?;
@@ -357,6 +362,15 @@ pub(super) fn light_functions(
         _ => None,
     };
     let gemma = be.module_global_u32(module, "plow_light_gemma")? == Some(1);
+    let fp8_attn = abi == Some(2) && be.module_global_u32(module, "plow_light_fp8_attn")? == Some(1);
+    let fp8_flash256 = match be.module_global_u32(module, "plow_light_fp8_flash256_smem")? {
+        Some(bytes) if fp8_attn => {
+            let f = be.get_function(module, &format!("plow_{arch}_light_fp8_flash256"))?;
+            be.set_max_dynamic_smem(f, bytes)?;
+            Some((f, bytes))
+        }
+        _ => None,
+    };
     let head = be.get_function(module, &format!("plow_{arch}_light_head")).ok();
     let flash = match be.module_global_u32(module, "plow_light_flash_smem")? {
         Some(bytes) if crate::config::RuntimeConfig::get().nv.decode_light_flash => {
@@ -387,7 +401,51 @@ pub(super) fn light_functions(
         }
         _ => None,
     };
-    Ok(Some(LightFunctions { single, gemma, direct: abi == Some(2), tail, capmax, attn, attn_s, head, flash, prefill }))
+    Ok(Some(LightFunctions { single, norm_quant, gemma, fp8_attn, direct: abi == Some(2), tail, capmax, attn, attn_s, fp8_flash256, head, flash, prefill }))
+}
+
+fn fp8_attention_tail(d: &packet::dev::DevInst64) -> bool {
+    let none = packet::dev::TENSOR_NONE16;
+    match DevOp::from_u16(d.op) {
+        Some(DevOp::QuantFp8) => d.t[3] == none && d.t[4] == none,
+        Some(DevOp::FlashMerge) => matches!(d.i[3], 256 | 512) && d.t[3] == none && d.t[7] == none,
+        _ => false,
+    }
+}
+
+fn norm_quant_pair(g: &DevProg, entries: &[packet::dev::StreamEnt]) -> Option<(usize, usize)> {
+    let first = entries.first()?;
+    let n = first.inst as usize;
+    let q = n + 1;
+    let (Some(norm), Some(quant)) = (g.insts.get(n), g.insts.get(q)) else { return None };
+    let blocks = usize::from(norm.blocks);
+    if blocks == 0 || entries.len() != 2 * blocks {
+        return None;
+    }
+    let none = packet::dev::TENSOR_NONE16;
+    let grouped = entries[..blocks].iter().enumerate().all(|(slice, e)| {
+        e.inst as usize == n && e.slice as usize == slice
+    }) && entries[blocks..].iter().enumerate().all(|(slice, e)| {
+        e.inst as usize == q && e.slice as usize == slice
+    });
+    let interleaved = entries.chunks_exact(2).enumerate().all(|(slice, pair)| {
+        pair[0].inst as usize == n && pair[1].inst as usize == q
+            && pair[0].slice as usize == slice && pair[1].slice as usize == slice
+    });
+    (quant.blocks == norm.blocks
+        && norm.op == DevOp::NormResidualNorm as u16
+        && quant.op == DevOp::QuantFp8 as u16
+        && norm.i[0] == u32::from(norm.blocks)
+        && norm.i[0] == quant.i[0]
+        && norm.i[1] == quant.i[1]
+        && norm.i[1] == 3840
+        && norm.t[..4].iter().all(|&t| t != none)
+        && quant.t[..3].iter().all(|&t| t != none)
+        && quant.t[1] == norm.t[0]
+        && quant.t[3] == none
+        && quant.t[4] == none
+        && (grouped || interleaved))
+    .then_some((n, q))
 }
 
 /// Each light-routable interpreter segment of `g`: `(segment, levels)`, a level being a
@@ -411,6 +469,11 @@ pub(super) fn light_segments(
         .filter(|&seg| library.get(seg).copied().flatten().is_none())
         .filter_map(|seg| {
             let entries = &g.gq_stream[g.gq_seg_ofs[seg] as usize..g.gq_seg_ofs[seg + 1] as usize];
+            if g.t == 128 && functions.direct && functions.norm_quant.is_some() {
+                if let Some((n, q)) = norm_quant_pair(g, entries) {
+                    return Some((seg, vec![(n, 1), (q, 1)]));
+                }
+            }
             let mut insts: Vec<usize> = Vec::new();
             for e in entries {
                 if insts.last() != Some(&(e.inst as usize)) {
@@ -456,15 +519,38 @@ pub(super) fn light_segments(
                     let d = &g.insts[inst];
                     match op(inst) {
                         Some(DevOp::HeadNormRope) => attn_hd(d.i[2]) && d.i[5] == 0,
+                        Some(DevOp::HeadNormRopeFp8) => {
+                            functions.fp8_attn && attn_hd(d.i[2]) && d.i[5] == 0
+                                && d.t[6] != packet::dev::TENSOR_NONE16
+                                && d.t[7] == packet::dev::TENSOR_NONE16
+                        }
                         Some(DevOp::FlashDecode) => attn_hd(d.i[6]),
-                        _ => false,
+                        Some(DevOp::FlashDecodeFp8) => {
+                            functions.fp8_attn && attn_hd(d.i[6])
+                                && d.t[6] != packet::dev::TENSOR_NONE16
+                                && d.t[7] != packet::dev::TENSOR_NONE16
+                        }
+                        _ => functions.fp8_attn && fp8_attention_tail(d),
                     }
                 });
-            if !attn {
+            if !attn
+                || (insts.iter().any(|&i| fp8_attention_tail(&g.insts[i]))
+                    && !insts.iter().any(|&i| matches!(op(i), Some(DevOp::FlashDecode | DevOp::FlashDecodeFp8))))
+            {
                 return None;
             }
+            let split_fp8_attention = functions.fp8_attn
+                && insts.iter().any(|&i| fp8_attention_tail(&g.insts[i]));
             let mut levels: Vec<(usize, usize)> = Vec::new();
             for &inst in &insts {
+                if fp8_attention_tail(&g.insts[inst]) {
+                    levels.push((inst, 0));
+                    continue;
+                }
+                if split_fp8_attention {
+                    levels.push((inst, 1));
+                    continue;
+                }
                 // A by-value span (light ABI 2) carries at most 4 instructions.
                 let joins = levels.last().is_some_and(|&(lo, n)| {
                     lo + n == inst
@@ -512,6 +598,30 @@ pub(super) fn prefill_light_segments(g: &DevProg, library: &[Option<usize>]) -> 
                         }
                 });
             ok.then_some((seg, insts))
+        })
+        .collect()
+}
+
+pub(super) fn prefill_glu_quant_segments(g: &DevProg) -> Vec<(usize, Vec<usize>)> {
+    g.gq_seg_ofs
+        .windows(2)
+        .enumerate()
+        .filter_map(|(seg, w)| {
+            let entries = g.gq_stream.get(w[0] as usize..w[1] as usize)?;
+            let inst = entries.first()?.inst as usize;
+            let d = g.insts.get(inst)?;
+            let matches = d.op == DevOp::QuantFp8 as u16
+                && d.i[0] >= 32
+                && d.i[1] == 15360
+                && d.i[2] == 0
+                && d.t[..5].iter().all(|&t| t != packet::dev::TENSOR_NONE16)
+                && d.blocks != 0
+                && entries.len() == usize::from(d.blocks)
+                && entries
+                    .iter()
+                    .enumerate()
+                    .all(|(slice, e)| e.inst as usize == inst && e.slice as usize == slice);
+            matches.then_some((seg, vec![inst]))
         })
         .collect()
 }
@@ -716,6 +826,12 @@ pub(super) fn add_light_routes(
     folds: &[ArgmaxFold],
     devp: &[DeviceMem],
 ) {
+    if functions.fp8_attn {
+        let attention_segments = light.iter().filter(|(_, levels)| {
+            levels.iter().any(|&(inst, _)| g.insts[inst].op == DevOp::FlashDecodeFp8 as u16)
+        }).count();
+        tracing::info!(attention_segments, "FP8 attention light routes prepared");
+    }
     for fold in folds {
         if routes.len() <= fold.segment {
             routes.resize_with(fold.segment + 1, || None);
@@ -728,6 +844,32 @@ pub(super) fn add_light_routes(
         }));
     }
     for (seg, levels) in light {
+        if let (Some(function), [(n, 1), (q, 1)]) = (functions.norm_quant, levels.as_slice()) {
+            if g.insts[*n].op == DevOp::NormResidualNorm as u16 {
+                let mut span = LightSpan { count: 2, ..Default::default() };
+                span.op[0] = LightOp::resolve(&g.insts[*n], devp);
+                span.op[1] = LightOp::resolve(&g.insts[*q], devp);
+                if routes.len() <= *seg {
+                    routes.resize_with(seg + 1, || None);
+                }
+                routes[*seg] = Some(LibraryRoute::Light(LightRoute {
+                    be: Arc::clone(be),
+                    kernarg,
+                    launches: vec![LightLaunch {
+                        function,
+                        xs: LightX::default(),
+                        kind: LightKind::NormQuant,
+                        direct: Some(Box::new(span)),
+                        instruction: *n as u32,
+                        blocks: u32::from(g.insts[*n].blocks),
+                        block: BLOCK,
+                        smem: 0,
+                    }],
+                    _scratch: None,
+                }));
+                continue;
+            }
+        }
         let fused = fusions.iter().find(|f| f.segment + 3 == *seg).zip(scratch).map(|(f, s)| {
             LightX {
                 base: s.base,
@@ -831,6 +973,12 @@ pub(super) fn add_light_routes(
             },
             _ => launches,
         };
+        if functions.fp8_attn && light.first().is_some_and(|(first, _)| first == seg) {
+            let spans: Vec<_> = launches.iter().filter_map(|l| l.direct.as_ref()).map(|s| {
+                (s.count, s.fused, s.op.iter().map(|o| (o.d.op, o.d.blocks, o.d.i[0], o.d.i[1])).collect::<Vec<_>>())
+            }).collect();
+            tracing::info!(segment = seg, ?levels, ?spans, "FP8 attention first light launch spans");
+        }
         let launches = launches.into_iter().map(|l| sliding(functions, l)).collect();
         routes[*seg] = Some(LibraryRoute::Light(LightRoute {
             be: Arc::clone(be),
@@ -844,8 +992,29 @@ pub(super) fn add_light_routes(
 /// `light_attn_s` arena: the hd256 row-group fold (8 groups x 256 f32 + m/l).
 const ATTN_S_SMEM: u32 = 16 << 10;
 
+fn fp8_flash256_blocks(span: &LightSpan, original_blocks: u32) -> Option<u32> {
+    let d = &span.op[0].d;
+    if span.count != 1 || span.fused != 0 || d.op != DevOp::FlashDecodeFp8 as u16
+        || d.i[6] != 256 || d.i[0] != 128 || d.i[1] != 16 || d.i[2] != 8
+        || d.i[5] != 1 || d.blocks == 0 || original_blocks == 0
+    {
+        return None;
+    }
+    let work = d.i[0] * (d.i[1] / 2) * d.i[5];
+    Some(work.min(original_blocks.saturating_mul(8)).min(u32::from(u16::MAX)))
+}
+
 /// An hd256 attention launch on `light_attn_s`, at twice the blocks (two per SM).
 fn sliding(functions: &LightFunctions, launch: LightLaunch) -> LightLaunch {
+    if let (Some((function, smem)), LightKind::Attn(1), Some(span)) =
+        (functions.fp8_flash256, launch.kind, launch.direct.as_ref())
+    {
+        if let Some(blocks) = fp8_flash256_blocks(span, launch.blocks) {
+            let mut span = **span;
+            span.op[0].d.blocks = blocks as u16;
+            return LightLaunch { function, blocks, smem, direct: Some(Box::new(span)), ..launch };
+        }
+    }
     let (Some(function), LightKind::Attn(_), Some(span)) = (functions.attn_s, launch.kind, launch.direct.as_ref())
     else {
         return launch;
@@ -1163,6 +1332,7 @@ pub(super) fn prepare_routes(
     };
     let mut plans = std::collections::HashMap::new();
     let mut pair_plans = std::collections::HashMap::new();
+    let mut fp8_plans = 0usize;
     let mut pairs = 0usize;
     let mut index = 0;
     while index < segments.len() {
@@ -1184,6 +1354,35 @@ pub(super) fn prepare_routes(
         );
         let ops = operands(&segment, insts, devp)?;
         let [output, input, weight] = ops;
+        let op = &insts[segment.instruction];
+        if matches!(DevOp::from_u16(op.op), Some(DevOp::GemmFp8 | DevOp::GemmMedFp8 | DevOp::GemmSmallFp8)) {
+            let ProjectionBackend::Lt(lt) = backend else {
+                return Err(RuntimeError::Rejected("FP8 projection requires cuBLASLt".into()));
+            };
+            if tail.is_some() || fold.is_some() {
+                return Err(RuntimeError::Rejected("FP8 projection cannot fold an output head".into()));
+            }
+            let mut scales = [0; 2];
+            for (index, (handle, elements)) in [(op.t[3], segment.m), (op.t[4], segment.n)].into_iter().enumerate() {
+                let mem = devp.get(handle as usize).ok_or_else(|| RuntimeError::Rejected("missing FP8 scale vector".into()))?;
+                let bytes = u64::from(elements) * 4;
+                let end = mem.base.checked_add(bytes).ok_or_else(|| RuntimeError::Rejected("FP8 scale range overflow".into()))?;
+                if mem.base == 0 || mem.base % 16 != 0 || mem.len < bytes
+                    || (mem.base < output + segment.output_bytes && output < end) {
+                    return Err(RuntimeError::Rejected("invalid FP8 scale vector".into()));
+                }
+                scales[index] = mem.base;
+            }
+            // Scale pointers belong to this layer; shape-only BF16 plan sharing is invalid here.
+            let plan = lt.fp8_plan(segment.m, segment.n, segment.k, scales[1], scales[0])?;
+            fp8_plans += 1;
+            insts[segment.instruction].op = DevOp::Nop as u16;
+            routes.push(Some(CublasLtDecodeRoute {
+                plan: Arc::new(ProjectionPlan::Lt(plan)), input, weight, output, tail: None,
+            }));
+            index += 1;
+            continue;
+        }
         insts[segment.instruction].op = DevOp::Nop as u16;
         if let (Some(fusion), Some(scratch), ProjectionBackend::Lt(lt)) = (
             fusions.iter().find(|f| f.segment == index),
@@ -1323,6 +1522,7 @@ pub(super) fn prepare_routes(
         segments = routes.len(),
         projections = routes.iter().flatten().count(),
         plans = plans.len(),
+        fp8_plans,
         pairs,
         native = matches!(backend, ProjectionBackend::Native(_)),
         "projection routes prepared"
@@ -1419,12 +1619,33 @@ impl GpuEngine {
         Ok(())
     }
 
+    /// Capture a partial widest-rung decode for tensor inspection. Later outputs are stale.
+    pub fn capture_debug_decode_prefix(&mut self, segments: usize) -> Result<()> {
+        let total = self.cublaslt_decode.len().max(self.decode_packet_roles.len());
+        if segments == 0 || segments > total || !self.cublaslt_decode_capture
+            || self.decode_contexts.is_some()
+        {
+            return Err(RuntimeError::Rejected(
+                "partial segment capture requires a captured decode chain and a valid segment count".into(),
+            ));
+        }
+        self.be.stream_synchronize(&self.stream)?;
+        let graph = self.be.graph_capture(&self.stream, || {
+            self.enqueue_decode_segments(segments)
+        })?;
+        if let Some(old) = self.cublaslt_decode_graph.replace(graph) {
+            self.be.graph_destroy(old);
+        }
+        Ok(())
+    }
+
     fn enqueue_decode_chain(&self) -> Result<()> {
-        let segments = self
-            .cublaslt_decode
-            .len()
-            .max(self.decode_packet_roles.len())
-            .max(1);
+        self.enqueue_decode_segments(
+            self.cublaslt_decode.len().max(self.decode_packet_roles.len()).max(1),
+        )
+    }
+
+    fn enqueue_decode_segments(&self, segments: usize) -> Result<()> {
         for seg in 0..segments {
             if let Some(Some(route)) = self.cublaslt_decode.get(seg) {
                 route.run(&self.stream)?;
@@ -1553,15 +1774,19 @@ fn projection_segments(
         }
         let instruction = entries[0].inst as usize;
         let op = program.insts.get(instruction).ok_or_else(fail)?;
+        let fp8 = matches!(DevOp::from_u16(op.op), Some(DevOp::GemmFp8 | DevOp::GemmMedFp8 | DevOp::GemmSmallFp8));
         let valid_op = match phase {
-            ProjectionPhase::Decode => op.op == DevOp::Gemv as u16,
+            ProjectionPhase::Decode => op.op == DevOp::Gemv as u16
+                || (fp8 && roles[segment] == plow_asset::segment_roles::CUBLASLT),
             ProjectionPhase::Prefill(profile) => {
-                matches!(
+                if fp8 {
+                    plow_asset::segment_roles::cublaslt_prefill_fp8(profile, op.i[0], op.i[1], op.i[2])
+                } else { matches!(
                     DevOp::from_u16(op.op),
                     Some(DevOp::Gemm | DevOp::GemmMed | DevOp::GemmSmall)
                 ) && plow_asset::segment_roles::cublaslt_prefill_bf16(
                     profile, op.i[0], op.i[1], op.i[2],
-                )
+                ) }
             }
         };
         let valid_immediates = match phase {
@@ -1569,7 +1794,7 @@ fn projection_segments(
             ProjectionPhase::Prefill(_) => op.i[3..6].iter().all(|&value| value == 0),
         };
         if !valid_op
-            || op.t[3..].iter().any(|&t| t != packet::dev::TENSOR_NONE16)
+            || op.t[if fp8 { 5 } else { 3 }..].iter().any(|&t| t != packet::dev::TENSOR_NONE16)
             || op.i[0] != rows
             || op.i[1] == 0
             || op.i[2] == 0
@@ -1591,8 +1816,18 @@ fn projection_segments(
                 .ok_or_else(fail)
         };
         let output_bytes = bytes(m, n)?;
-        let input_bytes = bytes(m, k)?;
-        let weight_bytes = bytes(n, k)?;
+        let input_bytes = bytes(m, k)? / if fp8 { 2 } else { 1 };
+        let weight_bytes = bytes(n, k)? / if fp8 { 2 } else { 1 };
+        if fp8 {
+            if op.t[..5].iter().copied().collect::<std::collections::BTreeSet<_>>().len() != 5 {
+                return Err(fail());
+            }
+            for (handle, required) in [(op.t[3], u64::from(m) * 4), (op.t[4], u64::from(n) * 4)] {
+                if tensors.get(handle as usize).is_none_or(|tensor| tensor.bytes < required) {
+                    return Err(fail());
+                }
+            }
+        }
         for (handle, required) in [
             (op.t[0], output_bytes),
             (op.t[1], input_bytes),
@@ -1625,6 +1860,93 @@ fn projection_segments(
 mod tests {
     use super::*;
     use packet::dev::{DevInst64, StreamEnt};
+
+    #[test]
+    fn norm_quant_pair_requires_complete_interleaved_slices_and_shared_output() {
+        let (mut g, _) = fixture(4);
+        let none = packet::dev::TENSOR_NONE16;
+        let norm = &mut g.insts[1];
+        norm.op = DevOp::NormResidualNorm as u16;
+        norm.blocks = 4;
+        norm.i[..2].copy_from_slice(&[4, 3840]);
+        norm.t.fill(none);
+        norm.t[..4].copy_from_slice(&[0, 1, 1, 2]);
+        let quant = &mut g.insts[2];
+        quant.op = DevOp::QuantFp8 as u16;
+        quant.blocks = 4;
+        quant.i[..2].copy_from_slice(&[4, 3840]);
+        quant.t.fill(none);
+        quant.t[..3].copy_from_slice(&[3, 0, 4]);
+        let entries: Vec<_> = (0..4)
+            .flat_map(|slice| [1, 2].map(move |inst| StreamEnt { inst, slice, ..Default::default() }))
+            .collect();
+        assert_eq!(norm_quant_pair(&g, &entries), Some((1, 2)));
+        let grouped: Vec<_> = [1, 2]
+            .into_iter()
+            .flat_map(|inst| (0..4).map(move |slice| StreamEnt { inst, slice, ..Default::default() }))
+            .collect();
+        assert_eq!(norm_quant_pair(&g, &grouped), Some((1, 2)));
+        let mut wrong_grouped = grouped.clone();
+        wrong_grouped.swap(0, 4);
+        assert_eq!(norm_quant_pair(&g, &wrong_grouped), None);
+        let mut wrong_order = entries.clone();
+        wrong_order.swap(1, 2);
+        assert_eq!(norm_quant_pair(&g, &wrong_order), None);
+        assert_eq!(norm_quant_pair(&g, &entries[..6]), None);
+        g.insts[2].t[1] = 5;
+        assert_eq!(norm_quant_pair(&g, &entries), None);
+        g.insts[2].t[1] = 0;
+        g.insts[2].t[3] = 6;
+        assert_eq!(norm_quant_pair(&g, &entries), None);
+        g.insts[2].t[3] = none;
+        g.insts[1].i[0] = 8;
+        g.insts[2].i[0] = 8;
+        assert_eq!(norm_quant_pair(&g, &entries), None);
+        g.insts[1].i[0] = 4;
+        g.insts[2].i[0] = 4;
+        g.insts[1].i[1] = 4096;
+        g.insts[2].i[1] = 4096;
+        assert_eq!(norm_quant_pair(&g, &entries), None);
+    }
+
+    #[test]
+    fn fp8_attention_tail_rejects_fused_glu_and_packed_merge() {
+        let mut d = DevInst64 { op: DevOp::QuantFp8 as u16, ..Default::default() };
+        d.t.fill(packet::dev::TENSOR_NONE16);
+        assert!(fp8_attention_tail(&d));
+        d.t[3] = 0;
+        assert!(!fp8_attention_tail(&d));
+        d.t[3] = packet::dev::TENSOR_NONE16;
+        d.op = DevOp::FlashMerge as u16;
+        for hd in [256, 512] {
+            d.i[3] = hd;
+            assert!(fp8_attention_tail(&d));
+        }
+        d.i[3] = 128;
+        assert!(!fp8_attention_tail(&d));
+        d.i[3] = 256;
+        d.t[7] = 0;
+        assert!(!fp8_attention_tail(&d));
+    }
+
+    #[test]
+    fn fp8_flash256_grid_stays_within_work_and_route() {
+        let mut span = LightSpan { count: 1, ..Default::default() };
+        let d = &mut span.op[0].d;
+        d.op = DevOp::FlashDecodeFp8 as u16;
+        d.blocks = 132;
+        d.i[0] = 128;
+        d.i[1] = 16;
+        d.i[2] = 8;
+        d.i[5] = 1;
+        d.i[6] = 256;
+        assert_eq!(fp8_flash256_blocks(&span, 132), Some(1024));
+        span.fused = 1;
+        assert_eq!(fp8_flash256_blocks(&span, 132), None);
+        span.fused = 0;
+        span.op[0].d.i[0] = 64;
+        assert_eq!(fp8_flash256_blocks(&span, 132), None);
+    }
 
     fn fixture(batch: u32) -> (DevProg, Vec<DevTensor>) {
         let ordinary = DevInst64 {
@@ -1673,6 +1995,37 @@ mod tests {
             },
             tensors,
         )
+    }
+
+    #[test]
+    fn prefill_glu_quant_requires_exact_shape_and_complete_segment() {
+        let make = || {
+            let (mut g, _) = fixture(128);
+            g.insts[1].op = DevOp::QuantFp8 as u16;
+            g.insts[1].i[..3].copy_from_slice(&[128, 15360, 0]);
+            g.insts[1].t[..5].copy_from_slice(&[0, 1, 2, 3, 4]);
+            g
+        };
+        let mut g = make();
+        assert_eq!(prefill_glu_quant_segments(&g), vec![(1, vec![1])]);
+        for field in [0, 1, 2] {
+            let mut bad = make();
+            bad.insts[1].i[field] = [1, 4096, 1][field];
+            assert!(prefill_glu_quant_segments(&bad).is_empty());
+        }
+        for tensor in 0..5 {
+            let mut bad = make();
+            bad.insts[1].t[tensor] = packet::dev::TENSOR_NONE16;
+            assert!(prefill_glu_quant_segments(&bad).is_empty());
+        }
+        g.insts[1].blocks = 2;
+        assert!(prefill_glu_quant_segments(&g).is_empty());
+        g.insts[1].blocks = 1;
+        g.gq_stream[1].slice = 1;
+        assert!(prefill_glu_quant_segments(&g).is_empty());
+        g.gq_stream[1].slice = 0;
+        g.gq_seg_ofs = vec![0, 1, 3];
+        assert!(prefill_glu_quant_segments(&g).is_empty());
     }
 
     fn roles() -> [u8; 3] {
@@ -1815,6 +2168,90 @@ mod tests {
         program.insts[1].op = DevOp::Gemm as u16;
         program.gq_stream[0].seg = 1;
         assert!(prefill_segments(&program, &tensors, &roles(), "sm90a").is_err());
+    }
+
+    #[test]
+    fn fp8_prefill_validates_scale_contract_and_native_exceptions() {
+        for rows in [128, 256, 512, 1024, 2048, 4096, 8192] {
+            for &(n, k) in &plow_asset::segment_roles::CUBLASLT_PREFILL_GEMMA4_SHAPES {
+                let (mut program, mut tensors) = prefill_fixture(rows, n, k);
+                program.insts[1].op = DevOp::GemmFp8 as u16;
+                program.insts[1].t[3..5].copy_from_slice(&[3, 4]);
+                tensors[1].bytes /= 2;
+                tensors[2].bytes /= 2;
+                for (name, bytes) in [
+                    ("input.scale", u64::from(rows) * 4),
+                    ("weight.scale", u64::from(n) * 4),
+                ] {
+                    tensors.push(DevTensor {
+                        name: name.into(),
+                        bytes,
+                        init: None,
+                    });
+                }
+                let result = prefill_segments(&program, &tensors, &roles(), "sm90a");
+                if (n, k) == (3840, 15360) && rows >= 2048 {
+                    assert!(result.is_err());
+                    continue;
+                }
+                let route = result.unwrap()[1].unwrap();
+                assert_eq!(route.input_bytes, u64::from(rows) * u64::from(k));
+                assert_eq!(route.weight_bytes, u64::from(n) * u64::from(k));
+                for handle in 0..5 {
+                    let saved = tensors[handle].bytes;
+                    tensors[handle].bytes -= 1;
+                    assert!(prefill_segments(&program, &tensors, &roles(), "sm90a").is_err());
+                    tensors[handle].bytes = saved;
+                }
+                for slot in 3..5 {
+                    let saved = program.insts[1].t[slot];
+                    for bad in [packet::dev::TENSOR_NONE16, 0, 1, 2] {
+                        program.insts[1].t[slot] = bad;
+                        assert!(prefill_segments(&program, &tensors, &roles(), "sm90a").is_err());
+                    }
+                    program.insts[1].t[slot] = saved;
+                }
+                program.insts[1].i[4] = 1;
+                assert!(prefill_segments(&program, &tensors, &roles(), "sm90a").is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn fp8_decode_requires_independent_scales_and_library_role() {
+        for rows in [32, 64, 128] {
+            let (mut program, mut tensors) = prefill_fixture(rows, 3840, 15360);
+            let op = &mut program.insts[1];
+            op.op = DevOp::GemmFp8 as u16;
+            op.i[6..].fill(0);
+            op.t[3..5].copy_from_slice(&[3, 4]);
+            tensors[1].bytes /= 2;
+            tensors[2].bytes /= 2;
+            for (name, bytes) in [("input.scale", u64::from(rows) * 4), ("weight.scale", 3840 * 4)] {
+                tensors.push(DevTensor { name: name.into(), bytes, init: None });
+            }
+            let route = decode_segments(&program, &tensors, &roles()).unwrap()[1].unwrap();
+            assert_eq!(route.input_bytes, u64::from(rows) * 15360);
+            assert_eq!(route.output_bytes, u64::from(rows) * 3840 * 2);
+            let mut native_roles = roles();
+            native_roles[1] = plow_asset::segment_roles::NATIVE_DECODE_TC;
+            assert!(decode_segments(&program, &tensors, &native_roles).is_err());
+            for handle in 0..5 {
+                tensors[handle].bytes -= 1;
+                assert!(decode_segments(&program, &tensors, &roles()).is_err());
+                tensors[handle].bytes += 1;
+            }
+            for slot in 3..5 {
+                let saved = program.insts[1].t[slot];
+                for bad in [packet::dev::TENSOR_NONE16, 0, 1, 2, 7 - slot as u16] {
+                    program.insts[1].t[slot] = bad;
+                    assert!(decode_segments(&program, &tensors, &roles()).is_err());
+                }
+                program.insts[1].t[slot] = saved;
+            }
+            program.insts[1].i[6] = 1;
+            assert!(decode_segments(&program, &tensors, &roles()).is_err());
+        }
     }
 
     #[test]

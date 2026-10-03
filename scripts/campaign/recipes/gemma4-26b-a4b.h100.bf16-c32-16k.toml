@@ -109,7 +109,7 @@ gate_prompt = "<bos><start_of_turn>user\nWhat is the capital of France? Answer i
 in_lens = "128 1024 4096 8192 15000"
 concs = "16 32"
 nprompt = 64
-serve_env = { PLOW_MULTISTEP = "2", PLOW_DECODE_MAX_RUNG = "32", PLOW_PF_INTERLEAVE = "0", PLOW_TOKEN_BATCH = "1", PLOW_QUEUE_TTL_MS = "0" }
+serve_env = { PLOW_MULTISTEP = "2", PLOW_DECODE_MAX_RUNG = "32" }
 
 [reference]
 csv = "perf-data/campaign/gemma4-26b-a4b.h100.reference-vllm028-bf16-high-concurrency.csv"

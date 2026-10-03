@@ -189,8 +189,7 @@ pub struct MuxConfig {
     /// Maximum requests waiting outside the engine slot table. `0` derives a
     /// bound of four full engine batches.
     pub max_queued_requests: usize,
-    /// Skip or end the cold-start hold once nothing else is queued or tokenizing
-    /// (`PLOW_IDLE_DISPATCH`).
+    /// Skip or end the cold-start hold once nothing else is queued or tokenizing.
     pub idle_dispatch: bool,
 }
 
@@ -202,7 +201,7 @@ impl Default for MuxConfig {
             multi_step: true,
             queue_depth: 0,
             max_queued_requests: 0,
-            idle_dispatch: crate::config::RuntimeConfig::get().idle_dispatch,
+            idle_dispatch: true,
         }
     }
 }
@@ -232,6 +231,11 @@ pub struct JobOpts {
     pub speech: Option<Box<SpeechJob>>,
     /// `X-Session-Id`: resume the session's retained rows, and retain this request's.
     pub session: Option<Box<SessionTicket>>,
+    /// The voice turn this request serves ([`crate::serve::turns`]).
+    pub turn: Option<crate::serve::turns::TurnKey>,
+    /// A later turn of a session that already had one: seated ahead of requests opening a
+    /// session, until either has waited [`crate::serve::cosched::max_wait`].
+    pub continuing: bool,
 }
 
 /// Queue priority. Orders the waiting queue and serial prefill, and scales the queue TTL.
@@ -265,7 +269,7 @@ impl JobClass {
 /// measured nothing at c1-c32: adaptive multistep already runs single steps while one is likely.)
 #[cfg(feature = "cuda")]
 struct QuantumCut {
-    turn: Option<(Arc<crate::serve::cosched::DeviceTurn>, crate::serve::cosched::Urgency)>,
+    turn: Option<(Arc<crate::serve::cosched::DeviceTurn>, crate::serve::cosched::Due)>,
 }
 #[cfg(not(feature = "cuda"))]
 struct QuantumCut;
@@ -273,7 +277,7 @@ struct QuantumCut;
 #[cfg(feature = "cuda")]
 impl QuantumCut {
     fn fire(&self) -> bool {
-        self.turn.as_ref().is_some_and(|(dt, mine)| dt.outranked(*mine))
+        self.turn.as_ref().is_some_and(|(dt, mine)| dt.outranked_due(*mine))
     }
 }
 
@@ -285,28 +289,119 @@ const CRITICAL_SPAN: std::time::Duration = std::time::Duration::from_millis(1000
 /// first chunks. Past both this and [`CRITICAL_SPAN`] it is throughput.
 const CRITICAL_TOKENS: usize = 48;
 
-/// The most urgent work this model holds, for [`crate::serve::cosched::CoSched::Deadline`]: an
-/// ASR final first; then a prompt still owed its first token, or a speech stream's start, is a
-/// deadline; decode is throughput; bulk-only work (partial transcripts) waits.
-fn turn_urgency(slots: &[Option<Slot>], waiting: &std::collections::VecDeque<(Job, Instant)>) -> crate::serve::cosched::Urgency {
+/// The class of one job's work, for [`crate::serve::cosched::CoSched::Deadline`] outside a voice
+/// turn: an ASR final first; then a prompt still owed its first token, or a speech stream's start,
+/// is a deadline; decode is throughput; bulk work (partial transcripts) waits.
+fn job_urgency(class: JobClass, step: usize, arrived: Instant, now: Instant) -> crate::serve::cosched::Urgency {
     use crate::serve::cosched::Urgency;
-    let now = Instant::now();
-    let live = slots.iter().flatten().map(|s| (s.class, s.step, s.arrived));
-    let queued = waiting.iter().map(|(j, _)| (j.opts.class, 0, j.arrived));
-    live.chain(queued).fold(Urgency::Bulk, |best, (class, step, arrived)| {
-        let u = match class {
-            JobClass::Bulk => Urgency::Bulk,
-            JobClass::Final => Urgency::Final,
-            _ if step == 0 => Urgency::Deadline,
-            JobClass::Critical
-                if step < CRITICAL_TOKENS || now.saturating_duration_since(arrived) < CRITICAL_SPAN =>
-            {
-                Urgency::Deadline
+    match class {
+        JobClass::Bulk => Urgency::Bulk,
+        JobClass::Final => Urgency::Final,
+        _ if step == 0 => Urgency::Deadline,
+        JobClass::Critical if step < CRITICAL_TOKENS || now.saturating_duration_since(arrived) < CRITICAL_SPAN => {
+            Urgency::Deadline
+        }
+        _ => Urgency::Normal,
+    }
+}
+
+/// When this model's next tick is due on the device ([`crate::serve::cosched::CoSched::Deadline`]):
+/// the best-ranked job ([`crate::serve::cosched::Due::rank`]). Jobs outside a voice turn keep the class deadline (the most urgent class,
+/// anchored at the oldest first output or ASR final of that class; ongoing work from now). Turn
+/// jobs take their stage deadline ([`crate::serve::deadlines`]) from the slot's turn times
+/// ([`refresh_turns`]); a queued turn job looks its turn up, the first [`QUEUED_TURN_LOOKUPS`] only (the
+/// queue head is all the next tick can admit). Costs come from [`crate::sched::cost`] for
+/// `model`, this model's cost-model id.
+fn tick_due(
+    slots: &[Option<Slot>],
+    waiting: &std::collections::VecDeque<(Job, Instant)>,
+    model: usize,
+    now: Instant,
+) -> crate::serve::cosched::Due {
+    use crate::sched::cost::{estimate_id, Op};
+    use crate::serve::cosched::{Due, Urgency};
+    let width = slots.iter().flatten().count();
+    let tick = estimate_id(model, Op::DecodeTick { width });
+    let legacy = || {
+        let live = slots.iter().flatten().filter(|s| s.turn.is_none()).map(|s| (s.class, s.step, s.arrived));
+        live.chain(waiting.iter().filter(|(j, _)| j.opts.turn.is_none()).map(|(j, _)| (j.opts.class, 0, j.arrived)))
+    };
+    let mut best = legacy().map(|(class, step, arrived)| job_urgency(class, step, arrived, now)).min().map(|u| {
+        let since = legacy()
+            .filter(|&(class, step, arrived)| (step == 0 || class == JobClass::Final) && job_urgency(class, step, arrived, now) == u)
+            .map(|(_, _, arrived)| arrived)
+            .fold(now, Instant::min);
+        Due { cost: tick, ..Due::from_urgency(u, since) }
+    });
+    let mut ests = None;
+    let raw_first = |raw_tokens: bool, speech: Option<&SpeechJob>| {
+        raw_tokens.then(|| speech.map_or(0, |sp| sp.first_tokens)).map(|n| if n == 0 { CRITICAL_TOKENS } else { n })
+    };
+    let mut tighter = |class: JobClass, raw_first: Option<usize>, step: usize, rows: usize, arrived: Instant, t: &crate::serve::turns::TurnTimes| {
+        let e = ests.get_or_insert_with(crate::serve::deadlines::ests);
+        let prefill = if rows > 0 { estimate_id(model, Op::Prefill { rows }) } else { std::time::Duration::ZERO };
+        let d = turn_job_due(model, class, raw_first, step, prefill, tick, arrived, t, e, now);
+        if best.is_none_or(|b| d.rank(now) < b.rank(now)) {
+            best = Some(d);
+        }
+    };
+    for s in slots.iter().flatten() {
+        if let Some(t) = &s.turn {
+            let rows = if s.step == 0 { s.prompt_ids.len().saturating_sub(s.pf_pos) } else { 0 };
+            tighter(s.class, raw_first(s.raw_tokens, s.speech.as_deref()), s.step, rows, s.arrived, t);
+        }
+    }
+    for (j, _) in waiting.iter().filter(|(j, _)| j.opts.turn.is_some()).take(QUEUED_TURN_LOOKUPS) {
+        if let Some(t) = j.opts.turn.as_ref().and_then(|k| crate::serve::turns::table().times(k)) {
+            tighter(j.opts.class, raw_first(j.opts.raw_tokens, j.opts.speech.as_deref()), 0, j.prompt_ids.len(), j.arrived, &t);
+        }
+    }
+    best.unwrap_or_else(|| Due { cost: tick, ..Due::from_urgency(Urgency::Bulk, now) })
+}
+
+/// Re-read the turn times of slots whose turn has no first audio yet: later stages (LLM first
+/// token, TTS first audio) land in the turn table after admission.
+fn refresh_turns(slots: &mut [Option<Slot>]) {
+    for s in slots.iter_mut().flatten() {
+        if s.turn.is_some_and(|t| t.tts_first_audio.is_none()) {
+            if let Some(t) = s.turn_key.as_ref().and_then(|k| crate::serve::turns::table().times(k)) {
+                s.turn = Some(t);
             }
-            _ => Urgency::Normal,
-        };
-        best.min(u)
-    })
+        }
+    }
+}
+
+/// Queued turn jobs [`tick_due`] looks up per tick.
+const QUEUED_TURN_LOOKUPS: usize = 2;
+
+/// One turn job's stage and `Due`, without model names: an ASR final or partial by class, a
+/// speech LM (raw-token stream, `raw_first`: tokens to its first audio) by its first chunk, else
+/// an LLM prompt or its decode.
+#[allow(clippy::too_many_arguments)]
+fn turn_job_due(
+    model: usize,
+    class: JobClass,
+    raw_first: Option<usize>,
+    step: usize,
+    prefill: std::time::Duration,
+    tick: std::time::Duration,
+    arrived: Instant,
+    t: &crate::serve::turns::TurnTimes,
+    e: &crate::serve::deadlines::Ests,
+    now: Instant,
+) -> crate::serve::cosched::Due {
+    use crate::serve::deadlines::{claim_stage, partial, stage_cost, stage_due};
+    use crate::serve::turns::Stage;
+    let (stage, since) = match class {
+        JobClass::Bulk => return partial(arrived, stage_cost(Stage::AsrFinal, prefill, tick, e)),
+        JobClass::Final => (Stage::AsrFinal, arrived),
+        _ if raw_first.is_some_and(|n| step < n) => (Stage::TtsFirst, arrived),
+        _ if raw_first.is_some() => (Stage::TtsStream, now),
+        _ if step == 0 => (Stage::LlmFirst, arrived),
+        _ => (Stage::LlmDecode, now),
+    };
+    claim_stage(stage, model);
+    stage_due(stage, t, e, stage_cost(stage, prefill, tick, e), since)
 }
 
 /// How long a raw-token consumer may hold its slot parked before the request is cut.
@@ -334,6 +429,9 @@ pub struct SpeechJob {
     /// Classifier-free guidance: the request also runs unconditionally on the partner slot
     /// (owner + 1), and each token is drawn from the combined logits on the host.
     pub cfg: Option<CfgJob>,
+    /// A voice turn's stream: tokens its first audio renders from. Its ticks are the turn's first
+    /// audio until then and stream decode after, so the first render outranks them (0: unknown).
+    pub first_tokens: usize,
 }
 
 /// The unconditional member of a CFG pair and the guided sampling chain.
@@ -369,6 +467,9 @@ pub struct ModelMux {
     /// from the message channel (see [`ModelMux::preempt`]).
     preempt: Arc<std::sync::atomic::AtomicBool>,
     preempt_notify: Arc<tokio::sync::Notify>,
+    /// A non-bulk job was sent: a dispatcher waiting for its device turn (`--co-sched deadline`)
+    /// re-queues with its new most urgent work instead of the `Due` it queued with.
+    arrival_notify: Arc<tokio::sync::Notify>,
     /// Requests past model lookup whose job is not on `tx` yet (still tokenizing).
     ingress: Arc<std::sync::atomic::AtomicUsize>,
 }
@@ -495,8 +596,14 @@ impl ModelMux {
         Metrics::inc(&self.metrics.queued_requests);
         // Released before the send: a dispatcher that dequeues this job must not see it as a peer.
         drop(ingress);
+        let urgent = job.opts.class != JobClass::Bulk;
         match self.tx.try_send(MuxMsg::Job(job, arrived)) {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                if urgent {
+                    self.arrival_notify.notify_one();
+                }
+                Ok(())
+            }
             Err(mpsc::error::TrySendError::Full(MuxMsg::Job(job, _))) => {
                 self.metrics.queued_requests.fetch_sub(1, Ordering::Relaxed);
                 Metrics::inc(&self.metrics.rejected);
@@ -518,6 +625,7 @@ impl ModelMux {
         self.metrics.serving.max_tokens.tokens(job.gen.max_tokens);
         Metrics::inc(&self.metrics.queued_requests);
         let arrived = job.arrived;
+        let urgent = job.opts.class != JobClass::Bulk;
         self.tx.send(MuxMsg::Job(job, arrived)).await.map_err(|mpsc::error::SendError(msg)| {
             self.metrics.queued_requests.fetch_sub(1, Ordering::Relaxed);
             Metrics::inc(&self.metrics.rejected);
@@ -525,7 +633,11 @@ impl ModelMux {
                 MuxMsg::Job(job, _) => SubmitError::Closed(job),
                 MuxMsg::Drain(_) => unreachable!("sent a job"),
             }
-        })
+        })?;
+        if urgent {
+            self.arrival_notify.notify_one();
+        }
+        Ok(())
     }
 
     /// Initiate graceful drain: no new requests accepted, all live slots run to
@@ -597,6 +709,9 @@ struct Slot {
     stop_pending: String,
     class: JobClass,
     raw_tokens: bool,
+    /// The voice turn's times ([`tick_due`]), refreshed by [`refresh_turns`] until its first audio.
+    turn: Option<crate::serve::turns::TurnTimes>,
+    turn_key: Option<crate::serve::turns::TurnKey>,
     speech: Option<Box<SpeechJob>>,
     /// Set on the owner of a CFG pair; its partner slot (owner + 1) stays `None` in the table
     /// and is reserved while the owner lives (see [`slot_free`]).
@@ -665,6 +780,8 @@ pub fn spawn(
     let preempt_seen = Arc::clone(&preempt_flag);
     let preempt_notify = Arc::new(tokio::sync::Notify::new());
     let preempt_wake = Arc::clone(&preempt_notify);
+    let arrival_notify = Arc::new(tokio::sync::Notify::new());
+    let arrival_wake = Arc::clone(&arrival_notify);
     let ingress = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let ingress_seen = Arc::clone(&ingress);
     let metrics = state.model_metrics(&slug);
@@ -692,8 +809,7 @@ pub fn spawn(
     #[cfg(not(any(feature = "cuda", feature = "hsa", feature = "cpu")))]
     let rung_widths: Option<Box<[u32]>> = None;
     let (capacity, rung_widths) = {
-        let honor = crate::serve::policy::honor_max_rung();
-        let max_rung = honor.then(|| crate::config::RuntimeConfig::get().decode_max_rung).flatten();
+        let max_rung = crate::config::RuntimeConfig::get().decode_max_rung;
         let min_rung = crate::config::RuntimeConfig::get().amd.decode_min_rung;
         if max_rung.is_some() || min_rung.is_some() {
             if let Some(widths) = rung_widths {
@@ -721,7 +837,7 @@ pub fn spawn(
             .and_then(|widths| match DecodeRungs::new(widths, capacity) {
                 Ok(rungs) if rungs.len() > 1 => Some(
                     RungController::new(rungs)
-                        .with_fast_probe(crate::config::RuntimeConfig::get().rung_fast_probe),
+                        .with_fast_probe(crate::serve::policy::fast_probe()),
                 ),
                 Ok(_) => None,
                 Err(err) => {
@@ -821,13 +937,12 @@ pub fn spawn(
         }
     });
 
-    // `PLOW_MUX_INLINE_TICK`: a GPU model's dispatcher gets its own OS thread and runs each tick
-    // inline, so a tick costs no engine-thread wake and no tokio-worker wake on return. Nothing
-    // else changes: the loop below already waits for every tick before touching the queue.
+    // A GPU model's dispatcher gets its own OS thread and runs each tick inline, so a tick costs
+    // no engine-thread wake and no tokio-worker wake on return (26B-A4B H100: handoff 50-87 ->
+    // 0.3 us per tick). Nothing else changes: the loop below already waits for every tick before
+    // touching the queue.
     #[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu"))]
-    let inline_tick = state.gpu_engine(&slug).is_some_and(|engine| {
-        crate::config::RuntimeConfig::get().mux_inline_tick(engine.lock().is_gpu())
-    });
+    let inline_tick = state.gpu_engine(&slug).is_some_and(|engine| engine.lock().is_gpu());
     #[cfg(not(any(feature = "cuda", feature = "hsa", feature = "cpu")))]
     let inline_tick = false;
     let dispatcher_name = format!("plow-mux-{slug}");
@@ -881,6 +996,7 @@ pub fn spawn(
         // model parks, so an idle model never sits on a device its co-tenant is
         // waiting for.
         let mut turn = crate::serve::cosched::Turn::default();
+        let cost_id = crate::sched::cost::id(&slug);
         #[cfg(not(any(feature = "cuda", feature = "hsa", feature = "cpu")))]
         let has_gpu = false;
         // Dedicated engine/submission thread for GPU models: every tick runs
@@ -1037,9 +1153,7 @@ pub fn spawn(
                     .store(occupied_extent as u64, Ordering::Relaxed);
                 crate::serve::policy::observe(occupied_extent, waiting.len());
                 if let Some(rc) = rung_controller.as_mut() {
-                    rc.set_fast_probe(crate::serve::policy::fast_probe(
-                        crate::config::RuntimeConfig::get().rung_fast_probe,
-                    ));
+                    rc.set_fast_probe(crate::serve::policy::fast_probe());
                 }
                 if admission != before {
                     Metrics::inc(&metrics.decode_rung_switches);
@@ -1057,6 +1171,7 @@ pub fn spawn(
                 capacity
             };
 
+            let mut queued_behind = false;
             // Non-blocking drain: fill every idle slot the queue can serve.
             // A short hold when we still have empty slots and no live work
             // yet keeps us from waking up on a single arrival amid a burst.
@@ -1113,18 +1228,25 @@ pub fn spawn(
                                 match msg {
                                     MuxMsg::Job(job, arrived) => {
                                         note_arrival(job.arrived, &mut load, &metrics);
-                                        if let Some(j) = admit_session(
-                                            &mut slots,
-                                            admission_limit,
-                                            job,
-                                            arrived,
-                                            arena.as_ref(),
-                                            &metrics,
-                                            &health,
-                                            kv_budget,
-                                            downstream.full(),
-                                            &mut retention,
-                                        ) {
+                                        // Behind anything already waiting: `drain_waiting` orders it.
+                                        let held = if waiting.is_empty() {
+                                            admit_session(
+                                                &mut slots,
+                                                admission_limit,
+                                                job,
+                                                arrived,
+                                                arena.as_ref(),
+                                                &metrics,
+                                                &health,
+                                                kv_budget,
+                                                downstream.full(),
+                                                &mut retention,
+                                            )
+                                        } else {
+                                            queued_behind = true;
+                                            Some((job, arrived))
+                                        };
+                                        if let Some(j) = held {
                                             Metrics::inc(&metrics.queued_requests);
                                             waiting.push_back(j);
                                         }
@@ -1158,18 +1280,24 @@ pub fn spawn(
                             match msg {
                                 MuxMsg::Job(job, arrived) => {
                                     note_arrival(job.arrived, &mut load, &metrics);
-                                    if let Some(j) = admit_session(
-                                        &mut slots,
-                                        admission_limit,
-                                        job,
-                                        arrived,
-                                        arena.as_ref(),
-                                        &metrics,
-                                        &health,
-                                        kv_budget,
-                                        downstream.full(),
-                                        &mut retention,
-                                    ) {
+                                    let held = if waiting.is_empty() {
+                                        admit_session(
+                                            &mut slots,
+                                            admission_limit,
+                                            job,
+                                            arrived,
+                                            arena.as_ref(),
+                                            &metrics,
+                                            &health,
+                                            kv_budget,
+                                            downstream.full(),
+                                            &mut retention,
+                                        )
+                                    } else {
+                                        queued_behind = true;
+                                        Some((job, arrived))
+                                    };
+                                    if let Some(j) = held {
                                         Metrics::inc(&metrics.queued_requests);
                                         waiting.push_back(j);
                                     }
@@ -1184,6 +1312,23 @@ pub fn spawn(
                         Err(_) => break,
                     }
                 }
+            }
+            // An arrival never takes a slot ahead of an older waiter: it joined the queue, which
+            // is drained again in its seat order.
+            if std::mem::take(&mut queued_behind) {
+                drain_waiting_session(
+                    &mut waiting,
+                    &mut slots,
+                    admission_limit,
+                    Instant::now(),
+                    cfg.slo_ms,
+                    arena.as_ref(),
+                    &metrics,
+                    &health,
+                    kv_budget,
+                    downstream.full(),
+                    &mut retention,
+                );
             }
             // A full slot table leaves arrivals in the channel in arrival order; in `waiting`,
             // `drain_waiting` seats them by class as slots free.
@@ -1279,32 +1424,31 @@ pub fn spawn(
             // One tick: advance every live slot by N tokens (multi-step).
             // Handed to the blocking pool so the dispatcher task stays hot
             // for arrivals.
-            let urgency = turn_urgency(&slots, &waiting);
+            refresh_turns(&mut slots);
+            let due = tick_due(&slots, &waiting, cost_id, Instant::now());
             // A co-tenant with more urgent work is waiting for the device: a K-step quantum
-            // here would hold it for all K.
-            let outranked = device_turn.as_ref().is_some_and(|dt| dt.outranked(urgency));
+            // here would hold it for all K. Under overload, voice turns already ahead of their
+            // deadlines give the device back sooner too.
+            let outranked = device_turn.as_ref().is_some_and(|dt| dt.outranked_due(due))
+                || (crate::serve::deadlines::ahead_under_overload(due, Instant::now())
+                    && slots.iter().flatten().any(|s| s.turn.is_some()));
             let steps = if outranked {
                 1
             } else if cfg.multi_step {
                 #[cfg(any(feature = "cuda", feature = "hsa"))]
-                let device_quantum = crate::config::RuntimeConfig::get().multistep();
+                let device_quantum = crate::serve::policy::decode_k(false, token_group);
                 #[cfg(not(any(feature = "cuda", feature = "hsa")))]
                 let device_quantum = 0;
-                #[cfg(any(feature = "cuda", feature = "hsa"))]
-                let adaptive = crate::config::RuntimeConfig::get().nv.multistep_adaptive;
-                #[cfg(not(any(feature = "cuda", feature = "hsa")))]
-                let adaptive = false;
 
                 if device_quantum > 1
-                    && adaptive
                     && (freed_last_tick
                         || !waiting.is_empty()
                         || slots.iter().flatten().any(|s| s.step == 0))
                 {
-                    // PLOW_MULTISTEP_ADAPTIVE: prefill is pending, so the next chunk must not
-                    // wait behind a K-step quantum. A slot freed last tick counts: its
-                    // successor is usually a round trip away, and a K-step quantum here lets
-                    // the next completion land in the same wave (two prefills back to back).
+                    // Prefill is pending, so the next chunk must not wait behind a K-step
+                    // quantum. A slot freed last tick counts: its successor is usually a round
+                    // trip away, and a K-step quantum here lets the next completion land in the
+                    // same wave (two prefills back to back). 15000/C4 TTFT 1099 -> 627 ms.
                     1
                 } else if device_quantum > 1 {
                     group_aligned(device_quantum.max(MultiStep::for_batch(live as i64).steps), token_group)
@@ -1319,7 +1463,7 @@ pub fn spawn(
                 turn: device_turn
                     .clone()
                     .filter(|dt| dt.mode() == crate::serve::cosched::CoSched::Deadline)
-                    .map(|dt| (dt, urgency)),
+                    .map(|dt| (dt, due)),
             };
             #[cfg(not(feature = "cuda"))]
             let quantum_cut = QuantumCut;
@@ -1352,13 +1496,15 @@ pub fn spawn(
                 tokio::select! {
                     biased;
                     _ = preempt_wake.notified() => continue,
-                    _ = turn.take_at(dt, urgency) => {}
+                    _ = turn.take_due(dt, due) => {}
+                    _ = arrival_wake.notified(), if dt.mode() == crate::serve::cosched::CoSched::Deadline => continue,
                 }
             }
             if preempt_seen.load(Ordering::Acquire) {
                 continue;
             }
             let co_scheduled = device_turn.as_ref().is_some_and(|dt| dt.ordered());
+            let pf_rows: usize = slots.iter().flatten().filter(|s| s.step == 0).map(|s| s.prompt_ids.len().saturating_sub(s.pf_pos)).sum();
             let taken_slots = std::mem::take(&mut slots);
             let taken_obs = obs.take().unwrap_or_else(|| {
                 let mut obs = RunObserver::new(state.record_trace, indirection_size);
@@ -1447,6 +1593,14 @@ pub fn spawn(
                     if tick_fault.is_some() {
                         Metrics::inc(&metrics.serving.tick_errors);
                     }
+                    // A decode sample is per step: a K-step quantum is compared against per-token deadlines.
+                    let (op, took) = if did_prefill {
+                        (crate::sched::cost::Op::Prefill { rows: pf_rows.min(crate::config::RuntimeConfig::get().pf_chunk_rows()) }, service)
+                    } else {
+                        let k = decode_progress.as_ref().map_or(steps, |p| p.steps.get() as u32).max(1);
+                        (crate::sched::cost::Op::DecodeTick { width: live }, service / k)
+                    };
+                    crate::sched::cost::record_id(cost_id, op, took);
                     let sample = service_sample(ms, did_prefill);
                     if let Some(sample) = sample {
                         load.service_ms.update(sample);
@@ -1558,6 +1712,7 @@ pub fn spawn(
         metrics: handle_metrics,
         preempt: preempt_flag,
         preempt_notify,
+        arrival_notify,
         ingress,
     }
 }
@@ -1621,12 +1776,12 @@ fn queue_aging_ms(slo_ms: f64) -> f64 {
     (slo_ms.max(0.0) * AGING_SLO_MULTIPLE).max(AGING_FLOOR_MS)
 }
 
-/// Wait after which a queued request is shed: `PLOW_QUEUE_TTL_MS` when set, else derived.
+/// Wait after which a queued request is shed: never under the throughput class, else derived.
 #[inline]
 fn queue_ttl_ms(slo_ms: f64) -> f64 {
     queue_ttl_with(
         slo_ms,
-        crate::serve::policy::queue_ttl_ms(crate::config::RuntimeConfig::get().queue_ttl_ms),
+        crate::serve::policy::queue_ttl_ms(),
     )
 }
 
@@ -1662,6 +1817,21 @@ fn queue_verdict(closed: bool, waited_ms: f64, slo_ms: f64, class: JobClass) -> 
     } else {
         Queued::Retry
     }
+}
+
+/// Seat order of a queued request: class first; within a class, every request that has waited
+/// `bound` oldest first, then continuing session turns, then requests opening a session, each by
+/// arrival. A continuing turn overtakes a new session by at most `bound`.
+#[inline]
+fn seat_order(class: JobClass, continuing: bool, arrived: Instant, now: Instant, bound: std::time::Duration) -> (JobClass, u8, Instant) {
+    let tier = if now.saturating_duration_since(arrived) >= bound {
+        0
+    } else if continuing {
+        1
+    } else {
+        2
+    };
+    (class, tier, arrived)
 }
 
 #[inline]
@@ -1752,9 +1922,11 @@ fn drain_waiting_session(
         }
     });
 
-    // Class order, arrival order within a class (a stable sort of an arrival-ordered queue).
-    if waiting.iter().any(|(job, _)| job.opts.class != JobClass::Normal) {
-        waiting.make_contiguous().sort_by_key(|(job, _)| job.opts.class);
+    let bound = crate::serve::cosched::max_wait();
+    let order = |(job, arrived): &(Job, Instant)| seat_order(job.opts.class, job.opts.continuing, *arrived, now, bound);
+    let queue = waiting.make_contiguous();
+    if !queue.is_sorted_by_key(order) {
+        queue.sort_by_key(order);
     }
     let aging = queue_aging_ms(slo_ms);
     let mut still: std::collections::VecDeque<(Job, Instant)> =
@@ -2024,6 +2196,8 @@ fn admit_session(
         kv,
         class: job.opts.class,
         raw_tokens: job.opts.raw_tokens,
+        turn: job.opts.turn.as_ref().and_then(|k| crate::serve::turns::table().times(k)),
+        turn_key: job.opts.turn,
         cfg: pair.then(|| {
             Box::new(CfgRun {
                 rng: job.opts.speech.as_ref().and_then(|s| s.cfg.as_ref()?.seed).map(crate::text::sample::SplitMix::new),
@@ -2310,15 +2484,8 @@ fn run_one_tick(
 
             // Whether this tick does any prefill work — reported to the dispatcher
             // so prefill tick durations never enter the decode-service EWMA.
-            //
-            // A row the pipe owes a token has already sampled (only sampling rows are parked), so
-            // it is waiting for a readback, not for prefill. Counting it here would be a
-            // liveness hole: its `step` stays 0 until that token is read, `gpu_decode_feeds`
-            // gathers only `step > 0` rows, and with no other live row `feeds` is empty, so
-            // neither the decode path nor the drain below runs and nothing ever completes the
-            // step holding its token.
-            let did_prefill = (0..cap.min(slots.len()))
-                .any(|i| slots[i].as_ref().is_some_and(|s| s.step == 0) && !e.pipe_owes(i));
+            let did_prefill =
+                (0..cap.min(slots.len())).any(|i| slots[i].as_ref().is_some_and(|s| s.step == 0));
 
             // Decode feeds, gathered BEFORE the prefill pass so a slot prefilled
             // this tick (which just produced its first token) doesn't also step.
@@ -2333,24 +2500,11 @@ fn run_one_tick(
                 feeds.clear();
             }
 
-            // A pipelined mixed launch takes its decode rows' tokens from the device, so a
-            // prefill tick no longer has to read the in-flight step out first.
-            // The pipe reads each launch's argmax a tick later, so a prompt that samples its first
-            // token keeps the synchronous launch (where it is drawn on the device).
-            let pipe_prefill = e.pipe_prefill_enabled()
-                && e.pf_batch_enabled()
-                && !e.pipe_full()
-                && (feeds.is_empty() || gpu_pipe_rows(&feeds, &slots))
-                && slots.iter().take(cap).flatten().all(|s| {
-                    s.step != 0 || (gpu_argmax_eligible(&s.gen.params) && s.cfg.is_none())
-                });
             // A pipelined decode step may still be in flight from the previous tick. Anything
-            // but its exact continuation (prefill the pipe cannot carry, a changed row set, a row
-            // the device cannot sample) completes it first, streams its tokens, and re-gathers.
+            // but its exact continuation (a prefill, a changed row set, a row the device cannot
+            // sample) completes it first, streams its tokens, and re-gathers.
             if e.pipe_busy()
-                && ((did_prefill && !pipe_prefill)
-                    || (!did_prefill
-                        && (!e.pipe_covers(&feeds) || !gpu_pipe_rows(&feeds, &slots))))
+                && (did_prefill || !e.pipe_covers(&feeds) || !gpu_pipe_rows(&feeds, &slots))
             {
                 let mut done = std::mem::take(&mut obs.host.pipe_tokens);
                 match e.pipe_drain(&mut done) {
@@ -2407,7 +2561,10 @@ fn run_one_tick(
                     let prefill_capacity = rows as usize - feeds.len();
                     let mut pack = Vec::<(usize, usize, usize)>::new();
                     let mut remaining = prefill_capacity;
-                    for i in 0..slots.len().min(cap) {
+                    let mut oldest_first: smallvec::SmallVec<[usize; 64]> =
+                        (0..slots.len().min(cap)).filter(|&i| slots[i].is_some()).collect();
+                    oldest_first.sort_unstable_by_key(|&i| slots[i].as_ref().map(|s| s.arrived));
+                    for i in oldest_first {
                         if remaining == 0 {
                             break;
                         }
@@ -2601,7 +2758,7 @@ fn run_one_tick(
                 }
                 if let Some(f) = gpu_prefill_batched_pass(
                     &mut *e, &mut slots, cap, &arena, feeds.is_empty(), co_scheduled, &mut completed,
-                    &mut feeds, &mut obs.host.token_batch_tokens, pipe_prefill, &mut dev_sampled,
+                    &mut feeds, &mut obs.host.token_batch_tokens, &mut dev_sampled,
                     &mut obs.host.ride,
                 ) {
                     if tick_fault.is_none() {
@@ -2673,37 +2830,6 @@ fn run_one_tick(
                     );
                 }
                 obs.host.prefill_tokens = completed;
-                // Pipelined, this tick's launch is parked behind the one before it: read that
-                // older step out now, so the host stays exactly one step behind the device.
-                if pipe_prefill {
-                    let mut done = std::mem::take(&mut obs.host.pipe_tokens);
-                    match e.pipe_reap(&mut done) {
-                        Ok(()) => {
-                            for &(i, token) in &done {
-                                if slots[i].is_some() {
-                                    disconnected[i] |= gpu_emit_slot_token(
-                                        &mut slots[i],
-                                        &arena,
-                                        bundle,
-                                        token,
-                                        &mut tokens_this_tick,
-                                        stop.as_slice(),
-                                    );
-                                }
-                            }
-                        }
-                        Err(err) => {
-                            tracing::warn!(
-                                error = %err,
-                                error_code = ?err.device_code(),
-                                fatal = err.is_fatal(),
-                                "gpu: pipelined mixed step failed"
-                            );
-                            note_fault(&mut tick_fault, &err);
-                        }
-                    }
-                    obs.host.pipe_tokens = done;
-                }
                 if !compact {
                     for i in 0..slots.len().min(cap) {
                         let Some(s) = slots[i].as_ref() else { continue };
@@ -2884,8 +3010,6 @@ fn run_one_tick(
                 // Device-sampleable rows ride the quantum too when the sampler is loaded:
                 // `plow_sample` runs between each decode and advance.
                 let sampled_multi = e.multistep_sampling();
-                // CFG pairs draw on the device (`plow_sample_cfg`), so they can ride the quantum.
-                let cfg_dev = gpu_cfg_device(e) && crate::config::RuntimeConfig::get().nv.cfg_multistep;
                 let use_multi = !use_pipe
                     && steps > 1
                     && e.multistep_quantum().is_some()
@@ -2893,8 +3017,11 @@ fn run_one_tick(
                         slots[i]
                             .as_ref()
                             .map(|s| {
+                                // A CFG pair rides one step per tick: K=8 vs 1 lost Chatterbox c16
+                                // 17.25 vs 18.75 aps (the quantum overshoots the stop and delays
+                                // prefill and first-chunk renders).
                                 if s.cfg.is_some() {
-                                    return sampled_multi && cfg_dev;
+                                    return false;
                                 }
                                 !s.plain_decode()
                                     && (gpu_argmax_eligible(&s.gen.params)
@@ -3251,9 +3378,6 @@ fn run_one_tick(
             // The separate prefill/decode fallback runs sequentially because it
             // shares input/activation buffers. The parked-row mask prevents a
             // mid-prefill KDA state from advancing during the decode dispatch.
-            //
-            // `--pf-no-interleave` / `PLOW_PF_NO_INTERLEAVE=1` restores the old
-            // prefill-only tick.
             let mut did_prefill = false;
             let _tick = crate::obs::tick::begin();
             let rt = crate::config::RuntimeConfig::get();
@@ -3261,7 +3385,6 @@ fn run_one_tick(
             let slo_on = slo_targets.active();
             let slo_t0 = slo_on.then(Instant::now);
             let mut slo_pf_ms = 0.0f64;
-            let no_interleave = rt.pf_no_interleave;
             let decode_rows = slots[..b.min(slots.len())]
                 .iter()
                 .filter(|slot| slot.as_ref().is_some_and(|slot| slot.step > 0))
@@ -3269,12 +3392,10 @@ fn run_one_tick(
             let has_decode = decode_rows > 0;
             let tick_max = amd_prefill_tick_cap(
                 has_decode || co_scheduled,
-                no_interleave && !co_scheduled,
                 rt.pf_defer_decode && !co_scheduled,
                 rt.pf_interleave_amd(),
             );
-            if rt.pf_batch_amd()
-                && slots[..b.min(slots.len())]
+            if slots[..b.min(slots.len())]
                     .iter()
                     .flatten()
                     .filter(|slot| slot.step == 0)
@@ -3311,7 +3432,7 @@ fn run_one_tick(
                     .enumerate()
                     .take(b)
                     .filter_map(|(i, slot)| {
-                        if no_interleave || rt.pf_defer_decode {
+                        if rt.pf_defer_decode {
                             return None;
                         }
                         let slot = slot.as_ref()?;
@@ -3391,8 +3512,7 @@ fn run_one_tick(
             //  * A member may consume its prompt to the end. `token_batch_prefill_rows` does
             //    not hold the last token back, and the sampled ids for prompts that finish
             //    here follow the decode feeds in `output`.
-            if !no_interleave
-                && !rt.pf_defer_decode
+            if !rt.pf_defer_decode
                 && !slo_on
                 && e.token_batch_rows(1, 0, 1).is_some()
             {
@@ -3507,13 +3627,9 @@ fn run_one_tick(
                     // top of it. Decode rows do not make a lone prefill a packed-prefill step:
                     // at 70K/C20, fusing decode with one full 8192-row member was 4.5% slower
                     // than the ordinary independent paths.
-                    //
-                    // `--amd-token-batch-solo` restores the unconditional form, which is what
-                    // the first campaign measured; it exists so the policy stays falsifiable.
-                    if feeds.len() + completing > 0
-                        && (pack.len() >= 2
-                            || crate::config::RuntimeConfig::get().amd.token_batch_solo)
-                    {
+                    // A lone member measured -3.5% tok/s and -35% TTFT at 512 input (Gemma-4
+                    // 31B, C1): it runs a far wider rung with nothing to pack it with.
+                    if feeds.len() + completing > 0 && pack.len() >= 2 {
                         chosen = Some((rows, pack));
                         break;
                     }
@@ -3649,7 +3765,6 @@ fn run_one_tick(
                 }
             }
             if has_decode
-                && !no_interleave
                 && !rt.pf_defer_decode
                 && !slo_on
                 && e.mixed_step_rows(decode_rows, 1).is_some()
@@ -3789,7 +3904,7 @@ fn run_one_tick(
             // single span one `prefill_chunked_at_most`, and the decodes are the batched
             // dispatch below. What the engine cannot run it refuses by name; the plan is never
             // narrowed here.
-            let pf_batch = rt.pf_batch_amd();
+            let pf_batch = true;
             let cap = b.min(slots.len()).min(u128::BITS as usize);
             let backend = e.step_backend();
             let now = Instant::now();
@@ -4037,9 +4152,6 @@ fn run_one_tick(
                     did_prefill = true;
                 }
             }
-            if did_prefill && no_interleave {
-                return (slots, bufs, obs, tokens_this_tick, true, tick_fault, None);
-            }
             if did_prefill {
                 let prefill_remains = slots[..b.min(slots.len())]
                     .iter()
@@ -4094,7 +4206,7 @@ fn run_one_tick(
             let requested = amd_multistep_requested(
                 remaining,
                 multi_step,
-                crate::config::RuntimeConfig::get().multistep() as usize,
+                crate::serve::policy::decode_k(true, 1) as usize,
             );
             let multi = e.multistep_quantum(&feeds, requested);
             let mut deferred = std::mem::take(&mut obs.host.slot_tokens);
@@ -4449,13 +4561,10 @@ fn service_sample(ms: f64, did_prefill: bool) -> Option<f64> {
     (ms > 0.0 && !did_prefill).then_some(ms)
 }
 
-/// The serve-layer interleave bound: max prefill-chunk rows per tick while
-/// other slots are mid-decode. `PLOW_PF_INTERLEAVE` overrides (rows; `0` =
-/// whole prompt in one tick, the pre-interleave behavior). Read once.
-/// Reads `RuntimeConfig::get().nv.pf_chunk_cost`: a launch's fixed cost, in rows.
+/// A prefill launch's fixed cost, in rows.
 #[cfg(feature = "cuda")]
 fn pf_chunk_cost_rows() -> usize {
-    crate::config::RuntimeConfig::get().nv.pf_chunk_cost
+    crate::exec::gpu::PF_CHUNK_COST_ROWS
 }
 
 /// Reads `RuntimeConfig::get().pf_interleave_rows()`.
@@ -4464,7 +4573,7 @@ fn pf_interleave_rows() -> usize {
     crate::config::RuntimeConfig::get().pf_interleave_rows()
 }
 
-/// Prefill rows for one launch, from the queue (`PLOW_PF_INTERLEAVE_ADAPTIVE`).
+/// Prefill rows for one launch, from the queue (the latency objective's packing).
 ///
 /// `rows` are the waiting prompts' offered rows, oldest first. A launch costs a fixed
 /// `chunk_cost` rows of time plus its rows, and every prompt packed into it finishes when the
@@ -4553,13 +4662,8 @@ fn gpu_prefill_should_yield(has_feeds: bool, defer_decode: bool, slot: Option<&S
 }
 
 #[cfg(any(feature = "hsa", feature = "cpu"))]
-fn amd_prefill_tick_cap(
-    has_decode: bool,
-    no_interleave: bool,
-    defer_decode: bool,
-    interleave: u32,
-) -> u32 {
-    if !has_decode || no_interleave || defer_decode || interleave == 0 {
+fn amd_prefill_tick_cap(has_decode: bool, defer_decode: bool, interleave: u32) -> u32 {
+    if !has_decode || defer_decode || interleave == 0 {
         u32::MAX
     } else {
         interleave
@@ -4829,8 +4933,7 @@ fn arrival_key(arrived: Instant, now: Instant) -> u64 {
 /// is shared by up to `R ≈ budget/C` requests instead of monopolized by the
 /// first big prompt. `0` = uncapped = today's byte-identical behaviour (the A/B
 /// canary; packing is numerics-neutral, so C only changes which requests share
-/// a launch, never any request's tokens). Read once. Default `0` (off) — this
-/// is opt-in alongside `PLOW_PF_BATCH=1`, matching the rest of the PX-1 knobs.
+/// a launch, never any request's tokens). Default `0` (off), an expert override.
 /// Unset and `0` both mean uncapped, so the default IS the zero sentinel.
 /// Reads `RuntimeConfig::get().pf_chunk_rows()`.
 #[cfg(feature = "cuda")]
@@ -4853,7 +4956,6 @@ fn gpu_prefill_batched_pass(
     completed: &mut Vec<(usize, u32)>,
     feeds: &mut Vec<(usize, u32)>,
     unified_output: &mut Vec<(u32, u32)>,
-    pipelined: bool,
     dev_sampled: &mut bool,
     ride: &mut crate::sched::ride::RideCost,
 ) -> Option<crate::DeviceErrorInfo> {
@@ -4862,32 +4964,12 @@ fn gpu_prefill_batched_pass(
     completed.clear();
     *dev_sampled = false;
     let compact = e.has_packed_terminal();
-    let mut unified =
-        e.token_batch_enabled() && !crate::config::RuntimeConfig::get().pf_no_interleave;
+    let mut unified = e.token_batch_enabled();
     // Whether this tick's decode rows may still leave the launch for their own step
     // (`sched::ride`): decided once, when the launch's bucket is known.
-    let mut ride_open = unified
-        && !pipelined
-        && !feeds.is_empty()
-        && !crate::config::RuntimeConfig::get().ride_fixed;
+    let mut ride_open = unified && !feeds.is_empty();
     let withheld = usize::from(!compact);
-    // Pipelined, a prompt whose first token is still on the device can decode from it: the row
-    // joins the next launch instead of idling one while the host reads that token back.
-    let pending_first: smallvec::SmallVec<[usize; 8]> = if pipelined && e.pipe_first_token_rows() {
-        (0..cap.min(slots.len()))
-            .filter(|&i| {
-                e.pipe_owes(i)
-                    && slots[i].as_ref().is_some_and(|s| {
-                        s.step == 0
-                            && s.pf_pos + withheld >= s.prompt_ids.len()
-                            && !s.respond.is_closed()
-                    })
-            })
-            .collect()
-    } else {
-        Default::default()
-    };
-    let mut decode_rows = if unified { feeds.len() + pending_first.len() } else { 0 };
+    let mut decode_rows = if unified { feeds.len() } else { 0 };
     let mut tick_fault: Option<crate::DeviceErrorInfo> = None;
     let budget_max = e.pf_max_rows();
     if budget_max == 0 {
@@ -4911,9 +4993,7 @@ fn gpu_prefill_batched_pass(
     // Bound each candidate before fair sharing. Short requests return unused
     // rows to later candidates in the same launch.
     let chunk_cap = pf_chunk_rows().min(e.pf_request_max_rows());
-    let adaptive = crate::serve::policy::adaptive_packing(
-        crate::config::RuntimeConfig::get().pf_interleave_adaptive,
-    );
+    let adaptive = crate::serve::policy::adaptive_packing();
     loop {
         let host_t = packlog::on().then(Instant::now);
         for (i, slot) in slots.iter_mut().enumerate().take(cap) {
@@ -5042,22 +5122,12 @@ fn gpu_prefill_batched_pass(
             bucket
         }
         .min(per_launch);
-        let pf_batch_cfg = crate::config::RuntimeConfig::get().pf_batch;
-        let is_fair =
-            crate::config::RuntimeConfig::get().pf_span_policy.as_deref() == Some("fair");
-        let packing_enabled = pf_batch_cfg.unwrap_or_else(|| {
-            if is_fair {
-                candidates.first().map(|c| c.span.n_rows < 1024).unwrap_or(true)
-            } else {
-                true
-            }
-        });
         let step = crate::sched::step::plan(
             e.step_backend(),
             crate::sched::step::Tick {
                 cap_rows: u32::try_from(per_launch).unwrap_or(u32::MAX),
-                packing: packing_enabled,
-                rotate: false,
+                packing: true,
+                rotate: crate::config::RuntimeConfig::get().pf_rotate(),
                 turn: e.prefill_turn(),
                 slots: cap.min(slots.len()),
             },
@@ -5087,7 +5157,7 @@ fn gpu_prefill_batched_pass(
                 t.elapsed().as_secs_f64() * 1e6
             );
         }
-        let riders = if unified { feeds.len() + pending_first.len() } else { 0 };
+        let riders = if unified { feeds.len() } else { 0 };
         let launch_bucket = e.pf_pack_budget(pack.iter().map(|p| p.2).sum::<usize>() + riders);
         let t_launch = Instant::now();
         let res = if unified {
@@ -5121,29 +5191,8 @@ fn gpu_prefill_batched_pass(
                     selection: Selection::default(),
                 })
             });
-            // One placeholder token per device-sourced row: the launch overwrites it with the
-            // sample the previous launch left in `d_last`.
-            const DEVICE_TOKEN: [u32; 1] = [0];
-            let first = pending_first.iter().filter_map(|&i| {
-                let slot = slots[i].as_ref()?;
-                Some(Request {
-                    id: i as u32,
-                    slot: i as u32,
-                    state_slot: i as u32,
-                    generation: e.slot_generation(i)?,
-                    phase: Phase::Decode,
-                    tokens: &DEVICE_TOKEN,
-                    prompt_len: slot.prompt_ids.len() as u32,
-                    selection: Selection::default(),
-                })
-            });
-            let requests: smallvec::SmallVec<[_; 16]> =
-                decode.chain(first).chain(prefill).collect();
-            // Pipelined, this launch reports no token: its samples — including a prompt's first
-            // token — are read back on a later tick, and `completed` stays empty.
-            let result = if pipelined {
-                e.token_batch_step_pipelined(&requests, unified_output)
-            } else if e.dev_sample_enabled() {
+            let requests: smallvec::SmallVec<[_; 16]> = decode.chain(prefill).collect();
+            let result = if e.dev_sample_enabled() {
                 // Stochastic rows draw on the device: a host draw downloads the row's 512 KiB of
                 // logits and walks the vocabulary once per row, serially, inside the tick.
                 *dev_sampled = true;
@@ -5207,7 +5256,7 @@ fn gpu_prefill_batched_pass(
                     Ok(())
                 })
         };
-        if res.is_ok() && !pipelined {
+        if res.is_ok() {
             ride.observe_launch(launch_bucket, riders, t_launch.elapsed().as_secs_f64() * 1e3);
         }
         match res {
@@ -5223,7 +5272,7 @@ fn gpu_prefill_batched_pass(
                     .as_ref()
                     .map(|s| s.pf_pos + withheld >= s.prompt_ids.len())
                     .unwrap_or(true);
-                if is_fair || last_finished {
+                if last_finished {
                     e.advance_prefill_turn(last_slot);
                 }
             }
@@ -6648,6 +6697,7 @@ mod tests {
             metrics: Arc::clone(&metrics),
             preempt: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             preempt_notify: Arc::new(tokio::sync::Notify::new()),
+            arrival_notify: Arc::new(tokio::sync::Notify::new()),
             ingress: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         };
 
@@ -6973,7 +7023,42 @@ mod tests {
         assert_eq!(slots[0].as_ref().unwrap().prompt_ids.len(), 20);
         assert!(matches!(rx_b.try_recv(), Ok(StreamChunk::Err(_))));
         let left: Vec<_> = waiting.iter().map(|(j, _)| j.prompt_ids.len()).collect();
-        assert_eq!(left, [10, 40]);
+        assert_eq!(left, [40, 10], "oldest first within a class");
+    }
+
+    /// A continuing session turn takes the slot ahead of a session opening, but only until the
+    /// opening request has waited the bound; past it, arrival order decides.
+    #[test]
+    fn continuing_turns_go_first_within_the_wait_bound() {
+        let now = Instant::now();
+        let bound = crate::serve::cosched::max_wait();
+        let seat = |opening_waited: std::time::Duration| {
+            let metrics = Arc::new(Metrics::default());
+            let mut slots: Vec<Option<Slot>> = std::iter::repeat_with(|| None).take(1).collect();
+            let (opening, _rx_o) = queued_job(10, now - opening_waited);
+            let ((mut next, t), _rx_c) = queued_job(20, now);
+            next.opts.continuing = true;
+            let mut waiting: std::collections::VecDeque<_> = [opening, (next, t)].into();
+            metrics.queued_requests.store(2, Ordering::Relaxed);
+            drain_waiting(
+                &mut waiting, &mut slots, 1, now, 250.0, None, &metrics, &EngineHealth::Healthy, None,
+                false,
+            );
+            slots[0].as_ref().unwrap().prompt_ids.len()
+        };
+        assert_eq!(seat(bound / 2), 20, "the continuing turn overtakes a young opening");
+        assert_eq!(seat(bound + std::time::Duration::from_millis(1)), 10, "never past the bound");
+
+        let o = |continuing, ago_ms| {
+            seat_order(JobClass::Normal, continuing, now - std::time::Duration::from_millis(ago_ms), now, bound)
+        };
+        let aged = bound.as_millis() as u64 + 10;
+        assert!(o(false, aged + 5) < o(false, aged), "aged requests are oldest first");
+        assert!(o(false, aged) < o(true, 0));
+        assert!(o(true, 0) < o(false, 500));
+        assert!(o(false, 500) < o(false, 100));
+        let critical = seat_order(JobClass::Critical, false, now, now, bound);
+        assert!(critical < o(false, aged), "class still comes first");
     }
 
     fn cfg_job(prompt: usize) -> ((Job, Instant), crate::serve::stream::ChunkReceiver) {
@@ -7344,6 +7429,8 @@ mod tests {
                 stop_pending: String::new(),
                 class: JobClass::Normal,
                 raw_tokens: false,
+                turn: None,
+                turn_key: None,
                 speech: None,
                 cfg: None,
                 held: Vec::new(),
@@ -7355,6 +7442,72 @@ mod tests {
             }),
             rx,
         )
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn tick_due_takes_turn_deadlines_and_keeps_classes_without_turns() {
+        use crate::serve::cosched::{Due, Urgency};
+        let model = crate::sched::cost::id("mux-test-tick-due");
+        let waiting = std::collections::VecDeque::new();
+        let (mut prompt, _rx) = prefill_test_slot();
+        let (mut fin, _rx2) = prefill_test_slot();
+        let now = Instant::now();
+        let arrived = prompt.as_ref().unwrap().arrived;
+        fin.as_mut().unwrap().class = JobClass::Final;
+        // No turns: the class mapping, anchored at the oldest job of the winning class.
+        let slots = vec![prompt.take(), None];
+        assert_eq!(tick_due(&slots, &waiting, model, now).deadline, Due::from_urgency(Urgency::Deadline, arrived).deadline);
+        let mut slots = slots;
+        slots[1] = fin;
+        assert_eq!(tick_due(&slots, &waiting, model, now).deadline, Due::from_urgency(Urgency::Final, slots[1].as_ref().unwrap().arrived).deadline);
+        // A prompt whose turn ended speech 1.4 s ago is tighter than a fresh ASR final.
+        let speech_end = now.checked_sub(std::time::Duration::from_millis(1400)).unwrap();
+        slots[0].as_mut().unwrap().turn =
+            Some(crate::serve::turns::TurnTimes { speech_end: Some(speech_end), budget: std::time::Duration::from_millis(1500), ..Default::default() });
+        let d = tick_due(&slots, &waiting, model, now);
+        assert!(d.deadline <= speech_end + std::time::Duration::from_millis(1500));
+        assert!(d.slack(now) < Due::from_urgency(Urgency::Final, now).slack(now));
+        // The same turn with time to spare yields to the final.
+        slots[0].as_mut().unwrap().turn.as_mut().unwrap().speech_end = Some(now);
+        let d = tick_due(&slots, &waiting, model, now);
+        assert_eq!(d.deadline, Due::from_urgency(Urgency::Final, slots[1].as_ref().unwrap().arrived).deadline);
+    }
+
+    #[test]
+    fn a_live_slot_sees_its_turns_first_audio() {
+        use crate::serve::turns::{table, Kind, Stage};
+        let now = Instant::now();
+        let session: Arc<str> = "mux-test-refresh-turn".into();
+        let key = table().join(&session, None, Kind::Llm, now, None, None, None).key;
+        let (mut slot, _rx) = prefill_test_slot();
+        let s = slot.as_mut().unwrap();
+        s.turn = table().times(&key);
+        s.turn_key = Some(key.clone());
+        let mut slots = vec![slot];
+        refresh_turns(&mut slots);
+        assert!(slots[0].as_ref().unwrap().turn.unwrap().tts_first_audio.is_none());
+        table().stamp(&key, Stage::TtsFirst, now);
+        refresh_turns(&mut slots);
+        assert_eq!(slots[0].as_ref().unwrap().turn.unwrap().tts_first_audio, Some(now));
+    }
+
+    /// A turn's speech stream is its first audio only until the tokens that audio renders from;
+    /// after them its ticks are stream decode, behind the first render.
+    #[test]
+    fn a_speech_stream_is_first_audio_until_its_first_tokens() {
+        use crate::serve::cosched::Band;
+        let (model, now) = (crate::sched::cost::id("mux-test-first-tokens"), Instant::now());
+        let t = crate::serve::turns::TurnTimes { speech_end: Some(now), ..Default::default() };
+        let e = crate::serve::deadlines::Ests::default();
+        let zero = std::time::Duration::ZERO;
+        let band = |first: Option<usize>, step| turn_job_due(model, JobClass::Critical, first, step, zero, zero, now, &t, &e, now).band;
+        assert_eq!(band(Some(20), 19), Band::First);
+        assert_eq!(band(Some(20), 20), Band::Stream);
+        assert_eq!(band(None, 0), Band::First, "an LLM prompt");
+        assert_eq!(band(None, 1), Band::Stream, "LLM decode");
+        let asr = turn_job_due(model, JobClass::Final, Some(CRITICAL_TOKENS), 3, zero, zero, now, &t, &e, now);
+        assert_eq!(asr.band, Band::Final, "an ASR final, every step");
     }
 
     #[cfg(feature = "cuda")]
@@ -7481,11 +7634,10 @@ mod tests {
     #[cfg(any(feature = "hsa", feature = "cpu"))]
     #[test]
     fn amd_prefill_scheduler_controls_are_bounded() {
-        assert_eq!(amd_prefill_tick_cap(false, false, false, 2048), u32::MAX);
-        assert_eq!(amd_prefill_tick_cap(true, true, false, 2048), u32::MAX);
-        assert_eq!(amd_prefill_tick_cap(true, false, false, 0), u32::MAX);
-        assert_eq!(amd_prefill_tick_cap(true, false, true, 2048), u32::MAX);
-        assert_eq!(amd_prefill_tick_cap(true, false, false, 2048), 2048);
+        assert_eq!(amd_prefill_tick_cap(false, false, 2048), u32::MAX);
+        assert_eq!(amd_prefill_tick_cap(true, false, 0), u32::MAX);
+        assert_eq!(amd_prefill_tick_cap(true, true, 2048), u32::MAX);
+        assert_eq!(amd_prefill_tick_cap(true, false, 2048), 2048);
         assert!(amd_defer_decode(true, true));
         assert!(!amd_defer_decode(true, false));
         assert!(!amd_defer_decode(false, true));

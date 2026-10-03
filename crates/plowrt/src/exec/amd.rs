@@ -11082,7 +11082,7 @@ impl AmdEngine {
     /// gfx942, where no build recipe emitted `interp_packed_mla_*` at all. The second door is
     /// the route being off on a blob that needs it: a dense packet packs on the ordinary
     /// span-aware objects, but an MLA one is refused by `check_packed_prefill_program`
-    /// wherever the family objects are not loaded, so `--pf-batch` alone reads as a null.
+    /// wherever the family objects are not loaded, so co-packing alone reads as a null.
     /// The packed route as resolved at load: the explicit knob, else the packet's own answer.
     fn packed_prefill_route_armed(&self) -> bool {
         crate::config::RuntimeConfig::get()
@@ -11099,8 +11099,7 @@ impl AmdEngine {
         let cfg = crate::config::RuntimeConfig::get();
         let route = self.packed_prefill_route_armed();
         let route_auto = cfg.amd.packed_prefill_route.is_none();
-        let pf_batch = cfg.pf_batch_amd();
-        if !route && cfg.pf_batch.is_none() {
+        if !route {
             // No siblings, no explicit opt-in: an ordinary packet on the default mux.
             return;
         }
@@ -11137,7 +11136,6 @@ impl AmdEngine {
             tracing::warn!(
                 route,
                 route_auto,
-                pf_batch,
                 dense_consumers = self.packed_prefill_dense,
                 packet_abi = self.packed_prefill_prefill_abi,
                 hsaco = %hsaco_dir.display(),
@@ -11146,13 +11144,6 @@ impl AmdEngine {
                     .as_deref()
                     .unwrap_or("this blob declares no prefill rung"),
                 "packed prefill cannot fire on this blob — every prefill rung refuses"
-            );
-        } else if !pf_batch {
-            tracing::warn!(
-                route,
-                route_auto,
-                rungs = ?capable,
-                "packed prefill is capable but --pf-batch is off — co-packing will never be attempted"
             );
         } else {
             tracing::info!(

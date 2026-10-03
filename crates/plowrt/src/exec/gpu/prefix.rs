@@ -23,7 +23,8 @@ pub(crate) struct VmmPrefixLayout {
 /// VMM live allocation or prefix-sharing state: the pool
 /// backing every FULL layer's `kv.{l}.k/v` tensor with per-sequence VA
 /// windows. Live mode can retain demand-mapped whole-slot rings; prefix
-/// mode keeps rings flat and snapshots their last `window` rows.
+/// mode snapshots the rings' last `window` rows and keeps them flat unless
+/// `PLOW_VMM_LIVE_RINGS=1` commits them per admitted slot.
 pub(super) struct VmmServe {
     pub(super) kv: crate::memory::vmm::VmmKv,
     pub(super) rings: Option<crate::memory::vmm::VmmRings>,
@@ -46,6 +47,16 @@ pub(super) struct VmmServe {
     /// Sliding ring rows (`min(max_ctx, KV_RING)`), a power of two.
     pub(super) ring: u64,
     pub(super) snap_row_bytes: u64,
+}
+
+impl VmmPrefixLayout {
+    /// Sliding K/V ring bytes over every slot (scales excluded).
+    pub(crate) fn slide_kv_bytes(&self, blob: &DevBlob) -> u64 {
+        self.slide
+            .iter()
+            .map(|&(k, v, _)| blob.tensors[k].bytes + blob.tensors[v].bytes)
+            .sum()
+    }
 }
 
 impl GpuEngine {
@@ -133,9 +144,8 @@ impl GpuEngine {
         if requested == Some(false)
             || (requested.is_none()
                 && (capability != (9, 0)
-                    || config.pf_batch_cuda()
                     || config.nv_vmm_live()
-                    || config.nv_vmm_live_rings()
+                    || config.nv_vmm_live_rings() == Some(true)
                     || blob.tp.is_some()
                     || blob.sections.iter().any(|section| {
                         matches!(
@@ -151,11 +161,13 @@ impl GpuEngine {
         let layout = Self::vmm_prefix_layout(blob, checkpoint_dir)?;
         if requested.is_none() {
             // Auto-selection is an allowlist of the geometry the sliding-ring
-            // snapshot path was qualified on (Gemma 4 hybrid BF16 KV), not a
+            // snapshot path was qualified on (Gemma 4 hybrid KV), not a
             // capability probe; other layouts need an explicit PLOW_VMM_PREFIX=1.
+            // FP8 KV (elem 1, per-token-head scales in the snapshot): Gemma-4 12B,
+            // cached and cold multi-turn sessions give the same greedy tokens.
             let g = &layout.geo;
-            let qualified = g.elem == 2
-                && g.elem_slide == 2
+            let qualified = matches!(g.elem, 1 | 2)
+                && matches!(g.elem_slide, 1 | 2)
                 && g.hd_full == 512
                 && g.hd_slide == 256
                 // 512: Gemma-4 E4B (KV-shared layers read their source's rings); cached and
@@ -171,7 +183,8 @@ impl GpuEngine {
                 hd_slide = g.hd_slide,
                 window = g.window,
                 kv_elem = g.elem,
-                "vmm prefix auto-selection (qualified Hopper hybrid BF16-KV geometry; \
+                kv_elem_slide = g.elem_slide,
+                "vmm prefix auto-selection (qualified Hopper hybrid BF16/FP8-KV geometry; \
                  PLOW_PREFIX_CACHE=0 or PLOW_VMM_PREFIX=0 disables, =1 forces)"
             );
             if !qualified {
@@ -340,15 +353,48 @@ impl GpuEngine {
         be: &Arc<CudaBackend>,
         blob: &DevBlob,
         layout: Option<VmmPrefixLayout>,
-    ) -> Option<VmmServe> {
-        let VmmPrefixLayout {
+        live_rings: bool,
+    ) -> Result<Option<VmmServe>> {
+        let Some(VmmPrefixLayout {
             geo,
             slide,
             slide_scale,
             full_scale,
             ring,
             snap_row_bytes,
-        } = layout?;
+        }) = layout
+        else {
+            return Ok(None);
+        };
+        // Sliding rings committed per admitted slot, idle rows on shared scratch: a slot's ring
+        // costs memory only while a request owns it, so admission charges it like its KV rows.
+        let rings = if live_rings && !slide.is_empty() {
+            let scale_stride = geo.kvh_slide as u64 * ring * 4;
+            let tensors: Vec<_> = slide
+                .iter()
+                .flat_map(|&(k, v, stride)| [(k, stride), (v, stride)])
+                .chain(
+                    slide_scale
+                        .iter()
+                        .flat_map(|&(k, v)| [(k, scale_stride), (v, scale_stride)]),
+                )
+                .map(|(tensor, slot_bytes)| crate::memory::vmm::LiveRingTensor { tensor, slot_bytes })
+                .collect();
+            let rings = crate::memory::vmm::VmmRings::new_idle_backed(
+                Arc::clone(be) as Arc<dyn crate::memory::vmm::VmmOps>,
+                &tensors,
+                geo.batch as usize,
+            )?;
+            tracing::info!(
+                slot_mib = rings.slot_charge() >> 20,
+                resident_mib = rings.stats().resident_bytes >> 20,
+                reserved_gib = rings.stats().reserved_bytes as f64 / (1u64 << 30) as f64,
+                "vmm prefix: live sliding rings (idle rows on shared scratch)"
+            );
+            Some(rings)
+        } else {
+            None
+        };
 
         // Default sharing block = the driver granularity (2 MiB measured):
         // the finest match unit VMM can map, e.g. 4096 tokens at hd256 bf16 —
@@ -367,8 +413,8 @@ impl GpuEngine {
             block_hint,
             cache_cap,
         ) {
-            Ok(mut kv) => Some(VmmServe {
-                rings: None,
+            Ok(mut kv) => Ok(Some(VmmServe {
+                rings,
                 tensor_tracks: blob
                     .tensors
                     .iter()
@@ -390,6 +436,10 @@ impl GpuEngine {
                     if rt.vmm_publish_shared() {
                         kv.enable_shared_publish();
                     }
+                    // FP8 full-layer scales snapshot over `[0, p_a)`, not just the tail.
+                    if !full_scale.is_empty() {
+                        kv.enable_strict_publish();
+                    }
                     kv
                 },
                 slide,
@@ -397,10 +447,10 @@ impl GpuEngine {
                 full_scale,
                 ring,
                 snap_row_bytes,
-            }),
+            })),
             Err(e) => {
                 tracing::warn!(error = %e, "vmm off: pool bringup failed");
-                None
+                Ok(None)
             }
         }
     }
@@ -658,15 +708,15 @@ impl GpuEngine {
         Ok(self.pos[b] as usize)
     }
 
-    fn publish_boundary(&self, b: usize, p_a: u32) {
+    fn publish_boundary(&self, b: usize, p_a: u32) -> bool {
         let Some(v) = self.vmm.as_ref().filter(|v| v.kv.prefix_reuse()) else {
-            return;
+            return false;
         };
         let rows = self.pos[b];
         let toks = &self.seq_tokens[b];
         let g = v.kv.geometry();
         if rows == 0 || toks.len() != rows as usize || p_a == 0 {
-            return;
+            return false;
         }
         if !v.slide.is_empty() && rows - p_a > v.ring as u32 - g.window {
             tracing::info!(
@@ -679,15 +729,21 @@ impl GpuEngine {
                 diff = rows - p_a,
                 "vmm: publish_boundary skipped: ring overflow"
             );
-            return;
+            return false;
+        }
+        if !v.kv.resolve_prefix_hazard(b, toks, p_a) {
+            tracing::debug!(slot = b, p_a, "vmm: publish_boundary skipped: orphaned blocks");
+            return false;
         }
         let snap_bytes = self.vmm_snap_bytes(p_a);
         if let Err(e) = v.kv.publish_at(b, toks, p_a, snap_bytes, |dst| {
             self.vmm_snap_copy(b, p_a, dst, true)
         }) {
             tracing::info!(error = %e, slot = b, p_a, "vmm: publish_boundary skipped");
+            false
         } else {
             tracing::info!(slot = b, p_a, snap_bytes, "vmm: published successfully");
+            true
         }
     }
 
@@ -733,7 +789,28 @@ impl GpuEngine {
             self.publish_boundary(b, p);
             p += step;
         }
-        self.publish_boundary(b, p_a);
+        // Only a prompt-side publish retires: the next turn's prompt re-renders this turn's
+        // reply, which need not re-tokenize to the generated ids, so the turn-end boundary
+        // may not match it and the prompt-end boundary must survive until then.
+        if self.publish_boundary(b, p_a) && self.session_pin[b].is_some() && max_rows < rows {
+            let freed = v.kv.retire_superseded(toks, p_a);
+            if freed > 0 {
+                tracing::debug!(slot = b, p_a, freed, "vmm: session retired superseded snapshots");
+            }
+        }
+    }
+
+    /// Publish slot `b`'s shared-prefix end (`VmmKv::share_rows`, e.g. a system prompt
+    /// another sequence also sent) once the prefill chunk that started at `c0` passed it,
+    /// while the rings still hold its window.
+    pub(super) fn vmm_publish_shared(&self, b: usize, c0: u32) {
+        let Some(v) = self.vmm.as_ref().filter(|v| v.kv.prefix_reuse()) else {
+            return;
+        };
+        let rows = v.kv.share_rows(b);
+        if rows > c0 && rows <= self.pos[b] {
+            self.publish_boundary(b, rows);
+        }
     }
 
     /// Slot `b`'s prompt is prefilled and its prompt-end publish has run.

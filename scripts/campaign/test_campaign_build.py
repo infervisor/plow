@@ -13,6 +13,75 @@ import campaign
 
 
 class CampaignBuildTests(unittest.TestCase):
+    def test_role_rebuild_preserves_overrides_and_copies_final_objects(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            compiler = root / "target/release/plowc"
+            compiler.parent.mkdir(parents=True)
+            compiler.write_bytes(b"compiler")
+            original_compiler_sha = campaign.sha(compiler)
+            recipe = root / "recipe.toml"
+            recipe.write_text('[cell]\nhf_dir="weights"\ngpu="H100"\narch="sm_90a"\nn_cu=132\n'
+                              '[emit]\n[emit_roles.env]\nPLOW_GEMMA4_SM90_W8A8_GEMM_GLU_ROLE="1"\n'
+                              '[objects]\nscript="build.sh"\nrole_files=["role.cubin"]\n'
+                              '[objects.env]\nPLOW_BUILD_W8A8="0"\n[bench]\n')
+            original_recipe = recipe.read_bytes()
+            (root / "flake.lock").write_bytes(b"original lock")
+            out = root / "build"
+            configs = []
+
+            def run(command, env, log):
+                recipe.write_bytes(b"recipe changed during compilation")
+                compiler.write_bytes(b"compiler replaced during compilation")
+                (root / "flake.lock").write_bytes(b"changed lock")
+                with log.open("a") as f:
+                    f.write(json.dumps(command) + "\n")
+                if "--out" in command:
+                    assets = Path(command[command.index("--out") + 1])
+                    (assets / "model.pkt").write_bytes(assets.name.encode())
+                    (assets / "plow_config.h").write_bytes(assets.name.encode())
+                    if assets.name == "assets":
+                        self.assertEqual((assets / "role.cubin").read_bytes(), b"base")
+                        (assets / "role.cubin").write_bytes(b"emit placeholder")
+                else:
+                    self.assertEqual(command[:2], ["bash", "-x"])
+                    self.assertEqual(env["PLOW_BUILD_W8A8"], "1")
+                    config = Path(env["PLOW_CUBIN_CONFIG"]).read_bytes()
+                    configs.append(config)
+                    objects = Path(command[-1])
+                    objects.mkdir()
+                    (objects / "role.cubin").write_bytes(config)
+                return 0
+
+            args = argparse.Namespace(recipe=str(recipe), out=str(out), env=[], no_probe=True,
+                                      object_env=["PLOW_BUILD_W8A8=1"])
+            with patch.object(campaign, "REPO", root), patch.object(campaign, "run", run), \
+                    patch.object(campaign, "git", side_effect=lambda *args, **kwargs:
+                                 "start" if recipe.read_bytes() == original_recipe else "end"), \
+                    patch.dict(campaign.os.environ, {"CARGO_TARGET_DIR": str(root / "target")}):
+                campaign.cmd_build(args)
+            self.assertEqual(configs, [b"base", b"assets"])
+            self.assertEqual((out / "objects-base/role.cubin").read_bytes(), b"base")
+            self.assertEqual((out / "assets/role.cubin").read_bytes(), b"assets")
+            record = json.loads((out / "build-record.json").read_text())
+            self.assertEqual(record["commit"], "start")
+            self.assertEqual(record["compiler_sha256"], original_compiler_sha)
+            provenance = record["build_provenance"]
+            self.assertEqual(provenance["source_end"]["commit"], "end")
+            self.assertTrue(provenance["source_state_changed"])
+            self.assertTrue(provenance["compiler_changed"])
+            self.assertEqual(provenance["compiler_end_sha256"], campaign.sha(compiler))
+            self.assertEqual((out / "source-start.diff").read_text(), "start")
+            self.assertEqual((out / "source-end.diff").read_text(), "end")
+            self.assertEqual((out / "recipe.toml").read_bytes(), original_recipe)
+            self.assertEqual(record["recipe_sha256"], campaign.sha(out / "recipe.toml"))
+            self.assertNotEqual(record["recipe_sha256"], campaign.sha(recipe))
+            self.assertEqual((out / "flake.lock").read_bytes(), b"original lock")
+            self.assertEqual(record["compilation"]["flake_lock_sha256"], campaign.sha(out / "flake.lock"))
+            self.assertEqual(record["hashes"]["role.cubin"], record["objects"]["role.cubin"])
+            self.assertEqual(record["compilation"]["log_sha256"], campaign.sha(out / "build.log"))
+            self.assertEqual(record["compilation"]["object_env"]["PLOW_BUILD_W8A8"], "1")
+
     def test_block_roofline_trace_binds_packet_runtime_and_counter_program(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

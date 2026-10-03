@@ -342,6 +342,7 @@ struct Shapes {
     moe_dec_group: bool,
     /// `K` (`i[2]`) of every dense decode GEMV site: the row kernels the decode object needs.
     decode_gemv_k: BTreeSet<u32>,
+    decode_fp8_gemv_rows: BTreeSet<u32>,
     /// hd → "bf16" | "e4m3", from which flash opcode reads that hd.
     kv_dtype: BTreeMap<u32, &'static str>,
     /// Largest prefill bucket = the largest chunk the runtime can submit.
@@ -488,6 +489,9 @@ fn shapes(m: &Model) -> Shapes {
                 )
             {
                 s.decode_gemv_k.insert(inst.i[2]);
+            }
+            if decode && matches!(op, DevOp::GemvFp8 | DevOp::GemvQkvFp8 | DevOp::GemvGluFp8) {
+                s.decode_fp8_gemv_rows.insert(inst.i[0]);
             }
             match op {
                 DevOp::XReduce if inst.i[7] != 0 => s.xr_combine_fold = true,
@@ -1171,6 +1175,20 @@ fn tuning(s: &Shapes, arch: &str) -> Map<String, Value> {
         {
             t.insert("gemv_wide".into(), json!(1));
         }
+    }
+    if sm90a && crate::emit_config::active().w8a8 && crate::emit_config::active().decode_cublaslt {
+        t.insert("fp8_lt_decode".into(), json!(true));
+    }
+    if crate::emit_config::active().fp8_decode_tc64 {
+        let config = crate::emit_config::active();
+        let routed_wider = s.decode_batch > 64
+            && config.decode_cublaslt_at(s.decode_batch)
+            && !config.decode_cublaslt_at(64)
+            && s.decode_fp8_gemv_rows.last() == Some(&64);
+        assert!(sm90a && (s.decode_batch == 64 || routed_wider) && t.contains_key("gemv_wide")
+            && s.ops_present.contains(&op_name(DevOp::GemvFp8)),
+            "FP8 TC64 requires an SM90 FP8 64-row decode ladder, optionally with wider cuBLASLt rungs");
+        t.insert("fp8_decode_tc64".into(), json!(true));
     }
     // * `fa_spart`: decode attention parks its score partials in smem (op_attention.cuh,
     //   PLOW_NV_FA_SPART) and holds 8 hd256 rows in flight. 12B 11.03/11.45/11.98/13.04/15.24 ->
@@ -2961,6 +2979,12 @@ pub fn config_header(manifest: &Value) -> String {
             if t.get("gemv_wide").is_some() {
                 out.push_str("#ifndef PLOW_NV_GEMV_WIDE\n#define PLOW_NV_GEMV_WIDE 1\n#endif\n");
             }
+            if t.get("fp8_lt_decode").and_then(Value::as_bool) == Some(true) {
+                out.push_str("#ifndef PLOW_NV_FP8_LT_DECODE\n#define PLOW_NV_FP8_LT_DECODE 1\n#endif\n");
+            }
+            if t.get("fp8_decode_tc64").and_then(Value::as_bool) == Some(true) {
+                out.push_str("#if defined(PLOW_NV_GW_OBJECT) && PLOW_NV_GW_OBJECT\n#ifndef PLOW_NV_FP8_DECODE_TC64\n#define PLOW_NV_FP8_DECODE_TC64 1\n#endif\n#endif\n");
+            }
             if t.get("gemv_k8").is_some() {
                 out.push_str("#ifndef PLOW_NV_GEMV_K8\n#define PLOW_NV_GEMV_K8 1\n#endif\n");
             }
@@ -3094,6 +3118,41 @@ mod tests {
     use super::*;
     use packet::dev::DevInst;
     use packet::devbuild::Program;
+
+    #[test]
+    fn fp8_tc64_is_an_explicit_wide_object_request() {
+        let _guard = crate::test_env::env_guard();
+        let mut shapes = Shapes::default();
+        shapes.decode_batch = 64;
+        shapes.decode_gemv_k.insert(3840);
+        shapes.ops_present.insert(op_name(DevOp::GemvFp8));
+        let _off = crate::test_env::EnvScope::set(&[("PLOW_FP8_DECODE_TC64", "0")]);
+        assert!(!tuning(&shapes, "sm_90a").contains_key("fp8_decode_tc64"));
+        let _on = crate::test_env::EnvScope::set(&[("PLOW_FP8_DECODE_TC64", "1")]);
+        let tune = tuning(&shapes, "sm_90a");
+        assert_eq!(tune["fp8_decode_tc64"], true);
+        assert_eq!(tune["gemv_wide"], 1);
+        let header = config_header(&json!({"arch": "sm_90a", "tuning": tune}));
+        assert!(header.contains("#if defined(PLOW_NV_GW_OBJECT) && PLOW_NV_GW_OBJECT\n#ifndef PLOW_NV_FP8_DECODE_TC64\n#define PLOW_NV_FP8_DECODE_TC64 1\n#endif\n#endif"));
+        shapes.decode_batch = 32;
+        assert!(std::panic::catch_unwind(|| tuning(&shapes, "sm_90a")).is_err());
+        shapes.decode_batch = 128;
+        assert!(std::panic::catch_unwind(|| tuning(&shapes, "sm_90a")).is_err());
+        let _routed = crate::test_env::EnvScope::set(&[
+            ("PLOW_EMIT_DECODE_CUBLASLT", "1"),
+            ("PLOW_EMIT_DECODE_CUBLASLT_MIN_ROWS", "128"),
+        ]);
+        assert!(std::panic::catch_unwind(|| tuning(&shapes, "sm_90a")).is_err());
+        shapes.decode_fp8_gemv_rows.insert(64);
+        assert_eq!(tuning(&shapes, "sm_90a")["fp8_decode_tc64"], true);
+        shapes.decode_fp8_gemv_rows.insert(96);
+        assert!(std::panic::catch_unwind(|| tuning(&shapes, "sm_90a")).is_err());
+        shapes.decode_fp8_gemv_rows.remove(&96);
+        let _all_routed = crate::test_env::EnvScope::set(&[
+            ("PLOW_EMIT_DECODE_CUBLASLT_MIN_ROWS", "64"),
+        ]);
+        assert!(std::panic::catch_unwind(|| tuning(&shapes, "sm_90a")).is_err());
+    }
 
     /// Shadows [`super::build`]: most assertions here are about arms/shapes and
     /// do not care about the lean block, which has its own tests below.

@@ -13,6 +13,10 @@ SLOs (per turn, p95 over all turns): ASR final latency (last chunk sent -> final
 LLM TTFT, TTS time to first audio, and playback underrun (audio not there when the player needs
 it). Without --llm-model the agent replies with --reply text; without --asr-model the user speaks
 for --user-s seconds without transcription (with neither: TTS-only load).
+
+Each turn sends `X-Turn-Id: <call>.<turn>` and a W3C `traceparent` (one trace per turn), and records
+the server's `Server-Timing` per stage (`srv_asr` / `srv_llm` / `srv_tts`: queue, wait-turn,
+device, first, total, slack ms; the LLM's from the stream's final `: server-timing` comment).
 """
 import argparse, asyncio, io, json, random, statistics, time, uuid
 
@@ -35,7 +39,28 @@ def pct(xs, q):
     return None if not xs else xs[min(len(xs) - 1, int(q * len(xs)))]
 
 
-async def asr_turn(s, a, sid, clip):
+def server_timing(value):
+    """`queue;dur=1.2, device;dur=3` -> {"queue": 1.2, "device": 3.0} (ms)."""
+    out = {}
+    for metric in (value or "").split(","):
+        name, _, params = metric.strip().partition(";")
+        for p in params.split(";"):
+            k, _, v = p.strip().partition("=")
+            if name and k == "dur":
+                try:
+                    out[name] = float(v)
+                except ValueError:
+                    pass
+    return out
+
+
+def turn_headers(sid, turn):
+    """One turn's routing headers; a fresh span per request."""
+    return {"X-Session-Id": sid, "X-Request-Id": uuid.uuid4().hex, "X-Turn-Id": turn["id"],
+            "traceparent": f"00-{turn['trace']}-{uuid.uuid4().hex[:16]}-01"}
+
+
+async def asr_turn(s, a, sid, clip, turn):
     """Real-time paced chunks; returns (transcript, final latency s, partial latencies)."""
     chunk = int(a.chunk_s * ASR_SR)
     sent, partial_lat, t_start = 0, [], time.perf_counter()
@@ -51,48 +76,52 @@ async def asr_turn(s, a, sid, clip):
         due = t_start + (i + len(piece)) / ASR_SR
         await asyncio.sleep(max(0.0, due - time.perf_counter()))
         t0 = time.perf_counter()
-        async with s.post(a.url + "/v1/audio/transcriptions", data=form,
-                          headers={"X-Session-Id": sid, "X-Request-Id": uuid.uuid4().hex}) as r:
+        headers = turn_headers(sid, turn) if last else {"X-Session-Id": sid, "X-Request-Id": uuid.uuid4().hex}
+        async with s.post(a.url + "/v1/audio/transcriptions", data=form, headers=headers) as r:
             body = await r.text()
             if r.status != 200:
                 raise RuntimeError(f"asr {r.status}: {body[:200]}")
+            timing = server_timing(r.headers.get("Server-Timing"))
         dt = time.perf_counter() - t0
         sent += len(piece)
         if last:
-            return json.loads(body)["text"], dt, partial_lat
+            return json.loads(body)["text"], dt, partial_lat, timing
         partial_lat.append(dt)
 
 
-async def llm_turn(s, a, sid, history):
+async def llm_turn(s, a, sid, history, turn):
     body = dict(model=a.llm_model, messages=history, max_tokens=a.max_tokens, temperature=0, stream=True)
     if a.logprobs:
         body.update(logprobs=True, top_logprobs=a.logprobs)
     t0, ttft, text = time.perf_counter(), None, []
-    async with s.post(a.url + "/v1/chat/completions", json=body,
-                      headers={"X-Session-Id": sid, "X-Request-Id": uuid.uuid4().hex}) as r:
+    async with s.post(a.url + "/v1/chat/completions", json=body, headers=turn_headers(sid, turn)) as r:
         if r.status != 200:
             raise RuntimeError(f"llm {r.status}: {(await r.text())[:200]}")
+        timing = server_timing(r.headers.get("Server-Timing"))
         async for line in r.content:
             line = line.decode().strip()
+            if line.startswith(": server-timing "):
+                timing = server_timing(line[len(": server-timing "):])
+                continue
             if not line.startswith("data:") or line == "data: [DONE]":
                 continue
             delta = json.loads(line[5:])["choices"][0].get("delta", {}).get("content")
             if delta:
                 ttft = ttft or time.perf_counter() - t0
                 text.append(delta)
-    return "".join(text).strip(), ttft, time.perf_counter() - t0
+    return "".join(text).strip(), ttft, time.perf_counter() - t0, timing
 
 
-async def tts_turn(s, a, sid, text):
+async def tts_turn(s, a, sid, text, turn):
     """Streams speech; returns (ttfa s, audio s, underrun s) on a real-time playback clock."""
     body = dict(model=a.tts_model, input=text, voice=a.voice, response_format="pcm", stream=True)
     if a.language:
         body["language"] = a.language
     t0, first, got, underrun = time.perf_counter(), None, 0, 0.0
-    async with s.post(a.url + "/v1/audio/speech", json=body,
-                      headers={"X-Session-Id": sid, "X-Request-Id": uuid.uuid4().hex}) as r:
+    async with s.post(a.url + "/v1/audio/speech", json=body, headers=turn_headers(sid, turn)) as r:
         if r.status != 200:
             raise RuntimeError(f"tts {r.status}: {(await r.text())[:200]}")
+        timing = server_timing(r.headers.get("Server-Timing"))
         async for b in r.content.iter_any():
             now = time.perf_counter()
             if first is None:
@@ -102,7 +131,7 @@ async def tts_turn(s, a, sid, text):
                 behind = (now - first) - got / 2 / TTS_SR
                 underrun = max(underrun, behind)
             got += len(b)
-    return (first - t0) if first else None, got / 2 / TTS_SR, underrun
+    return (first - t0) if first else None, got / 2 / TTS_SR, underrun, timing
 
 
 async def call(s, a, idx, clips, rec):
@@ -112,21 +141,23 @@ async def call(s, a, idx, clips, rec):
     rng = random.Random(a.seed * 1_000_003 + 1000 + idx)
     for turn in range(a.turns):
         row = dict(call=idx, turn=turn)
+        t = {"id": f"{idx}.{turn}", "trace": uuid.uuid4().hex}
         try:
             if a.asr_model:
                 clip = clips[rng.randrange(len(clips))]
-                text, row["asr_final_s"], partials = await asr_turn(s, a, sid, clip)
+                text, row["asr_final_s"], partials, row["srv_asr"] = await asr_turn(s, a, sid, clip, t)
                 row["asr_partial_p50_s"] = statistics.median(partials) if partials else None
             else:
                 await asyncio.sleep(a.user_s)
                 text = "Hello."
             history.append({"role": "user", "content": text or "Hello."})
             if a.llm_model:
-                reply, row["llm_ttft_s"], row["llm_total_s"] = await llm_turn(s, a, sid, history)
+                reply, row["llm_ttft_s"], row["llm_total_s"], row["srv_llm"] = await llm_turn(s, a, sid, history, t)
             else:
                 reply = a.reply
             history.append({"role": "assistant", "content": reply})
-            row["tts_ttfa_s"], row["tts_audio_s"], row["tts_underrun_s"] = await tts_turn(s, a, sid, reply or "Okay.")
+            (row["tts_ttfa_s"], row["tts_audio_s"], row["tts_underrun_s"],
+             row["srv_tts"]) = await tts_turn(s, a, sid, reply or "Okay.", t)
             await asyncio.sleep(row["tts_audio_s"] + a.think_s)  # the user listens, then answers
         except Exception as e:  # noqa: BLE001 — every failure is a data point
             row["error"] = str(e)[:300]
@@ -157,6 +188,18 @@ async def main_async(a):
             summ[k.replace("_s", "") + "_p95_ms"] = round(1e3 * pct(v, 0.95), 1)
     under = [r["tts_underrun_s"] for r in ok if r.get("tts_underrun_s") is not None]
     summ["turns_with_underrun_gt_100ms"] = sum(u > 0.1 for u in under)
+    # Server-side breakdown (Server-Timing), ms: srv_<stage>_<metric>_p50/_p95.
+    for stage in ("asr", "llm", "tts"):
+        for metric in ("queue", "wait-turn", "device", "first"):
+            v = [r.get(f"srv_{stage}", {}).get(metric) for r in ok]
+            if any(x is not None for x in v):
+                key = f"srv_{stage}_{metric.replace('-', '_')}"
+                summ[key + "_p50"], summ[key + "_p95"] = round(pct(v, 0.5), 1), round(pct(v, 0.95), 1)
+    # Where the LLM turns over the TTFT SLO spent it on the server (medians).
+    slow = [r.get("srv_llm", {}) for r in ok if (r.get("llm_ttft_s") or 0) * 1e3 > a.slo_ttft_ms]
+    if slow:
+        summ["srv_llm_slow"] = dict(turns=len(slow), **{m.replace("-", "_") + "_p50": pct([x.get(m) for x in slow], 0.5)
+                                                      for m in ("queue", "wait-turn", "device", "first")})
     slo = dict(asr_final_p95_ms=a.slo_asr_ms, llm_ttft_p95_ms=a.slo_ttft_ms, tts_ttfa_p95_ms=a.slo_ttfa_ms)
     summ["slo_pass"] = (summ["errors"] == 0
                         and all(summ.get(k) is None or summ[k] <= v for k, v in slo.items())

@@ -1,18 +1,84 @@
 # Request and session identity on `plowrt serve`
 
 Every OpenAI route (`/v1/chat/completions`, `/v1/completions`, `/v1/audio/speech`,
-`/v1/audio/transcriptions` and its WebSocket) reads two optional headers:
+`/v1/audio/transcriptions` and its WebSocket) reads these optional headers:
 
 | header | meaning |
 |---|---|
-| `X-Request-Id` | Names one request. Echoed on the response (and in every transcription SSE event, and the WebSocket `ready` event); generated (uuid v4 shape) when absent. Within a session, a request id already in flight there is refused with 409 (`duplicate_request_id`). No other dedupe. |
-| `X-Session-Id` | Names a session of one model. After each of its requests finishes, the request's KV stays in its slot for the session's next request. Without it a request behaves exactly as before. |
+| `X-Request-Id` | Names one request. Echoed on the response (and in every transcription SSE event, and the WebSocket `ready` event); generated when absent. Within a session, a request id already in flight there is refused with 409 (`duplicate_request_id`). No other dedupe. |
+| `X-Session-Id` | Names a session of one model. After each of its requests finishes, the request's KV stays in its slot for the session's next request. Without it a request behaves exactly as before. It also links the call's requests across models into turns (below). |
+| `X-Turn-Id` | The turn (one user utterance → transcript → reply → speech) a request serves. Inferred when absent. |
+| `traceparent` | W3C trace context. The trace id is propagated; each request gets its own span id. Invalid → ignored (`tracestate` is not read). |
+| `X-Turn-Budget-Ms` | End of user speech → first agent audio target for the turn (default `--turn-budget-ms`, 1500). |
+| `X-Playback` | TTS only: client playback state, `started=<unix ms>` or `buffered_ms=<n>`. Recorded on the turn. |
 
-Ids are 1..=128 visible ASCII characters (400 otherwise); header names are case-insensitive.
-Both are echoed unchanged on every response, so a router or load balancer above can pin a session
-to one server (session state is per process: nothing is shared between servers). A session that
-lands on a server without its state (failover, restart, eviction, TTL) is served normally: its KV
-is recomputed, never an error.
+Request and turn ids are 1..=128 visible ASCII characters, session ids 1..=256 (400 otherwise);
+header names are case-insensitive. Ids are echoed unchanged on every response, so a router or load
+balancer above can pin a session to one server (session state is per process: nothing is shared
+between servers). A session that lands on a server without its state (failover, restart, eviction,
+TTL) is served normally: its KV is recomputed, never an error. Ids the server mints (request ids,
+a WebSocket's session, inferred turn ids) are [svid](https://crates.io/crates/svid)s: 11-char
+base58, time-sortable; client ids are never parsed.
+
+### OpenRouter compatibility
+
+Body fields route like OpenRouter's (first match wins). Response bodies are unchanged.
+
+| field | sources, in precedence order |
+|---|---|
+| session | body `session_id` > `X-Session-Id` (`prompt_cache_key` is accepted and ignored) |
+| request | `X-Request-Id` |
+| trace | `traceparent` > body `trace.trace_id` + `trace.parent_span_id` (other `trace` keys ignored) |
+| turn | `X-Turn-Id` > body `metadata.turn_id` |
+| budget | `X-Turn-Budget-Ms` > body `metadata.turn_budget_ms` |
+
+Chat, completions and speech take them in the JSON body; transcription uploads take `session_id`,
+`turn_id` and `turn_budget_ms` form fields. An invalid body `session_id` is a
+400; the other body fields are hints, ignored when invalid.
+
+### Turns
+
+A turn table (process-wide, all models; `serve/turns.rs`) links a call's stages. Without
+`X-Turn-Id` the turn is inferred per session:
+
+* an ASR `final=true` upload (or a WebSocket `finish`) opens a new turn; its arrival is the end of
+  speech;
+* the session's next chat/completion joins the open turn, and the TTS request after it joins and
+  closes it;
+* a chat or TTS with no open turn opens one at its own arrival (text agents, TTS-only load).
+
+ASR partials (`append`) are no turn stage. A turn without a client trace id gets one minted (its
+high half is the turn's svid), shared by all its stages. Turns live for the session TTL (60 s when
+retention is off), 32 per session. `GET /v1/turns/{session}` returns a call's turns: per stage the
+arrival, admission, first output and done times (ms from the end of speech), device and wait-turn
+ms, the server's playback clock and worst underrun.
+
+### Response headers and Server-Timing
+
+Every response carries `X-Request-Id`, `X-Session-Id` (when set), `X-Turn-Id` (assigned or
+echoed), `traceparent` (the turn's trace id, this request's span id) and a W3C `Server-Timing`:
+
+| metric | meaning |
+|---|---|
+| `queue` | arrival → slot admission (session requests: the admission report) |
+| `wait-turn` | admission → first output not spent in the model's own ticks: co-tenant device turns and host gaps |
+| `device` | the model's tick time over the same interval |
+| `first` | arrival → first output (first token, transcript, first audio) |
+| `total` | arrival → done, when known |
+| `slack` | stage target − `first` (negative = missed): ASR final 500, LLM TTFT 800, TTS TTFA 800 ms (`--turn-asr-final-ms`, `--turn-llm-ttft-ms`, `--turn-tts-ttfa-ms`) |
+| `turn` | end of speech → this request's first output |
+
+A streamed chat/completion sends what is known at header time (`queue`) in the headers and the
+full set as a final SSE comment line before `data: [DONE]`: `: server-timing queue;dur=…, …`.
+SSE clients ignore comment lines. A streamed transcription does the same; its events carry
+`turn_id`, and the WebSocket `final` event carries `turn_id`, `traceparent` and `server_timing`.
+A streamed speech response sends its headers with the first audio, so they carry its timing.
+
+`/metrics` adds `plowrt_turn_stage_seconds{model_name,stage=asr_final|llm_ttft|tts_ttfa}`,
+`plowrt_turn_response_seconds` (end of speech → first audio), `plowrt_tts_underrun_seconds`
+(worst underrun per stream on the server's clock), `plowrt_deadline_slack_seconds{stage}` and
+`plowrt_deadline_missed_total{stage}`. A `tracing` span per request (`request_id`, `session`,
+`turn`, `trace_id`, `model`, `stage`) logs admission, first output and done at debug level.
 
 Session responses also carry
 
@@ -117,7 +183,7 @@ encoder's split-K order follows the launch's single-utterance capacity), so the 
 prompt prefix, not the windows.
 
 The WebSocket route (`/v1/audio/transcriptions/stream`) runs its once-per-second partials the same
-way on `plowrt serve`: each connection is a session (its `X-Session-Id`, or `ws-<request id>`).
+way on `plowrt serve`: each connection is a session (its `X-Session-Id`, or a minted one).
 The `ready` event's `session_id` is that id. The cohort engine (`plowrt asr`) keeps its whole-buffer
 partials and refuses `append`/`final`.
 
@@ -163,3 +229,25 @@ differ), and 357 of 443 agree with the final up to their last two words (388 fro
 session saves is under a millisecond of prefill. A resumed prefill is not bit-identical to a
 one-launch prefill (it is a chunked prefill split at the resume row): greedy Veena turn-2 text
 matched the plain run 3/8 times, diverging within 0-3 audio tokens in 3 trials.
+
+### Turn-aware scheduling, voice call_sim (H100, 2026-10-02)
+
+`scripts/voice/call_sim.py`, Qwen3-ASR + Gemma-4 E4B + Chatterbox on one GPU, all calls open at
+t=0, 3 turns per call, 2 reps. p50/p95 ms; underrun = turns with > 100 ms playback underrun.
+"pre" is the branch before turn-aware scheduling; "turns" is this change. Errors 0 in all runs.
+
+| calls | run | ASR final | LLM TTFT | TTS TTFA | underrun |
+|---|---|---|---|---|---|
+| 50 | pre | 166-195 / 374-417 | 71-92 / 231-279 | 371-390 / 681-761 | 0/150 |
+| 50 | turns | 130-134 / 522-569 | 34-40 / 301-365 | 397-405 / 670-727 | 0-2/150 |
+| 100 | pre | 219-243 / 540-556 | 160-164 / 877-993 | 1014-1034 / 2237-2390 | 150-193/300 |
+| 100 | turns | 303-340 / 863-965 | 321-424 / 951-1007 | 690-729 / 1203-1232 | 62-94/300 |
+| 200 | pre | 313-324 / 992-1012 | 1193-1333 / 66471-76768 | 2368-2592 / 4354-5269 | 481-502/600 |
+| 200 | turns | 984-991 / 2382-2688 | 1072-1090 / 2357-2798 | 1740-1761 / 3662-3925 | 558-560/600 |
+
+Turn deadlines bound the 200-call LLM tail (p95 ~70 s → 2.4-2.8 s) and cut 100-call TTFA and
+underruns, at the cost of ASR finals at 100/200 calls and a 50-call ASR final p95 just over the
+500 ms SLO. Ranking ASR finals above near-miss work fixed 50-call ASR p95 (182-250 ms) but at
+overload starved the speech pipeline (200-call LLM TTFT p95 4-12 s), with or without deferring
+ASR partials, so finals rank above first outputs but below near-miss work. 200 calls is over the
+device's capacity (~92% of turns underrun in every variant).

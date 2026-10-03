@@ -39,6 +39,53 @@ pub struct Window {
 /// [`Codec::set_yield`]).
 pub type YieldHook = std::sync::Arc<dyn Fn() + Send + Sync>;
 
+use crate::serve::cosched::Band;
+
+/// A render due `mine` (its launch's own `Due`), holding the device, yields between CFM steps
+/// when the best waiter outranks it ([`crate::serve::cosched::Due::outranks`] with a `margin_ns`
+/// slack margin) and is a first output or about to miss: never to decode, as the render thread is
+/// serial and every stream behind this launch waits out the yield.
+pub fn should_yield(
+    waiter: Option<crate::serve::cosched::Due>,
+    mine: &crate::serve::cosched::Due,
+    now: std::time::Instant,
+    margin_ns: i64,
+) -> bool {
+    waiter.is_some_and(|w| w.rank(now).0 <= Band::First && w.outranks(mine, now, margin_ns))
+}
+
+/// The `Due` a render takes (and takes back) the device by: at least a first output's band. The
+/// render thread is serial, so a stream that turns due while it waits (a first audio) waits
+/// behind this launch.
+pub fn serial_due(mine: crate::serve::cosched::Due) -> crate::serve::cosched::Due {
+    crate::serve::cosched::Due { band: mine.band.min(Band::First), ..mine }
+}
+
+/// [`should_yield`]'s margin: `PLOW_RENDER_YIELD_MARGIN_MS` (default 5 ms).
+pub fn yield_margin_ns() -> i64 {
+    (crate::config::RuntimeConfig::get().render_yield_margin_ms as i64).saturating_mul(1_000_000)
+}
+
+/// The render's turn and its launch's own `Due` (before [`serial_due`]) while a launch runs;
+/// empty between launches.
+pub type HeldTurn = std::sync::Arc<Mutex<Option<(crate::serve::cosched::Turn, crate::serve::cosched::Due)>>>;
+
+/// A yield hook handing the render's held turn to a tighter waiter ([`should_yield`]) and taking
+/// it back by [`serial_due`] before the next segment.
+pub fn turn_yield(dt: std::sync::Arc<crate::serve::cosched::DeviceTurn>, held: HeldTurn) -> YieldHook {
+    let margin = yield_margin_ns();
+    std::sync::Arc::new(move || {
+        let mut held = held.lock();
+        let Some((turn, due)) = held.as_mut() else { return };
+        let now = std::time::Instant::now();
+        if !should_yield(dt.tightest_waiter(), due, now, margin) {
+            return;
+        }
+        turn.release();
+        futures::executor::block_on(turn.take_due(&dt, serial_due(*due)));
+    })
+}
+
 /// A decode's PCM and, for a [`Window`], the source phase at its `next_seam`.
 pub struct Decoded {
     pub pcm: Vec<f32>,
@@ -489,5 +536,46 @@ fn run(rx: mpsc::Receiver<Job>, mut codec: Bound) {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_yield;
+    use crate::serve::cosched::{Band, Due};
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn render_yields_only_to_an_outranking_first_output_or_near_miss() {
+        let now = Instant::now();
+        let at = |ms: i64, band| Due {
+            deadline: if ms >= 0 { now + Duration::from_millis(ms as u64) } else { now - Duration::from_millis(-ms as u64) },
+            cost: Duration::ZERO,
+            band,
+        };
+        let m = 5_000_000;
+        let stream = at(100, Band::Stream);
+        assert!(!should_yield(None, &stream, now, m));
+        assert!(should_yield(Some(at(20, Band::Stream)), &stream, now, m), "about to miss");
+        assert!(!should_yield(Some(at(40, Band::Stream)), &stream, now, m), "decode, not urgent");
+        assert!(!should_yield(Some(at(200, Band::Stream)), &stream, now, m));
+        assert!(should_yield(Some(at(-50, Band::Stream)), &at(-10, Band::Stream), now, m), "both late: the later one first");
+        assert!(!should_yield(Some(at(-5, Band::Stream)), &at(-10, Band::Stream), now, m), "within the margin");
+        // A first output takes the device from window renders, not from an urgent one or a
+        // tighter first audio.
+        assert!(should_yield(Some(at(700, Band::First)), &stream, now, m));
+        assert!(!should_yield(Some(at(700, Band::First)), &at(20, Band::Stream), now, m));
+        assert!(!should_yield(Some(at(700, Band::First)), &at(400, Band::First), now, m));
+        assert!(!should_yield(Some(at(10, Band::Stream)), &at(5, Band::Stream), now, m));
+        assert!(!should_yield(Some(at(10, Band::Bulk)), &stream, now, m));
+        // A window render takes the device as a first output; a first output stays one.
+        assert_eq!(super::serial_due(stream).band, Band::First);
+        assert_eq!(super::serial_due(at(400, Band::First)).band, Band::First);
+        // An ASR final takes the device from any render that is not urgent; late, it competes with
+        // an urgent render by slack.
+        assert!(should_yield(Some(at(480, Band::Final)), &at(300, Band::First), now, m));
+        assert!(!should_yield(Some(at(480, Band::Final)), &at(20, Band::Stream), now, m));
+        assert!(!should_yield(Some(at(-10, Band::Final)), &at(-300, Band::Stream), now, m));
+        assert!(should_yield(Some(at(-300, Band::Final)), &at(-10, Band::Stream), now, m));
     }
 }

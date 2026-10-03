@@ -537,13 +537,6 @@ fn rule5_refuses_a_parent_whose_own_ladder_is_malformed() {
 // --- rule 6: budget ----------------------------------------------------------
 
 #[test]
-fn rule6_admits_what_fits_without_growing_anything() {
-    let p = parent();
-    let m = merge(&p, &[ext(&p)]).unwrap();
-    assert!(m.growth.grew.is_empty());
-}
-
-#[test]
 fn rule6_grows_the_vmm_pools_and_says_so() {
     let p = parent();
     let mut e = ext(&p);

@@ -6,11 +6,16 @@ accuracy gates (`[gates]`). Build and gate from a clean checkout; nothing else i
 
 | Recipe | Checkpoint (revision) | Serve env |
 |---|---|---|
-| `veena` | maya-research/Veena `8b770f9e` + hubertsiuzdak/snac_24khz `d73ad176` | multistep-adaptive, decode pipeline, per-rung Lt algos |
+| `veena` | maya-research/Veena `8b770f9e` + hubertsiuzdak/snac_24khz `d73ad176` | per-rung Lt algos |
 | `qwen3-asr` | Qwen/Qwen3-ASR-1.7B `7278e1e7` | defaults |
 | `chatterbox` | ResembleAI/chatterbox `5bb1f6ee` (`s3gen.safetensors`) | defaults |
 | `chatterbox-mtl` | ResembleAI/chatterbox `5bb1f6ee` (`t3_mtl23ls_v3`, `s3gen_v3`) | defaults |
-| `gemma-4-e4b` | google/gemma-4-E4B-it `ee0ef602` | multistep-adaptive, decode pipeline, per-rung Lt algos |
+| `gemma-4-e4b` | google/gemma-4-E4B-it `ee0ef602` | per-rung Lt algos |
+
+Scheduling is the runtime's default `auto` objective (`docs/flags-reference.md`, "Serving
+objective"): adaptive multistep and the lookahead-1 decode pipeline are derived, not set. A
+runtime older than the objective (the `plow_git` pin is the compiler commit that emitted the
+assets) needs `PLOW_MULTISTEP_ADAPTIVE=true PLOW_DECODE_PIPELINE=true` for Veena and E4B.
 
 ## Prerequisites (once per box)
 

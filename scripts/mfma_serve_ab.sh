@@ -16,7 +16,7 @@ BIN="${PLOW_BIN_DIR:-/app/plow/target-glm53/release}"
 mkdir -p "$OUT"
 
 serve_up() { # $1 objdir  $2 port  $3 logfile
-  PLOW_PF_BATCH=1 PLOW_PF_CHUNK=8192 PLOW_MULTISTEP=4 PLOW_TP_NO_AUDIT=1 \
+  PLOW_PF_CHUNK=8192 PLOW_MULTISTEP=4 PLOW_TP_NO_AUDIT=1 \
     "$ROOT/scripts/glm53_serve_inner.sh" "$ASSETS" "$2" "$1" "$BIN" > "$3" 2>&1 &
   SRV=$!
   for i in $(seq 1 240); do

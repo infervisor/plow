@@ -588,13 +588,21 @@ pub struct AttentionF32Stage<'a> {
 }
 
 /// A key prefix for [`AttentionF32Stage`]: item `b` first attends to the `rows` rows of block
-/// `index[b]` of `table` (`[blocks][rows][K | V]`, each `2 * heads * head_width` wide).
+/// `index[b]` of `table` (`[blocks][rows][K | V]`, each `2 * heads * head_width` wide, or with
+/// `h16` blocks of [`h16_prefix_floats`] written by [`StageProgram::format_prefix_h16`]).
 #[derive(Clone, Copy)]
 pub struct AttentionPrefix {
     pub table: u32,
     pub index: u32,
     pub blocks: u32,
     pub rows: u32,
+    pub h16: bool,
+}
+
+/// Floats of one block of a pre-formatted attention prefix (`AttentionF32` flag bit 4): per
+/// head, `rows / 16` (rounded up) tiles of 2072 (op_speech_f32.cuh SPH_XS).
+pub fn h16_prefix_floats(heads: u32, rows: u32) -> u64 {
+    u64::from(heads) * u64::from(rows.div_ceil(16)) * 2072
 }
 
 /// Several stages emitted into ONE program (one launch), ordered by explicit dependencies:
@@ -1225,6 +1233,31 @@ impl StageProgram {
         })
     }
 
+    /// [`DevOp::CopyColsF32`] format mode: `items` blocks of `rows` keys (`cols` = K | V of
+    /// `cols / 128` heads of width 64) from the column-copy source geometry into an attention
+    /// prefix table for [`AttentionPrefix::h16`]; block `b` at `b * out_item_stride + out_offset`
+    /// (`out_stride` unused).
+    pub fn format_prefix_h16(&mut self, x: u32, deps: &[u32], stage: CopyColsF32Stage<'_>) -> Result<Emitted, String> {
+        if stage.items == 0 || stage.rows == 0 || stage.cols == 0 || stage.cols % 128 != 0 {
+            return Err("invalid prefix-format geometry".into());
+        }
+        let heads = stage.cols / 128;
+        let block = h16_prefix_floats(heads, stage.rows);
+        if u64::from(stage.out_item_stride) < block {
+            return Err("prefix-format blocks overlap".into());
+        }
+        let span = strided_span(stage.items, stage.in_item_stride, stage.rows, stage.in_stride, stage.in_offset, stage.cols);
+        self.input(x, f32_bytes(span)?, "prefix-format source")?;
+        let span = u64::from(stage.out_offset) + u64::from(stage.items - 1) * u64::from(stage.out_item_stride) + block;
+        let output = self.resolve(stage.output, f32_bytes(span)?, "prefix-format output")?;
+        let units = product(&[stage.items, heads, stage.rows.div_ceil(16)])?.div_ceil(2);
+        self.emit(DevOp::CopyColsF32, units, deps, output, |d| {
+            d.t[..2].copy_from_slice(&[output, x]);
+            d.i = [stage.items, stage.rows, stage.cols, stage.in_stride, stage.in_offset, 0, stage.out_offset, 1];
+            d.j = [stage.in_item_stride, stage.out_item_stride];
+        })
+    }
+
     /// [`DevOp::Conv1dF32`], or [`DevOp::ConvTranspose1dF32`] with `transpose`.
     pub fn conv1d_f32(
         &mut self,
@@ -1528,7 +1561,15 @@ impl StageProgram {
             if stage.bias.is_some() || stage.causal || p.rows == 0 {
                 return Err("attention prefix: no bias or causal mask, and at least one row".into());
             }
-            self.input(p.table, f32_bytes(product(&[p.blocks, p.rows, 2 * width])?)?, "attention prefix")?;
+            if p.h16 && (stage.head_width != 64 || stage.q_rows.div_ceil(16) < 4) {
+                return Err("pre-formatted attention prefix: head_width 64 and at least 4 query tiles".into());
+            }
+            let floats = if p.h16 {
+                u64::from(p.blocks) * h16_prefix_floats(stage.heads, p.rows)
+            } else {
+                product(&[p.blocks, p.rows, 2 * width])?
+            };
+            self.input(p.table, f32_bytes(floats)?, "attention prefix")?;
             self.input(p.index, u64::from(stage.batch) * 4, "attention prefix index")?;
         }
         let bias = match stage.bias {
@@ -1575,7 +1616,11 @@ impl StageProgram {
                 stage.heads,
                 stage.head_width,
                 stage.in_stride,
-                u32::from(stage.causal) | (u32::from(tc) << 1) | (u32::from(stage.relative) << 2) | (stage.key_length_heads << 8),
+                u32::from(stage.causal)
+                    | (u32::from(tc) << 1)
+                    | (u32::from(stage.relative) << 2)
+                    | (u32::from(stage.prefix.is_some_and(|p| p.h16)) << 4)
+                    | (stage.key_length_heads << 8),
                 stage.prefix.map_or(stage.bias_head_stride, |p| p.rows),
             ];
             d.f[0] = stage.scale;
@@ -2247,6 +2292,54 @@ mod tests {
         assert_eq!(insts[3].j[1], 3);
         assert_eq!(insts[4].t[0], insts[4].t[1]);
         assert!(!prefix.model.to_blob().is_empty());
+    }
+
+    #[test]
+    fn h16_prefix_format_and_attention() {
+        let (b, rows, pre, heads) = (2u32, 72u32, 306u32, 8u32);
+        let width = heads * 64;
+        let block = u32::try_from(h16_prefix_floats(heads, pre)).unwrap();
+        let (prefix, h) = prefix_with(&[("qkv", u64::from(pre * 3 * width) * 4), ("idx", u64::from(b) * 4)]);
+        let mut p = prefix.program();
+        let copy = |output| CopyColsF32Stage {
+            output,
+            items: 2,
+            rows: pre,
+            cols: 2 * width,
+            in_item_stride: 0,
+            in_stride: 3 * width,
+            in_offset: width,
+            out_item_stride: block,
+            out_stride: 0,
+            out_offset: 0,
+        };
+        let f = p.format_prefix_h16(h[0], &[], copy(TensorRef::Named("cache"))).unwrap();
+        let attention = |rows, h16| AttentionF32Stage {
+            output: TensorRef::Named("ctx"),
+            key_lengths: None,
+            bias: None,
+            batch: b,
+            q_rows: rows,
+            kv_rows: rows,
+            heads,
+            head_width: 64,
+            in_stride: 3 * width,
+            k_col0: width,
+            v_col0: 2 * width,
+            causal: false,
+            scale: 0.125,
+            bias_head_stride: 0,
+            relative: false,
+            key_length_heads: 0,
+            prefix: Some(AttentionPrefix { table: f.output, index: h[1], blocks: 2, rows: pre, h16 }),
+        };
+        assert!(p.attention_f32(h[0], h[0], h[0], &[f.done], attention(48, true)).is_err());
+        p.attention_f32(h[0], h[0], h[0], &[f.done], attention(rows, true)).unwrap();
+        let prefix = p.finish(0);
+        let insts = &prefix.model.progs[0].insts;
+        assert_eq!(prefix.model.tensors[f.output as usize].bytes, 2 * u64::from(block) * 4);
+        assert_eq!((DevOp::from_u16(insts[0].op), insts[0].i[7]), (Some(DevOp::CopyColsF32), 1));
+        assert_eq!(insts[1].i[6], 2 | 16);
     }
 
     #[test]

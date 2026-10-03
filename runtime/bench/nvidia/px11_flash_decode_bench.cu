@@ -47,6 +47,7 @@ static float rnd() { rng_s ^= rng_s<<13; rng_s ^= rng_s>>17; rng_s ^= rng_s<<5;
     return (float)((int32_t)rng_s) / 2147483648.0f; }
 
 static int g_sm = 170;
+static unsigned g_grid_mult = 1;
 
 /* ------------------------------------------------------------------ rung 0/1/2: stream probes */
 /* All three read exactly `nbytes` from `p` per launch, with __ldcs (what the KV path uses).
@@ -257,7 +258,8 @@ static double run_fd(const Class& c, bool fp8, int B, unsigned ctx, unsigned str
     CK(cudaMalloc(&dO ,(size_t)B*c.NH*D*2));
 
     const size_t smem=(size_t)FA_DEC_SMEM_FLOATS(D,GF)*sizeof(float);
-    const unsigned grid = (n_work < (unsigned)g_sm) ? n_work : (unsigned)g_sm;
+    const unsigned cap = (unsigned)g_sm * g_grid_mult;
+    const unsigned grid = (n_work < cap) ? n_work : cap;
     auto lf=[&](){
         if (fp8) k_fd_fp8<D,GF><<<grid,256,smem>>>(dOp,dMl,g_p.q,(bf16*)g_p.k8,(bf16*)g_p.v8,
             g_p.len,(unsigned)B,c.NH,c.NKV,stride,(unsigned)c.window,scale,nsplit,mask,g_p.ks,g_p.vs);
@@ -384,9 +386,18 @@ static void ceiling(size_t nbytes, int iters){
 int main(int argc, char** argv){
     const char* mode = argc>1?argv[1]:"all";
     int iters = argc>2?atoi(argv[2]):30;
+    if (const char* e = getenv("PX11_GRID_MULT")) {
+        char* end = nullptr;
+        const unsigned long n = strtoul(e, &end, 10);
+        if (!*e || *end || n < 1 || n > 8) {
+            fprintf(stderr,"PX11_GRID_MULT must be an integer from 1 to 8\n");
+            return 2;
+        }
+        g_grid_mult = (unsigned)n;
+    }
     cudaDeviceProp p; CK(cudaGetDeviceProperties(&p,0)); g_sm=p.multiProcessorCount;
     printf("# device %s, SMs %d, iters %d\n", p.name, g_sm, iters);
-    printf("# knobs: FA_KUN=%d FA_WPR=%d FA_WPR_RB=%d FA_QGLOB=%d FA_REDBOUND=%d"
+    printf("# knobs: FA_KUN=%d FA_WPR=%d FA_WPR_RB=%d FA_QGLOB=%d FA_REDBOUND=%d GRID_MULT=%u"
 #ifdef PLOW_FP8_LD16
            " FP8_LD16=1"
 #endif
@@ -394,7 +405,7 @@ int main(int argc, char** argv){
            " FP8_FAST=1"
 #endif
            "\n", PLOW_NV_FA_KUN, PLOW_NV_FA_WPR, PLOW_NV_FA_WPR_RB,
-           PLOW_NV_FA_QGLOB, PLOW_NV_FA_REDBOUND);
+           PLOW_NV_FA_QGLOB, PLOW_NV_FA_REDBOUND, g_grid_mult);
 
     if (!strcmp(mode,"ceil") || !strcmp(mode,"all")) {
         size_t ws = (size_t)2048*1024*1024ull;              /* 2 GB, the in-tree HBM protocol */
@@ -405,16 +416,26 @@ int main(int argc, char** argv){
 
     /* --------- the real kernel, per layer class --------- */
     const char* cls = getenv("PX11_CLASS"); if (!cls) cls="full";
-    const Class& c = strcmp(cls,"slide")==0 ? C_SLIDE : C_FULL;
+    Class c = strcmp(cls,"slide")==0 ? C_SLIDE : C_FULL;
+    if (c.ring && getenv("PX11_RING")) {
+        c.ring = atoi(getenv("PX11_RING"));
+        if (c.ring < c.window || (c.ring & (c.ring - 1))) {
+            fprintf(stderr,"PX11_RING must be a power of two at least as large as the window\n");
+            return 2;
+        }
+    }
     const int B    = getenv("PX11_B")   ? atoi(getenv("PX11_B"))   : 8;
     const unsigned ctx = getenv("PX11_CTX") ? (unsigned)atoi(getenv("PX11_CTX")) : 131072u;
     const unsigned stride = c.ring ? (unsigned)c.ring : ctx;
     const unsigned mask   = c.ring ? (unsigned)(c.ring-1) : 0xFFFFFFFFu;
     const unsigned span   = c.window ? (ctx < (unsigned)c.window ? ctx : (unsigned)c.window) : ctx;
+    const double bw_ceiling = getenv("PX11_BW_GBPS") ? atof(getenv("PX11_BW_GBPS")) : 1695.6;
+    if (bw_ceiling <= 0) { fprintf(stderr,"PX11_BW_GBPS must be positive\n"); return 2; }
 
     g_do_flush = getenv("PX11_FLUSH") && atoi(getenv("PX11_FLUSH"));
     printf("# class=%s D=%d NH=%d NKV=%d gqa=%d window=%d ring=%u B=%d ctx=%u span=%u l2flush=%d\n",
            c.name,c.D,c.NH,c.NKV,c.NH/c.NKV,c.window,stride,B,ctx,span,(int)g_do_flush);
+    printf("# bandwidth ceiling %.1f GB/s%s\n",bw_ceiling,getenv("PX11_BW_GBPS")?" (supplied)":" (legacy default)");
     pool_alloc(c,B,stride);
     if (g_do_flush) CK(cudaMalloc(&g_flush,g_flush_bytes));
 
@@ -452,7 +473,7 @@ int main(int argc, char** argv){
                 printf("%-5s %-3d %-6u %-8u | %10.4f | %10.1f %10.1f | %7.1f %7.1f | %.3e\n",
                        fp8?"fp8":"bf16",GF,ns,nw,ms,
                        phys/(ms*1e-3)/1e9, iss/(ms*1e-3)/1e9,
-                       100.0*(phys/(ms*1e-3)/1e9)/1695.6, iss/phys, md);
+                       100.0*(phys/(ms*1e-3)/1e9)/bw_ceiling, iss/phys, md);
                 /* Cross-ARM numerics gate: PLOW_FP8_FAST/LD16 change the dequant rounding, so
                  * they are NOT bit-exact against the shipped path and need a measured bound. */
                 if (const char* dp = getenv("PX11_DUMP")) {

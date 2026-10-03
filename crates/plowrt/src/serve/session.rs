@@ -17,35 +17,151 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 pub const REQUEST_HEADER: HeaderName = HeaderName::from_static("x-request-id");
 pub const SESSION_HEADER: HeaderName = HeaderName::from_static("x-session-id");
+pub const TURN_ID_HEADER: HeaderName = HeaderName::from_static("x-turn-id");
+pub const TURN_BUDGET_HEADER: HeaderName = HeaderName::from_static("x-turn-budget-ms");
+pub const PLAYBACK_HEADER: HeaderName = HeaderName::from_static("x-playback");
+const TRACEPARENT_HEADER: HeaderName = HeaderName::from_static("traceparent");
 const MAX_ID_BYTES: usize = 128;
+/// OpenRouter's `session_id` limit.
+const MAX_SESSION_BYTES: usize = 256;
 
-/// One request's identity: its id (the client's `X-Request-Id`, or generated) and its session.
+/// A W3C trace context the client sent (`traceparent`, or body `trace`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TraceParent {
+    pub trace_id: u128,
+    /// The caller's span (0: none given).
+    pub parent: u64,
+    pub flags: u8,
+}
+
+impl TraceParent {
+    /// `version-traceid-parentid-flags`, lowercase hex. Invalid → `None` (W3C: restart the trace).
+    pub fn parse(value: &str) -> Option<Self> {
+        let tc = svid::TraceContext::parse(value.trim()).ok()?;
+        Some(Self { trace_id: tc.trace_id.as_u128(), parent: tc.parent_id.as_u64(), flags: tc.flags })
+    }
+
+    /// OpenRouter's body `trace` object: `trace_id` (32 hex) and `parent_span_id` (16 hex).
+    fn from_body(trace: &serde_json::Value) -> Option<Self> {
+        let field = |k: &str, len: usize| {
+            trace.get(k)?.as_str().map(str::trim).filter(|s| s.len() == len && s.bytes().all(|c| c.is_ascii_hexdigit()))
+        };
+        let trace_id = u128::from_str_radix(field("trace_id", 32)?, 16).ok().filter(|&x| x != 0)?;
+        let parent = field("parent_span_id", 16).and_then(|p| u64::from_str_radix(p, 16).ok()).unwrap_or(0);
+        Some(Self { trace_id, parent, flags: 0 })
+    }
+}
+
+/// Body fields that route a request (OpenRouter-compatible); flattened into the request DTOs.
+#[derive(Clone, Debug, Default, serde::Deserialize)]
+pub struct RouteFields {
+    #[serde(default)]
+    pub session_id: Option<String>,
+    /// Accepted for OpenAI compatibility; never a session: one fixed key is shared by many users.
+    #[serde(default)]
+    pub prompt_cache_key: Option<String>,
+    /// OpenAI `metadata`; `turn_id` and `turn_budget_ms` are read.
+    #[serde(default)]
+    pub metadata: Option<serde_json::Map<String, serde_json::Value>>,
+    #[serde(default)]
+    pub trace: Option<serde_json::Value>,
+}
+
+/// One request's identity: its id (the client's `X-Request-Id`, or generated), its session, and
+/// its turn and trace context.
 #[derive(Clone, Debug)]
 pub struct RequestIds {
     pub request: Arc<str>,
     pub session: Option<Arc<str>>,
+    pub trace: Option<TraceParent>,
+    /// The client's turn id (`X-Turn-Id` / `metadata.turn_id`); `None` = inferred per session.
+    pub turn: Option<Arc<str>>,
+    pub budget_ms: Option<u32>,
+    pub playback: Option<crate::serve::turns::Playback>,
+    /// The turn this request joined (`serve::turns::StageRun::start`), for the mux job.
+    pub turn_key: Option<crate::serve::turns::TurnKey>,
+}
+
+/// An id of 1..=`max` visible ASCII bytes.
+fn valid_id(value: &str, max: usize) -> bool {
+    !value.is_empty() && value.len() <= max && value.bytes().all(|b| b.is_ascii_graphic())
+}
+
+fn budget_ms(value: &str) -> Option<u32> {
+    value.trim().parse::<u32>().ok().filter(|&ms| (1..=600_000).contains(&ms))
 }
 
 impl RequestIds {
-    /// Read both headers. An id must be 1..=128 visible ASCII bytes.
+    /// Read the identity headers. A request or turn id must be 1..=128 visible ASCII bytes, a
+    /// session id 1..=256. An invalid `traceparent` or `X-Playback` is ignored.
     pub fn from_headers(headers: &HeaderMap) -> Result<Self, String> {
-        let read = |name: &HeaderName| -> Result<Option<Arc<str>>, String> {
+        let read = |name: &HeaderName, max: usize| -> Result<Option<Arc<str>>, String> {
             let Some(value) = headers.get(name) else { return Ok(None) };
             let value = value.to_str().map_err(|_| format!("{name} must be visible ASCII"))?.trim();
-            if value.is_empty() || value.len() > MAX_ID_BYTES || !value.bytes().all(|b| b.is_ascii_graphic()) {
-                return Err(format!("{name} must be 1..={MAX_ID_BYTES} visible ASCII characters"));
+            if !valid_id(value, max) {
+                return Err(format!("{name} must be 1..={max} visible ASCII characters"));
             }
             Ok(Some(value.into()))
         };
+        let text = |name: &HeaderName| headers.get(name).and_then(|v| v.to_str().ok());
+        let budget_ms = match text(&TURN_BUDGET_HEADER) {
+            Some(v) => Some(budget_ms(v).ok_or_else(|| format!("{TURN_BUDGET_HEADER} must be 1..=600000 ms"))?),
+            None => None,
+        };
         Ok(Self {
-            request: read(&REQUEST_HEADER)?.unwrap_or_else(|| generate_id().into()),
-            session: read(&SESSION_HEADER)?,
+            request: read(&REQUEST_HEADER, MAX_ID_BYTES)?.unwrap_or_else(|| generate_id().into()),
+            session: read(&SESSION_HEADER, MAX_SESSION_BYTES)?,
+            trace: text(&TRACEPARENT_HEADER).and_then(TraceParent::parse),
+            turn: read(&TURN_ID_HEADER, MAX_ID_BYTES)?,
+            budget_ms,
+            playback: text(&PLAYBACK_HEADER).and_then(crate::serve::turns::Playback::parse),
+            turn_key: None,
         })
+    }
+
+    /// Body fallbacks, OpenRouter precedence: session = body `session_id` > `X-Session-Id`; trace = `traceparent` > body `trace`; turn and budget = header > body
+    /// `metadata.turn_id` / `metadata.turn_budget_ms`. An invalid body `session_id` is an error;
+    /// the other body fields are hints and are ignored when invalid.
+    pub fn apply_body(&mut self, body: &RouteFields) -> Result<(), String> {
+        if let Some(s) = &body.session_id {
+            let s = s.trim();
+            if !valid_id(s, MAX_SESSION_BYTES) {
+                return Err(format!("session_id must be 1..={MAX_SESSION_BYTES} visible ASCII characters"));
+            }
+            self.session = Some(s.into());
+        }
+        if self.trace.is_none() {
+            self.trace = body.trace.as_ref().and_then(TraceParent::from_body);
+        }
+        let meta = |k: &str| -> Option<String> {
+            match body.metadata.as_ref()?.get(k)? {
+                serde_json::Value::String(s) => Some(s.trim().to_owned()),
+                serde_json::Value::Number(n) => Some(n.to_string()),
+                _ => None,
+            }
+        };
+        if self.turn.is_none() {
+            self.turn = meta("turn_id").filter(|t| valid_id(t, MAX_ID_BYTES)).map(Into::into);
+        }
+        if self.budget_ms.is_none() {
+            self.budget_ms = meta("turn_budget_ms").as_deref().and_then(budget_ms);
+        }
+        Ok(())
+    }
+
+    /// The client's turn budget.
+    pub fn budget(&self) -> Option<Duration> {
+        self.budget_ms.map(|ms| Duration::from_millis(u64::from(ms)))
     }
 
     /// A generated request id and no session.
     pub fn generated() -> Self {
-        Self { request: generate_id().into(), session: None }
+        Self { request: generate_id().into(), session: None, trace: None, turn: None, budget_ms: None, playback: None, turn_key: None }
+    }
+
+    /// The same identity under a fresh request id (one request of a multi-request connection).
+    pub fn with_new_request(&self) -> Self {
+        Self { request: generate_id().into(), turn_key: None, ..self.clone() }
     }
 
     /// The response headers echoing this identity.
@@ -135,10 +251,12 @@ pub struct CacheOutcome {
     pub status: CacheStatus,
     /// Prompt rows resumed instead of prefilled.
     pub rows: usize,
+    /// When the request was admitted to a slot (`None`: never admitted).
+    pub at: Option<Instant>,
 }
 
 impl CacheOutcome {
-    pub const OFF: Self = Self { status: CacheStatus::Off, rows: 0 };
+    pub const OFF: Self = Self { status: CacheStatus::Off, rows: 0, at: None };
 
     /// `X-Session-Cache` and `X-Session-Cached-Tokens`.
     pub fn stamp(&self, response: &mut axum::response::Response) {
@@ -189,23 +307,52 @@ impl Drop for InFlight {
     }
 }
 
-/// uuid-v4-shaped, from the clock, a counter and the process id through a 64-bit mixer.
 fn generate_id() -> String {
-    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_nanos() as u64);
-    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let a = mix(nanos ^ mix(seq) ^ (u64::from(std::process::id()) << 32));
-    let b = mix(a ^ seq.rotate_left(17) ^ 0x5851_f42d_4c95_7f2d);
-    format!(
-        "{:08x}-{:04x}-4{:03x}-{:04x}-{:012x}",
-        a >> 32,
-        (a >> 16) & 0xffff,
-        a & 0xfff,
-        0x8000 | (b >> 48) & 0x3fff,
-        b & 0xffff_ffff_ffff
-    )
+    minted::request()
+}
+
+/// Ids the server mints when the client sent none: svids (time-sortable 64-bit, tagged by kind,
+/// server source). Strings are the fixed 11-char base58 form. Client ids are never parsed.
+pub mod minted {
+    use std::sync::OnceLock;
+
+    #[derive(svid::Svid, Clone, Copy, Debug, PartialEq, Eq)]
+    #[svid(registry = IdRegistry)]
+    #[repr(u8)]
+    pub enum IdTag {
+        RequestId = 1,
+        SessionId = 2,
+        TurnId = 3,
+    }
+
+    fn registry() -> &'static IdRegistry {
+        static R: OnceLock<IdRegistry> = OnceLock::new();
+        R.get_or_init(|| IdRegistry::new(false))
+    }
+
+    pub fn request() -> String {
+        registry().request_id.generate_id().to_str()
+    }
+
+    pub fn session() -> String {
+        registry().session_id.generate_id().to_str()
+    }
+
+    /// A turn id: the svid and its string.
+    pub fn turn() -> (i64, String) {
+        let id = registry().turn_id.generate_id();
+        (id.to_i64(), id.to_str())
+    }
+
+    /// A W3C span id: 64 CSPRNG bits, never zero.
+    pub fn span() -> u64 {
+        svid::SpanId64::generate().as_u64()
+    }
+
+    /// A W3C trace id: a turn svid (sorts by time) over 64 CSPRNG bits.
+    pub fn trace_id(turn: i64) -> u128 {
+        (u128::from(turn as u64) << 64) | u128::from(rand::random::<u64>())
+    }
 }
 
 /// `PLOW_SESSION_TTL_MS`: how long a finished session request's KV stays retained (0: never).
@@ -409,7 +556,7 @@ impl RetainTable {
             (false, true) => CacheStatus::Evicted,
             (false, false) => CacheStatus::Miss,
         };
-        CacheOutcome { status, rows: resumed }
+        CacheOutcome { status, rows: resumed, at: None }
     }
 
     pub fn enabled(&self) -> bool {
@@ -572,7 +719,7 @@ impl Retention {
         let mut ticket = ticket?;
         if let Some(ttl) = self.prefix_pin {
             if let Some(report) = ticket.report.take() {
-                let _ = report.send(CacheOutcome { status: CacheStatus::Prefix, rows: 0 });
+                let _ = report.send(CacheOutcome { status: CacheStatus::Prefix, rows: 0, at: Some(Instant::now()) });
             }
             return Some(Seat::pinned(ticket, slot, ttl));
         }
@@ -589,7 +736,7 @@ impl Retention {
             CacheStatus::Prefix | CacheStatus::Off => {}
         }
         if let Some(report) = ticket.report.take() {
-            let _ = report.send(outcome);
+            let _ = report.send(CacheOutcome { at: Some(Instant::now()), ..outcome });
         }
         self.table.enabled().then(|| Seat::new(ticket, slot, pair, speech, self.inbox.clone()))
     }
@@ -748,7 +895,7 @@ mod tests {
 
     #[test]
     fn duplicate_request_ids_are_refused_only_while_in_flight_in_the_same_session() {
-        let ids = |r: &str, s: Option<&str>| RequestIds { request: r.into(), session: s.map(Into::into) };
+        let ids = |r: &str, s: Option<&str>| RequestIds { request: r.into(), session: s.map(Into::into), ..RequestIds::generated() };
         let first = ids("r1", Some("dup-s")).begin("m").expect("first");
         assert!(ids("r1", Some("dup-s")).begin("m").is_none());
         assert!(ids("r1", Some("dup-s")).begin("other-model").is_some());
@@ -763,14 +910,82 @@ mod tests {
     fn ids_are_read_validated_and_generated() {
         let mut h = HeaderMap::new();
         let got = RequestIds::from_headers(&h).unwrap();
-        assert_eq!(got.request.len(), 36);
+        assert_eq!(got.request.len(), 11);
         assert!(got.session.is_none());
         assert_ne!(RequestIds::generated().request, RequestIds::generated().request);
         h.insert(REQUEST_HEADER, HeaderValue::from_static("abc"));
         h.insert(SESSION_HEADER, HeaderValue::from_static("s-1"));
         let got = RequestIds::from_headers(&h).unwrap();
         assert_eq!((&*got.request, got.session.as_deref()), ("abc", Some("s-1")));
-        h.insert(SESSION_HEADER, HeaderValue::from_str(&"x".repeat(129)).unwrap());
+        h.insert(SESSION_HEADER, HeaderValue::from_str(&"x".repeat(256)).unwrap());
+        assert!(RequestIds::from_headers(&h).is_ok());
+        h.insert(SESSION_HEADER, HeaderValue::from_str(&"x".repeat(257)).unwrap());
         assert!(RequestIds::from_headers(&h).is_err());
+        h.remove(SESSION_HEADER);
+        h.insert(TURN_BUDGET_HEADER, HeaderValue::from_static("soon"));
+        assert!(RequestIds::from_headers(&h).is_err());
+    }
+
+    #[test]
+    fn traceparent_parses_w3c_and_rejects_invalid() {
+        let t = TraceParent::parse("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01").unwrap();
+        assert_eq!(t.trace_id, 0x4bf92f3577b34da6a3ce929d0e0e4736);
+        assert_eq!((t.parent, t.flags), (0x00f067aa0ba902b7, 1));
+        for bad in [
+            "00-00000000000000000000000000000000-00f067aa0ba902b7-01",
+            "00-4bf92f3577b34da6a3ce929d0e0e4736-0000000000000000-01",
+            "00-4BF92F3577B34DA6A3CE929D0E0E4736-00f067aa0ba902b7-01",
+            "ff-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+            "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01-extra",
+            "00-4bf92f3577b34da6a3ce929d0e0e473-00f067aa0ba902b7-01",
+            "",
+        ] {
+            assert_eq!(TraceParent::parse(bad), None, "{bad}");
+        }
+        // A later version may carry more fields.
+        assert!(TraceParent::parse("01-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01-xyz").is_some());
+    }
+
+    #[test]
+    fn body_fields_follow_openrouter_precedence() {
+        let body = |v: serde_json::Value| serde_json::from_value::<RouteFields>(v).unwrap();
+        let mut h = HeaderMap::new();
+        h.insert(SESSION_HEADER, HeaderValue::from_static("hdr"));
+        h.insert(TURN_ID_HEADER, HeaderValue::from_static("t-hdr"));
+        h.insert(
+            HeaderName::from_static("traceparent"),
+            HeaderValue::from_static("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"),
+        );
+        // body session_id > X-Session-Id; headers > metadata; traceparent > body trace.
+        let mut ids = RequestIds::from_headers(&h).unwrap();
+        ids.apply_body(&body(serde_json::json!({
+            "session_id": "body", "prompt_cache_key": "pck",
+            "metadata": {"turn_id": "t-body", "turn_budget_ms": "900"},
+            "trace": {"trace_id": "0af7651916cd43dd8448eb211c80319c", "parent_span_id": "b7ad6b7169203331"},
+        })))
+        .unwrap();
+        assert_eq!(ids.session.as_deref(), Some("body"));
+        assert_eq!(ids.turn.as_deref(), Some("t-hdr"));
+        assert_eq!(ids.trace.unwrap().trace_id, 0x4bf92f3577b34da6a3ce929d0e0e4736);
+        assert_eq!(ids.budget(), Some(Duration::from_millis(900)));
+        // Body trace and metadata when no headers.
+        let mut h2 = HeaderMap::new();
+        h2.insert(SESSION_HEADER, HeaderValue::from_static("hdr"));
+        let mut ids = RequestIds::from_headers(&h2).unwrap();
+        ids.apply_body(&body(serde_json::json!({
+            "prompt_cache_key": "pck", "metadata": {"turn_id": 3},
+            "trace": {"trace_id": "0af7651916cd43dd8448eb211c80319c", "parent_span_id": "b7ad6b7169203331"},
+        })))
+        .unwrap();
+        assert_eq!(ids.session.as_deref(), Some("hdr"));
+        assert_eq!(ids.turn.as_deref(), Some("3"));
+        let t = ids.trace.unwrap();
+        assert_eq!((t.trace_id, t.parent), (0x0af7651916cd43dd8448eb211c80319c, 0xb7ad6b7169203331));
+        // prompt_cache_key is no session; an invalid body session_id is refused.
+        let mut ids = RequestIds::from_headers(&HeaderMap::new()).unwrap();
+        ids.apply_body(&body(serde_json::json!({"prompt_cache_key": "pck"}))).unwrap();
+        assert_eq!(ids.session, None);
+        assert!(ids.apply_body(&body(serde_json::json!({"session_id": "has space"}))).is_err());
+        assert!(ids.apply_body(&body(serde_json::json!({"session_id": "x".repeat(257)}))).is_err());
     }
 }
