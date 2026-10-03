@@ -268,6 +268,7 @@ pub struct TensorDecl {
 /// Use `Fine` **only** where the dependency really is sparse. On an all-to-all edge it is
 /// strictly worse: the producer would have to bump one counter per consumer slice
 /// (256 × 256 atomics) to say what a single coarse counter says with one.
+#[derive(Clone)]
 pub enum Dep {
     /// Wait for all `blocks` workgroups of the producer.
     Coarse(u32),
@@ -1180,6 +1181,29 @@ impl Builder {
             work,
         });
         counter
+    }
+
+    /// Emit another copy of op `counter` (same instruction, slices, work and isolation) gated
+    /// behind `deps`. `f` adjusts the copy's instruction.
+    pub fn repeat(&mut self, counter: u32, deps: Vec<Dep>, f: impl FnOnce(&mut DevInst)) -> u32 {
+        let src = &self.ops[counter as usize];
+        let (op, cus, work, isolated) =
+            (src.inst.op, src.cus.clone(), src.work.clone(), src.isolated);
+        let inst = src.inst;
+        let op = DevOp::from_u16(op).expect("emitted opcode");
+        let c = self.emit_dep(op, cus, deps, |d| {
+            *d = inst;
+            f(d);
+        });
+        let new = &mut self.ops[c as usize];
+        new.work = work;
+        new.isolated = isolated;
+        c
+    }
+
+    /// The dependencies op `counter` was emitted with.
+    pub fn deps_of(&self, counter: u32) -> Vec<Dep> {
+        self.ops[counter as usize].deps.clone()
     }
 
     /// As [`Builder::emit_dep`], but supplying the per-slice cost the cost model predicts.

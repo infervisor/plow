@@ -312,6 +312,26 @@ What this does not yet show is the serving cost: a 1024-row request cap makes
 long prompts arrive as more, smaller packed chunks. Emit-verified, not yet
 benchmarked.
 
+**Staged sliding prefill (`PLOW_STAGE_ROWS`) removes that cost.** With a request
+chunk above the window-derived default chunk, the emitter keeps the ring at
+`next_pow2(window + stage - 1)` (window 1024: stage 1024, ring 2048) and, in every
+bucket wider than a stage, emits each sliding layer's K/V write and attention once
+per stage: `W_0 R_0 W_1 R_1 ...`, each attention in its own segment and each write
+gated on the previous stage's attention. The projections, norms and MLP still run
+the whole launch. Stage `k` binds its own slot mask (`stage_slots`, rows outside
+the stage are `-1`) and span table (`plan_stage`, the request's rows
+`[k*S, (k+1)*S)` with `kvlen` at the stage end), so each write wraps at most one
+stage onto history no later query reads; the ring's contents after the launch
+equal those of sequential stage-sized launches, which is what decode, riders and
+prefix snapshots read. The runtime binds stages by position
+(`packed_prefill::stage_map`; `Manifest::validate` proves the interleaving and
+segment order) and uploads every stage's tables with the launch's. Full-attention
+layers are unstaged. Riders write in stage 0 and attend after its attention;
+unpacked prefill is held to one stage. A prefix boundary is still publishable only
+within `ring - window` rows of a slice's end, so a slice is cut to keep a shared
+prefix end inside that slack (`pf_publish_cap`). `PLOW_STAGE_ROWS=0` restores a
+ring sized for the whole request chunk.
+
 ---
 
 ## 7. Slots, and who owns the memory
@@ -558,6 +578,7 @@ latent cache, not to this dense head-major cache.
 |---|---|---|
 | `PLOW_MAX_CHUNK` | `next_pow2(window)` | Prefill chunk; sets the sliding ring and the bucket ladder top |
 | `PLOW_MAX_REQUEST_CHUNK` | = `PLOW_MAX_CHUNK` | Per-request cap; enables masked padding and shrinks the ring independently |
+| `PLOW_STAGE_ROWS` | window-derived chunk when the request chunk exceeds it | Rows per sliding-layer stage of a packed launch; the ring holds `window + stage - 1`. `0` = unstaged |
 | `PLOW_FP8_KV` | off | e4m3 cache with per-row scales |
 | `PLOW_PREFIX_CACHE` | on | Master switch for all prefix reuse |
 | `PLOW_VMM_PREFIX` | unset = auto | Force VMM prefix reuse on or off, bypassing the allowlist |

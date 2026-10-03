@@ -10,7 +10,9 @@
 //!              [--max-inst N | --max-segments N]
 //! `--same` feeds every slot the SAME prompt and reports how many slots' greedy
 //! streams agree with slot 0 (a within-batch consistency check). `--packed-prefill`
-//! initializes prompts through packed request chunks and the compact terminal.
+//! initializes prompts through packed request chunks and the compact terminal, printing each
+//! launch's wall ms; `--pf-chunk N` caps the per-request slice below the packet's request chunk and
+//! `--pf-reps N` repeats the whole packed prefill (the first pass pays graph capture).
 //! `--dump-tensors`
 //! writes the named tensors raw after the last step (block_run's format), which
 //! with `--max-inst N`, one step and zero warmup gives partial decode activations.
@@ -56,6 +58,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut same = false;
     let mut multistep = false;
     let mut packed_prefill = false;
+    let mut pf_chunk = usize::MAX;
+    let mut pf_reps = 1usize;
     let mut warmup = 16usize;
     let mut sweep: Option<(u32, u32)> = None;
     let mut max_inst: Option<u32> = None;
@@ -70,6 +74,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "--max-inst" => max_inst = Some(args.next().ok_or("--max-inst N")?.parse()?),
             "--same" => same = true,
             "--packed-prefill" => packed_prefill = true,
+            "--pf-chunk" => pf_chunk = args.next().ok_or("--pf-chunk N")?.parse()?,
+            "--pf-reps" => pf_reps = args.next().ok_or("--pf-reps N")?.parse()?,
             "--multistep" => multistep = true,
             "--warmup" => warmup = args.next().ok_or("--warmup N")?.parse()?,
             // `--sweep LO..HI`: time decode steps with instruction caps LO..=HI in this process.
@@ -160,38 +166,45 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             return Err("--packed-prefill requires nonempty prompts, packed prefill and compact terminal".into());
         }
         let prompts: Vec<_> = (0..slots).map(prompt_for).collect();
-        for b in 0..slots {
-            e.begin_slot(b, ctx + steps + 1)?;
-            if let Some(histories) = &mut histories {
-                histories[b] = prompts[b].clone();
-            }
-        }
-        let chunk = e.pf_request_max_rows().min(e.pf_max_rows());
+        let chunk = e.pf_request_max_rows().min(e.pf_max_rows()).min(pf_chunk);
         if chunk == 0 {
             return Err("packed prefill has no chunk capacity".into());
         }
         let width = e.pf_max_rows() / chunk;
         let mut completed = Vec::new();
-        let t0 = Instant::now();
-        for c0 in (0..ctx).step_by(chunk) {
-            let len = chunk.min(ctx - c0);
-            for first in (0..slots).step_by(width) {
-                let end = (first + width).min(slots);
-                let requests: Vec<_> = (first..end).map(|slot| PfBatchReq {
-                    slot, prompt: &prompts[slot], c0, len,
-                }).collect();
-                println!("packed prefill: prefix={c0} chunk_rows={len} requests={} rows={}",
-                         requests.len(), requests.len() * len);
-                e.prefill_batched_complete(&requests, &mut completed)?;
-                if c0 + len == ctx && completed.len() != requests.len() {
-                    return Err("packed prefill did not complete every request".into());
+        for rep in 0..pf_reps.max(1) {
+            for b in 0..slots {
+                if rep > 0 {
+                    e.retire_slot(b, false);
                 }
-                for &(slot, token) in &completed {
-                    last[slot] = token;
+                e.begin_slot(b, ctx + steps + 1)?;
+                if let Some(histories) = &mut histories {
+                    histories[b] = prompts[b].clone();
                 }
             }
+            let t0 = Instant::now();
+            for c0 in (0..ctx).step_by(chunk) {
+                let len = chunk.min(ctx - c0);
+                for first in (0..slots).step_by(width) {
+                    let end = (first + width).min(slots);
+                    let requests: Vec<_> = (first..end).map(|slot| PfBatchReq {
+                        slot, prompt: &prompts[slot], c0, len,
+                    }).collect();
+                    let t = Instant::now();
+                    e.prefill_batched_complete(&requests, &mut completed)?;
+                    println!("packed prefill: rep={rep} prefix={c0} chunk_rows={len} requests={} rows={} ms={:.3}",
+                             requests.len(), requests.len() * len, t.elapsed().as_secs_f64() * 1e3);
+                    if c0 + len == ctx && completed.len() != requests.len() {
+                        return Err("packed prefill did not complete every request".into());
+                    }
+                    for &(slot, token) in &completed {
+                        last[slot] = token;
+                    }
+                }
+            }
+            println!("packed prompts consumed in {:.4} s (rep {rep}, first tokens {:?})",
+                     t0.elapsed().as_secs_f64(), &last[..slots.min(8)]);
         }
-        println!("packed prompts consumed in {:.4} s", t0.elapsed().as_secs_f64());
     } else {
         for b in 0..slots {
             let prompt = prompt_for(b);

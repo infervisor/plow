@@ -49,6 +49,12 @@ const GLM_RECIPE_PF_EXT: Status = Status::Qualified {
         "crates/devgen/src/emit_config.rs GLM_GEMM_LT_PF_EXT_QUALIFIED: router excluded, review log #65",
     ],
 };
+/// Unset stages a packed sliding prefill whose request chunk exceeds the window-derived chunk.
+const STAGE_ROWS: Status = Status::Qualified {
+    evidence: &[
+        "docs/flags-reference.md PLOW_STAGE_ROWS: Gemma-4 12B H100 request chunk 4096 staged at 1024 keeps the 2048-row ring; `=0` is the rollback",
+    ],
+};
 const DECODE_LADDER: Status = Status::Qualified {
     evidence: &[
         "crates/devgen/src/lib.rs apply_production_defaults: gfx942 MM=16 object costs c=8 -27.5%; the ladder stops at 8",
@@ -600,7 +606,10 @@ const C_SEQ_PAR_PROJ: &[Constraint] = &[Constraint {
 const C_STAGE_ROWS: &[Constraint] = &[Constraint {
     id: "stage_rows_requires_max_request_chunk",
     formula: F::Implies(
-        &F::Atom("emit.stage_rows", Cmp::Ne, Val::Unset),
+        &F::And(&[
+            F::Atom("emit.stage_rows", Cmp::Ne, Val::Unset),
+            F::Atom("emit.stage_rows", Cmp::Ne, Val::Nat(0)),
+        ]),
         &F::Atom("emit.max_request_chunk", Cmp::Ne, Val::Unset),
     ),
     site: "crates/plow-asset/src/packed_prefill.rs: stage_slots refuses an unmasked plan — a stage \
@@ -1050,7 +1059,7 @@ pub const EMIT: &[KnobSpec] = &[
     KnobSpec::new("emit.decode_projection_tuning", None, Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.max_chunk", Some("PLOW_MAX_CHUNK"), Layer::Emit, U32, UNSET, OPT_IN),
     KnobSpec::new("emit.max_request_chunk", Some("PLOW_MAX_REQUEST_CHUNK"), Layer::Emit, U32, UNSET, OPT_IN),
-    KnobSpec::new("emit.stage_rows", Some("PLOW_STAGE_ROWS"), Layer::Emit, U32, UNSET, OPT_IN).with(C_STAGE_ROWS),
+    KnobSpec::new("emit.stage_rows", Some("PLOW_STAGE_ROWS"), Layer::Emit, U32, UNSET, STAGE_ROWS).with(C_STAGE_ROWS),
     KnobSpec::new("emit.gemv_split", Some("PLOW_GEMV_SPLIT"), Layer::Emit, U32, Default::Static(Val::Nat(1)), OPT_IN),
     KnobSpec::new("emit.decode_tiled", Some("PLOW_DECODE_TILED"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.l2_place_prefill", Some("PLOW_L2_PLACE_PREFILL"), Layer::Emit, Domain::Bool, ON, PROMOTED),

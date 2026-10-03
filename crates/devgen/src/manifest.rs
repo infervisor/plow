@@ -1820,6 +1820,10 @@ pub fn build_for_packet(
     if let Some(section) = packed_prefill {
         let packed: plow_asset::packed_prefill::Manifest =
             serde_json::from_slice(&section.data).expect("emitted packed request manifest");
+        if let Some(rows) = packed.stage_rows {
+            manifest["objects"]["packed_prefill"]["stage_rows"] = json!(rows);
+            manifest["objects"]["packed_prefill"]["stages"] = json!(packed.stages.len());
+        }
         if let Some(rows) = packed.max_request_rows {
             manifest["objects"]["packed_prefill"]["max_request_rows"] = json!(rows);
             manifest["objects"]["packed_prefill"]["masked_padding_capability"] = json!({
