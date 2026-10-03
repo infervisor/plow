@@ -11298,9 +11298,6 @@ impl GpuEngine {
                     synchronize,
                 );
                 self.pf_seg_window = None;
-                if let Some(riders) = self.riders.as_mut() {
-                    riders.disarm();
-                }
                 chain
             } else {
                 let mut params = [&mut arg as *mut DevProgram as *mut std::ffi::c_void];
@@ -11314,6 +11311,9 @@ impl GpuEngine {
                 )
             }
         })();
+        if let Some(riders) = self.riders.as_mut() {
+            riders.disarm();
+        }
         if let Err(error) = launched {
             let _ = self.be.stream_synchronize(&self.stream);
             return Err(error);

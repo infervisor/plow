@@ -1022,6 +1022,9 @@ struct Inner {
     /// is being prefilled and its whole-block boundaries are about to be published
     /// ([`VmmKv::inflight_prefix`]).
     prefilling: Vec<bool>,
+    /// Per slot waiting in [`VmmKv::inflight_prefix`]: the chain hash of the whole-block
+    /// checkpoint it will attach to, kept by [`VmmKv::retire_superseded`].
+    awaited: Vec<Option<BlockHash>>,
     /// `seq` holds a session ([`VmmKv::note_session`]) until its next `begin_seq`.
     session: Vec<bool>,
     /// Recent prompt heads ([`note_share`]).
@@ -1214,6 +1217,7 @@ impl VmmKv {
                 lead: vec![None; batch],
                 lead_seen: FxHashMap::default(),
                 prefilling: vec![false; batch],
+                awaited: vec![None; batch],
                 session: vec![false; batch],
                 recent: std::collections::VecDeque::new(),
                 share: vec![0; batch],
@@ -1448,8 +1452,9 @@ impl VmmKv {
 
     /// A session just published `tokens[..rows]`: its next turn attaches there (attach takes
     /// the longest boundary), so its idle snapshots strictly below it on this chain are dead
-    /// weight. Free the tailed ones and the whole-block ones no request ever attached to
-    /// (a referenced block boundary is a proven shared prefix and stays). Shared KV blocks
+    /// weight. Free the tailed ones and the whole-block ones attached at most once that no
+    /// in-flight waiter ([`Self::inflight_prefix`]) will attach to (a block boundary
+    /// attached twice is a proven shared prefix and stays). Shared KV blocks
     /// are untouched. Without this a 10-turn session retains ~2 sliding-window snapshots per
     /// turn plus one per block, and at high session counts LRU evicts every session's
     /// boundary before its next turn. Returns the bytes freed.
@@ -1464,6 +1469,7 @@ impl VmmKv {
         let mut inner = s.inner.lock();
         let m = inner.cache.lookup(&hashes, &chain[..hashes.len() * br]);
         inner.cache.release(&hashes, m.blocks);
+        let waits = inner.awaited.clone();
         let mut dead = Vec::new();
         for blocks in 0..=m.blocks {
             let node = blocks.checked_sub(1).map(|i| m.placed[i]);
@@ -1478,7 +1484,11 @@ impl VmmKv {
                     // A never-attached turn end whose last rows differ: the next prompt
                     // re-rendered the reply to other token ids, so it can never attach.
                     let stale_turn_end = snap.attaches == 0 && common + TURN_END_SLACK >= snap.tail.len();
+                    let awaited = snap.tail.is_empty()
+                        && blocks > 0
+                        && waits.contains(&Some(hashes[blocks - 1]));
                     let superseded = snap.users == 0
+                        && !awaited
                         && snap.session
                         && snap.attaches <= 1
                         && snap.rows < rows
@@ -1616,6 +1626,7 @@ impl VmmKv {
         release_prefix_hold(&mut inner, seq);
         inner.lead[seq] = None;
         inner.prefilling[seq] = false;
+        inner.awaited[seq] = None;
         inner.session[seq] = false;
         inner.share[seq] = 0;
         let before = inner.stats;
@@ -1677,6 +1688,7 @@ impl VmmKv {
         let mut inner = s.inner.lock();
         inner.stats.tokens_queried += prompt.len() as u64;
         inner.prefilling[seq] = true;
+        inner.awaited[seq] = None;
         if inner.fine_rows > 0 && (prompt.len() as u64) < u64::from(inner.fine_ceiling) {
             return try_attach_fine(&mut inner, seq, prompt);
         }
@@ -1975,6 +1987,7 @@ impl VmmKv {
                 best = Some((owner, rows));
             }
         }
+        inner.awaited[seq] = best.map(|(_, rows)| hashes[rows as usize / br - 1]);
         if best.is_some() {
             note_lead(&mut inner, seq, prompt);
         }
@@ -3003,15 +3016,17 @@ fn evict_one(s: &Shared, inner: &mut Inner, preserve_hot: bool) -> bool {
     // blocks that become dead with it. A boundary inside a block serves only its exact
     // tail, the whole-block checkpoint under the same node every continuation: that tailed
     // one goes first. A boundary attached twice or more is a shared prefix (a system
-    // prompt) and goes last.
+    // prompt) and goes last; a session-pinned one (`pin_prefix`) just before it.
+    let pinned = inner.cache.pinned();
     if let Some((node, index)) = inner.published.iter()
         .flat_map(|(&node, snaps)| {
             let checkpoint = node.is_some() && snaps.iter().any(|snap| snap.tail.is_empty());
-            snaps.iter().enumerate().map(move |(i, snap)| (node, i, snap, checkpoint && !snap.tail.is_empty()))
+            let pin = node.is_some_and(|key| pinned.contains(&key));
+            snaps.iter().enumerate().map(move |(i, snap)| (node, i, snap, pin, checkpoint && !snap.tail.is_empty()))
         })
-        .filter(|(_, _, snap, _)| snap.users == 0 && Some(snap.va) != protected)
-        .min_by_key(|(_, _, snap, covered)| (snap.attaches >= 2, !covered, snap.last_used))
-        .map(|(node, index, _, _)| (node, index))
+        .filter(|(_, _, snap, _, _)| snap.users == 0 && Some(snap.va) != protected)
+        .min_by_key(|(_, _, snap, pin, covered)| (snap.attaches >= 2, *pin, !covered, snap.last_used))
+        .map(|(node, index, _, _, _)| (node, index))
     {
         let before = inner.stats.cache_bytes;
         remove_snapshot(s, inner, node, index);
@@ -4808,6 +4823,55 @@ mod tests {
         p.publish_at(1, &a, 28, 4, |_| Ok(())).unwrap();
         assert_eq!(p.retire_superseded(&a, 28), 4);
         assert_eq!(p.stats().snapshot_bytes, 4);
+    }
+
+    /// A request waiting on a session's in-flight prompt keeps the whole-block checkpoint it
+    /// will attach to through the session's retirement.
+    #[test]
+    fn session_retire_keeps_the_checkpoint_an_inflight_waiter_needs() {
+        let ops = Arc::new(MockVmm::default());
+        let p = uniform_pool(ops);
+        let o = prompt(30);
+        let mut w = o[..12].to_vec();
+        w.extend((0..18).map(|i| 5000 + i));
+        assert!(p.try_attach(0, &o).unwrap().is_none());
+        p.ensure_rows(0, 30).unwrap();
+        p.note_session(0, &o);
+        assert_eq!(p.inflight_prefix(1, &w, u32::MAX), Some((0, 8)));
+        p.publish_at(0, &o, 8, 4, |_| Ok(())).unwrap();
+        p.publish_at(0, &o, 16, 4, |_| Ok(())).unwrap();
+        p.publish_at(0, &o, 28, 4, |_| Ok(())).unwrap();
+        assert_eq!(p.retire_superseded(&o, 28), 4, "only the unwaited 16-row checkpoint");
+        p.prefill_done(0);
+        p.ensure_rows(1, 1).unwrap();
+        assert_eq!(p.try_attach(1, &w).unwrap().map(|a| a.rows), Some(8));
+    }
+
+    /// Eviction takes unpinned boundaries before a session-pinned one, however old.
+    #[test]
+    fn pinned_session_prefix_outlives_unpinned_under_pressure() {
+        let a = prompt(30);
+        let b: Vec<u32> = a.iter().map(|t| t + 1).collect();
+        let c: Vec<u32> = a.iter().map(|t| t + 2).collect();
+        let run = |cap: u64| {
+            let ops = Arc::new(MockVmm::default());
+            let geo = uniform_pool(ops.clone()).geometry().clone();
+            let p = VmmKv::new(ops, geo, 64, cap).expect("pool");
+            for (seq, pr, pin) in [(0usize, &a, true), (1, &b, false), (0, &c, false)] {
+                assert!(p.try_attach(seq, pr).unwrap().is_none());
+                p.ensure_rows(seq, 30).unwrap();
+                p.publish_at(seq, pr, 28, 4, |_| Ok(())).unwrap();
+                if pin {
+                    p.pin_prefix(pr, std::time::Instant::now() + std::time::Duration::from_secs(600));
+                }
+                p.begin_seq(seq);
+            }
+            p
+        };
+        let full = run(0).stats().cache_bytes;
+        let p = run(full - 1);
+        p.ensure_rows(0, 1).unwrap();
+        assert!(p.try_attach(0, &a).unwrap().is_some(), "pinned session prefix evicted first");
     }
 
     /// The second prompt sharing a 300-row head with a recent one names the shared end

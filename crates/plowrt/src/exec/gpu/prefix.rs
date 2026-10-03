@@ -436,6 +436,10 @@ impl GpuEngine {
                     if rt.vmm_publish_shared() {
                         kv.enable_shared_publish();
                     }
+                    // FP8 full-layer scales snapshot over `[0, p_a)`, not just the tail.
+                    if !full_scale.is_empty() {
+                        kv.enable_strict_publish();
+                    }
                     kv
                 },
                 slide,
@@ -725,6 +729,10 @@ impl GpuEngine {
                 diff = rows - p_a,
                 "vmm: publish_boundary skipped: ring overflow"
             );
+            return false;
+        }
+        if !v.kv.resolve_prefix_hazard(b, toks, p_a) {
+            tracing::debug!(slot = b, p_a, "vmm: publish_boundary skipped: orphaned blocks");
             return false;
         }
         let snap_bytes = self.vmm_snap_bytes(p_a);
