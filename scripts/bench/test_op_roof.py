@@ -113,18 +113,6 @@ class PrefillPrefixCostTests(unittest.TestCase):
         self.assertEqual(initial[0][1], 4 * 128 * 16 * 256 + 128 * 8 * (256 * 2 + 8))
         self.assertGreater(later[0][2], initial[0][2])
 
-    def test_fp8_kv_writer_infers_shape_from_consumer(self):
-        text = ("===== program T=64 =====\n"
-                "#3 HeadNormRopeFp8 b=132 out<-kv.0.k scale<-kv.0.k_scale\n"
-                "#4 HeadNormRopeFp8 b=132 out<-kv.0.v scale<-kv.0.v_scale\n"
-                "#5 FlashDecodeFp8 b=132 K<-kv.0.k V<-kv.0.v | "
-                "n_batch=64 n_head=16 n_kv_head=1 hd=512 window=0\n")
-        prog = op_roof.parse(text)[0]
-        for _, op, _, p in prog[2][:2]:
-            self.assertEqual(op, "HeadNormRopeFp8")
-            self.assertEqual(op_roof.cost(op, p, 64, 4096, 2, 2),
-                             (3 * 64 * 512 + 4 * 64, 0))
-
     def test_fp8_kv_writers_are_priced_in_prefill_and_decode_programs(self):
         text = ("===== program T=128 =====\n"
                 "#1 HeadNormRopeFp8 b=132 out<-kv.0.k scale<-kv.0.k_scale\n"

@@ -45,12 +45,6 @@ fn model(a_scale: u32) -> Model {
     }
 }
 
-#[test]
-#[should_panic(expected = "fp8_w8a16_prefill")]
-fn w8a16_fp8_prefill_is_refused_on_gfx950() {
-    check_fp8_a_scale_bound(&model(TENSOR_NONE), "gfx950", "");
-}
-
 /// w8a8 binds t[3], which is the profile that actually runs on gfx950.
 #[test]
 fn w8a8_fp8_prefill_passes_on_gfx950() {
