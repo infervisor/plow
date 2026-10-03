@@ -73,14 +73,51 @@ pub fn admit(
     start: usize,
     capacity: usize,
     policy: SpanPolicy,
-    mut program_rows: impl FnMut(u32) -> Option<u32>,
+    program_rows: impl FnMut(u32) -> Option<u32>,
 ) -> PrefillPack {
     if row_limit == 0 || capacity == 0 || capacity > MAX_SLOTS {
         return PrefillPack::default();
     }
+    let by_slot = valid_by_slot(candidates.into_iter().map(|span| (0, span)), row_limit, capacity, policy).0;
+    let start = start % capacity;
+    pack_in_order(&by_slot, (0..capacity).map(|offset| (start + offset) % capacity), row_limit, policy, program_rows)
+}
+
+/// [`admit`] in arrival order instead of slot rotation: the oldest candidate (smallest
+/// `arrival`, ties by slot) is offered rows first, so no request waits on its slot index.
+pub fn admit_oldest_first(
+    candidates: impl IntoIterator<Item = (u64, PrefillSpan)>,
+    row_limit: u32,
+    capacity: usize,
+    policy: SpanPolicy,
+    program_rows: impl FnMut(u32) -> Option<u32>,
+) -> PrefillPack {
+    if row_limit == 0 || capacity == 0 || capacity > MAX_SLOTS {
+        return PrefillPack::default();
+    }
+    let (by_slot, arrival) = valid_by_slot(candidates, row_limit, capacity, policy);
+    let mut order = [0usize; MAX_SLOTS];
+    let mut n = 0;
+    for slot in (0..capacity).filter(|&slot| by_slot[slot].is_some()) {
+        order[n] = slot;
+        n += 1;
+    }
+    order[..n].sort_unstable_by_key(|&slot| (arrival[slot], slot));
+    pack_in_order(&by_slot, order[..n].iter().copied(), row_limit, policy, program_rows)
+}
+
+type BySlot = [Option<PrefillSpan>; MAX_SLOTS];
+
+fn valid_by_slot(
+    candidates: impl IntoIterator<Item = (u64, PrefillSpan)>,
+    row_limit: u32,
+    capacity: usize,
+    policy: SpanPolicy,
+) -> (BySlot, [u64; MAX_SLOTS]) {
     let mut by_slot = [None; MAX_SLOTS];
+    let mut arrival = [0u64; MAX_SLOTS];
     let mut occupied = 0u128;
-    for span in candidates {
+    for (at, span) in candidates {
         let Ok(slot) = usize::try_from(span.slot) else {
             continue;
         };
@@ -95,11 +132,22 @@ pub fn admit(
             && (policy != SpanPolicy::Whole || span.n_rows <= row_limit);
         if valid {
             by_slot[slot] = Some(span);
+            arrival[slot] = at;
             occupied |= bit;
         }
     }
-    let start = start % capacity;
-    let slots = (0..capacity).map(|offset| (start + offset) % capacity);
+    (by_slot, arrival)
+}
+
+/// Select the first candidate's program in `slots` order and pack that program's candidates in
+/// the same order.
+fn pack_in_order(
+    by_slot: &BySlot,
+    slots: impl Iterator<Item = usize> + Clone,
+    row_limit: u32,
+    policy: SpanPolicy,
+    mut program_rows: impl FnMut(u32) -> Option<u32>,
+) -> PrefillPack {
     let Some(program) = slots
         .clone()
         .find_map(|slot| by_slot[slot].map(|span| span.program))
@@ -207,6 +255,30 @@ mod tests {
         assert_eq!(pack.spans(), &all[..1]);
         pack.limit_spans(0);
         assert!(pack.spans().is_empty());
+    }
+
+    #[test]
+    fn oldest_first_orders_by_arrival_then_slot() {
+        let pack = admit_oldest_first(
+            [(5, span(0, 0, 100, 7)), (1, span(1, 0, 100, 7)), (1, span(2, 0, 100, 7)), (0, span(3, 0, 100, 9))],
+            150,
+            4,
+            SpanPolicy::Greedy,
+            |_| Some(256),
+        );
+        // Slot 3 is the oldest and fixes the program; only its program's candidates pack.
+        assert_eq!(pack.spans().iter().map(|s| s.slot).collect::<Vec<_>>(), [3]);
+        let pack = admit_oldest_first(
+            [(5, span(0, 0, 100, 7)), (1, span(2, 0, 100, 7)), (1, span(1, 0, 100, 7))],
+            150,
+            4,
+            SpanPolicy::Greedy,
+            |_| Some(256),
+        );
+        assert_eq!(
+            pack.spans().iter().map(|s| (s.slot, s.row0, s.n_rows)).collect::<Vec<_>>(),
+            [(1, 0, 100), (2, 100, 50)]
+        );
     }
 
     #[test]

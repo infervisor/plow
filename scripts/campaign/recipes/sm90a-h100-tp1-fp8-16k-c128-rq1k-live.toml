@@ -1,0 +1,128 @@
+# Experimental 16K/128-slot BF16-KV candidate (FP8 weights); not qualified. Loads and serves where the
+# flat-ring packet ran out of VRAM at load: each 640 MiB sliding ring (2048 rows) is committed only
+# while a request owns its slot (PLOW_VMM_LIVE_RINGS=1 under PLOW_VMM_PREFIX=1), full-attention rows
+# map in 2048-row blocks, and the mux admits by bytes (ring + admission margin + 16 KiB/row) under
+# PLOW_KV_MEM_UTIL. Measured: ~71-78 live at 4K, 64 at 15K; output tok/s within 10% of the 64-slot
+# packet (prefill-bound), not above it.
+# PLOW_PF_ATTN_GEMM=1: its full-context-for-every-slot gate can never pass at 128 slots and the native
+# FlashPrefill fallback cost 2.5x serving throughput at 4K.
+schema = "plow.recipe.v1"
+namespace = "infervisor"
+name = "gemma-4-12b"
+label = "sm90a-h100-tp1-fp8-16k-c128-rq1k-live"
+status = "emits"
+plow_git = "9d67da85b9fa8c2cec1dfde12533a67f0ba469c2"
+network = "gemma4"
+
+[target]
+vendor = "nvidia"
+isa = "sm_90a"
+sku = "H100 SXM5"
+units = 132
+num_gpus = 1
+parallel = "tp"
+max_ctx = 16384
+toolchain = "cuda-12.9-nix"
+
+[checkpoint]
+source = "gemma-4-12b-it-fp8"
+layout = "plow-fp8-hub-rekey"
+
+[cell]
+name = "gemma4-12b.h100.fp8-16k-c128-rq1k-live"
+model = "gemma-4-12b-it-fp8 (compressed-tensors, re-keyed)"
+revision = "local"
+hf_dir = "{env:GEMMA12B_CHECKPOINT}"
+gpu = "H100 SXM5"
+arch = "sm_90a"
+n_cu = 132
+max_ctx = 16384
+precision = "w8a8"
+
+[emit]
+args = ["--segmented"]
+[emit.env]
+PLOW_GLU_QUANT_FUSE = "1"
+NVCC_APPEND_FLAGS = "-DPLOW_NV_GLU_QUANT_CACHE=1 -DPLOW_NV_GLU_QUANT_WPR=1"
+PLOW_FP8 = "1"
+PLOW_W8A8 = "1"
+PLOW_EMIT_PACKED_PREFILL = "1"     # default-on only for BF16 Hopper; the roles need the metadata
+PLOW_SEG_PURE_GEMM = "fp8"
+PLOW_SEG_FA512 = "1"               # [FP8-TAX] GEMMA4_SEG_FA512_DEFAULT is bf16-gated
+PLOW_SEG_FA256_GQA2 = "1"          # [FP8-TAX] GEMMA4_SEG_FA256_GQA2_DEFAULT is bf16-gated
+PLOW_TMA_GEMM = "1"
+PLOW_MAX_CHUNK = "4096"
+PLOW_MAX_REQUEST_CHUNK = "1024"
+PLOW_SLIDING_NS_CAP = "1"
+PLOW_SLIDING_NS_GRID = "1"
+PLOW_ATTENTION_DECODE_BALANCE_GF = "4"
+PLOW_NS_FULL_ABS = "66"
+PLOW_FA_MMAQK = "3"
+PLOW_DECODE_BATCH_LADDER = "1,2,4,8,16,32,64,128"
+PLOW_FP8_DECODE_TC64 = "1"
+PLOW_EMIT_DECODE_CUBLASLT = "1"
+PLOW_EMIT_DECODE_CUBLASLT_MIN_ROWS = "128"
+PLOW_EMIT_PREFILL_CUBLASLT = "1"
+PLOW_PF_LADDER_APPEND = "256,1088,1152,2112,4160,4224"
+PLOW_FUSE_ARGMAX = "1"
+
+[objects]
+script = "scripts/build_sm90a_gemma4_segments.sh"
+role_files = [
+  "interp_sm90a_pfattn_hd512_px4_bq64.cubin",
+  "interp_sm90a_pfattn_hd256_gqa2_bkv32.cubin",
+  "interp_sm90a_pfattn_hd256_bkv32.cubin",
+]
+[objects.env]
+PLOW_BUILD_FATLITE = "1"
+NVCC_APPEND_FLAGS = "-DPLOW_NV_GLU_QUANT_CACHE=1 -DPLOW_NV_GLU_QUANT_WPR=1"
+PLOW_BUILD_W8A8 = "1"
+PLOW_BUILD_FA_GQA2_PAIR = "1"
+PLOW_BUILD_PFATTN_HD256_BKV32 = "1"
+PLOW_BUILD_PFATTN_HD256_GQA2_BKV32 = "1"
+PLOW_BUILD_PFATTN_HD512_PX4_BQ64 = "1"
+
+[emit_roles.env]
+PLOW_GEMMA4_SM90_W8A8_GEMM_GLU_ROLE = "0"
+PLOW_GEMMA4_SM90_HD512_PX4_BQ64_ROLE = "1"
+PLOW_GEMMA4_SM90_HD256_GQA2_ROLE = "1"
+
+[serve.env]
+PLOW_PREFIX_CACHE = "1"
+PLOW_VMM_PREFIX = "1"
+PLOW_PF_SEG_PURE = "fp8"
+PLOW_PF_SEG_FA512 = "1"
+PLOW_PF_INTERLEAVE = "0"
+PLOW_VMM_LIVE_RINGS = "1"
+PLOW_KV_MEM_UTIL = "0.9"
+PLOW_PF_ATTN_GEMM = "1"
+PLOW_MULTISTEP = "0"
+PLOW_DECODE_MAX_RUNG = "128"
+PLOW_TOKEN_BATCH = "1"
+
+[bench]
+backend = "openai"
+in_lens = "128 1024 4096"
+concs = "1"
+nprompt = 32
+outlen = 128
+warmups = 2
+seed = 42
+tokenizer = "{env:GEMMA12B_CHECKPOINT}"
+model_id = "checkpoint"
+gate_prompt = "<bos><|turn>user\nWhat is the capital of France? Answer in one short sentence.<turn|>\n<|turn>model\n<|channel>thought\n<channel|>"
+
+[bench.profiles.realtime]
+in_lens = "128 1024 4096 7000 15000"
+concs = "1 4"
+nprompt = 32
+serve_env = { PLOW_DECODE_MAX_RUNG = "4" }
+
+[bench.profiles.high_concurrency]
+in_lens = "128 1024 4096 7000 15000"
+concs = "16 32 64 128"
+nprompt = 384
+serve_env = { PLOW_DECODE_MAX_RUNG = "128" }
+
+[reference]
+csv = "perf-data/campaign/gemma4-12b.h100.reference-vllm028-fp8.csv"

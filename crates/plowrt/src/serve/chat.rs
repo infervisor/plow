@@ -403,6 +403,7 @@ async fn chat_completions_with(
         opts: crate::serve::mux::JobOpts {
             session,
             turn: run.key(),
+            continuing: run.continuing(),
             ..Default::default()
         },
     };

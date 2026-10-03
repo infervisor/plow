@@ -99,7 +99,7 @@ pub enum Urgency {
 /// (`PLOW_COSCHED_MAX_WAIT_MS` overrides).
 pub const MAX_WAIT: Duration = Duration::from_millis(2000);
 
-fn max_wait() -> Duration {
+pub(crate) fn max_wait() -> Duration {
     static WAIT: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
     *WAIT.get_or_init(|| {
         crate::config::RuntimeConfig::get()
