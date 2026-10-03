@@ -855,6 +855,28 @@ impl AmdTpGroup {
         self.ranks.iter().all(|r| r.weights_bound())
     }
 
+    pub fn logits_row(&mut self, slot: usize, out: &mut Vec<f32>) -> Result<()> {
+        self.ranks[0].logits_row(slot, out)
+    }
+
+    pub fn write_tensor(&mut self, name: &str, src: &[u8]) -> Result<()> {
+        for rank in self.ranks.iter_mut() {
+            rank.write_tensor(name, src)?;
+        }
+        Ok(())
+    }
+
+    pub fn write_tensor_at(&mut self, name: &str, offset: u64, src: &[u8]) -> Result<()> {
+        for rank in self.ranks.iter_mut() {
+            rank.write_tensor_at(name, offset, src)?;
+        }
+        Ok(())
+    }
+
+    pub fn tensor_bytes(&self, name: &str) -> Option<u64> {
+        self.ranks[0].tensor_bytes(name)
+    }
+
     /// One decode token across every rank. Returns each rank's sampled id.
     ///
     /// Every rank must return the SAME id: they all hold the full replicated

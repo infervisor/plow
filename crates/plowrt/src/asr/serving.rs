@@ -23,9 +23,9 @@ use super::{
 };
 use crate::serve::session::RequestIds;
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "hsa"))]
 mod shared;
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "hsa"))]
 pub use shared::preload;
 
 const BATCH_FORMATION_WINDOW: Duration = Duration::from_millis(5);
@@ -55,7 +55,7 @@ enum Backend {
     /// `plowrt asr`: one model on a private cohort engine.
     Cohort { model: String, mux: AsrMux, finalization: FinalizationPolicy },
     /// `plowrt serve`: any registry model with a causal audio pipeline, through its text mux.
-    #[cfg(feature = "cuda")]
+    #[cfg(any(feature = "cuda", feature = "hsa"))]
     Serve(Arc<crate::serve::AppState>),
 }
 
@@ -63,7 +63,7 @@ enum Backend {
 #[derive(Clone)]
 enum Route {
     Cohort(AsrMux),
-    #[cfg(feature = "cuda")]
+    #[cfg(any(feature = "cuda", feature = "hsa"))]
     Shared(Arc<shared::SharedAsr>, crate::serve::mux::ModelMux),
 }
 
@@ -71,7 +71,7 @@ enum Route {
 /// for its later partial transcripts.
 #[derive(Default)]
 pub(crate) struct WindowCache {
-    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+    #[cfg_attr(not(any(feature = "cuda", feature = "hsa")), allow(dead_code))]
     rows: Vec<Arc<[f32]>>,
     /// The last partial's output tokens: the next partial forces all but their tail.
     #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
@@ -80,7 +80,7 @@ pub(crate) struct WindowCache {
 
 /// How one transcription runs beyond its audio.
 #[derive(Default)]
-#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+#[cfg_attr(not(any(feature = "cuda", feature = "hsa")), allow(dead_code))]
 pub(crate) struct AsrOpts {
     /// The answer a client waits on (a final); otherwise a revisable partial.
     pub final_pass: bool,
@@ -108,14 +108,14 @@ impl Route {
                 let _ = opts;
                 mux.submit(samples, language, context, cancel)
             }
-            #[cfg(feature = "cuda")]
+            #[cfg(any(feature = "cuda", feature = "hsa"))]
             Route::Shared(asr, mux) => asr.submit(mux.clone(), samples, language, context, cancel, opts),
         }
     }
 
     /// Whether this route keeps session state (retained decoder rows, appended audio).
     fn sessions(&self) -> bool {
-        #[cfg(feature = "cuda")]
+        #[cfg(any(feature = "cuda", feature = "hsa"))]
         if matches!(self, Route::Shared(..)) {
             return true;
         }
@@ -265,7 +265,7 @@ impl AsrServer {
 
     /// Transcription for every model `state` serves whose packet declares a causal audio pipeline:
     /// the prompt and encoder run here, the decoder on the model's continuous-batching mux.
-    #[cfg(feature = "cuda")]
+    #[cfg(any(feature = "cuda", feature = "hsa"))]
     pub fn for_serve(state: Arc<crate::serve::AppState>) -> Arc<Self> {
         Arc::new(Self {
             backend: Backend::Serve(state),
@@ -307,7 +307,7 @@ impl AsrServer {
                 }
                 Ok((Route::Cohort(mux.clone()), *finalization))
             }
-            #[cfg(feature = "cuda")]
+            #[cfg(any(feature = "cuda", feature = "hsa"))]
             Backend::Serve(state) => shared::route(state, model).await,
         }
     }

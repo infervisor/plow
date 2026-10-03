@@ -261,6 +261,7 @@ async fn speech_with(
     if let Some(canonical) = state.registry.resolve(&req.model) {
         req.model = canonical;
     }
+    #[cfg(feature = "cuda")]
     if let Some(mgr) = state.manager_for(&req.model) {
         if mgr.manages(&req.model) {
             if let Err(e) = mgr.ensure_resident(&req.model).await {

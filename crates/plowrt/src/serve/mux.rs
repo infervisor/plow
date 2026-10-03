@@ -3955,6 +3955,63 @@ fn run_one_tick(
                     // AMD prefill and decode share scratch and run sequentially.
                     // This interval measures isolated prefill, not mixed-kernel overlap.
                     let pk_t = packlog::on().then(Instant::now);
+                    let mut uncond_logits = None;
+                    if let Some(sp) = slots[i].as_ref().and_then(|s| s.speech.as_deref()) {
+                        let mut speech_err = None;
+                        let s = slots[i].as_ref().unwrap();
+                        let pf_pos = s.pf_pos;
+                        let prompt_ids = s.prompt_ids.clone();
+                        let has_cfg = s.cfg.is_some() && sp.cfg.is_some();
+                        if pf_pos == 0 && has_cfg {
+                            let cfg = sp.cfg.as_ref().unwrap();
+                            let partner = i + 1;
+                            let mut c0 = 0;
+                            loop {
+                                if let Err(err) = e.stage_speech_prefill(partner, c0, &cfg.uncond_overlay, &sp.overlay_pos, sp.pos_base) {
+                                    speech_err = Some(err);
+                                    break;
+                                }
+                                match e.prefill_chunked_at_most(partner, &prompt_ids, tick_max) {
+                                    Ok(Some(_)) => break,
+                                    Ok(None) => c0 = e.prefill_frontier(partner).unwrap_or(c0),
+                                    Err(err) => {
+                                        speech_err = Some(err);
+                                        break;
+                                    }
+                                }
+                            }
+                            if speech_err.is_none() {
+                                let mut uncond = Vec::new();
+                                let _ = e.logits_row(0, &mut uncond);
+                                uncond_logits = Some(uncond);
+                                if let Some(base) = sp.pos_base {
+                                    let _ = e.write_tensor_at("in.pos_base", (partner * 4) as u64, &base.to_le_bytes());
+                                }
+                            }
+                        }
+                        if speech_err.is_none() {
+                            if let Err(err) = e.stage_speech_prefill(i, pf_pos, &sp.overlay, &sp.overlay_pos, sp.pos_base) {
+                                speech_err = Some(err);
+                            }
+                        }
+                        if let Some(err) = speech_err {
+                            note_fault(&mut tick_fault, &err);
+                            if let Some(taken) = slots[i].take() {
+                                release_kv(&arena, taken.kv);
+                                let _ = taken.respond.try_send(StreamChunk::Err(err));
+                            }
+                            e.release(i);
+                            e.release(i + 1);
+                            continue;
+                        }
+                    }
+                    if let Some(uncond) = uncond_logits {
+                        if let Some(s) = slots[i].as_mut() {
+                            if let Some(r) = s.cfg.as_mut() {
+                                r.uncond = uncond;
+                            }
+                        }
+                    }
                     let slot_ref = slots[i].as_ref().expect("found above");
                     // §TTFT: everything between `mux.submit` and this line — the
                     // dispatcher wake, the formation hold, admission, and the
@@ -3998,6 +4055,21 @@ fn run_one_tick(
                             if let Some(s) = slots[i].as_mut() {
                                 s.pf_pos = s.prompt_ids.len();
                             }
+                            if let Some(sp) = slots[i].as_ref().and_then(|s| s.speech.as_deref()) {
+                                if let Some(base) = sp.pos_base {
+                                    let _ = e.write_tensor_at("in.pos_base", (i * 4) as u64, &base.to_le_bytes());
+                                }
+                            }
+                            let token = if let Some(slot_mut) = slots[i].as_mut() {
+                                if let Some(run) = slot_mut.cfg.as_mut() {
+                                    let _ = e.logits_row(0, &mut run.cond);
+                                    cfg_draw(slot_mut)
+                                } else {
+                                    token
+                                }
+                            } else {
+                                token
+                            };
                             tracing::debug!(token, slot = i, "amd: prefill token");
                             let t_tok = std::time::Instant::now();
                             handle_produced_token(
@@ -4012,6 +4084,7 @@ fn run_one_tick(
                             crate::obs::ttft::FIRST_TOK.add(t_tok.elapsed().as_nanos() as u64);
                             if slots[i].is_none() {
                                 e.release(i);
+                                e.release(i + 1);
                             }
                         }
                         Err(err) => {
@@ -4061,12 +4134,17 @@ fn run_one_tick(
             }
 
             // Decode: every live slot feeds the token it last produced.
-            let feeds: Vec<(usize, u32)> = (0..b.min(slots.len()))
-                .filter_map(|i| {
-                    let s = slots[i].as_ref()?;
-                    Some((i, *s.out_ids.last()?))
-                })
-                .collect();
+            let mut feeds: Vec<(usize, u32)> = Vec::new();
+            for i in 0..b.min(slots.len()) {
+                if let Some(s) = slots[i].as_ref() {
+                    if let Some(&last) = s.out_ids.last() {
+                        feeds.push((i, last));
+                        if s.cfg.is_some() {
+                            feeds.push((i + 1, last));
+                        }
+                    }
+                }
+            }
             let mut decode_progress = None;
             if feeds.is_empty() {
                 return (
@@ -4091,12 +4169,21 @@ fn run_one_tick(
                 .map(|slot| slot.gen.max_tokens.saturating_sub(slot.out_ids.len()))
                 .min()
                 .unwrap_or(1);
-            let requested = amd_multistep_requested(
-                remaining,
-                multi_step,
-                crate::config::RuntimeConfig::get().multistep() as usize,
-            );
-            let multi = e.multistep_quantum(&feeds, requested);
+            let has_cfg = feeds.iter().any(|&(i, _)| slots[i].as_ref().is_some_and(|s| s.cfg.is_some()));
+            let requested = if has_cfg {
+                1
+            } else {
+                amd_multistep_requested(
+                    remaining,
+                    multi_step,
+                    crate::config::RuntimeConfig::get().multistep() as usize,
+                )
+            };
+            let multi = if has_cfg {
+                None
+            } else {
+                e.multistep_quantum(&feeds, requested)
+            };
             let mut deferred = std::mem::take(&mut obs.host.slot_tokens);
             let t_dec = (crate::obs::tick::on() || slo_on).then(Instant::now);
             let t_call = crate::obs::host::on().then(Instant::now);
@@ -4105,6 +4192,9 @@ fn run_one_tick(
                 let t_emit = host_engine_call(t_call, feeds.len(), tokens_this_tick);
                 let res = call_res.and_then(|quantum| {
                     for &(i, _) in &feeds {
+                        if slots[i].is_none() {
+                            continue;
+                        }
                         for step in 0..quantum {
                             if slots[i].is_none() {
                                 break;
@@ -4123,6 +4213,7 @@ fn run_one_tick(
                         }
                         if slots[i].is_none() {
                             e.release(i);
+                            e.release(i + 1);
                         }
                     }
                     Ok(quantum)
@@ -4132,8 +4223,19 @@ fn run_one_tick(
             } else {
                 let call_res = e.step_batch(&feeds);
                 let t_emit = host_engine_call(t_call, feeds.len(), tokens_this_tick);
-                let res = call_res.map(|out| {
+                let res = call_res.and_then(|out| {
                     for (i, token) in out {
+                        if slots[i].is_none() {
+                            continue;
+                        }
+                        let mut token = token;
+                        if let Some(slot_mut) = slots[i].as_mut() {
+                            if let Some(run) = slot_mut.cfg.as_mut() {
+                                let _ = e.logits_row(i, &mut run.cond);
+                                let _ = e.logits_row(i + 1, &mut run.uncond);
+                                token = cfg_draw(slot_mut);
+                            }
+                        }
                         tracing::debug!(token, slot = i, "amd: token");
                         let t_stream = crate::obs::dstep::on().then(Instant::now);
                         handle_produced_token(
@@ -4150,9 +4252,10 @@ fn run_one_tick(
                         }
                         if slots[i].is_none() {
                             e.release(i);
+                            e.release(i + 1);
                         }
                     }
-                    1
+                    Ok(1)
                 });
                 host_emit_done(t_emit, tokens_this_tick);
                 res
@@ -5474,8 +5577,8 @@ fn gpu_speech_prefill_inputs(
 
 /// The chunk-relative overlay index for launch rows `[c0, c0 + window)`: the overlay rows
 /// `lo..hi` whose prompt positions fall there, renumbered from 0; every other row `u32::MAX`.
-#[cfg(any(feature = "cuda", test))]
-fn speech_overlay_index(pos: &[u32], c0: usize, window: usize, index: &mut Vec<u32>) -> (usize, usize) {
+#[cfg(any(feature = "cuda", feature = "hsa", test))]
+pub(crate) fn speech_overlay_index(pos: &[u32], c0: usize, window: usize, index: &mut Vec<u32>) -> (usize, usize) {
     let lo = pos.partition_point(|&p| (p as usize) < c0);
     let hi = pos.partition_point(|&p| (p as usize) < c0.saturating_add(window));
     index.clear();
@@ -5889,7 +5992,7 @@ fn gpu_cfg_advance(feeds: &[(usize, u32)], slots: &mut [Option<Slot>], k: usize)
 }
 
 /// A CFG owner's next token from its (cond, uncond) rows of the step's bf16 logits.
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "hsa"))]
 fn cfg_draw_bf16(slot: &mut Slot, cond: &[u8], uncond: &[u8]) -> u32 {
     let (Some(run), Some(cfg)) = (slot.cfg.as_mut(), slot.speech.as_ref().and_then(|s| s.cfg.as_ref())) else {
         unreachable!("cfg_draw on a CFG owner")
@@ -5900,7 +6003,7 @@ fn cfg_draw_bf16(slot: &mut Slot, cond: &[u8], uncond: &[u8]) -> u32 {
 }
 
 /// A CFG owner's next token from its stashed (cond, uncond) logits.
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "hsa"))]
 fn cfg_draw(slot: &mut Slot) -> u32 {
     let (Some(run), Some(cfg)) = (slot.cfg.as_mut(), slot.speech.as_ref().and_then(|s| s.cfg.as_ref())) else {
         unreachable!("cfg_draw on a CFG owner")

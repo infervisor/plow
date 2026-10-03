@@ -54,10 +54,13 @@
 ///   host from the addresses of tensors that ARE weights
 /// * `tmap.` — sm_90a TMA tensor-map descriptors (`GEN_TMAP_BF16`), 128 B each, encoded by
 ///   the loader from the TARGET tensor's device address after upload (`exec/gpu.rs`)
+/// * `scratch.` — temporary scratch buffers (e.g. `scratch.dense_f32_splitk`)
 ///
 /// Kept as data, not as a chain of `||`, so a test can assert over the constant rather than
 /// re-spelling the literals it is supposed to be checking.
-pub const RUNTIME_PREFIXES: &[&str] = &["act.", "in.", "kv.", "moe.", "tmap.", "state."];
+pub const RUNTIME_PREFIXES: &[&str] = &[
+    "act.", "in.", "kv.", "moe.", "tmap.", "state.", "scratch.",
+];
 
 /// True for a name in one of the [`RUNTIME_PREFIXES`] namespaces.
 pub fn is_runtime_tensor(name: &str) -> bool {
@@ -155,6 +158,7 @@ mod tests {
             "in.cos",
             "kv.3.krot",
             "moe.ewt.7",
+            "scratch.dense_f32_splitk",
         ] {
             assert!(!is_checkpoint_weight(n), "{n}");
         }

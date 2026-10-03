@@ -5385,15 +5385,29 @@ __device__ void d_gemv_glu(bf16* C, const bf16* x, const bf16* Wg, const bf16* W
 #ifndef PLOW_GLU_K4096_UN
 #define PLOW_GLU_K4096_UN 8
 #endif
-    if (K == 4096)
-        gemv_glu_rows<PLOW_GEMV_MM, PLOW_GLU_K4096_UN>(C_, Wg, Wu, M_, N, K, act, slice, nblk, lds, beta, lbeta);
-    else if (K == 7168)
-        /* 14 chunks: UN=7 is two clean passes where UN=6 runs three with four dead loads, the
-         * same rung d_gemv_qkvg already takes at K=7168. Per-lane accumulation order is
-         * unchanged (chunks still visit k in order), so the output is bit-identical. */
-        gemv_glu_rows<PLOW_GEMV_MM, 7>(C_, Wg, Wu, M_, N, K, act, slice, nblk, lds, beta, lbeta);
-    else
-        gemv_glu_rows<PLOW_GEMV_MM>(C_, Wg, Wu, M_, N, K, act, slice, nblk, lds, beta, lbeta);
+    if constexpr (PLOW_GEMV_MM == 1) {
+        if (K == 4096)
+            gemv_glu_rows<1, PLOW_GLU_K4096_UN>(C_, Wg, Wu, M_, N, K, act, slice, nblk, lds, beta, lbeta);
+        else if (K == 7168)
+            gemv_glu_rows<1, 7>(C_, Wg, Wu, M_, N, K, act, slice, nblk, lds, beta, lbeta);
+        else if (K == 3072)
+            gemv_glu_rows<1, 6>(C_, Wg, Wu, M_, N, K, act, slice, nblk, lds, beta, lbeta);
+        else if (K == 2560)
+            gemv_glu_rows<1, 5>(C_, Wg, Wu, M_, N, K, act, slice, nblk, lds, beta, lbeta);
+        else if (K == 2048)
+            gemv_glu_rows<1, 4>(C_, Wg, Wu, M_, N, K, act, slice, nblk, lds, beta, lbeta);
+        else if (K == 1024)
+            gemv_glu_rows<1, 2>(C_, Wg, Wu, M_, N, K, act, slice, nblk, lds, beta, lbeta);
+        else
+            gemv_glu_rows<1>(C_, Wg, Wu, M_, N, K, act, slice, nblk, lds, beta, lbeta);
+    } else {
+        if (K == 4096)
+            gemv_glu_rows<PLOW_GEMV_MM, PLOW_GLU_K4096_UN>(C_, Wg, Wu, M_, N, K, act, slice, nblk, lds, beta, lbeta);
+        else if (K == 7168)
+            gemv_glu_rows<PLOW_GEMV_MM, 7>(C_, Wg, Wu, M_, N, K, act, slice, nblk, lds, beta, lbeta);
+        else
+            gemv_glu_rows<PLOW_GEMV_MM>(C_, Wg, Wu, M_, N, K, act, slice, nblk, lds, beta, lbeta);
+    }
     /* Re-staging next block into the SAME arena: every wave must be done reading it. */
     if (PLOW_GEMV_WALK) __syncthreads();
   });
@@ -5447,14 +5461,31 @@ __device__ void d_gemv_qkvg(bf16* Cq, bf16* Ck, bf16* Cv, bf16* Cg, const bf16* 
                       (float*)(lds + (GM_LDS_HALVES - GV_NORM_SCRATCH)));
     }
 #endif
-    if (K == 2560)
-        gemv_qkvg_rows<PLOW_GEMV_MM, 5>(Cq_, Ck_, Cv_, Cg_, Wq, Wk, Wv, Wg, M_, Nq, Nk, Nv, Ng, K, slice, nblk, lds);
-    else if (K == 4096)
-        gemv_qkvg_rows<PLOW_GEMV_MM, 8>(Cq_, Ck_, Cv_, Cg_, Wq, Wk, Wv, Wg, M_, Nq, Nk, Nv, Ng, K, slice, nblk, lds);
-    else if (K == 7168)
-        gemv_qkvg_rows<PLOW_GEMV_MM, 7>(Cq_, Ck_, Cv_, Cg_, Wq, Wk, Wv, Wg, M_, Nq, Nk, Nv, Ng, K, slice, nblk, lds);
-    else
-        gemv_qkvg_rows<PLOW_GEMV_MM, 6>(Cq_, Ck_, Cv_, Cg_, Wq, Wk, Wv, Wg, M_, Nq, Nk, Nv, Ng, K, slice, nblk, lds);
+    if constexpr (PLOW_GEMV_MM == 1) {
+        if (K == 2560)
+            gemv_qkvg_rows<1, 5>(Cq_, Ck_, Cv_, Cg_, Wq, Wk, Wv, Wg, M_, Nq, Nk, Nv, Ng, K, slice, nblk, lds);
+        else if (K == 4096)
+            gemv_qkvg_rows<1, 8>(Cq_, Ck_, Cv_, Cg_, Wq, Wk, Wv, Wg, M_, Nq, Nk, Nv, Ng, K, slice, nblk, lds);
+        else if (K == 7168)
+            gemv_qkvg_rows<1, 7>(Cq_, Ck_, Cv_, Cg_, Wq, Wk, Wv, Wg, M_, Nq, Nk, Nv, Ng, K, slice, nblk, lds);
+        else if (K == 3072)
+            gemv_qkvg_rows<1, 6>(Cq_, Ck_, Cv_, Cg_, Wq, Wk, Wv, Wg, M_, Nq, Nk, Nv, Ng, K, slice, nblk, lds);
+        else if (K == 2048)
+            gemv_qkvg_rows<1, 4>(Cq_, Ck_, Cv_, Cg_, Wq, Wk, Wv, Wg, M_, Nq, Nk, Nv, Ng, K, slice, nblk, lds);
+        else if (K == 1024)
+            gemv_qkvg_rows<1, 2>(Cq_, Ck_, Cv_, Cg_, Wq, Wk, Wv, Wg, M_, Nq, Nk, Nv, Ng, K, slice, nblk, lds);
+        else
+            gemv_qkvg_rows<1, 6>(Cq_, Ck_, Cv_, Cg_, Wq, Wk, Wv, Wg, M_, Nq, Nk, Nv, Ng, K, slice, nblk, lds);
+    } else {
+        if (K == 2560)
+            gemv_qkvg_rows<PLOW_GEMV_MM, 5>(Cq_, Ck_, Cv_, Cg_, Wq, Wk, Wv, Wg, M_, Nq, Nk, Nv, Ng, K, slice, nblk, lds);
+        else if (K == 4096)
+            gemv_qkvg_rows<PLOW_GEMV_MM, 8>(Cq_, Ck_, Cv_, Cg_, Wq, Wk, Wv, Wg, M_, Nq, Nk, Nv, Ng, K, slice, nblk, lds);
+        else if (K == 7168)
+            gemv_qkvg_rows<PLOW_GEMV_MM, 7>(Cq_, Ck_, Cv_, Cg_, Wq, Wk, Wv, Wg, M_, Nq, Nk, Nv, Ng, K, slice, nblk, lds);
+        else
+            gemv_qkvg_rows<PLOW_GEMV_MM, 6>(Cq_, Ck_, Cv_, Cg_, Wq, Wk, Wv, Wg, M_, Nq, Nk, Nv, Ng, K, slice, nblk, lds);
+    }
     if (PLOW_GEMV_WALK) __syncthreads();
   });
 }
@@ -5526,7 +5557,30 @@ __device__ void d_gemv(bf16* C, const bf16* x, const bf16* W, const float* rms,
     else                  /* down (31B) K=21504, lm_head (31B) K=5376, Qwen down K=9728: keep 11 */
         d_gemv_t<PLOW_GEMV_MM>(C_, x_, W, rms_, gamma, M_, N, K, norm, eps, slice, nblk, lds);
 #else
-    d_gemv_t<PLOW_GEMV_MM>(C_, x_, W, rms_, gamma, M_, N, K, norm, eps, slice, nblk, lds);
+    if constexpr (PLOW_GEMV_MM == 1) {
+        if (K == 4096)
+            d_gemv_t<1, 8>(C_, x_, W, rms_, gamma, M_, N, K, norm, eps, slice, nblk, lds);
+        else if (K == 2560)
+            d_gemv_t<1, 5>(C_, x_, W, rms_, gamma, M_, N, K, norm, eps, slice, nblk, lds);
+        else if (K == 3072)
+            d_gemv_t<1, 6>(C_, x_, W, rms_, gamma, M_, N, K, norm, eps, slice, nblk, lds);
+        else if (K == 2048)
+            d_gemv_t<1, 4>(C_, x_, W, rms_, gamma, M_, N, K, norm, eps, slice, nblk, lds);
+        else if (K == 1024)
+            d_gemv_t<1, 2>(C_, x_, W, rms_, gamma, M_, N, K, norm, eps, slice, nblk, lds);
+        else if (K == 6144)
+            d_gemv_t<1, 6>(C_, x_, W, rms_, gamma, M_, N, K, norm, eps, slice, nblk, lds);
+        else if (K == 8192)
+            d_gemv_t<1, 8>(C_, x_, W, rms_, gamma, M_, N, K, norm, eps, slice, nblk, lds);
+        else if (K == 10240)
+            d_gemv_t<1, 10>(C_, x_, W, rms_, gamma, M_, N, K, norm, eps, slice, nblk, lds);
+        else if (K == 15360)
+            d_gemv_t<1, 10>(C_, x_, W, rms_, gamma, M_, N, K, norm, eps, slice, nblk, lds);
+        else
+            d_gemv_t<1>(C_, x_, W, rms_, gamma, M_, N, K, norm, eps, slice, nblk, lds);
+    } else {
+        d_gemv_t<PLOW_GEMV_MM>(C_, x_, W, rms_, gamma, M_, N, K, norm, eps, slice, nblk, lds);
+    }
 #endif
     if (PLOW_GEMV_WALK) __syncthreads();
   });

@@ -11712,6 +11712,38 @@ impl AmdEngine {
         EngineDevice::upload(&*self.be, &self.devp[i], offset, src)
     }
 
+    /// Download row `slot` of the `[B][vocab]` logits (bf16 -> f32) into `out`.
+    pub fn logits_row(&mut self, slot: usize, out: &mut Vec<f32>) -> Result<()> {
+        let t_logits = self.t_logits.ok_or_else(|| {
+            RuntimeError::Device("act.logits tensor is not present in the packet".into())
+        })?;
+        if slot >= self.batch {
+            return Err(RuntimeError::Rejected(format!(
+                "slot {slot} out of range (engine batch {})",
+                self.batch
+            )));
+        }
+        let total_bytes = self.devp[t_logits].len as usize;
+        let row_bytes = total_bytes / self.batch.max(1);
+        let vocab = row_bytes / 2;
+        let mut raw = vec![0u8; row_bytes];
+        EngineDevice::download(
+            &*self.be,
+            &self.devp[t_logits],
+            (slot * row_bytes) as u64,
+            &mut raw,
+        )?;
+        out.clear();
+        out.resize(vocab, 0.0);
+        let halves: &[u16] = unsafe {
+            std::slice::from_raw_parts(raw.as_ptr() as *const u16, vocab)
+        };
+        for i in 0..vocab {
+            out[i] = f32::from_bits((halves[i] as u32) << 16);
+        }
+        Ok(())
+    }
+
     /// Dump the decode program's `PlowTraceRec[n_stream]` to `path`.
     ///
     /// A no-op unless `PLOW_TRACE_RAW` was set when the engine was built — the

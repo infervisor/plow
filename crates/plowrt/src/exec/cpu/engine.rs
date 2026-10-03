@@ -679,7 +679,24 @@ impl CpuModel {
             tensor.init.is_none() && packet::names::is_checkpoint_weight(&tensor.name)
         });
         let ckpt = if needs_checkpoint {
-            let checkpoint = checkpoint.ok_or_else(|| {
+            let candidate = checkpoint
+                .map(std::path::Path::to_path_buf)
+                .or_else(|| {
+                    let parent = blob_path.parent()?;
+                    let cp = parent.join("checkpoint");
+                    if cp.is_dir() {
+                        Some(cp)
+                    } else if parent.read_dir().ok()?.any(|e| {
+                        e.ok().map_or(false, |entry| {
+                            entry.path().extension().is_some_and(|ext| ext == "safetensors")
+                        })
+                    }) {
+                        Some(parent.to_path_buf())
+                    } else {
+                        None
+                    }
+                });
+            let checkpoint = candidate.as_deref().ok_or_else(|| {
                 RuntimeError::Device("packet asset has external weights but no checkpoint".into())
             })?;
             Some(Checkpoint::open_with_twin(checkpoint, twin.as_deref())?)

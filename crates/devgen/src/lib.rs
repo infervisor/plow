@@ -8991,6 +8991,8 @@ const GFX950_DISPATCHED: &[&str] = &[
     "PLOW_DOP_DSA_POOL_STASH",
     "PLOW_DOP_DSA_Q_QUANT",
     "PLOW_DOP_EMBED",
+    "PLOW_DOP_EMBED_OVERLAY_BF16",
+    "PLOW_DOP_EMBED_POS_BF16",
     "PLOW_DOP_FLASH_DECODE",
     "PLOW_DOP_FLASH_DECODE_FP8",
     "PLOW_DOP_FLASH_GATHER_DECODE",
@@ -9009,6 +9011,8 @@ const GFX950_DISPATCHED: &[&str] = &[
     "PLOW_DOP_GEMM_F32",
     "PLOW_DOP_GEMM_FP8",
     "PLOW_DOP_GEMM_FP8_BLK",
+    "PLOW_DOP_GEMM_FP8_BLOCK128",
+    "PLOW_DOP_GEMM_FP8_BLOCK128_SPLIT4",
     "PLOW_DOP_GEMM_GLU",
     "PLOW_DOP_GEMM_GLU_FP8",
     "PLOW_DOP_GEMM_GLU_MXFP4",
@@ -9057,6 +9061,7 @@ const GFX950_DISPATCHED: &[&str] = &[
     "PLOW_DOP_KDA_STATE_STEP",
     "PLOW_DOP_KDA_STATE_STEP_G",
     "PLOW_DOP_LAYERNORM",
+    "PLOW_DOP_MLA_BMM_FP8",
     "PLOW_DOP_MLA_MERGE_FOLD",
     "PLOW_DOP_MLA_OUT_GATE",
     "PLOW_DOP_MOE_ALIGN_GEMMA_PF",
@@ -9067,6 +9072,7 @@ const GFX950_DISPATCHED: &[&str] = &[
     "PLOW_DOP_MOE_COMBINE_NORM_GEMMA_PF",
     "PLOW_DOP_MOE_COMBINE_PF",
     "PLOW_DOP_MOE_COMBINE_RESID_NORM_GEMMA",
+    "PLOW_DOP_MOE_DOWN_FP8_BLOCK128",
     "PLOW_DOP_MOE_EXPERT_DOWN",
     "PLOW_DOP_MOE_EXPERT_DOWN_FP8_BLK",
     "PLOW_DOP_MOE_EXPERT_DOWN_GEMMA",
@@ -9076,6 +9082,7 @@ const GFX950_DISPATCHED: &[&str] = &[
     "PLOW_DOP_MOE_EXPERT_GLU_GEMMA",
     "PLOW_DOP_MOE_EXPERT_GLU_GEMMA_FP8",
     "PLOW_DOP_MOE_EXPERT_GLU_NORM_GEMMA",
+    "PLOW_DOP_MOE_GLU_FP8_BLOCK128",
     "PLOW_DOP_MOE_GROUP_DOWN_FP8_BLK",
     "PLOW_DOP_MOE_GROUP_DOWN_GEMMA_PF",
     "PLOW_DOP_MOE_GROUP_DOWN_GEMMA_PF_W8A8",
@@ -9084,6 +9091,7 @@ const GFX950_DISPATCHED: &[&str] = &[
     "PLOW_DOP_MOE_GROUP_GLU_GEMMA_PF",
     "PLOW_DOP_MOE_GROUP_GLU_GEMMA_PF_W8A8",
     "PLOW_DOP_MOE_GROUP_GLU_PF",
+    "PLOW_DOP_MOE_QUANT_FP8_BLOCK128",
     "PLOW_DOP_MOE_ROUTER",
     "PLOW_DOP_MOE_ROUTER_GEMMA",
     "PLOW_DOP_MOE_ROUTER_GEMMA_PF",
@@ -9095,7 +9103,9 @@ const GFX950_DISPATCHED: &[&str] = &[
     "PLOW_DOP_NORM_RESIDUAL",
     "PLOW_DOP_NORM_RESIDUAL_NORM",
     "PLOW_DOP_O_UV_FOLD",
+    "PLOW_DOP_PER_LAYER_INPUT",
     "PLOW_DOP_QUANT_FP8",
+    "PLOW_DOP_QUANT_FP8_BLOCK128",
     "PLOW_DOP_QWEN_GATED_NORM",
     "PLOW_DOP_QWEN_GDN_CONV",
     "PLOW_DOP_QWEN_GDN_CONV_PREFILL",
@@ -9112,6 +9122,7 @@ const GFX950_DISPATCHED: &[&str] = &[
     "PLOW_DOP_ROW_GATHER",
     "PLOW_DOP_SITU_GLU",
     "PLOW_DOP_SOFTCAP",
+    "PLOW_DOP_SUM4_BF16",
     "PLOW_DOP_XALLGATHER",
     "PLOW_DOP_XALLTOALL_HEADS",
     "PLOW_DOP_XARGMAX_FIN",
@@ -9121,6 +9132,7 @@ const GFX950_DISPATCHED: &[&str] = &[
     "PLOW_DOP_XREDUCE2",
     "PLOW_DOP_XREDUCESCATTER",
     "PLOW_DOP_XREDUCE_ADD_NORM",
+    "PLOW_DOP_ZERO_F32",
 ];
 
 /// Opcodes executed by isolated `AmdEngine` segments instead of `interp.hip`.
@@ -10521,6 +10533,7 @@ fn emit_dense_gqa(
         &m,
         arch == "metal3" || (arch.is_empty() && gpu.is_empty()),
         arch.starts_with("sm_"),
+        amd,
     );
     check_group_routing_supported(&m, amd, &arch);
     warn_arch_gpu_vendor_mismatch(&arch, &gpu);
@@ -10786,12 +10799,23 @@ pub mod fp8_m1_role;
 /// Opcodes only the Metal interpreter (and the CPU golden tier) implement. Refused at emit for
 /// any other GPU target, so an E-series blob cannot reach a CUDA/HIP interpreter's
 /// `default: __trap()`.
-fn check_cpu_or_metal_opcode_coverage(m: &Model, supported: bool, cuda: bool) {
+fn check_cpu_or_metal_opcode_coverage(m: &Model, supported: bool, cuda: bool, amd: bool) {
     if supported {
         return;
     }
-    // The CUDA interpreter carries the embedding-overlay handoff (op 179) too.
-    let cuda_ok = |op: DevOp| cuda && matches!(op, DevOp::EmbedOverlayBf16 | DevOp::GluStrided);
+    // The CUDA interpreter carries the embedding-overlay handoff (op 179), pos embed (op 194), and GluStrided.
+    let cuda_ok = |op: DevOp| {
+        cuda && matches!(
+            op,
+            DevOp::EmbedOverlayBf16 | DevOp::EmbedPosBf16 | DevOp::GluStrided
+        )
+    };
+    // The AMD interpreter carries PerLayerInput (op 155), EmbedOverlayBf16 (op 179), and EmbedPosBf16 (op 194).
+    let amd_ok = |op: DevOp| {
+        amd && (op == DevOp::PerLayerInput
+            || op == DevOp::EmbedOverlayBf16
+            || op == DevOp::EmbedPosBf16)
+    };
     const CPU_OR_METAL_ONLY: [DevOp; 5] = [
         DevOp::PerLayerInput,
         DevOp::GluStrided,
@@ -10801,7 +10825,7 @@ fn check_cpu_or_metal_opcode_coverage(m: &Model, supported: bool, cuda: bool) {
     ];
     let bad: Vec<&'static str> = CPU_OR_METAL_ONLY
         .iter()
-        .filter(|op| !cuda_ok(**op))
+        .filter(|op| !cuda_ok(**op) && !amd_ok(**op))
         .filter(|op| {
             m.progs
                 .iter()
@@ -10811,7 +10835,7 @@ fn check_cpu_or_metal_opcode_coverage(m: &Model, supported: bool, cuda: bool) {
         .collect();
     assert!(
         bad.is_empty(),
-        "this packet carries opcode(s) only the CPU and Apple (metal3) interpreters currently \
+        "this packet carries opcode(s) only the CPU, Apple (metal3), and supported GPU interpreters currently \
          implement: {bad:?}; emit with --gpu <apple part> or a CPU target"
     );
 }
