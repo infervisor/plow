@@ -244,8 +244,12 @@ def cell_order(cell):
 def arm(root, prov, cell, tags, errors):
     runs = []
     for rep in sorted(tags):
-        r = (agentic_run(root, tags[rep], errors) if cell[0] == "a"
-             else single_run(root, tags[rep], prov, errors))
+        try:
+            r = (agentic_run(root, tags[rep], errors) if cell[0] == "a"
+                 else single_run(root, tags[rep], prov, errors))
+        except (OSError, ValueError, KeyError, TypeError, ZeroDivisionError) as e:
+            errors.append(f"{root}: {tags[rep]} malformed result ({type(e).__name__}: {e})")
+            r = None
         if r is not None:
             runs.append(r)
     if len(runs) != len(tags):
@@ -264,6 +268,9 @@ def arm(root, prov, cell, tags, errors):
             errors.append(f"{root}: {cell} {label} missing in a repeat")
             continue
         mean = sum(values) / len(values)
+        if mean <= 0:  # the Infervisor / Baseline ratio needs a positive mean
+            errors.append(f"{root}: {cell} {label} mean {mean} is not positive")
+            continue
         out["per_repeat"][key] = values
         out["mean"][key] = mean
         out["spread_pct"][key] = (max(values) - min(values)) / mean * 100 if mean else 0.0
@@ -275,8 +282,12 @@ def load_gate(path, packet_sha, errors):
     if path is None or not Path(path).is_file():
         errors.append(f"FP32-reference gate result missing ({path}); run campaign.py gate --only llm_fp32_ref")
         return None
-    g = json.loads(Path(path).read_text())
-    res = (g.get("gates") or {}).get("llm_fp32_ref")
+    try:
+        g = json.loads(Path(path).read_text())
+        res = (g.get("gates") or {}).get("llm_fp32_ref")
+    except (ValueError, AttributeError) as e:
+        errors.append(f"{path}: malformed gate record ({e})")
+        return None
     if res is None:
         errors.append(f"{path}: no llm_fp32_ref gate result")
         return None
@@ -294,7 +305,11 @@ def load_prov(path, side, errors):
     if not Path(path).is_file():
         errors.append(f"{path}: provenance missing (llm_grid.sh records it; or serving_comparison.py record)")
         return {}
-    prov = json.loads(Path(path).read_text())
+    try:
+        prov = json.loads(Path(path).read_text())
+    except ValueError as e:
+        errors.append(f"{path}: malformed provenance ({e})")
+        return {}
     need = ["model_version", "precision", "gpu_name", "gpu_count", "repeats"]
     need += ["stack"] if side == "baseline" else ["plowrt_git_sha", "packet_sha256"]
     for k in need:

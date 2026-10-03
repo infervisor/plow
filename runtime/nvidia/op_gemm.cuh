@@ -3400,7 +3400,9 @@ __device__ __forceinline__ void gemv_rows_fp8(__nv_bfloat16* __restrict__ C,
 #ifndef PLOW_NV_FP8_DECODE_TC
 #define PLOW_NV_FP8_DECODE_TC 1
 #endif
-#if PLOW_NV_FP8_DECODE_TC && defined(PLOW_NV_HOPPER) && PLOW_NV_HOPPER && !PLOW_NV_PREFILL
+/* Gemma-only: other models' decode objects lack the arena it needs (EMBED_SMEM, Qwen3.5 W8A8). */
+#if PLOW_NV_FP8_DECODE_TC && defined(PLOW_NV_GEMMA) && PLOW_NV_GEMMA && defined(PLOW_NV_HOPPER) && PLOW_NV_HOPPER && \
+    !PLOW_NV_PREFILL
 #define PLOW_NV_FP8_DECODE_TC_ACTIVE 1
 #include "op_gemv_fp8_tc.cuh"
 __device__ __forceinline__ bool gemv_fp8_tc_supported(unsigned M, unsigned K) {
@@ -3442,7 +3444,7 @@ static __device__ void d_gemv_fp8(__nv_bfloat16* __restrict__ C, const __nv_bflo
                            const uint8_t* __restrict__ W, const float* __restrict__ scale,
                            unsigned M, unsigned N, unsigned K, unsigned slice, unsigned nblk,
                            __nv_bfloat16* __restrict__ arena) {
-#if PLOW_NV_FP8_DECODE_TC_ACTIVE
+#if PLOW_NV_FP8_DECODE_TC_ACTIVE && !PLOW_NV_FP8_DECODE_WGMMA_ACTIVE
     if (gemv_fp8_tc_supported(M, K)) {
         if (M <= 8) d_gemv_fp8_tc<1, false>(C, x, W, nullptr, scale, nullptr, M, N, K, slice, nblk, (float*)arena);
         else if (M <= 16) d_gemv_fp8_tc2<false>(C, x, W, nullptr, scale, nullptr, M, N, K, slice, nblk, (float*)arena);
@@ -3709,7 +3711,7 @@ static __device__ void d_gemv_glu_fp8(__nv_bfloat16* __restrict__ C, const __nv_
                                const float* __restrict__ sg, const float* __restrict__ su,
                                unsigned M, unsigned N, unsigned K, unsigned act, unsigned slice,
                                unsigned nblk, __nv_bfloat16* __restrict__ arena) {
-#if PLOW_NV_FP8_DECODE_TC_ACTIVE
+#if PLOW_NV_FP8_DECODE_TC_ACTIVE && !PLOW_NV_FP8_DECODE_WGMMA_ACTIVE
     if (gemv_fp8_tc_supported(M, K) && act == PLOW_ACT_GELU_TANH_) {
         if (M <= 8) d_gemv_fp8_tc<1, true>(C, x, Wg, Wu, sg, su, M, N, K, slice, nblk, (float*)arena);
         else if (M <= 16) d_gemv_fp8_tc2<true>(C, x, Wg, Wu, sg, su, M, N, K, slice, nblk, (float*)arena);

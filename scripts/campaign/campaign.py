@@ -422,15 +422,17 @@ def nix(cmd: list[str]) -> list[str]:
     return ["nix", "develop", "--command", *cmd]
 
 
-def expand(value: str, out: Path) -> str:
+def expand(value: str, out: Path, lenient: bool = False) -> str:
     """Recipe placeholders: `{out}` (the build dir), `{repo}`, `{env:VAR}`, `{hf:org/name}` (the
     snapshot of a Hugging Face repo in $HF_HUB_CACHE / $HF_HOME/hub), `{hf:org/name@rev}` (that
-    exact snapshot)."""
+    exact snapshot). `lenient` leaves an unset `{env:}` or absent `{hf:}` unexpanded."""
     def hf(ref: str) -> str:
         repo, _, rev = ref.partition("@")
         hub = os.environ.get("HF_HUB_CACHE") or os.path.join(os.environ.get("HF_HOME", os.path.expanduser("~/.cache/huggingface")), "hub")
         snaps = sorted(Path(hub, "models--" + repo.replace("/", "--"), "snapshots").glob(rev or "*"))
         if not snaps:
+            if lenient:
+                return "{hf:" + ref + "}"
             want = f"{repo} revision {rev}" if rev else repo
             die(f"hf:{want} is not in {hub}; download it first "
                 f"(huggingface-cli download {repo}{' --revision ' + rev if rev else ''})")
@@ -444,6 +446,8 @@ def expand(value: str, out: Path) -> str:
         if key.startswith("env:"):
             v = os.environ.get(key[4:])
             if v is None:
+                if lenient:
+                    return m.group(0)
                 die(f"recipe needs ${key[4:]}")
             return v
         if key.startswith("hf:"):
@@ -698,7 +702,7 @@ def cmd_bench(a: argparse.Namespace) -> None:
         "LOG": str(out / "server.log"),
         "SERVE_EXTRA_ARGS": serve.get("extra_args", ""),
         "DATASET_ARGS": getattr(a, "dataset_args", None) or bench.get("dataset_args", ""),
-        "PREFIX_PCT": str(getattr(a, "prefix_pct", None) or bench.get("prefix_pct", 0)),
+        "PREFIX_PCT": str(a.prefix_pct if getattr(a, "prefix_pct", None) is not None else bench.get("prefix_pct", 0)),
     })
     (out / "hf-home").mkdir(exist_ok=True)
     model_id = bench.get("model_id") or json.loads((assets / "build.json").read_text()).get("slug") or cell["revision"]
@@ -1368,16 +1372,19 @@ def cmd_gate(a: argparse.Namespace) -> None:
     assets = Path(a.assets).resolve()
     out = Path(a.out).resolve()
     target = os.environ.get("CARGO_TARGET_DIR", str(REPO / "target"))
-    def x(v):
-        if a.score_only:  # only the thresholds matter; do not demand the run's env or snapshots
-            return v
-        return expand(str(v).replace("{assets}", str(assets)).replace("{target}", target), out)
+    def x(v):  # score-only does not demand the run's env or snapshots
+        return expand(str(v).replace("{assets}", str(assets)).replace("{target}", target), out, lenient=a.score_only)
     cfg = {k: {kk: ([x(i) for i in vv] if isinstance(vv, list) else x(vv) if isinstance(vv, str) else vv)
                for kk, vv in gates[k].items()} for k in kinds}
+    pkt = assets / "model.pkt"
+    # serving_comparison.py render accepts the gate only for the exact packet the Infervisor arm served,
+    # so the packet hash is the one captured with the run, never the --assets of a later re-score.
+    pkt_rec = out / "packet.sha256"
     if not a.score_only:
-        if not (assets / "model.pkt").exists():
+        if not pkt.exists():
             die(f"{assets}/model.pkt missing")
         out.mkdir(parents=True, exist_ok=True)
+        pkt_rec.write_text(sha(pkt) + "\n")
         serve = dict(r.get("serve", {}))
         env = {k: str(v) for k, v in serve.get("env", {}).items()}
         env.update(dict(kv.split("=", 1) for kv in (a.env or [])))
@@ -1423,11 +1430,14 @@ def cmd_gate(a: argparse.Namespace) -> None:
         print(f"gate run rc={rc}; log {out / 'gate.log'}", file=sys.stderr)
     if not out.is_dir():
         die(f"{out}: no gate run to score")
+    if not pkt_rec.is_file():
+        die(f"{pkt_rec} missing: the gate run did not record its packet; re-run the gate")
+    packet_sha = pkt_rec.read_text().strip()
+    if pkt.is_file() and sha(pkt) != packet_sha:
+        die(f"{pkt} sha256 {sha(pkt)} != {packet_sha} captured in {out}; score with the gate run's --assets")
     scores = {k: gate_score(k, cfg[k], out / k) for k in kinds}
-    pkt = assets / "model.pkt"
-    # serving_comparison.py render accepts the gate only for the exact packet the Infervisor arm served.
     record = dict(recipe=str(Path(a.recipe).resolve()), recipe_sha256=sha(Path(a.recipe)), assets=str(assets),
-                  packet_sha256=sha(pkt) if pkt.is_file() else None,
+                  packet_sha256=packet_sha,
                   commit=git("rev-parse", "HEAD"), dirty=bool(git("status", "--porcelain")),
                   utc=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), gates=scores,
                   thresholds={k: {kk: v for kk, v in gates[k].items() if kk.endswith(("_min", "_max"))} for k in kinds},

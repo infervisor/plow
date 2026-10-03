@@ -4,7 +4,7 @@
 //! matching an entry's signature to that entry's role; without it the packet is unchanged.
 
 use crate::attention_prefill_role::{self, Selection};
-use packet::dev::{DevInst, DevOp};
+use packet::dev::{DevInst, DevOp, TENSOR_NONE};
 use packet::devbuild::{Model, SectionData};
 use plow_asset::segment_roles::{
     AttentionCapability, GeneratedAbi, GENERATED_FIRST, GENERATED_FLASH_PREFILL_ABI,
@@ -58,7 +58,7 @@ pub(crate) struct Entry {
     pub ring_kv: bool,
     /// The object runs query heads in pairs per KV head: the GQA ratio must be even.
     pub pair_heads: bool,
-    /// Narrowest prefill rung bound: the table's smallest shape class.
+    /// Smallest prefill rung (rows) bound to the entry; narrower rungs keep their existing route.
     pub min_rows: u32,
 }
 
@@ -150,6 +150,8 @@ impl Entry {
             && heads_and_window_match(op, self.window, self.pair_heads)
             && op.i[7] == 1
             && (self.ring_kv || op.j[1] == u32::MAX)
+            // FP8-KV roles need the per-row K/V scales; gen_flash_prefill.cu reads t[6]/t[7] unchecked.
+            && (self.kv == KvDtype::Bf16 || (op.t[6] != TENSOR_NONE && op.t[7] != TENSOR_NONE))
     }
 
     fn object(&self, directory: &Path, profile: &str, gpu: &str) -> Result<Selection, String> {
@@ -313,6 +315,8 @@ mod tests {
         op.i[6] = 512;
         op.j[1] = u32::MAX;
         assert!(entry("attn_pf_hd512_fp8kv").matches(&op) && !entry("attn_pf_hd512").matches(&op));
+        op.t[7] = TENSOR_NONE;
+        assert!(!entry("attn_pf_hd512_fp8kv").matches(&op));
     }
 
     #[test]

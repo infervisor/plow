@@ -186,8 +186,9 @@ async def one_turn(http, args, sid, history, system, user):
                         ttft = ttft or time.perf_counter() - t0
                         text.append(piece)
     e2e = time.perf_counter() - t0
-    usage = usage or {}
-    n_out = usage.get("completion_tokens") or len(text)
+    if not usage or usage.get("completion_tokens") is None or usage.get("prompt_tokens") is None:
+        raise RuntimeError(f"stream carried no token usage: {usage}")
+    n_out = usage["completion_tokens"]
     # ignore_eos: anything short of max_tokens was cut, not finished.
     if n_out < args.max_tokens:
         raise RuntimeError(f"reply cut at {n_out} of {args.max_tokens} tokens")
@@ -197,7 +198,7 @@ async def one_turn(http, args, sid, history, system, user):
         cached = header_cached
     return dict(ttft_ms=None if ttft is None else ttft * 1e3, e2e_ms=e2e * 1e3,
                 tpot_ms=(e2e - ttft) / (n_out - 1) * 1e3 if ttft is not None and n_out > 1 else None,
-                prompt_tokens=usage.get("prompt_tokens") or 0, completion_tokens=n_out,
+                prompt_tokens=usage["prompt_tokens"], completion_tokens=n_out,
                 cached_tokens=cached), "".join(text)
 
 

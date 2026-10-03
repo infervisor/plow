@@ -169,6 +169,29 @@ class RenderTest(unittest.TestCase):
         self.f.gate.unlink()
         self.assertRefused("gate result missing")
 
+    def test_malformed_result_json_errors(self):
+        (self.f.plow / "g128.r1" / "bench.json").write_text("{truncated")
+        self.assertRefused("g128.r1 malformed result (JSONDecodeError")
+        (self.f.plow / "g128.r1" / "bench.json").write_text(json.dumps({"completed": 1, "num_prompts": 1}))
+        self.assertRefused("g128.r1 malformed result (KeyError")
+        (self.f.plow / "a32.g.r1.json").write_text("[]")
+        self.assertRefused("a32.g.r1 malformed result (TypeError")
+
+    def test_failed_requests_refused(self):
+        d = json.loads((self.f.base / "g128.r2" / "bench.json").read_text())
+        (self.f.base / "g128.r2" / "bench.json").write_text(json.dumps(dict(d, failed=1, completed=d["completed"] - 1)))
+        self.assertRefused("g128.r2 completed 383/384, failed 1")
+        a = json.loads((self.f.plow / "a32.g.r2.json").read_text())
+        a["overall"]["errors"] = 2
+        (self.f.plow / "a32.g.r2.json").write_text(json.dumps(a))
+        self.assertRefused("a32.g.r2.json: 2 failed requests")
+
+    def test_zero_baseline_mean_errors(self):
+        for rep in (1, 2):
+            p = self.f.base / f"g128.r{rep}" / "bench.json"
+            p.write_text(json.dumps(dict(json.loads(p.read_text()), p99_ttft_ms=0.0)))
+        self.assertRefused("g128 TTFT P99 mean 0.0 is not positive")
+
     def test_gate_for_other_packet_errors(self):
         self.f.write_gate(True, packet="cd" * 32)
         self.assertRefused("gate scored packet cdcdcdcdcdcd")

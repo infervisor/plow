@@ -1522,7 +1522,7 @@ __device__ __forceinline__ float plow_warp_dot_fp8_row(
  * B=4 9.59 vs 9.20 (few shared experts: the list build is pure cost), B=8 15.28 vs 15.75, B=16
  * 22.54 vs 26.37. A deduplicated DOWN lost at every B to the lane-split walk and was removed. */
 #ifndef PLOW_MOE_FP8_DEDUP
-#define PLOW_MOE_FP8_DEDUP 8
+#define PLOW_MOE_FP8_DEDUP 0
 #endif
 #if PLOW_MOE_FP8_DEDUP
 #define PLOW_DD_MAXS (PLOW_MOE_MAXB * 8u)

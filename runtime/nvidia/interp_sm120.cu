@@ -3746,8 +3746,12 @@ extern "C" __global__ void __launch_bounds__(PLOW_NV_THREADS)
             no[c].x[j] = __float2bfloat16(__bfloat162float(rv[c].x[j]) * invr * g);
             amax = fmaxf(amax, fabsf(__bfloat162float(no[c].x[j])));
         }
+#if defined(PLOW_NV_QUANT_FP8_VLLM) && PLOW_NV_QUANT_FP8_VLLM
+    const float as = fmaxf(__fdiv_rn(block_max(amax, part), 448.0f), 1.0f / (448.0f * 512.0f));
+#else
     const float as = fmaxf(block_max(amax, part) * (1.0f / 448.0f), 1e-12f);
     const float inv = 1.0f / as;
+#endif
     if (threadIdx.x == 0) ascale[row] = as;
 #pragma unroll
     for (int c = 0; c < 2; c++) {
@@ -3758,9 +3762,16 @@ extern "C" __global__ void __launch_bounds__(PLOW_NV_THREADS)
         uint2 q8;
         unsigned short* q2 = (unsigned short*)&q8;
 #pragma unroll
-        for (int j = 0; j < 4; j++)
+        for (int j = 0; j < 4; j++) {
+#if defined(PLOW_NV_QUANT_FP8_VLLM) && PLOW_NV_QUANT_FP8_VLLM
+            const float lo = __fdiv_rn(__bfloat162float(no[c].x[2 * j]), as);
+            const float hi = __fdiv_rn(__bfloat162float(no[c].x[2 * j + 1]), as);
+            q2[j] = pack_fp8_e4m3(fmaxf(-448.0f, fminf(lo, 448.0f)), fmaxf(-448.0f, fminf(hi, 448.0f)));
+#else
             q2[j] = pack_fp8_e4m3(__bfloat162float(no[c].x[2 * j]) * inv,
                                    __bfloat162float(no[c].x[2 * j + 1]) * inv);
+#endif
+        }
         *(uint2*)(xq + base + i) = q8;
     }
 }

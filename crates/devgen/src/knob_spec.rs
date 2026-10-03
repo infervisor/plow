@@ -1327,6 +1327,7 @@ pub const RAW_ENV: &[KnobSpec] = &[
     KnobSpec::new("env.PLOW_BUILD_MASKED_PADDING", Some("PLOW_BUILD_MASKED_PADDING"), Layer::RawEnv, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("env.PLOW_BUILD_PFATTN_HD256_BKV32", Some("PLOW_BUILD_PFATTN_HD256_BKV32"), Layer::RawEnv, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("env.PLOW_BUILD_PFATTN_HD256_GQA2_BKV32", Some("PLOW_BUILD_PFATTN_HD256_GQA2_BKV32"), Layer::RawEnv, Domain::Str, UNSET, OPT_IN),
+    KnobSpec::new("env.PLOW_BUILD_PFATTN_GQA2_BKV", Some("PLOW_BUILD_PFATTN_GQA2_BKV"), Layer::RawEnv, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("env.PLOW_BUILD_PFATTN_HD512_PX4_BQ64", Some("PLOW_BUILD_PFATTN_HD512_PX4_BQ64"), Layer::RawEnv, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("env.PLOW_BUILD_GEN_KERNELS", Some("PLOW_BUILD_GEN_KERNELS"), Layer::RawEnv, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("env.PLOW_BUILD_PFATTN_KV64", Some("PLOW_BUILD_PFATTN_KV64"), Layer::RawEnv, Domain::Str, UNSET, OPT_IN),

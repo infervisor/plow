@@ -2164,7 +2164,6 @@ fn build_cubin_from_manifest(
     let status = std::process::Command::new("cmake")
         .arg("--build")
         .arg(&build_dir)
-        .arg("--verbose")
         .arg("--target")
         .arg("sm120_cubins")
         .status()?;

@@ -11,11 +11,15 @@
 #   PLOW_SEG_FA512 / PLOW_SEG_FA256_GQA2 — [FP8-TAX] both defaults are bf16-gated.
 #   PLOW_BUILD_W8A8 + the three PLOW_BUILD_* — the object set; -DPLOW_NV_W8A8=1 is mandatory or the
 #                            w8a16 body misreads the operands.
+#
+# usage: block_e2e_fp8.sh <log-dir>
 set -uo pipefail
-W=/home/lava/plow/.claude/worktrees/gemma4-26b-beat-vllm
-T=/home/lava/.claude/jobs/ef9d0e7f/tmp
-MODEL=/opt/dlami/nvme/hf-cache/hub/gemma-4-26b-a4b-it
+W=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
+T=${1:?usage: block_e2e_fp8.sh <log-dir>}
+MODEL=${MODEL:-/opt/dlami/nvme/hf-cache/hub/gemma-4-26b-a4b-it}
+mkdir -p "$T" || exit 1
 cd "$W" || exit 1
+fail=0
 
 export GPU_LEASE_TIMEOUT=43200
 # emit
@@ -39,11 +43,13 @@ export PLOW_BUILD_PFATTN_HD256_BKV32=1 PLOW_BUILD_PFATTN_HD256_GQA2_BKV32=1
 
 run () {  # $1 cfg  $2 layer  $3 tag
   echo "########## FP8 single block: $3 (layer $2, $1)"
-  OUT="/opt/dlami/nvme/tmp/agent-geom/blkfp8-$3" \
+  OUT="$T/blkfp8-$3" \
   BATCH=1,4 CTX=128,1024 \
     bash "$W/scripts/block_e2e.sh" "$MODEL" "perf-data/block-configs/$1" "$2" 2048 \
     > "$T/blkfp8_$3.log" 2>&1
-  echo "$3 rc=$?"
+  local rc=$?
+  echo "$3 rc=$rc"
+  [ "$rc" = 0 ] || fail=1
   grep -nE "plow|vllm|ratio|FAIL|Error|error|refus|0\.[0-9]+x|[0-9]+\.[0-9]+x" "$T/blkfp8_$3.log" \
     | tail -32
   echo
@@ -52,3 +58,4 @@ run () {  # $1 cfg  $2 layer  $3 tag
 run gemma4-26b-a4b-sliding.json 0 sliding
 run gemma4-26b-a4b-full.json 5 full
 echo "===== BLKFP8 DONE"
+exit "$fail"

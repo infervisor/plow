@@ -21,9 +21,10 @@ is the lever rather than more quantisation.
 """
 import importlib.util
 import json
+from pathlib import Path
 import sys
 
-REPO = "/home/lava/plow/.claude/worktrees/gemma4-26b-beat-vllm"
+REPO = Path(__file__).resolve().parents[2]
 spec = importlib.util.spec_from_file_location("rf", f"{REPO}/scripts/campaign/roofline.py")
 rf = importlib.util.module_from_spec(spec)
 sys.modules["rf"] = rf
@@ -42,7 +43,7 @@ print(f"H100 SXM5 {h.bandwidth_for_bound_gbps} GB/s; ridge bf16 "
       f"{h.bf16_tflops_dense*1e12/bw:.0f} / fp8 {h.fp8_tflops_dense*1e12/bw:.0f} FLOP/B")
 print()
 
-CK = "/opt/dlami/nvme/hf-cache/hub/gemma-4-26b-a4b-it"
+CK = sys.argv[1] if len(sys.argv) > 1 else "/opt/dlami/nvme/hf-cache/hub/gemma-4-26b-a4b-it"
 m = rf.spec_from_hf_config(CK, "bf16")
 t = json.loads(open(f"{CK}/config.json").read())
 t = t.get("text_config", t)
