@@ -247,6 +247,47 @@ the packet a bring-up artifact and `freeze_serving_set.sh` will refuse it.
 
 A perf change that is not bit-identical needs a numerics gate, not just a faster number.
 
+**Cross-stack quality is gated against FP32, not against vLLM's bits** (`scripts/llm/fp32_ref_gate.py`,
+`campaign.py gate` kind `llm_fp32_ref`). Two FP8 stacks never agree bit for bit, and near-tie
+flips fail any exact-match gate (vLLM's repeat floor is 0). Instead an independent FP32 reference
+(the served FP8 checkpoint dequantized to FP32 weights, FP32 activations, TF32 off, exact chunked
+attention) scores both stacks on one fixed token-id prompt set, and Plow must stay within vLLM's
+distance to FP32:
+
+| metric (vs FP32) | definition | pass if Plow ... (default) |
+|---|---|---|
+| `kl_mean`, `kl_p99` | KL(FP32 ‖ stack) per teacher-forced position, FP32 top-20 + remainder bucket (stack's 20th logprob for a missing token) | ≤ vLLM × `kl_ratio_max` (1.25) + `kl_slack_max` (0.002) |
+| `top1_decisive` | top-1 agreement where the FP32 top-1/top-2 margin > `tie_margin` (1.0 nat) | ≥ vLLM − `top1_drop_max` (0.01) |
+| `cont_frac` | stack's own greedy continuation: tokens matching FP32 before the first divergence / reference length | ≥ vLLM − `cont_drop_max` (0.05) |
+| `needle_acc` | needle answer contained in the greedy continuation | ≥ vLLM − `needle_drop_max` (0) and ≥ `needle_min` (0.9) |
+
+Any missing scored position fails. Capture is teacher-forced through `/v1/completions` (token-id
+prompt, greedy, `logprobs: 20`): each request starts at prompt + FP32 continuation[:k]; positions up
+to and including the first disagreement have the exact FP32 history, the next request restarts one
+past it (1 + flips requests per case). Prompt set (`prompts`): natural text at 128/1K/4K/8K/15.9K
+tokens from two Gutenberg books, repo docs and repo Rust; eight chat-template agentic samples
+(tools, tool calls/results, multi-turn, 54 to 15.3K tokens); 18 chat needles (4K and 15.9K, depths
+0.1/0.5/0.9). Build once, cache with sha256s, gate many times:
+
+```bash
+P=scripts/llm/fp32_ref_gate.py; HF=<hub gemma-4-12b-it-fp8 dir>
+python3 $P prompts --hf $HF --corpus pride=pg1342.txt beagle=pg944.txt docs=repo-docs.md code=repo-code.rs --out prompts.json
+gpulease -n 1 fp32-ref timeout 5400 python3 $P reference --hf $HF --prompts prompts.json --out ref.json  # ~50 GB VRAM
+# recipe: [gates.llm_fp32_ref] reference = ".../ref.json", vllm_hf = $HF, vllm_args = "<matched vLLM serve flags>"
+#         (or vllm_capture = a cached vllm.json against the same ref.json); thresholds as above
+campaign.py gate <recipe> --assets <assets> --out <dir> [--only llm_fp32_ref] [--score-only]
+python3 $P gate --ref ref.json --cand <dir>/llm_fp32_ref/plow.json --peer <dir>/llm_fp32_ref/vllm.json
+```
+
+The tolerances were calibrated on Gemma-4 12B FP8 (H100), where vLLM's own repeats differ by 1.18× in
+KL mean, 0.006 in top-1 and 0.021 in agreement. vLLM gated against its own repeat passes in both
+directions. Results are in the [gemma12b comparison](results/gemma12b-fp8-20260930/comparison.md#fp32-reference-quality-gate).
+The in-lease vLLM server needs `nvcc` (CUDA toolkit on `PATH`, or `CUDA_HOME`), so run it inside
+`nix develop` or set it in `[gates.llm_fp32_ref.env]`. Captures send `ignore_eos`, because plowrt
+leaves a stop token out of completions logprobs.
+
+Unit tests: `cd scripts/llm && python3 -m unittest test_fp32_ref_gate`.
+
 ---
 
 ## 6. Measurement hazards

@@ -1,9 +1,14 @@
 """attn_pf_hd256_sliding: causal sliding-window flash prefill, head_dim 256, bf16, sm_90a.
 
-  attn_pf_hd256_sliding.py build OUT.cubin [--config k=v,...]   no GPU: nvcc one config
+  attn_pf_hd256_sliding.py build OUT.cubin [--config k=v,...] [--fp8kv]  no GPU: nvcc one config
   attn_pf_hd256_sliding.py check CUBIN                           GPU: contract + rel-L2 suite
   attn_pf_hd256_sliding.py bench CUBIN [--role14 CUBIN] [--fa3]  GPU: us per shape class
-  attn_pf_hd256_sliding.py tune OUT.json                         GPU: sweep configs per class
+  attn_pf_hd256_sliding.py tune OUT.json [--fp8kv]               GPU: sweep configs per class
+
+`--fp8kv` selects the FP8-KV twin (gen_attn_pf_hd256_sliding_fp8kv.cu: e4m3 K/V with one f32
+scale per row, the FlashPrefillFp8 contract); check/bench recognize it from the cubin's
+plow_gen_flash_prefill_abi (2) and quantize their K/V the way the packet writes the cache
+(scale = row amax / 448). The FP8 reference is fp32 attention over the dequantized cache.
 
 The kernel is runtime/nvidia/gen_attn_pf_hd256_sliding.cu, a parameterized wgmma template
 (GEN_BN score tile, GEN_STAGES K/V ring depth, GEN_PREG/GEN_CREG producer/consumer register
@@ -16,6 +21,7 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]
 SOURCE = REPO / "runtime/nvidia/gen_attn_pf_hd256_sliding.cu"
+SOURCE_FP8 = REPO / "runtime/nvidia/gen_attn_pf_hd256_sliding_fp8kv.cu"
 D = 256
 BF16_PEAK_TFLOPS = 989.0
 DEFAULT = {"bn": 64, "kstages": 3, "vstages": 2, "preg": 56}
@@ -79,24 +85,24 @@ def wgmma_inc():
     return head + "".join(qk(n) for n in (32, 64)) + "".join(pv(bn) for bn in (32, 64))
 
 
-def digest(cfg):
+def digest(cfg, fp8=False):
     """Generator identity of one config: the template sources plus the defines."""
     import hashlib
     h = hashlib.sha256()
-    for path in (SOURCE, SOURCE.with_name("gen_attn_pf_hd256_wgmma.inc")):
+    for path in (SOURCE_FP8 if fp8 else SOURCE, SOURCE.with_name("gen_attn_pf_hd256_wgmma.inc")):
         h.update(path.read_bytes())
     h.update(json.dumps(cfg, sort_keys=True).encode())
     return h.hexdigest()
 
 
-def build(out, cfg):
+def build(out, cfg, fp8=False):
     nvcc = os.environ.get("PLOW_NVCC", "/usr/local/cuda-12.9/bin/nvcc")
     cmd = [nvcc, "-ccbin", os.environ.get("PLOW_CXX", "/usr/bin/g++-14"), "-std=c++17",
            "-gencode", "arch=compute_90a,code=sm_90a", "-O3", "-cubin", "-Xptxas=-v",
            f"-I{REPO / 'runtime/common'}", f"-I{REPO / 'runtime/nvidia'}",
            f"-DGEN_BN={cfg['bn']}", f"-DGEN_KSTAGES={cfg['kstages']}",
            f"-DGEN_VSTAGES={cfg['vstages']}", f"-DGEN_PREG={cfg['preg']}",
-           f"-DGEN_CREG={creg(cfg['preg'])}", "-o", str(out), str(SOURCE)]
+           f"-DGEN_CREG={creg(cfg['preg'])}", "-o", str(out), str(SOURCE_FP8 if fp8 else SOURCE)]
     res = subprocess.run(cmd, capture_output=True, text=True)
     if res.returncode:
         raise RuntimeError(f"nvcc failed {cfg}:\n{res.stderr[-3000:]}")
@@ -174,7 +180,7 @@ class Case:
     of a request at ring row p & kv_mask; requests (q0, qlen, slot, kvlen) packed in order."""
 
     def __init__(self, drv, H, KVH, window, requests, seq_q=None, kv_stride=None, ring=True,
-                 slots=None, seed=0, qscale=None):
+                 slots=None, seed=0, qscale=None, fp8=False):
         torch = drv.torch
         self.drv, self.H, self.KVH, self.window, self.requests = drv, H, KVH, window, requests
         real = requests[-1][0] + requests[-1][1]
@@ -195,18 +201,33 @@ class Case:
         self.k = torch.zeros(slots, KVH, self.kv_stride, D, device="cuda", dtype=bf)
         self.v = torch.zeros_like(self.k)
         self.lin = []
+        self.fp8 = fp8
+        if fp8:
+            self.k8 = torch.zeros(slots, KVH, self.kv_stride, D, device="cuda", dtype=torch.uint8)
+            self.v8 = torch.zeros_like(self.k8)
+            self.ks = torch.zeros(slots, KVH, self.kv_stride, device="cuda", dtype=torch.float32)
+            self.vs = torch.zeros_like(self.ks)
         for q0, qlen, slot, kvlen in requests:
             kl = torch.randn(kvlen, KVH, D, device="cuda", generator=g).to(bf)
             vl = torch.randn(kvlen, KVH, D, device="cuda", generator=g).to(bf)
             pos = torch.arange(kvlen, device="cuda")
+            if fp8:
+                # The packet's cache write: per (position, KV head) row, scale = amax / 448.
+                (k8, ks, kl), (v8, vs, vl) = quant_rows(kl), quant_rows(vl)
+                keep = pos >= kvlen - self.kv_stride if ring else pos >= 0
+                rows = pos[keep] & self.kv_mask if ring else pos[keep]
+                self.k8[slot][:, rows] = k8[keep].transpose(0, 1)
+                self.v8[slot][:, rows] = v8[keep].transpose(0, 1)
+                self.ks[slot][:, rows] = ks[keep].transpose(0, 1)
+                self.vs[slot][:, rows] = vs[keep].transpose(0, 1)
             if ring:
                 keep = pos >= kvlen - self.kv_stride  # what the ring still holds
                 rows = pos[keep] & self.kv_mask
-                self.k[slot][:, rows] = kl[keep].transpose(0, 1)
-                self.v[slot][:, rows] = vl[keep].transpose(0, 1)
+                self.k[slot][:, rows] = kl[keep].transpose(0, 1).to(bf)
+                self.v[slot][:, rows] = vl[keep].transpose(0, 1).to(bf)
             else:
-                self.k[slot][:, :kvlen] = kl.transpose(0, 1)
-                self.v[slot][:, :kvlen] = vl.transpose(0, 1)
+                self.k[slot][:, :kvlen] = kl.transpose(0, 1).to(bf)
+                self.v[slot][:, :kvlen] = vl.transpose(0, 1).to(bf)
             self.lin.append((kl, vl))
         self.o = torch.full((self.seq_q, H, D), float("nan"), device="cuda", dtype=bf)
         flat = [len(requests)] + [x for r in requests for x in r]
@@ -237,6 +258,13 @@ class Case:
     def gen_args(self, scale=1.0, tma=False):
         p = lambda t: ("p", t.data_ptr())
         mapkv = self.map_table() if tma else 0
+        if self.fp8:
+            # plow_gen_flash_prefill_abi 2: k_scale / v_scale in the opart / mlpart slots.
+            return pack([p(self.req), p(self.ks), p(self.vs), p(self.q), p(self.k8), p(self.v8),
+                         p(self.o), ("p", 0), p(self.entries), p(self.counters), p(self.counters),
+                         ("u", self.seq_q), ("u", 0), ("u", 0), ("u", self.kv_stride),
+                         ("u", self.kv_mask), ("f", scale), ("u", self.H), ("u", self.KVH),
+                         ("u", self.window), ("u", 0)])
         return pack([p(self.req), p(self.scratch), p(self.scratch), p(self.q), p(self.k),
                      p(self.v), p(self.o), ("p", mapkv), p(self.entries), p(self.counters),
                      p(self.counters), ("u", self.seq_q), ("u", 0), ("u", 0),
@@ -280,6 +308,17 @@ class Case:
         return math.sqrt(num / den), tail_ok, finite
 
 
+def quant_rows(x):
+    """bf16 [rows][KVH][D] -> (e4m3 bytes, f32 scale [rows][KVH], dequantized bf16-exact f32),
+    the packet's per-row KV quantization."""
+    import torch
+    xf = x.float()
+    scale = xf.abs().amax(-1) / 448.0
+    inv = torch.where(scale > 0, 1.0 / scale, torch.zeros_like(scale))
+    q = (xf * inv[..., None]).to(torch.float8_e4m3fn)
+    return q.view(torch.uint8), scale, q.float() * scale[..., None]
+
+
 def graph_time(torch, fns, reps=7):
     for f in fns:
         f()
@@ -309,11 +348,14 @@ class Kernel:
     def __init__(self, drv, cubin, tma=False):
         self.drv, self.tma = drv, tma
         self.mod, self.fn = drv.function(Path(cubin).read_bytes(), "plow_gen_flash_prefill_direct")
+        self.fp8 = drv.global_u32(self.mod, "plow_gen_flash_prefill_abi") == 2
+        assert not (tma and self.fp8), "the FP8-KV object stages without tensor maps"
         self.block = drv.global_u32(self.mod, "plow_gen_block")
         self.smem = drv.global_u32(self.mod, "plow_gen_arena_bytes")
         drv.prepare(self.fn, self.block, self.smem)
 
     def __call__(self, case, scale=1.0):
+        assert case.fp8 == self.fp8, "case KV dtype differs from the object's"
         self.drv.launch(self.fn, 132, self.block, self.smem, case.gen_args(scale, self.tma))
 
 
@@ -359,16 +401,22 @@ def check_cases():
         ("w1024 linear kv chunked", 16, 8, 1024, [(0, 1024, 0, 3072)],
          {"ring": False, "kv_stride": 4096}),
         ("peaky logits w1024", 16, 8, 1024, [(0, 2048, 0, 2048)], {"qscale": 0.25}),
+        # Many short packed requests (a high-concurrency prefill chunk), ragged, one wrapping.
+        ("32 packed x 128, ragged kv", 16, 8, 1024,
+         [(sum(128 - (j % 3) * 17 for j in range(i)), 128 - (i % 3) * 17, i, 128 + 300 * i)
+          for i in range(32)],
+         {"seq_q": 4096, "kv_stride": 2048}),
     ]
 
 
 def cmd_check(a):
     drv = Driver()
-    kerns = {"cp.async": Kernel(drv, a.cubin), "tma": Kernel(drv, a.cubin, True)}
+    kern = Kernel(drv, a.cubin)
+    kerns = {"cp.async": kern} if kern.fp8 else {"cp.async": kern, "tma": Kernel(drv, a.cubin, True)}
     worst = 0.0
     ok_all = True
     for name, H, KVH, W, reqs, kw in check_cases():
-        c = Case(drv, H, KVH, W, reqs, **kw)
+        c = Case(drv, H, KVH, W, reqs, fp8=kern.fp8, **kw)
         for mode, kern in kerns.items():
             c.o.fill_(float("nan"))
             kern(c)
@@ -379,7 +427,7 @@ def cmd_check(a):
             worst = max(worst, err)
             print(f"{'PASS' if ok else 'FAIL'} {name} [{mode}]: rel_l2 {err:.2e} tail_zero {tail} "
                   f"finite {finite}", flush=True)
-        if a.role14 and (H, KVH, W) == (16, 8, 1024) and kw.get("ring", True):
+        if a.role14 and not kern.fp8 and (H, KVH, W) == (16, 8, 1024) and kw.get("ring", True):
             r14 = Role14(drv, a.role14)
             c.o.fill_(float("nan"))
             r14(c)
@@ -391,12 +439,22 @@ def cmd_check(a):
     return 0 if ok_all else 1
 
 
-def bench_class(drv, fns, H, KVH, W, rows, role14=None, fa3=False):
+def class_requests(rows, kvpos=0, count=1):
+    """One chunk of `rows` query rows at KV position `kvpos`, or `count` packed requests of `rows`
+    rows each at KV lengths kvpos + 64 r (the packed shapes of px23_hd256_fp8_bench)."""
+    if count == 1:
+        return [(0, rows, 0, rows + kvpos)]
+    return [(rows * r, rows, r, max(rows, kvpos + 64 * r)) for r in range(count)]
+
+
+def bench_class(drv, fns, H, KVH, W, rows, role14=None, fa3=False, kvpos=0, count=1):
     torch = drv.torch
-    reqs = [(0, rows, 0, rows)]
-    per = rows * (2 * H) * D * 2 + 2 * KVH * (1 << (W + rows - 2).bit_length()) * D * 2
+    reqs = class_requests(rows, kvpos, count)
+    span = max((W or kvlen) + qlen - 1 for _, qlen, _, kvlen in reqs)
+    per = rows * count * (2 * H) * D * 2 + 2 * KVH * count * (1 << (span - 1).bit_length()) * D * 2
     n = max(2, min(8, math.ceil(160e6 / per)))
-    cases = [Case(drv, H, KVH, W, reqs, seed=s) for s in range(n)]
+    fp8 = any(k.fp8 for k in fns.values())
+    cases = [Case(drv, H, KVH, W, reqs, seed=s, fp8=fp8) for s in range(n)]
     fl = flop(H, W, reqs)
     out = {"floor_us": round(fl / BF16_PEAK_TFLOPS / 1e6, 1)}
     for name, k in fns.items():
@@ -406,7 +464,7 @@ def bench_class(drv, fns, H, KVH, W, rows, role14=None, fa3=False):
         us = graph_time(torch, [(lambda c=c: k(c)) for c in cases])
         out[name] = {"us": round(us, 1), "rel_l2": float(f"{err:.2e}"),
                      "tflops": round(fl / us / 1e6)}
-    if role14 is not None and (H, KVH, W) == (16, 8, 1024):
+    if role14 is not None and not fp8 and (H, KVH, W) == (16, 8, 1024):
         for tma in (True,):
             r = Role14(drv, role14, tma)
             r(cases[0])
@@ -415,7 +473,7 @@ def bench_class(drv, fns, H, KVH, W, rows, role14=None, fa3=False):
             us = graph_time(torch, [(lambda c=c: r(c)) for c in cases])
             out["role14" + ("" if tma else "_cpasync")] = {
                 "us": round(us, 1), "rel_l2": float(f"{err:.2e}"), "tflops": round(fl / us / 1e6)}
-    if fa3:
+    if fa3 and not fp8:
         import flashinfer
         cu = torch.tensor([0, rows], device="cuda", dtype=torch.int32)
         fo = torch.empty(rows, H, D, device="cuda", dtype=torch.bfloat16)
@@ -439,19 +497,26 @@ def cmd_bench(a):
     for c in a.cubin:
         for tma in ((False, True) if a.tma else (False,)):
             fns[Path(c).stem + ("+tma" if tma else "")] = Kernel(drv, c, tma)
+    # A class is H,KVH,W,rows[,kvpos[,count]] (class_requests).
     classes = CLASSES if not a.classes else [tuple(int(x) for x in s.split(","))
                                              for s in a.classes]
     res = {}
-    for H, KVH, W, rows in classes:
-        key = f"h{H}kv{KVH}_w{W}_rows{rows}"
-        res[key] = bench_class(drv, fns, H, KVH, W, rows, a.role14, a.fa3)
+    for H, KVH, W, rows, *rest in classes:
+        key = f"h{H}kv{KVH}_w{W}_rows{rows}" + "".join(f"_{k}{v}" for k, v in zip(("kv", "x"), rest))
+        res[key] = bench_class(drv, fns, H, KVH, W, rows, a.role14, a.fa3, *rest)
         print(key, json.dumps(res[key]), flush=True)
     if a.json:
         Path(a.json).write_text(json.dumps(res, indent=1) + "\n")
 
 
-def sweep():
-    """K/V ring depths that fit beside Q (2 x 32 KiB) in the 227 KiB arena, per score tile."""
+def sweep(fp8=False):
+    """K/V ring depths that fit beside Q (2 x 32 KiB) in the 227 KiB arena, per score tile. The
+    FP8-KV object also holds 32 KiB of raw staging and per-stage scales: only BN64, 2 + 2 fits,
+    so its sweep is the producer register split."""
+    if fp8:
+        for preg in (56, 64, 72):
+            yield {"bn": 64, "kstages": 2, "vstages": 2, "preg": preg}
+        return
     for bn, ks, vs in itertools.product((64, 32), (2, 3, 4, 6), (2, 3, 4)):
         size = 2 * 64 * 512 + (ks + vs) * bn * 512 + 1024 + 8 * (4 + 2 * ks + 2 * vs)
         if size <= 227 * 1024 and vs <= ks:
@@ -466,31 +531,31 @@ def packed_check(drv, kern):
     """Three chunked requests in one padded launch with a wrapping ring: slot order, KV offset,
     zeroed tail."""
     c = Case(drv, 16, 8, 1024, [(0, 1000, 2, 3000), (1000, 1500, 0, 1500), (2500, 77, 1, 9000)],
-             seq_q=2688, kv_stride=4096)
+             seq_q=2688, kv_stride=4096, fp8=kern.fp8)
     kern(c)
     drv.torch.cuda.synchronize()
     err, tail, finite = c.reference_error()
     return {"rel_l2": float(f"{err:.2e}"), "tail_zero": tail, "finite": finite}
 
 
-def tune_row(log=print):
+def tune_row(log=print, fp8=False):
     """Sweep every config over every shape class with the packet's KV maps (the TMA staging the
     role runs in-model), pick the least total time, and return the catalog row (minus signature
     and object) for build_catalog.py's table."""
     drv = Driver()
     trials = []
     with tempfile.TemporaryDirectory() as tmp:
-        for cfg in sweep():
+        for cfg in sweep(fp8):
             out = Path(tmp) / "k.cubin"
             try:
-                spill = build(out, cfg)
+                spill = build(out, cfg, fp8)
             except RuntimeError as e:
                 log(f"{cfg}: build failed: {str(e).splitlines()[0]}")
                 continue
             if spill:
                 log(f"{cfg}: {spill} spill bytes, skipped")
                 continue
-            kern = Kernel(drv, out, tma=True)
+            kern = Kernel(drv, out, tma=not fp8)
             res = {class_key(*cl): bench_class(drv, {"gen": kern}, *cl)["gen"] | {
                 "floor_us": round(flop(cl[0], cl[2], [(0, cl[3], 0, cl[3])]) /
                                   BF16_PEAK_TFLOPS / 1e6, 1)} for cl in CLASSES}
@@ -508,20 +573,21 @@ def tune_row(log=print):
         key = class_key(*cl)
         meas = [{"config": c, **r[key]} for c, r, _ in trials]
         classes[key] = {"best": min(meas, key=lambda m: m["us"])["config"], "measured": meas}
-    return {"config": best[0], "body_sha256": digest(best[0]),
-            "selection": "min total us over classes, TMA staging", "classes": classes,
+    return {"config": best[0], "body_sha256": digest(best[0], fp8),
+            "selection": "min total us over classes" + ("" if fp8 else ", TMA staging"),
+            "classes": classes,
             "packed_check": best[2], "spill_bytes": 0}
 
 
-def catalog_build(cfg, out):
+def catalog_build(cfg, out, fp8=False):
     """build_catalog.py hook: compile one config, return its generator digest."""
-    if build(out, cfg):
-        raise RuntimeError(f"attn_pf_hd256_sliding {cfg} spills")
-    return digest(cfg)
+    if build(out, cfg, fp8):
+        raise RuntimeError(f"attn_pf_hd256_sliding{'_fp8kv' if fp8 else ''} {cfg} spills")
+    return digest(cfg, fp8)
 
 
 def cmd_tune(a):
-    row = tune_row()
+    row = tune_row(fp8=a.fp8kv)
     Path(a.out).write_text(json.dumps(row, indent=1) + "\n")
 
 
@@ -532,6 +598,7 @@ def main():
     b = sub.add_parser("build")
     b.add_argument("out")
     b.add_argument("--config", default="")
+    b.add_argument("--fp8kv", action="store_true")
     c = sub.add_parser("check")
     c.add_argument("cubin")
     c.add_argument("--role14")
@@ -544,6 +611,7 @@ def main():
     be.add_argument("--json")
     t = sub.add_parser("tune")
     t.add_argument("out")
+    t.add_argument("--fp8kv", action="store_true")
     sub.add_parser("wgmma-inc")
     a = ap.parse_args()
     if a.cmd == "wgmma-inc":
@@ -554,7 +622,7 @@ def main():
         for kv in filter(None, a.config.split(",")):
             k, v = kv.split("=")
             cfg[k] = int(v)
-        print(f"spill bytes {build(a.out, cfg)}")
+        print(f"spill bytes {build(a.out, cfg, a.fp8kv)}")
         return 0
     return {"check": cmd_check, "bench": cmd_bench, "tune": cmd_tune}[a.cmd](a) or 0
 

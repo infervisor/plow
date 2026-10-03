@@ -623,14 +623,15 @@ fn prefill_moe_lt_capacity(blob: &DevBlob, roles: Option<&SegmentRoles>) -> u32 
         .unwrap_or(0)
 }
 
-/// Bytes the KV admission budget charges one row, and the block a request's rows round up to
-/// (`None`: linear). `None` for flat KV, which backs every slot at load and has no budget.
+/// Bytes the KV admission budget charges one row, the block a request's rows round up to
+/// (`None`: linear), and the fixed bytes each request commits (prefix-mode live rings). `None`
+/// for flat KV, which backs every slot at load and has no budget.
 fn kv_row_charge(
     vmm: Option<&VmmServe>,
     blob: &DevBlob,
     max_ctx: usize,
     batch: usize,
-) -> Option<(u64, Option<u64>)> {
+) -> Option<(u64, Option<u64>, u64)> {
     let vmm = vmm?;
     // The budget is what is free AFTER the sliding rings were cudaMalloc'd, so a row may only be
     // charged for what will still be MAPPED for it: the full-attention head windows, a block at a
@@ -638,12 +639,30 @@ fn kv_row_charge(
     // B/token against a real 20480, admitted ~10 of 16 requests at 4096 tokens, and the other 6
     // waited out a whole generation: TTFT 3-4.5 s at C16. With live rings every cache maps
     // lazily and the average stays the honest bound.
-    if vmm.rings.is_none() {
-        let geo = vmm.kv.geometry();
-        let per_token = geo.full_layers.len() as u64 * 2 * geo.kvh_full as u64 * geo.row_bytes();
-        let block_rows = vmm.kv.block_rows() as u64;
+    let geo = vmm.kv.geometry();
+    let per_token = geo.full_layers.len() as u64 * 2 * geo.kvh_full as u64 * geo.row_bytes();
+    let block_rows = vmm.kv.block_rows() as u64;
+    let request_bytes = match &vmm.rings {
+        // Prefix admission maps `max(block, widest prefill bucket)` rows past the request
+        // (`admit_packed_slot`); with the ring committed per request, charge both, so a budget
+        // capped by `PLOW_KV_MEM_UTIL` bounds what admission actually maps.
+        Some(rings) if vmm.kv.prefix_reuse() => {
+            let pf_rows = blob
+                .progs
+                .iter()
+                .filter(|g| g.role.is_prefill_side())
+                .map(|g| g.t as u64)
+                .max()
+                .unwrap_or(0);
+            let margin_blocks = pf_rows.max(block_rows).div_ceil(block_rows.max(1));
+            Some(rings.slot_charge() + margin_blocks * block_rows * per_token)
+        }
+        Some(_) => None,
+        None => Some(0),
+    };
+    if let Some(request_bytes) = request_bytes {
         if per_token > 0 && block_rows > 0 {
-            return Some((per_token, Some(block_rows)));
+            return Some((per_token, Some(block_rows), request_bytes));
         }
     }
     let kv_bytes: u64 = blob
@@ -653,7 +672,7 @@ fn kv_row_charge(
         .map(|t| t.bytes)
         .sum();
     let rows = (max_ctx as u64).checked_mul(batch as u64)?;
-    Some((kv_bytes.checked_div(rows).filter(|&b| b > 0)?, None))
+    Some((kv_bytes.checked_div(rows).filter(|&b| b > 0)?, None, 0))
 }
 
 /// `PLOW_PF_ATTN_GEMM` unset: the route's scratch comes out of the KV admission budget (sampled
@@ -668,17 +687,18 @@ fn attention_route_fits_kv(
     batch: usize,
     scratch: u64,
 ) -> bool {
-    let Some((per_token, block_rows)) = kv_row_charge(vmm, blob, max_ctx, batch) else {
+    let Some((per_token, block_rows, request_bytes)) = kv_row_charge(vmm, blob, max_ctx, batch)
+    else {
         return true;
     };
-    let Ok((free, _)) = be.mem_info() else {
+    let Ok((free, total)) = be.mem_info() else {
         return false;
     };
     let config = RuntimeConfig::get();
     let live = config.decode_max_rung.map_or(batch, |rung| batch.min(rung as usize)) as u64;
     let request = (max_ctx as u64).next_multiple_of(block_rows.unwrap_or(1));
-    let need = live * request * per_token;
-    let budget = (free.saturating_sub(scratch) as f64 * config.kv_admit_headroom()) as u64;
+    let need = live * (request * per_token + request_bytes);
+    let budget = config.kv_admit_budget(free.saturating_sub(scratch), total);
     let fits = budget >= need;
     tracing::info!(
         fits,
@@ -869,8 +889,9 @@ impl SegmentRoleValidation for SegmentRoles {
 
 struct PacketRole {
     function: KernelFn,
-    /// Generated flash-prefill direct entry and the head width its packet ops must carry.
-    direct_gen: Option<(KernelFn, u32)>,
+    /// Generated flash-prefill direct entry, the head width its packet ops must carry, and
+    /// whether it reads an FP8 KV cache (`FlashPrefillFp8` operands).
+    direct_gen: Option<(KernelFn, u32, bool)>,
     direct_hd512: Option<KernelFn>,
     direct_hd256_gqa2: Option<KernelFn>,
     direct_w8a8_glu: Option<KernelFn>,
@@ -942,7 +963,8 @@ struct Gemma4GluW8A8DirectArgs {
 
 const _: () = assert!(std::mem::size_of::<Gemma4GluW8A8DirectArgs>() == 88);
 
-/// `PlowGenFlashPrefill` (runtime/nvidia/gen_flash_prefill.cu).
+/// `PlowGenFlashPrefill` (runtime/nvidia/gen_flash_prefill.cu). FP8-KV objects
+/// (`gen_flash_prefill_fp8kv_v1`) take the k / v scale vectors in `opart` / `mlpart`.
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct GenFlashPrefillArgs {
@@ -1345,6 +1367,51 @@ fn validate_attention_role_inst(
     Ok(())
 }
 
+/// A generated FP8-KV flash-prefill role's op: one-split fused `FlashPrefillFp8` over bf16 Q/O,
+/// e4m3 K/V [kv heads][stride][hd] and f32 row scales [kv heads][stride] (per slot).
+fn validate_fp8_kv_attention_role_inst(
+    d: &DevInst64,
+    rows: u32,
+    tensors: &[crate::asset::devblob::DevTensor],
+) -> Result<()> {
+    let reject =
+        || RuntimeError::Rejected("unsupported FP8-KV attention role operands or geometry".into());
+    let (heads, kv_heads, hd) = (d.i[2], d.i[3], d.i[6]);
+    if rows == 0
+        || d.i[0] != rows
+        || d.i[1] == 0
+        || heads == 0
+        || kv_heads == 0
+        || heads % kv_heads != 0
+        || d.i[7] != 1
+        || hd == 0
+        || !f32::from_bits(d.fj[0]).is_finite()
+    {
+        return Err(reject());
+    }
+    let extent = |slot: usize, bytes: u64| -> Result<()> {
+        if d.t[slot] == TENSOR_NONE16
+            || tensors.get(d.t[slot] as usize).is_none_or(|t| t.bytes < bytes)
+        {
+            return Err(reject());
+        }
+        Ok(())
+    };
+    let io_bytes = u64::from(rows) * u64::from(heads) * u64::from(hd) * 2;
+    let stride = if d.fj[1] == 0 { d.i[1] } else { d.fj[1] };
+    let kv_rows = u64::from(stride) * u64::from(kv_heads);
+    extent(2, io_bytes)?;
+    extent(5, io_bytes)?;
+    extent(3, kv_rows * u64::from(hd))?;
+    extent(4, kv_rows * u64::from(hd))?;
+    extent(6, kv_rows * 4)?;
+    extent(7, kv_rows * 4)?;
+    if d.t[2..5].contains(&d.t[5]) {
+        return Err(reject());
+    }
+    Ok(())
+}
+
 fn segment_window(arg: &mut DevProgram, base: &DevProgram, seg: usize, role: bool) {
     arg.cur_seg = if role { seg as u32 } else { 0 };
     arg.gq_seg_ofs = base.gq_seg_ofs + if role { 0 } else { (seg * 4) as u64 };
@@ -1615,6 +1682,10 @@ fn packet_role_segments(
                         "FP8 GEMM role requires mapped GEMMs".into(),
                     ));
                 }
+            } else if plow_asset::segment_roles::is_generated(role)
+                && d.op == DevOp::FlashPrefillFp8 as u16
+            {
+                validate_fp8_kv_attention_role_inst(d, g.t, tensors)?;
             } else if plow_asset::segment_roles::is_generated(role) {
                 if d.op != DevOp::FlashPrefill as u16 || d.i[7] != 1 || d.t[5] == TENSOR_NONE16 {
                     return Err(RuntimeError::Rejected(
@@ -4031,9 +4102,10 @@ impl GpuEngine {
                         "live ring allocation enabled for capacity-tier KV"
                     );
                 }
-                if rings && !live {
+                let prefix_rings = !live && prefix_layout.is_some() && configured_rings == Some(true);
+                if rings && !live && !prefix_rings {
                     return Err(RuntimeError::Rejected(
-                        "live rings require PLOW_VMM_LIVE=1".into(),
+                        "live rings require PLOW_VMM_LIVE=1 or the VMM prefix layout".into(),
                     ));
                 }
                 if live {
@@ -4044,7 +4116,7 @@ impl GpuEngine {
                     }
                     Self::vmm_live_bringup(&be, &blob, rings, live_kv_manifest.as_ref()).map(Some)
                 } else {
-                    Ok(Self::vmm_bringup(&be, &blob, prefix_layout))
+                    Self::vmm_bringup(&be, &blob, prefix_layout, prefix_rings)
                 }
             };
             if let Some(tm) = load_tim.as_mut() {
@@ -6195,21 +6267,21 @@ impl GpuEngine {
         let kv_admission = be
             .mem_info()
             .ok()
-            .map(|(free, _total)| free)
-            .and_then(|free| {
-                let (per_token, block_rows) =
+            .and_then(|(free, total)| {
+                let (per_token, block_rows, request_bytes) =
                     kv_row_charge(vmm.as_ref(), &blob, max_ctx, batch)?;
-                let budget = (free as f64 * crate::config::RuntimeConfig::get().kv_admit_headroom())
-                    as u64;
+                let budget = crate::config::RuntimeConfig::get().kv_admit_budget(free, total);
                 tracing::info!(
                     per_token,
                     block_rows,
+                    request_mib = request_bytes >> 20,
                     free_gib = free as f64 / (1u64 << 30) as f64,
                     budget_gib = budget as f64 / (1u64 << 30) as f64,
                     max_rows = budget / per_token,
                     "CUDA KV admission budget"
                 );
-                let linear = crate::sched::admission::KvBudget::linear(per_token, budget);
+                let linear = crate::sched::admission::KvBudget::linear(per_token, budget)
+                    .with_request_bytes(request_bytes);
                 Some(match block_rows {
                     Some(block_rows) => linear
                         .with_block_groups(&[(block_rows, block_rows.saturating_mul(per_token))])
@@ -9030,10 +9102,19 @@ impl GpuEngine {
                         "HD512 px4 direct role requires exact Gemma-4 geometry".into(),
                     ));
                 }
+                let generated_fp8 = segment_roles
+                    .and_then(|r| r.objects.get(&role))
+                    .and_then(|object| plow_asset::segment_roles::GeneratedAbi::parse(&object.abi))
+                    .is_some_and(|abi| abi.fp8_kv());
                 if plow_asset::segment_roles::is_generated(role)
-                    && (site.1 != DevOp::FlashPrefill as u16
+                    && (if generated_fp8 {
+                        site.1 != DevOp::FlashPrefillFp8 as u16
+                            || inst.t[6] == TENSOR_NONE16
+                            || inst.t[7] == TENSOR_NONE16
+                    } else {
+                        site.1 != DevOp::FlashPrefill as u16 || inst.t[6] != TENSOR_NONE16
+                    }
                         || inst.i[0] != g.t
-                        || inst.t[6] != TENSOR_NONE16
                         || segment_roles
                             .and_then(|r| r.objects.get(&role))
                             .and_then(|object| object.attention.as_ref())
@@ -9889,9 +9970,31 @@ impl GpuEngine {
             ));
         };
         let inst = &self.prefill[bi].h_inst[*pc];
-        if (role.direct_gen.is_some()
-            || role.direct_hd512.is_some()
-            || role.direct_hd256_gqa2.is_some())
+        // FlashPrefillFp8 carries its packed request table as an i[4] handle (bit 31); the
+        // bf16 op in t[6].
+        if role
+            .direct_gen
+            .is_some_and(|(_, _, fp8)| fp8 != (inst.op == DevOp::FlashPrefillFp8 as u16))
+        {
+            return Err(RuntimeError::Rejected(
+                "generated role KV dtype differs from its packet op".into(),
+            ));
+        }
+        let fp8_requests = match role.direct_gen {
+            Some((_, _, true)) => {
+                if inst.i[4] & (1 << 31) == 0 {
+                    return Ok(None);
+                }
+                Some(u16::try_from(inst.i[4] & !(1 << 31)).map_err(|_| {
+                    RuntimeError::Rejected("direct FP8-KV attention request handle".into())
+                })?)
+            }
+            _ => None,
+        };
+        if fp8_requests.is_none()
+            && (role.direct_gen.is_some()
+                || role.direct_hd512.is_some()
+                || role.direct_hd256_gqa2.is_some())
             && inst.t[6] == TENSOR_NONE16
         {
             return Ok(None);
@@ -9905,7 +10008,35 @@ impl GpuEngine {
         let entries = arg.gq_stream
             + u64::from(self.prefill[bi].segment_gq_lo[seg])
                 * std::mem::size_of::<packet::dev::StreamEnt>() as u64;
-        if let Some((function, _)) = role.direct_gen {
+        if let Some((function, _, _)) = role.direct_gen {
+            if let Some(requests) = fp8_requests {
+                return Ok(Some((
+                    function,
+                    DirectSegmentArgs::Generated(GenFlashPrefillArgs {
+                        requests: tensor(requests)?,
+                        opart: tensor(inst.t[6])?,
+                        mlpart: tensor(inst.t[7])?,
+                        q: tensor(inst.t[2])?,
+                        k: tensor(inst.t[3])?,
+                        v: tensor(inst.t[4])?,
+                        output: tensor(inst.t[5])?,
+                        mapkv: 0,
+                        entries,
+                        succs: arg.succs,
+                        counters: arg.counters,
+                        seq_q: inst.i[0],
+                        seq_kv: inst.i[1],
+                        q_pos0: 0,
+                        kv_stride: inst.fj[1],
+                        kv_mask: inst.fj[2],
+                        scale: f32::from_bits(inst.fj[0]),
+                        n_head: inst.i[2],
+                        n_kv_head: inst.i[3],
+                        window: inst.i[5],
+                        reserved: 0,
+                    }),
+                )));
+            }
             return Ok(Some((
                 function,
                 DirectSegmentArgs::Generated(GenFlashPrefillArgs {

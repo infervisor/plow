@@ -1243,6 +1243,11 @@ pub struct AmdRuntimeConfig {
     #[arg(long = "kv-admit-headroom", env = "PLOW_KV_ADMIT_HEADROOM", default_value_t = 0.9, value_parser = clap::value_parser!(f64), global = true)]
     pub kv_admit_headroom: f64,
 
+    /// Caps the KV admission budget so the process, KV fully admitted, holds at most this
+    /// fraction of device memory (vLLM's `--gpu-memory-utilization`). 0 = uncapped.
+    #[arg(long = "kv-mem-util", env = "PLOW_KV_MEM_UTIL", default_value_t = 0.0, value_parser = clap::value_parser!(f64), global = true)]
+    pub kv_mem_util: f64,
+
     /// VMM-backed KV on ROCr. Automatic when a flat tensor slab cannot fit;
     /// an explicit true/false forces the route (requires hsa_amd_vmem_*).
     #[arg(long = "amd-vmm-kv", env = "PLOW_VMM_KV", value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
@@ -1827,6 +1832,23 @@ impl RuntimeConfig {
             !Self::is_initialized(),
         )
         .clamp(0.0, 1.0)
+    }
+
+    /// KV admission budget from the device's `free`/`total` bytes after load: the headroom share
+    /// of free, capped by `--kv-mem-util` of the device when that is set.
+    pub(crate) fn kv_admit_budget(&self, free: u64, total: u64) -> u64 {
+        let budget = (free as f64 * self.kv_admit_headroom()) as u64;
+        let util = select_compat(
+            self.amd.kv_mem_util,
+            Self::env_parse("PLOW_KV_MEM_UTIL"),
+            !Self::is_initialized(),
+        )
+        .clamp(0.0, 1.0);
+        if util == 0.0 || budget == 0 {
+            return budget;
+        }
+        let used = total.saturating_sub(free);
+        budget.min(((total as f64 * util) as u64).saturating_sub(used))
     }
 
     /// Cache room, as a fraction of the device, that free-after-load must hold beside vLLM's 10%

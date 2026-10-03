@@ -310,6 +310,94 @@ In-model, Gemma-4 12B, realtime profile, C1, ABAB, 2 reps, 32 prompts per cell. 
 - **Verdict:** the entry stays opt-in. It is 2.4x faster than role 14 per site, but 12B TTFT
   at 4096/8192 improves 4.3%, short of the >5% rule.
 
+### FP8-KV entries (`kv_dtype` in the signature)
+
+The catalog signature carries the KV dtype (`KvDtype` in `gen_kernels.rs`): a bf16 entry binds
+only `FlashPrefill`, an FP8-KV entry only `FlashPrefillFp8` (e4m3 K/V, f32 scale per
+(position, KV head) row, `t6`/`t7`). FP8-KV objects export `plow_gen_flash_prefill_abi = 2`
+(ABI family `gen_flash_prefill_fp8kv_v1`): the scales ride the direct ABI's opart/mlpart slots,
+and the packed request table rides the op's `i[4]` handle (bit 31).
+
+- `attn_pf_hd256_sliding_fp8kv` (role 20): the hd256 kernel with an FP8 producer (cp.async of
+  raw e4m3 rows, exact e4m3 → bf16 into the swizzled stage); k_scale on S before masking,
+  v_scale on P before PV, both fp32. BN64, K/V rings 2+2, producer 72 regs, 0 spills. The packet
+  arg block lives in dynamic smem (static + dynamic would exceed 232448 B). rungs ≥ 128.
+- `attn_pf_hd512_fp8kv` (role 21): TileLang body over e4m3 K/V (`flash_prefill_body_fp8kv`),
+  wrapper `gen_flash_prefill.cu` with `PLOW_GEN_FP8_KV=1`. BM64 BN32, 1 stage, 0 spills.
+  rungs ≥ 128.
+
+Standalone vs FP32 over the dequantized cache (rel-L2), µs:
+
+| entry | 1024 | 4096 | 1024 after 7K | 1024 after 14K | packed check |
+|---|---|---|---|---|---|
+| hd256 sliding FP8-KV | 64 (2.4e-3) | 240 | 71.7 | - | 2.3e-3 |
+| hd512 global FP8-KV | 158.6 (1.4e-3) | 1962 (1.2e-3) | 1828 (2.4e-3) | 3444 (2.4e-3) | 1.9e-3 |
+
+The interpreter FP8 arms it replaces: hd256 px23 178 µs at 1024, packed 16×128 363-1423 µs vs
+generated 137-142 µs. TileLang in the nix shell needs a host g++ ≤ 14 (`-ccbin=/usr/bin/g++-14`
+in `NVCC_APPEND_FLAGS`; the system g++ 15 fails in `cuda_fp16.h`).
+
+## Gemma-4 12B FP8 per-rung routes (H100, FP8 KV, 16K, 128 slots)
+
+Recipe `scripts/campaign/recipes/gemma4-12b.h100.fp8kv-16k-c128.toml`; control = the same packet
+without the generated roles, the decode defines and with the 64 rung. `step_bench`, 2 reps
+(agree within 0.3%). Floors: `op_roof` at 3210 GB/s / dense peak, rows-linear for packs
+(approximate).
+
+Prefill, packed wall in s:
+
+| B×ctx | control | hd256 gen | **hd256 + hd512 gen** | % floor (chosen / control) |
+|---|---|---|---|---|
+| 1×1024 | 0.0753 | 0.0489 | **0.0366** | 44 / 22 |
+| 1×4096 | 0.4896 | 0.3349 | **0.1509** | 44 / 13 |
+| 1×15000 | 3.838 | 3.227 | **0.719** | 34 / 6.4 |
+| 4×1024 | 0.3474 | 0.2479 | **0.1970** | 33 / 19 |
+| 32×128 | 0.2904 | 0.1929 | **0.1647** | 40 / 23 |
+| 128×128 | 1.168 | 0.7718 | **0.6598** | 40 / 23 |
+| 16×512 | 0.612 | 0.4524 | **0.3872** | 34 / 22 |
+| 128×1024 | 11.12 | 7.918 | **6.294** | 34 / 19 |
+
+Decode, ms per step (B=64 runs on the 128 rung once the ladder drops 64):
+
+| ctx | B=1 | B=8 | B=32 | B=64 | B=128 (% floor) |
+|---|---|---|---|---|---|
+| 1024 | 8.54 / 8.84 | 9.73 / 10.34 | 15.71 / 17.36 | 20.17 / 139.6 | 27.21 / 40.5 (44%) |
+| 4096 | 8.61 / 8.89 | 10.78 / 11.52 | 18.94 / 21.10 | 27.07 / 146.9 | 40.65 / 55.2 (32%) |
+| 16000 | 8.83 / 9.15 | 13.79 / 14.87 | 32.12 / 35.82 | 52.57 / 175.0 | 91.98 / 111.1 (19%) |
+
+(chosen / control.) Chosen routes:
+
+- Prefill projections: unchanged cuBLASLt FP8 / native split (`segment_roles::cublaslt_prefill_fp8`
+  route matrix).
+- Prefill attention: generated FP8-KV hd256 + hd512 on every rung ≥ 128; runner-up the
+  interpreter FP8 arms (above).
+- Decode: light FP8 attention (16-byte loads, direct V, segmented FlashDecode grid), cuBLASLt
+  head at B=128, ladder without 64 (its TC64 GEMV was 3-7x slower than the 128 rung).
+
+Correctness:
+
+- Packed `--same` runs agree on every slot (4×1024, 16×512, 2×4096) in every arm.
+- The decode-only packet reproduces the control's prefill digests exactly.
+- FP32-reference gate (`fp32_ref_gate.py` with `ignore_eos`, edbda0d4), served, prefix cache
+  off, peer = the cached vLLM 0.28 captures: **PASS** against both vLLM repeats. All 1172
+  positions scored. Candidate vs vLLM: kl_mean 0.109 vs 0.128, kl_p99 2.50 vs 3.19,
+  top1_decisive 0.984 vs 0.982, cont_frac 0.650 vs 0.574, needle_acc 1.0 vs 1.0.
+
+Served A/B (`vllm bench serve`, greedy, OSL 128, prefix cache off on both arms, ABAB). Output
+tok/s, TTFT p50 s, TPOT p50 ms; candidate reps 1 / 2, control rep 1. Control rep 2 matched rep 1
+within 0.1% at 4K c32; its other cells were cut to free the shared GPU.
+
+| cell | candidate | control |
+|---|---|---|
+| 4K c32 | 381.3 / 381.5 tok/s, 0.87 s, 73.4 ms | 38.3, 12.1 s, 758 ms |
+| 4K c128 | 385.4 / 385.5, 21.7 s, 160.2 ms | 18.7, 487 s, 3734 ms |
+| 15K c32 | 94.6 / 94.6, 19.8 s, 156.6 ms | 7.3, 205 s, 2154 ms |
+| 15K c128 | 95.7 / 95.7, 82.6 s, 172.9 ms | 6.2, 1256 s, 2904 ms |
+
+The control's FP8-KV packed prefill (interpreter arms, serial over requests, decode rows riding
+the pack) is what made this packet unservable at ≥ 4K. The generated roles deal every
+request's tiles across all CTAs, riders included.
+
 ## Next pilots (ranked)
 
 **A. hd512 causal prefill, generated role object, replacing role 15.**

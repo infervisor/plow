@@ -23,7 +23,8 @@ pub(crate) struct VmmPrefixLayout {
 /// VMM live allocation or prefix-sharing state: the pool
 /// backing every FULL layer's `kv.{l}.k/v` tensor with per-sequence VA
 /// windows. Live mode can retain demand-mapped whole-slot rings; prefix
-/// mode keeps rings flat and snapshots their last `window` rows.
+/// mode snapshots the rings' last `window` rows and keeps them flat unless
+/// `PLOW_VMM_LIVE_RINGS=1` commits them per admitted slot.
 pub(super) struct VmmServe {
     pub(super) kv: crate::memory::vmm::VmmKv,
     pub(super) rings: Option<crate::memory::vmm::VmmRings>,
@@ -46,6 +47,16 @@ pub(super) struct VmmServe {
     /// Sliding ring rows (`min(max_ctx, KV_RING)`), a power of two.
     pub(super) ring: u64,
     pub(super) snap_row_bytes: u64,
+}
+
+impl VmmPrefixLayout {
+    /// Sliding K/V ring bytes over every slot (scales excluded).
+    pub(crate) fn slide_kv_bytes(&self, blob: &DevBlob) -> u64 {
+        self.slide
+            .iter()
+            .map(|&(k, v, _)| blob.tensors[k].bytes + blob.tensors[v].bytes)
+            .sum()
+    }
 }
 
 impl GpuEngine {
@@ -342,15 +353,48 @@ impl GpuEngine {
         be: &Arc<CudaBackend>,
         blob: &DevBlob,
         layout: Option<VmmPrefixLayout>,
-    ) -> Option<VmmServe> {
-        let VmmPrefixLayout {
+        live_rings: bool,
+    ) -> Result<Option<VmmServe>> {
+        let Some(VmmPrefixLayout {
             geo,
             slide,
             slide_scale,
             full_scale,
             ring,
             snap_row_bytes,
-        } = layout?;
+        }) = layout
+        else {
+            return Ok(None);
+        };
+        // Sliding rings committed per admitted slot, idle rows on shared scratch: a slot's ring
+        // costs memory only while a request owns it, so admission charges it like its KV rows.
+        let rings = if live_rings && !slide.is_empty() {
+            let scale_stride = geo.kvh_slide as u64 * ring * 4;
+            let tensors: Vec<_> = slide
+                .iter()
+                .flat_map(|&(k, v, stride)| [(k, stride), (v, stride)])
+                .chain(
+                    slide_scale
+                        .iter()
+                        .flat_map(|&(k, v)| [(k, scale_stride), (v, scale_stride)]),
+                )
+                .map(|(tensor, slot_bytes)| crate::memory::vmm::LiveRingTensor { tensor, slot_bytes })
+                .collect();
+            let rings = crate::memory::vmm::VmmRings::new_idle_backed(
+                Arc::clone(be) as Arc<dyn crate::memory::vmm::VmmOps>,
+                &tensors,
+                geo.batch as usize,
+            )?;
+            tracing::info!(
+                slot_mib = rings.slot_charge() >> 20,
+                resident_mib = rings.stats().resident_bytes >> 20,
+                reserved_gib = rings.stats().reserved_bytes as f64 / (1u64 << 30) as f64,
+                "vmm prefix: live sliding rings (idle rows on shared scratch)"
+            );
+            Some(rings)
+        } else {
+            None
+        };
 
         // Default sharing block = the driver granularity (2 MiB measured):
         // the finest match unit VMM can map, e.g. 4096 tokens at hd256 bf16 —
@@ -369,8 +413,8 @@ impl GpuEngine {
             block_hint,
             cache_cap,
         ) {
-            Ok(mut kv) => Some(VmmServe {
-                rings: None,
+            Ok(mut kv) => Ok(Some(VmmServe {
+                rings,
                 tensor_tracks: blob
                     .tensors
                     .iter()
@@ -399,10 +443,10 @@ impl GpuEngine {
                 full_scale,
                 ring,
                 snap_row_bytes,
-            }),
+            })),
             Err(e) => {
                 tracing::warn!(error = %e, "vmm off: pool bringup failed");
-                None
+                Ok(None)
             }
         }
     }

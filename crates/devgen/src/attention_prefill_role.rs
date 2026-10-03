@@ -97,6 +97,7 @@ pub(crate) struct Generated {
     pub window: u32,
     pub ring_kv: bool,
     pub pair_heads: bool,
+    pub kv: crate::gen_kernels::KvDtype,
 }
 
 struct Hd256Qualification {
@@ -476,14 +477,20 @@ fn eligible_for(op: &packet::dev::DevInst, n_cu: u16, selection: &Selection) -> 
         }
         // The wrapper traps outside this contract (gen_flash_prefill.cu).
         Kind::Generated => selection.generated.as_ref().is_some_and(|g| {
-            op.op == DevOp::FlashPrefill as u16
+            op.op == g.kv.op() as u16
                 && op.blocks == n_cu
                 && op.i[..4].iter().all(|&v| v > 0)
                 && op.i[2] % op.i[3] == 0
                 && op.i[6] == g.attention.head_dim
                 && crate::gen_kernels::heads_and_window_match(op, g.window, g.pair_heads)
                 && op.i[7] == 1
-                && op.t[6] == TENSOR_NONE
+                // FP8 KV: t[6] / t[7] are the k / v scale vectors (packed requests ride i[4]).
+                && match g.kv {
+                    crate::gen_kernels::KvDtype::Bf16 => op.t[6] == TENSOR_NONE,
+                    crate::gen_kernels::KvDtype::Fp8 => {
+                        op.t[6] != TENSOR_NONE && op.t[7] != TENSOR_NONE
+                    }
+                }
                 && (g.ring_kv || op.j[1] == u32::MAX)
                 && op.f[0].is_finite()
         }),
@@ -902,14 +909,16 @@ pub(crate) fn apply(
                 .zip(&eligible)
                 .enumerate()
                 .find(|(_, (op, selected))| {
-                    (if selection.kind == Kind::Generated {
-                        op.op == DevOp::FlashPrefill as u16 && op.i[6] == selection.head_dim()
+                    (if let Some(g) = &selection.generated {
+                        op.op == g.kv.op() as u16 && op.i[6] == selection.head_dim()
                     } else {
                         !selection.is_hd512() || is_hd512_attention(op)
                     })
                         && (!matches!(selection.kind, Kind::Hd256Bkv32 | Kind::Hd256Gqa2Bkv32)
                             || op.is_hd256_gqa2_sliding_prefill())
-                        && if op.op == DevOp::FlashPrefill as u16 {
+                        && if op.op == DevOp::FlashPrefill as u16
+                            || op.op == DevOp::FlashPrefillFp8 as u16
+                        {
                             !**selected
                         } else {
                             !valid_hd512_merge(op)

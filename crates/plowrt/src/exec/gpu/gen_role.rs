@@ -2,7 +2,9 @@
 //! every entry. The object is hash-pinned and its cubin geometry must equal the packet's
 //! declaration; the launch is the packet grid, one CTA per SM.
 use super::*;
-use plow_asset::segment_roles::{GeneratedAbi, GENERATED_FLASH_PREFILL_ABI};
+use plow_asset::segment_roles::{
+    GeneratedAbi, GENERATED_FLASH_PREFILL_ABI, GENERATED_FLASH_PREFILL_FP8KV_ABI,
+};
 
 pub(super) fn load_generated_role(
     be: &Arc<CudaBackend>,
@@ -19,7 +21,10 @@ pub(super) fn load_generated_role(
         .attention
         .as_ref()
         .ok_or_else(|| reject("no capability"))?;
-    if profile != "sm90a" || abi.family != GENERATED_FLASH_PREFILL_ABI {
+    if profile != "sm90a"
+        || (abi.family != GENERATED_FLASH_PREFILL_ABI
+            && abi.family != GENERATED_FLASH_PREFILL_FP8KV_ABI)
+    {
         return Err(reject("requires SM90 and a known family"));
     }
     let path = dir.join(&object.file);
@@ -34,7 +39,7 @@ pub(super) fn load_generated_role(
     }
     let module = DecodeModule::load(be, &image)?;
     for (name, want) in [
-        ("plow_gen_flash_prefill_abi", 1),
+        ("plow_gen_flash_prefill_abi", if abi.fp8_kv() { 2 } else { 1 }),
         ("plow_gen_block", abi.block),
         ("plow_gen_arena_bytes", abi.smem),
         ("plow_attention_head_dim", attention.head_dim),
@@ -57,7 +62,7 @@ pub(super) fn load_generated_role(
     tracing::info!(abi = %object.abi, object = %path.display(), "generated role object loaded");
     Ok(PacketRole {
         function,
-        direct_gen: Some((direct, attention.head_dim)),
+        direct_gen: Some((direct, attention.head_dim, abi.fp8_kv())),
         direct_hd512: None,
         direct_hd256_gqa2: None,
         direct_w8a8_glu: None,

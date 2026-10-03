@@ -290,6 +290,10 @@ struct RingWindow {
     map_bytes: u64,
     handles: Vec<Option<u64>>,
     refs: Vec<usize>,
+    /// Units currently mapped to the shared idle handle.
+    idle: Vec<bool>,
+    /// Committed whole at construction (idle-backed rings whose slots share mapping units).
+    pinned: bool,
 }
 
 /// Whole-slot ring backing is committed while at least one logical slot uses each mapping unit.
@@ -299,6 +303,10 @@ pub struct VmmRings {
     mapped: Vec<bool>,
     prefix: usize,
     stats: LiveRingStats,
+    /// `(unit bytes, handle)`: one physical unit per size, mapped under every unit no slot owns.
+    /// Decode and padded prefill rows write garbage into slots without a request; with this
+    /// backing those writes land in shared scratch instead of forcing a real ring per idle row.
+    idle: Vec<(u64, u64)>,
 }
 
 impl VmmRings {
@@ -343,6 +351,7 @@ impl VmmRings {
                 mapped_slots: 0,
                 mapped_prefix: 0,
             },
+            idle: Vec::new(),
         };
         for t in tensors {
             let logical_bytes = t.slot_bytes * batch as u64;
@@ -365,9 +374,104 @@ impl VmmRings {
                 map_bytes,
                 handles: vec![None; (bytes / map_bytes) as usize],
                 refs: vec![0; (bytes / map_bytes) as usize],
+                idle: vec![false; (bytes / map_bytes) as usize],
+                pinned: false,
             });
         }
         Ok(rings)
+    }
+
+    /// Rings whose every unit stays mapped: per-slot units to shared idle scratch until a slot
+    /// claims them, and windows whose slots share units committed whole. A slot then costs
+    /// exactly [`Self::slot_charge`] and no execution path has to map rows it does not own.
+    pub fn new_idle_backed(
+        ops: Arc<dyn VmmOps>,
+        tensors: &[LiveRingTensor],
+        batch: usize,
+    ) -> Result<Self> {
+        let mut rings = Self::new(ops, tensors, batch)?;
+        for i in 0..rings.windows.len() {
+            let (slot_bytes, map_bytes) = (rings.windows[i].slot_bytes, rings.windows[i].map_bytes);
+            if slot_bytes != map_bytes {
+                rings.windows[i].pinned = true;
+                for unit in 0..rings.windows[i].handles.len() {
+                    rings.commit_unit(i, unit)?;
+                    rings.windows[i].refs[unit] = 1;
+                }
+                continue;
+            }
+            if !rings.idle.iter().any(|&(bytes, _)| bytes == map_bytes) {
+                let handle = rings.ops.create(map_bytes)?;
+                rings.idle.push((map_bytes, handle));
+            }
+            for unit in 0..rings.windows[i].handles.len() {
+                rings.back_idle(i, unit)?;
+            }
+        }
+        Ok(rings)
+    }
+
+    /// Bytes one slot commits beyond the construction-time residency.
+    pub fn slot_charge(&self) -> u64 {
+        self.windows
+            .iter()
+            .filter(|w| !w.pinned)
+            .map(|w| w.slot_bytes)
+            .sum()
+    }
+
+    fn back_idle(&mut self, window: usize, unit: usize) -> Result<()> {
+        let w = &self.windows[window];
+        let Some(&(_, handle)) = self.idle.iter().find(|&&(bytes, _)| bytes == w.map_bytes) else {
+            return Ok(());
+        };
+        debug_assert!(w.handles[unit].is_none() && !w.idle[unit]);
+        let (va, bytes) = (w.va + unit as u64 * w.map_bytes, w.map_bytes);
+        self.ops.map(va, bytes, handle)?;
+        if let Err(e) = self.ops.set_access(va, bytes) {
+            self.ops.unmap(va, bytes);
+            return Err(e);
+        }
+        self.windows[window].idle[unit] = true;
+        Ok(())
+    }
+
+    fn commit_unit(&mut self, window: usize, unit: usize) -> Result<()> {
+        let w = &self.windows[window];
+        let (va, map_bytes, was_idle) =
+            (w.va + unit as u64 * w.map_bytes, w.map_bytes, w.idle[unit]);
+        if was_idle {
+            self.ops.unmap(va, map_bytes);
+            self.windows[window].idle[unit] = false;
+        }
+        let result = (|| {
+            let handle = self.ops.create(map_bytes)?;
+            if let Err(e) = self.ops.map(va, map_bytes, handle) {
+                self.ops.release(handle);
+                return Err(e);
+            }
+            if let Err(e) = self.ops.set_access(va, map_bytes) {
+                self.ops.unmap(va, map_bytes);
+                self.ops.release(handle);
+                return Err(e);
+            }
+            Ok(handle)
+        })();
+        match result {
+            Ok(handle) => {
+                self.windows[window].handles[unit] = Some(handle);
+                self.stats.resident_bytes += map_bytes;
+                Ok(())
+            }
+            Err(e) => {
+                if was_idle {
+                    if let Err(remap) = self.back_idle(window, unit) {
+                        tracing::error!(error = %remap, "live ring idle backing lost");
+                    }
+                }
+                Err(e)
+            }
+        }
     }
 
     pub fn tensor_va(&self, tensor: usize) -> Option<u64> {
@@ -392,7 +496,9 @@ impl VmmRings {
         }
         let mut touched = Vec::new();
         for i in 0..self.windows.len() {
-            let va_base = self.windows[i].va;
+            if self.windows[i].pinned {
+                continue;
+            }
             let slot_bytes = self.windows[i].slot_bytes;
             let map_bytes = self.windows[i].map_bytes;
             let first = slot as u64 * slot_bytes / map_bytes;
@@ -402,31 +508,11 @@ impl VmmRings {
                 let unit = unit as usize;
                 if self.windows[i].refs[unit] == 0 {
                     debug_assert!(self.windows[i].handles[unit].is_none());
-                    let va = va_base + unit as u64 * map_bytes;
-                    let result = (|| {
-                        let handle = self.ops.create(map_bytes)?;
-                        if let Err(e) = self.ops.map(va, map_bytes, handle) {
-                            self.ops.release(handle);
-                            return Err(e);
+                    if let Err(e) = self.commit_unit(i, unit) {
+                        for &(window, unit) in touched.iter().rev() {
+                            self.release_unit(window, unit);
                         }
-                        if let Err(e) = self.ops.set_access(va, map_bytes) {
-                            self.ops.unmap(va, map_bytes);
-                            self.ops.release(handle);
-                            return Err(e);
-                        }
-                        Ok(handle)
-                    })();
-                    match result {
-                        Ok(handle) => {
-                            self.windows[i].handles[unit] = Some(handle);
-                            self.stats.resident_bytes += map_bytes;
-                        }
-                        Err(e) => {
-                            for &(window, unit) in touched.iter().rev() {
-                                self.release_unit(window, unit);
-                            }
-                            return Err(e);
-                        }
+                        return Err(e);
                     }
                 }
                 self.windows[i].refs[unit] += 1;
@@ -447,6 +533,9 @@ impl VmmRings {
             return;
         }
         for i in 0..self.windows.len() {
+            if self.windows[i].pinned {
+                continue;
+            }
             let slot_bytes = self.windows[i].slot_bytes;
             let map_bytes = self.windows[i].map_bytes;
             let first = slot as u64 * slot_bytes / map_bytes;
@@ -474,6 +563,9 @@ impl VmmRings {
             .unmap(w.va + unit as u64 * w.map_bytes, w.map_bytes);
         self.ops.release(handle);
         self.stats.resident_bytes -= w.map_bytes;
+        if let Err(e) = self.back_idle(window, unit) {
+            tracing::error!(error = %e, "live ring idle backing lost");
+        }
     }
 
     pub fn ensure_prefix(&mut self, rows: usize) -> Result<()> {
@@ -481,6 +573,9 @@ impl VmmRings {
             return Err(RuntimeError::Rejected(
                 "live ring prefix out of bounds".into(),
             ));
+        }
+        if !self.idle.is_empty() {
+            return Ok(());
         }
         while self.prefix < rows {
             self.ensure_slot(self.prefix)?;
@@ -497,9 +592,15 @@ impl Drop for VmmRings {
                     self.ops
                         .unmap(w.va + slot as u64 * w.map_bytes, w.map_bytes);
                     self.ops.release(handle);
+                } else if std::mem::take(&mut w.idle[slot]) {
+                    self.ops
+                        .unmap(w.va + slot as u64 * w.map_bytes, w.map_bytes);
                 }
             }
             self.ops.address_free(w.va, w.bytes);
+        }
+        for (_, handle) in self.idle.drain(..) {
+            self.ops.release(handle);
         }
     }
 }

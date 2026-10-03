@@ -255,7 +255,11 @@ impl BlobPlan {
                 let block =
                     geo.block_bytes(granularity, u64::from(config.vmm_block_mib()) << 20)?;
                 let tracks = geo.full_layers.len() as u64 * 2;
-                let virtual_bytes = geo.full_tensor_bytes() * tracks;
+                let ring_bytes = match config.nv_vmm_live_rings() {
+                    Some(true) => layout.slide_kv_bytes(&blob),
+                    _ => 0,
+                };
+                let virtual_bytes = geo.full_tensor_bytes() * tracks + ring_bytes;
                 let resident = block * u64::from(geo.batch) * u64::from(geo.kvh_full) * tracks;
                 plan.kv_bytes = plan.kv_bytes.checked_sub(virtual_bytes).ok_or_else(|| {
                     RuntimeError::Rejected("prefix KV plan tensor classification".into())

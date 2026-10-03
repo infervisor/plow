@@ -1,0 +1,136 @@
+# Gemma-4-12B-it FP8 (hub checkpoint, re-keyed), H100 SXM5, FP8 KV, 16K context, 128 decode slots:
+# the per-rung route selection trial. Control = the 16K/128-slot FP8-KV packet this recipe extends
+# (campaign scratch production-16k128-fp8kv/recipe.toml); every difference below is a measured
+# per-rung route choice. FP32-reference gate (llm_fp32_ref, peer = cached vLLM 0.28 captures):
+# PASS, KL mean 0.109 vs vLLM 0.128. Matched vLLM serving not yet run.
+#
+# Routes (per-rung evidence: docs/runtime/kernel-generators.md "Gemma-4 12B FP8 per-rung routes"):
+#   prefill projections   cuBLASLt FP8 OUTER_VEC where it wins (segment_roles::cublaslt_prefill_fp8),
+#                         native FP8 GEMM where the route matrix measured native faster (down_proj
+#                         at M = 1088 and >= 2048, the 4160/2112 exceptions)
+#   prefill hd256 sliding generated attn_pf_hd256_sliding_fp8kv (FlashPrefillFp8, every rung >= 128)
+#   prefill hd512 global  generated attn_pf_hd512_fp8kv (TileLang, FlashPrefillFp8, every rung >= 128)
+#   decode B=128          cuBLASLt output head, light FP8 attention with 16-byte loads, direct
+#                         V conversion and the segmented FlashDecode grid (the light attention
+#                         also serves B < 128: 3-10% faster per step)
+#   decode B 33..128      the 128 rung: the control's 64 rung (TC64 GEMV) measured 139.6 / 146.9 /
+#                         175.0 ms per step at ctx 1K / 4K / 16K against 40.5 / 55.2 / 111.1 ms
+#                         on the 128 rung, so the ladder drops 64 (and with it TC64)
+schema = "plow.recipe.v1"
+namespace = "infervisor"
+name = "gemma-4-12b"
+label = "sm90a-h100-tp1-fp8kv-16k-c128-routes"
+status = "emits"
+network = "gemma4"
+
+[target]
+vendor = "nvidia"
+isa = "sm_90a"
+sku = "H100 SXM5"
+units = 132
+num_gpus = 1
+parallel = "tp"
+max_ctx = 16384
+toolchain = "cuda-12.9-nix"
+
+[checkpoint]
+source = "gemma-4-12b-it-fp8"
+layout = "plow-fp8-hub-rekey"
+
+[cell]
+name = "gemma4-12b.h100.fp8kv-16k-c128"
+model = "gemma-4-12b-it-fp8 (compressed-tensors, re-keyed)"
+revision = "local"
+hf_dir = "{env:GEMMA12B_CHECKPOINT}"
+gpu = "H100 SXM5"
+arch = "sm_90a"
+n_cu = 132
+max_ctx = 16384
+precision = "w8a8"
+
+[emit]
+args = ["--segmented"]
+[emit.env]
+PLOW_GLU_QUANT_FUSE = "1"
+# Decode B=128 attention: light FP8 attention, 16-byte K loads, direct V conversion. The light
+# module then carries the segmented hd256 FlashDecode grid (plowrt cublaslt.rs fp8_flash256).
+NVCC_APPEND_FLAGS = "-DPLOW_NV_GLU_QUANT_CACHE=1 -DPLOW_NV_GLU_QUANT_WPR=1 -DPLOW_NV_LIGHT_FP8_ATTN=1 -DPLOW_FP8_LD16=1 -DPLOW_FP8_FAST=1"
+PLOW_FP8 = "1"
+PLOW_W8A8 = "1"
+PLOW_FP8_KV = "1"
+PLOW_EMIT_PACKED_PREFILL = "1"
+PLOW_SEG_PURE_GEMM = "fp8"
+PLOW_SEG_FA512 = "1"
+PLOW_SEG_FA256_GQA2 = "1"
+PLOW_TMA_GEMM = "1"
+PLOW_MAX_CHUNK = "4096"
+PLOW_MAX_REQUEST_CHUNK = "1024"
+PLOW_SLIDING_NS_CAP = "1"
+PLOW_SLIDING_NS_GRID = "1"
+PLOW_ATTENTION_DECODE_BALANCE_GF = "4"
+PLOW_NS_FULL_ABS = "66"
+PLOW_FA_MMAQK = "3"
+PLOW_DECODE_BATCH_LADDER = "1,2,4,8,16,32,128"
+PLOW_EMIT_DECODE_CUBLASLT = "1"
+PLOW_EMIT_DECODE_CUBLASLT_MIN_ROWS = "128"
+PLOW_EMIT_DECODE_CUBLASLT_HEAD = "1"
+PLOW_EMIT_PREFILL_CUBLASLT = "1"
+PLOW_PF_LADDER_APPEND = "256,1088,1152,2112,4160,4224"
+PLOW_FUSE_ARGMAX = "1"
+
+[objects]
+script = "scripts/build_sm90a_gemma4_segments.sh"
+role_files = ["gen_sm90a_attn_pf_hd256_sliding_fp8kv.cubin", "gen_sm90a_attn_pf_hd512_fp8kv.cubin"]
+[objects.env]
+PLOW_BUILD_FATLITE = "1"
+NVCC_APPEND_FLAGS = "-DPLOW_NV_GLU_QUANT_CACHE=1 -DPLOW_NV_GLU_QUANT_WPR=1"
+PLOW_BUILD_W8A8 = "1"
+PLOW_BUILD_FA_GQA2_PAIR = "0"
+PLOW_BUILD_PFATTN_HD256_BKV32 = "0"
+PLOW_BUILD_PFATTN_HD256_GQA2_BKV32 = "0"
+PLOW_BUILD_PFATTN_HD512_PX4_BQ64 = "0"
+PLOW_BUILD_GEN_KERNELS = "attn_pf_hd256_sliding_fp8kv,attn_pf_hd512_fp8kv"
+
+[emit_roles.env]
+PLOW_GEMMA4_SM90_W8A8_GEMM_GLU_ROLE = "0"
+PLOW_GEMMA4_SM90_HD512_PX4_BQ64_ROLE = "0"
+PLOW_GEMMA4_SM90_HD256_GQA2_ROLE = "0"
+PLOW_EMIT_GEN_KERNELS = "attn_pf_hd256_sliding_fp8kv,attn_pf_hd512_fp8kv"
+
+[serve.env]
+PLOW_PREFIX_CACHE = "1"
+PLOW_VMM_PREFIX = "1"
+PLOW_PF_SEG_PURE = "fp8"
+PLOW_PF_SEG_FA512 = "1"
+PLOW_PF_INTERLEAVE = "2048"
+PLOW_VMM_LIVE_RINGS = "0"
+PLOW_MULTISTEP = "0"
+PLOW_DECODE_MAX_RUNG = "128"
+PLOW_TOKEN_BATCH = "1"
+
+[bench]
+backend = "openai"
+in_lens = "128 1024 4096"
+concs = "1"
+nprompt = 32
+outlen = 128
+warmups = 2
+seed = 42
+tokenizer = "{env:GEMMA12B_CHECKPOINT}"
+model_id = "checkpoint"
+gate_prompt = "<bos><|turn>user\nWhat is the capital of France? Answer in one short sentence.<turn|>\n<|turn>model\n<|channel>thought\n<channel|>"
+
+[bench.profiles.realtime]
+in_lens = "128 1024 4096 7000 15000"
+concs = "1 4"
+nprompt = 32
+serve_env = { PLOW_DECODE_MAX_RUNG = "4" }
+
+[bench.profiles.high_concurrency]
+in_lens = "128 1024 4096 7000 15000"
+concs = "16 32 64 128"
+nprompt = 384
+serve_env = { PLOW_DECODE_MAX_RUNG = "128" }
+
+[reference]
+csv = "perf-data/campaign/gemma4-12b.h100.reference-vllm028-fp8.csv"
