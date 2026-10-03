@@ -1517,6 +1517,21 @@ impl VmmKv {
         freed
     }
 
+    /// A request waits in [`Self::inflight_prefix`] for the whole-block checkpoint at
+    /// `tokens[..rows]`.
+    pub fn checkpoint_awaited(&self, tokens: &[u32], rows: u32) -> bool {
+        let br = self.shared.block_rows;
+        if rows == 0 || rows % br != 0 || rows as usize > tokens.len() {
+            return false;
+        }
+        let inner = self.shared.inner.lock();
+        if inner.awaited.iter().all(Option::is_none) {
+            return false;
+        }
+        let last = hash_blocks(&tokens[..rows as usize], br).pop();
+        inner.awaited.contains(&last)
+    }
+
     /// Prompt rows of `seq`'s current sequence (0 before its `try_attach`).
     pub fn prompt_rows(&self, seq: usize) -> u32 {
         self.shared.inner.lock().seqs[seq].prompt_rows as u32
@@ -3031,7 +3046,10 @@ fn evict_one(s: &Shared, inner: &mut Inner, preserve_hot: bool) -> bool {
     // blocks that become dead with it. A boundary inside a block serves only its exact
     // tail, the whole-block checkpoint under the same node every continuation: that tailed
     // one goes first. A boundary attached twice or more is a shared prefix (a system
-    // prompt) and goes last; a session-pinned one (`pin_prefix`) just before it.
+    // prompt) and goes last; a session-pinned one (`pin_prefix`) just before it. Among
+    // session-pinned boundaries the shortest goes first, not the LRU one: sessions reuse
+    // their boundaries round-robin, and LRU over a working set slightly larger than the
+    // cache evicts every boundary just before its next turn.
     let pinned = inner.cache.pinned();
     if let Some((node, index)) = inner.published.iter()
         .flat_map(|(&node, snaps)| {
@@ -3043,7 +3061,11 @@ fn evict_one(s: &Shared, inner: &mut Inner, preserve_hot: bool) -> bool {
             })
         })
         .filter(|(_, _, snap, _, _)| snap.users == 0 && Some(snap.va) != protected)
-        .min_by_key(|(_, _, snap, pin, covered)| (snap.attaches >= 2, *pin, !covered, snap.last_used))
+        .min_by_key(|(_, _, snap, pin, covered)| {
+            let by_rows = *pin && snap.session;
+            let order = if by_rows { u64::from(snap.rows) } else { snap.last_used };
+            (snap.attaches >= 2, *pin, !covered, by_rows, order)
+        })
         .map(|(node, index, _, _, _)| (node, index))
     {
         let before = inner.stats.cache_bytes;
@@ -4936,6 +4958,35 @@ mod tests {
         assert_eq!(p.try_attach(1, &t2).unwrap().map(|a| a.rows), Some(9));
     }
 
+    /// Session-pinned boundaries reused round-robin: eviction takes the shortest, not the
+    /// least recently used one (LRU would take each just before its session's next turn).
+    #[test]
+    fn pinned_session_boundaries_evict_shortest_first() {
+        let p = pool(Arc::new(MockVmm::default()));
+        let a = prompt(30);
+        let b: Vec<u32> = a.iter().map(|t| t + 1).collect();
+        let c: Vec<u32> = a.iter().map(|t| t + 2).collect();
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        for (pr, rows) in [(&c, 20u32), (&a, 12), (&b, 28)] {
+            assert!(p.try_attach(0, pr).unwrap().is_none());
+            p.ensure_rows(0, 30).unwrap();
+            p.note_session(0, pr);
+            p.publish_at(0, pr, rows, 48, |_| Ok(())).unwrap();
+            p.begin_seq(0);
+            p.pin_prefix(pr, until);
+        }
+        {
+            let mut inner = p.shared.inner.lock();
+            assert!(evict_one(&p.shared, &mut inner, true));
+            assert_eq!(inner.stats.snapshot_bytes, 96);
+        }
+        p.ensure_rows(1, 1).unwrap();
+        assert!(p.try_attach(1, &a).unwrap().is_none(), "the 12-row boundary went");
+        p.begin_seq(1);
+        p.ensure_rows(1, 1).unwrap();
+        assert_eq!(p.try_attach(1, &c).unwrap().map(|x| x.rows), Some(20), "the LRU one stays");
+    }
+
     /// A request waiting on a session's in-flight prompt keeps the whole-block checkpoint it
     /// will attach to through the session's retirement.
     #[test]
@@ -4949,6 +5000,8 @@ mod tests {
         p.ensure_rows(0, 30).unwrap();
         p.note_session(0, &o);
         assert_eq!(p.inflight_prefix(1, &w, u32::MAX), Some((0, 8)));
+        assert!(p.checkpoint_awaited(&o, 8));
+        assert!(!p.checkpoint_awaited(&o, 16), "nobody waits on the 16-row checkpoint");
         p.publish_at(0, &o, 8, 4, |_| Ok(())).unwrap();
         p.publish_at(0, &o, 16, 4, |_| Ok(())).unwrap();
         p.publish_at(0, &o, 28, 4, |_| Ok(())).unwrap();
