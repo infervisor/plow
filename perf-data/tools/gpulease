@@ -3,8 +3,13 @@
 # (nvidia-smi) and AMD/ROCm (amd-smi). Multi-GPU boxes lease PER GPU.
 #   gpulease <label> <command...>          exclusive: lease EVERY GPU
 #   gpulease -n <k> <label> <command...>   lease k free GPUs, pin the child to them
-#   gpulease --status                      holders + VRAM
-#   gpulease --audit                       list foreign GPU processes right now
+#   gpulease --max-hold <s> ...            hold limit for this run (0 = none)
+#   gpulease --status | status             holders, queue + VRAM
+#   gpulease --audit | audit               list foreign GPU processes right now
+# Waiters are served FIFO (ticket queue): a later request may only take cards no older
+# waiter needs, so nobody starves behind newcomers. The command runs in its own process
+# group, killed as a whole when it exits, when the lease is killed, or when it outlives
+# the hold limit while someone is waiting; nothing keeps a card after its lease ends.
 # NOTE: the lease is ADVISORY (flock). It cannot stop a process that never calls
 # it. So we also AUDIT for foreign compute processes before/after and WARN loudly,
 # because a contended run silently invalidates every timing number.
@@ -17,8 +22,17 @@
 #   GPU_LEASE_DIR      lock/log dir (default: /workspace/gpu, else /tmp/gpulease)
 #   GPU_LEASE_TIMEOUT  seconds to wait for the lease (default 1800)
 #   GPU_LEASE_NGPU     override detected GPU count
+#   GPU_LEASE_MAX_HOLD seconds a run may hold cards while others wait (default 7200;
+#                      0 = no limit). Past it the run is stopped (rc 124, PREEMPTED).
+#   GPU_LEASE_VENDOR   override vendor detection (nvidia|amd|none)
 
 TIMEOUT=${GPU_LEASE_TIMEOUT:-1800}
+MAX_HOLD=${GPU_LEASE_MAX_HOLD:-7200}
+
+# `gpulease status` used to lease the box under the label "status" and run nothing.
+if [ "$#" -eq 1 ]; then
+  case "$1" in status|audit) set -- "--$1" ;; esac
+fi
 
 # ---- lease dir. The old hard-coded /workspace/gpu does not exist on every box
 # (and is not creatable as non-root), which made every call die in `exec 9>`.
@@ -40,7 +54,8 @@ if [ -e "$LOG" ] && [ ! -w "$LOG" ]; then
 fi
 
 # ---- vendor detect
-if command -v nvidia-smi >/dev/null 2>&1; then VENDOR=nvidia
+if [ -n "$GPU_LEASE_VENDOR" ]; then VENDOR=$GPU_LEASE_VENDOR
+elif command -v nvidia-smi >/dev/null 2>&1; then VENDOR=nvidia
 elif command -v amd-smi >/dev/null 2>&1; then VENDOR=amd
 else VENDOR=none
 fi
@@ -174,6 +189,22 @@ foreign() {
   done
 }
 
+# ---- FIFO ticket queue. A ticket is "<seq>.<pid>" holding "want since start label"; it
+# is live while that pid runs with the recorded start time (pid reuse cannot revive it).
+QDIR="$LEASE_DIR/queue"
+mkdir -p "$QDIR" 2>/dev/null && chmod 1777 "$QDIR" 2>/dev/null
+proc_start() { awk '{print $22}' "/proc/$1/stat" 2>/dev/null; }
+live_tickets() {
+  local t pid start
+  for t in "$QDIR"/*.*; do
+    [ -e "$t" ] || continue
+    pid=${t##*.}
+    start=$(awk '{print $3}' "$t" 2>/dev/null)
+    if [ -n "$start" ] && [ "$(proc_start "$pid")" = "$start" ]; then echo "$t"
+    else rm -f "$t" 2>/dev/null; fi
+  done
+}
+
 if [ "$1" = "--audit" ]; then
   f=$(foreign); [ -n "$f" ] && { echo "FOREIGN GPU PROCS:"; echo "$f"; } || echo "GPU: no foreign compute procs"
   exit 0
@@ -183,6 +214,11 @@ if [ "$1" = "--status" ]; then
   for ((i = 0; i < NGPU; i++)); do
     f="$LEASE_DIR/gpu.$i.lease"; [ -e "$f" ] || : >"$f" 2>/dev/null
     if flock -n "$f" true 2>/dev/null; then echo "  gpu$i: free"; else echo "  gpu$i: HELD"; fi
+  done
+  echo "--- queue (oldest first) ---"
+  for t in $(live_tickets); do
+    read -r w since _ label <"$t" 2>/dev/null || continue
+    echo "  pid=${t##*.} want=$w waited=$(( $(date +%s) - since ))s $label"
   done
   echo "--- recent ---"; tail -20 "$LOG" 2>/dev/null
   case "$VENDOR" in
@@ -194,8 +230,15 @@ if [ "$1" = "--status" ]; then
 fi
 
 WANT=0
-if [ "$1" = "-n" ]; then WANT="${2:?-n needs a count}"; shift 2; fi
-LABEL="${1:?usage: gpulease [-n k] <label> <command...>}"; shift
+while :; do
+  case "$1" in
+    -n) WANT="${2:?-n needs a count}"; shift 2 ;;
+    --max-hold) MAX_HOLD="${2:?--max-hold needs seconds}"; shift 2 ;;
+    *) break ;;
+  esac
+done
+LABEL="${1:?usage: gpulease [-n k] [--max-hold s] <label> <command...>}"; shift
+[ "$#" -ge 1 ] || { echo "gpulease: no command for '$LABEL' (holders: gpulease --status)" >&2; exit 2; }
 [ "$WANT" -eq 0 ] && WANT=$NGPU                       # default: the whole box
 [ "$WANT" -gt "$NGPU" ] && { echo "gpulease: asked $WANT gpus, box has $NGPU" >&2; exit 2; }
 
@@ -230,15 +273,43 @@ try_acquire() {
   [ "$NGOT" -ge "$WANT" ]
 }
 
+free_cards() {
+  local i f n=0
+  for ((i = 0; i < NGPU; i++)); do
+    f="$LEASE_DIR/gpu.$i.lease"
+    [ -e "$f" ] || : >"$f" 2>/dev/null || continue
+    flock -n "$f" true 2>/dev/null && n=$((n + 1))
+  done
+  echo "$n"
+}
+# Cards claimed by live tickets older than ours: we may only take what is left over.
+older_want() {
+  local t w sum=0
+  for t in $(live_tickets); do
+    [ "$t" = "$TICKET" ] && break
+    read -r w _ <"$t" 2>/dev/null && sum=$((sum + w))
+  done
+  echo "$sum"
+}
+
 S=$(date +%s)
-until try_acquire; do
+: >>"$LEASE_DIR/queue.seq" 2>/dev/null; chmod 666 "$LEASE_DIR/queue.seq" 2>/dev/null
+exec 199<"$LEASE_DIR/queue.seq" && flock 199
+SEQ=$(( $(cat "$LEASE_DIR/queue.seq" 2>/dev/null || echo 0) + 1 ))
+echo "$SEQ" >"$LEASE_DIR/queue.seq"
+TICKET="$QDIR/$(printf %012d "$SEQ").$$"
+echo "$WANT $S $(proc_start $$) $LABEL" >"$TICKET"
+exec 199<&-
+trap 'rm -f "$TICKET"' EXIT
+until [ $(( $(free_cards) - $(older_want) )) -ge "$WANT" ] && try_acquire; do
   release_all                                          # avoid deadlocking peers
   if [ $(( $(date +%s) - S )) -ge "$TIMEOUT" ]; then
     echo "[$(date -Is)] $LABEL TIMEOUT after ${TIMEOUT}s (wanted $WANT of $NGPU)" | tee -a "$LOG" >&2
     exit 75
   fi
-  sleep $(( (RANDOM % 3) + 2 ))                        # jitter: avoid lockstep retries
+  sleep 1
 done
+rm -f "$TICKET"
 W=$(( $(date +%s) - S ))
 
 # Pin the child to exactly the cards we hold. A partial lease that still saw
@@ -265,7 +336,33 @@ if [ -n "$PRE" ]; then
 fi
 echo "[$(date -Is)] $LABEL ACQUIRED gpus=[$GOT] (waited ${W}s) pid=$$" >> "$LOG"
 
-"$@"; RC=$?
+# Own process group (job control), so the whole job tree stops with the lease: a killed
+# lease used to leave its servers on the card with no lease at all.
+set -m
+"$@" &
+CHILD=$!
+set +m
+stop_child() {
+  local i
+  kill -TERM -- "-$CHILD" 2>/dev/null || return 0
+  for i in $(seq 1 20); do kill -0 -- "-$CHILD" 2>/dev/null || return 0; sleep 0.5; done
+  kill -KILL -- "-$CHILD" 2>/dev/null
+}
+STOPPED=""
+trap 'STOPPED=signal; stop_child' TERM INT HUP
+T0=$(date +%s)
+while kill -0 "$CHILD" 2>/dev/null; do
+  sleep 2
+  if [ -z "$STOPPED" ] && [ "$MAX_HOLD" -gt 0 ] && [ $(( $(date +%s) - T0 )) -ge "$MAX_HOLD" ] &&
+     [ -n "$(live_tickets)" ]; then
+    STOPPED=preempt
+    echo "[$(date -Is)] $LABEL PREEMPTED after ${MAX_HOLD}s with waiters queued" | tee -a "$LOG" >&2
+    stop_child
+  fi
+done
+wait "$CHILD"; RC=$?
+stop_child                                             # strays the command left behind
+[ "$STOPPED" = preempt ] && RC=124
 
 POST=$(foreign "$GOT")
 if [ -n "$POST" ]; then
