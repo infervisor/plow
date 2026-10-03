@@ -2,9 +2,9 @@
 # llm_grid.sh plow|vllm <resdir> — the matched LLM serving grid, one side per call, run inside ONE
 # lease (the same client, `vllm bench serve` via pb_bench, against both servers):
 #
-#   GL=perf-data/tools/gpulease
-#   $GL -n 1 grid-plow timeout 3600 env ASSETS=... HF=... scripts/bench/llm_grid.sh plow <res>/plow
-#   $GL -n 1 grid-vllm timeout 3600 env HF=... scripts/bench/llm_grid.sh vllm <res>/vllm
+#   Q="scripts/bench/gpuq.py submit"
+#   $Q grid-plow 1 timeout 3600 env ASSETS=... HF=... scripts/bench/llm_grid.sh plow <res>/plow
+#   $Q grid-vllm 1 timeout 3600 env HF=... scripts/bench/llm_grid.sh vllm <res>/vllm
 #   scripts/bench/waterfall.py <res>/plow <res>/vllm          # grid table, spread, waterfall
 #
 # Hygiene it enforces: every cell and repeat draws unique prompts (explicit per-cell seed), so a

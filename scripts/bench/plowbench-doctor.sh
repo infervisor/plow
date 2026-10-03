@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # plowbench-doctor — validate the environment and the artifacts BEFORE leasing a GPU.
 #
-#   nix develop --command scripts/bench/plowbench-doctor.sh [assets-dir] [object-dir] [plowrt]
+#   nix develop --command scripts/bench/plowbench-doctor.sh [assets-dir] [object-dir] [plowrt] [arch] [serve|block]
+#   (block skips the vLLM client check)
 #
 # CPU only. Leases nothing, starts no server, touches no GPU. Run it first; every check here
 # corresponds to a failure that has already cost at least one leased run in this campaign.
@@ -79,15 +80,18 @@ if [ -x "$LEASE" ]; then
     # Print its own words; do not invent a card count from them.
     "$LEASE" --status 2>/dev/null | head -4 | sed 's/^/        /'
 else
-    pb_warn "gpulease not at $LEASE — it is NOT on PATH; every GPU process must go through it"
+    pb_warn "no gpulease at $WT/perf-data/tools/gpulease, /app/plow/perf-data/tools/gpulease or on PATH"
 fi
 QROOT="${PB_GPUQ:-}"
 if [ -n "$QROOT" ] && [ -e "$QROOT/runner.log" ]; then
-    if pgrep -f "$QROOT/runner.py" > /dev/null 2>&1; then
+    # The lab submit.sh queue runs runner.py; scripts/bench/gpuq.py runs `gpuq.py --root <root> run`.
+    if pgrep -f "$QROOT/runner.py" > /dev/null 2>&1 \
+        || pgrep -f "gpuq.py --root $(realpath -m "$QROOT") run" > /dev/null 2>&1; then
         pb_ok "queue runner alive ($(tail -1 "$QROOT/runner.log" | cut -c1-80))"
     else
         pb_warn "queue runner NOT running — it idle-exits after 1800 s on an empty spool."
-        pb_info "A job submitted after it exits sits in the spool forever. Restart it, then submit."
+        pb_info "lab submit.sh: a job submitted after it exits sits in the spool forever; restart it first."
+        pb_info "gpuq.py submit restarts its runner itself."
     fi
 fi
 

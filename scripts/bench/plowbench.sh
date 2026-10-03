@@ -27,7 +27,7 @@
 #     pb_bench stamps arm order into the result so a later reader can see it.
 #
 # Everything here is CPU-only except pb_serve_start. Nothing here leases a GPU — go through the
-# queue (`submit.sh`) for that, as the campaign rules require.
+# queue (`scripts/bench/gpuq.py`, or the lab `submit.sh`) for that, as the campaign rules require.
 
 [ -n "${PB_SOURCED:-}" ] && return 0
 PB_SOURCED=1
@@ -158,7 +158,7 @@ pb_require_nix() {
     pb_ok "nix dev shell ($info)"
 }
 
-# Refuse a run whose environment silently redefines the measurement.
+# Warn on (do not refuse) an environment that silently redefines the measurement.
 # PB_ALLOW_HAZARD="PLOW_TICK_LOG PLOW_GLM_ROWBAND" to opt in deliberately.
 pb_hazard_env() {
     local allow=" ${PB_ALLOW_HAZARD:-} "
@@ -311,9 +311,8 @@ PYEOF
     fi
 }
 
-pb_check_vllm() {
-    local arch="${1:-}"
-    [ -n "$arch" ] || arch=$(pb_detect_arch) || return 1
+# The client pb_check_vllm validates and pb_bench runs: PB_VLLM, else the first existing default.
+pb_vllm_client() {
     local v="${PB_VLLM:-}"
     if [ -z "$v" ]; then
         if [ -x "/app/plow/build-gemma31/vllm-python" ]; then
@@ -326,6 +325,13 @@ pb_check_vllm() {
             v="$VLLM_VENV/bin/vllm"
         fi
     fi
+    echo "$v"
+}
+
+pb_check_vllm() {
+    local arch="${1:-}"
+    [ -n "$arch" ] || arch=$(pb_detect_arch) || return 1
+    local v; v=$(pb_vllm_client)
 
     if pb_is_nvidia "$arch"; then
         if [ -z "$v" ] || [ ! -x "$v" ]; then
@@ -334,7 +340,7 @@ pb_check_vllm() {
                 pb_ok "vLLM available via python3 -m vllm (CUDA)"
                 return 0
             fi
-            pb_bad "no vLLM client found (checked PB_VLLM, /opt/pytorch/bin/vllm, and PATH)"
+            pb_bad "no vLLM client found (checked PB_VLLM, /app/plow/build-gemma31/vllm-python, /opt/pytorch/bin/vllm, PATH, VLLM_VENV)"
             return 1
         fi
         pb_ok "vLLM client $v (CUDA)"
@@ -412,7 +418,10 @@ pb_serve_stop() {
 PB_ARM_N=0
 pb_bench() {
     local res="$1" tag="$2" model="$3" conc="$4" np="$5" isl="$6" osl="$7"; shift 7
-    local v="${PB_VLLM:-/app/plow/build-gemma31/vllm-python}"
+    local v; v=$(pb_vllm_client); v=${v:-python3}
+    # A `vllm` console script takes the subcommand directly; a python launcher needs the module.
+    local cli=(-m vllm.entrypoints.cli.main)
+    [ "${v##*/}" = vllm ] && cli=()
     local lib="${PB_VLLM_ROCM_LIB:-/opt/rocm/core-7.14/lib}"
     local tokz="${PB_TOKENIZER:-zai-org/GLM-5.3}"
     PB_ARM_N=$((PB_ARM_N + 1))
@@ -424,7 +433,7 @@ pb_bench() {
     mkdir -p "$res"
     echo "$PB_ARM_N" > "$res/$tag.armorder"
     timeout --foreground --kill-after=10s -s TERM "${PB_BENCH_TIMEOUT:-3000}" env VLLM_ROCM_LIB="$lib" "$v" \
-        -m vllm.entrypoints.cli.main bench serve \
+        "${cli[@]}" bench serve \
         --backend vllm --host 127.0.0.1 --port "$PB_SERVER_PORT" --model "$model" \
         --tokenizer "$tokz" --trust-remote-code --dataset-name random \
         --seed "$seed" --num-prompts "$np" \
