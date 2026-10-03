@@ -57,8 +57,8 @@ fn packed_runtime_tables_are_excluded_from_both_weight_consumers() {
     let m = plow_asset::packed_prefill::Manifest {
         version: 1,
         max_request_rows: None,
-        stage_rows: None,
-        stages: Vec::new(),
+        stage_rows: Some(1024),
+        stages: vec![plow_asset::packed_prefill::Stage { slot: 8, request: 9 }],
         slot: 4,
         request: 5,
         maps: vec![plow_asset::packed_prefill::Map {
@@ -71,6 +71,8 @@ fn packed_runtime_tables_are_excluded_from_both_weight_consumers() {
         (4, "pf.request.slot"),
         (5, "pf.request.table"),
         (7, "pf.request.maps.6"),
+        (8, "pf.request.slot.0"),
+        (9, "pf.request.table.0"),
     ] {
         assert!(!is_checkpoint_tensor(index, name, Some(&m)));
         assert!(
@@ -87,6 +89,8 @@ fn packed_runtime_tables_are_excluded_from_both_weight_consumers() {
         (5, "pf.request.other"),
         (7, "pf.request.maps.9"),
         (6, "pf.request.maps.6"),
+        (8, "pf.request.slot.1"),
+        (9, "pf.request.slot.0"),
     ] {
         assert!(
             is_checkpoint_tensor(index, name, Some(&m)),

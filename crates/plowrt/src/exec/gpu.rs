@@ -3511,6 +3511,10 @@ fn is_checkpoint_tensor(
     let declared_runtime = packed.is_some_and(|m| {
         (index == usize::from(m.slot) && name == "pf.request.slot")
             || (index == usize::from(m.request) && name == "pf.request.table")
+            || m.stages.iter().enumerate().any(|(k, s)| {
+                (index == usize::from(s.slot) && name == format!("pf.request.slot.{k}"))
+                    || (index == usize::from(s.request) && name == format!("pf.request.table.{k}"))
+            })
             || m.maps.iter().any(|map| {
                 index == usize::from(map.slots)
                     && name == format!("pf.request.maps.{}", map.original)
