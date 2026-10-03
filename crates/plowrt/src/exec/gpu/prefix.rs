@@ -815,6 +815,13 @@ impl GpuEngine {
                 tracing::debug!(slot = b, p_a, freed, "vmm: session retired superseded snapshots");
             }
         }
+        // Turn end: pressure may have evicted the prompt end (the next turn's attach point)
+        // while this turn decoded. The rings still hold its window, so restore it now, newest in
+        // LRU just before the session's next request; a surviving one is only touched.
+        let end = prompt.saturating_sub(1) / 32 * 32;
+        if session && rows > prompt && end > 0 && end < p_a {
+            self.publish_boundary(b, end);
+        }
     }
 
     /// Publish slot `b`'s shared-prefix end (`VmmKv::share_rows`, e.g. a system prompt

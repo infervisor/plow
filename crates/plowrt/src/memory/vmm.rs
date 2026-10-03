@@ -3046,10 +3046,7 @@ fn evict_one(s: &Shared, inner: &mut Inner, preserve_hot: bool) -> bool {
     // blocks that become dead with it. A boundary inside a block serves only its exact
     // tail, the whole-block checkpoint under the same node every continuation: that tailed
     // one goes first. A boundary attached twice or more is a shared prefix (a system
-    // prompt) and goes last; a session-pinned one (`pin_prefix`) just before it. Among
-    // session-pinned boundaries the shortest goes first, not the LRU one: sessions reuse
-    // their boundaries round-robin, and LRU over a working set slightly larger than the
-    // cache evicts every boundary just before its next turn.
+    // prompt) and goes last; a session-pinned one (`pin_prefix`) just before it.
     let pinned = inner.cache.pinned();
     if let Some((node, index)) = inner.published.iter()
         .flat_map(|(&node, snaps)| {
@@ -3061,11 +3058,7 @@ fn evict_one(s: &Shared, inner: &mut Inner, preserve_hot: bool) -> bool {
             })
         })
         .filter(|(_, _, snap, _, _)| snap.users == 0 && Some(snap.va) != protected)
-        .min_by_key(|(_, _, snap, pin, covered)| {
-            let by_rows = *pin && snap.session;
-            let order = if by_rows { u64::from(snap.rows) } else { snap.last_used };
-            (snap.attaches >= 2, *pin, !covered, by_rows, order)
-        })
+        .min_by_key(|(_, _, snap, pin, covered)| (snap.attaches >= 2, *pin, !covered, snap.last_used))
         .map(|(node, index, _, _, _)| (node, index))
     {
         let before = inner.stats.cache_bytes;
@@ -4958,33 +4951,39 @@ mod tests {
         assert_eq!(p.try_attach(1, &t2).unwrap().map(|a| a.rows), Some(9));
     }
 
-    /// Session-pinned boundaries reused round-robin: eviction takes the shortest, not the
-    /// least recently used one (LRU would take each just before its session's next turn).
+    /// The turn-end re-publish of a session's prompt end: a surviving boundary is touched (no
+    /// copy) and becomes newest in LRU; an evicted one is restored for the next turn.
     #[test]
-    fn pinned_session_boundaries_evict_shortest_first() {
+    fn session_turn_end_republishes_its_prompt_end() {
         let p = pool(Arc::new(MockVmm::default()));
-        let a = prompt(30);
-        let b: Vec<u32> = a.iter().map(|t| t + 1).collect();
-        let c: Vec<u32> = a.iter().map(|t| t + 2).collect();
-        let until = std::time::Instant::now() + std::time::Duration::from_secs(60);
-        for (pr, rows) in [(&c, 20u32), (&a, 12), (&b, 28)] {
-            assert!(p.try_attach(0, pr).unwrap().is_none());
-            p.ensure_rows(0, 30).unwrap();
-            p.note_session(0, pr);
-            p.publish_at(0, pr, rows, 48, |_| Ok(())).unwrap();
-            p.begin_seq(0);
-            p.pin_prefix(pr, until);
-        }
+        let t1 = prompt(13);
+        let other: Vec<u32> = t1.iter().map(|t| t + 1).collect();
+        assert!(p.try_attach(1, &other).unwrap().is_none());
+        p.ensure_rows(1, 13).unwrap();
+        p.publish_at(1, &other, 9, 48, |_| Ok(())).unwrap();
+        assert!(p.try_attach(0, &t1).unwrap().is_none());
+        p.ensure_rows(0, 15).unwrap();
+        p.note_session(0, &t1);
+        p.publish_at(0, &t1, 9, 48, |_| Ok(())).unwrap();
+        let mut end = t1.clone();
+        end.extend([500, 501]);
+        p.publish_at(0, &end, 15, 48, |_| Ok(())).unwrap();
+        p.publish_at(0, &end, 9, 48, |_| panic!("a surviving boundary is not copied")).unwrap();
         {
             let mut inner = p.shared.inner.lock();
+            assert!(evict_one(&p.shared, &mut inner, true), "the turn end");
+            assert!(evict_one(&p.shared, &mut inner, true), "the other prefix, now LRU");
+            assert_eq!(inner.stats.snapshot_bytes, 48);
             assert!(evict_one(&p.shared, &mut inner, true));
-            assert_eq!(inner.stats.snapshot_bytes, 96);
         }
+        p.publish_at(0, &end, 9, 48, |_| Ok(())).unwrap();
+        p.begin_seq(0);
+        let mut t2 = t1[..9].to_vec();
+        t2.extend([600, 601, 602, 603, 604, 605, 606, 607]);
         p.ensure_rows(1, 1).unwrap();
-        assert!(p.try_attach(1, &a).unwrap().is_none(), "the 12-row boundary went");
         p.begin_seq(1);
         p.ensure_rows(1, 1).unwrap();
-        assert_eq!(p.try_attach(1, &c).unwrap().map(|x| x.rows), Some(20), "the LRU one stays");
+        assert_eq!(p.try_attach(1, &t2).unwrap().map(|a| a.rows), Some(9));
     }
 
     /// A request waiting on a session's in-flight prompt keeps the whole-block checkpoint it
