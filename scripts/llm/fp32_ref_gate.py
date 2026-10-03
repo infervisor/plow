@@ -416,15 +416,19 @@ def parse_choice(choice):
 
 def teacher_force(complete, prompt, cont):
     """Positions of `cont` scored on the exact reference history. complete(ids, n) -> (tokens,
-    tops, text). Returns (free-run tokens, free text, {k: top}, requests)."""
-    pos, k, free, text, requests = {}, 0, None, "", 0
+    tops, text). Returns (free-run tokens, free text, {k: top}, requests, empty replies)."""
+    pos, k, free, text, requests, empty = {}, 0, None, "", 0, 0
     while k < len(cont):
         toks, tops, txt = complete(prompt + cont[:k], len(cont) - k)
         requests += 1
+        if not toks:
+            # A reply with no tokens (plowrt drops a stop token without ignore_eos): retry, count it.
+            empty += 1
+            if empty > 3:
+                raise RuntimeError(f"no tokens returned at position {k}")
+            continue
         if free is None:
             free, text = toks, txt
-        if not toks:
-            raise RuntimeError(f"no tokens returned at position {k}")
         step = 0
         for t, top in zip(toks, tops):
             pos[k + step] = top
@@ -432,7 +436,7 @@ def teacher_force(complete, prompt, cont):
             if t != cont[k + step - 1]:
                 break
         k += step
-    return free, text, pos, requests
+    return free, text, pos, requests, empty
 
 
 def cmd_capture(a):
@@ -442,7 +446,9 @@ def cmd_capture(a):
 
     def complete(ids, n):
         r = post(url + "/v1/completions", {"model": model, "prompt": ids, "max_tokens": n, "temperature": 0,
-                                           "logprobs": TOP, "return_tokens_as_token_ids": True})
+                                           "logprobs": TOP, "return_tokens_as_token_ids": True,
+                                           # plowrt omits a stop token from logprobs; the EOS position must be scored.
+                                           "ignore_eos": True})
         c = r["choices"][0]
         if r["usage"]["prompt_tokens"] != len(ids):
             raise RuntimeError(f"server re-tokenized the prompt: {r['usage']['prompt_tokens']} != {len(ids)}")
@@ -452,8 +458,8 @@ def cmd_capture(a):
     def one(case):
         t = time.time()
         try:
-            free, text, pos, n = teacher_force(complete, case["prompt_ids"], case["cont"])
-            row = dict(free=free, free_text=text, pos={str(k): v for k, v in pos.items()}, requests=n)
+            free, text, pos, n, empty = teacher_force(complete, case["prompt_ids"], case["cont"])
+            row = dict(free=free, free_text=text, pos={str(k): v for k, v in pos.items()}, requests=n, empty_replies=empty)
         except Exception as e:  # noqa: BLE001 - a failed case is scored as missing, not a crash
             row = dict(error=repr(e))
         print(f"  {a.arm} {case['id']:<28} {row.get('requests', 'ERR')} req {time.time() - t:.1f}s "

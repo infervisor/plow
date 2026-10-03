@@ -279,6 +279,13 @@ campaign.py gate <recipe> --assets <assets> --out <dir> [--only llm_fp32_ref] [-
 python3 $P gate --ref ref.json --cand <dir>/llm_fp32_ref/plow.json --peer <dir>/llm_fp32_ref/vllm.json
 ```
 
+The tolerances were calibrated on Gemma-4 12B FP8 (H100), where vLLM's own repeats differ by 1.18× in
+KL mean, 0.006 in top-1 and 0.021 in agreement. vLLM gated against its own repeat passes in both
+directions. Results are in the [gemma12b comparison](results/gemma12b-fp8-20260930/comparison.md#fp32-reference-quality-gate).
+The in-lease vLLM server needs `nvcc` (CUDA toolkit on `PATH`, or `CUDA_HOME`), so run it inside
+`nix develop` or set it in `[gates.llm_fp32_ref.env]`. Captures send `ignore_eos`, because plowrt
+leaves a stop token out of completions logprobs.
+
 Unit tests: `cd scripts/llm && python3 -m unittest test_fp32_ref_gate`.
 
 ---
