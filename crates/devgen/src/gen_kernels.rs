@@ -63,7 +63,7 @@ pub(crate) struct Entry {
 }
 
 /// Mirrors the build_catalog.py entries; a new entry takes the next generated role ID.
-pub(crate) const CATALOG: [Entry; 3] = [
+pub(crate) const CATALOG: [Entry; 4] = [
     Entry {
         name: "attn_pf_hd512",
         role: GENERATED_FIRST,
@@ -95,6 +95,17 @@ pub(crate) const CATALOG: [Entry; 3] = [
         window: ANY_SLIDING,
         ring_kv: true,
         pair_heads: true,
+        min_rows: 128,
+    },
+    Entry {
+        name: "attn_pf_hd512_fp8kv",
+        role: GENERATED_FIRST + 3,
+        file: "gen_sm90a_attn_pf_hd512_fp8kv.cubin",
+        kv: KvDtype::Fp8,
+        head_dim: 512,
+        window: 0,
+        ring_kv: false,
+        pair_heads: false,
         min_rows: 128,
     },
 ];
@@ -297,10 +308,11 @@ mod tests {
         assert!(bf16.matches(&op) && !fp8.matches(&op));
         op.op = DevOp::FlashPrefillFp8 as u16;
         assert!(!bf16.matches(&op) && fp8.matches(&op));
-        // No entry claims FP8-KV global attention.
+        // FP8-KV global attention has its own entry; the bf16 one does not claim it.
         op.i[5] = 0;
         op.i[6] = 512;
-        assert!(CATALOG.iter().all(|e| !e.matches(&op)));
+        op.j[1] = u32::MAX;
+        assert!(entry("attn_pf_hd512_fp8kv").matches(&op) && !entry("attn_pf_hd512").matches(&op));
     }
 
     #[test]

@@ -9,9 +9,12 @@
 #                         native FP8 GEMM where the route matrix measured native faster (down_proj
 #                         at M = 1088 and >= 2048, the 4160/2112 exceptions)
 #   prefill hd256 sliding generated attn_pf_hd256_sliding_fp8kv (FlashPrefillFp8, every rung >= 128)
-#   prefill hd512 global  interpreter FP8 arm (no generated FP8-KV hd512 entry yet)
+#   prefill hd512 global  generated attn_pf_hd512_fp8kv (TileLang, FlashPrefillFp8, every rung >= 128)
 #   decode B=128          cuBLASLt output head, light FP8 attention with 16-byte loads, direct
 #                         V conversion and the segmented FlashDecode grid; B < 128 unchanged
+#   decode B 33..128      the 128 rung: the control's 64 rung (TC64 GEMV) measured 139.6 / 146.9 /
+#                         175.0 ms per step at ctx 1K / 4K / 16K against 40.5 / 55.2 / 111.1 ms
+#                         on the 128 rung, so the ladder drops 64 (and with it TC64)
 schema = "plow.recipe.v1"
 namespace = "infervisor"
 name = "gemma-4-12b"
@@ -76,7 +79,7 @@ PLOW_FUSE_ARGMAX = "1"
 
 [objects]
 script = "scripts/build_sm90a_gemma4_segments.sh"
-role_files = ["gen_sm90a_attn_pf_hd256_sliding_fp8kv.cubin"]
+role_files = ["gen_sm90a_attn_pf_hd256_sliding_fp8kv.cubin", "gen_sm90a_attn_pf_hd512_fp8kv.cubin"]
 [objects.env]
 PLOW_BUILD_FATLITE = "1"
 NVCC_APPEND_FLAGS = "-DPLOW_NV_GLU_QUANT_CACHE=1 -DPLOW_NV_GLU_QUANT_WPR=1"
@@ -85,13 +88,13 @@ PLOW_BUILD_FA_GQA2_PAIR = "0"
 PLOW_BUILD_PFATTN_HD256_BKV32 = "0"
 PLOW_BUILD_PFATTN_HD256_GQA2_BKV32 = "0"
 PLOW_BUILD_PFATTN_HD512_PX4_BQ64 = "0"
-PLOW_BUILD_GEN_KERNELS = "attn_pf_hd256_sliding_fp8kv"
+PLOW_BUILD_GEN_KERNELS = "attn_pf_hd256_sliding_fp8kv,attn_pf_hd512_fp8kv"
 
 [emit_roles.env]
 PLOW_GEMMA4_SM90_W8A8_GEMM_GLU_ROLE = "0"
 PLOW_GEMMA4_SM90_HD512_PX4_BQ64_ROLE = "0"
 PLOW_GEMMA4_SM90_HD256_GQA2_ROLE = "0"
-PLOW_EMIT_GEN_KERNELS = "attn_pf_hd256_sliding_fp8kv"
+PLOW_EMIT_GEN_KERNELS = "attn_pf_hd256_sliding_fp8kv,attn_pf_hd512_fp8kv"
 
 [serve.env]
 PLOW_PREFIX_CACHE = "1"

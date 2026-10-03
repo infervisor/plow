@@ -13,7 +13,20 @@ static_assert(PLOW_GEN_ARENA >= 116 * 1024,
 
 extern "C" __device__ __constant__ unsigned plow_pf_request_abi = 2;
 extern "C" __device__ __constant__ unsigned plow_pf_masked_padding_abi = 1;
+#ifndef PLOW_GEN_FP8_KV
+#define PLOW_GEN_FP8_KV 0
+#endif
+// FP8-KV mode (FlashPrefillFp8): e4m3 K/V, one f32 scale per (position, KV head) row passed in
+// the opart / mlpart slots (ABI 2), the packed request table in the op's i[4] handle.
+#if PLOW_GEN_FP8_KV
+extern "C" __device__ unsigned plow_gen_flash_prefill_abi = 2;
+extern "C" __device__ __constant__ unsigned plow_pf_fp8_request_abi = 1;
+extern "C" __device__ __constant__ unsigned plow_pf_fp8_masked_padding_abi = 1;
+typedef fp8_e4_t plow_gen_kv_t;
+#else
 extern "C" __device__ unsigned plow_gen_flash_prefill_abi = 1;
+typedef bfloat16_t plow_gen_kv_t;
+#endif
 extern "C" __device__ unsigned plow_gen_block = PLOW_GEN_THREADS;
 extern "C" __device__ unsigned plow_gen_arena_bytes = PLOW_GEN_ARENA;
 extern "C" __device__ unsigned plow_attention_head_dim = PLOW_GEN_HEAD_DIM;
@@ -26,8 +39,8 @@ typedef struct {
     float* opart;
     float* mlpart;
     const bfloat16_t* q;
-    const bfloat16_t* k;
-    const bfloat16_t* v;
+    const plow_gen_kv_t* k;
+    const plow_gen_kv_t* v;
     bfloat16_t* output;
     const void* mapkv;
     const PlowStreamEnt* entries;
@@ -88,13 +101,20 @@ __device__ __forceinline__ void gen_run(const PlowGenFlashPrefill& a) {
         const unsigned tiles = (qlen + PLOW_GEN_BM - 1) / PLOW_GEN_BM;
         const unsigned tile = tiles - 1 - local / a.n_head, head = local % a.n_head;
         const size_t qoff = (size_t)q0 * a.n_head * PLOW_GEN_HEAD_DIM;
-        const size_t kvoff =
-            ((size_t)slot * a.n_kv_head + head / (a.n_head / a.n_kv_head)) * a.kv_stride *
-            PLOW_GEN_HEAD_DIM;
+        const size_t kvrow =
+            ((size_t)slot * a.n_kv_head + head / (a.n_head / a.n_kv_head)) * a.kv_stride;
+        const size_t kvoff = kvrow * PLOW_GEN_HEAD_DIM;
         __syncthreads();
+#if PLOW_GEN_FP8_KV
+        plow_gen_call_fp8((int)tile, (int)head, a.q + qoff, a.k + kvoff, a.v + kvoff,
+                          a.opart + kvrow, a.mlpart + kvrow, a.output + qoff, (int)a.n_head,
+                          (int)qlen, (int)kvlen, a.scale, (int)a.window, a.kv_mask);
+#else
+        (void)kvrow;
         plow_gen_call((int)tile, (int)head, a.q + qoff, a.k + kvoff, a.v + kvoff,
                       a.output + qoff, (int)a.n_head, (int)qlen, (int)kvlen, a.scale,
                       (int)a.window, a.kv_mask);
+#endif
     }
 
     unsigned real = a.seq_q;
@@ -147,7 +167,12 @@ void plow_gen_flash_prefill(PlowProgram prog) {
     __syncthreads();
     const PlowDevInst* in = prog.insts + entry.inst;
     void* const* t = prog.tensors;
-    if (in->op != PLOW_DOP_FLASH_PREFILL || in->i[6] != PLOW_GEN_HEAD_DIM ||
+#if PLOW_GEN_FP8_KV
+    const unsigned op = PLOW_DOP_FLASH_PREFILL_FP8;
+#else
+    const unsigned op = PLOW_DOP_FLASH_PREFILL;
+#endif
+    if (in->op != op || in->i[6] != PLOW_GEN_HEAD_DIM ||
         in->i[7] != 1 || in->t[5] == PLOW_TENSOR_NONE ||
         in->i[3] == 0 || in->i[2] % in->i[3]) {
         __trap();
@@ -155,14 +180,25 @@ void plow_gen_flash_prefill(PlowProgram prog) {
     }
     __shared__ PlowGenFlashPrefill a;
     if (threadIdx.x == 0) {
+#if PLOW_GEN_FP8_KV
+        const unsigned handle = in->i[4] & ~(1u << 31);
+        const bool packed = in->i[4] & (1u << 31);
+        a.requests = packed && handle < PLOW_TENSOR_NONE ? static_cast<const int*>(t[handle])
+                                                         : nullptr;
+        if (packed && !a.requests) __trap();
+        a.opart = static_cast<float*>(t[in->t[6]]);
+        a.mlpart = static_cast<float*>(t[in->t[7]]);
+        a.q_pos0 = packed ? 0u : in->i[4];
+#else
         a.requests = in->t[6] == PLOW_TENSOR_NONE ? nullptr : static_cast<const int*>(t[in->t[6]]);
+        a.q_pos0 = in->i[4];
+#endif
         a.q = static_cast<const bfloat16_t*>(t[in->t[2]]);
-        a.k = static_cast<const bfloat16_t*>(t[in->t[3]]);
-        a.v = static_cast<const bfloat16_t*>(t[in->t[4]]);
+        a.k = static_cast<const plow_gen_kv_t*>(t[in->t[3]]);
+        a.v = static_cast<const plow_gen_kv_t*>(t[in->t[4]]);
         a.output = static_cast<bfloat16_t*>(t[in->t[5]]);
         a.seq_q = in->i[0];
         a.seq_kv = in->i[1];
-        a.q_pos0 = in->i[4];
         a.kv_stride = in->fj[1].u;
         a.kv_mask = in->fj[2].u;
         a.scale = in->fj[0].f;

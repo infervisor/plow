@@ -566,7 +566,7 @@
    "spill_bytes": 0
   },
   "attn_pf_hd256_sliding_fp8kv": {
-   "body_sha256": "cd4b3b046c16d6cdefeec17119e42669dc1b216bb5a2b2196fa298faef098351",
+   "body_sha256": "af3281cde502b27076e0c2c0d53717b0d2bb2ce734376ab3355580da0b9c5de5",
    "classes": {
     "h16kv8_w1024_rows1024": {
      "best": {
@@ -585,8 +585,8 @@
        },
        "floor_us": 8.7,
        "rel_l2": 0.00231,
-       "tflops": 128,
-       "us": 67.0
+       "tflops": 127,
+       "us": 67.7
       },
       {
        "config": {
@@ -597,8 +597,8 @@
        },
        "floor_us": 8.7,
        "rel_l2": 0.00231,
-       "tflops": 134,
-       "us": 64.1
+       "tflops": 135,
+       "us": 63.9
       }
      ]
     },
@@ -619,8 +619,8 @@
        },
        "floor_us": 60.8,
        "rel_l2": 0.00228,
-       "tflops": 241,
-       "us": 249.3
+       "tflops": 240,
+       "us": 250.3
       },
       {
        "config": {
@@ -631,8 +631,8 @@
        },
        "floor_us": 60.8,
        "rel_l2": 0.00228,
-       "tflops": 251,
-       "us": 240.0
+       "tflops": 254,
+       "us": 236.8
       }
      ]
     },
@@ -653,8 +653,8 @@
        },
        "floor_us": 130.3,
        "rel_l2": 0.00231,
-       "tflops": 265,
-       "us": 485.8
+       "tflops": 264,
+       "us": 489.0
       },
       {
        "config": {
@@ -665,8 +665,8 @@
        },
        "floor_us": 130.3,
        "rel_l2": 0.00231,
-       "tflops": 277,
-       "us": 465.9
+       "tflops": 279,
+       "us": 461.1
       }
      ]
     },
@@ -688,7 +688,7 @@
        "floor_us": 3.2,
        "rel_l2": 0.00221,
        "tflops": 75,
-       "us": 41.4
+       "us": 41.7
       },
       {
        "config": {
@@ -699,8 +699,8 @@
        },
        "floor_us": 3.2,
        "rel_l2": 0.00221,
-       "tflops": 78,
-       "us": 40.1
+       "tflops": 79,
+       "us": 39.5
       }
      ]
     },
@@ -708,7 +708,7 @@
      "best": {
       "bn": 64,
       "kstages": 2,
-      "preg": 64,
+      "preg": 72,
       "vstages": 2
      },
      "measured": [
@@ -721,8 +721,8 @@
        },
        "floor_us": 7.4,
        "rel_l2": 0.00239,
-       "tflops": 164,
-       "us": 44.5
+       "tflops": 163,
+       "us": 45.0
       },
       {
        "config": {
@@ -733,8 +733,8 @@
        },
        "floor_us": 7.4,
        "rel_l2": 0.00239,
-       "tflops": 164,
-       "us": 44.6
+       "tflops": 166,
+       "us": 44.1
       }
      ]
     }

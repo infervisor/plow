@@ -81,6 +81,78 @@ def flash_prefill_body(D, BM, BN, stages, threads):
     return attn_pf
 
 
+def flash_prefill_body_fp8kv(D, BM, BN, stages, threads):
+    """flash_prefill_body over an e4m3 KV cache with one f32 scale per row (FlashPrefillFp8): K/V
+    tiles are staged as e4m3 and converted exactly to bf16; k_scale multiplies the score columns
+    before masking, v_scale the P columns (after the row sum) before the PV."""
+    import tilelang.language as T
+    qlen, kvlen, heads = T.dynamic("qlen, kvlen, heads")
+    dt, acc, f8 = "bfloat16", "float", "float8_e4m3"
+    log2e = 1.4426950408889634
+
+    @T.prim_func
+    def attn_pf(Q: T.Tensor((qlen, heads, D), dt), K: T.Tensor((kvlen, D), f8),
+                V: T.Tensor((kvlen, D), f8), KS: T.Tensor((kvlen,), acc),
+                VS: T.Tensor((kvlen,), acc), O: T.Tensor((qlen, heads, D), dt),
+                scale: T.float32):
+        with T.Kernel(T.ceildiv(qlen, BM), heads, threads=threads) as (qb, h):
+            Q_s = T.alloc_shared((BM, D), dt)
+            K8 = T.alloc_shared((BN, D), f8)
+            V8 = T.alloc_shared((BN, D), f8)
+            K_s = T.alloc_shared((BN, D), dt)
+            V_s = T.alloc_shared((BN, D), dt)
+            ks = T.alloc_shared((BN,), acc)
+            vs = T.alloc_shared((BN,), acc)
+            S = T.alloc_fragment((BM, BN), acc)
+            P = T.alloc_shared((BM, BN), dt)
+            Oacc = T.alloc_fragment((BM, D), acc)
+            m = T.alloc_fragment((BM,), acc)
+            mp = T.alloc_fragment((BM,), acc)
+            sc = T.alloc_fragment((BM,), acc)
+            ssum = T.alloc_fragment((BM,), acc)
+            l = T.alloc_fragment((BM,), acc)
+            sl = scale * log2e
+            pos0 = kvlen - qlen
+            T.copy(Q[qb * BM:(qb + 1) * BM, h, :], Q_s)
+            T.fill(Oacc, 0)
+            T.fill(l, 0)
+            T.fill(m, -T.infinity(acc))
+            nt = T.min(T.ceildiv(kvlen, BN), T.ceildiv(pos0 + (qb + 1) * BM, BN))
+            for k in T.Pipelined(nt, num_stages=stages):
+                T.copy(K[k * BN:(k + 1) * BN, :], K8)
+                T.copy(KS[k * BN:(k + 1) * BN], ks)
+                T.copy(VS[k * BN:(k + 1) * BN], vs)
+                for i, j in T.Parallel(BN, D):
+                    K_s[i, j] = K8[i, j]
+                T.clear(S)
+                T.gemm(Q_s, K_s, S, transpose_B=True, policy=T.GemmWarpPolicy.FullRow)
+                for i, j in T.Parallel(BM, BN):
+                    S[i, j] = T.if_then_else(pos0 + qb * BM + i >= k * BN + j, S[i, j] * ks[j],
+                                             -T.infinity(acc))
+                T.copy(m, mp)
+                T.reduce_max(S, m, dim=1, clear=False)
+                for i in T.Parallel(BM):
+                    sc[i] = T.exp2(mp[i] * sl - m[i] * sl)
+                for i, j in T.Parallel(BM, BN):
+                    S[i, j] = T.exp2(S[i, j] * sl - m[i] * sl)
+                T.reduce_sum(S, ssum, dim=1)
+                for i in T.Parallel(BM):
+                    l[i] = l[i] * sc[i] + ssum[i]
+                for i, j in T.Parallel(BM, BN):
+                    P[i, j] = S[i, j] * vs[j]
+                for i, j in T.Parallel(BM, D):
+                    Oacc[i, j] *= sc[i]
+                T.copy(V[k * BN:(k + 1) * BN, :], V8)
+                for i, j in T.Parallel(BN, D):
+                    V_s[i, j] = V8[i, j]
+                T.gemm(P, V_s, Oacc, policy=T.GemmWarpPolicy.FullRow)
+            for i, j in T.Parallel(BM, D):
+                Oacc[i, j] /= l[i]
+            T.copy(Oacc, O[qb * BM:(qb + 1) * BM, h, :])
+
+    return attn_pf
+
+
 # Catalog entries. `signature` is what devgen matches packet ops against (crates/devgen/src/
 # gen_kernels.rs mirrors it); `classes` are the tuning shape classes (heads, kv heads, rows).
 ENTRIES = {
@@ -93,6 +165,23 @@ ENTRIES = {
                   for bm, bn, st, thr in [(64, 64, 1, 256), (64, 32, 1, 256), (64, 32, 2, 256),
                                           (64, 16, 2, 256), (64, 16, 3, 256)]],
         "classes": [(16, 1, 1024), (16, 1, 4096), (16, 1, 8192)],
+    },
+    # FlashPrefillFp8 global attention (crates/devgen/src/gen_kernels.rs KvDtype::Fp8). The
+    # extra staging tiles leave room for BN <= 32 only.
+    "attn_pf_hd512_fp8kv": {
+        "signature": {"op": "flash_prefill", "head_dim": 512, "mask": "causal", "window": 0,
+                      "gqa": [1, 16], "dtype": "bf16", "kv_dtype": "fp8_e4m3_rowscale",
+                      "arch": "sm_90a"},
+        "object": "gen_sm90a_attn_pf_hd512_fp8kv.cubin",
+        "fp8": True,
+        # bf16 P times the per-row V scale: the hd256 FP8-KV entry's 2.3e-3 class.
+        "tol": 4e-3,
+        "body": lambda c: flash_prefill_body_fp8kv(512, c["bm"], c["bn"], c["stages"],
+                                                   c["threads"]),
+        "sweep": [{"bm": bm, "bn": bn, "stages": st, "threads": thr}
+                  for bm, bn, st, thr in [(64, 32, 1, 256), (64, 32, 2, 256), (64, 16, 2, 256),
+                                          (64, 16, 3, 256)]],
+        "classes": [(16, 1, 1024), (16, 1, 4096), (16, 1, 1024, 7168), (16, 1, 1024, 14336)],
     },
 }
 
@@ -141,6 +230,9 @@ def generate(name, cfg):
     body = body.replace("blockIdx.x", "plow_bx").replace("blockIdx.y", "plow_by")
     args = {"Q": "Q_", "K": "K_", "V": "V_", "O": "O_", "heads": "heads_", "qlen": "qlen_",
             "kvlen": "kvlen_", "scale": "scale_", "window": "window_", "kv_mask": "kv_mask_"}
+    fp8 = ENTRIES[name].get("fp8", False)
+    if fp8:
+        args.update(KS="KS_", VS="VS_")
     assert set(params) <= set(args), f"unexpected body params {params}"
     sig = ENTRIES[name]["signature"]
     hdr = [f"// generated: {name} {json.dumps(cfg, sort_keys=True)} tilelang {tilelang.__version__}",
@@ -148,9 +240,16 @@ def generate(name, cfg):
            f"#define PLOW_GEN_BM {cfg['bm']}", f"#define PLOW_GEN_BN {cfg['bn']}",
            f"#define PLOW_GEN_THREADS {cfg['threads']}",
            f"#define PLOW_GEN_ARENA {max(arena, MIN_ARENA)}"]
-    call = ("#define plow_gen_call(bx, by, Q_, K_, V_, O_, heads_, qlen_, kvlen_, scale_, window_, "
-            "kv_mask_) "
-            f"plow_gen_body(bx, by, {', '.join(args[p] for p in params)})")
+    if fp8:
+        # The wrapper's FP8-KV mode (gen_flash_prefill.cu): e4m3 K/V plus per-row scales.
+        hdr.append("#define PLOW_GEN_FP8_KV 1")
+        call = ("#define plow_gen_call_fp8(bx, by, Q_, K_, V_, KS_, VS_, O_, heads_, qlen_, "
+                "kvlen_, scale_, window_, kv_mask_) "
+                f"plow_gen_body(bx, by, {', '.join(args[p] for p in params)})")
+    else:
+        call = ("#define plow_gen_call(bx, by, Q_, K_, V_, O_, heads_, qlen_, kvlen_, scale_, "
+                "window_, kv_mask_) "
+                f"plow_gen_body(bx, by, {', '.join(args[p] for p in params)})")
     text = "\n".join(hdr) + "\n" + body + "\n" + call + "\n"
     return text, max(arena, MIN_ARENA), tilelang.__version__
 
@@ -293,7 +392,8 @@ def graph_time(torch, fns, reps=5):
 class Case:
     """Packet-shaped buffers: Q/O [seq_q][H][D], K/V [slots][KVH][kv_stride][D], a request table."""
 
-    def __init__(self, drv, H, KVH, D, seq_q, kv_stride, slots, requests, seed=0, window=0):
+    def __init__(self, drv, H, KVH, D, seq_q, kv_stride, slots, requests, seed=0, window=0,
+                 fp8=False):
         torch = drv.torch
         g = torch.Generator(device="cuda").manual_seed(seed)
         self.H, self.KVH, self.D, self.seq_q, self.kv_stride = H, KVH, D, seq_q, kv_stride
@@ -304,6 +404,17 @@ class Case:
         self.q = (torch.randn(seq_q, H, D, device="cuda", generator=g) * D ** -0.5).to(bf)
         self.k = torch.randn(slots, KVH, kv_stride, D, device="cuda", dtype=bf, generator=g)
         self.v = torch.randn(slots, KVH, kv_stride, D, device="cuda", dtype=bf, generator=g)
+        self.fp8 = fp8
+        if fp8:
+            # The packet's cache write (one scale per row, amax / 448); the reference reads the
+            # dequantized cache.
+            def quant(x):
+                xf = x.float()
+                sc = (xf.abs().amax(-1) / 448.0).clamp_min(1e-12)
+                q = (xf / sc[..., None]).to(torch.float8_e4m3fn)
+                return q.view(torch.uint8).contiguous(), sc.contiguous(), q.float() * sc[..., None]
+            self.k8, self.ks, self.k = quant(self.k)
+            self.v8, self.vs, self.v = quant(self.v)
         self.o = torch.full((seq_q, H, D), float("nan"), device="cuda", dtype=bf)
         flat = [len(requests)] + [x for r in requests for x in r]
         self.req = torch.tensor(flat, device="cuda", dtype=torch.int32)
@@ -313,6 +424,13 @@ class Case:
 
     def gen_args(self):
         p = lambda t: ("p", t.data_ptr())
+        if self.fp8:
+            # ABI 2: k / v scales ride the opart / mlpart slots.
+            return pack_args([p(self.req), p(self.ks), p(self.vs), p(self.q), p(self.k8),
+                              p(self.v8), p(self.o), ("p", 0), p(self.entries), p(self.counters),
+                              p(self.counters), ("u", self.seq_q), ("u", 0), ("u", 0),
+                              ("u", self.kv_stride), ("u", 0xFFFFFFFF), ("f", 1.0),
+                              ("u", self.H), ("u", self.KVH), ("u", self.window), ("u", 0)])
         return pack_args([p(self.req), p(self.scratch), p(self.scratch), p(self.q), p(self.k),
                           p(self.v), p(self.o), ("p", 0), p(self.entries), p(self.counters),
                           p(self.counters), ("u", self.seq_q), ("u", 0), ("u", 0),
@@ -346,19 +464,24 @@ def bench_entry(drv, name, image, arena, block, classes, check_pack=True):
     torch = drv.torch
     _, fn = drv.function(image, "plow_gen_flash_prefill_direct", arena)
     res = {}
-    for H, KVH, rows in classes:
+    fp8 = ENTRIES[name].get("fp8", False)
+    # A class is (heads, kv heads, rows[, past]): one chunk of `rows` after `past` cached rows.
+    for H, KVH, rows, *rest in classes:
+        past = rest[0] if rest else 0
         D = ENTRIES[name]["signature"]["head_dim"]
-        per = rows * (2 * H + 2 * KVH) * D * 2
+        per = (rows * 2 * H + (rows + past) * 2 * KVH) * D * 2
         n = max(2, min(8, math.ceil(160e6 / per)))
         win = ENTRIES[name]["signature"]["window"]
-        cases = [Case(drv, H, KVH, D, rows, rows, 1, [(0, rows, 0, rows)], seed=s, window=win)
+        cases = [Case(drv, H, KVH, D, rows, rows + past, 1, [(0, rows, 0, rows + past)], seed=s,
+                      window=win, fp8=fp8)
                  for s in range(n)]
         run_gen(drv, fn, arena, block, cases[0])
         torch.cuda.synchronize()
         err = cases[0].reference()
         us = graph_time(torch, [(lambda c=c: run_gen(drv, fn, arena, block, c)) for c in cases])
-        flop = 4 * H * D * sum(min(r + 1, win) if win else r + 1 for r in range(rows))
-        res[f"h{H}kv{KVH}_rows{rows}"] = {"us": round(us, 1), "rel_l2": float(f"{err:.2e}"),
+        flop = 4 * H * D * sum(min(past + r + 1, win) if win else past + r + 1
+                               for r in range(rows))
+        res[f"h{H}kv{KVH}_rows{rows}" + (f"_past{past}" if past else "")] = {"us": round(us, 1), "rel_l2": float(f"{err:.2e}"),
                                          "floor_us": round(flop / BF16_PEAK_TFLOPS / 1e6, 1),
                                          "tflops": round(flop / us / 1e6)}
         del cases
@@ -368,7 +491,7 @@ def bench_entry(drv, name, image, arena, block, classes, check_pack=True):
         H, KVH, D = classes[0][0], classes[0][1], ENTRIES[name]["signature"]["head_dim"]
         reqs = [(0, 1000, 2, 3000), (1000, 1500, 0, 1500), (2500, 77, 1, 2125)]
         c = Case(drv, H, KVH, D, 2688, 4096, 3, reqs, seed=7,
-                 window=ENTRIES[name]["signature"]["window"])
+                 window=ENTRIES[name]["signature"]["window"], fp8=fp8)
         run_gen(drv, fn, arena, block, c)
         torch.cuda.synchronize()
         tail = c.o[2577:].float()
@@ -435,7 +558,8 @@ def cmd_tune(a):
                 spill = max(int(s) + int(l) for s, l in spills)
                 res["spill_bytes"] = spill
                 ok = (res["packed_check"]["tail_zero"]
-                      and all(v["rel_l2"] < 1e-3 for k, v in res.items() if k != "spill_bytes"))
+                      and all(v["rel_l2"] < e.get("tol", 1e-3)
+                              for k, v in res.items() if k != "spill_bytes"))
                 trials.append((cfg, header, res, ok))
                 print(f"{name} {cfg}: {json.dumps(res)} spill={spill}", flush=True)
             except Exception as ex:  # a config TileLang or nvcc rejects is just not a candidate
@@ -446,8 +570,8 @@ def cmd_tune(a):
         total = lambda t: sum(v["us"] for k, v in t[2].items() if k.startswith("h"))
         best = min(good, key=total)
         classes = {}
-        for H, KVH, rows in e["classes"]:
-            key = f"h{H}kv{KVH}_rows{rows}"
+        for H, KVH, rows, *past in e["classes"]:
+            key = f"h{H}kv{KVH}_rows{rows}" + (f"_past{past[0]}" if past else "")
             meas = [{"config": c, **r[key]} for c, _, r, ok in good]
             classes[key] = {"best": min(meas, key=lambda m: m["us"])["config"],
                             "measured": meas}
@@ -471,7 +595,7 @@ def cmd_bench(a):
         row = table["entries"][name]
         image = (Path(a.objdir) / row["object"]).read_bytes()
         header, arena, _ = generate(name, row["config"])
-        H, KVH, _ = ENTRIES[name]["classes"][0]
+        H, KVH = ENTRIES[name]["classes"][0][:2]
         classes = ENTRIES[name]["classes"] + [(H, KVH, int(x)) for x in a.rows]
         rows = [c[2] for c in classes]
         print(name, json.dumps(bench_entry(drv, name, image, arena, row["config"]["threads"],

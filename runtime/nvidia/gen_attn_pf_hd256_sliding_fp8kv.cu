@@ -57,7 +57,10 @@ constexpr unsigned OFF_SCALE = OFF_RAWV + RAW_BYTES;
 constexpr unsigned OFF_BAR = OFF_SCALE + KS * SCALE_BYTES;
 // fullQ[2] emptyQ[2] fullK[KS] emptyK[KS] fullV[VS] emptyV[VS]
 constexpr unsigned NBAR = 4 + 2 * KS + 2 * VS;
-constexpr unsigned ARENA = OFF_BAR + NBAR * 8 + 1024;
+// The packet entry keeps its operand block at the base of dynamic shared memory: static shared
+// memory would push the arena past the 227 KiB block limit.
+constexpr unsigned ARG_BYTES = 128;
+constexpr unsigned ARENA = ARG_BYTES + OFF_BAR + NBAR * 8 + 1024;
 static_assert(ARENA >= 116 * 1024 && ARENA <= 227 * 1024, "one CTA per SM");
 }  // namespace hd256
 
@@ -640,10 +643,15 @@ __device__ __forceinline__ bool valid(const PlowGenFlashPrefill& a) {
            (a.kv_mask == 0xffffffffu || a.kv_mask + 1 >= (unsigned)BN);
 }
 
-__device__ __forceinline__ uint8_t* arena() {
-    extern __shared__ __align__(1024) uint8_t dyn[];
-    const uint32_t s = (uint32_t)__cvta_generic_to_shared(dyn);
-    return dyn + ((1024u - (s & 1023u)) & 1023u);
+__device__ __forceinline__ uint8_t* dynamic_smem() {
+    extern __shared__ __align__(16) uint8_t dyn[];
+    return dyn;
+}
+// The 1024-aligned arena after `skip` bytes of dynamic shared memory.
+__device__ __forceinline__ uint8_t* arena(unsigned skip) {
+    uint8_t* const base = dynamic_smem() + skip;
+    const uint32_t s = (uint32_t)__cvta_generic_to_shared(base);
+    return base + ((1024u - (s & 1023u)) & 1023u);
 }
 
 }  // namespace hd256
@@ -654,7 +662,7 @@ void plow_gen_flash_prefill_direct(const __grid_constant__ PlowGenFlashPrefill a
         __trap();
         return;
     }
-    hd256::run(args, hd256::arena(), args.entries + blockIdx.x, args.succs, args.counters);
+    hd256::run(args, hd256::arena(0), args.entries + blockIdx.x, args.succs, args.counters);
 }
 
 // Packet entry: one FlashPrefillFp8 instruction per segment, `blocks` == gridDim.x.
@@ -682,7 +690,7 @@ void plow_gen_flash_prefill(PlowProgram prog) {
     __syncthreads();
     const PlowDevInst* in = prog.insts + entry.inst;
     void* const* t = prog.tensors;
-    __shared__ PlowGenFlashPrefill a;
+    PlowGenFlashPrefill& a = *reinterpret_cast<PlowGenFlashPrefill*>(hd256::dynamic_smem());
     if (threadIdx.x == 0) {
         // Packed: i[4] carries the request table's handle in its low bits (interpreter ABI).
         const unsigned q_pos0 = in->i[4];
@@ -712,5 +720,5 @@ void plow_gen_flash_prefill(PlowProgram prog) {
     if (in->op != PLOW_DOP_FLASH_PREFILL_FP8 || in->i[6] != hd256::HD || in->i[7] != 1 ||
         ((in->i[4] & (1u << 31)) && !a.requests) || !hd256::valid(a))
         __trap();
-    hd256::run(a, hd256::arena(), prog.gq_stream + index, prog.succs, prog.counters);
+    hd256::run(a, hd256::arena(hd256::ARG_BYTES), prog.gq_stream + index, prog.succs, prog.counters);
 }
