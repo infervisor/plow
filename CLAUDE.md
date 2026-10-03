@@ -23,6 +23,8 @@ environment failures on leased GPUs.
 * New probes `source scripts/bench/plowbench.sh` instead of re-implementing port choice, the
   readiness poll, the bench invocation, or result parsing.
 * Every GPU process goes through the queue, never a raw lease.
+* Final plow-vs-baseline performance comparisons: only `campaign.py report` output, in the strict
+  12-row format of `docs/bringup/agent-tools.md` "Final performance report (strict)".
 
 ### Performance campaign evidence and promotion
 

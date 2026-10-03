@@ -115,13 +115,76 @@ captures, profiler traces, generated HTML, temporary CSVs and full manifests in 
 outside the repo; link or hash the evidence from the summary. Never put raw benchmark data in
 arbitrary repo directories, including `docs/`, `scripts/` and `perf-data/`. Curated, validated
 tuning summaries can live in an established campaign area, with raw evidence kept in scratch.
-Use `campaign.py bench/compare`, `llm_grid.sh`, `waterfall.py` and the existing
-`serving_comparison.py` when present in the campaign branch. Keep the same client, model/weights,
+Use `campaign.py bench/compare`, `llm_grid.sh` and `waterfall.py` while iterating; a final
+comparison is rendered only by `campaign.py report` (next section). Keep the same client, model/weights,
 quantization, traffic, concurrency, GPU count and cache policy on both serving arms; record
 throughput, throughput/GPU, TTFT P99, TPOT P99, peak memory and output correctness. Render in
 scratch and append the vetted rows to the sole campaign CSV rather than committing each tool's
 generated result tree. Compare prefix-cache token-hit rates with token-hit rates and request-hit
 rates with request-hit rates; the two denominators can differ sharply on shared short prefixes.
+
+### Final performance report (strict)
+
+**This is the only accepted format for a final performance comparison** (Infervisor/plow vs vLLM
+or any other baseline): in a summary, a `comparison.md`, a PR or a chat report. Do not hand-write
+the table and do not quote another renderer's numbers as final. The harness renders it and
+refuses anything incomplete:
+
+```bash
+# both arms with llm_grid.sh (single-turn and/or --agentic); each writes <res>/provenance.json
+env ... KV_DTYPE=<plow KV dtype, named as vLLM names it> scripts/bench/llm_grid.sh plow <res>/plow [--agentic]
+env ... scripts/bench/llm_grid.sh vllm <res>/vllm [--agentic]
+campaign.py gate <recipe> --assets <served assets> --out <gate> --only llm_fp32_ref   # same packet
+campaign.py report --baseline <res>/vllm --infervisor <res>/plow --gate <gate>/gates.json --out <dir> \
+    [--cells g128,s128,a64.g]
+# = scripts/bench/serving_comparison.py render ...; writes comparison.md / .json / .csv
+```
+
+One table per compared cell (workload x input/output x concurrency x traffic):
+
+| Metric | Baseline | Infervisor |
+|---|---|---|
+| Model / version | | Same as baseline |
+| Precision / quantization | | Same as baseline |
+| Input / output length | | Same as baseline |
+| Traffic / concurrency | | Same as baseline |
+| GPU type & count | | Same as baseline |
+| Serving stack | | Infervisor |
+| Output quality / correctness | | Equivalent |
+| Peak GPU memory | | |
+| Total throughput | | |
+| Throughput / GPU | | |
+| TTFT P99 | | |
+| TPOT P99 | | |
+
+Rules (enforced in `serving_comparison.py`, tested in `scripts/bench/test_serving_comparison.py`):
+
+* Exactly these 12 rows, in this order. Every cell is filled; missing data is an error, not a blank.
+* "Same as baseline" only when the recorded value is literally identical; otherwise the Infervisor
+  value is shown and the cell is **NOT MATCHED**. Matched = the first five rows identical.
+  Input/output also compares the per-request length lists.
+* Serving stack: Baseline = stack, version and serve flags; Infervisor =
+  `Infervisor (plowrt <commit>, packet <model.pkt sha256 prefix>)`.
+* Output quality: from the FP32-reference gate (`gates.json`, `llm_fp32_ref`, §5). "Equivalent" only
+  if it passed for the exact served packet (its `packet_sha256` = the Infervisor arm's); otherwise
+  "Not equivalent (<failing metric>)". No gate, or a gate for another packet, is an error.
+* Total throughput = (input + output) tok/s; Throughput / GPU = total / GPU count; TTFT/TPOT P99 in
+  ms; peak GPU memory in GiB from `gpu_peak_mem.py` (sampled per cell by `llm_grid.sh`). The
+  Infervisor column shows the Infervisor / Baseline ratio, e.g. `1,234 tok/s (1.12x)`.
+* Values are means over repeats (at least 2, the recorded count, identical on both arms). The
+  spread, (max - min) / mean, is a note under each table; a spread > 10% marks the value `*` and
+  is listed as FLAGGED.
+* Exit 2 = refused, nothing written (missing data, provenance, gate, repeats, unpaired cells).
+  Exit 1 = written but NOT MATCHED or NOT EQUIVALENT: not a valid final comparison. Exit 0 = valid.
+
+Provenance comes from the run, never from a person: `llm_grid.sh` calls
+`serving_comparison.py record` (model id + config/weights hash, precision from `config.json` plus
+the KV dtype, GPU name/count from `nvidia-smi` honoring `CUDA_VISIBLE_DEVICES`, vLLM version and
+flags, plowrt commit, packet sha256, repeats, sampling flags). The plow arm needs `KV_DTYPE` (or
+`PRECISION`), and `PLOWRT_GIT_SHA` when `PLOWRT` is outside a checkout; `MODEL_VERSION` overrides
+the model id. A result dir from before the recorder needs a provenance file written from its logs
+(`--baseline-provenance` / `--infervisor-provenance`). `campaign.py gate` records `packet_sha256`;
+re-score an older gate with `--score-only` against the served assets.
 
 Pitfalls this playbook exists for:
 

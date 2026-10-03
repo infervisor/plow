@@ -5,6 +5,7 @@
     campaign.py serve   <recipe.toml> --assets DIR --profile P [--port N]  # production plowrt serve
     campaign.py bench   <recipe.toml> --assets DIR --out DIR [--concs "1 4"] [--in-lens ...]
     campaign.py compare <results.csv> <reference.csv> [--roofline] [--recipe <recipe.toml>]
+    campaign.py report  --baseline VLLM_RES --infervisor PLOW_RES --gate gates.json --out DIR  # final report
     campaign.py roofline <recipe.toml> [--results results.csv]
     campaign.py loop    <recipe.toml> [--out DIR] [--profile realtime]
     campaign.py sweep   <recipe.toml> --param KNOB --values V1,V2 [--out DIR]
@@ -1030,6 +1031,8 @@ def compare(res: Path, ref: Path) -> None:
 
 
 def cmd_compare(a: argparse.Namespace) -> None:
+    print("compare is a diagnostic; a final Infervisor-vs-baseline comparison must use `campaign.py report`",
+          file=sys.stderr)
     compare(Path(a.results), Path(a.reference))
     if getattr(a, "roofline", False):
         recipe_path = None
@@ -1048,6 +1051,16 @@ def cmd_compare(a: argparse.Namespace) -> None:
             print("\n" + generate_roofline_report(recipe_path, Path(a.results)))
         else:
             print("\n(roofline report: pass --recipe <recipe.toml> or place run-record.json beside results to calculate % roofline achieved)")
+
+
+def cmd_report(a: argparse.Namespace) -> None:
+    """The strict final Infervisor-vs-baseline report (scripts/bench/serving_comparison.py render)."""
+    cmd = [sys.executable, str(REPO / "scripts/bench/serving_comparison.py"), "render", "--baseline", a.baseline,
+           "--infervisor", a.infervisor, "--gate", a.gate, "--out", a.out]
+    for flag in ("cells", "baseline_provenance", "infervisor_provenance"):
+        if getattr(a, flag):
+            cmd += ["--" + flag.replace("_", "-"), getattr(a, flag)]
+    sys.exit(subprocess.run(cmd).returncode)
 
 
 def cmd_roofline(a: argparse.Namespace) -> None:
@@ -1411,7 +1424,10 @@ def cmd_gate(a: argparse.Namespace) -> None:
     if not out.is_dir():
         die(f"{out}: no gate run to score")
     scores = {k: gate_score(k, cfg[k], out / k) for k in kinds}
+    pkt = assets / "model.pkt"
+    # serving_comparison.py render accepts the gate only for the exact packet the Infervisor arm served.
     record = dict(recipe=str(Path(a.recipe).resolve()), recipe_sha256=sha(Path(a.recipe)), assets=str(assets),
+                  packet_sha256=sha(pkt) if pkt.is_file() else None,
                   commit=git("rev-parse", "HEAD"), dirty=bool(git("status", "--porcelain")),
                   utc=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), gates=scores,
                   thresholds={k: {kk: v for kk, v in gates[k].items() if kk.endswith(("_min", "_max"))} for k in kinds},
@@ -1539,6 +1555,12 @@ def main() -> None:
     c.add_argument("--roofline", action="store_true", help="display roofline analysis alongside comparison")
     c.add_argument("--recipe", help="optional recipe path to use for roofline geometry")
     c.set_defaults(f=cmd_compare)
+    rp = sp.add_parser("report", help="strict final Infervisor vs baseline report from two llm_grid result dirs")
+    rp.add_argument("--baseline", required=True); rp.add_argument("--infervisor", required=True)
+    rp.add_argument("--gate", required=True, help="gates.json from `gate --only llm_fp32_ref` on the served packet")
+    rp.add_argument("--out", required=True); rp.add_argument("--cells")
+    rp.add_argument("--baseline-provenance"); rp.add_argument("--infervisor-provenance")
+    rp.set_defaults(f=cmd_report)
     rf = sp.add_parser("roofline"); rf.add_argument("recipe"); rf.add_argument("--results"); rf.set_defaults(f=cmd_roofline)
     lp = sp.add_parser("loop"); lp.add_argument("recipe"); lp.add_argument("--out"); lp.add_argument("--profile")
     lp.add_argument("--concs"); lp.add_argument("--in-lens"); lp.add_argument("--label"); lp.add_argument("--reference")

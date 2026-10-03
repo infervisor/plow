@@ -29,6 +29,8 @@
 # (32 64 128) concurrent sessions x AGENTIC_TURNS (10), history growing to AGENTIC_TARGET (15600)
 # tokens, AGENTIC_MAX_TOKENS (128) per reply, AGENTIC_API (chat), REPS repeats, greedy + SAMPLED.
 # Prefix caching stays ON on both sides (vLLM APC default; plow X-Session-Id + prefix cache).
+# Records <resdir>/provenance.json for the strict report (serving_comparison.py render): plow needs
+# KV_DTYPE (or PRECISION) and, for a PLOWRT outside a git checkout, PLOWRT_GIT_SHA.
 set -u
 # Bash otherwise reads later commands from a file that a long campaign may edit.
 if [ -n "${BASH_SOURCE[0]:-}" ]; then
@@ -37,7 +39,7 @@ if [ -n "${BASH_SOURCE[0]:-}" ]; then
 fi
 HERE=$(cd "$(dirname "$0")/../.." && pwd)
 source "$HERE/scripts/bench/plowbench.sh"
-case "${1:-}" in plow|vllm) ;; *) sed -n '2,27p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;; esac
+case "${1:-}" in plow|vllm) ;; *) sed -n '2,33p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;; esac
 SIDE=$1 RES=${2:?resdir}
 if [ "$#" -gt 2 ] && ! { { [ "$3" = --quality ] && [ "$#" -ge 4 ]; } || { [ "$3" = --needle ] && [ "$#" -eq 3 ]; } \
         || { [ "$3" = --agentic ] && [ "$#" -eq 3 ]; }; }; then
@@ -62,12 +64,31 @@ else
         ${VLLM_ARGS:-} > "$PB_SERVER_LOG" 2>&1 &
 fi
 PB_SERVER_PID=$!
+if [ "$SIDE" = plow ]; then server_args=${SERVE_ARGS:-}
+else server_args="--gpu-memory-utilization ${VLLM_MEM:-0.85} --max-num-seqs 256 ${VLLM_ARGS:-}"; fi
+python3 "$HERE/scripts/bench/serving_comparison.py" record "$RES" --side "$SIDE" --hf "$HF" --reps "$REPS" \
+    --server-args "$server_args" --sampled "$SAMPLED" --pyref "$PYREF" --assets "${ASSETS:-}" \
+    --plowrt "${PLOWRT:-}" --repo "$HERE"
 memory_sampler_pid=
+memory_start() { # tag
+    if command -v nvidia-smi >/dev/null 2>&1; then
+        nvidia-smi --query-compute-apps=timestamp,pid,used_memory \
+            --format=csv,noheader,nounits -lms 100 > "$RES/$1.memory.csv" 2> "$RES/$1.memory.log" &
+        memory_sampler_pid=$!
+    fi
+}
 memory_stop() {
     if [ -n "$memory_sampler_pid" ]; then
         kill "$memory_sampler_pid" 2>/dev/null || true
         wait "$memory_sampler_pid" 2>/dev/null || true
         memory_sampler_pid=
+    fi
+}
+memory_finish() { # tag
+    memory_stop
+    if [ -f "$RES/$1.memory.csv" ]; then
+        python3 "$HERE/scripts/bench/gpu_peak_mem.py" "$RES/$1.memory.csv" \
+            --root-pid "$PB_SERVER_PID" > "$RES/$1.peak_gpu_memory_mib.txt"
     fi
 }
 trap 'memory_stop; pb_metrics_stop; pb_serve_stop' EXIT
@@ -103,11 +124,13 @@ if [ "${3:-}" = --agentic ]; then
     agentic() { # tag mode c rep [client args...]
         local tag=$1 mode=$2 c=$3 rep=$4; shift 4
         echo "CELL_BEGIN $tag $(date +%s.%N)" >> "$RES/cells.log"
+        memory_start "$tag"
         "$PYREF" "$HERE/scripts/bench/agentic_turns.py" --url "http://127.0.0.1:$PB_SERVER_PORT" \
             --model "$MODEL" --tokenizer "$HF" --sessions "$c" --turns "${AGENTIC_TURNS:-10}" \
             --target-tokens "${AGENTIC_TARGET:-15600}" --max-tokens "${AGENTIC_MAX_TOKENS:-128}" \
             --api "${AGENTIC_API:-chat}" --seed $(( 7001 + mode * 1000003 + c * 131 + rep * 7919 )) \
             --out "$RES/$tag.json" "$@" > "$RES/$tag.log" 2>&1
+        memory_finish "$tag"
         echo "CELL_END $tag $(date +%s.%N)" >> "$RES/cells.log"
         tail -1 "$RES/$tag.log" | sed "s/^/$tag /"
     }
@@ -131,18 +154,10 @@ fi
 # Distinct seed per (kind, conc, isl, osl, repeat): no cell's prompts are a prefix of another's.
 cell() { # tag kind conc np isl osl rep [client args...]
     local tag=$1 kind=$2 c=$3 np=$4 isl=$5 osl=$6 rep=$7; shift 7
-    if command -v nvidia-smi >/dev/null 2>&1; then
-        nvidia-smi --query-compute-apps=timestamp,pid,used_memory \
-            --format=csv,noheader,nounits -lms 100 > "$RES/$tag.memory.csv" 2> "$RES/$tag.memory.log" &
-        memory_sampler_pid=$!
-    fi
+    memory_start "$tag"
     PB_SEED=$(( 8193 + kind * 1000003 + c * 131 + isl * 7 + osl + rep * 7919 )) \
         pb_cell "$RES" "$tag" "$MODEL" "$c" "$np" "$isl" "$osl" "$@"
-    memory_stop
-    if [ -f "$RES/$tag.memory.csv" ]; then
-        python3 "$HERE/scripts/bench/gpu_peak_mem.py" "$RES/$tag.memory.csv" \
-            --root-pid "$PB_SERVER_PID" > "$RES/$tag.peak_gpu_memory_mib.txt"
-    fi
+    memory_finish "$tag"
     local f; f=$(pb_result "$RES" "$tag") && python3 - "$f" "$tag" <<'EOF'
 import json, sys
 d = json.load(open(sys.argv[1]))
