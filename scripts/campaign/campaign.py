@@ -513,6 +513,13 @@ def cmd_build(a: argparse.Namespace) -> None:
     if "max_ctx" in cell and cell["max_ctx"]:
         base_args.extend(["--max-ctx", str(cell["max_ctx"])])
     common = env_with(os.environ, emit.get("env", {}))
+    # The qualified [serve.env] rides in the packet's serve.json, so `plowrt serve --assets` alone
+    # serves it. Not the cache pin [serve.env] holds for ladder parity with vLLM, and not the
+    # paths a self-contained bundle resolves itself.
+    serve_defaults = {k: expand(str(v), out) for k, v in r.get("serve", {}).get("env", {}).items()
+                      if k not in ("PLOW_PREFIX_CACHE", "PLOW_PF_SEG_DIR", "PLOW_LT_ALGOS", "PLOW_LT_ALGOS_WRITE")}
+    if serve_defaults and "PLOW_EMIT_SERVE_DEFAULTS" not in common:
+        common["PLOW_EMIT_SERVE_DEFAULTS"] = ",".join(f"{k}={v}" for k, v in sorted(serve_defaults.items()))
     # The one emit-side variable of an A/B, named on the command line so build-record carries it.
     overrides = dict(kv.split("=", 1) for kv in (a.env or []))
     object_overrides = dict(kv.split("=", 1) for kv in (getattr(a, "object_env", None) or []))
@@ -558,6 +565,10 @@ def cmd_build(a: argparse.Namespace) -> None:
         # The role emit rebuilds its own cmake cubins (e.g. *_pfpackedseg); the recipe's object wins.
         for f in objects.get("role_files", []) if objects else []:
             (assets / f).write_bytes((obj_dir / f).read_bytes())
+        # The segment objects plowrt classes prefill against travel inside the bundle; plowrt
+        # takes `<assets>/objects` as PLOW_PF_SEG_DIR when nothing else is set.
+        if objects and obj_dir.is_dir():
+            shutil.copytree(obj_dir, assets / "objects")
     else:
         assets = out / "assets"
         print("== emit", file=sys.stderr)
@@ -600,6 +611,7 @@ def cmd_build(a: argparse.Namespace) -> None:
                               ("PLOW_NVCC", "PLOW_NVCC_PATH", "NVCC_PREPEND_FLAGS", "NVCC_APPEND_FLAGS")
                               if k in os.environ},
             "emit_env": {**emit.get("env", {}), **overrides},
+            "serve_defaults": common.get("PLOW_EMIT_SERVE_DEFAULTS"),
             "role_env": {**(roles or {}).get("env", {}), **overrides},
             "object_env": {**(objects or {}).get("env", {}), **object_overrides},
         },
@@ -785,7 +797,7 @@ def cmd_bench(a: argparse.Namespace) -> None:
 def packet_env(r: dict, assets: Path, env: dict) -> None:
     # A `build` places the segment/role objects beside the assets; the serve-side mirror of
     # the emit classing needs that directory and must not be typed by hand.
-    objects = assets.parent / "objects"
+    objects = assets / "objects" if (assets / "objects").is_dir() else assets.parent / "objects"
     if "objects" in r and "PLOW_PF_SEG_DIR" not in env and objects.is_dir():
         env["PLOW_PF_SEG_DIR"] = str(objects)
     # A `probe` (or a prior write) leaves the exact-shape cuBLASLt algorithm table beside the
