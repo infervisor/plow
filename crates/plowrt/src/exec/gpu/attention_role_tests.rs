@@ -143,7 +143,10 @@ fn hd512_object() -> plow_asset::segment_roles::SegmentObject {
             query_tile: 64,
             kv_tile: 32,
             warps: 8,
+            shape: None,
         }),
+        gemm: None,
+        decode_plan: None,
     }
 }
 
@@ -169,7 +172,10 @@ fn hd256_bkv64_object() -> plow_asset::segment_roles::SegmentObject {
             query_tile: 64,
             kv_tile: 64,
             warps: 8,
+            shape: None,
         }),
+        gemm: None,
+        decode_plan: None,
     }
 }
 

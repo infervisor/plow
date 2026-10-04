@@ -408,6 +408,8 @@ pub(crate) fn apply_native(
             sha256: Some(plow_asset::decode_objects::image_sha256(&image)),
             promote_k512: None,
             attention: None,
+            gemm: None,
+            decode_plan: None,
         },
     );
     roles.validate_schema()?;
@@ -1052,6 +1054,8 @@ mod tests {
                         sha256: None,
                         promote_k512: None,
                         attention: None,
+                        gemm: None,
+                        decode_plan: None,
                     },
                 )]
                 .into_iter()

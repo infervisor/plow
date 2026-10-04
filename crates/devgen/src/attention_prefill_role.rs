@@ -421,6 +421,7 @@ fn capability(query_tile: u32, kv_tile: u32) -> AttentionCapability {
         query_tile,
         kv_tile,
         warps: 8,
+        shape: None,
     }
 }
 
@@ -790,6 +791,7 @@ pub(crate) fn apply(
             query_tile: 64,
             kv_tile: 32,
             warps: 8,
+            shape: None,
         },
         Kind::Hd512 => capability(selection.query_tile, selection.kv_tile),
         Kind::Hd512Px4Bq64 => px4_bq64_capability(),
@@ -811,6 +813,8 @@ pub(crate) fn apply(
         sha256: Some(selection.sha256.clone()),
         promote_k512: None,
         attention: Some(attention),
+        gemm: None,
+        decode_plan: None,
     };
     let mut metadata = SegmentRoles {
         version: 1,
