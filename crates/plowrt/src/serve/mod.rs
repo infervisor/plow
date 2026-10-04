@@ -1020,6 +1020,8 @@ async fn metrics_handler(
         ("blocks_shared_mapped_total", "counter", "Shared prefix blocks mapped."),
         ("nodes_evicted_total", "counter", "Prefix tree nodes evicted."),
         ("blocks_live", "gauge", "Live prefix pool blocks."),
+        ("blocks_stale", "gauge", "Retired-window blocks still mapped, awaiting the reclaimer."),
+        ("blocks_pooled", "gauge", "Zero-reference blocks parked in the reuse pool."),
         ("cache_blocks", "gauge", "Prefix cache blocks."),
         ("cache_bytes", "gauge", "Prefix cache bytes."),
         ("snapshot_bytes", "gauge", "Prefix snapshot bytes."),
@@ -1044,6 +1046,8 @@ async fn metrics_handler(
              plowrt_prefix_blocks_shared_mapped_total{{model=\"{slug}\"}} {}\n\
              plowrt_prefix_nodes_evicted_total{{model=\"{slug}\"}} {}\n\
              plowrt_prefix_blocks_live{{model=\"{slug}\"}} {}\n\
+             plowrt_prefix_blocks_stale{{model=\"{slug}\"}} {}\n\
+             plowrt_prefix_blocks_pooled{{model=\"{slug}\"}} {}\n\
              plowrt_prefix_cache_blocks{{model=\"{slug}\"}} {}\n\
              plowrt_prefix_cache_bytes{{model=\"{slug}\"}} {}\n\
              plowrt_prefix_snapshot_bytes{{model=\"{slug}\"}} {}\n\
@@ -1058,6 +1062,8 @@ async fn metrics_handler(
             s.blocks_shared_mapped,
             s.nodes_evicted,
             s.blocks_live,
+            s.blocks_stale,
+            s.blocks_pooled,
             s.cache_blocks,
             s.cache_bytes,
             s.snapshot_bytes,

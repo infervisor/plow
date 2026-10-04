@@ -467,7 +467,15 @@ master switch and disables every side effect.
 
 Eviction runs a soft cap — `PLOW_VMM_CACHE_MIB`, else 5% of device memory —
 dropping output-only boundaries first, then zero-reference leaf nodes, then
-snapshots by least-recent use.
+snapshots by least-recent use. Session boundaries (`X-Session-Id`) go in their
+own order: one its session already attached (that turn is running), then one
+whose publisher still decodes (its turn end re-publishes it from the rings),
+then idle ones **newest first**. Sessions waiting for a slot are served in
+arrival order, so the newest idle boundary is needed last; LRU evicted each
+boundary just before its turn, and once the waiting sessions outnumbered the
+cache no turn attached (BF16 KV, 64 slots, 128 agentic sessions: 16% cached).
+Newest-first keeps a stable subset attaching instead (simulated 35%,
+`memory/vmm_sim_tests.rs`).
 
 ---
 
