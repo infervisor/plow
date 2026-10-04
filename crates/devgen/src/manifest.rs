@@ -2635,6 +2635,17 @@ pub fn pairing_hash(manifest: &Value) -> u64 {
     h
 }
 
+/// The FP32 speech ops (163..=204, `op_speech_f32.cuh`) a sidecar packet runs, bit `op - 163`:
+/// `PLOW_SPEECH_OPS`, which compiles only those arms into the speech interpreter object.
+pub fn speech_ops(model: &packet::devbuild::Model) -> u64 {
+    model
+        .progs
+        .iter()
+        .flat_map(|p| &p.insts)
+        .filter(|i| (163..=204).contains(&i.op))
+        .fold(0, |mask, i| mask | 1 << (i.op - 163))
+}
+
 /// Generate the header a specialised object compiles against.
 ///
 /// Two halves, and both matter:
@@ -2676,6 +2687,12 @@ pub fn config_header(manifest: &Value) -> String {
         "#define PLOW_PACKET_HASH 0x{:016x}ull\n\n",
         pairing_hash(manifest)
     ));
+    if let Some(mask) = manifest.get("speech_ops").and_then(Value::as_u64) {
+        out.push_str(&format!(
+            "/* FP32 speech ops of the sidecar packets: the speech object's arm set. */\n\
+             #ifndef PLOW_SPEECH_OPS\n#define PLOW_SPEECH_OPS 0x{mask:x}ull\n#endif\n\n"
+        ));
+    }
 
     // Presence macros, one per opcode in the union. Named from the `dev_isa.h`
     // spelling so a reader can grep the macro straight to the dispatch case.
@@ -3307,6 +3324,24 @@ mod tests {
             false
         );
         assert!(config_header(&ordinary).contains("#define PLOW_PACKET_REQUIRES_MOE_PREFILL_EP 0"));
+    }
+
+    #[test]
+    fn speech_ops_select_the_speech_arms_without_moving_the_pairing_hash() {
+        let mut sidecar = model();
+        sidecar.progs = vec![prog(vec![
+            inst(DevOp::LayerNormF32, [0; 8]),
+            inst(DevOp::AttentionF32, [0; 8]),
+            inst(DevOp::Gemv, [0; 8]),
+        ])];
+        let mask = speech_ops(&sidecar);
+        assert_eq!(mask, 1 << (DevOp::LayerNormF32 as u16 - 163) | 1 << (DevOp::AttentionF32 as u16 - 163));
+        let plain = build(&model(), "sm_90a");
+        let mut man = plain.clone();
+        man["speech_ops"] = mask.into();
+        assert_eq!(pairing_hash(&man), pairing_hash(&plain));
+        assert!(config_header(&man).contains(&format!("#ifndef PLOW_SPEECH_OPS\n#define PLOW_SPEECH_OPS 0x{mask:x}ull\n#endif\n")));
+        assert!(!config_header(&plain).contains("PLOW_SPEECH_OPS"));
     }
 
     /// The opt-in lean MoE body variants are object requests carried by the config header;
