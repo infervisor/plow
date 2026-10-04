@@ -824,10 +824,21 @@ impl DevBlob {
         let main = dir.join("model.pkt");
         if main.is_file() {
             let mut magic = [0u8; 8];
-            if std::fs::File::open(&main).and_then(|mut f| std::io::Read::read_exact(&mut f, &mut magic)).is_ok()
-                && is_blob_magic(&magic)
-            {
-                return Ok(Some(main));
+            if std::fs::File::open(&main).and_then(|mut f| std::io::Read::read_exact(&mut f, &mut magic)).is_ok() {
+                if is_blob_magic(&magic) {
+                    return Ok(Some(main));
+                }
+                // A device packet from a newer or older plowc. Skipping it registered the model
+                // with no device program, and every request then failed with no hint why.
+                if magic.starts_with(b"PLOWDEV") {
+                    return Err(RuntimeError::Device(format!(
+                        "{}: packet format version {} is not one this plowrt reads ({}); rebuild the \
+                         packet with a matching plowc or use a matching plowrt",
+                        main.display(),
+                        magic[7],
+                        packet::devbuild::BLOB_MAGICS.iter().map(|m| m[7].to_string()).collect::<Vec<_>>().join(", ")
+                    )));
+                }
             }
         }
         let mut found: Option<PathBuf> = None;
@@ -1152,6 +1163,18 @@ mod tests {
     use super::*;
     use packet::dev::DevInst;
     use packet::devbuild::{Model, Program, TensorDecl};
+
+    #[test]
+    fn unknown_packet_version_fails_at_discovery() {
+        let dir = std::env::temp_dir().join(format!("plowrt-pkt-version-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("model.pkt"), b"PLOWDEV\x7fnot-a-packet").unwrap();
+        let err = DevBlob::find_in_dir(&dir).unwrap_err().to_string();
+        assert!(err.contains("packet format version 127"), "{err}");
+        std::fs::write(dir.join("model.pkt"), b"not a device packet").unwrap();
+        assert!(DevBlob::find_in_dir(&dir).unwrap().is_none());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn packet_segments_recover_safe_cuda_object_routing() {

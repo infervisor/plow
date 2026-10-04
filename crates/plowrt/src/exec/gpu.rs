@@ -5675,7 +5675,9 @@ impl GpuEngine {
                 }
             }
         } else {
-            tracing::info!(
+            // Deliberate for decode-only bundles, but for a release asset it means prompts run one
+            // token per launch (~20x slower) with no other symptom.
+            tracing::warn!(
                 expected = profile.prefill_file,
                 "no prefill object for sm_{want_sm} — decode-only prompt consumption"
             );
