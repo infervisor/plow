@@ -249,10 +249,11 @@ def prod_run(root, tag, errors):
           f"[{c['out_min']}, {c['out_max']}] tokens, ignore_eos")
     traffic = (f"{temp_label(c['temperature'], c.get('top_p'))}, {c['api']} API, Poisson {c['rate']:g} sessions/s, "
                f"think lognormal({c['think_median_s']:g} s, {c['think_sigma']:g}) <= {c['think_max_s']:g} s, "
-               f"{c['duration']:g} s (measured {c['warmup']:g}-{c['duration'] - c['cooldown']:g} s), seed {c['seed']}, "
+               f"{c['duration']:g} s (measured {c['warmup']:g}-{c['duration'] - c['cooldown']:g} s), "
                f"session header {'on' if c.get('session_header', True) else 'off'} / open loop (achieved "
                f"concurrency in the supplementary note)")
     extra = {k: o.get(k) for k, _, _ in SUPPLEMENTARY}
+    extra["seed"] = c["seed"]
     extra["slo"] = f"TTFT <= {o['slo_ttft_ms']:g} ms and TPOT <= {o['slo_tpot_ms']:g} ms"
     return dict(io=io, io_key=io, traffic=traffic, total_tok_s=o["total_tok_s"],
                 ttft_p99_ms=o.get("ttft_p99_ms"), tpot_p99_ms=o.get("tpot_p99_ms"),
@@ -290,7 +291,10 @@ def arm(root, prov, cell, tags, errors):
     for k in ("io_key", "traffic"):
         if len({r[k] for r in runs}) > 1:
             errors.append(f"{root}: {cell} repeats differ in {k}")
-    out = dict(io=runs[0]["io"], io_key=runs[0]["io_key"], traffic=runs[0]["traffic"], repeats=len(runs),
+    traffic = runs[0]["traffic"]
+    if "extra" in runs[0]:  # one seed per repeat; the arms must replay the same plans
+        traffic += ", seeds " + "/".join(str(r["extra"]["seed"]) for r in runs)
+    out = dict(io=runs[0]["io"], io_key=runs[0]["io_key"], traffic=traffic, repeats=len(runs),
                sources=[r["source"] for r in runs], per_repeat={}, mean={}, spread_pct={})
     gpu_count = prov.get("gpu_count") or 1
     for r in runs:

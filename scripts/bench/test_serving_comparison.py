@@ -237,11 +237,11 @@ class RenderTest(unittest.TestCase):
         self.assertIn("Infervisor TTFT P99 40.0%", c["spread_flagged"][0])
         self.assertIn("FLAGGED", (out / "comparison.md").read_text())
 
-    def write_prod(self, **kw):
+    def write_prod(self, **kw):  # seed=N: Infervisor replays seed N in both repeats
         for d, scale in ((self.f.base, 1.0), (self.f.plow, 1.25)):
             for rep in (1, 2):
                 (d / f"q1250.g.r{rep}.json").write_text(json.dumps(prod(40000 * scale, 3000 / scale, 80, 4.0 * scale,
-                                                                      **(kw if d == self.f.plow else {}))))
+                                                                      **dict(dict(seed=9 + rep), **(kw if d == self.f.plow else {})))))
                 (d / f"q1250.g.r{rep}.peak_gpu_memory_mib.txt").write_text("70000\n")
 
     def test_open_loop_cell_strict_table_plus_supplementary(self):
@@ -253,6 +253,7 @@ class RenderTest(unittest.TestCase):
         self.assertEqual([r[0] for r in c["rows"]], list(sc.LABELS))
         self.assertTrue(c["matched"])
         self.assertIn("Poisson 1.25 sessions/s", rows["Traffic / concurrency"][0])
+        self.assertTrue(rows["Traffic / concurrency"][0].endswith("seeds 10/11"))
         self.assertEqual(rows["Total throughput"], ("40,000 tok/s", "50,000 tok/s (1.25x)"))
         self.assertEqual(rows["TTFT P99"], ("3,000.0 ms", "2,400.0 ms (0.80x)"))
         self.assertAlmostEqual(c["supplementary"]["infervisor"]["goodput_req_s"], 5.0)
