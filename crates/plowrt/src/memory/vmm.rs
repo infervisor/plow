@@ -3148,9 +3148,6 @@ fn evict_one(s: &Shared, inner: &mut Inner, preserve_hot: bool) -> bool {
         inner.stats.eviction_units += 1;
         inner.stats.eviction_unit_bytes += before - inner.stats.cache_bytes;
         tracing::debug!(freed = before - inner.stats.cache_bytes, blocks, "vmm prefix eviction unit");
-        if tracing::enabled!(tracing::Level::DEBUG) && inner.stats.eviction_units % 64 == 0 {
-            log_snapshot_mix(inner);
-        }
         return true;
     }
     let Some(key) = inner.cache.evict_lru() else {
@@ -3185,29 +3182,6 @@ fn evict_one(s: &Shared, inner: &mut Inner, preserve_hot: bool) -> bool {
     }
     inner.stats.nodes_evicted += 1;
     true
-}
-
-/// Debug: what the boundary cache holds, by the properties eviction orders on.
-fn log_snapshot_mix(inner: &Inner) {
-    let pinned = inner.cache.pinned();
-    let mut mix: std::collections::BTreeMap<String, (u32, u64)> = Default::default();
-    for (node, snaps) in &inner.published {
-        let pin = node.is_some_and(|key| pinned.contains(&key));
-        for snap in snaps {
-            let key = format!(
-                "users{} att{} pin{} share{} sess{} reuse{} tail{} root{}",
-                snap.users.min(9), snap.attaches.min(3), u8::from(pin), u8::from(snap.share),
-                u8::from(snap.session), u8::from(snap.reusable_prompt),
-                u8::from(!snap.tail.is_empty()), u8::from(node.is_none()),
-            );
-            let e = mix.entry(key).or_default();
-            e.0 += 1;
-            e.1 += snap.bytes;
-        }
-    }
-    for (key, (n, bytes)) in mix {
-        tracing::debug!(n, mib = bytes >> 20, "vmm snapshot mix {key}");
-    }
 }
 
 fn remove_snapshot(s: &Shared, inner: &mut Inner, node: Option<(u32, u32)>, index: usize) {
