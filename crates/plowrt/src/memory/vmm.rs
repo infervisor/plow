@@ -949,6 +949,8 @@ struct Snap {
     session: bool,
     /// The publishing sequence's prompt rows: `rows >= prompt_rows` is a turn end.
     prompt_rows: u32,
+    /// Published at a prompt's shared-prefix end ([`VmmKv::share_rows`]): seen on two prompts.
+    share: bool,
 }
 
 struct Inner {
@@ -1515,6 +1517,21 @@ impl VmmKv {
             free_snapshot(s, &mut inner, snap);
         }
         freed
+    }
+
+    /// A request waits in [`Self::inflight_prefix`] for the whole-block checkpoint at
+    /// `tokens[..rows]`.
+    pub fn checkpoint_awaited(&self, tokens: &[u32], rows: u32) -> bool {
+        let br = self.shared.block_rows;
+        if rows == 0 || rows % br != 0 || rows as usize > tokens.len() {
+            return false;
+        }
+        let inner = self.shared.inner.lock();
+        if inner.awaited.iter().all(Option::is_none) {
+            return false;
+        }
+        let last = hash_blocks(&tokens[..rows as usize], br).pop();
+        inner.awaited.contains(&last)
     }
 
     /// Prompt rows of `seq`'s current sequence (0 before its `try_attach`).
@@ -2311,6 +2328,7 @@ impl VmmKv {
                 attaches: 0,
                 session: false,
                 prompt_rows: 0,
+                share: false,
             });
             // Counts toward the same budget whole blocks and boundary snapshots do, so
             // `trim_cache` (both the static `cache_cap` and pressure-eviction branches) sees
@@ -2447,7 +2465,8 @@ fn publish_locked(
     };
     let reusable_prompt = (rows as usize) < prompt_rows;
     // A shared-prefix end is not the session's own boundary: `retire_superseded` keeps it.
-    let session = inner.session[seq] && rows != inner.share[seq];
+    let share = rows == inner.share[seq];
+    let session = inner.session[seq] && !share;
     let tail = &tokens[n_pub * s.block_rows as usize..rows as usize];
 
     let m = inner.cache.lookup(&hashes, tokens);
@@ -2538,6 +2557,7 @@ fn publish_locked(
     {
         snap.last_used = tick;
         snap.reusable_prompt |= reusable_prompt;
+        snap.share |= share;
         snapshot
     } else {
         let va = snapshot.expect("preflight cannot commit a missing snapshot");
@@ -2557,6 +2577,7 @@ fn publish_locked(
             attaches: 0,
             session,
             prompt_rows: prompt_rows as u32,
+            share,
         });
         inner.stats.snapshot_bytes += snap_bytes;
         inner.stats.cache_bytes += snap_bytes;
@@ -3031,7 +3052,8 @@ fn evict_one(s: &Shared, inner: &mut Inner, preserve_hot: bool) -> bool {
     // blocks that become dead with it. A boundary inside a block serves only its exact
     // tail, the whole-block checkpoint under the same node every continuation: that tailed
     // one goes first. A boundary attached twice or more is a shared prefix (a system
-    // prompt) and goes last; a session-pinned one (`pin_prefix`) just before it.
+    // prompt) and goes last; a session-pinned one (`pin_prefix`) or a shared-prefix end
+    // (a system prompt below one block sits on no pinnable node) just before it.
     let pinned = inner.cache.pinned();
     if let Some((node, index)) = inner.published.iter()
         .flat_map(|(&node, snaps)| {
@@ -3043,7 +3065,9 @@ fn evict_one(s: &Shared, inner: &mut Inner, preserve_hot: bool) -> bool {
             })
         })
         .filter(|(_, _, snap, _, _)| snap.users == 0 && Some(snap.va) != protected)
-        .min_by_key(|(_, _, snap, pin, covered)| (snap.attaches >= 2, *pin, !covered, snap.last_used))
+        .min_by_key(|(_, _, snap, pin, covered)| {
+            (snap.attaches >= 2, *pin || snap.share, !covered, snap.last_used)
+        })
         .map(|(node, index, _, _, _)| (node, index))
     {
         let before = inner.stats.cache_bytes;
@@ -4936,6 +4960,41 @@ mod tests {
         assert_eq!(p.try_attach(1, &t2).unwrap().map(|a| a.rows), Some(9));
     }
 
+    /// The turn-end re-publish of a session's prompt end: a surviving boundary is touched (no
+    /// copy) and becomes newest in LRU; an evicted one is restored for the next turn.
+    #[test]
+    fn session_turn_end_republishes_its_prompt_end() {
+        let p = pool(Arc::new(MockVmm::default()));
+        let t1 = prompt(13);
+        let other: Vec<u32> = t1.iter().map(|t| t + 1).collect();
+        assert!(p.try_attach(1, &other).unwrap().is_none());
+        p.ensure_rows(1, 13).unwrap();
+        p.publish_at(1, &other, 9, 48, |_| Ok(())).unwrap();
+        assert!(p.try_attach(0, &t1).unwrap().is_none());
+        p.ensure_rows(0, 15).unwrap();
+        p.note_session(0, &t1);
+        p.publish_at(0, &t1, 9, 48, |_| Ok(())).unwrap();
+        let mut end = t1.clone();
+        end.extend([500, 501]);
+        p.publish_at(0, &end, 15, 48, |_| Ok(())).unwrap();
+        p.publish_at(0, &end, 9, 48, |_| panic!("a surviving boundary is not copied")).unwrap();
+        {
+            let mut inner = p.shared.inner.lock();
+            assert!(evict_one(&p.shared, &mut inner, true), "the turn end");
+            assert!(evict_one(&p.shared, &mut inner, true), "the other prefix, now LRU");
+            assert_eq!(inner.stats.snapshot_bytes, 48);
+            assert!(evict_one(&p.shared, &mut inner, true));
+        }
+        p.publish_at(0, &end, 9, 48, |_| Ok(())).unwrap();
+        p.begin_seq(0);
+        let mut t2 = t1[..9].to_vec();
+        t2.extend([600, 601, 602, 603, 604, 605, 606, 607]);
+        p.ensure_rows(1, 1).unwrap();
+        p.begin_seq(1);
+        p.ensure_rows(1, 1).unwrap();
+        assert_eq!(p.try_attach(1, &t2).unwrap().map(|a| a.rows), Some(9));
+    }
+
     /// A request waiting on a session's in-flight prompt keeps the whole-block checkpoint it
     /// will attach to through the session's retirement.
     #[test]
@@ -4949,6 +5008,8 @@ mod tests {
         p.ensure_rows(0, 30).unwrap();
         p.note_session(0, &o);
         assert_eq!(p.inflight_prefix(1, &w, u32::MAX), Some((0, 8)));
+        assert!(p.checkpoint_awaited(&o, 8));
+        assert!(!p.checkpoint_awaited(&o, 16), "nobody waits on the 16-row checkpoint");
         p.publish_at(0, &o, 8, 4, |_| Ok(())).unwrap();
         p.publish_at(0, &o, 16, 4, |_| Ok(())).unwrap();
         p.publish_at(0, &o, 28, 4, |_| Ok(())).unwrap();
@@ -4983,6 +5044,47 @@ mod tests {
         let p = run(full - 1);
         p.ensure_rows(0, 1).unwrap();
         assert!(p.try_attach(0, &a).unwrap().is_some(), "pinned session prefix evicted first");
+    }
+
+    /// A system prompt shorter than one block ends on the root, which no session pins: its
+    /// shared-prefix boundary must not go before every pinned session boundary, or it never
+    /// lives to its second attach.
+    #[test]
+    fn shared_prefix_end_ranks_with_pinned_session_boundaries() {
+        let p = pool(Arc::new(MockVmm::default()));
+        let sys = prompt(6);
+        let a: Vec<u32> = sys.iter().copied().chain(100..110).collect();
+        let b: Vec<u32> = (200..216).collect();
+        let c: Vec<u32> = sys.iter().copied().chain(300..310).collect();
+        assert!(p.try_attach(0, &a).unwrap().is_none());
+        p.shared.inner.lock().share[0] = 6;
+        p.ensure_rows(0, 16).unwrap();
+        p.publish_at(0, &a, 6, 48, |_| Ok(())).unwrap();
+        p.begin_seq(0);
+        assert!(p.try_attach(0, &b).unwrap().is_none());
+        p.ensure_rows(0, 16).unwrap();
+        p.note_session(0, &b);
+        p.publish_at(0, &b, 12, 48, |_| Ok(())).unwrap();
+        p.pin_prefix(&b, std::time::Instant::now() + std::time::Duration::from_secs(600));
+        p.begin_seq(0);
+        assert!(p.try_attach(1, &c).unwrap().map(|x| x.rows) == Some(6), "the system prompt");
+        p.finish_attach(1);
+        p.ensure_rows(1, 16).unwrap();
+        p.note_session(1, &c);
+        p.publish_at(1, &c, 12, 48, |_| Ok(())).unwrap();
+        p.pin_prefix(&c, std::time::Instant::now() + std::time::Duration::from_secs(600));
+        p.begin_seq(1);
+        // The most recently attached snapshot is protected: make it the second session's.
+        assert_eq!(p.try_attach(1, &c).unwrap().map(|x| x.rows), Some(12));
+        p.finish_attach(1);
+        p.begin_seq(1);
+        {
+            let mut inner = p.shared.inner.lock();
+            assert!(evict_one(&p.shared, &mut inner, true));
+        }
+        let d: Vec<u32> = sys.iter().copied().chain(400..410).collect();
+        p.ensure_rows(1, 1).unwrap();
+        assert_eq!(p.try_attach(1, &d).unwrap().map(|x| x.rows), Some(6), "LRU took the session's");
     }
 
     /// The second prompt sharing a 300-row head with a recent one names the shared end

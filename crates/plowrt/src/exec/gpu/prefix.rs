@@ -784,30 +784,43 @@ impl GpuEngine {
         let step = crate::config::RuntimeConfig::get()
             .amd_prefix_fine_rows()
             .map_or(v.kv.block_rows(), |step| step.max(32));
-        // A session's turn-end publish leaves the checkpoints inside its prompt alone: its
-        // prompt-end publish retired them (`retire_superseded`), and re-creating one would
-        // outlive the prompt-end boundary in LRU.
-        let floor = if self.session_pin[b].is_some() {
-            let prompt = v.kv.prompt_rows(b);
-            if rows > prompt { prompt } else { 0 }
-        } else {
-            0
-        };
+        // A session's next turn attaches to its prompt end, which retires every checkpoint and
+        // chunk end inside the prompt (`retire_superseded`), and its reply rows are re-rendered:
+        // those snapshots are transient, and each one's trim evicts another session's boundary.
+        // Publish them only for a request waiting on this prefill (`inflight_prefix`).
+        let session = self.session_pin[b].is_some();
+        let prompt = v.kv.prompt_rows(b);
         let mut p = step;
         while p < p_a {
-            if p > floor {
+            if !session || v.kv.checkpoint_awaited(toks, p) {
                 self.publish_boundary(b, p);
             }
             p += step;
         }
-        // Only a prompt-side publish retires: the next turn's prompt re-renders this turn's
-        // reply, which need not re-tokenize to the generated ids, so the turn-end boundary
-        // may not match it and the prompt-end boundary must survive until then.
-        if self.publish_boundary(b, p_a) && self.session_pin[b].is_some() && max_rows < rows {
+        if session && rows < prompt && !v.kv.checkpoint_awaited(toks, p_a) {
+            return;
+        }
+        // Only the prompt-end publish retires (a chunk-end publish also caps `max_rows` below
+        // `rows`): the next turn's prompt re-renders this turn's reply, which need not
+        // re-tokenize to the generated ids, so the turn-end boundary may not match it and the
+        // prompt-end boundary must survive until then.
+        let published = self.publish_boundary(b, p_a);
+        let prompt_end = rows == prompt && max_rows < rows;
+        if let Some(ttl) = self.session_pin[b].filter(|_| published && prompt_end) {
+            // Pinned now, not at retire: while this turn decodes, other sessions' publishes
+            // must not evict it ahead of idle sessions' boundaries.
+            v.kv.pin_prefix(&toks[..p_a as usize], std::time::Instant::now() + ttl);
             let freed = v.kv.retire_superseded(toks, p_a);
             if freed > 0 {
                 tracing::debug!(slot = b, p_a, freed, "vmm: session retired superseded snapshots");
             }
+        }
+        // Turn end: pressure may have evicted the prompt end (the next turn's attach point)
+        // while this turn decoded. The rings still hold its window, so restore it now, newest in
+        // LRU just before the session's next request; a surviving one is only touched.
+        let end = prompt.saturating_sub(1) / 32 * 32;
+        if session && rows > prompt && end > 0 && end < p_a {
+            self.publish_boundary(b, end);
         }
     }
 
