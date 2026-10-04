@@ -319,6 +319,17 @@ async fn speech_with(
         Ok(r) => r,
         Err(e) => return crate::serve::api_error(e.status(), e.body_text(), "invalid_request_error", Some("invalid_json"), None),
     };
+    // The same ranges chat and completions enforce: `repetition_penalty: 0` divided the logits
+    // by zero and sampled from NaN probabilities.
+    let sampling = crate::serve::openai::SamplingFields {
+        temperature: req.temperature,
+        top_p: req.top_p,
+        repetition_penalty: req.repetition_penalty,
+        ..Default::default()
+    };
+    if let Err(e) = sampling.validate() {
+        return bad(e.message, e.field);
+    }
     let t_arrive = Instant::now();
     if let Some(canonical) = state.registry.resolve(&req.model) {
         req.model = canonical;
