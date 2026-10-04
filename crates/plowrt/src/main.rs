@@ -62,6 +62,9 @@ enum Cmd {
         prompt: String,
         #[arg(long)]
         port: Option<u16>,
+        /// Interface for direct remote inference, such as a WireGuard address.
+        #[arg(long, default_value = "127.0.0.1")]
+        bind: std::net::IpAddr,
         #[arg(long, requires = "port")]
         websocket: bool,
         /// Public model identity. Defaults to the packet pipeline name for compatibility.
@@ -98,6 +101,9 @@ enum Cmd {
         served_model_name: Vec<String>,
         #[arg(long, default_value_t = 8080)]
         port: u16,
+        /// Bind a specific private interface instead of every IPv4 interface.
+        #[arg(long, default_value = "0.0.0.0")]
+        bind: std::net::IpAddr,
         /// Optional Unix domain socket to also listen on (opt-in). Serves the
         /// same OpenAI-compatible router as `--port`; both listeners run in
         /// parallel.
@@ -727,6 +733,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     RuntimeConfig::init(cli.rt_cfg);
+    let _ = plowrt::obs::serving::started_at_unix_ms();
     plowrt::knob_spec::warn_removed_env();
     match cli.cmd {
         #[cfg(any(
@@ -741,6 +748,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             language,
             prompt,
             port,
+            bind,
             websocket,
             backend,
             served_model_name,
@@ -765,10 +773,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let router =
                     plowrt::asr::serving::AsrServer::new(served_model, engine).router(websocket);
                 let listener =
-                    tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port.unwrap()))
+                    tokio::net::TcpListener::bind((bind, port.unwrap()))
                         .await?;
                 tracing::info!(address = %listener.local_addr()?, websocket, "ASR server ready");
                 axum::serve(listener, router)
+                    .tcp_nodelay(true)
                     .with_graceful_shutdown(async {
                         let _ = tokio::signal::ctrl_c().await;
                     })
@@ -781,6 +790,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             model,
             served_model_name,
             port,
+            bind,
             socket,
             executors,
             trace,
@@ -818,6 +828,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 assets,
                 served_model_name,
                 port,
+                bind,
                 socket,
                 executors,
                 trace,
@@ -1160,6 +1171,13 @@ mod amd_bench_cli_tests {
     use plowrt::serve::bench::Input;
 
     #[test]
+    fn serve_can_bind_a_private_interface() {
+        let cli = Cli::try_parse_from(["plowrt", "serve", "--assets", "model", "--bind", "10.77.0.2"]).unwrap();
+        assert!(matches!(cli.cmd, super::Cmd::Serve { bind, .. } if bind.to_string() == "10.77.0.2"));
+        assert!(Cli::try_parse_from(["plowrt", "serve", "--assets", "model", "--bind", "not-an-address"]).is_err());
+    }
+
+    #[test]
     fn unbound_run_requires_explicit_synthetic_probe() {
         assert!(require_synthetic_probe(false, false).is_err());
         assert!(require_synthetic_probe(false, true).is_err());
@@ -1174,7 +1192,9 @@ mod amd_bench_cli_tests {
     fn asr_names_packet_and_tokenizer_inputs() {
         let named = Cli::try_parse_from(["plowrt", "asr", "--packet", "model.pkt",
             "--tokenizer", "tokens", "--port", "8080", "--served-model-name", "nemotron-asr-0.6b"]).unwrap();
-        assert!(matches!(named.cmd, super::Cmd::Asr { served_model_name: Some(name), .. } if name == "nemotron-asr-0.6b"));
+        assert!(matches!(named.cmd, super::Cmd::Asr { served_model_name: Some(name), bind, .. } if name == "nemotron-asr-0.6b" && bind.is_loopback()));
+        let remote = Cli::try_parse_from(["plowrt", "asr", "--packet", "model.pkt", "--tokenizer", "tokens", "--port", "8080", "--bind", "10.77.0.2"]).unwrap();
+        assert!(matches!(remote.cmd, super::Cmd::Asr { bind, .. } if bind.to_string() == "10.77.0.2"));
         for args in [
             ["--packet", "model.pkt", "--tokenizer", "tokens"],
             ["--blob", "model.pkt", "--checkpoint", "tokens"],
@@ -3822,6 +3842,7 @@ async fn serve(
     assets: Vec<PathBuf>,
     served_model_name: Vec<String>,
     port: u16,
+    bind: std::net::IpAddr,
     socket: Option<PathBuf>,
     executors: u32,
     trace: bool,
@@ -3841,7 +3862,7 @@ async fn serve(
     let router = app(Arc::clone(&state));
 
     // TCP listener: unchanged, always on.
-    let tcp_addr = std::net::SocketAddr::from(([0, 0, 0, 0], port));
+    let tcp_addr = std::net::SocketAddr::from((bind, port));
     let tcp_listener = tokio::net::TcpListener::bind(tcp_addr).await?;
     tracing::info!(%tcp_addr, "plowrt serving OpenAI API over TCP");
     let tcp_router = router.clone();
@@ -3889,7 +3910,7 @@ async fn serve(
                     if let Err(e) = hyper_util::server::conn::auto::Builder::new(
                         hyper_util::rt::TokioExecutor::new(),
                     )
-                    .serve_connection(io, svc)
+                    .serve_connection_with_upgrades(io, svc)
                     .await
                     {
                         tracing::debug!(error = %e, "UDS connection ended");

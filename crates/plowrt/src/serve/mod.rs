@@ -439,6 +439,7 @@ impl AppState {
 
     /// Construct with per-run timeline recording enabled/disabled.
     pub fn with_trace(registry: Registry, execset: Arc<ExecutorSet>, record_trace: bool) -> Self {
+        let _ = crate::obs::serving::started_at_unix_ms();
         AppState {
             registry,
             execset,
@@ -713,6 +714,9 @@ impl AppState {
     }
 
     pub(crate) fn model_metrics(&self, slug: &str) -> Arc<Metrics> {
+        if let Some(metrics) = self.model_metrics.read().get(slug) {
+            return metrics.clone();
+        }
         let mut models = self.model_metrics.write();
         models.retain(|name, metrics| {
             let keep = self.registry.contains(name) || Arc::strong_count(metrics) > 1;
@@ -953,6 +957,7 @@ pub fn app(state: Arc<AppState>) -> Router {
         .route("/health", get(healthz))
         .route("/healthz", get(healthz))
         .route("/metrics", get(metrics_handler))
+        .route("/v1/metrics", get(metrics_snapshot_handler))
         .route("/trace", get(trace_handler))
         .route("/v1/turns/:session", get(turns::session_turns))
         .layer(axum::extract::DefaultBodyLimit::max(MAX_BODY_BYTES))
@@ -974,11 +979,7 @@ async fn healthz() -> &'static str {
     "ok"
 }
 
-async fn metrics_handler(
-    axum::extract::State(state): axum::extract::State<Arc<AppState>>,
-) -> axum::response::Response {
-    use axum::response::IntoResponse;
-    let models: Vec<_> = {
+fn metrics_models(state: &AppState) -> Vec<(String, Arc<Metrics>, bool)> {
         let mut metrics = state.model_metrics.write();
         for slug in state.registry.slugs() {
             metrics.entry(slug).or_default();
@@ -999,7 +1000,19 @@ async fn metrics_handler(
         }).collect();
         models.sort_unstable_by(|a, b| a.0.cmp(&b.0));
         models
-    };
+}
+
+async fn metrics_snapshot_handler(
+    axum::extract::State(state): axum::extract::State<Arc<AppState>>,
+) -> axum::Json<crate::obs::serving::RuntimeSnapshot> {
+    axum::Json(crate::obs::serving::snapshot(&metrics_models(&state)))
+}
+
+async fn metrics_handler(
+    axum::extract::State(state): axum::extract::State<Arc<AppState>>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let models = metrics_models(&state);
     let aggregate = Metrics::default();
     aggregate.accumulate(&state.metrics);
     for (_, metrics, _) in &models {
