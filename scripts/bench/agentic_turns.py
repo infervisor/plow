@@ -18,11 +18,21 @@ replaying an earlier cell.
 Reports per turn and overall: TTFT/TPOT p50/p99/max, output tok/s, requests/s, errors, cached-token
 fraction (client: usage.prompt_tokens_details.cached_tokens, else plowrt's X-Session-Cached-Tokens;
 server: the /metrics vllm:prefix_cache_hits/queries delta, which both servers export).
+
+--open-loop: production-like mix instead of fixed closed-loop sessions. Sessions arrive as a Poisson
+process (--rate per s, or --target-concurrency in-flight requests via Little's law) for --duration s;
+each draws an app (one of --apps shared system prompts), a geometric turn count, lognormal think
+times, first-message / tool-output / reply lengths (reply: ignore_eos + per-turn max_tokens), capped
+at --max-model-len. The plan is a pure function of the seed and flags (identical for every server).
+Requests started in [--warmup, --duration - --cooldown] are measured: TTFT/TPOT/E2E, cached tokens,
+throughput, mean in-flight requests and live sessions, goodput (requests meeting --slo-ttft-ms and
+--slo-tpot-ms per s). No request starts after --duration.
 """
 import argparse
 import asyncio
 import hashlib
 import json
+import math
 import os
 import random
 import sys
@@ -135,8 +145,9 @@ def metrics_snapshot(url):
     return dict(zip(KEYS, metric_values(txt)))
 
 
-async def one_turn(http, args, sid, history, system, user):
+async def one_turn(http, args, sid, history, system, user, max_tokens=None):
     import aiohttp
+    max_tokens = max_tokens or args.max_tokens
     if args.api == "chat":
         msgs = [{"role": "system", "content": system}]
         for u, a in history:
@@ -151,7 +162,7 @@ async def one_turn(http, args, sid, history, system, user):
         parts += [f"User: {user}", "Assistant:"]
         body = dict(prompt="\n\n".join(parts))
         path = "/v1/completions"
-    body.update(model=args.model, max_tokens=args.max_tokens, temperature=args.temperature, stream=True,
+    body.update(model=args.model, max_tokens=max_tokens, temperature=args.temperature, stream=True,
                 ignore_eos=True, stream_options={"include_usage": True})
     if args.top_p is not None:
         body["top_p"] = args.top_p
@@ -190,8 +201,8 @@ async def one_turn(http, args, sid, history, system, user):
         raise RuntimeError(f"stream carried no token usage: {usage}")
     n_out = usage["completion_tokens"]
     # ignore_eos: anything short of max_tokens was cut, not finished.
-    if n_out < args.max_tokens:
-        raise RuntimeError(f"reply cut at {n_out} of {args.max_tokens} tokens")
+    if n_out < max_tokens:
+        raise RuntimeError(f"reply cut at {n_out} of {max_tokens} tokens")
     details = usage.get("prompt_tokens_details") or {}
     cached = details.get("cached_tokens")
     if cached is None:
@@ -235,12 +246,209 @@ async def run(args, system, sessions):
     return rows, wall
 
 
+# ---------------------------------------------------------------- open loop (--open-loop)
+def lognormal(r, median, sigma, lo, hi):
+    return min(hi, max(lo, median * math.exp(sigma * r.gauss(0.0, 1.0))))
+
+
+def geometric(r, mean, hi):
+    """Turns in 1..hi, P(n) ~ (1-p)^(n-1) p with p = 1/mean (truncated at hi)."""
+    n = 1
+    while n < hi and r.random() >= 1.0 / mean:
+        n += 1
+    return n
+
+
+def build_plan(args):
+    """Seeded open-loop schedule, token sizes only: (system sizes, sessions). A pure function of the
+    args, independent of the server, so both stacks get the same arrivals, turns, think times and
+    lengths. Prompt at turn k = system + users[:k+1] + replies[:k] (+ chat template, held in
+    --template-margin); a session ends before the turn that would exceed --max-model-len."""
+    apps = [int(lognormal(rng_for(args.seed, "app", a), args.system_median, args.system_sigma, 256, 4096))
+            for a in range(args.apps)]
+    arr = rng_for(args.seed, "arrivals")
+    sessions, t = [], 0.0
+    while True:
+        t += arr.expovariate(args.rate)
+        if t >= args.duration:
+            break
+        r = rng_for(args.seed, "plan", len(sessions))
+        app = r.randrange(args.apps)
+        n = geometric(r, args.turns_mean, args.turns_max)
+        ctx, turns = apps[app], []
+        for k in range(n):
+            first = k == 0
+            user = int(lognormal(r, args.first_median if first else args.tool_median,
+                                 args.first_sigma if first else args.tool_sigma, 64, args.max_model_len))
+            out = int(lognormal(r, args.out_median, args.out_sigma, args.out_min, args.out_max))
+            think = 0.0 if first else lognormal(r, args.think_median_s, args.think_sigma, 0.0, args.think_max_s)
+            room = args.max_model_len - args.template_margin - ctx - out
+            if first:
+                user = max(64, min(user, room))
+            elif user > room:
+                break
+            turns.append(dict(user_tokens=user, max_tokens=out, think_s=think, prompt_tokens=ctx + user))
+            ctx += user + out
+        sessions.append(dict(arrival_s=t, app=app, turns=turns))
+    return apps, sessions
+
+
+def build_open_content(args, sizer, apps, plan):
+    systems = []
+    for a, n in enumerate(apps):
+        r = rng_for(args.seed, "system", a)
+        head = f"You are assistant app {a} (seed {args.seed}). Use the tools, read their output, answer concisely.\n"
+        systems.append(head + sizer.fill(r, max(16, n - sizer.count(head)), prose_line))
+    users = []
+    for s, sess in enumerate(plan):
+        turns = []
+        for k, turn in enumerate(sess["turns"]):
+            r = rng_for(args.seed, "session", s, "turn", k)
+            ask = f"[session {args.seed}-{s} turn {k + 1}] " + prose_line(r)
+            head = "Context:\n" if k == 0 else f"Tool `{r.choice(TOOLS)}` returned:\n"
+            body = sizer.fill(r, max(8, turn["user_tokens"] - sizer.count(ask + head) - 4), tool_line)
+            turns.append(f"{head}{body}\n\n{ask}")
+        users.append(turns)
+    return systems, users
+
+
+def rate_for_concurrency(args, concurrency, e2e_s):
+    """Little's law: in-flight requests L = lambda * turns/session * E2E -> lambda."""
+    plan = build_plan(argparse.Namespace(**dict(vars(args), rate=1.0, duration=2000.0)))[1]
+    turns = sum(len(p["turns"]) for p in plan) / len(plan)
+    return concurrency / (turns * e2e_s)
+
+
+def window_metrics(rows, args, timeline):
+    """Requests started in [warmup, duration - cooldown]; goodput = requests meeting both SLOs / s."""
+    w0, w1 = args.warmup, args.duration - args.cooldown
+    win = w1 - w0
+    sel = [r for r in rows if w0 <= r["t_start"] < w1]
+    d = summarize(sel, win)
+    ok = [r for r in sel if r.get("error") is None]
+    good = [r for r in ok if r["ttft_ms"] is not None and r["ttft_ms"] <= args.slo_ttft_ms
+            and (r["tpot_ms"] is None or r["tpot_ms"] <= args.slo_tpot_ms)]
+    e2e = [r["e2e_ms"] for r in ok]
+    busy = sum(max(0.0, min(r["t_end"], w1) - max(r["t_start"], w0)) for r in rows)
+    samples = [x for x in timeline if w0 <= x[0] < w1]
+    d.update(window_start_s=w0, window_end_s=w1,
+             total_tok_s=sum(r["prompt_tokens"] + r["completion_tokens"] for r in ok) / win,
+             goodput_req_s=len(good) / win, slo_attainment=len(good) / len(sel) if sel else None,
+             e2e_p50_ms=pct(e2e, 50), e2e_p99_ms=pct(e2e, 99),
+             mean_inflight=busy / win, max_inflight=max((x[1] for x in samples), default=None),
+             mean_sessions=sum(x[2] for x in samples) / len(samples) if samples else None,
+             slo_ttft_ms=args.slo_ttft_ms, slo_tpot_ms=args.slo_tpot_ms)
+    return d
+
+
+async def run_open(args, systems, plan, users):
+    import aiohttp
+    rows, timeline = [], []
+    live = dict(inflight=0, sessions=0)
+    tag = f"prod-{args.seed}"
+
+    async def session(http, s, t0):
+        sess = plan[s]
+        await asyncio.sleep(max(0.0, sess["arrival_s"] - (time.perf_counter() - t0)))
+        live["sessions"] += 1
+        history = []
+        for k, turn in enumerate(sess["turns"]):
+            if turn["think_s"]:
+                await asyncio.sleep(turn["think_s"])
+            start = time.perf_counter() - t0
+            if start >= args.duration:  # hard stop: no request starts after the arrival window
+                break
+            live["inflight"] += 1
+            try:
+                row, reply = await one_turn(http, args, f"{tag}-{s}", history, systems[sess["app"]],
+                                            users[s][k], turn["max_tokens"])
+                row["error"] = None
+            except Exception as e:  # noqa: BLE001 - recorded, the session stops
+                row, reply = dict(ttft_ms=None, tpot_ms=None, e2e_ms=None, prompt_tokens=0, completion_tokens=0,
+                                  cached_tokens=None, error=f"{type(e).__name__}: {e}"[:300]), None
+            live["inflight"] -= 1
+            row.update(session=s, turn=k + 1, app=sess["app"], t_start=start, t_end=time.perf_counter() - t0,
+                       planned_prompt_tokens=turn["prompt_tokens"], max_tokens=turn["max_tokens"])
+            rows.append(row)
+            if reply is None:
+                break
+            history.append((users[s][k], reply))
+        live["sessions"] -= 1
+
+    async def sampler(t0, done):
+        while not done.is_set():
+            timeline.append((round(time.perf_counter() - t0, 3), live["inflight"], live["sessions"]))
+            try:
+                await asyncio.wait_for(done.wait(), 1.0)
+            except asyncio.TimeoutError:
+                pass
+
+    conn = aiohttp.TCPConnector(limit=0)
+    async with aiohttp.ClientSession(connector=conn) as http:
+        done = asyncio.Event()
+        t0 = time.perf_counter()
+        samp = asyncio.ensure_future(sampler(t0, done))
+        await asyncio.gather(*(session(http, s, t0) for s in range(len(plan))))
+        wall = time.perf_counter() - t0
+        done.set()
+        await samp
+    return rows, timeline, wall
+
+
+def plan_stats(apps, plan):
+    def q(xs):
+        return dict({f"p{k}": pct(xs, k) for k in (1, 50, 90, 99)}, mean=sum(xs) / len(xs)) if xs else None
+    turns = [len(p["turns"]) for p in plan]
+    return dict(system_tokens=apps, sessions=len(plan), requests=sum(turns), turns=q(turns),
+                prompt_tokens=q([t["prompt_tokens"] for p in plan for t in p["turns"]]),
+                output_tokens=q([t["max_tokens"] for p in plan for t in p["turns"]]),
+                think_s=q([t["think_s"] for p in plan for t in p["turns"] if t["think_s"]]))
+
+
+def main_open(args, sizer):
+    if args.target_concurrency:
+        args.rate = rate_for_concurrency(args, args.target_concurrency, args.est_e2e_s)
+    if not args.rate:
+        raise SystemExit("--open-loop needs --rate or --target-concurrency")
+    if args.warmup + args.cooldown >= args.duration:
+        raise SystemExit("--warmup + --cooldown must be shorter than --duration")
+    apps, plan = build_plan(args)
+    systems, users = build_open_content(args, sizer, apps, plan)
+    before = metrics_snapshot(args.url)
+    rows, timeline, wall = asyncio.run(run_open(args, systems, plan, users))
+    after = metrics_snapshot(args.url)
+    server = None
+    if before and after:
+        hits = after["prefix_cache_hits_total"] - before["prefix_cache_hits_total"]
+        queries = after["prefix_cache_queries_total"] - before["prefix_cache_queries_total"]
+        server = dict(prefix_hits=hits, prefix_queries=queries,
+                      prefix_token_hit=hits / queries if queries > 0 else None)
+    overall = window_metrics(rows, args, timeline)
+    overall.update(run_wall_s=wall, errors_total=sum(1 for r in rows if r.get("error") is not None))
+    os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
+    with open(args.out, "w") as f:
+        json.dump(dict(config=vars(args), plan=plan_stats(apps, plan), overall=overall, server=server,
+                       timeline=timeline, requests=rows), f, indent=1)
+
+    def fmt(v, p=1, scale=1):
+        return "-" if v is None else f"{v * scale:.{p}f}"
+    o = overall
+    print(f"PROD  rate {args.rate:.3f}/s reqs {o['requests']} err {o['errors']} (run {o['errors_total']})  "
+          f"goodput {fmt(o['goodput_req_s'], 3)} req/s ({fmt(o['slo_attainment'], 1, 100)}%)  "
+          f"req/s {o['request_s']:.3f}  tok/s {o['total_tok_s']:.0f} (out {o['output_tok_s']:.0f})  "
+          f"ttft p50/p99 {fmt(o['ttft_p50_ms'])}/{fmt(o['ttft_p99_ms'])} ms  "
+          f"tpot p50/p99 {fmt(o['tpot_p50_ms'], 2)}/{fmt(o['tpot_p99_ms'], 2)} ms  "
+          f"cached {fmt(o['cached_fraction'], 1, 100)}%  inflight {fmt(o['mean_inflight'])} "
+          f"sessions {fmt(o['mean_sessions'])}")
+    return 1 if o["errors_total"] else 0
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--url", required=True)
     ap.add_argument("--model")
     ap.add_argument("--tokenizer", help="dir holding tokenizer.json (sizes the content)")
-    ap.add_argument("--sessions", type=int, required=True, help="concurrent sessions")
+    ap.add_argument("--sessions", type=int, help="concurrent sessions (closed loop)")
     ap.add_argument("--sessions-per-worker", type=int, default=1)
     ap.add_argument("--turns", type=int, default=10)
     ap.add_argument("--system-tokens", type=int, default=1536)
@@ -254,12 +462,44 @@ def main(argv=None):
     ap.add_argument("--timeout", type=float, default=3600)
     ap.add_argument("--no-session-header", dest="session_header", action="store_false")
     ap.add_argument("--out", required=True)
+    o = ap.add_argument_group("open loop (--open-loop): Poisson session arrivals, sampled turns/think/lengths")
+    o.add_argument("--open-loop", action="store_true")
+    o.add_argument("--rate", type=float, help="session arrivals per second")
+    o.add_argument("--target-concurrency", type=float, help="in-flight requests; sets --rate by Little's law")
+    o.add_argument("--est-e2e-s", type=float, default=8.0, help="mean request E2E assumed by --target-concurrency")
+    o.add_argument("--duration", type=float, default=360, help="arrival window, s; no request starts after it")
+    o.add_argument("--warmup", type=float, default=90, help="requests started earlier are not measured")
+    o.add_argument("--cooldown", type=float, default=30, help="requests started in the last N s are not measured")
+    o.add_argument("--apps", type=int, default=4, help="shared system prompts")
+    o.add_argument("--system-median", type=float, default=1536)
+    o.add_argument("--system-sigma", type=float, default=0.6)
+    o.add_argument("--turns-mean", type=float, default=6)
+    o.add_argument("--turns-max", type=int, default=20)
+    o.add_argument("--first-median", type=float, default=1500, help="first user message tokens")
+    o.add_argument("--first-sigma", type=float, default=1.0)
+    o.add_argument("--tool-median", type=float, default=700, help="later turns' tool output tokens")
+    o.add_argument("--tool-sigma", type=float, default=1.0)
+    o.add_argument("--out-median", type=float, default=160)
+    o.add_argument("--out-sigma", type=float, default=0.7)
+    o.add_argument("--out-min", type=int, default=16)
+    o.add_argument("--out-max", type=int, default=1024)
+    o.add_argument("--think-median-s", type=float, default=5.0)
+    o.add_argument("--think-sigma", type=float, default=0.8)
+    o.add_argument("--think-max-s", type=float, default=60.0)
+    o.add_argument("--max-model-len", type=int, default=16384)
+    o.add_argument("--template-margin", type=int, default=512, help="tokens held back for the chat template")
+    o.add_argument("--slo-ttft-ms", type=float, default=2000)
+    o.add_argument("--slo-tpot-ms", type=float, default=100)
     args = ap.parse_args(argv)
+    if not args.open_loop and not args.sessions:
+        ap.error("--sessions is required without --open-loop")
     args.url = args.url.rstrip("/")
     if not args.model:
         with urllib.request.urlopen(args.url + "/v1/models", timeout=30) as r:
             args.model = json.load(r)["data"][0]["id"]
     sizer = Sizer(args.tokenizer)
+    if args.open_loop:
+        return main_open(args, sizer)
     system, sessions, per_turn = build_sessions(args, sizer)
     before = metrics_snapshot(args.url)
     rows, wall = asyncio.run(run(args, system, sessions))

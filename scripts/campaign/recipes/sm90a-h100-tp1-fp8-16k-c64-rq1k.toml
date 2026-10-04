@@ -82,7 +82,9 @@ PLOW_GEMMA4_SM90_HD512_PX4_BQ64_ROLE = "1"
 PLOW_GEMMA4_SM90_HD256_GQA2_ROLE = "1"
 
 [serve.env]
-PLOW_PREFIX_CACHE = "0"
+# Prefix cache at its default (on): agentic16k c32 with it on 700-732 tok/s at 75% cached
+# (2026-10-04 prefix-hit v5 and bf16-headroom runs) vs 295 tok/s with PLOW_PREFIX_CACHE=0
+# (final compare v2, same packet line); FP32 gate PASS with reuse on (kl_mean 0.118).
 PLOW_PF_SEG_PURE = "fp8"
 PLOW_PF_SEG_FA512 = "1"
 PLOW_PF_INTERLEAVE = "0"
