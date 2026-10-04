@@ -72,6 +72,14 @@ Other cells, measured but with no recorded value:
 
 ## Regressions > 5%
 
+**Bisect result (2026-10-04): neither flagged regression is real.**
+
+- **ASR:** the recorded 728 / 758 RTFx came from `manifest_x4.json` (292 clips, about 2.5 s of wall time), not the 73-clip manifest. On that workload main measures 739 / 775 and pre-squash dd1be445 measures 731 / 766.
+- **E4B:** pre-squash dd1be445, the same plowrt tree as the recording, measures 70.7 / 94.3 ms TTFT p50, not 51 / 80. The recorded 51 ms was one favourable repeat; raw repeats range from 51 to 130 ms. At c128 main is better (86 ms). At c64 main is about 10 ms higher, all of it in the second repeat. That excess goes away with the old 5% prefix-cache cap (`PLOW_VMM_CACHE_MEMORY_UTILIZATION=0.05`), so the likely cause is prefix-pool growth under the new uncapped default.
+- **Separate bug found during the bisect:** E4B on main with prefix reuse disabled (`PLOW_VMM_PREFIX=0` or `PLOW_PREFIX_CACHE=0`) faults at c64 with `CUDA_ERROR_ILLEGAL_ADDRESS` in the decode pipeline (3 of 3 runs).
+
+The original analysis follows.
+
 - **Qwen3-ASR RTFx c64 -11.4%, c128 -22.4%.**
   - Same client, same 73-clip / 481 s manifest, same RTFx definition (`served_bench.py` is unchanged since af3fda87).
   - Both repeats fall well below the recorded values.
