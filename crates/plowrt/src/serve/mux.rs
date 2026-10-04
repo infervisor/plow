@@ -5191,7 +5191,7 @@ fn gpu_prefill_batched_pass(
                     state_slot: i as u32,
                     generation: e.slot_generation(i)?,
                     phase: Phase::Prefill,
-                    tokens: &slot.prompt_ids[c0..c0 + len],
+                    tokens: slot.prompt_ids.get(c0..c0.checked_add(len)?)?,
                     prompt_len: slot.prompt_ids.len() as u32,
                     selection: Selection::default(),
                 })
@@ -5423,7 +5423,12 @@ fn gpu_prefill_advance(
         let end = start
             .saturating_add(cap_rows.max(1))
             .min(slot.prompt_ids.len());
-        let tail = &slot.prompt_ids[start..end];
+        let Some(tail) = slot.prompt_ids.get(start..end) else {
+            return Err(crate::RuntimeError::Msg(format!(
+                "prompt cursor {start} is past the prompt ({} tokens)",
+                slot.prompt_ids.len()
+            )));
+        };
         if !tail.is_empty() {
             tok = e.consume_prompt(slot_idx, tail, &mut toks)?;
         }

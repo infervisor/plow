@@ -39,8 +39,9 @@ impl Tokenize for ByteTokenizer {
         text.bytes().map(|b| b as u32).collect()
     }
 
+    /// Ids past the byte range (a `/detokenize` caller's) are skipped, not wrapped onto a byte.
     fn decode(&self, ids: &[u32]) -> String {
-        let bytes: Vec<u8> = ids.iter().map(|&id| id as u8).collect();
+        let bytes: Vec<u8> = ids.iter().filter_map(|&id| u8::try_from(id).ok()).collect();
         String::from_utf8_lossy(&bytes).into_owned()
     }
 
@@ -403,6 +404,11 @@ impl Tokenize for HfTokenizer {
 mod tests {
     use super::*;
     use std::str::FromStr;
+
+    #[test]
+    fn byte_decode_skips_ids_past_a_byte() {
+        assert_eq!(ByteTokenizer.decode(&[104, 0x168, u32::MAX, 105]), "hi");
+    }
 
     fn glm_like(add_prefix_space: bool) -> tokenizers::Tokenizer {
         use tokenizers::pre_tokenizers::byte_level::ByteLevel;
