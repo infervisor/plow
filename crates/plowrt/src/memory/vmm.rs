@@ -2000,7 +2000,7 @@ impl VmmKv {
         let s = &self.shared;
         let mut inner = s.inner.lock();
         let br = s.block_rows as usize;
-        if prompt.len() <= br
+        if prompt.len() < 2
             || (inner.fine_rows > 0 && (prompt.len() as u64) < u64::from(inner.fine_ceiling))
         {
             return None;
@@ -5183,6 +5183,13 @@ mod tests {
         assert_eq!(p.inflight_prefix(1, &b, 16, &[288]), None, "the boundary is attachable now");
         p.ensure_rows(1, 1).unwrap();
         assert_eq!(p.try_attach(1, &b).unwrap().unwrap().rows, 288);
+
+        // Prompts shorter than one KV block (FP8 KV on H100: 4096-row blocks).
+        let geo = VmmGeometry { max_ctx: 2048, ..uniform_pool(Arc::new(MockVmm::default())).geometry().clone() };
+        let p = VmmKv::new(Arc::new(MockVmm::default()), geo, 64 << 10, 0).expect("pool");
+        assert!(p.block_rows() as usize > a.len());
+        assert!(p.try_attach(0, &a).unwrap().is_none());
+        assert_eq!(p.inflight_prefix(1, &b, 16, &[0]), Some((0, 288)));
     }
 
     /// Two sessions share a system prompt (a boundary at 16 rows). Pressure evicts the
