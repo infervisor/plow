@@ -17,6 +17,30 @@ use crate::{Result, RuntimeError};
 
 const OBJECT: &str = "interp_sm90a_speech.cubin";
 const SYMBOL: &str = "_Z19interp_sm90a_speech11PlowProgram";
+/// FP32 speech ops are 163..=204, bit `op - 163` of `PLOW_SPEECH_OPS` (`op_speech_f32.cuh`).
+const SPEECH_OP0: u32 = 163;
+
+fn speech_ops(blob: &DevBlob) -> u64 {
+    blob.progs
+        .iter()
+        .flat_map(|p| &p.insts)
+        .map(|d| u32::from(d.op))
+        .filter(|op| (SPEECH_OP0..=204).contains(op))
+        .fold(0, |mask, op| mask | 1 << (op - SPEECH_OP0))
+}
+
+fn missing_speech_ops(required: u64, compiled: u64) -> Vec<u32> {
+    let missing = required & !compiled;
+    (0..64).filter(|b| missing >> b & 1 != 0).map(|b| b + SPEECH_OP0).collect()
+}
+
+#[cfg(test)]
+#[test]
+fn a_specialized_speech_object_must_cover_the_packet_ops() {
+    assert!(missing_speech_ops(0b1011, 0b1111).is_empty());
+    assert_eq!(missing_speech_ops(0b1011, 0b0011), vec![SPEECH_OP0 + 3]);
+    assert_eq!(missing_speech_ops(1 << 41, 0), vec![204]);
+}
 
 struct Program {
     kernarg: DevProgram,
@@ -68,6 +92,19 @@ impl CudaPacketRuntime {
         let image = std::fs::read(&object).map_err(|source| RuntimeError::Io { path: object.clone(), source })?;
         let module = be.module_load(&image)?;
         let function = be.get_function(&module, SYMBOL)?;
+        if let (Some(lo), Some(hi)) = (
+            be.module_global_u32(&module, "plow_speech_ops_lo_speech")?,
+            be.module_global_u32(&module, "plow_speech_ops_hi_speech")?,
+        ) {
+            let ops = missing_speech_ops(speech_ops(&blob), u64::from(hi) << 32 | u64::from(lo));
+            if !ops.is_empty() {
+                return Err(RuntimeError::Rejected(format!(
+                    "{}: {} lacks speech ops {ops:?}; rebuild it for this packet",
+                    path.display(),
+                    object.display()
+                )));
+            }
+        }
         let smem = be.module_global_u32(&module, "plow_arena_bytes_speech")?.unwrap_or(49152);
         if let Some(limit) = crate::config::RuntimeConfig::debug_max_inst() {
             if be.module_global_set_u32(&module, "plow_debug_max_inst_speech", limit)? {

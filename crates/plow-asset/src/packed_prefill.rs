@@ -471,24 +471,11 @@ fn validate_stages(
     request_rows: u32,
     stage_rows: u32,
 ) -> Result<()> {
-    let segment = |pc: usize| {
-        g.gq_seg_ofs.windows(2).position(|w| {
-            g.gq_stream
-                .get(w[0] as usize..w[1] as usize)
-                .is_some_and(|e| e.iter().any(|x| x.inst as usize == pc))
-        })
-    };
     let stages = request_rows.div_ceil(stage_rows) as usize;
     for c in live.caches.iter().filter(|c| c.window > 0 && c.stride < live.max_ctx) {
         let readers: Vec<usize> = (0..g.insts.len())
             .filter(|&pc| is_attention(&g.insts[pc]) && [g.insts[pc].t[3], g.insts[pc].t[4]] == c.pair)
             .collect();
-        let writers = |h: u16| -> Vec<usize> {
-            (0..g.insts.len())
-                .filter(|&pc| is_cache_writer(&g.insts[pc]) && g.insts[pc].t[0] == h)
-                .collect()
-        };
-        let (wk, wv) = (writers(c.pair[0]), writers(c.pair[1]));
         if readers.len() <= 1 {
             need(
                 u64::from(c.stride) >= u64::from(c.window) + u64::from(request_rows) - 1,
@@ -496,29 +483,84 @@ fn validate_stages(
             )?;
             continue;
         }
-        need(
-            readers.len() == stages && wk.len() == stages && wv.len() == stages,
-            "one writer pair and one reader per stage",
-        )?;
-        let mut last = None;
-        for k in 0..stages {
-            let (r, w0, w1) = (segment(readers[k]), segment(wk[k]), segment(wv[k]));
-            need(
-                r.is_some() && w0.is_some() && w1.is_some(),
-                "staged site outside the segment chain",
-            )?;
-            need(
-                w0 < r && w1 < r && last.is_none_or(|l| Some(l) < w0 && Some(l) < w1),
-                "stage order",
-            )?;
-            need(
-                g.insts[readers[k]].t[5] != TENSOR_NONE16,
-                "staged attention must write its own output",
-            )?;
-            last = r;
-        }
+        need(readers.len() == stages, "one writer pair and one reader per stage")?;
+        let (wk, wv) = (cache_writers(g.insts, c.pair[0]), cache_writers(g.insts, c.pair[1]));
+        check_stage_order(g, &readers, &wk, &wv)?;
     }
     Ok(())
+}
+
+fn check_stage_order(
+    g: &crate::program::Program<'_>,
+    readers: &[usize],
+    wk: &[usize],
+    wv: &[usize],
+) -> Result<()> {
+    need(
+        readers.len() > 1 && wk.len() == readers.len() && wv.len() == readers.len(),
+        "one writer pair and one reader per stage",
+    )?;
+    let segment = |pc: usize| {
+        g.gq_seg_ofs.windows(2).position(|w| {
+            g.gq_stream
+                .get(w[0] as usize..w[1] as usize)
+                .is_some_and(|e| e.iter().any(|x| x.inst as usize == pc))
+        })
+    };
+    let mut last = None;
+    for k in 0..readers.len() {
+        let (r, w0, w1) = (segment(readers[k]), segment(wk[k]), segment(wv[k]));
+        need(
+            r.is_some() && w0.is_some() && w1.is_some(),
+            "staged site outside the segment chain",
+        )?;
+        need(
+            w0 < r && w1 < r && last.is_none_or(|l| Some(l) < w0 && Some(l) < w1),
+            "stage order",
+        )?;
+        need(
+            g.insts[readers[k]].t[5] != TENSOR_NONE16,
+            "staged attention must write its own output",
+        )?;
+        last = r;
+    }
+    Ok(())
+}
+
+fn cache_writers(insts: &[DevInst64], h: u16) -> Vec<usize> {
+    (0..insts.len())
+        .filter(|&pc| is_cache_writer(&insts[pc]) && insts[pc].t[0] == h)
+        .collect()
+}
+
+/// Writer sites of a prefill program allowed to repeat: those of a cache pair written more than
+/// once, after proving the pair is staged (one writer pair per reader, stages in segment order).
+/// Repeated readers over single writers (KV sharing) need no proof. A packet may carry such sites
+/// only when its packed-prefill manifest declares `stage_rows` ([`has_repeated_writers`]).
+pub fn repeated_writers(g: &crate::program::Program<'_>) -> Result<Vec<bool>> {
+    let mut out = vec![false; g.insts.len()];
+    let mut readers: std::collections::BTreeMap<[u16; 2], Vec<usize>> = Default::default();
+    for (pc, d) in g.insts.iter().enumerate().filter(|(_, d)| is_attention(d)) {
+        readers.entry([d.t[3], d.t[4]]).or_default().push(pc);
+    }
+    for (pair, pcs) in &readers {
+        let (wk, wv) = (cache_writers(g.insts, pair[0]), cache_writers(g.insts, pair[1]));
+        if wk.len() <= 1 && wv.len() <= 1 {
+            continue;
+        }
+        check_stage_order(g, pcs, &wk, &wv)?;
+        for &pc in wk.iter().chain(&wv) {
+            out[pc] = true;
+        }
+    }
+    Ok(out)
+}
+
+pub fn has_repeated_writers(p: &Packet<'_>) -> bool {
+    p.programs[..p.prefill_count].iter().any(|g| {
+        let mut seen = BTreeSet::new();
+        g.insts.iter().filter(|d| is_cache_writer(d)).any(|d| !seen.insert(d.t[0]))
+    })
 }
 
 #[derive(Clone, Copy, Debug)]
