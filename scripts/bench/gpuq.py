@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import platform
 import sys
 import time
 import uuid
@@ -41,8 +42,9 @@ def work(root):
                 continue
             idle = time.monotonic()
             # Do not run a benchmark alongside a server that bypassed the lease locks.
-            audit = subprocess.run([str(LEASE), "--audit"], capture_output=True, text=True)
-            if audit.returncode or audit.stdout.strip() != "GPU: no foreign compute procs":
+            metal = platform.system() == "Darwin"
+            audit = None if metal else subprocess.run([str(LEASE), "--audit"], capture_output=True, text=True)
+            if audit is not None and (audit.returncode or audit.stdout.strip() != "GPU: no foreign compute procs"):
                 time.sleep(5)
                 continue
             path, job = pending[0]
@@ -51,11 +53,20 @@ def work(root):
             with (root / (path.stem + ".log")).open("ab") as log:
                 # The runner outlives submitters; a later job must not inherit the first job's Plow knobs.
                 child_env = {key: value for key, value in os.environ.items() if not key.startswith("PLOW_")}
-                child = subprocess.Popen([str(LEASE), "-n", str(job["ngpu"]), job["label"], *job["command"]],
+                # Metal has no SMI process audit or gpulease/flock utility.
+                # Share an advisory lock across queue roots on this Mac.
+                metal_lock = None
+                if metal:
+                    metal_lock = open("/tmp/plow-metal-gpu.lock", "a")
+                    fcntl.flock(metal_lock, fcntl.LOCK_EX)
+                command = job["command"] if metal else [str(LEASE), "-n", str(job["ngpu"]), job["label"], *job["command"]]
+                child = subprocess.Popen(command,
                                          cwd=job["cwd"], env=child_env, stdout=log, stderr=subprocess.STDOUT)
                 job["pid"] = child.pid
                 save(path, job)
                 rc = child.wait()
+                if metal_lock is not None:
+                    metal_lock.close()
             job.update(state="done" if rc == 0 else "failed", rc=rc, finished=time.time())
             save(path, job)
             idle = time.monotonic()
@@ -80,8 +91,10 @@ def main():
         for path in sorted(root.glob("*.json")):
             print(path.stem, json.loads(path.read_text()))
     else:
-        if not os.environ.get("ROCM_PATH"):
+        if not os.environ.get("ROCM_PATH") and not (platform.system() == "Darwin" and os.environ.get("IN_NIX_SHELL")):
             parser.error("submit inside nix develop")
+        if platform.system() == "Darwin" and args.ngpu != 1:
+            parser.error("Metal uses one shared device")
         if args.ngpu < 1 or not args.command:
             parser.error("submit needs a positive GPU count and a command")
         job_id = f"{time.time_ns()}-{uuid.uuid4().hex[:8]}"
