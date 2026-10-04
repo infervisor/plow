@@ -404,8 +404,10 @@ fn turn_job_due(
     stage_due(stage, t, e, stage_cost(stage, prefill, tick, e), since)
 }
 
-/// How long a raw-token consumer may hold its slot parked before the request is cut.
+/// How long a consumer that stopped reading may hold its slot parked before the request is cut.
 const PARK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+type HeldToken = (u32, String, Option<Box<crate::text::logprobs::TokenLogprobs>>);
 
 /// A request whose prefill splices host rows over prompt positions (`EmbedOverlayBf16`: the
 /// packet's `in.encoder_overlay` / `in.encoder_overlay_index`) and whose decode embedding may
@@ -716,9 +718,9 @@ struct Slot {
     /// Set on the owner of a CFG pair; its partner slot (owner + 1) stays `None` in the table
     /// and is reserved while the owner lives (see [`slot_free`]).
     cfg: Option<Box<CfgRun>>,
-    /// Raw tokens produced while the consumer's channel was full, oldest first. A parked slot is
+    /// Chunks produced while the consumer's channel was full, oldest first. A parked slot is
     /// not fed; see [`flush_parked`].
-    held: Vec<u32>,
+    held: Vec<HeldToken>,
     held_finish: Option<FinishReason>,
     parked_at: Option<Instant>,
     /// A session request's retention seat; dropped with the slot, it retires the rows.
@@ -3436,7 +3438,7 @@ fn run_one_tick(
                         if rt.pf_defer_decode {
                             return None;
                         }
-                        let slot = slot.as_ref()?;
+                        let slot = slot.as_ref().filter(|s| s.parked_at.is_none())?;
                         slot.out_ids.last().map(|&token| (i, token))
                     })
                     .collect();
@@ -3522,7 +3524,7 @@ fn run_one_tick(
                     .enumerate()
                     .take(b)
                     .filter_map(|(i, slot)| {
-                        let slot = slot.as_ref()?;
+                        let slot = slot.as_ref().filter(|s| s.parked_at.is_none())?;
                         (slot.step > 0).then(|| (i, *slot.out_ids.last().expect("decode output")))
                     })
                     .collect();
@@ -3804,7 +3806,7 @@ fn run_one_tick(
                             .enumerate()
                             .take(b)
                             .filter_map(|(i, slot)| {
-                                let slot = slot.as_ref()?;
+                                let slot = slot.as_ref().filter(|s| s.parked_at.is_none())?;
                                 (slot.step > 0)
                                     .then(|| (i, *slot.out_ids.last().expect("decode output")))
                             })
@@ -4176,7 +4178,7 @@ fn run_one_tick(
             // Decode: every live slot feeds the token it last produced.
             let feeds: Vec<(usize, u32)> = (0..b.min(slots.len()))
                 .filter_map(|i| {
-                    let s = slots[i].as_ref()?;
+                    let s = slots[i].as_ref().filter(|s| s.parked_at.is_none())?;
                     Some((i, *s.out_ids.last()?))
                 })
                 .collect();
@@ -4437,7 +4439,7 @@ fn run_one_tick(
             kv_pages_range.clone(),
         );
         for slot_opt in slots.iter_mut() {
-            let Some(slot) = slot_opt.as_mut() else {
+            let Some(slot) = slot_opt.as_mut().filter(|s| s.parked_at.is_none()) else {
                 continue;
             };
 
@@ -6099,7 +6101,8 @@ fn handle_produced_token(
     tokens_this_tick: &mut usize,
     stop_ids: Option<&[u32]>,
 ) -> bool {
-    let Some(slot) = slot_opt.as_mut() else {
+    // A finished slot parked on its consumer only drains; a token past its end is not output.
+    let Some(slot) = slot_opt.as_mut().filter(|s| s.held_finish.is_none()) else {
         return false;
     };
     if let Some(telemetry) = slot.telemetry.as_mut() {
@@ -6182,48 +6185,21 @@ fn handle_produced_token(
     } else {
         delta
     };
-    // The stop token emits nothing itself, so released bytes ride a chunk of their own; one entry
-    // stays free for the terminal.
-    if !carried.is_empty() && !slot.raw_tokens && slot.respond.capacity() > 1 {
-        let _ = slot.respond.try_send(StreamChunk::Token { id: token, text: carried, logprobs: None });
-    }
-    // A raw-token consumer that is behind (or already parked) keeps its tokens here, in order,
-    // and its slot stops being fed until `flush_parked` drains them.
-    if slot.raw_tokens && (slot.parked_at.is_some() || (!stop_token && slot.respond.capacity() <= 1)) {
-        if !stop_token {
-            slot.held.push(token);
-        }
-        if stop_token || stop_max {
-            slot.held_finish = Some(if stop_token { FinishReason::Stop } else { FinishReason::Length });
-        }
-        slot.parked_at.get_or_insert_with(Instant::now);
-        return false;
-    }
-    if !stop_token && slot.respond.capacity() <= 1 {
-        let _ = slot
-            .respond
-            .try_send(StreamChunk::Err(crate::RuntimeError::Rejected(
-                "response consumer is too slow".into(),
-            )));
+    // The stop token emits nothing itself, so released bytes ride a chunk of their own.
+    if !carried.is_empty() && !slot.raw_tokens && send_or_hold(slot, (token, carried, None)) {
         if let Some(taken) = slot_opt.take() {
             release_kv(arena, taken.kv);
         }
         return true;
     }
-    if !stop_token
-        && slot
-            .respond
-            .try_send(StreamChunk::Token {
-                id: token,
-                text: delta,
-                logprobs: slot.lp.take(),
-            })
-            .is_err()
-    {
-        if let Some(taken) = slot_opt.take() {
-            release_kv(arena, taken.kv);
+    if !stop_token {
+        let lp = slot.lp.take();
+        if send_or_hold(slot, (token, delta, lp)) {
+            if let Some(taken) = slot_opt.take() {
+                release_kv(arena, taken.kv);
+            }
+            return true;
         }
-        return true;
     }
     if slot.step == 1 && crate::obs::host::on() {
         crate::obs::host::first_token(slot.prompt_ids.len(), slot.arrived.elapsed());
@@ -6234,6 +6210,10 @@ fn handle_produced_token(
         } else {
             FinishReason::Stop
         };
+        if slot.parked_at.is_some() {
+            slot.held_finish = Some(reason);
+            return false;
+        }
         if let Some(telemetry) = slot.telemetry.as_mut() {
             telemetry.finish(reason, slot.executed);
         }
@@ -6254,7 +6234,19 @@ fn handle_produced_token(
     false
 }
 
-/// Drain a parked raw-token slot into its consumer's free capacity (one entry stays reserved for
+/// Send one token chunk, or hold it and park the slot while the consumer is behind or earlier
+/// chunks still wait; one channel entry stays free for the terminal. True when the consumer is
+/// gone.
+fn send_or_hold(slot: &mut Slot, (id, text, logprobs): HeldToken) -> bool {
+    if slot.parked_at.is_none() && slot.respond.capacity() > 1 {
+        return slot.respond.try_send(StreamChunk::Token { id, text, logprobs }).is_err();
+    }
+    slot.held.push((id, text, logprobs));
+    slot.parked_at.get_or_insert_with(Instant::now);
+    false
+}
+
+/// Drain a parked slot into its consumer's free capacity (one entry stays reserved for
 /// the terminal). Returns true when the slot was freed: finished, disconnected, or parked past
 /// [`PARK_TIMEOUT`].
 fn flush_parked(slot_opt: &mut Option<Slot>, arena: &Option<SharedKvState>) -> bool {
@@ -6266,15 +6258,10 @@ fn flush_parked(slot_opt: &mut Option<Slot>, arena: &Option<SharedKvState>) -> b
         }
         return true;
     }
-    let mut sent = 0;
-    while sent < slot.held.len() && slot.respond.capacity() > 1 {
-        let id = slot.held[sent];
-        if slot.respond.try_send(StreamChunk::Token { id, text: String::new(), logprobs: None }).is_err() {
-            break;
-        }
-        sent += 1;
+    let room = slot.respond.capacity().saturating_sub(1).min(slot.held.len());
+    for (id, text, logprobs) in slot.held.drain(..room) {
+        let _ = slot.respond.try_send(StreamChunk::Token { id, text, logprobs });
     }
-    slot.held.drain(..sent);
     if slot.held.is_empty() {
         let Some(reason) = slot.held_finish.take() else {
             slot.parked_at = None;
@@ -7252,6 +7239,35 @@ mod tests {
         slot.as_mut().unwrap().parked_at = Some(Instant::now() - PARK_TIMEOUT - PARK_TIMEOUT);
         assert!(flush_parked(&mut slot, &None));
         assert!(slot.is_none());
+    }
+
+    /// A text consumer that falls behind is parked too, not cut at the 33rd chunk: every delta
+    /// arrives in order, then the terminal.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn a_slow_text_consumer_is_parked_then_drained() {
+        let (mut slot, mut rx) = prefill_test_slot();
+        slot.as_mut().unwrap().gen.max_tokens = 40;
+        let bundle = prefill_test_bundle("park-text");
+        let mut n = 0;
+        for _ in 0..40 {
+            assert!(!handle_produced_token(&mut slot, &None, &bundle, u32::from(b'a'), 1, &mut n, Some(&[])));
+        }
+        assert!(slot.as_ref().is_some_and(|s| s.parked_at.is_some() && s.held_finish.is_some()));
+        assert!(gpu_decode_feeds(std::slice::from_ref(&slot), 1).is_empty());
+        let (mut text, mut done) = (String::new(), false);
+        for _ in 0..4 {
+            while let Ok(c) = rx.try_recv() {
+                match c {
+                    StreamChunk::Token { text: t, .. } => text.push_str(&t),
+                    StreamChunk::Done { reason, .. } => done = matches!(reason, FinishReason::Length),
+                    StreamChunk::Err(e) => panic!("{e}"),
+                }
+            }
+            flush_parked(&mut slot, &None);
+        }
+        assert!(done && slot.is_none());
+        assert_eq!(text, "a".repeat(40));
     }
 
     /// Aging must always come first, or a request would be shed before it ever blocks the
