@@ -18,6 +18,16 @@
 
 static_assert(PLOW_NV_THREADS == 256, "speech tiles assume 256 threads");
 
+/* The speech ops the packet's sidecar programs use, bit (op - 163) (plow_config.h); unset = all.
+ * Every arm compiled into the speech interpreter costs ptxas superlinearly (whole-program
+ * calling conventions with the interpreter kernel): all arms took hours, one packet's set minutes. */
+#ifndef PLOW_SPEECH_OPS
+#define PLOW_SPEECH_OPS (~0ull)
+#endif
+__device__ __forceinline__ constexpr bool sp_op_on(unsigned op) {
+    return op < 163u || op > 204u || ((PLOW_SPEECH_OPS >> (op - 163u)) & 1ull);
+}
+
 #define SPG_TM 8
 #define SPG_TN 8
 #define SPG_BK 16
@@ -3347,7 +3357,7 @@ __device__ __forceinline__ unsigned sp_w_conv_width(const PlowDevInst* in, const
 /* The wgmma arm of Conv1dF32 (flags bit 17), dispatched from the interpreter's inlined body:
  * wgmma in a called function is serialized (ptxas C7510). False when the op does not qualify. */
 __device__ __forceinline__ bool sp_wg_conv1d(const PlowDevInst* in, void* const* T, unsigned slice, unsigned nblk) {
-    if (in->op != PLOW_DOP_CONV1D_F32 || !((in->fj[2].u >> 17) & 1u)) return false;
+    if (!sp_op_on(PLOW_DOP_CONV1D_F32) || in->op != PLOW_DOP_CONV1D_F32 || !((in->fj[2].u >> 17) & 1u)) return false;
     SpConvArgs a;
     if (!sp_conv_args(in, T, false, a) || !spg_eligible(a)) return false;
     /* Grouped pointwise convs (group widths % 4 == 0) run per group; the rest as the wide tile. */
@@ -4492,39 +4502,46 @@ static __device__ __noinline__ void d_attention_f32(const PlowDevInst* in, void*
     else if (in->i[4] == 128u) sp_attention_f32<128, 64>(in, T, slice, nblk, arena);
 }
 
+/* An op outside PLOW_SPEECH_OPS traps; its arm is dead code. */
+#define SP_CASE(op)                                                                                  \
+    case PLOW_DOP_##op:                                                                              \
+        if (!sp_op_on(PLOW_DOP_##op)) {                                                              \
+            __trap();                                                                                \
+            break;                                                                                   \
+        }
 static __device__ __noinline__ void d_speech_f32(const PlowDevInst* in, void* const* T, unsigned slice,
                                     unsigned nblk, float* arena) {
     arena = sp_smem;
     switch (in->op) {
-    case PLOW_DOP_Q8_GEMM_F32:
+    SP_CASE(Q8_GEMM_F32)
         d_q8_gemm_f32((float*)SP_TEN(0), (const float*)SP_TEN(1), (const uint8_t*)SP_TEN(2), (const float*)SP_TEN(3),
                       in->i[0], in->i[1], in->i[2], in->i[3], in->i[4], slice, nblk, arena);
         break;
-    case PLOW_DOP_LAYERNORM_F32:
+    SP_CASE(LAYERNORM_F32)
         d_layernorm_f32((float*)SP_TEN(0), (const float*)SP_TEN(1), (const float*)SP_TEN(2), (const float*)SP_TEN(3),
                         in->i[0], in->i[1], in->i[2], in->fj[0].f, slice, nblk, arena, nullptr, (const float*)SP_TEN(4));
         break;
-    case PLOW_DOP_SCALED_ADD_F32:
+    SP_CASE(SCALED_ADD_F32)
         d_scaled_add_f32((float*)SP_TEN(0), (const float*)SP_TEN(1), (const float*)SP_TEN(2), in->i[0],
                          in->fj[0].f, in->i[1], slice, nblk);
         break;
-    case PLOW_DOP_GLU_F32:
+    SP_CASE(GLU_F32)
         d_glu_f32((float*)SP_TEN(0), (const float*)SP_TEN(1), in->i[0], in->i[1], slice, nblk);
         break;
-    case PLOW_DOP_CAUSAL_DEPTHWISE_CONV1D_F32:
+    SP_CASE(CAUSAL_DEPTHWISE_CONV1D_F32)
         d_causal_dwconv1d_f32((float*)SP_TEN(0), (const float*)SP_TEN(1), (const uint16_t*)SP_TEN(2), in->i[0],
                               in->i[1], in->i[2], slice, nblk);
         break;
-    case PLOW_DOP_RELATIVE_ATTENTION_F32:
+    SP_CASE(RELATIVE_ATTENTION_F32)
         d_relative_attention_f32((float*)SP_TEN(0), (const float*)SP_TEN(1), (const float*)SP_TEN(2),
                                  (const float*)SP_TEN(3), (const float*)SP_TEN(4), (const float*)SP_TEN(5),
                                  (const float*)SP_TEN(6), in->i[0], in->i[1], in->i[2], in->i[3], in->i[4],
                                  slice, nblk);
         break;
-    case PLOW_DOP_SILU_F32:
+    SP_CASE(SILU_F32)
         d_silu_f32((float*)SP_TEN(0), (const float*)SP_TEN(1), in->i[0], slice, nblk);
         break;
-    case PLOW_DOP_DENSE_GEMM_F32:
+    SP_CASE(DENSE_GEMM_F32)
         if (in->i[7] & 32u) {
             const SpLn ln{(const float*)SP_TEN(5), (const float*)SP_TEN(6), (const float*)SP_TEN(7), in->i[4],
                           (in->i[7] & 64u) != 0u};
@@ -4544,56 +4561,57 @@ static __device__ __noinline__ void d_speech_f32(const PlowDevInst* in, void* co
                          in->i[1], in->i[2], in->i[3], in->i[4], in->i[5], in->i[6], in->i[7], slice,
                          nblk, arena, (float*)SP_TEN(4), nullptr);
         break;
-    case PLOW_DOP_EMBED_F16_F32:
+    SP_CASE(EMBED_F16_F32)
         d_embed_f16_f32((float*)SP_TEN(0), (const uint16_t*)SP_TEN(1), (const unsigned*)SP_TEN(2), in->i[0],
                         in->i[1], slice, nblk);
         break;
-    case PLOW_DOP_LSTM_CELL_F32:
+    SP_CASE(LSTM_CELL_F32)
         d_lstm_cell_f32((float*)SP_TEN(0), (float*)SP_TEN(1), (const float*)SP_TEN(2), (const float*)SP_TEN(3),
                         in->i[0], slice, nblk);
         break;
-    case PLOW_DOP_ARGMAX_F32:
+    SP_CASE(ARGMAX_F32)
         d_argmax_f32((unsigned*)SP_TEN(0), (const float*)SP_TEN(1), in->i[0], in->i[1], slice, nblk, arena);
         break;
-    case PLOW_DOP_RELU_F32:
+    SP_CASE(RELU_F32)
         d_relu_f32((float*)SP_TEN(0), (const float*)SP_TEN(1), in->i[0], slice, nblk);
         break;
-    case PLOW_DOP_BROADCAST_ADD_F32:
+    SP_CASE(BROADCAST_ADD_F32)
         d_broadcast_add_f32((float*)SP_TEN(0), (const float*)SP_TEN(1), (const float*)SP_TEN(2), in->i[0],
                             in->i[1], slice, nblk);
         break;
-    case PLOW_DOP_CONV2D_F32:
+    SP_CASE(CONV2D_F32)
         d_conv2d_f32((float*)SP_TEN(0), (const float*)SP_TEN(1), SP_TEN(2), (const float*)SP_TEN(3), in->i[0],
                      in->i[1], in->i[2], in->i[3], in->i[4], in->i[5], in->i[6], in->i[7],
                      in->fj[1].u, in->fj[2].u, slice, nblk, arena);
         break;
-    case PLOW_DOP_PACK_NCFW_ROWS_F32:
+    SP_CASE(PACK_NCFW_ROWS_F32)
         d_pack_ncfw_rows_f32((float*)SP_TEN(0), (const float*)SP_TEN(1), in->i[0], in->i[1], in->i[2],
                              in->i[3], in->i[4], slice, nblk);
         break;
-    case PLOW_DOP_GROUPED_ATTENTION_F32:
+    SP_CASE(GROUPED_ATTENTION_F32)
         d_grouped_attention_f32((float*)SP_TEN(0), (const float*)SP_TEN(1), (const float*)SP_TEN(2),
                                 (const float*)SP_TEN(3), (const unsigned*)SP_TEN(4), in->i[0], in->i[1],
                                 in->i[2], in->i[3], in->i[4], slice, nblk, arena);
         break;
-    case PLOW_DOP_GEMM_F32:
+    SP_CASE(GEMM_F32)
         d_gemm_f32((float*)SP_TEN(0), (const __nv_bfloat16*)SP_TEN(1), (const __nv_bfloat16*)SP_TEN(2), in->i[0],
                    in->i[1], in->i[2], slice, nblk, arena);
         break;
-    case PLOW_DOP_GATHER_ROWS_F32: d_gather_rows_f32(in, T, slice, nblk); break;
-    case PLOW_DOP_COPY_COLS_F32: d_copy_cols_f32(in, T, slice, nblk); break;
-    case PLOW_DOP_CONV1D_F32: d_conv1d_f32(in, T, false, slice, nblk, arena); break;
-    case PLOW_DOP_CONV_TRANSPOSE1D_F32: d_conv1d_f32(in, T, true, slice, nblk, arena); break;
-    case PLOW_DOP_UNARY_F32: d_unary_f32(in, T, slice, nblk); break;
-    case PLOW_DOP_BINARY_F32: d_binary_f32(in, T, slice, nblk); break;
-    case PLOW_DOP_CUMSUM_F64: d_cumsum_f64(in, T, slice, nblk, arena); break;
-    case PLOW_DOP_RAND_F32: d_rand_f32(in, T, slice, nblk); break;
-    case PLOW_DOP_ATTENTION_F32: d_attention_f32(in, T, slice, nblk, arena); break;
-    case PLOW_DOP_ROW_STATS_F32:
+    SP_CASE(GATHER_ROWS_F32) d_gather_rows_f32(in, T, slice, nblk); break;
+    SP_CASE(COPY_COLS_F32) d_copy_cols_f32(in, T, slice, nblk); break;
+    SP_CASE(CONV1D_F32) d_conv1d_f32(in, T, false, slice, nblk, arena); break;
+    SP_CASE(CONV_TRANSPOSE1D_F32) d_conv1d_f32(in, T, true, slice, nblk, arena); break;
+    SP_CASE(UNARY_F32) d_unary_f32(in, T, slice, nblk); break;
+    SP_CASE(BINARY_F32) d_binary_f32(in, T, slice, nblk); break;
+    SP_CASE(CUMSUM_F64) d_cumsum_f64(in, T, slice, nblk, arena); break;
+    SP_CASE(RAND_F32) d_rand_f32(in, T, slice, nblk); break;
+    SP_CASE(ATTENTION_F32) d_attention_f32(in, T, slice, nblk, arena); break;
+    SP_CASE(ROW_STATS_F32)
         d_layernorm_f32(nullptr, (const float*)SP_TEN(1), nullptr, nullptr, in->i[0], in->i[1], in->i[2], in->fj[0].f,
                         slice, nblk, arena, (float*)SP_TEN(0));
         break;
     default: __trap(); break;
     }
 }
+#undef SP_CASE
 #undef SP_TEN
