@@ -145,7 +145,7 @@ async fn completions_with(
             use crate::serve::manager::EnsureError;
             if let Err(e) = mgr.ensure_resident(&req.model).await {
                 return match e {
-                    EnsureError::WontFit { .. } => (
+                    EnsureError::WontFit { .. } | EnsureError::SwitchTimeout(_) => (
                         axum::http::StatusCode::SERVICE_UNAVAILABLE,
                         [("retry-after", "30")],
                         Json(serde_json::json!({"error": e.to_string()})),
