@@ -150,6 +150,17 @@ enum Container {
     Extension,
 }
 
+fn known_ops() -> &'static [bool] {
+    static KNOWN: std::sync::OnceLock<Vec<bool>> = std::sync::OnceLock::new();
+    KNOWN.get_or_init(|| {
+        let mut known = vec![false; 1 << 16];
+        for op in DevOp::ALL {
+            known[*op as u16 as usize] = true;
+        }
+        known
+    })
+}
+
 /// Copy `n` `T` records out of `buf` at `*off` (unaligned-safe — the blob's
 /// sections are packed back to back with no padding between them).
 fn take<T: Copy>(buf: &[u8], off: &mut usize, n: usize, what: &str) -> Result<Vec<T>> {
@@ -322,6 +333,19 @@ impl DevBlob {
                 gq_seg_ofs: Vec::new(),
                 l2_domains: 0,
             });
+        }
+
+        // An opcode this build does not know is a packet from a newer plowc. The interpreter
+        // would trap on it at the first launch and poison the device context mid-serve.
+        let known = known_ops();
+        for (p, prog) in progs.iter().enumerate() {
+            if let Some((i, d)) = prog.insts.iter().enumerate().find(|(_, d)| !known[d.op as usize]) {
+                return Err(RuntimeError::Device(format!(
+                    "devblob: program {p} instruction {i} uses opcode {}, which this plowrt does not \
+                     know; the packet needs a matching plowrt",
+                    d.op
+                )));
+            }
         }
 
         // THE ONE PLACE a loaded table is turned into roles. Everything downstream — both
@@ -1479,6 +1503,15 @@ mod tests {
             prog_t: vec![128, 1],
             gen: Vec::new(),
         }
+    }
+
+    #[test]
+    fn an_opcode_this_build_does_not_know_is_refused_at_parse() {
+        let mut m = tiny_model();
+        assert!(DevBlob::parse(&m.to_blob()).is_ok());
+        m.progs[1].insts.push(DevInst { op: 0xfffe, blocks: 1, ..Default::default() });
+        let err = DevBlob::parse(&m.to_blob()).unwrap_err().to_string();
+        assert!(err.contains("opcode 65534"), "{err}");
     }
 
     /// Give program `p` the two collectives `devgen` emits per layer at tp=N:
