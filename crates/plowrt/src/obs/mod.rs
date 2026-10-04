@@ -46,6 +46,8 @@ pub struct Metrics {
     pub decode_rung_admission: AtomicU64,
     pub decode_occupied_extent: AtomicU64,
     pub decode_rung_switches: AtomicU64,
+    /// A fatal device fault poisoned this model's engine; `/health` answers 503.
+    pub engine_dead: std::sync::atomic::AtomicBool,
 }
 
 impl Metrics {

@@ -1632,6 +1632,7 @@ pub fn spawn(
                     health = advance_health(health, tick_fault);
                     if !was_dead {
                         if let EngineHealth::Dead(f) = &health {
+                            metrics.engine_dead.store(true, std::sync::atomic::Ordering::Relaxed);
                             tracing::error!(
                                 %slug,
                                 error_op = %f.operation,
@@ -6157,18 +6158,35 @@ fn handle_produced_token(
     // Stop-string bookkeeping over the run of generated-but-unemitted bytes. Extracted so it
     // can be driven token by token in a test: both bugs it has carried lived in the SEQUENCING
     // of hold, release and cut, not in either helper, and nothing exercised that.
-    let (delta, stop_string) = if !slot.gen.ignore_eos && !below_min && !slot.gen.stop.is_empty()
-    {
-        apply_stop_strings(
-            &mut slot.stop_tail,
-            &mut slot.stop_pending,
-            delta,
-            &slot.gen.stop,
-        )
-    } else {
-        (delta, false)
-    };
+    // Bytes withheld so far as a possible stop prefix. A stop token ends the text before its own
+    // bytes, so these are what it must still release.
+    let carried = if stop_token { std::mem::take(&mut slot.stop_pending) } else { String::new() };
+    let (delta, stop_string) =
+        if !stop_token && !slot.gen.ignore_eos && !below_min && !slot.gen.stop.is_empty() {
+            apply_stop_strings(
+                &mut slot.stop_tail,
+                &mut slot.stop_pending,
+                delta,
+                &slot.gen.stop,
+            )
+        } else {
+            (delta, false)
+        };
     let stop_max = slot.step >= slot.gen.max_tokens.max(1);
+    // Held bytes are text once the request ends without a stop-string match; dropping them
+    // truncated the answer.
+    let delta = if stop_max && !stop_string && !slot.stop_pending.is_empty() {
+        let mut d = delta;
+        d.push_str(&std::mem::take(&mut slot.stop_pending));
+        d
+    } else {
+        delta
+    };
+    // The stop token emits nothing itself, so released bytes ride a chunk of their own; one entry
+    // stays free for the terminal.
+    if !carried.is_empty() && !slot.raw_tokens && slot.respond.capacity() > 1 {
+        let _ = slot.respond.try_send(StreamChunk::Token { id: token, text: carried, logprobs: None });
+    }
     // A raw-token consumer that is behind (or already parked) keeps its tokens here, in order,
     // and its slot stops being fed until `flush_parked` drains them.
     if slot.raw_tokens && (slot.parked_at.is_some() || (!stop_token && slot.respond.capacity() <= 1)) {
@@ -7561,6 +7579,37 @@ mod tests {
 
         rx.close();
         assert!(!gpu_prefill_should_yield(false, false, slot.as_ref()));
+    }
+
+    /// Bytes held back as a possible stop-string prefix are released when the request ends on
+    /// its budget or on a stop token instead of being dropped.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn held_stop_prefix_is_released_at_finish() {
+        let bundle = prefill_test_bundle("stop-held");
+        // "STOP" never completes: "ST" is held, then the budget (2) or the stop token (0) ends it.
+        for (ids, max_tokens) in [(&[b'S' as u32, b'T' as u32][..], 2), (&[b'S' as u32, b'T' as u32, 0][..], 8)] {
+            let (mut slot, mut rx) = prefill_test_slot();
+            let s = slot.as_mut().unwrap();
+            s.gen.max_tokens = max_tokens;
+            s.gen.stop = vec!["STOP".into()];
+            let mut tokens = 0;
+            for &id in ids {
+                handle_produced_token(&mut slot, &None, &bundle, id, 1, &mut tokens, Some(&[0]));
+            }
+            assert!(slot.is_none(), "the request finished");
+            let mut text = String::new();
+            let mut done = false;
+            while let Ok(chunk) = rx.try_recv() {
+                match chunk {
+                    StreamChunk::Token { text: t, .. } => text.push_str(&t),
+                    StreamChunk::Done { .. } => done = true,
+                    StreamChunk::Err(e) => panic!("{e}"),
+                }
+            }
+            assert!(done);
+            assert_eq!(text, "ST", "max_tokens {max_tokens}");
+        }
     }
 
     #[cfg(feature = "cuda")]

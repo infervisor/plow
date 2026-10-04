@@ -83,6 +83,29 @@ pub struct GenParams {
     pub stop_token_ids: Vec<u32>,
 }
 
+/// The generation budget of a request that named none: the default, capped to the context the
+/// prompt leaves (as vLLM does), so a long prompt is served instead of refused for a budget the
+/// client never asked for.
+pub(crate) fn default_max_tokens(default: usize, max_ctx: Option<usize>, n_prompt: usize) -> usize {
+    match max_ctx {
+        Some(ctx) if n_prompt < ctx => default.min(ctx - n_prompt),
+        _ => default,
+    }
+}
+
+/// Refuse up front a request whose prompt plus budget cannot fit the context. The CUDA engine
+/// refuses it at seating; the AMD batch only noticed when the slot's position ran past the
+/// context, and that failed every request in the batch.
+pub(crate) fn context_overflow(max_ctx: Option<usize>, n_prompt: usize, max_tokens: usize) -> Option<RuntimeError> {
+    let ctx = max_ctx?;
+    let total = n_prompt.saturating_add(max_tokens.max(1));
+    (total > ctx).then(|| {
+        RuntimeError::ContextLength(format!(
+            "prompt ({n_prompt} tokens) + max_tokens ({max_tokens}) = {total} exceeds the context {ctx}"
+        ))
+    })
+}
+
 impl Default for GenParams {
     fn default() -> Self {
         GenParams {
@@ -106,6 +129,25 @@ mod tests {
     #[test]
     fn generation_default_allows_long_responses() {
         assert_eq!(GenParams::default().max_tokens, 4096);
+    }
+
+    #[test]
+    fn default_budget_fits_the_context_the_prompt_leaves() {
+        use super::default_max_tokens;
+        assert_eq!(default_max_tokens(4096, Some(16384), 14000), 2384);
+        assert_eq!(default_max_tokens(4096, Some(16384), 100), 4096);
+        // At or past the context the prompt is refused as too long, not given a zero budget.
+        assert_eq!(default_max_tokens(4096, Some(16384), 16384), 4096);
+        assert_eq!(default_max_tokens(4096, None, 14000), 4096);
+    }
+
+    #[test]
+    fn prompt_plus_budget_past_the_context_is_a_context_error() {
+        use super::context_overflow;
+        assert!(context_overflow(Some(16384), 14000, 2384).is_none());
+        assert!(matches!(context_overflow(Some(16384), 14000, 2385), Some(RuntimeError::ContextLength(_))));
+        assert!(matches!(context_overflow(Some(16384), 16384, 4096), Some(RuntimeError::ContextLength(_))));
+        assert!(context_overflow(None, 1 << 30, 1 << 30).is_none());
     }
 
     fn fault(fatal: bool) -> RuntimeError {
@@ -954,8 +996,24 @@ async fn trace_handler(
     ([("content-type", "application/json")], state.trace_json()).into_response()
 }
 
-async fn healthz() -> &'static str {
-    "ok"
+async fn healthz(
+    axum::extract::State(state): axum::extract::State<Arc<AppState>>,
+) -> (axum::http::StatusCode, String) {
+    let dead: Vec<String> = state
+        .model_metrics
+        .read()
+        .iter()
+        .filter(|(_, m)| m.engine_dead.load(std::sync::atomic::Ordering::Relaxed))
+        .map(|(slug, _)| slug.clone())
+        .collect();
+    if dead.is_empty() {
+        (axum::http::StatusCode::OK, "ok".into())
+    } else {
+        (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            format!("engine dead (fatal device fault): {}", dead.join(",")),
+        )
+    }
 }
 
 async fn metrics_handler(
@@ -1104,6 +1162,29 @@ pub(crate) fn api_error_for(err: &RuntimeError) -> axum::response::Response {
         _ => ("server_error", None),
     };
     api_error(status, err.to_string(), kind, code, None)
+}
+
+#[cfg(test)]
+mod health_tests {
+    use super::{healthz, AppState};
+    use axum::http::StatusCode;
+    use std::sync::{atomic::Ordering, Arc};
+
+    /// A poisoned CUDA context rejects every request; `/health` must say so, or an
+    /// orchestrator keeps routing traffic to an instance that can never answer.
+    #[tokio::test]
+    async fn health_reports_a_dead_engine() {
+        let backend: Arc<dyn crate::device::Backend> = Arc::new(crate::device::cpu::CpuBackend::new(1));
+        let execset = Arc::new(crate::exec::ExecutorSet::bringup(backend).unwrap());
+        let state = Arc::new(AppState::new(crate::orch::Registry::new(), execset));
+        let metrics = state.model_metrics("m");
+        let (code, _) = healthz(axum::extract::State(Arc::clone(&state))).await;
+        assert_eq!(code, StatusCode::OK);
+        metrics.engine_dead.store(true, Ordering::Relaxed);
+        let (code, body) = healthz(axum::extract::State(state)).await;
+        assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(body.contains('m'));
+    }
 }
 
 #[cfg(test)]

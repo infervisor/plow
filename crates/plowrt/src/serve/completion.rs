@@ -167,7 +167,11 @@ async fn completions_with(
         }
     }
 
-    if let Err(e) = req.sampling.validate() {
+    if let Err(e) = req
+        .sampling
+        .validate()
+        .and_then(|()| crate::serve::openai::validate_limits(req.max_tokens, req.stop.as_ref()))
+    {
         return crate::serve::api_error(
             axum::http::StatusCode::BAD_REQUEST,
             e.message,
@@ -284,6 +288,12 @@ async fn completions_with(
         );
     }
     let n_prompt = prompt_ids.len();
+    if req.max_tokens.is_none() {
+        gen.max_tokens = crate::serve::default_max_tokens(gen.max_tokens, state.max_ctx(&req.model), n_prompt);
+    }
+    if let Some(e) = crate::serve::context_overflow(state.max_ctx(&req.model), n_prompt, gen.max_tokens) {
+        return crate::serve::api_error_for(&e);
+    }
     let (tx, rx) = stream_mod::channel();
     let response_prompt_ids = req.return_token_ids.then(|| prompt_ids.clone());
     let lp_fmt = logprobs.map(|_| crate::serve::logprobs::TokenText {

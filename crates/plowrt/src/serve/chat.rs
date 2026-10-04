@@ -175,7 +175,11 @@ async fn chat_completions_with(
             Some("messages".into()),
         );
     }
-    if let Err(e) = req.sampling.validate() {
+    if let Err(e) = req
+        .sampling
+        .validate()
+        .and_then(|()| crate::serve::openai::validate_limits(req.max_tokens, req.stop.as_ref()))
+    {
         return crate::serve::api_error(
             axum::http::StatusCode::BAD_REQUEST,
             e.message,
@@ -371,6 +375,21 @@ async fn chat_completions_with(
         bundle.tokenizer().encode(&prompt)
     });
     let n_prompt = prompt_ids.len();
+    if prompt_ids.is_empty() {
+        return crate::serve::api_error(
+            axum::http::StatusCode::BAD_REQUEST,
+            "the conversation renders to zero prompt tokens",
+            "invalid_request_error",
+            Some("invalid_prompt"),
+            Some("messages".into()),
+        );
+    }
+    if req.max_tokens.is_none() {
+        gen.max_tokens = crate::serve::default_max_tokens(gen.max_tokens, state.max_ctx(&req.model), n_prompt);
+    }
+    if let Some(e) = crate::serve::context_overflow(state.max_ctx(&req.model), n_prompt, gen.max_tokens) {
+        return crate::serve::api_error_for(&e);
+    }
     let lp_fmt = gen.params.logprobs.map(|_| crate::serve::logprobs::TokenText {
         tok: bundle.tokenizer().clone(),
         as_ids: req.return_tokens_as_token_ids.unwrap_or(false),
