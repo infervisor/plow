@@ -706,6 +706,7 @@ pub mod packed_prefill;
 pub mod kv_shared_tail;
 
 pub mod packet_pipeline;
+pub mod serve_manifest;
 
 pub mod hetero;
 pub mod hetero_channel;

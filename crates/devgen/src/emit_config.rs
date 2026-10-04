@@ -1243,6 +1243,11 @@ pub struct EmitConfig {
     #[arg(long = "emit-gen-kernels", env = "PLOW_EMIT_GEN_KERNELS")]
     pub gen_kernels: Option<String>,
 
+    /// Serve-knob defaults carried in the packet's `serve.json`, `KEY=VALUE` comma-separated
+    /// (a recipe's qualified `[serve.env]`); plowrt applies each unless the environment sets it.
+    #[arg(long = "emit-serve-defaults", env = "PLOW_EMIT_SERVE_DEFAULTS")]
+    pub serve_defaults: Option<String>,
+
     /// Select the packet-declared native FP8 prefill GEMM role.
     #[arg(long, env = "PLOW_FP8_PF_GEMM_ROLE", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub fp8_pf_gemm_role: bool,
@@ -1677,6 +1682,7 @@ impl EmitConfig {
             gemma4_sm90_hd256_gqa2_wide: env_bool("PLOW_GEMMA4_SM90_HD256_GQA2_WIDE"),
             gemma4_sm90_hd512_px4_bq64_role: env_bool("PLOW_GEMMA4_SM90_HD512_PX4_BQ64_ROLE"),
             gen_kernels: env_str("PLOW_EMIT_GEN_KERNELS"),
+            serve_defaults: env_str("PLOW_EMIT_SERVE_DEFAULTS"),
             fp8_pf_gemm_role: env_bool("PLOW_FP8_PF_GEMM_ROLE"),
             fp8_pf_isolate: env_bool("PLOW_QWEN_FP8_PF_ISOLATE"),
             attention_pf_role: env_bool("PLOW_ATTENTION_PF_ROLE"),

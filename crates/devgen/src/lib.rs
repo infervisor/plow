@@ -52,6 +52,7 @@ pub mod gemm_policy;
 use checkpoint::{layer_scalars, validate_coverage};
 mod attention_prefill_role;
 mod gen_kernels;
+mod serve_section;
 mod gemma4_gemm_glu_role;
 mod gemma4_w8a8_gemm_glu_role;
 mod w8a16_prefill_role;
@@ -10567,6 +10568,12 @@ fn emit_dense_gqa(
                 serde_json::to_vec(&packed).expect("serialize packed prefill manifest");
         }
     }
+    if !block_mode {
+        sections.push(
+            serve_section::section(&dir, ecfg.serve_defaults.as_deref())
+                .unwrap_or_else(|error| panic!("serve manifest: {error}")),
+        );
+    }
     let lean = apply_verify_gate(&m, verify.as_ref());
     modular::update_section_with_lean(&mut sections, &lean);
     let blob = if sections.is_empty() {
@@ -10672,7 +10679,7 @@ fn emit_dense_gqa(
     if let Some(dir) = ecfg.tts_codec.as_deref().filter(|_| !block_mode) {
         let sites = whole_graph_audio_sites().0;
         let (model, section) = codec::lower_snac(dir, n_cu, m.target, sites).unwrap_or_else(|error| panic!("codec packet: {error}"));
-        let path = std::path::Path::new(&out).with_file_name("codec.pkt");
+        let path = std::path::Path::new(&out).with_file_name(tts::CODEC_PACKET);
         speech_ops |= manifest::speech_ops(&model);
         write_sidecar_packet(&path, &model, &[section]);
         eprintln!("  codec packet -> {}", path.display());
@@ -10686,7 +10693,7 @@ fn emit_dense_gqa(
         eprintln!("  s3gen packet -> {}", path.display());
     }
     if let Some((model, section)) = audio_blob {
-        let path = std::path::Path::new(&out).with_file_name("encoder.pkt");
+        let path = std::path::Path::new(&out).with_file_name(asr::qwen::ENCODER_PACKET);
         speech_ops |= manifest::speech_ops(&model);
         write_sidecar_packet(&path, &model, &[section]);
         eprintln!("  audio encoder packet -> {}", path.display());
