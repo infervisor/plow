@@ -145,7 +145,7 @@ async fn completions_with(
             use crate::serve::manager::EnsureError;
             if let Err(e) = mgr.ensure_resident(&req.model).await {
                 return match e {
-                    EnsureError::WontFit { .. } => (
+                    EnsureError::WontFit { .. } | EnsureError::SwitchTimeout(_) => (
                         axum::http::StatusCode::SERVICE_UNAVAILABLE,
                         [("retry-after", "30")],
                         Json(serde_json::json!({"error": e.to_string()})),
@@ -243,11 +243,19 @@ async fn completions_with(
     };
     let encode = |text: &str| {
         crate::obs::ttft::timed(&crate::obs::ttft::ENCODE, || {
-            bundle
-                .tokenizer()
-                .encode_with_special_tokens(text, req.add_special_tokens)
+            crate::serve::encode_prompt(text, |t| {
+                bundle.tokenizer().encode_with_special_tokens(t, req.add_special_tokens)
+            })
         })
     };
+    let text_bytes = match &req.prompt {
+        PromptSpec::Text(text) => text.len(),
+        PromptSpec::Batch(v) => v.iter().map(String::len).sum(),
+        PromptSpec::Tokens(_) | PromptSpec::TokenBatch(_) => 0,
+    };
+    if let Some(e) = crate::serve::prompt_bytes_overflow(state.max_ctx(&req.model), bundle.tokenizer().max_token_bytes(), text_bytes) {
+        return crate::serve::api_error_for(&e);
+    }
     let prompt_ids = match &req.prompt {
         PromptSpec::Text(text) => encode(text),
         PromptSpec::Tokens(ids) => ids.clone(),

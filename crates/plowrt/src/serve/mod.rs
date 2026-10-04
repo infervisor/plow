@@ -106,6 +106,31 @@ pub(crate) fn context_overflow(max_ctx: Option<usize>, n_prompt: usize, max_toke
     })
 }
 
+/// Refuse, before encoding, a prompt too long for the context under any tokenization: it has more
+/// than `max_ctx` tokens once no token can cover all `max_token_bytes` of its share.
+pub(crate) fn prompt_bytes_overflow(max_ctx: Option<usize>, max_token_bytes: usize, bytes: usize) -> Option<RuntimeError> {
+    let ctx = max_ctx?;
+    (bytes / max_token_bytes.max(1) > ctx).then(|| {
+        RuntimeError::ContextLength(format!("prompt ({bytes} bytes) has more tokens than the context {ctx}"))
+    })
+}
+
+/// Prompts at least this long encode with [`tokio::task::block_in_place`]: a 64 KiB prompt already
+/// takes tens of ms, and a 64 MiB one stalled every connection on its worker, `/health` included.
+const BLOCKING_ENCODE_BYTES: usize = 64 * 1024;
+
+pub(crate) fn encode_prompt(text: &str, encode: impl FnOnce(&str) -> Vec<u32>) -> Vec<u32> {
+    let multi_thread = || {
+        tokio::runtime::Handle::try_current()
+            .is_ok_and(|h| h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread)
+    };
+    if text.len() >= BLOCKING_ENCODE_BYTES && multi_thread() {
+        tokio::task::block_in_place(|| encode(text))
+    } else {
+        encode(text)
+    }
+}
+
 impl Default for GenParams {
     fn default() -> Self {
         GenParams {
@@ -148,6 +173,28 @@ mod tests {
         assert!(matches!(context_overflow(Some(16384), 14000, 2385), Some(RuntimeError::ContextLength(_))));
         assert!(matches!(context_overflow(Some(16384), 16384, 4096), Some(RuntimeError::ContextLength(_))));
         assert!(context_overflow(None, 1 << 30, 1 << 30).is_none());
+    }
+
+    #[test]
+    fn a_prompt_longer_than_any_tokenization_fits_is_refused_unencoded() {
+        use super::prompt_bytes_overflow;
+        let byte = crate::text::tokenizer::ByteTokenizer;
+        let tok: &dyn crate::text::tokenizer::Tokenize = &byte;
+        assert!(prompt_bytes_overflow(Some(8), tok.max_token_bytes(), 8).is_none());
+        assert!(matches!(prompt_bytes_overflow(Some(8), tok.max_token_bytes(), 9), Some(RuntimeError::ContextLength(_))));
+        assert!(prompt_bytes_overflow(Some(8), 400, 8 * 400 + 399).is_none());
+        assert!(prompt_bytes_overflow(Some(8), 400, 9 * 400).is_some());
+        assert!(prompt_bytes_overflow(Some(8), usize::MAX, usize::MAX).is_none());
+        assert!(prompt_bytes_overflow(None, 1, usize::MAX).is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_long_prompt_encodes_off_the_worker_with_the_same_ids() {
+        let long = "a".repeat(super::BLOCKING_ENCODE_BYTES + 1);
+        let tok = crate::text::tokenizer::ByteTokenizer;
+        use crate::text::tokenizer::Tokenize;
+        assert_eq!(super::encode_prompt(&long, |t| tok.encode(t)).len(), long.len());
+        assert_eq!(super::encode_prompt("hi", |t| tok.encode(t)), vec![104, 105]);
     }
 
     fn fault(fatal: bool) -> RuntimeError {

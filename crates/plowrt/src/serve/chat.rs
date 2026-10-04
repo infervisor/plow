@@ -98,7 +98,7 @@ async fn chat_completions_with(
             use crate::serve::manager::EnsureError;
             if let Err(e) = mgr.ensure_resident(&req.model).await {
                 return match e {
-                    EnsureError::WontFit { .. } => (
+                    EnsureError::WontFit { .. } | EnsureError::SwitchTimeout(_) => (
                         axum::http::StatusCode::SERVICE_UNAVAILABLE,
                         [("retry-after", "30")],
                         Json(serde_json::json!({"error": e.to_string()})),
@@ -390,15 +390,18 @@ async fn chat_completions_with(
     let ingress = mux.ingress();
     // Tokenize HERE, on the handler task — the dispatcher loop is the
     // serialized decode critical path and must never encode a long prompt.
-    // `ThinkTag` unconditionally: the splitter's own `Deciding` state settles
-    // after the first few bytes of generation, so a model that never reasons
-    // costs at most a 7-byte delay on its first chunk and nothing after. What
-    // the PROMPT decides is only whether the trace is already open (GLM leaves
-    // it dangling; Qwen3 and DeepSeek-R1 emit the marker themselves).
+    // The packet's reasoning markers (`<think>` for a legacy packet): the splitter's own
+    // `Deciding` state settles after the first few bytes of generation, so a model that never
+    // reasons costs at most a marker-length delay on its first chunk. What the PROMPT decides is
+    // only whether the trace is already open (GLM leaves it dangling; Qwen3 and DeepSeek-R1 emit
+    // the marker themselves).
     let reasoning_mode = crate::serve::reasoning::ReasoningMode::for_bundle(&bundle);
     let reasoning_open = reasoning_mode.prompt_opens(&prompt);
+    if let Some(e) = crate::serve::prompt_bytes_overflow(state.max_ctx(&req.model), bundle.tokenizer().max_token_bytes(), prompt.len()) {
+        return crate::serve::api_error_for(&e);
+    }
     let prompt_ids = crate::obs::ttft::timed(&crate::obs::ttft::ENCODE, || {
-        bundle.tokenizer().encode(&prompt)
+        crate::serve::encode_prompt(&prompt, |p| bundle.tokenizer().encode(p))
     });
     let n_prompt = prompt_ids.len();
     if prompt_ids.is_empty() {

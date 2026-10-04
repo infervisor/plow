@@ -493,10 +493,14 @@ async fn decode_all(model: &SpeechModel, codes: &[i32], frames: usize, seed: u64
         let e = (s + step).min(frames);
         let (ws, we) = (s.saturating_sub(window), (e + window).min(frames));
         let w = model.codec.decode(codes[ws * fc..we * fc].to_vec(), we - ws, seed ^ s as u64, Urgency::Whole).await?;
-        pcm.extend_from_slice(&w[(s - ws) * fs..(e - ws) * fs]);
+        pcm.extend_from_slice(w.get((s - ws) * fs..(e - ws) * fs).ok_or_else(|| short_window(w.len(), we - ws))?);
         s = e;
     }
     Ok(pcm)
+}
+
+fn short_window(samples: usize, frames: usize) -> String {
+    format!("codec returned {samples} samples for a {frames}-frame window")
 }
 
 /// Drain the LM stream promptly (the mux cuts a consumer that falls behind) keeping the codes.
@@ -581,8 +585,11 @@ async fn stream_task(
             let urgency = if emitted == 0 { Urgency::First } else { Urgency::Stream };
             match model.codec.decode(window, e - s, seed ^ (emitted as u64).wrapping_mul(0x9E37_79B9), urgency).await {
                 Ok(pcm) => {
+                    let Some(fresh) = pcm.get((emitted - s) * fs..(upto - s) * fs) else {
+                        return drop(out.send(Err(std::io::Error::other(short_window(pcm.len(), e - s)))).await);
+                    };
                     let mut bytes = Vec::new();
-                    pcm16(&pcm[(emitted - s) * fs..(upto - s) * fs], &mut bytes);
+                    pcm16(fresh, &mut bytes);
                     first.get_or_insert_with(|| t_arrive.elapsed());
                     run.audio((upto - emitted) * fs, sr);
                     if out.send(Ok(bytes)).await.is_err() {
