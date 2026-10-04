@@ -3102,31 +3102,42 @@ fn evict_one(s: &Shared, inner: &mut Inner, preserve_hot: bool) -> bool {
     // A radix lease protects shared KV, but snapshots are only needed while
     // restoring an attachment. Protect the most recently reused snapshot
     // against unique-tail bursts; the rest remain LRU so new prefixes fit.
+    // A session's own boundary attached once is spent, not hot.
     let protected = inner.published.values().flatten()
-        .filter(|snap| snap.users == 0 && snap.referenced)
+        .filter(|snap| {
+            snap.users == 0 && snap.referenced
+                && (!snap.session || snap.tail.is_empty() || snap.attaches >= 2)
+        })
         .max_by_key(|snap| snap.last_used)
         .map(|snap| snap.va);
     // One unit: the LRU boundary (a session's newest, after `retire_superseded`) and the
     // blocks that become dead with it. A boundary inside a block serves only its exact
     // tail, the whole-block checkpoint under the same node every continuation: that tailed
-    // one goes first. A boundary attached twice or more is a shared prefix (a system
-    // prompt) and goes last; a session-pinned one (`pin_prefix`) or a shared-prefix end
-    // (a system prompt below one block sits on no pinnable node) just before it.
+    // one goes first, then a session's boundary its next turn already attached (spent: that
+    // turn runs now; `retire_superseded` frees it at the turn's prompt end) and a session's
+    // whole-block checkpoint under its tailed boundary. A boundary attached twice or more is
+    // a shared prefix (a system prompt) and goes last; a session-pinned one (`pin_prefix`) or
+    // a shared-prefix end (a system prompt below one block sits on no pinnable node) just
+    // before it.
     let pinned = inner.cache.pinned();
     if let Some((node, index)) = inner.published.iter()
         .flat_map(|(&node, snaps)| {
             let checkpoint = node.is_some() && snaps.iter().any(|snap| snap.tail.is_empty());
+            let tailed = snaps.iter().any(|snap| snap.session && !snap.tail.is_empty());
             let pin = node.is_some_and(|key| pinned.contains(&key));
-            // A session's tailed boundary is its next turn's attach point, not a replay.
             snaps.iter().enumerate().map(move |(i, snap)| {
-                (node, i, snap, pin, checkpoint && !snap.tail.is_empty() && !snap.session)
+                let covered = checkpoint && !snap.tail.is_empty() && !snap.session;
+                let spent = snap.session
+                    && (!snap.tail.is_empty() && snap.attaches == 1
+                        || snap.tail.is_empty() && tailed && snap.attaches == 0);
+                (node, i, snap, pin, if covered { 0u8 } else if spent { 1 } else { 2 })
             })
         })
-        .filter(|(_, _, snap, _, _)| snap.users == 0 && Some(snap.va) != protected)
-        .min_by_key(|(_, _, snap, pin, covered)| {
-            (snap.attaches >= 2, *pin || snap.share, !covered, snap.last_used)
+        .filter(|(_, _, snap, ..)| snap.users == 0 && Some(snap.va) != protected)
+        .min_by_key(|(_, _, snap, pin, rank)| {
+            (snap.attaches >= 2, *pin || snap.share, *rank, snap.last_used)
         })
-        .map(|(node, index, _, _, _)| (node, index))
+        .map(|(node, index, ..)| (node, index))
     {
         let before = inner.stats.cache_bytes;
         remove_snapshot(s, inner, node, index);
@@ -5051,6 +5062,38 @@ mod tests {
         p.begin_seq(1);
         p.ensure_rows(1, 1).unwrap();
         assert_eq!(p.try_attach(1, &t2).unwrap().map(|a| a.rows), Some(9));
+    }
+
+    /// Publishes a 12-row session boundary of `pr` from `seq`, leaving the sequence running.
+    fn session_boundary(p: &VmmKv, seq: usize, pr: &[u32]) {
+        assert!(p.try_attach(seq, pr).unwrap().is_none());
+        p.ensure_rows(seq, 13).unwrap();
+        p.note_session(seq, pr);
+        p.publish_at(seq, pr, 12, 48, |_| Ok(())).unwrap();
+        p.pin_prefix(pr, std::time::Instant::now() + std::time::Duration::from_secs(600));
+    }
+
+    /// A session boundary already attached (its session runs that turn) goes before an older
+    /// idle one still waiting for its turn.
+    #[test]
+    fn spent_session_boundary_goes_before_an_idle_one() {
+        let p = pool(Arc::new(MockVmm::default()));
+        let a = prompt(13);
+        let b: Vec<u32> = a.iter().map(|t| t + 1).collect();
+        session_boundary(&p, 1, &b);
+        p.begin_seq(1);
+        session_boundary(&p, 0, &a);
+        p.begin_seq(0);
+        p.ensure_rows(0, 1).unwrap();
+        assert_eq!(p.try_attach(0, &a).unwrap().map(|x| x.rows), Some(12));
+        p.finish_attach(0);
+        {
+            let mut inner = p.shared.inner.lock();
+            assert!(evict_one(&p.shared, &mut inner, false));
+        }
+        p.begin_seq(0);
+        p.ensure_rows(1, 1).unwrap();
+        assert_eq!(p.try_attach(1, &b).unwrap().map(|x| x.rows), Some(12), "the idle boundary stays");
     }
 
     /// A request waiting on a session's in-flight prompt keeps the whole-block checkpoint it
@@ -7814,3 +7857,7 @@ mod tests {
 #[cfg(test)]
 #[path = "vmm_ring_tests.rs"]
 mod ring_tests;
+
+#[cfg(test)]
+#[path = "vmm_sim_tests.rs"]
+mod sim_tests;

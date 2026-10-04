@@ -467,7 +467,13 @@ master switch and disables every side effect.
 
 Eviction runs a soft cap — `PLOW_VMM_CACHE_MIB`, else 5% of device memory —
 dropping output-only boundaries first, then zero-reference leaf nodes, then
-snapshots by least-recent use.
+snapshots by least-recent use. A session boundary its next turn already
+attached is spent (that turn runs now) and goes before the idle ones. A
+session's prompt-end boundary stops 8 rows short of the prompt end: the next
+turn re-renders the last prompt rows (Gemma 4 drops the generation prompt's
+empty thought channel, 4 tokens), so a boundary inside them never attached —
+about one turn in eight. `memory/vmm_sim_tests.rs` replays agentic traces
+against the real pool on a byte-accounting driver.
 
 ---
 

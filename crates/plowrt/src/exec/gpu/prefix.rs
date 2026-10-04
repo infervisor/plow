@@ -759,6 +759,10 @@ impl GpuEngine {
         let rows = self.pos[b];
         let toks = &self.seq_tokens[b];
         let g = v.kv.geometry();
+        let session = self.session_pin[b].is_some();
+        let prompt = v.kv.prompt_rows(b);
+        let prompt_end = rows == prompt && max_rows < rows;
+        let max_rows = if session && prompt_end { session_prompt_end(prompt) } else { max_rows };
         let p_a = (rows.min(max_rows) / 32) * 32;
         tracing::info!(
             slot = b,
@@ -778,7 +782,7 @@ impl GpuEngine {
             tracing::info!(slot = b, p_a, "vmm_publish skipped: p_a == 0");
             return;
         }
-        if self.session_pin[b].is_some() {
+        if session {
             v.kv.note_session(b, toks);
         }
         let step = crate::config::RuntimeConfig::get()
@@ -788,8 +792,6 @@ impl GpuEngine {
         // chunk end inside the prompt (`retire_superseded`), and its reply rows are re-rendered:
         // those snapshots are transient, and each one's trim evicts another session's boundary.
         // Publish them only for a request waiting on this prefill (`inflight_prefix`).
-        let session = self.session_pin[b].is_some();
-        let prompt = v.kv.prompt_rows(b);
         let mut p = step;
         while p < p_a {
             if !session || v.kv.checkpoint_awaited(toks, p) {
@@ -805,7 +807,6 @@ impl GpuEngine {
         // re-tokenize to the generated ids, so the turn-end boundary may not match it and the
         // prompt-end boundary must survive until then.
         let published = self.publish_boundary(b, p_a);
-        let prompt_end = rows == prompt && max_rows < rows;
         if let Some(ttl) = self.session_pin[b].filter(|_| published && prompt_end) {
             // Pinned now, not at retire: while this turn decodes, other sessions' publishes
             // must not evict it ahead of idle sessions' boundaries.
@@ -818,7 +819,7 @@ impl GpuEngine {
         // Turn end: pressure may have evicted the prompt end (the next turn's attach point)
         // while this turn decoded. The rings still hold its window, so restore it now, newest in
         // LRU just before the session's next request; a surviving one is only touched.
-        let end = prompt.saturating_sub(1) / 32 * 32;
+        let end = session_prompt_end(prompt) / 32 * 32;
         if session && rows > prompt && end > 0 && end < p_a {
             self.publish_boundary(b, end);
         }
@@ -870,4 +871,13 @@ impl GpuEngine {
         };
         v.kv.inflight_prefix(b, prompt, lookback, &self.pos)
     }
+}
+
+/// Rows a session's prompt-end boundary may cover: its next turn re-renders the last few prompt
+/// rows (Gemma 4 drops the generation prompt's empty thought channel, 4 tokens), so a boundary
+/// within them never attaches — about one turn in eight missed that way.
+const SESSION_PROMPT_REWRITE: u32 = 8;
+
+fn session_prompt_end(prompt: u32) -> u32 {
+    prompt.saturating_sub(1 + SESSION_PROMPT_REWRITE)
 }

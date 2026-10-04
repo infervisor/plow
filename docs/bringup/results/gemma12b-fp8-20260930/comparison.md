@@ -8,7 +8,7 @@ experiment).
 ## Qualified wins (MATCHED + EQUIVALENT, `campaign.py report` exit 0)
 
 - Infervisor: plowrt `66e90a4b` (gemma12b-next), packet `c47fc3f20569`, built by `campaign.py
-  build` from [`scripts/campaign/recipes/gemma4-12b.h100.fp8kv-16k-c128.toml`](../../../../scripts/campaign/recipes/gemma4-12b.h100.fp8kv-16k-c128.toml)
+  build` from [`recipes/infervisor/gemma-4-12b/sm90a-h100-tp1.toml`](../../../../recipes/infervisor/gemma-4-12b/sm90a-h100-tp1.toml)
   (FP8 W8A8 weights, FP8 per-token-head KV, 16K context, 128 decode slots, prefix cache on).
 - Baseline: vLLM 0.28.0 with matched `fp8_per_token_head` KV. That KV dtype runs only on
   TRITON_ATTN (FLASHINFER rejects it, FLASH_ATTN does not list it). Probe at 4K/128 c32, out tok/s:
@@ -44,8 +44,8 @@ Caveats:
 - agentic16k c128 is unstable across repeats: 539 vs 290 out tok/s, prefix token hits 75.6% vs
   25.8% in r2.
 - Host load average (1-minute) during the closed-loop lease: median 1.4, max 7.8.
-- No production TOML under `recipes/infervisor` exists for this model yet; the recipe above is
-  still in the experimental area.
+- The recipe moved from `scripts/campaign/recipes/gemma4-12b.h100.fp8kv-16k-c128.toml` to
+  production after this run (label and gate table only; routes and flags unchanged).
 
 Evidence (campaign scratch):
 - Closed loop: `/opt/dlami/nvme/lava-tts/final2/` (`report/` strict reports, `res/` raw,

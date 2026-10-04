@@ -339,7 +339,7 @@ in `NVCC_APPEND_FLAGS`; the system g++ 15 fails in `cuda_fp16.h`).
 
 ## Gemma-4 12B FP8 per-rung routes (H100, FP8 KV, 16K, 128 slots)
 
-Recipe `scripts/campaign/recipes/gemma4-12b.h100.fp8kv-16k-c128.toml`; control = the same packet
+Recipe `recipes/infervisor/gemma-4-12b/sm90a-h100-tp1.toml`; control = the same packet
 without the generated roles, the decode defines and with the 64 rung. `step_bench`, 2 reps
 (agree within 0.3%). Floors: `op_roof` at 3210 GB/s / dense peak, rows-linear for packs
 (approximate).
