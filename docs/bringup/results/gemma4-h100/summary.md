@@ -7,7 +7,7 @@ rows marked "grid" come from `llm_grid.sh` or earlier same-client grids and are 
 | Model | Precision | Recipe | plowrt | Gate | vs baseline | Qualified |
 |---|---|---|---|---|---|---|
 | E4B | BF16 | [`recipes/infervisor/gemma-4-e4b/sm90a-h100-tp1.toml`](../../../../recipes/infervisor/gemma-4-e4b/sm90a-h100-tp1.toml) | main `fc0271e8` (repro) | `llm_logit_parity` PASS | grid only | no strict report |
-| 12B | FP8 W8A8, FP8 per-token-head KV | [`scripts/campaign/recipes/gemma4-12b.h100.fp8kv-16k-c128.toml`](../../../../scripts/campaign/recipes/gemma4-12b.h100.fp8kv-16k-c128.toml) | `66e90a4b` | `llm_fp32_ref` PASS | strict, 10 cells | **yes**, vs vLLM 0.28 FP8 KV |
+| 12B | FP8 W8A8, FP8 per-token-head KV | [`recipes/infervisor/gemma-4-12b/sm90a-h100-tp1.toml`](../../../../recipes/infervisor/gemma-4-12b/sm90a-h100-tp1.toml) | `66e90a4b` | `llm_fp32_ref` PASS | strict, 10 cells | **yes**, vs vLLM 0.28 FP8 KV |
 | 12B, 26B-A4B | BF16 | `scripts/campaign/recipes/gemma4-{12b,26b-a4b}.h100.bf16-*.toml` | | | ledgers only | no |
 | 31B | BF16 / FP8 | frozen release, no recipe | `3ca64e9` / `25fb3d7` | functional | none on H100 | no |
 
@@ -48,8 +48,7 @@ Campaign comparison with the qualified wins, strict tables and FP32 gate:
 [comparison.csv](../gemma12b-fp8-20260930/comparison.csv).
 
 - Qualified: plowrt `66e90a4b`, packet `c47fc3f20569`, recipe
-  `scripts/campaign/recipes/gemma4-12b.h100.fp8kv-16k-c128.toml` (no `recipes/infervisor`
-  production TOML yet). Baseline vLLM 0.28.0 TRITON_ATTN with matched `fp8_per_token_head` KV,
+  `recipes/infervisor/gemma-4-12b/sm90a-h100-tp1.toml` (production). Baseline vLLM 0.28.0 TRITON_ATTN with matched `fp8_per_token_head` KV,
   prefix caching on both, one H100, 2 repeats.
 - Gate: `llm_fp32_ref` PASS for that packet, KL mean 0.1076 vs vLLM 0.1277.
 - Total-throughput ratio (strict): 4K/128 1.38x / 1.37x (c32 / c128); 15K/128 1.79x / 1.74x;

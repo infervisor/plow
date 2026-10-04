@@ -1,8 +1,13 @@
-# Gemma-4-12B-it FP8 (hub checkpoint, re-keyed), H100 SXM5, FP8 KV, 16K context, 128 decode slots:
-# the per-rung route selection trial. Control = the 16K/128-slot FP8-KV packet this recipe extends
-# (campaign scratch production-16k128-fp8kv/recipe.toml); every difference below is a measured
-# per-rung route choice. FP32-reference gate (llm_fp32_ref, peer = cached vLLM 0.28 captures):
-# PASS, KL mean 0.109 vs vLLM 0.128. Matched vLLM serving not yet run.
+# Gemma-4-12B-it FP8 (hub checkpoint, re-keyed) on H100 SXM5: FP8 W8A8 weights, FP8 per-token-head
+# KV, 16K context, 128 decode slots, prefix cache on. Production recipe for this model/GPU/precision.
+#
+#   PLOW_CAMPAIGN_NO_NIX=1 (box without nix only) \
+#   python3 scripts/campaign/campaign.py build recipes/infervisor/gemma-4-12b/sm90a-h100-tp1.toml --out <fresh dir>
+#
+# Qualified (2026-10-04, plowrt 66e90a4b, packet c47fc3f20569): campaign.py report MATCHED + EQUIVALENT
+# vs vLLM 0.28 fp8_per_token_head KV on every 4K/15K/agentic16k/open-loop cell; FP32-reference gate
+# PASS, KL mean 0.108 vs vLLM 0.128. docs/bringup/results/gemma12b-fp8-20260930/comparison.md.
+# vLLM with BF16 KV (FLASH_ATTN) is still faster than this packet: same doc, Caveats.
 #
 # Routes (per-rung evidence: docs/runtime/kernel-generators.md "Gemma-4 12B FP8 per-rung routes"):
 #   prefill projections   cuBLASLt FP8 OUTER_VEC where it wins (segment_roles::cublaslt_prefill_fp8),
@@ -20,8 +25,9 @@
 schema = "plow.recipe.v1"
 namespace = "infervisor"
 name = "gemma-4-12b"
-label = "sm90a-h100-tp1-fp8kv-16k-c128-routes"
-status = "emits"
+label = "sm90a-h100-tp1"
+status = "validated"
+plow_git = "66e90a4b3a3a847838771a6a0dcb3b5e05923e0d"
 network = "gemma4"
 
 [target]
@@ -136,6 +142,14 @@ in_lens = "128 1024 4096 7000 15000"
 concs = "16 32 64 128"
 nprompt = 384
 serve_env = { PLOW_DECODE_MAX_RUNG = "128" }
+
+# FP32-reference gate (scripts/llm/fp32_ref_gate.py): GEMMA12B_FP32_REF = the cached FP32 ref.json,
+# GEMMA12B_FP32_VLLM = the vLLM 0.28 capture against it (this box: /opt/dlami/nvme/lava-tts/fp32gate/).
+[gates]
+python = "{env:PYREF}"
+[gates.llm_fp32_ref]
+reference = "{env:GEMMA12B_FP32_REF}"
+vllm_capture = "{env:GEMMA12B_FP32_VLLM}"
 
 [reference]
 csv = "perf-data/campaign/gemma4-12b.h100.reference-vllm028-fp8.csv"
