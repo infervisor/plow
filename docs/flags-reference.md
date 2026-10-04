@@ -917,6 +917,11 @@ object hardcodes one full-attention KV head. Each `=0` is the rollback.
 `interp_sm90a_pfpackedfa_fp8kv.cubin` with both head shapes and `PLOW_NV_FA_PIPE=1`.
 It requires a packet with FP8 FlashPrefill and no BF16 FlashPrefill; test it with
 `PLOW_PF_SEG_FA512=all` before including it in a serving recipe.
+`PLOW_BUILD_FP8KV_GEMM=1` rebuilds `interp_sm90a_pfpackedgemm_fp8kv.cubin` (the GEMM object an
+FP8-KV packet loads) as the ws384 TMA GEMM-only body of `interp_sm90a_pfpackedgemm.cubin`.
+Without it that object stays the base emit's generic body (128 regs, 1.8 KB stack), so every
+native-routed FP8 projection runs 4-5x slower than the route matrix measured (12B down_proj at
+M=4096: 1.76 ms vs 0.37 ms). It requires a packed FP8-KV packet.
 
 Ablation-only `PLOW_BUILD_*` switches, default off, leave them off unless
 reproducing a specific finding: `FA_ROPE`, `FA_WGITEM`, `FP8KV`, `GEMM_OCC1`,
