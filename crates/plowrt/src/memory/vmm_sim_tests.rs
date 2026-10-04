@@ -5,8 +5,10 @@
 //! `session turn prompt_tokens` lines, run back to back on one pool), `SIM_KV` (fp8|bf16),
 //! `SIM_SLOTS`, `SIM_FREE_MIB` (free after load), `SIM_FLOOR_MIB`, `SIM_CHUNK` / `SIM_PF_TPS`
 //! (prefill launch rows / rows per second), `SIM_TTL_S`, `SIM_GAP_MS` (client round trip between
-//! turns), `SIM_MARGIN` (admission rows past prompt + output), and `SIM_SCALE` with `SIM_UNMAP_US` /
-//! `SIM_RELEASE_US` to pace the reclaimer thread in real time instead of draining it per call.
+//! turns), `SIM_MARGIN` (admission rows past prompt + output), `SIM_GROW` (map output rows as decode
+//! reaches them, preempting on failure), `SIM_RING_DECODE` (ring rows a slot keeps after its
+//! prefill: 1024 = paged sliding rings), and `SIM_SCALE` with `SIM_UNMAP_US` / `SIM_RELEASE_US` to
+//! pace the reclaimer thread in real time instead of draining it per call.
 use super::*;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex as StdMutex;
@@ -84,6 +86,9 @@ impl VmmOps for SimVmm {
 struct Kv {
     kv: VmmKv,
     ring: u32,
+    /// Ring rows a slot keeps once its prefill is done (`SIM_RING_DECODE`): a paged slot drops to
+    /// its window page, so a decode-time boundary is publishable only at its own frontier.
+    ring_decode: std::cell::Cell<u32>,
     window: u32,
     snap_row: u64,
     full_row: u64,
@@ -108,7 +113,8 @@ impl Kv {
     fn boundary_copied(&self, b: usize, toks: &[u32], p_a: u32) -> (bool, bool) {
         let copied = std::cell::Cell::new(false);
         let rows = toks.len() as u32;
-        if rows == 0 || p_a == 0 || rows - p_a > self.ring - self.window {
+        let ring = if rows > self.kv.prompt_rows(b) { self.ring_decode.get() } else { self.ring };
+        if rows == 0 || p_a == 0 || rows - p_a > ring - self.window {
             return (false, false);
         }
         if !self.kv.resolve_prefix_hazard(b, toks, p_a) {
@@ -174,6 +180,12 @@ struct Sess {
     toks: Vec<u32>,
     decoded: usize,
     admitted: u64,
+    /// Output tokens kept across a preemption (`SIM_GROW`): the re-admitted prompt carries them.
+    resumed: Option<usize>,
+    /// The turn's own prompt length while `prompt` carries preempted output.
+    base_len: Option<usize>,
+    /// Sim time this turn joined the queue.
+    queued_at: f64,
 }
 
 fn tokens_for(cell: u32, s: usize, t: usize, prev: &[u32], prev_len: usize, len: usize) -> Vec<u32> {
@@ -252,6 +264,7 @@ fn vmm_sim_agentic() {
     let k = Kv {
         kv,
         ring: 2048,
+        ring_decode: std::cell::Cell::new(env_u64("SIM_RING_DECODE", 2048) as u32),
         window: 1024,
         snap_row: 40 * 2 * 8 * 256 * elem as u64,
         full_row: 16 * 512 * elem as u64,
@@ -259,7 +272,19 @@ fn vmm_sim_agentic() {
         republish: std::cell::Cell::new((0, 0)),
     };
     let ttl = std::time::Duration::from_secs(env_u64("SIM_TTL_S", 60));
-    let margin = env_u64("SIM_MARGIN", 4224) as usize;
+    // `GpuEngine::admission_rows` on a masked-padding packet: one decode quantum (K = 8) + 1.
+    let margin = env_u64("SIM_MARGIN", 9) as usize;
+    // `SIM_GROW=1`: admission maps the prompt plus `margin` only; decode maps each next row and a
+    // failed map preempts that sequence (vLLM recompute: drop its rows, requeue prompt + output).
+    let grow = env_u64("SIM_GROW", 0) == 1;
+    let mut preempted = 0u64;
+    let mut waits = 0u64;
+    // `SIM_ORDER=1`: admit the oldest queued turn whose own history is cached (more than
+    // `SIM_ORDER_ROWS` attachable rows) before FIFO, unless the queue head has waited `SIM_AGE_S`.
+    let order = env_u64("SIM_ORDER", 0) == 1;
+    let order_rows = env_u64("SIM_ORDER_ROWS", 2048) as u32;
+    let age = env_u64("SIM_AGE_S", 30) as f64;
+    let order_max = env_u64("SIM_ORDER_MAX", 0) == 1;
     for (cell, path) in cells.iter().enumerate() {
         let mut per: HashMap<usize, Vec<(usize, usize)>> = HashMap::new();
         for line in std::fs::read_to_string(path).expect("prompt file").lines() {
@@ -282,6 +307,9 @@ fn vmm_sim_agentic() {
                     toks: Vec::new(),
                     decoded: 0,
                     admitted: 0,
+                    resumed: None,
+                    base_len: None,
+                    queued_at: 0.0,
                 }
             })
             .collect();
@@ -299,12 +327,27 @@ fn vmm_sim_agentic() {
         let mut hit = vec![(0u64, 0u64, 0u64); turns];
         let mut last_prefill = false;
         let stats0 = k.kv.stats();
+        let mut queue_wait: Vec<f64> = Vec::new();
         loop {
             while arriving.front().is_some_and(|&(t, _)| t <= now) {
-                queue.push_back(arriving.pop_front().unwrap().1);
+                let id = arriving.pop_front().unwrap().1;
+                sess[id].queued_at = now;
+                queue.push_back(id);
             }
-            while let (Some(&id), Some(&b)) = (queue.front(), free_slots.last()) {
-                queue.pop_front();
+            while let (Some(&head), Some(&b)) = (queue.front(), free_slots.last()) {
+                let pick = if order && now - sess[head].queued_at < age {
+                    if order_max {
+                        // The waiting turn that saves the most prefill, if it beats the head by a block.
+                        let rows: Vec<u32> = queue.iter().map(|&i| k.kv.cached_rows(&sess[i].prompt)).collect();
+                        let best = (0..rows.len()).max_by_key(|&i| (rows[i], std::cmp::Reverse(i))).unwrap();
+                        if rows[best] >= rows[0] + k.kv.block_rows() { best } else { 0 }
+                    } else {
+                        queue.iter().position(|&i| k.kv.cached_rows(&sess[i].prompt) > order_rows).unwrap_or(0)
+                    }
+                } else {
+                    0
+                };
+                let id = queue.remove(pick).unwrap();
                 free_slots.pop();
                 let s = &mut sess[id];
                 k.kv.begin_seq(b);
@@ -319,13 +362,26 @@ fn vmm_sim_agentic() {
                 for slot in 0..slots {
                     k.kv.ensure_rows(slot, 1).expect("row 0");
                 }
-                let total = (s.prompt.len() + 128 + margin).min(16384);
-                k.kv.ensure_rows(b, total as u32).expect("admission rows");
+                let out = if grow { 0 } else { 128 };
+                let total = (s.prompt.len() + out + margin).min(16384);
+                // `GpuEngine::admit_packed_slot`: an admission that cannot map its rows waits
+                // (backpressure) until a retirement frees pages.
+                if k.kv.ensure_rows(b, total as u32).is_err() {
+                    k.kv.begin_seq(b);
+                    sync(&k.kv);
+                    free_slots.push(b);
+                    queue.push_front(id);
+                    waits += 1;
+                    break;
+                }
                 sync(&k.kv);
-                let h = &mut hit[s.turn];
-                h.0 += rows as u64;
-                h.1 += s.prompt.len() as u64;
-                h.2 += 1;
+                if s.resumed.is_none() {
+                    queue_wait.push(now - s.queued_at);
+                    let h = &mut hit[s.turn];
+                    h.0 += rows as u64;
+                    h.1 += s.prompt.len() as u64;
+                    h.2 += 1;
+                }
                 s.toks = s.prompt[..rows].to_vec();
                 s.slot = b;
                 s.phase = Phase::Prefill;
@@ -368,7 +424,7 @@ fn vmm_sim_agentic() {
                         k.publish(b, &s.toks, s.toks.len() as u32 - 1, ttl);
                         k.kv.prefill_done(b);
                         s.phase = Phase::Decode;
-                        s.decoded = 0;
+                        s.decoded = s.resumed.unwrap_or(0);
                     } else {
                         k.publish(b, &s.toks, s.toks.len() as u32, ttl);
                     }
@@ -384,12 +440,28 @@ fn vmm_sim_agentic() {
                 nap((dt * scale * 1e6) as u64);
                 for &id in &decoding {
                     let s = &mut sess[id];
+                    if grow && s.decoded + 1 < 128 {
+                        let need = (s.toks.len() + 1 + margin).min(16384) as u32;
+                        if k.kv.ensure_rows(s.slot, need).is_err() {
+                            preempted += 1;
+                            k.kv.begin_seq(s.slot);
+                            sync(&k.kv);
+                            free_slots.push(s.slot);
+                            s.resumed = Some(s.decoded);
+                            s.base_len.get_or_insert(s.prompt.len());
+                            s.prompt = s.toks.clone();
+                            s.phase = Phase::Queued;
+                            queue.push_front(id);
+                            continue;
+                        }
+                    }
                     s.decoded += 1;
                     if s.decoded < 128 {
                         let t = (s.toks.len() as u32) ^ 0x4000_0000;
                         s.toks.push(t);
                         continue;
                     }
+                    s.resumed = None;
                     let b = s.slot;
                     k.publish(b, &s.toks, s.toks.len() as u32, ttl);
                     k.kv.pin_prefix(&s.toks, std::time::Instant::now() + ttl);
@@ -401,7 +473,7 @@ fn vmm_sim_agentic() {
                         s.phase = Phase::Done;
                         continue;
                     }
-                    let prev_len = s.prompt.len();
+                    let prev_len = s.base_len.take().unwrap_or(s.prompt.len());
                     s.prompt = tokens_for(cell as u32, id, s.turn, &s.prompt, prev_len, s.prompts[s.turn]);
                     s.phase = Phase::Queued;
                     arriving.push_back((now + gap, id));
@@ -425,7 +497,10 @@ fn vmm_sim_agentic() {
         let per_turn: Vec<String> =
             hit.iter().map(|h| format!("{:.0}", 100.0 * h.0 as f64 / h.1.max(1) as f64)).collect();
         println!("SIM   per-turn cached% {}", per_turn.join(" "));
+        queue_wait.sort_by(f64::total_cmp);
+        let q = |f: f64| queue_wait.get(((queue_wait.len() as f64 * f) as usize).min(queue_wait.len().max(1) - 1)).copied().unwrap_or(0.0);
+        println!("SIM   queue wait s p50={:.1} p99={:.1} max={:.1}", q(0.5), q(0.99), q(1.0));
         let (c, n) = k.republish.replace((0, 0));
-        println!("SIM   turn-end re-publish copied {c} of {n}");
+        println!("SIM   turn-end re-publish copied {c} of {n} preempted {preempted} admission_waits {waits}");
     }
 }

@@ -441,6 +441,18 @@ impl ServeEngine {
             ServeEngine::Cpu(_) => None,
         }
     }
+
+    /// The prefix cache's read-only attach probe, for cache-aware admission order.
+    #[cfg(feature = "cuda")]
+    pub fn vmm_prefix_probe(&self) -> Option<crate::memory::vmm::PrefixProbe> {
+        match self {
+            ServeEngine::Cuda(e) => e.vmm_prefix_probe(),
+            #[cfg(feature = "hsa")]
+            ServeEngine::Amd(_) => None,
+            #[cfg(feature = "cpu")]
+            ServeEngine::Cpu(_) => None,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

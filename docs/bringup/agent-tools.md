@@ -104,8 +104,8 @@ reproducible recipe. Keep trial TOMLs in `scripts/campaign/recipes` or outside-r
 qualified. Do not create a second production variant to record an experiment.
 
 Scheduling is not a recipe choice: recipes (production and trial) leave `PLOW_OBJECTIVE` at the
-default `auto`, which runs the latency rules at narrow width and switches to throughput at 8 rows
-or any queue (`docs/flags-reference.md`). Pin it only as a deliberate, commented override in a
+default `auto`, which runs the latency rules at narrow width and switches to throughput at 8 rows,
+any queue or a 90%-reserved KV budget (`docs/flags-reference.md`). Pin it only as a deliberate, commented override in a
 profile's `serve_env`; expert overrides such as `PLOW_MULTISTEP` or `PLOW_DECODE_MAX_RUNG` stay
 where a cell measured them.
 

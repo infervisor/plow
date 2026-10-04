@@ -538,7 +538,12 @@ A packed launch writes several slots' KV rows in one kernel, so **every row must
 be mapped before the launch**. Only the unified token-batch route or an explicit
 `PLOW_PF_BATCH=1` plans that admission from the packed metadata, reserving the
 admitted slot's rows plus row zero of every other slot
-(`admit_packed_slot`, `gpu.rs:5564`).
+(`admit_packed_slot`, `gpu.rs:5564`). The admitted rows are the true bound of what the
+sequence's launches can write (`admission_rows`): prompt + `max_tokens` + one decode quantum
+(a multistep launch or the lookahead step runs past the last kept token), plus a whole bucket
+of pad rows only on packets whose padding is unmasked. It replaced a flat
+`max(block_rows, widest bucket)` margin (4224 rows on the 12B ladder packets), which held
+two to three idle blocks per sequence away from the prefix cache.
 
 The decision is (`gpu.rs:3434-3439`):
 

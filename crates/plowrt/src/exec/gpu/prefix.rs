@@ -691,6 +691,11 @@ impl GpuEngine {
         self.vmm.as_ref().map(|v| v.kv.stats_handle())
     }
 
+    /// Engine-lock-free attach probe for the mux's admission order; `None` without prefix reuse.
+    pub fn vmm_prefix_probe(&self) -> Option<crate::memory::vmm::PrefixProbe> {
+        self.vmm.as_ref().and_then(|v| v.kv.prefix_probe())
+    }
+
     /// Rows slot `b`'s current sequence attached from the prefix cache
     /// (0 = cold start). Valid from the first prefill chunk on.
     pub fn attached_rows(&self, b: usize) -> u32 {

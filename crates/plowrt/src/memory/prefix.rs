@@ -234,6 +234,27 @@ impl PrefixCache {
         }
     }
 
+    /// [`Self::lookup`]'s match without its side effects: no refcount, no recency, no
+    /// collision count. The `(owner_seq, block_idx)` of every matched node, in prefix order.
+    pub fn peek(&self, hashes: &[BlockHash], tokens: &[u32]) -> Vec<(u32, u32)> {
+        let mut placed = Vec::new();
+        let mut cur: Option<NodeId> = None;
+        for (i, h) in hashes.iter().enumerate() {
+            let next = match cur {
+                None => self.roots.get(h).copied(),
+                Some(p) => self.nodes[p as usize].children.get(h).copied(),
+            };
+            let Some(n) = next else { break };
+            let e = &self.nodes[n as usize];
+            if self.block_slice(tokens, i) != Some(&e.tokens) {
+                break;
+            }
+            placed.push((e.owner_seq, e.block_idx));
+            cur = Some(n);
+        }
+        placed
+    }
+
     /// Resolve placed blocks to coalesced per-`(kv, head)` runs. Split out so the
     /// coalescing is testable without touching the tree.
     fn runs_for(&self, placed: &[(u32, u32)]) -> Vec<Run> {

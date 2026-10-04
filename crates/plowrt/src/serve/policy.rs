@@ -7,7 +7,7 @@
 //! engine is built, not here.
 //!
 //! `auto` picks the latency or throughput rules per tick, from signals the dispatcher already
-//! has: occupied decode width and queue depth. Measured on p12r4, queue-sized prefill packing wins
+//! has: occupied decode width, queue depth and the share of the KV budget live sequences hold. Measured on p12r4, queue-sized prefill packing wins
 //! 1024/C4 TTFT (101 vs 123 ms) and loses 128/C4 (39.1 vs 34.2); the rung fast probe wins a cold
 //! C16 backlog (P99 TTFT 170 -> 150 ms) and buys nothing at C1. Startup decisions (the decode
 //! rung ladder, KV admission) cannot follow a per-tick class; they take the throughput side under
@@ -69,6 +69,11 @@ const WIDE_LEAVE: usize = 4;
 /// fresh burst on the latency rules for its first 200 ticks.
 const CALM_MS: u64 = 2000;
 const NOT_CALM: u64 = u64::MAX;
+/// Share of the KV budget live sequences reserve at or above which the window is
+/// high-concurrency whatever its width (a few long prompts fill the device as surely as many
+/// short ones), and the share it must fall back under before it is realtime again.
+const KV_ENTER: f64 = 0.9;
+const KV_LEAVE: f64 = 0.75;
 
 /// Throughput decode quantum: E4B and Veena serve their best c64/c128 at K = 8 with the
 /// single-step rule below (`docs/runtime/gemma4-e4b-h100.md`, `docs/runtime/tts.md`).
@@ -78,16 +83,29 @@ pub const THROUGHPUT_K: u32 = 8;
 const AMD_LATENCY_K: u32 = 4;
 
 static CLASS: AtomicU8 = AtomicU8::new(0);
+static SWITCHES: AtomicU64 = AtomicU64::new(0);
 /// When the window last became narrow (ms since `EPOCH`), or `NOT_CALM`.
 static CALM_SINCE: AtomicU64 = AtomicU64::new(NOT_CALM);
 static EPOCH: OnceLock<Instant> = OnceLock::new();
 
+/// One tick's signals.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Load {
+    /// Live decode rows (the occupied slot extent).
+    pub width: usize,
+    /// Requests waiting for a slot.
+    pub queued: usize,
+    /// Share of the KV-capacity budget the live sequences reserve (0 without a budget).
+    pub kv_used: f64,
+}
+
 /// The whole decision, as a pure function of the state and one tick's signals at `now` ms: the
 /// class in force afterwards and the calm start that goes with it.
-fn decide(current: Class, calm_since: u64, now: u64, width: usize, queued: usize) -> (Class, u64) {
-    if width >= WIDE_ENTER || queued > 0 {
+fn decide(current: Class, calm_since: u64, now: u64, load: Load) -> (Class, u64) {
+    let Load { width, queued, kv_used } = load;
+    if width >= WIDE_ENTER || queued > 0 || kv_used >= KV_ENTER {
         (Class::HighConcurrency, NOT_CALM)
-    } else if width <= WIDE_LEAVE && current == Class::HighConcurrency {
+    } else if width <= WIDE_LEAVE && kv_used < KV_LEAVE && current == Class::HighConcurrency {
         let since = if calm_since == NOT_CALM { now } else { calm_since };
         if now.saturating_sub(since) >= CALM_MS {
             (Class::Realtime, NOT_CALM)
@@ -115,20 +133,31 @@ fn class_for(objective: Objective, observed: u8) -> Class {
     }
 }
 
-/// One tick's observation: `width` live decode rows, `queued` requests waiting for a slot.
-/// A no-op unless the objective is `auto`.
-pub fn observe(width: usize, queued: usize) {
+/// One tick's observation. A no-op unless the objective is `auto`; `true` when the class
+/// switched.
+pub fn observe(load: Load) -> bool {
     if objective() != Objective::Auto {
-        return;
+        return false;
     }
     let current = class_for(Objective::Auto, CLASS.load(Ordering::Relaxed));
     let now = EPOCH.get_or_init(Instant::now).elapsed().as_millis() as u64;
-    let (next, calm) = decide(current, CALM_SINCE.load(Ordering::Relaxed), now, width, queued);
+    let (next, calm) = decide(current, CALM_SINCE.load(Ordering::Relaxed), now, load);
     CALM_SINCE.store(calm, Ordering::Relaxed);
-    if next != current {
-        CLASS.store(u8::from(next == Class::HighConcurrency), Ordering::Relaxed);
-        tracing::info!(from = ?current, to = ?next, width, queued, "serve objective: class switched");
+    if next == current {
+        return false;
     }
+    CLASS.store(u8::from(next == Class::HighConcurrency), Ordering::Relaxed);
+    let switches = SWITCHES.fetch_add(1, Ordering::Relaxed) + 1;
+    tracing::info!(
+        from = ?current,
+        to = ?next,
+        width = load.width,
+        queued = load.queued,
+        kv_used = load.kv_used,
+        switches,
+        "serve objective: class switched"
+    );
+    true
 }
 
 /// Decode steps per host sync for rows the lookahead pipeline does not carry.
@@ -160,6 +189,13 @@ pub fn decode_k_capacity() -> u32 {
 /// that filling the launch matters more.
 pub fn adaptive_packing() -> bool {
     class() == Class::Realtime
+}
+
+/// Cache-aware admission (`serve::mux::cache_first`): with requests waiting for a slot, seat
+/// first the one that attaches the most cached prefix rows. Under latency rules there is no
+/// standing queue to reorder.
+pub fn cache_aware_admission() -> bool {
+    class() == Class::HighConcurrency
 }
 
 /// The rung fast probe: a cold backlog tries the widest rung after one sample instead of four.
@@ -205,30 +241,46 @@ pub fn installed_co_sched() -> crate::serve::cosched::CoSched {
 mod tests {
     use super::*;
 
+    fn load(width: usize, queued: usize, kv_used: f64) -> Load {
+        Load { width, queued, kv_used }
+    }
+
     #[test]
     fn load_enters_throughput_at_once() {
-        for (width, queued) in [(WIDE_ENTER, 0), (1, 3)] {
-            let (c, calm) = decide(Class::Realtime, NOT_CALM, 10, width, queued);
-            assert_eq!((c, calm), (Class::HighConcurrency, NOT_CALM));
+        for l in [load(WIDE_ENTER, 0, 0.0), load(1, 3, 0.0), load(2, 0, KV_ENTER)] {
+            let (c, calm) = decide(Class::Realtime, NOT_CALM, 10, l);
+            assert_eq!((c, calm), (Class::HighConcurrency, NOT_CALM), "{l:?}");
         }
     }
 
     #[test]
-    fn throughput_leaves_only_after_the_window_stays_narrow() {
-        let (c, calm) = decide(Class::HighConcurrency, NOT_CALM, 1_000, 2, 0);
-        assert_eq!((c, calm), (Class::HighConcurrency, 1_000), "calm starts");
-        let (c, _) = decide(Class::HighConcurrency, calm, 1_000 + CALM_MS - 1, 2, 0);
-        assert_eq!(c, Class::HighConcurrency, "not calm for long enough");
-        let (c, _) = decide(Class::HighConcurrency, calm, 1_000 + CALM_MS, 2, 0);
+    fn kv_pressure_holds_throughput_until_it_drains_below_the_band() {
+        let (c, _) = decide(Class::HighConcurrency, 0, 10 * CALM_MS, load(2, 0, 0.8));
+        assert_eq!(c, Class::HighConcurrency, "0.8 is inside [{KV_LEAVE}, {KV_ENTER})");
+        let (c, calm) = decide(Class::HighConcurrency, NOT_CALM, 1_000, load(2, 0, 0.5));
+        assert_eq!((c, calm), (Class::HighConcurrency, 1_000), "calm starts below the band");
+        let (c, _) = decide(Class::HighConcurrency, calm, 1_000 + CALM_MS, load(2, 0, 0.5));
         assert_eq!(c, Class::Realtime);
-        let (c, calm) = decide(Class::HighConcurrency, calm, 1_500, 16, 0);
+        let (c, _) = decide(Class::Realtime, NOT_CALM, 10, load(2, 0, 0.8));
+        assert_eq!(c, Class::Realtime, "the band does not enter throughput either");
+    }
+
+    #[test]
+    fn throughput_leaves_only_after_the_window_stays_narrow() {
+        let (c, calm) = decide(Class::HighConcurrency, NOT_CALM, 1_000, load(2, 0, 0.0));
+        assert_eq!((c, calm), (Class::HighConcurrency, 1_000), "calm starts");
+        let (c, _) = decide(Class::HighConcurrency, calm, 1_000 + CALM_MS - 1, load(2, 0, 0.0));
+        assert_eq!(c, Class::HighConcurrency, "not calm for long enough");
+        let (c, _) = decide(Class::HighConcurrency, calm, 1_000 + CALM_MS, load(2, 0, 0.0));
+        assert_eq!(c, Class::Realtime);
+        let (c, calm) = decide(Class::HighConcurrency, calm, 1_500, load(16, 0, 0.0));
         assert_eq!((c, calm), (Class::HighConcurrency, NOT_CALM), "a wide tick resets calm");
     }
 
     #[test]
     fn the_band_holds_a_mid_width_workload_where_it_was() {
         for from in [Class::Realtime, Class::HighConcurrency] {
-            let (c, _) = decide(from, 0, 10 * CALM_MS, 6, 0);
+            let (c, _) = decide(from, 0, 10 * CALM_MS, load(6, 0, 0.0));
             assert_eq!(c, from, "6 rows is inside [{WIDE_LEAVE}, {WIDE_ENTER})");
         }
     }

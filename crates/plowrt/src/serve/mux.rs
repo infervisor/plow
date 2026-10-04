@@ -864,6 +864,10 @@ pub fn spawn(
     #[cfg(not(any(feature = "cuda", feature = "hsa", feature = "cpu")))]
     let kv_budget: Option<crate::sched::admission::KvBudget> = None;
     #[cfg(feature = "cuda")]
+    let prefix_probe = state.gpu_engine(&slug).and_then(|e| e.lock().vmm_prefix_probe());
+    #[cfg(not(feature = "cuda"))]
+    let prefix_probe: Option<crate::memory::vmm::PrefixProbe> = None;
+    #[cfg(feature = "cuda")]
     let (resume_supported, prefix_cache, kv_row_bytes) = state.gpu_engine(&slug).map_or((false, false, 0), |e| {
         let e = e.lock();
         (e.slot_resume_supported(), e.is_cuda() && e.prefix_cache_enabled(), e.kv_row_bytes())
@@ -1151,7 +1155,25 @@ pub fn spawn(
                 metrics
                     .decode_occupied_extent
                     .store(occupied_extent as u64, Ordering::Relaxed);
-                crate::serve::policy::observe(occupied_extent, waiting.len());
+                let kv_used = kv_budget.filter(|b| b.max_rows() > 0).map_or(0.0, |b| {
+                    let rows: u64 = slots
+                        .iter()
+                        .flatten()
+                        .map(|s| reserved_kv_rows(s.prompt_ids.len(), s.gen.max_tokens, s.out_ids.len()))
+                        .sum();
+                    rows as f64 / b.max_rows() as f64
+                });
+                if crate::serve::policy::observe(crate::serve::policy::Load {
+                    width: occupied_extent,
+                    queued: waiting.len(),
+                    kv_used,
+                }) {
+                    Metrics::inc(&metrics.serve_mode_switches);
+                }
+                metrics.serve_mode.store(
+                    u64::from(crate::serve::policy::class() == crate::serve::policy::Class::HighConcurrency),
+                    Ordering::Relaxed,
+                );
                 if let Some(rc) = rung_controller.as_mut() {
                     rc.set_fast_probe(crate::serve::policy::fast_probe());
                 }
@@ -1188,6 +1210,7 @@ pub fn spawn(
                     kv_budget,
                     downstream.full(),
                     &mut retention,
+                    prefix_probe.as_ref(),
                 );
             }
             let idle = slots[..admission_limit]
@@ -1328,6 +1351,7 @@ pub fn spawn(
                     kv_budget,
                     downstream.full(),
                     &mut retention,
+                    prefix_probe.as_ref(),
                 );
             }
             // A full slot table leaves arrivals in the channel in arrival order; in `waiting`,
@@ -1834,6 +1858,25 @@ fn seat_order(class: JobClass, continuing: bool, arrived: Instant, now: Instant,
     (class, tier, arrived)
 }
 
+/// The head of the queue keeps its seat against [`cache_first`] once it has waited this long.
+const CACHE_FIRST_WAIT_MS: f64 = QUEUE_TTL_FLOOR_MS;
+
+/// Cache-aware admission, the throughput class's retention rule: of the waiters in the head's
+/// class (`heads` = class and wait per waiter, in seat order; `rows` = rows each attaches from
+/// the prefix cache), seat first the one attaching the most rows when that beats the head by a
+/// block. FIFO under cyclic session reuse seats exactly the session whose prefix LRU evicted
+/// last; this seats sessions still cached, so their turns keep it. The head keeps its seat once
+/// it has waited [`CACHE_FIRST_WAIT_MS`]. Returns the waiter to seat ahead of the head.
+fn cache_first(heads: &[(JobClass, f64)], rows: &[u32], block: u32) -> Option<usize> {
+    let (&(class, waited), &head_rows) = heads.first().zip(rows.first())?;
+    if waited >= CACHE_FIRST_WAIT_MS {
+        return None;
+    }
+    let peers = heads.iter().take_while(|h| h.0 == class).count().min(rows.len());
+    let (best, &best_rows) = rows[..peers].iter().enumerate().rev().max_by_key(|&(_, r)| *r)?;
+    (best > 0 && best_rows >= head_rows.saturating_add(block)).then_some(best)
+}
+
 #[inline]
 fn waited_ms(now: Instant, arrived: Instant) -> f64 {
     now.saturating_duration_since(arrived).as_secs_f64() * 1e3
@@ -1882,6 +1925,7 @@ fn drain_waiting(
         kv_budget,
         downstream_full,
         &mut Retention::off(),
+        None,
     )
 }
 
@@ -1898,6 +1942,7 @@ fn drain_waiting_session(
     kv_budget: Option<crate::sched::admission::KvBudget>,
     downstream_full: bool,
     retention: &mut Retention,
+    prefix: Option<&crate::memory::vmm::PrefixProbe>,
 ) {
     waiting.retain(|(job, arrived)| {
         let class = job.opts.class;
@@ -1929,12 +1974,32 @@ fn drain_waiting_session(
         queue.sort_by_key(order);
     }
     let aging = queue_aging_ms(slo_ms);
+    // Attachable rows per waiter, once per pass: admissions within it barely move the cache.
+    let probe = prefix.filter(|_| {
+        crate::serve::policy::cache_aware_admission()
+            && slots[..admission_limit.min(slots.len())].iter().any(Option::is_none)
+    });
+    let mut rows: std::collections::VecDeque<u32> = probe
+        .map(|p| waiting.iter().map(|(job, _)| p.cached_rows(&job.prompt_ids)).collect())
+        .unwrap_or_default();
     let mut still: std::collections::VecDeque<(Job, Instant)> =
         std::collections::VecDeque::new();
     while slots[..admission_limit.min(slots.len())]
         .iter()
         .any(Option::is_none)
     {
+        if let Some(p) = probe {
+            let heads: Vec<(JobClass, f64)> =
+                waiting.iter().map(|(job, arrived)| (job.opts.class, waited_ms(now, *arrived))).collect();
+            if let Some(i) = cache_first(&heads, rows.make_contiguous(), p.block_rows()) {
+                let entry = waiting.remove(i).expect("in range");
+                waiting.push_front(entry);
+                let r = rows.remove(i).expect("in range");
+                rows.push_front(r);
+                Metrics::inc(&metrics.cache_first_admissions);
+            }
+        }
+        rows.pop_front();
         let Some((job, arrived)) = waiting.pop_front() else {
             break;
         };
@@ -7024,6 +7089,23 @@ mod tests {
         assert!(matches!(rx_b.try_recv(), Ok(StreamChunk::Err(_))));
         let left: Vec<_> = waiting.iter().map(|(j, _)| j.prompt_ids.len()).collect();
         assert_eq!(left, [40, 10], "oldest first within a class");
+    }
+
+    #[test]
+    fn cache_first_seats_the_most_cached_waiter_by_a_block_within_the_head_class() {
+        use super::{cache_first, JobClass::*, CACHE_FIRST_WAIT_MS};
+        let n = |w: f64| (Normal, w);
+        // A block better than the head wins; ties go to the earlier waiter.
+        assert_eq!(cache_first(&[n(5.0), n(4.0), n(3.0)], &[1536, 6144, 6144], 2048), Some(1));
+        // Less than a block better: FIFO.
+        assert_eq!(cache_first(&[n(5.0), n(4.0)], &[1536, 3500], 2048), None);
+        // The head already holds the most cache.
+        assert_eq!(cache_first(&[n(5.0), n(4.0)], &[8192, 2048], 2048), None);
+        // Only the head's class competes: a cached bulk waiter never overtakes it.
+        assert_eq!(cache_first(&[n(5.0), (Bulk, 9.0)], &[0, 8192], 2048), None);
+        // The head keeps its seat once it has waited the bound.
+        assert_eq!(cache_first(&[n(CACHE_FIRST_WAIT_MS), n(1.0)], &[0, 8192], 2048), None);
+        assert_eq!(cache_first(&[], &[], 2048), None);
     }
 
     /// A continuing session turn takes the slot ahead of a session opening, but only until the
