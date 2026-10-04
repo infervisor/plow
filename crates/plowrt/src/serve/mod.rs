@@ -1,6 +1,8 @@
 //! §G OpenAI-compatible API server.
 
 pub mod admin;
+#[cfg(feature = "cpu")]
+pub mod portable;
 pub mod bench;
 pub mod chat;
 pub mod completion;
@@ -373,6 +375,8 @@ pub struct AppState {
     /// Directories a control-plane `load` may take an assets dir from. Set
     /// once at startup; empty means no assets dir may be named by request.
     models_roots: std::sync::OnceLock<Vec<std::path::PathBuf>>,
+    #[cfg(feature = "cpu")]
+    portable: std::sync::OnceLock<Arc<portable::PortableManager>>,
     /// Operator-set residency overrides, slug → state. Absent = [`Residency::Auto`].
     /// Only the control plane writes here; the manager and the request path read it.
     residency: RwLock<FxHashMap<String, Residency>>,
@@ -451,6 +455,8 @@ impl AppState {
             slug_group: RwLock::new(FxHashMap::default()),
             turns: std::sync::OnceLock::new(),
             models_roots: std::sync::OnceLock::new(),
+            #[cfg(feature = "cpu")]
+            portable: std::sync::OnceLock::new(),
             residency: RwLock::new(FxHashMap::default()),
             control: Mutex::new(FxHashMap::default()),
             started: openai::now_secs(),
@@ -473,6 +479,16 @@ impl AppState {
             .write()
             .insert(slug.clone(), engine.honours_sampling());
         self.gpu.write().insert(slug, Arc::new(Mutex::new(engine)));
+    }
+
+    #[cfg(feature = "cpu")]
+    pub fn install_portable_manager(&self, manager: portable::PortableManager) {
+        let _ = self.portable.set(Arc::new(manager));
+    }
+
+    #[cfg(feature = "cpu")]
+    pub fn portable_manager(&self) -> Option<&Arc<portable::PortableManager>> {
+        self.portable.get()
     }
 
     /// Unix seconds this process started offering models.

@@ -321,8 +321,32 @@ impl AsrServer {
         }
     }
     pub fn router(self: Arc<Self>, websocket: bool) -> Router {
-        self.transcription_router(websocket)
-            .route("/health", get(|| async { StatusCode::OK }))
+        let model = match &self.backend {
+            Backend::Cohort { model, .. } => Some(model.clone()),
+            #[cfg(feature = "cuda")]
+            Backend::Serve(_) => None,
+        };
+        let mut router = self.transcription_router(websocket)
+            .route("/health", get(|| async { StatusCode::OK }));
+        if let Some(model) = model {
+            let mut endpoints = vec!["audio/transcriptions"];
+            if websocket { endpoints.push("audio/transcriptions/stream"); }
+            let card = json!({"id": model, "root": model, "object": "model", "created": 0,
+                "owned_by": "plow", "x_plow_endpoints": endpoints,
+                "input_modalities": ["audio"], "output_modalities": ["text"]});
+            let list_card = card.clone();
+            router = router.route("/v1/models", get(move || {
+                let card = list_card.clone();
+                async move { Json(json!({"object": "list", "data": [card]})) }
+            })).route("/v1/models/:model", get(move |axum::extract::Path(id): axum::extract::Path<String>| {
+                let card = card.clone();
+                async move {
+                    if card["id"] == id { Json(card).into_response() }
+                    else { failure(StatusCode::NOT_FOUND, "unknown ASR model") }
+                }
+            }));
+        }
+        router
     }
 
     /// The transcription routes alone, to merge into another server's router.
@@ -1194,6 +1218,20 @@ mod tests {
             .header("content-type", "multipart/form-data; boundary=audio")
             .body(Body::from(body))
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn standalone_discovery_preserves_model_identity_and_audio_capabilities() {
+        let app = AsrServer::new("nemotron-asr-0.6b".into(), Fake).router(true);
+        let response = app.clone().oneshot(Request::get("/v1/models").body(Body::empty()).unwrap()).await.unwrap();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let list: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(list["data"][0]["id"], "nemotron-asr-0.6b");
+        assert_eq!(list["data"][0]["x_plow_endpoints"], json!(["audio/transcriptions", "audio/transcriptions/stream"]));
+        for (name, status) in [("nemotron-asr-0.6b", 200), ("transcribe", 404)] {
+            assert_eq!(app.clone().oneshot(Request::get(format!("/v1/models/{name}")).body(Body::empty()).unwrap()).await.unwrap().status(), status);
+            assert_eq!(app.clone().oneshot(request(name, "json")).await.unwrap().status(), status);
+        }
     }
 
     #[tokio::test]

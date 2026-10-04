@@ -7405,7 +7405,6 @@ mod tests {
         bundle
     }
 
-    #[cfg(feature = "cuda")]
     fn prefill_test_slot() -> (Option<Slot>, crate::serve::stream::ChunkReceiver) {
         let (respond, rx) = crate::serve::stream::channel();
         (

@@ -64,6 +64,9 @@ enum Cmd {
         port: Option<u16>,
         #[arg(long, requires = "port")]
         websocket: bool,
+        /// Public model identity. Defaults to the packet pipeline name for compatibility.
+        #[arg(long, requires = "port")]
+        served_model_name: Option<String>,
         /// Packet execution backend. `auto` selects the best compiled backend.
         #[arg(long, default_value = "auto")]
         backend: String,
@@ -740,6 +743,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             port,
             websocket,
             backend,
+            served_model_name,
         } => {
             let samples = if let Some(audio) = audio {
                 Some(plowrt::asr::frontend::decode_wav(&std::fs::read(audio)?)?)
@@ -747,7 +751,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 None
             };
             let loaded = plowrt::asr::load_packet_transcriber(&packet, &tokenizer, &backend)?;
-            let served_model = loaded.pipeline;
+            let served_model = served_model_name.unwrap_or(loaded.pipeline);
             let mut engine = loaded.engine;
             if let Some(samples) = samples {
                 let result = engine.transcribe(
@@ -1168,6 +1172,9 @@ mod amd_bench_cli_tests {
     ))]
     #[test]
     fn asr_names_packet_and_tokenizer_inputs() {
+        let named = Cli::try_parse_from(["plowrt", "asr", "--packet", "model.pkt",
+            "--tokenizer", "tokens", "--port", "8080", "--served-model-name", "nemotron-asr-0.6b"]).unwrap();
+        assert!(matches!(named.cmd, super::Cmd::Asr { served_model_name: Some(name), .. } if name == "nemotron-asr-0.6b"));
         for args in [
             ["--packet", "model.pkt", "--tokenizer", "tokens"],
             ["--blob", "model.pkt", "--checkpoint", "tokens"],
@@ -3539,6 +3546,7 @@ async fn bringup_runtime(
     // interpreter. Same tokenizer refusal as the GPU paths.
     #[cfg(feature = "cpu")]
     if vendor.is_none() {
+        let portable = plowrt::serve::portable::PortableManager::new(mux_cfg);
         let slugs: Vec<String> = state.registry.slugs();
         for slug in slugs {
             let bundle = state.registry.get(&slug)?;
@@ -3557,50 +3565,11 @@ async fn bringup_runtime(
                 .clone()
                 .map(PathBuf::from)
                 .unwrap_or_else(|| bundle.dir.join("checkpoint"));
-            let cpu = &RuntimeConfig::get().cpu;
-            let opts = plowrt::exec::cpu::engine::CpuEngineOpts {
-                threads: cpu.threads as usize,
-                numa: cpu.numa.clone(),
-                isa: match cpu.isa {
-                    plowrt::config::CpuIsa::Scalar => plowrt::exec::cpu::ffi::Isa::Scalar,
-                    plowrt::config::CpuIsa::Avx512 => plowrt::exec::cpu::ffi::Isa::Avx512,
-                    plowrt::config::CpuIsa::Amx | plowrt::config::CpuIsa::Auto => {
-                        plowrt::exec::cpu::ffi::Isa::Amx
-                    }
-                },
-                spin_us: cpu.spin_us,
-                // The served model takes the live topology; only a head pool
-                // narrows it to a reservation.
-                topology: None,
-            };
-            tracing::info!(
-                %slug, blob = %blob.display(), checkpoint = %ckpt.display(), ?opts,
-                "loading CPU engine"
-            );
-            let t0 = std::time::Instant::now();
-            // The Metal engine rides the same slot-serve engine; `PLOW_BACKEND=cpu` keeps the
-            // worker-pool engine on a Metal-enabled build.
-            #[cfg(all(feature = "metal", target_os = "macos"))]
-            let eng = if plowrt::config::RuntimeConfig::get()
-                .apple
-                .backend
-                .as_deref()
-                != Some("cpu")
-            {
-                let m = plowrt::exec::apple::MetalEngine::load(&blob, &ckpt)?;
-                plowrt::serve::engine::CpuServe::from_engine(Box::new(m), &ckpt)?
-            } else {
-                plowrt::serve::engine::CpuServe::load(&blob, &ckpt, &opts)?
-            };
-            #[cfg(not(all(feature = "metal", target_os = "macos")))]
-            let eng = plowrt::serve::engine::CpuServe::load(&blob, &ckpt, &opts)?;
-            tracing::info!(
-                %slug, secs = t0.elapsed().as_secs_f64(), max_ctx = eng.max_ctx(),
-                engine = %eng.engine().describe(),
-                "slot engine loaded"
-            );
+            let eng = plowrt::serve::portable::load_engine(&blob, &ckpt)?;
+            portable.register(slug.clone(), ckpt);
             state.install_gpu_engine(slug, plowrt::serve::engine::ServeEngine::Cpu(eng));
         }
+        state.install_portable_manager(portable);
     }
 
     // Backends other than the CUDA placement path serve ONE device set, so one

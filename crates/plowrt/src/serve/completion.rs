@@ -139,6 +139,10 @@ async fn completions_with(
             Some("logprobs".into()),
         );
     }
+    if !state.residency(&req.model).admits() {
+        return crate::serve::api_error(axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "Model is explicitly unloaded or unloading", "server_error", Some("model_unloaded"), Some("model".into()));
+    }
     #[cfg(feature = "cuda")]
     if let Some(mgr) = state.manager_for(&req.model) {
         if mgr.manages(&req.model) {

@@ -244,7 +244,6 @@ pub fn synthesize_from_json(json: &str, name: String) -> Result<NetConfig, Strin
     synthesize_full(json, name).map(|s| s.net)
 }
 
-/// Derive a URL-safe slug from a directory path.
 /// `org/name` of a Hugging Face hub-cache snapshot (`.../models--org--name/snapshots/<rev>`).
 pub fn hub_repo_id(dir: &Path) -> Option<String> {
     let snapshots = dir.parent()?;
@@ -256,6 +255,9 @@ pub fn hub_repo_id(dir: &Path) -> Option<String> {
 }
 
 pub fn dir_slug(dir: &Path) -> String {
+    if let Some(repo) = hub_repo_id(dir) {
+        return repo.rsplit('/').next().unwrap().to_lowercase();
+    }
     dir.file_name()
         .map(|n| n.to_string_lossy().to_lowercase())
         .unwrap_or_else(|| dir.display().to_string().to_lowercase())
@@ -2484,6 +2486,8 @@ mod tests {
 
     #[test]
     fn hub_repo_id_from_hub_snapshot_only() {
+        assert_eq!(dir_slug(Path::new("/hf/hub/models--HuggingFaceTB--SmolLM2-360M-Instruct/snapshots/abcdef")), "smollm2-360m-instruct");
+        assert_eq!(dir_slug(Path::new("/models/Qwen3-0.6B")), "qwen3-0.6b");
         use std::path::Path;
         assert_eq!(
             hub_repo_id(Path::new("/hf/hub/models--Qwen--Qwen3-ASR-1.7B/snapshots/7278e1e")).as_deref(),

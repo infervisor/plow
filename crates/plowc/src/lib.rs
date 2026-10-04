@@ -482,6 +482,8 @@ fn build_memory_report(
 #[derive(Serialize, Debug)]
 pub struct Report {
     pub network: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub served_name: Option<String>,
     pub gpu: String,
     /// Calibration tier the tile selection actually rested on, and why.
     ///
@@ -573,6 +575,11 @@ fn fp8_scale_storage_bytes(graph: &nn_graph::Graph) -> u64 {
 /// Compile `src` for `opts`, writing one `.pkt` stream per bucket plus a
 /// `weights.json` manifest into `opts.out`, and return the [`Report`].
 pub fn compile(src: &Source, opts: &Options) -> Result<Report, PlowcError> {
+    compile_named(src, opts, None)
+}
+
+/// Compile with an explicit serving identity, independent of the network slug.
+pub fn compile_named(src: &Source, opts: &Options, served_name: Option<String>) -> Result<Report, PlowcError> {
     let started = std::time::Instant::now();
     info!(
         network = %src.name(), target = %opts.gpu, output = %opts.out.display(),
@@ -949,6 +956,12 @@ pub fn compile(src: &Source, opts: &Options) -> Result<Report, PlowcError> {
         lean_verified: lean.verified,
         lean_provenance: lean.provenance,
         network: src.name(),
+        served_name: served_name.or_else(|| match src {
+            Source::HfDir(dir) => hf_config::hub_repo_id(dir),
+            Source::Model(id) if std::path::Path::new(id).is_dir() => hf_config::hub_repo_id(std::path::Path::new(id)),
+            Source::Model(id) => Some(id.clone()),
+            Source::Net(_) => None,
+        }),
         gpu: opts.gpu.clone(),
         num_gpus: opts.num_gpus,
         parallel: opts.parallel,
