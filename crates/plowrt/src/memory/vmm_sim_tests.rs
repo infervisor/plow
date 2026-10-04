@@ -4,7 +4,8 @@
 //! publish, turn-end publish and retire). Env: `SIM_CELLS` (comma-separated prompt files of
 //! `session turn prompt_tokens` lines, run back to back on one pool), `SIM_KV` (fp8|bf16),
 //! `SIM_SLOTS`, `SIM_FREE_MIB` (free after load), `SIM_FLOOR_MIB`, `SIM_CHUNK` / `SIM_PF_TPS`
-//! (prefill launch rows / rows per second), `SIM_TTL_S`, and `SIM_SCALE` with `SIM_UNMAP_US` /
+//! (prefill launch rows / rows per second), `SIM_TTL_S`, `SIM_GAP_MS` (client round trip between
+//! turns), `SIM_MARGIN` (admission rows past prompt + output), and `SIM_SCALE` with `SIM_UNMAP_US` /
 //! `SIM_RELEASE_US` to pace the reclaimer thread in real time instead of draining it per call.
 use super::*;
 use std::collections::{HashMap, VecDeque};
@@ -87,6 +88,8 @@ struct Kv {
     snap_row: u64,
     full_row: u64,
     scale_row: u64,
+    /// Turn-end re-publishes that had to copy (the prompt end was evicted while decoding) / all.
+    republish: std::cell::Cell<(u64, u64)>,
 }
 
 impl Kv {
@@ -99,14 +102,23 @@ impl Kv {
 
     /// `exec/gpu/prefix.rs::publish_boundary`.
     fn boundary(&self, b: usize, toks: &[u32], p_a: u32) -> bool {
+        self.boundary_copied(b, toks, p_a).0
+    }
+
+    fn boundary_copied(&self, b: usize, toks: &[u32], p_a: u32) -> (bool, bool) {
+        let copied = std::cell::Cell::new(false);
         let rows = toks.len() as u32;
         if rows == 0 || p_a == 0 || rows - p_a > self.ring - self.window {
-            return false;
+            return (false, false);
         }
         if !self.kv.resolve_prefix_hazard(b, toks, p_a) {
-            return false;
+            return (false, false);
         }
-        self.kv.publish_at(b, toks, p_a, self.snap_bytes(p_a), |_| Ok(())).is_ok()
+        let ok = self.kv.publish_at(b, toks, p_a, self.snap_bytes(p_a), |_| {
+            copied.set(true);
+            Ok(())
+        });
+        (ok.is_ok(), copied.get())
     }
 
     /// `exec/gpu/prefix.rs::vmm_publish` for a session slot.
@@ -136,7 +148,9 @@ impl Kv {
         }
         let end = prompt.saturating_sub(1) / 32 * 32;
         if rows > prompt && end > 0 && end < p_a {
-            self.boundary(b, toks, end);
+            let (_, copied) = self.boundary_copied(b, toks, end);
+            let (c, n) = self.republish.get();
+            self.republish.set((c + u64::from(copied), n + 1));
         }
     }
 }
@@ -240,9 +254,10 @@ fn vmm_sim_agentic() {
         snap_row: 40 * 2 * 8 * 256 * elem as u64,
         full_row: 16 * 512 * elem as u64,
         scale_row: if fp8 { 64 } else { 0 },
+        republish: std::cell::Cell::new((0, 0)),
     };
     let ttl = std::time::Duration::from_secs(env_u64("SIM_TTL_S", 60));
-    let margin = 4096usize;
+    let margin = env_u64("SIM_MARGIN", 4224) as usize;
     for (cell, path) in cells.iter().enumerate() {
         let mut per: HashMap<usize, Vec<(usize, usize)>> = HashMap::new();
         for line in std::fs::read_to_string(path).expect("prompt file").lines() {
@@ -272,6 +287,9 @@ fn vmm_sim_agentic() {
             s.prompt = tokens_for(cell as u32, i, 0, &[], 0, s.prompts[0]);
         }
         let mut queue: VecDeque<usize> = (0..sess.len()).collect();
+        // Client round trip between a turn's end and the next turn's arrival.
+        let gap = env_u64("SIM_GAP_MS", 0) as f64 / 1e3;
+        let mut arriving: VecDeque<(f64, usize)> = VecDeque::new();
         let mut free_slots: Vec<usize> = (0..slots).rev().collect();
         let mut now = 0f64;
         let mut seqno = 0u64;
@@ -280,6 +298,9 @@ fn vmm_sim_agentic() {
         let mut last_prefill = false;
         let stats0 = k.kv.stats();
         loop {
+            while arriving.front().is_some_and(|&(t, _)| t <= now) {
+                queue.push_back(arriving.pop_front().unwrap().1);
+            }
             while let (Some(&id), Some(&b)) = (queue.front(), free_slots.last()) {
                 queue.pop_front();
                 free_slots.pop();
@@ -313,7 +334,13 @@ fn vmm_sim_agentic() {
                 (0..sess.len()).filter(|&i| sess[i].phase == Phase::Prefill).collect();
             let decoding: Vec<usize> = (0..sess.len()).filter(|&i| sess[i].phase == Phase::Decode).collect();
             if prefilling.is_empty() && decoding.is_empty() {
-                break;
+                match arriving.front() {
+                    Some(&(t, _)) => {
+                        now = now.max(t);
+                        continue;
+                    }
+                    None => break,
+                }
             }
             if !prefilling.is_empty() && (decoding.is_empty() || !last_prefill) {
                 last_prefill = true;
@@ -375,7 +402,7 @@ fn vmm_sim_agentic() {
                     let prev_len = s.prompt.len();
                     s.prompt = tokens_for(cell as u32, id, s.turn, &s.prompt, prev_len, s.prompts[s.turn]);
                     s.phase = Phase::Queued;
-                    queue.push_back(id);
+                    arriving.push_back((now + gap, id));
                 }
             }
         }
@@ -396,5 +423,7 @@ fn vmm_sim_agentic() {
         let per_turn: Vec<String> =
             hit.iter().map(|h| format!("{:.0}", 100.0 * h.0 as f64 / h.1.max(1) as f64)).collect();
         println!("SIM   per-turn cached% {}", per_turn.join(" "));
+        let (c, n) = k.republish.replace((0, 0));
+        println!("SIM   turn-end re-publish copied {c} of {n}");
     }
 }
