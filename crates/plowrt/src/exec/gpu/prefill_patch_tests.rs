@@ -294,3 +294,15 @@ fn patch_upload_covers_only_the_first_through_last_site() {
         assert_eq!(bytes, &pod_bytes(&insts)[range.start * 64..range.end * 64]);
     }
 }
+
+#[test]
+fn admission_maps_the_rows_launches_can_write_and_no_more() {
+    // Masked padding: prompt + max_tokens + one decode quantum, independent of the bucket.
+    assert_eq!(admission_rows(9_000 + 128, 9_000, 9, None, 16_384), 9_137);
+    // Unmasked padding: a prefilling prompt can be charged a whole bucket of pad rows.
+    assert_eq!(admission_rows(9_000 + 128, 9_000, 9, Some(4_224), 16_384), 13_224);
+    assert_eq!(admission_rows(100 + 8_000, 100, 9, Some(4_224), 16_384), 8_109);
+    // Never past the compiled context.
+    assert_eq!(admission_rows(16_384, 16_000, 9, None, 16_384), 16_384);
+    assert_eq!(admission_rows(16_000, 15_000, 9, Some(4_224), 16_384), 16_384);
+}
