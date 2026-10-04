@@ -1785,10 +1785,10 @@ impl RuntimeConfig {
     /// behaviour. Unset derives [`Self::VMM_CACHE_MIN_FREE_FRACTION`] of the device, because a
     /// fixed MiB figure that is right on a 192 GiB MI300X is a third of a small card. A caller
     /// that knows `free_after_load` (the CUDA engine) gets
-    /// [`Self::VMM_CACHE_MIN_FREE_FRACTION_LOADED`] instead, so a cache-on server peaks where
-    /// vLLM at its default utilization does, capped at half of `free_after_load`. That needs
-    /// room for the cache's static budget beside the 10%; a card whose KV rings leave less
-    /// (Gemma-4-26B on an 80 GiB H100: 4.8 GiB free, already at vLLM's peak) keeps an eighth
+    /// [`Self::VMM_CACHE_MIN_FREE_FRACTION_LOADED`] instead (the serving-time transient the
+    /// load does not preallocate), capped at half of `free_after_load`. That needs room for the
+    /// cache's static budget beside it; a card whose KV rings leave less (Gemma-4-26B on an
+    /// 80 GiB H100: 4.8 GiB free) keeps an eighth
     /// of `free_after_load` instead, because a larger floor evicts its shared checkpoints
     /// (57/67 prefix-repetition hits at 602 MiB, 52 at 764, 8 at 2409). A backend that cannot
     /// report free bytes degrades to the static budget on its own
@@ -1858,8 +1858,8 @@ impl RuntimeConfig {
         budget.min(((total as f64 * util) as u64).saturating_sub(used))
     }
 
-    /// Cache room, as a fraction of the device, that free-after-load must hold beside vLLM's 10%
-    /// headroom before the pressure floor is the 10%; below it (Gemma-4-26B on an 80 GiB H100) the
+    /// Cache room, as a fraction of the device, that free-after-load must hold beside the loaded
+    /// floor before the pressure floor is that fraction; below it (Gemma-4-26B on an 80 GiB H100) the
     /// floor is an eighth of free-after-load so the shared checkpoints stay cached.
     const VMM_CACHE_MIN_ROOM_FRACTION: f64 = 0.05;
 
@@ -1868,9 +1868,12 @@ impl RuntimeConfig {
     /// enough that the cache is not evicting on an idle device.
     const VMM_CACHE_MIN_FREE_FRACTION: f64 = 0.04;
 
-    /// vLLM's headroom at its default `--gpu-memory-utilization` 0.9: on an 80 GiB H100 it
-    /// peaks at 73.5 GiB, and a floor of 10% keeps a cache-on plow server there too.
-    const VMM_CACHE_MIN_FREE_FRACTION_LOADED: f64 = 0.10;
+    /// The CUDA engine preallocates activations, workspaces and rings at load; what serving adds
+    /// outside the prefix pool is lazily captured prefill graphs and the reuse pool (Gemma-4-12B
+    /// BF16 KV, agentic16k c32-c128: at most +1.0 GiB over the whole run). Snapshots and KV
+    /// blocks evict and retry on OOM. 2% (1.6 GiB on an 80 GiB H100) covers that; vLLM's 10%
+    /// held 6.5 GiB idle that the cache could use.
+    const VMM_CACHE_MIN_FREE_FRACTION_LOADED: f64 = 0.02;
 
     /// `--amd-prefix-fine-rows` / `PLOW_AMD_PREFIX_FINE_ROWS`, or `None` when unset (fine
     /// matching off, the default). See [`crate::memory::vmm::VmmKv::enable_fine_matching`].
@@ -2344,10 +2347,13 @@ mod tests {
         .unwrap();
         let four_pct = ((80u64 << 30) as f64 * 0.04) as u64 >> 20 << 20;
         assert_eq!(config.vmm_cache_min_free_bytes(80 << 30, None), Some(four_pct));
-        assert_eq!(config.vmm_cache_min_free_bytes(80 << 30, Some(60 << 30)), Some(8192 << 20));
+        let two_pct = ((80u64 << 30) as f64 * 0.02) as u64 >> 20 << 20;
+        assert_eq!(config.vmm_cache_min_free_bytes(80 << 30, Some(60 << 30)), Some(two_pct));
         // A card whose rings leave 5 GiB free keeps an eighth of it, not 10% of the device.
         assert_eq!(config.vmm_cache_min_free_bytes(80 << 30, Some(5 << 30)), Some(640 << 20));
-        assert_eq!(config.vmm_cache_min_free_bytes(80 << 30, Some(14546 << 20)), Some(7273 << 20));
+        assert_eq!(config.vmm_cache_min_free_bytes(80 << 30, Some(14546 << 20)), Some(two_pct));
+        // 5.4 GiB free cannot hold 2% plus 5% of cache room: an eighth.
+        assert_eq!(config.vmm_cache_min_free_bytes(80 << 30, Some(5530 << 20)), Some(691 << 20));
         let config = super::RuntimeConfig::from_arg_matches(
             &command.clone().try_get_matches_from(["test", "--vmm-cache-min-free-mib=100"]).unwrap(),
         )

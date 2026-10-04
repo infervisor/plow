@@ -355,8 +355,8 @@ cache looks the way it does:
   one base and the flash addressing is untouched (`memory/vmm.rs:14-24`).
   Physical blocks — `PLOW_VMM_BLOCK_MIB`, default 2 MiB — are mapped under a
   slot's frontier as it grows (`ensure_rows`), with a `vmm-premap` thread
-  keeping two block columns mapped ahead and `ensure_rows` acting as the
-  correctness backstop.
+  mapping the next block column once decode is within an eighth of a block of
+  it and `ensure_rows` acting as the correctness backstop.
 - **Sliding layers stay on flat device allocations** (`vmm.rs:1155`: "full
   layers VMM-backed, sliding on cudaMalloc"), because a wrapping ring has no
   stable block identity to map.

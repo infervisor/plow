@@ -1267,7 +1267,13 @@ impl VmmKv {
                     let s = &premap_shared;
                     match job {
                         Job::Premap { seq, pos, generation } => {
-                            let target = ((pos / s.block_rows) + 2)
+                            // The next block only once decode is within an eighth of a block
+                            // of it (256 steps at 2048 rows, vs a ~7 ms map): mapping it as
+                            // soon as a block starts held one idle column per slot (32 MiB on
+                            // Gemma-4-12B BF16, 2 GiB at 64 slots) the prefix cache could use.
+                            let lead = (s.block_rows / 8).max(1);
+                            let ahead = u32::from(pos % s.block_rows + lead >= s.block_rows);
+                            let target = ((pos / s.block_rows) + 1 + ahead)
                                 .saturating_mul(s.block_rows)
                                 .min(s.geo.max_ctx);
                             if s.frontier[seq as usize].load(Ordering::Acquire) < target {
