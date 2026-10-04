@@ -371,8 +371,11 @@ async fn chat_completions_with(
     // it dangling; Qwen3 and DeepSeek-R1 emit the marker themselves).
     let reasoning_mode = crate::serve::reasoning::ReasoningMode::ThinkTag;
     let reasoning_open = crate::serve::reasoning::ReasoningMode::prompt_opens(&prompt);
+    if let Some(e) = crate::serve::prompt_bytes_overflow(state.max_ctx(&req.model), bundle.tokenizer().max_token_bytes(), prompt.len()) {
+        return crate::serve::api_error_for(&e);
+    }
     let prompt_ids = crate::obs::ttft::timed(&crate::obs::ttft::ENCODE, || {
-        bundle.tokenizer().encode(&prompt)
+        crate::serve::encode_prompt(&prompt, |p| bundle.tokenizer().encode(p))
     });
     let n_prompt = prompt_ids.len();
     if prompt_ids.is_empty() {
