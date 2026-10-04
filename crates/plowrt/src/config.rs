@@ -1660,6 +1660,12 @@ impl RuntimeConfig {
         std::env::var(var).ok().filter(|value| !value.is_empty())
     }
 
+    /// `PLOW_THROUGHPUT_K`: the decode quantum under the throughput objective (default 8); a
+    /// packet's `serve.json` can carry the model's measured value.
+    pub(crate) fn throughput_k() -> Option<u32> {
+        Self::env_parse("PLOW_THROUGHPUT_K").filter(|&k: &u32| k > 0)
+    }
+
     /// `PLOW_DEBUG_MAX_INST`: interpreter instruction cap, a fault-bisect aid. Applied to
     /// the decode module and to every prefill object, which share one `e.inst` scale.
     #[cfg(feature = "cuda")]

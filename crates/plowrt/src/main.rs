@@ -686,8 +686,42 @@ impl SelectArgs {
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Before the runtime starts threads and before the CLI reads the environment.
+    let asset_defaults = apply_asset_env_defaults();
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(async_main(asset_defaults))
+}
+
+/// `serve --assets`: export each bundle's packet-carried serve-knob defaults (and its
+/// self-contained `objects/` and cuBLASLt table) unless the environment already sets them, so
+/// `plowrt serve --assets <dir>` alone serves the qualified configuration.
+fn apply_asset_env_defaults() -> Vec<(String, String, String)> {
+    let Ok(cli) = Cli::try_parse() else {
+        return Vec::new();
+    };
+    let Cmd::Serve { assets, .. } = &cli.cmd else {
+        return Vec::new();
+    };
+    match plowrt::asset::serve::asset_env_defaults(assets, |k| {
+        std::env::var(k).ok().filter(|v| !v.is_empty())
+    }) {
+        Ok(defaults) => {
+            for (key, value, _) in &defaults {
+                std::env::set_var(key, value);
+            }
+            defaults
+        }
+        Err(e) => {
+            eprintln!("plowrt serve: {e}");
+            std::process::exit(2);
+        }
+    }
+}
+
+async fn async_main(asset_defaults: Vec<(String, String, String)>) -> Result<(), Box<dyn std::error::Error>> {
     let matches = Cli::command().get_matches();
     let cli = Cli::from_arg_matches(&matches).unwrap_or_else(|err| err.exit());
     let filter =
@@ -723,6 +757,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "plowrt starting"
     );
 
+    for (key, value, source) in &asset_defaults {
+        tracing::info!(%key, %value, %source, "serve default from the assets");
+    }
     RuntimeConfig::init(cli.rt_cfg);
     plowrt::knob_spec::warn_removed_env();
     match cli.cmd {
@@ -3862,11 +3899,11 @@ async fn serve(
     #[cfg(feature = "cuda")]
     {
         let state = Arc::clone(&state);
-        tokio::task::spawn_blocking(move || {
-            plowrt::asr::serving::preload(&state);
-            plowrt::tts::serving::preload(&state);
+        tokio::task::spawn_blocking(move || -> Result<(), String> {
+            plowrt::asr::serving::preload(&state).map_err(|e| e.to_string())?;
+            plowrt::tts::serving::preload(&state)
         })
-        .await?;
+        .await??;
     }
 
     let router = app(Arc::clone(&state));

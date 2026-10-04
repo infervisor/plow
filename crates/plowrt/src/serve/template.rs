@@ -53,125 +53,20 @@ impl std::fmt::Debug for ChatTemplate {
     }
 }
 
-fn read_to_string(p: &Path) -> Option<String> {
-    std::fs::read_to_string(p).ok().filter(|s| !s.trim().is_empty())
-}
-
-/// The template text plus the special tokens, from `dir` or `dir/checkpoint`.
-///
-/// HF puts the template in FOUR places and all four are in the wild: a
-/// standalone `chat_template.jinja`, a `chat_template.json`, a `chat_template`
-/// key inside `tokenizer_config.json` (as a string OR as a list of named
-/// templates), and a `chat_templates/` directory. Reading only some of them
-/// means a checkpoint that uses another one falls silently through to the
-/// hand-written builders — an approximation of a file the weights already
-/// carry. Ordered as `transformers` orders them; the standalone file wins.
-fn find(dir: &Path) -> Option<(String, String, Option<String>, Option<String>)> {
-    for base in [dir.to_path_buf(), dir.join("checkpoint")] {
-        let jinja = base.join("chat_template.jinja");
-        let cfg_path = base.join("tokenizer_config.json");
-        let cfg: Option<serde_json::Value> = std::fs::read_to_string(&cfg_path)
-            .ok()
-            .and_then(|s| serde_json::from_str(&s).ok());
-        let tok = |k: &str| -> Option<String> {
-            let v = cfg.as_ref()?.get(k)?;
-            match v {
-                serde_json::Value::String(s) => Some(s.clone()),
-                // HF also writes `{"content": "<bos>", ...}` here.
-                serde_json::Value::Object(o) => {
-                    o.get("content")?.as_str().map(str::to_string)
-                }
-                _ => None,
-            }
-        };
-        if let Some(text) = read_to_string(&jinja) {
-            return Some((text, jinja.display().to_string(), tok("bos_token"), tok("eos_token")));
-        }
-        let json_path = base.join("chat_template.json");
-        if let Some(text) = read_to_string(&json_path)
-            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
-            .and_then(|v| v.get("chat_template")?.as_str().map(str::to_owned))
-            .filter(|s| !s.trim().is_empty())
-        {
-            return Some((
-                text,
-                json_path.display().to_string(),
-                tok("bos_token"),
-                tok("eos_token"),
-            ));
-        }
-        if let Some(text) = cfg
-            .as_ref()
-            .and_then(|c| c.get("chat_template"))
-            .and_then(|v| v.as_str())
-            .map(str::to_string)
-            .filter(|s| !s.trim().is_empty())
-        {
-            return Some((
-                text,
-                format!("{}#chat_template", cfg_path.display()),
-                tok("bos_token"),
-                tok("eos_token"),
-            ));
-        }
-        // The LIST form: `"chat_template": [{"name": "default", "template": ...}]`.
-        // Prefer the entry named `default`, as `transformers` does, else the
-        // first one — a checkpoint shipping only a named variant still renders.
-        if let Some((name, text)) = cfg
-            .as_ref()
-            .and_then(|c| c.get("chat_template"))
-            .and_then(|v| v.as_array())
-            .and_then(|entries| {
-                let pick = entries
-                    .iter()
-                    .find(|e| e.get("name").and_then(|n| n.as_str()) == Some("default"))
-                    .or_else(|| entries.first())?;
-                let text = pick.get("template")?.as_str()?.to_owned();
-                let name = pick
-                    .get("name")
-                    .and_then(|n| n.as_str())
-                    .unwrap_or("default")
-                    .to_owned();
-                (!text.trim().is_empty()).then_some((name, text))
-            })
-        {
-            return Some((
-                text,
-                format!("{}#chat_template[{name}]", cfg_path.display()),
-                tok("bos_token"),
-                tok("eos_token"),
-            ));
-        }
-        // The DIRECTORY form: `chat_templates/default.jinja`, else any single
-        // `.jinja` in there.
-        let tdir = base.join("chat_templates");
-        let named = tdir.join("default.jinja");
-        let from_dir = read_to_string(&named).map(|t| (named.clone(), t)).or_else(|| {
-            let mut entries: Vec<_> = std::fs::read_dir(&tdir)
-                .ok()?
-                .filter_map(|e| e.ok().map(|e| e.path()))
-                .filter(|p| p.extension().is_some_and(|x| x == "jinja"))
-                .collect();
-            entries.sort();
-            let p = entries.into_iter().next()?;
-            read_to_string(&p).map(|t| (p, t))
-        });
-        if let Some((path, text)) = from_dir {
-            return Some((
-                text,
-                path.display().to_string(),
-                tok("bos_token"),
-                tok("eos_token"),
-            ));
-        }
-    }
-    None
-}
-
 impl ChatTemplate {
-    /// Compile the template shipped with the assets, if any.
+    /// Compile the template shipped with the assets, if any (`dir` or `dir/checkpoint`).
     pub fn load(dir: &Path) -> Option<Arc<ChatTemplate>> {
-        let (text, source, bos_token, eos_token) = find(dir)?;
+        let t = plow_asset::serve_manifest::find_chat_template(dir)?;
+        Self::compile(t.text, t.source, t.bos_token, t.eos_token)
+    }
+
+    /// Compile a template carried by the packet (or found beside the weights).
+    pub fn compile(
+        text: String,
+        source: String,
+        bos_token: Option<String>,
+        eos_token: Option<String>,
+    ) -> Option<Arc<ChatTemplate>> {
         let mut env = Environment::new();
         // HF templates call `raise_exception` to reject a conversation shape.
         env.add_function("raise_exception", |msg: String| -> Result<Value, minijinja::Error> {

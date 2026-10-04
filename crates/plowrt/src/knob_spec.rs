@@ -406,6 +406,14 @@ pub fn warn_removed_env() {
     }
 }
 
+/// Whether `env` names a live runtime knob: what a packet's `serve.json` may carry a default for.
+pub fn is_runtime_env(env: &str) -> bool {
+    RUNTIME
+        .iter()
+        .chain(RAW_ENV)
+        .any(|k| k.env == Some(env) && !matches!(k.status, Status::Removed))
+}
+
 #[rustfmt::skip]
 pub const RUNTIME: &[KnobSpec] = &[
     KnobSpec::new("rt.rt_checkpoint", Some("PLOW_CHECKPOINT"), Layer::Runtime, Domain::Str, UNSET, OPT_IN),
@@ -661,6 +669,7 @@ pub const RAW_ENV: &[KnobSpec] = &[
     KnobSpec::new("env.PLOW_SERVE_POLICY", Some("PLOW_SERVE_POLICY"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
     KnobSpec::new("env.PLOW_TOKEN_BATCH_SOLO", Some("PLOW_TOKEN_BATCH_SOLO"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
     KnobSpec::new("env.PLOW_DEBUG_MAX_INST", Some("PLOW_DEBUG_MAX_INST"), Layer::RawEnv, Domain::Str, UNSET, DIAG),
+    KnobSpec::new("env.PLOW_THROUGHPUT_K", Some("PLOW_THROUGHPUT_K"), Layer::RawEnv, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("env.PLOW_DEV_SAMPLE", Some("PLOW_DEV_SAMPLE"), Layer::RawEnv, Domain::Str, UNSET, DIAG),
     KnobSpec::new("env.PLOW_DSA_VERIFY_CKPT", Some("PLOW_DSA_VERIFY_CKPT"), Layer::RawEnv, Domain::Str, UNSET, DIAG),
     KnobSpec::new("env.PLOW_DSA_VERIFY_OUT", Some("PLOW_DSA_VERIFY_OUT"), Layer::RawEnv, Domain::Str, UNSET, DIAG),

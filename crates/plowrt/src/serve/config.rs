@@ -31,6 +31,27 @@ impl Default for ServingConfig {
 }
 
 impl ServingConfig {
+    /// The checkpoint's sampling defaults over the stock ones; a field it omits keeps the stock
+    /// value.
+    pub fn from_defaults(d: Option<&plow_asset::serve_manifest::SamplingDefaults>) -> Self {
+        let mut cfg = ServingConfig::default();
+        let Some(d) = d else { return cfg };
+        let p = &mut cfg.default_sampling;
+        if let Some(t) = d.temperature {
+            p.temperature = t;
+        }
+        if let Some(t) = d.top_p {
+            p.top_p = t;
+        }
+        if let Some(k) = d.top_k {
+            p.top_k = k as usize;
+        }
+        if let Some(r) = d.repetition_penalty {
+            p.repetition_penalty = r;
+        }
+        cfg
+    }
+
     /// Read `generation_config.json` from `dir` or `dir/checkpoint` — the same
     /// two places [`crate::asset::checkpoint`] already looks for the eos set.
     ///
@@ -38,35 +59,7 @@ impl ServingConfig {
     /// corresponding default alone; a checkpoint that says nothing about
     /// sampling is served exactly as before.
     pub fn load(dir: &Path) -> Self {
-        let mut cfg = ServingConfig::default();
-        let Some(v) = [dir.join("generation_config.json"), dir.join("checkpoint").join("generation_config.json")]
-            .iter()
-            .find_map(|p| {
-                std::fs::read_to_string(p)
-                    .ok()
-                    .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
-            })
-        else {
-            return cfg;
-        };
-        let p = &mut cfg.default_sampling;
-        if let Some(t) = v.get("temperature").and_then(serde_json::Value::as_f64) {
-            p.temperature = t as f32;
-        }
-        if let Some(t) = v.get("top_p").and_then(serde_json::Value::as_f64) {
-            p.top_p = t as f32;
-        }
-        // HF spells "no top-k" as 0 or as a missing key; the sampler spells it 0.
-        if let Some(k) = v.get("top_k").and_then(serde_json::Value::as_u64) {
-            p.top_k = k as usize;
-        }
-        if let Some(r) = v
-            .get("repetition_penalty")
-            .and_then(serde_json::Value::as_f64)
-        {
-            p.repetition_penalty = r as f32;
-        }
-        cfg
+        Self::from_defaults(plow_asset::serve_manifest::read_sampling(dir).as_ref())
     }
 }
 

@@ -73,6 +73,11 @@ const NOT_CALM: u64 = u64::MAX;
 /// Throughput decode quantum: E4B and Veena serve their best c64/c128 at K = 8 with the
 /// single-step rule below (`docs/runtime/gemma4-e4b-h100.md`, `docs/runtime/tts.md`).
 pub const THROUGHPUT_K: u32 = 8;
+
+/// [`THROUGHPUT_K`] unless `PLOW_THROUGHPUT_K` (or the packet's serve default) says otherwise.
+pub fn throughput_k() -> u32 {
+    crate::config::RuntimeConfig::throughput_k().unwrap_or(THROUGHPUT_K)
+}
 /// AMD latency quantum. AMD has no lookahead pipeline, so a lone stream still needs the
 /// deferred read to amortise its host turnaround; every AMD latency recipe ran K = 4.
 const AMD_LATENCY_K: u32 = 4;
@@ -146,13 +151,13 @@ fn decode_k_for(class: Class, amd: bool, token_group: usize) -> u32 {
     match class {
         Class::Realtime if amd => AMD_LATENCY_K,
         Class::Realtime => token_group.max(1) as u32,
-        Class::HighConcurrency => THROUGHPUT_K,
+        Class::HighConcurrency => throughput_k(),
     }
 }
 
 /// The quantum an engine is built for: the widest any class may ask for.
 pub fn decode_k_capacity() -> u32 {
-    crate::config::RuntimeConfig::get().nv.multistep.unwrap_or(THROUGHPUT_K)
+    crate::config::RuntimeConfig::get().nv.multistep.unwrap_or_else(throughput_k)
 }
 
 /// Queue-sized prefill packing: the oldest prompt runs whole and later ones join only while that

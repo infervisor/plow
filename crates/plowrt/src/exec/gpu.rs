@@ -3593,6 +3593,7 @@ impl GpuEngine {
     pub fn load(be: Arc<CudaBackend>, assets_dir: &Path, checkpoint_dir: &Path) -> Result<Self> {
         let t0 = std::time::Instant::now();
         crate::knob_spec::check_assets(&assets_dir.join("model.pkt"))?;
+        let serve = crate::asset::serve::resolve(assets_dir, checkpoint_dir)?;
         let load_prof = load_profile();
         let mut load_tim = load_prof.then(|| LoadTiming::new(t0));
         if load_prof {
@@ -3778,7 +3779,7 @@ impl GpuEngine {
             .and_then(|granularity| {
                 Self::select_vmm_prefix_layout(
                     &blob,
-                    checkpoint_dir,
+                    serve.manifest.kv.as_ref(),
                     config,
                     be.compute_capability(),
                     granularity,
@@ -5589,11 +5590,7 @@ impl GpuEngine {
         // lives in `tokenizer_config.json` rather than in the eos list — K3
         // closes on `<|close|>` — ran past its own turn boundary on NVIDIA
         // while stopping correctly on the other two backends.
-        let mut stop_ids = crate::asset::checkpoint::read_eos_ids(checkpoint_dir);
-        stop_ids.extend(crate::asset::checkpoint::chat_stop_ids(
-            checkpoint_dir,
-            &stop_ids,
-        ));
+        let mut stop_ids = serve.manifest.stop_token_ids.clone();
         stop_ids.sort_unstable();
         stop_ids.dedup();
         if let Some(tm) = load_tim.as_mut() {

@@ -191,10 +191,14 @@ impl BlobPlan {
             let full = manifest
                 .as_ref()
                 .is_some_and(|m| m.caches.iter().any(|c| c.window == 0));
-            let prefix_layout = checkpoint.and_then(|path| {
+            let kv = match checkpoint {
+                Some(path) => crate::asset::serve::resolve(dir, path)?.manifest.kv,
+                None => None,
+            };
+            let prefix_layout = checkpoint.and_then(|_| {
                 crate::exec::gpu::GpuEngine::select_vmm_prefix_layout(
                     &blob,
-                    path,
+                    kv.as_ref(),
                     config,
                     capability,
                     granularity,

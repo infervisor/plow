@@ -200,6 +200,7 @@ async fn chat_completions_with(
     // reference path keeps the simple role-prefix flatten — its logits are a
     // stand-in, so a template would be costume jewelry there.
     let mut template_error: Option<String> = None;
+    let mut no_template: Option<String> = None;
     let render_opts = crate::serve::template::RenderOpts {
         kwargs: req.chat_template_kwargs.clone().unwrap_or_default(),
         reasoning_effort: req.reasoning_effort.clone(),
@@ -235,7 +236,23 @@ async fn chat_completions_with(
                     }
                 }
             }
-            gpu_chat_prompt(tok.as_deref(), &req.messages)
+            match tok.as_deref().map(|b| b.serve()) {
+                // A packet that carries serve.json is taken at its word: a built-in builder only
+                // when it names one, and no guessing from the vocabulary.
+                Some(serve) if serve.from_packet => {
+                    match serve.manifest.chat.as_ref().and_then(|c| c.builtin.as_deref()) {
+                        Some(id) => builtin_chat_prompt(id, &req.messages).unwrap_or_else(|| {
+                            no_template = Some(format!("unknown built-in chat format {id:?}"));
+                            String::new()
+                        }),
+                        None => {
+                            no_template = Some("this model's packet carries no chat template".into());
+                            String::new()
+                        }
+                    }
+                }
+                _ => gpu_chat_prompt(tok.as_deref(), &req.messages),
+            }
         } else {
             let mut prompt = String::new();
             for m in &req.messages {
@@ -250,6 +267,15 @@ async fn chat_completions_with(
         }
     });
 
+    if let Some(e) = no_template {
+        return crate::serve::api_error(
+            axum::http::StatusCode::BAD_REQUEST,
+            format!("{e}; use /v1/completions"),
+            "invalid_request_error",
+            Some("chat_template_missing"),
+            Some("messages".into()),
+        );
+    }
     if let Some(e) = template_error {
         return crate::serve::api_error(
             axum::http::StatusCode::BAD_REQUEST,
@@ -369,8 +395,8 @@ async fn chat_completions_with(
     // costs at most a 7-byte delay on its first chunk and nothing after. What
     // the PROMPT decides is only whether the trace is already open (GLM leaves
     // it dangling; Qwen3 and DeepSeek-R1 emit the marker themselves).
-    let reasoning_mode = crate::serve::reasoning::ReasoningMode::ThinkTag;
-    let reasoning_open = crate::serve::reasoning::ReasoningMode::prompt_opens(&prompt);
+    let reasoning_mode = crate::serve::reasoning::ReasoningMode::for_bundle(&bundle);
+    let reasoning_open = reasoning_mode.prompt_opens(&prompt);
     let prompt_ids = crate::obs::ttft::timed(&crate::obs::ttft::ENCODE, || {
         bundle.tokenizer().encode(&prompt)
     });
@@ -503,6 +529,19 @@ async fn chat_completions_with(
 /// which another checkpoint's tokenizer spells out as literal text.
 ///
 /// Unknown family → Gemma's format, the previous behavior.
+/// The built-in prompt builder a packet names (`serve.json` `chat.builtin`), for checkpoints that
+/// ship no template.
+fn builtin_chat_prompt(id: &str, messages: &[Message]) -> Option<String> {
+    Some(match id {
+        "k3" => k3_chat_prompt(messages),
+        "harmony" => harmony_chat_prompt(messages),
+        "glm" => glm_chat_prompt(messages),
+        "llama3" => llama3_chat_prompt(messages),
+        "gemma" => gemma_chat_prompt(messages),
+        _ => return None,
+    })
+}
+
 fn gpu_chat_prompt(bundle: Option<&crate::asset::ModelBundle>, messages: &[Message]) -> String {
     let one = |m: &str| {
         bundle

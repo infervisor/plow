@@ -580,87 +580,13 @@ impl Drop for Prefetcher {
     }
 }
 
-/// The checkpoint's stop-token set: `generation_config.json` `eos_token_id`
-/// (int or list), falling back to `config.json`, falling back to empty (the
-/// caller then stops on max_tokens only).
-///
-/// Metadata, not tensors — so it reads the directory directly and does not need
-/// the shards mmap'd. Shared by both engines: a backend that skipped this emits
-/// its eos id as ordinary text and runs every request to `max_tokens`.
+/// The checkpoint's stop-token set (`plow_asset::serve_manifest::read_eos_ids`), for engines
+/// served without an asset bundle.
 pub(crate) fn read_eos_ids(dir: &Path) -> Vec<u32> {
-    for file in ["generation_config.json", "config.json"] {
-        let Ok(bytes) = std::fs::read(dir.join(file)) else {
-            continue;
-        };
-        let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
-            continue;
-        };
-        match v.get("eos_token_id") {
-            Some(serde_json::Value::Number(n)) => {
-                if let Some(id) = n.as_u64() {
-                    return vec![id as u32];
-                }
-            }
-            Some(serde_json::Value::Array(a)) => {
-                let ids: Vec<u32> = a
-                    .iter()
-                    .filter_map(|x| x.as_u64().map(|v| v as u32))
-                    .collect();
-                if !ids.is_empty() {
-                    return ids;
-                }
-            }
-            _ => {}
-        }
-    }
-    Vec::new()
+    plow_asset::serve_manifest::read_eos_ids(dir)
 }
 
-/// Stop ids a served CHAT turn needs beyond `eos_token_id`.
-///
-/// `generation_config.json` names the id that ends a *sequence*. Some chat formats close a
-/// structured turn before they get there, and a served completion that runs to the sequence eos
-/// leaks the framing into the user's text.
-///
-/// Kimi-K3 is the live case and the only one so far. Its turn is XTML-ish
-/// (`encoding_k3.py::build_chat_segments`): the assistant opens `<|open|>response<|sep|>` and the
-/// answer ends at the MATCHING `<|close|>` — after which the template goes on to emit
-/// `response<|sep|><|close|>message<|sep|>` and only then `<|end_of_msg|>` (163586), which is what
-/// `eos_token_id` names. Stopping only at eos returned
-///
-/// ```text
-/// The capital of France is Paris.<|close|>response<|sep|><|close|>message<|sep|>
-/// ```
-///
-/// — a correct answer with four markers of channel bookkeeping stapled to it.
-/// (Fenced `text`, not indented: an indented block is a RUST block to rustdoc,
-/// which then tries to compile this sentence and fails the doctest run.)
-///
-/// Keyed on the CHECKPOINT's own tokens rather than on a model name: the extra stop is added only
-/// when this checkpoint both declares `<|end_of_msg|>` as its eos AND ships a `<|close|>` token,
-/// which is exactly the K3 turn structure and cannot fire on a checkpoint shaped differently.
-/// `serve::chat::k3_chat_prompt` renders the matching prompt; the two must stay in step, so if
-/// that template ever opens the `think` channel instead, this rule needs revisiting — `<|close|>`
-/// would then end the THOUGHT, not the answer.
+/// Stop ids a chat turn needs beyond `eos_token_id` (`plow_asset::serve_manifest::chat_stop_ids`).
 pub(crate) fn chat_stop_ids(dir: &Path, eos: &[u32]) -> Vec<u32> {
-    let Ok(bytes) = std::fs::read(dir.join("tokenizer_config.json")) else {
-        return Vec::new();
-    };
-    let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
-        return Vec::new();
-    };
-    let Some(added) = v.get("added_tokens_decoder").and_then(|a| a.as_object()) else {
-        return Vec::new();
-    };
-    let id_of = |want: &str| -> Option<u32> {
-        added.iter().find_map(|(k, e)| {
-            (e.get("content").and_then(|c| c.as_str()) == Some(want))
-                .then(|| k.parse::<u32>().ok())
-                .flatten()
-        })
-    };
-    match (id_of("<|end_of_msg|>"), id_of("<|close|>")) {
-        (Some(eom), Some(close)) if eos.contains(&eom) => vec![close],
-        _ => Vec::new(),
-    }
+    plow_asset::serve_manifest::chat_stop_ids(dir, eos)
 }
