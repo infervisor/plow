@@ -1,7 +1,7 @@
 use packet::dev::{DevOp, TENSOR_NONE};
 use packet::devbuild::{Model, SectionData, SECT_METADATA};
 use plow_asset::segment_roles::{
-    AttentionCapability, ProgramRoles, SegmentObject, SegmentRoles, INTERPRETER,
+    AttentionCapability, AttentionShape, ProgramRoles, SegmentObject, SegmentRoles, INTERPRETER,
     PREFILL_ATTENTION_HD256_BKV32, PREFILL_ATTENTION_HD256_BKV32_ABI,
     PREFILL_ATTENTION_HD256_GQA2_BKV32, PREFILL_ATTENTION_HD256_GQA2_BKV32_ABI,
     PREFILL_ATTENTION_HD512_PX4_BQ64, PREFILL_ATTENTION_HD512_PX4_BQ64_ABI,
@@ -428,7 +428,34 @@ fn capability(query_tile: u32, kv_tile: u32) -> AttentionCapability {
 fn px4_bq64_capability() -> AttentionCapability {
     AttentionCapability {
         warps: 16,
+        shape: Some(object_shape(
+            &HD512_PX4_BQ64_OBJECT_GLOBALS,
+            "plow_arena_bytes_pfattn_hd512_px4_bq64",
+            Some(vec![4096, 8192]),
+        )),
         ..capability(64, 16)
+    }
+}
+
+/// The model geometry pinned by a fixed-shape object's globals.
+fn object_shape(globals: &[(&str, u32)], arena: &str, rows: Option<Vec<u32>>) -> AttentionShape {
+    let global = |wanted: &str| {
+        globals
+            .iter()
+            .find(|(name, _)| *name == wanted)
+            .map(|&(_, value)| value)
+    };
+    let pinned = |wanted: &str| global(wanted).expect("pinned object global");
+    AttentionShape {
+        n_head: pinned("plow_attention_n_head"),
+        n_kv_head: pinned("plow_attention_n_kv_head"),
+        window: if global("plow_attention_global") == Some(1) {
+            0
+        } else {
+            pinned("plow_attention_window")
+        },
+        arena_bytes: pinned(arena),
+        rows,
     }
 }
 
@@ -791,7 +818,13 @@ pub(crate) fn apply(
             query_tile: 64,
             kv_tile: 32,
             warps: 8,
-            shape: None,
+            shape: (selection.kind == Kind::Hd256Gqa2Bkv32).then(|| {
+                object_shape(
+                    &HD256_GQA2_OBJECT_GLOBALS,
+                    "plow_arena_bytes_pfattn_hd256_gqa2_bkv32",
+                    None,
+                )
+            }),
         },
         Kind::Hd512 => capability(selection.query_tile, selection.kv_tile),
         Kind::Hd512Px4Bq64 => px4_bq64_capability(),

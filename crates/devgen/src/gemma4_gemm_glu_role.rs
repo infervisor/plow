@@ -2,7 +2,7 @@ use packet::dev::{DevOp, TENSOR_NONE};
 use packet::devbuild::{Model, SectionData, SECT_METADATA};
 use packet::rope::GEN_TMAP_BF16;
 use plow_asset::segment_roles::{
-    ProgramRoles, SegmentObject, SegmentRoles, BF16_PREFILL_GEMM_GLU_GEMMA4,
+    GemmCapability, ProgramRoles, SegmentObject, SegmentRoles, BF16_PREFILL_GEMM_GLU_GEMMA4,
     BF16_PREFILL_GEMM_GLU_GEMMA4_ABI, INTERPRETER, SECTION,
 };
 use std::collections::{BTreeMap, BTreeSet};
@@ -23,6 +23,32 @@ const OBJECT_GLOBALS: [(&str, u32); 11] = [
     ("plow_block_pfgemm_glu_gemma4", 384),
     ("plow_arena_bytes_pfgemm_glu_gemma4", 197696),
 ];
+
+fn gemm_capability() -> GemmCapability {
+    let global = |wanted: &str| {
+        OBJECT_GLOBALS
+            .iter()
+            .find(|(name, _)| *name == wanted)
+            .map(|&(_, value)| value)
+            .expect("pinned object global")
+    };
+    GemmCapability {
+        rows: vec![
+            global("plow_pfgemm_glu_gemma4_min_rows"),
+            global("plow_pfgemm_glu_gemma4_max_rows"),
+        ],
+        n: global("plow_pfgemm_glu_gemma4_n"),
+        k: global("plow_pfgemm_glu_gemma4_k"),
+        bm: global("plow_pfgemm_glu_gemma4_bm"),
+        bn: global("plow_pfgemm_glu_gemma4_bn"),
+        bk: global("plow_pfgemm_glu_gemma4_bk"),
+        stages: global("plow_pfgemm_glu_gemma4_stages"),
+        block: global("plow_block_pfgemm_glu_gemma4"),
+        arena_bytes: global("plow_arena_bytes_pfgemm_glu_gemma4"),
+        tile_band: None,
+        direct_entry: None,
+    }
+}
 
 pub(crate) fn exact_shape(m: u32, n: u32, k: u32) -> bool {
     matches!(m, 4096 | 8192) && n == 15360 && k == 3840
@@ -279,7 +305,7 @@ pub(crate) fn apply_output_object(
             sha256: Some(plow_asset::decode_objects::image_sha256(&image)),
             promote_k512: None,
             attention: None,
-            gemm: None,
+            gemm: Some(gemm_capability()),
             decode_plan: None,
         },
     );
@@ -458,6 +484,10 @@ mod tests {
         assert_eq!(
             roles.objects[&BF16_PREFILL_GEMM_GLU_GEMMA4].sha256,
             Some(plow_asset::decode_objects::image_sha256(&image))
+        );
+        assert_eq!(
+            roles.objects[&BF16_PREFILL_GEMM_GLU_GEMMA4].gemm,
+            plow_asset::segment_roles::legacy_gemm(BF16_PREFILL_GEMM_GLU_GEMMA4)
         );
         assert!(!roles.programs.iter().any(|record| record.index == 0));
         for (index, old) in original.iter().enumerate() {
