@@ -613,7 +613,9 @@ fn prefill_moe_lt_capacity(blob: &DevBlob, roles: Option<&SegmentRoles>) -> u32 
         .filter(|(_, g)| g.t >= min_rows)
         .filter_map(|(index, g)| {
             let program = roles?.program(index)?;
-            let selected = packet_role_segments(g, &program.roles, &blob.tensors).ok()?;
+            let selected =
+                packet_role_segments_with(g, &program.roles, &blob.tensors, &roles?.objects)
+                    .ok()?;
             if !selected.contains(&plow_asset::segment_roles::MOE_PREFILL_CUBLASLT) {
                 return None;
             }
@@ -862,7 +864,7 @@ impl SegmentRoleValidation for SegmentRoles {
                     "decode segment roles require coarse local counters".into(),
                 ));
             }
-            packet_role_segments(g, &p.roles, tensors)?;
+            packet_role_segments_with(g, &p.roles, tensors, &self.objects)?;
             if decode && projection_roles {
                 cublaslt::decode_segments(g, tensors, &p.roles)?;
             }
@@ -1428,13 +1430,15 @@ fn validate_gemma4_glu_role_inst(
     d: &DevInst64,
     rows: u32,
     tensors: &[crate::asset::devblob::DevTensor],
+    gemm: &plow_asset::segment_roles::GemmCapability,
 ) -> Result<()> {
     let reject = || RuntimeError::Rejected("invalid Gemma-4 BF16 GemmGlu role instruction".into());
+    let (n, k) = (gemm.n, gemm.k);
     if d.op != DevOp::GemmGlu as u16
         || d.i[0] != rows
-        || !matches!(rows, 4096 | 8192)
-        || d.i[1] != 15360
-        || d.i[2] != 3840
+        || !gemm.rows.contains(&rows)
+        || d.i[1] != n
+        || d.i[2] != k
         || d.i[3] == 0
         || d.i[4] != 0
         || d.i[5] != 0
@@ -1455,10 +1459,10 @@ fn validate_gemma4_glu_role_inst(
             .and_then(|elements| elements.checked_mul(2))
     };
     for (handle, required) in [
-        (u32::from(d.t[0]), bytes(rows, 15360)),
-        (u32::from(d.t[1]), bytes(rows, 3840)),
-        (u32::from(d.t[2]), bytes(15360, 3840)),
-        (u32::from(d.t[5]), bytes(15360, 3840)),
+        (u32::from(d.t[0]), bytes(rows, n)),
+        (u32::from(d.t[1]), bytes(rows, k)),
+        (u32::from(d.t[2]), bytes(n, k)),
+        (u32::from(d.t[5]), bytes(n, k)),
     ] {
         let required = required.ok_or_else(reject)?;
         if tensors
@@ -1482,13 +1486,15 @@ fn validate_gemma4_w8a8_glu_role_inst(
     d: &DevInst64,
     rows: u32,
     tensors: &[crate::asset::devblob::DevTensor],
+    gemm: &plow_asset::segment_roles::GemmCapability,
 ) -> Result<()> {
     let reject = || RuntimeError::Rejected("invalid Gemma-4 W8A8 GemmGlu role instruction".into());
+    let (n, k) = (gemm.n, gemm.k);
     if d.op != DevOp::GemmGluFp8 as u16
         || d.i[0] != rows
-        || !matches!(rows, 4096 | 8192)
-        || d.i[1] != 15360
-        || d.i[2] != 3840
+        || !gemm.rows.contains(&rows)
+        || d.i[1] != n
+        || d.i[2] != k
         || d.i[3] == 0
         || d.i[4] != 0
         || d.i[5] != 0
@@ -1507,13 +1513,13 @@ fn validate_gemma4_w8a8_glu_role_inst(
             .and_then(|elements| elements.checked_mul(element_bytes))
     };
     for (handle, required) in [
-        (u32::from(d.t[0]), matrix_bytes(rows, 15360, 2)),
-        (u32::from(d.t[1]), matrix_bytes(rows, 3840, 1)),
-        (u32::from(d.t[2]), matrix_bytes(15360, 3840, 1)),
+        (u32::from(d.t[0]), matrix_bytes(rows, n, 2)),
+        (u32::from(d.t[1]), matrix_bytes(rows, k, 1)),
+        (u32::from(d.t[2]), matrix_bytes(n, k, 1)),
         (u32::from(d.t[3]), Some(u64::from(rows) * 4)),
-        (u32::from(d.t[4]), Some(15360 * 4)),
-        (u32::from(d.t[5]), matrix_bytes(15360, 3840, 1)),
-        (u32::from(d.t[6]), Some(15360 * 4)),
+        (u32::from(d.t[4]), Some(u64::from(n) * 4)),
+        (u32::from(d.t[5]), matrix_bytes(n, k, 1)),
+        (u32::from(d.t[6]), Some(u64::from(n) * 4)),
     ] {
         let required = required.ok_or_else(reject)?;
         if tensors
@@ -1533,11 +1539,40 @@ fn validate_gemma4_w8a8_glu_role_inst(
     Ok(())
 }
 
+#[cfg(test)]
 fn packet_role_segments(
     g: &crate::asset::devblob::DevProg,
     roles: &[u8],
     tensors: &[crate::asset::devblob::DevTensor],
 ) -> Result<Vec<u8>> {
+    packet_role_segments_with(g, roles, tensors, &std::collections::BTreeMap::new())
+}
+
+/// `objects` supplies role descriptors; a role without one keeps the legacy Gemma-4 shape.
+fn packet_role_segments_with(
+    g: &crate::asset::devblob::DevProg,
+    roles: &[u8],
+    tensors: &[crate::asset::devblob::DevTensor],
+    objects: &std::collections::BTreeMap<u8, SegmentObject>,
+) -> Result<Vec<u8>> {
+    let gemm = |role: u8| {
+        objects
+            .get(&role)
+            .map_or_else(
+                || plow_asset::segment_roles::legacy_gemm(role),
+                |object| object.gemm_or_legacy(role),
+            )
+            .ok_or_else(|| RuntimeError::Rejected("GEMM role has no shape".into()))
+    };
+    let attention_shape = |role: u8| {
+        objects
+            .get(&role)
+            .map_or_else(
+                || plow_asset::segment_roles::legacy_attention_shape(role),
+                |object| object.attention_shape_or_legacy(role),
+            )
+            .ok_or_else(|| RuntimeError::Rejected("attention role has no shape".into()))
+    };
     validate_segment_windows(g)?;
     if roles.len() + 1 != g.gq_seg_ofs.len()
         || roles
@@ -1708,17 +1743,20 @@ fn packet_role_segments(
                     ));
                 }
                 validate_attention_role_inst(d, g.t, tensors, 512, true, true)?;
-                if role == plow_asset::segment_roles::PREFILL_ATTENTION_HD512_PX4_BQ64
-                    && (!matches!(g.t, 4096 | 8192)
-                        || d.i[2] != 16
-                        || d.i[3] != 1
+                if role == plow_asset::segment_roles::PREFILL_ATTENTION_HD512_PX4_BQ64 {
+                    let shape = attention_shape(role)?;
+                    if shape.rows.as_deref().is_none_or(|rows| !rows.contains(&g.t))
+                        || shape.window != 0
+                        || d.i[2] != shape.n_head
+                        || d.i[3] != shape.n_kv_head
                         || d.i[5] != 0
                         || d.i[7] != 1
-                        || d.t[5] == TENSOR_NONE16)
-                {
-                    return Err(RuntimeError::Rejected(
-                        "HD512 px4 BQ64 role requires exact Gemma-4 global attention".into(),
-                    ));
+                        || d.t[5] == TENSOR_NONE16
+                    {
+                        return Err(RuntimeError::Rejected(
+                            "HD512 px4 BQ64 role requires its fixed global attention shape".into(),
+                        ));
+                    }
                 }
             } else if matches!(
                 role,
@@ -1726,7 +1764,22 @@ fn packet_role_segments(
                     | plow_asset::segment_roles::PREFILL_ATTENTION_HD256_BKV32
                     | plow_asset::segment_roles::PREFILL_ATTENTION_HD256_GQA2_BKV32
             ) {
-                if !d.is_hd256_gqa2_sliding_prefill() {
+                let sliding = if role
+                    == plow_asset::segment_roles::PREFILL_ATTENTION_HD256_GQA2_BKV32
+                {
+                    let shape = attention_shape(role)?;
+                    shape.rows.as_deref().is_none_or(|rows| rows.contains(&g.t))
+                        && d.op == DevOp::FlashPrefill as u16
+                        && d.i[2] == shape.n_head
+                        && d.i[3] == shape.n_kv_head
+                        && d.i[5] == shape.window
+                        && d.i[6] == 256
+                        && d.i[7] == 1
+                        && d.t[5] != TENSOR_NONE16
+                } else {
+                    d.is_hd256_gqa2_sliding_prefill()
+                };
+                if !sliding {
                     return Err(RuntimeError::Rejected(
                         "HD256 role requires exact Gemma sliding attention".into(),
                     ));
@@ -1737,9 +1790,9 @@ fn packet_role_segments(
             } else if role == plow_asset::segment_roles::MXFP4_MOE {
                 validate_mxfp4_moe_role_inst(d, g.t, g.stream_ofs.len(), tensors)?;
             } else if role == plow_asset::segment_roles::BF16_PREFILL_GEMM_GLU_GEMMA4 {
-                validate_gemma4_glu_role_inst(d, g.t, tensors)?;
+                validate_gemma4_glu_role_inst(d, g.t, tensors, &gemm(role)?)?;
             } else if role == plow_asset::segment_roles::W8A8_PREFILL_GEMM_GLU_GEMMA4 {
-                validate_gemma4_w8a8_glu_role_inst(d, g.t, tensors)?;
+                validate_gemma4_w8a8_glu_role_inst(d, g.t, tensors, &gemm(role)?)?;
             } else if role == plow_asset::segment_roles::FP8_M1
                 && (g.t != 1 || d.op != DevOp::GemmFp8 as u16)
             {
@@ -5969,17 +6022,18 @@ impl GpuEngine {
                     }
                 }
                 plow_asset::segment_roles::BF16_PREFILL_GEMM_GLU_GEMMA4 => {
+                    let gemm = object.gemm_or_legacy(id).expect("GLU role shape");
                     let globals = [
-                        ("plow_pfgemm_glu_gemma4_min_rows", 4096),
-                        ("plow_pfgemm_glu_gemma4_max_rows", 8192),
-                        ("plow_pfgemm_glu_gemma4_n", 15360),
-                        ("plow_pfgemm_glu_gemma4_k", 3840),
-                        ("plow_pfgemm_glu_gemma4_stages", 4),
-                        ("plow_pfgemm_glu_gemma4_bm", 128),
-                        ("plow_pfgemm_glu_gemma4_bn", 128),
-                        ("plow_pfgemm_glu_gemma4_bk", 64),
+                        ("plow_pfgemm_glu_gemma4_min_rows", gemm.rows[0]),
+                        ("plow_pfgemm_glu_gemma4_max_rows", gemm.rows[gemm.rows.len() - 1]),
+                        ("plow_pfgemm_glu_gemma4_n", gemm.n),
+                        ("plow_pfgemm_glu_gemma4_k", gemm.k),
+                        ("plow_pfgemm_glu_gemma4_stages", gemm.stages),
+                        ("plow_pfgemm_glu_gemma4_bm", gemm.bm),
+                        ("plow_pfgemm_glu_gemma4_bn", gemm.bn),
+                        ("plow_pfgemm_glu_gemma4_bk", gemm.bk),
                     ];
-                    if capability != Some(1) || block != Some(384) {
+                    if capability != Some(1) || block != Some(gemm.block) {
                         return Err(RuntimeError::Rejected(
                             "incompatible Gemma-4 BF16 GemmGlu role".into(),
                         ));
@@ -5993,25 +6047,29 @@ impl GpuEngine {
                     }
                 }
                 plow_asset::segment_roles::W8A8_PREFILL_GEMM_GLU_GEMMA4 => {
+                    let gemm = object.gemm_or_legacy(id).expect("GLU role shape");
                     let globals = [
-                        ("plow_pfgemm_glu_w8a8_gemma4_min_rows", 4096),
-                        ("plow_pfgemm_glu_w8a8_gemma4_max_rows", 8192),
-                        ("plow_pfgemm_glu_w8a8_gemma4_n", 15360),
-                        ("plow_pfgemm_glu_w8a8_gemma4_k", 3840),
-                        ("plow_pfgemm_glu_w8a8_gemma4_stages", 4),
-                        ("plow_pfgemm_glu_w8a8_gemma4_bm", 128),
-                        ("plow_pfgemm_glu_w8a8_gemma4_bn", 128),
-                        ("plow_pfgemm_glu_w8a8_gemma4_bk", 128),
-                        ("plow_pfgemm_glu_w8a8_gemma4_tile_band", 16),
-                        ("plow_pfgemm_glu_w8a8_gemma4_direct_entry", 1),
+                        ("plow_pfgemm_glu_w8a8_gemma4_min_rows", Some(gemm.rows[0])),
+                        (
+                            "plow_pfgemm_glu_w8a8_gemma4_max_rows",
+                            Some(gemm.rows[gemm.rows.len() - 1]),
+                        ),
+                        ("plow_pfgemm_glu_w8a8_gemma4_n", Some(gemm.n)),
+                        ("plow_pfgemm_glu_w8a8_gemma4_k", Some(gemm.k)),
+                        ("plow_pfgemm_glu_w8a8_gemma4_stages", Some(gemm.stages)),
+                        ("plow_pfgemm_glu_w8a8_gemma4_bm", Some(gemm.bm)),
+                        ("plow_pfgemm_glu_w8a8_gemma4_bn", Some(gemm.bn)),
+                        ("plow_pfgemm_glu_w8a8_gemma4_bk", Some(gemm.bk)),
+                        ("plow_pfgemm_glu_w8a8_gemma4_tile_band", gemm.tile_band),
+                        ("plow_pfgemm_glu_w8a8_gemma4_direct_entry", gemm.direct_entry),
                     ];
-                    if capability != Some(2) || block != Some(384) {
+                    if capability != Some(2) || block != Some(gemm.block) {
                         return Err(RuntimeError::Rejected(
                             "incompatible Gemma-4 W8A8 GemmGlu role".into(),
                         ));
                     }
                     for (name, value) in globals {
-                        if be.module_global_u32(&module, name)? != Some(value) {
+                        if value.is_none() || be.module_global_u32(&module, name)? != value {
                             return Err(RuntimeError::Rejected(
                                 "incompatible Gemma-4 W8A8 GemmGlu role".into(),
                             ));
@@ -6031,25 +6089,28 @@ impl GpuEngine {
                 plow_asset::segment_roles::BF16_PREFILL_GEMM_GLU_GEMMA4
                     | plow_asset::segment_roles::W8A8_PREFILL_GEMM_GLU_GEMMA4
             )
-                && smem != 197696
+                && object.gemm_or_legacy(id).is_none_or(|gemm| smem != gemm.arena_bytes)
             {
                 return Err(RuntimeError::Rejected(
-                    "Gemma-4 BF16 GemmGlu role requires a 197696-byte arena".into(),
+                    "Gemma-4 GemmGlu role arena differs from its shape".into(),
                 ));
             }
+            let attention_shape = object.attention_shape_or_legacy(id);
             if id == plow_asset::segment_roles::PREFILL_ATTENTION_HD256_GQA2_BKV32
-                && smem != 141312
+                && attention_shape.as_ref().is_none_or(|s| smem != s.arena_bytes)
             {
                 return Err(RuntimeError::Rejected(
-                    "paired-GQA2 HD256 role requires a 141312-byte arena".into(),
+                    "paired-GQA2 HD256 role arena differs from its shape".into(),
                 ));
             }
-            if id == plow_asset::segment_roles::PREFILL_ATTENTION_HD256_GQA2_BKV32 {
+            if let (plow_asset::segment_roles::PREFILL_ATTENTION_HD256_GQA2_BKV32, Some(shape)) =
+                (id, &attention_shape)
+            {
                 for (name, value) in [
                     ("plow_attention_packed_only", 1),
-                    ("plow_attention_n_head", 16),
-                    ("plow_attention_n_kv_head", 8),
-                    ("plow_attention_window", 1024),
+                    ("plow_attention_n_head", shape.n_head),
+                    ("plow_attention_n_kv_head", shape.n_kv_head),
+                    ("plow_attention_window", shape.window),
                     ("plow_attention_nsplit", 1),
                     ("plow_attention_direct_entry", 1),
                 ] {
@@ -6061,15 +6122,17 @@ impl GpuEngine {
                 }
             }
             if id == plow_asset::segment_roles::PREFILL_ATTENTION_HD512_PX4_BQ64 {
-                if smem != 110592 {
+                let Some(shape) = attention_shape.as_ref().filter(|s| {
+                    smem == s.arena_bytes && s.window == 0
+                }) else {
                     return Err(RuntimeError::Rejected(
                         "HD512 px4 BQ64 role has incompatible fixed geometry".into(),
                     ));
-                }
+                };
                 for (name, value) in [
                     ("plow_attention_packed_only", 1),
-                    ("plow_attention_n_head", 16),
-                    ("plow_attention_n_kv_head", 1),
+                    ("plow_attention_n_head", shape.n_head),
+                    ("plow_attention_n_kv_head", shape.n_kv_head),
                     ("plow_attention_global", 1),
                     ("plow_attention_nsplit", 1),
                     ("plow_attention_direct_entry", 1),
@@ -9047,13 +9110,14 @@ impl GpuEngine {
                 .iter()
                 .position(|p| std::ptr::eq(p, g))
                 .expect("prefill belongs to blob");
-            let declared_roles = segment_roles.and_then(|r| r.program(program_index));
+            let declared_roles =
+                segment_roles.and_then(|r| Some((r.program(program_index)?, &r.objects)));
             let mut qwen_segments = qwen_prefill_segments(g, &blob.tensors)?;
-            let packet_segment_roles = if let Some(p) = declared_roles {
+            let packet_segment_roles = if let Some((p, objects)) = declared_roles {
                 if qwen_segments.is_empty() && !seg_mode {
                     qwen_segments = vec![None; p.roles.len()];
                 }
-                let selected = packet_role_segments(g, &p.roles, &blob.tensors)?;
+                let selected = packet_role_segments_with(g, &p.roles, &blob.tensors, objects)?;
                 tracing::info!(
                     program_index,
                     launches = p.roles.len(),
@@ -9165,11 +9229,21 @@ impl GpuEngine {
                         "direct packet role requires an exact ordered grid".into(),
                     ));
                 }
+                let px4_shape = (role
+                    == plow_asset::segment_roles::PREFILL_ATTENTION_HD512_PX4_BQ64)
+                    .then(|| {
+                        segment_roles
+                            .and_then(|r| r.objects.get(&role))
+                            .and_then(|object| object.attention_shape_or_legacy(role))
+                    })
+                    .flatten();
                 if role == plow_asset::segment_roles::PREFILL_ATTENTION_HD512_PX4_BQ64
                     && (site.1 != DevOp::FlashPrefill as u16
                         || inst.i[0] != g.t
-                        || !matches!(inst.i[0], 4096 | 8192)
-                        || inst.i[2..8] != [16, 1, 0, 0, 512, 1]
+                        || px4_shape.as_ref().is_none_or(|s| {
+                            s.rows.as_deref().is_none_or(|rows| !rows.contains(&inst.i[0]))
+                                || inst.i[2..8] != [s.n_head, s.n_kv_head, 0, s.window, 512, 1]
+                        })
                         || inst.t[5] == TENSOR_NONE16
                         || inst.t[6] != TENSOR_NONE16
                         || inst.fj[0] != 1.0f32.to_bits()
@@ -12198,6 +12272,9 @@ mod gemv_role_tests;
 mod mxfp4_moe_role_tests;
 
 #[cfg(test)]
+mod glu_role_tests;
+
+#[cfg(test)]
 #[test]
 fn batched_dsa_requires_a_row_aware_cuda_object() {
     let mut blob = decode_rung_tests::fixture();
@@ -12274,6 +12351,10 @@ fn native_w8a16_m1_role_validates_exact_operands_and_extents() {
 #[cfg(test)]
 #[test]
 fn gemma4_glu_role_validates_exact_shapes_maps_and_operands() {
+    let legacy = plow_asset::segment_roles::legacy_gemm(
+        plow_asset::segment_roles::BF16_PREFILL_GEMM_GLU_GEMMA4,
+    )
+    .unwrap();
     let tensors = [
         ("out", 8192_u64 * 15360 * 2),
         ("x", 8192_u64 * 3840 * 2),
@@ -12306,9 +12387,9 @@ fn gemma4_glu_role_validates_exact_shapes_maps_and_operands() {
         ..Default::default()
     };
     d.i = [4096, 15360, 3840, 6, 0, 0, 4, 5];
-    validate_gemma4_glu_role_inst(&d, 4096, &tensors).unwrap();
+    validate_gemma4_glu_role_inst(&d, 4096, &tensors, &legacy).unwrap();
     d.i[0] = 8192;
-    validate_gemma4_glu_role_inst(&d, 8192, &tensors).unwrap();
+    validate_gemma4_glu_role_inst(&d, 8192, &tensors, &legacy).unwrap();
 
     for bad in [
         {
@@ -12327,11 +12408,11 @@ fn gemma4_glu_role_validates_exact_shapes_maps_and_operands() {
             x
         },
     ] {
-        assert!(validate_gemma4_glu_role_inst(&bad, bad.i[0], &tensors).is_err());
+        assert!(validate_gemma4_glu_role_inst(&bad, bad.i[0], &tensors, &legacy).is_err());
     }
     let mut short_map = tensors;
     short_map[6].bytes = 127;
-    assert!(validate_gemma4_glu_role_inst(&d, 8192, &short_map).is_err());
+    assert!(validate_gemma4_glu_role_inst(&d, 8192, &short_map, &legacy).is_err());
 }
 
 mod fp8_m1_role;
