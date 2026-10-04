@@ -868,6 +868,6 @@ impl GpuEngine {
         } else {
             v.ring as u32 - v.kv.geometry().window
         };
-        v.kv.inflight_prefix(b, prompt, lookback)
+        v.kv.inflight_prefix(b, prompt, lookback, &self.pos)
     }
 }

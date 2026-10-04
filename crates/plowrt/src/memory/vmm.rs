@@ -1982,7 +1982,18 @@ impl VmmKv {
     /// records `seq`'s lead like an attach would, so the owner's publish counts it as a second
     /// sighting ([`Self::enable_shared_publish`]); a prompt that does not wait is recorded
     /// once, by its own attach. Commits nothing else for `seq`.
-    pub fn inflight_prefix(&self, seq: usize, prompt: &[u32], lookback: u32) -> Option<(usize, u32)> {
+    ///
+    /// The owner also publishes its shared-prefix end ([`Self::share_rows`]) when its prefill
+    /// passes it, however far below its prompt end (a system prompt under a long user turn).
+    /// While the owner's prefill `frontier` is still below the rows both prompts share, the
+    /// request waits for that boundary instead, moved down to where the prompts diverge.
+    pub fn inflight_prefix(
+        &self,
+        seq: usize,
+        prompt: &[u32],
+        lookback: u32,
+        frontier: &[u32],
+    ) -> Option<(usize, u32)> {
         if !self.prefix_reuse {
             return None;
         }
@@ -2012,7 +2023,7 @@ impl VmmKv {
             }
         }
         inner.cache.release(&hashes, m.blocks);
-        let mut best: Option<(usize, u32)> = None;
+        let mut best: Option<(usize, u32, bool)> = None;
         for (owner, other) in inner.seqs.iter().enumerate() {
             if owner == seq || !inner.prefilling[owner] {
                 continue;
@@ -2027,16 +2038,45 @@ impl VmmKv {
                 })
                 .count();
             let reachable = other.prompt_rows.saturating_sub(lookback as usize).div_ceil(br);
-            let rows = (shared * br) as u32;
-            if shared >= reachable && rows > cached && best.is_none_or(|(_, r)| rows > r) {
-                best = Some((owner, rows));
+            let block_rows = if shared >= reachable { (shared * br) as u32 } else { 0 };
+            // The shared-prefix end, 32-row aligned like `note_share`'s.
+            let common = other.tokens[..other.prompt_rows.saturating_sub(1).min(other.tokens.len())]
+                .iter()
+                .zip(&prompt[..prompt.len() - 1])
+                .take_while(|(a, b)| a == b)
+                .count()
+                / 32
+                * 32;
+            let share = match inner.share[owner] as usize {
+                0 => common,
+                rows => rows.min(common),
+            };
+            let share_rows = if share as u64 > u64::from(frontier.get(owner).copied().unwrap_or(0))
+                && share >= cached as usize + SHARE_MIN_ROWS
+            {
+                share as u32
+            } else {
+                0
+            };
+            let (rows, at_share) = if share_rows > block_rows {
+                (share_rows, true)
+            } else {
+                (block_rows, false)
+            };
+            if rows > cached && best.is_none_or(|(_, r, _)| rows > r) {
+                best = Some((owner, rows, at_share));
             }
         }
-        inner.awaited[seq] = best.map(|(_, rows)| hashes[rows as usize / br - 1]);
+        if let Some((owner, rows, true)) = best {
+            inner.share[owner] = rows;
+        }
+        inner.awaited[seq] = best
+            .filter(|&(_, rows, _)| rows as usize >= br)
+            .map(|(_, rows, _)| hashes[rows as usize / br - 1]);
         if best.is_some() {
             note_lead(&mut inner, seq, prompt);
         }
-        best
+        best.map(|(owner, rows, _)| (owner, rows))
     }
 
     /// Publish `seq`'s computed rows: insert `tokens`' whole blocks into
@@ -5025,7 +5065,7 @@ mod tests {
         assert!(p.try_attach(0, &o).unwrap().is_none());
         p.ensure_rows(0, 30).unwrap();
         p.note_session(0, &o);
-        assert_eq!(p.inflight_prefix(1, &w, u32::MAX), Some((0, 8)));
+        assert_eq!(p.inflight_prefix(1, &w, u32::MAX, &[]), Some((0, 8)));
         assert!(p.checkpoint_awaited(&o, 8));
         assert!(!p.checkpoint_awaited(&o, 16), "nobody waits on the 16-row checkpoint");
         p.publish_at(0, &o, 8, 4, |_| Ok(())).unwrap();
@@ -5123,6 +5163,28 @@ mod tests {
         assert_eq!(p.share_rows(1), 0, "a 100-row common head is below SHARE_MIN_ROWS");
     }
 
+    /// A burst of prompts sharing a system prompt far below their prompt ends: later ones wait
+    /// for the prefilling owner's shared-prefix boundary instead of each recomputing it.
+    #[test]
+    fn inflight_prefix_waits_for_the_owners_shared_prefix_end() {
+        let geo = VmmGeometry { max_ctx: 512, ..uniform_pool(Arc::new(MockVmm::default())).geometry().clone() };
+        let p = VmmKv::new(Arc::new(MockVmm::default()), geo, 64, 0).expect("pool");
+        let head = prompt(300);
+        let with = |tail: u32| -> Vec<u32> { head.iter().copied().chain((0..40).map(|i| tail + i)).collect() };
+        let (a, b) = (with(100_000), with(200_000));
+        assert!(p.try_attach(0, &a).unwrap().is_none());
+        assert_eq!(p.share_rows(0), 0, "no recent prompt yet");
+        assert_eq!(p.inflight_prefix(1, &b, 16, &[296]), None, "the owner passed the shared end");
+        assert_eq!(p.share_rows(0), 0);
+        assert_eq!(p.inflight_prefix(1, &b, 16, &[0]), Some((0, 288)));
+        assert_eq!(p.share_rows(0), 288, "the owner now publishes where the prompts diverge");
+        p.ensure_rows(0, 340).unwrap();
+        p.publish_at(0, &a, 288, 4, |_| Ok(())).unwrap();
+        assert_eq!(p.inflight_prefix(1, &b, 16, &[288]), None, "the boundary is attachable now");
+        p.ensure_rows(1, 1).unwrap();
+        assert_eq!(p.try_attach(1, &b).unwrap().unwrap().rows, 288);
+    }
+
     /// Two sessions share a system prompt (a boundary at 16 rows). Pressure evicts the
     /// older session's tail as one unit (its boundary and the block only it kept
     /// attachable); the shared prefix and the other session's boundary still attach.
@@ -5194,7 +5256,7 @@ mod tests {
         let mut p = pool(ops);
         p.enable_shared_publish();
         let pr = prompt(21);
-        assert_eq!(p.inflight_prefix(0, &pr, u32::MAX), None);
+        assert_eq!(p.inflight_prefix(0, &pr, u32::MAX, &[]), None);
         p.begin_seq(0);
         assert!(p.try_attach(0, &pr).unwrap().is_none());
         p.ensure_rows(0, 21).unwrap();
@@ -5311,23 +5373,23 @@ mod tests {
         assert!(p.try_attach(0, &a).unwrap().is_none());
         let mut b = prompt(16);
         b.extend([901, 902]);
-        assert_eq!(p.inflight_prefix(1, &b, u32::MAX), Some((0, 16)));
+        assert_eq!(p.inflight_prefix(1, &b, u32::MAX, &[]), Some((0, 16)));
         let mut c = prompt(8);
         c.extend((0..9).map(|i| 700 + i));
-        assert_eq!(p.inflight_prefix(1, &c, u32::MAX), Some((0, 8)), "shares the first block only");
+        assert_eq!(p.inflight_prefix(1, &c, u32::MAX, &[]), Some((0, 8)), "shares the first block only");
         let d: Vec<u32> = (0..17).map(|i| 100_000 + i).collect();
-        assert_eq!(p.inflight_prefix(1, &d, u32::MAX), None, "nothing shared");
-        assert_eq!(p.inflight_prefix(1, &prompt(8), u32::MAX), None, "no row left to recompute");
-        assert_eq!(p.inflight_prefix(0, &b, u32::MAX), None, "never waits on itself");
+        assert_eq!(p.inflight_prefix(1, &d, u32::MAX, &[]), None, "nothing shared");
+        assert_eq!(p.inflight_prefix(1, &prompt(8), u32::MAX, &[]), None, "no row left to recompute");
+        assert_eq!(p.inflight_prefix(0, &b, u32::MAX, &[]), None, "never waits on itself");
         // The owner's rings keep 4 rows behind its 17-row prompt end: it can publish the
         // boundary at 16 but not the one at 8.
-        assert_eq!(p.inflight_prefix(1, &b, 4), Some((0, 16)));
-        assert_eq!(p.inflight_prefix(1, &c, 4), None, "the shared boundary is unpublishable");
+        assert_eq!(p.inflight_prefix(1, &b, 4, &[]), Some((0, 16)));
+        assert_eq!(p.inflight_prefix(1, &c, 4, &[]), None, "the shared boundary is unpublishable");
 
         p.ensure_rows(0, 17).unwrap();
         p.publish(0, &a, 128, |_| Ok(())).unwrap();
         p.prefill_done(0);
-        assert_eq!(p.inflight_prefix(1, &b, u32::MAX), None, "the checkpoint is attachable now");
+        assert_eq!(p.inflight_prefix(1, &b, u32::MAX, &[]), None, "the checkpoint is attachable now");
         p.ensure_rows(1, 1).unwrap();
         assert_eq!(p.try_attach(1, &b).unwrap().unwrap().rows, 16);
     }
@@ -5340,9 +5402,9 @@ mod tests {
         assert!(p.try_attach(0, &a).unwrap().is_none());
         let mut b = prompt(16);
         b.push(901);
-        assert_eq!(p.inflight_prefix(1, &b, u32::MAX), Some((0, 16)));
+        assert_eq!(p.inflight_prefix(1, &b, u32::MAX, &[]), Some((0, 16)));
         p.begin_seq(0); // cancelled mid-prefill
-        assert_eq!(p.inflight_prefix(1, &b, u32::MAX), None);
+        assert_eq!(p.inflight_prefix(1, &b, u32::MAX, &[]), None);
     }
 
     #[test]
@@ -5368,7 +5430,7 @@ mod tests {
         assert!(p.try_attach(0, &a).unwrap().is_none());
         let mut b = prompt(32);
         b.push(901);
-        assert_eq!(p.inflight_prefix(1, &b, u32::MAX), Some((0, 32)));
+        assert_eq!(p.inflight_prefix(1, &b, u32::MAX, &[]), Some((0, 32)));
         p.ensure_rows(0, 41).unwrap();
         // The engine publishes every whole-block boundary below the prompt end, then the end.
         p.publish_at(0, &a, 32, 4, |_| Ok(())).unwrap();
