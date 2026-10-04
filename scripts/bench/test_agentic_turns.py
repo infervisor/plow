@@ -142,5 +142,133 @@ class AgenticTurnsTests(unittest.TestCase):
         self.assertAlmostEqual(res["overall"]["cached_fraction"], 7 / 1000)
 
 
+def open_args(**kw):
+    d = dict(seed=5, rate=1.0, duration=300.0, apps=4, system_median=1536, system_sigma=0.6, turns_mean=6,
+             turns_max=20, first_median=1500, first_sigma=1.0, tool_median=700, tool_sigma=1.0, out_median=160,
+             out_sigma=0.7, out_min=16, out_max=1024, think_median_s=5.0, think_sigma=0.8, think_max_s=60.0,
+             max_model_len=16384, template_margin=256, warmup=60.0, cooldown=20.0, slo_ttft_ms=2000.0,
+             slo_tpot_ms=100.0)
+    d.update(kw)
+    return agentic_turns.argparse.Namespace(**d)
+
+
+class OpenLoopPlanTests(unittest.TestCase):
+    def test_plan_is_deterministic_per_seed(self):
+        a, b = agentic_turns.build_plan(open_args()), agentic_turns.build_plan(open_args())
+        self.assertEqual(a, b)
+        self.assertNotEqual(a, agentic_turns.build_plan(open_args(seed=6)))
+        apps, plan = a
+        self.assertEqual(len(apps), 4)
+        arrivals = [p["arrival_s"] for p in plan]
+        self.assertEqual(arrivals, sorted(arrivals))
+        self.assertTrue(all(0 < t < 300 for t in arrivals))
+        # Content: a pure function of the seed, sized to the plan.
+        sizer = agentic_turns.Sizer(None)
+        small = open_args(duration=20.0)
+        apps, plan = agentic_turns.build_plan(small)
+        c1 = agentic_turns.build_open_content(small, sizer, apps, plan)
+        self.assertEqual(c1, agentic_turns.build_open_content(small, sizer, apps, plan))
+        for sess, users in zip(plan, c1[1]):
+            for turn, text in zip(sess["turns"], users):
+                self.assertLess(abs(sizer.count(text) - turn["user_tokens"]), 0.1 * turn["user_tokens"] + 24)
+
+    def test_distribution_parameters(self):
+        args = open_args(rate=2.0, duration=2000.0)
+        apps, plan = agentic_turns.build_plan(args)
+        self.assertLess(abs(len(plan) - 4000) / 4000, 0.05)
+        turns = [t for p in plan for t in p["turns"]]
+        med = lambda xs: sorted(xs)[len(xs) // 2]
+        self.assertLess(abs(med([t["max_tokens"] for t in turns]) - 160) / 160, 0.1)
+        self.assertLess(abs(med([t["think_s"] for t in turns if t["think_s"]]) - 5.0) / 5.0, 0.1)
+        self.assertTrue(all(16 <= t["max_tokens"] <= 1024 for t in turns))
+        self.assertTrue(all(p["turns"][0]["think_s"] == 0 for p in plan))
+        for p in plan:
+            self.assertTrue(1 <= len(p["turns"]) <= 20)
+            for t in p["turns"]:
+                self.assertLessEqual(t["prompt_tokens"] + t["max_tokens"], 16384 - 256)
+        # Without the context cap the turn count is geometric with the requested mean.
+        _, wide = agentic_turns.build_plan(open_args(rate=2.0, duration=2000.0, max_model_len=10**9, turns_max=1000))
+        mean = sum(len(p["turns"]) for p in wide) / len(wide)
+        self.assertLess(abs(mean - 6) / 6, 0.05)
+        prompts = [t["prompt_tokens"] for t in turns]
+        self.assertLess(min(prompts), 2000)
+        self.assertGreater(max(prompts), 15000)
+
+    def test_rate_for_concurrency_is_littles_law(self):
+        args = open_args()
+        plan = agentic_turns.build_plan(open_args(rate=1.0, duration=2000.0))[1]
+        turns = sum(len(p["turns"]) for p in plan) / len(plan)
+        self.assertAlmostEqual(agentic_turns.rate_for_concurrency(args, 48, 8.0), 48 / (turns * 8.0))
+
+    def test_window_metrics(self):
+        args = open_args(duration=100.0, warmup=10.0, cooldown=10.0)
+        row = lambda t0, t1, ttft, tpot, err=None: dict(t_start=t0, t_end=t1, ttft_ms=ttft, tpot_ms=tpot,
+                                                       e2e_ms=(t1 - t0) * 1e3, prompt_tokens=900,
+                                                       completion_tokens=100, cached_tokens=450, error=err)
+        rows = [row(5, 15, 100, 20),        # before the window: only its 5 s overlap counts as in-flight
+                row(20, 30, 1500, 50),      # good
+                row(30, 40, 2500, 50),      # TTFT miss
+                row(40, 60, 500, 150),      # TPOT miss
+                row(50, 70, 1000, 99),      # good
+                row(95, 99, 100, 10)]       # cooldown: unmeasured
+        timeline = [(t, 2, 3) for t in range(0, 100, 10)]
+        m = agentic_turns.window_metrics(rows, args, timeline)
+        self.assertEqual(m["requests"], 4)
+        self.assertAlmostEqual(m["goodput_req_s"], 2 / 80)
+        self.assertAlmostEqual(m["slo_attainment"], 0.5)
+        self.assertAlmostEqual(m["total_tok_s"], 4000 / 80)
+        self.assertAlmostEqual(m["mean_inflight"], (5 + 10 + 10 + 20 + 20) / 80)
+        self.assertAlmostEqual(m["cached_fraction"], 0.5)
+        self.assertEqual((m["max_inflight"], m["mean_sessions"]), (2, 3))
+        self.assertEqual(m["ttft_p50_ms"], 1500)
+        rows.append(row(60, 61, None, None, err="RuntimeError: cut"))
+        m = agentic_turns.window_metrics(rows, args, timeline)
+        self.assertEqual((m["requests"], m["errors"]), (5, 1))
+        self.assertAlmostEqual(m["slo_attainment"], 2 / 5)
+
+
+class OpenLoopServeTests(unittest.TestCase):
+    def setUp(self):
+        self.server = FakeServer()
+        self.tmp = tempfile.TemporaryDirectory()
+
+    def tearDown(self):
+        self.server.close()
+        self.tmp.cleanup()
+
+    def test_open_loop_replays_history_with_planned_lengths(self):
+        out = Path(self.tmp.name) / "q.json"
+        argv = ["--url", f"http://127.0.0.1:{self.server.port}", "--open-loop", "--rate", "4", "--duration", "3",
+                "--warmup", "0.5", "--cooldown", "0.5", "--think-median-s", "0.05", "--think-max-s", "0.2",
+                "--system-median", "300", "--first-median", "200", "--tool-median", "100", "--out-median", "6",
+                "--out-min", "2", "--out-max", "12", "--turns-mean", "3", "--temperature", "0", "--seed", "4",
+                "--out", str(out)]
+        self.assertEqual(agentic_turns.main(argv), 0)
+        res = json.loads(out.read_text())
+        args = agentic_turns.argparse.Namespace(**res["config"])
+        apps, plan = agentic_turns.build_plan(args)
+        rows = res["requests"]
+        self.assertEqual(len(rows), len(self.server.requests))
+        self.assertGreater(len(rows), 4)
+        by_session = {}
+        for headers, body in self.server.requests:
+            by_session.setdefault(headers["X-Session-Id"], []).append(body)
+            self.assertTrue(body["ignore_eos"] and body["temperature"] == 0)
+        for sid, bodies in by_session.items():
+            s = int(sid.rsplit("-", 1)[1])
+            self.assertEqual([b["max_tokens"] for b in bodies], [t["max_tokens"] for t in plan[s]["turns"]][:len(bodies)])
+            self.assertEqual(bodies[0]["messages"][0]["content"].split(")")[0], f"You are assistant app {plan[s]['app']} (seed 4")
+            for prev, cur in zip(bodies, bodies[1:]):
+                self.assertEqual(cur["messages"][:len(prev["messages"])], prev["messages"])
+        self.assertTrue(all(r["t_start"] < 3 for r in rows))
+        o = res["overall"]
+        self.assertEqual((o["errors"], o["errors_total"]), (0, 0))
+        self.assertEqual(o["requests"], sum(1 for r in rows if 0.5 <= r["t_start"] < 2.5))
+        self.assertAlmostEqual(o["slo_attainment"], 1.0)
+        self.assertGreater(o["mean_inflight"], 0)
+        self.assertEqual(res["plan"]["sessions"], len(plan))
+        self.assertTrue(res["timeline"])
+
+
 if __name__ == "__main__":
     unittest.main()
