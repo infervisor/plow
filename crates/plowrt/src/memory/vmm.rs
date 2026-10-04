@@ -302,6 +302,8 @@ pub struct VmmRings {
     windows: Vec<RingWindow>,
     mapped: Vec<bool>,
     prefix: usize,
+    /// Rows the latest [`Self::ensure_prefix`] mapped for a launch; [`Self::release_idle`] keeps them.
+    launch_rows: usize,
     stats: LiveRingStats,
     /// `(unit bytes, handle)`: one physical unit per size, mapped under every unit no slot owns.
     /// Decode and padded prefill rows write garbage into slots without a request; with this
@@ -345,6 +347,7 @@ impl VmmRings {
             windows: Vec::with_capacity(tensors.len()),
             mapped: vec![false; batch],
             prefix: 0,
+            launch_rows: 0,
             stats: LiveRingStats {
                 reserved_bytes,
                 resident_bytes: 0,
@@ -551,6 +554,14 @@ impl VmmRings {
         self.stats.mapped_prefix = self.prefix;
     }
 
+    /// Release a slot with no request unless the latest launch covered it: the next launch at that
+    /// width maps it again, so releasing it every tick costs a driver unmap/create/map per idle row.
+    pub fn release_idle(&mut self, slot: usize) {
+        if slot >= self.launch_rows {
+            self.release_slot(slot);
+        }
+    }
+
     fn release_unit(&mut self, window: usize, unit: usize) {
         let w = &mut self.windows[window];
         debug_assert!(w.refs[unit] > 0);
@@ -577,6 +588,7 @@ impl VmmRings {
         if !self.idle.is_empty() {
             return Ok(());
         }
+        self.launch_rows = rows;
         while self.prefix < rows {
             self.ensure_slot(self.prefix)?;
         }
