@@ -304,6 +304,16 @@ pub struct RuntimeConfig {
     )]
     pub drain_timeout_ms: Option<u64>,
 
+    /// HTTP/1 request-head deadline (ms), also the idle keep-alive bound: hyper arms it whenever
+    /// a connection waits for the next request. 0 = off; unset = 30 000.
+    #[arg(long = "http-header-timeout-ms", env = "PLOW_HTTP_HEADER_TIMEOUT_MS", global = true)]
+    pub http_header_timeout_ms: Option<u64>,
+
+    /// Concurrent HTTP connections per listener; past it accepting pauses. 0 = unbounded;
+    /// unset = 4096.
+    #[arg(long = "http-max-connections", env = "PLOW_HTTP_MAX_CONNECTIONS", global = true)]
+    pub http_max_connections: Option<usize>,
+
     /// Device ordinals to serve on, e.g. `--devices 0,1,2,3`. Unset = every
     /// visible GPU.
     ///

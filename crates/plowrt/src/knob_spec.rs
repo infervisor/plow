@@ -463,6 +463,8 @@ pub const RUNTIME: &[KnobSpec] = &[
     KnobSpec::new("rt.slab_keep", Some("PLOW_SLAB_KEEP"), Layer::Runtime, Domain::Bool, UNSET, OPT_IN),
     KnobSpec::new("rt.dstep_every", Some("PLOW_DSTEP_EVERY"), Layer::Runtime, U32, UNSET, OPT_IN),
     KnobSpec::new("rt.drain_timeout_ms", Some("PLOW_DRAIN_TIMEOUT_MS"), Layer::Runtime, USIZE, UNSET, OPT_IN),
+    KnobSpec::new("rt.http_header_timeout_ms", Some("PLOW_HTTP_HEADER_TIMEOUT_MS"), Layer::Runtime, USIZE, UNSET, OPT_IN),
+    KnobSpec::new("rt.http_max_connections", Some("PLOW_HTTP_MAX_CONNECTIONS"), Layer::Runtime, USIZE, UNSET, OPT_IN),
     KnobSpec::new("rt.devices", Some("PLOW_DEVICES"), Layer::Runtime, U32, UNSET, OPT_IN),
     KnobSpec::new("rt.place", Some("PLOW_PLACE"), Layer::Runtime, Domain::Str, Default::Static(Val::Str("spread")), OPT_IN),
     KnobSpec::new("rt.pin", Some("PLOW_PIN"), Layer::Runtime, Domain::Str, UNSET, OPT_IN),

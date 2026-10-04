@@ -3878,19 +3878,30 @@ async fn serve(
     let tcp_listener = tokio::net::TcpListener::bind(tcp_addr).await?;
     tracing::info!(%tcp_addr, "plowrt serving OpenAI API over TCP");
     let tcp_router = router.clone();
+    let tcp_http = HttpConns::from_config("TCP");
     let tcp_task = tokio::spawn(async move {
-        // TCP_NODELAY: a streamed response is headers, then the first token as a SECOND small
-        // write. With Nagle on, that write waits for the client's delayed ACK of the headers
-        // (~40 ms) on a reused keep-alive connection, so any TTFT under 40 ms reads as ~42 ms no
-        // matter how fast prefill is. Measured: 128-row prefill 28.7 ms on device, first chunk
-        // 32.5 ms on a fresh connection, 42.3 ms from `vllm bench`'s pooled one.
-        if let Err(e) = axum::serve(tcp_listener, tcp_router).tcp_nodelay(true).await {
-            tracing::error!(error = %e, "TCP listener error");
+        let svc = hyper_util::service::TowerToHyperService::new(tcp_router);
+        loop {
+            let permit = tcp_http.permit().await;
+            let stream = match tcp_listener.accept().await {
+                Ok((stream, _)) => stream,
+                Err(e) => {
+                    accept_failed("TCP", &e).await;
+                    continue;
+                }
+            };
+            // TCP_NODELAY: a streamed response is headers, then the first token as a SECOND small
+            // write. With Nagle on, that write waits for the client's delayed ACK of the headers
+            // (~40 ms) on a reused keep-alive connection, so any TTFT under 40 ms reads as ~42 ms no
+            // matter how fast prefill is. Measured: 128-row prefill 28.7 ms on device, first chunk
+            // 32.5 ms on a fresh connection, 42.3 ms from `vllm bench`'s pooled one.
+            let _ = stream.set_nodelay(true);
+            tcp_http.spawn(stream, svc.clone(), permit);
         }
     });
 
-    // Optional UDS listener: bridged through hyper directly (axum 0.7's
-    // `serve` accepts only TcpListener). Also exposes privileged model control.
+    // Optional UDS listener, with its own connection cap so a TCP flood cannot lock out the
+    // privileged model control it also exposes.
     let uds_task = if let Some(path) = socket {
         // Clear a stale socket (previous crashed instance left it behind).
         if path.exists() {
@@ -3906,30 +3917,19 @@ async fn serve(
         }
         tracing::info!(socket = %path.display(), "plowrt serving OpenAI API over UDS");
         let uds_router = router.clone().merge(plowrt::serve::admin_app(state));
+        let http = HttpConns::from_config("UDS");
         Some(tokio::spawn(async move {
             let svc = hyper_util::service::TowerToHyperService::new(uds_router);
             loop {
-                let (stream, _addr) = match uds_listener.accept().await {
-                    Ok(v) => v,
+                let permit = http.permit().await;
+                let stream = match uds_listener.accept().await {
+                    Ok((stream, _)) => stream,
                     Err(e) => {
-                        // EMFILE and friends persist; retrying at once spins a core and floods the log.
-                        tracing::warn!(error = %e, "UDS accept failed");
-                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                        accept_failed("UDS", &e).await;
                         continue;
                     }
                 };
-                let svc = svc.clone();
-                tokio::spawn(async move {
-                    let io = hyper_util::rt::TokioIo::new(stream);
-                    if let Err(e) = hyper_util::server::conn::auto::Builder::new(
-                        hyper_util::rt::TokioExecutor::new(),
-                    )
-                    .serve_connection(io, svc)
-                    .await
-                    {
-                        tracing::debug!(error = %e, "UDS connection ended");
-                    }
-                });
+                http.spawn(stream, svc.clone(), permit);
             }
         }))
     } else {
@@ -3959,6 +3959,124 @@ async fn serve(
         }
     }
     Ok(())
+}
+
+/// Per-listener HTTP connection handling: hyper's header-read timeout (which also ends an idle
+/// keep-alive connection) and a cap on open connections.
+struct HttpConns {
+    builder: Arc<hyper_util::server::conn::auto::Builder<hyper_util::rt::TokioExecutor>>,
+    open: Option<Arc<tokio::sync::Semaphore>>,
+}
+
+impl HttpConns {
+    fn from_config(listener: &str) -> Self {
+        let rt = plowrt::config::RuntimeConfig::get();
+        Self::new(listener, rt.http_header_timeout_ms.unwrap_or(30_000), rt.http_max_connections.unwrap_or(4096))
+    }
+
+    fn new(listener: &str, header_ms: u64, max: usize) -> Self {
+        let mut builder = hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new());
+        builder
+            .http1()
+            .timer(hyper_util::rt::TokioTimer::new())
+            .header_read_timeout((header_ms > 0).then(|| std::time::Duration::from_millis(header_ms)));
+        tracing::info!(listener, header_timeout_ms = header_ms, max_connections = max, "HTTP connection limits");
+        HttpConns {
+            builder: Arc::new(builder),
+            open: (max > 0).then(|| Arc::new(tokio::sync::Semaphore::new(max.min(tokio::sync::Semaphore::MAX_PERMITS)))),
+        }
+    }
+
+    /// Wait for a free connection slot; at the cap the listener stops accepting.
+    async fn permit(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        match &self.open {
+            Some(open) => Arc::clone(open).acquire_owned().await.ok(),
+            None => None,
+        }
+    }
+
+    fn spawn<I>(
+        &self,
+        io: I,
+        svc: hyper_util::service::TowerToHyperService<axum::Router>,
+        permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    ) where
+        I: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    {
+        let builder = Arc::clone(&self.builder);
+        tokio::spawn(async move {
+            let _permit = permit;
+            // Upgrades: the ASR websocket route.
+            if let Err(e) = builder.serve_connection_with_upgrades(hyper_util::rt::TokioIo::new(io), svc).await {
+                tracing::debug!(error = %e, "HTTP connection ended");
+            }
+        });
+    }
+}
+
+#[cfg(test)]
+mod http_conn_tests {
+    use super::HttpConns;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    async fn server(http: HttpConns) -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let svc = hyper_util::service::TowerToHyperService::new(
+            axum::Router::new().route("/", axum::routing::get(|| async { "ok" })),
+        );
+        tokio::spawn(async move {
+            loop {
+                let permit = http.permit().await;
+                let (stream, _) = listener.accept().await.unwrap();
+                http.spawn(stream, svc.clone(), permit);
+            }
+        });
+        addr
+    }
+
+    /// A client that never finishes its request head is dropped at the header timeout, and an
+    /// idle keep-alive connection after a served request is too.
+    #[tokio::test]
+    async fn a_silent_or_idle_connection_is_closed_at_the_header_timeout() {
+        let addr = server(HttpConns::new("test", 100, 16)).await;
+        let mut slow = tokio::net::TcpStream::connect(addr).await.unwrap();
+        slow.write_all(b"GET / HTTP/1.1\r\nHost: x\r\n").await.unwrap();
+        let mut buf = Vec::new();
+        let read = tokio::time::timeout(std::time::Duration::from_secs(5), slow.read_to_end(&mut buf)).await;
+        assert!(read.is_ok(), "the half-sent request was not cut");
+
+        let mut idle = tokio::net::TcpStream::connect(addr).await.unwrap();
+        idle.write_all(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n").await.unwrap();
+        let read = tokio::time::timeout(std::time::Duration::from_secs(5), idle.read_to_end(&mut buf)).await;
+        assert!(read.is_ok(), "the idle keep-alive connection was not closed");
+        assert!(String::from_utf8_lossy(&buf).contains("200 OK"));
+    }
+
+    /// At the cap the next connection is not served until one closes.
+    #[tokio::test]
+    async fn connections_past_the_cap_wait_for_a_free_slot() {
+        let addr = server(HttpConns::new("test", 0, 1)).await;
+        let first = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut second = tokio::net::TcpStream::connect(addr).await.unwrap();
+        second.write_all(b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").await.unwrap();
+        let mut buf = Vec::new();
+        let early = tokio::time::timeout(std::time::Duration::from_millis(200), second.read_to_end(&mut buf)).await;
+        assert!(early.is_err(), "served past the cap");
+        drop(first);
+        tokio::time::timeout(std::time::Duration::from_secs(5), second.read_to_end(&mut buf)).await.unwrap().unwrap();
+        assert!(String::from_utf8_lossy(&buf).contains("200 OK"));
+    }
+}
+
+async fn accept_failed(listener: &str, e: &std::io::Error) {
+    use std::io::ErrorKind::{ConnectionAborted, ConnectionRefused, ConnectionReset};
+    if matches!(e.kind(), ConnectionAborted | ConnectionRefused | ConnectionReset) {
+        return;
+    }
+    // EMFILE and friends persist; retrying at once spins a core and floods the log.
+    tracing::warn!(listener, error = %e, "accept failed");
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 }
 
 async fn shutdown_signal() -> &'static str {
