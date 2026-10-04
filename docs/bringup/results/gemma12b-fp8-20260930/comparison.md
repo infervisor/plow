@@ -1,5 +1,29 @@
 # Gemma-4 12B FP8 comparison
 
+2026-10-04 final comparison v2 (`campaign.py report`, rows `final-compare-20261004-*` in the CSV). Setup: plowrt `66e90a4b` (gemma12b-next), one H100, REPS=2 per cell in one server per arm, greedy decoding, prefix caching on in both stacks. Packets were built with `campaign.py build` from the recipes.
+
+**Qualified wins (MATCHED + EQUIVALENT, strict report exit 0)**: the FP8-KV arm vs vLLM 0.28.0 with matched `fp8_per_token_head` KV. Recipe: `scripts/campaign/recipes/gemma4-12b.h100.fp8kv-16k-c128.toml`, packet `c47fc3f20569`. FP32-reference gate PASS: KL mean 0.108 vs vLLM 0.128.
+
+| Cell | Infervisor output tok/s | vLLM output tok/s | Total-throughput ratio | TTFT P99 ratio | TPOT P99 ratio |
+|---|---:|---:|---:|---:|---:|
+| 4096/128 c32 | 550 | 398 | 1.38x | 0.70x | 0.70x |
+| 4096/128 c128 | 621 | 455 | 1.37x | 0.77x | 0.36x |
+| 15000/128 c32 | 145 | 81 | 1.79x | 0.57x | 0.30x |
+| 15000/128 c128 | 146 | 84 | 1.74x | 0.57x | 0.14x |
+| agentic16k c32 | 600 | 480 | 1.25x | 0.98x | 0.78x (spread 21%) |
+| agentic16k c64 | 631 | 581 | 1.09x | 1.40x | 0.90x |
+| agentic16k c128 | 415 | 172 | 2.41x (spread 60%, FLAGGED) | 0.68x | 0.25x |
+
+Caveats:
+- The matched vLLM baseline is its fastest config that keeps `fp8_per_token_head` KV. Probe at 4K/128 c32, out tok/s: TRITON_ATTN with max-num-batched-tokens 8192 = 399; with 16384 = 394; with 4096 = 398. FLASHINFER rejects this KV dtype, and FLASH_ATTN does not list it, so TRITON_ATTN is the only backend.
+- The earlier vLLM 783 tok/s reference (`reference-vllm028-fp8.csv`) was BF16 KV on FLASH_ATTN (reproduced at 781). vLLM's Triton per-token-head FP8 KV path costs it about 2x at 4K and 3x at 15K.
+- Against vLLM's fastest config overall (BF16 KV, FLASH_ATTN; extra `bf16-vbf16` rows, MATCHED with the BF16-KV plow packet `34641b1cace3`), plow loses. Ratios: 4K 0.76x / 0.72x, 15K 0.78x / 0.78x, agentic 0.23x / 0.65x / 0.67x at c32 / c64 / c128.
+- The plow FP8 arm (550 / 145 tok/s at 4K / 15K c32) is also below vLLM BF16 KV (780 / 235).
+- Agentic c128 FP8 is unstable across repeats: 539 vs 290 out tok/s, with prefix token hits of 75.6% vs 25.8% in r2.
+- The BF16-KV plow arm against vLLM FP8 KV is NOT MATCHED (strict exit 1) and is reference only.
+- Host load average (1-minute) during the lease: median 1.4, max 7.8.
+- Evidence (campaign scratch): `/opt/dlami/nvme/lava-tts/final2/report/` (strict reports), `res/` (raw), `gate/` (FP32-gate captures + `gates.json`), `probe/` (vLLM baseline probe).
+
 2026-10-03 final comparison (`campaign.py report`, rows `final-compare-20261003-*` in the CSV): still no qualified win.
 
 - Quality: both plow arms pass the FP32-reference gate, at KL mean 0.101 (BF16 KV) and 0.110 (FP8 KV) against vLLM's 0.128.
