@@ -296,7 +296,7 @@ pub struct RuntimeConfig {
     // ──────────────────────────────────────────────────────────────────────────
     /// S1 switch drain deadline (ms): past it the victim's live generations are
     /// preempted (`Preempted` finish, queued jobs 429). 0 = preempt immediately;
-    /// unset = unbounded drain.
+    /// unset = unbounded drain. Also bounds the SIGTERM/SIGINT drain (30 s when unset).
     #[arg(
         long = "drain-timeout-ms",
         env = "PLOW_DRAIN_TIMEOUT_MS",
@@ -1981,7 +1981,7 @@ impl RuntimeConfig {
     }
 
     #[cfg(feature = "cuda")]
-    pub(crate) fn drain_timeout_ms(&self) -> Option<u64> {
+    pub fn drain_timeout_ms(&self) -> Option<u64> {
         let environment = Self::env_parse("PLOW_DRAIN_TIMEOUT_MS").map(Some);
         select_compat(self.drain_timeout_ms, environment, !Self::is_initialized())
     }

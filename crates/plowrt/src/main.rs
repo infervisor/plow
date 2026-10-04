@@ -3870,6 +3870,8 @@ async fn serve(
     }
 
     let router = app(Arc::clone(&state));
+    let shutdown_state = Arc::clone(&state);
+    let shutdown_socket = socket.clone();
 
     // TCP listener: unchanged, always on.
     let tcp_addr = std::net::SocketAddr::from(([0, 0, 0, 0], port));
@@ -3910,7 +3912,9 @@ async fn serve(
                 let (stream, _addr) = match uds_listener.accept().await {
                     Ok(v) => v,
                     Err(e) => {
+                        // EMFILE and friends persist; retrying at once spins a core and floods the log.
                         tracing::warn!(error = %e, "UDS accept failed");
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                         continue;
                     }
                 };
@@ -3932,20 +3936,61 @@ async fn serve(
         None
     };
 
-    // Wait until any listener task exits. In practice they run until the
-    // process is signaled; the join here just keeps `main` alive.
-    match uds_task {
-        Some(uds) => {
-            tokio::select! {
-                r = tcp_task => { if let Err(e) = r { tracing::error!(error = %e, "TCP task join"); } }
-                r = uds => { if let Err(e) = r { tracing::error!(error = %e, "UDS task join"); } }
-            }
+    // Run until a listener exits or SIGTERM/SIGINT arrives.
+    let uds = async {
+        match uds_task {
+            Some(t) => t.await,
+            None => std::future::pending().await,
         }
-        None => {
-            if let Err(e) = tcp_task.await {
-                tracing::error!(error = %e, "TCP task join");
+    };
+    tokio::select! {
+        r = tcp_task => { if let Err(e) = r { tracing::error!(error = %e, "TCP task join"); } }
+        r = uds => { if let Err(e) = r { tracing::error!(error = %e, "UDS task join"); } }
+        signal = shutdown_signal() => {
+            tracing::info!(signal, "shutdown: draining in-flight requests");
+            drain_for_shutdown(&shutdown_state).await;
+            if let Some(path) = shutdown_socket {
+                let _ = std::fs::remove_file(path);
             }
+            tracing::info!("shutdown: drained");
+            // Engine threads and blocking tick tasks never finish on their own; the runtime's
+            // drop would wait on them forever.
+            std::process::exit(0);
         }
     }
     Ok(())
+}
+
+async fn shutdown_signal() -> &'static str {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let (Ok(mut term), Ok(mut int)) = (signal(SignalKind::terminate()), signal(SignalKind::interrupt())) else {
+            return std::future::pending().await;
+        };
+        tokio::select! {
+            _ = term.recv() => "SIGTERM",
+            _ = int.recv() => "SIGINT",
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+        "ctrl-c"
+    }
+}
+
+/// Stop admitting and let live generations finish, bounded by `PLOW_DRAIN_TIMEOUT_MS` (30 s
+/// when unset), then close whatever is still running with what it produced.
+async fn drain_for_shutdown(state: &Arc<AppState>) {
+    let deadline = std::time::Duration::from_millis(
+        plowrt::config::RuntimeConfig::get().drain_timeout_ms().unwrap_or(30_000),
+    );
+    let muxes: Vec<_> = state.registry.slugs().iter().filter_map(|s| state.mux(s)).collect();
+    futures::future::join_all(muxes.into_iter().map(|mux| async move {
+        if tokio::time::timeout(deadline, mux.drain()).await.is_err() {
+            mux.preempt().await;
+        }
+    }))
+    .await;
 }
