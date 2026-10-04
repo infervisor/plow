@@ -3779,6 +3779,13 @@ impl GpuEngine {
         } else {
             None
         };
+        if packed_prefill_metadata.as_ref().is_none_or(|m| m.stage_rows.is_none())
+            && blob.with_packet_view(plow_asset::packed_prefill::has_repeated_writers)
+        {
+            return Err(RuntimeError::Rejected(
+                "repeated KV cache writers need a packed-prefill manifest that declares stage_rows".into(),
+            ));
+        }
         if let Some(pack) = &packed_prefill_metadata {
             let live = live_kv_manifest.as_ref().ok_or_else(|| {
                 RuntimeError::Rejected("packed prefill requires compiled LIVE contract".into())

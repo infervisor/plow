@@ -1177,6 +1177,13 @@ extern "C" __device__ unsigned PLOW_SYM(plow_fa_hd512) = PLOW_NV_FA_ONLY_HD256_O
  *
  * Two 32-bit halves: module_global_u32 is the reader the engine already has, and a u64 device
  * global would need a second accessor for nothing. */
+/* The speech arms a PLOW_SPEECH_OPS object carries (bit op - 163). The mask is not part of the
+ * pairing hash, so the loader checks every sidecar's speech ops against it before launching.
+ * Absent on an all-arms object (unconstrained), like the pairing stamp. */
+#if PLOW_NV_SPEECH && PLOW_SPEECH_OPS != (~0ull)
+extern "C" __device__ unsigned PLOW_SYM(plow_speech_ops_lo) = (unsigned)(PLOW_SPEECH_OPS & 0xFFFFFFFFull);
+extern "C" __device__ unsigned PLOW_SYM(plow_speech_ops_hi) = (unsigned)(PLOW_SPEECH_OPS >> 32);
+#endif
 #if PLOW_PACKET_HASH != 0ull
 extern "C" __device__ unsigned PLOW_SYM(plow_packet_hash_lo) =
     (unsigned)(PLOW_PACKET_HASH & 0xFFFFFFFFull);

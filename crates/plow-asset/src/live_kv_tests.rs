@@ -304,6 +304,12 @@ fn an_unstaged_prefill_cache_has_one_writer() {
     assert!(validate_prefill(&[writer(2, 0), writer(3, 0), writer(2, 0), read])
         .unwrap_err()
         .contains("cache writer contract"));
+    // Duplicate writer/reader pairs without a segment-ordered stage proof are not a staged prefill.
+    assert!(validate_prefill(&[writer(2, 0), writer(3, 0), read, writer(2, 0), writer(3, 0), read])
+        .unwrap_err()
+        .contains("cache writer contract"));
+    // Repeated readers over one writer pair (KV sharing) stay valid.
+    validate_prefill(&[writer(2, 0), writer(3, 0), read, read]).unwrap();
 }
 
 #[test]
