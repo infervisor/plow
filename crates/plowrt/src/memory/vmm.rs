@@ -963,9 +963,6 @@ struct Snap {
     prompt_rows: u32,
     /// Published at a prompt's shared-prefix end ([`VmmKv::share_rows`]): seen on two prompts.
     share: bool,
-    /// The last publishing `(seq, generation)`: while that sequence is live its rings still
-    /// hold the window, and its turn end re-publishes a session's prompt end.
-    owner: (u32, u64),
 }
 
 struct Inner {
@@ -2350,7 +2347,6 @@ impl VmmKv {
                 session: false,
                 prompt_rows: 0,
                 share: false,
-                owner: (u32::MAX, 0),
             });
             // Counts toward the same budget whole blocks and boundary snapshots do, so
             // `trim_cache` (both the static `cache_cap` and pressure-eviction branches) sees
@@ -2574,12 +2570,10 @@ fn publish_locked(
     };
     inner.snapshot_tick += 1;
     let tick = inner.snapshot_tick;
-    let owner = (seq as u32, s.generation[seq].load(Ordering::Acquire));
     let unused_snapshot = if let Some(snap) = inner.published.get_mut(&bkey)
         .and_then(|list| list.iter_mut().find(|snap| snap.rows == rows && snap.tail == tail))
     {
         snap.last_used = tick;
-        snap.owner = owner;
         snap.reusable_prompt |= reusable_prompt;
         snap.share |= share;
         snapshot
@@ -2602,7 +2596,6 @@ fn publish_locked(
             session,
             prompt_rows: prompt_rows as u32,
             share,
-            owner,
         });
         inner.stats.snapshot_bytes += snap_bytes;
         inner.stats.cache_bytes += snap_bytes;
@@ -3080,18 +3073,13 @@ fn evict_one(s: &Shared, inner: &mut Inner, preserve_hot: bool) -> bool {
     // One unit: the LRU boundary (a session's newest, after `retire_superseded`) and the
     // blocks that become dead with it. A boundary inside a block serves only its exact
     // tail, the whole-block checkpoint under the same node every continuation: that tailed
-    // one goes first. A boundary attached twice or more is a shared prefix (a system
-    // prompt) and goes last; a session-pinned one (`pin_prefix`) or a shared-prefix end
-    // (a system prompt below one block sits on no pinnable node) just before it.
-    //
-    // Among session boundaries: a tailed one already attached is spent (its session runs that
-    // turn now), as is a whole-block one under the session's tailed boundary; then one whose
-    // publisher still decodes (its turn end re-publishes it from the
-    // rings), then idle ones newest first. Sessions waiting for a slot take turns in arrival
-    // order, so the newest boundary is needed last; LRU would evict each boundary just before
-    // its turn and, once the waiting sessions outnumber the cache, every one of them.
+    // one goes first, then a session's boundary its next turn already attached (spent: that
+    // turn runs now; `retire_superseded` frees it at the turn's prompt end) and a session's
+    // whole-block checkpoint under its tailed boundary. A boundary attached twice or more is
+    // a shared prefix (a system prompt) and goes last; a session-pinned one (`pin_prefix`) or
+    // a shared-prefix end (a system prompt below one block sits on no pinnable node) just
+    // before it.
     let pinned = inner.cache.pinned();
-    let generation = &s.generation;
     if let Some((node, index)) = inner.published.iter()
         .flat_map(|(&node, snaps)| {
             let checkpoint = node.is_some() && snaps.iter().any(|snap| snap.tail.is_empty());
@@ -3099,28 +3087,15 @@ fn evict_one(s: &Shared, inner: &mut Inner, preserve_hot: bool) -> bool {
             let pin = node.is_some_and(|key| pinned.contains(&key));
             snaps.iter().enumerate().map(move |(i, snap)| {
                 let covered = checkpoint && !snap.tail.is_empty() && !snap.session;
-                let rank = if covered {
-                    0
-                } else if !snap.session || snap.attaches >= 2 {
-                    4
-                } else if snap.tail.is_empty() && tailed && snap.attaches == 0
-                    || !snap.tail.is_empty() && snap.attaches == 1
-                {
-                    1
-                } else if generation.get(snap.owner.0 as usize)
-                    .is_some_and(|g| g.load(Ordering::Acquire) == snap.owner.1)
-                {
-                    2
-                } else {
-                    3
-                };
-                let age = if rank == 3 { u64::MAX - snap.last_used } else { snap.last_used };
-                (node, i, snap, pin, rank, age)
+                let spent = snap.session
+                    && (!snap.tail.is_empty() && snap.attaches == 1
+                        || snap.tail.is_empty() && tailed && snap.attaches == 0);
+                (node, i, snap, pin, if covered { 0u8 } else if spent { 1 } else { 2 })
             })
         })
         .filter(|(_, _, snap, ..)| snap.users == 0 && Some(snap.va) != protected)
-        .min_by_key(|(_, _, snap, pin, rank, age)| {
-            (snap.attaches >= 2, *pin || snap.share, *rank, *age)
+        .min_by_key(|(_, _, snap, pin, rank)| {
+            (snap.attaches >= 2, *pin || snap.share, *rank, snap.last_used)
         })
         .map(|(node, index, ..)| (node, index))
     {
@@ -3133,6 +3108,9 @@ fn evict_one(s: &Shared, inner: &mut Inner, preserve_hot: bool) -> bool {
         inner.stats.eviction_units += 1;
         inner.stats.eviction_unit_bytes += before - inner.stats.cache_bytes;
         tracing::debug!(freed = before - inner.stats.cache_bytes, blocks, "vmm prefix eviction unit");
+        if tracing::enabled!(tracing::Level::DEBUG) && inner.stats.eviction_units % 64 == 0 {
+            log_snapshot_mix(inner);
+        }
         return true;
     }
     let Some(key) = inner.cache.evict_lru() else {
@@ -3167,6 +3145,29 @@ fn evict_one(s: &Shared, inner: &mut Inner, preserve_hot: bool) -> bool {
     }
     inner.stats.nodes_evicted += 1;
     true
+}
+
+/// Debug: what the boundary cache holds, by the properties eviction orders on.
+fn log_snapshot_mix(inner: &Inner) {
+    let pinned = inner.cache.pinned();
+    let mut mix: std::collections::BTreeMap<String, (u32, u64)> = Default::default();
+    for (node, snaps) in &inner.published {
+        let pin = node.is_some_and(|key| pinned.contains(&key));
+        for snap in snaps {
+            let key = format!(
+                "users{} att{} pin{} share{} sess{} reuse{} tail{} root{}",
+                snap.users.min(9), snap.attaches.min(3), u8::from(pin), u8::from(snap.share),
+                u8::from(snap.session), u8::from(snap.reusable_prompt),
+                u8::from(!snap.tail.is_empty()), u8::from(node.is_none()),
+            );
+            let e = mix.entry(key).or_default();
+            e.0 += 1;
+            e.1 += snap.bytes;
+        }
+    }
+    for (key, (n, bytes)) in mix {
+        tracing::debug!(n, mib = bytes >> 20, "vmm snapshot mix {key}");
+    }
 }
 
 fn remove_snapshot(s: &Shared, inner: &mut Inner, node: Option<(u32, u32)>, index: usize) {
@@ -5049,62 +5050,6 @@ mod tests {
         assert_eq!(p.try_attach(1, &t2).unwrap().map(|a| a.rows), Some(9));
     }
 
-    /// One engine turn of session `s` in slot 0: attach, prefill, prompt-end publish (pin +
-    /// retire), turn-end publish and prompt-end re-publish, retire. Returns the attached rows.
-    fn session_turn(p: &VmmKv, prompt: &[u32], s: u32) -> u32 {
-        p.begin_seq(0);
-        let attached = p.try_attach(0, prompt).unwrap().map_or(0, |a| a.rows);
-        p.finish_attach(0);
-        let n = prompt.len() as u32;
-        p.ensure_rows(0, n + 2).unwrap();
-        p.note_session(0, prompt);
-        let pe = (n - 1) / 2 * 2;
-        p.publish_at(0, prompt, pe, 48, |_| Ok(())).unwrap();
-        let ttl = std::time::Instant::now() + std::time::Duration::from_secs(600);
-        p.pin_prefix(&prompt[..pe as usize], ttl);
-        p.retire_superseded(prompt, pe);
-        let mut end = prompt.to_vec();
-        end.extend([90_000 + s, 90_001 + s]);
-        p.publish_at(0, &end, n + 2, 48, |_| Ok(())).unwrap();
-        p.publish_at(0, &end, pe, 48, |_| Ok(())).unwrap();
-        p.pin_prefix(&end, ttl);
-        p.begin_seq(0);
-        attached
-    }
-
-    /// Four sessions take turns through one slot with room for about two of their boundaries.
-    /// LRU evicts each boundary just before its session's next turn (no hits at all); the
-    /// newest-first order for idle session boundaries keeps a stable subset attaching.
-    #[test]
-    fn round_robin_sessions_over_capacity_keep_a_stable_subset() {
-        let prompts = |round: usize| -> Vec<Vec<u32>> {
-            (0..4u32)
-                .map(|s| {
-                    let base = s * 10_000;
-                    (0..9 + 4 * round as u32).map(|i| base + i).collect()
-                })
-                .collect()
-        };
-        let run = |cap: u64| {
-            let ops = Arc::new(MockVmm::default());
-            let geo = pool(ops.clone()).geometry().clone();
-            let p = VmmKv::new(ops, geo, 64, cap).expect("pool");
-            let mut hits = Vec::new();
-            for round in 0..4 {
-                let mut h = 0;
-                for (s, pr) in prompts(round).iter().enumerate() {
-                    h += u32::from(session_turn(&p, pr, s as u32) > 0);
-                }
-                hits.push(h);
-            }
-            (hits, p.stats().cache_bytes)
-        };
-        let (all, full) = run(0);
-        assert_eq!(all[1..], [4, 4, 4], "unbounded: every turn after the first attaches");
-        let (hits, _) = run(full / 2);
-        assert!(hits[1..].iter().all(|&h| h >= 1), "over capacity: a subset keeps attaching: {hits:?}");
-    }
-
     /// Publishes a 12-row session boundary of `pr` from `seq`, leaving the sequence running.
     fn session_boundary(p: &VmmKv, seq: usize, pr: &[u32]) {
         assert!(p.try_attach(seq, pr).unwrap().is_none());
@@ -5135,28 +5080,6 @@ mod tests {
         p.begin_seq(0);
         p.ensure_rows(1, 1).unwrap();
         assert_eq!(p.try_attach(1, &b).unwrap().map(|x| x.rows), Some(12), "the idle boundary stays");
-    }
-
-    /// A boundary whose publisher still runs (its turn end re-publishes it from the rings) goes
-    /// before an older idle one.
-    #[test]
-    fn running_publishers_boundary_goes_before_an_idle_one() {
-        let p = pool(Arc::new(MockVmm::default()));
-        let b = prompt(13);
-        let c: Vec<u32> = b.iter().map(|t| t + 1).collect();
-        session_boundary(&p, 1, &b);
-        p.begin_seq(1);
-        session_boundary(&p, 0, &c);
-        {
-            let mut inner = p.shared.inner.lock();
-            assert!(evict_one(&p.shared, &mut inner, false));
-        }
-        p.begin_seq(0);
-        p.ensure_rows(1, 1).unwrap();
-        assert!(p.try_attach(1, &c).unwrap().is_none(), "the running publisher's boundary went");
-        p.begin_seq(1);
-        p.ensure_rows(1, 1).unwrap();
-        assert_eq!(p.try_attach(1, &b).unwrap().map(|x| x.rows), Some(12));
     }
 
     /// A request waiting on a session's in-flight prompt keeps the whole-block checkpoint it
@@ -5270,7 +5193,8 @@ mod tests {
     }
 
     /// Two sessions share a system prompt (a boundary at 16 rows). Pressure evicts the
-    /// running session's tail; the shared prefix and the idle session's boundary still attach.
+    /// older session's tail as one unit (its boundary and the block only it kept
+    /// attachable); the shared prefix and the other session's boundary still attach.
     #[test]
     fn pressure_evicts_one_session_suffix_and_keeps_the_shared_prefix() {
         let sys = prompt(16);
@@ -5302,12 +5226,13 @@ mod tests {
         let p = run(full - 1);
         let s = p.stats();
         assert_eq!(s.eviction_units, 1);
-        assert!(s.cache_bytes < full);
+        assert!(s.eviction_unit_bytes > 4, "the unit takes the dead block with the boundary");
+        assert_eq!(s.cache_bytes, full - s.eviction_unit_bytes);
         p.ensure_rows(0, 1).unwrap();
-        assert_eq!(p.try_attach(0, &b).unwrap().expect("shared prefix stays").rows, 16);
+        assert_eq!(p.try_attach(0, &a).unwrap().expect("shared prefix stays").rows, 16);
         p.begin_seq(0);
         p.ensure_rows(0, 1).unwrap();
-        assert_eq!(p.try_attach(0, &a).unwrap().expect("idle session stays").rows, 28);
+        assert_eq!(p.try_attach(0, &b).unwrap().expect("other session stays").rows, 28);
     }
 
     /// A whole-block boundary has no tail: it is what the second request sharing a prefix

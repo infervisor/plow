@@ -124,13 +124,15 @@ impl Kv {
     /// `exec/gpu/prefix.rs::vmm_publish` for a session slot.
     fn publish(&self, b: usize, toks: &[u32], max_rows: u32, ttl: std::time::Duration) {
         let rows = toks.len() as u32;
+        let prompt = self.kv.prompt_rows(b);
+        let slack = env_u64("SIM_PE_SLACK", 8) as u32;
+        let max_rows = if rows == prompt && max_rows < rows { prompt.saturating_sub(1 + slack) } else { max_rows };
         let p_a = rows.min(max_rows) / 32 * 32;
         if rows == 0 || p_a == 0 {
             return;
         }
         self.kv.note_session(b, toks);
         let step = self.kv.block_rows();
-        let prompt = self.kv.prompt_rows(b);
         let mut p = step;
         while p < p_a {
             if self.kv.checkpoint_awaited(toks, p) {
@@ -146,7 +148,7 @@ impl Kv {
             self.kv.pin_prefix(&toks[..p_a as usize], std::time::Instant::now() + ttl);
             self.kv.retire_superseded(toks, p_a);
         }
-        let end = prompt.saturating_sub(1) / 32 * 32;
+        let end = prompt.saturating_sub(1 + slack) / 32 * 32;
         if rows > prompt && end > 0 && end < p_a {
             let (_, copied) = self.boundary_copied(b, toks, end);
             let (c, n) = self.republish.get();
@@ -179,7 +181,7 @@ fn tokens_for(cell: u32, s: usize, t: usize, prev: &[u32], prev_len: usize, len:
     let mut p: Vec<u32> = if t == 0 {
         (0..1568u32).map(|i| salt + 10 + i).collect()
     } else {
-        prev[..prev_len - 1].to_vec()
+        prev[..prev_len - env_u64("SIM_RERENDER", 4) as usize].to_vec()
     };
     let base = salt + (s as u32 + 1) * 1_000_000 + t as u32 * 20_000;
     let mut i = 0;
