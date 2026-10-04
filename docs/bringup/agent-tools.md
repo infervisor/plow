@@ -112,7 +112,8 @@ where a cell measured them.
 ### Campaign result placement
 
 Use one designated `comparison.csv` per campaign for matched serving results and a neighboring
-`comparison.md` for qualified wins and concise provenance. Put raw client/server logs, JSON,
+`comparison.md` for qualified wins and concise provenance; per-family summaries are indexed in
+[results/README.md](results/README.md). Put raw client/server logs, JSON,
 captures, profiler traces, generated HTML, temporary CSVs and full manifests in named scratch
 outside the repo; link or hash the evidence from the summary. Never put raw benchmark data in
 arbitrary repo directories, including `docs/`, `scripts/` and `perf-data/`. Curated, validated

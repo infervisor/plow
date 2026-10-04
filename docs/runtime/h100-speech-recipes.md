@@ -61,17 +61,10 @@ Serve with the recipe's env (`campaign.py serve <recipe> --assets <dir>/assets`,
   --conc 1` (and `--conc 64,128`).
 - E4B / Veena tokens: `scripts/bench/llm_grid.sh` (ISL 128 / OSL 512, greedy, per-cell seeds).
 
-Measured on one H100 SXM5 (same client for plow and vLLM):
-
-| Model | Metric | plow | vLLM |
-|---|---|---|---|
-| Veena | tok/s c64 / c128 | ~13,780 / ~20,590 | 12,863 / 19,972 |
-| Veena | stream aps c64; TTFA p50 | 76.2; 138 ms | |
-| Gemma 4 E4B | tok/s c64 / c128 | 9,169 / 14,662 | 8,916 / 14,088 |
-| Gemma 4 E4B | TTFT p50 c64 / c128 | 51 / 80 ms | 181 / 338 ms |
-| Qwen3-ASR | c1 latency p50; RTFx c64 / c128 | 55.2 ms; 728 / 758 | |
-| Chatterbox MTL | stream steady aps c200 (0 failed) | 71.7 | |
-| Chatterbox | stream aps c64 | 58.4 | |
+Recorded and reproduced numbers, with the vLLM baselines and evidence paths, are in the results
+summaries: [TTS](../bringup/results/tts-h100/summary.md),
+[Qwen3-ASR](../bringup/results/qwen3-asr-h100/summary.md) (RTFx c64/c128 use `manifest_x4.json`),
+[Gemma 4 E4B](../bringup/results/gemma4-h100/summary.md#gemma-4-e4b-voice-agent-llm).
 
 Single runs vary about ±1.5% (c200 MTL steady aps ±1.5% over 6 runs). E4B and Veena served greedy
 text can differ between runs at c ≥ 64 (rung assignment follows arrival order); c1 is identical.
