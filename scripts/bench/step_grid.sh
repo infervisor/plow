@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # step_grid.sh <assets> <outdir> — plow's kernel-only decode step at matched context (the plow
 # half of llm_grid.sh's d<B>x<ctx> cells; served decode ticks land within ~1% of it), plus
-# per-instruction sweeps for scripts/bench/op_roof.py. Run inside a lease:
+# per-instruction sweeps for scripts/bench/op_roof.py. Run inside a lease, through the queue:
 #
-#   $GL -n 1 steps timeout 1800 scripts/bench/step_grid.sh <assets> <out>
+#   scripts/bench/gpuq.py submit steps 1 timeout 1800 scripts/bench/step_grid.sh <assets> <out>
 #   scripts/bench/op_roof.py <out>/disasm.txt --ctx 1024 --sweep 64=<out>/sweep.b64.c1024.jsonl
 #
 # Env (defaults): STEP_BENCH (<CARGO_TARGET_DIR or repo target>/release/examples/step_bench),

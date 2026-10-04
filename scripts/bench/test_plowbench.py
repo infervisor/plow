@@ -69,5 +69,22 @@ class ResultTests(unittest.TestCase):
                 self.assertEqual(check.returncode, rc, check.stderr)
 
 
+class BenchClientTests(unittest.TestCase):
+    def test_console_script_and_python_launcher(self):
+        for name, prefix in (("vllm", ["bench", "serve"]),
+                             ("vllm-python", ["-m", "vllm.entrypoints.cli.main", "bench", "serve"])):
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                client = root / name
+                client.write_text(f"#!{sys.executable}\nimport json, os, sys\n"
+                                  "open(os.environ['TEST_ARGV'], 'w').write(json.dumps(sys.argv[1:]))\n")
+                client.chmod(0o755)
+                subprocess.run(["bash", "-c", 'source "$1"; PB_SERVER_PORT=1 pb_bench "$2" t m 1 1 8 8',
+                                "test", str(HELPERS), str(root / "res")], check=True,
+                               env=dict(os.environ, PB_VLLM=str(client), TEST_ARGV=str(root / "argv")))
+                argv = json.loads((root / "argv").read_text())
+                self.assertEqual(argv[:len(prefix)], prefix)
+
+
 if __name__ == "__main__":
     unittest.main()

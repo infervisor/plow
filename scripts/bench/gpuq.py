@@ -80,8 +80,8 @@ def main():
         for path in sorted(root.glob("*.json")):
             print(path.stem, json.loads(path.read_text()))
     else:
-        if not os.environ.get("ROCM_PATH"):
-            parser.error("submit inside nix develop")
+        if not os.environ.get("ROCM_PATH") and os.environ.get("PLOW_CAMPAIGN_NO_NIX") != "1":
+            parser.error("submit inside nix develop (hand-built box without nix: PLOW_CAMPAIGN_NO_NIX=1)")
         if args.ngpu < 1 or not args.command:
             parser.error("submit needs a positive GPU count and a command")
         job_id = f"{time.time_ns()}-{uuid.uuid4().hex[:8]}"
