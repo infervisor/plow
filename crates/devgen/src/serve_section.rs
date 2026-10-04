@@ -9,6 +9,10 @@ use plow_asset::serve_manifest::{self, ServeManifest};
 
 pub(crate) fn manifest(dir: &Path, serve_defaults: Option<&str>) -> Result<ServeManifest, String> {
     let mut m = ServeManifest::from_checkpoint(dir, dir);
+    // The template's file name, not the emitting host's path.
+    if let Some(chat) = m.chat.as_mut() {
+        chat.source = chat.source.as_deref().and_then(|s| Path::new(s).file_name()).map(|n| n.to_string_lossy().into_owned());
+    }
     for item in serve_defaults.unwrap_or("").split(',').map(str::trim).filter(|s| !s.is_empty()) {
         let (key, value) = item
             .split_once('=')
