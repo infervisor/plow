@@ -3424,8 +3424,7 @@ struct MultiStep {
 /// (`ARGMAX_FIN` leaves each row's token in `in.ids`, the advance moves `pos`/`kvlen`), so the
 /// host waits on the older step's event while the newer one runs.
 struct DecodePipe {
-    /// Queued steps, oldest first; at most two, and one between ticks.
-    queue: std::collections::VecDeque<PipeStep>,
+    queue: PipeQueue,
     /// Pinned `[batch]` i32 token readback and completion event, per buffer. A decode step reads
     /// back `in.ids` whole (slot-indexed); a mixed step reads back its compact sample block.
     ids_host: [PinnedHost; 2],
@@ -3440,9 +3439,52 @@ struct DecodePipe {
     d_last: DeviceMem,
     /// Each fed row's input token for its oldest queued step (prefix-cache bookkeeping).
     last_in: Vec<u32>,
-    /// Slots the mux retired while a queued step still covered them, with `retire_slot`'s
-    /// `cache_output`: their KV stays mapped until the queue empties.
+}
+
+/// The pipeline's queued steps and the slot retirements they hold back.
+struct PipeQueue {
+    /// Queued steps, oldest first; at most two, and one between ticks.
+    steps: std::collections::VecDeque<PipeStep>,
+    /// Slots the mux retired while a step was queued, with `retire_slot`'s `cache_output`:
+    /// their KV stays mapped until the queue empties.
     retire: Vec<Option<bool>>,
+}
+
+impl PipeQueue {
+    fn new(batch: usize) -> Self {
+        PipeQueue { steps: std::collections::VecDeque::with_capacity(2), retire: vec![None; batch] }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.steps.is_empty()
+    }
+
+    fn holds(&self, slot: usize) -> bool {
+        self.steps.iter().any(|s| s.rows.iter().any(|r| r.slot == slot))
+    }
+
+    /// Defer retiring `slot` while any step is queued. A queued step runs every row of its rung,
+    /// fed or not, and an unfed row still writes its KV at `pos`: unmapping that slot's KV or live
+    /// ring (no idle backing without prefix reuse) under it faults the step.
+    fn defer_retire(&mut self, slot: usize, cache_output: bool) -> bool {
+        if self.steps.is_empty() {
+            return false;
+        }
+        self.retire[slot] = Some(cache_output);
+        true
+    }
+
+    /// Retirements held back so far, once nothing is queued.
+    fn take_retired(&mut self) -> smallvec::SmallVec<[(usize, bool); 8]> {
+        if !self.steps.is_empty() {
+            return smallvec::SmallVec::new();
+        }
+        self.retire
+            .iter_mut()
+            .enumerate()
+            .filter_map(|(b, r)| r.take().map(|c| (b, c)))
+            .collect()
+    }
 }
 
 /// One row of a queued step: which slot it belongs to, and whether its input token was the
@@ -3478,19 +3520,18 @@ enum PipeUpload {
 impl DecodePipe {
     fn new(be: &CudaBackend, batch: usize) -> Result<Self> {
         Ok(DecodePipe {
-            queue: std::collections::VecDeque::with_capacity(2),
+            queue: PipeQueue::new(batch),
             ids_host: [be.host_alloc_pinned(batch * 4)?, be.host_alloc_pinned(batch * 4)?],
             done: [be.event_create(false)?, be.event_create(false)?],
             next: 0,
             body_ev: be.event_create(false)?,
             d_last: be.alloc(0, (batch * 4) as u64)?,
             last_in: vec![0; batch],
-            retire: vec![None; batch],
         })
     }
 
     fn holds(&self, slot: usize) -> bool {
-        self.queue.iter().any(|s| s.rows.iter().any(|r| r.slot == slot))
+        self.queue.holds(slot)
     }
 }
 
@@ -6904,8 +6945,7 @@ impl GpuEngine {
     }
 
     pub fn retire_slot(&mut self, b: usize, cache_output: bool) {
-        if let Some(pipe) = self.pipe.as_mut().filter(|p| p.holds(b)) {
-            pipe.retire[b] = Some(cache_output);
+        if self.pipe.as_mut().is_some_and(|p| p.queue.defer_retire(b, cache_output)) {
             return;
         }
         self.slot_generations[b] = self.slot_generations[b].wrapping_add(1);
@@ -7975,7 +8015,7 @@ impl GpuEngine {
     /// [`Self::pipe_step`] continues without a drain. A mixed step is matched on its decode rows:
     /// a prompt it finished has a token nobody has read, so the mux cannot be feeding that slot.
     pub fn pipe_covers(&self, feeds: &[(usize, u32)]) -> bool {
-        self.pipe.as_ref().and_then(|p| p.queue.back()).is_some_and(|s| {
+        self.pipe.as_ref().and_then(|p| p.queue.steps.back()).is_some_and(|s| {
             let mut rows = s.rows.iter().filter(|r| r.carry);
             feeds.iter().all(|&(b, _)| rows.next().is_some_and(|r| r.slot == b))
                 && rows.next().is_none()
@@ -8020,7 +8060,7 @@ impl GpuEngine {
             // After a mixed launch the device's positions are the packed rows', so the
             // continuation re-uploads them and takes only the tokens from the device.
             let after_mixed =
-                self.pipe.as_ref().and_then(|p| p.queue.back()).is_some_and(|s| s.compact);
+                self.pipe.as_ref().and_then(|p| p.queue.steps.back()).is_some_and(|s| s.compact);
             let upload = if after_mixed { PipeUpload::State } else { PipeUpload::None };
             self.pipe_enqueue(feeds, upload)?;
         }
@@ -8187,7 +8227,7 @@ impl GpuEngine {
                 .memcpy_dtoh_async(pipe.ids_host[buf].as_mut_slice(), ids_base, &self.stream)?;
         }
         self.be.event_record(&pipe.done[buf], &self.stream)?;
-        pipe.queue.push_back(PipeStep {
+        pipe.queue.steps.push_back(PipeStep {
             buf,
             rows: feeds
                 .iter()
@@ -8209,7 +8249,7 @@ impl GpuEngine {
     /// Wait for the oldest queued step and account its tokens. Rows the mux retired while it
     /// was queued get no token; their deferred retirement runs once the queue is empty.
     fn pipe_complete(&mut self, out: &mut Vec<(usize, u32)>) -> Result<()> {
-        let Some(step) = self.pipe.as_mut().and_then(|p| p.queue.pop_front()) else {
+        let Some(step) = self.pipe.as_mut().and_then(|p| p.queue.steps.pop_front()) else {
             return Ok(());
         };
         let synced = {
@@ -8225,7 +8265,7 @@ impl GpuEngine {
                 grid = self.grid,
                 "decode pipeline: step failed"
             );
-            self.pipe.as_mut().expect("pipe").queue.clear();
+            self.pipe.as_mut().expect("pipe").queue.steps.clear();
             return Err(e);
         }
         let prefix = self.vmm_prefix_enabled();
@@ -8236,12 +8276,12 @@ impl GpuEngine {
             let b = row.slot;
             let token = ids[if step.compact { j } else { b }] as u32;
             if token as usize >= vocab {
-                pipe.queue.clear();
+                pipe.queue.steps.clear();
                 return Err(RuntimeError::Device(
                     "decode pipeline: step produced an invalid token".into(),
                 ));
             }
-            if pipe.retire[b].is_some() {
+            if pipe.queue.retire[b].is_some() {
                 // The mux retired this row while the step was queued, so its token is dropped.
                 // The frontier advanced when the step was enqueued, so take that back: the KV
                 // this step wrote is not part of the sequence any published prefix describes.
@@ -8254,16 +8294,8 @@ impl GpuEngine {
             }
             pipe.last_in[b] = token;
         }
-        if pipe.queue.is_empty() {
-            let retired: smallvec::SmallVec<[(usize, bool); 8]> = pipe
-                .retire
-                .iter_mut()
-                .enumerate()
-                .filter_map(|(b, r)| r.take().map(|c| (b, c)))
-                .collect();
-            for (b, cache_output) in retired {
-                self.retire_slot(b, cache_output);
-            }
+        for (b, cache_output) in pipe.queue.take_retired() {
+            self.retire_slot(b, cache_output);
         }
         Ok(())
     }
@@ -12050,6 +12082,9 @@ mod qwen_tests;
 
 #[cfg(test)]
 mod logprob_rows_tests;
+
+#[cfg(test)]
+mod pipe_tests;
 
 #[cfg(test)]
 #[test]
