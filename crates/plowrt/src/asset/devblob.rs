@@ -1510,8 +1510,8 @@ mod tests {
         let mut m = tiny_model();
         assert!(DevBlob::parse(&m.to_blob()).is_ok());
         m.progs[1].insts.push(DevInst { op: 0xfffe, blocks: 1, ..Default::default() });
-        let err = DevBlob::parse(&m.to_blob()).unwrap_err().to_string();
-        assert!(err.contains("opcode 65534"), "{err}");
+        let Err(err) = DevBlob::parse(&m.to_blob()) else { panic!("unknown opcode accepted") };
+        assert!(err.to_string().contains("opcode 65534"), "{err}");
     }
 
     /// Give program `p` the two collectives `devgen` emits per layer at tp=N:
