@@ -1,6 +1,8 @@
 //! §G OpenAI-compatible API server.
 
 pub mod admin;
+#[cfg(feature = "cpu")]
+pub mod portable;
 pub mod bench;
 pub mod chat;
 pub mod completion;
@@ -373,6 +375,8 @@ pub struct AppState {
     /// Directories a control-plane `load` may take an assets dir from. Set
     /// once at startup; empty means no assets dir may be named by request.
     models_roots: std::sync::OnceLock<Vec<std::path::PathBuf>>,
+    #[cfg(feature = "cpu")]
+    portable: std::sync::OnceLock<Arc<portable::PortableManager>>,
     /// Operator-set residency overrides, slug → state. Absent = [`Residency::Auto`].
     /// Only the control plane writes here; the manager and the request path read it.
     residency: RwLock<FxHashMap<String, Residency>>,
@@ -435,6 +439,7 @@ impl AppState {
 
     /// Construct with per-run timeline recording enabled/disabled.
     pub fn with_trace(registry: Registry, execset: Arc<ExecutorSet>, record_trace: bool) -> Self {
+        let _ = crate::obs::serving::started_at_unix_ms();
         AppState {
             registry,
             execset,
@@ -451,6 +456,8 @@ impl AppState {
             slug_group: RwLock::new(FxHashMap::default()),
             turns: std::sync::OnceLock::new(),
             models_roots: std::sync::OnceLock::new(),
+            #[cfg(feature = "cpu")]
+            portable: std::sync::OnceLock::new(),
             residency: RwLock::new(FxHashMap::default()),
             control: Mutex::new(FxHashMap::default()),
             started: openai::now_secs(),
@@ -473,6 +480,16 @@ impl AppState {
             .write()
             .insert(slug.clone(), engine.honours_sampling());
         self.gpu.write().insert(slug, Arc::new(Mutex::new(engine)));
+    }
+
+    #[cfg(feature = "cpu")]
+    pub fn install_portable_manager(&self, manager: portable::PortableManager) {
+        let _ = self.portable.set(Arc::new(manager));
+    }
+
+    #[cfg(feature = "cpu")]
+    pub fn portable_manager(&self) -> Option<&Arc<portable::PortableManager>> {
+        self.portable.get()
     }
 
     /// Unix seconds this process started offering models.
@@ -697,6 +714,9 @@ impl AppState {
     }
 
     pub(crate) fn model_metrics(&self, slug: &str) -> Arc<Metrics> {
+        if let Some(metrics) = self.model_metrics.read().get(slug) {
+            return metrics.clone();
+        }
         let mut models = self.model_metrics.write();
         models.retain(|name, metrics| {
             let keep = self.registry.contains(name) || Arc::strong_count(metrics) > 1;
@@ -937,6 +957,7 @@ pub fn app(state: Arc<AppState>) -> Router {
         .route("/health", get(healthz))
         .route("/healthz", get(healthz))
         .route("/metrics", get(metrics_handler))
+        .route("/v1/metrics", get(metrics_snapshot_handler))
         .route("/trace", get(trace_handler))
         .route("/v1/turns/:session", get(turns::session_turns))
         .layer(axum::extract::DefaultBodyLimit::max(MAX_BODY_BYTES))
@@ -958,11 +979,7 @@ async fn healthz() -> &'static str {
     "ok"
 }
 
-async fn metrics_handler(
-    axum::extract::State(state): axum::extract::State<Arc<AppState>>,
-) -> axum::response::Response {
-    use axum::response::IntoResponse;
-    let models: Vec<_> = {
+fn metrics_models(state: &AppState) -> Vec<(String, Arc<Metrics>, bool)> {
         let mut metrics = state.model_metrics.write();
         for slug in state.registry.slugs() {
             metrics.entry(slug).or_default();
@@ -983,7 +1000,19 @@ async fn metrics_handler(
         }).collect();
         models.sort_unstable_by(|a, b| a.0.cmp(&b.0));
         models
-    };
+}
+
+async fn metrics_snapshot_handler(
+    axum::extract::State(state): axum::extract::State<Arc<AppState>>,
+) -> axum::Json<crate::obs::serving::RuntimeSnapshot> {
+    axum::Json(crate::obs::serving::snapshot(&metrics_models(&state)))
+}
+
+async fn metrics_handler(
+    axum::extract::State(state): axum::extract::State<Arc<AppState>>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let models = metrics_models(&state);
     let aggregate = Metrics::default();
     aggregate.accumulate(&state.metrics);
     for (_, metrics, _) in &models {

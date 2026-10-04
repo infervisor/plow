@@ -1,5 +1,5 @@
 use std::fmt::Write;
-use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -63,7 +63,218 @@ impl Histogram {
 }
 
 #[derive(Default)]
+pub struct AsrMetrics {
+    pub cohort: AtomicBool,
+    pub http_requests: AtomicU64,
+    pub websocket_sessions: AtomicU64,
+    pub active_sessions: AtomicU64,
+    pub jobs: AtomicU64,
+    pub queued: AtomicU64,
+    pub running: AtomicU64,
+    pub completed: AtomicU64,
+    pub errors: AtomicU64,
+    pub cancelled: AtomicU64,
+    pub rejected: AtomicU64,
+    pub first_transcript: Histogram,
+    pub e2e: Histogram,
+    pub queue: Histogram,
+}
+
+#[derive(serde::Serialize)]
+pub struct LatencySnapshot {
+    pub count: u64,
+    pub sum_ms: f64,
+    /// Conservative bucket upper bounds; null means empty or beyond the last finite bucket.
+    pub p50_ms: Option<f64>,
+    pub p95_ms: Option<f64>,
+    pub p99_ms: Option<f64>,
+}
+
+impl Histogram {
+    pub fn snapshot(&self) -> LatencySnapshot {
+        let bins: Vec<_> = self.bins.iter().map(|b| b.load(Relaxed)).collect();
+        let count = bins.iter().sum();
+        let quantile = |percent: u64| {
+            if count == 0 {
+                return None;
+            }
+            let rank = (count as u128 * percent as u128).div_ceil(100);
+            let mut cumulative = 0u128;
+            for (index, bin) in bins.iter().enumerate() {
+                cumulative += *bin as u128;
+                if cumulative >= rank {
+                    return LATENCY.get(index).map(|us| *us as f64 / 1000.0);
+                }
+            }
+            None
+        };
+        LatencySnapshot {
+            count,
+            sum_ms: self.sum.load(Relaxed) as f64 / 1000.0,
+            p50_ms: quantile(50),
+            p95_ms: quantile(95),
+            p99_ms: quantile(99),
+        }
+    }
+}
+
+#[derive(serde::Serialize)]
+pub struct AsrSnapshot {
+    pub job_counters_available: bool,
+    pub http_requests: u64,
+    pub websocket_sessions: u64,
+    pub active_sessions: u64,
+    pub jobs: u64,
+    pub queued: u64,
+    pub running: u64,
+    pub completed: u64,
+    pub errors: u64,
+    pub cancelled: u64,
+    pub rejected: u64,
+    pub first_transcript: LatencySnapshot,
+    pub e2e: LatencySnapshot,
+    pub queue: LatencySnapshot,
+}
+
+impl AsrMetrics {
+    pub fn snapshot(&self) -> Option<AsrSnapshot> {
+        let http_requests = self.http_requests.load(Relaxed);
+        let websocket_sessions = self.websocket_sessions.load(Relaxed);
+        let cohort = self.cohort.load(Relaxed);
+        if !cohort && http_requests == 0 && websocket_sessions == 0 {
+            return None;
+        }
+        Some(AsrSnapshot {
+            job_counters_available: cohort,
+            http_requests,
+            websocket_sessions,
+            active_sessions: self.active_sessions.load(Relaxed),
+            jobs: self.jobs.load(Relaxed),
+            queued: self.queued.load(Relaxed),
+            running: self.running.load(Relaxed),
+            completed: self.completed.load(Relaxed),
+            errors: self.errors.load(Relaxed),
+            cancelled: self.cancelled.load(Relaxed),
+            rejected: self.rejected.load(Relaxed),
+            first_transcript: self.first_transcript.snapshot(),
+            e2e: self.e2e.snapshot(),
+            queue: self.queue.snapshot(),
+        })
+    }
+}
+
+#[derive(serde::Serialize)]
+pub struct ModelSnapshot {
+    pub id: String,
+    pub ready: bool,
+    pub requests: u64,
+    pub queued: u64,
+    pub running: u64,
+    pub completed: u64,
+    pub aborted: u64,
+    pub preempted: u64,
+    pub rejected: u64,
+    pub tick_errors: u64,
+    pub prompt_tokens: u64,
+    pub cached_tokens: u64,
+    pub generated_tokens: u64,
+    pub ttft: LatencySnapshot,
+    pub e2e: LatencySnapshot,
+    pub queue: LatencySnapshot,
+    pub asr: Option<AsrSnapshot>,
+}
+
+#[derive(serde::Serialize)]
+pub struct RuntimeSnapshot {
+    pub object: &'static str,
+    pub started_at_unix_ms: u64,
+    pub observed_at_unix_ms: u64,
+    pub models: Vec<ModelSnapshot>,
+}
+
+fn unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u64::MAX as u128) as u64
+}
+
+pub fn started_at_unix_ms() -> u64 {
+    static STARTED: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *STARTED.get_or_init(unix_ms)
+}
+
+pub fn snapshot(models: &[(String, Arc<Metrics>, bool)]) -> RuntimeSnapshot {
+    RuntimeSnapshot {
+        object: "runtime.metrics",
+        started_at_unix_ms: started_at_unix_ms(),
+        observed_at_unix_ms: unix_ms(),
+        models: models
+            .iter()
+            .map(|(id, m, ready)| {
+                let s = &m.serving;
+                let asr = s.asr.snapshot();
+                let cohort = s.asr.cohort.load(Relaxed);
+                ModelSnapshot {
+                    id: id.clone(),
+                    ready: *ready,
+                    requests: if cohort {
+                        s.asr.jobs.load(Relaxed)
+                    } else {
+                        m.requests.load(Relaxed)
+                    },
+                    queued: if cohort {
+                        s.asr.queued.load(Relaxed)
+                    } else {
+                        m.queued_requests.load(Relaxed)
+                    },
+                    running: if cohort {
+                        s.asr.running.load(Relaxed)
+                    } else {
+                        s.running.load(Relaxed)
+                    },
+                    completed: if cohort {
+                        s.asr.completed.load(Relaxed)
+                    } else {
+                        s.success.iter().map(|n| n.load(Relaxed)).sum()
+                    },
+                    aborted: if cohort {
+                        s.asr.cancelled.load(Relaxed)
+                    } else {
+                        s.aborted.load(Relaxed)
+                    },
+                    preempted: s.preempted.load(Relaxed),
+                    rejected: if cohort {
+                        s.asr.rejected.load(Relaxed)
+                    } else {
+                        m.rejected.load(Relaxed)
+                    },
+                    tick_errors: s.tick_errors.load(Relaxed),
+                    prompt_tokens: s.prompt_computed.load(Relaxed),
+                    cached_tokens: s.prompt_cached.load(Relaxed),
+                    generated_tokens: s.generation.load(Relaxed),
+                    ttft: s.ttft.snapshot(),
+                    e2e: if cohort {
+                        s.asr.e2e.snapshot()
+                    } else {
+                        s.e2e.snapshot()
+                    },
+                    queue: if cohort {
+                        s.asr.queue.snapshot()
+                    } else {
+                        s.queue.snapshot()
+                    },
+                    asr,
+                }
+            })
+            .collect(),
+    }
+}
+
+#[derive(Default)]
 pub struct ServingMetrics {
+    pub asr: AsrMetrics,
     pub running: AtomicU64,
     pub prompt_computed: AtomicU64,
     pub prompt_cached: AtomicU64,
@@ -148,13 +359,21 @@ impl ServingMetrics {
             "vllm:num_requests_running",
             "gauge",
             "Requests occupying execution slots.",
-            |m: &Metrics, _| m.serving.running.load(Relaxed)
+            |m: &Metrics, _| if m.serving.asr.cohort.load(Relaxed) {
+                m.serving.asr.running.load(Relaxed)
+            } else {
+                m.serving.running.load(Relaxed)
+            }
         );
         scalar!(
             "vllm:num_requests_waiting",
             "gauge",
             "Requests waiting outside execution slots.",
-            |m: &Metrics, _| m.queued_requests.load(Relaxed)
+            |m: &Metrics, _| if m.serving.asr.cohort.load(Relaxed) {
+                m.serving.asr.queued.load(Relaxed)
+            } else {
+                m.queued_requests.load(Relaxed)
+            }
         );
         scalar!(
             "vllm:prompt_tokens_total",
@@ -178,7 +397,8 @@ impl ServingMetrics {
             "vllm:prefix_cache_queries_total",
             "counter",
             "Prefix cache queries, in terms of number of queried tokens.",
-            |m: &Metrics, _| m.serving.prompt_computed.load(Relaxed) + m.serving.prompt_cached.load(Relaxed)
+            |m: &Metrics, _| m.serving.prompt_computed.load(Relaxed)
+                + m.serving.prompt_cached.load(Relaxed)
         );
         scalar!(
             "vllm:prefix_cache_hits_total",
@@ -186,7 +406,7 @@ impl ServingMetrics {
             "Prefix cache hits, in terms of number of cached tokens.",
             |m: &Metrics, _| m.serving.prompt_cached.load(Relaxed)
         );
-        scalar!("plowrt_requests_aborted_total", "counter", "Admitted requests dropped without normal completion or preemption; includes errors and disconnects.", |m: &Metrics, _| m.serving.aborted.load(Relaxed));
+        scalar!("plowrt_requests_aborted_total", "counter", "Admitted requests dropped without normal completion or preemption; includes errors and disconnects.", |m: &Metrics, _| if m.serving.asr.cohort.load(Relaxed) { m.serving.asr.cancelled.load(Relaxed) } else { m.serving.aborted.load(Relaxed) });
         scalar!(
             "plowrt_requests_preempted_total",
             "counter",
@@ -285,7 +505,15 @@ impl ServingMetrics {
                 let _ = writeln!(
                     out,
                     "vllm:request_success_total{{{labels},finished_reason=\"{reason}\"}} {}",
-                    m.serving.success[i].load(Relaxed)
+                    if m.serving.asr.cohort.load(Relaxed) {
+                        if i == 0 {
+                            m.serving.asr.completed.load(Relaxed)
+                        } else {
+                            0
+                        }
+                    } else {
+                        m.serving.success[i].load(Relaxed)
+                    }
                 );
             }
         }
@@ -426,15 +654,91 @@ impl ServingMetrics {
             "Stage start through its first output: ASR final transcript, LLM first token, TTS first audio.",
         );
         for ((_, m, _), labels) in models.iter().zip(&labels) {
-            for (stage, h) in ["asr_final", "llm_ttft", "tts_ttfa"].iter().zip(&m.serving.turn_stage) {
+            for (stage, h) in ["asr_final", "llm_ttft", "tts_ttfa"]
+                .iter()
+                .zip(&m.serving.turn_stage)
+            {
                 if h.bins.iter().any(|b| b.load(Relaxed) > 0) {
-                    h.write_seconds(out, "plowrt_turn_stage_seconds", &format!("{labels},stage=\"{stage}\""));
+                    h.write_seconds(
+                        out,
+                        "plowrt_turn_stage_seconds",
+                        &format!("{labels},stage=\"{stage}\""),
+                    );
                 }
+            }
+        }
+        scalar!("plowrt_asr_http_requests_total", "counter", "HTTP transcriptions routed to a known model; includes invalid parameters after routing.", |m: &Metrics, _| m.serving.asr.http_requests.load(Relaxed));
+        scalar!(
+            "plowrt_asr_websocket_sessions_total",
+            "counter",
+            "WebSocket sessions with a valid start and known model.",
+            |m: &Metrics, _| m.serving.asr.websocket_sessions.load(Relaxed)
+        );
+        scalar!(
+            "plowrt_asr_active_sessions",
+            "gauge",
+            "Active routed audio WebSocket sessions.",
+            |m: &Metrics, _| m.serving.asr.active_sessions.load(Relaxed)
+        );
+        scalar!(
+            "plowrt_asr_jobs_total",
+            "counter",
+            "Admitted cohort transcription jobs, including partial revisions.",
+            |m: &Metrics, _| m.serving.asr.jobs.load(Relaxed)
+        );
+        scalar!(
+            "plowrt_asr_jobs_queued",
+            "gauge",
+            "Cohort jobs waiting for engine admission, including batch formation.",
+            |m: &Metrics, _| m.serving.asr.queued.load(Relaxed)
+        );
+        scalar!(
+            "plowrt_asr_jobs_running",
+            "gauge",
+            "Cohort transcription jobs currently executing.",
+            |m: &Metrics, _| m.serving.asr.running.load(Relaxed)
+        );
+        scalar!(
+            "plowrt_asr_jobs_completed_total",
+            "counter",
+            "Cohort transcription jobs completed successfully.",
+            |m: &Metrics, _| m.serving.asr.completed.load(Relaxed)
+        );
+        scalar!(
+            "plowrt_asr_jobs_errors_total",
+            "counter",
+            "Cohort transcription jobs ending in an engine error.",
+            |m: &Metrics, _| m.serving.asr.errors.load(Relaxed)
+        );
+        scalar!(
+            "plowrt_asr_jobs_cancelled_total",
+            "counter",
+            "Cohort transcription jobs cancelled or disconnected before completion.",
+            |m: &Metrics, _| m.serving.asr.cancelled.load(Relaxed)
+        );
+        scalar!(
+            "plowrt_asr_jobs_rejected_total",
+            "counter",
+            "Cohort job admission refused because the engine queue was full or closed.",
+            |m: &Metrics, _| m.serving.asr.rejected.load(Relaxed)
+        );
+        for (name, help, select) in [
+            ("plowrt_asr_first_transcript_seconds", "Cohort submission through its first transcript; excludes audio upload and network transit.", (|m: &AsrMetrics| &m.first_transcript) as fn(&AsrMetrics) -> &Histogram),
+            ("plowrt_asr_job_duration_seconds", "Cohort submission through terminal success, error or cancellation.", (|m: &AsrMetrics| &m.e2e) as fn(&AsrMetrics) -> &Histogram),
+            ("plowrt_asr_queue_seconds", "Cohort submission through engine admission.", (|m: &AsrMetrics| &m.queue) as fn(&AsrMetrics) -> &Histogram),
+        ] {
+            family(out, name, "histogram", help);
+            for ((_, m, _), labels) in models.iter().zip(&labels) {
+                if m.serving.asr.cohort.load(Relaxed) { select(&m.serving.asr).write_seconds(out, name, labels); }
             }
         }
         crate::serve::turns::write_metrics(out);
         family(out, "plowrt_overload_level", "gauge", "Overload level: 0 normal, 1 ASR partials stretched, 2 TTS render-ahead capped, 3 new sessions shed.");
-        let _ = writeln!(out, "plowrt_overload_level {}", crate::serve::overload::level());
+        let _ = writeln!(
+            out,
+            "plowrt_overload_level {}",
+            crate::serve::overload::level()
+        );
     }
 }
 
@@ -516,7 +820,8 @@ impl RequestMetrics {
             let targets = crate::config::RuntimeConfig::get().slo_targets();
             if targets.active() {
                 let ttft_ms = first.saturating_duration_since(self.arrived).as_secs_f64() * 1e3;
-                let tpot_ms = decode.as_secs_f64() * 1e3 / self.tokens.saturating_sub(1).max(1) as f64;
+                let tpot_ms =
+                    decode.as_secs_f64() * 1e3 / self.tokens.saturating_sub(1).max(1) as f64;
                 let (ttft_ok, tbt_ok) = crate::sched::slo::attained(targets, ttft_ms, tpot_ms);
                 m.slo_requests.fetch_add(1, Relaxed);
                 m.slo_ttft_met.fetch_add(u64::from(ttft_ok), Relaxed);
@@ -544,6 +849,20 @@ impl Drop for RequestMetrics {
 mod tests {
     use super::*;
     use crate::serve::stream::FinishReason;
+
+    #[test]
+    fn latency_snapshot_uses_bucket_upper_bounds_without_inventing_empty_or_overflow_values() {
+        let histogram = Histogram::default();
+        assert!(histogram.snapshot().p95_ms.is_none());
+        histogram.duration(Duration::from_millis(2));
+        histogram.duration(Duration::from_millis(30));
+        let snapshot = histogram.snapshot();
+        assert_eq!((snapshot.count, snapshot.sum_ms), (2, 32.0));
+        assert_eq!(snapshot.p50_ms, Some(5.0));
+        assert_eq!(snapshot.p95_ms, Some(50.0));
+        histogram.duration(Duration::from_secs(700));
+        assert!(histogram.snapshot().p99_ms.is_none());
+    }
 
     #[test]
     fn histogram_is_cumulative_and_has_consistent_infinity_count() {

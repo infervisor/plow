@@ -339,3 +339,36 @@ assistant turn.
 `cargo check -p plowrt --features cpu` does not compile on `main`, independent of any of this:
 `serve/mux.rs` calls `RuntimeConfig::get().multistep()`, which is `#[cfg(any(cuda, hsa))]`, from
 an AMD multistep block that is not itself hsa-gated. Not touched here.
+
+### CPU/Metal model lifecycle and compiler identity
+
+Native CPU/Metal slot engines support the existing private `/v1/models/load`,
+`/v1/models/unload`, and `/v1/models/status` API, including explicit asset
+registration, aliases, deregistration and preemption of active streams. Status
+advertises `capabilities` so a controller can distinguish this support from a
+backend without a lifecycle manager. Automatic eviction is not supported on
+CPU/Metal. An unloaded model remains registered until `deregister: true`, and
+inference returns `model_unloaded` until an explicit load. Controls finish after
+client disconnect; public TCP inference does not expose these admin routes.
+Native allocation reclamation counters are `null` when they cannot be measured.
+
+`/v1/models` cards advertise `x_plow_endpoints`; text slot models currently list
+`chat/completions` and `completions`. Use private status to distinguish registered,
+resident and serving models. Resolve a card's `root` before issuing canonical
+model controls; aliases share residency and the same control lock.
+
+The compiler writes the network slug and optional serving identity to
+`weights.json`. Both packet and device-blob compilation honor `--served-name`.
+For a Hugging Face cache snapshot, the network slug comes from the model name,
+not the snapshot revision; the default serving identity preserves the HF repo
+ID (including organization and case). An ordinary local directory defaults to
+its lowercase basename. Output directories do not determine API identity.
+`plowrt` precedence is an explicit runtime slug, then manifest `served_name`,
+then manifest `network`; alternate client names should use aliases.
+
+Standalone ASR accepts `--served-model-name nemotron-asr-0.6b` and publishes that
+exact identity through `/v1/models` and `/v1/models/{id}`, with audio endpoint
+capabilities. This separates a public model name from the packet pipeline's
+operation name (often `transcribe`). Without the flag, the pipeline name remains
+the compatibility default. Standalone ASR does not advertise text inference or
+model lifecycle controls.

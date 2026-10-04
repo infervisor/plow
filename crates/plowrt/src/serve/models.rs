@@ -22,6 +22,7 @@ use crate::serve::AppState;
 fn card(state: &AppState, id: String, canonical: &str) -> ModelCard {
     let is_alias = id != canonical;
     ModelCard {
+        x_plow_endpoints: vec!["chat/completions", "completions"],
         max_model_len: state.max_ctx(canonical),
         root: canonical.to_string(),
         parent: is_alias.then(|| canonical.to_string()),
