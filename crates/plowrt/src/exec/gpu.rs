@@ -6974,7 +6974,7 @@ impl GpuEngine {
         self.reset_packed_admission(b);
         if !self.vmm_active[b] {
             if let Some(rings) = self.vmm.as_mut().and_then(|v| v.rings.as_mut()) {
-                rings.release_slot(b);
+                rings.release_idle(b);
             }
             return;
         }
