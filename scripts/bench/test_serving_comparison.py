@@ -31,6 +31,19 @@ def agentic(wall, ttft, tpot, sessions=32):
                 overall=dict(errors=0, wall_s=wall, ttft_p99_ms=ttft, tpot_p99_ms=tpot), requests=reqs)
 
 
+def prod(total, ttft, tpot, goodput, rate=1.25, seed=9):
+    cfg = dict(apps=4, system_median=1536, turns_mean=6, turns_max=20, first_median=1500, first_sigma=1.0,
+               tool_median=700, tool_sigma=1.0, max_model_len=16384, out_median=160, out_sigma=0.7, out_min=16,
+               out_max=1024, temperature=0.0, top_p=None, api="chat", rate=rate, think_median_s=5.0,
+               think_sigma=0.8, think_max_s=60.0, duration=300.0, warmup=75.0, cooldown=25.0, seed=seed,
+               session_header=True)
+    return dict(config=cfg, overall=dict(errors=0, errors_total=0, total_tok_s=total, ttft_p99_ms=ttft,
+                                         tpot_p99_ms=tpot, goodput_req_s=goodput, slo_attainment=0.9,
+                                         request_s=5.0, mean_inflight=40.0, mean_sessions=60.0,
+                                         ttft_p50_ms=300.0, tpot_p50_ms=40.0, cached_fraction=0.8,
+                                         slo_ttft_ms=2000.0, slo_tpot_ms=100.0))
+
+
 class Fixture:
     def __init__(self, root):
         self.root = Path(root)
@@ -223,6 +236,45 @@ class RenderTest(unittest.TestCase):
         self.assertTrue(rows["TTFT P99"][1].endswith(" *"))
         self.assertIn("Infervisor TTFT P99 40.0%", c["spread_flagged"][0])
         self.assertIn("FLAGGED", (out / "comparison.md").read_text())
+
+    def write_prod(self, **kw):  # seed=N: Infervisor replays seed N in both repeats
+        for d, scale in ((self.f.base, 1.0), (self.f.plow, 1.25)):
+            for rep in (1, 2):
+                (d / f"q1250.g.r{rep}.json").write_text(json.dumps(prod(40000 * scale, 3000 / scale, 80, 4.0 * scale,
+                                                                      **dict(dict(seed=9 + rep), **(kw if d == self.f.plow else {})))))
+                (d / f"q1250.g.r{rep}.peak_gpu_memory_mib.txt").write_text("70000\n")
+
+    def test_open_loop_cell_strict_table_plus_supplementary(self):
+        self.write_prod()
+        rc, err, out = self.f.render()
+        self.assertEqual(rc, 0, err)
+        report, c, rows = self.table(out, "q1250.g")
+        self.assertEqual([x["cell"] for x in report["cells"]], ["g128", "a32.g", "q1250.g"])
+        self.assertEqual([r[0] for r in c["rows"]], list(sc.LABELS))
+        self.assertTrue(c["matched"])
+        self.assertIn("Poisson 1.25 sessions/s", rows["Traffic / concurrency"][0])
+        self.assertTrue(rows["Traffic / concurrency"][0].endswith("seeds 10/11"))
+        self.assertEqual(rows["Total throughput"], ("40,000 tok/s", "50,000 tok/s (1.25x)"))
+        self.assertEqual(rows["TTFT P99"], ("3,000.0 ms", "2,400.0 ms (0.80x)"))
+        self.assertAlmostEqual(c["supplementary"]["infervisor"]["goodput_req_s"], 5.0)
+        md = (out / "comparison.md").read_text()
+        self.assertIn("goodput 4.000 req/s / 5.000 req/s", md)
+        self.assertIn("TTFT <= 2000 ms and TPOT <= 100 ms", md)
+
+    def test_open_loop_other_seed_is_not_matched(self):
+        self.write_prod(seed=10)
+        rc, _, out = self.f.render()
+        self.assertEqual(rc, 1)
+        _, c, _ = self.table(out, "q1250.g")
+        self.assertEqual(c["mismatched"], ["Traffic / concurrency"])
+
+    def test_open_loop_failed_requests_refused(self):
+        self.write_prod()
+        p = self.f.plow / "q1250.g.r1.json"
+        d = json.loads(p.read_text())
+        d["overall"]["errors_total"] = 3
+        p.write_text(json.dumps(d))
+        self.assertRefused("q1250.g.r1.json: 3 failed requests")
 
 
 class RecordTest(unittest.TestCase):
