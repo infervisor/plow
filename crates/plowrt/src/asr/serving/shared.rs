@@ -116,7 +116,9 @@ impl SharedAsr {
         let checkpoint = dir.join("checkpoint");
         let checkpoint = if checkpoint.is_dir() { checkpoint } else { dir.to_path_buf() };
         let prompt = AudioLmPrompt::load(&dir.join("model.pkt"), &checkpoint)?;
-        let mut encoder = PacketAudioEncoder::load(&dir.join("encoder.pkt"), "cuda")?;
+        let encoder_path =
+            crate::exec::packet_runtime::stage_packet(&dir.join("model.pkt"), "encoder.packet", "encoder.pkt")?;
+        let mut encoder = PacketAudioEncoder::load(&encoder_path, "cuda")?;
         let warm = Instant::now();
         encoder.warm()?;
         tracing::info!(ms = warm.elapsed().as_millis() as u64, packed_chunks = encoder.max_packed_chunks(), "asr: encoder graphs warmed");
@@ -126,7 +128,7 @@ impl SharedAsr {
         let chunking = prompt.chunking();
         let window_frames = encoder.window_rows() / chunking.chunk_frames.div_ceil(chunking.frame_stride) * chunking.chunk_frames;
         let (encode, rx) = std::sync::mpsc::channel::<Encode>();
-        let cost_id = crate::sched::cost::id(&dir.join("encoder.pkt").to_string_lossy());
+        let cost_id = crate::sched::cost::id(&encoder_path.to_string_lossy());
         std::thread::Builder::new()
             .name("plow-asr-encoder".into())
             .spawn(move || encode_loop(rx, encoder, cost_id))
@@ -421,7 +423,7 @@ fn is_audio_lm(dir: &Path) -> Result<bool> {
         .pipelines()
         .iter()
         .any(|p| p.driver == "causal.v1" && p.parameters.get("overlay_rows").is_some_and(|&r| r > 0))
-        && dir.join("encoder.pkt").is_file())
+        && dir.join(asset.stage_file("encoder.packet", "encoder.pkt")?).is_file())
 }
 
 fn shared_asr(state: &AppState, slug: &str, dir: &Path) -> Result<Option<Arc<SharedAsr>>> {
@@ -447,16 +449,16 @@ fn shared_asr(state: &AppState, slug: &str, dir: &Path) -> Result<Option<Arc<Sha
 }
 
 /// Bind every resident audio LM's front-end now, so the first request does not pay the encoder
-/// load.
-pub fn preload(state: &AppState) {
+/// load. A front-end that cannot load fails the serve at startup.
+pub fn preload(state: &AppState) -> Result<()> {
     for slug in state.registry.slugs() {
         let (Some(_), Ok(bundle)) = (state.mux(&slug), state.registry.get(&slug)) else {
             continue;
         };
-        if let Err(e) = shared_asr(state, &slug, &bundle.dir) {
-            tracing::warn!(%slug, error = %e, "asr: audio LM front failed to load");
-        }
+        shared_asr(state, &slug, &bundle.dir)
+            .map_err(|e| RuntimeError::Rejected(format!("{slug}: asr front-end failed to load: {e}")))?;
     }
+    Ok(())
 }
 
 pub(super) async fn route(

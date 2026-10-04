@@ -55,7 +55,7 @@ impl MetalAudioLmExecution {
                 "causal packet geometry does not match the checkpoint".into(),
             ));
         }
-        let encoder_packet = blob.with_file_name("encoder.pkt");
+        let encoder_packet = crate::exec::packet_runtime::stage_packet(blob, "encoder.packet", "encoder.pkt")?;
         let packet_encoder = encoder_packet
             .is_file()
             .then(|| PacketAudioEncoder::load(&encoder_packet, "metal"))

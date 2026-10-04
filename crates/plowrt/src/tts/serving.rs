@@ -103,7 +103,7 @@ fn guided_model(
 
 /// Bind every served speech model's host stages now (vocoder / codec graphs, prompt tables), so
 /// the first request does not pay them.
-pub fn preload(state: &AppState) {
+pub fn preload(state: &AppState) -> Result<(), String> {
     for slug in state.registry.slugs() {
         let (Some(_), Ok(bundle)) = (state.mux(&slug), state.registry.get(&slug)) else {
             continue;
@@ -112,10 +112,9 @@ pub fn preload(state: &AppState) {
             Some(_) => Ok(()),
             None => speech_model(&bundle.dir, state.downstream(&slug)).map(drop),
         });
-        if let Err(e) = bound {
-            tracing::warn!(%slug, error = %e, "tts: speech pipeline failed to bind");
-        }
+        bound.map_err(|e| format!("{slug}: speech pipeline failed to bind: {e}"))?;
     }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]

@@ -159,7 +159,8 @@ struct Bound {
 
 impl Codec {
     pub fn load(assets: &Path) -> Result<Self, String> {
-        let path = assets.join(PACKET);
+        let path = crate::exec::packet_runtime::stage_packet(&assets.join("model.pkt"), "codec.packet", PACKET)
+            .map_err(|e| e.to_string())?;
         if !path.is_file() {
             return Err(format!("{} missing: emit it with PLOW_TTS_CODEC_DIR (docs/runtime/tts.md)", path.display()));
         }

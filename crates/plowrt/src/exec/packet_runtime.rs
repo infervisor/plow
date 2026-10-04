@@ -271,6 +271,11 @@ pub fn load_packet_runtime(path: &Path, requested: &str) -> Result<LoadedPacketR
     }
 }
 
+/// The path of the sidecar `key` names in the pipelines of `model_pkt`, beside it.
+pub fn stage_packet(model_pkt: &Path, key: &str, legacy: &str) -> Result<std::path::PathBuf> {
+    Ok(model_pkt.with_file_name(PacketAsset::load(model_pkt)?.stage_file(key, legacy)?))
+}
+
 impl PacketAsset {
     pub fn load(path: &Path) -> Result<Self> {
         let image = std::fs::read(path).map_err(|source| RuntimeError::Io {
@@ -303,6 +308,21 @@ impl PacketAsset {
 
     pub fn pipelines(&self) -> &[PacketPipeline] {
         &self.pipelines.pipelines
+    }
+
+    /// The sidecar packet a pipeline names under `key` (e.g. `encoder.packet`), else `legacy`
+    /// for a packet emitted before the name was carried. A bare file name beside the packet.
+    pub fn stage_file(&self, key: &str, legacy: &str) -> Result<String> {
+        let named = self.pipelines().iter().find_map(|p| p.strings.get(key));
+        match named {
+            None => Ok(legacy.to_string()),
+            Some(name)
+                if !name.is_empty() && !name.contains(['/', '\\']) && name != "." && name != ".." =>
+            {
+                Ok(name.clone())
+            }
+            Some(name) => Err(RuntimeError::Rejected(format!("{key} {name:?} is not a file name beside the packet"))),
+        }
     }
 
     pub fn bind(&self, name: &str, runtime: &dyn PacketRuntime) -> Result<BoundPacketPipeline> {
