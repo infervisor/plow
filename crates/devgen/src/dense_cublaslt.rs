@@ -393,11 +393,29 @@ pub(crate) fn apply_native(
     }
     let mut section = apply_projections(model, true, 1)?;
     let mut roles = plow_asset::segment_roles::SegmentRoles::from_bytes(&section.data)?;
+    let mut plan = std::collections::BTreeSet::new();
     for p in &mut roles.programs {
-        for role in &mut p.roles {
-            if *role == CUBLASLT {
-                *role = plow_asset::segment_roles::NATIVE_DECODE_TC;
+        let program = &model.progs[p.index];
+        for (segment, role) in p.roles.iter_mut().enumerate() {
+            if *role != CUBLASLT {
+                continue;
             }
+            *role = plow_asset::segment_roles::NATIVE_DECODE_TC;
+            let inst = program
+                .stream
+                .iter()
+                .find(|e| e.seg as usize == segment)
+                .map(|e| &program.insts[e.inst as usize])
+                .ok_or("missing native decode segment")?;
+            let [m, n, k] = [inst.i[0], inst.i[1], inst.i[2]];
+            plan.insert(
+                *plow_asset::segment_roles::NATIVE_DECODE_BF16_SHAPES
+                    .iter()
+                    .find(|shape| shape[..3] == [m, n, k])
+                    .ok_or_else(|| {
+                        format!("native decode has no measured BF16 shape M{m}/N{n}/K{k}")
+                    })?,
+            );
         }
     }
     roles.objects.insert(
@@ -408,6 +426,8 @@ pub(crate) fn apply_native(
             sha256: Some(plow_asset::decode_objects::image_sha256(&image)),
             promote_k512: None,
             attention: None,
+            gemm: None,
+            decode_plan: Some(plan.into_iter().collect()),
         },
     );
     roles.validate_schema()?;
@@ -617,6 +637,16 @@ mod tests {
         }
     }
 
+    /// Body and head projections at measured native decode shapes.
+    fn native_model(widths: &[u32]) -> Model {
+        let mut model = model_rows(widths);
+        for program in &mut model.progs {
+            program.insts[1].i[1..3].copy_from_slice(&[512, 3840]);
+            program.insts[2].i[1..3].copy_from_slice(&[262144, 3840]);
+        }
+        model
+    }
+
     fn prefill_model() -> Model {
         let widths = [1, 64, 128, 256, 512, 1024, 1];
         let mut model = model_rows(&widths);
@@ -729,7 +759,12 @@ mod tests {
             90,
         );
         std::fs::write(directory.join("gemv_sm90_transposed.cubin"), &image).unwrap();
-        let mut m = model();
+        let mut unmeasured = model();
+        assert!(apply_native(&mut unmeasured, &directory.join("model.pkt"))
+            .err()
+            .expect("unmeasured shape")
+            .contains("no measured BF16 shape M8/N64/K64"));
+        let mut m = native_model(&[128, 8]);
         let section = apply_native(&mut m, &directory.join("model.pkt")).unwrap();
         let metadata = plow_asset::segment_roles::SegmentRoles::from_bytes(&section.data).unwrap();
         assert_eq!(
@@ -744,12 +779,16 @@ mod tests {
             metadata.objects[&plow_asset::segment_roles::NATIVE_DECODE_TC].sha256,
             Some(plow_asset::decode_objects::image_sha256(&image))
         );
-        let mut wide = model_rows(&[128, 1, 16, 32]);
+        assert_eq!(
+            metadata.objects[&plow_asset::segment_roles::NATIVE_DECODE_TC].decode_plan,
+            Some(vec![[8, 512, 3840, 256, 8], [8, 262144, 3840, 256, 1]])
+        );
+        let mut wide = native_model(&[128, 1, 16, 32]);
         assert!(apply_native(&mut wide, &directory.join("model.pkt"))
             .err()
             .expect("missing B32 capability")
             .contains("B32 capability"));
-        let mut prefill_32 = model_rows(&[32, 128, 1, 16]);
+        let mut prefill_32 = native_model(&[32, 128, 1, 16]);
         assert!(apply_native(&mut prefill_32, &directory.join("model.pkt")).is_ok());
         let wide_image = plow_asset::cubin::synthetic_elf(
             "plow_gemv_bf16_m32_bk128_s3",
@@ -1052,6 +1091,8 @@ mod tests {
                         sha256: None,
                         promote_k512: None,
                         attention: None,
+                        gemm: None,
+                        decode_plan: None,
                     },
                 )]
                 .into_iter()

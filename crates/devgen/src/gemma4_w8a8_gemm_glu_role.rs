@@ -2,8 +2,8 @@ use packet::dev::{DevOp, TENSOR_NONE};
 use packet::devbuild::{Model, SectionData, SECT_METADATA};
 use packet::rope::GEN_TMAP_E4M3;
 use plow_asset::segment_roles::{
-    ProgramRoles, SegmentObject, SegmentRoles, INTERPRETER, SECTION, W8A8_PREFILL_GEMM_GLU_GEMMA4,
-    W8A8_PREFILL_GEMM_GLU_GEMMA4_ABI,
+    GemmCapability, ProgramRoles, SegmentObject, SegmentRoles, INTERPRETER, SECTION,
+    W8A8_PREFILL_GEMM_GLU_GEMMA4, W8A8_PREFILL_GEMM_GLU_GEMMA4_ABI,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -25,6 +25,32 @@ const OBJECT_GLOBALS: [(&str, u32); 13] = [
     ("plow_block_pfgemm_glu_w8a8_gemma4", 384),
     ("plow_arena_bytes_pfgemm_glu_w8a8_gemma4", 197696),
 ];
+
+fn gemm_capability() -> GemmCapability {
+    let global = |wanted: &str| {
+        OBJECT_GLOBALS
+            .iter()
+            .find(|(name, _)| *name == wanted)
+            .map(|&(_, value)| value)
+            .expect("pinned object global")
+    };
+    GemmCapability {
+        rows: vec![
+            global("plow_pfgemm_glu_w8a8_gemma4_min_rows"),
+            global("plow_pfgemm_glu_w8a8_gemma4_max_rows"),
+        ],
+        n: global("plow_pfgemm_glu_w8a8_gemma4_n"),
+        k: global("plow_pfgemm_glu_w8a8_gemma4_k"),
+        bm: global("plow_pfgemm_glu_w8a8_gemma4_bm"),
+        bn: global("plow_pfgemm_glu_w8a8_gemma4_bn"),
+        bk: global("plow_pfgemm_glu_w8a8_gemma4_bk"),
+        stages: global("plow_pfgemm_glu_w8a8_gemma4_stages"),
+        block: global("plow_block_pfgemm_glu_w8a8_gemma4"),
+        arena_bytes: global("plow_arena_bytes_pfgemm_glu_w8a8_gemma4"),
+        tile_band: Some(global("plow_pfgemm_glu_w8a8_gemma4_tile_band")),
+        direct_entry: Some(global("plow_pfgemm_glu_w8a8_gemma4_direct_entry")),
+    }
+}
 
 pub(crate) fn exact_shape(m: u32, n: u32, k: u32) -> bool {
     matches!(m, 4096 | 8192) && n == 15360 && k == 3840
@@ -285,6 +311,8 @@ pub(crate) fn apply_output_object(
             sha256: Some(plow_asset::decode_objects::image_sha256(&image)),
             promote_k512: None,
             attention: None,
+            gemm: Some(gemm_capability()),
+            decode_plan: None,
         },
     );
     for update in &updates {
@@ -465,6 +493,10 @@ mod tests {
         assert_eq!(
             roles.objects[&W8A8_PREFILL_GEMM_GLU_GEMMA4].sha256,
             Some(plow_asset::decode_objects::image_sha256(&image))
+        );
+        assert_eq!(
+            roles.objects[&W8A8_PREFILL_GEMM_GLU_GEMMA4].gemm,
+            plow_asset::segment_roles::legacy_gemm(W8A8_PREFILL_GEMM_GLU_GEMMA4)
         );
         assert!(!roles.programs.iter().any(|record| record.index == 0));
         for (index, old) in original.iter().enumerate() {

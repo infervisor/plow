@@ -6,6 +6,7 @@ pub(super) struct Native {
     kernels: Vec<KernelFn>,
     reduce: KernelFn,
     workspace: DeviceMem,
+    decode_plan: Vec<[u32; 5]>,
 }
 
 pub(super) struct Plan {
@@ -16,10 +17,10 @@ pub(super) struct Plan {
     smem: u32,
 }
 
-fn selection(m: u32, n: u32, k: u32) -> Result<(usize, u32, u32)> {
-    let &(_, _, _, bk, splits) = SHAPES
+fn selection(plan: &[[u32; 5]], m: u32, n: u32, k: u32) -> Result<(usize, u32, u32)> {
+    let &[_, _, _, bk, splits] = plan
         .iter()
-        .find(|&&(mm, nn, kk, _, _)| (mm, nn, kk) == (m, n, k))
+        .find(|shape| shape[..3] == [m, n, k])
         .ok_or_else(|| {
             RuntimeError::Rejected(format!(
                 "native decode has no measured BF16 shape M{m}/N{n}/K{k}"
@@ -70,7 +71,7 @@ impl Native {
             .iter()
             .flatten()
             .map(|s| {
-                selection(s.m, s.n, s.k)?;
+                selection(object.decode_plan_or_legacy(), s.m, s.n, s.k)?;
                 Ok(u64::from(s.m) * u64::from(s.n) * 8 * 4)
             })
             .collect::<Result<Vec<_>>>()?
@@ -106,6 +107,7 @@ impl Native {
             kernels,
             reduce,
             workspace,
+            decode_plan: object.decode_plan_or_legacy().to_vec(),
         }))
     }
 
@@ -116,7 +118,7 @@ impl Native {
         k: u32,
         template: Option<&Plan>,
     ) -> Result<Plan> {
-        let (mut kernel, mut splits, mut smem) = selection(m, n, k)?;
+        let (mut kernel, mut splits, mut smem) = selection(&self.decode_plan, m, n, k)?;
         if let Some(template) = template {
             if !Arc::ptr_eq(self, &template.owner)
                 || template.shape[0] < m
@@ -211,71 +213,23 @@ mod tests {
 
     #[test]
     fn measured_shapes_have_bounded_launch_and_scratch() {
-        assert_eq!(SHAPES.len(), 54);
-        for &(m, n, k, _, _) in SHAPES {
-            let (kernel, splits, smem) = selection(m, n, k).unwrap();
+        let shapes = &plow_asset::segment_roles::NATIVE_DECODE_BF16_SHAPES;
+        for &[m, n, k, _, _] in shapes {
+            let (kernel, splits, smem) = selection(shapes, m, n, k).unwrap();
             assert!(kernel < 6 && [1, 4, 8].contains(&splits));
             assert!(smem <= 101376 && u64::from(m) * u64::from(n) <= i32::MAX as u64);
         }
-        assert!(selection(64, 15360, 3840).is_err());
-        assert!(selection(16, 15360, 3848).is_err());
-        assert!(selection(16, 262145, 3840).is_err());
+        assert!(selection(shapes, 64, 15360, 3840).is_err());
+        assert!(selection(shapes, 16, 15360, 3848).is_err());
+        assert!(selection(shapes, 16, 262145, 3840).is_err());
+    }
+
+    #[test]
+    fn descriptor_plan_replaces_the_measured_table() {
+        let plan = [[8, 2048, 2048, 128, 1], [32, 2816, 4096, 256, 4]];
+        assert_eq!(selection(&plan, 8, 2048, 2048).unwrap(), (0, 1, 3 * 72 * 136 * 2));
+        assert_eq!(selection(&plan, 32, 2816, 4096).unwrap(), (5, 4, 2 * 96 * 264 * 2));
+        assert!(selection(&plan, 8, 512, 3840).is_err());
     }
 }
 
-const SHAPES: &[(u32, u32, u32, u32, u32)] = &[
-    (1, 512, 3840, 256, 8),
-    (1, 2048, 3840, 256, 8),
-    (1, 3840, 4096, 128, 4),
-    (1, 3840, 8192, 128, 4),
-    (1, 3840, 15360, 256, 4),
-    (1, 4096, 3840, 256, 4),
-    (1, 8192, 3840, 256, 1),
-    (1, 15360, 3840, 128, 1),
-    (1, 262144, 3840, 256, 1),
-    (2, 512, 3840, 128, 8),
-    (2, 2048, 3840, 128, 8),
-    (2, 3840, 4096, 256, 4),
-    (2, 3840, 8192, 256, 4),
-    (2, 3840, 15360, 256, 4),
-    (2, 4096, 3840, 256, 4),
-    (2, 8192, 3840, 256, 1),
-    (2, 15360, 3840, 128, 1),
-    (2, 262144, 3840, 256, 1),
-    (4, 512, 3840, 256, 8),
-    (4, 2048, 3840, 256, 8),
-    (4, 3840, 4096, 256, 4),
-    (4, 3840, 8192, 128, 4),
-    (4, 3840, 15360, 128, 4),
-    (4, 4096, 3840, 128, 4),
-    (4, 8192, 3840, 256, 1),
-    (4, 15360, 3840, 256, 1),
-    (4, 262144, 3840, 256, 1),
-    (8, 512, 3840, 256, 8),
-    (8, 2048, 3840, 128, 8),
-    (8, 3840, 4096, 128, 4),
-    (8, 3840, 8192, 256, 4),
-    (8, 3840, 15360, 256, 4),
-    (8, 4096, 3840, 256, 4),
-    (8, 8192, 3840, 256, 1),
-    (8, 15360, 3840, 128, 1),
-    (8, 262144, 3840, 256, 1),
-    (16, 512, 3840, 256, 8),
-    (16, 2048, 3840, 256, 8),
-    (16, 3840, 4096, 128, 4),
-    (16, 3840, 8192, 128, 4),
-    (16, 3840, 15360, 128, 4),
-    (16, 4096, 3840, 256, 4),
-    (16, 8192, 3840, 256, 4),
-    (16, 15360, 3840, 128, 1),
-    (16, 262144, 3840, 256, 1),
-    (32, 512, 3840, 256, 8),
-    (32, 2048, 3840, 256, 8),
-    (32, 3840, 4096, 128, 4),
-    (32, 3840, 8192, 128, 4),
-    (32, 3840, 15360, 128, 4),
-    (32, 4096, 3840, 128, 4),
-    (32, 8192, 3840, 128, 1),
-    (32, 15360, 3840, 128, 1),
-    (32, 262144, 3840, 256, 1),
-];
