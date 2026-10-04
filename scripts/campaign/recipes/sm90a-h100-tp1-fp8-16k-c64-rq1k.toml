@@ -1,6 +1,9 @@
 # Experimental 16K/64-slot BF16-KV candidate; no performance or quality qualification.
 # Inherits the 8K/64 prefill routes and TC64 decode path.
-# Request chunk1024 gives a2048-row sliding ring; estimated KV56GiB, verify emitted assets.
+# Request chunk 4096 with staged sliding layers (PLOW_STAGE_ROWS auto = 1024) keeps the 2048-row
+# sliding ring and 56 GiB KV. vs request chunk 1024 (2026-10-03, REPS=2, live rings 0): agentic16k
+# c32/c64/c128 tok/s 374/353/353 vs 380/353/342, TTFT p99 -25/-2/-4%, TPOT p99 +9/+5/+6%;
+# 15K/128 c32 TTFT p50 2571 vs 3266 ms; 4K/128 c32 TTFT p50 626 vs 1072 ms. Label kept for history.
 # Compare against the 16K/32 request-chunk2048 recipe with matched traffic.
 schema = "plow.recipe.v1"
 namespace = "infervisor"
@@ -46,7 +49,7 @@ PLOW_SEG_FA512 = "1"               # [FP8-TAX] GEMMA4_SEG_FA512_DEFAULT is bf16-
 PLOW_SEG_FA256_GQA2 = "1"          # [FP8-TAX] GEMMA4_SEG_FA256_GQA2_DEFAULT is bf16-gated
 PLOW_TMA_GEMM = "1"
 PLOW_MAX_CHUNK = "4096"
-PLOW_MAX_REQUEST_CHUNK = "1024"
+PLOW_MAX_REQUEST_CHUNK = "4096"
 PLOW_SLIDING_NS_CAP = "1"
 PLOW_SLIDING_NS_GRID = "1"
 PLOW_ATTENTION_DECODE_BALANCE_GF = "4"
@@ -83,7 +86,7 @@ PLOW_PREFIX_CACHE = "0"
 PLOW_PF_SEG_PURE = "fp8"
 PLOW_PF_SEG_FA512 = "1"
 PLOW_PF_INTERLEAVE = "0"
-PLOW_VMM_LIVE_RINGS = "0"
+PLOW_VMM_LIVE_RINGS = "0"           # 1 costs 12-50% single-turn tok/s at 15K c32 with BF16 KV
 PLOW_MULTISTEP = "0"
 PLOW_DECODE_MAX_RUNG = "64"
 PLOW_TOKEN_BATCH = "1"
