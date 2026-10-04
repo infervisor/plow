@@ -10668,10 +10668,12 @@ fn emit_dense_gqa(
         (encoder.prefix.model, section)
     });
     std::fs::write(&out, blob).unwrap();
+    let mut speech_ops = 0u64;
     if let Some(dir) = ecfg.tts_codec.as_deref().filter(|_| !block_mode) {
         let sites = whole_graph_audio_sites().0;
         let (model, section) = codec::lower_snac(dir, n_cu, m.target, sites).unwrap_or_else(|error| panic!("codec packet: {error}"));
         let path = std::path::Path::new(&out).with_file_name("codec.pkt");
+        speech_ops |= manifest::speech_ops(&model);
         write_sidecar_packet(&path, &model, &[section]);
         eprintln!("  codec packet -> {}", path.display());
     }
@@ -10679,11 +10681,13 @@ fn emit_dense_gqa(
         let sites = whole_graph_audio_sites().1;
         let (model, section) = s3gen::lower_s3gen(dir, n_cu, m.target, sites, ecfg.s3gen_attn_h16).unwrap_or_else(|error| panic!("s3gen packet: {error}"));
         let path = std::path::Path::new(&out).with_file_name(s3gen::PACKET);
+        speech_ops |= manifest::speech_ops(&model);
         write_sidecar_packet(&path, &model, &[section]);
         eprintln!("  s3gen packet -> {}", path.display());
     }
     if let Some((model, section)) = audio_blob {
         let path = std::path::Path::new(&out).with_file_name("encoder.pkt");
+        speech_ops |= manifest::speech_ops(&model);
         write_sidecar_packet(&path, &model, &[section]);
         eprintln!("  audio encoder packet -> {}", path.display());
     }
@@ -10705,7 +10709,10 @@ fn emit_dense_gqa(
     // is unchanged.
     if !arch.is_empty() {
         write_lean_receipts(std::path::Path::new(&out), &lean);
-        let man = manifest::build_for_packet(&m, &arch, &lean, &sections);
+        let mut man = manifest::build_for_packet(&m, &arch, &lean, &sections);
+        if speech_ops != 0 {
+            man["speech_ops"] = speech_ops.into();
+        }
         report_dispatch_audit(&man);
         report_segment_resource(&man);
         if !hetero_progs.is_empty() {

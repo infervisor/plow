@@ -531,6 +531,13 @@ aps (67.5 to 69.6 -> 70.3 to 73.0), TTFA p50 7.0 -> 6.8 s; c128 73.5 steady aps,
 42.7, c1 8.0. Mel rel-L2 5e-6 to 1.1e-5; CER median 0.000 (96 at c1, 200 at c200), per language
 unchanged; English c64 58.4 aps, CER 0.000; Qwen3-ASR WER 3.913%; Veena CER 0.008, c64 57.8 aps.
 
+The speech object compiles only the FP32 ops its packet's sidecar programs use: devgen writes
+their set into `plow_config.h` (`PLOW_SPEECH_OPS`, bit `op - 163`; absent = every arm) and the
+other arms trap. ptxas time grows superlinearly with the arms called from the interpreter kernel
+(whole-program calling conventions; an ABI boundary would serialize the inlined wgmma): with every
+arm the speech cubin took 4-7 h of ptxas (the 3xFP16 attention alone added hours), with one
+packet's set 8 min (Chatterbox), 7 min (Veena), 1.5 min (Qwen3-ASR).
+
 ## Concurrency
 
 Speech requests take the LLM path on each model's mux: packed prefill (several requests' prompt
