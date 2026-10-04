@@ -3463,6 +3463,28 @@ impl PipeQueue {
         self.steps.iter().any(|s| s.rows.iter().any(|r| r.slot == slot))
     }
 
+    fn last(&self) -> Option<&PipeStep> {
+        self.steps.back()
+    }
+
+    fn push(&mut self, step: PipeStep) {
+        self.steps.push_back(step);
+    }
+
+    fn pop(&mut self) -> Option<PipeStep> {
+        self.steps.pop_front()
+    }
+
+    /// Drop the queued steps after a failed one; deferred retirements stay pending.
+    fn clear(&mut self) {
+        self.steps.clear();
+    }
+
+    /// The mux retired `slot` while a step was queued.
+    fn retiring(&self, slot: usize) -> bool {
+        self.retire[slot].is_some()
+    }
+
     /// Defer retiring `slot` while any step is queued. A queued step runs every row of its rung,
     /// fed or not, and an unfed row still writes its KV at `pos`: unmapping that slot's KV or live
     /// ring (no idle backing without prefix reuse) under it faults the step.
@@ -8015,7 +8037,7 @@ impl GpuEngine {
     /// [`Self::pipe_step`] continues without a drain. A mixed step is matched on its decode rows:
     /// a prompt it finished has a token nobody has read, so the mux cannot be feeding that slot.
     pub fn pipe_covers(&self, feeds: &[(usize, u32)]) -> bool {
-        self.pipe.as_ref().and_then(|p| p.queue.steps.back()).is_some_and(|s| {
+        self.pipe.as_ref().and_then(|p| p.queue.last()).is_some_and(|s| {
             let mut rows = s.rows.iter().filter(|r| r.carry);
             feeds.iter().all(|&(b, _)| rows.next().is_some_and(|r| r.slot == b))
                 && rows.next().is_none()
@@ -8060,7 +8082,7 @@ impl GpuEngine {
             // After a mixed launch the device's positions are the packed rows', so the
             // continuation re-uploads them and takes only the tokens from the device.
             let after_mixed =
-                self.pipe.as_ref().and_then(|p| p.queue.steps.back()).is_some_and(|s| s.compact);
+                self.pipe.as_ref().and_then(|p| p.queue.last()).is_some_and(|s| s.compact);
             let upload = if after_mixed { PipeUpload::State } else { PipeUpload::None };
             self.pipe_enqueue(feeds, upload)?;
         }
@@ -8227,7 +8249,7 @@ impl GpuEngine {
                 .memcpy_dtoh_async(pipe.ids_host[buf].as_mut_slice(), ids_base, &self.stream)?;
         }
         self.be.event_record(&pipe.done[buf], &self.stream)?;
-        pipe.queue.steps.push_back(PipeStep {
+        pipe.queue.push(PipeStep {
             buf,
             rows: feeds
                 .iter()
@@ -8249,7 +8271,7 @@ impl GpuEngine {
     /// Wait for the oldest queued step and account its tokens. Rows the mux retired while it
     /// was queued get no token; their deferred retirement runs once the queue is empty.
     fn pipe_complete(&mut self, out: &mut Vec<(usize, u32)>) -> Result<()> {
-        let Some(step) = self.pipe.as_mut().and_then(|p| p.queue.steps.pop_front()) else {
+        let Some(step) = self.pipe.as_mut().and_then(|p| p.queue.pop()) else {
             return Ok(());
         };
         let synced = {
@@ -8265,7 +8287,7 @@ impl GpuEngine {
                 grid = self.grid,
                 "decode pipeline: step failed"
             );
-            self.pipe.as_mut().expect("pipe").queue.steps.clear();
+            self.pipe.as_mut().expect("pipe").queue.clear();
             return Err(e);
         }
         let prefix = self.vmm_prefix_enabled();
@@ -8276,12 +8298,12 @@ impl GpuEngine {
             let b = row.slot;
             let token = ids[if step.compact { j } else { b }] as u32;
             if token as usize >= vocab {
-                pipe.queue.steps.clear();
+                pipe.queue.clear();
                 return Err(RuntimeError::Device(
                     "decode pipeline: step produced an invalid token".into(),
                 ));
             }
-            if pipe.queue.retire[b].is_some() {
+            if pipe.queue.retiring(b) {
                 // The mux retired this row while the step was queued, so its token is dropped.
                 // The frontier advanced when the step was enqueued, so take that back: the KV
                 // this step wrote is not part of the sequence any published prefix describes.
