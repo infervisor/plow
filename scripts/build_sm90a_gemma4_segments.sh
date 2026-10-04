@@ -160,6 +160,28 @@ if [ "${PLOW_BUILD_FP8KV_FA:-0}" = 1 ]; then
     }
   done
 fi
+# An FP8-KV packet loads interp_sm90a_pfpackedgemm_fp8kv.cubin, which otherwise stays the base
+# emit's generic GEMM body (128 regs, 1.8 KB stack): Gemma-4 12B down_proj at M=4096 ran 1.76 ms
+# there vs 0.37 ms on the ws384 body the route matrix measured.
+if [ "${PLOW_BUILD_FP8KV_GEMM:-0}" = 1 ]; then
+  if [ "$gemma_has_packed" != 1 ] || [ ! -f "$gemma_base/interp_sm90a_pfpackedgemm_fp8kv.cubin" ]; then
+    echo 'PLOW_BUILD_FP8KV_GEMM requires a packed FP8-KV packet.' >&2
+    exit 2
+  fi
+  "${gemma_nvenv[@]}" "$gemma_nvcc" \
+    "${gemma_flags[@]}" "${gemma_config_flags[@]}" \
+    -DPLOW_NV_SEG_WS384=1 -DPGM90_UNI_BN256=1 -DPLOW_NV_SEG_GEMM=1 \
+    -DPLOW_NV_GEMM_ONLY=1 -DPGM90_TMA_STAGES=3 \
+    -DPGM90_WS384_PREFETCH=1 -DPGM90_WS384_ISSUE_CURSOR=1 \
+    -DPGM90_WS384_SMEPI="${PLOW_BUILD_GEMM_SMEPI:-0}" \
+    -DPLOW_NV_MASKED_PADDING=1 -DPLOW_NV_PACKED_REQUEST=1 -DPLOW_FP8_KV=1 \
+    -o "$gemma_out/interp_sm90a_pfpackedgemm_fp8kv.cubin" runtime/nvidia/interp_sm90a.cu
+  "$gemma_cuda_bin/cuobjdump" -symbols "$gemma_out/interp_sm90a_pfpackedgemm_fp8kv.cubin" | \
+    grep -q plow_fp8_kv_abi || {
+      echo 'missing packed FP8 GEMM symbol: plow_fp8_kv_abi' >&2
+      exit 1
+    }
+fi
 if [ "${PLOW_BUILD_FA_GQA2_PAIR:-$gemma_bf16}" = 1 ] && [ "$gemma_has_packed" = 1 ]; then
   gemma_gqa2_padding_flags=()
   if [ "$gemma_masked_def" = 1 ]; then

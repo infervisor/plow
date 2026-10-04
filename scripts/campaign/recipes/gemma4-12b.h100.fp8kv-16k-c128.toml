@@ -7,7 +7,8 @@
 # Routes (per-rung evidence: docs/runtime/kernel-generators.md "Gemma-4 12B FP8 per-rung routes"):
 #   prefill projections   cuBLASLt FP8 OUTER_VEC where it wins (segment_roles::cublaslt_prefill_fp8),
 #                         native FP8 GEMM where the route matrix measured native faster (down_proj
-#                         at M = 1088 and >= 2048, the 4160/2112 exceptions)
+#                         at M = 1088 and >= 2048, the 4160/2112 exceptions), on the ws384 FP8-KV
+#                         GEMM object (PLOW_BUILD_FP8KV_GEMM; the base generic body was 4-5x slower)
 #   prefill hd256 sliding generated attn_pf_hd256_sliding_fp8kv (FlashPrefillFp8, every rung >= 128)
 #   prefill hd512 global  generated attn_pf_hd512_fp8kv (TileLang, FlashPrefillFp8, every rung >= 128)
 #   decode B=128          cuBLASLt output head, light FP8 attention with 16-byte loads, direct
@@ -64,7 +65,10 @@ PLOW_SEG_FA512 = "1"
 PLOW_SEG_FA256_GQA2 = "1"
 PLOW_TMA_GEMM = "1"
 PLOW_MAX_CHUNK = "4096"
-PLOW_MAX_REQUEST_CHUNK = "1024"   # 4096 (staged): FP8 rungs >1024 slower per row, agentic TPOT p99 +37-90%; 2048: TTFT p99 tail
+# Staged 4096 (PLOW_STAGE_ROWS auto) needs PLOW_BUILD_FP8KV_GEMM: 15.9K prompt 745 vs 756 ms at 1024;
+# served vs 1024 (REPS=2) agentic16k c32 tok/s +17%, TTFT/TPOT p99 -29/-16%; 4K c32/c128 tok/s
+# +36/+40%; 15K c32/c128 +34/+35%; 4K/15K TTFT and TPOT p99 -26..-31%. FP32 gate PASS (kl 0.110).
+PLOW_MAX_REQUEST_CHUNK = "4096"
 PLOW_SLIDING_NS_CAP = "1"
 PLOW_SLIDING_NS_GRID = "1"
 PLOW_ATTENTION_DECODE_BALANCE_GF = "4"
@@ -85,6 +89,7 @@ role_files = ["gen_sm90a_attn_pf_hd256_sliding_fp8kv.cubin", "gen_sm90a_attn_pf_
 PLOW_BUILD_FATLITE = "1"
 NVCC_APPEND_FLAGS = "-DPLOW_NV_GLU_QUANT_CACHE=1 -DPLOW_NV_GLU_QUANT_WPR=1"
 PLOW_BUILD_W8A8 = "1"
+PLOW_BUILD_FP8KV_GEMM = "1"
 PLOW_BUILD_FA_GQA2_PAIR = "0"
 PLOW_BUILD_PFATTN_HD256_BKV32 = "0"
 PLOW_BUILD_PFATTN_HD256_GQA2_BKV32 = "0"
