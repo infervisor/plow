@@ -1,234 +1,166 @@
+// sram_bench: exercise /dev/pseudo_lock the way plowrt uses it. Caller-owned, 2 MiB-aligned
+// THP buffers bound to the owner's node are locked into each node's L3 and into a few cores'
+// L2, measured by the driver, then re-measured after other cores stream far more than the
+// cache. A lock that holds keeps its lines in the L1/L2 (L2 lock) or L3 (L3 lock) class.
+//
+//   cc -O2 -pthread sram_bench.c -o sram_bench && ./sram_bench [stream_seconds] [l2 cpus...]
 #define _GNU_SOURCE
-#include <stdio.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <pthread.h>
+#include <sched.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <fcntl.h>
-#include <unistd.h>
-#include <sys/mman.h>
 #include <sys/ioctl.h>
-#include <sched.h>
-#include <pthread.h>
-#include <x86intrin.h>
+#include <sys/mman.h>
+#include <sys/syscall.h>
+#include <time.h>
+#include <unistd.h>
 
-#define PSEUDO_LOCK_IOC_MAGIC       'P'
-#define PSEUDO_LOCK_IOC_GET_INFO    _IOR(PSEUDO_LOCK_IOC_MAGIC, 1, struct pseudo_lock_info)
-#define PSEUDO_LOCK_IOC_MEASURE     _IOWR(PSEUDO_LOCK_IOC_MAGIC, 2, struct pseudo_lock_latency)
-#define PSEUDO_LOCK_IOC_RELOAD      _IO(PSEUDO_LOCK_IOC_MAGIC, 3)
-
-struct pseudo_lock_info {
-    uint32_t level;
-    uint32_t cpu;
-    uint64_t size;
-    uint32_t cbm;
-    uint32_t line_size;
-    uint64_t phys_addr;
+struct pl_caps {
+    uint32_t version, nodes, l2_cbm_full, l2_cbm_lock, l3_cbm_full, l3_cbm_lock;
+    uint64_t l2_lock_bytes_per_core, l3_lock_bytes_per_node;
 };
+struct pl_lock_req { uint64_t addr, len; int32_t cpu; uint32_t level, id, pad; };
+struct pl_measure { uint32_t id, pad; uint64_t lines, l1_l2, l3, dram, p50, cal_l2, cal_l3, cal_dram; };
+#define PL_IOC_CAPS    _IOR('P', 10, struct pl_caps)
+#define PL_IOC_LOCK    _IOWR('P', 11, struct pl_lock_req)
+#define PL_IOC_MEASURE _IOWR('P', 13, struct pl_measure)
+struct pl_clos_req { int32_t cpu; uint32_t on; };
+#define PL_IOC_WORKER  _IOW('P', 15, struct pl_clos_req)
 
-struct pseudo_lock_latency {
-    uint64_t min_cycles;
-    uint64_t avg_cycles;
-    uint64_t max_cycles;
-    uint64_t total_lines;
-    uint64_t l1_l2_hits;
-    uint64_t l3_hits;
-    uint64_t dram_misses;
-};
+#define MPOL_BIND 2
+#define HUGE (2UL << 20)
 
-static inline uint64_t rdtsc_fence(void) {
-    uint32_t lo, hi;
-    asm volatile("lfence\n\trdtsc\n\tlfence" : "=a"(lo), "=d"(hi));
-    return ((uint64_t)hi << 32) | lo;
+static int node_first_cpu(int node) {
+    char path[96], buf[256];
+    snprintf(path, sizeof path, "/sys/devices/system/node/node%d/cpulist", node);
+    FILE *f = fopen(path, "r");
+    if (!f || !fgets(buf, sizeof buf, f)) return -1;
+    fclose(f);
+    return atoi(buf);
 }
 
-static volatile int stop_stress = 0;
+static int cpu_node(int cpu) {
+    for (int n = 0; n < 64; n++) {
+        char path[96];
+        snprintf(path, sizeof path, "/sys/devices/system/cpu/cpu%d/node%d", cpu, n);
+        if (access(path, F_OK) == 0) return n;
+    }
+    return 0;
+}
 
-void *cache_pollution_worker(void *arg) {
+static void *alloc_on(int node, size_t len) {
+    size_t map = (len + HUGE - 1) / HUGE * HUGE;
+    char *p = mmap(NULL, map + HUGE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (p == MAP_FAILED) return NULL;
+    p = (char *)(((uintptr_t)p + HUGE - 1) & ~(HUGE - 1));
+    unsigned long mask = 1UL << node;
+    if (syscall(SYS_mbind, p, map, MPOL_BIND, &mask, 64, 0)) perror("mbind");
+    madvise(p, map, MADV_HUGEPAGE);
+    memset(p, 1, map);
+    return p;
+}
+
+static int lock(int fd, void *p, size_t len, int cpu, int level, struct pl_measure *m) {
+    struct pl_lock_req r = { (uintptr_t)p, len, cpu, level, 0, 0 };
+    if (ioctl(fd, PL_IOC_LOCK, &r)) {
+        fprintf(stderr, "LOCK L%d cpu %d %zu B: %s\n", level, cpu, len, strerror(errno));
+        return -1;
+    }
+    m->id = r.id;
+    return ioctl(fd, PL_IOC_MEASURE, m);
+}
+
+static void show(const char *tag, int level, int cpu, const struct pl_measure *m) {
+    uint64_t hit = level == 2 ? m->l1_l2 : m->l1_l2 + m->l3;
+    printf("%-7s L%d cpu %3d: %6.2f%% held (l1/l2 %llu, l3 %llu, dram %llu of %llu) p50 %llu cyc; cal L2 %llu L3 %llu DRAM %llu\n",
+           tag, level, cpu, 100.0 * hit / m->lines, (unsigned long long)m->l1_l2, (unsigned long long)m->l3,
+           (unsigned long long)m->dram, (unsigned long long)m->lines, (unsigned long long)m->p50,
+           (unsigned long long)m->cal_l2, (unsigned long long)m->cal_l3, (unsigned long long)m->cal_dram);
+}
+
+// READ_LOCKED=1: each streamer also re-reads its node's L3-locked range between 1 GiB passes
+// (a worker reusing KV/activations while streaming weights). WORKER_CLOS=1: streamer cpus run in
+// the driver's worker CLOS, whose L3 victims refill the locked ways.
+static volatile int stop;
+static char *l3_range[64];
+static size_t l3_len;
+static void *streamer(void *arg) {
     int cpu = (int)(intptr_t)arg;
-    cpu_set_t cpuset;
-    CPU_ZERO(&cpuset);
-    CPU_SET(cpu, &cpuset);
-    sched_setaffinity(0, sizeof(cpuset), &cpuset);
-
-    size_t sz = 64 * 1024 * 1024; // 64 MB per worker
-    char *buf = malloc(sz);
-    if (!buf) return NULL;
-    memset(buf, 0x5a, sz);
-
-    while (!stop_stress) {
-        for (size_t i = 0; i < sz; i += 64) {
-            buf[i] += 1;
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    CPU_SET(cpu, &set);
+    sched_setaffinity(0, sizeof set, &set);
+    size_t len = 1UL << 30;
+    volatile uint64_t *b = alloc_on(cpu_node(cpu), len), sum = 0;
+    const char *env = getenv("READ_LOCKED");
+    volatile const uint64_t *hot = env && *env == '1' ? (const uint64_t *)l3_range[cpu_node(cpu)] : NULL;
+    while (!stop) {
+        for (size_t i = 0; i < len / 8 && !stop; i += 8) {
+            sum += b[i];
+            if (hot && (i & 0xffff) == 0)
+                for (size_t j = 0; j < l3_len / 8; j += 8) sum += hot[j];
         }
     }
-    free(buf);
     return NULL;
 }
 
-void benchmark_sram(const char *dev_path, int target_cpu) {
-    printf("\n======================================================================\n");
-    printf("  BENCHMARKING PSEUDO-LOCKED SRAM DEVICE: %s\n", dev_path);
-    printf("======================================================================\n");
-
-    int fd = open(dev_path, O_RDWR);
-    if (fd < 0) {
-        perror("open device");
-        return;
+int main(int argc, char **argv) {
+    int secs = argc > 1 ? atoi(argv[1]) : 10;
+    int fd = open("/dev/pseudo_lock", O_RDWR);
+    if (fd < 0) { perror("/dev/pseudo_lock"); return 1; }
+    struct pl_caps c;
+    if (ioctl(fd, PL_IOC_CAPS, &c)) { perror("CAPS"); return 1; }
+    printf("pseudo_lock v%u: %u nodes, L2 lock %#x %llu KiB/core, L3 lock %#x %llu KiB/node\n", c.version, c.nodes,
+           c.l2_cbm_lock, (unsigned long long)c.l2_lock_bytes_per_core >> 10, c.l3_cbm_lock,
+           (unsigned long long)c.l3_lock_bytes_per_node >> 10);
+    enum { MAXR = 64 };
+    struct { int level, cpu; struct pl_measure m; } r[MAXR];
+    int n = 0;
+    const char *l3mb = getenv("L3_MB");
+    size_t l3 = l3mb ? (size_t)atoi(l3mb) << 20 : c.l3_lock_bytes_per_node / 4096 * 4096;
+    l3_len = l3;
+    for (int node = 0; node < (int)c.nodes && c.l3_cbm_lock && n < MAXR; node++) {
+        int cpu = node_first_cpu(node);
+        void *p = alloc_on(node, l3);
+        if (p && lock(fd, p, l3, cpu, 3, &r[n].m) == 0) { r[n].level = 3; r[n].cpu = cpu; show("locked", 3, cpu, &r[n].m); n++; l3_range[node] = p; }
     }
-
-    struct pseudo_lock_info info;
-    if (ioctl(fd, PSEUDO_LOCK_IOC_GET_INFO, &info) < 0) {
-        perror("ioctl GET_INFO");
-        close(fd);
-        return;
+    size_t l2 = c.l2_lock_bytes_per_core / 4096 * 4096;
+    int l2cpus[16] = { 0, 40, 80 }, nl2 = 3;
+    if (argc > 2) for (nl2 = 0; nl2 + 2 < argc && nl2 < 16; nl2++) l2cpus[nl2] = atoi(argv[nl2 + 2]);
+    for (int k = 0; k < nl2 && c.l2_cbm_lock && n < MAXR; k++) {
+        void *p = alloc_on(cpu_node(l2cpus[k]), l2);
+        if (p && lock(fd, p, l2, l2cpus[k], 2, &r[n].m) == 0) { r[n].level = 2; r[n].cpu = l2cpus[k]; show("locked", 2, l2cpus[k], &r[n].m); n++; }
     }
-
-    printf("Cache Hierarchy Level:  L%u\n", info.level);
-    printf("Target Core / Logical:  CPU %u\n", info.cpu);
-    printf("SRAM Allocated Size:    %lu KB (%lu MB, %lu bytes)\n",
-           info.size / 1024, info.size / (1024 * 1024), info.size);
-    printf("Capacity Bitmask (CBM): 0x%x (Way 0..%d dedicated)\n",
-           info.cbm, __builtin_popcount(info.cbm) - 1);
-    printf("Contiguous Phys Base:   0x%lx\n", info.phys_addr);
-
-    // Pin current benchmark process to target CPU
-    cpu_set_t cpuset;
-    CPU_ZERO(&cpuset);
-    CPU_SET(target_cpu, &cpuset);
-    if (sched_setaffinity(0, sizeof(cpuset), &cpuset) < 0) {
-        perror("sched_setaffinity");
-    }
-
-    // Memory map the SRAM region into our address space
-    void *sram = mmap(NULL, info.size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-    if (sram == MAP_FAILED) {
-        perror("mmap");
-        close(fd);
-        return;
-    }
-
-    // Lock CPU out of deep C-states during benchmark
-    int dma_fd = open("/dev/cpu_dma_latency", O_RDWR);
-    if (dma_fd >= 0) {
-        int32_t val = 0;
-        write(dma_fd, &val, sizeof(val));
-    }
-
-    /* 1. Data Integrity & Verification */
-    printf("\n[1] Data Integrity & Read/Write SRAM Operation:\n");
-    volatile uint64_t *sram64 = (volatile uint64_t *)sram;
-    size_t words = info.size / sizeof(uint64_t);
-
-    for (size_t i = 0; i < words; i++) {
-        sram64[i] = 0xcafebabe00000000ULL | i;
-    }
-    int verify_ok = 1;
-    for (size_t i = 0; i < words; i++) {
-        if (sram64[i] != (0xcafebabe00000000ULL | i)) {
-            verify_ok = 0;
-            break;
+    // Pressure: 32 threads stream 1 GiB each on cores the locks do not own (SMT siblings excluded).
+    pthread_t th[32];
+    int nt = 0;
+    for (int cpu = 1; cpu < 96 && nt < 32; cpu += 3) {
+        int owned = 0;
+        for (int k = 0; k < nl2; k++) owned |= cpu == l2cpus[k];
+        if (owned) continue;
+        const char *wc = getenv("WORKER_CLOS");
+        if (wc && *wc == '1') {
+            struct pl_clos_req q = { cpu, 1 };
+            if (ioctl(fd, PL_IOC_WORKER, &q)) perror("WORKER");
         }
+        pthread_create(&th[nt++], NULL, streamer, (void *)(intptr_t)cpu);
     }
-    printf("    -> Memory Read/Write Verification: %s\n",
-           verify_ok ? "PASSED (100% Data Integrity)" : "FAILED");
-
-    // Re-lock to refresh cache lines after initialization writes
-    ioctl(fd, PSEUDO_LOCK_IOC_RELOAD, 0);
-
-    /* 2. Cache Line Stride Latency Distribution */
-    printf("\n[2] Cache-Line Stride Latency Distribution (Entire Buffer):\n");
-    size_t num_lines = info.size / 64;
-    uint64_t total_cycles = 0;
-    uint32_t fast_hits = 0;  // <= 30c (L1/L2)
-    uint32_t l3_hits = 0;    // 31-150c (L3)
-    uint32_t misses = 0;     // > 150c (DRAM)
-    uint64_t min_c = (uint64_t)-1;
-    uint64_t max_c = 0;
-
-    for (size_t i = 0; i < num_lines; i++) {
-        uint64_t t0 = rdtsc_fence();
-        volatile uint32_t val = *(volatile uint32_t *)((char *)sram + i * 64);
-        uint64_t t1 = rdtsc_fence();
-        (void)val;
-
-        uint64_t diff = (t1 > t0) ? (t1 - t0) : 1;
-        if (diff < min_c) min_c = diff;
-        if (diff > max_c) max_c = diff;
-        total_cycles += diff;
-
-        if (diff <= 30) fast_hits++;
-        else if (diff <= 150) l3_hits++;
-        else misses++;
+    printf("streaming %d x 1 GiB for %d s...\n", nt, secs);
+    sleep(secs);
+    for (int i = 0; i < n; i++) {
+        struct pl_measure m = { .id = r[i].m.id };
+        if (ioctl(fd, PL_IOC_MEASURE, &m) == 0) show("stress", r[i].level, r[i].cpu, &m);
     }
-
-    double avg_cyc = (double)total_cycles / num_lines;
-    printf("    Lines Tested:         %zu\n", num_lines);
-    printf("    Min Latency:          %lu cycles\n", min_c);
-    printf("    Avg Latency:          %.1f cycles (~%.2f ns)\n", avg_cyc, avg_cyc / 3.9);
-    printf("    Max Latency:          %lu cycles\n", max_c);
-    printf("    L1/L2 Hits (<=30c):   %u (%.2f%%)\n", fast_hits, (double)fast_hits * 100.0 / num_lines);
-    printf("    L3 Hits (31-150c):    %u (%.2f%%)\n", l3_hits, (double)l3_hits * 100.0 / num_lines);
-    printf("    DRAM Misses (>150c):  %u (%.2f%%)\n", misses, (double)misses * 100.0 / num_lines);
-    printf("    Total Cache Residency:%.2f%%\n", (double)(fast_hits + l3_hits) * 100.0 / num_lines);
-
-    /* 3. Eviction Resistance Test under Active Background Thrashing */
-    printf("\n[3] Stress Test: Eviction Resistance Under Heavy Background Churn:\n");
-    printf("    Spawning 16 background cache-polluting stress threads...\n");
-    stop_stress = 0;
-    pthread_t threads[16];
-    for (int i = 0; i < 16; i++) {
-        pthread_create(&threads[i], NULL, cache_pollution_worker, (void *)(intptr_t)(i + 1));
+    stop = 1;
+    for (int i = 0; i < nt; i++) pthread_join(th[i], NULL);
+    sleep(2);
+    for (int i = 0; i < n; i++) {
+        struct pl_measure m = { .id = r[i].m.id };
+        if (ioctl(fd, PL_IOC_MEASURE, &m) == 0) show("idle", r[i].level, r[i].cpu, &m);
     }
-    usleep(500000); // 500ms burn-in
-
-    // Measure latency under extreme contention
-    total_cycles = 0;
-    fast_hits = 0;
-    l3_hits = 0;
-    misses = 0;
-
-    for (size_t i = 0; i < num_lines; i++) {
-        uint64_t t0 = rdtsc_fence();
-        volatile uint32_t val = *(volatile uint32_t *)((char *)sram + i * 64);
-        uint64_t t1 = rdtsc_fence();
-        (void)val;
-
-        uint64_t diff = (t1 > t0) ? (t1 - t0) : 1;
-        total_cycles += diff;
-
-        if (diff <= 30) fast_hits++;
-        else if (diff <= 150) l3_hits++;
-        else misses++;
-    }
-
-    stop_stress = 1;
-    for (int i = 0; i < 16; i++) {
-        pthread_join(threads[i], NULL);
-    }
-
-    double stressed_avg = (double)total_cycles / num_lines;
-    printf("    SRAM Avg Latency under 16-thread Thrash: %.1f cycles (~%.2f ns)\n",
-           stressed_avg, stressed_avg / 3.9);
-    printf("    Cache Residency under Contention:        %.2f%%\n",
-           (double)(fast_hits + l3_hits) * 100.0 / num_lines);
-    printf("    Latency Delta:                           %+.1f cycles\n", stressed_avg - avg_cyc);
-
-    if ((double)(fast_hits + l3_hits) / num_lines > 0.95) {
-        printf("    ==> STATUS: 100%% SRAM LOCK CONFIRMED! Zero evictions under intense thrashing!\n");
-    } else {
-        printf("    ==> STATUS: Contention detected.\n");
-    }
-
-    if (dma_fd >= 0) close(dma_fd);
-    munmap(sram, info.size);
-    close(fd);
-}
-
-int main(int argc, char *argv[]) {
-    printf("======================================================================\n");
-    printf("   INTEL XEON 6975P-C RDT CACHE PSEUDO-LOCKING (SRAM) BENCHMARK\n");
-    printf("======================================================================\n");
-
-    benchmark_sram("/dev/pseudo_lock_l2", 0);
-    benchmark_sram("/dev/pseudo_lock_l3", 0);
     return 0;
 }
