@@ -341,7 +341,8 @@ static void block(const plow_bf16* A0, const plow_bf16* A1, size_t lda, const ui
  * strip pack, skip the tile math, read A in place instead of staging, skip the x pack of the
  * pack-free path. `pack`: force the old B-strip-pack driver (correct results, A/B timing).
  * Read once, off by default. */
-enum { AMX_DBG_NOPACK = 1, AMX_DBG_NOTDP = 2, AMX_DBG_NOSTAGE = 4, AMX_DBG_PACK = 8, AMX_DBG_NOXPACK = 16, AMX_DBG_WSTAGE = 32, AMX_DBG_NOGRID = 64 };
+enum { AMX_DBG_NOPACK = 1, AMX_DBG_NOTDP = 2, AMX_DBG_NOSTAGE = 4, AMX_DBG_PACK = 8, AMX_DBG_NOXPACK = 16, AMX_DBG_WSTAGE = 32, AMX_DBG_NOGRID = 64,
+       AMX_DBG_L1PF = 128, AMX_DBG_NOSTREAM = 256, AMX_DBG_NOPF = 512 };
 static int amx_debug_flags(void) {
     static int f = -1;
     if (f < 0) {
@@ -353,6 +354,9 @@ static int amx_debug_flags(void) {
         if (e && strstr(e, "noxpack")) f |= AMX_DBG_NOXPACK;
         if (e && strstr(e, "wstage")) f |= AMX_DBG_WSTAGE;
         if (e && strstr(e, "nogrid")) f |= AMX_DBG_NOGRID;
+        if (e && strstr(e, "l1pf")) f |= AMX_DBG_L1PF;
+        if (e && strstr(e, "nostream")) f |= AMX_DBG_NOSTREAM;
+        if (e && strstr(e, "nopf")) f |= AMX_DBG_NOPF;
         for (const char* p = e ? strstr(e, "pack") : NULL; p; p = strstr(p + 1, "pack"))
             if (p == e || p[-1] == ',' || p[-1] == ' ') f |= AMX_DBG_PACK;
     }
@@ -566,10 +570,28 @@ static void wm_block(const uint8_t* W0, const uint8_t* W1, size_t ldw, size_t ks
         _tile_zero(3);
     }
     const uint32_t per = pend ? (ils_left(pend) + nkb - 1u) / nkb : 0u;
+    const int dbg = amx_debug_flags();
+    const int l1pf = dbg & AMX_DBG_L1PF, nostream = dbg & AMX_DBG_NOSTREAM;
     for (uint32_t kb = 0; kb < nkb; kb++) {
         const uint8_t* x = xtb + (size_t)kb * 2048u;
-        _tile_stream_loadd(6, x, 64);
-        if (nxt > 1u) _tile_stream_loadd(7, x + 1024, 64);
+        if (l1pf && kb + 2u < nkb) {
+            /* Two K steps ahead into L1: 32 x lines + 16 lines of each W tile. */
+            const char* xn = (const char*)xtb + (size_t)(kb + 2u) * 2048u;
+            for (uint32_t l = 0; l < 32u; l++) _mm_prefetch(xn + l * 64u, _MM_HINT_T0);
+            const char* w0n = (const char*)W0 + (size_t)(kb + 2u) * kstep;
+            for (uint32_t r = 0; r < 16u; r++) _mm_prefetch(w0n + r * ldw, _MM_HINT_T0);
+            if (r1) {
+                const char* w1n = (const char*)W1 + (size_t)(kb + 2u) * kstep;
+                for (uint32_t r = 0; r < 16u; r++) _mm_prefetch(w1n + r * ldw, _MM_HINT_T0);
+            }
+        }
+        if (nostream) {
+            _tile_loadd(6, x, 64);
+            if (nxt > 1u) _tile_loadd(7, x + 1024, 64);
+        } else {
+            _tile_stream_loadd(6, x, 64);
+            if (nxt > 1u) _tile_stream_loadd(7, x + 1024, 64);
+        }
         if (r0 == 16u) {
             _tile_loadd(4, W0 + kb * kstep, ldw);
         } else {
@@ -591,7 +613,7 @@ static void wm_block(const uint8_t* W0, const uint8_t* W1, size_t ldw, size_t ks
             _tile_dpbf16ps(2, 5, 6);
             if (nxt > 1u) _tile_dpbf16ps(3, 5, 7);
         }
-        if (pf) wm_prefetch(pf);
+        if (pf && !(dbg & AMX_DBG_NOPF)) wm_prefetch(pf);
         if (pend) ils_step(pend, per);
     }
     _tile_stored(0, out, 128);

@@ -203,6 +203,37 @@ static void dot_rows(const plow_bf16* W, size_t ldw, const plow_bf16* X, const u
         dot_tail(W + (size_t)(n + full * 16u) * ldw, ldw, X, K, M, K, rows - full * 16u, out + full * 16u * OC);
 }
 
+/* PLOW_AMX_DEBUG=demote: CLDEMOTE this slice's output rows once written. The next op's every slice
+ * reads the whole activation; demoted lines come from L3 instead of a cross-die snoop of the
+ * writer's L2. */
+static int gv_nopack(void) {
+    static int f = -1;
+    if (f < 0) {
+        const char* e = getenv("PLOW_AMX_DEBUG");
+        f = e && strstr(e, "gvnopack") ? 1 : 0;
+    }
+    return f;
+}
+
+static int gv_demote(void) {
+    static int f = -1;
+    if (f < 0) {
+        const char* e = getenv("PLOW_AMX_DEBUG");
+        f = e && strstr(e, "demote") ? 1 : 0;
+    }
+    return f;
+}
+
+static void demote_rows(const plow_bf16* C, size_t ldc, uint32_t M, uint32_t n0, uint32_t n1) {
+    if (!gv_demote() || n1 <= n0) return;
+    for (uint32_t m = 0; m < M; m++) {
+        const char* a = (const char*)(C + (size_t)m * ldc + n0);
+        const char* z = (const char*)(C + (size_t)m * ldc + n1);
+        for (const char* p = (const char*)((uintptr_t)a & ~(uintptr_t)63); p < z; p += 64)
+            __asm__ __volatile__(".byte 0x0f, 0x1c, 0x07" : : "D"(p) : "memory");
+    }
+}
+
 static void store_span(plow_bf16* C, size_t ldc, uint32_t n, uint32_t rows, uint32_t M, const float* out,
                        const plow_bf16* bias) {
     for (uint32_t r = 0; r < rows; r++) {
@@ -247,10 +278,11 @@ X_K(x_gemv) {
     const plow_bf16* W = PLOW_CPU_TEN(in, T, 2);
     const plow_bf16* bias = PLOW_CPU_TEN(in, T, 7);
     uint8_t* xp = ctx->scratch;
-    pack_x_tiles(xp, x, K, M, K);
+    if (!gv_nopack()) pack_x_tiles(xp, x, K, M, K);
     uint32_t n0, n1;
     g_range(N, slice, nblk, &n0, &n1);
     gemv_span_amx(C, N, W, x, xp, M, K, n0, n1, bias);
+    demote_rows(C, N, M, n0, n1);
 }
 
 /* t0=fu t1=x t2=W_gate t5=W_up t6=bias_gate? t7=bias_up?  i0=M i1=N i2=K i5=act f0/f1 */
@@ -268,7 +300,7 @@ X_K(x_gemv_glu) {
     const plow_bf16* bu = PLOW_CPU_TEN(in, T, 7);
     const float f0 = in->fj[0].f, f1 = in->fj[1].f;
     uint8_t* xp = ctx->scratch;
-    pack_x_tiles(xp, x, K, M, K);
+    if (!gv_nopack()) pack_x_tiles(xp, x, K, M, K);
     uint32_t n0, n1;
     g_range(N, slice, nblk, &n0, &n1);
     float g[32 * OC] __attribute__((aligned(64)));
@@ -291,6 +323,7 @@ X_K(x_gemv_glu) {
         }
         n += rows;
     }
+    demote_rows(C, N, M, n0, n1);
 }
 
 /* t0=q t1=x t2=W_q t3=k t4=W_k t5=v t6=W_v t7=q-norm gamma?  i0=M i1=Nq i2=K i3=Nk i4=Nv
@@ -307,14 +340,17 @@ X_K(x_gemv_qkv) {
     const plow_bf16* Bs[3] = {G_QKV_BIAS(in, T, 5), G_QKV_BIAS(in, T, 6), G_QKV_BIAS(in, T, 7)};
     const uint32_t Ns[3] = {Nq, Nk, Nv};
     uint8_t* xp = ctx->scratch;
-    pack_x_tiles(xp, x, K, M, K);
+    if (!gv_nopack()) pack_x_tiles(xp, x, K, M, K);
     uint32_t n0, n1;
     g_range(Nq + Nk + Nv, slice, nblk, &n0, &n1);
     uint32_t S0 = 0;
     for (uint32_t s = 0; s < 3; s++) {
         const uint32_t S1 = S0 + Ns[s];
         const uint32_t a = n0 > S0 ? n0 : S0, b = n1 < S1 ? n1 : S1;
-        if (a < b) gemv_span_amx(Cs[s], Ns[s], Ws[s], x, xp, M, K, a - S0, b - S0, Bs[s]);
+        if (a < b) {
+            gemv_span_amx(Cs[s], Ns[s], Ws[s], x, xp, M, K, a - S0, b - S0, Bs[s]);
+            demote_rows(Cs[s], Ns[s], M, a - S0, b - S0);
+        }
         S0 = S1;
     }
 }
@@ -335,7 +371,7 @@ X_K(x_gemv_fp8) {
     const plow_bf16* x = (const plow_bf16*)PLOW_CPU_TEN(in, T, 1) + (size_t)in->i[4] * K;
     const uint8_t* W = PLOW_CPU_TEN(in, T, 2);
     uint8_t* xp = ctx->scratch;
-    pack_x_tiles(xp, x, K, M, K);
+    if (!gv_nopack()) pack_x_tiles(xp, x, K, M, K);
     uint32_t n0, n1;
     g_range(N, slice, nblk, &n0, &n1);
     float out[32 * 16] __attribute__((aligned(64)));
@@ -362,7 +398,7 @@ X_K(x_gemv_glu_fp8) {
     const uint8_t* Wg = PLOW_CPU_TEN(in, T, 2);
     const uint8_t* Wu = PLOW_CPU_TEN(in, T, 5);
     uint8_t* xp = ctx->scratch;
-    pack_x_tiles(xp, x, K, M, K);
+    if (!gv_nopack()) pack_x_tiles(xp, x, K, M, K);
     uint32_t n0, n1;
     g_range(N, slice, nblk, &n0, &n1);
     float g[32 * 16] __attribute__((aligned(64)));
@@ -396,7 +432,7 @@ X_K(x_gemv_mxfp4) {
     const uint8_t* S = PLOW_CPU_TEN(in, T, 3);
     const plow_bf16* bias = PLOW_CPU_TEN(in, T, 7);
     uint8_t* xp = ctx->scratch;
-    pack_x_tiles(xp, x, K, M, K);
+    if (!gv_nopack()) pack_x_tiles(xp, x, K, M, K);
     uint32_t n0, n1;
     g_range(N, slice, nblk, &n0, &n1);
     float out[32 * 16] __attribute__((aligned(64)));
@@ -422,7 +458,7 @@ X_K(x_gemv_glu_mxfp4) {
     const uint8_t* Sg = PLOW_CPU_TEN(in, T, 3);
     const uint8_t* Su = PLOW_CPU_TEN(in, T, 4);
     uint8_t* xp = ctx->scratch;
-    pack_x_tiles(xp, x, K, M, K);
+    if (!gv_nopack()) pack_x_tiles(xp, x, K, M, K);
     uint32_t n0, n1;
     g_range(N, slice, nblk, &n0, &n1);
     float g[32 * 16] __attribute__((aligned(64)));
