@@ -3916,6 +3916,7 @@ async fn serve(
     tracing::info!(%tcp_addr, "plowrt serving OpenAI API over TCP");
     let tcp_router = router.clone();
     let tcp_http = HttpConns::from_config("TCP");
+    let mut conn_slots: Vec<(Arc<tokio::sync::Semaphore>, usize)> = tcp_http.slots().into_iter().collect();
     let tcp_task = tokio::spawn(async move {
         let svc = hyper_util::service::TowerToHyperService::new(tcp_router);
         loop {
@@ -3955,6 +3956,7 @@ async fn serve(
         tracing::info!(socket = %path.display(), "plowrt serving OpenAI API over UDS");
         let uds_router = router.clone().merge(plowrt::serve::admin_app(state));
         let http = HttpConns::from_config("UDS");
+        conn_slots.extend(http.slots());
         Some(tokio::spawn(async move {
             let svc = hyper_util::service::TowerToHyperService::new(uds_router);
             loop {
@@ -3974,6 +3976,8 @@ async fn serve(
     };
 
     // Run until a listener exits or SIGTERM/SIGINT arrives.
+    let accept_loops: Vec<_> =
+        std::iter::once(tcp_task.abort_handle()).chain(uds_task.as_ref().map(|t| t.abort_handle())).collect();
     let uds = async {
         match uds_task {
             Some(t) => t.await,
@@ -3986,6 +3990,10 @@ async fn serve(
         signal = shutdown_signal() => {
             tracing::info!(signal, "shutdown: draining in-flight requests");
             drain_for_shutdown(&shutdown_state).await;
+            for l in &accept_loops {
+                l.abort();
+            }
+            flush_connections(&conn_slots, std::time::Duration::from_secs(2)).await;
             if let Some(path) = shutdown_socket {
                 let _ = std::fs::remove_file(path);
             }
@@ -4022,6 +4030,11 @@ impl HttpConns {
             builder: Arc::new(builder),
             open: (max > 0).then(|| Arc::new(tokio::sync::Semaphore::new(max.min(tokio::sync::Semaphore::MAX_PERMITS)))),
         }
+    }
+
+    /// The connection slots and their count, for the shutdown flush.
+    fn slots(&self) -> Option<(Arc<tokio::sync::Semaphore>, usize)> {
+        self.open.as_ref().map(|s| (Arc::clone(s), s.available_permits()))
     }
 
     /// Wait for a free connection slot; at the cap the listener stops accepting.
@@ -4132,6 +4145,22 @@ async fn shutdown_signal() -> &'static str {
     {
         let _ = tokio::signal::ctrl_c().await;
         "ctrl-c"
+    }
+}
+
+/// After the drain the muxes have queued every final chunk, but the connection tasks may not have
+/// written them yet: wait until every connection closed, or `grace` (an idle keep-alive connection
+/// holds its slot until the header timeout). Without a connection cap there is nothing to count.
+async fn flush_connections(slots: &[(Arc<tokio::sync::Semaphore>, usize)], grace: std::time::Duration) {
+    let deadline = tokio::time::Instant::now() + grace;
+    if slots.is_empty() {
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        return;
+    }
+    while tokio::time::Instant::now() < deadline
+        && slots.iter().any(|(s, max)| s.available_permits() < *max)
+    {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
 }
 
