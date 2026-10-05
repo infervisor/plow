@@ -9666,7 +9666,7 @@ impl GpuEngine {
                     if light_routes.len() <= *seg {
                         light_routes.resize_with(seg + 1, || None);
                     }
-                    light_routes[*seg] = Some(cublaslt::prefill_light_route(
+                    light_routes[*seg] = Some(cublaslt::prefill_glu_quant_route(
                         be, function, kernarg, g, insts,
                     ));
                 }

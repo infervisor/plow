@@ -654,6 +654,23 @@ pub(super) fn prefill_light_route(
     }
 }
 
+/// The cached GLU quant kernel strides rows by `gridDim`: one CTA per row instead of the
+/// instruction's one per SM, which walked ~31 rows of a 4096-row chunk with its load and store
+/// phases never overlapping. Per-row work is unchanged, so the outputs are bit-identical.
+pub(super) fn prefill_glu_quant_route(
+    be: &Arc<CudaBackend>,
+    function: KernelFn,
+    kernarg: DevProgram,
+    g: &DevProg,
+    insts: &[usize],
+) -> LightRoute {
+    let mut route = prefill_light_route(be, function, kernarg, g, insts);
+    for launch in &mut route.launches {
+        launch.blocks = g.insts[launch.instruction as usize].i[0];
+    }
+    route
+}
+
 /// `(segment, instruction)` of every instruction a light route executes.
 pub(super) fn light_instructions(light: &[(usize, Vec<(usize, usize)>)]) -> Vec<(usize, usize)> {
     light
