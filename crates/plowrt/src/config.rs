@@ -2001,7 +2001,6 @@ impl RuntimeConfig {
         select_compat(self.glm_rowband, Self::env_bool("PLOW_GLM_ROWBAND"), !Self::is_initialized())
     }
 
-    #[cfg(feature = "cuda")]
     pub fn drain_timeout_ms(&self) -> Option<u64> {
         let environment = Self::env_parse("PLOW_DRAIN_TIMEOUT_MS").map(Some);
         select_compat(self.drain_timeout_ms, environment, !Self::is_initialized())
