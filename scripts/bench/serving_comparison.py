@@ -239,7 +239,7 @@ def prod_run(root, tag, errors):
     path = root / f"{tag}.json"
     d = json.loads(path.read_text())
     c, o = d["config"], d["overall"]
-    if o.get("errors_total"):
+    if o["errors_total"]:
         errors.append(f"{path}: {o['errors_total']} failed requests")
         return None
     io = (f"open-loop mix: {c['apps']} system prompts (lognormal median {c['system_median']:g}), turns geometric "
@@ -255,7 +255,14 @@ def prod_run(root, tag, errors):
     extra = {k: o.get(k) for k, _, _ in SUPPLEMENTARY}
     extra["seed"] = c["seed"]
     extra["slo"] = f"TTFT <= {o['slo_ttft_ms']:g} ms and TPOT <= {o['slo_tpot_ms']:g} ms"
-    return dict(io=io, io_key=io, traffic=traffic, total_tok_s=o["total_tok_s"],
+    # Pair on everything that shapes the plan or the goodput score, not only the described subset.
+    # Per-run fields (endpoint, output path, served name) and the seed (compared across arms per
+    # repeat) are left out; the rate stays in, so how it was derived does not matter.
+    plan = {k: v for k, v in c.items()
+            if k not in ("url", "out", "model", "seed", "timeout", "est_e2e_s", "target_concurrency")}
+    plan["slo"] = [o["slo_ttft_ms"], o["slo_tpot_ms"]]
+    io_key = io + " #" + hashlib.sha256(json.dumps(plan, sort_keys=True).encode()).hexdigest()[:16]
+    return dict(io=io, io_key=io_key, traffic=traffic, total_tok_s=o["total_tok_s"],
                 ttft_p99_ms=o.get("ttft_p99_ms"), tpot_p99_ms=o.get("tpot_p99_ms"),
                 peak_gib=read_peak(root, tag, errors), source=str(path), extra=extra)
 

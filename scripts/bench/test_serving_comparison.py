@@ -31,17 +31,18 @@ def agentic(wall, ttft, tpot, sessions=32):
                 overall=dict(errors=0, wall_s=wall, ttft_p99_ms=ttft, tpot_p99_ms=tpot), requests=reqs)
 
 
-def prod(total, ttft, tpot, goodput, rate=1.25, seed=9):
+def prod(total, ttft, tpot, goodput, rate=1.25, seed=9, slo_ttft_ms=2000.0, **cfg_kw):
     cfg = dict(apps=4, system_median=1536, turns_mean=6, turns_max=20, first_median=1500, first_sigma=1.0,
                tool_median=700, tool_sigma=1.0, max_model_len=16384, out_median=160, out_sigma=0.7, out_min=16,
                out_max=1024, temperature=0.0, top_p=None, api="chat", rate=rate, think_median_s=5.0,
                think_sigma=0.8, think_max_s=60.0, duration=300.0, warmup=75.0, cooldown=25.0, seed=seed,
-               session_header=True)
+               session_header=True, system_sigma=0.6, template_margin=512, url="http://x", out="o.json")
+    cfg.update(cfg_kw)
     return dict(config=cfg, overall=dict(errors=0, errors_total=0, total_tok_s=total, ttft_p99_ms=ttft,
                                          tpot_p99_ms=tpot, goodput_req_s=goodput, slo_attainment=0.9,
                                          request_s=5.0, mean_inflight=40.0, mean_sessions=60.0,
                                          ttft_p50_ms=300.0, tpot_p50_ms=40.0, cached_fraction=0.8,
-                                         slo_ttft_ms=2000.0, slo_tpot_ms=100.0))
+                                         slo_ttft_ms=slo_ttft_ms, slo_tpot_ms=100.0))
 
 
 class Fixture:
@@ -267,6 +268,20 @@ class RenderTest(unittest.TestCase):
         self.assertEqual(rc, 1)
         _, c, _ = self.table(out, "q1250.g")
         self.assertEqual(c["mismatched"], ["Traffic / concurrency"])
+
+    def test_open_loop_undescribed_plan_or_slo_difference_is_not_matched(self):
+        for kw in (dict(system_sigma=0.9), dict(template_margin=256), dict(slo_ttft_ms=5000.0)):
+            with self.subTest(**kw):
+                self.write_prod(**kw)
+                rc, _, out = self.f.render()
+                self.assertEqual(rc, 1)
+                _, c, _ = self.table(out, "q1250.g")
+                self.assertEqual(c["mismatched"], ["Input / output length"])
+
+    def test_open_loop_per_run_fields_still_match(self):
+        self.write_prod(url="http://y", out="other.json")
+        rc, err, _ = self.f.render()
+        self.assertEqual(rc, 0, err)
 
     def test_open_loop_failed_requests_refused(self):
         self.write_prod()
