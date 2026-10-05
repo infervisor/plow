@@ -6259,8 +6259,8 @@ fn handle_produced_token(
     };
     // A stop token's chunk carries only bytes released by the end of the stream.
     if !stop_token || !delta.is_empty() {
-        let lp = if stop_token { None } else { slot.lp.take() };
-        if send_or_hold(slot, (token, delta, lp)) {
+        let (id, lp) = if stop_token { (crate::serve::stream::TEXT_ONLY, None) } else { (token, slot.lp.take()) };
+        if send_or_hold(slot, (id, delta, lp)) {
             if let Some(taken) = slot_opt.take() {
                 release_kv(arena, taken.kv);
             }
@@ -6327,6 +6327,11 @@ fn flush_parked(slot_opt: &mut Option<Slot>, arena: &Option<SharedKvState>) -> b
     let room = slot.respond.capacity().saturating_sub(1).min(slot.held.len());
     for (id, text, logprobs) in slot.held.drain(..room) {
         let _ = slot.respond.try_send(StreamChunk::Token { id, text, logprobs });
+    }
+    // PARK_TIMEOUT bounds a consumer that stopped reading, not one that reads slowly.
+    if room > 0 && !slot.held.is_empty() {
+        slot.parked_at = Some(Instant::now());
+        return false;
     }
     if slot.held.is_empty() {
         let Some(reason) = slot.held_finish.take() else {

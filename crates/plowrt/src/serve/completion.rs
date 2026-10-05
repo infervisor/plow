@@ -415,7 +415,7 @@ async fn buffer_and_reply(
                     lps.push(fmt, id, lp, text.len());
                 }
                 text.push_str(&delta);
-                if prompt_token_ids.is_some() {
+                if prompt_token_ids.is_some() && id != crate::serve::stream::TEXT_ONLY {
                     completion_token_ids.push(id);
                 }
             }

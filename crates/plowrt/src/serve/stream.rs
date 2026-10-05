@@ -19,6 +19,10 @@ use crate::RuntimeError;
 /// The OpenAI stream terminator.
 pub const DONE: &str = "[DONE]";
 
+/// The id of a text-only [`StreamChunk::Token`]: no token was produced, so it is not a completion
+/// token id.
+pub const TEXT_ONLY: u32 = u32::MAX;
+
 /// One event from the muxer to the request handler.
 #[derive(Debug)]
 pub enum StreamChunk {
@@ -26,6 +30,7 @@ pub enum StreamChunk {
     /// (may be empty when the tokenizer's decode of the running id vec did
     /// not yield a new visible segment, e.g. a partial UTF-8 sequence).
     /// `logprobs` is set when the request asked for them (OpenAI `logprobs`).
+    /// `id` is [`TEXT_ONLY`] for a chunk that only releases held bytes at a stop token.
     Token {
         id: u32,
         text: String,
