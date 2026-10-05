@@ -1,5 +1,10 @@
-# Experimental 16K/64-slot BF16-KV candidate; no performance or quality qualification.
-# Inherits the 8K/64 prefill routes and TC64 decode path.
+# Experimental 16K/64-slot BF16-KV candidate. Inherits the 8K/64 prefill routes and TC64 decode.
+# Light-op FATLITE object + generated hd256 sliding prefill + PLOW_QNORM_FUSE (2026-10-04,
+# plowrt 9e532bd7, packet ec5aa004): 1x4096 prefill 150.6 -> 128.1 ms, 1x15000 641 -> 558 ms,
+# 1x1024 40.3 -> 33.3, 16x512 25.2 -> 23.7, 32x128 16.4 -> 16.2; first-token digests unchanged.
+# FP32 gate PASS (kl_mean 0.070 vs vLLM 0.128). Served REPS=2 out tok/s vs the same binary without
+# them: 4K/128 c32 586 -> 640, c128 630 -> 700; 15K/128 c32 181 -> 203, c128 187 -> 209.
+# Strict vs vLLM 0.28 BF16 KV (MATCHED, EQUIVALENT): total tok/s 0.82x / 0.79x / 0.86x / 0.86x.
 # Request chunk 4096 with staged sliding layers (PLOW_STAGE_ROWS auto = 1024) keeps the 2048-row
 # sliding ring and 56 GiB KV. vs request chunk 1024 (2026-10-03, REPS=2, live rings 0): agentic16k
 # c32/c64/c128 tok/s 374/353/353 vs 380/353/342, TTFT p99 -25/-2/-4%, TPOT p99 +9/+5/+6%;
@@ -60,6 +65,9 @@ PLOW_FP8_DECODE_TC64 = "1"
 PLOW_EMIT_PREFILL_CUBLASLT = "1"
 PLOW_PF_LADDER_APPEND = "256,1088,1152,2112,4160,4224"
 PLOW_FUSE_ARGMAX = "1"
+# Quant folded into the pre-QKV / pre-FFN RmsNorm (T11; also folds Glu into the down quant on
+# rungs without the GLU role). 4096 rung 128.7 -> 128.0 ms on top of FATLITE + generated hd256.
+PLOW_QNORM_FUSE = "1"
 
 [objects]
 script = "scripts/build_sm90a_gemma4_segments.sh"
@@ -68,9 +76,17 @@ role_files = [
   "interp_sm90a_pfattn_hd256_gqa2_bkv32.cubin",
   "interp_sm90a_pfattn_hd256_bkv32.cubin",
   "interp_sm90a_pfgemm_glu_w8a8_gemma4.cubin",
+  "gen_sm90a_attn_pf_hd256_sliding.cubin",
 ]
 [objects.env]
 PLOW_BUILD_W8A8 = "1"
+# Light-op object (norm/quant/rope+KV write) without the flash arms: 56 B stack vs 2144 B stack
+# and 7.5 KB spills in the generic body (W8A8 packets default FATLITE off). Bit-identical;
+# light ops 44.6 -> 30.8 ms per 4096-row chunk.
+PLOW_BUILD_FATLITE = "1"
+# Generated sliding hd256 prefill attention (role 19) on rungs >= 1024: 160 staged sites per
+# 4096 chunk 17.4 -> 8.2 ms (role 14 0.109 vs 0.051 ms per 1024-row stage).
+PLOW_BUILD_GEN_KERNELS = "attn_pf_hd256_sliding"
 PLOW_BUILD_FA_GQA2_PAIR = "1"
 PLOW_BUILD_PFATTN_HD256_BKV32 = "1"
 PLOW_BUILD_PFATTN_HD256_GQA2_BKV32 = "1"
@@ -80,6 +96,7 @@ PLOW_BUILD_PFATTN_HD512_PX4_BQ64 = "1"
 PLOW_GEMMA4_SM90_W8A8_GEMM_GLU_ROLE = "1"
 PLOW_GEMMA4_SM90_HD512_PX4_BQ64_ROLE = "1"
 PLOW_GEMMA4_SM90_HD256_GQA2_ROLE = "1"
+PLOW_EMIT_GEN_KERNELS = "attn_pf_hd256_sliding"
 
 [serve.env]
 # Prefix cache at its default (on): agentic16k c32 with it on 700-732 tok/s at 75% cached
