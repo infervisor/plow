@@ -1877,6 +1877,7 @@ fn hd512_prefill_segments_have_role(program: &DevProg, roles: &[u8]) -> bool {
 struct SegPf {
     f_flash: KernelFn,
     glu_quant_cached: Option<KernelFn>,
+    norm_rms_pf: Option<KernelFn>,
     smem_flash: u32,
     grid_flash: u32,
     f_gemm: KernelFn,
@@ -9063,8 +9064,18 @@ impl GpuEngine {
                 } else {
                     None
                 };
+                let norm_rms_pf = if be.module_global_u32(
+                    &m1,
+                    &format!("plow_norm_rms_pf_abi{seg_global_suffix}"),
+                )? == Some(1)
+                {
+                    Some(be.get_function(&m1, &format!("plow_norm_rms_pf{seg_global_suffix}"))?)
+                } else {
+                    None
+                };
                 let mut sp = SegPf {
                     glu_quant_cached,
+                    norm_rms_pf,
                     masked_padding,
                     f_flash: f1,
                     smem_flash: s1,
@@ -9427,18 +9438,30 @@ impl GpuEngine {
                 } else {
                     Vec::new()
                 };
+            let norm_rms_function = seg_pf.as_ref().and_then(|sp| sp.norm_rms_pf);
+            let norm_rms_segments =
+                if norm_rms_function.is_some() && seg_mode && qwen_segments.is_empty() {
+                    cublaslt::prefill_norm_rms_segments(g)
+                        .into_iter()
+                        .filter(|(seg, _)| packet_role_index(&packet_segment_roles, *seg).is_none())
+                        .collect::<Vec<_>>()
+                } else {
+                    Vec::new()
+                };
             let light_instructions: Vec<(usize, usize)> = light_segments
                 .iter()
                 .flat_map(|(seg, insts)| insts.iter().map(move |&i| (*seg, i)))
                 .chain(
                     cached_quant_segments
                         .iter()
+                        .chain(&norm_rms_segments)
                         .flat_map(|(seg, insts)| insts.iter().map(move |&i| (*seg, i))),
                 )
                 .chain(moe_instructions.iter().copied())
                 .collect();
             let cublaslt_waits = if projection_segments.is_empty()
                 && cached_quant_segments.is_empty()
+                && norm_rms_segments.is_empty()
                 && moe_instructions.is_empty()
                 && attention_gemm_segments.iter().all(Option::is_none)
             {
@@ -9675,6 +9698,22 @@ impl GpuEngine {
                         bucket = g.t,
                         segments = cached_quant_segments.len(),
                         "prefill cached GLU quant routes"
+                    );
+                }
+            }
+            if let Some(function) = norm_rms_function {
+                for (seg, insts) in &norm_rms_segments {
+                    if light_routes.len() <= *seg {
+                        light_routes.resize_with(seg + 1, || None);
+                    }
+                    light_routes[*seg] =
+                        Some(cublaslt::prefill_norm_rms_route(be, function, kernarg, g, insts));
+                }
+                if !norm_rms_segments.is_empty() {
+                    tracing::info!(
+                        bucket = g.t,
+                        segments = norm_rms_segments.len(),
+                        "prefill NormResidual+RmsNorm routes"
                     );
                 }
             }

@@ -671,6 +671,51 @@ pub(super) fn prefill_glu_quant_route(
     route
 }
 
+/// Segments that are exactly a prefill NormResidual and the RmsNorm reading its output (the next
+/// instruction), each over all of its slices: `plow_norm_rms_pf` runs the pair at any grid.
+pub(super) fn prefill_norm_rms_segments(g: &DevProg) -> Vec<(usize, Vec<usize>)> {
+    g.gq_seg_ofs
+        .windows(2)
+        .enumerate()
+        .filter_map(|(seg, w)| {
+            let entries = g.gq_stream.get(w[0] as usize..w[1] as usize)?;
+            let n = entries.first()?.inst as usize;
+            let (nr, rn) = (g.insts.get(n)?, g.insts.get(n + 1)?);
+            let complete = |inst: usize, blocks: u16| {
+                let own = entries.iter().filter(|e| e.inst as usize == inst);
+                blocks != 0
+                    && own.clone().count() == usize::from(blocks)
+                    && own.enumerate().all(|(slice, e)| e.slice as usize == slice)
+            };
+            let none = packet::dev::TENSOR_NONE16;
+            let matches = nr.op == DevOp::NormResidual as u16
+                && rn.op == DevOp::RmsNorm as u16
+                && entries.iter().all(|e| e.inst as usize == n || e.inst as usize == n + 1)
+                && complete(n, nr.blocks)
+                && complete(n + 1, rn.blocks)
+                && rn.i[..3] == [nr.i[0], nr.i[1], 0]
+                && nr.t[0] != none
+                && rn.t[1] == nr.t[0];
+            matches.then_some((seg, vec![n, n + 1]))
+        })
+        .collect()
+}
+
+/// The NormResidual+RmsNorm pair at one warp per row (`PLOW_NV_WARPS` = 8 rows per block).
+pub(super) fn prefill_norm_rms_route(
+    be: &Arc<CudaBackend>,
+    function: KernelFn,
+    kernarg: DevProgram,
+    g: &DevProg,
+    insts: &[usize],
+) -> LightRoute {
+    let mut route = prefill_light_route(be, function, kernarg, g, &insts[..1]);
+    for launch in &mut route.launches {
+        launch.blocks = g.insts[launch.instruction as usize].i[0].div_ceil(8);
+    }
+    route
+}
+
 /// `(segment, instruction)` of every instruction a light route executes.
 pub(super) fn light_instructions(light: &[(usize, Vec<(usize, usize)>)]) -> Vec<(usize, usize)> {
     light
@@ -2043,6 +2088,38 @@ mod tests {
         g.gq_stream[1].slice = 0;
         g.gq_seg_ofs = vec![0, 1, 3];
         assert!(prefill_glu_quant_segments(&g).is_empty());
+    }
+
+    #[test]
+    fn prefill_norm_rms_pairs_a_norm_residual_with_the_rmsnorm_reading_it() {
+        let make = || {
+            let (mut g, _) = fixture(128);
+            let none = packet::dev::TENSOR_NONE16;
+            g.insts[1].op = DevOp::NormResidual as u16;
+            g.insts[1].i[..2].copy_from_slice(&[128, 3840]);
+            g.insts[1].t = [0, 0, 1, 2, none, none, none, none];
+            g.insts[2].op = DevOp::RmsNorm as u16;
+            g.insts[2].i[..3].copy_from_slice(&[128, 3840, 0]);
+            g.insts[2].t = [3, 0, 4, 5, 6, none, none, none];
+            g.gq_seg_ofs = vec![0, 1, 3];
+            g
+        };
+        assert_eq!(prefill_norm_rms_segments(&make()), vec![(1, vec![1, 2])]);
+        let mut bad = make();
+        bad.insts[2].t[1] = 7;
+        assert!(prefill_norm_rms_segments(&bad).is_empty(), "the RmsNorm reads another tensor");
+        let mut bad = make();
+        bad.insts[2].i[2] = 64;
+        assert!(prefill_norm_rms_segments(&bad).is_empty(), "output row offset");
+        let mut bad = make();
+        bad.insts[2].op = DevOp::QuantFp8 as u16;
+        assert!(prefill_norm_rms_segments(&bad).is_empty());
+        let mut bad = make();
+        bad.insts[2].blocks = 2;
+        assert!(prefill_norm_rms_segments(&bad).is_empty(), "a slice runs elsewhere");
+        let mut bad = make();
+        bad.gq_seg_ofs = vec![0, 1, 2, 3];
+        assert!(prefill_norm_rms_segments(&bad).is_empty(), "the pair spans two segments");
     }
 
     fn roles() -> [u8; 3] {

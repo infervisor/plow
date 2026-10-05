@@ -4508,3 +4508,27 @@ extern "C" __global__ void __launch_bounds__(256, 2) PLOW_SYM(plow_glu_quant_cac
                             (const __nv_bfloat16*)t[in->t[4]], in->i[0], blockIdx.x, gridDim.x, part);
 }
 #endif
+#if PLOW_NV_PREFILL && PLOW_NV_SEGMENTS && PLOW_NV_GEMMA && PLOW_NV_THREADS == 256 && !PLOW_NV_GEMM_ONLY && \
+    !PLOW_NV_FA_ONLY
+/* A prefill NormResidual and the RmsNorm reading its output (instruction inst + 1) as one launch
+ * of any grid: both bodies take rows {blockIdx.x + k * gridDim.x}, so the block that wrote a row
+ * normalizes it, and each row's arithmetic is the interpreter's. The interpreter runs them on its
+ * one CTA per SM, ~31 latency-bound rows per block at 4096 rows. */
+extern "C" __device__ unsigned PLOW_SYM(plow_norm_rms_pf_abi) = 1;
+extern "C" __global__ void __launch_bounds__(256, 2) PLOW_SYM(plow_norm_rms_pf)(PlowProgram prog,
+                                                                            unsigned inst) {
+    __shared__ float part[32];
+    void* const* t = prog.tensors;
+#define NRP_TEN(d, k) ((d)->t[k] == PLOW_TENSOR_NONE ? nullptr : t[(d)->t[k]])
+    const PlowDevInst* nr = prog.insts + inst;
+    const PlowDevInst* rn = nr + 1;
+    d_norm_residual((__nv_bfloat16*)NRP_TEN(nr, 0), (const __nv_bfloat16*)NRP_TEN(nr, 1),
+                    (const __nv_bfloat16*)NRP_TEN(nr, 2), (const __nv_bfloat16*)NRP_TEN(nr, 3), nr->i[0],
+                    nr->i[1], nr->fj[0].f, nr->fj[1].f, blockIdx.x, gridDim.x, part);
+    __syncthreads();
+    d_rmsnorm((__nv_bfloat16*)NRP_TEN(rn, 0), (const __nv_bfloat16*)NRP_TEN(rn, 1),
+              (const __nv_bfloat16*)NRP_TEN(rn, 2), rn->i[0], rn->i[1], rn->fj[0].f, rn->i[2], blockIdx.x,
+              gridDim.x, part, (uint8_t*)NRP_TEN(rn, 3), (float*)NRP_TEN(rn, 4));
+#undef NRP_TEN
+}
+#endif
