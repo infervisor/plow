@@ -5,20 +5,46 @@ use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::Mutex;
 
-use plow_asset::certificates::{PacketCheckReceipts, PACKET_CHECKS_FILE};
+use plow_asset::certificates::{
+    sidecar_checks_file, PacketCheckReceipts, SidecarCheckReceipts, PACKET_CHECKS_FILE,
+};
 use plow_asset::decode_objects::image_sha256;
 
 use crate::asset::devblob::DevBlob;
 use crate::{Result, RuntimeError};
 
 pub(crate) fn check_packet(blob_path: &Path, raw: &[u8], blob: &DevBlob) -> Result<()> {
-    let path = blob_path.with_file_name(PACKET_CHECKS_FILE);
+    let stem = blob_path.file_stem().and_then(|s| s.to_str()).unwrap_or("packet");
+    let path = if stem == "model" || stem == "packet" {
+        let default_path = blob_path.with_file_name(PACKET_CHECKS_FILE);
+        if default_path.is_file() {
+            default_path
+        } else {
+            sidecar_checks_file(blob_path)
+        }
+    } else {
+        sidecar_checks_file(blob_path)
+    };
     let bytes = match std::fs::read(&path) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(source) => return Err(RuntimeError::Io { path, source }),
     };
     let rejected = |reason: String| RuntimeError::Rejected(format!("{}: {reason}", path.display()));
+    if let Ok(sidecar) = serde_json::from_slice::<SidecarCheckReceipts>(&bytes) {
+        sidecar.validate_packet(raw).map_err(rejected)?;
+        for (program, check_idx) in sidecar.program_checks.iter().enumerate() {
+            let Some(check_idx) = check_idx else { continue; };
+            let check = &sidecar.checks[*check_idx];
+            let expected = blob
+                .with_packet_view(|packet| plow_asset::logical_effects::obligation(packet, program))
+                .map_err(rejected)?;
+            if check.request != expected {
+                return Err(rejected("logical effects differ from loaded operands/counters".into()));
+            }
+        }
+        return Ok(());
+    }
     let receipts: PacketCheckReceipts =
         serde_json::from_slice(&bytes).map_err(|error| rejected(error.to_string()))?;
     receipts.validate_packet(raw).map_err(rejected)?;

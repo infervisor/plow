@@ -655,6 +655,7 @@ impl GuidedSpeech {
                     cfg: Some(CfgJob { uncond_overlay: uncond, params: c.cfg(), history: vec![c.start_speech], seed: Some(seed) }),
                     // Streams only: a whole reply's first audio needs every token.
                     first_tokens: if class == JobClass::Critical { self.first_tokens } else { 0 },
+                    codebook: None,
                 })),
             },
         })

@@ -60,7 +60,7 @@ fn encode_loop(rx: std::sync::mpsc::Receiver<Encode>, mut encoder: PacketAudioEn
                 let job = pending.pop_front().unwrap();
                 let started = Instant::now();
                 let rows = encoder.encode(&job.features);
-                tracing::debug!(
+                tracing::info!(
                     frames = job.features.frames,
                     urgent = job.urgent,
                     queued = pending.len(),
@@ -117,8 +117,9 @@ impl SharedAsr {
         let checkpoint = if checkpoint.is_dir() { checkpoint } else { dir.to_path_buf() };
         let prompt = AudioLmPrompt::load(&dir.join("model.pkt"), &checkpoint)?;
         let encoder_path =
-            crate::exec::packet_runtime::stage_packet(&dir.join("model.pkt"), "encoder.packet", "encoder.pkt")?;
-        let mut encoder = PacketAudioEncoder::load(&encoder_path, "cuda")?;
+            crate::exec::packet_runtime::stage_packet(&dir.join("model.pkt"), "encoder.packet", "encoder.pkt")
+                .unwrap_or_else(|_| dir.join("encoder.pkt"));
+        let mut encoder = PacketAudioEncoder::load(&encoder_path, "auto")?;
         let warm = Instant::now();
         encoder.warm()?;
         tracing::info!(ms = warm.elapsed().as_millis() as u64, packed_chunks = encoder.max_packed_chunks(), "asr: encoder graphs warmed");
@@ -126,7 +127,11 @@ impl SharedAsr {
             return Err(RuntimeError::Rejected("audio packet output width does not match the decoder".into()));
         }
         let chunking = prompt.chunking();
-        let window_frames = encoder.window_rows() / chunking.chunk_frames.div_ceil(chunking.frame_stride) * chunking.chunk_frames;
+        let window_frames = if encoder.window_rows() > 0 {
+            encoder.window_rows() / chunking.chunk_frames.div_ceil(chunking.frame_stride) * chunking.chunk_frames
+        } else {
+            chunking.chunk_frames
+        };
         let (encode, rx) = std::sync::mpsc::channel::<Encode>();
         let cost_id = crate::sched::cost::id(&encoder_path.to_string_lossy());
         std::thread::Builder::new()
@@ -155,7 +160,7 @@ impl SharedAsr {
         let (mut tx, rx) = oneshot::channel();
         let this = Arc::clone(self);
         tokio::spawn(async move {
-            let result = match opts.windows.clone().filter(|_| !opts.final_pass) {
+            let result = match opts.windows.clone() {
                 Some(windows) => this.run_partial(mux, samples, windows, language, context, &cancel, opts, &mut tx).await,
                 None => this.run(mux, samples, language, context, &cancel, opts, &mut tx).await,
             };
@@ -196,7 +201,7 @@ impl SharedAsr {
         cancelled(cancel)?;
         let frames = features.frames;
         let overlay = self.encode_rows(features, opts.final_pass).await?;
-        tracing::debug!(
+        tracing::info!(
             final_pass = opts.final_pass,
             frames,
             frontend_ms = front.as_secs_f64() * 1e3,
@@ -235,8 +240,7 @@ impl SharedAsr {
         .map_err(|e| RuntimeError::Msg(format!("ASR prompt task: {e}")))??;
         cancelled(cancel)?;
         let wf = self.window_frames;
-        // A window is final once the frames after it cover the STFT's right context.
-        let stable = if wf == 0 { 0 } else { features.frames.saturating_sub(STABLE_MARGIN_FRAMES) / wf };
+        let stable = if wf == 0 { 0 } else { features.frames / wf };
         let cached: Vec<Arc<[f32]>> = {
             let mut w = windows.lock();
             w.rows.truncate(stable);
@@ -246,7 +250,8 @@ impl SharedAsr {
         if stable * wf < features.frames {
             pieces.push((stable * wf, features.frames));
         }
-        let encoded = futures::future::try_join_all(pieces.iter().map(|&(a, b)| self.encode_rows(slice_frames(&features, a, b), false))).await?;
+        let urgent = opts.final_pass;
+        let encoded = futures::future::try_join_all(pieces.iter().map(|&(a, b)| self.encode_rows(slice_frames(&features, a, b), urgent))).await?;
         cancelled(cancel)?;
         let fresh = stable - cached.len();
         let hidden = self.prompt.hidden();
@@ -265,12 +270,22 @@ impl SharedAsr {
         }
         let rows = overlay.len() / hidden;
         let (ids, audio_positions) = self.prompt.prompt(rows, language.as_deref(), &context, self.max_context)?;
-        tracing::debug!(frames = features.frames, windows_cached = cached.len(), windows_encoded = fresh, open_frames = features.frames - stable * wf, "asr: partial encode");
+        tracing::info!(
+            final_pass = opts.final_pass,
+            frames = features.frames,
+            windows_cached = cached.len(),
+            windows_encoded = fresh,
+            open_frames = features.frames - stable * wf,
+            encode_ms = arrived.elapsed().as_secs_f64() * 1e3,
+            "asr: window encode"
+        );
         // Local agreement: the previous partial's transcript, less its last DRAFT_TAIL tokens, is
         // forced as prompt rows (one prefill, and resumed from the session's retained rows)
         // instead of decoded token by token again. Partials are revisable; the final decodes the
         // whole recording from scratch.
-        let forced = {
+        let forced = if opts.final_pass {
+            Vec::new()
+        } else {
             let w = windows.lock();
             w.draft[..w.draft.len().saturating_sub(DRAFT_TAIL)].to_vec()
         };
@@ -327,7 +342,7 @@ impl SharedAsr {
                 session,
                 turn: opts.ids.as_ref().and_then(|i| i.turn_key.clone()),
                 continuing: false,
-                speech: Some(Box::new(SpeechJob { overlay, overlay_pos, pos_base: None, cfg: None, first_tokens: 0 })),
+                speech: Some(Box::new(SpeechJob { overlay, overlay_pos, pos_base: None, cfg: None, first_tokens: 0, codebook: None })),
             },
         };
         mux.submit_wait(job).await.map_err(|e| match e {
@@ -468,6 +483,7 @@ pub(super) async fn route(
     model: &str,
 ) -> std::result::Result<(Route, FinalizationPolicy), Response> {
     let slug = state.registry.resolve(model).unwrap_or_else(|| model.to_owned());
+    #[cfg(feature = "cuda")]
     if let Some(mgr) = state.manager_for(&slug) {
         if mgr.manages(&slug) {
             if let Err(e) = mgr.ensure_resident(&slug).await {

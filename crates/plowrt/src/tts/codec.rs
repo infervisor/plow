@@ -269,8 +269,9 @@ impl Codec {
 
 fn bind(path: &Path) -> Result<Bound, String> {
     let e = |x: crate::RuntimeError| x.to_string();
-    let loaded = load_packet_runtime(path, "cuda").map_err(e)?;
-    let runtime = loaded.runtime;
+    let loaded = load_packet_runtime(path, "auto").map_err(e)?;
+    let is_cuda = loaded.backend == "cuda";
+    let mut runtime = loaded.runtime;
     let asset = PacketAsset::load(path).map_err(e)?;
     let pipeline = asset.bind_driver(DRIVER, runtime.as_ref()).map_err(e)?;
     let param = |k: &str| pipeline.parameter(k).map(|v| v as usize).map_err(e);
@@ -316,14 +317,25 @@ fn bind(path: &Path) -> Result<Bound, String> {
     if capacities.is_empty() {
         return Err("codec packet declares no decode capacity".into());
     }
-    // Run every capacity once now: each program sequence is captured as a CUDA graph on first
-    // use, and a capture that overlaps another thread's context synchronize (the LM engine) fails.
-    let t = std::time::Instant::now();
-    let mut runtime = runtime;
-    for (_, _, programs) in capacities.iter().chain(&cached) {
-        runtime.run_sequence(programs).map_err(e)?;
+    // Run every capacity once on CUDA: each program sequence is captured as a CUDA graph on
+    // first use, and a capture that overlaps another thread's context synchronize (the LM engine)
+    // fails. On CPU, graph capture does not apply, and running every capacity burns tens of CPU
+    // minutes during server startup.
+    if is_cuda {
+        let t = std::time::Instant::now();
+        for (_, _, programs) in capacities.iter().chain(&cached) {
+            runtime.run_sequence(programs).map_err(e)?;
+        }
+        tracing::info!(capacities = capacities.len() + cached.len(), ms = t.elapsed().as_millis() as u64, "codec graphs warmed");
+    } else {
+        let t = std::time::Instant::now();
+        let mut count = 0;
+        for (_, _, programs) in capacities.iter().filter(|(b, _, _)| *b == 1).take(2) {
+            runtime.run_sequence(programs).map_err(e)?;
+            count += 1;
+        }
+        tracing::info!(capacities = count, ms = t.elapsed().as_millis() as u64, "codec capacities warmed on cpu");
     }
-    tracing::info!(capacities = capacities.len() + cached.len(), ms = t.elapsed().as_millis() as u64, "codec graphs warmed");
     let lengths = (0..param("lengths.count")?)
         .map(|k| Ok((pipeline.tensor(&format!("lengths.{k}")).map_err(e)?, param(&format!("lengths.{k}.rows_per_frame"))?)))
         .collect::<Result<Vec<_>, String>>()?;
