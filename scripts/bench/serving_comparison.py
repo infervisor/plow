@@ -109,6 +109,11 @@ def precision(hf, side, server_args):
         kv = flag_value(server_args, "--kv-cache-dtype") or "auto"
         if kv == "auto":
             kv = dtype
+    elif side == "llamacpp":
+        k = flag_value(server_args, "--cache-type-k") or flag_value(server_args, "-ctk") or "f16"
+        v = flag_value(server_args, "--cache-type-v") or flag_value(server_args, "-ctv") or "f16"
+        names = {"bf16": "bfloat16", "f16": "float16", "f32": "float32"}
+        kv = names.get(k, k) if k == v else f"K {names.get(k, k)} / V {names.get(v, v)}"
     else:
         kv = os.environ.get("KV_DTYPE")
     return f"weights {weights}; KV cache {kv}" if weights and kv else None
@@ -126,6 +131,19 @@ def gpus():
     return (" + ".join(sorted(set(names))), len(names)) if names else (None, None)
 
 
+def cpus():
+    """(model name, socket count) of a CPU-only host: the device row when there is no GPU."""
+    try:
+        info = Path("/proc/cpuinfo").read_text()
+    except OSError:
+        return None, None
+    names = set(re.findall(r"^model name\s*:\s*(.+)$", info, re.M))
+    sockets = set(re.findall(r"^physical id\s*:\s*(\d+)$", info, re.M))
+    if len(names) != 1:
+        return None, None
+    return f"CPU {names.pop()} ({os.cpu_count()} logical CPUs)", len(sockets) or 1
+
+
 def git_sha(directory):
     def g(*a):
         r = subprocess.run(["git", "-C", str(directory), *a], capture_output=True, text=True)
@@ -139,6 +157,8 @@ def git_sha(directory):
 def record(a):
     res = Path(a.resdir)
     name, count = gpus()
+    if name is None:
+        name, count = cpus()
     prov = dict(side=a.side, utc=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), hf=str(Path(a.hf).resolve()),
                 model_version=model_version(a.hf), precision=precision(a.hf, a.side, a.server_args),
                 gpu_name=name, gpu_count=count, repeats=a.reps, sampled=a.sampled,
@@ -151,6 +171,18 @@ def record(a):
             version = r.stdout.strip() if r.returncode == 0 and r.stdout.strip() else None
         prov.update(stack_version=version,
                     stack=f"vLLM {version} ({a.server_args.strip() or 'default flags'})" if version else None)
+    elif a.side == "llamacpp":
+        version = None
+        if a.llama_image:
+            r = subprocess.run(["sudo", "-n", "docker", "run", "--rm", "--entrypoint", "/app/llama-server",
+                                a.llama_image, "--version"], capture_output=True, text=True)
+            m = re.search(r"version: (\S+ \(\S+\))", r.stdout + r.stderr)
+            version = m[1] if m else None
+        gguf = Path(a.gguf) if a.gguf else None
+        prov.update(stack_version=version, gguf=str(gguf) if gguf else None,
+                    gguf_sha256=sha256(gguf) if gguf and gguf.is_file() else None,
+                    stack=(f"llama.cpp {version} ({gguf.name if gguf else '?'}; "
+                           f"{a.server_args.strip() or 'default flags'})") if version else None)
     else:
         if os.environ.get("PLOWRT_GIT_SHA"):
             sha = os.environ["PLOWRT_GIT_SHA"]
@@ -515,7 +547,7 @@ def main(argv=None):
     sp = ap.add_subparsers(dest="cmd", required=True)
     r = sp.add_parser("record")
     r.add_argument("resdir")
-    r.add_argument("--side", choices=("plow", "vllm"), required=True)
+    r.add_argument("--side", choices=("plow", "vllm", "llamacpp"), required=True)
     r.add_argument("--hf", required=True)
     r.add_argument("--reps", type=int, required=True)
     r.add_argument("--server-args", default="")
@@ -524,8 +556,10 @@ def main(argv=None):
     r.add_argument("--assets")
     r.add_argument("--plowrt", help="plowrt binary as given (empty: <repo>/target/release/plowrt)")
     r.add_argument("--repo")
+    r.add_argument("--gguf", help="llamacpp: the served GGUF")
+    r.add_argument("--llama-image", help="llamacpp: the llama.cpp server image")
     v = sp.add_parser("render")
-    v.add_argument("--baseline", required=True, help="baseline (vLLM) llm_grid result dir")
+    v.add_argument("--baseline", required=True, help="baseline (vLLM or llama.cpp) llm_grid result dir")
     v.add_argument("--infervisor", required=True, help="Infervisor (plow) llm_grid result dir")
     v.add_argument("--gate", required=True, help="campaign.py gate gates.json with llm_fp32_ref")
     v.add_argument("--out", required=True)
