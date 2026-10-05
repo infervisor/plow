@@ -10,6 +10,9 @@
 # c32/c64/c128 tok/s 374/353/353 vs 380/353/342, TTFT p99 -25/-2/-4%, TPOT p99 +9/+5/+6%;
 # 15K/128 c32 TTFT p50 2571 vs 3266 ms; 4K/128 c32 TTFT p50 626 vs 1072 ms. Label kept for history.
 # Compare against the 16K/32 request-chunk2048 recipe with matched traffic.
+# 2026-10-05 GLU role off + 64-row decode cuBLASLt (+ plowrt 1088/4160 Lt routes, ride trim), served
+# REPS=2 total tok/s vs the final3 arm: 4K/128 c32/c128 +4.8/+6.5%, 15K/128 +4.0/+4.0%, agentic16k
+# c32/c64/c128 +3.5/+3.3/+10.8%.
 schema = "plow.recipe.v1"
 namespace = "infervisor"
 name = "gemma-4-12b"
@@ -68,6 +71,13 @@ PLOW_FUSE_ARGMAX = "1"
 # Quant folded into the pre-QKV / pre-FFN RmsNorm (T11; also folds Glu into the down quant on
 # rungs without the GLU role). 4096 rung 128.7 -> 128.0 ms on top of FATLITE + generated hd256.
 PLOW_QNORM_FUSE = "1"
+# cuBLASLt projections + lm_head on the 64-row decode rung only (narrower rungs keep the native
+# TC64 GEMV, which wins there): step_bench B64 ctx 1024/4096/15000 22.7/24.4/30.7 -> 21.0/22.8/29.1 ms;
+# B16/B32 unchanged and bit-identical (2026-10-05).
+PLOW_EMIT_DECODE_CUBLASLT = "1"
+PLOW_EMIT_DECODE_CUBLASLT_MIN_ROWS = "64"
+PLOW_EMIT_DECODE_CUBLASLT_HEAD = "1"
+NVCC_APPEND_FLAGS = "-DPLOW_NV_GLU_QUANT_CACHE=1 -DPLOW_NV_GLU_QUANT_WPR=1"
 
 [objects]
 script = "scripts/build_sm90a_gemma4_segments.sh"
@@ -75,10 +85,11 @@ role_files = [
   "interp_sm90a_pfattn_hd512_px4_bq64.cubin",
   "interp_sm90a_pfattn_hd256_gqa2_bkv32.cubin",
   "interp_sm90a_pfattn_hd256_bkv32.cubin",
-  "interp_sm90a_pfgemm_glu_w8a8_gemma4.cubin",
   "gen_sm90a_attn_pf_hd256_sliding.cubin",
 ]
 [objects.env]
+# Without the GLU role the down quant computes the GeGLU itself: cached + whole-CTA rows.
+NVCC_APPEND_FLAGS = "-DPLOW_NV_GLU_QUANT_CACHE=1 -DPLOW_NV_GLU_QUANT_WPR=1"
 PLOW_BUILD_W8A8 = "1"
 # Light-op object (norm/quant/rope+KV write) without the flash arms: 56 B stack vs 2144 B stack
 # and 7.5 KB spills in the generic body (W8A8 packets default FATLITE off). Bit-identical;
@@ -93,7 +104,9 @@ PLOW_BUILD_PFATTN_HD256_GQA2_BKV32 = "1"
 PLOW_BUILD_PFATTN_HD512_PX4_BQ64 = "1"
 
 [emit_roles.env]
-PLOW_GEMMA4_SM90_W8A8_GEMM_GLU_ROLE = "1"
+# GLU role off (Lt gate/up + fused GeGLU-quant): step_bench 1x4096 128.5 -> 126.8 ms, 1x15000
+# 575 -> 568, 1x1024 34.2 -> 32.5; first-token digests unchanged (2026-10-05).
+PLOW_GEMMA4_SM90_W8A8_GEMM_GLU_ROLE = "0"
 PLOW_GEMMA4_SM90_HD512_PX4_BQ64_ROLE = "1"
 PLOW_GEMMA4_SM90_HD256_GQA2_ROLE = "1"
 PLOW_EMIT_GEN_KERNELS = "attn_pf_hd256_sliding"
