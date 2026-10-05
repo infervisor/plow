@@ -418,7 +418,9 @@ fn is_audio_lm(dir: &Path) -> Result<bool> {
     if !packet.is_file() {
         return Ok(false);
     }
-    let asset = crate::exec::packet_runtime::PacketAsset::load(&packet)?;
+    let Some(asset) = crate::exec::packet_runtime::PacketAsset::load_if_present(&packet)? else {
+        return Ok(false);
+    };
     Ok(asset
         .pipelines()
         .iter()
