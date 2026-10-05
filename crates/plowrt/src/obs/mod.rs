@@ -46,6 +46,13 @@ pub struct Metrics {
     pub decode_rung_admission: AtomicU64,
     pub decode_occupied_extent: AtomicU64,
     pub decode_rung_switches: AtomicU64,
+    /// Serving objective class in force under `auto`: 0 latency rules, 1 throughput rules.
+    pub serve_mode: AtomicU64,
+    pub serve_mode_switches: AtomicU64,
+    /// Admissions cache-aware ordering seated ahead of the queue head.
+    pub cache_first_admissions: AtomicU64,
+    /// A fatal device fault poisoned this model's engine; `/health` answers 503.
+    pub engine_dead: std::sync::atomic::AtomicBool,
 }
 
 impl Metrics {
@@ -70,6 +77,14 @@ impl Metrics {
             .fetch_add(other.admit_shed.load(Ordering::Relaxed), Ordering::Relaxed);
         self.decode_rung_switches.fetch_add(
             other.decode_rung_switches.load(Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
+        self.serve_mode_switches.fetch_add(
+            other.serve_mode_switches.load(Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
+        self.cache_first_admissions.fetch_add(
+            other.cache_first_admissions.load(Ordering::Relaxed),
             Ordering::Relaxed,
         );
     }
@@ -98,6 +113,8 @@ impl Metrics {
             other.decode_occupied_extent.load(Ordering::Relaxed),
             Ordering::Relaxed,
         );
+        self.serve_mode
+            .fetch_max(other.serve_mode.load(Ordering::Relaxed), Ordering::Relaxed);
     }
 
     #[inline]
@@ -189,7 +206,16 @@ impl Metrics {
              plowrt_decode_occupied_extent {}\n\
              # HELP plowrt_decode_rung_switches_total Decode admission-rung changes.\n\
              # TYPE plowrt_decode_rung_switches_total counter\n\
-             plowrt_decode_rung_switches_total {}\n",
+             plowrt_decode_rung_switches_total {}\n\
+             # HELP plowrt_serve_mode Serving objective class in force: 0 latency rules, 1 throughput rules.\n\
+             # TYPE plowrt_serve_mode gauge\n\
+             plowrt_serve_mode {}\n\
+             # HELP plowrt_serve_mode_switches_total Serving objective class switches under auto.\n\
+             # TYPE plowrt_serve_mode_switches_total counter\n\
+             plowrt_serve_mode_switches_total {}\n\
+             # HELP plowrt_cache_first_admissions_total Admissions seated ahead of the queue head for their cached prefix.\n\
+             # TYPE plowrt_cache_first_admissions_total counter\n\
+             plowrt_cache_first_admissions_total {}\n",
             g(&self.requests),
             g(&self.tokens),
             g(&self.rejected),
@@ -207,6 +233,9 @@ impl Metrics {
             g(&self.decode_rung_admission),
             g(&self.decode_occupied_extent),
             g(&self.decode_rung_switches),
+            g(&self.serve_mode),
+            g(&self.serve_mode_switches),
+            g(&self.cache_first_admissions),
         )
     }
 }

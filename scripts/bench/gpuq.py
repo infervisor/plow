@@ -91,8 +91,9 @@ def main():
         for path in sorted(root.glob("*.json")):
             print(path.stem, json.loads(path.read_text()))
     else:
-        if not os.environ.get("ROCM_PATH") and not (platform.system() == "Darwin" and os.environ.get("IN_NIX_SHELL")):
-            parser.error("submit inside nix develop")
+        in_nix = os.environ.get("ROCM_PATH") or (platform.system() == "Darwin" and os.environ.get("IN_NIX_SHELL"))
+        if not in_nix and os.environ.get("PLOW_CAMPAIGN_NO_NIX") != "1":
+            parser.error("submit inside nix develop (hand-built box without nix: PLOW_CAMPAIGN_NO_NIX=1)")
         if platform.system() == "Darwin" and args.ngpu != 1:
             parser.error("Metal uses one shared device")
         if args.ngpu < 1 or not args.command:

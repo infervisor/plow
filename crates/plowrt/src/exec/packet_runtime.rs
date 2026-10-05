@@ -271,6 +271,11 @@ pub fn load_packet_runtime(path: &Path, requested: &str) -> Result<LoadedPacketR
     }
 }
 
+/// The path of the sidecar `key` names in the pipelines of `model_pkt`, beside it.
+pub fn stage_packet(model_pkt: &Path, key: &str, legacy: &str) -> Result<std::path::PathBuf> {
+    Ok(model_pkt.with_file_name(PacketAsset::load(model_pkt)?.stage_file(key, legacy)?))
+}
+
 impl PacketAsset {
     pub fn load(path: &Path) -> Result<Self> {
         let image = std::fs::read(path).map_err(|source| RuntimeError::Io {
@@ -278,6 +283,19 @@ impl PacketAsset {
             source,
         })?;
         Self::from_bytes(&image)
+    }
+
+    /// `None` for a packet without a pipeline section (a plain language-model packet).
+    pub fn load_if_present(path: &Path) -> Result<Option<Self>> {
+        let image = std::fs::read(path).map_err(|source| RuntimeError::Io {
+            path: path.to_owned(),
+            source,
+        })?;
+        let blob = crate::asset::devblob::DevBlob::parse(&image)?;
+        if blob.reserved_metadata(&image, SECTION)?.is_none() {
+            return Ok(None);
+        }
+        Self::from_bytes(&image).map(Some)
     }
 
     pub fn from_bytes(image: &[u8]) -> Result<Self> {
@@ -303,6 +321,21 @@ impl PacketAsset {
 
     pub fn pipelines(&self) -> &[PacketPipeline] {
         &self.pipelines.pipelines
+    }
+
+    /// The sidecar packet a pipeline names under `key` (e.g. `encoder.packet`), else `legacy`
+    /// for a packet emitted before the name was carried. A bare file name beside the packet.
+    pub fn stage_file(&self, key: &str, legacy: &str) -> Result<String> {
+        let named = self.pipelines().iter().find_map(|p| p.strings.get(key));
+        match named {
+            None => Ok(legacy.to_string()),
+            Some(name)
+                if !name.is_empty() && !name.contains(['/', '\\']) && name != "." && name != ".." =>
+            {
+                Ok(name.clone())
+            }
+            Some(name) => Err(RuntimeError::Rejected(format!("{key} {name:?} is not a file name beside the packet"))),
+        }
     }
 
     pub fn bind(&self, name: &str, runtime: &dyn PacketRuntime) -> Result<BoundPacketPipeline> {
@@ -816,6 +849,36 @@ mod tests {
             let actual = f32::from_ne_bytes(bytes[index * 4..index * 4 + 4].try_into().unwrap());
             assert!((actual - expected).abs() < 1e-6, "{actual} != {expected}");
         }
+    }
+
+    #[test]
+    fn a_packet_without_pipelines_is_not_a_pipeline_asset() {
+        use packet::dev::DevOp;
+        use packet::devbuild::{Builder, Model};
+
+        let mut builder = Builder::new(1);
+        let values = builder.tensor("act.values", 16);
+        builder.emit(DevOp::SiluF32, builder.all(), &[], |inst| {
+            inst.t[..2].copy_from_slice(&[values, values]);
+            inst.i[0] = 4;
+        });
+        let tensors = builder.tensors();
+        let model = Model {
+            n_cu: 1,
+            target: 0,
+            tensors,
+            progs: vec![builder.finish()],
+            prog_t: vec![1],
+            kv_row_insts: vec![],
+            gen: vec![],
+        };
+        let path = std::env::temp_dir().join(format!("plow-packet-no-pipelines-{}.plowdev", std::process::id()));
+        std::fs::write(&path, model.to_blob()).unwrap();
+        let present = PacketAsset::load_if_present(&path);
+        let strict = PacketAsset::load(&path);
+        let _ = std::fs::remove_file(&path);
+        assert!(matches!(present, Ok(None)));
+        assert!(strict.is_err());
     }
 
     #[cfg(all(feature = "metal", target_os = "macos"))]

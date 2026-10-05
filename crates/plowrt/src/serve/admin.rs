@@ -305,6 +305,7 @@ async fn load_inner(state: Arc<AppState>, mut req: LoadRequest) -> Response {
             Err(e @ EnsureError::WontFit { .. }) => err(StatusCode::CONFLICT, e),
             Err(e @ EnsureError::Unloaded) => err(StatusCode::CONFLICT, e),
             Err(EnsureError::Load(e)) => err(StatusCode::INTERNAL_SERVER_ERROR, e),
+            Err(e @ EnsureError::SwitchTimeout(_)) => err(StatusCode::SERVICE_UNAVAILABLE, e),
         };
     }
     #[cfg(not(feature = "cuda"))]

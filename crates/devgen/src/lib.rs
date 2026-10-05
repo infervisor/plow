@@ -52,6 +52,7 @@ pub mod gemm_policy;
 use checkpoint::{layer_scalars, validate_coverage};
 mod attention_prefill_role;
 mod gen_kernels;
+mod serve_section;
 mod gemma4_gemm_glu_role;
 mod gemma4_w8a8_gemm_glu_role;
 mod w8a16_prefill_role;
@@ -2078,7 +2079,7 @@ fn declare(
     //
     // Only `ids`/`pos` and the KV cache legitimately span the context: the cache IS the context,
     // and ids/pos are i32 (a rounding error). Everything else holds the CURRENT chunk.
-    let rows = chunk_rows(c.window, ctx);
+    let rows = chunk_rows(c, ctx);
     // TP head split: each rank owns heads/N q-heads and kvh/N kv-heads,
     // so every head-dimensioned activation and the KV cache shrink by N. Column/row-parallel
     // weights and the inter/vocab-dimensioned activations shrink by N too. tp==1 => /1, identical.
@@ -2559,7 +2560,7 @@ fn declare(
         // 2x on full layers only (a minority), the design's chosen tradeoff. Sliding layers (16 kv)
         // still split cleanly at tp=8. Requires kvh|tp OR tp|kvh; anything else fails loudly.
         let kvh_local = kvh_local(kvh, tp, l);
-        let (kvr, _) = kv_ring(full, ctx, c.window, request_chunk(c.window));
+        let (kvr, _) = kv_ring(full, ctx, c.window, write_chunk(c));
         let qd = (c.heads / tp) * hd; // column-parallel q output shard
         let kd = kvh_local * hd; // column-parallel k/v output shard (KV head-sharded/replicated)
                                  // fp8-KV: the cache is uint8 e4m3 (1 byte/elem, HALF the bf16 footprint) plus a per-row
@@ -3245,6 +3246,40 @@ fn max_chunk(window: u32) -> u32 {
     v
 }
 
+/// Rows one request writes to a sliding ring per staged write, when the packed prefill stages
+/// its sliding layers (`PLOW_STAGE_ROWS`; unset = the window-derived default chunk whenever the
+/// request chunk exceeds it, `0` = never). The ring is sized against this instead of the request
+/// chunk: window 1024 at request chunk 4096 rings 2048 rows, not 8192.
+fn stage_rows(c: &Cfg) -> Option<u32> {
+    let ecfg = emit_config::active();
+    let request = request_chunk(c.window);
+    let eligible = c.window > 0
+        && ecfg.max_request_chunk.is_some()
+        && ecfg.packed_prefill_metadata_on()
+        && !emit_is_amd()
+        && c.kv_shared == 0;
+    match ecfg.stage_rows {
+        Some(0) => None,
+        Some(rows) => {
+            assert!(
+                eligible && rows <= request,
+                "PLOW_STAGE_ROWS {rows} needs a packed sliding-window packet without KV sharing \
+                 and PLOW_MAX_REQUEST_CHUNK >= it"
+            );
+            (rows < request).then_some(rows)
+        }
+        None => {
+            let auto = default_chunk(c.window);
+            (eligible && request > auto).then_some(auto)
+        }
+    }
+}
+
+/// Rows one request writes to a sliding ring per launch (or per stage): what the ring holds.
+fn write_chunk(c: &Cfg) -> u32 {
+    stage_rows(c).unwrap_or_else(|| request_chunk(c.window))
+}
+
 fn request_chunk(window: u32) -> u32 {
     let aggregate = max_chunk(window);
     let rows = emit_config::active().max_request_chunk.unwrap_or(aggregate);
@@ -3276,17 +3311,23 @@ fn kv_ring_rows(window: u32, chunk: u32) -> u32 {
 /// A rung may exceed MAX_CHUNK when the sliding KV ring ALREADY holds it. The ring is
 /// `next_pow2(window + chunk - 1)`, so it usually has slack: window 1024, chunk 4096 rings 8192
 /// rows and a 4224 rung needs 5247. MAX_CHUNK must stay a power of two, and the next one would
-/// double every slot's sliding KV just to admit 128 more rows.
-fn appended_rungs(window: u32, ctx: u32) -> Vec<u32> {
+/// double every slot's sliding KV just to admit 128 more rows. A staged packet writes at most
+/// `stage_rows` rows per request per stage whatever the launch width, so any rung fits its ring.
+fn appended_rungs(c: &Cfg, ctx: u32) -> Vec<u32> {
+    let window = c.window;
     let cap = ctx.min(max_chunk(window));
-    let ring = kv_ring_rows(window, request_chunk(window));
+    let ring = kv_ring_rows(window, write_chunk(c));
+    let staged = stage_rows(c);
     emit_config::active()
         .pf_ladder_append
         .as_deref()
         .map(|s| {
             s.split(',')
                 .filter_map(|x| x.trim().parse::<u32>().ok())
-                .filter(|&x| x <= cap || (window > 0 && x <= ctx && window + x - 1 <= ring))
+                .filter(|&x| {
+                    x <= cap
+                        || (window > 0 && x <= ctx && window + staged.unwrap_or(x) - 1 <= ring)
+                })
                 .collect()
         })
         .unwrap_or_default()
@@ -3295,10 +3336,10 @@ fn appended_rungs(window: u32, ctx: u32) -> Vec<u32> {
 /// Rows every chunk-sized activation must hold: the WIDEST prefill rung, which an appended rung
 /// can push past MAX_CHUNK. Sizing these from MAX_CHUNK alone lets a 4224-row launch overrun
 /// tensors built for 4096 — the packed-prefill extent check is what caught it.
-fn chunk_rows(window: u32, ctx: u32) -> u32 {
-    appended_rungs(window, ctx)
+fn chunk_rows(c: &Cfg, ctx: u32) -> u32 {
+    appended_rungs(c, ctx)
         .into_iter()
-        .fold(ctx.min(max_chunk(window)), u32::max)
+        .fold(ctx.min(max_chunk(c.window)), u32::max)
 }
 const KV_MASK_NONE: u32 = 0xFFFF_FFFF;
 
@@ -4027,7 +4068,7 @@ fn emit_phase(
     // declared row count in declare()), so the slot is IDENTICAL across every prefill bucket AND
     // the decode program — the host binds dg_tp at that one fixed offset for all of them. For
     // decode t==1 so xr_elems==hidden and the layout is a superset of the old decode path.
-    let rows_max = chunk_rows(c.window, ctx);
+    let rows_max = chunk_rows(c, ctx);
     let xr_elems = t * c.hidden;
     let slot_b = rows_max * c.hidden * BF16 as u32;
     let rows: Vec<u32> = (0..t.min(n_cu).max(1)).collect();
@@ -4662,7 +4703,7 @@ fn emit_phase(
         // (GQA 8). A single nsplit for both would leave the full layers on 4 of 256 CUs.
         // The sliding layers' cache is a RING; the full layers' is linear. `kvm` is 0xFFFFFFFF
         // for a full layer, so the AND in the kernels is a no-op there. See kv_rows().
-        let (kvr, kvm) = kv_ring(full, ctx, c.window, request_chunk(c.window));
+        let (kvr, kvm) = kv_ring(full, ctx, c.window, write_chunk(c));
         // GF is the flash-decode GQA fusion factor: query heads carried by ONE work item, and it is
         // the KERNEL constant PLOW_FA_GF(hd) = PLOW_FA_GF_FULL (default 2) — NOT 8. The compiler and
         // kernel must agree (dev_isa.h). GF=2 fuses sliding layers fully (GQA 2) and full layers
@@ -5486,7 +5527,7 @@ fn emit_phase(
         let fuse_merge = fuse_hnr && n.mrgc != TENSOR_NONE;
         // See nv_decode_merge_fold: flash writes `n.at` itself, j[1] = at | mrgc << 16.
         let dec_fused = nv_fold;
-        let c_fa = if fuse_hnr {
+        let mut c_fa = if fuse_hnr {
             // NRF fold packet: flash depends on the three RAW projections directly (the hnr
             // level is gone). Operands per the exec's unpacking map; kv_rows gets nothing —
             // the fold reads the write position from the kv_len TENSOR (qpos = len-1), so
@@ -5689,6 +5730,31 @@ fn emit_phase(
         };
         if !gemv_family && b.packed_prefill_segments() {
             b.isolate(c_fa);
+        }
+        // STAGED SLIDING PREFILL (`stage_rows`): stage k writes rows [k*S, (k+1)*S) of every
+        // request (its own slot mask) and attends them (its own span table) before stage k+1
+        // writes, so the ring holds `window + S - 1` rows instead of a whole request chunk while
+        // the projections still run the full launch. The runtime binds each stage's tables by
+        // position (`packed_prefill::stage_map`), which its validate proves.
+        let stages = match stage_rows(c) {
+            Some(s) if !gemv_family && !decode && !full && !shared && !amd => {
+                t.min(request_chunk(c.window)).div_ceil(s)
+            }
+            _ => 1,
+        };
+        if stages > 1 {
+            assert!(
+                fused && c_kn != c_vn,
+                "staged prefill needs the fused attention epilogue and separate K/V writers"
+            );
+            let (dk, dv) = (b.deps_of(c_kn), b.deps_of(c_vn));
+            for _ in 1..stages {
+                let gate = Dep::Coarse(c_fa);
+                let kn = b.repeat(c_kn, [dk.clone(), vec![gate.clone()]].concat(), |_| {});
+                let vn = b.repeat(c_vn, [dv.clone(), vec![gate]].concat(), |_| {});
+                let deps = vec![Dep::Coarse(c_qn), Dep::Coarse(kn), Dep::Coarse(vn)];
+                c_fa = b.repeat(c_fa, deps, |_| {});
+            }
         }
         // When fused, flash_prefill already wrote the normalized bf16 to n.at, so there is no
         // FlashMerge op and o_proj depends on the flash op directly. Coarse: n.at row r needs
@@ -9658,7 +9724,7 @@ fn emit_dense_gqa(
     // A 4096+128 rung swallows it in one chunk for 114 pad rows; the runtime chunk-cost
     // model picks it automatically (fewer launches at equal padding). Needs PLOW_MAX_CHUNK
     // >= the rung (the cap below filters otherwise).
-    let append: Vec<u32> = appended_rungs(c.window, ctx);
+    let append: Vec<u32> = appended_rungs(&c, ctx);
     let buckets: Vec<u32> = if ladder_wave {
         let ops = ladder::ladder_ops(&c, LADDER_BN);
         let max_tm = cap.div_ceil(LADDER_BM).max(1);
@@ -9690,13 +9756,19 @@ fn emit_dense_gqa(
     // runtime caps every request at `max_request_rows` per launch (`plan_with_limit`,
     // `pf_request_max_rows`) and the packet's LIVE-KV manifest re-checks the ring against that cap
     // at load, so a 4096-row launch may pack four 1024-row slices onto 2048-row rings. Without the
-    // cap a request may fill the widest rung alone, and the ring must hold it.
+    // cap a request may fill the widest rung alone, and the ring must hold it. Staged
+    // (`stage_rows`), a request writes at most one stage per ring pass.
     let chunk = request_chunk(c.window);
-    let ring = kv_ring_rows(c.window, chunk);
+    let ring = kv_ring_rows(c.window, write_chunk(&c));
     let widest = buckets.iter().copied().max().unwrap_or(chunk).max(chunk);
     let capped = emit_config::active().max_request_chunk.is_some();
+    let held = match stage_rows(&c) {
+        Some(stage) => stage,
+        None if capped => chunk,
+        None => widest,
+    };
     assert!(
-        ring >= c.window + (if capped { chunk } else { widest }) - 1,
+        ring >= c.window + held - 1,
         "KV ring {ring} too small for window {} + widest rung {widest}",
         c.window
     );
@@ -9704,7 +9776,7 @@ fn emit_dense_gqa(
         !capped || buckets.contains(&chunk),
         "PLOW_MAX_REQUEST_CHUNK {chunk} must be a prefill rung of {buckets:?}"
     );
-    let arows = chunk_rows(c.window, ctx);
+    let arows = chunk_rows(&c, ctx);
     // opart/mlpart (the flash_prefill partials) are sized in declare() as arows*heads_sharded*ns_pre.
     // The flash writes t*heads_sharded*ns(t) row-splits for a bucket t, where emit_phase derives
     // ns(t) from the SHARDED head count (heads/tp) — so ns_pre must be the worst-case over buckets
@@ -10308,6 +10380,13 @@ fn emit_dense_gqa(
         };
         let slot = declare("pf.request.slot".into(), u64::from(max_rows) * 4);
         let request = declare("pf.request.table".into(), (1 + 4 * u64::from(batch)) * 4);
+        let stage_rows = stage_rows(&c);
+        let stages: Vec<_> = (0..stage_rows.map_or(0, |s| request_chunk(c.window).div_ceil(s)))
+            .map(|i| plow_asset::packed_prefill::Stage {
+                slot: declare(format!("pf.request.slot.{i}"), u64::from(max_rows) * 4),
+                request: declare(format!("pf.request.table.{i}"), (1 + 4 * u64::from(batch)) * 4),
+            })
+            .collect();
         let originals: Vec<_> = m
             .gen
             .iter()
@@ -10333,12 +10412,8 @@ fn emit_dense_gqa(
             let request = plow_asset::packed_prefill::Manifest {
                 version: live.version,
                 max_request_rows: ecfg.max_request_chunk,
-                // Emitting a staged chunk is not wired yet: the per-stage tables exist
-                // (packed_prefill::plan_stage / stage_slots) but nothing emits the HNR_i -> FP_i
-                // chain or binds a stage, so declaring stage_rows here would shorten the ring
-                // while the launch still wrote the whole chunk. validate() refuses that pairing.
-                stage_rows: None,
-                stages: Vec::new(),
+                stage_rows,
+                stages: stages.clone(),
                 slot,
                 request,
                 maps,
@@ -10493,6 +10568,12 @@ fn emit_dense_gqa(
                 serde_json::to_vec(&packed).expect("serialize packed prefill manifest");
         }
     }
+    if !block_mode {
+        sections.push(
+            serve_section::section(&dir, ecfg.serve_defaults.as_deref())
+                .unwrap_or_else(|error| panic!("serve manifest: {error}")),
+        );
+    }
     let lean = apply_verify_gate(&m, verify.as_ref());
     modular::update_section_with_lean(&mut sections, &lean);
     let blob = if sections.is_empty() {
@@ -10594,10 +10675,12 @@ fn emit_dense_gqa(
         (encoder.prefix.model, section)
     });
     std::fs::write(&out, blob).unwrap();
+    let mut speech_ops = 0u64;
     if let Some(dir) = ecfg.tts_codec.as_deref().filter(|_| !block_mode) {
         let sites = whole_graph_audio_sites().0;
         let (model, section) = codec::lower_snac(dir, n_cu, m.target, sites).unwrap_or_else(|error| panic!("codec packet: {error}"));
-        let path = std::path::Path::new(&out).with_file_name("codec.pkt");
+        let path = std::path::Path::new(&out).with_file_name(tts::CODEC_PACKET);
+        speech_ops |= manifest::speech_ops(&model);
         write_sidecar_packet(&path, &model, &[section]);
         eprintln!("  codec packet -> {}", path.display());
     }
@@ -10605,11 +10688,13 @@ fn emit_dense_gqa(
         let sites = whole_graph_audio_sites().1;
         let (model, section) = s3gen::lower_s3gen(dir, n_cu, m.target, sites, ecfg.s3gen_attn_h16).unwrap_or_else(|error| panic!("s3gen packet: {error}"));
         let path = std::path::Path::new(&out).with_file_name(s3gen::PACKET);
+        speech_ops |= manifest::speech_ops(&model);
         write_sidecar_packet(&path, &model, &[section]);
         eprintln!("  s3gen packet -> {}", path.display());
     }
     if let Some((model, section)) = audio_blob {
-        let path = std::path::Path::new(&out).with_file_name("encoder.pkt");
+        let path = std::path::Path::new(&out).with_file_name(asr::qwen::ENCODER_PACKET);
+        speech_ops |= manifest::speech_ops(&model);
         write_sidecar_packet(&path, &model, &[section]);
         eprintln!("  audio encoder packet -> {}", path.display());
     }
@@ -10631,7 +10716,10 @@ fn emit_dense_gqa(
     // is unchanged.
     if !arch.is_empty() {
         write_lean_receipts(std::path::Path::new(&out), &lean);
-        let man = manifest::build_for_packet(&m, &arch, &lean, &sections);
+        let mut man = manifest::build_for_packet(&m, &arch, &lean, &sections);
+        if speech_ops != 0 {
+            man["speech_ops"] = speech_ops.into();
+        }
         report_dispatch_audit(&man);
         report_segment_resource(&man);
         if !hetero_progs.is_empty() {

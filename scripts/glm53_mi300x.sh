@@ -108,9 +108,10 @@ bench)
   for inlen in ${IN_LENS:-1024 4096}; do
     for conc in ${CONCS:-1 4}; do
       echo "===== $label tp$tp in=$inlen conc=$conc out=${OUTLEN:-128}"
+      # The same client as the `vllm` reference server and plowbench.sh's pb_bench.
       env -u HIP_VISIBLE_DEVICES -u CUDA_VISIBLE_DEVICES HF_HUB_OFFLINE=1 \
-        LD_LIBRARY_PATH="/nix/store/8kvxvr3pmsypxiypq4g8zy13glnfr7nx-glibc-2.42-67/lib:/nix/store/chqq8mpmpyfi9kgsngya71akv5xicn03-gcc-15.2.0-lib/lib:/opt/rocm/core-7.14/lib:/lib/x86_64-linux-gnu:/usr/lib/x86_64-linux-gnu" \
-        "$WT/.venv-vllm028/bin/python" -m vllm.entrypoints.cli.main bench serve \
+        VLLM_ROCM_LIB="${PB_VLLM_ROCM_LIB:-/opt/rocm/core-7.14/lib}" \
+        "$WT/build-gemma31/vllm-python" -m vllm.entrypoints.cli.main bench serve \
         --backend openai-chat --endpoint /v1/chat/completions \
         --base-url "http://127.0.0.1:$port" --model "$m" --tokenizer "$RAW" \
         --dataset-name random --random-input-len "$inlen" --random-output-len "${OUTLEN:-128}" \
@@ -152,7 +153,7 @@ vllm)
 # lease when it returns; killing the wrapper instead orphans a live plowrt that keeps the port
 # and the cards, which is exactly what happened here on the first attempt.
 stop)
-  pat="${2:-/app/plow/build-glm53/tp}"
+  pat="${2:-$OUT/tp}"
   pids=$(pgrep -f "plowrt serve --assets $pat" || true)
   [ -z "$pids" ] && { echo "no plowrt serving $pat"; exit 0; }
   echo "stopping: $pids"

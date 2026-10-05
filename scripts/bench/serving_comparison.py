@@ -11,7 +11,8 @@ performance comparison (docs/bringup/agent-tools.md, "Final performance report (
 
   serving_comparison.py render --baseline DIR --infervisor DIR --gate gates.json --out DIR
       [--cells g128,s128,a64.g] [--baseline-provenance P] [--infervisor-provenance P]
-      One 12-row table per cell (single-turn g<c>/s<c>, agentic a<c>.g/a<c>.s) into
+      One 12-row table per cell (single-turn g<c>/s<c>, agentic a<c>.g/a<c>.s, open-loop production
+      mix q<1000*rate>.g/.s with goodput etc. in a supplementary note under the table) into
       comparison.md / comparison.json / comparison.csv. --gate is the `campaign.py gate --only
       llm_fp32_ref` gates.json for the served packet.
       Exit 2: rule violation (missing data, gate for another packet, < 2 repeats, unpaired cells);
@@ -227,18 +228,57 @@ def agentic_run(root, tag, errors):
                 peak_gib=read_peak(root, tag, errors), source=str(path))
 
 
+# Open-loop cells: values under the strict table, means over repeats.
+SUPPLEMENTARY = (("goodput_req_s", "goodput", "{:.3f} req/s"), ("slo_attainment", "SLO met", "{:.1%}"),
+                 ("request_s", "requests", "{:.3f} req/s"), ("mean_inflight", "mean in-flight", "{:.1f}"),
+                 ("mean_sessions", "mean live sessions", "{:.1f}"), ("ttft_p50_ms", "TTFT P50", "{:,.1f} ms"),
+                 ("tpot_p50_ms", "TPOT P50", "{:.2f} ms"), ("cached_fraction", "cached prompt tokens", "{:.1%}"))
+
+
+def prod_run(root, tag, errors):
+    path = root / f"{tag}.json"
+    d = json.loads(path.read_text())
+    c, o = d["config"], d["overall"]
+    if o["errors_total"]:
+        errors.append(f"{path}: {o['errors_total']} failed requests")
+        return None
+    io = (f"open-loop mix: {c['apps']} system prompts (lognormal median {c['system_median']:g}), turns geometric "
+          f"mean {c['turns_mean']:g} max {c['turns_max']}, first message lognormal({c['first_median']:g}, "
+          f"{c['first_sigma']:g}), tool output lognormal({c['tool_median']:g}, {c['tool_sigma']:g}), context cap "
+          f"{c['max_model_len']} / output lognormal({c['out_median']:g}, {c['out_sigma']:g}) in "
+          f"[{c['out_min']}, {c['out_max']}] tokens, ignore_eos")
+    traffic = (f"{temp_label(c['temperature'], c.get('top_p'))}, {c['api']} API, Poisson {c['rate']:g} sessions/s, "
+               f"think lognormal({c['think_median_s']:g} s, {c['think_sigma']:g}) <= {c['think_max_s']:g} s, "
+               f"{c['duration']:g} s (measured {c['warmup']:g}-{c['duration'] - c['cooldown']:g} s), "
+               f"session header {'on' if c.get('session_header', True) else 'off'} / open loop (achieved "
+               f"concurrency in the supplementary note)")
+    extra = {k: o.get(k) for k, _, _ in SUPPLEMENTARY}
+    extra["seed"] = c["seed"]
+    extra["slo"] = f"TTFT <= {o['slo_ttft_ms']:g} ms and TPOT <= {o['slo_tpot_ms']:g} ms"
+    # Pair on everything that shapes the plan or the goodput score, not only the described subset.
+    # Per-run fields (endpoint, output path, served name) and the seed (compared across arms per
+    # repeat) are left out; the rate stays in, so how it was derived does not matter.
+    plan = {k: v for k, v in c.items()
+            if k not in ("url", "out", "model", "seed", "timeout", "est_e2e_s", "target_concurrency")}
+    plan["slo"] = [o["slo_ttft_ms"], o["slo_tpot_ms"]]
+    io_key = io + " #" + hashlib.sha256(json.dumps(plan, sort_keys=True).encode()).hexdigest()[:16]
+    return dict(io=io, io_key=io_key, traffic=traffic, total_tok_s=o["total_tok_s"],
+                ttft_p99_ms=o.get("ttft_p99_ms"), tpot_p99_ms=o.get("tpot_p99_ms"),
+                peak_gib=read_peak(root, tag, errors), source=str(path), extra=extra)
+
+
 def discover(root):
-    """{cell: {repeat: tag}} for single-turn g<c>/s<c> and agentic a<c>.g/a<c>.s results."""
+    """{cell: {repeat: tag}} for single-turn g<c>/s<c>, agentic a<c>.g/a<c>.s and open-loop q<r>.g/q<r>.s results."""
     cells = {}
     for p in root.iterdir():
-        m = re.fullmatch(r"([gs]\d+)\.r(\d+)", p.name) if p.is_dir() else re.fullmatch(r"(a\d+\.[gs])\.r(\d+)\.json", p.name)
+        m = re.fullmatch(r"([gs]\d+)\.r(\d+)", p.name) if p.is_dir() else re.fullmatch(r"([aq]\d+\.[gs])\.r(\d+)\.json", p.name)
         if m:
             cells.setdefault(m[1], {})[int(m[2])] = p.name.removesuffix(".json")
     return cells
 
 
 def cell_order(cell):
-    return (cell[0] == "a", int(re.search(r"\d+", cell)[0]), cell)
+    return ("gsaq".index(cell[0]) // 2 + (cell[0] == "q"), int(re.search(r"\d+", cell)[0]), cell)
 
 
 def arm(root, prov, cell, tags, errors):
@@ -246,6 +286,7 @@ def arm(root, prov, cell, tags, errors):
     for rep in sorted(tags):
         try:
             r = (agentic_run(root, tags[rep], errors) if cell[0] == "a"
+                 else prod_run(root, tags[rep], errors) if cell[0] == "q"
                  else single_run(root, tags[rep], prov, errors))
         except (OSError, ValueError, KeyError, TypeError, ZeroDivisionError) as e:
             errors.append(f"{root}: {tags[rep]} malformed result ({type(e).__name__}: {e})")
@@ -257,7 +298,10 @@ def arm(root, prov, cell, tags, errors):
     for k in ("io_key", "traffic"):
         if len({r[k] for r in runs}) > 1:
             errors.append(f"{root}: {cell} repeats differ in {k}")
-    out = dict(io=runs[0]["io"], io_key=runs[0]["io_key"], traffic=runs[0]["traffic"], repeats=len(runs),
+    traffic = runs[0]["traffic"]
+    if "extra" in runs[0]:  # one seed per repeat; the arms must replay the same plans
+        traffic += ", seeds " + "/".join(str(r["extra"]["seed"]) for r in runs)
+    out = dict(io=runs[0]["io"], io_key=runs[0]["io_key"], traffic=traffic, repeats=len(runs),
                sources=[r["source"] for r in runs], per_repeat={}, mean={}, spread_pct={})
     gpu_count = prov.get("gpu_count") or 1
     for r in runs:
@@ -274,6 +318,10 @@ def arm(root, prov, cell, tags, errors):
         out["per_repeat"][key] = values
         out["mean"][key] = mean
         out["spread_pct"][key] = (max(values) - min(values)) / mean * 100 if mean else 0.0
+    if "extra" in runs[0]:
+        out["supplementary"] = {k: None if any(r["extra"][k] is None for r in runs)
+                                else sum(r["extra"][k] for r in runs) / len(runs) for k, _, _ in SUPPLEMENTARY}
+        out["supplementary"]["slo"] = runs[0]["extra"]["slo"]
     return out
 
 
@@ -359,7 +407,10 @@ def build_cell(cell, b, i, bprov, iprov, gate):
             is_ += " *"
         rows.append((label, bs, is_))
     assert tuple(r[0] for r in rows) == LABELS
-    return dict(cell=cell, matched=not mismatched, mismatched=mismatched, equivalent=gate["passed"],
+    extra = {}
+    if "supplementary" in b:
+        extra["supplementary"] = dict(baseline=b["supplementary"], infervisor=i["supplementary"])
+    return dict(extra, cell=cell, matched=not mismatched, mismatched=mismatched, equivalent=gate["passed"],
                 spread_flagged=flagged, rows=rows, repeats=b["repeats"],
                 ratios={k: i["mean"][k] / b["mean"][k] for k, _, _ in MEASURED},
                 baseline={k: b[k] for k in ("mean", "per_repeat", "spread_pct", "sources")},
@@ -386,6 +437,12 @@ def markdown(report):
         md += ["", f"Spread over {c['repeats']} repeats, (max - min) / mean, Baseline / Infervisor: {spreads}."]
         if c["spread_flagged"]:
             md += ["", "**FLAGGED: spread > 10%: " + "; ".join(c["spread_flagged"]) + ".**"]
+        if "supplementary" in c:
+            b, i = c["supplementary"]["baseline"], c["supplementary"]["infervisor"]
+            show = lambda v, f: "-" if v is None else f.format(v)
+            md += ["", f"Supplementary (outside the strict table; goodput = requests meeting {b['slo']} per "
+                   "second, measured window), Baseline / Infervisor: "
+                   + "; ".join(f"{label} {show(b[k], f)} / {show(i[k], f)}" for k, label, f in SUPPLEMENTARY) + "."]
         md.append("")
     return "\n".join(md)
 

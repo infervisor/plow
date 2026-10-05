@@ -441,6 +441,18 @@ impl ServeEngine {
             ServeEngine::Cpu(_) => None,
         }
     }
+
+    /// The prefix cache's read-only attach probe, for cache-aware admission order.
+    #[cfg(feature = "cuda")]
+    pub fn vmm_prefix_probe(&self) -> Option<crate::memory::vmm::PrefixProbe> {
+        match self {
+            ServeEngine::Cuda(e) => e.vmm_prefix_probe(),
+            #[cfg(feature = "hsa")]
+            ServeEngine::Amd(_) => None,
+            #[cfg(feature = "cpu")]
+            ServeEngine::Cpu(_) => None,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1376,17 +1388,12 @@ mod amd_serve {
                 .max(1);
             drop(raw);
 
-            let stop_ids = Arc::new(
-                checkpoint
-                    .map(|d| {
-                        let mut ids = crate::asset::checkpoint::read_eos_ids(d);
-                        // A structured chat turn can close before the sequence eos; without this
-                        // the framing lands in the user's text. See `chat_stop_ids`.
-                        ids.extend(crate::asset::checkpoint::chat_stop_ids(d, &ids));
-                        ids
-                    })
-                    .unwrap_or_default(),
-            );
+            let stop_ids = Arc::new(match checkpoint {
+                Some(d) => crate::asset::serve::resolve(blob_path.parent().unwrap_or(Path::new(".")), d)?
+                    .manifest
+                    .stop_token_ids,
+                None => Vec::new(),
+            });
 
             let ranks = if n_gpu == 1 {
                 let be = Arc::new(crate::device::hsa::HsaBackend::new(0)?);

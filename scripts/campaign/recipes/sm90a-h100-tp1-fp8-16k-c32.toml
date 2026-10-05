@@ -54,6 +54,7 @@ PLOW_SEG_FA256_GQA2 = "1"          # [FP8-TAX] GEMMA4_SEG_FA256_GQA2_DEFAULT is 
 PLOW_TMA_GEMM = "1"
 PLOW_MAX_CHUNK = "4096"
 PLOW_MAX_REQUEST_CHUNK = "2048"
+PLOW_STAGE_ROWS = "0"               # unstaged ring as measured; auto staging not re-measured here
 PLOW_SLIDING_NS_CAP = "1"
 PLOW_SLIDING_NS_GRID = "1"
 PLOW_ATTENTION_DECODE_BALANCE_GF = "4"

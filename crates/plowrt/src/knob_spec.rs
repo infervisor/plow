@@ -136,6 +136,7 @@ const PRESSURE_EVICTION_DEFAULT: Status = Status::Candidate {
         "device/hsa.rs `free_bytes` reports HSA_AMD_AGENT_INFO_MEMORY_AVAIL, reflecting every consumer of the device's VRAM, so the floor is measured not modelled",
         "memory/vmm.rs `enable_pressure_eviction`: a backend that cannot report free bytes degrades to the static budget, so arming this is safe on every backend",
         "docs/flags-reference.md: `=0` is the rollback to the static budget",
+        "CUDA floor 2% (was 10%): Gemma-4-12B BF16 KV agentic16k c64 cached 26.7% -> 76-78%, 408 -> 772-833 tok/s on a fresh cache; serving-time non-pool growth +1.0 GiB; 0 errors incl. 15K c128",
     ],
 };
 
@@ -405,6 +406,14 @@ pub fn warn_removed_env() {
     }
 }
 
+/// Whether `env` names a live runtime knob: what a packet's `serve.json` may carry a default for.
+pub fn is_runtime_env(env: &str) -> bool {
+    RUNTIME
+        .iter()
+        .chain(RAW_ENV)
+        .any(|k| k.env == Some(env) && !matches!(k.status, Status::Removed))
+}
+
 #[rustfmt::skip]
 pub const RUNTIME: &[KnobSpec] = &[
     KnobSpec::new("rt.rt_checkpoint", Some("PLOW_CHECKPOINT"), Layer::Runtime, Domain::Str, UNSET, OPT_IN),
@@ -462,6 +471,9 @@ pub const RUNTIME: &[KnobSpec] = &[
     KnobSpec::new("rt.slab_keep", Some("PLOW_SLAB_KEEP"), Layer::Runtime, Domain::Bool, UNSET, OPT_IN),
     KnobSpec::new("rt.dstep_every", Some("PLOW_DSTEP_EVERY"), Layer::Runtime, U32, UNSET, OPT_IN),
     KnobSpec::new("rt.drain_timeout_ms", Some("PLOW_DRAIN_TIMEOUT_MS"), Layer::Runtime, USIZE, UNSET, OPT_IN),
+    KnobSpec::new("rt.switch_timeout_ms", Some("PLOW_SWITCH_TIMEOUT_MS"), Layer::Runtime, USIZE, UNSET, OPT_IN),
+    KnobSpec::new("rt.http_header_timeout_ms", Some("PLOW_HTTP_HEADER_TIMEOUT_MS"), Layer::Runtime, USIZE, UNSET, OPT_IN),
+    KnobSpec::new("rt.http_max_connections", Some("PLOW_HTTP_MAX_CONNECTIONS"), Layer::Runtime, USIZE, UNSET, OPT_IN),
     KnobSpec::new("rt.devices", Some("PLOW_DEVICES"), Layer::Runtime, U32, UNSET, OPT_IN),
     KnobSpec::new("rt.place", Some("PLOW_PLACE"), Layer::Runtime, Domain::Str, Default::Static(Val::Str("spread")), OPT_IN),
     KnobSpec::new("rt.pin", Some("PLOW_PIN"), Layer::Runtime, Domain::Str, UNSET, OPT_IN),
@@ -660,6 +672,7 @@ pub const RAW_ENV: &[KnobSpec] = &[
     KnobSpec::new("env.PLOW_SERVE_POLICY", Some("PLOW_SERVE_POLICY"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
     KnobSpec::new("env.PLOW_TOKEN_BATCH_SOLO", Some("PLOW_TOKEN_BATCH_SOLO"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
     KnobSpec::new("env.PLOW_DEBUG_MAX_INST", Some("PLOW_DEBUG_MAX_INST"), Layer::RawEnv, Domain::Str, UNSET, DIAG),
+    KnobSpec::new("env.PLOW_THROUGHPUT_K", Some("PLOW_THROUGHPUT_K"), Layer::RawEnv, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("env.PLOW_DEV_SAMPLE", Some("PLOW_DEV_SAMPLE"), Layer::RawEnv, Domain::Str, UNSET, DIAG),
     KnobSpec::new("env.PLOW_DSA_VERIFY_CKPT", Some("PLOW_DSA_VERIFY_CKPT"), Layer::RawEnv, Domain::Str, UNSET, DIAG),
     KnobSpec::new("env.PLOW_DSA_VERIFY_OUT", Some("PLOW_DSA_VERIFY_OUT"), Layer::RawEnv, Domain::Str, UNSET, DIAG),

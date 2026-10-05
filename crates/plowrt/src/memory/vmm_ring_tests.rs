@@ -543,3 +543,31 @@ fn idle_backed_slot_failure_restores_the_idle_mapping() {
         ops.empty();
     }
 }
+
+/// Prefix reuse off: the mux retires every empty slot each tick while each decode launch maps its
+/// whole rung. Idle rows inside the rung stay mapped (no per-tick driver churn); rows past a
+/// narrower launch are reclaimed.
+#[test]
+fn idle_rows_inside_the_launch_stay_mapped() {
+    let ops = Arc::new(Mock::default());
+    let mut rings = VmmRings::new(ops.clone(), &tensors(), 16).unwrap();
+    rings.ensure_prefix(16).unwrap();
+    let calls = ops.calls();
+    for _ in 0..4 {
+        for slot in 1..16 {
+            rings.release_idle(slot);
+        }
+        rings.ensure_prefix(16).unwrap();
+    }
+    assert_eq!(ops.calls(), calls, "idle rung rows must not call the driver");
+    assert_eq!(rings.stats().mapped_prefix, 16);
+
+    rings.ensure_prefix(4).unwrap();
+    for slot in 1..16 {
+        rings.release_idle(slot);
+    }
+    assert_eq!(rings.stats().mapped_slots, 4);
+    assert_eq!(rings.stats().resident_bytes, 4 * 384);
+    drop(rings);
+    ops.empty();
+}

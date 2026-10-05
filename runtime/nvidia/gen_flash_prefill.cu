@@ -85,7 +85,9 @@ __device__ __forceinline__ void gen_run(const PlowGenFlashPrefill& a) {
         unsigned local = round * gridDim.x +
                          ((round & 1) ? gridDim.x - 1 - blockIdx.x : blockIdx.x);
         const unsigned count = a.requests ? (unsigned)a.requests[0] : 1u;
-        unsigned r = 0, q0 = 0, qlen = a.seq_q, slot = 0, kvlen = a.seq_kv;
+        // Unpacked: one request of seq_kv - q_pos0 real rows (an unpacked chunk's last bucket keeps
+        // i[0] at the rung, so rows past them are padding).
+        unsigned r = 0, q0 = 0, qlen = a.seq_kv - a.q_pos0, slot = 0, kvlen = a.seq_kv;
         for (; r < count; ++r) {
             if (a.requests) {
                 q0 = (unsigned)a.requests[1 + 4 * r];
@@ -117,7 +119,7 @@ __device__ __forceinline__ void gen_run(const PlowGenFlashPrefill& a) {
 #endif
     }
 
-    unsigned real = a.seq_q;
+    unsigned real = a.seq_kv - a.q_pos0;
     if (a.requests) {
         const unsigned count = (unsigned)a.requests[0];
         real = count ? (unsigned)a.requests[4 * count - 3] + (unsigned)a.requests[4 * count - 2]
@@ -205,7 +207,7 @@ void plow_gen_flash_prefill(PlowProgram prog) {
         a.n_head = in->i[2];
         a.n_kv_head = in->i[3];
         a.window = in->i[5];
-        if (!a.requests && a.q_pos0 + a.seq_q != a.seq_kv) __trap();
+        if (!a.requests && (a.seq_kv <= a.q_pos0 || a.q_pos0 + a.seq_q < a.seq_kv)) __trap();
     }
     __syncthreads();
     gen_run(a);

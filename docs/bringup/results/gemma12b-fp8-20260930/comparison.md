@@ -1,56 +1,313 @@
-# Gemma-4 12B FP8 comparison
+# Gemma-4 12B FP8 comparison (H100)
 
-No production-qualified win over vLLM is established. Cross-stack quality is gated against an independent FP32 reference ([below](#fp32-reference-quality-gate)); the current best packet passes it. Internal gains below do not qualify a production recipe.
+This file holds only qualified wins and their evidence. Experimental history, internal A/Bs and
+the non-matched arms are summarized in [../gemma4-h100/summary.md](../gemma4-h100/summary.md).
+Every matched serving row is in [comparison.csv](comparison.csv) (`campaign_source` names the
+experiment; this run's rows are `final3-20261005-*`).
 
-[All serving measurements](comparison.csv) are consolidated into one CSV. `campaign_source` identifies the original experiment. Existing metrics and qualifications are preserved. Fixed-16K experiments do not replace the best short-context configuration.
-The required production profile has prefix caching enabled and a compiled 128-row maximum decode rung; the cache-off 64-row comparisons in this CSV do not qualify that profile.
-The 16K/B128 BF16-KV packet compiled, but a one-H100 rung test failed at load: its 128 preallocated 2,048-row sliding rings exhaust VRAM. Live ring allocation loaded the packet but exhausted VRAM while admitting slot 98. The FP8-KV alternative is experimental and requires matched vLLM precision, correctness and cache validation.
+## Qualified wins (MATCHED + EQUIVALENT, `campaign.py report` exit 0)
 
-At concurrency 128, the recorded serving results are:
+- Infervisor: plowrt `ee57f7b7` (gemma12b-next), packet `5fbe627c02af`, built by `campaign.py
+  build` at gemma12b-next `6a21c8c3` from [`recipes/infervisor/gemma-4-12b/sm90a-h100-tp1.toml`](../../../../recipes/infervisor/gemma-4-12b/sm90a-h100-tp1.toml)
+  (FP8 W8A8 weights, FP8 per-token-head KV, 16K context, 128 decode slots, prefix cache on). The
+  bundle is self-contained: serve defaults come from the packet's `serve.json` (equal to the
+  recipe `[serve.env]`); the only server env was `PLOW_LIBCUDA`.
+- Baseline: vLLM 0.28.0 with matched `fp8_per_token_head` KV. That KV dtype runs only on
+  TRITON_ATTN (FLASHINFER rejects it, FLASH_ATTN does not list it). Probe at 4K/128 c32, out tok/s:
+  max-num-batched-tokens 8192 = 399, 16384 = 393, 4096 = 398; 8192 is used. Baseline arms are the
+  final2 (closed loop) and prodbench (open loop) vLLM runs, same client and plan hash.
+- One H100 80GB HBM3, same vLLM client, greedy, 2 repeats per cell in one server per arm.
+- Quality: FP32-reference gate PASS for the served packet (`gates.json` sha256 `1e64f6058d79`;
+  KL mean 0.1048 vs vLLM 0.1277). See [below](#fp32-reference-quality-gate).
+- Rebuild at `e93e0a64` (packet `ab1c1d583f8d`): differs only in
+  `gen_sm90a_attn_pf_hd512_fp8kv.cubin` (unpacked partial-chunk fix; the `5fbe627c` object faults
+  on step_bench's unpacked path at non-rung prompt lengths, which serving never takes). Gate PASS,
+  KL mean 0.1053; catalog bench rel_l2 and timing unchanged (within 2%).
 
-| Input/output tokens | Configuration and traffic | Infervisor output tok/s | vLLM output tok/s | Ratio |
-|---|---|---:|---:|---:|
-| 128/128 | Current experimental 16K-capacity, 128-slot FP8-KV; sampled | 4,228 | 6,552 | 64.5% |
-| 128/128 | Earlier 1K-capacity BF16-KV; sampled | 5,814 | 7,526 | 77.2% |
-| 4096/128 | Earlier 16K-capacity, 64-slot BF16-KV; greedy | 665 | 893 | 74.4% |
-| 15000/128 | Earlier 16K-capacity, 64-slot BF16-KV; greedy | 196 | 244 | 80.0% |
+Ratios are Infervisor / vLLM, from the strict tables below. `*` = repeat spread > 10% (FLAGGED);
+flagged values are direction only.
 
-Each row has a matched vLLM arm and two repeats in [comparison.csv](comparison.csv). The earlier rows use different KV precision, decode-slot capacity, or context capacity from the current FP8-KV packet, and cross-stack output equivalence is unresolved. There is no medium- or long-context serving result for the current 16K/128-slot FP8-KV packet.
+| Cell | Total throughput | TTFT P99 | TPOT P99 | Goodput (supplementary) |
+|---|---:|---:|---:|---:|
+| 4096/128 c32 | 1.38x | 0.70x | 0.70x |  |
+| 4096/128 c128 | 1.37x | 0.77x | 0.36x |  |
+| 15000/128 c32 | 1.79x | 0.57x | 0.30x |  |
+| 15000/128 c128 | 1.75x | 0.57x | 0.14x |  |
+| agentic16k c32 | 1.40x | 0.57x | 0.67x |  |
+| agentic16k c64 | 1.31x | 0.79x | 0.71x |  |
+| agentic16k c128 | 4.02x | 0.16x | 0.24x |  |
+| open loop, 0.628 sessions/s | 1.08x | 0.41x | 0.60x * | 1.08x (2.675 vs 2.485 req/s) |
+| open loop, 0.771 sessions/s | 1.18x | 0.28x * | 0.31x * | 1.57x (3.103 vs 1.980 req/s) |
+| open loop, 0.987 sessions/s | 1.50x | 0.23x * | 0.26x * | 4.57x (3.412 vs 0.748 req/s) |
 
-## Validated internal improvements
+Goodput = requests per second meeting TTFT <= 2000 ms and TPOT <= 100 ms. The open-loop rates are
+the vLLM-calibrated points for mean in-flight 16 / 48 / 96 (`prodbench/rates.txt`).
 
-| Change | Measured improvement | Validation scope |
+Caveats:
+- This win is against vLLM's matched FP8-KV config, not its fastest config overall. Against vLLM
+  BF16 KV (default backend, MATCHED + EQUIVALENT with the BF16-KV plow packet `af6ee1c20678`,
+  gate PASS KL 0.0821, rows `final3-20261005-*-bf16`), total throughput is 4K 0.83x / 0.79x, 15K
+  0.86x / 0.86x at c32 / c128, agentic 0.68x / 2.01x / 1.39x at c32 / c64 / c128. The plow FP8 arm
+  (551 / 145 out tok/s at 4K / 15K c32) is also below vLLM BF16 KV (780 / 235).
+- Host load average (1-minute) during the leases, mean / max: 4K 1.2 / 1.4, 15K 1.3 / 2.7,
+  agentic 2.2 / 3.0 (overlapped a niced 4-core packet build), open loop 1.0 / 1.1.
+
+Evidence (campaign scratch):
+- Infervisor arms, gates, reports: `/opt/dlami/nvme/lava-tts/final3/` (`report/` strict reports,
+  `res/` raw, `gate/{fp8,bf16,fp8b}/` FP32-gate captures + `gates.json`, `res/unpacked*/`
+  unpacked partial-chunk checks, `res/backcompat/`, `res/ramp/` latency/throughput mode ramp).
+- vLLM arms: `/opt/dlami/nvme/lava-tts/final2/res/` (closed loop, `probe/` baseline probe) and
+  `/opt/dlami/nvme/lava-tts/prodbench/res/vllm` (open loop, `rates.txt`).
+- Rebuild: `scripts/campaign/repro_gemma12b_h100.sh`.
+
+## Strict reports
+
+### 4096/128, closed loop
+
+Report `/opt/dlami/nvme/lava-tts/final3/report/st4k-fp8/comparison.md`. Arms: baseline `/opt/dlami/nvme/lava-tts/final2/res/st4k/vllm`, Infervisor `/opt/dlami/nvme/lava-tts/final3/res/st4k/fp8`. Gate `/opt/dlami/nvme/lava-tts/final3/gate/fp8/gates.json` (sha256 1e64f6058d79, packet 5fbe627c02af, PASS).
+
+#### g32
+
+Comparison: **MATCHED**; quality: **EQUIVALENT**
+
+| Metric | Baseline | Infervisor |
 |---|---|---|
-| FATLITE packed prefill | 8.1% lower instrumented prefill time; 5.7% higher long-serving throughput | Tested Plow logits preserved; still behind vLLM |
-| Dedicated cached GLU+quant | 2.5–3.4% lower block time across six rungs | Four-arm block measurements; 13 full-model packed-prefill plus decode cases bit-exact against Plow control |
-| Lightweight FP8 attention route | 8.6% lower decode time | Four-arm decode measurement; tested Plow logits preserved |
-| B128 FP8-KV light attention on cached norm/quant | 4.80% lower decode-step latency at 128-token context; 4.82% at 4K | Four-arm, 40-step packet measurements; matching token digests and one-step full logits vs Plow control; 48 six-launch routes confirmed by Nsight. Attention remains about 13.7% of its conditional roofline; no vLLM quality or serving qualification. |
-| B128 cuBLASLt output head | 13.38% lower decode-step latency at 128-token context; 5.40% at 4K | Four-arm, 40-step packet measurements; matching token digests. One-step 128/128 top-1 logits match Plow control (max KL 2.17×10⁻⁵); Nsight measures the Lt head at 0.699 ms plus 0.065 ms softcap/argmax. Matched-vLLM quality and serving are not qualified. |
-| B128 head-Lt plus FP8 light attention | Further 4.96% lower decode-step latency at 128-token context; 3.21% at 4K vs the head-only packet | Four-arm, 40-step packet measurements with matching digests; one-step full logits byte-identical to head-only. Nsight confirms both routes; attention remains far below its estimated roofline. No matched-vLLM qualification. |
-| B128 FP8 attention with 16-byte loads | Further 2.76% lower decode-step latency at 128-token context; 6.71% at 4K vs head-Lt plus FP8 light attention | Four-arm, 40-step packet measurements with matching token digests; one-step B128 full logits and pre-head tensors byte-identical. Nsight attributes 0.503 ms of a 0.465 ms shorter short-context graph to attention. Experimental: no matched-vLLM quality or serving qualification. |
-| B128 direct FP8 value conversion with 16-byte K loads | Further 1.65% lower decode-step latency at 128-token context; 4.49% at 4K; 3.24% at 15K vs 16-byte-load packet | Four-arm, 40-step packet measurements at all three contexts with matching token digests; one-step full logits and pre-head tensors byte-identical. Nsight attributes 0.273 ms of a 0.274 ms shorter short-context graph to sliding attention. Exact opt-in cubin flags and hash are in the scratch build record. Experimental: matched-vLLM quality and serving remain open. |
-| B128 segmented FP8 HD256 FlashDecode with a 1,024-block grid | 10.7% lower decode-step latency at 128-token context and 9.6% at 4K vs the preceding packet; 7.0% higher sampled short-serving output throughput vs its Plow control | Four-arm, 40-step A/B/A/B with matching token digests; one-step full logits and pre-head tensors byte-identical at 128 and 4K. Nsight confirms 40 dedicated launches, 95 registers, 11,328 B dynamic shared memory, zero spills. Serving at 128 concurrent requests used the same runtime and 16K/128-slot packet in both arms, two repeats, zero Plow prefix hits. The sampled serving repeat spread was under 0.5%; greedy repeats had 12–13% spread. Still below matched vLLM. Failed the retired bit-exact vLLM gate; passes the FP32-reference quality gate below. |
+| Model / version | gemma-4-12b-it-fp8 (config+weights 68f098a76c2b) | Same as baseline |
+| Precision / quantization | weights compressed-tensors W8 float per-channel, A8 float dynamic per-token; KV cache fp8_per_token_head | Same as baseline |
+| Input / output length | 4096 / 128 tokens | Same as baseline |
+| Traffic / concurrency | greedy (T=0), 96 prompts, request rate inf / concurrency 32 | Same as baseline |
+| GPU type & count | 1 x NVIDIA H100 80GB HBM3 | Same as baseline |
+| Serving stack | vLLM 0.28.0 (--gpu-memory-utilization 0.9 --max-num-seqs 256 --dtype bfloat16 --max-model-len 16384 --attention-backend TRITON_ATTN --kv-cache-dtype fp8_per_token_head --enable-prefix-caching --max-num-batched-tokens 8192 --enable-prompt-tokens-details) | Infervisor (plowrt ee57f7b7a084baab3295e7015bd4136a43afc17e, packet 5fbe627c02af) |
+| Output quality / correctness | FP32-reference gate peer (kl_mean 0.1277, top1_decisive 0.9823, needle_acc 1) | Equivalent |
+| Peak GPU memory | 73.0 GiB | 77.6 GiB (1.06x) |
+| Total throughput | 13,145 tok/s | 18,177 tok/s (1.38x) |
+| Throughput / GPU | 13,145 tok/s/GPU | 18,177 tok/s/GPU (1.38x) |
+| TTFT P99 | 7,770.7 ms | 5,419.1 ms (0.70x) |
+| TPOT P99 | 77.85 ms | 54.43 ms (0.70x) |
 
-The resumed H100 single-kernel packed FP8 HD256 prefill trial selected `PLOW_NV_FA_PIPE=1` with `PLOW_NV_FP8_PACKED_VARLEN=1`. At 16 packed requests and 2,048 query rows, mean CUDA-event time across two repeats fell from 6.5731 to 0.2683 ms at KV position 256, 10.4859 to 0.3621 ms at 4K, and 10.7184 to 0.3724 ms at 15K versus the existing `PIPE=0`, serial-request wrapper. A ragged four-request case fell from 0.3445 to 0.0504 ms. All four precision/scheduling variants passed the independent FP32 gate and byte-exact packed-versus-direct BF16 output checks. These are wrapper timings, not packet or serving gains. The conditional compulsory-byte/compute floor is about 10% of measured time at the three 16-request shapes. The packet-matched dedicated candidate cubin (`9c66eeab…`) builds with 255 registers and 160/188 bytes of reported spill stores/loads.
+Spread over 2 repeats, (max - min) / mean, Baseline / Infervisor: Peak GPU memory 0.0% / 0.4%; Total throughput 0.0% / 1.0%; Throughput / GPU 0.0% / 1.0%; TTFT P99 0.8% / 3.6%; TPOT P99 0.3% / 0.4%.
 
-A synthetic one-op packet launched through that dedicated interpreter cubin preserved byte-exact BF16 output against direct per-request calls. With matched dedicated objects differing only in flat scheduling, two-repeat mean cubin time fell from 1.2890 to 0.3666 ms at KV position 256, 1.8563 to 0.4809 ms at 4K, and 1.9011 to 0.4924 ms at 15K: 3.52×, 3.86× and 3.86× faster. The ragged four-request case improved 0.1388 to 0.0670 ms. The conditional floor is still only 7.3–7.4% of the three 16-request cubin times; hardware-counter roofline, block qualification and matched serving remain open. Exact compiler commands, hashes, per-repeat results and the floor model are in `packed-bench-build/production-flags/actual-cubin-ab.json` and `head-lt-build/grid-trial/fp8-fa-varlen0-matched/build-record.json` under the campaign scratch directory. No production recipe or matched-vLLM win follows from this isolated result.
+#### g128
 
-The next layer-0 block A/B used one Lean-verified 16K/128-slot FP8-KV packet and two complete, packet-matched 18-cubin object sets differing only in the dedicated packed-attention cubin. The ragged two-request check passed with byte-identical activation, FP8 KV and scales across both arms and against each arm's serial reference. For 16 requests and 2,048 query rows, one exploratory block timing per arm was 3.3782→2.4099 ms at KV position 256, 3.9385→2.5003 ms at 4K, and 3.9963→2.5126 ms at 15K. Packed activation and FP8 KV/scale bytes were identical between the two arms at every shape. The block's serial-vs-packed FP8 KV and scales were also exact, but final BF16 activations differed by about 0.45–0.47% relative L2 with a 0.25 maximum, exceeding the existing absolute parity bound. At fixed 16-request concurrency, 1,152 query rows were byte-exact and 1,168 rows failed, exactly where the packet switches from its 1,152-row to 2,048-row prefill bucket; 8 requests × 256 rows also failed, while 16 × 64 passed. Intermediate dumps localize the first difference to the cuBLASLt FP8 `down_proj` output (`act.dg`): its quantized input and scales, both feed-forward projection outputs, the normalized input, and the attention output projection are byte-identical. `act.dg` differs by 0.413% relative L2 in the first request. This block gate remains **failed** pending a quality decision against an independent reference. The timing is a single, host-inclusive observation, not a repeated kernel roofline or serving result. Nsight Compute initially could not access hardware counters as the ordinary user (`ERR_NVGPUCTRPERM`), so the earlier conditional floor is not counter-verified. Raw logs and dumps are under `head-lt-build/grid-trial/block-fa-probe` in campaign scratch; no candidate is promoted.
+Comparison: **MATCHED**; quality: **EQUIVALENT**
 
-Privileged Nsight Compute profiling of the actual flat dedicated cubin at the 16-request/2,048-row shapes measured 12.5% occupancy (one 256-thread block per SM), 255 registers/thread and 132,160 bytes dynamic shared memory. DRAM throughput was 6.14%, 5.88%, and 5.79% of peak at KV positions 256, 4K, and 15K; SM throughput was 27.18%, 30.21%, and 30.06%. L2 hit rates were 83.41%, 82.42%, and 82.25% on the repeated synthetic input. About 68% of scheduler cycles had no eligible warp; fixed-latency waits and short scoreboards dominated the stall sample. The serial-request cubin had the same 12.5% occupancy and similar per-SM active work, but its short-rung profiled duration was 1.48 ms versus 0.395 ms for flat scheduling, consistent with work imbalance across SMs. The candidate is **not at a measured roofline**; register/shared-memory occupancy and dependent instruction latency are the next kernel targets. An HD256-only object trial retained the same register, spill and shared-memory counts, so pruning the HD512 arm alone is insufficient. Profiler reports and the rejected compile trial are in `packed-bench-build/production-flags` and `head-lt-build/grid-trial/block-fa-probe/hd256-only-trial` in campaign scratch. These counter readings are from an isolated synthetic one-op packet, not full-model serving.
+| Metric | Baseline | Infervisor |
+|---|---|---|
+| Model / version | gemma-4-12b-it-fp8 (config+weights 68f098a76c2b) | Same as baseline |
+| Precision / quantization | weights compressed-tensors W8 float per-channel, A8 float dynamic per-token; KV cache fp8_per_token_head | Same as baseline |
+| Input / output length | 4096 / 128 tokens | Same as baseline |
+| Traffic / concurrency | greedy (T=0), 384 prompts, request rate inf / concurrency 128 | Same as baseline |
+| GPU type & count | 1 x NVIDIA H100 80GB HBM3 | Same as baseline |
+| Serving stack | vLLM 0.28.0 (--gpu-memory-utilization 0.9 --max-num-seqs 256 --dtype bfloat16 --max-model-len 16384 --attention-backend TRITON_ATTN --kv-cache-dtype fp8_per_token_head --enable-prefix-caching --max-num-batched-tokens 8192 --enable-prompt-tokens-details) | Infervisor (plowrt ee57f7b7a084baab3295e7015bd4136a43afc17e, packet 5fbe627c02af) |
+| Output quality / correctness | FP32-reference gate peer (kl_mean 0.1277, top1_decisive 0.9823, needle_acc 1) | Equivalent |
+| Peak GPU memory | 73.0 GiB | 77.7 GiB (1.06x) |
+| Total throughput | 15,004 tok/s | 20,547 tok/s (1.37x) |
+| Throughput / GPU | 15,004 tok/s/GPU | 20,547 tok/s/GPU (1.37x) |
+| TTFT P99 | 30,953.8 ms | 23,694.6 ms (0.77x) |
+| TPOT P99 | 275.42 ms | 98.23 ms (0.36x) |
 
-The latest matched short-serving comparison uses Gemma-4-12B-IT-FP8 on one H100 SXM, FP8 weights and per-token-head FP8 KV on both stacks, 128 input / 128 output tokens, concurrency 128, the same vLLM 0.28.0 client, and prefix caching enabled. The table reports the mean of two repeats; both arms completed 384 requests per repeat without failures. Plow's tested outputs match its control byte-for-byte, but only 37/64 exact-history decode top-1 tokens matched the vLLM oracle in the exact-match quality test. That test is retired as the promotion gate: its flips are near-ties and vLLM's own repeat floor is zero. See the FP32-reference gate below.
+Spread over 2 repeats, (max - min) / mean, Baseline / Infervisor: Peak GPU memory 0.0% / 0.0%; Total throughput 0.1% / 0.1%; Throughput / GPU 0.1% / 0.1%; TTFT P99 0.6% / 0.1%; TPOT P99 0.4% / 0.0%.
 
-| Traffic | Stack | Output tok/s/GPU | TTFT P99 ms | TPOT P99 ms | Peak GPU memory GiB |
-|---|---|---:|---:|---:|---:|
-| Greedy | Infervisor, dedicated grid | 4,002 | 3,052 | 36.98 | 63.23 |
-| Greedy | vLLM 0.28.0 | 6,116 | 1,558 | 17.51 | 72.85 |
-| Sampled | Infervisor, dedicated grid | 4,228 | 2,222 | 31.67 | 63.41 |
-| Sampled | vLLM 0.28.0 | 6,552 | 647 | 18.20 | 72.85 |
+### 15000/128, closed loop
 
-The greedy throughput repeat spreads were 13.4% for Infervisor and 24.5% for vLLM, so those means are diagnostic. Sampled spreads were 0.47% and 1.28%. Plow's measured prefix hit rate was zero; vLLM's token hit rate was 0.2–0.5%. The user-reported production 20% versus 80% cache-hit gap is not reproduced by this unique-prompt grid. The candidate remains experimental. The main FP8-KV cubin uses `PLOW_NV_LIGHT_FP8_ATTN=1`, `PLOW_FP8_LD16=1` and `PLOW_FP8_FAST=1` on the existing H100 Gemma FP8 flag set; the isolated sweep used `PX11_GRID_MULT=8`. Its exact cubin command, source hashes and binary hashes are in `head-lt-build/grid-trial/build-record.json` under the campaign scratch directory; per-repeat serving data are in the single `serving-summary.csv` there. The 15K tensor capture was stopped at the user's request, so long-context validation of this dedicated route remains open.
+Report `/opt/dlami/nvme/lava-tts/final3/report/st15k-fp8/comparison.md`. Arms: baseline `/opt/dlami/nvme/lava-tts/final2/res/st15k/vllm`, Infervisor `/opt/dlami/nvme/lava-tts/final3/res/st15k/fp8`. Gate `/opt/dlami/nvme/lava-tts/final3/gate/fp8/gates.json` (sha256 1e64f6058d79, packet 5fbe627c02af, PASS).
+
+#### g32
+
+Comparison: **MATCHED**; quality: **EQUIVALENT**
+
+| Metric | Baseline | Infervisor |
+|---|---|---|
+| Model / version | gemma-4-12b-it-fp8 (config+weights 68f098a76c2b) | Same as baseline |
+| Precision / quantization | weights compressed-tensors W8 float per-channel, A8 float dynamic per-token; KV cache fp8_per_token_head | Same as baseline |
+| Input / output length | 15000 / 128 tokens | Same as baseline |
+| Traffic / concurrency | greedy (T=0), 96 prompts, request rate inf / concurrency 32 | Same as baseline |
+| GPU type & count | 1 x NVIDIA H100 80GB HBM3 | Same as baseline |
+| Serving stack | vLLM 0.28.0 (--gpu-memory-utilization 0.9 --max-num-seqs 256 --dtype bfloat16 --max-model-len 16384 --attention-backend TRITON_ATTN --kv-cache-dtype fp8_per_token_head --enable-prefix-caching --max-num-batched-tokens 8192 --enable-prompt-tokens-details) | Infervisor (plowrt ee57f7b7a084baab3295e7015bd4136a43afc17e, packet 5fbe627c02af) |
+| Output quality / correctness | FP32-reference gate peer (kl_mean 0.1277, top1_decisive 0.9823, needle_acc 1) | Equivalent |
+| Peak GPU memory | 73.0 GiB | 77.7 GiB (1.06x) |
+| Total throughput | 9,567 tok/s | 17,111 tok/s (1.79x) |
+| Throughput / GPU | 9,567 tok/s/GPU | 17,111 tok/s/GPU (1.79x) |
+| TTFT P99 | 45,534.3 ms | 25,888.7 ms (0.57x) |
+| TPOT P99 | 382.92 ms | 114.50 ms (0.30x) |
+
+Spread over 2 repeats, (max - min) / mean, Baseline / Infervisor: Peak GPU memory 0.0% / 0.1%; Total throughput 0.0% / 0.3%; Throughput / GPU 0.0% / 0.3%; TTFT P99 0.1% / 0.8%; TPOT P99 0.0% / 0.3%.
+
+#### g128
+
+Comparison: **MATCHED**; quality: **EQUIVALENT**
+
+| Metric | Baseline | Infervisor |
+|---|---|---|
+| Model / version | gemma-4-12b-it-fp8 (config+weights 68f098a76c2b) | Same as baseline |
+| Precision / quantization | weights compressed-tensors W8 float per-channel, A8 float dynamic per-token; KV cache fp8_per_token_head | Same as baseline |
+| Input / output length | 15000 / 128 tokens | Same as baseline |
+| Traffic / concurrency | greedy (T=0), 384 prompts, request rate inf / concurrency 128 | Same as baseline |
+| GPU type & count | 1 x NVIDIA H100 80GB HBM3 | Same as baseline |
+| Serving stack | vLLM 0.28.0 (--gpu-memory-utilization 0.9 --max-num-seqs 256 --dtype bfloat16 --max-model-len 16384 --attention-backend TRITON_ATTN --kv-cache-dtype fp8_per_token_head --enable-prefix-caching --max-num-batched-tokens 8192 --enable-prompt-tokens-details) | Infervisor (plowrt ee57f7b7a084baab3295e7015bd4136a43afc17e, packet 5fbe627c02af) |
+| Output quality / correctness | FP32-reference gate peer (kl_mean 0.1277, top1_decisive 0.9823, needle_acc 1) | Equivalent |
+| Peak GPU memory | 73.0 GiB | 77.7 GiB (1.06x) |
+| Total throughput | 9,895 tok/s | 17,269 tok/s (1.75x) |
+| Throughput / GPU | 9,895 tok/s/GPU | 17,269 tok/s/GPU (1.75x) |
+| TTFT P99 | 186,793.9 ms | 106,551.3 ms (0.57x) |
+| TPOT P99 | 825.66 ms | 115.74 ms (0.14x) |
+
+Spread over 2 repeats, (max - min) / mean, Baseline / Infervisor: Peak GPU memory 0.0% / 0.0%; Total throughput 0.1% / 0.1%; Throughput / GPU 0.1% / 0.1%; TTFT P99 0.1% / 0.3%; TPOT P99 0.0% / 0.0%.
+
+### agentic16k (`llm_grid.sh --agentic`)
+
+Report `/opt/dlami/nvme/lava-tts/final3/report/agentic-fp8/comparison.md`. Arms: baseline `/opt/dlami/nvme/lava-tts/final2/res/agentic/vllm`, Infervisor `/opt/dlami/nvme/lava-tts/final3/res/agentic/fp8`. Gate `/opt/dlami/nvme/lava-tts/final3/gate/fp8/gates.json` (sha256 1e64f6058d79, packet 5fbe627c02af, PASS).
+
+#### a32.g
+
+Comparison: **MATCHED**; quality: **EQUIVALENT**
+
+| Metric | Baseline | Infervisor |
+|---|---|---|
+| Model / version | gemma-4-12b-it-fp8 (config+weights 68f098a76c2b) | Same as baseline |
+| Precision / quantization | weights compressed-tensors W8 float per-channel, A8 float dynamic per-token; KV cache fp8_per_token_head | Same as baseline |
+| Input / output length | agentic 10 turns, system 1536, prompt grows to 15600 / 128 tokens per turn | Same as baseline |
+| Traffic / concurrency | greedy (T=0), chat API, closed-loop sessions, session header on / concurrency 32 sessions | Same as baseline |
+| GPU type & count | 1 x NVIDIA H100 80GB HBM3 | Same as baseline |
+| Serving stack | vLLM 0.28.0 (--gpu-memory-utilization 0.9 --max-num-seqs 256 --dtype bfloat16 --max-model-len 16384 --attention-backend TRITON_ATTN --kv-cache-dtype fp8_per_token_head --enable-prefix-caching --max-num-batched-tokens 8192 --enable-prompt-tokens-details) | Infervisor (plowrt ee57f7b7a084baab3295e7015bd4136a43afc17e, packet 5fbe627c02af) |
+| Output quality / correctness | FP32-reference gate peer (kl_mean 0.1277, top1_decisive 0.9823, needle_acc 1) | Equivalent |
+| Peak GPU memory | 73.3 GiB | 77.7 GiB (1.06x) |
+| Total throughput | 35,035 tok/s | 49,087 tok/s (1.40x) |
+| Throughput / GPU | 35,035 tok/s/GPU | 49,087 tok/s/GPU (1.40x) |
+| TTFT P99 | 3,818.5 ms | 2,186.8 ms (0.57x) |
+| TPOT P99 | 82.04 ms | 54.76 ms (0.67x) |
+
+Spread over 2 repeats, (max - min) / mean, Baseline / Infervisor: Peak GPU memory 0.0% / 0.2%; Total throughput 0.2% / 4.1%; Throughput / GPU 0.2% / 4.1%; TTFT P99 4.2% / 7.7%; TPOT P99 3.6% / 1.4%.
+
+#### a64.g
+
+Comparison: **MATCHED**; quality: **EQUIVALENT**
+
+| Metric | Baseline | Infervisor |
+|---|---|---|
+| Model / version | gemma-4-12b-it-fp8 (config+weights 68f098a76c2b) | Same as baseline |
+| Precision / quantization | weights compressed-tensors W8 float per-channel, A8 float dynamic per-token; KV cache fp8_per_token_head | Same as baseline |
+| Input / output length | agentic 10 turns, system 1536, prompt grows to 15600 / 128 tokens per turn | Same as baseline |
+| Traffic / concurrency | greedy (T=0), chat API, closed-loop sessions, session header on / concurrency 64 sessions | Same as baseline |
+| GPU type & count | 1 x NVIDIA H100 80GB HBM3 | Same as baseline |
+| Serving stack | vLLM 0.28.0 (--gpu-memory-utilization 0.9 --max-num-seqs 256 --dtype bfloat16 --max-model-len 16384 --attention-backend TRITON_ATTN --kv-cache-dtype fp8_per_token_head --enable-prefix-caching --max-num-batched-tokens 8192 --enable-prompt-tokens-details) | Infervisor (plowrt ee57f7b7a084baab3295e7015bd4136a43afc17e, packet 5fbe627c02af) |
+| Output quality / correctness | FP32-reference gate peer (kl_mean 0.1277, top1_decisive 0.9823, needle_acc 1) | Equivalent |
+| Peak GPU memory | 73.3 GiB | 77.8 GiB (1.06x) |
+| Total throughput | 42,380 tok/s | 55,530 tok/s (1.31x) |
+| Throughput / GPU | 42,380 tok/s/GPU | 55,530 tok/s/GPU (1.31x) |
+| TTFT P99 | 5,371.2 ms | 4,219.9 ms (0.79x) |
+| TPOT P99 | 139.29 ms | 99.35 ms (0.71x) |
+
+Spread over 2 repeats, (max - min) / mean, Baseline / Infervisor: Peak GPU memory 0.0% / 0.0%; Total throughput 0.0% / 2.0%; Throughput / GPU 0.0% / 2.0%; TTFT P99 1.1% / 0.3%; TPOT P99 0.2% / 2.6%.
+
+#### a128.g
+
+Comparison: **MATCHED**; quality: **EQUIVALENT**
+
+| Metric | Baseline | Infervisor |
+|---|---|---|
+| Model / version | gemma-4-12b-it-fp8 (config+weights 68f098a76c2b) | Same as baseline |
+| Precision / quantization | weights compressed-tensors W8 float per-channel, A8 float dynamic per-token; KV cache fp8_per_token_head | Same as baseline |
+| Input / output length | agentic 10 turns, system 1536, prompt grows to 15600 / 128 tokens per turn | Same as baseline |
+| Traffic / concurrency | greedy (T=0), chat API, closed-loop sessions, session header on / concurrency 128 sessions | Same as baseline |
+| GPU type & count | 1 x NVIDIA H100 80GB HBM3 | Same as baseline |
+| Serving stack | vLLM 0.28.0 (--gpu-memory-utilization 0.9 --max-num-seqs 256 --dtype bfloat16 --max-model-len 16384 --attention-backend TRITON_ATTN --kv-cache-dtype fp8_per_token_head --enable-prefix-caching --max-num-batched-tokens 8192 --enable-prompt-tokens-details) | Infervisor (plowrt ee57f7b7a084baab3295e7015bd4136a43afc17e, packet 5fbe627c02af) |
+| Output quality / correctness | FP32-reference gate peer (kl_mean 0.1277, top1_decisive 0.9823, needle_acc 1) | Equivalent |
+| Peak GPU memory | 73.3 GiB | 77.8 GiB (1.06x) |
+| Total throughput | 12,553 tok/s | 50,475 tok/s (4.02x) |
+| Throughput / GPU | 12,553 tok/s/GPU | 50,475 tok/s/GPU (4.02x) |
+| TTFT P99 | 82,042.6 ms | 12,820.7 ms (0.16x) |
+| TPOT P99 | 892.14 ms | 210.47 ms (0.24x) |
+
+Spread over 2 repeats, (max - min) / mean, Baseline / Infervisor: Peak GPU memory 0.0% / 0.0%; Total throughput 0.1% / 0.3%; Throughput / GPU 0.1% / 0.3%; TTFT P99 0.1% / 1.7%; TPOT P99 0.1% / 0.5%.
+
+### open-loop production mix (`llm_grid.sh --prod`)
+
+Report `/opt/dlami/nvme/lava-tts/final3/report/prod-fp8/comparison.md`. Arms: baseline `/opt/dlami/nvme/lava-tts/prodbench/res/vllm`, Infervisor `/opt/dlami/nvme/lava-tts/final3/res/prod/fp8`. Gate `/opt/dlami/nvme/lava-tts/final3/gate/fp8/gates.json` (sha256 1e64f6058d79, packet 5fbe627c02af, PASS).
+
+#### q628.g
+
+Comparison: **MATCHED**; quality: **EQUIVALENT**
+
+| Metric | Baseline | Infervisor |
+|---|---|---|
+| Model / version | gemma-4-12b-it-fp8 (config+weights 68f098a76c2b) | Same as baseline |
+| Precision / quantization | weights compressed-tensors W8 float per-channel, A8 float dynamic per-token; KV cache fp8_per_token_head | Same as baseline |
+| Input / output length | open-loop mix: 4 system prompts (lognormal median 1536), turns geometric mean 6 max 20, first message lognormal(1500, 1), tool output lognormal(700, 1), context cap 16384 / output lognormal(160, 0.7) in [16, 1024] tokens, ignore_eos | Same as baseline |
+| Traffic / concurrency | greedy (T=0), chat API, Poisson 0.628 sessions/s, think lognormal(5 s, 0.8) <= 60 s, 300 s (measured 75-275 s), session header on / open loop (achieved concurrency in the supplementary note), seeds 1099191/1107110 | Same as baseline |
+| GPU type & count | 1 x NVIDIA H100 80GB HBM3 | Same as baseline |
+| Serving stack | vLLM 0.28.0 (--gpu-memory-utilization 0.9 --max-num-seqs 256 --dtype bfloat16 --max-model-len 16384 --attention-backend TRITON_ATTN --kv-cache-dtype fp8_per_token_head --enable-prefix-caching --max-num-batched-tokens 8192 --enable-prompt-tokens-details) | Infervisor (plowrt ee57f7b7a084baab3295e7015bd4136a43afc17e, packet 5fbe627c02af) |
+| Output quality / correctness | FP32-reference gate peer (kl_mean 0.1277, top1_decisive 0.9823, needle_acc 1) | Equivalent |
+| Peak GPU memory | 72.9 GiB | 77.8 GiB (1.07x) |
+| Total throughput | 18,611 tok/s | 20,106 tok/s (1.08x) |
+| Throughput / GPU | 18,611 tok/s/GPU | 20,106 tok/s/GPU (1.08x) |
+| TTFT P99 | 1,853.7 ms | 753.9 ms (0.41x) |
+| TPOT P99 | 94.83 ms * | 56.91 ms (0.60x) * |
+
+Spread over 2 repeats, (max - min) / mean, Baseline / Infervisor: Peak GPU memory 0.0% / 0.0%; Total throughput 6.1% / 9.4%; Throughput / GPU 6.1% / 9.4%; TTFT P99 3.0% / 4.2%; TPOT P99 30.4% / 19.0%.
+
+**FLAGGED: spread > 10%: Baseline TPOT P99 30.4%; Infervisor TPOT P99 19.0%.**
+
+Supplementary (outside the strict table; goodput = requests meeting TTFT <= 2000 ms and TPOT <= 100 ms per second, measured window), Baseline / Infervisor: goodput 2.485 req/s / 2.675 req/s; SLO met 98.0% / 100.0%; requests 2.540 req/s / 2.675 req/s; mean in-flight 29.3 / 21.2; mean live sessions 42.7 / 35.5; TTFT P50 275.2 ms / 157.4 ms; TPOT P50 59.92 ms / 38.49 ms; cached prompt tokens 77.2% / 79.0%.
+
+#### q771.g
+
+Comparison: **MATCHED**; quality: **EQUIVALENT**
+
+| Metric | Baseline | Infervisor |
+|---|---|---|
+| Model / version | gemma-4-12b-it-fp8 (config+weights 68f098a76c2b) | Same as baseline |
+| Precision / quantization | weights compressed-tensors W8 float per-channel, A8 float dynamic per-token; KV cache fp8_per_token_head | Same as baseline |
+| Input / output length | open-loop mix: 4 system prompts (lognormal median 1536), turns geometric mean 6 max 20, first message lognormal(1500, 1), tool output lognormal(700, 1), context cap 16384 / output lognormal(160, 0.7) in [16, 1024] tokens, ignore_eos | Same as baseline |
+| Traffic / concurrency | greedy (T=0), chat API, Poisson 0.771 sessions/s, think lognormal(5 s, 0.8) <= 60 s, 300 s (measured 75-275 s), session header on / open loop (achieved concurrency in the supplementary note), seeds 1117924/1125843 | Same as baseline |
+| GPU type & count | 1 x NVIDIA H100 80GB HBM3 | Same as baseline |
+| Serving stack | vLLM 0.28.0 (--gpu-memory-utilization 0.9 --max-num-seqs 256 --dtype bfloat16 --max-model-len 16384 --attention-backend TRITON_ATTN --kv-cache-dtype fp8_per_token_head --enable-prefix-caching --max-num-batched-tokens 8192 --enable-prompt-tokens-details) | Infervisor (plowrt ee57f7b7a084baab3295e7015bd4136a43afc17e, packet 5fbe627c02af) |
+| Output quality / correctness | FP32-reference gate peer (kl_mean 0.1277, top1_decisive 0.9823, needle_acc 1) | Equivalent |
+| Peak GPU memory | 72.9 GiB | 77.8 GiB (1.07x) |
+| Total throughput | 18,868 tok/s | 22,195 tok/s (1.18x) |
+| Throughput / GPU | 18,868 tok/s/GPU | 22,195 tok/s/GPU (1.18x) |
+| TTFT P99 | 3,790.5 ms * | 1,048.5 ms (0.28x) * |
+| TPOT P99 | 238.80 ms * | 74.57 ms (0.31x) * |
+
+Spread over 2 repeats, (max - min) / mean, Baseline / Infervisor: Peak GPU memory 0.0% / 0.0%; Total throughput 2.8% / 7.5%; Throughput / GPU 2.8% / 7.5%; TTFT P99 64.3% / 62.7%; TPOT P99 36.6% / 31.9%.
+
+**FLAGGED: spread > 10%: Baseline TTFT P99 64.3%; Infervisor TTFT P99 62.7%; Baseline TPOT P99 36.6%; Infervisor TPOT P99 31.9%.**
+
+Supplementary (outside the strict table; goodput = requests meeting TTFT <= 2000 ms and TPOT <= 100 ms per second, measured window), Baseline / Infervisor: goodput 1.980 req/s / 3.103 req/s; SLO met 71.9% / 99.8%; requests 2.745 req/s / 3.107 req/s; mean in-flight 44.1 / 31.9; mean live sessions 58.1 / 48.4; TTFT P50 371.7 ms / 181.8 ms; TPOT P50 75.55 ms / 54.77 ms; cached prompt tokens 69.5% / 75.8%.
+
+#### q987.g
+
+Comparison: **MATCHED**; quality: **EQUIVALENT**
+
+| Metric | Baseline | Infervisor |
+|---|---|---|
+| Model / version | gemma-4-12b-it-fp8 (config+weights 68f098a76c2b) | Same as baseline |
+| Precision / quantization | weights compressed-tensors W8 float per-channel, A8 float dynamic per-token; KV cache fp8_per_token_head | Same as baseline |
+| Input / output length | open-loop mix: 4 system prompts (lognormal median 1536), turns geometric mean 6 max 20, first message lognormal(1500, 1), tool output lognormal(700, 1), context cap 16384 / output lognormal(160, 0.7) in [16, 1024] tokens, ignore_eos | Same as baseline |
+| Traffic / concurrency | greedy (T=0), chat API, Poisson 0.987 sessions/s, think lognormal(5 s, 0.8) <= 60 s, 300 s (measured 75-275 s), session header on / open loop (achieved concurrency in the supplementary note), seeds 1146220/1154139 | Same as baseline |
+| GPU type & count | 1 x NVIDIA H100 80GB HBM3 | Same as baseline |
+| Serving stack | vLLM 0.28.0 (--gpu-memory-utilization 0.9 --max-num-seqs 256 --dtype bfloat16 --max-model-len 16384 --attention-backend TRITON_ATTN --kv-cache-dtype fp8_per_token_head --enable-prefix-caching --max-num-batched-tokens 8192 --enable-prompt-tokens-details) | Infervisor (plowrt ee57f7b7a084baab3295e7015bd4136a43afc17e, packet 5fbe627c02af) |
+| Output quality / correctness | FP32-reference gate peer (kl_mean 0.1277, top1_decisive 0.9823, needle_acc 1) | Equivalent |
+| Peak GPU memory | 72.9 GiB | 77.8 GiB (1.07x) |
+| Total throughput | 17,143 tok/s | 25,689 tok/s (1.50x) |
+| Throughput / GPU | 17,143 tok/s/GPU | 25,689 tok/s/GPU (1.50x) |
+| TTFT P99 | 6,135.4 ms * | 1,381.0 ms (0.23x) * |
+| TPOT P99 | 420.65 ms * | 108.05 ms (0.26x) * |
+
+Spread over 2 repeats, (max - min) / mean, Baseline / Infervisor: Peak GPU memory 0.0% / 0.0%; Total throughput 0.6% / 6.0%; Throughput / GPU 0.6% / 6.0%; TTFT P99 16.7% / 74.6%; TPOT P99 10.4% / 48.2%.
+
+**FLAGGED: spread > 10%: Baseline TTFT P99 16.7%; Infervisor TTFT P99 74.6%; Baseline TPOT P99 10.4%; Infervisor TPOT P99 48.2%.**
+
+Supplementary (outside the strict table; goodput = requests meeting TTFT <= 2000 ms and TPOT <= 100 ms per second, measured window), Baseline / Infervisor: goodput 0.748 req/s / 3.412 req/s; SLO met 26.3% / 87.9%; requests 2.835 req/s / 3.888 req/s; mean in-flight 90.9 / 55.3; mean live sessions 103.2 / 74.6; TTFT P50 1,070.0 ms / 268.5 ms; TPOT P50 188.53 ms / 68.82 ms; cached prompt tokens 48.4% / 70.8%.
 
 ## FP32-reference quality gate
+
+The qualified packet `5fbe627c02af` passed this gate at plowrt `ee57f7b7`
+(`/opt/dlami/nvme/lava-tts/final3/gate/fp8/gates.json`, 2026-10-05): KL mean 0.1048 vs vLLM
+0.1277, KL p99 2.957 vs 3.188, top1_decisive 0.9783 vs 0.9823, cont_frac
+0.627 vs 0.574, needle 1.0 vs 1.0. The `e93e0a64` rebuild `ab1c1d583f8d` also passes
+(`gate/fp8b/`, KL mean 0.1053, top1_decisive 0.981). The calibration run below, which set the
+thresholds, used the earlier grid-trial packet.
 
 Bit-exact agreement with vLLM is replaced as the promotion gate by `campaign.py gate` kind `llm_fp32_ref` ([agent-tools.md §5](../../agent-tools.md#5-numerics-and-retrieval-gates)). Reference: the same `gemma-4-12b-it-fp8` checkpoint dequantized to FP32 weights, FP32 activations, TF32 off, exact attention (H100, torch 2.13, transformers 5.16). Prompt set: 46 cases and 1,172 teacher-forced positions. That is 20 natural-text cases (128 to 15,872 tokens), 8 agentic chat cases (54 to 15,255 tokens) and 18 chat needles (4K and 15,872 tokens). Both stacks are teacher-forced on the FP32 greedy continuation through `/v1/completions` at concurrency 16. Plow is the current best packet: grid-trial dedicated-grid 16K/128-slot FP8-KV, with the `serve-short-grid` serve env and prefix cache on. vLLM is 0.28.0 with the `serve-short-vllm-fp8pth` flags. Each stack was captured twice against the same server.
 
@@ -77,45 +334,3 @@ During the run, plowrt was found to omit a stop token from completions logprobs 
 - Captures in `best/gate/llm_fp32_ref/`: plow `3d79bd08…`, vllm `74a7a572…`.
 - Gate recipe: `best/recipe.toml`.
 
-## Selection and reproduction
-
-Optimize native Plow kernels against the roofline for each rung, then select only the fastest correct implementation. Where cuBLASLt is faster, use the corresponding segmented route. A standalone kernel improvement must survive block and serving validation before promotion.
-
-Maintain one canonical production TOML under `recipes/infervisor`, updated in place with validated per-rung compilation flags, implementation choices and runtime settings. Earlier Gemma 12B trials reside in `scripts/campaign/recipes`; none is production-qualified. A 2.15 GB H100 streaming probe measured up to 3.21 TB/s; the latest B128 short-context attention group still takes 6.70 ms against an approximately 1.07 ms compulsory-byte floor at that bandwidth. This is a proxy ceiling rather than a measured per-kernel hardware-counter roofline.
-
-Detailed manifests, JSON, HTML, logs and kernel audits are archived outside the repository at:
-
-`/opt/dlami/nvme/tmp/gemma12b-main-20260930/repo-evidence-archive-327413c3`
-
-The archive manifest records SHA256s for every moved file. Live artifacts stay in the campaign scratch directory. Append future serving measurements to this CSV and record qualified wins here.
-
-## 128 slots at 16K context (live rings, byte admission)
-
-Not a win. The 16K/B128 BF16-KV packet that ran out of VRAM at load now loads and serves: each 640 MiB sliding ring is committed only while a request owns its slot (`PLOW_VMM_LIVE_RINGS=1` under `PLOW_VMM_PREFIX=1`; idle decode rows write one shared scratch unit), and the mux admits requests by bytes under `PLOW_KV_MEM_UTIL=0.9`. That admits 71-78 requests at 4K and 64 at 15K, against 64 slots on the current packet. Serving is prefill-bound at both lengths, so the extra live requests do not raise output tok/s.
-
-Setup: one H100, greedy, OSL 128, 3×c prompts per cell, same vLLM 0.28 client, Plow runtime `6f3fe2d5` (the margin row uses `da8b526d`). 64-slot = `glu-quant-wpr/full-model` packet with prefix cache off. 128-slot = `production-16k128-lt` packet with prefix cache on and `PLOW_PF_ATTN_GEMM=1`. Values are the mean of two repeats unless marked r1.
-
-| ISL | c | packet | out tok/s | TTFT p50 / p99 s | TPOT p50 / p99 ms | peak GiB | max live |
-|---:|---:|---|---:|---:|---:|---:|---:|
-| 4096 | 64 | 64-slot | 617 | 1.2 / 9.9 | 92 / 99 | 63.3 | 64 |
-| 4096 | 64 | 128-slot | 555 | 1.4 / 10.9 | 98 / 111 | 71.8 | 64 |
-| 4096 | 128 | 64-slot | 616 | 14.3 / 22.4 | 96 / 102 | 63.3 | 64 |
-| 4096 | 128 | 128-slot | 557 | 13.1 / 25.0 | 129 / 136 | 78.2 | 78 |
-| 4096 | 128 | 128-slot, margin charged | 547 | 14.7 / 25.0 | 118 / 126 | 73.0 | 71 |
-| 15000 | 64 | 64-slot | 189 | 22.4 / 40.3 | 158 / 164 | 64.3 | 64 |
-| 15000 | 64 | 128-slot (r1) | 186 | 20.4 / 42.1 | 176 / 179 | 73.7 | 64 |
-| 15000 | 128 | 64-slot | 195 | 61.4 / 80.0 | 172 / 174 | 65.5 | 64 |
-| 15000 | 128 | 128-slot (r1) | 189 | 63.0 / 82.6 | 176 / 179 | 73.7 | 64 |
-| agentic16k | 64 | 128-slot | 301 | 5.9 / 21.7 | 178 / 186 | | |
-| agentic16k | 128 | 128-slot | 290 | 27.8 / 67.0 | 180 / 192 | | |
-| agentic16k | 128 | 64-slot, prefix cache on | 307 | 28.8 / 64.6 | 171 / 179 | | |
-
-The agentic rows use `llm_grid.sh --agentic`, one repeat, with 0-5% prefix hits. A retained 16K session costs about 564 MiB on BF16 KV: a 320 MiB sliding snapshot plus 244 MiB of full-attention blocks.
-
-Memory per request: 640 MiB of sliding ring, plus 16 KiB per full-attention row in 2048-row blocks, plus the admission margin (one prefill bucket, 96 MiB). A 4K request costs about 800 MiB and a 16K request about 960 MiB. The KV budget after load is 56 GiB. The row without the margin charge peaked at 78-80 GiB because admission maps one widest prefill bucket past each request; charging that margin brings the peak to 73 GiB. Prefix-cache snapshots still sit outside the budget.
-
-FP8 KV (`sm90a-h100-tp1-fp8kv-16k-c128-rq1k-live`) would fit 128 × 16K: 320 MiB ring + 8 KiB per row, or about 512 MiB per 16K slot. It cannot serve at 4K yet. Its packed prefill attention costs about 55 ms per riding decode row: a 2112-row pack with 62 riders takes 3.8 s, against 0.17 s for 4096 rows with 63 riders on BF16 KV. `PLOW_TOKEN_BATCH=0` is refused for FP8-KV segmented prefill.
-
-Gates on the 128-slot packets: cached and cold prompts of 0.9K, 3.4K and 8.5K tokens give the same 48 greedy tokens, including with 32 concurrent sharers. Max |Δlogprob| is 0.33 on BF16 KV and 0.12 on FP8 KV; the logprobs are not byte-identical. A raw-prompt 16K needle (3 items × 3 depths × 10) scores 47/90 on BF16 and 41/90 on FP8. Its failures are deterministic by item and depth, so the raw-prompt probe needs the 64-slot baseline before it can count as a gate.
-
-Raw cells and logs: `/opt/dlami/nvme/lava-tts/cap128/serve`.

@@ -54,6 +54,9 @@ pub const VEENA: SpeechProfile = SpeechProfile {
 /// from the per-slot `pos_base`. Classifier-free guidance pairs two slots per request; the
 /// contract scalars (text/speech control ids, sampling, guidance weight) ride as parameters.
 pub const GUIDED_LM_DRIVER: &str = "tts.guided_lm.v1";
+/// Sidecar stage packets beside `model.pkt`, named in the pipeline so the runtime never
+/// hard-codes a file name.
+pub const CODEC_PACKET: &str = "codec.pkt";
 
 pub fn t3_pipeline_section(
     model: &Model,
@@ -78,6 +81,7 @@ pub fn t3_pipeline_section(
     }
     // Prefill layout: [voice rows][start_text, text..., stop_text: table + position][BOS x2];
     // the unconditional CFG member keeps positions but drops the text table.
+    pipe.strings.insert("vocoder.packet".into(), crate::s3gen::PACKET.into());
     pipe.parameters.insert("prompt.bos_repeat".into(), 2);
     pipe.parameters.insert("cfg.uncond_drops_text".into(), 1);
     match t3_text_frontend(dir)? {
@@ -125,6 +129,7 @@ pub fn speech_pipeline_section(
     pipe.driver = DRIVER.into();
     pipe.strings.insert("prompt.template".into(), p.prompt_template.into());
     pipe.strings.insert("prompt.voice_token".into(), p.voice_token.into());
+    pipe.strings.insert("codec.packet".into(), CODEC_PACKET.into());
     let params = &mut pipe.parameters;
     let mut put = |k: String, v: u64| {
         params.insert(k, v);

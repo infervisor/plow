@@ -57,8 +57,8 @@ fn packed_runtime_tables_are_excluded_from_both_weight_consumers() {
     let m = plow_asset::packed_prefill::Manifest {
         version: 1,
         max_request_rows: None,
-        stage_rows: None,
-        stages: Vec::new(),
+        stage_rows: Some(1024),
+        stages: vec![plow_asset::packed_prefill::Stage { slot: 8, request: 9 }],
         slot: 4,
         request: 5,
         maps: vec![plow_asset::packed_prefill::Map {
@@ -71,6 +71,8 @@ fn packed_runtime_tables_are_excluded_from_both_weight_consumers() {
         (4, "pf.request.slot"),
         (5, "pf.request.table"),
         (7, "pf.request.maps.6"),
+        (8, "pf.request.slot.0"),
+        (9, "pf.request.table.0"),
     ] {
         assert!(!is_checkpoint_tensor(index, name, Some(&m)));
         assert!(
@@ -87,6 +89,8 @@ fn packed_runtime_tables_are_excluded_from_both_weight_consumers() {
         (5, "pf.request.other"),
         (7, "pf.request.maps.9"),
         (6, "pf.request.maps.6"),
+        (8, "pf.request.slot.1"),
+        (9, "pf.request.slot.0"),
     ] {
         assert!(
             is_checkpoint_tensor(index, name, Some(&m)),
@@ -289,4 +293,16 @@ fn patch_upload_covers_only_the_first_through_last_site() {
         assert_eq!(bytes.len(), range.len() * 64);
         assert_eq!(bytes, &pod_bytes(&insts)[range.start * 64..range.end * 64]);
     }
+}
+
+#[test]
+fn admission_maps_the_rows_launches_can_write_and_no_more() {
+    // Masked padding: prompt + max_tokens + one decode quantum, independent of the bucket.
+    assert_eq!(admission_rows(9_000 + 128, 9_000, 9, None, 16_384), 9_137);
+    // Unmasked padding: a prefilling prompt can be charged a whole bucket of pad rows.
+    assert_eq!(admission_rows(9_000 + 128, 9_000, 9, Some(4_224), 16_384), 13_224);
+    assert_eq!(admission_rows(100 + 8_000, 100, 9, Some(4_224), 16_384), 8_109);
+    // Never past the compiled context.
+    assert_eq!(admission_rows(16_384, 16_000, 9, None, 16_384), 16_384);
+    assert_eq!(admission_rows(16_000, 15_000, 9, Some(4_224), 16_384), 16_384);
 }

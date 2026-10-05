@@ -102,7 +102,7 @@ async fn chat_completions_with(
             use crate::serve::manager::EnsureError;
             if let Err(e) = mgr.ensure_resident(&req.model).await {
                 return match e {
-                    EnsureError::WontFit { .. } => (
+                    EnsureError::WontFit { .. } | EnsureError::SwitchTimeout(_) => (
                         axum::http::StatusCode::SERVICE_UNAVAILABLE,
                         [("retry-after", "30")],
                         Json(serde_json::json!({"error": e.to_string()})),
@@ -179,7 +179,11 @@ async fn chat_completions_with(
             Some("messages".into()),
         );
     }
-    if let Err(e) = req.sampling.validate() {
+    if let Err(e) = req
+        .sampling
+        .validate()
+        .and_then(|()| crate::serve::openai::validate_limits(req.max_tokens, req.stop.as_ref()))
+    {
         return crate::serve::api_error(
             axum::http::StatusCode::BAD_REQUEST,
             e.message,
@@ -200,6 +204,7 @@ async fn chat_completions_with(
     // reference path keeps the simple role-prefix flatten — its logits are a
     // stand-in, so a template would be costume jewelry there.
     let mut template_error: Option<String> = None;
+    let mut no_template: Option<String> = None;
     let render_opts = crate::serve::template::RenderOpts {
         kwargs: req.chat_template_kwargs.clone().unwrap_or_default(),
         reasoning_effort: req.reasoning_effort.clone(),
@@ -235,7 +240,21 @@ async fn chat_completions_with(
                     }
                 }
             }
-            gpu_chat_prompt(tok.as_deref(), &req.messages)
+            match tok.as_deref().map(|b| b.serve()) {
+                // A packet that names a built-in builder gets exactly it. One that carries neither
+                // a usable template nor a builder (checkpoints without a template, e.g. Kimi-K3)
+                // keeps the vocabulary-probed builders it was served with before serve.json.
+                Some(serve) if serve.from_packet => {
+                    match serve.manifest.chat.as_ref().and_then(|c| c.builtin.as_deref()) {
+                        Some(id) => builtin_chat_prompt(id, &req.messages).unwrap_or_else(|| {
+                            no_template = Some(format!("unknown built-in chat format {id:?}"));
+                            String::new()
+                        }),
+                        None => gpu_chat_prompt(tok.as_deref(), &req.messages),
+                    }
+                }
+                _ => gpu_chat_prompt(tok.as_deref(), &req.messages),
+            }
         } else {
             let mut prompt = String::new();
             for m in &req.messages {
@@ -250,6 +269,15 @@ async fn chat_completions_with(
         }
     });
 
+    if let Some(e) = no_template {
+        return crate::serve::api_error(
+            axum::http::StatusCode::BAD_REQUEST,
+            format!("{e}; use /v1/completions"),
+            "invalid_request_error",
+            Some("chat_template_missing"),
+            Some("messages".into()),
+        );
+    }
     if let Some(e) = template_error {
         return crate::serve::api_error(
             axum::http::StatusCode::BAD_REQUEST,
@@ -364,17 +392,35 @@ async fn chat_completions_with(
     let ingress = mux.ingress();
     // Tokenize HERE, on the handler task — the dispatcher loop is the
     // serialized decode critical path and must never encode a long prompt.
-    // `ThinkTag` unconditionally: the splitter's own `Deciding` state settles
-    // after the first few bytes of generation, so a model that never reasons
-    // costs at most a 7-byte delay on its first chunk and nothing after. What
-    // the PROMPT decides is only whether the trace is already open (GLM leaves
-    // it dangling; Qwen3 and DeepSeek-R1 emit the marker themselves).
-    let reasoning_mode = crate::serve::reasoning::ReasoningMode::ThinkTag;
-    let reasoning_open = crate::serve::reasoning::ReasoningMode::prompt_opens(&prompt);
+    // The packet's reasoning markers (`<think>` for a legacy packet): the splitter's own
+    // `Deciding` state settles after the first few bytes of generation, so a model that never
+    // reasons costs at most a marker-length delay on its first chunk. What the PROMPT decides is
+    // only whether the trace is already open (GLM leaves it dangling; Qwen3 and DeepSeek-R1 emit
+    // the marker themselves).
+    let reasoning_mode = crate::serve::reasoning::ReasoningMode::for_bundle(&bundle);
+    let reasoning_open = reasoning_mode.prompt_opens(&prompt);
+    if let Some(e) = crate::serve::prompt_bytes_overflow(state.max_ctx(&req.model), bundle.tokenizer().max_token_bytes(), prompt.len()) {
+        return crate::serve::api_error_for(&e);
+    }
     let prompt_ids = crate::obs::ttft::timed(&crate::obs::ttft::ENCODE, || {
-        bundle.tokenizer().encode(&prompt)
+        crate::serve::encode_prompt(&prompt, |p| bundle.tokenizer().encode(p))
     });
     let n_prompt = prompt_ids.len();
+    if prompt_ids.is_empty() {
+        return crate::serve::api_error(
+            axum::http::StatusCode::BAD_REQUEST,
+            "the conversation renders to zero prompt tokens",
+            "invalid_request_error",
+            Some("invalid_prompt"),
+            Some("messages".into()),
+        );
+    }
+    if req.max_tokens.is_none() {
+        gen.max_tokens = crate::serve::default_max_tokens(gen.max_tokens, state.max_ctx(&req.model), n_prompt);
+    }
+    if let Some(e) = crate::serve::context_overflow(state.max_ctx(&req.model), n_prompt, gen.max_tokens) {
+        return crate::serve::api_error_for(&e);
+    }
     let lp_fmt = gen.params.logprobs.map(|_| crate::serve::logprobs::TokenText {
         tok: bundle.tokenizer().clone(),
         as_ids: req.return_tokens_as_token_ids.unwrap_or(false),
@@ -488,6 +534,19 @@ async fn chat_completions_with(
 /// which another checkpoint's tokenizer spells out as literal text.
 ///
 /// Unknown family → Gemma's format, the previous behavior.
+/// The built-in prompt builder a packet names (`serve.json` `chat.builtin`), for checkpoints that
+/// ship no template.
+fn builtin_chat_prompt(id: &str, messages: &[Message]) -> Option<String> {
+    Some(match id {
+        "k3" => k3_chat_prompt(messages),
+        "harmony" => harmony_chat_prompt(messages),
+        "glm" => glm_chat_prompt(messages),
+        "llama3" => llama3_chat_prompt(messages),
+        "gemma" => gemma_chat_prompt(messages),
+        _ => return None,
+    })
+}
+
 fn gpu_chat_prompt(bundle: Option<&crate::asset::ModelBundle>, messages: &[Message]) -> String {
     let one = |m: &str| {
         bundle

@@ -117,18 +117,25 @@ impl Riders {
         let (mut max_heads, mut max_hd) = (0u64, 0u64);
         let mut sites = Vec::with_capacity(e.prefill.len());
         for bucket in &e.prefill {
+            // A staged layer's riders attend after its first stage, which wrote their rows.
+            let flash_sites: Vec<usize> = bucket
+                .flash_sites
+                .iter()
+                .copied()
+                .filter(|&pc| bucket.stage_of.get(pc).copied().flatten().unwrap_or(0) == 0)
+                .collect();
             let Some(bucket_sites) = (|| {
                 if !uses_segmented_prefill(true, false, bucket.seg_class.len(), &bucket.packet_segment_roles)
                     || !bucket.qwen_segments.is_empty()
-                    || bucket.flash_sites.len() != decode_sites.len()
+                    || flash_sites.len() != decode_sites.len()
                 {
                     return None;
                 }
                 let segment_of = |pc: usize| {
                     bucket.segment_sites.iter().position(|s| s.iter().any(|&(i, _)| i == pc))
                 };
-                let mut out = Vec::with_capacity(bucket.flash_sites.len());
-                for (&pc, d) in bucket.flash_sites.iter().zip(&decode_sites) {
+                let mut out = Vec::with_capacity(flash_sites.len());
+                for (&pc, d) in flash_sites.iter().zip(&decode_sites) {
                     let p = &bucket.h_inst[pc];
                     let hd = p.i[6];
                     let seg = segment_of(pc)?;

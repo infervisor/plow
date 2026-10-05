@@ -109,38 +109,19 @@ impl Manifest {
         Ok(())
     }
 
-    /// Does this instruction already carry a STAGE's tables rather than the whole chunk's?
-    ///
-    /// A staged site is bound at emit, not at load: `FlashPrefill` has all eight `i[]` and all
-    /// three `fj[]` operands occupied, so there is no slot to tag it with a stage index, and the
-    /// stage is instead identified by which table handle it holds.
-    fn is_staged_site(&self, d: &DevInst64) -> bool {
-        if self.stages.is_empty() {
-            return false;
-        }
-        let mut any = |f: &dyn Fn(&Stage) -> bool| self.stages.iter().any(|s| f(s));
-        match DevOp::from_u16(d.op) {
-            Some(DevOp::HeadNormRope) => any(&|s: &Stage| d.t[6] == s.slot),
-            Some(DevOp::HeadNormRopeFp8) => any(&|s: &Stage| d.t[7] == s.slot),
-            Some(DevOp::FlashPrefill) => any(&|s: &Stage| d.t[6] == s.request),
-            Some(DevOp::FlashMerge) => any(&|s: &Stage| d.t[7] == s.request),
-            Some(DevOp::FlashPrefillFp8) => {
-                any(&|s: &Stage| d.i[4] == FP8_REQUEST_TAG | u32::from(s.request))
-            }
-            _ => false,
-        }
-    }
-
     /// Bind a validated prefill instruction, or restore its ordinary request operands.
     pub fn bind_request(&self, d: &mut DevInst64, packed: bool) {
-        // A staged site already holds its own stage's span table and slot mask. Rebinding it to
-        // the whole-chunk tables would make every stage write every row — precisely the wrap the
-        // shortened ring cannot survive, and silent: wrong tokens, no fault.
-        if self.is_staged_site(d) {
-            return;
-        }
-        let slot = if packed { self.slot } else { TENSOR_NONE16 };
-        let request = if packed { self.request } else { TENSOR_NONE16 };
+        self.bind_request_stage(d, packed, None);
+    }
+
+    /// As [`Self::bind_request`]; a staged site (`stage`, from [`stage_map`]) binds its stage's
+    /// span table and slot mask instead of the whole chunk's. Unpacked, every site is restored.
+    pub fn bind_request_stage(&self, d: &mut DevInst64, packed: bool, stage: Option<u16>) {
+        let (slot, request) = match (packed, stage.and_then(|k| self.stages.get(k as usize))) {
+            (false, _) => (TENSOR_NONE16, TENSOR_NONE16),
+            (true, Some(s)) => (s.slot, s.request),
+            (true, None) => (self.slot, self.request),
+        };
         match DevOp::from_u16(d.op) {
             Some(DevOp::HeadNormRope) => d.t[6] = slot,
             Some(DevOp::HeadNormRopeFp8) => d.t[7] = slot,
@@ -155,7 +136,7 @@ impl Manifest {
             }
             Some(DevOp::FlashPrefillFp8) => {
                 d.i[4] = if packed {
-                    FP8_REQUEST_TAG | u32::from(self.request)
+                    FP8_REQUEST_TAG | u32::from(request)
                 } else {
                     0
                 };
@@ -228,6 +209,11 @@ impl Manifest {
                         >= u64::from(cache.window) + u64::from(write_rows) - 1,
                 "ring must retain the attention window across all padded KV writes",
             )?;
+        }
+        if let Some(stage_rows) = self.stage_rows {
+            for g in &p.programs[..p.prefill_count] {
+                validate_stages(g, live, request_rows.min(g.rows), stage_rows)?;
+            }
         }
         let mut handles = BTreeSet::new();
         for (h, name, bytes) in [
@@ -435,6 +421,155 @@ impl Manifest {
         Ok(())
     }
 }
+fn is_attention(d: &DevInst64) -> bool {
+    matches!(
+        DevOp::from_u16(d.op),
+        Some(DevOp::FlashPrefill | DevOp::FlashPrefillFp8)
+    )
+}
+
+fn is_cache_writer(d: &DevInst64) -> bool {
+    matches!(
+        DevOp::from_u16(d.op),
+        Some(DevOp::HeadNormRope | DevOp::HeadNormRopeFp8)
+    ) && d.fj[1] != 0
+}
+
+/// Stage of each staged site of a prefill program, by position. A cache pair read by several
+/// attention sites is staged: its k-th reader and the k-th writer of each of its handles form
+/// stage k (devgen emits `W_0 R_0 W_1 R_1 ...` per sliding layer; [`Manifest::validate`] proves
+/// that shape before any binding trusts it).
+pub fn stage_map(insts: &[DevInst64]) -> Vec<Option<u16>> {
+    let mut out = vec![None; insts.len()];
+    let mut readers: std::collections::BTreeMap<[u16; 2], Vec<usize>> = Default::default();
+    for (pc, d) in insts.iter().enumerate().filter(|(_, d)| is_attention(d)) {
+        readers.entry([d.t[3], d.t[4]]).or_default().push(pc);
+    }
+    for (pair, pcs) in readers.iter().filter(|(_, pcs)| pcs.len() > 1) {
+        for (k, &pc) in pcs.iter().enumerate() {
+            out[pc] = Some(k as u16);
+        }
+        for h in pair {
+            let writers = insts
+                .iter()
+                .enumerate()
+                .filter(|(_, d)| is_cache_writer(d) && d.t[0] == *h);
+            for (k, (pc, _)) in writers.enumerate() {
+                out[pc] = Some(k as u16);
+            }
+        }
+    }
+    out
+}
+
+/// A staged sliding cache must be written and read stage by stage, each stage in a later
+/// segment than the one before, or a stage's writes wrap onto rows an earlier stage still reads.
+/// An unstaged one must hold a whole request.
+fn validate_stages(
+    g: &crate::program::Program<'_>,
+    live: &live_kv::Manifest,
+    request_rows: u32,
+    stage_rows: u32,
+) -> Result<()> {
+    let stages = request_rows.div_ceil(stage_rows) as usize;
+    let ring = |pair: [u16; 2]| live.caches.iter().any(|c| c.pair == pair && c.window > 0 && c.stride < live.max_ctx);
+    // `stage_map` binds stage tables to every pair read more than once; only sliding rings are
+    // proven below, so a repeated reader of any other cache (KV sharing) cannot be staged.
+    let mut seen = BTreeSet::new();
+    for pair in g.insts.iter().filter(|d| is_attention(d)).map(|d| [d.t[3], d.t[4]]) {
+        need(seen.insert(pair) || ring(pair), "staged packet reads a non-ring cache more than once")?;
+    }
+    for c in live.caches.iter().filter(|c| c.window > 0 && c.stride < live.max_ctx) {
+        let readers: Vec<usize> = (0..g.insts.len())
+            .filter(|&pc| is_attention(&g.insts[pc]) && [g.insts[pc].t[3], g.insts[pc].t[4]] == c.pair)
+            .collect();
+        if readers.len() <= 1 {
+            need(
+                u64::from(c.stride) >= u64::from(c.window) + u64::from(request_rows) - 1,
+                "unstaged ring must hold a whole request",
+            )?;
+            continue;
+        }
+        need(readers.len() == stages, "one writer pair and one reader per stage")?;
+        let (wk, wv) = (cache_writers(g.insts, c.pair[0]), cache_writers(g.insts, c.pair[1]));
+        check_stage_order(g, &readers, &wk, &wv)?;
+    }
+    Ok(())
+}
+
+fn check_stage_order(
+    g: &crate::program::Program<'_>,
+    readers: &[usize],
+    wk: &[usize],
+    wv: &[usize],
+) -> Result<()> {
+    need(
+        readers.len() > 1 && wk.len() == readers.len() && wv.len() == readers.len(),
+        "one writer pair and one reader per stage",
+    )?;
+    let segment = |pc: usize| {
+        g.gq_seg_ofs.windows(2).position(|w| {
+            g.gq_stream
+                .get(w[0] as usize..w[1] as usize)
+                .is_some_and(|e| e.iter().any(|x| x.inst as usize == pc))
+        })
+    };
+    let mut last = None;
+    for k in 0..readers.len() {
+        let (r, w0, w1) = (segment(readers[k]), segment(wk[k]), segment(wv[k]));
+        need(
+            r.is_some() && w0.is_some() && w1.is_some(),
+            "staged site outside the segment chain",
+        )?;
+        need(
+            w0 < r && w1 < r && last.is_none_or(|l| Some(l) < w0 && Some(l) < w1),
+            "stage order",
+        )?;
+        need(
+            g.insts[readers[k]].t[5] != TENSOR_NONE16,
+            "staged attention must write its own output",
+        )?;
+        last = r;
+    }
+    Ok(())
+}
+
+fn cache_writers(insts: &[DevInst64], h: u16) -> Vec<usize> {
+    (0..insts.len())
+        .filter(|&pc| is_cache_writer(&insts[pc]) && insts[pc].t[0] == h)
+        .collect()
+}
+
+/// Writer sites of a prefill program allowed to repeat: those of a cache pair written more than
+/// once, after proving the pair is staged (one writer pair per reader, stages in segment order).
+/// Repeated readers over single writers (KV sharing) need no proof. A packet may carry such sites
+/// only when its packed-prefill manifest declares `stage_rows` ([`has_repeated_writers`]).
+pub fn repeated_writers(g: &crate::program::Program<'_>) -> Result<Vec<bool>> {
+    let mut out = vec![false; g.insts.len()];
+    let mut readers: std::collections::BTreeMap<[u16; 2], Vec<usize>> = Default::default();
+    for (pc, d) in g.insts.iter().enumerate().filter(|(_, d)| is_attention(d)) {
+        readers.entry([d.t[3], d.t[4]]).or_default().push(pc);
+    }
+    for (pair, pcs) in &readers {
+        let (wk, wv) = (cache_writers(g.insts, pair[0]), cache_writers(g.insts, pair[1]));
+        if wk.len() <= 1 && wv.len() <= 1 {
+            continue;
+        }
+        check_stage_order(g, pcs, &wk, &wv)?;
+        for &pc in wk.iter().chain(&wv) {
+            out[pc] = true;
+        }
+    }
+    Ok(out)
+}
+
+pub fn has_repeated_writers(p: &Packet<'_>) -> bool {
+    p.programs[..p.prefill_count].iter().any(|g| {
+        let mut seen = BTreeSet::new();
+        g.insts.iter().filter(|d| is_cache_writer(d)).any(|d| !seen.insert(d.t[0]))
+    })
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct Request {
     pub slot: usize,
@@ -1119,59 +1254,64 @@ mod tests {
         DevInst64 { op: op as u16, blocks: 1, fj: [0; 3], t: [TENSOR_NONE16; 8], i: [0; 8] }
     }
 
-    /// Load-time binding must not reach a staged site. If it did, every stage would be pointed at
-    /// the whole-chunk span table and slot mask, so every stage would write every row — the wrap
-    /// the shortened ring cannot survive, with no fault to show for it.
+    /// A staged site binds its own stage's tables in packed mode and is restored unpacked.
     #[test]
-    fn binding_leaves_a_staged_site_alone_in_both_directions() {
+    fn a_staged_site_binds_its_stage_tables() {
         let m = staged_manifest(Some(1024), 4);
         let s = m.stages[2];
-
         let mut hnr = inst(DevOp::HeadNormRope);
-        hnr.t[6] = s.slot;
         let mut fp = inst(DevOp::FlashPrefill);
-        fp.t[6] = s.request;
-        let mut merge = inst(DevOp::FlashMerge);
-        merge.t[7] = s.request;
         let mut hnr8 = inst(DevOp::HeadNormRopeFp8);
-        hnr8.t[7] = s.slot;
         let mut fp8 = inst(DevOp::FlashPrefillFp8);
-        fp8.i[4] = FP8_REQUEST_TAG | u32::from(s.request);
-
-        for d in [&mut hnr, &mut fp, &mut merge, &mut hnr8, &mut fp8] {
-            let before = *d;
-            m.bind_request(d, true);
-            assert_eq!(*d, before, "packed bind touched a staged site");
-            m.bind_request(d, false);
-            assert_eq!(*d, before, "unpacked bind touched a staged site");
+        m.bind_request_stage(&mut hnr, true, Some(2));
+        m.bind_request_stage(&mut fp, true, Some(2));
+        m.bind_request_stage(&mut hnr8, true, Some(2));
+        m.bind_request_stage(&mut fp8, true, Some(2));
+        assert_eq!((hnr.t[6], fp.t[6], hnr8.t[7]), (s.slot, s.request, s.slot));
+        assert_eq!(fp8.i[4], FP8_REQUEST_TAG | u32::from(s.request));
+        for d in [&mut hnr, &mut fp, &mut hnr8, &mut fp8] {
+            m.bind_request_stage(d, false, Some(2));
+            assert_eq!(*d, inst(DevOp::from_u16(d.op).unwrap()));
         }
-    }
-
-    /// An UNSTAGED site in the same packet still binds normally, so a staged packet can carry
-    /// both (only the sliding layers are staged; a full-attention layer is not).
-    #[test]
-    fn binding_still_reaches_an_unstaged_site_in_a_staged_packet() {
-        let m = staged_manifest(Some(1024), 4);
-        let mut hnr = inst(DevOp::HeadNormRope);
-        m.bind_request(&mut hnr, true);
-        assert_eq!(hnr.t[6], m.slot);
-        m.bind_request(&mut hnr, false);
-        assert_eq!(hnr.t[6], TENSOR_NONE16);
-
-        let mut fp = inst(DevOp::FlashPrefill);
-        m.bind_request(&mut fp, true);
+        // An unstaged site of the same packet (a full-attention layer) binds the whole chunk.
+        m.bind_request_stage(&mut fp, true, None);
         assert_eq!(fp.t[6], m.request);
     }
 
-    /// With no stages declared, binding is exactly what it was.
+    /// Stages come from position: the k-th reader of a pair read more than once, and the k-th
+    /// writer of each of its handles. A pair read once (full attention) is not staged.
     #[test]
-    fn binding_is_unchanged_when_nothing_is_staged() {
-        let m = staged_manifest(None, 0);
-        let mut fp = inst(DevOp::FlashPrefill);
-        // a handle that WOULD have matched a stage if any were declared
-        fp.t[6] = 15;
-        m.bind_request(&mut fp, true);
-        assert_eq!(fp.t[6], m.request);
+    fn stage_map_numbers_interleaved_writers_and_readers() {
+        let writer = |h: u16| {
+            let mut d = inst(DevOp::HeadNormRope);
+            d.t[0] = h;
+            d.fj[1] = 2048;
+            d
+        };
+        let reader = |k: u16, v: u16| {
+            let mut d = inst(DevOp::FlashPrefill);
+            d.t[3] = k;
+            d.t[4] = v;
+            d
+        };
+        let mut q = inst(DevOp::HeadNormRope);
+        q.t[0] = 9;
+        let insts = [
+            q,
+            writer(1),
+            writer(2),
+            reader(1, 2),
+            writer(1),
+            writer(2),
+            reader(1, 2),
+            writer(3),
+            writer(4),
+            reader(3, 4),
+        ];
+        assert_eq!(
+            stage_map(&insts),
+            [None, Some(0), Some(0), Some(0), Some(1), Some(1), Some(1), None, None, None]
+        );
     }
 
     #[test]

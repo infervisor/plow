@@ -196,6 +196,7 @@ impl Entry {
             query_tile,
             kv_tile,
             warps,
+            shape: None,
         };
         Ok(Selection::generated(
             self.file.into(),

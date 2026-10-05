@@ -1960,13 +1960,14 @@ fn run_devblob(cli: &Cli) -> Result<PathBuf, Box<dyn std::error::Error>> {
 
         // A bundle is only servable if the runtime can find the checkpoint and a
         // real tokenizer. `plowrt serve` looks for `<assets>/checkpoint` and
-        // `<assets>/tokenizer.json`, so symlink both directly at the checkpoint
-        // — no copy, no manual completion step.
+        // `<assets>/tokenizer.json`. The weights stay a symlink; the tokenizer is
+        // copied so the bundle carries it (a symlink broke when the checkpoint
+        // moved, and the byte fallback then served garbage).
         let ckpt = std::fs::canonicalize(&dir)?;
         symlink_force(&ckpt, &out_dir.join("checkpoint"))?;
         let tok = ckpt.join("tokenizer.json");
         if tok.exists() {
-            symlink_force(&tok, &out_dir.join("tokenizer.json"))?;
+            copy_force(&tok, &out_dir.join("tokenizer.json"))?;
         } else if !(ckpt.join("vocab.json").is_file()
             && ckpt.join("merges.txt").is_file()
             && std::fs::read(ckpt.join("tokenizer_config.json"))
@@ -2273,6 +2274,10 @@ fn repo_runtime_dir() -> Result<PathBuf, Box<dyn std::error::Error>> {
 fn symlink_force(target: &std::path::Path, link: &std::path::Path) -> std::io::Result<()> {
     let _ = std::fs::remove_file(link);
     std::os::unix::fs::symlink(target, link)
+}
+fn copy_force(from: &std::path::Path, to: &std::path::Path) -> std::io::Result<()> {
+    let _ = std::fs::remove_file(to);
+    std::fs::copy(from, to).map(drop)
 }
 #[cfg(not(unix))]
 fn symlink_force(_target: &std::path::Path, _link: &std::path::Path) -> std::io::Result<()> {

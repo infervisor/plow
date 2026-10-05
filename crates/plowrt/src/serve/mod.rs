@@ -85,6 +85,54 @@ pub struct GenParams {
     pub stop_token_ids: Vec<u32>,
 }
 
+/// The generation budget of a request that named none: the default, capped to the context the
+/// prompt leaves (as vLLM does), so a long prompt is served instead of refused for a budget the
+/// client never asked for.
+pub(crate) fn default_max_tokens(default: usize, max_ctx: Option<usize>, n_prompt: usize) -> usize {
+    match max_ctx {
+        Some(ctx) if n_prompt < ctx => default.min(ctx - n_prompt),
+        _ => default,
+    }
+}
+
+/// Refuse up front a request whose prompt plus budget cannot fit the context. The CUDA engine
+/// refuses it at seating; the AMD batch only noticed when the slot's position ran past the
+/// context, and that failed every request in the batch.
+pub(crate) fn context_overflow(max_ctx: Option<usize>, n_prompt: usize, max_tokens: usize) -> Option<RuntimeError> {
+    let ctx = max_ctx?;
+    let total = n_prompt.saturating_add(max_tokens.max(1));
+    (total > ctx).then(|| {
+        RuntimeError::ContextLength(format!(
+            "prompt ({n_prompt} tokens) + max_tokens ({max_tokens}) = {total} exceeds the context {ctx}"
+        ))
+    })
+}
+
+/// Refuse, before encoding, a prompt too long for the context under any tokenization: it has more
+/// than `max_ctx` tokens once no token can cover all `max_token_bytes` of its share.
+pub(crate) fn prompt_bytes_overflow(max_ctx: Option<usize>, max_token_bytes: usize, bytes: usize) -> Option<RuntimeError> {
+    let ctx = max_ctx?;
+    (bytes / max_token_bytes.max(1) > ctx).then(|| {
+        RuntimeError::ContextLength(format!("prompt ({bytes} bytes) has more tokens than the context {ctx}"))
+    })
+}
+
+/// Prompts at least this long encode with [`tokio::task::block_in_place`]: a 64 KiB prompt already
+/// takes tens of ms, and a 64 MiB one stalled every connection on its worker, `/health` included.
+const BLOCKING_ENCODE_BYTES: usize = 64 * 1024;
+
+pub(crate) fn encode_prompt(text: &str, encode: impl FnOnce(&str) -> Vec<u32>) -> Vec<u32> {
+    let multi_thread = || {
+        tokio::runtime::Handle::try_current()
+            .is_ok_and(|h| h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread)
+    };
+    if text.len() >= BLOCKING_ENCODE_BYTES && multi_thread() {
+        tokio::task::block_in_place(|| encode(text))
+    } else {
+        encode(text)
+    }
+}
+
 impl Default for GenParams {
     fn default() -> Self {
         GenParams {
@@ -108,6 +156,47 @@ mod tests {
     #[test]
     fn generation_default_allows_long_responses() {
         assert_eq!(GenParams::default().max_tokens, 4096);
+    }
+
+    #[test]
+    fn default_budget_fits_the_context_the_prompt_leaves() {
+        use super::default_max_tokens;
+        assert_eq!(default_max_tokens(4096, Some(16384), 14000), 2384);
+        assert_eq!(default_max_tokens(4096, Some(16384), 100), 4096);
+        // At or past the context the prompt is refused as too long, not given a zero budget.
+        assert_eq!(default_max_tokens(4096, Some(16384), 16384), 4096);
+        assert_eq!(default_max_tokens(4096, None, 14000), 4096);
+    }
+
+    #[test]
+    fn prompt_plus_budget_past_the_context_is_a_context_error() {
+        use super::context_overflow;
+        assert!(context_overflow(Some(16384), 14000, 2384).is_none());
+        assert!(matches!(context_overflow(Some(16384), 14000, 2385), Some(RuntimeError::ContextLength(_))));
+        assert!(matches!(context_overflow(Some(16384), 16384, 4096), Some(RuntimeError::ContextLength(_))));
+        assert!(context_overflow(None, 1 << 30, 1 << 30).is_none());
+    }
+
+    #[test]
+    fn a_prompt_longer_than_any_tokenization_fits_is_refused_unencoded() {
+        use super::prompt_bytes_overflow;
+        let byte = crate::text::tokenizer::ByteTokenizer;
+        let tok: &dyn crate::text::tokenizer::Tokenize = &byte;
+        assert!(prompt_bytes_overflow(Some(8), tok.max_token_bytes(), 8).is_none());
+        assert!(matches!(prompt_bytes_overflow(Some(8), tok.max_token_bytes(), 9), Some(RuntimeError::ContextLength(_))));
+        assert!(prompt_bytes_overflow(Some(8), 400, 8 * 400 + 399).is_none());
+        assert!(prompt_bytes_overflow(Some(8), 400, 9 * 400).is_some());
+        assert!(prompt_bytes_overflow(Some(8), usize::MAX, usize::MAX).is_none());
+        assert!(prompt_bytes_overflow(None, 1, usize::MAX).is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_long_prompt_encodes_off_the_worker_with_the_same_ids() {
+        let long = "a".repeat(super::BLOCKING_ENCODE_BYTES + 1);
+        let tok = crate::text::tokenizer::ByteTokenizer;
+        use crate::text::tokenizer::Tokenize;
+        assert_eq!(super::encode_prompt(&long, |t| tok.encode(t)).len(), long.len());
+        assert_eq!(super::encode_prompt("hi", |t| tok.encode(t)), vec![104, 105]);
     }
 
     fn fault(fatal: bool) -> RuntimeError {
@@ -975,8 +1064,24 @@ async fn trace_handler(
     ([("content-type", "application/json")], state.trace_json()).into_response()
 }
 
-async fn healthz() -> &'static str {
-    "ok"
+async fn healthz(
+    axum::extract::State(state): axum::extract::State<Arc<AppState>>,
+) -> (axum::http::StatusCode, String) {
+    let dead: Vec<String> = state
+        .model_metrics
+        .read()
+        .iter()
+        .filter(|(_, m)| m.engine_dead.load(std::sync::atomic::Ordering::Relaxed))
+        .map(|(slug, _)| slug.clone())
+        .collect();
+    if dead.is_empty() {
+        (axum::http::StatusCode::OK, "ok".into())
+    } else {
+        (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            format!("engine dead (fatal device fault): {}", dead.join(",")),
+        )
+    }
 }
 
 fn metrics_models(state: &AppState) -> Vec<(String, Arc<Metrics>, bool)> {
@@ -1049,6 +1154,8 @@ async fn metrics_handler(
         ("blocks_shared_mapped_total", "counter", "Shared prefix blocks mapped."),
         ("nodes_evicted_total", "counter", "Prefix tree nodes evicted."),
         ("blocks_live", "gauge", "Live prefix pool blocks."),
+        ("blocks_stale", "gauge", "Retired-window blocks still mapped, awaiting the reclaimer."),
+        ("blocks_pooled", "gauge", "Zero-reference blocks parked in the reuse pool."),
         ("cache_blocks", "gauge", "Prefix cache blocks."),
         ("cache_bytes", "gauge", "Prefix cache bytes."),
         ("snapshot_bytes", "gauge", "Prefix snapshot bytes."),
@@ -1073,6 +1180,8 @@ async fn metrics_handler(
              plowrt_prefix_blocks_shared_mapped_total{{model=\"{slug}\"}} {}\n\
              plowrt_prefix_nodes_evicted_total{{model=\"{slug}\"}} {}\n\
              plowrt_prefix_blocks_live{{model=\"{slug}\"}} {}\n\
+             plowrt_prefix_blocks_stale{{model=\"{slug}\"}} {}\n\
+             plowrt_prefix_blocks_pooled{{model=\"{slug}\"}} {}\n\
              plowrt_prefix_cache_blocks{{model=\"{slug}\"}} {}\n\
              plowrt_prefix_cache_bytes{{model=\"{slug}\"}} {}\n\
              plowrt_prefix_snapshot_bytes{{model=\"{slug}\"}} {}\n\
@@ -1087,6 +1196,8 @@ async fn metrics_handler(
             s.blocks_shared_mapped,
             s.nodes_evicted,
             s.blocks_live,
+            s.blocks_stale,
+            s.blocks_pooled,
             s.cache_blocks,
             s.cache_bytes,
             s.snapshot_bytes,
@@ -1133,6 +1244,29 @@ pub(crate) fn api_error_for(err: &RuntimeError) -> axum::response::Response {
         _ => ("server_error", None),
     };
     api_error(status, err.to_string(), kind, code, None)
+}
+
+#[cfg(test)]
+mod health_tests {
+    use super::{healthz, AppState};
+    use axum::http::StatusCode;
+    use std::sync::{atomic::Ordering, Arc};
+
+    /// A poisoned CUDA context rejects every request; `/health` must say so, or an
+    /// orchestrator keeps routing traffic to an instance that can never answer.
+    #[tokio::test]
+    async fn health_reports_a_dead_engine() {
+        let backend: Arc<dyn crate::device::Backend> = Arc::new(crate::device::cpu::CpuBackend::new(1));
+        let execset = Arc::new(crate::exec::ExecutorSet::bringup(backend).unwrap());
+        let state = Arc::new(AppState::new(crate::orch::Registry::new(), execset));
+        let metrics = state.model_metrics("m");
+        let (code, _) = healthz(axum::extract::State(Arc::clone(&state))).await;
+        assert_eq!(code, StatusCode::OK);
+        metrics.engine_dead.store(true, Ordering::Relaxed);
+        let (code, body) = healthz(axum::extract::State(state)).await;
+        assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(body.contains('m'));
+    }
 }
 
 #[cfg(test)]

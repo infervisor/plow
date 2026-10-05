@@ -53,7 +53,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Weak};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use parking_lot::{Mutex, RwLock};
 use rustc_hash::FxHashMap;
@@ -191,10 +191,14 @@ impl BlobPlan {
             let full = manifest
                 .as_ref()
                 .is_some_and(|m| m.caches.iter().any(|c| c.window == 0));
-            let prefix_layout = checkpoint.and_then(|path| {
+            let kv = match checkpoint {
+                Some(path) => crate::asset::serve::resolve(dir, path)?.manifest.kv,
+                None => None,
+            };
+            let prefix_layout = checkpoint.and_then(|_| {
                 crate::exec::gpu::GpuEngine::select_vmm_prefix_layout(
                     &blob,
-                    path,
+                    kv.as_ref(),
                     config,
                     capability,
                     granularity,
@@ -330,6 +334,9 @@ pub enum EnsureError {
     Unloaded,
     /// The engine load (or drain plumbing) failed.
     Load(RuntimeError),
+    /// Another switch held the switch lock past `PLOW_SWITCH_TIMEOUT_MS`. Shed with 503 +
+    /// Retry-After.
+    SwitchTimeout(Duration),
 }
 
 impl std::fmt::Display for EnsureError {
@@ -346,6 +353,11 @@ impl std::fmt::Display for EnsureError {
                 "model was unloaded by the operator — load it again to serve it"
             ),
             EnsureError::Load(e) => write!(f, "model load failed: {e}"),
+            EnsureError::SwitchTimeout(d) => write!(
+                f,
+                "another model switch is still in progress after {} s; retry later",
+                d.as_secs()
+            ),
         }
     }
 }
@@ -624,7 +636,12 @@ impl ModelManager {
             return Ok(());
         }
 
-        let _g = self.switch.lock().await;
+        let _g = match switch_timeout() {
+            Some(d) => tokio::time::timeout(d, self.switch.lock())
+                .await
+                .map_err(|_| EnsureError::SwitchTimeout(d))?,
+            None => self.switch.lock().await,
+        };
         self.ensure_resident_locked(slug).await
     }
 
@@ -1085,6 +1102,12 @@ fn drain_timeout_ms() -> Option<u64> {
     crate::config::RuntimeConfig::get().drain_timeout_ms()
 }
 
+/// `--switch-timeout-ms` / `PLOW_SWITCH_TIMEOUT_MS` (600 s when unset, 0 = unbounded).
+fn switch_timeout() -> Option<Duration> {
+    let ms = crate::config::RuntimeConfig::get().switch_timeout_ms.unwrap_or(600_000);
+    (ms > 0).then(|| Duration::from_millis(ms))
+}
+
 /// Least-recently-used pick: the resident slug with the oldest (or absent)
 /// last-use stamp. Free-standing for unit tests.
 fn pick_victim(residents: &[String], last_use: &FxHashMap<String, Instant>) -> Option<String> {
@@ -1107,6 +1130,15 @@ fn gib(b: u64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_switch_lock_wait_is_bounded_by_default() {
+        if crate::config::RuntimeConfig::get().switch_timeout_ms.is_none() {
+            assert_eq!(switch_timeout(), Some(Duration::from_secs(600)));
+        }
+        let e = EnsureError::SwitchTimeout(Duration::from_secs(600));
+        assert!(e.to_string().contains("600 s"));
+    }
 
     #[test]
     fn plan_classifies_tensor_names() {

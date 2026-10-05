@@ -100,7 +100,8 @@ fn automatic_prefix_selection_requires_compatible_execution_and_valid_kv_layout(
     cfg.nv.vmm_live_rings = None;
     cfg.prefix_cache = true;
     let selected = |blob: &DevBlob, cfg: &RuntimeConfig, cc, gran| {
-        GpuEngine::select_vmm_prefix_layout(blob, &dir, cfg, cc, gran).is_some()
+        let kv = plow_asset::serve_manifest::KvGeometry::from_config(&dir);
+        GpuEngine::select_vmm_prefix_layout(blob, kv.as_ref(), cfg, cc, gran).is_some()
     };
     assert!(selected(&blob, &cfg, (9, 0), 2 << 20));
     assert!(!selected(&blob, &cfg, (12, 0), 2 << 20));

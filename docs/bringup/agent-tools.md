@@ -1,6 +1,6 @@
 # Agent tools: the scripts to use, and the environment they run in
 
-`scripts/` holds 251 scripts. Most campaigns have nonetheless written their own throwaway probe,
+`scripts/` holds 400+ scripts. Most campaigns have nonetheless written their own throwaway probe,
 rediscovered the same environment failures, and burned leased GPU time doing it. This file is the
 tool surface an agent should reach for FIRST, so that does not keep happening.
 
@@ -26,7 +26,7 @@ nix develop --command <script> <args>
 
 | dependency | where | how it is passed |
 |---|---|---|
-| vLLM client (`vllm bench serve`, and the vLLM reference server) | `/app/plow/build-gemma31/vllm-python` — a prebuilt venv/launcher, from source, not nix | `PB_VLLM` (that path is `plowbench.sh`'s default), or the path baked into the bench scripts |
+| vLLM client (`vllm bench serve`, and the vLLM reference server) | `/app/plow/build-gemma31/vllm-python` — a prebuilt venv/launcher, from source, not nix | `PB_VLLM`; else `plowbench.sh` takes the first of that path, `/opt/pytorch/bin/vllm`, `vllm` on `PATH`, `$VLLM_VENV/bin/vllm`. `llm_grid.sh` sets it to `PYREF` |
 | ROCm runtime the vLLM client links | `/opt/rocm/core-7.14/lib` — the LAB ROCm, not nix's | `PB_VLLM_ROCM_LIB` (its default), which `pb_bench` **exports** to the client as `VLLM_ROCM_LIB`. `VLLM_ROCM_LIB` is never read as an input |
 | `gpulease` | `<repo>/perf-data/tools/gpulease`, else `/app/plow/perf-data/tools/gpulease` — **not on PATH** | absolute path; `plowbench-doctor.sh` probes repo-relative first, then `/app/...`, then `PATH` |
 | model checkpoints | `/workspace/models/...` | `PLOW_CKPT`, `GLM_RAW` |
@@ -38,14 +38,16 @@ before pasting a path out of this table.
 The vLLM client should be the same binary against both servers: same client, same metric
 definitions, different `--base-url`. That symmetry is what makes a plow-vs-vLLM number comparable,
 so do not swap in a different client for one side. **This is a rule, not a property of the
-scripts** — they do not all agree today. `plowbench.sh` uses `$PB_VLLM`;
-`glm53_mi300x.sh vllm` uses `$WT/build-gemma31/vllm-python` while `glm53_mi300x.sh bench` uses
-`$WT/.venv-vllm028/bin/python`; `bench_plowrt_serve.sh` and `bench_vllm_chat.sh` run the client
-from a `rocm/vllm` **Docker image** unless `VLLM_VENV` is set. Pin one and say which.
+scripts** — they do not all agree today. `plowbench.sh` uses `$PB_VLLM` (above);
+`glm53_mi300x.sh vllm` and `bench` both use `$WT/build-gemma31/vllm-python`;
+`bench_vllm_chat.sh` always runs server and client from a `rocm/vllm` **Docker image**, and
+`bench_plowrt_serve.sh` uses that image unless `VLLM_VENV` is set. Pin one and say which.
 
 **Every GPU process goes through the queue**, never a raw `gpulease` and never a bare run. On the
-Gemma/H100 campaign use `scripts/bench/gpuq.py`; the external `submit.sh` queue in §8 is a separate
-lab workflow. A script that leases internally is not safe to run inside either queue unchanged.
+Gemma/H100 campaign use `scripts/bench/gpuq.py submit <label> <ngpu> <cmd...>` (FIFO, root
+`/tmp/plow-gpuq`, `status` lists jobs; submit restarts an idle-exited runner); the external
+`submit.sh` queue in §8 is a separate lab workflow. A script that leases internally is not safe to
+run inside either queue unchanged.
 Put every required `PLOW_*` setting in the queued command (for example, `env PLOW_FOO=1 ...`);
 the persistent queue runner removes inherited `PLOW_*` values before starting each job.
 
@@ -63,7 +65,7 @@ after a kernel change. Existing serving evidence can prioritize work but cannot 
 | 2 | build from the recipe | `campaign.py build recipes/<ns>/<model>/<cell>.toml --out <fresh dir>` |
 | 3 | per-rung accuracy, resources + measured roofline | `scripts/bench/step_grid.sh <assets> <out>` (step_bench B × ctx; instruction-cap sweeps for native decode only), then `scripts/bench/op_roof.py <out>/disasm.txt --ctx N --sweep B=<jsonl>` (bytes, FLOPs, floor, measured, % roof per op). Library-routed decode needs `op_roof.py --nsys` with JSON disassembly and a measured CUDA trace; prefill CUDA graphs use `--nsys-correlation <id>` for exact packet-segment mapping, while `--segtime` covers per-chunk prefill diagnostics. No measurement = floor only. Use block/route harnesses below for other kernels; GLM/MLA/MoE: `scripts/campaign/op_roofline.py` |
 | 4 | full-model accuracy gates | `campaign.py gate <recipe> --assets <out>/assets --out <dir>` runs the recipe's `[gates]` in one lease (logit parity top1/KL, ASR WER, TTS CER per language, S3Gen rel-L2); `--score-only` re-scores, `--dry-run` prints `run.sh` |
-| 5 | serving grid vs the reference | `scripts/bench/llm_grid.sh plow\|vllm <res>` (same client, unique prompts per cell and repeat, greedy + sampled, 2 repeats, prefill-only and decode-only cells, vLLM `/metrics`, plow PACKLOG); agentic multi-turn with prefix caching on both sides: `llm_grid.sh plow\|vllm <res> --agentic` (`agentic_turns.py`, c32/64/128 x 10 turns to ~16K); speech: `tts_bench.py`, `served_bench.py`; voice: `scripts/voice/serve_voice_agent.sh calls` |
+| 5 | serving grid vs the reference | `scripts/bench/llm_grid.sh plow\|vllm <res>` (same client, unique prompts per cell and repeat, greedy + sampled, 2 repeats, prefill-only and decode-only cells, vLLM `/metrics`, plow PACKLOG); agentic multi-turn with prefix caching on both sides: `llm_grid.sh plow\|vllm <res> --agentic` (`agentic_turns.py`, c32/64/128 x 10 turns to ~16K); open-loop production mix (Poisson sessions, think time, sampled turns/lengths, goodput): `PROD_RATES='0.5 1' llm_grid.sh plow\|vllm <res> --prod` (`agentic_turns.py --open-loop`, cells `q<1000*rate>`); speech: `scripts/tts/tts_bench.py`, `scripts/asr/nvidia/served_bench.py`; voice: `scripts/voice/serve_voice_agent.sh calls` |
 | 6 | audit waterfall | `scripts/bench/waterfall.py <res>/plow <res>/vllm`: grid with spread, reference prefix-cache hits (fails > 5%), wall ms/request split (mixed, prefill-only, decode, host gap, idle, padding, riders), decode ms/step side by side. `vllm_metrics.py cells`, `packlog_audit.py`, `nsys_busy.py` are its parts |
 | 7 | fix, one variable | kernel/runtime change in your own detached worktree |
 | 8 | verify the patch | `scripts/campaign/verify_patch.sh <patch>`: applies to HEAD in a private index, archives `git write-tree`, builds bins/examples/tests, plowrt lib (cuda+hsa), knob tests, plow-asset + packet tests, py_compile / `bash -n` / TOML of touched scripts |
@@ -102,15 +104,16 @@ reproducible recipe. Keep trial TOMLs in `scripts/campaign/recipes` or outside-r
 qualified. Do not create a second production variant to record an experiment.
 
 Scheduling is not a recipe choice: recipes (production and trial) leave `PLOW_OBJECTIVE` at the
-default `auto`, which runs the latency rules at narrow width and switches to throughput at 8 rows
-or any queue (`docs/flags-reference.md`). Pin it only as a deliberate, commented override in a
+default `auto`, which runs the latency rules at narrow width and switches to throughput at 8 rows,
+any queue or a 90%-reserved KV budget (`docs/flags-reference.md`). Pin it only as a deliberate, commented override in a
 profile's `serve_env`; expert overrides such as `PLOW_MULTISTEP` or `PLOW_DECODE_MAX_RUNG` stay
 where a cell measured them.
 
 ### Campaign result placement
 
 Use one designated `comparison.csv` per campaign for matched serving results and a neighboring
-`comparison.md` for qualified wins and concise provenance. Put raw client/server logs, JSON,
+`comparison.md` for qualified wins and concise provenance; per-family summaries are indexed in
+[results/README.md](results/README.md). Put raw client/server logs, JSON,
 captures, profiler traces, generated HTML, temporary CSVs and full manifests in named scratch
 outside the repo; link or hash the evidence from the summary. Never put raw benchmark data in
 arbitrary repo directories, including `docs/`, `scripts/` and `perf-data/`. Curated, validated
@@ -131,9 +134,10 @@ the table and do not quote another renderer's numbers as final. The harness rend
 refuses anything incomplete:
 
 ```bash
-# both arms with llm_grid.sh (single-turn and/or --agentic); each writes <res>/provenance.json
-env ... KV_DTYPE=<plow KV dtype, named as vLLM names it> scripts/bench/llm_grid.sh plow <res>/plow [--agentic]
-env ... scripts/bench/llm_grid.sh vllm <res>/vllm [--agentic]
+# both arms with llm_grid.sh (single-turn, --agentic and/or --prod open loop with PROD_RATES);
+# each writes <res>/provenance.json
+env ... KV_DTYPE=<plow KV dtype, named as vLLM names it> scripts/bench/llm_grid.sh plow <res>/plow [--agentic|--prod]
+env ... scripts/bench/llm_grid.sh vllm <res>/vllm [--agentic|--prod]
 campaign.py gate <recipe> --assets <served assets> --out <gate> --only llm_fp32_ref   # same packet
 campaign.py report --baseline <res>/vllm --infervisor <res>/plow --gate <gate>/gates.json --out <dir> \
     [--cells g128,s128,a64.g]
@@ -174,6 +178,10 @@ Rules (enforced in `serving_comparison.py`, tested in `scripts/bench/test_servin
 * Values are means over repeats (at least 2, the recorded count, identical on both arms). The
   spread, (max - min) / mean, is a note under each table; a spread > 10% marks the value `*` and
   is listed as FLAGGED.
+* Open-loop (`--prod`, cells `q<1000*rate>.g`): the same 12 rows. Input/output pairs on a hash of
+  the whole plan config plus the SLO, Traffic lists each repeat's seed (both arms must replay the
+  same seeds), and any failed request refuses the cell. Goodput, SLO attainment, achieved
+  concurrency, P50s and cached fraction go in a supplementary note under the table, never as rows.
 * Exit 2 = refused, nothing written (missing data, provenance, gate, repeats, unpaired cells).
   Exit 1 = written but NOT MATCHED or NOT EQUIVALENT: not a valid final comparison. Exit 0 = valid.
 
@@ -207,7 +215,7 @@ Pitfalls this playbook exists for:
   done-marker resume. Still wrap GPU commands in `timeout` and keep leases short.
   `gpulease --help` is not help: a label without a command is refused (exit 2).
 * **No nix.** On a hand-built box set `PLOW_CAMPAIGN_NO_NIX=1` (campaign.py, the doctor,
-  verify_patch.sh) instead of faking `ROCM_PATH`.
+  verify_patch.sh, `gpuq.py submit`) instead of faking `ROCM_PATH`.
 
 ---
 
@@ -224,15 +232,17 @@ Every argument is optional and has an env fallback: `PB_ASSETS`, `PLOW_HSACO`, `
 CPU only; leases nothing. Exit 0 = safe to lease, 1 = something will fail after the weights load,
 2 = warnings only. It checks, in order: the nix shell (plus `python3`, `curl`); hazardous `PLOW_*`
 overrides left in the environment; the binaries (plowrt, the vLLM client, `plowc`); the packet hash
-and the object set; `gpulease` and the queue runner; and scratch space (warn at 85% full, fail at
-95%). Run it first. Each check exists because its absence cost a leased run.
+and the object set; `gpulease` and the queue runner; scratch space (warn at 85% full, fail at
+95%); and harness/recipe files vs HEAD. Run it first. Each check exists because its absence cost
+a leased run.
 
 **It is arch-aware, not AMD-only.** `pb_detect_arch` resolves gfx942/gfx950/sm_90a/sm_120/sm_89
 from the hint, then `build.json`'s `arch`, then an objdir glob, then `nvidia-smi`/`rocminfo`. On
 AMD it checks the pinned vendor `.co` kernels that `build_gfx942.sh` does **not** emit (3 `fmoe`
 plus 2 MLA) and the four required `.elf`s; on NVIDIA it checks `.cubin` objects and CUDA symbols in
-plowrt instead. The queue-runner check runs only when `PB_GPUQ` is set *and* `$PB_GPUQ/runner.log`
-exists.
+plowrt instead. The queue-runner check runs only when `PB_GPUQ` (the queue root) is set *and*
+`$PB_GPUQ/runner.log` exists; it recognizes both the `gpuq.py` runner and the lab `runner.py`.
+A fifth argument `block` skips the vLLM client check.
 
 ---
 
@@ -267,9 +277,9 @@ Knobs it reads: `PLOW_CKPT` (the **prepped** checkpoint — a raw-HF dir will re
 
 | tool | use it for |
 |---|---|
-| `scripts/campaign/campaign.py <build\|serve\|bench\|probe\|gate\|cert\|compare\|roofline\|loop\|sweep\|ledger> <recipe>` | the unified campaign driver — a recipe TOML instead of a bespoke probe. See [07 — perf campaign](07-perf-campaign.md). |
+| `scripts/campaign/campaign.py <build\|serve\|bench\|serve-bench\|probe\|gate\|roofline\|loop\|sweep\|block-roofline\|block-bench\|block-ab> <recipe>`, plus `report`, `cert`, `compare`, `ledger` (no recipe; see `--help`) | the unified campaign driver — a recipe TOML instead of a bespoke probe. See [07 — perf campaign](07-perf-campaign.md). |
 | `scripts/bench_plowrt_serve.sh <assets> <port> <model> <tokenizer> [ready-timeout]` | `vllm bench serve` against a plowrt endpoint, sweeping `IN_LENS` x `CONCS`. Handles tokenizer-by-repo-id resolution and process-group teardown. **It runs the client from a `rocm/vllm` Docker image unless `VLLM_VENV` is set** — so by default it is *not* the same client binary as `plowbench.sh`'s. |
-| `scripts/bench_vllm_chat.sh <hf-repo-id> <tp>` | the symmetric vLLM point, same `--backend openai-chat`. Same Docker-image client as `bench_plowrt_serve.sh` unless `VLLM_VENV` is set — pair it with that script, not with `plowbench.sh`. |
+| `scripts/bench_vllm_chat.sh <hf-repo-id> <tp>` | the symmetric vLLM point, same `--backend openai-chat`. Server and client always run from the same Docker image as `bench_plowrt_serve.sh`'s default (it has no `VLLM_VENV`); pair it with that script without `VLLM_VENV`, not with `plowbench.sh`. It takes no lease itself. |
 | `scripts/bench_vllm_rocm.sh`, `scripts/bench_plow_rocm.sh` | the ROCm-side pair. |
 | `scripts/plow_vs_vllm_rocm.py` | the comparison itself. |
 | `scripts/glm53_bench_table.py` | render a result table. |
@@ -339,7 +349,7 @@ tokens from two Gutenberg books, repo docs and repo Rust; eight chat-template ag
 ```bash
 P=scripts/llm/fp32_ref_gate.py; HF=<hub gemma-4-12b-it-fp8 dir>
 python3 $P prompts --hf $HF --corpus pride=pg1342.txt beagle=pg944.txt docs=repo-docs.md code=repo-code.rs --out prompts.json
-gpulease -n 1 fp32-ref timeout 5400 python3 $P reference --hf $HF --prompts prompts.json --out ref.json  # ~50 GB VRAM
+scripts/bench/gpuq.py submit fp32-ref 1 timeout 5400 python3 $P reference --hf $HF --prompts prompts.json --out ref.json  # ~50 GB VRAM
 # recipe: [gates.llm_fp32_ref] reference = ".../ref.json", vllm_hf = $HF, vllm_args = "<matched vLLM serve flags>"
 #         (or vllm_capture = a cached vllm.json against the same ref.json); thresholds as above
 campaign.py gate <recipe> --assets <assets> --out <dir> [--only llm_fp32_ref] [--score-only]

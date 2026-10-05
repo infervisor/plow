@@ -2,9 +2,9 @@
 # llm_grid.sh plow|vllm <resdir> — the matched LLM serving grid, one side per call, run inside ONE
 # lease (the same client, `vllm bench serve` via pb_bench, against both servers):
 #
-#   GL=perf-data/tools/gpulease
-#   $GL -n 1 grid-plow timeout 3600 env ASSETS=... HF=... scripts/bench/llm_grid.sh plow <res>/plow
-#   $GL -n 1 grid-vllm timeout 3600 env HF=... scripts/bench/llm_grid.sh vllm <res>/vllm
+#   Q="scripts/bench/gpuq.py submit"
+#   $Q grid-plow 1 timeout 3600 env ASSETS=... HF=... scripts/bench/llm_grid.sh plow <res>/plow
+#   $Q grid-vllm 1 timeout 3600 env HF=... scripts/bench/llm_grid.sh vllm <res>/vllm
 #   scripts/bench/waterfall.py <res>/plow <res>/vllm          # grid table, spread, waterfall
 #
 # Hygiene it enforces: every cell and repeat draws unique prompts (explicit per-cell seed), so a
@@ -29,6 +29,9 @@
 # (32 64 128) concurrent sessions x AGENTIC_TURNS (10), history growing to AGENTIC_TARGET (15600)
 # tokens, AGENTIC_MAX_TOKENS (128) per reply, AGENTIC_API (chat), REPS repeats, greedy + SAMPLED.
 # Prefix caching stays ON on both sides (vLLM APC default; plow X-Session-Id + prefix cache).
+# Add --prod for the open-loop production mix (agentic_turns.py --open-loop): Poisson session
+# arrivals at each PROD_RATES (sessions/s; required) for PROD_DURATION (300) s, PROD_WARMUP (75) /
+# PROD_COOLDOWN (25) s unmeasured, PROD_ARGS (extra client args: distributions, SLOs); cells q<1000*rate>.
 # Records <resdir>/provenance.json for the strict report (serving_comparison.py render): plow needs
 # KV_DTYPE (or PRECISION) and, for a PLOWRT outside a git checkout, PLOWRT_GIT_SHA.
 set -u
@@ -39,11 +42,11 @@ if [ -n "${BASH_SOURCE[0]:-}" ]; then
 fi
 HERE=$(cd "$(dirname "$0")/../.." && pwd)
 source "$HERE/scripts/bench/plowbench.sh"
-case "${1:-}" in plow|vllm) ;; *) sed -n '2,33p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;; esac
+case "${1:-}" in plow|vllm) ;; *) sed -n '2,36p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;; esac
 SIDE=$1 RES=${2:?resdir}
 if [ "$#" -gt 2 ] && ! { { [ "$3" = --quality ] && [ "$#" -ge 4 ]; } || { [ "$3" = --needle ] && [ "$#" -eq 3 ]; } \
-        || { [ "$3" = --agentic ] && [ "$#" -eq 3 ]; }; }; then
-    echo 'usage: llm_grid.sh plow|vllm resdir [--quality corpus files... | --needle | --agentic]' >&2
+        || { { [ "$3" = --agentic ] || [ "$3" = --prod ]; } && [ "$#" -eq 3 ]; }; }; then
+    echo 'usage: llm_grid.sh plow|vllm resdir [--quality corpus files... | --needle | --agentic | --prod]' >&2
     exit 2
 fi
 : "${PYREF:?python with vllm}" "${HF:?checkpoint dir}"
@@ -119,7 +122,8 @@ MODEL=$(pb_model_id)
 export PB_VLLM=$PYREF PB_TOKENIZER=$HF
 pb_metrics_start "$RES"
 : > "$RES/cells.log"
-if [ "${3:-}" = --agentic ]; then
+if [ "${3:-}" = --prod ]; then : "${PROD_RATES:?sessions/s per load level}"; fi
+if [ "${3:-}" = --agentic ] || [ "${3:-}" = --prod ]; then
     # Distinct seed per (mode, sessions, repeat): no cell replays another's sessions or system prompt.
     agentic() { # tag mode c rep [client args...]
         local tag=$1 mode=$2 c=$3 rep=$4; shift 4
@@ -139,7 +143,32 @@ if [ "${3:-}" = --agentic ]; then
         --tokenizer "$HF" --sessions 16 --turns 3 --target-tokens "${AGENTIC_TARGET:-15600}" \
         --max-tokens "${AGENTIC_MAX_TOKENS:-128}" --api "${AGENTIC_API:-chat}" --seed 1 --temperature 0 \
         --out "$RES/warmup.json" > "$RES/warmup.log" 2>&1
+    # Same seed per (mode, rate, repeat) on both stacks; distinct across cells and repeats.
+    prod() { # tag mode rate rep [client args...]
+        local tag=$1 mode=$2 rate=$3 rep=$4 m; shift 4
+        m=$(python3 -c "print(round(1000 * $rate))")
+        echo "CELL_BEGIN $tag $(date +%s.%N)" >> "$RES/cells.log"
+        memory_start "$tag"
+        # shellcheck disable=SC2086
+        "$PYREF" "$HERE/scripts/bench/agentic_turns.py" --url "http://127.0.0.1:$PB_SERVER_PORT" \
+            --model "$MODEL" --tokenizer "$HF" --open-loop --rate "$rate" --duration "${PROD_DURATION:-300}" \
+            --warmup "${PROD_WARMUP:-75}" --cooldown "${PROD_COOLDOWN:-25}" --api "${AGENTIC_API:-chat}" \
+            --seed $(( 9001 + mode * 1000003 + m * 131 + rep * 7919 )) ${PROD_ARGS:-} \
+            --out "$RES/$tag.json" "$@" > "$RES/$tag.log" 2>&1
+        memory_finish "$tag"
+        echo "CELL_END $tag $(date +%s.%N)" >> "$RES/cells.log"
+        tail -1 "$RES/$tag.log" | sed "s/^/$tag /"
+    }
     for rep in $(seq 1 "$REPS"); do
+        if [ "$3" = --prod ]; then
+            for rate in $PROD_RATES; do
+                m=$(python3 -c "print(round(1000 * $rate))")
+                prod "q$m.g.r$rep" 1 "$rate" "$rep" --temperature 0
+                # shellcheck disable=SC2086
+                [ -n "$SAMPLED" ] && prod "q$m.s.r$rep" 2 "$rate" "$rep" $SAMPLED
+            done
+            continue
+        fi
         for c in ${AGENTIC_CONCS:-32 64 128}; do
             agentic "a$c.g.r$rep" 1 "$c" "$rep" --temperature 0
             # shellcheck disable=SC2086

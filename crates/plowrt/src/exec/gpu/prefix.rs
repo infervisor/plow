@@ -1,6 +1,5 @@
 //! CUDA KV mappings, prefix snapshots and cache attachment.
 
-use std::path::Path;
 use std::sync::Arc;
 
 use crate::asset::devblob::DevBlob;
@@ -131,7 +130,7 @@ impl GpuEngine {
 
     pub(crate) fn select_vmm_prefix_layout(
         blob: &DevBlob,
-        checkpoint_dir: &Path,
+        kv: Option<&plow_asset::serve_manifest::KvGeometry>,
         config: &RuntimeConfig,
         capability: (u32, u32),
         granularity: u64,
@@ -158,7 +157,7 @@ impl GpuEngine {
         {
             return None;
         }
-        let layout = Self::vmm_prefix_layout(blob, checkpoint_dir)?;
+        let layout = Self::vmm_prefix_layout(blob, kv)?;
         if requested.is_none() {
             // Auto-selection is an allowlist of the geometry the sliding-ring
             // snapshot path was qualified on (Gemma 4 hybrid KV), not a
@@ -200,7 +199,7 @@ impl GpuEngine {
 
     pub(crate) fn vmm_prefix_layout(
         blob: &DevBlob,
-        checkpoint_dir: &Path,
+        kv: Option<&plow_asset::serve_manifest::KvGeometry>,
     ) -> Option<VmmPrefixLayout> {
         let batch = blob.decode_prog().ok()?.t;
         let packet_max_ctx = blob
@@ -213,10 +212,8 @@ impl GpuEngine {
             .map(|c| c as u32)
             .unwrap_or(packet_max_ctx)
             .min(packet_max_ctx);
-        let Some(mut geo) =
-            crate::memory::vmm::VmmGeometry::from_config(checkpoint_dir, max_ctx, batch)
-        else {
-            tracing::warn!("vmm off: no usable KV geometry in config.json");
+        let Some(mut geo) = kv.and_then(|kv| crate::memory::vmm::VmmGeometry::from_kv(kv, max_ctx, batch)) else {
+            tracing::warn!("vmm off: no usable KV geometry in the serve manifest");
             return None;
         };
         let find = |name: &str| blob.tensors.iter().position(|t| t.name == name);
@@ -691,6 +688,11 @@ impl GpuEngine {
         self.vmm.as_ref().map(|v| v.kv.stats_handle())
     }
 
+    /// Engine-lock-free attach probe for the mux's admission order; `None` without prefix reuse.
+    pub fn vmm_prefix_probe(&self) -> Option<crate::memory::vmm::PrefixProbe> {
+        self.vmm.as_ref().and_then(|v| v.kv.prefix_probe())
+    }
+
     /// Rows slot `b`'s current sequence attached from the prefix cache
     /// (0 = cold start). Valid from the first prefill chunk on.
     pub fn attached_rows(&self, b: usize) -> u32 {
@@ -759,6 +761,10 @@ impl GpuEngine {
         let rows = self.pos[b];
         let toks = &self.seq_tokens[b];
         let g = v.kv.geometry();
+        let session = self.session_pin[b].is_some();
+        let prompt = v.kv.prompt_rows(b);
+        let prompt_end = is_prompt_end(rows, max_rows, prompt);
+        let max_rows = if session && prompt_end { session_prompt_end(prompt) } else { max_rows };
         let p_a = (rows.min(max_rows) / 32) * 32;
         tracing::info!(
             slot = b,
@@ -778,25 +784,46 @@ impl GpuEngine {
             tracing::info!(slot = b, p_a, "vmm_publish skipped: p_a == 0");
             return;
         }
-        if self.session_pin[b].is_some() {
+        if session {
             v.kv.note_session(b, toks);
         }
         let step = crate::config::RuntimeConfig::get()
             .amd_prefix_fine_rows()
             .map_or(v.kv.block_rows(), |step| step.max(32));
+        // A session's next turn attaches to its prompt end, which retires every checkpoint and
+        // chunk end inside the prompt (`retire_superseded`), and its reply rows are re-rendered:
+        // those snapshots are transient, and each one's trim evicts another session's boundary.
+        // Publish them only for a request waiting on this prefill (`inflight_prefix`).
         let mut p = step;
         while p < p_a {
-            self.publish_boundary(b, p);
+            if !session || v.kv.checkpoint_awaited(toks, p) {
+                self.publish_boundary(b, p);
+            }
             p += step;
         }
-        // Only a prompt-side publish retires: the next turn's prompt re-renders this turn's
-        // reply, which need not re-tokenize to the generated ids, so the turn-end boundary
-        // may not match it and the prompt-end boundary must survive until then.
-        if self.publish_boundary(b, p_a) && self.session_pin[b].is_some() && max_rows < rows {
+        if session && !prompt_end && rows < prompt && !v.kv.checkpoint_awaited(toks, p_a) {
+            return;
+        }
+        // Only the prompt-end publish retires (a chunk-end publish also caps `max_rows` below
+        // `rows`): the next turn's prompt re-renders this turn's reply, which need not
+        // re-tokenize to the generated ids, so the turn-end boundary may not match it and the
+        // prompt-end boundary must survive until then.
+        let published = self.publish_boundary(b, p_a);
+        if let Some(ttl) = self.session_pin[b].filter(|_| published && prompt_end) {
+            // Pinned now, not at retire: while this turn decodes, other sessions' publishes
+            // must not evict it ahead of idle sessions' boundaries.
+            v.kv.pin_prefix(&toks[..p_a as usize], std::time::Instant::now() + ttl);
             let freed = v.kv.retire_superseded(toks, p_a);
             if freed > 0 {
                 tracing::debug!(slot = b, p_a, freed, "vmm: session retired superseded snapshots");
             }
+        }
+        // Turn end: pressure may have evicted the prompt end (the next turn's attach point)
+        // while this turn decoded. The rings still hold its window, so restore it now, newest in
+        // LRU just before the session's next request; a surviving one is only touched.
+        let end = session_prompt_end(prompt) / 32 * 32;
+        if session && rows > prompt && end > 0 && end < p_a {
+            self.publish_boundary(b, end);
         }
     }
 
@@ -811,6 +838,20 @@ impl GpuEngine {
         if rows > c0 && rows <= self.pos[b] {
             self.publish_boundary(b, rows);
         }
+    }
+
+    /// Longest prefill slice from `c0` that leaves slot `b`'s shared-prefix end publishable:
+    /// the rings hold only `ring - window` rows past a boundary (`publish_boundary`), and a
+    /// request slice may be wider than that.
+    pub fn pf_publish_cap(&self, b: usize, c0: usize) -> usize {
+        let Some(v) = self.vmm.as_ref().filter(|v| v.kv.prefix_reuse() && !v.slide.is_empty()) else {
+            return usize::MAX;
+        };
+        let share = v.kv.share_rows(b) as usize;
+        if share <= c0 {
+            return usize::MAX;
+        }
+        share + (v.ring as usize).saturating_sub(v.kv.geometry().window as usize) - c0
     }
 
     /// Slot `b`'s prompt is prefilled and its prompt-end publish has run.
@@ -830,6 +871,32 @@ impl GpuEngine {
         } else {
             v.ring as u32 - v.kv.geometry().window
         };
-        v.kv.inflight_prefix(b, prompt, lookback)
+        v.kv.inflight_prefix(b, prompt, lookback, &self.pos)
     }
+}
+
+/// Rows a session's prompt-end boundary may cover: its next turn re-renders the last few prompt
+/// rows (Gemma 4 drops the generation prompt's empty thought channel, 4 tokens), so a boundary
+/// within them never attaches — about one turn in eight missed that way.
+const SESSION_PROMPT_REWRITE: u32 = 8;
+
+/// The publish at the end of a prompt's prefill: the whole prompt with the last row held back
+/// (`max_rows < rows`), or a packed pass that withheld the last prompt token (`pos` and
+/// `max_rows` both `prompt - 1`). A chunk-end publish caps `max_rows` below `rows`.
+fn is_prompt_end(rows: u32, max_rows: u32, prompt: u32) -> bool {
+    (rows == prompt && max_rows < rows) || (rows + 1 == prompt && max_rows == rows)
+}
+
+fn session_prompt_end(prompt: u32) -> u32 {
+    prompt.saturating_sub(1 + SESSION_PROMPT_REWRITE)
+}
+
+#[cfg(test)]
+#[test]
+fn prompt_end_covers_the_withheld_last_token() {
+    assert!(is_prompt_end(3000, 2999, 3000), "whole prompt, last row held back");
+    assert!(is_prompt_end(2999, 2999, 3000), "packed pass withheld the last prompt token");
+    assert!(!is_prompt_end(2048, 2047, 3000), "chunk end");
+    assert!(!is_prompt_end(2999, 2048, 3000), "chunk-capped publish");
+    assert!(!is_prompt_end(3100, 3099, 3000), "turn end");
 }

@@ -18,6 +18,10 @@ pub trait Tokenize: Send + Sync {
     fn decode(&self, ids: &[u32]) -> String;
     /// Number of token ids accepted by the model embedding table.
     fn vocab_size(&self) -> usize;
+    /// An upper bound on the input bytes one token covers; `usize::MAX` when unknown.
+    fn max_token_bytes(&self) -> usize {
+        usize::MAX
+    }
     /// True for the byte-fallback tokenizer. A real model served through the
     /// byte fallback produces silent garbage (the ids bear no relation to the
     /// checkpoint's vocab), so the GPU-engine install path refuses it loudly.
@@ -35,13 +39,18 @@ impl Tokenize for ByteTokenizer {
         text.bytes().map(|b| b as u32).collect()
     }
 
+    /// Ids past the byte range (a `/detokenize` caller's) are skipped, not wrapped onto a byte.
     fn decode(&self, ids: &[u32]) -> String {
-        let bytes: Vec<u8> = ids.iter().map(|&id| id as u8).collect();
+        let bytes: Vec<u8> = ids.iter().filter_map(|&id| u8::try_from(id).ok()).collect();
         String::from_utf8_lossy(&bytes).into_owned()
     }
 
     fn vocab_size(&self) -> usize {
         256
+    }
+
+    fn max_token_bytes(&self) -> usize {
+        1
     }
 
     fn is_byte_fallback(&self) -> bool {
@@ -88,6 +97,7 @@ pub struct HfTokenizer {
     /// `get_vocab_size(true)` rebuilds the whole vocab map per call (~10 ms on a 154k vocab);
     /// the vocabulary never changes after load.
     vocab_size: usize,
+    max_token_bytes: usize,
     fast: bool,
     /// Smallest split-encode piece in bytes; `None` encodes serially.
     split_min: Option<usize>,
@@ -294,8 +304,13 @@ impl HfTokenizer {
                 .is_some(),
             None => false,
         };
+        // A vocabulary string is never shorter than the input it covers (byte-level and `▁` encode
+        // a byte as 1-3 bytes); the margin covers a normalizer that composes (NFKC Hangul is 3:1).
+        let max_token_bytes =
+            inner.get_vocab(true).keys().map(String::len).max().unwrap_or(1).saturating_mul(4);
         HfTokenizer {
             vocab_size: inner.get_vocab_size(true),
+            max_token_bytes,
             inner,
             fast: rt.encode_fast,
             split_min: split.then_some(floor),
@@ -379,12 +394,21 @@ impl Tokenize for HfTokenizer {
     fn vocab_size(&self) -> usize {
         self.vocab_size
     }
+
+    fn max_token_bytes(&self) -> usize {
+        self.max_token_bytes
+    }
 }
 
 #[cfg(all(test, feature = "hf-tokenizer"))]
 mod tests {
     use super::*;
     use std::str::FromStr;
+
+    #[test]
+    fn byte_decode_skips_ids_past_a_byte() {
+        assert_eq!(ByteTokenizer.decode(&[104, 0x168, u32::MAX, 105]), "hi");
+    }
 
     fn glm_like(add_prefix_space: bool) -> tokenizers::Tokenizer {
         use tokenizers::pre_tokenizers::byte_level::ByteLevel;

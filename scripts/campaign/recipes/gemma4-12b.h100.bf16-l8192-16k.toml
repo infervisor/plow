@@ -39,6 +39,7 @@ PLOW_SLIDING_NS_CAP = "1"
 PLOW_MAX_CHUNK = "8192"
 # One request's rows per launch; sizes the sliding ring (see the header). Must be a prefill rung.
 PLOW_MAX_REQUEST_CHUNK = "4224"
+PLOW_STAGE_ROWS = "0"               # unstaged ring as measured; auto staging not re-measured here
 # FINE-GRAINED RUNGS, as in the 26B recipes: the server prepends BOS, so an N-token bench prompt
 # is N+1 rows and crosses its rung — without these a 129-row prompt runs the 512 bucket and a
 # 1025-row one the 2048 bucket (or pays a second launch for a 1-row tail).

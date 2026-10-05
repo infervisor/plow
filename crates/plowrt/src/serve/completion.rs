@@ -149,7 +149,7 @@ async fn completions_with(
             use crate::serve::manager::EnsureError;
             if let Err(e) = mgr.ensure_resident(&req.model).await {
                 return match e {
-                    EnsureError::WontFit { .. } => (
+                    EnsureError::WontFit { .. } | EnsureError::SwitchTimeout(_) => (
                         axum::http::StatusCode::SERVICE_UNAVAILABLE,
                         [("retry-after", "30")],
                         Json(serde_json::json!({"error": e.to_string()})),
@@ -171,7 +171,11 @@ async fn completions_with(
         }
     }
 
-    if let Err(e) = req.sampling.validate() {
+    if let Err(e) = req
+        .sampling
+        .validate()
+        .and_then(|()| crate::serve::openai::validate_limits(req.max_tokens, req.stop.as_ref()))
+    {
         return crate::serve::api_error(
             axum::http::StatusCode::BAD_REQUEST,
             e.message,
@@ -243,11 +247,19 @@ async fn completions_with(
     };
     let encode = |text: &str| {
         crate::obs::ttft::timed(&crate::obs::ttft::ENCODE, || {
-            bundle
-                .tokenizer()
-                .encode_with_special_tokens(text, req.add_special_tokens)
+            crate::serve::encode_prompt(text, |t| {
+                bundle.tokenizer().encode_with_special_tokens(t, req.add_special_tokens)
+            })
         })
     };
+    let text_bytes = match &req.prompt {
+        PromptSpec::Text(text) => text.len(),
+        PromptSpec::Batch(v) => v.iter().map(String::len).sum(),
+        PromptSpec::Tokens(_) | PromptSpec::TokenBatch(_) => 0,
+    };
+    if let Some(e) = crate::serve::prompt_bytes_overflow(state.max_ctx(&req.model), bundle.tokenizer().max_token_bytes(), text_bytes) {
+        return crate::serve::api_error_for(&e);
+    }
     let prompt_ids = match &req.prompt {
         PromptSpec::Text(text) => encode(text),
         PromptSpec::Tokens(ids) => ids.clone(),
@@ -288,6 +300,12 @@ async fn completions_with(
         );
     }
     let n_prompt = prompt_ids.len();
+    if req.max_tokens.is_none() {
+        gen.max_tokens = crate::serve::default_max_tokens(gen.max_tokens, state.max_ctx(&req.model), n_prompt);
+    }
+    if let Some(e) = crate::serve::context_overflow(state.max_ctx(&req.model), n_prompt, gen.max_tokens) {
+        return crate::serve::api_error_for(&e);
+    }
     let (tx, rx) = stream_mod::channel();
     let response_prompt_ids = req.return_token_ids.then(|| prompt_ids.clone());
     let lp_fmt = logprobs.map(|_| crate::serve::logprobs::TokenText {
@@ -401,7 +419,7 @@ async fn buffer_and_reply(
                     lps.push(fmt, id, lp, text.len());
                 }
                 text.push_str(&delta);
-                if prompt_token_ids.is_some() {
+                if prompt_token_ids.is_some() && id != crate::serve::stream::TEXT_ONLY {
                     completion_token_ids.push(id);
                 }
             }

@@ -695,8 +695,42 @@ impl SelectArgs {
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Before the runtime starts threads and before the CLI reads the environment.
+    let asset_defaults = apply_asset_env_defaults();
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(async_main(asset_defaults))
+}
+
+/// `serve --assets`: export each bundle's packet-carried serve-knob defaults (and its
+/// self-contained `objects/` and cuBLASLt table) unless the environment already sets them, so
+/// `plowrt serve --assets <dir>` alone serves the qualified configuration.
+fn apply_asset_env_defaults() -> Vec<(String, String, String)> {
+    let Ok(cli) = Cli::try_parse() else {
+        return Vec::new();
+    };
+    let Cmd::Serve { assets, .. } = &cli.cmd else {
+        return Vec::new();
+    };
+    match plowrt::asset::serve::asset_env_defaults(assets, |k| {
+        std::env::var(k).ok().filter(|v| !v.is_empty())
+    }) {
+        Ok(defaults) => {
+            for (key, value, _) in &defaults {
+                std::env::set_var(key, value);
+            }
+            defaults
+        }
+        Err(e) => {
+            eprintln!("plowrt serve: {e}");
+            std::process::exit(2);
+        }
+    }
+}
+
+async fn async_main(asset_defaults: Vec<(String, String, String)>) -> Result<(), Box<dyn std::error::Error>> {
     let matches = Cli::command().get_matches();
     let cli = Cli::from_arg_matches(&matches).unwrap_or_else(|err| err.exit());
     let filter =
@@ -732,6 +766,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "plowrt starting"
     );
 
+    for (key, value, source) in &asset_defaults {
+        tracing::info!(%key, %value, %source, "serve default from the assets");
+    }
     RuntimeConfig::init(cli.rt_cfg);
     let _ = plowrt::obs::serving::started_at_unix_ms();
     plowrt::knob_spec::warn_removed_env();
@@ -3852,33 +3889,47 @@ async fn serve(
     #[cfg(feature = "cuda")]
     {
         let state = Arc::clone(&state);
-        tokio::task::spawn_blocking(move || {
-            plowrt::asr::serving::preload(&state);
-            plowrt::tts::serving::preload(&state);
+        tokio::task::spawn_blocking(move || -> Result<(), String> {
+            plowrt::asr::serving::preload(&state).map_err(|e| e.to_string())?;
+            plowrt::tts::serving::preload(&state)
         })
-        .await?;
+        .await??;
     }
 
     let router = app(Arc::clone(&state));
+    let shutdown_state = Arc::clone(&state);
+    let shutdown_socket = socket.clone();
 
     // TCP listener: unchanged, always on.
     let tcp_addr = std::net::SocketAddr::from((bind, port));
     let tcp_listener = tokio::net::TcpListener::bind(tcp_addr).await?;
     tracing::info!(%tcp_addr, "plowrt serving OpenAI API over TCP");
     let tcp_router = router.clone();
+    let tcp_http = HttpConns::from_config("TCP");
+    let mut conn_slots: Vec<(Arc<tokio::sync::Semaphore>, usize)> = tcp_http.slots().into_iter().collect();
     let tcp_task = tokio::spawn(async move {
-        // TCP_NODELAY: a streamed response is headers, then the first token as a SECOND small
-        // write. With Nagle on, that write waits for the client's delayed ACK of the headers
-        // (~40 ms) on a reused keep-alive connection, so any TTFT under 40 ms reads as ~42 ms no
-        // matter how fast prefill is. Measured: 128-row prefill 28.7 ms on device, first chunk
-        // 32.5 ms on a fresh connection, 42.3 ms from `vllm bench`'s pooled one.
-        if let Err(e) = axum::serve(tcp_listener, tcp_router).tcp_nodelay(true).await {
-            tracing::error!(error = %e, "TCP listener error");
+        let svc = hyper_util::service::TowerToHyperService::new(tcp_router);
+        loop {
+            let permit = tcp_http.permit().await;
+            let stream = match tcp_listener.accept().await {
+                Ok((stream, _)) => stream,
+                Err(e) => {
+                    accept_failed("TCP", &e).await;
+                    continue;
+                }
+            };
+            // TCP_NODELAY: a streamed response is headers, then the first token as a SECOND small
+            // write. With Nagle on, that write waits for the client's delayed ACK of the headers
+            // (~40 ms) on a reused keep-alive connection, so any TTFT under 40 ms reads as ~42 ms no
+            // matter how fast prefill is. Measured: 128-row prefill 28.7 ms on device, first chunk
+            // 32.5 ms on a fresh connection, 42.3 ms from `vllm bench`'s pooled one.
+            let _ = stream.set_nodelay(true);
+            tcp_http.spawn(stream, svc.clone(), permit);
         }
     });
 
-    // Optional UDS listener: bridged through hyper directly (axum 0.7's
-    // `serve` accepts only TcpListener). Also exposes privileged model control.
+    // Optional UDS listener, with its own connection cap so a TCP flood cannot lock out the
+    // privileged model control it also exposes.
     let uds_task = if let Some(path) = socket {
         // Clear a stale socket (previous crashed instance left it behind).
         if path.exists() {
@@ -3894,48 +3945,226 @@ async fn serve(
         }
         tracing::info!(socket = %path.display(), "plowrt serving OpenAI API over UDS");
         let uds_router = router.clone().merge(plowrt::serve::admin_app(state));
+        let http = HttpConns::from_config("UDS");
+        conn_slots.extend(http.slots());
         Some(tokio::spawn(async move {
             let svc = hyper_util::service::TowerToHyperService::new(uds_router);
             loop {
-                let (stream, _addr) = match uds_listener.accept().await {
-                    Ok(v) => v,
+                let permit = http.permit().await;
+                let stream = match uds_listener.accept().await {
+                    Ok((stream, _)) => stream,
                     Err(e) => {
-                        tracing::warn!(error = %e, "UDS accept failed");
+                        accept_failed("UDS", &e).await;
                         continue;
                     }
                 };
-                let svc = svc.clone();
-                tokio::spawn(async move {
-                    let io = hyper_util::rt::TokioIo::new(stream);
-                    if let Err(e) = hyper_util::server::conn::auto::Builder::new(
-                        hyper_util::rt::TokioExecutor::new(),
-                    )
-                    .serve_connection_with_upgrades(io, svc)
-                    .await
-                    {
-                        tracing::debug!(error = %e, "UDS connection ended");
-                    }
-                });
+                http.spawn(stream, svc.clone(), permit);
             }
         }))
     } else {
         None
     };
 
-    // Wait until any listener task exits. In practice they run until the
-    // process is signaled; the join here just keeps `main` alive.
-    match uds_task {
-        Some(uds) => {
-            tokio::select! {
-                r = tcp_task => { if let Err(e) = r { tracing::error!(error = %e, "TCP task join"); } }
-                r = uds => { if let Err(e) = r { tracing::error!(error = %e, "UDS task join"); } }
-            }
+    // Run until a listener exits or SIGTERM/SIGINT arrives.
+    let accept_loops: Vec<_> =
+        std::iter::once(tcp_task.abort_handle()).chain(uds_task.as_ref().map(|t| t.abort_handle())).collect();
+    let uds = async {
+        match uds_task {
+            Some(t) => t.await,
+            None => std::future::pending().await,
         }
-        None => {
-            if let Err(e) = tcp_task.await {
-                tracing::error!(error = %e, "TCP task join");
+    };
+    tokio::select! {
+        r = tcp_task => { if let Err(e) = r { tracing::error!(error = %e, "TCP task join"); } }
+        r = uds => { if let Err(e) = r { tracing::error!(error = %e, "UDS task join"); } }
+        signal = shutdown_signal() => {
+            tracing::info!(signal, "shutdown: draining in-flight requests");
+            drain_for_shutdown(&shutdown_state).await;
+            for l in &accept_loops {
+                l.abort();
             }
+            flush_connections(&conn_slots, std::time::Duration::from_secs(2)).await;
+            if let Some(path) = shutdown_socket {
+                let _ = std::fs::remove_file(path);
+            }
+            tracing::info!("shutdown: drained");
+            // Engine threads and blocking tick tasks never finish on their own; the runtime's
+            // drop would wait on them forever.
+            std::process::exit(0);
         }
     }
     Ok(())
+}
+
+/// Per-listener HTTP connection handling: hyper's header-read timeout (which also ends an idle
+/// keep-alive connection) and a cap on open connections.
+struct HttpConns {
+    builder: Arc<hyper_util::server::conn::auto::Builder<hyper_util::rt::TokioExecutor>>,
+    open: Option<Arc<tokio::sync::Semaphore>>,
+}
+
+impl HttpConns {
+    fn from_config(listener: &str) -> Self {
+        let rt = plowrt::config::RuntimeConfig::get();
+        Self::new(listener, rt.http_header_timeout_ms.unwrap_or(30_000), rt.http_max_connections.unwrap_or(4096))
+    }
+
+    fn new(listener: &str, header_ms: u64, max: usize) -> Self {
+        let mut builder = hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new());
+        builder
+            .http1()
+            .timer(hyper_util::rt::TokioTimer::new())
+            .header_read_timeout((header_ms > 0).then(|| std::time::Duration::from_millis(header_ms)));
+        tracing::info!(listener, header_timeout_ms = header_ms, max_connections = max, "HTTP connection limits");
+        HttpConns {
+            builder: Arc::new(builder),
+            open: (max > 0).then(|| Arc::new(tokio::sync::Semaphore::new(max.min(tokio::sync::Semaphore::MAX_PERMITS)))),
+        }
+    }
+
+    /// The connection slots and their count, for the shutdown flush.
+    fn slots(&self) -> Option<(Arc<tokio::sync::Semaphore>, usize)> {
+        self.open.as_ref().map(|s| (Arc::clone(s), s.available_permits()))
+    }
+
+    /// Wait for a free connection slot; at the cap the listener stops accepting.
+    async fn permit(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        match &self.open {
+            Some(open) => Arc::clone(open).acquire_owned().await.ok(),
+            None => None,
+        }
+    }
+
+    fn spawn<I>(
+        &self,
+        io: I,
+        svc: hyper_util::service::TowerToHyperService<axum::Router>,
+        permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    ) where
+        I: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    {
+        let builder = Arc::clone(&self.builder);
+        tokio::spawn(async move {
+            let _permit = permit;
+            // Upgrades: the ASR websocket route.
+            if let Err(e) = builder.serve_connection_with_upgrades(hyper_util::rt::TokioIo::new(io), svc).await {
+                tracing::debug!(error = %e, "HTTP connection ended");
+            }
+        });
+    }
+}
+
+#[cfg(test)]
+mod http_conn_tests {
+    use super::HttpConns;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    async fn server(http: HttpConns) -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let svc = hyper_util::service::TowerToHyperService::new(
+            axum::Router::new().route("/", axum::routing::get(|| async { "ok" })),
+        );
+        tokio::spawn(async move {
+            loop {
+                let permit = http.permit().await;
+                let (stream, _) = listener.accept().await.unwrap();
+                http.spawn(stream, svc.clone(), permit);
+            }
+        });
+        addr
+    }
+
+    /// A client that never finishes its request head is dropped at the header timeout, and an
+    /// idle keep-alive connection after a served request is too.
+    #[tokio::test]
+    async fn a_silent_or_idle_connection_is_closed_at_the_header_timeout() {
+        let addr = server(HttpConns::new("test", 100, 16)).await;
+        let mut slow = tokio::net::TcpStream::connect(addr).await.unwrap();
+        slow.write_all(b"GET / HTTP/1.1\r\nHost: x\r\n").await.unwrap();
+        let mut buf = Vec::new();
+        let read = tokio::time::timeout(std::time::Duration::from_secs(5), slow.read_to_end(&mut buf)).await;
+        assert!(read.is_ok(), "the half-sent request was not cut");
+
+        let mut idle = tokio::net::TcpStream::connect(addr).await.unwrap();
+        idle.write_all(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n").await.unwrap();
+        let read = tokio::time::timeout(std::time::Duration::from_secs(5), idle.read_to_end(&mut buf)).await;
+        assert!(read.is_ok(), "the idle keep-alive connection was not closed");
+        assert!(String::from_utf8_lossy(&buf).contains("200 OK"));
+    }
+
+    /// At the cap the next connection is not served until one closes.
+    #[tokio::test]
+    async fn connections_past_the_cap_wait_for_a_free_slot() {
+        let addr = server(HttpConns::new("test", 0, 1)).await;
+        let first = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut second = tokio::net::TcpStream::connect(addr).await.unwrap();
+        second.write_all(b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").await.unwrap();
+        let mut buf = Vec::new();
+        let early = tokio::time::timeout(std::time::Duration::from_millis(200), second.read_to_end(&mut buf)).await;
+        assert!(early.is_err(), "served past the cap");
+        drop(first);
+        tokio::time::timeout(std::time::Duration::from_secs(5), second.read_to_end(&mut buf)).await.unwrap().unwrap();
+        assert!(String::from_utf8_lossy(&buf).contains("200 OK"));
+    }
+}
+
+async fn accept_failed(listener: &str, e: &std::io::Error) {
+    use std::io::ErrorKind::{ConnectionAborted, ConnectionRefused, ConnectionReset};
+    if matches!(e.kind(), ConnectionAborted | ConnectionRefused | ConnectionReset) {
+        return;
+    }
+    // EMFILE and friends persist; retrying at once spins a core and floods the log.
+    tracing::warn!(listener, error = %e, "accept failed");
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+}
+
+async fn shutdown_signal() -> &'static str {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let (Ok(mut term), Ok(mut int)) = (signal(SignalKind::terminate()), signal(SignalKind::interrupt())) else {
+            return std::future::pending().await;
+        };
+        tokio::select! {
+            _ = term.recv() => "SIGTERM",
+            _ = int.recv() => "SIGINT",
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+        "ctrl-c"
+    }
+}
+
+/// After the drain the muxes have queued every final chunk, but the connection tasks may not have
+/// written them yet: wait until every connection closed, or `grace` (an idle keep-alive connection
+/// holds its slot until the header timeout). Without a connection cap there is nothing to count.
+async fn flush_connections(slots: &[(Arc<tokio::sync::Semaphore>, usize)], grace: std::time::Duration) {
+    let deadline = tokio::time::Instant::now() + grace;
+    if slots.is_empty() {
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        return;
+    }
+    while tokio::time::Instant::now() < deadline
+        && slots.iter().any(|(s, max)| s.available_permits() < *max)
+    {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
+/// Stop admitting and let live generations finish, bounded by `PLOW_DRAIN_TIMEOUT_MS` (30 s
+/// when unset), then close whatever is still running with what it produced.
+async fn drain_for_shutdown(state: &Arc<AppState>) {
+    let deadline = std::time::Duration::from_millis(
+        plowrt::config::RuntimeConfig::get().drain_timeout_ms().unwrap_or(30_000),
+    );
+    let muxes: Vec<_> = state.registry.slugs().iter().filter_map(|s| state.mux(s)).collect();
+    futures::future::join_all(muxes.into_iter().map(|mux| async move {
+        if tokio::time::timeout(deadline, mux.drain()).await.is_err() {
+            mux.preempt().await;
+        }
+    }))
+    .await;
 }

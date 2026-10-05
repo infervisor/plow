@@ -49,6 +49,12 @@ const GLM_RECIPE_PF_EXT: Status = Status::Qualified {
         "crates/devgen/src/emit_config.rs GLM_GEMM_LT_PF_EXT_QUALIFIED: router excluded, review log #65",
     ],
 };
+/// Unset stages a packed sliding prefill whose request chunk exceeds the window-derived chunk.
+const STAGE_ROWS: Status = Status::Qualified {
+    evidence: &[
+        "docs/flags-reference.md PLOW_STAGE_ROWS: Gemma-4 12B H100 request chunk 4096 staged at 1024 keeps the 2048-row ring; `=0` is the rollback",
+    ],
+};
 const DECODE_LADDER: Status = Status::Qualified {
     evidence: &[
         "crates/devgen/src/lib.rs apply_production_defaults: gfx942 MM=16 object costs c=8 -27.5%; the ladder stops at 8",
@@ -600,7 +606,10 @@ const C_SEQ_PAR_PROJ: &[Constraint] = &[Constraint {
 const C_STAGE_ROWS: &[Constraint] = &[Constraint {
     id: "stage_rows_requires_max_request_chunk",
     formula: F::Implies(
-        &F::Atom("emit.stage_rows", Cmp::Ne, Val::Unset),
+        &F::And(&[
+            F::Atom("emit.stage_rows", Cmp::Ne, Val::Unset),
+            F::Atom("emit.stage_rows", Cmp::Ne, Val::Nat(0)),
+        ]),
         &F::Atom("emit.max_request_chunk", Cmp::Ne, Val::Unset),
     ),
     site: "crates/plow-asset/src/packed_prefill.rs: stage_slots refuses an unmasked plan — a stage \
@@ -1050,7 +1059,7 @@ pub const EMIT: &[KnobSpec] = &[
     KnobSpec::new("emit.decode_projection_tuning", None, Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.max_chunk", Some("PLOW_MAX_CHUNK"), Layer::Emit, U32, UNSET, OPT_IN),
     KnobSpec::new("emit.max_request_chunk", Some("PLOW_MAX_REQUEST_CHUNK"), Layer::Emit, U32, UNSET, OPT_IN),
-    KnobSpec::new("emit.stage_rows", Some("PLOW_STAGE_ROWS"), Layer::Emit, U32, UNSET, OPT_IN).with(C_STAGE_ROWS),
+    KnobSpec::new("emit.stage_rows", Some("PLOW_STAGE_ROWS"), Layer::Emit, U32, UNSET, STAGE_ROWS).with(C_STAGE_ROWS),
     KnobSpec::new("emit.gemv_split", Some("PLOW_GEMV_SPLIT"), Layer::Emit, U32, Default::Static(Val::Nat(1)), OPT_IN),
     KnobSpec::new("emit.decode_tiled", Some("PLOW_DECODE_TILED"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.l2_place_prefill", Some("PLOW_L2_PLACE_PREFILL"), Layer::Emit, Domain::Bool, ON, PROMOTED),
@@ -1239,6 +1248,7 @@ pub const EMIT: &[KnobSpec] = &[
     KnobSpec::new("emit.gemma4_sm90_hd256_gqa2_wide", Some("PLOW_GEMMA4_SM90_HD256_GQA2_WIDE"), Layer::Emit, Domain::Bool, GQA2_WIDE_DEFAULT, GQA2_WIDE_QUALIFIED),
     KnobSpec::new("emit.gemma4_sm90_hd512_px4_bq64_role", Some("PLOW_GEMMA4_SM90_HD512_PX4_BQ64_ROLE"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.gen_kernels", Some("PLOW_EMIT_GEN_KERNELS"), Layer::Emit, Domain::Str, UNSET, OPT_IN),
+    KnobSpec::new("emit.serve_defaults", Some("PLOW_EMIT_SERVE_DEFAULTS"), Layer::Emit, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("emit.fp8_pf_gemm_role", Some("PLOW_FP8_PF_GEMM_ROLE"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.fp8_pf_isolate", Some("PLOW_QWEN_FP8_PF_ISOLATE"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.attention_pf_role", Some("PLOW_ATTENTION_PF_ROLE"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
@@ -1322,6 +1332,8 @@ pub const RAW_ENV: &[KnobSpec] = &[
     KnobSpec::new("env.PLOW_BUILD_FA_V3_PACK", Some("PLOW_BUILD_FA_V3_PACK"), Layer::RawEnv, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("env.PLOW_BUILD_FA_GQA2_PAIR", Some("PLOW_BUILD_FA_GQA2_PAIR"), Layer::RawEnv, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("env.PLOW_BUILD_FP8KV_FA", Some("PLOW_BUILD_FP8KV_FA"), Layer::RawEnv, Domain::Bool, OFF, OPT_IN),
+    KnobSpec::new("env.PLOW_BUILD_FP8KV_GEMM", Some("PLOW_BUILD_FP8KV_GEMM"), Layer::RawEnv, Domain::Bool, OFF, OPT_IN),
+    KnobSpec::new("env.PLOW_BUILD_GEMM_SMEPI", Some("PLOW_BUILD_GEMM_SMEPI"), Layer::RawEnv, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("env.PLOW_BUILD_FATLITE", Some("PLOW_BUILD_FATLITE"), Layer::RawEnv, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("env.PLOW_BUILD_FATLITE_MOE", Some("PLOW_BUILD_FATLITE_MOE"), Layer::RawEnv, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("env.PLOW_BUILD_MASKED_PADDING", Some("PLOW_BUILD_MASKED_PADDING"), Layer::RawEnv, Domain::Str, UNSET, OPT_IN),
@@ -2079,6 +2091,7 @@ pub const OBJECT_DEFINES: &[KnobSpec] = &[
     KnobSpec::new("def.PLOW_SM90_WGMMA_CUH", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_SMP_THREADS", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_SMP_CAND", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
+    KnobSpec::new("def.PLOW_SPEECH_OPS", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_STAGE1_MIN_OCC", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_STAGE1_WG", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_TB_DEVICE", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),

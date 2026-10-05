@@ -393,6 +393,20 @@ impl AudioLmContract {
                 .cloned()
                 .ok_or_else(|| RuntimeError::Rejected(format!("audio LM string {name:?} is missing")))
         };
+        // The serving frontend decodes 16 kHz audio into windows of at most 30 s. A packet that
+        // declares other audio is refused here instead of being fed the wrong signal.
+        for (name, have) in [
+            ("audio.sample_rate", u64::from(super::frontend::SAMPLE_RATE)),
+            ("audio.max_seconds", (super::frontend::MAX_SAMPLES / super::frontend::SAMPLE_RATE as usize) as u64),
+        ] {
+            if let Some(&want) = decoder.parameters.get(name) {
+                if want != have {
+                    return Err(RuntimeError::Rejected(format!(
+                        "packet {name} = {want}; this plowrt's audio frontend serves {have}"
+                    )));
+                }
+            }
+        }
         let lines = |name: &str| -> Result<Vec<String>> {
             Ok(text(name)?.lines().filter(|l| !l.is_empty()).map(str::to_owned).collect())
         };
@@ -403,7 +417,7 @@ impl AudioLmContract {
         let messages: serde_json::Value = serde_json::from_str(&text("prompt.messages")?)
             .map_err(|e| RuntimeError::Rejected(format!("audio LM prompt.messages: {e}")))?;
 
-        let encoder_path = packet.with_file_name("encoder.pkt");
+        let encoder_path = crate::exec::packet_runtime::stage_packet(packet, "encoder.packet", "encoder.pkt")?;
         let encoder = crate::exec::packet_runtime::PacketAsset::load(&encoder_path)?;
         let audio = encoder
             .pipelines()

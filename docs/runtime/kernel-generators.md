@@ -339,7 +339,7 @@ in `NVCC_APPEND_FLAGS`; the system g++ 15 fails in `cuda_fp16.h`).
 
 ## Gemma-4 12B FP8 per-rung routes (H100, FP8 KV, 16K, 128 slots)
 
-Recipe `scripts/campaign/recipes/gemma4-12b.h100.fp8kv-16k-c128.toml`; control = the same packet
+Recipe `recipes/infervisor/gemma-4-12b/sm90a-h100-tp1.toml`; control = the same packet
 without the generated roles, the decode defines and with the 64 rung. `step_bench`, 2 reps
 (agree within 0.3%). Floors: `op_roof` at 3210 GB/s / dense peak, rows-linear for packs
 (approximate).
@@ -397,6 +397,54 @@ within 0.1% at 4K c32; its other cells were cut to free the shared GPU.
 The control's FP8-KV packed prefill (interpreter arms, serial over requests, decode rows riding
 the pack) is what made this packet unservable at ≥ 4K. The generated roles deal every
 request's tiles across all CTAs, riders included.
+
+### Native FP8 GEMM object and request chunk 4096 (2026-10-04)
+
+The native rows of the route matrix (down_proj at M = 1088 and ≥ 2048, the 2112/4160
+exceptions) were measured on the ws384 body, but an FP8-KV packet loads
+`interp_sm90a_pfpackedgemm_fp8kv.cubin`, which the segment script never rebuilt: those
+projections ran the base emit's generic GEMM (128 regs, 1.8 KB stack). down_proj at M = 4096
+took 1.76-2.34 ms there vs 0.37 ms on ws384 (cuBLASLt 0.40 ms; route bench, cold weights). That
+was the whole per-row loss of the 2048/4096 rungs. `PLOW_BUILD_FP8KV_GEMM=1` builds the ws384
+object for it (160 regs, no stack; same ABI symbols); the route matrix itself is unchanged.
+
+`step_bench`, one request of M rows on the request-chunk-4096 packet, first chunk (prefix 0), ms
+and µs/row, and `PLOW_PF_SEG_TIME` classes gemm / light / attention ms (generic → ws384). 4160 /
+4224 are 4096 slices plus riding decode rows; a single request caps at 4096, so they share the
+4096 kernels and were not timed separately.
+
+| M | generic ms (µs/row) | ws384 ms (µs/row) | generic classes | ws384 classes |
+|---|---|---|---|---|
+| 1024 | 35.8 (34.9) | 35.6 (34.8) | 0.8 / 15.9 / 20.0 | 0.0 / 16.0 / 20.0 |
+| 1088 | 67.4 (62.0) | 50.5 (46.4) | 26.8 / 21.6 / 19.9 | 8.8 / 21.6 / 20.1 |
+| 1152 | 46.8 (40.6) | 46.8 (40.6) | 0.7 / 22.0 / 24.8 | 0.0 / 21.9 / 24.6 |
+| 2048 | 102.7 (50.1) | 69.1 (33.7) | 43.4 / 32.1 / 27.9 | 9.3 / 32.1 / 27.8 |
+| 2112 | 123.0 (58.2) | 78.5 (37.2) | 58.6 / 36.4 / 28.5 | 13.7 / 36.3 / 28.4 |
+| 4096 | 212.6 (51.9) | 145.9 (35.6) | 84.9 / 73.0 / 54.6 | 18.1 / 73.0 / 54.3 |
+
+One 15,872-token request (3 reps, warm): request chunk 1024 control 756 ms (with the ws384
+object 758 ms: its only native rung, 1088, does not occur here), request chunk 4096 staged 745
+ms (generic object 1012 ms). Every arm emits the same first token and token-stream digest. The
+light ops (norm + quant, `interp_sm90a_pfpackedseg_fp8kv.cubin`, also the base generic body,
+not FATLITE) run at ~20% of the HBM floor and are the next per-row cost; the projections run at
+1.1-1.3 PFLOP/s.
+
+FP32-reference gate, request chunk 4096: **PASS**, kl_mean 0.110 vs vLLM 0.128, kl_p99 3.0 vs
+3.19, top1_decisive 0.980 vs 0.982, needle_acc 1.0.
+
+Served (`llm_grid.sh`, REPS=2, one server per cell, same binary; recipe serve env, interleave
+2048). Request chunk 1024 recipe as it was (generic GEMM object) → request chunk 4096 staged
+with the ws384 object; output tok/s, TTFT p99 ms, TPOT p99 ms:
+
+| cell | chunk 1024 | chunk 4096 |
+|---|---|---|
+| agentic16k c32 | 495.5, 5213, 76.5 | 581.4, 3708, 64.1 |
+| 4K c32 | 404.0, 7966, 74.3 | 548.0, 5464, 54.6 |
+| 4K c128 | 442.9, 34306, 139.2 | 618.1, 23921, 98.8 |
+| 15K c32 | 107.9, 35165, 155.6 | 144.6, 25941, 114.7 |
+| 15K c128 | 108.6, 144666, 156.4 | 146.1, 106476, 115.7 |
+
+The recipe takes `PLOW_MAX_REQUEST_CHUNK = "4096"` and `PLOW_BUILD_FP8KV_GEMM = "1"`.
 
 ## Next pilots (ranked)
 

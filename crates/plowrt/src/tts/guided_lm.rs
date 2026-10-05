@@ -89,7 +89,12 @@ impl GuidedLmContract {
     }
 
     pub fn load(assets: &Path) -> Result<Option<Self>> {
-        let asset = crate::exec::packet_runtime::PacketAsset::load(&assets.join("model.pkt"))?;
+        let Some(pkt) = crate::asset::devblob::DevBlob::find_in_dir(assets)? else {
+            return Ok(None);
+        };
+        let Some(asset) = crate::exec::packet_runtime::PacketAsset::load_if_present(&pkt)? else {
+            return Ok(None);
+        };
         let mut found = asset.pipelines().iter().filter(|p| p.driver == DRIVER);
         match (found.next(), found.next()) {
             (None, _) => Ok(None),

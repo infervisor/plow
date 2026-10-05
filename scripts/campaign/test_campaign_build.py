@@ -13,6 +13,26 @@ import campaign
 
 
 class CampaignBuildTests(unittest.TestCase):
+    def test_every_recipe_serve_env_yields_loadable_serve_defaults(self):
+        import tomllib
+        known = campaign.runtime_knobs()
+        self.assertIn("PLOW_PF_INTERLEAVE", known)
+        recipes = sorted((campaign.REPO / "recipes").rglob("*.toml")) + sorted(
+            (campaign.REPO / "scripts/campaign/recipes").glob("*.toml"))
+        self.assertTrue(recipes)
+        for path in recipes:
+            r = tomllib.loads(path.read_text())
+            keep, _ = campaign.packet_serve_defaults(r, Path("/tmp/out"))
+            for k, v in keep.items():
+                self.assertTrue(k.startswith("PLOW_") and k in known, f"{path}: {k}")
+                self.assertNotIn("/", v, f"{path}: {k}")
+                self.assertNotIn(",", v, f"{path}: {k}")
+        keep, skipped = campaign.packet_serve_defaults(
+            {"serve": {"env": {"LD_LIBRARY_PATH": "/usr/local/cuda/lib64", "PLOW_LIBCUDA": "/usr/lib/libcuda.so",
+                               "PLOW_PF_INTERLEAVE": "2048", "PLOW_PREFIX_CACHE": "1"}}}, Path("/tmp/out"))
+        self.assertEqual(keep, {"PLOW_PF_INTERLEAVE": "2048"})
+        self.assertEqual(sorted(skipped), ["LD_LIBRARY_PATH", "PLOW_LIBCUDA"])
+
     def test_role_rebuild_preserves_overrides_and_copies_final_objects(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

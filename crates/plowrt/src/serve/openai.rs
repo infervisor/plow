@@ -88,6 +88,12 @@ impl SamplingFields {
                 });
             }
         }
+        if self.stop_token_ids.as_ref().is_some_and(|ids| ids.len() > MAX_STOP_TOKEN_IDS) {
+            return Err(ParamError {
+                field: "stop_token_ids",
+                message: format!("at most {MAX_STOP_TOKEN_IDS} `stop_token_ids` are accepted"),
+            });
+        }
         for (k, v) in self.logit_bias.iter().flatten() {
             if k.parse::<u32>().is_err() {
                 return Err(ParamError {
@@ -216,6 +222,36 @@ pub struct ChatRequest {
     pub function_call: Option<serde_json::Value>,
     #[serde(default)]
     pub response_format: Option<serde_json::Value>,
+}
+
+/// Stop matching runs on the serialized dispatcher for every generated token, in time
+/// proportional to the number and length of the stop strings, so a single request with
+/// unbounded ones stalls decoding for every request on its model.
+pub const MAX_STOP_STRINGS: usize = 64;
+pub const MAX_STOP_STRING_BYTES: usize = 1024;
+pub const MAX_STOP_TOKEN_IDS: usize = 1024;
+
+/// Request limits shared by chat and completions: a zero token budget and stop sets the
+/// dispatcher cannot afford to scan per token are refused with a 400.
+pub fn validate_limits(max_tokens: Option<u32>, stop: Option<&StopSpec>) -> Result<(), ParamError> {
+    if max_tokens == Some(0) {
+        return Err(ParamError { field: "max_tokens", message: "`max_tokens` must be at least 1".into() });
+    }
+    let stops: &[String] = match stop {
+        Some(StopSpec::One(s)) => std::slice::from_ref(s),
+        Some(StopSpec::Many(v)) => v,
+        None => &[],
+    };
+    if stops.len() > MAX_STOP_STRINGS {
+        return Err(ParamError { field: "stop", message: format!("at most {MAX_STOP_STRINGS} `stop` strings are accepted") });
+    }
+    if stops.iter().any(|s| s.len() > MAX_STOP_STRING_BYTES) {
+        return Err(ParamError {
+            field: "stop",
+            message: format!("each `stop` string must be at most {MAX_STOP_STRING_BYTES} bytes"),
+        });
+    }
+    Ok(())
 }
 
 /// OpenAI `stop`: the wire form is a bare string or an array of them.
@@ -377,6 +413,18 @@ pub enum ContentPart {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stop_sets_and_zero_budget_are_bounded() {
+        assert!(validate_limits(Some(1), Some(&StopSpec::Many(vec!["a".into(); MAX_STOP_STRINGS]))).is_ok());
+        assert_eq!(validate_limits(Some(0), None).err().map(|e| e.field), Some("max_tokens"));
+        let many = StopSpec::Many(vec!["a".into(); MAX_STOP_STRINGS + 1]);
+        assert_eq!(validate_limits(None, Some(&many)).err().map(|e| e.field), Some("stop"));
+        let long = StopSpec::One("x".repeat(MAX_STOP_STRING_BYTES + 1));
+        assert_eq!(validate_limits(None, Some(&long)).err().map(|e| e.field), Some("stop"));
+        let ids = SamplingFields { stop_token_ids: Some(vec![1; MAX_STOP_TOKEN_IDS + 1]), ..Default::default() };
+        assert_eq!(ids.validate().err().map(|e| e.field), Some("stop_token_ids"));
+    }
 
     /// THE POINT OF `SamplingFields`, asserted end to end: the wire form has to
     /// DESERIALIZE and then actually reach `SamplingParams`. A test that only

@@ -334,6 +334,20 @@ assistant turn.
 - **No per-model fairness.** Co-tenants on a device group take turns through
   `cosched::DeviceTurn` with no weight or priority.
 
+## 7b. Running it in production
+
+- **Run plowrt under a supervisor** (systemd `Restart=always`, a Kubernetes pod) that restarts it
+  when it exits. The release build is `panic = "abort"`: any panic ends the process instead of
+  one request, and nothing inside plowrt brings it back.
+- **Probe `/health` (or `/healthz`).** It answers 503 once an engine is dead (a fatal device
+  fault poisons the context and every later request fails), so the orchestrator can restart the
+  instance or route away from it.
+- SIGTERM/SIGINT stop admission and drain live generations (bounded by `PLOW_DRAIN_TIMEOUT_MS`,
+  30 s when unset) before exiting 0.
+- Connection limits: `PLOW_HTTP_HEADER_TIMEOUT_MS` (request head and idle keep-alive, 30 s) and
+  `PLOW_HTTP_MAX_CONNECTIONS` (4096 per listener). A consumer that stops reading a stream is
+  parked for up to 5 s, then cut with "response consumer is too slow".
+
 ## 8. Unrelated, found while doing the above
 
 `cargo check -p plowrt --features cpu` does not compile on `main`, independent of any of this:

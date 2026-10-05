@@ -1,7 +1,7 @@
 {
  "entries": {
   "attn_pf_hd256_sliding": {
-   "body_sha256": "297a62d244c264dff21d3bcd741e03cf40bb3f6fee33dd026ae3e6ab20eb874c",
+   "body_sha256": "51d22b9fe138947d741efed068f3fe57bf68186fda207c3e4906928a4e54ffa0",
    "classes": {
     "h16kv8_w1024_rows1024": {
      "best": {
@@ -566,7 +566,7 @@
    "spill_bytes": 0
   },
   "attn_pf_hd256_sliding_fp8kv": {
-   "body_sha256": "af3281cde502b27076e0c2c0d53717b0d2bb2ce734376ab3355580da0b9c5de5",
+   "body_sha256": "89e4d75000ccd31f567ad568319298c79e0dfdf3d3f6d2acb40a8a2b31935781",
    "classes": {
     "h16kv8_w1024_rows1024": {
      "best": {

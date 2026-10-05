@@ -404,8 +404,10 @@ fn turn_job_due(
     stage_due(stage, t, e, stage_cost(stage, prefill, tick, e), since)
 }
 
-/// How long a raw-token consumer may hold its slot parked before the request is cut.
+/// How long a consumer that stopped reading may hold its slot parked before the request is cut.
 const PARK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+type HeldToken = (u32, String, Option<Box<crate::text::logprobs::TokenLogprobs>>);
 
 /// A request whose prefill splices host rows over prompt positions (`EmbedOverlayBf16`: the
 /// packet's `in.encoder_overlay` / `in.encoder_overlay_index`) and whose decode embedding may
@@ -716,9 +718,9 @@ struct Slot {
     /// Set on the owner of a CFG pair; its partner slot (owner + 1) stays `None` in the table
     /// and is reserved while the owner lives (see [`slot_free`]).
     cfg: Option<Box<CfgRun>>,
-    /// Raw tokens produced while the consumer's channel was full, oldest first. A parked slot is
+    /// Chunks produced while the consumer's channel was full, oldest first. A parked slot is
     /// not fed; see [`flush_parked`].
-    held: Vec<u32>,
+    held: Vec<HeldToken>,
     held_finish: Option<FinishReason>,
     parked_at: Option<Instant>,
     /// A session request's retention seat; dropped with the slot, it retires the rows.
@@ -863,6 +865,10 @@ pub fn spawn(
         .and_then(|e| e.lock().kv_admission_budget());
     #[cfg(not(any(feature = "cuda", feature = "hsa", feature = "cpu")))]
     let kv_budget: Option<crate::sched::admission::KvBudget> = None;
+    #[cfg(feature = "cuda")]
+    let prefix_probe = state.gpu_engine(&slug).and_then(|e| e.lock().vmm_prefix_probe());
+    #[cfg(not(feature = "cuda"))]
+    let prefix_probe: Option<crate::memory::vmm::PrefixProbe> = None;
     #[cfg(feature = "cuda")]
     let (resume_supported, prefix_cache, kv_row_bytes) = state.gpu_engine(&slug).map_or((false, false, 0), |e| {
         let e = e.lock();
@@ -1151,7 +1157,25 @@ pub fn spawn(
                 metrics
                     .decode_occupied_extent
                     .store(occupied_extent as u64, Ordering::Relaxed);
-                crate::serve::policy::observe(occupied_extent, waiting.len());
+                let kv_used = kv_budget.filter(|b| b.max_rows() > 0).map_or(0.0, |b| {
+                    let rows: u64 = slots
+                        .iter()
+                        .flatten()
+                        .map(|s| reserved_kv_rows(s.prompt_ids.len(), s.gen.max_tokens, s.out_ids.len()))
+                        .sum();
+                    rows as f64 / b.max_rows() as f64
+                });
+                if crate::serve::policy::observe(crate::serve::policy::Load {
+                    width: occupied_extent,
+                    queued: waiting.len(),
+                    kv_used,
+                }) {
+                    Metrics::inc(&metrics.serve_mode_switches);
+                }
+                metrics.serve_mode.store(
+                    u64::from(crate::serve::policy::class() == crate::serve::policy::Class::HighConcurrency),
+                    Ordering::Relaxed,
+                );
                 if let Some(rc) = rung_controller.as_mut() {
                     rc.set_fast_probe(crate::serve::policy::fast_probe());
                 }
@@ -1188,6 +1212,7 @@ pub fn spawn(
                     kv_budget,
                     downstream.full(),
                     &mut retention,
+                    prefix_probe.as_ref(),
                 );
             }
             let idle = slots[..admission_limit]
@@ -1328,6 +1353,7 @@ pub fn spawn(
                     kv_budget,
                     downstream.full(),
                     &mut retention,
+                    prefix_probe.as_ref(),
                 );
             }
             // A full slot table leaves arrivals in the channel in arrival order; in `waiting`,
@@ -1632,6 +1658,7 @@ pub fn spawn(
                     health = advance_health(health, tick_fault);
                     if !was_dead {
                         if let EngineHealth::Dead(f) = &health {
+                            metrics.engine_dead.store(true, std::sync::atomic::Ordering::Relaxed);
                             tracing::error!(
                                 %slug,
                                 error_op = %f.operation,
@@ -1834,6 +1861,25 @@ fn seat_order(class: JobClass, continuing: bool, arrived: Instant, now: Instant,
     (class, tier, arrived)
 }
 
+/// The head of the queue keeps its seat against [`cache_first`] once it has waited this long.
+const CACHE_FIRST_WAIT_MS: f64 = QUEUE_TTL_FLOOR_MS;
+
+/// Cache-aware admission, the throughput class's retention rule: of the waiters in the head's
+/// class (`heads` = class and wait per waiter, in seat order; `rows` = rows each attaches from
+/// the prefix cache), seat first the one attaching the most rows when that beats the head by a
+/// block. FIFO under cyclic session reuse seats exactly the session whose prefix LRU evicted
+/// last; this seats sessions still cached, so their turns keep it. The head keeps its seat once
+/// it has waited [`CACHE_FIRST_WAIT_MS`]. Returns the waiter to seat ahead of the head.
+fn cache_first(heads: &[(JobClass, f64)], rows: &[u32], block: u32) -> Option<usize> {
+    let (&(class, waited), &head_rows) = heads.first().zip(rows.first())?;
+    if waited >= CACHE_FIRST_WAIT_MS {
+        return None;
+    }
+    let peers = heads.iter().take_while(|h| h.0 == class).count().min(rows.len());
+    let (best, &best_rows) = rows[..peers].iter().enumerate().rev().max_by_key(|&(_, r)| *r)?;
+    (best > 0 && best_rows >= head_rows.saturating_add(block)).then_some(best)
+}
+
 #[inline]
 fn waited_ms(now: Instant, arrived: Instant) -> f64 {
     now.saturating_duration_since(arrived).as_secs_f64() * 1e3
@@ -1882,6 +1928,7 @@ fn drain_waiting(
         kv_budget,
         downstream_full,
         &mut Retention::off(),
+        None,
     )
 }
 
@@ -1898,6 +1945,7 @@ fn drain_waiting_session(
     kv_budget: Option<crate::sched::admission::KvBudget>,
     downstream_full: bool,
     retention: &mut Retention,
+    prefix: Option<&crate::memory::vmm::PrefixProbe>,
 ) {
     waiting.retain(|(job, arrived)| {
         let class = job.opts.class;
@@ -1929,12 +1977,32 @@ fn drain_waiting_session(
         queue.sort_by_key(order);
     }
     let aging = queue_aging_ms(slo_ms);
+    // Attachable rows per waiter, once per pass: admissions within it barely move the cache.
+    let probe = prefix.filter(|_| {
+        crate::serve::policy::cache_aware_admission()
+            && slots[..admission_limit.min(slots.len())].iter().any(Option::is_none)
+    });
+    let mut rows: std::collections::VecDeque<u32> = probe
+        .map(|p| waiting.iter().map(|(job, _)| p.cached_rows(&job.prompt_ids)).collect())
+        .unwrap_or_default();
     let mut still: std::collections::VecDeque<(Job, Instant)> =
         std::collections::VecDeque::new();
     while slots[..admission_limit.min(slots.len())]
         .iter()
         .any(Option::is_none)
     {
+        if let Some(p) = probe {
+            let heads: Vec<(JobClass, f64)> =
+                waiting.iter().map(|(job, arrived)| (job.opts.class, waited_ms(now, *arrived))).collect();
+            if let Some(i) = cache_first(&heads, rows.make_contiguous(), p.block_rows()) {
+                let entry = waiting.remove(i).expect("in range");
+                waiting.push_front(entry);
+                let r = rows.remove(i).expect("in range");
+                rows.push_front(r);
+                Metrics::inc(&metrics.cache_first_admissions);
+            }
+        }
+        rows.pop_front();
         let Some((job, arrived)) = waiting.pop_front() else {
             break;
         };
@@ -3435,7 +3503,7 @@ fn run_one_tick(
                         if rt.pf_defer_decode {
                             return None;
                         }
-                        let slot = slot.as_ref()?;
+                        let slot = slot.as_ref().filter(|s| s.parked_at.is_none())?;
                         slot.out_ids.last().map(|&token| (i, token))
                     })
                     .collect();
@@ -3521,7 +3589,7 @@ fn run_one_tick(
                     .enumerate()
                     .take(b)
                     .filter_map(|(i, slot)| {
-                        let slot = slot.as_ref()?;
+                        let slot = slot.as_ref().filter(|s| s.parked_at.is_none())?;
                         (slot.step > 0).then(|| (i, *slot.out_ids.last().expect("decode output")))
                     })
                     .collect();
@@ -3803,7 +3871,7 @@ fn run_one_tick(
                             .enumerate()
                             .take(b)
                             .filter_map(|(i, slot)| {
-                                let slot = slot.as_ref()?;
+                                let slot = slot.as_ref().filter(|s| s.parked_at.is_none())?;
                                 (slot.step > 0)
                                     .then(|| (i, *slot.out_ids.last().expect("decode output")))
                             })
@@ -4175,7 +4243,7 @@ fn run_one_tick(
             // Decode: every live slot feeds the token it last produced.
             let feeds: Vec<(usize, u32)> = (0..b.min(slots.len()))
                 .filter_map(|i| {
-                    let s = slots[i].as_ref()?;
+                    let s = slots[i].as_ref().filter(|s| s.parked_at.is_none())?;
                     Some((i, *s.out_ids.last()?))
                 })
                 .collect();
@@ -4436,7 +4504,7 @@ fn run_one_tick(
             kv_pages_range.clone(),
         );
         for slot_opt in slots.iter_mut() {
-            let Some(slot) = slot_opt.as_mut() else {
+            let Some(slot) = slot_opt.as_mut().filter(|s| s.parked_at.is_none()) else {
                 continue;
             };
 
@@ -5064,7 +5132,9 @@ fn gpu_prefill_batched_pass(
                 if !e.packed_slot_ready(i) || s.step != 0 || n == 0 || pf_pos + withheld >= n {
                     return None;
                 }
-                let remaining = e.pf_plan_slice(n - withheld - pf_pos, chunk_cap);
+                let remaining = e
+                    .pf_plan_slice(n - withheld - pf_pos, chunk_cap)
+                    .min(e.pf_publish_cap(i, pf_pos));
                 let n_rows = u32::try_from(remaining).ok()?;
                 let slot_u32 = u32::try_from(i).ok()?;
                 let kv_row0 = u32::try_from(pf_pos).ok()?;
@@ -5186,7 +5256,7 @@ fn gpu_prefill_batched_pass(
                     state_slot: i as u32,
                     generation: e.slot_generation(i)?,
                     phase: Phase::Prefill,
-                    tokens: &slot.prompt_ids[c0..c0 + len],
+                    tokens: slot.prompt_ids.get(c0..c0.checked_add(len)?)?,
                     prompt_len: slot.prompt_ids.len() as u32,
                     selection: Selection::default(),
                 })
@@ -5418,7 +5488,12 @@ fn gpu_prefill_advance(
         let end = start
             .saturating_add(cap_rows.max(1))
             .min(slot.prompt_ids.len());
-        let tail = &slot.prompt_ids[start..end];
+        let Some(tail) = slot.prompt_ids.get(start..end) else {
+            return Err(crate::RuntimeError::Msg(format!(
+                "prompt cursor {start} is past the prompt ({} tokens)",
+                slot.prompt_ids.len()
+            )));
+        };
         if !tail.is_empty() {
             tok = e.consume_prompt(slot_idx, tail, &mut toks)?;
         }
@@ -6056,12 +6131,14 @@ fn gpu_finish_and_emit_token(
 /// the bytes past the `*prefix..*read` span's decode. The window advances only
 /// when new visible bytes appear; a trailing replacement char (partial UTF-8
 /// sequence mid-multibyte-token) holds the delta back until the sequence
-/// completes. Free-standing so tests can drive it without a mux.
+/// completes, unless `last`: the stream ends here and nothing will complete it.
+/// Free-standing so tests can drive it without a mux.
 fn incremental_delta(
     tok: &dyn crate::text::tokenizer::Tokenize,
     out_ids: &[u32],
     prefix: &mut usize,
     read: &mut usize,
+    last: bool,
 ) -> String {
     const MAX_DETOKENIZE_WINDOW: usize = 16;
     let len = out_ids.len();
@@ -6072,7 +6149,7 @@ fn incremental_delta(
     let prefix_text = tok.decode(&out_ids[safe_start..effective_read]);
     let new_text = tok.decode(&out_ids[safe_start..]);
     match new_text.get(prefix_text.len()..) {
-        Some(d) if !d.is_empty() && !new_text.ends_with('\u{FFFD}') => {
+        Some(d) if !d.is_empty() && (last || !new_text.ends_with('\u{FFFD}')) => {
             let d = d.to_string();
             *prefix = effective_read;
             *read = len;
@@ -6096,7 +6173,8 @@ fn handle_produced_token(
     tokens_this_tick: &mut usize,
     stop_ids: Option<&[u32]>,
 ) -> bool {
-    let Some(slot) = slot_opt.as_mut() else {
+    // A finished slot parked on its consumer only drains; a token past its end is not output.
+    let Some(slot) = slot_opt.as_mut().filter(|s| s.held_finish.is_none()) else {
         return false;
     };
     if let Some(telemetry) = slot.telemetry.as_mut() {
@@ -6109,17 +6187,6 @@ fn handle_produced_token(
         seat.on_token(token);
     }
     *tokens_this_tick += 1;
-
-    let delta = if slot.raw_tokens {
-        String::new()
-    } else {
-        incremental_delta(
-            bundle.tokenizer().as_ref(),
-            &slot.out_ids,
-            &mut slot.prefix_offset,
-            &mut slot.read_offset,
-        )
-    };
 
     // Token sends leave one channel entry for Done/Err. Backpressure ends
     // this request explicitly without blocking another model's submission thread.
@@ -6143,6 +6210,21 @@ fn handle_produced_token(
                 Some(ids) => ids.contains(&token),
                 None => token % 256 == u32::from(b'\n'),
             });
+    let stop_max = slot.step >= slot.gen.max_tokens.max(1);
+    // A stop token's own text stays out of the decode; the stream's last token flushes bytes held
+    // for a UTF-8 continuation that will now never come.
+    let delta = if slot.raw_tokens {
+        String::new()
+    } else {
+        let n = slot.out_ids.len() - usize::from(stop_token);
+        incremental_delta(
+            bundle.tokenizer().as_ref(),
+            &slot.out_ids[..n],
+            &mut slot.prefix_offset,
+            &mut slot.read_offset,
+            stop_token || stop_max,
+        )
+    };
 
     // OPENAI `stop` STRINGS. The request field was not parsed at all before, so
     // a client that relied on `stop` to end a step — every LangChain ReAct or
@@ -6155,55 +6237,35 @@ fn handle_produced_token(
     // Stop-string bookkeeping over the run of generated-but-unemitted bytes. Extracted so it
     // can be driven token by token in a test: both bugs it has carried lived in the SEQUENCING
     // of hold, release and cut, not in either helper, and nothing exercised that.
-    let (delta, stop_string) = if !slot.gen.ignore_eos && !below_min && !slot.gen.stop.is_empty()
-    {
-        apply_stop_strings(
-            &mut slot.stop_tail,
-            &mut slot.stop_pending,
-            delta,
-            &slot.gen.stop,
-        )
+    let (delta, stop_string) =
+        if !slot.gen.ignore_eos && !below_min && !slot.gen.stop.is_empty() {
+            apply_stop_strings(
+                &mut slot.stop_tail,
+                &mut slot.stop_pending,
+                delta,
+                &slot.gen.stop,
+            )
+        } else {
+            (delta, false)
+        };
+    // Held bytes are text once the request ends without a stop-string match; dropping them
+    // truncated the answer.
+    let delta = if (stop_token || stop_max) && !stop_string && !slot.stop_pending.is_empty() {
+        let mut d = delta;
+        d.push_str(&std::mem::take(&mut slot.stop_pending));
+        d
     } else {
-        (delta, false)
+        delta
     };
-    let stop_max = slot.step >= slot.gen.max_tokens.max(1);
-    // A raw-token consumer that is behind (or already parked) keeps its tokens here, in order,
-    // and its slot stops being fed until `flush_parked` drains them.
-    if slot.raw_tokens && (slot.parked_at.is_some() || (!stop_token && slot.respond.capacity() <= 1)) {
-        if !stop_token {
-            slot.held.push(token);
+    // A stop token's chunk carries only bytes released by the end of the stream.
+    if !stop_token || !delta.is_empty() {
+        let (id, lp) = if stop_token { (crate::serve::stream::TEXT_ONLY, None) } else { (token, slot.lp.take()) };
+        if send_or_hold(slot, (id, delta, lp)) {
+            if let Some(taken) = slot_opt.take() {
+                release_kv(arena, taken.kv);
+            }
+            return true;
         }
-        if stop_token || stop_max {
-            slot.held_finish = Some(if stop_token { FinishReason::Stop } else { FinishReason::Length });
-        }
-        slot.parked_at.get_or_insert_with(Instant::now);
-        return false;
-    }
-    if !stop_token && slot.respond.capacity() <= 1 {
-        let _ = slot
-            .respond
-            .try_send(StreamChunk::Err(crate::RuntimeError::Rejected(
-                "response consumer is too slow".into(),
-            )));
-        if let Some(taken) = slot_opt.take() {
-            release_kv(arena, taken.kv);
-        }
-        return true;
-    }
-    if !stop_token
-        && slot
-            .respond
-            .try_send(StreamChunk::Token {
-                id: token,
-                text: delta,
-                logprobs: slot.lp.take(),
-            })
-            .is_err()
-    {
-        if let Some(taken) = slot_opt.take() {
-            release_kv(arena, taken.kv);
-        }
-        return true;
     }
     if slot.step == 1 && crate::obs::host::on() {
         crate::obs::host::first_token(slot.prompt_ids.len(), slot.arrived.elapsed());
@@ -6214,6 +6276,10 @@ fn handle_produced_token(
         } else {
             FinishReason::Stop
         };
+        if slot.parked_at.is_some() {
+            slot.held_finish = Some(reason);
+            return false;
+        }
         if let Some(telemetry) = slot.telemetry.as_mut() {
             telemetry.finish(reason, slot.executed);
         }
@@ -6234,7 +6300,19 @@ fn handle_produced_token(
     false
 }
 
-/// Drain a parked raw-token slot into its consumer's free capacity (one entry stays reserved for
+/// Send one token chunk, or hold it and park the slot while the consumer is behind or earlier
+/// chunks still wait; one channel entry stays free for the terminal. True when the consumer is
+/// gone.
+fn send_or_hold(slot: &mut Slot, (id, text, logprobs): HeldToken) -> bool {
+    if slot.parked_at.is_none() && slot.respond.capacity() > 1 {
+        return slot.respond.try_send(StreamChunk::Token { id, text, logprobs }).is_err();
+    }
+    slot.held.push((id, text, logprobs));
+    slot.parked_at.get_or_insert_with(Instant::now);
+    false
+}
+
+/// Drain a parked slot into its consumer's free capacity (one entry stays reserved for
 /// the terminal). Returns true when the slot was freed: finished, disconnected, or parked past
 /// [`PARK_TIMEOUT`].
 fn flush_parked(slot_opt: &mut Option<Slot>, arena: &Option<SharedKvState>) -> bool {
@@ -6246,15 +6324,15 @@ fn flush_parked(slot_opt: &mut Option<Slot>, arena: &Option<SharedKvState>) -> b
         }
         return true;
     }
-    let mut sent = 0;
-    while sent < slot.held.len() && slot.respond.capacity() > 1 {
-        let id = slot.held[sent];
-        if slot.respond.try_send(StreamChunk::Token { id, text: String::new(), logprobs: None }).is_err() {
-            break;
-        }
-        sent += 1;
+    let room = slot.respond.capacity().saturating_sub(1).min(slot.held.len());
+    for (id, text, logprobs) in slot.held.drain(..room) {
+        let _ = slot.respond.try_send(StreamChunk::Token { id, text, logprobs });
     }
-    slot.held.drain(..sent);
+    // PARK_TIMEOUT bounds a consumer that stopped reading, not one that reads slowly.
+    if room > 0 && !slot.held.is_empty() {
+        slot.parked_at = Some(Instant::now());
+        return false;
+    }
     if slot.held.is_empty() {
         let Some(reason) = slot.held_finish.take() else {
             slot.parked_at = None;
@@ -7024,6 +7102,23 @@ mod tests {
         assert_eq!(left, [40, 10], "oldest first within a class");
     }
 
+    #[test]
+    fn cache_first_seats_the_most_cached_waiter_by_a_block_within_the_head_class() {
+        use super::{cache_first, JobClass::*, CACHE_FIRST_WAIT_MS};
+        let n = |w: f64| (Normal, w);
+        // A block better than the head wins; ties go to the earlier waiter.
+        assert_eq!(cache_first(&[n(5.0), n(4.0), n(3.0)], &[1536, 6144, 6144], 2048), Some(1));
+        // Less than a block better: FIFO.
+        assert_eq!(cache_first(&[n(5.0), n(4.0)], &[1536, 3500], 2048), None);
+        // The head already holds the most cache.
+        assert_eq!(cache_first(&[n(5.0), n(4.0)], &[8192, 2048], 2048), None);
+        // Only the head's class competes: a cached bulk waiter never overtakes it.
+        assert_eq!(cache_first(&[n(5.0), (Bulk, 9.0)], &[0, 8192], 2048), None);
+        // The head keeps its seat once it has waited the bound.
+        assert_eq!(cache_first(&[n(CACHE_FIRST_WAIT_MS), n(1.0)], &[0, 8192], 2048), None);
+        assert_eq!(cache_first(&[], &[], 2048), None);
+    }
+
     /// A continuing session turn takes the slot ahead of a session opening, but only until the
     /// opening request has waited the bound; past it, arrival order decides.
     #[test]
@@ -7232,6 +7327,35 @@ mod tests {
         slot.as_mut().unwrap().parked_at = Some(Instant::now() - PARK_TIMEOUT - PARK_TIMEOUT);
         assert!(flush_parked(&mut slot, &None));
         assert!(slot.is_none());
+    }
+
+    /// A text consumer that falls behind is parked too, not cut at the 33rd chunk: every delta
+    /// arrives in order, then the terminal.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn a_slow_text_consumer_is_parked_then_drained() {
+        let (mut slot, mut rx) = prefill_test_slot();
+        slot.as_mut().unwrap().gen.max_tokens = 40;
+        let bundle = prefill_test_bundle("park-text");
+        let mut n = 0;
+        for _ in 0..40 {
+            assert!(!handle_produced_token(&mut slot, &None, &bundle, u32::from(b'a'), 1, &mut n, Some(&[])));
+        }
+        assert!(slot.as_ref().is_some_and(|s| s.parked_at.is_some() && s.held_finish.is_some()));
+        assert!(gpu_decode_feeds(std::slice::from_ref(&slot), 1).is_empty());
+        let (mut text, mut done) = (String::new(), false);
+        for _ in 0..4 {
+            while let Ok(c) = rx.try_recv() {
+                match c {
+                    StreamChunk::Token { text: t, .. } => text.push_str(&t),
+                    StreamChunk::Done { reason, .. } => done = matches!(reason, FinishReason::Length),
+                    StreamChunk::Err(e) => panic!("{e}"),
+                }
+            }
+            flush_parked(&mut slot, &None);
+        }
+        assert!(done && slot.is_none());
+        assert_eq!(text, "a".repeat(40));
     }
 
     /// Aging must always come first, or a request would be shed before it ever blocks the
@@ -7560,6 +7684,64 @@ mod tests {
         assert!(!gpu_prefill_should_yield(false, false, slot.as_ref()));
     }
 
+    /// Bytes held back as a possible stop-string prefix are released when the request ends on
+    /// its budget or on a stop token instead of being dropped.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn held_stop_prefix_is_released_at_finish() {
+        let bundle = prefill_test_bundle("stop-held");
+        // "STOP" never completes: "ST" is held, then the budget (2) or the stop token (0) ends it.
+        for (ids, max_tokens) in [(&[b'S' as u32, b'T' as u32][..], 2), (&[b'S' as u32, b'T' as u32, 0][..], 8)] {
+            let (mut slot, mut rx) = prefill_test_slot();
+            let s = slot.as_mut().unwrap();
+            s.gen.max_tokens = max_tokens;
+            s.gen.stop = vec!["STOP".into()];
+            let mut tokens = 0;
+            for &id in ids {
+                handle_produced_token(&mut slot, &None, &bundle, id, 1, &mut tokens, Some(&[0]));
+            }
+            assert!(slot.is_none(), "the request finished");
+            let mut text = String::new();
+            let mut done = false;
+            while let Ok(chunk) = rx.try_recv() {
+                match chunk {
+                    StreamChunk::Token { text: t, .. } => text.push_str(&t),
+                    StreamChunk::Done { .. } => done = true,
+                    StreamChunk::Err(e) => panic!("{e}"),
+                }
+            }
+            assert!(done);
+            assert_eq!(text, "ST", "max_tokens {max_tokens}");
+        }
+    }
+
+    /// A partial UTF-8 sequence held for its continuation is emitted when the stream ends on its
+    /// budget or a stop token, once, and the stop token's own text stays out.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn a_held_partial_utf8_tail_is_flushed_at_finish() {
+        let bundle = prefill_test_bundle("fffd-held");
+        for (ids, max_tokens) in [(&[u32::from(b'a'), 0xC3][..], 2), (&[u32::from(b'a'), 0xC3, u32::from(b'Z')][..], 8)] {
+            let (mut slot, mut rx) = prefill_test_slot();
+            slot.as_mut().unwrap().gen.max_tokens = max_tokens;
+            let mut tokens = 0;
+            for &id in ids {
+                handle_produced_token(&mut slot, &None, &bundle, id, 1, &mut tokens, Some(&[u32::from(b'Z')]));
+            }
+            assert!(slot.is_none(), "the request finished");
+            let (mut text, mut done) = (String::new(), false);
+            while let Ok(chunk) = rx.try_recv() {
+                match chunk {
+                    StreamChunk::Token { text: t, .. } => text.push_str(&t),
+                    StreamChunk::Done { .. } => done = true,
+                    StreamChunk::Err(e) => panic!("{e}"),
+                }
+            }
+            assert!(done);
+            assert_eq!(text, "a\u{FFFD}", "max_tokens {max_tokens}");
+        }
+    }
+
     #[cfg(feature = "cuda")]
     #[test]
     fn gpu_cold_prefill_continues_after_first_token_finishes_or_cancels() {
@@ -7810,7 +7992,7 @@ mod tests {
         let mut fed: Vec<u32> = Vec::new();
         for &id in &ids {
             fed.push(id);
-            streamed.push_str(&incremental_delta(&tok, &fed, &mut prefix, &mut read));
+            streamed.push_str(&incremental_delta(&tok, &fed, &mut prefix, &mut read, false));
         }
         assert_eq!(streamed, tok.decode(&ids));
         // The window stays bounded: prefix has advanced with the stream.
@@ -8166,7 +8348,7 @@ mod host_bench {
             let t = Instant::now();
             for &id in &ids {
                 fed.push(id);
-                std::hint::black_box(incremental_delta(&tok, &fed, &mut prefix, &mut read));
+                std::hint::black_box(incremental_delta(&tok, &fed, &mut prefix, &mut read, false));
             }
             detok_ns += t.elapsed().as_nanos();
             n_tok += ids.len();

@@ -312,6 +312,26 @@ What this does not yet show is the serving cost: a 1024-row request cap makes
 long prompts arrive as more, smaller packed chunks. Emit-verified, not yet
 benchmarked.
 
+**Staged sliding prefill (`PLOW_STAGE_ROWS`) removes that cost.** With a request
+chunk above the window-derived default chunk, the emitter keeps the ring at
+`next_pow2(window + stage - 1)` (window 1024: stage 1024, ring 2048) and, in every
+bucket wider than a stage, emits each sliding layer's K/V write and attention once
+per stage: `W_0 R_0 W_1 R_1 ...`, each attention in its own segment and each write
+gated on the previous stage's attention. The projections, norms and MLP still run
+the whole launch. Stage `k` binds its own slot mask (`stage_slots`, rows outside
+the stage are `-1`) and span table (`plan_stage`, the request's rows
+`[k*S, (k+1)*S)` with `kvlen` at the stage end), so each write wraps at most one
+stage onto history no later query reads; the ring's contents after the launch
+equal those of sequential stage-sized launches, which is what decode, riders and
+prefix snapshots read. The runtime binds stages by position
+(`packed_prefill::stage_map`; `Manifest::validate` proves the interleaving and
+segment order) and uploads every stage's tables with the launch's. Full-attention
+layers are unstaged. Riders write in stage 0 and attend after its attention;
+unpacked prefill is held to one stage. A prefix boundary is still publishable only
+within `ring - window` rows of a slice's end, so a slice is cut to keep a shared
+prefix end inside that slack (`pf_publish_cap`). `PLOW_STAGE_ROWS=0` restores a
+ring sized for the whole request chunk.
+
 ---
 
 ## 7. Slots, and who owns the memory
@@ -335,8 +355,8 @@ cache looks the way it does:
   one base and the flash addressing is untouched (`memory/vmm.rs:14-24`).
   Physical blocks — `PLOW_VMM_BLOCK_MIB`, default 2 MiB — are mapped under a
   slot's frontier as it grows (`ensure_rows`), with a `vmm-premap` thread
-  keeping two block columns mapped ahead and `ensure_rows` acting as the
-  correctness backstop.
+  mapping the next block column once decode is within an eighth of a block of
+  it and `ensure_rows` acting as the correctness backstop.
 - **Sliding layers stay on flat device allocations** (`vmm.rs:1155`: "full
   layers VMM-backed, sliding on cudaMalloc"), because a wrapping ring has no
   stable block identity to map.
@@ -447,7 +467,13 @@ master switch and disables every side effect.
 
 Eviction runs a soft cap — `PLOW_VMM_CACHE_MIB`, else 5% of device memory —
 dropping output-only boundaries first, then zero-reference leaf nodes, then
-snapshots by least-recent use.
+snapshots by least-recent use. A session boundary its next turn already
+attached is spent (that turn runs now) and goes before the idle ones. A
+session's prompt-end boundary stops 8 rows short of the prompt end: the next
+turn re-renders the last prompt rows (Gemma 4 drops the generation prompt's
+empty thought channel, 4 tokens), so a boundary inside them never attached —
+about one turn in eight. `memory/vmm_sim_tests.rs` replays agentic traces
+against the real pool on a byte-accounting driver.
 
 ---
 
@@ -512,7 +538,13 @@ A packed launch writes several slots' KV rows in one kernel, so **every row must
 be mapped before the launch**. Only the unified token-batch route or an explicit
 `PLOW_PF_BATCH=1` plans that admission from the packed metadata, reserving the
 admitted slot's rows plus row zero of every other slot
-(`admit_packed_slot`, `gpu.rs:5564`).
+(`admit_packed_slot`, `gpu.rs:5564`). The admitted rows are the true bound of what the
+sequence's launches can write (`admission_rows`): `max(prompt + max_tokens + quantum, prompt +
+pad bucket)`, capped at `max_ctx`, where the quantum is one decode step group (a multistep
+launch or the lookahead step runs past the last kept token) and the pad-bucket term applies only
+on packets whose padding is unmasked. It replaced a flat
+`max(block_rows, widest bucket)` margin (4224 rows on the 12B ladder packets), which held
+two to three idle blocks per sequence away from the prefix cache.
 
 The decision is (`gpu.rs:3434-3439`):
 
@@ -558,6 +590,7 @@ latent cache, not to this dense head-major cache.
 |---|---|---|
 | `PLOW_MAX_CHUNK` | `next_pow2(window)` | Prefill chunk; sets the sliding ring and the bucket ladder top |
 | `PLOW_MAX_REQUEST_CHUNK` | = `PLOW_MAX_CHUNK` | Per-request cap; enables masked padding and shrinks the ring independently |
+| `PLOW_STAGE_ROWS` | window-derived chunk when the request chunk exceeds it | Rows per sliding-layer stage of a packed launch; the ring holds `window + stage - 1`. `0` = unstaged |
 | `PLOW_FP8_KV` | off | e4m3 cache with per-row scales |
 | `PLOW_PREFIX_CACHE` | on | Master switch for all prefix reuse |
 | `PLOW_VMM_PREFIX` | unset = auto | Force VMM prefix reuse on or off, bypassing the allowlist |

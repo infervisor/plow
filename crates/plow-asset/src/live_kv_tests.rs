@@ -235,6 +235,83 @@ fn validate_generated(
     .map(|_| ())
 }
 
+fn writer(cache: u16, rows: u32) -> DevInst64 {
+    let mut d = inst(DevOp::HeadNormRope);
+    d.t[0] = cache;
+    d.t[5] = 0;
+    d.i = [2, 1, 256, 0, 0, 0, rows, 0];
+    d.fj[1] = 4;
+    d.fj[2] = u32::MAX;
+    d
+}
+
+fn validate_prefill(prefill: &[DevInst64]) -> Result<()> {
+    let tensors = [
+        ("in.pos", 16),
+        ("in.kvlen", 8),
+        ("kv.k", 4096),
+        ("kv.v", 4096),
+        ("act.q", 1024),
+        ("act.op", 2048),
+        ("act.ml", 16),
+    ]
+    .map(|(name, bytes)| Tensor {
+        name,
+        bytes,
+        initialized: false,
+    });
+    let mut decode = inst(DevOp::FlashDecode);
+    decode.t[..6].copy_from_slice(&[5, 6, 4, 2, 3, 1]);
+    decode.i = [2, 1, 1, 4, 0, 1, 256, u32::MAX];
+    let decode = [decode, writer(2, 2), writer(3, 2)];
+    let program = |rows, role, insts| Program {
+        rows,
+        role,
+        n_counter: 1,
+        insts,
+        stream: &[],
+        stream_ofs: &[],
+        stream_len: &[],
+        waits: &[],
+        succs: &[],
+        gq_stream: &[],
+        gq_seg_ofs: &[],
+        l2_domains: 0,
+    };
+    use packet::devbuild::ProgramRole::{DecodeRung, PrefillBucket};
+    emit(&Packet {
+        n_cu: 1,
+        tp: false,
+        prefill_count: 1,
+        tensors: &tensors,
+        programs: &[
+            program(2, PrefillBucket { rows: 2 }, prefill),
+            program(2, DecodeRung { rows: 2 }, &decode),
+        ],
+        generated: &[],
+        kv_row_insts: &[],
+    })
+    .map(|_| ())
+}
+
+#[test]
+fn an_unstaged_prefill_cache_has_one_writer() {
+    let mut read = inst(DevOp::FlashPrefill);
+    read.t[..6].copy_from_slice(&[5, 6, 4, 2, 3, 1]);
+    read.i = [2, 2, 1, 1, 0, 0, 256, 0];
+    read.fj = [0, 4, u32::MAX];
+    validate_prefill(&[writer(2, 0), writer(3, 0), read]).unwrap();
+    assert!(validate_prefill(&[writer(2, 0), writer(3, 0), writer(2, 0), read])
+        .unwrap_err()
+        .contains("cache writer contract"));
+    // Duplicate writer/reader pairs without a segment-ordered stage proof are not a staged prefill.
+    assert!(validate_prefill(&[writer(2, 0), writer(3, 0), read, writer(2, 0), writer(3, 0), read])
+        .unwrap_err()
+        .contains("cache writer contract"));
+    // Repeated readers over one writer pair (KV sharing) stay valid.
+    validate_prefill(&[writer(2, 0), writer(3, 0), read, read]).unwrap();
+}
+
 #[test]
 fn fp8_gemm_maps_match_sources_and_extents() {
     for op in [DevOp::GemmFp8, DevOp::GemmMedFp8, DevOp::GemmSmallFp8] {

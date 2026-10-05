@@ -351,6 +351,14 @@ impl Manifest {
             )?;
             let mut reads = BTreeSet::new();
             let mut writes = BTreeSet::new();
+            // Only staged writers, proven in segment order, may repeat; the loader also requires
+            // the packed-prefill manifest to declare `stage_rows` for them.
+            let stages = if prefill {
+                crate::packed_prefill::repeated_writers(p).map_err(|e| format!("cache writer contract: {e}"))?
+            } else {
+                Vec::new()
+            };
+            let staged = |pc: usize| stages.get(pc).copied().unwrap_or(false);
             for (pc, d) in p.insts.iter().enumerate() {
                 let op = DevOp::from_u16(d.op).ok_or("unknown opcode access contract")?;
                 direct_operands(op, d, packet).map_err(|e| format!("{e}: {op:?}"))?;
@@ -441,7 +449,7 @@ impl Manifest {
                             if slot == 6 || slot == 7 => {}
                         DevOp::HeadNormRopeFp8 if slot == 6 => {
                             require(
-                                scales.get(&h) == Some(&d.t[0]) && writes.insert(h),
+                                scales.get(&h) == Some(&d.t[0]) && (writes.insert(h) || staged(pc)),
                                 "scale writer contract",
                             )?;
                         }
@@ -510,7 +518,7 @@ impl Manifest {
                                     } else {
                                         d.i[6] == p.rows || (legacy && d.i[6] == 0)
                                     })
-                                    && writes.insert(h),
+                                    && (writes.insert(h) || staged(pc)),
                                 "cache writer contract",
                             )?;
                         }

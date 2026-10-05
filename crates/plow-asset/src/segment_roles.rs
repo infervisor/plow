@@ -87,6 +87,65 @@ pub fn is_projection(role: u8) -> bool {
     matches!(role, CUBLASLT | NATIVE_DECODE_TC)
 }
 
+/// Measured Gemma-4-12B native decode plans, `[m, n, k, bk, splits]`: devgen plans routed
+/// segments from this set, and the runtime falls back to it for an object without `decode_plan`.
+pub const NATIVE_DECODE_BF16_SHAPES: [[u32; 5]; 54] = [
+    [1, 512, 3840, 256, 8],
+    [1, 2048, 3840, 256, 8],
+    [1, 3840, 4096, 128, 4],
+    [1, 3840, 8192, 128, 4],
+    [1, 3840, 15360, 256, 4],
+    [1, 4096, 3840, 256, 4],
+    [1, 8192, 3840, 256, 1],
+    [1, 15360, 3840, 128, 1],
+    [1, 262144, 3840, 256, 1],
+    [2, 512, 3840, 128, 8],
+    [2, 2048, 3840, 128, 8],
+    [2, 3840, 4096, 256, 4],
+    [2, 3840, 8192, 256, 4],
+    [2, 3840, 15360, 256, 4],
+    [2, 4096, 3840, 256, 4],
+    [2, 8192, 3840, 256, 1],
+    [2, 15360, 3840, 128, 1],
+    [2, 262144, 3840, 256, 1],
+    [4, 512, 3840, 256, 8],
+    [4, 2048, 3840, 256, 8],
+    [4, 3840, 4096, 256, 4],
+    [4, 3840, 8192, 128, 4],
+    [4, 3840, 15360, 128, 4],
+    [4, 4096, 3840, 128, 4],
+    [4, 8192, 3840, 256, 1],
+    [4, 15360, 3840, 256, 1],
+    [4, 262144, 3840, 256, 1],
+    [8, 512, 3840, 256, 8],
+    [8, 2048, 3840, 128, 8],
+    [8, 3840, 4096, 128, 4],
+    [8, 3840, 8192, 256, 4],
+    [8, 3840, 15360, 256, 4],
+    [8, 4096, 3840, 256, 4],
+    [8, 8192, 3840, 256, 1],
+    [8, 15360, 3840, 128, 1],
+    [8, 262144, 3840, 256, 1],
+    [16, 512, 3840, 256, 8],
+    [16, 2048, 3840, 256, 8],
+    [16, 3840, 4096, 128, 4],
+    [16, 3840, 8192, 128, 4],
+    [16, 3840, 15360, 128, 4],
+    [16, 4096, 3840, 256, 4],
+    [16, 8192, 3840, 256, 4],
+    [16, 15360, 3840, 128, 1],
+    [16, 262144, 3840, 256, 1],
+    [32, 512, 3840, 256, 8],
+    [32, 2048, 3840, 256, 8],
+    [32, 3840, 4096, 128, 4],
+    [32, 3840, 8192, 128, 4],
+    [32, 3840, 15360, 128, 4],
+    [32, 4096, 3840, 128, 4],
+    [32, 8192, 3840, 128, 1],
+    [32, 15360, 3840, 128, 1],
+    [32, 262144, 3840, 256, 1],
+];
+
 pub const CUBLASLT_PREFILL_MAX_ROWS: u32 = 16384;
 /// Widest decode rung whose projections may run as cuBLASLt segments.
 pub const CUBLASLT_DECODE_MAX_ROWS: u32 = 128;
@@ -247,6 +306,11 @@ pub struct SegmentObject {
     pub promote_k512: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attention: Option<AttentionCapability>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gemm: Option<GemmCapability>,
+    /// Native decode `[m, n, k, bk, splits]` per routed projection shape.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decode_plan: Option<Vec<[u32; 5]>>,
 }
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -257,6 +321,162 @@ pub struct AttentionCapability {
     pub query_tile: u32,
     pub kv_tile: u32,
     pub warps: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shape: Option<AttentionShape>,
+}
+/// The model geometry a fixed-shape attention object is compiled for.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AttentionShape {
+    pub n_head: u32,
+    pub n_kv_head: u32,
+    /// Sliding window in rows; 0 is global attention.
+    pub window: u32,
+    pub arena_bytes: u32,
+    /// Prefill rungs the object serves; absent means any rung.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rows: Option<Vec<u32>>,
+}
+/// The shape and launch geometry a fixed-shape GEMM role object is compiled for.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GemmCapability {
+    /// Prefill rungs the object serves, ascending; the object's min/max row globals are the ends.
+    pub rows: Vec<u32>,
+    pub n: u32,
+    pub k: u32,
+    pub bm: u32,
+    pub bn: u32,
+    pub bk: u32,
+    pub stages: u32,
+    pub block: u32,
+    pub arena_bytes: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tile_band: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub direct_entry: Option<u32>,
+}
+
+/// The Gemma-4 geometry the fixed-shape GEMM roles had before packets carried a descriptor;
+/// the runtime holds descriptor-less packets to it.
+pub fn legacy_gemm(role: u8) -> Option<GemmCapability> {
+    let bf16 = GemmCapability {
+        rows: vec![4096, 8192],
+        n: 15360,
+        k: 3840,
+        bm: 128,
+        bn: 128,
+        bk: 64,
+        stages: 4,
+        block: 384,
+        arena_bytes: 197696,
+        tile_band: None,
+        direct_entry: None,
+    };
+    match role {
+        BF16_PREFILL_GEMM_GLU_GEMMA4 => Some(bf16),
+        W8A8_PREFILL_GEMM_GLU_GEMMA4 => Some(GemmCapability {
+            bk: 128,
+            tile_band: Some(16),
+            direct_entry: Some(1),
+            ..bf16
+        }),
+        _ => None,
+    }
+}
+
+/// Like [`legacy_gemm`], for the fixed-shape attention roles.
+pub fn legacy_attention_shape(role: u8) -> Option<AttentionShape> {
+    match role {
+        PREFILL_ATTENTION_HD512_PX4_BQ64 => Some(AttentionShape {
+            n_head: 16,
+            n_kv_head: 1,
+            window: 0,
+            arena_bytes: 110592,
+            rows: Some(vec![4096, 8192]),
+        }),
+        PREFILL_ATTENTION_HD256_GQA2_BKV32 => Some(AttentionShape {
+            n_head: 16,
+            n_kv_head: 8,
+            window: 1024,
+            arena_bytes: 141312,
+            rows: None,
+        }),
+        _ => None,
+    }
+}
+
+impl SegmentObject {
+    /// The descriptor when the packet carries one, else [`legacy_gemm`].
+    pub fn gemm_or_legacy(&self, role: u8) -> Option<GemmCapability> {
+        self.gemm.clone().or_else(|| legacy_gemm(role))
+    }
+    /// The descriptor when the packet carries one, else [`legacy_attention_shape`].
+    pub fn attention_shape_or_legacy(&self, role: u8) -> Option<AttentionShape> {
+        self.attention
+            .as_ref()
+            .and_then(|a| a.shape.clone())
+            .or_else(|| legacy_attention_shape(role))
+    }
+    /// The descriptor when the packet carries one, else [`NATIVE_DECODE_BF16_SHAPES`].
+    pub fn decode_plan_or_legacy(&self) -> &[[u32; 5]] {
+        self.decode_plan.as_deref().unwrap_or(&NATIVE_DECODE_BF16_SHAPES)
+    }
+}
+
+fn ascending_rows(rows: &[u32], multiple: u32) -> bool {
+    multiple > 0
+        && !rows.is_empty()
+        && rows.windows(2).all(|w| w[0] < w[1])
+        && rows.iter().all(|&r| r > 0 && r % multiple == 0)
+}
+
+fn valid_gemm(role: u8, g: &GemmCapability) -> bool {
+    matches!(role, BF16_PREFILL_GEMM_GLU_GEMMA4 | W8A8_PREFILL_GEMM_GLU_GEMMA4)
+        && ascending_rows(&g.rows, g.bm)
+        // The GLU objects run exactly their min and max rows (the runtime checks both against the
+        // object's globals); an interior row count would trap in the kernel.
+        && g.rows.len() <= 2
+        && [g.n, g.k, g.bn, g.bk, g.stages, g.arena_bytes].iter().all(|&v| v > 0)
+        && g.n % g.bn == 0
+        && g.k % g.bk == 0
+        && g.block > 0
+        && g.block % 128 == 0
+        && if role == W8A8_PREFILL_GEMM_GLU_GEMMA4 {
+            g.tile_band.is_some_and(|v| v > 0) && g.direct_entry == Some(1)
+        } else {
+            g.tile_band.is_none() && g.direct_entry.is_none()
+        }
+}
+
+fn valid_attention_shape(role: u8, a: &AttentionCapability, s: &AttentionShape) -> bool {
+    s.n_head > 0
+        && s.n_kv_head > 0
+        && s.n_head % s.n_kv_head == 0
+        && s.arena_bytes > 0
+        && s.rows.as_deref().is_none_or(|rows| ascending_rows(rows, a.query_tile))
+        && match role {
+            PREFILL_ATTENTION_HD512_PX4_BQ64 => s.window == 0 && s.rows.is_some(),
+            PREFILL_ATTENTION_HD256_GQA2_BKV32 => s.window > 0 && s.n_head == 2 * s.n_kv_head,
+            _ => false,
+        }
+}
+
+fn valid_decode_plan(plan: &[[u32; 5]]) -> bool {
+    let mut shapes = BTreeSet::new();
+    !plan.is_empty()
+        && plan.iter().all(|&[m, n, k, bk, splits]| {
+            // gemv_sm90_transposed traps unless splits is a power of two and K % 8 == 0.
+            (1..=32).contains(&m)
+                && n > 0
+                && k > 0
+                && k % 8 == 0
+                && n <= i32::MAX as u32
+                && k <= i32::MAX as u32
+                && matches!(bk, 128 | 256)
+                && matches!(splits, 1 | 2 | 4 | 8)
+                && shapes.insert((m, n, k))
+        })
 }
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -276,8 +496,11 @@ fn validate_generated(object: &SegmentObject) -> Result<(), String> {
         || std::path::Path::new(&object.file)
             .components()
             .any(|c| !matches!(c, std::path::Component::Normal(_)))
+        || object.gemm.is_some()
+        || object.decode_plan.is_some()
         || object.attention.as_ref().zip(abi.as_ref()).is_none_or(|(a, abi)| {
-            a.profile != "sm90a"
+            a.shape.is_some()
+                || a.profile != "sm90a"
                 || a.dtype != "bf16"
                 || a.head_dim == 0
                 || a.query_tile == 0
@@ -366,6 +589,7 @@ impl SegmentRoles {
                 query_tile: 64,
                 kv_tile: 32,
                 warps: 8,
+                shape: None,
             };
             let hd512_px4 = AttentionCapability {
                 profile: "sm90a".into(),
@@ -374,6 +598,7 @@ impl SegmentRoles {
                 query_tile: 32,
                 kv_tile: 16,
                 warps: 8,
+                shape: None,
             };
             let hd512_wg16 = AttentionCapability {
                 kv_tile: 16,
@@ -395,13 +620,26 @@ impl SegmentRoles {
                 query_tile: 64,
                 kv_tile: 64,
                 warps: 8,
+                shape: None,
             };
             let hd256_bkv32 = AttentionCapability {
                 kv_tile: 32,
                 ..hd256_bkv64.clone()
             };
+            let unshaped = object
+                .attention
+                .as_ref()
+                .map(|a| AttentionCapability { shape: None, ..a.clone() });
             if object.abi != abi
                 || object.file.is_empty()
+                || object.gemm.as_ref().is_some_and(|g| !valid_gemm(id, g))
+                || object
+                    .decode_plan
+                    .as_deref()
+                    .is_some_and(|plan| id != NATIVE_DECODE_TC || !valid_decode_plan(plan))
+                || object.attention.as_ref().is_some_and(|a| {
+                    a.shape.as_ref().is_some_and(|s| !valid_attention_shape(id, a, s))
+                })
                 || std::path::Path::new(&object.file)
                     .components()
                     .any(|c| !matches!(c, std::path::Component::Normal(_)))
@@ -432,11 +670,11 @@ impl SegmentRoles {
                 || (id == PREFILL_ATTENTION_HD256_GQA2_BKV32
                     && (!valid_hash(object.sha256.as_deref())
                         || object.promote_k512.is_some()
-                        || object.attention.as_ref() != Some(&hd256_bkv32)))
+                        || unshaped.as_ref() != Some(&hd256_bkv32)))
                 || (id == PREFILL_ATTENTION_HD512_PX4_BQ64
                     && (!valid_hash(object.sha256.as_deref())
                         || object.promote_k512.is_some()
-                        || object.attention.as_ref() != Some(&hd512_px4_bq64)))
+                        || unshaped.as_ref() != Some(&hd512_px4_bq64)))
                 || (matches!(
                     id,
                     MXFP4_MOE
@@ -791,6 +1029,144 @@ mod tests {
         ] {
             assert!(SegmentRoles::from_bytes(bad.as_bytes()).is_err());
         }
+    }
+
+    fn object_raw(id: u8, object: &str) -> String {
+        format!(
+            r#"{{"version":1,"objects":{{"{id}":{object}}},"programs":[{{"index":0,"roles":[0,{id},0]}}]}}"#
+        )
+    }
+
+    #[test]
+    fn gemm_descriptor_round_trips_and_is_validated() {
+        let hash = "a".repeat(64);
+        for (id, abi) in [
+            (BF16_PREFILL_GEMM_GLU_GEMMA4, BF16_PREFILL_GEMM_GLU_GEMMA4_ABI),
+            (W8A8_PREFILL_GEMM_GLU_GEMMA4, W8A8_PREFILL_GEMM_GLU_GEMMA4_ABI),
+        ] {
+            let legacy = object_raw(id, &format!(r#"{{"abi":"{abi}","file":"glu.cubin","sha256":"{hash}"}}"#));
+            let parsed = SegmentRoles::from_bytes(legacy.as_bytes()).unwrap();
+            assert!(parsed.objects[&id].gemm.is_none());
+            assert_eq!(parsed.objects[&id].gemm_or_legacy(id), legacy_gemm(id));
+            assert_eq!(serde_json::to_string(&parsed).unwrap(), legacy);
+
+            let mut roles = parsed;
+            roles.objects.get_mut(&id).unwrap().gemm = legacy_gemm(id);
+            let raw = serde_json::to_string(&roles).unwrap();
+            let back = SegmentRoles::from_bytes(raw.as_bytes()).unwrap();
+            assert_eq!(back.objects[&id].gemm, legacy_gemm(id));
+            let other = GemmCapability { rows: vec![2048, 4096], n: 2112 * 2, k: 2816, ..legacy_gemm(id).unwrap() };
+            roles.objects.get_mut(&id).unwrap().gemm = Some(other.clone());
+            roles.validate_schema().unwrap();
+            assert_eq!(roles.objects[&id].gemm_or_legacy(id), Some(other.clone()));
+            for bad in [
+                GemmCapability { rows: vec![], ..other.clone() },
+                GemmCapability { rows: vec![4096, 2048], ..other.clone() },
+                GemmCapability { rows: vec![100], ..other.clone() },
+                GemmCapability { rows: vec![2048, 3072, 4096], ..other.clone() },
+                GemmCapability { k: 2817, ..other.clone() },
+                GemmCapability { n: 0, ..other.clone() },
+                GemmCapability { block: 100, ..other.clone() },
+                GemmCapability {
+                    tile_band: if id == W8A8_PREFILL_GEMM_GLU_GEMMA4 { None } else { Some(16) },
+                    ..other.clone()
+                },
+            ] {
+                roles.objects.get_mut(&id).unwrap().gemm = Some(bad);
+                assert!(roles.validate_schema().is_err());
+            }
+        }
+        let attention = object_raw(
+            11,
+            &format!(r#"{{"abi":"{PREFILL_ATTENTION_HD256_BKV32_ABI}","file":"a.cubin","sha256":"{hash}","attention":{{"profile":"sm90a","dtype":"bf16","head_dim":256,"query_tile":64,"kv_tile":32,"warps":8}},"gemm":{{"rows":[4096],"n":128,"k":128,"bm":128,"bn":128,"bk":64,"stages":4,"block":384,"arena_bytes":1}}}}"#),
+        );
+        assert!(SegmentRoles::from_bytes(attention.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn attention_shape_round_trips_and_is_validated() {
+        let hash = "a".repeat(64);
+        let gqa2 = object_raw(
+            PREFILL_ATTENTION_HD256_GQA2_BKV32,
+            &format!(r#"{{"abi":"{PREFILL_ATTENTION_HD256_GQA2_BKV32_ABI}","file":"a.cubin","sha256":"{hash}","attention":{{"profile":"sm90a","dtype":"bf16","head_dim":256,"query_tile":64,"kv_tile":32,"warps":8,"shape":{{"n_head":32,"n_kv_head":16,"window":512,"arena_bytes":141312}}}}}}"#),
+        );
+        let parsed = SegmentRoles::from_bytes(gqa2.as_bytes()).unwrap();
+        assert_eq!(serde_json::to_string(&parsed).unwrap(), gqa2);
+        let shape = parsed.objects[&PREFILL_ATTENTION_HD256_GQA2_BKV32]
+            .attention_shape_or_legacy(PREFILL_ATTENTION_HD256_GQA2_BKV32)
+            .unwrap();
+        assert_eq!((shape.n_head, shape.n_kv_head, shape.window, shape.rows), (32, 16, 512, None));
+        for bad in [
+            gqa2.replace(r#""n_head":32"#, r#""n_head":48"#),
+            gqa2.replace(r#""window":512"#, r#""window":0"#),
+            gqa2.replace(r#""arena_bytes":141312"#, r#""arena_bytes":0"#),
+            gqa2.replace(r#""window":512"#, r#""window":512,"rows":[100]"#),
+            gqa2.replace(r#""window":512"#, r#""window":512,"extra":1"#),
+            gqa2.replace(PREFILL_ATTENTION_HD256_GQA2_BKV32_ABI, PREFILL_ATTENTION_HD256_BKV32_ABI)
+                .replace(r#""14""#, r#""11""#)
+                .replace("0,14,0", "0,11,0"),
+        ] {
+            assert!(SegmentRoles::from_bytes(bad.as_bytes()).is_err(), "{bad}");
+        }
+        let px4 = object_raw(
+            PREFILL_ATTENTION_HD512_PX4_BQ64,
+            &format!(r#"{{"abi":"{PREFILL_ATTENTION_HD512_PX4_BQ64_ABI}","file":"a.cubin","sha256":"{hash}","attention":{{"profile":"sm90a","dtype":"bf16","head_dim":512,"query_tile":64,"kv_tile":16,"warps":16}}}}"#),
+        );
+        let legacy = SegmentRoles::from_bytes(px4.as_bytes()).unwrap();
+        assert_eq!(
+            legacy.objects[&PREFILL_ATTENTION_HD512_PX4_BQ64]
+                .attention_shape_or_legacy(PREFILL_ATTENTION_HD512_PX4_BQ64),
+            legacy_attention_shape(PREFILL_ATTENTION_HD512_PX4_BQ64)
+        );
+        let shaped = px4.replace(
+            r#""warps":16"#,
+            r#""warps":16,"shape":{"n_head":8,"n_kv_head":1,"window":0,"arena_bytes":110592,"rows":[2048,4096]}"#,
+        );
+        SegmentRoles::from_bytes(shaped.as_bytes()).unwrap();
+        for bad in [
+            shaped.replace(r#","rows":[2048,4096]"#, ""),
+            shaped.replace(r#""window":0"#, r#""window":1024"#),
+            shaped.replace("[2048,4096]", "[4096,2048]"),
+        ] {
+            assert!(SegmentRoles::from_bytes(bad.as_bytes()).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn decode_plan_round_trips_and_is_validated() {
+        let raw = object_raw(
+            NATIVE_DECODE_TC,
+            &format!(r#"{{"abi":"gemv_transposed_sm90_bf16_v1","file":"n.cubin","sha256":"{}","decode_plan":[[1,512,3840,256,8],[8,2048,2048,128,1]]}}"#, "a".repeat(64)),
+        );
+        let parsed = SegmentRoles::from_bytes(raw.as_bytes()).unwrap();
+        assert_eq!(serde_json::to_string(&parsed).unwrap(), raw);
+        assert_eq!(
+            parsed.objects[&NATIVE_DECODE_TC].decode_plan_or_legacy(),
+            [[1, 512, 3840, 256, 8], [8, 2048, 2048, 128, 1]]
+        );
+        let legacy = raw.replace(r#","decode_plan":[[1,512,3840,256,8],[8,2048,2048,128,1]]"#, "");
+        assert_eq!(
+            SegmentRoles::from_bytes(legacy.as_bytes()).unwrap().objects[&NATIVE_DECODE_TC]
+                .decode_plan_or_legacy(),
+            NATIVE_DECODE_BF16_SHAPES
+        );
+        assert!(valid_decode_plan(&NATIVE_DECODE_BF16_SHAPES));
+        for bad in [
+            raw.replace("[8,2048,2048,128,1]", "[1,512,3840,128,8]"),
+            raw.replace("[8,2048,2048,128,1]", "[64,2048,2048,128,1]"),
+            raw.replace("[8,2048,2048,128,1]", "[8,2048,2048,64,1]"),
+            raw.replace("[8,2048,2048,128,1]", "[8,2048,2048,128,16]"),
+            raw.replace("[8,2048,2048,128,1]", "[8,2048,3840,128,3]"),
+            raw.replace("[8,2048,2048,128,1]", "[8,2048,2044,128,1]"),
+            raw.replace(r#"[[1,512,3840,256,8],[8,2048,2048,128,1]]"#, "[]"),
+        ] {
+            assert!(SegmentRoles::from_bytes(bad.as_bytes()).is_err(), "{bad}");
+        }
+        let misplaced = object_raw(
+            W8A16_PREFILL_M1,
+            &format!(r#"{{"abi":"{W8A16_PREFILL_M1_ABI}","file":"m.cubin","sha256":"{}","decode_plan":[[1,512,3840,256,8]]}}"#, "a".repeat(64)),
+        );
+        assert!(SegmentRoles::from_bytes(misplaced.as_bytes()).is_err());
     }
 
     #[test]
