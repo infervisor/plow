@@ -212,8 +212,8 @@ pub struct EmitConfig {
     #[arg(long = "emit-decode-projection-tuning", default_value_t = false)]
     pub decode_projection_tuning: bool,
 
-    /// Largest prefill chunk rows (power of two, ≤ 8192). Caps the bucket
-    /// ladder and the runtime PLOW_PF_INTERLEAVE ceiling.
+    /// Default prefill rows per request (power of two, ≤ 16384). The bucket ladder still
+    /// reaches 8192 when ctx does; only an explicit 16384 widens it further.
     #[arg(long = "emit-max-chunk", env = "PLOW_MAX_CHUNK")]
     pub max_chunk: Option<u32>,
 

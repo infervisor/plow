@@ -1127,6 +1127,7 @@ pub(super) fn run(
             };
             buckets.sort_unstable();
             buckets.dedup();
+            let buckets = crate::with_always_rung(buckets, ctx);
             model_prefill(&c, ctx, n_cu, target, &buckets, batch, fp8)
         }
     };

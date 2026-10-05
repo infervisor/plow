@@ -1475,11 +1475,13 @@ pub(crate) fn k3_prefill_buckets(ctx: u32) -> Vec<u32> {
     match emit_config::active().k3_prefill.as_deref() {
         Some("0") => Vec::new(),
         None | Some("") | Some("1") | Some("full") => glm_prefill_buckets(ctx),
-        Some(list) => list
-            .split(',')
-            .filter_map(|s| s.trim().parse::<u32>().ok())
-            .filter(|&x| x > 1 && x <= ctx)
-            .collect(),
+        Some(list) => crate::with_always_rung(
+            list.split(',')
+                .filter_map(|s| s.trim().parse::<u32>().ok())
+                .filter(|&x| x > 1 && x <= ctx)
+                .collect(),
+            ctx,
+        ),
     }
 }
 

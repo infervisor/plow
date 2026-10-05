@@ -1,4 +1,6 @@
-use super::{default_chunk, kv_ring, kv_ring_rows, DEFAULT_CHUNK_MAX};
+use super::{
+    default_chunk, kv_ring, kv_ring_rows, with_always_rung, ALWAYS_RUNG, DEFAULT_CHUNK_MAX,
+};
 
 /// An all-global model (`window == 0`) must keep the full chunk. `kv_ring`
 /// returns `(ctx, MASK_NONE)` for full layers, so a smaller chunk buys no
@@ -56,4 +58,22 @@ fn extension_kv_ring_rows_mirrors_devgen() {
             );
         }
     }
+}
+
+/// Every ladder reaches the 8192 rung once the context does, and a shorter context is untouched.
+#[test]
+fn ladders_always_carry_the_8192_rung_when_ctx_allows() {
+    assert_eq!(ALWAYS_RUNG, 8192);
+    assert_eq!(
+        with_always_rung(vec![128, 512, 1024], 16384),
+        [128, 512, 1024, 8192]
+    );
+    assert_eq!(
+        with_always_rung(vec![128, 8192, 16384], 16384),
+        [128, 8192, 16384]
+    );
+    assert_eq!(
+        with_always_rung(vec![128, 512, 1024], 8191),
+        [128, 512, 1024]
+    );
 }
