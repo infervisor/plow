@@ -472,6 +472,13 @@ fn validate_stages(
     stage_rows: u32,
 ) -> Result<()> {
     let stages = request_rows.div_ceil(stage_rows) as usize;
+    let ring = |pair: [u16; 2]| live.caches.iter().any(|c| c.pair == pair && c.window > 0 && c.stride < live.max_ctx);
+    // `stage_map` binds stage tables to every pair read more than once; only sliding rings are
+    // proven below, so a repeated reader of any other cache (KV sharing) cannot be staged.
+    let mut seen = BTreeSet::new();
+    for pair in g.insts.iter().filter(|d| is_attention(d)).map(|d| [d.t[3], d.t[4]]) {
+        need(seen.insert(pair) || ring(pair), "staged packet reads a non-ring cache more than once")?;
+    }
     for c in live.caches.iter().filter(|c| c.window > 0 && c.stride < live.max_ctx) {
         let readers: Vec<usize> = (0..g.insts.len())
             .filter(|&pc| is_attention(&g.insts[pc]) && [g.insts[pc].t[3], g.insts[pc].t[4]] == c.pair)
