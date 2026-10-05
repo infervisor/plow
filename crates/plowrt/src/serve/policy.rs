@@ -80,8 +80,10 @@ const KV_LEAVE: f64 = 0.75;
 pub const THROUGHPUT_K: u32 = 8;
 
 /// [`THROUGHPUT_K`] unless `PLOW_THROUGHPUT_K` (or the packet's serve default) says otherwise.
+/// Read once (every decode tick asks): packet serve defaults are in the environment by then.
 pub fn throughput_k() -> u32 {
-    crate::config::RuntimeConfig::throughput_k().unwrap_or(THROUGHPUT_K)
+    static K: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *K.get_or_init(|| crate::config::RuntimeConfig::throughput_k().unwrap_or(THROUGHPUT_K))
 }
 /// AMD latency quantum. AMD has no lookahead pipeline, so a lone stream still needs the
 /// deferred read to amortise its host turnaround; every AMD latency recipe ran K = 4.
