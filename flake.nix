@@ -3,9 +3,13 @@
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
+    rust-overlay = {
+      url = "github:oxalica/rust-overlay";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
   };
 
-  outputs = { self, nixpkgs }:
+  outputs = { self, nixpkgs, rust-overlay }:
     let
       systems = [ "aarch64-darwin" "x86_64-darwin" "x86_64-linux" "aarch64-linux" ];
       forAll = nixpkgs.lib.genAttrs systems;
@@ -24,13 +28,31 @@
       # allowUnfree is for the CUDA toolchain only (nvcc's EULA); ROCm is free.
       # The insecure-package allowance is exactly the optional vllm baseline
       # shell (nixpkgs flags this release; it never enters a plow build).
-      pkgsFor = system: import nixpkgs {
-        inherit system;
-        config = {
-          allowUnfree = true;
-          permittedInsecurePackages = [ "python3.13-vllm-0.27.0" ];
+      pkgsFor = system:
+        let
+          pkgsBase = import nixpkgs {
+            inherit system;
+            overlays = [ (import rust-overlay) ];
+            config = {
+              allowUnfree = true;
+              permittedInsecurePackages = [ "python3.13-vllm-0.27.0" ];
+            };
+          };
+          rustPkg = pkgsBase.rust-bin.stable."1.99.0".default.override {
+            extensions = [ "rust-src" "rustfmt" "clippy" ];
+          };
+          rustPlatform = pkgsBase.makeRustPlatform {
+            cargo = rustPkg;
+            rustc = rustPkg;
+          };
+        in
+        pkgsBase // {
+          inherit rustPlatform;
+          rustc = rustPkg;
+          cargo = rustPkg;
+          rustfmt = rustPkg;
+          clippy = rustPkg;
         };
-      };
 
       cargoLock = {
         lockFile = ./Cargo.lock;

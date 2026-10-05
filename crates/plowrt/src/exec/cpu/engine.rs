@@ -116,6 +116,7 @@ pub struct HostTensor {
     ptr: *mut u8,
     layout: Layout,
     pub bytes: usize,
+    pub is_sram: bool,
 }
 
 // SAFETY: plain heap memory; concurrent access is disjoint by the schedule,
@@ -126,6 +127,22 @@ unsafe impl Sync for HostTensor {}
 impl HostTensor {
     fn alloc(bytes: usize, zeroed: bool) -> Result<HostTensor> {
         Self::alloc_on_nodes(bytes, zeroed, &[], false)
+    }
+
+    /// Construct a HostTensor backed by hardware pseudo-locked on-chip SRAM.
+    pub fn from_sram(ptr: *mut u8, bytes: usize, zeroed: bool) -> HostTensor {
+        let align = 64;
+        let size = bytes.max(1).checked_next_multiple_of(align).unwrap_or(bytes.max(1));
+        let layout = Layout::from_size_align(size, align).unwrap_or(Layout::new::<u8>());
+        if zeroed {
+            unsafe { std::ptr::write_bytes(ptr, 0, bytes) };
+        }
+        HostTensor {
+            ptr,
+            layout,
+            bytes,
+            is_sram: true,
+        }
     }
 
     fn alloc_on_nodes(
@@ -216,7 +233,12 @@ impl HostTensor {
             // SAFETY: ptr/size describe our own mapping.
             unsafe { libc::madvise(ptr as *mut c_void, size, advice) };
         }
-        let tensor = HostTensor { ptr, layout, bytes };
+        let tensor = HostTensor {
+            ptr,
+            layout,
+            bytes,
+            is_sram: false,
+        };
         #[cfg(target_os = "linux")]
         if huge && !nodes.is_empty() {
             let maxnode = nodes.iter().copied().max().unwrap() as usize + 1;
@@ -280,6 +302,9 @@ impl HostTensor {
 
 impl Drop for HostTensor {
     fn drop(&mut self) {
+        if self.is_sram {
+            return;
+        }
         #[cfg(target_os = "linux")]
         if self.layout.align() == HUGE {
             unsafe { libc::munmap(self.ptr.cast(), self.layout.size()) };
@@ -834,7 +859,13 @@ impl CpuModel {
                 t
             } else {
                 // Runtime tensor (activations, KV, inputs): zeroed.
-                HostTensor::alloc_on_nodes(bytes, true, nodes, strict)?
+                let sram = crate::memory::sram::SramManager::global();
+                if let Some(sram_ptr) = sram.alloc_hot_tensor(bytes) {
+                    tracing::debug!(tensor = %td.name, bytes, "Allocated runtime tensor in L3 Pseudo-Lock SRAM");
+                    HostTensor::from_sram(sram_ptr, bytes, true)
+                } else {
+                    HostTensor::alloc_on_nodes(bytes, true, nodes, strict)?
+                }
             };
             tensors.push(t);
             names.push(td.name.clone());
@@ -1163,9 +1194,15 @@ impl KernelExec {
             }
         }
         let scratch_bytes = ffi::scratch_bytes().max(64) as usize;
+        let sram = crate::memory::sram::SramManager::global();
         let mut slots = Vec::with_capacity(workers);
         for w in 0..workers {
-            let scratch = HostTensor::alloc(scratch_bytes, false)?;
+            let scratch = if let Some(sram_ptr) = sram.alloc_scratch(scratch_bytes) {
+                tracing::debug!(worker = w, bytes = scratch_bytes, "Allocated worker scratch from Pseudo-Lock SRAM");
+                HostTensor::from_sram(sram_ptr, scratch_bytes, false)
+            } else {
+                HostTensor::alloc(scratch_bytes, false)?
+            };
             let mut ctx = PlowCpuCtx::new(w as u32, worker_node(w));
             ctx.scratch = scratch.as_ptr() as *mut c_void;
             ctx.scratch_bytes = scratch_bytes as u32;
@@ -1891,7 +1928,18 @@ impl CpuEngine {
         // core, and that tax exceeded the gain — the same fp8 cell measured 626 / 132 with a logical
         // pool whose prefill was narrowed to 8. Fixing that needs the idle worker to stop polling,
         // which is the real prerequisite for per-phase widths.
-        let wants_logical = model.blob.progs.iter().any(dense_row_decode);
+        let sram_active = crate::memory::sram::SramManager::global().has_l2()
+            || crate::memory::sram::SramManager::global().has_l3();
+        // Prevent SMT core thrashing: Both SMT siblings issue into the same TMUL and 512-bit
+        // FMA ports and share the core's private L2 cache. When AMX, AVX-512, or pseudo-locking
+        // SRAM is used, running on SMT siblings causes port contention, thermal throttling, and
+        // cache eviction. Pin workers strictly to physical cores (rank 0).
+        let avoid_smt = matches!(isa, Isa::Amx | Isa::Avx512) || sram_active;
+        let wants_logical = if avoid_smt {
+            false
+        } else {
+            model.blob.progs.iter().any(dense_row_decode)
+        };
         let threads = worker_width(
             opts.threads,
             threads.max(if wants_logical { logical_w } else { physical_w }),
@@ -1901,10 +1949,15 @@ impl CpuEngine {
         tracing::info!(
             threads,
             ?isa,
+            avoid_smt,
             physical_cores = topo.physical_cores(),
             "cpu: worker count"
         );
-        let placement = topo.worker_cpus(&nodes);
+        let placement = if avoid_smt {
+            topo.physical_worker_cpus(&nodes)
+        } else {
+            topo.worker_cpus(&nodes)
+        };
         let exec = Arc::new(KernelExec::new(&model, threads, |w| {
             placement[w % placement.len()].1
         })?);

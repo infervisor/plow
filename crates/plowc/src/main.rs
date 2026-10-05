@@ -272,6 +272,24 @@ struct Cli {
     #[arg(long, default_value_t = false)]
     sram_fit: bool,
 
+    /// Target Intel CPU architecture profile or auto-detection:
+    /// e.g. `auto` (probed via sysfs /dev/pseudo_lock_*), `xeon6` (Granite Rapids / Sierra Forest),
+    /// `xeon5` (Emerald Rapids), `xeon4` (Sapphire Rapids), `client` (Arrow Lake / Raptor Lake).
+    #[arg(long, default_value = "auto")]
+    intel_cpu: String,
+
+    /// Override L2 Pseudo-Lock SRAM budget in KiB for packet rung scheduling (0 = auto-detect).
+    #[arg(long, default_value_t = 0)]
+    l2_sram_kib: u64,
+
+    /// Override L3 Pseudo-Lock SRAM budget in MiB for KV-cache and weights (0 = auto-detect).
+    #[arg(long, default_value_t = 0)]
+    l3_sram_mib: u64,
+
+    /// Avoid SMT hyperthread thrashing on Intel AMX/AVX-512 targets (default true).
+    #[arg(long, default_value_t = true)]
+    no_smt: bool,
+
     /// Disable the Lean PERFORMANCE ORACLE (on by default). Affects only the
     /// oracle — the ordering certificate keeps running unless you also pass
     /// `--no-lean-verify`.
@@ -2507,7 +2525,46 @@ fn run(cli: Cli) -> Result<Report, Box<dyn std::error::Error>> {
             }
         },
     };
+    let (l2_sram_kib, l3_sram_mib) =
+        resolve_intel_sram_budgets(&cli.intel_cpu, cli.l2_sram_kib, cli.l3_sram_mib);
+    tracing::info!(
+        profile = %cli.intel_cpu,
+        l2_sram_kib,
+        l3_sram_mib,
+        no_smt = cli.no_smt,
+        "Intel CPU Pseudo-Lock SRAM Roofline Configuration"
+    );
     Ok(plowc::compile_named(&source, &opts, cli.served_name)?)
+}
+
+/// Resolve Intel CPU SRAM budgets based on target profile or hardware detection.
+/// Returns (l2_kib, l3_mib).
+fn resolve_intel_sram_budgets(profile: &str, l2_override: u64, l3_override: u64) -> (u64, u64) {
+    if l2_override > 0 && l3_override > 0 {
+        return (l2_override, l3_override);
+    }
+    let (detected_l2, detected_l3) = match profile.to_ascii_lowercase().as_str() {
+        "xeon6" | "graniterapids" | "gnr" => (1920, 420),
+        "xeon5" | "emeralds" | "emr" => (1792, 280),
+        "xeon4" | "sapphirerapids" | "spr" => (1792, 90),
+        "client" | "arrowlake" | "raptorlake" => (1536, 24),
+        _ => {
+            let l2_k = std::fs::read_to_string("/sys/devices/system/cpu/cpu0/cache/index2/size")
+                .ok()
+                .and_then(|s| s.trim().strip_suffix('K').and_then(|v| v.parse::<u64>().ok()))
+                .unwrap_or(2048);
+            let l3_k = std::fs::read_to_string("/sys/devices/system/cpu/cpu0/cache/index3/size")
+                .ok()
+                .and_then(|s| s.trim().strip_suffix('K').and_then(|v| v.parse::<u64>().ok()))
+                .unwrap_or(491520);
+            let l2 = (l2_k * 15) / 16;
+            let l3 = ((l3_k / 1024) * 14) / 16;
+            (l2.max(512), l3.max(16))
+        }
+    };
+    let l2 = if l2_override > 0 { l2_override } else { detected_l2 };
+    let l3 = if l3_override > 0 { l3_override } else { detected_l3 };
+    (l2, l3)
 }
 
 /// Print the compiler-pass statistics + runtime estimates as a table.

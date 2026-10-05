@@ -250,6 +250,28 @@ impl Topology {
         cpus
     }
 
+    /// Worker placement restricted strictly to rank 0 (physical cores).
+    /// Used when AMX or AVX-512 is active or Pseudo-Lock SRAM is enabled to prevent
+    /// SMT hyperthread contention, TMUL thrashing, and private L2 cache eviction.
+    pub fn physical_worker_cpus(&self, nodes: &[u32]) -> Vec<(u32, u32)> {
+        let groups: Vec<Vec<&Core>> = nodes
+            .iter()
+            .map(|&n| self.cores_on_node(n).collect())
+            .collect();
+        let width = groups.iter().map(Vec::len).max().unwrap_or(0);
+        let mut cpus = Vec::new();
+        for i in 0..width {
+            for cores in &groups {
+                if let Some(c) = cores.get(i) {
+                    if let Some(&cpu) = c.siblings.first() {
+                        cpus.push((cpu, c.node));
+                    }
+                }
+            }
+        }
+        cpus
+    }
+
     /// Cores on `node`, ascending.
     pub fn cores_on_node(&self, node: u32) -> impl Iterator<Item = &Core> {
         self.cores.iter().filter(move |c| c.node == node)

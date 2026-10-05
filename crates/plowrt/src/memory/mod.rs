@@ -6,6 +6,7 @@ pub mod dma;
 pub mod kv;
 pub mod pool;
 pub mod prefix;
+pub mod sram;
 pub mod streamer;
 pub mod tile_ref;
 pub mod vmm;

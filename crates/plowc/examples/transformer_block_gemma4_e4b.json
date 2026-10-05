@@ -1,0 +1,15 @@
+{
+  "name": "transformer-block-gemma4-e4b",
+  "note": "Full decoder block (Gemma 4 E4B text LLM of voice agent server): hidden 2560, 8 query heads, 2 KV heads shared (attention_k_eq_v true), head_dim 256, GeGLU MLP intermediate 10240. Fused QKV = 8*256 (Q) + 2*256 (shared K/V) = 2048 + 512 = 2560. o_proj: 8*256 -> 2560. GeGLU: fused up 2*10240 = 20480, act, down 10240 -> 2560.",
+  "hidden": 2560,
+  "ops": [
+    { "op": "norm" },
+    { "op": "gemm", "n": 2560, "k": 2560 },
+    { "op": "flash", "heads": 8, "head_dim": 256 },
+    { "op": "gemm", "n": 2560, "k": 2560 },
+    { "op": "norm" },
+    { "op": "gemm", "n": 20480, "k": 2560 },
+    { "op": "act" },
+    { "op": "gemm", "n": 2560, "k": 10240 }
+  ]
+}
