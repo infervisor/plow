@@ -607,25 +607,41 @@ static int wm_run(const gemm_args* g, uint32_t slice, uint32_t nblk, PlowCpuCtx*
     const int glu = g->Wu != NULL || g->Wu4 != NULL;
     const uint32_t nacc = glu ? 2u : 1u;
     const uint32_t S = (g->N + 31u) / 32u, MB = (g->M + 31u) / 32u;
-    /* Split axis. Normally N: a slice owns 32-column weight strips and W is read once per call.
-     * But pack_x_panel is per slice, so every slice packs the WHOLE M x K activation and the
-     * pack is done nblk times over. A narrow N makes that dominate -- at N=512, nblk=16 a
-     * slice's single strip does less compute than its pack -- and at N < 32*nblk most slices
-     * get no strip at all and the op serializes onto the few that do.
-     * Split over M instead when the whole-N W panel is L2-resident (so no slice has to re-chunk
-     * to hold it), every slice still gets a full 32-row token block, and M is worth at least
-     * half of N. The pack drops to 1x; each slice re-reads W, which those conditions keep small
-     * and L3-warm after the first slice. Output stays disjoint either way -- and the slice ->
-     * region map is already driver-dependent, since the strip driver splits (m, n) tiles. */
-    /* Never at fp4: an M-split slice owns EVERY strip, so all nblk threads would dequantize the
-     * whole weight — nblk times the unpack, which is the fp4 path's only added work. */
-    const int msplit = !mx && g->M >= 32u * nblk && (uint64_t)g->M * 2u > (uint64_t)g->N &&
-                       (size_t)S * nacc * 32u * WM_KP * 2u + WM_TB_BYTES + (size_t)S * nacc * 4096u <=
-                           WM_L2_BUDGET;
-    const uint32_t s0 = msplit ? 0u : (uint32_t)((uint64_t)S * slice / nblk);
-    const uint32_t s1 = msplit ? S : (uint32_t)((uint64_t)S * (slice + 1u) / nblk);
-    const uint32_t mlo = msplit ? (uint32_t)((uint64_t)MB * slice / nblk) * 32u : 0u;
-    uint32_t mhi = msplit ? (uint32_t)((uint64_t)MB * (slice + 1u) / nblk) * 32u : g->M;
+    /* Slice grid gm x gn over (32-token blocks, 32-column weight strips). pack_x_panel is per
+     * slice, so a pure N split packs the WHOLE M x K activation nblk times over: on Gemma-4-E2B
+     * a 1000-token prefill measured 300 ms with the pack and 108 ms without it, i.e. the
+     * redundant pack was ~2/3 of prefill. Splitting M cuts the pack to M/gm rows per slice but
+     * makes gm slices re-read each strip (out of L2/L3). Pick the grid minimising one slice's
+     * pack + weight fetch + TMUL work, in units of one bf16 MAC: a packed element (load,
+     * transpose, store, re-load) ~128, a weight element fetched into a strip ~30 (fitted to the
+     * measurement above). A narrow N also stops serializing onto the few slices that own a
+     * strip: N=1536 has 48 strips for 96 slices, and a 16 x 6 grid keeps every slice busy.
+     * Output stays disjoint (each slice owns an (m, n) rectangle); every consumer waits for the
+     * whole op, so the slice -> region map is the kernel's choice (the strip driver splits
+     * (m, n) tiles too). Never at fp4: each M group would re-dequantize its strips, and the
+     * unpack is the fp4 path's only added work. */
+    uint32_t gm = 1u, gn = nblk;
+    if (!mx) {
+        uint64_t best = ~0ull;
+        for (uint32_t m = 1u; m <= nblk && m <= MB; m++) {
+            const uint32_t n = nblk / m;
+            if (n == 0u) continue;
+            const uint64_t rows = (uint64_t)((MB + m - 1u) / m) * 32u;
+            const uint64_t strips = (S + (n < S ? n : S) - 1u) / (n < S ? n : S);
+            /* The slice's W panel must leave L2 room for two token blocks, or the chunking below
+             * drops to one block per chunk and re-reads W from L3 per 32 tokens (GLU at 16
+             * strips: 2 MiB of panel, +57% GEMM_GLU time). */
+            if (m > 1u && strips * nacc * (32u * WM_KP * 2u + 2u * 4096u) + 2u * WM_TB_BYTES > WM_L2_BUDGET)
+                continue;
+            const uint64_t cost = 128u * rows + 30u * strips * 32u * nacc + rows * strips * 32u * nacc;
+            if (cost < best) best = cost, gm = m, gn = n < S ? n : S;
+        }
+    }
+    if (slice >= gm * gn) return 1;
+    const uint32_t im = slice / gn, in_ = slice % gn;
+    const uint32_t s0 = (uint32_t)((uint64_t)S * in_ / gn), s1 = (uint32_t)((uint64_t)S * (in_ + 1u) / gn);
+    const uint32_t mlo = (uint32_t)((uint64_t)MB * im / gm) * 32u;
+    uint32_t mhi = (uint32_t)((uint64_t)MB * (im + 1u) / gm) * 32u;
     if (mhi > g->M) mhi = g->M;
     if (s0 >= s1 || mlo >= mhi) return 1;
     const uint32_t nstrip = s1 - s0;
