@@ -86,7 +86,9 @@ impl SpeechContract {
 
     /// The single speech pipeline of `<assets>/model.pkt`, or `None` for a non-speech packet.
     pub fn load(assets: &Path) -> Result<Option<Self>> {
-        let asset = crate::exec::packet_runtime::PacketAsset::load(&assets.join("model.pkt"))?;
+        let Some(asset) = crate::exec::packet_runtime::PacketAsset::load_if_present(&assets.join("model.pkt"))? else {
+            return Ok(None);
+        };
         let mut found = asset.pipelines().iter().filter(|p| p.driver == DRIVER);
         match (found.next(), found.next()) {
             (None, _) => Ok(None),

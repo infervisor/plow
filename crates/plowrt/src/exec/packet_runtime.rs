@@ -285,6 +285,19 @@ impl PacketAsset {
         Self::from_bytes(&image)
     }
 
+    /// `None` for a packet without a pipeline section (a plain language-model packet).
+    pub fn load_if_present(path: &Path) -> Result<Option<Self>> {
+        let image = std::fs::read(path).map_err(|source| RuntimeError::Io {
+            path: path.to_owned(),
+            source,
+        })?;
+        let blob = crate::asset::devblob::DevBlob::parse(&image)?;
+        if blob.reserved_metadata(&image, SECTION)?.is_none() {
+            return Ok(None);
+        }
+        Self::from_bytes(&image).map(Some)
+    }
+
     pub fn from_bytes(image: &[u8]) -> Result<Self> {
         let blob = crate::asset::devblob::DevBlob::parse(image)?;
         let raw = blob
@@ -836,6 +849,36 @@ mod tests {
             let actual = f32::from_ne_bytes(bytes[index * 4..index * 4 + 4].try_into().unwrap());
             assert!((actual - expected).abs() < 1e-6, "{actual} != {expected}");
         }
+    }
+
+    #[test]
+    fn a_packet_without_pipelines_is_not_a_pipeline_asset() {
+        use packet::dev::DevOp;
+        use packet::devbuild::{Builder, Model};
+
+        let mut builder = Builder::new(1);
+        let values = builder.tensor("act.values", 16);
+        builder.emit(DevOp::SiluF32, builder.all(), &[], |inst| {
+            inst.t[..2].copy_from_slice(&[values, values]);
+            inst.i[0] = 4;
+        });
+        let tensors = builder.tensors();
+        let model = Model {
+            n_cu: 1,
+            target: 0,
+            tensors,
+            progs: vec![builder.finish()],
+            prog_t: vec![1],
+            kv_row_insts: vec![],
+            gen: vec![],
+        };
+        let path = std::env::temp_dir().join(format!("plow-packet-no-pipelines-{}.plowdev", std::process::id()));
+        std::fs::write(&path, model.to_blob()).unwrap();
+        let present = PacketAsset::load_if_present(&path);
+        let strict = PacketAsset::load(&path);
+        let _ = std::fs::remove_file(&path);
+        assert!(matches!(present, Ok(None)));
+        assert!(strict.is_err());
     }
 
     #[cfg(all(feature = "metal", target_os = "macos"))]
