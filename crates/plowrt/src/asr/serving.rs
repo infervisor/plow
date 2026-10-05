@@ -126,9 +126,12 @@ impl Route {
 #[derive(Clone)]
 struct AsrMux {
     tx: mpsc::Sender<AsrJob>,
+    metrics: Arc<crate::obs::Metrics>,
 }
 
 struct AsrJob {
+    metrics: Arc<crate::obs::Metrics>,
+    queued_at: Instant,
     samples: Vec<f32>,
     language: Option<String>,
     context: String,
@@ -144,6 +147,9 @@ enum SubmitError {
 
 impl AsrMux {
     fn spawn(mut engine: Box<dyn Transcriber>) -> (Self, usize, FinalizationPolicy) {
+        let metrics = Arc::new(crate::obs::Metrics::default());
+        metrics.serving.asr.cohort.store(true, Ordering::Relaxed);
+        let _ = crate::obs::serving::started_at_unix_ms();
         let batch_capacity = engine.batch_capacity().max(1);
         let finalization = engine.finalization_policy();
         let ingress_capacity = batch_capacity.saturating_mul(4).max(4);
@@ -174,6 +180,12 @@ impl AsrMux {
                             .make_contiguous()
                             .sort_by_key(|job| std::cmp::Reverse(job.samples.len()));
                     }
+                    for job in &cohort {
+                        let metrics = &job.metrics.serving.asr;
+                        metrics.queued.fetch_sub(1, Ordering::Relaxed);
+                        metrics.running.fetch_add(1, Ordering::Relaxed);
+                        metrics.queue.duration(job.queued_at.elapsed());
+                    }
                     let requests: Vec<_> = cohort
                         .iter()
                         .map(|job| TranscriptionInput {
@@ -186,7 +198,7 @@ impl AsrMux {
                     match engine.transcribe_batch(&requests) {
                         Ok(results) if results.len() == cohort.len() => {
                             for (job, result) in cohort.drain(..).zip(results) {
-                                let _ = job.respond.send(result);
+                                finish_job(job, result);
                             }
                         }
                         Ok(results) => {
@@ -202,7 +214,7 @@ impl AsrMux {
                 }
             })
             .expect("failed to spawn ASR engine thread");
-        (Self { tx }, ingress_capacity, finalization)
+        (Self { tx, metrics }, ingress_capacity, finalization)
     }
 
     fn submit(
@@ -212,20 +224,44 @@ impl AsrMux {
         context: String,
         cancel: Arc<AtomicBool>,
     ) -> Result<oneshot::Receiver<crate::Result<Transcript>>, SubmitError> {
+        let permit = self.tx.try_reserve().map_err(|error| {
+            self.metrics.serving.asr.rejected.fetch_add(1, Ordering::Relaxed);
+            match error {
+                mpsc::error::TrySendError::Full(_) => SubmitError::Full,
+                mpsc::error::TrySendError::Closed(_) => SubmitError::Closed,
+            }
+        })?;
         let (respond, receive) = oneshot::channel();
         let job = AsrJob {
+            metrics: self.metrics.clone(),
+            queued_at: Instant::now(),
             samples,
             language,
             context,
             cancel,
             respond,
         };
-        self.tx.try_send(job).map_err(|error| match error {
-            mpsc::error::TrySendError::Full(_) => SubmitError::Full,
-            mpsc::error::TrySendError::Closed(_) => SubmitError::Closed,
-        })?;
+        self.metrics.serving.asr.jobs.fetch_add(1, Ordering::Relaxed);
+        self.metrics.serving.asr.queued.fetch_add(1, Ordering::Relaxed);
+        permit.send(job);
         Ok(receive)
     }
+}
+
+fn finish_job(job: AsrJob, result: crate::Result<Transcript>) {
+    let metrics = &job.metrics.serving.asr;
+    let elapsed = job.queued_at.elapsed();
+    metrics.running.fetch_sub(1, Ordering::Relaxed);
+    metrics.e2e.duration(elapsed);
+    if job.cancel.load(Ordering::Relaxed) || job.respond.is_closed() {
+        metrics.cancelled.fetch_add(1, Ordering::Relaxed);
+    } else if result.is_ok() {
+        metrics.completed.fetch_add(1, Ordering::Relaxed);
+        metrics.first_transcript.duration(elapsed);
+    } else {
+        metrics.errors.fetch_add(1, Ordering::Relaxed);
+    }
+    let _ = job.respond.send(result);
 }
 
 fn fanout_batch_error(cohort: &mut VecDeque<AsrJob>, error: crate::RuntimeError) {
@@ -241,7 +277,23 @@ fn fanout_batch_error(cohort: &mut VecDeque<AsrJob>, error: crate::RuntimeError)
             }
             _ => crate::RuntimeError::Msg(message.clone()),
         };
-        let _ = job.respond.send(Err(error));
+        finish_job(job, Err(error));
+    }
+}
+
+struct AsrSessionMetrics(Option<Arc<crate::obs::Metrics>>);
+impl AsrSessionMetrics {
+    fn new(metrics: Option<Arc<crate::obs::Metrics>>) -> Self {
+        if let Some(m) = &metrics {
+            m.serving.asr.websocket_sessions.fetch_add(1, Ordering::Relaxed);
+            m.serving.asr.active_sessions.fetch_add(1, Ordering::Relaxed);
+        }
+        Self(metrics)
+    }
+}
+impl Drop for AsrSessionMetrics {
+    fn drop(&mut self) {
+        if let Some(m) = &self.0 { m.serving.asr.active_sessions.fetch_sub(1, Ordering::Relaxed); }
     }
 }
 
@@ -299,10 +351,10 @@ impl AsrServer {
         map.entry(key).or_default().clone()
     }
 
-    /// The served model's metrics (`plowrt serve` only).
+    /// The served model's bounded atomic counters.
     fn metrics(&self, _model: &str) -> Option<Arc<crate::obs::Metrics>> {
         match &self.backend {
-            Backend::Cohort { .. } => None,
+            Backend::Cohort { mux, .. } => Some(mux.metrics.clone()),
             #[cfg(feature = "cuda")]
             Backend::Serve(state) => Some(state.model_metrics(_model)),
         }
@@ -321,8 +373,49 @@ impl AsrServer {
         }
     }
     pub fn router(self: Arc<Self>, websocket: bool) -> Router {
-        self.transcription_router(websocket)
-            .route("/health", get(|| async { StatusCode::OK }))
+        let model = match &self.backend {
+            Backend::Cohort { model, .. } => Some(model.clone()),
+            #[cfg(feature = "cuda")]
+            Backend::Serve(_) => None,
+        };
+        let metrics = match &self.backend {
+            Backend::Cohort { model, mux, .. } => Some((model.clone(), mux.metrics.clone())),
+            #[cfg(feature = "cuda")]
+            Backend::Serve(_) => None,
+        };
+        let mut router = self.transcription_router(websocket)
+            .route("/health", get(|| async { StatusCode::OK }));
+        if let Some((model, metrics)) = metrics {
+            let models = vec![(model, metrics, true)];
+            let json_models = models.clone();
+            router = router.route("/metrics", get(move || {
+                let mut out = String::new();
+                crate::obs::serving::ServingMetrics::write(&mut out, &models);
+                async move { ([("content-type", "text/plain; version=0.0.4; charset=utf-8")], out) }
+            })).route("/v1/metrics", get(move || {
+                let snapshot = crate::obs::serving::snapshot(&json_models);
+                async move { Json(snapshot) }
+            }));
+        }
+        if let Some(model) = model {
+            let mut endpoints = vec!["audio/transcriptions"];
+            if websocket { endpoints.push("audio/transcriptions/stream"); }
+            let card = json!({"id": model, "root": model, "object": "model", "created": 0,
+                "owned_by": "plow", "x_plow_endpoints": endpoints,
+                "input_modalities": ["audio"], "output_modalities": ["text"]});
+            let list_card = card.clone();
+            router = router.route("/v1/models", get(move || {
+                let card = list_card.clone();
+                async move { Json(json!({"object": "list", "data": [card]})) }
+            })).route("/v1/models/:model", get(move |axum::extract::Path(id): axum::extract::Path<String>| {
+                let card = card.clone();
+                async move {
+                    if card["id"] == id { Json(card).into_response() }
+                    else { failure(StatusCode::NOT_FOUND, "unknown ASR model") }
+                }
+            }));
+        }
+        router
     }
 
     /// The transcription routes alone, to merge into another server's router.
@@ -448,6 +541,10 @@ async fn transcribe_upload(state: Arc<AsrServer>, mut multipart: Multipart, ids:
         Ok((route, _)) => route,
         Err(response) => return response,
     };
+    let metrics = state.metrics(&model);
+    if let Some(metrics) = &metrics {
+        metrics.serving.asr.http_requests.fetch_add(1, Ordering::Relaxed);
+    }
     let format = fields
         .remove("response_format")
         .unwrap_or_else(|| "json".into());
@@ -505,7 +602,7 @@ async fn transcribe_upload(state: Arc<AsrServer>, mut multipart: Multipart, ids:
         ids,
         crate::serve::turns::Kind::Asr,
         &model,
-        state.metrics(&model),
+        metrics,
         Instant::now(),
         finals,
     );
@@ -580,7 +677,7 @@ async fn transcribe_upload(state: Arc<AsrServer>, mut multipart: Multipart, ids:
         let cache = crate::serve::session::CacheOutcome::received(report_rx).await;
         run.admitted(cache.and_then(|c| c.at));
         let stamped = run.headers();
-        let mut response = sse_transcript(work, delta_rx, ids.clone(), finals, offset, cache, (in_flight, cancel, recording), run);
+        let mut response = sse_transcript(work, delta_rx, ids.clone(), finals, offset, cache, cancel.0.clone(), (in_flight, cancel, recording), run);
         response.headers_mut().extend(stamped);
         if let Some(cache) = cache {
             cache.stamp(&mut response);
@@ -641,6 +738,7 @@ fn sse_transcript<H: Send + 'static>(
     finals: bool,
     offset: Option<usize>,
     cache: Option<crate::serve::session::CacheOutcome>,
+    cancel: Arc<AtomicBool>,
     held: H,
     mut run: crate::serve::turns::StageRun,
 ) -> Response {
@@ -650,9 +748,16 @@ fn sse_transcript<H: Send + 'static>(
         let mut shown = String::new();
         let result = loop {
             tokio::select! {
+                _ = tx.closed() => {
+                    cancel.store(true, Ordering::Relaxed);
+                    let _ = work.await;
+                    return;
+                },
                 Some(delta) = deltas.recv() => {
                     shown.push_str(&delta);
                     if tx.send(transcript_event("transcript.text.delta", &ids, json!({"delta": delta}))).await.is_err() {
+                        cancel.store(true, Ordering::Relaxed);
+                        let _ = work.await;
                         return;
                     }
                 }
@@ -803,6 +908,7 @@ async fn stream(state: Arc<AsrServer>, mut socket: WebSocket, _permit: OwnedSema
             return;
         }
     };
+    let _metrics = AsrSessionMetrics::new(state.metrics(&start.model));
     let language = start.language.clone();
     let partials = start.partials;
     let session = ids.session.clone().unwrap_or_default();
@@ -1081,6 +1187,10 @@ mod tests {
         }
         assert_eq!(*sizes.lock().unwrap(), [4]);
         assert_eq!(*sample_lengths.lock().unwrap(), [4, 3, 2, 1]);
+        let stats = mux.metrics.serving.asr.snapshot().unwrap();
+        assert_eq!((stats.jobs, stats.completed, stats.cancelled, stats.errors), (4, 3, 1, 0));
+        assert_eq!((stats.queued, stats.running), (0, 0));
+        assert_eq!((stats.e2e.count, stats.queue.count, stats.first_transcript.count), (4, 4, 3));
     }
 
     #[tokio::test]
@@ -1132,6 +1242,8 @@ mod tests {
             .unwrap();
         let queued: Vec<_> = (0..ingress_capacity).map(|_| submit().unwrap()).collect();
         assert_eq!(submit().unwrap_err(), SubmitError::Full);
+        let metrics = mux.metrics.serving.asr.snapshot().unwrap();
+        assert_eq!((metrics.running, metrics.queued, metrics.rejected), (1, ingress_capacity as u64, 1));
         *release.0.lock().unwrap() = true;
         release.1.notify_one();
         assert!(active.await.unwrap().is_ok());
@@ -1194,6 +1306,20 @@ mod tests {
             .header("content-type", "multipart/form-data; boundary=audio")
             .body(Body::from(body))
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn standalone_discovery_preserves_model_identity_and_audio_capabilities() {
+        let app = AsrServer::new("nemotron-asr-0.6b".into(), Fake).router(true);
+        let response = app.clone().oneshot(Request::get("/v1/models").body(Body::empty()).unwrap()).await.unwrap();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let list: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(list["data"][0]["id"], "nemotron-asr-0.6b");
+        assert_eq!(list["data"][0]["x_plow_endpoints"], json!(["audio/transcriptions", "audio/transcriptions/stream"]));
+        for (name, status) in [("nemotron-asr-0.6b", 200), ("transcribe", 404)] {
+            assert_eq!(app.clone().oneshot(Request::get(format!("/v1/models/{name}")).body(Body::empty()).unwrap()).await.unwrap().status(), status);
+            assert_eq!(app.clone().oneshot(request(name, "json")).await.unwrap().status(), status);
+        }
     }
 
     #[tokio::test]
@@ -1265,6 +1391,138 @@ mod tests {
             .status(),
             StatusCode::NOT_FOUND
         );
+    }
+
+    #[tokio::test]
+    async fn dropped_http_audio_stream_cancels_engine_work_and_balances_metrics() {
+        struct UntilCancelled(Arc<tokio::sync::Notify>, Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>);
+        impl Transcriber for UntilCancelled {
+            fn language(&self, _: Option<&str>) -> crate::Result<Option<String>> { Ok(None) }
+            fn transcribe(&mut self, _: &[f32], _: Option<&str>, _: &str, cancel: &AtomicBool) -> crate::Result<Transcript> {
+                while !cancel.load(Ordering::Relaxed) { std::thread::sleep(Duration::from_millis(1)); }
+                self.0.notify_one();
+                let mut released = self.1.0.lock().unwrap();
+                while !*released { released = self.1.1.wait(released).unwrap(); }
+                Err(crate::RuntimeError::Rejected("cancelled".into()))
+            }
+        }
+        let cancelled = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let server = AsrServer::new("test".into(), UntilCancelled(cancelled.clone(), release.clone()));
+        let (mut parts, body) = request("test", "json").into_parts();
+        parts.headers.insert("x-session-id", "http-cancellation-session".parse().unwrap());
+        parts.headers.insert("x-request-id", "http-cancellation-request".parse().unwrap());
+        let ids = RequestIds::from_headers(&parts.headers).unwrap();
+        let mut body = body.collect().await.unwrap().to_bytes().to_vec();
+        body.truncate(body.len() - b"--audio--\r\n".len());
+        body.extend_from_slice(b"--audio\r\nContent-Disposition: form-data; name=\"stream\"\r\n\r\ntrue\r\n--audio--\r\n");
+        let response = server.clone().router(true).oneshot(Request::from_parts(parts, Body::from(body))).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        drop(response);
+        tokio::time::timeout(Duration::from_secs(1), cancelled.notified()).await.unwrap();
+        let metrics = server.metrics("test").unwrap();
+        let retained = ids.begin("test").is_none();
+        let running = metrics.serving.asr.running.load(Ordering::Relaxed);
+        *release.0.lock().unwrap() = true;
+        release.1.notify_one();
+        assert!(retained, "request identity remains in flight until the cancelled worker returns");
+        assert_eq!(running, 1);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while metrics.serving.asr.cancelled.load(Ordering::Relaxed) == 0 { tokio::task::yield_now().await; }
+        }).await.unwrap();
+        let stats = metrics.serving.asr.snapshot().unwrap();
+        assert_eq!((stats.jobs, stats.cancelled, stats.running, stats.queued, stats.errors), (1, 1, 0, 0, 0));
+    }
+
+    #[tokio::test]
+    async fn standalone_metrics_count_work_and_publish_the_served_identity() {
+        let server = AsrServer::new("named-asr".into(), Fake);
+        let app = server.clone().router(true);
+        let ok = app.clone().oneshot(request("named-asr", "json")).await.unwrap();
+        assert_eq!(ok.status(), StatusCode::OK);
+        let bad = app.clone().oneshot(request("named-asr", "xml")).await.unwrap();
+        assert_eq!(bad.status(), StatusCode::BAD_REQUEST);
+        let Backend::Cohort { mux, .. } = &server.backend else { panic!("cohort") };
+        let error = mux.submit(vec![0.0; 8000], Some("Invalid".into()), String::new(), Arc::new(AtomicBool::new(false))).unwrap().await.unwrap();
+        assert!(error.is_err());
+        let response = app.clone().oneshot(Request::get("/v1/metrics").body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let snapshot: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(snapshot["object"], "runtime.metrics");
+        assert!(snapshot["started_at_unix_ms"].as_u64().unwrap() <= snapshot["observed_at_unix_ms"].as_u64().unwrap());
+        let model = &snapshot["models"][0];
+        assert_eq!(model["id"], "named-asr");
+        assert_eq!(model["requests"], 2);
+        assert_eq!(model["completed"], 1);
+        assert_eq!(model["asr"]["errors"], 1);
+        assert_eq!(model["asr"]["http_requests"], 2);
+        assert_eq!(model["asr"]["first_transcript"]["count"], 1);
+        assert_eq!(model["asr"]["e2e"]["count"], 2);
+        assert!(model["ttft"]["p95_ms"].is_null(), "audio transcripts must not invent token latency");
+        let response = app.oneshot(Request::get("/metrics").body(Body::empty()).unwrap()).await.unwrap();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(text.contains("plowrt_asr_jobs_errors_total{model_name=\"named-asr\",engine=\"0\"} 1"));
+        assert!(text.contains("plowrt_asr_jobs_running{model_name=\"named-asr\",engine=\"0\"} 0"));
+    }
+
+    #[tokio::test]
+    async fn http_discovery_and_transcription_reuse_one_tcp_socket() {
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = AsrServer::new("test".into(), Fake).router(true);
+        let task = tokio::spawn(async move { axum::serve(listener, app).tcp_nodelay(true).await.unwrap() });
+        let mut socket = BufReader::new(tokio::net::TcpStream::connect(address).await.unwrap());
+        let request = request("test", "json");
+        let (parts, body) = request.into_parts();
+        let body = body.collect().await.unwrap().to_bytes();
+        for transcription in [false, true, false] {
+            let head = if transcription {
+                format!("POST /v1/audio/transcriptions HTTP/1.1\r\nHost: {address}\r\nContent-Type: {}\r\nContent-Length: {}\r\n\r\n", parts.headers["content-type"].to_str().unwrap(), body.len())
+            } else {
+                format!("GET /v1/models HTTP/1.1\r\nHost: {address}\r\n\r\n")
+            };
+            socket.get_mut().write_all(head.as_bytes()).await.unwrap();
+            if transcription { socket.get_mut().write_all(&body).await.unwrap(); }
+            let mut line = String::new();
+            socket.read_line(&mut line).await.unwrap();
+            assert!(line.starts_with("HTTP/1.1 200"), "{line}");
+            let mut length = None;
+            loop {
+                line.clear();
+                assert!(socket.read_line(&mut line).await.unwrap() > 0);
+                if line == "\r\n" { break; }
+                if let Some((name, value)) = line.split_once(':') {
+                    if name.eq_ignore_ascii_case("content-length") { length = Some(value.trim().parse::<usize>().unwrap()); }
+                }
+            }
+            let mut response = vec![0; length.expect("bounded JSON response")];
+            socket.read_exact(&mut response).await.unwrap();
+            let response: serde_json::Value = serde_json::from_slice(&response).unwrap();
+            if transcription { assert_eq!(response["text"], "hello"); }
+            else { assert_eq!(response["data"][0]["id"], "test"); }
+        }
+        task.abort();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unix_socket_supports_audio_websocket_upgrade() {
+        let (client, server) = tokio::net::UnixStream::pair().unwrap();
+        let app = AsrServer::new("test".into(), Fake).router(true);
+        let task = tokio::spawn(async move {
+            hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new())
+                .serve_connection_with_upgrades(hyper_util::rt::TokioIo::new(server), hyper_util::service::TowerToHyperService::new(app))
+                .await.unwrap();
+        });
+        let (mut socket, _) = tokio_tungstenite::client_async("ws://localhost/v1/audio/transcriptions/stream", client).await.unwrap();
+        socket.send(tokio_tungstenite::tungstenite::Message::Text(json!({"type":"start","version":1,"model":"test","sample_rate":16000,"format":"pcm_s16le"}).to_string())).await.unwrap();
+        let ready = socket.next().await.unwrap().unwrap().into_text().unwrap();
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&ready).unwrap()["type"], "ready");
+        socket.close(None).await.unwrap();
+        task.await.unwrap();
     }
 
     #[tokio::test]
@@ -1404,6 +1662,15 @@ mod tests {
 
     #[tokio::test]
     async fn websocket_cancel_retains_session_until_worker_returns() {
+        held_websocket_cancellation(false).await;
+    }
+
+    #[tokio::test]
+    async fn websocket_disconnect_retains_session_until_worker_returns() {
+        held_websocket_cancellation(true).await;
+    }
+
+    async fn held_websocket_cancellation(disconnect: bool) {
         use tokio_tungstenite::{connect_async, tungstenite::Message as ClientMessage};
         struct Held {
             started: Arc<tokio::sync::Notify>,
@@ -1467,10 +1734,21 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(5), started.notified())
             .await
             .unwrap();
-        socket
-            .send(ClientMessage::Text(r#"{"type":"cancel"}"#.into()))
-            .await
-            .unwrap();
+        socket.send(ClientMessage::Ping(b"alive".to_vec())).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                match socket.next().await.unwrap().unwrap() {
+                    ClientMessage::Pong(payload) => { assert_eq!(payload, b"alive"); break; }
+                    ClientMessage::Text(_) => {}, // Buffered credit event.
+                    message => panic!("unexpected heartbeat reply: {message:?}"),
+                }
+            }
+        }).await.unwrap();
+        if disconnect {
+            drop(socket);
+        } else {
+            socket.send(ClientMessage::Text(r#"{"type":"cancel"}"#.into())).await.unwrap();
+        }
         let observed = tokio::time::timeout(Duration::from_secs(5), cancelled.notified()).await;
         let held = server.sessions.available_permits() + 1 == session_capacity;
         *release.0.lock().unwrap() = true;
@@ -1488,6 +1766,9 @@ mod tests {
         .unwrap()
         .unwrap();
         drop(permits);
+        let metrics = server.metrics("test").unwrap();
+        let stats = metrics.serving.asr.snapshot().unwrap();
+        assert_eq!((stats.websocket_sessions, stats.active_sessions, stats.cancelled, stats.running), (1, 0, 1, 0));
         task.abort();
     }
 }

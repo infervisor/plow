@@ -686,6 +686,7 @@ pub struct ModelList {
 
 #[derive(Clone, Debug, Serialize)]
 pub struct ModelCard {
+    pub x_plow_endpoints: Vec<&'static str>,
     pub id: String,
     pub object: &'static str,
     pub created: u64,

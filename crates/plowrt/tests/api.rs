@@ -732,3 +732,23 @@ async fn an_empty_messages_array_is_a_400() {
     assert_eq!(status, StatusCode::BAD_REQUEST, "{text}");
     assert!(text.contains("messages"), "{text}");
 }
+
+#[tokio::test]
+async fn typed_runtime_metrics_report_completed_model_work() {
+    let app = make_app();
+    assert_eq!(token_prompt(&app, serde_json::json!([65])).await.0, StatusCode::OK);
+    let response = app.oneshot(Request::get("/v1/metrics").body(Body::empty()).unwrap()).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let value: serde_json::Value = serde_json::from_str(&body_string(response).await).unwrap();
+    assert_eq!(value["object"], "runtime.metrics");
+    let model = &value["models"][0];
+    assert_eq!(model["id"], "api-model");
+    assert_eq!(model["ready"], true);
+    assert_eq!(model["requests"], 1);
+    assert_eq!(model["completed"], 1);
+    assert_eq!(model["running"], 0);
+    assert_eq!(model["generated_tokens"], 1);
+    assert_eq!(model["ttft"]["count"], 1);
+    assert_eq!(model["e2e"]["count"], 1);
+    assert!(model["asr"].is_null());
+}

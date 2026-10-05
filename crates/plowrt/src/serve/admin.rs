@@ -115,12 +115,21 @@ pub struct GroupStatus {
 
 #[derive(Debug, Serialize)]
 pub struct StatusResponse {
+    pub capabilities: ControlCapabilities,
     pub models: Vec<ModelStatus>,
     /// One entry per device group. Empty on a CPU-only serve.
     pub groups: Vec<GroupStatus>,
 }
 
-fn err(status: StatusCode, msg: impl std::fmt::Display) -> Response {
+#[derive(Debug, Serialize)]
+pub struct ControlCapabilities {
+    pub load: bool,
+    pub unload: bool,
+    pub register: bool,
+    pub eviction: bool,
+}
+
+pub(super) fn err(status: StatusCode, msg: impl std::fmt::Display) -> Response {
     (
         status,
         Json(serde_json::json!({ "error": msg.to_string() })),
@@ -170,6 +179,13 @@ fn resolve_assets(state: &AppState, dir: &str) -> std::result::Result<PathBuf, R
 /// `POST /v1/models/load` — make a model resident, registering its assets dir
 /// first when the slug is new.
 pub async fn load(State(state): State<Arc<AppState>>, Json(req): Json<LoadRequest>) -> Response {
+    match tokio::spawn(load_inner(state, req)).await {
+        Ok(response) => response,
+        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e),
+    }
+}
+async fn load_inner(state: Arc<AppState>, mut req: LoadRequest) -> Response {
+    req.model = state.registry.resolve(&req.model).unwrap_or(req.model);
     let _control = state.control_lock(&req.model).await;
     // The path check comes FIRST, before any backend or slug lookup. It is a
     // security boundary, and a boundary that only fires on builds which happen
@@ -180,6 +196,11 @@ pub async fn load(State(state): State<Arc<AppState>>, Json(req): Json<LoadReques
         Some(Ok(dir)) => Some(dir),
         None => None,
     };
+
+    #[cfg(feature = "cpu")]
+    if let Some(manager) = state.portable_manager() {
+        return manager.load(&state, req, assets).await;
+    }
 
     #[cfg(feature = "cuda")]
     {
@@ -303,7 +324,18 @@ pub async fn unload(
     State(state): State<Arc<AppState>>,
     Json(req): Json<UnloadRequest>,
 ) -> Response {
+    match tokio::spawn(unload_inner(state, req)).await {
+        Ok(response) => response,
+        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e),
+    }
+}
+async fn unload_inner(state: Arc<AppState>, mut req: UnloadRequest) -> Response {
+    req.model = state.registry.resolve(&req.model).unwrap_or(req.model);
     let _control = state.control_lock(&req.model).await;
+    #[cfg(feature = "cpu")]
+    if let Some(manager) = state.portable_manager() {
+        return manager.unload(&state, req).await;
+    }
     #[cfg(feature = "cuda")]
     {
         let Some(mgr) = state.manager_for(&req.model).cloned() else {
@@ -353,7 +385,7 @@ pub async fn status(State(state): State<Arc<AppState>>) -> Response {
         #[allow(unused_mut)]
         let mut entry = ModelStatus {
             resident: state.has_gpu_engine(&slug),
-            serving: state.mux(&slug).is_some(),
+            serving: state.mux(&slug).is_some() && state.residency(&slug).admits(),
             residency,
             required_mib: None,
             weights_mib: None,
@@ -393,5 +425,11 @@ pub async fn status(State(state): State<Arc<AppState>>) -> Response {
         });
     }
 
-    Json(StatusResponse { models, groups }).into_response()
+    #[allow(unused_mut)]
+    let mut capabilities = ControlCapabilities { load: false, unload: false, register: false, eviction: false };
+    #[cfg(feature="cuda")]
+    if !state.managers().is_empty() { capabilities = ControlCapabilities {load:true,unload:true,register:true,eviction:true}; }
+    #[cfg(feature="cpu")]
+    if state.portable_manager().is_some() { capabilities = ControlCapabilities {load:true,unload:true,register:true,eviction:false}; }
+    Json(StatusResponse { capabilities, models, groups }).into_response()
 }

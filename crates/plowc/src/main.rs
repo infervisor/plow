@@ -17,7 +17,7 @@ use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 use devgen::emit_config::EmitConfig;
 #[cfg(feature = "tuner")]
 use plowc::tune::{self, TuneAction, TuneOptions};
-use plowc::{compile, net::NetConfig, Options, Parallel, Report, Source};
+use plowc::{net::NetConfig, Options, Parallel, Report, Source};
 use schedule::Phase;
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
@@ -2507,7 +2507,7 @@ fn run(cli: Cli) -> Result<Report, Box<dyn std::error::Error>> {
             }
         },
     };
-    Ok(compile(&source, &opts)?)
+    Ok(plowc::compile_named(&source, &opts, cli.served_name)?)
 }
 
 /// Print the compiler-pass statistics + runtime estimates as a table.
