@@ -763,7 +763,7 @@ impl GpuEngine {
         let g = v.kv.geometry();
         let session = self.session_pin[b].is_some();
         let prompt = v.kv.prompt_rows(b);
-        let prompt_end = rows == prompt && max_rows < rows;
+        let prompt_end = is_prompt_end(rows, max_rows, prompt);
         let max_rows = if session && prompt_end { session_prompt_end(prompt) } else { max_rows };
         let p_a = (rows.min(max_rows) / 32) * 32;
         tracing::info!(
@@ -801,7 +801,7 @@ impl GpuEngine {
             }
             p += step;
         }
-        if session && rows < prompt && !v.kv.checkpoint_awaited(toks, p_a) {
+        if session && !prompt_end && rows < prompt && !v.kv.checkpoint_awaited(toks, p_a) {
             return;
         }
         // Only the prompt-end publish retires (a chunk-end publish also caps `max_rows` below
@@ -880,6 +880,23 @@ impl GpuEngine {
 /// within them never attaches — about one turn in eight missed that way.
 const SESSION_PROMPT_REWRITE: u32 = 8;
 
+/// The publish at the end of a prompt's prefill: the whole prompt with the last row held back
+/// (`max_rows < rows`), or a packed pass that withheld the last prompt token (`pos` and
+/// `max_rows` both `prompt - 1`). A chunk-end publish caps `max_rows` below `rows`.
+fn is_prompt_end(rows: u32, max_rows: u32, prompt: u32) -> bool {
+    (rows == prompt && max_rows < rows) || (rows + 1 == prompt && max_rows == rows)
+}
+
 fn session_prompt_end(prompt: u32) -> u32 {
     prompt.saturating_sub(1 + SESSION_PROMPT_REWRITE)
+}
+
+#[cfg(test)]
+#[test]
+fn prompt_end_covers_the_withheld_last_token() {
+    assert!(is_prompt_end(3000, 2999, 3000), "whole prompt, last row held back");
+    assert!(is_prompt_end(2999, 2999, 3000), "packed pass withheld the last prompt token");
+    assert!(!is_prompt_end(2048, 2047, 3000), "chunk end");
+    assert!(!is_prompt_end(2999, 2048, 3000), "chunk-capped publish");
+    assert!(!is_prompt_end(3100, 3099, 3000), "turn end");
 }
