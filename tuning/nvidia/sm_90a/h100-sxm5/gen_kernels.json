@@ -566,7 +566,7 @@
    "spill_bytes": 0
   },
   "attn_pf_hd256_sliding_fp8kv": {
-   "body_sha256": "af3281cde502b27076e0c2c0d53717b0d2bb2ce734376ab3355580da0b9c5de5",
+   "body_sha256": "89e4d75000ccd31f567ad568319298c79e0dfdf3d3f6d2acb40a8a2b31935781",
    "classes": {
     "h16kv8_w1024_rows1024": {
      "best": {

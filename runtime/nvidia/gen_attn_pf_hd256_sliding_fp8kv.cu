@@ -171,12 +171,13 @@ __device__ __forceinline__ float2 lds64f(uint32_t addr) {
     return v;
 }
 
-// Request r of the packed table; no table is one request covering the launch.
+// Request r of the packed table; no table is one request of seq_kv - q_pos0 real rows (an
+// unpacked chunk's last bucket keeps i[0] at the rung, so rows past them are padding).
 __device__ __forceinline__ unsigned req_count(const PlowGenFlashPrefill& a) {
     return a.requests ? (unsigned)a.requests[0] : 1u;
 }
 __device__ __forceinline__ uint4 req_at(const PlowGenFlashPrefill& a, unsigned r) {
-    if (!a.requests) return make_uint4(0u, a.seq_q, 0u, a.seq_kv);
+    if (!a.requests) return make_uint4(0u, a.seq_kv - a.q_pos0, 0u, a.seq_kv);
     const int* e = a.requests + 1 + 4 * r;
     return make_uint4((unsigned)e[0], (unsigned)e[1], (unsigned)e[2], (unsigned)e[3]);
 }
@@ -577,10 +578,12 @@ __device__ __forceinline__ void consume(const PlowGenFlashPrefill& a, uint32_t b
 
 __device__ __forceinline__ void zero_padding(const PlowGenFlashPrefill& a, unsigned lt,
                                              unsigned nt) {
-    if (!a.requests) return;
-    const unsigned count = (unsigned)a.requests[0];
-    const unsigned real =
-        count ? (unsigned)a.requests[4 * count - 3] + (unsigned)a.requests[4 * count - 2] : 0u;
+    unsigned real = a.seq_kv - a.q_pos0;
+    if (a.requests) {
+        const unsigned count = (unsigned)a.requests[0];
+        real = count ? (unsigned)a.requests[4 * count - 3] + (unsigned)a.requests[4 * count - 2]
+                     : 0u;
+    }
     const size_t begin = (size_t)real * a.n_head * HD;
     const size_t end = (size_t)a.seq_q * a.n_head * HD;
     for (size_t i = begin + (size_t)blockIdx.x * nt + lt; i < end; i += (size_t)gridDim.x * nt)
@@ -636,7 +639,8 @@ __device__ __forceinline__ void run(const PlowGenFlashPrefill& a, uint8_t* smem,
 }
 
 __device__ __forceinline__ bool valid(const PlowGenFlashPrefill& a) {
-    return (a.requests || a.q_pos0 + a.seq_q == a.seq_kv) && a.output && a.k_scale &&
+    return (a.requests || (a.seq_kv > a.q_pos0 && a.q_pos0 + a.seq_q >= a.seq_kv)) && a.output &&
+           a.k_scale &&
            a.v_scale && a.n_kv_head &&
            a.n_head % (2 * a.n_kv_head) == 0 &&
            (a.kv_mask == 0xffffffffu || ((a.kv_mask + 1) & a.kv_mask) == 0) &&
