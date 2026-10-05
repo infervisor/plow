@@ -67,6 +67,19 @@ tok/s 405.2 / 444.2 at 4K c32 / c128 and 108.3 / 108.9 at 15K, against the recor
 94.6 / 95.7 (`genrungs/m/serve3/cand2`, packet `bd968263`). The prompt count differs (3x conc vs
 2x / 1x), so these are not like-for-like. Evidence: `/opt/dlami/nvme/lava-tts/repro-main/`.
 
+### Reproduce
+
+`scripts/campaign/repro_gemma12b_h100.sh` rebuilds the whole strict comparison from a checkout:
+both packets (`build`), the FP32 reference (`ref`, skipped when `REF` exists), both gates
+(`gate fp8|bf16`), every arm (`bench <fp8|bf16|vllm|vllm-bf16> <st4k|st15k|agentic|prod>`) and the
+reports plus one combined markdown (`report`). It pins both vLLM flag sets; one GPU step per queue
+lease (`scripts/bench/gpuq.py submit`). Inputs are env (`OUT`, `GEMMA12B_CHECKPOINT`, `HF`, `PYREF`,
+`VLLM_PY`, `REF`/`REF_VLLM`, `CORPUS`, `OBJECT_ENV`, `RT_ENV`, `VLLM_ENV`; see the header). The
+qualified gate used `ref.json` sha256 `b2988c51`, prompts `10302403`, vLLM peer capture `74a7a572`
+(`/opt/dlami/nvme/lava-tts/fp32gate/`); passing those files as `REF`/`REF_VLLM` reproduces it. Its
+`report` step re-renders the 2026-10-05 tables byte-for-byte from the campaign's result dirs.
+Expect the usual run-to-run spread on re-measured arms (cells marked `*` most).
+
 ### Experimental history (not qualified)
 
 Manifests, JSON, HTML, logs and kernel audits from before 2026-10-01 are archived at
