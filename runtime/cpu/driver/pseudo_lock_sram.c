@@ -18,7 +18,11 @@
  *  - L3 is non-inclusive (lines enter L3 as L2 victims); lines still in L2 when the lock CLOS
  *    was dropped were later evicted into the normal ways. CLDEMOTE pushes them while locked.
  * Masks come from CPUID leaf 0x10; locked L3 ways never overlap the ways shared with I/O.
- * Core C6 flushes L2, so a CPU-latency QoS request keeps cores out of deep idle while loaded.
+ * Core C6 flushes L2, so a CPU-latency QoS request keeps cores out of deep idle while locks exist.
+ *
+ * The partition is LAZY: loading the module changes nothing. The CAT masks and the QoS request
+ * are applied when the first region or worker cpu appears and fully restored when the last one
+ * goes, so a loaded but idle driver leaves every other process the whole cache.
  */
 
 #include <linux/init.h>
@@ -131,6 +135,7 @@ struct pl_file {
 };
 
 static DEFINE_MUTEX(g_lock);
+static unsigned int g_users;            /* live regions + worker cpus, all files; g_lock */
 static LIST_HEAD(g_regions);
 static u32 g_next_id = 1;
 static u32 l2_full, l3_full, l2_lock, l3_lock, l2_norm, l3_norm;
@@ -215,6 +220,23 @@ static int cat_probe(void)
     pr_info("pseudo_lock: v%d L3 cbm %#x lock %#x (%zu KiB/node), L2 cbm %#x lock %#x (%zu KiB/core), %d node(s)\n",
             PL_VERSION, l3_full, l3_lock, l3_cap >> 10, l2_full, l2_lock, l2_cap >> 10, num_online_nodes());
     return 0;
+}
+
+/* g_lock held. The first user partitions the cache, the last one gives it back. */
+static void users_get(void)
+{
+    if (g_users++ == 0) {
+        cpu_latency_qos_add_request(&qos_req, 0);
+        on_each_cpu(set_masks, NULL, 1);
+    }
+}
+
+static void users_put(void)
+{
+    if (--g_users == 0) {
+        on_each_cpu(restore_masks, NULL, 1);
+        cpu_latency_qos_remove_request(&qos_req);
+    }
 }
 
 /* ------------------------------------------------------------------ lock / measure */
@@ -392,6 +414,7 @@ static void unlock_region(struct region *r)
     list_del(&r->node);
     list_del(&r->all);
     free_region(r);
+    users_put();
 }
 
 static long do_lock(struct pl_file *pf, struct pl_lock_req __user *ureq)
@@ -451,6 +474,7 @@ static long do_lock(struct pl_file *pf, struct pl_lock_req __user *ureq)
         return -ENOSPC;
     }
     *budget(r) += r->len;
+    users_get();
     r->id = g_next_id++;
     list_add(&r->node, &pf->regions);
     list_add(&r->all, &g_regions);
@@ -492,8 +516,10 @@ static int pl_release(struct inode *inode, struct file *filp)
     int cpu;
 
     mutex_lock(&g_lock);
-    for_each_cpu(cpu, &pf->workers)
+    for_each_cpu(cpu, &pf->workers) {
         smp_call_function_single(cpu, set_clos_fn, (void *)(uintptr_t)CLOS_DEFAULT, 1);
+        users_put();
+    }
     list_for_each_entry_safe(r, t, &pf->regions, node)
         unlock_region(r);
     mutex_unlock(&g_lock);
@@ -526,11 +552,15 @@ static long pl_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
         if (q.cpu < 0 || q.cpu >= nr_cpu_ids || !cpu_online(q.cpu))
             return -EINVAL;
         mutex_lock(&g_lock);
-        smp_call_function_single(q.cpu, set_clos_fn, (void *)(uintptr_t)(q.on ? CLOS_WORKER : CLOS_DEFAULT), 1);
-        if (q.on)
+        if (q.on && !cpumask_test_cpu(q.cpu, &pf->workers)) {
+            users_get();
             cpumask_set_cpu(q.cpu, &pf->workers);
-        else
+        }
+        smp_call_function_single(q.cpu, set_clos_fn, (void *)(uintptr_t)(q.on ? CLOS_WORKER : CLOS_DEFAULT), 1);
+        if (!q.on && cpumask_test_cpu(q.cpu, &pf->workers)) {
             cpumask_clear_cpu(q.cpu, &pf->workers);
+            users_put();
+        }
         mutex_unlock(&g_lock);
         return 0;
     }
@@ -650,8 +680,7 @@ static int __init pl_init(void)
             return -ENOMEM;
         }
     }
-    cpu_latency_qos_add_request(&qos_req, 0);
-    on_each_cpu(set_masks, NULL, 1);
+    on_each_cpu(restore_masks, NULL, 1);
     ret = misc_register(&pl_misc);
     if (ret)
         teardown();
