@@ -434,6 +434,9 @@ fn ascending_rows(rows: &[u32], multiple: u32) -> bool {
 fn valid_gemm(role: u8, g: &GemmCapability) -> bool {
     matches!(role, BF16_PREFILL_GEMM_GLU_GEMMA4 | W8A8_PREFILL_GEMM_GLU_GEMMA4)
         && ascending_rows(&g.rows, g.bm)
+        // The GLU objects run exactly their min and max rows (the runtime checks both against the
+        // object's globals); an interior row count would trap in the kernel.
+        && g.rows.len() <= 2
         && [g.n, g.k, g.bn, g.bk, g.stages, g.arena_bytes].iter().all(|&v| v > 0)
         && g.n % g.bn == 0
         && g.k % g.bk == 0
@@ -463,11 +466,15 @@ fn valid_decode_plan(plan: &[[u32; 5]]) -> bool {
     let mut shapes = BTreeSet::new();
     !plan.is_empty()
         && plan.iter().all(|&[m, n, k, bk, splits]| {
+            // gemv_sm90_transposed traps unless splits is a power of two and K % 8 == 0.
             (1..=32).contains(&m)
                 && n > 0
                 && k > 0
+                && k % 8 == 0
+                && n <= i32::MAX as u32
+                && k <= i32::MAX as u32
                 && matches!(bk, 128 | 256)
-                && (1..=8).contains(&splits)
+                && matches!(splits, 1 | 2 | 4 | 8)
                 && shapes.insert((m, n, k))
         })
 }
@@ -1056,6 +1063,7 @@ mod tests {
                 GemmCapability { rows: vec![], ..other.clone() },
                 GemmCapability { rows: vec![4096, 2048], ..other.clone() },
                 GemmCapability { rows: vec![100], ..other.clone() },
+                GemmCapability { rows: vec![2048, 3072, 4096], ..other.clone() },
                 GemmCapability { k: 2817, ..other.clone() },
                 GemmCapability { n: 0, ..other.clone() },
                 GemmCapability { block: 100, ..other.clone() },
@@ -1142,11 +1150,14 @@ mod tests {
                 .decode_plan_or_legacy(),
             NATIVE_DECODE_BF16_SHAPES
         );
+        assert!(valid_decode_plan(&NATIVE_DECODE_BF16_SHAPES));
         for bad in [
             raw.replace("[8,2048,2048,128,1]", "[1,512,3840,128,8]"),
             raw.replace("[8,2048,2048,128,1]", "[64,2048,2048,128,1]"),
             raw.replace("[8,2048,2048,128,1]", "[8,2048,2048,64,1]"),
             raw.replace("[8,2048,2048,128,1]", "[8,2048,2048,128,16]"),
+            raw.replace("[8,2048,2048,128,1]", "[8,2048,3840,128,3]"),
+            raw.replace("[8,2048,2048,128,1]", "[8,2048,2044,128,1]"),
             raw.replace(r#"[[1,512,3840,256,8],[8,2048,2048,128,1]]"#, "[]"),
         ] {
             assert!(SegmentRoles::from_bytes(bad.as_bytes()).is_err(), "{bad}");
