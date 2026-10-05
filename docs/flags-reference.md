@@ -993,8 +993,10 @@ checkpoint location, because the weights a bundle needs are the same weights
 decision a deployment makes. Every mechanism below is derived from it, the packet's capabilities,
 the backend and the layout (`crates/plowrt/src/serve/policy.rs`); a mechanism a packet or backend
 cannot run is off by capability, not by a knob. `auto` applies the latency rules while the live
-decode width is at most 4 with an empty queue and the throughput rules from 8 rows or any queue:
-it enters throughput at once and returns to latency after 2 s of a narrow window. Startup decisions (decode rung ladder, KV admission) take the throughput
+decode width is at most 4 with an empty queue and the throughput rules from 8 rows, any queue, or
+live sequences reserving 90% of the KV-capacity budget: it enters throughput at once and returns to
+latency after 2 s of a narrow window under 75% of the budget. `/metrics` exports the class in force
+(`plowrt_serve_mode`, 1 = throughput) and `plowrt_serve_mode_switches_total`. Startup decisions (decode rung ladder, KV admission) take the throughput
 side under `auto`.
 
 | mechanism | latency | throughput | capability gate |
@@ -1006,6 +1008,7 @@ side under `auto`.
 | prefill packing | queue-sized (oldest prompt whole) | fill the launch | CUDA packed-prefill metadata; AMD packed siblings |
 | decode riding a prefill launch | `sched::ride` cost model | same | token batch |
 | rung fast probe | off | on | a rung ladder |
+| admission order of waiting requests | class, then arrival | the waiter attaching the most cached prefix rows first when it beats the head by a KV block; the head keeps its seat after 30 s (`plowrt_cache_first_admissions_total`) | VMM prefix cache |
 | queue TTL | `--slo-ms` x 40, at least 30 s | never shed | |
 | co-tenant turns (several models) | CUDA `deadline`, AMD `rr` | `rr` | one model: `free` |
 

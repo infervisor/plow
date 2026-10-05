@@ -115,6 +115,19 @@ pub(crate) fn live_rings_for_capacity(
     )
 }
 
+/// [`GpuEngine::admission_rows`]: `total` plus a decode `quantum`, and with unmasked packed
+/// padding the `pad` rows (the widest bucket) a launch may charge past a prefilling prompt.
+fn admission_rows(
+    total: usize,
+    prompt: usize,
+    quantum: usize,
+    pad: Option<usize>,
+    max_ctx: usize,
+) -> usize {
+    let rows = total.saturating_add(quantum);
+    pad.map_or(rows, |pad| rows.max(prompt.saturating_add(pad))).min(max_ctx)
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct InterpreterProfile {
     tag: &'static str,
@@ -7143,8 +7156,7 @@ impl GpuEngine {
                 if let Some(t) = host_t {
                     marks[2] = t.elapsed().as_nanos() as u64;
                 }
-                let margin = (v.kv.block_rows() as usize).max(self.pf_max_rows());
-                let rows = total.saturating_add(margin).min(self.max_ctx);
+                let rows = self.admission_rows(total, prompt.len());
                 v.kv.ensure_rows(b, rows as u32)?;
             }
             Ok(frontier)
@@ -8607,6 +8619,31 @@ impl GpuEngine {
             .as_ref()
             .and_then(|p| p.max_request_rows)
             .map_or_else(|| self.pf_max_rows(), |rows| rows as usize)
+    }
+
+    /// Packed padding rows mask to slot -1 (the objects skip them) instead of continuing a
+    /// request's rows.
+    fn packed_padding_limit(&self) -> Option<u32> {
+        self.packed_prefill.as_ref().and_then(|p| p.max_request_rows).or(self
+            .seg_pf
+            .as_ref()
+            .is_some_and(|sp| sp.masked_padding)
+            .then(|| self.pf_max_rows() as u32))
+    }
+
+    /// Rows admission maps for a sequence of `total` = prompt + max_tokens rows: every row its
+    /// launches can write, so the launch-time backstops never need a page admission did not
+    /// take. Past `total` that is one decode quantum (a multistep launch or the lookahead step
+    /// runs past the last kept token) and, only where padding is unmasked, the bucket pad a
+    /// packed launch charges to one prefilling request.
+    fn admission_rows(&self, total: usize, prompt: usize) -> usize {
+        admission_rows(
+            total,
+            prompt,
+            crate::serve::policy::decode_k_capacity() as usize + 1,
+            self.packed_padding_limit().is_none().then(|| self.pf_max_rows()),
+            self.max_ctx,
+        )
     }
 
     /// Pack budget for `avail` waiting prefill rows (PX-1 batched path), in
@@ -11211,14 +11248,7 @@ impl GpuEngine {
                     self.max_ctx,
                     // Padding rows mask to slot -1 only on objects that skip them; otherwise
                     // they continue the last request's rows (its own later writes cover them).
-                    self.packed_prefill
-                        .as_ref()
-                        .and_then(|p| p.max_request_rows)
-                        .or(self
-                            .seg_pf
-                            .as_ref()
-                            .is_some_and(|sp| sp.masked_padding)
-                            .then(|| self.pf_max_rows() as u32)),
+                    self.packed_padding_limit(),
                 )
                 .map_err(RuntimeError::Rejected)?,
             )

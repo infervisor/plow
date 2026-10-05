@@ -1689,6 +1689,20 @@ impl VmmKv {
     /// token is recomputed by prefill. On a hit the shared
     /// blocks are multi-mapped (refcounted) and the snapshot handle returned.
     /// On miss the prompt's hashes are still recorded for `publish`.
+    /// Rows [`Self::try_attach`] would restore for `prompt` right now (0 = a miss), with no
+    /// side effect on the cache: no references, recency, statistics or slot state.
+    pub fn cached_rows(&self, prompt: &[u32]) -> u32 {
+        if !self.prefix_reuse {
+            return 0;
+        }
+        cached_rows(&self.shared, prompt)
+    }
+
+    /// A [`PrefixProbe`] for the serve layer's admission order (`None` without prefix reuse).
+    pub fn prefix_probe(&self) -> Option<PrefixProbe> {
+        self.prefix_reuse.then(|| PrefixProbe(Arc::clone(&self.shared)))
+    }
+
     pub fn try_attach(&self, seq: usize, prompt: &[u32]) -> Result<Option<Attach>> {
         if !self.prefix_reuse {
             return Ok(None);
@@ -2375,6 +2389,46 @@ impl VmmKv {
     pub fn stats_handle(&self) -> VmmStatsHandle {
         VmmStatsHandle(Arc::clone(&self.shared))
     }
+}
+
+/// See [`VmmKv::prefix_probe`]: the cache's attachable rows for a prompt, read-only.
+#[derive(Clone)]
+pub struct PrefixProbe(Arc<Shared>);
+
+impl PrefixProbe {
+    pub fn cached_rows(&self, prompt: &[u32]) -> u32 {
+        cached_rows(&self.0, prompt)
+    }
+
+    pub fn block_rows(&self) -> u32 {
+        self.0.block_rows
+    }
+}
+
+/// [`VmmKv::try_attach`]'s choice (the longest snapshot boundary on the matched block path),
+/// without its side effects.
+fn cached_rows(s: &Shared, prompt: &[u32]) -> u32 {
+    let inner = s.inner.lock();
+    if inner.fine_rows > 0 && (prompt.len() as u64) < u64::from(inner.fine_ceiling) {
+        return 0;
+    }
+    let hashes = hash_blocks(prompt, s.block_rows);
+    let aligned = &prompt[..hashes.len() * s.block_rows as usize];
+    let placed = inner.cache.peek(&hashes, aligned);
+    let mut best = 0;
+    for blocks in 0..=placed.len() {
+        let node = blocks.checked_sub(1).map(|i| placed[i]);
+        let start = blocks * s.block_rows as usize;
+        for snap in inner.published.get(&node).into_iter().flatten() {
+            if (snap.rows as usize) < prompt.len()
+                && snap.rows > best
+                && prompt.get(start..snap.rows as usize) == Some(snap.tail.as_slice())
+            {
+                best = snap.rows;
+            }
+        }
+    }
+    best
 }
 
 /// See [`VmmKv::stats_handle`].
