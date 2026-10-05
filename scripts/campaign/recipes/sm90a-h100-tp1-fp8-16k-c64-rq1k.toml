@@ -12,7 +12,9 @@
 # Compare against the 16K/32 request-chunk2048 recipe with matched traffic.
 # 2026-10-05 GLU role off + 64-row decode cuBLASLt (+ plowrt 1088/4160 Lt routes, ride trim), served
 # REPS=2 total tok/s vs the final3 arm: 4K/128 c32/c128 +4.8/+6.5%, 15K/128 +4.0/+4.0%, agentic16k
-# c32/c64/c128 +3.5/+3.3/+10.8%.
+# c32/c64/c128 +3.5/+3.3/+10.8%. With plowrt 1a4e4f76 (GLU-quant and NormResidual+RmsNorm light
+# routes), strict vs vLLM 0.28 BF16 KV (MATCHED, EQUIVALENT, FP32 gate kl_mean 0.112 vs 0.128):
+# 4K/128 c32/c128 0.91x/0.88x, 15K/128 0.94x/0.95x, agentic16k c32/c64/c128 0.71x/2.13x/1.60x.
 schema = "plow.recipe.v1"
 namespace = "infervisor"
 name = "gemma-4-12b"
