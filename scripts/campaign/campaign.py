@@ -91,7 +91,7 @@ def execution_artifacts(runtime: Path, assets: Path, recipe: Path, env: dict) ->
             "assets": {p.name: sha(p) for p in sorted(assets.iterdir()) if p.is_file()
                        and p.suffix in (".pkt", ".cubin", ".elf", ".co", ".json", ".h")},
             "objects": {p.name: sha(p) for p in sorted(objects.iterdir()) if p.is_file()
-                        and p.suffix in (".cubin", ".elf", ".co")} if objects.is_dir() else {}}
+                        and p.suffix in (".cubin", ".elf", ".co", ".so")} if objects.is_dir() else {}}
 
 
 def cmd_block_roofline(a: argparse.Namespace) -> None:
@@ -651,7 +651,7 @@ def cmd_build(a: argparse.Namespace) -> None:
         "prep": [s.get("name") for s in r.get("prep", [])],
         "utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "hashes": {p.name: sha(p) for p in sorted(assets.glob("*")) if p.is_file() and p.suffix in (".pkt", ".cubin", ".elf", ".co", ".json", ".h")},
-        "objects": {p.name: sha(p) for p in sorted((out / "objects").glob("*")) if p.is_file() and p.suffix in (".cubin", ".elf", ".co")} if (out / "objects").exists() else {},
+        "objects": {p.name: sha(p) for p in sorted((out / "objects").glob("*")) if p.is_file() and p.suffix in (".cubin", ".elf", ".co", ".so")} if (out / "objects").exists() else {},
     }
     (out / "build-record.json").write_text(json.dumps(rec, indent=1))
     print(f"built {assets}\nrecord {out / 'build-record.json'}", file=sys.stderr)

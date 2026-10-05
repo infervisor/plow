@@ -128,6 +128,8 @@ pub(crate) struct Lt {
     stored: std::collections::HashMap<(u32, u32, u32), Algo>,
     /// `PLOW_LT_ALGOS_WRITE`: append every load-time selection here.
     write: Option<std::path::PathBuf>,
+    /// `PLOW_CUTLASS_FP8_DECODE`: small-M FP8 decode projections.
+    cutlass_fp8: Option<Arc<super::cutlass_fp8::CutlassFp8>>,
 }
 
 impl Lt {
@@ -164,6 +166,16 @@ impl Lt {
             );
         }
         let write = nv.lt_algos_write.as_deref().map(std::path::PathBuf::from);
+        let cutlass_fp8 = nv
+            .cutlass_fp8_decode
+            .as_deref()
+            .map(|pins| {
+                let dir = nv.pf_seg_dir.as_deref().ok_or_else(|| {
+                    RuntimeError::Rejected("PLOW_CUTLASS_FP8_DECODE requires PLOW_PF_SEG_DIR".into())
+                })?;
+                super::cutlass_fp8::CutlassFp8::load(be, std::path::Path::new(dir), pins)
+            })
+            .transpose()?;
         Ok(Arc::new(Self {
             be: be.clone(),
             api,
@@ -171,7 +183,12 @@ impl Lt {
             workspace,
             stored,
             write,
+            cutlass_fp8,
         }))
+    }
+
+    pub(crate) fn cutlass_fp8(&self) -> Option<&Arc<super::cutlass_fp8::CutlassFp8>> {
+        self.cutlass_fp8.as_ref()
     }
 
     fn record(&self, m: u32, n: u32, k: u32, algo: &Algo, workspace: usize, matmul_us: f32) {
