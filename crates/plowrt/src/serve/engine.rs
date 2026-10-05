@@ -136,6 +136,9 @@ pub trait SeqEngine {
         crate::sched::step::Backend::default()
     }
     fn cached_rows(&self, _slot: usize) -> usize { 0 }
+    /// The softcapped logits behind `slot`'s most recent token (host logprobs); `false` = the
+    /// engine keeps them on device.
+    fn logits_row(&self, _slot: usize, _out: &mut Vec<f32>) -> bool { false }
     fn prefill_chunked_at_most(
         &mut self,
         slot: usize,

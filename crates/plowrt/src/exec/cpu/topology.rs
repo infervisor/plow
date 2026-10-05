@@ -67,6 +67,12 @@ impl std::str::FromStr for NumaMode {
 }
 
 /// Parse a sysfs cpulist (`0-3,8,10-11`) into sorted, deduplicated ids.
+/// The lowest online cpu of `node` (the owner a node-scoped L3 pseudo-lock is loaded from).
+pub fn first_cpu_of_node(node: u32) -> Option<u32> {
+    let s = std::fs::read_to_string(format!("/sys/devices/system/node/node{node}/cpulist")).ok()?;
+    parse_cpulist(s.trim()).into_iter().min()
+}
+
 pub fn parse_cpulist(s: &str) -> Vec<u32> {
     let mut out = Vec::new();
     for part in s.split(',') {

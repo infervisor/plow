@@ -4183,6 +4183,7 @@ fn run_one_tick(
                             }
                             tracing::debug!(token, slot = i, "amd: prefill token");
                             let t_tok = std::time::Instant::now();
+                            seq_host_logprobs(&*e, i, &mut slots[i], token);
                             handle_produced_token(
                                 &mut slots[i],
                                 &arena,
@@ -4316,6 +4317,7 @@ fn run_one_tick(
                     for (i, token) in out {
                         tracing::debug!(token, slot = i, "amd: token");
                         let t_stream = crate::obs::dstep::on().then(Instant::now);
+                        seq_host_logprobs(&*e, i, &mut slots[i], token);
                         handle_produced_token(
                             &mut slots[i],
                             &arena,
@@ -5824,6 +5826,19 @@ fn gpu_finish_token(
         return Ok(tok);
     }
     Ok(argmax_tok)
+}
+
+/// OpenAI logprobs for a single-sequence engine that exposes its logits to the host (CPU): only
+/// rows that asked for them pay the vocab read. The served token stays the engine's argmax.
+#[cfg(any(feature = "hsa", feature = "cpu"))]
+fn seq_host_logprobs(e: &dyn super::engine::SeqEngine, i: usize, slot: &mut Option<Slot>, token: u32) {
+    let Some(s) = slot.as_mut() else { return };
+    let Some(req) = s.gen.params.logprobs else { return };
+    let mut logits = Vec::new();
+    if e.logits_row(i, &mut logits) && (token as usize) < logits.len() {
+        let stats = crate::text::logprobs::RowStats::of(&logits, req);
+        s.lp = Some(Box::new(stats.finish(logits[token as usize])));
+    }
 }
 
 /// The top-k a greedy, unadjusted logprobs row asks the device stats kernel for; `None` when the

@@ -116,7 +116,6 @@ pub struct HostTensor {
     ptr: *mut u8,
     layout: Layout,
     pub bytes: usize,
-    pub is_sram: bool,
 }
 
 // SAFETY: plain heap memory; concurrent access is disjoint by the schedule,
@@ -125,26 +124,6 @@ unsafe impl Send for HostTensor {}
 unsafe impl Sync for HostTensor {}
 
 impl HostTensor {
-    fn alloc(bytes: usize, zeroed: bool) -> Result<HostTensor> {
-        Self::alloc_on_nodes(bytes, zeroed, &[], false)
-    }
-
-    /// Construct a HostTensor backed by hardware pseudo-locked on-chip SRAM.
-    pub fn from_sram(ptr: *mut u8, bytes: usize, zeroed: bool) -> HostTensor {
-        let align = 64;
-        let size = bytes.max(1).checked_next_multiple_of(align).unwrap_or(bytes.max(1));
-        let layout = Layout::from_size_align(size, align).unwrap_or(Layout::new::<u8>());
-        if zeroed {
-            unsafe { std::ptr::write_bytes(ptr, 0, bytes) };
-        }
-        HostTensor {
-            ptr,
-            layout,
-            bytes,
-            is_sram: true,
-        }
-    }
-
     fn alloc_on_nodes(
         bytes: usize,
         zeroed: bool,
@@ -233,12 +212,7 @@ impl HostTensor {
             // SAFETY: ptr/size describe our own mapping.
             unsafe { libc::madvise(ptr as *mut c_void, size, advice) };
         }
-        let tensor = HostTensor {
-            ptr,
-            layout,
-            bytes,
-            is_sram: false,
-        };
+        let tensor = HostTensor { ptr, layout, bytes };
         #[cfg(target_os = "linux")]
         if huge && !nodes.is_empty() {
             let maxnode = nodes.iter().copied().max().unwrap() as usize + 1;
@@ -302,9 +276,6 @@ impl HostTensor {
 
 impl Drop for HostTensor {
     fn drop(&mut self) {
-        if self.is_sram {
-            return;
-        }
         #[cfg(target_os = "linux")]
         if self.layout.align() == HUGE {
             unsafe { libc::munmap(self.ptr.cast(), self.layout.size()) };
@@ -786,6 +757,25 @@ impl CpuModel {
         let mut names = Vec::with_capacity(blob.tensors.len());
         let mut wk = Wellknown::default();
         let mut weight_bytes = 0u64;
+        // PLOW_CPU_SRAM: decode re-reads every layer weight once per step, so each byte held in
+        // pseudo-locked L3 is a DRAM byte saved per step. Whole tensors are bound to the node
+        // whose locked ways hold them (SNC caches a line only in its home node's slices),
+        // round-robin while a node has budget; workers run in the driver's worker CLOS so their
+        // reads keep the lines in the locked ways (see `memory::sram`).
+        let sram = crate::config::RuntimeConfig::get()
+            .cpu
+            .sram
+            .then(crate::memory::sram::PseudoLock::global)
+            .flatten();
+        let lock_nodes: Vec<u32> = if nodes.is_empty() {
+            crate::exec::cpu::topology::Topology::detect().nodes
+        } else {
+            nodes.to_vec()
+        };
+        let mut l3_left: Vec<usize> =
+            vec![sram.map_or(0, |d| d.caps.l3_lock_bytes_per_node as usize); lock_nodes.len()];
+        let mut l3_rr = 0usize;
+        let mut l3_locks: Vec<(usize, u32, usize)> = Vec::new();
         for (h, td) in blob.tensors.iter().enumerate() {
             let bytes = td.bytes as usize;
             match td.name.as_str() {
@@ -832,7 +822,24 @@ impl CpuModel {
                         src.len()
                     )));
                 }
-                let t = HostTensor::alloc_on_nodes(bytes, false, nodes, strict)?;
+                let lock_len = bytes.next_multiple_of(4096);
+                let hot = td.name.contains(".layers.") && !td.name.contains("embed") && bytes >= HUGE / 8;
+                let lock_node = (hot && !l3_left.is_empty())
+                    .then(|| {
+                        (0..l3_left.len())
+                            .map(|k| (l3_rr + k) % l3_left.len())
+                            .find(|&k| l3_left[k] >= lock_len)
+                    })
+                    .flatten();
+                let t = match lock_node {
+                    Some(k) => {
+                        l3_left[k] -= lock_len;
+                        l3_rr = k + 1;
+                        l3_locks.push((h, lock_nodes[k], lock_len));
+                        HostTensor::alloc_on_nodes(bytes, false, &lock_nodes[k..k + 1], false)?
+                    }
+                    None => HostTensor::alloc_on_nodes(bytes, false, nodes, strict)?,
+                };
                 // SAFETY: fresh allocation of `bytes`, no other reference yet.
                 unsafe { std::slice::from_raw_parts_mut(t.as_ptr(), t.bytes).copy_from_slice(src) };
                 weight_bytes += td.bytes;
@@ -859,13 +866,7 @@ impl CpuModel {
                 t
             } else {
                 // Runtime tensor (activations, KV, inputs): zeroed.
-                let sram = crate::memory::sram::SramManager::global();
-                if let Some(sram_ptr) = sram.alloc_hot_tensor(bytes) {
-                    tracing::debug!(tensor = %td.name, bytes, "Allocated runtime tensor in L3 Pseudo-Lock SRAM");
-                    HostTensor::from_sram(sram_ptr, bytes, true)
-                } else {
-                    HostTensor::alloc_on_nodes(bytes, true, nodes, strict)?
-                }
+                HostTensor::alloc_on_nodes(bytes, true, nodes, strict)?
             };
             tensors.push(t);
             names.push(td.name.clone());
@@ -921,6 +922,28 @@ impl CpuModel {
                 fill(&tensors[est], &tensors[gs], &tensors[ds])?;
             }
             tracing::debug!(layer, experts = e, "moe: fused expert pointer table filled");
+        }
+        if let Some(dev) = sram.filter(|_| !l3_locks.is_empty()) {
+            let (mut locked, mut held) = (0usize, 0.0f64);
+            for &(h, node, len) in &l3_locks {
+                let Some(cpu) = crate::exec::cpu::topology::first_cpu_of_node(node) else {
+                    continue;
+                };
+                // SAFETY: weight tensors live as long as the model; the pin ends at process exit.
+                match unsafe { dev.lock(tensors[h].as_ptr(), len, cpu, 3) } {
+                    Ok(m) => {
+                        locked += len;
+                        held += m.held(3) * len as f64;
+                    }
+                    Err(e) => tracing::warn!(tensor = %names[h], node, error = %e, "cpu: L3 pseudo-lock failed"),
+                }
+            }
+            tracing::info!(
+                tensors = l3_locks.len(),
+                locked_mib = locked >> 20,
+                held = format_args!("{:.3}", held / locked.max(1) as f64),
+                "cpu: decode weights pseudo-locked in L3"
+            );
         }
         let table = Arc::new(TensorTable::new(
             tensors.iter().map(|t| t.as_ptr() as *mut c_void).collect(),
@@ -1183,7 +1206,8 @@ unsafe impl Send for KernelExec {}
 unsafe impl Sync for KernelExec {}
 
 impl KernelExec {
-    fn new(model: &CpuModel, workers: usize, worker_node: impl Fn(usize) -> u32) -> Result<Self> {
+    /// `worker_cpu(w)` = the `(cpu, node)` worker `w` is pinned to.
+    fn new(model: &CpuModel, workers: usize, worker_cpu: impl Fn(usize) -> (u32, u32)) -> Result<Self> {
         let mut table: Vec<Option<KernelFn>> = vec![None; ffi::DOP_TABLE];
         for p in &model.blob.progs {
             for d in &p.insts {
@@ -1194,16 +1218,32 @@ impl KernelExec {
             }
         }
         let scratch_bytes = ffi::scratch_bytes().max(64) as usize;
-        let sram = crate::memory::sram::SramManager::global();
+        // PLOW_CPU_SRAM: hold the head of each worker's scratch (the AMX strip / A pad / C
+        // partial panels, < 1 MiB) in its core's pseudo-locked L2, so streamed weights cannot
+        // evict them. Scratch is node-local either way.
+        let sram = crate::config::RuntimeConfig::get()
+            .cpu
+            .sram
+            .then(crate::memory::sram::PseudoLock::global)
+            .flatten();
+        let (mut locked, mut held) = (0usize, 0.0f64);
         let mut slots = Vec::with_capacity(workers);
         for w in 0..workers {
-            let scratch = if let Some(sram_ptr) = sram.alloc_scratch(scratch_bytes) {
-                tracing::debug!(worker = w, bytes = scratch_bytes, "Allocated worker scratch from Pseudo-Lock SRAM");
-                HostTensor::from_sram(sram_ptr, scratch_bytes, false)
-            } else {
-                HostTensor::alloc(scratch_bytes, false)?
-            };
-            let mut ctx = PlowCpuCtx::new(w as u32, worker_node(w));
+            let (cpu, node) = worker_cpu(w);
+            let scratch = HostTensor::alloc_on_nodes(scratch_bytes, false, &[node], false)?;
+            if let Some(dev) = sram {
+                let len = (dev.caps.l2_lock_bytes_per_core as usize).min(scratch_bytes) & !4095;
+                // SAFETY: the scratch mapping lives in `WorkerSlot` until the engine drops,
+                // and the driver releases the pin when the process closes the device.
+                match unsafe { dev.lock(scratch.as_ptr(), len, cpu, 2) } {
+                    Ok(m) => {
+                        locked += len;
+                        held += m.held(2);
+                    }
+                    Err(e) => tracing::warn!(worker = w, cpu, error = %e, "cpu: L2 pseudo-lock failed"),
+                }
+            }
+            let mut ctx = PlowCpuCtx::new(w as u32, node);
             ctx.scratch = scratch.as_ptr() as *mut c_void;
             ctx.scratch_bytes = scratch_bytes as u32;
             slots.push(WorkerSlot {
@@ -1211,6 +1251,14 @@ impl KernelExec {
                 _scratch: scratch,
                 inited: AtomicBool::new(false),
             });
+        }
+        if sram.is_some() {
+            tracing::info!(
+                workers,
+                locked_kib = locked >> 10,
+                held_mean = held / workers.max(1) as f64,
+                "cpu: worker scratch pseudo-locked in L2"
+            );
         }
         Ok(KernelExec {
             table,
@@ -1928,8 +1976,7 @@ impl CpuEngine {
         // core, and that tax exceeded the gain — the same fp8 cell measured 626 / 132 with a logical
         // pool whose prefill was narrowed to 8. Fixing that needs the idle worker to stop polling,
         // which is the real prerequisite for per-phase widths.
-        let sram_active = crate::memory::sram::SramManager::global().has_l2()
-            || crate::memory::sram::SramManager::global().has_l3();
+        let sram_active = crate::config::RuntimeConfig::get().cpu.sram;
         // Prevent SMT core thrashing: Both SMT siblings issue into the same TMUL and 512-bit
         // FMA ports and share the core's private L2 cache. When AMX, AVX-512, or pseudo-locking
         // SRAM is used, running on SMT siblings causes port contention, thermal throttling, and
@@ -1959,8 +2006,20 @@ impl CpuEngine {
             topo.worker_cpus(&nodes)
         };
         let exec = Arc::new(KernelExec::new(&model, threads, |w| {
-            placement[w % placement.len()].1
+            placement[w % placement.len()]
         })?);
+        if let Some(dev) = crate::config::RuntimeConfig::get()
+            .cpu
+            .sram
+            .then(crate::memory::sram::PseudoLock::global)
+            .flatten()
+        {
+            for &(cpu, _) in placement.iter().take(threads) {
+                if let Err(e) = dev.set_worker(cpu, true) {
+                    tracing::warn!(cpu, error = %e, "cpu: worker CLOS failed");
+                }
+            }
+        }
         // The packet's locality hint, mapped onto this host's nodes. Absent for an unplaced blob,
         // one node, or domains that do not divide over the nodes: placement stays cu % nodes.
         let cu_dom = crate::config::RuntimeConfig::get()
@@ -2321,6 +2380,28 @@ impl CpuEngine {
         let t_ids = self.need(self.model.wk.ids, "in.ids")?;
         self.model.write_u32(t_ids, id);
         Ok(())
+    }
+
+    /// Row `row` of the bf16 `act.logits` tile ([slots][vocab], softcapped in place) as f32.
+    /// Prefill leaves its last row in row 0; a decode step leaves slot `s` in row `s`.
+    pub fn logits_row(&self, row: usize, out: &mut Vec<f32>) -> bool {
+        let Some(h) = self.model.wk.logits else {
+            return false;
+        };
+        let batch = self.model.batch.max(1);
+        // SAFETY: quiescent point between programs.
+        let s = unsafe { self.model.tensor(h).as_slice() };
+        if row >= batch || s.len() % (batch * 2) != 0 {
+            return false;
+        }
+        let vocab = s.len() / (batch * 2);
+        out.clear();
+        out.extend(
+            s[row * vocab * 2..(row + 1) * vocab * 2]
+                .chunks_exact(2)
+                .map(|c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16)),
+        );
+        true
     }
 
     /// The first `n` entries of `in.ids` (the device-sampled tokens per slot).

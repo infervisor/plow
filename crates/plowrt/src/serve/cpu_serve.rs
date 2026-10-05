@@ -33,6 +33,10 @@ pub trait SlotEngine: Send {
     fn max_ctx(&self) -> usize;
     /// One line for the ready log (unit, threads, tier).
     fn describe(&self) -> String;
+    /// Row `row` of the last program's softcapped logits as f32; `false` = not available.
+    fn logits_row(&self, _row: usize, _out: &mut Vec<f32>) -> bool {
+        false
+    }
 }
 
 impl SlotEngine for CpuEngine {
@@ -66,6 +70,9 @@ impl SlotEngine for CpuEngine {
     fn describe(&self) -> String {
         format!("cpu threads={} isa={:?}", self.threads, self.isa)
     }
+    fn logits_row(&self, row: usize, out: &mut Vec<f32>) -> bool {
+        CpuEngine::logits_row(self, row, out)
+    }
 }
 
 pub struct CpuServe {
@@ -93,6 +100,8 @@ pub struct CpuServe {
     /// rung-8 decode step (~400 ms) runs between chunks, while live slots still stall for a
     /// whole chunk. Only faster prefill or packing slots into one program helps here.
     pf_chunk: u32,
+    /// The logits row holding each slot's latest token (prefill: 0, decode: the slot).
+    lp_row: Vec<usize>,
 }
 
 impl CpuServe {
@@ -140,6 +149,7 @@ impl CpuServe {
             pf_pos: vec![0; batch],
             buckets,
             pf_chunk,
+            lp_row: (0..batch).collect(),
         })
     }
 
@@ -186,6 +196,7 @@ impl CpuServe {
     }
 
     fn admit_prefilled(&mut self, slot: usize, prompt: &[u32], tok: u32) {
+        self.lp_row[slot] = 0;
         self.pf_pos[slot] = 0;
         self.pos[slot] = prompt.len() as u32;
         self.live[slot] = true;
@@ -283,6 +294,7 @@ impl CpuServe {
         for &(s, _) in feeds {
             self.pos[s] += 1;
             self.next_id[s] = out[s];
+            self.lp_row[s] = s;
         }
         Ok(feeds.iter().map(|&(s, _)| (s, out[s])).collect())
     }
@@ -372,6 +384,10 @@ impl SeqEngine for CpuServe {
         Err(RuntimeError::Rejected(
             "multi-step is not supported by the CPU engine".into(),
         ))
+    }
+
+    fn logits_row(&self, slot: usize, out: &mut Vec<f32>) -> bool {
+        slot < self.batch && self.eng.logits_row(self.lp_row[slot], out)
     }
 
     fn step_batch(&mut self, feeds: &[(usize, u32)]) -> Result<Vec<(usize, u32)>> {

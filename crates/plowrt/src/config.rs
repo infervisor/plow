@@ -728,6 +728,11 @@ pub struct CpuRuntimeConfig {
     /// any node busier than the round-robin even when this is on.
     #[arg(long = "cpu-l2-place", env = "PLOW_CPU_L2_PLACE", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub l2_place: bool,
+
+    /// Pseudo-lock the head of each worker's scratch into its core's L2 through
+    /// `/dev/pseudo_lock` (runtime/cpu/driver). Inert when the driver is not loaded.
+    #[arg(long = "cpu-sram", env = "PLOW_CPU_SRAM", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub sram: bool,
 }
 
 /// NVIDIA / sm_120 runtime knobs.
