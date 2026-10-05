@@ -150,6 +150,17 @@ enum Container {
     Extension,
 }
 
+fn known_ops() -> &'static [bool] {
+    static KNOWN: std::sync::OnceLock<Vec<bool>> = std::sync::OnceLock::new();
+    KNOWN.get_or_init(|| {
+        let mut known = vec![false; 1 << 16];
+        for op in DevOp::ALL {
+            known[*op as u16 as usize] = true;
+        }
+        known
+    })
+}
+
 /// Copy `n` `T` records out of `buf` at `*off` (unaligned-safe — the blob's
 /// sections are packed back to back with no padding between them).
 fn take<T: Copy>(buf: &[u8], off: &mut usize, n: usize, what: &str) -> Result<Vec<T>> {
@@ -322,6 +333,19 @@ impl DevBlob {
                 gq_seg_ofs: Vec::new(),
                 l2_domains: 0,
             });
+        }
+
+        // An opcode this build does not know is a packet from a newer plowc. The interpreter
+        // would trap on it at the first launch and poison the device context mid-serve.
+        let known = known_ops();
+        for (p, prog) in progs.iter().enumerate() {
+            if let Some((i, d)) = prog.insts.iter().enumerate().find(|(_, d)| !known[d.op as usize]) {
+                return Err(RuntimeError::Device(format!(
+                    "devblob: program {p} instruction {i} uses opcode {}, which this plowrt does not \
+                     know; the packet needs a matching plowrt",
+                    d.op
+                )));
+            }
         }
 
         // THE ONE PLACE a loaded table is turned into roles. Everything downstream — both
@@ -824,10 +848,21 @@ impl DevBlob {
         let main = dir.join("model.pkt");
         if main.is_file() {
             let mut magic = [0u8; 8];
-            if std::fs::File::open(&main).and_then(|mut f| std::io::Read::read_exact(&mut f, &mut magic)).is_ok()
-                && is_blob_magic(&magic)
-            {
-                return Ok(Some(main));
+            if std::fs::File::open(&main).and_then(|mut f| std::io::Read::read_exact(&mut f, &mut magic)).is_ok() {
+                if is_blob_magic(&magic) {
+                    return Ok(Some(main));
+                }
+                // A device packet from a newer or older plowc. Skipping it registered the model
+                // with no device program, and every request then failed with no hint why.
+                if magic.starts_with(b"PLOWDEV") {
+                    return Err(RuntimeError::Device(format!(
+                        "{}: packet format version {} is not one this plowrt reads ({}); rebuild the \
+                         packet with a matching plowc or use a matching plowrt",
+                        main.display(),
+                        magic[7],
+                        packet::devbuild::BLOB_MAGICS.iter().map(|m| m[7].to_string()).collect::<Vec<_>>().join(", ")
+                    )));
+                }
             }
         }
         let mut found: Option<PathBuf> = None;
@@ -1154,6 +1189,18 @@ mod tests {
     use packet::devbuild::{Model, Program, TensorDecl};
 
     #[test]
+    fn unknown_packet_version_fails_at_discovery() {
+        let dir = std::env::temp_dir().join(format!("plowrt-pkt-version-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("model.pkt"), b"PLOWDEV\x7fnot-a-packet").unwrap();
+        let err = DevBlob::find_in_dir(&dir).unwrap_err().to_string();
+        assert!(err.contains("packet format version 127"), "{err}");
+        std::fs::write(dir.join("model.pkt"), b"not a device packet").unwrap();
+        assert!(DevBlob::find_in_dir(&dir).unwrap().is_none());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn packet_segments_recover_safe_cuda_object_routing() {
         let mut insts = vec![DevInst64 {
             op: DevOp::Embed as u16,
@@ -1456,6 +1503,15 @@ mod tests {
             prog_t: vec![128, 1],
             gen: Vec::new(),
         }
+    }
+
+    #[test]
+    fn an_opcode_this_build_does_not_know_is_refused_at_parse() {
+        let mut m = tiny_model();
+        assert!(DevBlob::parse(&m.to_blob()).is_ok());
+        m.progs[1].insts.push(DevInst { op: 0xfffe, blocks: 1, ..Default::default() });
+        let Err(err) = DevBlob::parse(&m.to_blob()) else { panic!("unknown opcode accepted") };
+        assert!(err.to_string().contains("opcode 65534"), "{err}");
     }
 
     /// Give program `p` the two collectives `devgen` emits per layer at tp=N:

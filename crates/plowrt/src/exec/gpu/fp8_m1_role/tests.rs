@@ -117,6 +117,8 @@ fn image_hash_and_isa_reject_without_device() {
         sha256: Some("a".repeat(64)),
         promote_k512: Some(1),
         attention: None,
+        gemm: None,
+        decode_plan: None,
     };
     assert!(check_image(&[0; 128], &object, "sm90a").is_err());
 }
@@ -172,6 +174,8 @@ fn actual_frozen_role_image_and_packet() {
         sha256: Some(plow_asset::decode_objects::image_sha256(&image)),
         promote_k512: Some(1),
         attention: None,
+        gemm: None,
+        decode_plan: None,
     };
     check_image(&image, &object, "sm90a").unwrap();
     assert!(check_image(&image, &object, "sm120").is_err());

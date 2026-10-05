@@ -82,7 +82,7 @@ pub(super) fn validate_cublaslt_ladder(blob: &DevBlob, metadata: &SegmentRoles) 
                 "cuBLASLt ladder projection roles differ".into(),
             ));
         }
-        packet_role_segments(program, roles, &blob.tensors)?;
+        packet_role_segments_with(program, roles, &blob.tensors, &metadata.objects)?;
         cublaslt::decode_segments(program, &blob.tensors, roles)?;
         previous_roles = Some(roles);
     }

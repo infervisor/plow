@@ -103,7 +103,7 @@ fn guided_model(
 
 /// Bind every served speech model's host stages now (vocoder / codec graphs, prompt tables), so
 /// the first request does not pay them.
-pub fn preload(state: &AppState) {
+pub fn preload(state: &AppState) -> Result<(), String> {
     for slug in state.registry.slugs() {
         let (Some(_), Ok(bundle)) = (state.mux(&slug), state.registry.get(&slug)) else {
             continue;
@@ -112,10 +112,9 @@ pub fn preload(state: &AppState) {
             Some(_) => Ok(()),
             None => speech_model(&bundle.dir, state.downstream(&slug)).map(drop),
         });
-        if let Err(e) = bound {
-            tracing::warn!(%slug, error = %e, "tts: speech pipeline failed to bind");
-        }
+        bound.map_err(|e| format!("{slug}: speech pipeline failed to bind: {e}"))?;
     }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -319,6 +318,17 @@ async fn speech_with(
         Ok(r) => r,
         Err(e) => return crate::serve::api_error(e.status(), e.body_text(), "invalid_request_error", Some("invalid_json"), None),
     };
+    // The same ranges chat and completions enforce: `repetition_penalty: 0` divided the logits
+    // by zero and sampled from NaN probabilities.
+    let sampling = crate::serve::openai::SamplingFields {
+        temperature: req.temperature,
+        top_p: req.top_p,
+        repetition_penalty: req.repetition_penalty,
+        ..Default::default()
+    };
+    if let Err(e) = sampling.validate() {
+        return bad(e.message, e.field);
+    }
     let t_arrive = Instant::now();
     if let Some(canonical) = state.registry.resolve(&req.model) {
         req.model = canonical;
@@ -483,10 +493,14 @@ async fn decode_all(model: &SpeechModel, codes: &[i32], frames: usize, seed: u64
         let e = (s + step).min(frames);
         let (ws, we) = (s.saturating_sub(window), (e + window).min(frames));
         let w = model.codec.decode(codes[ws * fc..we * fc].to_vec(), we - ws, seed ^ s as u64, Urgency::Whole).await?;
-        pcm.extend_from_slice(&w[(s - ws) * fs..(e - ws) * fs]);
+        pcm.extend_from_slice(w.get((s - ws) * fs..(e - ws) * fs).ok_or_else(|| short_window(w.len(), we - ws))?);
         s = e;
     }
     Ok(pcm)
+}
+
+fn short_window(samples: usize, frames: usize) -> String {
+    format!("codec returned {samples} samples for a {frames}-frame window")
 }
 
 /// Drain the LM stream promptly (the mux cuts a consumer that falls behind) keeping the codes.
@@ -571,8 +585,11 @@ async fn stream_task(
             let urgency = if emitted == 0 { Urgency::First } else { Urgency::Stream };
             match model.codec.decode(window, e - s, seed ^ (emitted as u64).wrapping_mul(0x9E37_79B9), urgency).await {
                 Ok(pcm) => {
+                    let Some(fresh) = pcm.get((emitted - s) * fs..(upto - s) * fs) else {
+                        return drop(out.send(Err(std::io::Error::other(short_window(pcm.len(), e - s)))).await);
+                    };
                     let mut bytes = Vec::new();
-                    pcm16(&pcm[(emitted - s) * fs..(upto - s) * fs], &mut bytes);
+                    pcm16(fresh, &mut bytes);
                     first.get_or_insert_with(|| t_arrive.elapsed());
                     run.audio((upto - emitted) * fs, sr);
                     if out.send(Ok(bytes)).await.is_err() {

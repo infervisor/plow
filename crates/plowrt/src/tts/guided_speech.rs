@@ -576,11 +576,12 @@ impl GuidedSpeech {
         let trim_tail = c.trim_tail_tokens;
         let (s_tx, s_rx) = mpsc::channel::<S3Msg>();
         let (s_ready_tx, s_ready_rx) = mpsc::channel::<Result<usize>>();
-        let dir = assets.to_path_buf();
+        let vocoder_path =
+            crate::exec::packet_runtime::stage_packet(&assets.join("model.pkt"), "vocoder.packet", VOCODER)?;
         std::thread::Builder::new()
             .name("plow-tts-render".into())
             .spawn(move || {
-                let mut vocoder = match Codec::load_packet(&dir.join(VOCODER)) {
+                let mut vocoder = match Codec::load_packet(&vocoder_path) {
                     Ok(v) => v,
                     Err(e) => return drop(s_ready_tx.send(Err(RuntimeError::Device(e)))),
                 };
@@ -590,7 +591,7 @@ impl GuidedSpeech {
                     Err(e) => return drop(s_ready_tx.send(Err(RuntimeError::Rejected(e)))),
                 };
                 let _ = s_ready_tx.send(Ok(sc.first));
-                render_loop(&vocoder, crate::sched::cost::id(&dir.join(VOCODER).to_string_lossy()), sc, s_rx, &credit);
+                render_loop(&vocoder, crate::sched::cost::id(&vocoder_path.to_string_lossy()), sc, s_rx, &credit);
             })
             .map_err(|e| RuntimeError::Device(e.to_string()))?;
         let first_tokens = s_ready_rx.recv().map_err(|e| RuntimeError::Device(e.to_string()))??;

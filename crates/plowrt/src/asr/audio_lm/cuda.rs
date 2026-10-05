@@ -23,7 +23,10 @@ impl CudaAudioLmExecution {
         let be = Arc::new(CudaBackend::new(0)?);
         let assets = blob.parent().unwrap_or(Path::new("."));
         let decoder = GpuEngine::load(be, assets, checkpoint)?;
-        let encoder = PacketAudioEncoder::load(&blob.with_file_name("encoder.pkt"), "cuda")?;
+        let encoder = PacketAudioEncoder::load(
+            &crate::exec::packet_runtime::stage_packet(blob, "encoder.packet", "encoder.pkt")?,
+            "cuda",
+        )?;
         if encoder.output_width() != hidden {
             return Err(RuntimeError::Rejected("audio packet output width does not match the decoder".into()));
         }

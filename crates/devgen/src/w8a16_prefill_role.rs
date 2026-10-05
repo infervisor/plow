@@ -201,6 +201,8 @@ pub(crate) fn apply_output_object(
             sha256: Some(plow_asset::decode_objects::image_sha256(&image)),
             promote_k512: None,
             attention: None,
+            gemm: None,
+            decode_plan: None,
         },
     );
     metadata.validate_schema()?;

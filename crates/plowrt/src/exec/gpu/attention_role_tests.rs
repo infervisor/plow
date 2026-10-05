@@ -143,7 +143,10 @@ fn hd512_object() -> plow_asset::segment_roles::SegmentObject {
             query_tile: 64,
             kv_tile: 32,
             warps: 8,
+            shape: None,
         }),
+        gemm: None,
+        decode_plan: None,
     }
 }
 
@@ -169,7 +172,10 @@ fn hd256_bkv64_object() -> plow_asset::segment_roles::SegmentObject {
             query_tile: 64,
             kv_tile: 64,
             warps: 8,
+            shape: None,
         }),
+        gemm: None,
+        decode_plan: None,
     }
 }
 
@@ -443,6 +449,64 @@ fn hd512_px4_bq64_packet_role_rejects_non_gemma_geometry() {
     }
     program.insts[2].t[5] = TENSOR_NONE16;
     assert!(packet_role_segments(&program, &roles, &tensors).is_err());
+}
+
+#[test]
+fn attention_shape_descriptor_replaces_the_legacy_gemma_geometry() {
+    let px4 = plow_asset::segment_roles::PREFILL_ATTENTION_HD512_PX4_BQ64;
+    let roles = [0, 0, px4, 0, 0];
+    let (mut program, tensors) = hd512_px4_fixture();
+    let mut object = hd512_px4_bq64_object();
+    object.attention.as_mut().unwrap().shape = Some(plow_asset::segment_roles::AttentionShape {
+        n_head: 8,
+        n_kv_head: 1,
+        window: 0,
+        arena_bytes: 110592,
+        rows: Some(vec![4096]),
+    });
+    let objects = std::collections::BTreeMap::from([(px4, object)]);
+    assert!(packet_role_segments_with(&program, &roles, &tensors, &objects).is_err());
+    program.insts[2].i[2] = 8;
+    assert_eq!(packet_role_segments_with(&program, &roles, &tensors, &objects).unwrap(), roles);
+    assert!(packet_role_segments(&program, &roles, &tensors).is_err());
+    assert!(packet_role_segments_with(
+        &program,
+        &roles,
+        &tensors,
+        &std::collections::BTreeMap::from([(px4, hd512_px4_bq64_object())])
+    )
+    .is_err());
+
+    let gqa2 = plow_asset::segment_roles::PREFILL_ATTENTION_HD256_GQA2_BKV32;
+    let roles = [0, 0, gqa2, 0, 0];
+    let (mut program, mut tensors) = fixture(4096, 1);
+    tensors.push(DevTensor {
+        name: "kv.map".into(),
+        bytes: 256,
+        init: None,
+    });
+    tensors[3].bytes *= 2;
+    tensors[4].bytes *= 2;
+    program.insts[2].i[2] = 16;
+    program.insts[2].i[3] = 8;
+    program.insts[2].i[5] = 512;
+    program.insts[2].i[7] = 1;
+    program.insts[2].t[5] = 5;
+    program.insts[2].t[7] = 6;
+    let mut object = hd256_gqa2_bkv32_object();
+    object.attention.as_mut().unwrap().shape = Some(plow_asset::segment_roles::AttentionShape {
+        n_head: 16,
+        n_kv_head: 8,
+        window: 512,
+        arena_bytes: 141312,
+        rows: None,
+    });
+    let objects = std::collections::BTreeMap::from([(gqa2, object)]);
+    assert_eq!(packet_role_segments_with(&program, &roles, &tensors, &objects).unwrap(), roles);
+    assert!(packet_role_segments(&program, &roles, &tensors).is_err());
+    program.insts[2].i[5] = 1024;
+    assert!(packet_role_segments_with(&program, &roles, &tensors, &objects).is_err());
+    assert_eq!(packet_role_segments(&program, &roles, &tensors).unwrap(), roles);
 }
 
 #[test]

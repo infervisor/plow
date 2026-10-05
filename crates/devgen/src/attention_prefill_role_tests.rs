@@ -107,6 +107,10 @@ fn px4_bq64_object_selects_only_the_exact_4k_role() {
         roles.objects[&PREFILL_ATTENTION_HD512_PX4_BQ64].attention,
         Some(px4_bq64_capability())
     );
+    assert_eq!(
+        px4_bq64_capability().shape,
+        plow_asset::segment_roles::legacy_attention_shape(PREFILL_ATTENTION_HD512_PX4_BQ64)
+    );
     std::fs::remove_dir_all(directory).unwrap();
 }
 
@@ -284,6 +288,10 @@ fn exact_hd256_gqa2_object_selects_only_a_packed_4k_rung() {
     assert_eq!(object.abi, PREFILL_ATTENTION_HD256_GQA2_BKV32_ABI);
     assert_eq!(object.sha256.as_deref().map(str::len), Some(64));
     assert_eq!(object.attention.as_ref().unwrap().kv_tile, 32);
+    assert_eq!(
+        object.attention.as_ref().unwrap().shape,
+        plow_asset::segment_roles::legacy_attention_shape(PREFILL_ATTENTION_HD256_GQA2_BKV32)
+    );
     std::fs::remove_dir_all(directory).unwrap();
 }
 

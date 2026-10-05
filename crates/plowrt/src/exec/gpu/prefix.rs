@@ -1,6 +1,5 @@
 //! CUDA KV mappings, prefix snapshots and cache attachment.
 
-use std::path::Path;
 use std::sync::Arc;
 
 use crate::asset::devblob::DevBlob;
@@ -131,7 +130,7 @@ impl GpuEngine {
 
     pub(crate) fn select_vmm_prefix_layout(
         blob: &DevBlob,
-        checkpoint_dir: &Path,
+        kv: Option<&plow_asset::serve_manifest::KvGeometry>,
         config: &RuntimeConfig,
         capability: (u32, u32),
         granularity: u64,
@@ -158,7 +157,7 @@ impl GpuEngine {
         {
             return None;
         }
-        let layout = Self::vmm_prefix_layout(blob, checkpoint_dir)?;
+        let layout = Self::vmm_prefix_layout(blob, kv)?;
         if requested.is_none() {
             // Auto-selection is an allowlist of the geometry the sliding-ring
             // snapshot path was qualified on (Gemma 4 hybrid KV), not a
@@ -200,7 +199,7 @@ impl GpuEngine {
 
     pub(crate) fn vmm_prefix_layout(
         blob: &DevBlob,
-        checkpoint_dir: &Path,
+        kv: Option<&plow_asset::serve_manifest::KvGeometry>,
     ) -> Option<VmmPrefixLayout> {
         let batch = blob.decode_prog().ok()?.t;
         let packet_max_ctx = blob
@@ -213,10 +212,8 @@ impl GpuEngine {
             .map(|c| c as u32)
             .unwrap_or(packet_max_ctx)
             .min(packet_max_ctx);
-        let Some(mut geo) =
-            crate::memory::vmm::VmmGeometry::from_config(checkpoint_dir, max_ctx, batch)
-        else {
-            tracing::warn!("vmm off: no usable KV geometry in config.json");
+        let Some(mut geo) = kv.and_then(|kv| crate::memory::vmm::VmmGeometry::from_kv(kv, max_ctx, batch)) else {
+            tracing::warn!("vmm off: no usable KV geometry in the serve manifest");
             return None;
         };
         let find = |name: &str| blob.tensors.iter().position(|t| t.name == name);

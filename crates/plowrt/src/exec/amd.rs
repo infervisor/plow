@@ -6460,6 +6460,7 @@ impl AmdEngine {
         be: &Arc<HsaBackend>,
         blob: &DevBlob,
         checkpoint: Option<&Path>,
+        hsaco_kv: Option<&plow_asset::serve_manifest::KvGeometry>,
         batch: usize,
         required: bool,
     ) -> Option<VmmKv> {
@@ -6485,10 +6486,14 @@ impl AmdEngine {
             .min(packet_max_ctx);
         let batch = u32::try_from(batch).ok()?;
 
-        let mut geo = match VmmGeometry::from_config(ckpt, max_ctx, batch) {
+        let kv = match hsaco_kv {
+            Some(kv) => Some(kv.clone()),
+            None => plow_asset::serve_manifest::KvGeometry::from_config(ckpt),
+        };
+        let mut geo = match kv.and_then(|kv| VmmGeometry::from_kv(&kv, max_ctx, batch)) {
             Some(g) => g,
             None => {
-                tracing::warn!("vmm off: no usable KV geometry in config.json");
+                tracing::warn!("vmm off: no usable KV geometry in the serve manifest");
                 return None;
             }
         };
@@ -9119,10 +9124,14 @@ impl AmdEngine {
                 config.vmm_cache_min_free_bytes(be.vram_bytes(), None))
         }).transpose()?;
         let vmm = if shared_prefix.is_none() {
+            let serve_kv = checkpoint
+                .and_then(|c| crate::asset::serve::resolve(blob_path.parent()?, c).ok())
+                .and_then(|s| s.manifest.kv);
             Self::vmm_bringup(
                 &be,
                 &blob,
                 checkpoint,
+                serve_kv.as_ref(),
                 max_decode_batch as usize,
                 flat_slab_bytes > be.vram_bytes(),
             )

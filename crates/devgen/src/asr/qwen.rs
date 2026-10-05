@@ -1217,6 +1217,8 @@ pub fn whisper_frontend(checkpoint: &std::path::Path) -> Result<WhisperFrontend,
     Ok(WhisperFrontend { parameters, filterbank, bins: bins as u32, spectrum_bins: spectrum as u32 })
 }
 
+pub const ENCODER_PACKET: &str = "encoder.pkt";
+
 /// Host contract of the Qwen3-ASR decoder for the generic audio-LM driver: prompt layout,
 /// audio marker, output markers, languages and stop ids, as packet strings and parameters.
 pub fn audio_lm_contract(
@@ -1254,8 +1256,11 @@ pub fn audio_lm_contract(
         ("da", "Danish"), ("fi", "Finnish"), ("pl", "Polish"), ("cs", "Czech"), ("fil", "Filipino"),
         ("fa", "Persian"), ("el", "Greek"), ("hu", "Hungarian"), ("mk", "Macedonian"), ("ro", "Romanian"),
     ];
+    let pre = json("preprocessor_config.json").unwrap_or_default();
     let mut parameters = BTreeMap::from([
         ("audio.token_id".into(), audio_token),
+        ("audio.sample_rate".into(), pre["sampling_rate"].as_u64().unwrap_or(16_000)),
+        ("audio.max_seconds".into(), pre["chunk_length"].as_u64().unwrap_or(30)),
         ("output.max_tokens".into(), 1024),
         ("prompt.context_max_tokens".into(), 256),
         ("stop.count".into(), stops.len() as u64),
@@ -1269,6 +1274,7 @@ pub fn audio_lm_contract(
             r#"[{"role":"system","content":"{context}"},{"role":"user","content":[{"type":"audio"}]}]"#.into(),
         ),
         ("audio.marker".into(), "<|audio_pad|>".into()),
+        ("encoder.packet".into(), ENCODER_PACKET.into()),
         ("prompt.language_suffix".into(), "language {language}<asr_text>".into()),
         ("prompt.context_forbidden".into(), "<|\n<asr_text>".into()),
         ("output.text_marker".into(), "<asr_text>".into()),

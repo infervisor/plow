@@ -51,6 +51,8 @@ pub struct Metrics {
     pub serve_mode_switches: AtomicU64,
     /// Admissions cache-aware ordering seated ahead of the queue head.
     pub cache_first_admissions: AtomicU64,
+    /// A fatal device fault poisoned this model's engine; `/health` answers 503.
+    pub engine_dead: std::sync::atomic::AtomicBool,
 }
 
 impl Metrics {

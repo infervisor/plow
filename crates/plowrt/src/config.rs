@@ -296,13 +296,28 @@ pub struct RuntimeConfig {
     // ──────────────────────────────────────────────────────────────────────────
     /// S1 switch drain deadline (ms): past it the victim's live generations are
     /// preempted (`Preempted` finish, queued jobs 429). 0 = preempt immediately;
-    /// unset = unbounded drain.
+    /// unset = unbounded drain. Also bounds the SIGTERM/SIGINT drain (30 s when unset).
     #[arg(
         long = "drain-timeout-ms",
         env = "PLOW_DRAIN_TIMEOUT_MS",
         global = true
     )]
     pub drain_timeout_ms: Option<u64>,
+
+    /// How long a request waits (ms) for another model switch to release the switch lock before
+    /// it is shed with 503 + Retry-After. 0 = unbounded; unset = 600 000.
+    #[arg(long = "switch-timeout-ms", env = "PLOW_SWITCH_TIMEOUT_MS", global = true)]
+    pub switch_timeout_ms: Option<u64>,
+
+    /// HTTP/1 request-head deadline (ms), also the idle keep-alive bound: hyper arms it whenever
+    /// a connection waits for the next request. 0 = off; unset = 30 000.
+    #[arg(long = "http-header-timeout-ms", env = "PLOW_HTTP_HEADER_TIMEOUT_MS", global = true)]
+    pub http_header_timeout_ms: Option<u64>,
+
+    /// Concurrent HTTP connections per listener; past it accepting pauses. 0 = unbounded;
+    /// unset = 4096.
+    #[arg(long = "http-max-connections", env = "PLOW_HTTP_MAX_CONNECTIONS", global = true)]
+    pub http_max_connections: Option<usize>,
 
     /// Device ordinals to serve on, e.g. `--devices 0,1,2,3`. Unset = every
     /// visible GPU.
@@ -1660,6 +1675,12 @@ impl RuntimeConfig {
         std::env::var(var).ok().filter(|value| !value.is_empty())
     }
 
+    /// `PLOW_THROUGHPUT_K`: the decode quantum under the throughput objective (default 8); a
+    /// packet's `serve.json` can carry the model's measured value.
+    pub(crate) fn throughput_k() -> Option<u32> {
+        Self::env_parse("PLOW_THROUGHPUT_K").filter(|&k: &u32| k > 0)
+    }
+
     /// `PLOW_DEBUG_MAX_INST`: interpreter instruction cap, a fault-bisect aid. Applied to
     /// the decode module and to every prefill object, which share one `e.inst` scale.
     #[cfg(feature = "cuda")]
@@ -1981,7 +2002,7 @@ impl RuntimeConfig {
     }
 
     #[cfg(feature = "cuda")]
-    pub(crate) fn drain_timeout_ms(&self) -> Option<u64> {
+    pub fn drain_timeout_ms(&self) -> Option<u64> {
         let environment = Self::env_parse("PLOW_DRAIN_TIMEOUT_MS").map(Some);
         select_compat(self.drain_timeout_ms, environment, !Self::is_initialized())
     }

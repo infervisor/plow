@@ -163,67 +163,32 @@ pub struct VmmGeometry {
 }
 
 impl VmmGeometry {
-    /// Parse the checkpoint's `config.json` (`text_config` or top level).
-    /// Gemma-family: `layer_types` splits full/sliding layers and
-    /// `sliding_window` is required. No `layer_types` (Qwen/Llama-family):
-    /// every `num_hidden_layers` layer is full attention, no rings, no
-    /// boundary snapshots. Heads/dims come from
-    /// `num_global_key_value_heads`/`num_key_value_heads` and
-    /// `global_head_dim`/`head_dim`. `None` when the shape isn't there — the
-    /// caller then leaves VMM off.
+    /// Parse the checkpoint's `config.json` (`plow_asset::serve_manifest::KvGeometry::from_config`):
+    /// the legacy source for a packet without `serve.json`.
     pub fn from_config(checkpoint_dir: &std::path::Path, max_ctx: u32, batch: u32) -> Option<Self> {
-        let bytes = std::fs::read(checkpoint_dir.join("config.json")).ok()?;
-        let v: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
-        let t = v.get("text_config").unwrap_or(&v);
-        let mut full_layers = Vec::new();
-        let mut slide_layers = Vec::new();
-        match t.get("layer_types").and_then(|x| x.as_array()) {
-            Some(layer_types) => {
-                for (l, ty) in layer_types.iter().enumerate() {
-                    match ty.as_str()? {
-                        "full_attention" => full_layers.push(l as u32),
-                        "sliding_attention" => slide_layers.push(l as u32),
-                        _ => return None,
-                    }
-                }
-            }
-            None => {
-                let n = t.get("num_hidden_layers")?.as_u64()? as u32;
-                full_layers = (0..n).collect();
-            }
-        }
-        let u = |k: &str| t.get(k).and_then(|x| x.as_u64()).map(|x| x as u32);
-        // Gemma-4 E-series: the trailing `num_kv_shared_layers` read an earlier layer's cache
-        // and own none.
-        if let (Some(n), Some(shared)) = (u("num_hidden_layers"), u("num_kv_shared_layers")) {
-            let own = n.saturating_sub(shared);
-            full_layers.retain(|&l| l < own);
-            slide_layers.retain(|&l| l < own);
-        }
-        let kvh_slide = u("num_key_value_heads")?;
-        let kvh_full = u("num_global_key_value_heads").unwrap_or(kvh_slide);
-        let hd_slide = u("head_dim")?;
-        let hd_full = u("global_head_dim").unwrap_or(hd_slide);
-        // Required only when sliding layers exist — their snapshot geometry
-        // depends on it. All-full models carry window 0 (nothing to restore).
-        let window = match slide_layers.is_empty() {
-            true => u("sliding_window").unwrap_or(0),
-            false => u("sliding_window")?,
-        };
-        if full_layers.is_empty()
+        Self::from_kv(&plow_asset::serve_manifest::KvGeometry::from_config(checkpoint_dir)?, max_ctx, batch)
+    }
+
+    /// The packet's KV geometry. `None` when it is not a usable shape — the caller then leaves
+    /// VMM off.
+    pub fn from_kv(kv: &plow_asset::serve_manifest::KvGeometry, max_ctx: u32, batch: u32) -> Option<Self> {
+        let (kvh_full, hd_full, kvh_slide, hd_slide, window) =
+            (kv.kv_heads_full, kv.head_dim_full, kv.kv_heads_slide, kv.head_dim_slide, kv.window);
+        let slide = !kv.slide_layers.is_empty();
+        if kv.full_layers.is_empty()
             || kvh_full == 0
             || hd_full == 0
             || batch == 0
             || max_ctx == 0
-            || (!slide_layers.is_empty() && (kvh_slide == 0 || hd_slide == 0 || window == 0))
+            || (slide && (kvh_slide == 0 || hd_slide == 0 || window == 0))
         {
             return None;
         }
         Some(VmmGeometry {
-            full_layers,
+            full_layers: kv.full_layers.clone(),
             kvh_full,
             hd_full,
-            slide_layers,
+            slide_layers: kv.slide_layers.clone(),
             kvh_slide,
             hd_slide,
             window,

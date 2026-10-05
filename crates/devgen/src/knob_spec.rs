@@ -1248,6 +1248,7 @@ pub const EMIT: &[KnobSpec] = &[
     KnobSpec::new("emit.gemma4_sm90_hd256_gqa2_wide", Some("PLOW_GEMMA4_SM90_HD256_GQA2_WIDE"), Layer::Emit, Domain::Bool, GQA2_WIDE_DEFAULT, GQA2_WIDE_QUALIFIED),
     KnobSpec::new("emit.gemma4_sm90_hd512_px4_bq64_role", Some("PLOW_GEMMA4_SM90_HD512_PX4_BQ64_ROLE"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.gen_kernels", Some("PLOW_EMIT_GEN_KERNELS"), Layer::Emit, Domain::Str, UNSET, OPT_IN),
+    KnobSpec::new("emit.serve_defaults", Some("PLOW_EMIT_SERVE_DEFAULTS"), Layer::Emit, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("emit.fp8_pf_gemm_role", Some("PLOW_FP8_PF_GEMM_ROLE"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.fp8_pf_isolate", Some("PLOW_QWEN_FP8_PF_ISOLATE"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.attention_pf_role", Some("PLOW_ATTENTION_PF_ROLE"), Layer::Emit, Domain::Bool, OFF, OPT_IN),

@@ -27,12 +27,43 @@ pub enum ReasoningMode {
     None,
     /// `<think>` … `</think>`, opened by the prompt or by the generation.
     ThinkTag,
+    /// Another marker pair, from the packet's `serve.json` (leaked once per loaded model).
+    Tags { open: &'static str, close: &'static str },
 }
 
 const OPEN: &str = "<think>";
 const CLOSE: &str = "</think>";
 
 impl ReasoningMode {
+    /// The mode a packet declares. A legacy packet (no `serve.json`) keeps `<think>` splitting
+    /// for every model, as before the section existed.
+    pub fn from_serve(serve: &crate::asset::serve::ServeInfo) -> Self {
+        if !serve.from_packet {
+            return ReasoningMode::ThinkTag;
+        }
+        match serve.manifest.chat.as_ref().and_then(|c| c.reasoning.as_ref()) {
+            None => ReasoningMode::None,
+            Some(t) if t.open == OPEN && t.close == CLOSE => ReasoningMode::ThinkTag,
+            Some(t) if !t.open.is_empty() && !t.close.is_empty() => ReasoningMode::Tags {
+                open: Box::leak(t.open.clone().into_boxed_str()),
+                close: Box::leak(t.close.clone().into_boxed_str()),
+            },
+            Some(_) => ReasoningMode::None,
+        }
+    }
+
+    pub fn for_bundle(bundle: &crate::asset::ModelBundle) -> Self {
+        bundle.reasoning()
+    }
+
+    fn markers(self) -> Option<(&'static str, &'static str)> {
+        match self {
+            ReasoningMode::None => None,
+            ReasoningMode::ThinkTag => Some((OPEN, CLOSE)),
+            ReasoningMode::Tags { open, close } => Some((open, close)),
+        }
+    }
+
     /// Whether the rendered prompt leaves the trace OPEN.
     ///
     /// Tested as a SUFFIX, never a search. `add_generation_prompt` puts the
@@ -43,8 +74,8 @@ impl ReasoningMode {
     ///
     /// A request that turned thinking off renders the pair CLOSED
     /// (`<think></think>`) and so correctly reads as not-open here.
-    pub fn prompt_opens(prompt: &str) -> bool {
-        prompt.ends_with(OPEN)
+    pub fn prompt_opens(self, prompt: &str) -> bool {
+        self.markers().is_some_and(|(open, _)| prompt.ends_with(open))
     }
 }
 
@@ -63,6 +94,8 @@ enum State {
 #[derive(Debug)]
 pub struct ReasoningSplit {
     state: State,
+    open: &'static str,
+    close: &'static str,
     /// Bytes generated but not yet attributed to one side or the other.
     hold: String,
     /// Tokens seen while inside the trace, for `reasoning_tokens`.
@@ -79,13 +112,16 @@ impl ReasoningSplit {
     /// `prompt_opens` comes from [`ReasoningMode::prompt_opens`]; `mode` being
     /// [`ReasoningMode::None`] disables splitting entirely.
     pub fn new(mode: ReasoningMode, prompt_opens: bool) -> Self {
+        let (open, close) = mode.markers().unwrap_or((OPEN, CLOSE));
         let state = match (mode, prompt_opens) {
             (ReasoningMode::None, _) => State::Answer,
-            (ReasoningMode::ThinkTag, true) => State::Open,
-            (ReasoningMode::ThinkTag, false) => State::Deciding,
+            (_, true) => State::Open,
+            (_, false) => State::Deciding,
         };
         ReasoningSplit {
             state,
+            open,
+            close,
             hold: String::new(),
             trace_tokens: 0,
             started_reasoning: false,
@@ -154,14 +190,14 @@ impl ReasoningSplit {
 
         if self.state == State::Deciding {
             let trimmed = self.hold.trim_start();
-            if trimmed.starts_with(OPEN) {
+            if trimmed.starts_with(self.open) {
                 // The model opened a trace. The marker and the whitespace in
                 // front of it are framing, not answer.
-                let consumed = self.hold.len() - trimmed.len() + OPEN.len();
+                let consumed = self.hold.len() - trimmed.len() + self.open.len();
                 self.hold.drain(..consumed);
                 self.state = State::Open;
                 self.had_trace = true;
-            } else if trimmed.is_empty() || OPEN.starts_with(trimmed) {
+            } else if trimmed.is_empty() || self.open.starts_with(trimmed) {
                 // Nothing but whitespace yet, or still a possible prefix of
                 // `<think>` — wait for more.
                 //
@@ -181,11 +217,11 @@ impl ReasoningSplit {
             }
         }
 
-        match self.hold.find(CLOSE) {
+        match self.hold.find(self.close) {
             Some(i) => {
                 // Last piece of the trace: trim only its END.
                 let before = self.hold[..i].trim_end().to_string();
-                let after = self.hold[i + CLOSE.len()..].to_string();
+                let after = self.hold[i + self.close.len()..].to_string();
                 self.hold.clear();
                 self.state = State::Answer;
                 let r = self.emit_reasoning(&before);
@@ -194,7 +230,7 @@ impl ReasoningSplit {
             }
             None => {
                 // Withhold only what could still begin the close marker.
-                let keep = (CLOSE.len() - 1).min(self.hold.len());
+                let keep = (self.close.len() - 1).min(self.hold.len());
                 let cut = (0..=keep)
                     .rev()
                     .map(|k| self.hold.len() - k)
@@ -416,10 +452,21 @@ mod tests {
 
     #[test]
     fn the_prompt_suffix_decides_whether_a_trace_is_open() {
-        assert!(ReasoningMode::prompt_opens("<|user|>hi<|assistant|><think>"));
+        assert!(ReasoningMode::ThinkTag.prompt_opens("<|user|>hi<|assistant|><think>"));
         // thinking disabled renders the pair closed
-        assert!(!ReasoningMode::prompt_opens("<|assistant|><think></think>"));
+        assert!(!ReasoningMode::ThinkTag.prompt_opens("<|assistant|><think></think>"));
         // user text cannot reach the end
-        assert!(!ReasoningMode::prompt_opens("what is <think>?<|assistant|>"));
+        assert!(!ReasoningMode::ThinkTag.prompt_opens("what is <think>?<|assistant|>"));
+    }
+
+    #[test]
+    fn packet_declared_markers_split_the_trace() {
+        let mode = ReasoningMode::Tags { open: "<|think|>", close: "<|/think|>" };
+        assert!(mode.prompt_opens("...<|think|>"));
+        assert!(!ReasoningMode::None.prompt_opens("...<think>"));
+        let (r, c) = split(mode, false, "<|think|>plan<|/think|>answer");
+        assert_eq!((r.as_deref(), c.as_str()), (Some("plan"), "answer"));
+        let (r, c) = split(mode, false, "<think>x</think>y");
+        assert_eq!((r, c.as_str()), (None, "<think>x</think>y"));
     }
 }

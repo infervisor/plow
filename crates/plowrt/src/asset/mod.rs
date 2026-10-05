@@ -25,6 +25,7 @@ mod bucket;
 // The prefetcher/slab helpers are GPU upload machinery; a cpu-only build binds directly.
 #[cfg_attr(not(any(feature = "cuda", feature = "hsa")), allow(dead_code))]
 pub mod checkpoint;
+pub mod serve;
 #[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu"))]
 pub use checkpoint::Checkpoint;
 pub mod devblob;
@@ -59,6 +60,8 @@ pub struct ModelBundle {
     chat_template: Option<Arc<crate::serve::template::ChatTemplate>>,
     /// What the CHECKPOINT says about sampling defaults and reasoning framing.
     serving: crate::serve::config::ServingConfig,
+    serve: Arc<serve::ServeInfo>,
+    reasoning: crate::serve::reasoning::ReasoningMode,
 }
 
 impl ModelBundle {
@@ -79,8 +82,21 @@ impl ModelBundle {
         // Load the model's tokenizer from `tokenizer.json` (byte fallback if
         // absent / feature off). Loaded once at startup, shared per request.
         let tokenizer = load_tokenizer(&dir);
-        let chat_template = crate::serve::template::ChatTemplate::load(&dir);
-        let serving = crate::serve::config::ServingConfig::load(&dir);
+        let serve = Arc::new(serve::resolve(&dir, &serve::checkpoint_dir(&dir))?);
+        let chat_template = if serve.from_packet {
+            serve.manifest.chat.as_ref().and_then(|c| {
+                let text = c.template.clone()?;
+                crate::serve::template::ChatTemplate::compile(
+                    text,
+                    c.source.clone().unwrap_or_else(|| "model.pkt serve.json".into()),
+                    c.bos_token.clone(),
+                    c.eos_token.clone(),
+                )
+            })
+        } else {
+            crate::serve::template::ChatTemplate::load(&dir)
+        };
+        let serving = crate::serve::config::ServingConfig::from_defaults(serve.manifest.sampling.as_ref());
         tracing::info!(
             temperature = serving.default_sampling.temperature,
             top_p = serving.default_sampling.top_p,
@@ -88,10 +104,16 @@ impl ModelBundle {
             "serving config resolved from the checkpoint"
         );
         match &chat_template {
-            Some(t) => tracing::info!(source = %t.source, "chat template loaded from the assets"),
-            None => tracing::info!(
+            Some(t) => tracing::info!(source = %t.source, from_packet = serve.from_packet, "chat template loaded"),
+            None if serve.from_packet => tracing::info!(
                 dir = %dir.display(),
-                "no chat_template.jinja in the assets — using the built-in prompt builders"
+                builtin = ?serve.manifest.chat.as_ref().and_then(|c| c.builtin.as_deref()),
+                "the packet carries no chat template"
+            ),
+            None => tracing::warn!(
+                dir = %dir.display(),
+                "legacy packet without serve.json and no chat template beside the weights — using \
+                 the built-in prompt builders"
             ),
         }
 
@@ -102,12 +124,23 @@ impl ModelBundle {
             tokenizer,
             chat_template,
             serving,
+            reasoning: crate::serve::reasoning::ReasoningMode::from_serve(&serve),
+            serve,
         })
     }
 
     /// The checkpoint's serving config (sampling defaults + reasoning framing).
     pub fn serving(&self) -> &crate::serve::config::ServingConfig {
         &self.serving
+    }
+
+    /// The serve manifest: the packet's `serve.json`, or a legacy packet's checkpoint reads.
+    pub fn serve(&self) -> &serve::ServeInfo {
+        &self.serve
+    }
+
+    pub fn reasoning(&self) -> crate::serve::reasoning::ReasoningMode {
+        self.reasoning
     }
 
     /// The model's advertised name (its API slug source).
