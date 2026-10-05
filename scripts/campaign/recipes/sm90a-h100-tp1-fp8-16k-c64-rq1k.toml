@@ -15,6 +15,10 @@
 # c32/c64/c128 +3.5/+3.3/+10.8%. With plowrt 1a4e4f76 (GLU-quant and NormResidual+RmsNorm light
 # routes), strict vs vLLM 0.28 BF16 KV (MATCHED, EQUIVALENT, FP32 gate kl_mean 0.112 vs 0.128):
 # 4K/128 c32/c128 0.91x/0.88x, 15K/128 0.94x/0.95x, agentic16k c32/c64/c128 0.71x/2.13x/1.60x.
+# 2026-10-05 prefill FP8 fast accumulation (K <= 8192), cached plain/GLU quant light routes, CUTLASS
+# B64 decode projections, always-shipped 8192 rung (plowrt 712e2dca, packet 6f36c31a): FP32 gate
+# PASS (kl_mean 0.097 vs vLLM 0.128); strict vs vLLM 0.28 BF16 KV (MATCHED, EQUIVALENT, REPS=2):
+# 4K/128 c32/c128 0.97x/0.97x, 15K/128 1.02x/1.03x, agentic16k c32/c64/c128 0.72x/2.25x/1.77x.
 schema = "plow.recipe.v1"
 namespace = "infervisor"
 name = "gemma-4-12b"
