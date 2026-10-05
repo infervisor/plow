@@ -110,7 +110,7 @@ bench)
       echo "===== $label tp$tp in=$inlen conc=$conc out=${OUTLEN:-128}"
       # The same client as the `vllm` reference server and plowbench.sh's pb_bench.
       env -u HIP_VISIBLE_DEVICES -u CUDA_VISIBLE_DEVICES HF_HUB_OFFLINE=1 \
-        VLLM_ROCM_LIB=/opt/rocm/core-7.14/lib \
+        VLLM_ROCM_LIB="${PB_VLLM_ROCM_LIB:-/opt/rocm/core-7.14/lib}" \
         "$WT/build-gemma31/vllm-python" -m vllm.entrypoints.cli.main bench serve \
         --backend openai-chat --endpoint /v1/chat/completions \
         --base-url "http://127.0.0.1:$port" --model "$m" --tokenizer "$RAW" \

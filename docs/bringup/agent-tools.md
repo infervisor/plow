@@ -134,9 +134,10 @@ the table and do not quote another renderer's numbers as final. The harness rend
 refuses anything incomplete:
 
 ```bash
-# both arms with llm_grid.sh (single-turn and/or --agentic); each writes <res>/provenance.json
-env ... KV_DTYPE=<plow KV dtype, named as vLLM names it> scripts/bench/llm_grid.sh plow <res>/plow [--agentic]
-env ... scripts/bench/llm_grid.sh vllm <res>/vllm [--agentic]
+# both arms with llm_grid.sh (single-turn, --agentic and/or --prod open loop with PROD_RATES);
+# each writes <res>/provenance.json
+env ... KV_DTYPE=<plow KV dtype, named as vLLM names it> scripts/bench/llm_grid.sh plow <res>/plow [--agentic|--prod]
+env ... scripts/bench/llm_grid.sh vllm <res>/vllm [--agentic|--prod]
 campaign.py gate <recipe> --assets <served assets> --out <gate> --only llm_fp32_ref   # same packet
 campaign.py report --baseline <res>/vllm --infervisor <res>/plow --gate <gate>/gates.json --out <dir> \
     [--cells g128,s128,a64.g]
@@ -177,6 +178,10 @@ Rules (enforced in `serving_comparison.py`, tested in `scripts/bench/test_servin
 * Values are means over repeats (at least 2, the recorded count, identical on both arms). The
   spread, (max - min) / mean, is a note under each table; a spread > 10% marks the value `*` and
   is listed as FLAGGED.
+* Open-loop (`--prod`, cells `q<1000*rate>.g`): the same 12 rows. Input/output pairs on a hash of
+  the whole plan config plus the SLO, Traffic lists each repeat's seed (both arms must replay the
+  same seeds), and any failed request refuses the cell. Goodput, SLO attainment, achieved
+  concurrency, P50s and cached fraction go in a supplementary note under the table, never as rows.
 * Exit 2 = refused, nothing written (missing data, provenance, gate, repeats, unpaired cells).
   Exit 1 = written but NOT MATCHED or NOT EQUIVALENT: not a valid final comparison. Exit 0 = valid.
 
