@@ -237,18 +237,16 @@ async fn chat_completions_with(
                 }
             }
             match tok.as_deref().map(|b| b.serve()) {
-                // A packet that carries serve.json is taken at its word: a built-in builder only
-                // when it names one, and no guessing from the vocabulary.
+                // A packet that names a built-in builder gets exactly it. One that carries neither
+                // a usable template nor a builder (checkpoints without a template, e.g. Kimi-K3)
+                // keeps the vocabulary-probed builders it was served with before serve.json.
                 Some(serve) if serve.from_packet => {
                     match serve.manifest.chat.as_ref().and_then(|c| c.builtin.as_deref()) {
                         Some(id) => builtin_chat_prompt(id, &req.messages).unwrap_or_else(|| {
                             no_template = Some(format!("unknown built-in chat format {id:?}"));
                             String::new()
                         }),
-                        None => {
-                            no_template = Some("this model's packet carries no chat template".into());
-                            String::new()
-                        }
+                        None => gpu_chat_prompt(tok.as_deref(), &req.messages),
                     }
                 }
                 _ => gpu_chat_prompt(tok.as_deref(), &req.messages),
