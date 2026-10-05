@@ -4675,6 +4675,16 @@ fn queue_pack_rows(rows: &[usize], chunk_cost: usize, bound: usize) -> usize {
     total
 }
 
+/// Whether a launch of `bucket` prefill rows trims its prefill so `decode_rows` riders fit, rather
+/// than running in the `spilled` bucket that holds both. A wide spill is a padded rung, not padded
+/// rows: 12B on H100 ran 1024 + riders in 1088 at 42.9 ms against 32.4 ms for 1024, and 4096 + 63
+/// in 4160 at 127.0 against 117.1 ms; the trimmed rows join the next launch. Below
+/// `pf_chunk_cost_rows()` a spill costs less than the tail launch a trim can leave.
+#[cfg(feature = "cuda")]
+fn trim_for_riders(bucket: usize, spilled: usize, decode_rows: usize) -> bool {
+    decode_rows > 0 && spilled > bucket && bucket >= pf_chunk_cost_rows()
+}
+
 /// Prompt rows one model may consume while holding its device turn, when there
 /// is no prefill object and the prompt is fed token by token. A bound on
 /// launches per turn rather than on a bucket's rows: ~256 decode-shaped
@@ -5160,9 +5170,11 @@ fn gpu_prefill_batched_pass(
             return tick_fault;
         }
         let avail: usize = candidates.iter().map(|c| c.span.n_rows as usize).sum();
-        if std::mem::take(&mut ride_open)
-            && !ride.ride(e.pf_pack_budget(avail.min(launch_cap)), feeds.len())
-        {
+        // `RideCost` keys both the decision and the launch it observes by the prefill bucket:
+        // keyed by the launch's own bucket, a riding launch that spills (4096 + 63 into 4160)
+        // records under a bucket the decision never asks about, and the rider cost is never learned.
+        let ride_key = e.pf_pack_budget(avail.min(launch_cap));
+        if std::mem::take(&mut ride_open) && !ride.ride(ride_key, feeds.len()) {
             unified = false;
             decode_rows = 0;
         }
@@ -5181,11 +5193,8 @@ fn gpu_prefill_batched_pass(
         let rows = avail.min(per_launch);
         let bucket = e.pf_pack_budget(rows);
         // Under the unified token batch the decode rows ride in this launch, and the batch takes the
-        // smallest bucket holding every row. When that spills past `bucket` by more than a launch
-        // costs (a 4224-row slice + 3 decode rows on the 8192 rung), trim the prefill to fit; a small
-        // spill (1024 + 1 into 1088) is cheaper than the tail launch a trim would leave.
-        let trim = decode_rows > 0
-            && e.pf_pack_budget(rows.min(bucket) + decode_rows) > bucket + pf_chunk_cost_rows();
+        // smallest bucket holding every row.
+        let trim = trim_for_riders(bucket, e.pf_pack_budget(rows.min(bucket) + decode_rows), decode_rows);
         let per_launch = if trim {
             bucket.saturating_sub(decode_rows).max(1)
         } else {
@@ -5228,7 +5237,6 @@ fn gpu_prefill_batched_pass(
             );
         }
         let riders = if unified { feeds.len() } else { 0 };
-        let launch_bucket = e.pf_pack_budget(pack.iter().map(|p| p.2).sum::<usize>() + riders);
         let t_launch = Instant::now();
         let res = if unified {
             use plow_asset::token_batch::{Phase, Request, Selection};
@@ -5327,7 +5335,7 @@ fn gpu_prefill_batched_pass(
                 })
         };
         if res.is_ok() {
-            ride.observe_launch(launch_bucket, riders, t_launch.elapsed().as_secs_f64() * 1e3);
+            ride.observe_launch(ride_key, riders, t_launch.elapsed().as_secs_f64() * 1e3);
         }
         match res {
             Ok(()) => {
@@ -6536,6 +6544,17 @@ mod tests {
         assert_eq!(super::co_sched_prefill_rows(8192, 512), 512);
         // Never zero: the caller uses this as a chunk width.
         assert_eq!(super::co_sched_prefill_rows(0, 0), 1);
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn riders_trim_wide_launches_that_spill_a_rung() {
+        assert!(super::trim_for_riders(4096, 4160, 63));
+        assert!(super::trim_for_riders(1024, 1088, 1));
+        assert!(super::trim_for_riders(4224, 8192, 3));
+        assert!(!super::trim_for_riders(4096, 4096, 63), "riders fit the bucket");
+        assert!(!super::trim_for_riders(4096, 4160, 0));
+        assert!(!super::trim_for_riders(128, 256, 63), "a narrow spill beats a tail launch");
     }
 
     #[cfg(feature = "cuda")]
