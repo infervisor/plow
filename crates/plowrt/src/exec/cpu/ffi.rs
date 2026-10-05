@@ -51,7 +51,9 @@ pub struct PlowCpuCtx {
     pub node: u32,
     /// Active tier for this thread; written by [`thread_init`].
     pub isa: u32,
-    pub reserved: [u64; 5],
+    /// Bytes at the head of `scratch` held in this core's pseudo-locked L2; 0 = none.
+    pub sram_bytes: u64,
+    pub reserved: [u64; 4],
 }
 
 impl PlowCpuCtx {
@@ -64,7 +66,8 @@ impl PlowCpuCtx {
             worker,
             node,
             isa: 0,
-            reserved: [0; 5],
+            sram_bytes: 0,
+            reserved: [0; 4],
         }
     }
 }

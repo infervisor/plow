@@ -632,6 +632,7 @@ pub const RUNTIME: &[KnobSpec] = &[
     KnobSpec::new("rt.gq_opt_in", Some("PLOW_CPU_GQ"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("rt.l2_place", Some("PLOW_CPU_L2_PLACE"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("rt.sram", Some("PLOW_CPU_SRAM"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
+    KnobSpec::new("rt.weight_affine", Some("PLOW_CPU_WEIGHT_AFFINE"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("rt.backend", Some("PLOW_BACKEND"), Layer::Runtime, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("rt.serial", Some("PLOW_METAL_SERIAL"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("rt.spin_max", Some("PLOW_METAL_SPIN_MAX"), Layer::Runtime, U32, UNSET, OPT_IN),

@@ -49,7 +49,10 @@ typedef struct {
     uint32_t worker;    /* worker index in the pool */
     uint32_t node;      /* NUMA node the worker is pinned to */
     uint32_t isa;       /* active tier for this thread (== plow_cpu_isa()) */
-    uint64_t reserved[5];
+    /* Bytes at the head of `scratch` held in this core's pseudo-locked L2 (plowrt PLOW_CPU_SRAM,
+     * runtime/cpu/driver); 0 = none. Kernels size their L2 working set to it. */
+    uint64_t sram_bytes;
+    uint64_t reserved[4];
 } PlowCpuCtx;
 
 /* Kernel entry. `tensors[h]` is the host base pointer for handle h; an absent operand

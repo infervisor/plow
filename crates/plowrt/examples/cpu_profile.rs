@@ -86,6 +86,33 @@ fn main() {
             "{:<28} {:>7} {:>10} {:>10} {:>9}",
             "op", "packets", "busy ms", "busy/thr", "span ms"
         );
+        // PROF_TOP=n: the n instructions with the most busy time (index, op, packets, busy, max packet).
+        if let Some(n) = std::env::var("PROF_TOP").ok().and_then(|v| v.parse::<usize>().ok()) {
+            let mut per_inst: BTreeMap<u32, (usize, u64, u64, u64, u64)> = BTreeMap::new();
+            for e in evs {
+                let d = e.t1_ns - e.t0_ns;
+                let ent = per_inst.entry(e.inst).or_insert((0, 0, 0, u64::MAX, 0));
+                ent.0 += 1;
+                ent.1 += d;
+                ent.2 = ent.2.max(d);
+                ent.3 = ent.3.min(e.t0_ns);
+                ent.4 = ent.4.max(e.t1_ns);
+            }
+            let mut top: Vec<_> = per_inst.iter().collect();
+            top.sort_by(|a, b| b.1 .1.cmp(&a.1 .1));
+            let t_first = evs.iter().map(|e| e.t0_ns).min().unwrap_or(0);
+            for (i, (cnt, busy, mx, a, z)) in top.into_iter().take(n) {
+                let op = insts[*i as usize].op;
+                println!(
+                    "  #{i:<5} {:<26} {cnt:>4} pk  busy {:>9.2} ms  max pk {:>7.3} ms  window {:>8.2}..{:>8.2} ms",
+                    DevOp::from_u16(op).map(|o| o.c_name()).unwrap_or("?"),
+                    *busy as f64 / 1e6,
+                    *mx as f64 / 1e6,
+                    (*a - t_first) as f64 / 1e6,
+                    (*z - t_first) as f64 / 1e6
+                );
+            }
+        }
         let mut rows: Vec<_> = per_op.iter().collect();
         rows.sort_by(|a, b| b.1 .1.cmp(&a.1 .1));
         for (op, (n, busy, t0, t1)) in rows {
@@ -115,8 +142,17 @@ fn main() {
         let _ = eng.prefill(&ids).expect("prefill");
         let wall = t.elapsed().as_secs_f64() * 1e3;
         let evs = trace_take();
-        // Prefill may span several programs (chunks); attribute by the first prefill program.
-        let insts = eng.model().prefill_progs()[0].insts.clone();
+        // Attribute by the bucket a whole-prompt prefill runs: the narrowest covering the prompt,
+        // else the widest (chunked). Instruction indices differ per bucket, so any other program
+        // mislabels every event.
+        let progs = eng.model().prefill_progs();
+        let p = progs
+            .iter()
+            .filter(|p| p.t as usize >= ids.len())
+            .min_by_key(|p| p.t)
+            .or_else(|| progs.iter().max_by_key(|p| p.t))
+            .expect("prefill program");
+        let insts = p.insts.clone();
         report("prefill", &evs, &insts, wall, eng.threads);
     }
     let first = eng.prefill(&ids).expect("prefill");

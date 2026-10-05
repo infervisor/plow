@@ -4,7 +4,13 @@
  * compared element-wise to the golden kernel (1e-2 relative + 1e-2 absolute, fp32 accumulate
  * with one bf16 round on both sides). `--bench`: single-thread GEMM GFLOPS. Exits 0 with a
  * message when the host has no AMX. */
+#define _GNU_SOURCE
+#include <fcntl.h>
 #include <math.h>
+#include <sched.h>
+#include <stdint.h>
+#include <sys/ioctl.h>
+#include <unistd.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -528,6 +534,23 @@ static void test_gemm_mx4_amx(uint16_t op, uint32_t M, uint32_t N, uint32_t K, i
     free(A); free(W); free(Wu); free(S); free(Su); free(b); free(C); free(R);
 }
 
+/* --bench with SRAM_LOCK=<bytes>: hold the scratch head in this core's L2 through /dev/pseudo_lock
+ * (runtime/cpu/driver), as plowrt's PLOW_CPU_SRAM does for every worker. */
+struct pl_lock_req { uint64_t addr, len; int32_t cpu; uint32_t level, id, pad; };
+#define PL_IOC_LOCK _IOWR('P', 11, struct pl_lock_req)
+static void sram_lock_scratch(PlowCpuCtx* ctx) {
+    const char* e = getenv("SRAM_LOCK");
+    if (!e) return;
+    const int fd = open("/dev/pseudo_lock", O_RDWR);
+    struct pl_lock_req r = { (uintptr_t)ctx->scratch, (uint64_t)atoll(e) & ~4095ull, sched_getcpu(), 2, 0, 0 };
+    if (fd < 0 || ioctl(fd, PL_IOC_LOCK, &r)) {
+        perror("SRAM_LOCK");
+        return;
+    }
+    ctx->sram_bytes = r.len;
+    printf("scratch head %llu B pseudo-locked in cpu %d's L2 (region %u)\n", (unsigned long long)r.len, r.cpu, r.id);
+}
+
 int main(int argc, char** argv) {
     const int tier = plow_cpu_init(PLOW_CPU_ISA_AMX);
     if (tier < PLOW_CPU_ISA_AMX) {
@@ -537,10 +560,11 @@ int main(int argc, char** argv) {
     PlowCpuCtx ctx;
     memset(&ctx, 0, sizeof ctx);
     ctx.scratch_bytes = plow_cpu_scratch_bytes();
-    ctx.scratch = aligned_alloc(64, ctx.scratch_bytes);
+    ctx.scratch = aligned_alloc(4096, ctx.scratch_bytes);
     memset(ctx.scratch, 0, ctx.scratch_bytes);
     CHECK(plow_cpu_thread_init(&ctx) == 0, "thread init");
     if (argc > 1 && strcmp(argv[1], "--bench") == 0) {
+        sram_lock_scratch(&ctx);
         bench(&ctx);
         return 0;
     }
@@ -591,10 +615,17 @@ int main(int argc, char** argv) {
     test_gemv_amx(8, 1000, 3840, 1, &ctx);   /* ragged slices: 16- and tail-row groups */
     test_gemv_amx(5, 37, 1024, 1, &ctx);     /* all-tail slices */
     test_gemv_amx(16, 256, 2048, 0, &ctx);
+    test_gemv_amx(32, 1000, 3840, 1, &ctx);  /* two B tiles */
+    test_gemv_amx(17, 37, 1024, 0, &ctx);    /* second B tile of one column, all-tail rows */
+    test_gemv_amx(24, 512, 1536, 1, &ctx);
     test_gemv_glu_amx(8, 500, 3840, 0, &ctx);
     test_gemv_glu_amx(6, 100, 1024, 1, &ctx);
+    test_gemv_glu_amx(32, 500, 3840, 0, &ctx);
+    test_gemv_glu_amx(19, 100, 1024, 1, &ctx);
     test_gemv_qkv_amx(8, 512, 128, 128, 3840, &ctx);
     test_gemv_qkv_amx(4, 100, 60, 60, 1024, &ctx);
+    test_gemv_qkv_amx(32, 512, 128, 128, 3840, &ctx);
+    test_gemv_qkv_amx(21, 100, 60, 60, 1024, &ctx);
     test_gemv_fp8_amx(8, 500, 3840, &ctx);
     test_gemv_fp8_amx(5, 37, 1024, &ctx);
     test_gemv_glu_fp8_amx(8, 300, 3840, 0, &ctx);

@@ -176,7 +176,7 @@ def record(a):
         if a.llama_image:
             r = subprocess.run(["sudo", "-n", "docker", "run", "--rm", "--entrypoint", "/app/llama-server",
                                 a.llama_image, "--version"], capture_output=True, text=True)
-            m = re.search(r"version: (\S+ \(\S+\))", r.stdout + r.stderr)
+            m = re.search(r"version: (.+)", r.stdout + r.stderr)
             version = m[1] if m else None
         gguf = Path(a.gguf) if a.gguf else None
         prov.update(stack_version=version, gguf=str(gguf) if gguf else None,

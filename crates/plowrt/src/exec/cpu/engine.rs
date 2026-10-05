@@ -123,7 +123,93 @@ pub struct HostTensor {
 unsafe impl Send for HostTensor {}
 unsafe impl Sync for HostTensor {}
 
+/// Per weight tensor, the `(byte offset, length, node)` ranges the decode program's GEMV slices
+/// stream: slice `s` of an op owns rows `g_range(N, s, blocks)` (runtime/cpu/dev/golden/golden.h)
+/// and runs on cu `c`, whose executor sits on `nodes[c % nodes.len()]` (`workers::cu_map`
+/// without a locality plan). Taken from the narrowest decode rung; the others slice identically.
+fn weight_affinity(
+    blob: &DevBlob,
+    nodes: &[u32],
+) -> rustc_hash::FxHashMap<usize, Vec<(usize, usize, u32)>> {
+    use packet::dev::DevOp;
+    let mut map: rustc_hash::FxHashMap<usize, Vec<(usize, usize, u32)>> = Default::default();
+    let pt: Vec<u32> = blob.progs.iter().map(|p| p.t).collect();
+    let Some(p) = blob.progs.get(packet::devbuild::decode_rung_lo(&pt)) else {
+        return map;
+    };
+    let g_range = |n: u32, slice: u32, nblk: u32| {
+        let per = n.div_ceil(nblk.max(1));
+        ((slice * per).min(n), (slice * per + per).min(n))
+    };
+    for cu in 0..(blob.n_cu as usize).min(p.stream_ofs.len()) {
+        let node = nodes[cu % nodes.len()];
+        let (o, l) = (p.stream_ofs[cu] as usize, p.stream_len[cu] as usize);
+        for e in &p.stream[o..o + l] {
+            let d = &p.insts[e.inst as usize];
+            let mut add = |t: u16, row: usize, a: u32, b: u32| {
+                if b > a && t != packet::dev::TENSOR_NONE16 {
+                    map.entry(t as usize).or_default().push((a as usize * row, (b - a) as usize * row, node));
+                }
+            };
+            match DevOp::from_u16(d.op) {
+                Some(DevOp::Gemv) if d.i[3] == 0 => {
+                    let (a, b) = g_range(d.i[1], e.slice, d.blocks as u32);
+                    add(d.t[2], d.i[2] as usize * 2, a, b);
+                }
+                Some(DevOp::GemvGlu) => {
+                    let (a, b) = g_range(d.i[1], e.slice, d.blocks as u32);
+                    add(d.t[2], d.i[2] as usize * 2, a, b);
+                    add(d.t[5], d.i[2] as usize * 2, a, b);
+                }
+                Some(DevOp::GemvQkv) => {
+                    let (nq, k, nk, nv) = (d.i[1], d.i[2] as usize * 2, d.i[3], d.i[4]);
+                    let (a, b) = g_range(nq + nk + nv, e.slice, d.blocks as u32);
+                    let mut s0 = 0u32;
+                    for (t, n) in [(d.t[2], nq), (d.t[4], nk), (d.t[6], nv)] {
+                        let (lo, hi) = (a.max(s0), b.min(s0 + n));
+                        if lo < hi {
+                            add(t, k, lo - s0, hi - s0);
+                        }
+                        s0 += n;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    map
+}
+
 impl HostTensor {
+    /// Re-bind whole pages of `[off, off + len)` to `node` before the first touch (a fresh
+    /// mapping from `alloc_on_nodes`); boundary pages keep the tensor's policy. Returns bytes bound.
+    fn bind_ranges(&self, ranges: &[(usize, usize, u32)]) -> usize {
+        let mut bound = 0usize;
+        #[cfg(target_os = "linux")]
+        for &(off, len, node) in ranges {
+            let start = (self.ptr as usize + off).next_multiple_of(4096);
+            let end = (self.ptr as usize + (off + len).min(self.bytes)) & !4095;
+            if end <= start || self.layout.align() != HUGE {
+                continue;
+            }
+            let mut mask = [0u64; 4];
+            mask[node as usize / 64] |= 1 << (node % 64);
+            // SAFETY: a sub-range of our own mapping; only placement policy changes.
+            let rc = unsafe {
+                libc::syscall(libc::SYS_mbind, start, end - start, libc::MPOL_BIND, mask.as_ptr(), 257usize, 0u32)
+            };
+            if rc == 0 {
+                bound += end - start;
+            }
+        }
+        bound
+    }
+
+    #[cfg(test)]
+    fn alloc(bytes: usize, zeroed: bool) -> Result<HostTensor> {
+        Self::alloc_on_nodes(bytes, zeroed, &[], false)
+    }
+
     fn alloc_on_nodes(
         bytes: usize,
         zeroed: bool,
@@ -772,6 +858,14 @@ impl CpuModel {
         } else {
             nodes.to_vec()
         };
+        // PLOW_CPU_WEIGHT_AFFINE: bind each decode GEMV slice's weight rows to the node of the
+        // executor that streams them, instead of page-interleaving (2/3 remote on 3 nodes).
+        let affine = if crate::config::RuntimeConfig::get().cpu.weight_affine && nodes.len() > 1 {
+            weight_affinity(&blob, nodes)
+        } else {
+            rustc_hash::FxHashMap::default()
+        };
+        let mut affine_bytes = 0usize;
         let mut l3_left: Vec<usize> =
             vec![sram.map_or(0, |d| d.caps.l3_lock_bytes_per_node as usize); lock_nodes.len()];
         let mut l3_rr = 0usize;
@@ -838,7 +932,13 @@ impl CpuModel {
                         l3_locks.push((h, lock_nodes[k], lock_len));
                         HostTensor::alloc_on_nodes(bytes, false, &lock_nodes[k..k + 1], false)?
                     }
-                    None => HostTensor::alloc_on_nodes(bytes, false, nodes, strict)?,
+                    None => {
+                        let t = HostTensor::alloc_on_nodes(bytes, false, nodes, strict)?;
+                        if let Some(ranges) = affine.get(&h) {
+                            affine_bytes += t.bind_ranges(ranges);
+                        }
+                        t
+                    }
                 };
                 // SAFETY: fresh allocation of `bytes`, no other reference yet.
                 unsafe { std::slice::from_raw_parts_mut(t.as_ptr(), t.bytes).copy_from_slice(src) };
@@ -943,6 +1043,13 @@ impl CpuModel {
                 locked_mib = locked >> 20,
                 held = format_args!("{:.3}", held / locked.max(1) as f64),
                 "cpu: decode weights pseudo-locked in L3"
+            );
+        }
+        if !affine.is_empty() {
+            tracing::info!(
+                tensors = affine.len(),
+                bound_gib = format_args!("{:.2}", affine_bytes as f64 / (1u64 << 30) as f64),
+                "cpu: decode weights bound to their executors' nodes"
             );
         }
         let table = Arc::new(TensorTable::new(
@@ -1231,6 +1338,7 @@ impl KernelExec {
         for w in 0..workers {
             let (cpu, node) = worker_cpu(w);
             let scratch = HostTensor::alloc_on_nodes(scratch_bytes, false, &[node], false)?;
+            let mut sram_bytes = 0u64;
             if let Some(dev) = sram {
                 let len = (dev.caps.l2_lock_bytes_per_core as usize).min(scratch_bytes) & !4095;
                 // SAFETY: the scratch mapping lives in `WorkerSlot` until the engine drops,
@@ -1239,11 +1347,13 @@ impl KernelExec {
                     Ok(m) => {
                         locked += len;
                         held += m.held(2);
+                        sram_bytes = len as u64;
                     }
                     Err(e) => tracing::warn!(worker = w, cpu, error = %e, "cpu: L2 pseudo-lock failed"),
                 }
             }
             let mut ctx = PlowCpuCtx::new(w as u32, node);
+            ctx.sram_bytes = sram_bytes;
             ctx.scratch = scratch.as_ptr() as *mut c_void;
             ctx.scratch_bytes = scratch_bytes as u32;
             slots.push(WorkerSlot {

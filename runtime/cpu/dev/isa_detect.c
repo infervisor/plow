@@ -155,6 +155,12 @@ int plow_cpu_thread_init(PlowCpuCtx* ctx) {
     if (g_isa < 0) return -EAGAIN;
     ctx->isa = (uint32_t)g_isa;
 #if PLOW_X86
+    /* FTZ + DAZ (MXCSR bits 15 and 6). bf16 shares the fp32 exponent range, so tiny activations
+     * widen to fp32 denormals and every AVX-512 op on them takes a microcode assist: Gemma-4-31B
+     * prefill spent ~900 of 1576 busy ms per worker in RMSNORM / NORM_RESIDUAL / HEADNORM_ROPE /
+     * FLASH_MERGE, and a 1024 x 5376 RMSNORM on denormal-laden rows measured 38 ms vs 0.95 ms
+     * flushed. Values below 2^-126 carry nothing a bf16 result can hold. */
+    __builtin_ia32_ldmxcsr(__builtin_ia32_stmxcsr() | 0x8040u);
     if (g_isa >= PLOW_CPU_ISA_AMX) return plow_cpu_thread_init_amx(ctx);
 #endif
     return 0;

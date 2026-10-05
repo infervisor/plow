@@ -733,6 +733,11 @@ pub struct CpuRuntimeConfig {
     /// `/dev/pseudo_lock` (runtime/cpu/driver). Inert when the driver is not loaded.
     #[arg(long = "cpu-sram", env = "PLOW_CPU_SRAM", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub sram: bool,
+
+    /// Bind each decode GEMV slice's weight rows to the NUMA node of the executor that streams
+    /// them (instead of page-interleaving every weight across the nodes).
+    #[arg(long = "cpu-weight-affine", env = "PLOW_CPU_WEIGHT_AFFINE", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub weight_affine: bool,
 }
 
 /// NVIDIA / sm_120 runtime knobs.
