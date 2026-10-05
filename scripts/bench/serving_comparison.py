@@ -181,7 +181,7 @@ def record(a):
         gguf = Path(a.gguf) if a.gguf else None
         prov.update(stack_version=version, gguf=str(gguf) if gguf else None,
                     gguf_sha256=sha256(gguf) if gguf and gguf.is_file() else None,
-                    stack=(f"llama.cpp {version} ({gguf.name if gguf else '?'}; "
+                    stack=(f"llama.cpp {version} [{a.llama_image}] ({gguf.name if gguf else '?'}; "
                            f"{a.server_args.strip() or 'default flags'})") if version else None)
     else:
         if os.environ.get("PLOWRT_GIT_SHA"):

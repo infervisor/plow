@@ -206,13 +206,21 @@ if [ "${3:-}" = --agentic ] || [ "${3:-}" = --prod ]; then
     exit 0
 fi
 # Distinct seed per (kind, conc, isl, osl, repeat): no cell's prompts are a prefix of another's.
+# A cell with any failed request is re-run with the same seed, up to CELL_RETRIES (2) more times, on
+# every side alike; the recorded result is the first clean attempt and cells.log names each retry.
 cell() { # tag kind conc np isl osl rep [client args...]
     local tag=$1 kind=$2 c=$3 np=$4 isl=$5 osl=$6 rep=$7; shift 7
-    memory_start "$tag"
-    PB_SEED=$(( 8193 + kind * 1000003 + c * 131 + isl * 7 + osl + rep * 7919 )) \
-        pb_cell "$RES" "$tag" "$MODEL" "$c" "$np" "$isl" "$osl" "$@"
-    memory_finish "$tag"
-    local f; f=$(pb_result "$RES" "$tag") && python3 - "$f" "$tag" <<'EOF'
+    local attempt f
+    for attempt in $(seq 0 "${CELL_RETRIES:-2}"); do
+        memory_start "$tag"
+        PB_SEED=$(( 8193 + kind * 1000003 + c * 131 + isl * 7 + osl + rep * 7919 )) \
+            pb_cell "$RES" "$tag" "$MODEL" "$c" "$np" "$isl" "$osl" "$@"
+        memory_finish "$tag"
+        f=$(pb_result "$RES" "$tag") || break
+        python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); sys.exit(d["completed"] != d["num_prompts"])' "$f" && break
+        echo "CELL_RETRY $tag attempt $((attempt + 1)): $(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d["completed"], "/", d["num_prompts"])' "$f")" >> "$RES/cells.log"
+    done
+    f=$(pb_result "$RES" "$tag") && python3 - "$f" "$tag" <<'EOF'
 import json, sys
 d = json.load(open(sys.argv[1]))
 print(f"{sys.argv[2]:12s} ttft p50 {d['median_ttft_ms']:8.1f}  tpot p50 {d['median_tpot_ms']:6.2f}  "
