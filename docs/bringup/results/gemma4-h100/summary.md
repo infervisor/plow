@@ -7,7 +7,7 @@ rows marked "grid" come from `llm_grid.sh` or earlier same-client grids and are 
 | Model | Precision | Recipe | plowrt | Gate | vs baseline | Qualified |
 |---|---|---|---|---|---|---|
 | E4B | BF16 | [`recipes/infervisor/gemma-4-e4b/sm90a-h100-tp1.toml`](../../../../recipes/infervisor/gemma-4-e4b/sm90a-h100-tp1.toml) | main `fc0271e8` (repro) | `llm_logit_parity` PASS | grid only | no strict report |
-| 12B | FP8 W8A8, FP8 per-token-head KV | [`recipes/infervisor/gemma-4-12b/sm90a-h100-tp1.toml`](../../../../recipes/infervisor/gemma-4-12b/sm90a-h100-tp1.toml) | `66e90a4b` | `llm_fp32_ref` PASS | strict, 10 cells | **yes**, vs vLLM 0.28 FP8 KV |
+| 12B | FP8 W8A8, FP8 per-token-head KV | [`recipes/infervisor/gemma-4-12b/sm90a-h100-tp1.toml`](../../../../recipes/infervisor/gemma-4-12b/sm90a-h100-tp1.toml) | `ee57f7b7` | `llm_fp32_ref` PASS | strict, 10 cells | **yes**, vs vLLM 0.28 FP8 KV |
 | 12B, 26B-A4B | BF16 | `scripts/campaign/recipes/gemma4-{12b,26b-a4b}.h100.bf16-*.toml` | | | ledgers only | no |
 | 31B | BF16 / FP8 | frozen release, no recipe | `3ca64e9` / `25fb3d7` | functional | none on H100 | no |
 
@@ -47,17 +47,20 @@ Campaign comparison with the qualified wins, strict tables and FP32 gate:
 [gemma12b-fp8-20260930/comparison.md](../gemma12b-fp8-20260930/comparison.md). Every matched row:
 [comparison.csv](../gemma12b-fp8-20260930/comparison.csv).
 
-- Qualified: plowrt `66e90a4b`, packet `c47fc3f20569`, recipe
+- Qualified: plowrt `ee57f7b7`, packet `5fbe627c02af` (gemma12b-next `6a21c8c3`), recipe
   `recipes/infervisor/gemma-4-12b/sm90a-h100-tp1.toml` (production). Baseline vLLM 0.28.0 TRITON_ATTN with matched `fp8_per_token_head` KV,
   prefix caching on both, one H100, 2 repeats.
-- Gate: `llm_fp32_ref` PASS for that packet, KL mean 0.1076 vs vLLM 0.1277.
-- Total-throughput ratio (strict): 4K/128 1.38x / 1.37x (c32 / c128); 15K/128 1.79x / 1.74x;
-  agentic16k 1.25x / 1.09x / 2.41x (c32 / c64 / c128; c128 FLAGGED, 60% spread). Open-loop
-  production mix at 0.628 / 0.771 / 0.987 sessions/s: 1.07x / 1.16x / 1.39x total throughput,
-  goodput 1.06x / 1.54x / 3.36x. TTFT/TPOT P99 ratios are in the comparison.
-- Not a win against vLLM's fastest config: BF16 KV on FLASH_ATTN beats both plow arms (matched
-  BF16-KV arm 0.76x / 0.72x at 4K, 0.78x at 15K, 0.23x-0.67x agentic).
-- Evidence: `/opt/dlami/nvme/lava-tts/final2/` (closed loop), `/opt/dlami/nvme/lava-tts/prodbench/`
+- Gate: `llm_fp32_ref` PASS for that packet, KL mean 0.1048 vs vLLM 0.1277.
+- Total-throughput ratio (strict): 4K/128 1.38x / 1.37x (c32 / c128); 15K/128 1.79x / 1.75x;
+  agentic16k 1.40x / 1.31x / 4.02x (c32 / c64 / c128). Open-loop production mix at
+  0.628 / 0.771 / 0.987 sessions/s: 1.08x / 1.18x / 1.50x total throughput, goodput
+  1.08x / 1.57x / 4.57x (open-loop P99 latencies FLAGGED, direction only). TTFT/TPOT P99 ratios
+  are in the comparison.
+- Not a win against vLLM's fastest config everywhere: vs vLLM BF16 KV, the matched BF16-KV plow
+  packet `af6ee1c20678` (gate PASS, KL 0.0821) is 0.83x / 0.79x at 4K, 0.86x / 0.86x at 15K and
+  0.68x / 2.01x / 1.39x on agentic16k (c32 / c64 / c128).
+- Evidence: `/opt/dlami/nvme/lava-tts/final3/` (plow arms, gates, reports), vLLM arms in
+  `/opt/dlami/nvme/lava-tts/final2/` (closed loop) and `/opt/dlami/nvme/lava-tts/prodbench/`
   (open loop), `/opt/dlami/nvme/lava-tts/fp32gate/` (gate calibration).
 
 Reproduction on main `fc0271e8` (2026-10-03; packet `31a1f44b` built clean from main through

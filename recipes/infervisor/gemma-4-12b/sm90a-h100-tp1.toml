@@ -4,9 +4,10 @@
 #   PLOW_CAMPAIGN_NO_NIX=1 (box without nix only) \
 #   python3 scripts/campaign/campaign.py build recipes/infervisor/gemma-4-12b/sm90a-h100-tp1.toml --out <fresh dir>
 #
-# Qualified (2026-10-04, plowrt 66e90a4b, packet c47fc3f20569): campaign.py report MATCHED + EQUIVALENT
+# Qualified (2026-10-05, plowrt ee57f7b7, packet 5fbe627c02af): campaign.py report MATCHED + EQUIVALENT
 # vs vLLM 0.28 fp8_per_token_head KV on every 4K/15K/agentic16k/open-loop cell; FP32-reference gate
-# PASS, KL mean 0.108 vs vLLM 0.128. docs/bringup/results/gemma12b-fp8-20260930/comparison.md.
+# PASS, KL mean 0.105 vs vLLM 0.128. docs/bringup/results/gemma12b-fp8-20260930/comparison.md.
+# plow_git rebuild (packet ab1c1d583f8d) changes only the hd512 FP8-KV attention object; gate PASS.
 # vLLM with BF16 KV (FLASH_ATTN) is still faster than this packet: same doc, Caveats.
 #
 # Routes (per-rung evidence: docs/runtime/kernel-generators.md "Gemma-4 12B FP8 per-rung routes"):
@@ -27,7 +28,7 @@ namespace = "infervisor"
 name = "gemma-4-12b"
 label = "sm90a-h100-tp1"
 status = "validated"
-plow_git = "66e90a4b3a3a847838771a6a0dcb3b5e05923e0d"
+plow_git = "e93e0a640b731f1262fca8687995c5d9109953ec"
 network = "gemma4"
 
 [target]
