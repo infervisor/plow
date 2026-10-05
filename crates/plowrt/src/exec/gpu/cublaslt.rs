@@ -469,7 +469,7 @@ pub(super) fn light_segments(
         .filter(|&seg| library.get(seg).copied().flatten().is_none())
         .filter_map(|seg| {
             let entries = &g.gq_stream[g.gq_seg_ofs[seg] as usize..g.gq_seg_ofs[seg + 1] as usize];
-            if g.t == 128 && functions.direct && functions.norm_quant.is_some() {
+            if functions.direct && functions.norm_quant.is_some() {
                 if let Some((n, q)) = norm_quant_pair(g, entries) {
                     return Some((seg, vec![(n, 1), (q, 1)]));
                 }
