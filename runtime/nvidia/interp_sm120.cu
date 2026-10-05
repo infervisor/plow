@@ -4507,9 +4507,38 @@ extern "C" __global__ void __launch_bounds__(256, 2) PLOW_SYM(plow_glu_quant_cac
                             (float*)t[in->t[2]], (const __nv_bfloat16*)t[in->t[3]],
                             (const __nv_bfloat16*)t[in->t[4]], in->i[0], blockIdx.x, gridDim.x, part);
 }
+/* The same rows without the bf16 GLU store, for an instruction whose output tensor nothing reads. */
+extern "C" __device__ unsigned PLOW_SYM(plow_glu_quant_cache_q_abi) = 1;
+extern "C" __global__ void __launch_bounds__(256, 2) PLOW_SYM(plow_glu_quant_cached_q)(PlowProgram prog,
+                                                                                   unsigned inst) {
+    __shared__ float part[8];
+    const PlowDevInst* in = prog.insts + inst;
+    void* const* t = prog.tensors;
+    d_glu_quant_fp8_cached<false>(nullptr, (uint8_t*)t[in->t[0]], (float*)t[in->t[2]],
+                                  (const __nv_bfloat16*)t[in->t[3]], (const __nv_bfloat16*)t[in->t[4]],
+                                  in->i[0], blockIdx.x, gridDim.x, part);
+}
 #endif
 #if PLOW_NV_PREFILL && PLOW_NV_SEGMENTS && PLOW_NV_GEMMA && PLOW_NV_THREADS == 256 && !PLOW_NV_GEMM_ONLY && \
     !PLOW_NV_FA_ONLY
+/* A plain QuantFp8 (no GLU) of a 4096- or 8192-wide row per CTA (any grid). */
+#if PLOW_NV_W8A8
+extern "C" __device__ unsigned PLOW_SYM(plow_quant_cached_abi) = 1;
+extern "C" __global__ void __launch_bounds__(256, 2) PLOW_SYM(plow_quant_cached)(PlowProgram prog,
+                                                                             unsigned inst) {
+    __shared__ float part[8];
+    const PlowDevInst* in = prog.insts + inst;
+    void* const* t = prog.tensors;
+    if (in->i[1] == 8192u)
+        d_quant_fp8_cached<8192>((uint8_t*)t[in->t[0]], (float*)t[in->t[2]],
+                                 (const __nv_bfloat16*)t[in->t[1]], in->i[0], blockIdx.x, gridDim.x, part);
+    else if (in->i[1] == 4096u)
+        d_quant_fp8_cached<4096>((uint8_t*)t[in->t[0]], (float*)t[in->t[2]],
+                                 (const __nv_bfloat16*)t[in->t[1]], in->i[0], blockIdx.x, gridDim.x, part);
+    else
+        __trap();
+}
+#endif
 /* A prefill NormResidual and the RmsNorm reading its output (instruction inst + 1) as one launch
  * of any grid: both bodies take rows {blockIdx.x + k * gridDim.x}, so the block that wrote a row
  * normalizes it, and each row's arithmetic is the interpreter's. The interpreter runs them on its

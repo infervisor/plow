@@ -626,6 +626,35 @@ pub(super) fn prefill_glu_quant_segments(g: &DevProg) -> Vec<(usize, Vec<usize>)
         .collect()
 }
 
+/// Segments that are exactly one plain (no GLU) QuantFp8 over a 4096- or 8192-wide row, all
+/// slices: `plow_quant_cached` runs it one row per CTA.
+pub(super) fn prefill_plain_quant_segments(g: &DevProg) -> Vec<(usize, Vec<usize>)> {
+    let none = packet::dev::TENSOR_NONE16;
+    g.gq_seg_ofs
+        .windows(2)
+        .enumerate()
+        .filter_map(|(seg, w)| {
+            let entries = g.gq_stream.get(w[0] as usize..w[1] as usize)?;
+            let inst = entries.first()?.inst as usize;
+            let d = g.insts.get(inst)?;
+            let matches = d.op == DevOp::QuantFp8 as u16
+                && d.i[0] >= 32
+                && matches!(d.i[1], 4096 | 8192)
+                && d.i[2] == 0
+                && d.t[..3].iter().all(|&t| t != none)
+                && d.t[3] == none
+                && d.t[4] == none
+                && d.blocks != 0
+                && entries.len() == usize::from(d.blocks)
+                && entries
+                    .iter()
+                    .enumerate()
+                    .all(|(slice, e)| e.inst as usize == inst && e.slice as usize == slice);
+            matches.then_some((seg, vec![inst]))
+        })
+        .collect()
+}
+
 /// One light route running `insts` of a prefill bucket, in order.
 pub(super) fn prefill_light_route(
     be: &Arc<CudaBackend>,
@@ -657,18 +686,35 @@ pub(super) fn prefill_light_route(
 /// The cached GLU quant kernel strides rows by `gridDim`: one CTA per row instead of the
 /// instruction's one per SM, which walked ~31 rows of a 4096-row chunk with its load and store
 /// phases never overlapping. Per-row work is unchanged, so the outputs are bit-identical.
+/// `quant_only` (the object's no-store twin) serves an instruction whose bf16 GLU output (t[1])
+/// no other instruction of the program names: its FP8 bytes and scales are the same.
 pub(super) fn prefill_glu_quant_route(
     be: &Arc<CudaBackend>,
     function: KernelFn,
+    quant_only: Option<KernelFn>,
     kernarg: DevProgram,
     g: &DevProg,
     insts: &[usize],
 ) -> LightRoute {
     let mut route = prefill_light_route(be, function, kernarg, g, insts);
     for launch in &mut route.launches {
-        launch.blocks = g.insts[launch.instruction as usize].i[0];
+        let inst = launch.instruction as usize;
+        launch.blocks = g.insts[inst].i[0];
+        if let Some(q) = quant_only.filter(|_| glu_output_unread(g, inst)) {
+            launch.function = q;
+        }
     }
     route
+}
+
+fn glu_output_unread(g: &DevProg, inst: usize) -> bool {
+    let output = g.insts[inst].t[1];
+    output != packet::dev::TENSOR_NONE16
+        && g
+            .insts
+            .iter()
+            .enumerate()
+            .all(|(i, d)| i == inst || !d.t.contains(&output))
 }
 
 /// Segments that are exactly a prefill NormResidual and the RmsNorm reading its output (the next
@@ -1436,7 +1482,12 @@ pub(super) fn prepare_routes(
                 scales[index] = mem.base;
             }
             // Scale pointers belong to this layer; shape-only BF16 plan sharing is invalid here.
-            let plan = lt.fp8_plan(segment.m, segment.n, segment.k, scales[1], scales[0])?;
+            let fast_accum = !decode
+                && crate::config::RuntimeConfig::get()
+                    .nv
+                    .lt_fp8_fast_accum_max_k
+                    .is_some_and(|max_k| segment.k <= max_k);
+            let plan = lt.fp8_plan(segment.m, segment.n, segment.k, scales[1], scales[0], fast_accum)?;
             fp8_plans += 1;
             insts[segment.instruction].op = DevOp::Nop as u16;
             routes.push(Some(CublasLtDecodeRoute {

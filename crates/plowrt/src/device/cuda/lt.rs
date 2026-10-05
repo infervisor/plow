@@ -225,6 +225,7 @@ impl Lt {
         k: u32,
         weight_scale: u64,
         input_scale: u64,
+        fast_accum: bool,
     ) -> Result<Arc<Plan>> {
         self.be.bind()?;
         let mut plan = Plan {
@@ -254,6 +255,18 @@ impl Lt {
                         size_of::<i32>(),
                     ),
                     "FP8 Lt mode",
+                )?;
+            }
+            // CUBLASLT_MATMUL_DESC_FAST_ACCUM = 25 (int8).
+            if fast_accum {
+                check(
+                    (self.api.cublasLtMatmulDescSetAttribute)(
+                        raw,
+                        25,
+                        &1i8 as *const _ as *const c_void,
+                        size_of::<i8>(),
+                    ),
+                    "FP8 Lt fast accumulation",
                 )?;
             }
             for (attr, value) in [(17, weight_scale), (18, input_scale)] {
@@ -1351,8 +1364,8 @@ mod tests {
         be.upload(&weight, 0, &w)?;
         be.upload(&ws, 0, bytemuck::cast_slice(&scales))?;
         be.upload(&ws2, 0, bytemuck::cast_slice(&scales2))?;
-        let first = lt.fp8_plan(m as u32, n as u32, k as u32, ws.base, xs.base)?;
-        let second = lt.fp8_plan(m as u32, n as u32, k as u32, ws2.base, xs.base)?;
+        let first = lt.fp8_plan(m as u32, n as u32, k as u32, ws.base, xs.base, false)?;
+        let second = lt.fp8_plan(m as u32, n as u32, k as u32, ws2.base, xs.base, false)?;
         for iteration in 1..=2 {
             let xscales: Vec<f32> = (0..m)
                 .map(|i| (1 + i % 8) as f32 * iteration as f32 / 16.0)

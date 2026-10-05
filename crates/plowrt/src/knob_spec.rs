@@ -518,6 +518,7 @@ pub const RUNTIME: &[KnobSpec] = &[
     KnobSpec::new("rt.lt_algos_write", Some("PLOW_LT_ALGOS_WRITE"), Layer::Runtime, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("rt.lt_pair", Some("PLOW_LT_PAIR"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
     KnobSpec::new("rt.lt_rung_algos", Some("PLOW_LT_RUNG_ALGOS"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
+    KnobSpec::new("rt.lt_fp8_fast_accum_max_k", Some("PLOW_LT_FP8_FAST_ACCUM_MAX_K"), Layer::Runtime, U32, UNSET, OPT_IN),
     KnobSpec::new("rt.decode_light", Some("PLOW_DECODE_LIGHT"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
     KnobSpec::new("rt.decode_light_flash", Some("PLOW_DECODE_LIGHT_FLASH"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
     KnobSpec::new("rt.tb_split_attn", Some("PLOW_TB_SPLIT_ATTN"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
