@@ -463,6 +463,35 @@ def env_with(base: dict, extra: dict) -> dict:
 
 
 # ---------------------------------------------------------------- build
+def runtime_knobs() -> set[str]:
+    """The env names plowrt's knob registry accepts as runtime knobs (`knob_spec::is_runtime_env`)."""
+    src = (Path(__file__).resolve().parents[2] / "crates/plowrt/src/knob_spec.rs").read_text()
+    return {m.group(1) for line in src.splitlines() if "REMOVED" not in line
+            for m in [re.search(r'Some\("(PLOW_[A-Z0-9_]+)"\)', line)] if m}
+
+
+# Not the cache pin [serve.env] holds for ladder parity with vLLM, and not the paths a
+# self-contained bundle resolves itself.
+SERVE_DEFAULTS_EXCLUDED = ("PLOW_PREFIX_CACHE", "PLOW_PF_SEG_DIR", "PLOW_LT_ALGOS", "PLOW_LT_ALGOS_WRITE")
+
+
+def packet_serve_defaults(r: dict, out: Path) -> tuple[dict[str, str], list[str]]:
+    """The qualified [serve.env] that rides in the packet's serve.json, so `plowrt serve --assets`
+    alone serves it: registered plowrt runtime knobs only (plowrt refuses others at load), and no
+    host paths or commas, which would tie the frozen packet to one machine or break the list."""
+    known = runtime_knobs()
+    keep, skipped = {}, []
+    for k, v in r.get("serve", {}).get("env", {}).items():
+        v = expand(str(v), out, lenient=True)
+        if k in SERVE_DEFAULTS_EXCLUDED:
+            continue
+        if k in known and "/" not in v and "," not in v:
+            keep[k] = v
+        else:
+            skipped.append(k)
+    return keep, skipped
+
+
 def cmd_build(a: argparse.Namespace) -> None:
     recipe_bytes = Path(a.recipe).read_bytes()
     r = tomllib.loads(recipe_bytes.decode("utf-8"))
@@ -513,11 +542,9 @@ def cmd_build(a: argparse.Namespace) -> None:
     if "max_ctx" in cell and cell["max_ctx"]:
         base_args.extend(["--max-ctx", str(cell["max_ctx"])])
     common = env_with(os.environ, emit.get("env", {}))
-    # The qualified [serve.env] rides in the packet's serve.json, so `plowrt serve --assets` alone
-    # serves it. Not the cache pin [serve.env] holds for ladder parity with vLLM, and not the
-    # paths a self-contained bundle resolves itself.
-    serve_defaults = {k: expand(str(v), out) for k, v in r.get("serve", {}).get("env", {}).items()
-                      if k not in ("PLOW_PREFIX_CACHE", "PLOW_PF_SEG_DIR", "PLOW_LT_ALGOS", "PLOW_LT_ALGOS_WRITE")}
+    serve_defaults, skipped = packet_serve_defaults(r, out)
+    if skipped:
+        print(f"campaign: [serve.env] kept out of serve.json: {', '.join(skipped)}")
     if serve_defaults and "PLOW_EMIT_SERVE_DEFAULTS" not in common:
         common["PLOW_EMIT_SERVE_DEFAULTS"] = ",".join(f"{k}={v}" for k, v in sorted(serve_defaults.items()))
     # The one emit-side variable of an A/B, named on the command line so build-record carries it.
