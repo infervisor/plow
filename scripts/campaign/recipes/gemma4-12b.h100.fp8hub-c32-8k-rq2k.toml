@@ -62,6 +62,7 @@ PLOW_MAX_CHUNK = "4096"
 # instead of 8192, so 32 slots fit in the 16-slot packet's ring budget. Aggregate 4096 keeps the
 # M4096 rungs the FP8 prefill roles require.
 PLOW_MAX_REQUEST_CHUNK = "2048"
+PLOW_STAGE_ROWS = "0"               # unstaged ring as measured; auto staging not re-measured here
 # [FP8-TAX] Three of the Hopper decode defaults the bf16 gate withholds. All three act on the
 # ATTENTION side, which is BF16 in this scheme either way (BF16 KV), so the FP8 weight encoding
 # is irrelevant to them and restoring them here is a restore, not a new claim:

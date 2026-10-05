@@ -63,6 +63,7 @@ PLOW_PF_LADDER_APPEND = "256,1152,4224"
 PLOW_MAX_CHUNK = "8192"
 # One request's rows per launch; sizes the sliding ring (see the header). Must be a prefill rung.
 PLOW_MAX_REQUEST_CHUNK = "4224"
+PLOW_STAGE_ROWS = "0"               # unstaged ring as measured; auto staging not re-measured here
 # Measured on this board (tune_decode_sweep.sh, step_bench, B=1, occ 1:132): folding the greedy
 # argmax into the lm_head GEMV epilogue is SLOWER here — 6.501 ms/step vs 5.837 without it.
 # (PLOW_FUSE_MERGE / PLOW_FUSE_HNR: no effect; PLOW_GEMMA_MOE_ROUTER_FUSED: 142 ms/step.)
