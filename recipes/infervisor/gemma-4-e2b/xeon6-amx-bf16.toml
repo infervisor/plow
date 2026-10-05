@@ -1,0 +1,75 @@
+# Gemma-4-E2B-it (per-layer inputs, KV-shared layers) BF16 on Intel Xeon 6975P-C (Granite Rapids, 96 cores, SNC3, AMX-BF16): BF16 weights, BF16
+# KV, 2K context, 32 decode slots, greedy. Production recipe for this model/CPU/precision.
+#
+#   nix develop -c cargo build --release -p plowc
+#   nix develop -c cargo build --release -p plowrt --no-default-features --features cpu
+#   GEMMA4_E2B_CHECKPOINT=<hf dir> python3 scripts/campaign/campaign.py build \
+#       recipes/infervisor/gemma-4-e2b/xeon6-amx-bf16.toml --out <fresh dir>
+#
+# CPU bundles are NVIDIA devblobs interpreted by the CPU engine (docs/runtime/cpu.md): `gpu` / `arch`
+# label the packet, `n_cu` = 96 virtual executors (one per physical core). Host state for every
+# measurement (all arms): kernel.numa_balancing=0, a zero-latency CPU QoS request held
+# (/dev/cpu_dma_latency, as tuned latency-performance does), THP madvise, pseudo_lock_sram not loaded.
+#
+# Status: candidate until campaign.py report qualifies it.
+schema = "plow.recipe.v1"
+namespace = "infervisor"
+name = "gemma-4-e2b"
+label = "xeon6-amx-bf16"
+status = "candidate"
+network = "gemma4"
+
+[target]
+vendor = "intel"
+isa = "x86-64 AMX-BF16 + AVX-512"
+sku = "Xeon 6975P-C"
+units = 96
+num_gpus = 1
+parallel = "none"
+max_ctx = 2048
+toolchain = "nix"
+
+[checkpoint]
+source = "google/gemma-4-E2B-it"
+layout = "hf-bf16"
+
+[cell]
+name = "gemma-4-e2b.xeon6.bf16-2k-c32"
+model = "gemma-4-E2B-it (BF16 safetensors)"
+revision = "local"
+hf_dir = "{env:GEMMA4_E2B_CHECKPOINT}"
+gpu = "rtx6000pro"
+arch = "sm_120a"
+n_cu = 96
+max_ctx = 2048
+precision = "bf16"
+
+[emit]
+emit = "devblob"
+args = []
+[emit.env]
+PLOW_DECODE_BATCH_LADDER = "1,2,4,8,16,32"
+PLOW_MAX_CHUNK = "2048"
+
+[serve.env]
+PLOW_CPU_WEIGHT_AFFINE = "1"
+
+[bench]
+backend = "openai"
+in_lens = "1000"
+concs = "1 8 32"
+nprompt = 96
+outlen = 128
+warmups = 2
+seed = 42
+tokenizer = "{env:GEMMA4_E2B_CHECKPOINT}"
+model_id = "checkpoint"
+
+# FP32-reference gate (scripts/llm/fp32_ref_gate.py, 2K prompt set, --device cpu reference):
+# GEMMA4_E2B_FP32_REF = ref.json, GEMMA4_E2B_FP32_VLLM = the vLLM 0.30 capture against it.
+[gates]
+python = "{env:PYREF}"
+[gates.llm_fp32_ref]
+reference = "{env:GEMMA4_E2B_FP32_REF}"
+vllm_capture = "{env:GEMMA4_E2B_FP32_VLLM}"
+concurrency = 8
