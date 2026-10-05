@@ -3562,6 +3562,12 @@ impl PipeQueue {
         true
     }
 
+    /// `slot` is being retired now: a retirement still pending from a failed (cleared) step must not
+    /// fire later against the request seated there next.
+    fn forget(&mut self, slot: usize) {
+        self.retire[slot] = None;
+    }
+
     /// Retirements held back so far, once nothing is queued.
     fn take_retired(&mut self) -> smallvec::SmallVec<[(usize, bool); 8]> {
         if !self.steps.is_empty() {
@@ -7049,8 +7055,11 @@ impl GpuEngine {
     }
 
     pub fn retire_slot(&mut self, b: usize, cache_output: bool) {
-        if self.pipe.as_mut().is_some_and(|p| p.queue.defer_retire(b, cache_output)) {
-            return;
+        if let Some(p) = self.pipe.as_mut() {
+            if p.queue.defer_retire(b, cache_output) {
+                return;
+            }
+            p.queue.forget(b);
         }
         self.slot_generations[b] = self.slot_generations[b].wrapping_add(1);
         self.reset_packed_admission(b);
