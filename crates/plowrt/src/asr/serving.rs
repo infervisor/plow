@@ -15,10 +15,10 @@ use std::sync::{
     Arc,
 };
 use std::time::{Duration, Instant};
-use tokio::sync::{mpsc, oneshot, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{mpsc, oneshot, watch, OwnedSemaphorePermit, Semaphore};
 
 use super::{
-    frontend::{decode_wav, decode_wav_chunk, AudioError, MAX_SAMPLES, SAMPLE_RATE},
+    frontend::{decode_wav, decode_wav_chunk, AudioError, Resampler, MAX_SAMPLES, SAMPLE_RATE},
     FinalizationPolicy, Transcriber, Transcript, TranscriptionInput,
 };
 use crate::serve::session::RequestIds;
@@ -34,6 +34,10 @@ pub struct AsrServer {
     backend: Backend,
     uploads: Arc<Semaphore>,
     sessions: Arc<Semaphore>,
+    /// Set on shutdown: new work is refused (503) and sessions still receiving audio end.
+    shutdown: watch::Sender<bool>,
+    /// Admission-to-answer deadline of one transcription (`--asr-request-timeout-ms`).
+    request_timeout: Option<Duration>,
     /// Recordings sent as `append` uploads, by (model, `X-Session-Id`).
     recordings: parking_lot::Mutex<HashMap<(String, Arc<str>), Arc<tokio::sync::Mutex<Recording>>>>,
 }
@@ -311,8 +315,44 @@ impl AsrServer {
             backend: Backend::Cohort { model, mux, finalization },
             uploads: Arc::new(Semaphore::new(ingress_capacity)),
             sessions: Arc::new(Semaphore::new(ingress_capacity)),
+            shutdown: watch::channel(false).0,
+            request_timeout: configured_timeout(),
             recordings: Default::default(),
         })
+    }
+
+    /// Replace the configured transcription deadline; only before the server is shared.
+    pub fn with_request_timeout(mut self: Arc<Self>, timeout: Option<Duration>) -> Arc<Self> {
+        Arc::get_mut(&mut self).expect("AsrServer already shared").request_timeout = timeout;
+        self
+    }
+
+    /// Stop admitting work: requests and new sessions get 503, sessions still receiving audio get
+    /// a terminal error and close 1001, transcriptions already submitted run to their answer.
+    pub fn begin_shutdown(&self) {
+        self.shutdown.send_replace(true);
+    }
+
+    fn draining(&self) -> bool {
+        *self.shutdown.borrow()
+    }
+
+    /// No queued or running job and no open session (the `plowrt asr` drain condition).
+    pub fn idle(&self) -> bool {
+        let Some(metrics) = self.metrics("") else { return true };
+        let asr = &metrics.serving.asr;
+        asr.queued.load(Ordering::Relaxed) == 0
+            && asr.running.load(Ordering::Relaxed) == 0
+            && asr.active_sessions.load(Ordering::Relaxed) == 0
+    }
+
+    /// Ready to take work: not shutting down and (cohort) the engine worker still running.
+    fn ready(&self) -> bool {
+        match &self.backend {
+            Backend::Cohort { mux, .. } => !self.draining() && !mux.tx.is_closed(),
+            #[cfg(feature = "cuda")]
+            Backend::Serve(_) => !self.draining(),
+        }
     }
 
     /// Transcription for every model `state` serves whose packet declares a causal audio pipeline:
@@ -320,9 +360,11 @@ impl AsrServer {
     #[cfg(feature = "cuda")]
     pub fn for_serve(state: Arc<crate::serve::AppState>) -> Arc<Self> {
         Arc::new(Self {
+            shutdown: state.shutdown.clone(),
             backend: Backend::Serve(state),
             uploads: Arc::new(Semaphore::new(shared::UPLOADS)),
             sessions: Arc::new(Semaphore::new(shared::UPLOADS)),
+            request_timeout: configured_timeout(),
             recordings: Default::default(),
         })
     }
@@ -383,8 +425,16 @@ impl AsrServer {
             #[cfg(feature = "cuda")]
             Backend::Serve(_) => None,
         };
-        let mut router = self.transcription_router(websocket)
-            .route("/health", get(|| async { StatusCode::OK }));
+        let health = Arc::clone(&self);
+        let mut router = self.transcription_router(websocket).route(
+            "/health",
+            get(move || {
+                let ready = health.ready();
+                async move {
+                    if ready { (StatusCode::OK, "ok") } else { (StatusCode::SERVICE_UNAVAILABLE, "unavailable") }
+                }
+            }),
+        );
         if let Some((model, metrics)) = metrics {
             let models = vec![(model, metrics, true)];
             let json_models = models.clone();
@@ -430,6 +480,23 @@ impl AsrServer {
     }
 }
 
+/// Served models (on `plowrt serve`) whose ASR encoder thread has exited.
+#[cfg(feature = "cuda")]
+pub fn dead_encoders() -> Vec<String> {
+    shared::dead_encoders()
+}
+
+/// Whether `slug` serves `/v1/audio/transcriptions` on `plowrt serve`.
+#[cfg(feature = "cuda")]
+pub fn serves_audio(state: &crate::serve::AppState, slug: &str) -> bool {
+    shared::serves_audio(state, slug)
+}
+
+fn configured_timeout() -> Option<Duration> {
+    let ms = crate::config::RuntimeConfig::get().asr_request_timeout_ms;
+    (ms > 0).then(|| Duration::from_millis(ms))
+}
+
 fn failure(status: StatusCode, message: impl ToString) -> Response {
     (
         status,
@@ -438,8 +505,20 @@ fn failure(status: StatusCode, message: impl ToString) -> Response {
         .into_response()
 }
 
+/// 429 with `Retry-After`: a full queue, retryable.
+fn busy(message: impl ToString) -> Response {
+    let mut response = failure(StatusCode::TOO_MANY_REQUESTS, message);
+    response.headers_mut().insert(axum::http::header::RETRY_AFTER, axum::http::HeaderValue::from_static("1"));
+    response
+}
+
+const SHUTTING_DOWN: &str = "server shutting down";
+const DEADLINE: &str = "transcription deadline exceeded";
+
 fn runtime_failure(error: crate::RuntimeError) -> Response {
     let status = match &error {
+        crate::RuntimeError::Overloaded(_) => return busy(error),
+        crate::RuntimeError::Unavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
         crate::RuntimeError::Rejected(_) | crate::RuntimeError::ContextLength(_) => {
             StatusCode::BAD_REQUEST
         }
@@ -474,9 +553,12 @@ fn form_bool(fields: &std::collections::HashMap<String, String>, name: &str) -> 
 }
 
 async fn transcribe_upload(state: Arc<AsrServer>, mut multipart: Multipart, ids: &mut RequestIds) -> Response {
+    if state.draining() {
+        return failure(StatusCode::SERVICE_UNAVAILABLE, SHUTTING_DOWN);
+    }
     let upload = match state.uploads.clone().try_acquire_owned() {
         Ok(p) => p,
-        Err(_) => return failure(StatusCode::TOO_MANY_REQUESTS, "too many ASR uploads"),
+        Err(_) => return busy("too many ASR uploads"),
     };
     let mut file = None;
     let mut fields = std::collections::HashMap::new();
@@ -667,17 +749,18 @@ async fn transcribe_upload(state: Arc<AsrServer>, mut multipart: Multipart, ids:
     }
     let work = match route.submit(samples, language, context, cancel.0.clone(), opts) {
         Ok(work) => work,
-        Err(SubmitError::Full) => return failure(StatusCode::TOO_MANY_REQUESTS, "ASR queue full"),
+        Err(SubmitError::Full) => return busy("ASR queue full"),
         Err(SubmitError::Closed) => {
             return failure(StatusCode::SERVICE_UNAVAILABLE, "ASR engine unavailable")
         }
     };
+    let deadline = state.request_timeout.map(|t| tokio::time::Instant::now() + t);
     let offset = recorded.then_some(recorded_samples);
     if stream {
         let cache = crate::serve::session::CacheOutcome::received(report_rx).await;
         run.admitted(cache.and_then(|c| c.at));
         let stamped = run.headers();
-        let mut response = sse_transcript(work, delta_rx, ids.clone(), finals, offset, cache, cancel.0.clone(), (in_flight, cancel, recording), run);
+        let mut response = sse_transcript(work, delta_rx, ids.clone(), finals, offset, cache, cancel.0.clone(), deadline, (in_flight, cancel, recording), run);
         response.headers_mut().extend(stamped);
         if let Some(cache) = cache {
             cache.stamp(&mut response);
@@ -685,7 +768,16 @@ async fn transcribe_upload(state: Arc<AsrServer>, mut multipart: Multipart, ids:
         return response;
     }
     let started = Instant::now();
-    let result = work.await;
+    let result = match deadline {
+        Some(deadline) => match tokio::time::timeout_at(deadline, work).await {
+            Ok(result) => result,
+            Err(_) => {
+                cancel.0.store(true, Ordering::Relaxed);
+                return failure(StatusCode::GATEWAY_TIMEOUT, DEADLINE);
+            }
+        },
+        None => work.await,
+    };
     if let (Some(rec), false, Ok(Ok(result))) = (recording.as_mut(), finals, &result) {
         let duty = crate::config::RuntimeConfig::get().asr_partial_duty.clamp(0.01, 1.0) * if crate::serve::overload::level() >= 1 { 0.5 } else { 1.0 };
         let rest = started.elapsed().mul_f64(1.0 / duty - 1.0);
@@ -724,6 +816,14 @@ fn transcript_event(kind: &str, ids: &RequestIds, mut body: serde_json::Value) -
     axum::response::sse::Event::default().data(body.to_string())
 }
 
+/// `deadline`, or never.
+async fn sleep_until(deadline: Option<tokio::time::Instant>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(deadline).await,
+        None => std::future::pending().await,
+    }
+}
+
 fn sse_events(events: Vec<axum::response::sse::Event>) -> Response {
     let stream = futures::stream::iter(events.into_iter().map(Ok::<_, std::convert::Infallible>));
     axum::response::sse::Sse::new(stream).into_response()
@@ -739,6 +839,7 @@ fn sse_transcript<H: Send + 'static>(
     offset: Option<usize>,
     cache: Option<crate::serve::session::CacheOutcome>,
     cancel: Arc<AtomicBool>,
+    deadline: Option<tokio::time::Instant>,
     held: H,
     mut run: crate::serve::turns::StageRun,
 ) -> Response {
@@ -762,6 +863,12 @@ fn sse_transcript<H: Send + 'static>(
                     }
                 }
                 result = &mut work => break result,
+                _ = sleep_until(deadline) => {
+                    cancel.store(true, Ordering::Relaxed);
+                    let _ = tx.send(transcript_event("error", &ids, json!({"message": DEADLINE, "code": "timeout"}))).await;
+                    let _ = work.await;
+                    return;
+                }
             }
         };
         let event = match result {
@@ -804,12 +911,15 @@ async fn upgrade(
         Ok(ids) => ids,
         Err(e) => return failure(StatusCode::BAD_REQUEST, e),
     };
+    if state.draining() {
+        return failure(StatusCode::SERVICE_UNAVAILABLE, SHUTTING_DOWN);
+    }
     if let Some(r) = crate::serve::overload::gate(&ids) {
         return r;
     }
     let permit = match state.sessions.clone().try_acquire_owned() {
         Ok(p) => p,
-        Err(_) => return failure(StatusCode::TOO_MANY_REQUESTS, "too many ASR sessions"),
+        Err(_) => return busy("too many ASR sessions"),
     };
     // Each connection is a session: its partials resume the decoder rows the last one retained.
     ids.session.get_or_insert_with(|| crate::serve::session::minted::session().into());
@@ -840,7 +950,18 @@ struct Start {
     /// Revisable partial transcripts while audio arrives (`"type":"partial"` events).
     #[serde(default)]
     partials: bool,
+    /// The final transcript's text as it decodes (`"type":"delta"` events before `final`).
+    #[serde(default)]
+    deltas: bool,
 }
+
+/// Client PCM rates the stream accepts; audio is resampled to 16 kHz as it arrives.
+const STREAM_RATES: [u32; 7] = [8_000, 16_000, 22_050, 24_000, 32_000, 44_100, 48_000];
+/// Server pings a stream this often, and ends one whose peer has not answered for `PONG_TIMEOUT`.
+const PING_INTERVAL: Duration = Duration::from_secs(15);
+const PONG_TIMEOUT: Duration = Duration::from_secs(45);
+/// A stream with no audio or control message for this long ends.
+const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Audio between partial transcriptions. On `plowrt serve` a partial encodes only the open encoder
 /// window and resumes the connection's retained decoder rows; the cohort engine re-transcribes the
@@ -876,10 +997,18 @@ fn append_final_padding(samples: &mut Vec<f32>, count: usize, amplitude: f32) {
     }
 }
 
+/// A terminal error, then close 1001 (going away).
+async fn going_away(socket: &mut WebSocket, message: &str) {
+    send(socket, json!({"type":"error","message":message,"terminal":true})).await;
+    let close = Message::Close(Some(axum::extract::ws::CloseFrame { code: 1001, reason: message.to_owned().into() }));
+    let _ = tokio::time::timeout(Duration::from_secs(5), socket.send(close)).await;
+}
+
 async fn stream(state: Arc<AsrServer>, mut socket: WebSocket, _permit: OwnedSemaphorePermit, ids: RequestIds) {
     let cancel = Cancellation(Arc::new(AtomicBool::new(false)));
+    let mut shutdown = state.shutdown.subscribe();
     let Some(Ok(Message::Text(text))) =
-        tokio::time::timeout(Duration::from_secs(30), socket.recv())
+        tokio::time::timeout(IDLE_TIMEOUT, socket.recv())
             .await
             .ok()
             .flatten()
@@ -890,7 +1019,7 @@ async fn stream(state: Arc<AsrServer>, mut socket: WebSocket, _permit: OwnedSema
         Ok(s)
             if s.kind == "start"
                 && s.version == 1
-                && s.sample_rate == SAMPLE_RATE
+                && STREAM_RATES.contains(&s.sample_rate)
                 && s.format == "pcm_s16le" =>
         {
             state.route(&s.model).await.ok().map(|r| (s, r))
@@ -908,6 +1037,10 @@ async fn stream(state: Arc<AsrServer>, mut socket: WebSocket, _permit: OwnedSema
             return;
         }
     };
+    if state.draining() {
+        going_away(&mut socket, SHUTTING_DOWN).await;
+        return;
+    }
     let _metrics = AsrSessionMetrics::new(state.metrics(&start.model));
     let language = start.language.clone();
     let partials = start.partials;
@@ -920,19 +1053,27 @@ async fn stream(state: Arc<AsrServer>, mut socket: WebSocket, _permit: OwnedSema
         deltas: None,
         report: None,
     };
-    let max_audio_samples = MAX_SAMPLES.saturating_sub(finalization.final_padding_samples);
-    let initial_credit = 16000usize.min(max_audio_samples);
+    // Credit and limits count the client's samples; `samples` holds them resampled to 16 kHz.
+    let rate = start.sample_rate as usize;
+    let mut resampler = Resampler::new(start.sample_rate).expect("a listed stream rate");
+    let max_audio_samples = MAX_SAMPLES.saturating_sub(finalization.final_padding_samples) * rate / SAMPLE_RATE as usize;
+    let initial_credit = rate.min(max_audio_samples);
     if !send(&mut socket,json!({"type":"ready","version":1,"session_id":&*session,"request_id":&*ids.request,
-        "sample_rate":SAMPLE_RATE,"format":"pcm_s16le","max_chunk_bytes":32000,"credit_samples":initial_credit,
-        "max_audio_samples":max_audio_samples,"partial_mode":if partials {"revision"} else {"final_only"}})).await{return;}
+        "sample_rate":start.sample_rate,"format":"pcm_s16le","max_chunk_bytes":32000,"credit_samples":initial_credit,
+        "max_audio_samples":max_audio_samples,"partial_mode":if partials {"revision"} else {"final_only"},
+        "deltas":start.deltas})).await{return;}
     let mut samples = Vec::new();
+    let mut received = 0usize;
     let mut sequence = 0u64;
     let mut credit = initial_credit;
     let (mut revision, mut last_partial, mut partial_at) = (0u64, String::new(), 0usize);
     let mut pending: Option<oneshot::Receiver<crate::Result<Transcript>>> = None;
+    let mut ping = tokio::time::interval_at(tokio::time::Instant::now() + PING_INTERVAL, PING_INTERVAL);
+    let mut last_pong = tokio::time::Instant::now();
+    let mut idle_at = tokio::time::Instant::now() + IDLE_TIMEOUT;
     loop {
         let message = tokio::select! {
-            m = tokio::time::timeout(Duration::from_secs(30), socket.recv()) => match m {
+            m = tokio::time::timeout_at(idle_at, socket.recv()) => match m {
                 Ok(Some(Ok(m))) => m,
                 _ => return,
             },
@@ -952,6 +1093,23 @@ async fn stream(state: Arc<AsrServer>, mut socket: WebSocket, _permit: OwnedSema
                 }
                 continue;
             }
+            _ = ping.tick() => {
+                if last_pong.elapsed() >= PONG_TIMEOUT {
+                    going_away(&mut socket, "ping timeout").await;
+                    return;
+                }
+                if socket.send(Message::Ping(Vec::new())).await.is_err() {
+                    return;
+                }
+                continue;
+            }
+            Ok(()) = shutdown.changed() => {
+                if *shutdown.borrow() {
+                    going_away(&mut socket, SHUTTING_DOWN).await;
+                    return;
+                }
+                continue;
+            }
         };
         let finish = match message {
             Message::Binary(bytes) => {
@@ -960,18 +1118,20 @@ async fn stream(state: Arc<AsrServer>, mut socket: WebSocket, _permit: OwnedSema
                     || (bytes.len() - 8) % 2 != 0
                     || u64::from_le_bytes(bytes[..8].try_into().unwrap()) != sequence
                     || (bytes.len() - 8) / 2 > credit
-                    || samples.len() + (bytes.len() - 8) / 2 > max_audio_samples
+                    || received + (bytes.len() - 8) / 2 > max_audio_samples
                 {
                     send(&mut socket,json!({"type":"error","message":"invalid PCM sequence or credit/length exceeded","terminal":true})).await;
                     return;
                 }
+                idle_at = tokio::time::Instant::now() + IDLE_TIMEOUT;
                 sequence += 1;
                 credit -= (bytes.len() - 8) / 2;
-                samples.extend(
-                    bytes[8..]
-                        .chunks_exact(2)
-                        .map(|b| i16::from_le_bytes([b[0], b[1]]) as f32 / 32768.0),
-                );
+                received += (bytes.len() - 8) / 2;
+                let pcm: Vec<f32> = bytes[8..]
+                    .chunks_exact(2)
+                    .map(|b| i16::from_le_bytes([b[0], b[1]]) as f32 / 32768.0)
+                    .collect();
+                samples.extend(resampler.push(&pcm));
                 false
             }
             Message::Text(text) => match serde_json::from_str::<serde_json::Value>(&text)
@@ -987,9 +1147,14 @@ async fn stream(state: Arc<AsrServer>, mut socket: WebSocket, _permit: OwnedSema
                 }
             },
             Message::Close(_) => return,
-            Message::Ping(_) | Message::Pong(_) => continue,
+            Message::Pong(_) => {
+                last_pong = tokio::time::Instant::now();
+                continue;
+            }
+            Message::Ping(_) => continue,
         };
         if finish {
+            samples.extend(resampler.finish());
             if samples.len() < SAMPLE_RATE as usize / 2 {
                 send(&mut socket,json!({"type":"error","message":"audio must contain at least 0.5 seconds","terminal":true})).await;
                 return;
@@ -1009,12 +1174,17 @@ async fn stream(state: Arc<AsrServer>, mut socket: WebSocket, _permit: OwnedSema
                 Instant::now(),
                 true,
             );
-            let mut work = match route.submit(samples, language, start.prompt, cancel.0.clone(), request(true, run.key())) {
+            let (delta_tx, mut delta_rx) = mpsc::unbounded_channel();
+            let mut opts = request(true, run.key());
+            if start.deltas {
+                opts.deltas = Some(delta_tx);
+            }
+            let mut work = match route.submit(samples, language, start.prompt, cancel.0.clone(), opts) {
                 Ok(work) => work,
                 Err(SubmitError::Full) => {
                     send(
                         &mut socket,
-                        json!({"type":"error","message":"ASR queue full","terminal":true}),
+                        json!({"type":"error","message":"ASR queue full","code":"overloaded","terminal":true}),
                     )
                     .await;
                     return;
@@ -1028,11 +1198,36 @@ async fn stream(state: Arc<AsrServer>, mut socket: WebSocket, _permit: OwnedSema
                     return;
                 }
             };
+            // A final already submitted runs to its answer through shutdown (the drain bounds it).
+            let deadline = state.request_timeout.map(|t| tokio::time::Instant::now() + t);
+            let mut shown = String::new();
             let result = loop {
                 tokio::select! {
                     result=&mut work=>break result,
+                    Some(delta) = delta_rx.recv(), if start.deltas => {
+                        shown.push_str(&delta);
+                        if !send(&mut socket, json!({"type":"delta","text":delta})).await {
+                            cancel.0.store(true,Ordering::Relaxed);
+                            let _=work.await;
+                            return;
+                        }
+                    }
+                    _ = sleep_until(deadline) => {
+                        cancel.0.store(true,Ordering::Relaxed);
+                        let _=work.await;
+                        send(&mut socket,json!({"type":"error","message":DEADLINE,"code":"timeout","terminal":true})).await;
+                        return;
+                    }
+                    _ = ping.tick() => {
+                        if last_pong.elapsed() >= PONG_TIMEOUT || socket.send(Message::Ping(Vec::new())).await.is_err() {
+                            cancel.0.store(true,Ordering::Relaxed);
+                            let _=work.await;
+                            return;
+                        }
+                    }
                     incoming=socket.recv()=>match incoming {
-                        Some(Ok(Message::Ping(_)|Message::Pong(_)))=>{},
+                        Some(Ok(Message::Pong(_)))=>last_pong=tokio::time::Instant::now(),
+                        Some(Ok(Message::Ping(_)))=>{},
                         other=>{
                             let cancelled=matches!(&other,Some(Ok(Message::Text(text))) if serde_json::from_str::<serde_json::Value>(text)
                                 .ok().is_some_and(|v|v["type"]=="cancel"));
@@ -1046,6 +1241,17 @@ async fn stream(state: Arc<AsrServer>, mut socket: WebSocket, _permit: OwnedSema
             };
             match result {
                 Ok(Ok(result)) => {
+                    if start.deltas {
+                        // A route that decodes without deltas (the cohort engine) sends the whole
+                        // text as one delta here.
+                        while let Ok(delta) = delta_rx.try_recv() {
+                            shown.push_str(&delta);
+                            send(&mut socket, json!({"type":"delta","text":delta})).await;
+                        }
+                        if let Some(rest) = result.text.strip_prefix(shown.as_str()).filter(|r| !r.is_empty()) {
+                            send(&mut socket, json!({"type":"delta","text":rest})).await;
+                        }
+                    }
                     run.first();
                     run.done();
                     send(
@@ -1059,9 +1265,14 @@ async fn stream(state: Arc<AsrServer>, mut socket: WebSocket, _permit: OwnedSema
                     .await;
                 }
                 Ok(Err(error)) => {
+                    let code = match &error {
+                        crate::RuntimeError::Overloaded(_) => Some("overloaded"),
+                        crate::RuntimeError::Unavailable(_) => Some("unavailable"),
+                        _ => None,
+                    };
                     send(
                         &mut socket,
-                        json!({"type":"error","message":error.to_string(),"terminal":true}),
+                        json!({"type":"error","message":error.to_string(),"code":code,"terminal":true}),
                     )
                     .await;
                 }
@@ -1076,8 +1287,8 @@ async fn stream(state: Arc<AsrServer>, mut socket: WebSocket, _permit: OwnedSema
             // A full queue skips this partial; the next stride retries.
             pending = route.submit(samples.clone(), language.clone(), start.prompt.clone(), cancel.0.clone(), request(false, None)).ok();
         }
-        let grant = (16000 - samples.len() % 16000)
-            .min(max_audio_samples - samples.len())
+        let grant = (rate - received % rate)
+            .min(max_audio_samples - received)
             .saturating_sub(credit);
         credit += grant;
         if grant > 0 && !send(&mut socket, json!({"type":"credit","credit_samples":grant})).await {
@@ -1351,7 +1562,7 @@ mod tests {
             StatusCode::BAD_REQUEST
         );
         for (rate, samples, status) in [
-            (8000, 8000, StatusCode::UNSUPPORTED_MEDIA_TYPE),
+            (7000, 7000, StatusCode::UNSUPPORTED_MEDIA_TYPE),
             (16000, 7999, StatusCode::BAD_REQUEST),
             (16000, 480001, StatusCode::PAYLOAD_TOO_LARGE),
         ] {
@@ -1771,4 +1982,184 @@ mod tests {
         assert_eq!((stats.websocket_sessions, stats.active_sessions, stats.cancelled, stats.running), (1, 0, 1, 0));
         task.abort();
     }
+
+    #[tokio::test]
+    async fn errors_map_to_retryable_statuses() {
+        let busy = runtime_failure(crate::RuntimeError::Overloaded("ASR queue full".into()));
+        assert_eq!(busy.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(busy.headers()[axum::http::header::RETRY_AFTER], "1");
+        let gone = runtime_failure(crate::RuntimeError::Unavailable("draining".into()));
+        assert_eq!(gone.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(runtime_failure(crate::RuntimeError::Rejected("bad".into())).status(), StatusCode::BAD_REQUEST);
+    }
+
+    struct UntilCancelled(Arc<tokio::sync::Notify>);
+    impl Transcriber for UntilCancelled {
+        fn language(&self, _: Option<&str>) -> crate::Result<Option<String>> {
+            Ok(None)
+        }
+        fn transcribe(&mut self, _: &[f32], _: Option<&str>, _: &str, cancel: &AtomicBool) -> crate::Result<Transcript> {
+            while !cancel.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            self.0.notify_one();
+            Err(crate::RuntimeError::Rejected("cancelled".into()))
+        }
+    }
+
+    #[tokio::test]
+    async fn deadline_answers_504_and_cancels_the_work() {
+        let cancelled = Arc::new(tokio::sync::Notify::new());
+        let server = AsrServer::new("test".into(), UntilCancelled(cancelled.clone()))
+            .with_request_timeout(Some(Duration::from_millis(50)));
+        let response = server.clone().router(false).oneshot(request("test", "json")).await.unwrap();
+        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+        tokio::time::timeout(Duration::from_secs(5), cancelled.notified()).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn full_queue_is_429_with_retry_after() {
+        struct Blocks(Arc<tokio::sync::Notify>);
+        impl Transcriber for Blocks {
+            fn language(&self, _: Option<&str>) -> crate::Result<Option<String>> {
+                Ok(None)
+            }
+            fn transcribe(&mut self, _: &[f32], _: Option<&str>, _: &str, cancel: &AtomicBool) -> crate::Result<Transcript> {
+                self.0.notify_one();
+                while !cancel.load(Ordering::Relaxed) {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(crate::RuntimeError::Rejected("cancelled".into()))
+            }
+        }
+        let started = Arc::new(tokio::sync::Notify::new());
+        let server = AsrServer::new("test".into(), Blocks(started.clone()));
+        let Backend::Cohort { mux, .. } = &server.backend else { panic!("cohort") };
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut held = vec![mux.submit(vec![0.0; 8000], None, String::new(), cancel.clone()).unwrap()];
+        tokio::time::timeout(Duration::from_secs(5), started.notified()).await.unwrap();
+        while let Ok(reply) = mux.submit(vec![0.0; 8000], None, String::new(), cancel.clone()) {
+            held.push(reply);
+        }
+        let response = server.clone().router(false).oneshot(request("test", "json")).await.unwrap();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(response.headers()[axum::http::header::RETRY_AFTER], "1");
+        cancel.store(true, Ordering::Relaxed);
+    }
+
+    #[tokio::test]
+    async fn health_and_admission_follow_shutdown_and_engine_exit() {
+        let health = |app: Router| async move {
+            app.oneshot(Request::get("/health").body(Body::empty()).unwrap()).await.unwrap().status()
+        };
+        let server = AsrServer::new("test".into(), Fake);
+        let app = server.clone().router(true);
+        assert_eq!(health(app.clone()).await, StatusCode::OK);
+        server.begin_shutdown();
+        assert_eq!(health(app.clone()).await, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(app.oneshot(request("test", "json")).await.unwrap().status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        struct Crashes;
+        impl Transcriber for Crashes {
+            fn language(&self, _: Option<&str>) -> crate::Result<Option<String>> {
+                Ok(None)
+            }
+            fn transcribe(&mut self, _: &[f32], _: Option<&str>, _: &str, _: &AtomicBool) -> crate::Result<Transcript> {
+                panic!("engine worker exits");
+            }
+        }
+        let server = AsrServer::new("test".into(), Crashes);
+        let app = server.clone().router(false);
+        assert_eq!(health(app.clone()).await, StatusCode::OK);
+        let _ = app.clone().oneshot(request("test", "json")).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while health(app.clone()).await != StatusCode::SERVICE_UNAVAILABLE {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn wav_at_48k_is_resampled() {
+        let app = AsrServer::new("test".into(), Fake).router(false);
+        let response = app.oneshot(request_wav("test", "json", 48_000, 24_000)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+
+    type ClientSocket = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+    /// The next text event, or `{"type":"close","code":..}`; pings and pongs skipped.
+    async fn next_event(socket: &mut ClientSocket) -> serde_json::Value {
+        use tokio_tungstenite::tungstenite::Message as ClientMessage;
+        loop {
+            match tokio::time::timeout(Duration::from_secs(5), socket.next()).await.unwrap().unwrap().unwrap() {
+                ClientMessage::Text(text) => return serde_json::from_str(&text).unwrap(),
+                ClientMessage::Close(frame) => return json!({"type":"close","code":u16::from(frame.unwrap().code)}),
+                _ => {}
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn websocket_resamples_48k_streams_deltas_and_ends_on_shutdown() {
+        use tokio_tungstenite::{connect_async, tungstenite::Message as ClientMessage};
+        struct Lengths(Arc<std::sync::Mutex<Vec<usize>>>);
+        impl Transcriber for Lengths {
+            fn language(&self, _: Option<&str>) -> crate::Result<Option<String>> {
+                Ok(None)
+            }
+            fn transcribe(&mut self, samples: &[f32], _: Option<&str>, _: &str, _: &AtomicBool) -> crate::Result<Transcript> {
+                self.0.lock().unwrap().push(samples.len());
+                Ok(Transcript { text: "hello".into(), language: None })
+            }
+        }
+        let lengths = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let server = AsrServer::new("test".into(), Lengths(lengths.clone()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = server.clone().router(true);
+        let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let url = format!("ws://{address}/v1/audio/transcriptions/stream");
+
+        let (mut socket, _) = connect_async(&url).await.unwrap();
+        socket.send(ClientMessage::Text(json!({"type":"start","version":1,"model":"test","sample_rate":48000,"format":"pcm_s16le","deltas":true}).to_string())).await.unwrap();
+        let ready = next_event(&mut socket).await;
+        assert_eq!((ready["type"].as_str(), ready["sample_rate"].as_u64(), ready["credit_samples"].as_u64()), (Some("ready"), Some(48_000), Some(48_000)));
+        for sequence in 0u64..3 {
+            let mut audio = sequence.to_le_bytes().to_vec();
+            audio.resize(32_008, 0);
+            socket.send(ClientMessage::Binary(audio)).await.unwrap();
+        }
+        socket.send(ClientMessage::Text(r#"{"type":"finish"}"#.into())).await.unwrap();
+        let mut events = Vec::new();
+        loop {
+            let event = next_event(&mut socket).await;
+            if event["type"] == "credit" {
+                continue;
+            }
+            events.push((event["type"].as_str().unwrap().to_owned(), event["text"].as_str().unwrap_or("").to_owned()));
+            if event["type"] == "final" {
+                break;
+            }
+        }
+        assert_eq!(events, [("delta".to_owned(), "hello".to_owned()), ("final".to_owned(), "hello".to_owned())]);
+        assert_eq!(*lengths.lock().unwrap(), [16_000]);
+
+        let (mut socket, _) = connect_async(&url).await.unwrap();
+        socket.send(ClientMessage::Text(json!({"type":"start","version":1,"model":"test","sample_rate":8000,"format":"pcm_s16le"}).to_string())).await.unwrap();
+        assert_eq!(next_event(&mut socket).await["type"], "ready");
+        server.begin_shutdown();
+        let error = next_event(&mut socket).await;
+        assert_eq!((error["type"].as_str(), error["message"].as_str(), error["terminal"].as_bool()), (Some("error"), Some(SHUTTING_DOWN), Some(true)));
+        assert_eq!(next_event(&mut socket).await, json!({"type":"close","code":1001}));
+        match connect_async(&url).await {
+            Err(tokio_tungstenite::tungstenite::Error::Http(response)) => assert_eq!(response.status(), 503),
+            other => panic!("a new session after shutdown must be refused: {:?}", other.map(|_| ())),
+        }
+        task.abort();
+    }
+
 }

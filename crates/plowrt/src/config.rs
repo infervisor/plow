@@ -18,6 +18,27 @@
 use clap::Args;
 use std::sync::OnceLock;
 
+/// A secret: `Debug` never prints it, since the parsed config is logged at startup.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ApiKey(pub String);
+
+impl std::str::FromStr for ApiKey {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, String> {
+        let key = s.trim();
+        if key.is_empty() {
+            return Err("an API key must not be empty".into());
+        }
+        Ok(ApiKey(key.to_owned()))
+    }
+}
+
+impl std::fmt::Debug for ApiKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ApiKey(<redacted>)")
+    }
+}
+
 /// Runtime configuration for the plow serving engine.
 ///
 /// Stored in a global `OnceLock` after CLI parse for hot-path access (single
@@ -103,6 +124,17 @@ pub struct RuntimeConfig {
     /// cadence and all run; loaded, they stop crowding out finals. 1 = every append transcribes.
     #[arg(long = "asr-partial-duty", env = "PLOW_ASR_PARTIAL_DUTY", hide = true, default_value_t = 0.5, global = true)]
     pub asr_partial_duty: f64,
+
+    /// Total deadline (ms) for one transcription, from its admission to its answer: past it the
+    /// work is cancelled and the client gets 504 (HTTP) or a terminal error (WebSocket). 0 = none.
+    #[arg(long = "asr-request-timeout-ms", env = "PLOW_ASR_REQUEST_TIMEOUT_MS", default_value_t = 120_000, global = true)]
+    pub asr_request_timeout_ms: u64,
+
+    /// API keys a request must present as `Authorization: Bearer <key>` or `x-api-key: <key>`.
+    /// Repeatable; the environment form is comma-separated. `/health` and `/healthz` stay open.
+    /// Unset = no authentication.
+    #[arg(long = "api-key", env = "PLOW_API_KEYS", value_delimiter = ',', hide_env_values = true, global = true)]
+    pub api_keys: Vec<ApiKey>,
 
     /// Under `--co-sched deadline`, most streams one vocoder render launch takes (0 = the packet's
     /// largest capacity). A launch is one cooperative grid that holds the device to its end (1.4 s

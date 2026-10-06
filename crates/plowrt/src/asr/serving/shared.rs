@@ -109,10 +109,21 @@ pub(super) struct SharedAsr {
     inflight: Arc<Semaphore>,
     /// Log-mel frames of one encoder attention window (0: the encoder is not windowed).
     window_frames: usize,
+    slug: String,
+    /// Cleared when the encoder thread exits (a panic included): `/health` reports the model.
+    alive: Arc<AtomicBool>,
+}
+
+/// Clears `alive` however the encoder thread ends.
+struct Alive(Arc<AtomicBool>);
+impl Drop for Alive {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Relaxed);
+    }
 }
 
 impl SharedAsr {
-    fn load(dir: &Path, max_context: usize, batch: usize) -> Result<Self> {
+    fn load(slug: &str, dir: &Path, max_context: usize, batch: usize) -> Result<Self> {
         let checkpoint = dir.join("checkpoint");
         let checkpoint = if checkpoint.is_dir() { checkpoint } else { dir.to_path_buf() };
         let prompt = AudioLmPrompt::load(&dir.join("model.pkt"), &checkpoint)?;
@@ -129,9 +140,14 @@ impl SharedAsr {
         let window_frames = encoder.window_rows() / chunking.chunk_frames.div_ceil(chunking.frame_stride) * chunking.chunk_frames;
         let (encode, rx) = std::sync::mpsc::channel::<Encode>();
         let cost_id = crate::sched::cost::id(&encoder_path.to_string_lossy());
+        let alive = Arc::new(AtomicBool::new(true));
+        let guard = Alive(Arc::clone(&alive));
         std::thread::Builder::new()
             .name("plow-asr-encoder".into())
-            .spawn(move || encode_loop(rx, encoder, cost_id))
+            .spawn(move || {
+                let _alive = guard;
+                encode_loop(rx, encoder, cost_id)
+            })
             .map_err(|e| RuntimeError::Msg(format!("spawn ASR encoder thread: {e}")))?;
         Ok(Self {
             prompt: Arc::new(prompt),
@@ -139,6 +155,8 @@ impl SharedAsr {
             max_context,
             inflight: Arc::new(Semaphore::new(batch.saturating_mul(4).max(UPLOADS))),
             window_frames,
+            slug: slug.to_owned(),
+            alive,
         })
     }
 
@@ -169,8 +187,8 @@ impl SharedAsr {
         let (tx, rx) = oneshot::channel();
         self.encode
             .send(Encode { features, urgent, respond: tx })
-            .map_err(|_| RuntimeError::Msg("ASR encoder thread is gone".into()))?;
-        rx.await.map_err(|_| RuntimeError::Msg("ASR encoder thread is gone".into()))?
+            .map_err(|_| RuntimeError::Unavailable("ASR encoder thread is gone".into()))?;
+        rx.await.map_err(|_| RuntimeError::Unavailable("ASR encoder thread is gone".into()))?
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -331,8 +349,8 @@ impl SharedAsr {
             },
         };
         mux.submit_wait(job).await.map_err(|e| match e {
-            crate::serve::mux::SubmitError::Full(_) => RuntimeError::Rejected("ASR queue full".into()),
-            crate::serve::mux::SubmitError::Closed(_) => RuntimeError::Msg("model dispatcher unavailable".into()),
+            crate::serve::mux::SubmitError::Full(_) => RuntimeError::Overloaded("ASR queue full".into()),
+            crate::serve::mux::SubmitError::Closed(_) => RuntimeError::Unavailable("model dispatcher unavailable".into()),
         })?;
         let mut output = forced;
         let mut shown = 0usize;
@@ -440,7 +458,7 @@ fn shared_asr(state: &AppState, slug: &str, dir: &Path) -> Result<Option<Arc<Sha
                 (e.max_ctx(), e.batch())
             })
             .ok_or_else(|| RuntimeError::Rejected(format!("{slug} has no GPU engine")))?;
-        let m = SharedAsr::load(dir, max_context, batch)?;
+        let m = SharedAsr::load(slug, dir, max_context, batch)?;
         tracing::info!(%slug, dir = %dir.display(), "asr: audio LM front bound to the serve mux");
         Some(Arc::new(m))
     } else {
@@ -448,6 +466,23 @@ fn shared_asr(state: &AppState, slug: &str, dir: &Path) -> Result<Option<Arc<Sha
     };
     models().lock().insert(dir.to_path_buf(), model.clone());
     Ok(model)
+}
+
+/// Served models whose encoder thread has exited.
+pub(super) fn dead_encoders() -> Vec<String> {
+    models()
+        .lock()
+        .values()
+        .flatten()
+        .filter(|asr| !asr.alive.load(Ordering::Relaxed))
+        .map(|asr| asr.slug.clone())
+        .collect()
+}
+
+/// Whether `slug` is a bound audio LM (preload binds every resident one); never loads.
+pub(super) fn serves_audio(state: &AppState, slug: &str) -> bool {
+    let Ok(bundle) = state.registry.get(slug) else { return false };
+    matches!(models().lock().get(&bundle.dir), Some(Some(_)))
 }
 
 /// Bind every resident audio LM's front-end now, so the first request does not pay the encoder

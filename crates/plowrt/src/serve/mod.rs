@@ -1,6 +1,7 @@
 //! §G OpenAI-compatible API server.
 
 pub mod admin;
+pub mod auth;
 #[cfg(feature = "cpu")]
 pub mod portable;
 pub mod bench;
@@ -483,6 +484,9 @@ pub struct AppState {
     /// When set, each run records a timeline dumpable at `GET /trace`.
     record_trace: bool,
     trace: Mutex<Timeline>,
+    /// Set once on SIGTERM/SIGINT: `/health` turns 503 and the ASR front refuses new work and
+    /// ends sessions still receiving audio.
+    pub shutdown: tokio::sync::watch::Sender<bool>,
 }
 
 /// Operator-visible residency state of a registered slug.
@@ -554,6 +558,7 @@ impl AppState {
             sampling_honoured: RwLock::new(FxHashMap::default()),
             record_trace,
             trace: Mutex::new(Timeline::new()),
+            shutdown: tokio::sync::watch::channel(false).0,
         }
     }
 
@@ -1074,12 +1079,17 @@ async fn healthz(
         .filter(|(_, m)| m.engine_dead.load(std::sync::atomic::Ordering::Relaxed))
         .map(|(slug, _)| slug.clone())
         .collect();
+    #[cfg(feature = "cuda")]
+    let dead = [dead, crate::asr::serving::dead_encoders()].concat();
+    if *state.shutdown.borrow() {
+        return (axum::http::StatusCode::SERVICE_UNAVAILABLE, "shutting down".into());
+    }
     if dead.is_empty() {
         (axum::http::StatusCode::OK, "ok".into())
     } else {
         (
             axum::http::StatusCode::SERVICE_UNAVAILABLE,
-            format!("engine dead (fatal device fault): {}", dead.join(",")),
+            format!("engine dead (fatal device fault or ASR encoder exit): {}", dead.join(",")),
         )
     }
 }
@@ -1238,7 +1248,7 @@ pub(crate) fn api_error_for(err: &RuntimeError) -> axum::response::Response {
         RuntimeError::ContextLength(_) => {
             ("invalid_request_error", Some("context_length_exceeded"))
         }
-        RuntimeError::Rejected(_) | RuntimeError::Oom(_) => {
+        RuntimeError::Rejected(_) | RuntimeError::Oom(_) | RuntimeError::Overloaded(_) => {
             ("rate_limit_error", Some("server_overloaded"))
         }
         _ => ("server_error", None),
@@ -1319,7 +1329,10 @@ pub(crate) fn status_for(err: &RuntimeError) -> axum::http::StatusCode {
         // 429 was actively harmful: every OpenAI-compatible client treats 429
         // as retryable and backs off in a loop against a permanent failure.
         RuntimeError::ContextLength(_) => StatusCode::BAD_REQUEST,
-        RuntimeError::Rejected(_) | RuntimeError::Oom(_) => StatusCode::TOO_MANY_REQUESTS,
+        RuntimeError::Rejected(_) | RuntimeError::Oom(_) | RuntimeError::Overloaded(_) => {
+            StatusCode::TOO_MANY_REQUESTS
+        }
+        RuntimeError::Unavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
         RuntimeError::DeviceFault { info } if info.fatal => StatusCode::SERVICE_UNAVAILABLE,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     }

@@ -324,9 +324,13 @@ assistant turn.
   the host (one logits-row download per token) and leaves the device multi-step quantum.
   `echo`/prompt logprobs are still refused. Contract and parity: `docs/runtime/gemma4-e4b-h100.md`.
 - **No `/v1/embeddings`.**
-- **No auth and no CORS** on the router. The body-size limit and the admin listener's 0600 UDS
-  are the only access controls; a request timeout is deliberately absent, because a blanket one
-  would cut legitimate long generations.
+- **No CORS and no TLS** on the router. API keys are optional (`--api-key`, repeatable, or
+  `PLOW_API_KEYS=k1,k2`): when set, every route except `/health` and `/healthz` requires
+  `Authorization: Bearer <key>` or `x-api-key: <key>` (401 otherwise), on TCP and on the admin
+  UDS. Without keys the body-size limit and the UDS's mode 0600 are the only access controls,
+  and a non-loopback bind logs a warning. Put a TLS-terminating proxy in front of a public bind.
+  A blanket request timeout is deliberately absent for text, because one would cut legitimate
+  long generations; transcriptions have one (`--asr-request-timeout-ms`, 120 s, 504).
 - **Reasoning traces spend `max_tokens`.** There is no separate budget for the trace, so a
   reasoning model with a small cap can be truncated before its answer. `chat_template_kwargs`
   now gives clients the same escape hatch they use against vLLM, but a real reasoning budget is
@@ -342,11 +346,19 @@ assistant turn.
 - **Probe `/health` (or `/healthz`).** It answers 503 once an engine is dead (a fatal device
   fault poisons the context and every later request fails), so the orchestrator can restart the
   instance or route away from it.
-- SIGTERM/SIGINT stop admission and drain live generations (bounded by `PLOW_DRAIN_TIMEOUT_MS`,
-  30 s when unset) before exiting 0.
+- SIGTERM/SIGINT turn `/health` to 503, stop admission and drain live generations (bounded by
+  `PLOW_DRAIN_TIMEOUT_MS`, 30 s when unset) before exiting 0.
 - Connection limits: `PLOW_HTTP_HEADER_TIMEOUT_MS` (request head and idle keep-alive, 30 s) and
   `PLOW_HTTP_MAX_CONNECTIONS` (4096 per listener). A consumer that stops reading a stream is
   parked for up to 5 s, then cut with "response consumer is too slow".
+- **Transcription** (`POST /v1/audio/transcriptions`, WebSocket
+  `/v1/audio/transcriptions/stream`) is served for every audio-LM bundle (Qwen3-ASR, CUDA);
+  `/v1/models` lists those endpoints on its card. Limits: 4 MiB body, 0.5 to 30 s of 8 to
+  48 kHz WAV (resampled to 16 kHz), 256 concurrent uploads and 256 WebSocket sessions. A full
+  queue answers 429 with `Retry-After: 1`; shutdown and a closed dispatcher answer 503; a missed
+  deadline answers 504. On SIGTERM `/health` turns 503 first, new transcriptions are refused,
+  and WebSocket sessions still receiving audio end with close code 1001. Protocol, fields and
+  status table: `docs/runtime/asr.md`.
 
 ## 8. Unrelated, found while doing the above
 

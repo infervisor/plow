@@ -21,8 +21,13 @@ use crate::serve::AppState;
 /// and how a router discovers the relationship.
 fn card(state: &AppState, id: String, canonical: &str) -> ModelCard {
     let is_alias = id != canonical;
+    let mut x_plow_endpoints = vec!["chat/completions", "completions"];
+    #[cfg(feature = "cuda")]
+    if crate::asr::serving::serves_audio(state, canonical) {
+        x_plow_endpoints.extend(["audio/transcriptions", "audio/transcriptions/stream"]);
+    }
     ModelCard {
-        x_plow_endpoints: vec!["chat/completions", "completions"],
+        x_plow_endpoints,
         max_model_len: state.max_ctx(canonical),
         root: canonical.to_string(),
         parent: is_alias.then(|| canonical.to_string()),

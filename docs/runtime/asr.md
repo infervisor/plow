@@ -81,47 +81,92 @@ curl --fail http://127.0.0.1:8080/v1/audio/transcriptions \
   -F model=decode -F file=@speech.wav -F language=en
 ```
 
-The server binds loopback and admits a bounded queue of HTTP requests or WebSocket
-sessions. Its model-owning worker forms cohorts up to the packet's batch capacity;
-a full queue returns 429. Omit `--websocket` to disable the streaming route. The
-request model is the packet pipeline name (`decode` for this Qwen asset and
-`transcribe` for Nemotron). This uses the `asr` command; the generic text `serve`
-registry is unchanged.
+Two servers expose the same transcription API:
+
+- `plowrt asr --port` serves one packet (Qwen or Nemotron RNNT) on a private cohort engine.
+  It binds loopback unless `--bind` names an interface, and `--socket <path>` adds a Unix
+  socket (mode 0600) serving the same routes. Its model-owning worker forms cohorts up to the
+  packet's batch capacity. The request model is the packet pipeline name (`decode` for Qwen,
+  `transcribe` for Nemotron) or `--served-model-name`.
+- `plowrt serve --assets` serves every audio-LM bundle (Qwen3-ASR) next to text and speech
+  models, the decoder on the model's continuous-batching mux; `/v1/models` lists
+  `audio/transcriptions` and `audio/transcriptions/stream` for them. Sessions
+  (`X-Session-Id`, `append`/`final`/`offset`) and windowed partials are serve-only
+  (`docs/runtime/sessions.md`).
+
+Routes: `POST /v1/audio/transcriptions`, `GET /v1/audio/transcriptions/stream` (WebSocket;
+`plowrt asr` needs `--websocket`), `GET /health`, `/metrics`, `/v1/metrics`, `/v1/models`.
 
 Multipart fields: required `file` and `model`; optional `language`, `prompt`,
-`response_format=json|text`, `temperature=0`. Unknown/duplicate fields and unsupported
-generation options fail. The body limit is 4 MiB. Malformed audio returns 400,
-unsupported sample rate/format 415, excessive duration 413, unknown model 404, and
-engine failures 500. `GET /health` reports readiness after model loading.
-Uploads have a 30-second deadline. Successful inference logs frontend, encoder,
-prefill, decode and total time, token count, audio duration and real-time factor.
-CLI transcript JSON is written to stdout; diagnostics go to stderr.
+`response_format=json|text`, `temperature=0`, `stream=true` (OpenAI server-sent events:
+`transcript.text.delta` as the decoder produces text, then `transcript.text.done`; on
+`plowrt asr` the whole text arrives as one delta). Unknown/duplicate fields and unsupported
+generation options fail. The body limit is 4 MiB. Audio is WAV, mono or stereo (averaged),
+integer 8/16/24/32-bit or 32-bit float, at 8 to 48 kHz; other rates are resampled to 16 kHz
+(windowed sinc). Appended session pieces must be 16 kHz. Audio is 0.5 to 30 seconds.
+
+| Status | Meaning |
+|---|---|
+| 400 | malformed audio or request, unknown field, unsupported option |
+| 401 | API keys are configured and the request has no valid key |
+| 404 | unknown model |
+| 408 | the upload did not arrive within 30 s |
+| 413 | more than 30 s of audio |
+| 415 | unsupported sample rate or WAV format |
+| 429 | queue, upload or session capacity full, or overload; `Retry-After: 1` |
+| 500 | engine failure |
+| 503 | shutting down, engine worker gone, or model dispatcher unavailable |
+| 504 | the transcription missed `--asr-request-timeout-ms` (120 s; the work is cancelled) |
+
+API keys: `--api-key <key>` (repeatable) or `PLOW_API_KEYS=k1,k2` on either server makes every
+route except `/health` and `/healthz` require `Authorization: Bearer <key>` or
+`x-api-key: <key>`, on TCP and on the Unix socket. A non-loopback bind without keys logs a
+warning at startup. There is no TLS: put a TLS-terminating proxy in front of a public bind.
+
+`GET /health` answers 503 while shutting down, after the `plowrt asr` engine worker exits, and
+(on serve) when a model's ASR encoder thread has exited. SIGTERM/SIGINT stops admission (503),
+ends WebSocket sessions still receiving audio with a terminal `error` and close code 1001, lets
+submitted transcriptions answer within `PLOW_DRAIN_TIMEOUT_MS` (30 s), then exits 0. Both
+servers apply `PLOW_HTTP_HEADER_TIMEOUT_MS` and `PLOW_HTTP_MAX_CONNECTIONS`. Successful
+inference logs frontend, encoder, prefill, decode and total time. CLI transcript JSON is
+written to stdout; diagnostics go to stderr.
 
 ## WebSocket protocol v1
 
-Connect to `ws://127.0.0.1:8080/v1/audio/transcriptions/stream` and send:
+Connect to `ws://127.0.0.1:8080/v1/audio/transcriptions/stream` (with the API key header when
+keys are configured) and send:
 
 ```json
 {"type":"start","version":1,"model":"decode","sample_rate":16000,"format":"pcm_s16le"}
 ```
 
-Optional start fields are `language` and `prompt`. The server's `ready` event contains
-a session ID, audio limits, `credit_samples`, and `partial_mode=final_only`.
+`sample_rate` is one of 8000, 16000, 22050, 24000, 32000, 44100 or 48000; the stream is
+resampled to 16 kHz as it arrives. Optional start fields: `language`, `prompt`,
+`partials` (revisable `partial` events while audio arrives) and `deltas` (the final
+transcript's text as `delta` events before `final`). Every new field is optional, so version 1
+clients are unaffected. The `ready` event carries `session_id`, `request_id`, `sample_rate`,
+`max_chunk_bytes`, `credit_samples`, `max_audio_samples` (both in the client's rate),
+`partial_mode` (`revision` with partials, else `final_only`) and `deltas`.
 
 - Each binary message: little-endian `u64` sequence number, starting at zero, then
   mono little-endian signed 16-bit PCM. Maximum PCM payload: 32,000 bytes.
 - Credit counts PCM samples, excluding the eight-byte sequence header. Send no more
-  than the outstanding grant. `credit` events add further credit after processing.
-- Send `{"type":"finish"}` once after the last samples.
-  One `final` event contains the complete transcript. Its stable prefix covers all
-  UTF-8 bytes of the final text.
-- `{"type":"cancel"}` or disconnection cancels the session. Terminal `error` events
-  end unsuccessful sessions. One utterance per connection, maximum 30 seconds.
-
-The server accumulates streamed PCM and decodes once at finalization. Partial
-transcripts require reusable encoder and decoder state; replaying the full model on
-each chunk is intentionally excluded. Credit keeps memory bounded. Idle input and
-blocked output have 30-second deadlines.
+  than the outstanding grant; `credit` events grant up to one second of audio at a time.
+- `partial {revision, text, language, stable_prefix_bytes}` events arrive about once per second
+  of new audio when requested, at most one in flight. On `plowrt serve` a partial encodes only
+  the open encoder window and resumes the session's decoder rows; on `plowrt asr` it
+  re-transcribes the whole buffer.
+- Send `{"type":"finish"}` once after the last samples. With `deltas`, `delta {text}` events
+  stream the transcript as it decodes (one delta with the whole text on `plowrt asr`), then one
+  `final {revision, text, language, stable_prefix_bytes, turn_id, traceparent, server_timing}`.
+- `{"type":"cancel"}` or disconnection cancels the session. Terminal
+  `error {message, terminal: true, code?}` events end unsuccessful sessions; `code` is
+  `overloaded`, `unavailable` or `timeout` (the final missed `--asr-request-timeout-ms`) when
+  it applies. One utterance per connection, maximum 30 seconds.
+- The server pings every 15 s and closes a connection whose peer has not answered for 45 s.
+  30 s without audio or a control message ends the session; a stalled send times out after 30 s.
+- On shutdown a session still receiving audio gets `error {message: "server shutting down"}` and
+  close code 1001; a session whose final is already decoding receives it.
 
 An adapter may reserve part of the advertised audio limit for finalization input.
 Qwen currently appends one second of deterministic low-level audio to close clipped

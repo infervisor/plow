@@ -65,6 +65,9 @@ enum Cmd {
         /// Interface for direct remote inference, such as a WireGuard address.
         #[arg(long, default_value = "127.0.0.1")]
         bind: std::net::IpAddr,
+        /// Also listen on this Unix domain socket (mode 0600), serving the same routes.
+        #[arg(long, requires = "port")]
+        socket: Option<PathBuf>,
         #[arg(long, requires = "port")]
         websocket: bool,
         /// Public model identity. Defaults to the packet pipeline name for compatibility.
@@ -786,6 +789,7 @@ async fn async_main(asset_defaults: Vec<(String, String, String)>) -> Result<(),
             prompt,
             port,
             bind,
+            socket,
             websocket,
             backend,
             served_model_name,
@@ -807,18 +811,8 @@ async fn async_main(asset_defaults: Vec<(String, String, String)>) -> Result<(),
                 )?;
                 println!("{}", serde_json::to_string(&result)?);
             } else {
-                let router =
-                    plowrt::asr::serving::AsrServer::new(served_model, engine).router(websocket);
-                let listener =
-                    tokio::net::TcpListener::bind((bind, port.unwrap()))
-                        .await?;
-                tracing::info!(address = %listener.local_addr()?, websocket, "ASR server ready");
-                axum::serve(listener, router)
-                    .tcp_nodelay(true)
-                    .with_graceful_shutdown(async {
-                        let _ = tokio::signal::ctrl_c().await;
-                    })
-                    .await?;
+                let server = plowrt::asr::serving::AsrServer::new(served_model, engine);
+                serve_asr(server, bind, port.unwrap(), socket, websocket).await?;
             }
             Ok(())
         }
@@ -3899,12 +3893,14 @@ async fn serve(
     let router = app(Arc::clone(&state));
     let shutdown_state = Arc::clone(&state);
     let shutdown_socket = socket.clone();
+    let keys = &plowrt::config::RuntimeConfig::get().api_keys;
+    plowrt::serve::auth::warn_if_open(bind, keys);
 
     // TCP listener: unchanged, always on.
     let tcp_addr = std::net::SocketAddr::from((bind, port));
     let tcp_listener = tokio::net::TcpListener::bind(tcp_addr).await?;
     tracing::info!(%tcp_addr, "plowrt serving OpenAI API over TCP");
-    let tcp_router = router.clone();
+    let tcp_router = plowrt::serve::auth::require(router.clone(), keys);
     let tcp_http = HttpConns::from_config("TCP");
     let mut conn_slots: Vec<(Arc<tokio::sync::Semaphore>, usize)> = tcp_http.slots().into_iter().collect();
     let tcp_task = tokio::spawn(async move {
@@ -3944,7 +3940,7 @@ async fn serve(
             std::fs::set_permissions(&path, perm)?;
         }
         tracing::info!(socket = %path.display(), "plowrt serving OpenAI API over UDS");
-        let uds_router = router.clone().merge(plowrt::serve::admin_app(state));
+        let uds_router = plowrt::serve::auth::require(router.clone().merge(plowrt::serve::admin_app(state)), keys);
         let http = HttpConns::from_config("UDS");
         conn_slots.extend(http.slots());
         Some(tokio::spawn(async move {
@@ -3979,6 +3975,8 @@ async fn serve(
         r = uds => { if let Err(e) = r { tracing::error!(error = %e, "UDS task join"); } }
         signal = shutdown_signal() => {
             tracing::info!(signal, "shutdown: draining in-flight requests");
+            // `/health` turns 503 and the ASR front refuses new work before the muxes drain.
+            shutdown_state.shutdown.send_replace(true);
             drain_for_shutdown(&shutdown_state).await;
             for l in &accept_loops {
                 l.abort();
@@ -3994,6 +3992,85 @@ async fn serve(
         }
     }
     Ok(())
+}
+
+/// `plowrt asr --port`: the cohort engine's routes over TCP and, optionally, a Unix socket, with
+/// serve's connection limits and API keys. SIGTERM/SIGINT stops accepting, ends sessions still
+/// receiving audio, and waits (`PLOW_DRAIN_TIMEOUT_MS`, 30 s) for submitted work to answer.
+#[cfg(any(
+    all(feature = "cpu", feature = "gguf"),
+    all(feature = "metal", target_os = "macos"),
+    feature = "cuda"
+))]
+async fn serve_asr(
+    server: Arc<plowrt::asr::serving::AsrServer>,
+    bind: std::net::IpAddr,
+    port: u16,
+    socket: Option<PathBuf>,
+    websocket: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let keys = &plowrt::config::RuntimeConfig::get().api_keys;
+    plowrt::serve::auth::warn_if_open(bind, keys);
+    let router = plowrt::serve::auth::require(Arc::clone(&server).router(websocket), keys);
+    let listener = tokio::net::TcpListener::bind((bind, port)).await?;
+    tracing::info!(address = %listener.local_addr()?, websocket, "ASR server ready");
+    let tcp = HttpConns::from_config("TCP");
+    let mut slots: Vec<_> = tcp.slots().into_iter().collect();
+    let svc = hyper_util::service::TowerToHyperService::new(router);
+    let tcp_svc = svc.clone();
+    let mut accept = vec![tokio::spawn(async move {
+        loop {
+            let permit = tcp.permit().await;
+            match listener.accept().await {
+                Ok((stream, _)) => {
+                    let _ = stream.set_nodelay(true);
+                    tcp.spawn(stream, tcp_svc.clone(), permit);
+                }
+                Err(e) => accept_failed("TCP", &e).await,
+            }
+        }
+    })];
+    if let Some(path) = &socket {
+        if path.exists() {
+            let _ = std::fs::remove_file(path);
+        }
+        let uds = tokio::net::UnixListener::bind(path)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        }
+        tracing::info!(socket = %path.display(), "ASR server listening on UDS");
+        let http = HttpConns::from_config("UDS");
+        slots.extend(http.slots());
+        accept.push(tokio::spawn(async move {
+            loop {
+                let permit = http.permit().await;
+                match uds.accept().await {
+                    Ok((stream, _)) => http.spawn(stream, svc.clone(), permit),
+                    Err(e) => accept_failed("UDS", &e).await,
+                }
+            }
+        }));
+    }
+    let signal = shutdown_signal().await;
+    tracing::info!(signal, "shutdown: draining ASR work");
+    server.begin_shutdown();
+    for task in &accept {
+        task.abort();
+    }
+    let deadline = tokio::time::Instant::now()
+        + std::time::Duration::from_millis(plowrt::config::RuntimeConfig::get().drain_timeout_ms().unwrap_or(30_000));
+    while !server.idle() && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    flush_connections(&slots, std::time::Duration::from_secs(2)).await;
+    if let Some(path) = socket {
+        let _ = std::fs::remove_file(path);
+    }
+    tracing::info!(drained = server.idle(), "shutdown: done");
+    // The engine thread never returns on its own.
+    std::process::exit(0);
 }
 
 /// Per-listener HTTP connection handling: hyper's header-read timeout (which also ends an idle
