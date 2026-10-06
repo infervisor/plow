@@ -1,4 +1,5 @@
 pub mod conformer;
+pub mod endpoint;
 pub mod frontend;
 #[cfg(feature = "gguf")]
 pub mod nemotron;

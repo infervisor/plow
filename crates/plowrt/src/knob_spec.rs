@@ -453,6 +453,7 @@ pub const RUNTIME: &[KnobSpec] = &[
     KnobSpec::new("rt.asr_partial_duty", Some("PLOW_ASR_PARTIAL_DUTY"), Layer::Runtime, Domain::Str, Default::Static(Val::Str("0.5")), DIAG),
     KnobSpec::new("rt.asr_request_timeout_ms", Some("PLOW_ASR_REQUEST_TIMEOUT_MS"), Layer::Runtime, USIZE, Default::Static(Val::Nat(120_000)), OPT_IN),
     KnobSpec::new("rt.api_keys", Some("PLOW_API_KEYS"), Layer::Runtime, Domain::Str, UNSET, OPT_IN),
+    KnobSpec::new("rt.asr_packets", Some("PLOW_ASR_PACKETS"), Layer::Runtime, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("rt.session_ttl_ms", Some("PLOW_SESSION_TTL_MS"), Layer::Runtime, USIZE, Default::Static(Val::Nat(60_000)), OPT_IN),
     KnobSpec::new("rt.session_max", Some("PLOW_SESSION_MAX"), Layer::Runtime, USIZE, Default::Static(Val::Nat(0)), OPT_IN),
     KnobSpec::new("rt.session_slack", Some("PLOW_SESSION_SLACK"), Layer::Runtime, USIZE, Default::Static(Val::Nat(0)), OPT_IN),

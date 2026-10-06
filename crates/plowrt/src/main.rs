@@ -3318,6 +3318,25 @@ async fn bringup_runtime(
         use plowrt::memory::vmm::VmmOps as _;
         use plowrt::serve::placement::{self, ModelSpec, Place};
 
+        // Packet ASR models load first, on device 0: the planner then sees the memory they took.
+        let packets = &RuntimeConfig::get().asr_packets;
+        let mut packet_bytes = 0u64;
+        if !packets.is_empty() {
+            let free_before = cuda.mem_info()?.0;
+            for p in packets {
+                if state.registry.contains(&p.name) || state.registry.resolve(&p.name).is_some() {
+                    return Err(format!("--asr-packet {}: a registry model already has that name", p.name).into());
+                }
+                let loaded = plowrt::asr::load_packet_transcriber(&p.packet, &p.tokenizer, &p.backend)?;
+                tracing::info!(name = %p.name, packet = %p.packet.display(), driver = %loaded.driver,
+                    backend = loaded.backend, "asr: packet model loaded");
+                plowrt::asr::serving::host_packet_model(&state, p.name.clone(), loaded.engine);
+            }
+            packet_bytes = free_before.saturating_sub(cuda.mem_info()?.0);
+            tracing::info!(models = packets.len(), used_mib = packet_bytes >> 20,
+                "asr: packet models resident; device 0's planner capacity reduced by their memory");
+        }
+
         let mut models: Vec<(String, PathBuf, PathBuf)> = Vec::new();
         let slugs: Vec<String> = state.registry.slugs();
         for slug in slugs {
@@ -3459,6 +3478,9 @@ async fn bringup_runtime(
                     total_bytes = total_bytes.min(be.mem_info()?.1);
                 }
                 group.capacity = budget.map(|b| b.min(total_bytes)).unwrap_or(total_bytes);
+                if group.ordinals.contains(&0) {
+                    group.capacity = group.capacity.saturating_sub(packet_bytes);
+                }
             }
             let groups = groups;
             let layout = placement::assign(&specs, &groups, policy)
@@ -4238,10 +4260,15 @@ async fn drain_for_shutdown(state: &Arc<AppState>) {
         plowrt::config::RuntimeConfig::get().drain_timeout_ms().unwrap_or(30_000),
     );
     let muxes: Vec<_> = state.registry.slugs().iter().filter_map(|s| state.mux(s)).collect();
+    let started = tokio::time::Instant::now();
     futures::future::join_all(muxes.into_iter().map(|mux| async move {
         if tokio::time::timeout(deadline, mux.drain()).await.is_err() {
             mux.preempt().await;
         }
     }))
     .await;
+    #[cfg(feature = "cuda")]
+    while !plowrt::asr::serving::packet_models_idle() && started.elapsed() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
 }

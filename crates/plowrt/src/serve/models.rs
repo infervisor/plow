@@ -40,6 +40,23 @@ fn card(state: &AppState, id: String, canonical: &str) -> ModelCard {
     }
 }
 
+/// A packet ASR model hosted beside the registry (`--asr-packet`): transcription only.
+#[cfg(feature = "cuda")]
+fn audio_card(state: &AppState, id: String) -> ModelCard {
+    ModelCard {
+        x_plow_endpoints: vec!["audio/transcriptions", "audio/transcriptions/stream"],
+        max_model_len: None,
+        root: id.clone(),
+        parent: None,
+        permission: Vec::new(),
+        x_plow_sampling: None,
+        id,
+        object: "model",
+        created: state.started(),
+        owned_by: "plow",
+    }
+}
+
 /// Every registered slug, then every alias — a client that hardcodes a served
 /// name must be able to SEE it in the catalogue, or it cannot discover that the
 /// name works.
@@ -60,6 +77,8 @@ pub async fn list_models(State(state): State<Arc<AppState>>) -> Json<ModelList> 
             .into_iter()
             .map(|(alias, canonical)| card(&state, alias, &canonical)),
     );
+    #[cfg(feature = "cuda")]
+    data.extend(crate::asr::serving::packet_model_names().into_iter().map(|name| audio_card(&state, name)));
     Json(ModelList {
         object: "list",
         data,
@@ -70,6 +89,10 @@ pub async fn list_models(State(state): State<Arc<AppState>>) -> Json<ModelList> 
 /// `max_model_len` before sizing a request; without this route they got a 404
 /// from a server that was serving the model perfectly well.
 pub async fn get_model(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
+    #[cfg(feature = "cuda")]
+    if crate::asr::serving::packet_model_names().contains(&id) {
+        return Json(audio_card(&state, id)).into_response();
+    }
     let canonical = state.registry.resolve(&id).unwrap_or_else(|| id.clone());
     if !state.registry.contains(&canonical) {
         return crate::serve::api_error(

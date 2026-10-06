@@ -39,6 +39,53 @@ impl std::fmt::Debug for ApiKey {
     }
 }
 
+/// `--asr-packet NAME=PATH.pkt[,tokenizer=PATH][,backend=NAME]`: a packet ASR model (Nemotron
+/// RNNT, or a Qwen audio-LM packet) served by `plowrt serve` on its own cohort engine.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AsrPacket {
+    pub name: String,
+    pub packet: std::path::PathBuf,
+    /// The tokenizer (a GGUF for Nemotron); default `<packet dir>/checkpoint`.
+    pub tokenizer: std::path::PathBuf,
+    pub backend: String,
+}
+
+#[cfg(test)]
+#[test]
+fn asr_packet_specs_parse() {
+    let p: AsrPacket = "nemo=/m/nemo.pkt,tokenizer=/m/t.gguf".parse().unwrap();
+    assert_eq!((p.name.as_str(), p.packet.to_str(), p.tokenizer.to_str(), p.backend.as_str()),
+        ("nemo", Some("/m/nemo.pkt"), Some("/m/t.gguf"), "cuda"));
+    let p: AsrPacket = "q=/a/model.pkt,backend=cpu".parse().unwrap();
+    assert_eq!((p.tokenizer.to_str(), p.backend.as_str()), (Some("/a/checkpoint"), "cpu"));
+    for bad in ["", "nemo", "=/x.pkt", "n=", "n=/x.pkt,tok=/y", "n=/x.pkt,tokenizer="] {
+        assert!(bad.parse::<AsrPacket>().is_err(), "{bad}");
+    }
+}
+
+impl std::str::FromStr for AsrPacket {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, String> {
+        let usage = || format!("--asr-packet {s:?}: expected NAME=PATH.pkt[,tokenizer=PATH][,backend=NAME]");
+        let mut fields = s.trim().split(',');
+        let (name, packet) = fields.next().and_then(|f| f.split_once('=')).ok_or_else(usage)?;
+        if name.is_empty() || packet.is_empty() {
+            return Err(usage());
+        }
+        let packet = std::path::PathBuf::from(packet);
+        let mut tokenizer = packet.parent().unwrap_or(std::path::Path::new(".")).join("checkpoint");
+        let mut backend = "cuda".to_owned();
+        for field in fields {
+            match field.split_once('=') {
+                Some(("tokenizer", path)) if !path.is_empty() => tokenizer = path.into(),
+                Some(("backend", name)) if !name.is_empty() => backend = name.to_owned(),
+                _ => return Err(usage()),
+            }
+        }
+        Ok(AsrPacket { name: name.to_owned(), packet, tokenizer, backend })
+    }
+}
+
 /// Runtime configuration for the plow serving engine.
 ///
 /// Stored in a global `OnceLock` after CLI parse for hot-path access (single
@@ -135,6 +182,12 @@ pub struct RuntimeConfig {
     /// Unset = no authentication.
     #[arg(long = "api-key", env = "PLOW_API_KEYS", value_delimiter = ',', hide_env_values = true, global = true)]
     pub api_keys: Vec<ApiKey>,
+
+    /// Packet ASR models `plowrt serve` hosts beside its registry, each on its own cohort engine
+    /// and loaded before the VRAM planner sizes the rest: `NAME=PATH.pkt[,tokenizer=PATH]
+    /// [,backend=NAME]`. Repeatable; the environment form is `;`-separated.
+    #[arg(long = "asr-packet", env = "PLOW_ASR_PACKETS", value_delimiter = ';', global = true)]
+    pub asr_packets: Vec<AsrPacket>,
 
     /// Under `--co-sched deadline`, most streams one vocoder render launch takes (0 = the packet's
     /// largest capacity). A launch is one cooperative grid that holds the device to its end (1.4 s

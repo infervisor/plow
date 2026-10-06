@@ -1094,6 +1094,16 @@ async fn healthz(
     }
 }
 
+fn packet_model(slug: &str) -> bool {
+    #[cfg(feature = "cuda")]
+    return crate::asr::serving::packet_model_names().iter().any(|n| n == slug);
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = slug;
+        false
+    }
+}
+
 fn metrics_models(state: &AppState) -> Vec<(String, Arc<Metrics>, bool)> {
         let mut metrics = state.model_metrics.write();
         for slug in state.registry.slugs() {
@@ -1110,7 +1120,7 @@ fn metrics_models(state: &AppState) -> Vec<(String, Arc<Metrics>, bool)> {
             (
                 slug.clone(),
                 Arc::clone(m),
-                state.mux(slug).is_some() && state.residency(slug).admits(),
+                state.mux(slug).is_some() && state.residency(slug).admits() || packet_model(slug),
             )
         }).collect();
         models.sort_unstable_by(|a, b| a.0.cmp(&b.0));

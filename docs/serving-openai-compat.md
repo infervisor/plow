@@ -352,8 +352,10 @@ assistant turn.
   `PLOW_HTTP_MAX_CONNECTIONS` (4096 per listener). A consumer that stops reading a stream is
   parked for up to 5 s, then cut with "response consumer is too slow".
 - **Transcription** (`POST /v1/audio/transcriptions`, WebSocket
-  `/v1/audio/transcriptions/stream`) is served for every audio-LM bundle (Qwen3-ASR, CUDA);
-  `/v1/models` lists those endpoints on its card. Limits: 4 MiB body, 0.5 to 30 s of 8 to
+  `/v1/audio/transcriptions/stream`) is served for every audio-LM bundle (Qwen3-ASR, CUDA)
+  and every `--asr-packet` model (Nemotron RNNT on its own cohort engine); `/v1/models` lists
+  those endpoints on its card. WebSocket `mode: continuous` streams unbounded audio as
+  endpointed segments, one `final` each. Limits: 4 MiB body, 0.5 to 30 s of 8 to
   48 kHz WAV (resampled to 16 kHz), 256 concurrent uploads and 256 WebSocket sessions. A full
   queue answers 429 with `Retry-After: 1`; shutdown and a closed dispatcher answer 503; a missed
   deadline answers 504. On SIGTERM `/health` turns 503 first, new transcriptions are refused,

@@ -93,6 +93,21 @@ Two servers expose the same transcription API:
   `audio/transcriptions` and `audio/transcriptions/stream` for them. Sessions
   (`X-Session-Id`, `append`/`final`/`offset`) and windowed partials are serve-only
   (`docs/runtime/sessions.md`).
+- `plowrt serve --asr-packet NAME=PATH.pkt[,tokenizer=PATH][,backend=NAME]` (repeatable;
+  `PLOW_ASR_PACKETS` is `;`-separated) also hosts packet ASR models such as Nemotron RNNT, each
+  on its own cohort engine (as `plowrt asr` runs it) under `NAME`. They load on device 0 before
+  the VRAM planner places the registry models, whose capacity drops by the memory they took.
+  They share the server's routes, auth, `/v1/models` (an audio-only card), per-model
+  `/metrics`, `/health` (503 if the engine worker exits), shutdown drain and request deadline.
+  The tokenizer defaults to `<packet dir>/checkpoint`; Nemotron needs its GGUF.
+
+One process serving Qwen3-ASR 1.7B and 0.6B and Nemotron 3.5 on one 24 GB L4 (18.3 GiB):
+
+```sh
+plowrt serve --assets qwen3-asr-1.7b/assets --assets qwen3-asr-0.6b/assets \
+  --asr-packet "nemotron-3.5-asr=nemo/nemotron.pkt,tokenizer=nemotron-3.5-asr-streaming-0.6b.q8_0.gguf" \
+  --api-key "$KEY" --port 8080
+```
 
 Routes: `POST /v1/audio/transcriptions`, `GET /v1/audio/transcriptions/stream` (WebSocket;
 `plowrt asr` needs `--websocket`), `GET /health`, `/metrics`, `/v1/metrics`, `/v1/models`.
@@ -162,11 +177,37 @@ clients are unaffected. The `ready` event carries `session_id`, `request_id`, `s
 - `{"type":"cancel"}` or disconnection cancels the session. Terminal
   `error {message, terminal: true, code?}` events end unsuccessful sessions; `code` is
   `overloaded`, `unavailable` or `timeout` (the final missed `--asr-request-timeout-ms`) when
-  it applies. One utterance per connection, maximum 30 seconds.
+  it applies. In utterance mode: one utterance per connection, maximum 30 seconds (see continuous mode).
 - The server pings every 15 s and closes a connection whose peer has not answered for 45 s.
   30 s without audio or a control message ends the session; a stalled send times out after 30 s.
 - On shutdown a session still receiving audio gets `error {message: "server shutting down"}` and
   close code 1001; a session whose final is already decoding receives it.
+
+### Continuous mode
+
+`"mode":"continuous"` in `start` (default `"utterance"`, the behaviour above) streams unbounded
+audio on one connection. An energy endpointer on the 16 kHz stream (20 ms frames; the noise
+floor is the quietest frame of the last 3 s, so stationary noise is not speech; speech is
+12 dB above it and above -54 dBFS for at least 100 ms) cuts it into segments, keeping 200 ms of
+context on each side. Optional start fields:
+
+- `min_silence_ms` (200..=2000, default 600): silence that ends a segment.
+- `max_segment_ms` (4000 up to the model's audio limit less its final padding; default 25000
+  or that limit): a longer segment is cut at its quietest frame of the last 3 s, and the next
+  segment starts there.
+
+`ready` echoes `mode`, `min_silence_ms` and `max_segment_ms`; `max_audio_samples` is null.
+Each segment is transcribed as an utterance while audio keeps arriving. Events carry
+`segment` (from 0): `partial {segment, revision, ...}` for the open segment (when
+`partials`), `delta {segment, text}` (when `deltas`), and one
+`final {segment, start_ms, end_ms, text, language, stable_prefix_bytes, turn_id, traceparent,
+server_timing}` per segment, in segment order. Offsets are stream milliseconds. A segment that
+misses `--asr-request-timeout-ms` (per segment) or fails gets a non-terminal
+`error {segment, message, code?, terminal: false}` and the session continues. At most two
+segments await their results; past that the server withholds credit until one answers. Only the
+open segment is buffered. After `{"type":"finish"}` the open segment is closed and transcribed,
+then `{"type":"done","segments":N}` arrives and the server closes normally (1000). Audio with
+no speech yields no segment.
 
 An adapter may reserve part of the advertised audio limit for finalization input.
 Qwen currently appends one second of deterministic low-level audio to close clipped
