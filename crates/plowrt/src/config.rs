@@ -738,6 +738,11 @@ pub struct CpuRuntimeConfig {
     /// them (instead of page-interleaving every weight across the nodes).
     #[arg(long = "cpu-weight-affine", env = "PLOW_CPU_WEIGHT_AFFINE", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub weight_affine: bool,
+
+    /// Serve weights read only as embedding-gather tables from the mmapped checkpoint instead
+    /// of copying them (only gathered rows become resident).
+    #[arg(long = "cpu-mmap-gather", env = "PLOW_CPU_MMAP_GATHER", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub mmap_gather: bool,
 }
 
 /// NVIDIA / sm_120 runtime knobs.

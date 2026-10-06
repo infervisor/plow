@@ -1288,6 +1288,7 @@ pub const EMIT: &[KnobSpec] = &[
 
 #[rustfmt::skip]
 pub const RAW_ENV: &[KnobSpec] = &[
+    KnobSpec::new("env.PLOW_AMX_DEBUG", Some("PLOW_AMX_DEBUG"), Layer::RawEnv, Domain::Str, UNSET, DIAG),
     KnobSpec::new("env.PLOW_BENCH_SHAPE", Some("PLOW_BENCH_SHAPE"), Layer::RawEnv, Domain::Str, UNSET, DIAG),
     KnobSpec::new("env.PLOW_GEMV_MFMA4", Some("PLOW_GEMV_MFMA4"), Layer::RawEnv, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("env.PLOW_GATE_HIER_PF", Some("PLOW_GATE_HIER_PF"), Layer::RawEnv, Domain::Bool, OFF, OPT_IN),

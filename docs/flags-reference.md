@@ -960,8 +960,15 @@ bundle in the first place, in [CPU execution](runtime/cpu.md).
 | `--fp8-dir DIR` | `PLOW_FP8_DIR` | unset | fp8 weight twin. Runtime-wide, but this is how a CPU bundle gets W8A16/W8A8 weights. |
 | `--cpu-global-queue=B` | `PLOW_CPU_GQ` | off | Global op-major work queue (windowed per segment and L2 domain, with stealing) instead of static per-cu streams. **~2x slower** on the EPYC 9654; kept for A/B. |
 | `--cpu-l2-place=B` | `PLOW_CPU_L2_PLACE` | off | Place executors by the packet's L2 locality domains instead of `cu % nodes`. **1.5x slower**, never faster (placement report in the `perf-data/cpu-numa-placement` campaign, kept out of source control). Inert without domains in the blob; a balance guard declines a losing plan even when on. |
+| `--cpu-sram=B` | `PLOW_CPU_SRAM` | off | Pseudo-lock worker scratch into L2 and hot layer weights into L3 through `/dev/pseudo_lock` (`runtime/cpu/driver`). Measured slower on Xeon 6975P-C Gemma-4 serving (12B prefill 606 → 817–982 ms); kept for A/B. |
+| `--cpu-weight-affine=B` | `PLOW_CPU_WEIGHT_AFFINE` | off | Bind each weight's per-executor slice to the node of the worker that reads it. −2 to −5% on Xeon 6975P-C (SNC3); set in the Gemma-4 Xeon recipes. |
+| `--cpu-mmap-gather=B` | `PLOW_CPU_MMAP_GATHER` | on | Serve weights read only as embedding-gather tables straight from the mmapped checkpoint (only gathered rows become resident). Gemma-4 E2B: −4.4 GiB resident. |
 
-The last two are off because they were *measured* worse, not because they are
+`PLOW_AMX_DEBUG` (comma list, diagnostic only) toggles AMX kernel study switches in
+`runtime/cpu/dev/amx` (`nopack`, `noxpack`, `wstage`, `nogrid`, `l1pf`, `nopf`, `demote`,
+`wpanel2`, …); some produce wrong output and exist only to bound a cost.
+
+The global-queue and L2-place knobs are off because they were *measured* worse, not because they are
 unfinished — neither changes what is computed, so both are safe to flip for an A/B
 on another host.
 

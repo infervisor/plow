@@ -116,6 +116,8 @@ pub struct HostTensor {
     ptr: *mut u8,
     layout: Layout,
     pub bytes: usize,
+    /// A view into memory someone else owns (the mmapped checkpoint); never freed here.
+    borrowed: bool,
 }
 
 // SAFETY: plain heap memory; concurrent access is disjoint by the schedule,
@@ -127,6 +129,39 @@ unsafe impl Sync for HostTensor {}
 /// stream: slice `s` of an op owns rows `g_range(N, s, blocks)` (runtime/cpu/dev/golden/golden.h)
 /// and runs on cu `c`, whose executor sits on `nodes[c % nodes.len()]` (`workers::cu_map`
 /// without a locality plan). Taken from the narrowest decode rung; the others slice identically.
+/// Drop our mapping of a copied checkpoint range: the copy is the live tensor, and the shared file
+/// pages would otherwise stay mapped (and counted in Pss) for the server's lifetime.
+fn release_mapped(src: &[u8]) {
+    let a = (src.as_ptr() as usize).next_multiple_of(4096);
+    let z = (src.as_ptr() as usize + src.len()) & !4095;
+    if z > a {
+        // SAFETY: advice on whole pages inside our read-only checkpoint mapping; a later reader
+        // faults them back in from the file. Partial edge pages (shared with neighbours) stay.
+        unsafe { libc::madvise(a as *mut c_void, z - a, libc::MADV_DONTNEED) };
+    }
+}
+
+/// Tensors whose every use in every program is the table operand (t[1]) of an EMBED gather.
+fn gather_only_tensors(blob: &DevBlob) -> rustc_hash::FxHashSet<usize> {
+    use packet::dev::DevOp;
+    let mut gather: rustc_hash::FxHashSet<usize> = Default::default();
+    let mut other: rustc_hash::FxHashSet<usize> = Default::default();
+    for d in blob.progs.iter().flat_map(|p| &p.insts) {
+        for (k, &t) in d.t.iter().enumerate() {
+            if t == packet::dev::TENSOR_NONE16 {
+                continue;
+            }
+            if d.op == DevOp::Embed as u16 && k == 1 {
+                gather.insert(t as usize);
+            } else {
+                other.insert(t as usize);
+            }
+        }
+    }
+    gather.retain(|h| !other.contains(h));
+    gather
+}
+
 fn weight_affinity(
     blob: &DevBlob,
     nodes: &[u32],
@@ -203,6 +238,16 @@ impl HostTensor {
             }
         }
         bound
+    }
+
+    /// Zero-copy view of `bytes` at `ptr`, owned elsewhere for at least this tensor's lifetime.
+    fn borrowed(ptr: *const u8, bytes: usize) -> HostTensor {
+        HostTensor {
+            ptr: ptr as *mut u8,
+            layout: Layout::from_size_align(bytes.max(1), 1).expect("byte layout"),
+            bytes,
+            borrowed: true,
+        }
     }
 
     #[cfg(test)]
@@ -298,7 +343,7 @@ impl HostTensor {
             // SAFETY: ptr/size describe our own mapping.
             unsafe { libc::madvise(ptr as *mut c_void, size, advice) };
         }
-        let tensor = HostTensor { ptr, layout, bytes };
+        let tensor = HostTensor { ptr, layout, bytes, borrowed: false };
         #[cfg(target_os = "linux")]
         if huge && !nodes.is_empty() {
             let maxnode = nodes.iter().copied().max().unwrap() as usize + 1;
@@ -362,6 +407,9 @@ impl HostTensor {
 
 impl Drop for HostTensor {
     fn drop(&mut self) {
+        if self.borrowed {
+            return;
+        }
         #[cfg(target_os = "linux")]
         if self.layout.align() == HUGE {
             unsafe { libc::munmap(self.ptr.cast(), self.layout.size()) };
@@ -464,6 +512,8 @@ pub struct CpuModel {
     pub kernels: Vec<KernelTable>,
     pub weight_bytes: u64,
     pub load_ms: f64,
+    /// Keeps the checkpoint mapped while borrowed (gather-only) tensors point into it.
+    _ckpt: Option<Checkpoint>,
 }
 
 // SAFETY: raw pointers are into `tensors`' own allocations.
@@ -866,6 +916,15 @@ impl CpuModel {
             rustc_hash::FxHashMap::default()
         };
         let mut affine_bytes = 0usize;
+        // PLOW_CPU_MMAP_GATHER: a weight read only as an EMBED table (row gather, e.g. Gemma-4
+        // E2B/E4B per-layer embeddings: 262144 x 35 x 256 bf16 = 4.7 GB) is served straight from the
+        // mmapped checkpoint; only the rows actually gathered become resident.
+        let gather_only: rustc_hash::FxHashSet<usize> = if crate::config::RuntimeConfig::get().cpu.mmap_gather {
+            gather_only_tensors(&blob)
+        } else {
+            Default::default()
+        };
+        let mut borrowed_bytes = 0usize;
         let mut l3_left: Vec<usize> =
             vec![sram.map_or(0, |d| d.caps.l3_lock_bytes_per_node as usize); lock_nodes.len()];
         let mut l3_rr = 0usize;
@@ -916,6 +975,13 @@ impl CpuModel {
                         src.len()
                     )));
                 }
+                if gather_only.contains(&h) {
+                    borrowed_bytes += bytes;
+                    weight_bytes += td.bytes;
+                    tensors.push(HostTensor::borrowed(src.as_ptr(), bytes));
+                    names.push(td.name.clone());
+                    continue;
+                }
                 let lock_len = bytes.next_multiple_of(4096);
                 let hot = td.name.contains(".layers.") && !td.name.contains("embed") && bytes >= HUGE / 8;
                 let lock_node = (hot && !l3_left.is_empty())
@@ -942,6 +1008,7 @@ impl CpuModel {
                 };
                 // SAFETY: fresh allocation of `bytes`, no other reference yet.
                 unsafe { std::slice::from_raw_parts_mut(t.as_ptr(), t.bytes).copy_from_slice(src) };
+                release_mapped(src);
                 weight_bytes += td.bytes;
                 t
             } else if let Some(g) = gen_of.get(&(h as u32)) {
@@ -1045,6 +1112,12 @@ impl CpuModel {
                 "cpu: decode weights pseudo-locked in L3"
             );
         }
+        if borrowed_bytes > 0 {
+            tracing::info!(
+                gib = format_args!("{:.2}", borrowed_bytes as f64 / (1u64 << 30) as f64),
+                "cpu: gather-only tables served from the mmapped checkpoint"
+            );
+        }
         if !affine.is_empty() {
             tracing::info!(
                 tensors = affine.len(),
@@ -1122,6 +1195,7 @@ impl CpuModel {
             kernels,
             weight_bytes,
             load_ms,
+            _ckpt: ckpt,
         })
     }
 

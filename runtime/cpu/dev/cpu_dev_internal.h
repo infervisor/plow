@@ -4,9 +4,11 @@
 
 #include "cpu_dev.h"
 
-/* 8 MiB: the pack-free AMX GEMM keeps an x panel for every token plus fp32 partials per (strip,
- * token block) here (amx/gemm_amx.c wm_run); allocated once per worker thread. */
-#define PLOW_CPU_SCRATCH_BYTES (8u << 20)
+/* 4 MiB: the pack-free AMX GEMM keeps a token chunk's x panel plus fp32 partials per (strip,
+ * token block) here (amx/gemm_amx.c wm_run), its chunk capped by the 1.5 MiB L2 budget; the
+ * largest other user is the M <= 32 decode GEMV pack (K/32 KiB per 16 rows: 1.3 MiB at K 21504).
+ * Allocated and touched once per worker thread, so it is resident: 8 MiB cost 768 MB at 96. */
+#define PLOW_CPU_SCRATCH_BYTES (4u << 20)
 
 /* The live table (dispatch.c). Registrars write it during plow_cpu_init only. */
 plow_cpu_kernel_fn* plow_cpu_table(void);

@@ -342,7 +342,8 @@ static void block(const plow_bf16* A0, const plow_bf16* A1, size_t lda, const ui
  * pack-free path. `pack`: force the old B-strip-pack driver (correct results, A/B timing).
  * Read once, off by default. */
 enum { AMX_DBG_NOPACK = 1, AMX_DBG_NOTDP = 2, AMX_DBG_NOSTAGE = 4, AMX_DBG_PACK = 8, AMX_DBG_NOXPACK = 16, AMX_DBG_WSTAGE = 32, AMX_DBG_NOGRID = 64,
-       AMX_DBG_L1PF = 128, AMX_DBG_NOSTREAM = 256, AMX_DBG_NOPF = 512 };
+       AMX_DBG_L1PF = 128, AMX_DBG_NOSTREAM = 256, AMX_DBG_NOPF = 512,
+       AMX_DBG_WPANEL2 = 1024 };
 static int amx_debug_flags(void) {
     static int f = -1;
     if (f < 0) {
@@ -357,6 +358,7 @@ static int amx_debug_flags(void) {
         if (e && strstr(e, "l1pf")) f |= AMX_DBG_L1PF;
         if (e && strstr(e, "nostream")) f |= AMX_DBG_NOSTREAM;
         if (e && strstr(e, "nopf")) f |= AMX_DBG_NOPF;
+        if (e && strstr(e, "wpanel2")) f |= AMX_DBG_WPANEL2;
         for (const char* p = e ? strstr(e, "pack") : NULL; p; p = strstr(p + 1, "pack"))
             if (p == e || p[-1] == ',' || p[-1] == ' ') f |= AMX_DBG_PACK;
     }
@@ -682,7 +684,8 @@ static int wm_run(const gemm_args* g, uint32_t slice, uint32_t nblk, PlowCpuCtx*
              * strips: 2 MiB of panel, +57% GEMM_GLU time). */
             if (m > 1u && (sram_budget
                                ? 2u * (WM_TB_BYTES + strips * nacc * 4096u) > sram_budget
-                               : strips * nacc * (32u * WM_KP * 2u + 2u * 4096u) + 2u * WM_TB_BYTES > WM_L2_BUDGET))
+                               : ((dbg & AMX_DBG_WPANEL2) ? 2u : strips) * nacc * 32u * WM_KP * 2u +
+                                     strips * nacc * 2u * 4096u + 2u * WM_TB_BYTES > WM_L2_BUDGET))
                 continue;
             const uint64_t cost = 128u * rows + 30u * strips * 32u * nacc + rows * strips * 32u * nacc;
             if (cost < best) best = cost, gm = m, gn = n < S ? n : S;
@@ -719,8 +722,11 @@ static int wm_run(const gemm_args* g, uint32_t slice, uint32_t nblk, PlowCpuCtx*
          * the 260 MiB L3), which is the far cheaper miss. */
         /* fp4 keeps ONE dequantized strip per accumulator hot (the rest of the slice's weight is
          * still packed fp4 in L3), so the resident weight does not scale with nstrip. */
+        /* The loop is panel -> strip -> token block: only the current strip (and the prefetched
+         * next one) is re-read across the chunk's token blocks. PLOW_AMX_DEBUG=wpanel2 budgets
+         * those two instead of the slice's whole W panel. */
         const size_t wpanel = mx ? (size_t)nacc * 32u * (WM_KP * 2u + WM_KP / 2u)
-                                 : (size_t)nstrip * nacc * 32u * WM_KP * 2u;
+                                 : (size_t)((dbg & AMX_DBG_WPANEL2) && nstrip > 2u ? 2u : nstrip) * nacc * 32u * WM_KP * 2u;
         const uint32_t ntb_l2 = sram_budget ? (sram_budget / per_tb ? (uint32_t)(sram_budget / per_tb) : 1u)
                                 : wpanel + per_tb <= WM_L2_BUDGET
                                     ? (uint32_t)((WM_L2_BUDGET - wpanel) / per_tb)
