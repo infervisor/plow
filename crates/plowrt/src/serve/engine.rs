@@ -130,6 +130,9 @@ pub trait SeqEngine {
     fn advance_packed_prefill(&mut self, members: &[(usize, &[u32])]) -> crate::Result<()>;
     fn prefill_frontier(&self, slot: usize) -> Option<usize>;
     fn next_prefill_rows(&self, _slot: usize) -> Option<u32> { None }
+    /// Keep `slot`'s first `rows` KV rows (a retained session prefix) so its next prefill
+    /// starts there; `false` = the slot no longer holds them and the prompt starts cold.
+    fn resume_slot(&mut self, _slot: usize, _rows: usize) -> bool { false }
     /// What this backend declares to the backend-neutral step planner
     /// (`crate::sched::step`). The default is a whole-prompt engine with no packing.
     fn step_backend(&self) -> crate::sched::step::Backend {
@@ -383,6 +386,8 @@ impl ServeEngine {
         match self {
             #[cfg(feature = "cuda")]
             ServeEngine::Cuda(e) => e.slot_resume_supported(),
+            #[cfg(feature = "cpu")]
+            ServeEngine::Cpu(_) => true,
             #[allow(unreachable_patterns)]
             _ => false,
         }

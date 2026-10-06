@@ -102,6 +102,14 @@ pub struct CpuServe {
     pf_chunk: u32,
     /// The logits row holding each slot's latest token (prefill: 0, decode: the slot).
     lp_row: Vec<usize>,
+    /// Rows a released slot still holds (its last sequence's `pos`): a session resume keeps
+    /// any prefix of them. Idle slots park on this row, the next one a resume rewrites.
+    kept: Vec<u32>,
+    /// Rows the current sequence resumed from (`cached_rows`).
+    resumed: Vec<u32>,
+    /// Smallest sliding ring's `stride - window`: a resume may drop at most this many tail
+    /// rows, or the suffix prefill would read ring entries the dropped rows overwrote.
+    ring_slack: u32,
 }
 
 impl CpuServe {
@@ -124,6 +132,10 @@ impl CpuServe {
             ));
         }
         let pf_chunk = crate::config::RuntimeConfig::get().cpu.prefill_chunk;
+        // No manifest: only an exact continuation resumes.
+        let ring_slack = eng.model().blob.with_packet_view(plow_asset::live_kv::emit).map_or(0, |m| {
+            m.caches.iter().filter(|c| c.window > 0).map(|c| c.stride.saturating_sub(c.window)).min().unwrap_or(u32::MAX)
+        });
         tracing::info!(
             max_ctx,
             batch,
@@ -150,6 +162,9 @@ impl CpuServe {
             buckets,
             pf_chunk,
             lp_row: (0..batch).collect(),
+            kept: vec![0; batch],
+            resumed: vec![0; batch],
+            ring_slack,
         })
     }
 
@@ -267,13 +282,14 @@ impl CpuServe {
         for s in 0..self.batch {
             // A slot mid-prefill is parked on its frontier row: the batched step's KV write
             // for a non-fed slot lands on `pos`, and the frontier row is exactly the one the
-            // next chunk rewrites — rows `[0, pf_pos)` stay intact. Idle slots park on row 0.
+            // next chunk rewrites — rows `[0, pf_pos)` stay intact. Idle slots park the same way
+            // on `kept`, so rows `[0, kept)` survive for a session resume.
             let (p, k) = if self.live[s] {
                 (self.pos[s], self.pos[s] + 1)
             } else if self.pf_pos[s] > 0 {
                 (self.pf_pos[s], self.pf_pos[s] + 1)
             } else {
-                (0, 1)
+                (self.kept[s], self.kept[s] + 1)
             };
             self.pos_stage[s] = p;
             self.kvlen_stage[s] = k;
@@ -299,14 +315,39 @@ impl CpuServe {
         Ok(feeds.iter().map(|&(s, _)| (s, out[s])).collect())
     }
 
-    /// Free a slot: the KV block is fixed and preallocated, so this only stops
-    /// the slot being fed; the next request rewrites every row it reads.
+    /// Free a slot: the KV block is fixed and preallocated, so this only stops the slot being
+    /// fed. Its rows stay for a session resume; any other next request rewrites what it reads.
     pub fn release(&mut self, slot: usize) {
         if slot < self.batch {
+            self.kept[slot] = if self.live[slot] {
+                self.pos[slot].min(self.max_ctx as u32 - 1)
+            } else {
+                self.pf_pos[slot]
+            };
             self.live[slot] = false;
             self.pos[slot] = 0;
             self.pf_pos[slot] = 0;
+            self.resumed[slot] = 0;
         }
+    }
+
+    /// Start `slot`'s next prefill at row `rows` over the rows its last sequence left.
+    pub fn resume_slot(&mut self, slot: usize, rows: usize) -> bool {
+        let ok = slot < self.batch
+            && !self.live[slot]
+            && self.pf_pos[slot] == 0
+            && rows > 0
+            && rows <= self.kept[slot] as usize
+            && rows < self.max_ctx
+            && {
+                let dropped = self.kept[slot] as usize - rows;
+                dropped == 0 || dropped < self.ring_slack as usize
+            };
+        if ok {
+            self.pf_pos[slot] = rows as u32;
+            self.resumed[slot] = rows as u32;
+        }
+        ok
     }
 }
 
@@ -345,6 +386,14 @@ impl SeqEngine for CpuServe {
 
     fn prefill_frontier(&self, slot: usize) -> Option<usize> {
         (slot < self.batch).then(|| self.pf_pos[slot] as usize)
+    }
+
+    fn resume_slot(&mut self, slot: usize, rows: usize) -> bool {
+        CpuServe::resume_slot(self, slot, rows)
+    }
+
+    fn cached_rows(&self, slot: usize) -> usize {
+        self.resumed.get(slot).map_or(0, |&r| r as usize)
     }
 
     /// `tick_max_bucket` is the mux's interleave budget (u32::MAX when no slot decodes, so a

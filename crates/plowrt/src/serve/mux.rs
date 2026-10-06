@@ -874,7 +874,10 @@ pub fn spawn(
         let e = e.lock();
         (e.slot_resume_supported(), e.is_cuda() && e.prefix_cache_enabled(), e.kv_row_bytes())
     });
-    #[cfg(not(feature = "cuda"))]
+    #[cfg(all(not(feature = "cuda"), feature = "cpu"))]
+    let (resume_supported, prefix_cache, kv_row_bytes) =
+        (state.gpu_engine(&slug).is_some_and(|e| e.lock().slot_resume_supported()), false, 0);
+    #[cfg(not(any(feature = "cuda", feature = "cpu")))]
     let (resume_supported, prefix_cache, kv_row_bytes) = (false, false, 0);
     if let Some(b) = kv_budget {
         tracing::info!(
@@ -4138,6 +4141,16 @@ fn run_one_tick(
                     // AMD prefill and decode share scratch and run sequentially.
                     // This interval measures isolated prefill, not mixed-kernel overlap.
                     let pk_t = packlog::on().then(Instant::now);
+                    // A retained session's rows: the engine keeps them and prefills only the
+                    // suffix, or refuses and the prompt starts cold.
+                    if let Some(s) = slots[i].as_mut().filter(|s| s.pf_pos == 0 && s.resume > 0) {
+                        if s.cfg.is_none() && e.resume_slot(i, s.resume) {
+                            s.pf_pos = s.resume;
+                            s.cached_tokens = s.resume;
+                        } else {
+                            s.resume = 0;
+                        }
+                    }
                     let slot_ref = slots[i].as_ref().expect("found above");
                     // §TTFT: everything between `mux.submit` and this line — the
                     // dispatcher wake, the formation hold, admission, and the
