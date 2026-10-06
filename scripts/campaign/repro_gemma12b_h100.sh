@@ -20,7 +20,8 @@
 # vllm 0.28.0 for the baseline server, default $PYREF); REF / REF_VLLM (FP32 reference + vLLM capture,
 # default $OUT/fp32ref/{ref,vllm}.json); CORPUS (dir with pg1342.txt pg944.txt repo-docs.md
 # repo-code.rs, only for `ref` when $REF is absent); OBJECT_ENV (extra `--object-env`, e.g.
-# "NVCC_APPEND_FLAGS=-ccbin=/usr/bin/g++-14" on a box without nix); RT_ENV (runtime env for plowrt,
+# "NVCC_APPEND_FLAGS=-ccbin=/usr/bin/g++-14 -DPLOW_NV_GLU_QUANT_CACHE=1 -DPLOW_NV_GLU_QUANT_WPR=1" on a
+# box without nix: it REPLACES the recipes' [objects.env] value, so repeat their flags); RT_ENV (runtime env for plowrt,
 # e.g. "PLOW_LIBCUDA=/usr/lib/x86_64-linux-gnu/libcuda.so.1"); VLLM_ENV (env for the vLLM server).
 #
 # The qualified campaign (2026-10-05) used REF sha256 b2988c51…, prompts sha256 103024034d…, vLLM

@@ -19,6 +19,11 @@
 # B64 decode projections, always-shipped 8192 rung (plowrt 712e2dca, packet 6f36c31a): FP32 gate
 # PASS (kl_mean 0.097 vs vLLM 0.128); strict vs vLLM 0.28 BF16 KV (MATCHED, EQUIVALENT, REPS=2):
 # 4K/128 c32/c128 0.97x/0.97x, 15K/128 1.02x/1.03x, agentic16k c32/c64/c128 0.72x/2.25x/1.77x.
+# 2026-10-06 vendor-GEMM prefill attention from 128-row requests, routed B32 decode (CUTLASS + light
+# attention + fused norm/GLU quant), GF16 global decode (plowrt fa8c4afc, packet 4e474dc4): FP32 gate
+# PASS at concurrency 16/64 (kl_mean 0.084/0.121 vs vLLM 0.128); strict vs vLLM 0.28 BF16 KV (MATCHED,
+# EQUIVALENT, REPS=2): 4K/128 c32/c128 1.02x/1.00x, 15K/128 1.05x/1.05x, agentic16k c32/c64/c128
+# 0.89x/2.77x/1.99x.
 schema = "plow.recipe.v1"
 namespace = "infervisor"
 name = "gemma-4-12b"
