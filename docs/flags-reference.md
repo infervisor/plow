@@ -1000,14 +1000,17 @@ decode width is at most 4 with an empty queue and the throughput rules from 8 ro
 live sequences reserving 90% of the KV-capacity budget: it enters throughput at once and returns to
 latency after 2 s of a narrow window under 75% of the budget. `/metrics` exports the class in force
 (`plowrt_serve_mode`, 1 = throughput) and `plowrt_serve_mode_switches_total`. Startup decisions (decode rung ladder, KV admission) take the throughput
-side under `auto`.
+side under `auto`. The CUDA packed prefill launch width follows
+demand the slots cannot seat instead of the decode width: `auto` widens to the full ladder at once
+when a widest launch of prompt rows waits with every slot taken or KV reaches 90%, and narrows back to the
+per-request cap after 2 s with no request waiting and KV under 75% (`plowrt_prefill_launch_rows`; log `prefill width switched`).
 
 | mechanism | latency | throughput | capability gate |
 |---|---|---|---|
 | decode quantum K (rows the pipeline does not carry) | CUDA one token group (1; Veena 7); AMD 4 | 8 | off under decode objects, roles, all-cuBLASLt ladders, recurrent state; AMD TP needs `PLOW_TP_AGREE_EVERY>1`; CPU 1 |
 | single-step while prefill, an arrival or a freed slot is pending | on | on | K > 1 |
 | lookahead-1 decode pipeline | on | on | CUDA greedy rows; same gate as K |
-| prefill rows per tick | widest launch | widest launch | `PLOW_TBT_SLO_MS` plans it on AMD |
+| prefill rows per launch while requests decode | the per-request cap (`PLOW_MAX_REQUEST_CHUNK`) | widest launch | CUDA packed prefill; `PLOW_TBT_SLO_MS` plans it on AMD |
 | prefill packing | queue-sized (oldest prompt whole) | fill the launch | CUDA packed-prefill metadata; AMD packed siblings |
 | decode riding a prefill launch | `sched::ride` cost model | same | token batch |
 | rung fast probe | off | on | a rung ladder |
@@ -1040,7 +1043,7 @@ Removed (a set value is ignored with a startup warning; recipes and scripts may 
 | var | default | effect |
 |---|---|---|
 | `PLOW_FUSION=1` / `--fusion` | off | AMD TP1 dense BF16 runtime prefill/decode fusion. Derives schedules from ordinary prefill/decode programs at model load and packs current rows per launch. Requires the normal gfx942 `interp_mixed_gq.elf`; unsupported programs or objects fall back with a warning. No fusion compiler flags or asset metadata. `--fusion=false` disables it. Multistep decode remains a separate setting. |
-| `PLOW_PF_INTERLEAVE=N` | unset (the widest compiled prefill launch) | **Expert.** Prefill rows admitted per tick while requests decode, on CUDA and AMD; `0` = unset. A cap protects live decoders from a long prompt at the cost of its TTFT: CUDA 1024 / 512 lost 18-35% (`docs/runtime/gemma4-e4b-h100.md`). |
+| `PLOW_PF_INTERLEAVE=N` | unset (CUDA: the objective's launch width; AMD: the widest compiled prefill launch) | **Expert.** Prefill rows admitted per tick while requests decode, on CUDA and AMD; set, it replaces the objective's CUDA launch width, and `0` pins the widest launch. A cap protects live decoders from a long prompt at the cost of its TTFT: CUDA 1024 / 512 lost 18-35% (`docs/runtime/gemma4-e4b-h100.md`). |
 | `PLOW_PF_CHUNK=C` | 0 (off) | **Expert.** Per-request prefill chunk-row cap (CUDA and AMD TP1/TP). On AMD it is also what makes two concurrent prompts co-packable, and isolated admission rotates across slots under it instead of serving the oldest first. `=2048` cost GLM-5.3 6.2% (`docs/amd/glm53-mi300x.md`). |
 | `PLOW_PF_DEFER_DECODE=1` | off | **Expert.** While prefill remains, skip decode so later decode ticks run at full width: CUDA 8x127k +7.1%, Veena c64 +2% / c128 -3%, AMD a null (`docs/runtime/tts.md`, `docs/amd/tp-bringup-mi300x.md`). Never derived. |
 | `PLOW_TBT_SLO_MS=<ms>` / `--tbt-slo-ms` | unset (off) | **AMD SLO-aware prefill budget.** While any request decodes, every tick still runs every decode row, and its prefill is sized in milliseconds instead of rows: candidates are taken in order and each gets the largest chunk (a multiple of the smallest rung, or its whole planned chunk) whose launch keeps the predicted tick — prefill launches + the decode pass + host remainder — at or under `ms`. Several requests may each get a launch. A shrunk chunk is re-planned as `[c0, c0+n)` through the ordinary span planner, so at deep prior it runs in the sparse bucket at its real row count (`PLOW_AMD_TAIL_SPARSE_CTX`). **Progress rule:** when even the smallest chunk would break the target, the tick decodes alone, and every `K = ceil(p_min / (target - decode - host))` ticks one chunk sized to `K x` that slack runs, so the mean inter-token time over the `K` ticks stays at or under the target; `K` is capped at 8, so a target below the decode pass itself still advances one smallest chunk every 8 ticks. Costs come from an online per-tick model (`sched::slo::TickCost`: per-bucket RLS over rows and prior context, decode pass by kind, host EWMA), seeded from GLM-5.3 TP8 tick logs and updated from every tick. The target is met on an upper quantile, not the mean: each tick is planned against its prediction times the running p90 of actual / predicted for its class (plain, completing a prompt, starting one — the error tail sits in the last two). Under a target, cross-request packing, the token-batch body and the mixed step are not used (their cost is not modelled). With `PLOW_TICK_LOG=1` each planned tick prints `SLOPLAN budget= pred= progress= k= launches=[slot:rows@prior]`. Unset (with `PLOW_TTFT_SLO_MS` unset) = the throughput schedule, unchanged. Attainment is exported as `plowrt_slo_*_total` and in `plowrt bench`'s `slo` block. |

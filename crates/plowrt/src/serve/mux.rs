@@ -866,6 +866,8 @@ pub fn spawn(
     #[cfg(not(any(feature = "cuda", feature = "hsa", feature = "cpu")))]
     let kv_budget: Option<crate::sched::admission::KvBudget> = None;
     #[cfg(feature = "cuda")]
+    let pf_rungs = state.gpu_engine(&slug).and_then(|e| e.lock().pf_launch_rungs());
+    #[cfg(feature = "cuda")]
     let prefix_probe = state.gpu_engine(&slug).and_then(|e| e.lock().vmm_prefix_probe());
     #[cfg(not(feature = "cuda"))]
     let prefix_probe: Option<crate::memory::vmm::PrefixProbe> = None;
@@ -1157,14 +1159,7 @@ pub fn spawn(
                 metrics
                     .decode_occupied_extent
                     .store(occupied_extent as u64, Ordering::Relaxed);
-                let kv_used = kv_budget.filter(|b| b.max_rows() > 0).map_or(0.0, |b| {
-                    let rows: u64 = slots
-                        .iter()
-                        .flatten()
-                        .map(|s| reserved_kv_rows(s.prompt_ids.len(), s.gen.max_tokens, s.out_ids.len()))
-                        .sum();
-                    rows as f64 / b.max_rows() as f64
-                });
+                let kv_used = kv_used(kv_budget, &slots);
                 if crate::serve::policy::observe(crate::serve::policy::Load {
                     width: occupied_extent,
                     queued: waiting.len(),
@@ -1194,6 +1189,25 @@ pub fn spawn(
             } else {
                 capacity
             };
+            #[cfg(feature = "cuda")]
+            if let Some((request_rows, top_rows)) = pf_rungs {
+                // Only demand past every slot: a rung admission hold (E4B c128's cold start
+                // queued 32K rows behind a 96-slot rung) is not overload.
+                let overflow_rows = if slots.iter().all(Option::is_some) {
+                    waiting.iter().map(|(job, _)| job.prompt_ids.len()).sum()
+                } else {
+                    0
+                };
+                crate::serve::policy::observe_prefill(crate::serve::policy::PrefillLoad {
+                    overflow_rows,
+                    queued: waiting.len() + rx.len(),
+                    top_rows,
+                    kv_used: kv_used(kv_budget, &slots),
+                });
+                metrics
+                    .prefill_launch_rows
+                    .store(pf_launch_rows(request_rows, top_rows).0 as u64, Ordering::Relaxed);
+            }
 
             let mut queued_behind = false;
             // Non-blocking drain: fill every idle slot the queue can serve.
@@ -4641,6 +4655,34 @@ fn pf_interleave_rows() -> usize {
     crate::config::RuntimeConfig::get().pf_interleave_rows()
 }
 
+/// Packed prefill rows per launch while requests decode, and the launch rows riders included:
+/// `PLOW_PF_INTERLEAVE` when set (`0` pins the widest launch), else the objective's width
+/// (`policy::prefill_launch_rows`). The objective's width bounds the whole launch like a ladder
+/// top: bounding only the prompt rows ran 2048 of them + 3 riders as a 4096-row launch (E4B c64,
+/// 31 of 98 launches; tok/s -14%).
+#[cfg(feature = "cuda")]
+fn pf_launch_rows(request: usize, top: usize) -> (usize, usize) {
+    match crate::config::RuntimeConfig::get().pf_interleave {
+        Some(_) => (pf_interleave_rows().min(top), top),
+        None => {
+            let rows = crate::serve::policy::prefill_launch_rows(request, top);
+            (rows, rows)
+        }
+    }
+}
+
+/// Share of the KV-capacity budget the live sequences reserve (0 without a budget).
+fn kv_used(kv_budget: Option<crate::sched::admission::KvBudget>, slots: &[Option<Slot>]) -> f64 {
+    kv_budget.filter(|b| b.max_rows() > 0).map_or(0.0, |b| {
+        let rows: u64 = slots
+            .iter()
+            .flatten()
+            .map(|s| reserved_kv_rows(s.prompt_ids.len(), s.gen.max_tokens, s.out_ids.len()))
+            .sum();
+        rows as f64 / b.max_rows() as f64
+    })
+}
+
 /// Prefill rows for one launch, from the queue (the latency objective's packing).
 ///
 /// `rows` are the waiting prompts' offered rows, oldest first. A launch costs a fixed
@@ -5063,10 +5105,10 @@ fn gpu_prefill_batched_pass(
             .map_or(1, |sp| sp.overlay.len() / sp.overlay_pos.len());
         bytes as usize / 4 / hidden.max(1)
     });
-    let launch_cap = if cold && !bounded_tick {
-        budget_max
+    let (launch_cap, launch_max) = if cold && !bounded_tick {
+        (budget_max, budget_max)
     } else {
-        pf_interleave_rows().min(budget_max)
+        pf_launch_rows(e.pf_request_max_rows(), budget_max)
     };
     // Bound each candidate before fair sharing. Short requests return unused
     // rows to later candidates in the same launch.
@@ -5178,7 +5220,7 @@ fn gpu_prefill_batched_pass(
             unified = false;
             decode_rows = 0;
         }
-        let per_launch = launch_cap.min(budget_max.saturating_sub(decode_rows));
+        let per_launch = launch_cap.min(launch_max.saturating_sub(decode_rows));
         // Every overlay row of a launch is staged at once: bound its rows by the overlay's.
         let per_launch = per_launch.min(overlay_rows.unwrap_or(usize::MAX)).max(1);
         let per_launch = if adaptive {
