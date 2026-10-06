@@ -2223,13 +2223,14 @@ fn cubin_arch_option(arch: &str) -> Result<&'static str, String> {
     match arch {
         "sm_90a" => Ok("-DPLOW_SM90A_CUBIN=ON"),
         "sm_120a" => Ok("-DPLOW_SM120_CUBIN=ON"),
+        "sm_89" => Ok("-DPLOW_SM89_CUBIN=ON"),
         _ if !arch.starts_with("sm_") => Err(format!(
             "--emit devblob+cubin: only the nvcc backend is wired; --arch {arch} would \
              need the hipcc/.hsaco backend (runtime/amd/), which is not implemented."
         )),
         _ => Err(format!(
             "--emit devblob+cubin: no served interpreter object is defined for --arch {arch}; \
-             supported CUDA architectures are sm_90a and sm_120a."
+             supported CUDA architectures are sm_90a, sm_120a and sm_89."
         )),
     }
 }
@@ -3080,6 +3081,7 @@ mod cli_tests {
             cubin_arch_option("sm_120a").unwrap(),
             "-DPLOW_SM120_CUBIN=ON"
         );
+        assert_eq!(cubin_arch_option("sm_89").unwrap(), "-DPLOW_SM89_CUBIN=ON");
         assert!(cubin_arch_option("sm_100a")
             .unwrap_err()
             .contains("no served interpreter"));

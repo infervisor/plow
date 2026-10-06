@@ -8584,13 +8584,14 @@ pub fn run_verified(args: EmitArgs, verify: Option<VerifyHook>) {
     }
     if emit_config::active().prefill_cublaslt {
         assert!(
-            (model_type.starts_with("gemma4") || model_type == "llama" || model_type == "qwen3_asr")
+            ((model_type.starts_with("gemma4") || model_type == "llama" || model_type == "qwen3_asr")
                 && arch == "sm_90a"
+                || model_type == "qwen3_asr" && arch == "sm_89")
                 && tp == 1
                 && (!emit_config::active().any_fp8_weights()
                     || (model_type.starts_with("gemma4") && emit_config::active().w8a8))
                 && !emit_config::active().mxfp4,
-            "cuBLASLt prefill emission requires Gemma 4 W8A8 or supported BF16 on single-GPU SM90"
+            "cuBLASLt prefill emission requires Gemma 4 W8A8 or supported BF16 on single-GPU SM90 (Qwen3-ASR BF16 also on SM89)"
         );
     }
     if emit_config::active().gemma4_sm90_gemm_glu_role {
@@ -10695,20 +10696,24 @@ fn emit_dense_gqa(
         } else {
             (&[], &[400, 800, 1200, 1600, 2000])
         };
+        let max_chunks = emit_config::active().asr_packed_max_chunks.unwrap_or(u32::MAX);
+        let packed: Vec<u32> = packed.iter().copied().filter(|&chunks| chunks <= max_chunks).collect();
+        let audio_dims = asr::qwen::AudioDims::from_checkpoint(&dir)
+            .unwrap_or_else(|error| panic!("Qwen audio encoder dims: {error}"));
         let mut encoder = match packed.first() {
-            Some(&chunks) => asr::qwen::lower_packed_audio_encoder(chunks, n_cu),
-            None => asr::qwen::lower_audio_encoder(3000, n_cu),
+            Some(&chunks) => asr::qwen::lower_packed_audio_encoder(chunks, n_cu, audio_dims),
+            None => asr::qwen::lower_audio_encoder(3000, n_cu, audio_dims),
         }
         .unwrap_or_else(|error| panic!("Qwen audio packet lowering: {error}"));
         for chunks in packed.iter().skip(1) {
-            let bucket = asr::qwen::lower_packed_audio_encoder(*chunks, n_cu)
+            let bucket = asr::qwen::lower_packed_audio_encoder(*chunks, n_cu, audio_dims)
                 .unwrap_or_else(|error| panic!("Qwen audio packet lowering: {error}"));
             encoder
                 .merge_capacity(bucket)
                 .unwrap_or_else(|error| panic!("Qwen audio packet capacity: {error}"));
         }
         for &capacity in single {
-            let bucket = asr::qwen::lower_audio_encoder(capacity, n_cu)
+            let bucket = asr::qwen::lower_audio_encoder(capacity, n_cu, audio_dims)
                 .unwrap_or_else(|error| panic!("Qwen audio packet lowering: {error}"));
             encoder
                 .merge_capacity(bucket)

@@ -40,7 +40,15 @@ __device__ __forceinline__ constexpr bool sp_op_on(unsigned op) {
 /* Covers the GEMM ring, AttentionF32's Q/K/V stages (SpfShape), and
  * GroupedAttention's K stage for group_rows*(head_width+1) <= SP_ARENA_FLOATS - 2048 (larger
  * groups read K from global instead). */
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 890
+/* sm_89 caps one block at 99 KiB of shared memory, static included. The hd128 AttentionF32
+ * stage (25856 floats) does not fit; that arm traps there. */
+#define SP_ARENA_FLOATS 24576
+#define SPF_HD128 0
+#else
 #define SP_ARENA_FLOATS 25856
+#define SPF_HD128 1
+#endif
 static_assert(SP_ARENA_FLOATS >= SPG_SMEM_FLOATS, "speech arena");
 
 /* The arena is the dynamic shared memory base (interp_sm120.cu's `arena`, the test kernel's). The
@@ -3469,8 +3477,8 @@ struct SpfShape {
     static constexpr int LDK = BK + 4 > (BK * SPF_LDP + HW - 1) / HW ? BK + 4 : (BK * SPF_LDP + HW - 1) / HW;
     static constexpr int FLOATS = HW * LDQ + HW * LDK + BK * LDV;
 };
-static_assert(SP_ARENA_FLOATS >= SpfShape<128, 64>::FLOATS && SP_ARENA_FLOATS >= SpfShape<64, 128>::FLOATS,
-              "attention stages");
+static_assert(SP_ARENA_FLOATS >= SpfShape<64, 128>::FLOATS, "attention stages");
+static_assert(!SPF_HD128 || SP_ARENA_FLOATS >= SpfShape<128, 64>::FLOATS, "attention stages");
 
 template <int HW, int BK>
 static __device__ __noinline__ void sp_attention_f32(const PlowDevInst* in, void* const* T, unsigned slice,
@@ -4499,7 +4507,13 @@ static __device__ __noinline__ void d_attention_f32(const PlowDevInst* in, void*
         else sp_attention_tc64(in, T, slice, nblk, arena);
     }
     else if (in->i[4] == 64u) sp_attention_f32<64, 128>(in, T, slice, nblk, arena);
-    else if (in->i[4] == 128u) sp_attention_f32<128, 64>(in, T, slice, nblk, arena);
+    else if (in->i[4] == 128u) {
+#if SPF_HD128
+        sp_attention_f32<128, 64>(in, T, slice, nblk, arena);
+#else
+        __trap();
+#endif
+    }
 }
 
 /* An op outside PLOW_SPEECH_OPS traps; its arm is dead code. */

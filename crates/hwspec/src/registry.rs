@@ -13,6 +13,7 @@ use crate::spec::GpuSpec;
 /// Every GPU model this crate describes.
 pub const ALL: &[&GpuSpec] = &[
     &ada::RTX_4090,
+    &ada::L4,
     &h100::H100_SXM5,
     &h100::H100_PCIE,
     &h100::H100_NVL,
@@ -36,6 +37,7 @@ pub const ALIASES: &[(&str, &str)] = &[
     // NVIDIA Ada
     ("rtx4090", "RTX 4090"),
     ("4090", "RTX 4090"),
+    ("l4", "L4"),
     // NVIDIA Hopper
     ("h100", "H100 SXM5"),
     ("h100sxm5", "H100 SXM5"),

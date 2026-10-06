@@ -408,3 +408,46 @@ These made no gain at B=1:
 - segment class slicing
 - folding each AddNorm into its consuming GEMV (−17 µs at B=1; the per-block norm staging costs
   about as much as the phases it removes, and removing AddNorm outright only bounds the gain at 165 µs)
+
+## L4 (Ada, sm_89)
+
+The L4 runs the sm_120 warp32 interpreter built for sm_89 (`interp_sm89*.cubin`: mma.sync and
+cp.async, no wgmma/TMA). Qwen decoder prefill projections go through cuBLASLt (BF16); encoders,
+RNNT and decode stay on the interpreter. sm_89 allows 99 KiB of shared memory per block, so the
+speech arena is 96 KiB there and the hd128 `AttentionF32` arm traps (no supported model uses it).
+
+```sh
+# Qwen3-ASR (1.7B; the 0.6B recipe is qwen3-asr-0.6b.l4.bf16.toml)
+python3 scripts/campaign/campaign.py build scripts/campaign/recipes/qwen3-asr.l4.bf16.toml \
+  --hf-dir models/Qwen3-ASR-1.7B --out <dir>
+plowrt serve --assets <dir>/assets [--assets <0.6B dir>/assets]
+
+# Nemotron 3.5: packet for 58 SMs, plus a speech object carrying its ops (163..178)
+asr_nemotron_pipeline_compile model.q8_0.gguf 200,400,...,3000 <dir>/nemotron.pkt 16 58
+cmake -S runtime -B <build> -DPLOW_SM89_CUBIN=ON -DPLOW_CUBIN_SPEECH=ON -DPLOW_CUBIN_ARCH=sm_89 \
+  -DPLOW_CUBIN_GEMMA=OFF "-DPLOW_EXTRA_DEFINES=-DPLOW_SPEECH_OPS=0xffffull"
+cmake --build <build> --target nv_cubins   # copy <build>/cubin/interp_sm89_speech.cubin beside nemotron.pkt
+plowrt asr --packet <dir>/nemotron.pkt --tokenizer model.q8_0.gguf --backend cuda --port 8080
+```
+
+An unspecialized speech object (all 42 arms) spends over 40 minutes in ptxas; specialize it.
+
+The L4 recipes compile `max_ctx` 1024 (KV 3.5 GiB at 32 slots) and cap packed encoder buckets at
+64 chunks (`PLOW_ASR_PACKED_MAX_CHUNKS`; the 192-chunk default holds ~5.7 GB of encoder
+activations). With both, all three models share one 23 GiB L4: 18.5 GiB loaded, 18.7 GiB peak.
+
+73-clip LibriSpeech dummy set (`scripts/asr/nvidia/served_bench.py`), each model alone, 2026-10-06:
+
+| model | conc | WER | p50 | p90 | RTFx |
+|---|---|---|---|---|---|
+| Qwen3-ASR-1.7B | 1 / 16 | 3.826% | 324 / 1519 ms | 593 / 2332 ms | 17.8 / 60.5 |
+| Qwen3-ASR-0.6B | 1 / 16 | 4.261% | 134 / 654 ms | 246 / 1014 ms | 42.9 / 140.5 |
+| Nemotron 3.5 (Q8_0) | 1 / 4 | 5.13% | 127 / 537 ms | 191 / 688 ms | 47.1 / 48.0 |
+
+All three at once (Qwen c16 + c16, Nemotron c4): WER unchanged; RTFx 27.1 / 27.5 / 20.0.
+Qwen 1.7B decode is 14.2 ms/token at B=1, against an 11.5 ms floor for 3.44 GB of BF16 weights
+at the 300 GB/s datasheet bandwidth. `plowrt asr` decodes one RNNT utterance at a time and
+queues four; more concurrent requests get 429.
+
+`nemotron-speech-streaming-en-0.6b` does not compile: its attention window (71 keys) exceeds
+the 64-key `RelativeAttentionF32` packet limit.

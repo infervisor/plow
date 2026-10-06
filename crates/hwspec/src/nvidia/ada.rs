@@ -54,3 +54,28 @@ pub const RTX_4090: GpuSpec = GpuSpec {
     clock_boost: Hertz::from_mhz(2520),
     soc: None,
 };
+
+/// L4 — AD104, 58 SMs, 24 GB GDDR6 (192-bit), 300 GB/s, 72 W PCIe.
+pub const L4: GpuSpec = GpuSpec {
+    name: "L4",
+    vendor: Vendor::Nvidia,
+    arch: Arch::AdaLovelace,
+    compute_cap: (8, 9),
+    sm_count: 58,
+    sm: ADA_SM,
+    dsm: None,
+    l2: Bytes::mib(48),
+    mem: MemorySpec {
+        kind: MemKind::Gddr6,
+        capacity: Bytes::gib(24),
+        bandwidth: GBps(300.0),
+        bandwidth_measured: None,
+        bus_width_bits: 192,
+    },
+    copy_engines: 2,
+    interconnect: None,
+    chiplet: None,
+    l2_partitioning: None,
+    clock_boost: Hertz::from_mhz(2040),
+    soc: None,
+};

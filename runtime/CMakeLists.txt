@@ -513,6 +513,8 @@ option(PLOW_SM120_CUBIN "Emit the sm_120a .cubin artifacts `plowrt serve` loads"
 # That script remains the way to get the experimental segmented/lean objects
 # (PLOW_BUILD_SEG etc.); the two DEFAULT served objects come from here.
 option(PLOW_SM90A_CUBIN "Emit the sm_90a .cubin artifacts `plowrt serve` loads" OFF)
+# Ada (L4 / RTX 4090): the sm_120a TU without Hopper arms, -arch sm_89, own symbols.
+option(PLOW_SM89_CUBIN "Emit the sm_89 .cubin artifacts `plowrt serve` loads" OFF)
 option(PLOW_SM120_CUBIN_FP8KV "Also emit the _fp8kv cubin variants (all enabled arches)" OFF)
 option(PLOW_SM120_CUBIN_SEG "Also emit the _pfseg (fat) and _pfgemm (lean occ-2) segmented prefill cubins" OFF)
 option(PLOW_CUBIN_PACKED_PREFILL "Emit ordinary and packet-request ABI segmented prefill pairs" OFF)
@@ -541,7 +543,7 @@ set(PLOW_EXTRA_DEFINES "" CACHE STRING "extra raw nvcc flags appended to every s
 # they have always been. See the header block in nvidia/interp_sm120.cu.
 set(PLOW_CUBIN_CONFIG "" CACHE FILEPATH "generated plow_config.h to specialise the cubins for one packet")
 
-if(PLOW_SM120_CUBIN OR PLOW_SM90A_CUBIN)
+if(PLOW_SM120_CUBIN OR PLOW_SM90A_CUBIN OR PLOW_SM89_CUBIN)
     # An fp8-KV build without FASTPF puts the PREFILL objects on the synchronous
     # PIPE=0 staging arm. That is correct, and it is slow: measured 175.90 s vs
     # 32.39 s on a 127k prefill. Say so at configure time rather than let it be
@@ -639,6 +641,8 @@ if(PLOW_SM120_CUBIN OR PLOW_SM90A_CUBIN)
     set(_nv_var_sm90a
         -DPLOW_NV_MLA=0 -DPLOW_NV_MAMBA=0 -DPLOW_NV_DSA=0
         -DPLOW_NV_GEMV_RB=1 -DPLOW_NV_RB_GEMV=1 -DPLOW_NV_RB_QKV=1 -DPLOW_NV_RB_LMHEAD=1 -DPLOW_NV_GEMV_XREG=1 -DPLOW_NV_GEMV_KPANEL=1 -DPLOW_MOE_DOWN_LANESPLIT=1 -DPLOW_NV_FA_WPR=1 -DPLOW_NV_FP8_RB=4)
+    # sm_89 carries only the dead-arm gating; the H100 decode-arm fixes are unmeasured on Ada.
+    set(_nv_var_sm89 -DPLOW_NV_MLA=0 -DPLOW_NV_MAMBA=0 -DPLOW_NV_DSA=0)
     set(_cubin_variants "")
     if(PLOW_SM120_CUBIN)
         list(APPEND _cubin_variants
@@ -647,6 +651,10 @@ if(PLOW_SM120_CUBIN OR PLOW_SM90A_CUBIN)
     if(PLOW_SM90A_CUBIN)
         list(APPEND _cubin_variants
             "interp_sm90a|sm_90a|interp_sm90a.cu|_Z12interp_sm90a11PlowProgram|_Z15interp_sm90a_pf11PlowProgram|_nv_var_sm90a")
+    endif()
+    if(PLOW_SM89_CUBIN)
+        list(APPEND _cubin_variants
+            "interp_sm89|sm_89|interp_sm89.cu|_Z11interp_sm8911PlowProgram|_Z14interp_sm89_pf11PlowProgram|_nv_var_sm89")
     endif()
 
     set(_cubin_outs "")
@@ -760,7 +768,7 @@ if(PLOW_SM120_CUBIN OR PLOW_SM90A_CUBIN)
     # defines, so it is not a row in the table above. A failure here is non-fatal:
     # serving falls back to host sampling (hence `optional`).
     set(_smp_src "${CMAKE_CURRENT_SOURCE_DIR}/nvidia/sample_sm120.cu")
-    if((PLOW_SM120_CUBIN OR PLOW_SM90A_CUBIN) AND EXISTS "${_smp_src}")
+    if((PLOW_SM120_CUBIN OR PLOW_SM90A_CUBIN OR PLOW_SM89_CUBIN) AND EXISTS "${_smp_src}")
         set(_smp_out "${PLOW_CUBIN_DIR}/sample_sm120.cubin")
         add_custom_command(OUTPUT "${_smp_out}"
             COMMAND bash "${_cubin_run}" "${PLOW_CUBIN_NVCC}" "${_smp_out}" plow_sample optional

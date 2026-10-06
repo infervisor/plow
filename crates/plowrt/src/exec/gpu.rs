@@ -156,6 +156,14 @@ fn interpreter_profile(cc: (u32, u32)) -> Option<InterpreterProfile> {
             prefill_symbol: "_Z15interp_sm120_pf11PlowProgram",
             embedded_decode: "interp_sm120",
         }),
+        (8, 9) => Some(InterpreterProfile {
+            tag: "sm89",
+            decode_file: "interp_sm89.cubin",
+            prefill_file: "interp_sm89_pf.cubin",
+            decode_symbol: "_Z11interp_sm8911PlowProgram",
+            prefill_symbol: "_Z14interp_sm89_pf11PlowProgram",
+            embedded_decode: "interp_sm89",
+        }),
         _ => None,
     }
 }

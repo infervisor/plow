@@ -1,0 +1,62 @@
+# Trial: Qwen3-ASR-0.6B on L4 (sm_89, 58 SMs). The H100 recipe minus the Hopper-only decode knobs
+# (gemv_k8, FA fold, dense tune, packed small-hd prefill) and the wgmma `_gw` rungs past 32.
+# Decoder prefill projections go through cuBLASLt (bf16, segment_roles sm89 policy).
+#
+#   PLOW_CAMPAIGN_NO_NIX=1 python3 scripts/campaign/campaign.py build \
+#     scripts/campaign/recipes/qwen3-asr.l4.bf16.toml --hf-dir <Qwen3-ASR dir> --out <fresh dir>
+
+schema = "plow.recipe.v1"
+namespace = "infervisor"
+name = "qwen3-asr-0.6b"
+label = "sm89-l4-tp1"
+network = "qwen3"
+doc = "docs/runtime/asr.md"
+
+[target]
+vendor = "nvidia"
+isa = "sm_89"
+sku = "L4"
+units = 58
+num_gpus = 1
+parallel = "tp"
+
+[checkpoint]
+source = "hf:Qwen/Qwen3-ASR-0.6B"
+
+[cell]
+name = "qwen3-asr-0.6b-l4"
+hf_dir = "{hf:Qwen/Qwen3-ASR-0.6B}"
+gpu = "l4"
+arch = "sm_89"
+n_cu = 58
+n_gpu = 1
+# 1024 (KV 3.5 GiB at 32 slots): 30 s of audio is ~390 rows + ~60 prompt, and every ASR model
+# (Qwen 1.7B + 0.6B + Nemotron) then shares one 24 GB L4.
+max_ctx = 1024
+
+[emit]
+emit = "devblob+cubin"
+args = ["--served-name", "qwen3-asr-0.6b"]
+[emit.env]
+PLOW_VERIFY_BIN = "{repo}/lean-plow/.lake/build/bin/plow_verify"
+PLOW_MAX_CHUNK = "512"
+PLOW_PF_LADDER_APPEND = "256,384"
+PLOW_DECODE_BATCH_LADDER = "1,2,4,8,16,32"
+PLOW_EMIT_PREFILL_CUBLASLT = "1"
+PLOW_NO_GLU_FUSE = "1"
+# Packed encoder buckets up to 64 chunks (64 s of audio): the 192-chunk default's shared FP32
+# activations take ~5.7 GB, which does not leave room for a second model on a 24 GB L4.
+PLOW_ASR_PACKED_MAX_CHUNKS = "64"
+
+[bench]
+kind = "asr"
+client = "crates/plowrt/examples/asr/packet_dataset.rs"
+manifest = "scripts/asr/nvidia/get_audio.py"
+reference = "scripts/asr/nvidia/ref_bench.py"
+
+[gates]
+python = "{env:PYREF}"
+[gates.asr_wer]
+manifest = "{env:ASR_MANIFEST}"
+conc = "1,16"
+wer_max = 0.045
