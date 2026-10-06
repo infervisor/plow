@@ -866,6 +866,8 @@ pub fn spawn(
     #[cfg(not(any(feature = "cuda", feature = "hsa", feature = "cpu")))]
     let kv_budget: Option<crate::sched::admission::KvBudget> = None;
     #[cfg(feature = "cuda")]
+    let pf_rungs = state.gpu_engine(&slug).and_then(|e| e.lock().pf_launch_rungs());
+    #[cfg(feature = "cuda")]
     let prefix_probe = state.gpu_engine(&slug).and_then(|e| e.lock().vmm_prefix_probe());
     #[cfg(not(feature = "cuda"))]
     let prefix_probe: Option<crate::memory::vmm::PrefixProbe> = None;
@@ -1157,14 +1159,7 @@ pub fn spawn(
                 metrics
                     .decode_occupied_extent
                     .store(occupied_extent as u64, Ordering::Relaxed);
-                let kv_used = kv_budget.filter(|b| b.max_rows() > 0).map_or(0.0, |b| {
-                    let rows: u64 = slots
-                        .iter()
-                        .flatten()
-                        .map(|s| reserved_kv_rows(s.prompt_ids.len(), s.gen.max_tokens, s.out_ids.len()))
-                        .sum();
-                    rows as f64 / b.max_rows() as f64
-                });
+                let kv_used = kv_used(kv_budget, &slots);
                 if crate::serve::policy::observe(crate::serve::policy::Load {
                     width: occupied_extent,
                     queued: waiting.len(),
@@ -1194,6 +1189,25 @@ pub fn spawn(
             } else {
                 capacity
             };
+            #[cfg(feature = "cuda")]
+            if let Some((request_rows, top_rows)) = pf_rungs {
+                // Only demand past every slot: a rung admission hold (E4B c128's cold start
+                // queued 32K rows behind a 96-slot rung) is not overload.
+                let overflow_rows = if slots.iter().all(Option::is_some) {
+                    waiting.iter().map(|(job, _)| job.prompt_ids.len()).sum()
+                } else {
+                    0
+                };
+                crate::serve::policy::observe_prefill(crate::serve::policy::PrefillLoad {
+                    overflow_rows,
+                    queued: waiting.len() + rx.len(),
+                    top_rows,
+                    kv_used: kv_used(kv_budget, &slots),
+                });
+                metrics
+                    .prefill_launch_rows
+                    .store(pf_launch_rows(request_rows, top_rows).0 as u64, Ordering::Relaxed);
+            }
 
             let mut queued_behind = false;
             // Non-blocking drain: fill every idle slot the queue can serve.
@@ -4641,6 +4655,34 @@ fn pf_interleave_rows() -> usize {
     crate::config::RuntimeConfig::get().pf_interleave_rows()
 }
 
+/// Packed prefill rows per launch while requests decode, and the launch rows riders included:
+/// `PLOW_PF_INTERLEAVE` when set (`0` pins the widest launch), else the objective's width
+/// (`policy::prefill_launch_rows`). The objective's width bounds the whole launch like a ladder
+/// top: bounding only the prompt rows ran 2048 of them + 3 riders as a 4096-row launch (E4B c64,
+/// 31 of 98 launches; tok/s -14%).
+#[cfg(feature = "cuda")]
+fn pf_launch_rows(request: usize, top: usize) -> (usize, usize) {
+    match crate::config::RuntimeConfig::get().pf_interleave {
+        Some(_) => (pf_interleave_rows().min(top), top),
+        None => {
+            let rows = crate::serve::policy::prefill_launch_rows(request, top);
+            (rows, rows)
+        }
+    }
+}
+
+/// Share of the KV-capacity budget the live sequences reserve (0 without a budget).
+fn kv_used(kv_budget: Option<crate::sched::admission::KvBudget>, slots: &[Option<Slot>]) -> f64 {
+    kv_budget.filter(|b| b.max_rows() > 0).map_or(0.0, |b| {
+        let rows: u64 = slots
+            .iter()
+            .flatten()
+            .map(|s| reserved_kv_rows(s.prompt_ids.len(), s.gen.max_tokens, s.out_ids.len()))
+            .sum();
+        rows as f64 / b.max_rows() as f64
+    })
+}
+
 /// Prefill rows for one launch, from the queue (the latency objective's packing).
 ///
 /// `rows` are the waiting prompts' offered rows, oldest first. A launch costs a fixed
@@ -4673,6 +4715,16 @@ fn queue_pack_rows(rows: &[usize], chunk_cost: usize, bound: usize) -> usize {
         total += r;
     }
     total
+}
+
+/// Whether a launch of `bucket` prefill rows trims its prefill so `decode_rows` riders fit, rather
+/// than running in the `spilled` bucket that holds both. A wide spill is a padded rung, not padded
+/// rows: 12B on H100 ran 1024 + riders in 1088 at 42.9 ms against 32.4 ms for 1024, and 4096 + 63
+/// in 4160 at 127.0 against 117.1 ms; the trimmed rows join the next launch. Below
+/// `pf_chunk_cost_rows()` a spill costs less than the tail launch a trim can leave.
+#[cfg(feature = "cuda")]
+fn trim_for_riders(bucket: usize, spilled: usize, decode_rows: usize) -> bool {
+    decode_rows > 0 && spilled > bucket && bucket >= pf_chunk_cost_rows()
 }
 
 /// Prompt rows one model may consume while holding its device turn, when there
@@ -5053,10 +5105,10 @@ fn gpu_prefill_batched_pass(
             .map_or(1, |sp| sp.overlay.len() / sp.overlay_pos.len());
         bytes as usize / 4 / hidden.max(1)
     });
-    let launch_cap = if cold && !bounded_tick {
-        budget_max
+    let (launch_cap, launch_max) = if cold && !bounded_tick {
+        (budget_max, budget_max)
     } else {
-        pf_interleave_rows().min(budget_max)
+        pf_launch_rows(e.pf_request_max_rows(), budget_max)
     };
     // Bound each candidate before fair sharing. Short requests return unused
     // rows to later candidates in the same launch.
@@ -5160,13 +5212,15 @@ fn gpu_prefill_batched_pass(
             return tick_fault;
         }
         let avail: usize = candidates.iter().map(|c| c.span.n_rows as usize).sum();
-        if std::mem::take(&mut ride_open)
-            && !ride.ride(e.pf_pack_budget(avail.min(launch_cap)), feeds.len())
-        {
+        // `RideCost` keys both the decision and the launch it observes by the prefill bucket:
+        // keyed by the launch's own bucket, a riding launch that spills (4096 + 63 into 4160)
+        // records under a bucket the decision never asks about, and the rider cost is never learned.
+        let ride_key = e.pf_pack_budget(avail.min(launch_cap));
+        if std::mem::take(&mut ride_open) && !ride.ride(ride_key, feeds.len()) {
             unified = false;
             decode_rows = 0;
         }
-        let per_launch = launch_cap.min(budget_max.saturating_sub(decode_rows));
+        let per_launch = launch_cap.min(launch_max.saturating_sub(decode_rows));
         // Every overlay row of a launch is staged at once: bound its rows by the overlay's.
         let per_launch = per_launch.min(overlay_rows.unwrap_or(usize::MAX)).max(1);
         let per_launch = if adaptive {
@@ -5181,11 +5235,8 @@ fn gpu_prefill_batched_pass(
         let rows = avail.min(per_launch);
         let bucket = e.pf_pack_budget(rows);
         // Under the unified token batch the decode rows ride in this launch, and the batch takes the
-        // smallest bucket holding every row. When that spills past `bucket` by more than a launch
-        // costs (a 4224-row slice + 3 decode rows on the 8192 rung), trim the prefill to fit; a small
-        // spill (1024 + 1 into 1088) is cheaper than the tail launch a trim would leave.
-        let trim = decode_rows > 0
-            && e.pf_pack_budget(rows.min(bucket) + decode_rows) > bucket + pf_chunk_cost_rows();
+        // smallest bucket holding every row.
+        let trim = trim_for_riders(bucket, e.pf_pack_budget(rows.min(bucket) + decode_rows), decode_rows);
         let per_launch = if trim {
             bucket.saturating_sub(decode_rows).max(1)
         } else {
@@ -5228,7 +5279,6 @@ fn gpu_prefill_batched_pass(
             );
         }
         let riders = if unified { feeds.len() } else { 0 };
-        let launch_bucket = e.pf_pack_budget(pack.iter().map(|p| p.2).sum::<usize>() + riders);
         let t_launch = Instant::now();
         let res = if unified {
             use plow_asset::token_batch::{Phase, Request, Selection};
@@ -5327,7 +5377,7 @@ fn gpu_prefill_batched_pass(
                 })
         };
         if res.is_ok() {
-            ride.observe_launch(launch_bucket, riders, t_launch.elapsed().as_secs_f64() * 1e3);
+            ride.observe_launch(ride_key, riders, t_launch.elapsed().as_secs_f64() * 1e3);
         }
         match res {
             Ok(()) => {
@@ -6536,6 +6586,17 @@ mod tests {
         assert_eq!(super::co_sched_prefill_rows(8192, 512), 512);
         // Never zero: the caller uses this as a chunk width.
         assert_eq!(super::co_sched_prefill_rows(0, 0), 1);
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn riders_trim_wide_launches_that_spill_a_rung() {
+        assert!(super::trim_for_riders(4096, 4160, 63));
+        assert!(super::trim_for_riders(1024, 1088, 1));
+        assert!(super::trim_for_riders(4224, 8192, 3));
+        assert!(!super::trim_for_riders(4096, 4096, 63), "riders fit the bucket");
+        assert!(!super::trim_for_riders(4096, 4160, 0));
+        assert!(!super::trim_for_riders(128, 256, 63), "a narrow spill beats a tail launch");
     }
 
     #[cfg(feature = "cuda")]

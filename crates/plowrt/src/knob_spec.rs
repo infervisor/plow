@@ -179,6 +179,16 @@ const C_PF_SEG_GEMM_SMALL: &[Constraint] = &[Constraint {
     check: Check::Site,
 }];
 
+const C_CUTLASS_FP8_DECODE: &[Constraint] = &[Constraint {
+    id: "cutlass_fp8_decode_requires_seg_dir",
+    formula: F::Implies(
+        &F::Atom("rt.cutlass_fp8_decode", Cmp::Ne, Val::Unset),
+        &F::Atom("rt.pf_seg_dir", Cmp::Ne, Val::Unset),
+    ),
+    site: "crates/plowrt/src/device/cuda/lt.rs: PLOW_CUTLASS_FP8_DECODE requires PLOW_PF_SEG_DIR",
+    check: Check::Site,
+}];
+
 const C_CHANNEL_MLP_RUNTIME: &[Constraint] = &[Constraint {
     id: "channel_mlp_runtime_exclusive",
     formula: F::Implies(
@@ -223,6 +233,7 @@ type Reader = fn(&RuntimeConfig) -> Val<'_>;
 const READERS: &[(&str, Reader)] = &[
     ("rt.pf_seg_dir", |c| opt_str(&c.nv.pf_seg_dir)),
     ("rt.pf_seg_gemm_small", |c| opt_str(&c.nv.pf_seg_gemm_small)),
+    ("rt.cutlass_fp8_decode", |c| opt_str(&c.nv.cutlass_fp8_decode)),
     ("rt.mla_pf_v2", |c| Val::Bool(c.amd.mla_pf_v2)),
     ("rt.serial", |c| Val::Bool(c.apple.serial)),
     ("rt.ane_mlp", |c| Val::Bool(c.apple.ane_mlp)),
@@ -518,6 +529,8 @@ pub const RUNTIME: &[KnobSpec] = &[
     KnobSpec::new("rt.lt_algos_write", Some("PLOW_LT_ALGOS_WRITE"), Layer::Runtime, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("rt.lt_pair", Some("PLOW_LT_PAIR"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
     KnobSpec::new("rt.lt_rung_algos", Some("PLOW_LT_RUNG_ALGOS"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
+    KnobSpec::new("rt.lt_fp8_fast_accum_max_k", Some("PLOW_LT_FP8_FAST_ACCUM_MAX_K"), Layer::Runtime, U32, UNSET, OPT_IN),
+    KnobSpec::new("rt.cutlass_fp8_decode", Some("PLOW_CUTLASS_FP8_DECODE"), Layer::Runtime, Domain::Str, UNSET, OPT_IN).with(C_CUTLASS_FP8_DECODE),
     KnobSpec::new("rt.decode_light", Some("PLOW_DECODE_LIGHT"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
     KnobSpec::new("rt.decode_light_flash", Some("PLOW_DECODE_LIGHT_FLASH"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
     KnobSpec::new("rt.tb_split_attn", Some("PLOW_TB_SPLIT_ATTN"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
@@ -961,6 +974,11 @@ mod tests {
             "gpu.rs",
             "PLOW_PF_SEG_GEMM_SMALL requires PLOW_PF_SEG_DIR",
             Site::Encoded("pf_seg_gemm_small_requires_seg_dir"),
+        ),
+        (
+            "lt.rs",
+            "PLOW_CUTLASS_FP8_DECODE requires PLOW_PF_SEG_DIR",
+            Site::Encoded("cutlass_fp8_decode_requires_seg_dir"),
         ),
         (
             "amd.rs",

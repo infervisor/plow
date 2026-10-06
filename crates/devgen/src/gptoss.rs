@@ -807,10 +807,15 @@ pub(super) fn run(
         chunk.is_power_of_two() && chunk <= MAX_CHUNK_MAX && chunk <= ctx,
         "gpt_oss: prefill chunk {chunk} must be a power of two <= min(ctx {ctx}, {MAX_CHUNK_MAX})"
     );
-    let buckets: Vec<u32> = [128u32, 512, 1024, 2048, 4096, 8192, 16384]
-        .into_iter()
-        .filter(|&x| x <= chunk)
-        .collect();
+    let buckets: Vec<u32> = crate::with_always_rung(
+        [128u32, 512, 1024, 2048, 4096, 8192, 16384]
+            .into_iter()
+            .filter(|&x| x <= chunk)
+            .collect(),
+        ctx,
+    );
+    // One request may fill the widest rung, so the ring and activations follow it.
+    let chunk = buckets.last().copied().map_or(chunk, |w| w.max(chunk));
     assert!(
         rungs.iter().all(|&r| buckets.iter().all(|&pb| pb > r)),
         "gpt_oss: decode rungs {rungs:?} overlap the prefill buckets {buckets:?} \

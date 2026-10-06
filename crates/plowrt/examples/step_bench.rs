@@ -64,6 +64,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut sweep: Option<(u32, u32)> = None;
     let mut max_inst: Option<u32> = None;
     let mut max_segments: Option<usize> = None;
+    let mut seg_sweep: Option<(usize, usize, usize)> = None;
     let mut prefill_logits_dir = None::<std::path::PathBuf>;
     let mut ride: Option<(usize, Vec<usize>)> = None;
     let mut ride_dump = None::<std::path::PathBuf>;
@@ -83,6 +84,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let r = args.next().ok_or("--sweep LO..HI")?;
                 let (lo, hi) = r.split_once("..").ok_or("--sweep LO..HI")?;
                 sweep = Some((lo.parse()?, hi.parse()?));
+            }
+            // `--seg-sweep LO..HI[:STEP]`: time the widest library-routed decode rung captured up to
+            // segment n for n in LO..=HI (the per-segment profile instruction caps cannot take).
+            "--seg-sweep" => {
+                let r = args.next().ok_or("--seg-sweep LO..HI[:STEP]")?;
+                let (r, step) = r.split_once(':').unwrap_or((r.as_str(), "1"));
+                let (lo, hi) = r.split_once("..").ok_or("--seg-sweep LO..HI[:STEP]")?;
+                seg_sweep = Some((lo.parse()?, hi.parse()?, step.parse()?));
             }
             "--dump-tensors" => dump_names = Some(args.next().ok_or("--dump-tensors a,b")?),
             "--dump-dir" => dump_dir = Some(args.next().ok_or("--dump-dir d")?),
@@ -131,7 +140,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if prefill_logits_dir.is_some() && (packed_prefill || !e.has_prefill()) {
         return Err("prefill logit capture requires ordinary GPU prefill".into());
     }
-    if max_segments.is_some() && slots != e.batch() {
+    if (max_segments.is_some() || seg_sweep.is_some()) && slots != e.batch() {
         return Err("--max-segments requires the widest decode rung".into());
     }
     println!(
@@ -270,6 +279,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             record_inputs(histories, &last, &toks, 1);
         }
         last.copy_from_slice(&toks);
+    }
+    if let Some((lo, hi, step)) = seg_sweep {
+        let base_pos: Vec<usize> = (0..slots).map(|_| ctx + warmup).collect();
+        let base_last = last.clone();
+        for n in (lo..=hi).step_by(step.max(1)) {
+            e.capture_debug_decode_prefix(n)?;
+            for (b, &p) in base_pos.iter().enumerate() {
+                e.rewind_slot(b, p)?;
+            }
+            last.copy_from_slice(&base_last);
+            for _ in 0..2 {
+                e.step_slots(&feeds_of(&last), &mut toks)?;
+            }
+            let mut v: Vec<f64> = (0..steps)
+                .map(|_| {
+                    let t0 = Instant::now();
+                    e.step_slots(&feeds_of(&last), &mut toks).map(|_| t0.elapsed().as_secs_f64() * 1e3)
+                })
+                .collect::<Result<_, _>>()?;
+            v.sort_by(f64::total_cmp);
+            println!("{{\"seg\":{n},\"ms\":{:.4}}}", v[v.len() / 2]);
+        }
+        return Ok(());
     }
     if let Some((lo, hi)) = sweep {
         let base_pos: Vec<usize> = (0..slots).map(|_| ctx + warmup).collect();

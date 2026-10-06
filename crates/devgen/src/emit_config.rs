@@ -212,8 +212,8 @@ pub struct EmitConfig {
     #[arg(long = "emit-decode-projection-tuning", default_value_t = false)]
     pub decode_projection_tuning: bool,
 
-    /// Largest prefill chunk rows (power of two, ≤ 8192). Caps the bucket
-    /// ladder and the runtime PLOW_PF_INTERLEAVE ceiling.
+    /// Default prefill rows per request (power of two, ≤ 16384). The bucket ladder still
+    /// reaches 8192 when ctx does; only an explicit 16384 widens it further.
     #[arg(long = "emit-max-chunk", env = "PLOW_MAX_CHUNK")]
     pub max_chunk: Option<u32>,
 
@@ -349,6 +349,11 @@ pub struct EmitConfig {
     /// Experimental full-attention decode GF with batch-aware balanced split counts.
     #[arg(long, env = "PLOW_ATTENTION_DECODE_BALANCE_GF")]
     pub attention_decode_balance_gf: Option<u32>,
+
+    /// GF of the light (ordinary-launch) hd512 decode attention on the library-routed rungs
+    /// (8 or 16); the interpreter rungs keep their own. Unset = the interpreter's GF.
+    #[arg(long, env = "PLOW_FA_GF_LIGHT512")]
+    pub fa_gf_light512: Option<u32>,
 
     /// sm_90a decode attention scores on the tensor cores with K straight from global
     /// (op_attention.cuh PLOW_NV_FA_MMAQK): bit 0 = hd256 layers, bit 1 = hd512 layers.
@@ -1493,6 +1498,7 @@ impl EmitConfig {
             moe_combine_blocks: env_u32("PLOW_MOE_COMBINE_BLOCKS"),
             fa_gf_full: env_u32("PLOW_FA_GF_FULL"),
             attention_decode_balance_gf: env_u32("PLOW_ATTENTION_DECODE_BALANCE_GF"),
+            fa_gf_light512: env_u32("PLOW_FA_GF_LIGHT512"),
             fa_mmaqk: env_u32("PLOW_FA_MMAQK"),
             tts_profile: env_str("PLOW_TTS_PROFILE"),
             tts_codec: env_str("PLOW_TTS_CODEC_DIR").map(std::path::PathBuf::from),

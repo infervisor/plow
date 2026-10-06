@@ -978,6 +978,22 @@ pub struct NvidiaRuntimeConfig {
     #[arg(long = "lt-rung-algos", env = "PLOW_LT_RUNG_ALGOS", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub lt_rung_algos: bool,
 
+    /// Prefill FP8 (W8A8 vector-scale) cuBLASLt projections with K at most this run with
+    /// `CUBLASLT_MATMUL_DESC_FAST_ACCUM` (wgmma accumulation without periodic FP32 promotion, as
+    /// vLLM's CUTLASS FP8 kernels). Unset = off. H100 standalone at M=4096: q 102 -> 88 us,
+    /// gate 374 -> 331 us; down (K 15360) unchanged with 2x the rel-L2, hence the K bound.
+    /// cuBLASLt decode rungs keep promoted accumulation (no measured gain at B=64); the CUTLASS
+    /// decode route (`--cutlass-fp8-decode`) applies the same K bound.
+    #[arg(long = "lt-fp8-fast-accum-max-k", env = "PLOW_LT_FP8_FAST_ACCUM_MAX_K", global = true)]
+    pub lt_fp8_fast_accum_max_k: Option<u32>,
+
+    /// `<cubin sha256>:<host library sha256>` of `cutlass_fp8_decode_sm90.cubin` and its Params
+    /// marshaller `libplow_cutlass_fp8_decode_sm90.so` in `--pf-seg-dir`: routed FP8 W8A8 decode
+    /// projections with M <= 128 run those CUTLASS swap-AB kernels instead of cuBLASLt (no ~13 us
+    /// small-M floor). Other bytes are rejected. Unset = cuBLASLt.
+    #[arg(long = "cutlass-fp8-decode", env = "PLOW_CUTLASS_FP8_DECODE", global = true)]
+    pub cutlass_fp8_decode: Option<String>,
+
     /// A routed decode rung's one-instruction AddNorm / Glu segments run as ordinary launches
     /// of the decode object's light kernel instead of interpreter windows.
     #[arg(long = "decode-light", env = "PLOW_DECODE_LIGHT", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]

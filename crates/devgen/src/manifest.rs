@@ -1224,6 +1224,13 @@ fn tuning(s: &Shapes, arch: &str) -> Map<String, Value> {
             gf
         };
         t.insert("gf_full".into(), json!(gf));
+        // The routed rungs' light hd512 attention may carry a wider group than the interpreter.
+        if let Some(light) = crate::emit_config::active().fa_gf_light512 {
+            assert!(matches!(light, 8 | 16), "PLOW_FA_GF_LIGHT512 must be 8 or 16, got {light}");
+            if light != gf && s.gqa % light == 0 {
+                t.insert("gf_light512".into(), json!(light));
+            }
+        }
     }
     // * `fa_mmaqk`: the emit's PLOW_FA_MMAQK, opt-in. Object-paired (the score arm and its smem
     //   claim change), so it rides in `tuning` and the pairing hash.
@@ -1404,6 +1411,9 @@ fn backend_nvcc(f: &Map<String, Value>, t: &Map<String, Value>, s: &Shapes) -> V
     }
     if let Some(v) = t.get("gf_full").and_then(Value::as_u64) {
         rec.push(format!("PLOW_NV_FA_GF_FULL={v}"));
+    }
+    if let Some(v) = t.get("gf_light512").and_then(Value::as_u64) {
+        rec.push(format!("PLOW_NV_FA_GF_LIGHT512={v}"));
     }
     json!({ "requires": req, "recommends": rec })
 }
@@ -3069,7 +3079,14 @@ pub fn config_header(manifest: &Value) -> String {
                     "#ifndef PLOW_NV_FA_MMAQK\n#define PLOW_NV_FA_MMAQK {v}\n#endif\n"
                 ));
             }
-            if t.get("gf_full").and_then(Value::as_u64) == Some(16) {
+            if let Some(v) = t.get("gf_light512").and_then(Value::as_u64) {
+                out.push_str(&format!(
+                    "#ifndef PLOW_NV_FA_GF_LIGHT512\n#define PLOW_NV_FA_GF_LIGHT512 {v}\n#endif\n"
+                ));
+            }
+            if t.get("gf_full").and_then(Value::as_u64) == Some(16)
+                || t.get("gf_light512").and_then(Value::as_u64) == Some(16)
+            {
                 out.push_str("#ifndef PLOW_NV_FA_GF16_BENCH\n#define PLOW_NV_FA_GF16_BENCH 1\n#endif\n");
             }
         }

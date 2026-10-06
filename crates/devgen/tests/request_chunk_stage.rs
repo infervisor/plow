@@ -9,7 +9,8 @@ struct Args {
 /// A request chunk above the window stages the sliding layers instead of growing their ring:
 /// window 1024 at request chunk 4096 keeps the 2048-row ring, every bucket wider than a stage
 /// writes and attends each sliding cache once per stage, and `PLOW_STAGE_ROWS=0` restores the
-/// ring sized for the whole request chunk.
+/// ring sized for the whole request chunk. The 8192 rung ships above `PLOW_MAX_CHUNK=4096`
+/// without touching the ring: it packs requests of at most 4096 rows.
 #[test]
 fn request_chunks_above_the_window_stage_the_sliding_ring() {
     let root = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("request_chunk_stage");
@@ -66,7 +67,7 @@ fn request_chunks_above_the_window_stage_the_sliding_ring() {
                     assert_eq!(sliding.iter().map(|c| c.stride).collect::<Vec<_>>(), [ring]);
                     let rows: Vec<u32> =
                         p.programs[..p.prefill_count].iter().map(|g| g.rows).collect();
-                    assert_eq!(rows, [128, 512, 1024, 2048, 4096, 4160, 4224]);
+                    assert_eq!(rows, [128, 512, 1024, 2048, 4096, 4160, 4224, 8192]);
                     for g in &p.programs[..p.prefill_count] {
                         let map = plow_asset::packed_prefill::stage_map(g.insts);
                         let stages = map.iter().flatten().map(|&k| k as u32 + 1).max().unwrap_or(1);

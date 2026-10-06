@@ -355,6 +355,8 @@ pub(super) fn light_functions(
     let attn = match be.module_global_u32(module, "plow_light_attn_hd")? {
         Some(hd) => {
             let f = be.get_function(module, &format!("plow_{arch}_light_attn"))?;
+            // A wider light hd512 head group than the interpreter's claims its own smem.
+            let smem = be.module_global_u32(module, "plow_light_attn_smem")?.map_or(smem, |s| s.max(smem));
             be.set_max_dynamic_smem(f, smem)?;
             let hd2 = be.module_global_u32(module, "plow_light_attn_hd2")?.unwrap_or(hd);
             Some((f, smem, [hd, hd2]))
@@ -469,7 +471,7 @@ pub(super) fn light_segments(
         .filter(|&seg| library.get(seg).copied().flatten().is_none())
         .filter_map(|seg| {
             let entries = &g.gq_stream[g.gq_seg_ofs[seg] as usize..g.gq_seg_ofs[seg + 1] as usize];
-            if g.t == 128 && functions.direct && functions.norm_quant.is_some() {
+            if functions.direct && functions.norm_quant.is_some() {
                 if let Some((n, q)) = norm_quant_pair(g, entries) {
                     return Some((seg, vec![(n, 1), (q, 1)]));
                 }
@@ -626,6 +628,35 @@ pub(super) fn prefill_glu_quant_segments(g: &DevProg) -> Vec<(usize, Vec<usize>)
         .collect()
 }
 
+/// Segments that are exactly one plain (no GLU) QuantFp8 over a 4096- or 8192-wide row, all
+/// slices: `plow_quant_cached` runs it one row per CTA.
+pub(super) fn prefill_plain_quant_segments(g: &DevProg) -> Vec<(usize, Vec<usize>)> {
+    let none = packet::dev::TENSOR_NONE16;
+    g.gq_seg_ofs
+        .windows(2)
+        .enumerate()
+        .filter_map(|(seg, w)| {
+            let entries = g.gq_stream.get(w[0] as usize..w[1] as usize)?;
+            let inst = entries.first()?.inst as usize;
+            let d = g.insts.get(inst)?;
+            let matches = d.op == DevOp::QuantFp8 as u16
+                && d.i[0] >= 32
+                && matches!(d.i[1], 4096 | 8192)
+                && d.i[2] == 0
+                && d.t[..3].iter().all(|&t| t != none)
+                && d.t[3] == none
+                && d.t[4] == none
+                && d.blocks != 0
+                && entries.len() == usize::from(d.blocks)
+                && entries
+                    .iter()
+                    .enumerate()
+                    .all(|(slice, e)| e.inst as usize == inst && e.slice as usize == slice);
+            matches.then_some((seg, vec![inst]))
+        })
+        .collect()
+}
+
 /// One light route running `insts` of a prefill bucket, in order.
 pub(super) fn prefill_light_route(
     be: &Arc<CudaBackend>,
@@ -652,6 +683,85 @@ pub(super) fn prefill_light_route(
             .collect(),
         _scratch: None,
     }
+}
+
+/// The cached GLU quant kernel strides rows by `gridDim`: one CTA per row instead of the
+/// instruction's one per SM, which walked ~31 rows of a 4096-row chunk with its load and store
+/// phases never overlapping. Per-row work is unchanged, so the outputs are bit-identical.
+/// `quant_only` (the object's no-store twin) serves an instruction whose bf16 GLU output (t[1])
+/// no other instruction of the program names: its FP8 bytes and scales are the same.
+pub(super) fn prefill_glu_quant_route(
+    be: &Arc<CudaBackend>,
+    function: KernelFn,
+    quant_only: Option<KernelFn>,
+    kernarg: DevProgram,
+    g: &DevProg,
+    insts: &[usize],
+) -> LightRoute {
+    let mut route = prefill_light_route(be, function, kernarg, g, insts);
+    for launch in &mut route.launches {
+        let inst = launch.instruction as usize;
+        launch.blocks = g.insts[inst].i[0];
+        if let Some(q) = quant_only.filter(|_| glu_output_unread(g, inst)) {
+            launch.function = q;
+        }
+    }
+    route
+}
+
+fn glu_output_unread(g: &DevProg, inst: usize) -> bool {
+    let output = g.insts[inst].t[1];
+    output != packet::dev::TENSOR_NONE16
+        && g
+            .insts
+            .iter()
+            .enumerate()
+            .all(|(i, d)| i == inst || !d.t.contains(&output))
+}
+
+/// Segments that are exactly a prefill NormResidual and the RmsNorm reading its output (the next
+/// instruction), each over all of its slices: `plow_norm_rms_pf` runs the pair at any grid.
+pub(super) fn prefill_norm_rms_segments(g: &DevProg) -> Vec<(usize, Vec<usize>)> {
+    g.gq_seg_ofs
+        .windows(2)
+        .enumerate()
+        .filter_map(|(seg, w)| {
+            let entries = g.gq_stream.get(w[0] as usize..w[1] as usize)?;
+            let n = entries.first()?.inst as usize;
+            let (nr, rn) = (g.insts.get(n)?, g.insts.get(n + 1)?);
+            let complete = |inst: usize, blocks: u16| {
+                let own = entries.iter().filter(|e| e.inst as usize == inst);
+                blocks != 0
+                    && own.clone().count() == usize::from(blocks)
+                    && own.enumerate().all(|(slice, e)| e.slice as usize == slice)
+            };
+            let none = packet::dev::TENSOR_NONE16;
+            let matches = nr.op == DevOp::NormResidual as u16
+                && rn.op == DevOp::RmsNorm as u16
+                && entries.iter().all(|e| e.inst as usize == n || e.inst as usize == n + 1)
+                && complete(n, nr.blocks)
+                && complete(n + 1, rn.blocks)
+                && rn.i[..3] == [nr.i[0], nr.i[1], 0]
+                && nr.t[0] != none
+                && rn.t[1] == nr.t[0];
+            matches.then_some((seg, vec![n, n + 1]))
+        })
+        .collect()
+}
+
+/// The NormResidual+RmsNorm pair at one warp per row (`PLOW_NV_WARPS` = 8 rows per block).
+pub(super) fn prefill_norm_rms_route(
+    be: &Arc<CudaBackend>,
+    function: KernelFn,
+    kernarg: DevProgram,
+    g: &DevProg,
+    insts: &[usize],
+) -> LightRoute {
+    let mut route = prefill_light_route(be, function, kernarg, g, &insts[..1]);
+    for launch in &mut route.launches {
+        launch.blocks = g.insts[launch.instruction as usize].i[0].div_ceil(8);
+    }
+    route
 }
 
 /// `(segment, instruction)` of every instruction a light route executes.
@@ -1135,6 +1245,8 @@ pub(super) enum ProjectionBackend {
 enum ProjectionPlan {
     Lt(Arc<crate::device::cuda::lt::Plan>),
     Native(native_decode::Plan),
+    /// Operands are bound into the plan's Params blob.
+    Cutlass(crate::device::cuda::cutlass_fp8::Plan),
     Folded,
 }
 
@@ -1143,6 +1255,7 @@ impl ProjectionPlan {
         match self {
             Self::Lt(p) => p.run(input, weight, output, stream),
             Self::Native(p) => p.run(input, weight, output, stream),
+            Self::Cutlass(p) => p.run(stream),
             Self::Folded => Ok(()),
         }
     }
@@ -1333,6 +1446,7 @@ pub(super) fn prepare_routes(
     let mut plans = std::collections::HashMap::new();
     let mut pair_plans = std::collections::HashMap::new();
     let mut fp8_plans = 0usize;
+    let mut cutlass_plans = 0usize;
     let mut pairs = 0usize;
     let mut index = 0;
     while index < segments.len() {
@@ -1374,11 +1488,38 @@ pub(super) fn prepare_routes(
                 scales[index] = mem.base;
             }
             // Scale pointers belong to this layer; shape-only BF16 plan sharing is invalid here.
-            let plan = lt.fp8_plan(segment.m, segment.n, segment.k, scales[1], scales[0])?;
+            let fast_k = crate::config::RuntimeConfig::get()
+                .nv
+                .lt_fp8_fast_accum_max_k
+                .is_some_and(|max_k| segment.k <= max_k);
+            let cutlass = match lt.cutlass_fp8().filter(|_| decode) {
+                Some(c) => c.plan(
+                    segment.m,
+                    segment.n,
+                    segment.k,
+                    [input, weight, output, scales[0], scales[1]],
+                    fast_k,
+                )?,
+                None => None,
+            };
+            let plan = match cutlass {
+                Some(plan) => {
+                    cutlass_plans += 1;
+                    ProjectionPlan::Cutlass(plan)
+                }
+                None => ProjectionPlan::Lt(lt.fp8_plan(
+                    segment.m,
+                    segment.n,
+                    segment.k,
+                    scales[1],
+                    scales[0],
+                    !decode && fast_k,
+                )?),
+            };
             fp8_plans += 1;
             insts[segment.instruction].op = DevOp::Nop as u16;
             routes.push(Some(CublasLtDecodeRoute {
-                plan: Arc::new(ProjectionPlan::Lt(plan)), input, weight, output, tail: None,
+                plan: Arc::new(plan), input, weight, output, tail: None,
             }));
             index += 1;
             continue;
@@ -1523,6 +1664,7 @@ pub(super) fn prepare_routes(
         projections = routes.iter().flatten().count(),
         plans = plans.len(),
         fp8_plans,
+        cutlass_plans,
         pairs,
         native = matches!(backend, ProjectionBackend::Native(_)),
         "projection routes prepared"
@@ -2026,6 +2168,38 @@ mod tests {
         g.gq_stream[1].slice = 0;
         g.gq_seg_ofs = vec![0, 1, 3];
         assert!(prefill_glu_quant_segments(&g).is_empty());
+    }
+
+    #[test]
+    fn prefill_norm_rms_pairs_a_norm_residual_with_the_rmsnorm_reading_it() {
+        let make = || {
+            let (mut g, _) = fixture(128);
+            let none = packet::dev::TENSOR_NONE16;
+            g.insts[1].op = DevOp::NormResidual as u16;
+            g.insts[1].i[..2].copy_from_slice(&[128, 3840]);
+            g.insts[1].t = [0, 0, 1, 2, none, none, none, none];
+            g.insts[2].op = DevOp::RmsNorm as u16;
+            g.insts[2].i[..3].copy_from_slice(&[128, 3840, 0]);
+            g.insts[2].t = [3, 0, 4, 5, 6, none, none, none];
+            g.gq_seg_ofs = vec![0, 1, 3];
+            g
+        };
+        assert_eq!(prefill_norm_rms_segments(&make()), vec![(1, vec![1, 2])]);
+        let mut bad = make();
+        bad.insts[2].t[1] = 7;
+        assert!(prefill_norm_rms_segments(&bad).is_empty(), "the RmsNorm reads another tensor");
+        let mut bad = make();
+        bad.insts[2].i[2] = 64;
+        assert!(prefill_norm_rms_segments(&bad).is_empty(), "output row offset");
+        let mut bad = make();
+        bad.insts[2].op = DevOp::QuantFp8 as u16;
+        assert!(prefill_norm_rms_segments(&bad).is_empty());
+        let mut bad = make();
+        bad.insts[2].blocks = 2;
+        assert!(prefill_norm_rms_segments(&bad).is_empty(), "a slice runs elsewhere");
+        let mut bad = make();
+        bad.gq_seg_ofs = vec![0, 1, 2, 3];
+        assert!(prefill_norm_rms_segments(&bad).is_empty(), "the pair spans two segments");
     }
 
     fn roles() -> [u8; 3] {

@@ -2560,7 +2560,7 @@ fn declare(
         // 2x on full layers only (a minority), the design's chosen tradeoff. Sliding layers (16 kv)
         // still split cleanly at tp=8. Requires kvh|tp OR tp|kvh; anything else fails loudly.
         let kvh_local = kvh_local(kvh, tp, l);
-        let (kvr, _) = kv_ring(full, ctx, c.window, write_chunk(c));
+        let (kvr, _) = kv_ring(full, ctx, c.window, write_chunk(c, ctx));
         let qd = (c.heads / tp) * hd; // column-parallel q output shard
         let kd = kvh_local * hd; // column-parallel k/v output shard (KV head-sharded/replicated)
                                  // fp8-KV: the cache is uint8 e4m3 (1 byte/elem, HALF the bf16 footprint) plus a per-row
@@ -3181,10 +3181,9 @@ pub(crate) fn dec_stage_halves() -> u64 {
 
 /// Largest prefill chunk. Mirrors `PLOW_MAX_CHUNK` in `dev_isa.h`.
 ///
-/// This is the ONLY row count any single program ever processes: chunked prefill never emits a
-/// chunk bigger than this, and decode is one row. So it caps BOTH the bucket ladder (a program
-/// for T > MAX_CHUNK can never be invoked) and every ACTIVATION tensor (they hold the current
-/// chunk, not the context -- only the KV cache spans the context).
+/// The widest rung ([`rung_cap`]: `PLOW_MAX_CHUNK`, or [`ALWAYS_RUNG`] above it) is the largest
+/// row count any single program processes, so it sizes every ACTIVATION tensor (they hold the
+/// current chunk, not the context -- only the KV cache spans the context).
 const MAX_CHUNK_MAX: u32 = 16384;
 
 /// Largest chunk the defaults pick (the runtime's `PLOW_MAX_CHUNK`); 16384 is explicit-only.
@@ -3192,6 +3191,30 @@ const DEFAULT_CHUNK_MAX: u32 = 8192;
 
 /// Smallest chunk the window-derived default will pick (the bucket ladder's floor).
 const MAX_CHUNK_MIN: u32 = 128;
+
+/// Prefill rung every packet ships once its context reaches it, whatever `PLOW_MAX_CHUNK` says.
+/// `PLOW_MAX_CHUNK` still sets the default per-request rows (and with them the sliding ring); a
+/// wider launch packs several requests, or one uncapped request whose ring then holds it.
+pub(crate) const ALWAYS_RUNG: u32 = 8192;
+
+/// `ladder` plus [`ALWAYS_RUNG`] when the context reaches it, ascending and deduplicated.
+pub(crate) fn with_always_rung(mut ladder: Vec<u32>, ctx: u32) -> Vec<u32> {
+    if ctx >= ALWAYS_RUNG && !ladder.contains(&ALWAYS_RUNG) {
+        ladder.push(ALWAYS_RUNG);
+        ladder.sort_unstable();
+    }
+    ladder
+}
+
+/// Widest shipped-ladder rung: `PLOW_MAX_CHUNK`, raised to [`ALWAYS_RUNG`] when ctx reaches it.
+fn rung_cap(window: u32, ctx: u32) -> u32 {
+    let cap = ctx.min(max_chunk(window));
+    if ctx >= ALWAYS_RUNG {
+        cap.max(ALWAYS_RUNG)
+    } else {
+        cap
+    }
+}
 
 /// Default prefill chunk **derived from the model**, not a constant.
 ///
@@ -3225,12 +3248,15 @@ fn default_chunk(window: u32) -> u32 {
     }
 }
 
-/// Largest prefill chunk for this compile. `PLOW_MAX_CHUNK` lowers it to buy back
+/// Default rows per request per launch for this compile; the ladder still reaches
+/// [`ALWAYS_RUNG`] (see [`rung_cap`]). `PLOW_MAX_CHUNK` lowers it to buy back
 /// sliding-layer KV: the ring is sized `window + chunk - 1` (see [`kv_ring_rows`]), so on a
 /// model whose window is far below the chunk it is the CHUNK that sets the ring, not the
 /// model. Gemma-4 (window 1024) at the 8192 default rings 16384 rows = 320 KiB/token * 16384
 /// = 5.0 GiB/seq; chunk 1024 rings 2048 and costs 0.625 GiB/seq — 8x, for more prefill
-/// launches on long prompts.
+/// launches on long prompts. Once ctx reaches [`ALWAYS_RUNG`] that buyback needs
+/// `PLOW_MAX_REQUEST_CHUNK` (or staging): uncapped, one request may fill the widest rung, so the
+/// ring holds it ([`write_chunk`]).
 ///
 /// Must be a power of two and no larger than [`MAX_CHUNK_MAX`] (the bucket ladder tops out
 /// there). Unset = [`default_chunk`] for this model's window; pass `PLOW_MAX_CHUNK=8192` to
@@ -3276,8 +3302,15 @@ fn stage_rows(c: &Cfg) -> Option<u32> {
 }
 
 /// Rows one request writes to a sliding ring per launch (or per stage): what the ring holds.
-fn write_chunk(c: &Cfg) -> u32 {
-    stage_rows(c).unwrap_or_else(|| request_chunk(c.window))
+/// Without `PLOW_MAX_REQUEST_CHUNK` the runtime lets one request fill the widest rung.
+fn write_chunk(c: &Cfg, ctx: u32) -> u32 {
+    stage_rows(c).unwrap_or_else(|| {
+        if emit_config::active().max_request_chunk.is_some() {
+            request_chunk(c.window)
+        } else {
+            rung_cap(c.window, ctx)
+        }
+    })
 }
 
 fn request_chunk(window: u32) -> u32 {
@@ -3315,8 +3348,8 @@ fn kv_ring_rows(window: u32, chunk: u32) -> u32 {
 /// `stage_rows` rows per request per stage whatever the launch width, so any rung fits its ring.
 fn appended_rungs(c: &Cfg, ctx: u32) -> Vec<u32> {
     let window = c.window;
-    let cap = ctx.min(max_chunk(window));
-    let ring = kv_ring_rows(window, write_chunk(c));
+    let cap = rung_cap(window, ctx);
+    let ring = kv_ring_rows(window, write_chunk(c, ctx));
     let staged = stage_rows(c);
     emit_config::active()
         .pf_ladder_append
@@ -3339,7 +3372,7 @@ fn appended_rungs(c: &Cfg, ctx: u32) -> Vec<u32> {
 fn chunk_rows(c: &Cfg, ctx: u32) -> u32 {
     appended_rungs(c, ctx)
         .into_iter()
-        .fold(ctx.min(max_chunk(c.window)), u32::max)
+        .fold(rung_cap(c.window, ctx), u32::max)
 }
 const KV_MASK_NONE: u32 = 0xFFFF_FFFF;
 
@@ -4534,8 +4567,10 @@ fn emit_phase(
     let qnorm_fuse = w8a8
         && !gemv_family
         && (emit_config::active().qnorm_fuse || (amd && emit_config::active().fuse_quant));
-    let glu_quant_fuse =
-        qnorm_fuse || (w8a8 && !gemv_family && emit_config::active().glu_quant_fuse);
+    // Library-routed (cuBLASLt/CUTLASS) decode rungs take the GLU fold too: their down quant
+    // otherwise waits on a separate Glu packet in the same segment.
+    let glu_quant_fuse = qnorm_fuse
+        || (w8a8 && (!gemv_family || fp8_lt_decode) && emit_config::active().glu_quant_fuse);
 
     // Qwen/Llama PRE-NORM decode fuses each (residual add, RMSNorm) pair into ONE AddNorm packet
     // (see the AddNorm emits in the loop). Deletes 72 packets/token and, more importantly, 72
@@ -4703,7 +4738,7 @@ fn emit_phase(
         // (GQA 8). A single nsplit for both would leave the full layers on 4 of 256 CUs.
         // The sliding layers' cache is a RING; the full layers' is linear. `kvm` is 0xFFFFFFFF
         // for a full layer, so the AND in the kernels is a no-op there. See kv_rows().
-        let (kvr, kvm) = kv_ring(full, ctx, c.window, write_chunk(c));
+        let (kvr, kvm) = kv_ring(full, ctx, c.window, write_chunk(c, ctx));
         // GF is the flash-decode GQA fusion factor: query heads carried by ONE work item, and it is
         // the KERNEL constant PLOW_FA_GF(hd) = PLOW_FA_GF_FULL (default 2) — NOT 8. The compiler and
         // kernel must agree (dev_isa.h). GF=2 fuses sliding layers fully (GQA 2) and full layers
@@ -4946,6 +4981,23 @@ fn emit_phase(
             .filter(|_| gemv_family && full)
             .map(|abs| (abs / t).max(1))
             .unwrap_or(ns);
+        // Library-routed rungs run their hd512 attention as light launches at PLOW_FA_GF_LIGHT512
+        // (manifest `gf_light512`): split as many more ways as the group is wider, so the layer
+        // keeps its work-item count. The interpreter rungs keep `gf` and this split.
+        let ns = match emit_config::active().fa_gf_light512 {
+            Some(light)
+                if gemv_family
+                    && full
+                    && hd == 512
+                    && !nv_fold
+                    && light > gf
+                    && gqa % light == 0
+                    && emit_config::active().decode_cublaslt_at(t) =>
+            {
+                ns * (light / gf)
+            }
+            _ => ns,
+        };
 
         // The norm is ONE packet whose result all of q/k/v share.
         //
@@ -9698,7 +9750,7 @@ fn emit_dense_gqa(
     // the flag rather than guessing the target's tile from here.
     const LADDER_BM: u32 = 128;
     const LADDER_BN: u32 = 128;
-    let cap = ctx.min(max_chunk(c.window));
+    let cap = rung_cap(c.window, ctx);
     // SUB-128 PREFILL RUNGS (32, 64), AMD only and OFF BY DEFAULT — see `PLOW_PF_FLOOR`, which
     // carries the measurement that withdrew them. The short version: sublinear saving because
     // `GM_BM=192` means the GEMM does not shrink below t=192 at all, zero in two serving
@@ -9746,7 +9798,7 @@ fn emit_dense_gqa(
             }
         }
         b.sort_unstable();
-        b
+        with_always_rung(b, ctx)
     };
     // The invariant that ties MAX_CHUNK to KV_RING (see dev_isa.h). Break it and a chunk's own
     // rows wrap onto their history: a silent wrong answer, not a crash.
@@ -9759,8 +9811,8 @@ fn emit_dense_gqa(
     // cap a request may fill the widest rung alone, and the ring must hold it. Staged
     // (`stage_rows`), a request writes at most one stage per ring pass.
     let chunk = request_chunk(c.window);
-    let ring = kv_ring_rows(c.window, write_chunk(&c));
-    let widest = buckets.iter().copied().max().unwrap_or(chunk).max(chunk);
+    let ring = kv_ring_rows(c.window, write_chunk(&c, ctx));
+    let widest = buckets.iter().copied().max().unwrap_or(chunk);
     let capped = emit_config::active().max_request_chunk.is_some();
     let held = match stage_rows(&c) {
         Some(stage) => stage,

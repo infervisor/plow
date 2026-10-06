@@ -372,6 +372,25 @@ if [ -n "${PLOW_BUILD_GEN_KERNELS:-}" ]; then
   "${PYREF:-python3}" scripts/gen_kernels/build_catalog.py build "$gemma_out" \
     --entries "$PLOW_BUILD_GEN_KERNELS"
 fi
+# CUTLASS small-M FP8 decode projections (plowrt PLOW_CUTLASS_FP8_DECODE pins both sha256): the
+# kernel cubin and its host Params marshaller, stripped so the library bytes are reproducible.
+# cicc and cudafe++ hash the source's absolute path into the anonymous-namespace module id
+# (_INTERNAL_<hash>_...; -frandom-seed does not cover it): both get the repo-relative path, so
+# every checkout builds the same bytes.
+if [ "${PLOW_BUILD_CUTLASS_FP8_DECODE:-0}" = 1 ]; then
+  gemma_cutlass_src=runtime/nvidia/cutlass_fp8_decode_sm90.cu
+  gemma_cutlass_inc=${CUTLASS_INCLUDE_DIR:-$("${PYREF:-python3}" -c \
+    'from tilelang import env; print(env.CUTLASS_INCLUDE_DIR)')}
+  gemma_cutlass_flags=(-std=c++17 -arch=sm_90a -O3 --expt-relaxed-constexpr -DNDEBUG
+    -DCUTLASS_ENABLE_DIRECT_CUDA_DRIVER_CALL=1 -I "$gemma_cutlass_inc"
+    -Xcicc --orig_src_path_name -Xcicc "$gemma_cutlass_src"
+    -Xcudafe --orig_src_path_name -Xcudafe "$gemma_cutlass_src")
+  "${gemma_nvenv[@]}" "$gemma_nvcc" "${gemma_cutlass_flags[@]}" -cubin \
+    -o "$gemma_out/cutlass_fp8_decode_sm90.cubin" "$gemma_cutlass_src"
+  "${gemma_nvenv[@]}" "$gemma_nvcc" "${gemma_cutlass_flags[@]}" -DPLOW_CUTLASS_HOST -shared \
+    -Xcompiler -fPIC -Xlinker -s -L "$gemma_cuda_bin/../lib64/stubs" -L "$gemma_cuda_bin/../lib/stubs" \
+    -lcuda -o "$gemma_out/libplow_cutlass_fp8_decode_sm90.so" "$gemma_cutlass_src"
+fi
 # Glue kernels of the cuBLASLt grouped-GEMM MoE prefill route (PLOW_MOE_PF_LT): only for a packet
 # that carries the grouped expert GEMMs.
 if [ -n "${PLOW_CUBIN_CONFIG:-}" ] &&

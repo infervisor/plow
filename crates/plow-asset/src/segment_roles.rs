@@ -231,8 +231,7 @@ pub fn cublaslt_prefill_fp8(profile: &str, m: u32, n: u32, k: u32) -> bool {
     matches!(profile, "sm90a" | "sm_90a")
         && [64, 128, 256, 512, 1024, 1088, 1152, 2048, 2112, 2176, 4096, 4160, 4224, 8192].contains(&m)
         && CUBLASLT_PREFILL_GEMMA4_SHAPES.contains(&(n, k))
-        && !((n, k) == (3840, 15360) && (m == 1088 || m >= 2048))
-        && !(m == 4160 && [(2048, 3840), (3840, 8192)].contains(&(n, k)))
+        && !((n, k) == (3840, 15360) && m >= 2048)
         && !(m == 2112 && [(3840, 4096), (3840, 8192)].contains(&(n, k)))
 }
 
@@ -737,8 +736,7 @@ mod tests {
     fn fp8_padded_rungs_keep_native_losses_and_near_ties() {
         for m in [64, 1088, 1152, 2112, 2176, 4160, 4224] {
             for (n, k) in super::CUBLASLT_PREFILL_GEMMA4_SHAPES {
-                let native = (n, k) == (3840, 15360) && (m == 1088 || m >= 2048)
-                    || m == 4160 && [(2048, 3840), (3840, 8192)].contains(&(n, k))
+                let native = (n, k) == (3840, 15360) && m >= 2048
                     || m == 2112 && [(3840, 4096), (3840, 8192)].contains(&(n, k));
                 assert_eq!(super::cublaslt_prefill_fp8("sm90a", m, n, k), !native);
             }

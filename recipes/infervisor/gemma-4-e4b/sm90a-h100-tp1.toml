@@ -45,6 +45,14 @@ args = ["--served-name", "gemma-4-e4b"]
 PLOW_VERIFY_BIN = "{repo}/lean-plow/.lake/build/bin/plow_verify"
 # Voice-agent turns: prompts ~200-2000 rows -> prefill 64..2048; decode up to 128 concurrent.
 PLOW_MAX_CHUNK = "2048"
+# The 8192 rung ships whenever ctx reaches it; capping one request at 2048 rows per launch keeps
+# the sliding ring at next_pow2(512 + 2047) = 4096 (uncapped: 8192, KV 36 -> 56 GiB) and makes
+# 8192 a packed launch of up to four requests. KV-shared layers: no staging (PLOW_STAGE_ROWS auto = off).
+# At 15925e5b: ring 4096, KV 36.00 GiB (uncapped 56.00), activations 1.60 GiB (the 8192 rung).
+# Served 1000/128 vs uncapped, same packet otherwise: c64/c128 tok/s 3965/4890 vs 3945/4836, TTFT
+# p50 246/259 vs 248/260 ms (REPS=2 vs 1). Vs the 2048-top ladder (main 3233d1f2): tok/s +1/+2%,
+# TTFT p99 -8/-10%, but TTFT p50 108/118 -> 246/259 ms, from the 4096/8192 rungs, cap or not.
+PLOW_MAX_REQUEST_CHUNK = "2048"
 PLOW_PF_LADDER_APPEND = "64,256"
 PLOW_DECODE_BATCH_LADDER = "1,2,4,8,16,32,48,64,96,128"
 PLOW_EMIT_PREFILL_CUBLASLT = "1"
@@ -96,6 +104,8 @@ kind = "chat"
 
 # `campaign.py gate <recipe> --assets <dir> --out <dir>` (one lease). PYREF: python with torch +
 # transformers. Measured at 820aa3ba: top1 0.9867 (371/376), KL mean 7.1e-4, max 1.6e-2.
+# 15925e5b + request cap 2048: top1 0.9845 (381/387), KL mean 7.4e-4, max 1.4e-2. One load in two
+# (shipped main bundle too) ends cmpl0 at 18 tokens: 0.9795 (334/341), load-to-load variance.
 [gates]
 python = "{env:PYREF}"
 [gates.llm_logit_parity]

@@ -10,6 +10,20 @@
 # c32/c64/c128 tok/s 374/353/353 vs 380/353/342, TTFT p99 -25/-2/-4%, TPOT p99 +9/+5/+6%;
 # 15K/128 c32 TTFT p50 2571 vs 3266 ms; 4K/128 c32 TTFT p50 626 vs 1072 ms. Label kept for history.
 # Compare against the 16K/32 request-chunk2048 recipe with matched traffic.
+# 2026-10-05 GLU role off + 64-row decode cuBLASLt (+ plowrt 1088/4160 Lt routes, ride trim), served
+# REPS=2 total tok/s vs the final3 arm: 4K/128 c32/c128 +4.8/+6.5%, 15K/128 +4.0/+4.0%, agentic16k
+# c32/c64/c128 +3.5/+3.3/+10.8%. With plowrt 1a4e4f76 (GLU-quant and NormResidual+RmsNorm light
+# routes), strict vs vLLM 0.28 BF16 KV (MATCHED, EQUIVALENT, FP32 gate kl_mean 0.112 vs 0.128):
+# 4K/128 c32/c128 0.91x/0.88x, 15K/128 0.94x/0.95x, agentic16k c32/c64/c128 0.71x/2.13x/1.60x.
+# 2026-10-05 prefill FP8 fast accumulation (K <= 8192), cached plain/GLU quant light routes, CUTLASS
+# B64 decode projections, always-shipped 8192 rung (plowrt 712e2dca, packet 6f36c31a): FP32 gate
+# PASS (kl_mean 0.097 vs vLLM 0.128); strict vs vLLM 0.28 BF16 KV (MATCHED, EQUIVALENT, REPS=2):
+# 4K/128 c32/c128 0.97x/0.97x, 15K/128 1.02x/1.03x, agentic16k c32/c64/c128 0.72x/2.25x/1.77x.
+# 2026-10-06 vendor-GEMM prefill attention from 128-row requests, routed B32 decode (CUTLASS + light
+# attention + fused norm/GLU quant), GF16 global decode (plowrt fa8c4afc, packet 4e474dc4): FP32 gate
+# PASS at concurrency 16/64 (kl_mean 0.084/0.121 vs vLLM 0.128); strict vs vLLM 0.28 BF16 KV (MATCHED,
+# EQUIVALENT, REPS=2): 4K/128 c32/c128 1.02x/1.00x, 15K/128 1.05x/1.05x, agentic16k c32/c64/c128
+# 0.89x/2.77x/1.99x.
 schema = "plow.recipe.v1"
 namespace = "infervisor"
 name = "gemma-4-12b"
@@ -57,7 +71,15 @@ PLOW_MAX_CHUNK = "4096"
 PLOW_MAX_REQUEST_CHUNK = "4096"
 PLOW_SLIDING_NS_CAP = "1"
 PLOW_SLIDING_NS_GRID = "1"
-PLOW_ATTENTION_DECODE_BALANCE_GF = "4"
+# Global (hd512, one KV head) decode at GF 16 (each KV row read once for all 16 heads) only in the
+# light attention of the routed B32/B64 rungs, split twice as many ways (132/B, 128 items); the
+# interpreter rungs B1-B16 keep GF 8 at 66/B, since a GF16 interpreter object (stack 208 -> 320 B,
+# arena 91200 -> 107648 B) costs every narrow rung ~0.3 ms. step_bench vs GF16 everywhere, ctx
+# 1024/4096/15000: B1 7.74/7.80/7.88 -> 7.43/7.48/7.60 ms, B16 10.60/10.97/12.07 -> 10.22/10.69/12.25,
+# B32 12.22/12.84/14.99 -> 12.15/12.77/14.92 and B64 16.28/17.51/21.81 -> 16.26/17.49/21.79
+# (bit-identical); vs GF 8 everywhere B32 15000 16.17 -> 14.92, B64 24.21 -> 21.79 (2026-10-06).
+PLOW_ATTENTION_DECODE_BALANCE_GF = "8"
+PLOW_FA_GF_LIGHT512 = "16"
 PLOW_NS_FULL_ABS = "66"
 PLOW_FA_MMAQK = "3"
 PLOW_DECODE_BATCH_LADDER = "1,2,4,8,16,32,64"
@@ -68,6 +90,17 @@ PLOW_FUSE_ARGMAX = "1"
 # Quant folded into the pre-QKV / pre-FFN RmsNorm (T11; also folds Glu into the down quant on
 # rungs without the GLU role). 4096 rung 128.7 -> 128.0 ms on top of FATLITE + generated hd256.
 PLOW_QNORM_FUSE = "1"
+# Library-routed decode (CUTLASS W8A8 projections, cuBLASLt lm_head) on the 32- and 64-row rungs;
+# narrower rungs keep the native TC64 GEMV. With the light attention launches below, the fused
+# NormResidualNorm+quant light route and the GLU folded into the down quant: step_bench B32 ctx
+# 1024/4096/8192/15000 14.00/14.90/16.10/18.03 -> 12.38/13.07/14.43/16.16 ms (2026-10-06).
+PLOW_EMIT_DECODE_CUBLASLT = "1"
+PLOW_EMIT_DECODE_CUBLASLT_MIN_ROWS = "32"
+PLOW_EMIT_DECODE_CUBLASLT_HEAD = "1"
+PLOW_GLU_QUANT_FUSE = "1"
+# Light (ordinary-launch) decode attention segments on the routed rungs, bit-identical: B64 ctx
+# 4096/15000 19.74/25.99 -> 18.31/24.42 ms.
+NVCC_APPEND_FLAGS = "-DPLOW_NV_GLU_QUANT_CACHE=1 -DPLOW_NV_GLU_QUANT_WPR=1 -DPLOW_NV_LIGHT_FP8_ATTN=1"
 
 [objects]
 script = "scripts/build_sm90a_gemma4_segments.sh"
@@ -75,10 +108,11 @@ role_files = [
   "interp_sm90a_pfattn_hd512_px4_bq64.cubin",
   "interp_sm90a_pfattn_hd256_gqa2_bkv32.cubin",
   "interp_sm90a_pfattn_hd256_bkv32.cubin",
-  "interp_sm90a_pfgemm_glu_w8a8_gemma4.cubin",
   "gen_sm90a_attn_pf_hd256_sliding.cubin",
 ]
 [objects.env]
+# Without the GLU role the down quant computes the GeGLU itself: cached + whole-CTA rows.
+NVCC_APPEND_FLAGS = "-DPLOW_NV_GLU_QUANT_CACHE=1 -DPLOW_NV_GLU_QUANT_WPR=1"
 PLOW_BUILD_W8A8 = "1"
 # Light-op object (norm/quant/rope+KV write) without the flash arms: 56 B stack vs 2144 B stack
 # and 7.5 KB spills in the generic body (W8A8 packets default FATLITE off). Bit-identical;
@@ -91,9 +125,13 @@ PLOW_BUILD_FA_GQA2_PAIR = "1"
 PLOW_BUILD_PFATTN_HD256_BKV32 = "1"
 PLOW_BUILD_PFATTN_HD256_GQA2_BKV32 = "1"
 PLOW_BUILD_PFATTN_HD512_PX4_BQ64 = "1"
+# CUTLASS swap-AB FP8 decode projections for the routed 64-row rung (PLOW_CUTLASS_FP8_DECODE).
+PLOW_BUILD_CUTLASS_FP8_DECODE = "1"
 
 [emit_roles.env]
-PLOW_GEMMA4_SM90_W8A8_GEMM_GLU_ROLE = "1"
+# GLU role off (Lt gate/up + fused GeGLU-quant): step_bench 1x4096 128.5 -> 126.8 ms, 1x15000
+# 575 -> 568, 1x1024 34.2 -> 32.5; first-token digests unchanged (2026-10-05).
+PLOW_GEMMA4_SM90_W8A8_GEMM_GLU_ROLE = "0"
 PLOW_GEMMA4_SM90_HD512_PX4_BQ64_ROLE = "1"
 PLOW_GEMMA4_SM90_HD256_GQA2_ROLE = "1"
 PLOW_EMIT_GEN_KERNELS = "attn_pf_hd256_sliding"
@@ -109,6 +147,18 @@ PLOW_VMM_LIVE_RINGS = "0"           # 1 costs 12-50% single-turn tok/s at 15K c3
 PLOW_MULTISTEP = "0"
 PLOW_DECODE_MAX_RUNG = "64"
 PLOW_TOKEN_BATCH = "1"
+# Prefill FP8 Lt GEMMs with K <= 8192 (all but down) use fast accumulation: step_bench 1x4096
+# 118.5 -> 109.4 ms, 1x15000 538 -> 492; served 4K c32 out tok/s +4.2% (2026-10-05).
+PLOW_LT_FP8_FAST_ACCUM_MAX_K = "8192"
+# B64 decode projections on the packet's CUTLASS objects (cubin:host sha256, CUDA 12.9 + g++-14):
+# step_bench B64 ctx 4096 22.84 -> 20.85 ms, ctx 15000 29.12 -> 27.13; 4K c128 out tok/s +1.7%.
+# The objects build from the repo-relative source path, so any checkout reproduces these bytes
+# (the host library still follows the host compiler).
+PLOW_CUTLASS_FP8_DECODE = "7b20915928c280733108e64036efb981351d6802d0b96c971b5b5462224e1076:0852b6085c29c57ac263c27d61c09ec1621da58f18f93a2dc3e80f03d0587974"
+# Vendor-GEMM (cuBLASLt QK^T / softmax / PV) global prefill attention for every request of >= 128
+# rows instead of >= 1024: long-prefix chunks leave the px4 role (512 rows over 15.5K prefix
+# 37.5 -> 19.9 ms per chunk; 8x512 pack at prefix 12K 238 -> 142 ms); prefix-0 packs equal.
+PLOW_PF_ATTN_GEMM_MIN_ROWS = "128"
 
 [bench]
 backend = "openai"
