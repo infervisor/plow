@@ -748,6 +748,11 @@ pub struct CpuRuntimeConfig {
     /// weight rows into L2.
     #[arg(long = "cpu-gate-pf", env = "PLOW_CPU_GATE_PF", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub gate_pf: bool,
+
+    /// A fresh prompt copies the KV rows of its longest common prefix from another slot
+    /// (live, mid-prefill or released) and prefills only the rest.
+    #[arg(long = "cpu-prefix-share", env = "PLOW_CPU_PREFIX_SHARE", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub prefix_share: bool,
 }
 
 /// NVIDIA / sm_120 runtime knobs.

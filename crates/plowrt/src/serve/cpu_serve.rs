@@ -110,6 +110,13 @@ pub struct CpuServe {
     /// Smallest sliding ring's `stride - window`: a resume may drop at most this many tail
     /// rows, or the suffix prefill would read ring entries the dropped rows overwrote.
     ring_slack: u32,
+    /// Cross-slot prefix share (`PLOW_CPU_PREFIX_SHARE`): every per-slot KV tensor as
+    /// `(handle, heads, ring rows, bytes per row)`, head-major `[slot][head][row]`. Empty = off.
+    share_kv: Vec<(usize, u32, u32, usize)>,
+    /// A donor whose rows reach this has wrapped a ring and no longer holds `[0, rows)`.
+    share_rows: u32,
+    /// The tokens behind each slot's KV rows.
+    hist: Vec<Vec<u32>>,
 }
 
 impl CpuServe {
@@ -136,9 +143,15 @@ impl CpuServe {
         let ring_slack = eng.model().blob.with_packet_view(plow_asset::live_kv::emit).map_or(0, |m| {
             m.caches.iter().filter(|c| c.window > 0).map(|c| c.stride.saturating_sub(c.window)).min().unwrap_or(u32::MAX)
         });
+        let (share_kv, share_rows) = if crate::config::RuntimeConfig::get().cpu.prefix_share && batch > 1 {
+            prefix_share_layout(eng.model(), batch)
+        } else {
+            (Vec::new(), 0)
+        };
         tracing::info!(
             max_ctx,
             batch,
+            prefix_share_tensors = share_kv.len(),
             rungs = ?decode_rungs,
             prefill_buckets = ?buckets,
             pf_chunk,
@@ -165,6 +178,9 @@ impl CpuServe {
             kept: vec![0; batch],
             resumed: vec![0; batch],
             ring_slack,
+            share_kv,
+            share_rows,
+            hist: vec![Vec::new(); batch],
         })
     }
 
@@ -238,6 +254,13 @@ impl CpuServe {
                 self.pf_pos[slot]
             )));
         }
+        if !self.share_kv.is_empty() {
+            if self.pf_pos[slot] == 0 {
+                self.share_prefix(slot, prompt);
+            }
+            self.hist[slot].clear();
+            self.hist[slot].extend_from_slice(prompt);
+        }
         let ch = next_chunk(&self.buckets, n, self.pf_pos[slot], cap.max(1));
         if let Err(e) = self.eng.prefill_slot_chunk(slot, prompt, ch) {
             self.pf_pos[slot] = 0;
@@ -308,6 +331,11 @@ impl CpuServe {
             dp,
         )?;
         for &(s, _) in feeds {
+            if !self.share_kv.is_empty() {
+                let h = &mut self.hist[s];
+                h.truncate(self.pos[s] as usize);
+                h.push(self.next_id[s]);
+            }
             self.pos[s] += 1;
             self.next_id[s] = out[s];
             self.lp_row[s] = s;
@@ -331,6 +359,64 @@ impl CpuServe {
         }
     }
 
+    /// Rows `[0, n)` of `slot` that hold its `hist` and that no ring has overwritten.
+    fn intact_rows(&self, slot: usize) -> usize {
+        let rows = if self.live[slot] {
+            self.pos[slot]
+        } else if self.pf_pos[slot] > 0 {
+            self.pf_pos[slot]
+        } else {
+            self.kept[slot]
+        };
+        // The parked step also writes row `rows`, so it must stay inside every ring too.
+        if rows >= self.share_rows {
+            return 0;
+        }
+        (rows as usize).min(self.hist[slot].len())
+    }
+
+    /// Start a fresh prefill of `slot` at the longest prefix of `prompt` some slot's KV already
+    /// holds: copy those rows (one memcpy per tensor and head) and prefill only the rest. The
+    /// last prompt row is always prefilled, so the chunk still yields logits.
+    fn share_prefix(&mut self, slot: usize, prompt: &[u32]) {
+        const MIN_ROWS: usize = 32;
+        let cap = prompt.len() - 1;
+        let mut best = (0usize, slot);
+        for d in 0..self.batch {
+            let n = self.intact_rows(d).min(cap);
+            let l = self.hist[d][..n].iter().zip(prompt).take_while(|(a, b)| a == b).count();
+            if l > best.0 || (l == best.0 && d == slot) {
+                best = (l, d);
+            }
+        }
+        let (rows, donor) = best;
+        if rows < MIN_ROWS {
+            return;
+        }
+        if donor != slot {
+            let model = self.eng.model();
+            for &(h, heads, stride, row) in &self.share_kv {
+                let base = model.tensor(h).as_ptr();
+                let block = heads as usize * stride as usize * row;
+                for head in 0..heads as usize {
+                    let off = head * stride as usize * row;
+                    // SAFETY: `prefix_share_layout` checked each tensor is `batch` blocks of
+                    // `block` bytes; donor != slot keeps the ranges disjoint; no program runs.
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            base.add(donor * block + off),
+                            base.add(slot * block + off),
+                            rows * row,
+                        );
+                    }
+                }
+            }
+        }
+        tracing::debug!(slot, donor, rows, "cpu: prefix share");
+        self.pf_pos[slot] = rows as u32;
+        self.resumed[slot] = rows as u32;
+    }
+
     /// Start `slot`'s next prefill at row `rows` over the rows its last sequence left.
     pub fn resume_slot(&mut self, slot: usize, rows: usize) -> bool {
         let ok = slot < self.batch
@@ -349,6 +435,32 @@ impl CpuServe {
         }
         ok
     }
+}
+
+/// The live-KV manifest's per-slot BF16 caches as `(handle, heads, rows, row bytes)` plus the
+/// smallest ring, or nothing when a cache is not a plain head-major block a row copy can move.
+fn prefix_share_layout(model: &CpuModel, batch: usize) -> (Vec<(usize, u32, u32, usize)>, u32) {
+    let Ok(m) = model.blob.with_packet_view(plow_asset::live_kv::emit) else {
+        return (Vec::new(), 0);
+    };
+    let mut kv: Vec<(usize, u32, u32, usize)> = Vec::new();
+    for c in &m.caches {
+        let identity = c.mask == u32::MAX || (c.stride.is_power_of_two() && c.mask == c.stride - 1);
+        if c.scales.is_some() || !identity {
+            return (Vec::new(), 0);
+        }
+        let row = c.hd as usize * 2;
+        for h in c.pair.map(usize::from) {
+            if model.tensor(h).bytes != batch * c.heads as usize * c.stride as usize * row {
+                return (Vec::new(), 0);
+            }
+            if !kv.iter().any(|e| e.0 == h) {
+                kv.push((h, c.heads, c.stride, row));
+            }
+        }
+    }
+    let rows = m.caches.iter().map(|c| c.stride).min().unwrap_or(0);
+    (kv, rows)
 }
 
 impl SeqEngine for CpuServe {
