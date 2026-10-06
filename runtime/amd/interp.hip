@@ -3505,6 +3505,12 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
                       (unsigned char*)TEN(3), (float*)TEN(4) PLOW_PACKED_NORM_ARGS);
             break;
 #endif
+        case PLOW_DOP_PER_LAYER_INPUT:
+            d_per_layer_input((bf16*)TEN(0), (const bf16*)TEN(1), (const bf16*)TEN(2),
+                              (const bf16*)TEN(3), (const bf16*)TEN(4), (bf16*)TEN(5),
+                              (const bf16*)TEN(6), PLOW_RUNTIME_ROWS(in->i[0]), in->i[1], in->i[2], in->i[3],
+                              in->i[4], in->fj[0].f, in->fj[1].f, slice, nblk, (float*)sm->raw);
+            break;
 #if !PLOW_DECODE_INVENTORY_PRUNE || PLOW_HAS_ROWRMS
         case PLOW_DOP_ROWRMS:
             d_rowrms((float*)TEN(0), (const bf16*)TEN(1), in->i[0], in->i[1], in->fj[0].f, slice,
@@ -3724,6 +3730,16 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
                     in->fj[0].f, slice, nblk);
             break;
 #endif
+        case PLOW_DOP_EMBED_OVERLAY_BF16:
+            d_embed_overlay((bf16*)TEN(0), (const bf16*)TEN(1), (const unsigned*)TEN(2),
+                            (const float*)TEN(3), (const unsigned*)TEN(4), PLOW_RUNTIME_ROWS(in->i[0]), in->i[1],
+                            in->i[2], in->i[3], slice, nblk);
+            break;
+        case PLOW_DOP_EMBED_POS_BF16:
+            d_embed_pos((bf16*)TEN(0), (const bf16*)TEN(1), (const unsigned*)TEN(2),
+                        (const bf16*)TEN(3), (const unsigned*)TEN(4), (const unsigned*)TEN(5),
+                        PLOW_RUNTIME_ROWS(in->i[0]), in->i[1], in->i[2], in->i[3], slice, nblk);
+            break;
         /* Terminal row selection for the unified token batch. Always dispatched: the arm is
          * a bounds-checked copy with no resource cost worth pruning, and a pruned arm here is
          * indistinguishable at runtime from a gather that silently wrote nothing. */

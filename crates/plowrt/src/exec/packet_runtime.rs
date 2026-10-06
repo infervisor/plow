@@ -229,13 +229,15 @@ pub fn load_packet_runtime(path: &Path, requested: &str) -> Result<LoadedPacketR
                 runtime: Box::new(crate::exec::apple::MetalEngine::load_packet(path)?),
             });
         }
-        #[cfg(all(feature = "cpu", not(all(feature = "metal", target_os = "macos"))))]
+        #[cfg(feature = "cuda")]
+        {
+            if let Ok(loaded) = load_packet_runtime(path, "cuda") {
+                return Ok(loaded);
+            }
+        }
+        #[cfg(feature = "cpu")]
         {
             return load_packet_runtime(path, "cpu");
-        }
-        #[cfg(all(feature = "cuda", not(feature = "cpu"), not(all(feature = "metal", target_os = "macos"))))]
-        {
-            return load_packet_runtime(path, "cuda");
         }
         #[cfg(not(any(feature = "cpu", feature = "cuda", all(feature = "metal", target_os = "macos"))))]
         {
@@ -247,7 +249,20 @@ pub fn load_packet_runtime(path: &Path, requested: &str) -> Result<LoadedPacketR
     match requested {
         #[cfg(feature = "cpu")]
         "cpu" => {
-            let options = crate::exec::cpu::engine::CpuEngineOpts::default();
+            let cpu = &crate::config::RuntimeConfig::get().cpu;
+            let options = crate::exec::cpu::engine::CpuEngineOpts {
+                threads: cpu.threads as usize,
+                numa: cpu.numa.clone(),
+                isa: match cpu.isa {
+                    crate::config::CpuIsa::Scalar => crate::exec::cpu::ffi::Isa::Scalar,
+                    crate::config::CpuIsa::Avx512 => crate::exec::cpu::ffi::Isa::Avx512,
+                    crate::config::CpuIsa::Amx | crate::config::CpuIsa::Auto => {
+                        crate::exec::cpu::ffi::Isa::Amx
+                    }
+                },
+                spin_us: cpu.spin_us,
+                topology: None,
+            };
             Ok(LoadedPacketRuntime {
                 backend: "cpu",
                 runtime: Box::new(crate::exec::cpu::engine::CpuEngine::load_packet(
@@ -299,7 +314,7 @@ impl PacketAsset {
     }
 
     pub fn from_bytes(image: &[u8]) -> Result<Self> {
-        let blob = crate::asset::devblob::DevBlob::parse(image)?;
+        let blob = crate::asset::devblob::DevBlob::parse_l2(image, true)?;
         let raw = blob
             .reserved_metadata(image, SECTION)?
             .ok_or_else(|| RuntimeError::Rejected(format!("packet is missing {SECTION}")))?;

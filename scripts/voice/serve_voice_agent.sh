@@ -51,9 +51,11 @@ cp "${PLOWRT_BIN:-$HERE/target/release/plowrt}" "$RT" || exit 2
 PB_SERVER_PORT=${PORT:-$(pb_free_port)}; PB_SERVER_LOG="$RES/serve.log"
 # LLM last: its KV admission budget is sampled from what the speech models leave.
 # shellcheck disable=SC2086
-PLOW_LIVE_CTX_MODELS=${VA_LIVE_CTX:-qwen3-asr=768,chatterbox-mtl=512} \
+PLOW_CPU_THREADS=${PLOW_CPU_THREADS:-96} \
+PLOW_LIVE_CTX_MODELS=${VA_LIVE_CTX:-qwen3-asr=768,${TTS_MODEL:-veena}=512} \
     "$RT" serve --assets "$A" --assets "$S" --assets "$L" --port "$PB_SERVER_PORT" \
-    --co-sched "${VA_CO_SCHED:-deadline}" --session-ttl-ms "${VA_SESSION_TTL_MS:-60000}" ${SERVE_ARGS:-} \
+    --co-sched "${VA_CO_SCHED:-rr}" --session-ttl-ms "${VA_SESSION_TTL_MS:-60000}" \
+    --max-queued-requests "${MAX_QUEUED_REQUESTS:-512}" ${SERVE_ARGS:-} \
     > "$PB_SERVER_LOG" 2>&1 &
 PB_SERVER_PID=$!
 trap pb_serve_stop EXIT
@@ -69,8 +71,8 @@ for n in "${@:-10}"; do
     curl -fsS "$URL/metrics" > "$RES/metrics-$n.before" 2>/dev/null
     # shellcheck disable=SC2086
     "$PY" "$HERE/scripts/voice/call_sim.py" --url "$URL" --calls "$n" --turns "${TURNS:-3}" \
-        --asr-model qwen3-asr --llm-model gemma-4-e4b --tts-model chatterbox-mtl \
-        --manifest "$MANIFEST" ${CALL_ARGS:---language en} --out "$RES/calls$n.json" 2>&1 | tail -2
+        --asr-model "${ASR_MODEL:-qwen3-asr}" --llm-model "${LLM_MODEL:-gemma-4-e4b}" --tts-model "${TTS_MODEL:-chatterbox-mtl}" \
+        --manifest "$MANIFEST" ${CALL_ARGS-} --out "$RES/calls$n.json" 2>&1 | tail -2
     curl -fsS "$URL/metrics" > "$RES/metrics-$n.after" 2>/dev/null
 done
 echo "server faults: $(grep -ciE 'panic|fault|illegal' "$PB_SERVER_LOG")"

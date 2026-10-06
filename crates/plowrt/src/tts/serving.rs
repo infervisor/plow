@@ -333,6 +333,7 @@ async fn speech_with(
     if let Some(canonical) = state.registry.resolve(&req.model) {
         req.model = canonical;
     }
+    #[cfg(feature = "cuda")]
     if let Some(mgr) = state.manager_for(&req.model) {
         if mgr.manages(&req.model) {
             if let Err(e) = mgr.ensure_resident(&req.model).await {
@@ -396,7 +397,7 @@ async fn speech_with(
     gen.max_tokens = req.max_tokens.unwrap_or_else(|| c.max_new_tokens(&req.input)).min(c.max_new_tokens_cap);
     gen.params.temperature = req.temperature.unwrap_or(c.temperature);
     gen.params.top_p = req.top_p.unwrap_or(c.top_p);
-    gen.params.repetition_penalty = req.repetition_penalty.unwrap_or(1.0);
+    gen.params.repetition_penalty = req.repetition_penalty.unwrap_or(1.05);
     gen.seed = req.seed;
     gen.stop_token_ids = c.stops.clone();
 
@@ -404,7 +405,14 @@ async fn speech_with(
     let opts = crate::serve::mux::JobOpts {
         class: if req.stream { crate::serve::mux::JobClass::Critical } else { crate::serve::mux::JobClass::Normal },
         raw_tokens: true,
-        speech: None,
+        speech: Some(Box::new(crate::serve::mux::SpeechJob {
+            codebook: Some(crate::serve::mux::CodebookConstraint {
+                base: c.audio_token_base,
+                frame_codes: c.frame_codes as u32,
+                codebook: c.codebook,
+            }),
+            ..Default::default()
+        })),
         session: ids.session.as_ref().and_then(|_| ids.ticket(crate::serve::session::row_keys(&prompt_ids, &[], &[]), report)),
         turn: ids.turn_key.clone(),
         continuing: run.continuing(),
@@ -530,7 +538,7 @@ async fn collect_codes(c: &SpeechContract, mut rx: stream_mod::ChunkReceiver) ->
 /// Veena c64 36% slower than whole-utterance decoding.
 fn stream_step(n: usize, emitted: usize, done: bool, window: usize, lookahead: usize, chunk: usize) -> Option<(usize, usize, usize)> {
     let upto = if done { n } else { n.saturating_sub(lookahead) };
-    let ready = upto > emitted && (done || emitted == 0 || upto - emitted >= chunk);
+    let ready = upto > emitted && (done || (emitted == 0 && upto >= 4) || (emitted > 0 && upto - emitted >= chunk));
     ready.then(|| (emitted.saturating_sub(window.saturating_sub(lookahead + 1)), n.min(upto + lookahead), upto))
 }
 
@@ -583,11 +591,22 @@ async fn stream_task(
         if let Some((s, e, upto)) = stream_step(frames.len() / fc, emitted, done, model.codec.window, lookahead, chunk) {
             let window = frames[s * fc..e * fc].to_vec();
             let urgency = if emitted == 0 { Urgency::First } else { Urgency::Stream };
+            let t_dec_start = Instant::now();
             match model.codec.decode(window, e - s, seed ^ (emitted as u64).wrapping_mul(0x9E37_79B9), urgency).await {
                 Ok(pcm) => {
                     let Some(fresh) = pcm.get((emitted - s) * fs..(upto - s) * fs) else {
                         return drop(out.send(Err(std::io::Error::other(short_window(pcm.len(), e - s)))).await);
                     };
+                    tracing::info!(
+                        emitted,
+                        s,
+                        e,
+                        upto,
+                        frames_total = frames.len() / fc,
+                        decode_ms = t_dec_start.elapsed().as_millis() as u64,
+                        elapsed_ms = t_arrive.elapsed().as_millis() as u64,
+                        "tts: stream decode step"
+                    );
                     let mut bytes = Vec::new();
                     pcm16(fresh, &mut bytes);
                     first.get_or_insert_with(|| t_arrive.elapsed());

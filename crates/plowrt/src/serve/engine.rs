@@ -255,6 +255,28 @@ pub trait SeqEngine {
         ))
     }
     fn step_batch(&mut self, feeds: &[(usize, u32)]) -> crate::Result<Vec<(usize, u32)>>;
+    fn write_tensor(&mut self, _name: &str, _src: &[u8]) -> crate::Result<()> {
+        Err(crate::RuntimeError::Rejected("write_tensor unavailable on this engine".into()))
+    }
+    fn write_tensor_at(&mut self, _name: &str, _offset: u64, _src: &[u8]) -> crate::Result<()> {
+        Err(crate::RuntimeError::Rejected("write_tensor_at unavailable on this engine".into()))
+    }
+    fn tensor_bytes(&self, _name: &str) -> Option<u64> {
+        None
+    }
+    fn logits_row(&mut self, _slot: usize, _out: &mut Vec<f32>) -> crate::Result<()> {
+        Err(crate::RuntimeError::Rejected("logits_row unavailable on this engine".into()))
+    }
+    fn stage_speech_prefill(
+        &mut self,
+        _slot_idx: usize,
+        _c0: usize,
+        _overlay: &[f32],
+        _overlay_pos: &[u32],
+        _pos_base: Option<u32>,
+    ) -> crate::Result<()> {
+        Ok(())
+    }
 }
 
 impl ServeEngine {
@@ -673,6 +695,39 @@ mod amd_serve {
                 }
                 Ranks::Tp(g) => g.data_snapshot(slot, SNAPSHOT_KV_BYTES, tensors),
             }
+        }
+
+        fn write_tensor(&mut self, name: &str, src: &[u8]) -> Result<()> {
+            match self {
+                Self::One(e) => e.write_tensor(name, src),
+                Self::Tp(g) => g.write_tensor(name, src),
+            }
+        }
+
+        fn write_tensor_at(&mut self, name: &str, offset: u64, src: &[u8]) -> Result<()> {
+            match self {
+                Self::One(e) => e.write_tensor_at(name, offset, src),
+                Self::Tp(g) => g.write_tensor_at(name, offset, src),
+            }
+        }
+
+        fn tensor_bytes(&self, name: &str) -> Option<u64> {
+            match self {
+                Self::One(e) => e.tensor_bytes(name),
+                Self::Tp(g) => g.tensor_bytes(name),
+            }
+        }
+
+        fn logits_row(&mut self, slot: usize, out: &mut Vec<f32>) -> Result<()> {
+            match self {
+                Self::One(e) => e.logits_row(slot, out),
+                Self::Tp(g) => g.logits_row(slot, out),
+            }
+        }
+
+        fn pf_max_rows(&self) -> usize {
+            let e = self.rank0();
+            e.prefill_rungs().map(|(_, w)| w).max().unwrap_or(0) as usize
         }
     }
 
@@ -3205,6 +3260,54 @@ mod amd_serve {
             Ok(feeds.iter().map(|&(s, _)| (s, out[s])).collect())
         }
 
+        pub fn write_tensor(&mut self, name: &str, src: &[u8]) -> Result<()> {
+            self.ranks.write_tensor(name, src)
+        }
+
+        pub fn write_tensor_at(&mut self, name: &str, offset: u64, src: &[u8]) -> Result<()> {
+            self.ranks.write_tensor_at(name, offset, src)
+        }
+
+        pub fn tensor_bytes(&self, name: &str) -> Option<u64> {
+            self.ranks.tensor_bytes(name)
+        }
+
+        pub fn logits_row(&mut self, slot: usize, out: &mut Vec<f32>) -> Result<()> {
+            self.ranks.logits_row(slot, out)
+        }
+
+        pub fn stage_speech_prefill(
+            &mut self,
+            slot_idx: usize,
+            c0: usize,
+            overlay: &[f32],
+            overlay_pos: &[u32],
+            pos_base: Option<u32>,
+        ) -> Result<()> {
+            if c0 == 0 && pos_base.is_some() {
+                self.ranks.write_tensor_at("in.pos_base", (slot_idx * 4) as u64, &0u32.to_le_bytes())?;
+            }
+            if overlay_pos.is_empty() {
+                return Ok(());
+            }
+            let hidden = overlay.len() / overlay_pos.len();
+            let index_bytes = self
+                .ranks
+                .tensor_bytes("in.encoder_overlay_index")
+                .ok_or_else(|| RuntimeError::Rejected("packet has no in.encoder_overlay_index".into()))?;
+            let index_rows = (index_bytes / 4) as usize;
+            let window = index_rows.min(self.ranks.pf_max_rows().max(1));
+            let mut index = Vec::new();
+            let (lo, hi) = crate::serve::mux::speech_overlay_index(overlay_pos, c0, window, &mut index);
+            if hi > lo {
+                self.ranks.write_tensor(
+                    "in.encoder_overlay",
+                    bytemuck::cast_slice(&overlay[lo * hidden..hi * hidden]),
+                )?;
+            }
+            self.ranks.write_tensor("in.encoder_overlay_index", bytemuck::cast_slice(&index))
+        }
+
         /// Free a slot. There is no cache to reclaim — the block is fixed and
         /// preallocated — so this only stops the slot being fed and lets
         /// admission reuse it. The next request rewrites every row it reads.
@@ -4421,5 +4524,27 @@ impl SeqEngine for AmdServe {
     }
     fn step_batch(&mut self, feeds: &[(usize, u32)]) -> crate::Result<Vec<(usize, u32)>> {
         AmdServe::step_batch(self, feeds)
+    }
+    fn write_tensor(&mut self, name: &str, src: &[u8]) -> crate::Result<()> {
+        AmdServe::write_tensor(self, name, src)
+    }
+    fn write_tensor_at(&mut self, name: &str, offset: u64, src: &[u8]) -> crate::Result<()> {
+        AmdServe::write_tensor_at(self, name, offset, src)
+    }
+    fn tensor_bytes(&self, name: &str) -> Option<u64> {
+        AmdServe::tensor_bytes(self, name)
+    }
+    fn logits_row(&mut self, slot: usize, out: &mut Vec<f32>) -> crate::Result<()> {
+        AmdServe::logits_row(self, slot, out)
+    }
+    fn stage_speech_prefill(
+        &mut self,
+        slot_idx: usize,
+        c0: usize,
+        overlay: &[f32],
+        overlay_pos: &[u32],
+        pos_base: Option<u32>,
+    ) -> crate::Result<()> {
+        AmdServe::stage_speech_prefill(self, slot_idx, c0, overlay, overlay_pos, pos_base)
     }
 }

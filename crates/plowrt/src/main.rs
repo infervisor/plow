@@ -3886,7 +3886,7 @@ async fn serve(
     mux_cfg: MuxConfig,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let state = bringup_runtime(assets, executors, trace, mux_cfg, served_model_name).await?;
-    #[cfg(feature = "cuda")]
+    #[cfg(any(feature = "cuda", feature = "hsa"))]
     {
         let state = Arc::clone(&state);
         tokio::task::spawn_blocking(move || -> Result<(), String> {
