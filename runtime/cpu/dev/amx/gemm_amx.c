@@ -177,12 +177,12 @@ static inline __m512 bf16x16_to_f32(const plow_bf16* p) {
 }
 
 /* Stores march kb-outer so the chunk TILELOADD reads first was written longest ago (ORM 20.15). */
-static void stage_a(plow_bf16* ap, const plow_bf16* A, uint32_t rows, uint32_t K, uint32_t k0,
+static void stage_a(plow_bf16* ap, size_t ldd, const plow_bf16* A, uint32_t rows, uint32_t K, uint32_t k0,
                     uint32_t kp, const float* rms, const plow_bf16* gamma) {
     for (uint32_t kk = 0; kk < kp; kk += 32u) {
         const uint32_t k = k0 + kk;
         for (uint32_t r = 0; r < 32u; r++) {
-            plow_bf16* d = ap + (size_t)r * KP + kk;
+            plow_bf16* d = ap + (size_t)r * ldd + kk;
             if (r >= rows) {
                 _mm512_storeu_si512((void*)d, _mm512_setzero_si512());
                 continue;
@@ -302,7 +302,7 @@ static inline void ils_drain(ils_t* e) {
 /* acc in tmm0-3 (zeroed or reloaded from `part`), K loop with the ILS epilogue of `pend`
  * sprinkled in, then TILESTORED to `out` (fp32 stride 128 B). A1 == NULL: 16-row block. */
 static void block(const plow_bf16* A0, const plow_bf16* A1, size_t lda, const uint8_t* bp,
-                  uint32_t nkb, const float* part, float* out, ils_t* pend) {
+                  uint32_t nkb, const float* part, float* out, ils_t* pend, int astream) {
     if (part) {
         _tile_loadd(0, part, 128);
         _tile_loadd(1, part + 16, 128);
@@ -317,13 +317,15 @@ static void block(const plow_bf16* A0, const plow_bf16* A1, size_t lda, const ui
     const uint32_t per = pend ? (ils_left(pend) + nkb - 1u) / nkb : 0u;
     for (uint32_t kb = 0; kb < nkb; kb++) {
         const uint8_t* b = bp + (size_t)kb * 2048u;
-        _tile_stream_loadd(4, A0 + kb * 32u, lda); /* A streams (T1 hint), B stays in L1 */
+        if (astream) _tile_stream_loadd(4, A0 + kb * 32u, lda); /* A streams (T1 hint), B stays in L1 */
+        else _tile_loadd(4, A0 + kb * 32u, lda);
         _tile_loadd(6, b, 64);
         _tile_dpbf16ps(0, 4, 6);
         _tile_loadd(7, b + 1024, 64);
         _tile_dpbf16ps(1, 4, 7);
         if (A1) {
-            _tile_stream_loadd(5, A1 + kb * 32u, lda);
+            if (astream) _tile_stream_loadd(5, A1 + kb * 32u, lda);
+            else _tile_loadd(5, A1 + kb * 32u, lda);
             _tile_dpbf16ps(2, 5, 6);
             _tile_dpbf16ps(3, 5, 7);
         }
@@ -343,7 +345,7 @@ static void block(const plow_bf16* A0, const plow_bf16* A1, size_t lda, const ui
  * Read once, off by default. */
 enum { AMX_DBG_NOPACK = 1, AMX_DBG_NOTDP = 2, AMX_DBG_NOSTAGE = 4, AMX_DBG_PACK = 8, AMX_DBG_NOXPACK = 16, AMX_DBG_WSTAGE = 32, AMX_DBG_NOGRID = 64,
        AMX_DBG_L1PF = 128, AMX_DBG_NOSTREAM = 256, AMX_DBG_NOPF = 512,
-       AMX_DBG_WPANEL2 = 1024 };
+       AMX_DBG_WPANEL2 = 1024, AMX_DBG_WM = 2048 };
 static int amx_debug_flags(void) {
     static int f = -1;
     if (f < 0) {
@@ -359,6 +361,7 @@ static int amx_debug_flags(void) {
         if (e && strstr(e, "nostream")) f |= AMX_DBG_NOSTREAM;
         if (e && strstr(e, "nopf")) f |= AMX_DBG_NOPF;
         if (e && strstr(e, "wpanel2")) f |= AMX_DBG_WPANEL2;
+        if (e && strstr(e, "wmrun")) f |= AMX_DBG_WM;
         for (const char* p = e ? strstr(e, "pack") : NULL; p; p = strstr(p + 1, "pack"))
             if (p == e || p[-1] == ',' || p[-1] == ' ') f |= AMX_DBG_PACK;
     }
@@ -408,7 +411,7 @@ static void tile_amx(const gemm_args* g, uint32_t m0, uint32_t m1, uint32_t n0, 
             if (g->rms || (rows != 32u && rows != 16u) ||
                 ((size_t)g->K * 2u > 4096u && !(dbg & AMX_DBG_NOSTAGE))) {
                 plow_bf16* a = ap + (size_t)mb * (ABLK_BYTES / 2u);
-                stage_a(a, g->A + (size_t)m * g->K, rows, g->K, k0, kp, g->rms ? g->rms + m : NULL,
+                stage_a(a, KP, g->A + (size_t)m * g->K, rows, g->K, k0, kp, g->rms ? g->rms + m : NULL,
                         g->gamma);
                 A0s[mb] = a;
                 A1s[mb] = rows > 16u ? a + 16u * KP : NULL;
@@ -430,10 +433,10 @@ static void tile_amx(const gemm_args* g, uint32_t m0, uint32_t m1, uint32_t n0, 
                 const float* in_part = first ? NULL : part;
                 float* out = last ? cb + (size_t)cur * 2048u : part;
                 if (!(dbg & AMX_DBG_NOTDP)) {
-                    block(A0s[mb], A1s[mb], ldas[mb], bs, nkb, in_part, out, pend.rows ? &pend : NULL);
+                    block(A0s[mb], A1s[mb], ldas[mb], bs, nkb, in_part, out, pend.rows ? &pend : NULL, 1);
                     if (glu)
                         block(A0s[mb], A1s[mb], ldas[mb], bs + STRIP_BYTES, nkb,
-                              in_part ? in_part + 1024 : NULL, out + 1024, pend.rows ? &pend : NULL);
+                              in_part ? in_part + 1024 : NULL, out + 1024, pend.rows ? &pend : NULL, 1);
                 } else if (pend.rows) {
                     ils_drain(&pend);
                 }
@@ -850,6 +853,136 @@ static int wm_run(const gemm_args* g, uint32_t slice, uint32_t nblk, PlowCpuCtx*
     return 1;
 }
 
+/* ---- W-stationary driver: each slice packs ITS weight strips once, x is the A operand in place ----
+ *
+ * Both drivers above pay for an x relayout: wm_run packs every token's activations per slice, and
+ * the strip driver re-packs W per 256-row M tile. Here the slice's weight strips (the only
+ * weights it reads) are packed ONCE per call per K panel into L2-resident VNNI strips, and every
+ * token block then reads x straight from the activation as the A operand: 32 row streams the L2
+ * streamer follows, no pack, no transpose in the epilogue (C tiles are [m][n]). The panel is the
+ * whole K whenever the slice's strips fit WP_WBUDGET, so W leaves DRAM once and nothing spills
+ * partials. Measured 96 threads, Gemma-4-E2B GEMM_GLU M 1000 N 12288 K 1536: prototype 0.83 ms vs
+ * 1.19 ms for wm_run (same data, bit-for-bit math aside from the summation tile order).
+ * The grid trades the per-slice W pack (gm re-packs every strip) against the x stream (gn re-read
+ * every row), in bf16-MAC units per K element: a packed weight element ~200 (DRAM pack rate),
+ * an x element ~110 (L3 stream), one MAC 1. */
+#define WP_WBUDGET (1280u << 10)
+#define WP_W_COST 200u
+#define WP_X_COST 110u
+
+static int wp_run(const gemm_args* g, uint32_t slice, uint32_t nblk, PlowCpuCtx* ctx) {
+    const int dbg = amx_debug_flags();
+    const int glu = g->Wu != NULL;
+    const uint32_t nacc = glu ? 2u : 1u;
+    const uint32_t S = (g->N + 31u) / 32u, MB = (g->M + 31u) / 32u;
+    uint32_t gm = 1u, gn = S < nblk ? S : nblk;
+    {
+        uint64_t best = ~0ull;
+        for (uint32_t m = 1u; m <= nblk && m <= MB; m++) {
+            const uint32_t n = nblk / m < S ? nblk / m : S;
+            if (!n) continue;
+            const uint64_t rows = (uint64_t)((MB + m - 1u) / m) * 32u, strips = (S + n - 1u) / n;
+            /* Each K panel past the first re-packs and splits every K loop and spills partials:
+             * measured +30% at E2B GLU N 12288 (gm 2, two panels) against gm 1 in one. */
+            const uint64_t panels = (strips * nacc * g->K * 64u + WP_WBUDGET - 1u) / WP_WBUDGET;
+            const uint64_t mac = rows * strips * 32u * nacc;
+            const uint64_t cost = WP_W_COST * strips * 32u * nacc + WP_X_COST * rows + mac + (panels - 1u) * mac / 2u;
+            if (cost < best) best = cost, gm = m, gn = n;
+        }
+    }
+    if (slice >= gm * gn) return 1;
+    const uint32_t im = slice / gn, in_ = slice % gn;
+    const uint32_t s0 = (uint32_t)((uint64_t)S * in_ / gn), s1 = (uint32_t)((uint64_t)S * (in_ + 1u) / gn);
+    const uint32_t tb0 = (uint32_t)((uint64_t)MB * im / gm), tb1 = (uint32_t)((uint64_t)MB * (im + 1u) / gm);
+    /* Sized by the widest slice so every slice takes this driver or none does (the fallback's
+     * grid differs). */
+    const uint32_t nstrip = s1 - s0, nsmax = (S + gn - 1u) / gn, nkbT = g->K / 32u;
+    /* K panels: as few as keep the slice's packed strips under WP_WBUDGET. */
+    uint32_t npanel = (uint32_t)(((size_t)nsmax * nacc * g->K * 64u + WP_WBUDGET - 1u) / WP_WBUDGET);
+    if (npanel > nkbT) npanel = nkbT;
+    const uint32_t kpb = (nkbT + npanel - 1u) / npanel;
+    npanel = (nkbT + kpb - 1u) / kpb;
+    const uint32_t kpmax = kpb * 32u;
+    uint8_t* sc = ctx->scratch;
+    float* cb = (float*)sc; /* ILS ping-pong x {gate, up}: 16 KiB */
+    plow_bf16* ap = (plow_bf16*)(sc + 16384u);
+    uint8_t* wp = sc + 16384u + (size_t)32u * kpmax * 2u;
+    const size_t wbytes = (size_t)nsmax * nacc * kpmax * 64u;
+    float* cp = (float*)(wp + wbytes);
+    const size_t used = 16384u + (size_t)32u * kpmax * 2u + wbytes;
+    if (used > ctx->scratch_bytes) return 0;
+    const size_t per_tb = (size_t)nsmax * nacc * 4096u;
+    uint32_t ctb = MB;
+    if (npanel > 1u) {
+        const size_t fit = (ctx->scratch_bytes - used) / per_tb;
+        if (!fit) return 0;
+        if (fit < ctb) ctb = (uint32_t)fit;
+    }
+    if (!nstrip || tb0 >= tb1) return 1;
+    const size_t lda_x = (size_t)g->K * 2u;
+    for (uint32_t c0 = tb0; c0 < tb1; c0 += ctb) {
+        const uint32_t c1 = c0 + ctb < tb1 ? c0 + ctb : tb1;
+        ils_t pend = {0};
+        uint32_t cur = 0;
+        for (uint32_t p = 0; p < npanel; p++) {
+            const uint32_t k0 = p * kpmax, kp = g->K - k0 < kpmax ? g->K - k0 : kpmax, nkb = kp / 32u;
+            const int first = p == 0, last = p + 1u == npanel;
+            for (uint32_t s = 0; s < nstrip && !(dbg & AMX_DBG_NOPACK); s++) {
+                const uint32_t n = (s0 + s) * 32u;
+                plow_cpu_amx_pack_b_strip(wp + (size_t)s * nacc * kp * 64u, g->W, g->N, g->K, n, k0, kp);
+                if (glu) plow_cpu_amx_pack_b_strip(wp + ((size_t)s * nacc + 1u) * kp * 64u, g->Wu, g->N, g->K, n, k0, kp);
+            }
+            for (uint32_t tb = c0; tb < c1; tb++) {
+                const uint32_t m = tb * 32u, rows = g->M - m < 32u ? g->M - m : 32u;
+                const plow_bf16 *A0, *A1;
+                size_t lda;
+                if (g->rms || (rows != 32u && rows != 16u)) {
+                    stage_a(ap, kp, g->A + (size_t)m * g->K, rows, g->K, k0, kp, g->rms ? g->rms + m : NULL, g->gamma);
+                    A0 = ap;
+                    A1 = rows > 16u ? ap + 16u * kp : NULL;
+                    lda = (size_t)kp * 2u;
+                } else {
+                    A0 = g->A + (size_t)m * g->K + k0;
+                    A1 = rows == 32u ? A0 + 16u * g->K : NULL;
+                    lda = lda_x;
+                }
+                for (uint32_t s = 0; s < nstrip; s++) {
+                    const uint32_t n = (s0 + s) * 32u, cols = g->N - n < 32u ? g->N - n : 32u;
+                    const uint8_t* bs = wp + (size_t)s * nacc * kp * 64u;
+                    float* part = cp + ((size_t)(tb - c0) * nstrip + s) * nacc * 1024u;
+                    const float* in_part = first ? NULL : part;
+                    float* out = last ? cb + (size_t)cur * 2048u : part;
+                    if (!(dbg & AMX_DBG_NOTDP)) {
+                        block(A0, A1, lda, bs, nkb, in_part, out, pend.rows ? &pend : NULL, 0);
+                        if (glu)
+                            block(A0, A1, lda, bs + (size_t)kp * 64u, nkb, in_part ? in_part + 1024 : NULL, out + 1024,
+                                  pend.rows ? &pend : NULL, 0);
+                    } else if (pend.rows) {
+                        ils_drain(&pend);
+                    }
+                    if (last) {
+                        ils_drain(&pend);
+                        pend = (ils_t){.cb = out,
+                                       .cb_up = glu ? out + 1024 : NULL,
+                                       .dst = g->C + (size_t)m * g->N + n,
+                                       .bias = g->bias ? g->bias + n : NULL,
+                                       .bias_up = g->bias_up ? g->bias_up + n : NULL,
+                                       .f0 = g->f0,
+                                       .f1 = g->f1,
+                                       .ldc = g->N,
+                                       .rows = rows,
+                                       .cols = cols,
+                                       .act = g->act};
+                        cur ^= 1u;
+                    }
+                }
+            }
+        }
+        ils_drain(&pend);
+    }
+    return 1;
+}
+
 int plow_amx_usable(const PlowCpuCtx* ctx, uint32_t K) {
     return ctx && ctx->scratch && ctx->scratch_bytes >= SCRATCH_NEED && (K % 32u) == 0u && K > 0;
 }
@@ -857,7 +990,16 @@ int plow_amx_usable(const PlowCpuCtx* ctx, uint32_t K) {
 void plow_amx_run_tiles(const gemm_args* g, uint32_t slice, uint32_t nblk, PlowCpuCtx* ctx) {
     /* bf16 weights take the pack-free driver unless PLOW_AMX_DEBUG=pack; fp8 (dequant in the
      * strip pack) and slices whose partials cannot fit the scratch keep the strip driver. */
-    if (!g->Wq && !(amx_debug_flags() & AMX_DBG_PACK) && wm_run(g, slice, nblk, ctx)) return;
+    if (!g->Wq && !(amx_debug_flags() & AMX_DBG_PACK)) {
+        /* wp_run reuses each x tile nstrip x nacc times out of L3; a plain GEMM wide in K and N
+         * leaves ~2 strips per slice and streams x faster than L3 delivers (96 threads, M 1000:
+         * N 5376 K 21504 7.2 ms vs 3.5 in wm_run, N 8192 K 5376 1.8 vs 1.4), while GLU and narrow
+         * shapes win (GLU N 12288 K 1536 0.97 vs 1.21, N 21504 K 5376 6.1 vs 8.7). Packing W also
+         * needs two token blocks to reuse it. */
+        const int wp = g->M >= 64u && (g->Wu || g->K <= 2048u || g->N <= 2048u);
+        if (wp && !(amx_debug_flags() & AMX_DBG_WM) && wp_run(g, slice, nblk, ctx)) return;
+        if (wm_run(g, slice, nblk, ctx)) return;
+    }
     const uint32_t tm = (g->M + g->BM - 1u) / g->BM, tn = (g->N + g->BN - 1u) / g->BN;
     for (uint32_t lin = slice; lin < tm * tn; lin += nblk) {
         const uint32_t m0 = (lin / tn) * g->BM, n0 = (lin % tn) * g->BN;
@@ -970,7 +1112,7 @@ double plow_cpu_amx_debug_kloop(uint32_t iters, PlowCpuCtx* ctx) {
     struct timespec t0, t1;
     clock_gettime(CLOCK_MONOTONIC, &t0);
     for (uint32_t i = 0; i < iters; i++)
-        block(ap, ap + 16u * KP, KP * 2u, sc + BP_OFF, KP / 32u, NULL, cb, NULL);
+        block(ap, ap + 16u * KP, KP * 2u, sc + BP_OFF, KP / 32u, NULL, cb, NULL, 1);
     clock_gettime(CLOCK_MONOTONIC, &t1);
     return (double)(t1.tv_sec - t0.tv_sec) + (double)(t1.tv_nsec - t0.tv_nsec) * 1e-9;
 }
