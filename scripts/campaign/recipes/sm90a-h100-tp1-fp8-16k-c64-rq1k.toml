@@ -148,9 +148,9 @@ PLOW_TOKEN_BATCH = "1"
 PLOW_LT_FP8_FAST_ACCUM_MAX_K = "8192"
 # B64 decode projections on the packet's CUTLASS objects (cubin:host sha256, CUDA 12.9 + g++-14):
 # step_bench B64 ctx 4096 22.84 -> 20.85 ms, ctx 15000 29.12 -> 27.13; 4K c128 out tok/s +1.7%.
-# The cubin's internal symbol hash follows the source's absolute path: a checkout elsewhere
-# builds different bytes and must re-pin these two hashes.
-PLOW_CUTLASS_FP8_DECODE = "7a6f5d98a31b79b184abfb97f22a907e51cf52a00083aea2b954df9c9dc75c8f:725994e93efa87bfbaa744ac41cf52dfaa4b1fb84bba4d680d0bd78693730a25"
+# The objects build from the repo-relative source path, so any checkout reproduces these bytes
+# (the host library still follows the host compiler).
+PLOW_CUTLASS_FP8_DECODE = "7b20915928c280733108e64036efb981351d6802d0b96c971b5b5462224e1076:0852b6085c29c57ac263c27d61c09ec1621da58f18f93a2dc3e80f03d0587974"
 # Vendor-GEMM (cuBLASLt QK^T / softmax / PV) global prefill attention for every request of >= 128
 # rows instead of >= 1024: long-prefix chunks leave the px4 role (512 rows over 15.5K prefix
 # 37.5 -> 19.9 ms per chunk; 8x512 pack at prefix 12K 238 -> 142 ms); prefix-0 packs equal.
