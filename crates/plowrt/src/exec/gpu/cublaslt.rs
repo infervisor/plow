@@ -355,6 +355,8 @@ pub(super) fn light_functions(
     let attn = match be.module_global_u32(module, "plow_light_attn_hd")? {
         Some(hd) => {
             let f = be.get_function(module, &format!("plow_{arch}_light_attn"))?;
+            // A wider light hd512 head group than the interpreter's claims its own smem.
+            let smem = be.module_global_u32(module, "plow_light_attn_smem")?.map_or(smem, |s| s.max(smem));
             be.set_max_dynamic_smem(f, smem)?;
             let hd2 = be.module_global_u32(module, "plow_light_attn_hd2")?.unwrap_or(hd);
             Some((f, smem, [hd, hd2]))

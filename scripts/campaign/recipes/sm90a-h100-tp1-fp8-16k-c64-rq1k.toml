@@ -71,12 +71,16 @@ PLOW_MAX_CHUNK = "4096"
 PLOW_MAX_REQUEST_CHUNK = "4096"
 PLOW_SLIDING_NS_CAP = "1"
 PLOW_SLIDING_NS_GRID = "1"
-# Global (hd512, one KV head) decode reads each KV row once for all 16 heads (GF 16) instead of
-# twice at GF 8, split 132/B ways (128 items at B32/B64): step_bench B32 ctx 4096/15000
-# 13.09/16.16 -> 12.84/14.99 ms, B64 18.10/24.21 -> 17.50/21.80; B1/B16 7.47/10.69 -> 7.78/10.98.
-PLOW_ATTENTION_DECODE_BALANCE_GF = "16"
-PLOW_FA_GF_FULL = "16"
-PLOW_NS_FULL_ABS = "132"
+# Global (hd512, one KV head) decode at GF 16 (each KV row read once for all 16 heads) only in the
+# light attention of the routed B32/B64 rungs, split twice as many ways (132/B, 128 items); the
+# interpreter rungs B1-B16 keep GF 8 at 66/B, since a GF16 interpreter object (stack 208 -> 320 B,
+# arena 91200 -> 107648 B) costs every narrow rung ~0.3 ms. step_bench vs GF16 everywhere, ctx
+# 1024/4096/15000: B1 7.74/7.80/7.88 -> 7.43/7.48/7.60 ms, B16 10.60/10.97/12.07 -> 10.22/10.69/12.25,
+# B32 12.22/12.84/14.99 -> 12.15/12.77/14.92 and B64 16.28/17.51/21.81 -> 16.26/17.49/21.79
+# (bit-identical); vs GF 8 everywhere B32 15000 16.17 -> 14.92, B64 24.21 -> 21.79 (2026-10-06).
+PLOW_ATTENTION_DECODE_BALANCE_GF = "8"
+PLOW_FA_GF_LIGHT512 = "16"
+PLOW_NS_FULL_ABS = "66"
 PLOW_FA_MMAQK = "3"
 PLOW_DECODE_BATCH_LADDER = "1,2,4,8,16,32,64"
 PLOW_FP8_DECODE_TC64 = "1"

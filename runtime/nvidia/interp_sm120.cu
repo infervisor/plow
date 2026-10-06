@@ -535,6 +535,15 @@ __device__ __forceinline__ PlowStreamEnt ld_stream_ent(const PlowStreamEnt* p) {
     !(PLOW_NV_FA_GF_FULL == 3 && !PLOW_NV_GEMMA)
 #error "PLOW_NV_FA_GF_FULL requires {1,2,4,8}, or16 with wide softmax reductions"
 #endif
+/* The light (ordinary-launch) hd512 FlashDecode's head group, the attention of the library-routed
+ * decode rungs. A wider group there leaves the interpreter's own GF, arena and registers alone. */
+#ifndef PLOW_NV_FA_GF_LIGHT512
+#define PLOW_NV_FA_GF_LIGHT512 PLOW_NV_FA_GF_FULL
+#endif
+#if PLOW_NV_FA_GF_LIGHT512 != PLOW_NV_FA_GF_FULL && PLOW_NV_FA_GF_LIGHT512 != 8 && \
+    !(PLOW_NV_FA_GF_LIGHT512 == 16 && PLOW_NV_FA_GF16_BENCH)
+#error "PLOW_NV_FA_GF_LIGHT512 requires 8, or 16 with wide softmax reductions"
+#endif
 #ifndef PLOW_NV_FA_GF_HD256
 #define PLOW_NV_FA_GF_HD256 2
 #endif
@@ -4171,7 +4180,7 @@ __device__ __forceinline__ void light_attn_gemma(const PlowLightSpan& a, float* 
         const unsigned nblk = fl->blocks ? fl->blocks : gridDim.x, slice = blockIdx.x;
         const unsigned warp = threadIdx.x >> PLOW_NV_WARP_SHIFT;
         const unsigned n_head = fl->i[1], nsplit = fl->i[5];
-        const unsigned GF = fl->i[6] == 256 ? PLOW_NV_FA_GF_LIGHT256 : PLOW_NV_FA_GF_FULL;
+        const unsigned GF = fl->i[6] == 256 ? PLOW_NV_FA_GF_LIGHT256 : PLOW_NV_FA_GF_LIGHT512;
         const unsigned gqa = n_head / fl->i[2], n_grp = n_head / GF;
         const unsigned n_work = fl->i[0] * n_grp * nsplit;
         for (unsigned w = slice; slice < nblk && w < n_work; w += nblk) {
@@ -4278,8 +4287,8 @@ __device__ __forceinline__ void light_attn_gemma(const PlowLightSpan& a, float* 
             __trap();
         } else if (in->op == PLOW_DOP_HEADNORM_ROPE && in->i[2] == 512 && in->i[5] == 0) {
             LIGHT_HNR(512);
-        } else if (in->op == PLOW_DOP_FLASH_DECODE && in->i[6] == 512 && gqa % PLOW_NV_FA_GF_FULL == 0) {
-            LIGHT_FLASH(512, PLOW_NV_FA_GF_FULL);
+        } else if (in->op == PLOW_DOP_FLASH_DECODE && in->i[6] == 512 && gqa % PLOW_NV_FA_GF_LIGHT512 == 0) {
+            LIGHT_FLASH(512, PLOW_NV_FA_GF_LIGHT512);
 #if PLOW_NV_LIGHT_FP8_ATTN && PLOW_FP8_KV
         } else if (in->op == PLOW_DOP_HEADNORM_ROPE_FP8 && in->i[2] == 256 && in->i[5] == 0) {
             LIGHT_HNR_FP8(256);
@@ -4287,8 +4296,8 @@ __device__ __forceinline__ void light_attn_gemma(const PlowLightSpan& a, float* 
             LIGHT_FLASH_FP8(256, 2);
         } else if (in->op == PLOW_DOP_HEADNORM_ROPE_FP8 && in->i[2] == 512 && in->i[5] == 0) {
             LIGHT_HNR_FP8(512);
-        } else if (in->op == PLOW_DOP_FLASH_DECODE_FP8 && in->i[6] == 512 && gqa % PLOW_NV_FA_GF_FULL == 0) {
-            LIGHT_FLASH_FP8(512, PLOW_NV_FA_GF_FULL);
+        } else if (in->op == PLOW_DOP_FLASH_DECODE_FP8 && in->i[6] == 512 && gqa % PLOW_NV_FA_GF_LIGHT512 == 0) {
+            LIGHT_FLASH_FP8(512, PLOW_NV_FA_GF_LIGHT512);
 #endif
         } else {
             __trap();
@@ -4334,6 +4343,13 @@ extern "C" __device__ unsigned PLOW_SYM(plow_light_fp8_flash256_smem) =
 #endif
 extern "C" __device__ unsigned PLOW_SYM(plow_light_attn_hd) = 256;
 extern "C" __device__ unsigned PLOW_SYM(plow_light_attn_hd2) = 512;
+#if PLOW_NV_FA_GF_LIGHT512 != PLOW_NV_FA_GF_FULL
+/* light_attn's dynamic smem when its hd512 group outgrows the interpreter arena it otherwise takes. */
+extern "C" __device__ unsigned PLOW_SYM(plow_light_attn_smem) =
+    (FA_DEC_SMEM_FLOATS(512, PLOW_NV_FA_GF_LIGHT512) > PLOW_NV_ARENA_FLOATS
+         ? FA_DEC_SMEM_FLOATS(512, PLOW_NV_FA_GF_LIGHT512)
+         : PLOW_NV_ARENA_FLOATS) * sizeof(float);
+#endif
 #endif
 #if PLOW_NV_GEMMA && !PLOW_NV_LEAN_DECODE && !PLOW_MIXED_STEP
 /* Unified token batch on sm_90a: the decode rows riding a packed prefill launch (rows

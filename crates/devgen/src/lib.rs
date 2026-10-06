@@ -4981,6 +4981,23 @@ fn emit_phase(
             .filter(|_| gemv_family && full)
             .map(|abs| (abs / t).max(1))
             .unwrap_or(ns);
+        // Library-routed rungs run their hd512 attention as light launches at PLOW_FA_GF_LIGHT512
+        // (manifest `gf_light512`): split as many more ways as the group is wider, so the layer
+        // keeps its work-item count. The interpreter rungs keep `gf` and this split.
+        let ns = match emit_config::active().fa_gf_light512 {
+            Some(light)
+                if gemv_family
+                    && full
+                    && hd == 512
+                    && !nv_fold
+                    && light > gf
+                    && gqa % light == 0
+                    && emit_config::active().decode_cublaslt_at(t) =>
+            {
+                ns * (light / gf)
+            }
+            _ => ns,
+        };
 
         // The norm is ONE packet whose result all of q/k/v share.
         //
