@@ -4567,8 +4567,10 @@ fn emit_phase(
     let qnorm_fuse = w8a8
         && !gemv_family
         && (emit_config::active().qnorm_fuse || (amd && emit_config::active().fuse_quant));
-    let glu_quant_fuse =
-        qnorm_fuse || (w8a8 && !gemv_family && emit_config::active().glu_quant_fuse);
+    // Library-routed (cuBLASLt/CUTLASS) decode rungs take the GLU fold too: their down quant
+    // otherwise waits on a separate Glu packet in the same segment.
+    let glu_quant_fuse = qnorm_fuse
+        || (w8a8 && (!gemv_family || fp8_lt_decode) && emit_config::active().glu_quant_fuse);
 
     // Qwen/Llama PRE-NORM decode fuses each (residual add, RMSNorm) pair into ONE AddNorm packet
     // (see the AddNorm emits in the loop). Deletes 72 packets/token and, more importantly, 72
