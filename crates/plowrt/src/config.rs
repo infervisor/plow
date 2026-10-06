@@ -743,6 +743,11 @@ pub struct CpuRuntimeConfig {
     /// of copying them (only gathered rows become resident).
     #[arg(long = "cpu-mmap-gather", env = "PLOW_CPU_MMAP_GATHER", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub mmap_gather: bool,
+
+    /// While a static worker waits on its next entry's gates, prefetch that slice's decode GEMV
+    /// weight rows into L2.
+    #[arg(long = "cpu-gate-pf", env = "PLOW_CPU_GATE_PF", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub gate_pf: bool,
 }
 
 /// NVIDIA / sm_120 runtime knobs.

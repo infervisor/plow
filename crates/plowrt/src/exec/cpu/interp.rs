@@ -177,6 +177,13 @@ pub struct WorkerCtx {
 /// tests. Must not block on other packets.
 pub trait Exec: Send + Sync {
     fn exec(&self, inst: &DevInst64, slice: u32, nblk: u32, worker: &WorkerCtx);
+
+    /// Warm up to `lines` more cache lines of what slice `slice` of `inst` will stream, from byte
+    /// `cursor` of that stream; called while the worker waits on the entry's gates. Returns false
+    /// once nothing is left to warm.
+    fn prefetch(&self, _inst: &DevInst64, _slice: u32, _nblk: u32, _cursor: &mut usize, _lines: usize) -> bool {
+        false
+    }
 }
 
 /// Spin → yield → park, shared by every wait in the pool. Parking is per node
@@ -382,6 +389,13 @@ impl StaticState {
 
 /// Static walk over this worker's owned streams. Returns when every owned
 /// stream is drained for `seg`, or on cancel. The caller bumps `done`.
+/// Lines warmed per wait poll (~64 spins apart): 4 KiB per poll is about one core's DRAM share.
+const GATE_PF_LINES: usize = 64;
+
+fn gate_prefetch() -> bool {
+    crate::config::RuntimeConfig::get().cpu.gate_pf
+}
+
 pub fn run_static(
     st: &mut StaticState,
     sh: &RunShared<'_>,
@@ -420,12 +434,24 @@ pub fn run_static(
             return;
         }
         if !progressed {
-            // Every owned head is blocked: wait for any successor bump.
+            // Every owned head is blocked: wait for any successor bump, warming the first blocked
+            // entry's weights meanwhile (the static stream says what this worker reads next).
             let heads = &st.heads;
+            let next = heads
+                .iter()
+                .find(|&&(h, e)| h < e)
+                .map(|&(h, _)| &prog.stream[h as usize])
+                .filter(|ent| !filter_seg || ent.seg as u32 == sh.seg);
+            let (mut cursor, mut warm) = (0usize, next.is_some() && gate_prefetch());
             let ok = wait_until(
                 parker,
                 sh.spin_us,
                 || {
+                    if warm {
+                        let ent = next.unwrap();
+                        let inst = &prog.insts[ent.inst as usize];
+                        warm = exec.prefetch(inst, ent.slice, inst.blocks as u32, &mut cursor, GATE_PF_LINES);
+                    }
                     heads.iter().any(|&(h, e)| {
                         h < e && {
                             let ent = &prog.stream[h as usize];

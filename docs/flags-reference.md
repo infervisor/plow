@@ -963,6 +963,7 @@ bundle in the first place, in [CPU execution](runtime/cpu.md).
 | `--cpu-sram=B` | `PLOW_CPU_SRAM` | off | Pseudo-lock worker scratch into L2 and hot layer weights into L3 through `/dev/pseudo_lock` (`runtime/cpu/driver`). Measured slower on Xeon 6975P-C Gemma-4 serving (12B prefill 606 → 817–982 ms); kept for A/B. |
 | `--cpu-weight-affine=B` | `PLOW_CPU_WEIGHT_AFFINE` | off | Bind each weight's per-executor slice to the node of the worker that reads it. −2 to −5% on Xeon 6975P-C (SNC3); set in the Gemma-4 Xeon recipes. |
 | `--cpu-mmap-gather=B` | `PLOW_CPU_MMAP_GATHER` | on | Serve weights read only as embedding-gather tables straight from the mmapped checkpoint (only gathered rows become resident). Gemma-4 E2B: −4.4 GiB resident. |
+| `--cpu-gate-pf=B` | `PLOW_CPU_GATE_PF` | on | While a static worker waits on its next entry's gates, prefetch (T1) up to 1 MiB of that slice's decode GEMV / GLU / QKV weight rows. Xeon 6975P-C batch-1 decode step: E2B −7%, E4B −3%, 12B −4%, 26B-A4B −4%, 31B −2%. |
 
 `PLOW_AMX_DEBUG` (comma list, diagnostic only) toggles AMX kernel study switches in
 `runtime/cpu/dev/amx` (`nopack`, `noxpack`, `wstage`, `nogrid`, `l1pf`, `nopf`, `demote`,

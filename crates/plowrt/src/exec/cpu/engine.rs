@@ -387,6 +387,10 @@ impl HostTensor {
                 "explicit NUMA placement requires Linux".into(),
             ));
         }
+        // Linux: a fresh anonymous mapping already reads as zero, and mbind places each page at
+        // its first touch, so an explicit fill would only make the whole KV pool (every slot x
+        // every ring row) resident at load instead of as sequences write it.
+        #[cfg(not(target_os = "linux"))]
         if huge && zeroed {
             unsafe { std::ptr::write_bytes(ptr, 0, size) };
         }
@@ -1475,6 +1479,57 @@ impl Exec for KernelExec {
         // SAFETY: handles were validated at load (< n_tensors or NONE); the
         // kernel contract is the interpreter's (slice of nblk, disjoint work).
         unsafe { f(inst, slice, nblk, self.tensors.as_ptr(), ctx) };
+    }
+
+    fn prefetch(&self, d: &DevInst64, slice: u32, nblk: u32, cursor: &mut usize, lines: usize) -> bool {
+        const CAP: usize = 1 << 20;
+        // GLU kernels walk gate and up together in 32-row chunks.
+        const GLU_ROWS: usize = 32;
+        let per = |n: u32| n.div_ceil(nblk.max(1));
+        let range = |n: u32| ((slice * per(n)).min(n) as usize, (slice * per(n) + per(n)).min(n) as usize);
+        let base = |t: u16| self.tensors.get(t as usize) as usize;
+        let row = d.i[2] as usize * 2;
+        // (byte length of this slice's weight stream, address of stream byte `pos`)
+        let (total, addr): (usize, &dyn Fn(usize) -> usize) = match DevOp::from_u16(d.op) {
+            Some(DevOp::Gemv) if d.i[3] == 0 && d.t[2] != TENSOR_NONE16 => {
+                let (a, b) = range(d.i[1]);
+                let w = base(d.t[2]) + a * row;
+                ((b - a) * row, &move |p| w + p)
+            }
+            Some(DevOp::GemvGlu) if d.t[2] != TENSOR_NONE16 && d.t[5] != TENSOR_NONE16 => {
+                let (a, b) = range(d.i[1]);
+                let (g, u, ch) = (base(d.t[2]) + a * row, base(d.t[5]) + a * row, GLU_ROWS * row);
+                (2 * (b - a) * row, &move |p| {
+                    let (c, r) = (p / (2 * ch), p % (2 * ch));
+                    (if r < ch { g } else { u }) + c * ch + r % ch
+                })
+            }
+            Some(DevOp::GemvQkv) => {
+                let (nq, nk, nv) = (d.i[1] as usize, d.i[3] as usize, d.i[4] as usize);
+                let (a, b) = range((nq + nk + nv) as u32);
+                let spans = [(d.t[2], 0, nq), (d.t[4], nq, nk), (d.t[6], nq + nk, nv)];
+                if spans.iter().any(|&(t, s, n)| t == TENSOR_NONE16 && a.max(s) < b.min(s + n)) {
+                    return false;
+                }
+                ((b - a) * row, &move |p| {
+                    let r = a + p / row;
+                    let &(t, s, _) = spans.iter().rfind(|&&(_, s, _)| s <= r).unwrap();
+                    base(t) + (r - s) * row + p % row
+                })
+            }
+            _ => return false,
+        };
+        let end = total.min(CAP);
+        let stop = (*cursor + lines * 64).min(end);
+        while *cursor < stop {
+            #[cfg(target_arch = "x86_64")]
+            // SAFETY: prefetch never faults; the address lies inside a live weight tensor anyway.
+            unsafe {
+                std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T1 }>(addr(*cursor) as *const i8)
+            };
+            *cursor += 64;
+        }
+        *cursor < end
     }
 }
 
