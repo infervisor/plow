@@ -843,7 +843,7 @@ fn q8(
     let bias = b.tensor(w.bias, u64::from(n) * 4);
     b.emit(
         DevOp::Q8GemmF32,
-        repeated(n_cu(b), m.div_ceil(128) * n.div_ceil(64)),
+        repeated(n_cu(b), m.div_ceil(64) * n.div_ceil(64)),
         &dep.into_iter().collect::<Vec<_>>(),
         |d| {
             d.t[..4].copy_from_slice(&[out, input, weight, bias]);

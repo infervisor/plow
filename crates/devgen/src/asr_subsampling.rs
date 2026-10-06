@@ -95,7 +95,7 @@ pub fn lower(
         DevOp::Q8GemmF32,
         repeated(
             n_cu,
-            frames.div_ceil(128) * projection.output_width.div_ceil(64),
+            frames.div_ceil(64) * projection.output_width.div_ceil(64),
         ),
         &[],
         |instruction| {

@@ -274,16 +274,18 @@ __device__ __forceinline__ void sp_conv_table(SpConvTab* tab, const SpConvGeom& 
     __syncthreads();
 }
 
-/* One 128x128 output tile at (m0, n0). */
-template <class LA, class LB, class EP>
+/* One (16 TM)x(16 TN) output tile at (m0, n0): 128x128 by default. Every output sums its K terms in
+ * the same fmaf order whatever the tile, so the tile shape never changes a result. */
+template <class LA, class LB, class EP, int TM = SPG_TM, int TN = SPG_TN>
 static __device__ __forceinline__ void sp_gemm_tile(unsigned m0, unsigned n0, unsigned M, unsigned N,
                                                     unsigned K, const LA& la, const LB& lb,
                                                     const EP& ep, float* arena) {
+    constexpr unsigned BM = 16 * TM, BN = 16 * TN, LDA = BM + 4, LDB = BN + 4;
     constexpr unsigned KT = SPG_BK / 4, RPP = PLOW_NV_THREADS / KT;
-    constexpr unsigned AP = SPG_BM / RPP, BP = SPG_BN / RPP;
-    static_assert(AP * RPP == SPG_BM && BP * RPP == SPG_BN, "loader coverage");
+    constexpr unsigned AP = BM / RPP, BP = BN / RPP;
+    static_assert(AP * RPP == BM && BP * RPP == BN, "loader coverage");
     float* As = arena;
-    float* Bs = arena + 2 * SPG_BK * SPG_LDA;
+    float* Bs = arena + 2 * SPG_BK * LDA;
     const unsigned tid = threadIdx.x, tx = tid & 15u, ty = tid >> 4;
     const unsigned lr = tid / KT, lk = (tid % KT) * 4u;
     const unsigned nk = (K + SPG_BK - 1) / SPG_BK;
@@ -294,23 +296,23 @@ static __device__ __forceinline__ void sp_gemm_tile(unsigned m0, unsigned n0, un
     for (unsigned p = 0; p < AP; p++) { ra[p] = la.row(m0 + lr + p * RPP, M); va[p] = la.load4(ra[p], lk); }
 #pragma unroll
     for (unsigned p = 0; p < BP; p++) { rb[p] = lb.row(n0 + lr + p * RPP, N); vb[p] = lb.load4(rb[p], lk); }
-    float acc[SPG_TM][SPG_TN];
+    float acc[TM][TN];
 #pragma unroll
-    for (int i = 0; i < SPG_TM; i++)
+    for (int i = 0; i < TM; i++)
 #pragma unroll
-        for (int j = 0; j < SPG_TN; j++) acc[i][j] = 0.f;
+        for (int j = 0; j < TN; j++) acc[i][j] = 0.f;
     for (unsigned kt = 0; kt < nk; kt++) {
-        float* as = As + (kt & 1u) * SPG_BK * SPG_LDA;
-        float* bs = Bs + (kt & 1u) * SPG_BK * SPG_LDB;
+        float* as = As + (kt & 1u) * SPG_BK * LDA;
+        float* bs = Bs + (kt & 1u) * SPG_BK * LDB;
 #pragma unroll
         for (unsigned p = 0; p < AP; p++) {
-            float* d = as + lk * SPG_LDA + lr + p * RPP;
-            d[0] = va[p].x; d[SPG_LDA] = va[p].y; d[2 * SPG_LDA] = va[p].z; d[3 * SPG_LDA] = va[p].w;
+            float* d = as + lk * LDA + lr + p * RPP;
+            d[0] = va[p].x; d[LDA] = va[p].y; d[2 * LDA] = va[p].z; d[3 * LDA] = va[p].w;
         }
 #pragma unroll
         for (unsigned p = 0; p < BP; p++) {
-            float* d = bs + lk * SPG_LDB + lr + p * RPP;
-            d[0] = vb[p].x; d[SPG_LDB] = vb[p].y; d[2 * SPG_LDB] = vb[p].z; d[3 * SPG_LDB] = vb[p].w;
+            float* d = bs + lk * LDB + lr + p * RPP;
+            d[0] = vb[p].x; d[LDB] = vb[p].y; d[2 * LDB] = vb[p].z; d[3 * LDB] = vb[p].w;
         }
         __syncthreads();
         if (kt + 1 < nk) {
@@ -319,43 +321,44 @@ static __device__ __forceinline__ void sp_gemm_tile(unsigned m0, unsigned n0, un
 #pragma unroll
             for (unsigned p = 0; p < BP; p++) vb[p] = lb.load4(rb[p], (kt + 1) * SPG_BK + lk);
         }
-        const float* a = as + ty * SPG_TM;
-        const float* b = bs + tx * SPG_TN;
+        const float* a = as + ty * TM;
+        const float* b = bs + tx * TN;
 #pragma unroll
         for (int k = 0; k < SPG_BK; k++) {
-            float av[SPG_TM], bv[SPG_TN];
+            float av[TM], bv[TN];
 #pragma unroll
-            for (int i = 0; i < SPG_TM; i += 4) *(float4*)(av + i) = *(const float4*)(a + k * SPG_LDA + i);
+            for (int i = 0; i < TM; i += 4) *(float4*)(av + i) = *(const float4*)(a + k * LDA + i);
 #pragma unroll
-            for (int j = 0; j < SPG_TN; j += 4) *(float4*)(bv + j) = *(const float4*)(b + k * SPG_LDB + j);
+            for (int j = 0; j < TN; j += 4) *(float4*)(bv + j) = *(const float4*)(b + k * LDB + j);
 #pragma unroll
-            for (int i = 0; i < SPG_TM; i++)
+            for (int i = 0; i < TM; i++)
 #pragma unroll
-                for (int j = 0; j < SPG_TN; j++) acc[i][j] = fmaf(av[i], bv[j], acc[i][j]);
+                for (int j = 0; j < TN; j++) acc[i][j] = fmaf(av[i], bv[j], acc[i][j]);
         }
     }
     /* The next tile's first store targets buffer 0, which the last odd k-tile may still read. */
     __syncthreads();
 #pragma unroll
-    for (int i = 0; i < SPG_TM; i++) {
-        const unsigned m = m0 + ty * SPG_TM + i;
+    for (int i = 0; i < TM; i++) {
+        const unsigned m = m0 + ty * TM + i;
         if (m >= M) break;
 #pragma unroll
-        for (int j = 0; j < SPG_TN; j++) {
-            const unsigned n = n0 + tx * SPG_TN + j;
+        for (int j = 0; j < TN; j++) {
+            const unsigned n = n0 + tx * TN + j;
             if (n < N) ep(m, n, acc[i][j]);
         }
     }
 }
 
-template <class LA, class LB, class EP>
+template <int TM = SPG_TM, int TN = SPG_TN, class LA, class LB, class EP>
 static __device__ __forceinline__ void sp_gemm(unsigned M, unsigned N, unsigned K, const LA& la,
                                                const LB& lb, const EP& ep, unsigned slice,
                                                unsigned nblk, float* arena) {
-    const unsigned tn = (N + SPG_BN - 1) / SPG_BN;
-    const unsigned ntiles = ((M + SPG_BM - 1) / SPG_BM) * tn;
+    constexpr unsigned BM = 16 * TM, BN = 16 * TN;
+    const unsigned tn = (N + BN - 1) / BN;
+    const unsigned ntiles = ((M + BM - 1) / BM) * tn;
     for (unsigned tile = slice; tile < ntiles; tile += nblk)
-        sp_gemm_tile((tile / tn) * SPG_BM, (tile % tn) * SPG_BN, M, N, K, la, lb, ep, arena);
+        sp_gemm_tile<LA, LB, EP, TM, TN>((tile / tn) * BM, (tile % tn) * BN, M, N, K, la, lb, ep, arena);
 }
 
 __device__ __forceinline__ bool sp_aligned(const void* p, unsigned bytes) {
@@ -1366,8 +1369,14 @@ static __device__ __noinline__ void d_q8_gemm_f32(float* __restrict__ out, const
     arena = sp_smem;
     if (k & 31u) { __trap(); return; }
     x += (size_t)a_row0 * k;
-    sp_gemm(m, n, k, SpRowF32{x, k, sp_aligned(x, 16)}, SpRowQ8{w, k},
-            SpQ8Epi{out, bias, n, activation == 1u}, slice, nblk, arena);
+    const SpRowF32 la{x, k, sp_aligned(x, 16)};
+    const SpRowQ8 lb{w, k};
+    const SpQ8Epi ep{out, bias, n, activation == 1u};
+    /* 64x64 tiles when 128x128 ones leave slices idle (the small-M conformer rows). */
+    if (((m + SPG_BM - 1) / SPG_BM) * ((n + SPG_BN - 1) / SPG_BN) < nblk)
+        sp_gemm<4, 4>(m, n, k, la, lb, ep, slice, nblk, arena);
+    else
+        sp_gemm(m, n, k, la, lb, ep, slice, nblk, arena);
 }
 
 /* Conv2dF32 (176). flags (fj1): 1 depthwise, 2 relu, [3:2] out layout, [5:4] in layout,

@@ -7,6 +7,7 @@
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ != 890
 #error "interp_sm89.cu must be compiled for sm_89"
 #endif
+#define PLOW_NV_ADA 1
 
 /* Architecture-specific public ABI. These aliases are expanded by the
  * two-level PLOW_SYM paste in interp_sm120.cu. */

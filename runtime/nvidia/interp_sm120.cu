@@ -229,8 +229,8 @@ extern "C" __device__ unsigned plow_pdl_wait_1 = 1;
 #endif
 #if PLOW_NV_PACKED_REQUEST
 #define PLOW_PF_REQ_ARG , (const int*)TEN(7)
-#if !defined(PLOW_NV_HOPPER) || !PLOW_NV_HOPPER || !PLOW_NV_PREFILL
-#error "packed request ABI requires Hopper prefill"
+#if !((defined(PLOW_NV_HOPPER) && PLOW_NV_HOPPER) || (defined(PLOW_NV_ADA) && PLOW_NV_ADA)) || !PLOW_NV_PREFILL
+#error "packed request ABI requires Hopper or Ada prefill"
 #endif
 extern "C" __device__ __constant__ unsigned plow_pf_request_abi = 2;
 #if defined(PLOW_NV_MASKED_PADDING) && PLOW_NV_MASKED_PADDING

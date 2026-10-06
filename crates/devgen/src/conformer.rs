@@ -530,7 +530,7 @@ fn emit_q8(
     dep: Option<u32>,
 ) -> u32 {
     let weight = b.tensor(weight_name, u64::from(n) * u64::from(k / 32) * 34);
-    let tiles = m.div_ceil(128) * n.div_ceil(64);
+    let tiles = m.div_ceil(64) * n.div_ceil(64);
     b.emit(
         DevOp::Q8GemmF32,
         repeated_cus(b.n_cu(), tiles),

@@ -30,9 +30,7 @@ gpu = "l4"
 arch = "sm_89"
 n_cu = 58
 n_gpu = 1
-# 1024 (KV 3.5 GiB at 32 slots): 30 s of audio is ~390 rows + ~60 prompt, and every ASR model
-# (Qwen 1.7B + 0.6B + Nemotron) then shares one 24 GB L4.
-max_ctx = 1024
+max_ctx = 2048
 
 [emit]
 emit = "devblob+cubin"
@@ -41,9 +39,15 @@ args = ["--served-name", "qwen3-asr-0.6b"]
 PLOW_VERIFY_BIN = "{repo}/lean-plow/.lake/build/bin/plow_verify"
 PLOW_MAX_CHUNK = "512"
 PLOW_PF_LADDER_APPEND = "256,384"
-PLOW_DECODE_BATCH_LADDER = "1,2,4,8,16,32"
+# 16 slots x 2048 ctx = 3.5 GiB of KV, so every ASR model (Qwen 1.7B + 0.6B + Nemotron) shares
+# one 24 GB L4; the CLI still needs prompt + the whole 1024-token budget in context.
+PLOW_DECODE_BATCH_LADDER = "1,2,4,8,16"
 PLOW_EMIT_PREFILL_CUBLASLT = "1"
 PLOW_NO_GLU_FUSE = "1"
+# Packed prefill (several requests' prompts per launch; weights read once): 1.7B c16 RTFx
+# 74.1 -> 85.2, WER unchanged. The packed-request objects build for Ada (PLOW_NV_ADA).
+PLOW_EMIT_PACKED_PREFILL = "1"
+PLOW_EMIT_PACKED_PREFILL_SMALL_HD = "1"
 # Packed encoder buckets up to 64 chunks (64 s of audio): the 192-chunk default's shared FP32
 # activations take ~5.7 GB, which does not leave room for a second model on a 24 GB L4.
 PLOW_ASR_PACKED_MAX_CHUNKS = "64"
