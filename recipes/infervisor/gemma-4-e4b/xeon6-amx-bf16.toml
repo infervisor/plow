@@ -50,6 +50,9 @@ args = []
 [emit.env]
 PLOW_DECODE_BATCH_LADDER = "1,2,4,8,16,32"
 PLOW_MAX_CHUNK = "2048"
+# E4B (GQA 4, hd 256/512) otherwise gets the NVIDIA decode merge-fold: no FLASH_MERGE, which the
+# CPU flash-decode kernels need (FP32-reference gate kl_mean 2.26 vs vLLM 0.0014 with the fold).
+PLOW_NV_FA_FOLD_WIDE = "0"
 
 [serve.env]
 PLOW_CPU_WEIGHT_AFFINE = "1"

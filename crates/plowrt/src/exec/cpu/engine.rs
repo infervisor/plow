@@ -596,6 +596,15 @@ fn validate_cpu_blob(blob: &DevBlob, language_model: bool) -> Result<()> {
         if p.t == 0 {
             return Err(RuntimeError::Device(format!("program {pi} has T=0")));
         }
+        // CPU FLASH_DECODE writes only the split partials; the NVIDIA decode merge-fold drops
+        // FLASH_MERGE and reuses j[1] (the CPU's kv mask), so such a packet decodes garbage.
+        let has = |op: DevOp| p.insts.iter().any(|d| d.op == op as u16);
+        if has(DevOp::FlashDecode) && !has(DevOp::FlashMerge) {
+            return Err(RuntimeError::Device(format!(
+                "program {pi} decodes without FLASH_MERGE (NVIDIA decode merge-fold); \
+                 emit CPU bundles with PLOW_NV_FA_FOLD_WIDE=0"
+            )));
+        }
         for (ii, inst) in p.insts.iter().enumerate() {
             if inst.op as usize >= ffi::DOP_TABLE {
                 return Err(RuntimeError::Device(format!(
