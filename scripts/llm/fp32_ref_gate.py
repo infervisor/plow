@@ -333,7 +333,8 @@ def load_fp32(hf, device="cuda"):
         with safe_open(str(path), "pt", device=device) as f:
             keys = set(f.keys())
             for k in sorted(keys):
-                if not k.startswith("model.language_model.") or k.endswith("_scale"):
+                # `<w>_scale` beside `<w>` is an FP8 companion; `router.per_expert_scale` is a parameter.
+                if not k.startswith("model.language_model.") or (k.endswith("_scale") and k[: -len("_scale")] in keys):
                     continue
                 name = "model." + k.removeprefix("model.language_model.")
                 if name not in params:  # e.g. k/v of KV-shared layers: the model never reads them

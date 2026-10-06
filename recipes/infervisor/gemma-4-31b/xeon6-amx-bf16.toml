@@ -9,7 +9,12 @@
 # CPU bundles are NVIDIA devblobs interpreted by the CPU engine (docs/runtime/cpu.md): `gpu` / `arch`
 # label the packet, `n_cu` = 96 virtual executors (one per physical core). Host state for every
 # measurement (all arms): kernel.numa_balancing=0, a zero-latency CPU QoS request held
-# (/dev/cpu_dma_latency, as tuned latency-performance does), THP madvise, pseudo_lock_sram not loaded.
+# (/dev/cpu_dma_latency, as tuned latency-performance does), THP madvise.
+#
+# L2 pseudo-lock (PLOW_CPU_SRAM): needs runtime/cpu/driver/pseudo_lock_sram.ko loaded with
+# `l2_ways=12 l3_ways=0` (1.31 MiB locked per core, no L3 partition). Each worker's AMX scratch head
+# (packed W panels) is held in its core's L2: 1000-token prefill 1544 -> 1401 ms (-9%), decode step
+# unchanged, greedy output identical. 12B / E2B measured slower with the same lock, so only 31B sets it.
 #
 # Status: candidate until campaign.py report qualifies it.
 schema = "plow.recipe.v1"
@@ -53,6 +58,7 @@ PLOW_MAX_CHUNK = "2048"
 
 [serve.env]
 PLOW_CPU_WEIGHT_AFFINE = "1"
+PLOW_CPU_SRAM = "1"
 
 [bench]
 backend = "openai"

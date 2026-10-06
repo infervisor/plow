@@ -9,7 +9,7 @@
 # CPU bundles are NVIDIA devblobs interpreted by the CPU engine (docs/runtime/cpu.md): `gpu` / `arch`
 # label the packet, `n_cu` = 96 virtual executors (one per physical core). Host state for every
 # measurement (all arms): kernel.numa_balancing=0, a zero-latency CPU QoS request held
-# (/dev/cpu_dma_latency, as tuned latency-performance does), THP madvise, pseudo_lock_sram not loaded.
+# (/dev/cpu_dma_latency, as tuned latency-performance does), THP madvise, no pseudo-lock held (PLOW_CPU_SRAM off).
 #
 # Status: candidate until campaign.py report qualifies it.
 schema = "plow.recipe.v1"
