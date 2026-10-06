@@ -66,8 +66,12 @@ PLOW_MAX_CHUNK = "4096"
 PLOW_MAX_REQUEST_CHUNK = "4096"
 PLOW_SLIDING_NS_CAP = "1"
 PLOW_SLIDING_NS_GRID = "1"
-PLOW_ATTENTION_DECODE_BALANCE_GF = "4"
-PLOW_NS_FULL_ABS = "66"
+# Global (hd512, one KV head) decode reads each KV row once for all 16 heads (GF 16) instead of
+# twice at GF 8, split 132/B ways (128 items at B32/B64): step_bench B32 ctx 4096/15000
+# 13.09/16.16 -> 12.84/14.99 ms, B64 18.10/24.21 -> 17.50/21.80; B1/B16 7.47/10.69 -> 7.78/10.98.
+PLOW_ATTENTION_DECODE_BALANCE_GF = "16"
+PLOW_FA_GF_FULL = "16"
+PLOW_NS_FULL_ABS = "132"
 PLOW_FA_MMAQK = "3"
 PLOW_DECODE_BATCH_LADDER = "1,2,4,8,16,32,64"
 PLOW_FP8_DECODE_TC64 = "1"
@@ -77,13 +81,17 @@ PLOW_FUSE_ARGMAX = "1"
 # Quant folded into the pre-QKV / pre-FFN RmsNorm (T11; also folds Glu into the down quant on
 # rungs without the GLU role). 4096 rung 128.7 -> 128.0 ms on top of FATLITE + generated hd256.
 PLOW_QNORM_FUSE = "1"
-# cuBLASLt projections + lm_head on the 64-row decode rung only (narrower rungs keep the native
-# TC64 GEMV, which wins there): step_bench B64 ctx 1024/4096/15000 22.7/24.4/30.7 -> 21.0/22.8/29.1 ms;
-# B16/B32 unchanged and bit-identical (2026-10-05).
+# Library-routed decode (CUTLASS W8A8 projections, cuBLASLt lm_head) on the 32- and 64-row rungs;
+# narrower rungs keep the native TC64 GEMV. With the light attention launches below, the fused
+# NormResidualNorm+quant light route and the GLU folded into the down quant: step_bench B32 ctx
+# 1024/4096/8192/15000 14.00/14.90/16.10/18.03 -> 12.38/13.07/14.43/16.16 ms (2026-10-06).
 PLOW_EMIT_DECODE_CUBLASLT = "1"
-PLOW_EMIT_DECODE_CUBLASLT_MIN_ROWS = "64"
+PLOW_EMIT_DECODE_CUBLASLT_MIN_ROWS = "32"
 PLOW_EMIT_DECODE_CUBLASLT_HEAD = "1"
-NVCC_APPEND_FLAGS = "-DPLOW_NV_GLU_QUANT_CACHE=1 -DPLOW_NV_GLU_QUANT_WPR=1"
+PLOW_GLU_QUANT_FUSE = "1"
+# Light (ordinary-launch) decode attention segments on the routed rungs, bit-identical: B64 ctx
+# 4096/15000 19.74/25.99 -> 18.31/24.42 ms.
+NVCC_APPEND_FLAGS = "-DPLOW_NV_GLU_QUANT_CACHE=1 -DPLOW_NV_GLU_QUANT_WPR=1 -DPLOW_NV_LIGHT_FP8_ATTN=1"
 
 [objects]
 script = "scripts/build_sm90a_gemma4_segments.sh"
@@ -135,7 +143,13 @@ PLOW_TOKEN_BATCH = "1"
 PLOW_LT_FP8_FAST_ACCUM_MAX_K = "8192"
 # B64 decode projections on the packet's CUTLASS objects (cubin:host sha256, CUDA 12.9 + g++-14):
 # step_bench B64 ctx 4096 22.84 -> 20.85 ms, ctx 15000 29.12 -> 27.13; 4K c128 out tok/s +1.7%.
-PLOW_CUTLASS_FP8_DECODE = "19fe64363466b253735f19ff120afdc63de6d9ae3efb3dc5115447917fb2d850:065e9acadc6cd2220a61978d729ab05c2aadf6107d514208175bc7625348ff07"
+# The cubin's internal symbol hash follows the source's absolute path: a checkout elsewhere
+# builds different bytes and must re-pin these two hashes.
+PLOW_CUTLASS_FP8_DECODE = "7a6f5d98a31b79b184abfb97f22a907e51cf52a00083aea2b954df9c9dc75c8f:725994e93efa87bfbaa744ac41cf52dfaa4b1fb84bba4d680d0bd78693730a25"
+# Vendor-GEMM (cuBLASLt QK^T / softmax / PV) global prefill attention for every request of >= 128
+# rows instead of >= 1024: long-prefix chunks leave the px4 role (512 rows over 15.5K prefix
+# 37.5 -> 19.9 ms per chunk; 8x512 pack at prefix 12K 238 -> 142 ms); prefix-0 packs equal.
+PLOW_PF_ATTN_GEMM_MIN_ROWS = "128"
 
 [bench]
 backend = "openai"
