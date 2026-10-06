@@ -462,6 +462,15 @@ def env_with(base: dict, extra: dict) -> dict:
     return e
 
 
+def merge_object_env(recipe: dict, caller: dict) -> dict:
+    """The recipe's [objects.env] under the caller's --object-env: a *_FLAGS value (NVCC_APPEND_FLAGS)
+    appends to the recipe's, so its defines survive a toolchain flag; any other key is replaced."""
+    e = {k: str(v) for k, v in recipe.items()}
+    for k, v in caller.items():
+        e[k] = f"{e[k]} {v}" if k.endswith("_FLAGS") and e.get(k) else v
+    return e
+
+
 # ---------------------------------------------------------------- build
 def runtime_knobs() -> set[str]:
     """The env names plowrt's knob registry accepts as runtime knobs (`knob_spec::is_runtime_env`)."""
@@ -554,6 +563,7 @@ def cmd_build(a: argparse.Namespace) -> None:
 
     roles = r.get("emit_roles")
     objects = r.get("objects")
+    object_env = merge_object_env((objects or {}).get("env", {}), object_overrides)
     if roles:
         # Role objects are looked up in the emit --out dir, so: base emit -> objects -> role emit.
         base_dir = out / "base"
@@ -564,8 +574,7 @@ def cmd_build(a: argparse.Namespace) -> None:
         obj_dir = out / "objects"
         if objects:
             print("== objects", file=sys.stderr)
-            oenv = env_with(os.environ, objects.get("env", {}))
-            oenv.update(object_overrides)
+            oenv = env_with(os.environ, object_env)
             oenv["PLOW_CUBIN_CONFIG"] = str(base_dir / "plow_config.h")
             if run(["bash", "-x", str(REPO / objects["script"]), str(base_dir), str(obj_dir)], oenv, log):
                 die("object build failed; see build.log")
@@ -584,8 +593,7 @@ def cmd_build(a: argparse.Namespace) -> None:
         if objects and final_cfg.read_bytes() != (base_dir / "plow_config.h").read_bytes():
             print("== objects (final packet config differs from base: rebuilding)", file=sys.stderr)
             obj_dir.rename(out / "objects-base")
-            oenv = env_with(os.environ, objects.get("env", {}))
-            oenv.update(object_overrides)
+            oenv = env_with(os.environ, object_env)
             oenv["PLOW_CUBIN_CONFIG"] = str(final_cfg)
             if run(["bash", "-x", str(REPO / objects["script"]), str(assets), str(obj_dir)], oenv, log):
                 die("final object build failed; see build.log")
@@ -603,8 +611,7 @@ def cmd_build(a: argparse.Namespace) -> None:
             die("emit failed; see build.log")
         if objects and cell["arch"].startswith("gfx"):
             print("== AMD objects", file=sys.stderr)
-            oenv = env_with(os.environ, objects.get("env", {}))
-            oenv.update(object_overrides)
+            oenv = env_with(os.environ, object_env)
             oenv["PLOW_HSACO_CONFIG"] = str(assets / "plow_config.h")
             if run(nix(["bash", str(REPO / objects["script"]), str(out / "objects")]), oenv, log):
                 die("object build failed; see build.log")
@@ -640,7 +647,7 @@ def cmd_build(a: argparse.Namespace) -> None:
             "emit_env": {**emit.get("env", {}), **overrides},
             "serve_defaults": common.get("PLOW_EMIT_SERVE_DEFAULTS"),
             "role_env": {**(roles or {}).get("env", {}), **overrides},
-            "object_env": {**(objects or {}).get("env", {}), **object_overrides},
+            "object_env": object_env,
         },
         "cell": cell,
         "overrides": overrides,
@@ -1475,8 +1482,13 @@ def cmd_gate(a: argparse.Namespace) -> None:
     if pkt.is_file() and sha(pkt) != packet_sha:
         die(f"{pkt} sha256 {sha(pkt)} != {packet_sha} captured in {out}; score with the gate run's --assets")
     scores = {k: gate_score(k, cfg[k], out / k) for k in kinds}
+    # The packet hash does not cover the object build: carry the campaign build's object hashes and
+    # effective object env so a gate names the exact objects (and flags) it qualified.
+    build_rec = assets.parent / "build-record.json"
+    built = json.loads(build_rec.read_text()) if build_rec.is_file() else {}
     record = dict(recipe=str(Path(a.recipe).resolve()), recipe_sha256=sha(Path(a.recipe)), assets=str(assets),
-                  packet_sha256=packet_sha,
+                  packet_sha256=packet_sha, objects=built.get("objects"),
+                  object_env=built.get("compilation", {}).get("object_env"),
                   commit=git("rev-parse", "HEAD"), dirty=bool(git("status", "--porcelain")),
                   utc=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), gates=scores,
                   thresholds={k: {kk: v for kk, v in gates[k].items() if kk.endswith(("_min", "_max"))} for k in kinds},
@@ -1568,7 +1580,7 @@ def main() -> None:
     sb.set_defaults(f=cmd_serve_bench)
     b = sp.add_parser("build"); b.add_argument("recipe"); b.add_argument("--out", required=True)
     b.add_argument("--env", action="append", metavar="K=V", help="one-variable override for the emit env; recorded")
-    b.add_argument("--object-env", action="append", metavar="K=V", help="object-build-only override; recorded")
+    b.add_argument("--object-env", action="append", metavar="K=V", help="object-build-only env over [objects.env]: *_FLAGS append, other keys replace; recorded")
     b.add_argument("--no-probe", action="store_true", help="skip the leased cuBLASLt algorithm probe even with the GPU present")
     b.add_argument("--store-cell", help="tune-store cell for the probe (default h100)")
     b.add_argument("--hf-dir", help="checkpoint snapshot on this host, replacing [cell].hf_dir; recorded")

@@ -44,7 +44,8 @@ class CampaignBuildTests(unittest.TestCase):
             recipe.write_text('[cell]\nhf_dir="weights"\ngpu="H100"\narch="sm_90a"\nn_cu=132\n'
                               '[emit]\n[emit_roles.env]\nPLOW_GEMMA4_SM90_W8A8_GEMM_GLU_ROLE="1"\n'
                               '[objects]\nscript="build.sh"\nrole_files=["role.cubin"]\n'
-                              '[objects.env]\nPLOW_BUILD_W8A8="0"\n[bench]\n')
+                              '[objects.env]\nPLOW_BUILD_W8A8="0"\nNVCC_APPEND_FLAGS="-DPLOW_NV_GLU_QUANT_CACHE=1"\n'
+                              '[bench]\n')
             original_recipe = recipe.read_bytes()
             (root / "flake.lock").write_bytes(b"original lock")
             out = root / "build"
@@ -66,6 +67,7 @@ class CampaignBuildTests(unittest.TestCase):
                 else:
                     self.assertEqual(command[:2], ["bash", "-x"])
                     self.assertEqual(env["PLOW_BUILD_W8A8"], "1")
+                    self.assertEqual(env["NVCC_APPEND_FLAGS"], "-DPLOW_NV_GLU_QUANT_CACHE=1 -ccbin=/usr/bin/g++-14")
                     config = Path(env["PLOW_CUBIN_CONFIG"]).read_bytes()
                     configs.append(config)
                     objects = Path(command[-1])
@@ -74,7 +76,7 @@ class CampaignBuildTests(unittest.TestCase):
                 return 0
 
             args = argparse.Namespace(recipe=str(recipe), out=str(out), env=[], no_probe=True,
-                                      object_env=["PLOW_BUILD_W8A8=1"])
+                                      object_env=["PLOW_BUILD_W8A8=1", "NVCC_APPEND_FLAGS=-ccbin=/usr/bin/g++-14"])
             with patch.object(campaign, "REPO", root), patch.object(campaign, "run", run), \
                     patch.object(campaign, "git", side_effect=lambda *args, **kwargs:
                                  "start" if recipe.read_bytes() == original_recipe else "end"), \
@@ -101,6 +103,18 @@ class CampaignBuildTests(unittest.TestCase):
             self.assertEqual(record["hashes"]["role.cubin"], record["objects"]["role.cubin"])
             self.assertEqual(record["compilation"]["log_sha256"], campaign.sha(out / "build.log"))
             self.assertEqual(record["compilation"]["object_env"]["PLOW_BUILD_W8A8"], "1")
+            self.assertEqual(record["compilation"]["object_env"]["NVCC_APPEND_FLAGS"],
+                             "-DPLOW_NV_GLU_QUANT_CACHE=1 -ccbin=/usr/bin/g++-14")
+
+    def test_object_env_appends_flags_and_replaces_scalars(self):
+        recipe = {"NVCC_APPEND_FLAGS": "-DPLOW_NV_GLU_QUANT_CACHE=1 -DPLOW_NV_GLU_QUANT_WPR=1",
+                  "PLOW_BUILD_W8A8": "1", "PLOW_BUILD_FATLITE": 1}
+        merged = campaign.merge_object_env(recipe, {"NVCC_APPEND_FLAGS": "-ccbin=/usr/bin/g++-14",
+                                                    "PLOW_BUILD_W8A8": "0", "CFLAGS": "-O2"})
+        self.assertEqual(merged, {
+            "NVCC_APPEND_FLAGS": "-DPLOW_NV_GLU_QUANT_CACHE=1 -DPLOW_NV_GLU_QUANT_WPR=1 -ccbin=/usr/bin/g++-14",
+            "PLOW_BUILD_W8A8": "0", "PLOW_BUILD_FATLITE": "1", "CFLAGS": "-O2"})
+        self.assertEqual(campaign.merge_object_env(recipe, {}), {k: str(v) for k, v in recipe.items()})
 
     def test_block_roofline_trace_binds_packet_runtime_and_counter_program(self):
         with tempfile.TemporaryDirectory() as temporary:
