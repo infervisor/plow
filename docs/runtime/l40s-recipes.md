@@ -129,3 +129,29 @@ TTS (`scripts/tts/tts_bench.py`, streaming):
 A SNAC codec-LM stream needs ~83 decode tokens per audio second, so BF16 Orpheus/Veena stay real
 time per stream up to 16 concurrent streams (11.8 ms steps); at 32 even the 12.5 ms roofline step
 is slower than real time.
+
+## Production traffic (one model per L40S, `--objective auto`)
+
+Each model alone on one GPU from its canonical recipe (ladder to 128, `PLOW_VMM_PREFIX=1`),
+`plowrt serve --objective auto` with no other serving limits; offered load swept until the SLO
+breaks. Goodput counts requests that meet the SLO.
+
+| model | load generator | SLO | holds SLO up to | at that load |
+|---|---|---|---|---|
+| Gemma 4 E4B | `agentic_turns.py --open-loop` (multi-turn sessions, 512-token system, 300-token turns, 256 out) | TTFT <= 1 s, TPOT <= 50 ms | 32 concurrent sessions, 100% | goodput 3.83 req/s, TTFT p50/p99 195/749 ms, TPOT p99 32 ms, 7.2k tok/s |
+| Qwen3-ASR 1.7B | `served_bench.py --rate` (Poisson, 73-clip set) | final <= 1 s | 40 req/s, 99.4% | p50/p99 285/850 ms, 262 audio s/s, WER 3.8% |
+| Qwen3-ASR 0.6B | same | final <= 1 s | 80 req/s, 99.4% | p50/p99 219/889 ms, 538 audio s/s, WER 4.2% |
+| Orpheus | `call_sim.py` TTS only, 3 turns per call | TTFA p95 <= 800 ms, underrun <= 1% | 48 calls | TTFA p50/p95 482/545 ms, no underrun |
+| Veena | same | same | 48 calls | TTFA p50/p95 402/507 ms, no underrun |
+| Chatterbox | same | same | 64 calls | TTFA p50/p95 450/770 ms, no underrun |
+| Chatterbox MTL | same | same | 32 calls (64: TTFA p95 825 ms) | TTFA p50/p95 350/713 ms, no underrun |
+
+Gemma before this campaign's prefill and cache work (interpreter prefill GEMMs, no prefix
+cache): 82% at 8 sessions, 57% at 16 (goodput 1.12 req/s), 0% from 32 (TTFT p50 13.9 s). Each
+agentic turn re-prefilled its whole history at 3.5k tok/s; with cuBLASLt prefill (11.3k tok/s)
+and ~50% of prompt tokens cached, 32 sessions hold 100%.
+
+On CUDA `auto` steers by live decode width, queue depth and KV share; `--ttft-slo-ms` /
+`--tbt-slo-ms` only feed the goodput counters (`plowrt_slo_*`). Past the knee `auto` keeps TPOT
+under the 50 ms target and the queue absorbs the excess (Gemma at 48 sessions: TPOT p99 50 ms,
+TTFT p50 5.4 s), so the admission rate, not the SLO, bounds TTFT there.
