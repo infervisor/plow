@@ -1,14 +1,14 @@
-# Trial: Orpheus 3B TTS (canopylabs/orpheus-3b-0.1-ft) on L40S (sm_89, 142 SMs, 48 GB), BF16. The Veena H100
-# recipe's codec-LM contract with the `orpheus` profile, minus the Hopper-only decode knobs (decode
-# cuBLASLt, FA fold, dense tune) and the wgmma `_gw` rungs past 32. Prefill projections go through
-# cuBLASLt (Llama-TTS shapes). The SNAC decoder runs as codec.pkt on the sm_89 speech object.
+# Trial: Veena (maya-research/Veena) on L40S (sm_89, 142 SMs, 48 GB), BF16. The H100 recipe's
+# codec-LM contract minus the Hopper-only decode knobs (decode cuBLASLt, FA fold, dense tune) and
+# the wgmma `_gw` rungs past 32. Prefill projections go through cuBLASLt (Llama-TTS shapes). The
+# SNAC decoder runs as codec.pkt on the sm_89 speech object.
 #
 #   PYREF=<python with torch + snac> python3 scripts/campaign/campaign.py build \
-#     scripts/campaign/recipes/orpheus.l40s.bf16.toml --hf-dir <orpheus snapshot> --out <fresh dir>
+#     scripts/campaign/recipes/veena.l40s.bf16.toml --out <fresh dir>
 
 schema = "plow.recipe.v1"
 namespace = "infervisor"
-name = "orpheus"
+name = "veena"
 label = "sm89-l40s-tp1"
 network = "llama"
 
@@ -21,13 +21,14 @@ num_gpus = 1
 parallel = "tp"
 
 [checkpoint]
-source = "hf:canopylabs/orpheus-3b-0.1-ft"
+source = "hf:maya-research/Veena"
+revision = "8b770f9e69e6b35ef320d4cd70a99a4ab6dd022f"
 codec = "hf:hubertsiuzdak/snac_24khz"
 codec_revision = "d73ad176a12188fcf4f360ba3bf2c2fbbe8f58ec"
 
 [cell]
-name = "orpheus-l40s"
-hf_dir = "{hf:canopylabs/orpheus-3b-0.1-ft}"
+name = "veena-l40s"
+hf_dir = "{hf:maya-research/Veena@8b770f9e69e6b35ef320d4cd70a99a4ab6dd022f}"
 gpu = "l40s"
 arch = "sm_89"
 n_cu = 142
@@ -42,14 +43,14 @@ args = ["{out}/prep/snac"]
 
 [emit]
 emit = "devblob+cubin"
-args = ["--served-name", "orpheus"]
+args = ["--served-name", "veena"]
 [emit.env]
-PLOW_TTS_PROFILE = "orpheus"
+PLOW_TTS_PROFILE = "veena"
 PLOW_TTS_CODEC_DIR = "{out}/prep/snac"
 PLOW_VERIFY_BIN = "{repo}/lean-plow/.lake/build/bin/plow_verify"
 PLOW_MAX_CHUNK = "512"
 PLOW_PF_LADDER_APPEND = "64,256"
-# 32 streams: 7 GiB of KV, leaving room for the codec and the ASR models on 48 GB.
+# 32 streams: 7 GiB of KV.
 PLOW_DECODE_BATCH_LADDER = "1,2,4,8,16,32"
 PLOW_EMIT_PREFILL_CUBLASLT = "1"
 PLOW_NO_GLU_FUSE = "1"
@@ -61,6 +62,5 @@ client = "scripts/tts/tts_bench.py"
 [gates]
 python = "{env:PYREF}"
 [gates.tts_cer]
-# English prompts on an Orpheus voice (the default set's Veena voices are not in prompt.voices: 400).
-arms = ["--conc 1 --stream --wav --n 16 --prompt-set chatterbox --voice tara", "--conc 32 --stream --wav --n 64 --prompt-set chatterbox --voice tara"]
+arms = ["--conc 1 --stream --wav --n 16", "--conc 32 --stream --wav --n 64"]
 cer_median_max = 0.05

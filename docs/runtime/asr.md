@@ -532,6 +532,8 @@ These made no gain at B=1:
 
 ## L4 (Ada, sm_89)
 
+The L40S runs the same objects; its recipes and measurements are in `docs/runtime/l40s-recipes.md`.
+
 The L4 runs the sm_120 warp32 interpreter built for sm_89 (`interp_sm89*.cubin`: mma.sync and
 cp.async, no wgmma/TMA). Qwen decoder prefill projections go through cuBLASLt (BF16); encoders,
 RNNT and decode stay on the interpreter. sm_89 allows 99 KiB of shared memory per block, so the

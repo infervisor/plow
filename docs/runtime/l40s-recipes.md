@@ -1,0 +1,104 @@
+# L40S (Ada, sm_89): ASR, TTS and Gemma 4 E4B
+
+The L40S (AD102: 142 SMs, 48 GB GDDR6, 864 GB/s datasheet, 841 GB/s measured read with
+`scripts/tts/hbm_bw.py`) runs the same sm_89 objects as the L4 (`docs/runtime/asr.md`, "L4"):
+the sm_120 warp32 interpreter built for Ada, mma.sync and cp.async, no wgmma/TMA, 99 KiB of
+shared memory per block. Only the packets differ (142 SMs, `--gpu l40s`).
+
+| model | recipe | gate | L40S result |
+|---|---|---|---|
+| Qwen3-ASR 1.7B | `scripts/campaign/recipes/qwen3-asr.l40s.bf16.toml` | WER, 73 clips | 3.826% |
+| Qwen3-ASR 0.6B | `qwen3-asr-0.6b.l40s.bf16.toml` | WER | 4.261% |
+| Nemotron 3.5 (Q8_0 RNNT) | packet, below | WER | 5.13% |
+| Orpheus 3B TTS | `orpheus.l40s.bf16.toml` | Whisper CER median | 0.000 (n=80) |
+| Veena TTS | `veena.l40s.bf16.toml` | Whisper CER median | 0.005-0.011 (n=80, sampled) |
+| Chatterbox TTS | `chatterbox.l40s.bf16.toml` | CER / S3Gen mel rel-L2 | 0.000 (n=32) / 1.4e-5 |
+| Gemma 4 E4B | `gemma4-e4b.l40s.bf16.toml` | logit parity vs HF bf16 | top1 0.9867, KL mean 7.8e-4 |
+
+ASR WERs equal the L4 and H100 numbers; the decode change below leaves every gate unchanged.
+
+## Build and serve
+
+Inside `nix develop` (on a box without flakes enabled in `nix.conf`, export
+`NIX_CONFIG="experimental-features = nix-command flakes"` so `campaign.py`'s own `nix develop`
+works too). `plowrt` loads cuBLASLt from `$CUDA_PATH/lib` when no system toolkit is on the loader
+path, so serve from the dev shell (Qwen, Orpheus, Veena and Chatterbox route prefill through it).
+
+```sh
+cargo build --release -p plowc && cargo build --release -p plowrt --features cuda,gguf
+python3 scripts/campaign/campaign.py build scripts/campaign/recipes/qwen3-asr.l40s.bf16.toml --out <dir>
+python3 scripts/campaign/campaign.py gate scripts/campaign/recipes/qwen3-asr.l40s.bf16.toml \
+  --assets <dir>/assets --out <dir>/gate     # PYREF, ASR_MANIFEST as in the recipe
+# Orpheus: --hf-dir <canopylabs or unsloth orpheus-3b-0.1-ft snapshot>
+# Chatterbox: CBX_PY=<python with chatterbox-tts 0.1.7> for the T3/S3Gen prep and the S3Gen gate
+
+# Nemotron 3.5: packet for 142 SMs + the specialized speech object (`gguf` feature in plowrt)
+asr_nemotron_pipeline_compile model.q8_0.gguf 200,400,...,3000 <dir>/nemotron.pkt 16 142
+cmake -S runtime -B <build> -DPLOW_SM89_CUBIN=ON -DPLOW_CUBIN_SPEECH=ON -DPLOW_CUBIN_ARCH=sm_89 \
+  -DPLOW_CUBIN_GEMMA=OFF "-DPLOW_EXTRA_DEFINES=-DPLOW_SPEECH_OPS=0x20000ffffull"
+cmake --build <build> --target nv_cubins   # interp_sm89_speech.cubin beside nemotron.pkt
+```
+
+The runtime CMake takes nvcc from `$PLOW_NVCC` (the dev shell's toolkit) when it is set.
+
+The recipes keep the L4 contracts at 48 GB sizes: decode ladders to 32 rows and the default
+192-chunk packed encoder buckets. One `plowrt serve --assets <1.7B> --assets <0.6B>
+--asr-packet nemotron-3.5-asr=...` hosts all three ASR models in 31.5 GiB (peak 31.5 GiB).
+
+## Decode against the roofline
+
+`scripts/bench/step_grid.sh` + `scripts/bench/op_roof.py --gpu l40s` (841 GB/s), ctx 1024, ms per
+step:
+
+| model | B=1 | B=8 | B=16 | B=32 | % of roofline B=1 / 16 / 32 |
+|---|---|---|---|---|---|
+| Qwen3-ASR 1.7B | 5.09 | 6.34 | 7.57 | 10.03 | 83 / 85 / 87 |
+| Qwen3-ASR 0.6B | 2.38 | 3.38 | 4.57 | 7.08 | 66 / 81 / 85 |
+| Orpheus / Veena (Llama 3B) | 9.01 | 10.31 | 11.81 | 14.29 | 89 / 86 / 88 |
+| Chatterbox T3 | 2.20 | 3.28 | 4.54 | 7.04 | 62 / 81 / 87 |
+| Gemma 4 E4B | 13.61 | 14.45 | 15.26 | 16.55 | 82 / 82 / 84 |
+
+Batched decode GEMVs (B >= 2) walk the weights on the tensor cores (`op_gemv_mma.cuh`,
+`PLOW_NV_GEMV_MMA`), as on H100. The CUDA-core dot8 walk they replace is issue-bound above one
+row: Orpheus B=16 ran at 51% of the roofline (GEMVs 37-57% of bandwidth), now 86%.
+
+| model | B=8 | B=16 | B=32 |
+|---|---|---|---|
+| Orpheus | 12.22 -> 10.31 | 20.01 -> 11.82 | 20.94 -> 14.30 |
+| Gemma 4 E4B | 17.07 -> 14.46 | 27.92 -> 15.28 | 28.70 -> 16.57 |
+| Qwen3-ASR 1.7B | 7.81 -> 6.34 | 10.93 -> 7.57 | 14.55 -> 10.02 |
+
+The speech object keeps the dot8 walk: the walk's static reduction smem on top of the 96 KiB
+speech arena passes the 99 KiB block limit (the ASR front end fails to load). Measured and not
+taken on Ada: the paired walk (`PLOW_NV_GEMV_MMA_PAIR`, +1-3%), the walk at B=1
+(`PLOW_NV_GEMV_MMA_B1`, B=1 +1.7%), `PLOW_FUSE_KV_HNR` and GLU fusion (no change). The
+`PLOW_NV_DENSE_TUNE` / gemv_k8 arms and decode cuBLASLt are emitted for sm_90a only, and
+`PLOW_NV_FA_FOLD` needs Hopper-only flash definitions. At B=1 the large GEMVs run at 89-99% of
+bandwidth; the rest is the interpreter skeleton (0.28-0.56 ms) and per-op latency of the small
+norm/rope/per-layer-input ops, which is why the ~1.2 GB models (Qwen3-ASR 0.6B, Chatterbox T3)
+sit at 62-66% at B=1.
+
+## Serving
+
+73-clip LibriSpeech dummy set (`scripts/asr/nvidia/served_bench.py`), each model alone:
+
+| model | conc | WER | p50 | p90 | RTFx |
+|---|---|---|---|---|---|
+| Qwen3-ASR-1.7B | 1 / 16 | 3.826% | 125 / 307 ms | 225 / 481 ms | 46.0 / 283.7 |
+| Qwen3-ASR-0.6B | 1 / 16 | 4.261% | 66 / 155 ms | 119 / 249 ms | 86.5 / 593.5 |
+| Nemotron 3.5 (Q8_0) | 1 / 4 | 5.13% | 60 / 205 ms | 79 / 247 ms | 103.5 / 123.2 |
+
+All three in one serve at once (Qwen c16 + c16, Nemotron c4): WER unchanged; RTFx 111.9 / 114.8
+/ 75.5.
+
+TTS (`scripts/tts/tts_bench.py`, streaming):
+
+| model | conc | TTFA median | RTF median | audio s per s |
+|---|---|---|---|---|
+| Orpheus | 1 / 32 | 141 / 299 ms | 0.75 / 1.21 | 1.34 / 20.3 |
+| Veena | 1 / 32 | 141 / 309 ms | 0.75 / 1.22 | 1.34 / 21.2 |
+| Chatterbox | 1 / 8 | 173 / 293 ms | 0.16 / 0.31 | 6.5 / 24.7 |
+
+A SNAC codec-LM stream needs ~83 decode tokens per audio second, so BF16 Orpheus/Veena stay real
+time per stream up to 16 concurrent streams (11.8 ms steps); at 32 even the 12.5 ms roofline step
+is slower than real time.

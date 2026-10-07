@@ -61,5 +61,6 @@ client = "scripts/tts/tts_bench.py"
 [gates]
 python = "{env:PYREF}"
 [gates.tts_cer]
-arms = ["--conc 1 --stream --wav --n 16", "--conc 16 --stream --wav --n 32"]
+# English prompts on an Orpheus voice (the default set's Veena voices are not in prompt.voices: 400).
+arms = ["--conc 1 --stream --wav --n 16 --prompt-set chatterbox --voice tara", "--conc 16 --stream --wav --n 32 --prompt-set chatterbox --voice tara"]
 cer_median_max = 0.05

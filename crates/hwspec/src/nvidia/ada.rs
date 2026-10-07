@@ -94,7 +94,8 @@ pub const L40S: GpuSpec = GpuSpec {
         kind: MemKind::Gddr6,
         capacity: Bytes::gib(48),
         bandwidth: GBps(864.0),
-        bandwidth_measured: None,
+        // scripts/tts/hbm_bw.py read-reduce, 4 GiB buffers (copy: 761 GB/s).
+        bandwidth_measured: Some(GBps(841.0)),
         bus_width_bits: 384,
     },
     copy_engines: 2,

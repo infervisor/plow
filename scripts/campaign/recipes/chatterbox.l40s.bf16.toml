@@ -1,0 +1,79 @@
+# Trial: Chatterbox (ResembleAI/chatterbox, English) on L40S (sm_89, 142 SMs, 48 GB). The H100
+# recipe minus the Hopper-only knobs (dense tune, S3Gen 3xFP16 cached attention on the sm_90 speech
+# object) and the wgmma `_gw` rungs past 32. T3 prefill projections go through cuBLASLt; S3Gen runs
+# as s3gen.pkt on the sm_89 speech object.
+#
+#   CBX_PY=<python with chatterbox-tts 0.1.7> PYREF=<python with transformers + jiwer + librosa> \
+#   python3 scripts/campaign/campaign.py build scripts/campaign/recipes/chatterbox.l40s.bf16.toml --out <fresh dir>
+
+schema = "plow.recipe.v1"
+namespace = "infervisor"
+name = "chatterbox"
+label = "sm89-l40s-tp1"
+network = "llama"
+doc = "docs/runtime/tts.md"
+
+[target]
+vendor = "nvidia"
+isa = "sm_89"
+sku = "L40S"
+units = 142
+num_gpus = 1
+parallel = "tp"
+
+[checkpoint]
+source = "hf:ResembleAI/chatterbox"
+revision = "5bb1f6ee58e50c3b8d408bc82a6d3740c2db6e18"
+
+[cell]
+name = "chatterbox-l40s"
+hf_dir = "{out}/prep/t3"
+gpu = "l40s"
+arch = "sm_89"
+n_cu = 142
+n_gpu = 1
+max_ctx = 2048
+
+[[prep]]
+name = "t3-checkpoint"
+script = "scripts/tts/chatterbox_prep.py"
+python = "{env:CBX_PY}"
+args = ["{out}/prep/t3"]
+env = { PYTHONPATH = "" }
+
+[[prep]]
+name = "s3gen-export"
+script = "scripts/tts/s3gen_export.py"
+python = "{env:CBX_PY}"
+args = ["{out}/prep/s3gen"]
+env = { PYTHONPATH = "" }
+
+[emit]
+emit = "devblob+cubin"
+args = ["--served-name", "chatterbox"]
+[emit.env]
+PLOW_TTS_VOCODER_DIR = "{out}/prep/s3gen"
+PLOW_VERIFY_BIN = "{repo}/lean-plow/.lake/build/bin/plow_verify"
+# Prefill rows = voice rows + text + 2 (~200-350); decode 1..32 slots = 16 requests as CFG pairs.
+PLOW_MAX_CHUNK = "512"
+PLOW_PF_LADDER_APPEND = "256,384"
+PLOW_DECODE_BATCH_LADDER = "1,2,4,8,16,32"
+PLOW_EMIT_PREFILL_CUBLASLT = "1"
+PLOW_NO_GLU_FUSE = "1"
+PLOW_FUSE_KV_HNR = "1"
+
+[bench]
+kind = "speech"
+client = "scripts/tts/tts_bench.py"
+arms = ["--conc 1 --stream --wav --n 16 --prompt-set chatterbox --voice default", "--conc 8 --stream --n 32 --prompt-set chatterbox --voice default"]
+
+[gates]
+python = "{env:PYREF}"
+[gates.tts_cer]
+arms = ["--conc 1 --stream --wav --n 16 --prompt-set chatterbox --voice default", "--conc 8 --stream --wav --n 16 --prompt-set chatterbox --voice default"]
+cer_median_max = 0.05
+[gates.s3gen_rel_l2]
+python = "{env:CBX_PY}"
+env = { PYTHONPATH = "" }
+rel_l2_max = 1e-3
+timeout_s = 1800
