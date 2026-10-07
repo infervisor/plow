@@ -3475,6 +3475,19 @@ fn run_one_tick(
                     == 2
             {
                 for (i, slot_opt) in slots.iter_mut().enumerate().take(b) {
+                    if e.resume_before_pack() {
+                        if let Some(s) = slot_opt
+                            .as_mut()
+                            .filter(|s| s.step == 0 && s.pf_pos == 0 && s.resume > 0)
+                        {
+                            if s.cfg.is_none() && e.resume_slot(i, s.resume) {
+                                s.pf_pos = s.resume;
+                                s.cached_tokens = s.resume;
+                            } else {
+                                s.resume = 0;
+                            }
+                        }
+                    }
                     let Some(slot) = slot_opt.as_ref().filter(|slot| slot.step == 0) else {
                         continue;
                     };
@@ -4104,7 +4117,33 @@ fn run_one_tick(
                                         "AMD packed prefill fired"
                                     )
                                 });
-                                tracing::debug!(spans = packed.len(), "AMD packed prefill advanced")
+                                tracing::debug!(spans = packed.len(), "AMD packed prefill advanced");
+                                for span in &packed {
+                                    let i = span.slot as usize;
+                                    if let Some(s) = slots[i].as_mut() {
+                                        s.cached_tokens = e.cached_rows(i);
+                                    }
+                                }
+                                for (i, token) in e.take_packed_tokens() {
+                                    if let Some(s) = slots[i].as_mut() {
+                                        s.pf_pos = s.prompt_ids.len();
+                                    }
+                                    let t_tok = std::time::Instant::now();
+                                    seq_host_logprobs(&*e, i, &mut slots[i], token);
+                                    handle_produced_token(
+                                        &mut slots[i],
+                                        &arena,
+                                        bundle,
+                                        token,
+                                        1,
+                                        &mut tokens_this_tick,
+                                        Some(stop.as_slice()),
+                                    );
+                                    crate::obs::ttft::FIRST_TOK.add(t_tok.elapsed().as_nanos() as u64);
+                                    if slots[i].is_none() {
+                                        e.release(i);
+                                    }
+                                }
                             }
                             Err(err) => {
                                 tracing::warn!(

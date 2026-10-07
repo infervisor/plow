@@ -40,6 +40,24 @@ enum {
 /* Dispatch table extent: PLOW_DOP_* are dense small integers (< 200 today). */
 #define PLOW_CPU_DOP_TABLE 256
 
+/* A packed (cross-request) prefill launch: rows [row0, row0 + n_rows) of spans[s] belong to KV
+ * slot spans[s].slot at absolute positions kv_row0.., and row_slot[r] is row r's slot. The host
+ * sets it only around a packed run (NULL otherwise); the row-dependent prefill kernels read it:
+ * HEADNORM_ROPE's KV write (row_slot, the n_batch_kv layout) and FLASH_PREFILL (spans). */
+typedef struct {
+    const PlowPrefillSpan* spans;
+    const uint32_t*        row_slot;
+    uint32_t               n_spans;
+    uint32_t               rows;
+} PlowCpuPack;
+
+/* FLASH_PREFILL's view of one work unit: the op itself, or under a pack the unit's span (its
+ * rows, positions, KV length and slot). Units are (q tile, head, split) per span, span-major. */
+typedef struct {
+    uint32_t row0, n_q, q_pos0, n_kv;
+    size_t   kv_off; /* elements: slot * n_kv_head * kv_stride * hd */
+} PlowPfView;
+
 /* Per-worker-thread context. Owned and zeroed by Rust; passed to every kernel.
  * `scratch` is a 64-byte-aligned per-thread arena of at least plow_cpu_scratch_bytes()
  * (flash softmax rows, GEMM C tiles, dequant staging). Fixed 64 bytes. */
@@ -52,8 +70,39 @@ typedef struct {
     /* Bytes at the head of `scratch` held in this core's pseudo-locked L2 (plowrt PLOW_CPU_SRAM,
      * runtime/cpu/driver); 0 = none. Kernels size their L2 working set to it. */
     uint64_t sram_bytes;
-    uint64_t reserved[4];
+    const PlowCpuPack* pack;
+    uint64_t reserved[3];
 } PlowCpuCtx;
+
+static inline uint32_t plow_pf_units(const PlowCpuPack* pk, uint32_t n_q, uint32_t tile, uint32_t per_tile) {
+    if (!pk) return (n_q + tile - 1) / tile * per_tile;
+    uint32_t n = 0;
+    for (uint32_t s = 0; s < pk->n_spans; s++) n += (pk->spans[s].n_rows + tile - 1) / tile * per_tile;
+    return n;
+}
+
+/* `*w` becomes the unit's index inside its span. */
+static inline PlowPfView plow_pf_view(const PlowCpuPack* pk, uint32_t* w, uint32_t n_q, uint32_t q_pos0,
+                                      uint32_t n_kv, uint32_t tile, uint32_t per_tile,
+                                      size_t slot_elems) {
+    PlowPfView v = {0u, n_q, q_pos0, n_kv, 0u};
+    if (!pk) return v;
+    for (uint32_t s = 0; s < pk->n_spans; s++) {
+        const PlowPrefillSpan* sp = &pk->spans[s];
+        const uint32_t u = (sp->n_rows + tile - 1) / tile * per_tile;
+        if (*w < u) {
+            v.row0 = sp->row0;
+            v.n_q = sp->n_rows;
+            v.q_pos0 = sp->kv_row0;
+            v.n_kv = sp->kv_len;
+            v.kv_off = (size_t)sp->slot * slot_elems;
+            return v;
+        }
+        *w -= u;
+    }
+    v.n_q = 0u;
+    return v;
+}
 
 /* Kernel entry. `tensors[h]` is the host base pointer for handle h; an absent operand
  * (t[k] == PLOW_TENSOR_NONE, the u16 sentinel from dev_isa.h) reads as NULL via

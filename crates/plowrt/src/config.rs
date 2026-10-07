@@ -753,6 +753,11 @@ pub struct CpuRuntimeConfig {
     /// (live, mid-prefill or released) and prefills only the rest.
     #[arg(long = "cpu-prefix-share", env = "PLOW_CPU_PREFIX_SHARE", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub prefix_share: bool,
+
+    /// Prefill the waiting requests' prompts together in one launch (rows concatenated, each
+    /// span attending only its own slot's KV), so the weights stream once per tick, not per prompt.
+    #[arg(long = "cpu-pack-prefill", env = "PLOW_CPU_PACK_PREFILL", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub pack_prefill: bool,
 }
 
 /// NVIDIA / sm_120 runtime knobs.

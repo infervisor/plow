@@ -103,13 +103,17 @@ fn main() {
             let t_first = evs.iter().map(|e| e.t0_ns).min().unwrap_or(0);
             for (i, (cnt, busy, mx, a, z)) in top.into_iter().take(n) {
                 let op = insts[*i as usize].op;
+                let d = &insts[*i as usize];
                 println!(
-                    "  #{i:<5} {:<26} {cnt:>4} pk  busy {:>9.2} ms  max pk {:>7.3} ms  window {:>8.2}..{:>8.2} ms",
+                    "  #{i:<5} {:<26} {cnt:>4} pk  busy {:>9.2} ms  max pk {:>7.3} ms  window {:>8.2}..{:>8.2} ms  i {}x{}x{}",
                     DevOp::from_u16(op).map(|o| o.c_name()).unwrap_or("?"),
                     *busy as f64 / 1e6,
                     *mx as f64 / 1e6,
                     (*a - t_first) as f64 / 1e6,
-                    (*z - t_first) as f64 / 1e6
+                    (*z - t_first) as f64 / 1e6,
+                    d.i[0],
+                    d.i[1],
+                    d.i[2]
                 );
             }
         }

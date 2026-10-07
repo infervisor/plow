@@ -636,6 +636,7 @@ pub const RUNTIME: &[KnobSpec] = &[
     KnobSpec::new("rt.mmap_gather", Some("PLOW_CPU_MMAP_GATHER"), Layer::Runtime, Domain::Bool, ON, OPT_IN),
     KnobSpec::new("rt.gate_pf", Some("PLOW_CPU_GATE_PF"), Layer::Runtime, Domain::Bool, ON, OPT_IN),
     KnobSpec::new("rt.prefix_share", Some("PLOW_CPU_PREFIX_SHARE"), Layer::Runtime, Domain::Bool, ON, OPT_IN),
+    KnobSpec::new("rt.pack_prefill", Some("PLOW_CPU_PACK_PREFILL"), Layer::Runtime, Domain::Bool, ON, OPT_IN),
     KnobSpec::new("rt.backend", Some("PLOW_BACKEND"), Layer::Runtime, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("rt.serial", Some("PLOW_METAL_SERIAL"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("rt.spin_max", Some("PLOW_METAL_SPIN_MAX"), Layer::Runtime, U32, UNSET, OPT_IN),

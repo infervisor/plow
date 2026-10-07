@@ -43,6 +43,10 @@ fn ctx_layout_matches_c() {
             offset_of!(PlowCpuCtx, isa)
         );
         assert_eq!(
+            abi::plow_cpu_abi_offsetof_ctx_pack(),
+            offset_of!(PlowCpuCtx, pack)
+        );
+        assert_eq!(
             abi::plow_cpu_abi_offsetof_ctx_reserved(),
             offset_of!(PlowCpuCtx, reserved)
         );

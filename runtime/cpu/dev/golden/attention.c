@@ -20,28 +20,41 @@ static float kv_value(const plow_bf16* data, const float* scales, size_t row, ui
  * f0=scale  fj1.u=kv_stride  fj2.u=kv_mask.  Q is [n_q][n_head][hd]; K/V head-major.
  * nsplit==1 with t5 present writes the normalized bf16 output straight to t5 and no partial. */
 G_K(g_flash_prefill) {
-    (void)ctx;
-    float* Opart = PLOW_CPU_TEN(in, T, 0);
-    float* mlpart = PLOW_CPU_TEN(in, T, 1);
-    const plow_bf16* Q = PLOW_CPU_TEN(in, T, 2);
-    const plow_bf16* K = PLOW_CPU_TEN(in, T, 3);
-    const plow_bf16* V = PLOW_CPU_TEN(in, T, 4);
+    float* const Opart0 = PLOW_CPU_TEN(in, T, 0);
+    float* const mlpart0 = PLOW_CPU_TEN(in, T, 1);
+    const plow_bf16* const Q0 = PLOW_CPU_TEN(in, T, 2);
+    const plow_bf16* const K0 = PLOW_CPU_TEN(in, T, 3);
+    const plow_bf16* const V0 = PLOW_CPU_TEN(in, T, 4);
     const int fp8 = in->op == PLOW_DOP_FLASH_PREFILL_FP8;
-    const float* ks = fp8 ? PLOW_CPU_TEN(in, T, 6) : NULL;
-    const float* vs = fp8 ? PLOW_CPU_TEN(in, T, 7) : NULL;
-    plow_bf16* O_final = PLOW_CPU_TEN(in, T, 5);
-    const uint32_t n_q = in->i[0], n_kv = in->i[1], n_head = in->i[2], n_kv_head = in->i[3];
-    const uint32_t q_pos0 = in->i[4], window = in->i[5], D = in->i[6];
+    const float* const ks0 = fp8 ? PLOW_CPU_TEN(in, T, 6) : NULL;
+    const float* const vs0 = fp8 ? PLOW_CPU_TEN(in, T, 7) : NULL;
+    plow_bf16* const O_final0 = PLOW_CPU_TEN(in, T, 5);
+    const uint32_t n_q0 = in->i[0], n_kv0 = in->i[1], n_head = in->i[2], n_kv_head = in->i[3];
+    const uint32_t q_pos00 = in->i[4], window = in->i[5], D = in->i[6];
     const uint32_t nsplit = in->i[7] ? in->i[7] : 1u;
     const float scale = in->fj[0].f;
     const uint32_t kv_stride = in->fj[1].u, kv_mask = in->fj[2].u;
     if (D > 512u) return;
     const uint32_t gqa = n_head / n_kv_head;
-    const uint32_t q_tiles = (n_q + FA_BQ_TILE - 1) / FA_BQ_TILE;
-    const uint32_t n_work = q_tiles * n_head * nsplit;
+    const PlowCpuPack* pk = ctx ? ctx->pack : NULL;
+    const uint32_t n_work = plow_pf_units(pk, n_q0, FA_BQ_TILE, n_head * nsplit);
     float acc[512];
 
-    for (uint32_t w = slice; w < n_work; w += nblk) {
+    for (uint32_t w0 = slice; w0 < n_work; w0 += nblk) {
+        uint32_t w = w0;
+        const PlowPfView pv = plow_pf_view(pk, &w, n_q0, q_pos00, n_kv0, FA_BQ_TILE, n_head * nsplit,
+                                           (size_t)n_kv_head * kv_stride * D);
+        const uint32_t n_q = pv.n_q, n_kv = pv.n_kv, q_pos0 = pv.q_pos0;
+        const plow_bf16* Q = Q0 + (size_t)pv.row0 * n_head * D;
+        /* An fp8 cache is one byte per element. */
+        const size_t kv_bytes = pv.kv_off * (fp8 ? 1u : sizeof(plow_bf16));
+        const plow_bf16* K = (const plow_bf16*)((const uint8_t*)K0 + kv_bytes);
+        const plow_bf16* V = (const plow_bf16*)((const uint8_t*)V0 + kv_bytes);
+        const float* ks = ks0 ? ks0 + pv.kv_off / D : NULL;
+        const float* vs = vs0 ? vs0 + pv.kv_off / D : NULL;
+        float* Opart = Opart0 ? Opart0 + (size_t)pv.row0 * n_head * nsplit * D : NULL;
+        float* mlpart = mlpart0 ? mlpart0 + (size_t)pv.row0 * n_head * nsplit * 2 : NULL;
+        plow_bf16* O_final = O_final0 ? O_final0 + (size_t)pv.row0 * n_head * D : NULL;
         const uint32_t sp = w % nsplit, h = (w / nsplit) % n_head, qt = w / (nsplit * n_head);
         const uint32_t hkv = h / gqa;
         const uint32_t q_base = qt * FA_BQ_TILE;

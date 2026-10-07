@@ -53,7 +53,19 @@ pub struct PlowCpuCtx {
     pub isa: u32,
     /// Bytes at the head of `scratch` held in this core's pseudo-locked L2; 0 = none.
     pub sram_bytes: u64,
-    pub reserved: [u64; 4],
+    /// The packed-prefill descriptor of the current run, or null (every other run).
+    pub pack: *const PlowCpuPack,
+    pub reserved: [u64; 3],
+}
+
+/// Mirror of `PlowCpuPack`: which rows of a packed prefill launch belong to which KV slot.
+#[derive(Debug)]
+#[repr(C)]
+pub struct PlowCpuPack {
+    pub spans: *const packet::dev::PrefillSpan,
+    pub row_slot: *const u32,
+    pub n_spans: u32,
+    pub rows: u32,
 }
 
 impl PlowCpuCtx {
@@ -67,7 +79,8 @@ impl PlowCpuCtx {
             node,
             isa: 0,
             sram_bytes: 0,
-            reserved: [0; 4],
+            pack: std::ptr::null(),
+            reserved: [0; 3],
         }
     }
 }
@@ -382,6 +395,7 @@ pub mod abi {
         pub fn plow_cpu_abi_offsetof_ctx_worker() -> usize;
         pub fn plow_cpu_abi_offsetof_ctx_node() -> usize;
         pub fn plow_cpu_abi_offsetof_ctx_isa() -> usize;
+        pub fn plow_cpu_abi_offsetof_ctx_pack() -> usize;
         pub fn plow_cpu_abi_offsetof_ctx_reserved() -> usize;
         pub fn plow_cpu_abi_offsetof_inst_op() -> usize;
         pub fn plow_cpu_abi_offsetof_inst_blocks() -> usize;

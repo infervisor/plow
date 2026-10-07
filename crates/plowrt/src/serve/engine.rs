@@ -128,6 +128,16 @@ pub trait SeqEngine {
     fn packable_prefill_span(&self, slot: usize, max_rows: u32)
         -> Option<packet::dev::PrefillSpan>;
     fn advance_packed_prefill(&mut self, members: &[(usize, &[u32])]) -> crate::Result<()>;
+    /// `(slot, token)` for each prompt the last [`Self::advance_packed_prefill`] completed. Empty
+    /// for a backend whose packs carry only intermediate chunks.
+    fn take_packed_tokens(&mut self) -> Vec<(usize, u32)> {
+        Vec::new()
+    }
+    /// Apply a retained session's resume before seeding pack cursors: this backend packs fresh
+    /// prompts, so the isolated path (which otherwise resumes) may never see them.
+    fn resume_before_pack(&self) -> bool {
+        false
+    }
     fn prefill_frontier(&self, slot: usize) -> Option<usize>;
     fn next_prefill_rows(&self, _slot: usize) -> Option<u32> { None }
     /// Keep `slot`'s first `rows` KV rows (a retained session prefix) so its next prefill

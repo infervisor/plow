@@ -1362,7 +1362,7 @@ impl CpuModel {
 // ---------------------------------------------------------------------------
 
 use std::cell::UnsafeCell;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 use std::sync::Arc;
 
 use crate::exec::counters::CounterPool;
@@ -1392,6 +1392,8 @@ pub struct KernelExec {
     table: Vec<Option<KernelFn>>,
     tensors: Arc<TensorTable>,
     slots: Vec<WorkerSlot>,
+    /// The engine's packed-prefill descriptor for the current run, or null.
+    pack: Arc<AtomicPtr<ffi::PlowCpuPack>>,
 }
 
 // SAFETY: `tensors` holds pointers into the model's allocations, which outlive
@@ -1401,8 +1403,15 @@ unsafe impl Sync for KernelExec {}
 
 impl KernelExec {
     /// `worker_cpu(w)` = the `(cpu, node)` worker `w` is pinned to.
-    fn new(model: &CpuModel, workers: usize, worker_cpu: impl Fn(usize) -> (u32, u32)) -> Result<Self> {
+    fn new(
+        model: &CpuModel,
+        workers: usize,
+        worker_cpu: impl Fn(usize) -> (u32, u32),
+        pack: Arc<AtomicPtr<ffi::PlowCpuPack>>,
+    ) -> Result<Self> {
         let mut table: Vec<Option<KernelFn>> = vec![None; ffi::DOP_TABLE];
+        // A packed prefill's head-only rerun turns the body into NOPs.
+        table[DevOp::Nop as usize] = ffi::kernel(DevOp::Nop as u16);
         for p in &model.blob.progs {
             for d in &p.insts {
                 let op = d.op as usize;
@@ -1461,6 +1470,7 @@ impl KernelExec {
             table,
             tensors: Arc::clone(&model.table),
             slots,
+            pack,
         })
     }
 }
@@ -1485,6 +1495,8 @@ impl Exec for KernelExec {
                 inst.op
             )
         });
+        // Stored at a quiescent point before the run; the pool's run handoff orders it.
+        ctx.pack = self.pack.load(Ordering::Relaxed);
         // SAFETY: handles were validated at load (< n_tensors or NONE); the
         // kernel contract is the interpreter's (slice of nblk, disjoint work).
         unsafe { f(inst, slice, nblk, self.tensors.as_ptr(), ctx) };
@@ -2108,6 +2120,91 @@ pub struct CpuEngine {
     pub threads: usize,
     /// Wall time of the last `run_prog`, for step telemetry.
     pub last_run_us: f64,
+    /// Each prefill program's lm_head instruction when the packet can run a packed
+    /// (cross-request) prefill ([`pack_route`]); the refusal reason otherwise.
+    pack_lm: std::result::Result<Vec<usize>, String>,
+    pack_cell: Arc<AtomicPtr<ffi::PlowCpuPack>>,
+}
+
+/// One request's rows in a packed prefill: `rows` are its prompt tokens at absolute positions
+/// `c0..`, written into KV slot `slot`; `sample` = this chunk ends the prompt and owes a token.
+#[derive(Clone, Copy, Debug)]
+pub struct PackMember<'a> {
+    pub slot: usize,
+    pub c0: u32,
+    pub rows: &'a [u32],
+    pub sample: bool,
+}
+
+/// Whether every prefill program can carry several requests in one launch, and if so each
+/// program's lm_head instruction. Every op must be row-independent, or one of those the pack
+/// descriptor rewires: the KV-writing HEADNORM_ROPE (per-row slot), FLASH_PREFILL (per-span
+/// slot, positions and KV length), and the trailing GEMM/SOFTCAP/ARGMAX/ARGMAX_FIN head.
+fn pack_route(model: &CpuModel) -> std::result::Result<Vec<usize>, String> {
+    if !cfg!(target_arch = "x86_64") {
+        return Err("the span-aware kernels are x86 only".into());
+    }
+    if model.batch < 2 || model.dec_ix == 0 {
+        return Err("one KV slot or no prefill program".into());
+    }
+    let slot_bytes = |h: u16| {
+        model
+            .kv_slot_stride
+            .iter()
+            .find(|e| e.0 == h as usize)
+            .map(|e| e.1)
+    };
+    let mut lm = Vec::with_capacity(model.dec_ix);
+    for p in &model.blob.progs[..model.dec_ix] {
+        let n = p.insts.len();
+        let is = |d: &DevInst64, op: DevOp| d.op == op as u16;
+        let head = n.checked_sub(4).map(|i| &p.insts[i..]).ok_or("empty prefill program")?;
+        if !(is(&head[0], DevOp::Gemm)
+            && model.wk.logits == Some(head[0].t[0] as usize)
+            && head[0].i[0] == 1
+            && is(&head[1], DevOp::SoftCap)
+            && is(&head[2], DevOp::Argmax)
+            && is(&head[3], DevOp::ArgmaxFin))
+        {
+            return Err("prefill head is not GEMM -> SOFTCAP -> ARGMAX -> ARGMAX_FIN".into());
+        }
+        for d in &p.insts[..n - 4] {
+            let Some(op) = DevOp::from_u16(d.op) else {
+                return Err(format!("unknown op {}", d.op));
+            };
+            match op {
+                DevOp::HeadNormRope if d.fj[1] != 0 => {
+                    let block = d.i[1] as u64 * d.fj[1] as u64 * d.i[2] as u64 * 2;
+                    if d.i[6] != 0 || slot_bytes(d.t[0]) != Some(block) {
+                        return Err("a KV write is not one [slot][head][row] block per slot".into());
+                    }
+                }
+                DevOp::FlashPrefill => {
+                    let block = d.i[3] as u64 * d.fj[1] as u64 * d.i[6] as u64 * 2;
+                    if slot_bytes(d.t[3]) != Some(block) || slot_bytes(d.t[4]) != Some(block) {
+                        return Err("a flash KV read is not one [slot][head][row] block per slot".into());
+                    }
+                }
+                DevOp::HeadNormRope
+                | DevOp::Embed
+                | DevOp::Gemm
+                | DevOp::GemmGlu
+                | DevOp::GluStrided
+                | DevOp::RmsNorm
+                | DevOp::NormResidual
+                | DevOp::Residual
+                | DevOp::FlashMerge
+                | DevOp::MoeRouterGemmaPf
+                | DevOp::MoeAlignGemmaPf
+                | DevOp::MoeGroupGluGemmaPf
+                | DevOp::MoeGroupDownGemmaPf
+                | DevOp::MoeCombineNormGemmaPf => {}
+                _ => return Err(format!("{} is not known to be row-independent", op.c_name())),
+            }
+        }
+        lm.push(n - 4);
+    }
+    Ok(lm)
 }
 
 impl CpuEngine {
@@ -2253,9 +2350,13 @@ impl CpuEngine {
         } else {
             topo.worker_cpus(&nodes)
         };
-        let exec = Arc::new(KernelExec::new(&model, threads, |w| {
-            placement[w % placement.len()]
-        })?);
+        let pack_cell = Arc::new(AtomicPtr::new(std::ptr::null_mut()));
+        let exec = Arc::new(KernelExec::new(
+            &model,
+            threads,
+            |w| placement[w % placement.len()],
+            Arc::clone(&pack_cell),
+        )?);
         if let Some(dev) = crate::config::RuntimeConfig::get()
             .cpu
             .sram
@@ -2329,6 +2430,11 @@ impl CpuEngine {
             max_ctx,
             "CPU engine ready"
         );
+        let pack_lm = pack_route(&model);
+        match &pack_lm {
+            Ok(_) => tracing::info!("cpu: packed prefill available"),
+            Err(why) => tracing::info!(why = %why, "cpu: packed prefill unavailable"),
+        }
         Ok(CpuEngine {
             pool,
             model,
@@ -2338,6 +2444,8 @@ impl CpuEngine {
             isa,
             threads,
             last_run_us: 0.0,
+            pack_lm,
+            pack_cell,
         })
     }
 
@@ -2514,6 +2622,169 @@ impl CpuEngine {
         let r = self.prefill_chunk(prompt, ch);
         self.model.kv_rebase(0)?;
         r
+    }
+
+    /// Whether [`Self::prefill_packed`] can run on this packet.
+    pub fn packs(&self) -> bool {
+        self.pack_lm.is_ok()
+    }
+
+    /// Prefill several requests' chunks in ONE launch of the narrowest bucket holding all their
+    /// rows, so the weights stream once for every member. Returns the greedy next token of each
+    /// `sample` member in order; its softcapped logits are the same-numbered `act.logits` row.
+    pub fn prefill_packed(&mut self, members: &[PackMember<'_>]) -> Result<Vec<u32>> {
+        let lm = match &self.pack_lm {
+            Ok(lm) => lm,
+            Err(why) => {
+                return Err(RuntimeError::Rejected(format!(
+                    "packed prefill unavailable: {why}"
+                )))
+            }
+        };
+        if self.model.kv_slot != 0 {
+            return Err(RuntimeError::Device(
+                "packed prefill with the KV table rebased onto a slot".into(),
+            ));
+        }
+        let mut m = 0u32;
+        for (k, mb) in members.iter().enumerate() {
+            let end = (mb.c0 as usize).checked_add(mb.rows.len());
+            if mb.slot >= self.model.batch
+                || mb.rows.is_empty()
+                || end.is_none_or(|e| e > self.max_ctx)
+                || members[..k].iter().any(|o| o.slot == mb.slot)
+            {
+                return Err(RuntimeError::Rejected(format!(
+                    "bad packed prefill member: slot {} rows [{}, +{})",
+                    mb.slot,
+                    mb.c0,
+                    mb.rows.len()
+                )));
+            }
+            m += mb.rows.len() as u32;
+        }
+        let (prog, t) = self
+            .prefill_buckets()
+            .into_iter()
+            .filter(|&(_, t)| t >= m)
+            .min_by_key(|&(_, t)| t)
+            .ok_or_else(|| {
+                RuntimeError::Rejected(format!("no prefill bucket holds {m} packed rows"))
+            })?;
+        let lm = lm[prog];
+        let (t_ids, t_pos) = (
+            self.need(self.model.wk.ids, "in.ids")?,
+            self.need(self.model.wk.pos, "in.pos")?,
+        );
+        let mut spans = Vec::with_capacity(members.len());
+        let mut row_slot = vec![0u32; m as usize];
+        let mut samples = Vec::with_capacity(members.len());
+        {
+            let (it, pt) = (self.model.tensor(t_ids), self.model.tensor(t_pos));
+            // SAFETY: no run in flight; both tensors hold `t >= m` u32 rows (64-byte aligned).
+            let (ids, pos) = unsafe {
+                (
+                    std::slice::from_raw_parts_mut(it.as_ptr().cast::<u32>(), it.bytes / 4),
+                    std::slice::from_raw_parts_mut(pt.as_ptr().cast::<u32>(), pt.bytes / 4),
+                )
+            };
+            let mut row0 = 0u32;
+            for mb in members {
+                let n = mb.rows.len() as u32;
+                let r = row0 as usize..(row0 + n) as usize;
+                ids[r.clone()].copy_from_slice(mb.rows);
+                for (p, j) in pos[r.clone()].iter_mut().zip(mb.c0..) {
+                    *p = j;
+                }
+                row_slot[r].fill(mb.slot as u32);
+                spans.push(packet::dev::PrefillSpan {
+                    row0,
+                    n_rows: n,
+                    slot: mb.slot as u32,
+                    flags: 0,
+                    kv_row0: mb.c0,
+                    kv_len: mb.c0 + n,
+                    state_slot: mb.slot as u32,
+                    program: prog as u32,
+                });
+                if mb.sample {
+                    samples.push(row0 + n - 1);
+                }
+                row0 += n;
+            }
+            ids[m as usize..t as usize].fill(0);
+            pos[m as usize..t as usize].fill(0);
+        }
+        let desc = ffi::PlowCpuPack {
+            spans: spans.as_ptr(),
+            row_slot: row_slot.as_ptr(),
+            n_spans: spans.len() as u32,
+            rows: m,
+        };
+        let lp = Arc::make_mut(&mut self.progs[prog]);
+        lp.insts
+            .copy_from_slice(&self.model.blob.progs[prog].insts);
+        rebase_chunk_rows(&mut lp.insts, &self.model.names, 0, m, t, Some(t));
+        if let [row] = samples[..] {
+            lp.insts[lm].i[4] = row;
+        } else {
+            for d in &mut lp.insts[lm..] {
+                d.op = DevOp::Nop as u16;
+            }
+        }
+        // `desc` and the vectors it points into outlive the run; the cell is cleared before
+        // either is dropped, on every path.
+        self.pack_cell
+            .store(&desc as *const ffi::PlowCpuPack as *mut _, Ordering::Relaxed);
+        let ran = self.run_prog(prog);
+        self.pack_cell.store(std::ptr::null_mut(), Ordering::Relaxed);
+        ran?;
+        if samples.len() >= 2 {
+            self.packed_head(prog, lm, &samples)?;
+        }
+        Ok(self.read_ids(samples.len()))
+    }
+
+    /// The head of a packed prefill that owes several tokens: gather each sampled row of the
+    /// final-normed hidden into rows `0..S`, then rerun the program as its 4-op head alone at
+    /// `M = S` (the body NOPs), the same multi-row head a decode rung runs.
+    fn packed_head(&mut self, prog: usize, lm: usize, rows: &[u32]) -> Result<()> {
+        let pristine = &self.model.blob.progs[prog].insts;
+        let head = pristine[lm];
+        let (hn, k, vocab) = (head.t[1] as usize, head.i[2] as usize, head.i[1]);
+        let s = rows.len();
+        let amax = &pristine[lm + 2];
+        let row = k * 2;
+        let hn_t = self.model.tensor(hn);
+        let fits = s <= self.model.batch
+            && rows.iter().all(|&r| (r as usize + 1) * row <= hn_t.bytes)
+            && self.model.tensor(amax.t[0] as usize).bytes >= s * amax.blocks as usize * 8;
+        if !fits {
+            return Err(RuntimeError::Rejected(format!(
+                "packed prefill head cannot hold {s} sampled rows"
+            )));
+        }
+        let mut tmp = vec![0u8; s * row];
+        // SAFETY: quiescent point; every source and target row is inside `hn` (checked above).
+        unsafe {
+            let base = hn_t.as_ptr();
+            for (j, &r) in rows.iter().enumerate() {
+                std::ptr::copy_nonoverlapping(base.add(r as usize * row), tmp.as_mut_ptr().add(j * row), row);
+            }
+            std::ptr::copy_nonoverlapping(tmp.as_ptr(), base, s * row);
+        }
+        let lp = Arc::make_mut(&mut self.progs[prog]);
+        lp.insts.copy_from_slice(pristine);
+        for d in &mut lp.insts[..lm] {
+            d.op = DevOp::Nop as u16;
+        }
+        let s = s as u32;
+        lp.insts[lm].i[0] = s;
+        lp.insts[lm].i[4] = 0;
+        lp.insts[lm + 1].i[0] = s * vocab;
+        lp.insts[lm + 2].i[1] = s;
+        lp.insts[lm + 3].i[1] = s;
+        self.run_prog(prog)
     }
 
     /// One decode step for `pos.len()` sequence slots on the narrowest rung
