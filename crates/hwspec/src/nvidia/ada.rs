@@ -79,3 +79,28 @@ pub const L4: GpuSpec = GpuSpec {
     clock_boost: Hertz::from_mhz(2040),
     soc: None,
 };
+
+/// L40S — AD102, 142 SMs, 48 GB GDDR6 (384-bit), 864 GB/s, 350 W PCIe.
+pub const L40S: GpuSpec = GpuSpec {
+    name: "L40S",
+    vendor: Vendor::Nvidia,
+    arch: Arch::AdaLovelace,
+    compute_cap: (8, 9),
+    sm_count: 142,
+    sm: ADA_SM,
+    dsm: None,
+    l2: Bytes::mib(96),
+    mem: MemorySpec {
+        kind: MemKind::Gddr6,
+        capacity: Bytes::gib(48),
+        bandwidth: GBps(864.0),
+        bandwidth_measured: None,
+        bus_width_bits: 384,
+    },
+    copy_engines: 2,
+    interconnect: None,
+    chiplet: None,
+    l2_partitioning: None,
+    clock_boost: Hertz::from_mhz(2520),
+    soc: None,
+};

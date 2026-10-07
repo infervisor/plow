@@ -42,7 +42,7 @@ pub enum MemKind {
     Hbm2e,
     Hbm3,
     Hbm3e,
-    /// GDDR6 (Ada datacenter: L4).
+    /// GDDR6 (Ada datacenter: L4, L40S).
     Gddr6,
     /// GDDR6X (Ada consumer: RTX 4090).
     Gddr6x,
