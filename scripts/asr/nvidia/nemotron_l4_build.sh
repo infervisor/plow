@@ -20,7 +20,7 @@ target=${CARGO_TARGET_DIR:-$repo/target}
 
 # Speech ops 163..178 plus 196 (CopyColsF32: the stream programs' [cache|new] windows); a packet
 # with stream programs fails on an object without bit 33.
-cmake -S runtime -B "$out/cmake" -DPLOW_SM89_CUBIN=ON -DPLOW_CUBIN_SPEECH=ON -DPLOW_CUBIN_ARCH=sm_89 \
+cmake -S runtime -B "$out/cmake" "-DPLOW_CUBIN_NVCC=$(command -v nvcc)" -DPLOW_SM89_CUBIN=ON -DPLOW_CUBIN_SPEECH=ON -DPLOW_CUBIN_ARCH=sm_89 \
   -DPLOW_CUBIN_GEMMA=OFF "-DPLOW_EXTRA_DEFINES=-DPLOW_SPEECH_OPS=0x20000ffffull" > "$out/cmake.log"
 cmake --build "$out/cmake" --target nv_cubins >> "$out/cmake.log"
 cp "$out/cmake/cubin/interp_sm89_speech.cubin" "$out/"

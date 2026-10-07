@@ -546,7 +546,7 @@ plowrt serve --assets <dir>/assets [--assets <0.6B dir>/assets]
 # Nemotron 3.5: packet for 58 SMs (with its cache-aware encoder stream, STREAM_ROWS defaults to
 # one attention chunk), plus a speech object carrying its ops (163..178, CopyColsF32 196)
 asr_nemotron_pipeline_compile model.q8_0.gguf 200,400,...,3000 <dir>/nemotron.pkt 16 58
-cmake -S runtime -B <build> -DPLOW_SM89_CUBIN=ON -DPLOW_CUBIN_SPEECH=ON -DPLOW_CUBIN_ARCH=sm_89 \
+cmake -S runtime -B <build> -DPLOW_CUBIN_NVCC=$(command -v nvcc) -DPLOW_SM89_CUBIN=ON -DPLOW_CUBIN_SPEECH=ON -DPLOW_CUBIN_ARCH=sm_89 \
   -DPLOW_CUBIN_GEMMA=OFF "-DPLOW_EXTRA_DEFINES=-DPLOW_SPEECH_OPS=0x20000ffffull"
 cmake --build <build> --target nv_cubins   # copy <build>/cubin/interp_sm89_speech.cubin beside nemotron.pkt
 plowrt asr --packet <dir>/nemotron.pkt --tokenizer model.q8_0.gguf --backend cuda --port 8080

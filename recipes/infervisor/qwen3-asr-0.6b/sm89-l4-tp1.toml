@@ -13,6 +13,7 @@ schema = "plow.recipe.v1"
 namespace = "infervisor"
 name = "qwen3-asr-0.6b"
 label = "sm89-l4-tp1"
+plow_git = "194e867f3fb91879d465e4d02728b5a146aad823"
 network = "qwen3"
 doc = "docs/runtime/asr.md"
 
