@@ -96,3 +96,5 @@ sglang-pkgs/
 !/runtime/nvidia/experiments/README.md
 /runtime/bench/amd/*/README.md
 /test_impl*
+
+result*/
