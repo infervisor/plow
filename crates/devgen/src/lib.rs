@@ -8586,7 +8586,8 @@ pub fn run_verified(args: EmitArgs, verify: Option<VerifyHook>) {
         assert!(
             ((model_type.starts_with("gemma4") || model_type == "llama" || model_type == "qwen3_asr")
                 && arch == "sm_90a"
-                || (model_type == "qwen3_asr" || model_type == "llama") && arch == "sm_89")
+                || (model_type == "qwen3_asr" || model_type == "llama" || model_type.starts_with("gemma4"))
+                    && arch == "sm_89")
                 && tp == 1
                 && (!emit_config::active().any_fp8_weights()
                     || (model_type.starts_with("gemma4") && emit_config::active().w8a8))

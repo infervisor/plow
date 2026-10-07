@@ -256,11 +256,13 @@ pub fn cublaslt_prefill_bf16(profile: &str, m: u32, n: u32, k: u32) -> bool {
                 || CUBLASLT_PREFILL_LLAMA_TTS_SHAPES.contains(&(n, k))
                 || CUBLASLT_PREFILL_QWEN3_1_7B_SHAPES.contains(&(n, k)))
         }
-        // Ada has no TMA/wgmma prefill GEMM; only the speech LMs (ASR decoders, Llama TTS) are routed.
+        // Ada has no TMA/wgmma prefill GEMM: the speech LMs (ASR decoders, Llama TTS) and Gemma 4
+        // E4B (L40S cold TTFT at 3944 tokens 1121 ms on the interpreter GEMM) are routed.
         "sm89" | "sm_89" => {
             rows && (CUBLASLT_PREFILL_QWEN3_1_7B_SHAPES.contains(&(n, k))
                 || CUBLASLT_PREFILL_QWEN3_0_6B_SHAPES.contains(&(n, k))
-                || CUBLASLT_PREFILL_LLAMA_TTS_SHAPES.contains(&(n, k)))
+                || CUBLASLT_PREFILL_LLAMA_TTS_SHAPES.contains(&(n, k))
+                || CUBLASLT_PREFILL_GEMMA4_E4B_SHAPES.contains(&(n, k)))
         }
         _ => false,
     }

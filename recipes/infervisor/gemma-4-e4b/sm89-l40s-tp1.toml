@@ -48,6 +48,11 @@ PLOW_DECODE_BATCH_LADDER = "1,2,4,8,16,32,64,128"
 PLOW_EMIT_DECODE_CUBLASLT = "1"
 PLOW_EMIT_DECODE_CUBLASLT_MIN_ROWS = "32"
 PLOW_EMIT_DECODE_CUBLASLT_HEAD = "1"
+# Prefill projections on cuBLASLt (segment_roles sm89 E4B shapes) with gate/up unfused so they reach
+# the library too (the fused GemmGlu stayed on the interpreter GEMM at 8% of the roofline): cold TTFT
+# 324/1376/3944 tokens 140/418/1121 -> 41.5/124/341 ms (11.6k tok/s); decode steps unchanged.
+PLOW_EMIT_PREFILL_CUBLASLT = "1"
+PLOW_NO_GLU_FUSE = "1"
 
 [bench]
 kind = "chat"
@@ -58,3 +63,7 @@ python = "{env:PYREF}"
 hf_dir = "{hf:google/gemma-4-E4B-it@ee0ef6023621cff504d758262d4e04895a5af4a2}"
 top1_min = 0.98
 kl_mean_max = 2e-3
+
+# VMM-backed KV prefix cache on every request path (sessions, shared system prompts, replays).
+[serve.env]
+PLOW_VMM_PREFIX = "1"
