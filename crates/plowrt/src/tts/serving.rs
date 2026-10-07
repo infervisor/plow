@@ -569,6 +569,7 @@ async fn stream_task(
         }
     });
     let (mut frames, mut emitted, mut first) = (Vec::<i32>::new(), 0usize, None);
+    let mut first_frame_at: Option<Instant> = None;
     loop {
         let next = frx.recv().await;
         let done = next.is_none();
@@ -577,6 +578,7 @@ async fn stream_task(
             while let Ok(f) = frx.try_recv() {
                 frames.extend(f);
             }
+            first_frame_at.get_or_insert_with(Instant::now);
         }
         let chunk = (model.codec.min_frames + 1).saturating_sub(model.codec.window).max(1);
         let lookahead = if emitted == 0 {
@@ -584,7 +586,21 @@ async fn stream_task(
         } else {
             model.codec.lookahead
         };
-        if let Some((s, e, upto)) = stream_step(frames.len() / fc, emitted, done, model.codec.window, lookahead, chunk) {
+        let n = frames.len() / fc;
+        // A short first lookahead buys time to first audio, but the next window needs the full
+        // lookahead: hold the first audio until it covers producing those frames at the measured
+        // frame rate (a stream near real time otherwise underruns right after its first chunk).
+        if emitted == 0 && !done && lookahead < model.codec.lookahead {
+            let Some(t0) = first_frame_at.filter(|_| n >= 2) else { continue };
+            let per_frame = t0.elapsed().as_secs_f64() / (n - 1) as f64;
+            let audio_per_frame = fs as f64 / sr;
+            let gap = (chunk + model.codec.lookahead - lookahead) as f64;
+            let need = ((gap * per_frame * 1.1) / audio_per_frame).ceil() as usize;
+            if n.saturating_sub(lookahead) < need.clamp(1, chunk + model.codec.lookahead) {
+                continue;
+            }
+        }
+        if let Some((s, e, upto)) = stream_step(n, emitted, done, model.codec.window, lookahead, chunk) {
             let window = frames[s * fc..e * fc].to_vec();
             let urgency = if emitted == 0 { Urgency::First } else { Urgency::Stream };
             match model.codec.decode(window, e - s, seed ^ (emitted as u64).wrapping_mul(0x9E37_79B9), urgency).await {
