@@ -32,6 +32,9 @@ pub struct SpeechContract {
     pub prompt_template: String,
     /// The voice's vocabulary token with a `{voice}` placeholder.
     pub voice_token: String,
+    /// Named voices (`prompt.voices`, one per line); empty: a voice is known when its
+    /// `voice_token` is one vocabulary token.
+    pub voices: Vec<String>,
     pub prefix: Vec<u32>,
     pub suffix: Vec<u32>,
     pub stops: Vec<u32>,
@@ -65,6 +68,7 @@ impl SpeechContract {
             pipeline: p.name.clone(),
             prompt_template: p.strings.get("prompt.template").cloned().ok_or_else(|| RuntimeError::Rejected("speech pipeline lacks prompt.template".into()))?,
             voice_token: p.strings.get("prompt.voice_token").cloned().ok_or_else(|| RuntimeError::Rejected("speech pipeline lacks prompt.voice_token".into()))?,
+            voices: p.strings.get("prompt.voices").map(|v| v.lines().map(str::to_owned).collect()).unwrap_or_default(),
             prefix: list("prompt.prefix")?,
             suffix: list("prompt.suffix")?,
             stops: list("stop")?,

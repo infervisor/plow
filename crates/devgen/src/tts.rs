@@ -13,8 +13,10 @@ pub const DRIVER: &str = "tts.codec_lm.v1";
 pub struct SpeechProfile {
     /// Prompt text between the prefix and suffix ids, with `{voice}` and `{input}`.
     pub prompt_template: &'static str,
-    /// A voice is valid when this renders to one vocabulary token.
+    /// A voice is valid when this renders to one vocabulary token, unless `voices` lists them.
     pub voice_token: &'static str,
+    /// Named voices (multi-token names); empty = any single-token `voice_token`.
+    pub voices: &'static [&'static str],
     pub prefix: &'static [u64],
     pub suffix: &'static [u64],
     pub stops: &'static [u64],
@@ -35,6 +37,7 @@ pub struct SpeechProfile {
 pub const VEENA: SpeechProfile = SpeechProfile {
     prompt_template: "<spk_{voice}> {input}",
     voice_token: "<spk_{voice}>",
+    voices: &[],
     prefix: &[128259],
     suffix: &[128260, 128261, 128257],
     stops: &[128258, 128262],
@@ -47,6 +50,26 @@ pub const VEENA: SpeechProfile = SpeechProfile {
     max_new_tokens_cap: 700,
     temperature: 0.4,
     top_p: 0.9,
+};
+
+/// canopylabs/orpheus-3b-0.1-ft (orpheus_tts `_format_prompt`): [SOH] BOS "voice: text" [EOT]
+/// [EOH] [SOA] [SOS] -> the same 7-code SNAC frames as Veena, stop on END_OF_SPEECH.
+pub const ORPHEUS: SpeechProfile = SpeechProfile {
+    prompt_template: "{voice}: {input}",
+    voice_token: "{voice}",
+    voices: &["tara", "leah", "jess", "leo", "dan", "mia", "zac", "zoe"],
+    prefix: &[128259, 128000],
+    suffix: &[128009, 128260, 128261, 128257],
+    stops: &[128258],
+    sample_rate: 24000,
+    frame_codes: 7,
+    codebook: 4096,
+    frame_samples: 2048,
+    audio_token_base: 128266,
+    per_char_frames: 1.3,
+    max_new_tokens_cap: 1200,
+    temperature: 0.6,
+    top_p: 0.8,
 };
 
 /// Chatterbox T3 (`tts.t3_cfg.v1`): a causal LM whose prefill rows are host embeddings (the
@@ -109,7 +132,8 @@ pub fn t3_pipeline_section(
 pub fn profile(name: &str) -> Result<&'static SpeechProfile, String> {
     match name {
         "veena" => Ok(&VEENA),
-        other => Err(format!("unknown tts profile {other:?} (known: veena)")),
+        "orpheus" => Ok(&ORPHEUS),
+        other => Err(format!("unknown tts profile {other:?} (known: veena, orpheus)")),
     }
 }
 
@@ -129,6 +153,9 @@ pub fn speech_pipeline_section(
     pipe.driver = DRIVER.into();
     pipe.strings.insert("prompt.template".into(), p.prompt_template.into());
     pipe.strings.insert("prompt.voice_token".into(), p.voice_token.into());
+    if !p.voices.is_empty() {
+        pipe.strings.insert("prompt.voices".into(), p.voices.join("\n"));
+    }
     pipe.strings.insert("codec.packet".into(), CODEC_PACKET.into());
     let params = &mut pipe.parameters;
     let mut put = |k: String, v: u64| {

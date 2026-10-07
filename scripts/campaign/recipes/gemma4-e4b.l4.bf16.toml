@@ -1,0 +1,49 @@
+# Trial: Gemma 4 E4B on L4 (sm_89, 58 SMs), BF16. The non-Hopper warp32 interpreter: no TMA GEMM,
+# FA v3 or wgmma segment objects; decode up to 16 rows.
+#
+#   python3 scripts/campaign/campaign.py build scripts/campaign/recipes/gemma4-e4b.l4.bf16.toml --out <fresh dir>
+
+schema = "plow.recipe.v1"
+namespace = "infervisor"
+name = "gemma-4-e4b"
+label = "sm89-l4-tp1"
+network = "gemma4"
+
+[target]
+vendor = "nvidia"
+isa = "sm_89"
+sku = "L4"
+units = 58
+num_gpus = 1
+parallel = "tp"
+
+[checkpoint]
+source = "hf:google/gemma-4-E4B-it"
+revision = "ee0ef6023621cff504d758262d4e04895a5af4a2"
+
+[cell]
+name = "gemma-4-e4b-l4"
+hf_dir = "{hf:google/gemma-4-E4B-it@ee0ef6023621cff504d758262d4e04895a5af4a2}"
+gpu = "l4"
+arch = "sm_89"
+n_cu = 58
+n_gpu = 1
+max_ctx = 4096
+
+[emit]
+emit = "devblob+cubin"
+args = ["--served-name", "gemma-4-e4b"]
+[emit.env]
+PLOW_VERIFY_BIN = "{repo}/lean-plow/.lake/build/bin/plow_verify"
+PLOW_MAX_CHUNK = "512"
+PLOW_DECODE_BATCH_LADDER = "1,2,4,8,16"
+
+[bench]
+kind = "chat"
+
+[gates]
+python = "{env:PYREF}"
+[gates.llm_logit_parity]
+hf_dir = "{hf:google/gemma-4-E4B-it@ee0ef6023621cff504d758262d4e04895a5af4a2}"
+top1_min = 0.98
+kl_mean_max = 2e-3

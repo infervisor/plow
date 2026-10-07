@@ -380,7 +380,11 @@ async fn speech_with(
     }
     let tok = bundle.tokenizer();
     let voice = req.voice.clone();
-    if tok.encode_with_special_tokens(&c.voice_token(&voice), false).len() != 1 {
+    if !c.voices.is_empty() {
+        if !c.voices.contains(&voice) {
+            return bad(format!("unknown voice {voice:?}; voices: {}", c.voices.join(", ")), "voice");
+        }
+    } else if tok.encode_with_special_tokens(&c.voice_token(&voice), false).len() != 1 {
         return bad(format!("unknown voice {voice:?}: {} is not a vocabulary token", c.voice_token(&voice)), "voice");
     }
     let wav = match req.response_format.as_deref().unwrap_or("wav") {

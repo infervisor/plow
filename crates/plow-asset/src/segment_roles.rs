@@ -256,10 +256,11 @@ pub fn cublaslt_prefill_bf16(profile: &str, m: u32, n: u32, k: u32) -> bool {
                 || CUBLASLT_PREFILL_LLAMA_TTS_SHAPES.contains(&(n, k))
                 || CUBLASLT_PREFILL_QWEN3_1_7B_SHAPES.contains(&(n, k)))
         }
-        // Ada has no TMA/wgmma prefill GEMM; only the ASR decoders are routed.
+        // Ada has no TMA/wgmma prefill GEMM; only the speech LMs (ASR decoders, Llama TTS) are routed.
         "sm89" | "sm_89" => {
             rows && (CUBLASLT_PREFILL_QWEN3_1_7B_SHAPES.contains(&(n, k))
-                || CUBLASLT_PREFILL_QWEN3_0_6B_SHAPES.contains(&(n, k)))
+                || CUBLASLT_PREFILL_QWEN3_0_6B_SHAPES.contains(&(n, k))
+                || CUBLASLT_PREFILL_LLAMA_TTS_SHAPES.contains(&(n, k)))
         }
         _ => false,
     }
@@ -783,7 +784,11 @@ mod tests {
         }
         for profile in ["sm89", "sm_89"] {
             for m in CUBLASLT_PREFILL_ROWS.iter().chain(&CUBLASLT_PREFILL_SPEECH_ROWS) {
-                for (n, k) in CUBLASLT_PREFILL_QWEN3_1_7B_SHAPES.into_iter().chain(CUBLASLT_PREFILL_QWEN3_0_6B_SHAPES) {
+                for (n, k) in CUBLASLT_PREFILL_QWEN3_1_7B_SHAPES
+                    .into_iter()
+                    .chain(CUBLASLT_PREFILL_QWEN3_0_6B_SHAPES)
+                    .chain(CUBLASLT_PREFILL_LLAMA_TTS_SHAPES)
+                {
                     assert!(cublaslt_prefill_bf16(profile, *m, n, k));
                 }
             }
