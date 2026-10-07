@@ -81,6 +81,23 @@ pub struct CudaPacketRuntime {
     /// valid); `None` once capture failed for that sequence.
     graphs: std::collections::HashMap<Vec<usize>, Option<GraphExec>>,
     last_us: f64,
+    /// Last field: dropped after every allocation above, so [`resident_in`] turns false only once
+    /// the device memory is back.
+    _resident: Arc<()>,
+}
+
+/// Live runtimes by the asset directory their packet sits in.
+fn residents() -> &'static parking_lot::Mutex<Vec<(std::path::PathBuf, std::sync::Weak<()>)>> {
+    static R: std::sync::OnceLock<parking_lot::Mutex<Vec<(std::path::PathBuf, std::sync::Weak<()>)>>> =
+        std::sync::OnceLock::new();
+    R.get_or_init(Default::default)
+}
+
+/// Whether a packet runtime loaded from `dir` still holds device memory.
+pub fn resident_in(dir: &Path) -> bool {
+    let mut r = residents().lock();
+    r.retain(|(_, live)| live.strong_count() > 0);
+    r.iter().any(|(d, _)| d == dir)
 }
 
 // SAFETY: the runtime owns its stream, module and allocations and is used by one thread at a time
@@ -235,6 +252,11 @@ impl CudaPacketRuntime {
             programs,
             graphs: std::collections::HashMap::new(),
             last_us: 0.0,
+            _resident: {
+                let token = Arc::new(());
+                residents().lock().push((dir.to_path_buf(), Arc::downgrade(&token)));
+                token
+            },
         })
     }
 

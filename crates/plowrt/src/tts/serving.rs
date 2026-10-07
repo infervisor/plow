@@ -105,16 +105,48 @@ fn guided_model(
 /// the first request does not pay them.
 pub fn preload(state: &AppState) -> Result<(), String> {
     for slug in state.registry.slugs() {
-        let (Some(_), Ok(bundle)) = (state.mux(&slug), state.registry.get(&slug)) else {
-            continue;
-        };
-        let bound = guided_model(&bundle.dir, state.downstream(&slug)).and_then(|g| match g {
-            Some(_) => Ok(()),
-            None => speech_model(&bundle.dir, state.downstream(&slug)).map(drop),
-        });
-        bound.map_err(|e| format!("{slug}: speech pipeline failed to bind: {e}"))?;
+        if state.mux(&slug).is_some() {
+            bind(state, &slug)?;
+        }
     }
     Ok(())
+}
+
+/// Bind `slug`'s speech pipeline now (a no-op for a model without one, or already bound).
+pub fn bind(state: &AppState, slug: &str) -> Result<(), String> {
+    let bundle = state.registry.get(slug).map_err(|e| e.to_string())?;
+    let bound = guided_model(&bundle.dir, state.downstream(slug)).and_then(|g| match g {
+        Some(_) => Ok(()),
+        None => speech_model(&bundle.dir, state.downstream(slug)).map(drop),
+    });
+    bound.map_err(|e| format!("{slug}: speech pipeline failed to bind: {e}"))
+}
+
+enum Pipeline {
+    Guided(Arc<super::guided_speech::GuidedSpeech>),
+    Speech(Arc<SpeechModel>),
+    /// Bound, and the model has no speech pipeline.
+    None,
+}
+
+/// `dir`'s bound pipeline; `None` when it is not bound (not resident, or mid-switch). Never
+/// binds: a managed model's pipeline binds with its engine ([`bind`]).
+fn bound_pipeline(dir: &Path) -> Option<Pipeline> {
+    if let Some(Some(g)) = guided_models().lock().get(dir) {
+        return Some(Pipeline::Guided(Arc::clone(g)));
+    }
+    match speech_models().lock().get(dir) {
+        Some(Some(m)) => Some(Pipeline::Speech(Arc::clone(m))),
+        Some(None) => Some(Pipeline::None),
+        None => None,
+    }
+}
+
+/// Forget `dir`'s speech pipeline: its vocoder/codec threads exit, freeing their packet
+/// runtimes, once the last request holding it ends.
+pub fn release(dir: &Path) {
+    guided_models().lock().remove(dir);
+    speech_models().lock().remove(dir);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -333,21 +365,41 @@ async fn speech_with(
     if let Some(canonical) = state.registry.resolve(&req.model) {
         req.model = canonical;
     }
-    if let Some(mgr) = state.manager_for(&req.model) {
-        if mgr.manages(&req.model) {
-            if let Err(e) = mgr.ensure_resident(&req.model).await {
-                return crate::serve::api_error(StatusCode::SERVICE_UNAVAILABLE, e.to_string(), "server_error", None, None);
+    // The pipeline binds with the engine and leaves with it: an eviction between the residency
+    // check and the lookup sends the request around again.
+    let mut attempts = 0;
+    let (mux, bundle, pipeline) = loop {
+        if let Some(mgr) = state.manager_for(&req.model) {
+            if mgr.manages(&req.model) {
+                if let Err(e) = mgr.ensure_resident(&req.model).await {
+                    return crate::serve::api_error(StatusCode::SERVICE_UNAVAILABLE, e.to_string(), "server_error", None, None);
+                }
             }
         }
-    }
-    let (Some(mux), Ok(bundle)) = (state.mux(&req.model), state.registry.get(&req.model)) else {
-        return crate::serve::api_error(
-            StatusCode::NOT_FOUND,
-            format!("no model registered for '{}'.", req.model),
-            "invalid_request_error",
-            Some("model_not_found"),
-            Some("model".into()),
-        );
+        let (Some(mux), Ok(bundle)) = (state.mux(&req.model), state.registry.get(&req.model)) else {
+            attempts += 1;
+            if attempts < 3 && state.manager_for(&req.model).is_some_and(|m| m.manages(&req.model)) {
+                continue;
+            }
+            return crate::serve::api_error(
+                StatusCode::NOT_FOUND,
+                format!("no model registered for '{}'.", req.model),
+                "invalid_request_error",
+                Some("model_not_found"),
+                Some("model".into()),
+            );
+        };
+        let managed = state.manager_for(&req.model).is_some_and(|m| m.manages(&req.model));
+        match bound_pipeline(&bundle.dir) {
+            Some(pipeline) => break (mux, bundle, Some(pipeline)),
+            None if !managed => break (mux, bundle, None),
+            None => {
+                attempts += 1;
+                if attempts >= 3 {
+                    return crate::serve::api_error(StatusCode::SERVICE_UNAVAILABLE, "speech pipeline is switching; retry", "server_error", None, None);
+                }
+            }
+        }
     };
     let Some(in_flight) = ids.begin(&req.model) else {
         return crate::serve::api_error(StatusCode::CONFLICT, format!("request {} is already in flight in this session", ids.request), "invalid_request_error", Some("duplicate_request_id"), None);
@@ -361,15 +413,23 @@ async fn speech_with(
         true,
     );
     let ids = &RequestIds { turn_key: run.key(), ..ids.clone() };
-    match tokio::task::block_in_place(|| guided_model(&bundle.dir, state.downstream(&req.model))) {
-        Ok(Some(g)) => return speech_on_guided(g, mux, req, t_arrive, ids, in_flight, report, report_rx.take(), run).await,
-        Ok(None) => {}
-        Err(e) => return server_error(format!("speech pipeline: {e}")),
-    }
-    let model = match tokio::task::block_in_place(|| speech_model(&bundle.dir, state.downstream(&req.model))) {
-        Ok(Some(m)) => m,
-        Ok(None) => return bad(format!("model '{}' declares no speech pipeline", req.model), "model"),
-        Err(e) => return server_error(format!("speech pipeline: {e}")),
+    let model = match pipeline {
+        Some(Pipeline::Guided(g)) => return speech_on_guided(g, mux, req, t_arrive, ids, in_flight, report, report_rx.take(), run).await,
+        Some(Pipeline::Speech(m)) => m,
+        Some(Pipeline::None) => return bad(format!("model '{}' declares no speech pipeline", req.model), "model"),
+        // Unmanaged (single-model) serve: bind on first use.
+        None => {
+            match tokio::task::block_in_place(|| guided_model(&bundle.dir, state.downstream(&req.model))) {
+                Ok(Some(g)) => return speech_on_guided(g, mux, req, t_arrive, ids, in_flight, report, report_rx.take(), run).await,
+                Ok(None) => {}
+                Err(e) => return server_error(format!("speech pipeline: {e}")),
+            }
+            match tokio::task::block_in_place(|| speech_model(&bundle.dir, state.downstream(&req.model))) {
+                Ok(Some(m)) => m,
+                Ok(None) => return bad(format!("model '{}' declares no speech pipeline", req.model), "model"),
+                Err(e) => return server_error(format!("speech pipeline: {e}")),
+            }
+        }
     };
     let c = &model.contract;
     if req.input.trim().is_empty() {

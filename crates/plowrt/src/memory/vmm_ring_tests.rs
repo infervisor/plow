@@ -606,19 +606,22 @@ fn slot_granular_full_caches_commit_on_admission_only() {
     assert_eq!(committed(&ops), startup);
     assert_eq!(rings.stats().mapped_slots, 0);
 
-    // Recycled units: a retire keeps up to the cap, the next admission creates nothing.
+    // Recycled units: kept while any slot is mapped, trimmed to the idle cap when none is.
     rings.enable_handle_recycling(rings.slot_charge());
-    rings.ensure_slot(1).unwrap();
-    rings.ensure_slot(3).unwrap();
+    let creates = |ops: &Mock| ops.0.lock().unwrap().calls.iter().filter(|&&c| c == Call::Create).count();
+    for slot in [1, 3, 4] {
+        rings.ensure_slot(slot).unwrap();
+    }
     rings.release_slot(1);
     rings.release_slot(3);
-    assert_eq!(committed(&ops), startup + rings.slot_charge(), "one slot's units kept");
-    let creates = |ops: &Mock| ops.0.lock().unwrap().calls.iter().filter(|&&c| c == Call::Create).count();
+    assert_eq!(committed(&ops), startup + 3 * rings.slot_charge(), "busy rings keep every unit");
     let before = creates(&ops);
     rings.ensure_slot(6).unwrap();
-    assert_eq!(creates(&ops), before);
-    assert_eq!(rings.stats().resident_bytes, 128 + rings.slot_charge());
+    assert_eq!(creates(&ops), before, "a recycled slot creates nothing");
     rings.release_slot(6);
+    rings.release_slot(4);
+    assert_eq!(committed(&ops), startup + rings.slot_charge(), "idle rings keep the cap");
+    assert_eq!(rings.stats().resident_bytes, 128);
     drop(rings);
     ops.empty();
 }

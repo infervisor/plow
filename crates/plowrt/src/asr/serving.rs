@@ -28,7 +28,7 @@ mod realtime;
 #[cfg(feature = "cuda")]
 mod shared;
 #[cfg(feature = "cuda")]
-pub use shared::preload;
+pub use shared::{bind, preload, release};
 
 const BATCH_FORMATION_WINDOW: Duration = Duration::from_millis(5);
 
@@ -71,8 +71,13 @@ enum Backend {
 #[derive(Clone)]
 enum Route {
     Cohort(AsrMux),
+    /// The ingress taken at routing covers the first submission (an evicting drain waits for it).
     #[cfg(feature = "cuda")]
-    Shared(Arc<shared::SharedAsr>, crate::serve::mux::ModelMux),
+    Shared(
+        Arc<shared::SharedAsr>,
+        crate::serve::mux::ModelMux,
+        Arc<parking_lot::Mutex<Option<crate::serve::mux::OwnedIngress>>>,
+    ),
 }
 
 /// Encoder rows of a growing recording's completed attention windows, one entry per window, kept
@@ -100,6 +105,9 @@ pub(crate) struct AsrOpts {
     pub deltas: Option<mpsc::UnboundedSender<String>>,
     /// What the session's admission reused.
     pub report: Option<crate::serve::session::Report>,
+    /// Counts the request against its mux until the job is submitted (an evicting drain waits).
+    #[cfg(feature = "cuda")]
+    pub ingress: Option<crate::serve::mux::OwnedIngress>,
 }
 
 impl Route {
@@ -117,7 +125,11 @@ impl Route {
                 mux.submit_with(samples, language, context, cancel, opts.deltas, stream)
             }
             #[cfg(feature = "cuda")]
-            Route::Shared(asr, mux) => asr.submit(mux.clone(), samples, language, context, cancel, opts),
+            Route::Shared(asr, mux, routed) => {
+                let ingress = routed.lock().take().unwrap_or_else(|| mux.ingress_owned());
+                let opts = AsrOpts { ingress: Some(ingress), ..opts };
+                asr.submit(mux.clone(), samples, language, context, cancel, opts)
+            }
         }
     }
 
@@ -1245,6 +1257,7 @@ async fn stream(state: Arc<AsrServer>, mut socket: WebSocket, _permit: OwnedSema
         windows: (!final_pass).then(|| windows.clone()),
         deltas: None,
         report: None,
+        ..Default::default()
     };
     // Credit and limits count the client's samples; `samples` holds them resampled to 16 kHz.
     let rate = start.sample_rate as usize;
@@ -1564,6 +1577,7 @@ async fn continuous(
         windows,
         deltas,
         report: None,
+        ..Default::default()
     };
     let launch = |segment: &Segment| -> Result<Flight, SubmitError> {
         let mut samples = segment.samples.clone();

@@ -274,10 +274,15 @@ pub struct VmmRings {
     /// Decode and padded prefill rows write garbage into slots without a request; with this
     /// backing those writes land in shared scratch instead of forcing a real ring per idle row.
     idle: Vec<(u64, u64)>,
-    /// `(unit bytes, handle)` released units kept for the next commit, up to `spare_cap` bytes:
-    /// a fresh `cuMemCreate` pays the driver's page commit on the admission path.
+    /// `(unit bytes, handle)` released units kept for the next commit: a fresh `cuMemCreate`
+    /// pays the driver's page commit (~17 ms a 224 MiB slot) on the admission path. Unbounded
+    /// while any slot is mapped, trimmed to `spare_cap` bytes once none is.
     spare: Vec<(u64, u64)>,
     spare_cap: u64,
+    recycle: bool,
+    /// Released slots whose units stay mapped in place (recycling): readmitting the slot costs no
+    /// driver call, and another slot takes them over only when no spare unit is left.
+    parked: Vec<bool>,
 }
 
 impl VmmRings {
@@ -326,6 +331,8 @@ impl VmmRings {
             idle: Vec::new(),
             spare: Vec::new(),
             spare_cap: 0,
+            recycle: false,
+            parked: vec![false; batch],
         };
         for t in tensors {
             let logical_bytes = t.slot_bytes * batch as u64;
@@ -402,9 +409,37 @@ impl VmmRings {
         pinned + idle.iter().sum::<u64>()
     }
 
-    /// Keep up to `cap_bytes` of released units for reuse instead of returning them to the driver.
-    pub fn enable_handle_recycling(&mut self, cap_bytes: u64) {
-        self.spare_cap = cap_bytes;
+    /// Keep released units for reuse instead of returning them to the driver: all of them while
+    /// the rings serve any slot, `idle_cap_bytes` once they serve none.
+    pub fn enable_handle_recycling(&mut self, idle_cap_bytes: u64) {
+        self.recycle = true;
+        self.spare_cap = idle_cap_bytes;
+    }
+
+    /// Released units kept for reuse ([`Self::enable_handle_recycling`]), parked ones included.
+    pub fn spare_bytes(&self) -> u64 {
+        let parked = self.parked.iter().filter(|&&p| p).count() as u64;
+        self.spare.iter().map(|&(bytes, _)| bytes).sum::<u64>() + parked * self.slot_charge()
+    }
+
+    /// Hand a parked slot's units to the spare list, its rows back to idle scratch.
+    fn unpark(&mut self, slot: usize) {
+        self.parked[slot] = false;
+        self.for_slot_units(slot, |rings, window, unit| rings.release_unit(window, unit));
+    }
+
+    fn for_slot_units(&mut self, slot: usize, mut f: impl FnMut(&mut Self, usize, usize)) {
+        for i in 0..self.windows.len() {
+            if self.windows[i].pinned {
+                continue;
+            }
+            let (slot_bytes, map_bytes) = (self.windows[i].slot_bytes, self.windows[i].map_bytes);
+            let first = slot as u64 * slot_bytes / map_bytes;
+            let last = ((slot as u64 + 1) * slot_bytes).div_ceil(map_bytes);
+            for unit in first..last {
+                f(self, i, unit as usize);
+            }
+        }
     }
 
     /// Bytes one slot commits beyond the construction-time residency.
@@ -495,6 +530,15 @@ impl VmmRings {
         if self.mapped[slot] {
             return Ok(());
         }
+        if std::mem::take(&mut self.parked[slot]) {
+            self.mark_mapped(slot);
+            return Ok(());
+        }
+        if self.spare.is_empty() {
+            if let Some(parked) = self.parked.iter().rposition(|&p| p) {
+                self.unpark(parked);
+            }
+        }
         let mut touched = Vec::new();
         for i in 0..self.windows.len() {
             if self.windows[i].pinned {
@@ -520,36 +564,43 @@ impl VmmRings {
                 touched.push((i, unit));
             }
         }
+        self.mark_mapped(slot);
+        Ok(())
+    }
+
+    fn mark_mapped(&mut self, slot: usize) {
         self.mapped[slot] = true;
         while self.prefix < self.mapped.len() && self.mapped[self.prefix] {
             self.prefix += 1;
         }
         self.stats.mapped_slots += 1;
         self.stats.mapped_prefix = self.prefix;
-        Ok(())
     }
 
     pub fn release_slot(&mut self, slot: usize) {
         if slot >= self.mapped.len() || !self.mapped[slot] {
             return;
         }
-        for i in 0..self.windows.len() {
-            if self.windows[i].pinned {
-                continue;
-            }
-            let slot_bytes = self.windows[i].slot_bytes;
-            let map_bytes = self.windows[i].map_bytes;
-            let first = slot as u64 * slot_bytes / map_bytes;
-            let end = (slot as u64 + 1) * slot_bytes;
-            let last = end.div_ceil(map_bytes);
-            for unit in first..last {
-                self.release_unit(i, unit as usize);
-            }
+        if self.recycle {
+            self.parked[slot] = true;
+        } else {
+            self.for_slot_units(slot, |rings, window, unit| rings.release_unit(window, unit));
         }
         self.mapped[slot] = false;
         self.prefix = self.prefix.min(slot);
         self.stats.mapped_slots -= 1;
         self.stats.mapped_prefix = self.prefix;
+        if self.stats.mapped_slots == 0 {
+            for parked in 0..self.parked.len() {
+                if self.parked[parked] {
+                    self.unpark(parked);
+                }
+            }
+            while self.spare_bytes() > self.spare_cap {
+                let (_, handle) = self.spare.pop().expect("spare over cap");
+                self.ops.release(handle);
+            }
+        }
     }
 
     /// Release a slot with no request unless the latest launch covered it: the next launch at that
@@ -570,8 +621,7 @@ impl VmmRings {
         let handle = w.handles[unit].take().expect("referenced ring mapping");
         let bytes = w.map_bytes;
         self.ops.unmap(w.va + unit as u64 * bytes, bytes);
-        let spare: u64 = self.spare.iter().map(|&(b, _)| b).sum();
-        if spare + bytes <= self.spare_cap {
+        if self.recycle {
             self.spare.push((bytes, handle));
         } else {
             self.ops.release(handle);

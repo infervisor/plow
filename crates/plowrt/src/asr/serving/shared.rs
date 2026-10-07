@@ -348,10 +348,13 @@ impl SharedAsr {
                 speech: Some(Box::new(SpeechJob { overlay, overlay_pos, pos_base: None, cfg: None, first_tokens: 0 })),
             },
         };
+        // Released once the job is on the channel: the dispatcher drains it, not closes on it.
+        let ingress = opts.ingress.take();
         mux.submit_wait(job).await.map_err(|e| match e {
             crate::serve::mux::SubmitError::Full(_) => RuntimeError::Overloaded("ASR queue full".into()),
             crate::serve::mux::SubmitError::Closed(_) => RuntimeError::Unavailable("model dispatcher unavailable".into()),
         })?;
+        drop(ingress);
         let mut output = forced;
         let mut shown = 0usize;
         let submitted = arrived.elapsed();
@@ -485,6 +488,18 @@ pub(super) fn serves_audio(state: &AppState, slug: &str) -> bool {
     matches!(models().lock().get(&bundle.dir), Some(Some(_)))
 }
 
+/// Bind `slug`'s front-end now (a no-op for a model that is not an audio LM or is bound).
+pub fn bind(state: &AppState, slug: &str) -> Result<()> {
+    let bundle = state.registry.get(slug)?;
+    shared_asr(state, slug, &bundle.dir).map(drop)
+}
+
+/// Forget `dir`'s front-end: its encoder thread exits, freeing the encoder runtime, once the last
+/// request holding it ends.
+pub fn release(dir: &Path) {
+    models().lock().remove(dir);
+}
+
 /// Bind every resident audio LM's front-end now, so the first request does not pay the encoder
 /// load. A front-end that cannot load fails the serve at startup.
 pub fn preload(state: &AppState) -> Result<()> {
@@ -503,20 +518,42 @@ pub(super) async fn route(
     model: &str,
 ) -> std::result::Result<(Route, FinalizationPolicy), Response> {
     let slug = state.registry.resolve(model).unwrap_or_else(|| model.to_owned());
-    if let Some(mgr) = state.manager_for(&slug) {
-        if mgr.manages(&slug) {
-            if let Err(e) = mgr.ensure_resident(&slug).await {
+    let managed = state.manager_for(&slug).is_some_and(|m| m.manages(&slug));
+    // A managed model's front binds with its engine and leaves with it: an eviction between the
+    // residency check and the lookup sends the request around again.
+    let mut attempts = 0;
+    let (mux, bundle, bound, ingress) = loop {
+        if managed {
+            if let Err(e) = state.manager_for(&slug).expect("managed").ensure_resident(&slug).await {
                 return Err(failure(StatusCode::SERVICE_UNAVAILABLE, e));
             }
         }
-    }
-    let (Some(mux), Ok(bundle)) = (state.mux(&slug), state.registry.get(&slug)) else {
-        return Err(failure(StatusCode::NOT_FOUND, "unknown ASR model"));
+        attempts += 1;
+        let (Some(mux), Ok(bundle)) = (state.mux(&slug), state.registry.get(&slug)) else {
+            if managed && attempts < 3 {
+                continue;
+            }
+            return Err(failure(StatusCode::NOT_FOUND, "unknown ASR model"));
+        };
+        // Counted before the residency re-check: an eviction that removes the mux after this
+        // point drains with the request counted, so the request's submission is served.
+        let ingress = mux.ingress_owned();
+        let bound = models().lock().get(&bundle.dir).cloned().filter(|_| state.mux(&slug).is_some());
+        match bound {
+            None if managed && attempts < 3 => continue,
+            None if managed => return Err(failure(StatusCode::SERVICE_UNAVAILABLE, "ASR front is switching; retry")),
+            bound => break (mux, bundle, bound, ingress),
+        }
     };
-    match tokio::task::block_in_place(|| shared_asr(state, &slug, &bundle.dir)) {
+    let bound = match bound {
+        Some(bound) => Ok(bound),
+        None => tokio::task::block_in_place(|| shared_asr(state, &slug, &bundle.dir)),
+    };
+    match bound {
         Ok(Some(asr)) => {
             let finalization = asr.prompt.finalization_policy();
-            Ok((Route::Shared(asr, mux), finalization))
+            let ingress = Arc::new(parking_lot::Mutex::new(Some(ingress)));
+            Ok((Route::Shared(asr, mux, ingress), finalization))
         }
         Ok(None) => Err(failure(StatusCode::NOT_FOUND, "model declares no ASR pipeline")),
         Err(e) => Err(failure(StatusCode::INTERNAL_SERVER_ERROR, e)),

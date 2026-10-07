@@ -2315,12 +2315,17 @@ struct NvDenseNsplit {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum PackedAdmission {
     Pending,
-    Waiting(u64),
+    /// Out of device memory at this retire epoch, since this instant: retried on a retire, or
+    /// after [`KV_MEMORY_RETRY`] (another model may have freed memory).
+    Waiting(u64, std::time::Instant),
     /// Another slot is prefilling this prompt's shared prefix; admit once its checkpoint is
     /// published (`vmm_inflight_prefix`), or after [`INFLIGHT_WAIT_LIMIT`] regardless.
     WaitingPrefix(std::time::Instant),
     Ready,
 }
+
+/// A packed admission that ran out of device memory retries after this long.
+const KV_MEMORY_RETRY: std::time::Duration = std::time::Duration::from_millis(100);
 
 /// Longest a request waits on another slot's prefill before it prefills the shared rows
 /// itself — a safety valve; the owner's prompt-end publish or retirement releases it first.
@@ -2553,6 +2558,8 @@ pub struct GpuEngine {
     vmm_active: Vec<bool>,
     packed_admission: Vec<PackedAdmission>,
     kv_admission_epoch: u64,
+    /// Packed admissions that waited for device memory.
+    kv_pressure_events: u64,
     /// Per-slot token ids whose KV rows the slot currently holds (prompt,
     /// then every decode-fed token) — `seq_tokens[b].len() == pos[b]` when
     /// consistent. Lets `begin_slot` publish the finished sequence's
@@ -6561,6 +6568,7 @@ impl GpuEngine {
             vmm_active: vec![false; batch],
             packed_admission: vec![PackedAdmission::Pending; batch],
             kv_admission_epoch: 0,
+            kv_pressure_events: 0,
             seq_tokens: vec![Vec::new(); batch],
             stop_ids: std::sync::Arc::new(stop_ids),
             logits_raw: Vec::new(),
@@ -6939,8 +6947,27 @@ impl GpuEngine {
         self.kv_row_bytes
     }
 
+    /// With slot-granular live KV, re-derived from device memory now: the slots this engine holds
+    /// plus its recycled units plus the admission share of what is free (other models load and
+    /// leave). At least one slot, so a request never looks larger than the device.
     pub fn kv_admission(&self) -> Option<crate::sched::admission::KvBudget> {
-        self.kv_admission
+        let mut budget = self.kv_admission?;
+        let rings = self.vmm.as_ref().filter(|v| v.kv.is_none()).and_then(|v| v.rings.as_ref());
+        if let (Some(rings), Ok((free, total))) = (rings, self.be.mem_info()) {
+            let slot = rings.slot_charge();
+            let held = rings.stats().mapped_slots as u64 * slot + rings.spare_bytes();
+            budget.budget_bytes = held + RuntimeConfig::get().kv_admit_budget(free, total).max(slot);
+        }
+        Some(budget)
+    }
+
+    pub fn kv_pressure_events(&self) -> u64 {
+        self.kv_pressure_events
+    }
+
+    /// A slot could not begin for device memory and waits.
+    pub fn note_kv_pressure(&mut self) {
+        self.kv_pressure_events += 1;
     }
 
     /// Decode widths this loaded engine can execute, in ascending order.
@@ -7094,6 +7121,13 @@ impl GpuEngine {
         }
         self.pos[b] = 0;
         self.vmm_attached[b] = 0;
+        // A retired row decodes as an idle lane from position 0: a stale learned-position base
+        // above it traps `EmbedPosBf16` (`in.pos_base`, speech packets).
+        if let Some(base) = self.handle_of("in.pos_base").map(|i| self.devp[i].base + b as u64 * 4) {
+            if let Err(e) = self.be.memset_d8_async(base, 0, 4, &self.stream) {
+                tracing::warn!(slot = b, error = %e, "retire: pos_base reset failed");
+            }
+        }
         // Decode's backstop maps row zero before any inactive-row write.
         self.vmm.as_ref().unwrap().begin_seq(b);
         if let Some(rings) = self.vmm.as_mut().and_then(|v| v.rings.as_mut()) {
@@ -7122,12 +7156,15 @@ impl GpuEngine {
     ) -> Result<Option<usize>> {
         match self.packed_admission.get(b) {
             Some(PackedAdmission::Ready) => return Ok(Some(self.pos[b] as usize)),
-            Some(PackedAdmission::Waiting(epoch)) if *epoch == self.kv_admission_epoch => {
+            Some(PackedAdmission::Waiting(epoch, since))
+                if *epoch == self.kv_admission_epoch && since.elapsed() < KV_MEMORY_RETRY =>
+            {
                 return Ok(None);
             }
             Some(PackedAdmission::Pending)
                 if self.packed_admission.iter().any(|state| {
-                    matches!(state, PackedAdmission::Waiting(epoch) if *epoch != self.kv_admission_epoch)
+                    matches!(state, PackedAdmission::Waiting(epoch, since)
+                        if *epoch != self.kv_admission_epoch || since.elapsed() >= KV_MEMORY_RETRY)
                 }) =>
             {
                 // Retry older waiters before a new arrival takes released pages.
@@ -7207,15 +7244,19 @@ impl GpuEngine {
             Err(error) => {
                 self.retire_slot(b, false);
                 let oom = matches!(error, RuntimeError::Oom(_)) || error.device_code() == Some(2);
+                // Slot-granular KV waits even with no other request live: memory comes back
+                // from other models (retired slots, evictions), not only from this one.
                 let slot_kv = self.vmm.as_ref().is_some_and(|v| v.kv.is_none());
                 if (self.vmm_prefix_enabled() || slot_kv)
                     && oom
                     && !error.is_fatal()
-                    && self.packed_admission.contains(&PackedAdmission::Ready)
+                    && (slot_kv || self.packed_admission.contains(&PackedAdmission::Ready))
                 {
                     self.vmm.as_ref().unwrap().ensure_rows(b, 1)?;
-                    self.packed_admission[b] = PackedAdmission::Waiting(self.kv_admission_epoch);
-                    tracing::info!(slot = b, total, "gpu: packed KV admission waiting");
+                    self.kv_pressure_events += 1;
+                    self.packed_admission[b] =
+                        PackedAdmission::Waiting(self.kv_admission_epoch, std::time::Instant::now());
+                    tracing::debug!(slot = b, total, "gpu: packed KV admission waiting");
                     Ok(None)
                 } else {
                     Err(error)

@@ -68,6 +68,33 @@ use crate::{Result, RuntimeError};
 /// Planner headroom kept free on top of a model's requirement (driver slack,
 /// transient staging).
 pub const RESERVE: u64 = 256 << 20;
+
+/// Run a switch's blocking step on a thread of its own: the blocking pool can be saturated by
+/// the very request load that needs this switch to finish.
+async fn on_own_thread<T: Send + 'static>(name: &str, f: impl FnOnce() -> T + Send + 'static) -> Result<T> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    std::thread::Builder::new()
+        .name(name.into())
+        .spawn(move || {
+            let _ = tx.send(f());
+        })
+        .map_err(|e| RuntimeError::Msg(format!("{name} thread: {e}")))?;
+    rx.await.map_err(|_| RuntimeError::Msg(format!("{name} thread panicked")))
+}
+
+/// A load or bind that failed for device memory, however the layer below spelled it.
+fn is_oom(e: &RuntimeError) -> bool {
+    matches!(e, RuntimeError::Oom(_))
+        || e.device_code() == Some(2)
+        || e.to_string().contains("OUT_OF_MEMORY")
+}
+
+/// A model that received a request this recently is not idle.
+const IDLE_GRACE: Duration = Duration::from_secs(2);
+
+/// How long an eviction waits for the evicted model's sibling packet runtimes to free.
+const SIDECAR_RELEASE_WAIT: Duration = Duration::from_secs(60);
+
 /// Non-tensor overhead assumed before the first load measures the real value.
 pub const DEFAULT_OVERHEAD: u64 = 512 << 20;
 
@@ -471,6 +498,11 @@ pub struct ModelManager {
     budget: Option<u64>,
     /// Last completed switch (None until the first one).
     pub last_switch: Mutex<Option<SwitchReport>>,
+    /// A growth eviction ([`Self::request_growth`]) is in flight.
+    growing: std::sync::atomic::AtomicBool,
+    /// The server runtime. A dispatcher asking for growth runs its own executor on a busy
+    /// thread, where a task spawned locally would wait for the load to stop.
+    runtime: Option<tokio::runtime::Handle>,
 }
 
 impl ModelManager {
@@ -528,6 +560,8 @@ impl ModelManager {
             overhead: Mutex::new(FxHashMap::default()),
             budget,
             last_switch: Mutex::new(None),
+            growing: std::sync::atomic::AtomicBool::new(false),
+            runtime: tokio::runtime::Handle::try_current().ok(),
         })
     }
 
@@ -643,6 +677,72 @@ impl ModelManager {
         Some(m.plan.tensor_total() + ovh)
     }
 
+    /// Least-recently-used resident model other than `target`, idle ones first.
+    fn lru_victim(&self, target: &str) -> Option<String> {
+        let victims: Vec<String> = self
+            .models
+            .read()
+            .iter()
+            .filter(|v| v.slug != target && self.is_resident(&v.slug))
+            .map(|v| v.slug.clone())
+            .collect();
+        let idle: Vec<String> = victims.iter().filter(|v| self.is_idle(v)).cloned().collect();
+        let last_use = self.last_use.lock();
+        pick_victim(&idle, &last_use).or_else(|| pick_victim(&victims, &last_use))
+    }
+
+    /// No request queued, tokenizing, in an engine slot or in a downstream stage, and none
+    /// arrived for [`IDLE_GRACE`] (an ASR request encodes before it reaches the mux).
+    fn is_idle(&self, slug: &str) -> bool {
+        let Some(state) = self.state.upgrade() else { return false };
+        let recent = self.last_use.lock().get(slug).is_some_and(|t| t.elapsed() < IDLE_GRACE);
+        !recent
+            && state.mux(slug).is_none_or(|m| !m.in_flight())
+            && state.downstream(slug).pending() == 0
+    }
+
+    /// `slug` is short of device memory for its KV: evict one idle resident model (never one
+    /// with work in flight) so it can grow toward its full ladder. Coalesced: one at a time, and
+    /// skipped while a switch holds the lock (that switch changes residency anyway).
+    pub fn request_growth(self: &Arc<Self>, slug: &str) {
+        use std::sync::atomic::Ordering;
+        if self.growing.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let Some(runtime) = self.runtime.clone() else {
+            self.growing.store(false, Ordering::Release);
+            return;
+        };
+        let mgr = Arc::clone(self);
+        let slug = slug.to_string();
+        runtime.spawn(async move {
+            let Ok(_g) = mgr.switch.try_lock() else {
+                tracing::debug!(%slug, "planner: growth skipped — a switch is in progress");
+                mgr.growing.store(false, Ordering::Release);
+                return;
+            };
+            let idle: Vec<String> = mgr
+                .models
+                .read()
+                .iter()
+                .filter(|v| v.slug != slug && mgr.is_serving(&v.slug))
+                .map(|v| v.slug.clone())
+                .filter(|v| mgr.is_idle(v))
+                .collect();
+            let victim = pick_victim(&idle, &mgr.last_use.lock());
+            match victim {
+                Some(victim) => {
+                    tracing::info!(%slug, %victim, "planner: evicting an idle model so a busy one can grow");
+                    if let Err(e) = mgr.evict(&victim, Stop::Graceful).await {
+                        tracing::warn!(%victim, error = %e, "planner: growth eviction failed");
+                    }
+                }
+                None => tracing::debug!(%slug, "planner: growth found no idle model to evict"),
+            }
+            mgr.growing.store(false, Ordering::Release);
+        });
+    }
+
     fn touch(&self, slug: &str) {
         self.last_use
             .lock()
@@ -659,10 +759,38 @@ impl ModelManager {
         })
     }
 
+    /// Bytes a load may plan on: free VRAM plus `credit` (reusable pooled chunks), but never
+    /// what resident models are planned to still commit (live KV slots, KV pools).
+    fn fit_capacity(&self, credit: u64) -> Result<u64> {
+        Ok((self.free_vram()? + credit).min(self.planned_headroom()?))
+    }
+
+    /// The device (or budget) less every resident model's planned requirement.
+    fn planned_headroom(&self) -> Result<u64> {
+        let (_, total) = self.be.mem_info()?;
+        let cap = self.budget.map_or(total, |b| b.min(total));
+        let overhead = self.overhead.lock();
+        let planned: u64 = self
+            .models
+            .read()
+            .iter()
+            .filter(|m| self.is_resident(&m.slug))
+            .map(|m| m.plan.tensor_total() + overhead.get(&m.slug).copied().unwrap_or(DEFAULT_OVERHEAD))
+            .sum();
+        Ok(cap.saturating_sub(planned))
+    }
+
     fn state(&self) -> std::result::Result<Arc<AppState>, EnsureError> {
         self.state
             .upgrade()
             .ok_or_else(|| EnsureError::Load(RuntimeError::Msg("server shutting down".into())))
+    }
+
+    /// Serving = resident with its mux installed (not mid-eviction).
+    fn is_serving(&self, slug: &str) -> bool {
+        self.state
+            .upgrade()
+            .is_some_and(|s| s.has_gpu_engine(slug) && s.mux(slug).is_some())
     }
 
     /// Resident = engine installed.
@@ -677,11 +805,9 @@ impl ModelManager {
     /// fit (no eviction — earlier models win). At least one model must load.
     pub async fn load_initial(&self) -> Result<()> {
         let mut loaded = 0usize;
-        // Sibling packets of the models loaded so far bind after startup (speech preload).
-        let mut unbound = 0u64;
         for m in self.models.read().clone() {
-            let need = self.required(&m.slug).expect("managed") + RESERVE + unbound;
-            let free = self.free_vram()?;
+            let need = self.required(&m.slug).expect("managed") + RESERVE;
+            let free = self.fit_capacity(0)?;
             if free < need {
                 tracing::info!(
                     slug = %m.slug,
@@ -694,7 +820,6 @@ impl ModelManager {
             self.load_model(&m)
                 .await
                 .map_err(|e| RuntimeError::Msg(format!("{}: {e}", m.slug)))?;
-            unbound += m.plan.sidecar_bytes;
             loaded += 1;
         }
         if loaded == 0 && !self.models.read().is_empty() {
@@ -721,7 +846,7 @@ impl ModelManager {
         // belongs here too — mid-unload a model is briefly still resident, and
         // admitting then would hand the request a mux that is about to vanish.
         let state = self.state()?;
-        if self.is_resident(slug) && state.residency(slug).admits() {
+        if self.is_serving(slug) && state.residency(slug).admits() {
             self.touch(slug);
             return Ok(());
         }
@@ -773,44 +898,54 @@ impl ModelManager {
         // 24 GiB target's cap left 5.7 GiB dead).
         let reusable_cap = m.plan.slab_reusable();
         loop {
-            let trimmed = VmmOps::pool_trim(&*self.be, reusable_cap);
-            if trimmed > 0 {
-                tracing::info!(
-                    trimmed_mib = trimmed >> 20,
-                    "planner: released pooled chunks the target cannot reuse"
-                );
+            loop {
+                let trimmed = VmmOps::pool_trim(&*self.be, reusable_cap);
+                if trimmed > 0 {
+                    tracing::info!(
+                        trimmed_mib = trimmed >> 20,
+                        "planner: released pooled chunks the target cannot reuse"
+                    );
+                }
+                let avail = self
+                    .fit_capacity(VmmOps::pool_bytes(&*self.be))
+                    .map_err(EnsureError::Load)?;
+                if avail >= need {
+                    break;
+                }
+                let Some(victim) = self.lru_victim(slug) else {
+                    tracing::warn!(
+                        %slug,
+                        need_gib = gib(need),
+                        free_gib = gib(avail),
+                        "planner: switch cannot fit — shedding"
+                    );
+                    return Err(EnsureError::WontFit { need, free: avail });
+                };
+                let (drain_ms, unload_ms) = self.evict(&victim, Stop::Graceful).await?;
+                report.evicted.push((victim, drain_ms, unload_ms));
             }
-            let free = self.free_vram().map_err(EnsureError::Load)?;
-            let credit = VmmOps::pool_bytes(&*self.be);
-            if free + credit >= need {
-                break;
-            }
-            let victims: Vec<String> = self
-                .models
-                .read()
-                .iter()
-                .filter(|v| v.slug != slug && self.is_resident(&v.slug))
-                .map(|v| v.slug.clone())
-                .collect();
-            let Some(victim) = pick_victim(&victims, &self.last_use.lock()) else {
-                tracing::warn!(
-                    %slug,
-                    need_gib = gib(need),
-                    free_gib = gib(free + credit),
-                    "planner: switch cannot fit — shedding"
-                );
-                return Err(EnsureError::WontFit {
-                    need,
-                    free: free + credit,
-                });
-            };
-            let (drain_ms, unload_ms) = self.evict(&victim, Stop::Graceful).await?;
-            report.evicted.push((victim, drain_ms, unload_ms));
-        }
 
-        let t0 = Instant::now();
-        self.load_model(&m).await?;
-        report.load_ms = ms(t0);
+            let t0 = Instant::now();
+            match self.load_model(&m).await {
+                Ok(()) => {
+                    report.load_ms = ms(t0);
+                    break;
+                }
+                // The plan fit but the device did not (an under-counted footprint): evict one more
+                // resident and retry, and shed only when nothing is left to evict.
+                Err(EnsureError::Load(e)) if is_oom(&e) => {
+                    let Some(victim) = self.lru_victim(slug) else {
+                        tracing::warn!(%slug, error = %e, "planner: switch load out of memory — shedding");
+                        let free = self.free_vram().map_err(EnsureError::Load)?;
+                        return Err(EnsureError::WontFit { need, free });
+                    };
+                    tracing::warn!(%slug, %victim, error = %e, "planner: switch load out of memory — evicting");
+                    let (drain_ms, unload_ms) = self.evict(&victim, Stop::Graceful).await?;
+                    report.evicted.push((victim, drain_ms, unload_ms));
+                }
+                Err(e) => return Err(e),
+            }
+        }
         let (free, total) = self.be.mem_info().map_err(EnsureError::Load)?;
         report.vram_used = total - free;
         tracing::info!(
@@ -951,13 +1086,11 @@ impl ModelManager {
         // Same accounting as the switch path: chunks the incoming slab cannot
         // consume have to be real free memory before the load.
         VmmOps::pool_trim(&*self.be, m.plan.slab_reusable());
-        let free = self.free_vram().map_err(EnsureError::Load)?;
-        let credit = VmmOps::pool_bytes(&*self.be);
-        if free + credit < need {
-            return Err(EnsureError::WontFit {
-                need,
-                free: free + credit,
-            });
+        let avail = self
+            .fit_capacity(VmmOps::pool_bytes(&*self.be))
+            .map_err(EnsureError::Load)?;
+        if avail < need {
+            return Err(EnsureError::WontFit { need, free: avail });
         }
         let t0 = Instant::now();
         self.load_model(&m).await?;
@@ -1002,8 +1135,8 @@ impl ModelManager {
     /// Hottest (most-recently-requested) non-resident model whose requirement
     /// fits free VRAM plus usable pooled chunks — no eviction considered.
     fn preload_candidate(&self) -> Option<String> {
-        let free = self.free_vram().ok()?;
         let pool = VmmOps::pool_bytes(&*self.be);
+        let (free, headroom) = (self.free_vram().ok()?, self.planned_headroom().ok()?);
         let state = self.state.upgrade()?;
         let last_use = self.last_use.lock();
         self.models
@@ -1014,7 +1147,7 @@ impl ModelManager {
             .filter(|m| state.residency(&m.slug).admits())
             .filter(|m| {
                 let credit = pool.min(m.plan.slab_reusable());
-                self.required(&m.slug).expect("managed") + RESERVE <= free + credit
+                self.required(&m.slug).expect("managed") + RESERVE <= (free + credit).min(headroom)
             })
             .max_by_key(|m| last_use.get(&m.slug).copied())
             .map(|m| m.slug.clone())
@@ -1068,12 +1201,26 @@ impl ModelManager {
                 tracing::error!(%slug, holders, "engine still referenced at evict — VRAM leak");
             }
         }
-        tokio::task::spawn_blocking(move || drop(engine))
+        on_own_thread("plow-unload", move || drop(engine))
             .await
-            .map_err(|e| EnsureError::Load(RuntimeError::Msg(format!("unload task: {e}"))))?;
+            .map_err(EnsureError::Load)?;
+        let engine_ms = ms(t1);
+        if let Ok(bundle) = state.registry.get(slug) {
+            crate::asr::serving::release(&bundle.dir);
+            crate::tts::serving::release(&bundle.dir);
+            // Their worker threads drop the packet runtimes once the last request lets go.
+            let deadline = Instant::now() + SIDECAR_RELEASE_WAIT;
+            while crate::exec::gpu::packet_exec::resident_in(&bundle.dir) {
+                if Instant::now() > deadline {
+                    tracing::error!(%slug, "sibling packets still resident after evict — VRAM leak");
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }
         let unload_ms = ms(t1);
         let (free, _) = self.be.mem_info().map_err(EnsureError::Load)?;
-        tracing::info!(%slug, drain_ms, unload_ms, free_gib = gib(free), "model evicted");
+        tracing::info!(%slug, drain_ms, unload_ms, engine_ms, free_gib = gib(free), "model evicted");
         Ok((drain_ms, unload_ms))
     }
 
@@ -1124,9 +1271,9 @@ impl ModelManager {
         let be = Arc::clone(&self.be);
         let (dir, ckpt) = (m.dir.clone(), m.ckpt.clone());
         let engine =
-            tokio::task::spawn_blocking(move || crate::exec::gpu::GpuEngine::load(be, &dir, &ckpt))
+            on_own_thread("plow-load", move || crate::exec::gpu::GpuEngine::load(be, &dir, &ckpt))
                 .await
-                .map_err(|e| EnsureError::Load(RuntimeError::Msg(format!("load task: {e}"))))?
+                .and_then(|engine| engine)
                 .map_err(EnsureError::Load)?;
         mux::check_speech_packet(&engine).map_err(EnsureError::Load)?;
         let (free_after, _) = self.be.mem_info().map_err(EnsureError::Load)?;
@@ -1157,6 +1304,21 @@ impl ModelManager {
             m.slug.clone(),
             crate::serve::engine::ServeEngine::Cuda(engine),
         );
+        // Sibling packets (ASR encoder, codec, vocoder) bind with the engine and before its mux,
+        // so residency and the planner's charge cover them, a request never binds them itself,
+        // and an eviction frees them.
+        let bind_state = Arc::clone(&state);
+        let slug = m.slug.clone();
+        let bound = on_own_thread("plow-bind", move || -> Result<()> {
+            crate::asr::serving::bind(&bind_state, &slug)?;
+            crate::tts::serving::bind(&bind_state, &slug).map_err(RuntimeError::Msg)
+        })
+        .await
+        .and_then(|bound| bound);
+        if let Err(e) = bound {
+            let _ = self.evict(&m.slug, Stop::Now).await;
+            return Err(EnsureError::Load(e));
+        }
         let mux = mux::spawn(m.slug.clone(), bundle, Arc::clone(&state), self.mux_cfg);
         state.install_mux(m.slug.clone(), mux);
         Ok(())

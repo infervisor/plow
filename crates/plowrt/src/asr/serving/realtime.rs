@@ -611,6 +611,7 @@ fn launch(
         windows: None,
         deltas: Some(tx),
         report: None,
+        ..Default::default()
     };
     let work = route.submit(samples, config.language.clone(), config.prompt.clone(), cancel.0.clone(), opts)?;
     Ok(Flight {

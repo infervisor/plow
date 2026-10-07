@@ -310,6 +310,16 @@ thread_local! {
 
 static NEXT_CONTEXT_ID: AtomicU64 = AtomicU64::new(1);
 
+/// A context synchronize waits on every stream, so one issued while another thread captures a
+/// graph fails both (`CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED`) — e.g. a speech pipeline binding
+/// its graphs during a model switch while resident models serve. Captures hold it exclusively.
+static CAPTURE_EXCLUSION: parking_lot::RwLock<()> = parking_lot::const_rwlock(());
+
+thread_local! {
+    /// This thread holds [`CAPTURE_EXCLUSION`] for a capture (its own synchronize fails, not blocks).
+    static CAPTURING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 // Cache the retained lifetime, not a driver handle that can be recycled on
 // another thread. Every context mutation must update this cache.
 unsafe fn bind_context(api: &Api, ctx: usize, id: u64) -> CUresult {
@@ -1458,14 +1468,18 @@ impl CudaBackend {
         enqueue: impl FnOnce() -> Result<()>,
     ) -> Result<GraphExec> {
         self.bind()?;
+        let exclusive = CAPTURE_EXCLUSION.write();
+        CAPTURING.set(true);
         // Thread-local capture; callers enqueue only immutable same-stream operations.
-        self.check(
+        let begun = self.check(
             unsafe { (self.api.cuStreamBeginCapture)(stream.raw as CUstream, 1) },
             "cuStreamBeginCapture",
-        )?;
-        let result = enqueue();
+        );
+        let result = begun.and_then(|()| enqueue());
         let mut graph = std::ptr::null_mut();
         let ended = unsafe { (self.api.cuStreamEndCapture)(stream.raw as CUstream, &mut graph) };
+        CAPTURING.set(false);
+        drop(exclusive);
         if let Err(e) = result {
             if !graph.is_null() {
                 unsafe {
@@ -1629,6 +1643,7 @@ impl CudaBackend {
     /// load/unload and error-path quiesce.
     pub fn synchronize(&self) -> Result<()> {
         self.bind()?;
+        let _shared = (!CAPTURING.get()).then(|| CAPTURE_EXCLUSION.read());
         // SAFETY: no arguments.
         self.check(unsafe { (self.api.cuCtxSynchronize)() }, "cuCtxSynchronize")
     }

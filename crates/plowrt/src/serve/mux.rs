@@ -404,6 +404,10 @@ fn turn_job_due(
     stage_due(stage, t, e, stage_cost(stage, prefill, tick, e), since)
 }
 
+/// How often a dispatcher re-reads its engine's KV admission budget from device memory.
+#[cfg(feature = "cuda")]
+const KV_BUDGET_REFRESH: std::time::Duration = std::time::Duration::from_millis(50);
+
 /// How long a consumer that stopped reading may hold its slot parked before the request is cut.
 const PARK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
@@ -478,6 +482,16 @@ pub struct ModelMux {
 
 /// Holds one count in [`ModelMux::ingress`] until dropped.
 pub struct IngressGuard<'a>(&'a std::sync::atomic::AtomicUsize);
+
+/// [`IngressGuard`] that outlives the borrow: a request that works before it submits (an ASR
+/// encode) holds it, so a draining dispatcher waits for its job instead of closing on it.
+pub struct OwnedIngress(Arc<std::sync::atomic::AtomicUsize>);
+
+impl Drop for OwnedIngress {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
 
 impl Drop for IngressGuard<'_> {
     fn drop(&mut self) {
@@ -575,6 +589,18 @@ fn completed_decode(feeds: &[(usize, u32)], steps: usize) -> Option<DecodeProgre
 }
 
 impl ModelMux {
+    /// Whether any request is queued, tokenizing or holding an engine slot.
+    pub fn in_flight(&self) -> bool {
+        self.ingress.load(Ordering::Relaxed) > 0
+            || self.metrics.queued_requests.load(Ordering::Relaxed) > 0
+            || self.metrics.slots_active.load(Ordering::Relaxed) > 0
+    }
+
+    pub fn ingress_owned(&self) -> OwnedIngress {
+        self.ingress.fetch_add(1, Ordering::Relaxed);
+        OwnedIngress(Arc::clone(&self.ingress))
+    }
+
     /// Count a request as pending before it tokenizes; hand the guard to `submit_arrived`.
     pub fn ingress(&self) -> IngressGuard<'_> {
         self.ingress.fetch_add(1, Ordering::Relaxed);
@@ -860,7 +886,7 @@ pub fn spawn(
     // a 55.59 GiB budget, and the overcommit arrived as an async queue fault instead of as
     // backpressure. `None` keeps slot-count admission for every engine without a budget.
     #[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu"))]
-    let kv_budget = state
+    let mut kv_budget = state
         .gpu_engine(&slug)
         .and_then(|e| e.lock().kv_admission_budget());
     #[cfg(not(any(feature = "cuda", feature = "hsa", feature = "cpu")))]
@@ -1014,6 +1040,9 @@ pub fn spawn(
         let engine_thread = (has_gpu && !inline_tick)
             .then(|| crate::exec::engine_thread::EngineThread::spawn(format!("plow-eng-{slug}")));
         let token_group = bundle.decode_token_group();
+        #[cfg(feature = "cuda")]
+        let (mut kv_refreshed, mut kv_pressure_seen) = (Instant::now(), (0u64, 0u64));
+        let (mut preempted, mut late_drains) = (false, Vec::new());
 
         loop {
             // Preempt ([`ModelMux::preempt`]): kill every live slot NOW.
@@ -1034,14 +1063,51 @@ pub fn spawn(
                     )));
                 }
                 draining = true;
+                preempted = true;
             }
             let live = slots.iter().filter(|s| s.is_some()).count();
+            metrics.slots_active.store(live as u64, Ordering::Relaxed);
+            // The budget follows device memory (other models load, grow and leave); memory
+            // pressure asks the planner to evict an idle co-tenant so this model can grow.
+            #[cfg(feature = "cuda")]
+            if kv_budget.is_some() && kv_refreshed.elapsed() >= KV_BUDGET_REFRESH {
+                kv_refreshed = Instant::now();
+                let pressure = state.gpu_engine(&slug).map(|e| {
+                    let e = e.lock();
+                    kv_budget = e.kv_admission_budget().or(kv_budget);
+                    e.kv_pressure_events()
+                });
+                let seen = (metrics.kv_budget_denials.load(Ordering::Relaxed), pressure.unwrap_or(0));
+                if seen != kv_pressure_seen {
+                    kv_pressure_seen = seen;
+                    tracing::debug!(%slug, denials = seen.0, oom_waits = seen.1, "mux: KV memory short — asking to grow");
+                    if let Some(mgr) = state.manager_for(&slug) {
+                        mgr.request_growth(&slug);
+                    }
+                }
+            }
 
             // Drain completion: if draining and no in-flight slots remain,
-            // signal the drain future and exit the dispatcher loop.
-            if draining && live == 0 && waiting.is_empty() {
+            // signal the drain future and exit the dispatcher loop. A request past model lookup
+            // (`ingress`) still submits here: closing on it would fail it.
+            let drained = draining && live == 0 && waiting.is_empty() && ingress_seen.load(Ordering::Relaxed) == 0;
+            // A graceful drain serves what was submitted before the mux left the routing table,
+            // however late its job reached the channel.
+            if drained && !preempted {
+                while let Ok(msg) = rx.try_recv() {
+                    note_dequeued(&msg, &metrics);
+                    match msg {
+                        MuxMsg::Drain(done) => late_drains.push(done),
+                        MuxMsg::Job(job, arrived) => {
+                            Metrics::inc(&metrics.queued_requests);
+                            waiting.push_back((job, arrived));
+                        }
+                    }
+                }
+            }
+            if drained && waiting.is_empty() {
                 turn.release();
-                if let Some(done) = drain_done.take() {
+                for done in drain_done.take().into_iter().chain(late_drains.drain(..)) {
                     let _ = done.send(());
                 }
                 // A preempt's completion oneshot rides a Drain message that
@@ -1102,11 +1168,14 @@ pub fn spawn(
                             waiting.push_back(j);
                         }
                     }
+                    // No in-flight work: the drain check at the loop top finishes, after serving
+                    // any request that was past model lookup when the drain began.
                     MuxMsg::Drain(done) => {
-                        // No in-flight work; signal immediately.
-                        let _ = done.send(());
-                        reject_pending_after_drain(&mut rx, &metrics);
-                        break;
+                        draining = true;
+                        match drain_done {
+                            None => drain_done = Some(done),
+                            Some(_) => late_drains.push(done),
+                        }
                     }
                 }
             }
@@ -1764,25 +1833,6 @@ fn note_dequeued(msg: &MuxMsg, metrics: &Metrics) {
     }
 }
 
-fn reject_pending_after_drain(rx: &mut mpsc::Receiver<MuxMsg>, metrics: &Metrics) {
-    while let Ok(msg) = rx.try_recv() {
-        note_dequeued(&msg, metrics);
-        match msg {
-            MuxMsg::Drain(done) => {
-                let _ = done.send(());
-            }
-            MuxMsg::Job(job, _) => {
-                Metrics::inc(&metrics.rejected);
-                let _ = job
-                    .respond
-                    .try_send(StreamChunk::Err(crate::RuntimeError::Rejected(
-                        "model is draining — retry".into(),
-                    )));
-            }
-        }
-    }
-}
-
 fn note_arrival(now: Instant, load: &mut LoadEstimator, metrics: &Metrics) {
     if packlog::on() {
         if let Some(gap) = load.lambda.since_last(now) {
@@ -2179,6 +2229,7 @@ fn admit_session(
             // backpressure mechanism.
             if denied.is_retryable() {
                 if let Denied::KvBudgetFull { want } = denied {
+                    Metrics::inc(&metrics.kv_budget_denials);
                     tracing::debug!(
                         want,
                         max_rows = kv_budget.map(|b| b.max_rows()).unwrap_or(0),
@@ -5477,7 +5528,26 @@ fn gpu_prefill_advance(
     let total = slot.prompt_ids.len() + slot.gen.max_tokens.max(1);
     if slot.pf_pos == 0 {
         let resume = slot.resume > 0 && slot.cfg.is_none() && e.resume_slot(slot_idx, slot.resume);
-        e.begin_slot(slot_idx, total)?;
+        // A CFG pair's partner begins with its owner, so memory for both is there or neither.
+        let partner = (slot.cfg.is_some() && slot.speech.as_ref().is_some_and(|sp| sp.cfg.is_some()))
+            .then_some(slot_idx + 1);
+        let begun = e
+            .begin_slot(slot_idx, total)
+            .and_then(|()| partner.map_or(Ok(()), |p| e.begin_slot(p, total)));
+        if let Err(err) = begun {
+            // Out of device memory for live KV: wait (the prompt stays at row 0), and ask the
+            // planner for room instead of failing the request.
+            let short = matches!(err, crate::RuntimeError::Oom(_)) || err.device_code() == Some(2);
+            if !short || err.is_fatal() {
+                return Err(err);
+            }
+            e.retire_slot(slot_idx, false);
+            if let Some(p) = partner {
+                e.retire_slot(p, false);
+            }
+            e.note_kv_pressure();
+            return Ok(None);
+        }
         if resume {
             slot.pf_pos = slot.resume;
             slot.cached_tokens = slot.resume;
@@ -5491,7 +5561,6 @@ fn gpu_prefill_advance(
         // first, its last-row logits stashed before the owner's prefill overwrites row 0.
         if let (0, Some(cfg), Some(run)) = (slot.pf_pos, sp.cfg.as_ref(), slot.cfg.as_mut()) {
             let partner = slot_idx + 1;
-            e.begin_slot(partner, total)?;
             let mut c0 = 0;
             loop {
                 gpu_speech_prefill_inputs(e, partner, c0, &cfg.uncond_overlay, &sp.overlay_pos, sp.pos_base)?;
@@ -6859,34 +6928,6 @@ mod tests {
             Err(SubmitError::Closed(_))
         ));
         assert_eq!(metrics.queued_requests.load(Ordering::Relaxed), 0);
-    }
-
-    #[test]
-    fn idle_drain_rejects_pending_jobs_and_answers_followup_drains() {
-        let metrics = Metrics::default();
-        let (tx, mut rx) = mpsc::channel(4);
-        let (respond, mut chunks) = crate::serve::stream::channel();
-        let job = Job {
-            prompt_ids: vec![1],
-            gen: GenParams::default(),
-            arrived: Instant::now(),
-            respond,
-            opts: Default::default(),
-        };
-        metrics.queued_requests.store(1, Ordering::Relaxed);
-        assert!(tx.try_send(MuxMsg::Job(job, Instant::now())).is_ok());
-        let (done, mut done_rx) = tokio::sync::oneshot::channel();
-        assert!(tx.try_send(MuxMsg::Drain(done)).is_ok());
-
-        reject_pending_after_drain(&mut rx, &metrics);
-
-        assert_eq!(metrics.queued_requests.load(Ordering::Relaxed), 0);
-        assert_eq!(metrics.rejected.load(Ordering::Relaxed), 1);
-        assert!(matches!(
-            chunks.try_recv(),
-            Ok(StreamChunk::Err(crate::RuntimeError::Rejected(_)))
-        ));
-        assert!(matches!(done_rx.try_recv(), Ok(())));
     }
 
     #[test]
