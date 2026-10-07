@@ -68,8 +68,8 @@ struct Cli {
     #[arg(long, value_name = "BUILD_JSON")]
     replay_knobs: Option<PathBuf>,
 
-    /// GPU spec name or short alias (e.g. `rtx6000pro`, `h100`, `mi350`).
-    /// Run with `--list-gpus` to see all recognized names.
+    /// GPU spec name or short alias (e.g. `rtx6000pro`, `h100`, `mi350`), or a CPU part for the
+    /// plowrt CPU engine (`xeon6975p`). Run with `--list-gpus` to see all recognized names.
     #[arg(long, default_value = "H100 SXM5")]
     gpu: String,
 
@@ -128,7 +128,8 @@ struct Cli {
     emit: Option<EmitKind>,
 
     /// devblob only: target ISA recorded in `build.json` (`sm_120a`, `sm_90a`,
-    /// `gfx950`, …), and the arch `--emit devblob+cubin` builds for.
+    /// `gfx950`, `amx`/`avx512` for the CPU engine, …), and the arch `--emit devblob+cubin`
+    /// builds for.
     ///
     /// METADATA for the packet itself — it does not change a single emitted byte.
     /// The manifest names opcodes, shapes and rules; mapping those to a
@@ -804,6 +805,20 @@ fn main() -> ExitCode {
         if spec.vendor == hwspec::Vendor::Apple && cli.arch == "sm_120a" {
             cli.arch = hwspec::IsaLevel::Metal3.arch_flag().to_string();
         }
+        // A CPU part runs the NVIDIA-format packet on the CPU engine; name the host ISA instead.
+        if spec.vendor == hwspec::Vendor::Intel && cli.arch == "sm_120a" {
+            cli.arch = hwspec::IsaLevel::from_spec(spec)
+                .unwrap_or(hwspec::IsaLevel::Amx)
+                .arch_flag()
+                .to_string();
+        }
+    }
+    let cpu_target = devgen::target_is_cpu(&cli.arch, &cli.gpu);
+    // The CPU flash-decode kernels need FLASH_MERGE; the NVIDIA hd256/512 decode merge-fold
+    // removes it and the CPU loader refuses the packet. Off by default for CPU targets.
+    if cpu_target && matches.value_source("nv_fa_fold_wide") == Some(clap::parser::ValueSource::DefaultValue) {
+        cli.emit_cfg.nv_fa_fold_wide = false;
+        devgen::emit_config::note_production_default("nv_fa_fold_wide", "false".into());
     }
 
     // DEFAULT ON FOR sm_120. The persistent sm_120 interpreter runs every op in one cooperative
@@ -816,6 +831,7 @@ fn main() -> ExitCode {
     // Opt out with PLOW_UNISEG=0.
     cli.emit_cfg.uniseg = effective_uniseg(
         &cli.arch,
+        cpu_target,
         cli.emit_cfg.uniseg,
         cli.segmented,
         std::env::var_os("PLOW_UNISEG").is_some(),
@@ -1836,7 +1852,8 @@ fn run_devblob(cli: &Cli) -> Result<PathBuf, Box<dyn std::error::Error>> {
             lean_oracle_on,
             bw_bytes_per_cycle,
             spec.clock_boost.0,
-            cli.arch.starts_with("sm_"),
+            // The CPU engine runs the NVIDIA arms (x staged at M=1, no LDS arena).
+            cli.arch.starts_with("sm_") || devgen::target_is_cpu(&cli.arch, &cli.gpu),
         )?)
     };
     let verify = match (fusion_coverage, verify) {
@@ -2193,10 +2210,10 @@ fn build_cubin_from_manifest(
     Ok(())
 }
 
-fn effective_uniseg(arch: &str, configured: bool, segmented: bool, env_present: bool) -> bool {
+fn effective_uniseg(arch: &str, cpu: bool, configured: bool, segmented: bool, env_present: bool) -> bool {
     if segmented {
         false
-    } else if (arch.starts_with("sm_120") || arch == "metal3") && !env_present {
+    } else if (arch.starts_with("sm_120") || arch == "metal3" || cpu) && !env_present {
         true
     } else {
         configured
@@ -2241,6 +2258,10 @@ fn cubin_arch_option(arch: &str) -> Result<&'static str, String> {
     match arch {
         "sm_90a" => Ok("-DPLOW_SM90A_CUBIN=ON"),
         "sm_120a" => Ok("-DPLOW_SM120_CUBIN=ON"),
+        _ if devgen::target_is_cpu(arch, "") => Err(format!(
+            "--emit devblob+cubin: --arch {arch} is a CPU target; the CPU engine needs no \
+             interpreter object, use --emit devblob."
+        )),
         _ if !arch.starts_with("sm_") => Err(format!(
             "--emit devblob+cubin: only the nvcc backend is wired; --arch {arch} would \
              need the hipcc/.hsaco backend (runtime/amd/), which is not implemented."
@@ -3186,10 +3207,11 @@ mod cli_tests {
 
     #[test]
     fn uniseg_cli_state_reaches_the_legacy_builder_switch() {
-        assert!(effective_uniseg("sm_90a", true, false, false));
-        assert!(!effective_uniseg("sm_90a", true, true, false));
-        assert!(effective_uniseg("sm_120a", false, false, false));
-        assert!(!effective_uniseg("sm_120a", false, false, true));
+        assert!(effective_uniseg("sm_90a", false, true, false, false));
+        assert!(!effective_uniseg("sm_90a", false, true, true, false));
+        assert!(effective_uniseg("sm_120a", false, false, false, false));
+        assert!(!effective_uniseg("sm_120a", false, false, false, true));
+        assert!(effective_uniseg("amx", true, false, false, false));
     }
 
     /// CORRECTION 1, HALF ONE. Both gates are ON with no flags. They used to be

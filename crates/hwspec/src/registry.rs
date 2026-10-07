@@ -7,6 +7,7 @@
 
 use crate::amd::{mi300, mi350};
 use crate::apple::m4;
+use crate::intel::xeon6;
 use crate::nvidia::{ada, blackwell, h100};
 use crate::spec::GpuSpec;
 
@@ -27,6 +28,7 @@ pub const ALL: &[&GpuSpec] = &[
     &m4::APPLE_M4,
     &m4::APPLE_M4_PRO,
     &m4::APPLE_M4_MAX,
+    &xeon6::XEON_6975P_C,
 ];
 
 /// Short aliases mapping to canonical spec names. Each entry is
@@ -67,6 +69,10 @@ pub const ALIASES: &[(&str, &str)] = &[
     ("m4-pro", "Apple M4 Pro"),
     ("m4max", "Apple M4 Max"),
     ("m4-max", "Apple M4 Max"),
+    // Intel Xeon 6 (CPU engine)
+    ("xeon6975p", "Xeon 6975P-C"),
+    ("xeon6975p-c", "Xeon 6975P-C"),
+    ("xeon6", "Xeon 6975P-C"),
 ];
 
 /// Resolve a model name (case-insensitive) to its spec.
@@ -216,6 +222,15 @@ mod tests {
         // PCIe-only ⇒ the scheduler takes the slow-link path.
         assert!(lookup("RTX 4090").unwrap().interconnect.is_none());
         assert!(lookup("RTX 5090").unwrap().interconnect.is_none());
+    }
+
+    #[test]
+    fn a_xeon_resolves_to_the_amx_cpu_level() {
+        let x = lookup("xeon6975p").unwrap();
+        assert_eq!(x.vendor, crate::spec::Vendor::Intel);
+        assert_eq!(crate::isa::IsaLevel::from_spec(x), Some(crate::isa::IsaLevel::Amx));
+        assert!(crate::isa::IsaLevel::Amx.is_cpu() && !crate::isa::IsaLevel::Sm120a.is_cpu());
+        assert_eq!(x.sm.warp_lanes, crate::isa::IsaLevel::Amx.caps().warp_lanes);
     }
 
     #[test]

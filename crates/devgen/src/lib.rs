@@ -8848,6 +8848,14 @@ fn target_is_amd(arch: &str, gpu: &str) -> bool {
         || hwspec::registry::lookup(gpu).is_some_and(|s| s.vendor == hwspec::Vendor::Amd)
 }
 
+/// Is the emit target the plowrt CPU engine? `--arch amx|avx512|cpu` or a `--gpu` the registry
+/// says is an Intel CPU. The CPU engine interprets the NVIDIA-format packet, so a CPU target takes
+/// every `sm_120a` emit decision; only the labels (`--gpu`, `--arch`) differ.
+pub fn target_is_cpu(arch: &str, gpu: &str) -> bool {
+    hwspec::IsaLevel::from_arch_flag(arch).is_some_and(hwspec::IsaLevel::is_cpu)
+        || hwspec::registry::lookup(gpu).is_some_and(|s| s.vendor == hwspec::Vendor::Intel)
+}
+
 /// The largest `top_k` the AMD MoE routers can select. Mirrors `PLOW_MOE_MAX_TOPK` in
 /// `runtime/amd/op_moe.h`, and `moe_topk_matches_the_amd_kernel` PARSES that `#define` and fails
 /// if the two drift — the same discipline `GFX950_DISPATCHED` applies to `interp.hip`.
@@ -9445,8 +9453,10 @@ fn warn_arch_gpu_vendor_mismatch(arch: &str, gpu: &str) {
     };
     let arch_amd = arch.starts_with("gfx");
     let arch_nv = arch.starts_with("sm_");
+    let arch_cpu = target_is_cpu(arch, "");
     let gpu_amd = spec.vendor == hwspec::Vendor::Amd;
-    if (arch_amd && !gpu_amd) || (arch_nv && gpu_amd) {
+    let gpu_cpu = spec.vendor == hwspec::Vendor::Intel;
+    if (arch_amd && !gpu_amd) || (arch_nv && (gpu_amd || gpu_cpu)) || (arch_cpu && !gpu_cpu) {
         eprintln!(
             "  WARNING: --arch {arch} and --gpu {gpu} name different vendors. build.json will \
              describe an object for {arch}, but the packet is sized for {gpu} ({} CUs). If this is \
@@ -10623,7 +10633,7 @@ fn emit_dense_gqa(
     check_nvidia_opcode_coverage(&m, amd);
     check_cpu_or_metal_opcode_coverage(
         &m,
-        arch == "metal3" || (arch.is_empty() && gpu.is_empty()),
+        arch == "metal3" || target_is_cpu(&arch, &gpu) || (arch.is_empty() && gpu.is_empty()),
         arch.starts_with("sm_"),
     );
     check_group_routing_supported(&m, amd, &arch);
@@ -10638,7 +10648,7 @@ fn emit_dense_gqa(
         // Single-utterance buckets (forward.v1); on CUDA also packed buckets (chunks of several
         // utterances, each attending in its own windows and splitting K as its single bucket
         // would), the largest sizing every shared tensor.
-        let (packed, single): (&[u32], &[u32]) = if arch.starts_with("sm_") {
+        let (packed, single): (&[u32], &[u32]) = if arch.starts_with("sm_") || target_is_cpu(&arch, &gpu) {
             (&[192, 160, 128, 96, 80, 64, 48, 40, 32, 24, 16, 12, 8, 4], &[3000, 400, 800, 1200, 1600, 2000])
         } else {
             (&[], &[400, 800, 1200, 1600, 2000])

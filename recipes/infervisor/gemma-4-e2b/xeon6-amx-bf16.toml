@@ -6,8 +6,8 @@
 #   GEMMA4_E2B_CHECKPOINT=<hf dir> python3 scripts/campaign/campaign.py build \
 #       recipes/infervisor/gemma-4-e2b/xeon6-amx-bf16.toml --out <fresh dir>
 #
-# CPU bundles are NVIDIA devblobs interpreted by the CPU engine (docs/runtime/cpu.md): `gpu` / `arch`
-# label the packet, `n_cu` = 96 virtual executors (one per physical core). Host state for every
+# CPU target (docs/runtime/cpu.md): `plowc --gpu xeon6975p --arch amx`; the CPU engine runs the packet on
+# its AMX/AVX-512 tiers, `n_cu` = 96 virtual executors (one per physical core). Host state for every
 # measurement (all arms): kernel.numa_balancing=0, a zero-latency CPU QoS request held
 # (/dev/cpu_dma_latency, as tuned latency-performance does), THP madvise, no pseudo-lock held (PLOW_CPU_SRAM off).
 #
@@ -21,7 +21,7 @@ network = "gemma4"
 
 [target]
 vendor = "intel"
-isa = "x86-64 AMX-BF16 + AVX-512"
+isa = "amx"
 sku = "Xeon 6975P-C"
 units = 96
 num_gpus = 1
@@ -38,8 +38,8 @@ name = "gemma-4-e2b.xeon6.bf16-2k-c32"
 model = "gemma-4-E2B-it (BF16 safetensors)"
 revision = "local"
 hf_dir = "{env:GEMMA4_E2B_CHECKPOINT}"
-gpu = "rtx6000pro"
-arch = "sm_120a"
+gpu = "xeon6975p"
+arch = "amx"
 n_cu = 96
 max_ctx = 2048
 precision = "bf16"

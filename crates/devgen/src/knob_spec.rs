@@ -476,11 +476,28 @@ const UNISEG_DEFAULT: Default = Default::Production {
                 F::Target(T::Arch("sm_120a")),
                 F::Target(T::Arch("sm_120")),
                 F::Target(T::Arch("metal3")),
+                F::Target(T::Arch("amx")),
+                F::Target(T::Arch("avx512")),
+                F::Target(T::Arch("cpu")),
             ]),
             value: TRUE,
         },
     ],
     otherwise: FALSE,
+};
+
+/// `plowc` turns the NVIDIA E-series decode merge-fold off for CPU targets: the CPU flash-decode
+/// kernels need FLASH_MERGE.
+const NV_FA_FOLD_WIDE_DEFAULT: Default = Default::Production {
+    cases: &[DefaultCase {
+        when: F::Or(&[
+            F::Target(T::Arch("amx")),
+            F::Target(T::Arch("avx512")),
+            F::Target(T::Arch("cpu")),
+        ]),
+        value: FALSE,
+    }],
+    otherwise: TRUE,
 };
 
 const C_W8A8: &[Constraint] = &[Constraint {
@@ -1021,6 +1038,16 @@ pub const TARGETS: &[TargetSpec] = &[
         caps: DENSE_CAPS,
         recipe: &[],
     },
+    // The plowrt CPU engine (NVIDIA-format packet, one executor per core).
+    TargetSpec {
+        name: "gemma4_amx_cpu",
+        arch: "amx",
+        tp: 1,
+        n_cu: 96,
+        model: "gemma4",
+        caps: &["gemma"],
+        recipe: &[],
+    },
     TargetSpec {
         name: "kimi_k3_gfx950_tp8",
         arch: "gfx950",
@@ -1071,7 +1098,7 @@ pub const EMIT: &[KnobSpec] = &[
     KnobSpec::new("emit.no_fuse_nrn", Some("PLOW_NO_FUSE_NRN"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.fuse_hnr", Some("PLOW_FUSE_HNR"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.fuse_merge", Some("PLOW_FUSE_MERGE"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
-    KnobSpec::new("emit.nv_fa_fold_wide", Some("PLOW_NV_FA_FOLD_WIDE"), Layer::Emit, Domain::Bool, ON, PROMOTED),
+    KnobSpec::new("emit.nv_fa_fold_wide", Some("PLOW_NV_FA_FOLD_WIDE"), Layer::Emit, Domain::Bool, NV_FA_FOLD_WIDE_DEFAULT, PROMOTED),
     KnobSpec::new("emit.nv_fa_fold", Some("PLOW_NV_FA_FOLD"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.nv_dense_tune", Some("PLOW_NV_DENSE_TUNE"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.packed_prefill_small_hd", Some("PLOW_EMIT_PACKED_PREFILL_SMALL_HD"), Layer::Emit, Domain::Bool, OFF, OPT_IN),

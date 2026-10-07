@@ -23,22 +23,28 @@ served models. A CPU-only build does not probe or link CUDA/HSA drivers.
 
 ## Compiling a bundle
 
-There is no CPU emit target. `plowc` always compiles for a *device* target and the
-CPU backend interprets the resulting packet, so the interpreter-object step of the
-GPU quickstart is skipped entirely — a CPU bundle is `model.pkt`, its manifest, and
-a tokenizer, with no cubin or hsaco.
+Compile for a CPU target: `--gpu xeon6975p` (alias `xeon6`; `plowc --list-gpus`) with
+`--arch amx` (AMX-BF16 + AVX-512, the default for that part) or `--arch avx512`. The
+interpreter-object step of the GPU quickstart is skipped entirely — a CPU bundle is
+`model.pkt`, its manifest, and a tokenizer, with no cubin or hsaco.
 
 ```sh
 CKPT=/path/to/gemma-4-12B-it
 target/release/plowc --hf-dir "$CKPT" \
-  --gpu rtx6000pro --n-cu 96 --max-ctx 2048 \
+  --gpu xeon6975p --arch amx --n-cu 96 --max-ctx 2048 \
   --batch 1,4 --seq 128,512 --out /path/to/bundle
 ```
 
-Pick an **NVIDIA** target. A gfx942/gfx950 packet carries AMD-specific fusion the
-CPU kernels do not implement and is rejected at load, typically as a KV-row site
-past the decode program's instruction count. `rtx6000pro` is what the bundles in
-`perf-data/cpu-*` were built with; the `--gpu` default is `h100`.
+The CPU engine interprets the NVIDIA-format packet, so a CPU target takes every
+`sm_120a` emit decision (single-segment packet, NVIDIA fusions) and the packet is
+byte-identical to an `--gpu rtx6000pro --arch sm_120a` one except the header's
+target hash (bytes 28-31). The one CPU-specific default: the NVIDIA E-series decode
+merge-fold (`PLOW_NV_FA_FOLD_WIDE`) is off, since the CPU flash-decode kernels need
+FLASH_MERGE. `--arch` labels the packet; the runtime tier is still chosen by
+`--cpu-isa`. An AMD gfx942/gfx950 packet carries AMD-specific fusion the CPU kernels
+do not implement and is rejected at load, typically as a KV-row site past the decode
+program's instruction count. Bundles in `perf-data/cpu-*` were built as
+`--gpu rtx6000pro`, which still loads.
 
 `--n-cu` is the packet's count of *virtual* executors, not a thread count. Kernels
 take "the `slice`-th of `nblk` shares", and the worker pool maps whatever thread

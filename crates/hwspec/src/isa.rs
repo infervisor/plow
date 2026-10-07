@@ -47,6 +47,12 @@ pub enum IsaLevel {
     /// simdgroups, 32 KiB threadgroup memory, no tensor units. One level for both chips because
     /// a `.metallib` (or MSL source compiled at load) built for one runs on the other.
     Metal3,
+    /// x86-64 with AVX-512 BF16 (no AMX): the plowrt CPU engine's avx512 tier. The packet is
+    /// the same NVIDIA-format devblob as `sm_120a`; the level names the host ISA it runs on.
+    Avx512,
+    /// x86-64 with AMX-BF16 tiles plus AVX-512 (Sapphire Rapids and later): the CPU engine's
+    /// amx tier.
+    Amx,
     /// Portable scalar reference. Always available; never fast.
     CpuRef,
 }
@@ -62,6 +68,8 @@ impl IsaLevel {
             IsaLevel::Gfx942 => "gfx942",
             IsaLevel::Gfx950 => "gfx950",
             IsaLevel::Metal3 => "metal3",
+            IsaLevel::Avx512 => "avx512",
+            IsaLevel::Amx => "amx",
             IsaLevel::CpuRef => "cpu",
         }
     }
@@ -85,10 +93,17 @@ impl IsaLevel {
             IsaLevel::Gfx942,
             IsaLevel::Gfx950,
             IsaLevel::Metal3,
+            IsaLevel::Avx512,
+            IsaLevel::Amx,
             IsaLevel::CpuRef,
         ]
         .into_iter()
         .find(|l| l.arch_flag().eq_ignore_ascii_case(base))
+    }
+
+    /// Levels the plowrt CPU engine executes (host ISAs, no device object).
+    pub fn is_cpu(self) -> bool {
+        matches!(self, IsaLevel::Avx512 | IsaLevel::Amx | IsaLevel::CpuRef)
     }
 
     pub fn vendor(self) -> Vendor {
@@ -98,9 +113,10 @@ impl IsaLevel {
             }
             IsaLevel::Gfx942 | IsaLevel::Gfx950 => Vendor::Amd,
             IsaLevel::Metal3 => Vendor::Apple,
+            IsaLevel::Avx512 | IsaLevel::Amx => Vendor::Intel,
             // The CPU reference has no vendor in the GPU sense; it is reported as
-            // NVIDIA only because `Vendor` has no third variant. Callers should
-            // branch on `IsaLevel`, which is why this is the one lossy mapping.
+            // NVIDIA, the packet format it interprets. Callers should branch on
+            // `IsaLevel`, which is why this is the one lossy mapping.
             IsaLevel::CpuRef => Vendor::Nvidia,
         }
     }
@@ -117,6 +133,8 @@ impl IsaLevel {
             (Vendor::Amd, (9, 4)) => IsaLevel::Gfx942,
             (Vendor::Amd, (9, 5)) => IsaLevel::Gfx950,
             (Vendor::Apple, (3, _) | (4, _)) => IsaLevel::Metal3,
+            (Vendor::Intel, (major, _)) if major >= 4 => IsaLevel::Amx,
+            (Vendor::Intel, _) => IsaLevel::Avx512,
             _ => return None,
         })
     }
@@ -258,6 +276,35 @@ impl IsaLevel {
                 mx_scale_cvt: false,
                 warp_lanes: 32,
                 mma_dtypes: &[MmaDtype::Fp16, MmaDtype::Bf16],
+            },
+            // AVX-512 has no matrix engine; bf16 dot products run on the vector units.
+            IsaLevel::Avx512 => IsaCaps {
+                mma_sync: false,
+                wgmma: false,
+                tcgen05: false,
+                tmem: false,
+                tma: false,
+                dsm_cluster: false,
+                mfma: false,
+                block_scale_mma: false,
+                mx_scale_cvt: false,
+                warp_lanes: 16,
+                mma_dtypes: &[],
+            },
+            // AMX TMUL: bf16 and int8 tiles (AMX-FP16 on Granite Rapids). None of the GPU
+            // instruction families below.
+            IsaLevel::Amx => IsaCaps {
+                mma_sync: false,
+                wgmma: false,
+                tcgen05: false,
+                tmem: false,
+                tma: false,
+                dsm_cluster: false,
+                mfma: false,
+                block_scale_mma: false,
+                mx_scale_cvt: false,
+                warp_lanes: 16,
+                mma_dtypes: &[MmaDtype::Fp16, MmaDtype::Bf16, MmaDtype::Int8],
             },
             IsaLevel::CpuRef => IsaCaps {
                 mma_sync: false,
@@ -561,6 +608,7 @@ impl HardwareFingerprint {
             Vendor::Nvidia => "nvidia",
             Vendor::Amd => "amd",
             Vendor::Apple => "apple",
+            Vendor::Intel => "intel",
         };
         let sku: String = self
             .sku
@@ -737,6 +785,8 @@ mod tests {
             IsaLevel::Gfx942,
             IsaLevel::Gfx950,
             IsaLevel::Metal3,
+            IsaLevel::Avx512,
+            IsaLevel::Amx,
             IsaLevel::CpuRef,
         ] {
             assert_eq!(
@@ -815,6 +865,8 @@ mod tests {
             IsaLevel::Gfx942,
             IsaLevel::Gfx950,
             IsaLevel::Metal3,
+            IsaLevel::Avx512,
+            IsaLevel::Amx,
             IsaLevel::CpuRef,
         ] {
             assert_eq!(IsaLevel::from_arch_flag(level.arch_flag()), Some(level));
