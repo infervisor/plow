@@ -76,3 +76,7 @@ python = "{env:PYREF}"
 [gates.tts_cer]
 arms = ["--conc 1 --stream --wav --n 16", "--conc 32 --stream --wav --n 64"]
 cer_median_max = 0.05
+
+# VMM-backed KV prefix cache on every request path (sessions, shared system prompts, replays).
+[serve.env]
+PLOW_VMM_PREFIX = "1"

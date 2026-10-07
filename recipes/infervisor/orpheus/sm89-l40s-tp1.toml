@@ -77,3 +77,7 @@ python = "{env:PYREF}"
 # English prompts on an Orpheus voice (the default set's Veena voices are not in prompt.voices: 400).
 arms = ["--conc 1 --stream --wav --n 16 --prompt-set chatterbox --voice tara", "--conc 32 --stream --wav --n 64 --prompt-set chatterbox --voice tara"]
 cer_median_max = 0.05
+
+# VMM-backed KV prefix cache on every request path (sessions, shared system prompts, replays).
+[serve.env]
+PLOW_VMM_PREFIX = "1"

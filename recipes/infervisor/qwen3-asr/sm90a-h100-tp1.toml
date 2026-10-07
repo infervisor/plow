@@ -77,3 +77,7 @@ python = "{env:PYREF}"
 manifest = "{env:ASR_MANIFEST}"
 conc = "1,16"
 wer_max = 0.045
+
+# VMM-backed KV prefix cache on every request path (sessions, shared system prompts, replays).
+[serve.env]
+PLOW_VMM_PREFIX = "1"

@@ -47,3 +47,7 @@ python = "{env:PYREF}"
 hf_dir = "{hf:google/gemma-4-E4B-it@ee0ef6023621cff504d758262d4e04895a5af4a2}"
 top1_min = 0.98
 kl_mean_max = 2e-3
+
+# VMM-backed KV prefix cache on every request path (sessions, shared system prompts, replays).
+[serve.env]
+PLOW_VMM_PREFIX = "1"
