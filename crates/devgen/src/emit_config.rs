@@ -1007,6 +1007,10 @@ pub struct EmitConfig {
     /// bf16 epilogue and drops the `FlashMerge` entirely (see [`dense_flash_split`]).
     #[arg(long, env = "PLOW_DENSE_PF_NS")]
     pub dense_pf_ns: Option<u32>,
+    /// Floor on the dense prefill KV split count (see `dense_pf_splits`); 2 keeps a FLASH_MERGE
+    /// in every prefill bucket.
+    #[arg(long, env = "PLOW_DENSE_PF_NS_MIN")]
+    pub dense_pf_ns_min: Option<u32>,
 
     /// Widen prefill norm/residual dispatch across CUs. DEFAULT ON (`=0` restores the
     /// single-workgroup emit for A/B). Bit-identical either way.
@@ -1641,6 +1645,7 @@ impl EmitConfig {
             glm_dsa_pf_span: env_u32("PLOW_GLM_DSA_PF_SPAN").unwrap_or(1),
             glm_dsa_pf_dexact: env_u32("PLOW_GLM_DSA_PF_DEXACT"),
             dense_pf_ns: env_u32("PLOW_DENSE_PF_NS"),
+            dense_pf_ns_min: env_u32("PLOW_DENSE_PF_NS_MIN"),
             pf_floor: env_bool("PLOW_PF_FLOOR"),
             glm_pf_wide: env_opt_out("PLOW_GLM_PF_WIDE"),
             glm_place_pf: env_opt_out("PLOW_GLM_PLACE_PF"),

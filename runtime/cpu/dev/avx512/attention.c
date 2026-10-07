@@ -8,6 +8,7 @@
 #include "avx512.h"
 
 #define FA_BQ_TILE 128u
+_Static_assert(FA_BQ_TILE == PLOW_PF_TILE, "pack views tile FLASH_PREFILL like the kernel");
 #define FA_BKV 32u
 #define FA_GF 2u
 #define FA_KB 8u /* decode keys per softmax block: FA_KB x FA_GF = 16 dpbf16 chains */
@@ -211,7 +212,7 @@ V_K(v_flash_prefill) {
     }
     const uint32_t gqa = n_head / n_kv_head;
     const PlowCpuPack* pk = ctx->pack;
-    const uint32_t n_work = plow_pf_units(pk, n_q0, FA_BQ_TILE, n_head, nsplit0);
+    const uint32_t n_work = plow_pf_units(pk, n_q0, n_head, nsplit0);
     /* Partials: [row][head][split][hd] at row-split offsets (unpacked: row * nsplit). */
     float* const Opart = pk ? pk->opart : Opart0;
     float* const mlpart = pk ? pk->mlpart : mlpart0;
@@ -223,15 +224,14 @@ V_K(v_flash_prefill) {
     const plow_bf16* q[FA_RB];
 
     for (uint32_t w0 = slice; w0 < n_work; w0 += nblk) {
-        uint32_t w = w0;
-        const PlowPfView pv = plow_pf_view(pk, &w, n_q0, q_pos00, n_kv0, nsplit0, FA_BQ_TILE, n_head,
+        const PlowPfView pv = plow_pf_view(pk, w0, n_q0, q_pos00, n_kv0, nsplit0, n_head,
                                            (size_t)n_kv_head * kv_stride * D);
         const uint32_t n_q = pv.n_q, n_kv = pv.n_kv, q_pos0 = pv.q_pos0, nsplit = pv.nsplit;
         const plow_bf16* Q = Q0 + (size_t)pv.row0 * n_head * D;
         const plow_bf16* K = K0 + pv.kv_off;
         const plow_bf16* V = V0 + pv.kv_off;
         plow_bf16* O_final = O_final0 ? O_final0 + (size_t)pv.row0 * n_head * D : NULL;
-        const uint32_t sp = w % nsplit, h = (w / nsplit) % n_head, qt = w / (nsplit * n_head);
+        const uint32_t sp = pv.sp, h = pv.h, qt = pv.qt;
         const uint32_t hkv = h / gqa;
         const uint32_t q_base = qt * FA_BQ_TILE;
         if (q_base >= n_q) continue;
@@ -242,11 +242,8 @@ V_K(v_flash_prefill) {
         const uint32_t q_tile_first = q_pos0 + q_base;
         const uint32_t win_lo = (window && q_tile_first >= window) ? q_tile_first - window + 1 : 0;
         const uint32_t kv_lo = (win_lo / FA_BKV) * FA_BKV;
-        const uint32_t tiles_kv = kv_end > kv_lo ? (kv_end - kv_lo + FA_BKV - 1) / FA_BKV : 0u;
-        const uint32_t per = (tiles_kv + nsplit - 1) / nsplit;
-        const uint32_t my_lo = kv_lo + sp * per * FA_BKV;
-        uint32_t my_hi = kv_lo + (sp + 1) * per * FA_BKV;
-        if (my_hi > kv_end) my_hi = kv_end;
+        uint32_t my_lo, my_hi;
+        plow_pf_split_range(&pv, kv_lo, kv_end, FA_BKV, &my_lo, &my_hi);
         const plow_bf16* kbase = K + (size_t)hkv * kv_stride * D;
         const plow_bf16* vbase = V + (size_t)hkv * kv_stride * D;
 
@@ -287,7 +284,7 @@ V_K(v_flash_prefill) {
         for (uint32_t r = 0; r < n_rows; r++) {
             const uint32_t qi = q_base + r;
             const float* ar = acc + (size_t)r * 512;
-            if (nsplit == 1u && O_final) {
+            if (nsplit == 1u && O_final && !pk) {
                 const float inv = l[r] > 0.0f ? 1.0f / l[r] : 0.0f;
                 const __m512 vinv = _mm512_set1_ps(inv);
                 plow_bf16* orow = O_final + ((size_t)qi * n_head + h) * D;

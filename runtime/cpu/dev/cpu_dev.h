@@ -45,25 +45,35 @@ enum {
  * sets it only around a packed run (NULL otherwise); the row-dependent prefill kernels read it:
  * HEADNORM_ROPE's KV write (row_slot, the n_batch_kv layout), FLASH_PREFILL and FLASH_MERGE.
  *
- * BATCH INVARIANCE. A span's split-KV count is the one its own prefill bucket would use
- * (span_nsplit), not the launch's, so every row's attention is reduced exactly as it would be
- * alone. Its partials live in opart/mlpart at row-split offset row_off[r] ([rows + 1], row r
- * has row_off[r + 1] - row_off[r] splits), laid out [row][head][split][hd]. */
+ * CHUNKING INVARIANCE. Under a pack, split s of FLASH_PREFILL covers the ABSOLUTE keys
+ * [s * split_rows, (s + 1) * split_rows), and a q tile carries every split up to its last key.
+ * A row's partial over a split then depends only on its own position, and the splits a wider
+ * tile adds are empty for it (m = -inf, l = 0, exact zeros in the merge), so a row's attention
+ * is bit-identical whatever bucket, chunking, pack or prefix reuse it runs under. Partials live
+ * in opart/mlpart at row-split offset row_off[r] ([rows + 1], row r has row_off[r + 1] -
+ * row_off[r] splits = plow_pf_tile_splits of its tile), laid out [row][head][split][hd]. */
 typedef struct {
     const PlowPrefillSpan* spans;
     const uint32_t*        row_slot;
     uint32_t               n_spans;
     uint32_t               rows;
-    const uint32_t*        span_nsplit;
+    uint32_t               split_rows; /* multiple of the kernels' 32-key KV tile */
+    uint32_t               reserved0;
     const uint32_t*        row_off;
     float*                 opart;
     float*                 mlpart;
 } PlowCpuPack;
 
+/* FLASH_PREFILL q tile (rows): a work unit's query rows, and the unit of row_off's split counts. */
+#define PLOW_PF_TILE 128u
+
 /* FLASH_PREFILL's view of one work unit: the op itself, or under a pack the unit's span (its
- * rows, positions, KV length and slot). Units are (q tile, head, split) per span, span-major. */
+ * rows, positions, KV length and slot) and absolute split. Units are (q tile, head, split),
+ * span-major then tile-major. split_rows = 0: the op's own i7 split count carves each tile's
+ * valid KV range. */
 typedef struct {
     uint32_t row0, n_q, q_pos0, n_kv, nsplit;
+    uint32_t qt, h, sp, split_rows;
     size_t   kv_off; /* elements: slot * n_kv_head * kv_stride * hd */
 } PlowPfView;
 
@@ -83,38 +93,77 @@ typedef struct {
     uint64_t reserved[3];
 } PlowCpuCtx;
 
-/* `heads` x the span's split count work units per q tile. */
-static inline uint32_t plow_pf_units(const PlowCpuPack* pk, uint32_t n_q, uint32_t tile, uint32_t heads,
-                                     uint32_t nsplit) {
-    if (!pk) return (n_q + tile - 1) / tile * heads * nsplit;
+/* Splits of the q tile at row q_base of a span at q_pos0 with n_kv keys: every absolute
+ * split_rows block up to the tile's last key (the tile's full PLOW_PF_TILE rows, as the kernels
+ * bound it). */
+static inline uint32_t plow_pf_tile_splits(uint32_t q_pos0, uint32_t q_base, uint32_t n_kv, uint32_t split_rows) {
+    uint32_t end = q_pos0 + q_base + PLOW_PF_TILE;
+    if (end > n_kv) end = n_kv;
+    return (end + split_rows - 1) / split_rows;
+}
+
+static inline uint32_t plow_pf_units(const PlowCpuPack* pk, uint32_t n_q, uint32_t heads, uint32_t nsplit) {
+    if (!pk) return (n_q + PLOW_PF_TILE - 1) / PLOW_PF_TILE * heads * nsplit;
     uint32_t n = 0;
-    for (uint32_t s = 0; s < pk->n_spans; s++)
-        n += (pk->spans[s].n_rows + tile - 1) / tile * heads * pk->span_nsplit[s];
+    for (uint32_t s = 0; s < pk->n_spans; s++) {
+        const PlowPrefillSpan* sp = &pk->spans[s];
+        for (uint32_t qb = 0; qb < sp->n_rows; qb += PLOW_PF_TILE)
+            n += heads * plow_pf_tile_splits(sp->kv_row0, qb, sp->kv_len, pk->split_rows);
+    }
     return n;
 }
 
-/* `*w` becomes the unit's index inside its span. */
-static inline PlowPfView plow_pf_view(const PlowCpuPack* pk, uint32_t* w, uint32_t n_q, uint32_t q_pos0,
-                                      uint32_t n_kv, uint32_t nsplit, uint32_t tile, uint32_t heads,
-                                      size_t slot_elems) {
-    PlowPfView v = {0u, n_q, q_pos0, n_kv, nsplit, 0u};
-    if (!pk) return v;
+static inline PlowPfView plow_pf_view(const PlowCpuPack* pk, uint32_t w, uint32_t n_q, uint32_t q_pos0,
+                                      uint32_t n_kv, uint32_t nsplit, uint32_t heads, size_t slot_elems) {
+    PlowPfView v = {0u, n_q, q_pos0, n_kv, nsplit, 0u, 0u, 0u, 0u, 0u};
+    if (!pk) {
+        v.sp = w % nsplit;
+        v.h = (w / nsplit) % heads;
+        v.qt = w / (nsplit * heads);
+        return v;
+    }
     for (uint32_t s = 0; s < pk->n_spans; s++) {
         const PlowPrefillSpan* sp = &pk->spans[s];
-        const uint32_t u = (sp->n_rows + tile - 1) / tile * heads * pk->span_nsplit[s];
-        if (*w < u) {
-            v.row0 = sp->row0;
-            v.n_q = sp->n_rows;
-            v.q_pos0 = sp->kv_row0;
-            v.n_kv = sp->kv_len;
-            v.nsplit = pk->span_nsplit[s];
-            v.kv_off = (size_t)sp->slot * slot_elems;
-            return v;
+        for (uint32_t qb = 0; qb < sp->n_rows; qb += PLOW_PF_TILE) {
+            const uint32_t ns = plow_pf_tile_splits(sp->kv_row0, qb, sp->kv_len, pk->split_rows);
+            if (w < heads * ns) {
+                v.row0 = sp->row0;
+                v.n_q = sp->n_rows;
+                v.q_pos0 = sp->kv_row0;
+                v.n_kv = sp->kv_len;
+                v.nsplit = ns;
+                v.qt = qb / PLOW_PF_TILE;
+                v.h = w / ns;
+                v.sp = w % ns;
+                v.split_rows = pk->split_rows;
+                v.kv_off = (size_t)sp->slot * slot_elems;
+                return v;
+            }
+            w -= heads * ns;
         }
-        *w -= u;
     }
     v.n_q = 0u;
     return v;
+}
+
+/* The unit's keys: an absolute split (packed), or split sp of nsplit over the tile's valid range
+ * [kv_lo, kv_end) in whole kv_tile blocks. May be empty. */
+static inline void plow_pf_split_range(const PlowPfView* v, uint32_t kv_lo, uint32_t kv_end, uint32_t kv_tile,
+                                       uint32_t* lo, uint32_t* hi) {
+    uint32_t a, b;
+    if (v->split_rows) {
+        a = v->sp * v->split_rows;
+        b = a + v->split_rows;
+        if (a < kv_lo) a = kv_lo;
+    } else {
+        const uint32_t tiles = kv_end > kv_lo ? (kv_end - kv_lo + kv_tile - 1) / kv_tile : 0u;
+        const uint32_t per = (tiles + v->nsplit - 1) / v->nsplit;
+        a = kv_lo + v->sp * per * kv_tile;
+        b = kv_lo + (v->sp + 1) * per * kv_tile;
+    }
+    if (b > kv_end) b = kv_end;
+    *lo = a;
+    *hi = b > a ? b : a;
 }
 
 /* Kernel entry. `tensors[h]` is the host base pointer for handle h; an absent operand

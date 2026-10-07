@@ -58,6 +58,9 @@ pub struct PlowCpuCtx {
     pub reserved: [u64; 3],
 }
 
+/// `PLOW_PF_TILE`: FLASH_PREFILL's q tile, the unit of a pack row's split count.
+pub const PF_TILE: u32 = 128;
+
 /// Mirror of `PlowCpuPack`: which rows of a packed prefill launch belong to which KV slot.
 #[derive(Debug)]
 #[repr(C)]
@@ -66,8 +69,9 @@ pub struct PlowCpuPack {
     pub row_slot: *const u32,
     pub n_spans: u32,
     pub rows: u32,
-    /// Each span's split-KV count: its own bucket's, so the pack is batch-invariant.
-    pub span_nsplit: *const u32,
+    /// FLASH_PREFILL splits the KV at absolute multiples of this ([`PF_TILE`] rows per tile).
+    pub split_rows: u32,
+    pub reserved0: u32,
     /// `[rows + 1]` row-split offsets into `opart` / `mlpart`.
     pub row_off: *const u32,
     pub opart: *mut f32,
@@ -403,6 +407,10 @@ pub mod abi {
         pub fn plow_cpu_abi_offsetof_ctx_isa() -> usize;
         pub fn plow_cpu_abi_offsetof_ctx_pack() -> usize;
         pub fn plow_cpu_abi_offsetof_ctx_reserved() -> usize;
+        pub fn plow_cpu_abi_sizeof_pack() -> usize;
+        pub fn plow_cpu_abi_offsetof_pack_split_rows() -> usize;
+        pub fn plow_cpu_abi_offsetof_pack_row_off() -> usize;
+        pub fn plow_cpu_abi_pf_tile() -> usize;
         pub fn plow_cpu_abi_offsetof_inst_op() -> usize;
         pub fn plow_cpu_abi_offsetof_inst_blocks() -> usize;
         pub fn plow_cpu_abi_offsetof_inst_fj() -> usize;

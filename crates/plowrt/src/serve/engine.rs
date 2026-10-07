@@ -140,9 +140,9 @@ pub trait SeqEngine {
     }
     fn prefill_frontier(&self, slot: usize) -> Option<usize>;
     fn next_prefill_rows(&self, _slot: usize) -> Option<u32> { None }
-    /// Keep `slot`'s first `rows` KV rows (a retained session prefix) so its next prefill
-    /// starts there; `false` = the slot no longer holds them and the prompt starts cold.
-    fn resume_slot(&mut self, _slot: usize, _rows: usize) -> bool { false }
+    /// Keep up to `slot`'s first `rows` KV rows (a retained session prefix) so its next prefill
+    /// starts there. Returns the rows kept, at most `rows`; 0 = the prompt starts cold.
+    fn resume_slot(&mut self, _slot: usize, _rows: usize) -> usize { 0 }
     /// What this backend declares to the backend-neutral step planner
     /// (`crate::sched::step`). The default is a whole-prompt engine with no packing.
     fn step_backend(&self) -> crate::sched::step::Backend {

@@ -121,6 +121,10 @@ pub struct CpuServe {
     kept: Vec<u32>,
     /// Rows the current sequence resumed from (`cached_rows`).
     resumed: Vec<u32>,
+    /// Leading rows of each slot that a prefill wrote (the rest a decode step did). Only these
+    /// are reused: a prefill row is the same bits whatever chunk, pack or reused prefix wrote it,
+    /// a decoded one is not, so a shared prefix stays bit-identical to a fresh prefill.
+    pfilled: Vec<u32>,
     /// Smallest sliding ring's `stride - window`: a resume may drop at most this many tail
     /// rows, or the suffix prefill would read ring entries the dropped rows overwrote.
     ring_slack: u32,
@@ -204,6 +208,7 @@ impl CpuServe {
             lp_row: (0..batch).collect(),
             kept: vec![0; batch],
             resumed: vec![0; batch],
+            pfilled: vec![0; batch],
             ring_slack,
             share_kv,
             share_rows,
@@ -257,6 +262,7 @@ impl CpuServe {
     }
 
     fn admit_prefilled(&mut self, slot: usize, prompt: &[u32], tok: u32) {
+        self.pfilled[slot] = prompt.len() as u32;
         self.lp_row[slot] = 0;
         self.pf_pos[slot] = 0;
         self.pend[slot] = 0;
@@ -381,6 +387,7 @@ impl CpuServe {
             self.kept[slot] = if self.live[slot] {
                 self.pos[slot].min(self.max_ctx as u32 - 1)
             } else {
+                self.pfilled[slot] = self.pf_pos[slot];
                 self.pf_pos[slot]
             };
             self.live[slot] = false;
@@ -391,14 +398,15 @@ impl CpuServe {
         }
     }
 
-    /// Rows `[0, n)` of `slot` that hold its `hist` and that no ring has overwritten.
+    /// Rows `[0, n)` of `slot` that hold its `hist`, that a prefill wrote, and that no ring has
+    /// overwritten.
     fn intact_rows(&self, slot: usize) -> usize {
         let rows = if self.live[slot] {
-            self.pos[slot]
+            self.pos[slot].min(self.pfilled[slot])
         } else if self.pf_pos[slot] > 0 {
             self.pf_pos[slot]
         } else {
-            self.kept[slot]
+            self.kept[slot].min(self.pfilled[slot])
         };
         // The parked step also writes row `rows`, so it must stay inside every ring too.
         if rows >= self.share_rows {
@@ -449,8 +457,10 @@ impl CpuServe {
         self.resumed[slot] = rows as u32;
     }
 
-    /// Start `slot`'s next prefill at row `rows` over the rows its last sequence left.
-    pub fn resume_slot(&mut self, slot: usize, rows: usize) -> bool {
+    /// Start `slot`'s next prefill over the rows its last sequence left: the first `rows`, at
+    /// most those a prefill wrote. Returns the rows kept (0 = cold).
+    pub fn resume_slot(&mut self, slot: usize, rows: usize) -> usize {
+        let rows = rows.min(self.pfilled.get(slot).map_or(0, |&p| p as usize));
         let ok = slot < self.batch
             && !self.live[slot]
             && self.pf_pos[slot] == 0
@@ -461,11 +471,12 @@ impl CpuServe {
                 let dropped = self.kept[slot] as usize - rows;
                 dropped == 0 || dropped < self.ring_slack as usize
             };
-        if ok {
-            self.pf_pos[slot] = rows as u32;
-            self.resumed[slot] = rows as u32;
+        if !ok {
+            return 0;
         }
-        ok
+        self.pf_pos[slot] = rows as u32;
+        self.resumed[slot] = rows as u32;
+        rows
     }
 }
 
@@ -619,7 +630,7 @@ impl SeqEngine for CpuServe {
         (slot < self.batch).then(|| self.pf_pos[slot] as usize)
     }
 
-    fn resume_slot(&mut self, slot: usize, rows: usize) -> bool {
+    fn resume_slot(&mut self, slot: usize, rows: usize) -> usize {
         CpuServe::resume_slot(self, slot, rows)
     }
 

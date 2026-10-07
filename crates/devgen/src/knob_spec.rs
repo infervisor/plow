@@ -1237,6 +1237,7 @@ pub const EMIT: &[KnobSpec] = &[
     KnobSpec::new("emit.glm_dsa_pf_dexact", Some("PLOW_GLM_DSA_PF_DEXACT"), Layer::Emit, U32, UNSET, OPT_IN),
     KnobSpec::new("emit.pf_floor", Some("PLOW_PF_FLOOR"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.dense_pf_ns", Some("PLOW_DENSE_PF_NS"), Layer::Emit, U32, UNSET, OPT_IN),
+    KnobSpec::new("emit.dense_pf_ns_min", Some("PLOW_DENSE_PF_NS_MIN"), Layer::Emit, U32, UNSET, OPT_IN),
     KnobSpec::new("emit.glm_pf_wide", Some("PLOW_GLM_PF_WIDE"), Layer::Emit, Domain::Bool, ON, PROMOTED),
     KnobSpec::new("emit.glm_place_pf", Some("PLOW_GLM_PLACE_PF"), Layer::Emit, Domain::Bool, ON, PROMOTED),
     KnobSpec::new("emit.glm_moe_stage1_native", Some("PLOW_GLM_MOE_STAGE1_NATIVE"), Layer::Emit, Domain::Bool, OFF, OPT_IN).scoped(GLM_MOE_STAGE1_NATIVE_SCOPE),

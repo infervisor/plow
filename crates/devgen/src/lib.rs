@@ -2974,15 +2974,23 @@ fn dense_flash_split(
         // `PLOW_DENSE_PF_NS` CAPS this, it does not replace it: a cap can only ever remove
         // splits the heuristic asked for, so a value above the heuristic cannot over-split a
         // bucket past the `Opart`/`mlpart` capacity `max_splits` sized from the same formula.
-        let heuristic = n_cu
-            .div_ceil((t.div_ceil(Q_TILE_ROWS) * heads).max(1))
-            .max(1);
+        let heuristic = dense_pf_splits(n_cu, heads, t);
         match emit_config::active().dense_pf_ns {
             Some(cap) => heuristic.min(cap.max(1)),
             None => heuristic,
         }
     };
     (ns, !gemv_family && ns == 1)
+}
+
+/// The dense prefill split heuristic, raised to `PLOW_DENSE_PF_NS_MIN`. A floor of 2 keeps a
+/// FLASH_MERGE in every bucket, which the CPU runtime's packed prefill needs: it splits the KV at
+/// absolute positions into the merge's partials, whatever the bucket's own count. `max_splits`
+/// sizes `Opart`/`mlpart` from this same function.
+fn dense_pf_splits(n_cu: u32, heads: u32, t: u32) -> u32 {
+    n_cu.div_ceil((t.div_ceil(Q_TILE_ROWS) * heads).max(1))
+        .max(emit_config::active().dense_pf_ns_min.unwrap_or(1))
+        .max(1)
 }
 
 /// The q-tile height `d_flash_prefill` ACTUALLY uses: `PLOW_WAVES * FA_BQ`, with `PLOW_WAVES = 4`.
@@ -9797,8 +9805,7 @@ fn emit_dense_gqa(
     let max_splits = buckets
         .iter()
         .map(|&t| {
-            let ns = n_cu.div_ceil((t.div_ceil(Q_TILE_ROWS) * hs).max(1)).max(1);
-            t * hs * ns
+            t * hs * dense_pf_splits(n_cu, hs, t)
         })
         .max()
         .unwrap_or(n_cu * Q_TILE_ROWS);

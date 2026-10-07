@@ -3480,12 +3480,9 @@ fn run_one_tick(
                             .as_mut()
                             .filter(|s| s.step == 0 && s.pf_pos == 0 && s.resume > 0)
                         {
-                            if s.cfg.is_none() && e.resume_slot(i, s.resume) {
-                                s.pf_pos = s.resume;
-                                s.cached_tokens = s.resume;
-                            } else {
-                                s.resume = 0;
-                            }
+                            s.resume = if s.cfg.is_none() { e.resume_slot(i, s.resume) } else { 0 };
+                            s.pf_pos = s.resume;
+                            s.cached_tokens = s.resume;
                         }
                     }
                     let Some(slot) = slot_opt.as_ref().filter(|slot| slot.step == 0) else {
@@ -4183,12 +4180,9 @@ fn run_one_tick(
                     // A retained session's rows: the engine keeps them and prefills only the
                     // suffix, or refuses and the prompt starts cold.
                     if let Some(s) = slots[i].as_mut().filter(|s| s.pf_pos == 0 && s.resume > 0) {
-                        if s.cfg.is_none() && e.resume_slot(i, s.resume) {
-                            s.pf_pos = s.resume;
-                            s.cached_tokens = s.resume;
-                        } else {
-                            s.resume = 0;
-                        }
+                        s.resume = if s.cfg.is_none() { e.resume_slot(i, s.resume) } else { 0 };
+                        s.pf_pos = s.resume;
+                        s.cached_tokens = s.resume;
                     }
                     let slot_ref = slots[i].as_ref().expect("found above");
                     // §TTFT: everything between `mux.submit` and this line — the
@@ -5138,8 +5132,8 @@ fn gpu_prefill_batched_pass(
             let admitted = (|| -> Result<()> {
                 for row in [i, i + 1].into_iter().take(1 + pair as usize) {
                     let fresh = !e.packed_slot_ready(row);
-                    if fresh && request.resume > 0 && !e.resume_slot(row, request.resume) {
-                        request.resume = 0;
+                    if fresh && request.resume > 0 {
+                        request.resume = e.resume_slot(row, request.resume);
                     }
                     let Some(frontier) = e.admit_packed_slot(row, &request.prompt_ids, total)? else {
                         continue;
@@ -5480,11 +5474,12 @@ fn gpu_prefill_advance(
     fit_speech_budget(slot, e.max_ctx());
     let total = slot.prompt_ids.len() + slot.gen.max_tokens.max(1);
     if slot.pf_pos == 0 {
-        let resume = slot.resume > 0 && slot.cfg.is_none() && e.resume_slot(slot_idx, slot.resume);
+        let kept = if slot.resume > 0 && slot.cfg.is_none() { e.resume_slot(slot_idx, slot.resume) } else { 0 };
         e.begin_slot(slot_idx, total)?;
-        if resume {
-            slot.pf_pos = slot.resume;
-            slot.cached_tokens = slot.resume;
+        if kept > 0 {
+            slot.resume = kept;
+            slot.pf_pos = kept;
+            slot.cached_tokens = kept;
         }
         if let Some(ttl) = slot.session.as_ref().and_then(|s| s.pin_ttl()) {
             e.hold_session_prefix(slot_idx, ttl);

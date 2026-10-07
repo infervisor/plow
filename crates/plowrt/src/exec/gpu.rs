@@ -7030,9 +7030,9 @@ impl GpuEngine {
     }
 
     /// Make the next `begin_slot(b, ..)` keep slot `b`'s first `rows` cache rows (a retained
-    /// session prefix) and start its sequence there. Refused (the sequence starts cold) unless the
-    /// slot still holds that many rows.
-    pub fn resume_slot(&mut self, b: usize, rows: usize) -> bool {
+    /// session prefix) and start its sequence there. Returns the rows kept: `rows`, or 0 (the
+    /// sequence starts cold) unless the slot still holds that many rows.
+    pub fn resume_slot(&mut self, b: usize, rows: usize) -> usize {
         let ok = self.slot_resume_supported()
             && b < self.batch
             && rows <= self.pos[b] as usize
@@ -7042,7 +7042,7 @@ impl GpuEngine {
         if let Some(r) = self.resume_rows.get_mut(b) {
             *r = if ok { rows as u32 } else { 0 };
         }
-        ok
+        if ok { rows } else { 0 }
     }
 
     /// Slot `b`'s current sequence belongs to a session: when it retires, its published prefix

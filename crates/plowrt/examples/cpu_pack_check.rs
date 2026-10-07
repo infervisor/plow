@@ -5,9 +5,10 @@
 //!
 //! A = one `prefill_slot` per prompt; B = the prompts packed into as few launches as fit; C = two
 //! packs, the first carrying an intermediate chunk of prompt 0 and the second its tail at `c0 > 0`;
-//! D = each prompt alone in a pack. Passes iff B, C and D are bit-identical to the same chunks
-//! prefilled alone (logits, first token, B's greedy decode): packing is batch-invariant. The
-//! distance of an unpacked run on the widest packed bucket from A is printed for scale.
+//! D = each prompt alone in a pack; W = each prompt alone on the widest packed bucket. Passes iff
+//! B, C, D and W are bit-identical to A (logits, first token, B's greedy decode), and so is
+//! prompt 0 prefilled as the two chunks C splits it into: prefill is invariant to the pack, the
+//! bucket and the chunking.
 
 #[cfg(feature = "cpu")]
 fn main() {
@@ -192,8 +193,7 @@ fn main() {
         }
     }
 
-    // D: each prompt alone in a pack. W: each prompt alone, unpacked, on the widest packed bucket
-    // (what packing without batch invariance would give; its distance from A is printed).
+    // D: each prompt alone in a pack. W: each prompt alone on the widest packed bucket.
     let wide = solo(&eng, cap);
     let mut lg_d = Vec::new();
     let mut tok_d = Vec::new();
@@ -213,12 +213,13 @@ fn main() {
         groups.len(),
         ms_a / ms_b
     );
-    let mut ok = c_ok;
+    let chunked_exact = tok_c0 == tok_a[0] && diff(&lg_c0, &lg_a[0]) == 0.0;
+    let mut ok = c_ok && chunked_exact;
     for i in 0..n {
         let exact = tok_b[i] == tok_a[i] && diff(&lg_b[i], &lg_a[i]) == 0.0 && dec_b[i] == dec_a[i];
-        ok &= exact && tok_d[i] == tok_a[i] && diff(&lg_d[i], &lg_a[i]) == 0.0;
+        ok &= exact && tok_d[i] == tok_a[i] && diff(&lg_d[i], &lg_a[i]) == 0.0 && diff(&lg_w[i], &lg_a[i]) == 0.0;
         println!(
-            "prompt {i} len {:>5}: first A/B {}/{}  B vs A max|dlogit| {:.4} decode {}  D vs A {:.4}  | unpacked wide bucket vs A {:.4} KL {:.2e}",
+            "prompt {i} len {:>5}: first A/B {}/{}  B vs A max|dlogit| {:.4} decode {}  D vs A {:.4}  W vs A {:.4} KL {:.2e}",
             prompts[i].len(),
             tok_a[i],
             tok_b[i],
@@ -230,6 +231,7 @@ fn main() {
         );
     }
     println!("split-chunk packs (C): {}", if c_ok { "exact" } else { "DIFFER" });
+    println!("prompt 0 in two chunks vs whole: {}", if chunked_exact { "exact" } else { "DIFFER" });
     println!("{}", if ok { "PACK_CHECK OK" } else { "PACK_CHECK MISMATCH" });
     std::process::exit(if ok { 0 } else { 1 });
 }

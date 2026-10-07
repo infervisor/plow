@@ -106,19 +106,28 @@ length and slot), and the head samples each finished prompt's last row (a second
 run at `M = S` when several finish). Everything else is row-independent; `pack_route`
 refuses a packet with any op it does not know to be, and logs why.
 
-Packing is batch-invariant. GEMMs are per-row invariant in `M`, and the one bucket-dependent
-choice, the attention KV split count, is taken per span from the bucket that span would
-have used alone (`span_nsplit`); partials go to an engine-owned scratch at per-row offsets
-(`row_off`) that `FLASH_MERGE` reads back. Packs therefore use only buckets that merge (on
-12B/26B-A4B the 2048 bucket writes attention directly, so packs there hold at most 1024
-rows), and a member whose own bucket does not merge prefills alone.
+Prefill is invariant to the pack, the bucket and the chunking. GEMMs are per-row invariant in
+`M`; attention splits the KV at absolute positions (`split_rows` = max(2048, max_ctx / 16) keys)
+instead of a per-bucket count, so a row's partial over a split depends only on its own position,
+and the splits a wider q tile adds are empty for it (exact zeros in `FLASH_MERGE`). Partials go
+to an engine-owned scratch at per-row offsets (`row_off`). Every prefill chunk, including one
+prefilled alone, runs this way on a bucket that carries a `FLASH_MERGE`, so a prompt's logits and
+KV are the same bits whether it is prefilled whole, in chunks, after a reused prefix (session
+resume, cross-slot prefix share) or packed with others. `plowc` keeps a merge in every bucket
+with `PLOW_DENSE_PF_NS_MIN=2` (the 12B/26B-A4B/31B recipes set it; their 2048 bucket otherwise
+writes attention directly and neither packs nor gets the invariance).
 
-`cpu_pack_check` is the gate: a request packed with others, alone in a pack, or split into
-chunks across packs must equal the same chunks prefilled alone, bit for bit (logits, first
-token, greedy decode). Measured on Xeon 6975P-C, six chat/natural prompts (1603 rows), all
-exact: E2B 1.54x, E4B 1.69x, 12B 2.06x, 26B-A4B 1.83x faster than one prefill per prompt.
-Without invariance (one prompt alone on the wider bucket) logits move by up to 6.8 and KL by
-up to 0.36 on 26B-A4B, enough to flip greedy near-ties.
+`cpu_pack_check` is the gate: packed, alone in a pack, on the widest bucket, and split into
+chunks across packs must all equal the whole prompt prefilled alone, bit for bit (logits, first
+token, greedy decode). Measured on Xeon 6975P-C, seven chat/natural prompts (3503 rows, two packs
+of <= 2048), all exact: E2B 1.66x, E4B 1.61x, 12B 1.53x faster than one prefill per prompt.
+`cpu_share_check` holds a reused prefix (prompt rows, decoded rows, a chain of both) to the same
+bits as a fresh prefill; only prefill-written rows are reused.
+
+The 2048-key floor on `split_rows` is for accuracy, not speed. Gemma-4-12B BF16 is sensitive to
+how attention partitions a long prompt's keys: with 256-key splits its FP32-reference gate KL
+p99 was 0.79 (vLLM 0.47), with every layer's attention as close to an f64 reference as the
+unsplit kernel's; at 2048 (one split per q tile up to 2K context, the unsplit sums) it is 0.33.
 
 ## ISA coverage
 

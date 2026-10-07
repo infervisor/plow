@@ -55,6 +55,7 @@ args = []
 [emit.env]
 PLOW_DECODE_BATCH_LADDER = "1,2,4,8,16,32"
 PLOW_MAX_CHUNK = "2048"
+PLOW_DENSE_PF_NS_MIN = "2"
 
 [serve.env]
 PLOW_CPU_WEIGHT_AFFINE = "1"

@@ -2126,6 +2126,8 @@ pub struct CpuEngine {
     pack_cell: Arc<AtomicPtr<ffi::PlowCpuPack>>,
     /// Packed-run flash partials (`opart`, `mlpart`), sized for the worst pack.
     pack_parts: Option<(HostTensor, HostTensor)>,
+    /// Absolute KV split of a packed FLASH_PREFILL ([`ffi::PlowCpuPack::split_rows`]).
+    split_rows: u32,
 }
 
 /// What a packed prefill needs to know about each prefill program (indexed like the buckets).
@@ -2133,11 +2135,8 @@ pub struct CpuEngine {
 pub struct PackRoute {
     /// The lm_head instruction.
     lm: Vec<usize>,
-    /// The split-KV count every FLASH_PREFILL of the program uses.
-    nsplit: Vec<u32>,
-    /// Every FLASH_PREFILL writes partials that a FLASH_MERGE reduces. Only these programs carry
-    /// packs, and a span joins one only if its own bucket is one: a merged pack reproduces any
-    /// split count, a direct-write one only its own.
+    /// Every FLASH_PREFILL writes partials that a FLASH_MERGE reduces: the programs a pack (and
+    /// a chunk prefilled alone, as a one-member pack) runs on.
     merge: Vec<bool>,
     /// Largest `n_head * hd` and `n_head` over the attention sites (partial row sizes).
     heads_d: usize,
@@ -2173,10 +2172,10 @@ fn pack_route(model: &CpuModel) -> std::result::Result<PackRoute, String> {
             .map(|e| e.1)
     };
     let mut lm = Vec::with_capacity(model.dec_ix);
-    let (mut nsplit, mut merge) = (Vec::new(), Vec::new());
+    let mut merge = Vec::new();
     let (mut heads_d, mut heads) = (0usize, 0usize);
     for p in &model.blob.progs[..model.dec_ix] {
-        let (mut ns, mut flash, mut merges, mut direct) = (None, 0usize, 0usize, false);
+        let (mut flash, mut merges, mut direct) = (0usize, 0usize, false);
         let n = p.insts.len();
         let is = |d: &DevInst64, op: DevOp| d.op == op as u16;
         let head = n.checked_sub(4).map(|i| &p.insts[i..]).ok_or("empty prefill program")?;
@@ -2205,10 +2204,6 @@ fn pack_route(model: &CpuModel) -> std::result::Result<PackRoute, String> {
                     if slot_bytes(d.t[3]) != Some(block) || slot_bytes(d.t[4]) != Some(block) {
                         return Err("a flash KV read is not one [slot][head][row] block per slot".into());
                     }
-                    let n = d.i[7].max(1);
-                    if *ns.get_or_insert(n) != n {
-                        return Err("a prefill program mixes split-KV counts".into());
-                    }
                     flash += 1;
                     direct |= d.t[5] != TENSOR_NONE16;
                     heads_d = heads_d.max(d.i[2] as usize * d.i[6] as usize);
@@ -2232,13 +2227,12 @@ fn pack_route(model: &CpuModel) -> std::result::Result<PackRoute, String> {
             }
         }
         lm.push(n - 4);
-        nsplit.push(ns.unwrap_or(1));
         merge.push(flash > 0 && merges == flash && !direct);
     }
     if !merge.iter().any(|&m| m) {
         return Err("no prefill bucket reduces its attention with FLASH_MERGE".into());
     }
-    Ok(PackRoute { lm, nsplit, merge, heads_d, heads })
+    Ok(PackRoute { lm, merge, heads_d, heads })
 }
 
 impl CpuEngine {
@@ -2465,17 +2459,24 @@ impl CpuEngine {
             "CPU engine ready"
         );
         let pack = pack_route(&model);
+        // At most 16 splits per row at full context, never under 2048 keys: a whole number of
+        // the kernels' 32-key tiles, and up to 2K context one split per q tile, the same sums as
+        // an unsplit FLASH_PREFILL. Gemma-4-12B BF16 is sensitive to that partition on long
+        // prompts: 256-key splits moved its FP32-reference KL on a 1.5K-token doc 0.06 -> 0.60
+        // with every layer's attention as accurate as unsplit.
+        let split_rows = ((max_ctx.next_power_of_two() / 16) as u32).max(2048);
         let pack_parts = match &pack {
             Ok(r) => {
-                // Worst pack: the widest merged bucket of rows, each at the largest split count.
-                let (rows, ns) = (0..r.merge.len())
+                // Worst pack: the widest merged bucket of rows, each at full context.
+                let rows = (0..r.merge.len())
                     .filter(|&p| r.merge[p])
-                    .fold((0usize, 1usize), |(t, n), p| {
-                        (t.max(model.blob.progs[p].t as usize), n.max(r.nsplit[p] as usize))
-                    });
-                let splits = rows * ns;
+                    .map(|p| model.blob.progs[p].t as usize)
+                    .max()
+                    .unwrap_or(0);
+                let splits = rows * (max_ctx as u32).div_ceil(split_rows).max(1) as usize;
                 tracing::info!(
                     max_rows = rows,
+                    split_rows,
                     splits,
                     mib = (splits * (r.heads_d + 2 * r.heads) * 4) >> 20,
                     "cpu: packed prefill available"
@@ -2502,6 +2503,7 @@ impl CpuEngine {
             pack,
             pack_cell,
             pack_parts,
+            split_rows,
         })
     }
 
@@ -2666,6 +2668,12 @@ impl CpuEngine {
     /// rebase, run the single-sequence prefill, restore the base — even on
     /// failure, since a table left on slot `s` would fold every decode into it).
     pub fn prefill_slot(&mut self, slot: usize, prompt: &[u32]) -> Result<u32> {
+        if self.pack.is_ok() && !prompt.is_empty() && prompt.len() < self.max_ctx {
+            for ch in plan_chunks(&self.prefill_buckets(), prompt.len() as u32) {
+                self.prefill_slot_chunk(slot, prompt, ch)?;
+            }
+            return self.last_token();
+        }
         self.model.kv_rebase(slot)?;
         let r = self.prefill(prompt);
         self.model.kv_rebase(0)?;
@@ -2673,7 +2681,22 @@ impl CpuEngine {
     }
 
     /// One chunk of a slot prefill (same rebase/restore discipline as [`Self::prefill_slot`]).
+    /// On a packed-prefill packet the chunk runs as a one-member pack, so its logits and KV are
+    /// the same bits whether it runs alone, in a pack, or after a reused prefix.
     pub fn prefill_slot_chunk(&mut self, slot: usize, prompt: &[u32], ch: Chunk) -> Result<()> {
+        let end = (ch.c0 + ch.clen) as usize;
+        if self.pack.as_ref().is_ok_and(|r| r.merge.get(ch.prog) == Some(&true))
+            && ch.clen > 0
+            && end <= prompt.len()
+        {
+            let m = PackMember {
+                slot,
+                c0: ch.c0,
+                rows: &prompt[ch.c0 as usize..end],
+                sample: true,
+            };
+            return self.run_pack(ch.prog, &[m]).map(|_| ());
+        }
         self.model.kv_rebase(slot)?;
         let r = self.prefill_chunk(prompt, ch);
         self.model.kv_rebase(0)?;
@@ -2691,22 +2714,34 @@ impl CpuEngine {
             .max()
     }
 
-    /// The bucket a chunk of `rows` runs alone (`next_chunk`'s smallest holding it).
-    fn solo_bucket(&self, rows: u32) -> Option<usize> {
-        self.prefill_buckets()
+    /// Prefill several requests' chunks in ONE launch of the narrowest merged bucket holding all
+    /// their rows, so the weights stream once for every member. Batch-invariant: attention splits
+    /// at absolute key positions and nothing else in a bucket depends on the launch's rows, so a
+    /// member's logits and KV are bit-identical to prefilling it alone. Returns the greedy next
+    /// token of each `sample` member in order; its softcapped logits are the same-numbered
+    /// `act.logits` row.
+    pub fn prefill_packed(&mut self, members: &[PackMember<'_>]) -> Result<Vec<u32>> {
+        let m: usize = members.iter().map(|mb| mb.rows.len()).sum();
+        let merge = match &self.pack {
+            Ok(r) => &r.merge,
+            Err(why) => {
+                return Err(RuntimeError::Rejected(format!(
+                    "packed prefill unavailable: {why}"
+                )))
+            }
+        };
+        let (prog, _) = self
+            .prefill_buckets()
             .into_iter()
-            .filter(|&(_, t)| t >= rows)
+            .filter(|&(p, t)| t as usize >= m && merge[p])
             .min_by_key(|&(_, t)| t)
-            .map(|(p, _)| p)
+            .ok_or_else(|| {
+                RuntimeError::Rejected(format!("no merged prefill bucket holds {m} packed rows"))
+            })?;
+        self.run_pack(prog, members)
     }
 
-    /// Prefill several requests' chunks in ONE launch of the narrowest merged bucket holding all
-    /// their rows, so the weights stream once for every member. Batch-invariant: each member's
-    /// attention keeps the split count of the bucket it would run alone, and nothing else in a
-    /// bucket depends on the launch's rows, so its logits and KV are bit-identical to prefilling
-    /// it alone. Returns the greedy next token of each `sample` member in order; its softcapped
-    /// logits are the same-numbered `act.logits` row.
-    pub fn prefill_packed(&mut self, members: &[PackMember<'_>]) -> Result<Vec<u32>> {
+    fn run_pack(&mut self, prog: usize, members: &[PackMember<'_>]) -> Result<Vec<u32>> {
         let route = match &self.pack {
             Ok(r) => r,
             Err(why) => {
@@ -2737,33 +2772,24 @@ impl CpuEngine {
             }
             m += mb.rows.len() as u32;
         }
-        let (prog, t) = self
-            .prefill_buckets()
-            .into_iter()
-            .filter(|&(p, t)| t >= m && route.merge[p])
-            .min_by_key(|&(_, t)| t)
-            .ok_or_else(|| {
-                RuntimeError::Rejected(format!("no merged prefill bucket holds {m} packed rows"))
-            })?;
-        let mut span_nsplit = Vec::with_capacity(members.len());
-        for mb in members {
-            match self.solo_bucket(mb.rows.len() as u32) {
-                Some(p) if route.merge[p] => span_nsplit.push(route.nsplit[p]),
-                _ => {
-                    return Err(RuntimeError::Rejected(format!(
-                        "a {}-row chunk runs alone on a bucket a pack cannot reproduce",
-                        mb.rows.len()
-                    )))
-                }
-            }
+        let t = self.model.blob.progs[prog].t;
+        if prog >= route.merge.len() || !route.merge[prog] || m > t {
+            return Err(RuntimeError::Rejected(format!(
+                "prefill program {prog} cannot carry a {m}-row pack"
+            )));
         }
         let lm = route.lm[prog];
         let (opart, mlpart) = self.pack_parts.as_ref().expect("packed prefill scratch");
+        // Each row carries every absolute split up to its q tile's last key
+        // (`plow_pf_tile_splits`).
+        let spl = self.split_rows;
         let mut row_off = Vec::with_capacity(m as usize + 1);
         row_off.push(0u32);
-        for (mb, &ns) in members.iter().zip(&span_nsplit) {
-            for _ in 0..mb.rows.len() {
-                row_off.push(row_off.last().unwrap() + ns);
+        for mb in members {
+            let n = mb.rows.len() as u32;
+            for i in 0..n {
+                let tile_end = (mb.c0 + i / ffi::PF_TILE * ffi::PF_TILE + ffi::PF_TILE).min(mb.c0 + n);
+                row_off.push(row_off.last().unwrap() + tile_end.div_ceil(spl));
             }
         }
         let splits = *row_off.last().unwrap() as usize;
@@ -2821,7 +2847,8 @@ impl CpuEngine {
             row_slot: row_slot.as_ptr(),
             n_spans: spans.len() as u32,
             rows: m,
-            span_nsplit: span_nsplit.as_ptr(),
+            split_rows: spl,
+            reserved0: 0,
             row_off: row_off.as_ptr(),
             opart,
             mlpart,
