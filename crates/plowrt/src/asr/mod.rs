@@ -60,6 +60,21 @@ pub trait Transcriber: Send {
         cancel: &std::sync::atomic::AtomicBool,
     ) -> crate::Result<Transcript>;
 
+    /// `transcribe`, reporting the transcript so far each time it grows (streamed deltas). An
+    /// engine that decodes in one step reports the final text once.
+    fn transcribe_streaming(
+        &mut self,
+        samples: &[f32],
+        language: Option<&str>,
+        context: &str,
+        cancel: &std::sync::atomic::AtomicBool,
+        on_text: &mut dyn FnMut(&str),
+    ) -> crate::Result<Transcript> {
+        let transcript = self.transcribe(samples, language, context, cancel)?;
+        on_text(&transcript.text);
+        Ok(transcript)
+    }
+
     fn transcribe_batch(
         &mut self,
         requests: &[TranscriptionInput<'_>],
@@ -105,6 +120,17 @@ impl<T: Transcriber + ?Sized> Transcriber for Box<T> {
         cancel: &std::sync::atomic::AtomicBool,
     ) -> crate::Result<Transcript> {
         (**self).transcribe(samples, language, context, cancel)
+    }
+
+    fn transcribe_streaming(
+        &mut self,
+        samples: &[f32],
+        language: Option<&str>,
+        context: &str,
+        cancel: &std::sync::atomic::AtomicBool,
+        on_text: &mut dyn FnMut(&str),
+    ) -> crate::Result<Transcript> {
+        (**self).transcribe_streaming(samples, language, context, cancel, on_text)
     }
 
     fn transcribe_batch(

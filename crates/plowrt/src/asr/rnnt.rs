@@ -198,13 +198,20 @@ impl PacketRnnt {
             input,
             self.frames,
             self.encoder_programs.len() - 1,
+            &mut |_| {},
         )
     }
 
-    pub fn transcribe_input_frames(
+    pub fn transcribe_input_frames(&mut self, input: &[f32], valid_input_frames: usize) -> Result<Vec<u32>> {
+        self.transcribe_input_frames_with(input, valid_input_frames, &mut |_| {})
+    }
+
+    /// [`Self::transcribe_input_frames`], reporting the tokens emitted so far after each one.
+    pub fn transcribe_input_frames_with(
         &mut self,
         input: &[f32],
         valid_input_frames: usize,
+        on_emit: &mut dyn FnMut(&[u32]),
     ) -> Result<Vec<u32>> {
         let encoder = self
             .encoder_programs
@@ -217,7 +224,7 @@ impl PacketRnnt {
             })?;
         let frames =
             self.valid_encoder_frames(valid_input_frames, self.encoder_programs[encoder].0)?;
-        self.transcribe_input_with_encoder_frames(input, frames, encoder)
+        self.transcribe_input_with_encoder_frames(input, frames, encoder, on_emit)
     }
 
     fn transcribe_input_with_encoder_frames(
@@ -225,9 +232,10 @@ impl PacketRnnt {
         input: &[f32],
         frames: usize,
         encoder: usize,
+        on_emit: &mut dyn FnMut(&[u32]),
     ) -> Result<Vec<u32>> {
         self.runtime.begin_execution()?;
-        let result = self.transcribe_active(input, frames, encoder);
+        let result = self.transcribe_active(input, frames, encoder, on_emit);
         let ended = self.runtime.end_execution();
         result.and_then(|tokens| ended.map(|()| tokens))
     }
@@ -237,6 +245,7 @@ impl PacketRnnt {
         input: &[f32],
         frames: usize,
         encoder: usize,
+        on_emit: &mut dyn FnMut(&[u32]),
     ) -> Result<Vec<u32>> {
         if input.len() != self.input_elements() {
             return Err(RuntimeError::Rejected(format!(
@@ -273,7 +282,7 @@ impl PacketRnnt {
             profile: profile.as_mut(),
         };
         let result =
-            GreedyRnnt::new(self.blank_id, self.max_symbols_per_frame)?.decode(&mut execution);
+            GreedyRnnt::new(self.blank_id, self.max_symbols_per_frame)?.decode_with(&mut execution, on_emit);
         self.last_profile = profile;
         result
     }
@@ -484,6 +493,15 @@ impl GreedyRnnt {
     /// Decode one encoder chunk. A fixed predictor state evaluates every remaining frame in one
     /// packet dispatch; the first nonblank token invalidates that speculative tail.
     pub fn decode(&mut self, execution: &mut dyn RnntExecution) -> Result<Vec<u32>> {
+        self.decode_with(execution, &mut |_| {})
+    }
+
+    /// [`Self::decode`], calling `on_emit` with every token emitted so far after each one.
+    pub fn decode_with(
+        &mut self,
+        execution: &mut dyn RnntExecution,
+        on_emit: &mut dyn FnMut(&[u32]),
+    ) -> Result<Vec<u32>> {
         let frames = execution.frames();
         let mut emitted = Vec::new();
         let mut ids = vec![self.blank_id; frames];
@@ -514,6 +532,7 @@ impl GreedyRnnt {
             frame += offset;
             let token = ids[offset];
             emitted.push(token);
+            on_emit(&emitted);
             execution.commit_prediction();
             self.previous_token = token;
             self.predictor_valid = false;

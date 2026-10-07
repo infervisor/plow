@@ -63,6 +63,18 @@ impl Transcriber for PacketRnntTranscriber {
         context: &str,
         cancel: &AtomicBool,
     ) -> Result<Transcript> {
+        self.transcribe_streaming(samples, language, context, cancel, &mut |_| {})
+    }
+
+    /// Text grows as the greedy RNNT loop emits tokens (after the whole encoder pass).
+    fn transcribe_streaming(
+        &mut self,
+        samples: &[f32],
+        language: Option<&str>,
+        context: &str,
+        cancel: &AtomicBool,
+        on_text: &mut dyn FnMut(&str),
+    ) -> Result<Transcript> {
         if !context.is_empty() {
             return Err(rejected("speech context is not implemented"));
         }
@@ -81,9 +93,10 @@ impl Transcriber for PacketRnntTranscriber {
         }
         let mut input = features.values;
         input.resize(expected, 0.0);
-        let tokens = self
-            .execution
-            .transcribe_input_frames(&input, valid_frames)?;
+        let vocabulary = &self.vocabulary;
+        let tokens = self.execution.transcribe_input_frames_with(&input, valid_frames, &mut |emitted| {
+            on_text(&detokenize_sentencepiece(vocabulary, emitted))
+        })?;
         if cancel.load(Ordering::Relaxed) {
             return Err(rejected("ASR cancelled"));
         }

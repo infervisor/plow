@@ -114,8 +114,9 @@ Routes: `POST /v1/audio/transcriptions`, `GET /v1/audio/transcriptions/stream` (
 
 Multipart fields: required `file` and `model`; optional `language`, `prompt`,
 `response_format=json|text`, `temperature=0`, `stream=true` (OpenAI server-sent events:
-`transcript.text.delta` as the decoder produces text, then `transcript.text.done`; on
-`plowrt asr` the whole text arrives as one delta). Unknown/duplicate fields and unsupported
+`transcript.text.delta` as the decoder produces text, then `transcript.text.done`; RNNT models
+emit a delta per token after their encoder pass; a cohort engine without token streaming, such as
+Qwen on `plowrt asr`, sends the whole text as one delta). Unknown/duplicate fields and unsupported
 generation options fail. The body limit is 4 MiB. Audio is WAV, mono or stereo (averaged),
 integer 8/16/24/32-bit or 32-bit float, at 8 to 48 kHz; other rates are resampled to 16 kHz
 (windowed sinc). Appended session pieces must be 16 kHz. Audio is 0.5 to 30 seconds.
@@ -172,7 +173,7 @@ clients are unaffected. The `ready` event carries `session_id`, `request_id`, `s
   the open encoder window and resumes the session's decoder rows; on `plowrt asr` it
   re-transcribes the whole buffer.
 - Send `{"type":"finish"}` once after the last samples. With `deltas`, `delta {text}` events
-  stream the transcript as it decodes (one delta with the whole text on `plowrt asr`), then one
+  stream the transcript as it decodes (RNNT: per token; Qwen on `plowrt asr`: one delta), then one
   `final {revision, text, language, stable_prefix_bytes, turn_id, traceparent, server_timing}`.
 - `{"type":"cancel"}` or disconnection cancels the session. Terminal
   `error {message, terminal: true, code?}` events end unsuccessful sessions; `code` is

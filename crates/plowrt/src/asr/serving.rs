@@ -109,10 +109,7 @@ impl Route {
         opts: AsrOpts,
     ) -> Result<oneshot::Receiver<crate::Result<Transcript>>, SubmitError> {
         match self {
-            Route::Cohort(mux) => {
-                let _ = opts;
-                mux.submit(samples, language, context, cancel)
-            }
+            Route::Cohort(mux) => mux.submit_with(samples, language, context, cancel, opts.deltas),
             #[cfg(feature = "cuda")]
             Route::Shared(asr, mux) => asr.submit(mux.clone(), samples, language, context, cancel, opts),
         }
@@ -142,6 +139,8 @@ struct AsrJob {
     context: String,
     cancel: Arc<AtomicBool>,
     respond: oneshot::Sender<crate::Result<Transcript>>,
+    /// Transcript text as it grows; honoured when the job runs alone (`transcribe_streaming`).
+    deltas: Option<mpsc::UnboundedSender<String>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -194,6 +193,27 @@ impl AsrMux {
                         metrics.running.fetch_add(1, Ordering::Relaxed);
                         metrics.queue.duration(job.queued_at.elapsed());
                     }
+                    if let [job] = cohort.make_contiguous() {
+                        if let Some(deltas) = job.deltas.clone() {
+                            let job = cohort.pop_front().expect("one job");
+                            let mut shown = String::new();
+                            let result = engine.transcribe_streaming(
+                                &job.samples,
+                                job.language.as_deref(),
+                                &job.context,
+                                &job.cancel,
+                                &mut |text| {
+                                    // Only text that extends what was sent; the final pass sends any rest.
+                                    if let Some(rest) = text.strip_prefix(shown.as_str()).filter(|r| !r.is_empty()) {
+                                        let _ = deltas.send(rest.to_owned());
+                                        shown.push_str(rest);
+                                    }
+                                },
+                            );
+                            finish_job(job, result);
+                            continue;
+                        }
+                    }
                     let requests: Vec<_> = cohort
                         .iter()
                         .map(|job| TranscriptionInput {
@@ -232,6 +252,17 @@ impl AsrMux {
         context: String,
         cancel: Arc<AtomicBool>,
     ) -> Result<oneshot::Receiver<crate::Result<Transcript>>, SubmitError> {
+        self.submit_with(samples, language, context, cancel, None)
+    }
+
+    fn submit_with(
+        &self,
+        samples: Vec<f32>,
+        language: Option<String>,
+        context: String,
+        cancel: Arc<AtomicBool>,
+        deltas: Option<mpsc::UnboundedSender<String>>,
+    ) -> Result<oneshot::Receiver<crate::Result<Transcript>>, SubmitError> {
         let permit = self.tx.try_reserve().map_err(|error| {
             self.metrics.serving.asr.rejected.fetch_add(1, Ordering::Relaxed);
             match error {
@@ -248,6 +279,7 @@ impl AsrMux {
             context,
             cancel,
             respond,
+            deltas,
         };
         self.metrics.serving.asr.jobs.fetch_add(1, Ordering::Relaxed);
         self.metrics.serving.asr.queued.fetch_add(1, Ordering::Relaxed);
@@ -1789,6 +1821,46 @@ mod tests {
         assert_eq!((stats.jobs, stats.completed, stats.cancelled, stats.errors), (4, 3, 1, 0));
         assert_eq!((stats.queued, stats.running), (0, 0));
         assert_eq!((stats.e2e.count, stats.queue.count, stats.first_transcript.count), (4, 4, 3));
+    }
+
+    #[tokio::test]
+    async fn cohort_streams_growing_text_as_deltas() {
+        struct Growing;
+        impl Transcriber for Growing {
+            fn language(&self, _: Option<&str>) -> crate::Result<Option<String>> {
+                Ok(None)
+            }
+            fn transcribe(&mut self, _: &[f32], _: Option<&str>, _: &str, _: &AtomicBool) -> crate::Result<Transcript> {
+                Ok(Transcript { text: "Hello world".into(), language: None })
+            }
+            fn transcribe_streaming(
+                &mut self,
+                _: &[f32],
+                _: Option<&str>,
+                _: &str,
+                _: &AtomicBool,
+                on_text: &mut dyn FnMut(&str),
+            ) -> crate::Result<Transcript> {
+                for text in ["Hello", "Hello", "Hello wor", "Hello world"] {
+                    on_text(text);
+                }
+                Ok(Transcript { text: "Hello world".into(), language: None })
+            }
+        }
+        let (mux, _, _) = AsrMux::spawn(Box::new(Growing));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let result = mux
+            .submit_with(vec![0.0], None, String::new(), Arc::new(AtomicBool::new(false)), Some(tx))
+            .unwrap()
+            .await
+            .unwrap()
+            .unwrap();
+        let mut deltas = Vec::new();
+        while let Ok(delta) = rx.try_recv() {
+            deltas.push(delta);
+        }
+        assert_eq!(deltas, ["Hello", " wor", "ld"]);
+        assert_eq!(result.text, deltas.concat());
     }
 
     #[tokio::test]
