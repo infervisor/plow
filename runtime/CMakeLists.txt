@@ -529,7 +529,13 @@ option(PLOW_CUBIN_GEMV_WIDE "Also emit the _gw decode cubin carrying the wide-ru
 # what the shipped assets were built at. This is ONE variable applied to every
 # decode-family object, which is what bug #2 above needed and did not have.
 set(PLOW_NV_FA_GF_FULL "4" CACHE STRING "full-attn (hd512) flash-decode GQA fusion: 1|2|4|8")
-set(PLOW_CUBIN_NVCC "/usr/local/cuda/bin/nvcc" CACHE FILEPATH "nvcc used for the served cubins")
+# The dev shell exports PLOW_NVCC (the nix toolkit), as plowc reads it.
+if(DEFINED ENV{PLOW_NVCC})
+    set(_plow_nvcc_default "$ENV{PLOW_NVCC}")
+else()
+    set(_plow_nvcc_default "/usr/local/cuda/bin/nvcc")
+endif()
+set(PLOW_CUBIN_NVCC "${_plow_nvcc_default}" CACHE FILEPATH "nvcc used for the served cubins")
 set(PLOW_CUBIN_ARCH "sm_120a" CACHE STRING "-arch for the served cubins")
 set(PLOW_CUBIN_DIR "${CMAKE_BINARY_DIR}/cubin" CACHE PATH "output directory for the served cubins")
 # Passed through verbatim after the derived set — the decode tuner's sweep knob

@@ -37,7 +37,15 @@ macro_rules! api {
             #[allow(non_snake_case)]
             fn load() -> Result<Self> {
                 let mut last = String::new();
-                for path in ["libcublasLt.so.13", "libcublasLt.so.12", "libcublasLt.so"] {
+                let mut paths: Vec<std::ffi::OsString> =
+                    ["libcublasLt.so.13", "libcublasLt.so.12", "libcublasLt.so"].map(Into::into).into();
+                // Without a system toolkit on the loader path (a nix-only box), the dev shell's
+                // CUDA_PATH toolkit carries the library.
+                if let Some(cuda) = std::env::var_os("CUDA_PATH") {
+                    let lib = std::path::Path::new(&cuda).join("lib");
+                    paths.extend(["libcublasLt.so.12", "libcublasLt.so"].map(|n| lib.join(n).into_os_string()));
+                }
+                for path in paths {
                     // SAFETY: optional NVIDIA host library, retained with its symbols.
                     let lib = match unsafe { libloading::Library::new(path) } {
                         Ok(lib) => lib,
