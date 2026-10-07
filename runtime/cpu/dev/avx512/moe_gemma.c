@@ -98,13 +98,17 @@ static inline float row_invrms(const plow_bf16* r, uint32_t H, float eps) {
     return g_rsqrt(v_row_ss(r, H) / (float)H + eps);
 }
 
-/* h2 = resid * invrms * root * scale (f32), staged once per row; shared by 69 and 73 so the two
- * paths produce bit-identical scores (the prefill chain must reproduce the decode chain). */
+/* h2 = resid * invrms, * scale, * root, each rounded to bf16 (golden gm_router_in), staged once
+ * per row; shared by 69 and 73 so the two paths produce bit-identical scores (the prefill chain
+ * must reproduce the decode chain). */
 static inline void stage_h2(float* h2, const plow_bf16* rr, const plow_bf16* scale, uint32_t H, float root,
                             float eps) {
-    const __m512 sc = _mm512_set1_ps(row_invrms(rr, H, eps) * root);
-    for (uint32_t h = 0; h < H; h += 16u)
-        _mm512_storeu_ps(h2 + h, _mm512_mul_ps(_mm512_mul_ps(v_load_bf16(rr + h), sc), v_load_bf16(scale + h)));
+    const __m512 inv = _mm512_set1_ps(row_invrms(rr, H, eps)), vr = _mm512_set1_ps(root);
+    for (uint32_t h = 0; h < H; h += 16u) {
+        const __m512 n = v_round_bf16(_mm512_mul_ps(v_load_bf16(rr + h), inv));
+        const __m512 s = v_round_bf16(_mm512_mul_ps(n, v_load_bf16(scale + h)));
+        _mm512_storeu_ps(h2 + h, v_round_bf16(_mm512_mul_ps(s, vr)));
+    }
 }
 
 /* srow[e] = proj[e] . h2 for e in [e0, e1), 4 experts per pass. dotf_r4 keeps one accumulator per
@@ -121,6 +125,7 @@ static void score_experts(float* srow, const plow_bf16* proj, const float* h2, u
         dotf_r4(pr, pr, pr, pr, h2, H, o);
         srow[e] = o[0];
     }
+    for (e = e0; e < e1; e++) srow[e] = plow_bf2f(plow_f2bf(srow[e])); /* bf16 scores, as golden */
 }
 
 /* golden gm_topk_tail with the k selection passes vectorized. Softmax, gate normalisation and the
