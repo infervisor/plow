@@ -2974,9 +2974,17 @@ pub fn config_header(manifest: &Value) -> String {
             // sm_90a: BATCH>=2 decode rungs walk the weights on the tensor cores
             // (op_gemv_mma.cuh). The dot8 walk is compute-bound above MM=1 — 100–366 GB/s at
             // M=16 vs 1.4–2.6 TB/s (experiments/gemv_mma_batch_h100.cu) — and the B=1 rung is
-            // untouched, so a packet whose ladder reaches 2 turns it on for its objects.
-            if v >= 2 && manifest.get("arch").and_then(Value::as_str) == Some("sm_90a") {
+            // untouched, so a packet whose ladder reaches 2 turns it on for its objects. The walk is
+            // mma.sync m16n8k16 + 16-byte loads, so Ada (sm_89) takes it too, except in the speech
+            // object: its static reduction smem on top of the 96 KiB speech arena passes sm_89's
+            // 99 KiB block limit, and speech packets run no batched decode GEMVs.
+            let arch = manifest.get("arch").and_then(Value::as_str);
+            if v >= 2 && arch == Some("sm_90a") {
                 out.push_str("#ifndef PLOW_NV_GEMV_MMA\n#define PLOW_NV_GEMV_MMA 1\n#endif\n");
+            } else if v >= 2 && arch == Some("sm_89") {
+                out.push_str(
+                    "#if !PLOW_NV_SPEECH\n#ifndef PLOW_NV_GEMV_MMA\n#define PLOW_NV_GEMV_MMA 1\n#endif\n#endif\n",
+                );
             }
         }
         if let Some(v) = t.get("gf256").and_then(Value::as_u64) {
