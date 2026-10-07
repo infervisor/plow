@@ -13,6 +13,7 @@ shared memory per block. Only the packets differ (142 SMs, `--gpu l40s`).
 | Orpheus 3B TTS | `orpheus/sm89-l40s-tp1.toml` | Whisper CER median | 0.000 (n=80) |
 | Veena TTS | `veena/sm89-l40s-tp1.toml` | Whisper CER median | 0.005-0.016 (n=80, sampled) |
 | Chatterbox TTS | `chatterbox/sm89-l40s-tp1.toml` | CER / S3Gen mel rel-L2 | 0.000 (n=32) / 1.4e-5 |
+| Chatterbox MTL (23 languages) | `chatterbox-mtl/sm89-l40s-tp1.toml` | CER median / worst language / S3Gen rel-L2 | 0.000 / fr 0.148 / 1.4e-5 |
 | Gemma 4 E4B | `gemma-4-e4b/sm89-l40s-tp1.toml` | logit parity vs HF bf16 | top1 0.9867, KL mean 7.8e-4 |
 
 ASR WERs equal the L4 and H100 numbers; the decode change below leaves every gate unchanged.
@@ -31,6 +32,7 @@ python3 scripts/campaign/campaign.py gate recipes/infervisor/qwen3-asr/sm89-l40s
   --assets <dir>/assets --out <dir>/gate     # PYREF, ASR_MANIFEST as in the recipe
 # Orpheus: --hf-dir <canopylabs or unsloth orpheus-3b-0.1-ft snapshot>
 # Chatterbox: CBX_PY=<python with chatterbox-tts 0.1.7> for the T3/S3Gen prep and the S3Gen gate
+# Chatterbox MTL: CBX_PY=<python with upstream chatterbox (git), whose mtl_tts loads t3_mtl23ls_v3>
 
 # Nemotron 3.5: packet for 142 SMs + the specialized speech object (`gguf` feature in plowrt)
 scripts/asr/nvidia/nemotron_l4_build.sh nemotron-3.5-asr-streaming-0.6b.q8_0.gguf <dir> 142
@@ -54,7 +56,7 @@ step:
 | Qwen3-ASR 1.7B | 5.04 | 6.17 | 7.32 | 9.68 | 84 / 88 / 90 |
 | Qwen3-ASR 0.6B | 2.34 | 3.27 | 4.41 | 6.81 | 67 / 85 / 89 |
 | Orpheus / Veena (Llama 3B) | 8.96 | 10.19 | 11.37 | 13.81 | 89 / 90 / 91 |
-| Chatterbox T3 | 2.20 | 3.28 | 4.54 | 7.04 | 62 / 81 / 87 |
+| Chatterbox / MTL T3 | 2.20 | 3.28 | 4.54 | 7.04 | 62 / 81 / 87 |
 | Gemma 4 E4B | 13.61 | 14.45 | 15.26 | 16.55 | 82 / 82 / 84 |
 
 Batched decode GEMVs (B >= 2) walk the weights on the tensor cores (`op_gemv_mma.cuh`,
@@ -99,6 +101,11 @@ sit at 62-66% at B=1.
 All three in one serve at once (Qwen c16 + c16, Nemotron c4): WER unchanged; RTFx 111.9 / 114.8
 / 75.5.
 
+Streaming on that serve, all three models, the four longest clips under 20 s: SSE deltas join to
+the HTTP transcript (first delta 57-91 ms), the native WebSocket at 16 kHz (partials + deltas) and
+48 kHz equals it, OpenAI Realtime (manual commit) equals it, and continuous mode over three clips
+with 1 s gaps yields three ordered segments within 0-3.5% WER of the whole-clip transcripts.
+
 TTS (`scripts/tts/tts_bench.py`, streaming):
 
 | model | conc | TTFA median | RTF median | audio s per s |
@@ -106,6 +113,7 @@ TTS (`scripts/tts/tts_bench.py`, streaming):
 | Orpheus | 1 / 32 | 141 / 299 ms | 0.75 / 1.21 | 1.34 / 20.3 |
 | Veena | 1 / 32 | 141 / 309 ms | 0.75 / 1.22 | 1.34 / 21.2 |
 | Chatterbox | 1 / 8 | 173 / 293 ms | 0.16 / 0.31 | 6.5 / 24.7 |
+| Chatterbox MTL | 1 / 8 | 175 / 420 ms | 0.17 / 0.33 | 5.9 / 23.9 |
 
 A SNAC codec-LM stream needs ~83 decode tokens per audio second, so BF16 Orpheus/Veena stay real
 time per stream up to 16 concurrent streams (11.8 ms steps); at 32 even the 12.5 ms roofline step
