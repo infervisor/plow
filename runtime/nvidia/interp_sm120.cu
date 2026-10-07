@@ -4030,7 +4030,9 @@ extern "C" __global__ void __launch_bounds__(PLOW_NV_THREADS, 1)
     }
 }
 extern "C" __device__ unsigned PLOW_SYM(plow_light_attn_hd) = PLOW_NV_FA_HD;
-#if PLOW_NV_FA_HD == 128 && PLOW_NV_FA_RG && PLOW_NV_FA_RG_U == 4
+/* The streamed body (cp.async.bulk + mbarrier) is sm_90+; Ada folds on the interpreter's item. */
+#if PLOW_NV_FA_HD == 128 && PLOW_NV_FA_RG && PLOW_NV_FA_RG_U == 4 && \
+    (!defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 900)
 /* A light attention segment's merge-folded hd128 FlashDecode (nsplit 1, no window, no ring wrap)
  * on the streamed body, bit-identical to the row-group one (d_flash_decode_stream). `hnr[0..3]`
  * = the q, k, v HeadNormRope instructions it folds in (~0u: none, Q is already roped); their x

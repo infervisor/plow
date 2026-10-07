@@ -6,8 +6,8 @@
 #   PYREF=<python with torch + snac> nix develop --command python3 scripts/campaign/campaign.py \
 #     build recipes/infervisor/orpheus/sm89-l40s-tp1.toml [--hf-dir <orpheus snapshot>] --out <fresh dir>
 #
-# Gate: Whisper CER median 0.000 (n=80). Decode ctx 1024 B=1/16/32 9.01/11.81/14.29 ms =
-# 89/86/88% of the roofline; streaming c1 TTFA 141 ms, RTF 0.75; real time up to 16 streams
+# Gate: Whisper CER median 0.000 (n=80). Decode ctx 1024 B=1/16/32 8.96/11.37/13.81 ms =
+# 89/90/91% of the roofline; streaming c1 TTFA 141 ms, RTF 0.75; real time up to 16 streams
 # (docs/runtime/l40s-recipes.md).
 
 schema = "plow.recipe.v1"
@@ -58,6 +58,9 @@ PLOW_PF_LADDER_APPEND = "64,256"
 PLOW_DECODE_BATCH_LADDER = "1,2,4,8,16,32"
 PLOW_EMIT_PREFILL_CUBLASLT = "1"
 PLOW_NO_GLU_FUSE = "1"
+# hd128 row-group flash decode with merge fold (no FlashMerge level; changes attention sum
+# order): 0.6B / 1.7B / Orpheus B=16 ctx 1024 4.57/7.57/11.81 -> 4.40/7.30/11.37 ms.
+PLOW_NV_FA_FOLD = "1"
 
 [bench]
 kind = "speech"

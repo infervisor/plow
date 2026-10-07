@@ -5,7 +5,7 @@
 #     recipes/infervisor/qwen3-asr-0.6b/sm89-l40s-tp1.toml --out <fresh dir>
 #
 # Gate: WER on the 73-clip LibriSpeech dummy set = 4.261% (c1 and c16). Decode ctx 1024
-# B=1/16/32 2.38/4.57/7.08 ms = 66/81/85% of the roofline (B=1: interpreter per-op latency);
+# B=1/16/32 2.34/4.41/6.81 ms = 67/85/89% of the roofline (B=1: interpreter per-op latency);
 # served c1 p50 66 ms, c16 RTFx 594 (docs/runtime/l40s-recipes.md).
 
 schema = "plow.recipe.v1"
@@ -48,6 +48,9 @@ PLOW_PF_LADDER_APPEND = "256,384"
 PLOW_DECODE_BATCH_LADDER = "1,2,4,8,16,32"
 PLOW_EMIT_PREFILL_CUBLASLT = "1"
 PLOW_NO_GLU_FUSE = "1"
+# hd128 row-group flash decode with merge fold (no FlashMerge level; changes attention sum
+# order): 0.6B / 1.7B / Orpheus B=16 ctx 1024 4.57/7.57/11.81 -> 4.40/7.30/11.37 ms.
+PLOW_NV_FA_FOLD = "1"
 # Packed prefill (several requests' prompts per launch; weights read once): 1.7B c16 RTFx
 # 74.1 -> 85.2, WER unchanged. The packed-request objects build for Ada (PLOW_NV_ADA).
 PLOW_EMIT_PACKED_PREFILL = "1"

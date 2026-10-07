@@ -11,7 +11,7 @@ shared memory per block. Only the packets differ (142 SMs, `--gpu l40s`).
 | Qwen3-ASR 0.6B | `qwen3-asr-0.6b/sm89-l40s-tp1.toml` | WER | 4.261% |
 | Nemotron 3.5 (Q8_0 RNNT) | `nemotron-3.5-asr/sm89-l40s-tp1.toml` | WER | 5.13% |
 | Orpheus 3B TTS | `orpheus/sm89-l40s-tp1.toml` | Whisper CER median | 0.000 (n=80) |
-| Veena TTS | `veena/sm89-l40s-tp1.toml` | Whisper CER median | 0.005-0.011 (n=80, sampled) |
+| Veena TTS | `veena/sm89-l40s-tp1.toml` | Whisper CER median | 0.005-0.016 (n=80, sampled) |
 | Chatterbox TTS | `chatterbox/sm89-l40s-tp1.toml` | CER / S3Gen mel rel-L2 | 0.000 (n=32) / 1.4e-5 |
 | Gemma 4 E4B | `gemma-4-e4b/sm89-l40s-tp1.toml` | logit parity vs HF bf16 | top1 0.9867, KL mean 7.8e-4 |
 
@@ -51,9 +51,9 @@ step:
 
 | model | B=1 | B=8 | B=16 | B=32 | % of roofline B=1 / 16 / 32 |
 |---|---|---|---|---|---|
-| Qwen3-ASR 1.7B | 5.09 | 6.34 | 7.57 | 10.03 | 83 / 85 / 87 |
-| Qwen3-ASR 0.6B | 2.38 | 3.38 | 4.57 | 7.08 | 66 / 81 / 85 |
-| Orpheus / Veena (Llama 3B) | 9.01 | 10.31 | 11.81 | 14.29 | 89 / 86 / 88 |
+| Qwen3-ASR 1.7B | 5.04 | 6.17 | 7.32 | 9.68 | 84 / 88 / 90 |
+| Qwen3-ASR 0.6B | 2.34 | 3.27 | 4.41 | 6.81 | 67 / 85 / 89 |
+| Orpheus / Veena (Llama 3B) | 8.96 | 10.19 | 11.37 | 13.81 | 89 / 90 / 91 |
 | Chatterbox T3 | 2.20 | 3.28 | 4.54 | 7.04 | 62 / 81 / 87 |
 | Gemma 4 E4B | 13.61 | 14.45 | 15.26 | 16.55 | 82 / 82 / 84 |
 
@@ -71,8 +71,14 @@ The speech object keeps the dot8 walk: the walk's static reduction smem on top o
 speech arena passes the 99 KiB block limit (the ASR front end fails to load). Measured and not
 taken on Ada: the paired walk (`PLOW_NV_GEMV_MMA_PAIR`, +1-3%), the walk at B=1
 (`PLOW_NV_GEMV_MMA_B1`, B=1 +1.7%), `PLOW_FUSE_KV_HNR` and GLU fusion (no change). The
-`PLOW_NV_DENSE_TUNE` / gemv_k8 arms and decode cuBLASLt are emitted for sm_90a only, and
-`PLOW_NV_FA_FOLD` needs Hopper-only flash definitions. At B=1 the large GEMVs run at 89-99% of
+`PLOW_NV_DENSE_TUNE` / gemv_k8 arms and decode cuBLASLt are emitted for sm_90a only;
+`PLOW_NV_PTXSYNC=3` faults (illegal instruction) and gate sleep 1/16 vs 64 ns is within noise.
+
+The hd128 recipes (Qwen, Orpheus, Veena) set `PLOW_NV_FA_FOLD`: the last flash split merges, so
+each layer loses its FlashMerge level (decode sync costs ~1.1 us per dependency level on Ada).
+The streamed Hopper flash kernel is not built for sm_89; the fold runs on the interpreter's item.
+B=16 ctx 1024: Qwen 0.6B / 1.7B / Orpheus 4.57/7.57/11.81 -> 4.40/7.32/11.37 ms, gates unchanged
+(Chatterbox T3 is hd64, Gemma E4B already folds). At B=1 the large GEMVs run at 89-99% of
 bandwidth; the rest is the interpreter skeleton (0.28-0.56 ms) and per-op latency of the small
 norm/rope/per-layer-input ops, which is why the ~1.2 GB models (Qwen3-ASR 0.6B, Chatterbox T3)
 sit at 62-66% at B=1.
