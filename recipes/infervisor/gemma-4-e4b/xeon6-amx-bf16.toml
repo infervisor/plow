@@ -11,12 +11,15 @@
 # measurement (all arms): kernel.numa_balancing=0, a zero-latency CPU QoS request held
 # (/dev/cpu_dma_latency, as tuned latency-performance does), THP madvise, no pseudo-lock held (PLOW_CPU_SRAM off).
 #
-# Status: candidate until campaign.py report qualifies it.
+# Qualified (2026-10-07, packet 40c87d8e49cf as sm_120a; the amx emit differs only in the header target hash):
+# campaign.py report MATCHED + EQUIVALENT vs vLLM 0.30 CPU at 1000/128 c1/c8/c32; FP32-reference gate PASS,
+# KL mean 0.0006 vs vLLM 0.0014. Throughput 1.19-3.28x, TPOT P99 lower everywhere; burst TTFT P99 loses 1.11x / 1.36x at c8 / c32.
+# docs/bringup/results/gemma4-xeon6-bf16-20261006/comparison.md.
 schema = "plow.recipe.v1"
 namespace = "infervisor"
 name = "gemma-4-e4b"
 label = "xeon6-amx-bf16"
-status = "candidate"
+status = "validated"
 network = "gemma4"
 
 [target]
