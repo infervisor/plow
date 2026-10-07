@@ -3,15 +3,15 @@
 //! `cargo run --release --no-default-features --features cpu --example cpu_pack_check -- \
 //!     <model.pkt> <ckpt> [--lens 300,500,77,1000 | --gate prompts.json id,id,..] [--steps 16]`
 //!
-//! A = one `prefill_slot` per prompt; B = every prompt in one `prefill_packed`; C = two packs,
-//! the first carrying an intermediate chunk of prompt 0 and the second its tail at `c0 > 0`;
-//! D = each prompt alone in a pack; A' = each prompt alone, unpacked, on B's bucket. Passes iff
-//! D == A and B == A' exactly (logits, first token, greedy decode): packing changes nothing but
-//! the bucket, whose own effect (A' vs A) is printed as the noise floor.
+//! A = one `prefill_slot` per prompt; B = the prompts packed into as few launches as fit; C = two
+//! packs, the first carrying an intermediate chunk of prompt 0 and the second its tail at `c0 > 0`;
+//! D = each prompt alone in a pack. Passes iff B, C and D are bit-identical to the same chunks
+//! prefilled alone (logits, first token, B's greedy decode): packing is batch-invariant. The
+//! distance of an unpacked run on the widest packed bucket from A is printed for scale.
 
 #[cfg(feature = "cpu")]
 fn main() {
-    use plowrt::exec::cpu::engine::{CpuEngine, CpuEngineOpts, PackMember};
+    use plowrt::exec::cpu::engine::{Chunk, CpuEngine, CpuEngineOpts, PackMember};
     use plowrt::text::tokenizer::load_tokenizer;
     use std::path::PathBuf;
     use std::time::Instant;
@@ -73,7 +73,7 @@ fn main() {
     lens = prompts.iter().map(Vec::len).collect();
 
     let mut eng = CpuEngine::load(&blob, &ckpt, &CpuEngineOpts::default()).expect("load");
-    assert!(eng.packs(), "this packet has no packed prefill route (see the load log)");
+    assert!(eng.pack_rows().is_some(), "this packet has no packed prefill route (see the load log)");
     let batch = eng.model().batch;
     let n = prompts.len();
     assert!(n <= batch, "{n} prompts but {batch} slots");
@@ -130,96 +130,106 @@ fn main() {
     let ms_a = t.elapsed().as_secs_f64() * 1e3;
     let dec_a = decode(&mut eng, &tok_a);
 
-    // B: every prompt in one launch.
-    let members: Vec<PackMember> = prompts
-        .iter()
-        .enumerate()
-        .map(|(i, p)| PackMember { slot: i, c0: 0, rows: p, sample: true })
-        .collect();
+    // B: the prompts packed greedily into launches of at most `pack_rows` rows.
+    let cap = eng.pack_rows().unwrap() as usize;
+    let mut groups: Vec<Vec<usize>> = Vec::new();
+    for (i, p) in prompts.iter().enumerate() {
+        match groups.last_mut() {
+            Some(g) if g.iter().map(|&j| prompts[j].len()).sum::<usize>() + p.len() <= cap => g.push(i),
+            _ => groups.push(vec![i]),
+        }
+    }
+    let mut tok_b = vec![0u32; n];
+    let mut lg_b = vec![Vec::new(); n];
     let t = Instant::now();
-    let tok_b = eng.prefill_packed(&members).expect("packed prefill");
+    for g in &groups {
+        let m: Vec<PackMember> =
+            g.iter().map(|&i| PackMember { slot: i, c0: 0, rows: &prompts[i], sample: true }).collect();
+        for (j, (&i, tok)) in g.iter().zip(eng.prefill_packed(&m).expect("packed prefill")).enumerate() {
+            tok_b[i] = tok;
+            lg_b[i] = logits(&eng, j);
+        }
+    }
     let ms_b = t.elapsed().as_secs_f64() * 1e3;
-    let lg_b: Vec<Vec<f32>> = (0..n).map(|i| logits(&eng, i)).collect();
     let dec_b = decode(&mut eng, &tok_b);
 
-    // C: prompt 0 split across two packs.
-    let cut = prompts[0].len() / 2;
-    let mut first = vec![PackMember { slot: 0, c0: 0, rows: &prompts[0][..cut], sample: false }];
-    let mut second =
-        vec![PackMember { slot: 0, c0: cut as u32, rows: &prompts[0][cut..], sample: true }];
-    for (i, p) in prompts.iter().enumerate().skip(1) {
-        let m = PackMember { slot: i, c0: 0, rows: p, sample: true };
-        if i % 2 == 1 { first.push(m) } else { second.push(m) }
+    // C: prompt 0 as two chunks, each riding a pack (an intermediate chunk, then its tail at
+    // c0 > 0), against the same two chunks prefilled alone.
+    let solo = |eng: &CpuEngine, rows: usize| {
+        eng.prefill_buckets()
+            .into_iter()
+            .filter(|&(_, t)| t as usize >= rows)
+            .min_by_key(|&(_, t)| t)
+            .unwrap()
+            .0
+    };
+    let (p0, cut) = (&prompts[0], prompts[0].len() / 2);
+    for (c0, clen) in [(0, cut), (cut, p0.len() - cut)] {
+        let ch = Chunk { prog: solo(&eng, clen), c0: c0 as u32, clen: clen as u32 };
+        eng.prefill_slot_chunk(0, p0, ch).expect("solo chunk");
     }
-    let mut tok_c = vec![0u32; n];
-    let t1 = eng.prefill_packed(&first).expect("pack 1");
-    for (m, t) in first.iter().filter(|m| m.sample).zip(t1) {
-        tok_c[m.slot] = t;
+    let (tok_c0, lg_c0) = (eng.last_token().unwrap(), logits(&eng, 0));
+    fn fill<'a>(head: PackMember<'a>, parity: usize, prompts: &'a [Vec<u32>], cap: usize) -> Vec<PackMember<'a>> {
+        let mut v = vec![head];
+        let mut rows = head.rows.len();
+        for (i, p) in prompts.iter().enumerate().skip(1).filter(|(i, _)| i % 2 == parity) {
+            if rows + p.len() <= cap {
+                rows += p.len();
+                v.push(PackMember { slot: i, c0: 0, rows: p.as_slice(), sample: true });
+            }
+        }
+        v
     }
-    let t2 = eng.prefill_packed(&second).expect("pack 2");
-    for (m, t) in second.iter().filter(|m| m.sample).zip(t2) {
-        tok_c[m.slot] = t;
+    let first = fill(PackMember { slot: 0, c0: 0, rows: &p0[..cut], sample: false }, 1, &prompts, cap);
+    let second = fill(PackMember { slot: 0, c0: cut as u32, rows: &p0[cut..], sample: true }, 0, &prompts, cap);
+    let mut c_ok = true;
+    for pack in [&first, &second] {
+        let toks = eng.prefill_packed(pack).expect("pack C");
+        for (j, (m, tok)) in pack.iter().filter(|m| m.sample).zip(toks).enumerate() {
+            let lg = logits(&eng, j);
+            let (rt, rl) = if m.slot == 0 { (tok_c0, &lg_c0) } else { (tok_a[m.slot], &lg_a[m.slot]) };
+            c_ok &= tok == rt && diff(&lg, rl) == 0.0;
+        }
     }
-    let dec_c = decode(&mut eng, &tok_c);
 
-    // D: each prompt alone in a pack (same bucket and M as A): must be bit-exact with A.
-    // A': each prompt alone, unpacked, through the bucket pack B ran: B must equal it exactly.
-    // A' vs A is the bucket-choice noise that exists without packing.
-    let total: u32 = lens.iter().map(|&l| l as u32).sum();
-    let widest = eng
-        .prefill_buckets()
-        .into_iter()
-        .filter(|&(_, t)| t >= total)
-        .min_by_key(|&(_, t)| t)
-        .expect("a bucket holds pack B");
+    // D: each prompt alone in a pack. W: each prompt alone, unpacked, on the widest packed bucket
+    // (what packing without batch invariance would give; its distance from A is printed).
+    let wide = solo(&eng, cap);
     let mut lg_d = Vec::new();
     let mut tok_d = Vec::new();
     let mut lg_w = Vec::new();
-    let mut tok_w = Vec::new();
     for (i, p) in prompts.iter().enumerate() {
         let m = [PackMember { slot: i, c0: 0, rows: p, sample: true }];
         tok_d.push(eng.prefill_packed(&m).expect("single pack")[0]);
         lg_d.push(logits(&eng, 0));
-        let ch = plowrt::exec::cpu::engine::Chunk { prog: widest.0, c0: 0, clen: p.len() as u32 };
+        let ch = Chunk { prog: wide, c0: 0, clen: p.len() as u32 };
         eng.prefill_slot_chunk(i, p, ch).expect("wide prefill");
-        tok_w.push(eng.last_token().unwrap());
         lg_w.push(logits(&eng, 0));
-    }
-    let dec_w = decode(&mut eng, &tok_w);
-    for i in 0..n {
-        println!(
-            "prompt {i}: single-pack D vs A max|dlogit| {:.4} tok {}  | wide-bucket A' vs A max|dlogit| {:.4} KL {:.2e} tok {} decode {}",
-            diff(&lg_a[i], &lg_d[i]),
-            if tok_a[i] == tok_d[i] { "same" } else { "DIFFERS" },
-            diff(&lg_a[i], &lg_w[i]),
-            kl(&lg_a[i], &lg_w[i]),
-            if tok_a[i] == tok_w[i] { "same" } else { "DIFFERS" },
-            if dec_a[i] == dec_w[i] { "same" } else { "DIFFERS" },
-        );
     }
 
     let rows: usize = lens.iter().sum();
     println!(
-        "prefill {rows} rows: sequential {ms_a:.1} ms, packed {ms_b:.1} ms ({:.2}x)",
+        "prefill {rows} rows in {} pack(s) of <= {cap}: sequential {ms_a:.1} ms, packed {ms_b:.1} ms ({:.2}x)",
+        groups.len(),
         ms_a / ms_b
     );
-    let mut ok = true;
+    let mut ok = c_ok;
     for i in 0..n {
-        ok &= tok_d[i] == tok_a[i] && diff(&lg_d[i], &lg_a[i]) == 0.0;
-        ok &= tok_b[i] == tok_w[i] && diff(&lg_b[i], &lg_w[i]) == 0.0 && dec_b[i] == dec_w[i];
+        let exact = tok_b[i] == tok_a[i] && diff(&lg_b[i], &lg_a[i]) == 0.0 && dec_b[i] == dec_a[i];
+        ok &= exact && tok_d[i] == tok_a[i] && diff(&lg_d[i], &lg_a[i]) == 0.0;
         println!(
-            "prompt {i} len {:>5}: first A/B/C {}/{}/{}  B vs A max|dlogit| {:.4} KL {:.2e}  B vs A' {:.4}  decode B {} C {} (vs A)",
+            "prompt {i} len {:>5}: first A/B {}/{}  B vs A max|dlogit| {:.4} decode {}  D vs A {:.4}  | unpacked wide bucket vs A {:.4} KL {:.2e}",
             prompts[i].len(),
             tok_a[i],
             tok_b[i],
-            tok_c[i],
             diff(&lg_a[i], &lg_b[i]),
-            kl(&lg_a[i], &lg_b[i]),
-            diff(&lg_b[i], &lg_w[i]),
             if dec_a[i] == dec_b[i] { "same" } else { "DIFFERS" },
-            if dec_a[i] == dec_c[i] { "same" } else { "DIFFERS" },
+            diff(&lg_a[i], &lg_d[i]),
+            diff(&lg_a[i], &lg_w[i]),
+            kl(&lg_a[i], &lg_w[i]),
         );
     }
+    println!("split-chunk packs (C): {}", if c_ok { "exact" } else { "DIFFER" });
     println!("{}", if ok { "PACK_CHECK OK" } else { "PACK_CHECK MISMATCH" });
     std::process::exit(if ok { 0 } else { 1 });
 }

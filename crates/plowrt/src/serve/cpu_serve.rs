@@ -37,9 +37,9 @@ pub trait SlotEngine: Send {
     fn logits_row(&self, _row: usize, _out: &mut Vec<f32>) -> bool {
         false
     }
-    /// Whether [`Self::prefill_packed`] runs here.
-    fn packs(&self) -> bool {
-        false
+    /// [`CpuEngine::pack_rows`]: the widest packed launch, `None` = no packed prefill.
+    fn pack_rows(&self) -> Option<u32> {
+        None
     }
     /// [`CpuEngine::prefill_packed`].
     fn prefill_packed(&mut self, _members: &[PackMember<'_>]) -> Result<Vec<u32>> {
@@ -81,8 +81,8 @@ impl SlotEngine for CpuEngine {
     fn logits_row(&self, row: usize, out: &mut Vec<f32>) -> bool {
         CpuEngine::logits_row(self, row, out)
     }
-    fn packs(&self) -> bool {
-        CpuEngine::packs(self)
+    fn pack_rows(&self) -> Option<u32> {
+        CpuEngine::pack_rows(self)
     }
     fn prefill_packed(&mut self, members: &[PackMember<'_>]) -> Result<Vec<u32>> {
         CpuEngine::prefill_packed(self, members)
@@ -131,8 +131,8 @@ pub struct CpuServe {
     share_rows: u32,
     /// The tokens behind each slot's KV rows.
     hist: Vec<Vec<u32>>,
-    /// Packed prefill (`PLOW_CPU_PACK_PREFILL`): the widest bucket `(program, rows)`, which a
-    /// pack is offered against; `None` = off.
+    /// Packed prefill (`PLOW_CPU_PACK_PREFILL`): the widest bucket `(program, rows)` a pack runs
+    /// on, which a pack is offered against; `None` = off.
     pack: Option<(usize, u32)>,
     /// Prompt length a slot was prepared for packing with (0 = none). Its rows are not yet the
     /// prompt's, so it is never a prefix-share donor.
@@ -165,9 +165,10 @@ impl CpuServe {
         let ring_slack = eng.model().blob.with_packet_view(plow_asset::live_kv::emit).map_or(0, |m| {
             m.caches.iter().filter(|c| c.window > 0).map(|c| c.stride.saturating_sub(c.window)).min().unwrap_or(u32::MAX)
         });
-        let pack = (crate::config::RuntimeConfig::get().cpu.pack_prefill && batch > 1 && eng.packs())
-            .then(|| buckets.iter().copied().max_by_key(|&(_, t)| t))
-            .flatten();
+        let pack = eng
+            .pack_rows()
+            .filter(|_| crate::config::RuntimeConfig::get().cpu.pack_prefill && batch > 1)
+            .and_then(|rows| buckets.iter().copied().find(|&(_, t)| t == rows));
         let (share_kv, share_rows) = if crate::config::RuntimeConfig::get().cpu.prefix_share && batch > 1 {
             prefix_share_layout(eng.model(), batch)
         } else {
@@ -542,12 +543,13 @@ impl SeqEngine for CpuServe {
         Ok(())
     }
 
-    /// The slot's whole remaining prompt (at most the widest bucket), offered against the widest
-    /// bucket; [`Self::advance_packed_prefill`] runs the narrowest one holding the pack.
+    /// The slot's whole remaining prompt, offered against the widest packed bucket when it fits
+    /// one: then prefilling it alone would be a single chunk too, which the pack reproduces bit
+    /// for bit. [`Self::advance_packed_prefill`] runs the narrowest bucket holding the pack.
     fn packable_prefill_span(&self, slot: usize, max_rows: u32) -> Option<PrefillSpan> {
         let (prog, widest) = self.pack?;
         let (n, c0) = (*self.pend.get(slot)?, self.pf_pos[slot]);
-        let rows = n.checked_sub(c0).filter(|&r| r > 0)?.min(widest);
+        let rows = n.checked_sub(c0).filter(|&r| r > 0 && r <= widest)?;
         (!self.live[slot] && rows <= max_rows).then_some(PrefillSpan {
             row0: 0,
             n_rows: rows,
@@ -561,9 +563,9 @@ impl SeqEngine for CpuServe {
     }
 
     fn advance_packed_prefill(&mut self, members: &[(usize, &[u32])]) -> Result<()> {
-        let Some((_, widest)) = self.pack else {
+        if self.pack.is_none() {
             return Err(RuntimeError::Rejected("packed prefill is off".into()));
-        };
+        }
         self.packed_tokens.clear();
         let mut pm = Vec::with_capacity(members.len());
         for &(slot, prompt) in members {
@@ -573,13 +575,12 @@ impl SeqEngine for CpuServe {
                     "packed prefill slot {slot} was not prepared for this prompt"
                 )));
             }
-            let c0 = self.pf_pos[slot];
-            let end = (prompt.len() as u32).min(c0 + widest);
+            let c0 = self.pf_pos[slot] as usize;
             pm.push(PackMember {
                 slot,
-                c0,
-                rows: &prompt[c0 as usize..end as usize],
-                sample: end as usize == prompt.len(),
+                c0: c0 as u32,
+                rows: &prompt[c0..],
+                sample: true,
             });
         }
         if !self.share_kv.is_empty() {

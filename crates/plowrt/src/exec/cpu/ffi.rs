@@ -66,6 +66,12 @@ pub struct PlowCpuPack {
     pub row_slot: *const u32,
     pub n_spans: u32,
     pub rows: u32,
+    /// Each span's split-KV count: its own bucket's, so the pack is batch-invariant.
+    pub span_nsplit: *const u32,
+    /// `[rows + 1]` row-split offsets into `opart` / `mlpart`.
+    pub row_off: *const u32,
+    pub opart: *mut f32,
+    pub mlpart: *mut f32,
 }
 
 impl PlowCpuCtx {

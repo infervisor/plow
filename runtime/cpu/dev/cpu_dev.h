@@ -43,18 +43,27 @@ enum {
 /* A packed (cross-request) prefill launch: rows [row0, row0 + n_rows) of spans[s] belong to KV
  * slot spans[s].slot at absolute positions kv_row0.., and row_slot[r] is row r's slot. The host
  * sets it only around a packed run (NULL otherwise); the row-dependent prefill kernels read it:
- * HEADNORM_ROPE's KV write (row_slot, the n_batch_kv layout) and FLASH_PREFILL (spans). */
+ * HEADNORM_ROPE's KV write (row_slot, the n_batch_kv layout), FLASH_PREFILL and FLASH_MERGE.
+ *
+ * BATCH INVARIANCE. A span's split-KV count is the one its own prefill bucket would use
+ * (span_nsplit), not the launch's, so every row's attention is reduced exactly as it would be
+ * alone. Its partials live in opart/mlpart at row-split offset row_off[r] ([rows + 1], row r
+ * has row_off[r + 1] - row_off[r] splits), laid out [row][head][split][hd]. */
 typedef struct {
     const PlowPrefillSpan* spans;
     const uint32_t*        row_slot;
     uint32_t               n_spans;
     uint32_t               rows;
+    const uint32_t*        span_nsplit;
+    const uint32_t*        row_off;
+    float*                 opart;
+    float*                 mlpart;
 } PlowCpuPack;
 
 /* FLASH_PREFILL's view of one work unit: the op itself, or under a pack the unit's span (its
  * rows, positions, KV length and slot). Units are (q tile, head, split) per span, span-major. */
 typedef struct {
-    uint32_t row0, n_q, q_pos0, n_kv;
+    uint32_t row0, n_q, q_pos0, n_kv, nsplit;
     size_t   kv_off; /* elements: slot * n_kv_head * kv_stride * hd */
 } PlowPfView;
 
@@ -74,27 +83,31 @@ typedef struct {
     uint64_t reserved[3];
 } PlowCpuCtx;
 
-static inline uint32_t plow_pf_units(const PlowCpuPack* pk, uint32_t n_q, uint32_t tile, uint32_t per_tile) {
-    if (!pk) return (n_q + tile - 1) / tile * per_tile;
+/* `heads` x the span's split count work units per q tile. */
+static inline uint32_t plow_pf_units(const PlowCpuPack* pk, uint32_t n_q, uint32_t tile, uint32_t heads,
+                                     uint32_t nsplit) {
+    if (!pk) return (n_q + tile - 1) / tile * heads * nsplit;
     uint32_t n = 0;
-    for (uint32_t s = 0; s < pk->n_spans; s++) n += (pk->spans[s].n_rows + tile - 1) / tile * per_tile;
+    for (uint32_t s = 0; s < pk->n_spans; s++)
+        n += (pk->spans[s].n_rows + tile - 1) / tile * heads * pk->span_nsplit[s];
     return n;
 }
 
 /* `*w` becomes the unit's index inside its span. */
 static inline PlowPfView plow_pf_view(const PlowCpuPack* pk, uint32_t* w, uint32_t n_q, uint32_t q_pos0,
-                                      uint32_t n_kv, uint32_t tile, uint32_t per_tile,
+                                      uint32_t n_kv, uint32_t nsplit, uint32_t tile, uint32_t heads,
                                       size_t slot_elems) {
-    PlowPfView v = {0u, n_q, q_pos0, n_kv, 0u};
+    PlowPfView v = {0u, n_q, q_pos0, n_kv, nsplit, 0u};
     if (!pk) return v;
     for (uint32_t s = 0; s < pk->n_spans; s++) {
         const PlowPrefillSpan* sp = &pk->spans[s];
-        const uint32_t u = (sp->n_rows + tile - 1) / tile * per_tile;
+        const uint32_t u = (sp->n_rows + tile - 1) / tile * heads * pk->span_nsplit[s];
         if (*w < u) {
             v.row0 = sp->row0;
             v.n_q = sp->n_rows;
             v.q_pos0 = sp->kv_row0;
             v.n_kv = sp->kv_len;
+            v.nsplit = pk->span_nsplit[s];
             v.kv_off = (size_t)sp->slot * slot_elems;
             return v;
         }

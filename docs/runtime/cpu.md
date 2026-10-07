@@ -81,7 +81,7 @@ the CLI wins over the environment. `plowrt serve --help` prints them under the
 | `--cpu-huge-pages=B` | `PLOW_CPU_HUGE_PAGES` | unset | Override transparent-huge-page *advice*: by default ordinary pages for interleaved tensors, huge-page advice for single-node or OS placement. Changes advice, not the system THP setting. |
 | `--cpu-spin-us N` | `PLOW_CPU_SPIN_US` | `2000` | Spin budget (µs) before a blocked worker yields and parks. Decode packets are 100–500 µs apart; parking on every gap measured **+17% TPOT** at 50 µs versus 1000. |
 | `--cpu-prefill-chunk N` | `PLOW_CPU_PF_CHUNK` | `0` | Largest prefill chunk (rows) one tick may run while other slots decode; `0` = whole prompt. Measured **negative** at concurrency ≥ 4, so it stays off. |
-| `--cpu-pack-prefill=B` | `PLOW_CPU_PACK_PREFILL` | `true` | Prefill the prompts waiting in one serve tick together, in one launch of the narrowest bucket holding all their rows (see *Packed prefill*). |
+| `--cpu-pack-prefill=B` | `PLOW_CPU_PACK_PREFILL` | `true` | Prefill the prompts waiting in one serve tick together, in one launch, bit-identical to prefilling each alone (see *Packed prefill*). |
 | `--cpu-mxfp4-dir DIR` | `PLOW_MXFP4_DIR` | unset | Directory holding the MXFP4 weight twin (`mxfp4/<name>` plus `_scale` rows, from `perf-data/tools/quantize_mxfp4.py`). |
 | `--fp8-dir DIR` | `PLOW_FP8_DIR` | unset | The fp8 weight twin. Runtime-wide rather than CPU-specific, but this is how a CPU bundle gets W8A16/W8A8 weights. |
 | `--cpu-global-queue=B` | `PLOW_CPU_GQ` | `false` | Take the blob's op-major global work queue, windowed per segment and locality domain, instead of static per-cu streams. **Measured ~2x slower** on the EPYC 9654; kept for A/B where the static partition is a poor fit. |
@@ -98,21 +98,27 @@ owns its own worker pool, so budget threads across concurrently served models.
 
 Prefill on the CPU is weight-bandwidth bound per launch, so prompts that wait in the same
 serve tick share one launch: their rows are concatenated (`M` = the sum, at most the widest
-bucket) and the weights stream once. Only three ops depend on which request a row belongs
-to, and the engine hands them a pack descriptor (`PlowCpuCtx::pack`) for that run only:
-the KV-writing `HEADNORM_ROPE` writes row `r` into slot `row_slot[r]`, `FLASH_PREFILL`
-walks its work per span (that span's rows, positions, KV length and slot), and the head
-samples each finished prompt's last row (a second, head-only run at `M = S` when several
-finish). Everything else is row-independent; `pack_route` refuses a packet with any op it
-does not know to be, and logs why.
+bucket whose attention merges split partials) and the weights stream once. Only three ops
+depend on which request a row belongs to, and the engine hands them a pack descriptor
+(`PlowCpuCtx::pack`) for that run only: the KV-writing `HEADNORM_ROPE` writes row `r` into
+slot `row_slot[r]`, `FLASH_PREFILL` walks its work per span (that span's rows, positions, KV
+length and slot), and the head samples each finished prompt's last row (a second, head-only
+run at `M = S` when several finish). Everything else is row-independent; `pack_route`
+refuses a packet with any op it does not know to be, and logs why.
 
-`cpu_pack_check` is the gate: a request packed with others must equal the same request
-prefilled alone on the same bucket, bit for bit (logits, first token, greedy decode).
-Measured on Xeon 6975P-C, six chat/natural prompts (1603 rows): E2B 1.56x, E4B 1.69x,
-12B 1.77x, 26B-A4B 2.07x faster than one prefill per prompt, all exact. The bucket itself
-moves logits (each bucket is its own compiled program), so a packed request differs from
-the same request prefilled on its own smaller bucket exactly as much as running it alone on
-the pack's bucket would; packing adds nothing beyond that.
+Packing is batch-invariant. GEMMs are per-row invariant in `M`, and the one bucket-dependent
+choice, the attention KV split count, is taken per span from the bucket that span would
+have used alone (`span_nsplit`); partials go to an engine-owned scratch at per-row offsets
+(`row_off`) that `FLASH_MERGE` reads back. Packs therefore use only buckets that merge (on
+12B/26B-A4B the 2048 bucket writes attention directly, so packs there hold at most 1024
+rows), and a member whose own bucket does not merge prefills alone.
+
+`cpu_pack_check` is the gate: a request packed with others, alone in a pack, or split into
+chunks across packs must equal the same chunks prefilled alone, bit for bit (logits, first
+token, greedy decode). Measured on Xeon 6975P-C, six chat/natural prompts (1603 rows), all
+exact: E2B 1.54x, E4B 1.69x, 12B 2.06x, 26B-A4B 1.83x faster than one prefill per prompt.
+Without invariance (one prompt alone on the wider bucket) logits move by up to 6.8 and KL by
+up to 0.36 on 26B-A4B, enough to flip greedy near-ties.
 
 ## ISA coverage
 

@@ -202,7 +202,7 @@ V_K(v_flash_prefill) {
     plow_bf16* const O_final0 = PLOW_CPU_TEN(in, T, 5);
     const uint32_t n_q0 = in->i[0], n_kv0 = in->i[1], n_head = in->i[2], n_kv_head = in->i[3];
     const uint32_t q_pos00 = in->i[4], window = in->i[5], D = in->i[6];
-    const uint32_t nsplit = in->i[7] ? in->i[7] : 1u;
+    const uint32_t nsplit0 = in->i[7] ? in->i[7] : 1u;
     const float scale = in->fj[0].f;
     const uint32_t kv_stride = in->fj[1].u, kv_mask = in->fj[2].u;
     if (D > 512u || (D & 31u) || !ctx || !ctx->scratch || ctx->scratch_bytes < FA_PF_SCRATCH) {
@@ -211,7 +211,10 @@ V_K(v_flash_prefill) {
     }
     const uint32_t gqa = n_head / n_kv_head;
     const PlowCpuPack* pk = ctx->pack;
-    const uint32_t n_work = plow_pf_units(pk, n_q0, FA_BQ_TILE, n_head * nsplit);
+    const uint32_t n_work = plow_pf_units(pk, n_q0, FA_BQ_TILE, n_head, nsplit0);
+    /* Partials: [row][head][split][hd] at row-split offsets (unpacked: row * nsplit). */
+    float* const Opart = pk ? pk->opart : Opart0;
+    float* const mlpart = pk ? pk->mlpart : mlpart0;
     float* acc = ctx->scratch; /* [FA_BQ_TILE][512], pair layout */
     uint32_t* Kt = (uint32_t*)(acc + (size_t)FA_BQ_TILE * 512u);
     float m[FA_BQ_TILE], l[FA_BQ_TILE];
@@ -221,14 +224,12 @@ V_K(v_flash_prefill) {
 
     for (uint32_t w0 = slice; w0 < n_work; w0 += nblk) {
         uint32_t w = w0;
-        const PlowPfView pv = plow_pf_view(pk, &w, n_q0, q_pos00, n_kv0, FA_BQ_TILE, n_head * nsplit,
+        const PlowPfView pv = plow_pf_view(pk, &w, n_q0, q_pos00, n_kv0, nsplit0, FA_BQ_TILE, n_head,
                                            (size_t)n_kv_head * kv_stride * D);
-        const uint32_t n_q = pv.n_q, n_kv = pv.n_kv, q_pos0 = pv.q_pos0;
+        const uint32_t n_q = pv.n_q, n_kv = pv.n_kv, q_pos0 = pv.q_pos0, nsplit = pv.nsplit;
         const plow_bf16* Q = Q0 + (size_t)pv.row0 * n_head * D;
         const plow_bf16* K = K0 + pv.kv_off;
         const plow_bf16* V = V0 + pv.kv_off;
-        float* Opart = Opart0 ? Opart0 + (size_t)pv.row0 * n_head * nsplit * D : NULL;
-        float* mlpart = mlpart0 ? mlpart0 + (size_t)pv.row0 * n_head * nsplit * 2 : NULL;
         plow_bf16* O_final = O_final0 ? O_final0 + (size_t)pv.row0 * n_head * D : NULL;
         const uint32_t sp = w % nsplit, h = (w / nsplit) % n_head, qt = w / (nsplit * n_head);
         const uint32_t hkv = h / gqa;
@@ -297,9 +298,11 @@ V_K(v_flash_prefill) {
                 }
                 continue;
             }
-            float* op = Opart + ((size_t)(qi * n_head + h) * nsplit + sp) * D;
+            const size_t rs = pk ? pk->row_off[pv.row0 + qi] : (size_t)qi * nsplit;
+            const size_t at = rs * n_head + (size_t)h * nsplit + sp;
+            float* op = Opart + at * D;
             for (uint32_t d = 0; d < D; d += 32) v_pv_unperm(op + d, ar + d);
-            float* ml = mlpart + ((size_t)(qi * n_head + h) * nsplit + sp) * 2;
+            float* ml = mlpart + at * 2;
             ml[0] = m[r];
             ml[1] = l[r];
         }
@@ -535,15 +538,15 @@ V_K(v_flash_decode) {
  * d-chunk), dsplit = ceil(nblk / (n_batch*n_head)) exactly as golden / devgen flash_merge_map.
  * The sink (golden g_flash_merge) is folded into (gm, gl) once per (row, head). */
 V_K(v_flash_merge) {
-    (void)ctx;
+    const PlowCpuPack* pk = ctx ? ctx->pack : NULL;
     plow_bf16* O = PLOW_CPU_TEN(in, T, 0);
-    const float* Opart = PLOW_CPU_TEN(in, T, 1);
-    const float* mlpart = PLOW_CPU_TEN(in, T, 2);
+    const float* Opart = pk ? pk->opart : PLOW_CPU_TEN(in, T, 1);
+    const float* mlpart = pk ? pk->mlpart : PLOW_CPU_TEN(in, T, 2);
     const PLOW_SINK_T* sinks = PLOW_CPU_TEN(in, T, 3);
-    const uint32_t n_batch = in->i[0], n_head = in->i[1], nsplit = in->i[2], D = in->i[3];
+    const uint32_t n_batch = in->i[0], n_head = in->i[1], nsplit0 = in->i[2], D = in->i[3];
     const uint32_t n_bh = n_batch * n_head;
-    if (n_bh == 0u || nsplit == 0u) return;
-    if (nsplit > 64u) {
+    if (n_bh == 0u || nsplit0 == 0u) return;
+    if (nsplit0 > 64u && !pk) {
         g_flash_merge(in, slice, nblk, T, ctx);
         return;
     }
@@ -554,7 +557,12 @@ V_K(v_flash_merge) {
     for (uint32_t w = slice; w < n_work; w += nblk) {
         const uint32_t dp = w % dsplit, hb = w / dsplit;
         const uint32_t d0 = dp * dchunk, d1 = d0 + dchunk < D ? d0 + dchunk : D;
-        const float* ml = mlpart + (size_t)hb * nsplit * 2;
+        /* Row hb / n_head's partials: a packed row carries its own span's split count. */
+        const uint32_t r = hb / n_head, hh = hb % n_head;
+        if (pk && r >= pk->rows) continue; /* padding past the pack: no partials */
+        const uint32_t nsplit = pk ? pk->row_off[r + 1] - pk->row_off[r] : nsplit0;
+        const size_t at = (pk ? (size_t)pk->row_off[r] * n_head : (size_t)r * n_head * nsplit) + (size_t)hh * nsplit;
+        const float* ml = mlpart + at * 2;
         float gm = G_NEG_INF;
         for (uint32_t s = 0; s < nsplit; s++) gm = gm > ml[s * 2] ? gm : ml[s * 2];
         const float sink = sinks ? PLOW_SINK_LOAD(sinks[hb % n_head]) : G_NEG_INF;
@@ -566,7 +574,7 @@ V_K(v_flash_merge) {
         }
         const float inv = gl > 0.0f ? 1.0f / gl : 0.0f;
         const __m512 vinv = _mm512_set1_ps(inv);
-        const float* obase = Opart + (size_t)hb * nsplit * D;
+        const float* obase = Opart + at * D;
         plow_bf16* orow = O + (size_t)hb * D;
         for (uint32_t d = d0; d < d1; d += 16) {
             const uint32_t n = d1 - d < 16 ? d1 - d : 16;
