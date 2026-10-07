@@ -73,6 +73,9 @@ taken on Ada: the paired walk (`PLOW_NV_GEMV_MMA_PAIR`, +1-3%), the walk at B=1
 (`PLOW_NV_GEMV_MMA_B1`, B=1 +1.7%), `PLOW_FUSE_KV_HNR` and GLU fusion (no change). The
 `PLOW_NV_DENSE_TUNE` / gemv_k8 arms and decode cuBLASLt are emitted for sm_90a only;
 `PLOW_NV_PTXSYNC=3` faults (illegal instruction) and gate sleep 1/16 vs 64 ns is within noise.
+The gemv_k8 K-split walk (mma.sync only) builds for Ada with its Hopper guards widened but loses
+at B=1: Qwen 1.7B 5.03 -> 5.78 ms, Gemma E4B 13.60 -> 13.77 (k8 to 32 rows: B=16 15.29 -> 14.84,
+B=1 13.83), so it stays Hopper-only.
 
 The hd128 recipes (Qwen, Orpheus, Veena) set `PLOW_NV_FA_FOLD`: the last flash split merges, so
 each layer loses its FlashMerge level (decode sync costs ~1.1 us per dependency level on Ada).
