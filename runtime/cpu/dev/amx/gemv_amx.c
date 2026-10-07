@@ -1,4 +1,4 @@
-/* gemv_amx.c — batched decode GEMV family (5 <= M <= 32 bf16, <= 16 quantized) on AMX-BF16, tier X.
+/* gemv_amx.c — batched decode GEMV family (5 <= M <= 64 bf16, <= 16 quantized) on AMX-BF16, tier X.
  *
  * The WEIGHTS are the A operand: 16 row-major rows x 32 K per TILELOADD straight from memory,
  * no repack. The M activation rows are the B operand, packed ONCE per call into VNNI tiles
@@ -23,9 +23,9 @@
 /* bf16: two B tiles (sequences 0-15, 16-31) share every weight tile load, so a rung-32 step
  * still streams the weights once. Above 16 the AVX-512 kernel refuses and the golden scalar
  * GEMV re-read the weights per row: 554 ms per Gemma-4-E2B rung-32 step vs 27 ms at rung 16. */
-#define XGV_MAX_M 32u
+#define XGV_MAX_M 64u
 #define XGV_Q_MAX_M 16u /* fp8 / mxfp4: one B tile */
-#define OC 32u          /* column stride of the f32 `out` blocks below */
+#define OC 64u          /* column stride of the f32 `out` blocks below */
 #define XGV_PF 1024u /* bytes ahead of the current weight byte per streamed row */
 
 /* B tiles for x[M][K] (row stride ldx elements), one group per 16 sequences: group g, tile kb at
@@ -199,6 +199,12 @@ static void dot_rows(const plow_bf16* W, size_t ldw, const plow_bf16* X, const u
                      uint32_t K, uint32_t n, uint32_t rows, float* out) {
     const uint32_t full = rows / 16u;
     if (full) dot_tiles(W + (size_t)n * ldw, ldw * 2u, xp, K / 32u, full, M > 16u ? 2u : 1u, out);
+    /* Sequences 32..63: a second pass over the same <= 32 weight rows, now L2-resident, so the
+     * weights still stream from DRAM once (above 32 the golden GEMV re-read them per row: 2137 ms
+     * per Gemma-4-E4B rung-64 step). */
+    if (full && M > 32u)
+        dot_tiles(W + (size_t)n * ldw, ldw * 2u, xp + 2u * (size_t)(K / 32u) * 1024u, K / 32u, full,
+                  M > 48u ? 2u : 1u, out + 32);
     if (rows > full * 16u)
         dot_tail(W + (size_t)(n + full * 16u) * ldw, ldw, X, K, M, K, rows - full * 16u, out + full * 16u * OC);
 }

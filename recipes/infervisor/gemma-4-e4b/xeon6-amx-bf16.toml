@@ -1,5 +1,5 @@
 # Gemma-4-E4B-it (per-layer inputs, KV-shared layers) BF16 on Intel Xeon 6975P-C (Granite Rapids, 96 cores, SNC3, AMX-BF16): BF16 weights, BF16
-# KV, 2K context, 32 decode slots, greedy. Production recipe for this model/CPU/precision.
+# KV, 2K context, 64 decode slots, greedy. Production recipe for this model/CPU/precision.
 #
 #   nix develop -c cargo build --release -p plowc
 #   nix develop -c cargo build --release -p plowrt --no-default-features --features cpu
@@ -51,7 +51,7 @@ precision = "bf16"
 emit = "devblob"
 args = []
 [emit.env]
-PLOW_DECODE_BATCH_LADDER = "1,2,4,8,16,32"
+PLOW_DECODE_BATCH_LADDER = "1,2,4,8,16,32,64"
 PLOW_MAX_CHUNK = "2048"
 
 [serve.env]
