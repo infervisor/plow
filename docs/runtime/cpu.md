@@ -144,6 +144,13 @@ accepts BF16 or scaled FP8 activations and decodes all e4m3fn codes, including
 subnormals and NaNs. MXFP4 uses the existing packed even-K row layout and E8M0
 block scales. Packet tile/slice ownership is preserved.
 
+The AMX tier runs `FLASH_PREFILL` on TMUL (`amx/attention_amx.c`): same units, absolute
+splits and partials as the AVX-512 kernel, with QK^T and PV as 2x2-blocked TDPBF16PS over a
+staged Q tile and per-64-key VNNI K^T / V blocks. Each row's scores and output keep a fixed
+summation order, so packed and chunked prefill stay exact (`cpu_pack_check`). Accuracy against
+an f64 reference matches the AVX-512 kernel; one thread runs 3.5-6x faster (hd 512 causal 2048:
+63 vs 384 ms), and a Gemma-4-E4B 2048-row prefill drops from 485 to 424 ms.
+
 `QUANT_FP8` supports per-row BF16-to-e4m3fn activation quantization with FP32
 scales, round-to-nearest ties-to-even, and finite saturation. Both its ordinary
 path and its fused gate/up activation use AVX-512; the fused form computes the

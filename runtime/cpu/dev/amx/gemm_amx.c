@@ -870,58 +870,23 @@ static int wm_run(const gemm_args* g, uint32_t slice, uint32_t nblk, PlowCpuCtx*
 #define WP_W_COST 200u
 #define WP_X_COST 110u
 
-static int wp_run(const gemm_args* g, uint32_t slice, uint32_t nblk, PlowCpuCtx* ctx) {
+typedef struct {
+    uint8_t* wp;
+    float *cb, *cp;
+    plow_bf16* ap;
+    uint32_t npanel, kpmax, ctb;
+} wp_geo;
+
+/* Strips [s0, s1) x token blocks [tb0, tb1) of one slice. */
+static void wp_rect(const gemm_args* g, const wp_geo* q, uint32_t s0, uint32_t s1, uint32_t tb0, uint32_t tb1) {
     const int dbg = amx_debug_flags();
     const int glu = g->Wu != NULL;
-    const uint32_t nacc = glu ? 2u : 1u;
-    const uint32_t S = (g->N + 31u) / 32u, MB = (g->M + 31u) / 32u;
-    uint32_t gm = 1u, gn = S < nblk ? S : nblk;
-    {
-        uint64_t best = ~0ull;
-        for (uint32_t m = 1u; m <= nblk && m <= MB; m++) {
-            const uint32_t n = nblk / m < S ? nblk / m : S;
-            if (!n) continue;
-            const uint64_t rows = (uint64_t)((MB + m - 1u) / m) * 32u, strips = (S + n - 1u) / n;
-            /* Each K panel past the first re-packs and splits every K loop and spills partials:
-             * measured +30% at E2B GLU N 12288 (gm 2, two panels) against gm 1 in one. */
-            const uint64_t panels = (strips * nacc * g->K * 64u + WP_WBUDGET - 1u) / WP_WBUDGET;
-            const uint64_t mac = rows * strips * 32u * nacc;
-            const uint64_t cost = WP_W_COST * strips * 32u * nacc + WP_X_COST * rows + mac + (panels - 1u) * mac / 2u;
-            if (cost < best) best = cost, gm = m, gn = n;
-        }
-    }
-    if (slice >= gm * gn) return 1;
-    const uint32_t im = slice / gn, in_ = slice % gn;
-    const uint32_t s0 = (uint32_t)((uint64_t)S * in_ / gn), s1 = (uint32_t)((uint64_t)S * (in_ + 1u) / gn);
-    const uint32_t tb0 = (uint32_t)((uint64_t)MB * im / gm), tb1 = (uint32_t)((uint64_t)MB * (im + 1u) / gm);
-    /* Sized by the widest slice so every slice takes this driver or none does (the fallback's
-     * grid differs). */
-    const uint32_t nstrip = s1 - s0, nsmax = (S + gn - 1u) / gn, nkbT = g->K / 32u;
-    /* K panels: as few as keep the slice's packed strips under WP_WBUDGET. */
-    uint32_t npanel = (uint32_t)(((size_t)nsmax * nacc * g->K * 64u + WP_WBUDGET - 1u) / WP_WBUDGET);
-    if (npanel > nkbT) npanel = nkbT;
-    const uint32_t kpb = (nkbT + npanel - 1u) / npanel;
-    npanel = (nkbT + kpb - 1u) / kpb;
-    const uint32_t kpmax = kpb * 32u;
-    uint8_t* sc = ctx->scratch;
-    float* cb = (float*)sc; /* ILS ping-pong x {gate, up}: 16 KiB */
-    plow_bf16* ap = (plow_bf16*)(sc + 16384u);
-    uint8_t* wp = sc + 16384u + (size_t)32u * kpmax * 2u;
-    const size_t wbytes = (size_t)nsmax * nacc * kpmax * 64u;
-    float* cp = (float*)(wp + wbytes);
-    const size_t used = 16384u + (size_t)32u * kpmax * 2u + wbytes;
-    if (used > ctx->scratch_bytes) return 0;
-    const size_t per_tb = (size_t)nsmax * nacc * 4096u;
-    uint32_t ctb = MB;
-    if (npanel > 1u) {
-        const size_t fit = (ctx->scratch_bytes - used) / per_tb;
-        if (!fit) return 0;
-        if (fit < ctb) ctb = (uint32_t)fit;
-    }
-    if (!nstrip || tb0 >= tb1) return 1;
+    const uint32_t nacc = glu ? 2u : 1u, nstrip = s1 - s0, npanel = q->npanel, kpmax = q->kpmax;
+    uint8_t* wp = q->wp;
+    if (!nstrip || tb0 >= tb1) return;
     const size_t lda_x = (size_t)g->K * 2u;
-    for (uint32_t c0 = tb0; c0 < tb1; c0 += ctb) {
-        const uint32_t c1 = c0 + ctb < tb1 ? c0 + ctb : tb1;
+    for (uint32_t c0 = tb0; c0 < tb1; c0 += q->ctb) {
+        const uint32_t c1 = c0 + q->ctb < tb1 ? c0 + q->ctb : tb1;
         ils_t pend = {0};
         uint32_t cur = 0;
         for (uint32_t p = 0; p < npanel; p++) {
@@ -937,9 +902,9 @@ static int wp_run(const gemm_args* g, uint32_t slice, uint32_t nblk, PlowCpuCtx*
                 const plow_bf16 *A0, *A1;
                 size_t lda;
                 if (g->rms || (rows != 32u && rows != 16u)) {
-                    stage_a(ap, kp, g->A + (size_t)m * g->K, rows, g->K, k0, kp, g->rms ? g->rms + m : NULL, g->gamma);
-                    A0 = ap;
-                    A1 = rows > 16u ? ap + 16u * kp : NULL;
+                    stage_a(q->ap, kp, g->A + (size_t)m * g->K, rows, g->K, k0, kp, g->rms ? g->rms + m : NULL, g->gamma);
+                    A0 = q->ap;
+                    A1 = rows > 16u ? q->ap + 16u * kp : NULL;
                     lda = (size_t)kp * 2u;
                 } else {
                     A0 = g->A + (size_t)m * g->K + k0;
@@ -949,9 +914,9 @@ static int wp_run(const gemm_args* g, uint32_t slice, uint32_t nblk, PlowCpuCtx*
                 for (uint32_t s = 0; s < nstrip; s++) {
                     const uint32_t n = (s0 + s) * 32u, cols = g->N - n < 32u ? g->N - n : 32u;
                     const uint8_t* bs = wp + (size_t)s * nacc * kp * 64u;
-                    float* part = cp + ((size_t)(tb - c0) * nstrip + s) * nacc * 1024u;
+                    float* part = q->cp + ((size_t)(tb - c0) * nstrip + s) * nacc * 1024u;
                     const float* in_part = first ? NULL : part;
-                    float* out = last ? cb + (size_t)cur * 2048u : part;
+                    float* out = last ? q->cb + (size_t)cur * 2048u : part;
                     if (!(dbg & AMX_DBG_NOTDP)) {
                         block(A0, A1, lda, bs, nkb, in_part, out, pend.rows ? &pend : NULL, 0);
                         if (glu)
@@ -980,6 +945,75 @@ static int wp_run(const gemm_args* g, uint32_t slice, uint32_t nblk, PlowCpuCtx*
         }
         ils_drain(&pend);
     }
+}
+
+static int wp_run(const gemm_args* g, uint32_t slice, uint32_t nblk, PlowCpuCtx* ctx) {
+    const int glu = g->Wu != NULL;
+    const uint32_t nacc = glu ? 2u : 1u;
+    const uint32_t S = (g->N + 31u) / 32u, MB = (g->M + 31u) / 32u;
+    uint32_t gm = 1u;
+    {
+        uint64_t best = ~0ull;
+        for (uint32_t m = 1u; m <= nblk && m <= MB; m++) {
+            const uint32_t n = nblk / m < S ? nblk / m : S;
+            if (!n) continue;
+            const uint64_t rows = (uint64_t)((MB + m - 1u) / m) * 32u, strips = (S + n - 1u) / n;
+            /* Each K panel past the first re-packs and splits every K loop and spills partials:
+             * measured +30% at E2B GLU N 12288 (gm 2, two panels) against gm 1 in one. */
+            const uint64_t panels = (strips * nacc * g->K * 64u + WP_WBUDGET - 1u) / WP_WBUDGET;
+            const uint64_t mac = rows * strips * 32u * nacc;
+            const uint64_t cost = WP_W_COST * strips * 32u * nacc + WP_X_COST * rows + mac + (panels - 1u) * mac / 2u;
+            if (cost < best) best = cost, gm = m;
+        }
+    }
+    /* Every slice of an M group takes an equal run of its (strip, token block) units in strip-major
+     * order, so no slice carries a whole extra strip (N 10240 = 320 strips over 96 slices: 3 or 4,
+     * the 4s set the op time) and N < 32 x nblk still uses every slice. A run is at most a strip
+     * tail, whole strips and a strip head; each output block keeps its K order. Gemma-4-E4B
+     * GLU, 2048 rows: 119 -> 111 ms per thread over a prefill. */
+    const uint32_t gn = nblk / gm;
+    if (slice >= gm * gn) return 1;
+    const uint32_t im = slice / gn, in_ = slice % gn;
+    const uint32_t tb0 = (uint32_t)((uint64_t)MB * im / gm), tb1 = (uint32_t)((uint64_t)MB * (im + 1u) / gm);
+    const uint32_t nt = tb1 - tb0;
+    /* Sized by the widest run so every slice takes this driver or none does (the fallback's
+     * grid differs). */
+    const uint32_t nsmax = (S + gn - 1u) / gn, nkbT = g->K / 32u;
+    /* K panels: as few as keep the slice's packed strips under WP_WBUDGET. */
+    uint32_t npanel = (uint32_t)(((size_t)nsmax * nacc * g->K * 64u + WP_WBUDGET - 1u) / WP_WBUDGET);
+    if (npanel > nkbT) npanel = nkbT;
+    const uint32_t kpb = (nkbT + npanel - 1u) / npanel;
+    npanel = (nkbT + kpb - 1u) / kpb;
+    const uint32_t kpmax = kpb * 32u;
+    uint8_t* sc = ctx->scratch;
+    wp_geo q = {.cb = (float*)sc, /* ILS ping-pong x {gate, up}: 16 KiB */
+                .ap = (plow_bf16*)(sc + 16384u),
+                .wp = sc + 16384u + (size_t)32u * kpmax * 2u,
+                .npanel = npanel,
+                .kpmax = kpmax,
+                .ctb = MB};
+    const size_t wbytes = (size_t)nsmax * nacc * kpmax * 64u;
+    q.cp = (float*)(q.wp + wbytes);
+    const size_t used = 16384u + (size_t)32u * kpmax * 2u + wbytes;
+    if (used > ctx->scratch_bytes) return 0;
+    const size_t per_tb = (size_t)nsmax * nacc * 4096u;
+    if (npanel > 1u) {
+        const size_t fit = (ctx->scratch_bytes - used) / per_tb;
+        if (!fit) return 0;
+        if (fit < q.ctb) q.ctb = (uint32_t)fit;
+    }
+    if (!nt) return 1;
+    const uint64_t U = (uint64_t)S * nt, u0 = U * in_ / gn, u1 = U * (in_ + 1u) / gn;
+    if (u0 >= u1) return 1;
+    const uint32_t sa = (uint32_t)(u0 / nt), ta = (uint32_t)(u0 % nt), sb = (uint32_t)(u1 / nt), tbe = (uint32_t)(u1 % nt);
+    if (sa == sb) {
+        wp_rect(g, &q, sa, sa + 1u, tb0 + ta, tb0 + tbe);
+        return 1;
+    }
+    uint32_t sf = sa;
+    if (ta) wp_rect(g, &q, sa, sa + 1u, tb0 + ta, tb1), sf++;
+    wp_rect(g, &q, sf, sb, tb0, tb1);
+    if (tbe) wp_rect(g, &q, sb, sb + 1u, tb0, tb0 + tbe);
     return 1;
 }
 
@@ -1143,11 +1177,18 @@ double plow_cpu_amx_debug_tdp(uint32_t iters, PlowCpuCtx* ctx) {
 
 void plow_cpu_register_amx_gemv(plow_cpu_kernel_fn* tab); /* gemv_amx.c: batched decode M >= 5 */
 void plow_cpu_register_amx_moe(plow_cpu_kernel_fn* tab);  /* moe_amx.c: Gemma grouped prefill 75/76 */
+void plow_cpu_register_amx_attention(plow_cpu_kernel_fn* tab); /* attention_amx.c: FLASH_PREFILL */
 
 void plow_cpu_register_amx(plow_cpu_kernel_fn* tab) {
     plow_fp8_vlut_init(&plow_amx_fp8_lut);
     plow_cpu_register_amx_gemv(tab);
     plow_cpu_register_amx_moe(tab);
+    /* PLOW_CPU_AMX_ATTN=0 keeps the AVX-512 FLASH_PREFILL (Gemma-4-26B-A4B: its FP32-reference
+     * gate sits at a router near-tie edge that the TMUL summation order tips over). */
+    {
+        const char* e = getenv("PLOW_CPU_AMX_ATTN");
+        if (!e || *e != '0') plow_cpu_register_amx_attention(tab);
+    }
     tab[PLOW_DOP_GEMM] = x_gemm;
     tab[PLOW_DOP_GEMM_SMALL] = x_gemm_small;
     tab[PLOW_DOP_GEMM_MED] = x_gemm_med;

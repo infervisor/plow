@@ -970,6 +970,10 @@ bundle in the first place, in [CPU execution](runtime/cpu.md).
 `runtime/cpu/dev/amx` (`nopack`, `noxpack`, `wstage`, `nogrid`, `l1pf`, `nopf`, `demote`,
 `wpanel2`, …); some produce wrong output and exist only to bound a cost.
 
+`PLOW_CPU_AMX_ATTN=0` (default on) keeps the AVX-512 `FLASH_PREFILL` on an AMX host instead of
+the TMUL kernel (3.5-6x faster per thread, same f64-measured accuracy). The Gemma-4-26B-A4B Xeon
+recipe sets it: that model's FP32-reference gate fails with the TMUL summation order.
+
 The global-queue and L2-place knobs are off because they were *measured* worse, not because they are
 unfinished — neither changes what is computed, so both are safe to flip for an A/B
 on another host.
