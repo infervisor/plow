@@ -2,23 +2,21 @@
 
 This file holds only qualified wins and their evidence. Every matched serving row is in
 [comparison.csv](comparison.csv) (one block per model, `campaign.py report` output with `model` and
-`status` columns prepended). Status: E2B, E4B, 12B final; 26B-A4B gate miss; 31B pending its vLLM
-baseline.
+`status` columns prepended). Status: E2B, E4B, 12B, 26B-A4B final (plowrt b6924229); 31B pending
+its vLLM baseline.
 
 ## Setup
 
 - Infervisor: plowrt CPU engine (`--no-default-features --features cpu`), AMX tier, 96 threads,
-  BF16 weights + BF16 KV, 2K context, 32 decode slots, prefix cache + session resume + cross-slot
-  prefix share on. Recipes: `recipes/infervisor/gemma-4-*/xeon6-amx-bf16.toml`.
+  BF16 weights + BF16 KV, 2K context, 32 (E2B, 26B) / 64 (E4B, 12B) decode slots, packed prefill,
+  AMX `FLASH_PREFILL` (26B: AVX-512, `PLOW_CPU_AMX_ATTN=0`), prefix cache + session resume +
+  cross-slot prefix share on. Recipes: `recipes/infervisor/gemma-4-*/xeon6-amx-bf16.toml`.
 - Baseline: vLLM 0.30.0+cpu, `--dtype bfloat16 --max-model-len 2048 --max-num-seqs 256`, prefix
   caching on, `VLLM_CPU_OMP_THREADS_BIND=0-95`. Same vLLM client for both arms, greedy.
 - One Intel Xeon 6975P-C (96 cores, SNC3, AMX-BF16), 377 GiB DDR5. Host state for every arm:
   `kernel.numa_balancing=0`, zero-latency CPU QoS held, THP madvise, no pseudo-lock.
 - llama.cpp was dropped as a baseline mid-campaign (2026-10-06).
-- Packets in the strict reports were emitted `--gpu rtx6000pro --arch sm_120a`. The recipes now
-  name the CPU target (`--gpu xeon6975p --arch amx`, e83faf4e); its packets are byte-identical
-  except the header target hash (bytes 28-31) on all five models, and serve identical greedy
-  output (E4B, max |dlogprob| 0.0), so this evidence carries over.
+- Packets: `campaign.py build` of each recipe (`--gpu xeon6975p --arch amx`); hashes in each report.
 
 ## Qualified wins (MATCHED + EQUIVALENT, `campaign.py report` exit 0)
 
@@ -27,22 +25,26 @@ better; TTFT, TPOT and peak memory lower is better. `*` = repeat spread > 10% (d
 
 | Model | FP32 gate kl_mean (plow / vLLM) | Cell | Total throughput | TTFT P99 | TPOT P99 | Peak memory |
 |---|---|---|---:|---:|---:|---:|
-| E2B | 0.0005 / 0.0005 PASS | c1 | 3.20x | 0.55x * | 0.29x | 0.27x * |
-| | | c8 | 1.90x | 0.94x | 0.51x | 0.29x * |
-| | | c32 | 1.20x | **1.09x** | 0.82x | 0.33x * |
-| E4B | 0.0006 / 0.0014 PASS | c1 | 3.28x | 0.61x * | 0.28x | 0.35x * |
-| | | c8 | 2.02x | **1.11x** * | 0.48x | 0.37x * |
-| | | c32 | 1.19x | **1.36x** | 0.83x | 0.42x |
-| 12B | 0.0181 / 0.0215 PASS | c1 | 3.36x | 0.75x * | 0.28x | 0.53x * |
-| | | c8 | 2.04x | **1.04x** * | 0.49x | 0.55x * |
-| | | c32 | 1.69x | **1.19x** | 0.60x | 0.63x |
+| E2B | 0.0004 / 0.0005 PASS | c1 | 3.25x | 0.52x * | 0.29x | 0.27x * |
+| | | c8 | 2.02x | 0.81x | 0.48x | 0.29x * |
+| | | c32 | 1.34x | 0.87x | 0.74x | 0.34x * |
+| E4B | 0.0005 / 0.0014 PASS | c1 | 3.26x | 0.55x | 0.29x | 0.35x * |
+| | | c8 | 2.24x | 0.82x | 0.43x | 0.37x * |
+| | | c32 | 1.45x | 0.91x | 0.69x | 0.43x |
+| 12B | 0.0110 / 0.0215 PASS | c1 | 3.41x | 0.67x * | 0.28x | 0.53x * |
+| | | c8 | 2.26x | 0.77x * | 0.44x | 0.55x * |
+| | | c32 | 2.04x | 0.82x * | 0.50x | 0.63x |
+| 26B-A4B | 0.0950 / 0.0893 PASS | c1 | 5.78x | 0.38x * | 0.16x | 0.72x * |
+| | | c8 | 3.52x | 0.65x * | 0.28x | 0.73x * |
+| | | c32 | 2.28x | 0.77x * | 0.44x | 0.77x |
 
-Bold = Infervisor loses. Burst TTFT P99 at c8/c32 (all prompts arriving at once) is bound by
-prefill throughput: plow prefills ~310 ms per 1000-token prompt back to back, vLLM batches
-(~255 ms each). Deferring decode during prefill (`PLOW_PF_DEFER_DECODE=1`) was measured and
-rejected (E4B c32 TTFT P99 9.9 s vs 11.1 s, vLLM 8.2 s; median TTFT 4.6x worse).
+Infervisor wins every row. Burst TTFT P99 at c8/c32 (all prompts arriving at once) is bound by
+prefill throughput; packed prefill (2048-row launches), AMX attention and the balanced
+W-stationary GEMM partition took E4B's 2048-row prefill from 0.74 s (sequential) to 0.42 s.
+Deferring decode during prefill (`PLOW_PF_DEFER_DECODE=1`) was measured and rejected (E4B c32 TTFT
+P99 9.9 s vs 11.1 s, vLLM 8.2 s; median TTFT 4.6x worse).
 
-## Real-world open loop (supplementary, not a strict report)
+## Real-world open loop (supplementary, not a strict report; plowrt 8e5f0039, before packed prefill)
 
 chat2k: multi-turn agentic sessions (4 apps, ~400-token system prompts, 4 turns mean, tool
 outputs, think time), Poisson session arrivals, 420 s per rate, SLO TTFT <= 3 s and a per-model
@@ -66,14 +68,10 @@ ladder was measured there and rejected (TTFT P99 487 s, throughput collapsed).
 
 ## Not qualified
 
-- 26B-A4B: MATCHED, NOT EQUIVALENT. FP32 gate kl_mean 0.1167 vs vLLM 0.0893 (limit 0.1136); one
-  case (`nat-code-128`) carries it. Root cause: a bf16-noise near-tie at the MoE top-k cutoff for
-  the first token after BOS cascades through later layers; forcing plow's routes into the HF fp32
-  model reproduces plow's output, and plow's per-layer residual error is below HF bf16's up to the
-  flip. Excluding that case: 0.083 vs 0.088. Performance (not a valid comparison): throughput
-  2.1-5.7x, TTFT P99 0.40-0.93x, TPOT P99 0.16-0.48x. chat2k: plow 100% SLO at 0.12 / 0.25 / 0.4
-  sessions/s (TTFT P99 757 / 724 / 1597 ms); the vLLM arm did not start (KV allocation on NUMA
-  node 0 short of memory) and is pending.
+- 26B-A4B with AMX attention: FP32 gate kl_mean 0.118-0.128 (limit 0.112) at f64-measured attention
+  accuracy equal to the AVX-512 kernel; the model's MoE top-k near-ties flip with the summation
+  order. Its recipe keeps AVX-512 attention (above: PASS).
+
 - 31B: vLLM baseline pending (vLLM CPU places KV on one NUMA node; 59 GiB weights + KV exceed the
   node with the current tmpfs model layout).
 

@@ -11,9 +11,9 @@
 # measurement (all arms): kernel.numa_balancing=0, a zero-latency CPU QoS request held
 # (/dev/cpu_dma_latency, as tuned latency-performance does), THP madvise, no pseudo-lock held (PLOW_CPU_SRAM off).
 #
-# Qualified (2026-10-07, packet 6fdccb6f9c5a as sm_120a; the amx emit differs only in the header target hash):
+# Qualified (2026-10-07, plowrt b6924229, packet 9481a0630569):
 # campaign.py report MATCHED + EQUIVALENT vs vLLM 0.30 CPU at 1000/128 c1/c8/c32; FP32-reference gate PASS,
-# KL mean 0.018 vs vLLM 0.022. Throughput 1.69-3.36x, TPOT P99 lower everywhere; burst TTFT P99 loses 1.04x / 1.19x at c8 / c32.
+# KL mean 0.011 vs vLLM 0.021. Throughput 2.04-3.41x, TTFT P99 0.67-0.82x, TPOT P99 0.28-0.50x, memory 0.53-0.63x (wins every row).
 # docs/bringup/results/gemma4-xeon6-bf16-20261006/comparison.md.
 schema = "plow.recipe.v1"
 namespace = "infervisor"
