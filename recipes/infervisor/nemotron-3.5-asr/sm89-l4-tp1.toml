@@ -1,0 +1,51 @@
+# Nemotron-3.5-ASR-streaming-0.6B on L4 (sm_89, 58 SMs): FastConformer encoder + RNNT greedy
+# decode as one `rnnt.greedy.v1` packet pipeline from the Q8_0 GGUF (weights stay Q8_0; no
+# re-quantization), FP32 speech ops on the sm_89 speech object. The packet carries the offline
+# encoder buckets and the cache-aware stream programs (stream.init/first/step: per-layer K/V and
+# conv caches, 4-row steps) that serve partial transcripts. Not a plowc emit, so
+# `campaign.py build` does not apply; [build].script is the reproducible build.
+#
+#   nix develop --command scripts/asr/nvidia/nemotron_l4_build.sh <q8_0.gguf> <fresh dir>
+#
+# Gate: WER on the 73-clip LibriSpeech dummy set (scripts/asr/nvidia/get_audio.py) = 5.13%,
+# c1 p50 85.6 ms, RTFx 68.5. Stream partials word-identical to offline on 6 clips
+# (crates/plowrt/examples/asr/stream_check.rs); 21.6 ms per 4-row step.
+
+schema = "plow.recipe.v1"
+namespace = "infervisor"
+name = "nemotron-3.5-asr"
+label = "sm89-l4-tp1"
+network = "fastconformer-rnnt"
+doc = "docs/runtime/asr.md"
+
+[target]
+vendor = "nvidia"
+isa = "sm_89"
+sku = "L4"
+units = 58
+num_gpus = 1
+parallel = "tp"
+
+[checkpoint]
+source = "hf:nvidia/nemotron-3.5-asr-streaming-0.6b"
+file = "nemotron-3.5-asr-streaming-0.6b.q8_0.gguf"
+
+[build]
+script = "scripts/asr/nvidia/nemotron_l4_build.sh"
+compiler = "crates/plowrt/examples/asr/nemotron_pipeline_compile.rs"
+feature_frames = "200,400,600,800,1000,1200,1400,1600,1800,2000,2200,2400,2600,2800,3000"
+joint_batch = 16
+n_cu = 58
+stream_rows = 4
+[build.objects]
+interp_sm89_speech = "-DPLOW_SPEECH_OPS=0x20000ffffull"
+
+[serve]
+# plowrt serve --asr-packet <served name>=<dir>/nemotron.pkt,tokenizer=<dir>/tokenizer.q8_0.gguf,backend=cuda
+served_name = "nemotron-3.5-asr"
+backend = "cuda"
+
+[gates.asr_wer]
+manifest = "{env:ASR_MANIFEST}"
+conc = "1"
+wer_max = 0.055

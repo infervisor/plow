@@ -1,9 +1,13 @@
-# Trial: Qwen3-ASR on L4 (sm_89, 58 SMs). The H100 recipe minus the Hopper-only decode knobs
-# (gemv_k8, FA fold, dense tune, packed small-hd prefill) and the wgmma `_gw` rungs past 32.
-# Decoder prefill projections go through cuBLASLt (bf16, segment_roles sm89 policy).
+# Qwen3-ASR-1.7B on L4 (sm_89, 58 SMs): the H100 recipe minus the Hopper-only decode knobs (gemv_k8,
+# FA fold, dense tune) and the wgmma `_gw` rungs past 32. Decoder prefill projections go through
+# cuBLASLt (bf16, segment_roles sm89 policy). Co-served with the other L4 ASR models on one 24 GB
+# card (scripts/asr/nvidia/l4_asr_deploy.sh).
 #
-#   PLOW_CAMPAIGN_NO_NIX=1 python3 scripts/campaign/campaign.py build \
-#     scripts/campaign/recipes/qwen3-asr.l4.bf16.toml --hf-dir <Qwen3-ASR dir> --out <fresh dir>
+#   nix develop --command python3 scripts/campaign/campaign.py build \
+#     recipes/infervisor/qwen3-asr/sm89-l4-tp1.toml --hf-dir <Qwen3-ASR-1.7B dir> --out <fresh dir>
+#
+# Gate: WER on the 73-clip LibriSpeech dummy set (scripts/asr/nvidia/get_audio.py), served
+# through plowrt = 3.652% (c1) / 3.826% (c16).
 
 schema = "plow.recipe.v1"
 namespace = "infervisor"

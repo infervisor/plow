@@ -538,8 +538,8 @@ RNNT and decode stay on the interpreter. sm_89 allows 99 KiB of shared memory pe
 speech arena is 96 KiB there and the hd128 `AttentionF32` arm traps (no supported model uses it).
 
 ```sh
-# Qwen3-ASR (1.7B; the 0.6B recipe is qwen3-asr-0.6b.l4.bf16.toml)
-python3 scripts/campaign/campaign.py build scripts/campaign/recipes/qwen3-asr.l4.bf16.toml \
+# Qwen3-ASR (1.7B; the 0.6B recipe is recipes/infervisor/qwen3-asr-0.6b/sm89-l4-tp1.toml)
+python3 scripts/campaign/campaign.py build recipes/infervisor/qwen3-asr/sm89-l4-tp1.toml \
   --hf-dir models/Qwen3-ASR-1.7B --out <dir>
 plowrt serve --assets <dir>/assets [--assets <0.6B dir>/assets]
 
@@ -553,6 +553,10 @@ plowrt asr --packet <dir>/nemotron.pkt --tokenizer model.q8_0.gguf --backend cud
 ```
 
 An unspecialized speech object (all 42 arms) spends over 40 minutes in ptxas; specialize it.
+
+Production recipes: `recipes/infervisor/{qwen3-asr,qwen3-asr-0.6b,nemotron-3.5-asr}/sm89-l4-tp1.toml`.
+`scripts/asr/nvidia/nemotron_l4_build.sh` builds the Nemotron one; `scripts/asr/nvidia/l4_asr_deploy.sh`
+installs all three into `/opt/plow-asr` and (re)starts `plow-asr.service` (`scripts/asr/nvidia/plow-asr.service`).
 
 The L4 recipes compile `max_ctx` 1024 (KV 3.5 GiB at 32 slots) and cap packed encoder buckets at
 64 chunks (`PLOW_ASR_PACKED_MAX_CHUNKS`; the 192-chunk default holds ~5.7 GB of encoder
