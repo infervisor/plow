@@ -378,6 +378,32 @@ impl PacketLogMelFrontend {
         }
         self.inner.extract(samples, true)
     }
+
+    /// Mel frames `from_frame..` of a growing recording and how many leading frames (counted from
+    /// 0) are final: their analysis window has arrived, so later audio cannot change them (no
+    /// per-utterance normalization). Frames are computed from a slice starting `MARGIN` frames
+    /// earlier, whose edge (padding, pre-emphasis) only the dropped frames see.
+    pub fn extract_partial(&self, samples: &[f32], from_frame: usize) -> Result<(LogMelFeatures, usize)> {
+        const MARGIN: usize = 2;
+        let config = self.inner.config;
+        let window_offset = if config.center_window { (config.fft - config.window) / 2 } else { 0 };
+        let reach = window_offset + config.window;
+        let pad = config.fft / 2;
+        if samples.len() > self.max_samples
+            || config.normalize_per_feature
+            || pad > MARGIN * config.hop + window_offset
+        {
+            return Err(invalid("audio cannot be streamed through this frontend"));
+        }
+        let complete = (samples.len() + pad).checked_sub(reach).map_or(0, |span| span / config.hop + 1);
+        let skip = from_frame.saturating_sub(MARGIN);
+        let tail = samples.get(skip * config.hop..).filter(|t| !t.is_empty()).ok_or_else(|| invalid("no audio past the requested frame"))?;
+        let mut features = self.inner.extract(tail, true)?;
+        let drop = from_frame - skip;
+        features.values.drain(..(drop * features.bins).min(features.values.len()));
+        features.frames = features.frames.saturating_sub(drop);
+        Ok((features, complete))
+    }
 }
 
 impl LogMelFrontend {

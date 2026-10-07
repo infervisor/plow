@@ -169,9 +169,11 @@ clients are unaffected. The `ready` event carries `session_id`, `request_id`, `s
 - Credit counts PCM samples, excluding the eight-byte sequence header. Send no more
   than the outstanding grant; `credit` events grant up to one second of audio at a time.
 - `partial {revision, text, language, stable_prefix_bytes}` events arrive about once per second
-  of new audio when requested, at most one in flight. On `plowrt serve` a partial encodes only
-  the open encoder window and resumes the session's decoder rows; on `plowrt asr` it
-  re-transcribes the whole buffer.
+  of new audio when requested, at most one in flight. A Qwen partial on `plowrt serve` encodes
+  only the open encoder window and resumes the session's decoder rows. An RNNT packet with an
+  encoder stream (Nemotron, see "L4") continues its cache-aware stream: each partial encodes only
+  the new audio and its text trails the audio by the attention lookahead. Other `plowrt asr`
+  engines re-transcribe the whole buffer. Finals always run the offline pass.
 - Send `{"type":"finish"}` once after the last samples. With `deltas`, `delta {text}` events
   stream the transcript as it decodes (RNNT: per token; Qwen on `plowrt asr`: one delta), then one
   `final {revision, text, language, stable_prefix_bytes, turn_id, traceparent, server_timing}`.
@@ -221,6 +223,38 @@ nix develop -c cargo run -p plowrt --example asr_stream -- \
   ws://127.0.0.1:8080/v1/audio/transcriptions/stream \
   decode speech.wav
 ```
+
+## Realtime (OpenAI-compatible)
+
+`GET /v1/realtime?intent=transcription[&model=NAME]` speaks OpenAI's Realtime transcription-session
+protocol, so its clients (the `openai` SDK's `client.realtime.connect`, browser code) connect
+unchanged. It is served wherever the WebSocket route is (`plowrt serve`; `plowrt asr --websocket`).
+Auth: the usual key headers, or the browser subprotocol `openai-insecure-api-key.<key>` beside
+`realtime` (the server selects `realtime`).
+
+- On connect: `transcription_session.created`. Client `transcription_session.update` (or the GA
+  `session.update` with a `type: "transcription"` session under `audio.input`) sets
+  `input_audio_format` (`pcm16` at 24 kHz, `g711_ulaw`, `g711_alaw` at 8 kHz; resampled to
+  16 kHz), `input_audio_transcription` {`model`, `language`, `prompt`} and `turn_detection`;
+  answered by `transcription_session.updated` (`session.updated`). An unknown model fails the
+  update (`model_not_found`). Audio needs a model, from `?model=` or the update.
+- `input_audio_buffer.append` {`audio`: base64}. With `turn_detection: {type: "server_vad"}` (the
+  default; `silence_duration_ms` 200..=2000, default 500) the continuous-mode endpointer cuts
+  turns: `input_audio_buffer.speech_started` {`audio_start_ms`, `item_id`},
+  `.speech_stopped` {`audio_end_ms`, `item_id`}, `.committed` {`item_id`, `previous_item_id`}.
+  `threshold` and `prefix_padding_ms` are echoed but fixed (12 dB over the noise floor, 200 ms
+  of context). With `turn_detection: null` audio accumulates (at most 30 s) until
+  `input_audio_buffer.commit` (at least 100 ms, else `input_audio_buffer_commit_empty`);
+  `input_audio_buffer.clear` drops it (`.cleared`). A commit under VAD closes the open turn.
+- Each committed item streams `conversation.item.input_audio_transcription.delta`
+  {`item_id`, `content_index`: 0, `delta`} then one `.completed` {`transcript`}, in commit
+  order; `.failed` {`error`} on a deadline (`timeout`) or a full queue (`rate_limit_exceeded`).
+  Every server event has `event_id`; `error` events carry `{type, code, message, param,
+  event_id}` (the client's `event_id`).
+- Limits: 1 MiB per event, two turns transcribing and 16 waiting (past it: `rate_limit_exceeded`
+  and close 1001), 120 s without client events or pending work closes the session, pings as on
+  the native stream, shutdown sends `error` (`unavailable`) and close 1001. Not implemented:
+  responses/conversation events, `semantic_vad`, noise reduction, `include` (logprobs), usage.
 
 ## Reference checks
 
@@ -509,10 +543,11 @@ python3 scripts/campaign/campaign.py build scripts/campaign/recipes/qwen3-asr.l4
   --hf-dir models/Qwen3-ASR-1.7B --out <dir>
 plowrt serve --assets <dir>/assets [--assets <0.6B dir>/assets]
 
-# Nemotron 3.5: packet for 58 SMs, plus a speech object carrying its ops (163..178)
+# Nemotron 3.5: packet for 58 SMs (with its cache-aware encoder stream, STREAM_ROWS defaults to
+# one attention chunk), plus a speech object carrying its ops (163..178, CopyColsF32 196)
 asr_nemotron_pipeline_compile model.q8_0.gguf 200,400,...,3000 <dir>/nemotron.pkt 16 58
 cmake -S runtime -B <build> -DPLOW_SM89_CUBIN=ON -DPLOW_CUBIN_SPEECH=ON -DPLOW_CUBIN_ARCH=sm_89 \
-  -DPLOW_CUBIN_GEMMA=OFF "-DPLOW_EXTRA_DEFINES=-DPLOW_SPEECH_OPS=0xffffull"
+  -DPLOW_CUBIN_GEMMA=OFF "-DPLOW_EXTRA_DEFINES=-DPLOW_SPEECH_OPS=0x20000ffffull"
 cmake --build <build> --target nv_cubins   # copy <build>/cubin/interp_sm89_speech.cubin beside nemotron.pkt
 plowrt asr --packet <dir>/nemotron.pkt --tokenizer model.q8_0.gguf --backend cuda --port 8080
 ```
@@ -538,3 +573,18 @@ queues four; more concurrent requests get 429.
 
 `nemotron-speech-streaming-en-0.6b` does not compile: its attention window (71 keys) exceeds
 the 64-key `RelativeAttentionF32` packet limit.
+
+### Cache-aware Nemotron stream
+
+Nemotron's encoder is causal (factor-8 causal subsampling, chunk-limited attention with 56 left
+frames and one 4-frame chunk of lookahead, causal depthwise convolution), so the packet carries a
+streaming variant (`stream.*` pipeline roles, `conformer::append_stream_step`): each step encodes
+one chunk (320 ms of audio) from the last 16 + 32 mel frames, with per-layer key/value caches of
+the left context and convolution caches of 8 rows, and the greedy RNNT loop continues across
+steps. A step computes every row in the offline order, so on the 6 checked LibriSpeech clips the
+stream's text equals the offline transcript word for word (`asr_stream_check`). A step costs
+~21.6 ms of GPU time (0.07x real time per stream); text first appears after 1.28 s of audio.
+Sessions keep their caches in per-session device copies (`PacketRuntime::create_tensor`),
+swapped per step, so concurrent streams share one packet. The 4-row FFN GEMVs dominate a step and
+still run well under the weight bandwidth (unaligned Q8_0 blocks); vectorizing them is the next
+gain.

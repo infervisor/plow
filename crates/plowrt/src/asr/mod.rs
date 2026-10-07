@@ -75,6 +75,23 @@ pub trait Transcriber: Send {
         Ok(transcript)
     }
 
+    /// Open an incremental (cache-aware) stream, or `None` when the engine has none: then partial
+    /// transcripts re-run [`Transcriber::transcribe`] on the audio so far.
+    fn stream_open(&mut self) -> crate::Result<Option<u64>> {
+        Ok(None)
+    }
+
+    /// Append audio to stream `id`; returns the transcript of the audio decoded so far (it trails
+    /// the audio by the encoder's lookahead), reporting each growth through `on_text`.
+    fn stream_push(&mut self, id: u64, samples: &[f32], on_text: &mut dyn FnMut(&str)) -> crate::Result<String> {
+        let _ = (id, samples, on_text);
+        Err(crate::RuntimeError::Rejected("this ASR engine has no incremental stream".into()))
+    }
+
+    fn stream_close(&mut self, id: u64) {
+        let _ = id;
+    }
+
     fn transcribe_batch(
         &mut self,
         requests: &[TranscriptionInput<'_>],
@@ -131,6 +148,18 @@ impl<T: Transcriber + ?Sized> Transcriber for Box<T> {
         on_text: &mut dyn FnMut(&str),
     ) -> crate::Result<Transcript> {
         (**self).transcribe_streaming(samples, language, context, cancel, on_text)
+    }
+
+    fn stream_open(&mut self) -> crate::Result<Option<u64>> {
+        (**self).stream_open()
+    }
+
+    fn stream_push(&mut self, id: u64, samples: &[f32], on_text: &mut dyn FnMut(&str)) -> crate::Result<String> {
+        (**self).stream_push(id, samples, on_text)
+    }
+
+    fn stream_close(&mut self, id: u64) {
+        (**self).stream_close(id)
     }
 
     fn transcribe_batch(

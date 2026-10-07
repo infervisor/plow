@@ -530,7 +530,8 @@ fn emit_q8(
     dep: Option<u32>,
 ) -> u32 {
     let weight = b.tensor(weight_name, u64::from(n) * u64::from(k / 32) * 34);
-    let tiles = m.div_ceil(64) * n.div_ceil(64);
+    // At most 8 rows the kernel walks columns warp by warp (SPQ_GEMV_ROWS): every CU takes a share.
+    let tiles = if m <= 8 { b.n_cu() } else { m.div_ceil(64) * n.div_ceil(64) };
     b.emit(
         DevOp::Q8GemmF32,
         repeated_cus(b.n_cu(), tiles),
@@ -598,6 +599,186 @@ fn validate(
         return Err("relative position table does not cover the frame count".into());
     }
     Ok(())
+}
+
+/// Cache-aware streaming (chunk-limited attention, causal convolutions): the attention's left
+/// context in rows. A stream step keeps this many key/value rows per layer.
+pub fn stream_left_rows(spec: &ConformerSpec<'_>) -> u32 {
+    spec.chunk_size * spec.left_chunks
+}
+
+/// Name of the per-step key mask: keys before row `key_start` of the attention window are not
+/// filled yet (the stream's first chunks). Written by the host every step.
+pub const STREAM_KEY_START: &str = "in.stream.key_start";
+
+/// One streaming encoder step: `rows` new encoder frames (whole attention chunks) taken from rows
+/// `keep_row0..` of the prefix output (the subsampling of the step's mel window) run through every
+/// layer. Row-local work runs on the new rows only; each layer's attention sees a window of
+/// `[key/value cache | new rows]` and its depthwise convolution `[conv cache | new rows]`, the
+/// caches (`state.stream.*`, zeroed when a stream opens) shifting by `rows` per step. Every output
+/// row is computed in the offline encoder's order, so the step reproduces its rows. Output:
+/// `act.stream.x` (`rows` x width). Run [`stream_init`] once before the first step.
+pub fn append_stream_step(
+    spec: ConformerSpec<'_>,
+    layers: &[ConformerLayerWeights<'_>],
+    prefix: PacketPrefix,
+    keep_row0: u32,
+    rows: u32,
+) -> Result<PacketPrefix, String> {
+    validate(spec, layers, prefix.model.n_cu)?;
+    let left = stream_left_rows(&spec);
+    let window = left + rows;
+    let tail = spec.convolution_kernel - 1;
+    if rows == 0 || rows % spec.chunk_size != 0 || left == 0 || keep_row0 + rows > spec.frames {
+        return Err("stream step rows must be whole attention chunks inside the prefix output".into());
+    }
+    if spec.position_center < window || spec.position_center + window > spec.position_count + 1 {
+        return Err("relative position table does not cover the stream window".into());
+    }
+    let n_cu = prefix.model.n_cu;
+    let mut b = Builder::new(n_cu);
+    b.set_tensor_dedup(true);
+    b.adopt_tensors(prefix.model.tensors.clone());
+    let w = spec.width;
+    let row_bytes = u64::from(w) * 4;
+    let rs = ConformerSpec { frames: rows, ..spec };
+    let x = b.tensor("act.stream.x", u64::from(rows) * row_bytes);
+    let d0 = b.tensor("act.stream.d0", u64::from(rows) * row_bytes);
+    let d1 = b.tensor("act.stream.d1", u64::from(rows) * row_bytes);
+    let large = b.tensor(
+        "act.stream.large",
+        u64::from(rows) * u64::from(spec.feed_forward_width.max(2 * w)) * 4,
+    );
+    let [q, k, v] = ["q", "k", "v"].map(|n| b.tensor(&format!("act.stream.{n}"), u64::from(rows) * row_bytes));
+    let [qw, kw, vw, ctx] =
+        ["qw", "kw", "vw", "ctx"].map(|n| b.tensor(&format!("act.stream.{n}"), u64::from(window) * row_bytes));
+    let gw = b.tensor("act.stream.gw", u64::from(tail + rows) * row_bytes);
+    let cw = b.tensor("act.stream.cw", u64::from(tail + rows) * row_bytes);
+    let key_start = b.tensor(STREAM_KEY_START, 4);
+    let mut dep = Some(copy_rows(&mut b, x, 0, prefix.output, keep_row0, rows, w, None));
+    for (l, layer) in layers.iter().enumerate() {
+        let k_cache = b.tensor(&format!("state.stream.k.{l}"), u64::from(left) * row_bytes);
+        let v_cache = b.tensor(&format!("state.stream.v.{l}"), u64::from(left) * row_bytes);
+        let conv_cache = b.tensor(&format!("state.stream.conv.{l}"), u64::from(tail) * row_bytes);
+        let position = b.tensor(&stream_position(l), u64::from(2 * window - 1) * row_bytes);
+        dep = Some(feed_forward(&mut b, rs, *layer, x, d0, large, dep, true));
+        let norm = emit_norm(&mut b, rs, x, d0, layer.attention.norm, dep);
+        let mut last = norm;
+        for (out, weight) in [(q, layer.attention.query), (k, layer.attention.key), (v, layer.attention.value)] {
+            last = emit_q8(&mut b, out, d0, weight, rows, w, w, 0, 0, Some(last));
+        }
+        last = copy_rows(&mut b, kw, 0, k_cache, 0, left, w, Some(last));
+        last = copy_rows(&mut b, kw, left, k, 0, rows, w, Some(last));
+        last = copy_rows(&mut b, vw, 0, v_cache, 0, left, w, Some(last));
+        last = copy_rows(&mut b, vw, left, v, 0, rows, w, Some(last));
+        last = copy_rows(&mut b, qw, left, q, 0, rows, w, Some(last));
+        let bu = b.tensor(layer.attention.bias_u, u64::from(w) * 4);
+        let bv = b.tensor(layer.attention.bias_v, u64::from(w) * 4);
+        last = b.emit(
+            DevOp::RelativeAttentionF32,
+            // query_row0 > 0: a block per (new row, head).
+            repeated_cus(n_cu, rows * spec.heads),
+            &[last],
+            |d| {
+                d.t[..8].copy_from_slice(&[ctx, qw, kw, vw, position, bu, bv, key_start]);
+                d.i[..6].copy_from_slice(&[window, w, spec.heads, spec.chunk_size, spec.left_chunks, left]);
+            },
+        );
+        last = copy_rows(&mut b, k_cache, 0, kw, rows, left, w, Some(last));
+        last = copy_rows(&mut b, v_cache, 0, vw, rows, left, w, Some(last));
+        last = copy_rows(&mut b, d1, 0, ctx, left, rows, w, Some(last));
+        last = emit_q8(&mut b, d0, d1, layer.attention.output, rows, w, w, 0, 0, Some(last));
+        dep = Some(emit_add(&mut b, rs, x, x, d0, 1.0, Some(last)));
+
+        let norm = emit_norm(&mut b, rs, x, d0, layer.convolution.norm, dep);
+        let pointwise = emit_q8(&mut b, large, d0, layer.convolution.pointwise_in, rows, w * 2, w, 0, 0, Some(norm));
+        let glu = b.emit(DevOp::GluF32, b.all(), &[pointwise], |d| {
+            d.t[0] = d1;
+            d.t[1] = large;
+            d.i[0] = rows;
+            d.i[1] = w;
+        });
+        last = copy_rows(&mut b, gw, 0, conv_cache, 0, tail, w, Some(glu));
+        last = copy_rows(&mut b, gw, tail, d1, 0, rows, w, Some(last));
+        let depthwise_weight = b.tensor(
+            layer.convolution.depthwise,
+            u64::from(w) * u64::from(spec.convolution_kernel) * 2,
+        );
+        last = b.emit(DevOp::CausalDepthwiseConv1dF32, b.all(), &[last], |d| {
+            d.t[..3].copy_from_slice(&[cw, gw, depthwise_weight]);
+            d.i[..3].copy_from_slice(&[tail + rows, w, spec.convolution_kernel]);
+        });
+        last = copy_rows(&mut b, conv_cache, 0, gw, rows, tail, w, Some(last));
+        last = copy_rows(&mut b, d0, 0, cw, tail, rows, w, Some(last));
+        let channel_norm = emit_norm(&mut b, rs, d0, d1, layer.convolution.channel_norm, Some(last));
+        let activated = b.emit(DevOp::SiluF32, b.all(), &[channel_norm], |d| {
+            d.t[..2].copy_from_slice(&[d1, d1]);
+            d.i[0] = rows * w;
+        });
+        let convolution = emit_q8(&mut b, d0, d1, layer.convolution.pointwise_out, rows, w, w, 0, 0, Some(activated));
+        dep = Some(emit_add(&mut b, rs, x, x, d0, 1.0, Some(convolution)));
+        dep = Some(feed_forward(&mut b, rs, *layer, x, d0, large, dep, false));
+        dep = Some(emit_norm(&mut b, rs, x, x, layer.output_norm, dep));
+    }
+    let tensors = b.tensors();
+    let program = b.finish();
+    let mut model = prefix.model;
+    model.tensors = tensors;
+    let index = model.progs.len();
+    model.progs.push(program);
+    model.prog_t.push(rows);
+    let mut programs = prefix.programs;
+    programs.push(index);
+    Ok(PacketPrefix { model, programs, input: prefix.input, output: x, input_shape: prefix.input_shape })
+}
+
+/// The stream's per-layer relative-position projections: input independent, so one program fills
+/// them once per packet load (`window` = left context + step rows).
+pub fn stream_init(
+    spec: ConformerSpec<'_>,
+    layers: &[ConformerLayerWeights<'_>],
+    rows: u32,
+    n_cu: u32,
+) -> Result<Model, String> {
+    let window = stream_left_rows(&spec) + rows;
+    if spec.position_center < window || spec.position_center + window > spec.position_count + 1 {
+        return Err("relative position table does not cover the stream window".into());
+    }
+    let mut b = Builder::new(n_cu);
+    b.set_tensor_dedup(true);
+    let table = b.tensor(spec.position_table, u64::from(spec.position_count) * u64::from(spec.width) * 4);
+    let mut dep = None;
+    for (l, layer) in layers.iter().enumerate() {
+        let position = b.tensor(&stream_position(l), u64::from(2 * window - 1) * u64::from(spec.width) * 4);
+        dep = Some(emit_q8(
+            &mut b,
+            position,
+            table,
+            layer.attention.position,
+            2 * window - 1,
+            spec.width,
+            spec.width,
+            0,
+            spec.position_center - window,
+            dep,
+        ));
+    }
+    let tensors = b.tensors();
+    let program = b.finish();
+    Ok(Model { n_cu, target: 0, tensors, progs: vec![program], prog_t: vec![1], kv_row_insts: Vec::new(), gen: Vec::new() })
+}
+
+fn stream_position(layer: usize) -> String {
+    format!("act.stream.position.{layer}")
+}
+
+/// `out[out_row0..+rows] = x[x_row0..+rows]` (`width` FP32 columns per row).
+#[allow(clippy::too_many_arguments)]
+fn copy_rows(b: &mut Builder, out: u32, out_row0: u32, x: u32, x_row0: u32, rows: u32, width: u32, dep: Option<u32>) -> u32 {
+    b.emit(DevOp::CopyColsF32, b.all(), &deps(dep), |d| {
+        d.t[..2].copy_from_slice(&[out, x]);
+        d.i[..7].copy_from_slice(&[1, rows, width, width, x_row0 * width, width, out_row0 * width]);
+    })
 }
 
 #[cfg(test)]

@@ -54,6 +54,12 @@ pub trait PacketRuntime: Send {
         target_offset: usize,
         bytes: usize,
     ) -> Result<()>;
+    /// A zeroed device buffer outside the packet (per-session state copies); `copy_tensor` moves
+    /// bytes between it and packet tensors. Unsupported by default.
+    fn create_tensor(&mut self, bytes: usize) -> Result<PacketTensor> {
+        let _ = bytes;
+        Err(RuntimeError::Rejected("this packet backend cannot create tensors".into()))
+    }
     fn run(&mut self, program: usize) -> Result<()>;
     fn run_sequence(&mut self, programs: &[usize]) -> Result<()> {
         for &program in programs {

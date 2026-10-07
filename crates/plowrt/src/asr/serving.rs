@@ -24,6 +24,7 @@ use super::{
 };
 use crate::serve::session::RequestIds;
 
+mod realtime;
 #[cfg(feature = "cuda")]
 mod shared;
 #[cfg(feature = "cuda")]
@@ -109,7 +110,10 @@ impl Route {
         opts: AsrOpts,
     ) -> Result<oneshot::Receiver<crate::Result<Transcript>>, SubmitError> {
         match self {
-            Route::Cohort(mux) => mux.submit_with(samples, language, context, cancel, opts.deltas),
+            Route::Cohort(mux) => {
+                let stream = opts.windows.as_ref().filter(|_| !opts.final_pass).map(Arc::downgrade);
+                mux.submit_with(samples, language, context, cancel, opts.deltas, stream)
+            }
             #[cfg(feature = "cuda")]
             Route::Shared(asr, mux) => asr.submit(mux.clone(), samples, language, context, cancel, opts),
         }
@@ -141,6 +145,46 @@ struct AsrJob {
     respond: oneshot::Sender<crate::Result<Transcript>>,
     /// Transcript text as it grows; honoured when the job runs alone (`transcribe_streaming`).
     deltas: Option<mpsc::UnboundedSender<String>>,
+    /// A partial of the recording this cache belongs to: continue its engine stream.
+    stream: Option<std::sync::Weak<parking_lot::Mutex<WindowCache>>>,
+}
+
+/// An engine stream (`Transcriber::stream_open`) following one recording's partials; closed once
+/// the recording's window cache is dropped (session or segment over).
+struct OpenStream {
+    key: std::sync::Weak<parking_lot::Mutex<WindowCache>>,
+    id: u64,
+    /// Samples of the recording already pushed.
+    pushed: usize,
+}
+
+/// A partial through the recording's stream: `None` when the engine has no stream (the caller then
+/// transcribes the whole recording).
+fn continue_stream(
+    engine: &mut dyn Transcriber,
+    streams: &mut Vec<OpenStream>,
+    key: std::sync::Weak<parking_lot::Mutex<WindowCache>>,
+    job: &AsrJob,
+) -> Option<crate::Result<Transcript>> {
+    let index = match streams.iter().position(|open| open.key.ptr_eq(&key)) {
+        Some(index) if streams[index].pushed <= job.samples.len() => index,
+        found => {
+            if let Some(index) = found {
+                engine.stream_close(streams.swap_remove(index).id);
+            }
+            let id = match engine.stream_open() {
+                Ok(Some(id)) => id,
+                Ok(None) => return None,
+                Err(error) => return Some(Err(error)),
+            };
+            streams.push(OpenStream { key, id, pushed: 0 });
+            streams.len() - 1
+        }
+    };
+    let open = &mut streams[index];
+    let result = engine.stream_push(open.id, &job.samples[open.pushed..], &mut |_| {});
+    open.pushed = job.samples.len();
+    Some(result.and_then(|text| Ok(Transcript { text, language: engine.language(job.language.as_deref())? })))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -165,6 +209,7 @@ impl AsrMux {
             .name("plow-asr-engine".into())
             .spawn(move || {
                 let mut cohort = VecDeque::with_capacity(batch_capacity);
+                let mut streams: Vec<OpenStream> = Vec::new();
                 while let Some(first) = rx.blocking_recv() {
                     cohort.push_back(first);
                     if batch_capacity > 1 {
@@ -192,6 +237,26 @@ impl AsrMux {
                         metrics.queued.fetch_sub(1, Ordering::Relaxed);
                         metrics.running.fetch_add(1, Ordering::Relaxed);
                         metrics.queue.duration(job.queued_at.elapsed());
+                    }
+                    // Partials of a growing recording continue its encoder stream (engines with one).
+                    streams.retain(|open: &OpenStream| {
+                        let live = open.key.strong_count() > 0;
+                        if !live {
+                            engine.stream_close(open.id);
+                        }
+                        live
+                    });
+                    for job in std::mem::take(&mut cohort) {
+                        match job.stream.clone() {
+                            Some(key) => match continue_stream(&mut *engine, &mut streams, key, &job) {
+                                Some(result) => finish_job(job, result),
+                                None => cohort.push_back(AsrJob { stream: None, ..job }),
+                            },
+                            None => cohort.push_back(job),
+                        }
+                    }
+                    if cohort.is_empty() {
+                        continue;
                     }
                     if let [job] = cohort.make_contiguous() {
                         if let Some(deltas) = job.deltas.clone() {
@@ -252,7 +317,7 @@ impl AsrMux {
         context: String,
         cancel: Arc<AtomicBool>,
     ) -> Result<oneshot::Receiver<crate::Result<Transcript>>, SubmitError> {
-        self.submit_with(samples, language, context, cancel, None)
+        self.submit_with(samples, language, context, cancel, None, None)
     }
 
     fn submit_with(
@@ -262,6 +327,7 @@ impl AsrMux {
         context: String,
         cancel: Arc<AtomicBool>,
         deltas: Option<mpsc::UnboundedSender<String>>,
+        stream: Option<std::sync::Weak<parking_lot::Mutex<WindowCache>>>,
     ) -> Result<oneshot::Receiver<crate::Result<Transcript>>, SubmitError> {
         let permit = self.tx.try_reserve().map_err(|error| {
             self.metrics.serving.asr.rejected.fetch_add(1, Ordering::Relaxed);
@@ -280,6 +346,7 @@ impl AsrMux {
             cancel,
             respond,
             deltas,
+            stream,
         };
         self.metrics.serving.asr.jobs.fetch_add(1, Ordering::Relaxed);
         self.metrics.serving.asr.queued.fetch_add(1, Ordering::Relaxed);
@@ -513,7 +580,9 @@ impl AsrServer {
     pub fn transcription_router(self: Arc<Self>, websocket: bool) -> Router {
         let mut router = Router::new().route("/v1/audio/transcriptions", post(transcription));
         if websocket {
-            router = router.route("/v1/audio/transcriptions/stream", get(upgrade));
+            router = router
+                .route("/v1/audio/transcriptions/stream", get(upgrade))
+                .route("/v1/realtime", get(realtime::upgrade));
         }
         router
             .layer(DefaultBodyLimit::max(4 * 1024 * 1024))
@@ -1824,6 +1893,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cohort_partials_continue_the_recording_stream() {
+        #[derive(Default)]
+        struct Log {
+            opened: u64,
+            pushed: Vec<(u64, usize)>,
+            closed: Vec<u64>,
+        }
+        struct Streaming(Arc<parking_lot::Mutex<Log>>);
+        impl Transcriber for Streaming {
+            fn language(&self, _: Option<&str>) -> crate::Result<Option<String>> {
+                Ok(None)
+            }
+            fn transcribe(&mut self, samples: &[f32], _: Option<&str>, _: &str, _: &AtomicBool) -> crate::Result<Transcript> {
+                Ok(Transcript { text: format!("final {}", samples.len()), language: None })
+            }
+            fn stream_open(&mut self) -> crate::Result<Option<u64>> {
+                let mut log = self.0.lock();
+                log.opened += 1;
+                Ok(Some(log.opened))
+            }
+            fn stream_push(&mut self, id: u64, samples: &[f32], _: &mut dyn FnMut(&str)) -> crate::Result<String> {
+                let mut log = self.0.lock();
+                log.pushed.push((id, samples.len()));
+                Ok(format!("stream {id}"))
+            }
+            fn stream_close(&mut self, id: u64) {
+                self.0.lock().closed.push(id);
+            }
+        }
+        let log = Arc::new(parking_lot::Mutex::new(Log::default()));
+        let (mux, _, _) = AsrMux::spawn(Box::new(Streaming(log.clone())));
+        let recording: Arc<parking_lot::Mutex<WindowCache>> = Default::default();
+        let run = |samples: usize, stream| {
+            mux.submit_with(vec![0.0; samples], None, String::new(), Arc::new(AtomicBool::new(false)), None, stream)
+                .unwrap()
+        };
+        assert_eq!(run(100, Some(Arc::downgrade(&recording))).await.unwrap().unwrap().text, "stream 1");
+        assert_eq!(run(250, Some(Arc::downgrade(&recording))).await.unwrap().unwrap().text, "stream 1");
+        assert_eq!(run(300, None).await.unwrap().unwrap().text, "final 300");
+        drop(recording);
+        let next: Arc<parking_lot::Mutex<WindowCache>> = Default::default();
+        assert_eq!(run(50, Some(Arc::downgrade(&next))).await.unwrap().unwrap().text, "stream 2");
+        let log = log.lock();
+        assert_eq!(log.pushed, [(1, 100), (1, 150), (2, 50)]);
+        assert_eq!(log.closed, [1]);
+    }
+
+    #[tokio::test]
     async fn cohort_streams_growing_text_as_deltas() {
         struct Growing;
         impl Transcriber for Growing {
@@ -1850,7 +1967,7 @@ mod tests {
         let (mux, _, _) = AsrMux::spawn(Box::new(Growing));
         let (tx, mut rx) = mpsc::unbounded_channel();
         let result = mux
-            .submit_with(vec![0.0], None, String::new(), Arc::new(AtomicBool::new(false)), Some(tx))
+            .submit_with(vec![0.0], None, String::new(), Arc::new(AtomicBool::new(false)), Some(tx), None)
             .unwrap()
             .await
             .unwrap()

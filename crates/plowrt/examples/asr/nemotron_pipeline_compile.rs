@@ -17,9 +17,9 @@ use plowrt::asset::gguf::GgufFile;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<_> = std::env::args().collect();
-    if !(4..=7).contains(&args.len()) {
+    if !(4..=8).contains(&args.len()) {
         return Err(
-            "usage: asr_nemotron_pipeline_compile MODEL_GGUF FEATURE_FRAMES OUTPUT_PACKET [JOINT_BATCH] [N_CU] [TRAILING_ENCODER_FRAMES]"
+            "usage: asr_nemotron_pipeline_compile MODEL_GGUF FEATURE_FRAMES OUTPUT_PACKET [JOINT_BATCH] [N_CU] [TRAILING_ENCODER_FRAMES] [STREAM_ROWS]"
                 .into(),
         );
     }
@@ -114,8 +114,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let layer_names: Vec<_> = (0..plan.blocks().len()).map(LayerNames::new).collect();
     let layers: Vec<_> = layer_names.iter().map(LayerNames::borrow).collect();
     let lstm = [lstm_weights(0), lstm_weights(1)];
-    let compile_capacity = |input_frames| -> Result<_, Box<dyn std::error::Error>> {
-        let subsampling = asr_subsampling::lower(
+    let rnnt_weights = RnntWeights {
+        prompt_in: linear("prompt_kernel.0"),
+        prompt_out: linear("prompt_kernel.2"),
+        encoder: linear("joint.enc"),
+        embedding: "decoder.prediction.embed.weight",
+        lstm: &lstm,
+        predictor: linear("joint.pred"),
+        output: linear("joint.joint_net.2"),
+    };
+    let conformer_spec = |frames| -> Result<ConformerSpec<'static>, Box<dyn std::error::Error>> {
+        Ok(ConformerSpec {
+            frames,
+            width: plan.width().try_into()?,
+            feed_forward_width: first.feed_forward1.expand.n().try_into()?,
+            heads: first.attention.heads.try_into()?,
+            convolution_kernel: first.convolution.kernel.try_into()?,
+            chunk_size: chunk_size.try_into()?,
+            left_chunks: left_chunks.try_into()?,
+            position_table: "encoder.pos_enc.pe",
+            position_count: first.attention.position_count.try_into()?,
+            position_center: first.attention.position_center.try_into()?,
+            epsilon: first.output_norm.epsilon(),
+        })
+    };
+    let subsample = |input_frames| {
+        asr_subsampling::lower(
             SubsamplingSpec {
                 input_frames,
                 input_width: 128,
@@ -127,25 +151,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 output_width: 1024,
             },
             n_cu,
-        )?;
+        )
+    };
+    let compile_capacity = |input_frames| -> Result<_, Box<dyn std::error::Error>> {
+        let subsampling = subsample(input_frames)?;
         let frames = subsampling.output_frames;
-        let conformer = conformer::append(
-            ConformerSpec {
-                frames,
-                width: plan.width().try_into()?,
-                feed_forward_width: first.feed_forward1.expand.n().try_into()?,
-                heads: first.attention.heads.try_into()?,
-                convolution_kernel: first.convolution.kernel.try_into()?,
-                chunk_size: chunk_size.try_into()?,
-                left_chunks: left_chunks.try_into()?,
-                position_table: "encoder.pos_enc.pe",
-                position_count: first.attention.position_count.try_into()?,
-                position_center: first.attention.position_center.try_into()?,
-                epsilon: first.output_norm.epsilon(),
-            },
-            &layers,
-            subsampling.into_prefix(),
-        )?;
+        let conformer = conformer::append(conformer_spec(frames)?, &layers, subsampling.into_prefix())?;
         let prefix: PacketPrefix = conformer.into_prefix();
         Ok((
             rnnt::append(
@@ -159,15 +170,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     joint_width: 640,
                     joint_batch,
                 },
-                &RnntWeights {
-                    prompt_in: linear("prompt_kernel.0"),
-                    prompt_out: linear("prompt_kernel.2"),
-                    encoder: linear("joint.enc"),
-                    embedding: "decoder.prediction.embed.weight",
-                    lstm: &lstm,
-                    predictor: linear("joint.pred"),
-                    output: linear("joint.joint_net.2"),
-                },
+                &rnnt_weights,
                 prefix,
                 0,
             )?,
@@ -178,6 +181,34 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for &capacity in &feature_frame_capacities[..feature_frame_capacities.len() - 1] {
         let (bucket, _) = compile_capacity(capacity)?;
         packets.merge_encoder_bucket(capacity, bucket)?;
+    }
+    // Cache-aware stream: STREAM_ROWS new encoder frames (whole attention chunks; default one
+    // chunk, 0 = no stream) per step. The subsampling is causal and factor 8: a later step's mel
+    // window carries 16 frames already seen, enough for its first new output row.
+    let stream_rows = args.get(7).map_or(Ok(u32::try_from(chunk_size)?), |v| v.parse::<u32>())?;
+    if stream_rows != 0 {
+        const FACTOR: u32 = 8;
+        const HISTORY: u32 = 16;
+        let stream_prefix = |input_frames, keep_row0| -> Result<PacketPrefix, Box<dyn std::error::Error>> {
+            let subsampling = subsample(input_frames)?;
+            let spec = conformer_spec(subsampling.output_frames)?;
+            Ok(conformer::append_stream_step(spec, &layers, subsampling.into_prefix(), keep_row0, stream_rows)?)
+        };
+        let spec = conformer_spec(stream_rows)?;
+        packets.add_stream(
+            rnnt::StreamGeometry {
+                rows: stream_rows,
+                left_rows: conformer::stream_left_rows(&spec),
+                first_input_frames: FACTOR * stream_rows,
+                step_input_frames: FACTOR * stream_rows + HISTORY,
+                history_input_frames: HISTORY,
+                step_keep_row0: HISTORY / FACTOR,
+            },
+            conformer::stream_init(spec, &layers, stream_rows, n_cu)?,
+            stream_prefix(FACTOR * stream_rows, 0)?,
+            stream_prefix(FACTOR * stream_rows + HISTORY, HISTORY / FACTOR)?,
+            &rnnt_weights,
+        )?;
     }
     packets.embed_weights(|name| {
         gguf.tensor(name)

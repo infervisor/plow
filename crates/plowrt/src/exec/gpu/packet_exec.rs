@@ -339,6 +339,16 @@ impl PacketRuntime for CudaPacketRuntime {
         self.be.memcpy_dtod_async(t.base + target_offset as u64, s.base + source_offset as u64, bytes as u64, &self.stream)
     }
 
+    fn create_tensor(&mut self, bytes: usize) -> Result<PacketTensor> {
+        let mem = self.be.alloc(0, (bytes as u64).max(4))?;
+        self.be.memset_d8_async(mem.base, 0, mem.len as usize, &self.stream)?;
+        self.be.stream_synchronize(&self.stream)?;
+        self.tensors.push(mem);
+        // Unnamed: `tensor(name)` never resolves it; only its handle does.
+        self.names.push(String::new());
+        Ok(PacketTensor { handle: self.tensors.len() - 1, bytes })
+    }
+
     fn run(&mut self, program: usize) -> Result<()> {
         self.run_sequence(&[program])
     }

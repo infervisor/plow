@@ -1362,6 +1362,47 @@ struct SpQ8Epi {
         out[(size_t)m * n + c] = silu ? sp_silu(v) : v;
     }
 };
+/* At most this many rows (a stream step, the RNNT predictor and joint) take the GEMV walk. */
+#define SPQ_GEMV_ROWS 8u
+/* A warp per output column walks K in Q8_0 blocks (lane = element), every row's sum in a register,
+ * then one fixed-order warp reduction: bandwidth-bound on the weights, every slice's warps sharing
+ * the columns. */
+static __device__ __forceinline__ void sp_q8_gemv(const float* __restrict__ x, const uint8_t* __restrict__ w,
+                                                  const SpQ8Epi& ep, unsigned m, unsigned n, unsigned k,
+                                                  unsigned slice, unsigned nblk) {
+    const unsigned lane = threadIdx.x & 31u, warp = threadIdx.x >> 5, blocks = k / 32u;
+    /* Every warp reads all rows of x: stage them in shared memory once when they fit. */
+    const bool staged = (size_t)m * k <= SP_ARENA_FLOATS;
+    if (staged) {
+        for (unsigned i = threadIdx.x; i < m * k; i += PLOW_NV_THREADS) sp_smem[i] = x[i];
+        __syncthreads();
+        x = sp_smem;
+    }
+    for (unsigned c = slice * PLOW_NV_WARPS + warp; c < n; c += nblk * PLOW_NV_WARPS) {
+        const uint8_t* row = w + (size_t)c * blocks * 34u;
+        float acc[SPQ_GEMV_ROWS];
+#pragma unroll
+        for (unsigned r = 0; r < SPQ_GEMV_ROWS; r++) acc[r] = 0.f;
+#pragma unroll 4
+        for (unsigned b = 0; b < blocks; b++) {
+            const uint8_t* block = row + b * 34u;
+            const float wv = __fmul_rn(sp_f16(*(const uint16_t*)block), (float)((const int8_t*)(block + 2))[lane]);
+            const float* xk = x + b * 32u + lane;
+#pragma unroll
+            for (unsigned r = 0; r < SPQ_GEMV_ROWS; r++)
+                if (r < m) acc[r] = fmaf(xk[(size_t)r * k], wv, acc[r]);
+        }
+#pragma unroll
+        for (unsigned r = 0; r < SPQ_GEMV_ROWS; r++) {
+            if (r >= m) break;
+            float v = acc[r];
+            for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
+            if (lane == 0) ep(r, c, v);
+        }
+    }
+    if (staged) __syncthreads(); /* the next op may reuse the arena */
+}
+
 static __device__ __noinline__ void d_q8_gemm_f32(float* __restrict__ out, const float* __restrict__ x,
                                      const uint8_t* __restrict__ w, const float* __restrict__ bias,
                                      unsigned m, unsigned n, unsigned k, unsigned activation,
@@ -1372,6 +1413,10 @@ static __device__ __noinline__ void d_q8_gemm_f32(float* __restrict__ out, const
     const SpRowF32 la{x, k, sp_aligned(x, 16)};
     const SpRowQ8 lb{w, k};
     const SpQ8Epi ep{out, bias, n, activation == 1u};
+    if (m <= SPQ_GEMV_ROWS) {
+        sp_q8_gemv(x, w, ep, m, n, k, slice, nblk);
+        return;
+    }
     /* 64x64 tiles when 128x128 ones leave slices idle (the small-M conformer rows). */
     if (((m + SPG_BM - 1) / SPG_BM) * ((n + SPG_BN - 1) / SPG_BN) < nblk)
         sp_gemm<4, 4>(m, n, k, la, lb, ep, slice, nblk, arena);
@@ -2125,14 +2170,18 @@ __device__ __forceinline__ float sp_rel_score(const float* q, const float* k, co
     return (float)((content + relative) / sqrt((double)hw));
 }
 #define SPR_COLS 8
-static __device__ __noinline__ void d_relative_attention_f32(float* __restrict__ context, const float* __restrict__ query,
-                                                const float* __restrict__ key, const float* __restrict__ value,
-                                                const float* __restrict__ position, const float* __restrict__ bias_u,
-                                                const float* __restrict__ bias_v, unsigned rows, unsigned width,
-                                                unsigned heads, unsigned chunk, unsigned left_chunks,
-                                                unsigned slice, unsigned nblk) {
+/* A stream step's few query rows (i5 > 0): a block per (row, head). Its warps split the keys' scores
+ * (the same sp_rel_score), then the softmax and the context sums run in key order exactly as the
+ * warp-per-item body does, so the rows match the offline encoder's bit for bit. */
+static __device__ __forceinline__ void sp_relative_attention_rows(
+    float* __restrict__ context, const float* __restrict__ query, const float* __restrict__ key,
+    const float* __restrict__ value, const float* __restrict__ position, const float* __restrict__ bias_u,
+    const float* __restrict__ bias_v, unsigned rows, unsigned width, unsigned heads, unsigned chunk,
+    unsigned left_chunks, unsigned key0, unsigned query_row0, unsigned slice, unsigned nblk) {
     const unsigned lane = threadIdx.x & 31u, warp = threadIdx.x >> 5, hw = width / heads;
-    for (unsigned item = slice * PLOW_NV_WARPS + warp; item < rows * heads; item += nblk * PLOW_NV_WARPS) {
+    float* scores = sp_smem; /* <= 64 keys (the packet's window bound) */
+    float* probs = sp_smem + 64;
+    for (unsigned item = query_row0 * heads + slice; item < rows * heads; item += nblk) {
         const unsigned qr = item / heads, head = item - qr * heads;
         unsigned first = 0, last = rows;
         if (left_chunks != 0xFFFFFFFFu) {
@@ -2141,6 +2190,63 @@ static __device__ __noinline__ void d_relative_attention_f32(float* __restrict__
             last = (qc + 1u) * chunk;
             if (last > rows) last = rows;
         }
+        if (first < key0) first = key0 < last ? key0 : last - 1u;
+        if (last - first > 64u) { __trap(); return; }
+        const size_t ho = (size_t)head * hw;
+        const float* q = query + (size_t)qr * width + ho;
+        for (unsigned kr = first + warp; kr < last; kr += PLOW_NV_WARPS) {
+            const float s = sp_rel_score(q, key + (size_t)kr * width + ho,
+                                         position + (size_t)(rows - 1u + kr - qr) * width + ho, bias_u + ho,
+                                         bias_v + ho, hw, lane);
+            if (lane == 0) scores[kr - first] = s;
+        }
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            float mx = -INFINITY;
+            for (unsigned kr = first; kr < last; kr++) mx = fmaxf(mx, scores[kr - first]);
+            float den = 0.f;
+            for (unsigned kr = first; kr < last; kr++) den = __fadd_rn(den, sp_expf(__fsub_rn(scores[kr - first], mx)));
+            for (unsigned kr = first; kr < last; kr++)
+                probs[kr - first] = __fdiv_rn(sp_expf(__fsub_rn(scores[kr - first], mx)), den);
+        }
+        __syncthreads();
+        for (unsigned c = threadIdx.x; c < hw; c += PLOW_NV_THREADS) {
+            float acc = 0.f;
+            for (unsigned kr = first; kr < last; kr++)
+                acc = __fadd_rn(acc, __fmul_rn(probs[kr - first], value[(size_t)kr * width + ho + c]));
+            context[(size_t)qr * width + ho + c] = acc;
+        }
+        __syncthreads();
+    }
+}
+static __device__ __noinline__ void d_relative_attention_f32(float* __restrict__ context, const float* __restrict__ query,
+                                                const float* __restrict__ key, const float* __restrict__ value,
+                                                const float* __restrict__ position, const float* __restrict__ bias_u,
+                                                const float* __restrict__ bias_v, unsigned rows, unsigned width,
+                                                unsigned heads, unsigned chunk, unsigned left_chunks,
+                                                unsigned slice, unsigned nblk,
+                                                const unsigned* __restrict__ key_start = nullptr,
+                                                unsigned query_row0 = 0) {
+    const unsigned lane = threadIdx.x & 31u, warp = threadIdx.x >> 5, hw = width / heads;
+    /* t7 (optional): keys before this row are not filled yet (a stream's first chunks). */
+    const unsigned key0 = key_start ? *key_start : 0u;
+    if (query_row0 != 0u) {
+        sp_relative_attention_rows(context, query, key, value, position, bias_u, bias_v, rows, width, heads, chunk,
+                                   left_chunks, key0, query_row0, slice, nblk);
+        return;
+    }
+    /* i5: only query rows from here on are wanted (a stream step's new rows). */
+    for (unsigned item = query_row0 * heads + slice * PLOW_NV_WARPS + warp; item < rows * heads;
+         item += nblk * PLOW_NV_WARPS) {
+        const unsigned qr = item / heads, head = item - qr * heads;
+        unsigned first = 0, last = rows;
+        if (left_chunks != 0xFFFFFFFFu) {
+            const unsigned qc = qr / chunk;
+            first = (qc > left_chunks ? qc - left_chunks : 0u) * chunk;
+            last = (qc + 1u) * chunk;
+            if (last > rows) last = rows;
+        }
+        if (first < key0) first = key0 < last ? key0 : last - 1u;
         const size_t ho = (size_t)head * hw;
         const float* q = query + (size_t)qr * width + ho;
         const float* u = bias_u + ho;
@@ -4559,7 +4665,7 @@ static __device__ __noinline__ void d_speech_f32(const PlowDevInst* in, void* co
         d_relative_attention_f32((float*)SP_TEN(0), (const float*)SP_TEN(1), (const float*)SP_TEN(2),
                                  (const float*)SP_TEN(3), (const float*)SP_TEN(4), (const float*)SP_TEN(5),
                                  (const float*)SP_TEN(6), in->i[0], in->i[1], in->i[2], in->i[3], in->i[4],
-                                 slice, nblk);
+                                 slice, nblk, (const unsigned*)SP_TEN(7), in->i[5]);
         break;
     SP_CASE(SILU_F32)
         d_silu_f32((float*)SP_TEN(0), (const float*)SP_TEN(1), in->i[0], slice, nblk);

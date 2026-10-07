@@ -360,7 +360,9 @@ assistant turn.
   queue answers 429 with `Retry-After: 1`; shutdown and a closed dispatcher answer 503; a missed
   deadline answers 504. On SIGTERM `/health` turns 503 first, new transcriptions are refused,
   and WebSocket sessions still receiving audio end with close code 1001. Protocol, fields and
-  status table: `docs/runtime/asr.md`.
+  status table: `docs/runtime/asr.md`. `GET /v1/realtime?intent=transcription` serves the same
+  models over OpenAI's Realtime transcription-session protocol (base64 pcm16 / G.711 audio,
+  server VAD or manual commits, transcription delta/completed events).
 
 ## 8. Unrelated, found while doing the above
 

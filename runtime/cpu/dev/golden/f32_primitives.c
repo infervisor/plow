@@ -487,7 +487,10 @@ G_K(g_relative_attention_f32) {
     const float* bias_v = PLOW_CPU_TEN(in, T, 6);
     const uint32_t rows = in->i[0], width = in->i[1], heads = in->i[2];
     const uint32_t chunk = in->i[3], left_chunks = in->i[4], head_width = width / heads;
-    for (uint32_t item = slice; item < rows * heads; item += nblk) {
+    /* t7 (optional): keys before this row are not filled yet (a stream's first chunks). */
+    const uint32_t key0 = in->t[7] != PLOW_TENSOR_NONE ? *(const uint32_t*)T[in->t[7]] : 0u;
+    /* i5: only query rows from here on are wanted (a stream step's new rows). */
+    for (uint32_t item = in->i[5] * heads + slice; item < rows * heads; item += nblk) {
         const uint32_t qr = item / heads, head = item % heads;
         uint32_t first = 0, last = rows;
         if (left_chunks != UINT32_MAX) {
@@ -495,6 +498,7 @@ G_K(g_relative_attention_f32) {
             first = (qc > left_chunks ? qc - left_chunks : 0u) * chunk;
             last = (qc + 1u) * chunk; if (last > rows) last = rows;
         }
+        if (first < key0) first = key0 < last ? key0 : last - 1u;
         float scores[rows];
         float maximum = -INFINITY;
         const float* q = query + (size_t)qr * width + head * head_width;
