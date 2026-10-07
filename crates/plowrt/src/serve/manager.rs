@@ -101,12 +101,14 @@ pub struct BlobPlan {
     pub kv_bytes: u64,
     /// Activations, IO, MoE tables — every other blob tensor.
     pub other_bytes: u64,
+    /// Speech pipeline sibling packets, allocated when the pipeline binds after the engine load.
+    pub sidecar_bytes: u64,
 }
 
 impl BlobPlan {
     /// Sum of the planned tensor bytes.
     pub fn tensor_total(&self) -> u64 {
-        self.weights_bytes + self.kv_bytes + self.other_bytes
+        self.weights_bytes + self.kv_bytes + self.other_bytes + self.sidecar_bytes
     }
 
     /// Bytes of this model's load the weight slab can satisfy from pooled
@@ -175,6 +177,7 @@ impl BlobPlan {
             weights_bytes: 0,
             kv_bytes: 0,
             other_bytes: 0,
+            sidecar_bytes: sidecar_bytes(&pkt)?,
         };
         for t in &blob.tensors {
             plan.add(&t.name, t.bytes);
@@ -204,7 +207,7 @@ impl BlobPlan {
                     granularity,
                 )
             });
-            let prefix_requested = config.nv_vmm_prefix() == Some(true) || prefix_layout.is_some();
+            let prefix_requested = config.nv_prefix_requested(prefix_layout.is_some());
             if config.nv_live_kv_enabled(packed, full, prefix_requested)
                 && (config.nv_vmm_live()
                     || crate::exec::gpu::live_kv_mappable(&blob, manifest.as_ref(), granularity))
@@ -220,6 +223,30 @@ impl BlobPlan {
                     .map(|&id| blob.tensors[id].bytes)
                     .sum();
                 let geo = &layout.geometry;
+                let hint = u64::from(config.vmm_block_mib()) << 20;
+                if let Some(full) = layout.slot_granular_full(&blob, granularity, hint) {
+                    // Slots commit on admission (`kv_row_charge`); plan the shared idle backing,
+                    // one admitted slot and the recycled-unit pool.
+                    let tensors: Vec<_> = full.into_iter().chain(layout.ring_tensors).collect();
+                    let virtual_bytes: u64 =
+                        tensors.iter().map(|t| blob.tensors[t.tensor].bytes).sum();
+                    let slot: u64 = tensors
+                        .iter()
+                        .filter(|t| t.slot_bytes % granularity == 0)
+                        .map(|t| t.slot_bytes)
+                        .sum();
+                    let startup = crate::memory::vmm::VmmRings::idle_backed_startup_bytes(
+                        &tensors,
+                        geo.batch as usize,
+                        granularity,
+                    );
+                    plan.kv_bytes = plan.kv_bytes.checked_sub(virtual_bytes).ok_or_else(|| {
+                        RuntimeError::Rejected("live KV plan tensor classification".into())
+                    })? + startup
+                        + slot
+                        + crate::memory::vmm::kv_pool_cap();
+                    return Ok(plan);
+                }
                 let live_rings = crate::exec::gpu::live_rings_for_capacity(
                     config.nv_vmm_live_rings(),
                     true,
@@ -273,6 +300,65 @@ impl BlobPlan {
         }
         Ok(plan)
     }
+}
+
+const GRAPH_BYTES_PER_PROGRAM: u64 = 320 << 10;
+
+/// Device bytes of the speech pipeline's sibling packets beside `pkt` (Qwen3-ASR `encoder.pkt`,
+/// codec `codec.pkt`, Chatterbox `s3gen.pkt`), bound after the engine load. Each binds a CUDA
+/// packet runtime (`CudaPacketRuntime::load_on`) that `cuMemAlloc`s every packet tensor
+/// (activation and batch buffers at their compiled capacity), one counter slab and eight
+/// uploads per program, then captures every program sequence as a CUDA graph.
+fn sidecar_bytes(pkt: &Path) -> Result<u64> {
+    // Allocations of 1 MiB and up take whole 2 MiB pages.
+    let alloc = |bytes: u64| match bytes.max(4) {
+        b if b >= 1 << 20 => b.next_multiple_of(2 << 20),
+        b => b.next_multiple_of(512),
+    };
+    let asset = crate::exec::packet_runtime::PacketAsset::load_if_present(pkt)?;
+    let mut total = 0u64;
+    for (key, legacy) in [
+        ("encoder.packet", "encoder.pkt"),
+        ("codec.packet", crate::tts::codec::PACKET),
+        ("vocoder.packet", crate::tts::guided_speech::VOCODER),
+    ] {
+        let name = match &asset {
+            Some(asset) => asset.stage_file(key, legacy)?,
+            None => legacy.to_string(),
+        };
+        let path = pkt.with_file_name(name);
+        if !path.is_file() {
+            continue;
+        }
+        let raw = std::fs::read(&path).map_err(|source| RuntimeError::Io { path: path.clone(), source })?;
+        let blob = DevBlob::parse_l2(&raw, true)?;
+        let ctr = u64::from(packet::dev::CTR_STRIDE) * 4;
+        let mut counters = 0u64;
+        for p in &blob.progs {
+            let segments = p.gq_seg_ofs.len().saturating_sub(1) as u64;
+            counters += (u64::from(p.n_counter) * ctr).max(4).next_multiple_of(256) + segments * ctr;
+            total += [
+                std::mem::size_of_val(&p.insts[..]),
+                std::mem::size_of_val(&p.stream[..]),
+                std::mem::size_of_val(&p.stream_ofs[..]),
+                std::mem::size_of_val(&p.stream_len[..]),
+                std::mem::size_of_val(&p.waits[..]),
+                std::mem::size_of_val(&p.succs[..]),
+                std::mem::size_of_val(&p.gq_stream[..]),
+                std::mem::size_of_val(&p.gq_seg_ofs[..]),
+            ]
+            .into_iter()
+            .map(|b| alloc(b as u64))
+            .sum::<u64>();
+        }
+        // Graph capture at bind: S3Gen 602 MiB over 1931 programs, Qwen3-ASR encoder ~65 MiB
+        // over 460 (L40S).
+        total += blob.progs.len() as u64 * GRAPH_BYTES_PER_PROGRAM;
+        total += blob.tensors.iter().map(|t| alloc(t.bytes)).sum::<u64>()
+            + alloc(blob.tensors.len() as u64 * 8)
+            + alloc(counters);
+    }
+    Ok(total)
 }
 
 /// One registered (not necessarily resident) model.
@@ -411,6 +497,7 @@ impl ModelManager {
                 weights_gib = gib(plan.weights_bytes),
                 kv_gib = gib(plan.kv_bytes),
                 other_gib = gib(plan.other_bytes),
+                sidecar_gib = gib(plan.sidecar_bytes),
                 total_gib = gib(plan.tensor_total()),
                 "planner: model registered"
             );
@@ -590,8 +677,10 @@ impl ModelManager {
     /// fit (no eviction — earlier models win). At least one model must load.
     pub async fn load_initial(&self) -> Result<()> {
         let mut loaded = 0usize;
+        // Sibling packets of the models loaded so far bind after startup (speech preload).
+        let mut unbound = 0u64;
         for m in self.models.read().clone() {
-            let need = self.required(&m.slug).expect("managed") + RESERVE;
+            let need = self.required(&m.slug).expect("managed") + RESERVE + unbound;
             let free = self.free_vram()?;
             if free < need {
                 tracing::info!(
@@ -605,6 +694,7 @@ impl ModelManager {
             self.load_model(&m)
                 .await
                 .map_err(|e| RuntimeError::Msg(format!("{}: {e}", m.slug)))?;
+            unbound += m.plan.sidecar_bytes;
             loaded += 1;
         }
         if loaded == 0 && !self.models.read().is_empty() {
@@ -1048,7 +1138,8 @@ impl ModelManager {
         // without touching `free` — count both ledgers or reused chunks make
         // the model look smaller than it is.
         let used = (free_before + pool_before).saturating_sub(free_after + pool_after);
-        let measured = used.saturating_sub(m.plan.tensor_total());
+        // Sibling packets bind later, outside this measurement.
+        let measured = used.saturating_sub(m.plan.tensor_total() - m.plan.sidecar_bytes);
         self.overhead
             .lock()
             .entry(m.slug.clone())
@@ -1056,7 +1147,8 @@ impl ModelManager {
         tracing::info!(
             slug = %m.slug,
             used_gib = gib(used),
-            planned_gib = gib(m.plan.tensor_total()),
+            planned_gib = gib(m.plan.tensor_total() - m.plan.sidecar_bytes),
+            sidecar_gib = gib(m.plan.sidecar_bytes),
             overhead_mib = measured >> 20,
             "planner: load measured"
         );
@@ -1146,6 +1238,7 @@ mod tests {
             weights_bytes: 0,
             kv_bytes: 0,
             other_bytes: 0,
+            sidecar_bytes: 0,
         };
         p.add("model.layers.0.self_attn.q_proj.weight", 100);
         p.add("fp8/model.layers.0.mlp.down_proj", 50);
@@ -1158,6 +1251,9 @@ mod tests {
         assert_eq!(p.kv_bytes, 60);
         assert_eq!(p.other_bytes, 28);
         assert_eq!(p.tensor_total(), 238);
+        p.sidecar_bytes = 12;
+        assert_eq!(p.tensor_total(), 250, "sibling packets are part of the footprint");
+        assert_eq!(p.slab_reusable(), 178, "but never ride the weight slab");
     }
 
     /// The VRAM plan must count as WEIGHTS exactly what the loaders will demand of the
@@ -1178,6 +1274,7 @@ mod tests {
             weights_bytes: 0,
             kv_bytes: 0,
             other_bytes: 0,
+            sidecar_bytes: 0,
         };
         let weights = [
             "lm_head.weight",
@@ -1229,3 +1326,4 @@ fn same_path(a: &Path, b: &Path) -> bool {
             .zip(b.canonicalize().ok())
             .is_some_and(|(a, b)| a == b)
 }
+

@@ -114,6 +114,15 @@ fn automatic_prefix_selection_requires_compatible_execution_and_valid_kv_layout(
     assert!(!selected(&blob, &cfg, (9, 0), 2 << 20));
     cfg.nv.vmm_prefix = Some(true);
     assert!(selected(&blob, &cfg, (12, 0), 2 << 20));
+    assert!(cfg.nv_prefix_requested(false));
+    cfg.nv.vmm_live = true;
+    assert!(selected(&blob, &cfg, (12, 0), 2 << 20));
+    assert!(
+        cfg.nv_prefix_requested(true) && !cfg.nv_prefix_requested(false),
+        "PLOW_VMM_LIVE=1 takes packets without a prefix layout"
+    );
+    assert!(!cfg.nv_live_kv_enabled(true, true, true));
+    cfg.nv.vmm_live = false;
     cfg.prefix_cache = false;
     assert!(
         !selected(&blob, &cfg, (9, 0), 2 << 20),

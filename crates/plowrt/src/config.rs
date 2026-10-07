@@ -1805,7 +1805,14 @@ impl RuntimeConfig {
         full_cache: bool,
         prefix: bool,
     ) -> bool {
-        self.nv_vmm_live() || (packed_prefill && full_cache && !prefix)
+        !prefix && (self.nv_vmm_live() || (packed_prefill && full_cache))
+    }
+
+    /// A packet with a VMM prefix layout takes the prefix cache, also under `PLOW_VMM_LIVE=1`
+    /// (one env shared by co-hosted packets); without one, `PLOW_VMM_PREFIX=1` yields to it.
+    #[cfg(feature = "cuda")]
+    pub(crate) fn nv_prefix_requested(&self, layout: bool) -> bool {
+        layout || (self.nv_vmm_prefix() == Some(true) && !self.nv_vmm_live())
     }
 
     #[cfg(feature = "cuda")]

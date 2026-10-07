@@ -571,3 +571,54 @@ fn idle_rows_inside_the_launch_stay_mapped() {
     drop(rings);
     ops.empty();
 }
+
+#[test]
+fn slot_granular_full_caches_commit_on_admission_only() {
+    let ops = Arc::new(Mock::with_granularity(64));
+    ops.0.lock().unwrap().multi_map = true;
+    let committed = |ops: &Mock| ops.0.lock().unwrap().handles.values().sum::<u64>();
+    // Two layers' K/V at two granules per slot, plus a sub-granule scale committed whole.
+    let mut tensors: Vec<_> = (0..4).map(|tensor| LiveRingTensor { tensor, slot_bytes: 128 }).collect();
+    tensors.push(LiveRingTensor { tensor: 9, slot_bytes: 16 });
+    let batch = 8;
+    let mut rings = VmmRings::new_idle_backed(ops.clone(), &tensors, batch).unwrap();
+    let startup = VmmRings::idle_backed_startup_bytes(&tensors, batch, 64);
+    assert_eq!(startup, 128 + 128);
+    assert_eq!(committed(&ops), startup);
+    assert_eq!(rings.slot_charge(), 4 * 128);
+    all_mapped(&ops, 4 * batch + 2);
+
+    rings.ensure_prefix(batch).unwrap();
+    assert_eq!(committed(&ops), startup, "padded and idle rows land on scratch");
+    for slot in [5, 0] {
+        rings.ensure_slot(slot).unwrap();
+    }
+    assert_eq!(committed(&ops), startup + 2 * rings.slot_charge());
+
+    // A slot short of memory fails whole and leaves its rows on scratch.
+    ops.fail(Call::Create, 3);
+    assert!(matches!(rings.ensure_slot(2), Err(RuntimeError::Oom(_))));
+    assert_eq!(committed(&ops), startup + 2 * rings.slot_charge());
+    all_mapped(&ops, 4 * batch + 2);
+
+    rings.release_slot(5);
+    rings.release_idle(0);
+    assert_eq!(committed(&ops), startup);
+    assert_eq!(rings.stats().mapped_slots, 0);
+
+    // Recycled units: a retire keeps up to the cap, the next admission creates nothing.
+    rings.enable_handle_recycling(rings.slot_charge());
+    rings.ensure_slot(1).unwrap();
+    rings.ensure_slot(3).unwrap();
+    rings.release_slot(1);
+    rings.release_slot(3);
+    assert_eq!(committed(&ops), startup + rings.slot_charge(), "one slot's units kept");
+    let creates = |ops: &Mock| ops.0.lock().unwrap().calls.iter().filter(|&&c| c == Call::Create).count();
+    let before = creates(&ops);
+    rings.ensure_slot(6).unwrap();
+    assert_eq!(creates(&ops), before);
+    assert_eq!(rings.stats().resident_bytes, 128 + rings.slot_charge());
+    rings.release_slot(6);
+    drop(rings);
+    ops.empty();
+}

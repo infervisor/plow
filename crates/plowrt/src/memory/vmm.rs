@@ -274,6 +274,10 @@ pub struct VmmRings {
     /// Decode and padded prefill rows write garbage into slots without a request; with this
     /// backing those writes land in shared scratch instead of forcing a real ring per idle row.
     idle: Vec<(u64, u64)>,
+    /// `(unit bytes, handle)` released units kept for the next commit, up to `spare_cap` bytes:
+    /// a fresh `cuMemCreate` pays the driver's page commit on the admission path.
+    spare: Vec<(u64, u64)>,
+    spare_cap: u64,
 }
 
 impl VmmRings {
@@ -320,6 +324,8 @@ impl VmmRings {
                 mapped_prefix: 0,
             },
             idle: Vec::new(),
+            spare: Vec::new(),
+            spare_cap: 0,
         };
         for t in tensors {
             let logical_bytes = t.slot_bytes * batch as u64;
@@ -379,6 +385,28 @@ impl VmmRings {
         Ok(rings)
     }
 
+    /// Device bytes [`Self::new_idle_backed`] commits before any slot is claimed: one idle unit
+    /// per distinct per-slot span, plus windows whose slots share units, committed whole.
+    pub fn idle_backed_startup_bytes(tensors: &[LiveRingTensor], batch: usize, granularity: u64) -> u64 {
+        let mut idle: Vec<u64> = Vec::new();
+        let mut pinned = 0u64;
+        for t in tensors {
+            if granularity != 0 && t.slot_bytes % granularity == 0 {
+                if !idle.contains(&t.slot_bytes) {
+                    idle.push(t.slot_bytes);
+                }
+            } else {
+                pinned += (t.slot_bytes * batch as u64).next_multiple_of(granularity.max(1));
+            }
+        }
+        pinned + idle.iter().sum::<u64>()
+    }
+
+    /// Keep up to `cap_bytes` of released units for reuse instead of returning them to the driver.
+    pub fn enable_handle_recycling(&mut self, cap_bytes: u64) {
+        self.spare_cap = cap_bytes;
+    }
+
     /// Bytes one slot commits beyond the construction-time residency.
     pub fn slot_charge(&self) -> u64 {
         self.windows
@@ -412,8 +440,13 @@ impl VmmRings {
             self.ops.unmap(va, map_bytes);
             self.windows[window].idle[unit] = false;
         }
+        let spare = self.spare.iter().position(|&(bytes, _)| bytes == map_bytes);
+        let spare = spare.map(|i| self.spare.swap_remove(i).1);
         let result = (|| {
-            let handle = self.ops.create(map_bytes)?;
+            let handle = match spare {
+                Some(handle) => handle,
+                None => self.ops.create(map_bytes)?,
+            };
             if let Err(e) = self.ops.map(va, map_bytes, handle) {
                 self.ops.release(handle);
                 return Err(e);
@@ -535,10 +568,15 @@ impl VmmRings {
             return;
         }
         let handle = w.handles[unit].take().expect("referenced ring mapping");
-        self.ops
-            .unmap(w.va + unit as u64 * w.map_bytes, w.map_bytes);
-        self.ops.release(handle);
-        self.stats.resident_bytes -= w.map_bytes;
+        let bytes = w.map_bytes;
+        self.ops.unmap(w.va + unit as u64 * bytes, bytes);
+        let spare: u64 = self.spare.iter().map(|&(b, _)| b).sum();
+        if spare + bytes <= self.spare_cap {
+            self.spare.push((bytes, handle));
+        } else {
+            self.ops.release(handle);
+        }
+        self.stats.resident_bytes -= bytes;
         if let Err(e) = self.back_idle(window, unit) {
             tracing::error!(error = %e, "live ring idle backing lost");
         }
@@ -576,7 +614,7 @@ impl Drop for VmmRings {
             }
             self.ops.address_free(w.va, w.bytes);
         }
-        for (_, handle) in self.idle.drain(..) {
+        for (_, handle) in self.idle.drain(..).chain(self.spare.drain(..)) {
             self.ops.release(handle);
         }
     }
@@ -673,6 +711,29 @@ impl LiveKvLayout {
             ring_tensors,
             cache_tensors,
         })
+    }
+    /// Full caches as slot-granular rings when their head window is below one VMM block
+    /// (`block_bytes` refuses it) but each slot's span is whole granules.
+    pub fn slot_granular_full(
+        &self,
+        blob: &crate::asset::devblob::DevBlob,
+        granularity: u64,
+        block_hint: u64,
+    ) -> Option<Vec<LiveRingTensor>> {
+        if self.geometry.block_bytes(granularity, block_hint).is_ok() || granularity == 0 {
+            return None;
+        }
+        let batch = u64::from(self.geometry.batch);
+        self.full_tensors
+            .iter()
+            .flatten()
+            .map(|&tensor| {
+                let bytes = blob.tensors[tensor].bytes;
+                let slot_bytes = bytes / batch.max(1);
+                (slot_bytes > 0 && slot_bytes * batch == bytes && slot_bytes % granularity == 0)
+                    .then_some(LiveRingTensor { tensor, slot_bytes })
+            })
+            .collect()
     }
     pub fn from_blob(blob: &crate::asset::devblob::DevBlob) -> Result<Self> {
         let manifest = blob
@@ -4390,6 +4451,29 @@ mod tests {
         assert_eq!(layout.geometry.kvh_full, 1);
         assert_eq!(layout.geometry.hd_full, 256);
         assert_eq!(layout.geometry.full_tensor_bytes(), 4 * 1024 * 256 * 2);
+    }
+
+    #[test]
+    fn sub_granule_head_windows_commit_full_caches_per_slot() {
+        let (gran, hint) = (2u64 << 20, 2u64 << 20);
+        let mut blob = live_blob();
+        let mut layout = LiveKvLayout::from_blob(&blob).unwrap();
+        // 512 KiB heads: one slot's single head is not whole granules either.
+        assert!(layout.slot_granular_full(&blob, gran, hint).is_none());
+        // Block-mappable heads keep the row-granular pool.
+        assert!(layout.slot_granular_full(&blob, 512 << 10, 512 << 10).is_none());
+        // Qwen3-ASR shape: 8 heads x 2048 rows x hd128 bf16 = 4 MiB per slot.
+        (layout.geometry.kvh_full, layout.geometry.hd_full, layout.geometry.max_ctx) = (8, 128, 2048);
+        for t in [1, 2] {
+            blob.tensors[t].bytes = 4 * 8 * 2048 * 128 * 2;
+        }
+        let full = layout.slot_granular_full(&blob, gran, hint).unwrap();
+        assert_eq!(
+            full.iter().map(|t| (t.tensor, t.slot_bytes)).collect::<Vec<_>>(),
+            [(1, 4 << 20), (2, 4 << 20)]
+        );
+        blob.tensors[2].bytes += 4;
+        assert!(layout.slot_granular_full(&blob, gran, hint).is_none());
     }
 
     #[test]
