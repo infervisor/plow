@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
-# Build recipes/infervisor/nemotron-3.5-asr/sm89-l4-tp1.toml: the RNNT packet pipeline (offline
-# buckets + cache-aware stream programs) and the sm_89 speech object beside it. Run inside
-# `nix develop`.
+# Build recipes/infervisor/nemotron-3.5-asr/sm89-{l4,l40s}-tp1.toml: the RNNT packet pipeline
+# (offline buckets + cache-aware stream programs) and the sm_89 speech object beside it. Run inside
+# `nix develop`. <n_cu>: 58 (L4, default) or 142 (L40S).
 #
-#   scripts/asr/nvidia/nemotron_l4_build.sh <nemotron-3.5-asr-streaming-0.6b.q8_0.gguf> <fresh dir>
+#   scripts/asr/nvidia/nemotron_l4_build.sh <nemotron-3.5-asr-streaming-0.6b.q8_0.gguf> <fresh dir> [n_cu]
 set -euo pipefail
 gguf=$(realpath "$1")
 out=$2
+n_cu=${3:-58}
 repo=$(cd "$(dirname "$0")/../../.." && pwd)
 buckets=200,400,600,800,1000,1200,1400,1600,1800,2000,2200,2400,2600,2800,3000
 [ -e "$out" ] && [ -n "$(ls -A "$out")" ] && { echo "$out exists and is not empty" >&2; exit 2; }
@@ -16,7 +17,7 @@ out=$(realpath "$out")
 cd "$repo"
 cargo build --release -p plowrt --features cuda,gguf,dist --example asr_nemotron_pipeline_compile
 target=${CARGO_TARGET_DIR:-$repo/target}
-"$target/release/examples/asr_nemotron_pipeline_compile" "$gguf" "$buckets" "$out/nemotron.pkt" 16 58
+"$target/release/examples/asr_nemotron_pipeline_compile" "$gguf" "$buckets" "$out/nemotron.pkt" 16 "$n_cu"
 
 # Speech ops 163..178 plus 196 (CopyColsF32: the stream programs' [cache|new] windows); a packet
 # with stream programs fails on an object without bit 33.

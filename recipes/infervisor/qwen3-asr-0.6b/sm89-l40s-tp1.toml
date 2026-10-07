@@ -1,14 +1,18 @@
-# Trial: Qwen3-ASR on L40S (sm_89, 142 SMs, 48 GB). The H100 recipe minus the Hopper-only decode knobs
-# (gemv_k8, FA fold, dense tune, packed small-hd prefill) and the wgmma `_gw` rungs past 32.
-# Decoder prefill projections go through cuBLASLt (bf16, segment_roles sm89 policy).
+# Qwen3-ASR-0.6B on L40S (sm_89, 142 SMs, 48 GB): the 1.7B L40S recipe's contract (H100 recipe
+# minus the Hopper-only decode knobs and the wgmma `_gw` rungs past 32).
 #
-#   PLOW_CAMPAIGN_NO_NIX=1 python3 scripts/campaign/campaign.py build \
-#     scripts/campaign/recipes/qwen3-asr.l40s.bf16.toml --hf-dir <Qwen3-ASR dir> --out <fresh dir>
+#   nix develop --command python3 scripts/campaign/campaign.py build \
+#     recipes/infervisor/qwen3-asr-0.6b/sm89-l40s-tp1.toml --out <fresh dir>
+#
+# Gate: WER on the 73-clip LibriSpeech dummy set = 4.261% (c1 and c16). Decode ctx 1024
+# B=1/16/32 2.38/4.57/7.08 ms = 66/81/85% of the roofline (B=1: interpreter per-op latency);
+# served c1 p50 66 ms, c16 RTFx 594 (docs/runtime/l40s-recipes.md).
 
 schema = "plow.recipe.v1"
 namespace = "infervisor"
-name = "qwen3-asr"
+name = "qwen3-asr-0.6b"
 label = "sm89-l40s-tp1"
+plow_git = "abb00b818378f4c09a2b53192d49cf192bc69f62"
 network = "qwen3"
 doc = "docs/runtime/asr.md"
 
@@ -21,12 +25,11 @@ num_gpus = 1
 parallel = "tp"
 
 [checkpoint]
-source = "hf:Qwen/Qwen3-ASR-1.7B"
-revision = "7278e1e70fe206f11671096ffdd38061171dd6e5"
+source = "hf:Qwen/Qwen3-ASR-0.6B"
 
 [cell]
-name = "qwen3-asr-l40s"
-hf_dir = "{hf:Qwen/Qwen3-ASR-1.7B@7278e1e70fe206f11671096ffdd38061171dd6e5}"
+name = "qwen3-asr-0.6b-l40s"
+hf_dir = "{hf:Qwen/Qwen3-ASR-0.6B}"
 gpu = "l40s"
 arch = "sm_89"
 n_cu = 142
@@ -35,7 +38,7 @@ max_ctx = 2048
 
 [emit]
 emit = "devblob+cubin"
-args = ["--served-name", "qwen3-asr"]
+args = ["--served-name", "qwen3-asr-0.6b"]
 [emit.env]
 PLOW_VERIFY_BIN = "{repo}/lean-plow/.lake/build/bin/plow_verify"
 PLOW_MAX_CHUNK = "512"

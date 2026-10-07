@@ -5,15 +5,15 @@ The L40S (AD102: 142 SMs, 48 GB GDDR6, 864 GB/s datasheet, 841 GB/s measured rea
 the sm_120 warp32 interpreter built for Ada, mma.sync and cp.async, no wgmma/TMA, 99 KiB of
 shared memory per block. Only the packets differ (142 SMs, `--gpu l40s`).
 
-| model | recipe | gate | L40S result |
+| model | recipe (`recipes/infervisor/`) | gate | L40S result |
 |---|---|---|---|
-| Qwen3-ASR 1.7B | `scripts/campaign/recipes/qwen3-asr.l40s.bf16.toml` | WER, 73 clips | 3.826% |
-| Qwen3-ASR 0.6B | `qwen3-asr-0.6b.l40s.bf16.toml` | WER | 4.261% |
-| Nemotron 3.5 (Q8_0 RNNT) | packet, below | WER | 5.13% |
-| Orpheus 3B TTS | `orpheus.l40s.bf16.toml` | Whisper CER median | 0.000 (n=80) |
-| Veena TTS | `veena.l40s.bf16.toml` | Whisper CER median | 0.005-0.011 (n=80, sampled) |
-| Chatterbox TTS | `chatterbox.l40s.bf16.toml` | CER / S3Gen mel rel-L2 | 0.000 (n=32) / 1.4e-5 |
-| Gemma 4 E4B | `gemma4-e4b.l40s.bf16.toml` | logit parity vs HF bf16 | top1 0.9867, KL mean 7.8e-4 |
+| Qwen3-ASR 1.7B | `qwen3-asr/sm89-l40s-tp1.toml` | WER, 73 clips | 3.826% |
+| Qwen3-ASR 0.6B | `qwen3-asr-0.6b/sm89-l40s-tp1.toml` | WER | 4.261% |
+| Nemotron 3.5 (Q8_0 RNNT) | `nemotron-3.5-asr/sm89-l40s-tp1.toml` | WER | 5.13% |
+| Orpheus 3B TTS | `orpheus/sm89-l40s-tp1.toml` | Whisper CER median | 0.000 (n=80) |
+| Veena TTS | `veena/sm89-l40s-tp1.toml` | Whisper CER median | 0.005-0.011 (n=80, sampled) |
+| Chatterbox TTS | `chatterbox/sm89-l40s-tp1.toml` | CER / S3Gen mel rel-L2 | 0.000 (n=32) / 1.4e-5 |
+| Gemma 4 E4B | `gemma-4-e4b/sm89-l40s-tp1.toml` | logit parity vs HF bf16 | top1 0.9867, KL mean 7.8e-4 |
 
 ASR WERs equal the L4 and H100 numbers; the decode change below leaves every gate unchanged.
 
@@ -26,20 +26,19 @@ path, so serve from the dev shell (Qwen, Orpheus, Veena and Chatterbox route pre
 
 ```sh
 cargo build --release -p plowc && cargo build --release -p plowrt --features cuda,gguf
-python3 scripts/campaign/campaign.py build scripts/campaign/recipes/qwen3-asr.l40s.bf16.toml --out <dir>
-python3 scripts/campaign/campaign.py gate scripts/campaign/recipes/qwen3-asr.l40s.bf16.toml \
+python3 scripts/campaign/campaign.py build recipes/infervisor/qwen3-asr/sm89-l40s-tp1.toml --out <dir>
+python3 scripts/campaign/campaign.py gate recipes/infervisor/qwen3-asr/sm89-l40s-tp1.toml \
   --assets <dir>/assets --out <dir>/gate     # PYREF, ASR_MANIFEST as in the recipe
 # Orpheus: --hf-dir <canopylabs or unsloth orpheus-3b-0.1-ft snapshot>
 # Chatterbox: CBX_PY=<python with chatterbox-tts 0.1.7> for the T3/S3Gen prep and the S3Gen gate
 
 # Nemotron 3.5: packet for 142 SMs + the specialized speech object (`gguf` feature in plowrt)
-asr_nemotron_pipeline_compile model.q8_0.gguf 200,400,...,3000 <dir>/nemotron.pkt 16 142
-cmake -S runtime -B <build> -DPLOW_SM89_CUBIN=ON -DPLOW_CUBIN_SPEECH=ON -DPLOW_CUBIN_ARCH=sm_89 \
-  -DPLOW_CUBIN_GEMMA=OFF "-DPLOW_EXTRA_DEFINES=-DPLOW_SPEECH_OPS=0x20000ffffull"
-cmake --build <build> --target nv_cubins   # interp_sm89_speech.cubin beside nemotron.pkt
+scripts/asr/nvidia/nemotron_l4_build.sh nemotron-3.5-asr-streaming-0.6b.q8_0.gguf <dir> 142
 ```
 
 The runtime CMake takes nvcc from `$PLOW_NVCC` (the dev shell's toolkit) when it is set.
+`scripts/asr/nvidia/l4_asr_deploy.sh` installs the three L40S ASR builds the same way as the L4
+ones (same objects, same layout).
 
 The recipes keep the L4 contracts at 48 GB sizes: decode ladders to 32 rows and the default
 192-chunk packed encoder buckets. One `plowrt serve --assets <1.7B> --assets <0.6B>

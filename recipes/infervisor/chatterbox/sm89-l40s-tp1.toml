@@ -1,15 +1,20 @@
-# Trial: Chatterbox (ResembleAI/chatterbox, English) on L40S (sm_89, 142 SMs, 48 GB). The H100
-# recipe minus the Hopper-only knobs (dense tune, S3Gen 3xFP16 cached attention on the sm_90 speech
-# object) and the wgmma `_gw` rungs past 32. T3 prefill projections go through cuBLASLt; S3Gen runs
-# as s3gen.pkt on the sm_89 speech object.
+# Chatterbox (ResembleAI/chatterbox, English) on L40S (sm_89, 142 SMs, 48 GB): the H100 recipe
+# minus the Hopper-only knobs (dense tune, S3Gen 3xFP16 cached attention on the sm_90 speech
+# object) and the wgmma `_gw` rungs past 32. T3 prefill projections go through cuBLASLt; S3Gen
+# runs as s3gen.pkt on the sm_89 speech object.
 #
 #   CBX_PY=<python with chatterbox-tts 0.1.7> PYREF=<python with transformers + jiwer + librosa> \
-#   python3 scripts/campaign/campaign.py build scripts/campaign/recipes/chatterbox.l40s.bf16.toml --out <fresh dir>
+#   nix develop --command python3 scripts/campaign/campaign.py build \
+#     recipes/infervisor/chatterbox/sm89-l40s-tp1.toml --out <fresh dir>
+#
+# Gates: Whisper CER median 0.000 (n=32), S3Gen mel rel-L2 1.4e-5. T3 decode ctx 1024
+# B=1/16/32 2.20/4.54/7.04 ms = 62/81/87% of the roofline; streaming c1 TTFA 173 ms, RTF 0.16.
 
 schema = "plow.recipe.v1"
 namespace = "infervisor"
 name = "chatterbox"
 label = "sm89-l40s-tp1"
+plow_git = "abb00b818378f4c09a2b53192d49cf192bc69f62"
 network = "llama"
 doc = "docs/runtime/tts.md"
 

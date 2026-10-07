@@ -1,14 +1,20 @@
-# Trial: Qwen3-ASR-0.6B on L40S (sm_89, 142 SMs, 48 GB). The H100 recipe minus the Hopper-only decode knobs
-# (gemv_k8, FA fold, dense tune, packed small-hd prefill) and the wgmma `_gw` rungs past 32.
-# Decoder prefill projections go through cuBLASLt (bf16, segment_roles sm89 policy).
+# Qwen3-ASR-1.7B on L40S (sm_89, 142 SMs, 48 GB): the H100 recipe minus the Hopper-only decode
+# knobs (gemv_k8, FA fold, dense tune) and the wgmma `_gw` rungs past 32. Decoder prefill
+# projections go through cuBLASLt (bf16, segment_roles sm89 policy); batched decode GEMVs walk the
+# tensor cores (PLOW_NV_GEMV_MMA). Co-served with the other ASR models on one card.
 #
-#   PLOW_CAMPAIGN_NO_NIX=1 python3 scripts/campaign/campaign.py build \
-#     scripts/campaign/recipes/qwen3-asr.l40s.bf16.toml --hf-dir <Qwen3-ASR dir> --out <fresh dir>
+#   nix develop --command python3 scripts/campaign/campaign.py build \
+#     recipes/infervisor/qwen3-asr/sm89-l40s-tp1.toml --out <fresh dir>
+#
+# Gate: WER on the 73-clip LibriSpeech dummy set (scripts/asr/nvidia/get_audio.py) = 3.826%
+# (c1 and c16). Decode ctx 1024 B=1/16/32 5.09/7.57/10.03 ms = 83/85/87% of the 841 GB/s roofline;
+# served c1 p50 125 ms, c16 RTFx 284 (docs/runtime/l40s-recipes.md).
 
 schema = "plow.recipe.v1"
 namespace = "infervisor"
-name = "qwen3-asr-0.6b"
+name = "qwen3-asr"
 label = "sm89-l40s-tp1"
+plow_git = "abb00b818378f4c09a2b53192d49cf192bc69f62"
 network = "qwen3"
 doc = "docs/runtime/asr.md"
 
@@ -21,11 +27,12 @@ num_gpus = 1
 parallel = "tp"
 
 [checkpoint]
-source = "hf:Qwen/Qwen3-ASR-0.6B"
+source = "hf:Qwen/Qwen3-ASR-1.7B"
+revision = "7278e1e70fe206f11671096ffdd38061171dd6e5"
 
 [cell]
-name = "qwen3-asr-0.6b-l40s"
-hf_dir = "{hf:Qwen/Qwen3-ASR-0.6B}"
+name = "qwen3-asr-l40s"
+hf_dir = "{hf:Qwen/Qwen3-ASR-1.7B@7278e1e70fe206f11671096ffdd38061171dd6e5}"
 gpu = "l40s"
 arch = "sm_89"
 n_cu = 142
@@ -34,7 +41,7 @@ max_ctx = 2048
 
 [emit]
 emit = "devblob+cubin"
-args = ["--served-name", "qwen3-asr-0.6b"]
+args = ["--served-name", "qwen3-asr"]
 [emit.env]
 PLOW_VERIFY_BIN = "{repo}/lean-plow/.lake/build/bin/plow_verify"
 PLOW_MAX_CHUNK = "512"

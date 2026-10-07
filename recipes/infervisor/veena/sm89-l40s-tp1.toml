@@ -1,15 +1,19 @@
-# Trial: Veena (maya-research/Veena) on L40S (sm_89, 142 SMs, 48 GB), BF16. The H100 recipe's
-# codec-LM contract minus the Hopper-only decode knobs (decode cuBLASLt, FA fold, dense tune) and
-# the wgmma `_gw` rungs past 32. Prefill projections go through cuBLASLt (Llama-TTS shapes). The
-# SNAC decoder runs as codec.pkt on the sm_89 speech object.
+# Veena (maya-research/Veena) on L40S (sm_89, 142 SMs, 48 GB), BF16: the H100 recipe's codec-LM
+# contract minus the Hopper-only decode knobs (decode cuBLASLt, FA fold, dense tune) and the wgmma
+# `_gw` rungs past 32. Prefill projections go through cuBLASLt (Llama-TTS shapes); the SNAC
+# decoder runs as codec.pkt on the sm_89 speech object.
 #
-#   PYREF=<python with torch + snac> python3 scripts/campaign/campaign.py build \
-#     scripts/campaign/recipes/veena.l40s.bf16.toml --out <fresh dir>
+#   PYREF=<python with torch + snac> nix develop --command python3 scripts/campaign/campaign.py \
+#     build recipes/infervisor/veena/sm89-l40s-tp1.toml --out <fresh dir>
+#
+# Gate: Whisper CER median 0.005-0.011 (n=80, sampled). Decode as Orpheus (same Llama-3.2-3B
+# shapes): 89/86/88% of the roofline at B=1/16/32; streaming c1 TTFA 141 ms, RTF 0.75.
 
 schema = "plow.recipe.v1"
 namespace = "infervisor"
 name = "veena"
 label = "sm89-l40s-tp1"
+plow_git = "abb00b818378f4c09a2b53192d49cf192bc69f62"
 network = "llama"
 
 [target]

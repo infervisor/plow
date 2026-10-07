@@ -1,12 +1,17 @@
-# Trial: Gemma 4 E4B on L40S (sm_89, 142 SMs, 48 GB), BF16. The non-Hopper warp32 interpreter: no TMA GEMM,
-# FA v3 or wgmma segment objects; decode up to 32 rows.
+# Gemma 4 E4B on L40S (sm_89, 142 SMs, 48 GB), BF16. The non-Hopper warp32 interpreter: no TMA
+# GEMM, FA v3 or wgmma segment objects; decode up to 32 rows, batched GEMVs on the tensor cores.
 #
-#   python3 scripts/campaign/campaign.py build scripts/campaign/recipes/gemma4-e4b.l40s.bf16.toml --out <fresh dir>
+#   nix develop --command python3 scripts/campaign/campaign.py build \
+#     recipes/infervisor/gemma-4-e4b/sm89-l40s-tp1.toml --out <fresh dir>
+#
+# Gate: logit parity vs HF bf16 top1 0.9867, KL mean 7.75e-4. Decode ctx 1024 B=1/16/32
+# 13.61/15.26/16.55 ms = 82/82/84% of the roofline (docs/runtime/l40s-recipes.md).
 
 schema = "plow.recipe.v1"
 namespace = "infervisor"
 name = "gemma-4-e4b"
 label = "sm89-l40s-tp1"
+plow_git = "abb00b818378f4c09a2b53192d49cf192bc69f62"
 network = "gemma4"
 
 [target]
