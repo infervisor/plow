@@ -51,13 +51,24 @@ The recipes keep the L4 contracts at 48 GB sizes: decode ladders to 32 rows and 
 `scripts/bench/step_grid.sh` + `scripts/bench/op_roof.py --gpu l40s` (841 GB/s), ctx 1024, ms per
 step:
 
-| model | B=1 | B=8 | B=16 | B=32 | % of roofline B=1 / 16 / 32 |
-|---|---|---|---|---|---|
-| Qwen3-ASR 1.7B | 5.04 | 6.17 | 7.32 | 9.68 | 84 / 88 / 90 |
-| Qwen3-ASR 0.6B | 2.34 | 3.27 | 4.41 | 6.81 | 67 / 85 / 89 |
-| Orpheus / Veena (Llama 3B) | 8.96 | 10.19 | 11.37 | 13.81 | 89 / 90 / 91 |
-| Chatterbox / MTL T3 | 2.20 | 3.28 | 4.54 | 7.04 | 62 / 81 / 87 |
-| Gemma 4 E4B | 13.61 | 14.45 | 15.26 | 16.55 | 82 / 82 / 84 |
+| model | B=1 | B=16 | B=32 | B=64 | B=128 | % of roofline B=1 / 16 / 32 / 64 / 128 | tok/s at 128 |
+|---|---|---|---|---|---|---|---|
+| Qwen3-ASR 1.7B | 5.02 | 7.30 | 9.67 | 14.38 | 23.82 | 84 / 88 / 90 / 93 / 95 | 5373 |
+| Qwen3-ASR 0.6B | 2.33 | 4.44 | 6.80 | 11.51 | 20.87 | 67 / 83 / 88 / 92 / 95 | 6134 |
+| Orpheus / Veena (Llama 3B) | 8.96 | 11.38 | 13.66 | 18.48 | 28.14 | 89 / 89 / 91 / 93 / 94 | 4549 |
+| Chatterbox / MTL T3 | 2.20 | 4.55 | 7.04 | 12.36 | 22.44 | 62 / 80 / 86 / 89 / 93 | 5705 |
+| Gemma 4 E4B | 13.61 | 15.27 | 15.67 | 18.61 | 24.87 | 82 / 82 / 89 / 90 / 91 | 5148 |
+
+The decode ladders run to the 128-row clamp (slots = the widest rung; `auto` picks the rung per
+tick). Rungs past 32 would take ceil(B/32) passes of the mma walk (Orpheus B=128 at 69% of the
+roofline: projections 43-52%, lm_head 24%), so their projections and lm_head run on cuBLASLt,
+which reads the weights once (`PLOW_EMIT_DECODE_CUBLASLT`, now emitted for sm_89 and for
+Qwen3/Qwen3-ASR). From 32 rows on Gemma, Orpheus and Veena (B=32 also gains); from 64 on Qwen
+and Chatterbox, whose B=32 loses on the library. B=64/128 before -> after, ms: Orpheus
+22.07/38.75 -> 18.48/28.14, Gemma 25.06/42.82 -> 18.61/24.87, Qwen 1.7B 16.44/29.93 ->
+14.38/23.82, Chatterbox 12.86/24.16 -> 12.36/22.44. Floors are `op_roof.py` per-program floors;
+at 128 rows attention (KV) is the largest term, at 98-99% of bandwidth.
+
 
 Batched decode GEMVs (B >= 2) walk the weights on the tensor cores (`op_gemv_mma.cuh`,
 `PLOW_NV_GEMV_MMA`), as on H100. The CUDA-core dot8 walk they replace is issue-bound above one

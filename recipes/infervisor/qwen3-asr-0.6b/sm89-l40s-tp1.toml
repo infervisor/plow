@@ -43,9 +43,13 @@ args = ["--served-name", "qwen3-asr-0.6b"]
 PLOW_VERIFY_BIN = "{repo}/lean-plow/.lake/build/bin/plow_verify"
 PLOW_MAX_CHUNK = "512"
 PLOW_PF_LADDER_APPEND = "256,384"
-# 32 slots x 2048 ctx = 7 GiB of KV per model; Qwen 1.7B + 0.6B + Nemotron still share one
-# 48 GB L40S. The CLI needs prompt + the whole 1024-token budget in context.
-PLOW_DECODE_BATCH_LADDER = "1,2,4,8,16,32"
+# Decode ladder to the 128-row clamp: slots are the widest rung and `auto` picks the rung per
+# tick. Rungs past 32 take ceil(B/32) mma walks, so their projections (and lm_head) run on
+# cuBLASLt from 64 rows, reading the weights once: B=64/128 ctx 1024 11.51/20.86 ms.
+PLOW_DECODE_BATCH_LADDER = "1,2,4,8,16,32,64,128"
+PLOW_EMIT_DECODE_CUBLASLT = "1"
+PLOW_EMIT_DECODE_CUBLASLT_MIN_ROWS = "64"
+PLOW_EMIT_DECODE_CUBLASLT_HEAD = "1"
 PLOW_EMIT_PREFILL_CUBLASLT = "1"
 PLOW_NO_GLU_FUSE = "1"
 # hd128 row-group flash decode with merge fold (no FlashMerge level; changes attention sum
@@ -66,5 +70,5 @@ reference = "scripts/asr/nvidia/ref_bench.py"
 python = "{env:PYREF}"
 [gates.asr_wer]
 manifest = "{env:ASR_MANIFEST}"
-conc = "1,16"
+conc = "1,16,64"
 wer_max = 0.045

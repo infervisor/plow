@@ -8156,7 +8156,7 @@ fn emit_capabilities(model_type: &str) -> EmitCapabilities {
         gemma,
         dense_packet_contracts: dense,
         decode_objects: dense || model_type == "qwen3_5",
-        cublaslt_decode: gemma || matches!(model_type, "llama" | "qwen3_5"),
+        cublaslt_decode: gemma || matches!(model_type, "llama" | "qwen3" | "qwen3_asr" | "qwen3_5"),
         decode_ladder: dense || model_type == "gpt_oss",
         packed_prefill_siblings: matches!(model_type, "glm_moe_dsa" | "glm5_next"),
         glm: matches!(model_type, "glm_moe_dsa" | "glm5_next"),
@@ -8433,7 +8433,7 @@ fn cublaslt_emit_supported(
     tp: u32,
     has_decode_objects: bool,
 ) -> bool {
-    capabilities.cublaslt_decode && arch == "sm_90a" && tp == 1 && !has_decode_objects
+    capabilities.cublaslt_decode && matches!(arch, "sm_90a" | "sm_89") && tp == 1 && !has_decode_objects
 }
 
 /// [`run`] plus an optional pre-write verification gate (see [`VerifyHook`]).

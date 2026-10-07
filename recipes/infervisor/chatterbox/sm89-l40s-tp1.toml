@@ -62,7 +62,13 @@ PLOW_VERIFY_BIN = "{repo}/lean-plow/.lake/build/bin/plow_verify"
 # Prefill rows = voice rows + text + 2 (~200-350); decode 1..32 slots = 16 requests as CFG pairs.
 PLOW_MAX_CHUNK = "512"
 PLOW_PF_LADDER_APPEND = "256,384"
-PLOW_DECODE_BATCH_LADDER = "1,2,4,8,16,32"
+# Decode ladder to the 128-row clamp: slots are the widest rung and `auto` picks the rung per
+# tick. Rungs past 32 take ceil(B/32) mma walks, so their projections (and lm_head) run on
+# cuBLASLt from 64 rows, reading the weights once: B=64/128 ctx 1024 12.86/24.16 -> 12.38/22.44 ms (from 32 rows B=32 loses 3%).
+PLOW_DECODE_BATCH_LADDER = "1,2,4,8,16,32,64,128"
+PLOW_EMIT_DECODE_CUBLASLT = "1"
+PLOW_EMIT_DECODE_CUBLASLT_MIN_ROWS = "64"
+PLOW_EMIT_DECODE_CUBLASLT_HEAD = "1"
 PLOW_EMIT_PREFILL_CUBLASLT = "1"
 PLOW_NO_GLU_FUSE = "1"
 PLOW_FUSE_KV_HNR = "1"
@@ -75,7 +81,7 @@ arms = ["--conc 1 --stream --wav --n 16 --prompt-set chatterbox --voice default"
 [gates]
 python = "{env:PYREF}"
 [gates.tts_cer]
-arms = ["--conc 1 --stream --wav --n 16 --prompt-set chatterbox --voice default", "--conc 8 --stream --wav --n 16 --prompt-set chatterbox --voice default"]
+arms = ["--conc 1 --stream --wav --n 16 --prompt-set chatterbox --voice default", "--conc 8 --stream --wav --n 16 --prompt-set chatterbox --voice default", "--conc 32 --stream --wav --n 32 --prompt-set chatterbox --voice default"]
 cer_median_max = 0.05
 [gates.s3gen_rel_l2]
 python = "{env:CBX_PY}"

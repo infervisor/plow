@@ -41,7 +41,13 @@ args = ["--served-name", "gemma-4-e4b"]
 [emit.env]
 PLOW_VERIFY_BIN = "{repo}/lean-plow/.lake/build/bin/plow_verify"
 PLOW_MAX_CHUNK = "512"
-PLOW_DECODE_BATCH_LADDER = "1,2,4,8,16,32"
+# Decode ladder to the 128-row clamp: slots are the widest rung and `auto` picks the rung per
+# tick. Rungs past 32 take ceil(B/32) mma walks, so their projections (and lm_head) run on
+# cuBLASLt from 32 rows, reading the weights once: B=32/64/128 ctx 1024 16.55/25.06/42.82 -> 15.66/18.60/24.83 ms.
+PLOW_DECODE_BATCH_LADDER = "1,2,4,8,16,32,64,128"
+PLOW_EMIT_DECODE_CUBLASLT = "1"
+PLOW_EMIT_DECODE_CUBLASLT_MIN_ROWS = "32"
+PLOW_EMIT_DECODE_CUBLASLT_HEAD = "1"
 
 [bench]
 kind = "chat"

@@ -157,6 +157,9 @@ def cost(op, p, rows, ctx, wb, kvb):
         row_count = g("ntok") * g("nhead")
         # BF16 input, FP8 cache output, and one FP32 scale per cache row.
         return 3 * row_count * g("hd") + 4 * row_count, 0
+    if op == "EmbedOverlayBf16":
+        # Per row: a token-table or overlay (encoder) row read, BF16 row written.
+        return 4 * g("rows", rows) * g("width"), 0
     if op == "EmbedPosBf16":
         # Token row + position row read, BF16 row written.
         return 6 * g("rows", rows) * g("width"), 0
