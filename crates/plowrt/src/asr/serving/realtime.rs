@@ -219,8 +219,7 @@ pub(super) async fn upgrade(
 /// An `error` event, then close 1001 (going away).
 async fn going_away(socket: &mut WebSocket, out: &mut Events, code: &str, message: &str) {
     send(socket, out.error(code, message, None, None)).await;
-    let close = Message::Close(Some(axum::extract::ws::CloseFrame { code: 1001, reason: message.to_owned().into() }));
-    let _ = tokio::time::timeout(Duration::from_secs(5), socket.send(close)).await;
+    super::close(socket, 1001, message).await;
 }
 
 async fn session(state: Arc<AsrServer>, mut socket: WebSocket, ids: RequestIds, model: Option<String>) {
@@ -292,6 +291,10 @@ async fn session(state: Arc<AsrServer>, mut socket: WebSocket, ids: RequestIds, 
         let message = tokio::select! {
             m = tokio::time::timeout_at(idle_at, socket.recv()) => match m {
                 Ok(Some(Ok(m))) => m,
+                Err(_) => {
+                    going_away(&mut socket, &mut out, "timeout", "no client event for 120 s").await;
+                    return;
+                }
                 _ => return,
             },
             event = front_event(&mut flights), if !flights.is_empty() => {

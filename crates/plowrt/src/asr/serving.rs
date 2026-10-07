@@ -40,6 +40,8 @@ pub struct AsrServer {
     shutdown: watch::Sender<bool>,
     /// Admission-to-answer deadline of one transcription (`--asr-request-timeout-ms`).
     request_timeout: Option<Duration>,
+    /// A WebSocket stream with no audio or control message for this long ends.
+    idle_timeout: Duration,
     /// Recordings sent as `append` uploads, by (model, `X-Session-Id`).
     recordings: parking_lot::Mutex<HashMap<(String, Arc<str>), Arc<tokio::sync::Mutex<Recording>>>>,
 }
@@ -420,6 +422,7 @@ impl AsrServer {
             sessions: Arc::new(Semaphore::new(ingress_capacity)),
             shutdown: watch::channel(false).0,
             request_timeout: configured_timeout(),
+            idle_timeout: IDLE_TIMEOUT,
             recordings: Default::default(),
         })
     }
@@ -427,6 +430,12 @@ impl AsrServer {
     /// Replace the configured transcription deadline; only before the server is shared.
     pub fn with_request_timeout(mut self: Arc<Self>, timeout: Option<Duration>) -> Arc<Self> {
         Arc::get_mut(&mut self).expect("AsrServer already shared").request_timeout = timeout;
+        self
+    }
+
+    #[cfg(test)]
+    fn with_idle_timeout(mut self: Arc<Self>, timeout: Duration) -> Arc<Self> {
+        Arc::get_mut(&mut self).expect("AsrServer already shared").idle_timeout = timeout;
         self
     }
 
@@ -468,6 +477,7 @@ impl AsrServer {
             uploads: Arc::new(Semaphore::new(shared::UPLOADS)),
             sessions: Arc::new(Semaphore::new(shared::UPLOADS)),
             request_timeout: configured_timeout(),
+            idle_timeout: IDLE_TIMEOUT,
             recordings: Default::default(),
         })
     }
@@ -1152,15 +1162,38 @@ fn append_final_padding(samples: &mut Vec<f32>, count: usize, amplitude: f32) {
 /// A terminal error, then close 1001 (going away).
 async fn going_away(socket: &mut WebSocket, message: &str) {
     send(socket, json!({"type":"error","message":message,"terminal":true})).await;
-    let close = Message::Close(Some(axum::extract::ws::CloseFrame { code: 1001, reason: message.to_owned().into() }));
-    let _ = tokio::time::timeout(Duration::from_secs(5), socket.send(close)).await;
+    close(socket, 1001, message).await;
+}
+
+/// The idle timeout passed with nothing from the client: say so before closing, so it is not
+/// mistaken for a dropped connection.
+async fn idle_close(socket: &mut WebSocket, after: Duration) {
+    let message = format!("no audio or control message for {} s", after.as_secs_f32());
+    send(socket, json!({"type":"error","message":message,"code":"timeout","terminal":true})).await;
+    close(socket, 1000, "idle timeout").await;
+}
+
+/// Send a close frame and wait (5 s at most) for the peer's: dropping the socket first resets the
+/// connection under the client's close reply, which clients report as an I/O error.
+pub(super) async fn close(socket: &mut WebSocket, code: u16, reason: &str) {
+    let frame = Message::Close(Some(axum::extract::ws::CloseFrame { code, reason: reason.to_owned().into() }));
+    let _ = tokio::time::timeout(Duration::from_secs(5), async {
+        if socket.send(frame).await.is_ok() {
+            while let Some(Ok(message)) = socket.recv().await {
+                if matches!(message, Message::Close(_)) {
+                    break;
+                }
+            }
+        }
+    })
+    .await;
 }
 
 async fn stream(state: Arc<AsrServer>, mut socket: WebSocket, _permit: OwnedSemaphorePermit, ids: RequestIds) {
     let cancel = Cancellation(Arc::new(AtomicBool::new(false)));
     let mut shutdown = state.shutdown.subscribe();
     let Some(Ok(Message::Text(text))) =
-        tokio::time::timeout(IDLE_TIMEOUT, socket.recv())
+        tokio::time::timeout(state.idle_timeout, socket.recv())
             .await
             .ok()
             .flatten()
@@ -1230,11 +1263,15 @@ async fn stream(state: Arc<AsrServer>, mut socket: WebSocket, _permit: OwnedSema
     let mut pending: Option<oneshot::Receiver<crate::Result<Transcript>>> = None;
     let mut ping = tokio::time::interval_at(tokio::time::Instant::now() + PING_INTERVAL, PING_INTERVAL);
     let mut last_pong = tokio::time::Instant::now();
-    let mut idle_at = tokio::time::Instant::now() + IDLE_TIMEOUT;
+    let mut idle_at = tokio::time::Instant::now() + state.idle_timeout;
     loop {
         let message = tokio::select! {
             m = tokio::time::timeout_at(idle_at, socket.recv()) => match m {
                 Ok(Some(Ok(m))) => m,
+                Err(_) => {
+                    idle_close(&mut socket, state.idle_timeout).await;
+                    return;
+                }
                 _ => return,
             },
             Ok(result) = async { pending.as_mut().expect("guarded").await }, if pending.is_some() => {
@@ -1283,7 +1320,7 @@ async fn stream(state: Arc<AsrServer>, mut socket: WebSocket, _permit: OwnedSema
                     send(&mut socket,json!({"type":"error","message":"invalid PCM sequence or credit/length exceeded","terminal":true})).await;
                     return;
                 }
-                idle_at = tokio::time::Instant::now() + IDLE_TIMEOUT;
+                idle_at = tokio::time::Instant::now() + state.idle_timeout;
                 sequence += 1;
                 credit -= (bytes.len() - 8) / 2;
                 received += (bytes.len() - 8) / 2;
@@ -1575,7 +1612,7 @@ async fn continuous(
     let mut windows: Arc<parking_lot::Mutex<WindowCache>> = Default::default();
     let mut ping = tokio::time::interval_at(tokio::time::Instant::now() + PING_INTERVAL, PING_INTERVAL);
     let mut last_pong = tokio::time::Instant::now();
-    let mut idle_at = tokio::time::Instant::now() + IDLE_TIMEOUT;
+    let mut idle_at = tokio::time::Instant::now() + state.idle_timeout;
     loop {
         while flights.len() < MAX_SEGMENTS_IN_FLIGHT {
             let Some(segment) = waiting.front() else { break };
@@ -1611,11 +1648,15 @@ async fn continuous(
         }
         if finishing || backpressured {
             // The client may not send: no idle deadline while the server holds it up.
-            idle_at = tokio::time::Instant::now() + IDLE_TIMEOUT;
+            idle_at = tokio::time::Instant::now() + state.idle_timeout;
         }
         let message = tokio::select! {
             m = tokio::time::timeout_at(idle_at, socket.recv()) => match m {
                 Ok(Some(Ok(m))) => m,
+                Err(_) => {
+                    idle_close(&mut socket, state.idle_timeout).await;
+                    return;
+                }
                 _ => return,
             },
             event = front_event(&mut flights), if !flights.is_empty() => {
@@ -1728,7 +1769,7 @@ async fn continuous(
                     send(&mut socket, json!({"type":"error","message":"invalid PCM sequence or credit exceeded","terminal":true})).await;
                     return;
                 }
-                idle_at = tokio::time::Instant::now() + IDLE_TIMEOUT;
+                idle_at = tokio::time::Instant::now() + state.idle_timeout;
                 sequence += 1;
                 credit -= (bytes.len() - 8) / 2;
                 let pcm: Vec<f32> = bytes[8..]
@@ -2358,6 +2399,41 @@ mod tests {
             }
             let _ = socket.close(None).await;
             tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn websocket_idle_timeout_sends_an_error_and_a_close_frame() {
+        use tokio_tungstenite::{connect_async, tungstenite::Message as ClientMessage};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = AsrServer::new("test".into(), Fake).with_idle_timeout(Duration::from_millis(300)).router(true);
+        let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let url = format!("ws://{address}/v1/audio/transcriptions/stream");
+        for mode in ["utterance", "continuous"] {
+            let (mut socket, _) = connect_async(&url).await.unwrap();
+            socket.send(ClientMessage::Text(json!({"type":"start","version":1,"model":"test","sample_rate":16000,
+                "format":"pcm_s16le","mode":mode}).to_string())).await.unwrap();
+            let (mut error, mut close) = (None, None);
+            while let Some(message) = tokio::time::timeout(Duration::from_secs(10), socket.next()).await.unwrap() {
+                match message.unwrap() {
+                    ClientMessage::Text(text) => {
+                        let event: serde_json::Value = serde_json::from_str(&text).unwrap();
+                        if event["type"] == "error" {
+                            error = Some(event);
+                        }
+                    }
+                    ClientMessage::Close(frame) => {
+                        close = frame.map(|f| u16::from(f.code));
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            let error = error.expect("a terminal error before the close");
+            assert_eq!((error["code"].as_str(), error["terminal"].as_bool()), (Some("timeout"), Some(true)), "{mode}");
+            assert_eq!(close, Some(1000), "{mode}");
         }
         task.abort();
     }
