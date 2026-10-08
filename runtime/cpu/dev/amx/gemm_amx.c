@@ -177,12 +177,12 @@ static inline __m512 bf16x16_to_f32(const plow_bf16* p) {
 }
 
 /* Stores march kb-outer so the chunk TILELOADD reads first was written longest ago (ORM 20.15). */
-static void stage_a(plow_bf16* ap, const plow_bf16* A, uint32_t rows, uint32_t K, uint32_t k0,
+static void stage_a(plow_bf16* ap, size_t ldd, const plow_bf16* A, uint32_t rows, uint32_t K, uint32_t k0,
                     uint32_t kp, const float* rms, const plow_bf16* gamma) {
     for (uint32_t kk = 0; kk < kp; kk += 32u) {
         const uint32_t k = k0 + kk;
         for (uint32_t r = 0; r < 32u; r++) {
-            plow_bf16* d = ap + (size_t)r * KP + kk;
+            plow_bf16* d = ap + (size_t)r * ldd + kk;
             if (r >= rows) {
                 _mm512_storeu_si512((void*)d, _mm512_setzero_si512());
                 continue;
@@ -302,7 +302,7 @@ static inline void ils_drain(ils_t* e) {
 /* acc in tmm0-3 (zeroed or reloaded from `part`), K loop with the ILS epilogue of `pend`
  * sprinkled in, then TILESTORED to `out` (fp32 stride 128 B). A1 == NULL: 16-row block. */
 static void block(const plow_bf16* A0, const plow_bf16* A1, size_t lda, const uint8_t* bp,
-                  uint32_t nkb, const float* part, float* out, ils_t* pend) {
+                  uint32_t nkb, const float* part, float* out, ils_t* pend, int astream) {
     if (part) {
         _tile_loadd(0, part, 128);
         _tile_loadd(1, part + 16, 128);
@@ -317,13 +317,15 @@ static void block(const plow_bf16* A0, const plow_bf16* A1, size_t lda, const ui
     const uint32_t per = pend ? (ils_left(pend) + nkb - 1u) / nkb : 0u;
     for (uint32_t kb = 0; kb < nkb; kb++) {
         const uint8_t* b = bp + (size_t)kb * 2048u;
-        _tile_stream_loadd(4, A0 + kb * 32u, lda); /* A streams (T1 hint), B stays in L1 */
+        if (astream) _tile_stream_loadd(4, A0 + kb * 32u, lda); /* A streams (T1 hint), B stays in L1 */
+        else _tile_loadd(4, A0 + kb * 32u, lda);
         _tile_loadd(6, b, 64);
         _tile_dpbf16ps(0, 4, 6);
         _tile_loadd(7, b + 1024, 64);
         _tile_dpbf16ps(1, 4, 7);
         if (A1) {
-            _tile_stream_loadd(5, A1 + kb * 32u, lda);
+            if (astream) _tile_stream_loadd(5, A1 + kb * 32u, lda);
+            else _tile_loadd(5, A1 + kb * 32u, lda);
             _tile_dpbf16ps(2, 5, 6);
             _tile_dpbf16ps(3, 5, 7);
         }
@@ -341,7 +343,9 @@ static void block(const plow_bf16* A0, const plow_bf16* A1, size_t lda, const ui
  * strip pack, skip the tile math, read A in place instead of staging, skip the x pack of the
  * pack-free path. `pack`: force the old B-strip-pack driver (correct results, A/B timing).
  * Read once, off by default. */
-enum { AMX_DBG_NOPACK = 1, AMX_DBG_NOTDP = 2, AMX_DBG_NOSTAGE = 4, AMX_DBG_PACK = 8, AMX_DBG_NOXPACK = 16 };
+enum { AMX_DBG_NOPACK = 1, AMX_DBG_NOTDP = 2, AMX_DBG_NOSTAGE = 4, AMX_DBG_PACK = 8, AMX_DBG_NOXPACK = 16, AMX_DBG_WSTAGE = 32, AMX_DBG_NOGRID = 64,
+       AMX_DBG_L1PF = 128, AMX_DBG_NOSTREAM = 256, AMX_DBG_NOPF = 512,
+       AMX_DBG_WPANEL2 = 1024, AMX_DBG_WM = 2048 };
 static int amx_debug_flags(void) {
     static int f = -1;
     if (f < 0) {
@@ -351,6 +355,13 @@ static int amx_debug_flags(void) {
         if (e && strstr(e, "notdp")) f |= AMX_DBG_NOTDP;
         if (e && strstr(e, "nostage")) f |= AMX_DBG_NOSTAGE;
         if (e && strstr(e, "noxpack")) f |= AMX_DBG_NOXPACK;
+        if (e && strstr(e, "wstage")) f |= AMX_DBG_WSTAGE;
+        if (e && strstr(e, "nogrid")) f |= AMX_DBG_NOGRID;
+        if (e && strstr(e, "l1pf")) f |= AMX_DBG_L1PF;
+        if (e && strstr(e, "nostream")) f |= AMX_DBG_NOSTREAM;
+        if (e && strstr(e, "nopf")) f |= AMX_DBG_NOPF;
+        if (e && strstr(e, "wpanel2")) f |= AMX_DBG_WPANEL2;
+        if (e && strstr(e, "wmrun")) f |= AMX_DBG_WM;
         for (const char* p = e ? strstr(e, "pack") : NULL; p; p = strstr(p + 1, "pack"))
             if (p == e || p[-1] == ',' || p[-1] == ' ') f |= AMX_DBG_PACK;
     }
@@ -400,7 +411,7 @@ static void tile_amx(const gemm_args* g, uint32_t m0, uint32_t m1, uint32_t n0, 
             if (g->rms || (rows != 32u && rows != 16u) ||
                 ((size_t)g->K * 2u > 4096u && !(dbg & AMX_DBG_NOSTAGE))) {
                 plow_bf16* a = ap + (size_t)mb * (ABLK_BYTES / 2u);
-                stage_a(a, g->A + (size_t)m * g->K, rows, g->K, k0, kp, g->rms ? g->rms + m : NULL,
+                stage_a(a, KP, g->A + (size_t)m * g->K, rows, g->K, k0, kp, g->rms ? g->rms + m : NULL,
                         g->gamma);
                 A0s[mb] = a;
                 A1s[mb] = rows > 16u ? a + 16u * KP : NULL;
@@ -422,10 +433,10 @@ static void tile_amx(const gemm_args* g, uint32_t m0, uint32_t m1, uint32_t n0, 
                 const float* in_part = first ? NULL : part;
                 float* out = last ? cb + (size_t)cur * 2048u : part;
                 if (!(dbg & AMX_DBG_NOTDP)) {
-                    block(A0s[mb], A1s[mb], ldas[mb], bs, nkb, in_part, out, pend.rows ? &pend : NULL);
+                    block(A0s[mb], A1s[mb], ldas[mb], bs, nkb, in_part, out, pend.rows ? &pend : NULL, 1);
                     if (glu)
                         block(A0s[mb], A1s[mb], ldas[mb], bs + STRIP_BYTES, nkb,
-                              in_part ? in_part + 1024 : NULL, out + 1024, pend.rows ? &pend : NULL);
+                              in_part ? in_part + 1024 : NULL, out + 1024, pend.rows ? &pend : NULL, 1);
                 } else if (pend.rows) {
                     ils_drain(&pend);
                 }
@@ -547,7 +558,7 @@ static inline void wm_prefetch(wm_pf_t* pf) {
 /* One (strip, token block) over one panel: acc tmm0..3 = W rows [n, n+r0) x tokens [0,16) /
  * [16,32) and W rows [n+16, n+16+r1) likewise. W tiles load in place (rows staged into `wt` when a
  * strip has fewer than 16 rows); x tiles stream (T1) from the L2-resident panel. */
-static void wm_block(const uint8_t* W0, const uint8_t* W1, size_t ldw, uint32_t r0, uint32_t r1,
+static void wm_block(const uint8_t* W0, const uint8_t* W1, size_t ldw, size_t kstep, uint32_t r0, uint32_t r1,
                      const uint8_t* xtb, uint32_t nkb, uint32_t nxt, const float* part, float* out,
                      uint8_t* wt, wm_pf_t* pf, ils_t* pend) {
     if (part) {
@@ -564,32 +575,50 @@ static void wm_block(const uint8_t* W0, const uint8_t* W1, size_t ldw, uint32_t 
         _tile_zero(3);
     }
     const uint32_t per = pend ? (ils_left(pend) + nkb - 1u) / nkb : 0u;
+    const int dbg = amx_debug_flags();
+    const int l1pf = dbg & AMX_DBG_L1PF, nostream = dbg & AMX_DBG_NOSTREAM;
     for (uint32_t kb = 0; kb < nkb; kb++) {
         const uint8_t* x = xtb + (size_t)kb * 2048u;
-        _tile_stream_loadd(6, x, 64);
-        if (nxt > 1u) _tile_stream_loadd(7, x + 1024, 64);
+        if (l1pf && kb + 2u < nkb) {
+            /* Two K steps ahead into L1: 32 x lines + 16 lines of each W tile. */
+            const char* xn = (const char*)xtb + (size_t)(kb + 2u) * 2048u;
+            for (uint32_t l = 0; l < 32u; l++) _mm_prefetch(xn + l * 64u, _MM_HINT_T0);
+            const char* w0n = (const char*)W0 + (size_t)(kb + 2u) * kstep;
+            for (uint32_t r = 0; r < 16u; r++) _mm_prefetch(w0n + r * ldw, _MM_HINT_T0);
+            if (r1) {
+                const char* w1n = (const char*)W1 + (size_t)(kb + 2u) * kstep;
+                for (uint32_t r = 0; r < 16u; r++) _mm_prefetch(w1n + r * ldw, _MM_HINT_T0);
+            }
+        }
+        if (nostream) {
+            _tile_loadd(6, x, 64);
+            if (nxt > 1u) _tile_loadd(7, x + 1024, 64);
+        } else {
+            _tile_stream_loadd(6, x, 64);
+            if (nxt > 1u) _tile_stream_loadd(7, x + 1024, 64);
+        }
         if (r0 == 16u) {
-            _tile_loadd(4, W0 + kb * 64u, ldw);
+            _tile_loadd(4, W0 + kb * kstep, ldw);
         } else {
             for (uint32_t r = 0; r < r0; r++)
-                _mm512_store_si512((void*)(wt + r * 64u), _mm512_loadu_si512((const void*)(W0 + r * ldw + kb * 64u)));
+                _mm512_store_si512((void*)(wt + r * 64u), _mm512_loadu_si512((const void*)(W0 + r * ldw + kb * kstep)));
             _tile_loadd(4, wt, 64);
         }
         _tile_dpbf16ps(0, 4, 6);
         if (nxt > 1u) _tile_dpbf16ps(1, 4, 7);
         if (r1) {
             if (r1 == 16u) {
-                _tile_loadd(5, W1 + kb * 64u, ldw);
+                _tile_loadd(5, W1 + kb * kstep, ldw);
             } else {
                 for (uint32_t r = 0; r < r1; r++)
                     _mm512_store_si512((void*)(wt + 1024u + r * 64u),
-                                       _mm512_loadu_si512((const void*)(W1 + r * ldw + kb * 64u)));
+                                       _mm512_loadu_si512((const void*)(W1 + r * ldw + kb * kstep)));
                 _tile_loadd(5, wt + 1024u, 64);
             }
             _tile_dpbf16ps(2, 5, 6);
             if (nxt > 1u) _tile_dpbf16ps(3, 5, 7);
         }
-        if (pf) wm_prefetch(pf);
+        if (pf && !(dbg & AMX_DBG_NOPF)) wm_prefetch(pf);
         if (pend) ils_step(pend, per);
     }
     _tile_stored(0, out, 128);
@@ -600,6 +629,24 @@ static void wm_block(const uint8_t* W0, const uint8_t* W1, size_t ldw, uint32_t 
     }
 }
 
+/* bf16 W strip -> tile-contiguous staging: half h (rows 16h..16h+15), K step kb at
+ * ws + (h*nkb + kb)*1024, 16 rows x 64 B; rows past `cols` are zero. In place, a 16-row tile spans
+ * 16 rows at the weight stride (K*2 B) and every token block re-reads it that way; staged, each tile
+ * is 1 KiB contiguous, read nblk-token-block times from the scratch head that plowrt can hold in
+ * pseudo-locked L2 (PLOW_CPU_SRAM), while only this one copy streams the weight through the cache. */
+static void wm_stage(uint8_t* ws, const uint8_t* W0, size_t ldw, uint32_t cols, uint32_t nkb) {
+    for (uint32_t row = 0; row < 32u; row++) {
+        uint8_t* d = ws + (size_t)(row / 16u) * nkb * 1024u + (row % 16u) * 64u;
+        if (row < cols) {
+            const uint8_t* src = W0 + (size_t)row * ldw;
+            for (uint32_t kb = 0; kb < nkb; kb++)
+                _mm512_store_si512((void*)(d + (size_t)kb * 1024u), _mm512_loadu_si512((const void*)(src + kb * 64u)));
+        } else {
+            for (uint32_t kb = 0; kb < nkb; kb++) _mm512_store_si512((void*)(d + (size_t)kb * 1024u), _mm512_setzero_si512());
+        }
+    }
+}
+
 /* Returns 0 when this slice's partials do not fit even one token block (caller falls back). */
 static int wm_run(const gemm_args* g, uint32_t slice, uint32_t nblk, PlowCpuCtx* ctx) {
     const int dbg = amx_debug_flags();
@@ -607,25 +654,51 @@ static int wm_run(const gemm_args* g, uint32_t slice, uint32_t nblk, PlowCpuCtx*
     const int glu = g->Wu != NULL || g->Wu4 != NULL;
     const uint32_t nacc = glu ? 2u : 1u;
     const uint32_t S = (g->N + 31u) / 32u, MB = (g->M + 31u) / 32u;
-    /* Split axis. Normally N: a slice owns 32-column weight strips and W is read once per call.
-     * But pack_x_panel is per slice, so every slice packs the WHOLE M x K activation and the
-     * pack is done nblk times over. A narrow N makes that dominate -- at N=512, nblk=16 a
-     * slice's single strip does less compute than its pack -- and at N < 32*nblk most slices
-     * get no strip at all and the op serializes onto the few that do.
-     * Split over M instead when the whole-N W panel is L2-resident (so no slice has to re-chunk
-     * to hold it), every slice still gets a full 32-row token block, and M is worth at least
-     * half of N. The pack drops to 1x; each slice re-reads W, which those conditions keep small
-     * and L3-warm after the first slice. Output stays disjoint either way -- and the slice ->
-     * region map is already driver-dependent, since the strip driver splits (m, n) tiles. */
-    /* Never at fp4: an M-split slice owns EVERY strip, so all nblk threads would dequantize the
-     * whole weight — nblk times the unpack, which is the fp4 path's only added work. */
-    const int msplit = !mx && g->M >= 32u * nblk && (uint64_t)g->M * 2u > (uint64_t)g->N &&
-                       (size_t)S * nacc * 32u * WM_KP * 2u + WM_TB_BYTES + (size_t)S * nacc * 4096u <=
-                           WM_L2_BUDGET;
-    const uint32_t s0 = msplit ? 0u : (uint32_t)((uint64_t)S * slice / nblk);
-    const uint32_t s1 = msplit ? S : (uint32_t)((uint64_t)S * (slice + 1u) / nblk);
-    const uint32_t mlo = msplit ? (uint32_t)((uint64_t)MB * slice / nblk) * 32u : 0u;
-    uint32_t mhi = msplit ? (uint32_t)((uint64_t)MB * (slice + 1u) / nblk) * 32u : g->M;
+    /* Slice grid gm x gn over (32-token blocks, 32-column weight strips). pack_x_panel is per
+     * slice, so a pure N split packs the WHOLE M x K activation nblk times over: on Gemma-4-E2B
+     * a 1000-token prefill measured 300 ms with the pack and 108 ms without it, i.e. the
+     * redundant pack was ~2/3 of prefill. Splitting M cuts the pack to M/gm rows per slice but
+     * makes gm slices re-read each strip (out of L2/L3). Pick the grid minimising one slice's
+     * pack + weight fetch + TMUL work, in units of one bf16 MAC: a packed element (load,
+     * transpose, store, re-load) ~128, a weight element fetched into a strip ~30 (fitted to the
+     * measurement above). A narrow N also stops serializing onto the few slices that own a
+     * strip: N=1536 has 48 strips for 96 slices, and a 16 x 6 grid keeps every slice busy.
+     * Output stays disjoint (each slice owns an (m, n) rectangle); every consumer waits for the
+     * whole op, so the slice -> region map is the kernel's choice (the strip driver splits
+     * (m, n) tiles too). Never at fp4: each M group would re-dequantize its strips, and the
+     * unpack is the fp4 path's only added work. */
+    /* SRAM plan: with the scratch head pseudo-locked in this core's L2 (ctx->sram_bytes), W strips
+     * always go through the staging bounce buffer below WM_XP_OFF and the x panel + C partials are
+     * sized to the locked bytes, so everything the TMUL loop re-reads sits in ways no stream can
+     * evict; only the one sequential staging read per strip uses the unlocked way(s). */
+    const size_t sram_budget = !mx && ctx->sram_bytes > (size_t)WM_XP_OFF + 2u * WM_TB_BYTES
+                                   ? (size_t)ctx->sram_bytes - WM_XP_OFF
+                                   : 0u;
+    uint32_t gm = 1u, gn = nblk;
+    if (!mx && !(dbg & AMX_DBG_NOGRID)) {
+        uint64_t best = ~0ull;
+        for (uint32_t m = 1u; m <= nblk && m <= MB; m++) {
+            const uint32_t n = nblk / m;
+            if (n == 0u) continue;
+            const uint64_t rows = (uint64_t)((MB + m - 1u) / m) * 32u;
+            const uint64_t strips = (S + (n < S ? n : S) - 1u) / (n < S ? n : S);
+            /* The slice's W panel must leave L2 room for two token blocks, or the chunking below
+             * drops to one block per chunk and re-reads W from L3 per 32 tokens (GLU at 16
+             * strips: 2 MiB of panel, +57% GEMM_GLU time). */
+            if (m > 1u && (sram_budget
+                               ? 2u * (WM_TB_BYTES + strips * nacc * 4096u) > sram_budget
+                               : ((dbg & AMX_DBG_WPANEL2) ? 2u : strips) * nacc * 32u * WM_KP * 2u +
+                                     strips * nacc * 2u * 4096u + 2u * WM_TB_BYTES > WM_L2_BUDGET))
+                continue;
+            const uint64_t cost = 128u * rows + 30u * strips * 32u * nacc + rows * strips * 32u * nacc;
+            if (cost < best) best = cost, gm = m, gn = n < S ? n : S;
+        }
+    }
+    if (slice >= gm * gn) return 1;
+    const uint32_t im = slice / gn, in_ = slice % gn;
+    const uint32_t s0 = (uint32_t)((uint64_t)S * in_ / gn), s1 = (uint32_t)((uint64_t)S * (in_ + 1u) / gn);
+    const uint32_t mlo = (uint32_t)((uint64_t)MB * im / gm) * 32u;
+    uint32_t mhi = (uint32_t)((uint64_t)MB * (im + 1u) / gm) * 32u;
     if (mhi > g->M) mhi = g->M;
     if (s0 >= s1 || mlo >= mhi) return 1;
     const uint32_t nstrip = s1 - s0;
@@ -637,7 +710,10 @@ static int wm_run(const gemm_args* g, uint32_t slice, uint32_t nblk, PlowCpuCtx*
     float* cb = (float*)(sc + WM_CT_OFF);
     uint8_t* wt = sc + WM_WT_OFF;
     plow_bf16* dq = (plow_bf16*)(sc + WM_DQ_OFF);
-    const uint32_t xp_off = mx ? WM_XP_OFF : WM_DQ_OFF;
+    /* bf16 stages W strips into the dq region (wm_stage) under the SRAM plan; PLOW_AMX_DEBUG=wstage
+     * forces it without one (measured neutral to slightly slower unlocked). */
+    const int wstage = !mx && (sram_budget || (dbg & AMX_DBG_WSTAGE));
+    const uint32_t xp_off = mx || wstage ? WM_XP_OFF : WM_DQ_OFF;
     uint8_t* xp = sc + xp_off;
     /* Token chunk: x panel (ntb x 64 KiB) + partials (nstrip x ntb x nacc x 4 KiB) must fit. */
     const size_t per_tb = (size_t)WM_TB_BYTES + (size_t)nstrip * nacc * 4096u;
@@ -649,9 +725,13 @@ static int wm_run(const gemm_args* g, uint32_t slice, uint32_t nblk, PlowCpuCtx*
          * the 260 MiB L3), which is the far cheaper miss. */
         /* fp4 keeps ONE dequantized strip per accumulator hot (the rest of the slice's weight is
          * still packed fp4 in L3), so the resident weight does not scale with nstrip. */
+        /* The loop is panel -> strip -> token block: only the current strip (and the prefetched
+         * next one) is re-read across the chunk's token blocks. PLOW_AMX_DEBUG=wpanel2 budgets
+         * those two instead of the slice's whole W panel. */
         const size_t wpanel = mx ? (size_t)nacc * 32u * (WM_KP * 2u + WM_KP / 2u)
-                                 : (size_t)nstrip * nacc * 32u * WM_KP * 2u;
-        const uint32_t ntb_l2 = wpanel + per_tb <= WM_L2_BUDGET
+                                 : (size_t)((dbg & AMX_DBG_WPANEL2) && nstrip > 2u ? 2u : nstrip) * nacc * 32u * WM_KP * 2u;
+        const uint32_t ntb_l2 = sram_budget ? (sram_budget / per_tb ? (uint32_t)(sram_budget / per_tb) : 1u)
+                                : wpanel + per_tb <= WM_L2_BUDGET
                                     ? (uint32_t)((WM_L2_BUDGET - wpanel) / per_tb)
                                     : 1u;
         if (ntb_l2 < ntb_max) ntb_max = ntb_l2;
@@ -712,6 +792,25 @@ static int wm_run(const gemm_args* g, uint32_t slice, uint32_t nblk, PlowCpuCtx*
                 }
                 const uint8_t* Wt = mx ? (const uint8_t*)dq : W0;
                 const uint8_t* Ut = mx ? (const uint8_t*)(dq + WM_DQ_BYTES / 2u) : U0;
+                const uint8_t* W1t = Wt + 16u * tld;
+                const uint8_t* U1t = glu ? Ut + 16u * tld : NULL;
+                size_t bld = tld, kstep = 64u;
+                uint32_t br0 = r0, br1 = r1;
+                if (wstage) {
+                    uint8_t* ws = (uint8_t*)dq;
+                    wm_stage(ws, W0, ldw, cols, nkb);
+                    Wt = ws;
+                    W1t = ws + (size_t)nkb * 1024u;
+                    if (glu) {
+                        wm_stage(ws + (size_t)2u * nkb * 1024u, U0, ldw, cols, nkb);
+                        Ut = ws + (size_t)2u * nkb * 1024u;
+                        U1t = ws + (size_t)3u * nkb * 1024u;
+                    }
+                    bld = 64u;
+                    kstep = 1024u;
+                    br0 = 16u;
+                    br1 = cols > 16u ? 16u : 0u;
+                }
                 for (uint32_t tb = 0; tb < ntb; tb++) {
                     const uint32_t trows = rows - tb * 32u < 32u ? rows - tb * 32u : 32u;
                     const uint32_t nxt = trows > 16u ? 2u : 1u;
@@ -720,10 +819,10 @@ static int wm_run(const gemm_args* g, uint32_t slice, uint32_t nblk, PlowCpuCtx*
                     float* out = last ? cbT + (size_t)cur * 2048u : part;
                     const uint8_t* xtb = xp + (size_t)tb * nkb * 2048u;
                     if (!(dbg & AMX_DBG_NOTDP)) {
-                        wm_block(Wt, Wt + 16u * tld, tld, r0, r1, xtb, nkb, nxt, in_part, out, wt,
+                        wm_block(Wt, W1t, bld, kstep, br0, br1, xtb, nkb, nxt, in_part, out, wt,
                                  pf.p[0] ? &pf : NULL, pend.rows ? &pend : NULL);
                         if (glu)
-                            wm_block(Ut, Ut + 16u * tld, tld, r0, r1, xtb, nkb, nxt,
+                            wm_block(Ut, U1t, bld, kstep, br0, br1, xtb, nkb, nxt,
                                      in_part ? in_part + 1024 : NULL, out + 1024, wt, pf.p[0] ? &pf : NULL,
                                      pend.rows ? &pend : NULL);
                     } else if (pend.rows) {
@@ -754,6 +853,170 @@ static int wm_run(const gemm_args* g, uint32_t slice, uint32_t nblk, PlowCpuCtx*
     return 1;
 }
 
+/* ---- W-stationary driver: each slice packs ITS weight strips once, x is the A operand in place ----
+ *
+ * Both drivers above pay for an x relayout: wm_run packs every token's activations per slice, and
+ * the strip driver re-packs W per 256-row M tile. Here the slice's weight strips (the only
+ * weights it reads) are packed ONCE per call per K panel into L2-resident VNNI strips, and every
+ * token block then reads x straight from the activation as the A operand: 32 row streams the L2
+ * streamer follows, no pack, no transpose in the epilogue (C tiles are [m][n]). The panel is the
+ * whole K whenever the slice's strips fit WP_WBUDGET, so W leaves DRAM once and nothing spills
+ * partials. Measured 96 threads, Gemma-4-E2B GEMM_GLU M 1000 N 12288 K 1536: prototype 0.83 ms vs
+ * 1.19 ms for wm_run (same data, bit-for-bit math aside from the summation tile order).
+ * The grid trades the per-slice W pack (gm re-packs every strip) against the x stream (gn re-read
+ * every row), in bf16-MAC units per K element: a packed weight element ~200 (DRAM pack rate),
+ * an x element ~110 (L3 stream), one MAC 1. */
+#define WP_WBUDGET (1280u << 10)
+#define WP_W_COST 200u
+#define WP_X_COST 110u
+
+typedef struct {
+    uint8_t* wp;
+    float *cb, *cp;
+    plow_bf16* ap;
+    uint32_t npanel, kpmax, ctb;
+} wp_geo;
+
+/* Strips [s0, s1) x token blocks [tb0, tb1) of one slice. */
+static void wp_rect(const gemm_args* g, const wp_geo* q, uint32_t s0, uint32_t s1, uint32_t tb0, uint32_t tb1) {
+    const int dbg = amx_debug_flags();
+    const int glu = g->Wu != NULL;
+    const uint32_t nacc = glu ? 2u : 1u, nstrip = s1 - s0, npanel = q->npanel, kpmax = q->kpmax;
+    uint8_t* wp = q->wp;
+    if (!nstrip || tb0 >= tb1) return;
+    const size_t lda_x = (size_t)g->K * 2u;
+    for (uint32_t c0 = tb0; c0 < tb1; c0 += q->ctb) {
+        const uint32_t c1 = c0 + q->ctb < tb1 ? c0 + q->ctb : tb1;
+        ils_t pend = {0};
+        uint32_t cur = 0;
+        for (uint32_t p = 0; p < npanel; p++) {
+            const uint32_t k0 = p * kpmax, kp = g->K - k0 < kpmax ? g->K - k0 : kpmax, nkb = kp / 32u;
+            const int first = p == 0, last = p + 1u == npanel;
+            for (uint32_t s = 0; s < nstrip && !(dbg & AMX_DBG_NOPACK); s++) {
+                const uint32_t n = (s0 + s) * 32u;
+                plow_cpu_amx_pack_b_strip(wp + (size_t)s * nacc * kp * 64u, g->W, g->N, g->K, n, k0, kp);
+                if (glu) plow_cpu_amx_pack_b_strip(wp + ((size_t)s * nacc + 1u) * kp * 64u, g->Wu, g->N, g->K, n, k0, kp);
+            }
+            for (uint32_t tb = c0; tb < c1; tb++) {
+                const uint32_t m = tb * 32u, rows = g->M - m < 32u ? g->M - m : 32u;
+                const plow_bf16 *A0, *A1;
+                size_t lda;
+                if (g->rms || (rows != 32u && rows != 16u)) {
+                    stage_a(q->ap, kp, g->A + (size_t)m * g->K, rows, g->K, k0, kp, g->rms ? g->rms + m : NULL, g->gamma);
+                    A0 = q->ap;
+                    A1 = rows > 16u ? q->ap + 16u * kp : NULL;
+                    lda = (size_t)kp * 2u;
+                } else {
+                    A0 = g->A + (size_t)m * g->K + k0;
+                    A1 = rows == 32u ? A0 + 16u * g->K : NULL;
+                    lda = lda_x;
+                }
+                for (uint32_t s = 0; s < nstrip; s++) {
+                    const uint32_t n = (s0 + s) * 32u, cols = g->N - n < 32u ? g->N - n : 32u;
+                    const uint8_t* bs = wp + (size_t)s * nacc * kp * 64u;
+                    float* part = q->cp + ((size_t)(tb - c0) * nstrip + s) * nacc * 1024u;
+                    const float* in_part = first ? NULL : part;
+                    float* out = last ? q->cb + (size_t)cur * 2048u : part;
+                    if (!(dbg & AMX_DBG_NOTDP)) {
+                        block(A0, A1, lda, bs, nkb, in_part, out, pend.rows ? &pend : NULL, 0);
+                        if (glu)
+                            block(A0, A1, lda, bs + (size_t)kp * 64u, nkb, in_part ? in_part + 1024 : NULL, out + 1024,
+                                  pend.rows ? &pend : NULL, 0);
+                    } else if (pend.rows) {
+                        ils_drain(&pend);
+                    }
+                    if (last) {
+                        ils_drain(&pend);
+                        pend = (ils_t){.cb = out,
+                                       .cb_up = glu ? out + 1024 : NULL,
+                                       .dst = g->C + (size_t)m * g->N + n,
+                                       .bias = g->bias ? g->bias + n : NULL,
+                                       .bias_up = g->bias_up ? g->bias_up + n : NULL,
+                                       .f0 = g->f0,
+                                       .f1 = g->f1,
+                                       .ldc = g->N,
+                                       .rows = rows,
+                                       .cols = cols,
+                                       .act = g->act};
+                        cur ^= 1u;
+                    }
+                }
+            }
+        }
+        ils_drain(&pend);
+    }
+}
+
+static int wp_run(const gemm_args* g, uint32_t slice, uint32_t nblk, PlowCpuCtx* ctx) {
+    const int glu = g->Wu != NULL;
+    const uint32_t nacc = glu ? 2u : 1u;
+    const uint32_t S = (g->N + 31u) / 32u, MB = (g->M + 31u) / 32u;
+    uint32_t gm = 1u;
+    {
+        uint64_t best = ~0ull;
+        for (uint32_t m = 1u; m <= nblk && m <= MB; m++) {
+            const uint32_t n = nblk / m < S ? nblk / m : S;
+            if (!n) continue;
+            const uint64_t rows = (uint64_t)((MB + m - 1u) / m) * 32u, strips = (S + n - 1u) / n;
+            /* Each K panel past the first re-packs and splits every K loop and spills partials:
+             * measured +30% at E2B GLU N 12288 (gm 2, two panels) against gm 1 in one. */
+            const uint64_t panels = (strips * nacc * g->K * 64u + WP_WBUDGET - 1u) / WP_WBUDGET;
+            const uint64_t mac = rows * strips * 32u * nacc;
+            const uint64_t cost = WP_W_COST * strips * 32u * nacc + WP_X_COST * rows + mac + (panels - 1u) * mac / 2u;
+            if (cost < best) best = cost, gm = m;
+        }
+    }
+    /* Every slice of an M group takes an equal run of its (strip, token block) units in strip-major
+     * order, so no slice carries a whole extra strip (N 10240 = 320 strips over 96 slices: 3 or 4,
+     * the 4s set the op time) and N < 32 x nblk still uses every slice. A run is at most a strip
+     * tail, whole strips and a strip head; each output block keeps its K order. Gemma-4-E4B
+     * GLU, 2048 rows: 119 -> 111 ms per thread over a prefill. */
+    const uint32_t gn = nblk / gm;
+    if (slice >= gm * gn) return 1;
+    const uint32_t im = slice / gn, in_ = slice % gn;
+    const uint32_t tb0 = (uint32_t)((uint64_t)MB * im / gm), tb1 = (uint32_t)((uint64_t)MB * (im + 1u) / gm);
+    const uint32_t nt = tb1 - tb0;
+    /* Sized by the widest run so every slice takes this driver or none does (the fallback's
+     * grid differs). */
+    const uint32_t nsmax = (S + gn - 1u) / gn, nkbT = g->K / 32u;
+    /* K panels: as few as keep the slice's packed strips under WP_WBUDGET. */
+    uint32_t npanel = (uint32_t)(((size_t)nsmax * nacc * g->K * 64u + WP_WBUDGET - 1u) / WP_WBUDGET);
+    if (npanel > nkbT) npanel = nkbT;
+    const uint32_t kpb = (nkbT + npanel - 1u) / npanel;
+    npanel = (nkbT + kpb - 1u) / kpb;
+    const uint32_t kpmax = kpb * 32u;
+    uint8_t* sc = ctx->scratch;
+    wp_geo q = {.cb = (float*)sc, /* ILS ping-pong x {gate, up}: 16 KiB */
+                .ap = (plow_bf16*)(sc + 16384u),
+                .wp = sc + 16384u + (size_t)32u * kpmax * 2u,
+                .npanel = npanel,
+                .kpmax = kpmax,
+                .ctb = MB};
+    const size_t wbytes = (size_t)nsmax * nacc * kpmax * 64u;
+    q.cp = (float*)(q.wp + wbytes);
+    const size_t used = 16384u + (size_t)32u * kpmax * 2u + wbytes;
+    if (used > ctx->scratch_bytes) return 0;
+    const size_t per_tb = (size_t)nsmax * nacc * 4096u;
+    if (npanel > 1u) {
+        const size_t fit = (ctx->scratch_bytes - used) / per_tb;
+        if (!fit) return 0;
+        if (fit < q.ctb) q.ctb = (uint32_t)fit;
+    }
+    if (!nt) return 1;
+    const uint64_t U = (uint64_t)S * nt, u0 = U * in_ / gn, u1 = U * (in_ + 1u) / gn;
+    if (u0 >= u1) return 1;
+    const uint32_t sa = (uint32_t)(u0 / nt), ta = (uint32_t)(u0 % nt), sb = (uint32_t)(u1 / nt), tbe = (uint32_t)(u1 % nt);
+    if (sa == sb) {
+        wp_rect(g, &q, sa, sa + 1u, tb0 + ta, tb0 + tbe);
+        return 1;
+    }
+    uint32_t sf = sa;
+    if (ta) wp_rect(g, &q, sa, sa + 1u, tb0 + ta, tb1), sf++;
+    wp_rect(g, &q, sf, sb, tb0, tb1);
+    if (tbe) wp_rect(g, &q, sb, sb + 1u, tb0, tb0 + tbe);
+    return 1;
+}
+
 int plow_amx_usable(const PlowCpuCtx* ctx, uint32_t K) {
     return ctx && ctx->scratch && ctx->scratch_bytes >= SCRATCH_NEED && (K % 32u) == 0u && K > 0;
 }
@@ -761,7 +1024,16 @@ int plow_amx_usable(const PlowCpuCtx* ctx, uint32_t K) {
 void plow_amx_run_tiles(const gemm_args* g, uint32_t slice, uint32_t nblk, PlowCpuCtx* ctx) {
     /* bf16 weights take the pack-free driver unless PLOW_AMX_DEBUG=pack; fp8 (dequant in the
      * strip pack) and slices whose partials cannot fit the scratch keep the strip driver. */
-    if (!g->Wq && !(amx_debug_flags() & AMX_DBG_PACK) && wm_run(g, slice, nblk, ctx)) return;
+    if (!g->Wq && !(amx_debug_flags() & AMX_DBG_PACK)) {
+        /* wp_run reuses each x tile nstrip x nacc times out of L3; a plain GEMM wide in K and N
+         * leaves ~2 strips per slice and streams x faster than L3 delivers (96 threads, M 1000:
+         * N 5376 K 21504 7.2 ms vs 3.5 in wm_run, N 8192 K 5376 1.8 vs 1.4), while GLU and narrow
+         * shapes win (GLU N 12288 K 1536 0.97 vs 1.21, N 21504 K 5376 6.1 vs 8.7). Packing W also
+         * needs two token blocks to reuse it. */
+        const int wp = g->M >= 64u && (g->Wu || g->K <= 2048u || g->N <= 2048u);
+        if (wp && !(amx_debug_flags() & AMX_DBG_WM) && wp_run(g, slice, nblk, ctx)) return;
+        if (wm_run(g, slice, nblk, ctx)) return;
+    }
     const uint32_t tm = (g->M + g->BM - 1u) / g->BM, tn = (g->N + g->BN - 1u) / g->BN;
     for (uint32_t lin = slice; lin < tm * tn; lin += nblk) {
         const uint32_t m0 = (lin / tn) * g->BM, n0 = (lin % tn) * g->BN;
@@ -874,7 +1146,7 @@ double plow_cpu_amx_debug_kloop(uint32_t iters, PlowCpuCtx* ctx) {
     struct timespec t0, t1;
     clock_gettime(CLOCK_MONOTONIC, &t0);
     for (uint32_t i = 0; i < iters; i++)
-        block(ap, ap + 16u * KP, KP * 2u, sc + BP_OFF, KP / 32u, NULL, cb, NULL);
+        block(ap, ap + 16u * KP, KP * 2u, sc + BP_OFF, KP / 32u, NULL, cb, NULL, 1);
     clock_gettime(CLOCK_MONOTONIC, &t1);
     return (double)(t1.tv_sec - t0.tv_sec) + (double)(t1.tv_nsec - t0.tv_nsec) * 1e-9;
 }
@@ -905,11 +1177,18 @@ double plow_cpu_amx_debug_tdp(uint32_t iters, PlowCpuCtx* ctx) {
 
 void plow_cpu_register_amx_gemv(plow_cpu_kernel_fn* tab); /* gemv_amx.c: batched decode M >= 5 */
 void plow_cpu_register_amx_moe(plow_cpu_kernel_fn* tab);  /* moe_amx.c: Gemma grouped prefill 75/76 */
+void plow_cpu_register_amx_attention(plow_cpu_kernel_fn* tab); /* attention_amx.c: FLASH_PREFILL */
 
 void plow_cpu_register_amx(plow_cpu_kernel_fn* tab) {
     plow_fp8_vlut_init(&plow_amx_fp8_lut);
     plow_cpu_register_amx_gemv(tab);
     plow_cpu_register_amx_moe(tab);
+    /* PLOW_CPU_AMX_ATTN=0 keeps the AVX-512 FLASH_PREFILL (Gemma-4-26B-A4B: its FP32-reference
+     * gate sits at a router near-tie edge that the TMUL summation order tips over). */
+    {
+        const char* e = getenv("PLOW_CPU_AMX_ATTN");
+        if (!e || *e != '0') plow_cpu_register_amx_attention(tab);
+    }
     tab[PLOW_DOP_GEMM] = x_gemm;
     tab[PLOW_DOP_GEMM_SMALL] = x_gemm_small;
     tab[PLOW_DOP_GEMM_MED] = x_gemm_med;

@@ -1,0 +1,82 @@
+# Gemma-4-E2B-it (per-layer inputs, KV-shared layers) BF16 on Intel Xeon 6975P-C (Granite Rapids, 96 cores, SNC3, AMX-BF16): BF16 weights, BF16
+# KV, 2K context, 32 decode slots, greedy. Production recipe for this model/CPU/precision.
+#
+#   nix develop -c cargo build --release -p plowc
+#   nix develop -c cargo build --release -p plowrt --no-default-features --features cpu
+#   GEMMA4_E2B_CHECKPOINT=<hf dir> python3 scripts/campaign/campaign.py build \
+#       recipes/infervisor/gemma-4-e2b/xeon6-amx-bf16.toml --out <fresh dir>
+#
+# CPU target (docs/runtime/cpu.md): `plowc --gpu xeon6975p --arch amx`; the CPU engine runs the packet on
+# its AMX/AVX-512 tiers, `n_cu` = 96 virtual executors (one per physical core). Host state for every
+# measurement (all arms): kernel.numa_balancing=0, a zero-latency CPU QoS request held
+# (/dev/cpu_dma_latency, as tuned latency-performance does), THP madvise, no pseudo-lock held (PLOW_CPU_SRAM off).
+#
+# Qualified (2026-10-08, plowrt 59a36e3d, packet 4fea6d8c3932):
+# campaign.py report MATCHED + EQUIVALENT vs vLLM 0.30 CPU at 1000/128 c1/c8/c32; FP32-reference gate PASS,
+# KL mean 0.0004 vs vLLM 0.0005. Throughput 1.36-3.24x, TTFT P99 0.53-0.82x, TPOT P99 0.29-0.73x, memory 0.27-0.34x (wins every row).
+# docs/bringup/results/gemma4-xeon6-bf16-20261006/comparison.md.
+#
+# 16K agentic serving (same plowrt, packet 42aadb1b2d38): this recipe's emit/serve env with --max-ctx 16384,
+# PLOW_DECODE_BATCH_LADDER=1,2,4,8,16,32,64, and serve PLOW_SESSION_SLACK=64. A recipe carries one max_ctx, so the
+# 16K packet is a separate emit; comparison.md "Agentic sessions to 16K context".
+schema = "plow.recipe.v1"
+namespace = "infervisor"
+name = "gemma-4-e2b"
+label = "xeon6-amx-bf16"
+status = "validated"
+network = "gemma4"
+
+[target]
+vendor = "intel"
+isa = "amx"
+sku = "Xeon 6975P-C"
+units = 96
+num_gpus = 1
+parallel = "none"
+max_ctx = 2048
+toolchain = "nix"
+
+[checkpoint]
+source = "google/gemma-4-E2B-it"
+layout = "hf-bf16"
+
+[cell]
+name = "gemma-4-e2b.xeon6.bf16-2k-c32"
+model = "gemma-4-E2B-it (BF16 safetensors)"
+revision = "local"
+hf_dir = "{env:GEMMA4_E2B_CHECKPOINT}"
+gpu = "xeon6975p"
+arch = "amx"
+n_cu = 96
+max_ctx = 2048
+precision = "bf16"
+
+[emit]
+emit = "devblob"
+args = []
+[emit.env]
+PLOW_DECODE_BATCH_LADDER = "1,2,4,8,16,32"
+PLOW_MAX_CHUNK = "2048"
+
+[serve.env]
+PLOW_CPU_WEIGHT_AFFINE = "1"
+
+[bench]
+backend = "openai"
+in_lens = "1000"
+concs = "1 8 32"
+nprompt = 96
+outlen = 128
+warmups = 2
+seed = 42
+tokenizer = "{env:GEMMA4_E2B_CHECKPOINT}"
+model_id = "checkpoint"
+
+# FP32-reference gate (scripts/llm/fp32_ref_gate.py, 2K prompt set, --device cpu reference):
+# GEMMA4_E2B_FP32_REF = ref.json, GEMMA4_E2B_FP32_VLLM = the vLLM 0.30 capture against it.
+[gates]
+python = "{env:PYREF}"
+[gates.llm_fp32_ref]
+reference = "{env:GEMMA4_E2B_FP32_REF}"
+vllm_capture = "{env:GEMMA4_E2B_FP32_VLLM}"
+concurrency = 8

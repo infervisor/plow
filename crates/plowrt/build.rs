@@ -60,7 +60,12 @@ size_t plow_cpu_abi_offsetof_ctx_scratch_bytes(void) { return offsetof(PlowCpuCt
 size_t plow_cpu_abi_offsetof_ctx_worker(void) { return offsetof(PlowCpuCtx, worker); }
 size_t plow_cpu_abi_offsetof_ctx_node(void) { return offsetof(PlowCpuCtx, node); }
 size_t plow_cpu_abi_offsetof_ctx_isa(void) { return offsetof(PlowCpuCtx, isa); }
+size_t plow_cpu_abi_offsetof_ctx_pack(void) { return offsetof(PlowCpuCtx, pack); }
 size_t plow_cpu_abi_offsetof_ctx_reserved(void) { return offsetof(PlowCpuCtx, reserved); }
+size_t plow_cpu_abi_sizeof_pack(void) { return sizeof(PlowCpuPack); }
+size_t plow_cpu_abi_offsetof_pack_split_rows(void) { return offsetof(PlowCpuPack, split_rows); }
+size_t plow_cpu_abi_offsetof_pack_row_off(void) { return offsetof(PlowCpuPack, row_off); }
+size_t plow_cpu_abi_pf_tile(void) { return PLOW_PF_TILE; }
 size_t plow_cpu_abi_offsetof_inst_op(void) { return offsetof(PlowDevInst, op); }
 size_t plow_cpu_abi_offsetof_inst_blocks(void) { return offsetof(PlowDevInst, blocks); }
 size_t plow_cpu_abi_offsetof_inst_fj(void) { return offsetof(PlowDevInst, fj); }

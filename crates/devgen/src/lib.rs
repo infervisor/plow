@@ -2974,15 +2974,23 @@ fn dense_flash_split(
         // `PLOW_DENSE_PF_NS` CAPS this, it does not replace it: a cap can only ever remove
         // splits the heuristic asked for, so a value above the heuristic cannot over-split a
         // bucket past the `Opart`/`mlpart` capacity `max_splits` sized from the same formula.
-        let heuristic = n_cu
-            .div_ceil((t.div_ceil(Q_TILE_ROWS) * heads).max(1))
-            .max(1);
+        let heuristic = dense_pf_splits(n_cu, heads, t);
         match emit_config::active().dense_pf_ns {
             Some(cap) => heuristic.min(cap.max(1)),
             None => heuristic,
         }
     };
     (ns, !gemv_family && ns == 1)
+}
+
+/// The dense prefill split heuristic, raised to `PLOW_DENSE_PF_NS_MIN`. A floor of 2 keeps a
+/// FLASH_MERGE in every bucket, which the CPU runtime's packed prefill needs: it splits the KV at
+/// absolute positions into the merge's partials, whatever the bucket's own count. `max_splits`
+/// sizes `Opart`/`mlpart` from this same function.
+fn dense_pf_splits(n_cu: u32, heads: u32, t: u32) -> u32 {
+    n_cu.div_ceil((t.div_ceil(Q_TILE_ROWS) * heads).max(1))
+        .max(emit_config::active().dense_pf_ns_min.unwrap_or(1))
+        .max(1)
 }
 
 /// The q-tile height `d_flash_prefill` ACTUALLY uses: `PLOW_WAVES * FA_BQ`, with `PLOW_WAVES = 4`.
@@ -8902,6 +8910,14 @@ fn target_is_amd(arch: &str, gpu: &str) -> bool {
         || hwspec::registry::lookup(gpu).is_some_and(|s| s.vendor == hwspec::Vendor::Amd)
 }
 
+/// Is the emit target the plowrt CPU engine? `--arch amx|avx512|cpu` or a `--gpu` the registry
+/// says is an Intel CPU. The CPU engine interprets the NVIDIA-format packet, so a CPU target takes
+/// every `sm_120a` emit decision; only the labels (`--gpu`, `--arch`) differ.
+pub fn target_is_cpu(arch: &str, gpu: &str) -> bool {
+    hwspec::IsaLevel::from_arch_flag(arch).is_some_and(hwspec::IsaLevel::is_cpu)
+        || hwspec::registry::lookup(gpu).is_some_and(|s| s.vendor == hwspec::Vendor::Intel)
+}
+
 /// The largest `top_k` the AMD MoE routers can select. Mirrors `PLOW_MOE_MAX_TOPK` in
 /// `runtime/amd/op_moe.h`, and `moe_topk_matches_the_amd_kernel` PARSES that `#define` and fails
 /// if the two drift — the same discipline `GFX950_DISPATCHED` applies to `interp.hip`.
@@ -9499,8 +9515,10 @@ fn warn_arch_gpu_vendor_mismatch(arch: &str, gpu: &str) {
     };
     let arch_amd = arch.starts_with("gfx");
     let arch_nv = arch.starts_with("sm_");
+    let arch_cpu = target_is_cpu(arch, "");
     let gpu_amd = spec.vendor == hwspec::Vendor::Amd;
-    if (arch_amd && !gpu_amd) || (arch_nv && gpu_amd) {
+    let gpu_cpu = spec.vendor == hwspec::Vendor::Intel;
+    if (arch_amd && !gpu_amd) || (arch_nv && (gpu_amd || gpu_cpu)) || (arch_cpu && !gpu_cpu) {
         eprintln!(
             "  WARNING: --arch {arch} and --gpu {gpu} name different vendors. build.json will \
              describe an object for {arch}, but the packet is sized for {gpu} ({} CUs). If this is \
@@ -9841,8 +9859,7 @@ fn emit_dense_gqa(
     let max_splits = buckets
         .iter()
         .map(|&t| {
-            let ns = n_cu.div_ceil((t.div_ceil(Q_TILE_ROWS) * hs).max(1)).max(1);
-            t * hs * ns
+            t * hs * dense_pf_splits(n_cu, hs, t)
         })
         .max()
         .unwrap_or(n_cu * Q_TILE_ROWS);
@@ -10677,7 +10694,7 @@ fn emit_dense_gqa(
     check_nvidia_opcode_coverage(&m, amd);
     check_cpu_or_metal_opcode_coverage(
         &m,
-        arch == "metal3" || (arch.is_empty() && gpu.is_empty()),
+        arch == "metal3" || target_is_cpu(&arch, &gpu) || (arch.is_empty() && gpu.is_empty()),
         arch.starts_with("sm_"),
     );
     check_group_routing_supported(&m, amd, &arch);
@@ -10692,7 +10709,7 @@ fn emit_dense_gqa(
         // Single-utterance buckets (forward.v1); on CUDA also packed buckets (chunks of several
         // utterances, each attending in its own windows and splitting K as its single bucket
         // would), the largest sizing every shared tensor.
-        let (packed, single): (&[u32], &[u32]) = if arch.starts_with("sm_") {
+        let (packed, single): (&[u32], &[u32]) = if arch.starts_with("sm_") || target_is_cpu(&arch, &gpu) {
             (&[192, 160, 128, 96, 80, 64, 48, 40, 32, 24, 16, 12, 8, 4], &[3000, 400, 800, 1200, 1600, 2000])
         } else {
             (&[], &[400, 800, 1200, 1600, 2000])

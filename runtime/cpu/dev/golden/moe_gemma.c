@@ -72,13 +72,23 @@ static void gm_topk_tail(plow_moe_route* tab, float* sc, const plow_bf16* pes, u
     }
 }
 
+/* The router's bf16 roundings, as the checkpoint's bf16 reference (HF Gemma4TextRouter) runs it:
+ * norm(r), * scale, * root and the expert scores each land in bf16 before the f32 softmax. Scores
+ * then tie exactly where that reference ties, and the lower id wins. An f32 router instead resolves
+ * 26B-A4B's near-ties its own way: one flipped expert after BOS cost FP32-reference KL 8 on a
+ * 128-token prompt (HF bf16 with only the router in f32 reproduces it). */
+static inline float gm_bfr(float x) { return plow_bf2f(plow_f2bf(x)); }
+static inline float gm_router_in(plow_bf16 r, float inv, plow_bf16 scale, float root) {
+    return gm_bfr(gm_bfr(gm_bfr(plow_bf2f(r) * inv) * plow_bf2f(scale)) * root);
+}
+
 /* One router row: weightless RMS, h2 = r*invrms*scale*root, sc[e] = h2 . proj[e], tail. */
 static void gm_router_row(plow_moe_route* tab, const plow_bf16* resid, const plow_bf16* proj,
                           const plow_bf16* scale, const plow_bf16* pes, uint32_t H, uint32_t n_exp,
                           uint32_t k, float root, float eps, float* h2, float* sc) {
     const float inv = gm_invrms(resid, H, eps);
-    for (uint32_t h = 0; h < H; h++) h2[h] = plow_bf2f(resid[h]) * inv * plow_bf2f(scale[h]) * root;
-    for (uint32_t e = 0; e < n_exp; e++) sc[e] = gm_dot_bf16_f32(proj + (size_t)e * H, h2, H);
+    for (uint32_t h = 0; h < H; h++) h2[h] = gm_router_in(resid[h], inv, scale[h], root);
+    for (uint32_t e = 0; e < n_exp; e++) sc[e] = gm_bfr(gm_dot_bf16_f32(proj + (size_t)e * H, h2, H));
     gm_topk_tail(tab, sc, pes, n_exp, k);
 }
 
@@ -101,9 +111,8 @@ G_K(g_moe_router_gemma_score_fast) {
         if (row != cur_row) { inv = gm_invrms(rr, H, eps); cur_row = row; }
         const plow_bf16* pr = proj + (size_t)e * H;
         float acc = 0.0f;
-        for (uint32_t h = 0; h < H; h++)
-            acc = fmaf(plow_bf2f(rr[h]) * inv * plow_bf2f(scale[h]) * root, plow_bf2f(pr[h]), acc);
-        score[(size_t)row * E + e] = acc;
+        for (uint32_t h = 0; h < H; h++) acc = fmaf(gm_router_in(rr[h], inv, scale[h], root), plow_bf2f(pr[h]), acc);
+        score[(size_t)row * E + e] = gm_bfr(acc);
     }
 }
 

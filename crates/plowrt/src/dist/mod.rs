@@ -38,6 +38,7 @@ pub fn live_target(backends: &[std::sync::Arc<dyn crate::device::Backend>]) -> L
                 hwspec::Vendor::Nvidia => "nvidia",
                 hwspec::Vendor::Amd => "amd",
                 hwspec::Vendor::Apple => "apple",
+                hwspec::Vendor::Intel => "intel",
             }
             .to_string(),
             isa: fp.isa.arch_flag().to_string(),

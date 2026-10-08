@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# llm_grid.sh plow|vllm <resdir> — the matched LLM serving grid, one side per call, run inside ONE
+# llm_grid.sh plow|vllm|llamacpp <resdir> — the matched LLM serving grid, one side per call, run inside ONE
 # lease (the same client, `vllm bench serve` via pb_bench, against both servers):
 #
 #   Q="scripts/bench/gpuq.py submit"
@@ -34,6 +34,10 @@
 # PROD_COOLDOWN (25) s unmeasured, PROD_ARGS (extra client args: distributions, SLOs); cells q<1000*rate>.
 # Records <resdir>/provenance.json for the strict report (serving_comparison.py render): plow needs
 # KV_DTYPE (or PRECISION) and, for a PLOWRT outside a git checkout, PLOWRT_GIT_SHA.
+# CPU host (no nvidia-smi): peak memory is the server's summed Pss (cpu_peak_mem.py), vLLM drops
+# --gpu-memory-utilization, and a containerised server is sampled through its cgroup. llamacpp
+# serves GGUF (BF16 for a matched comparison) with LLAMA_IMAGE (ghcr.io/ggml-org/llama.cpp:full)
+# and LLAMA_ARGS (llama-server flags); PYREF stays the vLLM client.
 set -u
 # Bash otherwise reads later commands from a file that a long campaign may edit.
 if [ -n "${BASH_SOURCE[0]:-}" ]; then
@@ -42,17 +46,21 @@ if [ -n "${BASH_SOURCE[0]:-}" ]; then
 fi
 HERE=$(cd "$(dirname "$0")/../.." && pwd)
 source "$HERE/scripts/bench/plowbench.sh"
-case "${1:-}" in plow|vllm) ;; *) sed -n '2,36p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;; esac
+case "${1:-}" in plow|vllm|llamacpp) ;; *) sed -n '2,36p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;; esac
 SIDE=$1 RES=${2:?resdir}
 if [ "$#" -gt 2 ] && ! { { [ "$3" = --quality ] && [ "$#" -ge 4 ]; } || { [ "$3" = --needle ] && [ "$#" -eq 3 ]; } \
         || { { [ "$3" = --agentic ] || [ "$3" = --prod ]; } && [ "$#" -eq 3 ]; }; }; then
-    echo 'usage: llm_grid.sh plow|vllm resdir [--quality corpus files... | --needle | --agentic | --prod]' >&2
+    echo 'usage: llm_grid.sh plow|vllm|llamacpp resdir [--quality corpus files... | --needle | --agentic | --prod]' >&2
     exit 2
 fi
 : "${PYREF:?python with vllm}" "${HF:?checkpoint dir}"
 CONCS=${CONCS:-1 8 32 64 128} ISL=${ISL:-1000} OSL=${OSL:-128} REPS=${REPS:-2}
 SAMPLED=${SAMPLED---temperature 1 --top-p 0.95}
 mkdir -p "$RES"
+CPU_HOST=; command -v nvidia-smi >/dev/null 2>&1 || CPU_HOST=1
+SERVER_CONTAINER=
+VLLM_GPU_ARGS="--gpu-memory-utilization ${VLLM_MEM:-0.85}"
+[ -n "$CPU_HOST" ] && VLLM_GPU_ARGS=
 PB_SERVER_PORT=${PORT:-$(pb_free_port)} PB_SERVER_LOG=$RES/server.log
 if [ "$SIDE" = plow ]; then
     : "${ASSETS:?plow assets dir}"
@@ -60,21 +68,38 @@ if [ "$SIDE" = plow ]; then
     # shellcheck disable=SC2086
     PLOW_PF_PACKLOG=${PACKLOG:-1} PLOW_HSACO="$ASSETS" "$RES/plowrt" serve --assets "$ASSETS" \
         --port "$PB_SERVER_PORT" ${SERVE_ARGS:-} > "$PB_SERVER_LOG" 2>&1 &
-else
+elif [ "$SIDE" = llamacpp ]; then
+    : "${GGUF:?llama.cpp GGUF file}"
+    SERVER_CONTAINER=grid-llamacpp-$$
+    LLAMA_IMAGE=${LLAMA_IMAGE:-ghcr.io/ggml-org/llama.cpp:full}
     # shellcheck disable=SC2086
-    "$PYREF" -m vllm.entrypoints.cli.main serve "$HF" --served-model-name "${MODEL_NAME:-$(basename "$HF")}" \
-        --port "$PB_SERVER_PORT" --gpu-memory-utilization "${VLLM_MEM:-0.85}" --max-num-seqs 256 \
+    sudo docker run --rm --init --network host --name "$SERVER_CONTAINER" --user "$(id -u):$(id -g)" \
+        -v /tmp:/tmp --entrypoint /app/llama-server "$LLAMA_IMAGE" -m "$GGUF" \
+        --alias "${MODEL_NAME:-$(basename "$HF")}" --host 127.0.0.1 --port "$PB_SERVER_PORT" ${LLAMA_ARGS:-} \
+        > "$PB_SERVER_LOG" 2>&1 &
+else
+    SERVER_CONTAINER=grid-vllm-$$
+    # shellcheck disable=SC2086
+    VLLM_CONTAINER=$SERVER_CONTAINER "$PYREF" -m vllm.entrypoints.cli.main serve "$HF" \
+        --served-model-name "${MODEL_NAME:-$(basename "$HF")}" \
+        --port "$PB_SERVER_PORT" $VLLM_GPU_ARGS --max-num-seqs 256 \
         ${VLLM_ARGS:-} > "$PB_SERVER_LOG" 2>&1 &
 fi
 PB_SERVER_PID=$!
 if [ "$SIDE" = plow ]; then server_args=${SERVE_ARGS:-}
-else server_args="--gpu-memory-utilization ${VLLM_MEM:-0.85} --max-num-seqs 256 ${VLLM_ARGS:-}"; fi
+elif [ "$SIDE" = llamacpp ]; then server_args="${LLAMA_ARGS:-}"
+else server_args="${VLLM_GPU_ARGS:+$VLLM_GPU_ARGS }--max-num-seqs 256 ${VLLM_ARGS:-}"; fi
 python3 "$HERE/scripts/bench/serving_comparison.py" record "$RES" --side "$SIDE" --hf "$HF" --reps "$REPS" \
     --server-args "$server_args" --sampled "$SAMPLED" --pyref "$PYREF" --assets "${ASSETS:-}" \
-    --plowrt "${PLOWRT:-}" --repo "$HERE"
+    --plowrt "${PLOWRT:-}" --repo "$HERE" ${GGUF:+--gguf "$GGUF"} ${LLAMA_IMAGE:+--llama-image "$LLAMA_IMAGE"}
 memory_sampler_pid=
 memory_start() { # tag
-    if command -v nvidia-smi >/dev/null 2>&1; then
+    if [ -n "$CPU_HOST" ]; then
+        python3 "$HERE/scripts/bench/cpu_peak_mem.py" --out "$RES/$1.peak_gpu_memory_mib.txt" \
+            --root-pid "$PB_SERVER_PID" ${SERVER_CONTAINER:+--container "$SERVER_CONTAINER"} \
+            2> "$RES/$1.memory.log" &
+        memory_sampler_pid=$!
+    elif command -v nvidia-smi >/dev/null 2>&1; then
         nvidia-smi --query-compute-apps=timestamp,pid,used_memory \
             --format=csv,noheader,nounits -lms 100 > "$RES/$1.memory.csv" 2> "$RES/$1.memory.log" &
         memory_sampler_pid=$!
@@ -94,7 +119,7 @@ memory_finish() { # tag
             --root-pid "$PB_SERVER_PID" > "$RES/$1.peak_gpu_memory_mib.txt"
     fi
 }
-trap 'memory_stop; pb_metrics_stop; pb_serve_stop' EXIT
+trap 'memory_stop; pb_metrics_stop; pb_serve_stop; [ -n "$SERVER_CONTAINER" ] && sudo -n docker rm -f "$SERVER_CONTAINER" >/dev/null 2>&1' EXIT
 pb_serve_wait 900 || exit 3
 if [ "${3:-}" = --needle ]; then
     needle_template_args=()
@@ -181,13 +206,21 @@ if [ "${3:-}" = --agentic ] || [ "${3:-}" = --prod ]; then
     exit 0
 fi
 # Distinct seed per (kind, conc, isl, osl, repeat): no cell's prompts are a prefix of another's.
+# A cell with any failed request is re-run with the same seed, up to CELL_RETRIES (2) more times, on
+# every side alike; the recorded result is the first clean attempt and cells.log names each retry.
 cell() { # tag kind conc np isl osl rep [client args...]
     local tag=$1 kind=$2 c=$3 np=$4 isl=$5 osl=$6 rep=$7; shift 7
-    memory_start "$tag"
-    PB_SEED=$(( 8193 + kind * 1000003 + c * 131 + isl * 7 + osl + rep * 7919 )) \
-        pb_cell "$RES" "$tag" "$MODEL" "$c" "$np" "$isl" "$osl" "$@"
-    memory_finish "$tag"
-    local f; f=$(pb_result "$RES" "$tag") && python3 - "$f" "$tag" <<'EOF'
+    local attempt f
+    for attempt in $(seq 0 "${CELL_RETRIES:-2}"); do
+        memory_start "$tag"
+        PB_SEED=$(( 8193 + kind * 1000003 + c * 131 + isl * 7 + osl + rep * 7919 )) \
+            pb_cell "$RES" "$tag" "$MODEL" "$c" "$np" "$isl" "$osl" "$@"
+        memory_finish "$tag"
+        f=$(pb_result "$RES" "$tag") || break
+        python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); sys.exit(d["completed"] != d["num_prompts"])' "$f" && break
+        echo "CELL_RETRY $tag attempt $((attempt + 1)): $(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d["completed"], "/", d["num_prompts"])' "$f")" >> "$RES/cells.log"
+    done
+    f=$(pb_result "$RES" "$tag") && python3 - "$f" "$tag" <<'EOF'
 import json, sys
 d = json.load(open(sys.argv[1]))
 print(f"{sys.argv[2]:12s} ttft p50 {d['median_ttft_ms']:8.1f}  tpot p50 {d['median_tpot_ms']:6.2f}  "
@@ -209,7 +242,7 @@ for bc in ${DECODE-1x1024 64x1024 128x1024}; do
 done
 pb_metrics_stop
 if [ "$SIDE" = vllm ]; then python3 "$HERE/scripts/bench/vllm_metrics.py" cells "$RES"
-else
+elif [ "$SIDE" = plow ]; then
     python3 "$HERE/scripts/bench/packlog_audit.py" "$PB_SERVER_LOG" > "$RES/packlog.txt"
     python3 "$HERE/scripts/bench/vllm_metrics.py" cells "$RES" --cache-only > "$RES/cache.json"
 fi

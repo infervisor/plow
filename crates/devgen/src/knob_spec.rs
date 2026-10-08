@@ -476,11 +476,28 @@ const UNISEG_DEFAULT: Default = Default::Production {
                 F::Target(T::Arch("sm_120a")),
                 F::Target(T::Arch("sm_120")),
                 F::Target(T::Arch("metal3")),
+                F::Target(T::Arch("amx")),
+                F::Target(T::Arch("avx512")),
+                F::Target(T::Arch("cpu")),
             ]),
             value: TRUE,
         },
     ],
     otherwise: FALSE,
+};
+
+/// `plowc` turns the NVIDIA E-series decode merge-fold off for CPU targets: the CPU flash-decode
+/// kernels need FLASH_MERGE.
+const NV_FA_FOLD_WIDE_DEFAULT: Default = Default::Production {
+    cases: &[DefaultCase {
+        when: F::Or(&[
+            F::Target(T::Arch("amx")),
+            F::Target(T::Arch("avx512")),
+            F::Target(T::Arch("cpu")),
+        ]),
+        value: FALSE,
+    }],
+    otherwise: TRUE,
 };
 
 const C_W8A8: &[Constraint] = &[Constraint {
@@ -1021,6 +1038,16 @@ pub const TARGETS: &[TargetSpec] = &[
         caps: DENSE_CAPS,
         recipe: &[],
     },
+    // The plowrt CPU engine (NVIDIA-format packet, one executor per core).
+    TargetSpec {
+        name: "gemma4_amx_cpu",
+        arch: "amx",
+        tp: 1,
+        n_cu: 96,
+        model: "gemma4",
+        caps: &["gemma"],
+        recipe: &[],
+    },
     TargetSpec {
         name: "kimi_k3_gfx950_tp8",
         arch: "gfx950",
@@ -1072,7 +1099,7 @@ pub const EMIT: &[KnobSpec] = &[
     KnobSpec::new("emit.no_fuse_nrn", Some("PLOW_NO_FUSE_NRN"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.fuse_hnr", Some("PLOW_FUSE_HNR"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.fuse_merge", Some("PLOW_FUSE_MERGE"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
-    KnobSpec::new("emit.nv_fa_fold_wide", Some("PLOW_NV_FA_FOLD_WIDE"), Layer::Emit, Domain::Bool, ON, PROMOTED),
+    KnobSpec::new("emit.nv_fa_fold_wide", Some("PLOW_NV_FA_FOLD_WIDE"), Layer::Emit, Domain::Bool, NV_FA_FOLD_WIDE_DEFAULT, PROMOTED),
     KnobSpec::new("emit.nv_fa_fold", Some("PLOW_NV_FA_FOLD"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.nv_dense_tune", Some("PLOW_NV_DENSE_TUNE"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.packed_prefill_small_hd", Some("PLOW_EMIT_PACKED_PREFILL_SMALL_HD"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
@@ -1212,6 +1239,7 @@ pub const EMIT: &[KnobSpec] = &[
     KnobSpec::new("emit.glm_dsa_pf_dexact", Some("PLOW_GLM_DSA_PF_DEXACT"), Layer::Emit, U32, UNSET, OPT_IN),
     KnobSpec::new("emit.pf_floor", Some("PLOW_PF_FLOOR"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.dense_pf_ns", Some("PLOW_DENSE_PF_NS"), Layer::Emit, U32, UNSET, OPT_IN),
+    KnobSpec::new("emit.dense_pf_ns_min", Some("PLOW_DENSE_PF_NS_MIN"), Layer::Emit, U32, UNSET, OPT_IN),
     KnobSpec::new("emit.glm_pf_wide", Some("PLOW_GLM_PF_WIDE"), Layer::Emit, Domain::Bool, ON, PROMOTED),
     KnobSpec::new("emit.glm_place_pf", Some("PLOW_GLM_PLACE_PF"), Layer::Emit, Domain::Bool, ON, PROMOTED),
     KnobSpec::new("emit.glm_moe_stage1_native", Some("PLOW_GLM_MOE_STAGE1_NATIVE"), Layer::Emit, Domain::Bool, OFF, OPT_IN).scoped(GLM_MOE_STAGE1_NATIVE_SCOPE),
@@ -1290,6 +1318,9 @@ pub const EMIT: &[KnobSpec] = &[
 
 #[rustfmt::skip]
 pub const RAW_ENV: &[KnobSpec] = &[
+    KnobSpec::new("env.PLOW_AMX_DEBUG", Some("PLOW_AMX_DEBUG"), Layer::RawEnv, Domain::Str, UNSET, DIAG),
+    KnobSpec::new("env.PLOW_CPU_AMX_ATTN", Some("PLOW_CPU_AMX_ATTN"), Layer::RawEnv, Domain::Bool, ON, OPT_IN),
+    KnobSpec::new("env.PLOW_CPU_AMX_ATTN_SPLIT_P", Some("PLOW_CPU_AMX_ATTN_SPLIT_P"), Layer::RawEnv, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("env.PLOW_BENCH_SHAPE", Some("PLOW_BENCH_SHAPE"), Layer::RawEnv, Domain::Str, UNSET, DIAG),
     KnobSpec::new("env.PLOW_GEMV_MFMA4", Some("PLOW_GEMV_MFMA4"), Layer::RawEnv, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("env.PLOW_GATE_HIER_PF", Some("PLOW_GATE_HIER_PF"), Layer::RawEnv, Domain::Bool, OFF, OPT_IN),

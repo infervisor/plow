@@ -6,6 +6,7 @@ plans/
 *.swp
 .idea/
 .vscode/
+target
 target/
 plow-out/
 models/
@@ -48,6 +49,20 @@ plow_profile.sqlite
 # GPU binary build outputs — never check in (bundles link them from build dirs)
 *.cubin
 *.hsaco
+
+# Kernel module build outputs
+*.ko
+*.o
+.*.o
+*.mod
+*.mod.c
+*.mod.o
+*.cmd
+.*.cmd
+modules.order
+Module.symvers
+crypto-module.a
+
 
 # plowc/plowrt emitted serve-asset bundles for this campaign (model.pkt, weights.json, cubins)
 assets-run/
@@ -96,3 +111,5 @@ sglang-pkgs/
 !/runtime/nvidia/experiments/README.md
 /runtime/bench/amd/*/README.md
 /test_impl*
+
+result*/

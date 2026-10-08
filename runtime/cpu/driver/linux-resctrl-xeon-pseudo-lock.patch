@@ -1,0 +1,57 @@
+--- arch/x86/kernel/cpu/resctrl/pseudo_lock.c.orig	2026-10-05 11:22:20.028145084 +0000
++++ arch/x86/kernel/cpu/resctrl/pseudo_lock.c	2026-10-05 11:22:20.030223811 +0000
+@@ -66,6 +66,13 @@
+ 
+ 	switch (boot_cpu_data.x86_vfm) {
+ 	case INTEL_BROADWELL_X:
++	case INTEL_SKYLAKE_X:
++	case INTEL_ICELAKE_X:
++	case INTEL_SAPPHIRERAPIDS_X:  /* Xeon 4th Gen */
++	case INTEL_EMERALDRAPIDS_X:   /* Xeon 5th Gen */
++	case INTEL_GRANITERAPIDS_X:   /* Xeon 6th Gen P-core */
++	case INTEL_GRANITERAPIDS_D:   /* Xeon 6th Gen D */
++	case INTEL_ATOM_CRESTMONT_X:  /* Xeon 6th Gen E-core Sierra Forest */
+ 		/*
+ 		 * SDM defines bits of MSR_MISC_FEATURE_CONTROL register
+ 		 * as:
+@@ -476,6 +483,13 @@
+ 
+ 	switch (boot_cpu_data.x86_vfm) {
+ 	case INTEL_BROADWELL_X:
++	case INTEL_SKYLAKE_X:
++	case INTEL_ICELAKE_X:
++	case INTEL_SAPPHIRERAPIDS_X:  /* Xeon 4th Gen */
++	case INTEL_EMERALDRAPIDS_X:   /* Xeon 5th Gen */
++	case INTEL_GRANITERAPIDS_X:   /* Xeon 6th Gen P-core */
++	case INTEL_GRANITERAPIDS_D:   /* Xeon 6th Gen D */
++	case INTEL_ATOM_CRESTMONT_X:  /* Xeon 6th Gen E-core Sierra Forest */
+ 		/* On BDW the hit event counts references, not hits */
+ 		perf_hit_attr.config = X86_CONFIG(.event = 0x2e,
+ 						  .umask = 0x4f);
+--- fs/resctrl/pseudo_lock.c.orig	2026-10-05 11:22:20.029081998 +0000
++++ fs/resctrl/pseudo_lock.c	2026-10-05 11:22:20.033696910 +0000
+@@ -194,7 +194,7 @@
+ {
+ 	plr->size = 0;
+ 	plr->line_size = 0;
+-	kfree(plr->kmem);
++	kvfree(plr->kmem);
+ 	plr->kmem = NULL;
+ 	plr->s = NULL;
+ 	if (plr->d)
+@@ -302,13 +302,13 @@
+ 	 * We do not yet support contiguous regions larger than
+ 	 * KMALLOC_MAX_SIZE.
+ 	 */
+-	if (plr->size > KMALLOC_MAX_SIZE) {
++	if (0 && plr->size > KMALLOC_MAX_SIZE) {
+ 		rdt_last_cmd_puts("Requested region exceeds maximum size\n");
+ 		ret = -E2BIG;
+ 		goto out_region;
+ 	}
+ 
+-	plr->kmem = kzalloc(plr->size, GFP_KERNEL);
++	plr->kmem = kvzalloc(plr->size, GFP_KERNEL);
+ 	if (!plr->kmem) {
+ 		rdt_last_cmd_puts("Unable to allocate memory\n");
+ 		ret = -ENOMEM;

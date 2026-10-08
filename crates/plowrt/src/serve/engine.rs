@@ -128,14 +128,30 @@ pub trait SeqEngine {
     fn packable_prefill_span(&self, slot: usize, max_rows: u32)
         -> Option<packet::dev::PrefillSpan>;
     fn advance_packed_prefill(&mut self, members: &[(usize, &[u32])]) -> crate::Result<()>;
+    /// `(slot, token)` for each prompt the last [`Self::advance_packed_prefill`] completed. Empty
+    /// for a backend whose packs carry only intermediate chunks.
+    fn take_packed_tokens(&mut self) -> Vec<(usize, u32)> {
+        Vec::new()
+    }
+    /// Apply a retained session's resume before seeding pack cursors: this backend packs fresh
+    /// prompts, so the isolated path (which otherwise resumes) may never see them.
+    fn resume_before_pack(&self) -> bool {
+        false
+    }
     fn prefill_frontier(&self, slot: usize) -> Option<usize>;
     fn next_prefill_rows(&self, _slot: usize) -> Option<u32> { None }
+    /// Keep up to `slot`'s first `rows` KV rows (a retained session prefix) so its next prefill
+    /// starts there. Returns the rows kept, at most `rows`; 0 = the prompt starts cold.
+    fn resume_slot(&mut self, _slot: usize, _rows: usize) -> usize { 0 }
     /// What this backend declares to the backend-neutral step planner
     /// (`crate::sched::step`). The default is a whole-prompt engine with no packing.
     fn step_backend(&self) -> crate::sched::step::Backend {
         crate::sched::step::Backend::default()
     }
     fn cached_rows(&self, _slot: usize) -> usize { 0 }
+    /// The softcapped logits behind `slot`'s most recent token (host logprobs); `false` = the
+    /// engine keeps them on device.
+    fn logits_row(&self, _slot: usize, _out: &mut Vec<f32>) -> bool { false }
     fn prefill_chunked_at_most(
         &mut self,
         slot: usize,
@@ -403,6 +419,8 @@ impl ServeEngine {
         match self {
             #[cfg(feature = "cuda")]
             ServeEngine::Cuda(e) => e.slot_resume_supported(),
+            #[cfg(feature = "cpu")]
+            ServeEngine::Cpu(_) => true,
             #[allow(unreachable_patterns)]
             _ => false,
         }

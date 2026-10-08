@@ -67,6 +67,12 @@ impl std::str::FromStr for NumaMode {
 }
 
 /// Parse a sysfs cpulist (`0-3,8,10-11`) into sorted, deduplicated ids.
+/// The lowest online cpu of `node` (the owner a node-scoped L3 pseudo-lock is loaded from).
+pub fn first_cpu_of_node(node: u32) -> Option<u32> {
+    let s = std::fs::read_to_string(format!("/sys/devices/system/node/node{node}/cpulist")).ok()?;
+    parse_cpulist(s.trim()).into_iter().min()
+}
+
 pub fn parse_cpulist(s: &str) -> Vec<u32> {
     let mut out = Vec::new();
     for part in s.split(',') {
@@ -243,6 +249,28 @@ impl Topology {
                         if let Some(&cpu) = c.siblings.get(rank) {
                             cpus.push((cpu, c.node));
                         }
+                    }
+                }
+            }
+        }
+        cpus
+    }
+
+    /// Worker placement restricted strictly to rank 0 (physical cores).
+    /// Used when AMX or AVX-512 is active or Pseudo-Lock SRAM is enabled to prevent
+    /// SMT hyperthread contention, TMUL thrashing, and private L2 cache eviction.
+    pub fn physical_worker_cpus(&self, nodes: &[u32]) -> Vec<(u32, u32)> {
+        let groups: Vec<Vec<&Core>> = nodes
+            .iter()
+            .map(|&n| self.cores_on_node(n).collect())
+            .collect();
+        let width = groups.iter().map(Vec::len).max().unwrap_or(0);
+        let mut cpus = Vec::new();
+        for i in 0..width {
+            for cores in &groups {
+                if let Some(c) = cores.get(i) {
+                    if let Some(&cpu) = c.siblings.first() {
+                        cpus.push((cpu, c.node));
                     }
                 }
             }

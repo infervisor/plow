@@ -91,7 +91,7 @@ libloading = { version = "0.8", optional = true }
 gguf-rs-lib = { version = "0.3", optional = true }
 # CPU engine: thread affinity / mbind for the persistent worker pool
 # (`exec::cpu`). Optional because only the `cpu` feature links the kernel lib.
-libc = { version = "0.2", optional = true }
+libc = "0.2"
 
 # Metal GPU backend (`exec::apple`): objc2 bindings to Metal/Foundation. Frameworks are part of
 # the OS, so they are linked, not dlopen'd. macOS only.
@@ -113,7 +113,7 @@ default = []
 # (`runtime/cpu/dev/`, golden / AVX-512 / AMX tiers) built by build.rs and
 # reached through `exec::cpu::ffi`. Real-weight loading (safetensors, tokenizer)
 # joins this feature in P2 — see `plans/cpu-backend.md`.
-cpu = ["dep:cc", "dep:libc", "dep:safetensors", "hf-tokenizer"]
+cpu = ["dep:cc", "dep:safetensors", "hf-tokenizer"]
 # Metal GPU engine for Apple Silicon (plans/apple-silicon-backend.md rung 2). Builds on the CPU
 # engine's loader (unified memory: the host tensors ARE the device buffers), so it implies `cpu`.
 metal = ["cpu", "dep:objc2", "dep:objc2-metal", "dep:objc2-foundation"]
@@ -136,7 +136,7 @@ dist = ["dep:ureq", "dep:zstd", "dep:zip", "dep:hf-hub", "hf-tokenizer"]
 # and pulls hf-tokenizer for the same reason: a real model served through the
 # byte-fallback tokenizer produces silent garbage (a `--features cuda`-only
 # build did exactly that, 2026-07-19; see serve() 's byte-fallback refusal).
-cuda = ["dep:libloading", "dep:libc", "dep:safetensors", "hf-tokenizer"]
+cuda = ["dep:libloading", "dep:safetensors", "hf-tokenizer"]
 # HSA driver-API backend (dlopen of libhsa-runtime64 — direct ROCr, no HIP).
 # Pulls the same two extras as `cuda`, for the same two reasons: the AMD engine
 # (`exec::amd`) binds checkpoint weights by tensor name, which needs the
@@ -144,7 +144,7 @@ cuda = ["dep:libloading", "dep:libc", "dep:safetensors", "hf-tokenizer"]
 # tokenizer produces silent garbage rather than an error (measured on the CUDA
 # side, 2026-07-19). The features stay symmetric so an AMD serve cannot inherit
 # a failure mode the NVIDIA one was fixed for.
-hsa = ["dep:libloading", "dep:libc", "dep:safetensors", "hf-tokenizer"]
+hsa = ["dep:libloading", "dep:safetensors", "hf-tokenizer"]
 # Generic GGUF asset reader; it is independent of the execution backend.
 gguf = ["dep:gguf-rs-lib"]
 # In-process adapter for NVIDIA NeMo-Speech's stable ASR C ABI. The selected

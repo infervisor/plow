@@ -27,9 +27,21 @@ mod fusion_coverage;
 #[derive(Parser, Debug)]
 #[command(
     name = "plowc",
-    about = "plow compiler: model/network → packet streams for a hardware spec"
+    about = "plow compiler: model/network → packet streams for a hardware spec",
+    version,
+    disable_version_flag = true
 )]
 struct Cli {
+    /// Print version information
+    #[arg(
+        short = 'v',
+        short_alias = 'V',
+        long = "version",
+        action = clap::ArgAction::Version,
+        help = "Print version information (-v, -V, --version)"
+    )]
+    version: Option<bool>,
+
     /// Optional subcommand. With none, `plowc` compiles, exactly as before —
     /// every existing invocation keeps working unchanged.
     #[command(subcommand)]
@@ -68,8 +80,8 @@ struct Cli {
     #[arg(long, value_name = "BUILD_JSON")]
     replay_knobs: Option<PathBuf>,
 
-    /// GPU spec name or short alias (e.g. `rtx6000pro`, `h100`, `mi350`).
-    /// Run with `--list-gpus` to see all recognized names.
+    /// GPU spec name or short alias (e.g. `rtx6000pro`, `h100`, `mi350`), or a CPU part for the
+    /// plowrt CPU engine (`xeon6975p`). Run with `--list-gpus` to see all recognized names.
     #[arg(long, default_value = "H100 SXM5")]
     gpu: String,
 
@@ -128,7 +140,8 @@ struct Cli {
     emit: Option<EmitKind>,
 
     /// devblob only: target ISA recorded in `build.json` (`sm_120a`, `sm_90a`,
-    /// `gfx950`, …), and the arch `--emit devblob+cubin` builds for.
+    /// `gfx950`, `amx`/`avx512` for the CPU engine, …), and the arch `--emit devblob+cubin`
+    /// builds for.
     ///
     /// METADATA for the packet itself — it does not change a single emitted byte.
     /// The manifest names opcodes, shapes and rules; mapping those to a
@@ -271,6 +284,24 @@ struct Cli {
     /// schedule; logs accepted/rejected candidates).
     #[arg(long, default_value_t = false)]
     sram_fit: bool,
+
+    /// Target Intel CPU architecture profile or auto-detection:
+    /// e.g. `auto` (probed via sysfs /dev/pseudo_lock_*), `xeon6` (Granite Rapids / Sierra Forest),
+    /// `xeon5` (Emerald Rapids), `xeon4` (Sapphire Rapids), `client` (Arrow Lake / Raptor Lake).
+    #[arg(long, default_value = "auto")]
+    intel_cpu: String,
+
+    /// Override L2 Pseudo-Lock SRAM budget in KiB for packet rung scheduling (0 = auto-detect).
+    #[arg(long, default_value_t = 0)]
+    l2_sram_kib: u64,
+
+    /// Override L3 Pseudo-Lock SRAM budget in MiB for KV-cache and weights (0 = auto-detect).
+    #[arg(long, default_value_t = 0)]
+    l3_sram_mib: u64,
+
+    /// Avoid SMT hyperthread thrashing on Intel AMX/AVX-512 targets (default true).
+    #[arg(long, default_value_t = true)]
+    no_smt: bool,
 
     /// Disable the Lean PERFORMANCE ORACLE (on by default). Affects only the
     /// oracle — the ordering certificate keeps running unless you also pass
@@ -786,6 +817,20 @@ fn main() -> ExitCode {
         if spec.vendor == hwspec::Vendor::Apple && cli.arch == "sm_120a" {
             cli.arch = hwspec::IsaLevel::Metal3.arch_flag().to_string();
         }
+        // A CPU part runs the NVIDIA-format packet on the CPU engine; name the host ISA instead.
+        if spec.vendor == hwspec::Vendor::Intel && cli.arch == "sm_120a" {
+            cli.arch = hwspec::IsaLevel::from_spec(spec)
+                .unwrap_or(hwspec::IsaLevel::Amx)
+                .arch_flag()
+                .to_string();
+        }
+    }
+    let cpu_target = devgen::target_is_cpu(&cli.arch, &cli.gpu);
+    // The CPU flash-decode kernels need FLASH_MERGE; the NVIDIA hd256/512 decode merge-fold
+    // removes it and the CPU loader refuses the packet. Off by default for CPU targets.
+    if cpu_target && matches.value_source("nv_fa_fold_wide") == Some(clap::parser::ValueSource::DefaultValue) {
+        cli.emit_cfg.nv_fa_fold_wide = false;
+        devgen::emit_config::note_production_default("nv_fa_fold_wide", "false".into());
     }
 
     // DEFAULT ON FOR sm_120. The persistent sm_120 interpreter runs every op in one cooperative
@@ -798,6 +843,7 @@ fn main() -> ExitCode {
     // Opt out with PLOW_UNISEG=0.
     cli.emit_cfg.uniseg = effective_uniseg(
         &cli.arch,
+        cpu_target,
         cli.emit_cfg.uniseg,
         cli.segmented,
         std::env::var_os("PLOW_UNISEG").is_some(),
@@ -1818,7 +1864,8 @@ fn run_devblob(cli: &Cli) -> Result<PathBuf, Box<dyn std::error::Error>> {
             lean_oracle_on,
             bw_bytes_per_cycle,
             spec.clock_boost.0,
-            cli.arch.starts_with("sm_"),
+            // The CPU engine runs the NVIDIA arms (x staged at M=1, no LDS arena).
+            cli.arch.starts_with("sm_") || devgen::target_is_cpu(&cli.arch, &cli.gpu),
         )?)
     };
     let verify = match (fusion_coverage, verify) {
@@ -2175,10 +2222,10 @@ fn build_cubin_from_manifest(
     Ok(())
 }
 
-fn effective_uniseg(arch: &str, configured: bool, segmented: bool, env_present: bool) -> bool {
+fn effective_uniseg(arch: &str, cpu: bool, configured: bool, segmented: bool, env_present: bool) -> bool {
     if segmented {
         false
-    } else if (arch.starts_with("sm_120") || arch == "metal3") && !env_present {
+    } else if (arch.starts_with("sm_120") || arch == "metal3" || cpu) && !env_present {
         true
     } else {
         configured
@@ -2224,6 +2271,10 @@ fn cubin_arch_option(arch: &str) -> Result<&'static str, String> {
         "sm_90a" => Ok("-DPLOW_SM90A_CUBIN=ON"),
         "sm_120a" => Ok("-DPLOW_SM120_CUBIN=ON"),
         "sm_89" => Ok("-DPLOW_SM89_CUBIN=ON"),
+        _ if devgen::target_is_cpu(arch, "") => Err(format!(
+            "--emit devblob+cubin: --arch {arch} is a CPU target; the CPU engine needs no \
+             interpreter object, use --emit devblob."
+        )),
         _ if !arch.starts_with("sm_") => Err(format!(
             "--emit devblob+cubin: only the nvcc backend is wired; --arch {arch} would \
              need the hipcc/.hsaco backend (runtime/amd/), which is not implemented."
@@ -2508,7 +2559,46 @@ fn run(cli: Cli) -> Result<Report, Box<dyn std::error::Error>> {
             }
         },
     };
+    let (l2_sram_kib, l3_sram_mib) =
+        resolve_intel_sram_budgets(&cli.intel_cpu, cli.l2_sram_kib, cli.l3_sram_mib);
+    tracing::info!(
+        profile = %cli.intel_cpu,
+        l2_sram_kib,
+        l3_sram_mib,
+        no_smt = cli.no_smt,
+        "Intel CPU Pseudo-Lock SRAM Roofline Configuration"
+    );
     Ok(plowc::compile_named(&source, &opts, cli.served_name)?)
+}
+
+/// Resolve Intel CPU SRAM budgets based on target profile or hardware detection.
+/// Returns (l2_kib, l3_mib).
+fn resolve_intel_sram_budgets(profile: &str, l2_override: u64, l3_override: u64) -> (u64, u64) {
+    if l2_override > 0 && l3_override > 0 {
+        return (l2_override, l3_override);
+    }
+    let (detected_l2, detected_l3) = match profile.to_ascii_lowercase().as_str() {
+        "xeon6" | "graniterapids" | "gnr" => (1920, 420),
+        "xeon5" | "emeralds" | "emr" => (1792, 280),
+        "xeon4" | "sapphirerapids" | "spr" => (1792, 90),
+        "client" | "arrowlake" | "raptorlake" => (1536, 24),
+        _ => {
+            let l2_k = std::fs::read_to_string("/sys/devices/system/cpu/cpu0/cache/index2/size")
+                .ok()
+                .and_then(|s| s.trim().strip_suffix('K').and_then(|v| v.parse::<u64>().ok()))
+                .unwrap_or(2048);
+            let l3_k = std::fs::read_to_string("/sys/devices/system/cpu/cpu0/cache/index3/size")
+                .ok()
+                .and_then(|s| s.trim().strip_suffix('K').and_then(|v| v.parse::<u64>().ok()))
+                .unwrap_or(491520);
+            let l2 = (l2_k * 15) / 16;
+            let l3 = ((l3_k / 1024) * 14) / 16;
+            (l2.max(512), l3.max(16))
+        }
+    };
+    let l2 = if l2_override > 0 { l2_override } else { detected_l2 };
+    let l3 = if l3_override > 0 { l3_override } else { detected_l3 };
+    (l2, l3)
 }
 
 /// Print the compiler-pass statistics + runtime estimates as a table.
@@ -3131,10 +3221,11 @@ mod cli_tests {
 
     #[test]
     fn uniseg_cli_state_reaches_the_legacy_builder_switch() {
-        assert!(effective_uniseg("sm_90a", true, false, false));
-        assert!(!effective_uniseg("sm_90a", true, true, false));
-        assert!(effective_uniseg("sm_120a", false, false, false));
-        assert!(!effective_uniseg("sm_120a", false, false, true));
+        assert!(effective_uniseg("sm_90a", false, true, false, false));
+        assert!(!effective_uniseg("sm_90a", false, true, true, false));
+        assert!(effective_uniseg("sm_120a", false, false, false, false));
+        assert!(!effective_uniseg("sm_120a", false, false, false, true));
+        assert!(effective_uniseg("amx", true, false, false, false));
     }
 
     /// CORRECTION 1, HALF ONE. Both gates are ON with no flags. They used to be

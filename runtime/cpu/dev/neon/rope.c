@@ -12,6 +12,8 @@ N_K(n_headnorm_rope) {
     const int32_t* pos = PLOW_CPU_TEN(in, T, 5);
     const uint32_t ntok = in->i[0], nhead = in->i[1], hd = in->i[2], out_row0 = in->i[3];
     const uint32_t skip_norm = in->i[4], n_batch_kv = in->i[6];
+    /* A packed prefill writes each row's KV into its own slot (the n_batch_kv layout). */
+    const uint32_t* row_slot = ctx && ctx->pack ? ctx->pack->row_slot : NULL;
     const uint32_t out_stride = in->fj[1].u, kv_mask = in->fj[2].u;
     const float eps = in->fj[0].f;
     const int interleave = in->i[5] == 2u ? 0 : (hd == 64u) || (hd == 128u && in->i[5] == 1u);
@@ -31,8 +33,8 @@ N_K(n_headnorm_rope) {
             const plow_bf16* xr = x + ((size_t)t * nhead + hh) * hd;
             const size_t obase =
                 out_stride
-                    ? (n_batch_kv != 0
-                           ? ((size_t)(t * nhead + hh) * out_stride + (position & kv_mask)) * hd
+                    ? (n_batch_kv != 0 || row_slot
+                           ? ((size_t)((row_slot ? row_slot[t] : t) * nhead + hh) * out_stride + (position & kv_mask)) * hd
                            : ((size_t)hh * out_stride + ((out_row0 + t) & kv_mask)) * hd)
                     : ((size_t)(out_row0 + t) * nhead + hh) * hd;
 

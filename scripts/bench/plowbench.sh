@@ -143,6 +143,14 @@ pb_is_amd() {
     esac
 }
 
+# plowrt CPU engine targets (plowc --gpu xeon6975p --arch amx|avx512): no device object.
+pb_is_cpu() {
+    case "${1:-}" in
+        amx|avx512|cpu) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 pb_require_nix() {
     # A box without nix (PLOW_CAMPAIGN_NO_NIX=1, as campaign.py) runs in a hand-built shell instead.
     if [ "${PLOW_CAMPAIGN_NO_NIX:-0}" = 1 ]; then
@@ -223,6 +231,10 @@ pb_check_objects() {
     local arch="${2:-}"
     local assets="${3:-}"
     [ -n "$arch" ] || arch=$(pb_detect_arch "" "" "$dir")
+    if pb_is_cpu "$arch"; then
+        pb_ok "CPU target $arch: the CPU engine needs no interpreter objects"
+        return 0
+    fi
     [ -d "$dir" ] || { pb_bad "no object dir $dir"; return 1; }
 
     if pb_is_nvidia "$arch"; then
@@ -333,17 +345,19 @@ pb_check_vllm() {
     [ -n "$arch" ] || arch=$(pb_detect_arch) || return 1
     local v; v=$(pb_vllm_client)
 
-    if pb_is_nvidia "$arch"; then
+    if pb_is_nvidia "$arch" || pb_is_cpu "$arch"; then
+        local kind=CUDA
+        pb_is_cpu "$arch" && kind=CPU
         if [ -z "$v" ] || [ ! -x "$v" ]; then
             # Test python module
             if python3 -c 'import vllm' >/dev/null 2>&1; then
-                pb_ok "vLLM available via python3 -m vllm (CUDA)"
+                pb_ok "vLLM available via python3 -m vllm ($kind)"
                 return 0
             fi
             pb_bad "no vLLM client found (checked PB_VLLM, /app/plow/build-gemma31/vllm-python, /opt/pytorch/bin/vllm, PATH, VLLM_VENV)"
             return 1
         fi
-        pb_ok "vLLM client $v (CUDA)"
+        pb_ok "vLLM client $v ($kind)"
         return 0
     fi
 

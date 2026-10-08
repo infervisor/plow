@@ -12,6 +12,7 @@ static float kv_value(const plow_bf16* data, const float* scales, size_t row, ui
 }
 
 #define FA_BQ_TILE 128u /* query rows per work item: 4 waves x FA_BQ (the Gemma flash object) */
+_Static_assert(FA_BQ_TILE == PLOW_PF_TILE, "pack views tile FLASH_PREFILL like the kernel");
 #define FA_BKV 32u
 #define FA_GF 2u        /* PLOW_FA_GF: query heads fused per decode item */
 
@@ -20,29 +21,42 @@ static float kv_value(const plow_bf16* data, const float* scales, size_t row, ui
  * f0=scale  fj1.u=kv_stride  fj2.u=kv_mask.  Q is [n_q][n_head][hd]; K/V head-major.
  * nsplit==1 with t5 present writes the normalized bf16 output straight to t5 and no partial. */
 G_K(g_flash_prefill) {
-    (void)ctx;
-    float* Opart = PLOW_CPU_TEN(in, T, 0);
-    float* mlpart = PLOW_CPU_TEN(in, T, 1);
-    const plow_bf16* Q = PLOW_CPU_TEN(in, T, 2);
-    const plow_bf16* K = PLOW_CPU_TEN(in, T, 3);
-    const plow_bf16* V = PLOW_CPU_TEN(in, T, 4);
+    float* const Opart0 = PLOW_CPU_TEN(in, T, 0);
+    float* const mlpart0 = PLOW_CPU_TEN(in, T, 1);
+    const plow_bf16* const Q0 = PLOW_CPU_TEN(in, T, 2);
+    const plow_bf16* const K0 = PLOW_CPU_TEN(in, T, 3);
+    const plow_bf16* const V0 = PLOW_CPU_TEN(in, T, 4);
     const int fp8 = in->op == PLOW_DOP_FLASH_PREFILL_FP8;
-    const float* ks = fp8 ? PLOW_CPU_TEN(in, T, 6) : NULL;
-    const float* vs = fp8 ? PLOW_CPU_TEN(in, T, 7) : NULL;
-    plow_bf16* O_final = PLOW_CPU_TEN(in, T, 5);
-    const uint32_t n_q = in->i[0], n_kv = in->i[1], n_head = in->i[2], n_kv_head = in->i[3];
-    const uint32_t q_pos0 = in->i[4], window = in->i[5], D = in->i[6];
-    const uint32_t nsplit = in->i[7] ? in->i[7] : 1u;
+    const float* const ks0 = fp8 ? PLOW_CPU_TEN(in, T, 6) : NULL;
+    const float* const vs0 = fp8 ? PLOW_CPU_TEN(in, T, 7) : NULL;
+    plow_bf16* const O_final0 = PLOW_CPU_TEN(in, T, 5);
+    const uint32_t n_q0 = in->i[0], n_kv0 = in->i[1], n_head = in->i[2], n_kv_head = in->i[3];
+    const uint32_t q_pos00 = in->i[4], window = in->i[5], D = in->i[6];
+    const uint32_t nsplit0 = in->i[7] ? in->i[7] : 1u;
     const float scale = in->fj[0].f;
     const uint32_t kv_stride = in->fj[1].u, kv_mask = in->fj[2].u;
     if (D > 512u) return;
     const uint32_t gqa = n_head / n_kv_head;
-    const uint32_t q_tiles = (n_q + FA_BQ_TILE - 1) / FA_BQ_TILE;
-    const uint32_t n_work = q_tiles * n_head * nsplit;
+    const PlowCpuPack* pk = ctx ? ctx->pack : NULL;
+    const uint32_t n_work = plow_pf_units(pk, n_q0, n_head, nsplit0);
+    /* Partials: [row][head][split][hd] at row-split offsets (unpacked: row * nsplit). */
+    float* const Opart = pk ? pk->opart : Opart0;
+    float* const mlpart = pk ? pk->mlpart : mlpart0;
     float acc[512];
 
-    for (uint32_t w = slice; w < n_work; w += nblk) {
-        const uint32_t sp = w % nsplit, h = (w / nsplit) % n_head, qt = w / (nsplit * n_head);
+    for (uint32_t w0 = slice; w0 < n_work; w0 += nblk) {
+        const PlowPfView pv = plow_pf_view(pk, w0, n_q0, q_pos00, n_kv0, nsplit0, n_head,
+                                           (size_t)n_kv_head * kv_stride * D);
+        const uint32_t n_q = pv.n_q, n_kv = pv.n_kv, q_pos0 = pv.q_pos0, nsplit = pv.nsplit;
+        const plow_bf16* Q = Q0 + (size_t)pv.row0 * n_head * D;
+        /* An fp8 cache is one byte per element. */
+        const size_t kv_bytes = pv.kv_off * (fp8 ? 1u : sizeof(plow_bf16));
+        const plow_bf16* K = (const plow_bf16*)((const uint8_t*)K0 + kv_bytes);
+        const plow_bf16* V = (const plow_bf16*)((const uint8_t*)V0 + kv_bytes);
+        const float* ks = ks0 ? ks0 + pv.kv_off / D : NULL;
+        const float* vs = vs0 ? vs0 + pv.kv_off / D : NULL;
+        plow_bf16* O_final = O_final0 ? O_final0 + (size_t)pv.row0 * n_head * D : NULL;
+        const uint32_t sp = pv.sp, h = pv.h, qt = pv.qt;
         const uint32_t hkv = h / gqa;
         const uint32_t q_base = qt * FA_BQ_TILE;
         /* The split carves the TILE's causal/window-valid KV range, in whole FA_BKV tiles. */
@@ -51,11 +65,8 @@ G_K(g_flash_prefill) {
         const uint32_t q_tile_first = q_pos0 + q_base;
         const uint32_t win_lo = (window && q_tile_first >= window) ? q_tile_first - window + 1 : 0;
         const uint32_t kv_lo = (win_lo / FA_BKV) * FA_BKV;
-        const uint32_t tiles_kv = kv_end > kv_lo ? (kv_end - kv_lo + FA_BKV - 1) / FA_BKV : 0u;
-        const uint32_t per = (tiles_kv + nsplit - 1) / nsplit;
-        const uint32_t my_lo = kv_lo + sp * per * FA_BKV;
-        uint32_t my_hi = kv_lo + (sp + 1) * per * FA_BKV;
-        if (my_hi > kv_end) my_hi = kv_end;
+        uint32_t my_lo, my_hi;
+        plow_pf_split_range(&pv, kv_lo, kv_end, FA_BKV, &my_lo, &my_hi);
 
         for (uint32_t qi = q_base; qi < q_base + FA_BQ_TILE && qi < n_q; qi++) {
             const plow_bf16* q = Q + ((size_t)qi * n_head + h) * D;
@@ -75,15 +86,17 @@ G_K(g_flash_prefill) {
                 m = mnew;
                 for (uint32_t d = 0; d < D; d++) acc[d] = acc[d] * corr + pe * kv_value(V, vs, row, D, d);
             }
-            if (nsplit == 1u && O_final) {
+            if (nsplit == 1u && O_final && !pk) {
                 const float inv = l > 0.0f ? 1.0f / l : 0.0f;
                 plow_bf16* orow = O_final + ((size_t)qi * n_head + h) * D;
                 for (uint32_t d = 0; d < D; d++) orow[d] = plow_f2bf(acc[d] * inv);
                 continue;
             }
-            float* op = Opart + ((size_t)(qi * n_head + h) * nsplit + sp) * D;
+            const size_t rs = pk ? pk->row_off[pv.row0 + qi] : (size_t)qi * nsplit;
+            const size_t at = rs * n_head + (size_t)h * nsplit + sp;
+            float* op = Opart + at * D;
             memcpy(op, acc, sizeof(float) * D);
-            float* ml = mlpart + ((size_t)(qi * n_head + h) * nsplit + sp) * 2;
+            float* ml = mlpart + at * 2;
             ml[0] = m;
             ml[1] = l;
         }
@@ -169,12 +182,12 @@ G_K(g_flash_decode) {
  * Sinks (GPT-OSS): one extra UNSCALED logit per head that has no value row. It enters the
  * softmax denominator exactly once, here: gm' = max(gm, sink_h), gl' = gl*e^(gm-gm') + e^(sink_h-gm'). */
 G_K(g_flash_merge) {
-    (void)ctx;
+    const PlowCpuPack* pk = ctx ? ctx->pack : NULL;
     plow_bf16* O = PLOW_CPU_TEN(in, T, 0);
-    const float* Opart = PLOW_CPU_TEN(in, T, 1);
-    const float* mlpart = PLOW_CPU_TEN(in, T, 2);
+    const float* Opart = pk ? pk->opart : PLOW_CPU_TEN(in, T, 1);
+    const float* mlpart = pk ? pk->mlpart : PLOW_CPU_TEN(in, T, 2);
     const PLOW_SINK_T* sinks = PLOW_CPU_TEN(in, T, 3);
-    const uint32_t n_batch = in->i[0], n_head = in->i[1], nsplit = in->i[2], D = in->i[3];
+    const uint32_t n_batch = in->i[0], n_head = in->i[1], nsplit0 = in->i[2], D = in->i[3];
     const uint32_t n_bh = n_batch * n_head;
     if (n_bh == 0u) return;
     const uint32_t dsplit = (nblk + n_bh - 1) / n_bh;
@@ -183,7 +196,11 @@ G_K(g_flash_merge) {
     for (uint32_t w = slice; w < n_work; w += nblk) {
         const uint32_t dp = w % dsplit, hb = w / dsplit;
         const uint32_t d0 = dp * dchunk, d1 = d0 + dchunk < D ? d0 + dchunk : D;
-        const float* ml = mlpart + (size_t)hb * nsplit * 2;
+        const uint32_t r = hb / n_head, hh = hb % n_head;
+        if (pk && r >= pk->rows) continue; /* padding past the pack: no partials */
+        const uint32_t nsplit = pk ? pk->row_off[r + 1] - pk->row_off[r] : nsplit0;
+        const size_t at = (pk ? (size_t)pk->row_off[r] * n_head : (size_t)r * n_head * nsplit) + (size_t)hh * nsplit;
+        const float* ml = mlpart + at * 2;
         float gm = G_NEG_INF;
         for (uint32_t s = 0; s < nsplit; s++) gm = gm > ml[s * 2] ? gm : ml[s * 2];
         const float sink = sinks ? PLOW_SINK_LOAD(sinks[hb % n_head]) : G_NEG_INF;
@@ -192,7 +209,7 @@ G_K(g_flash_merge) {
         for (uint32_t s = 0; s < nsplit; s++)
             if (ml[s * 2] != G_NEG_INF) gl += ml[s * 2 + 1] * expf(ml[s * 2] - gm);
         const float inv = gl > 0.0f ? 1.0f / gl : 0.0f;
-        const float* obase = Opart + (size_t)hb * nsplit * D;
+        const float* obase = Opart + at * D;
         for (uint32_t d = d0; d < d1; d++) {
             float acc = 0.0f;
             for (uint32_t s = 0; s < nsplit; s++)
