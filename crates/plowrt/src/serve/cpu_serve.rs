@@ -343,13 +343,15 @@ impl CpuServe {
             // A slot mid-prefill is parked on its frontier row: the batched step's KV write
             // for a non-fed slot lands on `pos`, and the frontier row is exactly the one the
             // next chunk rewrites — rows `[0, pf_pos)` stay intact. Idle slots park the same way
-            // on `kept`, so rows `[0, kept)` survive for a session resume.
+            // on `kept`, so rows `[0, kept)` survive for a session resume. A parked slot's output
+            // is discarded, so it attends over one row: a retained 16K session below the live
+            // extent would otherwise stream its whole KV every step.
             let (p, k) = if self.live[s] {
                 (self.pos[s], self.pos[s] + 1)
             } else if self.pf_pos[s] > 0 {
-                (self.pf_pos[s], self.pf_pos[s] + 1)
+                (self.pf_pos[s], 1)
             } else {
-                (self.kept[s], self.kept[s] + 1)
+                (self.kept[s], 1)
             };
             self.pos_stage[s] = p;
             self.kvlen_stage[s] = k;
