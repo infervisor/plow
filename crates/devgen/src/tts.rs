@@ -47,7 +47,9 @@ pub const VEENA: SpeechProfile = SpeechProfile {
     frame_samples: 2048,
     audio_token_base: 128266,
     per_char_frames: 1.3,
-    max_new_tokens_cap: 700,
+    // The model card's 700 (8.3 s) clipped inputs from ~110 characters. At 1400 the cap binds
+    // past 151 characters, and the runtime splits longer inputs into segments.
+    max_new_tokens_cap: 1400,
     temperature: 0.4,
     top_p: 0.9,
 };
@@ -66,8 +68,10 @@ pub const ORPHEUS: SpeechProfile = SpeechProfile {
     codebook: 4096,
     frame_samples: 2048,
     audio_token_base: 128266,
-    per_char_frames: 1.3,
-    max_new_tokens_cap: 1200,
+    // Orpheus voices speak down to ~8 characters/s; 1.3 frames (9 chars/s) clipped the slow tail.
+    // The cap binds past 141 characters, and the runtime splits longer inputs into segments.
+    per_char_frames: 1.8,
+    max_new_tokens_cap: 1800,
     temperature: 0.6,
     top_p: 0.8,
 };

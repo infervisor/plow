@@ -165,6 +165,15 @@ pub struct RuntimeConfig {
     #[arg(long = "tts-first-lookahead", env = "PLOW_TTS_FIRST_LOOKAHEAD", default_value_t = 1, global = true)]
     pub tts_first_lookahead: usize,
 
+    /// Real-time admission of codec-LM speech (`tts::realtime`): a request starts only while the
+    /// decode step projected at one more request keeps every playing stream ahead of playback.
+    #[arg(long = "tts-realtime", env = "PLOW_TTS_REALTIME", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub tts_realtime: bool,
+
+    /// Longest a speech request waits for real-time admission before 429 + `Retry-After`.
+    #[arg(long = "tts-admit-wait-ms", env = "PLOW_TTS_ADMIT_WAIT_MS", default_value_t = 6000, global = true)]
+    pub tts_admit_wait_ms: u64,
+
     /// Share of a streaming ASR session's time its partial transcripts may keep the model busy:
     /// after a partial that took `t`, the session's appends answer the previous partial's text
     /// until `t * (1 / duty - 1)` has passed. Idle, partials take far less than the 1 s append

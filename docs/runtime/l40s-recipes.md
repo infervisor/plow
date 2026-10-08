@@ -178,5 +178,11 @@ streamed and whole, mixed languages on MTL; 2% client disconnects, 1% malformed 
 `/health` answered 200 on every 1 s sample; no panic, CUDA error or restart; latency back to warm
 levels within 10 s of recovery; GPU memory and RSS step up at peak concurrency and hold flat
 through recovery. Gemma and TTS queue rather than shed, so 3x bursts stretch their tails (Gemma
-TTFT p99 10.5 s, Chatterbox TTFA p99 18.7 s). Orpheus and Veena packets cap a request at 1200 /
-700 generated tokens (~14.6 / 8.5 s of audio): longer input is cut short with a 200.
+TTFT p99 10.5 s, Chatterbox TTFA p99 18.7 s). Orpheus and Veena (v7 packets) capped a request at
+1200 / 700 generated tokens (~14.6 / 8.5 s of audio) and cut longer input short with a 200; since
+then long input is segmented and codec-LM streams are admitted against real time
+([tts.md](tts.md#long-inputs-and-real-time-admission-codec-lm-veena-orpheus)): Veena soak at knee 48
+0 5xx, underrun >100 ms 0% sustained / 0.4% overload / 2% burst (rest shed with 429 +
+Retry-After), CER 0.005; Orpheus holds 0% sustained only at knee 32 (full-length audio is 37% longer
+than the clipped v7 audio the old knee of 48 was measured with), and still underruns 10-22% of
+admitted streams under 2-3x overload.
