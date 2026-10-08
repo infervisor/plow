@@ -10,7 +10,7 @@
  *   B  activation broadcast + per-die reduction: write 256 B to this core's slot of a per-SNC-node array,
  *      read all slots of the node (32 x 256 B), and a 10 KiB shared hidden vector rewritten by one core
  *   C  KV streaming from DRAM: L2R_KV_STEP bytes (default 256 KiB) of a per-core L2R_KV_BYTES buffer
- *      (default 256 MiB), VDPBF16PS over it, cursor advancing
+ *      (default 256 MiB), VDPBF16PS over it, cursor advancing; L2R_GAP_NS spins that long after each KV phase (C/D/E)
  *   D  LLC-resident KV: same, over a per-core L2R_LLC_KV buffer (default 2 MiB, 180 MiB total < L3) plus
  *      L2R_HK_THREADS (default 6) housekeeping threads on cpus 0,1,32,33,64,65 streaming DRAM
  *   E  C plus an attention-like dot over a resident 64 KiB q/score block (long run: pass secs 600/1800)
@@ -46,6 +46,7 @@ struct pl_measure { uint32_t id, pad; uint64_t lines, l1_l2, l3, dram, p50, cal_
 static int NT, CPUS[MAXT], LOCK, AMX, PLFD = -1;
 static char SCEN;
 static size_t WB, KVB, KVSTEP, LLCKV;
+static uint64_t GAP_CYC;
 static double SECS;
 static pthread_barrier_t bar;
 static volatile int stop_hk;
@@ -178,6 +179,7 @@ static void* run(void* arg) {
             acc = gemv_avx(kv + cur, KVSTEP, acc);
             cur += KVSTEP;
             if (SCEN == 'E') acc = gemv_avx(qblk, 64 << 10, acc);
+            if (GAP_CYC) { const uint64_t g = __rdtsc() + GAP_CYC; while (__rdtsc() < g) _mm_pause(); }
         }
     }
     if (AMX) { float o[256]; _tile_stored(0, o, 64); acc = _mm512_add_ps(acc, _mm512_set1_ps(o[1])); _tile_release(); }
@@ -208,6 +210,7 @@ int main(int argc, char** argv) {
     KVB = envsz("L2R_KV_BYTES", (size_t)256 << 20); KVSTEP = envsz("L2R_KV_STEP", 256 << 10) / 512 * 512;
     LLCKV = envsz("L2R_LLC_KV", (size_t)2 << 20);
     tsc_ghz = calib();
+    GAP_CYC = (uint64_t)(envsz("L2R_GAP_NS", 0) * tsc_ghz);
     if (AMX && syscall(SYS_arch_prctl, 0x1023, 18)) { perror("amx perm"); return 1; }
     struct pl_caps caps = {0};
     if (LOCK) {
