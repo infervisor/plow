@@ -876,7 +876,10 @@ pub fn spawn(
         let e = e.lock();
         (e.slot_resume_supported(), e.is_cuda() && e.prefix_cache_enabled(), e.kv_row_bytes())
     });
-    #[cfg(not(feature = "cuda"))]
+    #[cfg(all(not(feature = "cuda"), feature = "cpu"))]
+    let (resume_supported, prefix_cache, kv_row_bytes) =
+        (state.gpu_engine(&slug).is_some_and(|e| e.lock().slot_resume_supported()), false, 0);
+    #[cfg(not(any(feature = "cuda", feature = "cpu")))]
     let (resume_supported, prefix_cache, kv_row_bytes) = (false, false, 0);
     if let Some(b) = kv_budget {
         tracing::info!(
@@ -3486,6 +3489,16 @@ fn run_one_tick(
                     == 2
             {
                 for (i, slot_opt) in slots.iter_mut().enumerate().take(b) {
+                    if e.resume_before_pack() {
+                        if let Some(s) = slot_opt
+                            .as_mut()
+                            .filter(|s| s.step == 0 && s.pf_pos == 0 && s.resume > 0)
+                        {
+                            s.resume = if s.cfg.is_none() { e.resume_slot(i, s.resume) } else { 0 };
+                            s.pf_pos = s.resume;
+                            s.cached_tokens = s.resume;
+                        }
+                    }
                     let Some(slot) = slot_opt.as_ref().filter(|slot| slot.step == 0) else {
                         continue;
                     };
@@ -3612,6 +3625,16 @@ fn run_one_tick(
                 // prefix-cache hit would then run alone at the smallest rung that holds its
                 // suffix. Seed every waiting slot first so the suffix is a candidate here.
                 for (i, slot_opt) in slots.iter_mut().enumerate().take(b) {
+                    if e.resume_before_pack() {
+                        if let Some(s) = slot_opt
+                            .as_mut()
+                            .filter(|s| s.step == 0 && s.pf_pos == 0 && s.resume > 0)
+                        {
+                            s.resume = if s.cfg.is_none() { e.resume_slot(i, s.resume) } else { 0 };
+                            s.pf_pos = s.resume;
+                            s.cached_tokens = s.resume;
+                        }
+                    }
                     let Some(slot) = slot_opt
                         .as_ref()
                         .filter(|slot| slot.step == 0 && !slot.respond.is_closed())
@@ -3799,6 +3822,7 @@ fn run_one_tick(
                                         }
                                     }
                                 }
+                                seq_host_logprobs(&*e, slot, &mut slots[slot], token);
                                 handle_produced_token(
                                     &mut slots[slot],
                                     &arena,
@@ -4115,7 +4139,33 @@ fn run_one_tick(
                                         "AMD packed prefill fired"
                                     )
                                 });
-                                tracing::debug!(spans = packed.len(), "AMD packed prefill advanced")
+                                tracing::debug!(spans = packed.len(), "AMD packed prefill advanced");
+                                for span in &packed {
+                                    let i = span.slot as usize;
+                                    if let Some(s) = slots[i].as_mut() {
+                                        s.cached_tokens = e.cached_rows(i);
+                                    }
+                                }
+                                for (i, token) in e.take_packed_tokens() {
+                                    if let Some(s) = slots[i].as_mut() {
+                                        s.pf_pos = s.prompt_ids.len();
+                                    }
+                                    let t_tok = std::time::Instant::now();
+                                    seq_host_logprobs(&*e, i, &mut slots[i], token);
+                                    handle_produced_token(
+                                        &mut slots[i],
+                                        &arena,
+                                        bundle,
+                                        token,
+                                        1,
+                                        &mut tokens_this_tick,
+                                        Some(stop.as_slice()),
+                                    );
+                                    crate::obs::ttft::FIRST_TOK.add(t_tok.elapsed().as_nanos() as u64);
+                                    if slots[i].is_none() {
+                                        e.release(i);
+                                    }
+                                }
                             }
                             Err(err) => {
                                 tracing::warn!(
@@ -4152,6 +4202,13 @@ fn run_one_tick(
                     // AMD prefill and decode share scratch and run sequentially.
                     // This interval measures isolated prefill, not mixed-kernel overlap.
                     let pk_t = packlog::on().then(Instant::now);
+                    // A retained session's rows: the engine keeps them and prefills only the
+                    // suffix, or refuses and the prompt starts cold.
+                    if let Some(s) = slots[i].as_mut().filter(|s| s.pf_pos == 0 && s.resume > 0) {
+                        s.resume = if s.cfg.is_none() { e.resume_slot(i, s.resume) } else { 0 };
+                        s.pf_pos = s.resume;
+                        s.cached_tokens = s.resume;
+                    }
                     let slot_ref = slots[i].as_ref().expect("found above");
                     // §TTFT: everything between `mux.submit` and this line — the
                     // dispatcher wake, the formation hold, admission, and the
@@ -4197,6 +4254,7 @@ fn run_one_tick(
                             }
                             tracing::debug!(token, slot = i, "amd: prefill token");
                             let t_tok = std::time::Instant::now();
+                            seq_host_logprobs(&*e, i, &mut slots[i], token);
                             handle_produced_token(
                                 &mut slots[i],
                                 &arena,
@@ -4330,6 +4388,7 @@ fn run_one_tick(
                     for (i, token) in out {
                         tracing::debug!(token, slot = i, "amd: token");
                         let t_stream = crate::obs::dstep::on().then(Instant::now);
+                        seq_host_logprobs(&*e, i, &mut slots[i], token);
                         handle_produced_token(
                             &mut slots[i],
                             &arena,
@@ -5136,8 +5195,8 @@ fn gpu_prefill_batched_pass(
             let admitted = (|| -> Result<()> {
                 for row in [i, i + 1].into_iter().take(1 + pair as usize) {
                     let fresh = !e.packed_slot_ready(row);
-                    if fresh && request.resume > 0 && !e.resume_slot(row, request.resume) {
-                        request.resume = 0;
+                    if fresh && request.resume > 0 {
+                        request.resume = e.resume_slot(row, request.resume);
                     }
                     let Some(frontier) = e.admit_packed_slot(row, &request.prompt_ids, total)? else {
                         continue;
@@ -5476,11 +5535,12 @@ fn gpu_prefill_advance(
     fit_speech_budget(slot, e.max_ctx());
     let total = slot.prompt_ids.len() + slot.gen.max_tokens.max(1);
     if slot.pf_pos == 0 {
-        let resume = slot.resume > 0 && slot.cfg.is_none() && e.resume_slot(slot_idx, slot.resume);
+        let kept = if slot.resume > 0 && slot.cfg.is_none() { e.resume_slot(slot_idx, slot.resume) } else { 0 };
         e.begin_slot(slot_idx, total)?;
-        if resume {
-            slot.pf_pos = slot.resume;
-            slot.cached_tokens = slot.resume;
+        if kept > 0 {
+            slot.resume = kept;
+            slot.pf_pos = kept;
+            slot.cached_tokens = kept;
         }
         if let Some(ttl) = slot.session.as_ref().and_then(|s| s.pin_ttl()) {
             e.hold_session_prefix(slot_idx, ttl);
@@ -5874,6 +5934,19 @@ fn gpu_finish_token(
         return Ok(tok);
     }
     Ok(argmax_tok)
+}
+
+/// OpenAI logprobs for a single-sequence engine that exposes its logits to the host (CPU): only
+/// rows that asked for them pay the vocab read. The served token stays the engine's argmax.
+#[cfg(any(feature = "hsa", feature = "cpu"))]
+fn seq_host_logprobs(e: &dyn super::engine::SeqEngine, i: usize, slot: &mut Option<Slot>, token: u32) {
+    let Some(s) = slot.as_mut() else { return };
+    let Some(req) = s.gen.params.logprobs else { return };
+    let mut logits = Vec::new();
+    if e.logits_row(i, &mut logits) && (token as usize) < logits.len() {
+        let stats = crate::text::logprobs::RowStats::of(&logits, req);
+        s.lp = Some(Box::new(stats.finish(logits[token as usize])));
+    }
 }
 
 /// The top-k a greedy, unadjusted logprobs row asks the device stats kernel for; `None` when the

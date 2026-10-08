@@ -64,6 +64,8 @@ pub fn kernel_reservation_bytes(arch: Arch) -> u64 {
         // Apple GPU: 32 KiB threadgroup memory total; the interpreter's reductions and
         // counters take one 2 KiB slice (runtime/apple/interp.metal: red/keys/gate).
         Arch::AppleM3 | Arch::AppleM4 => 2 * 1024,
+        // CPU core: the L2 budget holds operand tiles only; no barrier/descriptor carve-out.
+        Arch::GraniteRapids => 0,
     }
 }
 

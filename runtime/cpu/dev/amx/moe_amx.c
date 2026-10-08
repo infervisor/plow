@@ -162,6 +162,39 @@ static uint32_t take_rows(const uint32_t* key, uint32_t* r, uint32_t rend, uint3
 #define X_K(name) \
     static void name(const PlowDevInst* in, uint32_t slice, uint32_t nblk, void* const* T, PlowCpuCtx* ctx)
 
+/* This slice's output columns of every expert, [n0[e], n1[e]), for an op whose experts each have
+ * `ncol` columns. An even split of E * ncol columns ignores how many tokens each expert got: on
+ * Gemma-4-26B-A4B a 1000-token prefill left workers 62% idle behind the slices that owned the busy
+ * experts. Each 32-column strip of expert e instead costs (its 32-token blocks + 1 for streaming the
+ * strip), and slices take contiguous equal-cost runs of strips, so a slice still owns a contiguous
+ * column range per expert and packs that expert's rows once. Experts with no rows cost nothing. */
+#define MOE_SPLIT_MAX_E 512u
+static int moe_slice_cols(const int32_t* meta, uint32_t E, uint32_t ncol, uint32_t slice, uint32_t nblk,
+                          uint32_t* n0, uint32_t* n1) {
+    if (E > MOE_SPLIT_MAX_E) return 0;
+    const uint32_t ns = (ncol + 31u) / 32u;
+    uint64_t total = 0;
+    for (uint32_t e = 0; e < E; e++)
+        if (meta[E + e] > 0) total += (uint64_t)ns * ((uint32_t)(meta[E + e] + 31) / 32u + 1u);
+    uint64_t cum = 0;
+    for (uint32_t e = 0; e < E; e++) {
+        n0[e] = n1[e] = 0;
+        if (meta[E + e] <= 0) continue;
+        const uint64_t c = (uint32_t)(meta[E + e] + 31) / 32u + 1u;
+        uint32_t lo = ns, hi = 0;
+        for (uint32_t s = 0; s < ns; s++, cum += c) {
+            if (cum * nblk / total != slice) continue;
+            if (s < lo) lo = s;
+            hi = s + 1u;
+        }
+        if (lo < hi) {
+            n0[e] = lo * 32u;
+            n1[e] = hi * 32u < ncol ? hi * 32u : ncol;
+        }
+    }
+    return 1;
+}
+
 /* 75: t0=fu_g([rows][I]) t1=xn2([T][H]) t2=ewt t3=meta t4=row_token  i0=I i1=H i2=E i5=act. */
 X_K(x_moe_group_glu_gemma_pf) {
     const uint32_t I = in->i[0], H = in->i[1], E = in->i[2], act = in->i[5];
@@ -181,12 +214,14 @@ X_K(x_moe_group_glu_gemma_pf) {
     float g[32 * 32] __attribute__((aligned(64)));
     float u[32 * 32] __attribute__((aligned(64)));
     float of[32] __attribute__((aligned(64)));
-    uint32_t lo, hi;
-    g_range(E * I, slice, nblk, &lo, &hi);
-    for (uint32_t idx = lo; idx < hi;) {
-        const uint32_t e = idx / I, n0 = idx - e * I;
-        const uint32_t n1 = n0 + (hi - idx) < I ? n0 + (hi - idx) : I;
-        idx += n1 - n0;
+    uint32_t c0[MOE_SPLIT_MAX_E], c1[MOE_SPLIT_MAX_E];
+    if (!moe_slice_cols(meta, E, I, slice, nblk, c0, c1)) {
+        g_moe_group_glu_gemma_pf(in, slice, nblk, T, ctx);
+        return;
+    }
+    for (uint32_t e = 0; e < E; e++) {
+        const uint32_t n0 = c0[e], n1 = c1[e];
+        if (n0 >= n1) continue;
         const uint32_t r0 = (uint32_t)meta[e], rend = r0 + (uint32_t)meta[E + e];
         const plow_bf16* gu = ewt_base(ewt, e, 0);
         if (rend == r0 || !gu) continue;
@@ -230,12 +265,14 @@ X_K(x_moe_group_down_gemma_pf) {
     const plow_bf16* rowp[XM_MAX];
     uint32_t rows[XM_MAX];
     float o[32 * 32] __attribute__((aligned(64)));
-    uint32_t lo, hi;
-    g_range(E * H, slice, nblk, &lo, &hi);
-    for (uint32_t idx = lo; idx < hi;) {
-        const uint32_t e = idx / H, h0 = idx - e * H;
-        const uint32_t h1 = h0 + (hi - idx) < H ? h0 + (hi - idx) : H;
-        idx += h1 - h0;
+    uint32_t c0[MOE_SPLIT_MAX_E], c1[MOE_SPLIT_MAX_E];
+    if (!moe_slice_cols(meta, E, H, slice, nblk, c0, c1)) {
+        g_moe_group_down_gemma_pf(in, slice, nblk, T, ctx);
+        return;
+    }
+    for (uint32_t e = 0; e < E; e++) {
+        const uint32_t h0 = c0[e], h1 = c1[e];
+        if (h0 >= h1) continue;
         const uint32_t r0 = (uint32_t)meta[e], rend = r0 + (uint32_t)meta[E + e];
         const plow_bf16* dn = ewt_base(ewt, e, 1);
         if (rend == r0 || !dn) continue;

@@ -728,6 +728,36 @@ pub struct CpuRuntimeConfig {
     /// any node busier than the round-robin even when this is on.
     #[arg(long = "cpu-l2-place", env = "PLOW_CPU_L2_PLACE", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub l2_place: bool,
+
+    /// Pseudo-lock the head of each worker's scratch into its core's L2 through
+    /// `/dev/pseudo_lock` (runtime/cpu/driver). Inert when the driver is not loaded.
+    #[arg(long = "cpu-sram", env = "PLOW_CPU_SRAM", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub sram: bool,
+
+    /// Bind each decode GEMV slice's weight rows to the NUMA node of the executor that streams
+    /// them (instead of page-interleaving every weight across the nodes).
+    #[arg(long = "cpu-weight-affine", env = "PLOW_CPU_WEIGHT_AFFINE", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub weight_affine: bool,
+
+    /// Serve weights read only as embedding-gather tables from the mmapped checkpoint instead
+    /// of copying them (only gathered rows become resident).
+    #[arg(long = "cpu-mmap-gather", env = "PLOW_CPU_MMAP_GATHER", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub mmap_gather: bool,
+
+    /// While a static worker waits on its next entry's gates, prefetch that slice's decode GEMV
+    /// weight rows into L2.
+    #[arg(long = "cpu-gate-pf", env = "PLOW_CPU_GATE_PF", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub gate_pf: bool,
+
+    /// A fresh prompt copies the KV rows of its longest common prefix from another slot
+    /// (live, mid-prefill or released) and prefills only the rest.
+    #[arg(long = "cpu-prefix-share", env = "PLOW_CPU_PREFIX_SHARE", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub prefix_share: bool,
+
+    /// Prefill the waiting requests' prompts together in one launch (rows concatenated, each
+    /// span attending only its own slot's KV), so the weights stream once per tick, not per prompt.
+    #[arg(long = "cpu-pack-prefill", env = "PLOW_CPU_PACK_PREFILL", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub pack_prefill: bool,
 }
 
 /// NVIDIA / sm_120 runtime knobs.

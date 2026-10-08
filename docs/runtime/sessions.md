@@ -136,6 +136,12 @@ Two mechanisms, one per KV layout, never both:
   `usage.prompt_tokens_details.cached_tokens`; the header says `prefix-cache`. The prefix cache
   stays off for overlay packets (their rows are not keyed by ids).
 
+The CPU engine retains slots the same way (`CpuServe::resume_slot`): a released slot keeps its
+rows, idle slots park on the kept row so the batched decode step never rewrites them, and the
+next turn prefills only its suffix. A resume may drop at most the smallest sliding ring's
+`stride - window` tail rows. Gemma-4-E2B, 4-turn chat: ~90% of later turns' prompt tokens
+cached, reply logprobs within 0.11 of a cold prefill (BF16 path difference, not bit-exact).
+
 Other backends echo and dedupe the headers and retain nothing.
 
 ## Streaming transcription (`/v1/audio/transcriptions`)

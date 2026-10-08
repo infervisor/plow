@@ -128,9 +128,13 @@ const CDNA4: [MmaShape; 2] = [
 /// matrix shape the ISA offers, so every tile is a multiple of 8 on each axis.
 const APPLE: &[MmaShape] = &[MmaShape { m: 8, n: 8, k: 8 }];
 
+/// AMX `TDPBF16PS`: a 16x16 fp32 accumulator tile from 16x32 / 32x16 bf16 operand tiles.
+const AMX: &[MmaShape] = &[MmaShape { m: 16, n: 16, k: 32 }];
+
 pub fn shapes_for(arch: Arch) -> &'static [MmaShape] {
     match arch {
         Arch::AppleM3 | Arch::AppleM4 => APPLE,
+        Arch::GraniteRapids => AMX,
         Arch::AdaLovelace => &ADA,
         Arch::Hopper => &HOPPER,
         Arch::Blackwell => &BLACKWELL,

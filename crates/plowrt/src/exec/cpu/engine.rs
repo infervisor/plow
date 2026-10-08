@@ -116,6 +116,8 @@ pub struct HostTensor {
     ptr: *mut u8,
     layout: Layout,
     pub bytes: usize,
+    /// A view into memory someone else owns (the mmapped checkpoint); never freed here.
+    borrowed: bool,
 }
 
 // SAFETY: plain heap memory; concurrent access is disjoint by the schedule,
@@ -123,7 +125,132 @@ pub struct HostTensor {
 unsafe impl Send for HostTensor {}
 unsafe impl Sync for HostTensor {}
 
+/// Per weight tensor, the `(byte offset, length, node)` ranges the decode program's GEMV slices
+/// stream: slice `s` of an op owns rows `g_range(N, s, blocks)` (runtime/cpu/dev/golden/golden.h)
+/// and runs on cu `c`, whose executor sits on `nodes[c % nodes.len()]` (`workers::cu_map`
+/// without a locality plan). Taken from the narrowest decode rung; the others slice identically.
+/// Drop our mapping of a copied checkpoint range: the copy is the live tensor, and the shared file
+/// pages would otherwise stay mapped (and counted in Pss) for the server's lifetime.
+fn release_mapped(src: &[u8]) {
+    let a = (src.as_ptr() as usize).next_multiple_of(4096);
+    let z = (src.as_ptr() as usize + src.len()) & !4095;
+    if z > a {
+        // SAFETY: advice on whole pages inside our read-only checkpoint mapping; a later reader
+        // faults them back in from the file. Partial edge pages (shared with neighbours) stay.
+        unsafe { libc::madvise(a as *mut c_void, z - a, libc::MADV_DONTNEED) };
+    }
+}
+
+/// Tensors whose every use in every program is the table operand (t[1]) of an EMBED gather.
+fn gather_only_tensors(blob: &DevBlob) -> rustc_hash::FxHashSet<usize> {
+    use packet::dev::DevOp;
+    let mut gather: rustc_hash::FxHashSet<usize> = Default::default();
+    let mut other: rustc_hash::FxHashSet<usize> = Default::default();
+    for d in blob.progs.iter().flat_map(|p| &p.insts) {
+        for (k, &t) in d.t.iter().enumerate() {
+            if t == packet::dev::TENSOR_NONE16 {
+                continue;
+            }
+            if d.op == DevOp::Embed as u16 && k == 1 {
+                gather.insert(t as usize);
+            } else {
+                other.insert(t as usize);
+            }
+        }
+    }
+    gather.retain(|h| !other.contains(h));
+    gather
+}
+
+fn weight_affinity(
+    blob: &DevBlob,
+    nodes: &[u32],
+) -> rustc_hash::FxHashMap<usize, Vec<(usize, usize, u32)>> {
+    use packet::dev::DevOp;
+    let mut map: rustc_hash::FxHashMap<usize, Vec<(usize, usize, u32)>> = Default::default();
+    let pt: Vec<u32> = blob.progs.iter().map(|p| p.t).collect();
+    let Some(p) = blob.progs.get(packet::devbuild::decode_rung_lo(&pt)) else {
+        return map;
+    };
+    let g_range = |n: u32, slice: u32, nblk: u32| {
+        let per = n.div_ceil(nblk.max(1));
+        ((slice * per).min(n), (slice * per + per).min(n))
+    };
+    for cu in 0..(blob.n_cu as usize).min(p.stream_ofs.len()) {
+        let node = nodes[cu % nodes.len()];
+        let (o, l) = (p.stream_ofs[cu] as usize, p.stream_len[cu] as usize);
+        for e in &p.stream[o..o + l] {
+            let d = &p.insts[e.inst as usize];
+            let mut add = |t: u16, row: usize, a: u32, b: u32| {
+                if b > a && t != packet::dev::TENSOR_NONE16 {
+                    map.entry(t as usize).or_default().push((a as usize * row, (b - a) as usize * row, node));
+                }
+            };
+            match DevOp::from_u16(d.op) {
+                Some(DevOp::Gemv) if d.i[3] == 0 => {
+                    let (a, b) = g_range(d.i[1], e.slice, d.blocks as u32);
+                    add(d.t[2], d.i[2] as usize * 2, a, b);
+                }
+                Some(DevOp::GemvGlu) => {
+                    let (a, b) = g_range(d.i[1], e.slice, d.blocks as u32);
+                    add(d.t[2], d.i[2] as usize * 2, a, b);
+                    add(d.t[5], d.i[2] as usize * 2, a, b);
+                }
+                Some(DevOp::GemvQkv) => {
+                    let (nq, k, nk, nv) = (d.i[1], d.i[2] as usize * 2, d.i[3], d.i[4]);
+                    let (a, b) = g_range(nq + nk + nv, e.slice, d.blocks as u32);
+                    let mut s0 = 0u32;
+                    for (t, n) in [(d.t[2], nq), (d.t[4], nk), (d.t[6], nv)] {
+                        let (lo, hi) = (a.max(s0), b.min(s0 + n));
+                        if lo < hi {
+                            add(t, k, lo - s0, hi - s0);
+                        }
+                        s0 += n;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    map
+}
+
 impl HostTensor {
+    /// Re-bind whole pages of `[off, off + len)` to `node` before the first touch (a fresh
+    /// mapping from `alloc_on_nodes`); boundary pages keep the tensor's policy. Returns bytes bound.
+    fn bind_ranges(&self, ranges: &[(usize, usize, u32)]) -> usize {
+        let mut bound = 0usize;
+        #[cfg(target_os = "linux")]
+        for &(off, len, node) in ranges {
+            let start = (self.ptr as usize + off).next_multiple_of(4096);
+            let end = (self.ptr as usize + (off + len).min(self.bytes)) & !4095;
+            if end <= start || self.layout.align() != HUGE {
+                continue;
+            }
+            let mut mask = [0u64; 4];
+            mask[node as usize / 64] |= 1 << (node % 64);
+            // SAFETY: a sub-range of our own mapping; only placement policy changes.
+            let rc = unsafe {
+                libc::syscall(libc::SYS_mbind, start, end - start, libc::MPOL_BIND, mask.as_ptr(), 257usize, 0u32)
+            };
+            if rc == 0 {
+                bound += end - start;
+            }
+        }
+        bound
+    }
+
+    /// Zero-copy view of `bytes` at `ptr`, owned elsewhere for at least this tensor's lifetime.
+    fn borrowed(ptr: *const u8, bytes: usize) -> HostTensor {
+        HostTensor {
+            ptr: ptr as *mut u8,
+            layout: Layout::from_size_align(bytes.max(1), 1).expect("byte layout"),
+            bytes,
+            borrowed: true,
+        }
+    }
+
+    #[cfg(test)]
     fn alloc(bytes: usize, zeroed: bool) -> Result<HostTensor> {
         Self::alloc_on_nodes(bytes, zeroed, &[], false)
     }
@@ -216,7 +343,7 @@ impl HostTensor {
             // SAFETY: ptr/size describe our own mapping.
             unsafe { libc::madvise(ptr as *mut c_void, size, advice) };
         }
-        let tensor = HostTensor { ptr, layout, bytes };
+        let tensor = HostTensor { ptr, layout, bytes, borrowed: false };
         #[cfg(target_os = "linux")]
         if huge && !nodes.is_empty() {
             let maxnode = nodes.iter().copied().max().unwrap() as usize + 1;
@@ -260,6 +387,10 @@ impl HostTensor {
                 "explicit NUMA placement requires Linux".into(),
             ));
         }
+        // Linux: a fresh anonymous mapping already reads as zero, and mbind places each page at
+        // its first touch, so an explicit fill would only make the whole KV pool (every slot x
+        // every ring row) resident at load instead of as sequences write it.
+        #[cfg(not(target_os = "linux"))]
         if huge && zeroed {
             unsafe { std::ptr::write_bytes(ptr, 0, size) };
         }
@@ -280,6 +411,9 @@ impl HostTensor {
 
 impl Drop for HostTensor {
     fn drop(&mut self) {
+        if self.borrowed {
+            return;
+        }
         #[cfg(target_os = "linux")]
         if self.layout.align() == HUGE {
             unsafe { libc::munmap(self.ptr.cast(), self.layout.size()) };
@@ -382,6 +516,8 @@ pub struct CpuModel {
     pub kernels: Vec<KernelTable>,
     pub weight_bytes: u64,
     pub load_ms: f64,
+    /// Keeps the checkpoint mapped while borrowed (gather-only) tensors point into it.
+    _ckpt: Option<Checkpoint>,
 }
 
 // SAFETY: raw pointers are into `tensors`' own allocations.
@@ -459,6 +595,15 @@ fn validate_cpu_blob(blob: &DevBlob, language_model: bool) -> Result<()> {
     for (pi, p) in blob.progs.iter().enumerate() {
         if p.t == 0 {
             return Err(RuntimeError::Device(format!("program {pi} has T=0")));
+        }
+        // CPU FLASH_DECODE writes only the split partials; the NVIDIA decode merge-fold drops
+        // FLASH_MERGE and reuses j[1] (the CPU's kv mask), so such a packet decodes garbage.
+        let has = |op: DevOp| p.insts.iter().any(|d| d.op == op as u16);
+        if has(DevOp::FlashDecode) && !has(DevOp::FlashMerge) {
+            return Err(RuntimeError::Device(format!(
+                "program {pi} decodes without FLASH_MERGE (NVIDIA decode merge-fold); \
+                 emit CPU bundles with PLOW_NV_FA_FOLD_WIDE=0"
+            )));
         }
         for (ii, inst) in p.insts.iter().enumerate() {
             if inst.op as usize >= ffi::DOP_TABLE {
@@ -761,6 +906,42 @@ impl CpuModel {
         let mut names = Vec::with_capacity(blob.tensors.len());
         let mut wk = Wellknown::default();
         let mut weight_bytes = 0u64;
+        // PLOW_CPU_SRAM: decode re-reads every layer weight once per step, so each byte held in
+        // pseudo-locked L3 is a DRAM byte saved per step. Whole tensors are bound to the node
+        // whose locked ways hold them (SNC caches a line only in its home node's slices),
+        // round-robin while a node has budget; workers run in the driver's worker CLOS so their
+        // reads keep the lines in the locked ways (see `memory::sram`).
+        let sram = crate::config::RuntimeConfig::get()
+            .cpu
+            .sram
+            .then(crate::memory::sram::PseudoLock::global)
+            .flatten();
+        let lock_nodes: Vec<u32> = if nodes.is_empty() {
+            crate::exec::cpu::topology::Topology::detect().nodes
+        } else {
+            nodes.to_vec()
+        };
+        // PLOW_CPU_WEIGHT_AFFINE: bind each decode GEMV slice's weight rows to the node of the
+        // executor that streams them, instead of page-interleaving (2/3 remote on 3 nodes).
+        let affine = if crate::config::RuntimeConfig::get().cpu.weight_affine && nodes.len() > 1 {
+            weight_affinity(&blob, nodes)
+        } else {
+            rustc_hash::FxHashMap::default()
+        };
+        let mut affine_bytes = 0usize;
+        // PLOW_CPU_MMAP_GATHER: a weight read only as an EMBED table (row gather, e.g. Gemma-4
+        // E2B/E4B per-layer embeddings: 262144 x 35 x 256 bf16 = 4.7 GB) is served straight from the
+        // mmapped checkpoint; only the rows actually gathered become resident.
+        let gather_only: rustc_hash::FxHashSet<usize> = if crate::config::RuntimeConfig::get().cpu.mmap_gather {
+            gather_only_tensors(&blob)
+        } else {
+            Default::default()
+        };
+        let mut borrowed_bytes = 0usize;
+        let mut l3_left: Vec<usize> =
+            vec![sram.map_or(0, |d| d.caps.l3_lock_bytes_per_node as usize); lock_nodes.len()];
+        let mut l3_rr = 0usize;
+        let mut l3_locks: Vec<(usize, u32, usize)> = Vec::new();
         for (h, td) in blob.tensors.iter().enumerate() {
             let bytes = td.bytes as usize;
             match td.name.as_str() {
@@ -807,9 +988,40 @@ impl CpuModel {
                         src.len()
                     )));
                 }
-                let t = HostTensor::alloc_on_nodes(bytes, false, nodes, strict)?;
+                if gather_only.contains(&h) {
+                    borrowed_bytes += bytes;
+                    weight_bytes += td.bytes;
+                    tensors.push(HostTensor::borrowed(src.as_ptr(), bytes));
+                    names.push(td.name.clone());
+                    continue;
+                }
+                let lock_len = bytes.next_multiple_of(4096);
+                let hot = td.name.contains(".layers.") && !td.name.contains("embed") && bytes >= HUGE / 8;
+                let lock_node = (hot && !l3_left.is_empty())
+                    .then(|| {
+                        (0..l3_left.len())
+                            .map(|k| (l3_rr + k) % l3_left.len())
+                            .find(|&k| l3_left[k] >= lock_len)
+                    })
+                    .flatten();
+                let t = match lock_node {
+                    Some(k) => {
+                        l3_left[k] -= lock_len;
+                        l3_rr = k + 1;
+                        l3_locks.push((h, lock_nodes[k], lock_len));
+                        HostTensor::alloc_on_nodes(bytes, false, &lock_nodes[k..k + 1], false)?
+                    }
+                    None => {
+                        let t = HostTensor::alloc_on_nodes(bytes, false, nodes, strict)?;
+                        if let Some(ranges) = affine.get(&h) {
+                            affine_bytes += t.bind_ranges(ranges);
+                        }
+                        t
+                    }
+                };
                 // SAFETY: fresh allocation of `bytes`, no other reference yet.
                 unsafe { std::slice::from_raw_parts_mut(t.as_ptr(), t.bytes).copy_from_slice(src) };
+                release_mapped(src);
                 weight_bytes += td.bytes;
                 t
             } else if let Some(g) = gen_of.get(&(h as u32)) {
@@ -891,6 +1103,41 @@ impl CpuModel {
             }
             tracing::debug!(layer, experts = e, "moe: fused expert pointer table filled");
         }
+        if let Some(dev) = sram.filter(|_| !l3_locks.is_empty()) {
+            let (mut locked, mut held) = (0usize, 0.0f64);
+            for &(h, node, len) in &l3_locks {
+                let Some(cpu) = crate::exec::cpu::topology::first_cpu_of_node(node) else {
+                    continue;
+                };
+                // SAFETY: weight tensors live as long as the model; the pin ends at process exit.
+                match unsafe { dev.lock(tensors[h].as_ptr(), len, cpu, 3) } {
+                    Ok(m) => {
+                        locked += len;
+                        held += m.held(3) * len as f64;
+                    }
+                    Err(e) => tracing::warn!(tensor = %names[h], node, error = %e, "cpu: L3 pseudo-lock failed"),
+                }
+            }
+            tracing::info!(
+                tensors = l3_locks.len(),
+                locked_mib = locked >> 20,
+                held = format_args!("{:.3}", held / locked.max(1) as f64),
+                "cpu: decode weights pseudo-locked in L3"
+            );
+        }
+        if borrowed_bytes > 0 {
+            tracing::info!(
+                gib = format_args!("{:.2}", borrowed_bytes as f64 / (1u64 << 30) as f64),
+                "cpu: gather-only tables served from the mmapped checkpoint"
+            );
+        }
+        if !affine.is_empty() {
+            tracing::info!(
+                tensors = affine.len(),
+                bound_gib = format_args!("{:.2}", affine_bytes as f64 / (1u64 << 30) as f64),
+                "cpu: decode weights bound to their executors' nodes"
+            );
+        }
         let table = Arc::new(TensorTable::new(
             tensors.iter().map(|t| t.as_ptr() as *mut c_void).collect(),
         ));
@@ -961,6 +1208,7 @@ impl CpuModel {
             kernels,
             weight_bytes,
             load_ms,
+            _ckpt: ckpt,
         })
     }
 
@@ -1114,7 +1362,7 @@ impl CpuModel {
 // ---------------------------------------------------------------------------
 
 use std::cell::UnsafeCell;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 use std::sync::Arc;
 
 use crate::exec::counters::CounterPool;
@@ -1144,6 +1392,8 @@ pub struct KernelExec {
     table: Vec<Option<KernelFn>>,
     tensors: Arc<TensorTable>,
     slots: Vec<WorkerSlot>,
+    /// The engine's packed-prefill descriptor for the current run, or null.
+    pack: Arc<AtomicPtr<ffi::PlowCpuPack>>,
 }
 
 // SAFETY: `tensors` holds pointers into the model's allocations, which outlive
@@ -1152,8 +1402,16 @@ unsafe impl Send for KernelExec {}
 unsafe impl Sync for KernelExec {}
 
 impl KernelExec {
-    fn new(model: &CpuModel, workers: usize, worker_node: impl Fn(usize) -> u32) -> Result<Self> {
+    /// `worker_cpu(w)` = the `(cpu, node)` worker `w` is pinned to.
+    fn new(
+        model: &CpuModel,
+        workers: usize,
+        worker_cpu: impl Fn(usize) -> (u32, u32),
+        pack: Arc<AtomicPtr<ffi::PlowCpuPack>>,
+    ) -> Result<Self> {
         let mut table: Vec<Option<KernelFn>> = vec![None; ffi::DOP_TABLE];
+        // A packed prefill's head-only rerun turns the body into NOPs.
+        table[DevOp::Nop as usize] = ffi::kernel(DevOp::Nop as u16);
         for p in &model.blob.progs {
             for d in &p.insts {
                 let op = d.op as usize;
@@ -1163,10 +1421,35 @@ impl KernelExec {
             }
         }
         let scratch_bytes = ffi::scratch_bytes().max(64) as usize;
+        // PLOW_CPU_SRAM: hold the head of each worker's scratch (the AMX strip / A pad / C
+        // partial panels, < 1 MiB) in its core's pseudo-locked L2, so streamed weights cannot
+        // evict them. Scratch is node-local either way.
+        let sram = crate::config::RuntimeConfig::get()
+            .cpu
+            .sram
+            .then(crate::memory::sram::PseudoLock::global)
+            .flatten();
+        let (mut locked, mut held) = (0usize, 0.0f64);
         let mut slots = Vec::with_capacity(workers);
         for w in 0..workers {
-            let scratch = HostTensor::alloc(scratch_bytes, false)?;
-            let mut ctx = PlowCpuCtx::new(w as u32, worker_node(w));
+            let (cpu, node) = worker_cpu(w);
+            let scratch = HostTensor::alloc_on_nodes(scratch_bytes, false, &[node], false)?;
+            let mut sram_bytes = 0u64;
+            if let Some(dev) = sram {
+                let len = (dev.caps.l2_lock_bytes_per_core as usize).min(scratch_bytes) & !4095;
+                // SAFETY: the scratch mapping lives in `WorkerSlot` until the engine drops,
+                // and the driver releases the pin when the process closes the device.
+                match unsafe { dev.lock(scratch.as_ptr(), len, cpu, 2) } {
+                    Ok(m) => {
+                        locked += len;
+                        held += m.held(2);
+                        sram_bytes = len as u64;
+                    }
+                    Err(e) => tracing::warn!(worker = w, cpu, error = %e, "cpu: L2 pseudo-lock failed"),
+                }
+            }
+            let mut ctx = PlowCpuCtx::new(w as u32, node);
+            ctx.sram_bytes = sram_bytes;
             ctx.scratch = scratch.as_ptr() as *mut c_void;
             ctx.scratch_bytes = scratch_bytes as u32;
             slots.push(WorkerSlot {
@@ -1175,10 +1458,19 @@ impl KernelExec {
                 inited: AtomicBool::new(false),
             });
         }
+        if sram.is_some() {
+            tracing::info!(
+                workers,
+                locked_kib = locked >> 10,
+                held_mean = held / workers.max(1) as f64,
+                "cpu: worker scratch pseudo-locked in L2"
+            );
+        }
         Ok(KernelExec {
             table,
             tensors: Arc::clone(&model.table),
             slots,
+            pack,
         })
     }
 }
@@ -1203,9 +1495,62 @@ impl Exec for KernelExec {
                 inst.op
             )
         });
+        // Stored at a quiescent point before the run; the pool's run handoff orders it.
+        ctx.pack = self.pack.load(Ordering::Relaxed);
         // SAFETY: handles were validated at load (< n_tensors or NONE); the
         // kernel contract is the interpreter's (slice of nblk, disjoint work).
         unsafe { f(inst, slice, nblk, self.tensors.as_ptr(), ctx) };
+    }
+
+    fn prefetch(&self, d: &DevInst64, slice: u32, nblk: u32, cursor: &mut usize, lines: usize) -> bool {
+        const CAP: usize = 1 << 20;
+        // GLU kernels walk gate and up together in 32-row chunks.
+        const GLU_ROWS: usize = 32;
+        let per = |n: u32| n.div_ceil(nblk.max(1));
+        let range = |n: u32| ((slice * per(n)).min(n) as usize, (slice * per(n) + per(n)).min(n) as usize);
+        let base = |t: u16| self.tensors.get(t as usize) as usize;
+        let row = d.i[2] as usize * 2;
+        // (byte length of this slice's weight stream, address of stream byte `pos`)
+        let (total, addr): (usize, &dyn Fn(usize) -> usize) = match DevOp::from_u16(d.op) {
+            Some(DevOp::Gemv) if d.i[3] == 0 && d.t[2] != TENSOR_NONE16 => {
+                let (a, b) = range(d.i[1]);
+                let w = base(d.t[2]) + a * row;
+                ((b - a) * row, &move |p| w + p)
+            }
+            Some(DevOp::GemvGlu) if d.t[2] != TENSOR_NONE16 && d.t[5] != TENSOR_NONE16 => {
+                let (a, b) = range(d.i[1]);
+                let (g, u, ch) = (base(d.t[2]) + a * row, base(d.t[5]) + a * row, GLU_ROWS * row);
+                (2 * (b - a) * row, &move |p| {
+                    let (c, r) = (p / (2 * ch), p % (2 * ch));
+                    (if r < ch { g } else { u }) + c * ch + r % ch
+                })
+            }
+            Some(DevOp::GemvQkv) => {
+                let (nq, nk, nv) = (d.i[1] as usize, d.i[3] as usize, d.i[4] as usize);
+                let (a, b) = range((nq + nk + nv) as u32);
+                let spans = [(d.t[2], 0, nq), (d.t[4], nq, nk), (d.t[6], nq + nk, nv)];
+                if spans.iter().any(|&(t, s, n)| t == TENSOR_NONE16 && a.max(s) < b.min(s + n)) {
+                    return false;
+                }
+                ((b - a) * row, &move |p| {
+                    let r = a + p / row;
+                    let &(t, s, _) = spans.iter().rfind(|&&(_, s, _)| s <= r).unwrap();
+                    base(t) + (r - s) * row + p % row
+                })
+            }
+            _ => return false,
+        };
+        let end = total.min(CAP);
+        let stop = (*cursor + lines * 64).min(end);
+        while *cursor < stop {
+            #[cfg(target_arch = "x86_64")]
+            // SAFETY: prefetch never faults; the address lies inside a live weight tensor anyway.
+            unsafe {
+                std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T1 }>(addr(*cursor) as *const i8)
+            };
+            *cursor += 64;
+        }
+        *cursor < end
     }
 }
 
@@ -1775,6 +2120,119 @@ pub struct CpuEngine {
     pub threads: usize,
     /// Wall time of the last `run_prog`, for step telemetry.
     pub last_run_us: f64,
+    /// How this packet runs a packed (cross-request) prefill ([`pack_route`]); the refusal
+    /// reason otherwise.
+    pack: std::result::Result<PackRoute, String>,
+    pack_cell: Arc<AtomicPtr<ffi::PlowCpuPack>>,
+    /// Packed-run flash partials (`opart`, `mlpart`), sized for the worst pack.
+    pack_parts: Option<(HostTensor, HostTensor)>,
+    /// Absolute KV split of a packed FLASH_PREFILL ([`ffi::PlowCpuPack::split_rows`]).
+    split_rows: u32,
+}
+
+/// What a packed prefill needs to know about each prefill program (indexed like the buckets).
+#[derive(Debug)]
+pub struct PackRoute {
+    /// The lm_head instruction.
+    lm: Vec<usize>,
+    /// Every FLASH_PREFILL writes partials that a FLASH_MERGE reduces: the programs a pack (and
+    /// a chunk prefilled alone, as a one-member pack) runs on.
+    merge: Vec<bool>,
+    /// Largest `n_head * hd` and `n_head` over the attention sites (partial row sizes).
+    heads_d: usize,
+    heads: usize,
+}
+
+/// One request's rows in a packed prefill: `rows` are its prompt tokens at absolute positions
+/// `c0..`, written into KV slot `slot`; `sample` = this chunk ends the prompt and owes a token.
+#[derive(Clone, Copy, Debug)]
+pub struct PackMember<'a> {
+    pub slot: usize,
+    pub c0: u32,
+    pub rows: &'a [u32],
+    pub sample: bool,
+}
+
+/// Whether every prefill program can carry several requests in one launch, and if so each
+/// program's lm_head instruction. Every op must be row-independent, or one of those the pack
+/// descriptor rewires: the KV-writing HEADNORM_ROPE (per-row slot), FLASH_PREFILL (per-span
+/// slot, positions and KV length), and the trailing GEMM/SOFTCAP/ARGMAX/ARGMAX_FIN head.
+fn pack_route(model: &CpuModel) -> std::result::Result<PackRoute, String> {
+    if !cfg!(target_arch = "x86_64") {
+        return Err("the span-aware kernels are x86 only".into());
+    }
+    if model.batch < 2 || model.dec_ix == 0 {
+        return Err("one KV slot or no prefill program".into());
+    }
+    let slot_bytes = |h: u16| {
+        model
+            .kv_slot_stride
+            .iter()
+            .find(|e| e.0 == h as usize)
+            .map(|e| e.1)
+    };
+    let mut lm = Vec::with_capacity(model.dec_ix);
+    let mut merge = Vec::new();
+    let (mut heads_d, mut heads) = (0usize, 0usize);
+    for p in &model.blob.progs[..model.dec_ix] {
+        let (mut flash, mut merges, mut direct) = (0usize, 0usize, false);
+        let n = p.insts.len();
+        let is = |d: &DevInst64, op: DevOp| d.op == op as u16;
+        let head = n.checked_sub(4).map(|i| &p.insts[i..]).ok_or("empty prefill program")?;
+        if !(is(&head[0], DevOp::Gemm)
+            && model.wk.logits == Some(head[0].t[0] as usize)
+            && head[0].i[0] == 1
+            && is(&head[1], DevOp::SoftCap)
+            && is(&head[2], DevOp::Argmax)
+            && is(&head[3], DevOp::ArgmaxFin))
+        {
+            return Err("prefill head is not GEMM -> SOFTCAP -> ARGMAX -> ARGMAX_FIN".into());
+        }
+        for d in &p.insts[..n - 4] {
+            let Some(op) = DevOp::from_u16(d.op) else {
+                return Err(format!("unknown op {}", d.op));
+            };
+            match op {
+                DevOp::HeadNormRope if d.fj[1] != 0 => {
+                    let block = d.i[1] as u64 * d.fj[1] as u64 * d.i[2] as u64 * 2;
+                    if d.i[6] != 0 || slot_bytes(d.t[0]) != Some(block) {
+                        return Err("a KV write is not one [slot][head][row] block per slot".into());
+                    }
+                }
+                DevOp::FlashPrefill => {
+                    let block = d.i[3] as u64 * d.fj[1] as u64 * d.i[6] as u64 * 2;
+                    if slot_bytes(d.t[3]) != Some(block) || slot_bytes(d.t[4]) != Some(block) {
+                        return Err("a flash KV read is not one [slot][head][row] block per slot".into());
+                    }
+                    flash += 1;
+                    direct |= d.t[5] != TENSOR_NONE16;
+                    heads_d = heads_d.max(d.i[2] as usize * d.i[6] as usize);
+                    heads = heads.max(d.i[2] as usize);
+                }
+                DevOp::FlashMerge => merges += 1,
+                DevOp::HeadNormRope
+                | DevOp::Embed
+                | DevOp::Gemm
+                | DevOp::GemmGlu
+                | DevOp::GluStrided
+                | DevOp::RmsNorm
+                | DevOp::NormResidual
+                | DevOp::Residual
+                | DevOp::MoeRouterGemmaPf
+                | DevOp::MoeAlignGemmaPf
+                | DevOp::MoeGroupGluGemmaPf
+                | DevOp::MoeGroupDownGemmaPf
+                | DevOp::MoeCombineNormGemmaPf => {}
+                _ => return Err(format!("{} is not known to be row-independent", op.c_name())),
+            }
+        }
+        lm.push(n - 4);
+        merge.push(flash > 0 && merges == flash && !direct);
+    }
+    if !merge.iter().any(|&m| m) {
+        return Err("no prefill bucket reduces its attention with FLASH_MERGE".into());
+    }
+    Ok(PackRoute { lm, merge, heads_d, heads })
 }
 
 impl CpuEngine {
@@ -1891,7 +2349,17 @@ impl CpuEngine {
         // core, and that tax exceeded the gain — the same fp8 cell measured 626 / 132 with a logical
         // pool whose prefill was narrowed to 8. Fixing that needs the idle worker to stop polling,
         // which is the real prerequisite for per-phase widths.
-        let wants_logical = model.blob.progs.iter().any(dense_row_decode);
+        let sram_active = crate::config::RuntimeConfig::get().cpu.sram;
+        // Prevent SMT core thrashing: Both SMT siblings issue into the same TMUL and 512-bit
+        // FMA ports and share the core's private L2 cache. When AMX, AVX-512, or pseudo-locking
+        // SRAM is used, running on SMT siblings causes port contention, thermal throttling, and
+        // cache eviction. Pin workers strictly to physical cores (rank 0).
+        let avoid_smt = matches!(isa, Isa::Amx | Isa::Avx512) || sram_active;
+        let wants_logical = if avoid_smt {
+            false
+        } else {
+            model.blob.progs.iter().any(dense_row_decode)
+        };
         let threads = worker_width(
             opts.threads,
             threads.max(if wants_logical { logical_w } else { physical_w }),
@@ -1901,13 +2369,34 @@ impl CpuEngine {
         tracing::info!(
             threads,
             ?isa,
+            avoid_smt,
             physical_cores = topo.physical_cores(),
             "cpu: worker count"
         );
-        let placement = topo.worker_cpus(&nodes);
-        let exec = Arc::new(KernelExec::new(&model, threads, |w| {
-            placement[w % placement.len()].1
-        })?);
+        let placement = if avoid_smt {
+            topo.physical_worker_cpus(&nodes)
+        } else {
+            topo.worker_cpus(&nodes)
+        };
+        let pack_cell = Arc::new(AtomicPtr::new(std::ptr::null_mut()));
+        let exec = Arc::new(KernelExec::new(
+            &model,
+            threads,
+            |w| placement[w % placement.len()],
+            Arc::clone(&pack_cell),
+        )?);
+        if let Some(dev) = crate::config::RuntimeConfig::get()
+            .cpu
+            .sram
+            .then(crate::memory::sram::PseudoLock::global)
+            .flatten()
+        {
+            for &(cpu, _) in placement.iter().take(threads) {
+                if let Err(e) = dev.set_worker(cpu, true) {
+                    tracing::warn!(cpu, error = %e, "cpu: worker CLOS failed");
+                }
+            }
+        }
         // The packet's locality hint, mapped onto this host's nodes. Absent for an unplaced blob,
         // one node, or domains that do not divide over the nodes: placement stays cu % nodes.
         let cu_dom = crate::config::RuntimeConfig::get()
@@ -1969,6 +2458,39 @@ impl CpuEngine {
             max_ctx,
             "CPU engine ready"
         );
+        let pack = pack_route(&model);
+        // At most 16 splits per row at full context, never under 2048 keys: a whole number of
+        // the kernels' 32-key tiles, and up to 2K context one split per q tile, the same sums as
+        // an unsplit FLASH_PREFILL. Gemma-4-12B BF16 is sensitive to that partition on long
+        // prompts: 256-key splits moved its FP32-reference KL on a 1.5K-token doc 0.06 -> 0.60
+        // with every layer's attention as accurate as unsplit.
+        let split_rows = ((max_ctx.next_power_of_two() / 16) as u32).max(2048);
+        let pack_parts = match &pack {
+            Ok(r) => {
+                // Worst pack: the widest merged bucket of rows, each at full context.
+                let rows = (0..r.merge.len())
+                    .filter(|&p| r.merge[p])
+                    .map(|p| model.blob.progs[p].t as usize)
+                    .max()
+                    .unwrap_or(0);
+                let splits = rows * (max_ctx as u32).div_ceil(split_rows).max(1) as usize;
+                tracing::info!(
+                    max_rows = rows,
+                    split_rows,
+                    splits,
+                    mib = (splits * (r.heads_d + 2 * r.heads) * 4) >> 20,
+                    "cpu: packed prefill available"
+                );
+                Some((
+                    HostTensor::alloc_on_nodes(splits * r.heads_d * 4, false, &nodes, false)?,
+                    HostTensor::alloc_on_nodes(splits * r.heads * 2 * 4, false, &nodes, false)?,
+                ))
+            }
+            Err(why) => {
+                tracing::info!(why = %why, "cpu: packed prefill unavailable");
+                None
+            }
+        };
         Ok(CpuEngine {
             pool,
             model,
@@ -1978,6 +2500,10 @@ impl CpuEngine {
             isa,
             threads,
             last_run_us: 0.0,
+            pack,
+            pack_cell,
+            pack_parts,
+            split_rows,
         })
     }
 
@@ -2142,6 +2668,12 @@ impl CpuEngine {
     /// rebase, run the single-sequence prefill, restore the base — even on
     /// failure, since a table left on slot `s` would fold every decode into it).
     pub fn prefill_slot(&mut self, slot: usize, prompt: &[u32]) -> Result<u32> {
+        if self.pack.is_ok() && !prompt.is_empty() && prompt.len() < self.max_ctx {
+            for ch in plan_chunks(&self.prefill_buckets(), prompt.len() as u32) {
+                self.prefill_slot_chunk(slot, prompt, ch)?;
+            }
+            return self.last_token();
+        }
         self.model.kv_rebase(slot)?;
         let r = self.prefill(prompt);
         self.model.kv_rebase(0)?;
@@ -2149,11 +2681,242 @@ impl CpuEngine {
     }
 
     /// One chunk of a slot prefill (same rebase/restore discipline as [`Self::prefill_slot`]).
+    /// On a packed-prefill packet the chunk runs as a one-member pack, so its logits and KV are
+    /// the same bits whether it runs alone, in a pack, or after a reused prefix.
     pub fn prefill_slot_chunk(&mut self, slot: usize, prompt: &[u32], ch: Chunk) -> Result<()> {
+        let end = (ch.c0 + ch.clen) as usize;
+        if self.pack.as_ref().is_ok_and(|r| r.merge.get(ch.prog) == Some(&true))
+            && ch.clen > 0
+            && end <= prompt.len()
+        {
+            let m = PackMember {
+                slot,
+                c0: ch.c0,
+                rows: &prompt[ch.c0 as usize..end],
+                sample: true,
+            };
+            return self.run_pack(ch.prog, &[m]).map(|_| ());
+        }
         self.model.kv_rebase(slot)?;
         let r = self.prefill_chunk(prompt, ch);
         self.model.kv_rebase(0)?;
         r
+    }
+
+    /// The widest rows one packed launch carries, `None` = no packed prefill on this packet. A
+    /// chunk of at most this many rows prefilled alone runs a bucket a pack can reproduce.
+    pub fn pack_rows(&self) -> Option<u32> {
+        let r = self.pack.as_ref().ok()?;
+        self.prefill_buckets()
+            .into_iter()
+            .filter(|&(p, _)| r.merge[p])
+            .map(|(_, t)| t)
+            .max()
+    }
+
+    /// Prefill several requests' chunks in ONE launch of the narrowest merged bucket holding all
+    /// their rows, so the weights stream once for every member. Batch-invariant: attention splits
+    /// at absolute key positions and nothing else in a bucket depends on the launch's rows, so a
+    /// member's logits and KV are bit-identical to prefilling it alone. Returns the greedy next
+    /// token of each `sample` member in order; its softcapped logits are the same-numbered
+    /// `act.logits` row.
+    pub fn prefill_packed(&mut self, members: &[PackMember<'_>]) -> Result<Vec<u32>> {
+        let m: usize = members.iter().map(|mb| mb.rows.len()).sum();
+        let merge = match &self.pack {
+            Ok(r) => &r.merge,
+            Err(why) => {
+                return Err(RuntimeError::Rejected(format!(
+                    "packed prefill unavailable: {why}"
+                )))
+            }
+        };
+        let (prog, _) = self
+            .prefill_buckets()
+            .into_iter()
+            .filter(|&(p, t)| t as usize >= m && merge[p])
+            .min_by_key(|&(_, t)| t)
+            .ok_or_else(|| {
+                RuntimeError::Rejected(format!("no merged prefill bucket holds {m} packed rows"))
+            })?;
+        self.run_pack(prog, members)
+    }
+
+    fn run_pack(&mut self, prog: usize, members: &[PackMember<'_>]) -> Result<Vec<u32>> {
+        let route = match &self.pack {
+            Ok(r) => r,
+            Err(why) => {
+                return Err(RuntimeError::Rejected(format!(
+                    "packed prefill unavailable: {why}"
+                )))
+            }
+        };
+        if self.model.kv_slot != 0 {
+            return Err(RuntimeError::Device(
+                "packed prefill with the KV table rebased onto a slot".into(),
+            ));
+        }
+        let mut m = 0u32;
+        for (k, mb) in members.iter().enumerate() {
+            let end = (mb.c0 as usize).checked_add(mb.rows.len());
+            if mb.slot >= self.model.batch
+                || mb.rows.is_empty()
+                || end.is_none_or(|e| e > self.max_ctx)
+                || members[..k].iter().any(|o| o.slot == mb.slot)
+            {
+                return Err(RuntimeError::Rejected(format!(
+                    "bad packed prefill member: slot {} rows [{}, +{})",
+                    mb.slot,
+                    mb.c0,
+                    mb.rows.len()
+                )));
+            }
+            m += mb.rows.len() as u32;
+        }
+        let t = self.model.blob.progs[prog].t;
+        if prog >= route.merge.len() || !route.merge[prog] || m > t {
+            return Err(RuntimeError::Rejected(format!(
+                "prefill program {prog} cannot carry a {m}-row pack"
+            )));
+        }
+        let lm = route.lm[prog];
+        let (opart, mlpart) = self.pack_parts.as_ref().expect("packed prefill scratch");
+        // Each row carries every absolute split up to its q tile's last key
+        // (`plow_pf_tile_splits`).
+        let spl = self.split_rows;
+        let mut row_off = Vec::with_capacity(m as usize + 1);
+        row_off.push(0u32);
+        for mb in members {
+            let n = mb.rows.len() as u32;
+            for i in 0..n {
+                let tile_end = (mb.c0 + i / ffi::PF_TILE * ffi::PF_TILE + ffi::PF_TILE).min(mb.c0 + n);
+                row_off.push(row_off.last().unwrap() + tile_end.div_ceil(spl));
+            }
+        }
+        let splits = *row_off.last().unwrap() as usize;
+        if splits * route.heads_d * 4 > opart.bytes || splits * route.heads * 8 > mlpart.bytes {
+            return Err(RuntimeError::Rejected(format!(
+                "packed prefill needs {splits} attention partial rows, more than its scratch"
+            )));
+        }
+        let (opart, mlpart) = (opart.as_ptr().cast::<f32>(), mlpart.as_ptr().cast::<f32>());
+        let (t_ids, t_pos) = (
+            self.need(self.model.wk.ids, "in.ids")?,
+            self.need(self.model.wk.pos, "in.pos")?,
+        );
+        let mut spans = Vec::with_capacity(members.len());
+        let mut row_slot = vec![0u32; m as usize];
+        let mut samples = Vec::with_capacity(members.len());
+        {
+            let (it, pt) = (self.model.tensor(t_ids), self.model.tensor(t_pos));
+            // SAFETY: no run in flight; both tensors hold `t >= m` u32 rows (64-byte aligned).
+            let (ids, pos) = unsafe {
+                (
+                    std::slice::from_raw_parts_mut(it.as_ptr().cast::<u32>(), it.bytes / 4),
+                    std::slice::from_raw_parts_mut(pt.as_ptr().cast::<u32>(), pt.bytes / 4),
+                )
+            };
+            let mut row0 = 0u32;
+            for mb in members {
+                let n = mb.rows.len() as u32;
+                let r = row0 as usize..(row0 + n) as usize;
+                ids[r.clone()].copy_from_slice(mb.rows);
+                for (p, j) in pos[r.clone()].iter_mut().zip(mb.c0..) {
+                    *p = j;
+                }
+                row_slot[r].fill(mb.slot as u32);
+                spans.push(packet::dev::PrefillSpan {
+                    row0,
+                    n_rows: n,
+                    slot: mb.slot as u32,
+                    flags: 0,
+                    kv_row0: mb.c0,
+                    kv_len: mb.c0 + n,
+                    state_slot: mb.slot as u32,
+                    program: prog as u32,
+                });
+                if mb.sample {
+                    samples.push(row0 + n - 1);
+                }
+                row0 += n;
+            }
+            ids[m as usize..t as usize].fill(0);
+            pos[m as usize..t as usize].fill(0);
+        }
+        let desc = ffi::PlowCpuPack {
+            spans: spans.as_ptr(),
+            row_slot: row_slot.as_ptr(),
+            n_spans: spans.len() as u32,
+            rows: m,
+            split_rows: spl,
+            reserved0: 0,
+            row_off: row_off.as_ptr(),
+            opart,
+            mlpart,
+        };
+        let lp = Arc::make_mut(&mut self.progs[prog]);
+        lp.insts
+            .copy_from_slice(&self.model.blob.progs[prog].insts);
+        rebase_chunk_rows(&mut lp.insts, &self.model.names, 0, m, t, Some(t));
+        if let [row] = samples[..] {
+            lp.insts[lm].i[4] = row;
+        } else {
+            for d in &mut lp.insts[lm..] {
+                d.op = DevOp::Nop as u16;
+            }
+        }
+        // `desc` and the vectors it points into outlive the run; the cell is cleared before
+        // either is dropped, on every path.
+        self.pack_cell
+            .store(&desc as *const ffi::PlowCpuPack as *mut _, Ordering::Relaxed);
+        let ran = self.run_prog(prog);
+        self.pack_cell.store(std::ptr::null_mut(), Ordering::Relaxed);
+        ran?;
+        if samples.len() >= 2 {
+            self.packed_head(prog, lm, &samples)?;
+        }
+        Ok(self.read_ids(samples.len()))
+    }
+
+    /// The head of a packed prefill that owes several tokens: gather each sampled row of the
+    /// final-normed hidden into rows `0..S`, then rerun the program as its 4-op head alone at
+    /// `M = S` (the body NOPs), the same multi-row head a decode rung runs.
+    fn packed_head(&mut self, prog: usize, lm: usize, rows: &[u32]) -> Result<()> {
+        let pristine = &self.model.blob.progs[prog].insts;
+        let head = pristine[lm];
+        let (hn, k, vocab) = (head.t[1] as usize, head.i[2] as usize, head.i[1]);
+        let s = rows.len();
+        let amax = &pristine[lm + 2];
+        let row = k * 2;
+        let hn_t = self.model.tensor(hn);
+        let fits = s <= self.model.batch
+            && rows.iter().all(|&r| (r as usize + 1) * row <= hn_t.bytes)
+            && self.model.tensor(amax.t[0] as usize).bytes >= s * amax.blocks as usize * 8;
+        if !fits {
+            return Err(RuntimeError::Rejected(format!(
+                "packed prefill head cannot hold {s} sampled rows"
+            )));
+        }
+        let mut tmp = vec![0u8; s * row];
+        // SAFETY: quiescent point; every source and target row is inside `hn` (checked above).
+        unsafe {
+            let base = hn_t.as_ptr();
+            for (j, &r) in rows.iter().enumerate() {
+                std::ptr::copy_nonoverlapping(base.add(r as usize * row), tmp.as_mut_ptr().add(j * row), row);
+            }
+            std::ptr::copy_nonoverlapping(tmp.as_ptr(), base, s * row);
+        }
+        let lp = Arc::make_mut(&mut self.progs[prog]);
+        lp.insts.copy_from_slice(pristine);
+        for d in &mut lp.insts[..lm] {
+            d.op = DevOp::Nop as u16;
+        }
+        let s = s as u32;
+        lp.insts[lm].i[0] = s;
+        lp.insts[lm].i[4] = 0;
+        lp.insts[lm + 1].i[0] = s * vocab;
+        lp.insts[lm + 2].i[1] = s;
+        lp.insts[lm + 3].i[1] = s;
+        self.run_prog(prog)
     }
 
     /// One decode step for `pos.len()` sequence slots on the narrowest rung
@@ -2268,6 +3031,28 @@ impl CpuEngine {
         let t_ids = self.need(self.model.wk.ids, "in.ids")?;
         self.model.write_u32(t_ids, id);
         Ok(())
+    }
+
+    /// Row `row` of the bf16 `act.logits` tile ([slots][vocab], softcapped in place) as f32.
+    /// Prefill leaves its last row in row 0; a decode step leaves slot `s` in row `s`.
+    pub fn logits_row(&self, row: usize, out: &mut Vec<f32>) -> bool {
+        let Some(h) = self.model.wk.logits else {
+            return false;
+        };
+        let batch = self.model.batch.max(1);
+        // SAFETY: quiescent point between programs.
+        let s = unsafe { self.model.tensor(h).as_slice() };
+        if row >= batch || s.len() % (batch * 2) != 0 {
+            return false;
+        }
+        let vocab = s.len() / (batch * 2);
+        out.clear();
+        out.extend(
+            s[row * vocab * 2..(row + 1) * vocab * 2]
+                .chunks_exact(2)
+                .map(|c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16)),
+        );
+        true
     }
 
     /// The first `n` entries of `in.ids` (the device-sampled tokens per slot).

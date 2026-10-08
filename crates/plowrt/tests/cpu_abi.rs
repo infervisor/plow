@@ -43,9 +43,23 @@ fn ctx_layout_matches_c() {
             offset_of!(PlowCpuCtx, isa)
         );
         assert_eq!(
+            abi::plow_cpu_abi_offsetof_ctx_pack(),
+            offset_of!(PlowCpuCtx, pack)
+        );
+        assert_eq!(
             abi::plow_cpu_abi_offsetof_ctx_reserved(),
             offset_of!(PlowCpuCtx, reserved)
         );
+        assert_eq!(abi::plow_cpu_abi_sizeof_pack(), size_of::<ffi::PlowCpuPack>());
+        assert_eq!(
+            abi::plow_cpu_abi_offsetof_pack_split_rows(),
+            offset_of!(ffi::PlowCpuPack, split_rows)
+        );
+        assert_eq!(
+            abi::plow_cpu_abi_offsetof_pack_row_off(),
+            offset_of!(ffi::PlowCpuPack, row_off)
+        );
+        assert_eq!(abi::plow_cpu_abi_pf_tile(), ffi::PF_TILE as usize);
     }
 }
 

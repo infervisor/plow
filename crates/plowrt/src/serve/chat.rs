@@ -328,10 +328,10 @@ async fn chat_completions_with(
             )
         }
     };
-    if gen.params.logprobs.is_some() && !cfg!(feature = "cuda") {
+    if gen.params.logprobs.is_some() && !cfg!(any(feature = "cuda", feature = "cpu")) {
         return crate::serve::api_error(
             axum::http::StatusCode::BAD_REQUEST,
-            "`logprobs` is served by the CUDA engine only",
+            "`logprobs` is served by the CUDA and CPU engines only",
             "invalid_request_error",
             Some("unsupported_parameter"),
             Some("logprobs".into()),

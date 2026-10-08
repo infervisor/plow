@@ -51,7 +51,31 @@ pub struct PlowCpuCtx {
     pub node: u32,
     /// Active tier for this thread; written by [`thread_init`].
     pub isa: u32,
-    pub reserved: [u64; 5],
+    /// Bytes at the head of `scratch` held in this core's pseudo-locked L2; 0 = none.
+    pub sram_bytes: u64,
+    /// The packed-prefill descriptor of the current run, or null (every other run).
+    pub pack: *const PlowCpuPack,
+    pub reserved: [u64; 3],
+}
+
+/// `PLOW_PF_TILE`: FLASH_PREFILL's q tile, the unit of a pack row's split count.
+pub const PF_TILE: u32 = 128;
+
+/// Mirror of `PlowCpuPack`: which rows of a packed prefill launch belong to which KV slot.
+#[derive(Debug)]
+#[repr(C)]
+pub struct PlowCpuPack {
+    pub spans: *const packet::dev::PrefillSpan,
+    pub row_slot: *const u32,
+    pub n_spans: u32,
+    pub rows: u32,
+    /// FLASH_PREFILL splits the KV at absolute multiples of this ([`PF_TILE`] rows per tile).
+    pub split_rows: u32,
+    pub reserved0: u32,
+    /// `[rows + 1]` row-split offsets into `opart` / `mlpart`.
+    pub row_off: *const u32,
+    pub opart: *mut f32,
+    pub mlpart: *mut f32,
 }
 
 impl PlowCpuCtx {
@@ -64,7 +88,9 @@ impl PlowCpuCtx {
             worker,
             node,
             isa: 0,
-            reserved: [0; 5],
+            sram_bytes: 0,
+            pack: std::ptr::null(),
+            reserved: [0; 3],
         }
     }
 }
@@ -379,7 +405,12 @@ pub mod abi {
         pub fn plow_cpu_abi_offsetof_ctx_worker() -> usize;
         pub fn plow_cpu_abi_offsetof_ctx_node() -> usize;
         pub fn plow_cpu_abi_offsetof_ctx_isa() -> usize;
+        pub fn plow_cpu_abi_offsetof_ctx_pack() -> usize;
         pub fn plow_cpu_abi_offsetof_ctx_reserved() -> usize;
+        pub fn plow_cpu_abi_sizeof_pack() -> usize;
+        pub fn plow_cpu_abi_offsetof_pack_split_rows() -> usize;
+        pub fn plow_cpu_abi_offsetof_pack_row_off() -> usize;
+        pub fn plow_cpu_abi_pf_tile() -> usize;
         pub fn plow_cpu_abi_offsetof_inst_op() -> usize;
         pub fn plow_cpu_abi_offsetof_inst_blocks() -> usize;
         pub fn plow_cpu_abi_offsetof_inst_fj() -> usize;

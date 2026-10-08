@@ -8,6 +8,7 @@ set, and the candidate passes if it is within the peer's distance to FP32 plus a
 
   prompts   --hf DIR --corpus NAME=FILE ... --out prompts.json     fixed token-id prompt set (CPU)
   reference --hf DIR --prompts prompts.json --out ref.json         FP32 greedy continuation + top-20
+            [--device cpu]                                         (default cuda)
   capture   --url URL --ref ref.json --arm NAME --out cap.json     a served stack, teacher-forced
   score     --ref ref.json CAP...                                  metrics per capture
   gate      --ref ref.json --cand CAP --peer CAP [thresholds]      verdict (exit 1 on fail)
@@ -266,6 +267,11 @@ def cmd_prompts(a):
                 ids = needle.exact_prompt(enc, n, d, sentence, q, prefix, ending)
                 cases.append(dict(id=f"needle-{nid}-{n}-{d}", kind="needle", prompt_ids=ids, max_new=a.needle_new,
                                   expect=expect))
+    if a.drop_over_ctx:
+        over = [c for c in cases if len(c["prompt_ids"]) + c["max_new"] > a.max_ctx]
+        for c in over:
+            print(f"dropped {c['id']}: {len(c['prompt_ids'])} + {c['max_new']} exceeds --max-ctx {a.max_ctx}")
+        cases = [c for c in cases if c not in over]
     for c in cases:
         if len(c["prompt_ids"]) + c["max_new"] > a.max_ctx:
             raise SystemExit(f"{c['id']}: {len(c['prompt_ids'])} + {c['max_new']} exceeds --max-ctx {a.max_ctx}")
@@ -303,32 +309,37 @@ def fp32_attention(module, query, key, value, attention_mask, dropout=0.0, scali
     return out.transpose(1, 2).contiguous(), None
 
 
-def load_fp32(hf):
+def load_fp32(hf, device="cuda"):
     import torch
     from safetensors import safe_open
     from transformers import AutoConfig
     from transformers.modeling_utils import AttentionInterface
-    from transformers.models.gemma4_unified.modeling_gemma4_unified import Gemma4UnifiedForCausalLM
     AttentionInterface.register("sdpa", fp32_attention)
     cfg = AutoConfig.from_pretrained(hf).text_config
+    if cfg.model_type == "gemma4_text":  # hub Gemma-4 (E2B/E4B per-layer inputs, 26B MoE, 31B)
+        from transformers.models.gemma4.modeling_gemma4 import Gemma4ForCausalLM as Gemma4UnifiedForCausalLM
+    else:
+        from transformers.models.gemma4_unified.modeling_gemma4_unified import Gemma4UnifiedForCausalLM
     cfg._attn_implementation = "sdpa"
     cfg.dtype = torch.float32
     torch.set_default_dtype(torch.float32)
-    with torch.device("cuda"):
+    with torch.device(device):
         model = Gemma4UnifiedForCausalLM(cfg).eval()
     params = dict(model.named_parameters())
     params.update(dict(model.named_buffers()))
-    loaded = set()
+    loaded, unused = set(), []
     files = sorted(Path(hf).glob("*.safetensors"))
     for path in files:
-        with safe_open(str(path), "pt", device="cuda") as f:
+        with safe_open(str(path), "pt", device=device) as f:
             keys = set(f.keys())
             for k in sorted(keys):
-                if not k.startswith("model.language_model.") or k.endswith("_scale"):
+                # `<w>_scale` beside `<w>` is an FP8 companion; `router.per_expert_scale` is a parameter.
+                if not k.startswith("model.language_model.") or (k.endswith("_scale") and k[: -len("_scale")] in keys):
                     continue
                 name = "model." + k.removeprefix("model.language_model.")
-                if name not in params:
-                    raise SystemExit(f"checkpoint tensor {k} has no FP32 model slot")
+                if name not in params:  # e.g. k/v of KV-shared layers: the model never reads them
+                    unused.append(k)
+                    continue
                 w = f.get_tensor(k).to(torch.float32)
                 if k + "_scale" in keys:  # FP8 per-output-channel: dequantize exactly in FP32
                     w = w * f.get_tensor(k + "_scale").to(torch.float32)
@@ -339,19 +350,22 @@ def load_fp32(hf):
     unset = [n for n, _ in model.named_parameters() if n not in loaded]
     if unset:
         raise SystemExit(f"FP32 parameters not loaded from the checkpoint: {unset[:8]}")
+    if unused:
+        print(f"{len(unused)} checkpoint tensors have no FP32 model slot (unused by the model): {unused[:4]} ...")
     return model, [dict(file=str(p), sha256=file_sha(p)) for p in files]
 
 
 def cmd_reference(a):
     import torch
     import transformers
+    dev = a.device
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
     torch.set_float32_matmul_precision("highest")
     from transformers import AutoTokenizer
     tok = AutoTokenizer.from_pretrained(a.hf, local_files_only=True)
     prompts = json.loads(Path(a.prompts).read_text())
-    model, weights = load_fp32(a.hf)
+    model, weights = load_fp32(a.hf, dev)
     cases = []
     t0 = time.time()
     with torch.no_grad():
@@ -359,7 +373,7 @@ def cmd_reference(a):
             if a.only and c["id"] not in a.only.split(","):
                 continue
             ids = c["prompt_ids"]
-            x = torch.tensor([ids], device="cuda")
+            x = torch.tensor([ids], device=dev)
             out = model(input_ids=x, use_cache=True, logits_to_keep=1)
             cont = []
             while True:
@@ -367,17 +381,18 @@ def cmd_reference(a):
                 cont.append(t)
                 if t in EOS or len(cont) == c["max_new"]:
                     break
-                out = model(input_ids=torch.tensor([[t]], device="cuda"), past_key_values=out.past_key_values, use_cache=True)
+                out = model(input_ids=torch.tensor([[t]], device=dev), past_key_values=out.past_key_values, use_cache=True)
             del out
             # Teacher-forced pass over the full sequence: the scored distributions.
-            logits = model(input_ids=torch.tensor([ids + cont[:-1]], device="cuda"), logits_to_keep=len(cont)).logits[0]
+            logits = model(input_ids=torch.tensor([ids + cont[:-1]], device=dev), logits_to_keep=len(cont)).logits[0]
             lsm = torch.log_softmax(logits.float(), -1)
             v, i = lsm.topk(TOP)
             pos = [dict(top=[[int(t), float(l)] for t, l in zip(i[k].tolist(), v[k].tolist())],
                         margin=float(v[k, 0] - v[k, 1])) for k in range(len(cont))]
             mism = sum(p["top"][0][0] != t for p, t in zip(pos, cont))
             del logits, lsm
-            torch.cuda.empty_cache()
+            if dev == "cuda":
+                torch.cuda.empty_cache()
             row = dict(c, cont=cont, cont_text=tok.decode(cont), pos=pos, tf_argmax_mismatch=mism)
             if "expect" in c:
                 row["ref_correct"] = c["expect"] in row["cont_text"]
@@ -387,7 +402,7 @@ def cmd_reference(a):
     meta = dict(schema="plow.fp32ref.v1", prompts=str(Path(a.prompts).resolve()), prompts_sha256=file_sha(a.prompts),
                 weights=weights, dtype="float32", tf32=False, attention="fp32 chunked math",
                 dequant="fp8_e4m3 weight x per-channel scale in fp32", torch=torch.__version__,
-                transformers=transformers.__version__, device=torch.cuda.get_device_name(),
+                transformers=transformers.__version__, device=torch.cuda.get_device_name() if dev == "cuda" else f"cpu ({torch.get_num_threads()} threads)",
                 utc=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), top=TOP)
     Path(a.out).write_text(json.dumps(dict(meta=meta, cases=cases)))
     print(f"reference: {len(cases)} cases -> {a.out} sha256 {file_sha(a.out)}")
@@ -537,12 +552,15 @@ def main():
     pr.add_argument("--needle-depths", default="0.1,0.5,0.9")
     pr.add_argument("--needle-new", type=int, default=16)
     pr.add_argument("--max-ctx", type=int, default=16384)
+    pr.add_argument("--drop-over-ctx", action="store_true",
+                    help="drop (and list) cases longer than --max-ctx instead of failing")
     pr.add_argument("--out", required=True)
     pr.set_defaults(f=cmd_prompts)
     rf = sp.add_parser("reference")
     rf.add_argument("--hf", required=True)
     rf.add_argument("--prompts", required=True)
     rf.add_argument("--only", help="comma-separated case ids (debug)")
+    rf.add_argument("--device", default="cuda", help="torch device for the FP32 model (cuda or cpu)")
     rf.add_argument("--out", required=True)
     rf.set_defaults(f=cmd_reference)
     cp = sp.add_parser("capture")

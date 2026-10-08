@@ -23,22 +23,28 @@ served models. A CPU-only build does not probe or link CUDA/HSA drivers.
 
 ## Compiling a bundle
 
-There is no CPU emit target. `plowc` always compiles for a *device* target and the
-CPU backend interprets the resulting packet, so the interpreter-object step of the
-GPU quickstart is skipped entirely — a CPU bundle is `model.pkt`, its manifest, and
-a tokenizer, with no cubin or hsaco.
+Compile for a CPU target: `--gpu xeon6975p` (alias `xeon6`; `plowc --list-gpus`) with
+`--arch amx` (AMX-BF16 + AVX-512, the default for that part) or `--arch avx512`. The
+interpreter-object step of the GPU quickstart is skipped entirely — a CPU bundle is
+`model.pkt`, its manifest, and a tokenizer, with no cubin or hsaco.
 
 ```sh
 CKPT=/path/to/gemma-4-12B-it
 target/release/plowc --hf-dir "$CKPT" \
-  --gpu rtx6000pro --n-cu 96 --max-ctx 2048 \
+  --gpu xeon6975p --arch amx --n-cu 96 --max-ctx 2048 \
   --batch 1,4 --seq 128,512 --out /path/to/bundle
 ```
 
-Pick an **NVIDIA** target. A gfx942/gfx950 packet carries AMD-specific fusion the
-CPU kernels do not implement and is rejected at load, typically as a KV-row site
-past the decode program's instruction count. `rtx6000pro` is what the bundles in
-`perf-data/cpu-*` were built with; the `--gpu` default is `h100`.
+The CPU engine interprets the NVIDIA-format packet, so a CPU target takes every
+`sm_120a` emit decision (single-segment packet, NVIDIA fusions) and the packet is
+byte-identical to an `--gpu rtx6000pro --arch sm_120a` one except the header's
+target hash (bytes 28-31). The one CPU-specific default: the NVIDIA E-series decode
+merge-fold (`PLOW_NV_FA_FOLD_WIDE`) is off, since the CPU flash-decode kernels need
+FLASH_MERGE. `--arch` labels the packet; the runtime tier is still chosen by
+`--cpu-isa`. An AMD gfx942/gfx950 packet carries AMD-specific fusion the CPU kernels
+do not implement and is rejected at load, typically as a KV-row site past the decode
+program's instruction count. Bundles in `perf-data/cpu-*` were built as
+`--gpu rtx6000pro`, which still loads.
 
 `--n-cu` is the packet's count of *virtual* executors, not a thread count. Kernels
 take "the `slice`-th of `nblk` shares", and the worker pool maps whatever thread
@@ -75,6 +81,7 @@ the CLI wins over the environment. `plowrt serve --help` prints them under the
 | `--cpu-huge-pages=B` | `PLOW_CPU_HUGE_PAGES` | unset | Override transparent-huge-page *advice*: by default ordinary pages for interleaved tensors, huge-page advice for single-node or OS placement. Changes advice, not the system THP setting. |
 | `--cpu-spin-us N` | `PLOW_CPU_SPIN_US` | `2000` | Spin budget (µs) before a blocked worker yields and parks. Decode packets are 100–500 µs apart; parking on every gap measured **+17% TPOT** at 50 µs versus 1000. |
 | `--cpu-prefill-chunk N` | `PLOW_CPU_PF_CHUNK` | `0` | Largest prefill chunk (rows) one tick may run while other slots decode; `0` = whole prompt. Measured **negative** at concurrency ≥ 4, so it stays off. |
+| `--cpu-pack-prefill=B` | `PLOW_CPU_PACK_PREFILL` | `true` | Prefill the prompts waiting in one serve tick together, in one launch, bit-identical to prefilling each alone (see *Packed prefill*). |
 | `--cpu-mxfp4-dir DIR` | `PLOW_MXFP4_DIR` | unset | Directory holding the MXFP4 weight twin (`mxfp4/<name>` plus `_scale` rows, from `perf-data/tools/quantize_mxfp4.py`). |
 | `--fp8-dir DIR` | `PLOW_FP8_DIR` | unset | The fp8 weight twin. Runtime-wide rather than CPU-specific, but this is how a CPU bundle gets W8A16/W8A8 weights. |
 | `--cpu-global-queue=B` | `PLOW_CPU_GQ` | `false` | Take the blob's op-major global work queue, windowed per segment and locality domain, instead of static per-cu streams. **Measured ~2x slower** on the EPYC 9654; kept for A/B where the static partition is a poor fit. |
@@ -86,6 +93,41 @@ what is computed.
 
 `--executors` (not CPU-specific) sizes the reference interpreter. Each loaded model
 owns its own worker pool, so budget threads across concurrently served models.
+
+## Packed prefill
+
+Prefill on the CPU is weight-bandwidth bound per launch, so prompts that wait in the same
+serve tick share one launch: their rows are concatenated (`M` = the sum, at most the widest
+bucket whose attention merges split partials) and the weights stream once. Only three ops
+depend on which request a row belongs to, and the engine hands them a pack descriptor
+(`PlowCpuCtx::pack`) for that run only: the KV-writing `HEADNORM_ROPE` writes row `r` into
+slot `row_slot[r]`, `FLASH_PREFILL` walks its work per span (that span's rows, positions, KV
+length and slot), and the head samples each finished prompt's last row (a second, head-only
+run at `M = S` when several finish). Everything else is row-independent; `pack_route`
+refuses a packet with any op it does not know to be, and logs why.
+
+Prefill is invariant to the pack, the bucket and the chunking. GEMMs are per-row invariant in
+`M`; attention splits the KV at absolute positions (`split_rows` = max(2048, max_ctx / 16) keys)
+instead of a per-bucket count, so a row's partial over a split depends only on its own position,
+and the splits a wider q tile adds are empty for it (exact zeros in `FLASH_MERGE`). Partials go
+to an engine-owned scratch at per-row offsets (`row_off`). Every prefill chunk, including one
+prefilled alone, runs this way on a bucket that carries a `FLASH_MERGE`, so a prompt's logits and
+KV are the same bits whether it is prefilled whole, in chunks, after a reused prefix (session
+resume, cross-slot prefix share) or packed with others. `plowc` keeps a merge in every bucket
+with `PLOW_DENSE_PF_NS_MIN=2` (the 12B/26B-A4B/31B recipes set it; their 2048 bucket otherwise
+writes attention directly and neither packs nor gets the invariance).
+
+`cpu_pack_check` is the gate: packed, alone in a pack, on the widest bucket, and split into
+chunks across packs must all equal the whole prompt prefilled alone, bit for bit (logits, first
+token, greedy decode). Measured on Xeon 6975P-C, seven chat/natural prompts (3503 rows, two packs
+of <= 2048), all exact: E2B 1.66x, E4B 1.61x, 12B 1.53x faster than one prefill per prompt.
+`cpu_share_check` holds a reused prefix (prompt rows, decoded rows, a chain of both) to the same
+bits as a fresh prefill; only prefill-written rows are reused.
+
+The 2048-key floor on `split_rows` is for accuracy, not speed. Gemma-4-12B BF16 is sensitive to
+how attention partitions a long prompt's keys: with 256-key splits its FP32-reference gate KL
+p99 was 0.79 (vLLM 0.47), with every layer's attention as close to an f64 reference as the
+unsplit kernel's; at 2048 (one split per q tile up to 2K context, the unsplit sums) it is 0.33.
 
 ## ISA coverage
 
@@ -101,6 +143,13 @@ RoPE, pointwise operations, and the existing Gemma/GPT-OSS MoE kernels. FP8 GEMM
 accepts BF16 or scaled FP8 activations and decodes all e4m3fn codes, including
 subnormals and NaNs. MXFP4 uses the existing packed even-K row layout and E8M0
 block scales. Packet tile/slice ownership is preserved.
+
+The AMX tier runs `FLASH_PREFILL` on TMUL (`amx/attention_amx.c`): same units, absolute
+splits and partials as the AVX-512 kernel, with QK^T and PV as 2x2-blocked TDPBF16PS over a
+staged Q tile and per-64-key VNNI K^T / V blocks. Each row's scores and output keep a fixed
+summation order, so packed and chunked prefill stay exact (`cpu_pack_check`). Accuracy against
+an f64 reference matches the AVX-512 kernel; one thread runs 3.5-6x faster (hd 512 causal 2048:
+63 vs 384 ms), and a Gemma-4-E4B 2048-row prefill drops from 485 to 424 ms.
 
 `QUANT_FP8` supports per-row BF16-to-e4m3fn activation quantization with FP32
 scales, round-to-nearest ties-to-even, and finite saturation. Both its ordinary

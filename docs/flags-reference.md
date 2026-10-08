@@ -964,8 +964,25 @@ bundle in the first place, in [CPU execution](runtime/cpu.md).
 | `--fp8-dir DIR` | `PLOW_FP8_DIR` | unset | fp8 weight twin. Runtime-wide, but this is how a CPU bundle gets W8A16/W8A8 weights. |
 | `--cpu-global-queue=B` | `PLOW_CPU_GQ` | off | Global op-major work queue (windowed per segment and L2 domain, with stealing) instead of static per-cu streams. **~2x slower** on the EPYC 9654; kept for A/B. |
 | `--cpu-l2-place=B` | `PLOW_CPU_L2_PLACE` | off | Place executors by the packet's L2 locality domains instead of `cu % nodes`. **1.5x slower**, never faster (placement report in the `perf-data/cpu-numa-placement` campaign, kept out of source control). Inert without domains in the blob; a balance guard declines a losing plan even when on. |
+| `--cpu-sram=B` | `PLOW_CPU_SRAM` | off | Pseudo-lock worker scratch into L2 and hot layer weights into L3 through `/dev/pseudo_lock` (`runtime/cpu/driver`). Measured slower on Xeon 6975P-C Gemma-4 serving (12B prefill 606 → 817–982 ms); kept for A/B. |
+| `--cpu-weight-affine=B` | `PLOW_CPU_WEIGHT_AFFINE` | off | Bind each weight's per-executor slice to the node of the worker that reads it. −2 to −5% on Xeon 6975P-C (SNC3); set in the Gemma-4 Xeon recipes. |
+| `--cpu-mmap-gather=B` | `PLOW_CPU_MMAP_GATHER` | on | Serve weights read only as embedding-gather tables straight from the mmapped checkpoint (only gathered rows become resident). Gemma-4 E2B: −4.4 GiB resident. |
+| `--cpu-gate-pf=B` | `PLOW_CPU_GATE_PF` | on | While a static worker waits on its next entry's gates, prefetch (T1) up to 1 MiB of that slice's decode GEMV / GLU / QKV weight rows. Xeon 6975P-C batch-1 decode step: E2B −7%, E4B −3%, 12B −4%, 26B-A4B −4%, 31B −2%. |
+| `--cpu-prefix-share=B` | `PLOW_CPU_PREFIX_SHARE` | on | CPU serve: a fresh prompt copies the KV rows of its longest common token prefix from another slot (live, mid-prefill or released; rings must not have wrapped) and prefills only the suffix — vLLM's automatic prefix caching on the slot KV (shared system prompts). Reported as cached tokens. |
 
-The last two are off because they were *measured* worse, not because they are
+`PLOW_AMX_DEBUG` (comma list, diagnostic only) toggles AMX kernel study switches in
+`runtime/cpu/dev/amx` (`nopack`, `noxpack`, `wstage`, `nogrid`, `l1pf`, `nopf`, `demote`,
+`wpanel2`, …); some produce wrong output and exist only to bound a cost.
+
+`PLOW_CPU_AMX_ATTN=0` (default on) keeps the AVX-512 `FLASH_PREFILL` on an AMX host instead of
+the TMUL kernel (3.5-6x faster per thread, same f64-measured accuracy). The Gemma-4-26B-A4B Xeon
+recipe sets it: that model's FP32-reference gate fails with the TMUL summation order.
+
+`PLOW_CPU_AMX_ATTN_SPLIT_P=1` (default off) keeps the TMUL `FLASH_PREFILL`'s softmax weights
+f32-accurate through the bf16 PV product (P = hi + lo, two TDPBF16PS per key step; `l` sums the
+unrounded P), instead of rounding P to bf16. Doubles the PV half of the kernel.
+
+The global-queue and L2-place knobs are off because they were *measured* worse, not because they are
 unfinished — neither changes what is computed, so both are safe to flip for an A/B
 on another host.
 

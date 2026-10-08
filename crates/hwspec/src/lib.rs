@@ -19,6 +19,7 @@
 
 pub mod amd;
 pub mod apple;
+pub mod intel;
 pub mod isa;
 pub mod nvidia;
 pub mod registry;

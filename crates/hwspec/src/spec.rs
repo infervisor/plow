@@ -16,6 +16,8 @@ pub enum Vendor {
     Amd,
     /// Apple Silicon: the GPU is one unit of a unified-memory SoC (see [`SocSpec`]).
     Apple,
+    /// Intel Xeon CPU, run by the plowrt CPU engine (no device; one executor per core).
+    Intel,
 }
 
 /// Microarchitecture generation. Drives tile-shape selection in the cost model.
@@ -34,6 +36,8 @@ pub enum Arch {
     AppleM3,
     /// Apple GPU family 9 (M4). Same ISA level as M3 (`metal3`); Dynamic Caching.
     AppleM4,
+    /// Intel Xeon 6 P-core (Granite Rapids): AVX-512 + AMX-BF16/FP16.
+    GraniteRapids,
 }
 
 /// On-package memory technology.
@@ -48,6 +52,8 @@ pub enum MemKind {
     Gddr7,
     /// LPDDR5X unified memory (Apple Silicon): one bus shared by CPU, GPU and ANE.
     Lpddr5x,
+    /// DDR5 DIMMs (CPU hosts).
+    Ddr5,
 }
 
 /// The cross-SM shared-memory domain kind. On Hopper, SMs within one GPC

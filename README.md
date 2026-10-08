@@ -300,11 +300,11 @@ packet directly, so **step 2 is skipped entirely** and nothing links CUDA or HSA
 cargo build --release -p plowc
 cargo build --release -p plowrt --no-default-features --features cpu
 
-# 2. Compile the packet. plowc always emits for a device target; pick an NVIDIA
-#    one — an AMD gfx942/gfx950 packet does NOT load on the CPU backend.
+# 2. Compile the packet for the CPU target (--arch amx or avx512); an AMD
+#    gfx942/gfx950 packet does NOT load on the CPU backend.
 CKPT="$HOME/models/gemma-4-12B-it"
 ./target/release/plowc --hf-dir "$CKPT" \
-  --gpu rtx6000pro --n-cu 96 --max-ctx 2048 \
+  --gpu xeon6975p --arch amx --n-cu 96 --max-ctx 2048 \
   --batch 1,4 --seq 128,512 --out "$ASSETS"
 
 # 3. Serve. --rt-checkpoint is required; the bundle carries no weights.
