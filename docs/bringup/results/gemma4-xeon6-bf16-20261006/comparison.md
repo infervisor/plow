@@ -135,6 +135,21 @@ Results:
   - 15.5% of a 15.8K-token E4B prefill is the norm kernels (`v_rmsnorm`, `v_norm_residual`), which
     are limited by moving data between cores. Fusing the norms into the GEMMs is the open lever.
 
+E4B 0.05 with a 1,500 s window (1,320 s measured, same arrival plan; `prod-{plow,vllm}-long3`):
+
+| Server | Requests | TTFT P99 | SLO attainment | TPOT P99 |
+|---|---:|---:|---:|---:|
+| Infervisor | 267 | 3,393 ms | 100% | 68 ms |
+| vLLM | 248 | 7,895 ms | 79% | 249 ms |
+
+Read this as supplementary, not as a replacement for the 600 s cell:
+- **Infervisor reproduces its 600 s run.** Over requests started in 120-540 s: TTFT P99 4,086 vs 4,099 ms,
+  TPOT P50 26 vs 26 ms.
+- **vLLM does not.** Over the same window with the same arrivals, it is slower than its 600 s baseline
+  from 10-07: TPOT P50 153 vs 103 ms.
+- **The host differed:** before the run, tmpfs pages were interleaved over the NUMA nodes and node 0 was
+  freed for vLLM's KV cache. The cause of vLLM's slowdown was not isolated.
+
 ## Not qualified
 
 - 26B-A4B with bf16-rounded P in the AMX attention PV: FP32 gate kl_mean 0.118-0.128 (limit 0.112);
