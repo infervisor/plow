@@ -125,6 +125,11 @@ impl Drop for Alive {
 }
 
 impl SharedAsr {
+    /// The instance key (model, or `model#rank`) whose dispatcher this front feeds.
+    pub(super) fn key(&self) -> &str {
+        &self.slug
+    }
+
     fn load(slug: &str, dir: &Path, max_context: usize, batch: usize, device: u8) -> Result<Self> {
         let checkpoint = dir.join("checkpoint");
         let checkpoint = if checkpoint.is_dir() { checkpoint } else { dir.to_path_buf() };

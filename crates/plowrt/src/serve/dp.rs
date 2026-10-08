@@ -510,14 +510,20 @@ impl DpSet {
                 let mut chain = [0u64; TAIL_CHAIN];
                 let blocks = tail_chain(p, &mut chain);
                 let now = self.tails.now();
+                let mut shared = false;
                 for i in (0..blocks).rev().take(TAIL_WALK) {
                     if let Some(r) = self.tails.peek(chain[i], now).filter(|&r| r < n && cands[r].up) {
-                        cands[r].cached = ((i + 1) * TAIL_ROWS) as u32;
-                        followed = true;
+                        // Ending exactly on a routed tail adds nothing to it: a prefix many
+                        // prompts share (a system prompt), not a conversation going on.
+                        shared = i == blocks - 1;
+                        if !shared {
+                            cands[r].cached = ((i + 1) * TAIL_ROWS) as u32;
+                            followed = true;
+                        }
                         break;
                     }
                 }
-                tail = Some((chain[blocks - 1], now));
+                tail = Some((chain[blocks - 1], now, shared));
                 block_rows = TAIL_ROWS as u32;
             }
             let br = self.block_rows.load(Relaxed);
@@ -562,8 +568,8 @@ impl DpSet {
         let prompt_rows = prompt.map_or(0, <[u32]>::len);
         let (rank, reason) = choose(&cands[..n], sticky, prompt_rows, block_rows, cfg, rr)?;
         let reason = if retry { Reason::Retry } else { reason };
-        if let Some((last, now)) = tail {
-            self.tails.put_tail(last, rank, now);
+        if let Some((last, now, shared)) = tail {
+            self.tails.put_tail(last, if shared { SHARED_TAIL as usize } else { rank }, now);
         }
         if let Some((h, now)) = session {
             let fresh = stored.is_some_and(|(r, t)| r == rank && now.wrapping_sub(t) < SESSION_REFRESH_S);
@@ -812,6 +818,22 @@ mod tests {
         s.tails.put_tail(tail_hash(&shared), 1, s.tails.now());
         let next: Vec<u32> = (0..300).collect();
         assert_eq!(s.route(&RouteCfg::default(), None, Some(&next), 0).unwrap().reason, Reason::LeastLoaded);
+    }
+
+    /// First turns that end inside a common system prompt do not pile onto the first one's rank.
+    #[test]
+    fn prompts_ending_in_a_common_prefix_spread() {
+        let s = set(4);
+        up(&s);
+        let cfg = RouteCfg::default();
+        for k in 0..8u32 {
+            let mut p: Vec<u32> = (0..256).collect();
+            p.extend((0..50).map(|j| 10_000 + k * 100 + j));
+            let r = s.route(&cfg, None, Some(&p), 0).unwrap();
+            assert_eq!(r.reason, Reason::LeastLoaded, "turn {k}");
+            s.ranks[r.rank].metrics.slots_active.fetch_add(1, Relaxed);
+        }
+        assert!(s.ranks.iter().all(|r| r.metrics.slots_active.load(Relaxed) == 2));
     }
 
     fn tail_hash(p: &[u32]) -> u64 {

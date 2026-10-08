@@ -133,12 +133,14 @@ impl Route {
         }
     }
 
-    /// The dispatcher behind this route was preempted or has exited: route again.
-    fn stale(&self) -> bool {
+    /// The dispatcher behind this route is leaving (out of the routing table, preempted or
+    /// exited): route again.
+    fn stale(&self, server: &AsrServer) -> bool {
         #[cfg(feature = "cuda")]
-        if let Route::Shared(_, mux, _) = self {
-            return mux.preempted() || mux.is_closed();
+        if let (Route::Shared(asr, mux, _), Backend::Serve(state)) = (self, &server.backend) {
+            return mux.preempted() || mux.is_closed() || state.mux(asr.key()).is_none();
         }
+        let _ = server;
         false
     }
 

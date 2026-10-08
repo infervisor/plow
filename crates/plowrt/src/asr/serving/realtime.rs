@@ -273,7 +273,7 @@ async fn session(state: Arc<AsrServer>, mut socket: WebSocket, ids: RequestIds, 
         // Launch waiting turns with the settings current at their commit.
         while flights.len() < MAX_SEGMENTS_IN_FLIGHT {
             // A rank unloaded under the session: route its turns (and the session) again.
-            if let Some((_, _, turn)) = waiting.front_mut().filter(|(_, _, t)| t.route.stale()) {
+            if let Some((_, _, turn)) = waiting.front_mut().filter(|(_, _, t)| t.route.stale(&state)) {
                 if let Ok((r, finalization)) = state.route(&turn.model, ids.session.as_deref()).await {
                     if let Some(current) = route.as_mut().filter(|c| c.0 == turn.model) {
                         current.1 = r.clone();
