@@ -1333,6 +1333,22 @@ impl GroupedPlan {
         self.candidates.clear();
     }
 
+    /// The opaque algorithm of candidate `index`, to hand another engine (see `select_algo`).
+    pub(crate) fn candidate_algo(&self, index: usize) -> [u64; 8] {
+        self.candidates[index].data
+    }
+
+    /// Select the candidate whose algorithm is `data`; `false` when the heuristic did not offer it.
+    pub(crate) fn select_algo(&mut self, data: &[u64; 8]) -> bool {
+        match self.candidates.iter().position(|c| c.data == *data) {
+            Some(index) => {
+                self.select(index);
+                true
+            }
+            None => false,
+        }
+    }
+
     /// `a`, `w`, `c` are device arrays of `groups` matrix pointers.
     pub(crate) fn run(&self, a: u64, w: u64, c: u64, stream: &CudaStream) -> Result<()> {
         self.run_algo(&self.algo, a, w, c, stream)
