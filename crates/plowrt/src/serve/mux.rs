@@ -3808,6 +3808,7 @@ fn run_one_tick(
                                         }
                                     }
                                 }
+                                seq_host_logprobs(&*e, slot, &mut slots[slot], token);
                                 handle_produced_token(
                                     &mut slots[slot],
                                     &arena,

@@ -255,3 +255,25 @@ fn live_token_batch_cost() {
         feeds = out.iter().filter(|o| (o.0 as usize) < live).map(|&(s, t)| (s as usize, t)).collect();
     });
 }
+
+/// Whole-prompt prefill time of one `PLOW_PF_TOKENS`-token prompt (default 12288), for profiling
+/// long-context prefill.
+#[test]
+#[ignore]
+fn live_long_prefill_time() {
+    let Some((blob, ckpt)) = env_paths() else {
+        eprintln!("PLOW_LADDER_BLOB / PLOW_CKPT unset — skipping");
+        return;
+    };
+    let n: usize = std::env::var("PLOW_PF_TOKENS").ok().and_then(|v| v.parse().ok()).unwrap_or(12288);
+    let mut opts = CpuEngineOpts::default();
+    opts.threads = std::env::var("PLOW_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(96);
+    let mut e = CpuServe::load(&blob, &ckpt, &opts).expect("load");
+    let prompt: Vec<u32> = (0..n as u32).map(|i| 2000 + (i * 7919) % 30000).collect();
+    for run in 0..2 {
+        let t = Instant::now();
+        e.prefill(0, &prompt).expect("prefill");
+        eprintln!("prefill {n} tokens (run {run}): {:.0} ms", t.elapsed().as_secs_f64() * 1e3);
+        SeqEngine::release(&mut e, 0);
+    }
+}
