@@ -49,6 +49,8 @@ pub struct Metrics {
     /// Serving objective class in force under `auto`: 0 latency rules, 1 throughput rules.
     pub serve_mode: AtomicU64,
     pub serve_mode_switches: AtomicU64,
+    /// Packed prefill rows per launch while requests decode (0: no packed prefill).
+    pub prefill_launch_rows: AtomicU64,
     /// Admissions cache-aware ordering seated ahead of the queue head.
     pub cache_first_admissions: AtomicU64,
     /// A fatal device fault poisoned this model's engine; `/health` answers 503.
@@ -115,6 +117,8 @@ impl Metrics {
         );
         self.serve_mode
             .fetch_max(other.serve_mode.load(Ordering::Relaxed), Ordering::Relaxed);
+        self.prefill_launch_rows
+            .fetch_max(other.prefill_launch_rows.load(Ordering::Relaxed), Ordering::Relaxed);
     }
 
     #[inline]
@@ -213,6 +217,9 @@ impl Metrics {
              # HELP plowrt_serve_mode_switches_total Serving objective class switches under auto.\n\
              # TYPE plowrt_serve_mode_switches_total counter\n\
              plowrt_serve_mode_switches_total {}\n\
+             # HELP plowrt_prefill_launch_rows Packed prefill rows per launch while requests decode; zero means no packed prefill.\n\
+             # TYPE plowrt_prefill_launch_rows gauge\n\
+             plowrt_prefill_launch_rows {}\n\
              # HELP plowrt_cache_first_admissions_total Admissions seated ahead of the queue head for their cached prefix.\n\
              # TYPE plowrt_cache_first_admissions_total counter\n\
              plowrt_cache_first_admissions_total {}\n",
@@ -235,6 +242,7 @@ impl Metrics {
             g(&self.decode_rung_switches),
             g(&self.serve_mode),
             g(&self.serve_mode_switches),
+            g(&self.prefill_launch_rows),
             g(&self.cache_first_admissions),
         )
     }

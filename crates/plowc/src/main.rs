@@ -27,9 +27,21 @@ mod fusion_coverage;
 #[derive(Parser, Debug)]
 #[command(
     name = "plowc",
-    about = "plow compiler: model/network → packet streams for a hardware spec"
+    about = "plow compiler: model/network → packet streams for a hardware spec",
+    version,
+    disable_version_flag = true
 )]
 struct Cli {
+    /// Print version information
+    #[arg(
+        short = 'v',
+        short_alias = 'V',
+        long = "version",
+        action = clap::ArgAction::Version,
+        help = "Print version information (-v, -V, --version)"
+    )]
+    version: Option<bool>,
+
     /// Optional subcommand. With none, `plowc` compiles, exactly as before —
     /// every existing invocation keeps working unchanged.
     #[command(subcommand)]

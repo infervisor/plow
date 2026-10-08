@@ -2585,6 +2585,9 @@ static __device__ __noinline__ void d_quant_fp8_wpr(uint8_t* __restrict__ xq,
 }
 
 #if PLOW_NV_THREADS == 256
+/* STORE = false: the bf16 GLU output has no reader (plowrt checks the program), so only the FP8
+ * bytes and row scales are written; both are bit-identical to the storing form. */
+template <bool STORE = true>
 static __device__ __forceinline__ void d_glu_quant_fp8_cached(__nv_bfloat16* output, uint8_t* quantized, float* scales,
                                   const __nv_bfloat16* gate, const __nv_bfloat16* up, unsigned rows,
                                   unsigned slice, unsigned nblk, float* part) {
@@ -2627,7 +2630,7 @@ static __device__ __forceinline__ void d_glu_quant_fp8_cached(__nv_bfloat16* out
         for (unsigned v = 0; v < 8; ++v) {
             const unsigned k = threadIdx.x * 8 + v * 2048;
             if (k < width) {
-                st_glob8(output + base + k, values[v]);
+                if constexpr (STORE) st_glob8(output + base + k, values[v]);
                 uint2 q8;
                 auto* q2 = reinterpret_cast<unsigned short*>(&q8);
 #pragma unroll
@@ -2644,6 +2647,61 @@ static __device__ __forceinline__ void d_glu_quant_fp8_cached(__nv_bfloat16* out
                 }
                 *reinterpret_cast<uint2*>(quantized + base + k) = q8;
             }
+        }
+        __syncthreads();
+    }
+}
+
+#endif
+
+#if PLOW_NV_THREADS == 256
+/* d_quant_fp8 of one WIDTH-wide row per CTA with the row held in registers: one read of x
+ * instead of two. Row scales and FP8 bytes are bit-identical (max is associative). */
+template <unsigned WIDTH>
+static __device__ __forceinline__ void d_quant_fp8_cached(uint8_t* quantized, float* scales,
+                                                          const __nv_bfloat16* x, unsigned rows,
+                                                          unsigned slice, unsigned nblk, float* part) {
+    static_assert(WIDTH % 2048 == 0, "256 threads x 8 bf16 per vector");
+    constexpr unsigned vectors = WIDTH / 2048;
+    for (unsigned row = slice; row < rows; row += nblk) {
+        bf16v8 values[vectors];
+        const size_t base = size_t(row) * WIDTH;
+        float amax = 0;
+#pragma unroll
+        for (unsigned v = 0; v < vectors; ++v) {
+            values[v] = ld_glob8(x + base + threadIdx.x * 8 + v * 2048);
+#pragma unroll
+            for (unsigned j = 0; j < 8; ++j) amax = fmaxf(amax, fabsf(__bfloat162float(values[v].x[j])));
+        }
+        amax = warp_max32(amax);
+        if ((threadIdx.x & 31) == 0) part[threadIdx.x / 32] = amax;
+        __syncthreads();
+        amax = 0;
+#pragma unroll
+        for (unsigned w = 0; w < 8; ++w) amax = fmaxf(amax, part[w]);
+#if defined(PLOW_NV_QUANT_FP8_VLLM) && PLOW_NV_QUANT_FP8_VLLM
+        const float scale = fmaxf(__fdiv_rn(amax, 448.0f), 1.0f / (448.0f * 512.0f));
+#else
+        const float scale = fmaxf(amax * (1.0f / 448.0f), 1e-12f);
+        const float inv = 1.0f / scale;
+#endif
+        if (threadIdx.x == 0) scales[row] = scale;
+#pragma unroll
+        for (unsigned v = 0; v < vectors; ++v) {
+            uint2 q8;
+            auto* q2 = reinterpret_cast<unsigned short*>(&q8);
+#pragma unroll
+            for (unsigned j = 0; j < 4; ++j) {
+#if defined(PLOW_NV_QUANT_FP8_VLLM) && PLOW_NV_QUANT_FP8_VLLM
+                const float lo = __fdiv_rn(__bfloat162float(values[v].x[j * 2]), scale);
+                const float hi = __fdiv_rn(__bfloat162float(values[v].x[j * 2 + 1]), scale);
+                q2[j] = pack_fp8_e4m3(fmaxf(-448.0f, fminf(lo, 448.0f)), fmaxf(-448.0f, fminf(hi, 448.0f)));
+#else
+                q2[j] = pack_fp8_e4m3(__bfloat162float(values[v].x[j * 2]) * inv,
+                                       __bfloat162float(values[v].x[j * 2 + 1]) * inv);
+#endif
+            }
+            *reinterpret_cast<uint2*>(quantized + base + threadIdx.x * 8 + v * 2048) = q8;
         }
         __syncthreads();
     }

@@ -535,6 +535,15 @@ __device__ __forceinline__ PlowStreamEnt ld_stream_ent(const PlowStreamEnt* p) {
     !(PLOW_NV_FA_GF_FULL == 3 && !PLOW_NV_GEMMA)
 #error "PLOW_NV_FA_GF_FULL requires {1,2,4,8}, or16 with wide softmax reductions"
 #endif
+/* The light (ordinary-launch) hd512 FlashDecode's head group, the attention of the library-routed
+ * decode rungs. A wider group there leaves the interpreter's own GF, arena and registers alone. */
+#ifndef PLOW_NV_FA_GF_LIGHT512
+#define PLOW_NV_FA_GF_LIGHT512 PLOW_NV_FA_GF_FULL
+#endif
+#if PLOW_NV_FA_GF_LIGHT512 != PLOW_NV_FA_GF_FULL && PLOW_NV_FA_GF_LIGHT512 != 8 && \
+    !(PLOW_NV_FA_GF_LIGHT512 == 16 && PLOW_NV_FA_GF16_BENCH)
+#error "PLOW_NV_FA_GF_LIGHT512 requires 8, or 16 with wide softmax reductions"
+#endif
 #ifndef PLOW_NV_FA_GF_HD256
 #define PLOW_NV_FA_GF_HD256 2
 #endif
@@ -4171,7 +4180,7 @@ __device__ __forceinline__ void light_attn_gemma(const PlowLightSpan& a, float* 
         const unsigned nblk = fl->blocks ? fl->blocks : gridDim.x, slice = blockIdx.x;
         const unsigned warp = threadIdx.x >> PLOW_NV_WARP_SHIFT;
         const unsigned n_head = fl->i[1], nsplit = fl->i[5];
-        const unsigned GF = fl->i[6] == 256 ? PLOW_NV_FA_GF_LIGHT256 : PLOW_NV_FA_GF_FULL;
+        const unsigned GF = fl->i[6] == 256 ? PLOW_NV_FA_GF_LIGHT256 : PLOW_NV_FA_GF_LIGHT512;
         const unsigned gqa = n_head / fl->i[2], n_grp = n_head / GF;
         const unsigned n_work = fl->i[0] * n_grp * nsplit;
         for (unsigned w = slice; slice < nblk && w < n_work; w += nblk) {
@@ -4278,8 +4287,8 @@ __device__ __forceinline__ void light_attn_gemma(const PlowLightSpan& a, float* 
             __trap();
         } else if (in->op == PLOW_DOP_HEADNORM_ROPE && in->i[2] == 512 && in->i[5] == 0) {
             LIGHT_HNR(512);
-        } else if (in->op == PLOW_DOP_FLASH_DECODE && in->i[6] == 512 && gqa % PLOW_NV_FA_GF_FULL == 0) {
-            LIGHT_FLASH(512, PLOW_NV_FA_GF_FULL);
+        } else if (in->op == PLOW_DOP_FLASH_DECODE && in->i[6] == 512 && gqa % PLOW_NV_FA_GF_LIGHT512 == 0) {
+            LIGHT_FLASH(512, PLOW_NV_FA_GF_LIGHT512);
 #if PLOW_NV_LIGHT_FP8_ATTN && PLOW_FP8_KV
         } else if (in->op == PLOW_DOP_HEADNORM_ROPE_FP8 && in->i[2] == 256 && in->i[5] == 0) {
             LIGHT_HNR_FP8(256);
@@ -4287,8 +4296,8 @@ __device__ __forceinline__ void light_attn_gemma(const PlowLightSpan& a, float* 
             LIGHT_FLASH_FP8(256, 2);
         } else if (in->op == PLOW_DOP_HEADNORM_ROPE_FP8 && in->i[2] == 512 && in->i[5] == 0) {
             LIGHT_HNR_FP8(512);
-        } else if (in->op == PLOW_DOP_FLASH_DECODE_FP8 && in->i[6] == 512 && gqa % PLOW_NV_FA_GF_FULL == 0) {
-            LIGHT_FLASH_FP8(512, PLOW_NV_FA_GF_FULL);
+        } else if (in->op == PLOW_DOP_FLASH_DECODE_FP8 && in->i[6] == 512 && gqa % PLOW_NV_FA_GF_LIGHT512 == 0) {
+            LIGHT_FLASH_FP8(512, PLOW_NV_FA_GF_LIGHT512);
 #endif
         } else {
             __trap();
@@ -4334,6 +4343,13 @@ extern "C" __device__ unsigned PLOW_SYM(plow_light_fp8_flash256_smem) =
 #endif
 extern "C" __device__ unsigned PLOW_SYM(plow_light_attn_hd) = 256;
 extern "C" __device__ unsigned PLOW_SYM(plow_light_attn_hd2) = 512;
+#if PLOW_NV_FA_GF_LIGHT512 != PLOW_NV_FA_GF_FULL
+/* light_attn's dynamic smem when its hd512 group outgrows the interpreter arena it otherwise takes. */
+extern "C" __device__ unsigned PLOW_SYM(plow_light_attn_smem) =
+    (FA_DEC_SMEM_FLOATS(512, PLOW_NV_FA_GF_LIGHT512) > PLOW_NV_ARENA_FLOATS
+         ? FA_DEC_SMEM_FLOATS(512, PLOW_NV_FA_GF_LIGHT512)
+         : PLOW_NV_ARENA_FLOATS) * sizeof(float);
+#endif
 #endif
 #if PLOW_NV_GEMMA && !PLOW_NV_LEAN_DECODE && !PLOW_MIXED_STEP
 /* Unified token batch on sm_90a: the decode rows riding a packed prefill launch (rows
@@ -4506,5 +4522,58 @@ extern "C" __global__ void __launch_bounds__(256, 2) PLOW_SYM(plow_glu_quant_cac
     d_glu_quant_fp8_cached((__nv_bfloat16*)t[in->t[1]], (uint8_t*)t[in->t[0]],
                             (float*)t[in->t[2]], (const __nv_bfloat16*)t[in->t[3]],
                             (const __nv_bfloat16*)t[in->t[4]], in->i[0], blockIdx.x, gridDim.x, part);
+}
+/* The same rows without the bf16 GLU store, for an instruction whose output tensor nothing reads. */
+extern "C" __device__ unsigned PLOW_SYM(plow_glu_quant_cache_q_abi) = 1;
+extern "C" __global__ void __launch_bounds__(256, 2) PLOW_SYM(plow_glu_quant_cached_q)(PlowProgram prog,
+                                                                                   unsigned inst) {
+    __shared__ float part[8];
+    const PlowDevInst* in = prog.insts + inst;
+    void* const* t = prog.tensors;
+    d_glu_quant_fp8_cached<false>(nullptr, (uint8_t*)t[in->t[0]], (float*)t[in->t[2]],
+                                  (const __nv_bfloat16*)t[in->t[3]], (const __nv_bfloat16*)t[in->t[4]],
+                                  in->i[0], blockIdx.x, gridDim.x, part);
+}
+#endif
+#if PLOW_NV_PREFILL && PLOW_NV_SEGMENTS && PLOW_NV_GEMMA && PLOW_NV_THREADS == 256 && !PLOW_NV_GEMM_ONLY && \
+    !PLOW_NV_FA_ONLY
+/* A plain QuantFp8 (no GLU) of a 4096- or 8192-wide row per CTA (any grid). */
+#if PLOW_NV_W8A8
+extern "C" __device__ unsigned PLOW_SYM(plow_quant_cached_abi) = 1;
+extern "C" __global__ void __launch_bounds__(256, 2) PLOW_SYM(plow_quant_cached)(PlowProgram prog,
+                                                                             unsigned inst) {
+    __shared__ float part[8];
+    const PlowDevInst* in = prog.insts + inst;
+    void* const* t = prog.tensors;
+    if (in->i[1] == 8192u)
+        d_quant_fp8_cached<8192>((uint8_t*)t[in->t[0]], (float*)t[in->t[2]],
+                                 (const __nv_bfloat16*)t[in->t[1]], in->i[0], blockIdx.x, gridDim.x, part);
+    else if (in->i[1] == 4096u)
+        d_quant_fp8_cached<4096>((uint8_t*)t[in->t[0]], (float*)t[in->t[2]],
+                                 (const __nv_bfloat16*)t[in->t[1]], in->i[0], blockIdx.x, gridDim.x, part);
+    else
+        __trap();
+}
+#endif
+/* A prefill NormResidual and the RmsNorm reading its output (instruction inst + 1) as one launch
+ * of any grid: both bodies take rows {blockIdx.x + k * gridDim.x}, so the block that wrote a row
+ * normalizes it, and each row's arithmetic is the interpreter's. The interpreter runs them on its
+ * one CTA per SM, ~31 latency-bound rows per block at 4096 rows. */
+extern "C" __device__ unsigned PLOW_SYM(plow_norm_rms_pf_abi) = 1;
+extern "C" __global__ void __launch_bounds__(256, 2) PLOW_SYM(plow_norm_rms_pf)(PlowProgram prog,
+                                                                            unsigned inst) {
+    __shared__ float part[32];
+    void* const* t = prog.tensors;
+#define NRP_TEN(d, k) ((d)->t[k] == PLOW_TENSOR_NONE ? nullptr : t[(d)->t[k]])
+    const PlowDevInst* nr = prog.insts + inst;
+    const PlowDevInst* rn = nr + 1;
+    d_norm_residual((__nv_bfloat16*)NRP_TEN(nr, 0), (const __nv_bfloat16*)NRP_TEN(nr, 1),
+                    (const __nv_bfloat16*)NRP_TEN(nr, 2), (const __nv_bfloat16*)NRP_TEN(nr, 3), nr->i[0],
+                    nr->i[1], nr->fj[0].f, nr->fj[1].f, blockIdx.x, gridDim.x, part);
+    __syncthreads();
+    d_rmsnorm((__nv_bfloat16*)NRP_TEN(rn, 0), (const __nv_bfloat16*)NRP_TEN(rn, 1),
+              (const __nv_bfloat16*)NRP_TEN(rn, 2), rn->i[0], rn->i[1], rn->fj[0].f, rn->i[2], blockIdx.x,
+              gridDim.x, part, (uint8_t*)NRP_TEN(rn, 3), (float*)NRP_TEN(rn, 4));
+#undef NRP_TEN
 }
 #endif

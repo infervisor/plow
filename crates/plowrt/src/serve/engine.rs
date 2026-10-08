@@ -368,6 +368,19 @@ impl ServeEngine {
         }
     }
 
+    /// Packed prefill launch widths `(per-request cap, widest launch)`; `None` without packed
+    /// CUDA prefill.
+    pub fn pf_launch_rungs(&self) -> Option<(usize, usize)> {
+        match self {
+            #[cfg(feature = "cuda")]
+            ServeEngine::Cuda(e) if e.pf_batch_enabled() && e.pf_max_rows() > 0 => {
+                Some((e.pf_request_max_rows(), e.pf_max_rows()))
+            }
+            #[allow(unreachable_patterns)]
+            _ => None,
+        }
+    }
+
     /// What the device can back, so the mux admits on KV bytes instead of free slots alone.
     /// `None` = admit on slots, the behaviour every non-AMD engine keeps.
     pub fn kv_admission_budget(&self) -> Option<crate::sched::admission::KvBudget> {

@@ -3665,7 +3665,8 @@ fn check_glm_flat_segments(resident: bool) {
     let verify: crate::VerifyHook = Box::new(move |model| {
         let mut checked = 0;
         let prefill_count = packet::devbuild::decode_rung_lo(&model.prog_t);
-        assert_eq!(prefill_count, if resident { 15 } else { 1 });
+        // `full:128` at ctx 81920 also ships the 8192 rung.
+        assert_eq!(prefill_count, if resident { 15 } else { 2 });
         for (p, (prog, &rows)) in model.progs.iter().zip(&model.prog_t).enumerate() {
             let decode = p >= prefill_count;
             let native = prog

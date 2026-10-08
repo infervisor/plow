@@ -128,6 +128,8 @@ pub(crate) struct Lt {
     stored: std::collections::HashMap<(u32, u32, u32), Algo>,
     /// `PLOW_LT_ALGOS_WRITE`: append every load-time selection here.
     write: Option<std::path::PathBuf>,
+    /// `PLOW_CUTLASS_FP8_DECODE`: small-M FP8 decode projections.
+    cutlass_fp8: Option<Arc<super::cutlass_fp8::CutlassFp8>>,
 }
 
 impl Lt {
@@ -164,6 +166,16 @@ impl Lt {
             );
         }
         let write = nv.lt_algos_write.as_deref().map(std::path::PathBuf::from);
+        let cutlass_fp8 = nv
+            .cutlass_fp8_decode
+            .as_deref()
+            .map(|pins| {
+                let dir = nv.pf_seg_dir.as_deref().ok_or_else(|| {
+                    RuntimeError::Rejected("PLOW_CUTLASS_FP8_DECODE requires PLOW_PF_SEG_DIR".into())
+                })?;
+                super::cutlass_fp8::CutlassFp8::load(be, std::path::Path::new(dir), pins)
+            })
+            .transpose()?;
         Ok(Arc::new(Self {
             be: be.clone(),
             api,
@@ -171,7 +183,12 @@ impl Lt {
             workspace,
             stored,
             write,
+            cutlass_fp8,
         }))
+    }
+
+    pub(crate) fn cutlass_fp8(&self) -> Option<&Arc<super::cutlass_fp8::CutlassFp8>> {
+        self.cutlass_fp8.as_ref()
     }
 
     fn record(&self, m: u32, n: u32, k: u32, algo: &Algo, workspace: usize, matmul_us: f32) {
@@ -225,6 +242,7 @@ impl Lt {
         k: u32,
         weight_scale: u64,
         input_scale: u64,
+        fast_accum: bool,
     ) -> Result<Arc<Plan>> {
         self.be.bind()?;
         let mut plan = Plan {
@@ -254,6 +272,18 @@ impl Lt {
                         size_of::<i32>(),
                     ),
                     "FP8 Lt mode",
+                )?;
+            }
+            // CUBLASLT_MATMUL_DESC_FAST_ACCUM = 25 (int8).
+            if fast_accum {
+                check(
+                    (self.api.cublasLtMatmulDescSetAttribute)(
+                        raw,
+                        25,
+                        &1i8 as *const _ as *const c_void,
+                        size_of::<i8>(),
+                    ),
+                    "FP8 Lt fast accumulation",
                 )?;
             }
             for (attr, value) in [(17, weight_scale), (18, input_scale)] {
@@ -1351,8 +1381,8 @@ mod tests {
         be.upload(&weight, 0, &w)?;
         be.upload(&ws, 0, bytemuck::cast_slice(&scales))?;
         be.upload(&ws2, 0, bytemuck::cast_slice(&scales2))?;
-        let first = lt.fp8_plan(m as u32, n as u32, k as u32, ws.base, xs.base)?;
-        let second = lt.fp8_plan(m as u32, n as u32, k as u32, ws2.base, xs.base)?;
+        let first = lt.fp8_plan(m as u32, n as u32, k as u32, ws.base, xs.base, false)?;
+        let second = lt.fp8_plan(m as u32, n as u32, k as u32, ws2.base, xs.base, false)?;
         for iteration in 1..=2 {
             let xscales: Vec<f32> = (0..m)
                 .map(|i| (1 + i % 8) as f32 * iteration as f32 / 16.0)

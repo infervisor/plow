@@ -9226,13 +9226,13 @@ pub(crate) fn glm_prefill_buckets(ctx: u32) -> Vec<u32> {
 ///   * `1`              — attention-only buckets on the ladder above;
 ///   * `128,512`        — attention-only buckets on the given rungs;
 ///   * `full`           — whole-layer prefill (attention + FFN) on the whole ladder;
-///   * `full:128,512`   — whole-layer prefill on the given rungs ONLY.
+///   * `full:128,512`   — whole-layer prefill on the given rungs only.
 ///
-/// The scoped-list form exists because the ladder's top rungs are not free in DEVICE MEMORY: every
-/// activation is declared for the WIDEST bucket, and `act.part` alone is `T * top_k * hidden` f32 —
-/// 1.6 GiB at T=8192 on GLM-5.2. A run that will only ever see 1k prompts should not pay for the
-/// 8192 rung, and before this form the only way to limit the ladder also silently downgraded the
-/// scope to attention-only, which for a MODEL emit produces a blob that cannot sample.
+/// Every list also gets the 8192 rung once ctx reaches it ([`crate::ALWAYS_RUNG`]), although every
+/// activation is declared for the WIDEST bucket and `act.part` alone is `T * top_k * hidden` f32 —
+/// 1.6 GiB at T=8192 on GLM-5.2. The scoped-list form still trims the rungs below it, and before it
+/// the only way to limit the ladder also silently downgraded the scope to attention-only, which
+/// for a MODEL emit produces a blob that cannot sample.
 pub(crate) fn glm_prefill_buckets_env(ctx: u32) -> (Vec<u32>, PrefillScope) {
     let parse_list = |list: &str| -> Vec<u32> {
         list.split(',')
@@ -9244,8 +9244,11 @@ pub(crate) fn glm_prefill_buckets_env(ctx: u32) -> (Vec<u32>, PrefillScope) {
         None | Some("") | Some("0") => (Vec::new(), PrefillScope::Attn),
         Some("1") => (glm_prefill_buckets(ctx), PrefillScope::Attn),
         Some("full") => (glm_prefill_buckets(ctx), PrefillScope::Full),
-        Some(s) if s.starts_with("full:") => (parse_list(&s["full:".len()..]), PrefillScope::Full),
-        Some(list) => (parse_list(list), PrefillScope::Attn),
+        Some(s) if s.starts_with("full:") => (
+            crate::with_always_rung(parse_list(&s["full:".len()..]), ctx),
+            PrefillScope::Full,
+        ),
+        Some(list) => (crate::with_always_rung(parse_list(list), ctx), PrefillScope::Attn),
     }
 }
 

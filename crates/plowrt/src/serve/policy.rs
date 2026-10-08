@@ -167,6 +167,97 @@ pub fn observe(load: Load) -> bool {
     true
 }
 
+/// Prefill launch width. A packed launch wider than the per-request cap only ever packs several
+/// prompts, and every prompt in it finishes when the whole launch does: E4B 1000/128 c64/c128 ran
+/// TTFT p50 108/117 ms at the 2048-row cap and 248/261 ms on the full ladder, for +1/+2% tok/s
+/// and -10% TTFT p99 (the cold burst).
+/// The decode width cannot pick it (c64 is throughput by width), and neither can the prompt rows
+/// already seated: widening on four top rungs of them let each closed-loop wave of returning
+/// requests (36K rows) re-enter wide and stay synchronized, TTFT p50 550/690 ms. The throughput
+/// signals are demand the slots cannot seat: a widest launch of prompt rows queued with every
+/// slot taken, or KV pressure. Wide enters at once and narrows after `CALM_MS` with no request
+/// waiting at all and KV under the band: a dwell of 0.5 s on "every slot taken" alone flipped 12
+/// times in 26 s of a 48 req/s overload as single slots freed and refilled.
+
+static PF_WIDE: AtomicU8 = AtomicU8::new(0);
+static PF_SWITCHES: AtomicU64 = AtomicU64::new(0);
+static PF_CALM_SINCE: AtomicU64 = AtomicU64::new(NOT_CALM);
+
+/// One tick's prefill signals.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PrefillLoad {
+    /// Prompt rows of the requests waiting while every slot is taken.
+    pub overflow_rows: usize,
+    /// Requests waiting for a slot.
+    pub queued: usize,
+    /// The widest compiled prefill launch.
+    pub top_rows: usize,
+    pub kv_used: f64,
+}
+
+fn decide_prefill(wide: bool, calm_since: u64, now: u64, load: PrefillLoad) -> (bool, u64) {
+    let PrefillLoad { overflow_rows, queued, top_rows, kv_used } = load;
+    if overflow_rows >= top_rows || kv_used >= KV_ENTER {
+        (true, NOT_CALM)
+    } else if wide && queued == 0 && kv_used < KV_LEAVE {
+        let since = if calm_since == NOT_CALM { now } else { calm_since };
+        if now.saturating_sub(since) >= CALM_MS {
+            (false, NOT_CALM)
+        } else {
+            (true, since)
+        }
+    } else {
+        (wide, NOT_CALM)
+    }
+}
+
+/// Whether prefill launches may use the full ladder: fixed by a pinned objective, observed under
+/// `auto`.
+pub fn wide_prefill() -> bool {
+    match objective() {
+        Objective::Latency => false,
+        Objective::Throughput => true,
+        Objective::Auto => PF_WIDE.load(Ordering::Relaxed) != 0,
+    }
+}
+
+/// Prefill rows per launch while requests decode: the full ladder (`top`) when wide, else the
+/// per-request cap (`request`), the widest launch one prompt fills alone.
+pub fn prefill_launch_rows(request: usize, top: usize) -> usize {
+    if wide_prefill() {
+        top
+    } else {
+        request.min(top)
+    }
+}
+
+/// One tick's prefill observation. A no-op unless the objective is `auto`; `true` when the width
+/// switched.
+pub fn observe_prefill(load: PrefillLoad) -> bool {
+    if objective() != Objective::Auto || load.top_rows == 0 {
+        return false;
+    }
+    let wide = PF_WIDE.load(Ordering::Relaxed) != 0;
+    let now = EPOCH.get_or_init(Instant::now).elapsed().as_millis() as u64;
+    let (next, calm) = decide_prefill(wide, PF_CALM_SINCE.load(Ordering::Relaxed), now, load);
+    PF_CALM_SINCE.store(calm, Ordering::Relaxed);
+    if next == wide {
+        return false;
+    }
+    PF_WIDE.store(u8::from(next), Ordering::Relaxed);
+    let switches = PF_SWITCHES.fetch_add(1, Ordering::Relaxed) + 1;
+    tracing::info!(
+        wide = next,
+        overflow_rows = load.overflow_rows,
+        queued = load.queued,
+        top_rows = load.top_rows,
+        kv_used = load.kv_used,
+        switches,
+        "serve objective: prefill width switched"
+    );
+    true
+}
+
 /// Decode steps per host sync for rows the lookahead pipeline does not carry.
 ///
 /// `PLOW_MULTISTEP` pins it. Otherwise latency on CUDA runs one token group per sync: a chat
@@ -290,6 +381,31 @@ mod tests {
             let (c, _) = decide(from, 0, 10 * CALM_MS, load(6, 0, 0.0));
             assert_eq!(c, from, "6 rows is inside [{WIDE_LEAVE}, {WIDE_ENTER})");
         }
+    }
+
+    fn pf(overflow_rows: usize, queued: usize, kv_used: f64) -> PrefillLoad {
+        PrefillLoad { overflow_rows, queued, top_rows: 8192, kv_used }
+    }
+
+    #[test]
+    fn overflow_of_one_widest_launch_or_kv_pressure_widens_prefill_at_once() {
+        for l in [pf(8192, 8, 0.0), pf(0, 0, KV_ENTER)] {
+            assert_eq!(decide_prefill(false, NOT_CALM, 10, l), (true, NOT_CALM), "{l:?}");
+        }
+        assert_eq!(decide_prefill(false, NOT_CALM, 10, pf(8191, 8, 0.0)), (false, NOT_CALM));
+        assert_eq!(decide_prefill(false, NOT_CALM, 10, pf(0, 64, 0.0)).0, false, "a rung hold is not overflow");
+    }
+
+    #[test]
+    fn wide_prefill_narrows_only_after_no_request_waits() {
+        assert_eq!(decide_prefill(true, NOT_CALM, 10 * CALM_MS, pf(0, 1, 0.0)).0, true, "a queue below overflow");
+        assert_eq!(decide_prefill(true, NOT_CALM, 10 * CALM_MS, pf(0, 0, 0.8)).0, true, "KV band");
+        let (w, calm) = decide_prefill(true, NOT_CALM, 1_000, pf(0, 0, 0.0));
+        assert_eq!((w, calm), (true, 1_000), "calm starts");
+        assert_eq!(decide_prefill(true, calm, 1_000 + CALM_MS - 1, pf(0, 0, 0.0)).0, true);
+        assert_eq!(decide_prefill(true, calm, 1_000 + CALM_MS, pf(0, 0, 0.0)), (false, NOT_CALM));
+        assert_eq!(decide_prefill(true, calm, 1_200, pf(0, 1, 0.0)), (true, NOT_CALM), "a waiter resets calm");
+        assert_eq!(decide_prefill(false, NOT_CALM, 10, pf(4_000, 4, 0.8)).0, false, "the bands do not widen");
     }
 
     #[test]
