@@ -3611,6 +3611,16 @@ fn run_one_tick(
                 // prefix-cache hit would then run alone at the smallest rung that holds its
                 // suffix. Seed every waiting slot first so the suffix is a candidate here.
                 for (i, slot_opt) in slots.iter_mut().enumerate().take(b) {
+                    if e.resume_before_pack() {
+                        if let Some(s) = slot_opt
+                            .as_mut()
+                            .filter(|s| s.step == 0 && s.pf_pos == 0 && s.resume > 0)
+                        {
+                            s.resume = if s.cfg.is_none() { e.resume_slot(i, s.resume) } else { 0 };
+                            s.pf_pos = s.resume;
+                            s.cached_tokens = s.resume;
+                        }
+                    }
                     let Some(slot) = slot_opt
                         .as_ref()
                         .filter(|slot| slot.step == 0 && !slot.respond.is_closed())
