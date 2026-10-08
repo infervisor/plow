@@ -1955,7 +1955,9 @@ pub enum DevOp {
     /// FP32 relative-position attention. Q/K/V/position/context are `[rows,width]`, position has
     /// `2*rows-1` rows, and u/v are `[heads,width/heads]`. `left_chunks = u32::MAX` selects full
     /// attention; otherwise keys span the query chunk and `left_chunks` preceding chunks. Optional
-    /// `t7` (u32): keys before that row are excluded (a cache-aware stream's unfilled window).
+    /// `t7` (u32), chunked: keys before that row are excluded (a cache-aware stream's unfilled
+    /// window); full attention: the valid rows of a padded input, so later keys are excluded and
+    /// later context rows are written as zeros.
     /// `i5` (0 = all) skips the query rows before it; their context rows are not written.
     /// `t0=context t1=query t2=key t3=value t4=position t5=bias_u t6=bias_v t7=key_start?` ·
     /// `i0=rows i1=width i2=heads i3=chunk_size i4=left_chunks i5=query_row0`.

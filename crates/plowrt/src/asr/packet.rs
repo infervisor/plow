@@ -13,7 +13,8 @@ pub struct PacketRnntTranscriber {
     frontend: PacketLogMelFrontend,
     execution: PacketRnnt,
     vocabulary: Vec<String>,
-    language: String,
+    /// The compiled prompt's language; `None` for an unprompted packet.
+    language: Option<String>,
     streams: std::collections::HashMap<u64, TranscriberStream>,
     next_stream: u64,
 }
@@ -32,9 +33,14 @@ impl PacketRnntTranscriber {
         let vocabulary = string_array(&model, "asr.tokenizer.vocab")?;
         let execution = PacketRnnt::load(packet, backend)?;
         let frontend = execution.log_mel_frontend()?;
-        let prompt_index = usize::try_from(execution.parameter("prompt_index")?)
-            .map_err(|_| rejected("prompt index overflows"))?;
-        let language = prompt_language(&model, prompt_index)?;
+        // Unprompted packets (Parakeet) detect the language themselves.
+        let language = if execution.parameter("prompt_count")? == 0 {
+            None
+        } else {
+            let prompt_index = usize::try_from(execution.parameter("prompt_index")?)
+                .map_err(|_| rejected("prompt index overflows"))?;
+            Some(prompt_language(&model, prompt_index)?)
+        };
         Ok(Self {
             frontend,
             execution,
@@ -103,21 +109,21 @@ impl Transcriber for PacketRnntTranscriber {
         }
     }
 
+    /// A prompted packet answers in its compiled language only; an unprompted one detects the
+    /// language itself, so a requested language is accepted but not applied.
     fn language(&self, requested: Option<&str>) -> Result<Option<String>> {
-        let Some(requested) = requested else {
-            return Ok(Some(self.language.clone()));
+        let Some(compiled) = &self.language else {
+            return Ok(None);
         };
-        let compatible = requested.eq_ignore_ascii_case(&self.language)
-            || (self.language.eq_ignore_ascii_case("en-US")
+        let Some(requested) = requested else {
+            return Ok(Some(compiled.clone()));
+        };
+        let compatible = requested.eq_ignore_ascii_case(compiled)
+            || (compiled.eq_ignore_ascii_case("en-US")
                 && matches!(requested.to_ascii_lowercase().as_str(), "en" | "english"));
         compatible
-            .then(|| Some(self.language.clone()))
-            .ok_or_else(|| {
-                rejected(format!(
-                    "packet was compiled for {}, not {requested}",
-                    self.language
-                ))
-            })
+            .then(|| Some(compiled.clone()))
+            .ok_or_else(|| rejected(format!("packet was compiled for {compiled}, not {requested}")))
     }
 
     fn transcribe(
