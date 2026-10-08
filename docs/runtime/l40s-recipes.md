@@ -155,3 +155,28 @@ On CUDA `auto` steers by live decode width, queue depth and KV share; `--ttft-sl
 `--tbt-slo-ms` only feed the goodput counters (`plowrt_slo_*`). Past the knee `auto` keeps TPOT
 under the 50 ms target and the queue absorbs the excess (Gemma at 48 sessions: TPOT p99 50 ms,
 TTFT p50 5.4 s), so the admission rate, not the SLO, bounds TTFT there.
+
+## Production soak (one model per L40S)
+
+Each model alone on one GPU, `plowrt serve --objective auto` with recipe defaults, ~25 min:
+warm 0.5x knee, sustained 0.9x (10 min), overload 2x (3 min), recovery 0.5x (5 min), 3x bursts
+of 15 s per minute. Mixed shapes: ASR 1-30 s clips at 8-48 kHz over HTTP, SSE, WebSocket and
+OpenAI Realtime; multi-turn and long-prompt chat, streamed and not; short and long TTS texts,
+streamed and whole, mixed languages on MTL; 2% client disconnects, 1% malformed requests.
+
+| model | 2xx | shed (429 / in-band rate limit) | 4xx (malformed) | 5xx | accuracy after |
+|---|---|---|---|---|---|
+| Qwen3-ASR 1.7B | 32958 | 176 / 29 | 325 | 0 | WER 0.03826 |
+| Qwen3-ASR 0.6B | 61324 | 4358 / 717 | 671 | 0 | WER 0.04261 |
+| Nemotron 3.5 | 10486 | 3866 / 647 | 129 | 0 | WER 0.0513 |
+| Gemma 4 E4B | 5461 | queues | 15 | 0 | greedy 10-11/11 equal to a fresh server |
+| Orpheus | 2276 | queues | 21 | 0 | CER 0.000 |
+| Veena | 3364 | queues | 24 | 0 | CER 0.000 |
+| Chatterbox | 4191 | queues | 43 | 0 | CER 0.000 |
+| Chatterbox MTL | 2108 | queues | 23 | 0 | CER 0.000 |
+
+`/health` answered 200 on every 1 s sample; no panic, CUDA error or restart; latency back to warm
+levels within 10 s of recovery; GPU memory and RSS step up at peak concurrency and hold flat
+through recovery. Gemma and TTS queue rather than shed, so 3x bursts stretch their tails (Gemma
+TTFT p99 10.5 s, Chatterbox TTFA p99 18.7 s). Orpheus and Veena packets cap a request at 1200 /
+700 generated tokens (~14.6 / 8.5 s of audio): longer input is cut short with a 200.

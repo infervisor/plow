@@ -1486,6 +1486,29 @@ impl VmmKv {
         self.shared.cache_min_free.store(min_free_bytes, Ordering::Relaxed);
     }
 
+    /// Give memory back for an allocation outside this pool that failed for lack of it (a
+    /// lazily instantiated graph): release pooled blocks, then evict cached prefixes until the
+    /// device reports `bytes` above the pressure floor free. `false` = nothing was freed.
+    pub fn relieve(&self, bytes: u64) -> bool {
+        let s = &*self.shared;
+        let mut inner = s.inner.lock();
+        let mut freed = false;
+        while let Some(handle) = inner.pooled.pop() {
+            inner.stats.blocks_pooled -= 1;
+            s.ops.release(handle);
+            freed = true;
+        }
+        let target = s.cache_min_free.load(Ordering::Relaxed).saturating_add(bytes);
+        let queued = inner.release_queued;
+        while s.ops.free_bytes().is_some_and(|free| free + (inner.release_queued - queued) < target) {
+            if !evict_one(s, &mut inner, false) {
+                break;
+            }
+            freed = true;
+        }
+        freed
+    }
+
     /// Take slot recycling off the caller's thread: [`Self::begin_seq`] keeps a
     /// private row-0 block in place and hands the rest of the window to the
     /// pool thread (see [`retire_window`]); zero-ref handles past the pool cap
@@ -6170,6 +6193,28 @@ mod tests {
         p.begin_seq(0);
         assert_eq!(p.stats().cache_bytes, 0, "a scarce-memory report must evict although cache_cap was nowhere near its limit");
         assert_eq!(ops.frees.load(Ordering::SeqCst), 1);
+    }
+
+    /// A graph instantiation that ran out of memory gets the cache back: `relieve` evicts while
+    /// the device is short of floor + request, and reports when there was nothing to free.
+    #[test]
+    fn relieve_evicts_the_cache_for_an_outside_allocation() {
+        let ops = Arc::new(MockVmm::default());
+        let mut p = pool_with_cap(ops.clone(), 1 << 20);
+        p.enable_pressure_eviction(500);
+        *ops.free_bytes.lock().unwrap() = Some(1 << 30);
+        let a = prompt(17);
+        p.try_attach(0, &a).unwrap();
+        p.ensure_rows(0, 17).unwrap();
+        p.publish(0, &a, 192, |_| Ok(())).unwrap();
+        p.begin_seq(0);
+        assert!(p.stats().cache_bytes > 0);
+        assert!(!p.relieve(256), "ample free memory: nothing to evict");
+        assert!(p.stats().cache_bytes > 0);
+        *ops.free_bytes.lock().unwrap() = Some(600); // above the floor, short of floor + 256
+        assert!(p.relieve(256));
+        assert_eq!(p.stats().cache_bytes, 0);
+        assert!(!p.relieve(256), "an empty cache cannot help");
     }
 
     /// A backend that cannot answer `free_bytes` (every real one, today) must not silently

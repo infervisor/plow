@@ -169,6 +169,9 @@ async fn speech_on_guided(
     if req.input.trim().is_empty() {
         return bad("`input` is empty", "input");
     }
+    if req.speed.is_some_and(|s| s != 1.0) {
+        return bad("only speed 1.0 is supported", "speed");
+    }
     let seed = req.seed.unwrap_or_else(|| {
         std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(1)
     });
@@ -179,7 +182,7 @@ async fn speech_on_guided(
     if req.stream {
         let mut ev = match w.synthesize_stream(&mux, req.voice.clone(), req.input.clone(), lang.as_deref(), seed, ids, report) {
             Ok(rx) => rx,
-            Err(e) => return server_error(e),
+            Err(e) => return speech_failure(e),
         };
         let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<Result<Vec<u8>, std::io::Error>>(64);
         if wav {
@@ -244,7 +247,7 @@ async fn speech_on_guided(
         run.done();
     }
     let mut response = match result {
-        Err(e) => server_error(e),
+        Err(e) => speech_failure(e),
         Ok(a) => {
             let audio_s = a.pcm.len() as f64 / f64::from(w.sample_rate);
             let mut out = if wav { wav_header(w.sample_rate, (a.pcm.len() * 2) as u32) } else { Vec::new() };
@@ -311,6 +314,13 @@ fn server_error(msg: impl Into<String>) -> Response {
         return crate::serve::api_error(StatusCode::TOO_MANY_REQUESTS, msg, "rate_limit_error", Some("server_overloaded"), None);
     }
     crate::serve::api_error(StatusCode::INTERNAL_SERVER_ERROR, msg, "server_error", None, None)
+}
+
+fn speech_failure(e: super::guided_speech::SpeechError) -> Response {
+    match e {
+        super::guided_speech::SpeechError::Invalid(msg, param) => bad(msg, param),
+        super::guided_speech::SpeechError::Failed(msg) => server_error(msg),
+    }
 }
 
 pub async fn speech(
@@ -699,6 +709,16 @@ mod tests {
 
     const WINDOW: usize = 6;
     const LOOKAHEAD: usize = 2;
+
+    /// A request the guided pipeline cannot take is the client's error, not a server fault.
+    #[test]
+    fn guided_speech_failures_map_to_their_status() {
+        use super::super::guided_speech::{SpeechError, QUEUE_FULL};
+        let invalid = speech_failure(SpeechError::Invalid("unknown voice \"x\"".into(), "voice"));
+        assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(speech_failure(SpeechError::Failed(QUEUE_FULL.into())).status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(speech_failure(SpeechError::Failed("render failed".into())).status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
 
     /// Every frame is emitted exactly once, in order, each with LOOKAHEAD right context until
     /// the final flush and the one-frame window's left context; later windows emit CHUNK frames

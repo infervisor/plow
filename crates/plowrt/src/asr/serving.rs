@@ -209,15 +209,20 @@ enum SubmitError {
 
 impl AsrMux {
     fn spawn(engine: Box<dyn Transcriber>) -> (Self, usize, FinalizationPolicy) {
-        Self::spawn_with(engine, Arc::new(crate::obs::Metrics::default()))
+        Self::spawn_with(engine, Arc::new(crate::obs::Metrics::default()), 4)
     }
 
-    fn spawn_with(mut engine: Box<dyn Transcriber>, metrics: Arc<crate::obs::Metrics>) -> (Self, usize, FinalizationPolicy) {
+    /// `min_queue` floors the ingress queue (four batches otherwise).
+    fn spawn_with(
+        mut engine: Box<dyn Transcriber>,
+        metrics: Arc<crate::obs::Metrics>,
+        min_queue: usize,
+    ) -> (Self, usize, FinalizationPolicy) {
         metrics.serving.asr.cohort.store(true, Ordering::Relaxed);
         let _ = crate::obs::serving::started_at_unix_ms();
         let batch_capacity = engine.batch_capacity().max(1);
         let finalization = engine.finalization_policy();
-        let ingress_capacity = batch_capacity.saturating_mul(4).max(4);
+        let ingress_capacity = batch_capacity.saturating_mul(4).max(min_queue);
         let (tx, mut rx) = mpsc::channel::<AsrJob>(ingress_capacity);
         std::thread::Builder::new()
             .name("plow-asr-engine".into())
@@ -628,10 +633,16 @@ fn packet_models() -> &'static parking_lot::RwLock<HashMap<String, (AsrMux, Fina
     MODELS.get_or_init(Default::default)
 }
 
+/// Requests a packet model on `plowrt serve` queues before 429. Its engine runs one utterance at a
+/// time (~0.1-0.2 s on an L40S), so four slots refused a burst of 16 clients on an idle server and
+/// shed WebSocket partials at a fraction of capacity; 32 bounds the queue wait to a few seconds.
+#[cfg(any(feature = "cuda", test))]
+const SERVE_PACKET_QUEUE: usize = 32;
+
 /// Serve `engine` as `name` on `plowrt serve`, counting into that model's serve metrics.
 #[cfg(feature = "cuda")]
 pub fn host_packet_model(state: &crate::serve::AppState, name: String, engine: Box<dyn Transcriber>) {
-    let (mux, _, finalization) = AsrMux::spawn_with(engine, state.model_metrics(&name));
+    let (mux, _, finalization) = AsrMux::spawn_with(engine, state.model_metrics(&name), SERVE_PACKET_QUEUE);
     packet_models().write().insert(name, (mux, finalization));
 }
 
@@ -2037,6 +2048,17 @@ mod tests {
 
     #[tokio::test]
     async fn mux_rejects_only_after_its_bounded_queue_is_full() {
+        assert_eq!(bounded_queue(AsrMux::spawn).await, 4);
+    }
+
+    #[tokio::test]
+    async fn serve_packet_mux_queues_a_burst() {
+        let spawn = |e| AsrMux::spawn_with(e, Arc::new(crate::obs::Metrics::default()), SERVE_PACKET_QUEUE);
+        assert_eq!(bounded_queue(spawn).await, SERVE_PACKET_QUEUE);
+    }
+
+    /// Holds one transcription, fills the queue, checks the next submit is refused; returns the depth.
+    async fn bounded_queue(spawn: impl FnOnce(Box<dyn Transcriber>) -> (AsrMux, usize, FinalizationPolicy)) -> usize {
         struct Held {
             started: Arc<tokio::sync::Notify>,
             release: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
@@ -2066,7 +2088,7 @@ mod tests {
         }
         let started = Arc::new(tokio::sync::Notify::new());
         let release = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
-        let (mux, ingress_capacity, _) = AsrMux::spawn(Box::new(Held {
+        let (mux, ingress_capacity, _) = spawn(Box::new(Held {
             started: started.clone(),
             release: release.clone(),
         }));
@@ -2092,6 +2114,7 @@ mod tests {
         for reply in queued {
             assert!(reply.await.unwrap().is_ok());
         }
+        ingress_capacity
     }
 
     struct Fake;

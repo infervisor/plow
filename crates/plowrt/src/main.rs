@@ -78,11 +78,11 @@ enum Cmd {
         backend: String,
     },
     /// Load compiled assets and serve the OpenAI-compatible API.
-    // A serve needs a source, and there are two: a directory on disk or a
-    // reference in the local store. Grouping them means the error names BOTH,
-    // rather than telling a `--model` user that `--assets` is required.
+    // A serve needs a source: a directory on disk, a reference in the local store, or a packet
+    // ASR model. Grouping them means the error names all of them, rather than telling a
+    // `--model` user that `--assets` is required.
     #[command(group(clap::ArgGroup::new("model_source").required(true).multiple(true)
-        .args(["assets", "model"])))]
+        .args(["assets", "model", "asr_packets"])))]
     Serve {
         /// One or more compiled-model directories.
         #[arg(long = "assets")]
@@ -1206,6 +1206,13 @@ mod amd_bench_cli_tests {
         let cli = Cli::try_parse_from(["plowrt", "serve", "--assets", "model", "--bind", "10.77.0.2"]).unwrap();
         assert!(matches!(cli.cmd, super::Cmd::Serve { bind, .. } if bind.to_string() == "10.77.0.2"));
         assert!(Cli::try_parse_from(["plowrt", "serve", "--assets", "model", "--bind", "not-an-address"]).is_err());
+    }
+
+    #[test]
+    fn serve_accepts_a_packet_asr_model_alone() {
+        let cli = Cli::try_parse_from(["plowrt", "serve", "--asr-packet", "asr=a.pkt"]).unwrap();
+        assert!(matches!(cli.cmd, super::Cmd::Serve { ref assets, .. } if assets.is_empty()));
+        assert!(Cli::try_parse_from(["plowrt", "serve"]).is_err());
     }
 
     #[test]

@@ -10563,7 +10563,31 @@ impl GpuEngine {
 
     /// `riders`: the graph also runs the token-batch rider attention after each attention
     /// segment, sized on the device by the launch's `Riders::arm` (its own cache key).
+    /// A graph is built on its slot's first use, when the prefix cache may already hold the
+    /// device at its pressure floor: out of memory, the cache gives some back and the build is
+    /// retried once instead of failing the request.
     fn ensure_seg_graph_with(
+        &mut self,
+        bi: usize,
+        arg: &DevProgram,
+        range: std::ops::Range<usize>,
+        riders: bool,
+    ) -> Result<()> {
+        const RELIEF: u64 = 512 << 20;
+        match self.build_seg_graph(bi, arg, range.clone(), riders) {
+            Err(e) if e.device_code() == Some(2) => {
+                let relieved = self.vmm.as_ref().and_then(|v| v.kv.as_ref()).is_some_and(|kv| kv.relieve(RELIEF));
+                tracing::warn!(error = %e, bucket = bi, relieved, "seg graph out of memory; relieving the prefix cache");
+                if !relieved {
+                    return Err(e);
+                }
+                self.build_seg_graph(bi, arg, range, riders)
+            }
+            r => r,
+        }
+    }
+
+    fn build_seg_graph(
         &mut self,
         bi: usize,
         arg: &DevProgram,
