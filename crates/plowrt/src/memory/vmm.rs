@@ -274,6 +274,15 @@ pub struct VmmRings {
     /// Decode and padded prefill rows write garbage into slots without a request; with this
     /// backing those writes land in shared scratch instead of forcing a real ring per idle row.
     idle: Vec<(u64, u64)>,
+    /// `(unit bytes, handle)` released units kept for the next commit: a fresh `cuMemCreate`
+    /// pays the driver's page commit (~17 ms a 224 MiB slot) on the admission path. Unbounded
+    /// while any slot is mapped, trimmed to `spare_cap` bytes once none is.
+    spare: Vec<(u64, u64)>,
+    spare_cap: u64,
+    recycle: bool,
+    /// Released slots whose units stay mapped in place (recycling): readmitting the slot costs no
+    /// driver call, and another slot takes them over only when no spare unit is left.
+    parked: Vec<bool>,
 }
 
 impl VmmRings {
@@ -320,6 +329,10 @@ impl VmmRings {
                 mapped_prefix: 0,
             },
             idle: Vec::new(),
+            spare: Vec::new(),
+            spare_cap: 0,
+            recycle: false,
+            parked: vec![false; batch],
         };
         for t in tensors {
             let logical_bytes = t.slot_bytes * batch as u64;
@@ -379,6 +392,56 @@ impl VmmRings {
         Ok(rings)
     }
 
+    /// Device bytes [`Self::new_idle_backed`] commits before any slot is claimed: one idle unit
+    /// per distinct per-slot span, plus windows whose slots share units, committed whole.
+    pub fn idle_backed_startup_bytes(tensors: &[LiveRingTensor], batch: usize, granularity: u64) -> u64 {
+        let mut idle: Vec<u64> = Vec::new();
+        let mut pinned = 0u64;
+        for t in tensors {
+            if granularity != 0 && t.slot_bytes % granularity == 0 {
+                if !idle.contains(&t.slot_bytes) {
+                    idle.push(t.slot_bytes);
+                }
+            } else {
+                pinned += (t.slot_bytes * batch as u64).next_multiple_of(granularity.max(1));
+            }
+        }
+        pinned + idle.iter().sum::<u64>()
+    }
+
+    /// Keep released units for reuse instead of returning them to the driver: all of them while
+    /// the rings serve any slot, `idle_cap_bytes` once they serve none.
+    pub fn enable_handle_recycling(&mut self, idle_cap_bytes: u64) {
+        self.recycle = true;
+        self.spare_cap = idle_cap_bytes;
+    }
+
+    /// Released units kept for reuse ([`Self::enable_handle_recycling`]), parked ones included.
+    pub fn spare_bytes(&self) -> u64 {
+        let parked = self.parked.iter().filter(|&&p| p).count() as u64;
+        self.spare.iter().map(|&(bytes, _)| bytes).sum::<u64>() + parked * self.slot_charge()
+    }
+
+    /// Hand a parked slot's units to the spare list, its rows back to idle scratch.
+    fn unpark(&mut self, slot: usize) {
+        self.parked[slot] = false;
+        self.for_slot_units(slot, |rings, window, unit| rings.release_unit(window, unit));
+    }
+
+    fn for_slot_units(&mut self, slot: usize, mut f: impl FnMut(&mut Self, usize, usize)) {
+        for i in 0..self.windows.len() {
+            if self.windows[i].pinned {
+                continue;
+            }
+            let (slot_bytes, map_bytes) = (self.windows[i].slot_bytes, self.windows[i].map_bytes);
+            let first = slot as u64 * slot_bytes / map_bytes;
+            let last = ((slot as u64 + 1) * slot_bytes).div_ceil(map_bytes);
+            for unit in first..last {
+                f(self, i, unit as usize);
+            }
+        }
+    }
+
     /// Bytes one slot commits beyond the construction-time residency.
     pub fn slot_charge(&self) -> u64 {
         self.windows
@@ -412,8 +475,13 @@ impl VmmRings {
             self.ops.unmap(va, map_bytes);
             self.windows[window].idle[unit] = false;
         }
+        let spare = self.spare.iter().position(|&(bytes, _)| bytes == map_bytes);
+        let spare = spare.map(|i| self.spare.swap_remove(i).1);
         let result = (|| {
-            let handle = self.ops.create(map_bytes)?;
+            let handle = match spare {
+                Some(handle) => handle,
+                None => self.ops.create(map_bytes)?,
+            };
             if let Err(e) = self.ops.map(va, map_bytes, handle) {
                 self.ops.release(handle);
                 return Err(e);
@@ -462,6 +530,15 @@ impl VmmRings {
         if self.mapped[slot] {
             return Ok(());
         }
+        if std::mem::take(&mut self.parked[slot]) {
+            self.mark_mapped(slot);
+            return Ok(());
+        }
+        if self.spare.is_empty() {
+            if let Some(parked) = self.parked.iter().rposition(|&p| p) {
+                self.unpark(parked);
+            }
+        }
         let mut touched = Vec::new();
         for i in 0..self.windows.len() {
             if self.windows[i].pinned {
@@ -487,36 +564,43 @@ impl VmmRings {
                 touched.push((i, unit));
             }
         }
+        self.mark_mapped(slot);
+        Ok(())
+    }
+
+    fn mark_mapped(&mut self, slot: usize) {
         self.mapped[slot] = true;
         while self.prefix < self.mapped.len() && self.mapped[self.prefix] {
             self.prefix += 1;
         }
         self.stats.mapped_slots += 1;
         self.stats.mapped_prefix = self.prefix;
-        Ok(())
     }
 
     pub fn release_slot(&mut self, slot: usize) {
         if slot >= self.mapped.len() || !self.mapped[slot] {
             return;
         }
-        for i in 0..self.windows.len() {
-            if self.windows[i].pinned {
-                continue;
-            }
-            let slot_bytes = self.windows[i].slot_bytes;
-            let map_bytes = self.windows[i].map_bytes;
-            let first = slot as u64 * slot_bytes / map_bytes;
-            let end = (slot as u64 + 1) * slot_bytes;
-            let last = end.div_ceil(map_bytes);
-            for unit in first..last {
-                self.release_unit(i, unit as usize);
-            }
+        if self.recycle {
+            self.parked[slot] = true;
+        } else {
+            self.for_slot_units(slot, |rings, window, unit| rings.release_unit(window, unit));
         }
         self.mapped[slot] = false;
         self.prefix = self.prefix.min(slot);
         self.stats.mapped_slots -= 1;
         self.stats.mapped_prefix = self.prefix;
+        if self.stats.mapped_slots == 0 {
+            for parked in 0..self.parked.len() {
+                if self.parked[parked] {
+                    self.unpark(parked);
+                }
+            }
+            while self.spare_bytes() > self.spare_cap {
+                let (_, handle) = self.spare.pop().expect("spare over cap");
+                self.ops.release(handle);
+            }
+        }
     }
 
     /// Release a slot with no request unless the latest launch covered it: the next launch at that
@@ -535,10 +619,14 @@ impl VmmRings {
             return;
         }
         let handle = w.handles[unit].take().expect("referenced ring mapping");
-        self.ops
-            .unmap(w.va + unit as u64 * w.map_bytes, w.map_bytes);
-        self.ops.release(handle);
-        self.stats.resident_bytes -= w.map_bytes;
+        let bytes = w.map_bytes;
+        self.ops.unmap(w.va + unit as u64 * bytes, bytes);
+        if self.recycle {
+            self.spare.push((bytes, handle));
+        } else {
+            self.ops.release(handle);
+        }
+        self.stats.resident_bytes -= bytes;
         if let Err(e) = self.back_idle(window, unit) {
             tracing::error!(error = %e, "live ring idle backing lost");
         }
@@ -576,7 +664,7 @@ impl Drop for VmmRings {
             }
             self.ops.address_free(w.va, w.bytes);
         }
-        for (_, handle) in self.idle.drain(..) {
+        for (_, handle) in self.idle.drain(..).chain(self.spare.drain(..)) {
             self.ops.release(handle);
         }
     }
@@ -673,6 +761,29 @@ impl LiveKvLayout {
             ring_tensors,
             cache_tensors,
         })
+    }
+    /// Full caches as slot-granular rings when their head window is below one VMM block
+    /// (`block_bytes` refuses it) but each slot's span is whole granules.
+    pub fn slot_granular_full(
+        &self,
+        blob: &crate::asset::devblob::DevBlob,
+        granularity: u64,
+        block_hint: u64,
+    ) -> Option<Vec<LiveRingTensor>> {
+        if self.geometry.block_bytes(granularity, block_hint).is_ok() || granularity == 0 {
+            return None;
+        }
+        let batch = u64::from(self.geometry.batch);
+        self.full_tensors
+            .iter()
+            .flatten()
+            .map(|&tensor| {
+                let bytes = blob.tensors[tensor].bytes;
+                let slot_bytes = bytes / batch.max(1);
+                (slot_bytes > 0 && slot_bytes * batch == bytes && slot_bytes % granularity == 0)
+                    .then_some(LiveRingTensor { tensor, slot_bytes })
+            })
+            .collect()
     }
     pub fn from_blob(blob: &crate::asset::devblob::DevBlob) -> Result<Self> {
         let manifest = blob
@@ -1373,6 +1484,29 @@ impl VmmKv {
     /// Off by default (`min_free_bytes == 0`): every existing caller is unaffected.
     pub fn enable_pressure_eviction(&mut self, min_free_bytes: u64) {
         self.shared.cache_min_free.store(min_free_bytes, Ordering::Relaxed);
+    }
+
+    /// Give memory back for an allocation outside this pool that failed for lack of it (a
+    /// lazily instantiated graph): release pooled blocks, then evict cached prefixes until the
+    /// device reports `bytes` above the pressure floor free. `false` = nothing was freed.
+    pub fn relieve(&self, bytes: u64) -> bool {
+        let s = &*self.shared;
+        let mut inner = s.inner.lock();
+        let mut freed = false;
+        while let Some(handle) = inner.pooled.pop() {
+            inner.stats.blocks_pooled -= 1;
+            s.ops.release(handle);
+            freed = true;
+        }
+        let target = s.cache_min_free.load(Ordering::Relaxed).saturating_add(bytes);
+        let queued = inner.release_queued;
+        while s.ops.free_bytes().is_some_and(|free| free + (inner.release_queued - queued) < target) {
+            if !evict_one(s, &mut inner, false) {
+                break;
+            }
+            freed = true;
+        }
+        freed
     }
 
     /// Take slot recycling off the caller's thread: [`Self::begin_seq`] keeps a
@@ -4393,6 +4527,29 @@ mod tests {
     }
 
     #[test]
+    fn sub_granule_head_windows_commit_full_caches_per_slot() {
+        let (gran, hint) = (2u64 << 20, 2u64 << 20);
+        let mut blob = live_blob();
+        let mut layout = LiveKvLayout::from_blob(&blob).unwrap();
+        // 512 KiB heads: one slot's single head is not whole granules either.
+        assert!(layout.slot_granular_full(&blob, gran, hint).is_none());
+        // Block-mappable heads keep the row-granular pool.
+        assert!(layout.slot_granular_full(&blob, 512 << 10, 512 << 10).is_none());
+        // Qwen3-ASR shape: 8 heads x 2048 rows x hd128 bf16 = 4 MiB per slot.
+        (layout.geometry.kvh_full, layout.geometry.hd_full, layout.geometry.max_ctx) = (8, 128, 2048);
+        for t in [1, 2] {
+            blob.tensors[t].bytes = 4 * 8 * 2048 * 128 * 2;
+        }
+        let full = layout.slot_granular_full(&blob, gran, hint).unwrap();
+        assert_eq!(
+            full.iter().map(|t| (t.tensor, t.slot_bytes)).collect::<Vec<_>>(),
+            [(1, 4 << 20), (2, 4 << 20)]
+        );
+        blob.tensors[2].bytes += 4;
+        assert!(layout.slot_granular_full(&blob, gran, hint).is_none());
+    }
+
+    #[test]
     fn live_geometry_rejects_conflicting_or_unbounded_access() {
         use packet::dev::DevOp;
         let mutations: &[fn(&mut crate::asset::devblob::DevBlob)] = &[
@@ -6036,6 +6193,28 @@ mod tests {
         p.begin_seq(0);
         assert_eq!(p.stats().cache_bytes, 0, "a scarce-memory report must evict although cache_cap was nowhere near its limit");
         assert_eq!(ops.frees.load(Ordering::SeqCst), 1);
+    }
+
+    /// A graph instantiation that ran out of memory gets the cache back: `relieve` evicts while
+    /// the device is short of floor + request, and reports when there was nothing to free.
+    #[test]
+    fn relieve_evicts_the_cache_for_an_outside_allocation() {
+        let ops = Arc::new(MockVmm::default());
+        let mut p = pool_with_cap(ops.clone(), 1 << 20);
+        p.enable_pressure_eviction(500);
+        *ops.free_bytes.lock().unwrap() = Some(1 << 30);
+        let a = prompt(17);
+        p.try_attach(0, &a).unwrap();
+        p.ensure_rows(0, 17).unwrap();
+        p.publish(0, &a, 192, |_| Ok(())).unwrap();
+        p.begin_seq(0);
+        assert!(p.stats().cache_bytes > 0);
+        assert!(!p.relieve(256), "ample free memory: nothing to evict");
+        assert!(p.stats().cache_bytes > 0);
+        *ops.free_bytes.lock().unwrap() = Some(600); // above the floor, short of floor + 256
+        assert!(p.relieve(256));
+        assert_eq!(p.stats().cache_bytes, 0);
+        assert!(!p.relieve(256), "an empty cache cannot help");
     }
 
     /// A backend that cannot answer `free_bytes` (every real one, today) must not silently

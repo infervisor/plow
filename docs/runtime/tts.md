@@ -566,6 +566,36 @@ its own requests in flight at 256 and waits for mux room instead of answering 42
 request takes two slots, so the 128-slot rung serves 64 Chatterbox requests; the rest queue
 (`DECODE_RUNG_MAX` = 128 is the packet format's decode/prefill boundary).
 
+## Long inputs and real-time admission (codec-LM: Veena, Orpheus)
+
+`input` takes up to 4096 characters (`tts::MAX_INPUT_CHARS`, ~7 minutes of speech); longer is a
+400. A request's token budget is `min(chars x tokens.per_char_frames x 7 + 21, tokens.max_new_cap)`;
+an input past the length where the cap binds (`SpeechContract::segment_chars`: Veena 151, Orpheus
+141 characters) is spoken as segments of at most that length: whole sentences (`. ! ? … । ॥`, line
+breaks) packed greedily, a longer sentence split after clause marks, then between words. Segments
+generate in order with the same voice (seed + k when a seed is given) and stream back to back; a
+whole response is their concatenation. At a join, silence beyond a 0.5 s pause is dropped (Orpheus
+segments often open with 1-2 s of silence), a segment that keeps silent for 3 s after speaking
+ends, and one silent for 3 s from its start is generated again with another seed (twice at most).
+A request of one segment is unchanged. `max_tokens` applies per segment.
+
+Profiles (`devgen::tts`): Veena's cap 700 -> 1400 tokens (700 cut 8.3 s, inputs from ~110
+characters); Orpheus 1.3 -> 1.8 frames per character (its voices speak down to ~8 characters/s, so
+1.3 clipped the slow tail) and cap 1200 -> 1800. Tokens before the old limit are unchanged.
+
+Every codec-LM request shares the model's decode steps, so each one admitted slows the rest
+(L40S, Llama-3.2-3B BF16: 9 ms per token at B=1, 13.8 at B=32 against 85 ms of audio per 7-token
+frame). `tts::realtime` admits a request only while the step projected at one more generating
+request keeps every playing stream ahead of playback: each stream's sent-but-unplayed audio covers
+its remaining frames' deficit (`frames x (7 x step - 85 ms)`, frames from the characters left at
+the learnt frames per character, mean plus two mean deviations) with 0.25 s to spare (0.55 s with a
+segment still to start, for its prefill and first window), and a new stream can bank its own
+deficit by holding its first audio at most 1.5 s. A multi-segment stream also banks its first
+join before its first audio (TTFA ~580 vs ~330 ms alone). The step is a line in the generating
+width fit online from the streams' own frame times. Requests wait in arrival order; past
+`PLOW_TTS_ADMIT_WAIT_MS` (6000) a request gets 429 with `Retry-After` (the projected time to the
+next stream finishing). `PLOW_TTS_REALTIME=0` admits everything (the previous behavior).
+
 ## Sessions and streaming
 
 `X-Request-Id` / `X-Session-Id` (`docs/runtime/sessions.md`): a session's requests resume the KV

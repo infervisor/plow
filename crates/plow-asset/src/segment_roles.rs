@@ -226,6 +226,8 @@ pub const CUBLASLT_PREFILL_LLAMA_TTS_SHAPES: [(u32, u32); 7] = [
 /// Qwen3-1.7B decoder (Qwen3-ASR thinker: hidden 2048, 16/8 heads x 128, inter 6144): q/o, k/v,
 /// unfused gate/up, down.
 pub const CUBLASLT_PREFILL_QWEN3_1_7B_SHAPES: [(u32, u32); 4] = [(2048, 2048), (1024, 2048), (6144, 2048), (2048, 6144)];
+/// Qwen3-0.6B decoder (Qwen3-ASR-0.6B thinker: hidden 1024, 16/8 heads x 128, inter 3072).
+pub const CUBLASLT_PREFILL_QWEN3_0_6B_SHAPES: [(u32, u32); 5] = [(2048, 1024), (1024, 1024), (1024, 2048), (3072, 1024), (1024, 3072)];
 
 pub fn cublaslt_prefill_fp8(profile: &str, m: u32, n: u32, k: u32) -> bool {
     matches!(profile, "sm90a" | "sm_90a")
@@ -243,15 +245,27 @@ pub fn cublaslt_prefill_bf16(profile: &str, m: u32, n: u32, k: u32) -> bool {
     // Every Gemma-4 projection at every rung: at 128 rows the native GEMM object still cost
     // ~50 us per launch for the q/k/v and sliding-o shapes (~176 launches per chunk) while the
     // cuBLASLt calls at the same M run 10-45 us (H100 2026-09-17, campaign tracker).
-    matches!(profile, "sm90a" | "sm_90a")
-        && (CUBLASLT_PREFILL_ROWS.contains(&m)
-            || CUBLASLT_PREFILL_WIDE_ROWS.contains(&m)
-            || CUBLASLT_PREFILL_SPEECH_ROWS.contains(&m))
-        && (CUBLASLT_PREFILL_GEMMA4_SHAPES.contains(&(n, k))
-            || CUBLASLT_PREFILL_GEMMA4_26B_SHAPES.contains(&(n, k))
-            || CUBLASLT_PREFILL_GEMMA4_E4B_SHAPES.contains(&(n, k))
-            || CUBLASLT_PREFILL_LLAMA_TTS_SHAPES.contains(&(n, k))
-            || CUBLASLT_PREFILL_QWEN3_1_7B_SHAPES.contains(&(n, k)))
+    let rows = CUBLASLT_PREFILL_ROWS.contains(&m)
+        || CUBLASLT_PREFILL_WIDE_ROWS.contains(&m)
+        || CUBLASLT_PREFILL_SPEECH_ROWS.contains(&m);
+    match profile {
+        "sm90a" | "sm_90a" => {
+            rows && (CUBLASLT_PREFILL_GEMMA4_SHAPES.contains(&(n, k))
+                || CUBLASLT_PREFILL_GEMMA4_26B_SHAPES.contains(&(n, k))
+                || CUBLASLT_PREFILL_GEMMA4_E4B_SHAPES.contains(&(n, k))
+                || CUBLASLT_PREFILL_LLAMA_TTS_SHAPES.contains(&(n, k))
+                || CUBLASLT_PREFILL_QWEN3_1_7B_SHAPES.contains(&(n, k)))
+        }
+        // Ada has no TMA/wgmma prefill GEMM: the speech LMs (ASR decoders, Llama TTS) and Gemma 4
+        // E4B (L40S cold TTFT at 3944 tokens 1121 ms on the interpreter GEMM) are routed.
+        "sm89" | "sm_89" => {
+            rows && (CUBLASLT_PREFILL_QWEN3_1_7B_SHAPES.contains(&(n, k))
+                || CUBLASLT_PREFILL_QWEN3_0_6B_SHAPES.contains(&(n, k))
+                || CUBLASLT_PREFILL_LLAMA_TTS_SHAPES.contains(&(n, k))
+                || CUBLASLT_PREFILL_GEMMA4_E4B_SHAPES.contains(&(n, k)))
+        }
+        _ => false,
+    }
 }
 
 pub const PREFILL_ATTENTION_HD512_WG32_ABI: &str = "attention_sm90_hd512_wg32_v1";
@@ -770,7 +784,19 @@ mod tests {
         for shape in CUBLASLT_PREFILL_GEMMA4_26B_SHAPES {
             assert!(!CUBLASLT_PREFILL_GEMMA4_SHAPES.contains(&shape));
         }
+        for profile in ["sm89", "sm_89"] {
+            for m in CUBLASLT_PREFILL_ROWS.iter().chain(&CUBLASLT_PREFILL_SPEECH_ROWS) {
+                for (n, k) in CUBLASLT_PREFILL_QWEN3_1_7B_SHAPES
+                    .into_iter()
+                    .chain(CUBLASLT_PREFILL_QWEN3_0_6B_SHAPES)
+                    .chain(CUBLASLT_PREFILL_LLAMA_TTS_SHAPES)
+                {
+                    assert!(cublaslt_prefill_bf16(profile, *m, n, k));
+                }
+            }
+        }
         for (profile, m, n, k) in [
+            ("sm89", 128, 3840, 15360),
             ("sm120", 128, 3840, 15360),
             ("gfx942", 128, 3840, 8192),
             ("sm90a", 0, 3840, 15360),

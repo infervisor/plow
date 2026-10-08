@@ -48,6 +48,44 @@ pub struct PacketRnnt {
     trailing_frames: usize,
     profiling: bool,
     last_profile: Option<RnntProfile>,
+    stream: Option<StreamBinding>,
+}
+
+/// A cache-aware encoder stream (`stream.*` pipeline roles): each step turns one mel window into
+/// `rows` encoder frames whose joint rows the ordinary greedy loop decodes.
+struct StreamBinding {
+    first: Vec<usize>,
+    step: Vec<usize>,
+    input: PacketTensor,
+    key_start: PacketTensor,
+    /// The packet's live stream caches, then the predictor banks: what a session saves.
+    states: Vec<PacketTensor>,
+    rows: usize,
+    left_rows: usize,
+    first_input_frames: usize,
+    step_input_frames: usize,
+    history_input_frames: usize,
+    bins: usize,
+    /// Released sessions' state copies, reused by the next open.
+    pool: Vec<Vec<PacketTensor>>,
+}
+
+/// One open stream: a device copy of its state and the greedy decoder's position.
+pub struct RnntStream {
+    saved: Vec<PacketTensor>,
+    previous_token: u32,
+    active_bank: usize,
+    steps: usize,
+}
+
+/// Mel frames the stream reads per step: the first window, later windows, and how many of a later
+/// window's leading frames repeat the previous step's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StreamWindows {
+    pub first: usize,
+    pub step: usize,
+    pub history: usize,
+    pub bins: usize,
 }
 
 #[derive(Clone, Copy, Debug, Default, serde::Serialize)]
@@ -138,6 +176,40 @@ impl PacketRnnt {
                 "packet RNNT tensor geometry is inconsistent".into(),
             ));
         }
+        let stream = if backend == "cuda" && pipeline.program("stream.init").is_ok() {
+            let usize_param = |name| usize_parameter(&pipeline, name);
+            let input_tensor = pipeline.tensor("stream.input")?;
+            let bins = usize_param("audio.frontend.bins")?;
+            let mut stream_states = pipeline.tensor_sequence("stream.state")?;
+            stream_states.extend(states.iter().copied());
+            let binding = StreamBinding {
+                first: pipeline.program_sequence("stream.first")?,
+                step: pipeline.program_sequence("stream.step")?,
+                input: input_tensor,
+                key_start: pipeline.tensor("stream.key_start")?,
+                states: stream_states,
+                rows: usize_param("stream.rows")?,
+                left_rows: usize_param("stream.left_rows")?,
+                first_input_frames: usize_param("stream.first_input_frames")?,
+                step_input_frames: usize_param("stream.step_input_frames")?,
+                history_input_frames: usize_param("stream.history_input_frames")?,
+                bins,
+                pool: Vec::new(),
+            };
+            if binding.rows == 0
+                || binding.rows > frames
+                || bins == 0
+                || binding.step_input_frames.max(binding.first_input_frames) * bins * 4 > input_tensor.bytes
+                || binding.key_start.bytes != 4
+            {
+                return Err(RuntimeError::Rejected("packet stream geometry is invalid".into()));
+            }
+            // The per-layer position projections are input independent: fill them once.
+            runtime.run(pipeline.program("stream.init")?)?;
+            Some(binding)
+        } else {
+            None
+        };
         let state_zeros = vec![0; states.iter().map(|state| state.bytes).max().unwrap_or(0)];
         runtime.end_execution()?;
         Ok(Self {
@@ -163,11 +235,130 @@ impl PacketRnnt {
             trailing_frames,
             profiling: false,
             last_profile: None,
+            stream,
         })
     }
 
     pub fn backend(&self) -> &'static str {
         self.backend
+    }
+
+    /// The mel windows of the packet's encoder stream, if it carries one this backend can run.
+    pub fn stream_windows(&self) -> Option<StreamWindows> {
+        self.stream.as_ref().map(|s| StreamWindows {
+            first: s.first_input_frames,
+            step: s.step_input_frames,
+            history: s.history_input_frames,
+            bins: s.bins,
+        })
+    }
+
+    /// Open a stream: zeroed caches and predictor, the decoder at the blank token.
+    pub fn stream_open(&mut self) -> Result<RnntStream> {
+        let binding = self.stream.as_mut().ok_or_else(|| RuntimeError::Rejected("packet has no encoder stream".into()))?;
+        let saved = match binding.pool.pop() {
+            Some(saved) => {
+                for &tensor in &saved {
+                    self.runtime.write_tensor(tensor, &vec![0; tensor.bytes])?;
+                }
+                saved
+            }
+            None => binding
+                .states
+                .iter()
+                .map(|state| self.runtime.create_tensor(state.bytes))
+                .collect::<Result<_>>()?,
+        };
+        Ok(RnntStream { saved, previous_token: self.blank_id, active_bank: 0, steps: 0 })
+    }
+
+    pub fn stream_close(&mut self, stream: RnntStream) {
+        if let Some(binding) = &mut self.stream {
+            binding.pool.push(stream.saved);
+        }
+    }
+
+    /// One stream step: `window` holds `StreamWindows::first` mel frames on the stream's first step
+    /// and `StreamWindows::step` after (its leading `history` frames repeat the previous window's
+    /// last ones). Returns the tokens the step's encoder rows decode to, reporting each through
+    /// `on_emit` as it is emitted (with this step's tokens so far).
+    pub fn stream_step(
+        &mut self,
+        stream: &mut RnntStream,
+        window: &[f32],
+        on_emit: &mut dyn FnMut(&[u32]),
+    ) -> Result<Vec<u32>> {
+        let binding = self.stream.take().ok_or_else(|| RuntimeError::Rejected("packet has no encoder stream".into()))?;
+        self.runtime.begin_execution()?;
+        let result = self.stream_step_active(&binding, stream, window, on_emit);
+        let ended = self.runtime.end_execution();
+        self.stream = Some(binding);
+        let tokens = result?;
+        ended?;
+        stream.steps += 1;
+        Ok(tokens)
+    }
+
+    fn stream_step_active(
+        &mut self,
+        binding: &StreamBinding,
+        stream: &mut RnntStream,
+        window: &[f32],
+        on_emit: &mut dyn FnMut(&[u32]),
+    ) -> Result<Vec<u32>> {
+        let first = stream.steps == 0;
+        let frames = if first { binding.first_input_frames } else { binding.step_input_frames };
+        if window.len() != frames * binding.bins || stream.saved.len() != binding.states.len() {
+            return Err(RuntimeError::Rejected(format!(
+                "stream window has {} values, expected {}",
+                window.len(),
+                frames * binding.bins
+            )));
+        }
+        self.runtime.write_tensor_at(binding.input, 0, bytemuck::cast_slice(window))?;
+        for (&live, &saved) in binding.states.iter().zip(&stream.saved) {
+            self.runtime.copy_tensor(saved, 0, live, 0, live.bytes)?;
+        }
+        // Keys before this window row are not filled yet: the stream's first chunks.
+        let key_start = binding.left_rows.saturating_sub(stream.steps.saturating_mul(binding.rows)) as u32;
+        self.runtime.write_tensor(binding.key_start, &key_start.to_ne_bytes())?;
+        let started = Instant::now();
+        self.runtime.run_sequence(if first { &binding.first } else { &binding.step })?;
+        let encoder_us = self.runtime.last_run_us();
+        let encoder_wall = started.elapsed();
+        let mut execution = PacketRnntExecution {
+            runtime: &mut *self.runtime,
+            pipeline: &self.pipeline,
+            frames: binding.rows,
+            token: self.token,
+            ids: self.ids,
+            encoder_joint: self.encoder_joint,
+            encoder_window: self.encoder_window,
+            row_bytes: self.row_bytes,
+            predictor_programs: self.predictor_programs,
+            active_bank: stream.active_bank,
+            pending_predictor: None,
+            all_ids: vec![0; self.joint_batch_max],
+            profile: None,
+        };
+        // The predictor reruns from the saved bank each step (idempotent), so only its banks persist.
+        let mut decoder = GreedyRnnt::new(self.blank_id, self.max_symbols_per_frame)?;
+        decoder.previous_token = stream.previous_token;
+        let tokens = decoder.decode_with(&mut execution, on_emit)?;
+        stream.active_bank = execution.active_bank;
+        stream.previous_token = decoder.previous_token;
+        tracing::debug!(
+            step = stream.steps,
+            encoder_us,
+            encoder_wall_us = encoder_wall.as_micros() as u64,
+            decode_us = (started.elapsed() - encoder_wall).as_micros() as u64,
+            tokens = tokens.len(),
+            "rnnt stream step"
+        );
+        for (&live, &saved) in binding.states.iter().zip(&stream.saved) {
+            self.runtime.copy_tensor(live, 0, saved, 0, live.bytes)?;
+        }
+        Ok(tokens)
     }
 
     pub fn input_elements(&self) -> usize {
@@ -198,13 +389,20 @@ impl PacketRnnt {
             input,
             self.frames,
             self.encoder_programs.len() - 1,
+            &mut |_| {},
         )
     }
 
-    pub fn transcribe_input_frames(
+    pub fn transcribe_input_frames(&mut self, input: &[f32], valid_input_frames: usize) -> Result<Vec<u32>> {
+        self.transcribe_input_frames_with(input, valid_input_frames, &mut |_| {})
+    }
+
+    /// [`Self::transcribe_input_frames`], reporting the tokens emitted so far after each one.
+    pub fn transcribe_input_frames_with(
         &mut self,
         input: &[f32],
         valid_input_frames: usize,
+        on_emit: &mut dyn FnMut(&[u32]),
     ) -> Result<Vec<u32>> {
         let encoder = self
             .encoder_programs
@@ -217,7 +415,7 @@ impl PacketRnnt {
             })?;
         let frames =
             self.valid_encoder_frames(valid_input_frames, self.encoder_programs[encoder].0)?;
-        self.transcribe_input_with_encoder_frames(input, frames, encoder)
+        self.transcribe_input_with_encoder_frames(input, frames, encoder, on_emit)
     }
 
     fn transcribe_input_with_encoder_frames(
@@ -225,9 +423,10 @@ impl PacketRnnt {
         input: &[f32],
         frames: usize,
         encoder: usize,
+        on_emit: &mut dyn FnMut(&[u32]),
     ) -> Result<Vec<u32>> {
         self.runtime.begin_execution()?;
-        let result = self.transcribe_active(input, frames, encoder);
+        let result = self.transcribe_active(input, frames, encoder, on_emit);
         let ended = self.runtime.end_execution();
         result.and_then(|tokens| ended.map(|()| tokens))
     }
@@ -237,6 +436,7 @@ impl PacketRnnt {
         input: &[f32],
         frames: usize,
         encoder: usize,
+        on_emit: &mut dyn FnMut(&[u32]),
     ) -> Result<Vec<u32>> {
         if input.len() != self.input_elements() {
             return Err(RuntimeError::Rejected(format!(
@@ -273,7 +473,7 @@ impl PacketRnnt {
             profile: profile.as_mut(),
         };
         let result =
-            GreedyRnnt::new(self.blank_id, self.max_symbols_per_frame)?.decode(&mut execution);
+            GreedyRnnt::new(self.blank_id, self.max_symbols_per_frame)?.decode_with(&mut execution, on_emit);
         self.last_profile = profile;
         result
     }
@@ -484,6 +684,15 @@ impl GreedyRnnt {
     /// Decode one encoder chunk. A fixed predictor state evaluates every remaining frame in one
     /// packet dispatch; the first nonblank token invalidates that speculative tail.
     pub fn decode(&mut self, execution: &mut dyn RnntExecution) -> Result<Vec<u32>> {
+        self.decode_with(execution, &mut |_| {})
+    }
+
+    /// [`Self::decode`], calling `on_emit` with every token emitted so far after each one.
+    pub fn decode_with(
+        &mut self,
+        execution: &mut dyn RnntExecution,
+        on_emit: &mut dyn FnMut(&[u32]),
+    ) -> Result<Vec<u32>> {
         let frames = execution.frames();
         let mut emitted = Vec::new();
         let mut ids = vec![self.blank_id; frames];
@@ -514,6 +723,7 @@ impl GreedyRnnt {
             frame += offset;
             let token = ids[offset];
             emitted.push(token);
+            on_emit(&emitted);
             execution.commit_prediction();
             self.previous_token = token;
             self.predictor_valid = false;

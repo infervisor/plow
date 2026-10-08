@@ -58,6 +58,8 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4", features = ["derive", "env"] }
 futures = "0.3"
+# OpenAI Realtime transcription events carry base64 audio (already in the lockfile).
+base64 = "0.22"
 hound = "3.5"
 rustfft = "6"
 # Ids the server mints (request, session, turn; `serve::session`): sortable 64-bit, tagged; W3C
@@ -199,6 +201,10 @@ path = "examples/asr/dataset.rs"
 [[example]]
 name = "asr_packet_dataset"
 path = "examples/asr/packet_dataset.rs"
+
+[[example]]
+name = "asr_stream_check"
+path = "examples/asr/stream_check.rs"
 
 [[example]]
 name = "asr_batch_check"

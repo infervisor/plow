@@ -310,6 +310,23 @@ thread_local! {
 
 static NEXT_CONTEXT_ID: AtomicU64 = AtomicU64::new(1);
 
+/// A context synchronize waits on every stream of its context, so one issued while another
+/// thread captures a graph there fails both (`CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED`) — e.g. a
+/// speech pipeline binding its graphs during a model switch while resident models serve.
+/// Captures hold their device's lock exclusively. One lock per device (its primary context, which
+/// every backend on it shares): a capture on one GPU never delays a synchronize on another.
+fn capture_exclusion(dev: CUdevice) -> Arc<parking_lot::RwLock<()>> {
+    static BY_DEVICE: std::sync::OnceLock<Mutex<FxHashMap<CUdevice, Arc<parking_lot::RwLock<()>>>>> =
+        std::sync::OnceLock::new();
+    BY_DEVICE.get_or_init(Default::default).lock().entry(dev).or_default().clone()
+}
+
+thread_local! {
+    /// The capture exclusion this thread holds for a capture, by address (0: none): its own
+    /// synchronize on that device fails, not blocks.
+    static CAPTURING: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 // Cache the retained lifetime, not a driver handle that can be recycled on
 // another thread. Every context mutation must update this cache.
 unsafe fn bind_context(api: &Api, ctx: usize, id: u64) -> CUresult {
@@ -586,6 +603,8 @@ pub struct CudaBackend {
     ctx: usize,
     /// Handed to every owned `DeviceMem`; its Drop releases the primary ctx.
     freer: Arc<CudaFreer>,
+    /// This device's [`capture_exclusion`].
+    capture_exclusion: Arc<parking_lot::RwLock<()>>,
     pub device_ordinal: u8,
     /// `cuDriverGetVersion` (e.g. 12080 = CUDA 12.8) — the load-time ceiling
     /// on cubin toolkit versions; surfaced in the `module_load` error.
@@ -793,6 +812,7 @@ impl CudaBackend {
                 tmap_encode,
                 ctx: ctx as usize,
                 freer,
+                capture_exclusion: capture_exclusion(dev),
                 device_ordinal,
                 driver_version,
                 name,
@@ -1458,14 +1478,18 @@ impl CudaBackend {
         enqueue: impl FnOnce() -> Result<()>,
     ) -> Result<GraphExec> {
         self.bind()?;
+        let exclusive = self.capture_exclusion.write();
+        let outer = CAPTURING.replace(Arc::as_ptr(&self.capture_exclusion) as usize);
         // Thread-local capture; callers enqueue only immutable same-stream operations.
-        self.check(
+        let begun = self.check(
             unsafe { (self.api.cuStreamBeginCapture)(stream.raw as CUstream, 1) },
             "cuStreamBeginCapture",
-        )?;
-        let result = enqueue();
+        );
+        let result = begun.and_then(|()| enqueue());
         let mut graph = std::ptr::null_mut();
         let ended = unsafe { (self.api.cuStreamEndCapture)(stream.raw as CUstream, &mut graph) };
+        CAPTURING.set(outer);
+        drop(exclusive);
         if let Err(e) = result {
             if !graph.is_null() {
                 unsafe {
@@ -1629,6 +1653,8 @@ impl CudaBackend {
     /// load/unload and error-path quiesce.
     pub fn synchronize(&self) -> Result<()> {
         self.bind()?;
+        let lock = &self.capture_exclusion;
+        let _shared = (CAPTURING.get() != Arc::as_ptr(lock) as usize).then(|| lock.read());
         // SAFETY: no arguments.
         self.check(unsafe { (self.api.cuCtxSynchronize)() }, "cuCtxSynchronize")
     }
@@ -2359,6 +2385,17 @@ impl Backend for CudaBackend {
 
 #[cfg(test)]
 mod tests {
+    /// A capture holds only its own device's exclusion; the same device shares one.
+    #[test]
+    fn capture_exclusion_is_per_device() {
+        let (a, b) = (super::capture_exclusion(0), super::capture_exclusion(1));
+        assert!(std::sync::Arc::ptr_eq(&a, &super::capture_exclusion(0)));
+        let capturing = b.write();
+        assert!(a.try_read().is_some(), "a capture on device 1 blocked a synchronize on device 0");
+        assert!(super::capture_exclusion(1).try_read().is_none());
+        drop(capturing);
+    }
+
     use super::is_cuda_fatal;
 
     #[test]

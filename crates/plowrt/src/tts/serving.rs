@@ -20,6 +20,7 @@ use parking_lot::Mutex;
 use serde::Deserialize;
 
 use super::codec::{Codec, Urgency};
+use super::realtime::Ticket;
 use super::{pcm16, wav_header, SpeechContract};
 use crate::serve::session::{InFlight, RequestIds};
 use crate::serve::stream::{self as stream_mod, StreamChunk};
@@ -105,16 +106,48 @@ fn guided_model(
 /// the first request does not pay them.
 pub fn preload(state: &AppState) -> Result<(), String> {
     for slug in state.registry.slugs() {
-        let (Some(_), Ok(bundle)) = (state.mux(&slug), state.registry.get(&slug)) else {
-            continue;
-        };
-        let bound = guided_model(&bundle.dir, state.downstream(&slug)).and_then(|g| match g {
-            Some(_) => Ok(()),
-            None => speech_model(&bundle.dir, state.downstream(&slug)).map(drop),
-        });
-        bound.map_err(|e| format!("{slug}: speech pipeline failed to bind: {e}"))?;
+        if state.mux(&slug).is_some() {
+            bind(state, &slug)?;
+        }
     }
     Ok(())
+}
+
+/// Bind `slug`'s speech pipeline now (a no-op for a model without one, or already bound).
+pub fn bind(state: &AppState, slug: &str) -> Result<(), String> {
+    let bundle = state.registry.get(slug).map_err(|e| e.to_string())?;
+    let bound = guided_model(&bundle.dir, state.downstream(slug)).and_then(|g| match g {
+        Some(_) => Ok(()),
+        None => speech_model(&bundle.dir, state.downstream(slug)).map(drop),
+    });
+    bound.map_err(|e| format!("{slug}: speech pipeline failed to bind: {e}"))
+}
+
+enum Pipeline {
+    Guided(Arc<super::guided_speech::GuidedSpeech>),
+    Speech(Arc<SpeechModel>),
+    /// Bound, and the model has no speech pipeline.
+    None,
+}
+
+/// `dir`'s bound pipeline; `None` when it is not bound (not resident, or mid-switch). Never
+/// binds: a managed model's pipeline binds with its engine ([`bind`]).
+fn bound_pipeline(dir: &Path) -> Option<Pipeline> {
+    if let Some(Some(g)) = guided_models().lock().get(dir) {
+        return Some(Pipeline::Guided(Arc::clone(g)));
+    }
+    match speech_models().lock().get(dir) {
+        Some(Some(m)) => Some(Pipeline::Speech(Arc::clone(m))),
+        Some(None) => Some(Pipeline::None),
+        None => None,
+    }
+}
+
+/// Forget `dir`'s speech pipeline: its vocoder/codec threads exit, freeing their packet
+/// runtimes, once the last request holding it ends.
+pub fn release(dir: &Path) {
+    guided_models().lock().remove(dir);
+    speech_models().lock().remove(dir);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -137,6 +170,9 @@ async fn speech_on_guided(
     if req.input.trim().is_empty() {
         return bad("`input` is empty", "input");
     }
+    if req.speed.is_some_and(|s| s != 1.0) {
+        return bad("only speed 1.0 is supported", "speed");
+    }
     let seed = req.seed.unwrap_or_else(|| {
         std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(1)
     });
@@ -147,7 +183,7 @@ async fn speech_on_guided(
     if req.stream {
         let mut ev = match w.synthesize_stream(&mux, req.voice.clone(), req.input.clone(), lang.as_deref(), seed, ids, report) {
             Ok(rx) => rx,
-            Err(e) => return server_error(e),
+            Err(e) => return speech_failure(e),
         };
         let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<Result<Vec<u8>, std::io::Error>>(64);
         if wav {
@@ -212,7 +248,7 @@ async fn speech_on_guided(
         run.done();
     }
     let mut response = match result {
-        Err(e) => server_error(e),
+        Err(e) => speech_failure(e),
         Ok(a) => {
             let audio_s = a.pcm.len() as f64 / f64::from(w.sample_rate);
             let mut out = if wav { wav_header(w.sample_rate, (a.pcm.len() * 2) as u32) } else { Vec::new() };
@@ -234,6 +270,7 @@ async fn speech_on_guided(
 pub struct SpeechModel {
     pub contract: SpeechContract,
     codec: Codec,
+    realtime: Arc<super::realtime::RealTime>,
 }
 
 /// Speech models by asset directory, bound on first use.
@@ -262,7 +299,8 @@ pub fn speech_model(
                 ));
             }
             tracing::info!(pipeline = %contract.pipeline, sample_rate = contract.sample_rate, "tts: speech pipeline bound");
-            Some(Arc::new(SpeechModel { contract, codec }))
+            let realtime = super::realtime::RealTime::new(contract.frame_samples as f64 / f64::from(contract.sample_rate), contract.frame_codes);
+            Some(Arc::new(SpeechModel { contract, codec, realtime }))
         }
     };
     speech_models().lock().insert(assets.to_path_buf(), model.clone());
@@ -273,12 +311,31 @@ fn bad(msg: impl Into<String>, param: &str) -> Response {
     crate::serve::api_error(StatusCode::BAD_REQUEST, msg, "invalid_request_error", Some("invalid_value"), Some(param.into()))
 }
 
+fn busy(retry: std::time::Duration) -> Response {
+    let mut r = crate::serve::api_error(
+        StatusCode::TOO_MANY_REQUESTS,
+        "speech is at real-time capacity; retry",
+        "rate_limit_error",
+        Some("server_overloaded"),
+        None,
+    );
+    r.headers_mut().insert(header::RETRY_AFTER, axum::http::HeaderValue::from(retry.as_secs()));
+    r
+}
+
 fn server_error(msg: impl Into<String>) -> Response {
     let msg = msg.into();
     if msg == super::guided_speech::QUEUE_FULL {
         return crate::serve::api_error(StatusCode::TOO_MANY_REQUESTS, msg, "rate_limit_error", Some("server_overloaded"), None);
     }
     crate::serve::api_error(StatusCode::INTERNAL_SERVER_ERROR, msg, "server_error", None, None)
+}
+
+fn speech_failure(e: super::guided_speech::SpeechError) -> Response {
+    match e {
+        super::guided_speech::SpeechError::Invalid(msg, param) => bad(msg, param),
+        super::guided_speech::SpeechError::Failed(msg) => server_error(msg),
+    }
 }
 
 pub async fn speech(
@@ -333,21 +390,41 @@ async fn speech_with(
     if let Some(canonical) = state.registry.resolve(&req.model) {
         req.model = canonical;
     }
-    if let Some(mgr) = state.manager_for(&req.model) {
-        if mgr.manages(&req.model) {
-            if let Err(e) = mgr.ensure_resident(&req.model).await {
-                return crate::serve::api_error(StatusCode::SERVICE_UNAVAILABLE, e.to_string(), "server_error", None, None);
+    // The pipeline binds with the engine and leaves with it: an eviction between the residency
+    // check and the lookup sends the request around again.
+    let mut attempts = 0;
+    let (mux, bundle, pipeline) = loop {
+        if let Some(mgr) = state.manager_for(&req.model) {
+            if mgr.manages(&req.model) {
+                if let Err(e) = mgr.ensure_resident(&req.model).await {
+                    return crate::serve::api_error(StatusCode::SERVICE_UNAVAILABLE, e.to_string(), "server_error", None, None);
+                }
             }
         }
-    }
-    let (Some(mux), Ok(bundle)) = (state.mux(&req.model), state.registry.get(&req.model)) else {
-        return crate::serve::api_error(
-            StatusCode::NOT_FOUND,
-            format!("no model registered for '{}'.", req.model),
-            "invalid_request_error",
-            Some("model_not_found"),
-            Some("model".into()),
-        );
+        let (Some(mux), Ok(bundle)) = (state.mux(&req.model), state.registry.get(&req.model)) else {
+            attempts += 1;
+            if attempts < 3 && state.manager_for(&req.model).is_some_and(|m| m.manages(&req.model)) {
+                continue;
+            }
+            return crate::serve::api_error(
+                StatusCode::NOT_FOUND,
+                format!("no model registered for '{}'.", req.model),
+                "invalid_request_error",
+                Some("model_not_found"),
+                Some("model".into()),
+            );
+        };
+        let managed = state.manager_for(&req.model).is_some_and(|m| m.manages(&req.model));
+        match bound_pipeline(&bundle.dir) {
+            Some(pipeline) => break (mux, bundle, Some(pipeline)),
+            None if !managed => break (mux, bundle, None),
+            None => {
+                attempts += 1;
+                if attempts >= 3 {
+                    return crate::serve::api_error(StatusCode::SERVICE_UNAVAILABLE, "speech pipeline is switching; retry", "server_error", None, None);
+                }
+            }
+        }
     };
     let Some(in_flight) = ids.begin(&req.model) else {
         return crate::serve::api_error(StatusCode::CONFLICT, format!("request {} is already in flight in this session", ids.request), "invalid_request_error", Some("duplicate_request_id"), None);
@@ -361,26 +438,42 @@ async fn speech_with(
         true,
     );
     let ids = &RequestIds { turn_key: run.key(), ..ids.clone() };
-    match tokio::task::block_in_place(|| guided_model(&bundle.dir, state.downstream(&req.model))) {
-        Ok(Some(g)) => return speech_on_guided(g, mux, req, t_arrive, ids, in_flight, report, report_rx.take(), run).await,
-        Ok(None) => {}
-        Err(e) => return server_error(format!("speech pipeline: {e}")),
-    }
-    let model = match tokio::task::block_in_place(|| speech_model(&bundle.dir, state.downstream(&req.model))) {
-        Ok(Some(m)) => m,
-        Ok(None) => return bad(format!("model '{}' declares no speech pipeline", req.model), "model"),
-        Err(e) => return server_error(format!("speech pipeline: {e}")),
+    let model = match pipeline {
+        Some(Pipeline::Guided(g)) => return speech_on_guided(g, mux, req, t_arrive, ids, in_flight, report, report_rx.take(), run).await,
+        Some(Pipeline::Speech(m)) => m,
+        Some(Pipeline::None) => return bad(format!("model '{}' declares no speech pipeline", req.model), "model"),
+        // Unmanaged (single-model) serve: bind on first use.
+        None => {
+            match tokio::task::block_in_place(|| guided_model(&bundle.dir, state.downstream(&req.model))) {
+                Ok(Some(g)) => return speech_on_guided(g, mux, req, t_arrive, ids, in_flight, report, report_rx.take(), run).await,
+                Ok(None) => {}
+                Err(e) => return server_error(format!("speech pipeline: {e}")),
+            }
+            match tokio::task::block_in_place(|| speech_model(&bundle.dir, state.downstream(&req.model))) {
+                Ok(Some(m)) => m,
+                Ok(None) => return bad(format!("model '{}' declares no speech pipeline", req.model), "model"),
+                Err(e) => return server_error(format!("speech pipeline: {e}")),
+            }
+        }
     };
     let c = &model.contract;
     if req.input.trim().is_empty() {
         return bad("`input` is empty", "input");
+    }
+    let n_chars = req.input.chars().count();
+    if n_chars > super::MAX_INPUT_CHARS {
+        return bad(format!("`input` is {n_chars} characters; at most {} are accepted", super::MAX_INPUT_CHARS), "input");
     }
     if req.speed.is_some_and(|s| s != 1.0) {
         return bad("only speed 1.0 is supported", "speed");
     }
     let tok = bundle.tokenizer();
     let voice = req.voice.clone();
-    if tok.encode_with_special_tokens(&c.voice_token(&voice), false).len() != 1 {
+    if !c.voices.is_empty() {
+        if !c.voices.contains(&voice) {
+            return bad(format!("unknown voice {voice:?}; voices: {}", c.voices.join(", ")), "voice");
+        }
+    } else if tok.encode_with_special_tokens(&c.voice_token(&voice), false).len() != 1 {
         return bad(format!("unknown voice {voice:?}: {} is not a vocabulary token", c.voice_token(&voice)), "voice");
     }
     let wav = match req.response_format.as_deref().unwrap_or("wav") {
@@ -388,28 +481,43 @@ async fn speech_with(
         "pcm" => false,
         f => return bad(format!("response_format {f:?} unsupported; use wav or pcm"), "response_format"),
     };
-    let mut prompt_ids = c.prefix.clone();
-    prompt_ids.extend(tok.encode_with_special_tokens(&c.prompt_text(&voice, &req.input), false));
-    prompt_ids.extend_from_slice(&c.suffix);
+    // Past the cap the reference budget clips the audio: a longer input is spoken in order as
+    // sentence-sized segments, each with its full budget.
+    let segs: Vec<Segment> = super::segments(&req.input, c.segment_chars())
+        .into_iter()
+        .enumerate()
+        .map(|(k, text)| {
+            let mut prompt_ids = c.prefix.clone();
+            prompt_ids.extend(tok.encode_with_special_tokens(&c.prompt_text(&voice, text), false));
+            prompt_ids.extend_from_slice(&c.suffix);
+            let mut gen = crate::serve::GenParams::default();
+            gen.max_tokens = req.max_tokens.unwrap_or_else(|| c.max_new_tokens(text)).min(c.max_new_tokens_cap);
+            gen.params.temperature = req.temperature.unwrap_or(c.temperature);
+            gen.params.top_p = req.top_p.unwrap_or(c.top_p);
+            gen.params.repetition_penalty = req.repetition_penalty.unwrap_or(1.0);
+            gen.seed = req.seed.map(|s| s.wrapping_add(k as u64));
+            gen.stop_token_ids = c.stops.clone();
+            Segment { prompt_ids, gen, chars: text.chars().count() }
+        })
+        .collect();
 
-    let mut gen = crate::serve::GenParams::default();
-    gen.max_tokens = req.max_tokens.unwrap_or_else(|| c.max_new_tokens(&req.input)).min(c.max_new_tokens_cap);
-    gen.params.temperature = req.temperature.unwrap_or(c.temperature);
-    gen.params.top_p = req.top_p.unwrap_or(c.top_p);
-    gen.params.repetition_penalty = req.repetition_penalty.unwrap_or(1.0);
-    gen.seed = req.seed;
-    gen.stop_token_ids = c.stops.clone();
-
+    let need = super::realtime::Need { stream: req.stream, chars: segs.iter().map(|s| s.chars).collect() };
+    let ticket = match model.realtime.admit(need).await {
+        Ok(t) => Arc::new(t),
+        Err(retry) => return busy(retry),
+    };
+    let class = if req.stream { crate::serve::mux::JobClass::Critical } else { crate::serve::mux::JobClass::Normal };
+    let first = segs[0].clone();
     let (tx, rx) = stream_mod::channel();
     let opts = crate::serve::mux::JobOpts {
-        class: if req.stream { crate::serve::mux::JobClass::Critical } else { crate::serve::mux::JobClass::Normal },
+        class,
         raw_tokens: true,
         speech: None,
-        session: ids.session.as_ref().and_then(|_| ids.ticket(crate::serve::session::row_keys(&prompt_ids, &[], &[]), report)),
+        session: ids.session.as_ref().and_then(|_| ids.ticket(crate::serve::session::row_keys(&first.prompt_ids, &[], &[]), report)),
         turn: ids.turn_key.clone(),
         continuing: run.continuing(),
     };
-    let job = crate::serve::mux::Job { prompt_ids, gen, arrived: Instant::now(), respond: tx, opts };
+    let job = crate::serve::mux::Job { prompt_ids: first.prompt_ids, gen: first.gen, arrived: Instant::now(), respond: tx, opts };
     if let Err(err) = mux.submit_arrived(job, t_arrive, Some(mux.ingress())) {
         return match err {
             crate::serve::mux::SubmitError::Full(_) => {
@@ -423,6 +531,7 @@ async fn speech_with(
     let seed = req.seed.unwrap_or_else(|| {
         std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(1)
     }) | 1;
+    let later = Later { mux: mux.clone(), segs, class, seed };
     let content_type = if wav { "audio/wav" } else { "audio/pcm" };
     if req.stream {
         let (out_tx, out_rx) = tokio::sync::mpsc::channel::<Result<Vec<u8>, std::io::Error>>(64);
@@ -432,7 +541,7 @@ async fn speech_with(
         let cache = crate::serve::session::CacheOutcome::received(report_rx.take()).await;
         run.admitted(cache.and_then(|c| c.at));
         let stamped = run.headers();
-        tokio::spawn(stream_task(Arc::clone(&model), rx, out_tx, seed, t_arrive, run));
+        tokio::spawn(stream_task(Arc::clone(&model), rx, later, ticket, out_tx, seed, t_arrive, run));
         let mut out_rx = out_rx;
         let body = Body::from_stream(futures::stream::poll_fn(move |cx| {
             let _held = &in_flight;
@@ -445,24 +554,64 @@ async fn speech_with(
         }
         return response;
     }
-    let (codes, n_tokens) = match collect_codes(c, rx).await {
-        Ok(v) => v,
-        Err(e) => return crate::serve::api_error_for(&e),
-    };
-    let frames = codes.len() / c.frame_codes;
+    let (mut pcm, mut n_tokens, mut frames, mut t_lm) = (Vec::new(), 0, 0, std::time::Duration::ZERO);
+    // Sample offsets where one segment's audio follows another's.
+    let (mut joins, mut joiner) = (Vec::new(), super::Joins::new(c.sample_rate));
+    let mut rx = Some(rx);
+    for k in 0..later.segs.len() {
+        let mut attempt = 0;
+        loop {
+            let rx = match rx.take() {
+                Some(rx) => rx,
+                None => match later.submit(k, attempt) {
+                    Ok(rx) => rx,
+                    Err(e) => return server_error(e),
+                },
+            };
+            let t0 = Instant::now();
+            ticket.segment(k);
+            let (codes, n) = match collect_codes(c, rx, &ticket).await {
+                Ok(v) => v,
+                Err(e) => return crate::serve::api_error_for(&e),
+            };
+            ticket.segment_done();
+            t_lm += if k == 0 && attempt == 0 { t_arrive.elapsed() } else { t0.elapsed() };
+            n_tokens += n;
+            let f = codes.len() / c.frame_codes;
+            if f == 0 {
+                break;
+            }
+            let p = match decode_all(&model, &codes[..f * c.frame_codes], f, seed ^ segment_salt(k)).await {
+                Ok(p) => p,
+                Err(e) => return server_error(e),
+            };
+            frames += f;
+            if later.segs.len() == 1 {
+                pcm = p;
+                break;
+            }
+            if !joiner.speaks(&p) && attempt < MUTE_RETRIES {
+                attempt += 1;
+                tracing::warn!(segment = k, attempt, "tts: mute segment; retrying");
+                continue;
+            }
+            if !pcm.is_empty() {
+                joiner.next_segment();
+                joins.push(pcm.len());
+            }
+            joiner.push(&p, f64::INFINITY, &mut pcm);
+            break;
+        }
+    }
+    drop(ticket);
     if frames == 0 {
         return server_error("model produced no audio frames");
     }
-    let t_lm = t_arrive.elapsed();
-    let pcm = match decode_all(&model, &codes[..frames * c.frame_codes], frames, seed).await {
-        Ok(p) => p,
-        Err(e) => return server_error(e),
-    };
     let mut out = if wav { wav_header(c.sample_rate, (pcm.len() * 2) as u32) } else { Vec::new() };
     pcm16(&pcm, &mut out);
     let audio_s = pcm.len() as f64 / f64::from(c.sample_rate);
     let total = t_arrive.elapsed().as_secs_f64();
-    tracing::info!(tokens = n_tokens, frames, audio_s, lm_ms = t_lm.as_secs_f64() * 1e3, total_ms = total * 1e3, rtf = total / audio_s, "tts: speech");
+    tracing::info!(tokens = n_tokens, frames, segments = later.segs.len(), ?joins, audio_s, lm_ms = t_lm.as_secs_f64() * 1e3, total_ms = total * 1e3, rtf = total / audio_s, "tts: speech");
     run.first();
     run.done();
     let mut response = (
@@ -476,6 +625,47 @@ async fn speech_with(
         .into_response();
     run.stamp(&mut response);
     response
+}
+
+/// A mute segment (no speech) of a multi-segment request is generated again, with another seed.
+const MUTE_RETRIES: usize = 2;
+
+/// One segment's LM job.
+#[derive(Clone)]
+struct Segment {
+    prompt_ids: Vec<u32>,
+    gen: crate::serve::GenParams,
+    chars: usize,
+}
+
+/// The request's segments; each after the first is submitted as the previous one finishes.
+struct Later {
+    mux: crate::serve::mux::ModelMux,
+    segs: Vec<Segment>,
+    class: crate::serve::mux::JobClass,
+    /// Base of a retry's sampling seed when the request gave none (unseeded sampling repeats).
+    seed: u64,
+}
+
+impl Later {
+    fn submit(&self, k: usize, attempt: usize) -> Result<stream_mod::ChunkReceiver, String> {
+        let mut s = self.segs[k].clone();
+        if attempt > 0 {
+            s.gen.seed = Some(s.gen.seed.unwrap_or(self.seed ^ k as u64) ^ ((attempt as u64) << 48));
+        }
+        let (tx, rx) = stream_mod::channel();
+        let opts = crate::serve::mux::JobOpts { class: self.class, raw_tokens: true, speech: None, session: None, turn: None, continuing: false };
+        let job = crate::serve::mux::Job { prompt_ids: s.prompt_ids, gen: s.gen, arrived: Instant::now(), respond: tx, opts };
+        self.mux.submit(job).map(|()| rx).map_err(|e| match e {
+            crate::serve::mux::SubmitError::Full(_) => "model request queue full".to_string(),
+            crate::serve::mux::SubmitError::Closed(_) => "model dispatcher unavailable".to_string(),
+        })
+    }
+}
+
+/// Codec seed salt of segment `k` (0 for the first: a one-segment request decodes as before).
+fn segment_salt(k: usize) -> u64 {
+    (k as u64) << 40
 }
 
 /// Whole utterance; beyond the codec's frame capacity, windows with the codec's context frames
@@ -504,7 +694,7 @@ fn short_window(samples: usize, frames: usize) -> String {
 }
 
 /// Drain the LM stream promptly (the mux cuts a consumer that falls behind) keeping the codes.
-async fn collect_codes(c: &SpeechContract, mut rx: stream_mod::ChunkReceiver) -> crate::Result<(Vec<i32>, usize)> {
+async fn collect_codes(c: &SpeechContract, mut rx: stream_mod::ChunkReceiver, ticket: &Ticket) -> crate::Result<(Vec<i32>, usize)> {
     let (mut codes, mut n) = (Vec::new(), 0);
     while let Some(chunk) = rx.recv().await {
         match chunk {
@@ -512,6 +702,9 @@ async fn collect_codes(c: &SpeechContract, mut rx: stream_mod::ChunkReceiver) ->
                 n += 1;
                 if let Some(code) = c.code_of(codes.len(), id) {
                     codes.push(code);
+                    if codes.len() % c.frame_codes == 0 {
+                        ticket.frame();
+                    }
                 }
             }
             StreamChunk::Done { .. } => break,
@@ -534,79 +727,227 @@ fn stream_step(n: usize, emitted: usize, done: bool, window: usize, lookahead: u
     ready.then(|| (emitted.saturating_sub(window.saturating_sub(lookahead + 1)), n.min(upto + lookahead), upto))
 }
 
+enum SegMsg {
+    Frame(Vec<i32>),
+    /// The current segment generated its last frame.
+    End,
+    /// The current segment was mute and generates again: drop its frames.
+    Retry,
+    Err(String),
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn stream_task(
     model: Arc<SpeechModel>,
-    mut rx: stream_mod::ChunkReceiver,
+    rx: stream_mod::ChunkReceiver,
+    later: Later,
+    ticket: Arc<Ticket>,
     out: tokio::sync::mpsc::Sender<Result<Vec<u8>, std::io::Error>>,
     seed: u64,
     t_arrive: Instant,
     mut run: crate::serve::turns::StageRun,
 ) {
+    use std::sync::atomic::Ordering::SeqCst;
     let c = model.contract.clone();
     let sr = f64::from(c.sample_rate);
     let (fc, fs) = (c.frame_codes, c.frame_samples);
-    let (ftx, mut frx) = tokio::sync::mpsc::unbounded_channel::<Vec<i32>>();
-    // The LM drain never waits on the codec.
+    let n_segs = later.segs.len();
+    let (ftx, mut frx) = tokio::sync::mpsc::unbounded_channel::<SegMsg>();
+    // The LM drain never waits on the codec; the next segment starts as the previous one ends.
+    let lm = Arc::clone(&ticket);
+    // Segments below this index are cut short (run on silent, `Joins::runaway`).
+    let cut = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mute = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (lm_cut, lm_mute) = (Arc::clone(&cut), Arc::clone(&mute));
     tokio::spawn(async move {
-        let mut codes = Vec::new();
-        while let Some(chunk) = rx.recv().await {
-            match chunk {
-                StreamChunk::Token { id, .. } => {
-                    if let Some(code) = c.code_of(codes.len(), id) {
-                        codes.push(code);
-                        if codes.len() % fc == 0 && ftx.send(codes[codes.len() - fc..].to_vec()).is_err() {
-                            return;
+        let drain = async {
+            let mut rx = Some(rx);
+            for k in 0..n_segs {
+                let mut attempt = 0;
+                loop {
+                    let mut rx = match rx.take() {
+                        Some(rx) => rx,
+                        None => match later.submit(k, attempt) {
+                            Ok(rx) => rx,
+                            Err(e) => return drop(ftx.send(SegMsg::Err(e))),
+                        },
+                    };
+                    lm.segment(k);
+                    let mut codes = Vec::new();
+                    loop {
+                        match rx.recv().await {
+                            Some(StreamChunk::Token { id, .. }) => {
+                                if let Some(code) = c.code_of(codes.len(), id) {
+                                    codes.push(code);
+                                    if codes.len() % fc == 0 {
+                                        lm.frame();
+                                        if ftx.send(SegMsg::Frame(codes[codes.len() - fc..].to_vec())).is_err() {
+                                            return;
+                                        }
+                                    }
+                                }
+                                if lm_cut.load(SeqCst) > k {
+                                    break;
+                                }
+                            }
+                            Some(StreamChunk::Done { .. }) => break,
+                            Some(StreamChunk::Err(e)) => return tracing::warn!(error = %e, "tts: stream LM error"),
+                            None => return,
                         }
                     }
+                    lm.segment_done();
+                    if lm_mute.swap(false, SeqCst) && attempt < MUTE_RETRIES {
+                        attempt += 1;
+                        tracing::warn!(segment = k, attempt, "tts: mute segment; retrying");
+                        lm_cut.store(0, SeqCst);
+                        if ftx.send(SegMsg::Retry).is_err() {
+                            return;
+                        }
+                        continue;
+                    }
+                    if ftx.send(SegMsg::End).is_err() {
+                        return;
+                    }
+                    break;
                 }
-                StreamChunk::Done { .. } => return,
-                StreamChunk::Err(e) => return tracing::warn!(error = %e, "tts: stream LM error"),
             }
-        }
+        };
+        drain.await;
+        lm.lm_done();
     });
     let (mut frames, mut emitted, mut first) = (Vec::<i32>::new(), 0usize, None);
+    // Segment index and frames the earlier segments emitted.
+    let (mut seg, mut total, mut joins) = (0usize, 0usize, Vec::new());
+    // Samples sent and when the first went out (the client's playback clock).
+    let (mut sent, mut playing): (usize, Option<Instant>) = (0, None);
+    let mut joiner = super::Joins::new(model.contract.sample_rate);
+    // Dropping the rest of the current segment (cut short or mute).
+    let mut skipping = false;
+    let mut first_frame_at: Option<Instant> = None;
     loop {
-        let next = frx.recv().await;
-        let done = next.is_none();
-        if let Some(f) = next {
-            frames.extend(f);
-            while let Ok(f) = frx.try_recv() {
+        let (mut done, mut closed) = (false, false);
+        match frx.recv().await {
+            None => (done, closed) = (true, true),
+            Some(SegMsg::End) => done = true,
+            Some(SegMsg::Err(e)) => return drop(out.send(Err(std::io::Error::other(e))).await),
+            Some(SegMsg::Retry) => {
+                (frames, emitted, skipping) = (Vec::new(), 0, false);
+                joiner.next_segment();
+                continue;
+            }
+            Some(SegMsg::Frame(f)) => {
                 frames.extend(f);
+                while let Ok(m) = frx.try_recv() {
+                    match m {
+                        SegMsg::Frame(f) => frames.extend(f),
+                        SegMsg::End => {
+                            done = true;
+                            break;
+                        }
+                        SegMsg::Retry => {
+                            (frames, emitted, skipping) = (Vec::new(), 0, false);
+                            joiner.next_segment();
+                        }
+                        SegMsg::Err(e) => return drop(out.send(Err(std::io::Error::other(e))).await),
+                    }
+                }
+                first_frame_at.get_or_insert_with(Instant::now);
             }
         }
+        let first_audio = first.is_none() && emitted == 0;
         let chunk = (model.codec.min_frames + 1).saturating_sub(model.codec.window).max(1);
         let lookahead = if emitted == 0 {
             model.codec.lookahead.min(crate::config::RuntimeConfig::get().tts_first_lookahead)
         } else {
             model.codec.lookahead
         };
-        if let Some((s, e, upto)) = stream_step(frames.len() / fc, emitted, done, model.codec.window, lookahead, chunk) {
+        let n = frames.len() / fc;
+        // A short first lookahead buys time to first audio, but the next window needs the full
+        // lookahead: hold the first audio until it covers producing those frames at the measured
+        // frame rate (a stream near real time otherwise underruns right after its first chunk).
+        if first_audio && !done && lookahead < model.codec.lookahead {
+            let Some(t0) = first_frame_at.filter(|_| n >= 2) else { continue };
+            let per_frame = t0.elapsed().as_secs_f64() / (n - 1) as f64;
+            let audio_per_frame = fs as f64 / sr;
+            let gap = (chunk + model.codec.lookahead - lookahead) as f64;
+            let need = ((gap * per_frame * 1.1) / audio_per_frame).ceil() as usize;
+            let mut need = need.clamp(1, chunk + model.codec.lookahead);
+            // A later segment's first window waits for its prefill and frames: bank that too.
+            if n_segs > 1 {
+                need += model.codec.lookahead + 2;
+            }
+            // Slower than real time (a wide batch): also bank the audio the rest of the utterance
+            // falls behind by at this rate, holding at most MAX_HOLD_S.
+            let deficit = ticket.remaining_frames() * (per_frame - audio_per_frame);
+            if deficit > 0.0 && t0.elapsed().as_secs_f64() < super::realtime::MAX_HOLD_S {
+                need = need.max((deficit / audio_per_frame).ceil() as usize);
+            }
+            if n.saturating_sub(lookahead) < need {
+                continue;
+            }
+        }
+        if let Some((s, e, upto)) = stream_step(n, emitted, done, model.codec.window, lookahead, chunk).filter(|_| !skipping) {
             let window = frames[s * fc..e * fc].to_vec();
-            let urgency = if emitted == 0 { Urgency::First } else { Urgency::Stream };
-            match model.codec.decode(window, e - s, seed ^ (emitted as u64).wrapping_mul(0x9E37_79B9), urgency).await {
+            let urgency = if first_audio { Urgency::First } else { Urgency::Stream };
+            let wseed = seed ^ segment_salt(seg) ^ (emitted as u64).wrapping_mul(0x9E37_79B9);
+            match model.codec.decode(window, e - s, wseed, urgency).await {
                 Ok(pcm) => {
                     let Some(fresh) = pcm.get((emitted - s) * fs..(upto - s) * fs) else {
                         return drop(out.send(Err(std::io::Error::other(short_window(pcm.len(), e - s)))).await);
                     };
-                    let mut bytes = Vec::new();
-                    pcm16(fresh, &mut bytes);
-                    first.get_or_insert_with(|| t_arrive.elapsed());
-                    run.audio((upto - emitted) * fs, sr);
-                    if out.send(Ok(bytes)).await.is_err() {
-                        return; // client gone: dropping frx ends the drain, which cancels the slot
-                    }
+                    let joined;
+                    let fresh = if n_segs == 1 {
+                        fresh
+                    } else {
+                        let lead = playing.map_or(f64::INFINITY, |t| sent as f64 / sr - t.elapsed().as_secs_f64());
+                        let mut v = Vec::with_capacity(fresh.len());
+                        joiner.push(fresh, lead, &mut v);
+                        if joiner.runaway() || joiner.mute() {
+                            mute.store(joiner.mute(), SeqCst);
+                            cut.store(seg + 1, SeqCst);
+                            skipping = true;
+                        }
+                        joined = v;
+                        &joined[..]
+                    };
                     emitted = upto;
+                    if !fresh.is_empty() {
+                        let mut bytes = Vec::new();
+                        pcm16(fresh, &mut bytes);
+                        if first.is_none() {
+                            ticket.first_audio();
+                        }
+                        first.get_or_insert_with(|| t_arrive.elapsed());
+                        playing.get_or_insert_with(Instant::now);
+                        sent += fresh.len();
+                        ticket.sent(sent as f64 / sr);
+                        run.audio(fresh.len(), sr);
+                        if out.send(Ok(bytes)).await.is_err() {
+                            return; // client gone: dropping frx ends the drain, which cancels the slot
+                        }
+                    }
                 }
                 Err(e) => return drop(out.send(Err(std::io::Error::other(e))).await),
             }
         }
         if done {
-            break;
+            if closed || seg + 1 >= n_segs {
+                break;
+            }
+            total += emitted;
+            joins.push(sent);
+            joiner.next_segment();
+            skipping = false;
+            frames.clear();
+            emitted = 0;
+            seg += 1;
         }
     }
     run.done();
     tracing::info!(
-        frames = emitted,
+        frames = total + emitted,
+        segments = n_segs,
+        ?joins,
         ttfa_ms = first.map(|d| d.as_secs_f64() * 1e3),
         total_ms = t_arrive.elapsed().as_secs_f64() * 1e3,
         "tts: stream"
@@ -619,6 +960,16 @@ mod tests {
 
     const WINDOW: usize = 6;
     const LOOKAHEAD: usize = 2;
+
+    /// A request the guided pipeline cannot take is the client's error, not a server fault.
+    #[test]
+    fn guided_speech_failures_map_to_their_status() {
+        use super::super::guided_speech::{SpeechError, QUEUE_FULL};
+        let invalid = speech_failure(SpeechError::Invalid("unknown voice \"x\"".into(), "voice"));
+        assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(speech_failure(SpeechError::Failed(QUEUE_FULL.into())).status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(speech_failure(SpeechError::Failed("render failed".into())).status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
 
     /// Every frame is emitted exactly once, in order, each with LOOKAHEAD right context until
     /// the final flush and the one-frame window's left context; later windows emit CHUNK frames

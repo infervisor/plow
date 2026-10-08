@@ -64,9 +64,121 @@ pub struct RnntPackets {
     compiled_prompt_index: Option<u32>,
     frontend: Option<EmbeddedLogMelFrontend>,
     encoder_buckets: BTreeMap<u32, Vec<usize>>,
+    stream: Option<StreamPrograms>,
+}
+
+/// Geometry of a cache-aware encoder stream (see `conformer::append_stream_step`).
+#[derive(Clone, Copy, Debug)]
+pub struct StreamGeometry {
+    /// New encoder frames per step (whole attention chunks).
+    pub rows: u32,
+    /// Attention left context in encoder frames.
+    pub left_rows: u32,
+    /// Input frames (mel) the first step reads; it keeps output rows `0..rows`.
+    pub first_input_frames: u32,
+    /// Input frames each later step reads: `history` frames already seen, then new ones.
+    pub step_input_frames: u32,
+    pub history_input_frames: u32,
+    /// Output row of the later steps' subsampling where the new rows start.
+    pub step_keep_row0: u32,
+}
+
+struct StreamPrograms {
+    geometry: StreamGeometry,
+    init: usize,
+    first: Vec<usize>,
+    step: Vec<usize>,
+    input: String,
+}
+
+/// Append `programs` of `sub` to `main`, binding `sub`'s tensors to `main`'s by name (declared
+/// sizes grow to the larger; initializers must agree). Returns the new program indices.
+fn graft(main: &mut Model, sub: Model, programs: &[usize]) -> Result<Vec<usize>, String> {
+    if sub.n_cu != main.n_cu || !sub.gen.is_empty() {
+        return Err("grafted programs need the packet's CU count and no generated tensors".into());
+    }
+    let mut map = Vec::with_capacity(sub.tensors.len());
+    for tensor in sub.tensors {
+        let index = match main.tensors.iter().position(|t| t.name == tensor.name) {
+            Some(index) => {
+                let base = &mut main.tensors[index];
+                match (&base.init, tensor.init) {
+                    (_, None) => base.bytes = base.bytes.max(tensor.bytes),
+                    (Some(existing), Some(init)) if *existing == init => {}
+                    (None, Some(init)) if base.bytes == tensor.bytes => base.init = Some(init),
+                    _ => return Err(format!("grafted tensor {:?} has a different initialization", tensor.name)),
+                }
+                index
+            }
+            None => {
+                main.tensors.push(tensor);
+                main.tensors.len() - 1
+            }
+        };
+        map.push(u32::try_from(index).map_err(|_| "tensor index overflows")?);
+    }
+    let mut progs: Vec<_> = sub.progs.into_iter().map(Some).collect();
+    let mut out = Vec::with_capacity(programs.len());
+    for &p in programs {
+        let mut program = progs.get_mut(p).and_then(Option::take).ok_or("grafted program is missing")?;
+        for inst in &mut program.insts {
+            for t in &mut inst.t {
+                if *t != packet::dev::TENSOR_NONE {
+                    *t = *map.get(*t as usize).ok_or("grafted instruction names a missing tensor")?;
+                }
+            }
+        }
+        out.push(main.progs.len());
+        main.progs.push(program);
+        main.prog_t.push(*sub.prog_t.get(p).ok_or("grafted program shape is missing")?);
+    }
+    Ok(out)
 }
 
 impl RnntPackets {
+    /// Add a cache-aware encoder stream: `first` and `step` are the stream encoder prefixes (mel
+    /// window -> `rows` encoder frames, see `conformer::append_stream_step`), `init` the program
+    /// filling their constant tensors. Each gets this packet's encoder projection, so a step leaves
+    /// its rows in `act.rnnt.encoder_joint` for the ordinary joint programs.
+    pub fn add_stream(
+        &mut self,
+        geometry: StreamGeometry,
+        init: Model,
+        first: PacketPrefix,
+        step: PacketPrefix,
+        weights: &RnntWeights<'_>,
+    ) -> Result<(), String> {
+        let prompt_index = self.compiled_prompt_index.ok_or("a stream needs a compiled RNNT prompt")?;
+        if self.stream.is_some()
+            || geometry.rows == 0
+            || geometry.rows > self.spec.frames
+            || first.input != step.input
+            || first.model.tensors[first.input as usize].name != step.model.tensors[step.input as usize].name
+        {
+            return Err("invalid RNNT encoder stream".into());
+        }
+        let input = first.model.tensors[first.input as usize].name.clone();
+        let spec = RnntSpec { frames: geometry.rows, ..self.spec };
+        let mut variant = |prefix: PacketPrefix| -> Result<Vec<usize>, String> {
+            let mut b = builder(prefix.model.n_cu, prefix.model.tensors.clone());
+            emit_encoder(&mut b, spec, weights, EncoderInput::Existing { tensor: prefix.output, prompt_index });
+            let tensors = b.tensors();
+            let program = b.finish();
+            let mut model = prefix.model;
+            model.tensors = tensors;
+            let mut programs = prefix.programs;
+            programs.push(model.progs.len());
+            model.progs.push(program);
+            model.prog_t.push(geometry.rows);
+            graft(&mut self.model, model, &programs)
+        };
+        let first = variant(first)?;
+        let step = variant(step)?;
+        let init = graft(&mut self.model, init, &[0])?[0];
+        self.stream = Some(StreamPrograms { geometry, init, first, step, input });
+        Ok(())
+    }
+
     pub fn merge_encoder_bucket(
         &mut self,
         input_frames: u32,
@@ -375,6 +487,49 @@ impl RnntPackets {
                 parameters.insert(name.into(), value);
             }
         }
+        if let Some(stream) = &self.stream {
+            let g = stream.geometry;
+            programs.insert("stream.init".into(), stream.init as u32);
+            for (prefix, sequence) in [("stream.first", &stream.first), ("stream.step", &stream.step)] {
+                for (stage, &program) in sequence.iter().enumerate() {
+                    programs.insert(format!("{prefix}.{stage}"), program as u32);
+                }
+            }
+            // The offline encoder input, shared: a step writes its window's leading frames.
+            let bins = self.frontend.as_ref().map_or(0, |f| u64::from(f.spec.bins));
+            let input = self.model.tensors.iter().find(|t| t.name == stream.input).ok_or("stream input is missing")?;
+            if bins == 0 || input.bytes % (4 * bins) != 0 || input.bytes / (4 * bins) < u64::from(g.step_input_frames.max(g.first_input_frames)) {
+                return Err("stream input does not hold the step windows".into());
+            }
+            tensors.insert(
+                "stream.input".into(),
+                PipelineTensor { name: stream.input.clone(), dtype: PipelineDType::F32, shape: vec![input.bytes / (4 * bins), bins] },
+            );
+            tensors.insert(
+                "stream.key_start".into(),
+                PipelineTensor {
+                    name: crate::conformer::STREAM_KEY_START.into(),
+                    dtype: PipelineDType::U32,
+                    shape: vec![1],
+                },
+            );
+            for (index, state) in self.model.tensors.iter().filter(|t| t.name.starts_with("state.stream.")).enumerate() {
+                tensors.insert(
+                    format!("stream.state.{index}"),
+                    PipelineTensor { name: state.name.clone(), dtype: PipelineDType::F32, shape: vec![state.bytes / 4] },
+                );
+            }
+            for (name, value) in [
+                ("stream.rows", g.rows),
+                ("stream.left_rows", g.left_rows),
+                ("stream.first_input_frames", g.first_input_frames),
+                ("stream.step_input_frames", g.step_input_frames),
+                ("stream.history_input_frames", g.history_input_frames),
+                ("stream.step_keep_row0", g.step_keep_row0),
+            ] {
+                parameters.insert(name.into(), u64::from(value));
+            }
+        }
         if !stages.is_empty() {
             if input_frames == 0 {
                 return Err("RNNT frame transform input is empty".into());
@@ -615,6 +770,7 @@ fn lower_inner(
         compiled_prompt_index,
         frontend: None,
         encoder_buckets: BTreeMap::new(),
+        stream: None,
     })
 }
 
@@ -843,7 +999,8 @@ fn q8(
     let bias = b.tensor(w.bias, u64::from(n) * 4);
     b.emit(
         DevOp::Q8GemmF32,
-        repeated(n_cu(b), m.div_ceil(128) * n.div_ceil(64)),
+        // At most 8 rows the kernel walks columns warp by warp (SPQ_GEMV_ROWS): every CU takes a share.
+        repeated(n_cu(b), if m <= 8 { n_cu(b) } else { m.div_ceil(64) * n.div_ceil(64) }),
         &dep.into_iter().collect::<Vec<_>>(),
         |d| {
             d.t[..4].copy_from_slice(&[out, input, weight, bias]);

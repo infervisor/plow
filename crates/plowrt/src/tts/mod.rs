@@ -11,6 +11,8 @@ pub mod codec;
 #[cfg(feature = "cuda")]
 pub mod serving;
 #[cfg(feature = "cuda")]
+pub mod realtime;
+#[cfg(feature = "cuda")]
 pub mod guided_lm;
 #[cfg(feature = "cuda")]
 #[cfg(feature = "cuda")]
@@ -32,6 +34,9 @@ pub struct SpeechContract {
     pub prompt_template: String,
     /// The voice's vocabulary token with a `{voice}` placeholder.
     pub voice_token: String,
+    /// Named voices (`prompt.voices`, one per line); empty: a voice is known when its
+    /// `voice_token` is one vocabulary token.
+    pub voices: Vec<String>,
     pub prefix: Vec<u32>,
     pub suffix: Vec<u32>,
     pub stops: Vec<u32>,
@@ -65,6 +70,7 @@ impl SpeechContract {
             pipeline: p.name.clone(),
             prompt_template: p.strings.get("prompt.template").cloned().ok_or_else(|| RuntimeError::Rejected("speech pipeline lacks prompt.template".into()))?,
             voice_token: p.strings.get("prompt.voice_token").cloned().ok_or_else(|| RuntimeError::Rejected("speech pipeline lacks prompt.voice_token".into()))?,
+            voices: p.strings.get("prompt.voices").map(|v| v.lines().map(str::to_owned).collect()).unwrap_or_default(),
             prefix: list("prompt.prefix")?,
             suffix: list("prompt.suffix")?,
             stops: list("stop")?,
@@ -115,11 +121,213 @@ impl SpeechContract {
         (frames * self.frame_codes + 21).min(self.max_new_tokens_cap)
     }
 
+    /// Longest input whose [`Self::max_new_tokens`] the cap does not clip; a longer one is spoken
+    /// as [`segments`] of at most this many characters.
+    pub fn segment_chars(&self) -> usize {
+        let frames = self.max_new_tokens_cap.saturating_sub(21) / self.frame_codes.max(1);
+        let fits = |c: usize| (c as f32 * self.per_char_frames) as usize <= frames;
+        let mut c = (frames as f32 / self.per_char_frames) as usize;
+        while c > 1 && !fits(c) {
+            c -= 1;
+        }
+        while c < MAX_INPUT_CHARS && fits(c + 1) {
+            c += 1;
+        }
+        c.max(1)
+    }
+
     /// Codebook id of the `n`-th kept audio token, or `None` when `tok` is not the code its frame
     /// position expects (dropped, as the reference decoder drops out-of-range ids).
     pub fn code_of(&self, n: usize, tok: u32) -> Option<i32> {
         let lo = self.audio_token_base + (n % self.frame_codes) as u32 * self.codebook;
         (lo..lo + self.codebook).contains(&tok).then(|| (tok - lo) as i32)
+    }
+}
+
+/// Longest `input` a codec-LM speech request takes, in characters (400 beyond): about 7 minutes
+/// of English audio, spoken as [`segments`].
+pub const MAX_INPUT_CHARS: usize = 4096;
+
+/// `text` as consecutive slices of at most `max` characters, outer whitespace trimmed: whole
+/// sentences packed greedily; a longer sentence splits after clause marks, then between words,
+/// then anywhere. A text of at most `max` characters is the one segment, unchanged.
+pub fn segments(text: &str, max: usize) -> Vec<&str> {
+    let max = max.max(1);
+    if text.chars().count() <= max {
+        return vec![text];
+    }
+    let mut pieces = Vec::new();
+    for r in cuts(text, (0, text.len()), Cut::Sentence) {
+        split_piece(text, r, max, Cut::Clause, &mut pieces);
+    }
+    let mut out = Vec::new();
+    let mut cur: Option<(usize, usize)> = None;
+    for (s, e) in pieces {
+        cur = match cur {
+            Some((cs, _)) if text[cs..e].chars().count() <= max => Some((cs, e)),
+            Some((cs, ce)) => {
+                out.push(&text[cs..ce]);
+                Some((s, e))
+            }
+            None => Some((s, e)),
+        };
+    }
+    out.extend(cur.map(|(s, e)| &text[s..e]));
+    out
+}
+
+#[derive(Clone, Copy, PartialEq, PartialOrd)]
+enum Cut {
+    Sentence,
+    Clause,
+    Word,
+    Char,
+}
+
+fn split_piece(text: &str, r: (usize, usize), max: usize, cut: Cut, out: &mut Vec<(usize, usize)>) {
+    if text[r.0..r.1].chars().count() <= max {
+        return out.push(r);
+    }
+    if cut == Cut::Char {
+        let mut s = r.0;
+        for (n, (i, _)) in text[r.0..r.1].char_indices().enumerate() {
+            if n > 0 && n % max == 0 {
+                out.push((s, r.0 + i));
+                s = r.0 + i;
+            }
+        }
+        return out.push((s, r.1));
+    }
+    let next = if cut == Cut::Clause { Cut::Word } else { Cut::Char };
+    for sub in cuts(text, r, cut) {
+        split_piece(text, sub, max, next, out);
+    }
+}
+
+/// `r` split after each `cut` boundary, every piece trimmed and non-empty.
+fn cuts(text: &str, r: (usize, usize), cut: Cut) -> Vec<(usize, usize)> {
+    let s = &text[r.0..r.1];
+    let mut out = Vec::new();
+    let mut push = |a: usize, b: usize| {
+        let p = &text[a..b];
+        let lead = p.len() - p.trim_start().len();
+        let t = p.trim();
+        if !t.is_empty() {
+            out.push((a + lead, a + lead + t.len()));
+        }
+    };
+    let mut start = r.0;
+    let mut it = s.char_indices().peekable();
+    while let Some((_, c)) = it.next() {
+        let end = match cut {
+            Cut::Sentence if matches!(c, '\n' | '।' | '॥' | '。' | '！' | '？') => true,
+            Cut::Sentence if matches!(c, '.' | '!' | '?' | '…') => {
+                while let Some(&(_, n)) = it.peek() {
+                    if !matches!(n, '.' | '!' | '?' | '…' | '"' | '\'' | '”' | '’' | ')' | ']' | '»') {
+                        break;
+                    }
+                    it.next();
+                }
+                it.peek().is_none_or(|&(_, n)| n.is_whitespace())
+            }
+            Cut::Clause if matches!(c, ',' | ';' | ':' | '—' | '–' | '،' | '、' | '，') => {
+                it.peek().is_none_or(|&(_, n)| n.is_whitespace())
+            }
+            Cut::Word => c.is_whitespace(),
+            _ => false,
+        };
+        if end {
+            let b = it.peek().map_or(r.1, |&(j, _)| r.0 + j);
+            push(start, b);
+            start = b;
+        }
+    }
+    push(start, r.1);
+    out
+}
+
+/// Silence across the joins of a multi-segment utterance. A segment can open with seconds of
+/// silence (Orpheus) or run on silent to its budget, so a run of silent blocks past `KEEP_S` is
+/// held back: speech resuming within the segment sends it (a real pause); at a join only enough to
+/// make a `JOIN_PAUSE_S` pause is sent; a run reaching `RUNAWAY_S` ends the segment, and a segment
+/// silent for `RUNAWAY_S` from its start is mute (retried). Silence is held only while the client
+/// has more than `HOLD_LEAD_S` of audio beyond it.
+pub(crate) struct Joins {
+    rate: f64,
+    /// Silent samples of the current run sent, and held back.
+    sent: usize,
+    held: Vec<f32>,
+    /// The current segment has spoken; the first segment's leading silence is never held.
+    speech: bool,
+    first: bool,
+    /// Silent samples since the segment started, until it speaks.
+    quiet: usize,
+}
+
+impl Joins {
+    const BLOCK: usize = 256;
+    /// RMS under -45 dBFS.
+    const SILENCE: f32 = 0.0056;
+    const KEEP_S: f64 = 0.3;
+    const JOIN_PAUSE_S: f64 = 0.5;
+    const RUNAWAY_S: f64 = 3.0;
+    const HOLD_LEAD_S: f64 = 1.5;
+
+    pub(crate) fn new(sample_rate: u32) -> Self {
+        Joins { rate: f64::from(sample_rate), sent: 0, held: Vec::new(), speech: false, first: true, quiet: 0 }
+    }
+
+    /// The next segment starts: the previous one's held silence is dropped.
+    pub(crate) fn next_segment(&mut self) {
+        self.held.clear();
+        self.speech = false;
+        self.first = false;
+        self.quiet = 0;
+    }
+
+    /// Append to `out` what of `pcm` to send now; `lead_s` is the audio the client has buffered.
+    pub(crate) fn push(&mut self, pcm: &[f32], lead_s: f64, out: &mut Vec<f32>) {
+        let samples = |s: f64| (s * self.rate) as usize;
+        for b in pcm.chunks(Self::BLOCK) {
+            let rms = (b.iter().map(|x| x * x).sum::<f32>() / b.len() as f32).sqrt();
+            if rms >= Self::SILENCE {
+                let room = if self.speech || self.first { self.held.len() } else { samples(Self::JOIN_PAUSE_S).saturating_sub(self.sent) };
+                out.extend_from_slice(&self.held[self.held.len().saturating_sub(room)..]);
+                self.held.clear();
+                self.sent = 0;
+                self.speech = true;
+                out.extend_from_slice(b);
+                continue;
+            }
+            if !self.speech {
+                self.quiet += b.len();
+            }
+            let held_s = (self.held.len() + b.len()) as f64 / self.rate;
+            let hold = (self.speech || !self.first) && self.sent >= samples(Self::KEEP_S) && lead_s - held_s > Self::HOLD_LEAD_S;
+            if hold {
+                self.held.extend_from_slice(b);
+            } else {
+                self.sent += self.held.len() + b.len();
+                out.append(&mut self.held);
+                out.extend_from_slice(b);
+            }
+        }
+    }
+
+    /// The current segment has spoken and then stayed silent for `RUNAWAY_S`.
+    pub(crate) fn runaway(&self) -> bool {
+        self.speech && (self.sent + self.held.len()) as f64 >= Self::RUNAWAY_S * self.rate
+    }
+
+    /// The current segment has been silent for `RUNAWAY_S` since it started.
+    pub(crate) fn mute(&self) -> bool {
+        !self.speech && self.quiet as f64 >= Self::RUNAWAY_S * self.rate
+    }
+
+    /// Whether `pcm` holds a quarter second of sound.
+    pub(crate) fn speaks(&self, pcm: &[f32]) -> bool {
+        let loud = pcm.chunks(Self::BLOCK).filter(|b| (b.iter().map(|x| x * x).sum::<f32>() / b.len() as f32).sqrt() >= Self::SILENCE);
+        loud.map(<[f32]>::len).sum::<usize>() as f64 >= 0.25 * self.rate
     }
 }
 
@@ -221,6 +429,117 @@ mod tests {
         // scripts/tts/veena_ref.py max_new: min(int(len*1.3)*7+21, 700)
         assert_eq!(c.max_new_tokens("Hello, how are you doing today?"), 40 * 7 + 21);
         assert_eq!(c.max_new_tokens(&"x".repeat(200)), 700);
+    }
+
+    /// Segments are ordered, non-overlapping slices of the text, at most `max` characters, with
+    /// only whitespace between them.
+    fn check_cover(text: &str, max: usize) -> Vec<&str> {
+        let segs = segments(text, max);
+        let mut at = 0;
+        for s in &segs {
+            assert!(!s.is_empty() && s.chars().count() <= max, "{s:?}");
+            let off = s.as_ptr() as usize - text.as_ptr() as usize;
+            assert!(off >= at && text[at..off].trim().is_empty(), "gap {:?}", &text[at..off]);
+            at = off + s.len();
+        }
+        assert!(text[at..].trim().is_empty());
+        segs
+    }
+
+    #[test]
+    fn short_input_is_one_unchanged_segment() {
+        assert_eq!(segments("  Hello there.  ", 16), ["  Hello there.  "]);
+    }
+
+    #[test]
+    fn sentences_pack_up_to_the_limit() {
+        let t = "One two three. Four five six! Seven eight nine? Ten eleven.";
+        assert_eq!(check_cover(t, 30), ["One two three. Four five six!", "Seven eight nine? Ten eleven."]);
+        assert_eq!(check_cover(t, 17), ["One two three.", "Four five six!", "Seven eight nine?", "Ten eleven."]);
+        // No whitespace after the point: a number, not a sentence end.
+        assert_eq!(check_cover("It costs 3.5 dollars. Then more.", 22), ["It costs 3.5 dollars.", "Then more."]);
+        assert_eq!(check_cover("\"Stop!\" she said. Go on.", 18), ["\"Stop!\" she said.", "Go on."]);
+    }
+
+    #[test]
+    fn danda_ends_a_sentence() {
+        let t = "मेरा नाम वीणा है। मैं हिंदी बोलती हूँ। आप कैसे हैं?";
+        let segs = check_cover(t, 20);
+        assert_eq!(segs, ["मेरा नाम वीणा है।", "मैं हिंदी बोलती हूँ।", "आप कैसे हैं?"]);
+    }
+
+    #[test]
+    fn long_sentences_split_at_clauses_then_words_then_chars() {
+        let t = "alpha beta gamma, delta epsilon zeta, eta theta iota kappa lambda mu";
+        assert_eq!(check_cover(t, 40), ["alpha beta gamma, delta epsilon zeta,", "eta theta iota kappa lambda mu"]);
+        let w = check_cover("aaaa bbbb cccc dddd eeee", 10);
+        assert_eq!(w, ["aaaa bbbb", "cccc dddd", "eeee"]);
+        let x = "x".repeat(25);
+        let c = check_cover(&x, 10);
+        assert_eq!(c.iter().map(|s| s.len()).collect::<Vec<_>>(), [10, 10, 5]);
+        for max in [1, 7, 33, 151] {
+            check_cover(&"The quick brown fox, jumps over; the lazy dog. ".repeat(40), max);
+        }
+    }
+
+    #[test]
+    fn segment_chars_is_the_longest_unclipped_input() {
+        let c = SpeechContract::from_pipeline(&pipeline()).unwrap();
+        let n = c.segment_chars();
+        assert_eq!(n, 75);
+        let budget = |k: usize| (k as f32 * c.per_char_frames) as usize * c.frame_codes + 21;
+        assert!(budget(n) <= c.max_new_tokens_cap && budget(n + 1) > c.max_new_tokens_cap);
+    }
+
+    const SR: u32 = 24000;
+
+    fn tone(s: f64) -> Vec<f32> {
+        (0..(s * f64::from(SR)) as usize).map(|i| 0.3 * (i as f32 * 0.05).sin()).collect()
+    }
+
+    fn quiet(s: f64) -> Vec<f32> {
+        vec![0.0; (s * f64::from(SR)) as usize]
+    }
+
+    fn secs(v: &[f32]) -> f64 {
+        v.len() as f64 / f64::from(SR)
+    }
+
+    #[test]
+    fn joins_keep_internal_pauses_and_bound_join_pauses() {
+        let mut j = Joins::new(SR);
+        let mut out = Vec::new();
+        // First segment: leading silence passes untouched, an internal 2 s pause too.
+        for p in [quiet(1.5), tone(1.0), quiet(2.0), tone(1.0), quiet(1.2)] {
+            j.push(&p, f64::INFINITY, &mut out);
+        }
+        assert!((secs(&out) - (1.5 + 1.0 + 2.0 + 1.0 + 0.3)).abs() < 0.02, "{}", secs(&out));
+        // Next segment opens with 2 s of silence: the join pause is 0.5 s in all.
+        j.next_segment();
+        let before = out.len();
+        for p in [quiet(2.0), tone(1.0)] {
+            j.push(&p, f64::INFINITY, &mut out);
+        }
+        assert!((secs(&out[before..]) - (0.2 + 1.0)).abs() < 0.02, "{}", secs(&out[before..]));
+        assert!(!j.runaway());
+        j.push(&quiet(3.1), f64::INFINITY, &mut out);
+        assert!(j.runaway() && !j.mute());
+        j.next_segment();
+        j.push(&quiet(2.9), f64::INFINITY, &mut out);
+        assert!(!j.mute());
+        j.push(&quiet(0.2), f64::INFINITY, &mut out);
+        assert!(j.mute() && !j.speaks(&quiet(1.0)) && !j.speaks(&tone(0.1)) && j.speaks(&tone(0.3)));
+    }
+
+    #[test]
+    fn joins_never_hold_silence_into_an_underrun() {
+        let mut j = Joins::new(SR);
+        let mut out = Vec::new();
+        j.push(&tone(1.0), 0.0, &mut out);
+        j.next_segment();
+        // The client has 1.7 s buffered: at most ~0.2 s of silence may be held back.
+        j.push(&quiet(2.0), 1.7, &mut out);
+        assert!(secs(&out) > 1.0 + 1.75, "{}", secs(&out));
     }
 
     #[test]

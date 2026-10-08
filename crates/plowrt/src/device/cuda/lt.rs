@@ -24,6 +24,25 @@ struct Heuristic {
     reserved: [i32; 4],
 }
 
+/// cuBLASLt, first match wins: beside the binary (`<exe>/../lib`, `<exe>`: a deploy bundle ships it
+/// there), the system loader's sonames, then the toolkit plowrt was built against.
+fn cublaslt_candidates() -> Vec<std::path::PathBuf> {
+    use std::path::{Path, PathBuf};
+    const NAMES: [&str; 3] = ["libcublasLt.so.13", "libcublasLt.so.12", "libcublasLt.so"];
+    let beside: Vec<PathBuf> = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(Path::to_path_buf))
+        .map(|dir| vec![dir.join("../lib"), dir])
+        .unwrap_or_default();
+    let mut paths: Vec<PathBuf> =
+        beside.iter().flat_map(|dir| NAMES.map(|n| dir.join(n))).filter(|p| p.is_file()).collect();
+    paths.extend(NAMES.map(PathBuf::from));
+    if let Some(dir) = option_env!("PLOW_BUILD_CUDA_LIB") {
+        paths.extend(NAMES.map(|n| Path::new(dir).join(n)));
+    }
+    paths
+}
+
 macro_rules! api {
     ($($name:ident: fn($($arg:ty),*) -> Status),+ ;
      optional $($oname:ident: fn($($oarg:ty),*) -> Status),+ $(,)?) => {
@@ -37,7 +56,7 @@ macro_rules! api {
             #[allow(non_snake_case)]
             fn load() -> Result<Self> {
                 let mut last = String::new();
-                for path in ["libcublasLt.so.13", "libcublasLt.so.12", "libcublasLt.so"] {
+                for path in cublaslt_candidates() {
                     // SAFETY: optional NVIDIA host library, retained with its symbols.
                     let lib = match unsafe { libloading::Library::new(path) } {
                         Ok(lib) => lib,

@@ -156,6 +156,14 @@ fn interpreter_profile(cc: (u32, u32)) -> Option<InterpreterProfile> {
             prefill_symbol: "_Z15interp_sm120_pf11PlowProgram",
             embedded_decode: "interp_sm120",
         }),
+        (8, 9) => Some(InterpreterProfile {
+            tag: "sm89",
+            decode_file: "interp_sm89.cubin",
+            prefill_file: "interp_sm89_pf.cubin",
+            decode_symbol: "_Z11interp_sm8911PlowProgram",
+            prefill_symbol: "_Z14interp_sm89_pf11PlowProgram",
+            embedded_decode: "interp_sm89",
+        }),
         _ => None,
     }
 }
@@ -655,14 +663,20 @@ fn kv_row_charge(
     // B/token against a real 20480, admitted ~10 of 16 requests at 4096 tokens, and the other 6
     // waited out a whole generation: TTFT 3-4.5 s at C16. With live rings every cache maps
     // lazily and the average stays the honest bound.
-    let geo = vmm.kv.geometry();
+    let Some(kv) = &vmm.kv else {
+        // Slot-granular caches: any request commits one whole slot, charged as one block.
+        let rows = (max_ctx as u64).max(1);
+        let slot = vmm.rings.as_ref()?.slot_charge();
+        return Some((slot.div_ceil(rows).max(1), Some(rows), 0));
+    };
+    let geo = kv.geometry();
     let per_token = geo.full_layers.len() as u64 * 2 * geo.kvh_full as u64 * geo.row_bytes();
-    let block_rows = vmm.kv.block_rows() as u64;
+    let block_rows = kv.block_rows() as u64;
     let request_bytes = match &vmm.rings {
         // Prefix admission maps `max(block, widest prefill bucket)` rows past the request
         // (`admit_packed_slot`); with the ring committed per request, charge both, so a budget
         // capped by `PLOW_KV_MEM_UTIL` bounds what admission actually maps.
-        Some(rings) if vmm.kv.prefix_reuse() => {
+        Some(rings) if kv.prefix_reuse() => {
             let pf_rows = blob
                 .progs
                 .iter()
@@ -2301,12 +2315,17 @@ struct NvDenseNsplit {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum PackedAdmission {
     Pending,
-    Waiting(u64),
+    /// Out of device memory at this retire epoch, since this instant: retried on a retire, or
+    /// after [`KV_MEMORY_RETRY`] (another model may have freed memory).
+    Waiting(u64, std::time::Instant),
     /// Another slot is prefilling this prompt's shared prefix; admit once its checkpoint is
     /// published (`vmm_inflight_prefix`), or after [`INFLIGHT_WAIT_LIMIT`] regardless.
     WaitingPrefix(std::time::Instant),
     Ready,
 }
+
+/// A packed admission that ran out of device memory retries after this long.
+const KV_MEMORY_RETRY: std::time::Duration = std::time::Duration::from_millis(100);
 
 /// Longest a request waits on another slot's prefill before it prefills the shared rows
 /// itself — a safety valve; the owner's prompt-end publish or retirement releases it first.
@@ -2539,6 +2558,8 @@ pub struct GpuEngine {
     vmm_active: Vec<bool>,
     packed_admission: Vec<PackedAdmission>,
     kv_admission_epoch: u64,
+    /// Packed admissions that waited for device memory.
+    kv_pressure_events: u64,
     /// Per-slot token ids whose KV rows the slot currently holds (prompt,
     /// then every decode-fed token) — `seq_tokens[b].len() == pos[b]` when
     /// consistent. Lets `begin_slot` publish the finished sequence's
@@ -3867,7 +3888,7 @@ impl GpuEngine {
                     granularity,
                 )
             });
-        let prefix_requested = config.nv_vmm_prefix() == Some(true) || prefix_layout.is_some();
+        let prefix_requested = config.nv_prefix_requested(prefix_layout.is_some());
         let unified_packed = config.token_batch
             && !config.fusion
             && prefix_layout.is_some()
@@ -4296,7 +4317,7 @@ impl GpuEngine {
         let vmm_va_of = |id: usize| -> Option<u64> {
             let v = vmm.as_ref()?;
             if let Some(&(_, layer, tensor)) = v.tensor_tracks.iter().find(|&&(i, _, _)| i == id) {
-                v.kv.tensor_va(layer, tensor)
+                v.kv.as_ref()?.tensor_va(layer, tensor)
             } else {
                 v.rings.as_ref().and_then(|rings| rings.tensor_va(id))
             }
@@ -6292,7 +6313,7 @@ impl GpuEngine {
             (Some((d_slot, d_req)), Some((h_slot, h_req)))
                 if f_pf.is_some() && !prefill.is_empty() =>
             {
-                if (vmm.as_ref().is_some_and(|v| v.kv.prefix_reuse()) && !packed_prefix)
+                if (vmm.as_ref().is_some_and(|v| v.prefix_kv().is_some()) && !packed_prefix)
                     || recurrent.is_some()
                     || prefill.iter().any(|b| {
                         b.seg_class.len() < 2 || b.qwen_segments.iter().any(Option::is_some)
@@ -6338,8 +6359,8 @@ impl GpuEngine {
             batch,
             prefill_buckets = prefill.len(),
             stop_ids = ?stop_ids,
-            vmm_prefix = vmm.as_ref().is_some_and(|v| v.kv.prefix_reuse()),
-            vmm_live = vmm.as_ref().is_some_and(|v| !v.kv.prefix_reuse()),
+            vmm_prefix = vmm.as_ref().is_some_and(|v| v.prefix_kv().is_some()),
+            vmm_live = vmm.as_ref().is_some_and(|v| v.prefix_kv().is_none()),
             elapsed_s = t0.elapsed().as_secs_f32(),
             // Was a hardcoded "sm_120" from the sm120-only era. On a Hopper card it
             // printed sm_120 while running the sm90a object, which reads as a
@@ -6421,11 +6442,11 @@ impl GpuEngine {
         // Prefix cache: evict on real device pressure (`cuMemGetInfo`), not the static budget.
         // The floor is 2% of the device, at most half of what is free after load; a card the
         // rings nearly fill (26B: 5 GiB) keeps an eighth of it instead.
-        if let Some(v) = vmm.as_mut().filter(|v| v.kv.prefix_reuse()) {
+        if let Some(kv) = vmm.as_mut().and_then(|v| v.kv.as_mut()).filter(|kv| kv.prefix_reuse()) {
             if let Ok((free, total)) = be.mem_info() {
                 let config = crate::config::RuntimeConfig::get();
                 if let Some(floor) = config.vmm_cache_min_free_bytes(total, Some(free)) {
-                    v.kv.enable_pressure_eviction(floor);
+                    kv.enable_pressure_eviction(floor);
                     tracing::info!(
                         floor_mib = floor >> 20,
                         free_mib = free >> 20,
@@ -6547,6 +6568,7 @@ impl GpuEngine {
             vmm_active: vec![false; batch],
             packed_admission: vec![PackedAdmission::Pending; batch],
             kv_admission_epoch: 0,
+            kv_pressure_events: 0,
             seq_tokens: vec![Vec::new(); batch],
             stop_ids: std::sync::Arc::new(stop_ids),
             logits_raw: Vec::new(),
@@ -6925,8 +6947,27 @@ impl GpuEngine {
         self.kv_row_bytes
     }
 
+    /// With slot-granular live KV, re-derived from device memory now: the slots this engine holds
+    /// plus its recycled units plus the admission share of what is free (other models load and
+    /// leave). At least one slot, so a request never looks larger than the device.
     pub fn kv_admission(&self) -> Option<crate::sched::admission::KvBudget> {
-        self.kv_admission
+        let mut budget = self.kv_admission?;
+        let rings = self.vmm.as_ref().filter(|v| v.kv.is_none()).and_then(|v| v.rings.as_ref());
+        if let (Some(rings), Ok((free, total))) = (rings, self.be.mem_info()) {
+            let slot = rings.slot_charge();
+            let held = rings.stats().mapped_slots as u64 * slot + rings.spare_bytes();
+            budget.budget_bytes = held + RuntimeConfig::get().kv_admit_budget(free, total).max(slot);
+        }
+        Some(budget)
+    }
+
+    pub fn kv_pressure_events(&self) -> u64 {
+        self.kv_pressure_events
+    }
+
+    /// A slot could not begin for device memory and waits.
+    pub fn note_kv_pressure(&mut self) {
+        self.kv_pressure_events += 1;
     }
 
     /// Decode widths this loaded engine can execute, in ascending order.
@@ -7006,9 +7047,9 @@ impl GpuEngine {
             self.vmm_active[b] = true;
             self.seq_tokens[b].clear();
             self.seq_tokens[b].reserve(total);
-            v.kv.begin_seq(b);
-            if !v.kv.prefix_reuse() {
-                v.kv.ensure_rows(b, 1)?;
+            v.begin_seq(b);
+            if v.prefix_kv().is_none() {
+                v.ensure_rows(b, 1)?;
             }
         }
         Ok(())
@@ -7075,13 +7116,20 @@ impl GpuEngine {
         if cache_output && crate::config::RuntimeConfig::get().prefix_cache_output() {
             self.vmm_publish(b, self.pos[b]);
         }
-        if let (Some(ttl), Some(v)) = (self.session_pin[b].take(), self.vmm.as_ref()) {
-            v.kv.pin_prefix(&self.seq_tokens[b], std::time::Instant::now() + ttl);
+        if let (Some(ttl), Some(kv)) = (self.session_pin[b].take(), self.vmm.as_ref().and_then(|v| v.kv.as_ref())) {
+            kv.pin_prefix(&self.seq_tokens[b], std::time::Instant::now() + ttl);
         }
         self.pos[b] = 0;
         self.vmm_attached[b] = 0;
+        // A retired row decodes as an idle lane from position 0: a stale learned-position base
+        // above it traps `EmbedPosBf16` (`in.pos_base`, speech packets).
+        if let Some(base) = self.handle_of("in.pos_base").map(|i| self.devp[i].base + b as u64 * 4) {
+            if let Err(e) = self.be.memset_d8_async(base, 0, 4, &self.stream) {
+                tracing::warn!(slot = b, error = %e, "retire: pos_base reset failed");
+            }
+        }
         // Decode's backstop maps row zero before any inactive-row write.
-        self.vmm.as_ref().unwrap().kv.begin_seq(b);
+        self.vmm.as_ref().unwrap().begin_seq(b);
         if let Some(rings) = self.vmm.as_mut().and_then(|v| v.rings.as_mut()) {
             rings.release_slot(b);
         }
@@ -7108,12 +7156,15 @@ impl GpuEngine {
     ) -> Result<Option<usize>> {
         match self.packed_admission.get(b) {
             Some(PackedAdmission::Ready) => return Ok(Some(self.pos[b] as usize)),
-            Some(PackedAdmission::Waiting(epoch)) if *epoch == self.kv_admission_epoch => {
+            Some(PackedAdmission::Waiting(epoch, since))
+                if *epoch == self.kv_admission_epoch && since.elapsed() < KV_MEMORY_RETRY =>
+            {
                 return Ok(None);
             }
             Some(PackedAdmission::Pending)
                 if self.packed_admission.iter().any(|state| {
-                    matches!(state, PackedAdmission::Waiting(epoch) if *epoch != self.kv_admission_epoch)
+                    matches!(state, PackedAdmission::Waiting(epoch, since)
+                        if *epoch != self.kv_admission_epoch || since.elapsed() >= KV_MEMORY_RETRY)
                 }) =>
             {
                 // Retry older waiters before a new arrival takes released pages.
@@ -7159,17 +7210,17 @@ impl GpuEngine {
             if let Some(t) = host_t {
                 marks[1] = t.elapsed().as_nanos() as u64;
             }
-            if let Some(v) = self.vmm.as_ref().filter(|v| v.kv.prefix_reuse()) {
+            if let Some(v) = self.vmm.as_ref().filter(|v| v.prefix_kv().is_some()) {
                 // Wider decode rungs write idle rows too. Reserve those before
                 // one request can consume their remaining physical pages.
                 for slot in 0..self.batch {
-                    v.kv.ensure_rows(slot, 1)?;
+                    v.ensure_rows(slot, 1)?;
                 }
                 if let Some(t) = host_t {
                     marks[2] = t.elapsed().as_nanos() as u64;
                 }
                 let rows = self.admission_rows(total, prompt.len());
-                v.kv.ensure_rows(b, rows as u32)?;
+                v.ensure_rows(b, rows as u32)?;
             }
             Ok(frontier)
         })();
@@ -7193,14 +7244,19 @@ impl GpuEngine {
             Err(error) => {
                 self.retire_slot(b, false);
                 let oom = matches!(error, RuntimeError::Oom(_)) || error.device_code() == Some(2);
-                if self.vmm_prefix_enabled()
+                // Slot-granular KV waits even with no other request live: memory comes back
+                // from other models (retired slots, evictions), not only from this one.
+                let slot_kv = self.vmm.as_ref().is_some_and(|v| v.kv.is_none());
+                if (self.vmm_prefix_enabled() || slot_kv)
                     && oom
                     && !error.is_fatal()
-                    && self.packed_admission.contains(&PackedAdmission::Ready)
+                    && (slot_kv || self.packed_admission.contains(&PackedAdmission::Ready))
                 {
-                    self.vmm.as_ref().unwrap().kv.ensure_rows(b, 1)?;
-                    self.packed_admission[b] = PackedAdmission::Waiting(self.kv_admission_epoch);
-                    tracing::info!(slot = b, total, "gpu: packed KV admission waiting");
+                    self.vmm.as_ref().unwrap().ensure_rows(b, 1)?;
+                    self.kv_pressure_events += 1;
+                    self.packed_admission[b] =
+                        PackedAdmission::Waiting(self.kv_admission_epoch, std::time::Instant::now());
+                    tracing::debug!(slot = b, total, "gpu: packed KV admission waiting");
                     Ok(None)
                 } else {
                     Err(error)
@@ -7357,9 +7413,7 @@ impl GpuEngine {
             }
             for b in 0..launch_rows {
                 let need = self.pos[b] + 1;
-                if v.kv.mapped_rows(b) < need {
-                    v.kv.ensure_rows(b, need)?;
-                }
+                v.ensure_rows(b, need)?;
             }
         }
 
@@ -7555,7 +7609,7 @@ impl GpuEngine {
         // frontier reaches it (map-during-decode is safe — probe [5]).
         if let Some(v) = &self.vmm {
             for &(b, _) in feeds {
-                v.kv.advise(b, self.pos[b]);
+                v.advise(b, self.pos[b]);
             }
         }
 
@@ -7618,17 +7672,13 @@ impl GpuEngine {
                 rings.ensure_prefix(launch_rows)?;
             }
             let need = self.pos[slot] + tokens.len() as u32;
-            if v.kv.mapped_rows(slot) < need {
-                v.kv.ensure_rows(slot, need)?;
-            }
+            v.ensure_rows(slot, need)?;
             for b in 0..launch_rows {
                 if b == slot {
                     continue;
                 }
                 let n = self.pos[b] + 1;
-                if v.kv.mapped_rows(b) < n {
-                    v.kv.ensure_rows(b, n)?;
-                }
+                v.ensure_rows(b, n)?;
             }
         }
 
@@ -7646,7 +7696,7 @@ impl GpuEngine {
                     self.seq_tokens[slot].push(token);
                 }
                 if let Some(v) = &self.vmm {
-                    v.kv.advise(slot, self.pos[slot]);
+                    v.advise(slot, self.pos[slot]);
                 }
             }
         }
@@ -7813,7 +7863,7 @@ impl GpuEngine {
             self.seq_tokens[slot].push(token);
         }
         if let Some(v) = &self.vmm {
-            v.kv.advise(slot, self.pos[slot]);
+            v.advise(slot, self.pos[slot]);
         }
         Ok(())
     }
@@ -7895,9 +7945,7 @@ impl GpuEngine {
             for b in 0..launch_rows {
                 let active = feeds.iter().any(|&(slot, _)| slot == b);
                 let need = self.pos[b] + if active { k as u32 } else { 1 };
-                if v.kv.mapped_rows(b) < need {
-                    v.kv.ensure_rows(b, need)?;
-                }
+                v.ensure_rows(b, need)?;
             }
         }
 
@@ -8096,7 +8144,7 @@ impl GpuEngine {
                 self.seq_tokens[b].extend_from_slice(&out[ri * k..ri * k + (k - 1)]);
             }
             if let Some(v) = &self.vmm {
-                v.kv.advise(b, self.pos[b]);
+                v.advise(b, self.pos[b]);
             }
         }
         Ok(k)
@@ -8217,9 +8265,7 @@ impl GpuEngine {
             }
             for b in 0..launch_rows {
                 let need = self.pos[b] + 1;
-                if v.kv.mapped_rows(b) < need {
-                    v.kv.ensure_rows(b, need)?;
-                }
+                v.ensure_rows(b, need)?;
             }
         }
         let max_kvlen = feeds.iter().map(|&(b, _)| self.pos[b] + 1).max().unwrap_or(1);
@@ -8355,7 +8401,7 @@ impl GpuEngine {
         for &(b, _) in feeds {
             self.pos[b] += 1;
             if let Some(v) = &self.vmm {
-                v.kv.advise(b, self.pos[b]);
+                v.advise(b, self.pos[b]);
             }
         }
         Ok(())
@@ -10110,7 +10156,7 @@ impl GpuEngine {
         // VMM: the bucket writes all tc rows (pad rows write garbage past
         // `real`) — map the chunk's full row span before launching.
         if let Some(v) = &mut self.vmm {
-            if !v.kv.prefix_reuse() && c0 + tc > self.max_ctx {
+            if v.prefix_kv().is_none() && c0 + tc > self.max_ctx {
                 return Err(RuntimeError::Rejected(
                     "live KV prefill padding exceeds the reserved context".into(),
                 ));
@@ -10118,7 +10164,7 @@ impl GpuEngine {
             if let Some(rings) = &mut v.rings {
                 rings.ensure_slot(b)?;
             }
-            v.kv.ensure_rows(b, ((c0 + tc) as u32).min(self.max_ctx as u32))?;
+            v.ensure_rows(b, ((c0 + tc) as u32).min(self.max_ctx as u32))?;
         }
 
         if self.packed_prefill.is_some() && self.prefill[bi].batch_patched {
@@ -10517,7 +10563,31 @@ impl GpuEngine {
 
     /// `riders`: the graph also runs the token-batch rider attention after each attention
     /// segment, sized on the device by the launch's `Riders::arm` (its own cache key).
+    /// A graph is built on its slot's first use, when the prefix cache may already hold the
+    /// device at its pressure floor: out of memory, the cache gives some back and the build is
+    /// retried once instead of failing the request.
     fn ensure_seg_graph_with(
+        &mut self,
+        bi: usize,
+        arg: &DevProgram,
+        range: std::ops::Range<usize>,
+        riders: bool,
+    ) -> Result<()> {
+        const RELIEF: u64 = 512 << 20;
+        match self.build_seg_graph(bi, arg, range.clone(), riders) {
+            Err(e) if e.device_code() == Some(2) => {
+                let relieved = self.vmm.as_ref().and_then(|v| v.kv.as_ref()).is_some_and(|kv| kv.relieve(RELIEF));
+                tracing::warn!(error = %e, bucket = bi, relieved, "seg graph out of memory; relieving the prefix cache");
+                if !relieved {
+                    return Err(e);
+                }
+                self.build_seg_graph(bi, arg, range, riders)
+            }
+            r => r,
+        }
+    }
+
+    fn build_seg_graph(
         &mut self,
         bi: usize,
         arg: &DevProgram,
@@ -11403,7 +11473,7 @@ impl GpuEngine {
                 if let Some(rings) = &mut v.rings {
                     rings.ensure_slot(slot)?;
                 }
-                v.kv.ensure_rows(slot, end)?;
+                v.ensure_rows(slot, end)?;
             }
         }
         self.ensure_batch_patch(bi)?;

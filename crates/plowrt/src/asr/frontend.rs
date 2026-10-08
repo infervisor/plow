@@ -27,26 +27,50 @@ pub enum AudioError {
     TooLong,
 }
 
+/// Input sample rates accepted (WAV and the WebSocket stream); audio is resampled to 16 kHz.
+pub const MIN_INPUT_RATE: u32 = 8_000;
+pub const MAX_INPUT_RATE: u32 = 48_000;
+
 pub fn decode_wav(bytes: &[u8]) -> std::result::Result<Vec<f32>, AudioError> {
-    let samples = decode_wav_chunk(bytes)?;
+    let (samples, rate) = read_wav(bytes)?;
+    let samples = if rate == SAMPLE_RATE {
+        samples
+    } else {
+        let mut resampler = Resampler::new(rate).map_err(AudioError::Unsupported)?;
+        let mut out = resampler.push(&samples);
+        out.extend(resampler.finish());
+        out
+    };
     if samples.len() < SAMPLE_RATE as usize / 2 {
         return Err(AudioError::Invalid("audio must contain at least 0.5 seconds".into()));
     }
     Ok(samples)
 }
 
-/// [`decode_wav`] for a piece of a longer recording: any length up to 30 seconds.
+/// [`decode_wav`] for a piece of a longer recording: any length up to 30 seconds, 16 kHz only
+/// (resampling each piece on its own would put seams at the piece boundaries).
 pub fn decode_wav_chunk(bytes: &[u8]) -> std::result::Result<Vec<f32>, AudioError> {
+    let (samples, rate) = read_wav(bytes)?;
+    if rate != SAMPLE_RATE {
+        return Err(AudioError::Unsupported(
+            "appended recording pieces must be 16 kHz WAV; the WebSocket stream resamples".into(),
+        ));
+    }
+    Ok(samples)
+}
+
+/// Mono samples (stereo averaged) and their rate, at most 30 seconds.
+fn read_wav(bytes: &[u8]) -> std::result::Result<(Vec<f32>, u32), AudioError> {
     let invalid = |message| AudioError::Invalid(message);
     let mut reader = hound::WavReader::new(Cursor::new(bytes))
         .map_err(|e| invalid(format!("invalid WAV: {e}")))?;
     let spec = reader.spec();
-    if spec.sample_rate != SAMPLE_RATE || !(1..=2).contains(&spec.channels) {
+    if !(MIN_INPUT_RATE..=MAX_INPUT_RATE).contains(&spec.sample_rate) || !(1..=2).contains(&spec.channels) {
         return Err(AudioError::Unsupported(
-            "ASR requires 16 kHz mono/stereo WAV".into(),
+            "ASR requires 8-48 kHz mono/stereo WAV".into(),
         ));
     }
-    if reader.duration() as usize > MAX_SAMPLES {
+    if reader.duration() as u64 * u64::from(SAMPLE_RATE) > MAX_SAMPLES as u64 * u64::from(spec.sample_rate) {
         return Err(AudioError::TooLong);
     }
     let samples: Vec<f32> = match spec.sample_format {
@@ -72,12 +96,128 @@ pub fn decode_wav_chunk(bytes: &[u8]) -> std::result::Result<Vec<f32>, AudioErro
         return Err(invalid("invalid PCM samples".into()));
     }
     if spec.channels == 1 {
-        return Ok(samples);
+        return Ok((samples, spec.sample_rate));
     }
-    Ok(samples
+    Ok((samples
         .chunks_exact(2)
         .map(|s| s[0] * 0.5 + s[1] * 0.5)
-        .collect())
+        .collect(), spec.sample_rate))
+}
+
+/// Windowed-sinc resampling to 16 kHz, fed in pieces. Polyphase over the exact rational ratio
+/// `L/M`: output `n` sits at input position `n M / L` and sums the `2K` inputs around it, so an
+/// output depends only on its inputs and is the same whatever the piece boundaries. Inputs before
+/// the start and after [`finish`](Self::finish) are zeros. 16 kHz input passes through untouched.
+pub struct Resampler {
+    up: u64,
+    down: u64,
+    half: usize,
+    /// `[phase][tap]`, taps for input offsets `-half+1 ..= half`.
+    taps: Vec<f32>,
+    /// Inputs from absolute index `base` on.
+    input: Vec<f32>,
+    base: u64,
+    received: u64,
+    produced: u64,
+}
+
+impl Resampler {
+    /// Zero crossings each side at the narrower of the two Nyquist bands.
+    const ZEROS: f64 = 16.0;
+    /// Cutoff as a share of that Nyquist band (the transition band below it).
+    const ROLLOFF: f64 = 0.94;
+
+    pub fn new(rate: u32) -> std::result::Result<Self, String> {
+        if !(MIN_INPUT_RATE..=MAX_INPUT_RATE).contains(&rate) {
+            return Err(format!("sample rate {rate} is outside {MIN_INPUT_RATE}..={MAX_INPUT_RATE} Hz"));
+        }
+        let gcd = |mut a: u64, mut b: u64| {
+            while b != 0 {
+                (a, b) = (b, a % b);
+            }
+            a
+        };
+        let g = gcd(u64::from(rate), u64::from(SAMPLE_RATE));
+        let (up, down) = (u64::from(SAMPLE_RATE) / g, u64::from(rate) / g);
+        if up == down {
+            return Ok(Self { up, down, half: 0, taps: Vec::new(), input: Vec::new(), base: 0, received: 0, produced: 0 });
+        }
+        // Cutoff in cycles per input sample (Nyquist = 0.5), below both rates' Nyquist.
+        let cutoff = 0.5 * (up as f64 / down as f64).min(1.0) * Self::ROLLOFF;
+        let half = (Self::ZEROS / (2.0 * cutoff)).ceil() as usize;
+        let mut taps = Vec::with_capacity(up as usize * 2 * half);
+        for phase in 0..up {
+            let frac = phase as f64 / up as f64;
+            let row: Vec<f64> = (0..2 * half)
+                .map(|i| {
+                    let t = (i as f64 - half as f64 + 1.0) - frac;
+                    let x = 2.0 * cutoff * t;
+                    let sinc = if x == 0.0 { 1.0 } else { (std::f64::consts::PI * x).sin() / (std::f64::consts::PI * x) };
+                    let u = t / half as f64;
+                    let window = if u.abs() >= 1.0 {
+                        0.0
+                    } else {
+                        0.42 + 0.5 * (std::f64::consts::PI * u).cos() + 0.08 * (2.0 * std::f64::consts::PI * u).cos()
+                    };
+                    sinc * window
+                })
+                .collect();
+            // Unit DC gain on every phase.
+            let sum: f64 = row.iter().sum();
+            taps.extend(row.iter().map(|v| (v / sum) as f32));
+        }
+        Ok(Self { up, down, half, taps, input: Vec::new(), base: 0, received: 0, produced: 0 })
+    }
+
+    /// Outputs `samples` completes: every one whose right context has arrived.
+    pub fn push(&mut self, samples: &[f32]) -> Vec<f32> {
+        if self.half == 0 {
+            return samples.to_vec();
+        }
+        self.input.extend_from_slice(samples);
+        self.received += samples.len() as u64;
+        self.drain(false)
+    }
+
+    /// The remaining outputs, the input end padded with zeros.
+    pub fn finish(&mut self) -> Vec<f32> {
+        if self.half == 0 {
+            return Vec::new();
+        }
+        self.drain(true)
+    }
+
+    fn drain(&mut self, flush: bool) -> Vec<f32> {
+        // Outputs n with n M / L < received; without flush, also all `half` right taps present.
+        let total = (self.received * self.up).div_ceil(self.down);
+        let mut out = Vec::new();
+        while self.produced < total {
+            let pos = self.produced * self.down;
+            let (center, phase) = (pos / self.up, (pos % self.up) as usize);
+            if !flush && center + self.half as u64 >= self.received {
+                break;
+            }
+            let taps = &self.taps[phase * 2 * self.half..(phase + 1) * 2 * self.half];
+            let first = center as i64 - self.half as i64 + 1;
+            let mut acc = 0f32;
+            for (i, &w) in taps.iter().enumerate() {
+                let index = first + i as i64;
+                if index >= self.base as i64 && (index as u64) < self.received {
+                    acc += w * self.input[(index as u64 - self.base) as usize];
+                }
+            }
+            out.push(acc);
+            self.produced += 1;
+        }
+        // Keep the inputs the next output can still reach.
+        let next = (self.produced * self.down / self.up).saturating_sub(self.half as u64);
+        if next > self.base {
+            let drop = ((next - self.base) as usize).min(self.input.len());
+            self.input.drain(..drop);
+            self.base += drop as u64;
+        }
+        out
+    }
 }
 
 pub struct MelFeatures {
@@ -237,6 +377,32 @@ impl PacketLogMelFrontend {
             )));
         }
         self.inner.extract(samples, true)
+    }
+
+    /// Mel frames `from_frame..` of a growing recording and how many leading frames (counted from
+    /// 0) are final: their analysis window has arrived, so later audio cannot change them (no
+    /// per-utterance normalization). Frames are computed from a slice starting `MARGIN` frames
+    /// earlier, whose edge (padding, pre-emphasis) only the dropped frames see.
+    pub fn extract_partial(&self, samples: &[f32], from_frame: usize) -> Result<(LogMelFeatures, usize)> {
+        const MARGIN: usize = 2;
+        let config = self.inner.config;
+        let window_offset = if config.center_window { (config.fft - config.window) / 2 } else { 0 };
+        let reach = window_offset + config.window;
+        let pad = config.fft / 2;
+        if samples.len() > self.max_samples
+            || config.normalize_per_feature
+            || pad > MARGIN * config.hop + window_offset
+        {
+            return Err(invalid("audio cannot be streamed through this frontend"));
+        }
+        let complete = (samples.len() + pad).checked_sub(reach).map_or(0, |span| span / config.hop + 1);
+        let skip = from_frame.saturating_sub(MARGIN);
+        let tail = samples.get(skip * config.hop..).filter(|t| !t.is_empty()).ok_or_else(|| invalid("no audio past the requested frame"))?;
+        let mut features = self.inner.extract(tail, true)?;
+        let drop = from_frame - skip;
+        features.values.drain(..(drop * features.bins).min(features.values.len()));
+        features.frames = features.frames.saturating_sub(drop);
+        Ok((features, complete))
     }
 }
 
@@ -547,6 +713,56 @@ impl QwenFrontend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn resample(rate: u32, input: &[f32]) -> Vec<f32> {
+        let mut r = Resampler::new(rate).unwrap();
+        let mut out = r.push(input);
+        out.extend(r.finish());
+        out
+    }
+
+    #[test]
+    fn resampler_keeps_dc_tone_and_length() {
+        for rate in [8_000, 22_050, 24_000, 32_000, 44_100, 48_000] {
+            let out = resample(rate, &vec![0.5; rate as usize]);
+            assert_eq!(out.len(), 16_000, "{rate}");
+            assert!(out[2_000..14_000].iter().all(|v| (v - 0.5).abs() < 1e-4), "{rate}: DC");
+            let tone: Vec<f32> = (0..rate)
+                .map(|i| (2.0 * std::f64::consts::PI * 1_000.0 * i as f64 / rate as f64).sin() as f32)
+                .collect();
+            let out = resample(rate, &tone);
+            let rms = (out[2_000..14_000].iter().map(|v| v * v).sum::<f32>() / 12_000.0).sqrt();
+            assert!((rms - std::f32::consts::FRAC_1_SQRT_2).abs() < 5e-3, "{rate}: 1 kHz rms {rms}");
+            let expected: Vec<f32> = (0..16_000)
+                .map(|n| (2.0 * std::f64::consts::PI * 1_000.0 * n as f64 / 16_000.0).sin() as f32)
+                .collect();
+            let err = out[2_000..14_000].iter().zip(&expected[2_000..14_000]).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+            assert!(err < 5e-3, "{rate}: phase-aligned error {err}");
+        }
+    }
+
+    #[test]
+    fn resampler_pieces_match_one_buffer() {
+        let input: Vec<f32> = (0..30_011u32).map(|i| ((i * 7919) % 2001) as f32 / 1000.0 - 1.0).collect();
+        for rate in [8_000, 22_050, 44_100, 48_000] {
+            let whole = resample(rate, &input);
+            let mut r = Resampler::new(rate).unwrap();
+            let mut pieces = Vec::new();
+            let mut at = 0;
+            for size in [1usize, 317, 4_000, 29, 16_000].iter().cycle() {
+                if at >= input.len() {
+                    break;
+                }
+                let end = (at + size).min(input.len());
+                pieces.extend(r.push(&input[at..end]));
+                at = end;
+            }
+            pieces.extend(r.finish());
+            assert_eq!(pieces, whole, "{rate}");
+        }
+        assert_eq!(resample(16_000, &input), input);
+        assert!(Resampler::new(7_999).is_err() && Resampler::new(48_001).is_err());
+    }
 
     #[test]
     fn sparse_filters_match_dense_projection() {

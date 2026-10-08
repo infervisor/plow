@@ -55,6 +55,10 @@ pub struct Metrics {
     pub cache_first_admissions: AtomicU64,
     /// A fatal device fault poisoned this model's engine; `/health` answers 503.
     pub engine_dead: std::sync::atomic::AtomicBool,
+    /// Occupied engine slots at the dispatcher's last loop top.
+    pub slots_active: AtomicU64,
+    /// Admissions the KV budget held back (memory, not slots).
+    pub kv_budget_denials: AtomicU64,
 }
 
 impl Metrics {

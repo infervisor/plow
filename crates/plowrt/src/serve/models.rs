@@ -21,13 +21,35 @@ use crate::serve::AppState;
 /// and how a router discovers the relationship.
 fn card(state: &AppState, id: String, canonical: &str) -> ModelCard {
     let is_alias = id != canonical;
+    let mut x_plow_endpoints = vec!["chat/completions", "completions"];
+    #[cfg(feature = "cuda")]
+    if crate::asr::serving::serves_audio(state, canonical) {
+        x_plow_endpoints.extend(["audio/transcriptions", "audio/transcriptions/stream"]);
+    }
     ModelCard {
-        x_plow_endpoints: vec!["chat/completions", "completions"],
+        x_plow_endpoints,
         max_model_len: state.max_ctx(canonical),
         root: canonical.to_string(),
         parent: is_alias.then(|| canonical.to_string()),
         permission: Vec::new(),
         x_plow_sampling: (!state.sampling_honoured(canonical)).then_some("device_argmax"),
+        id,
+        object: "model",
+        created: state.started(),
+        owned_by: "plow",
+    }
+}
+
+/// A packet ASR model hosted beside the registry (`--asr-packet`): transcription only.
+#[cfg(feature = "cuda")]
+fn audio_card(state: &AppState, id: String) -> ModelCard {
+    ModelCard {
+        x_plow_endpoints: vec!["audio/transcriptions", "audio/transcriptions/stream"],
+        max_model_len: None,
+        root: id.clone(),
+        parent: None,
+        permission: Vec::new(),
+        x_plow_sampling: None,
         id,
         object: "model",
         created: state.started(),
@@ -55,6 +77,8 @@ pub async fn list_models(State(state): State<Arc<AppState>>) -> Json<ModelList> 
             .into_iter()
             .map(|(alias, canonical)| card(&state, alias, &canonical)),
     );
+    #[cfg(feature = "cuda")]
+    data.extend(crate::asr::serving::packet_model_names().into_iter().map(|name| audio_card(&state, name)));
     Json(ModelList {
         object: "list",
         data,
@@ -65,6 +89,10 @@ pub async fn list_models(State(state): State<Arc<AppState>>) -> Json<ModelList> 
 /// `max_model_len` before sizing a request; without this route they got a 404
 /// from a server that was serving the model perfectly well.
 pub async fn get_model(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
+    #[cfg(feature = "cuda")]
+    if crate::asr::serving::packet_model_names().contains(&id) {
+        return Json(audio_card(&state, id)).into_response();
+    }
     let canonical = state.registry.resolve(&id).unwrap_or_else(|| id.clone());
     if !state.registry.contains(&canonical) {
         return crate::serve::api_error(

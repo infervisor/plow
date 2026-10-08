@@ -42,6 +42,8 @@ pub enum MemKind {
     Hbm2e,
     Hbm3,
     Hbm3e,
+    /// GDDR6 (Ada datacenter: L4, L40S).
+    Gddr6,
     /// GDDR6X (Ada consumer: RTX 4090).
     Gddr6x,
     /// GDDR7 (Blackwell consumer: RTX 5090, RTX 6000 Pro).
