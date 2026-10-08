@@ -56,6 +56,20 @@ class GatePacketTests(unittest.TestCase):
             with self.assertRaises(SystemExit):
                 campaign.cmd_gate(a)
 
+    def test_suffixed_table_is_a_second_gate_of_its_kind(self):
+        self.assertEqual(campaign.gate_kind("llm_fp32_ref_long"), "llm_fp32_ref")
+        self.assertEqual(campaign.gate_kind("llm_fp32_ref"), "llm_fp32_ref")
+        self.assertIsNone(campaign.gate_kind("llm_fp32"))
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            a = self.fixture(root)
+            Path(a.recipe).write_text('[gates.asr_wer]\nmanifest = "m"\n[gates.asr_wer_long]\nmanifest = "l"\n')
+            a.dry_run = True
+            campaign.cmd_gate(a)
+            run = (Path(a.out) / "run.sh").read_text()
+            self.assertIn(str(Path(a.out) / "asr_wer_long"), run)
+            self.assertIn("--manifest l", run)
+
     def test_lenient_expand_keeps_unset_env(self):
         out = Path("/x")
         self.assertEqual(campaign.expand("{env:GATE_TEST_UNSET}/{out}", out, lenient=True), "{env:GATE_TEST_UNSET}//x")

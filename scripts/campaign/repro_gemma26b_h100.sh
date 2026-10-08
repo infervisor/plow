@@ -96,15 +96,25 @@ serve_capture() {
   )
 }
 
+# gate <arm>: the canonical recipe's [gates] (llm_fp32_ref, plus llm_fp32_ref_long when REF_LONG_<P> is
+# set) on the packet: campaign.py gate --dry-run writes run.sh, this lease runs it, --score-only scores.
 gate() {
-  local arm=$1 g=$OUT/gate/$1 r rv; r=$(ref_of "$arm"); rv=$(refv_of "$arm")
+  local arm=$1 g=$OUT/gate/$1 P r rv rl rvl recipe=$BF16_RECIPE only=llm_fp32_ref
+  [ "$arm" = fp8 ] && recipe=$FP8_RECIPE
+  P=$(prec_of "$arm" | tr a-z A-Z); r=$(ref_of "$arm"); rv=$(refv_of "$arm")
+  local vl="REF_LONG_$P" vvl="REF_VLLM_LONG_$P"; rl=${!vl:-} rvl=${!vvl:-}
   [ -s "$r" ] && [ -s "$rv" ] || die "no FP32 reference for $arm: run \`ref $(prec_of "$arm")\`"
-  rm -rf "$g"; mkdir -p "$g/llm_fp32_ref"
-  sha256sum "$OUT/pk/$arm/assets/model.pkt" | cut -d' ' -f1 > "$g/packet.sha256"
-  serve_capture "$arm" "$g/llm_fp32_ref" "$g/llm_fp32_ref/plow.json" || die "gate $arm capture failed"
-  printf '%s\n' 'schema = "plow.recipe.v1"' 'name = "repro-gate"' '[gates]' "python = \"$PYREF\"" \
-    '[gates.llm_fp32_ref]' "reference = \"$r\"" "vllm_capture = \"$rv\"" > "$g/gate.toml"
-  python3 "$REPO/scripts/campaign/campaign.py" gate "$g/gate.toml" --assets "$OUT/pk/$arm/assets" --out "$g" --score-only
+  if [ -n "$rl" ]; then
+    [ -s "$rl" ] && [ -s "$rvl" ] || die "REF_LONG_$P set but $rl / $rvl missing"
+    only=llm_fp32_ref,llm_fp32_ref_long
+  fi
+  export "G26_${P}_FP32_REF=$r" "G26_${P}_FP32_VLLM=$rv" "G26_${P}_FP32_REF_LONG=$rl" "G26_${P}_FP32_VLLM_LONG=$rvl"
+  rm -rf "$g"
+  local c=(python3 "$REPO/scripts/campaign/campaign.py" gate "$recipe" --assets "$OUT/pk/$arm/assets" --out "$g"
+           --plowrt "$OUT/bin/plowrt" --only "${GATE_ONLY:-$only}")
+  "${c[@]}" --dry-run > /dev/null || die "gate $arm: campaign.py gate --dry-run failed"
+  env $RT_ENV bash "$g/run.sh" > "$g/run.log" 2>&1
+  "${c[@]}" --score-only
 }
 
 bench() {
