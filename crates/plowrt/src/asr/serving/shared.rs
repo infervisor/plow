@@ -102,7 +102,9 @@ fn encode_loop(rx: std::sync::mpsc::Receiver<Encode>, mut encoder: PacketAudioEn
 
 pub(super) struct SharedAsr {
     prompt: Arc<AudioLmPrompt>,
-    encode: std::sync::mpsc::Sender<Encode>,
+    /// Taken at [`release`]: the encoder thread then exits, freeing its packet, even while an idle
+    /// session still holds this front.
+    encode: Mutex<Option<std::sync::mpsc::Sender<Encode>>>,
     max_context: usize,
     /// Requests between submit and their answer: the front's bound. Past it a request is refused
     /// at once; under it a request waits in the mux queue (a full ingress makes submit wait).
@@ -151,7 +153,7 @@ impl SharedAsr {
             .map_err(|e| RuntimeError::Msg(format!("spawn ASR encoder thread: {e}")))?;
         Ok(Self {
             prompt: Arc::new(prompt),
-            encode,
+            encode: Mutex::new(Some(encode)),
             max_context,
             inflight: Arc::new(Semaphore::new(batch.saturating_mul(4).max(UPLOADS))),
             window_frames,
@@ -174,6 +176,8 @@ impl SharedAsr {
         let this = Arc::clone(self);
         tokio::spawn(async move {
             let result = match opts.windows.clone().filter(|_| !opts.final_pass) {
+                // Work held across a preempt (an idle session's next turn) is told so up front.
+                _ if mux.preempted() => Err(RuntimeError::Unavailable(crate::serve::mux::PREEMPTED.into())),
                 Some(windows) => this.run_partial(mux, samples, windows, language, context, &cancel, opts, &mut tx).await,
                 None => this.run(mux, samples, language, context, &cancel, opts, &mut tx).await,
             };
@@ -185,7 +189,8 @@ impl SharedAsr {
 
     async fn encode_rows(&self, features: MelFeatures, urgent: bool) -> Result<Vec<f32>> {
         let (tx, rx) = oneshot::channel();
-        self.encode
+        let encode = self.encode.lock().clone().ok_or_else(|| RuntimeError::Unavailable("ASR front released; retry".into()))?;
+        encode
             .send(Encode { features, urgent, respond: tx })
             .map_err(|_| RuntimeError::Unavailable("ASR encoder thread is gone".into()))?;
         rx.await.map_err(|_| RuntimeError::Unavailable("ASR encoder thread is gone".into()))?
@@ -350,8 +355,14 @@ impl SharedAsr {
         };
         // Released once the job is on the channel: the dispatcher drains it, not closes on it.
         let ingress = opts.ingress.take();
+        // A preempt does not wait for this request's ingress: tell it so instead of submitting.
+        let preempted = || RuntimeError::Unavailable(crate::serve::mux::PREEMPTED.into());
+        if mux.preempted() {
+            return Err(preempted());
+        }
         mux.submit_wait(job).await.map_err(|e| match e {
             crate::serve::mux::SubmitError::Full(_) => RuntimeError::Overloaded("ASR queue full".into()),
+            crate::serve::mux::SubmitError::Closed(_) if mux.preempted() => preempted(),
             crate::serve::mux::SubmitError::Closed(_) => RuntimeError::Unavailable("model dispatcher unavailable".into()),
         })?;
         drop(ingress);
@@ -382,7 +393,10 @@ impl SharedAsr {
                 Some(StreamChunk::Done { reason: FinishReason::Length, .. }) => {
                     return Err(RuntimeError::Rejected("ASR exceeded output token limit".into()))
                 }
+                // A preempted slot's tokens so far are not the transcript.
+                Some(StreamChunk::Done { reason: FinishReason::Preempted, .. }) => return Err(preempted()),
                 Some(StreamChunk::Done { usage, .. }) => break usage.cached_tokens,
+                Some(StreamChunk::Err(_)) if mux.preempted() => return Err(preempted()),
                 Some(StreamChunk::Err(e)) => return Err(e),
                 None => return Err(RuntimeError::Msg("ASR stream ended without a result".into())),
             }
@@ -494,10 +508,12 @@ pub fn bind(state: &AppState, slug: &str) -> Result<()> {
     shared_asr(state, slug, &bundle.dir).map(drop)
 }
 
-/// Forget `dir`'s front-end: its encoder thread exits, freeing the encoder runtime, once the last
-/// request holding it ends.
+/// Forget `dir`'s front-end: its encoder thread exits, freeing the encoder runtime, once the
+/// encodes already queued finish — a session still holding the front does not keep it.
 pub fn release(dir: &Path) {
-    models().lock().remove(dir);
+    if let Some(Some(asr)) = models().lock().remove(dir) {
+        asr.encode.lock().take();
+    }
 }
 
 /// Bind every resident audio LM's front-end now, so the first request does not pay the encoder

@@ -1212,7 +1212,7 @@ pub(super) async fn close(socket: &mut WebSocket, code: u16, reason: &str) {
     .await;
 }
 
-async fn stream(state: Arc<AsrServer>, mut socket: WebSocket, _permit: OwnedSemaphorePermit, ids: RequestIds) {
+async fn stream(state: Arc<AsrServer>, mut socket: WebSocket, permit: OwnedSemaphorePermit, ids: RequestIds) {
     let cancel = Cancellation(Arc::new(AtomicBool::new(false)));
     let mut shutdown = state.shutdown.subscribe();
     let Some(Ok(Message::Text(text))) =
@@ -1429,20 +1429,20 @@ async fn stream(state: Arc<AsrServer>, mut socket: WebSocket, _permit: OwnedSema
                         shown.push_str(&delta);
                         if !send(&mut socket, json!({"type":"delta","text":delta})).await {
                             cancel.0.store(true,Ordering::Relaxed);
-                            let _=work.await;
+                            retire(work, permit);
                             return;
                         }
                     }
                     _ = sleep_until(deadline) => {
                         cancel.0.store(true,Ordering::Relaxed);
-                        let _=work.await;
+                        retire(work, permit);
                         send(&mut socket,json!({"type":"error","message":DEADLINE,"code":"timeout","terminal":true})).await;
                         return;
                     }
                     _ = ping.tick() => {
                         if last_pong.elapsed() >= PONG_TIMEOUT || socket.send(Message::Ping(Vec::new())).await.is_err() {
                             cancel.0.store(true,Ordering::Relaxed);
-                            let _=work.await;
+                            retire(work, permit);
                             return;
                         }
                     }
@@ -1453,7 +1453,7 @@ async fn stream(state: Arc<AsrServer>, mut socket: WebSocket, _permit: OwnedSema
                             let cancelled=matches!(&other,Some(Ok(Message::Text(text))) if serde_json::from_str::<serde_json::Value>(text)
                                 .ok().is_some_and(|v|v["type"]=="cancel"));
                             cancel.0.store(true,Ordering::Relaxed);
-                            let _=work.await;
+                            retire(work, permit);
                             if !cancelled {send(&mut socket,json!({"type":"error","message":"input sent after finish or invalid event","terminal":true})).await;}
                             return;
                         }
@@ -1518,6 +1518,15 @@ async fn stream(state: Arc<AsrServer>, mut socket: WebSocket, _permit: OwnedSema
     }
 }
 
+/// Cancelled work the stream no longer waits on (a stalled engine must not hold its reply): the
+/// session permit stays with it until the engine lets go.
+fn retire<T: Send + 'static>(work: oneshot::Receiver<T>, permit: OwnedSemaphorePermit) {
+    tokio::spawn(async move {
+        let _ = work.await;
+        drop(permit);
+    });
+}
+
 /// Segments a continuous session may have awaiting results; past it credit is withheld.
 const MAX_SEGMENTS_IN_FLIGHT: usize = 2;
 
@@ -1531,7 +1540,8 @@ struct Flight {
     shown: String,
     deadline: Option<tokio::time::Instant>,
     run: crate::serve::turns::StageRun,
-    cancel: Cancellation,
+    /// Dropping the flight cancels its work.
+    _cancel: Cancellation,
 }
 
 enum FrontEvent {
@@ -1622,7 +1632,7 @@ async fn continuous(
             shown: String::new(),
             deadline: state.request_timeout.map(|t| tokio::time::Instant::now() + t),
             run,
-            cancel,
+            _cancel: cancel,
         })
     };
     let mut credit = rate;
@@ -1694,9 +1704,9 @@ async fn continuous(
                         }
                     }
                     FrontEvent::Timeout => {
-                        let mut f = flights.pop_front().expect("guarded");
-                        f.cancel.0.store(true, Ordering::Relaxed);
-                        let _ = (&mut f.work).await;
+                        // Dropping the flight cancels its work without waiting for a stalled engine;
+                        // the work releases its slot and ingress when it ends.
+                        let f = flights.pop_front().expect("guarded");
                         emitted += 1;
                         if !send(&mut socket, json!({"type":"error","segment":f.segment,"message":DEADLINE,
                             "code":"timeout","terminal":false})).await {
@@ -2704,6 +2714,63 @@ mod tests {
         let response = server.clone().router(false).oneshot(request("test", "json")).await.unwrap();
         assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
         tokio::time::timeout(Duration::from_secs(5), cancelled.notified()).await.unwrap();
+    }
+
+    /// A stream's deadline answers while the engine is still stalled; the session's permit stays
+    /// with the work until the engine lets go of it.
+    #[tokio::test]
+    async fn stream_deadline_answers_without_waiting_for_a_stalled_engine() {
+        use tokio_tungstenite::{connect_async, tungstenite::Message as ClientMessage};
+        type Gate = Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>;
+        struct Stalled(Gate);
+        impl Transcriber for Stalled {
+            fn language(&self, _: Option<&str>) -> crate::Result<Option<String>> {
+                Ok(None)
+            }
+            fn transcribe(&mut self, _: &[f32], _: Option<&str>, _: &str, _: &AtomicBool) -> crate::Result<Transcript> {
+                let mut open = self.0 .0.lock().unwrap();
+                while !*open {
+                    open = self.0 .1.wait(open).unwrap();
+                }
+                Ok(Transcript { text: "late".into(), language: None })
+            }
+        }
+        let gate: Gate = Default::default();
+        let server = AsrServer::new("test".into(), Stalled(gate.clone())).with_request_timeout(Some(Duration::from_millis(100)));
+        let capacity = server.sessions.available_permits();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = server.clone().router(true);
+        let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let (mut socket, _) = connect_async(format!("ws://{address}/v1/audio/transcriptions/stream")).await.unwrap();
+        socket.send(ClientMessage::Text(json!({"type":"start","version":1,"model":"test","sample_rate":16000,"format":"pcm_s16le"}).to_string())).await.unwrap();
+        socket.next().await.unwrap().unwrap();
+        socket.send(ClientMessage::Binary(vec![0; 32008])).await.unwrap();
+        socket.send(ClientMessage::Text(r#"{"type":"finish"}"#.into())).await.unwrap();
+        let error = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let ClientMessage::Text(text) = socket.next().await.unwrap().unwrap() {
+                    let event: serde_json::Value = serde_json::from_str(&text).unwrap();
+                    if event["type"] == "error" {
+                        return event;
+                    }
+                }
+            }
+        })
+        .await
+        .expect("the deadline waited for the stalled engine");
+        assert_eq!((error["code"].as_str(), error["terminal"].as_bool()), (Some("timeout"), Some(true)));
+        assert_eq!(server.sessions.available_permits() + 1, capacity, "the stalled work let go of its permit");
+        *gate.0.lock().unwrap() = true;
+        gate.1.notify_all();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while server.sessions.available_permits() != capacity {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the retired work never released its permit");
+        task.abort();
     }
 
     #[tokio::test]

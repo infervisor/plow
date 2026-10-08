@@ -225,19 +225,34 @@ async fn going_away(socket: &mut WebSocket, out: &mut Events, code: &str, messag
 async fn session(state: Arc<AsrServer>, mut socket: WebSocket, ids: RequestIds, model: Option<String>) {
     let session_id = format!("sess_{}", ids.session.as_deref().unwrap_or_default());
     let mut out = Events(0);
+    let mut route: Option<(String, Route, FinalizationPolicy)> = None;
+    let mut _metrics: Option<AsrSessionMetrics> = None;
+    // `?model=` routes now, as a session update's model does: an unknown one fails the connect.
+    if let Some(model) = &model {
+        match state.route(model).await {
+            Ok((r, finalization)) => {
+                _metrics = Some(AsrSessionMetrics::new(state.metrics(model)));
+                route = Some((model.clone(), r, finalization));
+            }
+            Err(_) => {
+                let message = format!("unknown ASR model {model:?}");
+                send(&mut socket, out.error("model_not_found", &message, Some("model"), None)).await;
+                super::close(&mut socket, 1008, "model_not_found").await;
+                return;
+            }
+        }
+    }
     let mut config = Config { model, language: None, prompt: String::new(), format: Format::Pcm16, vad: Some(DEFAULT_VAD) };
     if !send(&mut socket, out.event("transcription_session.created", json!({"session": config.session(&session_id)}))).await {
         return;
     }
-    let mut route: Option<(String, Route, FinalizationPolicy)> = None;
-    let mut _metrics: Option<AsrSessionMetrics> = None;
     let mut shutdown = state.shutdown.subscribe();
     let mut resampler = Resampler::new(config.format.rate()).expect("a listed format rate");
     let new_endpointer = |vad: Option<Vad>, finalization: Option<&FinalizationPolicy>| {
         let cap_ms = (MAX_SAMPLES.saturating_sub(finalization.map_or(0, |f| f.final_padding_samples)) / 16) as u32;
         vad.map(|v| Endpointer::new(EndpointConfig { min_silence_ms: v.silence_duration_ms, max_segment_ms: cap_ms.min(25_000) }))
     };
-    let mut endpointer = new_endpointer(config.vad, None);
+    let mut endpointer = new_endpointer(config.vad, route.as_ref().map(|r| &r.2));
     // 16 kHz samples fed since the session (or the last clear) and before the current endpointer.
     let (mut epoch, mut fed) = (0u64, 0u64);
     let mut manual: Vec<f32> = Vec::new();
@@ -248,26 +263,25 @@ async fn session(state: Arc<AsrServer>, mut socket: WebSocket, ids: RequestIds, 
     };
     let mut speaking: Option<(u64, String)> = None;
     let mut previous: Option<String> = None;
-    let mut waiting: VecDeque<(String, Segment)> = VecDeque::new();
+    let mut waiting: VecDeque<(String, Segment, Turn)> = VecDeque::new();
     let mut flights: VecDeque<Flight> = VecDeque::new();
     let mut flight_items: VecDeque<String> = VecDeque::new();
     let mut ping = tokio::time::interval_at(tokio::time::Instant::now() + PING_INTERVAL, PING_INTERVAL);
     let mut last_pong = tokio::time::Instant::now();
     let mut idle_at = tokio::time::Instant::now() + REALTIME_IDLE;
     loop {
-        // Launch waiting turns on the route current at their commit.
+        // Launch waiting turns with the settings current at their commit.
         while flights.len() < MAX_SEGMENTS_IN_FLIGHT {
-            let Some((_, segment)) = waiting.front() else { break };
-            let Some((model, r, finalization)) = route.as_ref() else { break };
-            match launch(&state, &ids, &config, model, r, finalization, segment) {
+            let Some((_, segment, turn)) = waiting.front() else { break };
+            match launch(&state, &ids, turn, segment) {
                 Ok(flight) => {
-                    let (item, _) = waiting.pop_front().expect("guarded");
+                    let (item, _, _) = waiting.pop_front().expect("guarded");
                     flights.push_back(flight);
                     flight_items.push_back(item);
                 }
                 Err(SubmitError::Full) if !flights.is_empty() => break,
                 Err(SubmitError::Full) => {
-                    let (item, _) = waiting.pop_front().expect("guarded");
+                    let (item, _, _) = waiting.pop_front().expect("guarded");
                     let failed = out.event("conversation.item.input_audio_transcription.failed", json!({"item_id": item,
                         "content_index": 0, "error": {"type": "server_error", "code": "rate_limit_exceeded",
                         "message": "ASR queue full", "param": null}}));
@@ -306,10 +320,9 @@ async fn session(state: Arc<AsrServer>, mut socket: WebSocket, ids: RequestIds, 
                             json!({"item_id": item, "content_index": 0, "delta": delta}))).await
                     }
                     FrontEvent::Timeout => {
-                        let mut f = flights.pop_front().expect("guarded");
+                        // Dropping the flight cancels its work without waiting for a stalled engine.
+                        drop(flights.pop_front());
                         flight_items.pop_front();
-                        f.cancel.0.store(true, Ordering::Relaxed);
-                        let _ = (&mut f.work).await;
                         send(&mut socket, out.event("conversation.item.input_audio_transcription.failed", json!({
                             "item_id": item, "content_index": 0, "error": {"type": "server_error", "code": "timeout",
                             "message": DEADLINE, "param": null}}))).await
@@ -398,12 +411,10 @@ async fn session(state: Arc<AsrServer>, mut socket: WebSocket, ids: RequestIds, 
             kind @ ("transcription_session.update" | "session.update") => match config.update(&event["session"]) {
                 Ok(next) => {
                     // Route the (new) model now, so a bad name fails the update, not a later turn.
+                    let mut rerouted = None;
                     if let Some(model) = next.model.clone().filter(|m| route.as_ref().is_none_or(|r| &r.0 != m)) {
                         match state.route(&model).await {
-                            Ok((r, finalization)) => {
-                                _metrics = Some(AsrSessionMetrics::new(state.metrics(&model)));
-                                route = Some((model, r, finalization));
-                            }
+                            Ok((r, finalization)) => rerouted = Some((model, r, finalization)),
                             Err(_) => {
                                 if !send(&mut socket, out.error("model_not_found", format!("unknown ASR model {model:?}"),
                                     Some("session.input_audio_transcription.model"), client_id)).await {
@@ -417,13 +428,19 @@ async fn session(state: Arc<AsrServer>, mut socket: WebSocket, ids: RequestIds, 
                         resampler = Resampler::new(next.format.rate()).expect("a listed format rate");
                     }
                     if next.vad != config.vad {
-                        // Settings change between turns: the open turn (if any) is committed first.
+                        // Settings change between turns: the open turn (if any) is committed first,
+                        // with the settings it was spoken under.
                         if let Some(segment) = endpointer.as_mut().and_then(Endpointer::finish) {
-                            commit_turn(&mut out, &mut socket, &mut speaking, &mut previous, &mut waiting, &mut next_item, epoch, segment).await;
+                            let turn = Turn::of(&config, &route);
+                            commit_turn(&mut out, &mut socket, &mut speaking, &mut previous, &mut waiting, &mut next_item, epoch, segment, turn).await;
                         }
                         epoch += fed;
                         fed = 0;
-                        endpointer = new_endpointer(next.vad, route.as_ref().map(|r| &r.2));
+                        endpointer = new_endpointer(next.vad, rerouted.as_ref().or(route.as_ref()).map(|r| &r.2));
+                    }
+                    if let Some((model, r, finalization)) = rerouted {
+                        _metrics = Some(AsrSessionMetrics::new(state.metrics(&model)));
+                        route = Some((model, r, finalization));
                     }
                     config = next;
                     let updated = if kind == "session.update" { "session.updated" } else { "transcription_session.updated" };
@@ -479,7 +496,7 @@ async fn session(state: Arc<AsrServer>, mut socket: WebSocket, ids: RequestIds, 
                         let closed = e.push(&pcm);
                         let open = e.open_audio().map(|(index, audio)| (index, fed - audio.len() as u64));
                         for segment in closed {
-                            if !commit_turn(&mut out, &mut socket, &mut speaking, &mut previous, &mut waiting, &mut next_item, epoch, segment).await {
+                            if !commit_turn(&mut out, &mut socket, &mut speaking, &mut previous, &mut waiting, &mut next_item, epoch, segment, Turn::of(&config, &route)).await {
                                 return;
                             }
                         }
@@ -516,7 +533,7 @@ async fn session(state: Arc<AsrServer>, mut socket: WebSocket, ids: RequestIds, 
                         closed.extend(e.finish());
                         let last = closed.pop();
                         for segment in closed {
-                            if !commit_turn(&mut out, &mut socket, &mut speaking, &mut previous, &mut waiting, &mut next_item, epoch, segment).await {
+                            if !commit_turn(&mut out, &mut socket, &mut speaking, &mut previous, &mut waiting, &mut next_item, epoch, segment, Turn::of(&config, &route)).await {
                                 return;
                             }
                         }
@@ -525,7 +542,7 @@ async fn session(state: Arc<AsrServer>, mut socket: WebSocket, ids: RequestIds, 
                 };
                 match segment {
                     Some(segment) => {
-                        if !commit_turn(&mut out, &mut socket, &mut speaking, &mut previous, &mut waiting, &mut next_item, epoch, segment).await {
+                        if !commit_turn(&mut out, &mut socket, &mut speaking, &mut previous, &mut waiting, &mut next_item, epoch, segment, Turn::of(&config, &route)).await {
                             return;
                         }
                         continue;
@@ -558,11 +575,14 @@ async fn commit_turn(
     socket: &mut WebSocket,
     speaking: &mut Option<(u64, String)>,
     previous: &mut Option<String>,
-    waiting: &mut VecDeque<(String, Segment)>,
+    waiting: &mut VecDeque<(String, Segment, Turn)>,
     next_item: &mut impl FnMut() -> String,
     epoch: u64,
     segment: Segment,
+    turn: Option<Turn>,
 ) -> bool {
+    // Audio is refused until the session has a model, so a turn always has one.
+    let Some(turn) = turn else { return true };
     let vad = segment.index != u64::MAX;
     let item = match speaking.take() {
         Some((index, item)) if index == segment.index => item,
@@ -584,19 +604,35 @@ async fn commit_turn(
         return false;
     }
     *previous = Some(item.clone());
-    waiting.push_back((item, segment));
+    waiting.push_back((item, segment, turn));
     true
 }
 
-fn launch(
-    state: &AsrServer,
-    ids: &RequestIds,
-    config: &Config,
-    model: &str,
-    route: &Route,
-    finalization: &FinalizationPolicy,
-    segment: &Segment,
-) -> Result<Flight, SubmitError> {
+/// What a committed turn is transcribed with: the session's settings at its commit, so a later
+/// session update changes only later turns.
+struct Turn {
+    model: String,
+    route: Route,
+    finalization: FinalizationPolicy,
+    language: Option<String>,
+    prompt: String,
+}
+
+impl Turn {
+    fn of(config: &Config, route: &Option<(String, Route, FinalizationPolicy)>) -> Option<Self> {
+        let (model, route, finalization) = route.as_ref()?;
+        Some(Self {
+            model: model.clone(),
+            route: route.clone(),
+            finalization: *finalization,
+            language: config.language.clone(),
+            prompt: config.prompt.clone(),
+        })
+    }
+}
+
+fn launch(state: &AsrServer, ids: &RequestIds, turn: &Turn, segment: &Segment) -> Result<Flight, SubmitError> {
+    let Turn { model, route, finalization, .. } = turn;
     let mut samples = segment.samples.clone();
     if samples.len() < SAMPLE_RATE as usize / 2 {
         samples.resize(SAMPLE_RATE as usize / 2, 0.0);
@@ -613,7 +649,7 @@ fn launch(
         report: None,
         ..Default::default()
     };
-    let work = route.submit(samples, config.language.clone(), config.prompt.clone(), cancel.0.clone(), opts)?;
+    let work = route.submit(samples, turn.language.clone(), turn.prompt.clone(), cancel.0.clone(), opts)?;
     Ok(Flight {
         segment: segment.index,
         start_ms: segment.start / 16,
@@ -623,7 +659,7 @@ fn launch(
         shown: String::new(),
         deadline: state.request_timeout.map(|t| tokio::time::Instant::now() + t),
         run,
-        cancel,
+        _cancel: cancel,
     })
 }
 
@@ -789,6 +825,113 @@ mod tests {
         let first = &order[..order.iter().position(|k| k.ends_with("completed")).unwrap() + 1];
         assert_eq!(&first[..3], ["input_audio_buffer.speech_started", "input_audio_buffer.speech_stopped", "input_audio_buffer.committed"]);
         assert_eq!(transcripts, ["hello world 0", "hello world 1"]);
+        task.abort();
+    }
+
+    type Gate = Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>;
+
+    fn open(gate: &Gate) {
+        *gate.0.lock().unwrap() = true;
+        gate.1.notify_all();
+    }
+
+    /// Answers `language|prompt`, but only once `gate` opens (cancellation is ignored: a stall).
+    struct Gated(Gate);
+    impl Transcriber for Gated {
+        fn language(&self, _: Option<&str>) -> crate::Result<Option<String>> {
+            Ok(None)
+        }
+        fn transcribe(&mut self, _: &[f32], language: Option<&str>, prompt: &str, _: &AtomicBool) -> crate::Result<Transcript> {
+            let mut open = self.0 .0.lock().unwrap();
+            while !*open {
+                open = self.0 .1.wait(open).unwrap();
+            }
+            Ok(Transcript { text: format!("{}|{prompt}", language.unwrap_or("-")), language: None })
+        }
+    }
+
+    async fn gated_server(timeout: Option<Duration>) -> (std::net::SocketAddr, Gate, tokio::task::JoinHandle<()>) {
+        let gate: Gate = Default::default();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = AsrServer::new("test".into(), Gated(gate.clone())).with_request_timeout(timeout).router(true);
+        (address, gate, tokio::spawn(async move { axum::serve(listener, app).await.unwrap() }))
+    }
+
+    /// `?model=` alone routes the session; an unknown one is refused at connect.
+    #[tokio::test]
+    async fn query_model_routes_the_session() {
+        let (address, task) = server(&[]).await;
+        let mut socket = connect(address, "&model=test").await;
+        assert_eq!(next(&mut socket).await["type"], "transcription_session.created");
+        event(&mut socket, json!({"type":"transcription_session.update","session":{"turn_detection":null}})).await;
+        assert_eq!(next(&mut socket).await["type"], "transcription_session.updated");
+        append_24k(&mut socket, &[(1.0, true)]).await;
+        event(&mut socket, json!({"type":"input_audio_buffer.commit"})).await;
+        let completed = loop {
+            let e = next(&mut socket).await;
+            assert_ne!(e["type"], "error", "{e}");
+            if e["type"] == "conversation.item.input_audio_transcription.completed" {
+                break e;
+            }
+        };
+        assert_eq!(completed["transcript"], "hello world 0");
+
+        let mut socket = connect(address, "&model=nope").await;
+        let refused = next(&mut socket).await;
+        assert_eq!((refused["type"].as_str(), refused["error"]["code"].as_str()), (Some("error"), Some("model_not_found")));
+        assert_eq!(next(&mut socket).await["type"], "close");
+        task.abort();
+    }
+
+    /// A session update changes only turns committed after it, not ones still waiting to launch.
+    #[tokio::test]
+    async fn committed_turns_keep_their_settings() {
+        let (address, gate, task) = gated_server(None).await;
+        let mut socket = connect(address, "&model=test").await;
+        assert_eq!(next(&mut socket).await["type"], "transcription_session.created");
+        event(&mut socket, json!({"type":"transcription_session.update","session":{"turn_detection":null,
+            "input_audio_transcription":{"language":"en","prompt":"one"}}})).await;
+        assert_eq!(next(&mut socket).await["type"], "transcription_session.updated");
+        // Two turns in flight on the held engine, the third waits behind them.
+        for _ in 0..3 {
+            append_24k(&mut socket, &[(0.5, true)]).await;
+            event(&mut socket, json!({"type":"input_audio_buffer.commit"})).await;
+            assert_eq!(next(&mut socket).await["type"], "input_audio_buffer.committed");
+        }
+        event(&mut socket, json!({"type":"transcription_session.update","session":{
+            "input_audio_transcription":{"language":"fr","prompt":"two"}}})).await;
+        assert_eq!(next(&mut socket).await["type"], "transcription_session.updated");
+        append_24k(&mut socket, &[(0.5, true)]).await;
+        event(&mut socket, json!({"type":"input_audio_buffer.commit"})).await;
+        assert_eq!(next(&mut socket).await["type"], "input_audio_buffer.committed");
+        open(&gate);
+        let mut transcripts = Vec::new();
+        while transcripts.len() < 4 {
+            let e = next(&mut socket).await;
+            if e["type"] == "conversation.item.input_audio_transcription.completed" {
+                transcripts.push(e["transcript"].as_str().unwrap().to_owned());
+            }
+        }
+        assert_eq!(transcripts, ["en|one", "en|one", "en|one", "fr|two"]);
+        task.abort();
+    }
+
+    /// The deadline answers while the engine is still stalled on the turn.
+    #[tokio::test]
+    async fn deadline_fails_the_turn_without_waiting_for_the_engine() {
+        let (address, gate, task) = gated_server(Some(Duration::from_millis(100))).await;
+        let mut socket = connect(address, "&model=test").await;
+        assert_eq!(next(&mut socket).await["type"], "transcription_session.created");
+        event(&mut socket, json!({"type":"transcription_session.update","session":{"turn_detection":null}})).await;
+        assert_eq!(next(&mut socket).await["type"], "transcription_session.updated");
+        append_24k(&mut socket, &[(0.5, true)]).await;
+        event(&mut socket, json!({"type":"input_audio_buffer.commit"})).await;
+        assert_eq!(next(&mut socket).await["type"], "input_audio_buffer.committed");
+        let failed = next(&mut socket).await;
+        assert_eq!((failed["type"].as_str(), failed["error"]["code"].as_str()),
+            (Some("conversation.item.input_audio_transcription.failed"), Some("timeout")));
+        open(&gate);
         task.abort();
     }
 

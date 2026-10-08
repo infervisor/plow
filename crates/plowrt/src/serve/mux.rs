@@ -477,25 +477,54 @@ pub struct ModelMux {
     /// re-queues with its new most urgent work instead of the `Due` it queued with.
     arrival_notify: Arc<tokio::sync::Notify>,
     /// Requests past model lookup whose job is not on `tx` yet (still tokenizing).
-    ingress: Arc<std::sync::atomic::AtomicUsize>,
+    ingress: Arc<Ingress>,
+    /// Set by [`ModelMux::preempt`] and never cleared: held work submitting later fails retryably.
+    preempted: Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// What a request submitting to a preempted mux is told (503-class).
+pub const PREEMPTED: &str = "model preempted — retry";
+
+/// Requests past model lookup; the last to leave wakes a gracefully draining dispatcher.
+#[derive(Default)]
+struct Ingress {
+    count: std::sync::atomic::AtomicUsize,
+    idle: tokio::sync::Notify,
+}
+
+impl Ingress {
+    fn enter(&self) {
+        self.count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn leave(&self) {
+        if self.count.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.idle.notify_one();
+        }
+    }
+
+    fn pending(&self) -> usize {
+        self.count.load(Ordering::Acquire)
+    }
 }
 
 /// Holds one count in [`ModelMux::ingress`] until dropped.
-pub struct IngressGuard<'a>(&'a std::sync::atomic::AtomicUsize);
+pub struct IngressGuard<'a>(&'a Ingress);
 
 /// [`IngressGuard`] that outlives the borrow: a request that works before it submits (an ASR
-/// encode) holds it, so a draining dispatcher waits for its job instead of closing on it.
-pub struct OwnedIngress(Arc<std::sync::atomic::AtomicUsize>);
+/// encode) holds it, so a graceful drain waits for its job instead of closing on it. A preempt
+/// does not wait for it; the job's later submission fails with [`PREEMPTED`].
+pub struct OwnedIngress(Arc<Ingress>);
 
 impl Drop for OwnedIngress {
     fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::Relaxed);
+        self.0.leave();
     }
 }
 
 impl Drop for IngressGuard<'_> {
     fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::Relaxed);
+        self.0.leave();
     }
 }
 
@@ -591,20 +620,25 @@ fn completed_decode(feeds: &[(usize, u32)], steps: usize) -> Option<DecodeProgre
 impl ModelMux {
     /// Whether any request is queued, tokenizing or holding an engine slot.
     pub fn in_flight(&self) -> bool {
-        self.ingress.load(Ordering::Relaxed) > 0
+        self.ingress.pending() > 0
             || self.metrics.queued_requests.load(Ordering::Relaxed) > 0
             || self.metrics.slots_active.load(Ordering::Relaxed) > 0
     }
 
     pub fn ingress_owned(&self) -> OwnedIngress {
-        self.ingress.fetch_add(1, Ordering::Relaxed);
+        self.ingress.enter();
         OwnedIngress(Arc::clone(&self.ingress))
     }
 
     /// Count a request as pending before it tokenizes; hand the guard to `submit_arrived`.
     pub fn ingress(&self) -> IngressGuard<'_> {
-        self.ingress.fetch_add(1, Ordering::Relaxed);
+        self.ingress.enter();
         IngressGuard(&self.ingress)
+    }
+
+    /// [`Self::preempt`] has run: this dispatcher is gone or going, and serves nothing more.
+    pub fn preempted(&self) -> bool {
+        self.preempted.load(Ordering::Acquire)
     }
 
     /// Submit a job. Returns immediately; the caller awaits the stream.
@@ -684,6 +718,7 @@ impl ModelMux {
     /// service_ms) — a 2048-token slot at 40 ms/token is an 82 s wait.
     /// Returns when the dispatcher has exited.
     pub async fn preempt(&self) {
+        self.preempted.store(true, Ordering::Release);
         self.preempt.store(true, Ordering::Release);
         self.preempt_notify.notify_one();
         // The Drain message wakes a dispatcher blocked on recv (idle path)
@@ -810,7 +845,7 @@ pub fn spawn(
     let preempt_wake = Arc::clone(&preempt_notify);
     let arrival_notify = Arc::new(tokio::sync::Notify::new());
     let arrival_wake = Arc::clone(&arrival_notify);
-    let ingress = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let ingress = Arc::new(Ingress::default());
     let ingress_seen = Arc::clone(&ingress);
     let metrics = state.model_metrics(&slug);
     let handle_metrics = Arc::clone(&metrics);
@@ -1088,9 +1123,10 @@ pub fn spawn(
             }
 
             // Drain completion: if draining and no in-flight slots remain,
-            // signal the drain future and exit the dispatcher loop. A request past model lookup
-            // (`ingress`) still submits here: closing on it would fail it.
-            let drained = draining && live == 0 && waiting.is_empty() && ingress_seen.load(Ordering::Relaxed) == 0;
+            // signal the drain future and exit the dispatcher loop. A graceful drain waits for a
+            // request past model lookup (`ingress`): closing on it would fail it. A preempt does not
+            // (an idle stream can hold one indefinitely); its later submission fails retryably.
+            let drained = draining && live == 0 && waiting.is_empty() && (preempted || ingress_seen.pending() == 0);
             // A graceful drain serves what was submitted before the mux left the routing table,
             // however late its job reached the channel.
             if drained && !preempted {
@@ -1146,7 +1182,13 @@ pub fn spawn(
                 // Parking with the turn held would starve a co-tenant for as
                 // long as this model has nothing to do, which is unbounded.
                 turn.release();
-                let Some(msg) = rx.recv().await else { break };
+                let msg = tokio::select! {
+                    msg = rx.recv() => msg,
+                    // A graceful drain held only by ingress: the last request leaving without
+                    // submitting must wake it, as no message will.
+                    _ = ingress_seen.idle.notified(), if draining => continue,
+                };
+                let Some(msg) = msg else { break };
                 note_dequeued(&msg, &metrics);
                 match msg {
                     MuxMsg::Job(job, arrived) => {
@@ -1312,7 +1354,7 @@ pub fn spawn(
                         lambda,
                         cfg.max_hold_ms,
                         cfg.idle_dispatch,
-                        rx.len() + ingress_seen.load(Ordering::Relaxed),
+                        rx.len() + ingress_seen.pending(),
                     )
                 } else {
                     0.0
@@ -1360,7 +1402,7 @@ pub fn spawn(
                                         }
                                         if cfg.idle_dispatch
                                             && rx.is_empty()
-                                            && ingress_seen.load(Ordering::Relaxed) == 0
+                                            && ingress_seen.pending() == 0
                                         {
                                             break;
                                         }
@@ -1824,6 +1866,7 @@ pub fn spawn(
         preempt_notify,
         arrival_notify,
         ingress,
+        preempted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     }
 }
 
@@ -6904,15 +6947,16 @@ mod tests {
             preempt: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             preempt_notify: Arc::new(tokio::sync::Notify::new()),
             arrival_notify: Arc::new(tokio::sync::Notify::new()),
-            ingress: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            ingress: Arc::default(),
+            preempted: Arc::default(),
         };
 
         let (a, b) = (mux.ingress(), mux.ingress());
-        assert_eq!(mux.ingress.load(Ordering::Relaxed), 2);
+        assert_eq!(mux.ingress.pending(), 2);
         drop(a);
-        assert_eq!(mux.ingress.load(Ordering::Relaxed), 1);
+        assert_eq!(mux.ingress.pending(), 1);
         drop(b);
-        assert_eq!(mux.ingress.load(Ordering::Relaxed), 0);
+        assert_eq!(mux.ingress.pending(), 0);
 
         assert!(mux.submit(test_job()).is_ok());
         assert_eq!(metrics.queued_requests.load(Ordering::Relaxed), 1);
@@ -6928,6 +6972,44 @@ mod tests {
             Err(SubmitError::Closed(_))
         ));
         assert_eq!(metrics.queued_requests.load(Ordering::Relaxed), 0);
+    }
+
+    #[cfg(feature = "cuda")]
+    fn idle_test_mux(name: &str) -> ModelMux {
+        let backend: Arc<dyn crate::device::Backend> = Arc::new(crate::device::cpu::CpuBackend::new(1));
+        let execset = Arc::new(crate::exec::ExecutorSet::bringup(backend).unwrap());
+        let state = Arc::new(AppState::new(crate::orch::Registry::new(), execset));
+        spawn(name.into(), Arc::new(prefill_test_bundle(name)), state, MuxConfig::default())
+    }
+
+    /// An idle stream holding ingress must not hold a preempt: it completes, and the held work's
+    /// later submission is told the model was preempted.
+    #[cfg(feature = "cuda")]
+    #[tokio::test]
+    async fn preempt_does_not_wait_for_held_ingress() {
+        let mux = idle_test_mux("preempt-held-ingress");
+        let held = mux.ingress_owned();
+        tokio::time::timeout(std::time::Duration::from_secs(5), mux.preempt()).await.expect("preempt waited on ingress");
+        assert!(mux.preempted());
+        assert!(matches!(mux.submit_wait(test_job()).await, Err(SubmitError::Closed(_))));
+        drop(held);
+    }
+
+    /// A graceful drain held only by ingress completes once that request leaves without submitting.
+    #[cfg(feature = "cuda")]
+    #[tokio::test]
+    async fn graceful_drain_wakes_when_ingress_leaves() {
+        let mux = idle_test_mux("drain-ingress-leaves");
+        let held = mux.ingress_owned();
+        let draining = {
+            let mux = mux.clone();
+            tokio::spawn(async move { mux.drain().await })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(!draining.is_finished(), "a graceful drain closed on a request past model lookup");
+        drop(held);
+        tokio::time::timeout(std::time::Duration::from_secs(5), draining).await.expect("drain never woke").unwrap();
+        assert!(!mux.preempted());
     }
 
     #[test]
