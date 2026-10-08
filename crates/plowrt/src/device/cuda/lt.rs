@@ -1009,6 +1009,18 @@ pub(crate) struct Plan {
     algo: Algo,
 }
 
+/// Load-time selections by device model and problem: a second engine of the same model on a
+/// same-model GPU (a DP rank) takes the first one's pick instead of re-timing. Timing picks among
+/// near-tied candidates, and ranks timing concurrently picked differently, which made temperature-0
+/// output differ by rank.
+type Selection = (String, u32, u32, u32, Vec<u32>, Option<(i64, i64, bool)>);
+
+fn selections() -> &'static parking_lot::Mutex<std::collections::HashMap<Selection, [u64; 8]>> {
+    static S: std::sync::OnceLock<parking_lot::Mutex<std::collections::HashMap<Selection, [u64; 8]>>> =
+        std::sync::OnceLock::new();
+    S.get_or_init(Default::default)
+}
+
 impl Plan {
     #[allow(clippy::too_many_arguments)]
     fn select(
@@ -1021,9 +1033,41 @@ impl Plan {
         pair: Option<Pair>,
         rows: &[u32],
     ) -> Result<()> {
-        if let Some(pair) = pair {
-            return self.select_pair(candidates, m, n, k, weight, pair, rows);
+        let key: Selection = (
+            self.lt.be.device_name().to_string(),
+            m,
+            n,
+            k,
+            rows.to_vec(),
+            pair.as_ref().map(|p| (p.w_stride, p.c_stride, p.cold)),
+        );
+        let known = selections().lock().get(&key).copied();
+        if let Some(c) = known.and_then(|data| {
+            candidates
+                .iter()
+                .find(|c| c.algo.data == data && c.state == 0 && c.workspace <= self.lt.workspace.len as usize)
+        }) {
+            self.algo = c.algo;
+            tracing::debug!(m, n, k, ?rows, "cuBLASLt algorithm reused from an earlier load");
+            return Ok(());
         }
+        match pair {
+            Some(pair) => self.select_pair(candidates, m, n, k, weight, pair, rows)?,
+            None => self.select_timed(candidates, m, n, k, weight, rows)?,
+        }
+        selections().lock().entry(key).or_insert(self.algo.data);
+        Ok(())
+    }
+
+    fn select_timed(
+        &mut self,
+        candidates: &[Heuristic],
+        m: u32,
+        n: u32,
+        k: u32,
+        weight: u64,
+        rows: &[u32],
+    ) -> Result<()> {
         let be = Arc::clone(&self.lt.be);
         let bytes_w = n as u64 * k as u64 * 2;
         let repeats = ((700 * 1024 * 1024u64).div_ceil(bytes_w)).clamp(2, 16);
