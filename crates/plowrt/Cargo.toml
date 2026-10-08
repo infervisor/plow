@@ -136,7 +136,7 @@ dist = ["dep:ureq", "dep:zstd", "dep:zip", "dep:hf-hub", "hf-tokenizer"]
 # and pulls hf-tokenizer for the same reason: a real model served through the
 # byte-fallback tokenizer produces silent garbage (a `--features cuda`-only
 # build did exactly that, 2026-07-19; see serve() 's byte-fallback refusal).
-cuda = ["dep:libloading", "dep:safetensors", "hf-tokenizer"]
+cuda = ["dep:libloading", "dep:libc", "dep:safetensors", "hf-tokenizer"]
 # HSA driver-API backend (dlopen of libhsa-runtime64 — direct ROCr, no HIP).
 # Pulls the same two extras as `cuda`, for the same two reasons: the AMD engine
 # (`exec::amd`) binds checkpoint weights by tensor name, which needs the

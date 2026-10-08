@@ -85,7 +85,11 @@ impl AudioChunking {
 
 impl PacketAudioEncoder {
     pub(crate) fn load(path: &std::path::Path, backend: &str) -> Result<Self> {
-        let packet = ForwardPacket::load(path, "audio.encode", backend)?;
+        Self::load_on(path, backend, 0)
+    }
+
+    pub(crate) fn load_on(path: &std::path::Path, backend: &str, device: u8) -> Result<Self> {
+        let packet = ForwardPacket::load_on(path, "audio.encode", backend, device)?;
         let chunking = AudioChunking::from_pipeline(|name| packet.optional_parameter(name))?;
         let usize_param = |name: &str| {
             usize::try_from(packet.parameter(name)?)

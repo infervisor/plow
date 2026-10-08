@@ -133,6 +133,15 @@ impl Route {
         }
     }
 
+    /// The dispatcher behind this route was preempted or has exited: route again.
+    fn stale(&self) -> bool {
+        #[cfg(feature = "cuda")]
+        if let Route::Shared(_, mux, _) = self {
+            return mux.preempted() || mux.is_closed();
+        }
+        false
+    }
+
     /// Whether this route keeps session state (retained decoder rows, appended audio).
     fn sessions(&self) -> bool {
         #[cfg(feature = "cuda")]
@@ -532,7 +541,7 @@ impl AsrServer {
         }
     }
 
-    async fn route(&self, model: &str) -> Result<(Route, FinalizationPolicy), Response> {
+    async fn route(&self, model: &str, session: Option<&str>) -> Result<(Route, FinalizationPolicy), Response> {
         match &self.backend {
             Backend::Cohort { model: served, mux, finalization } => {
                 if model != served {
@@ -545,7 +554,7 @@ impl AsrServer {
                 if let Some((mux, finalization)) = packet_models().read().get(model) {
                     return Ok((Route::Cohort(mux.clone()), *finalization));
                 }
-                shared::route(state, model).await
+                shared::route(state, model, session).await
             }
         }
     }
@@ -796,7 +805,7 @@ async fn transcribe_upload(state: Arc<AsrServer>, mut multipart: Multipart, ids:
     let Some(model) = fields.get("model").cloned() else {
         return failure(StatusCode::BAD_REQUEST, "model is required");
     };
-    let route = match state.route(&model).await {
+    let route = match state.route(&model, ids.session.as_deref()).await {
         Ok((route, _)) => route,
         Err(response) => return response,
     };
@@ -1230,7 +1239,7 @@ async fn stream(state: Arc<AsrServer>, mut socket: WebSocket, permit: OwnedSemap
                 && STREAM_RATES.contains(&s.sample_rate)
                 && s.format == "pcm_s16le" =>
         {
-            state.route(&s.model).await.ok().map(|r| (s, r))
+            state.route(&s.model, ids.session.as_deref()).await.ok().map(|r| (s, r))
         }
         _ => None,
     };

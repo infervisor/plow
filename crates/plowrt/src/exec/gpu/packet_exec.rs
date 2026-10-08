@@ -86,18 +86,19 @@ pub struct CudaPacketRuntime {
     _resident: Arc<()>,
 }
 
-/// Live runtimes by the asset directory their packet sits in.
-fn residents() -> &'static parking_lot::Mutex<Vec<(std::path::PathBuf, std::sync::Weak<()>)>> {
-    static R: std::sync::OnceLock<parking_lot::Mutex<Vec<(std::path::PathBuf, std::sync::Weak<()>)>>> =
-        std::sync::OnceLock::new();
+type Residents = parking_lot::Mutex<Vec<(std::path::PathBuf, u8, std::sync::Weak<()>)>>;
+
+/// Live runtimes by the asset directory their packet sits in and their device.
+fn residents() -> &'static Residents {
+    static R: std::sync::OnceLock<Residents> = std::sync::OnceLock::new();
     R.get_or_init(Default::default)
 }
 
-/// Whether a packet runtime loaded from `dir` still holds device memory.
-pub fn resident_in(dir: &Path) -> bool {
+/// Whether a packet runtime loaded from `dir` onto `device` still holds device memory.
+pub fn resident_in(dir: &Path, device: u8) -> bool {
     let mut r = residents().lock();
-    r.retain(|(_, live)| live.strong_count() > 0);
-    r.iter().any(|(d, _)| d == dir)
+    r.retain(|(_, _, live)| live.strong_count() > 0);
+    r.iter().any(|(d, o, _)| d == dir && *o == device)
 }
 
 // SAFETY: the runtime owns its stream, module and allocations and is used by one thread at a time
@@ -111,6 +112,7 @@ impl CudaPacketRuntime {
     }
 
     pub fn load_on(be: Arc<CudaBackend>, path: &Path) -> Result<Self> {
+        let ordinal = be.device_ordinal;
         let raw = std::fs::read(path).map_err(|source| RuntimeError::Io { path: path.to_path_buf(), source })?;
         let blob = DevBlob::parse(&raw)?;
         if !blob.gen.is_empty() || blob.tp.is_some() {
@@ -254,7 +256,7 @@ impl CudaPacketRuntime {
             last_us: 0.0,
             _resident: {
                 let token = Arc::new(());
-                residents().lock().push((dir.to_path_buf(), Arc::downgrade(&token)));
+                residents().lock().push((dir.to_path_buf(), ordinal, Arc::downgrade(&token)));
                 token
             },
         })

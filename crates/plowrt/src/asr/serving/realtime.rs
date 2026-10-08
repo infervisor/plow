@@ -229,7 +229,7 @@ async fn session(state: Arc<AsrServer>, mut socket: WebSocket, ids: RequestIds, 
     let mut _metrics: Option<AsrSessionMetrics> = None;
     // `?model=` routes now, as a session update's model does: an unknown one fails the connect.
     if let Some(model) = &model {
-        match state.route(model).await {
+        match state.route(model, ids.session.as_deref()).await {
             Ok((r, finalization)) => {
                 _metrics = Some(AsrSessionMetrics::new(state.metrics(model)));
                 route = Some((model.clone(), r, finalization));
@@ -272,6 +272,17 @@ async fn session(state: Arc<AsrServer>, mut socket: WebSocket, ids: RequestIds, 
     loop {
         // Launch waiting turns with the settings current at their commit.
         while flights.len() < MAX_SEGMENTS_IN_FLIGHT {
+            // A rank unloaded under the session: route its turns (and the session) again.
+            if let Some((_, _, turn)) = waiting.front_mut().filter(|(_, _, t)| t.route.stale()) {
+                if let Ok((r, finalization)) = state.route(&turn.model, ids.session.as_deref()).await {
+                    if let Some(current) = route.as_mut().filter(|c| c.0 == turn.model) {
+                        current.1 = r.clone();
+                        current.2 = finalization;
+                    }
+                    turn.route = r;
+                    turn.finalization = finalization;
+                }
+            }
             let Some((_, segment, turn)) = waiting.front() else { break };
             match launch(&state, &ids, turn, segment) {
                 Ok(flight) => {
@@ -413,7 +424,7 @@ async fn session(state: Arc<AsrServer>, mut socket: WebSocket, ids: RequestIds, 
                     // Route the (new) model now, so a bad name fails the update, not a later turn.
                     let mut rerouted = None;
                     if let Some(model) = next.model.clone().filter(|m| route.as_ref().is_none_or(|r| &r.0 != m)) {
-                        match state.route(&model).await {
+                        match state.route(&model, ids.session.as_deref()).await {
                             Ok((r, finalization)) => rerouted = Some((model, r, finalization)),
                             Err(_) => {
                                 if !send(&mut socket, out.error("model_not_found", format!("unknown ASR model {model:?}"),

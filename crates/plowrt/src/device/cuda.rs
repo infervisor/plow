@@ -128,6 +128,9 @@ const ATTR_MULTIPROCESSOR_COUNT: i32 = 16;
 const ATTR_COMPUTE_CAPABILITY_MAJOR: i32 = 75;
 const ATTR_COMPUTE_CAPABILITY_MINOR: i32 = 76;
 const ATTR_COOPERATIVE_LAUNCH: i32 = 95;
+const ATTR_PCI_BUS_ID: i32 = 33;
+const ATTR_PCI_DEVICE_ID: i32 = 34;
+const ATTR_PCI_DOMAIN_ID: i32 = 50;
 const ATTR_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN: i32 = 97;
 /// `CU_DEVICE_ATTRIBUTE_PAGEABLE_MEMORY_ACCESS_USES_HOST_PAGE_TABLES`: 1 only
 /// on hardware-coherent platforms (Grace-Hopper ATS), where the DMA engines
@@ -617,6 +620,8 @@ pub struct CudaBackend {
     /// Hardware-coherent pageable access (attr 100) — see
     /// [`Backend::coherent_host_dma`].
     coherent_host_dma: bool,
+    /// PCI address (`0000:41:00.0`), for host-thread placement on the device's socket.
+    pci_bdf: Option<String>,
     /// Real loaded modules by placeholder-exclusive id (id 0 = "no module",
     /// handed out for an empty image so `ExecutorSet::bringup` works before
     /// any real cubin exists — the engine loads its module explicitly).
@@ -645,6 +650,11 @@ unsafe impl Send for CudaBackend {}
 unsafe impl Sync for CudaBackend {}
 
 impl CudaBackend {
+    /// PCI address of this device, when the driver reports it.
+    pub fn pci_bdf(&self) -> Option<&str> {
+        self.pci_bdf.as_deref()
+    }
+
     /// `dlopen` the driver, `cuInit`, retain the device's primary context, and
     /// read the device geometry. Fails cleanly on a host without a CUDA driver
     /// — the runtime then falls back to another backend.
@@ -781,6 +791,10 @@ impl CudaBackend {
                     (api.cuDeviceGetAttribute)(&mut v, ATTR_PAGEABLE_USES_HOST_PAGE_TABLES, dev);
                 rc == 0 && v == 1
             };
+            let pci_bdf = match (attr(ATTR_PCI_DOMAIN_ID, "pci"), attr(ATTR_PCI_BUS_ID, "pci"), attr(ATTR_PCI_DEVICE_ID, "pci")) {
+                (Ok(d), Ok(b), Ok(s)) => Some(format!("{d:04x}:{b:02x}:{s:02x}.0")),
+                _ => None,
+            };
             let coop = attr(ATTR_COOPERATIVE_LAUNCH, "attr cooperative")?;
             if coop == 0 {
                 return Err(RuntimeError::Device(format!(
@@ -821,6 +835,7 @@ impl CudaBackend {
                 compute_capability,
                 smem_optin,
                 coherent_host_dma,
+                pci_bdf,
                 modules: Mutex::new(FxHashMap::default()),
                 module_images: Mutex::new(FxHashMap::default()),
                 next_module: AtomicU64::new(1),

@@ -78,27 +78,31 @@ impl SpeechRequest {
     }
 }
 
-/// Guided speech front-ends (`tts.guided_lm.v1`) by asset directory, bound on first use.
-fn guided_models() -> &'static Mutex<HashMap<PathBuf, Option<Arc<super::guided_speech::GuidedSpeech>>>> {
-    static M: OnceLock<Mutex<HashMap<PathBuf, Option<Arc<super::guided_speech::GuidedSpeech>>>>> = OnceLock::new();
+type Bound<T> = Mutex<HashMap<(PathBuf, u8), Option<Arc<T>>>>;
+
+/// Guided speech front-ends (`tts.guided_lm.v1`) by asset directory and device, bound on first use.
+fn guided_models() -> &'static Bound<super::guided_speech::GuidedSpeech> {
+    static M: OnceLock<Bound<super::guided_speech::GuidedSpeech>> = OnceLock::new();
     M.get_or_init(Default::default)
 }
 
 fn guided_model(
     assets: &Path,
     credit: Arc<crate::sched::admission::DownstreamCredit>,
+    device: u8,
 ) -> Result<Option<Arc<super::guided_speech::GuidedSpeech>>, String> {
-    if let Some(m) = guided_models().lock().get(assets) {
+    let at = (assets.to_path_buf(), device);
+    if let Some(m) = guided_models().lock().get(&at) {
         return Ok(m.clone());
     }
     let model = if super::guided_lm::GuidedLmContract::load(assets).map_err(|e| e.to_string())?.is_some() {
-        let g = super::guided_speech::GuidedSpeech::start(assets, credit).map_err(|e| e.to_string())?;
-        tracing::info!(dir = %assets.display(), "tts: guided speech pipeline bound to the serve mux");
+        let g = super::guided_speech::GuidedSpeech::start(assets, credit, device).map_err(|e| e.to_string())?;
+        tracing::info!(dir = %assets.display(), device, "tts: guided speech pipeline bound to the serve mux");
         Some(Arc::new(g))
     } else {
         None
     };
-    guided_models().lock().insert(assets.to_path_buf(), model.clone());
+    guided_models().lock().insert(at, model.clone());
     Ok(model)
 }
 
@@ -115,10 +119,11 @@ pub fn preload(state: &AppState) -> Result<(), String> {
 
 /// Bind `slug`'s speech pipeline now (a no-op for a model without one, or already bound).
 pub fn bind(state: &AppState, slug: &str) -> Result<(), String> {
-    let bundle = state.registry.get(slug).map_err(|e| e.to_string())?;
-    let bound = guided_model(&bundle.dir, state.downstream(slug)).and_then(|g| match g {
+    let bundle = state.registry.get(state.model_of(slug)).map_err(|e| e.to_string())?;
+    let device = state.ordinal_of(slug);
+    let bound = guided_model(&bundle.dir, state.downstream(slug), device).and_then(|g| match g {
         Some(_) => Ok(()),
-        None => speech_model(&bundle.dir, state.downstream(slug)).map(drop),
+        None => speech_model(&bundle.dir, state.downstream(slug), device).map(drop),
     });
     bound.map_err(|e| format!("{slug}: speech pipeline failed to bind: {e}"))
 }
@@ -132,22 +137,24 @@ enum Pipeline {
 
 /// `dir`'s bound pipeline; `None` when it is not bound (not resident, or mid-switch). Never
 /// binds: a managed model's pipeline binds with its engine ([`bind`]).
-fn bound_pipeline(dir: &Path) -> Option<Pipeline> {
-    if let Some(Some(g)) = guided_models().lock().get(dir) {
+fn bound_pipeline(dir: &Path, device: u8) -> Option<Pipeline> {
+    let at = (dir.to_path_buf(), device);
+    if let Some(Some(g)) = guided_models().lock().get(&at) {
         return Some(Pipeline::Guided(Arc::clone(g)));
     }
-    match speech_models().lock().get(dir) {
+    match speech_models().lock().get(&at) {
         Some(Some(m)) => Some(Pipeline::Speech(Arc::clone(m))),
         Some(None) => Some(Pipeline::None),
         None => None,
     }
 }
 
-/// Forget `dir`'s speech pipeline: its vocoder/codec threads exit, freeing their packet
-/// runtimes, once the last request holding it ends.
-pub fn release(dir: &Path) {
-    guided_models().lock().remove(dir);
-    speech_models().lock().remove(dir);
+/// Forget `dir`'s speech pipeline on `device`: its vocoder/codec threads exit, freeing their
+/// packet runtimes, once the last request holding it ends.
+pub fn release(dir: &Path, device: u8) {
+    let at = (dir.to_path_buf(), device);
+    guided_models().lock().remove(&at);
+    speech_models().lock().remove(&at);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -273,9 +280,9 @@ pub struct SpeechModel {
     realtime: Arc<super::realtime::RealTime>,
 }
 
-/// Speech models by asset directory, bound on first use.
-fn speech_models() -> &'static Mutex<HashMap<PathBuf, Option<Arc<SpeechModel>>>> {
-    static M: OnceLock<Mutex<HashMap<PathBuf, Option<Arc<SpeechModel>>>>> = OnceLock::new();
+/// Speech models by asset directory and device, bound on first use.
+fn speech_models() -> &'static Bound<SpeechModel> {
+    static M: OnceLock<Bound<SpeechModel>> = OnceLock::new();
     M.get_or_init(Default::default)
 }
 
@@ -283,14 +290,16 @@ fn speech_models() -> &'static Mutex<HashMap<PathBuf, Option<Arc<SpeechModel>>>>
 pub fn speech_model(
     assets: &Path,
     credit: Arc<crate::sched::admission::DownstreamCredit>,
+    device: u8,
 ) -> Result<Option<Arc<SpeechModel>>, String> {
-    if let Some(m) = speech_models().lock().get(assets) {
+    let at = (assets.to_path_buf(), device);
+    if let Some(m) = speech_models().lock().get(&at) {
         return Ok(m.clone());
     }
     let model = match SpeechContract::load(assets).map_err(|e| e.to_string())? {
         None => None,
         Some(contract) => {
-            let mut codec = Codec::load(assets)?;
+            let mut codec = Codec::load_on(assets, device)?;
             codec.couple(credit);
             if codec.frame_codes != contract.frame_codes || codec.frame_samples != contract.frame_samples {
                 return Err(format!(
@@ -303,7 +312,7 @@ pub fn speech_model(
             Some(Arc::new(SpeechModel { contract, codec, realtime }))
         }
     };
-    speech_models().lock().insert(assets.to_path_buf(), model.clone());
+    speech_models().lock().insert(at, model.clone());
     Ok(model)
 }
 
@@ -393,17 +402,35 @@ async fn speech_with(
     // The pipeline binds with the engine and leaves with it: an eviction between the residency
     // check and the lookup sends the request around again.
     let mut attempts = 0;
+    let dp = state.dp_set(&req.model).cloned();
+    let mut exclude = 0u32;
+    let mut key = req.model.clone();
     let (mux, bundle, pipeline) = loop {
-        if let Some(mgr) = state.manager_for(&req.model) {
-            if mgr.manages(&req.model) {
-                if let Err(e) = mgr.ensure_resident(&req.model).await {
+        let routed = match dp.as_deref() {
+            Some(set) => {
+                if let Err(e) = state.dp_admit(set).await {
                     return crate::serve::api_error(StatusCode::SERVICE_UNAVAILABLE, e.to_string(), "server_error", None, None);
                 }
+                state.dp_route(set, ids.session.as_deref(), None, exclude).map(|(rank, mux, _, _)| {
+                    exclude |= 1 << rank;
+                    key.clone_from(&set.ranks[rank].key);
+                    mux
+                })
             }
-        }
-        let (Some(mux), Ok(bundle)) = (state.mux(&req.model), state.registry.get(&req.model)) else {
+            None => {
+                if let Some(mgr) = state.manager_for(&req.model) {
+                    if mgr.manages(&req.model) {
+                        if let Err(e) = mgr.ensure_resident(&req.model).await {
+                            return crate::serve::api_error(StatusCode::SERVICE_UNAVAILABLE, e.to_string(), "server_error", None, None);
+                        }
+                    }
+                }
+                state.mux(&req.model)
+            }
+        };
+        let (Some(mux), Ok(bundle)) = (routed, state.registry.get(&req.model)) else {
             attempts += 1;
-            if attempts < 3 && state.manager_for(&req.model).is_some_and(|m| m.manages(&req.model)) {
+            if attempts < 3 && (dp.is_some() || state.manager_for(&req.model).is_some_and(|m| m.manages(&req.model))) {
                 continue;
             }
             return crate::serve::api_error(
@@ -414,8 +441,8 @@ async fn speech_with(
                 Some("model".into()),
             );
         };
-        let managed = state.manager_for(&req.model).is_some_and(|m| m.manages(&req.model));
-        match bound_pipeline(&bundle.dir) {
+        let managed = dp.is_some() || state.manager_for(&req.model).is_some_and(|m| m.manages(&req.model));
+        match bound_pipeline(&bundle.dir, state.ordinal_of(&key)) {
             Some(pipeline) => break (mux, bundle, Some(pipeline)),
             None if !managed => break (mux, bundle, None),
             None => {
@@ -433,7 +460,7 @@ async fn speech_with(
         ids,
         crate::serve::turns::Kind::Tts,
         &req.model,
-        Some(state.model_metrics(&req.model)),
+        Some(state.model_metrics(&key)),
         t_arrive,
         true,
     );
@@ -444,12 +471,12 @@ async fn speech_with(
         Some(Pipeline::None) => return bad(format!("model '{}' declares no speech pipeline", req.model), "model"),
         // Unmanaged (single-model) serve: bind on first use.
         None => {
-            match tokio::task::block_in_place(|| guided_model(&bundle.dir, state.downstream(&req.model))) {
+            match tokio::task::block_in_place(|| guided_model(&bundle.dir, state.downstream(&req.model), state.ordinal_of(&req.model))) {
                 Ok(Some(g)) => return speech_on_guided(g, mux, req, t_arrive, ids, in_flight, report, report_rx.take(), run).await,
                 Ok(None) => {}
                 Err(e) => return server_error(format!("speech pipeline: {e}")),
             }
-            match tokio::task::block_in_place(|| speech_model(&bundle.dir, state.downstream(&req.model))) {
+            match tokio::task::block_in_place(|| speech_model(&bundle.dir, state.downstream(&req.model), state.ordinal_of(&req.model))) {
                 Ok(Some(m)) => m,
                 Ok(None) => return bad(format!("model '{}' declares no speech pipeline", req.model), "model"),
                 Err(e) => return server_error(format!("speech pipeline: {e}")),
@@ -514,6 +541,7 @@ async fn speech_with(
         session: ids.session.as_ref().and_then(|_| ids.ticket(crate::serve::session::row_keys(&first.prompt_ids, &[], &[]), report)),
         turn: ids.turn_key.clone(),
         continuing: run.continuing(),
+        prefix: None,
     };
     let job = crate::serve::mux::Job { prompt_ids: first.prompt_ids, gen: first.gen, arrived: Instant::now(), respond: tx, opts };
     if let Err(err) = mux.submit_arrived(job, t_arrive, Some(mux.ingress())) {
@@ -715,7 +743,7 @@ impl Later {
             s.gen.seed = Some(s.gen.seed.unwrap_or(self.seed ^ k as u64) ^ ((attempt as u64) << 48));
         }
         let (tx, rx) = stream_mod::channel();
-        let opts = crate::serve::mux::JobOpts { class: self.class, raw_tokens: true, speech: None, session: None, turn: None, continuing: false };
+        let opts = crate::serve::mux::JobOpts { class: self.class, raw_tokens: true, speech: None, session: None, turn: None, continuing: false, prefix: None };
         let job = crate::serve::mux::Job { prompt_ids: s.prompt_ids, gen: s.gen, arrived: Instant::now(), respond: tx, opts };
         self.mux.submit(job).map(|()| rx).map_err(|e| match e {
             crate::serve::mux::SubmitError::Full(_) => "model request queue full".to_string(),

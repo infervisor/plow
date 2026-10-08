@@ -419,6 +419,9 @@ enum Stop {
     /// Stop at the next tick top and flush what each slot produced. The
     /// control-plane unload path.
     Now,
+    /// Let live slots finish for up to this long, then stop the rest: a DP rank's unload, whose
+    /// new requests already route to its siblings.
+    Bounded(Duration),
 }
 
 /// What one control-plane unload did.
@@ -642,6 +645,11 @@ impl ModelManager {
     /// Every registered slug, in registration order.
     pub fn slugs(&self) -> Vec<String> {
         self.models.read().iter().map(|m| m.slug.clone()).collect()
+    }
+
+    /// The device this manager's engines and their sibling packets run on.
+    pub fn ordinal(&self) -> u8 {
+        self.be.device_ordinal
     }
 
     /// The device ordinals this manager's group covers. One today (a manager
@@ -982,13 +990,25 @@ impl ModelManager {
         self.unload_and_deregister(slug, false).await
     }
 
+    /// Unload a DP rank: in-flight work drains for up to `bound` (new work already routes to the
+    /// other ranks), then the rest is stopped.
+    pub async fn unload_rank(&self, key: &str, bound: Duration) -> std::result::Result<UnloadReport, EnsureError> {
+        let _g = self.switch.lock().await;
+        self.unload_locked(key, Stop::Bounded(bound)).await
+    }
+
     pub async fn unload_and_deregister(
         &self,
         slug: &str,
         deregister: bool,
     ) -> std::result::Result<UnloadReport, EnsureError> {
+        if deregister && self.state()?.dp_rank(slug).is_some() {
+            return Err(EnsureError::Load(RuntimeError::Rejected(format!(
+                "{slug} is a DP rank; deregister its model instead"
+            ))));
+        }
         let _g = self.switch.lock().await;
-        let report = self.unload_locked(slug).await?;
+        let report = self.unload_locked(slug, Stop::Now).await?;
         if deregister {
             let state = self.state()?;
             let _ = state.registry.unload(slug);
@@ -999,7 +1019,7 @@ impl ModelManager {
         Ok(report)
     }
 
-    async fn unload_locked(&self, slug: &str) -> std::result::Result<UnloadReport, EnsureError> {
+    async fn unload_locked(&self, slug: &str, stop: Stop) -> std::result::Result<UnloadReport, EnsureError> {
         if !self.manages(slug) {
             return Err(EnsureError::Load(RuntimeError::UnknownModel(slug.into())));
         }
@@ -1010,7 +1030,7 @@ impl ModelManager {
         state.set_residency(slug, crate::serve::Residency::Unloading);
 
         let (free_before, _) = self.be.mem_info().map_err(EnsureError::Load)?;
-        let (stop_ms, unload_ms) = self.evict(slug, Stop::Now).await?;
+        let (stop_ms, unload_ms) = self.evict(slug, stop).await?;
         let pool_trimmed = VmmOps::pool_trim(&*self.be, 0);
         let (free_after, _) = self.be.mem_info().map_err(EnsureError::Load)?;
 
@@ -1172,6 +1192,12 @@ impl ModelManager {
                 // `max_tokens`. Live generations stop at the next tick top and
                 // close with what they produced.
                 Stop::Now => mux.preempt().await,
+                Stop::Bounded(bound) => {
+                    if tokio::time::timeout(bound, mux.drain()).await.is_err() {
+                        tracing::info!(%slug, bound_ms = bound.as_millis() as u64, "rank drain bound passed — preempting");
+                        mux.preempt().await;
+                    }
+                }
                 Stop::Graceful => match drain_timeout_ms() {
                     None => mux.drain().await,
                     Some(ms) => {
@@ -1205,12 +1231,13 @@ impl ModelManager {
             .await
             .map_err(EnsureError::Load)?;
         let engine_ms = ms(t1);
-        if let Ok(bundle) = state.registry.get(slug) {
-            crate::asr::serving::release(&bundle.dir);
-            crate::tts::serving::release(&bundle.dir);
+        if let Ok(bundle) = state.registry.get(state.model_of(slug)) {
+            let device = self.ordinal();
+            crate::asr::serving::release(&bundle.dir, device);
+            crate::tts::serving::release(&bundle.dir, device);
             // Their worker threads drop the packet runtimes once the last request lets go.
             let deadline = Instant::now() + SIDECAR_RELEASE_WAIT;
-            while crate::exec::gpu::packet_exec::resident_in(&bundle.dir) {
+            while crate::exec::gpu::packet_exec::resident_in(&bundle.dir, device) {
                 if Instant::now() > deadline {
                     tracing::error!(%slug, "sibling packets still resident after evict — VRAM leak");
                     break;
@@ -1228,7 +1255,7 @@ impl ModelManager {
     /// spawn its dispatcher. Calibrates the overhead cache on first load.
     async fn load_model(&self, m: &Managed) -> std::result::Result<(), EnsureError> {
         let state = self.state()?;
-        let bundle = state.registry.get(&m.slug).map_err(EnsureError::Load)?;
+        let bundle = state.registry.get(state.model_of(&m.slug)).map_err(EnsureError::Load)?;
         if bundle.tokenizer().is_byte_fallback() {
             return Err(EnsureError::Load(RuntimeError::Msg(format!(
                 "{}: GPU engine requires a real tokenizer.json in {}",

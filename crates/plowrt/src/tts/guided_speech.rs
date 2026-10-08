@@ -595,7 +595,7 @@ impl GuidedSpeech {
     /// Bind the packet's prompt tables and start the render thread. `credit` is the serving
     /// model's downstream credit: the vocoder's backlog gates the model's admission, and a render
     /// holding a first chunk holds its ticks.
-    pub fn start(assets: &Path, credit: Arc<DownstreamCredit>) -> Result<Self> {
+    pub fn start(assets: &Path, credit: Arc<DownstreamCredit>, device: u8) -> Result<Self> {
         let c = GuidedLmContract::load(assets)?
             .ok_or_else(|| RuntimeError::Rejected(format!("{} declares no guided LM pipeline", assets.display())))?;
         let tables = PromptTables::load(assets, c.hidden)?;
@@ -607,7 +607,7 @@ impl GuidedSpeech {
         std::thread::Builder::new()
             .name("plow-tts-render".into())
             .spawn(move || {
-                let mut vocoder = match Codec::load_packet(&vocoder_path) {
+                let mut vocoder = match Codec::load_packet_on(&vocoder_path, device) {
                     Ok(v) => v,
                     Err(e) => return drop(s_ready_tx.send(Err(RuntimeError::Device(e)))),
                 };
@@ -682,6 +682,7 @@ impl GuidedSpeech {
                     // Streams only: a whole reply's first audio needs every token.
                     first_tokens: if class == JobClass::Critical { self.first_tokens } else { 0 },
                 })),
+                prefix: None,
             },
         })
     }

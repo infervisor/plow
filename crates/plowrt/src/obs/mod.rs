@@ -59,6 +59,10 @@ pub struct Metrics {
     pub slots_active: AtomicU64,
     /// Admissions the KV budget held back (memory, not slots).
     pub kv_budget_denials: AtomicU64,
+    /// Engine slots the dispatcher can seat (set once at spawn); the DP router's load divisor.
+    pub slots_capacity: AtomicU64,
+    /// Admitted sequences' reserved KV rows over the KV budget, ×1000 (0 without a budget).
+    pub kv_used_milli: AtomicU64,
 }
 
 impl Metrics {

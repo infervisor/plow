@@ -3377,30 +3377,13 @@ async fn bringup_runtime(
                 )?;
                 specs.push(ModelSpec {
                     slug: slug.clone(),
+                    model: slug.clone(),
                     tp: plowrt::serve::manager::tp_degree(dir)?,
                     required: plan.tensor_total()
                         + plowrt::serve::manager::DEFAULT_OVERHEAD
                         + plowrt::serve::manager::RESERVE,
                     device: None,
                 });
-            }
-
-            // `--pin slug@ordinal`. A pin naming a model this server does not
-            // serve is an error: it is almost always a typo, and honouring the
-            // rest of the pins while dropping that one places a model somewhere
-            // the operator did not ask for.
-            for (slug, ordinal) in placement::parse_pins(&RuntimeConfig::get().pin)
-                .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?
-            {
-                match specs.iter_mut().find(|s| s.slug == slug) {
-                    Some(spec) => spec.device = Some(ordinal),
-                    None => {
-                        return Err(format!(
-                            "--pin {slug}@{ordinal} names a model this server does not serve"
-                        )
-                        .into())
-                    }
-                }
             }
 
             // Visible ordinals.
@@ -3490,8 +3473,96 @@ async fn bringup_runtime(
                 }
             }
             let groups = groups;
+
+            // `--dp`: expand each model into its data-parallel ranks before placement, so the
+            // anti-affinity sees every rank. Rank r of `slug` is the instance `slug#r`.
+            let dp = placement::parse_dp(&RuntimeConfig::get().dp)
+                .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+            if let Some(m) = dp.named().find(|m| !specs.iter().any(|s| s.slug == *m)) {
+                return Err(format!("--dp {m}=… names a model this server does not serve on the GPU").into());
+            }
+            let mut dp_models: Vec<(String, usize)> = Vec::new();
+            let mut ranked_specs = Vec::with_capacity(specs.len());
+            let mut ranked_models = Vec::with_capacity(models.len());
+            for (spec, (_, dir, ckpt)) in specs.into_iter().zip(models) {
+                let n = dp.ranks(&spec.slug, groups.len());
+                if n == 1 {
+                    ranked_models.push((spec.slug.clone(), dir, ckpt));
+                    ranked_specs.push(spec);
+                    continue;
+                }
+                if spec.tp > 1 {
+                    return Err(format!("{}: --dp {n} over a TP{} bundle is not supported", spec.slug, spec.tp).into());
+                }
+                if n > plowrt::serve::dp::MAX_DP {
+                    return Err(format!("{}: --dp {n} exceeds {} ranks", spec.slug, plowrt::serve::dp::MAX_DP).into());
+                }
+                for r in 0..n {
+                    let key = plowrt::serve::dp::rank_key(&spec.slug, r);
+                    ranked_models.push((key.clone(), dir.clone(), ckpt.clone()));
+                    ranked_specs.push(ModelSpec { slug: key, ..spec.clone() });
+                }
+                dp_models.push((spec.slug, n));
+            }
+            let (mut specs, models) = (ranked_specs, ranked_models);
+
+            // `--pin slug@ordinal`. A pin naming a model this server does not
+            // serve is an error: it is almost always a typo, and honouring the
+            // rest of the pins while dropping that one places a model somewhere
+            // the operator did not ask for. A DP model's pins go to its ranks
+            // in order (`--pin m@2,m@5` places rank 0 on 2 and rank 1 on 5).
+            for (slug, ordinal) in placement::parse_pins(&RuntimeConfig::get().pin)
+                .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?
+            {
+                let unpinned = specs.iter().position(|s| (s.slug == slug || s.model == slug) && s.device.is_none());
+                match unpinned.or_else(|| specs.iter().position(|s| s.slug == slug)) {
+                    Some(i) => specs[i].device = Some(ordinal),
+                    None => {
+                        return Err(format!(
+                            "--pin {slug}@{ordinal} names a model this server does not serve"
+                        )
+                        .into())
+                    }
+                }
+            }
+            let specs = specs;
             let layout = placement::assign(&specs, &groups, policy)
                 .map_err(|e| -> Box<dyn std::error::Error> { e.to_string().into() })?;
+
+            if !dp_models.is_empty() {
+                use plowrt::serve::dp::{rank_key, DpRouter, DpSet, RouteCfg};
+                let mut router = DpRouter::new(RouteCfg::from_config());
+                for (model, n) in &dp_models {
+                    let ranks: Vec<_> = (0..*n)
+                        .map(|r| {
+                            let key = rank_key(model, r);
+                            let i = specs.iter().position(|s| s.slug == key).expect("expanded above");
+                            let g = layout.assignment[i];
+                            (layout.groups[g].first(), g, state.model_metrics(&key))
+                        })
+                        .collect();
+                    let mut set = DpSet::new(model, ranks);
+                    for r in &mut set.ranks {
+                        let be = backends.iter().find(|(d, _)| *d == r.ordinal).map(|(_, b)| b);
+                        if let Some((node, _, cpus)) = be
+                            .and_then(|b| b.pci_bdf())
+                            .and_then(|bdf| plowrt::exec::engine_affinity::socket_cpus_of_pci(std::path::Path::new("/sys"), &bdf.to_ascii_lowercase()))
+                        {
+                            tracing::info!(key = %r.key, device = r.ordinal, numa_node = node, cpus = cpus.len(), "dp: rank dispatcher placed on its GPU's socket");
+                            r.cpus = cpus;
+                        }
+                    }
+                    tracing::info!(
+                        %model,
+                        dp = n,
+                        devices = ?set.ranks.iter().map(|r| r.ordinal).collect::<Vec<_>>(),
+                        cfg = ?router.cfg,
+                        "dp: ranks placed"
+                    );
+                    router.add(set);
+                }
+                state.install_dp(router);
+            }
 
             // One manager per group that received a model. A group's manager
             // owns that group's backend, free-VRAM view, slab pool, LRU order
@@ -3538,14 +3609,32 @@ async fn bringup_runtime(
             state.install_device_turns(layout.groups.len(), true);
             // Load each group's initial residents. Sequential: the loads are
             // H2D-bound and share host bandwidth, so overlapping them buys
-            // little while making a failure harder to attribute.
-            for mgr in &managers {
-                mgr.load_initial().await?;
+            // little while making a failure harder to attribute. DP ranks are
+            // N copies of one checkpoint on N cards: those overlap, a few at a time.
+            if state.dp().is_some() {
+                use futures::{StreamExt, TryStreamExt};
+                // The first group alone: its load-time GEMM selections are then reused by every
+                // later rank (`device::cuda::lt`), so ranks run identical kernels.
+                if let Some(first) = managers.first() {
+                    first.load_initial().await?;
+                }
+                futures::stream::iter(managers.iter().skip(1).map(|m| m.load_initial()))
+                    .buffer_unordered(DP_PARALLEL_LOADS)
+                    .try_collect::<Vec<()>>()
+                    .await?;
+            } else {
+                for mgr in &managers {
+                    mgr.load_initial().await?;
+                }
             }
         }
     }
     #[cfg(not(feature = "cuda"))]
     let managed_slugs: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let dp_spec = plowrt::serve::placement::parse_dp(&RuntimeConfig::get().dp)?;
+    if managed_slugs.is_empty() && (dp_spec.ranks("", 2) > 1 || dp_spec.named().next().is_some()) {
+        return Err("--dp needs the CUDA serve with model bundles under the GPU manager".into());
+    }
 
     // AMD/gfx950 engines. Deliberately NOT under the S1 `ModelManager`: that is
     // the multi-model residency planner (VRAM planning, co-residency, evict-LRU)
@@ -3815,6 +3904,8 @@ async fn bench(
     Ok(())
 }
 
+/// DP rank loads in flight at once at startup (H2D of one checkpoint onto several cards).
+const DP_PARALLEL_LOADS: usize = 4;
 const MAX_TOKEN_AUDIT_REQUESTS: usize = 64;
 const MAX_TOKEN_AUDIT_IDS: usize = 65_536;
 
@@ -4266,7 +4357,7 @@ async fn drain_for_shutdown(state: &Arc<AppState>) {
     let deadline = std::time::Duration::from_millis(
         plowrt::config::RuntimeConfig::get().drain_timeout_ms().unwrap_or(30_000),
     );
-    let muxes: Vec<_> = state.registry.slugs().iter().filter_map(|s| state.mux(s)).collect();
+    let muxes = state.all_muxes();
     let started = tokio::time::Instant::now();
     futures::future::join_all(muxes.into_iter().map(|mux| async move {
         if tokio::time::timeout(deadline, mux.drain()).await.is_err() {

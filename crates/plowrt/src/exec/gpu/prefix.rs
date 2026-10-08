@@ -685,11 +685,12 @@ impl GpuEngine {
     /// Consult the prefix cache for slot `b`'s prompt and attach a published
     /// prefix: multi-map the shared full-layer blocks, restore the sliding
     /// windows and private partial block, then advance the prefill frontier.
-    pub(super) fn vmm_attach(&mut self, b: usize, prompt: &[u32]) -> Result<()> {
+    pub(super) fn vmm_attach(&mut self, b: usize, prompt: &[u32], key: Option<crate::memory::vmm::PrefixKey>) -> Result<()> {
+        let staged = self.staged_prefix[b].take();
         let Some((_, kv)) = self.vmm_prefix() else {
             return Ok(());
         };
-        let att = kv.try_attach(b, prompt)?;
+        let att = kv.try_attach_keyed(b, prompt, key.or(staged))?;
         let attached = att.is_some();
         let att_rows = att.as_ref().map(|a| a.rows).unwrap_or(0);
         tracing::info!(slot = b, prompt = prompt.len(), attached, att_rows, "vmm_attach query");
@@ -763,8 +764,18 @@ impl GpuEngine {
     /// ring and full scales, and sets `pos[b]` to the matched rows. Returns
     /// the new position (`> 0` on attach, `0` on miss).
     pub fn attach_prompt(&mut self, b: usize, prompt: &[u32]) -> Result<usize> {
+        self.attach_prompt_keyed(b, prompt, None)
+    }
+
+    /// Stage `key` for slot `b`'s next attach inside [`Self::prefill_chunk`]; `None` clears it.
+    pub fn stage_prefix_key(&mut self, b: usize, key: Option<crate::memory::vmm::PrefixKey>) {
+        self.staged_prefix[b] = key;
+    }
+
+    /// [`Self::attach_prompt`] with the prompt's block hashes already computed.
+    pub fn attach_prompt_keyed(&mut self, b: usize, prompt: &[u32], key: Option<crate::memory::vmm::PrefixKey>) -> Result<usize> {
         if self.pos[b] == 0 && self.vmm_prefix_enabled() {
-            self.vmm_attach(b, prompt)?;
+            self.vmm_attach(b, prompt, key)?;
         }
         Ok(self.pos[b] as usize)
     }

@@ -446,6 +446,30 @@ pub struct RuntimeConfig {
     #[arg(long = "pin", env = "PLOW_PIN", value_delimiter = ',', global = true)]
     pub pin: Vec<String>,
 
+    /// Data-parallel ranks per model on one serve (CUDA, TP1 bundles): `--dp 8`, `--dp all`
+    /// (one per device group), or per model `--dp gemma=4,asr=2`. Each rank is a full copy on its
+    /// own device group; requests route by session, prefix cache and load. Unset = 1.
+    #[arg(long = "dp", env = "PLOW_DP", value_delimiter = ',', global = true)]
+    pub dp: Vec<String>,
+
+    /// DP routing: send a prompt to the rank whose prefix cache already holds it.
+    #[arg(long = "route-prefix", env = "PLOW_ROUTE_PREFIX", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub route_prefix: bool,
+
+    /// DP routing: queued requests past which a session or prefix match stops pinning a rank.
+    /// Unset = max(4, slots / 4).
+    #[arg(long = "route-spill", env = "PLOW_ROUTE_SPILL", global = true)]
+    pub route_spill: Option<u32>,
+
+    /// DP routing: load a prefix match may carry over the least-loaded rank, as a multiple of
+    /// the fraction of the prompt it saves.
+    #[arg(long = "route-prefix-slack", env = "PLOW_ROUTE_PREFIX_SLACK", default_value_t = 0.5, value_parser = clap::value_parser!(f64), global = true)]
+    pub route_prefix_slack: f64,
+
+    /// Pin each DP rank's dispatcher thread to the CPU socket of its GPU.
+    #[arg(long = "dp-numa-pin", env = "PLOW_DP_NUMA_PIN", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub dp_numa_pin: bool,
+
     /// Expert: how co-resident models take a shared GPU: `free` (private streams), `rr`
     /// (round-robin turns) or `deadline` (turns by urgency, see `serve::cosched`). Unset =
     /// derived from the objective and backend (`serve::policy::co_sched`).

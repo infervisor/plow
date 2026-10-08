@@ -2566,6 +2566,8 @@ pub struct GpuEngine {
     /// GENERATED blocks into the prefix cache, so a follow-up turn embedding
     /// this turn's output attaches instead of re-prefilling it.
     seq_tokens: Vec<Vec<u32>>,
+    /// A prompt's prefix-cache key staged for the next attach of that slot (DP router hashes).
+    staged_prefix: Vec<Option<crate::memory::vmm::PrefixKey>>,
     /// Stop-token set (the checkpoint's `eos_token_id`). `Arc` so the mux can
     /// take a per-tick handle without cloning the Vec while the engine stays
     /// mutably borrowed.
@@ -6570,6 +6572,7 @@ impl GpuEngine {
             kv_admission_epoch: 0,
             kv_pressure_events: 0,
             seq_tokens: vec![Vec::new(); batch],
+            staged_prefix: vec![None; batch],
             stop_ids: std::sync::Arc::new(stop_ids),
             logits_raw: Vec::new(),
             stage,
@@ -7099,6 +7102,7 @@ impl GpuEngine {
     }
 
     pub fn retire_slot(&mut self, b: usize, cache_output: bool) {
+        self.staged_prefix[b] = None;
         if let Some(p) = self.pipe.as_mut() {
             if p.queue.defer_retire(b, cache_output) {
                 return;
@@ -7138,6 +7142,7 @@ impl GpuEngine {
     }
 
     fn reset_packed_admission(&mut self, b: usize) {
+        self.staged_prefix[b] = None;
         if self.packed_admission[b] == PackedAdmission::Ready {
             self.kv_admission_epoch = self.kv_admission_epoch.wrapping_add(1);
         }
@@ -9998,7 +10003,7 @@ impl GpuEngine {
         // VMM: first chunk of a fresh sequence consults the prefix cache —
         // a hit shares the whole-block prefix and moves the frontier there.
         if self.pos[b] == 0 && self.vmm_prefix_enabled() {
-            self.vmm_attach(b, prompt)?;
+            self.vmm_attach(b, prompt, None)?;
         }
         let c0 = self.pos[b] as usize;
         debug_assert!(c0 < n, "prefill_chunk past the prompt end");

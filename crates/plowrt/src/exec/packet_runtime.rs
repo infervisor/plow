@@ -100,8 +100,13 @@ pub struct ForwardPacket {
 
 impl ForwardPacket {
     pub fn load(path: &Path, pipeline_name: &str, backend: &str) -> Result<Self> {
+        Self::load_on(path, pipeline_name, backend, 0)
+    }
+
+    /// As [`Self::load`], on CUDA device `device` (other backends ignore it).
+    pub fn load_on(path: &Path, pipeline_name: &str, backend: &str, device: u8) -> Result<Self> {
         let asset = PacketAsset::load(path)?;
-        let mut loaded = load_packet_runtime(path, backend)?;
+        let mut loaded = load_packet_runtime_on(path, backend, device)?;
         let pipeline = asset.bind(pipeline_name, loaded.runtime.as_ref())?;
         if pipeline.driver() != "forward.v1" {
             return Err(RuntimeError::Rejected(format!(
@@ -226,7 +231,12 @@ impl ForwardPacket {
 }
 
 pub fn load_packet_runtime(path: &Path, requested: &str) -> Result<LoadedPacketRuntime> {
-    let _ = path;
+    load_packet_runtime_on(path, requested, 0)
+}
+
+/// As [`load_packet_runtime`], with a CUDA runtime on device `device` (other backends ignore it).
+pub fn load_packet_runtime_on(path: &Path, requested: &str, device: u8) -> Result<LoadedPacketRuntime> {
+    let _ = (path, device);
     if requested == "auto" {
         #[cfg(all(feature = "metal", target_os = "macos"))]
         {
@@ -237,11 +247,11 @@ pub fn load_packet_runtime(path: &Path, requested: &str) -> Result<LoadedPacketR
         }
         #[cfg(all(feature = "cpu", not(all(feature = "metal", target_os = "macos"))))]
         {
-            return load_packet_runtime(path, "cpu");
+            return load_packet_runtime_on(path, "cpu", device);
         }
         #[cfg(all(feature = "cuda", not(feature = "cpu"), not(all(feature = "metal", target_os = "macos"))))]
         {
-            return load_packet_runtime(path, "cuda");
+            return load_packet_runtime_on(path, "cuda", device);
         }
         #[cfg(not(any(feature = "cpu", feature = "cuda", all(feature = "metal", target_os = "macos"))))]
         {
@@ -264,7 +274,7 @@ pub fn load_packet_runtime(path: &Path, requested: &str) -> Result<LoadedPacketR
         #[cfg(feature = "cuda")]
         "cuda" => Ok(LoadedPacketRuntime {
             backend: "cuda",
-            runtime: Box::new(crate::exec::gpu::packet_exec::CudaPacketRuntime::load(path, 0)?),
+            runtime: Box::new(crate::exec::gpu::packet_exec::CudaPacketRuntime::load(path, device)?),
         }),
         #[cfg(all(feature = "metal", target_os = "macos"))]
         "metal" => Ok(LoadedPacketRuntime {

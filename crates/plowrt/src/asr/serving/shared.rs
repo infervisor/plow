@@ -125,13 +125,13 @@ impl Drop for Alive {
 }
 
 impl SharedAsr {
-    fn load(slug: &str, dir: &Path, max_context: usize, batch: usize) -> Result<Self> {
+    fn load(slug: &str, dir: &Path, max_context: usize, batch: usize, device: u8) -> Result<Self> {
         let checkpoint = dir.join("checkpoint");
         let checkpoint = if checkpoint.is_dir() { checkpoint } else { dir.to_path_buf() };
         let prompt = AudioLmPrompt::load(&dir.join("model.pkt"), &checkpoint)?;
         let encoder_path =
             crate::exec::packet_runtime::stage_packet(&dir.join("model.pkt"), "encoder.packet", "encoder.pkt")?;
-        let mut encoder = PacketAudioEncoder::load(&encoder_path, "cuda")?;
+        let mut encoder = PacketAudioEncoder::load_on(&encoder_path, "cuda", device)?;
         let warm = Instant::now();
         encoder.warm()?;
         tracing::info!(ms = warm.elapsed().as_millis() as u64, packed_chunks = encoder.max_packed_chunks(), "asr: encoder graphs warmed");
@@ -351,6 +351,7 @@ impl SharedAsr {
                 turn: opts.ids.as_ref().and_then(|i| i.turn_key.clone()),
                 continuing: false,
                 speech: Some(Box::new(SpeechJob { overlay, overlay_pos, pos_base: None, cfg: None, first_tokens: 0 })),
+                prefix: None,
             },
         };
         // Released once the job is on the channel: the dispatcher drains it, not closes on it.
@@ -442,9 +443,11 @@ fn slice_frames(features: &MelFeatures, a: usize, b: usize) -> MelFeatures {
     MelFeatures { values, frames: b - a }
 }
 
-/// Audio LM front-ends by asset directory, bound on first use (`None`: not an audio LM).
-fn models() -> &'static Mutex<HashMap<PathBuf, Option<Arc<SharedAsr>>>> {
-    static M: OnceLock<Mutex<HashMap<PathBuf, Option<Arc<SharedAsr>>>>> = OnceLock::new();
+type Fronts = Mutex<HashMap<(PathBuf, u8), Option<Arc<SharedAsr>>>>;
+
+/// Audio LM front-ends by asset directory and device, bound on first use (`None`: not an audio LM).
+fn models() -> &'static Fronts {
+    static M: OnceLock<Fronts> = OnceLock::new();
     M.get_or_init(Default::default)
 }
 
@@ -463,8 +466,11 @@ fn is_audio_lm(dir: &Path) -> Result<bool> {
         && dir.join(asset.stage_file("encoder.packet", "encoder.pkt")?).is_file())
 }
 
+/// `slug` is an instance key: the front binds on its engine's device.
 fn shared_asr(state: &AppState, slug: &str, dir: &Path) -> Result<Option<Arc<SharedAsr>>> {
-    if let Some(m) = models().lock().get(dir) {
+    let device = state.ordinal_of(slug);
+    let at = (dir.to_path_buf(), device);
+    if let Some(m) = models().lock().get(&at) {
         return Ok(m.clone());
     }
     let model = if is_audio_lm(dir)? {
@@ -475,13 +481,13 @@ fn shared_asr(state: &AppState, slug: &str, dir: &Path) -> Result<Option<Arc<Sha
                 (e.max_ctx(), e.batch())
             })
             .ok_or_else(|| RuntimeError::Rejected(format!("{slug} has no GPU engine")))?;
-        let m = SharedAsr::load(slug, dir, max_context, batch)?;
-        tracing::info!(%slug, dir = %dir.display(), "asr: audio LM front bound to the serve mux");
+        let m = SharedAsr::load(slug, dir, max_context, batch, device)?;
+        tracing::info!(%slug, device, dir = %dir.display(), "asr: audio LM front bound to the serve mux");
         Some(Arc::new(m))
     } else {
         None
     };
-    models().lock().insert(dir.to_path_buf(), model.clone());
+    models().lock().insert(at, model.clone());
     Ok(model)
 }
 
@@ -496,22 +502,23 @@ pub(super) fn dead_encoders() -> Vec<String> {
         .collect()
 }
 
-/// Whether `slug` is a bound audio LM (preload binds every resident one); never loads.
+/// Whether `slug` is a bound audio LM on any device (preload binds every resident one); never
+/// loads.
 pub(super) fn serves_audio(state: &AppState, slug: &str) -> bool {
     let Ok(bundle) = state.registry.get(slug) else { return false };
-    matches!(models().lock().get(&bundle.dir), Some(Some(_)))
+    models().lock().iter().any(|((dir, _), m)| *dir == bundle.dir && m.is_some())
 }
 
-/// Bind `slug`'s front-end now (a no-op for a model that is not an audio LM or is bound).
+/// Bind instance `slug`'s front-end now (a no-op for a model that is not an audio LM or is bound).
 pub fn bind(state: &AppState, slug: &str) -> Result<()> {
-    let bundle = state.registry.get(slug)?;
+    let bundle = state.registry.get(state.model_of(slug))?;
     shared_asr(state, slug, &bundle.dir).map(drop)
 }
 
-/// Forget `dir`'s front-end: its encoder thread exits, freeing the encoder runtime, once the
-/// encodes already queued finish — a session still holding the front does not keep it.
-pub fn release(dir: &Path) {
-    if let Some(Some(asr)) = models().lock().remove(dir) {
+/// Forget `dir`'s front-end on `device`: its encoder thread exits, freeing the encoder runtime,
+/// once the encodes already queued finish — a session still holding the front does not keep it.
+pub fn release(dir: &Path, device: u8) {
+    if let Some(Some(asr)) = models().lock().remove(&(dir.to_path_buf(), device)) {
         asr.encode.lock().take();
     }
 }
@@ -529,23 +536,45 @@ pub fn preload(state: &AppState) -> Result<()> {
     Ok(())
 }
 
+/// The front and dispatcher a request (or a realtime session) for `model` runs on. A DP model
+/// picks a rank here, sticky by `session`.
 pub(super) async fn route(
     state: &Arc<AppState>,
     model: &str,
+    session: Option<&str>,
 ) -> std::result::Result<(Route, FinalizationPolicy), Response> {
     let slug = state.registry.resolve(model).unwrap_or_else(|| model.to_owned());
-    let managed = state.manager_for(&slug).is_some_and(|m| m.manages(&slug));
+    let dp = state.dp_set(&slug).cloned();
+    let managed = dp.is_some() || state.manager_for(&slug).is_some_and(|m| m.manages(&slug));
     // A managed model's front binds with its engine and leaves with it: an eviction between the
     // residency check and the lookup sends the request around again.
     let mut attempts = 0;
-    let (mux, bundle, bound, ingress) = loop {
-        if managed {
-            if let Err(e) = state.manager_for(&slug).expect("managed").ensure_resident(&slug).await {
-                return Err(failure(StatusCode::SERVICE_UNAVAILABLE, e));
-            }
-        }
+    let mut exclude = 0u32;
+    let (key, mux, bundle, bound, ingress) = loop {
         attempts += 1;
-        let (Some(mux), Ok(bundle)) = (state.mux(&slug), state.registry.get(&slug)) else {
+        let (key, mux) = match dp.as_deref() {
+            Some(set) => {
+                if let Err(e) = state.dp_admit(set).await {
+                    return Err(failure(StatusCode::SERVICE_UNAVAILABLE, e));
+                }
+                match state.dp_route(set, session, None, exclude) {
+                    Some((rank, mux, _, _)) => {
+                        exclude |= 1 << rank;
+                        (set.ranks[rank].key.clone(), Some(mux))
+                    }
+                    None => (slug.clone(), None),
+                }
+            }
+            None => {
+                if managed {
+                    if let Err(e) = state.manager_for(&slug).expect("managed").ensure_resident(&slug).await {
+                        return Err(failure(StatusCode::SERVICE_UNAVAILABLE, e));
+                    }
+                }
+                (slug.clone(), state.mux(&slug))
+            }
+        };
+        let (Some(mux), Ok(bundle)) = (mux, state.registry.get(&slug)) else {
             if managed && attempts < 3 {
                 continue;
             }
@@ -554,16 +583,17 @@ pub(super) async fn route(
         // Counted before the residency re-check: an eviction that removes the mux after this
         // point drains with the request counted, so the request's submission is served.
         let ingress = mux.ingress_owned();
-        let bound = models().lock().get(&bundle.dir).cloned().filter(|_| state.mux(&slug).is_some());
+        let at = (bundle.dir.clone(), state.ordinal_of(&key));
+        let bound = models().lock().get(&at).cloned().filter(|_| state.mux(&key).is_some());
         match bound {
             None if managed && attempts < 3 => continue,
             None if managed => return Err(failure(StatusCode::SERVICE_UNAVAILABLE, "ASR front is switching; retry")),
-            bound => break (mux, bundle, bound, ingress),
+            bound => break (key, mux, bundle, bound, ingress),
         }
     };
     let bound = match bound {
         Some(bound) => Ok(bound),
-        None => tokio::task::block_in_place(|| shared_asr(state, &slug, &bundle.dir)),
+        None => tokio::task::block_in_place(|| shared_asr(state, &key, &bundle.dir)),
     };
     match bound {
         Ok(Some(asr)) => {

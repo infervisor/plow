@@ -1838,6 +1838,12 @@ impl VmmKv {
     }
 
     pub fn try_attach(&self, seq: usize, prompt: &[u32]) -> Result<Option<Attach>> {
+        self.try_attach_keyed(seq, prompt, None)
+    }
+
+    /// [`Self::try_attach`] with the prompt's block hashes already computed (by the DP router);
+    /// a key for another block size or prompt is ignored and the prompt hashed here.
+    pub fn try_attach_keyed(&self, seq: usize, prompt: &[u32], key: Option<PrefixKey>) -> Result<Option<Attach>> {
         if !self.prefix_reuse {
             return Ok(None);
         }
@@ -1851,7 +1857,10 @@ impl VmmKv {
             return try_attach_fine(&mut inner, seq, prompt);
         }
         note_lead(&mut inner, seq, prompt);
-        let hashes = hash_blocks(prompt, s.block_rows);
+        let hashes = match key {
+            Some(k) if k.fits(s.block_rows, prompt) => k.hashes,
+            _ => hash_blocks(prompt, s.block_rows),
+        };
         let aligned = &prompt[..hashes.len() * s.block_rows as usize];
 
         let m = inner.cache.lookup(&hashes, aligned);
@@ -2534,21 +2543,75 @@ impl PrefixProbe {
         cached_rows(&self.0, prompt)
     }
 
+    /// [`Self::cached_rows`] reusing `key` when it was hashed for this block size and prompt.
+    pub fn cached_rows_keyed(&self, prompt: &[u32], key: Option<&PrefixKey>) -> u32 {
+        match key {
+            Some(k) if k.fits(self.0.block_rows, prompt) => rows_for(&self.0, &self.0.inner.lock(), prompt, &k.hashes),
+            _ => cached_rows(&self.0, prompt),
+        }
+    }
+
+    /// `prompt`'s block hashes, computed with no lock held.
+    pub fn key(&self, prompt: &[u32]) -> PrefixKey {
+        PrefixKey::new(prompt, self.0.block_rows)
+    }
+
+    /// Leading prompt rows whose blocks this cache holds (whole blocks; an upper bound on what an
+    /// attach restores, without walking its snapshots), or `None` when the cache lock is held: a
+    /// router must not wait on an engine.
+    pub fn try_matched_rows(&self, key: &PrefixKey, prompt: &[u32]) -> Option<u32> {
+        if !key.fits(self.0.block_rows, prompt) {
+            return Some(0);
+        }
+        let inner = self.0.inner.try_lock()?;
+        if inner.fine_rows > 0 && (prompt.len() as u64) < u64::from(inner.fine_ceiling) {
+            return Some(0);
+        }
+        let aligned = &prompt[..key.hashes.len() * self.0.block_rows as usize];
+        Some(inner.cache.matched_blocks(&key.hashes, aligned) as u32 * self.0.block_rows)
+    }
+
     pub fn block_rows(&self) -> u32 {
         self.0.block_rows
+    }
+}
+
+/// A prompt's chained block hashes ([`hash_blocks`]), computed once and reused by every probe
+/// and the attach that follows.
+#[derive(Clone, Debug, Default)]
+pub struct PrefixKey {
+    block_rows: u32,
+    prompt_len: usize,
+    pub hashes: Vec<BlockHash>,
+}
+
+impl PrefixKey {
+    pub fn new(prompt: &[u32], block_rows: u32) -> Self {
+        PrefixKey { block_rows, prompt_len: prompt.len(), hashes: hash_blocks(prompt, block_rows) }
+    }
+
+    pub fn block_rows(&self) -> u32 {
+        self.block_rows
+    }
+
+    fn fits(&self, block_rows: u32, prompt: &[u32]) -> bool {
+        self.block_rows == block_rows && self.prompt_len == prompt.len()
     }
 }
 
 /// [`VmmKv::try_attach`]'s choice (the longest snapshot boundary on the matched block path),
 /// without its side effects.
 fn cached_rows(s: &Shared, prompt: &[u32]) -> u32 {
-    let inner = s.inner.lock();
+    let hashes = hash_blocks(prompt, s.block_rows);
+    rows_for(s, &s.inner.lock(), prompt, &hashes)
+}
+
+fn rows_for(s: &Shared, inner: &Inner, prompt: &[u32], hashes: &[BlockHash]) -> u32 {
     if inner.fine_rows > 0 && (prompt.len() as u64) < u64::from(inner.fine_ceiling) {
         return 0;
     }
-    let hashes = hash_blocks(prompt, s.block_rows);
     let aligned = &prompt[..hashes.len() * s.block_rows as usize];
-    let placed = inner.cache.peek(&hashes, aligned);
+    let placed = inner.cache.peek(hashes, aligned);
     let mut best = 0;
     for blocks in 0..=placed.len() {
         let node = blocks.checked_sub(1).map(|i| placed[i]);
@@ -5009,6 +5072,116 @@ mod tests {
         let a = p.try_attach(1, &pr).unwrap().expect("published boundary");
         assert_eq!(a.rows, 16);
         assert_eq!(a.snap_bytes, 4);
+    }
+
+    /// DP router cost at dp=8: block hashing, route without the probe, route with it (hashing
+    /// included). One rank holds half the prompt, so every rank is probed. Run with
+    /// `cargo test --release -p plowrt --features cuda --lib dp_route_microbench -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn dp_route_microbench() {
+        use crate::serve::dp::{DpSet, RouteCfg};
+        fn pct(mut v: Vec<u64>) -> (u64, u64) {
+            v.sort_unstable();
+            (v[v.len() / 2], v[v.len() * 99 / 100])
+        }
+        let max_ctx = 32 * 1024 + 256;
+        let pools: Vec<VmmKv> = (0..8)
+            .map(|_| {
+                let ops = Arc::new(MockVmm::default());
+                ops.granularity.store(64 << 10, Ordering::SeqCst);
+                let geo = VmmGeometry {
+                    full_layers: vec![0, 1],
+                    kvh_full: 1,
+                    hd_full: 256,
+                    slide_layers: vec![],
+                    kvh_slide: 1,
+                    hd_slide: 256,
+                    window: 0,
+                    elem: 2,
+                    elem_slide: 2,
+                    max_ctx,
+                    batch: 2,
+                };
+                VmmKv::new(ops, geo, 64 << 10, 0).expect("pool")
+            })
+            .collect();
+        let br = pools[0].block_rows();
+        let set = DpSet::new("m", (0..8).map(|r| (r, r as usize, Arc::new(crate::obs::Metrics::default()))).collect());
+        for (r, p) in pools.iter().enumerate() {
+            set.ranks[r].metrics.slots_capacity.store(16, Ordering::Relaxed);
+            set.ranks[r].set_up(true);
+            set.set_probe(r, p.prefix_probe());
+        }
+        println!("block_rows {br}");
+        println!("{:>6} {:>16} {:>16} {:>16} {:>18}", "prompt", "hash p50/p99", "route p50/p99", "+probe p50/p99", "probe-hash p50/p99");
+        for len in [1024usize, 8192, 32768] {
+            let mut prompt: Vec<u32> = (0..len as u32).map(|i| (i ^ len as u32).wrapping_mul(2654435761) % 150_000).collect();
+            let half = (len / 2) as u32 / br * br;
+            pools[3].ensure_rows(0, half + 1).unwrap();
+            assert!(pools[3].try_attach(0, &prompt[..half as usize + 1]).unwrap().is_none());
+            pools[3].publish_at(0, &prompt, half, 4, |_| Ok(())).unwrap();
+            let cfg = RouteCfg::default();
+            let n = 2000;
+            let time = |f: &mut dyn FnMut()| -> Vec<u64> {
+                (0..n)
+                    .map(|_| {
+                        let t = std::time::Instant::now();
+                        f();
+                        t.elapsed().as_nanos() as u64
+                    })
+                    .collect()
+            };
+            let hash = time(&mut || {
+                std::hint::black_box(PrefixKey::new(std::hint::black_box(&prompt), br));
+            });
+            let plain = time(&mut || {
+                std::hint::black_box(set.route(&cfg, None, None, 0));
+            });
+            let mut hit = 0;
+            // A fresh last token per request: no routed prompt's tail matches, so every request
+            // walks the tail chain to its limit and then probes all eight caches (the worst case).
+            let mut fresh = 0u32;
+            let probed = time(&mut || {
+                fresh += 1;
+                *prompt.last_mut().unwrap() = 200_000 + fresh;
+                let r = set.route(&cfg, None, Some(&prompt), 0).unwrap();
+                hit += usize::from(r.rank == 3);
+            });
+            assert_eq!(hit, n, "the rank holding the prefix wins");
+            let net: Vec<u64> = probed.iter().zip(&hash).map(|(p, h)| p.saturating_sub(*h)).collect();
+            let (h, p, q, d) = (pct(hash), pct(plain), pct(probed), pct(net));
+            println!("{len:>6} {:>7}/{:<8} {:>7}/{:<8} {:>7}/{:<8} {:>8}/{:<9}", h.0, h.1, p.0, p.1, q.0, q.1, d.0, d.1);
+            pools[3].begin_seq(0);
+        }
+        println!("probes {} contended {}", set.stats.probes.load(Ordering::Relaxed), set.stats.probe_contended.load(Ordering::Relaxed));
+    }
+
+    /// The DP router's keyed probe answers what `cached_rows` answers, never trusts a key hashed
+    /// for another prompt, and gives up instead of waiting on a held cache lock.
+    #[test]
+    fn keyed_probes_match_cached_rows_and_skip_a_held_lock() {
+        let ops = Arc::new(MockVmm::default());
+        let p = uniform_pool(ops.clone());
+        let pr = prompt(17);
+        assert!(p.try_attach(0, &pr).unwrap().is_none());
+        p.ensure_rows(0, 17).unwrap();
+        p.publish(0, &pr, 4, |_va| Ok(())).unwrap();
+        let probe = p.prefix_probe().expect("prefix reuse");
+        let key = probe.key(&pr);
+        assert_eq!(p.cached_rows(&pr), 16);
+        assert_eq!(probe.try_matched_rows(&key, &pr), Some(16));
+        assert_eq!(probe.cached_rows_keyed(&pr, Some(&key)), 16);
+        let wrong = probe.key(&prompt(18));
+        assert_eq!(probe.cached_rows_keyed(&pr, Some(&wrong)), 16);
+        assert_eq!(probe.try_matched_rows(&wrong, &pr), Some(0));
+        {
+            let _held = p.shared.inner.lock();
+            assert_eq!(probe.try_matched_rows(&key, &pr), None);
+        }
+        p.ensure_rows(1, 1).unwrap();
+        let a = p.try_attach_keyed(1, &pr, Some(key)).unwrap().expect("keyed attach");
+        assert_eq!(a.rows, 16);
     }
 
     /// `enable_shared_publish`: a lead seen on one sequence only never snapshots; the
