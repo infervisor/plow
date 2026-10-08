@@ -1,0 +1,102 @@
+# Experimental: Gemma-4-26B-A4B-it FP8 (hub compressed-tensors W8 per-channel / A8 dynamic per-token,
+# re-keyed by scripts/gemma4_fp8_hub_rekey.py), FP8 per-token-head KV, 16K context, 128 decode slots,
+# prefix cache on, one H100 SXM5 -- the 26B FP8 serving baseline for the strict cells. The 12B FP8
+# production stack (packed staged 4096-row prefill, FP8 cuBLASLt prefill projections, generated hd256
+# FP8-KV sliding prefill) on the 26B W8A8 grouped MoE.
+schema = "plow.recipe.v1"
+namespace = "infervisor"
+name = "gemma-4-26b-a4b"
+label = "sm90a-h100-tp1-fp8-16k-c128"
+status = "emits"
+network = "gemma4"
+
+[target]
+vendor = "nvidia"
+isa = "sm_90a"
+sku = "H100 SXM5"
+units = 132
+num_gpus = 1
+parallel = "tp"
+max_ctx = 16384
+toolchain = "cuda-12.9"
+
+[checkpoint]
+source = "gemma-4-26b-a4b-it-fp8"
+layout = "plow-fp8-hub-rekey"
+
+[cell]
+name = "gemma4-26b-a4b.h100.fp8-16k-c128"
+model = "gemma-4-26b-a4b-it-fp8 (compressed-tensors, re-keyed)"
+revision = "local"
+hf_dir = "{env:PLOW_FP8_CKPT}"
+gpu = "H100 SXM5"
+arch = "sm_90a"
+n_cu = 132
+max_ctx = 16384
+precision = "w8a8"
+
+[emit]
+args = ["--segmented"]
+[emit.env]
+PLOW_FP8 = "1"
+PLOW_W8A8 = "1"
+PLOW_FP8_KV = "1"
+PLOW_EMIT_PACKED_PREFILL = "1"
+PLOW_SEG_PURE_GEMM = "fp8"
+PLOW_SEG_FA512 = "1"
+PLOW_SEG_FA256_GQA2 = "1"
+PLOW_TMA_GEMM = "1"
+PLOW_MAX_CHUNK = "4096"
+PLOW_MAX_REQUEST_CHUNK = "4096"
+PLOW_SLIDING_NS_CAP = "1"
+PLOW_SLIDING_NS_GRID = "1"
+PLOW_ATTENTION_DECODE_BALANCE_GF = "4"
+PLOW_FA_MMAQK = "3"
+PLOW_DECODE_BATCH_LADDER = "1,2,4,8,16,32"
+PLOW_EMIT_PREFILL_CUBLASLT = "1"
+PLOW_PF_LADDER_APPEND = "256,1088,1152,2112,4160,4224"
+PLOW_FUSE_ARGMAX = "0"
+PLOW_GEMMA_MOE_ROUTER_EXACT = "0"
+
+[objects]
+script = "scripts/build_sm90a_gemma4_segments.sh"
+role_files = ["gen_sm90a_attn_pf_hd256_sliding_fp8kv.cubin"]
+[objects.env]
+PLOW_BUILD_FATLITE = "1"
+PLOW_BUILD_W8A8 = "1"
+PLOW_BUILD_FP8KV_GEMM = "1"
+PLOW_BUILD_FA_GQA2_PAIR = "0"
+PLOW_BUILD_PFATTN_HD256_BKV32 = "0"
+PLOW_BUILD_PFATTN_HD256_GQA2_BKV32 = "0"
+PLOW_BUILD_PFATTN_HD512_PX4_BQ64 = "0"
+PLOW_BUILD_GEN_KERNELS = "attn_pf_hd256_sliding_fp8kv"
+
+[emit_roles.env]
+PLOW_GEMMA4_SM90_W8A8_GEMM_GLU_ROLE = "0"
+PLOW_GEMMA4_SM90_HD512_PX4_BQ64_ROLE = "0"
+PLOW_GEMMA4_SM90_HD256_GQA2_ROLE = "0"
+PLOW_EMIT_GEN_KERNELS = "attn_pf_hd256_sliding_fp8kv"
+
+[serve.env]
+PLOW_PREFIX_CACHE = "1"
+PLOW_VMM_PREFIX = "1"
+PLOW_PF_SEG_PURE = "fp8"
+PLOW_PF_SEG_FA512 = "1"
+PLOW_PF_INTERLEAVE = "0"
+PLOW_VMM_LIVE_RINGS = "0"
+PLOW_MULTISTEP = "0"
+PLOW_DECODE_MAX_RUNG = "32"
+PLOW_TOKEN_BATCH = "1"
+PLOW_LT_FP8_FAST_ACCUM_MAX_K = "8192"
+
+[bench]
+backend = "openai"
+in_lens = "128 1024 4096"
+concs = "1"
+nprompt = 32
+outlen = 128
+warmups = 2
+seed = 42
+tokenizer = "{env:PLOW_FP8_CKPT}"
+model_id = "checkpoint"
+gate_prompt = "<bos><|turn>user\nWhat is the capital of France? Answer in one short sentence.<turn|>\n<|turn>model\n<|channel>thought\n<channel|>"
