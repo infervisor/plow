@@ -522,9 +522,9 @@ fn prefix_share_layout(model: &CpuModel, batch: usize) -> (Vec<(usize, u32, u32,
 
 /// Rows of `slot`'s next token-batch chunk when `waiting` `(slot, rows left, prepared seq)`
 /// share `cap` rows. Shortest remaining prompt first, each whole, so a burst still finishes its
-/// prompts one launch at a time; the oldest prompt always keeps `cap / 4`, so a long prompt
-/// is never starved, and takes whatever the short ones leave. Chunk cuts are free: packed
-/// prefill is chunking-invariant.
+/// prompts one launch at a time; the oldest prompt keeps at least `cap / 4` wherever it falls
+/// in that order, so a long prompt is never starved. Chunk cuts are free: packed prefill is
+/// chunking-invariant.
 fn token_batch_share(waiting: &mut [(usize, u32, u64)], slot: usize, cap: u32) -> u32 {
     const GRAIN: u32 = 32;
     let Some(&(oldest, r_old, _)) = waiting.iter().min_by_key(|w| w.2) else {
@@ -533,15 +533,21 @@ fn token_batch_share(waiting: &mut [(usize, u32, u64)], slot: usize, cap: u32) -
     let floor = r_old.min((cap / 4 / GRAIN * GRAIN).max(GRAIN)).min(cap);
     let mut left = cap - floor;
     waiting.sort_unstable_by_key(|w| (w.1, w.2));
-    let mut own = None;
-    for &(s, r, _) in waiting.iter().filter(|w| w.0 != oldest) {
-        let take = if r <= left { r } else { left / GRAIN * GRAIN };
+    for &(s, r, _) in waiting.iter() {
+        let take = if s == oldest {
+            left += floor;
+            r.min(left)
+        } else if r <= left {
+            r
+        } else {
+            left / GRAIN * GRAIN
+        };
         left -= take;
         if s == slot {
-            own = Some(take);
+            return take;
         }
     }
-    own.unwrap_or_else(|| if slot == oldest { r_old.min(floor + left) } else { 0 })
+    0
 }
 
 impl SeqEngine for CpuServe {
@@ -865,6 +871,12 @@ mod tests {
         let s = shares(&w, 1024);
         assert!(s[0] >= 256);
         assert_eq!(s.iter().sum::<u32>(), 1024);
+    }
+
+    #[test]
+    fn an_oldest_prompt_that_is_also_shortest_goes_first() {
+        // E4B 16K: an 11,985-token prompt and a 15,803-token one a second later.
+        assert_eq!(shares(&[(0, 11_985, 0), (1, 15_803, 1)], 2016), vec![2016, 0]);
     }
 
     #[test]
