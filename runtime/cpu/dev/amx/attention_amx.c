@@ -6,6 +6,7 @@
  * Every score and output element is one row's dot product in a fixed order, so a row's result
  * does not depend on the other rows of its tile, and blocks sit at absolute key positions:
  * packed and chunked prefill stay invariant as on the AVX-512 kernel. */
+#include <stdlib.h>
 #include <string.h>
 #include "cpu_dev_internal.h"
 #include "../avx512/avx512.h"
@@ -24,7 +25,20 @@ _Static_assert(XA_BK % 32u == 0u && XA_BK <= 64u, "key blocks are whole TDP K st
 #define XA_VP_OFF (XA_KT_OFF + XA_BK * 512u * 2u)
 #define XA_S_OFF (XA_VP_OFF + XA_BK * 512u * 2u)
 #define XA_P_OFF (XA_S_OFF + XA_BQ * XA_BK * 4u)
-#define XA_SCRATCH (XA_P_OFF + XA_BQ * XA_BK * 2u)
+#define XA_PL_OFF (XA_P_OFF + XA_BQ * XA_BK * 2u)
+#define XA_SCRATCH (XA_PL_OFF + XA_BQ * XA_BK * 2u)
+
+/* PLOW_CPU_AMX_ATTN_SPLIT_P=1: P stays f32-accurate through the bf16 PV as P = hi + lo (both
+ * bf16, two TDPBF16PS per key step) and l sums the unrounded P, as the AVX-512 decode kernel
+ * does. Off: P = bf16(exp(s - m)), the MFMA operand round shared with the AVX-512 prefill. */
+static int xa_split_p(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char* e = getenv("PLOW_CPU_AMX_ATTN_SPLIT_P");
+        on = e && *e == '1';
+    }
+    return on;
+}
 
 /* K^T tile (key tile t, K step k) = [16 d pairs][16 keys] u32: B of S = Q K^T. */
 static void xa_build_kt(uint8_t* kt, const plow_bf16* kbase, const uint32_t* row, uint32_t D) {
@@ -90,6 +104,8 @@ static void x_flash_prefill(const PlowDevInst* in, uint32_t slice, uint32_t nblk
     uint8_t* const vp = sc + XA_VP_OFF;
     float* const s = (float*)(sc + XA_S_OFF);
     plow_bf16* const p = (plow_bf16*)(sc + XA_P_OFF);
+    plow_bf16* const plo = (plow_bf16*)(sc + XA_PL_OFF);
+    const int split = xa_split_p();
     float m[XA_BQ], l[XA_BQ];
     float corr[XA_BQ] __attribute__((aligned(64)));
     uint32_t jlo[XA_BQ], jhi[XA_BQ], row[XA_BK];
@@ -187,9 +203,11 @@ static void x_flash_prefill(const PlowDevInst* in, uint32_t slice, uint32_t nblk
              * the rounded values; rows without keys here keep corr 1 and P 0. */
             for (uint32_t r = qt_lo * 16u; r < qt_hi * 16u; r++) {
                 plow_bf16* pr = p + (size_t)r * XA_BK;
+                plow_bf16* plr = plo + (size_t)r * XA_BK;
                 corr[r] = 1.0f;
                 if (r >= n_rows || jlo[r] >= jhi[r]) {
                     memset(pr, 0, XA_BK * sizeof(plow_bf16));
+                    if (split) memset(plr, 0, XA_BK * sizeof(plow_bf16));
                     continue;
                 }
                 float* sr = s + (size_t)r * XA_BK;
@@ -208,10 +226,17 @@ static void x_flash_prefill(const PlowDevInst* in, uint32_t slice, uint32_t nblk
                 const __m512 mv = _mm512_set1_ps(mnew);
                 __m512 ls = _mm512_setzero_ps();
                 for (uint32_t c = 0; c < XA_BK; c += 32u) {
-                    const __m512 p0 = v_round_bf16(_mm512_maskz_mov_ps((__mmask16)(vb >> c), v_expf(_mm512_sub_ps(_mm512_load_ps(sr + c), mv))));
-                    const __m512 p1 = v_round_bf16(
-                        _mm512_maskz_mov_ps((__mmask16)(vb >> (c + 16u)), v_expf(_mm512_sub_ps(_mm512_load_ps(sr + c + 16u), mv))));
-                    ls = _mm512_add_ps(ls, _mm512_add_ps(p0, p1));
+                    const __m512 f0 = _mm512_maskz_mov_ps((__mmask16)(vb >> c), v_expf(_mm512_sub_ps(_mm512_load_ps(sr + c), mv)));
+                    const __m512 f1 =
+                        _mm512_maskz_mov_ps((__mmask16)(vb >> (c + 16u)), v_expf(_mm512_sub_ps(_mm512_load_ps(sr + c + 16u), mv)));
+                    const __m512 p0 = v_round_bf16(f0), p1 = v_round_bf16(f1);
+                    if (split) {
+                        ls = _mm512_add_ps(ls, _mm512_add_ps(f0, f1));
+                        _mm512_store_si512((void*)(plr + c),
+                                           (__m512i)_mm512_cvtne2ps_pbh(_mm512_sub_ps(f1, p1), _mm512_sub_ps(f0, p0)));
+                    } else {
+                        ls = _mm512_add_ps(ls, _mm512_add_ps(p0, p1));
+                    }
                     _mm512_store_si512((void*)(pr + c), (__m512i)_mm512_cvtne2ps_pbh(p1, p0));
                 }
                 m[r] = mnew;
@@ -230,6 +255,7 @@ static void x_flash_prefill(const PlowDevInst* in, uint32_t slice, uint32_t nblk
             for (uint32_t qa = qt_lo; qa < qt_hi; qa += 2u) {
                 const int two = qa + 1u < qt_hi;
                 const plow_bf16* p0 = p + (size_t)qa * 16u * XA_BK;
+                const plow_bf16* pl0 = plo + (size_t)qa * 16u * XA_BK;
                 for (uint32_t dt = 0; dt < D / 16u; dt += 2u) {
                     float* a0 = acc + (size_t)qa * 16u * D + dt * 16u;
                     _tile_loadd(0, a0, D * 4);
@@ -248,6 +274,16 @@ static void x_flash_prefill(const PlowDevInst* in, uint32_t slice, uint32_t nblk
                             _tile_loadd(5, p0 + 16u * XA_BK + ks * 32u, XA_BK * 2);
                             _tile_dpbf16ps(2, 5, 6);
                             _tile_dpbf16ps(3, 5, 7);
+                        }
+                        if (split) {
+                            _tile_loadd(4, pl0 + ks * 32u, XA_BK * 2);
+                            _tile_dpbf16ps(0, 4, 6);
+                            _tile_dpbf16ps(1, 4, 7);
+                            if (two) {
+                                _tile_loadd(5, pl0 + 16u * XA_BK + ks * 32u, XA_BK * 2);
+                                _tile_dpbf16ps(2, 5, 6);
+                                _tile_dpbf16ps(3, 5, 7);
+                            }
                         }
                     }
                     _tile_stored(0, a0, D * 4);

@@ -1318,6 +1318,7 @@ pub const EMIT: &[KnobSpec] = &[
 pub const RAW_ENV: &[KnobSpec] = &[
     KnobSpec::new("env.PLOW_AMX_DEBUG", Some("PLOW_AMX_DEBUG"), Layer::RawEnv, Domain::Str, UNSET, DIAG),
     KnobSpec::new("env.PLOW_CPU_AMX_ATTN", Some("PLOW_CPU_AMX_ATTN"), Layer::RawEnv, Domain::Bool, ON, OPT_IN),
+    KnobSpec::new("env.PLOW_CPU_AMX_ATTN_SPLIT_P", Some("PLOW_CPU_AMX_ATTN_SPLIT_P"), Layer::RawEnv, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("env.PLOW_BENCH_SHAPE", Some("PLOW_BENCH_SHAPE"), Layer::RawEnv, Domain::Str, UNSET, DIAG),
     KnobSpec::new("env.PLOW_GEMV_MFMA4", Some("PLOW_GEMV_MFMA4"), Layer::RawEnv, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("env.PLOW_GATE_HIER_PF", Some("PLOW_GATE_HIER_PF"), Layer::RawEnv, Domain::Bool, OFF, OPT_IN),

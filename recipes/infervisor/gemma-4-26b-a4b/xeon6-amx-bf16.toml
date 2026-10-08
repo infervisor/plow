@@ -57,9 +57,10 @@ PLOW_DENSE_PF_NS_MIN = "2"
 
 [serve.env]
 PLOW_CPU_WEIGHT_AFFINE = "1"
-# AMX FLASH_PREFILL fails this model's FP32 gate (kl_mean 0.118-0.128 vs threshold 0.112; the
-# AVX-512 kernel 0.095) at equal f64-measured attention accuracy: router near-ties flip.
-PLOW_CPU_AMX_ATTN = "0"
+# TMUL FLASH_PREFILL with P kept f32-accurate through PV (hi + lo bf16): FP32 gate kl_mean 0.0999
+# (threshold 0.1116; bf16-rounded P failed at 0.118-0.128 on router near-ties). 12,288-token
+# prefill 6.26 s on the AVX-512 kernel -> 3.81 s.
+PLOW_CPU_AMX_ATTN_SPLIT_P = "1"
 
 [bench]
 backend = "openai"

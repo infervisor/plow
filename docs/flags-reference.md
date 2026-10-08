@@ -974,6 +974,10 @@ bundle in the first place, in [CPU execution](runtime/cpu.md).
 the TMUL kernel (3.5-6x faster per thread, same f64-measured accuracy). The Gemma-4-26B-A4B Xeon
 recipe sets it: that model's FP32-reference gate fails with the TMUL summation order.
 
+`PLOW_CPU_AMX_ATTN_SPLIT_P=1` (default off) keeps the TMUL `FLASH_PREFILL`'s softmax weights
+f32-accurate through the bf16 PV product (P = hi + lo, two TDPBF16PS per key step; `l` sums the
+unrounded P), instead of rounding P to bf16. Doubles the PV half of the kernel.
+
 The global-queue and L2-place knobs are off because they were *measured* worse, not because they are
 unfinished — neither changes what is computed, so both are safe to flip for an A/B
 on another host.
