@@ -694,7 +694,8 @@ fn kv_row_charge(
 /// `PLOW_PF_ATTN_GEMM` unset: the route's scratch comes out of the KV admission budget (sampled
 /// after load; 1 GiB on Gemma-4-26B, where 133 MiB already cost one 15000-token request at C16),
 /// so it loads only while that budget still admits every live request (`PLOW_DECODE_MAX_RUNG`,
-/// else the batch) at full context.
+/// else the batch) at the context the scratch is sized for (`attention_gemm::scratch_ctx`): no
+/// budget seats every slot at a 262144 context, and longer requests are admission's to queue.
 fn attention_route_fits_kv(
     be: &CudaBackend,
     vmm: Option<&VmmServe>,
@@ -712,7 +713,8 @@ fn attention_route_fits_kv(
     };
     let config = RuntimeConfig::get();
     let live = config.decode_max_rung.map_or(batch, |rung| batch.min(rung as usize)) as u64;
-    let request = (max_ctx as u64).next_multiple_of(block_rows.unwrap_or(1));
+    let request =
+        (attention_gemm::scratch_ctx(max_ctx) as u64).next_multiple_of(block_rows.unwrap_or(1));
     let need = live * (request * per_token + request_bytes);
     let budget = config.kv_admit_budget(free.saturating_sub(scratch), total);
     let fits = budget >= need;
