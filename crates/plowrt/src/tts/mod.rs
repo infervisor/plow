@@ -199,9 +199,33 @@ fn split_piece(text: &str, r: (usize, usize), max: usize, cut: Cut, out: &mut Ve
         return out.push((s, r.1));
     }
     let next = if cut == Cut::Clause { Cut::Word } else { Cut::Char };
+    let mut parts = Vec::new();
     for sub in cuts(text, r, cut) {
-        split_piece(text, sub, max, next, out);
+        split_piece(text, sub, max, next, &mut parts);
     }
+    balance(text, &parts, max, out);
+}
+
+/// `parts` (consecutive, each at most `max` characters) packed into about equal groups of at
+/// most `max`: greedy packing left a sentence's last word or two as a segment of its own, and
+/// Orpheus goes mute on such a fragment ("busy.") whatever the seed.
+fn balance(text: &str, parts: &[(usize, usize)], max: usize, out: &mut Vec<(usize, usize)>) {
+    let (Some(&(s0, _)), Some(&(_, e0))) = (parts.first(), parts.last()) else { return };
+    let total = text[s0..e0].chars().count();
+    let groups = total.div_ceil(max);
+    let target = total.div_ceil(groups);
+    let mut cur: Option<(usize, usize)> = None;
+    for &(s, e) in parts {
+        cur = match cur {
+            Some((cs, ce)) if text[cs..ce].chars().count() >= target || text[cs..e].chars().count() > max => {
+                out.push((cs, ce));
+                Some((s, e))
+            }
+            Some((cs, _)) => Some((cs, e)),
+            None => Some((s, e)),
+        };
+    }
+    out.extend(cur);
 }
 
 /// `r` split after each `cut` boundary, every piece trimmed and non-empty.
@@ -250,8 +274,9 @@ fn cuts(text: &str, r: (usize, usize), cut: Cut) -> Vec<(usize, usize)> {
 /// silence (Orpheus) or run on silent to its budget, so a run of silent blocks past `KEEP_S` is
 /// held back: speech resuming within the segment sends it (a real pause); at a join only enough to
 /// make a `JOIN_PAUSE_S` pause is sent; a run reaching `RUNAWAY_S` ends the segment, and a segment
-/// silent for `RUNAWAY_S` from its start is mute (retried). Silence is held only while the client
-/// has more than `HOLD_LEAD_S` of audio beyond it.
+/// silent for `RUNAWAY_S` from its start is mute (retried). A segment that drones (a sustained hum
+/// or "rrrr" with no syllable modulation for `DRONE_S`) is retried too. Silence is held only while
+/// the client has more than `HOLD_LEAD_S` of audio beyond it.
 pub(crate) struct Joins {
     rate: f64,
     /// Silent samples of the current run sent, and held back.
@@ -260,8 +285,14 @@ pub(crate) struct Joins {
     /// The current segment has spoken; the first segment's leading silence is never held.
     speech: bool,
     first: bool,
-    /// Silent samples since the segment started, until it speaks.
+    /// Silent samples since the segment started, until it speaks; and its sounding samples.
     quiet: usize,
+    loud: usize,
+    /// The segment's envelope over the last `DRONE_S` (RMS per `ENV_BLOCKS` blocks), the block
+    /// energy accumulating toward the next point, and whether it has droned.
+    env: std::collections::VecDeque<f32>,
+    acc: (f32, usize),
+    droned: bool,
 }
 
 impl Joins {
@@ -272,9 +303,26 @@ impl Joins {
     const JOIN_PAUSE_S: f64 = 0.5;
     const RUNAWAY_S: f64 = 3.0;
     const HOLD_LEAD_S: f64 = 1.5;
+    /// Envelope points of ~53 ms; a drone is `DRONE_S` of sound whose envelope varies less than
+    /// `DRONE_CV` (std / mean). Orpheus speech windows measure >= 0.36, its "rrrr" drone 0.01-0.02;
+    /// genuine leading silence runs to 2.9 s, so mute detection stays at `RUNAWAY_S`.
+    const ENV_BLOCKS: usize = 5;
+    const DRONE_S: f64 = 2.0;
+    const DRONE_CV: f32 = 0.15;
 
     pub(crate) fn new(sample_rate: u32) -> Self {
-        Joins { rate: f64::from(sample_rate), sent: 0, held: Vec::new(), speech: false, first: true, quiet: 0 }
+        Joins {
+            rate: f64::from(sample_rate),
+            sent: 0,
+            held: Vec::new(),
+            speech: false,
+            first: true,
+            quiet: 0,
+            loud: 0,
+            env: Default::default(),
+            acc: (0.0, 0),
+            droned: false,
+        }
     }
 
     /// The next segment starts: the previous one's held silence is dropped.
@@ -283,14 +331,22 @@ impl Joins {
         self.speech = false;
         self.first = false;
         self.quiet = 0;
+        self.loud = 0;
+        self.env.clear();
+        self.acc = (0.0, 0);
+        self.droned = false;
     }
 
     /// Append to `out` what of `pcm` to send now; `lead_s` is the audio the client has buffered.
     pub(crate) fn push(&mut self, pcm: &[f32], lead_s: f64, out: &mut Vec<f32>) {
-        let samples = |s: f64| (s * self.rate) as usize;
+        let rate = self.rate;
+        let samples = |s: f64| (s * rate) as usize;
         for b in pcm.chunks(Self::BLOCK) {
-            let rms = (b.iter().map(|x| x * x).sum::<f32>() / b.len() as f32).sqrt();
+            let ms = b.iter().map(|x| x * x).sum::<f32>() / b.len() as f32;
+            self.envelope(ms);
+            let rms = ms.sqrt();
             if rms >= Self::SILENCE {
+                self.loud += b.len();
                 let room = if self.speech || self.first { self.held.len() } else { samples(Self::JOIN_PAUSE_S).saturating_sub(self.sent) };
                 out.extend_from_slice(&self.held[self.held.len().saturating_sub(room)..]);
                 self.held.clear();
@@ -312,6 +368,41 @@ impl Joins {
                 out.extend_from_slice(b);
             }
         }
+    }
+
+    fn envelope(&mut self, mean_square: f32) {
+        self.acc = (self.acc.0 + mean_square, self.acc.1 + 1);
+        if self.acc.1 < Self::ENV_BLOCKS {
+            return;
+        }
+        self.env.push_back((self.acc.0 / self.acc.1 as f32).sqrt());
+        self.acc = (0.0, 0);
+        let points = (Self::DRONE_S * self.rate) as usize / (Self::BLOCK * Self::ENV_BLOCKS);
+        while self.env.len() > points {
+            self.env.pop_front();
+        }
+        if self.env.len() == points && self.env.iter().all(|&e| e >= Self::SILENCE) {
+            let mean = self.env.iter().sum::<f32>() / points as f32;
+            let var = self.env.iter().map(|e| (e - mean) * (e - mean)).sum::<f32>() / points as f32;
+            self.droned |= var.sqrt() < Self::DRONE_CV * mean;
+        }
+    }
+
+    /// The current segment has droned for `DRONE_S`.
+    pub(crate) fn drone(&self) -> bool {
+        self.droned
+    }
+
+    /// The current segment, pushed whole, held under a quarter second of sound or droned.
+    pub(crate) fn segment_failed(&self) -> bool {
+        (self.loud as f64) < 0.25 * self.rate || self.droned
+    }
+
+    /// Whether `pcm` (one segment) is mute or drones: generate it again.
+    pub(crate) fn failed(&self, pcm: &[f32]) -> bool {
+        let mut probe = Joins::new(self.rate as u32);
+        probe.push(pcm, f64::INFINITY, &mut Vec::new());
+        !self.speaks(pcm) || probe.drone()
     }
 
     /// The current segment has spoken and then stayed silent for `RUNAWAY_S`.
@@ -474,6 +565,11 @@ mod tests {
         assert_eq!(check_cover(t, 40), ["alpha beta gamma, delta epsilon zeta,", "eta theta iota kappa lambda mu"]);
         let w = check_cover("aaaa bbbb cccc dddd eeee", 10);
         assert_eq!(w, ["aaaa bbbb", "cccc dddd", "eeee"]);
+        // A sentence just over the limit splits in about equal halves, not into a lone tail word.
+        let t = "In fact there is nothing he can do in these dominions as well as our nomes whose numbers are so great that it worries us to keep them all busy.";
+        let h = check_cover(t, 141);
+        assert_eq!(h.len(), 2);
+        assert!(h.iter().all(|s| s.chars().count() >= 60), "{h:?}");
         let x = "x".repeat(25);
         let c = check_cover(&x, 10);
         assert_eq!(c.iter().map(|s| s.len()).collect::<Vec<_>>(), [10, 10, 5]);
@@ -529,6 +625,31 @@ mod tests {
         assert!(!j.mute());
         j.push(&quiet(0.2), f64::INFINITY, &mut out);
         assert!(j.mute() && !j.speaks(&quiet(1.0)) && !j.speaks(&tone(0.1)) && j.speaks(&tone(0.3)));
+    }
+
+    /// A steady drone is a failed segment; speech-like modulation (4 Hz syllables) is not.
+    #[test]
+    fn joins_catch_a_drone_but_not_modulated_sound() {
+        let j = Joins::new(SR);
+        let syllables: Vec<f32> = tone(3.0)
+            .iter()
+            .enumerate()
+            .map(|(i, x)| x * (0.55 + 0.45 * (i as f32 * 4.0 * std::f32::consts::TAU / SR as f32).sin()))
+            .collect();
+        assert!(!j.failed(&syllables));
+        assert!(j.failed(&tone(2.5)));
+        assert!(!j.failed(&tone(1.5)), "shorter than DRONE_S");
+        assert!(j.failed(&quiet(2.0)), "mute");
+        let mut s = Joins::new(SR);
+        s.push(&syllables, f64::INFINITY, &mut Vec::new());
+        assert!(!s.drone());
+        assert!(!s.segment_failed());
+        s.push(&tone(2.2), f64::INFINITY, &mut Vec::new());
+        assert!(s.drone() && s.segment_failed());
+        s.next_segment();
+        assert!(!s.drone() && s.segment_failed(), "nothing pushed yet: no speech");
+        s.push(&quiet(1.0), f64::INFINITY, &mut Vec::new());
+        assert!(s.segment_failed());
     }
 
     #[test]

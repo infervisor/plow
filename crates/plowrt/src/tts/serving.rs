@@ -483,25 +483,23 @@ async fn speech_with(
     };
     // Past the cap the reference budget clips the audio: a longer input is spoken in order as
     // sentence-sized segments, each with its full budget.
-    let segs: Vec<Segment> = super::segments(&req.input, c.segment_chars())
-        .into_iter()
-        .enumerate()
-        .map(|(k, text)| {
-            let mut prompt_ids = c.prefix.clone();
-            prompt_ids.extend(tok.encode_with_special_tokens(&c.prompt_text(&voice, text), false));
-            prompt_ids.extend_from_slice(&c.suffix);
-            let mut gen = crate::serve::GenParams::default();
-            gen.max_tokens = req.max_tokens.unwrap_or_else(|| c.max_new_tokens(text)).min(c.max_new_tokens_cap);
-            gen.params.temperature = req.temperature.unwrap_or(c.temperature);
-            gen.params.top_p = req.top_p.unwrap_or(c.top_p);
-            gen.params.repetition_penalty = req.repetition_penalty.unwrap_or(1.0);
-            gen.seed = req.seed.map(|s| s.wrapping_add(k as u64));
-            gen.stop_token_ids = c.stops.clone();
-            Segment { prompt_ids, gen, chars: text.chars().count() }
-        })
-        .collect();
+    let maker = SegmentMaker {
+        tok: Arc::clone(tok),
+        contract: c.clone(),
+        voice: voice.clone(),
+        max_tokens: req.max_tokens,
+        temperature: req.temperature.unwrap_or(c.temperature),
+        top_p: req.top_p.unwrap_or(c.top_p),
+        repetition_penalty: req.repetition_penalty.unwrap_or(1.0),
+        seed: req.seed,
+    };
+    let segs: Vec<Segment> = super::segments(&req.input, c.segment_chars()).into_iter().enumerate().map(|(k, t)| maker.make(k, t)).collect();
 
-    let need = super::realtime::Need { stream: req.stream, chars: segs.iter().map(|s| s.chars).collect() };
+    let need = super::realtime::Need {
+        stream: req.stream,
+        chars: segs.iter().map(|s| s.chars).collect(),
+        budget: segs.iter().map(|s| s.gen.max_tokens / c.frame_codes).collect(),
+    };
     let ticket = match model.realtime.admit(need).await {
         Ok(t) => Arc::new(t),
         Err(retry) => return busy(retry),
@@ -531,7 +529,7 @@ async fn speech_with(
     let seed = req.seed.unwrap_or_else(|| {
         std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(1)
     }) | 1;
-    let later = Later { mux: mux.clone(), segs, class, seed };
+    let mut later = Later { mux: mux.clone(), segs, class, seed, maker };
     let content_type = if wav { "audio/wav" } else { "audio/pcm" };
     if req.stream {
         let (out_tx, out_rx) = tokio::sync::mpsc::channel::<Result<Vec<u8>, std::io::Error>>(64);
@@ -558,8 +556,9 @@ async fn speech_with(
     // Sample offsets where one segment's audio follows another's.
     let (mut joins, mut joiner) = (Vec::new(), super::Joins::new(c.sample_rate));
     let mut rx = Some(rx);
-    for k in 0..later.segs.len() {
-        let mut attempt = 0;
+    let mut k = 0;
+    while k < later.segs.len() {
+        let (mut attempt, mut tries) = (0, 0);
         loop {
             let rx = match rx.take() {
                 Some(rx) => rx,
@@ -578,22 +577,26 @@ async fn speech_with(
             t_lm += if k == 0 && attempt == 0 { t_arrive.elapsed() } else { t0.elapsed() };
             n_tokens += n;
             let f = codes.len() / c.frame_codes;
-            if f == 0 {
-                break;
-            }
-            let p = match decode_all(&model, &codes[..f * c.frame_codes], f, seed ^ segment_salt(k)).await {
-                Ok(p) => p,
-                Err(e) => return server_error(e),
+            let p = if f == 0 {
+                Vec::new()
+            } else {
+                match decode_all(&model, &codes[..f * c.frame_codes], f, seed ^ segment_salt(k)).await {
+                    Ok(p) => p,
+                    Err(e) => return server_error(e),
+                }
             };
             frames += f;
             if later.segs.len() == 1 {
                 pcm = p;
                 break;
             }
-            if !joiner.speaks(&p) && attempt < MUTE_RETRIES {
-                attempt += 1;
-                tracing::warn!(segment = k, attempt, "tts: mute segment; retrying");
-                continue;
+            match later.judge(k, f, f > 0 && joiner.failed(&p), &mut tries) {
+                Verdict::Keep => {}
+                Verdict::Retry => {
+                    attempt += 1;
+                    continue;
+                }
+                Verdict::Fail => return server_error(format!("segment {k} produced no speech")),
             }
             if !pcm.is_empty() {
                 joiner.next_segment();
@@ -602,6 +605,7 @@ async fn speech_with(
             joiner.push(&p, f64::INFINITY, &mut pcm);
             break;
         }
+        k += 1;
     }
     drop(ticket);
     if frames == 0 {
@@ -627,15 +631,48 @@ async fn speech_with(
     response
 }
 
-/// A mute segment (no speech) of a multi-segment request is generated again, with another seed.
-const MUTE_RETRIES: usize = 2;
+/// A mute or droning segment of a multi-segment request is generated again with another seed;
+/// still failing, it is split in two (Orpheus goes mute on some long run-on segments and not on
+/// their halves), down to `SPLIT_MIN_CHARS`; only then does the request fail.
+const MUTE_RETRIES: usize = 1;
+const SPLIT_MIN_CHARS: usize = 40;
 
 /// One segment's LM job.
 #[derive(Clone)]
 struct Segment {
+    text: String,
     prompt_ids: Vec<u32>,
     gen: crate::serve::GenParams,
     chars: usize,
+}
+
+/// Builds a segment's prompt and generation parameters from its text.
+struct SegmentMaker {
+    tok: Arc<dyn crate::text::tokenizer::Tokenize>,
+    contract: SpeechContract,
+    voice: String,
+    max_tokens: Option<usize>,
+    temperature: f32,
+    top_p: f32,
+    repetition_penalty: f32,
+    seed: Option<u64>,
+}
+
+impl SegmentMaker {
+    fn make(&self, k: usize, text: &str) -> Segment {
+        let c = &self.contract;
+        let mut prompt_ids = c.prefix.clone();
+        prompt_ids.extend(self.tok.encode_with_special_tokens(&c.prompt_text(&self.voice, text), false));
+        prompt_ids.extend_from_slice(&c.suffix);
+        let mut gen = crate::serve::GenParams::default();
+        gen.max_tokens = self.max_tokens.unwrap_or_else(|| c.max_new_tokens(text)).min(c.max_new_tokens_cap);
+        gen.params.temperature = self.temperature;
+        gen.params.top_p = self.top_p;
+        gen.params.repetition_penalty = self.repetition_penalty;
+        gen.seed = self.seed.map(|s| s.wrapping_add(k as u64));
+        gen.stop_token_ids = c.stops.clone();
+        Segment { text: text.to_owned(), prompt_ids, gen, chars: text.chars().count() }
+    }
 }
 
 /// The request's segments; each after the first is submitted as the previous one finishes.
@@ -645,9 +682,33 @@ struct Later {
     class: crate::serve::mux::JobClass,
     /// Base of a retry's sampling seed when the request gave none (unseeded sampling repeats).
     seed: u64,
+    maker: SegmentMaker,
 }
 
 impl Later {
+    /// The fate of segment `k`'s attempt with `frames` frames, `failed` (mute or droning) or not;
+    /// `tries` counts the attempts at its current text. A split replaces segment `k` by its
+    /// halves and generates the first.
+    fn judge(&mut self, k: usize, frames: usize, failed: bool, tries: &mut usize) -> Verdict {
+        let v = verdict(frames, failed, *tries);
+        if v == Verdict::Retry {
+            *tries += 1;
+            tracing::warn!(segment = k, tries = *tries, "tts: mute or droning segment; retrying");
+        }
+        if v != Verdict::Fail {
+            return v;
+        }
+        let Some(halves) = split_halves(&self.segs[k].text) else {
+            tracing::warn!(segment = k, chars = self.segs[k].chars, "tts: segment produced no speech; failing the request");
+            return v;
+        };
+        tracing::warn!(segment = k, chars = self.segs[k].chars, "tts: segment still mute; splitting it");
+        let made: Vec<Segment> = halves.iter().map(|t| self.maker.make(k, t)).collect();
+        self.segs.splice(k..=k, made);
+        *tries = 0;
+        Verdict::Retry
+    }
+
     fn submit(&self, k: usize, attempt: usize) -> Result<stream_mod::ChunkReceiver, String> {
         let mut s = self.segs[k].clone();
         if attempt > 0 {
@@ -661,6 +722,16 @@ impl Later {
             crate::serve::mux::SubmitError::Closed(_) => "model dispatcher unavailable".to_string(),
         })
     }
+}
+
+/// `text` as two segments of about half its length, or `None` under `SPLIT_MIN_CHARS`.
+fn split_halves(text: &str) -> Option<Vec<String>> {
+    let n = text.chars().count();
+    if n < SPLIT_MIN_CHARS {
+        return None;
+    }
+    let parts: Vec<String> = super::segments(text, n.div_ceil(2) + n / 8).into_iter().map(str::to_owned).collect();
+    (parts.len() >= 2).then_some(parts)
 }
 
 /// Codec seed salt of segment `k` (0 for the first: a one-segment request decodes as before).
@@ -729,18 +800,51 @@ fn stream_step(n: usize, emitted: usize, done: bool, window: usize, lookahead: u
 
 enum SegMsg {
     Frame(Vec<i32>),
-    /// The current segment generated its last frame.
+    /// The current segment attempt generated its last frame. A multi-segment drain then waits for
+    /// the emitter's verdict on it before it starts anything else.
     End,
-    /// The current segment was mute and generates again: drop its frames.
+    /// The current segment was mute or droned and generates again: drop its frames.
     Retry,
     Err(String),
+}
+
+/// What becomes of a multi-segment request's segment attempt.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Verdict {
+    Keep,
+    Retry,
+    /// Still without speech after `MUTE_RETRIES`: the request fails rather than skip the text.
+    Fail,
+}
+
+fn verdict(frames: usize, failed: bool, attempt: usize) -> Verdict {
+    match (frames > 0 && !failed, attempt < MUTE_RETRIES) {
+        (true, _) => Verdict::Keep,
+        (false, true) => Verdict::Retry,
+        (false, false) => Verdict::Fail,
+    }
+}
+
+/// Identity of a segment attempt: a cut or verdict raised for one never acts on another.
+fn attempt_tag(segment: usize, attempt: usize) -> u64 {
+    ((segment as u64 + 1) << 32) | attempt as u64
+}
+
+/// The emitter's verdict for `tag`, ignoring any other (stale) one; `None` when it is gone.
+async fn verdict_for(rx: &mut tokio::sync::mpsc::UnboundedReceiver<(u64, bool)>, tag: u64) -> Option<bool> {
+    loop {
+        let (t, failed) = rx.recv().await?;
+        if t == tag {
+            return Some(failed);
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
 async fn stream_task(
     model: Arc<SpeechModel>,
     rx: stream_mod::ChunkReceiver,
-    later: Later,
+    mut later: Later,
     ticket: Arc<Ticket>,
     out: tokio::sync::mpsc::Sender<Result<Vec<u8>, std::io::Error>>,
     seed: u64,
@@ -753,17 +857,22 @@ async fn stream_task(
     let (fc, fs) = (c.frame_codes, c.frame_samples);
     let n_segs = later.segs.len();
     let (ftx, mut frx) = tokio::sync::mpsc::unbounded_channel::<SegMsg>();
-    // The LM drain never waits on the codec; the next segment starts as the previous one ends.
+    // The emitter's verdict per segment attempt (multi-segment only), tagged by `attempt_tag`.
+    let (vtx, mut vrx) = tokio::sync::mpsc::unbounded_channel::<(u64, bool)>();
+    // The segment attempt (`attempt_tag`) the emitter cut short; 0: none.
+    let cut = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let lm = Arc::clone(&ticket);
-    // Segments below this index are cut short (run on silent, `Joins::runaway`).
-    let cut = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let mute = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let (lm_cut, lm_mute) = (Arc::clone(&cut), Arc::clone(&mute));
+    let lm_cut = Arc::clone(&cut);
+    // The LM drain never waits on the codec within a segment. Between segments of a multi-segment
+    // stream it waits for the emitter's verdict, so a retry targets the attempt found mute.
     tokio::spawn(async move {
         let drain = async {
             let mut rx = Some(rx);
-            for k in 0..n_segs {
-                let mut attempt = 0;
+            let mut k = 0;
+            while k < later.segs.len() {
+                // `attempt` names each generation of segment `k` (a retry or a split's first
+                // half), `tries` the generations of its current text.
+                let (mut attempt, mut tries) = (0, 0);
                 loop {
                     let mut rx = match rx.take() {
                         Some(rx) => rx,
@@ -772,21 +881,23 @@ async fn stream_task(
                             Err(e) => return drop(ftx.send(SegMsg::Err(e))),
                         },
                     };
+                    let tag = attempt_tag(k, attempt);
                     lm.segment(k);
-                    let mut codes = Vec::new();
+                    let (mut codes, mut frames) = (Vec::new(), 0);
                     loop {
                         match rx.recv().await {
                             Some(StreamChunk::Token { id, .. }) => {
                                 if let Some(code) = c.code_of(codes.len(), id) {
                                     codes.push(code);
                                     if codes.len() % fc == 0 {
+                                        frames += 1;
                                         lm.frame();
                                         if ftx.send(SegMsg::Frame(codes[codes.len() - fc..].to_vec())).is_err() {
                                             return;
                                         }
                                     }
                                 }
-                                if lm_cut.load(SeqCst) > k {
+                                if lm_cut.load(SeqCst) == tag {
                                     break;
                                 }
                             }
@@ -795,46 +906,73 @@ async fn stream_task(
                             None => return,
                         }
                     }
+                    drop(rx);
                     lm.segment_done();
-                    if lm_mute.swap(false, SeqCst) && attempt < MUTE_RETRIES {
-                        attempt += 1;
-                        tracing::warn!(segment = k, attempt, "tts: mute segment; retrying");
-                        lm_cut.store(0, SeqCst);
-                        if ftx.send(SegMsg::Retry).is_err() {
-                            return;
+                    if n_segs == 1 {
+                        if frames == 0 {
+                            return drop(ftx.send(SegMsg::Err("model produced no audio frames".into())));
                         }
-                        continue;
+                        return drop(ftx.send(SegMsg::End));
                     }
                     if ftx.send(SegMsg::End).is_err() {
                         return;
                     }
-                    break;
+                    let Some(failed) = verdict_for(&mut vrx, tag).await else { return };
+                    match later.judge(k, frames, failed, &mut tries) {
+                        Verdict::Keep => break,
+                        Verdict::Retry => {
+                            attempt += 1;
+                            if ftx.send(SegMsg::Retry).is_err() {
+                                return;
+                            }
+                        }
+                        Verdict::Fail => return drop(ftx.send(SegMsg::Err(format!("segment {k} produced no speech")))),
+                    }
                 }
+                k += 1;
             }
         };
         drain.await;
         lm.lm_done();
     });
     let (mut frames, mut emitted, mut first) = (Vec::<i32>::new(), 0usize, None);
-    // Segment index and frames the earlier segments emitted.
-    let (mut seg, mut total, mut joins) = (0usize, 0usize, Vec::new());
+    // Segment and attempt, frames the earlier segments emitted, and whether this attempt's verdict
+    // is out (the next message is a retry, the next segment, or the end).
+    let (mut seg, mut attempt, mut total, mut joins, mut judged) = (0usize, 0usize, 0usize, Vec::new(), false);
     // Samples sent and when the first went out (the client's playback clock).
     let (mut sent, mut playing): (usize, Option<Instant>) = (0, None);
     let mut joiner = super::Joins::new(model.contract.sample_rate);
-    // Dropping the rest of the current segment (cut short or mute).
+    // Dropping the rest of the current attempt (cut short).
     let mut skipping = false;
     let mut first_frame_at: Option<Instant> = None;
     loop {
-        let (mut done, mut closed) = (false, false);
-        match frx.recv().await {
-            None => (done, closed) = (true, true),
+        let mut done = false;
+        let msg = frx.recv().await;
+        if judged {
+            judged = false;
+            match msg {
+                None => break,
+                Some(SegMsg::Retry) => {
+                    (frames, emitted, skipping) = (Vec::new(), 0, false);
+                    attempt += 1;
+                    joiner.next_segment();
+                    continue;
+                }
+                Some(SegMsg::Err(_)) => {}
+                Some(_) => {
+                    total += emitted;
+                    joins.push(sent);
+                    joiner.next_segment();
+                    (frames, emitted, skipping) = (Vec::new(), 0, false);
+                    (seg, attempt) = (seg + 1, 0);
+                }
+            }
+        }
+        match msg {
+            None => done = true,
             Some(SegMsg::End) => done = true,
             Some(SegMsg::Err(e)) => return drop(out.send(Err(std::io::Error::other(e))).await),
-            Some(SegMsg::Retry) => {
-                (frames, emitted, skipping) = (Vec::new(), 0, false);
-                joiner.next_segment();
-                continue;
-            }
+            Some(SegMsg::Retry) => {}
             Some(SegMsg::Frame(f)) => {
                 frames.extend(f);
                 while let Ok(m) = frx.try_recv() {
@@ -844,10 +982,7 @@ async fn stream_task(
                             done = true;
                             break;
                         }
-                        SegMsg::Retry => {
-                            (frames, emitted, skipping) = (Vec::new(), 0, false);
-                            joiner.next_segment();
-                        }
+                        SegMsg::Retry => {}
                         SegMsg::Err(e) => return drop(out.send(Err(std::io::Error::other(e))).await),
                     }
                 }
@@ -902,9 +1037,8 @@ async fn stream_task(
                         let lead = playing.map_or(f64::INFINITY, |t| sent as f64 / sr - t.elapsed().as_secs_f64());
                         let mut v = Vec::with_capacity(fresh.len());
                         joiner.push(fresh, lead, &mut v);
-                        if joiner.runaway() || joiner.mute() {
-                            mute.store(joiner.mute(), SeqCst);
-                            cut.store(seg + 1, SeqCst);
+                        if joiner.runaway() || joiner.mute() || joiner.drone() {
+                            cut.store(attempt_tag(seg, attempt), SeqCst);
                             skipping = true;
                         }
                         joined = v;
@@ -931,16 +1065,14 @@ async fn stream_task(
             }
         }
         if done {
-            if closed || seg + 1 >= n_segs {
+            if n_segs == 1 {
                 break;
             }
-            total += emitted;
-            joins.push(sent);
-            joiner.next_segment();
-            skipping = false;
-            frames.clear();
-            emitted = 0;
-            seg += 1;
+            // The drain waits on this: keep the attempt, generate it again, or fail the request.
+            if vtx.send((attempt_tag(seg, attempt), joiner.segment_failed())).is_err() {
+                break;
+            }
+            judged = true;
         }
     }
     run.done();
@@ -960,6 +1092,43 @@ mod tests {
 
     const WINDOW: usize = 6;
     const LOOKAHEAD: usize = 2;
+
+    /// A segment attempt without frames or speech is generated again, then fails the request:
+    /// never kept (a silent 200 missing part of the text).
+    #[test]
+    fn a_segment_without_speech_retries_then_fails() {
+        assert_eq!(verdict(40, false, 0), Verdict::Keep);
+        assert_eq!(verdict(0, false, 0), Verdict::Retry);
+        assert_eq!(verdict(40, true, MUTE_RETRIES - 1), Verdict::Retry);
+        assert_eq!(verdict(0, false, MUTE_RETRIES), Verdict::Fail);
+        assert_eq!(verdict(40, true, MUTE_RETRIES), Verdict::Fail);
+        assert_eq!(verdict(40, false, MUTE_RETRIES), Verdict::Keep);
+        let t = "As for etchings they are of two kinds british and foreign, he laments most bitterly the divorce";
+        let h = split_halves(t).unwrap();
+        assert_eq!(h.len(), 2);
+        assert_eq!(h.join(" "), t);
+        assert!(split_halves("Too short to split again.").is_none());
+    }
+
+    /// Cuts and verdicts carry their segment attempt: a stale one (another segment, or an
+    /// earlier attempt of this one) never acts on the current attempt.
+    #[tokio::test(flavor = "current_thread")]
+    async fn segment_signals_act_only_on_their_attempt() {
+        let tags = [attempt_tag(0, 0), attempt_tag(0, 1), attempt_tag(1, 0), attempt_tag(1, 1)];
+        for (i, a) in tags.iter().enumerate() {
+            assert!(*a != 0 && tags.iter().skip(i + 1).all(|b| b != a));
+        }
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        // A verdict for segment 0 arrives while the drain waits on segment 1: ignored.
+        tx.send((attempt_tag(0, 0), true)).unwrap();
+        tx.send((attempt_tag(1, 0), false)).unwrap();
+        assert_eq!(verdict_for(&mut rx, attempt_tag(1, 0)).await, Some(false));
+        tx.send((attempt_tag(1, 0), true)).unwrap();
+        tx.send((attempt_tag(1, 1), true)).unwrap();
+        assert_eq!(verdict_for(&mut rx, attempt_tag(1, 1)).await, Some(true));
+        drop(tx);
+        assert_eq!(verdict_for(&mut rx, attempt_tag(2, 0)).await, None);
+    }
 
     /// A request the guided pipeline cannot take is the client's error, not a server fault.
     #[test]

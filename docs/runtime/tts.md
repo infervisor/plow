@@ -572,11 +572,19 @@ request takes two slots, so the 128-slot rung serves 64 Chatterbox requests; the
 400. A request's token budget is `min(chars x tokens.per_char_frames x 7 + 21, tokens.max_new_cap)`;
 an input past the length where the cap binds (`SpeechContract::segment_chars`: Veena 151, Orpheus
 141 characters) is spoken as segments of at most that length: whole sentences (`. ! ? … । ॥`, line
-breaks) packed greedily, a longer sentence split after clause marks, then between words. Segments
+breaks) packed greedily, a longer sentence split after clause marks, then between words, into
+about equal parts (a lone tail word made Orpheus go mute whatever the seed). Segments
 generate in order with the same voice (seed + k when a seed is given) and stream back to back; a
 whole response is their concatenation. At a join, silence beyond a 0.5 s pause is dropped (Orpheus
 segments often open with 1-2 s of silence), a segment that keeps silent for 3 s after speaking
-ends, and one silent for 3 s from its start is generated again with another seed (twice at most).
+ends, and one silent for 3 s from its start, or droning for 2 s (a hum or "rrrr" whose 53 ms
+envelope varies under 15%; speech measures >= 36%), is generated once more with another seed,
+then split in two (Orpheus goes mute on some long run-on segments, persistently across seeds, and
+not on their halves), down to 40 characters. Genuine Orpheus segments open with up to 2.9 s of
+silence, so mute detection stays at 3 s. A segment still without speech (or without frames) after
+that fails the request (500, or a terminal stream error), never a 200 missing part of the text. A streamed request's LM drain
+waits for the emitter's verdict on each segment attempt before it starts the next; cuts and
+verdicts carry the (segment, attempt) they were raised for.
 A request of one segment is unchanged. `max_tokens` applies per segment.
 
 Profiles (`devgen::tts`): Veena's cap 700 -> 1400 tokens (700 cut 8.3 s, inputs from ~110
@@ -587,12 +595,21 @@ Every codec-LM request shares the model's decode steps, so each one admitted slo
 (L40S, Llama-3.2-3B BF16: 9 ms per token at B=1, 13.8 at B=32 against 85 ms of audio per 7-token
 frame). `tts::realtime` admits a request only while the step projected at one more generating
 request keeps every playing stream ahead of playback: each stream's sent-but-unplayed audio covers
-its remaining frames' deficit (`frames x (7 x step - 85 ms)`, frames from the characters left at
-the learnt frames per character, mean plus two mean deviations) with 0.25 s to spare (0.55 s with a
-segment still to start, for its prefill and first window), and a new stream can bank its own
-deficit by holding its first audio at most 1.5 s. A multi-segment stream also banks its first
-join before its first audio (TTFA ~580 vs ~330 ms alone). The step is a line in the generating
-width fit online from the streams' own frame times. Requests wait in arrival order; past
+its remaining frames' deficit (`frames x (7 x step - 85 ms)`) with 0.25 s to spare (0.55 s with
+a segment still to start, for its prefill and first window), and a new stream can bank its own
+deficit by holding its first audio at most 1.5 s. A segment's frames are projected at the p95
+frames per character of the last 256 finished segments, capped by its budget (at its budget until
+16 have finished; a segment past its projection at its budget): Orpheus runs ~15% of segments to
+the budget (mean 1.23, p90 1.78 of 1.8 frames per character), and mean-based projections let 5-24%
+of its admitted streams underrun in soak. A multi-segment stream also banks its first join before
+its first audio (TTFA ~580 vs ~330 ms alone). The step is fit online from the streams' own
+frame times: a width with 8+ samples predicts its own measured step, an unmeasured one the line
+in the width but never below a narrower measured step. A width past a decode-ladder rung runs on
+the next rung (L40S: 13.8 ms at 32 rows, 18.5 ms at 33-64), which the line missed and which let
+Orpheus streams underrun just past 32 generating requests. Admission grows at most 8 requests
+beyond the widest measured width, so a cold burst admits 8 until the first samples arrive. The
+per-frame bookkeeping is O(1) atomics on the request's own state (a step sample every 4 frames
+takes the lock); with `PLOW_TTS_REALTIME=0` nothing is tracked. Requests wait in arrival order; past
 `PLOW_TTS_ADMIT_WAIT_MS` (6000) a request gets 429 with `Retry-After` (the projected time to the
 next stream finishing). `PLOW_TTS_REALTIME=0` admits everything (the previous behavior).
 
