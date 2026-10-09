@@ -7,7 +7,8 @@
 //! piece adds its partial down sum); attention and the per-layer-input block are never split. The plan is
 //! therefore whole layers, several layers or part of a layer per socket, as the sizes dictate. Every stage gets a
 //! predicted time from the calibrated stage cost (L2 GEMV rate per core, cost per all-core exchange, KV stream
-//! rate), which the single-socket stage measurements check.
+//! rate, and per extra batch row the activation bytes every core gathers), which the single-socket stage
+//! measurements check.
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -39,6 +40,9 @@ pub struct Unit {
     pub window: Option<u64>,
     /// KV-shared layer: the layer whose cache it reads (its stage needs a replica).
     pub kv_source: Option<u32>,
+    /// Activation bytes every core gathers per batch row: fixed, plus per split row.
+    pub act_fixed: u64,
+    pub act_per_row: u64,
 }
 
 impl Unit {
@@ -62,6 +66,8 @@ pub struct Cost {
     pub gemv_gbps_per_core: f64,
     pub exchange_us: f64,
     pub kv_gbps: f64,
+    /// Per-core all-gather rate for the activations of each batch row past the first.
+    pub act_gbps: f64,
     pub hop_us: f64,
 }
 
@@ -81,6 +87,7 @@ pub struct Pred {
     pub gemv_us: f64,
     pub sync_us: f64,
     pub attn_us: f64,
+    pub act_us: f64,
     pub total_us: f64,
 }
 
@@ -158,6 +165,9 @@ pub fn gemma4_units(shapes: &HashMap<String, Vec<i64>>, config: &Value) -> Resul
             kv_row_bytes: 0,
             window: None,
             kv_source: None,
+            // each core reads only its own PLE rows of this output; it travels with the hop, not an all-gather
+            act_fixed: 0,
+            act_per_row: 0,
         });
     }
     for l in 0..n_layers {
@@ -182,6 +192,7 @@ pub fn gemma4_units(shapes: &HashMap<String, Vec<i64>>, config: &Value) -> Resul
             }
         }
         let kv_rows = dim(shapes, &t(&format!("layers.{src}.self_attn.k_proj.weight")), 0)?;
+        let q_rows = dim(shapes, &w("self_attn.q_proj.weight"), 0)?;
         u.push(Unit {
             kind: UnitKind::Attn,
             layer: Some(l),
@@ -192,6 +203,9 @@ pub fn gemma4_units(shapes: &HashMap<String, Vec<i64>>, config: &Value) -> Resul
             kv_row_bytes: 2 * kv_rows * BF16,
             window: if types.get(l as usize) == Some(&"sliding_attention") { window } else { None },
             kv_source: (!own_kv).then_some(src),
+            // q (FP32), attention output (BF16), o (FP32)
+            act_fixed: q_rows * 4 + q_rows * BF16 + hidden * 4,
+            act_per_row: 0,
         });
         let inter = dim(shapes, &w("mlp.gate_proj.weight"), 0)?;
         u.push(Unit {
@@ -204,6 +218,9 @@ pub fn gemma4_units(shapes: &HashMap<String, Vec<i64>>, config: &Value) -> Resul
             kv_row_bytes: 0,
             window: None,
             kv_source: None,
+            // gelu(gate) * up (BF16) per intermediate row, down output (FP32)
+            act_fixed: hidden * 4,
+            act_per_row: BF16,
         });
         if shapes.contains_key(&w("per_layer_input_gate.weight")) {
             let mut b = 0;
@@ -220,6 +237,8 @@ pub fn gemma4_units(shapes: &HashMap<String, Vec<i64>>, config: &Value) -> Resul
                 kv_row_bytes: 0,
                 window: None,
                 kv_source: None,
+                act_fixed: dim(shapes, &w("per_layer_input_gate.weight"), 0)? * BF16 + hidden * 4,
+                act_per_row: 0,
             });
         }
     }
@@ -233,6 +252,9 @@ pub fn gemma4_units(shapes: &HashMap<String, Vec<i64>>, config: &Value) -> Resul
         kv_row_bytes: 0,
         window: None,
         kv_source: None,
+        // logits stay on their stage (top-k reduce); only the normed hidden state arrives
+        act_fixed: hidden * 4,
+        act_per_row: 0,
     });
     Ok(u)
 }
@@ -258,9 +280,11 @@ fn finish(index: usize, pieces: Vec<Piece>, units: &[Unit], b: &Budget, c: &Cost
     let bpc = bytes.div_ceil(b.cores as u64);
     let exchanges: u32 = pieces.iter().map(|p| units[p.unit].exchanges).sum();
     let mut kv = 0;
+    let mut act = 0;
     let mut replicas = Vec::new();
     for p in &pieces {
         let u = &units[p.unit];
+        act += u.act_fixed + u.act_per_row * (if u.rows == 0 { 0 } else { p.row1 - p.row0 });
         let rows = u.window.map_or(b.ctx, |w| w.min(b.ctx));
         kv += u.kv_row_bytes * rows * b.batch as u64;
         if let Some(s) = u.kv_source {
@@ -272,6 +296,7 @@ fn finish(index: usize, pieces: Vec<Piece>, units: &[Unit], b: &Budget, c: &Cost
     let gemv_us = bpc as f64 / (c.gemv_gbps_per_core * 1e3);
     let sync_us = exchanges as f64 * c.exchange_us;
     let attn_us = kv as f64 / (c.kv_gbps * 1e3);
+    let act_us = b.batch.saturating_sub(1) as f64 * act as f64 / (c.act_gbps * 1e3);
     let first = pieces.first().map(label).unwrap_or_default();
     let last = pieces.last().map(label).unwrap_or_default();
     Stage {
@@ -284,7 +309,7 @@ fn finish(index: usize, pieces: Vec<Piece>, units: &[Unit], b: &Budget, c: &Cost
         exchanges,
         kv_bytes_per_step: kv,
         kv_replicas_of: replicas,
-        pred: Pred { gemv_us, sync_us, attn_us, total_us: gemv_us + sync_us + attn_us },
+        pred: Pred { gemv_us, sync_us, attn_us, act_us, total_us: gemv_us + sync_us + attn_us + act_us },
     }
 }
 
@@ -369,7 +394,7 @@ mod tests {
     use super::*;
 
     fn unit(kind: UnitKind, layer: u32, rows: u64, row_bytes: u64, fixed: u64) -> Unit {
-        Unit { kind, layer: Some(layer), rows, row_bytes, fixed_bytes: fixed, exchanges: 2, kv_row_bytes: 0, window: None, kv_source: None }
+        Unit { kind, layer: Some(layer), rows, row_bytes, fixed_bytes: fixed, exchanges: 2, kv_row_bytes: 0, window: None, kv_source: None, act_fixed: 0, act_per_row: 0 }
     }
 
     #[test]
@@ -382,7 +407,7 @@ mod tests {
             unit(UnitKind::Attn, 2, 0, 0, 30),
         ];
         let b = Budget { cores: 2, l2_weight_bytes_per_core: 50, batch: 1, ctx: 1, min_rows_per_core: 1 };
-        let c = Cost { gemv_gbps_per_core: 1.0, exchange_us: 1.0, kv_gbps: 1.0, hop_us: 0.0 };
+        let c = Cost { gemv_gbps_per_core: 1.0, exchange_us: 1.0, kv_gbps: 1.0, act_gbps: 1.0, hop_us: 0.0 };
         let (s, sum) = plan(&u, &b, &c).unwrap();
         assert_eq!(s.len(), 3);
         assert_eq!((s[0].pieces[1].row0, s[0].pieces[1].row1), (0, 4));
@@ -398,7 +423,7 @@ mod tests {
     fn indivisible_unit_larger_than_a_stage_is_an_error() {
         let u = vec![unit(UnitKind::Attn, 0, 0, 0, 300)];
         let b = Budget { cores: 2, l2_weight_bytes_per_core: 100, batch: 1, ctx: 1, min_rows_per_core: 1 };
-        let c = Cost { gemv_gbps_per_core: 1.0, exchange_us: 1.0, kv_gbps: 1.0, hop_us: 0.0 };
+        let c = Cost { gemv_gbps_per_core: 1.0, exchange_us: 1.0, kv_gbps: 1.0, act_gbps: 1.0, hop_us: 0.0 };
         assert!(plan(&u, &b, &c).is_err());
     }
 
@@ -406,7 +431,7 @@ mod tests {
     fn split_pieces_respect_the_row_granularity() {
         let u = vec![unit(UnitKind::Ffn, 0, 1000, 1, 0)];
         let b = Budget { cores: 3, l2_weight_bytes_per_core: 100, batch: 1, ctx: 1, min_rows_per_core: 16 };
-        let c = Cost { gemv_gbps_per_core: 1.0, exchange_us: 1.0, kv_gbps: 1.0, hop_us: 0.0 };
+        let c = Cost { gemv_gbps_per_core: 1.0, exchange_us: 1.0, kv_gbps: 1.0, act_gbps: 1.0, hop_us: 0.0 };
         let (s, _) = plan(&u, &b, &c).unwrap();
         for st in &s[..s.len() - 1] {
             assert_eq!((st.pieces[0].row1 - st.pieces[0].row0) % 16, 0);

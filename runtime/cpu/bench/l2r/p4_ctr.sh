@@ -11,7 +11,7 @@ rm -f "$fifo"; mkfifo "$fifo"
 sudo perf stat -a -A -x, -D -1 --control "fifo:$fifo" -o "$O/$tag.ctr.csv" \
   -e r1f25,uncore_imc/cas_count_read_sch0/,uncore_imc/cas_count_read_sch1/ -- \
   sudo -u "$(id -un)" env L2R_PERF_CTL="$fifo" L2R_BIN="${L2R_BIN:-/tmp/g4c/l2r/l2r_layer}" \
-  L2R_COLD_MIB="${L2R_COLD_MIB:-1536}" bash "$S/p4_run.sh" "$O" "$tag" "$@"
+  L2R_COLD_MIB="${L2R_COLD_MIB:-1536}" P4_STEPS="${P4_STEPS:-}" bash "$S/p4_run.sh" "$O" "$tag" "$@"
 rm -f "$fifo"
 python3 - "$O/$tag" <<'EOF'
 import json, sys

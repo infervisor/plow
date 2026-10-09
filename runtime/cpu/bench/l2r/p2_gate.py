@@ -23,21 +23,23 @@ def gate(err, ref_dir):
     return ok, rows
 
 
-ok_all = True
-for f in sys.argv[1:]:
-    s = json.loads(open(f).read().strip().splitlines()[-1])
-    ok, rows = gate(s["err"], s["ref"])
-    bad_rows = []
-    for i, r in enumerate(s.get("rows", [])):
-        rok, rrows = gate(r["err"], r["dir"])
-        if not rok:
-            bad_rows.append(f"row {i} {r['dir'].split('/')[-1]}: " + " ".join(x for x in rrows if x.endswith("!")))
-        ok &= rok
-    ok_all &= ok
-    st = s["step_us"]
-    print(f"{'PASS' if ok else 'FAIL'} {s['ref'].split('/')[-1]} b{s.get('batch', 1)} {s['gemv']} step p50 {st['p50']:.2f} "
-          f"p99 {st['p99']:.2f} us out cos {s['err']['out'][1]:.8f}")
-    print("   ", " ".join(rows))
-    for b in bad_rows:
-        print("    FAIL", b)
-sys.exit(0 if ok_all else 1)
+
+if __name__ == "__main__":
+    ok_all = True
+    for f in sys.argv[1:]:
+        s = json.loads(open(f).read().strip().splitlines()[-1])
+        ok, rows = gate(s["err"], s["ref"])
+        bad_rows = []
+        for i, r in enumerate(s.get("rows", [])):
+            rok, rrows = gate(r["err"], r["dir"])
+            if not rok:
+                bad_rows.append(f"row {i} {r['dir'].split('/')[-1]}: " + " ".join(x for x in rrows if x.endswith("!")))
+            ok &= rok
+        ok_all &= ok
+        st = s["step_us"]
+        print(f"{'PASS' if ok else 'FAIL'} {s['ref'].split('/')[-1]} b{s.get('batch', 1)} {s['gemv']} step p50 {st['p50']:.2f} "
+              f"p99 {st['p99']:.2f} us out cos {s['err']['out'][1]:.8f}")
+        print("   ", " ".join(rows))
+        for b in bad_rows:
+            print("    FAIL", b)
+    sys.exit(0 if ok_all else 1)

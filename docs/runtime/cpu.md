@@ -79,7 +79,8 @@ never split. The result can be whole layers, several layers or part of a layer p
 lists the stage that needs a replica of its source layer's cache.
 
 Every stage gets a predicted time: resident bytes per core / `--gemv-gbps`, plus exchanges x `--exchange-us`,
-plus KV bytes at `--batch` x `--ctx` / `--kv-gbps`. The defaults are the single-socket stage measurements
+plus KV bytes at `--batch` x `--ctx` / `--kv-gbps`, plus (`--batch` - 1) x the activation bytes every core
+gathers per row / `--act-gbps`. The defaults are the single-socket stage measurements
 (`docs/bringup/results/xeon6-l2r-bf16-20261008/`). Output is `stage_plan.json` (units, stages, summary) plus one
 line per stage.
 
