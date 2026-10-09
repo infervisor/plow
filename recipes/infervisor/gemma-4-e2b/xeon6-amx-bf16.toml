@@ -11,9 +11,9 @@
 # measurement (all arms): kernel.numa_balancing=0, a zero-latency CPU QoS request held
 # (/dev/cpu_dma_latency, as tuned latency-performance does), THP madvise, no pseudo-lock held (PLOW_CPU_SRAM off).
 #
-# Qualified (2026-10-08, plowrt 59a36e3d, packet 4fea6d8c3932):
+# Qualified (2026-10-09, plowrt 53581658 with PLOW_CPU_COMBINE=16, packet 4fea6d8c3932):
 # campaign.py report MATCHED + EQUIVALENT vs vLLM 0.30 CPU at 1000/128 c1/c8/c32; FP32-reference gate PASS,
-# KL mean 0.0004 vs vLLM 0.0005. Throughput 1.36-3.24x, TTFT P99 0.53-0.82x, TPOT P99 0.29-0.73x, memory 0.27-0.34x (wins every row).
+# KL mean 0.0004 vs vLLM 0.0005. Throughput 1.46-3.67x, TTFT P99 0.52-0.81x, TPOT P99 0.25-0.68x, memory 0.27-0.34x (wins every row).
 # docs/bringup/results/gemma4-xeon6-bf16-20261006/comparison.md.
 #
 # 16K agentic serving (same plowrt, packet 42aadb1b2d38): this recipe's emit/serve env with --max-ctx 16384,
@@ -60,6 +60,8 @@ PLOW_MAX_CHUNK = "2048"
 
 [serve.env]
 PLOW_CPU_WEIGHT_AFFINE = "1"
+# combining-tree completion counters, 16 executors per group (docs/runtime/cpu.md; P5 grid: c1 TPOT -7..-10%)
+PLOW_CPU_COMBINE = "16"
 
 [bench]
 backend = "openai"

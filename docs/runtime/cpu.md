@@ -67,6 +67,26 @@ Emit-time choices the CPU loader constrains:
 | `--batch` / `--seq` | the compiled prefill buckets and decode rungs; a bundle with no grouped-prefill program prefills one token at a time |
 | MXFP4 | `--gpu` must be a target that permits it at emit; the twin is supplied at run time with `--cpu-mxfp4-dir` |
 
+### Pipeline stage plan
+
+`plowc --hf-dir <ckpt> stage-plan` splits a checkpoint into weight-stationary pipeline stages: one socket per
+stage, every weight L2-resident, tokens streamed through the stages. It packs the BF16 weights in execution order
+into stages of `--cores` x `--l2-weight-kib` (`auto` = the lockable L2 per core that `/dev/pseudo_lock` reports).
+The units are the per-layer-input projection, then per layer attention, FFN and the per-layer-input block, then
+the tied LM head. FFN and head units split by output rows, in multiples of `--min-rows-per-core` x `--cores`.
+An FFN piece is a slice of the intermediate dimension, so the next piece adds its partial down sum. Attention is
+never split. The result can be whole layers, several layers or part of a layer per stage. A KV-shared layer
+lists the stage that needs a replica of its source layer's cache.
+
+Every stage gets a predicted time: resident bytes per core / `--gemv-gbps`, plus exchanges x `--exchange-us`,
+plus KV bytes at `--batch` x `--ctx` / `--kv-gbps`. The defaults are the single-socket stage measurements
+(`docs/bringup/results/xeon6-l2r-bf16-20261008/`). Output is `stage_plan.json` (units, stages, summary) plus one
+line per stage.
+
+```sh
+plowc --hf-dir "$CKPT" stage-plan --cores 90 --batch 16 --ctx 16384 --out stage_plan.json
+```
+
 ## Flags
 
 Every CPU runtime knob is a `--cpu-*` flag with a `PLOW_CPU_*` environment twin;
@@ -80,7 +100,7 @@ the CLI wins over the environment. `plowrt serve --help` prints them under the
 | `--cpu-isa TIER` | `PLOW_CPU_ISA` | `auto` | Kernel tier ceiling: `scalar`, `avx512`, `amx`. For A/B, and for hosts without AMX. Never activates above what cpuid and OS state permit. |
 | `--cpu-huge-pages=B` | `PLOW_CPU_HUGE_PAGES` | unset | Override transparent-huge-page *advice*: by default ordinary pages for interleaved tensors, huge-page advice for single-node or OS placement. Changes advice, not the system THP setting. |
 | `--cpu-spin-us N` | `PLOW_CPU_SPIN_US` | `2000` | Spin budget (µs) before a blocked worker yields and parks. Decode packets are 100–500 µs apart; parking on every gap measured **+17% TPOT** at 50 µs versus 1000. |
-| `--cpu-combine G` | `PLOW_CPU_COMBINE` | `0` | Combining-tree completion counters. A counter bumped by at least `2G` static executors gets one sub-counter per group of `G` executors on the same node; the group's last arrival adds the group's share to the real counter, so consumers and thresholds are unchanged. Off, every slice of a full-width op bumps one shared line and the last bump measured 2 µs median, up to 16 µs. `G=16` measured TPOT p50 −7.9% (E2B) and −6.4% (E4B) at c1 on the Xeon 6975P-C, outputs identical (`docs/bringup/results/xeon6-l2r-bf16-20261008/p5_serving_report.md`). |
+| `--cpu-combine G` | `PLOW_CPU_COMBINE` | `0` | Combining-tree completion counters. A counter bumped by at least `2G` static executors gets one sub-counter per group of `G` executors on the same node; the group's last arrival adds the group's share to the real counter, so consumers and thresholds are unchanged. Off, every slice of a full-width op bumps one shared line and the last bump measured 2 µs median, up to 16 µs. `G=16` measured TPOT p50 −7 to −10% at c1 (E2B, E4B; ISL 1000-15900) on the Xeon 6975P-C, outputs identical (`docs/bringup/results/xeon6-l2r-bf16-20261008/p5_serving_report.md`). |
 | `--cpu-prefill-chunk N` | `PLOW_CPU_PF_CHUNK` | `0` | Largest prefill chunk (rows) one tick may run while other slots decode; `0` = whole prompt. Measured **negative** at concurrency ≥ 4, so it stays off. |
 | `--cpu-pack-prefill=B` | `PLOW_CPU_PACK_PREFILL` | `true` | Prefill the prompts waiting in one serve tick together, in one launch, bit-identical to prefilling each alone (see *Packed prefill*). |
 | `--cpu-mxfp4-dir DIR` | `PLOW_MXFP4_DIR` | unset | Directory holding the MXFP4 weight twin (`mxfp4/<name>` plus `_scale` rows, from `perf-data/tools/quantize_mxfp4.py`). |
