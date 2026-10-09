@@ -159,26 +159,35 @@ async fn chat_completions_with(
             );
         }
     }
-    for (val, field) in [
-        (&req.tools, "tools"),
-        (&req.tool_choice, "tool_choice"),
-        (&req.functions, "functions"),
-        (&req.function_call, "function_call"),
-        (&req.response_format, "response_format"),
-    ] {
-        if val.as_ref().is_some_and(|v| !v.is_null()) {
+    if req.response_format.as_ref().is_some_and(|v| !v.is_null()) {
+        return crate::serve::api_error(
+            axum::http::StatusCode::BAD_REQUEST,
+            "`response_format` is not implemented by this server; it is refused rather than \
+             ignored, because ignoring it returns a confidently wrong answer",
+            "invalid_request_error",
+            Some("unsupported_parameter"),
+            Some("response_format".into()),
+        );
+    }
+    // TOOLS: served when the model's own template renders them and its call syntax is one
+    // `serve::tools` parses; refused otherwise (see `tools::request::plan`).
+    let tool_support = if state.has_gpu_engine(&req.model) {
+        state.registry.get(&req.model).ok().and_then(|b| b.chat_template().map(|t| t.tools))
+    } else {
+        None
+    };
+    let tool_plan = match crate::serve::tools::request::plan(&req, tool_support) {
+        Ok(p) => p,
+        Err(r) => {
             return crate::serve::api_error(
                 axum::http::StatusCode::BAD_REQUEST,
-                format!(
-                    "`{field}` is not implemented by this server; it is refused rather than \
-                     ignored, because ignoring it returns a confidently wrong answer"
-                ),
+                r.message,
                 "invalid_request_error",
-                Some("unsupported_parameter"),
-                Some(field.into()),
-            );
+                Some(r.code),
+                Some(r.param.into()),
+            )
         }
-    }
+    };
 
     // OpenAI's schema requires at least one message, and answering an empty
     // conversation means generating from a bare generation prompt: the model
@@ -218,11 +227,13 @@ async fn chat_completions_with(
     // reference path keeps the simple role-prefix flatten — its logits are a
     // stand-in, so a template would be costume jewelry there.
     let mut template_error: Option<String> = None;
+    let mut request_error: Option<crate::serve::tools::request::Refusal> = None;
     let mut no_template: Option<String> = None;
     let render_opts = crate::serve::template::RenderOpts {
         kwargs: req.chat_template_kwargs.clone().unwrap_or_default(),
         reasoning_effort: req.reasoning_effort.clone(),
         continue_final_message: req.continue_final_message.unwrap_or(false),
+        tools: tool_plan.template_tools.clone(),
     };
     let prompt = crate::obs::ttft::timed(&crate::obs::ttft::TEMPLATE, || {
         if state.has_gpu_engine(&req.model) {
@@ -232,24 +243,19 @@ async fn chat_completions_with(
             // are an approximation of a file the weights already carry, and
             // every divergence between the two is a wrong prompt.
             if let Some(t) = tok.as_deref().and_then(|b| b.chat_template()) {
-                let msgs: Vec<serde_json::Value> = req
-                    .messages
-                    .iter()
-                    .map(|m| {
-                        serde_json::json!({
-                            "role": m.role,
-                            "content": m.text(),
-                        })
-                    })
-                    .collect();
-                match t.render_with(&msgs, &render_opts) {
+                use crate::serve::tools::request::{render, RenderError};
+                match render(t, &req.messages, &render_opts) {
                     Ok(p) => return p,
-                    Err(e) => {
-                        // The template REFUSED this conversation (HF templates
-                        // call `raise_exception` for shapes they cannot render,
-                        // e.g. an out-of-order role sequence). Surface it as a
-                        // 400 rather than silently rendering something else.
+                    // The template REFUSED this conversation (HF templates call
+                    // `raise_exception` for shapes they cannot render, e.g. an
+                    // out-of-order role sequence). Surface it as a 400 rather than
+                    // silently rendering something else.
+                    Err(RenderError::Template(e)) => {
                         template_error = Some(e);
+                        return String::new();
+                    }
+                    Err(RenderError::Request(r)) => {
+                        request_error = Some(r);
                         return String::new();
                     }
                 }
@@ -290,6 +296,15 @@ async fn chat_completions_with(
             "invalid_request_error",
             Some("chat_template_missing"),
             Some("messages".into()),
+        );
+    }
+    if let Some(r) = request_error {
+        return crate::serve::api_error(
+            axum::http::StatusCode::BAD_REQUEST,
+            r.message,
+            "invalid_request_error",
+            Some(r.code),
+            Some(r.param.into()),
         );
     }
     if let Some(e) = template_error {
@@ -353,6 +368,7 @@ async fn chat_completions_with(
     }
     gen.min_tokens = req.sampling.min_tokens.unwrap_or(0) as usize;
     gen.stop_token_ids = req.sampling.stop_token_ids.clone().unwrap_or_default();
+    gen.keep_special_tokens = tool_plan.parse.is_some();
     if gen.min_tokens > gen.max_tokens {
         return crate::serve::api_error(
             axum::http::StatusCode::BAD_REQUEST,
@@ -416,6 +432,9 @@ async fn chat_completions_with(
     // the marker themselves).
     let reasoning_mode = crate::serve::reasoning::ReasoningMode::for_bundle(&bundle);
     let reasoning_open = reasoning_mode.prompt_opens(&prompt);
+    let tool_stream = tool_plan.parse.as_ref().map(|spec| {
+        crate::serve::tools::stream::ToolStream::new(spec, reasoning_mode, reasoning_open, bundle.special_text().clone())
+    });
     if let Some(e) = crate::serve::prompt_bytes_overflow(state.max_ctx(&req.model), bundle.tokenizer().max_token_bytes(), prompt.len()) {
         return crate::serve::api_error_for(&e);
     }
@@ -533,6 +552,7 @@ async fn chat_completions_with(
             reasoning_mode,
             reasoning_open,
             lp_fmt,
+            tool_stream,
             run,
         );
         let mut response = crate::serve::session::hold_until_sent(sse.into_response(), in_flight);
@@ -547,6 +567,7 @@ async fn chat_completions_with(
             reasoning_mode,
             reasoning_open,
             lp_fmt,
+            tool_stream,
             run,
         )
         .await
@@ -816,8 +837,10 @@ async fn buffer_and_reply(
     reasoning_mode: crate::serve::reasoning::ReasoningMode,
     reasoning_open: bool,
     lp_fmt: Option<crate::serve::logprobs::TokenText>,
+    mut tools: Option<crate::serve::tools::stream::ToolStream>,
     mut run: crate::serve::turns::StageRun,
 ) -> Response {
+    let mut calls: Vec<crate::serve::openai::ToolCall> = Vec::new();
     let mut text = String::new();
     let mut lp_content = Vec::new();
     // Driven PER TOKEN, exactly as the streamed path drives it — same type,
@@ -845,7 +868,14 @@ async fn buffer_and_reply(
                     lp_content.push(crate::serve::logprobs::chat_entry(fmt, id, lp));
                 }
                 text.push_str(&delta);
-                let (r, c) = split.push(&delta);
+                let (r, c) = match tools.as_mut() {
+                    Some(ts) => {
+                        let st = ts.push(&delta);
+                        calls.extend(st.calls.into_iter().map(|(_, c)| c));
+                        (st.reasoning, st.content)
+                    }
+                    None => split.push(&delta),
+                };
                 reasoning_buf.push_str(&r.unwrap_or_default());
                 answer_buf.push_str(&c.unwrap_or_default());
             }
@@ -890,21 +920,35 @@ async fn buffer_and_reply(
     // and the trace goes to `reasoning_content`, which is where a reasoning
     // model's clients look for it. A model that never opened a trace is
     // unaffected — `split_reasoning` returns the whole string as the answer.
-    let (r, c) = split.finish();
+    let (r, c) = match tools.as_mut() {
+        Some(ts) => {
+            let st = ts.finish();
+            calls.extend(st.calls.into_iter().map(|(_, c)| c));
+            (st.reasoning, st.content)
+        }
+        None => split.finish(),
+    };
     reasoning_buf.push_str(&r.unwrap_or_default());
     answer_buf.push_str(&c.unwrap_or_default());
     let reasoning = {
         let t = reasoning_buf.trim();
         (!t.is_empty()).then(|| t.to_string())
     };
-    let answer = answer_buf;
-    if split.trace_tokens > 0 {
+    // A turn that is only calls answers `content: null`, as OpenAI does.
+    let answer = (calls.is_empty() || !answer_buf.trim().is_empty()).then_some(answer_buf);
+    let trace_tokens = tools.as_ref().map_or(split.trace_tokens, |ts| ts.split.trace_tokens);
+    if trace_tokens > 0 {
         if let Some(u) = usage.as_mut() {
             u.completion_tokens_details = Some(CompletionTokensDetails {
-                reasoning_tokens: split.trace_tokens,
+                reasoning_tokens: trace_tokens,
             });
         }
     }
+    // `tool_calls` only for a turn that ended on its own: a cut-off turn stays "length".
+    let finish_reason = match finish {
+        stream_mod::FinishReason::Stop if !calls.is_empty() => "tool_calls",
+        f => f.as_openai(),
+    };
     run.done();
     let mut response = Json(ChatResponse {
         id: request_id.clone(),
@@ -913,10 +957,11 @@ async fn buffer_and_reply(
         model,
         choices: vec![Choice {
             index: 0,
-            message: Message {
-                role: "assistant".into(),
-                content: Some(Content::Text(answer)),
+            message: ResponseMessage {
+                role: "assistant",
+                content: answer,
                 reasoning_content: reasoning,
+                tool_calls: (!calls.is_empty()).then_some(calls),
             },
             logprobs: lp_fmt.map(|_| crate::serve::logprobs::ChatLogprobs { content: lp_content }),
             // The WIRE value, which is not always the internal one: a
@@ -925,7 +970,7 @@ async fn buffer_and_reply(
             // sight. Collapsing it to "stop" would be worse still — a
             // truncated answer claiming to be complete — so the real cause
             // rides along in `x_plow_finish_reason`.
-            finish_reason: Some(finish.as_openai()),
+            finish_reason: Some(finish_reason),
             x_plow_finish_reason: finish.is_vendor_specific().then(|| finish.as_str()),
         }],
         usage,
@@ -933,6 +978,47 @@ async fn buffer_and_reply(
     .into_response();
     run.stamp(&mut response);
     response
+}
+
+/// Streamed form of complete calls: the head deltas (`index`, `id`, `type`, `name`, empty
+/// `arguments`) for the token's own frame, then one `arguments` delta per call for frames of
+/// their own — the OpenAI shape clients accumulate by `index`.
+fn call_deltas(
+    calls: Vec<(u32, crate::serve::openai::ToolCall)>,
+) -> (Option<Vec<ToolCallDelta>>, Vec<ToolCallDelta>) {
+    if calls.is_empty() {
+        return (None, Vec::new());
+    }
+    let mut heads = Vec::with_capacity(calls.len());
+    let mut args = Vec::with_capacity(calls.len());
+    for (index, c) in calls {
+        heads.push(ToolCallDelta {
+            index,
+            id: Some(c.id),
+            kind: Some("function"),
+            function: FunctionDelta { name: Some(c.function.name), arguments: Some(String::new()) },
+        });
+        args.push(ToolCallDelta { index, id: None, kind: None, function: FunctionDelta { name: None, arguments: Some(c.function.arguments) } });
+    }
+    (Some(heads), args)
+}
+
+fn tool_frame(id: &str, created: u64, model: &str, d: ToolCallDelta, finish: Option<&'static str>) -> Event {
+    let ch = ChatChunk {
+        id: id.to_string(),
+        object: "chat.completion.chunk",
+        created,
+        model: model.to_string(),
+        choices: vec![ChunkChoice {
+            index: 0,
+            delta: Delta { role: None, content: None, reasoning_content: None, tool_calls: Some(vec![d]) },
+            logprobs: None,
+            finish_reason: finish,
+            x_plow_finish_reason: None,
+        }],
+        usage: None,
+    };
+    Event::default().data(stream_mod::chunk_data(&ch))
 }
 
 /// Streaming path: one SSE `chat.completion.chunk` frame per produced token,
@@ -966,6 +1052,7 @@ fn sse_response(
     reasoning_mode: crate::serve::reasoning::ReasoningMode,
     reasoning_open: bool,
     lp_fmt: Option<crate::serve::logprobs::TokenText>,
+    tools: Option<crate::serve::tools::stream::ToolStream>,
     run: crate::serve::turns::StageRun,
 ) -> Sse<impl Stream<Item = Result<Event, std::convert::Infallible>>> {
 
@@ -974,6 +1061,10 @@ fn sse_response(
     struct SseState {
         rx: stream_mod::ChunkReceiver,
         done: bool,
+        /// Tool-call frames a token produced beyond its own, sent before the next receive.
+        queued: std::collections::VecDeque<Event>,
+        /// Set for a tool-calling request; replaces `split`.
+        tools: Option<crate::serve::tools::stream::ToolStream>,
         /// The `role` delta has not been sent yet — it rides the FIRST token.
         role_pending: bool,
         /// Routes each delta to `reasoning_content` or `content`. The SAME
@@ -987,6 +1078,8 @@ fn sse_response(
         SseState {
             rx,
             done: false,
+            queued: std::collections::VecDeque::new(),
+            tools,
             role_pending: true,
             split: crate::serve::reasoning::ReasoningSplit::new(reasoning_mode, reasoning_open),
             pending: std::collections::VecDeque::new(),
@@ -999,6 +1092,9 @@ fn sse_response(
             async move {
                 if st.done {
                     return None;
+                }
+                if let Some(ev) = st.queued.pop_front() {
+                    return Some((Ok(ev), st));
                 }
                 if let Some(ev) = st.pending.pop_front() {
                     st.done = st.pending.is_empty();
@@ -1044,18 +1140,29 @@ fn sse_response(
                                 crate::obs::host::first_frame(n_prompt, t_arrive.elapsed());
                             }
                         }
-                        let (reasoning, content) = st.split.push(&text);
+                        let (reasoning, content, calls) = match st.tools.as_mut() {
+                            Some(ts) => {
+                                let s = ts.push(&text);
+                                (s.reasoning, s.content, s.calls)
+                            }
+                            None => {
+                                let (r, c) = st.split.push(&text);
+                                (r, c, Vec::new())
+                            }
+                        };
+                        let (heads, args) = call_deltas(calls);
                         let ch = ChatChunk {
                             id: request_id.clone(),
                             object: "chat.completion.chunk",
                             created,
-                            model,
+                            model: model.clone(),
                             choices: vec![ChunkChoice {
                                 index: 0,
                                 delta: Delta {
                                     role,
                                     content,
                                     reasoning_content: reasoning,
+                                    tool_calls: heads,
                                 },
                                 logprobs,
                                 finish_reason: None,
@@ -1063,7 +1170,67 @@ fn sse_response(
                             }],
                             usage: None,
                         };
+                        for a in args {
+                            st.queued.push_back(tool_frame(&request_id, created, &model, a, None));
+                        }
                         (Event::default().data(stream_mod::chunk_data(&ch)), false)
+                    }
+                    StreamChunk::Done { reason, usage, .. } if st.tools.is_some() => {
+                        let ts = st.tools.as_mut().expect("checked");
+                        let s = ts.finish();
+                        let finish = match reason {
+                            stream_mod::FinishReason::Stop if ts.calls() > 0 => "tool_calls",
+                            r => r.as_openai(),
+                        };
+                        let trace_tokens = ts.split.trace_tokens;
+                        let (heads, args) = call_deltas(s.calls);
+                        let mut frames = Vec::new();
+                        if s.content.is_some() || s.reasoning.is_some() || heads.is_some() {
+                            let ch = ChatChunk {
+                                id: request_id.clone(),
+                                object: "chat.completion.chunk",
+                                created,
+                                model: model.clone(),
+                                choices: vec![ChunkChoice {
+                                    index: 0,
+                                    delta: Delta { role: None, content: s.content, reasoning_content: s.reasoning, tool_calls: heads },
+                                    logprobs: None,
+                                    finish_reason: None,
+                                    x_plow_finish_reason: None,
+                                }],
+                                usage: None,
+                            };
+                            frames.push(Event::default().data(stream_mod::chunk_data(&ch)));
+                        }
+                        frames.extend(args.into_iter().map(|a| tool_frame(&request_id, created, &model, a, None)));
+                        let mut last = ChatChunk {
+                            id: request_id.clone(),
+                            object: "chat.completion.chunk",
+                            created,
+                            model: model.clone(),
+                            choices: vec![ChunkChoice {
+                                index: 0,
+                                delta: Delta { role: None, content: None, reasoning_content: None, tool_calls: None },
+                                logprobs: None,
+                                finish_reason: Some(finish),
+                                x_plow_finish_reason: reason.is_vendor_specific().then(|| reason.as_str()),
+                            }],
+                            usage: None,
+                        };
+                        frames.push(Event::default().data(stream_mod::chunk_data(&last)));
+                        if include_usage {
+                            let mut u: Usage = usage.into();
+                            if trace_tokens > 0 {
+                                u.completion_tokens_details = Some(CompletionTokensDetails { reasoning_tokens: trace_tokens });
+                            }
+                            last.choices.clear();
+                            last.usage = Some(u);
+                            st.pending.push_back(Event::default().data(stream_mod::chunk_data(&last)));
+                        }
+                        let mut frames = frames.into_iter();
+                        let first = frames.next().expect("the finish frame");
+                        st.queued.extend(frames);
+                        (first, true)
                     }
                     StreamChunk::Done { reason, usage, .. } => {
                         // FLUSH. Whatever the splitter still holds belongs to
@@ -1081,6 +1248,7 @@ fn sse_response(
                                     role: None,
                                     content: flushed_c,
                                     reasoning_content: flushed_r,
+                                    tool_calls: None,
                                 },
                                 logprobs: None,
                                 // The wire value: "preempted" is not an OpenAI
@@ -1180,7 +1348,7 @@ mod tests {
         Message {
             role: role.into(),
             content: Some(crate::serve::openai::Content::Text(text.into())),
-            reasoning_content: None,
+            ..Default::default()
         }
     }
 

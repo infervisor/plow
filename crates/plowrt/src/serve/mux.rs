@@ -6430,6 +6430,7 @@ fn incremental_delta(
     prefix: &mut usize,
     read: &mut usize,
     last: bool,
+    keep_special: bool,
 ) -> String {
     const MAX_DETOKENIZE_WINDOW: usize = 16;
     let len = out_ids.len();
@@ -6437,8 +6438,9 @@ fn incremental_delta(
         .saturating_sub(MAX_DETOKENIZE_WINDOW)
         .max((*prefix).min(len));
     let effective_read = (*read).clamp(safe_start, len);
-    let prefix_text = tok.decode(&out_ids[safe_start..effective_read]);
-    let new_text = tok.decode(&out_ids[safe_start..]);
+    let decode = |ids: &[u32]| if keep_special { tok.decode_keep_special(ids) } else { tok.decode(ids) };
+    let prefix_text = decode(&out_ids[safe_start..effective_read]);
+    let new_text = decode(&out_ids[safe_start..]);
     match new_text.get(prefix_text.len()..) {
         Some(d) if !d.is_empty() && (last || !new_text.ends_with('\u{FFFD}')) => {
             let d = d.to_string();
@@ -6514,6 +6516,7 @@ fn handle_produced_token(
             &mut slot.prefix_offset,
             &mut slot.read_offset,
             stop_token || stop_max,
+            slot.gen.keep_special_tokens,
         )
     };
 
@@ -8353,7 +8356,7 @@ mod tests {
         let mut fed: Vec<u32> = Vec::new();
         for &id in &ids {
             fed.push(id);
-            streamed.push_str(&incremental_delta(&tok, &fed, &mut prefix, &mut read, false));
+            streamed.push_str(&incremental_delta(&tok, &fed, &mut prefix, &mut read, false, false));
         }
         assert_eq!(streamed, tok.decode(&ids));
         // The window stays bounded: prefix has advanced with the stream.
@@ -8709,7 +8712,7 @@ mod host_bench {
             let t = Instant::now();
             for &id in &ids {
                 fed.push(id);
-                std::hint::black_box(incremental_delta(&tok, &fed, &mut prefix, &mut read, false));
+                std::hint::black_box(incremental_delta(&tok, &fed, &mut prefix, &mut read, false, false));
             }
             detok_ns += t.elapsed().as_nanos();
             n_tok += ids.len();

@@ -212,10 +212,14 @@ pub struct ChatRequest {
     pub return_tokens_as_token_ids: Option<bool>,
     #[serde(default)]
     pub n: Option<u32>,
+    /// OpenAI tool calling; validated and mapped by `serve::tools::request`.
     #[serde(default)]
     pub tools: Option<serde_json::Value>,
     #[serde(default)]
     pub tool_choice: Option<serde_json::Value>,
+    #[serde(default)]
+    pub parallel_tool_calls: Option<bool>,
+    /// Deprecated OpenAI function calling: refused in favour of `tools`.
     #[serde(default)]
     pub functions: Option<serde_json::Value>,
     #[serde(default)]
@@ -344,7 +348,8 @@ pub struct StreamOptions {
     pub include_usage: bool,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+/// A request message.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct Message {
     pub role: String,
     /// OPTIONAL. An assistant turn that carried a tool call has `content: null`,
@@ -358,6 +363,60 @@ pub struct Message {
     /// the whole trace landed in `content` as literal text.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_content: Option<String>,
+    /// An assistant turn's calls, validated by `serve::tools::request`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<serde_json::Value>,
+    /// A `role: "tool"` result's call.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
+
+/// The assistant message of a non-streamed response. `content` is `null` (not absent) when the
+/// turn is only tool calls, as OpenAI returns it.
+#[derive(Clone, Debug, Serialize)]
+pub struct ResponseMessage {
+    pub role: &'static str,
+    pub content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<ToolCall>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct ToolCall {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub kind: &'static str,
+    pub function: FunctionCall,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct FunctionCall {
+    pub name: String,
+    /// A JSON object, serialized.
+    pub arguments: String,
+}
+
+/// One streamed `delta.tool_calls` entry.
+#[derive(Clone, Debug, Serialize)]
+pub struct ToolCallDelta {
+    pub index: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    pub kind: Option<&'static str>,
+    pub function: FunctionDelta,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct FunctionDelta {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub arguments: Option<String>,
 }
 
 impl Message {
@@ -595,7 +654,7 @@ impl From<crate::serve::stream::TokenUsage> for Usage {
 #[derive(Clone, Debug, Serialize)]
 pub struct Choice {
     pub index: u32,
-    pub message: Message,
+    pub message: ResponseMessage,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub logprobs: Option<crate::serve::logprobs::ChatLogprobs>,
     pub finish_reason: Option<&'static str>,
@@ -643,6 +702,8 @@ pub struct Delta {
     /// Streamed thinking trace, before the answer starts.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<ToolCallDelta>>,
 }
 
 #[derive(Clone, Debug, Serialize)]
