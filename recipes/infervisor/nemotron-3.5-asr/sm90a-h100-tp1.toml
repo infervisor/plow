@@ -8,7 +8,8 @@
 #
 # Carried over from L40S unmeasured on H100: buckets, joint_batch 16, stream_rows 4 (no knob is
 # arch-specific here except the speech object, which is rebuilt for sm_90a).
-# Gate: WER on the 73-clip LibriSpeech dummy set; L4/L40S 5.13%.
+# Gate (H100, 09e53e76): WER on the 73-clip LibriSpeech dummy set 5.13% (= L4/L40S); served c1
+# p50 48 ms, RTFx 129; c4 RTFx 137.
 
 schema = "plow.recipe.v1"
 namespace = "infervisor"

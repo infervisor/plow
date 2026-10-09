@@ -8,7 +8,9 @@
 # Checkpoint: unsloth/orpheus-3b-0.1-ft, the ungated mirror of canopylabs/orpheus-3b-0.1-ft (gated;
 # no token on the build box). Every decode/prefill knob is the Veena H100 recipe's, measured there on
 # the identical Llama-3.2-3B shapes; none was re-measured on Orpheus (time-boxed bring-up).
-# Gate: Whisper CER median; L40S 0.000 (n=80).
+# Gate (H100, 09e53e76): Whisper CER median 0.000 (n=80; L40S 0.000), but 7/80 clips CER > 0.3:
+# sampled repetition loops (temperature 0.6 / top_p 0.8, no repetition penalty in the profile).
+# Streaming c1 TTFA 81 ms, RTF 0.30; c32 47 audio s/s.
 
 schema = "plow.recipe.v1"
 namespace = "infervisor"

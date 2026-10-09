@@ -8,7 +8,9 @@
 # Carried over from the 1.7B H100 recipe UNMEASURED on 0.6B: PLOW_NV_GEMV_K8_B1, PLOW_NV_DENSE_TUNE,
 # PLOW_NV_FA_FOLD, the `_gw` decode rungs past 32, the speech-shaped prefill ladder. No per-rung
 # step_bench A/B was run for 0.6B on H100 (time-boxed bring-up); gate + smoke only.
-# Gate: WER on the 73-clip LibriSpeech dummy set; L40S/L4 4.261%.
+# Gate (H100, 09e53e76, packet f7dd071e34c0): WER on the 73-clip LibriSpeech dummy
+# set c1 4.435% / c16 4.261% (L40S/L4 4.261% at both; the B=1 decode path differs). Served c1 p50
+# 42 ms, RTFx 138; c16 RTFx 508; open loop 80 req/s holds the 1 s SLO for only 74% (L40S 99.4%).
 
 schema = "plow.recipe.v1"
 namespace = "infervisor"
