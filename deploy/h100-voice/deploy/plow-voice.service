@@ -1,0 +1,28 @@
+[Unit]
+# Adapted from scripts/asr/nvidia/plow-asr.service. `plow-voice.sh install` fills @PREFIX@, @CONFIG@
+# and @USER@ and installs this as /etc/systemd/system/plow-voice.service.
+Description=plowrt voice stack (ASR + LLM + TTS on one H100; OpenAI-compatible HTTP + WebSocket)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=@USER@
+WorkingDirectory=@PREFIX@/current
+Environment=PLOW_VOICE_CONFIG=@CONFIG@
+# The launcher reads the config (profile, bind, port, API keys, log level) and execs plowrt with a
+# clean environment. Logs go to the journal (journalctl -u plow-voice) unless LOG_FILE is set.
+ExecStart=@PREFIX@/current/deploy/plow-voice.sh run
+# `systemctl start` returns once /health answers 200 (all models loaded and resident).
+ExecStartPost=@PREFIX@/current/deploy/plow-voice.sh wait-ready "" 900
+TimeoutStartSec=960
+Restart=always
+RestartSec=5
+# SIGTERM: /health turns 503, admission stops, live requests drain for DRAIN_TIMEOUT_MS (30 s),
+# then plowrt exits 0. Keep TimeoutStopSec above the drain timeout.
+KillSignal=SIGTERM
+TimeoutStopSec=60
+LimitNOFILE=65536
+LimitMEMLOCK=infinity
+
+[Install]
+WantedBy=multi-user.target

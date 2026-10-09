@@ -1,0 +1,20 @@
+# Caddy TLS front for plow-voice (automatic HTTPS via ACME). Caddy proxies WebSocket upgrades and
+# streams SSE / chunked responses without extra settings; flush_interval -1 disables buffering.
+# Keep plow-voice on BIND=127.0.0.1.
+
+voice.example.com {
+	request_body {
+		max_size 64MB
+	}
+	@metrics path /metrics
+	handle @metrics {
+		respond 403
+	}
+	reverse_proxy 127.0.0.1:8000 {
+		flush_interval -1
+		transport http {
+			read_timeout 1h
+			write_timeout 1h
+		}
+	}
+}
