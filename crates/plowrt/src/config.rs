@@ -242,6 +242,22 @@ pub struct RuntimeConfig {
     #[arg(long = "tts-stream-windows", env = "PLOW_TTS_STREAM_WINDOWS", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub tts_stream_windows: bool,
 
+    /// Most images one multimodal request may carry (more answers 400).
+    #[arg(long = "mm-max-images", env = "PLOW_MM_MAX_IMAGES", default_value_t = 8, global = true)]
+    pub mm_max_images: usize,
+
+    /// Most audio clips one multimodal request may carry (more answers 400).
+    #[arg(long = "mm-max-audio", env = "PLOW_MM_MAX_AUDIO", default_value_t = 4, global = true)]
+    pub mm_max_audio: usize,
+
+    /// Largest decoded image accepted, in pixels (larger answers 400 before resizing).
+    #[arg(long = "mm-max-image-pixels", env = "PLOW_MM_MAX_IMAGE_PIXELS", default_value_t = 40_000_000, global = true)]
+    pub mm_max_image_pixels: u64,
+
+    /// Longest audio clip accepted, in seconds (also capped by the model's processor).
+    #[arg(long = "mm-max-audio-seconds", env = "PLOW_MM_MAX_AUDIO_SECONDS", default_value_t = 30, global = true)]
+    pub mm_max_audio_seconds: u64,
+
     /// How long a finished `X-Session-Id` request's KV (and an ASR session's audio and encoder
     /// windows) stays retained for the session's next request, in ms. 0 disables retention.
     #[arg(long = "session-ttl-ms", env = "PLOW_SESSION_TTL_MS", default_value_t = 60_000, global = true)]

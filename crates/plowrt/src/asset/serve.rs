@@ -12,6 +12,8 @@ use crate::{Result, RuntimeError};
 #[derive(Debug)]
 pub struct ServeInfo {
     pub manifest: ServeManifest,
+    /// The packet's `plow.multimodal.v1` contract: which media parts it serves and how.
+    pub multimodal: Option<plow_asset::multimodal::MmContract>,
     /// The packet carried `serve.json`. A legacy packet keeps every legacy fallback (built-in
     /// chat builders, `<think>` splitting); a packet that carries the section is taken at its word.
     pub from_packet: bool,
@@ -19,6 +21,20 @@ pub struct ServeInfo {
 
 /// The packet's `serve.json` bytes, read from the section directory without loading the packet.
 pub fn read_section(pkt: &Path) -> Result<Option<Vec<u8>>> {
+    read_named_section(pkt, serve_manifest::SECTION)
+}
+
+/// The packet's multimodal contract, when it carries one.
+pub fn read_multimodal(pkt: &Path) -> Result<Option<plow_asset::multimodal::MmContract>> {
+    let Some(bytes) = read_named_section(pkt, plow_asset::multimodal::SECTION)? else { return Ok(None) };
+    let contract: plow_asset::multimodal::MmContract = serde_json::from_slice(&bytes)
+        .map_err(|e| RuntimeError::Device(format!("{}: multimodal contract: {e}", pkt.display())))?;
+    contract.validate().map_err(|e| RuntimeError::Device(format!("{}: {e}", pkt.display())))?;
+    Ok(Some(contract))
+}
+
+/// A metadata section's bytes, read from the section directory without loading the packet.
+pub fn read_named_section(pkt: &Path, section: &str) -> Result<Option<Vec<u8>>> {
     let io = |source| RuntimeError::Io { path: pkt.to_path_buf(), source };
     let bad = |what: &str| RuntimeError::Device(format!("{}: {what}", pkt.display()));
     let mut f = std::fs::File::open(pkt).map_err(io)?;
@@ -49,14 +65,14 @@ pub fn read_section(pkt: &Path) -> Result<Option<Vec<u8>>> {
         let name = &e[24..48];
         let name = &name[..name.iter().position(|&b| b == 0).unwrap_or(24)];
         let kind = u32::from_le_bytes(e[0..4].try_into().expect("4 bytes"));
-        if name == serve_manifest::SECTION.as_bytes() && kind == packet::devbuild::SECT_METADATA {
+        if name == section.as_bytes() && kind == packet::devbuild::SECT_METADATA {
             if found.is_some() {
-                return Err(bad("two serve.json sections"));
+                return Err(bad(&format!("two {section} sections")));
             }
             let off = u64::from_le_bytes(e[8..16].try_into().expect("8 bytes"));
             let size = u64::from_le_bytes(e[16..24].try_into().expect("8 bytes"));
             if size > 16 << 20 || off.checked_add(size).is_none_or(|end| end > len) {
-                return Err(bad("serve.json section range outside the packet"));
+                return Err(bad(&format!("{section} section range outside the packet")));
             }
             found = Some((off, size));
         }
@@ -76,14 +92,18 @@ pub fn resolve(asset_dir: &Path, checkpoint_dir: &Path) -> Result<ServeInfo> {
         Some(p) => read_section(p)?,
         None => None,
     };
+    let multimodal = match &pkt {
+        Some(p) => read_multimodal(p)?,
+        None => None,
+    };
     let Some(bytes) = section else {
-        return Ok(ServeInfo { manifest: ServeManifest::from_checkpoint(asset_dir, checkpoint_dir), from_packet: false });
+        return Ok(ServeInfo { manifest: ServeManifest::from_checkpoint(asset_dir, checkpoint_dir), multimodal, from_packet: false });
     };
     let manifest = ServeManifest::parse(&bytes).map_err(RuntimeError::Device)?;
     if !manifest.weights.is_empty() {
         serve_manifest::verify_pins(checkpoint_dir, &manifest.weights).map_err(RuntimeError::Device)?;
     }
-    Ok(ServeInfo { manifest, from_packet: true })
+    Ok(ServeInfo { manifest, multimodal, from_packet: true })
 }
 
 /// The checkpoint a bundle serves against: `PLOW_CHECKPOINT`, else `<assets>/checkpoint`.

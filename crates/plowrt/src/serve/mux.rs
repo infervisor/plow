@@ -238,6 +238,8 @@ pub struct JobOpts {
     pub continuing: bool,
     /// The prompt's prefix-cache block hashes, when the DP router already computed them.
     pub prefix: Option<crate::memory::vmm::PrefixKey>,
+    /// Multimodal soft-token rows the prompt's bit-31 ids name (`serve::mm`).
+    pub mm: Option<Box<crate::serve::mm::MmJob>>,
 }
 
 /// Queue priority. Orders the waiting queue and serial prefill, and scales the queue TTL.
@@ -806,6 +808,10 @@ struct Slot {
     /// [`JobOpts::prefix`], consumed by the prefix-cache attach.
     #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
     prefix: Option<crate::memory::vmm::PrefixKey>,
+    /// [`JobOpts::mm`]: staged into the LM's slab before any launch reads the prompt; its rows
+    /// are released when the slot is dropped.
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+    mm: Option<Box<crate::serve::mm::MmJob>>,
 }
 
 impl Slot {
@@ -2425,6 +2431,7 @@ fn admit_session(
         parked_at: None,
         lp: None,
         prefix: job.opts.prefix,
+        mm: job.opts.mm,
     });
     None
 }
@@ -2691,6 +2698,19 @@ fn run_one_tick(
                             .try_send(StreamChunk::Err(crate::RuntimeError::Rejected(format!(
                                 "GPU engine serves {cap} sequence slot(s)"
                             ))));
+                }
+            }
+
+            // Multimodal soft-token rows reach the LM's slab before any launch this tick reads them.
+            for i in 0..cap.min(slots.len()) {
+                let Some(mm) = slots[i].as_mut().and_then(|s| s.mm.as_mut()) else { continue };
+                let slab = mm.slab();
+                if let Err(err) = slab.stage(mm, |t, off, b| e.write_tensor_ordered(t, off, b)) {
+                    tracing::warn!(%err, "multimodal rows not staged");
+                    if let Some(taken) = slots[i].take() {
+                        release_kv(&arena, taken.kv);
+                        let _ = taken.respond.try_send(StreamChunk::Err(err));
+                    }
                 }
             }
 
@@ -7916,6 +7936,7 @@ mod tests {
                 turn: None,
                 turn_key: None,
                 speech: None,
+                mm: None,
                 cfg: None,
                 held: Vec::new(),
                 held_finish: None,

@@ -2182,7 +2182,9 @@ fn build_cubin_from_manifest(
     let _ = t3;
     args.push("-DPLOW_TTS_S3GEN=OFF".into());
     // An ASR packet's audio encoder runs the FP32 speech arms, which only the _speech object has.
-    let asr = ["encoder.pkt", "codec.pkt", "s3gen.pkt"].iter().any(|f| pkt.with_file_name(f).is_file());
+    let asr = ["encoder.pkt", "codec.pkt", "s3gen.pkt", "mm_vision.pkt", "mm_audio.pkt"]
+        .iter()
+        .any(|f| pkt.with_file_name(f).is_file());
     args.push(format!("-DPLOW_CUBIN_SPEECH={}", if asr { "ON" } else { "OFF" }));
 
     let out_dir = pkt.parent().map(PathBuf::from).unwrap_or_default();
