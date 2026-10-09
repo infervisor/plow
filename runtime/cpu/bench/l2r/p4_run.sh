@@ -8,7 +8,7 @@ B=${L2R_BIN:-/tmp/g4c/l2r/l2r_layer}
 mkdir -p "$O"
 kvmib=$(python3 -c "
 import json; m = json.load(open('$ref/meta.json'))
-print(max(1, round(2 * m['kv_heads'] * (m['cache_len'] + 1) * m['head_dim'] * 2 * $seqs / 2**20)))")
+print(max(1, round(2 * m.get('kv_heads', 0) * (m.get('cache_len', 0) + 1) * m.get('head_dim', 0) * 2 * $seqs / 2**20)))")
 copies=1
 [ "$path" = A ] && copies=$(( (${L2R_COLD_MIB:-1536} + kvmib - 1) / kvmib ))
 steps=5000

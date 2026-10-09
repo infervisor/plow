@@ -1130,6 +1130,7 @@ static int experts_main(const char* js) {
     for (int w = 0; w < NW; w++) { if (WK[w].held0 < h0) h0 = WK[w].held0; if (WK[w].held1 < h1v) h1v = WK[w].held1; }
     if (PLFD >= 0) printf(",\"lock\":{\"held_l2_before_min\":%.4f,\"held_l2_after_min\":%.4f}", h0, h1v);
     const size_t wb = (size_t)NE * 3 * EI * H * 2;
+    printf(",\"kv\":{\"copies\":1,\"rows\":%d,\"bytes_per_step\":0}", NB);
     printf(",\"weight_bytes\":%zu,\"weight_bytes_per_worker\":%.0f}\n", wb, (double)wb / NW);
     return 0;
 }

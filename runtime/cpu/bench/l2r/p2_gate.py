@@ -10,12 +10,19 @@ RATIO, COS = 1.5, 0.99999
 
 
 def gate(err, ref_dir):
-    bar = json.load(open(ref_dir + "/meta.json"))["bf16_ref_err"]
+    meta = json.load(open(ref_dir + "/meta.json"))
+    bar = meta["bf16_ref_err"]
     rows, ok = [], True
     for k, e in err.items():
         if e is None:
             continue
         ref = bar["out" if k == "out_last" else k]["rel_rms"]
+        if meta.get("pairs") == 0 and k.startswith("out"):
+            # an expert group no token of this row routes to: the partial is exactly zero, so it must be reproduced exactly
+            good = e[2] == 0.0
+            ok &= good
+            rows.append(f"{k}:max_abs {e[2]:.2e} (no pairs){'' if good else '!'}")
+            continue
         ratio = e[0] / ref if ref else float("inf")
         good = ratio <= RATIO and (not k.startswith("out") or e[1] >= COS)
         ok &= good

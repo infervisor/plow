@@ -84,6 +84,20 @@ gathers per row / `--act-gbps`. The defaults are the single-socket stage measure
 (`docs/bringup/results/xeon6-l2r-bf16-20261008/`). Output is `stage_plan.json` (units, stages, summary) plus one
 line per stage.
 
+`--split tp` (default) handles layers larger than one socket and MoE layers. `--split pipe` packs only, and fails on
+MoE.
+
+* **Dense layer larger than one socket**: a tensor-parallel group of the smallest socket count S that fits.
+  * Each socket holds whole q heads with their KV heads; a KV head is replicated when S exceeds the KV heads.
+  * Each socket also holds an FFN row block.
+  * o / down are split by K, so each layer needs 2 cross-socket all-reduces of `--allreduce-us` each.
+* **MoE layer**: a head stage (attention, dense MLP, router) followed by an experts stage.
+  * The experts stage takes ceil(experts / experts per socket) sockets, each expert striped over all cores.
+  * Its predicted bytes are the experts active at `--batch` with top-k routing.
+* **LM head**: vocabulary-parallel, 1 all-reduce.
+
+`runtime/cpu/bench/l2r/cluster.py` maps measured single-socket stage runs onto these plans.
+
 ```sh
 plowc --hf-dir "$CKPT" stage-plan --cores 90 --batch 16 --ctx 16384 --out stage_plan.json
 ```
