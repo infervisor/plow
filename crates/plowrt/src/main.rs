@@ -1599,10 +1599,7 @@ fn runtime_environment() -> Vec<(String, String)> {
                 )
         })
         .map(|(key, value)| {
-            let upper = key.to_ascii_uppercase();
-            let secret = ["TOKEN", "SECRET", "PASSWORD", "CREDENTIAL", "API_KEY"]
-                .iter()
-                .any(|needle| upper.contains(needle));
+            let secret = plowrt::config::is_secret_env(&key);
             (key, if secret { "<redacted>".into() } else { value })
         })
         .collect();

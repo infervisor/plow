@@ -2295,9 +2295,18 @@ pub fn serve_replay(m: &clap::ArgMatches) -> std::collections::BTreeMap<String, 
                     .join(",")
             })
             .unwrap_or_default();
+        let val = if is_secret_env(&env) { "<redacted>".into() } else { val };
         out.insert(env, val);
     }
     out
+}
+
+/// An environment variable whose value must never reach a log (`PLOW_API_KEYS`, tokens, ...).
+pub fn is_secret_env(name: &str) -> bool {
+    // Suffix tests for KEY/TOKEN: `PLOW_TOKEN_BATCH` and friends are knobs, not credentials.
+    let upper = name.to_ascii_uppercase();
+    ["API_KEY", "SECRET", "PASSWORD", "CREDENTIAL"].iter().any(|needle| upper.contains(needle))
+        || ["_KEY", "_KEYS", "_TOKEN", "_TOKENS"].iter().any(|suffix| upper.ends_with(suffix))
 }
 
 #[cfg(test)]
@@ -2708,6 +2717,26 @@ mod tests {
             super::NvidiaRuntimeConfig::from_arg_matches(&matches).unwrap().vmm_live_rings,
             Some(false)
         );
+    }
+
+    /// The startup replay line goes to the journal: API keys must not.
+    #[test]
+    fn serve_replay_redacts_secrets() {
+        use clap::Args;
+        let command = super::RuntimeConfig::augment_args(clap::Command::new("plowrt"));
+        let matches = command
+            .try_get_matches_from(["plowrt", "--api-key", "sk-live-123", "--session-ttl-ms", "5000"])
+            .unwrap();
+        let replay = super::serve_replay(&matches);
+        assert_eq!(replay.get("PLOW_API_KEYS").map(String::as_str), Some("<redacted>"));
+        assert_eq!(replay.get("PLOW_SESSION_TTL_MS").map(String::as_str), Some("5000"));
+        assert!(!format!("{replay:?}").contains("sk-live-123"));
+        for secret in ["PLOW_API_KEYS", "HF_TOKEN", "AWS_SECRET_ACCESS_KEY", "DB_PASSWORD", "X_KEY"] {
+            assert!(super::is_secret_env(secret), "{secret}");
+        }
+        for knob in ["PLOW_TOKEN_BATCH", "PLOW_SESSION_TTL_MS", "PLOW_KV_POOL_MIB"] {
+            assert!(!super::is_secret_env(knob), "{knob}");
+        }
     }
 
     #[cfg(feature = "cuda")]
