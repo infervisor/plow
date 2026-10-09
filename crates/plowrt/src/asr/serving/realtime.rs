@@ -254,7 +254,7 @@ async fn session(state: Arc<AsrServer>, mut socket: WebSocket, ids: RequestIds, 
     let mut resampler = Resampler::new(config.format.rate()).expect("a listed format rate");
     let new_endpointer = |vad: Option<Vad>, finalization: Option<&FinalizationPolicy>| {
         let cap_ms = (MAX_SAMPLES.saturating_sub(finalization.map_or(0, |f| f.final_padding_samples)) / 16) as u32;
-        vad.map(|v| state.endpointer(EndpointConfig { min_silence_ms: v.silence_duration_ms, max_segment_ms: cap_ms.min(25_000) }, v.threshold as f32))
+        vad.map(|v| state.endpointer(EndpointConfig { min_silence_ms: v.silence_duration_ms, max_segment_ms: cap_ms.min(25_000) }, Some(v.threshold as f32)))
     };
     let mut endpointer = new_endpointer(config.vad, route.as_ref().map(|r| &r.2));
     // 16 kHz samples fed since the session (or the last clear) and before the current endpointer.

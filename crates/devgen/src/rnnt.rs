@@ -71,6 +71,8 @@ pub struct RnntPackets {
     stream: Option<StreamPrograms>,
     /// Frames each TDT duration logit advances (`spec.durations` values).
     tdt_durations: Vec<u32>,
+    /// Vocabulary, detokenizer and language (ASR contract 1); required by plowrt.
+    output: Option<plow_asset::speech_contract::TokenOutput>,
 }
 
 /// `index` selects a compiled prompt; an unprompted packet (`count == 0`) takes index 0.
@@ -188,6 +190,25 @@ impl RnntPackets {
         let init = graft(&mut self.model, init, &[0])?[0];
         self.stream = Some(StreamPrograms { geometry, init, first, step, input });
         Ok(())
+    }
+
+    /// Vocabulary, detokenizer and language (ASR contract 1); ids past the pieces are dropped.
+    pub fn set_output(&mut self, output: plow_asset::speech_contract::TokenOutput) -> Result<(), String> {
+        if output.pieces.is_empty() || output.pieces.len() > self.spec.vocabulary as usize {
+            return Err(format!("output vocabulary has {} pieces for a joint of {}", output.pieces.len(), self.spec.vocabulary));
+        }
+        self.output = Some(output);
+        Ok(())
+    }
+
+    /// The `asr_vocabulary.json` section (after [`Self::set_output`]).
+    pub fn vocabulary_section(&self) -> Result<packet::devbuild::SectionData, String> {
+        let output = self.output.as_ref().ok_or("RNNT output vocabulary is not set")?;
+        Ok(packet::devbuild::SectionData {
+            kind: packet::devbuild::SECT_METADATA,
+            name: plow_asset::speech_contract::VOCABULARY_SECTION.into(),
+            data: output.vocabulary_section(),
+        })
     }
 
     /// The frames each TDT duration logit advances, in logit order (a TDT packet needs them).
@@ -608,8 +629,12 @@ impl RnntPackets {
         } else if input_frames != 0 || trailing_frames != 0 {
             return Err("RNNT frame transform stages are empty".into());
         }
+        let mut strings = BTreeMap::new();
+        if let Some(output) = &self.output {
+            output.apply(&mut parameters, &mut strings);
+        }
         let pipeline = PacketPipeline {
-            strings: Default::default(),
+            strings,
             name: "transcribe".into(),
             driver: "rnnt.greedy.v1".into(),
             programs,
@@ -819,6 +844,7 @@ fn lower_inner(
         encoder_buckets: BTreeMap::new(),
         stream: None,
         tdt_durations: Vec::new(),
+        output: None,
     })
 }
 

@@ -1,15 +1,11 @@
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     use std::path::Path;
 
-    use plowrt::asset::gguf::GgufFile;
-
     let args: Vec<_> = std::env::args().collect();
-    if !(3..=5).contains(&args.len()) {
-        return Err(
-            "usage: asr_rnnt_packet PACKET TOKENIZER_GGUF [REPEATS] [INPUT_F32_OR_WAV]".into(),
-        );
+    if !(2..=4).contains(&args.len()) {
+        return Err("usage: asr_rnnt_packet PACKET [REPEATS] [INPUT_F32_OR_WAV]".into());
     }
-    let repeats = args.get(3).map_or(Ok(1), |value| value.parse::<usize>())?;
+    let repeats = args.get(2).map_or(Ok(1), |value| value.parse::<usize>())?;
     if repeats == 0 {
         return Err("REPEATS must be positive".into());
     }
@@ -17,7 +13,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut execution =
         plowrt::asr::rnnt::PacketRnnt::load(Path::new(&args[1]), &requested_backend)?;
     execution.set_profiling(true);
-    let (input, valid_frames) = if let Some(path) = args.get(4) {
+    let (input, valid_frames) = if let Some(path) = args.get(3) {
         let path = Path::new(path);
         if path.extension().and_then(|value| value.to_str()) == Some("wav") {
             let samples = plowrt::asr::frontend::decode_wav(&std::fs::read(path)?)?;
@@ -32,7 +28,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         (vec![0.0; execution.input_elements()], None)
     };
-    let vocabulary = vocabulary(&GgufFile::open(Path::new(&args[2]))?)?;
     let mut timings = Vec::with_capacity(repeats);
     let mut tokens = Vec::new();
     for repeat in 0..repeats {
@@ -57,34 +52,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "driver": "rnnt.greedy.v1",
             "backend": execution.backend(),
             "tokens": tokens,
-            "text": plowrt::asr::rnnt::detokenize_sentencepiece(&vocabulary, &tokens),
+            "text": execution.output().map(|output| plowrt::asr::rnnt::detokenize(output, &tokens)),
             "total_median_ms": timings[timings.len() / 2],
             "last_profile": execution.last_profile(),
             "repeats": repeats,
         })
     );
     Ok(())
-}
-
-fn vocabulary(model: &plowrt::asset::gguf::GgufFile) -> plowrt::Result<Vec<String>> {
-    use gguf_rs_lib::format::metadata::MetadataValue;
-
-    let Some(MetadataValue::Array(values)) = model.metadata().data.get("asr.tokenizer.vocab")
-    else {
-        return Err(plowrt::RuntimeError::Rejected(
-            "GGUF ASR vocabulary is missing".into(),
-        ));
-    };
-    values
-        .values
-        .iter()
-        .map(|value| match value {
-            MetadataValue::String(value) => Ok(value.clone()),
-            _ => Err(plowrt::RuntimeError::Rejected(
-                "GGUF ASR vocabulary contains a non-string".into(),
-            )),
-        })
-        .collect()
 }
 
 fn read_f32(path: &std::path::Path) -> Result<Vec<f32>, Box<dyn std::error::Error>> {

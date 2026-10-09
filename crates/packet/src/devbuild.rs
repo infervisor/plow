@@ -4260,6 +4260,70 @@ impl Model {
     }
 }
 
+/// A v6+ container with its metadata sections named in `set` replaced (or appended); tensors,
+/// programs and every other section are kept byte for byte. Sections sit contiguously between
+/// the GQ01 appendix and the section directory (as [`Model::to_blob_v6`] writes them).
+pub fn replace_metadata_sections(blob: &[u8], set: &[SectionData]) -> Result<Vec<u8>, String> {
+    let ent = size_of::<BlobSectionEntry>();
+    let dir = blob.get(40..48).map(|b| u64::from_le_bytes(b.try_into().unwrap()) as usize).ok_or("truncated blob")?;
+    if dir == 0 || blob.get(dir..dir + 4) != Some(&SECT_MAGIC[..]) {
+        return Err("blob has no v6 section directory".into());
+    }
+    let count = blob.get(dir + 4..dir + 8).map(|b| u32::from_le_bytes(b.try_into().unwrap()) as usize).ok_or("truncated directory")?;
+    if blob.len() != dir + 8 + count * ent {
+        return Err("section directory is not at the end of the blob".into());
+    }
+    let entries: Vec<BlobSectionEntry> = (0..count)
+        // SAFETY: in bounds (checked above); BlobSectionEntry is plain old data.
+        .map(|i| unsafe { core::ptr::read_unaligned(blob[dir + 8 + i * ent..].as_ptr() as *const BlobSectionEntry) })
+        .collect();
+    let start = entries.first().map_or(dir, |e| e.offset as usize);
+    let mut at = start;
+    for e in &entries {
+        if e.offset as usize != at {
+            return Err("sections are not contiguous".into());
+        }
+        at += e.size as usize;
+    }
+    if at != dir {
+        return Err("sections do not end at the directory".into());
+    }
+    let name_of = |e: &BlobSectionEntry| {
+        let end = e.name.iter().position(|&c| c == 0).unwrap_or(SECT_NAME_LEN);
+        String::from_utf8_lossy(&e.name[..end]).into_owned()
+    };
+    if set.iter().any(|s| s.kind != SECT_METADATA || s.name.is_empty() || s.name.len() >= SECT_NAME_LEN) {
+        return Err("only named metadata sections can be replaced".into());
+    }
+    let mut sections: Vec<(u32, String, &[u8])> = entries
+        .iter()
+        .map(|e| (e.kind, name_of(e), &blob[e.offset as usize..(e.offset + e.size) as usize]))
+        .collect();
+    for s in set {
+        match sections.iter_mut().find(|(kind, name, _)| *kind == SECT_METADATA && *name == s.name) {
+            Some(slot) => slot.2 = &s.data,
+            None => sections.push((SECT_METADATA, s.name.clone(), &s.data)),
+        }
+    }
+    let mut out = blob[..start].to_vec();
+    let mut dir_entries = Vec::with_capacity(sections.len());
+    for (kind, name, data) in &sections {
+        let mut fixed = [0u8; SECT_NAME_LEN];
+        fixed[..name.len()].copy_from_slice(name.as_bytes());
+        dir_entries.push(BlobSectionEntry { kind: *kind, _pad: 0, offset: out.len() as u64, size: data.len() as u64, name: fixed });
+        out.extend_from_slice(data);
+    }
+    let new_dir = out.len() as u64;
+    out.extend_from_slice(SECT_MAGIC);
+    out.extend_from_slice(&(dir_entries.len() as u32).to_le_bytes());
+    for e in &dir_entries {
+        // SAFETY: BlobSectionEntry is repr(C) plain old data.
+        out.extend_from_slice(unsafe { std::slice::from_raw_parts(e as *const BlobSectionEntry as *const u8, ent) });
+    }
+    out[40..48].copy_from_slice(&new_dir.to_le_bytes());
+    Ok(out)
+}
+
 impl Builder {
     /// Hand the tensor table to another Builder so two programs address the same buffers.
     pub fn adopt_tensors(&mut self, tensors: Vec<TensorDecl>) {
@@ -6386,6 +6450,21 @@ mod v6_tests {
             &blob[e1.offset as usize..e1.offset as usize + e1.size as usize],
             &meta_data
         );
+    }
+
+    #[test]
+    fn replacing_metadata_keeps_everything_else() {
+        let m = tiny_model();
+        let section = |kind, name: &str, data: &[u8]| SectionData { kind, name: name.into(), data: data.to_vec() };
+        let old = m.to_blob_v6(&[section(SECT_CUBIN, "cubin", b"\x01\x02"), section(SECT_METADATA, "meta", b"old")]);
+        let new = replace_metadata_sections(&old, &[section(SECT_METADATA, "meta", b"newer"), section(SECT_METADATA, "added", b"x")]).unwrap();
+        let want = m.to_blob_v6(&[
+            section(SECT_CUBIN, "cubin", b"\x01\x02"),
+            section(SECT_METADATA, "meta", b"newer"),
+            section(SECT_METADATA, "added", b"x"),
+        ]);
+        assert_eq!(new, want);
+        assert!(replace_metadata_sections(&old, &[section(SECT_CUBIN, "cubin", b"")]).is_err());
     }
 
     #[test]

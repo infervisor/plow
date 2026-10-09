@@ -1,20 +1,20 @@
+//! `rnnt.greedy.v1` packets as a [`Transcriber`]: frontend, greedy decode, detokenizer and
+//! language all from the packet (ASR contract, `plow_asset::speech_contract`).
+
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use gguf_rs_lib::format::metadata::MetadataValue;
+use plow_asset::speech_contract::{self, TokenOutput};
 
 use crate::asr::frontend::PacketLogMelFrontend;
-use crate::asr::rnnt::{detokenize_sentencepiece, PacketRnnt, RnntStream};
+use crate::asr::rnnt::{detokenize, PacketRnnt, RnntStream};
 use crate::asr::{Transcriber, Transcript};
-use crate::asset::gguf::GgufFile;
 use crate::{Result, RuntimeError};
 
 pub struct PacketRnntTranscriber {
     frontend: PacketLogMelFrontend,
     execution: PacketRnnt,
-    vocabulary: Vec<String>,
-    /// The compiled prompt's language; `None` for an unprompted packet.
-    language: Option<String>,
+    output: TokenOutput,
     streams: std::collections::HashMap<u64, TranscriberStream>,
     next_stream: u64,
 }
@@ -28,27 +28,17 @@ struct TranscriberStream {
 }
 
 impl PacketRnntTranscriber {
-    pub fn load(packet: &Path, model: &Path, backend: &str) -> Result<Self> {
-        let model = GgufFile::open(model)?;
-        let vocabulary = string_array(&model, "asr.tokenizer.vocab")?;
+    pub fn load(packet: &Path, backend: &str) -> Result<Self> {
         let execution = PacketRnnt::load(packet, backend)?;
+        speech_contract::check_contract(
+            execution.parameter(speech_contract::CONTRACT).ok(),
+            speech_contract::ASR_CONTRACT,
+            "rnnt.greedy.v1",
+        )
+        .map_err(rejected)?;
+        let output = execution.output().cloned().ok_or_else(|| rejected("packet declares no output contract"))?;
         let frontend = execution.log_mel_frontend()?;
-        // Unprompted packets (Parakeet) detect the language themselves.
-        let language = if execution.parameter("prompt_count")? == 0 {
-            None
-        } else {
-            let prompt_index = usize::try_from(execution.parameter("prompt_index")?)
-                .map_err(|_| rejected("prompt index overflows"))?;
-            Some(prompt_language(&model, prompt_index)?)
-        };
-        Ok(Self {
-            frontend,
-            execution,
-            vocabulary,
-            language,
-            streams: Default::default(),
-            next_stream: 0,
-        })
+        Ok(Self { frontend, execution, output, streams: Default::default(), next_stream: 0 })
     }
 
     pub fn backend(&self) -> &'static str {
@@ -92,15 +82,15 @@ impl Transcriber for PacketRnntTranscriber {
                 .values
                 .get((start - from) * windows.bins..(stop - from) * windows.bins)
                 .ok_or_else(|| rejected("stream window is outside the computed mel frames"))?;
-            let (vocabulary, before) = (&self.vocabulary, &stream.tokens);
+            let (output, before) = (&self.output, &stream.tokens);
             let tokens = self.execution.stream_step(&mut stream.rnnt, window, &mut |emitted| {
                 let all: Vec<u32> = before.iter().chain(emitted).copied().collect();
-                on_text(&detokenize_sentencepiece(vocabulary, &all));
+                on_text(&detokenize(output, &all));
             })?;
             stream.tokens.extend(tokens);
             stream.steps += 1;
         }
-        Ok(detokenize_sentencepiece(&self.vocabulary, &stream.tokens))
+        Ok(detokenize(&self.output, &stream.tokens))
     }
 
     fn stream_close(&mut self, id: u64) {
@@ -109,18 +99,17 @@ impl Transcriber for PacketRnntTranscriber {
         }
     }
 
-    /// A prompted packet answers in its compiled language only; an unprompted one detects the
-    /// language itself, so a requested language is accepted but not applied.
+    /// A packet declaring a `language` answers in it only (or a declared alias of it); one
+    /// without detects the language itself, so a requested language is accepted but not applied.
     fn language(&self, requested: Option<&str>) -> Result<Option<String>> {
-        let Some(compiled) = &self.language else {
+        let Some(compiled) = &self.output.language else {
             return Ok(None);
         };
         let Some(requested) = requested else {
             return Ok(Some(compiled.clone()));
         };
         let compatible = requested.eq_ignore_ascii_case(compiled)
-            || (compiled.eq_ignore_ascii_case("en-US")
-                && matches!(requested.to_ascii_lowercase().as_str(), "en" | "english"));
+            || self.output.language_aliases.iter().any(|(alias, l)| alias.eq_ignore_ascii_case(requested) && l == compiled);
         compatible
             .then(|| Some(compiled.clone()))
             .ok_or_else(|| rejected(format!("packet was compiled for {compiled}, not {requested}")))
@@ -163,43 +152,18 @@ impl Transcriber for PacketRnntTranscriber {
         }
         let mut input = features.values;
         input.resize(expected, 0.0);
-        let vocabulary = &self.vocabulary;
+        let output = &self.output;
         let tokens = self.execution.transcribe_input_frames_with(&input, valid_frames, &mut |emitted| {
-            on_text(&detokenize_sentencepiece(vocabulary, emitted))
+            on_text(&detokenize(output, emitted))
         })?;
         if cancel.load(Ordering::Relaxed) {
             return Err(rejected("ASR cancelled"));
         }
         Ok(Transcript {
-            text: detokenize_sentencepiece(&self.vocabulary, &tokens),
+            text: detokenize(&self.output, &tokens),
             language,
         })
     }
-}
-
-fn prompt_language(model: &GgufFile, prompt_index: usize) -> Result<String> {
-    let dictionary = string_array(model, "asr.rnnt.prompt_dictionary")?;
-    dictionary
-        .iter()
-        .filter_map(|entry| entry.rsplit_once(':'))
-        .find_map(|(language, index)| {
-            (index.parse::<usize>().ok() == Some(prompt_index)).then(|| language.to_owned())
-        })
-        .ok_or_else(|| rejected(format!("prompt dictionary has no index {prompt_index}")))
-}
-
-fn string_array(model: &GgufFile, key: &str) -> Result<Vec<String>> {
-    let Some(MetadataValue::Array(values)) = model.metadata().data.get(key) else {
-        return Err(rejected(format!("missing {key}")));
-    };
-    values
-        .values
-        .iter()
-        .map(|value| match value {
-            MetadataValue::String(value) => Ok(value.clone()),
-            _ => Err(rejected(format!("{key} contains a non-string"))),
-        })
-        .collect()
 }
 
 fn rejected(message: impl Into<String>) -> RuntimeError {

@@ -251,6 +251,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             ]
         })
         .collect();
+    packets.set_output(nemotron_packet_support::token_output(&gguf, Some(0))?)?;
     let section = packets.pipeline_section_with_frame_transform(
         13087,
         10,
@@ -259,7 +260,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &frame_transform,
         trailing_encoder_frames,
     )?;
-    std::fs::write(&args[3], packets.model.to_blob_v6(&[section]))?;
+    std::fs::write(&args[3], packets.model.to_blob_v6(&[section, packets.vocabulary_section()?]))?;
     println!(
         "{}",
         serde_json::json!({

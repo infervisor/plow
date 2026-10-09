@@ -1,6 +1,7 @@
-# Silero VAD v5 (16 kHz) for the H100 speech serve: the `vad.silero.v1` packet (devgen::vad, two
-# LSTM-state-bank programs of generic FP32 ops) run by plowrt's host executor (asr::vad, CPU, AVX2/
-# FMA picked at runtime). No device object: the packet is device-agnostic; this recipe pins the
+# Silero VAD v5 (16 kHz) for the H100 speech serve: a `vad.frame.v1` packet (speech contract 1,
+# docs/runtime/asr-packet-contract.md; devgen::vad, two LSTM-state-bank programs of generic FP32
+# ops, Silero's segment policy as packet parameters) run by plowrt's generic host executor
+# (asr::vad, CPU, AVX2/FMA picked at runtime). No device object: the packet is device-agnostic; this recipe pins the
 # build, the gate and the H100 host numbers. Not a plowc emit; [build].script is the build.
 #
 #   scripts/asr/silero_vad_build.sh <python with torch, silero-vad 5.1.2, safetensors> <fresh dir>
@@ -11,13 +12,14 @@
 # H100 host (AMD EPYC 7R13): 70 us per stream-frame on one core; 256 streams 17.7 ms per 32 ms tick
 # on one core, 3.7 ms on 8 threads (asr_vad_check bench).
 # Gate (host executor vs the TorchScript model): 79 clips, 17,321 frames, max |dp| 2.0e-6,
-# mean 2.6e-8, decisions at 0.5 agree 100% (0 flips).
+# mean 2.6e-8, decisions at 0.5 agree 100% (0 flips). Contract 1 (f0766b0d): packet sha256
+# 1a2ac957..., the same gate numbers; 256 streams 17.7 ms per tick on one core (base 17.9).
 
 schema = "plow.recipe.v1"
 namespace = "infervisor"
 name = "silero-vad"
 label = "sm90a-h100-tp1"
-plow_git = "ed56a89aa2e2a9d2a3aa67854a2108ed98e69d89"
+plow_git = "f0766b0d1c6fa9d6a68d8910fea2133670e204c0"
 network = "silero-vad-v5"
 doc = "docs/runtime/asr.md"
 

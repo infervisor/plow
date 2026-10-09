@@ -1,5 +1,5 @@
 """Export Silero VAD v5's 16 kHz weights (from the `silero-vad` package's TorchScript model) to a
-safetensors checkpoint that `asr_silero_vad_compile` lowers into a `vad.silero.v1` packet.
+safetensors checkpoint that `asr_silero_vad_compile` lowers into a `vad.frame.v1` packet.
 
   python scripts/asr/silero_export.py <out dir>      (needs torch, silero-vad, safetensors)
 

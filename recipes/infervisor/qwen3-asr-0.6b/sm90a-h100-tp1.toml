@@ -11,6 +11,11 @@
 # Gate (H100, 09e53e76, packet f7dd071e34c0): WER on the 73-clip LibriSpeech dummy
 # set c1 4.435% / c16 4.261% (L40S/L4 4.261% at both; the B=1 decode path differs). Served c1 p50
 # 42 ms, RTFx 138; c16 RTFx 508; open loop 80 req/s holds the 1 s SLO for only 74% (L40S 99.4%).
+#
+# Speech contract 1 (docs/runtime/asr-packet-contract.md): plowrt >= asr-packets refuses the
+# contract-0 model.pkt of earlier emits; re-emit (the receipts pin the packet). Re-emitted at
+# 11c4a5bb: model.pkt 1da8ea9f49d7 (only its metadata differs from 09e53e76's), encoder.pkt unchanged;
+# with the 09e53e76 objects, H100 WER c1 4.435% / c16 4.261% as before.
 
 schema = "plow.recipe.v1"
 namespace = "infervisor"
