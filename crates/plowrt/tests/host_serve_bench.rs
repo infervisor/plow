@@ -21,17 +21,34 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 mod common;
 
 struct Counting;
-static ALLOCS: AtomicU64 = AtomicU64::new(0);
-static ALLOC_BYTES: AtomicU64 = AtomicU64::new(0);
+/// Per-thread shards: one shared counter bounced its cache line across every server thread and
+/// showed up as 7% of the request handler's profile.
+const SHARDS: usize = 64;
+static ALLOCS: [crossbeam_utils::CachePadded<AtomicU64>; SHARDS] =
+    [const { crossbeam_utils::CachePadded::new(AtomicU64::new(0)) }; SHARDS];
+static NEXT_SHARD: AtomicU64 = AtomicU64::new(0);
 thread_local! {
     static CLIENT: Cell<bool> = const { Cell::new(false) };
+    static SHARD: Cell<usize> = const { Cell::new(usize::MAX) };
 }
 
-fn count(n: usize) {
-    if !CLIENT.try_with(Cell::get).unwrap_or(true) {
-        ALLOCS.fetch_add(1, Relaxed);
-        ALLOC_BYTES.fetch_add(n as u64, Relaxed);
+fn count(_n: usize) {
+    if CLIENT.try_with(Cell::get).unwrap_or(true) {
+        return;
     }
+    let shard = SHARD
+        .try_with(|s| {
+            if s.get() == usize::MAX {
+                s.set(NEXT_SHARD.fetch_add(1, Relaxed) as usize % SHARDS);
+            }
+            s.get()
+        })
+        .unwrap_or(0);
+    ALLOCS[shard].fetch_add(1, Relaxed);
+}
+
+fn allocs() -> u64 {
+    ALLOCS.iter().map(|a| a.load(Relaxed)).sum()
 }
 
 unsafe impl GlobalAlloc for Counting {
@@ -254,7 +271,7 @@ fn host_serve_bench() {
     for cell in cells.iter().filter(|c| c.name == "warm" || only.as_deref().map_or(true, |o| o.split(',').any(|n| n == c.name))) {
         let requests = ((cell.requests as f64 * scale) as usize).max(cell.conc);
         let req = Arc::new(request(if cell.long { &prompt } else { short }, cell.max_tokens, cell.stream));
-        let (cpu0, a0) = (server_cpu_ms(), ALLOCS.load(Relaxed));
+        let (cpu0, a0) = (server_cpu_ms(), allocs());
         let t0 = Instant::now();
         let left = Arc::new(AtomicU64::new(requests as u64));
         let mut stats = cli.block_on(async {
@@ -283,7 +300,7 @@ fn host_serve_bench() {
         });
         let wall = t0.elapsed().as_secs_f64();
         std::thread::sleep(Duration::from_millis(50));
-        let (cpu, allocs) = (server_cpu_ms() - cpu0, ALLOCS.load(Relaxed) - a0);
+        let (cpu, n_allocs) = (server_cpu_ms() - cpu0, allocs() - a0);
         let tok = stats.tokens.max(1) as f64;
         println!(
             "HOSTSERVE {} {} {} {:.2} {:.0} {:.0} {:.1} {:.2} {:.0} {:.1} {:.0} {:.1} {:.0}",
@@ -295,8 +312,8 @@ fn host_serve_bench() {
             stats.tokens as f64 / wall,
             cpu * 1e3 / requests as f64,
             cpu * 1e3 / tok,
-            allocs as f64 / requests as f64,
-            allocs as f64 / tok,
+            n_allocs as f64 / requests as f64,
+            n_allocs as f64 / tok,
             pct(&mut stats.ttft_us, 0.5),
             pct(&mut stats.itl_us, 0.5),
             pct(&mut stats.e2e_us, 0.5),

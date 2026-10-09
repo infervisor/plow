@@ -58,6 +58,17 @@ impl Tokenize for ByteTokenizer {
         String::from_utf8_lossy(&bytes).into_owned()
     }
 
+    fn decode_append(&self, ids: &[u32], _keep_special: bool, out: &mut String) {
+        thread_local! {
+            static BYTES: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+        }
+        BYTES.with_borrow_mut(|bytes| {
+            bytes.clear();
+            bytes.extend(ids.iter().filter_map(|&id| u8::try_from(id).ok()));
+            out.push_str(&String::from_utf8_lossy(bytes));
+        });
+    }
+
     fn vocab_size(&self) -> usize {
         256
     }

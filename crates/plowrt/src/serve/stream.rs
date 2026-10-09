@@ -182,13 +182,20 @@ impl FrameHead {
         FrameHead(head)
     }
 
-    /// One SSE event carrying the chunk with `choice` as its only choice.
+    /// One SSE event carrying the chunk with `choice` as its only choice. Built in a reused buffer
+    /// and copied out at its exact length: `Bytes::from` a `Vec` with spare capacity allocates a
+    /// second, shared header.
     pub fn frame(&self, choice: &impl serde::Serialize) -> Bytes {
-        let mut buf = Vec::with_capacity(self.0.len() + 160);
-        buf.extend_from_slice(&self.0);
-        let _ = serde_json::to_writer(&mut buf, choice);
-        buf.extend_from_slice(b"]}\n\n");
-        Bytes::from(buf)
+        thread_local! {
+            static BUF: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+        }
+        BUF.with_borrow_mut(|buf| {
+            buf.clear();
+            buf.extend_from_slice(&self.0);
+            let _ = serde_json::to_writer(&mut *buf, choice);
+            buf.extend_from_slice(b"]}\n\n");
+            Bytes::copy_from_slice(buf)
+        })
     }
 }
 
