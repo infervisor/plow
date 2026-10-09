@@ -1202,41 +1202,26 @@ fn lower_audio_capacity(seq: &mut Seq, a: &AudioTower, ckpt: &Ckpt, frames: u32)
         })?;
         seq.done(e);
         seq.round(g, t2, h)?;
-        let dw = seq.weight_f32(&format!("{lc}depthwise_conv1d.weight"), u64::from(h * a.conv_kernel));
-        let deps = seq.deps();
-        let e = seq.p().conv1d_f32(
-            g,
-            false,
-            &deps,
-            crate::pipeline::Conv1dF32Stage {
-                output: TensorRef::Named("act.mm.a.lc_conv"),
-                weight: TensorRef::Handle(dw),
-                bias: None,
-                alpha: None,
-                residual: None,
-                lengths: None,
-                batch: 1,
-                in_rows: t2,
-                in_channels: h,
-                out_channels: h,
-                kernel: a.conv_kernel,
-                stride: 1,
-                dilation_or_output_padding: 1,
-                groups: h,
-                pad_before: a.conv_kernel - 1,
-                pad_after: 0,
-                pad_mode: crate::pipeline::PadMode::Zero,
-                input_activation: crate::pipeline::Activation::None,
-                output_activation: crate::pipeline::Activation::None,
-                slope: 0.0,
-                weight_f16: false,
-                split_bf16: false,
-                weight_tap_major: false,
-                wgmma: false,
-                weight_split: false,
-            },
-        )?;
-        let cv = seq.done(e);
+        // Causal depthwise conv as shifted row gathers times per-channel taps, accumulated in f32
+        // and rounded once: y[t] = sum_k w[:, k] * g[t - (K - 1) + k]. (The speech Conv1d arm
+        // would add ~300k PTX lines to the speech object for one op.)
+        let wk = ckpt.f32s(&format!("{lc}depthwise_conv1d.weight"))?;
+        let kn = a.conv_kernel;
+        let cv = seq.t("act.mm.a.lc_conv", u64::from(t2 * h));
+        let tap = seq.t("act.mm.a.lc_tap", u64::from(t2 * h));
+        for k in 0..kn {
+            let shift = kn - 1 - k;
+            let index: Vec<u32> = (0..t2).map(|t| if t >= shift { t - shift } else { u32::MAX }).collect();
+            let index = seq.constant_u32(&format!("const.mm.a.shift{shift}.{t2}"), &index);
+            let w: Vec<f32> = (0..h).map(|c| wk[(c * kn + k) as usize]).collect();
+            let w = seq.constant(&format!("{lc}depthwise_conv1d.tap{k}"), w);
+            let dst = if k == 0 { cv } else { tap };
+            seq.gather(dst, g, t2, index, t2, h, false)?;
+            seq.binary(dst, w, None, 2, [1, t2, h], [0, 0, 1], false)?;
+            if k > 0 {
+                seq.binary(cv, tap, None, 0, [1, t2, h], [0, h, 1], false)?;
+            }
+        }
         seq.round(cv, t2, h)?;
         seq.rms(cv, None, t2, 1, h, Some(&format!("{lc}conv_norm.weight")), a.eps)?;
         seq.unary(cv, None, t2, h, ACT_SILU, 0.0, 0.0)?;

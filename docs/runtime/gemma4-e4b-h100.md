@@ -45,6 +45,38 @@ Two builds from the same recipe (shared tree and a clean worktree) produce a byt
   (`prefix.rs`). Cached and cold prompts give the same tokens (see below). Sessions
   (`X-Session-Id`) are served from the prefix cache (`X-Session-Cache: prefix-cache`).
 
+## Images and audio (experimental: `PLOW_EMIT_MULTIMODAL=1`)
+
+```sh
+python3 scripts/campaign/campaign.py build recipes/infervisor/gemma-4-e4b/sm90a-h100-tp1.toml --out $OUT \
+  --env PLOW_EMIT_MULTIMODAL=1
+```
+
+The flag adds `mm_vision.pkt` (SigLIP-style tower, 16 layers, plus `embed_vision`) and `mm_audio.pkt`
+(USM conformer, 12 layers, plus `embed_audio`) next to `model.pkt`. It also adds `MmRowsBf16` after
+`Embed` in every prefill program, and the `plow.multimodal.v1` contract. Without the flag,
+`model.pkt` is byte-identical. The request surface is described in
+[serving-openai-compat.md](../serving-openai-compat.md) §2c.
+
+* **Rungs.**
+  * Vision: `PLOW_EMIT_MM_VISION_LADDER` images per launch (default `1,2`). Each image is padded
+    to 2520 patches, as in HF.
+  * Audio: `PLOW_EMIT_MM_AUDIO_LADDER` log-mel frames (default `400,1000,2000,3000`, i.e. 4 to 30 s).
+  * The speech interpreter (`interp_sm90a_speech.cubin`) runs both sidecars.
+* **Preprocessing (CPU, from the contract).**
+  * Images: aspect-preserving resize to at most 280 soft tokens (sides multiples of 48), Pillow
+    bicubic, then 16×16 patches.
+  * Audio: 16 kHz, semicausal log-mel (128 HTK bins, frame 320, hop 160, fft 512). Tokens =
+    ⌈⌈valid/2⌉/2⌉.
+* **New ops.**
+  * `RmsNormF32` (206): grouped RMSNorm, optional gamma.
+  * `RopeAxialF32` (207): 2-D axial rotate-half.
+  * `ChunkAttentionF32` (208): USM chunked local attention with the relative-position term and
+    the logit softcap.
+  * Clipped linears are lowered as clamp → dense → clamp. The depthwise conv is lowered as 5
+    shifted gathers × per-channel taps.
+* **Parity.** See "Multimodal parity" below.
+
 ## Logprobs API
 
 Served on the CUDA engine. Other backends return 400.

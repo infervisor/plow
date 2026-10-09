@@ -249,6 +249,18 @@ only that metadata. It has no per-model code, so adding a model means emitting i
 - **Limits.** These answer 400: `PLOW_MM_MAX_IMAGES` (8), `PLOW_MM_MAX_AUDIO` (4),
   `PLOW_MM_MAX_IMAGE_PIXELS` (40M) and `PLOW_MM_MAX_AUDIO_SECONDS` (30).
 - **Streaming, logprobs and tools** are unchanged: media only changes prompt ids.
+- **Per model (Gemma 4).**
+
+  | model | image | audio |
+  |---|---|---|
+  | E4B | yes: gemma4_vision tower | yes: USM conformer |
+  | 12B | not emitted | yes: encoder-free 640-sample frames → `embed_audio` |
+  | 26B-A4B, 31B | not emitted | none in the checkpoint |
+
+  - Vision is skipped (with a logged reason) on every checkpoint whose text config sets
+    `use_bidirectional_attention: "vision"`. Those LMs attend bidirectionally within each image on
+    their sliding layers, and the LM attention kernels are causal-only.
+  - 26B/31B vision also needs head_dim 72 in the tower's attention, which supports only 64 and 128.
 
 ## 3. Refusing to serve from the CPU by accident
 
