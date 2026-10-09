@@ -274,6 +274,15 @@ pub struct VmmRings {
     /// Decode and padded prefill rows write garbage into slots without a request; with this
     /// backing those writes land in shared scratch instead of forcing a real ring per idle row.
     idle: Vec<(u64, u64)>,
+    /// `(unit bytes, handle)` released units kept for the next commit: a fresh `cuMemCreate`
+    /// pays the driver's page commit (~17 ms a 224 MiB slot) on the admission path. Unbounded
+    /// while any slot is mapped, trimmed to `spare_cap` bytes once none is.
+    spare: Vec<(u64, u64)>,
+    spare_cap: u64,
+    recycle: bool,
+    /// Released slots whose units stay mapped in place (recycling): readmitting the slot costs no
+    /// driver call, and another slot takes them over only when no spare unit is left.
+    parked: Vec<bool>,
 }
 
 impl VmmRings {
@@ -320,6 +329,10 @@ impl VmmRings {
                 mapped_prefix: 0,
             },
             idle: Vec::new(),
+            spare: Vec::new(),
+            spare_cap: 0,
+            recycle: false,
+            parked: vec![false; batch],
         };
         for t in tensors {
             let logical_bytes = t.slot_bytes * batch as u64;
@@ -379,6 +392,56 @@ impl VmmRings {
         Ok(rings)
     }
 
+    /// Device bytes [`Self::new_idle_backed`] commits before any slot is claimed: one idle unit
+    /// per distinct per-slot span, plus windows whose slots share units, committed whole.
+    pub fn idle_backed_startup_bytes(tensors: &[LiveRingTensor], batch: usize, granularity: u64) -> u64 {
+        let mut idle: Vec<u64> = Vec::new();
+        let mut pinned = 0u64;
+        for t in tensors {
+            if granularity != 0 && t.slot_bytes % granularity == 0 {
+                if !idle.contains(&t.slot_bytes) {
+                    idle.push(t.slot_bytes);
+                }
+            } else {
+                pinned += (t.slot_bytes * batch as u64).next_multiple_of(granularity.max(1));
+            }
+        }
+        pinned + idle.iter().sum::<u64>()
+    }
+
+    /// Keep released units for reuse instead of returning them to the driver: all of them while
+    /// the rings serve any slot, `idle_cap_bytes` once they serve none.
+    pub fn enable_handle_recycling(&mut self, idle_cap_bytes: u64) {
+        self.recycle = true;
+        self.spare_cap = idle_cap_bytes;
+    }
+
+    /// Released units kept for reuse ([`Self::enable_handle_recycling`]), parked ones included.
+    pub fn spare_bytes(&self) -> u64 {
+        let parked = self.parked.iter().filter(|&&p| p).count() as u64;
+        self.spare.iter().map(|&(bytes, _)| bytes).sum::<u64>() + parked * self.slot_charge()
+    }
+
+    /// Hand a parked slot's units to the spare list, its rows back to idle scratch.
+    fn unpark(&mut self, slot: usize) {
+        self.parked[slot] = false;
+        self.for_slot_units(slot, |rings, window, unit| rings.release_unit(window, unit));
+    }
+
+    fn for_slot_units(&mut self, slot: usize, mut f: impl FnMut(&mut Self, usize, usize)) {
+        for i in 0..self.windows.len() {
+            if self.windows[i].pinned {
+                continue;
+            }
+            let (slot_bytes, map_bytes) = (self.windows[i].slot_bytes, self.windows[i].map_bytes);
+            let first = slot as u64 * slot_bytes / map_bytes;
+            let last = ((slot as u64 + 1) * slot_bytes).div_ceil(map_bytes);
+            for unit in first..last {
+                f(self, i, unit as usize);
+            }
+        }
+    }
+
     /// Bytes one slot commits beyond the construction-time residency.
     pub fn slot_charge(&self) -> u64 {
         self.windows
@@ -412,8 +475,13 @@ impl VmmRings {
             self.ops.unmap(va, map_bytes);
             self.windows[window].idle[unit] = false;
         }
+        let spare = self.spare.iter().position(|&(bytes, _)| bytes == map_bytes);
+        let spare = spare.map(|i| self.spare.swap_remove(i).1);
         let result = (|| {
-            let handle = self.ops.create(map_bytes)?;
+            let handle = match spare {
+                Some(handle) => handle,
+                None => self.ops.create(map_bytes)?,
+            };
             if let Err(e) = self.ops.map(va, map_bytes, handle) {
                 self.ops.release(handle);
                 return Err(e);
@@ -462,6 +530,15 @@ impl VmmRings {
         if self.mapped[slot] {
             return Ok(());
         }
+        if std::mem::take(&mut self.parked[slot]) {
+            self.mark_mapped(slot);
+            return Ok(());
+        }
+        if self.spare.is_empty() {
+            if let Some(parked) = self.parked.iter().rposition(|&p| p) {
+                self.unpark(parked);
+            }
+        }
         let mut touched = Vec::new();
         for i in 0..self.windows.len() {
             if self.windows[i].pinned {
@@ -487,36 +564,43 @@ impl VmmRings {
                 touched.push((i, unit));
             }
         }
+        self.mark_mapped(slot);
+        Ok(())
+    }
+
+    fn mark_mapped(&mut self, slot: usize) {
         self.mapped[slot] = true;
         while self.prefix < self.mapped.len() && self.mapped[self.prefix] {
             self.prefix += 1;
         }
         self.stats.mapped_slots += 1;
         self.stats.mapped_prefix = self.prefix;
-        Ok(())
     }
 
     pub fn release_slot(&mut self, slot: usize) {
         if slot >= self.mapped.len() || !self.mapped[slot] {
             return;
         }
-        for i in 0..self.windows.len() {
-            if self.windows[i].pinned {
-                continue;
-            }
-            let slot_bytes = self.windows[i].slot_bytes;
-            let map_bytes = self.windows[i].map_bytes;
-            let first = slot as u64 * slot_bytes / map_bytes;
-            let end = (slot as u64 + 1) * slot_bytes;
-            let last = end.div_ceil(map_bytes);
-            for unit in first..last {
-                self.release_unit(i, unit as usize);
-            }
+        if self.recycle {
+            self.parked[slot] = true;
+        } else {
+            self.for_slot_units(slot, |rings, window, unit| rings.release_unit(window, unit));
         }
         self.mapped[slot] = false;
         self.prefix = self.prefix.min(slot);
         self.stats.mapped_slots -= 1;
         self.stats.mapped_prefix = self.prefix;
+        if self.stats.mapped_slots == 0 {
+            for parked in 0..self.parked.len() {
+                if self.parked[parked] {
+                    self.unpark(parked);
+                }
+            }
+            while self.spare_bytes() > self.spare_cap {
+                let (_, handle) = self.spare.pop().expect("spare over cap");
+                self.ops.release(handle);
+            }
+        }
     }
 
     /// Release a slot with no request unless the latest launch covered it: the next launch at that
@@ -535,10 +619,14 @@ impl VmmRings {
             return;
         }
         let handle = w.handles[unit].take().expect("referenced ring mapping");
-        self.ops
-            .unmap(w.va + unit as u64 * w.map_bytes, w.map_bytes);
-        self.ops.release(handle);
-        self.stats.resident_bytes -= w.map_bytes;
+        let bytes = w.map_bytes;
+        self.ops.unmap(w.va + unit as u64 * bytes, bytes);
+        if self.recycle {
+            self.spare.push((bytes, handle));
+        } else {
+            self.ops.release(handle);
+        }
+        self.stats.resident_bytes -= bytes;
         if let Err(e) = self.back_idle(window, unit) {
             tracing::error!(error = %e, "live ring idle backing lost");
         }
@@ -576,7 +664,7 @@ impl Drop for VmmRings {
             }
             self.ops.address_free(w.va, w.bytes);
         }
-        for (_, handle) in self.idle.drain(..) {
+        for (_, handle) in self.idle.drain(..).chain(self.spare.drain(..)) {
             self.ops.release(handle);
         }
     }
@@ -673,6 +761,29 @@ impl LiveKvLayout {
             ring_tensors,
             cache_tensors,
         })
+    }
+    /// Full caches as slot-granular rings when their head window is below one VMM block
+    /// (`block_bytes` refuses it) but each slot's span is whole granules.
+    pub fn slot_granular_full(
+        &self,
+        blob: &crate::asset::devblob::DevBlob,
+        granularity: u64,
+        block_hint: u64,
+    ) -> Option<Vec<LiveRingTensor>> {
+        if self.geometry.block_bytes(granularity, block_hint).is_ok() || granularity == 0 {
+            return None;
+        }
+        let batch = u64::from(self.geometry.batch);
+        self.full_tensors
+            .iter()
+            .flatten()
+            .map(|&tensor| {
+                let bytes = blob.tensors[tensor].bytes;
+                let slot_bytes = bytes / batch.max(1);
+                (slot_bytes > 0 && slot_bytes * batch == bytes && slot_bytes % granularity == 0)
+                    .then_some(LiveRingTensor { tensor, slot_bytes })
+            })
+            .collect()
     }
     pub fn from_blob(blob: &crate::asset::devblob::DevBlob) -> Result<Self> {
         let manifest = blob
@@ -1375,6 +1486,29 @@ impl VmmKv {
         self.shared.cache_min_free.store(min_free_bytes, Ordering::Relaxed);
     }
 
+    /// Give memory back for an allocation outside this pool that failed for lack of it (a
+    /// lazily instantiated graph): release pooled blocks, then evict cached prefixes until the
+    /// device reports `bytes` above the pressure floor free. `false` = nothing was freed.
+    pub fn relieve(&self, bytes: u64) -> bool {
+        let s = &*self.shared;
+        let mut inner = s.inner.lock();
+        let mut freed = false;
+        while let Some(handle) = inner.pooled.pop() {
+            inner.stats.blocks_pooled -= 1;
+            s.ops.release(handle);
+            freed = true;
+        }
+        let target = s.cache_min_free.load(Ordering::Relaxed).saturating_add(bytes);
+        let queued = inner.release_queued;
+        while s.ops.free_bytes().is_some_and(|free| free + (inner.release_queued - queued) < target) {
+            if !evict_one(s, &mut inner, false) {
+                break;
+            }
+            freed = true;
+        }
+        freed
+    }
+
     /// Take slot recycling off the caller's thread: [`Self::begin_seq`] keeps a
     /// private row-0 block in place and hands the rest of the window to the
     /// pool thread (see [`retire_window`]); zero-ref handles past the pool cap
@@ -1704,6 +1838,12 @@ impl VmmKv {
     }
 
     pub fn try_attach(&self, seq: usize, prompt: &[u32]) -> Result<Option<Attach>> {
+        self.try_attach_keyed(seq, prompt, None)
+    }
+
+    /// [`Self::try_attach`] with the prompt's block hashes already computed (by the DP router);
+    /// a key for another block size or prompt is ignored and the prompt hashed here.
+    pub fn try_attach_keyed(&self, seq: usize, prompt: &[u32], key: Option<PrefixKey>) -> Result<Option<Attach>> {
         if !self.prefix_reuse {
             return Ok(None);
         }
@@ -1717,7 +1857,10 @@ impl VmmKv {
             return try_attach_fine(&mut inner, seq, prompt);
         }
         note_lead(&mut inner, seq, prompt);
-        let hashes = hash_blocks(prompt, s.block_rows);
+        let hashes = match key {
+            Some(k) if k.fits(s.block_rows, prompt) => k.hashes,
+            _ => hash_blocks(prompt, s.block_rows),
+        };
         let aligned = &prompt[..hashes.len() * s.block_rows as usize];
 
         let m = inner.cache.lookup(&hashes, aligned);
@@ -2400,21 +2543,75 @@ impl PrefixProbe {
         cached_rows(&self.0, prompt)
     }
 
+    /// [`Self::cached_rows`] reusing `key` when it was hashed for this block size and prompt.
+    pub fn cached_rows_keyed(&self, prompt: &[u32], key: Option<&PrefixKey>) -> u32 {
+        match key {
+            Some(k) if k.fits(self.0.block_rows, prompt) => rows_for(&self.0, &self.0.inner.lock(), prompt, &k.hashes),
+            _ => cached_rows(&self.0, prompt),
+        }
+    }
+
+    /// `prompt`'s block hashes, computed with no lock held.
+    pub fn key(&self, prompt: &[u32]) -> PrefixKey {
+        PrefixKey::new(prompt, self.0.block_rows)
+    }
+
+    /// Leading prompt rows whose blocks this cache holds (whole blocks; an upper bound on what an
+    /// attach restores, without walking its snapshots), or `None` when the cache lock is held: a
+    /// router must not wait on an engine.
+    pub fn try_matched_rows(&self, key: &PrefixKey, prompt: &[u32]) -> Option<u32> {
+        if !key.fits(self.0.block_rows, prompt) {
+            return Some(0);
+        }
+        let inner = self.0.inner.try_lock()?;
+        if inner.fine_rows > 0 && (prompt.len() as u64) < u64::from(inner.fine_ceiling) {
+            return Some(0);
+        }
+        let aligned = &prompt[..key.hashes.len() * self.0.block_rows as usize];
+        Some(inner.cache.matched_blocks(&key.hashes, aligned) as u32 * self.0.block_rows)
+    }
+
     pub fn block_rows(&self) -> u32 {
         self.0.block_rows
+    }
+}
+
+/// A prompt's chained block hashes ([`hash_blocks`]), computed once and reused by every probe
+/// and the attach that follows.
+#[derive(Clone, Debug, Default)]
+pub struct PrefixKey {
+    block_rows: u32,
+    prompt_len: usize,
+    pub hashes: Vec<BlockHash>,
+}
+
+impl PrefixKey {
+    pub fn new(prompt: &[u32], block_rows: u32) -> Self {
+        PrefixKey { block_rows, prompt_len: prompt.len(), hashes: hash_blocks(prompt, block_rows) }
+    }
+
+    pub fn block_rows(&self) -> u32 {
+        self.block_rows
+    }
+
+    fn fits(&self, block_rows: u32, prompt: &[u32]) -> bool {
+        self.block_rows == block_rows && self.prompt_len == prompt.len()
     }
 }
 
 /// [`VmmKv::try_attach`]'s choice (the longest snapshot boundary on the matched block path),
 /// without its side effects.
 fn cached_rows(s: &Shared, prompt: &[u32]) -> u32 {
-    let inner = s.inner.lock();
+    let hashes = hash_blocks(prompt, s.block_rows);
+    rows_for(s, &s.inner.lock(), prompt, &hashes)
+}
+
+fn rows_for(s: &Shared, inner: &Inner, prompt: &[u32], hashes: &[BlockHash]) -> u32 {
     if inner.fine_rows > 0 && (prompt.len() as u64) < u64::from(inner.fine_ceiling) {
         return 0;
     }
-    let hashes = hash_blocks(prompt, s.block_rows);
     let aligned = &prompt[..hashes.len() * s.block_rows as usize];
-    let placed = inner.cache.peek(&hashes, aligned);
+    let placed = inner.cache.peek(hashes, aligned);
     let mut best = 0;
     for blocks in 0..=placed.len() {
         let node = blocks.checked_sub(1).map(|i| placed[i]);
@@ -4393,6 +4590,29 @@ mod tests {
     }
 
     #[test]
+    fn sub_granule_head_windows_commit_full_caches_per_slot() {
+        let (gran, hint) = (2u64 << 20, 2u64 << 20);
+        let mut blob = live_blob();
+        let mut layout = LiveKvLayout::from_blob(&blob).unwrap();
+        // 512 KiB heads: one slot's single head is not whole granules either.
+        assert!(layout.slot_granular_full(&blob, gran, hint).is_none());
+        // Block-mappable heads keep the row-granular pool.
+        assert!(layout.slot_granular_full(&blob, 512 << 10, 512 << 10).is_none());
+        // Qwen3-ASR shape: 8 heads x 2048 rows x hd128 bf16 = 4 MiB per slot.
+        (layout.geometry.kvh_full, layout.geometry.hd_full, layout.geometry.max_ctx) = (8, 128, 2048);
+        for t in [1, 2] {
+            blob.tensors[t].bytes = 4 * 8 * 2048 * 128 * 2;
+        }
+        let full = layout.slot_granular_full(&blob, gran, hint).unwrap();
+        assert_eq!(
+            full.iter().map(|t| (t.tensor, t.slot_bytes)).collect::<Vec<_>>(),
+            [(1, 4 << 20), (2, 4 << 20)]
+        );
+        blob.tensors[2].bytes += 4;
+        assert!(layout.slot_granular_full(&blob, gran, hint).is_none());
+    }
+
+    #[test]
     fn live_geometry_rejects_conflicting_or_unbounded_access() {
         use packet::dev::DevOp;
         let mutations: &[fn(&mut crate::asset::devblob::DevBlob)] = &[
@@ -4852,6 +5072,116 @@ mod tests {
         let a = p.try_attach(1, &pr).unwrap().expect("published boundary");
         assert_eq!(a.rows, 16);
         assert_eq!(a.snap_bytes, 4);
+    }
+
+    /// DP router cost at dp=8: block hashing, route without the probe, route with it (hashing
+    /// included). One rank holds half the prompt, so every rank is probed. Run with
+    /// `cargo test --release -p plowrt --features cuda --lib dp_route_microbench -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn dp_route_microbench() {
+        use crate::serve::dp::{DpSet, RouteCfg};
+        fn pct(mut v: Vec<u64>) -> (u64, u64) {
+            v.sort_unstable();
+            (v[v.len() / 2], v[v.len() * 99 / 100])
+        }
+        let max_ctx = 32 * 1024 + 256;
+        let pools: Vec<VmmKv> = (0..8)
+            .map(|_| {
+                let ops = Arc::new(MockVmm::default());
+                ops.granularity.store(64 << 10, Ordering::SeqCst);
+                let geo = VmmGeometry {
+                    full_layers: vec![0, 1],
+                    kvh_full: 1,
+                    hd_full: 256,
+                    slide_layers: vec![],
+                    kvh_slide: 1,
+                    hd_slide: 256,
+                    window: 0,
+                    elem: 2,
+                    elem_slide: 2,
+                    max_ctx,
+                    batch: 2,
+                };
+                VmmKv::new(ops, geo, 64 << 10, 0).expect("pool")
+            })
+            .collect();
+        let br = pools[0].block_rows();
+        let set = DpSet::new("m", (0..8).map(|r| (r, r as usize, Arc::new(crate::obs::Metrics::default()))).collect());
+        for (r, p) in pools.iter().enumerate() {
+            set.ranks[r].metrics.slots_capacity.store(16, Ordering::Relaxed);
+            set.ranks[r].set_up(true);
+            set.set_probe(r, p.prefix_probe());
+        }
+        println!("block_rows {br}");
+        println!("{:>6} {:>16} {:>16} {:>16} {:>18}", "prompt", "hash p50/p99", "route p50/p99", "+probe p50/p99", "probe-hash p50/p99");
+        for len in [1024usize, 8192, 32768] {
+            let mut prompt: Vec<u32> = (0..len as u32).map(|i| (i ^ len as u32).wrapping_mul(2654435761) % 150_000).collect();
+            let half = (len / 2) as u32 / br * br;
+            pools[3].ensure_rows(0, half + 1).unwrap();
+            assert!(pools[3].try_attach(0, &prompt[..half as usize + 1]).unwrap().is_none());
+            pools[3].publish_at(0, &prompt, half, 4, |_| Ok(())).unwrap();
+            let cfg = RouteCfg::default();
+            let n = 2000;
+            let time = |f: &mut dyn FnMut()| -> Vec<u64> {
+                (0..n)
+                    .map(|_| {
+                        let t = std::time::Instant::now();
+                        f();
+                        t.elapsed().as_nanos() as u64
+                    })
+                    .collect()
+            };
+            let hash = time(&mut || {
+                std::hint::black_box(PrefixKey::new(std::hint::black_box(&prompt), br));
+            });
+            let plain = time(&mut || {
+                std::hint::black_box(set.route(&cfg, None, None, 0));
+            });
+            let mut hit = 0;
+            // A fresh last token per request: no routed prompt's tail matches, so every request
+            // walks the tail chain to its limit and then probes all eight caches (the worst case).
+            let mut fresh = 0u32;
+            let probed = time(&mut || {
+                fresh += 1;
+                *prompt.last_mut().unwrap() = 200_000 + fresh;
+                let r = set.route(&cfg, None, Some(&prompt), 0).unwrap();
+                hit += usize::from(r.rank == 3);
+            });
+            assert_eq!(hit, n, "the rank holding the prefix wins");
+            let net: Vec<u64> = probed.iter().zip(&hash).map(|(p, h)| p.saturating_sub(*h)).collect();
+            let (h, p, q, d) = (pct(hash), pct(plain), pct(probed), pct(net));
+            println!("{len:>6} {:>7}/{:<8} {:>7}/{:<8} {:>7}/{:<8} {:>8}/{:<9}", h.0, h.1, p.0, p.1, q.0, q.1, d.0, d.1);
+            pools[3].begin_seq(0);
+        }
+        println!("probes {} contended {}", set.stats.probes.load(Ordering::Relaxed), set.stats.probe_contended.load(Ordering::Relaxed));
+    }
+
+    /// The DP router's keyed probe answers what `cached_rows` answers, never trusts a key hashed
+    /// for another prompt, and gives up instead of waiting on a held cache lock.
+    #[test]
+    fn keyed_probes_match_cached_rows_and_skip_a_held_lock() {
+        let ops = Arc::new(MockVmm::default());
+        let p = uniform_pool(ops.clone());
+        let pr = prompt(17);
+        assert!(p.try_attach(0, &pr).unwrap().is_none());
+        p.ensure_rows(0, 17).unwrap();
+        p.publish(0, &pr, 4, |_va| Ok(())).unwrap();
+        let probe = p.prefix_probe().expect("prefix reuse");
+        let key = probe.key(&pr);
+        assert_eq!(p.cached_rows(&pr), 16);
+        assert_eq!(probe.try_matched_rows(&key, &pr), Some(16));
+        assert_eq!(probe.cached_rows_keyed(&pr, Some(&key)), 16);
+        let wrong = probe.key(&prompt(18));
+        assert_eq!(probe.cached_rows_keyed(&pr, Some(&wrong)), 16);
+        assert_eq!(probe.try_matched_rows(&wrong, &pr), Some(0));
+        {
+            let _held = p.shared.inner.lock();
+            assert_eq!(probe.try_matched_rows(&key, &pr), None);
+        }
+        p.ensure_rows(1, 1).unwrap();
+        let a = p.try_attach_keyed(1, &pr, Some(key)).unwrap().expect("keyed attach");
+        assert_eq!(a.rows, 16);
     }
 
     /// `enable_shared_publish`: a lead seen on one sequence only never snapshots; the
@@ -6036,6 +6366,28 @@ mod tests {
         p.begin_seq(0);
         assert_eq!(p.stats().cache_bytes, 0, "a scarce-memory report must evict although cache_cap was nowhere near its limit");
         assert_eq!(ops.frees.load(Ordering::SeqCst), 1);
+    }
+
+    /// A graph instantiation that ran out of memory gets the cache back: `relieve` evicts while
+    /// the device is short of floor + request, and reports when there was nothing to free.
+    #[test]
+    fn relieve_evicts_the_cache_for_an_outside_allocation() {
+        let ops = Arc::new(MockVmm::default());
+        let mut p = pool_with_cap(ops.clone(), 1 << 20);
+        p.enable_pressure_eviction(500);
+        *ops.free_bytes.lock().unwrap() = Some(1 << 30);
+        let a = prompt(17);
+        p.try_attach(0, &a).unwrap();
+        p.ensure_rows(0, 17).unwrap();
+        p.publish(0, &a, 192, |_| Ok(())).unwrap();
+        p.begin_seq(0);
+        assert!(p.stats().cache_bytes > 0);
+        assert!(!p.relieve(256), "ample free memory: nothing to evict");
+        assert!(p.stats().cache_bytes > 0);
+        *ops.free_bytes.lock().unwrap() = Some(600); // above the floor, short of floor + 256
+        assert!(p.relieve(256));
+        assert_eq!(p.stats().cache_bytes, 0);
+        assert!(!p.relieve(256), "an empty cache cannot help");
     }
 
     /// A backend that cannot answer `free_bytes` (every real one, today) must not silently

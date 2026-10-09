@@ -299,7 +299,7 @@ const DOC: &[S] = &[
     S { op: DevOp::ScaledAddF32, t: &["out", "a", "b"], i: &["n", "flags"], f: &["scale"], j: &[] },
     S { op: DevOp::GluF32, t: &["out", "x"], i: &["rows", "width"], f: &[], j: &[] },
     S { op: DevOp::CausalDepthwiseConv1dF32, t: &["out", "x", "weight"], i: &["rows", "channels", "kernel"], f: &[], j: &[] },
-    S { op: DevOp::RelativeAttentionF32, t: &["context", "query", "key", "value", "position", "bias_u", "bias_v"], i: &["rows", "width", "heads", "chunk_size", "left_chunks"], f: &[], j: &[] },
+    S { op: DevOp::RelativeAttentionF32, t: &["context", "query", "key", "value", "position", "bias_u", "bias_v", "key_start?"], i: &["rows", "width", "heads", "chunk_size", "left_chunks", "query_row0"], f: &[], j: &[] },
     S { op: DevOp::SiluF32, t: &["out", "x"], i: &["n"], f: &[], j: &[] },
     S { op: DevOp::DenseGemmF32, t: &["C", "A", "W", "bias?", "scratch?", "stats?", "gamma?", "beta?"], i: &["M", "N", "K", "activation", "a_row0", "weight_stride?", "implicit_onehot_col", "flags"], f: &[], j: &[] },
     S { op: DevOp::EmbedF16F32, t: &["out", "table", "token"], i: &["vocab", "width"], f: &[], j: &[] },

@@ -236,6 +236,8 @@ pub struct JobOpts {
     /// A later turn of a session that already had one: seated ahead of requests opening a
     /// session, until either has waited [`crate::serve::cosched::max_wait`].
     pub continuing: bool,
+    /// The prompt's prefix-cache block hashes, when the DP router already computed them.
+    pub prefix: Option<crate::memory::vmm::PrefixKey>,
 }
 
 /// Queue priority. Orders the waiting queue and serial prefill, and scales the queue TTL.
@@ -404,6 +406,10 @@ fn turn_job_due(
     stage_due(stage, t, e, stage_cost(stage, prefill, tick, e), since)
 }
 
+/// How often a dispatcher re-reads its engine's KV admission budget from device memory.
+#[cfg(feature = "cuda")]
+const KV_BUDGET_REFRESH: std::time::Duration = std::time::Duration::from_millis(50);
+
 /// How long a consumer that stopped reading may hold its slot parked before the request is cut.
 const PARK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
@@ -473,15 +479,54 @@ pub struct ModelMux {
     /// re-queues with its new most urgent work instead of the `Due` it queued with.
     arrival_notify: Arc<tokio::sync::Notify>,
     /// Requests past model lookup whose job is not on `tx` yet (still tokenizing).
-    ingress: Arc<std::sync::atomic::AtomicUsize>,
+    ingress: Arc<Ingress>,
+    /// Set by [`ModelMux::preempt`] and never cleared: held work submitting later fails retryably.
+    preempted: Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// What a request submitting to a preempted mux is told (503-class).
+pub const PREEMPTED: &str = "model preempted — retry";
+
+/// Requests past model lookup; the last to leave wakes a gracefully draining dispatcher.
+#[derive(Default)]
+struct Ingress {
+    count: std::sync::atomic::AtomicUsize,
+    idle: tokio::sync::Notify,
+}
+
+impl Ingress {
+    fn enter(&self) {
+        self.count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn leave(&self) {
+        if self.count.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.idle.notify_one();
+        }
+    }
+
+    fn pending(&self) -> usize {
+        self.count.load(Ordering::Acquire)
+    }
 }
 
 /// Holds one count in [`ModelMux::ingress`] until dropped.
-pub struct IngressGuard<'a>(&'a std::sync::atomic::AtomicUsize);
+pub struct IngressGuard<'a>(&'a Ingress);
+
+/// [`IngressGuard`] that outlives the borrow: a request that works before it submits (an ASR
+/// encode) holds it, so a graceful drain waits for its job instead of closing on it. A preempt
+/// does not wait for it; the job's later submission fails with [`PREEMPTED`].
+pub struct OwnedIngress(Arc<Ingress>);
+
+impl Drop for OwnedIngress {
+    fn drop(&mut self) {
+        self.0.leave();
+    }
+}
 
 impl Drop for IngressGuard<'_> {
     fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::Relaxed);
+        self.0.leave();
     }
 }
 
@@ -575,10 +620,37 @@ fn completed_decode(feeds: &[(usize, u32)], steps: usize) -> Option<DecodeProgre
 }
 
 impl ModelMux {
+    /// Whether any request is queued, tokenizing or holding an engine slot.
+    pub fn in_flight(&self) -> bool {
+        self.ingress.pending() > 0
+            || self.metrics.queued_requests.load(Ordering::Relaxed) > 0
+            || self.metrics.slots_active.load(Ordering::Relaxed) > 0
+    }
+
+    pub fn ingress_owned(&self) -> OwnedIngress {
+        self.ingress.enter();
+        OwnedIngress(Arc::clone(&self.ingress))
+    }
+
     /// Count a request as pending before it tokenizes; hand the guard to `submit_arrived`.
     pub fn ingress(&self) -> IngressGuard<'_> {
-        self.ingress.fetch_add(1, Ordering::Relaxed);
+        self.ingress.enter();
         IngressGuard(&self.ingress)
+    }
+
+    /// [`Self::preempt`] has run: this dispatcher is gone or going, and serves nothing more.
+    pub fn preempted(&self) -> bool {
+        self.preempted.load(Ordering::Acquire)
+    }
+
+    /// The dispatcher has exited (a drain finished).
+    pub fn is_closed(&self) -> bool {
+        self.tx.is_closed()
+    }
+
+    /// Requests submitted and not yet in an engine slot.
+    pub fn pending(&self) -> usize {
+        self.metrics.queued_requests.load(Ordering::Relaxed) as usize
     }
 
     /// Submit a job. Returns immediately; the caller awaits the stream.
@@ -658,6 +730,7 @@ impl ModelMux {
     /// service_ms) — a 2048-token slot at 40 ms/token is an 82 s wait.
     /// Returns when the dispatcher has exited.
     pub async fn preempt(&self) {
+        self.preempted.store(true, Ordering::Release);
         self.preempt.store(true, Ordering::Release);
         self.preempt_notify.notify_one();
         // The Drain message wakes a dispatcher blocked on recv (idle path)
@@ -730,6 +803,9 @@ struct Slot {
     resume: usize,
     /// The next token's OpenAI logprobs, set by the sampler when the request asked for them.
     lp: Option<Box<crate::text::logprobs::TokenLogprobs>>,
+    /// [`JobOpts::prefix`], consumed by the prefix-cache attach.
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+    prefix: Option<crate::memory::vmm::PrefixKey>,
 }
 
 impl Slot {
@@ -784,7 +860,7 @@ pub fn spawn(
     let preempt_wake = Arc::clone(&preempt_notify);
     let arrival_notify = Arc::new(tokio::sync::Notify::new());
     let arrival_wake = Arc::clone(&arrival_notify);
-    let ingress = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let ingress = Arc::new(Ingress::default());
     let ingress_seen = Arc::clone(&ingress);
     let metrics = state.model_metrics(&slug);
     let handle_metrics = Arc::clone(&metrics);
@@ -854,13 +930,14 @@ pub fn spawn(
     };
     let (tx, mut rx) = mpsc::channel::<MuxMsg>(ingress_capacity);
     tracing::info!(%slug, capacity, ingress_capacity, "mux capacity resolved");
+    metrics.slots_capacity.store(capacity as u64, Ordering::Relaxed);
 
     // WHAT THE DEVICE CAN BACK, taken once like `gpu_shape` above. Admission used free SLOTS
     // alone, which is right at 8k prompts and fatal at 70k: 20 x 70,000 rows wants 72.1 GiB of
     // a 55.59 GiB budget, and the overcommit arrived as an async queue fault instead of as
     // backpressure. `None` keeps slot-count admission for every engine without a budget.
     #[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu"))]
-    let kv_budget = state
+    let mut kv_budget = state
         .gpu_engine(&slug)
         .and_then(|e| e.lock().kv_admission_budget());
     #[cfg(not(any(feature = "cuda", feature = "hsa", feature = "cpu")))]
@@ -957,6 +1034,10 @@ pub fn spawn(
     #[cfg(not(any(feature = "cuda", feature = "hsa", feature = "cpu")))]
     let inline_tick = false;
     let dispatcher_name = format!("plow-mux-{slug}");
+    let dp_cpus = state
+        .dp_rank(&slug)
+        .map(|(set, r)| set.ranks[r].cpus.clone())
+        .filter(|cpus| !cpus.is_empty() && crate::config::RuntimeConfig::get().dp_numa_pin);
     let downstream = state.downstream(&slug);
 
     let dispatcher = async move {
@@ -1017,6 +1098,9 @@ pub fn spawn(
         let engine_thread = (has_gpu && !inline_tick)
             .then(|| crate::exec::engine_thread::EngineThread::spawn(format!("plow-eng-{slug}")));
         let token_group = bundle.decode_token_group();
+        #[cfg(feature = "cuda")]
+        let (mut kv_refreshed, mut kv_pressure_seen) = (Instant::now(), (0u64, 0u64));
+        let (mut preempted, mut late_drains) = (false, Vec::new());
 
         loop {
             // Preempt ([`ModelMux::preempt`]): kill every live slot NOW.
@@ -1037,14 +1121,52 @@ pub fn spawn(
                     )));
                 }
                 draining = true;
+                preempted = true;
             }
             let live = slots.iter().filter(|s| s.is_some()).count();
+            metrics.slots_active.store(live as u64, Ordering::Relaxed);
+            // The budget follows device memory (other models load, grow and leave); memory
+            // pressure asks the planner to evict an idle co-tenant so this model can grow.
+            #[cfg(feature = "cuda")]
+            if kv_budget.is_some() && kv_refreshed.elapsed() >= KV_BUDGET_REFRESH {
+                kv_refreshed = Instant::now();
+                let pressure = state.gpu_engine(&slug).map(|e| {
+                    let e = e.lock();
+                    kv_budget = e.kv_admission_budget().or(kv_budget);
+                    e.kv_pressure_events()
+                });
+                let seen = (metrics.kv_budget_denials.load(Ordering::Relaxed), pressure.unwrap_or(0));
+                if seen != kv_pressure_seen {
+                    kv_pressure_seen = seen;
+                    tracing::debug!(%slug, denials = seen.0, oom_waits = seen.1, "mux: KV memory short — asking to grow");
+                    if let Some(mgr) = state.manager_for(&slug) {
+                        mgr.request_growth(&slug);
+                    }
+                }
+            }
 
             // Drain completion: if draining and no in-flight slots remain,
-            // signal the drain future and exit the dispatcher loop.
-            if draining && live == 0 && waiting.is_empty() {
+            // signal the drain future and exit the dispatcher loop. A graceful drain waits for a
+            // request past model lookup (`ingress`): closing on it would fail it. A preempt does not
+            // (an idle stream can hold one indefinitely); its later submission fails retryably.
+            let drained = draining && live == 0 && waiting.is_empty() && (preempted || ingress_seen.pending() == 0);
+            // A graceful drain serves what was submitted before the mux left the routing table,
+            // however late its job reached the channel.
+            if drained && !preempted {
+                while let Ok(msg) = rx.try_recv() {
+                    note_dequeued(&msg, &metrics);
+                    match msg {
+                        MuxMsg::Drain(done) => late_drains.push(done),
+                        MuxMsg::Job(job, arrived) => {
+                            Metrics::inc(&metrics.queued_requests);
+                            waiting.push_back((job, arrived));
+                        }
+                    }
+                }
+            }
+            if drained && waiting.is_empty() {
                 turn.release();
-                if let Some(done) = drain_done.take() {
+                for done in drain_done.take().into_iter().chain(late_drains.drain(..)) {
                     let _ = done.send(());
                 }
                 // A preempt's completion oneshot rides a Drain message that
@@ -1083,7 +1205,13 @@ pub fn spawn(
                 // Parking with the turn held would starve a co-tenant for as
                 // long as this model has nothing to do, which is unbounded.
                 turn.release();
-                let Some(msg) = rx.recv().await else { break };
+                let msg = tokio::select! {
+                    msg = rx.recv() => msg,
+                    // A graceful drain held only by ingress: the last request leaving without
+                    // submitting must wake it, as no message will.
+                    _ = ingress_seen.idle.notified(), if draining => continue,
+                };
+                let Some(msg) = msg else { break };
                 note_dequeued(&msg, &metrics);
                 match msg {
                     MuxMsg::Job(job, arrived) => {
@@ -1105,11 +1233,14 @@ pub fn spawn(
                             waiting.push_back(j);
                         }
                     }
+                    // No in-flight work: the drain check at the loop top finishes, after serving
+                    // any request that was past model lookup when the drain began.
                     MuxMsg::Drain(done) => {
-                        // No in-flight work; signal immediately.
-                        let _ = done.send(());
-                        reject_pending_after_drain(&mut rx, &metrics);
-                        break;
+                        draining = true;
+                        match drain_done {
+                            None => drain_done = Some(done),
+                            Some(_) => late_drains.push(done),
+                        }
                     }
                 }
             }
@@ -1163,6 +1294,7 @@ pub fn spawn(
                     .decode_occupied_extent
                     .store(occupied_extent as u64, Ordering::Relaxed);
                 let kv_used = kv_used(kv_budget, &slots);
+                metrics.kv_used_milli.store((kv_used * 1000.0) as u64, Ordering::Relaxed);
                 if crate::serve::policy::observe(crate::serve::policy::Load {
                     width: occupied_extent,
                     queued: waiting.len(),
@@ -1246,7 +1378,7 @@ pub fn spawn(
                         lambda,
                         cfg.max_hold_ms,
                         cfg.idle_dispatch,
-                        rx.len() + ingress_seen.load(Ordering::Relaxed),
+                        rx.len() + ingress_seen.pending(),
                     )
                 } else {
                     0.0
@@ -1294,7 +1426,7 @@ pub fn spawn(
                                         }
                                         if cfg.idle_dispatch
                                             && rx.is_empty()
-                                            && ingress_seen.load(Ordering::Relaxed) == 0
+                                            && ingress_seen.pending() == 0
                                         {
                                             break;
                                         }
@@ -1740,6 +1872,14 @@ pub fn spawn(
             .name(dispatcher_name)
             .spawn(move || {
                 crate::exec::engine_thread::pin_serving();
+                #[cfg(any(feature = "hsa", feature = "cuda"))]
+                if let Some(cpus) = dp_cpus {
+                    if let Err(e) = crate::exec::engine_affinity::pin_current_thread(&cpus) {
+                        tracing::warn!(error = %e, "dp: pinning the rank's dispatcher failed; left unpinned");
+                    }
+                }
+                #[cfg(not(any(feature = "hsa", feature = "cuda")))]
+                let _ = dp_cpus;
                 tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()
@@ -1758,31 +1898,13 @@ pub fn spawn(
         preempt_notify,
         arrival_notify,
         ingress,
+        preempted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     }
 }
 
 fn note_dequeued(msg: &MuxMsg, metrics: &Metrics) {
     if matches!(msg, MuxMsg::Job(_, _)) {
         metrics.queued_requests.fetch_sub(1, Ordering::Relaxed);
-    }
-}
-
-fn reject_pending_after_drain(rx: &mut mpsc::Receiver<MuxMsg>, metrics: &Metrics) {
-    while let Ok(msg) = rx.try_recv() {
-        note_dequeued(&msg, metrics);
-        match msg {
-            MuxMsg::Drain(done) => {
-                let _ = done.send(());
-            }
-            MuxMsg::Job(job, _) => {
-                Metrics::inc(&metrics.rejected);
-                let _ = job
-                    .respond
-                    .try_send(StreamChunk::Err(crate::RuntimeError::Rejected(
-                        "model is draining — retry".into(),
-                    )));
-            }
-        }
     }
 }
 
@@ -2000,7 +2122,7 @@ fn drain_waiting_session(
             && slots[..admission_limit.min(slots.len())].iter().any(Option::is_none)
     });
     let mut rows: std::collections::VecDeque<u32> = probe
-        .map(|p| waiting.iter().map(|(job, _)| p.cached_rows(&job.prompt_ids)).collect())
+        .map(|p| waiting.iter().map(|(job, _)| p.cached_rows_keyed(&job.prompt_ids, job.opts.prefix.as_ref())).collect())
         .unwrap_or_default();
     let mut still: std::collections::VecDeque<(Job, Instant)> =
         std::collections::VecDeque::new();
@@ -2043,7 +2165,10 @@ fn drain_waiting_session(
                 }
             }
             None => {
+                // Seated: count it active now, not at the next loop top a long prefill tick away,
+                // so a load reader (the DP router) never sees it in neither gauge.
                 metrics.queued_requests.fetch_sub(1, Ordering::Relaxed);
+                metrics.slots_active.fetch_add(1, Ordering::Relaxed);
             }
         }
     }
@@ -2182,6 +2307,7 @@ fn admit_session(
             // backpressure mechanism.
             if denied.is_retryable() {
                 if let Denied::KvBudgetFull { want } = denied {
+                    Metrics::inc(&metrics.kv_budget_denials);
                     tracing::debug!(
                         want,
                         max_rows = kv_budget.map(|b| b.max_rows()).unwrap_or(0),
@@ -2298,6 +2424,7 @@ fn admit_session(
         held_finish: None,
         parked_at: None,
         lp: None,
+        prefix: job.opts.prefix,
     });
     None
 }
@@ -2681,8 +2808,8 @@ fn run_one_tick(
                                 continue;
                             }
                             let attached = {
-                                let request = slots[i].as_ref().expect("checked Some");
-                                e.attach_prompt(i, &request.prompt_ids)
+                                let request = slots[i].as_mut().expect("checked Some");
+                                e.attach_prompt_keyed(i, &request.prompt_ids, request.prefix.take())
                             };
                             match attached {
                                 Ok(frontier) => {
@@ -5198,6 +5325,9 @@ fn gpu_prefill_batched_pass(
                     if fresh && request.resume > 0 {
                         request.resume = e.resume_slot(row, request.resume);
                     }
+                    if fresh && row == i && request.prefix.is_some() {
+                        e.stage_prefix_key(row, request.prefix.take());
+                    }
                     let Some(frontier) = e.admit_packed_slot(row, &request.prompt_ids, total)? else {
                         continue;
                     };
@@ -5536,7 +5666,26 @@ fn gpu_prefill_advance(
     let total = slot.prompt_ids.len() + slot.gen.max_tokens.max(1);
     if slot.pf_pos == 0 {
         let kept = if slot.resume > 0 && slot.cfg.is_none() { e.resume_slot(slot_idx, slot.resume) } else { 0 };
-        e.begin_slot(slot_idx, total)?;
+        // A CFG pair's partner begins with its owner, so memory for both is there or neither.
+        let partner = (slot.cfg.is_some() && slot.speech.as_ref().is_some_and(|sp| sp.cfg.is_some()))
+            .then_some(slot_idx + 1);
+        let begun = e
+            .begin_slot(slot_idx, total)
+            .and_then(|()| partner.map_or(Ok(()), |p| e.begin_slot(p, total)));
+        if let Err(err) = begun {
+            // Out of device memory for live KV: wait (the prompt stays at row 0), and ask the
+            // planner for room instead of failing the request.
+            let short = matches!(err, crate::RuntimeError::Oom(_)) || err.device_code() == Some(2);
+            if !short || err.is_fatal() {
+                return Err(err);
+            }
+            e.retire_slot(slot_idx, false);
+            if let Some(p) = partner {
+                e.retire_slot(p, false);
+            }
+            e.note_kv_pressure();
+            return Ok(None);
+        }
         if kept > 0 {
             slot.resume = kept;
             slot.pf_pos = kept;
@@ -5551,7 +5700,6 @@ fn gpu_prefill_advance(
         // first, its last-row logits stashed before the owner's prefill overwrites row 0.
         if let (0, Some(cfg), Some(run)) = (slot.pf_pos, sp.cfg.as_ref(), slot.cfg.as_mut()) {
             let partner = slot_idx + 1;
-            e.begin_slot(partner, total)?;
             let mut c0 = 0;
             loop {
                 gpu_speech_prefill_inputs(e, partner, c0, &cfg.uncond_overlay, &sp.overlay_pos, sp.pos_base)?;
@@ -5568,7 +5716,15 @@ fn gpu_prefill_advance(
         gpu_speech_prefill_inputs(e, slot_idx, slot.pf_pos, &sp.overlay, &sp.overlay_pos, sp.pos_base)?;
     }
     let tok = if e.has_prefill() {
-        match e.prefill_chunk(slot_idx, &slot.prompt_ids, cap_rows)? {
+        let staged = slot.pf_pos == 0 && slot.prefix.is_some();
+        if staged {
+            e.stage_prefix_key(slot_idx, slot.prefix.take());
+        }
+        let step = e.prefill_chunk(slot_idx, &slot.prompt_ids, cap_rows);
+        if staged {
+            e.stage_prefix_key(slot_idx, None);
+        }
+        match step? {
             PrefillStep::Progress(frontier) => {
                 slot.pf_pos = frontier;
                 // First chunk consulted the prefix cache — record the hit.
@@ -5589,7 +5745,7 @@ fn gpu_prefill_advance(
         // `consume_prompt` overlaps host submit with the in-flight
         // interpreter (one D2H+sync after the last token).
         let start = if slot.pf_pos == 0 {
-            let attached = e.attach_prompt(slot_idx, &slot.prompt_ids)?;
+            let attached = e.attach_prompt_keyed(slot_idx, &slot.prompt_ids, slot.prefix.take())?;
             slot.cached_tokens = attached;
             attached
         } else {
@@ -6908,15 +7064,16 @@ mod tests {
             preempt: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             preempt_notify: Arc::new(tokio::sync::Notify::new()),
             arrival_notify: Arc::new(tokio::sync::Notify::new()),
-            ingress: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            ingress: Arc::default(),
+            preempted: Arc::default(),
         };
 
         let (a, b) = (mux.ingress(), mux.ingress());
-        assert_eq!(mux.ingress.load(Ordering::Relaxed), 2);
+        assert_eq!(mux.ingress.pending(), 2);
         drop(a);
-        assert_eq!(mux.ingress.load(Ordering::Relaxed), 1);
+        assert_eq!(mux.ingress.pending(), 1);
         drop(b);
-        assert_eq!(mux.ingress.load(Ordering::Relaxed), 0);
+        assert_eq!(mux.ingress.pending(), 0);
 
         assert!(mux.submit(test_job()).is_ok());
         assert_eq!(metrics.queued_requests.load(Ordering::Relaxed), 1);
@@ -6934,32 +7091,87 @@ mod tests {
         assert_eq!(metrics.queued_requests.load(Ordering::Relaxed), 0);
     }
 
-    #[test]
-    fn idle_drain_rejects_pending_jobs_and_answers_followup_drains() {
-        let metrics = Metrics::default();
-        let (tx, mut rx) = mpsc::channel(4);
-        let (respond, mut chunks) = crate::serve::stream::channel();
-        let job = Job {
-            prompt_ids: vec![1],
-            gen: GenParams::default(),
-            arrived: Instant::now(),
-            respond,
-            opts: Default::default(),
-        };
-        metrics.queued_requests.store(1, Ordering::Relaxed);
-        assert!(tx.try_send(MuxMsg::Job(job, Instant::now())).is_ok());
-        let (done, mut done_rx) = tokio::sync::oneshot::channel();
-        assert!(tx.try_send(MuxMsg::Drain(done)).is_ok());
+    #[cfg(feature = "cuda")]
+    fn idle_test_mux(name: &str) -> ModelMux {
+        let backend: Arc<dyn crate::device::Backend> = Arc::new(crate::device::cpu::CpuBackend::new(1));
+        let execset = Arc::new(crate::exec::ExecutorSet::bringup(backend).unwrap());
+        let state = Arc::new(AppState::new(crate::orch::Registry::new(), execset));
+        spawn(name.into(), Arc::new(prefill_test_bundle(name)), state, MuxConfig::default())
+    }
 
-        reject_pending_after_drain(&mut rx, &metrics);
+    /// A DP rank taken out mid-burst: the router stops choosing it the moment its dispatcher leaves
+    /// the table, and a job already holding its (now closed) dispatcher is resubmitted to the other
+    /// rank instead of failing.
+    #[cfg(feature = "cuda")]
+    #[tokio::test]
+    async fn a_rank_removed_mid_burst_loses_no_request() {
+        use crate::serve::dp::{DpRouter, DpSet, RouteCfg};
+        let backend: Arc<dyn crate::device::Backend> = Arc::new(crate::device::cpu::CpuBackend::new(1));
+        let execset = Arc::new(crate::exec::ExecutorSet::bringup(backend).unwrap());
+        let state = Arc::new(AppState::new(crate::orch::Registry::new(), execset));
+        let mut router = DpRouter::new(RouteCfg::default());
+        router.add(DpSet::new("m", (0..2).map(|r| (r as u32, r, state.model_metrics(&format!("m#{r}")))).collect()));
+        state.install_dp(router);
+        for r in 0..2 {
+            let key = format!("m#{r}");
+            let mux = spawn(key.clone(), Arc::new(prefill_test_bundle(&format!("dp-burst-{r}"))), Arc::clone(&state), MuxConfig::default());
+            state.install_mux(key, mux);
+        }
+        let set = Arc::clone(state.dp_set("m").unwrap());
+        let mut seen = [0usize; 2];
+        for _ in 0..6 {
+            let (rank, mux, _, _pick) = state.dp_route(&set, None, Some(&[1, 2, 3]), 0).unwrap();
+            seen[rank] += 1;
+            assert!(state.submit_routed(Some((&set, rank)), None, &mux, test_job(), Instant::now(), None).is_ok());
+        }
+        assert!(seen.iter().all(|&n| n > 0), "both ranks take work: {seen:?}");
 
-        assert_eq!(metrics.queued_requests.load(Ordering::Relaxed), 0);
-        assert_eq!(metrics.rejected.load(Ordering::Relaxed), 1);
+        let stale = state.mux("m#0").unwrap();
+        let removed = state.remove_mux("m#0").unwrap();
+        removed.drain().await;
+        assert!(stale.is_closed());
+        for _ in 0..16 {
+            let (rank, _, _, _) = state.dp_route(&set, Some("s"), None, 0).unwrap();
+            assert_eq!(rank, 1, "a removed rank is never routed to");
+        }
+        assert!(state.submit_routed(Some((&set, 0)), None, &stale, test_job(), Instant::now(), None).is_ok());
+        assert_eq!(set.stats.retries.load(Ordering::Relaxed), 1);
+        state.remove_mux("m#1");
+        assert!(state.dp_route(&set, None, None, 0).is_none());
         assert!(matches!(
-            chunks.try_recv(),
-            Ok(StreamChunk::Err(crate::RuntimeError::Rejected(_)))
+            state.submit_routed(Some((&set, 0)), None, &stale, test_job(), Instant::now(), None),
+            Err(SubmitError::Closed(_))
         ));
-        assert!(matches!(done_rx.try_recv(), Ok(())));
+    }
+
+    /// An idle stream holding ingress must not hold a preempt: it completes, and the held work's
+    /// later submission is told the model was preempted.
+    #[cfg(feature = "cuda")]
+    #[tokio::test]
+    async fn preempt_does_not_wait_for_held_ingress() {
+        let mux = idle_test_mux("preempt-held-ingress");
+        let held = mux.ingress_owned();
+        tokio::time::timeout(std::time::Duration::from_secs(5), mux.preempt()).await.expect("preempt waited on ingress");
+        assert!(mux.preempted());
+        assert!(matches!(mux.submit_wait(test_job()).await, Err(SubmitError::Closed(_))));
+        drop(held);
+    }
+
+    /// A graceful drain held only by ingress completes once that request leaves without submitting.
+    #[cfg(feature = "cuda")]
+    #[tokio::test]
+    async fn graceful_drain_wakes_when_ingress_leaves() {
+        let mux = idle_test_mux("drain-ingress-leaves");
+        let held = mux.ingress_owned();
+        let draining = {
+            let mux = mux.clone();
+            tokio::spawn(async move { mux.drain().await })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(!draining.is_finished(), "a graceful drain closed on a request past model lookup");
+        drop(held);
+        tokio::time::timeout(std::time::Duration::from_secs(5), draining).await.expect("drain never woke").unwrap();
+        assert!(!mux.preempted());
     }
 
     #[test]
@@ -7694,6 +7906,7 @@ mod tests {
                 session: None,
                 resume: 0,
                 lp: None,
+                prefix: None,
             }),
             rx,
         )

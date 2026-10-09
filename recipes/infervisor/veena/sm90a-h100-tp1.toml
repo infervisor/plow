@@ -83,7 +83,7 @@ PLOW_NV_DENSE_TUNE = "1"
 # algorithms per rung (step_bench B=32..64 -3..-5%, digests equal).
 [serve]
 # Env, not flags, so every launcher (campaign serve/gate, plowbench.sh probes) applies it.
-env = { PLOW_LT_RUNG_ALGOS = "true" }
+env = { PLOW_VMM_PREFIX = "1", PLOW_LT_RUNG_ALGOS = "true" }
 
 [bench]
 kind = "speech"

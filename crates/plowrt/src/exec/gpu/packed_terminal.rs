@@ -678,7 +678,7 @@ mod tests {
         let mut requests = Vec::new();
         for i in 0..2 {
             e.begin_slot(slots[i], prompts[i].len() + 64).unwrap();
-            assert_eq!(e.vmm.as_ref().unwrap().kv.mapped_rows(slots[i]), 0);
+            assert_eq!(e.vmm.as_ref().unwrap().kv.as_ref().unwrap().mapped_rows(slots[i]), 0);
             let cached = e.attach_prompt(slots[i], &prompts[i]).unwrap();
             assert_eq!(cached, (prompts[i].len() - 1) / 32 * 32);
             requests.push(PfBatchReq {

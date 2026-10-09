@@ -198,7 +198,14 @@ impl PromptTables {
         let h = self.hidden;
         let cond = self.voices.get(voice).ok_or_else(|| RuntimeError::Rejected(format!("unknown voice {voice:?}")))?;
         let ids: Vec<u32> = std::iter::once(c.start_text).chain(text_ids.iter().copied()).chain(std::iter::once(c.stop_text)).collect();
-        if ids.len() * h > self.text_pos.len() || ids.iter().any(|&i| i as usize >= c.text_vocab) {
+        if ids.len() * h > self.text_pos.len() {
+            let max = (self.text_pos.len() / h).saturating_sub(2);
+            return Err(RuntimeError::Rejected(format!(
+                "input is {} text tokens; this model takes at most {max}",
+                text_ids.len()
+            )));
+        }
+        if ids.iter().any(|&i| i as usize >= c.text_vocab) {
             return Err(RuntimeError::Rejected("text exceeds the T3 text tables".into()));
         }
         let mut rows = Vec::with_capacity(cond.len() + (ids.len() + self.bos_repeat) * h);

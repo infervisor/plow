@@ -102,23 +102,41 @@ fn encode_loop(rx: std::sync::mpsc::Receiver<Encode>, mut encoder: PacketAudioEn
 
 pub(super) struct SharedAsr {
     prompt: Arc<AudioLmPrompt>,
-    encode: std::sync::mpsc::Sender<Encode>,
+    /// Taken at [`release`]: the encoder thread then exits, freeing its packet, even while an idle
+    /// session still holds this front.
+    encode: Mutex<Option<std::sync::mpsc::Sender<Encode>>>,
     max_context: usize,
     /// Requests between submit and their answer: the front's bound. Past it a request is refused
     /// at once; under it a request waits in the mux queue (a full ingress makes submit wait).
     inflight: Arc<Semaphore>,
     /// Log-mel frames of one encoder attention window (0: the encoder is not windowed).
     window_frames: usize,
+    slug: String,
+    /// Cleared when the encoder thread exits (a panic included): `/health` reports the model.
+    alive: Arc<AtomicBool>,
+}
+
+/// Clears `alive` however the encoder thread ends.
+struct Alive(Arc<AtomicBool>);
+impl Drop for Alive {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Relaxed);
+    }
 }
 
 impl SharedAsr {
-    fn load(dir: &Path, max_context: usize, batch: usize) -> Result<Self> {
+    /// The instance key (model, or `model#rank`) whose dispatcher this front feeds.
+    pub(super) fn key(&self) -> &str {
+        &self.slug
+    }
+
+    fn load(slug: &str, dir: &Path, max_context: usize, batch: usize, device: u8) -> Result<Self> {
         let checkpoint = dir.join("checkpoint");
         let checkpoint = if checkpoint.is_dir() { checkpoint } else { dir.to_path_buf() };
         let prompt = AudioLmPrompt::load(&dir.join("model.pkt"), &checkpoint)?;
         let encoder_path =
             crate::exec::packet_runtime::stage_packet(&dir.join("model.pkt"), "encoder.packet", "encoder.pkt")?;
-        let mut encoder = PacketAudioEncoder::load(&encoder_path, "cuda")?;
+        let mut encoder = PacketAudioEncoder::load_on(&encoder_path, "cuda", device)?;
         let warm = Instant::now();
         encoder.warm()?;
         tracing::info!(ms = warm.elapsed().as_millis() as u64, packed_chunks = encoder.max_packed_chunks(), "asr: encoder graphs warmed");
@@ -129,16 +147,23 @@ impl SharedAsr {
         let window_frames = encoder.window_rows() / chunking.chunk_frames.div_ceil(chunking.frame_stride) * chunking.chunk_frames;
         let (encode, rx) = std::sync::mpsc::channel::<Encode>();
         let cost_id = crate::sched::cost::id(&encoder_path.to_string_lossy());
+        let alive = Arc::new(AtomicBool::new(true));
+        let guard = Alive(Arc::clone(&alive));
         std::thread::Builder::new()
             .name("plow-asr-encoder".into())
-            .spawn(move || encode_loop(rx, encoder, cost_id))
+            .spawn(move || {
+                let _alive = guard;
+                encode_loop(rx, encoder, cost_id)
+            })
             .map_err(|e| RuntimeError::Msg(format!("spawn ASR encoder thread: {e}")))?;
         Ok(Self {
             prompt: Arc::new(prompt),
-            encode,
+            encode: Mutex::new(Some(encode)),
             max_context,
             inflight: Arc::new(Semaphore::new(batch.saturating_mul(4).max(UPLOADS))),
             window_frames,
+            slug: slug.to_owned(),
+            alive,
         })
     }
 
@@ -156,6 +181,8 @@ impl SharedAsr {
         let this = Arc::clone(self);
         tokio::spawn(async move {
             let result = match opts.windows.clone().filter(|_| !opts.final_pass) {
+                // Work held across a preempt (an idle session's next turn) is told so up front.
+                _ if mux.preempted() => Err(RuntimeError::Unavailable(crate::serve::mux::PREEMPTED.into())),
                 Some(windows) => this.run_partial(mux, samples, windows, language, context, &cancel, opts, &mut tx).await,
                 None => this.run(mux, samples, language, context, &cancel, opts, &mut tx).await,
             };
@@ -167,10 +194,11 @@ impl SharedAsr {
 
     async fn encode_rows(&self, features: MelFeatures, urgent: bool) -> Result<Vec<f32>> {
         let (tx, rx) = oneshot::channel();
-        self.encode
+        let encode = self.encode.lock().clone().ok_or_else(|| RuntimeError::Unavailable("ASR front released; retry".into()))?;
+        encode
             .send(Encode { features, urgent, respond: tx })
-            .map_err(|_| RuntimeError::Msg("ASR encoder thread is gone".into()))?;
-        rx.await.map_err(|_| RuntimeError::Msg("ASR encoder thread is gone".into()))?
+            .map_err(|_| RuntimeError::Unavailable("ASR encoder thread is gone".into()))?;
+        rx.await.map_err(|_| RuntimeError::Unavailable("ASR encoder thread is gone".into()))?
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -328,12 +356,22 @@ impl SharedAsr {
                 turn: opts.ids.as_ref().and_then(|i| i.turn_key.clone()),
                 continuing: false,
                 speech: Some(Box::new(SpeechJob { overlay, overlay_pos, pos_base: None, cfg: None, first_tokens: 0 })),
+                prefix: None,
             },
         };
+        // Released once the job is on the channel: the dispatcher drains it, not closes on it.
+        let ingress = opts.ingress.take();
+        // A preempt does not wait for this request's ingress: tell it so instead of submitting.
+        let preempted = || RuntimeError::Unavailable(crate::serve::mux::PREEMPTED.into());
+        if mux.preempted() {
+            return Err(preempted());
+        }
         mux.submit_wait(job).await.map_err(|e| match e {
-            crate::serve::mux::SubmitError::Full(_) => RuntimeError::Rejected("ASR queue full".into()),
-            crate::serve::mux::SubmitError::Closed(_) => RuntimeError::Msg("model dispatcher unavailable".into()),
+            crate::serve::mux::SubmitError::Full(_) => RuntimeError::Overloaded("ASR queue full".into()),
+            crate::serve::mux::SubmitError::Closed(_) if mux.preempted() => preempted(),
+            crate::serve::mux::SubmitError::Closed(_) => RuntimeError::Unavailable("model dispatcher unavailable".into()),
         })?;
+        drop(ingress);
         let mut output = forced;
         let mut shown = 0usize;
         let submitted = arrived.elapsed();
@@ -361,7 +399,10 @@ impl SharedAsr {
                 Some(StreamChunk::Done { reason: FinishReason::Length, .. }) => {
                     return Err(RuntimeError::Rejected("ASR exceeded output token limit".into()))
                 }
+                // A preempted slot's tokens so far are not the transcript.
+                Some(StreamChunk::Done { reason: FinishReason::Preempted, .. }) => return Err(preempted()),
                 Some(StreamChunk::Done { usage, .. }) => break usage.cached_tokens,
+                Some(StreamChunk::Err(_)) if mux.preempted() => return Err(preempted()),
                 Some(StreamChunk::Err(e)) => return Err(e),
                 None => return Err(RuntimeError::Msg("ASR stream ended without a result".into())),
             }
@@ -407,9 +448,11 @@ fn slice_frames(features: &MelFeatures, a: usize, b: usize) -> MelFeatures {
     MelFeatures { values, frames: b - a }
 }
 
-/// Audio LM front-ends by asset directory, bound on first use (`None`: not an audio LM).
-fn models() -> &'static Mutex<HashMap<PathBuf, Option<Arc<SharedAsr>>>> {
-    static M: OnceLock<Mutex<HashMap<PathBuf, Option<Arc<SharedAsr>>>>> = OnceLock::new();
+type Fronts = Mutex<HashMap<(PathBuf, u8), Option<Arc<SharedAsr>>>>;
+
+/// Audio LM front-ends by asset directory and device, bound on first use (`None`: not an audio LM).
+fn models() -> &'static Fronts {
+    static M: OnceLock<Fronts> = OnceLock::new();
     M.get_or_init(Default::default)
 }
 
@@ -428,8 +471,11 @@ fn is_audio_lm(dir: &Path) -> Result<bool> {
         && dir.join(asset.stage_file("encoder.packet", "encoder.pkt")?).is_file())
 }
 
+/// `slug` is an instance key: the front binds on its engine's device.
 fn shared_asr(state: &AppState, slug: &str, dir: &Path) -> Result<Option<Arc<SharedAsr>>> {
-    if let Some(m) = models().lock().get(dir) {
+    let device = state.ordinal_of(slug);
+    let at = (dir.to_path_buf(), device);
+    if let Some(m) = models().lock().get(&at) {
         return Ok(m.clone());
     }
     let model = if is_audio_lm(dir)? {
@@ -440,14 +486,46 @@ fn shared_asr(state: &AppState, slug: &str, dir: &Path) -> Result<Option<Arc<Sha
                 (e.max_ctx(), e.batch())
             })
             .ok_or_else(|| RuntimeError::Rejected(format!("{slug} has no GPU engine")))?;
-        let m = SharedAsr::load(dir, max_context, batch)?;
-        tracing::info!(%slug, dir = %dir.display(), "asr: audio LM front bound to the serve mux");
+        let m = SharedAsr::load(slug, dir, max_context, batch, device)?;
+        tracing::info!(%slug, device, dir = %dir.display(), "asr: audio LM front bound to the serve mux");
         Some(Arc::new(m))
     } else {
         None
     };
-    models().lock().insert(dir.to_path_buf(), model.clone());
+    models().lock().insert(at, model.clone());
     Ok(model)
+}
+
+/// Served models whose encoder thread has exited.
+pub(super) fn dead_encoders() -> Vec<String> {
+    models()
+        .lock()
+        .values()
+        .flatten()
+        .filter(|asr| !asr.alive.load(Ordering::Relaxed))
+        .map(|asr| asr.slug.clone())
+        .collect()
+}
+
+/// Whether `slug` is a bound audio LM on any device (preload binds every resident one); never
+/// loads.
+pub(super) fn serves_audio(state: &AppState, slug: &str) -> bool {
+    let Ok(bundle) = state.registry.get(slug) else { return false };
+    models().lock().iter().any(|((dir, _), m)| *dir == bundle.dir && m.is_some())
+}
+
+/// Bind instance `slug`'s front-end now (a no-op for a model that is not an audio LM or is bound).
+pub fn bind(state: &AppState, slug: &str) -> Result<()> {
+    let bundle = state.registry.get(state.model_of(slug))?;
+    shared_asr(state, slug, &bundle.dir).map(drop)
+}
+
+/// Forget `dir`'s front-end on `device`: its encoder thread exits, freeing the encoder runtime,
+/// once the encodes already queued finish — a session still holding the front does not keep it.
+pub fn release(dir: &Path, device: u8) {
+    if let Some(Some(asr)) = models().lock().remove(&(dir.to_path_buf(), device)) {
+        asr.encode.lock().take();
+    }
 }
 
 /// Bind every resident audio LM's front-end now, so the first request does not pay the encoder
@@ -463,25 +541,70 @@ pub fn preload(state: &AppState) -> Result<()> {
     Ok(())
 }
 
+/// The front and dispatcher a request (or a realtime session) for `model` runs on. A DP model
+/// picks a rank here, sticky by `session`.
 pub(super) async fn route(
     state: &Arc<AppState>,
     model: &str,
+    session: Option<&str>,
 ) -> std::result::Result<(Route, FinalizationPolicy), Response> {
     let slug = state.registry.resolve(model).unwrap_or_else(|| model.to_owned());
-    if let Some(mgr) = state.manager_for(&slug) {
-        if mgr.manages(&slug) {
-            if let Err(e) = mgr.ensure_resident(&slug).await {
-                return Err(failure(StatusCode::SERVICE_UNAVAILABLE, e));
+    let dp = state.dp_set(&slug).cloned();
+    let managed = dp.is_some() || state.manager_for(&slug).is_some_and(|m| m.manages(&slug));
+    // A managed model's front binds with its engine and leaves with it: an eviction between the
+    // residency check and the lookup sends the request around again.
+    let mut attempts = 0;
+    let mut exclude = 0u32;
+    let (key, mux, bundle, bound, ingress) = loop {
+        attempts += 1;
+        let (key, mux) = match dp.as_deref() {
+            Some(set) => {
+                if let Err(e) = state.dp_admit(set).await {
+                    return Err(failure(StatusCode::SERVICE_UNAVAILABLE, e));
+                }
+                match state.dp_route(set, session, None, exclude) {
+                    Some((rank, mux, _, _)) => {
+                        exclude |= 1 << rank;
+                        (set.ranks[rank].key.clone(), Some(mux))
+                    }
+                    None => (slug.clone(), None),
+                }
             }
+            None => {
+                if managed {
+                    if let Err(e) = state.manager_for(&slug).expect("managed").ensure_resident(&slug).await {
+                        return Err(failure(StatusCode::SERVICE_UNAVAILABLE, e));
+                    }
+                }
+                (slug.clone(), state.mux(&slug))
+            }
+        };
+        let (Some(mux), Ok(bundle)) = (mux, state.registry.get(&slug)) else {
+            if managed && attempts < 3 {
+                continue;
+            }
+            return Err(failure(StatusCode::NOT_FOUND, "unknown ASR model"));
+        };
+        // Counted before the residency re-check: an eviction that removes the mux after this
+        // point drains with the request counted, so the request's submission is served.
+        let ingress = mux.ingress_owned();
+        let at = (bundle.dir.clone(), state.ordinal_of(&key));
+        let bound = models().lock().get(&at).cloned().filter(|_| state.mux(&key).is_some());
+        match bound {
+            None if managed && attempts < 3 => continue,
+            None if managed => return Err(failure(StatusCode::SERVICE_UNAVAILABLE, "ASR front is switching; retry")),
+            bound => break (key, mux, bundle, bound, ingress),
         }
-    }
-    let (Some(mux), Ok(bundle)) = (state.mux(&slug), state.registry.get(&slug)) else {
-        return Err(failure(StatusCode::NOT_FOUND, "unknown ASR model"));
     };
-    match tokio::task::block_in_place(|| shared_asr(state, &slug, &bundle.dir)) {
+    let bound = match bound {
+        Some(bound) => Ok(bound),
+        None => tokio::task::block_in_place(|| shared_asr(state, &key, &bundle.dir)),
+    };
+    match bound {
         Ok(Some(asr)) => {
             let finalization = asr.prompt.finalization_policy();
-            Ok((Route::Shared(asr, mux), finalization))
+            let ingress = Arc::new(parking_lot::Mutex::new(Some(ingress)));
+            Ok((Route::Shared(asr, mux, ingress), finalization))
         }
         Ok(None) => Err(failure(StatusCode::NOT_FOUND, "model declares no ASR pipeline")),
         Err(e) => Err(failure(StatusCode::INTERNAL_SERVER_ERROR, e)),

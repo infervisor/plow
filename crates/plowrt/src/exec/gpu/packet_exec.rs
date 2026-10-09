@@ -1,7 +1,7 @@
 //! A self-contained packet (weights embedded, no language-model step protocol) on the CUDA
 //! interpreter: the `PacketRuntime` for forward pipelines such as the Qwen3-ASR audio encoder.
 //! Every program runs as one cooperative launch per global-queue segment of the speech object
-//! (`interp_sm90a_speech.cubin`, the interpreter with the FP32 speech arms).
+//! (`interp_sm90a_speech.cubin` or `interp_sm89_speech.cubin`, the interpreter with the FP32 speech arms).
 
 use std::path::Path;
 use std::sync::Arc;
@@ -15,8 +15,20 @@ use crate::device::{Backend, DeviceMem, Module};
 use crate::exec::packet_runtime::{check_copy, check_transfer, PacketRuntime, PacketTensor};
 use crate::{Result, RuntimeError};
 
-const OBJECT: &str = "interp_sm90a_speech.cubin";
-const SYMBOL: &str = "_Z19interp_sm90a_speech11PlowProgram";
+/// The speech object and its entry symbol for a compute capability.
+fn speech_object(cc: (u32, u32)) -> (&'static str, &'static str) {
+    match cc {
+        (8, 9) => ("interp_sm89_speech.cubin", "_Z18interp_sm89_speech11PlowProgram"),
+        _ => ("interp_sm90a_speech.cubin", "_Z19interp_sm90a_speech11PlowProgram"),
+    }
+}
+fn in_range(mem: &DeviceMem, offset: usize, bytes: usize) -> Result<()> {
+    if offset as u64 + bytes as u64 > mem.len {
+        return Err(RuntimeError::Device(format!("packet transfer out of range: off {offset} + {bytes} > {}", mem.len)));
+    }
+    Ok(())
+}
+
 /// FP32 speech ops are 163..=204, bit `op - 163` of `PLOW_SPEECH_OPS` (`op_speech_f32.cuh`).
 const SPEECH_OP0: u32 = 163;
 
@@ -69,6 +81,24 @@ pub struct CudaPacketRuntime {
     /// valid); `None` once capture failed for that sequence.
     graphs: std::collections::HashMap<Vec<usize>, Option<GraphExec>>,
     last_us: f64,
+    /// Last field: dropped after every allocation above, so [`resident_in`] turns false only once
+    /// the device memory is back.
+    _resident: Arc<()>,
+}
+
+type Residents = parking_lot::Mutex<Vec<(std::path::PathBuf, u8, std::sync::Weak<()>)>>;
+
+/// Live runtimes by the asset directory their packet sits in and their device.
+fn residents() -> &'static Residents {
+    static R: std::sync::OnceLock<Residents> = std::sync::OnceLock::new();
+    R.get_or_init(Default::default)
+}
+
+/// Whether a packet runtime loaded from `dir` onto `device` still holds device memory.
+pub fn resident_in(dir: &Path, device: u8) -> bool {
+    let mut r = residents().lock();
+    r.retain(|(_, _, live)| live.strong_count() > 0);
+    r.iter().any(|(d, o, _)| d == dir && *o == device)
 }
 
 // SAFETY: the runtime owns its stream, module and allocations and is used by one thread at a time
@@ -82,16 +112,18 @@ impl CudaPacketRuntime {
     }
 
     pub fn load_on(be: Arc<CudaBackend>, path: &Path) -> Result<Self> {
+        let ordinal = be.device_ordinal;
         let raw = std::fs::read(path).map_err(|source| RuntimeError::Io { path: path.to_path_buf(), source })?;
         let blob = DevBlob::parse(&raw)?;
         if !blob.gen.is_empty() || blob.tp.is_some() {
             return Err(RuntimeError::Rejected(format!("{}: generated tensors or TP are not supported by the CUDA packet runtime", path.display())));
         }
         let dir = path.parent().unwrap_or(Path::new("."));
-        let object = dir.join(OBJECT);
+        let (file, symbol) = speech_object(be.compute_capability());
+        let object = dir.join(file);
         let image = std::fs::read(&object).map_err(|source| RuntimeError::Io { path: object.clone(), source })?;
         let module = be.module_load(&image)?;
-        let function = be.get_function(&module, SYMBOL)?;
+        let function = be.get_function(&module, symbol)?;
         if let (Some(lo), Some(hi)) = (
             be.module_global_u32(&module, "plow_speech_ops_lo_speech")?,
             be.module_global_u32(&module, "plow_speech_ops_hi_speech")?,
@@ -201,6 +233,9 @@ impl CudaPacketRuntime {
                 _tables: vec![d_inst, d_stream, d_sofs, d_slen, d_waits, d_succs, d_gq_stream, d_gq_seg],
             });
         }
+        // The init copies and memsets ran on the legacy stream, which the non-blocking packet
+        // stream does not wait for.
+        be.synchronize()?;
         let stream = be.stream_create()?;
         let events = (be.event_create(true)?, be.event_create(true)?);
         tracing::info!(packet = %path.display(), programs = programs.len(), tensors = tensors.len(), grid = blob.n_cu, smem, "cuda packet runtime loaded");
@@ -219,6 +254,11 @@ impl CudaPacketRuntime {
             programs,
             graphs: std::collections::HashMap::new(),
             last_us: 0.0,
+            _resident: {
+                let token = Arc::new(());
+                residents().lock().push((dir.to_path_buf(), ordinal, Arc::downgrade(&token)));
+                token
+            },
         })
     }
 
@@ -259,6 +299,22 @@ impl CudaPacketRuntime {
         Ok(())
     }
 
+    /// Every transfer goes through the packet stream: it is NON_BLOCKING, so a legacy-stream copy
+    /// is not ordered before the next program (a DtoD copy returns before it lands).
+    fn upload(&self, mem: &DeviceMem, offset: usize, bytes: &[u8]) -> Result<()> {
+        in_range(mem, offset, bytes.len())?;
+        // SAFETY: `bytes` outlives the copy (synchronized below); the range is inside `mem`.
+        unsafe { self.be.memcpy_htod_async(mem.base + offset as u64, bytes, &self.stream)? };
+        self.be.stream_synchronize(&self.stream)
+    }
+
+    fn download(&self, mem: &DeviceMem, offset: usize, bytes: &mut [u8]) -> Result<()> {
+        in_range(mem, offset, bytes.len())?;
+        // SAFETY: as `upload`.
+        unsafe { self.be.memcpy_dtoh_async(bytes, mem.base + offset as u64, &self.stream)? };
+        self.be.stream_synchronize(&self.stream)
+    }
+
     fn mem(&self, t: PacketTensor) -> Result<&DeviceMem> {
         self.tensors.get(t.handle).ok_or_else(|| RuntimeError::Device(format!("packet tensor handle {} is missing", t.handle)))
     }
@@ -273,25 +329,25 @@ impl PacketRuntime for CudaPacketRuntime {
     fn write_tensor(&mut self, tensor: PacketTensor, bytes: &[u8]) -> Result<()> {
         let mem = self.mem(tensor)?;
         check_transfer(tensor, tensor.handle, mem.len as usize, bytes.len())?;
-        self.be.upload(mem, 0, bytes)
+        self.upload(mem, 0, bytes)
     }
 
     fn read_tensor(&self, tensor: PacketTensor, bytes: &mut [u8]) -> Result<()> {
         let mem = self.mem(tensor)?;
         check_transfer(tensor, tensor.handle, mem.len as usize, bytes.len())?;
-        self.be.download(mem, 0, bytes)
+        self.download(mem, 0, bytes)
     }
 
     fn write_tensor_at(&mut self, tensor: PacketTensor, offset: usize, bytes: &[u8]) -> Result<()> {
         let mem = self.mem(tensor)?;
         check_transfer(tensor, tensor.handle, mem.len as usize, mem.len as usize)?;
-        self.be.upload(mem, offset as u64, bytes)
+        self.upload(mem, offset, bytes)
     }
 
     fn read_tensor_at(&self, tensor: PacketTensor, offset: usize, bytes: &mut [u8]) -> Result<()> {
         let mem = self.mem(tensor)?;
         check_transfer(tensor, tensor.handle, mem.len as usize, mem.len as usize)?;
-        self.be.download(mem, offset as u64, bytes)
+        self.download(mem, offset, bytes)
     }
 
     fn copy_tensor(
@@ -304,7 +360,17 @@ impl PacketRuntime for CudaPacketRuntime {
     ) -> Result<()> {
         let (s, t) = (self.mem(source)?, self.mem(target)?);
         check_copy(source, s.len as usize, source_offset, target, t.len as usize, target_offset, bytes)?;
-        self.be.memcpy_dtod(t.base + target_offset as u64, s.base + source_offset as u64, bytes as u64)
+        self.be.memcpy_dtod_async(t.base + target_offset as u64, s.base + source_offset as u64, bytes as u64, &self.stream)
+    }
+
+    fn create_tensor(&mut self, bytes: usize) -> Result<PacketTensor> {
+        let mem = self.be.alloc(0, (bytes as u64).max(4))?;
+        self.be.memset_d8_async(mem.base, 0, mem.len as usize, &self.stream)?;
+        self.be.stream_synchronize(&self.stream)?;
+        self.tensors.push(mem);
+        // Unnamed: `tensor(name)` never resolves it; only its handle does.
+        self.names.push(String::new());
+        Ok(PacketTensor { handle: self.tensors.len() - 1, bytes })
     }
 
     fn run(&mut self, program: usize) -> Result<()> {

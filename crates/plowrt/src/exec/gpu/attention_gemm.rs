@@ -332,6 +332,15 @@ pub(super) struct AttentionGemm {
 /// the buckets steer the heuristic.
 type GroupedKey = (Gemm, usize, u32, u32, u32, u32);
 
+/// Measured grouped-attention picks by device model: every engine of one GPU model in the
+/// process (DP ranks) runs the first one's pick, so their outputs agree; timing near-tied
+/// candidates on each made temperature-0 output differ by rank.
+fn grouped_selections() -> &'static parking_lot::Mutex<std::collections::HashMap<(String, GroupedKey), [u64; 8]>> {
+    static S: std::sync::OnceLock<parking_lot::Mutex<std::collections::HashMap<(String, GroupedKey), [u64; 8]>>> =
+        std::sync::OnceLock::new();
+    S.get_or_init(Default::default)
+}
+
 impl AttentionGemm {
     /// `max_sites` routed segments per launch, `batch` slots, `max_rows` the largest routed
     /// bucket.
@@ -920,6 +929,11 @@ impl AttentionGemm {
         if plan.candidates() == 0 {
             return plan.run(a, w, c, stream);
         }
+        let memo_key = (self.be.device_name().to_string(), key);
+        let known = grouped_selections().lock().get(&memo_key).copied();
+        if known.is_some_and(|data| plan.select_algo(&data)) {
+            return plan.run(a, w, c, stream);
+        }
         let start = self.be.event_create(true)?;
         let end = self.be.event_create(true)?;
         let mut times = Vec::with_capacity(plan.candidates());
@@ -948,6 +962,7 @@ impl AttentionGemm {
         let (ms, index) = best.filter(|(ms, _)| ms.is_finite()).ok_or_else(|| {
             RuntimeError::Device("no runnable grouped attention candidate".into())
         })?;
+        grouped_selections().lock().entry(memo_key).or_insert(plan.candidate_algo(index));
         plan.select(index);
         tracing::info!(
             ?key,

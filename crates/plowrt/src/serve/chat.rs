@@ -97,10 +97,17 @@ async fn chat_completions_with(
             "Model is explicitly unloaded or unloading", "server_error", Some("model_unloaded"), Some("model".into()));
     }
     #[cfg(feature = "cuda")]
-    if let Some(mgr) = state.manager_for(&req.model) {
-        if mgr.manages(&req.model) {
-            use crate::serve::manager::EnsureError;
-            if let Err(e) = mgr.ensure_resident(&req.model).await {
+    {
+        use crate::serve::manager::EnsureError;
+        let ensured = match state.dp_set(&req.model) {
+            Some(set) => Some(state.dp_admit(set).await),
+            None => match state.manager_for(&req.model) {
+                Some(mgr) if mgr.manages(&req.model) => Some(mgr.ensure_resident(&req.model).await),
+                _ => None,
+            },
+        };
+        {
+            if let Some(Err(e)) = ensured {
                 return match e {
                     EnsureError::WontFit { .. } | EnsureError::SwitchTimeout(_) => (
                         axum::http::StatusCode::SERVICE_UNAVAILABLE,
@@ -380,7 +387,10 @@ async fn chat_completions_with(
 
     // Route to the per-model muxer. Tokens stream back as `StreamChunk`s over
     // an mpsc — the muxer produces one per generated token, ending with `Done`.
-    let (Some(mux), Ok(bundle)) = (state.mux(&req.model), state.registry.get(&req.model)) else {
+    // A data-parallel model picks its rank after tokenizing (the prefix probe needs the ids).
+    let dp = state.dp_set(&req.model);
+    let direct = if dp.is_some() { None } else { state.mux(&req.model) };
+    let (true, Ok(bundle)) = (dp.is_some() || direct.is_some(), state.registry.get(&req.model)) else {
         return crate::serve::api_error(
             axum::http::StatusCode::NOT_FOUND,
             format!("no model registered for '{}'.", req.model),
@@ -389,7 +399,7 @@ async fn chat_completions_with(
             Some("model".into()),
         );
     };
-    let ingress = mux.ingress();
+    let ingress = direct.as_ref().map(|m| m.ingress());
     // Tokenize HERE, on the handler task — the dispatcher loop is the
     // serialized decode critical path and must never encode a long prompt.
     // The packet's reasoning markers (`<think>` for a legacy packet): the splitter's own
@@ -425,6 +435,21 @@ async fn chat_completions_with(
         tok: bundle.tokenizer().clone(),
         as_ids: req.return_tokens_as_token_ids.unwrap_or(false),
     });
+    let routed;
+    let (mut rank, mut prefix, mut _pick) = (0, None, None);
+    let mux = match (&direct, dp) {
+        (Some(m), _) => m,
+        (None, Some(set)) => match state.dp_route(set, ids.session.as_deref(), Some(&prompt_ids), 0) {
+            Some((r, m, key, pick)) => {
+                (rank, prefix, _pick) = (r, key, Some(pick));
+                routed = m;
+                &routed
+            }
+            None => return dp_unavailable(&req.model),
+        },
+        (None, None) => unreachable!("checked at lookup"),
+    };
+    let key = dp.map_or(req.model.as_str(), |set| set.ranks[rank].key.as_str());
     let (tx, rx) = stream_mod::channel();
     let Some(in_flight) = ids.begin(&req.model) else {
         return crate::serve::api_error(
@@ -439,7 +464,7 @@ async fn chat_completions_with(
         ids,
         crate::serve::turns::Kind::Llm,
         &req.model,
-        Some(state.model_metrics(&req.model)),
+        Some(state.model_metrics(key)),
         t_arrive,
         true,
     );
@@ -454,13 +479,14 @@ async fn chat_completions_with(
             session,
             turn: run.key(),
             continuing: run.continuing(),
+            prefix: prefix.take(),
             ..Default::default()
         },
     };
     if crate::obs::host::on() {
         crate::obs::host::submitted(n_prompt, t_arrive.elapsed());
     }
-    if let Err(err) = mux.submit_arrived(job, t_arrive, Some(ingress)) {
+    if let Err(err) = state.submit_routed(dp.map(|s| (&**s, rank)), ids.session.as_deref(), mux, job, t_arrive, ingress) {
         return match err {
             crate::serve::mux::SubmitError::Full(_) => {
                 crate::serve::api_error(
@@ -522,6 +548,17 @@ async fn chat_completions_with(
         cache.stamp(&mut response);
     }
     response
+}
+
+/// No rank of a data-parallel model is serving (all unloading, or each refused the request).
+pub(crate) fn dp_unavailable(model: &str) -> Response {
+    crate::serve::api_error(
+        axum::http::StatusCode::SERVICE_UNAVAILABLE,
+        format!("no data-parallel rank of '{model}' is serving; retry"),
+        "server_error",
+        None,
+        None,
+    )
 }
 
 /// Pick the chat template a GPU-served model wants.

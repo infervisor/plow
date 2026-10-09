@@ -121,8 +121,8 @@ not implement Qwen or Nemotron control flow.
 
 | Path | Metal | CPU | CUDA/HSA |
 |---|---:|---:|---:|
-| `rnnt.greedy.v1` packet controller | Verified | Available for correctness | Packet-runtime adapters pending |
-| Qwen `causal.v1` ASR controller | Verified | Not yet wired | Packet-runtime adapters pending |
+| `rnnt.greedy.v1` packet controller | Verified | Available for correctness | CUDA verified (L4 sm_89); HSA pending |
+| Qwen `causal.v1` ASR controller | Verified | Not yet wired | CUDA verified (H100 sm_90a, L4 sm_89); HSA pending |
 | HTTP and WebSocket serving | Shared | Shared when the model path is available | Shared when a backend is added |
 
 Metal kernels and device selection remain under `exec/apple` and

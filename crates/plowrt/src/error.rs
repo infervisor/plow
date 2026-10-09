@@ -90,6 +90,14 @@ pub enum RuntimeError {
     #[error("context length exceeded: {0}")]
     ContextLength(String),
 
+    /// A full queue: retryable, HTTP 429.
+    #[error("overloaded: {0}")]
+    Overloaded(String),
+
+    /// The serving path is closed or draining: retry elsewhere, HTTP 503.
+    #[error("unavailable: {0}")]
+    Unavailable(String),
+
     /// Asset distribution: the registry, the local store, a manifest, or the
     /// checkpoint farm. SEPARATE from [`Device`](Self::Device) because none of
     /// these involve a driver — reporting "device error: this model has not been

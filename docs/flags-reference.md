@@ -1134,7 +1134,12 @@ Removed (a set value is ignored with a startup warning; recipes and scripts may 
 | `PLOW_PRELOAD` | on | speculative next-model preload after an S1 switch; `=0` disables. |
 | `PLOW_DEVICES=0,1` | all visible | CUDA device ordinals to serve on. Indices into the **visible** set, not the physical one. |
 | `PLOW_PLACE=spread\|pack\|explicit` | `spread` | CUDA: how models are laid out over the visible devices. |
-| `PLOW_PIN=slug@2,...` | unset | CUDA: pin a model to a device; required for every model under `--place explicit`. |
+| `PLOW_PIN=slug@2,...` | unset | CUDA: pin a model to a device; required for every model under `--place explicit`. A DP model's pins go to its ranks in order. |
+| `PLOW_DP=N\|all\|slug=N,...` (`--dp`) | 1 | CUDA: data-parallel ranks per model (TP1 bundles), one per device group, routed by session, prefix cache and load (`docs/runtime/data-parallel.md`). |
+| `PLOW_ROUTE_PREFIX=0/1` (`--route-prefix`) | on | DP routing: probe each rank's prefix cache and prefer the rank holding the longest prefix. |
+| `PLOW_ROUTE_SPILL=N` (`--route-spill`) | max(4, slots/4) | DP routing: queued requests past which a session or prefix match stops pinning a rank. |
+| `PLOW_ROUTE_PREFIX_SLACK=F` (`--route-prefix-slack`) | 0.5 | DP routing: extra load a prefix match may carry over the least-loaded rank, per fraction of the prompt it saves. |
+| `PLOW_DP_NUMA_PIN=0/1` (`--dp-numa-pin`) | on | DP: pin each rank's dispatcher thread to its GPU's CPU socket. |
 | `PLOW_CO_SCHED=free\|rr\|deadline` | derived | **Expert.** How co-resident models take a shared device group. Unset: one model `free`; several on AMD `rr` (required for whole-grid residency); several on CUDA `deadline` (latency / auto) or `rr` (throughput). The turn quantum is 4 ticks. |
 | `PLOW_MODELS_ROOT=dir[:dir]` | startup `--assets` parents | directories `POST /v1/models/load` may take an assets dir from. Defaults closed. |
 | `PLOW_TP_AGREE_EVERY=N` | 1 | TP cross-rank agreement interval. `PLOW_TP_NO_AUDIT=1` disables the redundant-rank audit (timing runs); `PLOW_TP_SERIAL_LOAD=1` restores one-at-a-time per-rank load. |

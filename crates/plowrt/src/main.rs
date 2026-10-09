@@ -80,6 +80,9 @@ enum Cmd {
         /// Interface for direct remote inference, such as a WireGuard address.
         #[arg(long, default_value = "127.0.0.1")]
         bind: std::net::IpAddr,
+        /// Also listen on this Unix domain socket (mode 0600), serving the same routes.
+        #[arg(long, requires = "port")]
+        socket: Option<PathBuf>,
         #[arg(long, requires = "port")]
         websocket: bool,
         /// Public model identity. Defaults to the packet pipeline name for compatibility.
@@ -90,11 +93,11 @@ enum Cmd {
         backend: String,
     },
     /// Load compiled assets and serve the OpenAI-compatible API.
-    // A serve needs a source, and there are two: a directory on disk or a
-    // reference in the local store. Grouping them means the error names BOTH,
-    // rather than telling a `--model` user that `--assets` is required.
+    // A serve needs a source: a directory on disk, a reference in the local store, or a packet
+    // ASR model. Grouping them means the error names all of them, rather than telling a
+    // `--model` user that `--assets` is required.
     #[command(group(clap::ArgGroup::new("model_source").required(true).multiple(true)
-        .args(["assets", "model"])))]
+        .args(["assets", "model", "asr_packets"])))]
     Serve {
         /// One or more compiled-model directories.
         #[arg(long = "assets")]
@@ -801,6 +804,7 @@ async fn async_main(asset_defaults: Vec<(String, String, String)>) -> Result<(),
             prompt,
             port,
             bind,
+            socket,
             websocket,
             backend,
             served_model_name,
@@ -822,18 +826,9 @@ async fn async_main(asset_defaults: Vec<(String, String, String)>) -> Result<(),
                 )?;
                 println!("{}", serde_json::to_string(&result)?);
             } else {
-                let router =
-                    plowrt::asr::serving::AsrServer::new(served_model, engine).router(websocket);
-                let listener =
-                    tokio::net::TcpListener::bind((bind, port.unwrap()))
-                        .await?;
-                tracing::info!(address = %listener.local_addr()?, websocket, "ASR server ready");
-                axum::serve(listener, router)
-                    .tcp_nodelay(true)
-                    .with_graceful_shutdown(async {
-                        let _ = tokio::signal::ctrl_c().await;
-                    })
-                    .await?;
+                plowrt::asr::vad::configured()?;
+                let server = plowrt::asr::serving::AsrServer::new(served_model, engine);
+                serve_asr(server, bind, port.unwrap(), socket, websocket).await?;
             }
             Ok(())
         }
@@ -1227,6 +1222,13 @@ mod amd_bench_cli_tests {
         let cli = Cli::try_parse_from(["plowrt", "serve", "--assets", "model", "--bind", "10.77.0.2"]).unwrap();
         assert!(matches!(cli.cmd, super::Cmd::Serve { bind, .. } if bind.to_string() == "10.77.0.2"));
         assert!(Cli::try_parse_from(["plowrt", "serve", "--assets", "model", "--bind", "not-an-address"]).is_err());
+    }
+
+    #[test]
+    fn serve_accepts_a_packet_asr_model_alone() {
+        let cli = Cli::try_parse_from(["plowrt", "serve", "--asr-packet", "asr=a.pkt"]).unwrap();
+        assert!(matches!(cli.cmd, super::Cmd::Serve { ref assets, .. } if assets.is_empty()));
+        assert!(Cli::try_parse_from(["plowrt", "serve"]).is_err());
     }
 
     #[test]
@@ -3339,6 +3341,26 @@ async fn bringup_runtime(
         use plowrt::memory::vmm::VmmOps as _;
         use plowrt::serve::placement::{self, ModelSpec, Place};
 
+        plowrt::asr::vad::configured()?;
+        // Packet ASR models load first, on device 0: the planner then sees the memory they took.
+        let packets = &RuntimeConfig::get().asr_packets;
+        let mut packet_bytes = 0u64;
+        if !packets.is_empty() {
+            let free_before = cuda.mem_info()?.0;
+            for p in packets {
+                if state.registry.contains(&p.name) || state.registry.resolve(&p.name).is_some() {
+                    return Err(format!("--asr-packet {}: a registry model already has that name", p.name).into());
+                }
+                let loaded = plowrt::asr::load_packet_transcriber(&p.packet, &p.tokenizer, &p.backend)?;
+                tracing::info!(name = %p.name, packet = %p.packet.display(), driver = %loaded.driver,
+                    backend = loaded.backend, "asr: packet model loaded");
+                plowrt::asr::serving::host_packet_model(&state, p.name.clone(), loaded.engine);
+            }
+            packet_bytes = free_before.saturating_sub(cuda.mem_info()?.0);
+            tracing::info!(models = packets.len(), used_mib = packet_bytes >> 20,
+                "asr: packet models resident; device 0's planner capacity reduced by their memory");
+        }
+
         let mut models: Vec<(String, PathBuf, PathBuf)> = Vec::new();
         let slugs: Vec<String> = state.registry.slugs();
         for slug in slugs {
@@ -3372,30 +3394,13 @@ async fn bringup_runtime(
                 )?;
                 specs.push(ModelSpec {
                     slug: slug.clone(),
+                    model: slug.clone(),
                     tp: plowrt::serve::manager::tp_degree(dir)?,
                     required: plan.tensor_total()
                         + plowrt::serve::manager::DEFAULT_OVERHEAD
                         + plowrt::serve::manager::RESERVE,
                     device: None,
                 });
-            }
-
-            // `--pin slug@ordinal`. A pin naming a model this server does not
-            // serve is an error: it is almost always a typo, and honouring the
-            // rest of the pins while dropping that one places a model somewhere
-            // the operator did not ask for.
-            for (slug, ordinal) in placement::parse_pins(&RuntimeConfig::get().pin)
-                .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?
-            {
-                match specs.iter_mut().find(|s| s.slug == slug) {
-                    Some(spec) => spec.device = Some(ordinal),
-                    None => {
-                        return Err(format!(
-                            "--pin {slug}@{ordinal} names a model this server does not serve"
-                        )
-                        .into())
-                    }
-                }
             }
 
             // Visible ordinals.
@@ -3480,10 +3485,101 @@ async fn bringup_runtime(
                     total_bytes = total_bytes.min(be.mem_info()?.1);
                 }
                 group.capacity = budget.map(|b| b.min(total_bytes)).unwrap_or(total_bytes);
+                if group.ordinals.contains(&0) {
+                    group.capacity = group.capacity.saturating_sub(packet_bytes);
+                }
             }
             let groups = groups;
+
+            // `--dp`: expand each model into its data-parallel ranks before placement, so the
+            // anti-affinity sees every rank. Rank r of `slug` is the instance `slug#r`.
+            let dp = placement::parse_dp(&RuntimeConfig::get().dp)
+                .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+            if let Some(m) = dp.named().find(|m| !specs.iter().any(|s| s.slug == *m)) {
+                return Err(format!("--dp {m}=… names a model this server does not serve on the GPU").into());
+            }
+            let mut dp_models: Vec<(String, usize)> = Vec::new();
+            let mut ranked_specs = Vec::with_capacity(specs.len());
+            let mut ranked_models = Vec::with_capacity(models.len());
+            for (spec, (_, dir, ckpt)) in specs.into_iter().zip(models) {
+                let n = dp.ranks(&spec.slug, groups.len());
+                if n == 1 {
+                    ranked_models.push((spec.slug.clone(), dir, ckpt));
+                    ranked_specs.push(spec);
+                    continue;
+                }
+                if spec.tp > 1 {
+                    return Err(format!("{}: --dp {n} over a TP{} bundle is not supported", spec.slug, spec.tp).into());
+                }
+                if n > plowrt::serve::dp::MAX_DP {
+                    return Err(format!("{}: --dp {n} exceeds {} ranks", spec.slug, plowrt::serve::dp::MAX_DP).into());
+                }
+                for r in 0..n {
+                    let key = plowrt::serve::dp::rank_key(&spec.slug, r);
+                    ranked_models.push((key.clone(), dir.clone(), ckpt.clone()));
+                    ranked_specs.push(ModelSpec { slug: key, ..spec.clone() });
+                }
+                dp_models.push((spec.slug, n));
+            }
+            let (mut specs, models) = (ranked_specs, ranked_models);
+
+            // `--pin slug@ordinal`. A pin naming a model this server does not
+            // serve is an error: it is almost always a typo, and honouring the
+            // rest of the pins while dropping that one places a model somewhere
+            // the operator did not ask for. A DP model's pins go to its ranks
+            // in order (`--pin m@2,m@5` places rank 0 on 2 and rank 1 on 5).
+            for (slug, ordinal) in placement::parse_pins(&RuntimeConfig::get().pin)
+                .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?
+            {
+                let unpinned = specs.iter().position(|s| (s.slug == slug || s.model == slug) && s.device.is_none());
+                match unpinned.or_else(|| specs.iter().position(|s| s.slug == slug)) {
+                    Some(i) => specs[i].device = Some(ordinal),
+                    None => {
+                        return Err(format!(
+                            "--pin {slug}@{ordinal} names a model this server does not serve"
+                        )
+                        .into())
+                    }
+                }
+            }
+            let specs = specs;
             let layout = placement::assign(&specs, &groups, policy)
                 .map_err(|e| -> Box<dyn std::error::Error> { e.to_string().into() })?;
+
+            if !dp_models.is_empty() {
+                use plowrt::serve::dp::{rank_key, DpRouter, DpSet, RouteCfg};
+                let mut router = DpRouter::new(RouteCfg::from_config());
+                for (model, n) in &dp_models {
+                    let ranks: Vec<_> = (0..*n)
+                        .map(|r| {
+                            let key = rank_key(model, r);
+                            let i = specs.iter().position(|s| s.slug == key).expect("expanded above");
+                            let g = layout.assignment[i];
+                            (layout.groups[g].first(), g, state.model_metrics(&key))
+                        })
+                        .collect();
+                    let mut set = DpSet::new(model, ranks);
+                    for r in &mut set.ranks {
+                        let be = backends.iter().find(|(d, _)| *d == r.ordinal).map(|(_, b)| b);
+                        if let Some((node, _, cpus)) = be
+                            .and_then(|b| b.pci_bdf())
+                            .and_then(|bdf| plowrt::exec::engine_affinity::socket_cpus_of_pci(std::path::Path::new("/sys"), &bdf.to_ascii_lowercase()))
+                        {
+                            tracing::info!(key = %r.key, device = r.ordinal, numa_node = node, cpus = cpus.len(), "dp: rank dispatcher placed on its GPU's socket");
+                            r.cpus = cpus;
+                        }
+                    }
+                    tracing::info!(
+                        %model,
+                        dp = n,
+                        devices = ?set.ranks.iter().map(|r| r.ordinal).collect::<Vec<_>>(),
+                        cfg = ?router.cfg,
+                        "dp: ranks placed"
+                    );
+                    router.add(set);
+                }
+                state.install_dp(router);
+            }
 
             // One manager per group that received a model. A group's manager
             // owns that group's backend, free-VRAM view, slab pool, LRU order
@@ -3530,14 +3626,32 @@ async fn bringup_runtime(
             state.install_device_turns(layout.groups.len(), true);
             // Load each group's initial residents. Sequential: the loads are
             // H2D-bound and share host bandwidth, so overlapping them buys
-            // little while making a failure harder to attribute.
-            for mgr in &managers {
-                mgr.load_initial().await?;
+            // little while making a failure harder to attribute. DP ranks are
+            // N copies of one checkpoint on N cards: those overlap, a few at a time.
+            if state.dp().is_some() {
+                use futures::{StreamExt, TryStreamExt};
+                // The first group alone: its load-time GEMM selections are then reused by every
+                // later rank (`device::cuda::lt`), so ranks run identical kernels.
+                if let Some(first) = managers.first() {
+                    first.load_initial().await?;
+                }
+                futures::stream::iter(managers.iter().skip(1).map(|m| m.load_initial()))
+                    .buffer_unordered(DP_PARALLEL_LOADS)
+                    .try_collect::<Vec<()>>()
+                    .await?;
+            } else {
+                for mgr in &managers {
+                    mgr.load_initial().await?;
+                }
             }
         }
     }
     #[cfg(not(feature = "cuda"))]
     let managed_slugs: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let dp_spec = plowrt::serve::placement::parse_dp(&RuntimeConfig::get().dp)?;
+    if managed_slugs.is_empty() && (dp_spec.ranks("", 2) > 1 || dp_spec.named().next().is_some()) {
+        return Err("--dp needs the CUDA serve with model bundles under the GPU manager".into());
+    }
 
     // AMD/gfx950 engines. Deliberately NOT under the S1 `ModelManager`: that is
     // the multi-model residency planner (VRAM planning, co-residency, evict-LRU)
@@ -3807,6 +3921,8 @@ async fn bench(
     Ok(())
 }
 
+/// DP rank loads in flight at once at startup (H2D of one checkpoint onto several cards).
+const DP_PARALLEL_LOADS: usize = 4;
 const MAX_TOKEN_AUDIT_REQUESTS: usize = 64;
 const MAX_TOKEN_AUDIT_IDS: usize = 65_536;
 
@@ -3914,12 +4030,14 @@ async fn serve(
     let router = app(Arc::clone(&state));
     let shutdown_state = Arc::clone(&state);
     let shutdown_socket = socket.clone();
+    let keys = &plowrt::config::RuntimeConfig::get().api_keys;
+    plowrt::serve::auth::warn_if_open(bind, keys);
 
     // TCP listener: unchanged, always on.
     let tcp_addr = std::net::SocketAddr::from((bind, port));
     let tcp_listener = tokio::net::TcpListener::bind(tcp_addr).await?;
     tracing::info!(%tcp_addr, "plowrt serving OpenAI API over TCP");
-    let tcp_router = router.clone();
+    let tcp_router = plowrt::serve::auth::require(router.clone(), keys);
     let tcp_http = HttpConns::from_config("TCP");
     let mut conn_slots: Vec<(Arc<tokio::sync::Semaphore>, usize)> = tcp_http.slots().into_iter().collect();
     let tcp_task = tokio::spawn(async move {
@@ -3959,7 +4077,7 @@ async fn serve(
             std::fs::set_permissions(&path, perm)?;
         }
         tracing::info!(socket = %path.display(), "plowrt serving OpenAI API over UDS");
-        let uds_router = router.clone().merge(plowrt::serve::admin_app(state));
+        let uds_router = plowrt::serve::auth::require(router.clone().merge(plowrt::serve::admin_app(state)), keys);
         let http = HttpConns::from_config("UDS");
         conn_slots.extend(http.slots());
         Some(tokio::spawn(async move {
@@ -3994,6 +4112,8 @@ async fn serve(
         r = uds => { if let Err(e) = r { tracing::error!(error = %e, "UDS task join"); } }
         signal = shutdown_signal() => {
             tracing::info!(signal, "shutdown: draining in-flight requests");
+            // `/health` turns 503 and the ASR front refuses new work before the muxes drain.
+            shutdown_state.shutdown.send_replace(true);
             drain_for_shutdown(&shutdown_state).await;
             for l in &accept_loops {
                 l.abort();
@@ -4009,6 +4129,85 @@ async fn serve(
         }
     }
     Ok(())
+}
+
+/// `plowrt asr --port`: the cohort engine's routes over TCP and, optionally, a Unix socket, with
+/// serve's connection limits and API keys. SIGTERM/SIGINT stops accepting, ends sessions still
+/// receiving audio, and waits (`PLOW_DRAIN_TIMEOUT_MS`, 30 s) for submitted work to answer.
+#[cfg(any(
+    all(feature = "cpu", feature = "gguf"),
+    all(feature = "metal", target_os = "macos"),
+    feature = "cuda"
+))]
+async fn serve_asr(
+    server: Arc<plowrt::asr::serving::AsrServer>,
+    bind: std::net::IpAddr,
+    port: u16,
+    socket: Option<PathBuf>,
+    websocket: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let keys = &plowrt::config::RuntimeConfig::get().api_keys;
+    plowrt::serve::auth::warn_if_open(bind, keys);
+    let router = plowrt::serve::auth::require(Arc::clone(&server).router(websocket), keys);
+    let listener = tokio::net::TcpListener::bind((bind, port)).await?;
+    tracing::info!(address = %listener.local_addr()?, websocket, "ASR server ready");
+    let tcp = HttpConns::from_config("TCP");
+    let mut slots: Vec<_> = tcp.slots().into_iter().collect();
+    let svc = hyper_util::service::TowerToHyperService::new(router);
+    let tcp_svc = svc.clone();
+    let mut accept = vec![tokio::spawn(async move {
+        loop {
+            let permit = tcp.permit().await;
+            match listener.accept().await {
+                Ok((stream, _)) => {
+                    let _ = stream.set_nodelay(true);
+                    tcp.spawn(stream, tcp_svc.clone(), permit);
+                }
+                Err(e) => accept_failed("TCP", &e).await,
+            }
+        }
+    })];
+    if let Some(path) = &socket {
+        if path.exists() {
+            let _ = std::fs::remove_file(path);
+        }
+        let uds = tokio::net::UnixListener::bind(path)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        }
+        tracing::info!(socket = %path.display(), "ASR server listening on UDS");
+        let http = HttpConns::from_config("UDS");
+        slots.extend(http.slots());
+        accept.push(tokio::spawn(async move {
+            loop {
+                let permit = http.permit().await;
+                match uds.accept().await {
+                    Ok((stream, _)) => http.spawn(stream, svc.clone(), permit),
+                    Err(e) => accept_failed("UDS", &e).await,
+                }
+            }
+        }));
+    }
+    let signal = shutdown_signal().await;
+    tracing::info!(signal, "shutdown: draining ASR work");
+    server.begin_shutdown();
+    for task in &accept {
+        task.abort();
+    }
+    let deadline = tokio::time::Instant::now()
+        + std::time::Duration::from_millis(plowrt::config::RuntimeConfig::get().drain_timeout_ms().unwrap_or(30_000));
+    while !server.idle() && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    flush_connections(&slots, std::time::Duration::from_secs(2)).await;
+    if let Some(path) = socket {
+        let _ = std::fs::remove_file(path);
+    }
+    tracing::info!(drained = server.idle(), "shutdown: done");
+    // The engine thread never returns on its own.
+    std::process::exit(0);
 }
 
 /// Per-listener HTTP connection handling: hyper's header-read timeout (which also ends an idle
@@ -4175,11 +4374,16 @@ async fn drain_for_shutdown(state: &Arc<AppState>) {
     let deadline = std::time::Duration::from_millis(
         plowrt::config::RuntimeConfig::get().drain_timeout_ms().unwrap_or(30_000),
     );
-    let muxes: Vec<_> = state.registry.slugs().iter().filter_map(|s| state.mux(s)).collect();
+    let muxes = state.all_muxes();
+    let started = tokio::time::Instant::now();
     futures::future::join_all(muxes.into_iter().map(|mux| async move {
         if tokio::time::timeout(deadline, mux.drain()).await.is_err() {
             mux.preempt().await;
         }
     }))
     .await;
+    #[cfg(feature = "cuda")]
+    while !plowrt::asr::serving::packet_models_idle() && started.elapsed() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
 }

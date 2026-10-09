@@ -221,6 +221,11 @@ pub struct EmitConfig {
     #[arg(long = "emit-max-request-chunk", env = "PLOW_MAX_REQUEST_CHUNK")]
     pub max_request_chunk: Option<u32>,
 
+    /// Largest packed Qwen audio-encoder bucket, in 100-frame chunks (default 192). The largest
+    /// bucket sizes every shared encoder tensor; a smaller GPU trades encoder passes for memory.
+    #[arg(long = "emit-asr-packed-max-chunks", env = "PLOW_ASR_PACKED_MAX_CHUNKS")]
+    pub asr_packed_max_chunks: Option<u32>,
+
     /// Rows a request may WRITE per launch when the chunk is staged, which is what the sliding
     /// ring is sized against (`window + stage - 1`) instead of the whole chunk.
     ///
@@ -1477,6 +1482,7 @@ impl EmitConfig {
             decode_ladder_default: false,
             max_chunk: env_u32("PLOW_MAX_CHUNK"),
             max_request_chunk: env_u32("PLOW_MAX_REQUEST_CHUNK"),
+            asr_packed_max_chunks: env_u32("PLOW_ASR_PACKED_MAX_CHUNKS"),
             stage_rows: env_u32("PLOW_STAGE_ROWS"),
             gemv_split: env_u32("PLOW_GEMV_SPLIT").unwrap_or(1),
             decode_tiled: env_bool("PLOW_DECODE_TILED"),
