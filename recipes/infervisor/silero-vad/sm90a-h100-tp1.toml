@@ -48,7 +48,7 @@ output = "silero_vad.pkt"
 
 [serve]
 attach = "--asr-vad-packet"
-env = "PLOW_ASR_VAD_PACKET"
+env_var = "PLOW_ASR_VAD_PACKET"
 
 [bench]
 kind = "vad"
