@@ -25,8 +25,9 @@ Per request, after tokenizing (lock-free, relaxed atomics only):
 1. **Session**: a request with `X-Session-Id` goes to the session's rank (its retained rows live
    there) unless that rank is down, or has more than `PLOW_ROUTE_SPILL` queued requests (default
    max(4, slots/4)) *and* carries 0.5 more load than the least-loaded rank. A new session goes to
-   the rank with the least load + pinned sessions / slots. Sessions live in 64 shards and expire
-   after 15 min idle.
+   the rank holding the fewest sessions (claimed atomically, so a burst of first turns spreads
+   evenly; a momentary queue does not skew it, only KV past 90% excludes a rank). Sessions live in
+   64 shards and expire after 15 min idle.
 2. **Prefix**: the router keeps the last 128-token block hash of each prompt it routed (a sampled
    chain, per model); a prompt extending one goes to that prompt's rank, before the rank has
    published the rows. A tail routed to two ranks (a shared system prompt) points nowhere. A
@@ -61,7 +62,7 @@ model reuse the first one's timed cuBLASLt picks, so ranks run identical kernels
 
 | test | result |
 |---|---|
-| gemma closed-loop agentic, 64N sessions x 6 turns (`X-Session-Id`) | out tok/s 1096 / 2215 / 4401 / 7825 at N=1/2/4/8 (2.02x, 4.02x, 7.14x); per-turn TTFT p50 within 3% of N=1; 0 errors |
+| gemma closed-loop agentic, 64N sessions x 6 turns (`X-Session-Id`) | out tok/s 1103 / 8660 at N=1/8 (7.85x; 7.83x on a second run); every rank served exactly 384 requests; TTFT p50 133.7 vs 133.5 ms at N=1; 0 errors |
 | qwen3-asr, N open-loop clients at 60 req/s, 73-clip manifest | 397 / 783 / 1571 / 3147 audio-s/s (7.9x at N=8); WER 3.74% -> 3.82%; each GPU 38.6 GiB (encoders on their own GPU) |
 | temperature 0, 16 prompts x 16 repeats over 8 ranks | identical to N=1 output (3 runs) |
 | no `X-Session-Id`, VMM prefix cache on, N=8 | prefix routing: cache hit 75-77% (N=1 77.3%) vs 20.2% without; 1.3-1.9x tok/s; rank imbalance up to 1.5x (open risk) |

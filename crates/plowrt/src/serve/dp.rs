@@ -115,6 +115,8 @@ pub fn load(c: &Cand) -> f32 {
 
 /// Load (fraction of slots) a session's rank must exceed the least-loaded rank by to spill.
 const SPILL_MARGIN: f32 = 0.5;
+/// KV commitment (per mille) past which a rank takes no new session while another has room.
+const KV_FULL_MILLI: u32 = 900;
 
 fn spill(cfg: &RouteCfg, c: &Cand) -> u32 {
     cfg.spill.unwrap_or_else(|| (c.capacity / 4).max(4))
@@ -264,7 +266,34 @@ impl Sessions {
         Some((r as usize, t))
     }
 
-    fn put(&self, h: u64, rank: usize, now: u32) {
+    /// A new session's rank: fewest sessions, ties to the lower load. Queue depth does not exclude a
+    /// rank: a burst of first turns skews it for a moment while the session stays for its whole
+    /// life (an overloaded rank sheds sessions by spill later); only KV near full does. Claimed by
+    /// CAS, so concurrent first turns cannot all read the same counts and pile onto one rank. Pass
+    /// the result to [`Self::put`] as `reserved`.
+    fn reserve(&self, cands: &[Cand]) -> Option<usize> {
+        let roomy = cands.iter().any(|c| c.up && c.kv_milli < KV_FULL_MILLI);
+        loop {
+            let mut best: Option<(usize, u32, f32)> = None;
+            for (i, c) in cands.iter().enumerate() {
+                let l = load(c);
+                if !c.up || roomy && c.kv_milli >= KV_FULL_MILLI {
+                    continue;
+                }
+                let s = self.count(i);
+                if best.is_none_or(|(_, bs, bl)| s < bs || s == bs && l < bl) {
+                    best = Some((i, s, l));
+                }
+            }
+            let (i, s, _) = best?;
+            if self.counts[i].compare_exchange_weak(s, s + 1, Relaxed, Relaxed).is_ok() {
+                return Some(i);
+            }
+        }
+    }
+
+    /// `reserved`: `rank`'s count already holds this session ([`Self::reserve`]).
+    fn put(&self, h: u64, rank: usize, now: u32, reserved: bool) {
         let mut s = self.shard(h).lock();
         if s.len() >= SHARD_CAP && !s.contains_key(&h) {
             s.retain(|_, &mut (r, t)| {
@@ -281,11 +310,18 @@ impl Sessions {
             }
         }
         match s.insert(h, (rank as u8, now)) {
-            Some((old, _)) if old as usize == rank => return,
+            Some((old, _)) if old as usize == rank => {
+                if reserved {
+                    self.forget(old);
+                }
+                return;
+            }
             Some((old, _)) => self.forget(old),
             None => {}
         }
-        self.counts[rank].fetch_add(1, Relaxed);
+        if !reserved {
+            self.counts[rank].fetch_add(1, Relaxed);
+        }
     }
 
     fn len(&self) -> usize {
@@ -566,7 +602,13 @@ impl DpSet {
             v
         });
         let prompt_rows = prompt.map_or(0, <[u32]>::len);
-        let (rank, reason) = choose(&cands[..n], sticky, prompt_rows, block_rows, cfg, rr)?;
+        let (mut rank, reason) = choose(&cands[..n], sticky, prompt_rows, block_rows, cfg, rr)?;
+        let mut reserved = false;
+        if session.is_some() && sticky.is_none() && reason == Reason::LeastLoaded {
+            if let Some(r) = self.sessions.reserve(&cands[..n]) {
+                (rank, reserved) = (r, true);
+            }
+        }
         let reason = if retry { Reason::Retry } else { reason };
         if let Some((last, now, shared)) = tail {
             self.tails.put_tail(last, if shared { SHARED_TAIL as usize } else { rank }, now);
@@ -574,7 +616,7 @@ impl DpSet {
         if let Some((h, now)) = session {
             let fresh = stored.is_some_and(|(r, t)| r == rank && now.wrapping_sub(t) < SESSION_REFRESH_S);
             if !fresh {
-                self.sessions.put(h, rank, now);
+                self.sessions.put(h, rank, now, reserved);
             }
         }
         self.stats.decisions[reason as usize].fetch_add(1, Relaxed);
@@ -750,17 +792,44 @@ mod tests {
         up(&s);
         let cfg = RouteCfg::default();
         s.ranks[3].metrics.slots_active.store(2, Relaxed);
+        s.ranks[5].metrics.slots_active.store(12, Relaxed);
+        s.ranks[6].metrics.kv_used_milli.store(950, Relaxed);
         for i in 0..64 {
             s.route(&cfg, Some(&format!("sess-{i}")), None, 0).unwrap();
         }
         let counts: Vec<u32> = (0..8).map(|r| s.sessions.count(r)).collect();
         assert_eq!(counts.iter().sum::<u32>(), 64);
-        assert!(counts.iter().all(|&c| (6..=9).contains(&c)), "{counts:?}");
-        assert!(counts[3] <= 7, "the busier rank takes fewer: {counts:?}");
+        assert_eq!(counts[6], 0, "a rank with KV near full takes none: {counts:?}");
+        assert!(counts[5] >= 9, "a momentary queue does not unbalance sessions: {counts:?}");
+        let live = counts.iter().enumerate().filter(|&(r, _)| r != 6).map(|(_, &c)| c);
+        assert!(live.clone().max().unwrap() - live.min().unwrap() <= 1, "{counts:?}");
         let h = Sessions::hash("sess-0");
         let before = counts.iter().sum::<u32>();
         assert!(s.sessions.get(h, s.sessions.now() + SESSION_TTL_S).is_none());
         assert_eq!((0..8).map(|r| s.sessions.count(r)).sum::<u32>(), before - 1, "expiry uncounts");
+    }
+
+    /// First turns placing concurrently each claim a distinct share: no rank ends more than one
+    /// session ahead.
+    #[test]
+    fn a_concurrent_burst_of_new_sessions_spreads_evenly() {
+        let s = set(8);
+        up(&s);
+        let cfg = RouteCfg::default();
+        std::thread::scope(|t| {
+            for w in 0..16 {
+                let (s, cfg) = (&s, &cfg);
+                t.spawn(move || {
+                    for i in 0..32 {
+                        let r = s.route(cfg, Some(&format!("w{w}-{i}")), None, 0).unwrap();
+                        assert_eq!(r.reason, Reason::LeastLoaded);
+                    }
+                });
+            }
+        });
+        let counts: Vec<u32> = (0..8).map(|r| s.sessions.count(r)).collect();
+        assert_eq!(counts, vec![64; 8]);
+        assert_eq!(s.sessions(), 512);
     }
 
     #[test]
@@ -770,12 +839,12 @@ mod tests {
         let mut same: Vec<u64> = (0u64..).map(|i| i << 58 | i).filter(|&h| shard_of(h) == 0).take(SHARD_CAP + 1).collect();
         let last = same.pop().unwrap();
         for &h in &same[..SHARD_CAP / 2] {
-            s.put(h, 1, 0);
+            s.put(h, 1, 0, false);
         }
         for &h in &same[SHARD_CAP / 2..] {
-            s.put(h, 1, SESSION_TTL_S + 10);
+            s.put(h, 1, SESSION_TTL_S + 10, false);
         }
-        s.put(last, 2, SESSION_TTL_S + 10);
+        s.put(last, 2, SESSION_TTL_S + 10, false);
         assert_eq!(s.shards[0].lock().len(), SHARD_CAP / 2 + 1);
         assert_eq!(s.get(last, SESSION_TTL_S + 10), Some((2, SESSION_TTL_S + 10)));
     }
