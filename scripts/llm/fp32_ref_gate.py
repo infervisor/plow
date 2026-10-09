@@ -8,7 +8,10 @@ set, and the candidate passes if it is within the peer's distance to FP32 plus a
 
   prompts   --hf DIR --corpus NAME=FILE ... --out prompts.json     fixed token-id prompt set (CPU)
   reference --hf DIR --prompts prompts.json --out ref.json         FP32 greedy continuation + top-20
-            [--device cpu]                                         (default cuda)
+            [--device cpu|offload]                                 (default cuda; offload keeps
+                                                                   what fits on the GPU and streams
+                                                                   the other decoder layers from
+                                                                   pinned host memory, e.g. 31B)
   capture   --url URL --ref ref.json --arm NAME --out cap.json     a served stack, teacher-forced
   score     --ref ref.json CAP...                                  metrics per capture
   gate      --ref ref.json --cand CAP --peer CAP [thresholds]      verdict (exit 1 on fail)
@@ -393,8 +396,68 @@ def scaled_tensors(files, device="cuda"):
                 yield k, w, scale
 
 
-def load_fp32(hf, device="cuda"):
+def offload_layers(model, compact, headroom_gib=40.0):
+    """Decoder layers kept in checkpoint precision (`compact`: name -> (weight, scale or None),
+    on the GPU while it fits beside `headroom_gib` of activations, else in pinned host memory) and
+    materialized in FP32 on the GPU per forward with the same `w.float() * scale.float()` as the
+    resident load, so the reference is bit-identical to an all-FP32 model. Everything else lives
+    on the GPU in FP32."""
     import torch
+    layers = model.model.layers
+    for name, child in model.model.named_children():
+        if name != "layers":
+            child.to("cuda")
+    model.lm_head.to("cuda")
+    named = []
+    for i, layer in enumerate(layers):
+        ps = [(p, tuple(p.shape), compact.pop(f"model.layers.{i}.{n}")) for n, p in layer.named_parameters()]
+        for p, *_ in ps:
+            p.data = torch.empty(0)
+        layer.to("cuda")  # buffers; the parameters are placeholders
+        named.append(ps)
+    per = max(sum(w.numel() * w.element_size() for _, _, (w, _) in ps) for ps in named)
+    free = torch.cuda.mem_get_info()[0] - int(headroom_gib * 2**30)
+    on_gpu = max(0, min(len(layers), free // per))
+    store = []
+    for i, ps in enumerate(named):
+        dev = "cuda" if i < on_gpu else None
+        row = []
+        for p, shape, (w, scale) in ps:
+            w = w.to("cuda") if dev else w.contiguous().pin_memory()
+            scale = None if scale is None else scale.to("cuda", torch.float32)
+            row.append((p, shape, w, scale))
+        store.append(row)
+    torch.cuda.empty_cache()
+
+    def pre(j):
+        def hook(_m, _a):
+            for p, shape, w, scale in store[j]:
+                d = w.to("cuda", non_blocking=True).to(torch.float32)
+                if scale is not None:
+                    d = d * scale
+                p.data = d.reshape(shape)
+        return hook
+
+    def post(j):
+        def hook(_m, _a, _o):
+            for p, *_ in store[j]:
+                p.data = torch.empty(0, device="cuda")
+        return hook
+
+    for j, layer in enumerate(layers):
+        layer.register_forward_pre_hook(pre(j))
+        layer.register_forward_hook(post(j))
+    print(f"offload: {on_gpu}/{len(layers)} decoder layers in checkpoint precision on the GPU, "
+          f"{len(layers) - on_gpu} in pinned host memory ({per / 2**30:.2f} GiB each)", flush=True)
+
+
+def load_fp32(hf, device="cuda", compact=None):
+    import torch
+    if device == "offload":
+        compact = {}
+        model, weights = load_fp32(hf, "cpu", compact)
+        offload_layers(model, compact)
+        return model, weights
     from transformers import AutoConfig
     from transformers.modeling_utils import AttentionInterface
     AttentionInterface.register("sdpa", fp32_attention)
@@ -413,6 +476,7 @@ def load_fp32(hf, device="cuda"):
     with torch.device(device):
         model = model_class(cfg).eval()
     params = dict(model.named_parameters())
+    weights_of = set(params)
     params.update(dict(model.named_buffers()))
     loaded, unused = set(), []
     experts = 0
@@ -426,6 +490,16 @@ def load_fp32(hf, device="cuda"):
             continue
         if name not in params:  # e.g. k/v of KV-shared layers: the model never reads them
             unused.append(k)
+            continue
+        if compact is not None:  # offload: keep checkpoint precision, materialize per forward
+            if name.startswith("model.layers.") and name in weights_of:
+                compact[name] = (w, scale)
+            else:
+                w = w.to(torch.float32)
+                if scale is not None:
+                    w = w * scale.to(torch.float32)
+                params[name].data = w.reshape(params[name].shape)
+            loaded.add(name)
             continue
         w = w.to(torch.float32)
         if scale is not None:  # FP8 per-output-channel: dequantize exactly in FP32
@@ -447,14 +521,14 @@ def load_fp32(hf, device="cuda"):
 def cmd_reference(a):
     import torch
     import transformers
-    dev = a.device
+    dev = "cuda" if a.device == "offload" else a.device
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
     torch.set_float32_matmul_precision("highest")
     from transformers import AutoTokenizer
     tok = AutoTokenizer.from_pretrained(a.hf, local_files_only=True)
     prompts = json.loads(Path(a.prompts).read_text())
-    model, weights = load_fp32(a.hf, dev)
+    model, weights = load_fp32(a.hf, a.device)
     # Long prompts compute their masks inside fp32_attention (causal + sliding window): HF would
     # materialize a q x kv mask per layer type, 64 GiB at 262144 tokens.
     no_masks = {t: None for t in set(getattr(model.config, "layer_types", None) or ["full_attention"])}
@@ -497,7 +571,7 @@ def cmd_reference(a):
     meta = dict(schema="plow.fp32ref.v1", prompts=str(Path(a.prompts).resolve()), prompts_sha256=file_sha(a.prompts),
                 weights=weights, dtype="float32", tf32=False, attention="fp32 chunked math",
                 dequant="fp8_e4m3 weight x per-channel scale in fp32", torch=torch.__version__,
-                transformers=transformers.__version__, device=torch.cuda.get_device_name() if dev == "cuda" else f"cpu ({torch.get_num_threads()} threads)",
+                transformers=transformers.__version__, device=(torch.cuda.get_device_name() + (" + host offload" if a.device == "offload" else "")) if dev == "cuda" else f"cpu ({torch.get_num_threads()} threads)",
                 utc=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), top=TOP)
     Path(a.out).write_text(json.dumps(dict(meta=meta, cases=cases)))
     print(f"reference: {len(cases)} cases -> {a.out} sha256 {file_sha(a.out)}")
@@ -655,7 +729,7 @@ def main():
     rf.add_argument("--hf", required=True)
     rf.add_argument("--prompts", required=True)
     rf.add_argument("--only", help="comma-separated case ids (debug)")
-    rf.add_argument("--device", default="cuda", help="torch device for the FP32 model (cuda or cpu)")
+    rf.add_argument("--device", default="cuda", help="torch device for the FP32 model (cuda, cpu, or offload: GPU + pinned host layers)")
     rf.add_argument("--out", required=True)
     rf.set_defaults(f=cmd_reference)
     cp = sp.add_parser("capture")

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Build and run the Gemma-4 per-kernel ROUTE MATRIX on sm_90a: for every dense projection shape
-# of the 12B and the 26B-A4B, plow's shipped ws384 GEMM body vs cuBLASLt, in BOTH precisions.
+# of the 12B, the 26B-A4B and the 31B, plow's shipped ws384 GEMM body vs cuBLASLt, in BOTH precisions.
 #
 #   bf16 arm : k_ws384 <PROD,false>  vs  cuBLASLt bf16          (the shipped BF16 route pair)
 #   w8a8 arm : k_ws384_fp8 <PROD,true> vs cuBLASLt e4m3 with
@@ -54,7 +54,7 @@ common=(
   # rejected there before the real sm_90a pass ever runs. -gencode emits SASS only.
   -std=c++17 -gencode arch=compute_90a,code=sm_90a -O3 -Xptxas=-v
   -I "$root/runtime/common" -I "$root/runtime/nvidia"
-  -DPLOW_BENCH_WS384=1 -DPLOW_BENCH_GEMMA4_ALL=1 -DPLOW_BENCH_GEMMA4_26B=1
+  -DPLOW_BENCH_WS384=1 -DPLOW_BENCH_GEMMA4_ALL=1 -DPLOW_BENCH_GEMMA4_26B=1 -DPLOW_BENCH_GEMMA4_31B=1
   -DPGM90_TMA_STAGES=3 -DPGM90_WS384_PREFETCH=1 -DPGM90_WS384_ISSUE_CURSOR=1
   -DPGM90_WS384_SMEPI=0
   -DPLOW_NV_GEMM_ONLY=1

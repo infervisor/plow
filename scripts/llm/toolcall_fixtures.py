@@ -23,6 +23,8 @@ FAMILIES = {
     # name: (hub repo, local template override or None)
     "gemma4-e4b": ("google/gemma-4-E4B-it", None),
     "gemma4-12b": ("google/gemma-4-12b-it", "/opt/dlami/nvme/hf-cache/hub/gemma-4-12b-it-fp8"),
+    "gemma4-31b": ("google/gemma-4-31B-it",
+                   "/opt/dlami/nvme/lava-tts/hf/hub/models--google--gemma-4-31B-it/snapshots/842da3794eaa0b77d5f08bae87a17459d91ff475"),
     "qwen3": ("Qwen/Qwen3-8B", None),
     "qwen2.5": ("Qwen/Qwen2.5-7B-Instruct", None),
     "qwen3.5": ("Qwen/Qwen3.5-27B", None),
