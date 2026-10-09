@@ -272,6 +272,7 @@ async fn session(state: Arc<AsrServer>, mut socket: WebSocket, ids: RequestIds, 
     let mut waiting: VecDeque<(String, Segment, Turn)> = VecDeque::new();
     let mut flights: VecDeque<Flight> = VecDeque::new();
     let mut flight_items: VecDeque<String> = VecDeque::new();
+    let mut spec: Option<Speculation> = None;
     let mut ping = tokio::time::interval_at(tokio::time::Instant::now() + PING_INTERVAL, PING_INTERVAL);
     let mut last_pong = tokio::time::Instant::now();
     let mut idle_at = tokio::time::Instant::now() + REALTIME_IDLE;
@@ -279,7 +280,7 @@ async fn session(state: Arc<AsrServer>, mut socket: WebSocket, ids: RequestIds, 
         // Launch waiting turns with the settings current at their commit.
         while flights.len() < MAX_SEGMENTS_IN_FLIGHT {
             let Some((_, segment, turn)) = waiting.front() else { break };
-            match launch(&state, &ids, turn, segment) {
+            match take_or_launch(&mut spec, &state, &ids, turn, segment) {
                 Ok(flight) => {
                     let (item, _, _) = waiting.pop_front().expect("guarded");
                     flights.push_back(flight);
@@ -443,6 +444,7 @@ async fn session(state: Arc<AsrServer>, mut socket: WebSocket, ids: RequestIds, 
                         epoch += fed;
                         fed = 0;
                         endpointer = new_endpointer(next.vad, rerouted.as_ref().or(route.as_ref()).map(|r| &r.2));
+                        spec = None;
                     }
                     if let Some((model, r, finalization)) = rerouted {
                         _metrics = Some(AsrSessionMetrics::new(state.metrics(&model)));
@@ -501,10 +503,21 @@ async fn session(state: Arc<AsrServer>, mut socket: WebSocket, ids: RequestIds, 
                         fed += pcm.len() as u64;
                         let closed = e.push(&pcm);
                         let open = e.open_audio().map(|(index, audio)| (index, fed - audio.len() as u64));
+                        let tentative = e.tentative();
                         for segment in closed {
                             if !commit_turn(&mut out, &mut socket, &mut speaking, &mut previous, &mut waiting, &mut next_item, epoch, segment, Turn::of(&config, &route)).await {
                                 return;
                             }
+                        }
+                        if let (Some(segment), Some(turn)) = (tentative, Turn::of(&config, &route)) {
+                            spec = launch(&state, &ids, &turn, &segment).ok().map(|flight| Speculation {
+                                index: segment.index,
+                                end: segment.end,
+                                model: turn.model,
+                                language: turn.language,
+                                prompt: turn.prompt,
+                                flight,
+                            });
                         }
                         if let Some((index, start)) = open.filter(|o| speaking.as_ref().is_none_or(|s| s.0 != o.0)) {
                             let item = next_item();
@@ -528,7 +541,7 @@ async fn session(state: Arc<AsrServer>, mut socket: WebSocket, ids: RequestIds, 
                         (manual.len() >= MIN_COMMIT).then(|| {
                             let samples = std::mem::take(&mut manual);
                             let end = fed + samples.len() as u64;
-                            let segment = Segment { index: u64::MAX, start: fed, end, samples };
+                            let segment = Segment { index: u64::MAX, start: fed, end, speech: end - fed, samples };
                             fed = end;
                             segment
                         })
@@ -563,6 +576,7 @@ async fn session(state: Arc<AsrServer>, mut socket: WebSocket, ids: RequestIds, 
                 fed = 0;
                 speaking = None;
                 endpointer = new_endpointer(config.vad, route.as_ref().map(|r| &r.2));
+                spec = None;
                 out.event("input_audio_buffer.cleared", json!({}))
             }
             other => out.error("invalid_event", format!("unsupported event type {other:?}"), Some("type"), client_id),
@@ -637,8 +651,59 @@ impl Turn {
     }
 }
 
+/// A turn's transcription started once its audio was final ([`Endpointer::tentative`]), before its
+/// silence ran out; the turn uses it if it closes unchanged under the same settings.
+struct Speculation {
+    index: u64,
+    end: u64,
+    model: String,
+    language: Option<String>,
+    prompt: String,
+    flight: Flight,
+}
+
+/// A VAD turn with less speech than this (Silero frames at or over the threshold) is answered with
+/// an empty transcript: on the customer calls such turns were noise the model filled with words.
+const TURN_MIN_SPEECH: u64 = SAMPLE_RATE as u64 / 4;
+
+fn take_or_launch(
+    spec: &mut Option<Speculation>,
+    state: &AsrServer,
+    ids: &RequestIds,
+    turn: &Turn,
+    segment: &Segment,
+) -> Result<Flight, SubmitError> {
+    if let Some(s) = spec.take() {
+        if (s.index, s.end) == (segment.index, segment.end)
+            && (&s.model, &s.language, &s.prompt) == (&turn.model, &turn.language, &turn.prompt)
+        {
+            return Ok(s.flight);
+        }
+        // A later turn's: still possibly used.
+        if segment.index != u64::MAX && s.index > segment.index {
+            *spec = Some(s);
+        }
+    }
+    launch(state, ids, turn, segment)
+}
+
 fn launch(state: &AsrServer, ids: &RequestIds, turn: &Turn, segment: &Segment) -> Result<Flight, SubmitError> {
     let Turn { model, route, finalization, .. } = turn;
+    if state.vad.is_some() && segment.index != u64::MAX && segment.speech < TURN_MIN_SPEECH {
+        let (answer, work) = oneshot::channel();
+        let _ = answer.send(Ok(Transcript { text: String::new(), language: None }));
+        return Ok(Flight {
+            segment: segment.index,
+            start_ms: segment.start / 16,
+            end_ms: segment.end / 16,
+            work,
+            deltas: mpsc::unbounded_channel().1,
+            shown: String::new(),
+            deadline: None,
+            run: crate::serve::turns::StageRun::start(ids, crate::serve::turns::Kind::Asr, model, state.metrics(model), Instant::now(), true),
+            _cancel: Cancellation(Arc::new(AtomicBool::new(false))),
+        });
+    }
     let mut samples = segment.samples.clone();
     if samples.len() < SAMPLE_RATE as usize / 2 {
         samples.resize(SAMPLE_RATE as usize / 2, 0.0);

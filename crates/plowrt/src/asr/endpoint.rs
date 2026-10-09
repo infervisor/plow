@@ -34,6 +34,8 @@ pub struct Segment {
     /// Absolute 16 kHz sample offsets of the segment in the stream.
     pub start: u64,
     pub end: u64,
+    /// Samples the detector judged speech (confident Silero frames, or loud energy frames).
+    pub speech: u64,
     pub samples: Vec<f32>,
 }
 
@@ -43,6 +45,9 @@ struct Open {
     last_speech_end: u64,
     /// A loud slice has timed this turn's speech: from then on only loud slices extend it.
     loud_seen: bool,
+    speech: u64,
+    /// The speech end [`Endpointer::tentative`] last offered this turn at.
+    offered: Option<u64>,
     /// (frame start, rms or speech probability) of the last `cut_frames` frames.
     recent: VecDeque<(u64, f32)>,
 }
@@ -133,7 +138,21 @@ impl Endpointer {
     pub fn finish(&mut self) -> Option<Segment> {
         let open = self.open.take()?;
         let end = self.end();
-        Some(self.cut(open.index, open.start, end))
+        Some(self.cut(open.index, open.start, end, open.speech))
+    }
+
+    /// The open turn as it would close now, once [`CONTEXT`] of silence has followed its speech:
+    /// its audio is then final unless speech resumes, so its transcription can start before the
+    /// turn's silence runs out. Offered once per speech end.
+    pub fn tentative(&mut self) -> Option<Segment> {
+        let open = self.open.as_mut()?;
+        let end = open.last_speech_end + CONTEXT as u64;
+        if self.scanned < end || open.offered == Some(open.last_speech_end) {
+            return None;
+        }
+        open.offered = Some(open.last_speech_end);
+        let (index, start, speech) = (open.index, open.start, open.speech);
+        Some(self.cut(index, start, end, speech))
     }
 
     /// The open segment's index and audio so far.
@@ -161,7 +180,7 @@ impl Endpointer {
         match &mut self.detector {
             Detector::Energy { levels } => {
                 let (rms, speech) = loud(levels, frame, FLOOR_FRAMES);
-                (rms, speech, speech.then_some(frame.len()), false)
+                (rms, speech, speech.then_some(frame.len()), speech)
             }
             Detector::Silero { vad, stream, threshold, speaking, levels } => {
                 let p = vad.step(stream, frame);
@@ -191,7 +210,8 @@ impl Endpointer {
                 let start = onset.saturating_sub(CONTEXT as u64).max(self.base);
                 let mut recent = VecDeque::with_capacity(self.cut_frames);
                 recent.push_back((at, score));
-                self.open = Some(Open { index: self.next_index, start, last_speech_end: frame_end, loud_seen: false, recent });
+                let speech = (self.run * self.frame) as u64;
+                self.open = Some(Open { index: self.next_index, start, last_speech_end: frame_end, loud_seen: false, speech, offered: None, recent });
                 self.next_index += 1;
                 self.run = 0;
             }
@@ -201,6 +221,9 @@ impl Endpointer {
             open.recent.pop_front();
         }
         open.recent.push_back((at, score));
+        if confident {
+            open.speech += self.frame as u64;
+        }
         // Speech ends where it last sounds loud. A turn too quiet for that (a soft talker under the
         // energy margin) is timed by confident frames instead.
         let speech_end = match loud_end {
@@ -214,10 +237,10 @@ impl Endpointer {
         if let Some(end) = speech_end {
             open.last_speech_end = at + end as u64;
         } else if frame_end - open.last_speech_end >= self.min_silence {
-            let (index, start) = (open.index, open.start);
+            let (index, start, speech) = (open.index, open.start, open.speech);
             let end = (open.last_speech_end + CONTEXT as u64).min(frame_end);
             self.open = None;
-            return Some(self.cut(index, start, end));
+            return Some(self.cut(index, start, end, speech));
         }
         if frame_end - open.start >= self.max_segment {
             // The quietest recent frame ends this segment and starts the next.
@@ -229,19 +252,21 @@ impl Endpointer {
                 .min_by(|a, b| a.1.total_cmp(&b.1))
                 .unwrap_or((at, score));
             let cut = quiet + self.frame as u64 / 2;
-            let (index, start) = (open.index, open.start);
+            let (index, start, speech) = (open.index, open.start, open.speech);
             open.index = self.next_index;
             open.start = cut;
+            open.speech = 0;
+            open.offered = None;
             open.recent.retain(|&(t, _)| t >= cut);
             self.next_index += 1;
-            return Some(self.cut(index, start, cut));
+            return Some(self.cut(index, start, cut, speech));
         }
         None
     }
 
-    fn cut(&self, index: u64, start: u64, end: u64) -> Segment {
+    fn cut(&self, index: u64, start: u64, end: u64, speech: u64) -> Segment {
         let samples = self.buf[(start - self.base) as usize..(end - self.base) as usize].to_vec();
-        Segment { index, start, end, samples }
+        Segment { index, start, end, speech, samples }
     }
 }
 
@@ -353,6 +378,24 @@ mod tests {
         let silero = closed(Endpointer::with_vad(CONFIG, Arc::new(vad), 0.5)).expect("Silero closes the burst");
         // Both time the end by the voice's energy; Silero decides only in 32 ms frames.
         assert!(silero.abs_diff(energy) <= 512 + 160, "energy closed at {energy}, Silero at {silero}");
+    }
+
+    #[test]
+    fn a_turn_is_offered_before_it_closes_with_its_final_audio() {
+        let mut audio = silence(0.5);
+        audio.extend(tone(2.0));
+        audio.extend(silence(1.5));
+        let mut e = Endpointer::new(CONFIG);
+        let (mut offered, mut closed) = (Vec::new(), Vec::new());
+        for chunk in audio.chunks(320) {
+            closed.extend(e.push(chunk).into_iter().map(|s| (s.index, s.start, s.end, s.samples.len(), offered.len())));
+            offered.extend(e.tentative().map(|s| (s.index, s.start, s.end, s.samples.len())));
+        }
+        assert_eq!(closed.len(), 1);
+        let (index, start, end, len, offers_before) = closed[0];
+        assert!(offers_before >= 1, "offered before closing");
+        assert_eq!(offered.last().map(|o| (o.0, o.1, o.2, o.3)), Some((index, start, end, len)));
+        assert!(closed.iter().all(|c| c.3 > 0) && e.tentative().is_none());
     }
 
     #[test]
