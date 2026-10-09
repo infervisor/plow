@@ -152,7 +152,9 @@ pub(crate) struct Lt {
 }
 
 impl Lt {
-    pub(crate) fn load(be: &Arc<CudaBackend>) -> Result<Arc<Self>> {
+    /// `objects`: the serving bundle's object dir (`asset::serve::objects_dir`), where the
+    /// `PLOW_CUTLASS_FP8_DECODE` library lives.
+    pub(crate) fn load(be: &Arc<CudaBackend>, objects: Option<&std::path::Path>) -> Result<Arc<Self>> {
         be.bind()?;
         let api = Api::load()?;
         let workspace = be.alloc(0, 256 * 1024 * 1024)?;
@@ -189,10 +191,12 @@ impl Lt {
             .cutlass_fp8_decode
             .as_deref()
             .map(|pins| {
-                let dir = nv.pf_seg_dir.as_deref().ok_or_else(|| {
-                    RuntimeError::Rejected("PLOW_CUTLASS_FP8_DECODE requires PLOW_PF_SEG_DIR".into())
+                let dir = objects.ok_or_else(|| {
+                    RuntimeError::Rejected(
+                        "PLOW_CUTLASS_FP8_DECODE requires PLOW_PF_SEG_DIR or the bundle's objects/".into(),
+                    )
                 })?;
-                super::cutlass_fp8::CutlassFp8::load(be, std::path::Path::new(dir), pins)
+                super::cutlass_fp8::CutlassFp8::load(be, dir, pins)
             })
             .transpose()?;
         Ok(Arc::new(Self {
@@ -1439,7 +1443,7 @@ mod tests {
     #[ignore = "requires a leased SM90 GPU and cuBLASLt 12.9 or newer"]
     fn fp8_vector_scales_follow_rows_channels_and_plan_identity() -> Result<()> {
         let be = Arc::new(CudaBackend::new(0)?);
-        let lt = Lt::load(&be)?;
+        let lt = Lt::load(&be, None)?;
         let stream = be.stream_create()?;
         let (m, n, k) = (128usize, 512usize, 3840usize);
         let input = be.alloc(0, (m * k) as u64)?;

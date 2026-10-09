@@ -1242,7 +1242,7 @@ A mismatch is a wrong-object launch, i.e. a device trap, not a slowdown.
 
 | flag (env) | default | effect |
 |---|---|---|
-| `--pf-seg-dir` (`PLOW_PF_SEG_DIR`) | unset | dir holding `interp_sm90a_pfseg/_pfgemm[/_pffa].cubin`. Unset = single-object prefill. Packets must be emitted **without** `PLOW_UNISEG`. |
+| `--pf-seg-dir` (`PLOW_PF_SEG_DIR`) | unset | dir holding `interp_sm90a_pfseg/_pfgemm[/_pffa].cubin`. Unset = each bundle uses its own `objects/` if it has one (resolved per bundle, so co-served bundles never share another's objects), else single-object prefill. Set, it overrides every bundle's `objects/`. Packets must be emitted **without** `PLOW_UNISEG`. |
 | `--pf-seg-pure` (`PLOW_PF_SEG_PURE`) | from the packet | segment classing (unset: `1` when the packet has TMA-mapped GEMMs): `1` = every plain tiled GEMM is GEMM-class, `fp8` = only TMA-mapped fp8 GEMMs (the ws-entry object's sole arm). |
 | `--pf-seg-fa512` (`PLOW_PF_SEG_FA512`) | from the packet | hd512 flash on the dedicated `_pffa` object: `1` = hd512 only, `all` = both head dims — `all` **requires** an object built `PLOW_BUILD_FA_HD256=1`; the loader refuses the mismatch rather than trapping. Unset: `1` when the packet isolates hd512 flash (`PLOW_SEG_FA512=1`); an hd256-capable object no longer upgrades it to `all`. |
 | `--pf-seg-graph` (`PLOW_PF_SEG_GRAPH`) | **on** | submit each chunk's whole segment chain as ONE CUDA graph (T35). `=0` is the rollback to per-segment launches. |

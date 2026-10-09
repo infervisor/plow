@@ -49,16 +49,13 @@ const STAGING: usize = 4;
 /// Shape arrays per wave block: hd, m, n8, ld_s, ld_p.
 const DIMS: usize = 5;
 
-/// The softmax object the route loads (`--pf-seg-dir`, then the asset dir), or `None` when the
-/// route is off: `PLOW_PF_ATTN_GEMM=0`, or unset and the packet carries no object. `=1` names
-/// the object whether or not it exists, so a missing one fails the load.
+/// The softmax object the route loads (the bundle's object dir, then the asset dir), or `None`
+/// when the route is off: `PLOW_PF_ATTN_GEMM=0`, or unset and the packet carries no object.
+/// `=1` names the object whether or not it exists, so a missing one fails the load.
 pub(super) fn object(assets_dir: &Path) -> Option<std::path::PathBuf> {
     let config = &crate::config::RuntimeConfig::get().nv;
-    let path = config
-        .pf_seg_dir
-        .as_deref()
-        .filter(|dir| !dir.is_empty())
-        .map(|dir| Path::new(dir).join(SOFTMAX_OBJECT))
+    let path = crate::asset::serve::objects_dir(assets_dir)
+        .map(|dir| dir.join(SOFTMAX_OBJECT))
         .filter(|path| path.exists())
         .unwrap_or_else(|| assets_dir.join(SOFTMAX_OBJECT));
     match config.pf_attn_gemm {

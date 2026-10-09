@@ -723,8 +723,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /// `serve --assets`: export each bundle's packet-carried serve-knob defaults (and its
-/// self-contained `objects/` and cuBLASLt table) unless the environment already sets them, so
-/// `plowrt serve --assets <dir>` alone serves the qualified configuration.
+/// self-contained cuBLASLt table) unless the environment already sets them, so
+/// `plowrt serve --assets <dir>` alone serves the qualified configuration. A bundle's
+/// `objects/` is resolved per bundle at load (`asset::serve::objects_dir`), not exported.
 fn apply_asset_env_defaults() -> Vec<(String, String, String)> {
     let Ok(cli) = Cli::try_parse() else {
         return Vec::new();

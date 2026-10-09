@@ -5032,6 +5032,7 @@ impl GpuEngine {
             kvrow.clear();
             tracing::info!("decode: dynamic B=1 KV row — immutable instruction stream");
         }
+        let objects_dir = crate::asset::serve::objects_dir(assets_dir);
         // Rung graphs run serially on the engine stream and share one Lt workspace.
         let cublaslt = if native_enabled {
             let object = &segment_roles.as_ref().expect("native roles").objects
@@ -5047,7 +5048,7 @@ impl GpuEngine {
             ))
         } else if cublaslt_enabled {
             Some(cublaslt::ProjectionBackend::Lt(
-                crate::device::cuda::lt::Lt::load(&be)?,
+                crate::device::cuda::lt::Lt::load(&be, objects_dir.as_deref())?,
             ))
         } else {
             None
@@ -5055,7 +5056,7 @@ impl GpuEngine {
         let cublaslt_prefill = if prefill_cublaslt_enabled {
             let lt = match &cublaslt {
                 Some(cublaslt::ProjectionBackend::Lt(lt)) => Arc::clone(lt),
-                _ => crate::device::cuda::lt::Lt::load(&be)?,
+                _ => crate::device::cuda::lt::Lt::load(&be, objects_dir.as_deref())?,
             };
             Some(cublaslt::ProjectionBackend::Lt(lt))
         } else {
@@ -5066,18 +5067,12 @@ impl GpuEngine {
             Some(match (&cublaslt, &cublaslt_prefill) {
                 (Some(cublaslt::ProjectionBackend::Lt(lt)), _)
                 | (_, Some(cublaslt::ProjectionBackend::Lt(lt))) => Arc::clone(lt),
-                _ => crate::device::cuda::lt::Lt::load(&be)?,
+                _ => crate::device::cuda::lt::Lt::load(&be, objects_dir.as_deref())?,
             })
         } else {
             None
         };
-        let moe_lt_dirs: Vec<&Path> = nv_config
-            .pf_seg_dir
-            .as_deref()
-            .map(Path::new)
-            .into_iter()
-            .chain([assets_dir])
-            .collect();
+        let moe_lt_dirs: Vec<&Path> = objects_dir.as_deref().into_iter().chain([assets_dir]).collect();
         let routed_decode = if moe_lt_decode_min.is_some()
             && nv_config.cubin.is_none()
             && nv_config.kernel.is_none()
@@ -5808,7 +5803,7 @@ impl GpuEngine {
             } else {
                 let lt = match &cublaslt_prefill {
                     Some(cublaslt::ProjectionBackend::Lt(lt)) => Arc::clone(lt),
-                    _ => crate::device::cuda::lt::Lt::load(&be)?,
+                    _ => crate::device::cuda::lt::Lt::load(&be, objects_dir.as_deref())?,
                 };
                 let object = attention_gemm::object(assets_dir).ok_or_else(|| {
                     RuntimeError::Rejected("PLOW_PF_ATTN_GEMM: softmax object vanished".into())
@@ -8825,17 +8820,12 @@ impl GpuEngine {
         be.set_max_dynamic_smem(f_pf, smem_pf)?;
 
         // Fine-gated packets select the segmented pair from their own asset directory.
-        // `--pf-seg-dir` remains an explicit object-directory override.
+        // The bundle's own `objects/` (or an explicit `--pf-seg-dir`) holds its configured pair.
         let small_gemm_path = crate::config::RuntimeConfig::get()
             .nv
             .pf_seg_gemm_small
             .as_deref();
-        let configured_seg_dir = crate::config::RuntimeConfig::get()
-            .nv
-            .pf_seg_dir
-            .as_deref()
-            .filter(|dir| !dir.is_empty())
-            .map(PathBuf::from);
+        let configured_seg_dir = crate::asset::serve::objects_dir(assets_dir);
         let suffix = if packed_requests { "pfpacked" } else { "pf" };
         let kv_suffix = if packed.is_some_and(|p| p.version == 2) {
             "_fp8kv"
@@ -9596,6 +9586,7 @@ impl GpuEngine {
                     &[],
                 )?
             };
+            let seg_dir = crate::asset::serve::objects_dir(assets_dir);
             let mut moe_lt_segments = Vec::new();
             for segment in &moe_segments {
                 let route = match segment {
@@ -9603,11 +9594,10 @@ impl GpuEngine {
                         if moe_lt.as_ref().is_none_or(|owner| !owner.fits(segment)) {
                             let lt = match cublaslt_backend {
                                 Some(cublaslt::ProjectionBackend::Lt(lt)) => Arc::clone(lt),
-                                _ => crate::device::cuda::lt::Lt::load(be)?,
+                                _ => crate::device::cuda::lt::Lt::load(be, seg_dir.as_deref())?,
                             };
-                            let seg_dir = config.nv.pf_seg_dir.as_deref().map(Path::new);
                             let directories: Vec<&Path> =
-                                seg_dir.into_iter().chain([assets_dir]).collect();
+                                seg_dir.as_deref().into_iter().chain([assets_dir]).collect();
                             moe_lt = Some(moe_lt::MoeLt::load(
                                 be,
                                 &lt,
