@@ -691,6 +691,18 @@ pub struct CpuRuntimeConfig {
     )]
     pub spin_us: u32,
 
+    /// Combining-tree completion counters: a counter bumped by at least 2x this many static
+    /// executors gets one sub-counter per group of this many executors on the same node; the
+    /// group's last arrival adds the group's share to the real counter. 0 = off (every producer
+    /// slice bumps the shared counter directly, so up to n_cu atomics contend on one line).
+    #[arg(
+        long = "cpu-combine",
+        env = "PLOW_CPU_COMBINE",
+        default_value_t = 0,
+        global = true
+    )]
+    pub combine: u32,
+
     /// Largest prefill chunk (rows) one tick may run while other slots decode. 0 = whole prompt.
     /// Measured NEGATIVE at concurrency >= 4 (chunks prefill slower than whole prompts and the
     /// threads are throughput-bound, not stall-bound), so it stays off by default.

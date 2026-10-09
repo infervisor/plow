@@ -640,6 +640,7 @@ pub const RUNTIME: &[KnobSpec] = &[
     KnobSpec::new("rt.huge_pages", Some("PLOW_CPU_HUGE_PAGES"), Layer::Runtime, Domain::Bool, UNSET, OPT_IN),
     KnobSpec::new("rt.isa", Some("PLOW_CPU_ISA"), Layer::Runtime, Domain::Str, Default::Static(Val::Str("auto")), OPT_IN),
     KnobSpec::new("rt.spin_us", Some("PLOW_CPU_SPIN_US"), Layer::Runtime, U32, Default::Static(Val::Nat(2000)), OPT_IN),
+    KnobSpec::new("rt.combine", Some("PLOW_CPU_COMBINE"), Layer::Runtime, U32, Default::Static(Val::Nat(0)), OPT_IN),
     KnobSpec::new("rt.prefill_chunk", Some("PLOW_CPU_PF_CHUNK"), Layer::Runtime, U32, Default::Static(Val::Nat(0)), OPT_IN),
     KnobSpec::new("rt.mxfp4_dir", Some("PLOW_MXFP4_DIR"), Layer::Runtime, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("rt.gq_opt_in", Some("PLOW_CPU_GQ"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),

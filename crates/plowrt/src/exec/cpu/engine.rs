@@ -2012,8 +2012,25 @@ fn loaded(
     // No per-program narrowing: an idle worker still polls on the SMT sibling of a busy core, which
     // cost more than the narrowing gained (see the module note on worker width). The pool is sized
     // once for the model and every program uses all of it.
-    let _ = (per_node, nodes, physical, logical);
+    let _ = (per_node, physical, logical);
+    let g = crate::config::RuntimeConfig::get().cpu.combine;
+    let (comb_ofs, comb, n_cells) = if g > 0 && gq.is_none() {
+        crate::exec::cpu::interp::combine_tables(
+            &p.stream,
+            &p.stream_ofs,
+            &p.stream_len,
+            &p.succs,
+            p.n_counter,
+            nodes.max(1) as u32,
+            g,
+        )
+    } else {
+        (Vec::new(), Vec::new(), p.n_counter)
+    };
     LoadedProgram {
+        comb_ofs,
+        comb,
+        n_cells,
         cus_of: None,
         insts: p.insts.clone(),
         stream: p.stream.clone(),
@@ -2444,11 +2461,9 @@ impl CpuEngine {
                 ))
             })
             .collect();
-        let counters = model
-            .blob
-            .progs
+        let counters = progs
             .iter()
-            .map(|p| Arc::new(CounterPool::with_len(p.n_counter as usize)))
+            .map(|p| Arc::new(CounterPool::with_len(p.n_cells as usize)))
             .collect();
         let max_ctx = model.wk.pos.map(|h| model.tensor(h).bytes / 4).unwrap_or(0);
         tracing::info!(

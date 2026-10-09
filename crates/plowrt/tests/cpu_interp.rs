@@ -119,6 +119,9 @@ fn build(
             // None = keep the pool's spawn-time ownership; this harness runs pools whose thread
             // count differs from the cu count and every stream must still be covered.
             cus_of: None,
+            comb_ofs: Vec::new(),
+            comb: Vec::new(),
+            n_cells: 0,
         },
         counters,
     )
@@ -288,6 +291,44 @@ fn static_mode_orders_dependencies_on_every_thread_count() {
                 0,
                 "threads={threads}"
             );
+        }
+    }
+}
+
+#[test]
+fn combining_tree_orders_dependencies() {
+    // PLOW_CPU_COMBINE: producers bump per-group sub counters, the group's last arrival bumps the
+    // real counter by the group's share. Same ordering contract as direct bumps.
+    let mut wide = fan_ops();
+    for op in wide.iter_mut().skip(1).take(4) {
+        op.blocks = 16;
+    }
+    for ops in [wide, diamond_ops()] {
+        let (mut prog, _) = build(&ops, 16, 1, 0);
+        let (comb_ofs, comb, n_cells) = plowrt::exec::cpu::interp::combine_tables(
+            &prog.stream,
+            &prog.stream_ofs,
+            &prog.stream_len,
+            &prog.succs,
+            ops.len() as u32,
+            2,
+            2,
+        );
+        assert!(comb.iter().any(|&(_, share)| share >= 2), "no counter was combined");
+        prog.comb_ofs = comb_ofs;
+        prog.comb = comb;
+        prog.n_cells = n_cells;
+        let prog = Arc::new(prog);
+        let ctr = Arc::new(CounterPool::with_len(n_cells as usize));
+        for threads in [1usize, 4, 16] {
+            let rec = Arc::new(Recorder::new(&ops, Duration::ZERO));
+            let p = pool(threads, 16, rec.clone());
+            for _ in 0..20 {
+                rec.reset();
+                run_once(&p, &prog, &ctr, 0, &rec);
+                assert_eq!(rec.count.load(Ordering::Relaxed), total_slices(&ops));
+            }
+            assert_eq!(rec.violations.load(Ordering::Relaxed), 0, "threads={threads}");
         }
     }
 }

@@ -225,6 +225,9 @@ fn program(ops: &[Op]) -> (LoadedProgram, Vec<packet::Counter>) {
             seg_ofs: None,
             gq: None,
             cus_of: None,
+            comb_ofs: Vec::new(),
+            comb: Vec::new(),
+            n_cells: 0,
         },
         counters,
     )

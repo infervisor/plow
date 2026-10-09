@@ -44,6 +44,8 @@ pub struct TraceEv {
     /// Nanoseconds since [`trace_begin`].
     pub t0_ns: u64,
     pub t1_ns: u64,
+    /// After the successor counters are bumped (and sleepers woken).
+    pub t2_ns: u64,
 }
 
 static TRACE_EPOCH: Mutex<Option<std::time::Instant>> = Mutex::new(None);
@@ -124,6 +126,13 @@ pub struct LoadedProgram {
     /// SMT siblings), so the narrowing is per program and the tail workers simply own nothing.
     /// `None` matters: a pool with fewer threads than cus must still cover every stream.
     pub cus_of: Option<Vec<Vec<u32>>>,
+    /// Combining tree (`PLOW_CPU_COMBINE`): `comb_ofs[i]` indexes `comb` for static stream entry
+    /// `i` — one `(sub counter, group share)` per successor, share 0 = bump directly — or is
+    /// `u32::MAX`. Empty when off. Sub counters are pool cells past the blob's counters.
+    pub comb_ofs: Vec<u32>,
+    pub comb: Vec<(u32, u32)>,
+    /// Counter cells a run needs (the blob's counters plus the sub counters).
+    pub n_cells: u32,
 }
 
 impl LoadedProgram {
@@ -160,6 +169,12 @@ impl LoadedProgram {
     #[inline]
     fn succs_of(&self, e: &StreamEnt) -> &[u32] {
         &self.succs[e.succ_ofs as usize..e.succ_ofs as usize + e.succ_len as usize]
+    }
+
+    #[inline]
+    fn comb_of(&self, idx: usize, n: usize) -> Option<&[(u32, u32)]> {
+        let o = *self.comb_ofs.get(idx)?;
+        (o != u32::MAX).then(|| &self.comb[o as usize..o as usize + n])
     }
 }
 
@@ -287,6 +302,62 @@ pub fn wait_until(
     }
 }
 
+/// `PLOW_CPU_COMBINE`: sub counters for every counter bumped by at least `2 * g` static entries.
+/// An entry's group is its cu's node (`cu % nodes`, as `cu_map` places it) and its index among that
+/// node's cus divided by `g`; a group with one bumper keeps the direct bump. Returns
+/// [`LoadedProgram::comb_ofs`], [`LoadedProgram::comb`] and [`LoadedProgram::n_cells`].
+pub fn combine_tables(
+    stream: &[StreamEnt],
+    stream_ofs: &[u32],
+    stream_len: &[u32],
+    succs: &[u32],
+    n_counter: u32,
+    nodes: u32,
+    g: u32,
+) -> (Vec<u32>, Vec<(u32, u32)>, u32) {
+    use std::collections::HashMap;
+    let succ = |e: &StreamEnt| &succs[e.succ_ofs as usize..e.succ_ofs as usize + e.succ_len as usize];
+    let entries = || {
+        (0..stream_ofs.len()).flat_map(move |cu| {
+            let o = stream_ofs[cu] as usize;
+            (o..o + stream_len[cu] as usize).map(move |i| (cu as u32, i))
+        })
+    };
+    let group = |cu: u32| (cu % nodes, cu / nodes / g);
+    let mut total: HashMap<u32, u32> = HashMap::new();
+    let mut per: HashMap<(u32, (u32, u32)), u32> = HashMap::new();
+    for (cu, i) in entries() {
+        for &c in succ(&stream[i]) {
+            *total.entry(c).or_default() += 1;
+            *per.entry((c, group(cu))).or_default() += 1;
+        }
+    }
+    let mut sub: HashMap<(u32, (u32, u32)), u32> = HashMap::new();
+    let mut next = n_counter;
+    let mut comb_ofs = vec![u32::MAX; stream.len()];
+    let mut comb = Vec::new();
+    for (cu, i) in entries() {
+        let s = succ(&stream[i]);
+        let eligible = |c: u32| total[&c] >= 2 * g && per[&(c, group(cu))] >= 2;
+        if !s.iter().any(|&c| eligible(c)) {
+            continue;
+        }
+        comb_ofs[i] = comb.len() as u32;
+        for &c in s {
+            if eligible(c) {
+                let id = *sub.entry((c, group(cu))).or_insert_with(|| {
+                    next += 1;
+                    next - 1
+                });
+                comb.push((id, per[&(c, group(cu))]));
+            } else {
+                comb.push((0, 0));
+            }
+        }
+    }
+    (comb_ofs, comb, next)
+}
+
 /// Everything a run shares between workers, besides the program itself.
 pub struct RunShared<'a> {
     pub prog: &'a LoadedProgram,
@@ -317,24 +388,31 @@ impl<'a> RunShared<'a> {
 
     /// Execute one entry and publish its successors.
     #[inline]
-    fn fire(&self, e: &StreamEnt, exec: &dyn Exec, me: &WorkerCtx) {
+    /// `idx`: the entry's index in the static stream (`None` from the global queue).
+    fn fire(&self, e: &StreamEnt, idx: Option<usize>, exec: &dyn Exec, me: &WorkerCtx) {
         let inst = &self.prog.insts[e.inst as usize];
         let tracing = TRACE_ON.load(Ordering::Relaxed);
         let t0 = if tracing { trace_now_ns() } else { 0 };
         exec.exec(inst, e.slice, inst.blocks as u32, me);
-        if tracing {
-            let ev = TraceEv {
-                inst: e.inst,
-                slice: e.slice,
-                worker: me.worker as u16,
-                t0_ns: t0,
-                t1_ns: trace_now_ns(),
-            };
-            TRACE_BUF.with(|b| b.borrow_mut().push(ev));
-        }
+        let t1 = if tracing { trace_now_ns() } else { 0 };
         let succs = self.prog.succs_of(e);
-        for &c in succs {
-            self.pool.add(c, 1);
+        match idx.and_then(|i| self.prog.comb_of(i, succs.len())) {
+            // Release chain: this add publishes our writes to the group's last arrival, whose add
+            // to the real counter publishes the whole group's to the consumers.
+            Some(comb) => {
+                for (&c, &(s, share)) in succs.iter().zip(comb) {
+                    if share == 0 {
+                        self.pool.add(c, 1);
+                    } else if self.pool.add(s, 1) == share as u64 {
+                        self.pool.add(c, share as u64);
+                    }
+                }
+            }
+            None => {
+                for &c in succs {
+                    self.pool.add(c, 1);
+                }
+            }
         }
         if !succs.is_empty() {
             // One relaxed load per parker on the hot path; the wake itself is cold.
@@ -343,6 +421,17 @@ impl<'a> RunShared<'a> {
                     p.unpark_all();
                 }
             }
+        }
+        if tracing {
+            let ev = TraceEv {
+                inst: e.inst,
+                slice: e.slice,
+                worker: me.worker as u16,
+                t0_ns: t0,
+                t1_ns: t1,
+                t2_ns: trace_now_ns(),
+            };
+            TRACE_BUF.with(|b| b.borrow_mut().push(ev));
         }
     }
 }
@@ -420,7 +509,7 @@ pub fn run_static(
                 if !sh.gates_open(e) {
                     break;
                 }
-                sh.fire(e, exec, me);
+                sh.fire(e, Some(head as usize), exec, me);
                 head += 1;
                 progressed = true;
                 if sh.cancelled() {
@@ -524,7 +613,7 @@ pub fn run_gq(
         while k < st.pending.len() {
             let e = &gq.stream[st.pending[k] as usize];
             if sh.gates_open(e) {
-                sh.fire(e, exec, me);
+                sh.fire(e, None, exec, me);
                 st.pending.swap_remove(k);
                 if sh.cancelled() {
                     return;
@@ -544,7 +633,7 @@ pub fn run_gq(
                 drained = 0;
                 let e = &gq.stream[idx as usize];
                 if sh.gates_open(e) {
-                    sh.fire(e, exec, me);
+                    sh.fire(e, None, exec, me);
                     if sh.cancelled() {
                         return;
                     }
