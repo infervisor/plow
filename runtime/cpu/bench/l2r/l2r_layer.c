@@ -40,6 +40,10 @@
  *   workers [NW r / b, NW (r + 1) / b), which split that row's KV positions and combine only each other's partials
  *   (b = 1: the group is every worker, the P2-P4 scheme). b > 1 needs
  *   L2R_BCAST=direct|rep|repcld|repnt and no L2R_NOBCAST or streamed rows.
+ * 12B / 26B / 31B dumps: no per-layer input (ple = 0: phases 6-7 are empty and the step ends after down), full layers
+ *   with attention_k_eq_v (no v_proj: V is the K projection, normed without scale). A tensor-parallel socket slice
+ *   (ref_layer.py REF_TP, meta tp > 1) holds whole heads and a block of FFN rows; o and down are the slice's partial sums,
+ *   and the other ranks' share (o_rest / down_rest of each row's dump) is added where the cross-socket all-reduce lands.
  * L2R_NOBCAST=1: after step 0 every worker reads private snapshots of the shared vectors (identical values, since
  * the step repeats), which removes the activation all-gather from the timing; writes are unchanged.
  * Prints one JSON line: per-boundary error vs the FP32 reference (first and last step), step p50/p95/p99,
@@ -101,6 +105,8 @@ static double tsc_ghz;
 
 /* ---- model ---- */
 static int H, NH, KVH, HD, I, PLE, WIN, CL0, CL; /* CL0: dumped cache rows, CL: rows attended before the new token */
+static int KVEQ, TP;
+static float *o_rest, *down_rest; /* [NB][H], TP > 1 */
 static float EPS, SCALAR;
 static float *x_in, *pli, *cosv, *sinv; /* [NB][H], [NB][PLE], [NB][HD], [NB][HD] */
 static bf16 *kc0[MAXB], *vc0[MAXB];
@@ -167,6 +173,16 @@ static void* load_in(const char* dir, const char* name, size_t* n_out, char* dt_
     fprintf(stderr, "%s not in manifest of %s\n", name, dir); exit(1);
 }
 static void* load(const char* name, size_t* n_out, char* dt_out) { return load_in(DIR, name, n_out, dt_out); }
+static int in_manifest(const char* dir, const char* name) {
+    char path[512], line[512], nm[256];
+    snprintf(path, sizeof path, "%s/manifest.txt", dir);
+    FILE* m = fopen(path, "r");
+    if (!m) return 0;
+    int hit = 0;
+    while (!hit && fgets(line, sizeof line, m)) hit = sscanf(line, "%255s", nm) == 1 && !strcmp(nm, name);
+    fclose(m);
+    return hit;
+}
 
 static float* loadbf_as_f(const char* name) {
     size_t n; char dt; void* p = load(name, &n, &dt);
@@ -724,7 +740,7 @@ static void* run(void* arg) {
             if (BCAST == 4) { fv_gather(&fv_k, nd, lk, tag, par); fv_gather(&fv_v, nd, lv, tag, par); }
             float kn[1024], vn[1024];
             for (int h = 0; h < KVH; h++) {
-                rms(rk + (size_t)row * KD + h * HD, w_kn, HD, kn); rope(kn, row); rms(rv + (size_t)row * KD + h * HD, NULL, HD, vn);
+                rms(rk + (size_t)row * KD + h * HD, w_kn, HD, kn); rope(kn, row); rms((KVEQ ? rk : rv) + (size_t)row * KD + h * HD, NULL, HD, vn);
                 tobf(kn, HD, (bf16*)kvs + ((size_t)h * np + np - 1) * HD);
                 tobf(vn, HD, (bf16*)kvs + me->kvblk + ((size_t)h * np + np - 1) * HD);
             }
@@ -734,10 +750,15 @@ static void* run(void* arg) {
                 float* oh = my_po + (size_t)kh * g * HD;
                 const float* qh = qn + (size_t)kh * g * HD;
                 const bf16 *kr = kvs + (size_t)kh * np * HD, *vr = kr + me->kvblk;
-                if (g == 8) attn_group(8, qh, kr, vr, np, T, sc, m, l, oh);
-                else if (g == 4) attn_group(4, qh, kr, vr, np, T, sc, m, l, oh);
-                else if (g == 2) attn_group(2, qh, kr, vr, np, T, sc, m, l, oh);
-                else attn_group(1, qh, kr, vr, np, T, sc, m, l, oh);
+                for (int j = 0; j < g;) { /* groups above 8 heads (12B full layer: 16 per KV head) in chunks */
+                    const int c = g - j >= 8 ? 8 : g - j >= 4 ? 4 : g - j >= 2 ? 2 : 1;
+                    const float* qj = qh + (size_t)j * HD; float* oj = oh + (size_t)j * HD;
+                    if (c == 8) attn_group(8, qj, kr, vr, np, T, sc, m + j, l + j, oj);
+                    else if (c == 4) attn_group(4, qj, kr, vr, np, T, sc, m + j, l + j, oj);
+                    else if (c == 2) attn_group(2, qj, kr, vr, np, T, sc, m + j, l + j, oj);
+                    else attn_group(1, qj, kr, vr, np, T, sc, m + j, l + j, oj);
+                    j += c;
+                }
             }
         if (BCAST) { /* each line of the partial block goes only to the node(s) whose combine workers read it */
             const uint8_t* src = (const uint8_t*)my_po;
@@ -749,8 +770,8 @@ static void* run(void* arg) {
                         if (BCAST >= 3) _mm512_stream_si512((__m512i*)d, v); else _mm512_store_si512(d, v);
                     }
             }
-            float rec[16];
-            for (int h = 0; h < NH; h++) { rec[h] = my_pm[h]; rec[8 + h] = my_pl[h]; }
+            float rec[2 * 64];
+            for (int h = 0; h < NH; h++) { rec[h] = my_pm[h]; rec[NH + h] = my_pl[h]; }
             bc_publish(&bc_pml, id, rec, 0);
         }
         PHASE(1);
@@ -758,7 +779,7 @@ static void* run(void* arg) {
         for (int h = me->e0 / HD; me->e1 > me->e0 && h <= (me->e1 - 1) / HD; h++) {
             float M = -INFINITY, den = 0;
 #define PM_(w) (BCAST ? pmw[w][h] : rpm[(w) * NH + h])
-#define PL_(w) (BCAST ? pmw[w][8 + h] : rpl[(w) * NH + h])
+#define PL_(w) (BCAST ? pmw[w][NH + h] : rpl[(w) * NH + h])
             for (int w = me->g0; w < me->g1; w++) if (PM_(w) > M) M = PM_(w);
             for (int w = me->g0; w < me->g1; w++) { fw[w] = PM_(w) == -INFINITY ? 0.f : expf(PM_(w) - M); den += fw[w] * PL_(w); }
             const int a = h * HD > me->e0 ? h * HD : me->e0, b = (h + 1) * HD < me->e1 ? (h + 1) * HD : me->e1;
@@ -782,7 +803,9 @@ static void* run(void* arg) {
         if (BCAST == 4) fv_gather(&fv_o, nd, lo, tag, par); else if (BCAST) bc_gather(&bc_o, nd, lo, H);
         for (int b = 0; b < NB; b++) {
             float* hb = h1 + (size_t)b * H;
-            rms(ro + (size_t)b * H, w_pa, H, tmp); for (int i = 0; i < H; i++) hb[i] = x_in[(size_t)b * H + i] + tmp[i];
+            const float* ob = ro + (size_t)b * H;
+            if (TP > 1) { for (int i = 0; i < H; i++) tmp[i] = ob[i] + o_rest[(size_t)b * H + i]; ob = tmp; }
+            rms(ob, w_pa, H, tmp); for (int i = 0; i < H; i++) hb[i] = x_in[(size_t)b * H + i] + tmp[i];
             rms(hb, w_pf, H, tmp); tobf(tmp, H, x2b + (size_t)b * H);
             if (st == 0 && id == 0) memcpy(chk_xn2 + (size_t)b * H, tmp, H * 4);
         }
@@ -803,12 +826,26 @@ static void* run(void* arg) {
         (PLFD >= 0 ? gemv_avx1 : gemv_nta)(me->ws[6], me->r1[6] - me->r0[6] - me->nres[6], I, ract, down + me->r0[6] + me->nres[6]);
         if (BCAST == 4) fv_publish(&fv_down, id, down + me->r0[6], tag, par); else if (BCAST) bc_publish(&bc_down, id, down + me->r0[6], H);
         PHASE(5);
-        /* 6: residual (redundant); ple gate rows, gelu * per-layer input */
-        if (BCAST == 4) fv_gather(&fv_down, nd, ldown, tag, par); else if (BCAST) bc_gather(&bc_down, nd, ldown, H);
-        for (int b = 0; b < NB; b++) {
-            float* hb = h2 + (size_t)b * H;
-            rms(rdown + (size_t)b * H, w_pff, H, tmp); for (int i = 0; i < H; i++) hb[i] = h1[(size_t)b * H + i] + tmp[i];
-            tobf(hb, H, h2b + (size_t)b * H);
+        /* 6: residual (redundant; without the per-layer input only worker 0 forms the output); ple gate rows,
+         * gelu * per-layer input */
+        if (PLE || id == 0) {
+            if (BCAST == 4) fv_gather(&fv_down, nd, ldown, tag, par); else if (BCAST) bc_gather(&bc_down, nd, ldown, H);
+            for (int b = 0; b < NB; b++) {
+                float* hb = h2 + (size_t)b * H;
+                const float* db = rdown + (size_t)b * H;
+                if (TP > 1) { for (int i = 0; i < H; i++) tmp[i] = db[i] + down_rest[(size_t)b * H + i]; db = tmp; }
+                rms(db, w_pff, H, tmp); for (int i = 0; i < H; i++) hb[i] = h1[(size_t)b * H + i] + tmp[i];
+                tobf(hb, H, h2b + (size_t)b * H);
+            }
+        }
+        if (!PLE) {
+            if (id == 0) {
+                memcpy(outv + (size_t)(st == 0 ? 0 : 1) * NB * H, h2, (size_t)NB * H * 4);
+                for (size_t i = 0; i < (size_t)NB * H; i++) outv[(size_t)(st == 0 ? 0 : 1) * NB * H + i] *= SCALAR;
+                if (st == 0) memcpy(chk_h2, h2, (size_t)NB * H * 4);
+            }
+            me->steps_t[st] = __rdtsc() - t0;
+            continue;
         }
         me->pro[6] += __rdtsc() - t;
         if (st == 0 && id == 0) memcpy(chk_h2, h2, (size_t)NB * H * 4);
@@ -900,19 +937,23 @@ int main(int argc, char** argv) {
     H = meta_int(js, "hidden"); NH = meta_int(js, "heads"); KVH = meta_int(js, "kv_heads"); HD = meta_int(js, "head_dim");
     I = meta_int(js, "inter"); PLE = meta_int(js, "ple"); WIN = meta_int(js, "window"); CL0 = meta_int(js, "cache_len");
     EPS = (float)meta_f(js, "eps");
+    KVEQ = !in_manifest(DIR, "w.self_attn.v_proj.weight"); TP = strstr(js, "\"tp\": ") ? meta_int(js, "tp") : 1;
+    if (TP > 1 && (NOBCAST || BCAST == 4)) { fprintf(stderr, "tp > 1 needs L2R_BCAST=direct|rep|repcld|repnt\n"); return 1; }
     CL = CL0 * REP;
     for (int m = 0; m < 9; m++) {
         char nm[128]; snprintf(nm, sizeof nm, "w.%s.weight", WN[m]);
+        if ((m == 2 && KVEQ) || (m >= 7 && !PLE)) { Wfull[m] = NULL; continue; }
         size_t n; Wfull[m] = load(nm, &n, NULL);
     }
-    Wn[0] = NH * HD; Wk[0] = H; Wn[1] = Wn[2] = KVH * HD; Wk[1] = Wk[2] = H; Wn[3] = H; Wk[3] = NH * HD;
+    Wn[0] = NH * HD; Wk[0] = H; Wn[1] = KVH * HD; Wn[2] = KVEQ ? 0 : KVH * HD; Wk[1] = Wk[2] = H; Wn[3] = H; Wk[3] = NH * HD;
     Wn[4] = Wn[5] = I; Wk[4] = Wk[5] = H; Wn[6] = H; Wk[6] = I; Wn[7] = PLE; Wk[7] = H; Wn[8] = H; Wk[8] = PLE;
     w_in = loadbf_as_f("w.input_layernorm.weight"); w_pa = loadbf_as_f("w.post_attention_layernorm.weight");
     w_pf = loadbf_as_f("w.pre_feedforward_layernorm.weight"); w_pff = loadbf_as_f("w.post_feedforward_layernorm.weight");
-    w_pn = loadbf_as_f("w.post_per_layer_input_norm.weight");
+    if (PLE) w_pn = loadbf_as_f("w.post_per_layer_input_norm.weight");
     w_qn = loadbf_as_f("w.self_attn.q_norm.weight"); w_kn = loadbf_as_f("w.self_attn.k_norm.weight");
     float* ls = load("layer_scalar", NULL, NULL); SCALAR = ls[0];
-    x_in = malloc((size_t)NB * H * 4); pli = malloc((size_t)NB * PLE * 4); cosv = malloc((size_t)NB * HD * 4); sinv = malloc((size_t)NB * HD * 4);
+    if (TP > 1) { o_rest = malloc((size_t)NB * H * 4); down_rest = malloc((size_t)NB * H * 4); }
+    x_in = malloc((size_t)NB * H * 4); pli = malloc((size_t)NB * PLE * 4 + 64); cosv = malloc((size_t)NB * HD * 4); sinv = malloc((size_t)NB * HD * 4);
     for (int b = 0; b < NB; b++) {
         snprintf(path, sizeof path, "%s/meta.json", ROWDIR[b]);
         if (!(f = fopen(path, "r"))) { perror(path); return 1; }
@@ -921,7 +962,9 @@ int main(int argc, char** argv) {
             fprintf(stderr, "%s: not the same layer / cache length as %s\n", ROWDIR[b], DIR); return 1;
         }
 #define ROWLD(dst, nm, n) do { float* t_ = load_in(ROWDIR[b], nm, NULL, NULL); memcpy(dst + (size_t)b * (n), t_, (size_t)(n) * 4); free(t_); } while (0)
-        ROWLD(x_in, "x_in", H); ROWLD(pli, "per_layer_input", PLE); ROWLD(cosv, "cos", HD); ROWLD(sinv, "sin", HD);
+        ROWLD(x_in, "x_in", H); ROWLD(cosv, "cos", HD); ROWLD(sinv, "sin", HD);
+        if (PLE) ROWLD(pli, "per_layer_input", PLE);
+        if (TP > 1) { ROWLD(o_rest, "o_rest", H); ROWLD(down_rest, "down_rest", H); }
         kc0[b] = load_in(ROWDIR[b], "kcache", NULL, NULL); vc0[b] = load_in(ROWDIR[b], "vcache", NULL, NULL);
     }
     const int A = NH * HD;
@@ -949,8 +992,8 @@ int main(int argc, char** argv) {
     if (BCAST) {
         const int u = AMX ? 16 : 4;
         bc_init(&bc_q, 4, A, u, 0, NB); bc_init(&bc_o, 4, H, u, 0, NB); bc_init(&bc_down, 4, H, u, 0, NB);
-        bc_init_grp(&bc_attn, 2, A); bc_init(&bc_act, 2, I, u, 0, NB); bc_init(&bc_pact, 2, PLE, u, 0, NB);
-        bc_init(&bc_po, 4, A, 0, 1, 1); bc_init(&bc_pml, 4, 16, 0, 1, 1);
+        bc_init_grp(&bc_attn, 2, A); bc_init(&bc_act, 2, I, u, 0, NB); if (PLE) bc_init(&bc_pact, 2, PLE, u, 0, NB);
+        bc_init(&bc_po, 4, A, 0, 1, 1); bc_init(&bc_pml, 4, 2 * NH, 0, 1, 1);
         if (BCAST == 4) {
             fv_init(&fv_q, 4, A, u); fv_init(&fv_k, 4, KVH * HD, u); fv_init(&fv_v, 4, KVH * HD, u); fv_init(&fv_attn, 2, A, 1);
             fv_init(&fv_o, 4, H, u); fv_init(&fv_act, 2, I, u); fv_init(&fv_down, 4, H, u); fv_init(&fv_pact, 2, PLE, u);
@@ -968,14 +1011,14 @@ int main(int argc, char** argv) {
 
     /* numerics (step 0 boundaries; out of step 0 and of the last step) */
     struct { const char* n; float* a; int len; } B[] = {
-        {"q", q, A}, {"k", k, KVH * HD}, {"v", v, KVH * HD}, {"qn", chk_qn, A}, {"attn", chk_attn, A}, {"o", o, H},
+        {"q", q, A}, {"k", k, KVH * HD}, {"v", KVEQ ? k : v, KVH * HD}, {"qn", chk_qn, A}, {"attn", chk_attn, A}, {"o", o, H},
         {"h1", chk_h1, H}, {"xn2", chk_xn2, H}, {"gate", gate, I}, {"up", up, I}, {"act", chk_act, I},
         {"down", down, H}, {"h2", chk_h2, H}, {"pg", pg, PLE}, {"pact", chk_pact, PLE}, {"pp", pp, H},
         {"out", outv, H}, {"out_last", outv + (size_t)NB * H, H}};
     printf("{\"ref\":\"%s\",\"batch\":%d,\"gemv\":\"%s\",\"nobcast\":%d,\"bcast\":%d,\"barrier\":\"%s\",\"resident_kib\":%zu,\"workers\":%d,\"steps\":%d,\"ctx_rows\":%d,\"tsc_ghz\":%.3f,\"err\":{", DIR, NB, AMX ? "amx" : "avx", NOBCAST, BCAST, BARR ? "hier" : "diss", RESKIB, NW, STEPS, CL + 1, tsc_ghz);
     for (size_t b = 0; b < sizeof B / sizeof B[0]; b++) {
         char nm[64]; snprintf(nm, sizeof nm, "ref.%s", !strcmp(B[b].n, "out_last") ? "out" : B[b].n);
-        float* r = REP == 1 ? load(nm, NULL, NULL) : NULL;
+        float* r = REP == 1 && in_manifest(DIR, nm) ? load(nm, NULL, NULL) : NULL;
         if (r) {
             err_t e = err(B[b].a, r, B[b].len);
             printf("%s\"%s\":[%.3e,%.8f,%.3e]", b ? "," : "", B[b].n, e.rel_rms, e.cos, e.max_abs);
@@ -1007,7 +1050,7 @@ int main(int argc, char** argv) {
             printf("%s{\"dir\":\"%s\",\"err\":{", b ? "," : "", ROWDIR[b]);
             for (size_t i = 0; i < sizeof B / sizeof B[0]; i++) {
                 char nm[64]; snprintf(nm, sizeof nm, "ref.%s", !strcmp(B[i].n, "out_last") ? "out" : B[i].n);
-                float* r = REP == 1 ? load_in(ROWDIR[b], nm, NULL, NULL) : NULL;
+                float* r = REP == 1 && in_manifest(ROWDIR[b], nm) ? load_in(ROWDIR[b], nm, NULL, NULL) : NULL;
                 if (r) {
                     err_t e = err(B[i].a + (size_t)b * B[i].len, r, B[i].len);
                     printf("%s\"%s\":[%.3e,%.8f,%.3e]", i ? "," : "", B[i].n, e.rel_rms, e.cos, e.max_abs);
