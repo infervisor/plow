@@ -31,10 +31,15 @@
  *   L2R_KV_PFD=d, L2R_KV_PFH=t0|t1|t2|nta: software prefetch of the K / V row d rows ahead (path C, in-loop).
  *   L2R_KV_EARLY_KIB=n: at the start of the step, before the qkv GEMV, prefetch (L2R_KV_PFH) the first n KiB of this
  *     step's K and V slice per KV head (path C, staged ahead; its cost is inside the step).
- *   L2R_SEQS=b (repnt/rep only): b sequences, each with its own KV copy (same contents) and its own attention and
- *     combine; the GEMVs stay batch 1 (sequence 0), so this models the KV side of concurrency b only.
  *   L2R_ATTN_ONLY=1: skip every GEMV (timing of attention, combine and sync alone; numerics not checked).
  * L2R_PERF_CTL=<fifo>: write enable / disable to a `perf stat -D -1 --control fifo:<fifo>` around the timed steps.
+ * Batch (P5): L2R_BATCH=b (1..16) decode tokens per step, one per sequence; L2R_ROWS=dir,dir,... gives each row its own
+ *   dump of the same layer and context length (row r uses dir r % n; default <refdir>): its own hidden state,
+ *   per-layer input, RoPE, KV cache and FP32 reference. Weights come from <refdir>. Every GEMV is batch b (AMX: A tile
+ *   rows = b), norms / RoPE / residuals per row, broadcasts carry b rows. Attention is split by row group: row r gets
+ *   workers [NW r / b, NW (r + 1) / b), which split that row's KV positions and combine only each other's partials
+ *   (b = 1: the group is every worker, the P2-P4 scheme). b > 1 needs
+ *   L2R_BCAST=direct|rep|repcld|repnt and no L2R_NOBCAST or streamed rows.
  * L2R_NOBCAST=1: after step 0 every worker reads private snapshots of the shared vectors (identical values, since
  * the step repeats), which removes the activation all-gather from the timing; writes are unchanged.
  * Prints one JSON line: per-boundary error vs the FP32 reference (first and last step), step p50/p95/p99,
@@ -64,14 +69,17 @@ static const char* DIR;
 static int NW, STEPS, AMX, REP, NOBCAST;
 static size_t RESKIB;
 static int PLFD = -1;
-static int KVR = 1, TILE_KIB, PFD, PFH, SEQS = 1, ATTN_ONLY;
+#define MAXB 16
+static int KVR = 1, TILE_KIB, PFD, PFH, NB = 1, ATTN_ONLY;
+static const char* ROWDIR[MAXB];
 static size_t EARLY_KIB;
 static int PERF_FD = -1; /* L2R_PERF_CTL: perf stat --control fifo, enabled for the timed steps only */
 static int BCAST, BARR;               /* L2R_BCAST: 0 direct, 1 rep, 2 repcld, 3 repnt, 4 fid; L2R_BARRIER: 0 diss, 1 hier */
 static int NNODE, nodeof[MAXW], node_first[8], node_count[8];
-/* One broadcast vector: producer w owns elements [off, off + len); in the per-node replicas its segment starts at
- * byte seg (64-byte aligned, so no line has two writers). rep[n] is homed on node n. */
-typedef struct { int esz, off[MAXW], len[MAXW]; size_t seg[MAXW], bytes; uint8_t* rep[8]; } bc_t;
+/* One broadcast vector of `rows` rows: producer w owns elements [off, off + len) of every row; in the per-node replicas
+ * its segment starts at byte seg and holds its rows rb bytes apart (64-byte aligned, so no line has two writers).
+ * rep[n] is homed on node n. */
+typedef struct { int esz, rows, off[MAXW], len[MAXW], row[MAXW]; size_t seg[MAXW], rb[MAXW], bytes; uint8_t* rep[8]; } bc_t;
 static bc_t bc_q, bc_o, bc_down, bc_attn, bc_act, bc_pact, bc_po, bc_pml;
 static line_t *b_arrive[8], *b_done[8], *b_gate[8];
 /* Flag-in-data vectors (L2R_BCAST=fid): every 64-byte line is [tag u32 | 56 payload bytes | tag u32], written with
@@ -79,7 +87,11 @@ static line_t *b_arrive[8], *b_done[8], *b_gate[8];
  * lines until both tags equal the step's tag, so the gather itself is the synchronisation and no barrier is needed. */
 typedef struct { int esz, epl, off[MAXW], len[MAXW], line0[MAXW], lines; uint8_t* rep[8][2]; } fv_t;
 static fv_t fv_q, fv_k, fv_v, fv_attn, fv_o, fv_act, fv_down, fv_pact, fv_pp;
-static uint8_t* line_nodes; /* [NH*HD/16]: bit k = a combine worker on node k reads this line of every partial block */
+static uint8_t* line_nodes; /* [NB][NH*HD/16]: bit k = a combine worker of the row's group on node k reads this line */
+/* attention row groups: row r is attended by workers [grp0(r), grp0(r + 1)) */
+static inline int grp0(int r) { return (int)((long)NW * r / NB); }
+static inline int row_of(int w) { int r = 0; while (grp0(r + 1) <= w) r++; return r; }
+static inline int gsplit(int n, int w, int r) { const int g0 = grp0(r), gs = grp0(r + 1) - g0; return (int)((long)n * (w - g0) / gs); }
 struct pl_lock_req { uint64_t addr, len; int32_t cpu; uint32_t level, id, pad; };
 struct pl_measure { uint32_t id, pad; uint64_t lines, l1_l2, l3, dram, p50, cal_l2, cal_l3, cal_dram; };
 #define PL_IOC_LOCK _IOWR('P', 11, struct pl_lock_req)
@@ -90,19 +102,18 @@ static double tsc_ghz;
 /* ---- model ---- */
 static int H, NH, KVH, HD, I, PLE, WIN, CL0, CL; /* CL0: dumped cache rows, CL: rows attended before the new token */
 static float EPS, SCALAR;
-static float *x_in, *pli, *cosv, *sinv;
-static bf16 *kc0, *vc0;
+static float *x_in, *pli, *cosv, *sinv; /* [NB][H], [NB][PLE], [NB][HD], [NB][HD] */
+static bf16 *kc0[MAXB], *vc0[MAXB];
 static const char* WN[9] = {"self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj", "self_attn.o_proj",
                             "mlp.gate_proj", "mlp.up_proj", "mlp.down_proj", "per_layer_input_gate", "per_layer_projection"};
 static bf16* Wfull[9];
 static int Wn[9], Wk[9];
 static float *w_in, *w_pa, *w_pf, *w_pff, *w_pn, *w_qn, *w_kn;
 
-/* ---- shared vectors ---- */
-static float *q, *k, *v, *o, *gate, *up, *down, *pg, *pp, *outv;
+/* ---- shared vectors, all [NB][n] ---- */
+static float *q, *k, *v, *o, *gate, *up, *down, *pg, *pp, *outv; /* outv [2][NB][H]: step 0, last step */
 static bf16 *attn_b, *act_b, *pact_b;
-static float *pm, *pl, *po; /* partials [NW][NH], [NW][NH], [NW][NH][HD] */
-static float* chk_attn_seq; /* [SEQS][NH*HD], sequences >= 1 */
+static float *pm, *pl, *po; /* partials [NW][NB][NH], [NW][NB][NH], [NW][NB][NH][HD] */
 static float *chk_qn, *chk_h1, *chk_xn2, *chk_h2, *chk_attn, *chk_act, *chk_pact;
 
 /* ---- per worker ---- */
@@ -113,9 +124,10 @@ typedef struct {
     bf16* ws[9];
     bf16* w[9];
     int p0, p1;           /* KV positions [p0, p1) of 0..CL-1; the last worker also owns the new row */
-    bf16 *kv;             /* [KVR][SEQS][K, V][KVH][np][HD] */
+    bf16 *kv;             /* [KVR][NB][K, V][KVH][np][HD] */
     size_t kvblk;         /* elements of one [KVH][np][HD] block */
-    int e0, e1;           /* attention-combine element slice of NH*HD */
+    int e0, e1;           /* attention-combine element slice of NH*HD (of the worker's row) */
+    int row, g0, g1;      /* attention row and its worker group [g0, g1) */
     uint32_t lock_id; double held0, held1;
     uint64_t ph[NPH], wt[NPH], pro[NPH]; /* pro: the phase's redundant prologue (reads the shared vectors) */
     uint64_t* steps_t;
@@ -130,9 +142,9 @@ static double calib(void) { double t0 = now_s(); uint64_t c0 = __rdtsc(); while 
 static inline float bf2f(bf16 b) { uint32_t u = (uint32_t)b << 16; float f; memcpy(&f, &u, 4); return f; }
 static inline bf16 f2bf(float f) { uint32_t u; memcpy(&u, &f, 4); u += 0x7fff + ((u >> 16) & 1); return (bf16)(u >> 16); }
 
-static void* load(const char* name, size_t* n_out, char* dt_out) {
+static void* load_in(const char* dir, const char* name, size_t* n_out, char* dt_out) {
     char path[512], line[512];
-    snprintf(path, sizeof path, "%s/manifest.txt", DIR);
+    snprintf(path, sizeof path, "%s/manifest.txt", dir);
     FILE* m = fopen(path, "r");
     if (!m) { perror(path); exit(1); }
     while (fgets(line, sizeof line, m)) {
@@ -142,7 +154,7 @@ static void* load(const char* name, size_t* n_out, char* dt_out) {
         while (sscanf(p, "%ld%n", &d, &off) == 1) { n *= (size_t)d; p += off; }
         fclose(m);
         const size_t es = strcmp(dt, "bf16") ? 4 : 2;
-        snprintf(path, sizeof path, "%s/%s.%s", DIR, name, dt);
+        snprintf(path, sizeof path, "%s/%s.%s", dir, name, dt);
         FILE* f = fopen(path, "rb");
         if (!f) { perror(path); exit(1); }
         void* b = aligned_alloc(64, (n * es + 63) / 64 * 64);
@@ -152,8 +164,9 @@ static void* load(const char* name, size_t* n_out, char* dt_out) {
         if (dt_out) *dt_out = es == 2 ? 'b' : 'f';
         return b;
     }
-    fprintf(stderr, "%s not in manifest\n", name); exit(1);
+    fprintf(stderr, "%s not in manifest of %s\n", name, dir); exit(1);
 }
+static void* load(const char* name, size_t* n_out, char* dt_out) { return load_in(DIR, name, n_out, dt_out); }
 
 static float* loadbf_as_f(const char* name) {
     size_t n; char dt; void* p = load(name, &n, &dt);
@@ -189,44 +202,72 @@ static void* node_alloc(size_t bytes, int node) {
     return p;
 }
 
-static void bc_init(bc_t* b, int esz, int n, int unit, int whole_blocks) {
-    b->esz = esz;
+static void bc_init(bc_t* b, int esz, int n, int unit, int whole_blocks, int rows) {
+    b->esz = esz; b->rows = rows;
     size_t at = 0;
     for (int w = 0; w < NW; w++) {
         int a, z;
         if (whole_blocks) { a = w * n; z = a + n; } else split(n, unit, w, &a, &z);
-        b->off[w] = a; b->len[w] = z - a; b->seg[w] = at;
-        at += ((size_t)(z - a) * esz + 63) / 64 * 64;
+        b->off[w] = a; b->len[w] = z - a; b->seg[w] = at; b->row[w] = -1;
+        b->rb[w] = ((size_t)(z - a) * esz + 63) / 64 * 64;
+        at += b->rb[w] * rows;
+    }
+    b->bytes = at;
+    for (int k = 0; k < NNODE; k++) b->rep[k] = node_alloc(at, k);
+}
+/* one row of n per producer: worker w owns elements [gsplit(n, w), gsplit(n, w + 1)) of its attention row */
+static void bc_init_grp(bc_t* b, int esz, int n) {
+    b->esz = esz; b->rows = 1;
+    size_t at = 0;
+    for (int w = 0; w < NW; w++) {
+        const int r = row_of(w), a = gsplit(n, w, r), z = w + 1 == grp0(r + 1) ? n : gsplit(n, w + 1, r);
+        b->off[w] = a; b->len[w] = z - a; b->seg[w] = at; b->row[w] = r;
+        b->rb[w] = ((size_t)(z - a) * esz + 63) / 64 * 64;
+        at += b->rb[w];
     }
     b->bytes = at;
     for (int k = 0; k < NNODE; k++) b->rep[k] = node_alloc(at, k);
 }
 
-/* producer w copies its elements (src points at element off[w]) into every node's replica */
-static inline void bc_publish(const bc_t* b, int w, const void* src) {
+/* producer w copies its elements of every row (src points at element off[w] of row 0; rows ld elements apart) into
+ * every node's replica */
+static inline void bc_publish(const bc_t* b, int w, const void* src, size_t ld) {
     const size_t n = (size_t)b->len[w] * b->esz;
-    if (BCAST >= 3) { /* whole 64-byte lines (the segment is padded), streamed past the caches to the replica's node */
-        for (size_t i = 0; i < n; i += 64) {
-            const __mmask64 k = n - i >= 64 ? ~0ull : (1ull << (n - i)) - 1;
-            const __m512i v = _mm512_maskz_loadu_epi8(k, (const uint8_t*)src + i);
-            for (int r = 0; r < NNODE; r++) _mm512_stream_si512((__m512i*)(b->rep[r] + b->seg[w] + i), v);
+    for (int r = 0; r < b->rows; r++) {
+        const uint8_t* s = (const uint8_t*)src + (size_t)r * ld * b->esz;
+        const size_t o = b->seg[w] + (size_t)r * b->rb[w];
+        if (BCAST >= 3) { /* whole 64-byte lines (the segment is padded), streamed past the caches to the replica's node */
+            for (size_t i = 0; i < n; i += 64) {
+                const __mmask64 k = n - i >= 64 ? ~0ull : (1ull << (n - i)) - 1;
+                const __m512i v = _mm512_maskz_loadu_epi8(k, s + i);
+                for (int nd = 0; nd < NNODE; nd++) _mm512_stream_si512((__m512i*)(b->rep[nd] + o + i), v);
+            }
+            continue;
         }
-        _mm_sfence();
-        return;
+        for (int nd = 0; nd < NNODE; nd++) {
+            uint8_t* d = b->rep[nd] + o;
+            memcpy(d, s, n);
+            if (BCAST == 2) for (size_t i = 0; i < n; i += 64) _cldemote(d + i);
+        }
     }
-    for (int k = 0; k < NNODE; k++) {
-        uint8_t* d = b->rep[k] + b->seg[w];
-        memcpy(d, src, n);
-        if (BCAST == 2) for (size_t i = 0; i < n; i += 64) _cldemote(d + i);
-    }
+    if (BCAST >= 3) _mm_sfence();
 }
 
-/* reader on `node` gathers the whole vector into dst (element 0 at dst) */
-static inline void bc_gather(const bc_t* b, int node, void* dst) {
+/* reader on `node` gathers the whole vector into dst (element 0 of row 0 at dst, rows ld elements apart) */
+static inline void bc_gather(const bc_t* b, int node, void* dst, size_t ld) {
     /* all lines requested up front: the copy below then finds them in flight instead of missing one segment at a time */
     for (size_t i = 0; i < b->bytes; i += 64) _mm_prefetch((const char*)b->rep[node] + i, _MM_HINT_T0);
     for (int w = 0; w < NW; w++)
-        memcpy((uint8_t*)dst + (size_t)b->off[w] * b->esz, b->rep[node] + b->seg[w], (size_t)b->len[w] * b->esz);
+        for (int r = 0; r < b->rows; r++)
+            memcpy((uint8_t*)dst + ((size_t)(b->row[w] < 0 ? r : b->row[w]) * ld + b->off[w]) * b->esz,
+                   b->rep[node] + b->seg[w] + (size_t)r * b->rb[w], (size_t)b->len[w] * b->esz);
+}
+/* only row r of a vector replicated per row (bc_init rows > 1), into dst (element 0 of that row at dst) */
+static inline void bc_gather_row(const bc_t* b, int node, void* dst, int r) {
+    for (int w = 0; w < NW; w++)
+        for (size_t i = 0; i < (size_t)b->len[w] * b->esz; i += 64) _mm_prefetch((const char*)b->rep[node] + b->seg[w] + (size_t)r * b->rb[w] + i, _MM_HINT_T0);
+    for (int w = 0; w < NW; w++)
+        memcpy((uint8_t*)dst + (size_t)b->off[w] * b->esz, b->rep[node] + b->seg[w] + (size_t)r * b->rb[w], (size_t)b->len[w] * b->esz);
 }
 
 static void fv_init(fv_t* f, int esz, int n, int unit) {
@@ -294,33 +335,48 @@ static inline void barrier(int id, uint64_t e) {
     }
 }
 
-/* ---- GEMV kernels: y[r] = sum_k W[r][k] * x[k], W rows bf16 [n][K], x bf16 [K] ---- */
-static void gemv_avx(const bf16* W, int n, int K, const bf16* x, float* y) {
-    int r = 0;
-    for (; r + 4 <= n; r += 4) {
-        const bf16 *w0 = W + (size_t)r * K, *w1 = w0 + K, *w2 = w1 + K, *w3 = w2 + K;
-        __m512 a0 = _mm512_setzero_ps(), a1 = a0, a2 = a0, a3 = a0;
-        for (int c = 0; c < K; c += 32) {
-            const __m512bh xv = (__m512bh)_mm512_loadu_si512(x + c);
-            a0 = _mm512_dpbf16_ps(a0, (__m512bh)_mm512_loadu_si512(w0 + c), xv);
-            a1 = _mm512_dpbf16_ps(a1, (__m512bh)_mm512_loadu_si512(w1 + c), xv);
-            a2 = _mm512_dpbf16_ps(a2, (__m512bh)_mm512_loadu_si512(w2 + c), xv);
-            a3 = _mm512_dpbf16_ps(a3, (__m512bh)_mm512_loadu_si512(w3 + c), xv);
+/* ---- GEMV kernels: y[b][r] = sum_k W[r][k] * x[b][k], W rows bf16 [n][K], x bf16 [nb][K], y rows ldy apart ---- */
+/* 4 weight rows x Bc batch rows; Bc is a compile-time constant at every call so the accumulators stay in registers */
+static inline __attribute__((always_inline)) void avx_blk(const int Bc, const bf16* w0, int K, const bf16* x, float* y, int ldy) {
+    const bf16 *w1 = w0 + K, *w2 = w1 + K, *w3 = w2 + K;
+    __m512 a[4][Bc];
+    for (int j = 0; j < 4; j++) for (int b = 0; b < Bc; b++) a[j][b] = _mm512_setzero_ps();
+    for (int c = 0; c < K; c += 32) {
+        const __m512bh v0 = (__m512bh)_mm512_loadu_si512(w0 + c), v1 = (__m512bh)_mm512_loadu_si512(w1 + c);
+        const __m512bh v2 = (__m512bh)_mm512_loadu_si512(w2 + c), v3 = (__m512bh)_mm512_loadu_si512(w3 + c);
+        for (int b = 0; b < Bc; b++) {
+            const __m512bh xv = (__m512bh)_mm512_loadu_si512(x + (size_t)b * K + c);
+            a[0][b] = _mm512_dpbf16_ps(a[0][b], v0, xv); a[1][b] = _mm512_dpbf16_ps(a[1][b], v1, xv);
+            a[2][b] = _mm512_dpbf16_ps(a[2][b], v2, xv); a[3][b] = _mm512_dpbf16_ps(a[3][b], v3, xv);
         }
-        y[r] = _mm512_reduce_add_ps(a0); y[r + 1] = _mm512_reduce_add_ps(a1);
-        y[r + 2] = _mm512_reduce_add_ps(a2); y[r + 3] = _mm512_reduce_add_ps(a3);
     }
-    for (; r < n; r++) {
-        const bf16* w0 = W + (size_t)r * K;
-        __m512 a0 = _mm512_setzero_ps();
-        for (int c = 0; c < K; c += 32)
-            a0 = _mm512_dpbf16_ps(a0, (__m512bh)_mm512_loadu_si512(w0 + c), (__m512bh)_mm512_loadu_si512(x + c));
-        y[r] = _mm512_reduce_add_ps(a0);
-    }
+    for (int b = 0; b < Bc; b++) for (int j = 0; j < 4; j++) y[(size_t)b * ldy + j] = _mm512_reduce_add_ps(a[j][b]);
+}
+static void gemv_avx(const bf16* W, int n, int K, const bf16* x, int nb, float* y, int ldy) {
+    int r = 0;
+    for (; r + 4 <= n; r += 4)
+        for (int b0 = 0; b0 < nb; b0 += 4) {
+            const bf16* xb = x + (size_t)b0 * K; float* yb = y + (size_t)b0 * ldy + r;
+            switch (nb - b0 < 4 ? nb - b0 : 4) {
+            case 1: avx_blk(1, W + (size_t)r * K, K, xb, yb, ldy); break;
+            case 2: avx_blk(2, W + (size_t)r * K, K, xb, yb, ldy); break;
+            case 3: avx_blk(3, W + (size_t)r * K, K, xb, yb, ldy); break;
+            default: avx_blk(4, W + (size_t)r * K, K, xb, yb, ldy);
+            }
+        }
+    for (; r < n; r++)
+        for (int b = 0; b < nb; b++) {
+            const bf16* w0 = W + (size_t)r * K;
+            __m512 a0 = _mm512_setzero_ps();
+            for (int c = 0; c < K; c += 32)
+                a0 = _mm512_dpbf16_ps(a0, (__m512bh)_mm512_loadu_si512(w0 + c), (__m512bh)_mm512_loadu_si512(x + (size_t)b * K + c));
+            y[(size_t)b * ldy + r] = _mm512_reduce_add_ps(a0);
+        }
 }
 
 /* AMX: rows packed per 16-row group g, per 32-wide K chunk c, as one 1 KiB B tile [16 k-pairs][16 rows][2].
- * A = x chunk in tile row 0 (1 row); C[0][0..15] = the group's 16 outputs. n must be a multiple of 16. */
+ * A = the nb batch rows' x chunk (tile rows = nb, set in the tile config); C[b][0..15] = the group's 16 outputs of
+ * batch row b. n must be a multiple of 16. */
 typedef struct { uint8_t palette, start; uint8_t res[14]; uint16_t colsb[16]; uint8_t rows[16]; } tilecfg_t;
 static void pack_amx(const bf16* src, int n, int K, bf16* dst) {
     for (int g = 0; g < n / 16; g++)
@@ -332,31 +388,31 @@ static void pack_amx(const bf16* src, int n, int K, bf16* dst) {
                         t[kp * 32 + r * 2 + e] = src[(size_t)(g * 16 + r) * K + c * 32 + kp * 2 + e];
         }
 }
-static void gemv_amx(const bf16* Wp, int n, int K, const bf16* x, float* y) {
+static void gemv_amx(const bf16* Wp, int n, int K, const bf16* x, int nb, float* y, int ldy) {
     _Alignas(64) float cbuf[16 * 16];
     const int nc = K / 32;
+    const size_t xs = (size_t)K * 2;
+#define CST(t, gg) do { _tile_stored(t, cbuf, 64); for (int b_ = 0; b_ < nb; b_++) memcpy(y + (size_t)b_ * ldy + (gg) * 16, cbuf + b_ * 16, 64); } while (0)
     int g = 0;
     for (; g + 4 <= n / 16; g += 4) {
         _tile_zero(0); _tile_zero(1); _tile_zero(2); _tile_zero(3);
         const bf16* b = Wp + (size_t)g * nc * 512;
         for (int c = 0; c < nc; c++) {
-            _tile_loadd(4, x + c * 32, 64);
+            _tile_loadd(4, x + c * 32, xs);
             _tile_loadd(5, b + (size_t)c * 512, 64); _tile_dpbf16ps(0, 4, 5);
             _tile_loadd(6, b + ((size_t)nc + c) * 512, 64); _tile_dpbf16ps(1, 4, 6);
             _tile_loadd(7, b + ((size_t)2 * nc + c) * 512, 64); _tile_dpbf16ps(2, 4, 7);
             _tile_loadd(5, b + ((size_t)3 * nc + c) * 512, 64); _tile_dpbf16ps(3, 4, 5);
         }
-        _tile_stored(0, cbuf, 64); memcpy(y + (g + 0) * 16, cbuf, 64);
-        _tile_stored(1, cbuf, 64); memcpy(y + (g + 1) * 16, cbuf, 64);
-        _tile_stored(2, cbuf, 64); memcpy(y + (g + 2) * 16, cbuf, 64);
-        _tile_stored(3, cbuf, 64); memcpy(y + (g + 3) * 16, cbuf, 64);
+        CST(0, g); CST(1, g + 1); CST(2, g + 2); CST(3, g + 3);
     }
     for (; g < n / 16; g++) {
         _tile_zero(0);
         const bf16* b = Wp + (size_t)g * nc * 512;
-        for (int c = 0; c < nc; c++) { _tile_loadd(4, x + c * 32, 64); _tile_loadd(5, b + (size_t)c * 512, 64); _tile_dpbf16ps(0, 4, 5); }
-        _tile_stored(0, cbuf, 64); memcpy(y + g * 16, cbuf, 64);
+        for (int c = 0; c < nc; c++) { _tile_loadd(4, x + c * 32, xs); _tile_loadd(5, b + (size_t)c * 512, 64); _tile_dpbf16ps(0, 4, 5); }
+        CST(0, g);
     }
+#undef CST
 }
 /* Streamed rows: same math as gemv_avx; the next 4-row block is prefetched non-temporally (into L1, not L2) while the
  * current one is computed, so streaming rows from L3 does not evict the L2-resident part of the slice. */
@@ -381,12 +437,14 @@ static void gemv_nta(const bf16* W, int n, int K, const bf16* x, float* y) {
         y[r] = _mm512_reduce_add_ps(a0); y[r + 1] = _mm512_reduce_add_ps(a1);
         y[r + 2] = _mm512_reduce_add_ps(a2); y[r + 3] = _mm512_reduce_add_ps(a3);
     }
-    if (r < n) gemv_avx(W + (size_t)r * K, n - r, K, x, y + r);
+    if (r < n) gemv_avx(W + (size_t)r * K, n - r, K, x, 1, y + r, 0);
 }
 
-static inline void gemv(const bf16* W, int n, int K, const bf16* x, float* y) {
+static void gemv_avx1(const bf16* W, int n, int K, const bf16* x, float* y) { if (n > 0 && !ATTN_ONLY) gemv_avx(W, n, K, x, 1, y, 0); }
+
+static inline void gemv(const bf16* W, int n, int K, const bf16* x, float* y, int ldy) {
     if (n <= 0 || ATTN_ONLY) return;
-    if (AMX) gemv_amx(W, n, K, x, y); else gemv_avx(W, n, K, x, y);
+    if (AMX) gemv_amx(W, n, K, x, NB, y, ldy); else gemv_avx(W, n, K, x, NB, y, ldy);
 }
 
 /* ---- small ops ---- */
@@ -405,13 +463,13 @@ static void tobf(const float* x, int n, bf16* y) {
     for (int i = 0; i < n; i += 32)
         _mm512_storeu_si512(y + i, (__m512i)_mm512_cvtne2ps_pbh(_mm512_loadu_ps(x + i + 16), _mm512_loadu_ps(x + i)));
 }
-static void rope(float* x) {
+static void rope(float* x, int row) {
     const int h = HD / 2;
+    const float *cs = cosv + (size_t)row * HD, *sn = sinv + (size_t)row * HD;
     float t[1024];
     for (int i = 0; i < HD; i++) t[i] = i < h ? -x[i + h] : x[i - h];
-    for (int i = 0; i < HD; i++) x[i] = x[i] * cosv[i] + t[i] * sinv[i];
+    for (int i = 0; i < HD; i++) x[i] = x[i] * cs[i] + t[i] * sn[i];
 }
-static inline float gelu(float x) { return 0.5f * x * (1.f + tanhf(0.7978845608028654f * (x + 0.044715f * x * x * x))); }
 
 /* exp for x <= 0 (softmax): x = n ln2 + r, |r| <= ln2/2, degree-7 Taylor (< 1 ulp), 2^n by scalef */
 static inline __m512 exp512(__m512 x) {
@@ -428,6 +486,24 @@ static inline __m512 exp512(__m512 x) {
     y = _mm512_fmadd_ps(y, r, _mm512_set1_ps(1.f));
     y = _mm512_fmadd_ps(y, r, _mm512_set1_ps(1.f));
     return _mm512_scalef_ps(y, n);
+}
+
+/* out[i] = bf16(gelu_tanh(g[i]) * u[i]), chk[i] = the FP32 value (chk may be NULL); tanh(y) = sign(y) (1 - e) / (1 + e),
+ * e = exp(-2 |y|) <= 1 */
+static void gelu_mul(const float* g, const float* u, int n, bf16* out, float* chk) {
+    const __m512 c0 = _mm512_set1_ps(0.7978845608028654f), c1 = _mm512_set1_ps(0.044715f), one = _mm512_set1_ps(1.f), half = _mm512_set1_ps(0.5f);
+    for (int i = 0; i < n; i += 16) {
+        const __mmask16 k = n - i >= 16 ? 0xffff : (__mmask16)((1u << (n - i)) - 1);
+        const __m512 x = _mm512_maskz_loadu_ps(k, g + i);
+        const __m512 y = _mm512_mul_ps(c0, _mm512_fmadd_ps(_mm512_mul_ps(c1, _mm512_mul_ps(x, x)), x, x));
+        const __m512 e = exp512(_mm512_mul_ps(_mm512_set1_ps(-2.f), _mm512_abs_ps(y)));
+        const __m512 th = _mm512_div_ps(_mm512_sub_ps(one, e), _mm512_add_ps(one, e));
+        const __m512 t = _mm512_castsi512_ps(_mm512_or_si512(_mm512_castps_si512(th),
+                             _mm512_and_si512(_mm512_castps_si512(y), _mm512_set1_epi32((int)0x80000000))));
+        const __m512 a = _mm512_mul_ps(_mm512_mul_ps(_mm512_mul_ps(half, x), _mm512_add_ps(one, t)), _mm512_maskz_loadu_ps(k, u + i));
+        _mm256_mask_storeu_epi16(out + i, k, (__m256i)_mm512_cvtneps_pbh(a));
+        if (chk) _mm512_mask_storeu_ps(chk + i, k, a);
+    }
 }
 
 static inline void pf_line(const void* a) {
@@ -512,8 +588,7 @@ static void* run(void* arg) {
     if (AMX) {
         if (syscall(SYS_arch_prctl, 0x1023, 18)) { perror("amx"); exit(1); }
         tilecfg_t c; memset(&c, 0, sizeof c); c.palette = 1;
-        for (int t = 0; t < 4; t++) { c.colsb[t] = 64; c.rows[t] = 1; }
-        c.colsb[4] = 64; c.rows[4] = 1;
+        for (int t = 0; t < 5; t++) { c.colsb[t] = 64; c.rows[t] = NB; }
         for (int t = 5; t < 8; t++) { c.colsb[t] = 64; c.rows[t] = 16; }
         _tile_loadconfig(&c);
     }
@@ -525,7 +600,8 @@ static void* run(void* arg) {
         me->nres[m] = me->r1[m] - me->r0[m];
         bytes += (size_t)(me->r1[m] - me->r0[m]) * Wk[m] * 2;
     }
-    if (RESKIB && !AMX && bytes > RESKIB << 10) {
+    if (RESKIB && bytes > RESKIB << 10) {
+        if (AMX || NB > 1) { fprintf(stderr, "streamed rows (slice %zu B > L2R_RESIDENT_KIB) need the AVX GEMV and L2R_BATCH=1\n", bytes); exit(1); }
         const size_t ffn = (size_t)(me->nres[4] + me->nres[5]) * H * 2 + (size_t)me->nres[6] * I * 2;
         const double f = (double)(bytes - (RESKIB << 10)) / ffn;
         const int sgu = (int)(me->nres[4] * f + 3) / 4 * 4, sd = (int)(me->nres[6] * f + 3) / 4 * 4;
@@ -558,33 +634,37 @@ static void* run(void* arg) {
         struct pl_measure ms = {rq.id, 0};
         ioctl(PLFD, PL_IOC_MEASURE, &ms); me->held0 = ms.lines ? (double)ms.l1_l2 / ms.lines : -1;
     }
-    /* KV slice, node-local */
-    me->p0 = (int)((long)CL * id / NW); me->p1 = (int)((long)CL * (id + 1) / NW);
-    const int last = id == NW - 1, np = me->p1 - me->p0 + last;
+    /* KV slice of the worker's attention row, node-local */
+    me->row = row_of(id); me->g0 = grp0(me->row); me->g1 = grp0(me->row + 1);
+    const int row = me->row, gs = me->g1 - me->g0;
+    me->p0 = (int)((long)CL * (id - me->g0) / gs); me->p1 = (int)((long)CL * (id - me->g0 + 1) / gs);
+    const int last = id == me->g1 - 1, np = me->p1 - me->p0 + last;
     me->kvblk = ((size_t)KVH * np * HD + 31) / 32 * 32;
     {
-        const size_t kb = (size_t)KVR * SEQS * 2 * me->kvblk * 2, ka = (kb + HUGE - 1) / HUGE * HUGE;
+        const size_t kb = (size_t)KVR * 2 * me->kvblk * 2, ka = (kb + HUGE - 1) / HUGE * HUGE;
         uint8_t* kraw = mmap(NULL, ka + HUGE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         me->kv = (bf16*)(((uintptr_t)kraw + HUGE - 1) & ~(HUGE - 1));
         madvise(me->kv, ka, MADV_HUGEPAGE);
     }
-    for (int c = 0; c < KVR * SEQS; c++) {
+    for (int c = 0; c < KVR; c++) {
         bf16 *kc = me->kv + (size_t)c * 2 * me->kvblk, *vc = kc + me->kvblk;
+        const bf16 *ks = kc0[row], *vs = vc0[row];
         for (int h = 0; h < KVH; h++)
             for (int p = me->p0; p < me->p1; p++) {
-                memcpy(kc + ((size_t)h * np + p - me->p0) * HD, kc0 + ((size_t)h * CL0 + p % CL0) * HD, HD * 2);
-                memcpy(vc + ((size_t)h * np + p - me->p0) * HD, vc0 + ((size_t)h * CL0 + p % CL0) * HD, HD * 2);
+                memcpy(kc + ((size_t)h * np + p - me->p0) * HD, ks + ((size_t)h * CL0 + p % CL0) * HD, HD * 2);
+                memcpy(vc + ((size_t)h * np + p - me->p0) * HD, vs + ((size_t)h * CL0 + p % CL0) * HD, HD * 2);
             }
     }
     int T = TILE_KIB ? (int)(((size_t)TILE_KIB << 10) / (2 * HD * 2)) : np + 1;
     if (T < 1) T = 1;
-    split(NH * HD, 1, id, &me->e0, &me->e1);
+    me->e0 = gsplit(NH * HD, id, row); me->e1 = last ? NH * HD : gsplit(NH * HD, id + 1, row);
 
-    float* xn = aligned_alloc(64, (size_t)H * 4); bf16* xb = aligned_alloc(64, (size_t)H * 2 + 64);
-    float* qn = aligned_alloc(64, (size_t)NH * HD * 4);
-    float* h1 = aligned_alloc(64, (size_t)H * 4); float* h2 = aligned_alloc(64, (size_t)H * 4);
+    const int A = NH * HD, KD = KVH * HD;
+    float* xn = aligned_alloc(64, (size_t)H * 4); bf16* xb = aligned_alloc(64, (size_t)NB * H * 2 + 64);
+    float* qn = aligned_alloc(64, (size_t)A * 4);
+    float* h1 = aligned_alloc(64, (size_t)NB * H * 4); float* h2 = aligned_alloc(64, (size_t)NB * H * 4);
     float* tmp = aligned_alloc(64, (size_t)(H > I ? H : I) * 4);
-    bf16* x2b = aligned_alloc(64, (size_t)H * 2 + 64); bf16* h2b = aligned_alloc(64, (size_t)H * 2 + 64);
+    bf16* x2b = aligned_alloc(64, (size_t)NB * H * 2 + 64); bf16* h2b = aligned_alloc(64, (size_t)NB * H * 2 + 64);
     float* sc = aligned_alloc(64, (size_t)(np + 1) * 4 * NH + 64);
     float fw[MAXW];
     /* read side of every shared vector; L2R_NOBCAST=1 points them at private snapshots after step 0 */
@@ -592,14 +672,14 @@ static void* run(void* arg) {
     const bf16 *rattn = attn_b, *ract = act_b, *rpact = pact_b;
     const int g = NH / KVH;
     const int nd = nodeof[id];
-    float *lq = aligned_alloc(64, (size_t)NH * HD * 4), *lo = aligned_alloc(64, (size_t)H * 4), *ldown = aligned_alloc(64, (size_t)H * 4);
-    bf16 *lattn = aligned_alloc(64, (size_t)NH * HD * 2 + 64), *lact = aligned_alloc(64, (size_t)I * 2 + 64), *lpact = aligned_alloc(64, (size_t)PLE * 2 + 64);
-    float *lk = aligned_alloc(64, (size_t)KVH * HD * 4), *lv = aligned_alloc(64, (size_t)KVH * HD * 4), *lpp = aligned_alloc(64, (size_t)H * 4);
+    float *lq = aligned_alloc(64, (size_t)NB * A * 4), *lo = aligned_alloc(64, (size_t)NB * H * 4), *ldown = aligned_alloc(64, (size_t)NB * H * 4);
+    bf16 *lattn = aligned_alloc(64, (size_t)NB * A * 2 + 64), *lact = aligned_alloc(64, (size_t)NB * I * 2 + 64), *lpact = aligned_alloc(64, (size_t)NB * PLE * 2 + 64);
+    float *lk = aligned_alloc(64, (size_t)KD * 4), *lv = aligned_alloc(64, (size_t)KD * 4), *lpp = aligned_alloc(64, (size_t)H * 4);
     if (BCAST == 4) { rk = lk; rv = lv; }
     /* attention partials are owner-homed: each worker writes its block into the replica of its own node only and
      * combine readers fetch producer w's block from w's node (one reader per line, so no replication) */
     const float* pow_[MAXW]; const float* pmw[MAXW];
-    float *my_po = po + (size_t)id * SEQS * NH * HD, *my_pm = pm + id * SEQS * NH, *my_pl = pl + id * SEQS * NH;
+    float *my_po = po + (size_t)id * A, *my_pm = pm + id * NH, *my_pl = pl + id * NH;
     if (BCAST) {
         rq = lq; ro = lo; rdown = ldown; rattn = lattn; ract = lact; rpact = lpact;
         for (int w = 0; w < NW; w++) {
@@ -618,136 +698,138 @@ static void* run(void* arg) {
         uint64_t t = __rdtsc(), t0 = t, u;
 #define PHASE(i) do { u = __rdtsc(); me->ph[i] += u - t; ++e; if (BCAST != 4 || (i) == 1) barrier(id, e); t = __rdtsc(); me->wt[i] += t - u; } while (0)
         const uint32_t tag = (uint32_t)st + 1; const int par = st & 1;
-        const bf16* kvs = me->kv + (size_t)(st % KVR) * SEQS * 2 * me->kvblk; /* this step's copy, sequence 0 */
+        const bf16* kvs = me->kv + (size_t)(st % KVR) * 2 * me->kvblk; /* this step's copy */
         if (EARLY_KIB)
-            for (int b = 0; b < SEQS; b++)
-                for (int x = 0; x < 2; x++)
-                    for (int h = 0; h < KVH; h++) {
-                        const uint8_t* a = (const uint8_t*)(kvs + ((size_t)b * 2 + x) * me->kvblk + (size_t)h * np * HD);
+            for (int x = 0; x < 2; x++)
+                for (int h = 0; h < KVH; h++) {
+                        const uint8_t* a = (const uint8_t*)(kvs + (size_t)x * me->kvblk + (size_t)h * np * HD);
                         const size_t n = (size_t)np * HD * 2 < EARLY_KIB << 10 ? (size_t)np * HD * 2 : EARLY_KIB << 10;
                         for (size_t i = 0; i < n; i += 64) pf_line(a + i);
-                    }
+                }
         /* 0: input norm (redundant), qkv rows */
-        rms(x_in, w_in, H, xn); tobf(xn, H, xb);
-        gemv(me->w[0], me->r1[0] - me->r0[0], H, xb, q + me->r0[0]);
-        gemv(me->w[1], me->r1[1] - me->r0[1], H, xb, k + me->r0[1]);
-        gemv(me->w[2], me->r1[2] - me->r0[2], H, xb, v + me->r0[2]);
+        for (int b = 0; b < NB; b++) { rms(x_in + (size_t)b * H, w_in, H, xn); tobf(xn, H, xb + (size_t)b * H); }
+        gemv(me->w[0], me->r1[0] - me->r0[0], H, xb, q + me->r0[0], A);
+        gemv(me->w[1], me->r1[1] - me->r0[1], H, xb, k + me->r0[1], KD);
+        gemv(me->w[2], me->r1[2] - me->r0[2], H, xb, v + me->r0[2], KD);
         if (BCAST == 4) { fv_publish(&fv_k, id, k + me->r0[1], tag, par); fv_publish(&fv_v, id, v + me->r0[2], tag, par); }
-        if (BCAST == 4) fv_publish(&fv_q, id, q + me->r0[0], tag, par); else if (BCAST) bc_publish(&bc_q, id, q + me->r0[0]);
+        if (BCAST == 4) fv_publish(&fv_q, id, q + me->r0[0], tag, par); else if (BCAST) bc_publish(&bc_q, id, q + me->r0[0], A);
         PHASE(0);
         /* 1: q/k norm + rope, v norm (redundant); attention over this worker's KV positions */
-        if (BCAST == 4) fv_gather(&fv_q, nd, lq, tag, par); else if (BCAST) bc_gather(&bc_q, nd, lq);
-        for (int h = 0; h < NH; h++) { rms(rq + h * HD, w_qn, HD, qn + h * HD); rope(qn + h * HD); }
+        const float* rqr = rq + (size_t)row * A;
+        if (BCAST == 4) fv_gather(&fv_q, nd, lq, tag, par); else if (BCAST) { bc_gather_row(&bc_q, nd, lq, row); rqr = lq; }
+        for (int h = 0; h < NH; h++) { rms(rqr + h * HD, w_qn, HD, qn + h * HD); rope(qn + h * HD, row); }
         me->pro[1] += __rdtsc() - t;
+        if (st == 0 && id == me->g0) memcpy(chk_qn + (size_t)row * A, qn, (size_t)A * 4);
         if (last) {
             if (BCAST == 4) { fv_gather(&fv_k, nd, lk, tag, par); fv_gather(&fv_v, nd, lv, tag, par); }
             float kn[1024], vn[1024];
             for (int h = 0; h < KVH; h++) {
-                rms(rk + h * HD, w_kn, HD, kn); rope(kn); rms(rv + h * HD, NULL, HD, vn);
-                for (int b = 0; b < SEQS; b++) {
-                    tobf(kn, HD, (bf16*)kvs + ((size_t)b * 2) * me->kvblk + ((size_t)h * np + np - 1) * HD);
-                    tobf(vn, HD, (bf16*)kvs + ((size_t)b * 2 + 1) * me->kvblk + ((size_t)h * np + np - 1) * HD);
-                }
+                rms(rk + (size_t)row * KD + h * HD, w_kn, HD, kn); rope(kn, row); rms(rv + (size_t)row * KD + h * HD, NULL, HD, vn);
+                tobf(kn, HD, (bf16*)kvs + ((size_t)h * np + np - 1) * HD);
+                tobf(vn, HD, (bf16*)kvs + me->kvblk + ((size_t)h * np + np - 1) * HD);
             }
         }
-        for (int b = 0; b < SEQS; b++)
-            for (int kh = 0; kh < KVH; kh++) {
-                float* m = my_pm + b * NH + kh * g; float* l = my_pl + b * NH + kh * g;
-                float* oh = my_po + ((size_t)b * NH + kh * g) * HD;
-                const bf16 *kr = kvs + (size_t)b * 2 * me->kvblk + (size_t)kh * np * HD, *vr = kr + me->kvblk;
-                if (g == 8) attn_group(8, qn + kh * g * HD, kr, vr, np, T, sc, m, l, oh);
-                else if (g == 4) attn_group(4, qn + kh * g * HD, kr, vr, np, T, sc, m, l, oh);
-                else if (g == 2) attn_group(2, qn + kh * g * HD, kr, vr, np, T, sc, m, l, oh);
-                else attn_group(1, qn + kh * g * HD, kr, vr, np, T, sc, m, l, oh);
+        for (int kh = 0; kh < KVH; kh++) {
+                float* m = my_pm + kh * g; float* l = my_pl + kh * g;
+                float* oh = my_po + (size_t)kh * g * HD;
+                const float* qh = qn + (size_t)kh * g * HD;
+                const bf16 *kr = kvs + (size_t)kh * np * HD, *vr = kr + me->kvblk;
+                if (g == 8) attn_group(8, qh, kr, vr, np, T, sc, m, l, oh);
+                else if (g == 4) attn_group(4, qh, kr, vr, np, T, sc, m, l, oh);
+                else if (g == 2) attn_group(2, qh, kr, vr, np, T, sc, m, l, oh);
+                else attn_group(1, qh, kr, vr, np, T, sc, m, l, oh);
             }
         if (BCAST) { /* each line of the partial block goes only to the node(s) whose combine workers read it */
-            const uint8_t* src = (const uint8_t*)(po + (size_t)id * SEQS * NH * HD);
-            for (int li = 0; li < SEQS * NH * HD / 16; li++) {
+            const uint8_t* src = (const uint8_t*)my_po;
+            for (int li = 0; li < A / 16; li++) {
                 const __m512i v = _mm512_loadu_si512(src + (size_t)li * 64);
                 for (int k = 0; k < NNODE; k++)
-                    if (line_nodes[li % (NH * HD / 16)] >> k & 1) {
+                    if (line_nodes[(size_t)row * (A / 16) + li] >> k & 1) {
                         uint8_t* d = bc_po.rep[k] + bc_po.seg[id] + (size_t)li * 64;
                         if (BCAST >= 3) _mm512_stream_si512((__m512i*)d, v); else _mm512_store_si512(d, v);
                     }
             }
-            float rec[16 * 16];
-            for (int b = 0; b < SEQS; b++)
-                for (int h = 0; h < NH; h++) { rec[b * 16 + h] = my_pm[b * NH + h]; rec[b * 16 + 8 + h] = my_pl[b * NH + h]; }
-            bc_publish(&bc_pml, id, rec);
+            float rec[16];
+            for (int h = 0; h < NH; h++) { rec[h] = my_pm[h]; rec[8 + h] = my_pl[h]; }
+            bc_publish(&bc_pml, id, rec, 0);
         }
         PHASE(1);
-        /* 2: combine partials for this worker's slice of NH*HD: one scale per (worker, head) */
-        for (int sq = 0; sq < SEQS; sq++)
+        /* 2: combine the row group's partials for this worker's slice of NH*HD: one scale per (worker, head) */
         for (int h = me->e0 / HD; me->e1 > me->e0 && h <= (me->e1 - 1) / HD; h++) {
             float M = -INFINITY, den = 0;
-#define PM_(w) (BCAST ? pmw[w][sq * 16 + h] : rpm[(w) * NH + h])
-#define PL_(w) (BCAST ? pmw[w][sq * 16 + 8 + h] : rpl[(w) * NH + h])
-            for (int w = 0; w < NW; w++) if (PM_(w) > M) M = PM_(w);
-            for (int w = 0; w < NW; w++) { fw[w] = PM_(w) == -INFINITY ? 0.f : expf(PM_(w) - M); den += fw[w] * PL_(w); }
+#define PM_(w) (BCAST ? pmw[w][h] : rpm[(w) * NH + h])
+#define PL_(w) (BCAST ? pmw[w][8 + h] : rpl[(w) * NH + h])
+            for (int w = me->g0; w < me->g1; w++) if (PM_(w) > M) M = PM_(w);
+            for (int w = me->g0; w < me->g1; w++) { fw[w] = PM_(w) == -INFINITY ? 0.f : expf(PM_(w) - M); den += fw[w] * PL_(w); }
             const int a = h * HD > me->e0 ? h * HD : me->e0, b = (h + 1) * HD < me->e1 ? (h + 1) * HD : me->e1;
             for (int i = a; i < b; i++) {
                 const int d = i - h * HD;
                 float num = 0;
-                if (BCAST) for (int w = 0; w < NW; w++) num += fw[w] * pow_[w][((size_t)sq * NH + h) * HD + d];
-                else for (int w = 0; w < NW; w++) num += fw[w] * rpo[((size_t)w * NH + h) * HD + d];
-                if (sq) { if (st == 0) chk_attn_seq[(size_t)sq * NH * HD + i] = num / den; continue; }
-                attn_b[i] = f2bf(num / den);
-                if (st == 0) chk_attn[i] = num / den;
+                if (BCAST) for (int w = me->g0; w < me->g1; w++) num += fw[w] * pow_[w][(size_t)h * HD + d];
+                else for (int w = me->g0; w < me->g1; w++) num += fw[w] * rpo[((size_t)w * NH + h) * HD + d];
+                attn_b[(size_t)row * A + i] = f2bf(num / den);
+                if (st == 0) chk_attn[(size_t)row * A + i] = num / den;
             }
         }
-        if (BCAST == 4) fv_publish(&fv_attn, id, attn_b + me->e0, tag, par); else if (BCAST) bc_publish(&bc_attn, id, attn_b + me->e0);
+        if (BCAST == 4) fv_publish(&fv_attn, id, attn_b + me->e0, tag, par); else if (BCAST) bc_publish(&bc_attn, id, attn_b + (size_t)row * A + me->e0, 0);
         PHASE(2);
         /* 3: o rows */
-        if (BCAST == 4) fv_gather(&fv_attn, nd, lattn, tag, par); else if (BCAST) bc_gather(&bc_attn, nd, lattn);
-        gemv(me->w[3], me->r1[3] - me->r0[3], NH * HD, rattn, o + me->r0[3]);
-        if (BCAST == 4) fv_publish(&fv_o, id, o + me->r0[3], tag, par); else if (BCAST) bc_publish(&bc_o, id, o + me->r0[3]);
+        if (BCAST == 4) fv_gather(&fv_attn, nd, lattn, tag, par); else if (BCAST) bc_gather(&bc_attn, nd, lattn, A);
+        gemv(me->w[3], me->r1[3] - me->r0[3], A, rattn, o + me->r0[3], H);
+        if (BCAST == 4) fv_publish(&fv_o, id, o + me->r0[3], tag, par); else if (BCAST) bc_publish(&bc_o, id, o + me->r0[3], H);
         PHASE(3);
         /* 4: residual + norms (redundant); gate/up rows, gelu * up */
-        if (BCAST == 4) fv_gather(&fv_o, nd, lo, tag, par); else if (BCAST) bc_gather(&bc_o, nd, lo);
-        rms(ro, w_pa, H, tmp); for (int i = 0; i < H; i++) h1[i] = x_in[i] + tmp[i];
-        rms(h1, w_pf, H, tmp); tobf(tmp, H, x2b);
-        me->pro[4] += __rdtsc() - t;
-        if (st == 0 && id == 0) { memcpy(chk_h1, h1, H * 4); memcpy(chk_xn2, tmp, H * 4); memcpy(chk_qn, qn, NH * HD * 4); }
-        gemv(me->w[4], me->nres[4], H, x2b, gate + me->r0[4]);
-        gemv(me->w[5], me->nres[5], H, x2b, up + me->r0[5]);
-        (PLFD >= 0 ? gemv : gemv_nta)(me->ws[4], me->r1[4] - me->r0[4] - me->nres[4], H, x2b, gate + me->r0[4] + me->nres[4]);
-        (PLFD >= 0 ? gemv : gemv_nta)(me->ws[5], me->r1[5] - me->r0[5] - me->nres[5], H, x2b, up + me->r0[5] + me->nres[5]);
-        for (int r = me->r0[4]; r < me->r1[4]; r++) {
-            const float a = gelu(gate[r]) * up[r];
-            act_b[r] = f2bf(a);
-            if (st == 0) chk_act[r] = a;
+        if (BCAST == 4) fv_gather(&fv_o, nd, lo, tag, par); else if (BCAST) bc_gather(&bc_o, nd, lo, H);
+        for (int b = 0; b < NB; b++) {
+            float* hb = h1 + (size_t)b * H;
+            rms(ro + (size_t)b * H, w_pa, H, tmp); for (int i = 0; i < H; i++) hb[i] = x_in[(size_t)b * H + i] + tmp[i];
+            rms(hb, w_pf, H, tmp); tobf(tmp, H, x2b + (size_t)b * H);
+            if (st == 0 && id == 0) memcpy(chk_xn2 + (size_t)b * H, tmp, H * 4);
         }
-        if (BCAST == 4) fv_publish(&fv_act, id, act_b + me->r0[4], tag, par); else if (BCAST) bc_publish(&bc_act, id, act_b + me->r0[4]);
+        me->pro[4] += __rdtsc() - t;
+        if (st == 0 && id == 0) memcpy(chk_h1, h1, (size_t)NB * H * 4);
+        gemv(me->w[4], me->nres[4], H, x2b, gate + me->r0[4], I);
+        gemv(me->w[5], me->nres[5], H, x2b, up + me->r0[5], I);
+        (PLFD >= 0 ? gemv_avx1 : gemv_nta)(me->ws[4], me->r1[4] - me->r0[4] - me->nres[4], H, x2b, gate + me->r0[4] + me->nres[4]);
+        (PLFD >= 0 ? gemv_avx1 : gemv_nta)(me->ws[5], me->r1[5] - me->r0[5] - me->nres[5], H, x2b, up + me->r0[5] + me->nres[5]);
+        for (int b = 0; b < NB; b++)
+            gelu_mul(gate + (size_t)b * I + me->r0[4], up + (size_t)b * I + me->r0[4], me->r1[4] - me->r0[4],
+                     act_b + (size_t)b * I + me->r0[4], st == 0 ? chk_act + (size_t)b * I + me->r0[4] : NULL);
+        if (BCAST == 4) fv_publish(&fv_act, id, act_b + me->r0[4], tag, par); else if (BCAST) bc_publish(&bc_act, id, act_b + me->r0[4], I);
         PHASE(4);
         /* 5: down rows */
-        if (BCAST == 4) fv_gather(&fv_act, nd, lact, tag, par); else if (BCAST) bc_gather(&bc_act, nd, lact);
-        gemv(me->w[6], me->nres[6], I, ract, down + me->r0[6]);
-        (PLFD >= 0 ? gemv : gemv_nta)(me->ws[6], me->r1[6] - me->r0[6] - me->nres[6], I, ract, down + me->r0[6] + me->nres[6]);
-        if (BCAST == 4) fv_publish(&fv_down, id, down + me->r0[6], tag, par); else if (BCAST) bc_publish(&bc_down, id, down + me->r0[6]);
+        if (BCAST == 4) fv_gather(&fv_act, nd, lact, tag, par); else if (BCAST) bc_gather(&bc_act, nd, lact, I);
+        gemv(me->w[6], me->nres[6], I, ract, down + me->r0[6], H);
+        (PLFD >= 0 ? gemv_avx1 : gemv_nta)(me->ws[6], me->r1[6] - me->r0[6] - me->nres[6], I, ract, down + me->r0[6] + me->nres[6]);
+        if (BCAST == 4) fv_publish(&fv_down, id, down + me->r0[6], tag, par); else if (BCAST) bc_publish(&bc_down, id, down + me->r0[6], H);
         PHASE(5);
         /* 6: residual (redundant); ple gate rows, gelu * per-layer input */
-        if (BCAST == 4) fv_gather(&fv_down, nd, ldown, tag, par); else if (BCAST) bc_gather(&bc_down, nd, ldown);
-        rms(rdown, w_pff, H, tmp); for (int i = 0; i < H; i++) h2[i] = h1[i] + tmp[i];
-        tobf(h2, H, h2b);
-        me->pro[6] += __rdtsc() - t;
-        if (st == 0 && id == 0) memcpy(chk_h2, h2, H * 4);
-        gemv(me->w[7], me->r1[7] - me->r0[7], H, h2b, pg + me->r0[7]);
-        for (int r = me->r0[7]; r < me->r1[7]; r++) {
-            const float a = gelu(pg[r]) * pli[r];
-            pact_b[r] = f2bf(a);
-            if (st == 0) chk_pact[r] = a;
+        if (BCAST == 4) fv_gather(&fv_down, nd, ldown, tag, par); else if (BCAST) bc_gather(&bc_down, nd, ldown, H);
+        for (int b = 0; b < NB; b++) {
+            float* hb = h2 + (size_t)b * H;
+            rms(rdown + (size_t)b * H, w_pff, H, tmp); for (int i = 0; i < H; i++) hb[i] = h1[(size_t)b * H + i] + tmp[i];
+            tobf(hb, H, h2b + (size_t)b * H);
         }
-        if (BCAST == 4) fv_publish(&fv_pact, id, pact_b + me->r0[7], tag, par); else if (BCAST) bc_publish(&bc_pact, id, pact_b + me->r0[7]);
+        me->pro[6] += __rdtsc() - t;
+        if (st == 0 && id == 0) memcpy(chk_h2, h2, (size_t)NB * H * 4);
+        gemv(me->w[7], me->r1[7] - me->r0[7], H, h2b, pg + me->r0[7], PLE);
+        for (int b = 0; b < NB; b++)
+            gelu_mul(pg + (size_t)b * PLE + me->r0[7], pli + (size_t)b * PLE + me->r0[7], me->r1[7] - me->r0[7],
+                     pact_b + (size_t)b * PLE + me->r0[7], st == 0 ? chk_pact + (size_t)b * PLE + me->r0[7] : NULL);
+        if (BCAST == 4) fv_publish(&fv_pact, id, pact_b + me->r0[7], tag, par); else if (BCAST) bc_publish(&bc_pact, id, pact_b + me->r0[7], PLE);
         PHASE(6);
         /* 7: ple projection rows */
-        if (BCAST == 4) fv_gather(&fv_pact, nd, lpact, tag, par); else if (BCAST) bc_gather(&bc_pact, nd, lpact);
-        gemv(me->w[8], me->r1[8] - me->r0[8], PLE, rpact, pp + me->r0[8]);
+        if (BCAST == 4) fv_gather(&fv_pact, nd, lpact, tag, par); else if (BCAST) bc_gather(&bc_pact, nd, lpact, PLE);
+        gemv(me->w[8], me->r1[8] - me->r0[8], PLE, rpact, pp + me->r0[8], H);
         if (BCAST == 4) fv_publish(&fv_pp, id, pp + me->r0[8], tag, par);
         PHASE(7);
         if (id == 0) {
             if (BCAST == 4) fv_gather(&fv_pp, nd, lpp, tag, par);
-            rms(BCAST == 4 ? lpp : pp, w_pn, H, tmp);
-            for (int i = 0; i < H; i++) outv[(size_t)(st == 0 ? 0 : 1) * H + i] = (h2[i] + tmp[i]) * SCALAR;
+            for (int b = 0; b < NB; b++) {
+                rms(BCAST == 4 ? lpp : pp + (size_t)b * H, w_pn, H, tmp);
+                float* ov = outv + ((size_t)(st == 0 ? 0 : 1) * NB + b) * H;
+                for (int i = 0; i < H; i++) ov[i] = (h2[(size_t)b * H + i] + tmp[i]) * SCALAR;
+            }
         }
         me->steps_t[st] = __rdtsc() - t0;
         if (st == 0 && NOBCAST) {
@@ -786,17 +868,23 @@ int main(int argc, char** argv) {
     { const char* b = getenv("L2R_BARRIER"); BARR = b && !strcmp(b, "hier"); }
     RESKIB = getenv("L2R_RESIDENT_KIB") ? strtoull(getenv("L2R_RESIDENT_KIB"), 0, 10) : 0;
     if (getenv("L2R_LOCK") && atoi(getenv("L2R_LOCK"))) {
-        if (!RESKIB || AMX) { fprintf(stderr, "L2R_LOCK needs L2R_RESIDENT_KIB and the AVX GEMV\n"); return 1; }
+        if (!RESKIB) { fprintf(stderr, "L2R_LOCK needs L2R_RESIDENT_KIB\n"); return 1; }
         if ((PLFD = open("/dev/pseudo_lock", O_RDWR)) < 0) { perror("/dev/pseudo_lock"); return 1; }
     }
 #define ENVI(v, n) if (getenv(n)) v = atoi(getenv(n))
-    ENVI(KVR, "L2R_KV_COPIES"); ENVI(TILE_KIB, "L2R_KV_TILE_KIB"); ENVI(PFD, "L2R_KV_PFD"); ENVI(SEQS, "L2R_SEQS");
+    ENVI(KVR, "L2R_KV_COPIES"); ENVI(TILE_KIB, "L2R_KV_TILE_KIB"); ENVI(PFD, "L2R_KV_PFD"); ENVI(NB, "L2R_BATCH");
     ENVI(ATTN_ONLY, "L2R_ATTN_ONLY");
     EARLY_KIB = getenv("L2R_KV_EARLY_KIB") ? strtoull(getenv("L2R_KV_EARLY_KIB"), 0, 10) : 0;
     { const char* h = getenv("L2R_KV_PFH"); PFH = !h || !strcmp(h, "t0") ? 0 : !strcmp(h, "t1") ? 1 : !strcmp(h, "t2") ? 2 : 3; }
     if (KVR < 1) KVR = 1;
     if (getenv("L2R_PERF_CTL") && (PERF_FD = open(getenv("L2R_PERF_CTL"), O_WRONLY)) < 0) { perror("L2R_PERF_CTL"); return 1; }
-    if (SEQS < 1 || SEQS > 16 || (SEQS > 1 && (BCAST < 1 || BCAST > 3))) { fprintf(stderr, "L2R_SEQS: 1..16, >1 needs L2R_BCAST=rep|repcld|repnt\n"); return 1; }
+    if (NB < 1 || NB > MAXB || (NB > 1 && (BCAST == 4 || NOBCAST))) { fprintf(stderr, "L2R_BATCH: 1..16, >1 needs L2R_BCAST=direct|rep|repcld|repnt and no L2R_NOBCAST\n"); return 1; }
+    {
+        static char rows[4096]; int ndir = 0;
+        snprintf(rows, sizeof rows, "%s", getenv("L2R_ROWS") ? getenv("L2R_ROWS") : DIR);
+        for (char* t = strtok(rows, ","); t && ndir < MAXB; t = strtok(NULL, ",")) ROWDIR[ndir++] = t;
+        for (int b = ndir; b < NB; b++) ROWDIR[b] = ROWDIR[b % ndir];
+    }
     REP = getenv("L2R_CTX_REPEAT") ? atoi(getenv("L2R_CTX_REPEAT")) : 1;
     const char* cl = getenv("L2R_CPUS") ? getenv("L2R_CPUS") : "2-31,34-63,66-95";
     for (const char* p = cl; *p;) {
@@ -805,6 +893,7 @@ int main(int argc, char** argv) {
         for (int c = a; c <= b && NW < MAXW; c++) cpus[NW++] = c;
         if (*p == ',') p++;
     }
+    if (NB > NW) { fprintf(stderr, "L2R_BATCH %d > %d workers\n", NB, NW); return 1; }
     char path[512]; snprintf(path, sizeof path, "%s/meta.json", DIR);
     FILE* f = fopen(path, "r"); if (!f) { perror(path); return 1; }
     static char js[1 << 20]; js[fread(js, 1, sizeof js - 1, f)] = 0; fclose(f);
@@ -823,15 +912,25 @@ int main(int argc, char** argv) {
     w_pn = loadbf_as_f("w.post_per_layer_input_norm.weight");
     w_qn = loadbf_as_f("w.self_attn.q_norm.weight"); w_kn = loadbf_as_f("w.self_attn.k_norm.weight");
     float* ls = load("layer_scalar", NULL, NULL); SCALAR = ls[0];
-    x_in = load("x_in", NULL, NULL); pli = load("per_layer_input", NULL, NULL);
-    cosv = load("cos", NULL, NULL); sinv = load("sin", NULL, NULL);
-    kc0 = load("kcache", NULL, NULL); vc0 = load("vcache", NULL, NULL);
+    x_in = malloc((size_t)NB * H * 4); pli = malloc((size_t)NB * PLE * 4); cosv = malloc((size_t)NB * HD * 4); sinv = malloc((size_t)NB * HD * 4);
+    for (int b = 0; b < NB; b++) {
+        snprintf(path, sizeof path, "%s/meta.json", ROWDIR[b]);
+        if (!(f = fopen(path, "r"))) { perror(path); return 1; }
+        static char rj[1 << 20]; rj[fread(rj, 1, sizeof rj - 1, f)] = 0; fclose(f);
+        if (meta_int(rj, "layer") != meta_int(js, "layer") || meta_int(rj, "cache_len") != CL0 || meta_int(rj, "hidden") != H) {
+            fprintf(stderr, "%s: not the same layer / cache length as %s\n", ROWDIR[b], DIR); return 1;
+        }
+#define ROWLD(dst, nm, n) do { float* t_ = load_in(ROWDIR[b], nm, NULL, NULL); memcpy(dst + (size_t)b * (n), t_, (size_t)(n) * 4); free(t_); } while (0)
+        ROWLD(x_in, "x_in", H); ROWLD(pli, "per_layer_input", PLE); ROWLD(cosv, "cos", HD); ROWLD(sinv, "sin", HD);
+        kc0[b] = load_in(ROWDIR[b], "kcache", NULL, NULL); vc0[b] = load_in(ROWDIR[b], "vcache", NULL, NULL);
+    }
     const int A = NH * HD;
 #define ZA(p, n) p = aligned_alloc(64, ((size_t)(n) * 4 + 63) / 64 * 64), memset(p, 0, (size_t)(n) * 4)
-    ZA(q, A); ZA(k, KVH * HD); ZA(v, KVH * HD); ZA(o, H); ZA(gate, I); ZA(up, I); ZA(down, H); ZA(pg, PLE); ZA(pp, H); ZA(outv, 2 * H);
-    ZA(pm, NW * SEQS * NH); ZA(pl, NW * SEQS * NH); ZA(po, (size_t)NW * SEQS * NH * HD); ZA(chk_attn_seq, (size_t)SEQS * NH * HD);
-    ZA(chk_qn, A); ZA(chk_h1, H); ZA(chk_xn2, H); ZA(chk_h2, H); ZA(chk_attn, A); ZA(chk_act, I); ZA(chk_pact, PLE);
-    attn_b = aligned_alloc(64, A * 2 + 64); act_b = aligned_alloc(64, I * 2 + 64); pact_b = aligned_alloc(64, PLE * 2 + 64);
+    ZA(q, NB * A); ZA(k, NB * KVH * HD); ZA(v, NB * KVH * HD); ZA(o, NB * H); ZA(gate, NB * I); ZA(up, NB * I); ZA(down, NB * H);
+    ZA(pg, NB * PLE); ZA(pp, NB * H); ZA(outv, 2 * NB * H);
+    ZA(pm, NW * NH); ZA(pl, NW * NH); ZA(po, (size_t)NW * NH * HD);
+    ZA(chk_qn, NB * A); ZA(chk_h1, NB * H); ZA(chk_xn2, NB * H); ZA(chk_h2, NB * H); ZA(chk_attn, NB * A); ZA(chk_act, NB * I); ZA(chk_pact, NB * PLE);
+    attn_b = aligned_alloc(64, (size_t)NB * A * 2 + 64); act_b = aligned_alloc(64, (size_t)NB * I * 2 + 64); pact_b = aligned_alloc(64, (size_t)NB * PLE * 2 + 64);
     for (int i = 0; i < NW; i++) {
         nodeof[i] = 0;
         for (int k = 0; k < 8; k++) {
@@ -848,20 +947,18 @@ int main(int argc, char** argv) {
         if (!node_count[k]) b_done[k]->v = ~0ull; /* nodes without workers never hold the leaders back */
     }
     if (BCAST) {
-        bc_init(&bc_q, 4, A, AMX ? 16 : 4, 0); bc_init(&bc_o, 4, H, AMX ? 16 : 4, 0); bc_init(&bc_down, 4, H, AMX ? 16 : 4, 0);
-        bc_init(&bc_attn, 2, A, 1, 0); bc_init(&bc_act, 2, I, AMX ? 16 : 4, 0); bc_init(&bc_pact, 2, PLE, AMX ? 16 : 4, 0);
-        bc_init(&bc_po, 4, SEQS * A, 0, 1); bc_init(&bc_pml, 4, 16 * SEQS, 0, 1);
+        const int u = AMX ? 16 : 4;
+        bc_init(&bc_q, 4, A, u, 0, NB); bc_init(&bc_o, 4, H, u, 0, NB); bc_init(&bc_down, 4, H, u, 0, NB);
+        bc_init_grp(&bc_attn, 2, A); bc_init(&bc_act, 2, I, u, 0, NB); bc_init(&bc_pact, 2, PLE, u, 0, NB);
+        bc_init(&bc_po, 4, A, 0, 1, 1); bc_init(&bc_pml, 4, 16, 0, 1, 1);
         if (BCAST == 4) {
-            const int u = AMX ? 16 : 4;
             fv_init(&fv_q, 4, A, u); fv_init(&fv_k, 4, KVH * HD, u); fv_init(&fv_v, 4, KVH * HD, u); fv_init(&fv_attn, 2, A, 1);
             fv_init(&fv_o, 4, H, u); fv_init(&fv_act, 2, I, u); fv_init(&fv_down, 4, H, u); fv_init(&fv_pact, 2, PLE, u);
             fv_init(&fv_pp, 4, H, u);
         }
-        line_nodes = calloc(A / 16, 1);
-        for (int w = 0; w < NW; w++) {
-            int a, z; split(A, 1, w, &a, &z);
-            for (int i = a; i < z; i++) line_nodes[i / 16] |= 1 << nodeof[w];
-        }
+        line_nodes = calloc((size_t)NB * A / 16, 1);
+        for (int w = 0; w < NW; w++)
+            for (int i = bc_attn.off[w]; i < bc_attn.off[w] + bc_attn.len[w]; i++) line_nodes[(size_t)bc_attn.row[w] * (A / 16) + i / 16] |= 1 << nodeof[w];
     }
     tsc_ghz = calib();
     pthread_barrier_init(&pbar, NULL, NW);
@@ -874,8 +971,8 @@ int main(int argc, char** argv) {
         {"q", q, A}, {"k", k, KVH * HD}, {"v", v, KVH * HD}, {"qn", chk_qn, A}, {"attn", chk_attn, A}, {"o", o, H},
         {"h1", chk_h1, H}, {"xn2", chk_xn2, H}, {"gate", gate, I}, {"up", up, I}, {"act", chk_act, I},
         {"down", down, H}, {"h2", chk_h2, H}, {"pg", pg, PLE}, {"pact", chk_pact, PLE}, {"pp", pp, H},
-        {"out", outv, H}, {"out_last", outv + H, H}};
-    printf("{\"ref\":\"%s\",\"gemv\":\"%s\",\"nobcast\":%d,\"bcast\":%d,\"barrier\":\"%s\",\"resident_kib\":%zu,\"workers\":%d,\"steps\":%d,\"ctx_rows\":%d,\"tsc_ghz\":%.3f,\"err\":{", DIR, AMX ? "amx" : "avx", NOBCAST, BCAST, BARR ? "hier" : "diss", RESKIB, NW, STEPS, CL + 1, tsc_ghz);
+        {"out", outv, H}, {"out_last", outv + (size_t)NB * H, H}};
+    printf("{\"ref\":\"%s\",\"batch\":%d,\"gemv\":\"%s\",\"nobcast\":%d,\"bcast\":%d,\"barrier\":\"%s\",\"resident_kib\":%zu,\"workers\":%d,\"steps\":%d,\"ctx_rows\":%d,\"tsc_ghz\":%.3f,\"err\":{", DIR, NB, AMX ? "amx" : "avx", NOBCAST, BCAST, BARR ? "hier" : "diss", RESKIB, NW, STEPS, CL + 1, tsc_ghz);
     for (size_t b = 0; b < sizeof B / sizeof B[0]; b++) {
         char nm[64]; snprintf(nm, sizeof nm, "ref.%s", !strcmp(B[b].n, "out_last") ? "out" : B[b].n);
         float* r = REP == 1 ? load(nm, NULL, NULL) : NULL;
@@ -904,13 +1001,25 @@ int main(int argc, char** argv) {
     double h0 = 1, h1 = 1;
     for (int w = 0; w < NW; w++) { if (WK[w].held0 < h0) h0 = WK[w].held0; if (WK[w].held1 < h1) h1 = WK[w].held1; }
     printf("]");
-    if (SEQS > 1 && REP == 1) {
-        float* r = load("ref.attn", NULL, NULL); double worst = 0;
-        for (int b = 1; b < SEQS; b++) { err_t e = err(chk_attn_seq + (size_t)b * A, r, A); if (e.rel_rms > worst) worst = e.rel_rms; }
-        printf(",\"attn_seqs_worst_rel_rms\":%.3e", worst); free(r);
+    if (NB > 1) { /* every row against its own dump's reference */
+        printf(",\"rows\":[");
+        for (int b = 0; b < NB; b++) {
+            printf("%s{\"dir\":\"%s\",\"err\":{", b ? "," : "", ROWDIR[b]);
+            for (size_t i = 0; i < sizeof B / sizeof B[0]; i++) {
+                char nm[64]; snprintf(nm, sizeof nm, "ref.%s", !strcmp(B[i].n, "out_last") ? "out" : B[i].n);
+                float* r = REP == 1 ? load_in(ROWDIR[b], nm, NULL, NULL) : NULL;
+                if (r) {
+                    err_t e = err(B[i].a + (size_t)b * B[i].len, r, B[i].len);
+                    printf("%s\"%s\":[%.3e,%.8f,%.3e]", i ? "," : "", B[i].n, e.rel_rms, e.cos, e.max_abs);
+                    free(r);
+                } else printf("%s\"%s\":null", i ? "," : "", B[i].n);
+            }
+            printf("}}");
+        }
+        printf("]");
     }
-    printf(",\"kv\":{\"copies\":%d,\"seqs\":%d,\"tile_kib\":%d,\"pfd\":%d,\"pfh\":%d,\"early_kib\":%zu,\"attn_only\":%d,\"bytes_per_step\":%zu}",
-           KVR, SEQS, TILE_KIB, PFD, PFH, EARLY_KIB, ATTN_ONLY, (size_t)SEQS * 2 * KVH * (CL + 1) * HD * 2);
+    printf(",\"kv\":{\"copies\":%d,\"rows\":%d,\"tile_kib\":%d,\"pfd\":%d,\"pfh\":%d,\"early_kib\":%zu,\"attn_only\":%d,\"bytes_per_step\":%zu}",
+           KVR, NB, TILE_KIB, PFD, PFH, EARLY_KIB, ATTN_ONLY, (size_t)NB * 2 * KVH * (CL + 1) * HD * 2);
     if (PLFD >= 0) printf(",\"lock\":{\"held_l2_before_min\":%.4f,\"held_l2_after_min\":%.4f}", h0, h1);
     printf(",\"weight_bytes\":%zu,\"weight_bytes_per_worker\":%.0f}\n", wb, (double)wb / NW);
     return 0;

@@ -1,4 +1,4 @@
-"""ref_layer.py <hf_dir> <layer> <ctx> <outdir> [chunk]: FP32 reference for one Gemma-4 text decoder layer at one decode step.
+"""ref_layer.py <hf_dir> <layer> <ctx> <outdir> [chunk] [offset]: FP32 reference for one Gemma-4 text decoder layer at one decode step.
 
 Runs the HF model in FP32 on <ctx> tokens of real text (repo docs), then one decode token, stopping after <layer>.
 Dumps to <outdir>: the layer's BF16 weights, its inputs at the decode step (hidden state, per-layer input, RoPE
@@ -12,6 +12,7 @@ import torch
 import torch.nn.functional as F
 
 hf, L, ctx, out = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), sys.argv[4]
+off = int(sys.argv[6]) if len(sys.argv) > 6 else 0  # tokens of text skipped: distinct sequences for batch rows
 os.makedirs(out, exist_ok=True)
 torch.set_grad_enabled(False)
 
@@ -28,9 +29,10 @@ repo = os.path.dirname(os.path.abspath(__file__)) + "/../../../.."
 text = ""
 for f in sorted(glob.glob(repo + "/docs/**/*.md", recursive=True)):
     text += open(f, errors="ignore").read() + "\n\n"
-    if len(text) > ctx * 6:
+    if len(text) > (ctx + off) * 6:
         break
-ids = tok(text, return_tensors="pt").input_ids[:, : ctx + 1]
+ids = tok(text, return_tensors="pt").input_ids
+ids = torch.cat((ids[:, :1], ids[:, 1 + off : off + ctx + 1]), 1)  # BOS kept
 assert ids.shape[1] == ctx + 1, ids.shape
 
 cap = {}
@@ -198,7 +200,7 @@ dump("vcache", vc, "bf16")
 for k, v in f32.items():
     dump("ref." + k, v, "f32")
 open(f"{out}/manifest.txt", "w").write("\n".join(man) + "\n")
-meta = dict(hf=hf, layer=L, ctx=ctx, layer_type=cfg.layer_types[L], hidden=cfg.hidden_size, heads=nh, kv_heads=kvh,
+meta = dict(hf=hf, layer=L, ctx=ctx, offset=off, layer_type=cfg.layer_types[L], hidden=cfg.hidden_size, heads=nh, kv_heads=kvh,
             head_dim=hd, window=window, cache_len=int(kc.shape[1]), eps=eps, inter=int(W["mlp.gate_proj.weight"].shape[0]),
             ple=cfg.hidden_size_per_layer_input, token=int(ids[0, ctx]), torch=torch.__version__,
             hf_check=check, hf_check_fail=bad, bf16_ref_err=bf_err)

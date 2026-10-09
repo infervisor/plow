@@ -1669,7 +1669,7 @@ pub fn validate_against_checkpoint(
 /// Read the tensor name → shape map from every `*.safetensors` file directly
 /// in `dir` (like `bin/gemma4.rs::shard_files`, we enumerate what is actually
 /// there rather than trusting an index file).
-fn safetensor_shapes(dir: &Path) -> Result<std::collections::HashMap<String, Vec<i64>>, String> {
+pub fn safetensor_shapes(dir: &Path) -> Result<std::collections::HashMap<String, Vec<i64>>, String> {
     let mut out = std::collections::HashMap::new();
     let rd = std::fs::read_dir(dir).map_err(|e| format!("read_dir {}: {e}", dir.display()))?;
     let mut files: Vec<_> = rd

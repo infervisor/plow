@@ -46,6 +46,7 @@
 pub mod hf_config;
 pub mod net;
 pub mod parallel;
+pub mod stage_plan;
 #[cfg(feature = "tuner")]
 pub mod tune;
 #[cfg(feature = "tuner")]
