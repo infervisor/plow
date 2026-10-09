@@ -1230,6 +1230,32 @@ fn glue_kernels<'a>(routes: impl Iterator<Item = &'a LibraryRoute>) -> Vec<Kerne
         .collect()
 }
 
+/// One decode program's projection routes and MoE routes, which own disjoint segments.
+pub(super) fn merge_routes(
+    projections: Vec<Option<LibraryRoute>>,
+    moe: Vec<Option<LibraryRoute>>,
+) -> Result<Vec<Option<LibraryRoute>>> {
+    if moe.is_empty() {
+        return Ok(projections);
+    }
+    if projections.is_empty() {
+        return Ok(moe);
+    }
+    if projections.len() != moe.len() {
+        return Err(RuntimeError::Rejected("projection and MoE decode segments disagree".into()));
+    }
+    projections
+        .into_iter()
+        .zip(moe)
+        .map(|pair| match pair {
+            (Some(_), Some(_)) => Err(RuntimeError::Rejected(
+                "a decode segment is both a projection and a MoE route".into(),
+            )),
+            (a, b) => Ok(a.or(b)),
+        })
+        .collect()
+}
+
 pub(super) fn library_routes(routes: Vec<Option<CublasLtDecodeRoute>>) -> Vec<Option<LibraryRoute>> {
     routes
         .into_iter()
@@ -2002,6 +2028,13 @@ fn projection_segments(
 mod tests {
     use super::*;
     use packet::dev::{DevInst64, StreamEnt};
+
+    #[test]
+    fn merge_routes_keeps_either_side_when_the_other_is_absent() {
+        assert_eq!(merge_routes(vec![None, None], Vec::new()).unwrap().len(), 2);
+        assert_eq!(merge_routes(Vec::new(), vec![None, None, None]).unwrap().len(), 3);
+        assert!(merge_routes(vec![None], vec![None, None]).is_err());
+    }
 
     #[test]
     fn norm_quant_pair_requires_complete_interleaved_slices_and_shared_output() {

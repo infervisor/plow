@@ -1067,8 +1067,23 @@ static_assert(PLOW_NV_GEMV_STAGING_BYTES <= PLOW_NV_BASE_ARENA_FLOATS * sizeof(f
 #endif
 #define PLOW_NV_NON_FP8_ARENA_FLOATS                                                          \
     (PLOW_NV_BASE_ARENA_FLOATS > PLOW_NV_M16_ARENA_FLOATS ? PLOW_NV_BASE_ARENA_FLOATS : PLOW_NV_M16_ARENA_FLOATS)
-#define PLOW_NV_ARENA_FLOATS00                                                                \
+/* The tensor-core W8A16 GEMV's K-split reduction joins the launch claim (the 26B-A4B decode
+ * attention arena is smaller than the 12B's, which covered it), and behind it the wide-ladder
+ * fp8 MoE dedupe slot tables (op_moe.cuh PLOW_DD_DYN_OFF). */
+#ifdef PLOW_DD_DYN_BYTES
+#define PLOW_NV_DD_DYN_BYTES PLOW_DD_DYN_BYTES
+#else
+#define PLOW_NV_DD_DYN_BYTES 0u
+#endif
+#if PLOW_NV_FP8_DECODE_TC_ACTIVE
+#define PLOW_NV_FP8TC_ARENA_FLOATS ((PLOW_FP8TC_ARENA_BYTES + PLOW_NV_DD_DYN_BYTES + 3u) / 4u)
+#else
+#define PLOW_NV_FP8TC_ARENA_FLOATS ((PLOW_NV_DD_DYN_BYTES + 3u) / 4u)
+#endif
+#define PLOW_NV_ARENA_FLOATS000                                                               \
     (PLOW_NV_NON_FP8_ARENA_FLOATS > PLOW_NV_FP8_DECODE_WGMMA_ARENA_FLOATS ? PLOW_NV_NON_FP8_ARENA_FLOATS : PLOW_NV_FP8_DECODE_WGMMA_ARENA_FLOATS)
+#define PLOW_NV_ARENA_FLOATS00                                                                \
+    (PLOW_NV_ARENA_FLOATS000 > PLOW_NV_FP8TC_ARENA_FLOATS ? PLOW_NV_ARENA_FLOATS000 : PLOW_NV_FP8TC_ARENA_FLOATS)
 #define PLOW_NV_ARENA_FLOATS0                                                                 \
     (PLOW_NV_ARENA_FLOATS00 > PLOW_NV_K8_ARENA_FLOATS ? PLOW_NV_ARENA_FLOATS00 : PLOW_NV_K8_ARENA_FLOATS)
 #if PLOW_NV_SPEECH
@@ -1576,7 +1591,7 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
     case PLOW_DOP_MOE_ALIGN_GEMMA_PF:
         d_moe_align_gemma_pf((int*)TEN(0), (const unsigned char*)TEN(1), (unsigned*)TEN(2),
                              (unsigned*)TEN(3), (float*)TEN(4), in->i[0], in->i[1], in->i[2],
-                             slice);
+                             slice, nblk);
         break;
 
     case PLOW_DOP_MOE_GROUP_GLU_GEMMA_PF:
@@ -2899,7 +2914,7 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
         if (in->i[0] >= in->i[3])
             d_moe_align_gemma_pf((int*)TEN(0), (const unsigned char*)TEN(1), (unsigned*)TEN(2),
                                  (unsigned*)TEN(3), (float*)TEN(4), in->i[0], in->i[1], in->i[2],
-                                 slice);
+                                 slice, 1u);
         break;
 #endif
 

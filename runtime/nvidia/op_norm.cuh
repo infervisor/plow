@@ -904,6 +904,24 @@ static __device__ void d_norm_residual_norm(__nv_bfloat16* __restrict__ out, __n
  * so N requests' chunks share ONE launch while each row lands in its own request's cache. The
  * host only patches t6 (the slot map) on prefill KV-write sites in batched mode; pfslot==nullptr
  * keeps every existing packet byte-identical. */
+/* MASKED PADDING: the first of this warp's items w, w + step, ... whose row is live (pfslot >= 0),
+ * or `total`. A staged launch masks every row outside the stage, so most items are dead; probing
+ * 32 of them per load round replaces one dependent pfslot load per dead item. Warp-uniform `w`. */
+static __device__ __forceinline__ unsigned plow_hnr_next_live(const int* __restrict__ pfslot,
+                                                             unsigned w, unsigned step,
+                                                             unsigned total, unsigned nhead,
+                                                             unsigned lane) {
+    const bool pow2 = (nhead & (nhead - 1u)) == 0u;
+    const unsigned nsh = 31u - (unsigned)__clz((int)nhead);
+    for (; w < total; w += 32u * step) {
+        const unsigned wl = w + lane * step;
+        const bool live = wl < total && pfslot[pow2 ? wl >> nsh : wl / nhead] >= 0;
+        const unsigned m = __ballot_sync(0xffffffffu, live);
+        if (m) return w + (unsigned)(__ffs(m) - 1) * step;
+    }
+    return total;
+}
+
 template <int HD, bool INTERLEAVE = false>
 static __device__ void d_headnorm_rope(__nv_bfloat16* __restrict__ hnr_out,
                                 const __nv_bfloat16* __restrict__ hnr_x,
@@ -943,6 +961,12 @@ static __device__ void d_headnorm_rope(__nv_bfloat16* __restrict__ hnr_out,
 
     for (unsigned w = slice * PLOW_NV_WARPS + warp_in_blk; w < total;
          w += nblk * PLOW_NV_WARPS) {
+#if defined(PLOW_NV_MASKED_PADDING) && PLOW_NV_MASKED_PADDING
+        if (out_stride && pfslot) {
+            w = plow_hnr_next_live(pfslot, w, nblk * PLOW_NV_WARPS, total, nhead, lane);
+            if (w >= total) break;
+        }
+#endif
         /* nhead is a power of two on every shipped model (Qwen3 32/8, Gemma alike); the u32
          * div/mod chain (~35 instrs) was ~23% of this latency-dust body. Uniform branch: pow2
          * path is 3 instrs, div path survives for any future non-pow2 head count. */
@@ -951,9 +975,6 @@ static __device__ void d_headnorm_rope(__nv_bfloat16* __restrict__ hnr_out,
             const unsigned nsh = 31u - (unsigned)__clz((int)nhead);
             t = w >> nsh; hh = w & (nhead - 1u);
         } else { t = w / nhead; hh = w % nhead; }
-#if defined(PLOW_NV_MASKED_PADDING) && PLOW_NV_MASKED_PADDING
-        if (out_stride && pfslot && pfslot[t] < 0) continue;
-#endif
 #if PLOW_MIXED_STEP
         PlowMixedRow mixed_row = {nullptr, 0u, 0u, 0u, 0u};
         if (out_stride && mixed) {
@@ -1171,6 +1192,12 @@ static __device__ void d_headnorm_rope_fp8(uint8_t* __restrict__ out, float* __r
 
     for (unsigned w = slice * PLOW_NV_WARPS + warp_in_blk; w < total;
          w += nblk * PLOW_NV_WARPS) {
+#if defined(PLOW_NV_MASKED_PADDING) && PLOW_NV_MASKED_PADDING
+        if (pfslot) {
+            w = plow_hnr_next_live(pfslot, w, nblk * PLOW_NV_WARPS, total, nhead, lane);
+            if (w >= total) break;
+        }
+#endif
         /* nhead is a power of two on every shipped model (Qwen3 32/8, Gemma alike); the u32
          * div/mod chain (~35 instrs) was ~23% of this latency-dust body. Uniform branch: pow2
          * path is 3 instrs, div path survives for any future non-pow2 head count. */
@@ -1179,9 +1206,6 @@ static __device__ void d_headnorm_rope_fp8(uint8_t* __restrict__ out, float* __r
             const unsigned nsh = 31u - (unsigned)__clz((int)nhead);
             t = w >> nsh; hh = w & (nhead - 1u);
         } else { t = w / nhead; hh = w % nhead; }
-#if defined(PLOW_NV_MASKED_PADDING) && PLOW_NV_MASKED_PADDING
-        if (pfslot && pfslot[t] < 0) continue;
-#endif
         const size_t ibase = ((size_t)t * nhead + hh) * hd;
         /* KV write (out_stride!=0 always here): per-row slot map (batched prefill), per-batch ring
          * when n_batch_kv!=0 (pos[t]-derived row; ==1 is the patch-free B=1 decode ring), else

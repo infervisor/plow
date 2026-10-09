@@ -56,10 +56,55 @@ pub(crate) fn apply_moe_prefill(
             {
                 groups[head] = Some(head);
                 groups[head + 1] = Some(head);
+                if let Some(comb) = insts.get(head + 2) {
+                    if is_prefill_tail(glu, down, comb) {
+                        groups[head + 2] = Some(head);
+                    }
+                }
+            }
+            if let [quant, down, comb] = insts.get(head + 1..head + 4).unwrap_or_default() {
+                if is_w8a8_prefill_chain(model, glu, quant, down, comb) {
+                    groups[head..head + 4].fill(Some(head));
+                }
             }
         }
         groups
     })
+}
+
+/// The W8A8 twin of the pair + combine: grouped e4m3 GLU, the QuantFp8 of its `fu`, the
+/// grouped e4m3 DOWN on that quant and the combine of its `part`. The route runs the GEMMs
+/// unscaled in cuBLASLt and the scales and the re-quantization in its glue. plowrt's
+/// `moe_lt::segments` checks the same operands.
+fn is_w8a8_prefill_chain(
+    model: &Model,
+    glu: &DevInst,
+    quant: &DevInst,
+    down: &DevInst,
+    comb: &DevInst,
+) -> bool {
+    glu.op == DevOp::MoeGroupGluGemmaPfW8a8 as u16
+        && quant.op == DevOp::QuantFp8 as u16
+        && down.op == DevOp::MoeGroupDownGemmaPfW8a8 as u16
+        && u32::from(glu.blocks) == model.n_cu
+        && down.blocks == glu.blocks
+        && [quant.t[1], quant.t[0], quant.t[2]] == [glu.t[0], down.t[1], down.t[7]]
+        && quant.i[1] == glu.i[0]
+        && [glu.t[2], glu.t[3], glu.t[6]] == [down.t[2], down.t[3], down.t[6]]
+        && [glu.i[0], glu.i[1], glu.i[2]] == [down.i[1], down.i[0], down.i[2]]
+        && glu.i[0] % 16 == 0
+        && glu.i[1] % 16 == 0
+        && is_prefill_tail(glu, down, comb)
+}
+
+/// The `MoeCombineNormGemmaPf` right after a routed prefill pair, which the route's glue runs
+/// from the down rows (`plow_moe_lt_combine_pf`): the pair's `part` at k = 8 and hidden <= 3072.
+/// plowrt's `moe_lt::prefill_tail` checks the same shape.
+fn is_prefill_tail(glu: &DevInst, down: &DevInst, comb: &DevInst) -> bool {
+    comb.op == DevOp::MoeCombineNormGemmaPf as u16
+        && comb.t[1] == down.t[0]
+        && [comb.i[0], comb.i[1]] == [glu.i[1], 8]
+        && glu.i[1] <= 12 * 256
 }
 
 /// The decode twin of [`apply_moe_prefill`]: one `MOE_DECODE_CUBLASLT` segment per layer on

@@ -74,10 +74,20 @@ fn tile_rows(max_rows: u32) -> u32 {
     crate::config::RuntimeConfig::get().nv.pf_attn_gemm_tile.clamp(1, max_rows.max(1))
 }
 
-/// The score scratch `load` allocates: one tile of every head at the widest KV pitch.
+/// KV columns the score scratch is sized for. A longer extent runs proportionally shorter tiles
+/// (`AttentionGemm::tile`) instead of growing the scratch with the context: f32 scores at a
+/// 262144 context would take 16 GiB.
+const SCRATCH_COLS: usize = 16384;
+
+/// The context the scratch holds whole tiles of.
+pub(super) fn scratch_ctx(max_ctx: usize) -> usize {
+    max_ctx.min(SCRATCH_COLS)
+}
+
+/// The score scratch `load` allocates: one tile of every head at the widest KV pitch it holds.
 pub(super) fn scratch_bytes(max_heads: u32, max_ctx: usize, max_rows: u32) -> u64 {
     let element = if crate::config::RuntimeConfig::get().nv.pf_attn_gemm_s32 { 4 } else { 2 };
-    let pitch = (max_ctx as u64).next_multiple_of(u64::from(PITCH));
+    let pitch = (scratch_ctx(max_ctx) as u64).next_multiple_of(u64::from(PITCH));
     u64::from(tile_rows(max_rows)) * u64::from(max_heads) * pitch * element
 }
 
@@ -447,6 +457,20 @@ impl AttentionGemm {
     /// `m` counts rows of one GEMM batch: every head's rows (one KV head, `group == 1`) or one
     /// query head's (a batch of `group` query heads).
     #[allow(clippy::too_many_arguments)]
+    /// Query rows of the next tile after `past` KV rows: the knob's tile, shortened while its
+    /// score rows would not fit the scratch.
+    fn tile(&self, heads: u32, past: u32, left: u32, element: u64) -> u32 {
+        let mut tile = self.tile_rows.min(left);
+        loop {
+            let pitch = (past + tile).next_multiple_of(8).next_multiple_of(PITCH);
+            let fit = self.scratch.len / (u64::from(heads) * u64::from(pitch) * element);
+            if u64::from(tile) <= fit || tile == 1 {
+                return tile;
+            }
+            tile = (fit as u32).max(1);
+        }
+    }
+
     fn plan(
         &mut self,
         kind: Gemm,
@@ -507,7 +531,7 @@ impl AttentionGemm {
             let v = site.v + u64::from(slot) * site.slot_bytes;
             let mut done = 0;
             while done < qlen {
-                let tile = self.tile_rows.min(qlen - done);
+                let tile = self.tile(site.heads, past + done, qlen - done, element);
                 let m = tile * site.heads;
                 // One GEMM batch: every head's rows, or one query head's of a KV head's group.
                 let (gm, batch) = if site.kv_heads == 1 { (m, 1) } else { (tile, group) };
@@ -624,7 +648,7 @@ impl AttentionGemm {
             }
             let mut done = 0;
             while done < qlen {
-                let tile = self.tile_rows.min(qlen - done);
+                let tile = self.tile(site.heads, past + done, qlen - done, element);
                 let m = tile * site.heads;
                 let n8 = (past + done + tile).next_multiple_of(8);
                 let pitch = n8.next_multiple_of(PITCH);
@@ -1170,6 +1194,8 @@ mod tests {
         assert_eq!(scratch_bytes(16, 16384, 4224), 1 << 30);
         // No request of a 1024-row bucket runs a longer tile.
         assert_eq!(scratch_bytes(16, 15000, 1024), 1024 * 16 * 15104 * 2);
+        // A longer context keeps the 16k scratch and runs shorter tiles.
+        assert_eq!(scratch_bytes(16, 262144, 4224), 1 << 30);
     }
 
     #[test]

@@ -618,6 +618,7 @@ if(PLOW_SM120_CUBIN OR PLOW_SM90A_CUBIN)
     # dequants at the smem stage (cp.async cannot convert fp8 inline), so PIPE=0 is
     # the legacy all-layer arm and PIPE=1 is the px4 fp8-mma arm FASTPF selects.
     set(_ax_fp8kv -DPLOW_FP8_KV=1)
+    set(_ax_routed_fp8kv ${_ax_routed} ${_ax_fp8kv})
     if(PLOW_FP8_KV_FASTPF)
         set(_ax_fp8kv_pf -DPLOW_FP8_KV=1 -DPLOW_NV_FA_PIPE=1)
     else()
@@ -669,6 +670,10 @@ if(PLOW_SM120_CUBIN OR PLOW_SM90A_CUBIN)
             string(LENGTH "${_vstem}_routed" _len_routed)
             list(APPEND _cubin_rows
                 "${_vstem}_routed|_Z${_len_routed}${_vstem}_routed11PlowProgram|_ax_decode|_ax_routed")
+            if(PLOW_SM120_CUBIN_FP8KV)
+                list(APPEND _cubin_rows
+                    "${_vstem}_routed_fp8kv|_Z${_len_routed}${_vstem}_routed11PlowProgram|_ax_decode|_ax_routed_fp8kv")
+            endif()
         endif()
         if(PLOW_CUBIN_SPEECH)
             string(LENGTH "${_vstem}_speech" _len_speech)

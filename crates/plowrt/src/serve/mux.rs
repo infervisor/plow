@@ -4780,10 +4780,16 @@ fn queue_pack_rows(rows: &[usize], chunk_cost: usize, bound: usize) -> usize {
 /// than running in the `spilled` bucket that holds both. A wide spill is a padded rung, not padded
 /// rows: 12B on H100 ran 1024 + riders in 1088 at 42.9 ms against 32.4 ms for 1024, and 4096 + 63
 /// in 4160 at 127.0 against 117.1 ms; the trimmed rows join the next launch. Below
-/// `pf_chunk_cost_rows()` a spill costs less than the tail launch a trim can leave.
+/// `pf_chunk_cost_rows()` a spill costs less than the tail launch a trim can leave. So does a
+/// narrow spill whose trimmed `rows` tail no other waiting row (`beyond`) would join: 26B at C4
+/// trimmed 1024 + 3 riders to 1021 rows (31.1 ms) and paid a lone 3-row tail launch (16 ms), where
+/// 1088 holds all of it in 32.6 ms.
 #[cfg(feature = "cuda")]
-fn trim_for_riders(bucket: usize, spilled: usize, decode_rows: usize) -> bool {
-    decode_rows > 0 && spilled > bucket && bucket >= pf_chunk_cost_rows()
+fn trim_for_riders(bucket: usize, spilled: usize, decode_rows: usize, rows: usize, beyond: usize) -> bool {
+    let cost = pf_chunk_cost_rows();
+    let tail = (rows + decode_rows).saturating_sub(bucket);
+    let lone_tail = tail + beyond < cost && spilled - bucket < cost;
+    decode_rows > 0 && spilled > bucket && bucket >= cost && !lone_tail
 }
 
 /// Prompt rows one model may consume while holding its device turn, when there
@@ -5295,7 +5301,13 @@ fn gpu_prefill_batched_pass(
         let bucket = e.pf_pack_budget(rows);
         // Under the unified token batch the decode rows ride in this launch, and the batch takes the
         // smallest bucket holding every row.
-        let trim = trim_for_riders(bucket, e.pf_pack_budget(rows.min(bucket) + decode_rows), decode_rows);
+        let trim = trim_for_riders(
+            bucket,
+            e.pf_pack_budget(rows.min(bucket) + decode_rows),
+            decode_rows,
+            rows,
+            avail - rows,
+        );
         let per_launch = if trim {
             bucket.saturating_sub(decode_rows).max(1)
         } else {
@@ -6664,12 +6676,14 @@ mod tests {
     #[cfg(feature = "cuda")]
     #[test]
     fn riders_trim_wide_launches_that_spill_a_rung() {
-        assert!(super::trim_for_riders(4096, 4160, 63));
-        assert!(super::trim_for_riders(1024, 1088, 1));
-        assert!(super::trim_for_riders(4224, 8192, 3));
-        assert!(!super::trim_for_riders(4096, 4096, 63), "riders fit the bucket");
-        assert!(!super::trim_for_riders(4096, 4160, 0));
-        assert!(!super::trim_for_riders(128, 256, 63), "a narrow spill beats a tail launch");
+        assert!(super::trim_for_riders(4096, 4160, 63, 4096, 4096));
+        assert!(super::trim_for_riders(1024, 1088, 1, 1024, 1024));
+        assert!(super::trim_for_riders(4224, 8192, 3, 4224, 0), "a wide spill costs more than a tail");
+        assert!(!super::trim_for_riders(4096, 4096, 63, 4000, 0), "riders fit the bucket");
+        assert!(!super::trim_for_riders(4096, 4160, 0, 4096, 0));
+        assert!(!super::trim_for_riders(128, 256, 63, 128, 0), "a narrow spill beats a tail launch");
+        assert!(!super::trim_for_riders(1024, 1088, 3, 1024, 0), "no waiting row would join the tail");
+        assert!(super::trim_for_riders(1024, 1088, 3, 1024, 600), "the tail joins waiting rows");
     }
 
     #[cfg(feature = "cuda")]

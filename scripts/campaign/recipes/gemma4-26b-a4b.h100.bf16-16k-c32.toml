@@ -1,0 +1,89 @@
+# Experimental: Gemma-4-26B-A4B-it BF16 weights, BF16 KV, 16K context, 32 decode slots, prefix cache
+# on, on one H100 SXM5 -- the 26B serving baseline for the 4K/15K/agentic16k strict cells. The
+# 12B serving stack (staged 4096-row request chunk, token batch, vendor-GEMM prefill attention from
+# 128-row requests) on the 26B MoE defaults (Lt grouped MoE prefill and decode >= 4 rows).
+# Slot count: BF16 weights 47 GiB; a staged slot keeps a 2048-row sliding ring = 400 MiB (25 layers x
+# 8 KV heads x 256 x K+V x 2 B), so 32 slots = 12.5 GiB of rings + VMM full-attention KV.
+schema = "plow.recipe.v1"
+namespace = "infervisor"
+name = "gemma-4-26b-a4b"
+label = "sm90a-h100-tp1-bf16-16k-c32"
+status = "emits"
+network = "gemma4"
+
+[target]
+vendor = "nvidia"
+isa = "sm_90a"
+sku = "H100 SXM5"
+units = 132
+num_gpus = 1
+parallel = "tp"
+max_ctx = 16384
+toolchain = "cuda-12.9"
+
+[checkpoint]
+source = "google/gemma-4-26B-A4B-it"
+layout = "hf"
+
+[cell]
+name = "gemma4-26b-a4b.h100.bf16-16k-c32"
+model = "google/gemma-4-26b-a4b-it"
+revision = "4d7ae4984b7db7de8f8457170b3f1a419ee76d52"
+hf_dir = "{env:HF26}"
+gpu = "H100 SXM5"
+arch = "sm_90a"
+n_cu = 132
+max_ctx = 16384
+precision = "bf16"
+
+[emit]
+args = ["--segmented"]
+[emit.env]
+PLOW_TMA_GEMM = "1"
+PLOW_FA_MMAQK = "3"
+PLOW_MAX_CHUNK = "4096"
+PLOW_MAX_REQUEST_CHUNK = "4096"
+PLOW_DECODE_BATCH_LADDER = "1,2,4,8,16,32"
+PLOW_PF_LADDER_APPEND = "256,1088,1152,2112,4160,4224"
+PLOW_FUSE_ARGMAX = "0"
+PLOW_GEMMA_MOE_ROUTER_EXACT = "0"
+
+[objects]
+script = "scripts/build_sm90a_gemma4_segments.sh"
+role_files = [
+  "interp_sm90a_pfattn_hd512.cubin",
+  "interp_sm90a_pfattn_hd256_gqa2_bkv32.cubin",
+  "interp_sm90a_pfattn_hd256_bkv32.cubin",
+  "gen_sm90a_attn_pf_hd256_sliding.cubin",
+]
+[objects.env]
+PLOW_BUILD_GEN_KERNELS = "attn_pf_hd256_sliding"
+PLOW_BUILD_FA_GQA2_PAIR = "1"
+PLOW_BUILD_PFATTN_HD256_BKV32 = "1"
+PLOW_BUILD_PFATTN_HD256_GQA2_BKV32 = "1"
+
+[emit_roles.env]
+PLOW_GEMMA4_SM90_HD256_GQA2_ROLE = "1"
+PLOW_GEMMA4_SM90_HD512_PX4_BQ64_ROLE = "0"
+PLOW_EMIT_GEN_KERNELS = "attn_pf_hd256_sliding"
+
+[serve.env]
+PLOW_PREFIX_CACHE = "1"
+PLOW_PF_INTERLEAVE = "0"
+PLOW_VMM_LIVE_RINGS = "0"
+PLOW_MULTISTEP = "0"
+PLOW_DECODE_MAX_RUNG = "32"
+PLOW_TOKEN_BATCH = "1"
+PLOW_PF_ATTN_GEMM_MIN_ROWS = "128"
+
+[bench]
+backend = "openai"
+in_lens = "128 1024 4096"
+concs = "1"
+nprompt = 32
+outlen = 128
+warmups = 2
+seed = 42
+tokenizer = "{env:HF26}"
+model_id = "gemma-4-26b-a4b-it"
+gate_prompt = "<bos><|turn>user\nWhat is the capital of France? Answer in one short sentence.<turn|>\n<|turn>model\n<|channel>thought\n<channel|>"

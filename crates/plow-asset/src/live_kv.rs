@@ -691,6 +691,13 @@ fn direct_operands(op: DevOp, d: &DevInst64, packet: &Packet<'_>) -> Result<()> 
                 | DevOp::MoeGroupGluGemmaPf
                 | DevOp::MoeGroupDownGemmaPf
                 | DevOp::MoeCombineNormGemmaPf
+                // FP8 twins: e4m3 activations (`xq8`/`fu8`) with f32 row scales
+                // (`ascale`/`fscale`), routing metadata and e4m3 expert weights + f32 channel
+                // scales (`ewt`/`est`). Same class: no KV pair, no generated tensor map.
+                | DevOp::MoeExpertGluGemmaFp8
+                | DevOp::MoeExpertDownGemmaFp8
+                | DevOp::MoeGroupGluGemmaPfW8a8
+                | DevOp::MoeGroupDownGemmaPfW8a8
         ),
         "opcode has no audited direct-operand access contract",
     )
