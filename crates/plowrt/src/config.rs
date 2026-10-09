@@ -927,6 +927,12 @@ pub struct NvidiaRuntimeConfig {
     #[arg(long = "vmm-live-rings", env = "PLOW_VMM_LIVE_RINGS", value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub vmm_live_rings: Option<bool>,
 
+    /// `--vmm-live-rings=true` for these served names only (`<name>[,...]`), over
+    /// `--vmm-live-rings`: a co-served packet with a VMM prefix layout allocates its sliding
+    /// rings per live slot while the others keep theirs.
+    #[arg(long = "vmm-live-rings-models", env = "PLOW_VMM_LIVE_RINGS_MODELS", global = true)]
+    pub vmm_live_rings_models: Option<String>,
+
     /// Track NV dense decode KV-split count from the LIVE `kv_len` instead of
     /// the `max_ctx` the emitter baked it from (NVIDIA twin of `PLOW_MLA_NS_LIVE`).
     #[arg(long = "nv-ns-live", env = "PLOW_NV_NS_LIVE", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
@@ -983,6 +989,11 @@ pub struct NvidiaRuntimeConfig {
     /// Cap the ModelManager VRAM budget (MiB).
     #[arg(long = "vram-budget-mib", env = "PLOW_VRAM_BUDGET_MIB", global = true)]
     pub vram_budget_mib: Option<u64>,
+
+    /// Keep every registered model resident: startup fails unless all of them fit, and no
+    /// model is ever evicted (no S1 switch, no eviction for another model's KV growth).
+    #[arg(long = "pin-resident", env = "PLOW_PIN_RESIDENT", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub pin_resident: bool,
 
     /// Per-decode-step host-op timing.
     #[arg(long = "step-time", env = "PLOW_STEP_TIME", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
@@ -1826,6 +1837,14 @@ pub struct AmdRuntimeConfig {
 /// Global runtime config, initialized once at startup from CLI parse.
 static RUNTIME_CONFIG: OnceLock<RuntimeConfig> = OnceLock::new();
 
+/// The OpenAI model id a bundle is served under (`weights.json` `served_name`), which the
+/// per-model knobs (`--live-ctx-models`, `--vmm-live-rings-models`) key on.
+fn served_name(assets_dir: &std::path::Path) -> Option<String> {
+    let bytes = std::fs::read(assets_dir.join("weights.json")).ok()?;
+    let v: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    Some(v.get("served_name")?.as_str()?.to_owned())
+}
+
 fn select_compat<T>(parsed: T, environment: Option<T>, allow_environment: bool) -> T {
     if allow_environment {
         environment.unwrap_or(parsed)
@@ -1900,6 +1919,21 @@ impl RuntimeConfig {
         )
     }
 
+    /// [`Self::nv_vmm_live_rings`] for the packet in `assets_dir`: `Some(true)` when its served
+    /// name is listed in `--vmm-live-rings-models`.
+    #[cfg(feature = "cuda")]
+    pub(crate) fn nv_vmm_live_rings_for(&self, assets_dir: &std::path::Path) -> Option<bool> {
+        let spec = self.nv.vmm_live_rings_models.clone().or_else(|| Self::env_nonempty("PLOW_VMM_LIVE_RINGS_MODELS"));
+        let listed = spec.is_some_and(|spec| {
+            served_name(assets_dir).is_some_and(|slug| spec.split(',').any(|m| m.trim() == slug))
+        });
+        if listed {
+            Some(true)
+        } else {
+            self.nv_vmm_live_rings()
+        }
+    }
+
     #[cfg(feature = "cuda")]
     pub(crate) fn nv_ns_live(&self) -> bool {
         select_compat(
@@ -1920,9 +1954,7 @@ impl RuntimeConfig {
     pub fn live_ctx_for(&self, assets_dir: &std::path::Path) -> Option<u32> {
         let spec = self.amd.live_ctx_models.clone().or_else(|| Self::env_nonempty("PLOW_LIVE_CTX_MODELS"));
         let per_model = spec.and_then(|spec| {
-            let bytes = std::fs::read(assets_dir.join("weights.json")).ok()?;
-            let v: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
-            let slug = v.get("served_name")?.as_str()?.to_owned();
+            let slug = served_name(assets_dir)?;
             spec.split(',').find_map(|kv| {
                 let (k, n) = kv.split_once('=')?;
                 (k.trim() == slug).then(|| n.trim().parse().ok()).flatten()
@@ -2676,6 +2708,34 @@ mod tests {
             super::NvidiaRuntimeConfig::from_arg_matches(&matches).unwrap().vmm_live_rings,
             Some(false)
         );
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn per_model_live_rings_and_pinned_residency() {
+        use clap::Parser;
+        #[derive(Parser)]
+        struct Cli {
+            #[command(flatten)]
+            cfg: super::RuntimeConfig,
+        }
+        let root = std::env::temp_dir().join(format!("plow-live-rings-models-{}", std::process::id()));
+        let (llm, tts) = (root.join("llm"), root.join("tts"));
+        for (dir, name) in [(&llm, "gemma-4-e4b"), (&tts, "chatterbox-mtl")] {
+            std::fs::create_dir_all(dir).unwrap();
+            std::fs::write(dir.join("weights.json"), format!(r#"{{"served_name": "{name}"}}"#)).unwrap();
+        }
+        let cfg = Cli::parse_from(["plowrt", "--vmm-live-rings-models", "qwen3-asr, gemma-4-e4b", "--vmm-live-rings=false"]).cfg;
+        assert_eq!(cfg.nv_vmm_live_rings_for(&llm), Some(true));
+        assert_eq!(cfg.nv_vmm_live_rings_for(&tts), Some(false), "an unlisted model keeps the global setting");
+        assert_eq!(cfg.nv_vmm_live_rings_for(&root.join("missing")), Some(false));
+        assert!(!cfg.nv.pin_resident);
+        let cfg = Cli::parse_from(["plowrt", "--pin-resident", "--live-ctx-models", "chatterbox-mtl=512"]).cfg;
+        assert!(cfg.nv.pin_resident);
+        assert_eq!(cfg.nv.vmm_live_rings_models, None);
+        assert_eq!(cfg.live_ctx_for(&tts), Some(512));
+        assert_eq!(cfg.live_ctx_for(&llm), cfg.live_ctx());
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]

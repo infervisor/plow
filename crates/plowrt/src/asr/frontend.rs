@@ -17,6 +17,14 @@ fn invalid(message: impl Into<String>) -> RuntimeError {
     RuntimeError::Rejected(message.into())
 }
 
+/// `f32::log10` links `log10f@GLIBC_2.43` when built on glibc >= 2.43, the only symbol that keeps
+/// the release binary off glibc 2.34-2.42 hosts (Ubuntu 22.04/24.04, RHEL 9). The f64 route links
+/// `log10@GLIBC_2.2.5`; rounded to f32 it is the correctly rounded value 2.43's `log10f` returns,
+/// short of a double-rounding tie.
+fn log10_f32(x: f32) -> f32 {
+    (x as f64).log10() as f32
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum AudioError {
     #[error("{0}")]
@@ -531,7 +539,7 @@ impl LogMelFrontend {
                     .map(|(filter, power)| filter * power)
                     .sum::<f32>();
                 let energy = if shaping.log_floor { energy.max(config.log_guard) } else { energy + config.log_guard };
-                *out = if shaping.log10 { energy.log10() } else { energy.ln() };
+                *out = if shaping.log10 { log10_f32(energy) } else { energy.ln() };
             }
         };
         // Frames are independent: a request's frontend spreads over the rayon pool (c1 latency).
@@ -700,7 +708,7 @@ impl QwenFrontend {
                     .zip(&power[range])
                     .map(|(a, b)| a * b)
                     .sum();
-                let value = energy.max(1e-10).log10();
+                let value = log10_f32(energy.max(1e-10));
                 values[m * frames + frame] = value;
                 maximum = maximum.max(value);
             }

@@ -69,6 +69,17 @@ use crate::{Result, RuntimeError};
 /// transient staging).
 pub const RESERVE: u64 = 256 << 20;
 
+/// The startup refusal under `--pin-resident` for a model the planner cannot fit.
+fn pinned_misfit(slug: &str, need: u64, free: u64) -> String {
+    format!(
+        "planner: {slug} needs {:.1} GiB and {:.1} GiB is left; --pin-resident keeps every model \
+         resident, so all of them must fit (narrow them with --live-ctx-models or \
+         --vmm-live-rings-models, or serve fewer models)",
+        gib(need),
+        gib(free)
+    )
+}
+
 /// Run a switch's blocking step on a thread of its own: the blocking pool can be saturated by
 /// the very request load that needs this switch to finish.
 async fn on_own_thread<T: Send + 'static>(name: &str, f: impl FnOnce() -> T + Send + 'static) -> Result<T> {
@@ -275,7 +286,7 @@ impl BlobPlan {
                     return Ok(plan);
                 }
                 let live_rings = crate::exec::gpu::live_rings_for_capacity(
-                    config.nv_vmm_live_rings(),
+                    config.nv_vmm_live_rings_for(dir),
                     true,
                     Some(geo.max_ctx),
                     Some(geo.batch),
@@ -310,19 +321,20 @@ impl BlobPlan {
                     + crate::memory::vmm::kv_pool_cap();
             } else if let Some(layout) = prefix_layout {
                 let geo = &layout.geo;
-                let block =
-                    geo.block_bytes(granularity, u64::from(config.vmm_block_mib()) << 20)?;
+                geo.block_bytes(granularity, u64::from(config.vmm_block_mib()) << 20)?;
                 let tracks = geo.full_layers.len() as u64 * 2;
-                let ring_bytes = match config.nv_vmm_live_rings() {
+                let ring_bytes = match config.nv_vmm_live_rings_for(dir) {
                     Some(true) => layout.slide_kv_bytes(&blob),
                     _ => 0,
                 };
                 let virtual_bytes = geo.full_tensor_bytes() * tracks + ring_bytes;
-                let resident = block * u64::from(geo.batch) * u64::from(geo.kvh_full) * tracks;
+                // Prefix slots start unmapped (`VmmKv::new`) and map on admission against the KV
+                // budget; at load only the block pool's precreated columns commit, inside
+                // `kv_pool_cap`. Charging a block per slot and head (4 GiB on Gemma-4 E4B, which
+                // measures 3.6 GiB under that plan) kept E4B from fitting beside ASR and TTS.
                 plan.kv_bytes = plan.kv_bytes.checked_sub(virtual_bytes).ok_or_else(|| {
                     RuntimeError::Rejected("prefix KV plan tensor classification".into())
-                })? + resident
-                    + crate::memory::vmm::kv_pool_cap();
+                })? + crate::memory::vmm::kv_pool_cap();
             }
         }
         Ok(plan)
@@ -687,6 +699,9 @@ impl ModelManager {
 
     /// Least-recently-used resident model other than `target`, idle ones first.
     fn lru_victim(&self, target: &str) -> Option<String> {
+        if crate::config::RuntimeConfig::get().nv.pin_resident {
+            return None;
+        }
         let victims: Vec<String> = self
             .models
             .read()
@@ -714,7 +729,7 @@ impl ModelManager {
     /// skipped while a switch holds the lock (that switch changes residency anyway).
     pub fn request_growth(self: &Arc<Self>, slug: &str) {
         use std::sync::atomic::Ordering;
-        if self.growing.swap(true, Ordering::AcqRel) {
+        if crate::config::RuntimeConfig::get().nv.pin_resident || self.growing.swap(true, Ordering::AcqRel) {
             return;
         }
         let Some(runtime) = self.runtime.clone() else {
@@ -813,10 +828,14 @@ impl ModelManager {
     /// fit (no eviction — earlier models win). At least one model must load.
     pub async fn load_initial(&self) -> Result<()> {
         let mut loaded = 0usize;
+        let pinned = crate::config::RuntimeConfig::get().nv.pin_resident;
         for m in self.models.read().clone() {
             let need = self.required(&m.slug).expect("managed") + RESERVE;
             let free = self.fit_capacity(0)?;
             if free < need {
+                if pinned {
+                    return Err(RuntimeError::Msg(pinned_misfit(&m.slug, need, free)));
+                }
                 tracing::info!(
                     slug = %m.slug,
                     need_gib = gib(need),

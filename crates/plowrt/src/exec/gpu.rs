@@ -4273,7 +4273,7 @@ impl GpuEngine {
                         live = false;
                     }
                 }
-                let configured_rings = config.nv_vmm_live_rings();
+                let configured_rings = config.nv_vmm_live_rings_for(assets_dir);
                 let rings = live_rings_for_capacity(
                     configured_rings,
                     live,

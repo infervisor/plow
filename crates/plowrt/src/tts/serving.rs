@@ -128,6 +128,13 @@ pub fn bind(state: &AppState, slug: &str) -> Result<(), String> {
     bound.map_err(|e| format!("{slug}: speech pipeline failed to bind: {e}"))
 }
 
+/// `slug` has a bound speech pipeline (a TTS model): its catalogue card lists `audio/speech`.
+pub fn serves_speech(state: &AppState, slug: &str) -> bool {
+    let Ok(bundle) = state.registry.get(slug) else { return false };
+    guided_models().lock().iter().any(|((dir, _), g)| *dir == bundle.dir && g.is_some())
+        || speech_models().lock().iter().any(|((dir, _), m)| *dir == bundle.dir && m.is_some())
+}
+
 enum Pipeline {
     Guided(Arc<super::guided_speech::GuidedSpeech>),
     Speech(Arc<SpeechModel>),

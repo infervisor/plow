@@ -23,8 +23,12 @@ fn card(state: &AppState, id: String, canonical: &str) -> ModelCard {
     let is_alias = id != canonical;
     let mut x_plow_endpoints = vec!["chat/completions", "completions"];
     #[cfg(feature = "cuda")]
-    if crate::asr::serving::serves_audio(state, canonical) {
-        x_plow_endpoints.extend(["audio/transcriptions", "audio/transcriptions/stream"]);
+    if crate::tts::serving::serves_speech(state, canonical) {
+        // A speech LM's tokens are codec / speech ids: it serves audio, not text.
+        x_plow_endpoints = vec!["audio/speech"];
+    } else if crate::asr::serving::serves_audio(state, canonical) {
+        // An audio LM's prompt contract needs audio: transcription only, as a packet ASR card.
+        x_plow_endpoints = vec!["audio/transcriptions", "audio/transcriptions/stream"];
     }
     ModelCard {
         x_plow_endpoints,
