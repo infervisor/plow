@@ -1,16 +1,20 @@
-//! Energy endpointing of a 16 kHz stream into utterance segments, for continuous WebSocket
-//! sessions. Only the open segment (or a short lead-in) stays buffered.
+//! Endpointing of a 16 kHz stream into utterance segments, for continuous WebSocket sessions:
+//! by energy, or by a Silero VAD packet's speech probability. Only the open segment (or a short
+//! lead-in) stays buffered.
 
 use std::collections::VecDeque;
+use std::sync::Arc;
 
-/// 20 ms analysis frame.
+use crate::asr::vad::{Vad, VadStream};
+
+/// 20 ms energy analysis frame.
 pub const FRAME: usize = 320;
-/// Speech must last this many frames (100 ms) to open a segment.
-const ONSET_FRAMES: usize = 5;
+/// Speech must last this long (100 ms) to open a segment.
+const ONSET: usize = 1_600;
 /// Context kept before the onset and after the last speech frame (200 ms).
 const CONTEXT: usize = 3_200;
-/// Frames searched (backwards, 3 s) for the quietest cut point of an overlong segment.
-const CUT_FRAMES: usize = 150;
+/// Searched (backwards, 3 s) for the quietest cut point of an overlong segment.
+const CUT: usize = 48_000;
 /// The noise floor is the quietest frame over this many frames (3 s): stationary noise sets it,
 /// speech pauses are too short to.
 const FLOOR_FRAMES: usize = 150;
@@ -38,11 +42,21 @@ struct Open {
     start: u64,
     last_speech_end: u64,
     silence: usize,
-    /// (frame start, rms) of the last `CUT_FRAMES` frames.
+    /// (frame start, rms or speech probability) of the last `cut_frames` frames.
     recent: VecDeque<(u64, f32)>,
 }
 
+enum Detector {
+    Energy { levels: VecDeque<f32> },
+    /// Silero's hysteresis: speech from `threshold`, silence below `threshold - 0.15`.
+    Silero { vad: Arc<Vad>, stream: VadStream, threshold: f32, speaking: bool },
+}
+
 pub struct Endpointer {
+    detector: Detector,
+    frame: usize,
+    onset_frames: usize,
+    cut_frames: usize,
     min_silence: usize,
     max_segment: u64,
     buf: Vec<f32>,
@@ -50,7 +64,6 @@ pub struct Endpointer {
     base: u64,
     /// Stream offset of the first sample not yet analysed.
     scanned: u64,
-    levels: VecDeque<f32>,
     run: usize,
     open: Option<Open>,
     next_index: u64,
@@ -58,13 +71,27 @@ pub struct Endpointer {
 
 impl Endpointer {
     pub fn new(config: EndpointConfig) -> Self {
+        Self::with_detector(config, Detector::Energy { levels: VecDeque::with_capacity(FLOOR_FRAMES) }, FRAME)
+    }
+
+    /// Speech is a Silero frame at or above `threshold` (Realtime `server_vad.threshold`).
+    pub fn with_vad(config: EndpointConfig, vad: Arc<Vad>, threshold: f32) -> Self {
+        let frame = vad.frame;
+        let stream = vad.open();
+        Self::with_detector(config, Detector::Silero { vad, stream, threshold, speaking: false }, frame)
+    }
+
+    fn with_detector(config: EndpointConfig, detector: Detector, frame: usize) -> Self {
         Self {
-            min_silence: (config.min_silence_ms as usize * 16).div_ceil(FRAME),
+            detector,
+            frame,
+            onset_frames: ONSET.div_ceil(frame),
+            cut_frames: CUT / frame,
+            min_silence: (config.min_silence_ms as usize * 16).div_ceil(frame),
             max_segment: u64::from(config.max_segment_ms) * 16,
             buf: Vec::new(),
             base: 0,
             scanned: 0,
-            levels: VecDeque::with_capacity(FLOOR_FRAMES),
             run: 0,
             open: None,
             next_index: 0,
@@ -75,18 +102,17 @@ impl Endpointer {
     pub fn push(&mut self, samples: &[f32]) -> Vec<Segment> {
         self.buf.extend_from_slice(samples);
         let mut done = Vec::new();
-        while self.scanned + FRAME as u64 <= self.end() {
+        while self.scanned + self.frame as u64 <= self.end() {
             let at = (self.scanned - self.base) as usize;
-            let frame = &self.buf[at..at + FRAME];
-            let rms = (frame.iter().map(|x| x * x).sum::<f32>() / FRAME as f32).sqrt();
-            if let Some(segment) = self.frame(self.scanned, rms) {
+            let (score, speech) = self.classify(at);
+            if let Some(segment) = self.frame(self.scanned, score, speech) {
                 done.push(segment);
             }
-            self.scanned += FRAME as u64;
+            self.scanned += self.frame as u64;
         }
         let keep = match &self.open {
             Some(open) => open.start,
-            None => self.scanned.saturating_sub((ONSET_FRAMES * FRAME + CONTEXT + FRAME) as u64),
+            None => self.scanned.saturating_sub(((self.onset_frames + 1) * self.frame + CONTEXT) as u64),
         };
         if keep > self.base {
             self.buf.drain(..(keep - self.base) as usize);
@@ -111,31 +137,50 @@ impl Endpointer {
         self.base + self.buf.len() as u64
     }
 
-    fn frame(&mut self, at: u64, rms: f32) -> Option<Segment> {
-        if self.levels.len() == FLOOR_FRAMES {
-            self.levels.pop_front();
+    /// The frame at `buf[at..]`: its cut score (lower is quieter) and whether it is speech.
+    fn classify(&mut self, at: usize) -> (f32, bool) {
+        let frame = &self.buf[at..at + self.frame];
+        match &mut self.detector {
+            Detector::Energy { levels } => {
+                let rms = (frame.iter().map(|x| x * x).sum::<f32>() / frame.len() as f32).sqrt();
+                if levels.len() == FLOOR_FRAMES {
+                    levels.pop_front();
+                }
+                levels.push_back(rms);
+                let floor = levels.iter().copied().fold(f32::INFINITY, f32::min);
+                (rms, rms > (floor * MARGIN).max(MIN_LEVEL))
+            }
+            Detector::Silero { vad, stream, threshold, speaking } => {
+                let p = vad.step(stream, frame);
+                if p >= *threshold {
+                    *speaking = true;
+                } else if p < (*threshold - 0.15).max(0.01) {
+                    *speaking = false;
+                }
+                (p, *speaking)
+            }
         }
-        self.levels.push_back(rms);
-        let floor = self.levels.iter().copied().fold(f32::INFINITY, f32::min);
-        let speech = rms > (floor * MARGIN).max(MIN_LEVEL);
-        let frame_end = at + FRAME as u64;
+    }
+
+    fn frame(&mut self, at: u64, score: f32, speech: bool) -> Option<Segment> {
+        let frame_end = at + self.frame as u64;
         let Some(open) = &mut self.open else {
             self.run = if speech { self.run + 1 } else { 0 };
-            if self.run >= ONSET_FRAMES {
-                let onset = frame_end - (self.run * FRAME) as u64;
+            if self.run >= self.onset_frames {
+                let onset = frame_end - (self.run * self.frame) as u64;
                 let start = onset.saturating_sub(CONTEXT as u64).max(self.base);
-                let mut recent = VecDeque::with_capacity(CUT_FRAMES);
-                recent.push_back((at, rms));
+                let mut recent = VecDeque::with_capacity(self.cut_frames);
+                recent.push_back((at, score));
                 self.open = Some(Open { index: self.next_index, start, last_speech_end: frame_end, silence: 0, recent });
                 self.next_index += 1;
                 self.run = 0;
             }
             return None;
         };
-        if open.recent.len() == CUT_FRAMES {
+        if open.recent.len() == self.cut_frames {
             open.recent.pop_front();
         }
-        open.recent.push_back((at, rms));
+        open.recent.push_back((at, score));
         if speech {
             open.silence = 0;
             open.last_speech_end = frame_end;
@@ -156,8 +201,8 @@ impl Endpointer {
                 .copied()
                 .filter(|&(t, _)| t > open.start)
                 .min_by(|a, b| a.1.total_cmp(&b.1))
-                .unwrap_or((at, rms));
-            let cut = quiet + FRAME as u64 / 2;
+                .unwrap_or((at, score));
+            let cut = quiet + self.frame as u64 / 2;
             let (index, start) = (open.index, open.start);
             open.index = self.next_index;
             open.start = cut;
@@ -247,6 +292,22 @@ mod tests {
         let a: Vec<_> = feed(&mut Endpointer::new(CONFIG), &audio, 160).into_iter().map(|s| (s.start, s.end)).collect();
         let b: Vec<_> = feed(&mut Endpointer::new(CONFIG), &audio, 48_000).into_iter().map(|s| (s.start, s.end)).collect();
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn silero_segments_follow_its_speech_frames() {
+        let dir = std::path::Path::new("/home/ssm-user/models/silero-vad-v5");
+        let Ok(vad) = Vad::load(&dir.join("silero_vad.pkt")) else { return };
+        let vad = Arc::new(vad);
+        let reference: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.join("reference.json")).unwrap()).unwrap();
+        let signal: Vec<f32> = reference["signal"].as_array().unwrap().iter().map(|v| v.as_f64().unwrap() as f32).collect();
+        let speech: Vec<usize> = vad.probabilities(&signal).iter().enumerate().filter(|(_, &p)| p >= 0.5).map(|(f, _)| f * 512).collect();
+        let segments = feed(&mut Endpointer::with_vad(CONFIG, vad.clone(), 0.5), &signal, 1_000);
+        assert_eq!(segments.len(), 1);
+        let (first, last) = (speech[0] as u64, *speech.last().unwrap() as u64 + 512);
+        assert_eq!(segments[0].start, first - CONTEXT as u64);
+        assert!(segments[0].end >= last && segments[0].end <= last + CONTEXT as u64 + 512);
+        assert!(feed(&mut Endpointer::with_vad(CONFIG, vad, 0.5), &silence(5.0), 4_000).is_empty());
     }
 
     #[test]

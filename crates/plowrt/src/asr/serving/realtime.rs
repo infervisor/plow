@@ -75,8 +75,9 @@ fn alaw(byte: u8) -> i16 {
     (if a & 0x80 != 0 { magnitude } else { -magnitude }) as i16
 }
 
-/// `server_vad` settings. Only `silence_duration_ms` drives the endpointer; `threshold` and
-/// `prefix_padding_ms` are accepted and echoed (its margin and 200 ms context are fixed).
+/// `server_vad` settings. `silence_duration_ms` ends a turn; `threshold` is the Silero speech
+/// probability when a VAD packet is loaded (the energy endpointer's margin is fixed);
+/// `prefix_padding_ms` is accepted and echoed (the 200 ms context is fixed).
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct Vad {
     threshold: f64,
@@ -145,6 +146,9 @@ impl Config {
                         prefix_padding_ms: turn["prefix_padding_ms"].as_u64().map_or(current.prefix_padding_ms, |v| v as u32),
                         silence_duration_ms: turn["silence_duration_ms"].as_u64().map_or(current.silence_duration_ms, |v| v as u32),
                     };
+                    if !(0.0..=1.0).contains(&vad.threshold) {
+                        return Err(("session.turn_detection.threshold", "must be 0..=1".into()));
+                    }
                     if !(200..=2000).contains(&vad.silence_duration_ms) {
                         return Err(("session.turn_detection.silence_duration_ms", "must be 200..=2000".into()));
                     }
@@ -250,7 +254,7 @@ async fn session(state: Arc<AsrServer>, mut socket: WebSocket, ids: RequestIds, 
     let mut resampler = Resampler::new(config.format.rate()).expect("a listed format rate");
     let new_endpointer = |vad: Option<Vad>, finalization: Option<&FinalizationPolicy>| {
         let cap_ms = (MAX_SAMPLES.saturating_sub(finalization.map_or(0, |f| f.final_padding_samples)) / 16) as u32;
-        vad.map(|v| Endpointer::new(EndpointConfig { min_silence_ms: v.silence_duration_ms, max_segment_ms: cap_ms.min(25_000) }))
+        vad.map(|v| state.endpointer(EndpointConfig { min_silence_ms: v.silence_duration_ms, max_segment_ms: cap_ms.min(25_000) }, v.threshold as f32))
     };
     let mut endpointer = new_endpointer(config.vad, route.as_ref().map(|r| &r.2));
     // 16 kHz samples fed since the session (or the last clear) and before the current endpointer.

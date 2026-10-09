@@ -2336,6 +2336,7 @@ __device__ __forceinline__ void sp_with_act(unsigned kind, float p1, const B& bo
     case 13: body([p1](float x, float p0) { return fminf(fmaxf(x, p0), p1); }); break;
     case 14: body([p1](float x, float p0) { return __fadd_rn(__fmul_rn(x, p0), p1); }); break;
     case 15: body([](float x, float) { return x > 0.0f ? x : 0.0f; }); break;
+    case 16: body([](float x, float) { return sqrtf(x); }); break;
     default: body([](float x, float) { return x; }); break;
     }
 }
@@ -2356,6 +2357,7 @@ __device__ __forceinline__ float sp_act(unsigned kind, float x, float p0, float 
     case 13: return fminf(fmaxf(x, p0), p1);
     case 14: return __fadd_rn(__fmul_rn(x, p0), p1);
     case 15: return x > 0.0f ? x : 0.0f;
+    case 16: return sqrtf(x);
     default: return x;
     }
 }

@@ -9,6 +9,7 @@ pub mod audio_lm;
 pub mod rnnt;
 pub mod serving;
 pub mod subsampling;
+pub mod vad;
 
 use std::path::Path;
 

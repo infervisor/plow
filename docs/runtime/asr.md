@@ -242,8 +242,9 @@ Auth: the usual key headers, or the browser subprotocol `openai-insecure-api-key
   default; `silence_duration_ms` 200..=2000, default 500) the continuous-mode endpointer cuts
   turns: `input_audio_buffer.speech_started` {`audio_start_ms`, `item_id`},
   `.speech_stopped` {`audio_end_ms`, `item_id`}, `.committed` {`item_id`, `previous_item_id`}.
-  `threshold` and `prefix_padding_ms` are echoed but fixed (12 dB over the noise floor, 200 ms
-  of context). With `turn_detection: null` audio accumulates (at most 30 s) until
+  `threshold` (0..=1) is the Silero speech probability when a VAD packet is loaded (see
+  [Voice activity](#voice-activity-silero-vad)), else fixed (12 dB over the noise floor);
+  `prefix_padding_ms` is echoed but fixed (200 ms of context). With `turn_detection: null` audio accumulates (at most 30 s) until
   `input_audio_buffer.commit` (at least 100 ms, else `input_audio_buffer_commit_empty`);
   `input_audio_buffer.clear` drops it (`.cleared`). A commit under VAD closes the open turn.
 - Each committed item streams `conversation.item.input_audio_transcription.delta`
@@ -255,6 +256,30 @@ Auth: the usual key headers, or the browser subprotocol `openai-insecure-api-key
   and close 1001), 120 s without client events or pending work closes the session, pings as on
   the native stream, shutdown sends `error` (`unavailable`) and close 1001. Not implemented:
   responses/conversation events, `semantic_vad`, noise reduction, `include` (logprobs), usage.
+
+## Voice activity (Silero VAD)
+
+`--asr-vad-packet PATH` (`PLOW_ASR_VAD_PACKET`) loads a `vad.silero.v1` packet built by
+`scripts/asr/silero_vad_build.sh`: Silero VAD v5 (16 kHz) lowered by `devgen::vad` into two
+LSTM-state-bank programs of generic ops (`Conv1dF32` STFT with reflect pad, magnitude via
+`BinaryF32`/`CopyColsF32`/`UnaryF32` sqrt, four ReLU convolutions, `DenseGemmF32` +
+`LstmCellF32`, sigmoid decoder). It runs on the CPU in `asr::vad`: a Rust interpreter of those
+programs over a per-stream arena, weights shared, any number of streams on any threads. Per
+32 ms frame: 66 us on one EPYC 7R13 core (AVX2/FMA chosen at runtime); probabilities match the
+PyTorch model to 6e-7. A configured packet that does not load fails startup.
+
+- `POST /v1/audio/vad` (multipart `file`: WAV, 8-48 kHz, up to 10 minutes; optional `threshold`,
+  `min_speech_duration_ms`, `min_silence_duration_ms`, `speech_pad_ms`, `max_speech_duration_s`
+  with Silero's `get_speech_timestamps` defaults) answers
+  `{"duration", "speech_duration", "segments": [{"start", "end"}]}` in seconds. 404 without a
+  packet.
+- Uploads (`/v1/audio/transcriptions`, not `append`/`final` pieces) with under 250 ms of
+  detected speech are answered with an empty transcript before any model runs: an audio-LM
+  otherwise transcribes noise or echoes its prompt.
+- Continuous WebSocket sessions and Realtime `server_vad` end turns on Silero speech (hysteresis
+  `threshold` / `threshold - 0.15`) instead of the energy endpointer; turn timing
+  (`min_silence_ms` / `silence_duration_ms`, 200 ms context, overlong cuts at the least-speech
+  frame) is unchanged.
 
 ## Reference checks
 
