@@ -11990,6 +11990,22 @@ impl GpuEngine {
         self.be.synchronize()
     }
 
+    /// [`Self::write_tensor`] in the engine's stream order: retires before this returns and before
+    /// any later launch, without the context-wide synchronize (an encoder on another stream of
+    /// the device keeps running).
+    pub fn write_tensor_ordered(&mut self, name: &str, offset: u64, src: &[u8]) -> Result<()> {
+        let i = self.handle_of(name).ok_or_else(|| {
+            RuntimeError::Rejected(format!("no tensor named {name:?} in the blob"))
+        })?;
+        if offset.checked_add(src.len() as u64).is_none_or(|end| end > self.devp[i].len) {
+            return Err(RuntimeError::Rejected(format!("write_tensor_ordered {name}: range exceeds the tensor")));
+        }
+        // SAFETY: the range is inside the allocation (checked above) and `src` outlives the
+        // stream synchronize below.
+        unsafe { self.be.memcpy_htod_async(self.devp[i].base + offset, src, &self.stream)? };
+        self.be.stream_synchronize(&self.stream)
+    }
+
     /// Byte size of a named tensor's device allocation.
     pub fn tensor_bytes(&self, name: &str) -> Option<u64> {
         self.handle_of(name).map(|i| self.devp[i].len)

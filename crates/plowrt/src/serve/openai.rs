@@ -429,6 +429,29 @@ impl Message {
     pub fn has_image(&self) -> bool {
         self.content.as_ref().is_some_and(Content::has_image)
     }
+
+    /// Whether this message carries an image or audio part.
+    pub fn has_media(&self) -> bool {
+        self.content.as_ref().is_some_and(Content::has_media)
+    }
+
+    /// The content as the chat template sees it: the text, or, when the message carries media,
+    /// its parts with each image as `{"type": "image"}` and each audio clip as `{"type": "audio"}`
+    /// (the template renders the model's placeholder for each, in order).
+    pub fn template_content(&self) -> serde_json::Value {
+        match &self.content {
+            Some(c @ Content::Parts(parts)) if c.has_media() => serde_json::Value::Array(
+                parts
+                    .iter()
+                    .map(|p| match p.media_kind() {
+                        Some(kind) => serde_json::json!({ "type": kind }),
+                        None => serde_json::json!({ "type": "text", "text": p.text().unwrap_or_default() }),
+                    })
+                    .collect(),
+            ),
+            _ => serde_json::Value::String(self.text()),
+        }
+    }
 }
 
 /// Message content: a plain string or multimodal parts (`text` / `image_url`).
@@ -446,10 +469,7 @@ impl Content {
             Content::Text(s) => s.clone(),
             Content::Parts(parts) => parts
                 .iter()
-                .filter_map(|p| match p {
-                    ContentPart::Text { text } => Some(text.as_str()),
-                    _ => None,
-                })
+                .filter_map(ContentPart::text)
                 .collect::<Vec<_>>()
                 .join(""),
         }
@@ -457,16 +477,52 @@ impl Content {
 
     /// Whether any part is an image (routes through the vision stage).
     pub fn has_image(&self) -> bool {
-        matches!(self, Content::Parts(parts)
-            if parts.iter().any(|p| matches!(p, ContentPart::ImageUrl { .. })))
+        matches!(self, Content::Parts(parts) if parts.iter().any(|p| p.media_kind() == Some("image")))
+    }
+
+    /// Whether any part is an image or audio clip.
+    pub fn has_media(&self) -> bool {
+        matches!(self, Content::Parts(parts) if parts.iter().any(|p| p.media_kind().is_some()))
     }
 }
 
+/// A chat content part. Images: Chat Completions `image_url` (`{"url": ...}`) and Responses
+/// `input_image` (`"image_url": "..."`); audio: `input_audio` (`{"data": base64, "format"}`) and
+/// `audio_url` (`{"url": ...}`).
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ContentPart {
     Text { text: String },
+    InputText { text: String },
     ImageUrl { image_url: ImageUrl },
+    InputImage { image_url: String },
+    InputAudio { input_audio: InputAudio },
+    AudioUrl { audio_url: ImageUrl },
+}
+
+impl ContentPart {
+    pub fn text(&self) -> Option<&str> {
+        match self {
+            ContentPart::Text { text } | ContentPart::InputText { text } => Some(text),
+            _ => None,
+        }
+    }
+
+    /// `image` / `audio` for a media part.
+    pub fn media_kind(&self) -> Option<&'static str> {
+        match self {
+            ContentPart::ImageUrl { .. } | ContentPart::InputImage { .. } => Some("image"),
+            ContentPart::InputAudio { .. } | ContentPart::AudioUrl { .. } => Some("audio"),
+            ContentPart::Text { .. } | ContentPart::InputText { .. } => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct InputAudio {
+    pub data: String,
+    #[serde(default)]
+    pub format: Option<String>,
 }
 
 #[cfg(test)]
@@ -580,6 +636,7 @@ mod tests {
             ContentPart::ImageUrl {
                 image_url: ImageUrl {
                     url: "image".into(),
+                    detail: None,
                 },
             },
             ContentPart::Text {
@@ -593,6 +650,8 @@ mod tests {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ImageUrl {
     pub url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
 }
 
 // --- responses ---
@@ -748,6 +807,9 @@ pub struct ModelList {
 #[derive(Clone, Debug, Serialize)]
 pub struct ModelCard {
     pub x_plow_endpoints: Vec<&'static str>,
+    /// Chat input modalities: `text`, plus `image` / `audio` when the packet carries encoders.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub x_plow_modalities: Vec<String>,
     pub id: String,
     pub object: &'static str,
     pub created: u64,
@@ -836,6 +898,7 @@ mod image_refusal_tests {
             ContentPart::ImageUrl {
                 image_url: ImageUrl {
                     url: "data:image/png;base64,AAAA".into(),
+                    detail: None,
                 },
             },
             ContentPart::Text {

@@ -706,6 +706,7 @@ pub mod packed_prefill;
 pub mod kv_shared_tail;
 
 pub mod packet_pipeline;
+pub mod multimodal;
 pub mod serve_manifest;
 
 pub mod hetero;

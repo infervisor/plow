@@ -23,7 +23,8 @@ fn outputs(d: &DevInst64) -> Result<&'static [usize], String> {
         | RelativeAttentionF32 | SiluF32 | DenseGemmF32 | EmbedF16F32 | ArgmaxF32 | ReluF32
         | BroadcastAddF32 | Conv2dF32 | PackNcfwRowsF32 | GroupedAttentionF32 | EmbedOverlayBf16
         | GemmF32 | GatherRowsF32 | CopyColsF32 | Conv1dF32 | ConvTranspose1dF32 | UnaryF32
-        | BinaryF32 | CumSumF64 | RandF32 | AttentionF32 | RowStatsF32 => 2,
+        | BinaryF32 | CumSumF64 | RandF32 | AttentionF32 | RowStatsF32 | RmsNormF32 | RopeAxialF32 => 2,
+        ChunkAttentionF32 => 5,
         LstmCellF32 => 3,
         _ => return Err(format!("unaudited logical effects for {op:?}")),
     };
@@ -47,7 +48,8 @@ fn outputs(d: &DevInst64) -> Result<&'static [usize], String> {
         | RelativeAttentionF32 | SiluF32 | DenseGemmF32 | EmbedF16F32 | ArgmaxF32 | ReluF32
         | BroadcastAddF32 | Conv2dF32 | PackNcfwRowsF32 | GroupedAttentionF32 | EmbedOverlayBf16
         | GemmF32 | GatherRowsF32 | CopyColsF32 | Conv1dF32 | ConvTranspose1dF32 | UnaryF32
-        | BinaryF32 | CumSumF64 | RandF32 | AttentionF32 | RowStatsF32 => Ok(&[0]),
+        | BinaryF32 | CumSumF64 | RandF32 | AttentionF32 | RowStatsF32 | RmsNormF32 | RopeAxialF32
+        | ChunkAttentionF32 => Ok(&[0]),
         op => Err(format!("unaudited logical effects for {op:?}")),
     }
 }

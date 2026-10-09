@@ -1452,6 +1452,11 @@ enum {
      * t0=out t1=gate t2=up  i0=rows i1=width i2=col0 i3=stride i4=act (0 gelu_tanh, 1 silu).
      * Gemma-4 E-series per-layer input gate where op 155 has no arm (CUDA). */
     PLOW_DOP_GLU_STRIDED = 205,
+    /* Multimodal encoders and LM soft-token injection; contracts in packet::dev::DevOp. */
+    PLOW_DOP_RMSNORM_F32 = 206,
+    PLOW_DOP_ROPE_AXIAL_F32 = 207,
+    PLOW_DOP_CHUNK_ATTENTION_F32 = 208,
+    PLOW_DOP_MM_ROWS_BF16 = 209,
 
     PLOW_DOP__COUNT
 };

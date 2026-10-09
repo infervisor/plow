@@ -216,6 +216,52 @@ carries in `serve.json`.
   `created`; request ids are seeded per process instead of starting at zero; CUDA reads the
   same stop-id sources as the AMD and CPU engines.
 
+## 2c. Images and audio (`PLOW_EMIT_MULTIMODAL=1` packets)
+
+A packet built with `PLOW_EMIT_MULTIMODAL=1` carries one encoder sidecar per tower in the
+checkpoint (`mm_vision.pkt`, `mm_audio.pkt`). Each is a `forward.v1` pipeline `mm.encode` with a
+rung ladder: `PLOW_EMIT_MM_VISION_LADDER` (images per launch, default `1,2`) and
+`PLOW_EMIT_MM_AUDIO_LADDER` (log-mel frames, default `400,1000,2000,3000`). `model.pkt` also gets
+a `plow.multimodal.v1` section (placeholder ids, processor parameters, slab size). plowrt reads
+only that metadata. It has no per-model code, so adding a model means emitting its towers.
+
+- **Request parts.**
+  - `image_url` and `input_image` accept `data:` URLs only. `http(s)` URLs get 400; the server has
+    no fetcher.
+  - `input_audio` accepts `format: "wav"` (any rate, resampled; channels mixed to mono). Other
+    formats get 400.
+  - Text-only requests render the template exactly as before.
+- **Unsupported.** A model without a matching tower answers 400
+  `unsupported content type for this model: <kind>`.
+- **Discovery.** `/v1/models` cards carry `x_plow_modalities` (`["text","image","audio"]`).
+- **Preprocessing** runs on the CPU from the contract's parameters. Images get an
+  aspect-preserving resize (Pillow bicubic, fixed point), then patches. Audio becomes a
+  semicausal log-mel spectrogram. The template's placeholder expands to
+  `begin + n × soft-token + end`, with n computed the way the HF processor computes it.
+- **Injection.** Each soft token is a prompt id with bit 31 set, holding a 31-bit content hash of
+  (kind, media bytes, row). The LM's `Embed` maps those ids to the pad row. `MmRowsBf16` then
+  replaces each of those rows with the encoder's projected row, which a per-engine slab holds
+  (`in.mm_slab` plus the hash table `in.mm_table`).
+  - Rows are reserved at submit, staged before the launch and released when the job ends. A full
+    slab answers 503.
+  - Because the ids hash the media, the prefix cache and session keys see different images as
+    different prompts. Token-batch, mixed-step and the VMM prefix cache all keep working.
+- **Limits.** These answer 400: `PLOW_MM_MAX_IMAGES` (8), `PLOW_MM_MAX_AUDIO` (4),
+  `PLOW_MM_MAX_IMAGE_PIXELS` (40M) and `PLOW_MM_MAX_AUDIO_SECONDS` (30).
+- **Streaming, logprobs and tools** are unchanged: media only changes prompt ids.
+- **Per model (Gemma 4).**
+
+  | model | image | audio |
+  |---|---|---|
+  | E4B | yes: gemma4_vision tower | yes: USM conformer |
+  | 12B | not emitted | yes: encoder-free 640-sample frames → `embed_audio` |
+  | 26B-A4B, 31B | not emitted | none in the checkpoint |
+
+  - Vision is skipped (with a logged reason) on every checkpoint whose text config sets
+    `use_bidirectional_attention: "vision"`. Those LMs attend bidirectionally within each image on
+    their sliding layers, and the LM attention kernels are causal-only.
+  - 26B/31B vision also needs head_dim 72 in the tower's attention, which supports only 64 and 128.
+
 ## 3. Refusing to serve from the CPU by accident
 
 plowrt warned and continued when a bundle's target GPU had no matching driver, then served it

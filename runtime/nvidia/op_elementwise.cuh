@@ -19,9 +19,11 @@
  * makes EMBED read a null pointer. */
 static __device__ void d_embed(__nv_bfloat16* __restrict__ out, const __nv_bfloat16* __restrict__ table,
                         const int* __restrict__ ids, unsigned ntok, unsigned hidden, float scale,
-                        unsigned slice, unsigned nblk) {
+                        unsigned slice, unsigned nblk, unsigned pad = 0) {
     for (unsigned t = slice; t < ntok; t += nblk) {
-        const size_t src = (size_t)ids[t] * hidden, dst = (size_t)t * hidden;
+        /* A multimodal row id (bit 31, MmRowsBf16) embeds as the pad token. */
+        const int id = ids[t] < 0 ? (int)pad : ids[t];
+        const size_t src = (size_t)id * hidden, dst = (size_t)t * hidden;
         if ((hidden & 7u) == 0) {
             for (unsigned i = threadIdx.x * 8; i < hidden; i += PLOW_NV_THREADS * 8) {
                 const bf16v8 v = ld_glob8(table + src + i);
@@ -35,6 +37,31 @@ static __device__ void d_embed(__nv_bfloat16* __restrict__ out, const __nv_bfloa
             for (unsigned i = threadIdx.x; i < hidden; i += PLOW_NV_THREADS)
                 out[dst + i] = __float2bfloat16(__bfloat162float(table[src + i]) * scale);
         }
+    }
+}
+
+/* MmRowsBf16 (op 209): a row whose id has bit 31 set is replaced by its slab row, found in the
+ * open-addressed `table` of (id, slab row) pairs (`cap` a power of two, id 0 = empty). A missing
+ * id leaves the row as embedded. */
+static __device__ void d_mm_rows(__nv_bfloat16* __restrict__ out, const unsigned* __restrict__ ids,
+                                 const unsigned* __restrict__ table, const __nv_bfloat16* __restrict__ slab,
+                                 unsigned rows, unsigned width, unsigned cap, unsigned slab_rows,
+                                 unsigned slice, unsigned nblk) {
+    for (unsigned r = slice; r < rows; r += nblk) {
+        const unsigned id = ids[r];
+        if (!(id & 0x80000000u)) continue;
+        unsigned h = id & (cap - 1u), row = 0xFFFFFFFFu;
+        for (unsigned n = 0; n < cap; n++, h = (h + 1u) & (cap - 1u)) {
+            const unsigned key = table[2u * h];
+            if (key == id) {
+                row = table[2u * h + 1u];
+                break;
+            }
+            if (key == 0u) break;
+        }
+        if (row >= slab_rows) continue;
+        const __nv_bfloat16* src = slab + (size_t)row * width;
+        for (unsigned i = threadIdx.x; i < width; i += PLOW_NV_THREADS) out[(size_t)r * width + i] = src[i];
     }
 }
 

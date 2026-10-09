@@ -138,7 +138,7 @@ const DOC: &[S] = &[
     S { op: DevOp::HeadNormRope, t: &["out", "x", "gamma?", "cos?", "sin?", "pos"], i: &["ntok", "nhead", "hd", "out_row0", "flags", "pair_mode", "n_batch_kv"], f: &["eps"], j: &["out_stride", "kv_mask"] },
     S { op: DevOp::Residual, t: &["out", "a", "b", "pre?"], i: &["n"], f: &["scale"], j: &[] },
     S { op: DevOp::Glu, t: &["out", "gate", "up"], i: &["n", "act"], f: &["alpha", "limit"], j: &[] },
-    S { op: DevOp::Embed, t: &["out", "table", "ids"], i: &["ntok", "hidden"], f: &["scale"], j: &[] },
+    S { op: DevOp::Embed, t: &["out", "table", "ids"], i: &["ntok", "hidden", "pad"], f: &["scale"], j: &[] },
     S { op: DevOp::SoftCap, t: &["out", "x"], i: &["n"], f: &["cap"], j: &[] },
     S { op: DevOp::Gemm, t: &["C", "A", "B", "", "", "", "", "bias?"], i: &["M", "N", "K"], f: &[], j: &[] },
     S { op: DevOp::Gemv, t: &["C", "x", "W", "rms?", "gamma?", "", "", "bias?"], i: &["M", "N", "K", "norm"], f: &["eps"], j: &[] },
@@ -323,6 +323,10 @@ const DOC: &[S] = &[
     S { op: DevOp::AttentionF32, t: &["out", "query", "key", "value", "key_lengths?", "bias?", "prefix?", "prefix_index?"], i: &["batch", "q_rows", "kv_rows", "heads", "head_width", "in_stride", "flags", "bias_head_stride"], f: &["scale"], j: &["k_col0", "v_col0"] },
     S { op: DevOp::GluStrided, t: &["out", "gate", "up"], i: &["rows", "width", "col0", "stride", "act"], f: &[], j: &[] },
     S { op: DevOp::RowStatsF32, t: &["out", "x"], i: &["rows", "feat", "flags"], f: &["eps"], j: &[] },
+    S { op: DevOp::RmsNormF32, t: &["out", "x", "gamma?"], i: &["rows", "groups", "group_width", "stride", "flags", "group_stride"], f: &["eps"], j: &[] },
+    S { op: DevOp::RopeAxialF32, t: &["x", "pos"], i: &["rows", "heads", "head_width", "stride", "axes", "head_stride", "flags"], f: &["theta"], j: &[] },
+    S { op: DevOp::ChunkAttentionF32, t: &["out", "q", "k", "v", "rel_k", "qscale?", "valid?"], i: &["rows", "heads", "head_width", "chunk", "past", "future", "positions", "left"], f: &["kscale", "cap"], j: &[] },
+    S { op: DevOp::MmRowsBf16, t: &["x", "ids", "table", "slab"], i: &["rows", "width", "cap", "slab_rows"], f: &[], j: &[] },
 ];
 
 /// Ops that say "As [`DevOp::X`]" / "twin of [`DevOp::X`]" / "Same operands as

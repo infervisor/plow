@@ -357,6 +357,7 @@ impl SharedAsr {
                 continuing: false,
                 speech: Some(Box::new(SpeechJob { overlay, overlay_pos, pos_base: None, cfg: None, first_tokens: 0 })),
                 prefix: None,
+                mm: None,
             },
         };
         // Released once the job is on the channel: the dispatcher drains it, not closes on it.

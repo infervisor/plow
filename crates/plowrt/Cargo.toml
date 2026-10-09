@@ -62,6 +62,10 @@ futures = "0.3"
 base64 = "0.22"
 hound = "3.5"
 rustfft = "6"
+# Chat image parts (OpenAI `image_url` / `input_image` data URLs): decode PNG/JPEG/WebP/GIF to RGB.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif"] }
+# Content hashes of multimodal inputs: soft-token row ids, so prefix-cache keys tell media apart.
+sha2 = "0.10"
 # Ids the server mints (request, session, turn; `serve::session`): sortable 64-bit, tagged; W3C
 # traceparent parsing and span ids. Not `monotonic`: minted session ids must not be guessable.
 svid = { version = "0.6.0", default-features = false, features = ["bits-high-rand"] }
@@ -353,4 +357,9 @@ required-features = ["cuda"]
 [[example]]
 name = "t3_check"
 path = "examples/t3_check.rs"
+required-features = ["cuda"]
+
+[[example]]
+name = "mm_check"
+path = "examples/mm_check.rs"
 required-features = ["cuda"]

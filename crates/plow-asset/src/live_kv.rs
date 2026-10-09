@@ -656,6 +656,7 @@ fn direct_operands(op: DevOp, d: &DevInst64, packet: &Packet<'_>) -> Result<()> 
                 // learned position at a per-slot base. Neither names a cache or a generated map.
                 | DevOp::EmbedOverlayBf16
                 | DevOp::EmbedPosBf16
+                | DevOp::MmRowsBf16
                 | DevOp::Argmax
                 | DevOp::ArgmaxFin
                 | DevOp::SoftCap
