@@ -342,6 +342,10 @@ name = "asr_silero_vad_compile"
 path = "examples/asr/silero_vad_compile.rs"
 
 [[example]]
+name = "asr_endpoint_replay"
+path = "examples/asr/endpoint_replay.rs"
+
+[[example]]
 name = "step_bench"
 path = "examples/step_bench.rs"
 required-features = ["cuda"]

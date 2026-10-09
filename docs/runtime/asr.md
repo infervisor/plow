@@ -239,7 +239,7 @@ Auth: the usual key headers, or the browser subprotocol `openai-insecure-api-key
   answered by `transcription_session.updated` (`session.updated`). An unknown model fails the
   update (`model_not_found`). Audio needs a model, from `?model=` or the update.
 - `input_audio_buffer.append` {`audio`: base64}. With `turn_detection: {type: "server_vad"}` (the
-  default; `silence_duration_ms` 200..=2000, default 500) the continuous-mode endpointer cuts
+  default; `silence_duration_ms` 200..=2000, default 300) the continuous-mode endpointer cuts
   turns: `input_audio_buffer.speech_started` {`audio_start_ms`, `item_id`},
   `.speech_stopped` {`audio_end_ms`, `item_id`}, `.committed` {`item_id`, `previous_item_id`}.
   `threshold` (0..=1) is the Silero speech probability when a VAD packet is loaded (see
@@ -276,10 +276,13 @@ PyTorch model to 6e-7. A configured packet that does not load fails startup.
 - Uploads (`/v1/audio/transcriptions`, not `append`/`final` pieces) with under 250 ms of
   detected speech are answered with an empty transcript before any model runs: an audio-LM
   otherwise transcribes noise or echoes its prompt.
-- Continuous WebSocket sessions and Realtime `server_vad` end turns on Silero speech (hysteresis
-  `threshold` / `threshold - 0.15`) instead of the energy endpointer; turn timing
-  (`min_silence_ms` / `silence_duration_ms`, 200 ms context, overlong cuts at the least-speech
-  frame) is unchanged.
+- Continuous WebSocket sessions and Realtime `server_vad` decide speech with Silero (hysteresis
+  `threshold` / `threshold - 0.15`) instead of the energy endpointer. Where speech ends is timed by
+  energy in 8 ms slices (only confident frames time a turn too quiet for energy): Silero's
+  probability decays about 60 ms after the voice stops. On the customer calls turns close 520/540 ms
+  (p50/p95) after the voice at a 500 ms silence, against 500/500 for energy and 580/640 when Silero
+  timed the end itself. Turn timing (`min_silence_ms` / `silence_duration_ms`, 200 ms context,
+  overlong cuts at the least-speech frame) is otherwise unchanged.
 
 ## Transcript output policy
 
