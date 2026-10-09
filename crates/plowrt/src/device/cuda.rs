@@ -41,6 +41,7 @@ use crate::{DeviceErrorInfo, Result, RuntimeError};
 
 pub(crate) mod cutlass_fp8;
 pub(crate) mod lt;
+pub use lt::library as cublaslt_library;
 pub(crate) mod qwen_gdn;
 
 // Driver ABI types (bindgen-equivalent, transcribed from cuda.h).

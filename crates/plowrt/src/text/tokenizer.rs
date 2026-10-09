@@ -71,9 +71,18 @@ impl Tokenize for ByteTokenizer {
 /// fallback. Never fails — a missing/broken tokenizer degrades to bytes with a
 /// warning, so serving still works.
 pub fn load_tokenizer(dir: &Path) -> Arc<dyn Tokenize> {
+    load_tokenizer_with(dir, &dir.join("checkpoint"))
+}
+
+/// [`load_tokenizer`] for a bundle whose HF files live in `checkpoint` (see
+/// `asset::serve::checkpoint_dir`): `dir` first, then `checkpoint`.
+pub fn load_tokenizer_with(dir: &Path, checkpoint: &Path) -> Arc<dyn Tokenize> {
     #[cfg(feature = "hf-tokenizer")]
     {
-        let path = dir.join("tokenizer.json");
+        let path = [dir.join("tokenizer.json"), checkpoint.join("tokenizer.json")]
+            .into_iter()
+            .find(|p| p.exists())
+            .unwrap_or_else(|| dir.join("tokenizer.json"));
         if path.exists() {
             match HfTokenizer::from_file(&path) {
                 Ok(t) => {
@@ -85,16 +94,16 @@ pub fn load_tokenizer(dir: &Path) -> Arc<dyn Tokenize> {
                 }
             }
         }
-        for base in [dir.to_path_buf(), dir.join("checkpoint")] {
+        for base in [dir, checkpoint] {
             if base.join("vocab.json").is_file() && base.join("merges.txt").is_file() {
-                match HfTokenizer::from_qwen2_files(&base) {
+                match HfTokenizer::from_qwen2_files(base) {
                     Ok(t) => return Arc::new(t),
                     Err(e) => tracing::warn!(error = %e, "Qwen2 tokenizer failed to load"),
                 }
             }
         }
     }
-    let _ = dir;
+    let _ = (dir, checkpoint);
     Arc::new(ByteTokenizer)
 }
 

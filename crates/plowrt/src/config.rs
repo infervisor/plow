@@ -39,13 +39,15 @@ impl std::fmt::Debug for ApiKey {
     }
 }
 
-/// `--asr-packet NAME=PATH.pkt[,tokenizer=PATH][,backend=NAME]`: a packet ASR model (Nemotron
-/// RNNT, or a Qwen audio-LM packet) served by `plowrt serve` on its own cohort engine.
+/// `--asr-packet NAME=PATH.pkt[,tokenizer=PATH|,checkpoint=PATH][,backend=NAME]`: a packet ASR
+/// model (Nemotron RNNT, or a Qwen audio-LM packet) served by `plowrt serve` on its own cohort
+/// engine. `checkpoint=` names the HF directory an audio-LM packet reads its tokenizer and chat
+/// template from, `tokenizer=` a tokenizer file (Nemotron's GGUF); both set the same input.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AsrPacket {
     pub name: String,
     pub packet: std::path::PathBuf,
-    /// The tokenizer (a GGUF for Nemotron); default `<packet dir>/checkpoint`.
+    /// The tokenizer (a GGUF for Nemotron) or HF checkpoint dir; default `<packet dir>/checkpoint`.
     pub tokenizer: std::path::PathBuf,
     pub backend: String,
 }
@@ -58,7 +60,10 @@ fn asr_packet_specs_parse() {
         ("nemo", Some("/m/nemo.pkt"), Some("/m/t.gguf"), "cuda"));
     let p: AsrPacket = "q=/a/model.pkt,backend=cpu".parse().unwrap();
     assert_eq!((p.tokenizer.to_str(), p.backend.as_str()), (Some("/a/checkpoint"), "cpu"));
-    for bad in ["", "nemo", "=/x.pkt", "n=", "n=/x.pkt,tok=/y", "n=/x.pkt,tokenizer="] {
+    let p: AsrPacket = "q=/a/model.pkt,checkpoint=/hf/qwen3-asr".parse().unwrap();
+    assert_eq!(p.tokenizer.to_str(), Some("/hf/qwen3-asr"));
+    for bad in ["", "nemo", "=/x.pkt", "n=", "n=/x.pkt,tok=/y", "n=/x.pkt,tokenizer=", "n=/x.pkt,checkpoint=",
+        "n=/x.pkt,tokenizer=/a,checkpoint=/b"] {
         assert!(bad.parse::<AsrPacket>().is_err(), "{bad}");
     }
 }
@@ -66,7 +71,9 @@ fn asr_packet_specs_parse() {
 impl std::str::FromStr for AsrPacket {
     type Err = String;
     fn from_str(s: &str) -> Result<Self, String> {
-        let usage = || format!("--asr-packet {s:?}: expected NAME=PATH.pkt[,tokenizer=PATH][,backend=NAME]");
+        let usage = || {
+            format!("--asr-packet {s:?}: expected NAME=PATH.pkt[,tokenizer=PATH|,checkpoint=PATH][,backend=NAME]")
+        };
         let mut fields = s.trim().split(',');
         let (name, packet) = fields.next().and_then(|f| f.split_once('=')).ok_or_else(usage)?;
         if name.is_empty() || packet.is_empty() {
@@ -74,10 +81,14 @@ impl std::str::FromStr for AsrPacket {
         }
         let packet = std::path::PathBuf::from(packet);
         let mut tokenizer = packet.parent().unwrap_or(std::path::Path::new(".")).join("checkpoint");
+        let mut named = false;
         let mut backend = "cuda".to_owned();
         for field in fields {
             match field.split_once('=') {
-                Some(("tokenizer", path)) if !path.is_empty() => tokenizer = path.into(),
+                Some(("tokenizer" | "checkpoint", path)) if !path.is_empty() && !named => {
+                    tokenizer = path.into();
+                    named = true;
+                }
                 Some(("backend", name)) if !name.is_empty() => backend = name.to_owned(),
                 _ => return Err(usage()),
             }

@@ -14,9 +14,7 @@
 * **Veena** speaks long input as consecutive segments of whole sentences (no length issue). Its
   first audio arrives after ~81 ms at c1, by design: the first chunk is sized so the next one does
   not underrun.
-* **Orpheus is experimental** and only under `experimental/`: some seeds fall into repetition
-  loops ("Bye-bye. Bye-bye. ..."; 3 of 12 renders in a probe, 7 of 80 gate clips with CER > 0.3).
-  Its sampling profile lacks the repetition penalty upstream uses. Not for production.
+* **Orpheus is not shipped** (removed in kit4).
 * **Not every bundle fits at once.** All seven production bundles need ~107 GiB even with narrowed
   contexts. Profiles are fixed sets that fit, and `--pin-resident` refuses one that does not. Use
   one instance per GPU for more models (`CUDA_VISIBLE_DEVICES`, separate configs and ports).

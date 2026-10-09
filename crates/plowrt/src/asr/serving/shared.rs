@@ -131,7 +131,7 @@ impl SharedAsr {
     }
 
     fn load(slug: &str, dir: &Path, max_context: usize, batch: usize, device: u8) -> Result<Self> {
-        let checkpoint = dir.join("checkpoint");
+        let checkpoint = crate::asset::serve::checkpoint_dir(dir);
         let checkpoint = if checkpoint.is_dir() { checkpoint } else { dir.to_path_buf() };
         let prompt = AudioLmPrompt::load(&dir.join("model.pkt"), &checkpoint)?;
         let encoder_path =

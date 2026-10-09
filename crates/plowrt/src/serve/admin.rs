@@ -296,6 +296,13 @@ async fn load_inner(state: Arc<AppState>, mut req: LoadRequest) -> Response {
                 }
             }
             if newly_registered {
+                // The pairing is recorded first so the bundle's pin check and every HF-file read
+                // at load see the requested checkpoint.
+                if let Some(c) = &req.checkpoint {
+                    if let Err(e) = crate::asset::serve::set_checkpoint(&dir, std::path::Path::new(c)) {
+                        return err(StatusCode::CONFLICT, e);
+                    }
+                }
                 if let Err(e) = state.registry.load(&dir, Some(req.model.clone())) {
                     return err(StatusCode::BAD_REQUEST, e);
                 }
@@ -304,7 +311,7 @@ async fn load_inner(state: Arc<AppState>, mut req: LoadRequest) -> Response {
                 .checkpoint
                 .as_ref()
                 .map(PathBuf::from)
-                .unwrap_or_else(|| dir.join("checkpoint"));
+                .unwrap_or_else(|| crate::asset::serve::checkpoint_dir(&dir));
             if let Err(e) = mgr.register(&req.model, dir, ckpt) {
                 if newly_registered {
                     let _ = state.registry.unload(&req.model);

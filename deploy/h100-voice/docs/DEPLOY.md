@@ -10,7 +10,7 @@ by the server. Every path the scripts use is relative to the kit directory.
 | | requirement | checked by `hostcheck` |
 |---|---|---|
 | GPU | NVIDIA H100 80GB (SXM5 or PCIe HBM3, sm_90a); the packets are compiled for 132 SMs | yes |
-| Driver | NVIDIA driver >= 575 recommended; tested 595.91.07. 525.60-574 run under CUDA 12 minor-version compatibility (untested) | yes |
+| Driver | NVIDIA driver >= 580 (CUDA 13: the shipped cuBLAS 13.4 needs it); tested 595.91.07 | yes |
 | OS | x86_64 Linux with glibc >= 2.34: Ubuntu 22.04 / 24.04 / 26.04, Debian 12+, RHEL / Rocky / Alma 9+ | yes |
 | CPU RAM | >= 64 GB (checkpoints are memory-mapped and page-cached; the voice profiles touch ~22 GB) | yes |
 | Disk | ~46 GB for the kit, plus the same again for the installed copy | yes |
@@ -19,8 +19,13 @@ by the server. Every path the scripts use is relative to the kit directory.
 
 The GPU must be otherwise idle: a voice profile keeps ~65-75 GB of the 80 GB resident.
 `libcuda.so.1` comes from the driver; set `LIBCUDA=/path/to/libcuda.so.1` in the config if it is not
-on the default loader path. `plowrt/libcublasLt.so.12` (CUDA 12.9) ships beside the binary and is
-loaded from there; keep the two files in the same directory.
+on the default loader path. `plowrt/libcublasLt.so.13` (cuBLAS 13.4) ships beside the binary and is
+loaded from there; keep the two files in the same directory. That one runtime serves every model of
+the kit, including `gemma-4-26b-a4b-it-fp8` (docs/serving-deploy-runtime.md in the plow repo).
+
+Model bundles (`models/<name>/`) hold the compiled assets; their HF checkpoints live once under
+`hf/`, paired per model by `deploy/checkpoints.map`. `plowrt` checks each checkpoint against the
+weight pins in the packet at startup and refuses a mismatch.
 
 ## 2. Check, install, start
 
@@ -78,6 +83,7 @@ calling shell cannot change its behaviour; everything comes from the config and 
 | `CUDA_VISIBLE_DEVICES` | empty | GPU index or UUID on a multi-GPU host |
 | `LIBCUDA` | empty | path to `libcuda.so.1` when it is not on the loader path |
 | `MODELS`, `LIVE_CTX` | empty | override the profile's model list / per-model context bounds |
+| `CHECKPOINTS` | empty | `name=dir,...`: override a model's HF checkpoint dir (default `deploy/checkpoints.map`) |
 | `EXTRA_ARGS` | empty | extra `plowrt serve` flags |
 
 ## 4. Profiles: what stays resident on the GPU
@@ -92,7 +98,7 @@ swapping. Measured on one H100 80GB (driver 595.91.07):
 | `voice-veena` | Silero VAD, qwen3-asr, veena, gemma-4-e4b | 67.1 / 76.5 GiB | 34 s | Indic + English voices (Veena) instead of Chatterbox; ~16-30 calls |
 | `asr` | Silero VAD, nemotron-3.5-asr, qwen3-asr, qwen3-asr-0.6b | see below | | transcription only, full context |
 | `single-<model>` | one model at its full packet context (ASR ones with Silero VAD) | 37-43 GiB | 14-41 s | the BASELINE.md single-model configuration |
-| `experimental-orpheus` | orpheus | ~37 GiB | | EXPERIMENTAL (KNOWN_ISSUES.md) |
+| `gemma-26b-fp8` | gemma-4-26b-a4b-it-fp8 alone, 131072-token context | ~75 GiB | ~1-2 min | chat, completions and tool calls; replaces the voice stack on the GPU |
 
 How the voice profiles fit, and what each setting costs:
 
