@@ -456,6 +456,8 @@ pub const RUNTIME: &[KnobSpec] = &[
     KnobSpec::new("rt.asr_request_timeout_ms", Some("PLOW_ASR_REQUEST_TIMEOUT_MS"), Layer::Runtime, USIZE, Default::Static(Val::Nat(120_000)), OPT_IN),
     KnobSpec::new("rt.asr_context_max_tokens", Some("PLOW_ASR_CONTEXT_MAX_TOKENS"), Layer::Runtime, USIZE, Default::Static(Val::Nat(0)), OPT_IN),
     KnobSpec::new("rt.api_keys", Some("PLOW_API_KEYS"), Layer::Runtime, Domain::Str, UNSET, OPT_IN),
+    KnobSpec::new("rt.asr_numerals", Some("PLOW_ASR_NUMERALS"), Layer::Runtime, Domain::Bool, ON, OPT_IN),
+    KnobSpec::new("rt.asr_auto_languages", Some("PLOW_ASR_AUTO_LANGUAGES"), Layer::Runtime, Domain::Str, Default::Static(Val::Str("English,Spanish")), OPT_IN),
     KnobSpec::new("rt.asr_vad_packet", Some("PLOW_ASR_VAD_PACKET"), Layer::Runtime, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("rt.asr_packets", Some("PLOW_ASR_PACKETS"), Layer::Runtime, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("rt.session_ttl_ms", Some("PLOW_SESSION_TTL_MS"), Layer::Runtime, USIZE, Default::Static(Val::Nat(60_000)), OPT_IN),
