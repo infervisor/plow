@@ -7,11 +7,13 @@ boundary. `layer_ref` re-implements the layer standalone; it must match HF's cap
 BF16 mode (BF16 weights, activations rounded to BF16 at every GEMV input, BF16 KV, FP32 accumulation) gives the
 error bar a BF16 kernel is held to. Files: raw little-endian, listed in manifest.txt as `name dtype d0 d1 ...`.
 
-Models without per-layer input and KV sharing (12B / 26B-A4B / 31B) load layers 0..<layer> only. tp = S > 1 writes S
+Models without per-layer input and KV sharing (12B / 26B-A4B / 31B) load layers 0..<layer> only. tp = S > 1 (S:r: rank r only) writes S
 tensor-parallel socket slices `<outdir>.tp<S>r<r>` instead of <outdir>: whole q heads with their KV heads (a KV head
 shared by several ranks is replicated), a block of FFN rows, o / down split by K. Their `ref.o` / `ref.down` are the
 rank's partial sums; `o_rest` / `down_rest` hold the other ranks' share, which the stage adds where the cross-socket
-all-reduce lands."""
+all-reduce lands. MoE layers (26B-A4B), tp = moe:G[:g|:head]: `<outdir>.head` holds attention, dense FFN and router
+(`moe_rest` = every expert's weighted sum, which the expert sockets return) and `<outdir>.ex<G>g<g>` expert group g of
+G: its experts, the decode token's h1 and routing, and `ref.moe` = the group's partial weighted sum."""
 import glob, json, os, sys
 import numpy as np
 import torch
@@ -19,7 +21,8 @@ import torch.nn.functional as F
 
 hf, L, ctx, out = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), sys.argv[4]
 off = int(sys.argv[6]) if len(sys.argv) > 6 else 0  # tokens of text skipped: distinct sequences for batch rows
-TP = int(sys.argv[7]) if len(sys.argv) > 7 else 1
+TPS = sys.argv[7].split(":") if len(sys.argv) > 7 else ["1"]  # "S" (every rank), "S:r" (rank r only) or "moe:G[:g|:head]"
+TP = 1 if TPS[0] == "moe" else int(TPS[0])
 torch.set_grad_enabled(False)
 
 from transformers import AutoConfig, AutoTokenizer, AutoModelForImageTextToText
@@ -189,7 +192,8 @@ def layer_ref(bf16):
             gu = r(b["xn3"]) @ W["experts.gate_up_proj"][e].T
             a = F.gelu(gu[:I2], approximate="tanh") * gu[I2:]
             b[f"eact{j}"] = a
-            moe += (r(a) @ W["experts.down_proj"][e].T) * wk[j]
+            b[f"ey{j}"] = r(a) @ W["experts.down_proj"][e].T
+            moe += b[f"ey{j}"] * wk[j]
         b["moe"] = moe
         ffn = rms(b["down"], W["post_feedforward_layernorm_1.weight"]) + rms(moe, W["post_feedforward_layernorm_2.weight"])
     h2 = h1 + rms(ffn, W["post_feedforward_layernorm.weight"])
@@ -244,11 +248,13 @@ def rank_slice(r):
                 kv1=k1)
 
 
-def slice_weights(s):
+def slice_weights(s, experts=True):
     q0, q1 = s["q"]; v0, v1 = s["kv"]; f0, f1 = s["f"]
     ws = {}
     for k, v in layer.state_dict().items():
         if not ((k.endswith("weight") and v.dim() >= 1) or k.startswith(("experts.", "router."))):
+            continue
+        if not experts and k.startswith("experts."):
             continue
         if k.endswith(("q_proj.weight",)):
             v = v[q0:q1]
@@ -281,7 +287,7 @@ def slice_refs(b, s, bf16):
     return o
 
 
-def write(d, s, rank):
+def write(d, s, rank, experts=True, weights=True):
     os.makedirs(d, exist_ok=True)
     man = []
 
@@ -291,7 +297,7 @@ def write(d, s, rank):
         raw.tofile(f"{d}/{name}.{dt}")
         man.append(f"{name} {dt} " + " ".join(str(x) for x in a.shape))
 
-    for k, v in slice_weights(s).items():
+    for k, v in (slice_weights(s, experts) if weights else {}).items():
         dump("w." + k, v, "bf16")
     dump("layer_scalar", W["layer_scalar"].reshape(1), "f32")
     dump("x_in", cap["x_in"].reshape(-1), "f32")
@@ -320,11 +326,75 @@ def write(d, s, rank):
     return meta
 
 
+def write_head(d):
+    """MoE head socket: attention, dense FFN, router; the experts' weighted sum arrives as moe_rest."""
+    m = write(d, full_slice(), None, experts=False, weights=not off)
+    raw = f32["moe"].detach().contiguous().float().numpy()
+    raw.tofile(f"{d}/moe_rest.f32")
+    open(f"{d}/manifest.txt", "a").write(f"moe_rest f32 {raw.shape[0]}\n")
+    m["stage"] = "head"
+    json.dump(m, open(f"{d}/meta.json", "w"), indent=1)
+    return m
+
+
+def write_experts(d, G, g):
+    """Expert group g of G: experts [e0, e1), the token's h1 and routing, the group's partial weighted sum."""
+    n = W["experts.gate_up_proj"].shape[0]
+    e0, e1 = g * n // G, (g + 1) * n // G
+    os.makedirs(d, exist_ok=True)
+    man = []
+
+    def dump(name, t, dt):
+        a = t.detach().contiguous()
+        raw = a.to(torch.bfloat16).view(torch.int16).numpy() if dt == "bf16" else a.float().numpy()
+        raw.tofile(f"{d}/{name}.{dt}")
+        man.append(f"{name} {dt} " + " ".join(str(x) for x in a.shape))
+
+    sd = layer.state_dict()
+    if not off:  # batch-row dumps (text offset > 0) carry inputs and references only; weights come from row 0
+        dump("w.experts.gate_up_proj", sd["experts.gate_up_proj"][e0:e1], "bf16")
+        dump("w.experts.down_proj", sd["experts.down_proj"][e0:e1], "bf16")
+        dump("w.pre_feedforward_layernorm_2.weight", sd["pre_feedforward_layernorm_2.weight"], "bf16")
+    idx = cap["router_idx"].reshape(-1)
+    mine = [j for j, e in enumerate(idx.tolist()) if e0 <= e < e1]
+    dump("h1", f32["h1"], "f32")
+    dump("router_idx", idx.float(), "f32")
+    dump("router_w", f32["rw"], "f32")
+    part = lambda b: sum((b[f"ey{j}"] * b["rw"][j] for j in mine), torch.zeros(cfg.hidden_size))
+    eact = lambda b: torch.cat([b[f"eact{j}"] for j in mine]) if mine else torch.zeros(0)
+    fr = {"xn3": f32["xn3"], "moe": part(f32), "eact": eact(f32), "out": part(f32)}  # out: what leaves the socket
+    br = {"xn3": bf["xn3"], "moe": part(bf), "eact": eact(bf), "out": part(bf)}
+    for k, v in fr.items():
+        dump("ref." + k, v, "f32")
+    open(f"{d}/manifest.txt", "w").write("\n".join(man) + "\n")
+    meta = dict(hf=hf, layer=L, ctx=ctx, offset=off, layer_type=cfg.layer_types[L], stage="experts", hidden=cfg.hidden_size,
+                eps=eps, moe=True, experts=e1 - e0, e0=e0, moe_inter=int(W["experts.down_proj"].shape[2]),
+                top_k=int(idx.numel()), pairs=len(mine), group=g, groups=G, token=int(ids[0, ctx]),
+                torch=torch.__version__, hf_check=check, hf_check_fail=bad,
+                bf16_ref_err={k: err(br[k], fr[k]) for k in fr if fr[k].numel()})
+    json.dump(meta, open(f"{d}/meta.json", "w"), indent=1)
+    return meta
+
+
+if TPS[0] == "moe":
+    assert MOE, "tp moe:G needs an MoE layer"
+    G = int(TPS[1])
+    which = TPS[2] if len(TPS) > 2 else "all"
+    metas = []
+    if which in ("all", "head"):
+        metas.append(write_head(f"{out}.head"))
+    if which != "head":
+        metas += [write_experts(f"{out}.ex{G}g{g}", G, g) for g in (range(G) if which == "all" else [int(which)])]
+    m = metas[0]
+    print(json.dumps(dict(layer=L, ctx=ctx, type=m["layer_type"], moe=G, hf_check_fail=list(bad),
+                          out_rel_rms_bf16=f32 and err(bf["out"], f32["out"])["rel_rms"],
+                          pairs=[x.get("pairs") for x in metas])))
+    sys.exit(1 if bad else 0)
 if TP == 1:
     metas = [write(out, full_slice(), None)]
 else:
     assert not MOE, "tp: dense layers only"
-    metas = [write(f"{out}.tp{TP}r{r}", rank_slice(r), r) for r in range(TP)]
+    metas = [write(f"{out}.tp{TP}r{r}", rank_slice(r), r) for r in ([int(TPS[1])] if len(TPS) > 1 else range(TP))]
 m = metas[0]
 print(json.dumps(dict(layer=L, ctx=ctx, type=m["layer_type"], cache_len=m["cache_len"], tp=TP, hf_check_fail=list(bad),
                       out_rel_rms_bf16=m["bf16_ref_err"]["out"]["rel_rms"], out_cos_bf16=m["bf16_ref_err"]["out"]["cos"])))

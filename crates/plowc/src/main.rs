@@ -539,6 +539,13 @@ struct StagePlanCli {
     /// Socket-to-socket activation hop, us (assumed; not measured on one socket).
     #[arg(long, default_value_t = 5.0)]
     hop_us: f64,
+    /// All-reduce of a hidden-size partial across a tensor-parallel group, us (assumed: two hops).
+    #[arg(long, default_value_t = 10.0)]
+    allreduce_us: f64,
+    /// Layers that do not fit one socket: `tp` = tensor-parallel socket group (MoE: head + expert groups), `pipe` =
+    /// FFN cut across consecutive stages.
+    #[arg(long, default_value = "tp")]
+    split: String,
     #[arg(long, default_value = "stage_plan.json")]
     out: PathBuf,
 }
@@ -2896,7 +2903,7 @@ fn urldecode(s: &str) -> String {
 /// In serve mode the page's model form hits `GET /graph?model=…&batch=…&seq=…`
 /// and the server rebuilds — any model, any B/S binding, without restarting.
 fn run_stage_plan(p: &StagePlanCli, cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
-    use plowc::stage_plan::{driver_l2_lock_bytes, gemma4_units, plan, Budget, Cost};
+    use plowc::stage_plan::{driver_l2_lock_bytes, gemma4_units, plan, Budget, Cost, Split};
     let dir = cli.hf_dir.as_deref().ok_or("stage-plan needs --hf-dir")?;
     let l2 = if p.l2_weight_kib == "auto" {
         driver_l2_lock_bytes().ok_or("--l2-weight-kib auto: no /sys/class/misc/pseudo_lock/caps; pass KiB")?
@@ -2906,25 +2913,31 @@ fn run_stage_plan(p: &StagePlanCli, cli: &Cli) -> Result<(), Box<dyn std::error:
     let shapes = plowc::hf_config::safetensor_shapes(dir)?;
     let config: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.join("config.json"))?)?;
     let units = gemma4_units(&shapes, &config)?;
-    let b = Budget { cores: p.cores, l2_weight_bytes_per_core: l2, batch: p.batch, ctx: p.ctx, min_rows_per_core: p.min_rows_per_core };
-    let c = Cost { gemv_gbps_per_core: p.gemv_gbps, exchange_us: p.exchange_us, kv_gbps: p.kv_gbps, act_gbps: p.act_gbps, hop_us: p.hop_us };
+    let split = match p.split.as_str() {
+        "tp" => Split::Tp,
+        "pipe" => Split::Pipe,
+        x => return Err(format!("--split {x}: tp or pipe").into()),
+    };
+    let b = Budget { cores: p.cores, l2_weight_bytes_per_core: l2, batch: p.batch, ctx: p.ctx, min_rows_per_core: p.min_rows_per_core, split };
+    let c = Cost { gemv_gbps_per_core: p.gemv_gbps, exchange_us: p.exchange_us, kv_gbps: p.kv_gbps, act_gbps: p.act_gbps, hop_us: p.hop_us, allreduce_us: p.allreduce_us };
     let (stages, summary) = plan(&units, &b, &c)?;
     for s in &stages {
         println!(
-            "stage {:3} {:7.1} MiB {:5.0} KiB/core fill {:.2} exch {:2} KV {:7.1} MiB  {:6.1} us (gemv {:5.1} sync {:5.1} attn {:6.1} act {:5.1})  {}",
-            s.index, s.bytes as f64 / 1048576.0, s.bytes_per_core as f64 / 1024.0, s.fill, s.exchanges,
-            s.kv_bytes_per_step as f64 / 1048576.0, s.pred.total_us, s.pred.gemv_us, s.pred.sync_us, s.pred.attn_us, s.pred.act_us, s.label
+            "stage {:3} x{:<3} {:7.1} MiB {:5.0} KiB/core fill {:.2} exch {:2} KV {:7.1} MiB  {:6.1} us (gemv {:5.1} sync {:5.1} attn {:6.1} act {:5.1} allreduce {:4.1})  {}",
+            s.index, s.sockets, s.bytes as f64 / 1048576.0, s.bytes_per_core as f64 / 1024.0, s.fill, s.exchanges,
+            s.kv_bytes_per_step as f64 / 1048576.0, s.pred.total_us, s.pred.gemv_us, s.pred.sync_us, s.pred.attn_us, s.pred.act_us,
+            s.pred.allreduce_us, s.label
         );
     }
     println!(
-        "{} stages for {} layers ({:.2} layers/stage), bottleneck {:.1} us, token latency {:.0} us, {:.0} tok/s at {} sequences in flight",
-        summary.stages, summary.layers, summary.layers_per_stage, summary.bottleneck_us, summary.token_latency_us,
+        "{} stages on {} sockets for {} layers ({:.2} layers/stage), bottleneck {:.1} us, token latency {:.0} us, {:.0} tok/s at {} sequences in flight",
+        summary.stages, summary.sockets, summary.layers, summary.layers_per_stage, summary.bottleneck_us, summary.token_latency_us,
         summary.pipeline_tokens_per_s, summary.sequences_in_flight
     );
     let j = serde_json::json!({
         "schema": "plow.stage_plan.v1",
         "hf_dir": dir,
-        "budget": {"cores": p.cores, "l2_weight_bytes_per_core": l2, "batch": p.batch, "ctx": p.ctx, "min_rows_per_core": p.min_rows_per_core},
+        "budget": {"cores": p.cores, "l2_weight_bytes_per_core": l2, "batch": p.batch, "ctx": p.ctx, "min_rows_per_core": p.min_rows_per_core, "split": split},
         "cost": c,
         "units": units,
         "stages": stages,

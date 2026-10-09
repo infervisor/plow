@@ -44,6 +44,11 @@
  *   with attention_k_eq_v (no v_proj: V is the K projection, normed without scale). A tensor-parallel socket slice
  *   (ref_layer.py REF_TP, meta tp > 1) holds whole heads and a block of FFN rows; o and down are the slice's partial sums,
  *   and the other ranks' share (o_rest / down_rest of each row's dump) is added where the cross-socket all-reduce lands.
+ * MoE (26B-A4B; ref_layer.py tp = moe:G): stage "head" adds the router rows (input rms(h1) * scale / sqrt(hidden)) to
+ *   the gate / up phase and combines h2 = h1 + rms(rms(down, pf1) + rms(moe_rest, pf2), pf), moe_rest being the expert
+ *   sockets' weighted sum. Stage "experts" is one expert socket: every local expert is striped over all workers (gate /
+ *   up rows and down rows by output rows); phase 0 runs gate / up + gelu for the tokens that picked each expert and
+ *   all-gathers the activations, phase 1 runs the down rows, weights them and all-gathers the socket's partial sum.
  * L2R_NOBCAST=1: after step 0 every worker reads private snapshots of the shared vectors (identical values, since
  * the step repeats), which removes the activation all-gather from the timing; writes are unchanged.
  * Prints one JSON line: per-boundary error vs the FP32 reference (first and last step), step p50/p95/p99,
@@ -105,15 +110,20 @@ static double tsc_ghz;
 
 /* ---- model ---- */
 static int H, NH, KVH, HD, I, PLE, WIN, CL0, CL; /* CL0: dumped cache rows, CL: rows attended before the new token */
-static int KVEQ, TP;
+static int KVEQ, TP, STAGE; /* STAGE: 0 layer, 1 MoE head, 2 MoE experts */
+static float *moe_rest, *w_pf1, *w_pf2, *w_rsc, *rs; /* head: [NB][H] experts' sum, norms, router scale, scores */
+static int NE, EI, TOPK, NP, *pb, *pel, *el_p0, *el_n; static float *pw, *h1x, *part, *chk_xn3, *chk_eact;
+static bf16 *Wgu, *Wdn, *eact_b; static bc_t bc_eact, bc_part;
 static float *o_rest, *down_rest; /* [NB][H], TP > 1 */
 static float EPS, SCALAR;
 static float *x_in, *pli, *cosv, *sinv; /* [NB][H], [NB][PLE], [NB][HD], [NB][HD] */
 static bf16 *kc0[MAXB], *vc0[MAXB];
-static const char* WN[9] = {"self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj", "self_attn.o_proj",
-                            "mlp.gate_proj", "mlp.up_proj", "mlp.down_proj", "per_layer_input_gate", "per_layer_projection"};
-static bf16* Wfull[9];
-static int Wn[9], Wk[9];
+#define NMAT 10
+static const char* WN[NMAT] = {"self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj", "self_attn.o_proj",
+                            "mlp.gate_proj", "mlp.up_proj", "mlp.down_proj", "per_layer_input_gate", "per_layer_projection",
+                               "router.proj"};
+static bf16* Wfull[NMAT];
+static int Wn[NMAT], Wk[NMAT];
 static float *w_in, *w_pa, *w_pf, *w_pff, *w_pn, *w_qn, *w_kn;
 
 /* ---- shared vectors, all [NB][n] ---- */
@@ -125,10 +135,10 @@ static float *chk_qn, *chk_h1, *chk_xn2, *chk_h2, *chk_attn, *chk_act, *chk_pact
 /* ---- per worker ---- */
 typedef struct {
     int id, node;
-    int r0[9], r1[9];
-    int nres[9];          /* rows of the slice kept L2-resident; the rest stream with PREFETCHNTA */
-    bf16* ws[9];
-    bf16* w[9];
+    int r0[NMAT], r1[NMAT];
+    int nres[NMAT];          /* rows of the slice kept L2-resident; the rest stream with PREFETCHNTA */
+    bf16* ws[NMAT];
+    bf16* w[NMAT];
     int p0, p1;           /* KV positions [p0, p1) of 0..CL-1; the last worker also owns the new row */
     bf16 *kv;             /* [KVR][NB][K, V][KVH][np][HD] */
     size_t kvblk;         /* elements of one [KVH][np][HD] block */
@@ -611,7 +621,7 @@ static void* run(void* arg) {
     /* weights: one arena, 2 MiB aligned, THP, first touch here. With L2R_RESIDENT_KIB, FFN rows beyond the budget
      * (gate/up paired, down proportional) go after all resident rows and stream through gemv_nta. */
     size_t bytes = 0;
-    for (int m = 0; m < 9; m++) {
+    for (int m = 0; m < NMAT; m++) {
         split(Wn[m], AMX ? 16 : 4, id, &me->r0[m], &me->r1[m]);
         me->nres[m] = me->r1[m] - me->r0[m];
         bytes += (size_t)(me->r1[m] - me->r0[m]) * Wk[m] * 2;
@@ -629,7 +639,7 @@ static void* run(void* arg) {
     uint8_t* arena = (uint8_t*)(((uintptr_t)raw + HUGE - 1) & ~(HUGE - 1));
     madvise(arena, al, MADV_HUGEPAGE);
     size_t off = 0;
-    for (int m = 0; m < 9; m++) {
+    for (int m = 0; m < NMAT; m++) {
         const int n = me->nres[m];
         me->w[m] = (bf16*)(arena + off);
         if (AMX) pack_amx(Wfull[m] + (size_t)me->r0[m] * Wk[m], n, Wk[m], me->w[m]);
@@ -637,7 +647,7 @@ static void* run(void* arg) {
         off += (size_t)n * Wk[m] * 2;
     }
     const size_t resident = off;
-    for (int m = 0; m < 9; m++) {
+    for (int m = 0; m < NMAT; m++) {
         const int n = me->r1[m] - me->r0[m] - me->nres[m];
         me->ws[m] = (bf16*)(arena + off);
         memcpy(me->ws[m], Wfull[m] + (size_t)(me->r0[m] + me->nres[m]) * Wk[m], (size_t)n * Wk[m] * 2);
@@ -811,6 +821,14 @@ static void* run(void* arg) {
         }
         me->pro[4] += __rdtsc() - t;
         if (st == 0 && id == 0) memcpy(chk_h1, h1, (size_t)NB * H * 4);
+        if (STAGE == 1) {
+            for (int b = 0; b < NB; b++) {
+                rms(h1 + (size_t)b * H, w_rsc, H, tmp);
+                for (int i = 0; i < H; i++) tmp[i] *= 1.f / sqrtf((float)H);
+                tobf(tmp, H, h2b + (size_t)b * H);
+            }
+            gemv(me->w[9], me->r1[9] - me->r0[9], H, h2b, rs + me->r0[9], Wn[9]);
+        }
         gemv(me->w[4], me->nres[4], H, x2b, gate + me->r0[4], I);
         gemv(me->w[5], me->nres[5], H, x2b, up + me->r0[5], I);
         (PLFD >= 0 ? gemv_avx1 : gemv_nta)(me->ws[4], me->r1[4] - me->r0[4] - me->nres[4], H, x2b, gate + me->r0[4] + me->nres[4]);
@@ -834,6 +852,12 @@ static void* run(void* arg) {
                 float* hb = h2 + (size_t)b * H;
                 const float* db = rdown + (size_t)b * H;
                 if (TP > 1) { for (int i = 0; i < H; i++) tmp[i] = db[i] + down_rest[(size_t)b * H + i]; db = tmp; }
+                if (STAGE == 1) {
+                    float* t2 = lpp; /* H floats of scratch, unused without PLE */
+                    rms(db, w_pf1, H, tmp); rms(moe_rest + (size_t)b * H, w_pf2, H, t2);
+                    for (int i = 0; i < H; i++) tmp[i] += t2[i];
+                    db = tmp;
+                }
                 rms(db, w_pff, H, tmp); for (int i = 0; i < H; i++) hb[i] = h1[(size_t)b * H + i] + tmp[i];
                 tobf(hb, H, h2b + (size_t)b * H);
             }
@@ -896,6 +920,220 @@ static err_t err(const float* a, const float* r, int n) {
 }
 static int cmpu64(const void* a, const void* b) { uint64_t x = *(const uint64_t*)a, y = *(const uint64_t*)b; return x < y ? -1 : x > y; }
 
+/* ---- MoE expert socket (STAGE 2) ---- */
+static inline void gemvn(const bf16* W, int n, int K, const bf16* x, int nb, float* y, int ldy) {
+    if (n <= 0 || nb <= 0) return;
+    if (AMX) gemv_amx(W, n, K, x, nb, y, ldy); else gemv_avx(W, n, K, x, nb, y, ldy);
+}
+
+static void* run_experts(void* arg) {
+    worker_t* me = arg;
+    const int id = me->id;
+    cpu_set_t cs; CPU_ZERO(&cs); CPU_SET(cpus[id], &cs); sched_setaffinity(0, sizeof cs, &cs);
+    if (AMX) {
+        if (syscall(SYS_arch_prctl, 0x1023, 18)) { perror("amx"); exit(1); }
+        tilecfg_t c; memset(&c, 0, sizeof c); c.palette = 1;
+        for (int t = 0; t < 5; t++) { c.colsb[t] = 64; c.rows[t] = NB; }
+        for (int t = 5; t < 8; t++) { c.colsb[t] = 64; c.rows[t] = 16; }
+        _tile_loadconfig(&c);
+    }
+    const int u = AMX ? 16 : 4;
+    int ga, gz, da, dz;
+    split(EI, u, id, &ga, &gz); split(H, u, id, &da, &dz);
+    const int ng = gz - ga, ndn = dz - da;
+    /* per local expert: gate rows [ga, gz), up rows [EI + ga, EI + gz) (K = H), down rows [da, dz) (K = EI) */
+    const size_t eg = (size_t)ng * H, ed = (size_t)ndn * EI, per = 2 * eg + ed, bytes = per * NE * 2;
+    const size_t HUGE = 2u << 20, al = (bytes + HUGE - 1) / HUGE * HUGE + HUGE;
+    uint8_t* raw = mmap(NULL, al + HUGE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    bf16* arena = (bf16*)(((uintptr_t)raw + HUGE - 1) & ~(HUGE - 1));
+    madvise(arena, al, MADV_HUGEPAGE);
+    for (int e = 0; e < NE; e++) {
+        const bf16* gu = Wgu + (size_t)e * 2 * EI * H;
+        const bf16* dn = Wdn + (size_t)e * H * EI;
+        bf16* a = arena + (size_t)e * per;
+        if (AMX) {
+            pack_amx(gu + (size_t)ga * H, ng, H, a); pack_amx(gu + (size_t)(EI + ga) * H, ng, H, a + eg);
+            pack_amx(dn + (size_t)da * EI, ndn, EI, a + 2 * eg);
+        } else {
+            memcpy(a, gu + (size_t)ga * H, eg * 2); memcpy(a + eg, gu + (size_t)(EI + ga) * H, eg * 2);
+            memcpy(a + 2 * eg, dn + (size_t)da * EI, ed * 2);
+        }
+    }
+    if (PLFD >= 0) {
+        struct pl_lock_req rq = {(uintptr_t)arena, (bytes + 4095) / 4096 * 4096, cpus[id], 2, 0, 0};
+        if (ioctl(PLFD, PL_IOC_LOCK, &rq)) { fprintf(stderr, "cpu %d LOCK %zu B: %m\n", cpus[id], (size_t)rq.len); exit(1); }
+        me->lock_id = rq.id;
+        struct pl_measure ms = {rq.id, 0};
+        ioctl(PLFD, PL_IOC_MEASURE, &ms); me->held0 = ms.lines ? (double)ms.l1_l2 / ms.lines : -1;
+    }
+    float* xn = aligned_alloc(64, (size_t)H * 4);
+    bf16* xb = aligned_alloc(64, (size_t)NB * H * 2 + 64);
+    bf16* xe = aligned_alloc(64, (size_t)NB * H * 2 + 64);
+    float* gb = aligned_alloc(64, (size_t)NB * (ng + 16) * 4 + 64);
+    float* ub = aligned_alloc(64, (size_t)NB * (ng + 16) * 4 + 64);
+    float* yb = aligned_alloc(64, (size_t)NB * (ndn + 16) * 4 + 64);
+    bf16* lact = aligned_alloc(64, (size_t)(NP + NB) * EI * 2 + 64);
+    float* lpart = aligned_alloc(64, (size_t)NB * H * 4);
+    memset(lact, 0, (size_t)(NP + NB) * EI * 2);
+    const int nd = nodeof[id];
+    me->steps_t = calloc(STEPS, 8);
+    pthread_barrier_wait(&pbar);
+    uint64_t e = 0;
+    for (int st = 0; st < STEPS; st++) {
+        if (id == 0 && PERF_FD >= 0 && st == STEPS / 10 && write(PERF_FD, "enable\n", 7) != 7) perror("perf ctl");
+        uint64_t t = __rdtsc(), t0 = t, u_;
+#undef PHASE
+#define PHASE(i) do { u_ = __rdtsc(); me->ph[i] += u_ - t; ++e; barrier(id, e); t = __rdtsc(); me->wt[i] += t - u_; } while (0)
+        /* 0: pre-FFN-2 norm of every row (redundant), gate / up rows of every picked expert, gelu * up */
+        for (int b = 0; b < NB; b++) {
+            rms(h1x + (size_t)b * H, w_pf2, H, xn); tobf(xn, H, xb + (size_t)b * H);
+            if (st == 0 && id == 0) memcpy(chk_xn3 + (size_t)b * H, xn, (size_t)H * 4);
+        }
+        me->pro[0] += __rdtsc() - t;
+        for (int el = 0; el < NE; el++) {
+            const int m = el_n[el], p0 = el_p0[el];
+            if (!m || !ng) continue;
+            for (int i = 0; i < m; i++) memcpy(xe + (size_t)i * H, xb + (size_t)pb[p0 + i] * H, (size_t)H * 2);
+            const bf16* a = arena + (size_t)el * per;
+            gemvn(a, ng, H, xe, m, gb, ng); gemvn(a + eg, ng, H, xe, m, ub, ng);
+            for (int i = 0; i < m; i++)
+                gelu_mul(gb + (size_t)i * ng, ub + (size_t)i * ng, ng, eact_b + (size_t)(p0 + i) * EI + ga,
+                         st == 0 ? chk_eact + (size_t)(p0 + i) * EI + ga : NULL);
+        }
+        if (NP) bc_publish(&bc_eact, id, eact_b + ga, EI);
+        PHASE(0);
+        /* 1: down rows of every picked expert, times the routing weight, summed per token */
+        if (NP) bc_gather(&bc_eact, nd, lact, EI);
+        me->pro[1] += __rdtsc() - t;
+        for (int b = 0; b < NB; b++) memset(part + (size_t)b * H + da, 0, (size_t)ndn * 4);
+        for (int el = 0; el < NE; el++) {
+            const int m = el_n[el], p0 = el_p0[el];
+            if (!m || !ndn) continue;
+            gemvn(arena + (size_t)el * per + 2 * eg, ndn, EI, lact + (size_t)p0 * EI, m, yb, ndn);
+            for (int i = 0; i < m; i++) {
+                float* d = part + (size_t)pb[p0 + i] * H + da;
+                const float w = pw[p0 + i];
+                for (int r = 0; r < ndn; r++) d[r] += w * yb[(size_t)i * ndn + r];
+            }
+        }
+        bc_publish(&bc_part, id, part + da, H);
+        PHASE(1);
+        if (id == 0) { /* the socket's partial sum, as it would leave for the combining head socket */
+            bc_gather(&bc_part, nd, lpart, H);
+            memcpy(outv + (size_t)(st == 0 ? 0 : 1) * NB * H, lpart, (size_t)NB * H * 4);
+        }
+#undef PHASE
+        me->steps_t[st] = __rdtsc() - t0;
+    }
+    if (id == 0 && PERF_FD >= 0 && write(PERF_FD, "disable\n", 8) != 8) perror("perf ctl");
+    if (PLFD >= 0) { struct pl_measure ms = {me->lock_id, 0}; ioctl(PLFD, PL_IOC_MEASURE, &ms); me->held1 = ms.lines ? (double)ms.l1_l2 / ms.lines : -1; }
+    if (AMX) _tile_release();
+    return NULL;
+}
+
+static void print_err(const char* dir, const char* name, const float* a, int n, int first) {
+    char nm[64]; snprintf(nm, sizeof nm, "ref.%s", !strcmp(name, "out_last") ? "out" : name);
+    float* r = in_manifest(dir, nm) ? load_in(dir, nm, NULL, NULL) : NULL;
+    if (r && n > 0) {
+        err_t e = err(a, r, n);
+        printf("%s\"%s\":[%.3e,%.8f,%.3e]", first ? "" : ",", name, e.rel_rms, e.cos, e.max_abs);
+    } else printf("%s\"%s\":null", first ? "" : ",", name);
+    free(r);
+}
+
+static int experts_main(const char* js) {
+    H = meta_int(js, "hidden"); EPS = (float)meta_f(js, "eps"); NE = meta_int(js, "experts"); EI = meta_int(js, "moe_inter");
+    TOPK = meta_int(js, "top_k");
+    const int E0 = meta_int(js, "e0");
+    if (!BCAST || BCAST == 4 || NOBCAST || RESKIB) { fprintf(stderr, "experts stage: L2R_BCAST=rep|repcld|repnt, no L2R_NOBCAST / L2R_RESIDENT_KIB\n"); return 1; }
+    Wgu = load("w.experts.gate_up_proj", NULL, NULL); Wdn = load("w.experts.down_proj", NULL, NULL);
+    w_pf2 = loadbf_as_f("w.pre_feedforward_layernorm_2.weight");
+    h1x = malloc((size_t)NB * H * 4);
+    int* ridx = malloc((size_t)NB * TOPK * sizeof(int)); float* rwt = malloc((size_t)NB * TOPK * 4);
+    for (int b = 0; b < NB; b++) {
+        float* t = load_in(ROWDIR[b], "h1", NULL, NULL); memcpy(h1x + (size_t)b * H, t, (size_t)H * 4); free(t);
+        float* ix = load_in(ROWDIR[b], "router_idx", NULL, NULL); float* wv = load_in(ROWDIR[b], "router_w", NULL, NULL);
+        for (int j = 0; j < TOPK; j++) { ridx[b * TOPK + j] = (int)ix[j]; rwt[b * TOPK + j] = wv[j]; }
+        free(ix); free(wv);
+    }
+    /* (token, expert) pairs of this socket, grouped by local expert; experts in order of first pick, so with one row the
+     * pairs keep the router's top-k order (ref.eact) */
+    pb = malloc((size_t)NB * TOPK * sizeof(int)); pel = malloc((size_t)NB * TOPK * sizeof(int)); pw = malloc((size_t)NB * TOPK * 4);
+    el_p0 = calloc(NE + 1, sizeof(int)); el_n = calloc(NE + 1, sizeof(int));
+    int* order = malloc((size_t)NE * sizeof(int)); int no = 0;
+    for (int b = 0; b < NB; b++)
+        for (int j = 0; j < TOPK; j++) {
+            const int el = ridx[b * TOPK + j] - E0;
+            if (el < 0 || el >= NE) continue;
+            if (!el_n[el]) order[no++] = el;
+            el_n[el]++;
+        }
+    NP = 0;
+    for (int o = 0; o < no; o++) {
+        const int el = order[o];
+        el_p0[el] = NP;
+        for (int b = 0; b < NB; b++)
+            for (int j = 0; j < TOPK; j++)
+                if (ridx[b * TOPK + j] - E0 == el) { pb[NP] = b; pel[NP] = el; pw[NP] = rwt[b * TOPK + j]; NP++; }
+    }
+    eact_b = aligned_alloc(64, (size_t)(NP + 1) * EI * 2 + 64);
+#define ZA(p, n) p = aligned_alloc(64, ((size_t)(n) * 4 + 63) / 64 * 64), memset(p, 0, (size_t)(n) * 4)
+    ZA(part, NB * H); ZA(outv, 2 * NB * H); ZA(chk_xn3, NB * H); ZA(chk_eact, (NP + 1) * EI);
+#undef ZA
+    for (int i = 0; i < NW; i++) {
+        nodeof[i] = 0;
+        for (int k = 0; k < 8; k++) {
+            char np_[96]; snprintf(np_, sizeof np_, "/sys/devices/system/cpu/cpu%d/node%d", cpus[i], k);
+            if (!access(np_, F_OK)) { nodeof[i] = k; break; }
+        }
+        if (nodeof[i] + 1 > NNODE) NNODE = nodeof[i] + 1;
+    }
+    const int u = AMX ? 16 : 4;
+    bc_init(&bc_eact, 2, EI, u, 0, NP > 0 ? NP : 1); bc_init(&bc_part, 4, H, u, 0, NB);
+    tsc_ghz = calib();
+    pthread_barrier_init(&pbar, NULL, NW);
+    pthread_t th[MAXW];
+    for (int i = 0; i < NW; i++) { WK[i].id = i; pthread_create(&th[i], NULL, run_experts, &WK[i]); }
+    for (int i = 0; i < NW; i++) pthread_join(th[i], NULL);
+    printf("{\"ref\":\"%s\",\"stage\":\"experts\",\"batch\":%d,\"gemv\":\"%s\",\"bcast\":%d,\"workers\":%d,\"steps\":%d,\"experts\":%d,\"pairs\":%d,\"tsc_ghz\":%.3f,\"err\":{",
+           DIR, NB, AMX ? "amx" : "avx", BCAST, NW, STEPS, NE, NP, tsc_ghz);
+    print_err(DIR, "xn3", chk_xn3, H, 1);
+    if (NB == 1) print_err(DIR, "eact", chk_eact, NP * EI, 0);
+    print_err(DIR, "out", outv, H, 0); print_err(DIR, "out_last", outv + (size_t)NB * H, H, 0);
+    const int skip = STEPS / 10;
+    uint64_t* stt = malloc(STEPS * 8);
+    int n = 0;
+    for (int s2 = skip; s2 < STEPS; s2++) { uint64_t m = 0; for (int w = 0; w < NW; w++) if (WK[w].steps_t[s2] > m) m = WK[w].steps_t[s2]; stt[n++] = m; }
+    qsort(stt, n, 8, cmpu64);
+    const double us = 1e-3 / tsc_ghz;
+    double mean = 0; for (int i = 0; i < n; i++) mean += stt[i]; mean /= n;
+    printf("},\"step_us\":{\"mean\":%.2f,\"p50\":%.2f,\"p95\":%.2f,\"p99\":%.2f,\"max\":%.2f},\"phase_us\":[", mean * us,
+           stt[n / 2] * us, stt[n * 95 / 100] * us, stt[n * 99 / 100] * us, stt[n - 1] * us);
+    for (int p = 0; p < 2; p++) {
+        double mx = 0, avg = 0, wmx = 0, pr = 0;
+        for (int w = 0; w < NW; w++) { double c = (double)WK[w].ph[p] / STEPS; avg += c; if (c > mx) mx = c; wmx += (double)WK[w].wt[p] / STEPS; pr += (double)WK[w].pro[p] / STEPS; }
+        printf("%s{\"compute_max\":%.3f,\"compute_mean\":%.3f,\"prologue_mean\":%.3f,\"barrier_mean\":%.3f}", p ? "," : "", mx * us, avg / NW * us, pr / NW * us, wmx / NW * us);
+    }
+    printf("]");
+    if (NB > 1) {
+        printf(",\"rows\":[");
+        for (int b = 0; b < NB; b++) {
+            printf("%s{\"dir\":\"%s\",\"err\":{", b ? "," : "", ROWDIR[b]);
+            print_err(ROWDIR[b], "xn3", chk_xn3 + (size_t)b * H, H, 1);
+            print_err(ROWDIR[b], "out", outv + (size_t)b * H, H, 0);
+            print_err(ROWDIR[b], "out_last", outv + (size_t)(NB + b) * H, H, 0);
+            printf("}}");
+        }
+        printf("]");
+    }
+    double h0 = 1, h1v = 1;
+    for (int w = 0; w < NW; w++) { if (WK[w].held0 < h0) h0 = WK[w].held0; if (WK[w].held1 < h1v) h1v = WK[w].held1; }
+    if (PLFD >= 0) printf(",\"lock\":{\"held_l2_before_min\":%.4f,\"held_l2_after_min\":%.4f}", h0, h1v);
+    const size_t wb = (size_t)NE * 3 * EI * H * 2;
+    printf(",\"weight_bytes\":%zu,\"weight_bytes_per_worker\":%.0f}\n", wb, (double)wb / NW);
+    return 0;
+}
+
 int main(int argc, char** argv) {
     if (argc < 3) { fprintf(stderr, "usage: l2r_layer <refdir> <steps>\n"); return 1; }
     DIR = argv[1]; STEPS = atoi(argv[2]);
@@ -905,7 +1143,7 @@ int main(int argc, char** argv) {
     { const char* b = getenv("L2R_BARRIER"); BARR = b && !strcmp(b, "hier"); }
     RESKIB = getenv("L2R_RESIDENT_KIB") ? strtoull(getenv("L2R_RESIDENT_KIB"), 0, 10) : 0;
     if (getenv("L2R_LOCK") && atoi(getenv("L2R_LOCK"))) {
-        if (!RESKIB) { fprintf(stderr, "L2R_LOCK needs L2R_RESIDENT_KIB\n"); return 1; }
+        if (!RESKIB && !getenv("L2R_EXPERTS_LOCK")) { fprintf(stderr, "L2R_LOCK needs L2R_RESIDENT_KIB\n"); return 1; }
         if ((PLFD = open("/dev/pseudo_lock", O_RDWR)) < 0) { perror("/dev/pseudo_lock"); return 1; }
     }
 #define ENVI(v, n) if (getenv(n)) v = atoi(getenv(n))
@@ -934,25 +1172,34 @@ int main(int argc, char** argv) {
     char path[512]; snprintf(path, sizeof path, "%s/meta.json", DIR);
     FILE* f = fopen(path, "r"); if (!f) { perror(path); return 1; }
     static char js[1 << 20]; js[fread(js, 1, sizeof js - 1, f)] = 0; fclose(f);
+    STAGE = strstr(js, "\"stage\": \"experts\"") ? 2 : strstr(js, "\"stage\": \"head\"") ? 1 : 0;
+    if (STAGE == 2) return experts_main(js);
     H = meta_int(js, "hidden"); NH = meta_int(js, "heads"); KVH = meta_int(js, "kv_heads"); HD = meta_int(js, "head_dim");
     I = meta_int(js, "inter"); PLE = meta_int(js, "ple"); WIN = meta_int(js, "window"); CL0 = meta_int(js, "cache_len");
     EPS = (float)meta_f(js, "eps");
     KVEQ = !in_manifest(DIR, "w.self_attn.v_proj.weight"); TP = strstr(js, "\"tp\": ") ? meta_int(js, "tp") : 1;
     if (TP > 1 && (NOBCAST || BCAST == 4)) { fprintf(stderr, "tp > 1 needs L2R_BCAST=direct|rep|repcld|repnt\n"); return 1; }
     CL = CL0 * REP;
-    for (int m = 0; m < 9; m++) {
+    for (int m = 0; m < NMAT; m++) {
         char nm[128]; snprintf(nm, sizeof nm, "w.%s.weight", WN[m]);
-        if ((m == 2 && KVEQ) || (m >= 7 && !PLE)) { Wfull[m] = NULL; continue; }
+        if ((m == 2 && KVEQ) || ((m == 7 || m == 8) && !PLE) || (m == 9 && STAGE != 1)) { Wfull[m] = NULL; continue; }
         size_t n; Wfull[m] = load(nm, &n, NULL);
     }
     Wn[0] = NH * HD; Wk[0] = H; Wn[1] = KVH * HD; Wn[2] = KVEQ ? 0 : KVH * HD; Wk[1] = Wk[2] = H; Wn[3] = H; Wk[3] = NH * HD;
     Wn[4] = Wn[5] = I; Wk[4] = Wk[5] = H; Wn[6] = H; Wk[6] = I; Wn[7] = PLE; Wk[7] = H; Wn[8] = H; Wk[8] = PLE;
+    Wn[9] = 0; Wk[9] = H;
+    if (STAGE == 1) {
+        size_t ne; free(load("w.router.proj.weight", &ne, NULL)); Wn[9] = (int)(ne / H);
+        w_pf1 = loadbf_as_f("w.post_feedforward_layernorm_1.weight"); w_pf2 = loadbf_as_f("w.pre_feedforward_layernorm_2.weight");
+        free(w_pf2); w_pf2 = loadbf_as_f("w.post_feedforward_layernorm_2.weight"); w_rsc = loadbf_as_f("w.router.scale");
+    }
     w_in = loadbf_as_f("w.input_layernorm.weight"); w_pa = loadbf_as_f("w.post_attention_layernorm.weight");
     w_pf = loadbf_as_f("w.pre_feedforward_layernorm.weight"); w_pff = loadbf_as_f("w.post_feedforward_layernorm.weight");
     if (PLE) w_pn = loadbf_as_f("w.post_per_layer_input_norm.weight");
     w_qn = loadbf_as_f("w.self_attn.q_norm.weight"); w_kn = loadbf_as_f("w.self_attn.k_norm.weight");
     float* ls = load("layer_scalar", NULL, NULL); SCALAR = ls[0];
     if (TP > 1) { o_rest = malloc((size_t)NB * H * 4); down_rest = malloc((size_t)NB * H * 4); }
+    if (STAGE == 1) moe_rest = malloc((size_t)NB * H * 4);
     x_in = malloc((size_t)NB * H * 4); pli = malloc((size_t)NB * PLE * 4 + 64); cosv = malloc((size_t)NB * HD * 4); sinv = malloc((size_t)NB * HD * 4);
     for (int b = 0; b < NB; b++) {
         snprintf(path, sizeof path, "%s/meta.json", ROWDIR[b]);
@@ -965,12 +1212,13 @@ int main(int argc, char** argv) {
         ROWLD(x_in, "x_in", H); ROWLD(cosv, "cos", HD); ROWLD(sinv, "sin", HD);
         if (PLE) ROWLD(pli, "per_layer_input", PLE);
         if (TP > 1) { ROWLD(o_rest, "o_rest", H); ROWLD(down_rest, "down_rest", H); }
+        if (STAGE == 1) ROWLD(moe_rest, "moe_rest", H);
         kc0[b] = load_in(ROWDIR[b], "kcache", NULL, NULL); vc0[b] = load_in(ROWDIR[b], "vcache", NULL, NULL);
     }
     const int A = NH * HD;
 #define ZA(p, n) p = aligned_alloc(64, ((size_t)(n) * 4 + 63) / 64 * 64), memset(p, 0, (size_t)(n) * 4)
     ZA(q, NB * A); ZA(k, NB * KVH * HD); ZA(v, NB * KVH * HD); ZA(o, NB * H); ZA(gate, NB * I); ZA(up, NB * I); ZA(down, NB * H);
-    ZA(pg, NB * PLE); ZA(pp, NB * H); ZA(outv, 2 * NB * H);
+    ZA(pg, NB * PLE); ZA(pp, NB * H); ZA(outv, 2 * NB * H); ZA(rs, NB * (Wn[9] + 16));
     ZA(pm, NW * NH); ZA(pl, NW * NH); ZA(po, (size_t)NW * NH * HD);
     ZA(chk_qn, NB * A); ZA(chk_h1, NB * H); ZA(chk_xn2, NB * H); ZA(chk_h2, NB * H); ZA(chk_attn, NB * A); ZA(chk_act, NB * I); ZA(chk_pact, NB * PLE);
     attn_b = aligned_alloc(64, (size_t)NB * A * 2 + 64); act_b = aligned_alloc(64, (size_t)NB * I * 2 + 64); pact_b = aligned_alloc(64, (size_t)NB * PLE * 2 + 64);
@@ -1013,7 +1261,7 @@ int main(int argc, char** argv) {
     struct { const char* n; float* a; int len; } B[] = {
         {"q", q, A}, {"k", k, KVH * HD}, {"v", KVEQ ? k : v, KVH * HD}, {"qn", chk_qn, A}, {"attn", chk_attn, A}, {"o", o, H},
         {"h1", chk_h1, H}, {"xn2", chk_xn2, H}, {"gate", gate, I}, {"up", up, I}, {"act", chk_act, I},
-        {"down", down, H}, {"h2", chk_h2, H}, {"pg", pg, PLE}, {"pact", chk_pact, PLE}, {"pp", pp, H},
+        {"down", down, H}, {"rs", rs, Wn[9]}, {"h2", chk_h2, H}, {"pg", pg, PLE}, {"pact", chk_pact, PLE}, {"pp", pp, H},
         {"out", outv, H}, {"out_last", outv + (size_t)NB * H, H}};
     printf("{\"ref\":\"%s\",\"batch\":%d,\"gemv\":\"%s\",\"nobcast\":%d,\"bcast\":%d,\"barrier\":\"%s\",\"resident_kib\":%zu,\"workers\":%d,\"steps\":%d,\"ctx_rows\":%d,\"tsc_ghz\":%.3f,\"err\":{", DIR, NB, AMX ? "amx" : "avx", NOBCAST, BCAST, BARR ? "hier" : "diss", RESKIB, NW, STEPS, CL + 1, tsc_ghz);
     for (size_t b = 0; b < sizeof B / sizeof B[0]; b++) {
@@ -1040,7 +1288,7 @@ int main(int argc, char** argv) {
         for (int w = 0; w < NW; w++) { double c = (double)WK[w].ph[p] / STEPS; avg += c; if (c > mx) mx = c; wmx += (double)WK[w].wt[p] / STEPS; pr += (double)WK[w].pro[p] / STEPS; }
         printf("%s{\"compute_max\":%.3f,\"compute_mean\":%.3f,\"prologue_mean\":%.3f,\"barrier_mean\":%.3f}", p ? "," : "", mx * us, avg / NW * us, pr / NW * us, wmx / NW * us);
     }
-    size_t wb = 0; for (int m = 0; m < 9; m++) wb += (size_t)Wn[m] * Wk[m] * 2;
+    size_t wb = 0; for (int m = 0; m < NMAT; m++) wb += (size_t)Wn[m] * Wk[m] * 2;
     double h0 = 1, h1 = 1;
     for (int w = 0; w < NW; w++) { if (WK[w].held0 < h0) h0 = WK[w].held0; if (WK[w].held1 < h1) h1 = WK[w].held1; }
     printf("]");
