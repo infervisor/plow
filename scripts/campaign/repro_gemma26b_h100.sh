@@ -7,7 +7,7 @@
 #   gate <bf16|fp8>          GPU: serve the packet, FP32-reference capture, score (writes gates.json)
 #   bench <arm> <workload>   GPU: one arm of one workload through llm_grid.sh
 #                            arms: bf16 fp8 vllm-bf16 vllm-fp8; workloads: st4k st15k agentic lat,
-#                            lc32k lc128k (long prompts, c1/c4/c16), prod (open-loop mix at RATES
+#                            lc32k lc128k (32768 / 130944 prompts, c1/c4/c16), prod (open-loop mix at RATES
 #                            sessions/s), prodlong (the mix with a long-prompt tail to 131072)
 #   report                   CPU: campaign.py report for every pair present + one combined markdown
 #
@@ -23,7 +23,7 @@
 # default $OUT/fp32ref/<arm>/{ref,vllm}.json); PROMPTS (fp32_ref_gate.py prompt set; built from CORPUS
 # when absent); OBJECT_ENV (extra `--object-env`, e.g. "NVCC_APPEND_FLAGS=-ccbin=/usr/bin/g++-14");
 # RT_ENV (runtime env for plowrt); VLLM_ENV (env for the vLLM server); MAX_MODEL_LEN (vLLM
-# --max-model-len, 16384; the plow packet's max_ctx); RATES (prod/prodlong sessions/s).
+# --max-model-len; default the recipe's max_ctx: FP8 131072, BF16 16384); RATES (prod/prodlong sessions/s).
 set -u
 REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 : "${OUT:?set OUT to a scratch directory outside the repo}"
@@ -33,9 +33,9 @@ TARGET=${CARGO_TARGET_DIR:-$REPO/target}
 : "${FP8_RECIPE:=$REPO/recipes/infervisor/gemma-4-26b-a4b/sm90a-h100-tp1-fp8.toml}"
 # llm_grid.sh adds --gpu-memory-utilization $VLLM_MEM --max-num-seqs 256. fp8_per_token_head KV runs
 # only on TRITON_ATTN.
-VLLM_COMMON="--max-model-len ${MAX_MODEL_LEN:-16384} --enable-prefix-caching --max-num-batched-tokens 8192 --enable-prompt-tokens-details"
-VLLM_BF16_ARGS="--dtype bfloat16 $VLLM_COMMON"
-VLLM_FP8_ARGS="--dtype bfloat16 --attention-backend TRITON_ATTN --kv-cache-dtype fp8_per_token_head $VLLM_COMMON"
+VLLM_COMMON="--enable-prefix-caching --max-num-batched-tokens 8192 --enable-prompt-tokens-details"
+VLLM_BF16_ARGS="--dtype bfloat16 --max-model-len ${MAX_MODEL_LEN:-16384} $VLLM_COMMON"
+VLLM_FP8_ARGS="--dtype bfloat16 --attention-backend TRITON_ATTN --kv-cache-dtype fp8_per_token_head --max-model-len ${MAX_MODEL_LEN:-131072} $VLLM_COMMON"
 COMMON="REPS=${REPS:-2} SAMPLED= PREFILL_CONCS= DECODE= PACKLOG=1 PB_BENCH_TIMEOUT=5400"
 
 die() { echo "repro26: $*" >&2; exit 2; }
@@ -125,7 +125,7 @@ bench() {
     agentic) wlenv="AGENTIC_CONCS='32 64 128'"; mode=--agentic ;;
     lat) wlenv="CONCS='1 4' ISL=1024 OSL=128" ;;
     lc32k) wlenv="CONCS='1 4 16' ISL=32768 OSL=128" ;;
-    lc128k) wlenv="CONCS='1 4 16' ISL=131072 OSL=128" ;;
+    lc128k) wlenv="CONCS='1 4 16' ISL=130944 OSL=128" ;;
     prod) need RATES; wlenv="PROD_RATES='$RATES'"; mode=--prod ;;
     prodlong) need RATES; wlenv="PROD_RATES='$RATES' PROD_ARGS='--max-model-len 131072 --first-sigma 2.0'"; mode=--prod ;;
     *) die "workload $wl" ;;

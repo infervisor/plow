@@ -1,15 +1,31 @@
-# Gemma-4-26B-A4B-it BF16 weights, BF16 KV, 16K context, 32 decode slots, prefix cache on, one
+# Gemma-4-26B-A4B-it BF16 weights, BF16 KV, 16384 context, 32 decode slots, prefix cache on, one
 # H100 SXM5. Production recipe for this model/GPU/precision.
 #
-#   PLOW_CAMPAIGN_NO_NIX=1 (box without nix only) HF26=<google/gemma-4-26B-A4B-it snapshot> \
+# Checkpoint: google/gemma-4-26B-A4B-it @ 4d7ae4984b7db7de8f8457170b3f1a419ee76d52.
+#   PLOW_CAMPAIGN_NO_NIX=1 (box without nix only) HF26=<that snapshot> \
 #   python3 scripts/campaign/campaign.py build recipes/infervisor/gemma-4-26b-a4b/sm90a-h100-tp1-bf16.toml --out <fresh dir>
 #
-# Measured (2026-10-07, plowrt 2cc23e9e, packet f33189e78e8e): campaign.py report MATCHED +
-# EQUIVALENT vs vLLM 0.28 BF16; FP32-reference gate PASS twice (kl_mean 0.104 / 0.116 vs vLLM
-# 0.1005, cont_frac 0.598 / 0.643 vs 0.638). Wins agentic c32/c64/c128 1.57x / 1.32x / 1.03x. Loses
-# 4K c32/c128 0.88x / 0.77x, 15K 0.87x / 0.86x, latency c1/c4 0.94x / 0.93x: per-token decode
-# (B=32 4K step 14.8 ms vs vLLM ~12) and 32 slots (2048-row sliding rings, 400 MiB each; 40 slots
-# measured no faster). docs/bringup/results/gemma26b-h100-20261007/.
+# Qualified (2026-10-09, packet 475cb17f9986, plowrt 80097064): FP32-reference gate PASS (kl_mean
+# 0.099 vs vLLM 0.1005, kl_p99 2.21 vs 2.25, cont_frac 0.630 vs 0.638, needle 1.0). Earlier runs of
+# the same gate sat at the kl_p99 limit (2.85 FAIL / 2.75 PASS on the 131072 packet; limit 2.81).
+# Serving comparison: the 2026-10-07 strict report (packet f33189e78e8e, which differs only by the
+# served name and the 0685a38a single-block MoE align below 1024 rows, digest-identical), campaign.py
+# report MATCHED + EQUIVALENT vs vLLM 0.28 BF16: wins agentic c32/c64/c128 1.57x / 1.32x / 1.03x;
+# loses 4K c32/c128 0.88x / 0.77x, 15K 0.87x / 0.86x, latency c1/c4 0.94x / 0.93x.
+# docs/bringup/results/gemma26b-h100-20261007/comparison.md.
+# Known limitations, stated plainly:
+# - Slower than vLLM on fixed-length 4K / 15K serving and at latency c1/c4: per-token decode (B=32 4K
+#   step 14.8 ms vs vLLM ~12) and 32 slots (2048-row sliding rings, 400 MiB each; 40 slots measured
+#   no faster).
+# - Decode after a prompt whose length is an exact multiple of 4096 sometimes picks a token the FP32
+#   reference is sure of against (about 1 in 5 such prompts within 12 tokens; 0 of 60 other lengths).
+#   Deterministic, BF16 only, independent of prefill chunking, launch width, prefix cache, VMM block
+#   size and token batching. Open. It is what moves kl_p99 between runs (the gate's natural-text
+#   cases are 4096 / 8192 tokens long).
+# - max_ctx 131072 was measured but is NOT gated: on the 131072 packet (c44a2a1f8463) needles pass
+#   54/54 at 8192..130000, but the long FP32 gate (20 cases to 32768) FAILS (kl_p99 2.56 vs vLLM 1.48,
+#   cont_frac 0.560 vs 0.645), driven by the 16384 / 32768 natural-text cases above. Agentic c128
+#   tok/s 51717 / 50841 at max_ctx 16384 / 131072.
 # Decode rungs 16/32 run the dense projections on cuBLASLt beside the MoE expert routes
 # (PLOW_EMIT_DECODE_CUBLASLT*). PLOW_PF_ATTN_GEMM_S32: BF16 scores on the cuBLASLt prefill
 # attention route flipped FP32-certain tokens (chat-long-15k pos 1); f32 scores cost ~5% of a 15K
@@ -21,6 +37,7 @@ namespace = "infervisor"
 name = "gemma-4-26b-a4b"
 label = "sm90a-h100-tp1-bf16"
 status = "validated"
+plow_git = "800970648b1a3ac7e8acb6535924dd0af2dfa734"
 network = "gemma4"
 
 [target]
@@ -49,7 +66,7 @@ max_ctx = 16384
 precision = "bf16"
 
 [emit]
-args = ["--segmented"]
+args = ["--segmented", "--served-name", "gemma-4-26b-a4b-it"]
 [emit.env]
 PLOW_TMA_GEMM = "1"
 PLOW_FA_MMAQK = "3"
@@ -84,6 +101,9 @@ PLOW_EMIT_GEN_KERNELS = "attn_pf_hd256_sliding"
 
 [serve.env]
 PLOW_PREFIX_CACHE = "1"
+# Pinned wide (8192 launches). The auto width objective measured TTFT p50 -20..40% but tok/s -2..3%
+# at 4K c16/c32, TTFT p99 +9..16% and FP8 agentic c128 -11% tok/s (p99 3.6x): narrow 4096 launches
+# cost ~8% more per row (2026-10-08 auto-vs-pin A/B, docs/bringup/results/gemma26b-h100-20261009).
 PLOW_PF_INTERLEAVE = "0"
 PLOW_VMM_LIVE_RINGS = "0"
 PLOW_MULTISTEP = "0"
@@ -103,3 +123,25 @@ seed = 42
 tokenizer = "{env:HF26}"
 model_id = "gemma-4-26b-a4b-it"
 gate_prompt = "<bos><|turn>user\nWhat is the capital of France? Answer in one short sentence.<turn|>\n<|turn>model\n<|channel>thought\n<channel|>"
+
+[measured]
+tok_s = 949.0
+p50_tpot_ms = 32.2
+concurrency = 128
+input_len = 4096
+output_len = 128
+client = "vllm 0.28.0 bench serve (repro_gemma26b_h100.sh st4k, 2 repeats, max_ctx 131072 packet c44a2a1f8463; st4k is unchanged across max_ctx)"
+
+# FP32-reference gates (scripts/llm/fp32_ref_gate.py; repro_gemma26b_h100.sh gate runs these):
+#   llm_fp32_ref       G26_BF16_FP32_REF = the 46-case FP32 reference (prompts sha256 103024034dce0594,
+#                      ref c7d0ed0bad501ffe...), G26_BF16_FP32_VLLM = the vLLM 0.28 capture against it (ae102ba90aba7a25...)
+# No llm_fp32_ref_long here: its prompts reach 32768 tokens, past this packet's max_ctx (the run on the
+# 131072 packet is recorded in the header).
+# Thresholds: fp32_ref_gate.py DEFAULTS (docs/bringup/agent-tools.md section 5).
+[gates]
+python = "{env:PYREF}"
+[gates.llm_fp32_ref]
+reference = "{env:G26_BF16_FP32_REF}"
+vllm_capture = "{env:G26_BF16_FP32_VLLM}"
+concurrency = 16
+timeout_s = 2400
