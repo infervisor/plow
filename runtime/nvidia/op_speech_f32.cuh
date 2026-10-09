@@ -2170,20 +2170,28 @@ __device__ __forceinline__ float sp_rel_score(const float* q, const float* k, co
     return (float)((content + relative) / sqrt((double)hw));
 }
 #define SPR_COLS 8
-/* A stream step's few query rows (i5 > 0): a block per (row, head). Its warps split the keys' scores
- * (the same sp_rel_score), then the softmax and the context sums run in key order exactly as the
- * warp-per-item body does, so the rows match the offline encoder's bit for bit. */
+/* A block per (row, head): a stream step's few query rows (i5 > 0), and full-context attention
+ * (left_chunks = u32::MAX), whose window is too wide for the warp-per-item body. Its warps split the
+ * keys' scores (the same sp_rel_score), then the softmax and the context sums run in key order
+ * exactly as the warp-per-item body does, so the rows match the offline encoder's bit for bit. */
+#define SPR_MAX_KEYS (SP_ARENA_FLOATS / 2u)
 static __device__ __forceinline__ void sp_relative_attention_rows(
     float* __restrict__ context, const float* __restrict__ query, const float* __restrict__ key,
     const float* __restrict__ value, const float* __restrict__ position, const float* __restrict__ bias_u,
     const float* __restrict__ bias_v, unsigned rows, unsigned width, unsigned heads, unsigned chunk,
-    unsigned left_chunks, unsigned key0, unsigned query_row0, unsigned slice, unsigned nblk) {
+    unsigned left_chunks, unsigned key0, unsigned query_row0, unsigned slice, unsigned nblk, unsigned valid) {
     const unsigned lane = threadIdx.x & 31u, warp = threadIdx.x >> 5, hw = width / heads;
-    float* scores = sp_smem; /* <= 64 keys (the packet's window bound) */
-    float* probs = sp_smem + 64;
+    float* scores = sp_smem;
+    float* probs = sp_smem + SPR_MAX_KEYS;
     for (unsigned item = query_row0 * heads + slice; item < rows * heads; item += nblk) {
         const unsigned qr = item / heads, head = item - qr * heads;
-        unsigned first = 0, last = rows;
+        if (qr >= valid) {
+            /* A padded row: nothing reads it, but it must not hold a stale or non-finite value. */
+            for (unsigned c = threadIdx.x; c < hw; c += PLOW_NV_THREADS)
+                context[(size_t)qr * width + (size_t)head * hw + c] = 0.f;
+            continue;
+        }
+        unsigned first = 0, last = valid;
         if (left_chunks != 0xFFFFFFFFu) {
             const unsigned qc = qr / chunk;
             first = (qc > left_chunks ? qc - left_chunks : 0u) * chunk;
@@ -2191,7 +2199,7 @@ static __device__ __forceinline__ void sp_relative_attention_rows(
             if (last > rows) last = rows;
         }
         if (first < key0) first = key0 < last ? key0 : last - 1u;
-        if (last - first > 64u) { __trap(); return; }
+        if (last - first > SPR_MAX_KEYS) { __trap(); return; }
         const size_t ho = (size_t)head * hw;
         const float* q = query + (size_t)qr * width + ho;
         for (unsigned kr = first + warp; kr < last; kr += PLOW_NV_WARPS) {
@@ -2228,11 +2236,19 @@ static __device__ __noinline__ void d_relative_attention_f32(float* __restrict__
                                                 const unsigned* __restrict__ key_start = nullptr,
                                                 unsigned query_row0 = 0) {
     const unsigned lane = threadIdx.x & 31u, warp = threadIdx.x >> 5, hw = width / heads;
+    if (left_chunks == 0xFFFFFFFFu) {
+        /* Full context, t7 (optional): the valid rows of a padded bucket. Later keys are masked
+         * and later query rows written as zeros. */
+        const unsigned valid = key_start && *key_start < rows ? *key_start : rows;
+        sp_relative_attention_rows(context, query, key, value, position, bias_u, bias_v, rows, width, heads, chunk,
+                                   left_chunks, 0u, query_row0, slice, nblk, valid);
+        return;
+    }
     /* t7 (optional): keys before this row are not filled yet (a stream's first chunks). */
     const unsigned key0 = key_start ? *key_start : 0u;
     if (query_row0 != 0u) {
         sp_relative_attention_rows(context, query, key, value, position, bias_u, bias_v, rows, width, heads, chunk,
-                                   left_chunks, key0, query_row0, slice, nblk);
+                                   left_chunks, key0, query_row0, slice, nblk, rows);
         return;
     }
     /* i5: only query rows from here on are wanted (a stream step's new rows). */

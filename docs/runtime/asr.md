@@ -578,7 +578,26 @@ at the 300 GB/s datasheet bandwidth. `plowrt asr` decodes one RNNT utterance at 
 queues four; more concurrent requests get 429.
 
 `nemotron-speech-streaming-en-0.6b` does not compile: its attention window (71 keys) exceeds
-the 64-key `RelativeAttentionF32` packet limit.
+the 64-key chunk-limited `RelativeAttentionF32` limit.
+
+### Parakeet TDT
+
+`parakeet-tdt-0.6b-v3` (25 European languages, detected, no prompt) compiles from its GGUF with
+`scripts/asr/nvidia/parakeet_build.sh` into the same `rnnt.greedy.v1` packet shape:
+
+- Full-context relative attention (`left_chunks = u32::MAX`, up to 4096 frames) on the
+  row-parallel kernel, one block per (row, head). The host writes the bucket's valid frame count
+  (`encoder.valid_rows`), which masks attention keys and is the centred convolution's length.
+- Centred depthwise convolution: the batch norm is folded into the weights and a bias at compile
+  time, then one `Conv1dF32` with SiLU fused (speech object mask `0x60000ffffull`).
+- TDT joint: the projection's last 5 columns are duration logits, split from the token logits
+  with `CopyColsF32` and argmaxed separately (`joint.duration_ids`, `tdt.duration.*`). The host loop
+  is NeMo's greedy TDT: blanks jump by their duration inside one joint evaluation.
+
+Served from a side `plowrt asr` on the 224 Lava upload segments (80 min, 16 kHz telephony): English
+WER 15.44% against the NeMo reference's 15.75% (Whisper normalizer, full-precision `.nemo`; the
+Q8_0 GGUF accounts for the 3% word differences), no output on the 7 non-speech calls, RTFx 50
+with one request at a time on the L4.
 
 ### Cache-aware Nemotron stream
 

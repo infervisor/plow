@@ -34,8 +34,13 @@ pub struct AttentionWeights<'a> {
 pub struct ConvolutionWeights<'a> {
     pub norm: NormWeights<'a>,
     pub pointwise_in: &'a str,
+    /// FP16 `[channels, kernel]` for a causal convolution; with `depthwise_bias`, FP32
+    /// `[channels, 1, kernel]` with the channel norm (batch norm) already folded in.
     pub depthwise: &'a str,
     pub channel_norm: NormWeights<'a>,
+    /// FP32 `[channels]`: set for a non-causal convolution whose batch norm is folded into
+    /// `depthwise` (`channel_norm` is then unused).
+    pub depthwise_bias: Option<&'a str>,
     pub pointwise_out: &'a str,
 }
 
@@ -55,7 +60,11 @@ pub struct ConformerSpec<'a> {
     pub feed_forward_width: u32,
     pub heads: u32,
     pub convolution_kernel: u32,
+    /// Causal depthwise convolution (zero left pad, layer-norm channel norm); otherwise the
+    /// convolution is centred and its batch norm is folded (`ConvolutionWeights::depthwise_bias`).
+    pub causal_convolution: bool,
     pub chunk_size: u32,
+    /// `u32::MAX`: full-context attention (every key; `chunk_size` is then ignored).
     pub left_chunks: u32,
     pub position_table: &'a str,
     pub position_count: u32,
@@ -285,6 +294,9 @@ fn lower_inner(
         spec.position_table,
         u64::from(spec.position_count) * u64::from(spec.width) * 4,
     );
+    // Full context: the host writes the valid frame count of the padded bucket, which masks the
+    // attention keys and the centred convolution's input past it.
+    let valid_rows = (spec.left_chunks == u32::MAX).then(|| b.tensor(VALID_ROWS, 4));
     let mut dep = None;
     for layer in layers {
         dep = Some(feed_forward(&mut b, spec, *layer, io, d0, large, dep, true));
@@ -339,12 +351,18 @@ fn lower_inner(
         );
         let bu = b.tensor(layer.attention.bias_u, u64::from(spec.width) * 4);
         let bv = b.tensor(layer.attention.bias_v, u64::from(spec.width) * 4);
+        // Full context runs a block per (row, head); the chunked body a warp per (row, head).
+        let attention_blocks = if spec.left_chunks == u32::MAX {
+            spec.frames * spec.heads
+        } else {
+            (spec.frames * spec.heads).div_ceil(8)
+        };
         let attention = b.emit(
             DevOp::RelativeAttentionF32,
-            repeated_cus(n_cu, (spec.frames * spec.heads).div_ceil(8)),
+            repeated_cus(n_cu, attention_blocks),
             &[qd, kd, vd, pos],
             |d| {
-                d.t[..7].copy_from_slice(&[d1, q, k, v, position, bu, bv]);
+                d.t[..8].copy_from_slice(&[d1, q, k, v, position, bu, bv, valid_rows.unwrap_or(TENSOR_NONE)]);
                 d.i[..5].copy_from_slice(&[
                     spec.frames,
                     spec.width,
@@ -387,30 +405,36 @@ fn lower_inner(
             d.i[0] = spec.frames;
             d.i[1] = spec.width;
         });
-        let depthwise_weight = b.tensor(
-            layer.convolution.depthwise,
-            u64::from(spec.width) * u64::from(spec.convolution_kernel) * 2,
-        );
-        let depthwise = b.emit(DevOp::CausalDepthwiseConv1dF32, b.all(), &[glu], |d| {
-            d.t[..3].copy_from_slice(&[d0, d1, depthwise_weight]);
-            d.i[..3].copy_from_slice(&[spec.frames, spec.width, spec.convolution_kernel]);
-        });
-        let channel_norm = emit_norm(
-            &mut b,
-            spec,
-            d0,
-            d1,
-            layer.convolution.channel_norm,
-            Some(depthwise),
-        );
-        let activated = b.emit(DevOp::SiluF32, b.all(), &[channel_norm], |d| {
-            d.t[..2].copy_from_slice(&[d1, d1]);
-            d.i[0] = spec.frames * spec.width;
-        });
+        let (activated, activated_rows) = if spec.causal_convolution {
+            let depthwise_weight = b.tensor(
+                layer.convolution.depthwise,
+                u64::from(spec.width) * u64::from(spec.convolution_kernel) * 2,
+            );
+            let depthwise = b.emit(DevOp::CausalDepthwiseConv1dF32, b.all(), &[glu], |d| {
+                d.t[..3].copy_from_slice(&[d0, d1, depthwise_weight]);
+                d.i[..3].copy_from_slice(&[spec.frames, spec.width, spec.convolution_kernel]);
+            });
+            let channel_norm = emit_norm(
+                &mut b,
+                spec,
+                d0,
+                d1,
+                layer.convolution.channel_norm,
+                Some(depthwise),
+            );
+            let activated = b.emit(DevOp::SiluF32, b.all(), &[channel_norm], |d| {
+                d.t[..2].copy_from_slice(&[d1, d1]);
+                d.i[0] = spec.frames * spec.width;
+            });
+            (activated, d1)
+        } else {
+            // `large` is free once the GLU has read it.
+            (emit_centred_depthwise(&mut b, spec, layer.convolution, large, d1, glu, valid_rows), large)
+        };
         let convolution = emit_q8(
             &mut b,
             d0,
-            d1,
+            activated_rows,
             layer.convolution.pointwise_out,
             spec.frames,
             spec.width,
@@ -493,6 +517,35 @@ fn feed_forward(
     emit_add(b, spec, io, io, normalized, 0.5, Some(contract))
 }
 
+/// Centred depthwise convolution with its batch norm folded into `weights.depthwise` (FP32
+/// `[channels, 1, kernel]`) and `weights.depthwise_bias`, then SiLU: one [`DevOp::Conv1dF32`].
+/// With `valid_rows`, input rows past it are padding (zeros), as the reference masks them.
+fn emit_centred_depthwise(
+    b: &mut Builder,
+    spec: ConformerSpec<'_>,
+    weights: ConvolutionWeights<'_>,
+    output: u32,
+    input: u32,
+    dep: u32,
+    valid_rows: Option<u32>,
+) -> u32 {
+    let (k, width) = (spec.convolution_kernel, spec.width);
+    let weight = b.tensor(weights.depthwise, u64::from(width) * u64::from(k) * 4);
+    let bias = b.tensor(
+        weights.depthwise_bias.expect("validated: a centred convolution has a folded bias"),
+        u64::from(width) * 4,
+    );
+    let pad = (k - 1) / 2;
+    // Depthwise Conv1dF32: one block per 64 output rows x 64 channels.
+    let blocks = spec.frames.div_ceil(64) * width.div_ceil(64);
+    b.emit(DevOp::Conv1dF32, repeated_cus(b.n_cu(), blocks), &[dep], |d| {
+        d.t[..4].copy_from_slice(&[output, input, weight, bias]);
+        d.t[6] = valid_rows.unwrap_or(TENSOR_NONE);
+        d.i = [1, spec.frames, width, width, k, 1, 1, width];
+        d.j = [pad | (pad << 16), packet::dev::ACT_SILU << 8];
+    })
+}
+
 fn emit_norm(
     b: &mut Builder,
     spec: ConformerSpec<'_>,
@@ -567,6 +620,13 @@ fn repeated_cus(n_cu: u32, blocks: u32) -> Vec<u32> {
     (0..blocks).map(|block| block % n_cu).collect()
 }
 
+/// The NVIDIA row-parallel relative attention keeps a row's scores and probabilities in the
+/// speech arena (`SPR_MAX_KEYS`); this bound stays well inside it.
+pub const FULL_CONTEXT_MAX_KEYS: u32 = 4096;
+
+/// Full-context encoders: u32 valid frame count of the padded bucket, written by the host.
+pub const VALID_ROWS: &str = "in.asr.valid_rows";
+
 fn validate(
     spec: ConformerSpec<'_>,
     layers: &[ConformerLayerWeights<'_>],
@@ -586,12 +646,28 @@ fn validate(
     if spec.width % spec.heads != 0 || spec.width % 32 != 0 || spec.feed_forward_width % 32 != 0 {
         return Err("Conformer projection geometry must divide heads and Q8_0 blocks".into());
     }
-    let window = spec
-        .chunk_size
-        .checked_mul(spec.left_chunks + 1)
-        .ok_or("attention window overflows")?;
-    if window > 64 {
-        return Err("relative attention packet currently supports at most 64 keys".into());
+    if spec.left_chunks == u32::MAX {
+        if spec.frames > FULL_CONTEXT_MAX_KEYS {
+            return Err(format!(
+                "full-context relative attention supports at most {FULL_CONTEXT_MAX_KEYS} frames"
+            ));
+        }
+    } else {
+        let window = spec
+            .chunk_size
+            .checked_mul(spec.left_chunks + 1)
+            .ok_or("attention window overflows")?;
+        if window > 64 {
+            return Err("chunk-limited relative attention supports at most 64 keys".into());
+        }
+    }
+    let centred_ok = |layer: &ConformerLayerWeights<'_>| {
+        layer.convolution.depthwise_bias.is_some() && spec.convolution_kernel % 2 == 1
+    };
+    if spec.causal_convolution && layers.iter().any(|l| l.convolution.depthwise_bias.is_some())
+        || !spec.causal_convolution && !layers.iter().all(centred_ok)
+    {
+        return Err("a centred convolution needs an odd kernel and a folded bias per layer; a causal one none".into());
     }
     if spec.position_center < spec.frames
         || spec.position_center + spec.frames > spec.position_count + 1
@@ -626,6 +702,9 @@ pub fn append_stream_step(
     rows: u32,
 ) -> Result<PacketPrefix, String> {
     validate(spec, layers, prefix.model.n_cu)?;
+    if !spec.causal_convolution || spec.left_chunks == u32::MAX {
+        return Err("a cache-aware stream needs causal convolutions and chunk-limited attention".into());
+    }
     let left = stream_left_rows(&spec);
     let window = left + rows;
     let tail = spec.convolution_kernel - 1;
@@ -740,6 +819,9 @@ pub fn stream_init(
     rows: u32,
     n_cu: u32,
 ) -> Result<Model, String> {
+    if !spec.causal_convolution || spec.left_chunks == u32::MAX {
+        return Err("a cache-aware stream needs causal convolutions and chunk-limited attention".into());
+    }
     let window = stream_left_rows(&spec) + rows;
     if spec.position_center < window || spec.position_center + window > spec.position_count + 1 {
         return Err("relative position table does not cover the stream window".into());
@@ -790,14 +872,13 @@ mod tests {
         beta: "encoder.norm.bias",
     };
 
-    #[test]
-    fn lowering_emits_only_generic_packet_ops() {
+    fn layer() -> ConformerLayerWeights<'static> {
         let ff = FeedForwardWeights {
             norm: N,
             expand: "encoder.ff.expand",
             contract: "encoder.ff.contract",
         };
-        let layer = ConformerLayerWeights {
+        ConformerLayerWeights {
             feed_forward1: ff,
             attention: AttentionWeights {
                 norm: N,
@@ -814,29 +895,65 @@ mod tests {
                 pointwise_in: "encoder.conv.in",
                 depthwise: "encoder.conv.dw",
                 channel_norm: N,
+                depthwise_bias: None,
                 pointwise_out: "encoder.conv.out",
             },
             feed_forward2: ff,
             output_norm: N,
-        };
-        let packets = lower(
-            ConformerSpec {
-                frames: 8,
-                width: 32,
-                feed_forward_width: 64,
-                heads: 2,
-                convolution_kernel: 3,
-                chunk_size: 4,
-                left_chunks: 1,
-                position_table: "encoder.pos",
-                position_count: 31,
-                position_center: 15,
-                epsilon: 1e-5,
-            },
-            &[layer],
-            4,
-        )
-        .unwrap();
+        }
+    }
+
+    fn spec() -> ConformerSpec<'static> {
+        ConformerSpec {
+            frames: 8,
+            width: 32,
+            feed_forward_width: 64,
+            heads: 2,
+            convolution_kernel: 3,
+            causal_convolution: true,
+            chunk_size: 4,
+            left_chunks: 1,
+            position_table: "encoder.pos",
+            position_count: 31,
+            position_center: 15,
+            epsilon: 1e-5,
+        }
+    }
+
+    #[test]
+    fn full_context_centred_convolution_folds_the_norm_into_one_conv1d() {
+        let mut layer = layer();
+        layer.convolution.depthwise = "encoder.conv.dw.folded";
+        layer.convolution.depthwise_bias = Some("encoder.conv.dw.folded_bias");
+        let spec = ConformerSpec { causal_convolution: false, left_chunks: u32::MAX, ..spec() };
+        let packets = lower(spec, &[layer], 4).unwrap();
+        let insts = &packets.model.progs[0].insts;
+        let ops: Vec<_> = insts.iter().map(|d| DevOp::from_u16(d.op).unwrap()).collect();
+        assert_eq!(ops.len(), 23);
+        assert!(!ops.iter().any(|op| matches!(op, DevOp::CausalDepthwiseConv1dF32 | DevOp::SiluF32)));
+        let conv = insts.iter().find(|d| d.op == DevOp::Conv1dF32 as u16).unwrap();
+        assert_eq!(conv.i, [1, 8, 32, 32, 3, 1, 1, 32]);
+        assert_eq!(conv.j, [1 | (1 << 16), packet::dev::ACT_SILU << 8]);
+        let attention = insts.iter().find(|d| d.op == DevOp::RelativeAttentionF32 as u16).unwrap();
+        assert_eq!(attention.i[4], u32::MAX);
+        // One host-written valid-row count masks both the attention keys and the conv input.
+        let valid = attention.t[7];
+        assert_eq!(packets.model.tensors[valid as usize].name, VALID_ROWS);
+        assert_eq!(conv.t[6], valid);
+        // A stream over full context, a window wider than the kernel's key bound, and a centred
+        // convolution without a folded bias are all refused.
+        let prefix = lower(self::spec(), &[self::layer()], 4).unwrap().into_prefix();
+        assert!(append_stream_step(spec, &[layer], prefix, 0, 4).is_err());
+        let max = FULL_CONTEXT_MAX_KEYS;
+        let wide = ConformerSpec { frames: max + 1, position_count: 2 * max + 1, position_center: max + 1, ..spec };
+        assert!(lower(wide, &[layer], 4).is_err());
+        layer.convolution.depthwise_bias = None;
+        assert!(lower(spec, &[layer], 4).is_err());
+    }
+
+    #[test]
+    fn lowering_emits_only_generic_packet_ops() {
+        let packets = lower(spec(), &[layer()], 4).unwrap();
         let ops: Vec<_> = packets.model.progs[0]
             .insts
             .iter()

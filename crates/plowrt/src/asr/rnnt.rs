@@ -15,6 +15,10 @@ pub trait RnntExecution: Send {
     fn frames(&self) -> usize;
     fn predict(&mut self, previous_token: u32) -> Result<()>;
     fn joint_argmax(&mut self, first_frame: usize, output: &mut [u32]) -> Result<usize>;
+    /// TDT: the duration-logit argmax of each row the last [`Self::joint_argmax`] evaluated.
+    fn joint_durations(&self) -> &[u32] {
+        &[]
+    }
     fn commit_prediction(&mut self);
 }
 
@@ -23,6 +27,8 @@ pub struct GreedyRnnt {
     max_symbols_per_frame: usize,
     previous_token: u32,
     predictor_valid: bool,
+    /// TDT: frames each duration logit advances; empty for plain RNNT.
+    tdt_durations: Vec<u32>,
 }
 
 pub struct PacketRnnt {
@@ -42,6 +48,11 @@ pub struct PacketRnnt {
     joint_batch_max: usize,
     blank_id: u32,
     max_symbols_per_frame: usize,
+    /// TDT packets: `joint.duration_ids` and the frames each duration logit advances.
+    duration_ids: Option<PacketTensor>,
+    tdt_durations: Vec<u32>,
+    /// Full-context encoders: the valid frame count of the padded bucket, written per run.
+    valid_rows: Option<PacketTensor>,
     state_zeros: Vec<u8>,
     input_frames: Option<usize>,
     frame_transform: Vec<[usize; 4]>,
@@ -176,6 +187,26 @@ impl PacketRnnt {
                 "packet RNNT tensor geometry is inconsistent".into(),
             ));
         }
+        let (duration_ids, tdt_durations) = match pipeline.optional_parameter("tdt.durations") {
+            None => (None, Vec::new()),
+            Some(count) => {
+                let durations = (0..count)
+                    .map(|index| {
+                        u32::try_from(pipeline.parameter(&format!("tdt.duration.{index}"))?)
+                            .map_err(|_| RuntimeError::Rejected("TDT duration overflows".into()))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                let tensor = pipeline.tensor("joint.duration_ids")?;
+                if durations.is_empty() || tensor.bytes != ids.bytes {
+                    return Err(RuntimeError::Rejected("packet TDT geometry is inconsistent".into()));
+                }
+                (Some(tensor), durations)
+            }
+        };
+        let valid_rows = pipeline.tensor("encoder.valid_rows").ok();
+        if valid_rows.is_some_and(|tensor| tensor.bytes != std::mem::size_of::<u32>()) {
+            return Err(RuntimeError::Rejected("packet encoder valid-rows tensor is not a u32".into()));
+        }
         let stream = if backend == "cuda" && pipeline.program("stream.init").is_ok() {
             let usize_param = |name| usize_parameter(&pipeline, name);
             let input_tensor = pipeline.tensor("stream.input")?;
@@ -229,6 +260,9 @@ impl PacketRnnt {
             joint_batch_max,
             blank_id,
             max_symbols_per_frame,
+            duration_ids,
+            tdt_durations,
+            valid_rows,
             state_zeros,
             input_frames,
             frame_transform,
@@ -339,10 +373,12 @@ impl PacketRnnt {
             active_bank: stream.active_bank,
             pending_predictor: None,
             all_ids: vec![0; self.joint_batch_max],
+            duration_ids: self.duration_ids,
+            all_durations: vec![0; self.joint_batch_max],
             profile: None,
         };
         // The predictor reruns from the saved bank each step (idempotent), so only its banks persist.
-        let mut decoder = GreedyRnnt::new(self.blank_id, self.max_symbols_per_frame)?;
+        let mut decoder = GreedyRnnt::new(self.blank_id, self.max_symbols_per_frame)?.with_tdt_durations(&self.tdt_durations);
         decoder.previous_token = stream.previous_token;
         let tokens = decoder.decode_with(&mut execution, on_emit)?;
         stream.active_bank = execution.active_bank;
@@ -451,6 +487,11 @@ impl PacketRnnt {
         }
         self.runtime
             .write_tensor(self.input, bytemuck::cast_slice(input))?;
+        if let Some(valid_rows) = self.valid_rows {
+            let valid = u32::try_from(frames)
+                .map_err(|_| RuntimeError::Rejected("encoder frame count overflows".into()))?;
+            self.runtime.write_tensor(valid_rows, &valid.to_ne_bytes())?;
+        }
         self.runtime
             .run_sequence(&self.encoder_programs[encoder].1)?;
         let mut profile = self.profiling.then(|| RnntProfile {
@@ -470,10 +511,12 @@ impl PacketRnnt {
             active_bank: 0,
             pending_predictor: None,
             all_ids: vec![0; self.joint_batch_max],
+            duration_ids: self.duration_ids,
+            all_durations: vec![0; self.joint_batch_max],
             profile: profile.as_mut(),
         };
         let result =
-            GreedyRnnt::new(self.blank_id, self.max_symbols_per_frame)?.decode_with(&mut execution, on_emit);
+            GreedyRnnt::new(self.blank_id, self.max_symbols_per_frame)?.with_tdt_durations(&self.tdt_durations).decode_with(&mut execution, on_emit);
         self.last_profile = profile;
         result
     }
@@ -520,6 +563,9 @@ struct PacketRnntExecution<'a> {
     active_bank: usize,
     pending_predictor: Option<usize>,
     all_ids: Vec<u32>,
+    /// TDT: `joint.duration_ids`, read beside the token ids.
+    duration_ids: Option<PacketTensor>,
+    all_durations: Vec<u32>,
     profile: Option<&'a mut RnntProfile>,
 }
 
@@ -583,11 +629,19 @@ impl RnntExecution for PacketRnntExecution<'_> {
         let transfer = self.profile.is_some().then(Instant::now);
         self.runtime
             .read_tensor(self.ids, bytemuck::cast_slice_mut(&mut self.all_ids))?;
+        if let Some(durations) = self.duration_ids {
+            self.runtime
+                .read_tensor(durations, bytemuck::cast_slice_mut(&mut self.all_durations))?;
+        }
         if let (Some(profile), Some(transfer)) = (&mut self.profile, transfer) {
             profile.transfer_us += transfer.elapsed().as_secs_f64() * 1e6;
         }
         output[..rows].copy_from_slice(&self.all_ids[..rows]);
         Ok(rows)
+    }
+
+    fn joint_durations(&self) -> &[u32] {
+        &self.all_durations
     }
 
     fn commit_prediction(&mut self) {
@@ -673,7 +727,15 @@ impl GreedyRnnt {
             max_symbols_per_frame,
             previous_token: blank_id,
             predictor_valid: false,
+            tdt_durations: Vec::new(),
         })
+    }
+
+    /// Token-and-duration transducer decoding: each joint row also picks how many frames to
+    /// advance, `durations[argmax]`.
+    pub fn with_tdt_durations(mut self, durations: &[u32]) -> Self {
+        self.tdt_durations = durations.to_vec();
+        self
     }
 
     pub fn reset(&mut self) {
@@ -693,6 +755,9 @@ impl GreedyRnnt {
         execution: &mut dyn RnntExecution,
         on_emit: &mut dyn FnMut(&[u32]),
     ) -> Result<Vec<u32>> {
+        if !self.tdt_durations.is_empty() {
+            return self.decode_tdt(execution, on_emit);
+        }
         let frames = execution.frames();
         let mut emitted = Vec::new();
         let mut ids = vec![self.blank_id; frames];
@@ -731,6 +796,62 @@ impl GreedyRnnt {
             if symbols_at_frame == self.max_symbols_per_frame {
                 frame += 1;
                 symbols_at_frame = 0;
+            }
+        }
+        Ok(emitted)
+    }
+
+    /// NeMo's greedy TDT loop, walked over one joint evaluation per predictor state: the rows
+    /// past `frame` share the predictor, so blanks jump by their duration without another
+    /// dispatch. A blank that predicts 0 frames would repeat unchanged until the symbol limit,
+    /// so it advances one frame; a token that predicts 0 stays on its frame up to that limit.
+    fn decode_tdt(
+        &mut self,
+        execution: &mut dyn RnntExecution,
+        on_emit: &mut dyn FnMut(&[u32]),
+    ) -> Result<Vec<u32>> {
+        let frames = execution.frames();
+        let mut emitted = Vec::new();
+        let mut ids = vec![self.blank_id; frames];
+        let mut frame = 0;
+        let mut symbols_at_frame = 0;
+        while frame < frames {
+            if !self.predictor_valid {
+                execution.predict(self.previous_token)?;
+                self.predictor_valid = true;
+            }
+            let window = frame;
+            let evaluated = execution.joint_argmax(window, &mut ids[..frames - window])?;
+            if evaluated == 0 || evaluated > frames - window || execution.joint_durations().len() < evaluated {
+                return Err(RuntimeError::Device("TDT joint returned an invalid frame count".into()));
+            }
+            while frame < window + evaluated {
+                let row = frame - window;
+                let skip = *self
+                    .tdt_durations
+                    .get(execution.joint_durations()[row] as usize)
+                    .ok_or_else(|| RuntimeError::Device("TDT duration index is out of range".into()))?
+                    as usize;
+                let token = ids[row];
+                // NeMo counts every step at a frame, blanks included; a step that lands on the
+                // limit advances one frame more than its duration.
+                symbols_at_frame += 1;
+                let at_limit = usize::from(symbols_at_frame == self.max_symbols_per_frame);
+                if token == self.blank_id {
+                    frame += if skip == 0 { 1 } else { skip + at_limit };
+                    symbols_at_frame = 0;
+                    continue;
+                }
+                emitted.push(token);
+                on_emit(&emitted);
+                execution.commit_prediction();
+                self.previous_token = token;
+                self.predictor_valid = false;
+                if skip > 0 || at_limit == 1 {
+                    frame += skip + at_limit;
+                    symbols_at_frame = 0;
+                }
+                break;
             }
         }
         Ok(emitted)
@@ -807,6 +928,74 @@ mod tests {
         assert_eq!(decoder.decode(&mut execution).unwrap(), [7]);
         assert_eq!(execution.calls, [(0, 3), (1, 2)]);
         assert_eq!(execution.commits, 1);
+    }
+
+    /// Per predictor state (0, 1, ...): `(token, duration index)` for every frame.
+    struct ScriptedTdt {
+        rows: Vec<Vec<(u32, u32)>>,
+        prediction: usize,
+        calls: Vec<usize>,
+        durations: Vec<u32>,
+    }
+
+    impl RnntExecution for ScriptedTdt {
+        fn frames(&self) -> usize {
+            self.rows[0].len()
+        }
+
+        fn predict(&mut self, _previous_token: u32) -> Result<()> {
+            self.prediction += 1;
+            Ok(())
+        }
+
+        fn joint_argmax(&mut self, first_frame: usize, output: &mut [u32]) -> Result<usize> {
+            self.calls.push(first_frame);
+            let rows = &self.rows[self.prediction - 1][first_frame..];
+            for (out, &(token, _)) in output.iter_mut().zip(rows) {
+                *out = token;
+            }
+            self.durations = rows.iter().map(|&(_, d)| d).collect();
+            Ok(rows.len())
+        }
+
+        fn joint_durations(&self) -> &[u32] {
+            &self.durations
+        }
+
+        fn commit_prediction(&mut self) {}
+    }
+
+    #[test]
+    fn tdt_jumps_blanks_by_duration_and_stays_on_zero_duration_tokens() {
+        const B: u32 = 13;
+        // Durations [0, 1, 2, 3, 4]: index = frames advanced.
+        let mut execution = ScriptedTdt {
+            rows: vec![
+                // Blank skips 2 to frame 2, which emits 7 and stays (duration 0).
+                vec![(B, 2), (9, 1), (7, 0), (B, 1), (B, 1), (B, 1)],
+                // Same frame: 8 advances 1 to frame 3; frame 3's blank with duration 0 moves 1.
+                vec![(B, 1), (B, 1), (8, 1), (B, 0), (B, 4), (5, 1)],
+                // Frame 4 blank jumps 4, past the end.
+                vec![(B, 1), (B, 1), (B, 1), (B, 1), (B, 4), (5, 1)],
+            ],
+            prediction: 0,
+            calls: Vec::new(),
+            durations: Vec::new(),
+        };
+        let mut decoder = GreedyRnnt::new(B, 10).unwrap().with_tdt_durations(&[0, 1, 2, 3, 4]);
+        assert_eq!(decoder.decode(&mut execution).unwrap(), [7, 8]);
+        assert_eq!(execution.calls, [0, 2, 3]);
+
+        // A zero-duration token at the symbol limit moves one frame on.
+        let mut limited = ScriptedTdt {
+            rows: vec![vec![(4, 0), (B, 4)], vec![(4, 0), (B, 4)], vec![(4, 0), (B, 4)]],
+            prediction: 0,
+            calls: Vec::new(),
+            durations: Vec::new(),
+        };
+        let mut decoder = GreedyRnnt::new(B, 2).unwrap().with_tdt_durations(&[0, 1, 2, 3, 4]);
+        assert_eq!(decoder.decode(&mut limited).unwrap(), [4, 4]);
+        assert_eq!(limited.calls, [0, 0, 1]);
     }
 
     #[test]
