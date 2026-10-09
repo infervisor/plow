@@ -281,6 +281,21 @@ PyTorch model to 6e-7. A configured packet that does not load fails startup.
   (`min_silence_ms` / `silence_duration_ms`, 200 ms context, overlong cuts at the least-speech
   frame) is unchanged.
 
+## Transcript output policy
+
+Every transcription (uploads, Realtime and WebSocket turns) passes `Route::submit`, which applies:
+
+- `--asr-numerals` (`PLOW_ASR_NUMERALS`, on): runs of three or more spoken digits become numerals,
+  ten digits as `918-734-1538`, seven as `734-1538`, others plain; "double five" is `55`. Runs need
+  two digits other than "oh", and "oh" at a run's ends stays a word, so interjections survive.
+- `--asr-auto-languages` (`PLOW_ASR_AUTO_LANGUAGES`, `English,Spanish`): a final pass that named no
+  language and was detected in another is transcribed again in the first listed (a caller opening
+  in Hindi otherwise gets the whole segment in Devanagari). Empty = any language.
+- Uploads under 0.5 s are padded with silence to the minimum instead of refused.
+
+On the customer's 49-call set with their `transcribe.py`/`score.py` (Gemini references), English
+caller WER went 12.03% → 9.94% and caller digit recall 31.8% → 50.0% (language auto).
+
 ## Reference checks
 
 `scripts/asr/reference.py` exports fixtures using qwen-asr 0.0.6,
