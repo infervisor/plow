@@ -529,6 +529,17 @@ def cmd_reference(a):
     tok = AutoTokenizer.from_pretrained(a.hf, local_files_only=True)
     prompts = json.loads(Path(a.prompts).read_text())
     model, weights = load_fp32(a.hf, a.device, headroom_gib=a.offload_headroom_gib)
+    # HF's sliding cache keeps its last-window slice as a view of the whole prefill K/V, so every
+    # sliding layer pins prompt-length K/V (31B at 32K: 54 GB in FP32). Copy the window out.
+    from transformers import cache_utils
+    window_update = cache_utils.DynamicSlidingWindowLayer.update
+
+    def update_owning_window(self, *args, **kwargs):
+        out = window_update(self, *args, **kwargs)
+        if getattr(self.keys, "_base", None) is not None:
+            self.keys, self.values = self.keys.clone(), self.values.clone()
+        return out
+    cache_utils.DynamicSlidingWindowLayer.update = update_owning_window
     # Long prompts compute their masks inside fp32_attention (causal + sliding window): HF would
     # materialize a q x kv mask per layer type, 64 GiB at 262144 tokens.
     no_masks = {t: None for t in set(getattr(model.config, "layer_types", None) or ["full_attention"])}
