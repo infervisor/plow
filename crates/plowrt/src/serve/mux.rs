@@ -8747,10 +8747,25 @@ mod host_bench {
                     .data(crate::serve::stream::chunk_data(&frame)),
             );
         }
+        let serde_event_us = t.elapsed().as_secs_f64() * 1e6 / frames as f64;
+        // The served path: the stream's fixed head serialized once, one choice per frame.
+        let head = crate::serve::stream::FrameHead::new(&id, "text_completion", 1_789_920_673, &model);
+        let t = Instant::now();
+        for i in 0..frames {
+            let choice = CompletionChoice {
+                index: 0,
+                text: if i % 2 == 0 { " the".into() } else { ".".into() },
+                logprobs: None,
+                finish_reason: None,
+                x_plow_finish_reason: None,
+            };
+            let _ = std::hint::black_box(head.frame(&choice));
+        }
         println!(
-            "HOSTBENCH per token: detok_us={:.2} ({n_tok} tokens) sse_frame_us={:.2}",
+            "HOSTBENCH per token: detok_us={:.2} ({n_tok} tokens) sse_frame_us={:.2} (serde+Event {:.2})",
             detok_ns as f64 / 1e3 / n_tok.max(1) as f64,
-            t.elapsed().as_secs_f64() * 1e6 / frames as f64
+            t.elapsed().as_secs_f64() * 1e6 / frames as f64,
+            serde_event_us,
         );
 
         // Per-tick dispatcher <-> engine handoff around a 2 ms tick body, the mux's own shape.

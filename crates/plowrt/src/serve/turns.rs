@@ -694,6 +694,11 @@ impl StageRun {
     pub fn sse_comment(&self) -> axum::response::sse::Event {
         axum::response::sse::Event::default().comment(format!("server-timing {}", self.timing().header()))
     }
+
+    /// [`Self::sse_comment`] as its wire bytes.
+    pub fn sse_comment_frame(&self) -> axum::body::Bytes {
+        crate::serve::stream::sse_comment(&format!("server-timing {}", self.timing().header()))
+    }
 }
 
 fn ms(d: Duration) -> f64 {
