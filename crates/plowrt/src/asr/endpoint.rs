@@ -1,5 +1,5 @@
 //! Endpointing of a 16 kHz stream into utterance segments, for continuous WebSocket sessions:
-//! by energy, or by a Silero VAD packet's speech probability. Only the open segment (or a short
+//! by energy, or by a VAD packet's speech probability. Only the open segment (or a short
 //! lead-in) stays buffered.
 
 use std::collections::VecDeque;
@@ -48,8 +48,8 @@ struct Open {
 
 enum Detector {
     Energy { levels: VecDeque<f32> },
-    /// Silero's hysteresis: speech from `threshold`, silence below `threshold - 0.15`.
-    Silero { vad: Arc<Vad>, stream: VadStream, threshold: f32, speaking: bool },
+    /// The packet's hysteresis: speech from `threshold`, silence below `release`.
+    Vad { vad: Arc<Vad>, stream: VadStream, threshold: f32, release: f32, speaking: bool },
 }
 
 pub struct Endpointer {
@@ -74,11 +74,17 @@ impl Endpointer {
         Self::with_detector(config, Detector::Energy { levels: VecDeque::with_capacity(FLOOR_FRAMES) }, FRAME)
     }
 
-    /// Speech is a Silero frame at or above `threshold` (Realtime `server_vad.threshold`).
-    pub fn with_vad(config: EndpointConfig, vad: Arc<Vad>, threshold: f32) -> Self {
+    /// Speech is a VAD frame at or above `threshold` (Realtime `server_vad.threshold`), else the
+    /// packet's default; it ends below the packet's release threshold for it.
+    pub fn with_vad(config: EndpointConfig, vad: Arc<Vad>, threshold: Option<f32>) -> Self {
         let frame = vad.frame;
         let stream = vad.open();
-        Self::with_detector(config, Detector::Silero { vad, stream, threshold, speaking: false }, frame)
+        let mut options = vad.segment_options();
+        if let Some(threshold) = threshold {
+            options.threshold = threshold;
+        }
+        let (threshold, release) = (options.threshold, options.release_threshold());
+        Self::with_detector(config, Detector::Vad { vad, stream, threshold, release, speaking: false }, frame)
     }
 
     fn with_detector(config: EndpointConfig, detector: Detector, frame: usize) -> Self {
@@ -150,11 +156,11 @@ impl Endpointer {
                 let floor = levels.iter().copied().fold(f32::INFINITY, f32::min);
                 (rms, rms > (floor * MARGIN).max(MIN_LEVEL))
             }
-            Detector::Silero { vad, stream, threshold, speaking } => {
+            Detector::Vad { vad, stream, threshold, release, speaking } => {
                 let p = vad.step(stream, frame);
                 if p >= *threshold {
                     *speaking = true;
-                } else if p < (*threshold - 0.15).max(0.01) {
+                } else if p < *release {
                     *speaking = false;
                 }
                 (p, *speaking)
@@ -302,12 +308,12 @@ mod tests {
         let reference: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.join("reference.json")).unwrap()).unwrap();
         let signal: Vec<f32> = reference["signal"].as_array().unwrap().iter().map(|v| v.as_f64().unwrap() as f32).collect();
         let speech: Vec<usize> = vad.probabilities(&signal).iter().enumerate().filter(|(_, &p)| p >= 0.5).map(|(f, _)| f * 512).collect();
-        let segments = feed(&mut Endpointer::with_vad(CONFIG, vad.clone(), 0.5), &signal, 1_000);
+        let segments = feed(&mut Endpointer::with_vad(CONFIG, vad.clone(), None), &signal, 1_000);
         assert_eq!(segments.len(), 1);
         let (first, last) = (speech[0] as u64, *speech.last().unwrap() as u64 + 512);
         assert_eq!(segments[0].start, first - CONTEXT as u64);
         assert!(segments[0].end >= last && segments[0].end <= last + CONTEXT as u64 + 512);
-        assert!(feed(&mut Endpointer::with_vad(CONFIG, vad, 0.5), &silence(5.0), 4_000).is_empty());
+        assert!(feed(&mut Endpointer::with_vad(CONFIG, vad, None), &silence(5.0), 4_000).is_empty());
     }
 
     #[test]

@@ -342,6 +342,11 @@ path = "examples/asr/parakeet_pipeline_compile.rs"
 required-features = ["gguf"]
 
 [[example]]
+name = "asr_packet_upgrade"
+path = "examples/asr/packet_upgrade.rs"
+required-features = ["gguf"]
+
+[[example]]
 name = "asr_silero_vad_compile"
 path = "examples/asr/silero_vad_compile.rs"
 

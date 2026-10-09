@@ -31,6 +31,7 @@ A bundle is a directory of compiled assets: packets (`*.pkt`), cubins, `objects/
 | checkpoint identity | `serve.json` (a `model.pkt` section) `weights`: per shard, size + sha256 of the safetensors header (every tensor's name, dtype, shape, offset), recorded at emit | plowrt at load, before any weight is read |
 | cuBLASLt minimum | `build.json` `runtime_requires.cublaslt` (`"13.4"`) when declared; otherwise derived from the emit knobs in `build.json` `knobs.values`: `emit.moe_pf_lt` or `emit.moe_dec_lt` (grouped cuBLASLt MoE routes) need 13.4. Bundles emitted before the field exist get the derived default | plowrt at startup, per bundle |
 | minimum plowrt | `build.json` `runtime_requires.plowrt_contract` (integer); this plowrt implements contract 1. Absent = 1 | plowrt at startup, per bundle |
+| speech contract (ASR, VAD) | packet pipeline parameter `contract` (+ the driver name), per pipeline: `vad.frame.v1` 1, `rnnt.greedy.v1` 1, audio-LM `causal.v1` 1 ([ASR/VAD packet contract](runtime/asr-packet-contract.md)) | plowrt when it loads the packet (`--assets`, `--asr-packet`, `--asr-vad-packet`): newer or older than implemented = refusal |
 | serve settings | `serve.json` `serve_defaults` (registered `PLOW_*` knobs; the environment overrides) | plowrt at startup (unknown knob = refusal) |
 | kit pairing | `KIT.json` / `PAIRING.txt`: the plowrt sha256 and the sha256 of every packet it was qualified with | `plow-voice.sh preflight` |
 
@@ -38,7 +39,7 @@ A bundle is a directory of compiled assets: packets (`*.pkt`), cubins, `objects/
 
 `plowrt serve --assets <dir>[,checkpoint=<hf dir>]` pairs each bundle with its checkpoint; repeat
 `--assets` per model. `--asr-packet NAME=PATH.pkt,checkpoint=<hf dir>` does the same for a packet
-ASR model (`tokenizer=` is the same input, for a tokenizer file such as Nemotron's GGUF).
+audio-LM packet (`tokenizer=` is an alias); RNNT packets carry their vocabulary and need none.
 
 Resolution, per bundle:
 
@@ -60,6 +61,7 @@ source=...` for each bundle.
 | packet records no pins (old emit) | warning; tensors are still checked by byte size at bind |
 | bundle needs cuBLASLt >= X and the runtime loads an older one, or none | startup error naming the model, the requirement and why, and the library found |
 | bundle needs a newer runtime contract | startup error |
+| ASR/VAD packet with another speech contract (e.g. a contract-0 `vad.silero.v1` or GGUF-vocabulary RNNT packet), or a required speech op/parameter missing | startup error; `asr_packet_upgrade` rewrites contract-0 metadata in place of a re-emit |
 | `--assets` value with an unknown key, or two different checkpoints for one bundle | startup error |
 | packet/object pairing hash mismatch | module refused at load |
 | a model listed by the profile is not in the kit, or its mapped checkpoint dir is missing | `plow-voice.sh` refuses to start |

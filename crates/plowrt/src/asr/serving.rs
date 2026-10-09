@@ -19,7 +19,7 @@ use tokio::sync::{mpsc, oneshot, watch, OwnedSemaphorePermit, Semaphore};
 
 use super::{
     endpoint::{EndpointConfig, Endpointer, Segment},
-    vad::{speech_samples, speech_segments, SegmentOptions},
+    vad::{speech_samples, speech_segments},
     frontend::{decode_wav, decode_wav_chunk, decode_wav_within, AudioError, Resampler, MAX_SAMPLES, SAMPLE_RATE},
     FinalizationPolicy, Transcriber, Transcript, TranscriptionInput,
 };
@@ -465,8 +465,9 @@ impl AsrServer {
         self
     }
 
-    /// A stream endpointer: Silero at `threshold` when a VAD packet is loaded, else energy.
-    fn endpointer(&self, config: EndpointConfig, threshold: f32) -> Endpointer {
+    /// A stream endpointer: the VAD packet at `threshold` (default: the packet's) when one is
+    /// loaded, else energy.
+    fn endpointer(&self, config: EndpointConfig, threshold: Option<f32>) -> Endpointer {
         match &self.vad {
             Some(vad) => Endpointer::with_vad(config, vad.clone(), threshold),
             None => Endpointer::new(config),
@@ -888,7 +889,8 @@ async fn transcribe_upload(state: Arc<AsrServer>, mut multipart: Multipart, ids:
             let samples = if recorded { decode_wav_chunk(&file) } else { decode_wav(&file) }?;
             let speech = vad.map(|vad| {
                 let probabilities = vad.probabilities(&samples);
-                speech_samples(&speech_segments(&probabilities, vad.frame, vad.sample_rate, samples.len(), GATE_SEGMENTS))
+                let (options, least) = vad.gate();
+                (speech_samples(&speech_segments(&probabilities, vad.frame, vad.sample_rate, samples.len(), options)), least)
             });
             Ok((samples, speech))
         })
@@ -900,9 +902,9 @@ async fn transcribe_upload(state: Arc<AsrServer>, mut multipart: Multipart, ids:
         },
     };
     drop(upload);
-    if speech.is_some_and(|speech| speech < GATE_MIN_SPEECH) {
+    if speech.is_some_and(|(speech, least)| speech < least) {
         // No speech: an audio-LM would transcribe the noise (or echo its prompt); nothing runs.
-        tracing::debug!(speech_ms = speech.unwrap_or(0) / 16, "upload has no speech");
+        tracing::debug!(speech_ms = speech.map_or(0, |(s, _)| s) / 16, "upload has no speech");
         return if stream {
             sse_events(vec![transcript_event("transcript.text.done", ids, json!({"text": "", "language": language, "final": true}))])
         } else if format == "text" {
@@ -1036,11 +1038,6 @@ async fn transcribe_upload(state: Arc<AsrServer>, mut multipart: Multipart, ids:
     response
 }
 
-/// Speech regions the upload gate counts: Silero's, with short speech kept and no padding.
-const GATE_SEGMENTS: SegmentOptions =
-    SegmentOptions { min_speech_ms: 150, min_silence_ms: 150, speech_pad_ms: 0, ..SegmentOptions::DEFAULT };
-/// An upload with less detected speech (250 ms) is answered with an empty transcript.
-const GATE_MIN_SPEECH: usize = SAMPLE_RATE as usize / 4;
 /// Longest audio `/v1/audio/vad` takes.
 const VAD_MAX_SAMPLES: usize = 10 * 60 * SAMPLE_RATE as usize;
 
@@ -1066,7 +1063,7 @@ async fn detect_speech(State(state): State<Arc<AsrServer>>, mut multipart: Multi
     let Ok(_upload) = state.uploads.clone().try_acquire_owned() else {
         return busy("too many ASR uploads");
     };
-    let (mut file, mut options) = (None, SegmentOptions::DEFAULT);
+    let (mut file, mut options, bound) = (None, vad.segment_options(), vad.max_override_ms() as f32);
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     loop {
         let field = match tokio::time::timeout_at(deadline, multipart.next_field()).await {
@@ -1093,9 +1090,9 @@ async fn detect_speech(State(state): State<Arc<AsrServer>>, mut multipart: Multi
         };
         match name.as_str() {
             "threshold" if number <= 1.0 => options.threshold = number,
-            "min_speech_duration_ms" => options.min_speech_ms = number as u32,
-            "min_silence_duration_ms" => options.min_silence_ms = number as u32,
-            "speech_pad_ms" => options.speech_pad_ms = number as u32,
+            "min_speech_duration_ms" if number <= bound => options.min_speech_ms = number as u32,
+            "min_silence_duration_ms" if number <= bound => options.min_silence_ms = number as u32,
+            "speech_pad_ms" if number <= bound => options.speech_pad_ms = number as u32,
             "max_speech_duration_s" if number > 0.0 => options.max_speech_s = number,
             _ => return failure(StatusCode::BAD_REQUEST, format!("unknown or invalid field {name:?}")),
         }
@@ -1725,7 +1722,7 @@ async fn continuous(
     let session = ids.session.clone().unwrap_or_default();
     let rate = start.sample_rate as usize;
     let mut resampler = Resampler::new(start.sample_rate).expect("a listed stream rate");
-    let mut endpointer = state.endpointer(EndpointConfig { min_silence_ms, max_segment_ms }, 0.5);
+    let mut endpointer = state.endpointer(EndpointConfig { min_silence_ms, max_segment_ms }, None);
     if !send(&mut socket, json!({"type":"ready","version":1,"session_id":&*session,"request_id":&*ids.request,
         "sample_rate":start.sample_rate,"format":"pcm_s16le","max_chunk_bytes":32000,"credit_samples":rate,
         "max_audio_samples":null,"partial_mode":if start.partials {"revision"} else {"final_only"},

@@ -72,6 +72,8 @@ pub trait PacketRuntime: Send {
 
 pub struct PacketAsset {
     pipelines: PacketPipelines,
+    /// The speech contract's own metadata sections (`asr_vocabulary.json`), by name.
+    sections: std::collections::BTreeMap<String, Vec<u8>>,
 }
 
 pub struct BoundPacketPipeline {
@@ -332,7 +334,21 @@ impl PacketAsset {
                     .map(|tensor| tensor.bytes)
             })
             .map_err(RuntimeError::Rejected)?;
-        Ok(Self { pipelines })
+        let mut sections = std::collections::BTreeMap::new();
+        for name in [plow_asset::speech_contract::VOCABULARY_SECTION] {
+            if let Some(data) = blob.reserved_metadata(image, name)? {
+                if data.len() > 4 * 1024 * 1024 {
+                    return Err(RuntimeError::Rejected(format!("{name} is too large")));
+                }
+                sections.insert(name.to_owned(), data.to_vec());
+            }
+        }
+        Ok(Self { pipelines, sections })
+    }
+
+    /// A speech-contract metadata section of the packet.
+    pub fn metadata(&self, name: &str) -> Option<&[u8]> {
+        self.sections.get(name).map(Vec::as_slice)
     }
 
     pub fn pipelines(&self) -> &[PacketPipeline] {

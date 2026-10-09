@@ -1,18 +1,20 @@
-//! Host executor for `vad.silero.v1` packets: the packet's two state-bank programs interpreted
-//! in plain Rust over a per-stream FP32 arena, with weights shared read-only. A [`Vad`] is `Sync`;
-//! each [`VadStream`] is independent, so streams run on any number of threads.
+//! Host executor for `vad.frame.v1` packets (`plow_asset::speech_contract`): the packet's
+//! state-bank programs interpreted in plain Rust over a per-stream FP32 arena, with weights shared
+//! read-only. The segment policy (thresholds, hysteresis, durations) is packet data. A [`Vad`] is
+//! `Sync`; each [`VadStream`] is independent, so streams run on any number of threads.
 
 use std::ops::Range;
 use std::path::Path;
 use std::sync::{Arc, OnceLock};
 
 use packet::dev::{DevInst64, DevOp, TENSOR_NONE16};
+use plow_asset::speech_contract::{self as contract, VadContract, VadPolicy};
 
 use crate::asset::devblob::DevBlob;
 use crate::exec::packet_runtime::PacketAsset;
 use crate::{Result, RuntimeError};
 
-pub const DRIVER: &str = "vad.silero.v1";
+pub const DRIVER: &str = contract::VAD_DRIVER;
 
 #[derive(Clone, Copy)]
 enum Loc {
@@ -21,7 +23,8 @@ enum Loc {
 }
 
 pub struct Vad {
-    programs: [Vec<DevInst64>; 2],
+    /// One program per state bank, run in rotation.
+    programs: Vec<Vec<DevInst64>>,
     locs: Vec<Loc>,
     weights: Vec<f32>,
     /// Arena image at stream open: zeros, with the initialized runtime tensors (states) filled.
@@ -33,6 +36,7 @@ pub struct Vad {
     pub sample_rate: u32,
     pub frame: usize,
     pub context: usize,
+    pub contract: VadContract,
 }
 
 pub struct VadStream {
@@ -67,21 +71,48 @@ impl Vad {
         let raw = std::fs::read(path).map_err(|source| RuntimeError::Io { path: path.to_owned(), source })?;
         let blob = DevBlob::parse(&raw)?;
         let asset = PacketAsset::load(path)?;
+        if asset.pipelines().iter().any(|p| p.driver == contract::VAD_DRIVER_V0) {
+            return Err(reject(format!(
+                "{} is a contract-0 VAD packet; re-emit it (scripts/asr/silero_vad_build.sh) or upgrade it (asr_packet_upgrade vad)",
+                contract::VAD_DRIVER_V0
+            )));
+        }
         let pipeline = asset
             .pipelines()
             .iter()
             .find(|p| p.driver == DRIVER)
             .ok_or_else(|| reject(format!("packet pipeline driver {DRIVER:?} is missing")))?;
-        let program = |role: &str| -> Result<Vec<DevInst64>> {
-            let index = *pipeline.programs.get(role).ok_or_else(|| reject(format!("VAD program {role} is missing")))?;
-            Ok(blob.progs.get(index as usize).ok_or_else(|| reject("VAD program index is invalid"))?.insts.clone())
-        };
-        let programs = [program("step.0")?, program("step.1")?];
         let parameter = |name: &str| {
             pipeline.parameters.get(name).copied().ok_or_else(|| reject(format!("VAD parameter {name} is missing")))
         };
+        let version = parameter(contract::CONTRACT)?;
+        if version > contract::VAD_CONTRACT {
+            return Err(reject(format!("VAD packet contract {version}; this plowrt implements {}", contract::VAD_CONTRACT)));
+        }
+        if parameter("executor")? != contract::EXECUTOR_HOST {
+            return Err(reject("VAD packet does not declare the host executor; this plowrt runs VAD on the host only"));
+        }
+        let banks = parameter("state_banks")?;
+        if !(1..=16).contains(&banks) {
+            return Err(reject("VAD state bank count is invalid"));
+        }
+        let programs = (0..banks)
+            .map(|bank| {
+                let role = format!("step.{bank}");
+                let index = *pipeline.programs.get(&role).ok_or_else(|| reject(format!("VAD program {role} is missing")))?;
+                Ok(blob.progs.get(index as usize).ok_or_else(|| reject("VAD program index is invalid"))?.insts.clone())
+            })
+            .collect::<Result<Vec<_>>>()?;
         let (sample_rate, frame, context) =
             (parameter("sample_rate")? as u32, parameter("frame_samples")? as usize, parameter("context_samples")? as usize);
+        // Serving decodes and resamples every input to the canonical rate before the VAD sees it.
+        if sample_rate != crate::asr::frontend::SAMPLE_RATE || frame == 0 || context > frame {
+            return Err(reject(format!(
+                "VAD packet frames {frame} + {context} samples at {sample_rate} Hz; plowrt feeds {} Hz frames",
+                crate::asr::frontend::SAMPLE_RATE
+            )));
+        }
+        let contract = VadContract::from_parameters(|name| pipeline.parameters.get(name).copied()).map_err(reject)?;
 
         let written: std::collections::BTreeSet<u16> =
             programs.iter().flatten().flat_map(|inst| outputs(inst).iter().map(move |&slot| inst.t[slot])).collect();
@@ -120,7 +151,7 @@ impl Vad {
         let fma = std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma");
         #[cfg(not(target_arch = "x86_64"))]
         let fma = false;
-        Ok(Self { programs, locs, weights, arena, input, probability, scratch, fma, sample_rate, frame, context })
+        Ok(Self { programs, locs, weights, arena, input, probability, scratch, fma, sample_rate, frame, context, contract })
     }
 
     pub fn open(&self) -> VadStream {
@@ -143,7 +174,7 @@ impl Vad {
         }
         #[cfg(not(target_arch = "x86_64"))]
         self.run::<false>(stream);
-        stream.bank ^= 1;
+        stream.bank = (stream.bank + 1) % self.programs.len();
         stream.arena[self.probability]
     }
 
@@ -477,11 +508,12 @@ fn dot<const FMA: bool>(a: &[f32], b: &[f32]) -> f32 {
     lanes.iter().sum::<f32>() + tail
 }
 
-/// Silero's `get_speech_timestamps` defaults; durations in samples at the VAD's rate.
+/// Segment policy of one request: the packet's [`VadPolicy`], optionally overridden.
 #[derive(Clone, Copy, Debug)]
 pub struct SegmentOptions {
     pub threshold: f32,
-    pub neg_threshold: Option<f32>,
+    pub release_offset: f32,
+    pub release_floor: f32,
     pub min_speech_ms: u32,
     pub max_speech_s: f32,
     pub min_silence_ms: u32,
@@ -490,20 +522,46 @@ pub struct SegmentOptions {
 }
 
 impl SegmentOptions {
-    pub const DEFAULT: Self = Self {
-        threshold: 0.5,
-        neg_threshold: None,
-        min_speech_ms: 250,
-        max_speech_s: f32::INFINITY,
-        min_silence_ms: 100,
-        speech_pad_ms: 30,
-        min_silence_at_max_speech_ms: 98,
-    };
+    pub fn from_policy(p: &VadPolicy) -> Self {
+        Self {
+            threshold: p.threshold,
+            release_offset: p.release_offset,
+            release_floor: p.release_floor,
+            min_speech_ms: p.min_speech_ms,
+            max_speech_s: if p.max_speech_ms == 0 { f32::INFINITY } else { p.max_speech_ms as f32 / 1000.0 },
+            min_silence_ms: p.min_silence_ms,
+            speech_pad_ms: p.speech_pad_ms,
+            min_silence_at_max_speech_ms: p.min_silence_at_max_speech_ms,
+        }
+    }
+
+    /// Below this a speaking stream turns silent (hysteresis).
+    pub fn release_threshold(&self) -> f32 {
+        (self.threshold - self.release_offset).max(self.release_floor)
+    }
 }
 
-impl Default for SegmentOptions {
-    fn default() -> Self {
-        Self::DEFAULT
+impl Vad {
+    /// The packet's default segment policy (`/v1/audio/vad`, turn detection).
+    pub fn segment_options(&self) -> SegmentOptions {
+        SegmentOptions::from_policy(&self.contract.policy)
+    }
+
+    /// The no-speech upload gate's policy and the least speech (samples) an upload needs.
+    pub fn gate(&self) -> (SegmentOptions, usize) {
+        let g = &self.contract.gate;
+        let options = SegmentOptions {
+            min_speech_ms: g.min_speech_ms,
+            min_silence_ms: g.min_silence_ms,
+            speech_pad_ms: g.speech_pad_ms,
+            ..self.segment_options()
+        };
+        (options, self.sample_rate as usize * g.min_total_speech_ms as usize / 1000)
+    }
+
+    /// Longest duration (ms) a request override may set.
+    pub fn max_override_ms(&self) -> u32 {
+        self.contract.bounds.max_duration_ms
     }
 }
 
@@ -516,7 +574,7 @@ pub fn speech_segments(probabilities: &[f32], frame: usize, sample_rate: u32, au
         (ms(o.min_speech_ms), ms(o.speech_pad_ms), ms(o.min_silence_ms), ms(o.min_silence_at_max_speech_ms));
     let max_speech = rate * f64::from(o.max_speech_s) - frame as f64 - 2.0 * pad;
     let threshold = o.threshold;
-    let neg_threshold = o.neg_threshold.unwrap_or((threshold - 0.15).max(0.01));
+    let neg_threshold = o.release_threshold();
     let audio = audio_samples as i64;
 
     let mut speeches: Vec<(i64, i64)> = Vec::new();
@@ -630,9 +688,9 @@ mod tests {
         };
         let segment = |speech: &[Range<usize>], options| speech_segments(&p(speech), 512, 16_000, 100 * 512, options);
         // A 64 ms pause (< 100 ms) joins; 128 ms of speech (< 250 ms) is dropped; 30 ms pads.
-        assert_eq!(segment(&[10..40, 42..60, 80..84], SegmentOptions::default()), vec![10 * 512 - 480..60 * 512 + 480]);
+        assert_eq!(segment(&[10..40, 42..60, 80..84], SegmentOptions::from_policy(&devgen::vad::POLICY.policy)), vec![10 * 512 - 480..60 * 512 + 480]);
         // A pause shorter than both pads is split down the middle.
-        let wide = SegmentOptions { speech_pad_ms: 100, ..SegmentOptions::default() };
+        let wide = SegmentOptions { speech_pad_ms: 100, ..SegmentOptions::from_policy(&devgen::vad::POLICY.policy) };
         let split = segment(&[10..40, 45..60], wide);
         assert_eq!(split, vec![10 * 512 - 1600..40 * 512 + 1280, 40 * 512 + 1280..60 * 512 + 1600]);
     }

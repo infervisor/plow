@@ -8,8 +8,11 @@ use crate::{Result, RuntimeError};
 
 pub const SAMPLE_RATE: u32 = 16_000;
 pub const MEL_BINS: usize = 128;
+#[cfg(any(test, all(feature = "metal", target_os = "macos")))]
 const FFT: usize = 400;
+#[cfg(any(test, all(feature = "metal", target_os = "macos")))]
 const HOP: usize = 160;
+#[cfg(any(test, all(feature = "metal", target_os = "macos")))]
 const BINS: usize = FFT / 2 + 1;
 pub const MAX_SAMPLES: usize = 30 * SAMPLE_RATE as usize;
 
@@ -380,6 +383,17 @@ impl PacketLogMelFrontend {
         self.sample_rate
     }
 
+    /// Microseconds of audio per feature frame (the packet's hop).
+    pub fn frame_us(&self) -> u32 {
+        (self.inner.config.hop as u64 * 1_000_000 / self.sample_rate as u64) as u32
+    }
+
+    /// Frames past a frame its analysis window reaches (centred, `fft / 2` samples), plus two of
+    /// slack: earlier frames no longer change as audio arrives.
+    pub fn reach_frames(&self) -> usize {
+        (self.inner.config.fft / 2).div_ceil(self.inner.config.hop) + 2
+    }
+
     pub fn extract(&self, samples: &[f32]) -> Result<LogMelFeatures> {
         if samples.len() < self.min_samples || samples.len() > self.max_samples {
             return Err(invalid(format!(
@@ -610,6 +624,9 @@ impl LogMelFrontend {
     }
 }
 
+/// Qwen3-ASR's Whisper log-mel, hand-written: the Metal reference path and the oracle the
+/// packet-driven [`LogMelFrontend`] is tested against. Serving uses the packet's frontend.
+#[cfg(any(test, all(feature = "metal", target_os = "macos")))]
 pub struct QwenFrontend {
     fft: Arc<dyn Fft<f32>>,
     window: [f32; FFT],
@@ -617,6 +634,7 @@ pub struct QwenFrontend {
     filter_ranges: [std::ops::Range<usize>; MEL_BINS],
 }
 
+#[cfg(any(test, all(feature = "metal", target_os = "macos")))]
 impl Default for QwenFrontend {
     fn default() -> Self {
         let hz_to_mel = |hz: f64| {
@@ -663,6 +681,7 @@ impl Default for QwenFrontend {
     }
 }
 
+#[cfg(any(test, all(feature = "metal", target_os = "macos")))]
 impl QwenFrontend {
     pub fn extract(&self, samples: &[f32]) -> Result<MelFeatures> {
         if samples.len() < SAMPLE_RATE as usize / 2

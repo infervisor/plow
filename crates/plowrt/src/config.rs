@@ -41,8 +41,8 @@ impl std::fmt::Debug for ApiKey {
 
 /// `--asr-packet NAME=PATH.pkt[,tokenizer=PATH|,checkpoint=PATH][,backend=NAME]`: a packet ASR
 /// model (Nemotron RNNT, or a Qwen audio-LM packet) served by `plowrt serve` on its own cohort
-/// engine. `checkpoint=` names the HF directory an audio-LM packet reads its tokenizer and chat
-/// template from, `tokenizer=` a tokenizer file (Nemotron's GGUF); both set the same input.
+/// engine. `checkpoint=` (alias `tokenizer=`) names the HF directory an audio-LM packet reads its
+/// tokenizer and chat template from; an RNNT packet carries its vocabulary and ignores it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AsrPacket {
     pub name: String,
@@ -203,7 +203,7 @@ pub struct RuntimeConfig {
     #[arg(long = "asr-context-max-tokens", env = "PLOW_ASR_CONTEXT_MAX_TOKENS", default_value_t = 0, global = true)]
     pub asr_context_max_tokens: usize,
 
-    /// A `vad.silero.v1` packet (`asr_silero_vad_compile`), run on the CPU: it serves
+    /// A `vad.frame.v1` VAD packet (`asr_silero_vad_compile`), run on the CPU: it serves
     /// `/v1/audio/vad`, answers uploads without speech with an empty transcript before any model
     /// runs, and ends streaming turns in place of the energy endpointer. Unset = none of these.
     #[arg(long = "asr-vad-packet", env = "PLOW_ASR_VAD_PACKET", global = true)]

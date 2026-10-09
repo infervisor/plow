@@ -195,9 +195,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map(|stage| [stage.kernel, stage.stride, stage.pad_before, stage.pad_after])
         .collect();
     // Full context: no right-context flush; padded frames are masked, not decoded.
+    packets.set_output(nemotron_packet_support::token_output(&gguf, None)?)?;
     let section =
         packets.pipeline_section_with_frame_transform(blank_id, 10, 0, feature_frames, &frame_transform, 0)?;
-    std::fs::write(&args[3], packets.model.to_blob_v6(&[section]))?;
+    std::fs::write(&args[3], packets.model.to_blob_v6(&[section, packets.vocabulary_section()?]))?;
     println!(
         "{}",
         serde_json::json!({
