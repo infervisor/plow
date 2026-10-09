@@ -24,7 +24,8 @@
 # default $OUT/fp32ref/<arm>/{ref,vllm}.json); PROMPTS (fp32_ref_gate.py prompt set; built from CORPUS
 # when absent); OBJECT_ENV (extra `--object-env`, e.g. "NVCC_APPEND_FLAGS=-ccbin=/usr/bin/g++-14");
 # RT_ENV (runtime env for plowrt); VLLM_ENV (env for the vLLM server); MAX_MODEL_LEN (vLLM
-# --max-model-len; default the recipe's max_ctx: FP8 131072, BF16 16384); RATES (prod/prodlong sessions/s).
+# --max-model-len; default FP8 65536, BF16 16384: the largest each fits); VLLM_MEM_BF16 / VLLM_MEM_FP8
+# (default 0.97 / 0.9); RATES (prod/prodlong sessions/s).
 set -u
 REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 : "${OUT:?set OUT to a scratch directory outside the repo}"
@@ -36,7 +37,8 @@ TARGET=${CARGO_TARGET_DIR:-$REPO/target}
 # only on TRITON_ATTN.
 VLLM_COMMON="--enable-prefix-caching --max-num-batched-tokens 8192 --enable-prompt-tokens-details"
 VLLM_BF16_ARGS="--dtype bfloat16 --max-model-len ${MAX_MODEL_LEN:-16384} $VLLM_COMMON"
-VLLM_FP8_ARGS="--dtype bfloat16 --attention-backend TRITON_ATTN --kv-cache-dtype fp8_per_token_head --max-model-len ${MAX_MODEL_LEN:-131072} $VLLM_COMMON"
+# FP8: 65536 is the largest power of two vLLM fits at 0.9 (full-length sliding KV, ~440 KiB/token).
+VLLM_FP8_ARGS="--dtype bfloat16 --attention-backend TRITON_ATTN --kv-cache-dtype fp8_per_token_head --max-model-len ${MAX_MODEL_LEN:-65536} $VLLM_COMMON"
 COMMON="REPS=${REPS:-2} SAMPLED= PREFILL_CONCS= DECODE= PACKLOG=1 PB_BENCH_TIMEOUT=5400"
 
 die() { echo "repro31: $*" >&2; exit 2; }
@@ -46,6 +48,9 @@ prec_of() { case $1 in bf16|vllm-bf16) echo bf16 ;; *) echo fp8 ;; esac; }
 ref_of() { local p; p=$(prec_of "$1"); local v="REF_${p^^}"; echo "${!v:-$OUT/fp32ref/$p/ref.json}"; }
 refv_of() { local p; p=$(prec_of "$1"); local v="REF_VLLM_${p^^}"; echo "${!v:-$OUT/fp32ref/$p/vllm.json}"; }
 vargs_of() { case $(prec_of "$1") in bf16) echo "$VLLM_BF16_ARGS" ;; *) echo "$VLLM_FP8_ARGS" ;; esac; }
+# vLLM 0.28 sizes Gemma-4's sliding layers at full length: 31B BF16 at 0.9 has 10.3 GiB of KV, short of
+# one 16384-token request (13.8 GiB), so BF16 runs at 0.97.
+vmem_of() { case $(prec_of "$1") in bf16) echo "${VLLM_MEM_BF16:-0.97}" ;; *) echo "${VLLM_MEM_FP8:-0.9}" ;; esac; }
 mkdir -p "$OUT"
 
 build() {
@@ -87,7 +92,7 @@ serve_capture() {
     PB_SERVER_PORT=$(pb_free_port); PB_SERVER_LOG=$dir/server.log
     case $arm in
       vllm-*) env $VLLM_ENV "$PYREF" -m vllm.entrypoints.cli.main serve "$(hf_of "$arm")" --port "$PB_SERVER_PORT" \
-                --served-model-name checkpoint --gpu-memory-utilization 0.9 --max-num-seqs 256 $(vargs_of "$arm") \
+                --served-model-name checkpoint --gpu-memory-utilization "$(vmem_of "$arm")" --max-num-seqs 256 $(vargs_of "$arm") \
                 > "$PB_SERVER_LOG" 2>&1 & ;;
       *) env $RT_ENV "$OUT/bin/plowrt" serve --assets "$OUT/pk/$arm/assets" --port "$PB_SERVER_PORT" > "$PB_SERVER_LOG" 2>&1 & ;;
     esac
@@ -141,7 +146,7 @@ bench() {
         PLOWRT_GIT_SHA=$(cat "$OUT/bin/plowrt.sha") KV_DTYPE=$kv ASSETS=$OUT/pk/$arm/assets $wlenv \
         bash "$REPO/scripts/bench/llm_grid.sh" plow "$out" $mode ;;
     vllm-bf16|vllm-fp8)
-      eval env $COMMON HF=$hf MODEL_NAME=checkpoint PYREF=$PYREF $VLLM_ENV VLLM_MEM=0.9 "VLLM_ARGS='$(vargs_of "$arm")'" \
+      eval env $COMMON HF=$hf MODEL_NAME=checkpoint PYREF=$PYREF $VLLM_ENV VLLM_MEM=$(vmem_of "$arm") "VLLM_ARGS='$(vargs_of "$arm")'" \
         $wlenv bash "$REPO/scripts/bench/llm_grid.sh" vllm "$out" $mode ;;
     *) die "arm $arm" ;;
   esac > "$out/run.log" 2>&1
