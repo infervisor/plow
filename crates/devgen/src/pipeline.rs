@@ -317,6 +317,8 @@ pub enum Activation {
     Clamp,
     ScaleShift,
     Relu,
+    /// [`UnaryF32Stage`] only.
+    Sqrt,
 }
 
 impl Activation {
@@ -339,6 +341,7 @@ impl Activation {
             Activation::Clamp => ACT_CLAMP,
             Activation::ScaleShift => ACT_SCALE_SHIFT,
             Activation::Relu => ACT_RELU,
+            Activation::Sqrt => ACT_SQRT,
         }
     }
 }
@@ -1746,6 +1749,35 @@ impl StageProgram {
                 u32::from(stage.activation == DenseActivation::Relu),
             ]);
             d.i[7] = flags;
+        })
+    }
+
+    /// LstmCellF32 over `rows` cells of `width`: `gates` `[rows][4 * width]` (`[i | f | g | o]`,
+    /// both projections and biases summed), `c_prev` `[rows][width]`; returns `h_new` (the
+    /// emitted output) after writing `c_new`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn lstm_cell_f32(
+        &mut self,
+        gates: u32,
+        c_prev: u32,
+        deps: &[u32],
+        h_new: TensorRef<'_>,
+        c_new: TensorRef<'_>,
+        rows: u32,
+        width: u32,
+    ) -> Result<Emitted, String> {
+        if rows == 0 || width == 0 {
+            return Err("invalid LSTM geometry".into());
+        }
+        let state = f32_bytes(product(&[rows, width])?)?;
+        u32_elements(product(&[rows, width, 4])?, "LSTM gates")?;
+        self.input(gates, state * 4, "LSTM gates")?;
+        self.input(c_prev, state, "LSTM cell state")?;
+        let h = self.resolve(h_new, state, "LSTM hidden output")?;
+        let c = self.resolve(c_new, state, "LSTM cell output")?;
+        self.emit(DevOp::LstmCellF32, (state / 4).div_ceil(2048), deps, h, |d| {
+            d.t[..4].copy_from_slice(&[h, c, gates, c_prev]);
+            d.i[..2].copy_from_slice(&[width, rows]);
         })
     }
 

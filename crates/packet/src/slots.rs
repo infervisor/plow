@@ -303,7 +303,7 @@ const DOC: &[S] = &[
     S { op: DevOp::SiluF32, t: &["out", "x"], i: &["n"], f: &[], j: &[] },
     S { op: DevOp::DenseGemmF32, t: &["C", "A", "W", "bias?", "scratch?", "stats?", "gamma?", "beta?"], i: &["M", "N", "K", "activation", "a_row0", "weight_stride?", "implicit_onehot_col", "flags"], f: &[], j: &[] },
     S { op: DevOp::EmbedF16F32, t: &["out", "table", "token"], i: &["vocab", "width"], f: &[], j: &[] },
-    S { op: DevOp::LstmCellF32, t: &["h_new", "c_new", "gates", "c_prev"], i: &["width"], f: &[], j: &[] },
+    S { op: DevOp::LstmCellF32, t: &["h_new", "c_new", "gates", "c_prev"], i: &["width", "rows?"], f: &[], j: &[] },
     S { op: DevOp::ArgmaxF32, t: &["ids", "x"], i: &["rows", "width"], f: &[], j: &[] },
     S { op: DevOp::ReluF32, t: &["out", "x"], i: &["n"], f: &[], j: &[] },
     S { op: DevOp::BroadcastAddF32, t: &["out", "matrix", "vector"], i: &["rows", "width"], f: &[], j: &[] },

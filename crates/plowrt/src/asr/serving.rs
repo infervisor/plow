@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot, watch, OwnedSemaphorePermit, Semaphore};
 
 use super::{
-    endpoint::{EndpointConfig, Endpointer, Segment},
+    endpoint::{EndpointConfig, Segment, Turns},
     frontend::{decode_wav, decode_wav_chunk, AudioError, Resampler, MAX_SAMPLES, SAMPLE_RATE},
     FinalizationPolicy, Transcriber, Transcript, TranscriptionInput,
 };
@@ -44,6 +44,8 @@ pub struct AsrServer {
     idle_timeout: Duration,
     /// Recordings sent as `append` uploads, by (model, `X-Session-Id`).
     recordings: parking_lot::Mutex<HashMap<(String, Arc<str>), Arc<tokio::sync::Mutex<Recording>>>>,
+    /// The `--vad-packet` detector for turn detection, else the energy endpointer.
+    vad: Option<Arc<crate::asr::vad::Vad>>,
 }
 
 /// One session's recording so far (HTTP `append` uploads), until its `final` upload.
@@ -452,6 +454,7 @@ impl AsrServer {
             request_timeout: configured_timeout(),
             idle_timeout: IDLE_TIMEOUT,
             recordings: Default::default(),
+            vad: crate::asr::vad::shared(),
         })
     }
 
@@ -507,6 +510,7 @@ impl AsrServer {
             request_timeout: configured_timeout(),
             idle_timeout: IDLE_TIMEOUT,
             recordings: Default::default(),
+            vad: crate::asr::vad::shared(),
         })
     }
 
@@ -1595,7 +1599,8 @@ async fn continuous(
     let session = ids.session.clone().unwrap_or_default();
     let rate = start.sample_rate as usize;
     let mut resampler = Resampler::new(start.sample_rate).expect("a listed stream rate");
-    let mut endpointer = Endpointer::new(EndpointConfig { min_silence_ms, max_segment_ms });
+    // With a VAD: Silero's default threshold, and the energy endpointer's 200 ms of lead-in.
+    let mut endpointer = Turns::new(EndpointConfig { min_silence_ms, max_segment_ms }, 0.5, 200, state.vad.as_ref());
     if !send(&mut socket, json!({"type":"ready","version":1,"session_id":&*session,"request_id":&*ids.request,
         "sample_rate":start.sample_rate,"format":"pcm_s16le","max_chunk_bytes":32000,"credit_samples":rate,
         "max_audio_samples":null,"partial_mode":if start.partials {"revision"} else {"final_only"},
@@ -1822,7 +1827,13 @@ async fn continuous(
                     .chunks_exact(2)
                     .map(|b| i16::from_le_bytes([b[0], b[1]]) as f32 / 32768.0)
                     .collect();
-                waiting.extend(endpointer.push(&resampler.push(&pcm)));
+                match endpointer.push(&resampler.push(&pcm)).await {
+                    Ok((_, closed)) => waiting.extend(closed),
+                    Err(e) => {
+                        send(&mut socket, json!({"type":"error","message":format!("VAD: {e}"),"terminal":true})).await;
+                        return;
+                    }
+                }
                 if start.partials && partial.is_none() {
                     if let Some((segment, audio)) = endpointer.open_audio() {
                         if segment != partial_segment {
@@ -1851,8 +1862,13 @@ async fn continuous(
                     finishing = true;
                     partial = None;
                     let tail = resampler.finish();
-                    waiting.extend(endpointer.push(&tail));
-                    waiting.extend(endpointer.finish());
+                    match endpointer.close(&tail).await {
+                        Ok((_, closed)) => waiting.extend(closed),
+                        Err(e) => {
+                            send(&mut socket, json!({"type":"error","message":format!("VAD: {e}"),"terminal":true})).await;
+                            return;
+                        }
+                    }
                 }
                 Some("cancel") => return,
                 _ => {

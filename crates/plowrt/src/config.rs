@@ -198,6 +198,12 @@ pub struct RuntimeConfig {
     #[arg(long = "asr-packet", env = "PLOW_ASR_PACKETS", value_delimiter = ';', global = true)]
     pub asr_packets: Vec<AsrPacket>,
 
+    /// A `vad.v1` packet (`PATH/vad.pkt[,backend=NAME]`, default backend cuda) the ASR servers use
+    /// for `server_vad` turn detection (Realtime) and continuous-stream segmentation: speech
+    /// probabilities against the session's `threshold`, instead of the energy endpointer.
+    #[arg(long = "vad-packet", env = "PLOW_VAD_PACKET", global = true)]
+    pub vad_packet: Option<String>,
+
     /// Under `--co-sched deadline`, most streams one vocoder render launch takes (0 = the packet's
     /// largest capacity). A launch is one cooperative grid that holds the device to its end (1.4 s
     /// at 64 streams, 0.45 s at 16), so this bounds how long ASR finals and prompts wait behind

@@ -49,7 +49,7 @@ pub(super) fn supports(insts: &[DevInst64]) -> bool {
             }
             Some(DevOp::EmbedF16F32) => nonzero(&inst.i[..2]) && tensors(inst, &[0, 1, 2]),
             Some(DevOp::ScaledAddF32) => inst.i[0] != 0 && tensors(inst, &[0, 1, 2]),
-            Some(DevOp::LstmCellF32) => inst.i[0] != 0 && tensors(inst, &[0, 1, 2, 3]),
+            Some(DevOp::LstmCellF32) => inst.i[0] != 0 && inst.i[1] <= 1 && tensors(inst, &[0, 1, 2, 3]),
             Some(DevOp::BroadcastAddF32) => {
                 nonzero(&inst.i[..2])
                     && product_fits_u32(inst.i[0], inst.i[1])

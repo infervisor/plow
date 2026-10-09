@@ -1936,15 +1936,16 @@ static __device__ __noinline__ void d_embed_f16_f32(float* out, const uint16_t* 
     SP_FOR_EACH(i, width) out[i] = sp_f16(table[(size_t)t * width + i]);
 }
 
-/* LstmCellF32 (172): gates = [i | f | g | o] x width. */
+/* LstmCellF32 (172): per row, gates = [i | f | g | o] x width. */
 static __device__ __noinline__ void d_lstm_cell_f32(float* h_new, float* c_new, const float* gates,
-                                       const float* c_prev, unsigned width, unsigned slice,
+                                       const float* c_prev, unsigned width, unsigned rows, unsigned slice,
                                        unsigned nblk) {
-    SP_FOR_EACH(i, width) {
-        const float ig = sp_sigmoid(gates[i]);
-        const float fg = sp_sigmoid(gates[width + i]);
-        const float cell = sp_tanhf(gates[2u * width + i]);
-        const float og = sp_sigmoid(gates[3u * width + i]);
+    SP_FOR_EACH(i, (rows ? rows : 1u) * width) {
+        const float* g = gates + (size_t)(i / width) * 4u * width + i % width;
+        const float ig = sp_sigmoid(g[0]);
+        const float fg = sp_sigmoid(g[width]);
+        const float cell = sp_tanhf(g[2u * width]);
+        const float og = sp_sigmoid(g[3u * width]);
         const float c = __fadd_rn(__fmul_rn(fg, c_prev[i]), __fmul_rn(ig, cell));
         c_new[i] = c;
         h_new[i] = __fmul_rn(og, sp_tanhf(c));
@@ -2320,6 +2321,7 @@ __device__ __forceinline__ void sp_with_act(unsigned kind, float p1, const B& bo
     case 13: body([p1](float x, float p0) { return fminf(fmaxf(x, p0), p1); }); break;
     case 14: body([p1](float x, float p0) { return __fadd_rn(__fmul_rn(x, p0), p1); }); break;
     case 15: body([](float x, float) { return x > 0.0f ? x : 0.0f; }); break;
+    case 16: body([](float x, float) { return __fsqrt_rn(x); }); break;
     default: body([](float x, float) { return x; }); break;
     }
 }
@@ -2340,6 +2342,7 @@ __device__ __forceinline__ float sp_act(unsigned kind, float x, float p0, float 
     case 13: return fminf(fmaxf(x, p0), p1);
     case 14: return __fadd_rn(__fmul_rn(x, p0), p1);
     case 15: return x > 0.0f ? x : 0.0f;
+    case 16: return __fsqrt_rn(x);
     default: return x;
     }
 }
@@ -4696,7 +4699,7 @@ static __device__ __noinline__ void d_speech_f32(const PlowDevInst* in, void* co
         break;
     SP_CASE(LSTM_CELL_F32)
         d_lstm_cell_f32((float*)SP_TEN(0), (float*)SP_TEN(1), (const float*)SP_TEN(2), (const float*)SP_TEN(3),
-                        in->i[0], slice, nblk);
+                        in->i[0], in->i[1], slice, nblk);
         break;
     SP_CASE(ARGMAX_F32)
         d_argmax_f32((unsigned*)SP_TEN(0), (const float*)SP_TEN(1), in->i[0], in->i[1], slice, nblk, arena);

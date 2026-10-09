@@ -231,6 +231,10 @@ name = "asr_stream"
 path = "examples/asr/stream.rs"
 
 [[example]]
+name = "asr_vad_check"
+path = "examples/asr/vad_check.rs"
+
+[[example]]
 name = "asr_decoder_trace"
 path = "examples/asr/decoder_trace.rs"
 

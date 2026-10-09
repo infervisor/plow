@@ -242,8 +242,10 @@ Auth: the usual key headers, or the browser subprotocol `openai-insecure-api-key
   default; `silence_duration_ms` 200..=2000, default 500) the continuous-mode endpointer cuts
   turns: `input_audio_buffer.speech_started` {`audio_start_ms`, `item_id`},
   `.speech_stopped` {`audio_end_ms`, `item_id`}, `.committed` {`item_id`, `previous_item_id`}.
-  `threshold` and `prefix_padding_ms` are echoed but fixed (12 dB over the noise floor, 200 ms
-  of context). With `turn_detection: null` audio accumulates (at most 30 s) until
+  With a VAD packet attached (`--vad-packet`, below) turns follow its speech probabilities and
+  `threshold` (0..=1, default 0.5) and `prefix_padding_ms` (0..=2000, default 300) apply; without
+  one they are echoed but fixed (12 dB over the noise floor, 200 ms of context). With
+  `turn_detection: null` audio accumulates (at most 30 s) until
   `input_audio_buffer.commit` (at least 100 ms, else `input_audio_buffer_commit_empty`);
   `input_audio_buffer.clear` drops it (`.cleared`). A commit under VAD closes the open turn.
 - Each committed item streams `conversation.item.input_audio_transcription.delta`

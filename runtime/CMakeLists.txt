@@ -520,6 +520,8 @@ option(PLOW_SM120_CUBIN_SEG "Also emit the _pfseg (fat) and _pfgemm (lean occ-2)
 option(PLOW_CUBIN_PACKED_PREFILL "Emit ordinary and packet-request ABI segmented prefill pairs" OFF)
 option(PLOW_CUBIN_ROUTED_DECODE "Also emit the _routed decode cubin for cuBLASLt-routed MoE rungs" OFF)
 option(PLOW_CUBIN_SPEECH "Also emit the _speech decode cubin carrying the FP32 speech arms (ASR encoder)" OFF)
+# Object stems to build (e.g. interp_sm90a_speech for a standalone sidecar packet); empty = all.
+set(PLOW_CUBIN_ONLY "" CACHE STRING "Build only these interpreter object stems (;-separated); empty = every row")
 option(PLOW_CUBIN_FP8_TC64_DEPTH2 "Emit a separate depth-2 FP8 TC64 decode cubin" OFF)
 option(PLOW_CUBIN_GEMV_WIDE "Also emit the _gw decode cubin carrying the wide-rung wgmma GEMV (sm_90a)" OFF)
 
@@ -733,6 +735,9 @@ if(PLOW_SM120_CUBIN OR PLOW_SM90A_CUBIN OR PLOW_SM89_CUBIN)
             list(GET _f 1 _sym)
             list(GET _f 2 _a1)
             list(GET _f 3 _a2)
+            if(PLOW_CUBIN_ONLY AND NOT _stem IN_LIST PLOW_CUBIN_ONLY)
+                continue()
+            endif()
             set(_defs ${_cubin_base} ${${_vdefs_var}} ${${_a1}})
             if(_varch STREQUAL "sm_90a" AND PLOW_CUBIN_GEMMA AND
                ((PLOW_NV_W8A8 AND _a1 STREQUAL "_ax_seg_gemm") OR
@@ -756,7 +761,7 @@ if(PLOW_SM120_CUBIN OR PLOW_SM90A_CUBIN OR PLOW_SM89_CUBIN)
         endforeach()
     endforeach()
 
-    if(PLOW_SM90A_CUBIN)
+    if(PLOW_SM90A_CUBIN AND NOT PLOW_CUBIN_ONLY)
         set(_w8a16_m1_src "${CMAKE_CURRENT_SOURCE_DIR}/nvidia/interp_sm90a_pfgemm_w8a16_m1.cu")
         set(_w8a16_m1_out "${PLOW_CUBIN_DIR}/interp_sm90a_pfgemm_w8a16_m1.cubin")
         add_custom_command(OUTPUT "${_w8a16_m1_out}"
@@ -774,7 +779,7 @@ if(PLOW_SM120_CUBIN OR PLOW_SM90A_CUBIN OR PLOW_SM89_CUBIN)
     # defines, so it is not a row in the table above. A failure here is non-fatal:
     # serving falls back to host sampling (hence `optional`).
     set(_smp_src "${CMAKE_CURRENT_SOURCE_DIR}/nvidia/sample_sm120.cu")
-    if((PLOW_SM120_CUBIN OR PLOW_SM90A_CUBIN OR PLOW_SM89_CUBIN) AND EXISTS "${_smp_src}")
+    if((PLOW_SM120_CUBIN OR PLOW_SM90A_CUBIN OR PLOW_SM89_CUBIN) AND EXISTS "${_smp_src}" AND NOT PLOW_CUBIN_ONLY)
         set(_smp_out "${PLOW_CUBIN_DIR}/sample_sm120.cubin")
         add_custom_command(OUTPUT "${_smp_out}"
             COMMAND bash "${_cubin_run}" "${PLOW_CUBIN_NVCC}" "${_smp_out}" plow_sample optional

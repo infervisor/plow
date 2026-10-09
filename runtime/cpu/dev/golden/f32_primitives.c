@@ -397,14 +397,15 @@ G_K(g_lstm_cell_f32) {
     float* c_new = PLOW_CPU_TEN(in, T, 1);
     const float* gates = PLOW_CPU_TEN(in, T, 2);
     const float* c_prev = PLOW_CPU_TEN(in, T, 3);
-    const uint32_t width = in->i[0];
+    const uint32_t width = in->i[0], rows = in->i[1] ? in->i[1] : 1u;
     uint32_t lo, hi;
-    g_range(width, slice, nblk, &lo, &hi);
+    g_range(rows * width, slice, nblk, &lo, &hi);
     for (uint32_t i = lo; i < hi; i++) {
-        const float input = g_sigmoid(gates[i]);
-        const float forget = g_sigmoid(gates[width + i]);
-        const float cell = tanhf(gates[2u * width + i]);
-        const float output = g_sigmoid(gates[3u * width + i]);
+        const float* g = gates + (size_t)(i / width) * 4u * width + i % width;
+        const float input = g_sigmoid(g[0]);
+        const float forget = g_sigmoid(g[width]);
+        const float cell = tanhf(g[2u * width]);
+        const float output = g_sigmoid(g[3u * width]);
         c_new[i] = forget * c_prev[i] + input * cell;
         h_new[i] = output * tanhf(c_new[i]);
     }
@@ -601,6 +602,7 @@ static float g_act_f32(uint32_t kind, float x, float p0, float p1) {
     case 13: return fminf(fmaxf(x, p0), p1);
     case 14: return x * p0 + p1;
     case 15: return x > 0.0f ? x : 0.0f;
+    case 16: return sqrtf(x);
     default: return x;
     }
 }

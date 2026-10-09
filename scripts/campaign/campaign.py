@@ -1281,6 +1281,9 @@ def cmd_sweep(a: argparse.Namespace) -> None:
 #   asr_wer           /v1/audio/transcriptions over a manifest (served_bench.py): wer_max
 #   tts_cer           tts_bench.py --wav arms, Whisper round trip (asr_check.py): cer_median_max, cer_lang_max
 #   s3gen_rel_l2      s3gen.pkt vs torch (s3gen_packet_check.py, packet_run): rel_l2_max
+#   vad_parity        vad.pkt per-frame speech probability vs the Silero TorchScript reference
+#                     (silero_vad_parity.py, asr_vad_check): max_dp_max, agree_min; `jit`, `manifest`.
+#                     A packet-only bundle names its packet in [gates] `packet` (default model.pkt).
 #   llm_fp32_ref      plow AND vLLM vs a cached FP32 reference (scripts/llm/fp32_ref_gate.py); plow must
 #                     stay within vLLM's distance to FP32. `reference` (ref.json), then `vllm_capture` (cached)
 #                     or `vllm_hf` [+ `vllm_args`, `vllm_python`] to capture vLLM in the same lease:
@@ -1288,7 +1291,7 @@ def cmd_sweep(a: argparse.Namespace) -> None:
 #                     needle_min, tie_margin (docs/bringup/agent-tools.md §5)
 # Each may set `python` (default [gates].python, else python3), `args` (extra client args) and
 # `timeout_s`. Placeholders as in `build`, plus {assets}, {target} (cargo target dir) and {out}.
-GATE_KINDS = ("llm_logit_parity", "llm_fp32_ref", "asr_wer", "tts_cer", "s3gen_rel_l2")
+GATE_KINDS = ("llm_logit_parity", "llm_fp32_ref", "asr_wer", "tts_cer", "s3gen_rel_l2", "vad_parity")
 
 
 def gate_steps(kind: str, g: dict, py: str, out: Path, assets: Path) -> tuple[list[str], list[str]]:
@@ -1335,6 +1338,15 @@ def gate_steps(kind: str, g: dict, py: str, out: Path, assets: Path) -> tuple[li
         return [], [f"{q(py)} {sc('scripts/tts/s3gen_packet_check.py')} --packet {q(str(assets / 's3gen.pkt'))} "
                     f"--runner {q(runner)} "
                     f"--out {d} --skip-cer {args} "
+                    f"> {d}/check.log 2>&1"]
+    if kind == "vad_parity":
+        runner = g.get("runner") or os.environ.get("CARGO_TARGET_DIR", str(REPO / "target")) + "/release/examples/asr_vad_check"
+        if not Path(runner).exists():
+            die(f"{runner} missing: cargo build --release -p plowrt --features cuda --example asr_vad_check")
+        return [], [f"{q(py)} {sc('scripts/asr/silero_vad_parity.py')} --packet {q(str(assets / 'vad.pkt'))} "
+                    f"--jit {q(g['jit'])} --manifest {q(g['manifest'])} --runner {q(runner)} --out {d} "
+                    f"--backend {q(g.get('backend', 'cuda'))} --threshold {float(g.get('threshold', 0.5))} "
+                    f"--max-dp {float(g.get('max_dp_max', 1e-4))} --min-agree {float(g.get('agree_min', 0.999))} {args} "
                     f"> {d}/check.log 2>&1"]
     die(f"unknown gate kind {kind}")
 
@@ -1403,6 +1415,13 @@ def gate_score(kind: str, g: dict, d: Path) -> dict:
         if not rels:
             return {"pass": False, "why": ["no numerics rows (see check.log)"]}
         lim("mel_rel_l2_max", max(rels), "rel_l2_max")
+    elif kind == "vad_parity":
+        if not (d / "parity.json").is_file():
+            return {"pass": False, "why": ["no parity.json (see check.log)"]}
+        par = json.loads((d / "parity.json").read_text())
+        lim("max_dp", par["max_dp"], "max_dp_max")
+        lim("agree", par["agree"], "agree_min", upper=False)
+        res.update(mean_dp=par["mean_dp"], flips=len(par["flips"]), frames=par["frames"], clips=len(par["clips"]))
     res["pass"] = not why
     res["why"] = why
     return res
@@ -1422,13 +1441,13 @@ def cmd_gate(a: argparse.Namespace) -> None:
         return expand(str(v).replace("{assets}", str(assets)).replace("{target}", target), out, lenient=a.score_only)
     cfg = {k: {kk: ([x(i) for i in vv] if isinstance(vv, list) else x(vv) if isinstance(vv, str) else vv)
                for kk, vv in gates[k].items()} for k in kinds}
-    pkt = assets / "model.pkt"
+    pkt = assets / gates.get("packet", "model.pkt")
     # serving_comparison.py render accepts the gate only for the exact packet the Infervisor arm served,
     # so the packet hash is the one captured with the run, never the --assets of a later re-score.
     pkt_rec = out / "packet.sha256"
     if not a.score_only:
         if not pkt.exists():
-            die(f"{assets}/model.pkt missing")
+            die(f"{pkt} missing")
         out.mkdir(parents=True, exist_ok=True)
         pkt_rec.write_text(sha(pkt) + "\n")
         serve = dict(r.get("serve", {}))

@@ -3166,12 +3166,12 @@ void op_lstm_cell_f32(const thread Inst& in, device const ulong* tab,
     device float* c = ten<float>(tab, in, 1);
     device const float* gates = ten<float>(tab, in, 2);
     device const float* previous = ten<float>(tab, in, 3);
-    uint width = in.i[0], lo, hi; range(width, slice, nblk, lo, hi);
+    uint width = in.i[0], rows = max(in.i[1], 1u), lo, hi; range(rows * width, slice, nblk, lo, hi);
     for (uint i = lo + lid; i < hi; i += NT) {
-        float cell = fma(sigmoidf(gates[width + i]), previous[i],
-                         sigmoidf(gates[i]) * tanh(gates[2u * width + i]));
+        device const float* g = gates + (i / width) * 4u * width + i % width;
+        float cell = fma(sigmoidf(g[width]), previous[i], sigmoidf(g[0]) * tanh(g[2u * width]));
         c[i] = cell;
-        h[i] = sigmoidf(gates[3u * width + i]) * tanh(cell);
+        h[i] = sigmoidf(g[3u * width]) * tanh(cell);
     }
 }
 

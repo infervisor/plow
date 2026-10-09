@@ -1981,8 +1981,9 @@ pub enum DevOp {
     /// Gather one FP16 embedding row and convert it to FP32.
     /// `t0=out(f32) t1=table(f16) t2=token(u32)` · `i0=vocab i1=width`.
     EmbedF16F32 = 171,
-    /// One FP32 LSTM cell after the input and recurrent projections have been summed. Gates are
-    /// contiguous `[input,forget,cell,output]`. `t0=h_new t1=c_new t2=gates t3=c_prev` · `i0=width`.
+    /// FP32 LSTM cells after the input and recurrent projections have been summed, one per row
+    /// (`rows` 0 = 1). Each row's gates are contiguous `[input,forget,cell,output]` x `width`;
+    /// states are `[rows,width]`. `t0=h_new t1=c_new t2=gates t3=c_prev` · `i0=width i1=rows?`.
     LstmCellF32 = 172,
     /// Row-wise FP32 argmax. `t0=ids(u32) t1=x(f32)` · `i0=rows i1=width`.
     ArgmaxF32 = 173,
@@ -2236,6 +2237,9 @@ pub const ACT_CLAMP: u32 = 13;
 /// `x * p0 + p1`.
 pub const ACT_SCALE_SHIFT: u32 = 14;
 pub const ACT_RELU: u32 = 15;
+/// `sqrt(x)`, correctly rounded. [`DevOp::UnaryF32`] only (the convolution activation fields
+/// hold 4 bits).
+pub const ACT_SQRT: u32 = 16;
 
 /// GLU-family `act` code for GPT-OSS's `swiglu_oai` (pair form, `f0 = alpha`, `f1 = limit`).
 /// Codes 0/1/2 are gelu_tanh / silu / situ; see [`DevOp::Glu`].

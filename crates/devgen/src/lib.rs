@@ -91,6 +91,7 @@ pub mod rnnt;
 pub mod tts;
 pub mod codec;
 pub mod s3gen;
+pub mod vad;
 pub mod tune_demand;
 pub mod segment_resource;
 
@@ -7542,6 +7543,16 @@ pub type SidecarVerifier = Box<
 >;
 
 static SIDECAR_VERIFIER: std::sync::Mutex<Option<SidecarVerifier>> = std::sync::Mutex::new(None);
+
+/// A standalone `vad.pkt` for the VAD export in `dir` (scripts/asr/silero_vad_export.py), written
+/// like the sidecar packets (logical-effect checks when a verifier is installed). Returns the FP32
+/// speech ops it runs (`PLOW_SPEECH_OPS` of its speech object).
+pub fn emit_vad_packet(dir: &std::path::Path, out: &std::path::Path, n_cu: u32, gpu: &str) -> Result<u64, String> {
+    let target = if gpu.is_empty() { 0 } else { packet::devbuild::gpu_fingerprint(gpu) };
+    let (model, section) = vad::lower_silero(dir, n_cu, target)?;
+    write_sidecar_packet(out, &model, &[section]);
+    Ok(manifest::speech_ops(&model))
+}
 
 /// Checkpoint D (logical tensor effects) for every sidecar packet (`encoder.pkt`, `codec.pkt`,
 /// `s3gen.pkt`) emitted later in this process. Not installed = those packets are not checked.

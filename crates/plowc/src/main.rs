@@ -1712,6 +1712,9 @@ fn run_devblob(cli: &Cli) -> Result<PathBuf, Box<dyn std::error::Error>> {
 
     let config_json = std::fs::read_to_string(dir.join("config.json"))?;
     ensure_devblob_arch_supported(&config_json)?;
+    if serde_json::from_str::<serde_json::Value>(&config_json)?["model_type"].as_str() == Some("silero_vad") {
+        return run_vad_devblob(cli, &dir);
+    }
 
     let slug = plowc::hf_config::dir_slug(&dir);
 
@@ -2040,6 +2043,97 @@ fn run_devblob(cli: &Cli) -> Result<PathBuf, Box<dyn std::error::Error>> {
         "devblob written"
     );
     Ok(pkt)
+}
+
+/// A VAD export (`model_type` silero_vad) compiles to a standalone `<out>/vad.pkt`
+/// (crates/devgen/src/vad.rs); `--emit devblob+cubin` also builds the speech interpreter object
+/// carrying exactly its FP32 ops (`interp_<arch>_speech.cubin` beside it).
+fn run_vad_devblob(cli: &Cli, dir: &Path) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let out_dir = cli.out.clone().unwrap_or_else(|| PathBuf::from("plow-out").join(plowc::hf_config::dir_slug(dir)));
+    std::fs::create_dir_all(&out_dir)?;
+    let n_cu = if cli.n_cu > 0 {
+        cli.n_cu
+    } else {
+        hwspec::registry::lookup(&cli.gpu)
+            .map(|s| s.sm_count)
+            .ok_or_else(|| format!("unknown GPU {:?}; pass --n-cu explicitly", cli.gpu))?
+    };
+    if cli.lean_verify || cli.lean_verify_devblob {
+        // Installs the sidecar verifier: the packet's logical tensor effects are Lean-checked.
+        let _ = devblob_verify_hook(true, false, 0, 0, true)?;
+    }
+    let pkt = out_dir.join(devgen::vad::PACKET);
+    let ops = devgen::emit_vad_packet(dir, &pkt, n_cu, &cli.gpu)?;
+    std::fs::write(
+        out_dir.join("vad.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "packet": devgen::vad::PACKET,
+            "pipeline": devgen::vad::PIPELINE,
+            "driver": devgen::vad::DRIVER,
+            "arch": cli.arch,
+            "gpu": cli.gpu,
+            "n_cu": n_cu,
+            "speech_ops": ops,
+            "checkpoint": serde_json::from_slice::<serde_json::Value>(&std::fs::read(dir.join("config.json"))?)?,
+        }))?,
+    )?;
+    if cli.emit() == EmitKind::DevblobCubin {
+        build_speech_cubin(&out_dir, &cli.arch, ops)?;
+    }
+    info!(out = %pkt.display(), n_cu, speech_ops = format!("{ops:#x}"), "vad packet written");
+    Ok(pkt)
+}
+
+/// The speech interpreter object alone (`interp_<arch>_speech.cubin`) with the FP32 speech arms
+/// in `ops` (`PLOW_SPEECH_OPS`), for a standalone sidecar packet with no LM object set.
+fn build_speech_cubin(out_dir: &Path, arch: &str, ops: u64) -> Result<(), Box<dyn std::error::Error>> {
+    let nvcc = std::env::var_os("PLOW_NVCC")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/usr/local/cuda/bin/nvcc"));
+    if !nvcc.exists() || which_cmake().is_none() {
+        return Err(format!("--emit devblob+cubin needs nvcc ({}) and cmake; the packet was written", nvcc.display()).into());
+    }
+    let stem = match arch {
+        "sm_90a" => "interp_sm90a",
+        "sm_89" => "interp_sm89",
+        _ => return Err(format!("--arch {arch}: the speech object is built for sm_90a or sm_89").into()),
+    };
+    let build_dir = out_dir.join(".cubin-build");
+    let cubins = build_dir.join("cubin");
+    let object = format!("{stem}_speech.cubin");
+    let status = std::process::Command::new("cmake")
+        .arg("-S")
+        .arg(repo_runtime_dir()?)
+        .arg("-B")
+        .arg(&build_dir)
+        .args([
+            cubin_arch_option(arch)?.to_string(),
+            "-DPLOW_CUBIN_SPEECH=ON".into(),
+            "-DPLOW_CUBIN_GEMMA=OFF".into(),
+            "-DPLOW_TTS_SNAC=OFF".into(),
+            "-DPLOW_TTS_S3GEN=OFF".into(),
+            format!("-DPLOW_CUBIN_ARCH={arch}"),
+            format!("-DPLOW_CUBIN_NVCC={}", nvcc.display()),
+            format!("-DPLOW_CUBIN_DIR={}", cubins.display()),
+            format!("-DPLOW_EXTRA_DEFINES=-DPLOW_SPEECH_OPS={ops:#x}ull"),
+            format!("-DPLOW_CUBIN_ONLY={stem}_speech"),
+        ])
+        .status()?;
+    if !status.success() {
+        return Err(format!("cmake configure failed ({status})").into());
+    }
+    let status = std::process::Command::new("cmake")
+        .arg("--build")
+        .arg(&build_dir)
+        .arg("--target")
+        .arg("nv_cubins")
+        .status()?;
+    if !status.success() {
+        return Err(format!("cmake build of {object} failed ({status})").into());
+    }
+    std::fs::copy(cubins.join(&object), out_dir.join(&object))?;
+    info!(object = %out_dir.join(&object).display(), "speech object built");
+    Ok(())
 }
 
 fn ensure_devblob_arch_supported(config_json: &str) -> Result<(), String> {
