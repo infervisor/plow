@@ -25,6 +25,7 @@ checklist phases P0-P5). Raw output goes to campaign scratch, never into the rep
 | `catinfo.c` | CPUID 0x10 CAT capability widths | `cc -O2 catinfo.c -o catinfo` |
 | `iso_demo.c` | isolated-core mailbox round trip with involuntary-preemption count | `cc -O2 -pthread iso_demo.c -o iso_demo` |
 | `project.py` | the plan's per-layer latency projection model | `python3 project.py` |
+| `campaign/` | as-run P0-P6 campaign drivers copied from `/tmp/g4c/l2r` (hard-coded `/tmp/g4c` paths and this box's 90-worker layout; recipes, not portable tools); resume notes in `docs/bringup/results/xeon6-l2r-bf16-20261008/TRACKER.md` | |
 
 L2 locking uses the out-of-tree driver in `runtime/cpu/driver/` (`/dev/pseudo_lock`). Reloading it
 with other way counts affects every process on the host; check `/sys/class/misc/pseudo_lock/caps`

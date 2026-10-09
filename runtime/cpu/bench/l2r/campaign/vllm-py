@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# python3 inside the vLLM 0.30.0 CPU image; host network, /tmp and the repo at identical paths.
+# VLLM_CONTAINER names the container (cgroup memory sampling). sudo resets the environment, so
+# the vLLM CPU knobs are forwarded as explicit VAR=value pairs.
+name=${VLLM_CONTAINER:-vpy-$$-$RANDOM}
+envs=()
+for v in VLLM_CPU_KVCACHE_SPACE VLLM_CPU_OMP_THREADS_BIND VLLM_CPU_NUM_OF_RESERVED_CPU OMP_NUM_THREADS; do
+    [ -n "${!v:-}" ] && envs+=(-e "$v=${!v}")
+done
+exec sudo docker run --rm --init --network host --ipc host --name "$name" \
+  --user "$(id -u):$(id -g)" -e HOME=/tmp/g4c/home -e HF_HOME=/tmp/hf_cache "${envs[@]}" \
+  -v /tmp:/tmp -v /home/ec2-user/plow:/home/ec2-user/plow -w "$PWD" \
+  --entrypoint python3 vllm/vllm-openai-cpu:v0.30.0 "$@"
