@@ -89,6 +89,7 @@ mod projection_rewrite;
 mod rewrite_lower;
 pub mod rnnt;
 pub mod tts;
+pub mod vad;
 pub mod codec;
 pub mod s3gen;
 pub mod tune_demand;

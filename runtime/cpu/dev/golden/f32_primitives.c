@@ -609,6 +609,7 @@ static float g_act_f32(uint32_t kind, float x, float p0, float p1) {
     case 13: return fminf(fmaxf(x, p0), p1);
     case 14: return x * p0 + p1;
     case 15: return x > 0.0f ? x : 0.0f;
+    case 16: return sqrtf(x);
     default: return x;
     }
 }

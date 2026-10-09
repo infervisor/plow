@@ -2238,6 +2238,8 @@ pub const ACT_CLAMP: u32 = 13;
 /// `x * p0 + p1`.
 pub const ACT_SCALE_SHIFT: u32 = 14;
 pub const ACT_RELU: u32 = 15;
+/// `sqrt(x)` ([`DevOp::UnaryF32`] only; a convolution's activations stop at [`ACT_RELU`]).
+pub const ACT_SQRT: u32 = 16;
 
 /// GLU-family `act` code for GPT-OSS's `swiglu_oai` (pair form, `f0 = alpha`, `f1 = limit`).
 /// Codes 0/1/2 are gelu_tanh / silu / situ; see [`DevOp::Glu`].
