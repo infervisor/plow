@@ -15,6 +15,15 @@
  * with PREFETCHNTA (the E4B split: one E4B layer is ~2 MiB per worker).
  * L2R_LOCK=1 (with L2R_RESIDENT_KIB): lock the resident part in L2 through /dev/pseudo_lock (level 2, owner = the worker's
  *   cpu); the rest streams normally, confined by CAT to the unlocked ways. Prints the minimum held fraction.
+ * L2R_BCAST=direct|rep|repcld|repnt|fid: how the output vectors reach every worker. direct: read the shared vector (homed
+ *   wherever main touched it). rep: each producer copies its slice (64-byte aligned segment) into one replica per
+ *   SNC node, homed on that node; readers gather from their own node's replica. repcld: rep + CLDEMOTE of the
+ *   written lines, so readers hit their node's L3 instead of snooping the producer's core. repnt: rep with
+ *   non-temporal full-line stores (readers fetch from their node's memory, no remote snoop). fid: repnt where each
+ *   line carries the step's tag at both ends, readers poll until it matches, and only the barrier before the
+ *   attention combine remains (7 of 8 barriers removed).
+ * L2R_BARRIER=diss|hier: dissemination flags, or a per-node arrival counter -> node leaders -> per-node gate (all
+ *   lines homed on their node).
  * L2R_NOBCAST=1: after step 0 every worker reads private snapshots of the shared vectors (identical values, since
  * the step repeats), which removes the activation all-gather from the timing; writes are unchanged.
  * Prints one JSON line: per-boundary error vs the FP32 reference (first and last step), step p50/p95/p99,
@@ -44,6 +53,19 @@ static const char* DIR;
 static int NW, STEPS, AMX, REP, NOBCAST;
 static size_t RESKIB;
 static int PLFD = -1;
+static int BCAST, BARR;               /* L2R_BCAST: 0 direct, 1 rep, 2 repcld, 3 repnt, 4 fid; L2R_BARRIER: 0 diss, 1 hier */
+static int NNODE, nodeof[MAXW], node_first[8], node_count[8];
+/* One broadcast vector: producer w owns elements [off, off + len); in the per-node replicas its segment starts at
+ * byte seg (64-byte aligned, so no line has two writers). rep[n] is homed on node n. */
+typedef struct { int esz, off[MAXW], len[MAXW]; size_t seg[MAXW], bytes; uint8_t* rep[8]; } bc_t;
+static bc_t bc_q, bc_o, bc_down, bc_attn, bc_act, bc_pact, bc_po, bc_pml;
+static line_t *b_arrive[8], *b_done[8], *b_gate[8];
+/* Flag-in-data vectors (L2R_BCAST=fid): every 64-byte line is [tag u32 | 56 payload bytes | tag u32], written with
+ * one non-temporal full-line store into each node's replica (parity-buffered by step); a reader polls its node's
+ * lines until both tags equal the step's tag, so the gather itself is the synchronisation and no barrier is needed. */
+typedef struct { int esz, epl, off[MAXW], len[MAXW], line0[MAXW], lines; uint8_t* rep[8][2]; } fv_t;
+static fv_t fv_q, fv_k, fv_v, fv_attn, fv_o, fv_act, fv_down, fv_pact, fv_pp;
+static uint8_t* line_nodes; /* [NH*HD/16]: bit k = a combine worker on node k reads this line of every partial block */
 struct pl_lock_req { uint64_t addr, len; int32_t cpu; uint32_t level, id, pad; };
 struct pl_measure { uint32_t id, pad; uint64_t lines, l1_l2, l3, dram, p50, cal_l2, cal_l3, cal_dram; };
 #define PL_IOC_LOCK _IOWR('P', 11, struct pl_lock_req)
@@ -140,8 +162,116 @@ static double meta_f(const char* js, const char* key) {
     return p ? atof(p + strlen(pat)) : 0;
 }
 
+static void split(int n, int unit, int w, int* a, int* b);
+
+static void* node_alloc(size_t bytes, int node) {
+    bytes = (bytes + 4095) / 4096 * 4096;
+    void* p = mmap(NULL, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    unsigned long mask = 1ul << node;
+    if (syscall(SYS_mbind, p, bytes, 2 /* MPOL_BIND */, &mask, 64, 0)) { perror("mbind"); exit(1); }
+    memset(p, 0, bytes);
+    return p;
+}
+
+static void bc_init(bc_t* b, int esz, int n, int unit, int whole_blocks) {
+    b->esz = esz;
+    size_t at = 0;
+    for (int w = 0; w < NW; w++) {
+        int a, z;
+        if (whole_blocks) { a = w * n; z = a + n; } else split(n, unit, w, &a, &z);
+        b->off[w] = a; b->len[w] = z - a; b->seg[w] = at;
+        at += ((size_t)(z - a) * esz + 63) / 64 * 64;
+    }
+    b->bytes = at;
+    for (int k = 0; k < NNODE; k++) b->rep[k] = node_alloc(at, k);
+}
+
+/* producer w copies its elements (src points at element off[w]) into every node's replica */
+static inline void bc_publish(const bc_t* b, int w, const void* src) {
+    const size_t n = (size_t)b->len[w] * b->esz;
+    if (BCAST >= 3) { /* whole 64-byte lines (the segment is padded), streamed past the caches to the replica's node */
+        for (size_t i = 0; i < n; i += 64) {
+            const __mmask64 k = n - i >= 64 ? ~0ull : (1ull << (n - i)) - 1;
+            const __m512i v = _mm512_maskz_loadu_epi8(k, (const uint8_t*)src + i);
+            for (int r = 0; r < NNODE; r++) _mm512_stream_si512((__m512i*)(b->rep[r] + b->seg[w] + i), v);
+        }
+        _mm_sfence();
+        return;
+    }
+    for (int k = 0; k < NNODE; k++) {
+        uint8_t* d = b->rep[k] + b->seg[w];
+        memcpy(d, src, n);
+        if (BCAST == 2) for (size_t i = 0; i < n; i += 64) _cldemote(d + i);
+    }
+}
+
+/* reader on `node` gathers the whole vector into dst (element 0 at dst) */
+static inline void bc_gather(const bc_t* b, int node, void* dst) {
+    /* all lines requested up front: the copy below then finds them in flight instead of missing one segment at a time */
+    for (size_t i = 0; i < b->bytes; i += 64) _mm_prefetch((const char*)b->rep[node] + i, _MM_HINT_T0);
+    for (int w = 0; w < NW; w++)
+        memcpy((uint8_t*)dst + (size_t)b->off[w] * b->esz, b->rep[node] + b->seg[w], (size_t)b->len[w] * b->esz);
+}
+
+static void fv_init(fv_t* f, int esz, int n, int unit) {
+    f->esz = esz; f->epl = 56 / esz;
+    int at = 0;
+    for (int w = 0; w < NW; w++) {
+        int a, z; split(n, unit, w, &a, &z);
+        f->off[w] = a; f->len[w] = z - a; f->line0[w] = at;
+        at += (z - a + f->epl - 1) / f->epl;
+    }
+    f->lines = at;
+    for (int k = 0; k < NNODE; k++)
+        for (int par = 0; par < 2; par++) f->rep[k][par] = node_alloc((size_t)at * 64, k);
+}
+
+static inline void fv_publish(const fv_t* f, int w, const void* src, uint32_t tag, int par) {
+    const uint8_t* s8 = src;
+    const int n = f->len[w];
+    for (int i = 0, li = f->line0[w]; i < n; i += f->epl, li++) {
+        _Alignas(64) uint8_t line[64] = {0};
+        const int c = n - i < f->epl ? n - i : f->epl;
+        memcpy(line, &tag, 4); memcpy(line + 60, &tag, 4);
+        memcpy(line + 4, s8 + (size_t)i * f->esz, (size_t)c * f->esz);
+        const __m512i v = _mm512_load_si512(line);
+        for (int k = 0; k < NNODE; k++) _mm512_stream_si512((__m512i*)(f->rep[k][par] + (size_t)li * 64), v);
+    }
+    _mm_sfence();
+}
+
+static inline void fv_gather(const fv_t* f, int node, void* dst, uint32_t tag, int par) {
+    uint8_t* d8 = dst;
+    const uint8_t* base = f->rep[node][par];
+    for (int w = 0; w < NW; w++) {
+        const int n = f->len[w];
+        for (int i = 0, li = f->line0[w]; i < n; i += f->epl, li++) {
+            _Alignas(64) uint8_t line[64];
+            for (;;) {
+                _mm512_store_si512(line, _mm512_load_si512(base + (size_t)li * 64));
+                uint32_t t0, t1; memcpy(&t0, line, 4); memcpy(&t1, line + 60, 4);
+                if (t0 == tag && t1 == tag) break;
+                _mm_pause();
+            }
+            const int c = n - i < f->epl ? n - i : f->epl;
+            memcpy(d8 + (size_t)(f->off[w] + i) * f->esz, line + 4, (size_t)c * f->esz);
+        }
+    }
+}
+
 /* ---- barrier: dissemination, epoch-tagged flags, one line each ---- */
 static inline void barrier(int id, uint64_t e) {
+    if (BARR) { /* hierarchical: node-local arrival counter -> node leaders exchange -> node-local gate */
+        const int n = nodeof[id];
+        __atomic_fetch_add(&b_arrive[n]->v, 1, __ATOMIC_ACQ_REL);
+        if (id == node_first[n]) {
+            while (__atomic_load_n(&b_arrive[n]->v, __ATOMIC_ACQUIRE) < (uint64_t)node_count[n] * e) _mm_pause();
+            __atomic_store_n(&b_done[n]->v, e, __ATOMIC_RELEASE);
+            for (int m = 0; m < NNODE; m++) while (__atomic_load_n(&b_done[m]->v, __ATOMIC_ACQUIRE) < e) _mm_pause();
+            __atomic_store_n(&b_gate[n]->v, e, __ATOMIC_RELEASE);
+        } else while (__atomic_load_n(&b_gate[n]->v, __ATOMIC_ACQUIRE) < e) _mm_pause();
+        return;
+    }
     for (int r = 0, d = 1; d < NW; r++, d <<= 1) {
         dis[(id + d) % NW][r].v = e;
         while (dis[id][r].v < e) _mm_pause();
@@ -414,23 +544,46 @@ static void* run(void* arg) {
     const float *rq = q, *rk = k, *rv = v, *rpm = pm, *rpl = pl, *rpo = po, *ro = o, *rdown = down;
     const bf16 *rattn = attn_b, *ract = act_b, *rpact = pact_b;
     const int g = NH / KVH;
+    const int nd = nodeof[id];
+    float *lq = aligned_alloc(64, (size_t)NH * HD * 4), *lo = aligned_alloc(64, (size_t)H * 4), *ldown = aligned_alloc(64, (size_t)H * 4);
+    bf16 *lattn = aligned_alloc(64, (size_t)NH * HD * 2 + 64), *lact = aligned_alloc(64, (size_t)I * 2 + 64), *lpact = aligned_alloc(64, (size_t)PLE * 2 + 64);
+    float *lk = aligned_alloc(64, (size_t)KVH * HD * 4), *lv = aligned_alloc(64, (size_t)KVH * HD * 4), *lpp = aligned_alloc(64, (size_t)H * 4);
+    if (BCAST == 4) { rk = lk; rv = lv; }
+    /* attention partials are owner-homed: each worker writes its block into the replica of its own node only and
+     * combine readers fetch producer w's block from w's node (one reader per line, so no replication) */
+    const float* pow_[MAXW]; const float* pmw[MAXW];
+    float *my_po = po + (size_t)id * NH * HD, *my_pm = pm + id * NH, *my_pl = pl + id * NH;
+    if (BCAST) {
+        rq = lq; ro = lo; rdown = ldown; rattn = lattn; ract = lact; rpact = lpact;
+        for (int w = 0; w < NW; w++) {
+            pow_[w] = (const float*)(bc_po.rep[nodeof[w]] + bc_po.seg[w]);
+            pmw[w] = (const float*)(bc_pml.rep[nodeof[w]] + bc_pml.seg[w]);
+        }
+        for (int w = 0; w < NW; w++) pow_[w] = (const float*)(bc_po.rep[nd] + bc_po.seg[w]); /* reader-homed */
+        for (int w = 0; w < NW; w++) pmw[w] = (const float*)(bc_pml.rep[nd] + bc_pml.seg[w]);
+    }
     me->steps_t = calloc(STEPS, 8);
 
     pthread_barrier_wait(&pbar);
     uint64_t e = 0;
     for (int st = 0; st < STEPS; st++) {
         uint64_t t = __rdtsc(), t0 = t, u;
-#define PHASE(i) do { u = __rdtsc(); me->ph[i] += u - t; barrier(id, ++e); t = __rdtsc(); me->wt[i] += t - u; } while (0)
+#define PHASE(i) do { u = __rdtsc(); me->ph[i] += u - t; ++e; if (BCAST != 4 || (i) == 1) barrier(id, e); t = __rdtsc(); me->wt[i] += t - u; } while (0)
+        const uint32_t tag = (uint32_t)st + 1; const int par = st & 1;
         /* 0: input norm (redundant), qkv rows */
         rms(x_in, w_in, H, xn); tobf(xn, H, xb);
         gemv(me->w[0], me->r1[0] - me->r0[0], H, xb, q + me->r0[0]);
         gemv(me->w[1], me->r1[1] - me->r0[1], H, xb, k + me->r0[1]);
         gemv(me->w[2], me->r1[2] - me->r0[2], H, xb, v + me->r0[2]);
+        if (BCAST == 4) { fv_publish(&fv_k, id, k + me->r0[1], tag, par); fv_publish(&fv_v, id, v + me->r0[2], tag, par); }
+        if (BCAST == 4) fv_publish(&fv_q, id, q + me->r0[0], tag, par); else if (BCAST) bc_publish(&bc_q, id, q + me->r0[0]);
         PHASE(0);
         /* 1: q/k norm + rope, v norm (redundant); attention over this worker's KV positions */
+        if (BCAST == 4) fv_gather(&fv_q, nd, lq, tag, par); else if (BCAST) bc_gather(&bc_q, nd, lq);
         for (int h = 0; h < NH; h++) { rms(rq + h * HD, w_qn, HD, qn + h * HD); rope(qn + h * HD); }
         me->pro[1] += __rdtsc() - t;
         if (last) {
+            if (BCAST == 4) { fv_gather(&fv_k, nd, lk, tag, par); fv_gather(&fv_v, nd, lv, tag, par); }
             float kn[1024], vn[1024];
             for (int h = 0; h < KVH; h++) {
                 rms(rk + h * HD, w_kn, HD, kn); rope(kn); rms(rv + h * HD, NULL, HD, vn);
@@ -439,34 +592,55 @@ static void* run(void* arg) {
             }
         }
         for (int kh = 0; kh < KVH; kh++) {
-            float* m = pm + id * NH + kh * g; float* l = pl + id * NH + kh * g;
-            float* oh = po + ((size_t)id * NH + kh * g) * HD;
+            float* m = my_pm + kh * g; float* l = my_pl + kh * g;
+            float* oh = my_po + (size_t)kh * g * HD;
             const bf16 *kr = me->kc + (size_t)kh * np * HD, *vr = me->vc + (size_t)kh * np * HD;
             if (g == 8) attn_group(8, qn + kh * g * HD, kr, vr, np, sc, m, l, oh);
             else if (g == 4) attn_group(4, qn + kh * g * HD, kr, vr, np, sc, m, l, oh);
             else if (g == 2) attn_group(2, qn + kh * g * HD, kr, vr, np, sc, m, l, oh);
             else attn_group(1, qn + kh * g * HD, kr, vr, np, sc, m, l, oh);
         }
+        if (BCAST) { /* each line of the partial block goes only to the node(s) whose combine workers read it */
+            const uint8_t* src = (const uint8_t*)(po + (size_t)id * NH * HD);
+            for (int li = 0; li < NH * HD / 16; li++) {
+                const __m512i v = _mm512_loadu_si512(src + (size_t)li * 64);
+                for (int k = 0; k < NNODE; k++)
+                    if (line_nodes[li] >> k & 1) {
+                        uint8_t* d = bc_po.rep[k] + bc_po.seg[id] + (size_t)li * 64;
+                        if (BCAST >= 3) _mm512_stream_si512((__m512i*)d, v); else _mm512_store_si512(d, v);
+                    }
+            }
+            float rec[16];
+            for (int h = 0; h < NH; h++) { rec[h] = pm[id * NH + h]; rec[8 + h] = pl[id * NH + h]; }
+            bc_publish(&bc_pml, id, rec);
+        }
         PHASE(1);
         /* 2: combine partials for this worker's slice of NH*HD: one scale per (worker, head) */
         for (int h = me->e0 / HD; me->e1 > me->e0 && h <= (me->e1 - 1) / HD; h++) {
             float M = -INFINITY, den = 0;
-            for (int w = 0; w < NW; w++) if (rpm[w * NH + h] > M) M = rpm[w * NH + h];
-            for (int w = 0; w < NW; w++) { fw[w] = rpm[w * NH + h] == -INFINITY ? 0.f : expf(rpm[w * NH + h] - M); den += fw[w] * rpl[w * NH + h]; }
+#define PM_(w) (BCAST ? pmw[w][h] : rpm[(w) * NH + h])
+#define PL_(w) (BCAST ? pmw[w][8 + h] : rpl[(w) * NH + h])
+            for (int w = 0; w < NW; w++) if (PM_(w) > M) M = PM_(w);
+            for (int w = 0; w < NW; w++) { fw[w] = PM_(w) == -INFINITY ? 0.f : expf(PM_(w) - M); den += fw[w] * PL_(w); }
             const int a = h * HD > me->e0 ? h * HD : me->e0, b = (h + 1) * HD < me->e1 ? (h + 1) * HD : me->e1;
             for (int i = a; i < b; i++) {
                 const int d = i - h * HD;
                 float num = 0;
-                for (int w = 0; w < NW; w++) num += fw[w] * rpo[((size_t)w * NH + h) * HD + d];
+                if (BCAST) for (int w = 0; w < NW; w++) num += fw[w] * pow_[w][h * HD + d];
+                else for (int w = 0; w < NW; w++) num += fw[w] * rpo[((size_t)w * NH + h) * HD + d];
                 attn_b[i] = f2bf(num / den);
                 if (st == 0) chk_attn[i] = num / den;
             }
         }
+        if (BCAST == 4) fv_publish(&fv_attn, id, attn_b + me->e0, tag, par); else if (BCAST) bc_publish(&bc_attn, id, attn_b + me->e0);
         PHASE(2);
         /* 3: o rows */
+        if (BCAST == 4) fv_gather(&fv_attn, nd, lattn, tag, par); else if (BCAST) bc_gather(&bc_attn, nd, lattn);
         gemv(me->w[3], me->r1[3] - me->r0[3], NH * HD, rattn, o + me->r0[3]);
+        if (BCAST == 4) fv_publish(&fv_o, id, o + me->r0[3], tag, par); else if (BCAST) bc_publish(&bc_o, id, o + me->r0[3]);
         PHASE(3);
         /* 4: residual + norms (redundant); gate/up rows, gelu * up */
+        if (BCAST == 4) fv_gather(&fv_o, nd, lo, tag, par); else if (BCAST) bc_gather(&bc_o, nd, lo);
         rms(ro, w_pa, H, tmp); for (int i = 0; i < H; i++) h1[i] = x_in[i] + tmp[i];
         rms(h1, w_pf, H, tmp); tobf(tmp, H, x2b);
         me->pro[4] += __rdtsc() - t;
@@ -480,12 +654,16 @@ static void* run(void* arg) {
             act_b[r] = f2bf(a);
             if (st == 0) chk_act[r] = a;
         }
+        if (BCAST == 4) fv_publish(&fv_act, id, act_b + me->r0[4], tag, par); else if (BCAST) bc_publish(&bc_act, id, act_b + me->r0[4]);
         PHASE(4);
         /* 5: down rows */
+        if (BCAST == 4) fv_gather(&fv_act, nd, lact, tag, par); else if (BCAST) bc_gather(&bc_act, nd, lact);
         gemv(me->w[6], me->nres[6], I, ract, down + me->r0[6]);
         (PLFD >= 0 ? gemv : gemv_nta)(me->ws[6], me->r1[6] - me->r0[6] - me->nres[6], I, ract, down + me->r0[6] + me->nres[6]);
+        if (BCAST == 4) fv_publish(&fv_down, id, down + me->r0[6], tag, par); else if (BCAST) bc_publish(&bc_down, id, down + me->r0[6]);
         PHASE(5);
         /* 6: residual (redundant); ple gate rows, gelu * per-layer input */
+        if (BCAST == 4) fv_gather(&fv_down, nd, ldown, tag, par); else if (BCAST) bc_gather(&bc_down, nd, ldown);
         rms(rdown, w_pff, H, tmp); for (int i = 0; i < H; i++) h2[i] = h1[i] + tmp[i];
         tobf(h2, H, h2b);
         me->pro[6] += __rdtsc() - t;
@@ -496,12 +674,16 @@ static void* run(void* arg) {
             pact_b[r] = f2bf(a);
             if (st == 0) chk_pact[r] = a;
         }
+        if (BCAST == 4) fv_publish(&fv_pact, id, pact_b + me->r0[7], tag, par); else if (BCAST) bc_publish(&bc_pact, id, pact_b + me->r0[7]);
         PHASE(6);
         /* 7: ple projection rows */
+        if (BCAST == 4) fv_gather(&fv_pact, nd, lpact, tag, par); else if (BCAST) bc_gather(&bc_pact, nd, lpact);
         gemv(me->w[8], me->r1[8] - me->r0[8], PLE, rpact, pp + me->r0[8]);
+        if (BCAST == 4) fv_publish(&fv_pp, id, pp + me->r0[8], tag, par);
         PHASE(7);
         if (id == 0) {
-            rms(pp, w_pn, H, tmp);
+            if (BCAST == 4) fv_gather(&fv_pp, nd, lpp, tag, par);
+            rms(BCAST == 4 ? lpp : pp, w_pn, H, tmp);
             for (int i = 0; i < H; i++) outv[(size_t)(st == 0 ? 0 : 1) * H + i] = (h2[i] + tmp[i]) * SCALAR;
         }
         me->steps_t[st] = __rdtsc() - t0;
@@ -536,6 +718,8 @@ int main(int argc, char** argv) {
     DIR = argv[1]; STEPS = atoi(argv[2]);
     const char* g = getenv("L2R_GEMV"); AMX = g && !strcmp(g, "amx");
     NOBCAST = getenv("L2R_NOBCAST") && atoi(getenv("L2R_NOBCAST"));
+    { const char* b = getenv("L2R_BCAST"); BCAST = !b || !strcmp(b, "direct") ? 0 : !strcmp(b, "rep") ? 1 : !strcmp(b, "repcld") ? 2 : !strcmp(b, "repnt") ? 3 : 4; }
+    { const char* b = getenv("L2R_BARRIER"); BARR = b && !strcmp(b, "hier"); }
     RESKIB = getenv("L2R_RESIDENT_KIB") ? strtoull(getenv("L2R_RESIDENT_KIB"), 0, 10) : 0;
     if (getenv("L2R_LOCK") && atoi(getenv("L2R_LOCK"))) {
         if (!RESKIB || AMX) { fprintf(stderr, "L2R_LOCK needs L2R_RESIDENT_KIB and the AVX GEMV\n"); return 1; }
@@ -576,6 +760,37 @@ int main(int argc, char** argv) {
     ZA(pm, NW * NH); ZA(pl, NW * NH); ZA(po, (size_t)NW * NH * HD);
     ZA(chk_qn, A); ZA(chk_h1, H); ZA(chk_xn2, H); ZA(chk_h2, H); ZA(chk_attn, A); ZA(chk_act, I); ZA(chk_pact, PLE);
     attn_b = aligned_alloc(64, A * 2 + 64); act_b = aligned_alloc(64, I * 2 + 64); pact_b = aligned_alloc(64, PLE * 2 + 64);
+    for (int i = 0; i < NW; i++) {
+        nodeof[i] = 0;
+        for (int k = 0; k < 8; k++) {
+            char np_[96]; snprintf(np_, sizeof np_, "/sys/devices/system/cpu/cpu%d/node%d", cpus[i], k);
+            if (!access(np_, F_OK)) { nodeof[i] = k; break; }
+        }
+        if (nodeof[i] + 1 > NNODE) NNODE = nodeof[i] + 1;
+    }
+    for (int k = 0; k < NNODE; k++) { node_first[k] = -1; node_count[k] = 0; }
+    for (int i = 0; i < NW; i++) { if (node_first[nodeof[i]] < 0) node_first[nodeof[i]] = i; node_count[nodeof[i]]++; }
+    for (int k = 0; k < NNODE; k++) {
+        if (!node_count[k]) { node_first[k] = -1; }
+        b_arrive[k] = node_alloc(64, k); b_done[k] = node_alloc(64, k); b_gate[k] = node_alloc(64, k);
+        if (!node_count[k]) b_done[k]->v = ~0ull; /* nodes without workers never hold the leaders back */
+    }
+    if (BCAST) {
+        bc_init(&bc_q, 4, A, AMX ? 16 : 4, 0); bc_init(&bc_o, 4, H, AMX ? 16 : 4, 0); bc_init(&bc_down, 4, H, AMX ? 16 : 4, 0);
+        bc_init(&bc_attn, 2, A, 1, 0); bc_init(&bc_act, 2, I, AMX ? 16 : 4, 0); bc_init(&bc_pact, 2, PLE, AMX ? 16 : 4, 0);
+        bc_init(&bc_po, 4, A, 0, 1); bc_init(&bc_pml, 4, 16, 0, 1);
+        if (BCAST == 4) {
+            const int u = AMX ? 16 : 4;
+            fv_init(&fv_q, 4, A, u); fv_init(&fv_k, 4, KVH * HD, u); fv_init(&fv_v, 4, KVH * HD, u); fv_init(&fv_attn, 2, A, 1);
+            fv_init(&fv_o, 4, H, u); fv_init(&fv_act, 2, I, u); fv_init(&fv_down, 4, H, u); fv_init(&fv_pact, 2, PLE, u);
+            fv_init(&fv_pp, 4, H, u);
+        }
+        line_nodes = calloc(A / 16, 1);
+        for (int w = 0; w < NW; w++) {
+            int a, z; split(A, 1, w, &a, &z);
+            for (int i = a; i < z; i++) line_nodes[i / 16] |= 1 << nodeof[w];
+        }
+    }
     tsc_ghz = calib();
     pthread_barrier_init(&pbar, NULL, NW);
     pthread_t th[MAXW];
@@ -588,7 +803,7 @@ int main(int argc, char** argv) {
         {"h1", chk_h1, H}, {"xn2", chk_xn2, H}, {"gate", gate, I}, {"up", up, I}, {"act", chk_act, I},
         {"down", down, H}, {"h2", chk_h2, H}, {"pg", pg, PLE}, {"pact", chk_pact, PLE}, {"pp", pp, H},
         {"out", outv, H}, {"out_last", outv + H, H}};
-    printf("{\"ref\":\"%s\",\"gemv\":\"%s\",\"nobcast\":%d,\"resident_kib\":%zu,\"workers\":%d,\"steps\":%d,\"ctx_rows\":%d,\"tsc_ghz\":%.3f,\"err\":{", DIR, AMX ? "amx" : "avx", NOBCAST, RESKIB, NW, STEPS, CL + 1, tsc_ghz);
+    printf("{\"ref\":\"%s\",\"gemv\":\"%s\",\"nobcast\":%d,\"bcast\":%d,\"barrier\":\"%s\",\"resident_kib\":%zu,\"workers\":%d,\"steps\":%d,\"ctx_rows\":%d,\"tsc_ghz\":%.3f,\"err\":{", DIR, AMX ? "amx" : "avx", NOBCAST, BCAST, BARR ? "hier" : "diss", RESKIB, NW, STEPS, CL + 1, tsc_ghz);
     for (size_t b = 0; b < sizeof B / sizeof B[0]; b++) {
         char nm[64]; snprintf(nm, sizeof nm, "ref.%s", !strcmp(B[b].n, "out_last") ? "out" : B[b].n);
         float* r = REP == 1 ? load(nm, NULL, NULL) : NULL;
