@@ -230,7 +230,8 @@ pub const CUBLASLT_PREFILL_QWEN3_1_7B_SHAPES: [(u32, u32); 4] = [(2048, 2048), (
 pub fn cublaslt_prefill_fp8(profile: &str, m: u32, n: u32, k: u32) -> bool {
     matches!(profile, "sm90a" | "sm_90a")
         && [64, 128, 256, 512, 1024, 1088, 1152, 2048, 2112, 2176, 4096, 4160, 4224, 8192].contains(&m)
-        && CUBLASLT_PREFILL_GEMMA4_SHAPES.contains(&(n, k))
+        && (CUBLASLT_PREFILL_GEMMA4_SHAPES.contains(&(n, k))
+            || CUBLASLT_PREFILL_GEMMA4_26B_SHAPES.contains(&(n, k)))
         && !((n, k) == (3840, 15360) && m >= 2048)
         && !(m == 2112 && [(3840, 4096), (3840, 8192)].contains(&(n, k)))
 }

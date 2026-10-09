@@ -1288,12 +1288,19 @@ def cmd_sweep(a: argparse.Namespace) -> None:
 #                     needle_min, tie_margin (docs/bringup/agent-tools.md §5)
 # Each may set `python` (default [gates].python, else python3), `args` (extra client args) and
 # `timeout_s`. Placeholders as in `build`, plus {assets}, {target} (cargo target dir) and {out}.
+# A table named <kind>_<suffix> (e.g. [gates.llm_fp32_ref_long], a second reference set) runs as
+# another gate of that kind, in out/<kind>_<suffix>/.
 GATE_KINDS = ("llm_logit_parity", "llm_fp32_ref", "asr_wer", "tts_cer", "s3gen_rel_l2")
 
 
-def gate_steps(kind: str, g: dict, py: str, out: Path, assets: Path) -> tuple[list[str], list[str]]:
-    """(steps while the server is up, steps after it stops); each writes into out/<kind>/."""
-    d = shlex.quote(str(out / kind))
+def gate_kind(key: str) -> str | None:
+    return next((k for k in GATE_KINDS if key == k or key.startswith(k + "_")), None)
+
+
+def gate_steps(key: str, g: dict, py: str, out: Path, assets: Path) -> tuple[list[str], list[str]]:
+    """(steps while the server is up, steps after it stops); each writes into out/<key>/."""
+    d = shlex.quote(str(out / key))
+    kind = gate_kind(key)
     q = shlex.quote
     sc = lambda rel: q(str(REPO / rel))
     args = " ".join(q(x) for x in g.get("args", []))
@@ -1346,8 +1353,9 @@ def fp32_ref_module():
     return mod
 
 
-def gate_score(kind: str, g: dict, d: Path) -> dict:
+def gate_score(key: str, g: dict, d: Path) -> dict:
     """{metric: value, ..., "pass": bool, "why": [...]} from the files gate_steps wrote."""
+    kind = gate_kind(key)
     txt = lambda name: (d / name).read_text(errors="replace") if (d / name).is_file() else ""
     res, why = {}, []
     def lim(metric, value, key, upper=True):
@@ -1412,7 +1420,8 @@ def cmd_gate(a: argparse.Namespace) -> None:
     with open(a.recipe, "rb") as f:
         r = tomllib.load(f)
     gates = dict(r.get("gates", {}))
-    kinds = [k for k in GATE_KINDS if k in gates and (not a.only or k in a.only.split(","))]
+    kinds = [k for k in gates if isinstance(gates[k], dict) and gate_kind(k)
+             and (not a.only or k in a.only.split(","))]
     if not kinds:
         die(f"{a.recipe}: no [gates.<kind>] tables ({', '.join(GATE_KINDS)})")
     assets = Path(a.assets).resolve()

@@ -726,6 +726,8 @@ pub(crate) struct GroupedDims {
     pub k_array: u64,
     /// Expected `m_g`; only steers the heuristic.
     pub average_rows: u32,
+    /// e4m3 `W` and `A` (unit scales, fast accumulation) instead of bf16; `C` stays bf16.
+    pub fp8: bool,
 }
 
 /// Device `i32[groups]` arrays of a grouped attention GEMM's per-group shapes (see
@@ -753,15 +755,20 @@ impl Lt {
         self.api.cublasLtGroupedMatrixLayoutCreate.is_some()
     }
 
-    pub(crate) fn grouped_plan(self: &Arc<Self>, dims: &GroupedDims) -> Result<Arc<GroupedPlan>> {
+    /// The plan comes back unselected: every runnable heuristic candidate is a
+    /// [`GroupedPlan::candidates`] entry, best-first by the heuristic.
+    pub(crate) fn grouped_plan(self: &Arc<Self>, dims: &GroupedDims) -> Result<GroupedPlan> {
         // Column-major views of the row-major operands: W is k x n, A is k x m_g, C is n x m_g.
-        let mut plan = self.grouped_plan_raw(
+        // CUDA_R_8F_E4M3 = 28, CUDA_R_16BF = 14.
+        let input = if dims.fp8 { 28 } else { 14 };
+        let plan = self.grouped_plan_raw(
             true,
+            dims.fp8,
             1.0,
             dims.groups,
             [
-                (14, dims.k_array, dims.n_array, dims.k_array),
-                (14, dims.k_array, dims.rows, dims.k_array),
+                (input, dims.k_array, dims.n_array, dims.k_array),
+                (input, dims.k_array, dims.rows, dims.k_array),
                 (14, dims.n_array, dims.rows, dims.n_array),
             ],
             [
@@ -770,14 +777,7 @@ impl Lt {
                 u64::from(dims.average_rows.max(1)),
             ],
         )?;
-        plan.select(0);
-        tracing::info!(
-            groups = dims.groups,
-            n = dims.n,
-            k = dims.k,
-            "cuBLASLt grouped algorithm selected"
-        );
-        Ok(Arc::new(plan))
+        Ok(plan)
     }
 
     /// The grouped form of [`Self::attention_plan`]: `alpha` scales the scores. The plan comes
@@ -808,7 +808,7 @@ impl Lt {
                 [u64::from(dims.average_n), hd, u64::from(dims.average_m)],
             ),
         };
-        self.grouped_plan_raw(kind == AttentionGemm::Scores, alpha, dims.groups, layouts, averages)
+        self.grouped_plan_raw(kind == AttentionGemm::Scores, false, alpha, dims.groups, layouts, averages)
     }
 
     /// `layouts` = `[W, A, C]`; `averages` = `[reduction dim, D rows, D cols]` for the heuristic.
@@ -816,6 +816,7 @@ impl Lt {
     fn grouped_plan_raw(
         self: &Arc<Self>,
         transpose_w: bool,
+        fast_accum: bool,
         alpha: f32,
         groups: u32,
         layouts: [GroupedLayout; 3],
@@ -865,6 +866,18 @@ impl Lt {
                         size_of::<i32>(),
                     ),
                     "Lt grouped descriptor attribute",
+                )?;
+            }
+            // CUBLASLT_MATMUL_DESC_FAST_ACCUM = 25 (int8).
+            if fast_accum {
+                check(
+                    (self.api.cublasLtMatmulDescSetAttribute)(
+                        raw,
+                        25,
+                        &1i8 as *const _ as *const c_void,
+                        size_of::<i8>(),
+                    ),
+                    "Lt grouped fast accumulation",
                 )?;
             }
             for (dst, (dtype, rows, cols, ld)) in

@@ -22,6 +22,9 @@ KEYS = ["num_requests_running", "num_requests_waiting", "iteration_tokens_total_
         "iteration_tokens_total_sum", "prompt_tokens_total", "generation_tokens_total",
         "prefix_cache_hits_total", "prefix_cache_queries_total"]
 REQUEST_KEYS = ["plowrt_prefix_attach_hits_total", "plowrt_prefix_attach_misses_total"]
+# plowrt scheduler gauges, for a mode / launch-width timeline (NaN on vLLM).
+PLOW_GAUGES = ["plowrt_serve_mode", "plowrt_prefill_launch_rows", "plowrt_queued_requests",
+               "plowrt_decode_occupied_extent"]
 
 
 def metric_values(txt):
@@ -29,12 +32,12 @@ def metric_values(txt):
         matches = list(re.finditer(r"^" + re.escape(name) + r"(\{[^}]*\})? ([0-9.eE+-]+)$", txt, re.M))
         return sum(float(m.group(2)) for m in matches) if matches else missing
     return ([value("vllm:" + k, float("nan") if k.startswith("prefix_cache_") else 0.0) for k in KEYS]
-            + [value(k, float("nan")) for k in REQUEST_KEYS])
+            + [value(k, float("nan")) for k in REQUEST_KEYS + PLOW_GAUGES])
 
 
 def poll(port, out):
     with open(out, "w") as f:
-        f.write("t\t" + "\t".join(KEYS + REQUEST_KEYS) + "\n")
+        f.write("t\t" + "\t".join(KEYS + REQUEST_KEYS + PLOW_GAUGES) + "\n")
         while True:
             try:
                 txt = urllib.request.urlopen(f"http://127.0.0.1:{port}/metrics", timeout=2).read().decode()

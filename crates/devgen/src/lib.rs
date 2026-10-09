@@ -1939,9 +1939,12 @@ struct Tn {
     moe_fug: u32,
     // beat26b w8a8 grouped-MoE prefill: fp8 twin of the gathered GLU output `fug` (uint8
     // [total_pad*moe_inter] e4m3 + f32 fscale[total_pad]), quantized by QuantFp8 between the w8a8
-    // GLU and DOWN. TENSOR_NONE unless moe_pf && w8a8. (xn2 reuses xqh/ash — same hidden width.)
+    // GLU and DOWN. TENSOR_NONE unless moe_pf && w8a8. xn2's e4m3 rows also land in `fuq` (their
+    // scales in `xas`), never in xqh/ash: the dense GLU reads xqh/ash on a branch that does not
+    // order against the MoE one.
     moe_fuq: u32,
     moe_fus: u32,
+    moe_xas: u32,
     // T8 w8a8: reused-per-layer fp8 ACTIVATION quant scratch (uint8 xq + f32 row a_scale), one pair
     // per distinct activation width. Emitted only under PLOW_W8A8; TENSOR_NONE otherwise.
     //   xqh/ash  — hidden-width (q/k/v read n.hn; gate/up read n.hn again).
@@ -2486,6 +2489,11 @@ fn declare(
         },
         moe_fus: if moe_pf_on && w8a8 {
             ac(b, "moe.fus", total_pad as u64 * F32)
+        } else {
+            TENSOR_NONE
+        },
+        moe_xas: if moe_pf_on && w8a8 {
+            ac(b, "moe.xas", rows as u64 * F32)
         } else {
             TENSOR_NONE
         },
@@ -4434,9 +4442,12 @@ fn emit_phase(
             // sm_90a TMA (see `tmap` above): w8a8 only — both operands are e4m3 tensors
             // the TMA e4m3 maps can describe. The w8a16 body keeps cp.async (its A is
             // bf16 and its weight is dequanted in-kernel; no TMA arm exists for it).
+            // The e4m3 maps use a 128-wide inner box: K = 2112 (26B-A4B down_proj) keeps
+            // cp.async, as the live-KV manifest requires.
             let tm8 = (tma_gemm
                 && !fp8_lt_decode
                 && w8a8
+                && k % 128 == 0
                 && matches!(op, DevOp::GemmFp8 | DevOp::GemmMedFp8 | DevOp::GemmSmallFp8))
             .then(|| (tmap8(xq, m, k), tmap8(w8, nn, k)));
             return b.emit(op, cus, deps, |d| {
@@ -6399,8 +6410,8 @@ fn emit_phase(
             // an expert read that expert's weight rows once from HBM (op_moe.cuh ordering note).
             let nb = if decode && t > 1 { t } else { 0 };
             assert!(
-                !decode || t <= 32,
-                "MoE decode batch is capped at 32 (per-CTA inv[] scratch, PLOW_MOE_MAXB)"
+                !decode || t <= 128,
+                "MoE decode batch is capped at 128 (per-CTA inv[] scratch, PLOW_MOE_MAXB)"
             );
             if decode {
                 // h1 = post_feedforward_layernorm_1(dense MLP output)
@@ -6692,8 +6703,15 @@ fn emit_phase(
                     d.f[0] = root;
                     d.f[1] = c.eps;
                 });
-                // align/sort (SINGLE block): histogram -> padded prefix -> scatter gather maps.
-                let c_align = b.emit(DevOp::MoeAlignGemmaPf, vec![0], &[c_rt], |d| {
+                // align/sort: histogram -> padded prefix -> scatter gather maps. BF16 CUDA scatters
+                // across every block from 1024 rows: every block histograms all T*k slots, and
+                // below that the single block measured the same (26B H100 packed prefill, 128-512
+                // tie; 1024 / 4096 / 15K -0.4 / -2.0 / -6.9 ms multi-block). The AMD op is
+                // single-block; on W8A8 a full-width align lets the shared-expert GEMMs interleave
+                // into the MoE cuBLASLt chain's stream window.
+                let align_cus =
+                    if emit_is_amd() || w8a8 || t < 1024 { vec![0] } else { all.clone() };
+                let c_align = b.emit(DevOp::MoeAlignGemmaPf, align_cus, &[c_rt], |d| {
                     d.t[0] = n.moe_meta;
                     d.t[1] = n.moe_tab;
                     d.t[2] = n.moe_rowtok;
@@ -6705,23 +6723,23 @@ fn emit_phase(
                 });
                 // grouped gate/up GEMM + GeGLU (gathered A, expert-selected B) -> fu_gathered.
                 // beat26b: w8a8 arm = native fp8 tensor-core GEMM (both operands e4m3). xn2 is quantized
-                // to e4m3 (xqh/ash, hidden width) once; the grouped GLU gathers e4m3 rows and dequants
+                // to e4m3 (fuq/xas, hidden width) once; the grouped GLU gathers e4m3 rows and dequants
                 // with a_scale[token]*w_scale[chan] in the epilogue. bf16 arm unchanged.
                 let c_dn = if w8a8 {
                     // total_pad rows the align op touched for THIS bucket (matches align's write extent).
                     let moe_total_pad = t * c.top_k + c.n_exp * 128;
-                    let c_xn2q = quant(b, n.xqh, n.ash, n.moe_xn2, c.hidden, c_xn2);
+                    let c_xn2q = quant(b, n.moe_fuq, n.moe_xas, n.moe_xn2, c.hidden, c_xn2);
                     let c_glu = b.emit(
                         DevOp::MoeGroupGluGemmaPfW8a8,
                         all.clone(),
                         &[c_align, c_xn2q],
                         |d| {
                             d.t[0] = n.moe_fug;
-                            d.t[1] = n.xqh; // xn2 e4m3
+                            d.t[1] = n.moe_fuq; // xn2 e4m3
                             d.t[2] = w.ewt; // fp8 expert weights
                             d.t[3] = n.moe_meta;
                             d.t[4] = n.moe_rowtok;
-                            d.t[5] = n.ash; // per-token a_scale
+                            d.t[5] = n.moe_xas; // per-token a_scale
                             d.t[6] = w.est; // per-channel weight scales
                             d.i[0] = c.moe_inter;
                             d.i[1] = c.hidden;
@@ -9878,13 +9896,14 @@ fn emit_dense_gqa(
     // slot `s`'s offset into the KV cache is `s * (kv_head*ring*hd)` — INVARIANT in B — so a
     // sequence keeps its slot while the program under it changes rung to rung.
     let mut dbatch: u32 = *rungs.last().expect("decode_rungs is non-empty");
-    // 26B-A4B MoE decode is BATCHED (B in 1..=32): the router family, the flat expert GLU/down
+    // 26B-A4B MoE decode is BATCHED (B in 1..=128): the router family, the flat expert GLU/down
     // and the combine all carry a batch row count and index [B][k] routing slots. See the
     // work-item ordering note in runtime/nvidia/op_moe.cuh for the weight-reuse design.
     // (The fp8 batch refusal is gone: the fp8 GEMV arms are batched as of the B=32 work.)
+    // PLOW_MOE_MAXB follows PLOW_PACKET_DECODE_BATCH above 32 rows.
     assert!(
-        !(c.moe && dbatch > 32),
-        "MoE decode batch is capped at 32 (per-CTA inv[] scratch, PLOW_MOE_MAXB)"
+        !(c.moe && dbatch > 128),
+        "MoE decode batch is capped at 128 (per-CTA inv[] scratch, PLOW_MOE_MAXB)"
     );
 
     // Grouped-MoE PREFILL: token-sorted grouped expert GEMM buckets.
@@ -10148,8 +10167,10 @@ fn emit_dense_gqa(
     let mut sections = Vec::new();
     if ecfg.decode_cublaslt || ecfg.decode_native_tc {
         assert!(
-            !c.moe && !amd && (!fp8 || (c.arch == Arch::Gemma4 && ecfg.w8a8 && !ecfg.decode_native_tc)),
-            "Gemma cuBLASLt decode requires dense BF16 or Gemma 4 W8A8 CUDA"
+            !amd
+                && (!c.moe || c.arch == Arch::Gemma4)
+                && (!fp8 || (c.arch == Arch::Gemma4 && ecfg.w8a8 && !ecfg.decode_native_tc)),
+            "Gemma cuBLASLt decode requires dense BF16 or Gemma 4 CUDA (MoE: Gemma 4 only)"
         );
         sections.push(
             if ecfg.decode_native_tc {
