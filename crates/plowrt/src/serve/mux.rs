@@ -6438,18 +6438,24 @@ fn incremental_delta(
         .saturating_sub(MAX_DETOKENIZE_WINDOW)
         .max((*prefix).min(len));
     let effective_read = (*read).clamp(safe_start, len);
-    let decode = |ids: &[u32]| if keep_special { tok.decode_keep_special(ids) } else { tok.decode(ids) };
-    let prefix_text = decode(&out_ids[safe_start..effective_read]);
-    let new_text = decode(&out_ids[safe_start..]);
-    match new_text.get(prefix_text.len()..) {
-        Some(d) if !d.is_empty() && (last || !new_text.ends_with('\u{FFFD}')) => {
-            let d = d.to_string();
-            *prefix = effective_read;
-            *read = len;
-            d
-        }
-        _ => String::new(),
+    thread_local! {
+        static TEXT: std::cell::RefCell<(String, String)> = const { std::cell::RefCell::new((String::new(), String::new())) };
     }
+    TEXT.with_borrow_mut(|(prefix_text, new_text)| {
+        prefix_text.clear();
+        new_text.clear();
+        tok.decode_append(&out_ids[safe_start..effective_read], keep_special, prefix_text);
+        tok.decode_append(&out_ids[safe_start..], keep_special, new_text);
+        match new_text.get(prefix_text.len()..) {
+            Some(d) if !d.is_empty() && (last || !new_text.ends_with('\u{FFFD}')) => {
+                let d = d.to_string();
+                *prefix = effective_read;
+                *read = len;
+                d
+            }
+            _ => String::new(),
+        }
+    })
 }
 
 /// Common per-slot bookkeeping for a produced token: append to `out_ids`,

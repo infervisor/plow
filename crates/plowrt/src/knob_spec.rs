@@ -730,6 +730,7 @@ pub const RAW_ENV: &[KnobSpec] = &[
     KnobSpec::new("env.PLOW_TEST_AUDIO_DIR", Some("PLOW_TEST_AUDIO_DIR"), Layer::RawEnv, Domain::Str, UNSET, DIAG),
     KnobSpec::new("env.PLOW_TEST_BLK_CAPTURE", Some("PLOW_TEST_BLK_CAPTURE"), Layer::RawEnv, Domain::Str, UNSET, DIAG),
     KnobSpec::new("env.PLOW_TEST_BLOB", Some("PLOW_TEST_BLOB"), Layer::RawEnv, Domain::Str, UNSET, DIAG),
+    KnobSpec::new("env.PLOW_TEST_TOKENIZERS", Some("PLOW_TEST_TOKENIZERS"), Layer::RawEnv, Domain::Str, UNSET, DIAG),
     KnobSpec::new("env.PLOW_TEST_CHECKPOINT", Some("PLOW_TEST_CHECKPOINT"), Layer::RawEnv, Domain::Str, UNSET, DIAG),
     KnobSpec::new("env.PLOW_TEST_DSA_DIR", Some("PLOW_TEST_DSA_DIR"), Layer::RawEnv, Domain::Str, UNSET, DIAG),
     KnobSpec::new("env.PLOW_TEST_FOLD_DIR", Some("PLOW_TEST_FOLD_DIR"), Layer::RawEnv, Domain::Str, UNSET, DIAG),
