@@ -1955,7 +1955,9 @@ pub enum DevOp {
     /// FP32 relative-position attention. Q/K/V/position/context are `[rows,width]`, position has
     /// `2*rows-1` rows, and u/v are `[heads,width/heads]`. `left_chunks = u32::MAX` selects full
     /// attention; otherwise keys span the query chunk and `left_chunks` preceding chunks. Optional
-    /// `t7` (u32): keys before that row are excluded (a cache-aware stream's unfilled window).
+    /// `t7` (u32), chunked: keys before that row are excluded (a cache-aware stream's unfilled
+    /// window); full attention: the valid rows of a padded input, so later keys are excluded and
+    /// later context rows are written as zeros.
     /// `i5` (0 = all) skips the query rows before it; their context rows are not written.
     /// `t0=context t1=query t2=key t3=value t4=position t5=bias_u t6=bias_v t7=key_start?` ·
     /// `i0=rows i1=width i2=heads i3=chunk_size i4=left_chunks i5=query_row0`.
@@ -1981,9 +1983,8 @@ pub enum DevOp {
     /// Gather one FP16 embedding row and convert it to FP32.
     /// `t0=out(f32) t1=table(f16) t2=token(u32)` · `i0=vocab i1=width`.
     EmbedF16F32 = 171,
-    /// FP32 LSTM cells after the input and recurrent projections have been summed, one per row
-    /// (`rows` 0 = 1). Each row's gates are contiguous `[input,forget,cell,output]` x `width`;
-    /// states are `[rows,width]`. `t0=h_new t1=c_new t2=gates t3=c_prev` · `i0=width i1=rows?`.
+    /// One FP32 LSTM cell after the input and recurrent projections have been summed. Gates are
+    /// contiguous `[input,forget,cell,output]`. `t0=h_new t1=c_new t2=gates t3=c_prev` · `i0=width`.
     LstmCellF32 = 172,
     /// Row-wise FP32 argmax. `t0=ids(u32) t1=x(f32)` · `i0=rows i1=width`.
     ArgmaxF32 = 173,
@@ -2237,8 +2238,7 @@ pub const ACT_CLAMP: u32 = 13;
 /// `x * p0 + p1`.
 pub const ACT_SCALE_SHIFT: u32 = 14;
 pub const ACT_RELU: u32 = 15;
-/// `sqrt(x)`, correctly rounded. [`DevOp::UnaryF32`] only (the convolution activation fields
-/// hold 4 bits).
+/// `sqrt(x)` ([`DevOp::UnaryF32`] only; a convolution's activations stop at [`ACT_RELU`]).
 pub const ACT_SQRT: u32 = 16;
 
 /// GLU-family `act` code for GPT-OSS's `swiglu_oai` (pair form, `f0 = alpha`, `f1 = limit`).

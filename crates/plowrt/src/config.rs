@@ -186,6 +186,18 @@ pub struct RuntimeConfig {
     #[arg(long = "asr-request-timeout-ms", env = "PLOW_ASR_REQUEST_TIMEOUT_MS", default_value_t = 120_000, global = true)]
     pub asr_request_timeout_ms: u64,
 
+    /// Upper bound (tokens) on an audio-LM request's context (`prompt`). The context is otherwise
+    /// sized per request to what the window leaves after the template, the audio and the output
+    /// reserve, trimmed from its oldest words. 0 = no bound beyond the window.
+    #[arg(long = "asr-context-max-tokens", env = "PLOW_ASR_CONTEXT_MAX_TOKENS", default_value_t = 0, global = true)]
+    pub asr_context_max_tokens: usize,
+
+    /// A `vad.silero.v1` packet (`asr_silero_vad_compile`), run on the CPU: it serves
+    /// `/v1/audio/vad`, answers uploads without speech with an empty transcript before any model
+    /// runs, and ends streaming turns in place of the energy endpointer. Unset = none of these.
+    #[arg(long = "asr-vad-packet", env = "PLOW_ASR_VAD_PACKET", global = true)]
+    pub asr_vad_packet: Option<std::path::PathBuf>,
+
     /// API keys a request must present as `Authorization: Bearer <key>` or `x-api-key: <key>`.
     /// Repeatable; the environment form is comma-separated. `/health` and `/healthz` stay open.
     /// Unset = no authentication.
@@ -197,12 +209,6 @@ pub struct RuntimeConfig {
     /// [,backend=NAME]`. Repeatable; the environment form is `;`-separated.
     #[arg(long = "asr-packet", env = "PLOW_ASR_PACKETS", value_delimiter = ';', global = true)]
     pub asr_packets: Vec<AsrPacket>,
-
-    /// A `vad.v1` packet (`PATH/vad.pkt[,backend=NAME]`, default backend cuda) the ASR servers use
-    /// for `server_vad` turn detection (Realtime) and continuous-stream segmentation: speech
-    /// probabilities against the session's `threshold`, instead of the energy endpointer.
-    #[arg(long = "vad-packet", env = "PLOW_VAD_PACKET", global = true)]
-    pub vad_packet: Option<String>,
 
     /// Under `--co-sched deadline`, most streams one vocoder render launch takes (0 = the packet's
     /// largest capacity). A launch is one cooperative grid that holds the device to its end (1.4 s

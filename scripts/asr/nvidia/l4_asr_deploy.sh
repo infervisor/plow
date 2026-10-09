@@ -4,6 +4,7 @@
 #   <stage>/qwen3-asr          campaign.py build recipes/infervisor/qwen3-asr/sm89-l4-tp1.toml
 #   <stage>/qwen3-asr-0.6b     campaign.py build recipes/infervisor/qwen3-asr-0.6b/sm89-l4-tp1.toml
 #   <stage>/nemotron-3.5-asr   scripts/asr/nvidia/nemotron_l4_build.sh
+#   <stage>/silero-vad         scripts/asr/silero_vad_build.sh
 #
 #   scripts/asr/nvidia/l4_asr_deploy.sh <stage> <plowrt binary> [libcublasLt.so.13]
 set -euo pipefail
@@ -16,8 +17,8 @@ here=$(cd "$(dirname "$0")" && pwd)
 for d in "$stage/qwen3-asr/assets" "$stage/qwen3-asr-0.6b/assets"; do
   [ -f "$d/model.pkt" ] && [ -f "$d/encoder.pkt" ] && [ -f "$d/interp_sm89_speech.cubin" ] || { echo "$d incomplete" >&2; exit 2; }
 done
-for f in nemotron.pkt interp_sm89_speech.cubin tokenizer.q8_0.gguf; do
-  [ -f "$stage/nemotron-3.5-asr/$f" ] || { echo "$stage/nemotron-3.5-asr/$f missing" >&2; exit 2; }
+for f in nemotron-3.5-asr/nemotron.pkt nemotron-3.5-asr/interp_sm89_speech.cubin nemotron-3.5-asr/tokenizer.q8_0.gguf silero-vad/silero_vad.pkt; do
+  [ -f "$stage/$f" ] || { echo "$stage/$f missing" >&2; exit 2; }
 done
 
 sudo systemctl stop plow-asr.service 2>/dev/null || true
@@ -34,7 +35,10 @@ done
 rm -rf "$dest/models/nemotron-3.5-asr.new"
 mkdir "$dest/models/nemotron-3.5-asr.new"
 cp -a "$stage/nemotron-3.5-asr"/{nemotron.pkt,interp_sm89_speech.cubin,tokenizer.q8_0.gguf,commit,sha256} "$dest/models/nemotron-3.5-asr.new/"
-for m in qwen3-asr qwen3-asr-0.6b nemotron-3.5-asr; do
+rm -rf "$dest/models/silero-vad.new"
+mkdir "$dest/models/silero-vad.new"
+cp -a "$stage/silero-vad"/{silero_vad.pkt,commit,sha256} "$dest/models/silero-vad.new/"
+for m in qwen3-asr qwen3-asr-0.6b nemotron-3.5-asr silero-vad; do
   rm -rf "$dest/models/$m"
   mv "$dest/models/$m.new" "$dest/models/$m"
 done

@@ -242,10 +242,9 @@ Auth: the usual key headers, or the browser subprotocol `openai-insecure-api-key
   default; `silence_duration_ms` 200..=2000, default 500) the continuous-mode endpointer cuts
   turns: `input_audio_buffer.speech_started` {`audio_start_ms`, `item_id`},
   `.speech_stopped` {`audio_end_ms`, `item_id`}, `.committed` {`item_id`, `previous_item_id`}.
-  With a VAD packet attached (`--vad-packet`, below) turns follow its speech probabilities and
-  `threshold` (0..=1, default 0.5) and `prefix_padding_ms` (0..=2000, default 300) apply; without
-  one they are echoed but fixed (12 dB over the noise floor, 200 ms of context). With
-  `turn_detection: null` audio accumulates (at most 30 s) until
+  `threshold` (0..=1) is the Silero speech probability when a VAD packet is loaded (see
+  [Voice activity](#voice-activity-silero-vad)), else fixed (12 dB over the noise floor);
+  `prefix_padding_ms` is echoed but fixed (200 ms of context). With `turn_detection: null` audio accumulates (at most 30 s) until
   `input_audio_buffer.commit` (at least 100 ms, else `input_audio_buffer_commit_empty`);
   `input_audio_buffer.clear` drops it (`.cleared`). A commit under VAD closes the open turn.
 - Each committed item streams `conversation.item.input_audio_transcription.delta`
@@ -257,6 +256,38 @@ Auth: the usual key headers, or the browser subprotocol `openai-insecure-api-key
   and close 1001), 120 s without client events or pending work closes the session, pings as on
   the native stream, shutdown sends `error` (`unavailable`) and close 1001. Not implemented:
   responses/conversation events, `semantic_vad`, noise reduction, `include` (logprobs), usage.
+
+## Voice activity (Silero VAD)
+
+`--asr-vad-packet PATH` (`PLOW_ASR_VAD_PACKET`) loads a `vad.silero.v1` packet built by
+`scripts/asr/silero_vad_build.sh`: Silero VAD v5 (16 kHz) lowered by `devgen::vad` into two
+LSTM-state-bank programs of generic ops (`Conv1dF32` STFT with reflect pad, magnitude via
+`BinaryF32`/`CopyColsF32`/`UnaryF32` sqrt, four ReLU convolutions, `DenseGemmF32` +
+`LstmCellF32`, sigmoid decoder). It runs on the CPU in `asr::vad`: a Rust interpreter of those
+programs over a per-stream arena, weights shared, any number of streams on any threads. Per
+32 ms frame: 66 us on one EPYC 7R13 core (AVX2/FMA chosen at runtime); probabilities match the
+PyTorch model to 6e-7. A configured packet that does not load fails startup.
+
+- `POST /v1/audio/vad` (multipart `file`: WAV, 8-48 kHz, up to 10 minutes; optional `threshold`,
+  `min_speech_duration_ms`, `min_silence_duration_ms`, `speech_pad_ms`, `max_speech_duration_s`
+  with Silero's `get_speech_timestamps` defaults) answers
+  `{"duration", "speech_duration", "segments": [{"start", "end"}]}` in seconds. 404 without a
+  packet.
+- Uploads (`/v1/audio/transcriptions`, not `append`/`final` pieces) with under 250 ms of
+  detected speech are answered with an empty transcript before any model runs: an audio-LM
+  otherwise transcribes noise or echoes its prompt.
+- Continuous WebSocket sessions and Realtime `server_vad` end turns on Silero speech (hysteresis
+  `threshold` / `threshold - 0.15`) instead of the energy endpointer; turn timing
+  (`min_silence_ms` / `silence_duration_ms`, 200 ms context, overlong cuts at the least-speech
+  frame) is unchanged.
+
+H100 serving host (`recipes/infervisor/silero-vad/sm90a-h100-tp1.toml`; the packet is
+device-agnostic and runs beside any ASR bundle): on one EPYC 7R13 core 70 us per stream-frame,
+so 256 live streams cost 17.7 ms of each 32 ms tick on one core (3.7 ms on 8 threads). Gate
+`vad_parity` (`campaign.py gate`, `scripts/asr/silero_vad_parity.py`): 79 clips (73 LibriSpeech,
+pauses of silence and noise, silence, white noise, hum), 17,321 frames, max |dp| 2.0e-6 against
+the TorchScript model, decisions at 0.5 agree on every frame. `scripts/asr/realtime_vad_smoke.py`
+drives the Realtime `server_vad` path end to end.
 
 ## Reference checks
 
@@ -580,7 +611,26 @@ at the 300 GB/s datasheet bandwidth. `plowrt asr` decodes one RNNT utterance at 
 queues four; more concurrent requests get 429.
 
 `nemotron-speech-streaming-en-0.6b` does not compile: its attention window (71 keys) exceeds
-the 64-key `RelativeAttentionF32` packet limit.
+the 64-key chunk-limited `RelativeAttentionF32` limit.
+
+### Parakeet TDT
+
+`parakeet-tdt-0.6b-v3` (25 European languages, detected, no prompt) compiles from its GGUF with
+`scripts/asr/nvidia/parakeet_build.sh` into the same `rnnt.greedy.v1` packet shape:
+
+- Full-context relative attention (`left_chunks = u32::MAX`, up to 4096 frames) on the
+  row-parallel kernel, one block per (row, head). The host writes the bucket's valid frame count
+  (`encoder.valid_rows`), which masks attention keys and is the centred convolution's length.
+- Centred depthwise convolution: the batch norm is folded into the weights and a bias at compile
+  time, then one `Conv1dF32` with SiLU fused (speech object mask `0x60000ffffull`).
+- TDT joint: the projection's last 5 columns are duration logits, split from the token logits
+  with `CopyColsF32` and argmaxed separately (`joint.duration_ids`, `tdt.duration.*`). The host loop
+  is NeMo's greedy TDT: blanks jump by their duration inside one joint evaluation.
+
+Served from a side `plowrt asr` on the 224 Lava upload segments (80 min, 16 kHz telephony): English
+WER 15.44% against the NeMo reference's 15.75% (Whisper normalizer, full-precision `.nemo`; the
+Q8_0 GGUF accounts for the 3% word differences), no output on the 7 non-speech calls, RTFx 50
+with one request at a time on the L4.
 
 ### Cache-aware Nemotron stream
 

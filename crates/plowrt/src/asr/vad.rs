@@ -1,283 +1,639 @@
-//! Voice activity detection on a `vad.v1` packet: per launch, one 16 kHz frame of each stream
-//! (with its left context) and its recurrent state in, the frame's speech probability and the next
-//! state out; one program per batch capacity (`step.b{B}`). One worker thread owns the packet
-//! runtime and runs the pending frames of every stream together, a frame per stream per launch, so
-//! streams advance in lockstep and a stream's probabilities never depend on its batch.
+//! Host executor for `vad.silero.v1` packets: the packet's two state-bank programs interpreted
+//! in plain Rust over a per-stream FP32 arena, with weights shared read-only. A [`Vad`] is `Sync`;
+//! each [`VadStream`] is independent, so streams run on any number of threads.
 
+use std::ops::Range;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{mpsc, Arc, OnceLock};
+use std::sync::{Arc, OnceLock};
 
-use parking_lot::Mutex;
+use packet::dev::{DevInst64, DevOp, TENSOR_NONE16};
 
-use crate::exec::packet_runtime::{load_packet_runtime_on, PacketAsset, PacketRuntime, PacketTensor};
+use crate::asset::devblob::DevBlob;
+use crate::exec::packet_runtime::PacketAsset;
+use crate::{Result, RuntimeError};
 
-pub const DRIVER: &str = "vad.v1";
+pub const DRIVER: &str = "vad.silero.v1";
 
-struct Job {
-    /// `frames` windows of `context + frame` samples.
-    windows: Vec<f32>,
-    frames: usize,
-    state: Vec<Vec<f32>>,
-    reply: tokio::sync::oneshot::Sender<Result<(Vec<f32>, Vec<Vec<f32>>), String>>,
+#[derive(Clone, Copy)]
+enum Loc {
+    Weight(usize, usize),
+    Arena(usize, usize),
 }
 
 pub struct Vad {
-    tx: Mutex<mpsc::Sender<Job>>,
-    pub frame_samples: usize,
-    pub context_samples: usize,
+    programs: [Vec<DevInst64>; 2],
+    locs: Vec<Loc>,
+    weights: Vec<f32>,
+    /// Arena image at stream open: zeros, with the initialized runtime tensors (states) filled.
+    arena: Vec<f32>,
+    input: usize,
+    probability: usize,
+    scratch: usize,
+    fma: bool,
     pub sample_rate: u32,
-    /// Floats per stream of each recurrent state tensor.
-    state_widths: Vec<usize>,
-    pub max_batch: usize,
-    pub backend: &'static str,
-    pub stats: Arc<VadStats>,
+    pub frame: usize,
+    pub context: usize,
 }
 
-/// Worker counters: launches, frames scored, device (or engine) time of the launches.
-#[derive(Default)]
-pub struct VadStats {
-    pub launches: AtomicU64,
-    pub frames: AtomicU64,
-    pub device_ns: AtomicU64,
+pub struct VadStream {
+    arena: Vec<f32>,
+    scratch: Vec<f32>,
+    bank: usize,
+    tail: Vec<f32>,
 }
 
-struct Bound {
-    stats: Arc<VadStats>,
-    runtime: Box<dyn PacketRuntime>,
-    /// (batch, program), ascending.
-    capacities: Vec<(usize, usize)>,
-    audio: PacketTensor,
-    prob: PacketTensor,
-    state: Vec<(PacketTensor, PacketTensor)>,
-    window: usize,
-    widths: Vec<usize>,
+fn reject(message: impl Into<String>) -> RuntimeError {
+    RuntimeError::Rejected(message.into())
+}
+
+/// The `--asr-vad-packet` VAD, loaded once; `Err` when it is configured but does not load.
+pub fn configured() -> Result<Option<Arc<Vad>>> {
+    static VAD: OnceLock<std::result::Result<Option<Arc<Vad>>, String>> = OnceLock::new();
+    VAD.get_or_init(|| match &crate::config::RuntimeConfig::get().asr_vad_packet {
+        None => Ok(None),
+        Some(path) => Vad::load(path).map(|vad| Some(Arc::new(vad))).map_err(|e| format!("{}: {e}", path.display())),
+    })
+    .clone()
+    .map_err(RuntimeError::Rejected)
+}
+
+/// Total detected speech in `segments`, in samples.
+pub fn speech_samples(segments: &[Range<usize>]) -> usize {
+    segments.iter().map(ExactSizeIterator::len).sum()
 }
 
 impl Vad {
-    /// Bind the `vad.v1` pipeline of `path` on `backend` (`cuda`, `cpu`, `auto`).
-    pub fn load(path: &Path, backend: &str, device: u8) -> Result<Arc<Self>, String> {
-        let (path, backend_name) = (path.to_path_buf(), backend.to_owned());
-        let (tx, rx) = mpsc::channel::<Job>();
-        let (ready_tx, ready_rx) = mpsc::channel();
-        let stats = Arc::new(VadStats::default());
-        let worker_stats = stats.clone();
-        std::thread::Builder::new()
-            .name("plow-vad".into())
-            .spawn(move || {
-                let (mut bound, geometry, backend) = match bind(&path, &backend_name, device) {
-                    Ok(b) => b,
-                    Err(e) => return drop(ready_tx.send(Err(e))),
-                };
-                bound.stats = worker_stats;
-                let _ = ready_tx.send(Ok((geometry, bound.widths.clone(), bound.capacities.last().map_or(0, |c| c.0), backend)));
-                run(rx, bound);
-            })
-            .map_err(|e| e.to_string())?;
-        let ((frame_samples, context_samples, sample_rate), state_widths, max_batch, backend) =
-            ready_rx.recv().map_err(|e| e.to_string())??;
-        Ok(Arc::new(Self { tx: Mutex::new(tx), frame_samples, context_samples, sample_rate, state_widths, max_batch, backend, stats }))
-    }
+    pub fn load(path: &Path) -> Result<Self> {
+        let raw = std::fs::read(path).map_err(|source| RuntimeError::Io { path: path.to_owned(), source })?;
+        let blob = DevBlob::parse(&raw)?;
+        let asset = PacketAsset::load(path)?;
+        let pipeline = asset
+            .pipelines()
+            .iter()
+            .find(|p| p.driver == DRIVER)
+            .ok_or_else(|| reject(format!("packet pipeline driver {DRIVER:?} is missing")))?;
+        let program = |role: &str| -> Result<Vec<DevInst64>> {
+            let index = *pipeline.programs.get(role).ok_or_else(|| reject(format!("VAD program {role} is missing")))?;
+            Ok(blob.progs.get(index as usize).ok_or_else(|| reject("VAD program index is invalid"))?.insts.clone())
+        };
+        let programs = [program("step.0")?, program("step.1")?];
+        let parameter = |name: &str| {
+            pipeline.parameters.get(name).copied().ok_or_else(|| reject(format!("VAD parameter {name} is missing")))
+        };
+        let (sample_rate, frame, context) =
+            (parameter("sample_rate")? as u32, parameter("frame_samples")? as usize, parameter("context_samples")? as usize);
 
-    /// A stream with zero state and context.
-    pub fn stream(self: &Arc<Self>) -> VadStream {
-        VadStream {
-            vad: Arc::clone(self),
-            context: vec![0.0; self.context_samples],
-            pending: Vec::new(),
-            state: self.state_widths.iter().map(|&w| vec![0.0; w]).collect(),
-        }
-    }
-}
-
-fn bind(path: &Path, backend: &str, device: u8) -> Result<(Bound, (usize, usize, u32), &'static str), String> {
-    let e = |x: crate::RuntimeError| x.to_string();
-    let loaded = load_packet_runtime_on(path, backend, device).map_err(e)?;
-    let mut runtime = loaded.runtime;
-    let asset = PacketAsset::load(path).map_err(e)?;
-    let pipeline = asset.bind_driver(DRIVER, runtime.as_ref()).map_err(e)?;
-    let param = |k: &str| pipeline.parameter(k).map(|v| v as usize).map_err(e);
-    let (frame, context) = (param("vad.frame_samples")?, param("vad.context_samples")?);
-    let rate = param("audio.sample_rate")? as u32;
-    let mut capacities: Vec<(usize, usize)> = pipeline
-        .programs()
-        .filter_map(|(role, program)| Some((role.strip_prefix("step.b")?.parse().ok()?, program)))
-        .collect();
-    capacities.sort();
-    let bmax = capacities.last().map(|c| c.0).ok_or("vad packet declares no step capacity")?;
-    let audio = pipeline.tensor("audio").map_err(e)?;
-    let prob = pipeline.tensor("prob").map_err(e)?;
-    let state = (0..param("state.count")?)
-        .map(|k| Ok((pipeline.tensor(&format!("state.{k}")).map_err(e)?, pipeline.tensor(&format!("state_out.{k}")).map_err(e)?)))
-        .collect::<Result<Vec<_>, String>>()?;
-    let window = frame + context;
-    if audio.bytes != bmax * window * 4 || prob.bytes != bmax * 4 || state.iter().any(|(s, o)| s.bytes != o.bytes || s.bytes % (bmax * 4) != 0) {
-        return Err("vad packet tensors do not match its capacities".into());
-    }
-    let widths = state.iter().map(|(s, _)| s.bytes / bmax / 4).collect();
-    // Each capacity once now: a CUDA program sequence is captured as a graph on first use, which
-    // must not overlap another thread's context synchronize.
-    for &(_, program) in &capacities {
-        runtime.run_sequence(&[program]).map_err(e)?;
-    }
-    let stats = Default::default();
-    Ok((Bound { stats, runtime, capacities, audio, prob, state, window, widths }, (frame, context, rate), loaded.backend))
-}
-
-struct Active {
-    job: Job,
-    next: usize,
-    probs: Vec<f32>,
-}
-
-fn run(rx: mpsc::Receiver<Job>, mut bound: Bound) {
-    let mut active: std::collections::VecDeque<Active> = Default::default();
-    loop {
-        if active.is_empty() {
-            match rx.recv() {
-                Ok(job) => active.push_back(Active { probs: Vec::with_capacity(job.frames), job, next: 0 }),
-                Err(_) => return,
+        let written: std::collections::BTreeSet<u16> =
+            programs.iter().flatten().flat_map(|inst| outputs(inst).iter().map(move |&slot| inst.t[slot])).collect();
+        let (mut locs, mut weights, mut arena) = (Vec::with_capacity(blob.tensors.len()), Vec::new(), Vec::new());
+        for (index, tensor) in blob.tensors.iter().enumerate() {
+            if tensor.bytes % 4 != 0 {
+                return Err(reject(format!("VAD tensor {} is not FP32", tensor.name)));
+            }
+            let elements = tensor.bytes as usize / 4;
+            let init = tensor.init.clone().map(|range| &blob.init[range]);
+            let (store, loc): (&mut Vec<f32>, fn(usize, usize) -> Loc) = match init {
+                Some(_) if !written.contains(&(index as u16)) => (&mut weights, Loc::Weight),
+                _ => (&mut arena, Loc::Arena),
+            };
+            locs.push(loc(store.len(), elements));
+            match init {
+                Some(bytes) => store.extend(bytes.chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap()))),
+                None => store.resize(store.len() + elements, 0.0),
             }
         }
-        while let Ok(job) = rx.try_recv() {
-            active.push_back(Active { probs: Vec::with_capacity(job.frames), job, next: 0 });
+        let role = |name: &str, elements: usize| -> Result<usize> {
+            let tensor = pipeline.tensors.get(name).ok_or_else(|| reject(format!("VAD tensor {name} is missing")))?;
+            let index = blob.tensors.iter().position(|t| t.name == tensor.name).ok_or_else(|| reject("VAD tensor is undeclared"))?;
+            match locs[index] {
+                Loc::Arena(offset, len) if len == elements => Ok(offset),
+                _ => Err(reject(format!("VAD tensor {name} has the wrong geometry"))),
+            }
+        };
+        let input = role("input", context + frame)?;
+        let probability = role("probability", 1)?;
+        let mut scratch = 0;
+        for inst in programs.iter().flatten() {
+            scratch = scratch.max(validate(inst, &locs)?);
         }
-        let n = active.len().min(bound.capacities.last().map_or(1, |c| c.0));
-        if let Err(error) = bound.step(&mut active.make_contiguous()[..n]) {
-            for a in active.drain(..n) {
-                let _ = a.job.reply.send(Err(error.clone()));
+        #[cfg(target_arch = "x86_64")]
+        let fma = std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma");
+        #[cfg(not(target_arch = "x86_64"))]
+        let fma = false;
+        Ok(Self { programs, locs, weights, arena, input, probability, scratch, fma, sample_rate, frame, context })
+    }
+
+    pub fn open(&self) -> VadStream {
+        VadStream { arena: self.arena.clone(), scratch: vec![0.0; self.scratch], bank: 0, tail: vec![0.0; self.context] }
+    }
+
+    /// The speech probability of the next `frame` samples of the stream.
+    pub fn step(&self, stream: &mut VadStream, frame: &[f32]) -> f32 {
+        assert_eq!(frame.len(), self.frame, "a VAD step takes exactly one frame");
+        let window = &mut stream.arena[self.input..self.input + self.context + self.frame];
+        window[..self.context].copy_from_slice(&stream.tail);
+        window[self.context..].copy_from_slice(frame);
+        stream.tail.copy_from_slice(&frame[self.frame - self.context..]);
+        #[cfg(target_arch = "x86_64")]
+        if self.fma {
+            // SAFETY: the CPU supports the enabled features (checked at load).
+            unsafe { self.run_fma(stream) };
+        } else {
+            self.run::<false>(stream);
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        self.run::<false>(stream);
+        stream.bank ^= 1;
+        stream.arena[self.probability]
+    }
+
+    /// Per-frame probabilities of a whole signal; a short last frame is zero padded.
+    pub fn probabilities(&self, audio: &[f32]) -> Vec<f32> {
+        let mut stream = self.open();
+        let mut padded = vec![0.0; self.frame];
+        audio
+            .chunks(self.frame)
+            .map(|chunk| {
+                let frame = if chunk.len() == self.frame {
+                    chunk
+                } else {
+                    padded[..chunk.len()].copy_from_slice(chunk);
+                    &padded[..]
+                };
+                self.step(&mut stream, frame)
+            })
+            .collect()
+    }
+
+    fn weight(&self, inst: &DevInst64, slot: usize) -> Option<&[f32]> {
+        match self.locs.get(inst.t[slot] as usize)? {
+            Loc::Weight(offset, len) => Some(&self.weights[*offset..offset + len]),
+            Loc::Arena(..) => None,
+        }
+    }
+
+    fn arena(&self, inst: &DevInst64, slot: usize) -> Range<usize> {
+        match self.locs[inst.t[slot] as usize] {
+            Loc::Arena(offset, len) => offset..offset + len,
+            Loc::Weight(..) => unreachable!("validated: operand {slot} is a runtime tensor"),
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2,fma")]
+    unsafe fn run_fma(&self, stream: &mut VadStream) {
+        self.run::<true>(stream)
+    }
+
+    #[inline(always)]
+    fn run<const FMA: bool>(&self, stream: &mut VadStream) {
+        for inst in &self.programs[stream.bank] {
+            self.execute::<FMA>(inst, &mut stream.arena, &mut stream.scratch);
+        }
+    }
+
+    #[inline(always)]
+    fn execute<const FMA: bool>(&self, inst: &DevInst64, arena: &mut [f32], scratch: &mut [f32]) {
+        let i = inst.i;
+        match DevOp::from_u16(inst.op) {
+            Some(DevOp::Conv1dF32) => {
+                let (out, x) = disjoint(arena, self.arena(inst, 0), self.arena(inst, 1));
+                conv1d::<FMA>(out, x, self.weight(inst, 2).unwrap(), self.weight(inst, 3), &i, inst.fj, scratch);
+            }
+            Some(DevOp::DenseGemmF32) => {
+                let (out, a) = disjoint(arena, self.arena(inst, 0), self.arena(inst, 1));
+                let (w, bias) = (self.weight(inst, 2).unwrap(), self.weight(inst, 3));
+                let (m, n, k) = (i[0] as usize, i[1] as usize, i[2] as usize);
+                for row in 0..m {
+                    for col in 0..n {
+                        let v = dot::<FMA>(&a[row * k..][..k], &w[col * k..][..k]) + bias.map_or(0.0, |b| b[col]);
+                        out[row * n + col] = if i[3] == 1 { v.max(0.0) } else { v };
+                    }
+                }
+            }
+            Some(DevOp::CopyColsF32) => {
+                let (out, x) = disjoint(arena, self.arena(inst, 0), self.arena(inst, 1));
+                let (items, rows, cols) = (i[0] as usize, i[1] as usize, i[2] as usize);
+                let (in_items, out_items) = (inst.fj[1] as usize, inst.fj[2] as usize);
+                for item in 0..items {
+                    for row in 0..rows {
+                        let src = item * in_items + row * i[3] as usize + i[4] as usize;
+                        let dst = item * out_items + row * i[5] as usize + i[6] as usize;
+                        out[dst..dst + cols].copy_from_slice(&x[src..src + cols]);
+                    }
+                }
+            }
+            Some(DevOp::BinaryF32) => {
+                let (o, a, b) = (self.arena(inst, 0).start, self.arena(inst, 1).start, self.arena(inst, 2).start);
+                let (items, rows, width) = (i[0] as usize, i[1] as usize, i[2] as usize);
+                let scale = if i[7] & 1 != 0 { f32::from_bits(inst.fj[0]) } else { 1.0 };
+                for item in 0..items {
+                    for row in 0..rows {
+                        for col in 0..width {
+                            let at = (item * rows + row) * width + col;
+                            let y = arena[b + item * i[4] as usize + row * i[5] as usize + col * i[6] as usize];
+                            let x = arena[a + at];
+                            arena[o + at] = scale
+                                * match i[3] {
+                                    0 => x + y,
+                                    1 => x - y,
+                                    2 => x * y,
+                                    3 => x / y,
+                                    4 => x.max(y),
+                                    _ => x.min(y),
+                                };
+                        }
+                    }
+                }
+            }
+            Some(DevOp::UnaryF32) => {
+                let (o, x) = (self.arena(inst, 0).start, self.arena(inst, 1).start);
+                let (rows, width, stride, col0) = (i[0] as usize, i[1] as usize, i[3] as usize, i[4] as usize);
+                let stride = if stride == 0 { width } else { stride };
+                for row in 0..rows {
+                    for col in col0..col0 + width {
+                        let at = row * stride + col;
+                        arena[o + at] = activation(i[2], arena[x + at]);
+                    }
+                }
+            }
+            Some(DevOp::ScaledAddF32) => {
+                let (o, a, b) = (self.arena(inst, 0).start, self.arena(inst, 1).start, self.arena(inst, 2).start);
+                let scale = f32::from_bits(inst.fj[0]);
+                for at in 0..i[0] as usize {
+                    arena[o + at] = arena[a + at] + scale * arena[b + at];
+                }
+            }
+            Some(DevOp::LstmCellF32) => {
+                let (h, c, gates, previous) =
+                    (self.arena(inst, 0).start, self.arena(inst, 1).start, self.arena(inst, 2).start, self.arena(inst, 3).start);
+                let width = i[0] as usize;
+                let sigmoid = |x: f32| 1.0 / (1.0 + (-x).exp());
+                for j in 0..width {
+                    let gate = |g: usize| arena[gates + g * width + j];
+                    let cell = sigmoid(gate(1)) * arena[previous + j] + sigmoid(gate(0)) * gate(2).tanh();
+                    let hidden = sigmoid(gate(3)) * cell.tanh();
+                    arena[c + j] = cell;
+                    arena[h + j] = hidden;
+                }
+            }
+            _ => unreachable!("validated op"),
+        }
+    }
+}
+
+/// Output operand slots of each supported op.
+fn outputs(inst: &DevInst64) -> &'static [usize] {
+    match DevOp::from_u16(inst.op) {
+        Some(DevOp::LstmCellF32) => &[0, 1],
+        _ => &[0],
+    }
+}
+
+/// Check one instruction is a form this executor runs; returns the scratch it needs.
+fn validate(inst: &DevInst64, locs: &[Loc]) -> Result<usize> {
+    let op = DevOp::from_u16(inst.op).ok_or_else(|| reject(format!("unknown VAD op {}", inst.op)))?;
+    let i = inst.i;
+    let loc = |slot: usize| locs.get(inst.t[slot] as usize).copied();
+    let arena = |slot: usize| matches!(loc(slot), Some(Loc::Arena(..)));
+    let weight = |slot: usize| matches!(loc(slot), Some(Loc::Weight(..)));
+    let len = |slot: usize| match loc(slot) {
+        Some(Loc::Arena(_, len) | Loc::Weight(_, len)) => len,
+        None => 0,
+    };
+    let none = |slots: Range<usize>| slots.into_iter().all(|slot| inst.t[slot] == TENSOR_NONE16);
+    let distinct = |a: usize, b: usize| inst.t[a] != inst.t[b];
+    let (ok, scratch) = match op {
+        DevOp::Conv1dF32 => {
+            let (batch, rows, cin, cout, kernel, stride, dilation, groups) =
+                (i[0], i[1], i[2], i[3], i[4], i[5], i[6], i[7]);
+            let (before, after) = (inst.fj[1] & 0xffff, inst.fj[1] >> 16);
+            let (flags, span) = (inst.fj[2], dilation * kernel.saturating_sub(1) + 1);
+            let padded = rows + before + after;
+            let out_rows = if padded >= span && stride > 0 { (padded - span) / stride + 1 } else { 0 };
+            let ok = batch == 1
+                && kernel > 0
+                && dilation > 0
+                && groups > 0
+                && cin % groups == 0
+                && cout % groups == 0
+                && flags & !0xf03 == 0
+                && flags & 3 <= 1
+                && matches!((flags >> 8) & 15, 0 | 15)
+                && out_rows > 0
+                && (flags & 3 == 0 || (before < rows && after < rows))
+                && arena(0)
+                && arena(1)
+                && distinct(0, 1)
+                && weight(2)
+                && (inst.t[3] == TENSOR_NONE16 || (weight(3) && len(3) == cout as usize))
+                && none(4..8)
+                && len(0) >= (out_rows * cout) as usize
+                && len(1) >= (rows * cin) as usize
+                && len(2) == (cout * cin / groups * kernel) as usize;
+            (ok, (cin / groups.max(1) * kernel) as usize)
+        }
+        DevOp::DenseGemmF32 => {
+            let (m, n, k) = (i[0] as usize, i[1] as usize, i[2] as usize);
+            let ok = i[3] <= 1
+                && i[4..].iter().all(|&v| v == 0)
+                && arena(0)
+                && arena(1)
+                && distinct(0, 1)
+                && weight(2)
+                && (inst.t[3] == TENSOR_NONE16 || (weight(3) && len(3) == n))
+                && none(4..8)
+                && len(0) >= m * n
+                && len(1) >= m * k
+                && len(2) == n * k;
+            (ok, 0)
+        }
+        DevOp::CopyColsF32 => {
+            let last = |items: u32, item_stride: u32, rows: u32, stride: u32, offset: u32| {
+                (items.saturating_sub(1) * item_stride + rows.saturating_sub(1) * stride + offset + i[2]) as usize
+            };
+            let ok = i[7] == 0
+                && arena(0)
+                && arena(1)
+                && distinct(0, 1)
+                && none(2..8)
+                && len(1) >= last(i[0], inst.fj[1], i[1], i[3], i[4])
+                && len(0) >= last(i[0], inst.fj[2], i[1], i[5], i[6]);
+            (ok, 0)
+        }
+        DevOp::BinaryF32 => {
+            let n = (i[0] * i[1] * i[2]) as usize;
+            let b_last = (i[0].saturating_sub(1) * i[4] + i[1].saturating_sub(1) * i[5] + i[2].saturating_sub(1) * i[6]) as usize;
+            let ok = i[3] <= 5
+                && i[7] & !1 == 0
+                && (0..3).all(arena)
+                && none(3..8)
+                && len(0) >= n
+                && len(1) >= n
+                && len(2) > b_last
+                && distinct(0, 2);
+            (ok, 0)
+        }
+        DevOp::UnaryF32 => {
+            let stride = if i[3] == 0 { i[1] } else { i[3] };
+            let need = (i[0].saturating_sub(1) * stride + i[4] + i[1]) as usize;
+            let ok = matches!(i[2], 0 | 1 | 4 | 5 | 6 | 15 | 16)
+                && arena(0)
+                && arena(1)
+                && none(2..8)
+                && len(0) >= need
+                && len(1) >= need;
+            (ok, 0)
+        }
+        DevOp::ScaledAddF32 => {
+            let n = i[0] as usize;
+            let ok = i[1] == 0 && (0..3).all(arena) && none(3..8) && (0..3).all(|slot| len(slot) >= n);
+            (ok, 0)
+        }
+        DevOp::LstmCellF32 => {
+            let w = i[0] as usize;
+            let ok = (0..4).all(arena)
+                && none(4..8)
+                && [0, 1, 3].iter().all(|&slot| len(slot) >= w)
+                && len(2) >= 4 * w
+                && distinct(0, 1);
+            (ok, 0)
+        }
+        _ => (false, 0),
+    };
+    if !ok {
+        return Err(reject(format!("VAD executor does not support this {op:?} form")));
+    }
+    Ok(scratch)
+}
+
+fn activation(kind: u32, x: f32) -> f32 {
+    match kind {
+        1 => x.tanh(),
+        4 => x.exp(),
+        5 => x.abs(),
+        6 => 1.0 / (1.0 + (-x).exp()),
+        15 => x.max(0.0),
+        16 => x.sqrt(),
+        _ => x,
+    }
+}
+
+/// Mutable `out` and shared `input` views of the arena; validated non-overlapping.
+fn disjoint(arena: &mut [f32], out: Range<usize>, input: Range<usize>) -> (&mut [f32], &[f32]) {
+    if out.end <= input.start {
+        let (low, high) = arena.split_at_mut(input.start);
+        (&mut low[out], &high[..input.len()])
+    } else {
+        assert!(input.end <= out.start, "VAD operands overlap");
+        let (low, high) = arena.split_at_mut(out.start);
+        (&mut high[..out.len()], &low[input])
+    }
+}
+
+/// `Conv1dF32` for one item: gather each output row's receptive field into `scratch` in the
+/// weight's `[in/groups][kernel]` order, then one dot product per output channel.
+#[inline(always)]
+fn conv1d<const FMA: bool>(out: &mut [f32], x: &[f32], weight: &[f32], bias: Option<&[f32]>, i: &[u32; 8], fj: [u32; 3], scratch: &mut [f32]) {
+    let (rows, cin, cout, kernel, stride, dilation, groups) =
+        (i[1] as i64, i[2] as usize, i[3] as usize, i[4] as usize, i[5] as i64, i[6] as i64, i[7] as usize);
+    let (before, after) = ((fj[1] & 0xffff) as i64, (fj[1] >> 16) as i64);
+    let (reflect, relu) = (fj[2] & 3 == 1, (fj[2] >> 8) & 15 == 15);
+    let span = dilation * (kernel as i64 - 1) + 1;
+    let out_rows = ((rows + before + after - span) / stride + 1) as usize;
+    let (cg, ng) = (cin / groups, cout / groups);
+    let field = &mut scratch[..cg * kernel];
+    for t in 0..out_rows {
+        for g in 0..groups {
+            for k in 0..kernel {
+                let mut u = t as i64 * stride + k as i64 * dilation - before;
+                if reflect && !(0..rows).contains(&u) {
+                    u = if u < 0 { -u } else { 2 * (rows - 1) - u };
+                }
+                for c in 0..cg {
+                    field[c * kernel + k] = if (0..rows).contains(&u) { x[u as usize * cin + g * cg + c] } else { 0.0 };
+                }
+            }
+            for o in g * ng..(g + 1) * ng {
+                let v = dot::<FMA>(field, &weight[o * cg * kernel..][..cg * kernel]) + bias.map_or(0.0, |b| b[o]);
+                out[t * cout + o] = if relu { v.max(0.0) } else { v };
+            }
+        }
+    }
+}
+
+/// Independent accumulators so the loop vectorizes; `FMA` only inside an `fma` target feature
+/// (elsewhere `mul_add` is a libm call).
+#[inline(always)]
+fn dot<const FMA: bool>(a: &[f32], b: &[f32]) -> f32 {
+    let mut lanes = [0.0f32; 16];
+    let (ac, bc) = (a.chunks_exact(16), b.chunks_exact(16));
+    let tail: f32 = ac.remainder().iter().zip(bc.remainder()).map(|(x, y)| x * y).sum();
+    for (x, y) in ac.zip(bc) {
+        for lane in 0..16 {
+            lanes[lane] = if FMA { x[lane].mul_add(y[lane], lanes[lane]) } else { lanes[lane] + x[lane] * y[lane] };
+        }
+    }
+    lanes.iter().sum::<f32>() + tail
+}
+
+/// Silero's `get_speech_timestamps` defaults; durations in samples at the VAD's rate.
+#[derive(Clone, Copy, Debug)]
+pub struct SegmentOptions {
+    pub threshold: f32,
+    pub neg_threshold: Option<f32>,
+    pub min_speech_ms: u32,
+    pub max_speech_s: f32,
+    pub min_silence_ms: u32,
+    pub speech_pad_ms: u32,
+    pub min_silence_at_max_speech_ms: u32,
+}
+
+impl SegmentOptions {
+    pub const DEFAULT: Self = Self {
+        threshold: 0.5,
+        neg_threshold: None,
+        min_speech_ms: 250,
+        max_speech_s: f32::INFINITY,
+        min_silence_ms: 100,
+        speech_pad_ms: 30,
+        min_silence_at_max_speech_ms: 98,
+    };
+}
+
+impl Default for SegmentOptions {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
+/// Speech `[start, end)` sample ranges from per-frame probabilities: a port of Silero's
+/// `get_speech_timestamps_from_probs` (longest-silence cut at the maximum speech length).
+pub fn speech_segments(probabilities: &[f32], frame: usize, sample_rate: u32, audio_samples: usize, o: SegmentOptions) -> Vec<Range<usize>> {
+    let rate = sample_rate as f64;
+    let ms = |v: u32| rate * f64::from(v) / 1000.0;
+    let (min_speech, pad, min_silence, min_silence_at_max) =
+        (ms(o.min_speech_ms), ms(o.speech_pad_ms), ms(o.min_silence_ms), ms(o.min_silence_at_max_speech_ms));
+    let max_speech = rate * f64::from(o.max_speech_s) - frame as f64 - 2.0 * pad;
+    let threshold = o.threshold;
+    let neg_threshold = o.neg_threshold.unwrap_or((threshold - 0.15).max(0.01));
+    let audio = audio_samples as i64;
+
+    let mut speeches: Vec<(i64, i64)> = Vec::new();
+    let mut current: Option<i64> = None;
+    let (mut temp_end, mut prev_end, mut next_start) = (0i64, 0i64, 0i64);
+    let mut possible_ends: Vec<(i64, i64)> = Vec::new();
+    for (index, &p) in probabilities.iter().enumerate() {
+        let sample = (frame * index) as i64;
+        if p >= threshold && temp_end != 0 {
+            let silence = sample - temp_end;
+            if silence as f64 > min_silence_at_max {
+                possible_ends.push((temp_end, silence));
+            }
+            temp_end = 0;
+            if next_start < prev_end {
+                next_start = sample;
+            }
+        }
+        let Some(start) = current else {
+            if p >= threshold {
+                current = Some(sample);
             }
             continue;
-        }
-        // Finished streams answer; the rest rotate behind the waiting ones.
-        for _ in 0..n {
-            let a = active.pop_front().expect("stepped");
-            if a.next == a.job.frames {
-                let Active { job, probs, .. } = a;
-                let _ = job.reply.send(Ok((probs, job.state)));
+        };
+        if (sample - start) as f64 > max_speech {
+            // Silero keeps `possible_ends` in order; the first of the longest silences wins.
+            if let Some(&(end, silence)) = possible_ends.iter().rev().max_by_key(|e| e.1) {
+                speeches.push((start, end));
+                next_start = end + silence;
+                current = (next_start < end + sample).then_some(next_start);
             } else {
-                active.push_back(a);
+                speeches.push((start, sample));
+                current = None;
+                (prev_end, next_start, temp_end) = (0, 0, 0);
+                possible_ends.clear();
+                continue;
             }
+            (prev_end, next_start, temp_end) = (0, 0, 0);
+            possible_ends.clear();
         }
-    }
-}
-
-impl Bound {
-    /// One launch: the next frame of each of `step`.
-    fn step(&mut self, step: &mut [Active]) -> Result<(), String> {
-        let n = step.len();
-        let &(_, program) = self.capacities.iter().find(|c| c.0 >= n).ok_or("no vad capacity")?;
-        let e = |x: crate::RuntimeError| x.to_string();
-        let w = self.window;
-        let mut audio = Vec::with_capacity(n * w * 4);
-        for a in step.iter() {
-            audio.extend(a.job.windows[a.next * w..(a.next + 1) * w].iter().flat_map(|x| x.to_le_bytes()));
-        }
-        self.runtime.write_tensor_at(self.audio, 0, &audio).map_err(e)?;
-        for (k, &(tensor, _)) in self.state.iter().enumerate() {
-            let bytes: Vec<u8> = step.iter().flat_map(|a| a.job.state[k].iter().flat_map(|x| x.to_le_bytes())).collect();
-            self.runtime.write_tensor_at(tensor, 0, &bytes).map_err(e)?;
-        }
-        self.runtime.run_sequence(&[program]).map_err(e)?;
-        self.stats.launches.fetch_add(1, Ordering::Relaxed);
-        self.stats.frames.fetch_add(n as u64, Ordering::Relaxed);
-        self.stats.device_ns.fetch_add((self.runtime.last_run_us() * 1e3) as u64, Ordering::Relaxed);
-        let mut prob = vec![0u8; n * 4];
-        self.runtime.read_tensor_at(self.prob, 0, &mut prob).map_err(e)?;
-        let mut states = Vec::with_capacity(self.state.len());
-        for (k, &(_, out)) in self.state.iter().enumerate() {
-            let mut bytes = vec![0u8; n * self.widths[k] * 4];
-            self.runtime.read_tensor_at(out, 0, &mut bytes).map_err(e)?;
-            states.push(bytes);
-        }
-        let f32s = |b: &[u8]| b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect::<Vec<f32>>();
-        let probs = f32s(&prob);
-        let states: Vec<Vec<f32>> = states.iter().map(|b| f32s(b)).collect();
-        for (i, a) in step.iter_mut().enumerate() {
-            a.probs.push(probs[i]);
-            for (k, s) in states.iter().enumerate() {
-                let width = self.widths[k];
-                a.job.state[k].copy_from_slice(&s[i * width..(i + 1) * width]);
+        let Some(start) = current else { continue };
+        if p < neg_threshold {
+            if temp_end == 0 {
+                temp_end = sample;
             }
-            a.next += 1;
+            if ((sample - temp_end) as f64) < min_silence {
+                continue;
+            }
+            if (temp_end - start) as f64 > min_speech {
+                speeches.push((start, temp_end));
+            }
+            current = None;
+            (prev_end, next_start, temp_end) = (0, 0, 0);
+            possible_ends.clear();
         }
-        Ok(())
     }
+    if let Some(start) = current {
+        if (audio - start) as f64 > min_speech {
+            speeches.push((start, audio));
+        }
+    }
+    let pad_samples = pad as i64;
+    for index in 0..speeches.len() {
+        if index == 0 {
+            speeches[0].0 = (speeches[0].0 as f64 - pad).max(0.0) as i64;
+        }
+        if index + 1 < speeches.len() {
+            let silence = speeches[index + 1].0 - speeches[index].1;
+            if (silence as f64) < 2.0 * pad {
+                speeches[index].1 += silence / 2;
+                speeches[index + 1].0 = (speeches[index + 1].0 - silence / 2).max(0);
+            } else {
+                speeches[index].1 = (speeches[index].1 + pad_samples).min(audio);
+                speeches[index + 1].0 = (speeches[index + 1].0 - pad_samples).max(0);
+            }
+        } else {
+            speeches[index].1 = (speeches[index].1 + pad_samples).min(audio);
+        }
+    }
+    speeches.into_iter().map(|(s, e)| s as usize..e as usize).collect()
 }
 
-/// One stream's VAD state: its recurrent state, the last `context` samples and a partial frame.
-pub struct VadStream {
-    vad: Arc<Vad>,
-    context: Vec<f32>,
-    pending: Vec<f32>,
-    state: Vec<Vec<f32>>,
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-impl VadStream {
-    pub fn frame_samples(&self) -> usize {
-        self.vad.frame_samples
+    /// `scripts/asr/silero_export.py` output compiled by `asr_silero_vad_compile`; skipped when absent.
+    const MODEL: &str = "/home/ssm-user/models/silero-vad-v5";
+
+    #[test]
+    fn packet_matches_the_reference_probabilities() {
+        let dir = Path::new(MODEL);
+        let Ok(vad) = Vad::load(&dir.join("silero_vad.pkt")) else { return };
+        let reference: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.join("reference.json")).unwrap()).unwrap();
+        let values = |key: &str| -> Vec<f32> {
+            reference[key].as_array().unwrap().iter().map(|v| v.as_f64().unwrap() as f32).collect()
+        };
+        let (signal, expected) = (values("signal"), values("probabilities"));
+        let frames = signal.len() / vad.frame;
+        let actual = vad.probabilities(&signal[..frames * vad.frame]);
+        assert_eq!(actual.len(), expected.len());
+        let worst = actual.iter().zip(&expected).map(|(a, e)| (a - e).abs()).fold(0.0f32, f32::max);
+        assert!(worst < 1e-4, "max |p - p_torch| = {worst}");        assert!(expected.iter().any(|&p| p > 0.5) && expected.iter().any(|&p| p < 0.1));
     }
 
-    /// Append 16 kHz samples; returns the whole frames they complete (their samples, in order) and
-    /// one speech probability per frame. A partial frame waits for the next call.
-    pub async fn push(&mut self, samples: &[f32]) -> Result<(Vec<f32>, Vec<f32>), String> {
-        self.pending.extend_from_slice(samples);
-        let (frame, context) = (self.vad.frame_samples, self.vad.context_samples);
-        let frames = self.pending.len() / frame;
-        if frames == 0 {
-            return Ok((Vec::new(), Vec::new()));
-        }
-        let mut windows = Vec::with_capacity(frames * (frame + context));
-        for k in 0..frames {
-            windows.extend_from_slice(&self.context);
-            let f = &self.pending[k * frame..(k + 1) * frame];
-            windows.extend_from_slice(f);
-            self.context.copy_from_slice(&f[frame - context..]);
-        }
-        let (reply, rx) = tokio::sync::oneshot::channel();
-        let state = std::mem::take(&mut self.state);
-        self.vad
-            .tx
-            .lock()
-            .send(Job { windows, frames, state, reply })
-            .map_err(|_| "vad worker stopped".to_string())?;
-        let (probs, state) = rx.await.map_err(|_| "vad worker dropped the job".to_string())??;
-        self.state = state;
-        Ok((self.pending.drain(..frames * frame).collect(), probs))
+    #[test]
+    fn segments_join_short_pauses_drop_short_speech_and_pad() {
+        let p = |speech: &[Range<usize>]| -> Vec<f32> {
+            (0..100).map(|f| if speech.iter().any(|r| r.contains(&f)) { 0.9 } else { 0.05 }).collect()
+        };
+        let segment = |speech: &[Range<usize>], options| speech_segments(&p(speech), 512, 16_000, 100 * 512, options);
+        // A 64 ms pause (< 100 ms) joins; 128 ms of speech (< 250 ms) is dropped; 30 ms pads.
+        assert_eq!(segment(&[10..40, 42..60, 80..84], SegmentOptions::default()), vec![10 * 512 - 480..60 * 512 + 480]);
+        // A pause shorter than both pads is split down the middle.
+        let wide = SegmentOptions { speech_pad_ms: 100, ..SegmentOptions::default() };
+        let split = segment(&[10..40, 45..60], wide);
+        assert_eq!(split, vec![10 * 512 - 1600..40 * 512 + 1280, 40 * 512 + 1280..60 * 512 + 1600]);
     }
-
-    /// The partial frame not yet scored (end of a turn or stream).
-    pub fn take_rest(&mut self) -> Vec<f32> {
-        std::mem::take(&mut self.pending)
-    }
-}
-
-/// The process's VAD (`--vad-packet`), loaded once at startup by [`init`].
-static SHARED: OnceLock<Option<Arc<Vad>>> = OnceLock::new();
-
-/// Load `--vad-packet` (if set) on CUDA device 0, or the named backend. Idempotent.
-pub fn init() -> Result<(), String> {
-    if SHARED.get().is_some() {
-        return Ok(());
-    }
-    let cfg = crate::config::RuntimeConfig::get();
-    let vad = match cfg.vad_packet.as_deref() {
-        None => None,
-        Some(spec) => {
-            let (path, backend) = match spec.split_once(",backend=") {
-                Some((p, b)) => (p, b),
-                None => (spec, "cuda"),
-            };
-            let vad = Vad::load(Path::new(path), backend, 0).map_err(|e| format!("--vad-packet {path}: {e}"))?;
-            tracing::info!(packet = path, backend = vad.backend, frame = vad.frame_samples, max_batch = vad.max_batch, "vad loaded");
-            Some(vad)
-        }
-    };
-    let _ = SHARED.set(vad);
-    Ok(())
-}
-
-/// The process's VAD, if one was loaded.
-pub fn shared() -> Option<Arc<Vad>> {
-    SHARED.get().cloned().flatten()
 }

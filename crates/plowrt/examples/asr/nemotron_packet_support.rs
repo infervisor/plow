@@ -108,6 +108,7 @@ impl LayerNames {
                 pointwise_in: &self.pointwise_in,
                 depthwise: &self.depthwise,
                 channel_norm: norm(&self.channel_norm_weight, &self.channel_norm_bias),
+                depthwise_bias: None,
                 pointwise_out: &self.pointwise_out,
             },
             feed_forward2: FeedForwardWeights {

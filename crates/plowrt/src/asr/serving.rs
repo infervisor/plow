@@ -18,8 +18,9 @@ use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot, watch, OwnedSemaphorePermit, Semaphore};
 
 use super::{
-    endpoint::{EndpointConfig, Segment, Turns},
-    frontend::{decode_wav, decode_wav_chunk, AudioError, Resampler, MAX_SAMPLES, SAMPLE_RATE},
+    endpoint::{EndpointConfig, Endpointer, Segment},
+    vad::{speech_samples, speech_segments, SegmentOptions},
+    frontend::{decode_wav, decode_wav_chunk, decode_wav_within, AudioError, Resampler, MAX_SAMPLES, SAMPLE_RATE},
     FinalizationPolicy, Transcriber, Transcript, TranscriptionInput,
 };
 use crate::serve::session::RequestIds;
@@ -44,7 +45,7 @@ pub struct AsrServer {
     idle_timeout: Duration,
     /// Recordings sent as `append` uploads, by (model, `X-Session-Id`).
     recordings: parking_lot::Mutex<HashMap<(String, Arc<str>), Arc<tokio::sync::Mutex<Recording>>>>,
-    /// The `--vad-packet` detector for turn detection, else the energy endpointer.
+    /// `--asr-vad-packet`: `/v1/audio/vad`, the no-speech upload gate and streaming endpointing.
     vad: Option<Arc<crate::asr::vad::Vad>>,
 }
 
@@ -454,13 +455,27 @@ impl AsrServer {
             request_timeout: configured_timeout(),
             idle_timeout: IDLE_TIMEOUT,
             recordings: Default::default(),
-            vad: crate::asr::vad::shared(),
+            vad: configured_vad(),
         })
     }
 
     /// Replace the configured transcription deadline; only before the server is shared.
     pub fn with_request_timeout(mut self: Arc<Self>, timeout: Option<Duration>) -> Arc<Self> {
         Arc::get_mut(&mut self).expect("AsrServer already shared").request_timeout = timeout;
+        self
+    }
+
+    /// A stream endpointer: Silero at `threshold` when a VAD packet is loaded, else energy.
+    fn endpointer(&self, config: EndpointConfig, threshold: f32) -> Endpointer {
+        match &self.vad {
+            Some(vad) => Endpointer::with_vad(config, vad.clone(), threshold),
+            None => Endpointer::new(config),
+        }
+    }
+
+    #[cfg(test)]
+    fn with_vad(mut self: Arc<Self>, vad: Arc<crate::asr::vad::Vad>) -> Arc<Self> {
+        Arc::get_mut(&mut self).expect("AsrServer already shared").vad = Some(vad);
         self
     }
 
@@ -510,7 +525,7 @@ impl AsrServer {
             request_timeout: configured_timeout(),
             idle_timeout: IDLE_TIMEOUT,
             recordings: Default::default(),
-            vad: crate::asr::vad::shared(),
+            vad: configured_vad(),
         })
     }
 
@@ -626,8 +641,11 @@ impl AsrServer {
                 .route("/v1/audio/transcriptions/stream", get(upgrade))
                 .route("/v1/realtime", get(realtime::upgrade));
         }
+        // 10 minutes of 16 kHz 16-bit audio is 19 MB.
+        let vad = Router::new().route("/v1/audio/vad", post(detect_speech)).layer(DefaultBodyLimit::max(32 * 1024 * 1024));
         router
             .layer(DefaultBodyLimit::max(4 * 1024 * 1024))
+            .merge(vad)
             .with_state(self)
     }
 }
@@ -682,6 +700,13 @@ pub fn packet_models_idle() -> bool {
 #[cfg(feature = "cuda")]
 pub fn serves_audio(state: &crate::serve::AppState, slug: &str) -> bool {
     shared::serves_audio(state, slug)
+}
+
+fn configured_vad() -> Option<Arc<crate::asr::vad::Vad>> {
+    crate::asr::vad::configured().unwrap_or_else(|error| {
+        tracing::error!(%error, "ASR VAD packet did not load; energy endpointing, no /v1/audio/vad");
+        None
+    })
 }
 
 fn configured_timeout() -> Option<Duration> {
@@ -855,22 +880,37 @@ async fn transcribe_upload(state: Arc<AsrServer>, mut multipart: Multipart, ids:
     };
     let language = fields.remove("language");
     let context = fields.remove("prompt").unwrap_or_default();
-    let samples = match file {
-        None => Vec::new(),
-        Some(file) => match tokio::task::spawn_blocking(move || if recorded { decode_wav_chunk(&file) } else { decode_wav(&file) }).await {
-            Ok(Ok(samples)) => samples,
-            Ok(Err(error)) => {
-                let status = match &error {
-                    AudioError::Invalid(_) => StatusCode::BAD_REQUEST,
-                    AudioError::Unsupported(_) => StatusCode::UNSUPPORTED_MEDIA_TYPE,
-                    AudioError::TooLong => StatusCode::PAYLOAD_TOO_LARGE,
-                };
-                return failure(status, error);
-            }
+    // A whole upload is gated on detected speech; recording pieces are not (speech may follow).
+    let vad = state.vad.clone().filter(|_| !recorded);
+    let (samples, speech) = match file {
+        None => (Vec::new(), None),
+        Some(file) => match tokio::task::spawn_blocking(move || {
+            let samples = if recorded { decode_wav_chunk(&file) } else { decode_wav(&file) }?;
+            let speech = vad.map(|vad| {
+                let probabilities = vad.probabilities(&samples);
+                speech_samples(&speech_segments(&probabilities, vad.frame, vad.sample_rate, samples.len(), GATE_SEGMENTS))
+            });
+            Ok((samples, speech))
+        })
+        .await
+        {
+            Ok(Ok(decoded)) => decoded,
+            Ok(Err(error)) => return audio_failure(error),
             Err(error) => return failure(StatusCode::INTERNAL_SERVER_ERROR, error),
         },
     };
     drop(upload);
+    if speech.is_some_and(|speech| speech < GATE_MIN_SPEECH) {
+        // No speech: an audio-LM would transcribe the noise (or echo its prompt); nothing runs.
+        tracing::debug!(speech_ms = speech.unwrap_or(0) / 16, "upload has no speech");
+        return if stream {
+            sse_events(vec![transcript_event("transcript.text.done", ids, json!({"text": "", "language": language, "final": true}))])
+        } else if format == "text" {
+            String::new().into_response()
+        } else {
+            Json(json!({"text": ""})).into_response()
+        };
+    }
     let finals = !recorded || finish;
     let mut run = crate::serve::turns::StageRun::start(
         ids,
@@ -994,6 +1034,92 @@ async fn transcribe_upload(state: Arc<AsrServer>, mut multipart: Multipart, ids:
         cache.stamp(&mut response);
     }
     response
+}
+
+/// Speech regions the upload gate counts: Silero's, with short speech kept and no padding.
+const GATE_SEGMENTS: SegmentOptions =
+    SegmentOptions { min_speech_ms: 150, min_silence_ms: 150, speech_pad_ms: 0, ..SegmentOptions::DEFAULT };
+/// An upload with less detected speech (250 ms) is answered with an empty transcript.
+const GATE_MIN_SPEECH: usize = SAMPLE_RATE as usize / 4;
+/// Longest audio `/v1/audio/vad` takes.
+const VAD_MAX_SAMPLES: usize = 10 * 60 * SAMPLE_RATE as usize;
+
+fn audio_failure(error: AudioError) -> Response {
+    let status = match &error {
+        AudioError::Invalid(_) => StatusCode::BAD_REQUEST,
+        AudioError::Unsupported(_) => StatusCode::UNSUPPORTED_MEDIA_TYPE,
+        AudioError::TooLong(_) => StatusCode::PAYLOAD_TOO_LARGE,
+    };
+    failure(status, error)
+}
+
+/// `POST /v1/audio/vad`: Silero speech segments of a WAV upload (multipart `file`, optional
+/// `threshold`, `min_speech_duration_ms`, `min_silence_duration_ms`, `speech_pad_ms`,
+/// `max_speech_duration_s`), in seconds.
+async fn detect_speech(State(state): State<Arc<AsrServer>>, mut multipart: Multipart) -> Response {
+    let Some(vad) = state.vad.clone() else {
+        return failure(StatusCode::NOT_FOUND, "no VAD packet is loaded (--asr-vad-packet)");
+    };
+    if state.draining() {
+        return failure(StatusCode::SERVICE_UNAVAILABLE, SHUTTING_DOWN);
+    }
+    let Ok(_upload) = state.uploads.clone().try_acquire_owned() else {
+        return busy("too many ASR uploads");
+    };
+    let (mut file, mut options) = (None, SegmentOptions::DEFAULT);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let field = match tokio::time::timeout_at(deadline, multipart.next_field()).await {
+            Ok(Ok(Some(f))) => f,
+            Ok(Ok(None)) => break,
+            Ok(Err(e)) => return failure(e.status(), e),
+            Err(_) => return failure(StatusCode::REQUEST_TIMEOUT, "upload timed out"),
+        };
+        let name = field.name().unwrap_or("").to_owned();
+        let value = match tokio::time::timeout_at(deadline, field.bytes()).await {
+            Ok(Ok(b)) => b,
+            Ok(Err(e)) => return failure(e.status(), e),
+            Err(_) => return failure(StatusCode::REQUEST_TIMEOUT, "upload timed out"),
+        };
+        if name == "file" {
+            if file.replace(value).is_some() {
+                return failure(StatusCode::BAD_REQUEST, "duplicate file");
+            }
+            continue;
+        }
+        let number = std::str::from_utf8(&value).ok().and_then(|v| v.trim().parse::<f32>().ok()).filter(|v| v.is_finite() && *v >= 0.0);
+        let Some(number) = number else {
+            return failure(StatusCode::BAD_REQUEST, format!("{name} must be a non-negative number"));
+        };
+        match name.as_str() {
+            "threshold" if number <= 1.0 => options.threshold = number,
+            "min_speech_duration_ms" => options.min_speech_ms = number as u32,
+            "min_silence_duration_ms" => options.min_silence_ms = number as u32,
+            "speech_pad_ms" => options.speech_pad_ms = number as u32,
+            "max_speech_duration_s" if number > 0.0 => options.max_speech_s = number,
+            _ => return failure(StatusCode::BAD_REQUEST, format!("unknown or invalid field {name:?}")),
+        }
+    }
+    let Some(file) = file else {
+        return failure(StatusCode::BAD_REQUEST, "file is required");
+    };
+    let detected = tokio::task::spawn_blocking(move || {
+        let samples = decode_wav_within(&file, VAD_MAX_SAMPLES)?;
+        let probabilities = vad.probabilities(&samples);
+        Ok::<_, AudioError>((samples.len(), speech_segments(&probabilities, vad.frame, vad.sample_rate, samples.len(), options)))
+    })
+    .await;
+    let seconds = |samples: usize| (samples as f64 / f64::from(SAMPLE_RATE) * 1000.0).round() / 1000.0;
+    match detected {
+        Ok(Ok((samples, segments))) => Json(json!({
+            "duration": seconds(samples),
+            "speech_duration": seconds(speech_samples(&segments)),
+            "segments": segments.iter().map(|s| json!({"start": seconds(s.start), "end": seconds(s.end)})).collect::<Vec<_>>(),
+        }))
+        .into_response(),
+        Ok(Err(error)) => audio_failure(error),
+        Err(error) => failure(StatusCode::INTERNAL_SERVER_ERROR, error),
+    }
 }
 
 fn transcript_event(kind: &str, ids: &RequestIds, mut body: serde_json::Value) -> axum::response::sse::Event {
@@ -1599,8 +1725,7 @@ async fn continuous(
     let session = ids.session.clone().unwrap_or_default();
     let rate = start.sample_rate as usize;
     let mut resampler = Resampler::new(start.sample_rate).expect("a listed stream rate");
-    // With a VAD: Silero's default threshold, and the energy endpointer's 200 ms of lead-in.
-    let mut endpointer = Turns::new(EndpointConfig { min_silence_ms, max_segment_ms }, 0.5, 200, state.vad.as_ref());
+    let mut endpointer = state.endpointer(EndpointConfig { min_silence_ms, max_segment_ms }, 0.5);
     if !send(&mut socket, json!({"type":"ready","version":1,"session_id":&*session,"request_id":&*ids.request,
         "sample_rate":start.sample_rate,"format":"pcm_s16le","max_chunk_bytes":32000,"credit_samples":rate,
         "max_audio_samples":null,"partial_mode":if start.partials {"revision"} else {"final_only"},
@@ -1827,13 +1952,7 @@ async fn continuous(
                     .chunks_exact(2)
                     .map(|b| i16::from_le_bytes([b[0], b[1]]) as f32 / 32768.0)
                     .collect();
-                match endpointer.push(&resampler.push(&pcm)).await {
-                    Ok((_, closed)) => waiting.extend(closed),
-                    Err(e) => {
-                        send(&mut socket, json!({"type":"error","message":format!("VAD: {e}"),"terminal":true})).await;
-                        return;
-                    }
-                }
+                waiting.extend(endpointer.push(&resampler.push(&pcm)));
                 if start.partials && partial.is_none() {
                     if let Some((segment, audio)) = endpointer.open_audio() {
                         if segment != partial_segment {
@@ -1862,13 +1981,8 @@ async fn continuous(
                     finishing = true;
                     partial = None;
                     let tail = resampler.finish();
-                    match endpointer.close(&tail).await {
-                        Ok((_, closed)) => waiting.extend(closed),
-                        Err(e) => {
-                            send(&mut socket, json!({"type":"error","message":format!("VAD: {e}"),"terminal":true})).await;
-                            return;
-                        }
-                    }
+                    waiting.extend(endpointer.push(&tail));
+                    waiting.extend(endpointer.finish());
                 }
                 Some("cancel") => return,
                 _ => {
@@ -2208,6 +2322,57 @@ mod tests {
             .header("content-type", "multipart/form-data; boundary=audio")
             .body(Body::from(body))
             .unwrap()
+    }
+
+    fn upload(path: &str, fields: &[(&str, &str)], samples: &[f32]) -> Request<Body> {
+        let mut wav = std::io::Cursor::new(Vec::new());
+        let spec = hound::WavSpec { channels: 1, sample_rate: 16_000, bits_per_sample: 16, sample_format: hound::SampleFormat::Int };
+        let mut writer = hound::WavWriter::new(&mut wav, spec).unwrap();
+        for &x in samples {
+            writer.write_sample((x.clamp(-1.0, 1.0) * 32767.0) as i16).unwrap();
+        }
+        writer.finalize().unwrap();
+        let mut body = Vec::new();
+        for (name, value) in fields {
+            body.extend(format!("--audio\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n").bytes());
+        }
+        body.extend(b"--audio\r\nContent-Disposition: form-data; name=\"file\"; filename=\"a.wav\"\r\nContent-Type: audio/wav\r\n\r\n");
+        body.extend(wav.into_inner());
+        body.extend(b"\r\n--audio--\r\n");
+        Request::post(path).header("content-type", "multipart/form-data; boundary=audio").body(Body::from(body)).unwrap()
+    }
+
+    #[tokio::test]
+    async fn vad_answers_silent_uploads_without_the_model_and_reports_speech() {
+        let dir = std::path::Path::new("/home/ssm-user/models/silero-vad-v5");
+        let Ok(vad) = crate::asr::vad::Vad::load(&dir.join("silero_vad.pkt")) else { return };
+        let reference: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.join("reference.json")).unwrap()).unwrap();
+        let signal: Vec<f32> = reference["signal"].as_array().unwrap().iter().map(|v| v.as_f64().unwrap() as f32).collect();
+        let app = AsrServer::new("test".into(), Fake).with_vad(Arc::new(vad)).router(false);
+        let text = |samples: &[f32]| upload("/v1/audio/transcriptions", &[("model", "test")], samples);
+        let response = app.clone().oneshot(text(&[0.0; 16_000])).await.unwrap();
+        assert_eq!(&response.into_body().collect().await.unwrap().to_bytes()[..], br#"{"text":""}"#);
+        let response = app.clone().oneshot(text(&signal)).await.unwrap();
+        assert_eq!(&response.into_body().collect().await.unwrap().to_bytes()[..], br#"{"text":"hello"}"#);
+
+        let response = app.clone().oneshot(upload("/v1/audio/vad", &[("speech_pad_ms", "0")], &signal)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let detected: serde_json::Value = serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
+        assert_eq!(detected["duration"], 4.0);
+        let segments = detected["segments"].as_array().unwrap();
+        assert_eq!(segments.len(), 1);
+        // The tone burst spans 1..2 s of the reference signal.
+        let (start, end) = (segments[0]["start"].as_f64().unwrap(), segments[0]["end"].as_f64().unwrap());
+        assert!((0.9..1.2).contains(&start) && (1.8..2.2).contains(&end), "{segments:?}");
+        let response = app.clone().oneshot(upload("/v1/audio/vad", &[("model", "test")], &signal)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn vad_route_is_absent_without_a_packet() {
+        let app = AsrServer::new("test".into(), Fake).router(false);
+        let response = app.oneshot(upload("/v1/audio/vad", &[], &[0.0; 16_000])).await.unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]

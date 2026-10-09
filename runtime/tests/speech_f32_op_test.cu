@@ -455,14 +455,6 @@ static void t_elementwise() {
         run("LstmCellF32", c, g_lstm_cell_f32, {h, cn}, FP32);
     }
     {
-        Case c; const unsigned width = 128, rows = 37;
-        unsigned h = c.out(rows * width), cn = c.out(rows * width), g = c.f32(rows * 4 * width, 4.f),
-                 cp = c.f32(rows * width, 2.f);
-        c.in.op = PLOW_DOP_LSTM_CELL_F32; c.in.t[0] = h; c.in.t[1] = cn; c.in.t[2] = g; c.in.t[3] = cp;
-        c.in.i[0] = width; c.in.i[1] = rows;
-        run("LstmCellF32 rows", c, g_lstm_cell_f32, {h, cn}, FP32);
-    }
-    {
         Case c; const unsigned rows = 6, width = 3001;
         unsigned o = c.out(rows), x = c.f32(rows * width, 1.f);
         float* xp = (float*)c.host[x].data();
@@ -686,11 +678,11 @@ static void t_convt1d(const char* name, const ConvSpec& s, double tol = 2e-5) {
 }
 
 static void t_unary() {
-    static const char* names[17] = {"none", "tanh", "sin", "cos", "exp", "abs", "sigmoid", "silu", "elu",
-                                    "leaky", "mish", "gelu_erf", "snake", "clamp", "scale_shift", "relu", "sqrt"};
-    for (unsigned kind = 0; kind < 17; kind++) {
+    static const char* names[16] = {"none", "tanh", "sin", "cos", "exp", "abs", "sigmoid", "silu", "elu",
+                                    "leaky", "mish", "gelu_erf", "snake", "clamp", "scale_shift", "relu"};
+    for (unsigned kind = 0; kind < 16; kind++) {
         Case c; const unsigned rows = 97, width = 40, stride = 50, col0 = 7;
-        unsigned o = c.f32(rows * stride, 1.f), x = kind == 16 ? c.f32(rows * stride, 2.f, 2.f) : c.f32(rows * stride, 4.f);
+        unsigned o = c.f32(rows * stride, 1.f), x = c.f32(rows * stride, 4.f);
         unsigned p = kind == 12 || kind == 14 ? c.f32(width, 0.5f, 0.7f) : PLOW_TENSOR_NONE;
         c.in.op = PLOW_DOP_UNARY_F32; c.in.t[0] = o; c.in.t[1] = x; c.in.t[2] = p;
         c.in.i[0] = rows; c.in.i[1] = width; c.in.i[2] = kind; c.in.i[3] = stride; c.in.i[4] = col0;

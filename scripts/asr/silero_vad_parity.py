@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Per-frame speech-probability parity of a `vad.pkt` (plowrt's VAD driver) vs the Silero VAD
-TorchScript reference, on a fixed audio set: LibriSpeech clips (an ASR manifest), the first clips
+"""Per-frame speech-probability parity of a `vad.silero.v1` packet (plowrt's host executor,
+`--asr-vad-packet`) vs the Silero VAD TorchScript reference, on a fixed audio set: LibriSpeech clips (an ASR manifest), the first clips
 joined by pauses of silence and of noise, and pure silence / noise segments.
 
-  python scripts/asr/silero_vad_parity.py --packet ASSETS/vad.pkt --jit silero_vad.jit \
+  python scripts/asr/silero_vad_parity.py --packet DIR/silero_vad.pkt --jit silero_vad.jit \
       --manifest MANIFEST.json --runner TARGET/release/examples/asr_vad_check --out DIR \
-      [--backend cuda] [--max-dp 1e-4] [--min-agree 0.999]
+      [--max-dp 1e-4] [--min-agree 0.999]
 
 Writes DIR/audio/*.f32 (16 kHz f32le), DIR/ref.json, DIR/plow.json and DIR/parity.json, and
 prints `VAD_PARITY max_dp=.. mean_dp=.. agree=.. flips=.. frames=..` (decisions at 0.5).
@@ -76,7 +76,6 @@ def main():
     p.add_argument("--manifest", required=True)
     p.add_argument("--runner", required=True)
     p.add_argument("--out", required=True)
-    p.add_argument("--backend", default="cuda")
     p.add_argument("--threshold", type=float, default=0.5)
     p.add_argument("--max-dp", type=float, default=1e-4)
     p.add_argument("--min-agree", type=float, default=0.999)
@@ -90,7 +89,7 @@ def main():
     ref = reference(a.jit, clips)
     json.dump(ref, open(os.path.join(a.out, "ref.json"), "w"))
     plow_json = os.path.join(a.out, "plow.json")
-    subprocess.run([a.runner, a.packet, "probs", a.backend, plow_json, *paths.values()], check=True)
+    subprocess.run([a.runner, a.packet, "probs", plow_json, *paths.values()], check=True)
     got = {name: json.load(open(plow_json))[path] for name, path in paths.items()}
     rows, dps, agree, flips = {}, [], 0, []
     for name in clips:
@@ -105,7 +104,7 @@ def main():
         rows[name] = dict(frames=len(r), max_dp=float(d.max()), speech_frames=int((r >= a.threshold).sum()))
     d = np.concatenate(dps)
     res = dict(frames=int(d.size), max_dp=float(d.max()), mean_dp=float(d.mean()), agree=agree / d.size,
-               flips=flips, threshold=a.threshold, backend=a.backend, clips=rows,
+               flips=flips, threshold=a.threshold, clips=rows,
                max_dp_limit=a.max_dp, min_agree_limit=a.min_agree)
     res["pass"] = res["max_dp"] <= a.max_dp and res["agree"] >= a.min_agree
     json.dump(res, open(os.path.join(a.out, "parity.json"), "w"), indent=1)

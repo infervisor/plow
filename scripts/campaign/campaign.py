@@ -1281,8 +1281,9 @@ def cmd_sweep(a: argparse.Namespace) -> None:
 #   asr_wer           /v1/audio/transcriptions over a manifest (served_bench.py): wer_max
 #   tts_cer           tts_bench.py --wav arms, Whisper round trip (asr_check.py): cer_median_max, cer_lang_max
 #   s3gen_rel_l2      s3gen.pkt vs torch (s3gen_packet_check.py, packet_run): rel_l2_max
-#   vad_parity        vad.pkt per-frame speech probability vs the Silero TorchScript reference
-#                     (silero_vad_parity.py, asr_vad_check): max_dp_max, agree_min; `jit`, `manifest`.
+#   vad_parity        silero_vad.pkt per-frame speech probability vs the Silero TorchScript reference
+#                     (silero_vad_parity.py, asr_vad_check, host executor): max_dp_max, agree_min;
+#                     `jit`, `manifest`.
 #                     A packet-only bundle names its packet in [gates] `packet` (default model.pkt).
 #   llm_fp32_ref      plow AND vLLM vs a cached FP32 reference (scripts/llm/fp32_ref_gate.py); plow must
 #                     stay within vLLM's distance to FP32. `reference` (ref.json), then `vllm_capture` (cached)
@@ -1342,10 +1343,10 @@ def gate_steps(kind: str, g: dict, py: str, out: Path, assets: Path) -> tuple[li
     if kind == "vad_parity":
         runner = g.get("runner") or os.environ.get("CARGO_TARGET_DIR", str(REPO / "target")) + "/release/examples/asr_vad_check"
         if not Path(runner).exists():
-            die(f"{runner} missing: cargo build --release -p plowrt --features cuda --example asr_vad_check")
-        return [], [f"{q(py)} {sc('scripts/asr/silero_vad_parity.py')} --packet {q(str(assets / 'vad.pkt'))} "
+            die(f"{runner} missing: cargo build --release -p plowrt --example asr_vad_check")
+        return [], [f"{q(py)} {sc('scripts/asr/silero_vad_parity.py')} --packet {q(str(assets / 'silero_vad.pkt'))} "
                     f"--jit {q(g['jit'])} --manifest {q(g['manifest'])} --runner {q(runner)} --out {d} "
-                    f"--backend {q(g.get('backend', 'cuda'))} --threshold {float(g.get('threshold', 0.5))} "
+                    f"--threshold {float(g.get('threshold', 0.5))} "
                     f"--max-dp {float(g.get('max_dp_max', 1e-4))} --min-agree {float(g.get('agree_min', 0.999))} {args} "
                     f"> {d}/check.log 2>&1"]
     die(f"unknown gate kind {kind}")

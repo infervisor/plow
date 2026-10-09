@@ -397,15 +397,14 @@ G_K(g_lstm_cell_f32) {
     float* c_new = PLOW_CPU_TEN(in, T, 1);
     const float* gates = PLOW_CPU_TEN(in, T, 2);
     const float* c_prev = PLOW_CPU_TEN(in, T, 3);
-    const uint32_t width = in->i[0], rows = in->i[1] ? in->i[1] : 1u;
+    const uint32_t width = in->i[0];
     uint32_t lo, hi;
-    g_range(rows * width, slice, nblk, &lo, &hi);
+    g_range(width, slice, nblk, &lo, &hi);
     for (uint32_t i = lo; i < hi; i++) {
-        const float* g = gates + (size_t)(i / width) * 4u * width + i % width;
-        const float input = g_sigmoid(g[0]);
-        const float forget = g_sigmoid(g[width]);
-        const float cell = tanhf(g[2u * width]);
-        const float output = g_sigmoid(g[3u * width]);
+        const float input = g_sigmoid(gates[i]);
+        const float forget = g_sigmoid(gates[width + i]);
+        const float cell = tanhf(gates[2u * width + i]);
+        const float output = g_sigmoid(gates[3u * width + i]);
         c_new[i] = forget * c_prev[i] + input * cell;
         h_new[i] = output * tanhf(c_new[i]);
     }
@@ -488,12 +487,20 @@ G_K(g_relative_attention_f32) {
     const float* bias_v = PLOW_CPU_TEN(in, T, 6);
     const uint32_t rows = in->i[0], width = in->i[1], heads = in->i[2];
     const uint32_t chunk = in->i[3], left_chunks = in->i[4], head_width = width / heads;
-    /* t7 (optional): keys before this row are not filled yet (a stream's first chunks). */
-    const uint32_t key0 = in->t[7] != PLOW_TENSOR_NONE ? *(const uint32_t*)T[in->t[7]] : 0u;
+    /* t7 (optional): chunked, keys before this row are not filled yet (a stream's first chunks);
+     * full context, the valid rows of a padded bucket (later keys masked, later rows zero). */
+    const uint32_t t7 = in->t[7] != PLOW_TENSOR_NONE ? *(const uint32_t*)T[in->t[7]] : UINT32_MAX;
+    const uint32_t key0 = left_chunks != UINT32_MAX && t7 != UINT32_MAX ? t7 : 0u;
+    const uint32_t valid = left_chunks == UINT32_MAX && t7 < rows ? t7 : rows;
     /* i5: only query rows from here on are wanted (a stream step's new rows). */
     for (uint32_t item = in->i[5] * heads + slice; item < rows * heads; item += nblk) {
         const uint32_t qr = item / heads, head = item % heads;
-        uint32_t first = 0, last = rows;
+        if (qr >= valid) {
+            for (uint32_t col = 0; col < head_width; col++)
+                context[(size_t)qr * width + head * head_width + col] = 0.0f;
+            continue;
+        }
+        uint32_t first = 0, last = valid;
         if (left_chunks != UINT32_MAX) {
             const uint32_t qc = qr / chunk;
             first = (qc > left_chunks ? qc - left_chunks : 0u) * chunk;

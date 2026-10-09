@@ -1,7 +1,6 @@
 //! OpenAI Realtime-compatible transcription sessions: `GET /v1/realtime?intent=transcription`.
 //! Base64 audio arrives in `input_audio_buffer.append` (pcm16 at 24 kHz, G.711 μ-law / A-law at
-//! 8 kHz) and is resampled to 16 kHz. With `server_vad` the continuous-mode endpointer cuts turns
-//! (on a VAD packet's speech probabilities with `--vad-packet`, else on energy);
+//! 8 kHz) and is resampled to 16 kHz. With `server_vad` the continuous-mode endpointer cuts turns;
 //! with `turn_detection: null` audio accumulates until `input_audio_buffer.commit`. Each turn is
 //! an item transcribed on the model's route, answered as
 //! `conversation.item.input_audio_transcription.delta` events and one `.completed`, in turn order.
@@ -76,9 +75,9 @@ fn alaw(byte: u8) -> i16 {
     (if a & 0x80 != 0 { magnitude } else { -magnitude }) as i16
 }
 
-/// `server_vad` settings. With a VAD packet (`--vad-packet`) all three drive the endpointer;
-/// without one only `silence_duration_ms` does (the energy endpointer's margin and 200 ms context
-/// are fixed) and `threshold` and `prefix_padding_ms` are echoed.
+/// `server_vad` settings. `silence_duration_ms` ends a turn; `threshold` is the Silero speech
+/// probability when a VAD packet is loaded (the energy endpointer's margin is fixed);
+/// `prefix_padding_ms` is accepted and echoed (the 200 ms context is fixed).
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct Vad {
     threshold: f64,
@@ -147,14 +146,11 @@ impl Config {
                         prefix_padding_ms: turn["prefix_padding_ms"].as_u64().map_or(current.prefix_padding_ms, |v| v as u32),
                         silence_duration_ms: turn["silence_duration_ms"].as_u64().map_or(current.silence_duration_ms, |v| v as u32),
                     };
+                    if !(0.0..=1.0).contains(&vad.threshold) {
+                        return Err(("session.turn_detection.threshold", "must be 0..=1".into()));
+                    }
                     if !(200..=2000).contains(&vad.silence_duration_ms) {
                         return Err(("session.turn_detection.silence_duration_ms", "must be 200..=2000".into()));
-                    }
-                    if !(0.0..=1.0).contains(&vad.threshold) {
-                        return Err(("session.turn_detection.threshold", "must be 0.0..=1.0".into()));
-                    }
-                    if vad.prefix_padding_ms > 2000 {
-                        return Err(("session.turn_detection.prefix_padding_ms", "must be 0..=2000".into()));
                     }
                     Some(vad)
                 }
@@ -256,13 +252,9 @@ async fn session(state: Arc<AsrServer>, mut socket: WebSocket, ids: RequestIds, 
     }
     let mut shutdown = state.shutdown.subscribe();
     let mut resampler = Resampler::new(config.format.rate()).expect("a listed format rate");
-    let detector = state.vad.clone();
     let new_endpointer = |vad: Option<Vad>, finalization: Option<&FinalizationPolicy>| {
         let cap_ms = (MAX_SAMPLES.saturating_sub(finalization.map_or(0, |f| f.final_padding_samples)) / 16) as u32;
-        vad.map(|v| {
-            let config = EndpointConfig { min_silence_ms: v.silence_duration_ms, max_segment_ms: cap_ms.min(25_000) };
-            Turns::new(config, v.threshold as f32, v.prefix_padding_ms, detector.as_ref())
-        })
+        vad.map(|v| state.endpointer(EndpointConfig { min_silence_ms: v.silence_duration_ms, max_segment_ms: cap_ms.min(25_000) }, v.threshold as f32))
     };
     let mut endpointer = new_endpointer(config.vad, route.as_ref().map(|r| &r.2));
     // 16 kHz samples fed since the session (or the last clear) and before the current endpointer.
@@ -453,12 +445,9 @@ async fn session(state: Arc<AsrServer>, mut socket: WebSocket, ids: RequestIds, 
                     if next.vad != config.vad {
                         // Settings change between turns: the open turn (if any) is committed first,
                         // with the settings it was spoken under.
-                        if let Some((skipped, last)) = endpointer.as_mut().map(Turns::finish) {
-                            fed += skipped as u64;
-                            if let Some(segment) = last {
-                                let turn = Turn::of(&config, &route);
-                                commit_turn(&mut out, &mut socket, &mut speaking, &mut previous, &mut waiting, &mut next_item, epoch, segment, turn).await;
-                            }
+                        if let Some(segment) = endpointer.as_mut().and_then(Endpointer::finish) {
+                            let turn = Turn::of(&config, &route);
+                            commit_turn(&mut out, &mut socket, &mut speaking, &mut previous, &mut waiting, &mut next_item, epoch, segment, turn).await;
                         }
                         epoch += fed;
                         fed = 0;
@@ -518,16 +507,8 @@ async fn session(state: Arc<AsrServer>, mut socket: WebSocket, ids: RequestIds, 
                         continue;
                     }
                     Some(e) => {
-                        let closed = match e.push(&pcm).await {
-                            Ok((taken, closed)) => {
-                                fed += taken as u64;
-                                closed
-                            }
-                            Err(error) => {
-                                going_away(&mut socket, &mut out, "server_error", &format!("VAD failed: {error}")).await;
-                                return;
-                            }
-                        };
+                        fed += pcm.len() as u64;
+                        let closed = e.push(&pcm);
                         let open = e.open_audio().map(|(index, audio)| (index, fed - audio.len() as u64));
                         for segment in closed {
                             if !commit_turn(&mut out, &mut socket, &mut speaking, &mut previous, &mut waiting, &mut next_item, epoch, segment, Turn::of(&config, &route)).await {
@@ -562,16 +543,9 @@ async fn session(state: Arc<AsrServer>, mut socket: WebSocket, ids: RequestIds, 
                         })
                     }
                     Some(e) => {
-                        let mut closed = match e.close(&tail).await {
-                            Ok((taken, closed)) => {
-                                fed += taken as u64;
-                                closed
-                            }
-                            Err(error) => {
-                                going_away(&mut socket, &mut out, "server_error", &format!("VAD failed: {error}")).await;
-                                return;
-                            }
-                        };
+                        fed += tail.len() as u64;
+                        let mut closed = e.push(&tail);
+                        closed.extend(e.finish());
                         let last = closed.pop();
                         for segment in closed {
                             if !commit_turn(&mut out, &mut socket, &mut speaking, &mut previous, &mut waiting, &mut next_item, epoch, segment, Turn::of(&config, &route)).await {

@@ -337,6 +337,15 @@ path = "examples/asr/nemotron_pipeline_compile.rs"
 required-features = ["gguf"]
 
 [[example]]
+name = "asr_parakeet_pipeline_compile"
+path = "examples/asr/parakeet_pipeline_compile.rs"
+required-features = ["gguf"]
+
+[[example]]
+name = "asr_silero_vad_compile"
+path = "examples/asr/silero_vad_compile.rs"
+
+[[example]]
 name = "step_bench"
 path = "examples/step_bench.rs"
 required-features = ["cuda"]

@@ -1936,16 +1936,15 @@ static __device__ __noinline__ void d_embed_f16_f32(float* out, const uint16_t* 
     SP_FOR_EACH(i, width) out[i] = sp_f16(table[(size_t)t * width + i]);
 }
 
-/* LstmCellF32 (172): per row, gates = [i | f | g | o] x width. */
+/* LstmCellF32 (172): gates = [i | f | g | o] x width. */
 static __device__ __noinline__ void d_lstm_cell_f32(float* h_new, float* c_new, const float* gates,
-                                       const float* c_prev, unsigned width, unsigned rows, unsigned slice,
+                                       const float* c_prev, unsigned width, unsigned slice,
                                        unsigned nblk) {
-    SP_FOR_EACH(i, (rows ? rows : 1u) * width) {
-        const float* g = gates + (size_t)(i / width) * 4u * width + i % width;
-        const float ig = sp_sigmoid(g[0]);
-        const float fg = sp_sigmoid(g[width]);
-        const float cell = sp_tanhf(g[2u * width]);
-        const float og = sp_sigmoid(g[3u * width]);
+    SP_FOR_EACH(i, width) {
+        const float ig = sp_sigmoid(gates[i]);
+        const float fg = sp_sigmoid(gates[width + i]);
+        const float cell = sp_tanhf(gates[2u * width + i]);
+        const float og = sp_sigmoid(gates[3u * width + i]);
         const float c = __fadd_rn(__fmul_rn(fg, c_prev[i]), __fmul_rn(ig, cell));
         c_new[i] = c;
         h_new[i] = __fmul_rn(og, sp_tanhf(c));
@@ -2171,20 +2170,28 @@ __device__ __forceinline__ float sp_rel_score(const float* q, const float* k, co
     return (float)((content + relative) / sqrt((double)hw));
 }
 #define SPR_COLS 8
-/* A stream step's few query rows (i5 > 0): a block per (row, head). Its warps split the keys' scores
- * (the same sp_rel_score), then the softmax and the context sums run in key order exactly as the
- * warp-per-item body does, so the rows match the offline encoder's bit for bit. */
+/* A block per (row, head): a stream step's few query rows (i5 > 0), and full-context attention
+ * (left_chunks = u32::MAX), whose window is too wide for the warp-per-item body. Its warps split the
+ * keys' scores (the same sp_rel_score), then the softmax and the context sums run in key order
+ * exactly as the warp-per-item body does, so the rows match the offline encoder's bit for bit. */
+#define SPR_MAX_KEYS (SP_ARENA_FLOATS / 2u)
 static __device__ __forceinline__ void sp_relative_attention_rows(
     float* __restrict__ context, const float* __restrict__ query, const float* __restrict__ key,
     const float* __restrict__ value, const float* __restrict__ position, const float* __restrict__ bias_u,
     const float* __restrict__ bias_v, unsigned rows, unsigned width, unsigned heads, unsigned chunk,
-    unsigned left_chunks, unsigned key0, unsigned query_row0, unsigned slice, unsigned nblk) {
+    unsigned left_chunks, unsigned key0, unsigned query_row0, unsigned slice, unsigned nblk, unsigned valid) {
     const unsigned lane = threadIdx.x & 31u, warp = threadIdx.x >> 5, hw = width / heads;
-    float* scores = sp_smem; /* <= 64 keys (the packet's window bound) */
-    float* probs = sp_smem + 64;
+    float* scores = sp_smem;
+    float* probs = sp_smem + SPR_MAX_KEYS;
     for (unsigned item = query_row0 * heads + slice; item < rows * heads; item += nblk) {
         const unsigned qr = item / heads, head = item - qr * heads;
-        unsigned first = 0, last = rows;
+        if (qr >= valid) {
+            /* A padded row: nothing reads it, but it must not hold a stale or non-finite value. */
+            for (unsigned c = threadIdx.x; c < hw; c += PLOW_NV_THREADS)
+                context[(size_t)qr * width + (size_t)head * hw + c] = 0.f;
+            continue;
+        }
+        unsigned first = 0, last = valid;
         if (left_chunks != 0xFFFFFFFFu) {
             const unsigned qc = qr / chunk;
             first = (qc > left_chunks ? qc - left_chunks : 0u) * chunk;
@@ -2192,7 +2199,7 @@ static __device__ __forceinline__ void sp_relative_attention_rows(
             if (last > rows) last = rows;
         }
         if (first < key0) first = key0 < last ? key0 : last - 1u;
-        if (last - first > 64u) { __trap(); return; }
+        if (last - first > SPR_MAX_KEYS) { __trap(); return; }
         const size_t ho = (size_t)head * hw;
         const float* q = query + (size_t)qr * width + ho;
         for (unsigned kr = first + warp; kr < last; kr += PLOW_NV_WARPS) {
@@ -2229,11 +2236,19 @@ static __device__ __noinline__ void d_relative_attention_f32(float* __restrict__
                                                 const unsigned* __restrict__ key_start = nullptr,
                                                 unsigned query_row0 = 0) {
     const unsigned lane = threadIdx.x & 31u, warp = threadIdx.x >> 5, hw = width / heads;
+    if (left_chunks == 0xFFFFFFFFu) {
+        /* Full context, t7 (optional): the valid rows of a padded bucket. Later keys are masked
+         * and later query rows written as zeros. */
+        const unsigned valid = key_start && *key_start < rows ? *key_start : rows;
+        sp_relative_attention_rows(context, query, key, value, position, bias_u, bias_v, rows, width, heads, chunk,
+                                   left_chunks, 0u, query_row0, slice, nblk, valid);
+        return;
+    }
     /* t7 (optional): keys before this row are not filled yet (a stream's first chunks). */
     const unsigned key0 = key_start ? *key_start : 0u;
     if (query_row0 != 0u) {
         sp_relative_attention_rows(context, query, key, value, position, bias_u, bias_v, rows, width, heads, chunk,
-                                   left_chunks, key0, query_row0, slice, nblk);
+                                   left_chunks, key0, query_row0, slice, nblk, rows);
         return;
     }
     /* i5: only query rows from here on are wanted (a stream step's new rows). */
@@ -2321,7 +2336,7 @@ __device__ __forceinline__ void sp_with_act(unsigned kind, float p1, const B& bo
     case 13: body([p1](float x, float p0) { return fminf(fmaxf(x, p0), p1); }); break;
     case 14: body([p1](float x, float p0) { return __fadd_rn(__fmul_rn(x, p0), p1); }); break;
     case 15: body([](float x, float) { return x > 0.0f ? x : 0.0f; }); break;
-    case 16: body([](float x, float) { return __fsqrt_rn(x); }); break;
+    case 16: body([](float x, float) { return sqrtf(x); }); break;
     default: body([](float x, float) { return x; }); break;
     }
 }
@@ -2342,7 +2357,7 @@ __device__ __forceinline__ float sp_act(unsigned kind, float x, float p0, float 
     case 13: return fminf(fmaxf(x, p0), p1);
     case 14: return __fadd_rn(__fmul_rn(x, p0), p1);
     case 15: return x > 0.0f ? x : 0.0f;
-    case 16: return __fsqrt_rn(x);
+    case 16: return sqrtf(x);
     default: return x;
     }
 }
@@ -4699,7 +4714,7 @@ static __device__ __noinline__ void d_speech_f32(const PlowDevInst* in, void* co
         break;
     SP_CASE(LSTM_CELL_F32)
         d_lstm_cell_f32((float*)SP_TEN(0), (float*)SP_TEN(1), (const float*)SP_TEN(2), (const float*)SP_TEN(3),
-                        in->i[0], in->i[1], slice, nblk);
+                        in->i[0], slice, nblk);
         break;
     SP_CASE(ARGMAX_F32)
         d_argmax_f32((unsigned*)SP_TEN(0), (const float*)SP_TEN(1), in->i[0], in->i[1], slice, nblk, arena);
