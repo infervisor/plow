@@ -20,7 +20,8 @@
 # FP8 checkpoint, with a tokenizer.json: vLLM model and FP32 reference); PLOW_FP8_CKPT (HF_FP8 re-keyed
 # by scripts/gemma4_fp8_hub_rekey.py: the plow FP8 checkpoint); BF16_RECIPE / FP8_RECIPE; PYREF (python
 # with torch + vllm 0.28.0); REF_DEVICE (fp32_ref_gate.py reference --device; default offload: 31B FP32 is
-# 115 GiB and does not fit one 80 GiB GPU); REF_<BF16|FP8> / REF_VLLM_<BF16|FP8> (FP32 reference + vLLM capture,
+# 115 GiB and does not fit one 80 GiB GPU); REF_HEADROOM (--offload-headroom-gib; 56 for 32K prompts);
+# REF_<BF16|FP8> / REF_VLLM_<BF16|FP8> (FP32 reference + vLLM capture,
 # default $OUT/fp32ref/<arm>/{ref,vllm}.json); PROMPTS (fp32_ref_gate.py prompt set; built from CORPUS
 # when absent); OBJECT_ENV (extra `--object-env`, e.g. "NVCC_APPEND_FLAGS=-ccbin=/usr/bin/g++-14");
 # RT_ENV (runtime env for plowrt); VLLM_ENV (env for the vLLM server); MAX_MODEL_LEN (vLLM
@@ -79,7 +80,7 @@ ref() {
       --corpus pride="$CORPUS/pg1342.txt" beagle="$CORPUS/pg944.txt" docs="$CORPUS/repo-docs.md" code="$CORPUS/repo-code.rs" || exit
   fi
   [ -s "$r" ] || "$PYREF" "$REPO/scripts/llm/fp32_ref_gate.py" reference --hf "$hf" --prompts "$PROMPTS" --out "$r" \
-    --device "${REF_DEVICE:-offload}" || exit
+    --device "${REF_DEVICE:-offload}" ${REF_HEADROOM:+--offload-headroom-gib "$REF_HEADROOM"} || exit
   [ -s "$rv" ] || serve_capture "vllm-$p" "$(dirname "$rv")" "$rv"
 }
 

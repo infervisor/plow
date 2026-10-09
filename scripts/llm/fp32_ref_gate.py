@@ -396,7 +396,7 @@ def scaled_tensors(files, device="cuda"):
                 yield k, w, scale
 
 
-def offload_layers(model, compact, headroom_gib=40.0):
+def offload_layers(model, compact, headroom_gib):
     """Decoder layers kept in checkpoint precision (`compact`: name -> (weight, scale or None),
     on the GPU while it fits beside `headroom_gib` of activations, else in pinned host memory) and
     materialized in FP32 on the GPU per forward with the same `w.float() * scale.float()` as the
@@ -451,12 +451,12 @@ def offload_layers(model, compact, headroom_gib=40.0):
           f"{len(layers) - on_gpu} in pinned host memory ({per / 2**30:.2f} GiB each)", flush=True)
 
 
-def load_fp32(hf, device="cuda", compact=None):
+def load_fp32(hf, device="cuda", compact=None, headroom_gib=40.0):
     import torch
     if device == "offload":
         compact = {}
         model, weights = load_fp32(hf, "cpu", compact)
-        offload_layers(model, compact)
+        offload_layers(model, compact, headroom_gib)
         return model, weights
     from transformers import AutoConfig
     from transformers.modeling_utils import AttentionInterface
@@ -528,7 +528,7 @@ def cmd_reference(a):
     from transformers import AutoTokenizer
     tok = AutoTokenizer.from_pretrained(a.hf, local_files_only=True)
     prompts = json.loads(Path(a.prompts).read_text())
-    model, weights = load_fp32(a.hf, a.device)
+    model, weights = load_fp32(a.hf, a.device, headroom_gib=a.offload_headroom_gib)
     # Long prompts compute their masks inside fp32_attention (causal + sliding window): HF would
     # materialize a q x kv mask per layer type, 64 GiB at 262144 tokens.
     no_masks = {t: None for t in set(getattr(model.config, "layer_types", None) or ["full_attention"])}
@@ -730,6 +730,8 @@ def main():
     rf.add_argument("--prompts", required=True)
     rf.add_argument("--only", help="comma-separated case ids (debug)")
     rf.add_argument("--device", default="cuda", help="torch device for the FP32 model (cuda, cpu, or offload: GPU + pinned host layers)")
+    rf.add_argument("--offload-headroom-gib", type=float, default=40.0,
+                    help="offload: GPU memory left for activations (16K prompts fit in 40; 32K needs ~56)")
     rf.add_argument("--out", required=True)
     rf.set_defaults(f=cmd_reference)
     cp = sp.add_parser("capture")
