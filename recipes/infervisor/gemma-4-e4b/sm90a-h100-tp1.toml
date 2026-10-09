@@ -97,7 +97,7 @@ PLOW_BUILD_FA_V3_PACK = "1"
 # Served: per-rung cuBLASLt algorithms (step_bench B=48/64 7.29/7.52 -> 7.13/7.41 ms; the chosen
 # algorithm, and so the B<128 rung digests, can differ between loads).
 [serve]
-env = { PLOW_LT_RUNG_ALGOS = "true" }
+env = { PLOW_VMM_PREFIX = "1", PLOW_LT_RUNG_ALGOS = "true" }
 
 [bench]
 kind = "chat"

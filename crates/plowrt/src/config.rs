@@ -18,6 +18,74 @@
 use clap::Args;
 use std::sync::OnceLock;
 
+/// A secret: `Debug` never prints it, since the parsed config is logged at startup.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ApiKey(pub String);
+
+impl std::str::FromStr for ApiKey {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, String> {
+        let key = s.trim();
+        if key.is_empty() {
+            return Err("an API key must not be empty".into());
+        }
+        Ok(ApiKey(key.to_owned()))
+    }
+}
+
+impl std::fmt::Debug for ApiKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ApiKey(<redacted>)")
+    }
+}
+
+/// `--asr-packet NAME=PATH.pkt[,tokenizer=PATH][,backend=NAME]`: a packet ASR model (Nemotron
+/// RNNT, or a Qwen audio-LM packet) served by `plowrt serve` on its own cohort engine.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AsrPacket {
+    pub name: String,
+    pub packet: std::path::PathBuf,
+    /// The tokenizer (a GGUF for Nemotron); default `<packet dir>/checkpoint`.
+    pub tokenizer: std::path::PathBuf,
+    pub backend: String,
+}
+
+#[cfg(test)]
+#[test]
+fn asr_packet_specs_parse() {
+    let p: AsrPacket = "nemo=/m/nemo.pkt,tokenizer=/m/t.gguf".parse().unwrap();
+    assert_eq!((p.name.as_str(), p.packet.to_str(), p.tokenizer.to_str(), p.backend.as_str()),
+        ("nemo", Some("/m/nemo.pkt"), Some("/m/t.gguf"), "cuda"));
+    let p: AsrPacket = "q=/a/model.pkt,backend=cpu".parse().unwrap();
+    assert_eq!((p.tokenizer.to_str(), p.backend.as_str()), (Some("/a/checkpoint"), "cpu"));
+    for bad in ["", "nemo", "=/x.pkt", "n=", "n=/x.pkt,tok=/y", "n=/x.pkt,tokenizer="] {
+        assert!(bad.parse::<AsrPacket>().is_err(), "{bad}");
+    }
+}
+
+impl std::str::FromStr for AsrPacket {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, String> {
+        let usage = || format!("--asr-packet {s:?}: expected NAME=PATH.pkt[,tokenizer=PATH][,backend=NAME]");
+        let mut fields = s.trim().split(',');
+        let (name, packet) = fields.next().and_then(|f| f.split_once('=')).ok_or_else(usage)?;
+        if name.is_empty() || packet.is_empty() {
+            return Err(usage());
+        }
+        let packet = std::path::PathBuf::from(packet);
+        let mut tokenizer = packet.parent().unwrap_or(std::path::Path::new(".")).join("checkpoint");
+        let mut backend = "cuda".to_owned();
+        for field in fields {
+            match field.split_once('=') {
+                Some(("tokenizer", path)) if !path.is_empty() => tokenizer = path.into(),
+                Some(("backend", name)) if !name.is_empty() => backend = name.to_owned(),
+                _ => return Err(usage()),
+            }
+        }
+        Ok(AsrPacket { name: name.to_owned(), packet, tokenizer, backend })
+    }
+}
+
 /// Runtime configuration for the plow serving engine.
 ///
 /// Stored in a global `OnceLock` after CLI parse for hot-path access (single
@@ -97,12 +165,50 @@ pub struct RuntimeConfig {
     #[arg(long = "tts-first-lookahead", env = "PLOW_TTS_FIRST_LOOKAHEAD", default_value_t = 1, global = true)]
     pub tts_first_lookahead: usize,
 
+    /// Real-time admission of codec-LM speech (`tts::realtime`): a request starts only while the
+    /// decode step projected at one more request keeps every playing stream ahead of playback.
+    #[arg(long = "tts-realtime", env = "PLOW_TTS_REALTIME", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub tts_realtime: bool,
+
+    /// Longest a speech request waits for real-time admission before 429 + `Retry-After`.
+    #[arg(long = "tts-admit-wait-ms", env = "PLOW_TTS_ADMIT_WAIT_MS", default_value_t = 6000, global = true)]
+    pub tts_admit_wait_ms: u64,
+
     /// Share of a streaming ASR session's time its partial transcripts may keep the model busy:
     /// after a partial that took `t`, the session's appends answer the previous partial's text
     /// until `t * (1 / duty - 1)` has passed. Idle, partials take far less than the 1 s append
     /// cadence and all run; loaded, they stop crowding out finals. 1 = every append transcribes.
     #[arg(long = "asr-partial-duty", env = "PLOW_ASR_PARTIAL_DUTY", hide = true, default_value_t = 0.5, global = true)]
     pub asr_partial_duty: f64,
+
+    /// Total deadline (ms) for one transcription, from its admission to its answer: past it the
+    /// work is cancelled and the client gets 504 (HTTP) or a terminal error (WebSocket). 0 = none.
+    #[arg(long = "asr-request-timeout-ms", env = "PLOW_ASR_REQUEST_TIMEOUT_MS", default_value_t = 120_000, global = true)]
+    pub asr_request_timeout_ms: u64,
+
+    /// Upper bound (tokens) on an audio-LM request's context (`prompt`). The context is otherwise
+    /// sized per request to what the window leaves after the template, the audio and the output
+    /// reserve, trimmed from its oldest words. 0 = no bound beyond the window.
+    #[arg(long = "asr-context-max-tokens", env = "PLOW_ASR_CONTEXT_MAX_TOKENS", default_value_t = 0, global = true)]
+    pub asr_context_max_tokens: usize,
+
+    /// A `vad.silero.v1` packet (`asr_silero_vad_compile`), run on the CPU: it serves
+    /// `/v1/audio/vad`, answers uploads without speech with an empty transcript before any model
+    /// runs, and ends streaming turns in place of the energy endpointer. Unset = none of these.
+    #[arg(long = "asr-vad-packet", env = "PLOW_ASR_VAD_PACKET", global = true)]
+    pub asr_vad_packet: Option<std::path::PathBuf>,
+
+    /// API keys a request must present as `Authorization: Bearer <key>` or `x-api-key: <key>`.
+    /// Repeatable; the environment form is comma-separated. `/health` and `/healthz` stay open.
+    /// Unset = no authentication.
+    #[arg(long = "api-key", env = "PLOW_API_KEYS", value_delimiter = ',', hide_env_values = true, global = true)]
+    pub api_keys: Vec<ApiKey>,
+
+    /// Packet ASR models `plowrt serve` hosts beside its registry, each on its own cohort engine
+    /// and loaded before the VRAM planner sizes the rest: `NAME=PATH.pkt[,tokenizer=PATH]
+    /// [,backend=NAME]`. Repeatable; the environment form is `;`-separated.
+    #[arg(long = "asr-packet", env = "PLOW_ASR_PACKETS", value_delimiter = ';', global = true)]
+    pub asr_packets: Vec<AsrPacket>,
 
     /// Under `--co-sched deadline`, most streams one vocoder render launch takes (0 = the packet's
     /// largest capacity). A launch is one cooperative grid that holds the device to its end (1.4 s
@@ -304,6 +410,12 @@ pub struct RuntimeConfig {
     )]
     pub drain_timeout_ms: Option<u64>,
 
+    /// `plowrt serve`: exit non-zero (after a drain of at most 5 s) once an engine is dead from a
+    /// fatal device fault, so a supervisor restarts the process. Off: `/health` answers 503 and
+    /// the process stays up.
+    #[arg(long = "exit-on-engine-death", env = "PLOW_EXIT_ON_ENGINE_DEATH", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub exit_on_engine_death: bool,
+
     /// How long a request waits (ms) for another model switch to release the switch lock before
     /// it is shed with 503 + Retry-After. 0 = unbounded; unset = 600 000.
     #[arg(long = "switch-timeout-ms", env = "PLOW_SWITCH_TIMEOUT_MS", global = true)]
@@ -351,6 +463,30 @@ pub struct RuntimeConfig {
     /// model under `--place explicit`; an override elsewhere.
     #[arg(long = "pin", env = "PLOW_PIN", value_delimiter = ',', global = true)]
     pub pin: Vec<String>,
+
+    /// Data-parallel ranks per model on one serve (CUDA, TP1 bundles): `--dp 8`, `--dp all`
+    /// (one per device group), or per model `--dp gemma=4,asr=2`. Each rank is a full copy on its
+    /// own device group; requests route by session, prefix cache and load. Unset = 1.
+    #[arg(long = "dp", env = "PLOW_DP", value_delimiter = ',', global = true)]
+    pub dp: Vec<String>,
+
+    /// DP routing: send a prompt to the rank whose prefix cache already holds it.
+    #[arg(long = "route-prefix", env = "PLOW_ROUTE_PREFIX", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub route_prefix: bool,
+
+    /// DP routing: queued requests past which a session or prefix match stops pinning a rank.
+    /// Unset = max(4, slots / 4).
+    #[arg(long = "route-spill", env = "PLOW_ROUTE_SPILL", global = true)]
+    pub route_spill: Option<u32>,
+
+    /// DP routing: load a prefix match may carry over the least-loaded rank, as a multiple of
+    /// the fraction of the prompt it saves.
+    #[arg(long = "route-prefix-slack", env = "PLOW_ROUTE_PREFIX_SLACK", default_value_t = 0.5, value_parser = clap::value_parser!(f64), global = true)]
+    pub route_prefix_slack: f64,
+
+    /// Pin each DP rank's dispatcher thread to the CPU socket of its GPU.
+    #[arg(long = "dp-numa-pin", env = "PLOW_DP_NUMA_PIN", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub dp_numa_pin: bool,
 
     /// Expert: how co-resident models take a shared GPU: `free` (private streams), `rr`
     /// (round-robin turns) or `deadline` (turns by urgency, see `serve::cosched`). Unset =
@@ -797,6 +933,12 @@ pub struct NvidiaRuntimeConfig {
     #[arg(long = "vmm-live-rings", env = "PLOW_VMM_LIVE_RINGS", value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub vmm_live_rings: Option<bool>,
 
+    /// `--vmm-live-rings=true` for these served names only (`<name>[,...]`), over
+    /// `--vmm-live-rings`: a co-served packet with a VMM prefix layout allocates its sliding
+    /// rings per live slot while the others keep theirs.
+    #[arg(long = "vmm-live-rings-models", env = "PLOW_VMM_LIVE_RINGS_MODELS", global = true)]
+    pub vmm_live_rings_models: Option<String>,
+
     /// Track NV dense decode KV-split count from the LIVE `kv_len` instead of
     /// the `max_ctx` the emitter baked it from (NVIDIA twin of `PLOW_MLA_NS_LIVE`).
     #[arg(long = "nv-ns-live", env = "PLOW_NV_NS_LIVE", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
@@ -853,6 +995,11 @@ pub struct NvidiaRuntimeConfig {
     /// Cap the ModelManager VRAM budget (MiB).
     #[arg(long = "vram-budget-mib", env = "PLOW_VRAM_BUDGET_MIB", global = true)]
     pub vram_budget_mib: Option<u64>,
+
+    /// Keep every registered model resident: startup fails unless all of them fit, and no
+    /// model is ever evicted (no S1 switch, no eviction for another model's KV growth).
+    #[arg(long = "pin-resident", env = "PLOW_PIN_RESIDENT", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub pin_resident: bool,
 
     /// Per-decode-step host-op timing.
     #[arg(long = "step-time", env = "PLOW_STEP_TIME", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
@@ -1696,6 +1843,14 @@ pub struct AmdRuntimeConfig {
 /// Global runtime config, initialized once at startup from CLI parse.
 static RUNTIME_CONFIG: OnceLock<RuntimeConfig> = OnceLock::new();
 
+/// The OpenAI model id a bundle is served under (`weights.json` `served_name`), which the
+/// per-model knobs (`--live-ctx-models`, `--vmm-live-rings-models`) key on.
+fn served_name(assets_dir: &std::path::Path) -> Option<String> {
+    let bytes = std::fs::read(assets_dir.join("weights.json")).ok()?;
+    let v: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    Some(v.get("served_name")?.as_str()?.to_owned())
+}
+
 fn select_compat<T>(parsed: T, environment: Option<T>, allow_environment: bool) -> T {
     if allow_environment {
         environment.unwrap_or(parsed)
@@ -1750,7 +1905,15 @@ impl RuntimeConfig {
         full_cache: bool,
         prefix: bool,
     ) -> bool {
-        self.nv_vmm_live() || (packed_prefill && full_cache && !prefix)
+        !prefix && (self.nv_vmm_live() || (packed_prefill && full_cache))
+    }
+
+    /// The prefix cache exists only where the packet has a VMM prefix layout (also under
+    /// `PLOW_VMM_LIVE=1`). Without one, `PLOW_VMM_PREFIX=1` builds no cache, so it must not cost
+    /// live KV or packed prefill (audio/voice overlay packets, heads below one granule).
+    #[cfg(feature = "cuda")]
+    pub(crate) fn nv_prefix_requested(&self, layout: bool) -> bool {
+        layout
     }
 
     #[cfg(feature = "cuda")]
@@ -1760,6 +1923,21 @@ impl RuntimeConfig {
             Self::env_bool("PLOW_VMM_LIVE_RINGS").map(Some),
             !Self::is_initialized(),
         )
+    }
+
+    /// [`Self::nv_vmm_live_rings`] for the packet in `assets_dir`: `Some(true)` when its served
+    /// name is listed in `--vmm-live-rings-models`.
+    #[cfg(feature = "cuda")]
+    pub(crate) fn nv_vmm_live_rings_for(&self, assets_dir: &std::path::Path) -> Option<bool> {
+        let spec = self.nv.vmm_live_rings_models.clone().or_else(|| Self::env_nonempty("PLOW_VMM_LIVE_RINGS_MODELS"));
+        let listed = spec.is_some_and(|spec| {
+            served_name(assets_dir).is_some_and(|slug| spec.split(',').any(|m| m.trim() == slug))
+        });
+        if listed {
+            Some(true)
+        } else {
+            self.nv_vmm_live_rings()
+        }
     }
 
     #[cfg(feature = "cuda")]
@@ -1782,9 +1960,7 @@ impl RuntimeConfig {
     pub fn live_ctx_for(&self, assets_dir: &std::path::Path) -> Option<u32> {
         let spec = self.amd.live_ctx_models.clone().or_else(|| Self::env_nonempty("PLOW_LIVE_CTX_MODELS"));
         let per_model = spec.and_then(|spec| {
-            let bytes = std::fs::read(assets_dir.join("weights.json")).ok()?;
-            let v: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
-            let slug = v.get("served_name")?.as_str()?.to_owned();
+            let slug = served_name(assets_dir)?;
             spec.split(',').find_map(|kv| {
                 let (k, n) = kv.split_once('=')?;
                 (k.trim() == slug).then(|| n.trim().parse().ok()).flatten()
@@ -2125,9 +2301,18 @@ pub fn serve_replay(m: &clap::ArgMatches) -> std::collections::BTreeMap<String, 
                     .join(",")
             })
             .unwrap_or_default();
+        let val = if is_secret_env(&env) { "<redacted>".into() } else { val };
         out.insert(env, val);
     }
     out
+}
+
+/// An environment variable whose value must never reach a log (`PLOW_API_KEYS`, tokens, ...).
+pub fn is_secret_env(name: &str) -> bool {
+    // Suffix tests for KEY/TOKEN: `PLOW_TOKEN_BATCH` and friends are knobs, not credentials.
+    let upper = name.to_ascii_uppercase();
+    ["API_KEY", "SECRET", "PASSWORD", "CREDENTIAL"].iter().any(|needle| upper.contains(needle))
+        || ["_KEY", "_KEYS", "_TOKEN", "_TOKENS"].iter().any(|suffix| upper.ends_with(suffix))
 }
 
 #[cfg(test)]
@@ -2538,6 +2723,59 @@ mod tests {
             super::NvidiaRuntimeConfig::from_arg_matches(&matches).unwrap().vmm_live_rings,
             Some(false)
         );
+    }
+
+    /// The startup replay line goes to the journal: API keys must not.
+    #[test]
+    fn serve_replay_redacts_secrets() {
+        use clap::Args;
+        let command = super::RuntimeConfig::augment_args(clap::Command::new("plowrt"));
+        let matches = command
+            .try_get_matches_from(["plowrt", "--api-key", "sk-live-123", "--session-ttl-ms", "5000"])
+            .unwrap();
+        let replay = super::serve_replay(&matches);
+        assert_eq!(replay.get("PLOW_API_KEYS").map(String::as_str), Some("<redacted>"));
+        assert_eq!(replay.get("PLOW_SESSION_TTL_MS").map(String::as_str), Some("5000"));
+        assert!(!format!("{replay:?}").contains("sk-live-123"));
+        let exit = super::RuntimeConfig::augment_args(clap::Command::new("plowrt"));
+        use clap::FromArgMatches;
+        let parse = |args: &[&str]| super::RuntimeConfig::from_arg_matches(&exit.clone().try_get_matches_from(args).unwrap()).unwrap();
+        assert!(!parse(&["plowrt"]).exit_on_engine_death);
+        assert!(parse(&["plowrt", "--exit-on-engine-death"]).exit_on_engine_death);
+        for secret in ["PLOW_API_KEYS", "HF_TOKEN", "AWS_SECRET_ACCESS_KEY", "DB_PASSWORD", "X_KEY"] {
+            assert!(super::is_secret_env(secret), "{secret}");
+        }
+        for knob in ["PLOW_TOKEN_BATCH", "PLOW_SESSION_TTL_MS", "PLOW_KV_POOL_MIB"] {
+            assert!(!super::is_secret_env(knob), "{knob}");
+        }
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn per_model_live_rings_and_pinned_residency() {
+        use clap::Parser;
+        #[derive(Parser)]
+        struct Cli {
+            #[command(flatten)]
+            cfg: super::RuntimeConfig,
+        }
+        let root = std::env::temp_dir().join(format!("plow-live-rings-models-{}", std::process::id()));
+        let (llm, tts) = (root.join("llm"), root.join("tts"));
+        for (dir, name) in [(&llm, "gemma-4-e4b"), (&tts, "chatterbox-mtl")] {
+            std::fs::create_dir_all(dir).unwrap();
+            std::fs::write(dir.join("weights.json"), format!(r#"{{"served_name": "{name}"}}"#)).unwrap();
+        }
+        let cfg = Cli::parse_from(["plowrt", "--vmm-live-rings-models", "qwen3-asr, gemma-4-e4b", "--vmm-live-rings=false"]).cfg;
+        assert_eq!(cfg.nv_vmm_live_rings_for(&llm), Some(true));
+        assert_eq!(cfg.nv_vmm_live_rings_for(&tts), Some(false), "an unlisted model keeps the global setting");
+        assert_eq!(cfg.nv_vmm_live_rings_for(&root.join("missing")), Some(false));
+        assert!(!cfg.nv.pin_resident);
+        let cfg = Cli::parse_from(["plowrt", "--pin-resident", "--live-ctx-models", "chatterbox-mtl=512"]).cfg;
+        assert!(cfg.nv.pin_resident);
+        assert_eq!(cfg.nv.vmm_live_rings_models, None);
+        assert_eq!(cfg.live_ctx_for(&tts), Some(512));
+        assert_eq!(cfg.live_ctx_for(&llm), cfg.live_ctx());
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]

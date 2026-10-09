@@ -325,6 +325,13 @@ pub fn escape_label(value: &str) -> String {
         .replace('\n', "\\n")
 }
 
+/// `model_name="…",engine="…"` for a model's metrics: a DP rank (`slug#r`) reports its model
+/// and rank, anything else engine 0.
+pub fn model_labels(key: &str) -> String {
+    let (model, engine) = crate::serve::dp::split_key(key).unwrap_or((key, 0));
+    format!("model_name=\"{}\",engine=\"{engine}\"", escape_label(model))
+}
+
 pub fn family(out: &mut String, name: &str, kind: &str, help: &str) {
     let _ = writeln!(out, "# HELP {name} {help}\n# TYPE {name} {kind}");
 }
@@ -338,7 +345,7 @@ impl ServingMetrics {
     pub fn write(out: &mut String, models: &[(String, Arc<Metrics>, bool)]) {
         let labels: Vec<String> = models
             .iter()
-            .map(|(slug, _, _)| format!("model_name=\"{}\",engine=\"0\"", escape_label(slug)))
+            .map(|(slug, _, _)| model_labels(slug))
             .collect();
         macro_rules! scalar {
             ($name:expr, $kind:expr, $help:expr, $value:expr) => {{

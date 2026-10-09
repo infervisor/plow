@@ -81,47 +81,136 @@ curl --fail http://127.0.0.1:8080/v1/audio/transcriptions \
   -F model=decode -F file=@speech.wav -F language=en
 ```
 
-The server binds loopback and admits a bounded queue of HTTP requests or WebSocket
-sessions. Its model-owning worker forms cohorts up to the packet's batch capacity;
-a full queue returns 429. Omit `--websocket` to disable the streaming route. The
-request model is the packet pipeline name (`decode` for this Qwen asset and
-`transcribe` for Nemotron). This uses the `asr` command; the generic text `serve`
-registry is unchanged.
+Two servers expose the same transcription API:
+
+- `plowrt asr --port` serves one packet (Qwen or Nemotron RNNT) on a private cohort engine.
+  It binds loopback unless `--bind` names an interface, and `--socket <path>` adds a Unix
+  socket (mode 0600) serving the same routes. Its model-owning worker forms cohorts up to the
+  packet's batch capacity. The request model is the packet pipeline name (`decode` for Qwen,
+  `transcribe` for Nemotron) or `--served-model-name`.
+- `plowrt serve --assets` serves every audio-LM bundle (Qwen3-ASR) next to text and speech
+  models, the decoder on the model's continuous-batching mux; `/v1/models` lists
+  `audio/transcriptions` and `audio/transcriptions/stream` for them. Sessions
+  (`X-Session-Id`, `append`/`final`/`offset`) and windowed partials are serve-only
+  (`docs/runtime/sessions.md`).
+- `plowrt serve --asr-packet NAME=PATH.pkt[,tokenizer=PATH][,backend=NAME]` (repeatable;
+  `PLOW_ASR_PACKETS` is `;`-separated) also hosts packet ASR models such as Nemotron RNNT, each
+  on its own cohort engine (as `plowrt asr` runs it) under `NAME`. They load on device 0 before
+  the VRAM planner places the registry models, whose capacity drops by the memory they took.
+  They share the server's routes, auth, `/v1/models` (an audio-only card), per-model
+  `/metrics`, `/health` (503 if the engine worker exits), shutdown drain and request deadline.
+  The tokenizer defaults to `<packet dir>/checkpoint`; Nemotron needs its GGUF.
+
+One process serving Qwen3-ASR 1.7B and 0.6B and Nemotron 3.5 on one 24 GB L4 (18.3 GiB):
+
+```sh
+plowrt serve --assets qwen3-asr-1.7b/assets --assets qwen3-asr-0.6b/assets \
+  --asr-packet "nemotron-3.5-asr=nemo/nemotron.pkt,tokenizer=nemotron-3.5-asr-streaming-0.6b.q8_0.gguf" \
+  --api-key "$KEY" --port 8080
+```
+
+Routes: `POST /v1/audio/transcriptions`, `GET /v1/audio/transcriptions/stream` (WebSocket;
+`plowrt asr` needs `--websocket`), `GET /health`, `/metrics`, `/v1/metrics`, `/v1/models`.
 
 Multipart fields: required `file` and `model`; optional `language`, `prompt`,
-`response_format=json|text`, `temperature=0`. Unknown/duplicate fields and unsupported
-generation options fail. The body limit is 4 MiB. Malformed audio returns 400,
-unsupported sample rate/format 415, excessive duration 413, unknown model 404, and
-engine failures 500. `GET /health` reports readiness after model loading.
-Uploads have a 30-second deadline. Successful inference logs frontend, encoder,
-prefill, decode and total time, token count, audio duration and real-time factor.
-CLI transcript JSON is written to stdout; diagnostics go to stderr.
+`response_format=json|text`, `temperature=0`, `stream=true` (OpenAI server-sent events:
+`transcript.text.delta` as the decoder produces text, then `transcript.text.done`; RNNT models
+emit a delta per token after their encoder pass; a cohort engine without token streaming, such as
+Qwen on `plowrt asr`, sends the whole text as one delta). Unknown/duplicate fields and unsupported
+generation options fail. The body limit is 4 MiB. Audio is WAV, mono or stereo (averaged),
+integer 8/16/24/32-bit or 32-bit float, at 8 to 48 kHz; other rates are resampled to 16 kHz
+(windowed sinc). Appended session pieces must be 16 kHz. Audio is 0.5 to 30 seconds.
+
+| Status | Meaning |
+|---|---|
+| 400 | malformed audio or request, unknown field, unsupported option |
+| 401 | API keys are configured and the request has no valid key |
+| 404 | unknown model |
+| 408 | the upload did not arrive within 30 s |
+| 413 | more than 30 s of audio |
+| 415 | unsupported sample rate or WAV format |
+| 429 | queue, upload or session capacity full, or overload; `Retry-After: 1` |
+| 500 | engine failure |
+| 503 | shutting down, engine worker gone, or model dispatcher unavailable |
+| 504 | the transcription missed `--asr-request-timeout-ms` (120 s; the work is cancelled) |
+
+API keys: `--api-key <key>` (repeatable) or `PLOW_API_KEYS=k1,k2` on either server makes every
+route except `/health` and `/healthz` require `Authorization: Bearer <key>` or
+`x-api-key: <key>`, on TCP and on the Unix socket. A non-loopback bind without keys logs a
+warning at startup. There is no TLS: put a TLS-terminating proxy in front of a public bind.
+
+`GET /health` answers 503 while shutting down, after the `plowrt asr` engine worker exits, and
+(on serve) when a model's ASR encoder thread has exited. SIGTERM/SIGINT stops admission (503),
+ends WebSocket sessions still receiving audio with a terminal `error` and close code 1001, lets
+submitted transcriptions answer within `PLOW_DRAIN_TIMEOUT_MS` (30 s), then exits 0. Both
+servers apply `PLOW_HTTP_HEADER_TIMEOUT_MS` and `PLOW_HTTP_MAX_CONNECTIONS`. Successful
+inference logs frontend, encoder, prefill, decode and total time. CLI transcript JSON is
+written to stdout; diagnostics go to stderr.
 
 ## WebSocket protocol v1
 
-Connect to `ws://127.0.0.1:8080/v1/audio/transcriptions/stream` and send:
+Connect to `ws://127.0.0.1:8080/v1/audio/transcriptions/stream` (with the API key header when
+keys are configured) and send:
 
 ```json
 {"type":"start","version":1,"model":"decode","sample_rate":16000,"format":"pcm_s16le"}
 ```
 
-Optional start fields are `language` and `prompt`. The server's `ready` event contains
-a session ID, audio limits, `credit_samples`, and `partial_mode=final_only`.
+`sample_rate` is one of 8000, 16000, 22050, 24000, 32000, 44100 or 48000; the stream is
+resampled to 16 kHz as it arrives. Optional start fields: `language`, `prompt`,
+`partials` (revisable `partial` events while audio arrives) and `deltas` (the final
+transcript's text as `delta` events before `final`). Every new field is optional, so version 1
+clients are unaffected. The `ready` event carries `session_id`, `request_id`, `sample_rate`,
+`max_chunk_bytes`, `credit_samples`, `max_audio_samples` (both in the client's rate),
+`partial_mode` (`revision` with partials, else `final_only`) and `deltas`.
 
 - Each binary message: little-endian `u64` sequence number, starting at zero, then
   mono little-endian signed 16-bit PCM. Maximum PCM payload: 32,000 bytes.
 - Credit counts PCM samples, excluding the eight-byte sequence header. Send no more
-  than the outstanding grant. `credit` events add further credit after processing.
-- Send `{"type":"finish"}` once after the last samples.
-  One `final` event contains the complete transcript. Its stable prefix covers all
-  UTF-8 bytes of the final text.
-- `{"type":"cancel"}` or disconnection cancels the session. Terminal `error` events
-  end unsuccessful sessions. One utterance per connection, maximum 30 seconds.
+  than the outstanding grant; `credit` events grant up to one second of audio at a time.
+- `partial {revision, text, language, stable_prefix_bytes}` events arrive about once per second
+  of new audio when requested, at most one in flight. A Qwen partial on `plowrt serve` encodes
+  only the open encoder window and resumes the session's decoder rows. An RNNT packet with an
+  encoder stream (Nemotron, see "L4") continues its cache-aware stream: each partial encodes only
+  the new audio and its text trails the audio by the attention lookahead. Other `plowrt asr`
+  engines re-transcribe the whole buffer. Finals always run the offline pass.
+- Send `{"type":"finish"}` once after the last samples. With `deltas`, `delta {text}` events
+  stream the transcript as it decodes (RNNT: per token; Qwen on `plowrt asr`: one delta), then one
+  `final {revision, text, language, stable_prefix_bytes, turn_id, traceparent, server_timing}`.
+- `{"type":"cancel"}` or disconnection cancels the session. Terminal
+  `error {message, terminal: true, code?}` events end unsuccessful sessions; `code` is
+  `overloaded`, `unavailable` or `timeout` (the final missed `--asr-request-timeout-ms`) when
+  it applies. In utterance mode: one utterance per connection, maximum 30 seconds (see continuous mode).
+- The server pings every 15 s and closes a connection whose peer has not answered for 45 s.
+  30 s without audio or a control message ends the session; a stalled send times out after 30 s.
+- On shutdown a session still receiving audio gets `error {message: "server shutting down"}` and
+  close code 1001; a session whose final is already decoding receives it.
 
-The server accumulates streamed PCM and decodes once at finalization. Partial
-transcripts require reusable encoder and decoder state; replaying the full model on
-each chunk is intentionally excluded. Credit keeps memory bounded. Idle input and
-blocked output have 30-second deadlines.
+### Continuous mode
+
+`"mode":"continuous"` in `start` (default `"utterance"`, the behaviour above) streams unbounded
+audio on one connection. An energy endpointer on the 16 kHz stream (20 ms frames; the noise
+floor is the quietest frame of the last 3 s, so stationary noise is not speech; speech is
+12 dB above it and above -54 dBFS for at least 100 ms) cuts it into segments, keeping 200 ms of
+context on each side. Optional start fields:
+
+- `min_silence_ms` (200..=2000, default 600): silence that ends a segment.
+- `max_segment_ms` (4000 up to the model's audio limit less its final padding; default 25000
+  or that limit): a longer segment is cut at its quietest frame of the last 3 s, and the next
+  segment starts there.
+
+`ready` echoes `mode`, `min_silence_ms` and `max_segment_ms`; `max_audio_samples` is null.
+Each segment is transcribed as an utterance while audio keeps arriving. Events carry
+`segment` (from 0): `partial {segment, revision, ...}` for the open segment (when
+`partials`), `delta {segment, text}` (when `deltas`), and one
+`final {segment, start_ms, end_ms, text, language, stable_prefix_bytes, turn_id, traceparent,
+server_timing}` per segment, in segment order. Offsets are stream milliseconds. A segment that
+misses `--asr-request-timeout-ms` (per segment) or fails gets a non-terminal
+`error {segment, message, code?, terminal: false}` and the session continues. At most two
+segments await their results; past that the server withholds credit until one answers. Only the
+open segment is buffered. After `{"type":"finish"}` the open segment is closed and transcribed,
+then `{"type":"done","segments":N}` arrives and the server closes normally (1000). Audio with
+no speech yields no segment.
 
 An adapter may reserve part of the advertised audio limit for finalization input.
 Qwen currently appends one second of deterministic low-level audio to close clipped
@@ -134,6 +223,71 @@ nix develop -c cargo run -p plowrt --example asr_stream -- \
   ws://127.0.0.1:8080/v1/audio/transcriptions/stream \
   decode speech.wav
 ```
+
+## Realtime (OpenAI-compatible)
+
+`GET /v1/realtime?intent=transcription[&model=NAME]` speaks OpenAI's Realtime transcription-session
+protocol, so its clients (the `openai` SDK's `client.realtime.connect`, browser code) connect
+unchanged. It is served wherever the WebSocket route is (`plowrt serve`; `plowrt asr --websocket`).
+Auth: the usual key headers, or the browser subprotocol `openai-insecure-api-key.<key>` beside
+`realtime` (the server selects `realtime`).
+
+- On connect: `transcription_session.created`. Client `transcription_session.update` (or the GA
+  `session.update` with a `type: "transcription"` session under `audio.input`) sets
+  `input_audio_format` (`pcm16` at 24 kHz, `g711_ulaw`, `g711_alaw` at 8 kHz; resampled to
+  16 kHz), `input_audio_transcription` {`model`, `language`, `prompt`} and `turn_detection`;
+  answered by `transcription_session.updated` (`session.updated`). An unknown model fails the
+  update (`model_not_found`). Audio needs a model, from `?model=` or the update.
+- `input_audio_buffer.append` {`audio`: base64}. With `turn_detection: {type: "server_vad"}` (the
+  default; `silence_duration_ms` 200..=2000, default 500) the continuous-mode endpointer cuts
+  turns: `input_audio_buffer.speech_started` {`audio_start_ms`, `item_id`},
+  `.speech_stopped` {`audio_end_ms`, `item_id`}, `.committed` {`item_id`, `previous_item_id`}.
+  `threshold` (0..=1) is the Silero speech probability when a VAD packet is loaded (see
+  [Voice activity](#voice-activity-silero-vad)), else fixed (12 dB over the noise floor);
+  `prefix_padding_ms` is echoed but fixed (200 ms of context). With `turn_detection: null` audio accumulates (at most 30 s) until
+  `input_audio_buffer.commit` (at least 100 ms, else `input_audio_buffer_commit_empty`);
+  `input_audio_buffer.clear` drops it (`.cleared`). A commit under VAD closes the open turn.
+- Each committed item streams `conversation.item.input_audio_transcription.delta`
+  {`item_id`, `content_index`: 0, `delta`} then one `.completed` {`transcript`}, in commit
+  order; `.failed` {`error`} on a deadline (`timeout`) or a full queue (`rate_limit_exceeded`).
+  Every server event has `event_id`; `error` events carry `{type, code, message, param,
+  event_id}` (the client's `event_id`).
+- Limits: 1 MiB per event, two turns transcribing and 16 waiting (past it: `rate_limit_exceeded`
+  and close 1001), 120 s without client events or pending work closes the session, pings as on
+  the native stream, shutdown sends `error` (`unavailable`) and close 1001. Not implemented:
+  responses/conversation events, `semantic_vad`, noise reduction, `include` (logprobs), usage.
+
+## Voice activity (Silero VAD)
+
+`--asr-vad-packet PATH` (`PLOW_ASR_VAD_PACKET`) loads a `vad.silero.v1` packet built by
+`scripts/asr/silero_vad_build.sh`: Silero VAD v5 (16 kHz) lowered by `devgen::vad` into two
+LSTM-state-bank programs of generic ops (`Conv1dF32` STFT with reflect pad, magnitude via
+`BinaryF32`/`CopyColsF32`/`UnaryF32` sqrt, four ReLU convolutions, `DenseGemmF32` +
+`LstmCellF32`, sigmoid decoder). It runs on the CPU in `asr::vad`: a Rust interpreter of those
+programs over a per-stream arena, weights shared, any number of streams on any threads. Per
+32 ms frame: 66 us on one EPYC 7R13 core (AVX2/FMA chosen at runtime); probabilities match the
+PyTorch model to 6e-7. A configured packet that does not load fails startup.
+
+- `POST /v1/audio/vad` (multipart `file`: WAV, 8-48 kHz, up to 10 minutes; optional `threshold`,
+  `min_speech_duration_ms`, `min_silence_duration_ms`, `speech_pad_ms`, `max_speech_duration_s`
+  with Silero's `get_speech_timestamps` defaults) answers
+  `{"duration", "speech_duration", "segments": [{"start", "end"}]}` in seconds. 404 without a
+  packet.
+- Uploads (`/v1/audio/transcriptions`, not `append`/`final` pieces) with under 250 ms of
+  detected speech are answered with an empty transcript before any model runs: an audio-LM
+  otherwise transcribes noise or echoes its prompt.
+- Continuous WebSocket sessions and Realtime `server_vad` end turns on Silero speech (hysteresis
+  `threshold` / `threshold - 0.15`) instead of the energy endpointer; turn timing
+  (`min_silence_ms` / `silence_duration_ms`, 200 ms context, overlong cuts at the least-speech
+  frame) is unchanged.
+
+H100 serving host (`recipes/infervisor/silero-vad/sm90a-h100-tp1.toml`; the packet is
+device-agnostic and runs beside any ASR bundle): on one EPYC 7R13 core 70 us per stream-frame,
+so 256 live streams cost 17.7 ms of each 32 ms tick on one core (3.7 ms on 8 threads). Gate
+`vad_parity` (`campaign.py gate`, `scripts/asr/silero_vad_parity.py`): 79 clips (73 LibriSpeech,
+pauses of silence and noise, silence, white noise, hum), 17,321 frames, max |dp| 2.0e-6 against
+the TorchScript model, decisions at 0.5 agree on every frame. `scripts/asr/realtime_vad_smoke.py`
+drives the Realtime `server_vad` path end to end.
 
 ## Reference checks
 
@@ -408,3 +562,87 @@ These made no gain at B=1:
 - segment class slicing
 - folding each AddNorm into its consuming GEMV (−17 µs at B=1; the per-block norm staging costs
   about as much as the phases it removes, and removing AddNorm outright only bounds the gain at 165 µs)
+
+## L4 (Ada, sm_89)
+
+The L40S runs the same objects; its recipes and measurements are in `docs/runtime/l40s-recipes.md`.
+
+The L4 runs the sm_120 warp32 interpreter built for sm_89 (`interp_sm89*.cubin`: mma.sync and
+cp.async, no wgmma/TMA). Qwen decoder prefill projections go through cuBLASLt (BF16); encoders,
+RNNT and decode stay on the interpreter. sm_89 allows 99 KiB of shared memory per block, so the
+speech arena is 96 KiB there and the hd128 `AttentionF32` arm traps (no supported model uses it).
+
+```sh
+# Qwen3-ASR (1.7B; the 0.6B recipe is recipes/infervisor/qwen3-asr-0.6b/sm89-l4-tp1.toml)
+python3 scripts/campaign/campaign.py build recipes/infervisor/qwen3-asr/sm89-l4-tp1.toml \
+  --hf-dir models/Qwen3-ASR-1.7B --out <dir>
+plowrt serve --assets <dir>/assets [--assets <0.6B dir>/assets]
+
+# Nemotron 3.5: packet for 58 SMs (with its cache-aware encoder stream, STREAM_ROWS defaults to
+# one attention chunk), plus a speech object carrying its ops (163..178, CopyColsF32 196)
+asr_nemotron_pipeline_compile model.q8_0.gguf 200,400,...,3000 <dir>/nemotron.pkt 16 58
+cmake -S runtime -B <build> -DPLOW_CUBIN_NVCC=$(command -v nvcc) -DPLOW_SM89_CUBIN=ON -DPLOW_CUBIN_SPEECH=ON -DPLOW_CUBIN_ARCH=sm_89 \
+  -DPLOW_CUBIN_GEMMA=OFF "-DPLOW_EXTRA_DEFINES=-DPLOW_SPEECH_OPS=0x20000ffffull"
+cmake --build <build> --target nv_cubins   # copy <build>/cubin/interp_sm89_speech.cubin beside nemotron.pkt
+plowrt asr --packet <dir>/nemotron.pkt --tokenizer model.q8_0.gguf --backend cuda --port 8080
+```
+
+An unspecialized speech object (all 42 arms) spends over 40 minutes in ptxas; specialize it.
+
+Production recipes: `recipes/infervisor/{qwen3-asr,qwen3-asr-0.6b,nemotron-3.5-asr}/sm89-l4-tp1.toml`.
+`scripts/asr/nvidia/nemotron_l4_build.sh` builds the Nemotron one; `scripts/asr/nvidia/l4_asr_deploy.sh`
+installs all three into `/opt/plow-asr` and (re)starts `plow-asr.service` (`scripts/asr/nvidia/plow-asr.service`).
+
+The L4 recipes compile `max_ctx` 1024 (KV 3.5 GiB at 32 slots) and cap packed encoder buckets at
+64 chunks (`PLOW_ASR_PACKED_MAX_CHUNKS`; the 192-chunk default holds ~5.7 GB of encoder
+activations). With both, all three models share one 23 GiB L4: 18.5 GiB loaded, 18.7 GiB peak.
+
+73-clip LibriSpeech dummy set (`scripts/asr/nvidia/served_bench.py`), each model alone, 2026-10-06:
+
+| model | conc | WER | p50 | p90 | RTFx |
+|---|---|---|---|---|---|
+| Qwen3-ASR-1.7B | 1 / 16 | 3.826% | 324 / 1519 ms | 593 / 2332 ms | 17.8 / 60.5 |
+| Qwen3-ASR-0.6B | 1 / 16 | 4.261% | 134 / 654 ms | 246 / 1014 ms | 42.9 / 140.5 |
+| Nemotron 3.5 (Q8_0) | 1 / 4 | 5.13% | 127 / 537 ms | 191 / 688 ms | 47.1 / 48.0 |
+
+All three at once (Qwen c16 + c16, Nemotron c4): WER unchanged; RTFx 27.1 / 27.5 / 20.0.
+Qwen 1.7B decode is 14.2 ms/token at B=1, against an 11.5 ms floor for 3.44 GB of BF16 weights
+at the 300 GB/s datasheet bandwidth. `plowrt asr` decodes one RNNT utterance at a time and
+queues four; more concurrent requests get 429.
+
+`nemotron-speech-streaming-en-0.6b` does not compile: its attention window (71 keys) exceeds
+the 64-key chunk-limited `RelativeAttentionF32` limit.
+
+### Parakeet TDT
+
+`parakeet-tdt-0.6b-v3` (25 European languages, detected, no prompt) compiles from its GGUF with
+`scripts/asr/nvidia/parakeet_build.sh` into the same `rnnt.greedy.v1` packet shape:
+
+- Full-context relative attention (`left_chunks = u32::MAX`, up to 4096 frames) on the
+  row-parallel kernel, one block per (row, head). The host writes the bucket's valid frame count
+  (`encoder.valid_rows`), which masks attention keys and is the centred convolution's length.
+- Centred depthwise convolution: the batch norm is folded into the weights and a bias at compile
+  time, then one `Conv1dF32` with SiLU fused (speech object mask `0x60000ffffull`).
+- TDT joint: the projection's last 5 columns are duration logits, split from the token logits
+  with `CopyColsF32` and argmaxed separately (`joint.duration_ids`, `tdt.duration.*`). The host loop
+  is NeMo's greedy TDT: blanks jump by their duration inside one joint evaluation.
+
+Served from a side `plowrt asr` on the 224 Lava upload segments (80 min, 16 kHz telephony): English
+WER 15.44% against the NeMo reference's 15.75% (Whisper normalizer, full-precision `.nemo`; the
+Q8_0 GGUF accounts for the 3% word differences), no output on the 7 non-speech calls, RTFx 50
+with one request at a time on the L4.
+
+### Cache-aware Nemotron stream
+
+Nemotron's encoder is causal (factor-8 causal subsampling, chunk-limited attention with 56 left
+frames and one 4-frame chunk of lookahead, causal depthwise convolution), so the packet carries a
+streaming variant (`stream.*` pipeline roles, `conformer::append_stream_step`): each step encodes
+one chunk (320 ms of audio) from the last 16 + 32 mel frames, with per-layer key/value caches of
+the left context and convolution caches of 8 rows, and the greedy RNNT loop continues across
+steps. A step computes every row in the offline order, so on the 6 checked LibriSpeech clips the
+stream's text equals the offline transcript word for word (`asr_stream_check`). A step costs
+~21.6 ms of GPU time (0.07x real time per stream); text first appears after 1.28 s of audio.
+Sessions keep their caches in per-session device copies (`PacketRuntime::create_tensor`),
+swapped per step, so concurrent streams share one packet. The 4-row FFN GEMVs dominate a step and
+still run well under the weight bandwidth (unaligned Q8_0 blocks); vectorizing them is the next
+gain.

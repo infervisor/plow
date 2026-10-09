@@ -58,6 +58,8 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4", features = ["derive", "env"] }
 futures = "0.3"
+# OpenAI Realtime transcription events carry base64 audio (already in the lockfile).
+base64 = "0.22"
 hound = "3.5"
 rustfft = "6"
 # Ids the server mints (request, session, turn; `serve::session`): sortable 64-bit, tagged; W3C
@@ -201,6 +203,10 @@ name = "asr_packet_dataset"
 path = "examples/asr/packet_dataset.rs"
 
 [[example]]
+name = "asr_stream_check"
+path = "examples/asr/stream_check.rs"
+
+[[example]]
 name = "asr_batch_check"
 path = "examples/asr/batch_check.rs"
 
@@ -223,6 +229,10 @@ path = "examples/packet_run.rs"
 [[example]]
 name = "asr_stream"
 path = "examples/asr/stream.rs"
+
+[[example]]
+name = "asr_vad_check"
+path = "examples/asr/vad_check.rs"
 
 [[example]]
 name = "asr_decoder_trace"
@@ -325,6 +335,15 @@ required-features = ["gguf"]
 name = "asr_nemotron_pipeline_compile"
 path = "examples/asr/nemotron_pipeline_compile.rs"
 required-features = ["gguf"]
+
+[[example]]
+name = "asr_parakeet_pipeline_compile"
+path = "examples/asr/parakeet_pipeline_compile.rs"
+required-features = ["gguf"]
+
+[[example]]
+name = "asr_silero_vad_compile"
+path = "examples/asr/silero_vad_compile.rs"
 
 [[example]]
 name = "step_bench"

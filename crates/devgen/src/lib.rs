@@ -89,6 +89,7 @@ mod projection_rewrite;
 mod rewrite_lower;
 pub mod rnnt;
 pub mod tts;
+pub mod vad;
 pub mod codec;
 pub mod s3gen;
 pub mod tune_demand;
@@ -8182,7 +8183,7 @@ fn emit_capabilities(model_type: &str) -> EmitCapabilities {
         gemma,
         dense_packet_contracts: dense,
         decode_objects: dense || model_type == "qwen3_5",
-        cublaslt_decode: gemma || matches!(model_type, "llama" | "qwen3_5"),
+        cublaslt_decode: gemma || matches!(model_type, "llama" | "qwen3" | "qwen3_asr" | "qwen3_5"),
         decode_ladder: dense || model_type == "gpt_oss",
         packed_prefill_siblings: matches!(model_type, "glm_moe_dsa" | "glm5_next"),
         glm: matches!(model_type, "glm_moe_dsa" | "glm5_next"),
@@ -8459,7 +8460,7 @@ fn cublaslt_emit_supported(
     tp: u32,
     has_decode_objects: bool,
 ) -> bool {
-    capabilities.cublaslt_decode && arch == "sm_90a" && tp == 1 && !has_decode_objects
+    capabilities.cublaslt_decode && matches!(arch, "sm_90a" | "sm_89") && tp == 1 && !has_decode_objects
 }
 
 /// [`run`] plus an optional pre-write verification gate (see [`VerifyHook`]).
@@ -8610,13 +8611,15 @@ pub fn run_verified(args: EmitArgs, verify: Option<VerifyHook>) {
     }
     if emit_config::active().prefill_cublaslt {
         assert!(
-            (model_type.starts_with("gemma4") || model_type == "llama" || model_type == "qwen3_asr")
+            ((model_type.starts_with("gemma4") || model_type == "llama" || model_type == "qwen3_asr")
                 && arch == "sm_90a"
+                || (model_type == "qwen3_asr" || model_type == "llama" || model_type.starts_with("gemma4"))
+                    && arch == "sm_89")
                 && tp == 1
                 && (!emit_config::active().any_fp8_weights()
                     || (model_type.starts_with("gemma4") && emit_config::active().w8a8))
                 && !emit_config::active().mxfp4,
-            "cuBLASLt prefill emission requires Gemma 4 W8A8 or supported BF16 on single-GPU SM90"
+            "cuBLASLt prefill emission requires Gemma 4 W8A8 or supported BF16 on single-GPU SM90 (Qwen3-ASR and Llama BF16 also on SM89)"
         );
     }
     if emit_config::active().gemma4_sm90_gemm_glu_role {
@@ -10733,20 +10736,24 @@ fn emit_dense_gqa(
         } else {
             (&[], &[400, 800, 1200, 1600, 2000])
         };
+        let max_chunks = emit_config::active().asr_packed_max_chunks.unwrap_or(u32::MAX);
+        let packed: Vec<u32> = packed.iter().copied().filter(|&chunks| chunks <= max_chunks).collect();
+        let audio_dims = asr::qwen::AudioDims::from_checkpoint(&dir)
+            .unwrap_or_else(|error| panic!("Qwen audio encoder dims: {error}"));
         let mut encoder = match packed.first() {
-            Some(&chunks) => asr::qwen::lower_packed_audio_encoder(chunks, n_cu),
-            None => asr::qwen::lower_audio_encoder(3000, n_cu),
+            Some(&chunks) => asr::qwen::lower_packed_audio_encoder(chunks, n_cu, audio_dims),
+            None => asr::qwen::lower_audio_encoder(3000, n_cu, audio_dims),
         }
         .unwrap_or_else(|error| panic!("Qwen audio packet lowering: {error}"));
         for chunks in packed.iter().skip(1) {
-            let bucket = asr::qwen::lower_packed_audio_encoder(*chunks, n_cu)
+            let bucket = asr::qwen::lower_packed_audio_encoder(*chunks, n_cu, audio_dims)
                 .unwrap_or_else(|error| panic!("Qwen audio packet lowering: {error}"));
             encoder
                 .merge_capacity(bucket)
                 .unwrap_or_else(|error| panic!("Qwen audio packet capacity: {error}"));
         }
         for &capacity in single {
-            let bucket = asr::qwen::lower_audio_encoder(capacity, n_cu)
+            let bucket = asr::qwen::lower_audio_encoder(capacity, n_cu, audio_dims)
                 .unwrap_or_else(|error| panic!("Qwen audio packet lowering: {error}"));
             encoder
                 .merge_capacity(bucket)

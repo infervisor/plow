@@ -49,16 +49,13 @@ const STAGING: usize = 4;
 /// Shape arrays per wave block: hd, m, n8, ld_s, ld_p.
 const DIMS: usize = 5;
 
-/// The softmax object the route loads (`--pf-seg-dir`, then the asset dir), or `None` when the
-/// route is off: `PLOW_PF_ATTN_GEMM=0`, or unset and the packet carries no object. `=1` names
-/// the object whether or not it exists, so a missing one fails the load.
+/// The softmax object the route loads (the bundle's object dir, then the asset dir), or `None`
+/// when the route is off: `PLOW_PF_ATTN_GEMM=0`, or unset and the packet carries no object.
+/// `=1` names the object whether or not it exists, so a missing one fails the load.
 pub(super) fn object(assets_dir: &Path) -> Option<std::path::PathBuf> {
     let config = &crate::config::RuntimeConfig::get().nv;
-    let path = config
-        .pf_seg_dir
-        .as_deref()
-        .filter(|dir| !dir.is_empty())
-        .map(|dir| Path::new(dir).join(SOFTMAX_OBJECT))
+    let path = crate::asset::serve::objects_dir(assets_dir)
+        .map(|dir| dir.join(SOFTMAX_OBJECT))
         .filter(|path| path.exists())
         .unwrap_or_else(|| assets_dir.join(SOFTMAX_OBJECT));
     match config.pf_attn_gemm {
@@ -341,6 +338,15 @@ pub(super) struct AttentionGemm {
 /// (kind, wave, m bucket, n bucket, head dim, alpha bits): the wave fixes the shape arrays,
 /// the buckets steer the heuristic.
 type GroupedKey = (Gemm, usize, u32, u32, u32, u32);
+
+/// Measured grouped-attention picks by device model: every engine of one GPU model in the
+/// process (DP ranks) runs the first one's pick, so their outputs agree; timing near-tied
+/// candidates on each made temperature-0 output differ by rank.
+fn grouped_selections() -> &'static parking_lot::Mutex<std::collections::HashMap<(String, GroupedKey), [u64; 8]>> {
+    static S: std::sync::OnceLock<parking_lot::Mutex<std::collections::HashMap<(String, GroupedKey), [u64; 8]>>> =
+        std::sync::OnceLock::new();
+    S.get_or_init(Default::default)
+}
 
 impl AttentionGemm {
     /// `max_sites` routed segments per launch, `batch` slots, `max_rows` the largest routed
@@ -944,6 +950,11 @@ impl AttentionGemm {
         if plan.candidates() == 0 {
             return plan.run(a, w, c, stream);
         }
+        let memo_key = (self.be.device_name().to_string(), key);
+        let known = grouped_selections().lock().get(&memo_key).copied();
+        if known.is_some_and(|data| plan.select_algo(&data)) {
+            return plan.run(a, w, c, stream);
+        }
         let start = self.be.event_create(true)?;
         let end = self.be.event_create(true)?;
         let mut times = Vec::with_capacity(plan.candidates());
@@ -972,6 +983,7 @@ impl AttentionGemm {
         let (ms, index) = best.filter(|(ms, _)| ms.is_finite()).ok_or_else(|| {
             RuntimeError::Device("no runnable grouped attention candidate".into())
         })?;
+        grouped_selections().lock().entry(memo_key).or_insert(plan.candidate_algo(index));
         plan.select(index);
         tracing::info!(
             ?key,

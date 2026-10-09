@@ -204,7 +204,7 @@ impl GpuEngine {
             // that computed them lands, not after the owner's whole prompt.
             let chunk_ends: smallvec::SmallVec<[(usize, u32); 16]> = match RuntimeConfig::get()
                 .prefix_chunk_publish()
-                .then(|| self.vmm.as_ref().map(|v| v.kv.block_rows()))
+                .then(|| self.vmm.as_ref().and_then(|v| v.kv.as_ref()).map(|kv| kv.block_rows()))
                 .flatten()
             {
                 Some(br) => plan

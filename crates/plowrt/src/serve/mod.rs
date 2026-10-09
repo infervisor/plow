@@ -1,6 +1,7 @@
 //! §G OpenAI-compatible API server.
 
 pub mod admin;
+pub mod auth;
 #[cfg(feature = "cpu")]
 pub mod portable;
 pub mod bench;
@@ -9,6 +10,7 @@ pub mod completion;
 pub mod config;
 pub mod cosched;
 pub mod deadlines;
+pub mod dp;
 #[cfg(feature = "cpu")]
 pub mod cpu_serve;
 /// The loaded device engine behind a slug, as one type over both backends —
@@ -483,6 +485,11 @@ pub struct AppState {
     /// When set, each run records a timeline dumpable at `GET /trace`.
     record_trace: bool,
     trace: Mutex<Timeline>,
+    /// Set once on SIGTERM/SIGINT: `/health` turns 503 and the ASR front refuses new work and
+    /// ends sessions still receiving audio.
+    pub shutdown: tokio::sync::watch::Sender<bool>,
+    /// Data-parallel models and their ranks (`--dp`). Unset when every model has one rank.
+    dp: std::sync::OnceLock<dp::DpRouter>,
 }
 
 /// Operator-visible residency state of a registered slug.
@@ -554,7 +561,130 @@ impl AppState {
             sampling_honoured: RwLock::new(FxHashMap::default()),
             record_trace,
             trace: Mutex::new(Timeline::new()),
+            shutdown: tokio::sync::watch::channel(false).0,
+            dp: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Install the DP router (once, at startup, before any rank loads).
+    pub fn install_dp(&self, router: dp::DpRouter) {
+        let _ = self.dp.set(router);
+    }
+
+    /// The DP router, when any model has more than one rank.
+    pub fn dp(&self) -> Option<&dp::DpRouter> {
+        self.dp.get()
+    }
+
+    /// `model`'s ranks, when it is served data-parallel.
+    #[inline]
+    pub fn dp_set(&self, model: &str) -> Option<&Arc<dp::DpSet>> {
+        self.dp.get()?.set(model)
+    }
+
+    /// The DP set and rank of an instance key.
+    pub fn dp_rank(&self, key: &str) -> Option<(&Arc<dp::DpSet>, usize)> {
+        self.dp.get()?.rank(key)
+    }
+
+    /// The registry model an instance key serves: itself unless it is a DP rank.
+    pub fn model_of<'a>(&'a self, key: &'a str) -> &'a str {
+        self.dp_rank(key).map_or(key, |(set, _)| set.model.as_str())
+    }
+
+    /// The CUDA device an instance key runs on (0 when no manager places it).
+    pub fn ordinal_of(&self, key: &str) -> u8 {
+        #[cfg(feature = "cuda")]
+        if let Some(m) = self.manager_for(key) {
+            return m.ordinal();
+        }
+        let _ = key;
+        0
+    }
+
+    fn refresh_up(&self, key: &str) {
+        if let Some((set, r)) = self.dp_rank(key) {
+            set.ranks[r].set_up(self.muxes.read().contains_key(key) && self.residency(key).admits());
+        }
+    }
+
+    /// Pick a rank of `set` and its dispatcher. Ranks in `exclude`, and any whose dispatcher
+    /// is gone or preempted by the time it is looked up, are skipped.
+    /// The returned [`dp::Pick`] counts the request against its rank until dropped: hold it
+    /// until the job is submitted.
+    pub fn dp_route<'s>(
+        &self,
+        set: &'s dp::DpSet,
+        session: Option<&str>,
+        prompt: Option<&[u32]>,
+        mut exclude: u32,
+    ) -> Option<(usize, mux::ModelMux, Option<crate::memory::vmm::PrefixKey>, dp::Pick<'s>)> {
+        let cfg = self.dp.get()?.cfg;
+        loop {
+            let routed = set.route(&cfg, session, prompt, exclude)?;
+            match self.mux(&set.ranks[routed.rank].key) {
+                Some(m) if !m.preempted() => return Some((routed.rank, m, routed.key, routed.pick)),
+                _ => exclude |= 1 << routed.rank,
+            }
+        }
+    }
+
+    /// Submit `job` to `mux`, the dispatcher of `set`'s rank `rank` when routed data-parallel. A
+    /// rank that has closed or is full hands the same job (tokens and prefix key included) to
+    /// another rank.
+    pub(crate) fn submit_routed(
+        &self,
+        routed: Option<(&dp::DpSet, usize)>,
+        session: Option<&str>,
+        mux: &mux::ModelMux,
+        job: mux::Job,
+        arrived: std::time::Instant,
+        ingress: Option<mux::IngressGuard<'_>>,
+    ) -> std::result::Result<(), mux::SubmitError> {
+        let Some((set, mut rank)) = routed else {
+            return mux.submit_arrived(job, arrived, ingress);
+        };
+        let mut exclude = 0u32;
+        let mut next: Option<mux::ModelMux> = None;
+        let mut held: Option<dp::Pick<'_>> = None;
+        let mut job = job;
+        let mut ingress = ingress;
+        loop {
+            let target = next.as_ref().unwrap_or(mux);
+            let refused = match target.submit_arrived(job, arrived, ingress.take()) {
+                Ok(()) => return Ok(()),
+                Err(e) => e,
+            };
+            drop(held.take());
+            exclude |= 1 << rank;
+            let Some((r, m, _, pick)) = self.dp_route(set, session, None, exclude) else {
+                return Err(refused);
+            };
+            job = match refused {
+                mux::SubmitError::Full(j) | mux::SubmitError::Closed(j) => j,
+            };
+            rank = r;
+            next = Some(m);
+            held = Some(pick);
+        }
+    }
+
+    /// Make some rank of `set` serve: a no-op while one does; otherwise load one whose residency
+    /// admits (S1 switch on its group).
+    #[cfg(feature = "cuda")]
+    pub async fn dp_admit(&self, set: &dp::DpSet) -> std::result::Result<(), manager::EnsureError> {
+        if set.ranks.iter().any(|r| r.is_up()) {
+            return Ok(());
+        }
+        let mut last = manager::EnsureError::Unloaded;
+        for r in set.ranks.iter().filter(|r| self.residency(&r.key).admits()) {
+            let Some(mgr) = self.manager_for(&r.key) else { continue };
+            match mgr.ensure_resident(&r.key).await {
+                Ok(()) => return Ok(()),
+                Err(e) => last = e,
+            }
+        }
+        Err(last)
     }
 
     /// Register a GPU engine for a model slug. Called once at startup.
@@ -568,6 +698,14 @@ impl AppState {
         self.sampling_honoured
             .write()
             .insert(slug.clone(), engine.honours_sampling());
+        if let Some((set, r)) = self.dp_rank(&slug) {
+            self.max_ctx.write().insert(set.model.clone(), engine.max_ctx());
+            self.sampling_honoured.write().insert(set.model.clone(), engine.honours_sampling());
+            #[cfg(feature = "cuda")]
+            set.set_probe(r, engine.vmm_prefix_probe());
+            #[cfg(not(feature = "cuda"))]
+            let _ = r;
+        }
         self.gpu.write().insert(slug, Arc::new(Mutex::new(engine)));
     }
 
@@ -609,7 +747,13 @@ impl AppState {
     pub fn has_gpu_engine(&self, slug: &str) -> bool {
         #[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu"))]
         {
-            return self.gpu.read().contains_key(slug);
+            if self.gpu.read().contains_key(slug) {
+                return true;
+            }
+            return self.dp_set(slug).is_some_and(|set| {
+                let gpu = self.gpu.read();
+                set.ranks.iter().any(|r| gpu.contains_key(&r.key))
+            });
         }
         #[cfg(not(any(feature = "cuda", feature = "hsa", feature = "cpu")))]
         {
@@ -630,6 +774,9 @@ impl AppState {
     pub fn remove_gpu_engine(&self, slug: &str) -> Option<Arc<Mutex<engine::ServeEngine>>> {
         #[cfg(feature = "cuda")]
         self.vmm_stats.write().remove(slug);
+        if let Some((set, r)) = self.dp_rank(slug) {
+            set.set_probe(r, None);
+        }
         self.gpu.write().remove(slug)
     }
 
@@ -791,24 +938,31 @@ impl AppState {
 
     /// Set the residency state of `slug`. `Auto` clears the override.
     pub fn set_residency(&self, slug: &str, state: Residency) {
-        let mut map = self.residency.write();
-        match state {
-            Residency::Auto => {
-                map.remove(slug);
-            }
-            _ => {
-                map.insert(slug.to_string(), state);
+        {
+            let mut map = self.residency.write();
+            match state {
+                Residency::Auto => {
+                    map.remove(slug);
+                }
+                _ => {
+                    map.insert(slug.to_string(), state);
+                }
             }
         }
+        self.refresh_up(slug);
     }
 
-    pub(crate) fn model_metrics(&self, slug: &str) -> Arc<Metrics> {
+    pub fn model_metrics(&self, slug: &str) -> Arc<Metrics> {
+        // A DP model's own counters (a front's, before it routes) land on rank 0.
+        if let Some(set) = self.dp_set(slug) {
+            return Arc::clone(&set.ranks[0].metrics);
+        }
         if let Some(metrics) = self.model_metrics.read().get(slug) {
             return metrics.clone();
         }
         let mut models = self.model_metrics.write();
         models.retain(|name, metrics| {
-            let keep = self.registry.contains(name) || Arc::strong_count(metrics) > 1;
+            let keep = self.registry.contains(name) || Arc::strong_count(metrics) > 1 || self.dp_rank(name).is_some();
             if !keep {
                 self.metrics.accumulate_counters(metrics);
             }
@@ -819,13 +973,25 @@ impl AppState {
 
     /// Register a dispatcher for a model slug. Called once at startup.
     pub fn install_mux(&self, slug: String, m: mux::ModelMux) {
+        let dp = self.dp_rank(&slug).is_some();
+        let key = dp.then(|| slug.clone());
         self.muxes.write().insert(slug, m);
+        if let Some(key) = key {
+            self.refresh_up(&key);
+        }
     }
 
     /// Remove a dispatcher (S1 eviction) — new lookups fail fast; the caller
     /// drains the returned handle before dropping the engine.
     pub fn remove_mux(&self, slug: &str) -> Option<mux::ModelMux> {
-        self.muxes.write().remove(slug)
+        let m = self.muxes.write().remove(slug);
+        self.refresh_up(slug);
+        m
+    }
+
+    /// Every installed dispatcher.
+    pub fn all_muxes(&self) -> Vec<mux::ModelMux> {
+        self.muxes.read().values().cloned().collect()
     }
 
     /// Look up the dispatcher for a slug (clones the underlying Sender).
@@ -1067,6 +1233,26 @@ async fn trace_handler(
 async fn healthz(
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
 ) -> (axum::http::StatusCode, String) {
+    if *state.shutdown.borrow() {
+        return (axum::http::StatusCode::SERVICE_UNAVAILABLE, "shutting down".into());
+    }
+    let (dead, degraded) = dead_engines(&state);
+    if dead.is_empty() && !degraded.is_empty() {
+        return (axum::http::StatusCode::OK, format!("degraded: DP ranks dead: {}", degraded.join(",")));
+    }
+    if dead.is_empty() {
+        (axum::http::StatusCode::OK, "ok".into())
+    } else {
+        (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            format!("engine dead (fatal device fault or ASR encoder exit): {}", dead.join(",")),
+        )
+    }
+}
+
+/// Models that can no longer serve (a fatal device fault or an ASR encoder exit), and DP ranks
+/// that died while their set still has a live rank.
+pub fn dead_engines(state: &AppState) -> (Vec<String>, Vec<String>) {
     let dead: Vec<String> = state
         .model_metrics
         .read()
@@ -1074,23 +1260,105 @@ async fn healthz(
         .filter(|(_, m)| m.engine_dead.load(std::sync::atomic::Ordering::Relaxed))
         .map(|(slug, _)| slug.clone())
         .collect();
-    if dead.is_empty() {
-        (axum::http::StatusCode::OK, "ok".into())
-    } else {
-        (
-            axum::http::StatusCode::SERVICE_UNAVAILABLE,
-            format!("engine dead (fatal device fault): {}", dead.join(",")),
-        )
+    #[cfg(feature = "cuda")]
+    let dead = [dead, crate::asr::serving::dead_encoders()].concat();
+    // A DP model with a live rank still serves: report the dead ranks, answer 200.
+    let (degraded, dead): (Vec<String>, Vec<String>) = dead.into_iter().partition(|key| {
+        state
+            .dp_rank(key)
+            .is_some_and(|(set, _)| set.ranks.iter().any(|r| !dead_rank(&r.metrics)))
+    });
+    (dead, degraded)
+}
+
+fn dp_metrics(out: &mut String, router: &dp::DpRouter, state: &AppState) {
+    use crate::obs::serving::{escape_label, family};
+    use std::fmt::Write;
+    use std::sync::atomic::Ordering::Relaxed;
+    let mut sets: Vec<_> = router.sets().collect();
+    sets.sort_unstable_by(|a, b| a.model.cmp(&b.model));
+    family(out, "plowrt_dp_rank_info", "gauge", "DP rank placement: the device its group starts at.");
+    for set in &sets {
+        for r in &set.ranks {
+            let m = escape_label(&set.model);
+            let _ = writeln!(out, "plowrt_dp_rank_info{{model_name=\"{m}\",engine=\"{}\",device=\"{}\"}} 1", r.rank, r.ordinal);
+        }
+    }
+    family(out, "plowrt_dp_rank_up", "gauge", "DP rank has a dispatcher and admits requests.");
+    for set in &sets {
+        for r in &set.ranks {
+            let m = escape_label(&set.model);
+            let _ = writeln!(out, "plowrt_dp_rank_up{{model_name=\"{m}\",engine=\"{}\"}} {}", r.rank, u8::from(r.is_up() && state.residency(&r.key).admits()));
+        }
+    }
+    family(out, "plowrt_dp_rank_load", "gauge", "DP router load signal: (queued + active) / slots + KV pressure.");
+    for set in &sets {
+        for r in &set.ranks {
+            let m = escape_label(&set.model);
+            let _ = writeln!(out, "plowrt_dp_rank_load{{model_name=\"{m}\",engine=\"{}\"}} {}", r.rank, dp::load(&r.cand()));
+        }
+    }
+    family(out, "plowrt_dp_route_decisions_total", "counter", "DP routing decisions by the rule that chose the rank.");
+    for set in &sets {
+        for reason in dp::Reason::ALL {
+            let m = escape_label(&set.model);
+            let _ = writeln!(out, "plowrt_dp_route_decisions_total{{model_name=\"{m}\",reason=\"{}\"}} {}", reason.as_str(), set.stats.decisions[reason as usize].load(Relaxed));
+        }
+    }
+    for (name, help, read) in [
+        ("plowrt_dp_route_retries_total", "Requests resubmitted to another rank after the first closed.", (|s: &dp::DpStats| s.retries.load(Relaxed)) as fn(&dp::DpStats) -> u64),
+        ("plowrt_route_probes_total", "Prefix-cache probes the DP router made.", |s| s.probes.load(Relaxed)),
+        ("plowrt_route_probe_contended_total", "Prefix-cache probes skipped because the cache lock was held.", |s| s.probe_contended.load(Relaxed)),
+    ] {
+        family(out, name, "counter", help);
+        for set in &sets {
+            let _ = writeln!(out, "{name}{{model_name=\"{}\"}} {}", escape_label(&set.model), read(&set.stats));
+        }
+    }
+    family(out, "plowrt_dp_route_seconds", "gauge", "DP route wall time, upper bound of the log2 bucket at the quantile.");
+    for set in &sets {
+        for q in [0.5, 0.99, 0.999] {
+            let _ = writeln!(out, "plowrt_dp_route_seconds{{model_name=\"{}\",quantile=\"{q}\"}} {}", escape_label(&set.model), set.stats.route_ns_quantile(q) as f64 * 1e-9);
+        }
+    }
+    family(out, "plowrt_dp_sessions", "gauge", "Sessions pinned to a DP rank.");
+    for set in &sets {
+        let _ = writeln!(out, "plowrt_dp_sessions{{model_name=\"{}\"}} {}", escape_label(&set.model), set.sessions());
+    }
+}
+
+fn dead_rank(m: &Metrics) -> bool {
+    m.engine_dead.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+fn packet_model(slug: &str) -> bool {
+    #[cfg(feature = "cuda")]
+    return crate::asr::serving::packet_model_names().iter().any(|n| n == slug);
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = slug;
+        false
     }
 }
 
 fn metrics_models(state: &AppState) -> Vec<(String, Arc<Metrics>, bool)> {
         let mut metrics = state.model_metrics.write();
         for slug in state.registry.slugs() {
-            metrics.entry(slug).or_default();
+            match state.dp_set(&slug) {
+                Some(set) => {
+                    for r in &set.ranks {
+                        metrics.entry(r.key.clone()).or_insert_with(|| Arc::clone(&r.metrics));
+                    }
+                }
+                None => {
+                    metrics.entry(slug).or_default();
+                }
+            }
         }
         metrics.retain(|slug, metrics| {
-            let keep = state.registry.contains(slug) || Arc::strong_count(metrics) > 1;
+            let keep = state.registry.contains(slug) && state.dp_set(slug).is_none()
+                || Arc::strong_count(metrics) > 1
+                || state.dp_rank(slug).is_some();
             if !keep {
                 state.metrics.accumulate_counters(metrics);
             }
@@ -1100,7 +1368,7 @@ fn metrics_models(state: &AppState) -> Vec<(String, Arc<Metrics>, bool)> {
             (
                 slug.clone(),
                 Arc::clone(m),
-                state.mux(slug).is_some() && state.residency(slug).admits(),
+                state.mux(slug).is_some() && state.residency(slug).admits() || packet_model(slug),
             )
         }).collect();
         models.sort_unstable_by(|a, b| a.0.cmp(&b.0));
@@ -1125,7 +1393,7 @@ async fn metrics_handler(
     }
     let mut out = aggregate.to_prometheus();
     for (index, (slug, metrics, _)) in models.iter().enumerate() {
-        let label = crate::obs::serving::escape_label(slug);
+        let label = crate::obs::serving::model_labels(slug);
         for line in metrics.to_prometheus().replace("plowrt_", "plowrt_model_").lines() {
             if line.starts_with('#') {
                 if index == 0 {
@@ -1136,11 +1404,14 @@ async fn metrics_handler(
             }
             if let Some((name, value)) = line.split_once(' ') {
                 use std::fmt::Write;
-                let _ = writeln!(out, "{name}{{model_name=\"{label}\",engine=\"0\"}} {value}");
+                let _ = writeln!(out, "{name}{{{label}}} {value}");
             }
         }
     }
     crate::obs::serving::ServingMetrics::write(&mut out, &models);
+    if let Some(router) = state.dp() {
+        dp_metrics(&mut out, router, &state);
+    }
     // Prefix-cache (VMM) counters, one block per GPU-served model, read
     // through the engine-lock-free stats handles — series stay continuous
     // under sustained inference (only the pool mutex is taken, µs holds).
@@ -1238,7 +1509,7 @@ pub(crate) fn api_error_for(err: &RuntimeError) -> axum::response::Response {
         RuntimeError::ContextLength(_) => {
             ("invalid_request_error", Some("context_length_exceeded"))
         }
-        RuntimeError::Rejected(_) | RuntimeError::Oom(_) => {
+        RuntimeError::Rejected(_) | RuntimeError::Oom(_) | RuntimeError::Overloaded(_) => {
             ("rate_limit_error", Some("server_overloaded"))
         }
         _ => ("server_error", None),
@@ -1262,10 +1533,42 @@ mod health_tests {
         let metrics = state.model_metrics("m");
         let (code, _) = healthz(axum::extract::State(Arc::clone(&state))).await;
         assert_eq!(code, StatusCode::OK);
+        assert!(super::dead_engines(&state).0.is_empty());
         metrics.engine_dead.store(true, Ordering::Relaxed);
+        // What `--exit-on-engine-death` watches.
+        assert_eq!(super::dead_engines(&state).0, ["m"]);
         let (code, body) = healthz(axum::extract::State(state)).await;
         assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE);
         assert!(body.contains('m'));
+    }
+
+    /// One dead DP rank degrades the model; only every rank dead fails `/health`.
+    #[tokio::test]
+    async fn health_is_degraded_until_every_dp_rank_is_dead() {
+        let backend: Arc<dyn crate::device::Backend> = Arc::new(crate::device::cpu::CpuBackend::new(1));
+        let execset = Arc::new(crate::exec::ExecutorSet::bringup(backend).unwrap());
+        let state = Arc::new(AppState::new(crate::orch::Registry::new(), execset));
+        let mut router = super::dp::DpRouter::new(Default::default());
+        router.add(super::dp::DpSet::new("g", (0..2).map(|r| (r, r as usize, state.model_metrics(&format!("g#{r}")))).collect()));
+        state.install_dp(router);
+        let set = Arc::clone(state.dp_set("g").unwrap());
+        set.ranks[0].metrics.engine_dead.store(true, Ordering::Relaxed);
+        let (code, body) = healthz(axum::extract::State(Arc::clone(&state))).await;
+        assert_eq!(code, StatusCode::OK);
+        assert!(body.starts_with("degraded") && body.contains("g#0"), "{body}");
+        // A degraded DP set still serves: no exit for it.
+        assert!(super::dead_engines(&state).0.is_empty());
+        set.ranks[1].metrics.engine_dead.store(true, Ordering::Relaxed);
+        let (code, _) = healthz(axum::extract::State(state)).await;
+        assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[test]
+    fn dp_ranks_label_their_model_and_engine() {
+        use crate::obs::serving::model_labels;
+        assert_eq!(model_labels("gemma"), "model_name=\"gemma\",engine=\"0\"");
+        assert_eq!(model_labels("gemma#5"), "model_name=\"gemma\",engine=\"5\"");
+        assert_eq!(model_labels("a\"b#1"), "model_name=\"a\\\"b\",engine=\"1\"");
     }
 }
 
@@ -1319,7 +1622,10 @@ pub(crate) fn status_for(err: &RuntimeError) -> axum::http::StatusCode {
         // 429 was actively harmful: every OpenAI-compatible client treats 429
         // as retryable and backs off in a loop against a permanent failure.
         RuntimeError::ContextLength(_) => StatusCode::BAD_REQUEST,
-        RuntimeError::Rejected(_) | RuntimeError::Oom(_) => StatusCode::TOO_MANY_REQUESTS,
+        RuntimeError::Rejected(_) | RuntimeError::Oom(_) | RuntimeError::Overloaded(_) => {
+            StatusCode::TOO_MANY_REQUESTS
+        }
+        RuntimeError::Unavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
         RuntimeError::DeviceFault { info } if info.fatal => StatusCode::SERVICE_UNAVAILABLE,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     }

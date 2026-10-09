@@ -95,11 +95,25 @@ pub fn checkpoint_dir(asset_dir: &Path) -> PathBuf {
         .unwrap_or_else(|| asset_dir.join("checkpoint"))
 }
 
-/// `serve.json` serve-knob defaults of the bundles in `asset_dirs`, plus the files a
-/// self-contained bundle carries (`objects/` for `PLOW_PF_SEG_DIR`, `cublaslt_algos.jsonl` for
-/// `PLOW_LT_ALGOS`), as `(knob, value, source)`. A knob the environment already sets is left
-/// out, so an explicit setting always wins. Every packet-carried key must be a registered
-/// runtime knob.
+/// The object directory of one bundle: an explicit `PLOW_PF_SEG_DIR` / `--pf-seg-dir` (which
+/// applies to every bundle of the process), else the bundle's own `objects/`. Never derived
+/// from another bundle, so co-served bundles each pair with their own specialised objects.
+pub fn objects_dir(assets_dir: &Path) -> Option<PathBuf> {
+    objects_dir_with(crate::config::RuntimeConfig::get().nv.pf_seg_dir.as_deref(), assets_dir)
+}
+
+fn objects_dir_with(explicit: Option<&str>, assets_dir: &Path) -> Option<PathBuf> {
+    explicit.filter(|dir| !dir.is_empty()).map(PathBuf::from).or_else(|| {
+        let own = assets_dir.join("objects");
+        own.is_dir().then_some(own)
+    })
+}
+
+/// `serve.json` serve-knob defaults of the bundles in `asset_dirs`, plus the cuBLASLt table a
+/// self-contained bundle carries (`cublaslt_algos.jsonl` for `PLOW_LT_ALGOS`), as
+/// `(knob, value, source)`. A bundle's `objects/` is not exported: each bundle resolves it
+/// itself ([`objects_dir`]). A knob the environment already sets is left out, so an explicit
+/// setting always wins. Every packet-carried key must be a registered runtime knob.
 pub fn asset_env_defaults(
     asset_dirs: &[PathBuf],
     env: impl Fn(&str) -> Option<String>,
@@ -134,10 +148,6 @@ pub fn asset_env_defaults(
                     put(key, value.clone(), pkt.display().to_string(), &mut out)?;
                 }
             }
-        }
-        let objects = dir.join("objects");
-        if objects.is_dir() {
-            put("PLOW_PF_SEG_DIR", objects.display().to_string(), dir.display().to_string(), &mut out)?;
         }
         let lt = dir.join("cublaslt_algos.jsonl");
         if lt.is_file() && env("PLOW_LT_ALGOS_WRITE").is_none() {
@@ -206,6 +216,24 @@ mod tests {
     }
 
     #[test]
+    fn each_bundle_resolves_its_own_objects_dir() {
+        let with = bundle("objects-with", None);
+        std::fs::create_dir_all(with.join("objects")).unwrap();
+        let without = bundle("objects-without", None);
+        assert_eq!(objects_dir_with(None, &with), Some(with.join("objects")));
+        assert_eq!(objects_dir_with(None, &without), None);
+        assert_eq!(objects_dir_with(Some(""), &without), None);
+        // An explicit directory overrides every bundle's own.
+        assert_eq!(objects_dir_with(Some("/explicit"), &with), Some(PathBuf::from("/explicit")));
+        assert_eq!(objects_dir_with(Some("/explicit"), &without), Some(PathBuf::from("/explicit")));
+        // Co-serving does not leak one bundle's objects/ into the process environment.
+        let got = asset_env_defaults(&[with.clone(), without.clone()], |_| None).unwrap();
+        assert!(!got.iter().any(|(k, _, _)| k == "PLOW_PF_SEG_DIR"));
+        std::fs::remove_dir_all(with).unwrap();
+        std::fs::remove_dir_all(without).unwrap();
+    }
+
+    #[test]
     fn serve_defaults_yield_to_the_environment_and_must_be_runtime_knobs() {
         let mut m = ServeManifest { version: 1, ..Default::default() };
         m.serve_defaults.insert("PLOW_PF_INTERLEAVE".into(), "2048".into());
@@ -215,7 +243,7 @@ mod tests {
         let got = asset_env_defaults(&[dir.clone()], |k| (k == "PLOW_MULTISTEP").then(|| "4".into())).unwrap();
         let keys: Vec<_> = got.iter().map(|(k, v, _)| (k.as_str(), v.clone())).collect();
         assert!(keys.contains(&("PLOW_PF_INTERLEAVE", "2048".into())));
-        assert!(keys.iter().any(|(k, _)| *k == "PLOW_PF_SEG_DIR"));
+        assert!(!keys.iter().any(|(k, _)| *k == "PLOW_PF_SEG_DIR"));
         assert!(!keys.iter().any(|(k, _)| *k == "PLOW_MULTISTEP"));
 
         m.serve_defaults.insert("PLOW_NOT_A_KNOB".into(), "1".into());

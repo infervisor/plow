@@ -9,6 +9,12 @@
 //! `tests/cpu_abi.rs` asserts them against Rust's.
 
 fn main() {
+    // The CUDA toolkit this binary was built against (the nix dev shell exports CUDA_PATH): its
+    // lib/ is plowrt's last cuBLASLt candidate, so no runtime environment is needed to find it.
+    println!("cargo:rerun-if-env-changed=CUDA_PATH");
+    if let Ok(cuda) = std::env::var("CUDA_PATH") {
+        println!("cargo:rustc-env=PLOW_BUILD_CUDA_LIB={cuda}/lib");
+    }
     #[cfg(feature = "cpu")]
     cpu::build();
 }

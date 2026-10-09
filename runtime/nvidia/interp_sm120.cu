@@ -229,8 +229,8 @@ extern "C" __device__ unsigned plow_pdl_wait_1 = 1;
 #endif
 #if PLOW_NV_PACKED_REQUEST
 #define PLOW_PF_REQ_ARG , (const int*)TEN(7)
-#if !defined(PLOW_NV_HOPPER) || !PLOW_NV_HOPPER || !PLOW_NV_PREFILL
-#error "packed request ABI requires Hopper prefill"
+#if !((defined(PLOW_NV_HOPPER) && PLOW_NV_HOPPER) || (defined(PLOW_NV_ADA) && PLOW_NV_ADA)) || !PLOW_NV_PREFILL
+#error "packed request ABI requires Hopper or Ada prefill"
 #endif
 extern "C" __device__ __constant__ unsigned plow_pf_request_abi = 2;
 #if defined(PLOW_NV_MASKED_PADDING) && PLOW_NV_MASKED_PADDING
@@ -4045,7 +4045,9 @@ extern "C" __global__ void __launch_bounds__(PLOW_NV_THREADS, 1)
     }
 }
 extern "C" __device__ unsigned PLOW_SYM(plow_light_attn_hd) = PLOW_NV_FA_HD;
-#if PLOW_NV_FA_HD == 128 && PLOW_NV_FA_RG && PLOW_NV_FA_RG_U == 4
+/* The streamed body (cp.async.bulk + mbarrier) is sm_90+; Ada folds on the interpreter's item. */
+#if PLOW_NV_FA_HD == 128 && PLOW_NV_FA_RG && PLOW_NV_FA_RG_U == 4 && \
+    (!defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 900)
 /* A light attention segment's merge-folded hd128 FlashDecode (nsplit 1, no window, no ring wrap)
  * on the streamed body, bit-identical to the row-group one (d_flash_decode_stream). `hnr[0..3]`
  * = the q, k, v HeadNormRope instructions it folds in (~0u: none, Q is already roped); their x

@@ -89,6 +89,9 @@ async fn completions_with(
     if let Some(canonical) = state.registry.resolve(&req.model) {
         req.model = canonical;
     }
+    if let Some(r) = crate::serve::models::refuse_unserved(&state, &req.model, "completions") {
+        return r;
+    }
 
     if let Err(error) = validate_return_token_ids(req.stream, req.return_token_ids) {
         return crate::serve::api_error(
@@ -144,10 +147,17 @@ async fn completions_with(
             "Model is explicitly unloaded or unloading", "server_error", Some("model_unloaded"), Some("model".into()));
     }
     #[cfg(feature = "cuda")]
-    if let Some(mgr) = state.manager_for(&req.model) {
-        if mgr.manages(&req.model) {
-            use crate::serve::manager::EnsureError;
-            if let Err(e) = mgr.ensure_resident(&req.model).await {
+    {
+        use crate::serve::manager::EnsureError;
+        let ensured = match state.dp_set(&req.model) {
+            Some(set) => Some(state.dp_admit(set).await),
+            None => match state.manager_for(&req.model) {
+                Some(mgr) if mgr.manages(&req.model) => Some(mgr.ensure_resident(&req.model).await),
+                _ => None,
+            },
+        };
+        {
+            if let Some(Err(e)) = ensured {
                 return match e {
                     EnsureError::WontFit { .. } | EnsureError::SwitchTimeout(_) => (
                         axum::http::StatusCode::SERVICE_UNAVAILABLE,
@@ -169,6 +179,10 @@ async fn completions_with(
                 };
             }
         }
+    }
+    // Again once a switch has bound the model (see `chat`).
+    if let Some(r) = crate::serve::models::refuse_unserved(&state, &req.model, "completions") {
+        return r;
     }
 
     if let Err(e) = req
@@ -224,7 +238,9 @@ async fn completions_with(
         );
     }
 
-    let (Some(mux), Ok(bundle)) = (state.mux(&req.model), state.registry.get(&req.model)) else {
+    let dp = state.dp_set(&req.model);
+    let direct = if dp.is_some() { None } else { state.mux(&req.model) };
+    let (true, Ok(bundle)) = (dp.is_some() || direct.is_some(), state.registry.get(&req.model)) else {
         return crate::serve::api_error(
             axum::http::StatusCode::NOT_FOUND,
             format!("no model registered for '{}'.", req.model),
@@ -233,7 +249,7 @@ async fn completions_with(
             Some("model".into()),
         );
     };
-    let ingress = mux.ingress();
+    let ingress = direct.as_ref().map(|m| m.ingress());
     // OpenAI's four prompt forms. Token-id prompts skip the tokenizer entirely;
     // batches are refused explicitly rather than silently serving element 0.
     let batch_refusal = || {
@@ -306,6 +322,21 @@ async fn completions_with(
     if let Some(e) = crate::serve::context_overflow(state.max_ctx(&req.model), n_prompt, gen.max_tokens) {
         return crate::serve::api_error_for(&e);
     }
+    let routed;
+    let (mut rank, mut prefix, mut _pick) = (0, None, None);
+    let mux = match (&direct, dp) {
+        (Some(m), _) => m,
+        (None, Some(set)) => match state.dp_route(set, ids.session.as_deref(), Some(&prompt_ids), 0) {
+            Some((r, m, key, pick)) => {
+                (rank, prefix, _pick) = (r, key, Some(pick));
+                routed = m;
+                &routed
+            }
+            None => return crate::serve::chat::dp_unavailable(&req.model),
+        },
+        (None, None) => unreachable!("checked at lookup"),
+    };
+    let key = dp.map_or(req.model.as_str(), |set| set.ranks[rank].key.as_str());
     let (tx, rx) = stream_mod::channel();
     let response_prompt_ids = req.return_token_ids.then(|| prompt_ids.clone());
     let lp_fmt = logprobs.map(|_| crate::serve::logprobs::TokenText {
@@ -325,7 +356,7 @@ async fn completions_with(
         ids,
         crate::serve::turns::Kind::Llm,
         &req.model,
-        Some(state.model_metrics(&req.model)),
+        Some(state.model_metrics(key)),
         t_arrive,
         true,
     );
@@ -340,13 +371,14 @@ async fn completions_with(
             session,
             turn: run.key(),
             continuing: run.continuing(),
+            prefix: prefix.take(),
             ..Default::default()
         },
     };
     if crate::obs::host::on() {
         crate::obs::host::submitted(n_prompt, t_arrive.elapsed());
     }
-    if let Err(err) = mux.submit_arrived(job, t_arrive, Some(ingress)) {
+    if let Err(err) = state.submit_routed(dp.map(|s| (&**s, rank)), ids.session.as_deref(), mux, job, t_arrive, ingress) {
         return match err {
             crate::serve::mux::SubmitError::Full(_) => {
                 crate::serve::api_error(

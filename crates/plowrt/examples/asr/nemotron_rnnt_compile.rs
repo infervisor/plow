@@ -33,6 +33,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             prompt_count: 128,
             prompt_width: 2048,
             vocabulary: 13088,
+            durations: 0,
             predictor_width: 640,
             joint_width: 640,
             joint_batch,
