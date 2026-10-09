@@ -263,6 +263,8 @@ fn host_serve_bench() {
         Cell_ { name: "warm", conc: 8, requests: 64, max_tokens: 16, stream: true, long: false },
         Cell_ { name: "req_c16_t1", conc: 16, requests: 4000, max_tokens: 1, stream: false, long: false },
         Cell_ { name: "req_c16_isl1k_t1", conc: 16, requests: 2000, max_tokens: 1, stream: false, long: true },
+        Cell_ { name: "req_c1_isl1k_t1", conc: 1, requests: 400, max_tokens: 1, stream: false, long: true },
+        Cell_ { name: "req_c4_isl1k_t1", conc: 4, requests: 1000, max_tokens: 1, stream: false, long: true },
         Cell_ { name: "stream_c1_t128", conc: 1, requests: 80, max_tokens: 128, stream: true, long: false },
         Cell_ { name: "stream_c64_t128", conc: 64, requests: 1280, max_tokens: 128, stream: true, long: false },
     ];
