@@ -83,7 +83,10 @@ PLOW_NV_DENSE_TUNE = "1"
 # algorithms per rung (step_bench B=32..64 -3..-5%, digests equal).
 [serve]
 # Env, not flags, so every launcher (campaign serve/gate, plowbench.sh probes) applies it.
-env = { PLOW_VMM_PREFIX = "1", PLOW_LT_RUNG_ALGOS = "true" }
+# VMM prefix cache off: requested on (c240cf01) it cost 3.5% at c64 on H100 (tts_bench c64 --n 256
+# stream, release bundle PLOW_VMM_PREFIX=1 vs 0, ABAB, h100-speech 09e53e76: 76.7 / 77.1 -> 79.5 /
+# 80.0 aps, CER median 0.000 n=256 in every arm).
+env = { PLOW_VMM_PREFIX = "0", PLOW_LT_RUNG_ALGOS = "true" }
 
 [bench]
 kind = "speech"

@@ -98,6 +98,9 @@ args = ["--s3gen-weights", "s3gen_v3.safetensors"]
 rel_l2_max = 1e-3
 timeout_s = 1800
 
-# VMM-backed KV prefix cache on every request path (sessions, shared system prompts, replays).
+# VMM prefix cache off: requested on (c240cf01) it cost 9-10% of served throughput at c200 on H100
+# (tts_bench c200 --n 800 stream, same lease, h100-speech 09e53e76: VMM on 70.1 / 71.9 aps, TTFA
+# p50 6.57 s; off 77.7 / 78.3 aps, TTFA p50 6.30 s; the e53e48f4 bundle 77.3 off -> 71.5 forced on).
+# c1 unchanged (8.1 aps, TTFA 134-136 ms).
 [serve.env]
-PLOW_VMM_PREFIX = "1"
+PLOW_VMM_PREFIX = "0"
