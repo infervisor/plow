@@ -138,10 +138,80 @@ the eos set came from the `config.json` fallback rather than `generation_config.
 - `/v1/completions` accepts all four OpenAI prompt forms; batches are refused explicitly.
 - `messages[].content` may be `null`, so an assistant tool-call turn can be replayed.
 - Malformed JSON returns the envelope, not axum's plain-text rejection.
-- **Refused rather than silently dropped**: `n != 1`, `tools`, `tool_choice`, `functions`,
-  `function_call`, `response_format`, `echo`, `suffix`, `best_of`. (`logprobs` / `top_logprobs`
-  were on this list; they are served on the CUDA engine since 2026-09-27, see below.)
-  A silently dropped `tools` is a confidently wrong answer that scores as success.
+- **Refused rather than silently dropped**: `n != 1`, `functions`, `function_call`,
+  `response_format`, `echo`, `suffix`, `best_of`, and `tools` wherever §2b cannot honor them.
+  (`logprobs` / `top_logprobs` were on this list; they are served on the CUDA engine since
+  2026-09-27, see below.) A silently dropped `tools` is a confidently wrong answer that scores
+  as success.
+
+## 2b. Tool calling
+
+`tools`, `tool_choice` (`"auto"` / `"none"`), `parallel_tool_calls`, assistant `tool_calls` and
+`role: "tool"` results are served on `/v1/chat/completions`, streamed and not, for any model whose
+own chat template renders tools in a call syntax the server parses (`crates/plowrt/src/serve/tools/`).
+Nothing is keyed on the model name.
+
+**Is it supported?** Decided per model at load: the template is rendered once with a probe tool
+(`ToolSupport::probe`). A template that never prints it ignores `tools` (Mixtral, DeepSeek-V3.x
+whose templates have no tools block) and the request is refused (400, `param: tools`) instead of
+answered without them. A model served without a template (built-in builders: Kimi-K3, DeepSeek-V4
+with its Python-only `encoding_dsv4.py`) refuses `tools` and assistant `tool_calls` history.
+
+**Call syntax**, read from the template's own markers (`ToolFormat::detect`), with one streaming
+parser each:
+
+| format | families (template checked) | model output |
+|---|---|---|
+| `gemma4` | Gemma 4 E4B / 12B / 26B / 31B | `<\|tool_call>call:NAME{k:<\|"\|>v<\|"\|>,n:1}<tool_call\|>` |
+| `hermes` | Qwen3, Qwen2.5, Hermes | `<tool_call>{"name": .., "arguments": {..}}</tool_call>` (after any `<think>` trace) |
+| `qwen3_xml` | Qwen3.5, Qwen3-Coder | `<tool_call><function=NAME><parameter=K>V</parameter></function></tool_call>`; values typed by the tool's JSON schema |
+| `glm45` | GLM-4.5 / 4.6 / 5 / 5.3 | `<tool_call>NAME<arg_key>K</arg_key><arg_value>V</arg_value></tool_call>` |
+| `llama3_json` | Llama 3.1 / 3.2 / 3.3 | an answer that opens with `{"name": .., "parameters": {..}}` (or `<\|python_tag\|>`), `;`-separated |
+| `mistral` | Mistral v0.3 (`[TOOL_CALLS] [..]`) and v11+ (`[TOOL_CALLS]NAME[ARGS]{..}`) | ids are 9 alphanumerics, as the template requires |
+| `kimi_k2` | Kimi-K2 | `<\|tool_call_begin\|>functions.NAME:IDX<\|tool_call_argument_begin\|>{..}`; the id is kept |
+| `harmony` | gpt-oss | `commentary to=functions.NAME` messages; `analysis` → `reasoning_content` |
+
+A template that renders tools in any other syntax refuses `tools` (400) rather than returning
+unparsed calls as text.
+
+**Request mapping** (`tools::request`), matching vLLM's hand-off to `apply_chat_template`:
+`tools` is passed through unchanged; `tool_calls[].function.arguments` strings become objects
+(a template that concatenates strings, DeepSeek's, is re-rendered with the original strings);
+a tool-call turn's `content: null` becomes `""` (gpt-oss's template fails on `None`, GLM-4.5's
+prints the word `None`); `tool_call_id`, `name`, `reasoning_content` pass through. Validation:
+function tools only, names `^[a-zA-Z0-9_-]{1,64}$`, unique; `tool` messages need
+`tool_call_id`; history `tool_calls` need `id`, `function.name` and JSON-object `arguments`.
+The renderer now matches `transformers`' Jinja environment: `trim_blocks`/`lstrip_blocks`,
+insertion-ordered maps, `loop.previtem`/`nextitem`, `none is iterable` false, `tojson` as
+Python's `json.dumps` (`", "` / `": "` spacing, `ensure_ascii`, `indent`, `separators`,
+`sort_keys`, float `repr`), and `strip`/`split`/`replace` with Python's arguments.
+
+**Refused** (400): `tool_choice: "required"` and a forced function (no constrained decoding, so
+the call cannot be guaranteed); the deprecated `functions` / `function_call` (use `tools`);
+non-function tool types. `tool_choice: "none"` renders the conversation without `tools` and
+does not parse. `parallel_tool_calls: false` keeps only the first call. An empty `tools: []`
+is the same as none.
+
+**Response.** For these requests the generation is decoded with special tokens KEPT (the call
+markers are special tokens in most vocabularies), split for reasoning, parsed, and only then
+stripped of the remaining special tokens. `message.tool_calls` carries
+`{id, type: "function", function: {name, arguments: <JSON string>}}`, `content` is the text
+before the calls or `null`, and `finish_reason` is `"tool_calls"` when the turn ended on its own
+(a turn cut by `max_tokens` stays `"length"`). Streaming sends, per completed call, one delta with
+`index`, `id`, `type`, `name` and empty `arguments`, then one with the full `arguments`; markers
+never reach `delta.content`. A call is emitted once it is complete, so arguments arrive per call,
+not per token. A malformed or truncated call falls back to text, stripped as before.
+
+**Parity.** `scripts/llm/toolcall_fixtures.py` renders 7 conversations per family with
+`transformers` (`render_jinja_template`, the `apply_chat_template` code path) into
+`crates/plowrt/tests/fixtures/toolcall/`; `serve::tools::parity_tests` renders the same
+OpenAI-shaped requests through the handler's mapping and must match the text, and the token ids
+where the family's `tokenizer.json` is on the host. 15 families: gemma4-e4b, gemma4-12b, qwen3,
+qwen2.5, qwen3.5, qwen3-coder, llama3.1, llama3.2, mistral-v0.3, glm4.5, glm5.3, kimi-k2,
+gpt-oss, and the two refused (deepseek-v3.1, mixtral).
+
+**No packet re-emit is needed**: the format comes from the chat template the packet already
+carries in `serve.json`.
 - `/health` added alongside `/healthz`; `/tokenize` reports `count`; model cards carry
   `created`; request ids are seeded per process instead of starting at zero; CUDA reads the
   same stop-id sources as the AMD and CPU engines.
@@ -244,9 +314,8 @@ the `chat_template` key in `tokenizer_config.json` **as a string or as the list 
 the last two used to fall silently through to the hand-written builders.
 
 `tojson` **takes keyword arguments**. GLM's tool path calls `tojson(ensure_ascii=False)`, which
-minijinja rejected as too many arguments, failing the whole render. `ensure_ascii=True` is
-refused explicitly rather than answered with bytes that do not match the request, because
-`serde_json` never escapes non-ASCII.
+minijinja rejected as too many arguments, failing the whole render. It is now Python's
+`json.dumps` byte for byte, `ensure_ascii=True` included (§2b).
 
 ## 6b. Stop strings, reasoning framing and empty conversations
 
@@ -302,9 +371,12 @@ assistant turn.
 
   The per-model sampling DEFAULTS above are still read and still plumbed; they simply have no
   effect on these two backends yet, and the card says so.
-- **Tool calling is refused, not implemented.** The templates can render tool blocks; nothing
-  parses a tool call back out of the generation.
-- **Only think-tag reasoning is parsed.** `ReasoningMode` covers `<think>`/`</think>`, which is
+- **Tool calling** is served per §2b. Not served: `tool_choice` `required` / forced function,
+  incremental per-token `arguments` streaming, DeepSeek's `<｜tool▁calls▁begin｜>` and DSML
+  syntaxes (no DeepSeek checkpoint ships a template that renders `tools`), and Hermes-3's named
+  `tool_use` template (the default template is picked).
+- **Only think-tag reasoning is parsed** (outside tool requests; a gpt-oss tool request parses
+  its harmony channels, §2b). `ReasoningMode` covers `<think>`/`</think>`, which is
   how GLM, Qwen3 and DeepSeek-R1 frame a trace. gpt-oss's harmony channels are NOT parsed and
   its trace still reaches `content`. A harmony arm was written and then removed rather than
   shipped: the built-in `harmony_chat_prompt` pins the FINAL channel (reasoning off), so a mode
@@ -312,11 +384,6 @@ assistant turn.
   `reasoning_content` and return an empty `content` — the exact failure this section exists to
   remove — and there is no gpt-oss checkpoint on this host to settle what the real template
   renders. The mode enum is the seam: a verified harmony arm is a variant and a close marker.
-- **The handler projects each message to `{role, content}` before rendering**, so a template
-  never sees `tool_calls`, `name` or `reasoning_content`, and `tools` is passed as none. Kimi's
-  template keys the speaker off `message.get('name')`, and every family renders an assistant
-  turn that carried a tool call as an empty one. Latent while `tools` is refused at the API
-  boundary; it is the thing to fix first when tool calling lands.
 - **`logprobs` is served on the CUDA engine only** (chat `logprobs`/`top_logprobs`, completions
   `logprobs` 0..=20, plus vLLM's `logprobs_mode` `raw_logprobs`|`raw_logits` per request and
   `return_tokens_as_token_ids`); other backends refuse it with 400. Values are the raw model

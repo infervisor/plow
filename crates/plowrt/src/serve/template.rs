@@ -33,6 +33,8 @@ pub struct RenderOpts {
     /// vLLM `continue_final_message`: render the last assistant turn as a
     /// prefix to continue instead of opening a fresh one.
     pub continue_final_message: bool,
+    /// OpenAI `tools`, bound as the template's `tools` (`None` renders as Python `None`).
+    pub tools: Option<serde_json::Value>,
 }
 
 /// A checkpoint's chat template, compiled once at load.
@@ -43,6 +45,8 @@ pub struct ChatTemplate {
     eos_token: Option<String>,
     /// Where it came from, for the startup log.
     pub source: String,
+    /// Whether the template renders `tools`, and the call syntax its model answers in.
+    pub tools: crate::serve::tools::ToolSupport,
 }
 
 impl std::fmt::Debug for ChatTemplate {
@@ -68,6 +72,13 @@ impl ChatTemplate {
         eos_token: Option<String>,
     ) -> Option<Arc<ChatTemplate>> {
         let mut env = Environment::new();
+        // `transformers` compiles every chat template with these; without them a template that
+        // relies on them (`{% ... %}` followed by a newline) renders extra whitespace.
+        env.set_trim_blocks(true);
+        env.set_lstrip_blocks(true);
+        // Python's `iter(None)` raises, so Jinja2's `none is iterable` is false; minijinja iterates
+        // none as empty. `tools is iterable and tools | length > 0` (Qwen3-Coder) depends on it.
+        env.add_test("iterable", |v: Value| !v.is_none() && v.try_iter().is_ok());
         // HF templates call `raise_exception` to reject a conversation shape.
         env.add_function("raise_exception", |msg: String| -> Result<Value, minijinja::Error> {
             Err(minijinja::Error::new(
@@ -130,18 +141,35 @@ impl ChatTemplate {
                     minijinja::ErrorKind::UnknownMethod,
                 ));
             };
+            // Python's optional `chars` argument (`content.rstrip('\n')` in Qwen3's template).
+            let strip_set = |chars: Option<&str>| -> Box<dyn Fn(char) -> bool> {
+                match chars {
+                    Some(c) => {
+                        let c = c.to_string();
+                        Box::new(move |x| c.contains(x))
+                    }
+                    None => Box::new(char::is_whitespace),
+                }
+            };
             match method {
                 "strip" => {
-                    let () = from_args(args)?;
-                    Ok(Value::from(s.trim()))
+                    let (c,): (Option<&str>,) = from_args(args)?;
+                    let p = strip_set(c);
+                    Ok(Value::from(s.trim_matches(|x| p(x))))
                 }
                 "lstrip" => {
-                    let () = from_args(args)?;
-                    Ok(Value::from(s.trim_start()))
+                    let (c,): (Option<&str>,) = from_args(args)?;
+                    let p = strip_set(c);
+                    Ok(Value::from(s.trim_start_matches(|x| p(x))))
                 }
                 "rstrip" => {
-                    let () = from_args(args)?;
-                    Ok(Value::from(s.trim_end()))
+                    let (c,): (Option<&str>,) = from_args(args)?;
+                    let p = strip_set(c);
+                    Ok(Value::from(s.trim_end_matches(|x| p(x))))
+                }
+                "replace" => {
+                    let (from, to): (&str, &str) = from_args(args)?;
+                    Ok(Value::from(s.replace(from, to)))
                 }
                 "startswith" => {
                     let (p,): (&str,) = from_args(args)?;
@@ -160,10 +188,13 @@ impl ChatTemplate {
                     Ok(Value::from(s.to_uppercase()))
                 }
                 "split" => {
-                    let (sep,): (Option<&str>,) = from_args(args)?;
-                    let parts: Vec<Value> = match sep {
-                        Some(sep) => s.split(sep).map(Value::from).collect(),
-                        None => s.split_whitespace().map(Value::from).collect(),
+                    // Python's `maxsplit` (`content.split('</think>', 1)` in DeepSeek's template).
+                    let (sep, max): (Option<&str>, Option<i64>) = from_args(args)?;
+                    let n = max.filter(|&m| m >= 0).map(|m| m as usize + 1);
+                    let parts: Vec<Value> = match (sep, n) {
+                        (Some(sep), Some(n)) => s.splitn(n, sep).map(Value::from).collect(),
+                        (Some(sep), None) => s.split(sep).map(Value::from).collect(),
+                        (None, _) => s.split_whitespace().map(Value::from).collect(),
                     };
                     Ok(Value::from(parts))
                 }
@@ -195,60 +226,45 @@ impl ChatTemplate {
                 .format_with_items(parsed.iter())
                 .to_string())
         });
-        // `tojson` under a different spelling, used by tool-calling templates.
-        //
-        // ACCEPTS KEYWORD ARGUMENTS. Python's `json.dumps` takes them and HF
-        // templates pass them through — GLM's tool path calls
-        // `tojson(ensure_ascii=False)`. minijinja rejected the extra argument
-        // outright ("too many arguments"), failing the whole render. The kwargs
-        // are accepted and, where they do not change this serializer's output,
-        // ignored: `serde_json` never escapes non-ASCII, so `ensure_ascii=False`
-        // is already what it does, and `ensure_ascii=True` is the case worth
-        // refusing rather than answering with the wrong bytes.
+        // `tojson` as `transformers` defines it: Python's `json.dumps`, keyword arguments
+        // (`ensure_ascii=False` by default, `indent`, `separators`, `sort_keys`) and spacing
+        // (`", "` / `": "`) included, so a tool schema renders byte for byte as the reference.
         env.add_filter(
             "tojson",
             |v: Value, kwargs: minijinja::value::Kwargs| -> Result<String, minijinja::Error> {
-                if let Some(true) = kwargs.get::<Option<bool>>("ensure_ascii")? {
-                    return Err(minijinja::Error::new(
-                        minijinja::ErrorKind::InvalidOperation,
-                        "tojson(ensure_ascii=True) is not supported: this server's JSON                          serializer emits non-ASCII characters literally",
-                    ));
-                }
-                let indent = kwargs.get::<Option<usize>>("indent")?;
-                kwargs.assert_all_used()?;
-                let out = match indent {
-                    Some(n) => {
-                        let pad = vec![b' '; n];
-                        let mut buf = Vec::new();
-                        let fmt = serde_json::ser::PrettyFormatter::with_indent(&pad);
-                        let mut ser = serde_json::Serializer::with_formatter(&mut buf, fmt);
-                        serde::Serialize::serialize(&v, &mut ser).map_err(|e| {
-                            minijinja::Error::new(
-                                minijinja::ErrorKind::InvalidOperation,
-                                e.to_string(),
-                            )
-                        })?;
-                        String::from_utf8(buf).unwrap_or_default()
-                    }
-                    None => serde_json::to_string(&v).map_err(|e| {
-                        minijinja::Error::new(minijinja::ErrorKind::InvalidOperation, e.to_string())
-                    })?,
+                let err = |m: String| minijinja::Error::new(minijinja::ErrorKind::InvalidOperation, m);
+                let mut opts = crate::serve::tools::pyjson::Opts {
+                    ensure_ascii: kwargs.get::<Option<bool>>("ensure_ascii")?.unwrap_or(false),
+                    indent: kwargs.get::<Option<usize>>("indent")?,
+                    sort_keys: kwargs.get::<Option<bool>>("sort_keys")?.unwrap_or(false),
+                    separators: None,
                 };
-                Ok(out)
+                if let Some(seps) = kwargs.get::<Option<Vec<String>>>("separators")? {
+                    let [item, key] = <[String; 2]>::try_from(seps)
+                        .map_err(|_| err("tojson: `separators` must be a pair".into()))?;
+                    opts.separators = Some((item, key));
+                }
+                kwargs.assert_all_used()?;
+                let json = serde_json::to_value(&v).map_err(|e| err(e.to_string()))?;
+                Ok(crate::serve::tools::pyjson::dumps(&json, &opts))
             },
         );
-        if let Err(e) = env.add_template_owned("chat", text) {
+        if let Err(e) = env.add_template_owned("chat", text.clone()) {
             // A template that will not COMPILE is a defect in the assets, and
             // falling back silently is how a wrong prompt ships. Say which file.
             tracing::error!(%source, error = %e, "chat template failed to compile — falling back to the built-in prompt builders");
             return None;
         }
-        Some(Arc::new(ChatTemplate {
+        let mut t = ChatTemplate {
             env,
             bos_token,
             eos_token,
             source,
-        }))
+            tools: crate::serve::tools::ToolSupport::None,
+        };
+        t.tools = crate::serve::tools::ToolSupport::probe(&t, &text);
+        tracing::info!(source = %t.source, tools = ?t.tools, "chat template tool support");
+        Some(Arc::new(t))
     }
 
     /// Render `messages` with `add_generation_prompt=true` and no extra
@@ -289,7 +305,10 @@ impl ChatTemplate {
         );
         ctx.insert("bos_token".into(), Value::from(self.bos_token.clone()));
         ctx.insert("eos_token".into(), Value::from(self.eos_token.clone()));
-        ctx.insert("tools".into(), Value::from(()));
+        ctx.insert(
+            "tools".into(),
+            opts.tools.as_ref().map_or(Value::from(()), Value::from_serialize),
+        );
         if let Some(effort) = &opts.reasoning_effort {
             ctx.insert("reasoning_effort".into(), Value::from(effort.clone()));
         }

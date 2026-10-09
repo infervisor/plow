@@ -62,6 +62,8 @@ pub struct ModelBundle {
     serving: crate::serve::config::ServingConfig,
     serve: Arc<serve::ServeInfo>,
     reasoning: crate::serve::reasoning::ReasoningMode,
+    /// Built on the first tool-calling request.
+    special_text: std::sync::OnceLock<Arc<crate::serve::tools::SpecialText>>,
 }
 
 impl ModelBundle {
@@ -126,7 +128,14 @@ impl ModelBundle {
             serving,
             reasoning: crate::serve::reasoning::ReasoningMode::from_serve(&serve),
             serve,
+            special_text: std::sync::OnceLock::new(),
         })
+    }
+
+    /// The tokenizer's special-token text, for stripping after tool-call parsing.
+    pub fn special_text(&self) -> &Arc<crate::serve::tools::SpecialText> {
+        self.special_text
+            .get_or_init(|| Arc::new(crate::serve::tools::SpecialText::new(self.tokenizer.special_tokens())))
     }
 
     /// The checkpoint's serving config (sampling defaults + reasoning framing).

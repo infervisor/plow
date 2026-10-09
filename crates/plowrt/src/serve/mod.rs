@@ -36,6 +36,7 @@ pub mod session;
 mod step_lowering_tests;
 pub mod template;
 pub mod tokenize;
+pub mod tools;
 pub mod turns;
 
 use std::sync::Arc;
@@ -83,6 +84,9 @@ pub struct GenParams {
     /// vLLM `stop_token_ids`: request-supplied ids that end generation, on top
     /// of the checkpoint's own eos set.
     pub stop_token_ids: Vec<u32>,
+    /// Stream text with special tokens kept: tool-call markers are special tokens in most
+    /// vocabularies, and the chat handler parses them before stripping the rest.
+    pub keep_special_tokens: bool,
 }
 
 /// The generation budget of a request that named none: the default, capped to the context the
@@ -143,6 +147,7 @@ impl Default for GenParams {
             seed: None,
             min_tokens: 0,
             stop_token_ids: Vec::new(),
+            keep_special_tokens: false,
         }
     }
 }

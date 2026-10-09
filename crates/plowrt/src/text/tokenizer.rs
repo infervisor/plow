@@ -16,6 +16,14 @@ pub trait Tokenize: Send + Sync {
         self.encode(text)
     }
     fn decode(&self, ids: &[u32]) -> String;
+    /// `decode` keeping special tokens as their text (tool-call parsers read the markers).
+    fn decode_keep_special(&self, ids: &[u32]) -> String {
+        self.decode(ids)
+    }
+    /// The text of every token `decode` drops as special.
+    fn special_tokens(&self) -> Vec<String> {
+        Vec::new()
+    }
     /// Number of token ids accepted by the model embedding table.
     fn vocab_size(&self) -> usize;
     /// An upper bound on the input bytes one token covers; `usize::MAX` when unknown.
@@ -389,6 +397,19 @@ impl Tokenize for HfTokenizer {
 
     fn decode(&self, ids: &[u32]) -> String {
         self.inner.decode(ids, true).unwrap_or_default()
+    }
+
+    fn decode_keep_special(&self, ids: &[u32]) -> String {
+        self.inner.decode(ids, false).unwrap_or_default()
+    }
+
+    fn special_tokens(&self) -> Vec<String> {
+        self.inner
+            .get_added_tokens_decoder()
+            .into_values()
+            .filter(|t| t.special)
+            .map(|t| t.content)
+            .collect()
     }
 
     fn vocab_size(&self) -> usize {
