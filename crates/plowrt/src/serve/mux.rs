@@ -6438,18 +6438,24 @@ fn incremental_delta(
         .saturating_sub(MAX_DETOKENIZE_WINDOW)
         .max((*prefix).min(len));
     let effective_read = (*read).clamp(safe_start, len);
-    let decode = |ids: &[u32]| if keep_special { tok.decode_keep_special(ids) } else { tok.decode(ids) };
-    let prefix_text = decode(&out_ids[safe_start..effective_read]);
-    let new_text = decode(&out_ids[safe_start..]);
-    match new_text.get(prefix_text.len()..) {
-        Some(d) if !d.is_empty() && (last || !new_text.ends_with('\u{FFFD}')) => {
-            let d = d.to_string();
-            *prefix = effective_read;
-            *read = len;
-            d
-        }
-        _ => String::new(),
+    thread_local! {
+        static TEXT: std::cell::RefCell<(String, String)> = const { std::cell::RefCell::new((String::new(), String::new())) };
     }
+    TEXT.with_borrow_mut(|(prefix_text, new_text)| {
+        prefix_text.clear();
+        new_text.clear();
+        tok.decode_append(&out_ids[safe_start..effective_read], keep_special, prefix_text);
+        tok.decode_append(&out_ids[safe_start..], keep_special, new_text);
+        match new_text.get(prefix_text.len()..) {
+            Some(d) if !d.is_empty() && (last || !new_text.ends_with('\u{FFFD}')) => {
+                let d = d.to_string();
+                *prefix = effective_read;
+                *read = len;
+                d
+            }
+            _ => String::new(),
+        }
+    })
 }
 
 /// Common per-slot bookkeeping for a produced token: append to `out_ids`,
@@ -8741,10 +8747,25 @@ mod host_bench {
                     .data(crate::serve::stream::chunk_data(&frame)),
             );
         }
+        let serde_event_us = t.elapsed().as_secs_f64() * 1e6 / frames as f64;
+        // The served path: the stream's fixed head serialized once, one choice per frame.
+        let head = crate::serve::stream::FrameHead::new(&id, "text_completion", 1_789_920_673, &model);
+        let t = Instant::now();
+        for i in 0..frames {
+            let choice = CompletionChoice {
+                index: 0,
+                text: if i % 2 == 0 { " the".into() } else { ".".into() },
+                logprobs: None,
+                finish_reason: None,
+                x_plow_finish_reason: None,
+            };
+            let _ = std::hint::black_box(head.frame(&choice));
+        }
         println!(
-            "HOSTBENCH per token: detok_us={:.2} ({n_tok} tokens) sse_frame_us={:.2}",
+            "HOSTBENCH per token: detok_us={:.2} ({n_tok} tokens) sse_frame_us={:.2} (serde+Event {:.2})",
             detok_ns as f64 / 1e3 / n_tok.max(1) as f64,
-            t.elapsed().as_secs_f64() * 1e6 / frames as f64
+            t.elapsed().as_secs_f64() * 1e6 / frames as f64,
+            serde_event_us,
         );
 
         // Per-tick dispatcher <-> engine handoff around a 2 ms tick body, the mux's own shape.
