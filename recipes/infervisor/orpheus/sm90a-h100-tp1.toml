@@ -87,9 +87,7 @@ PLOW_NV_DENSE_TUNE = "1"
 # algorithms per rung (step_bench B=32..64 -3..-5%, digests equal).
 [serve]
 # Env, not flags, so every launcher (campaign serve/gate, plowbench.sh probes) applies it.
-# VMM prefix cache off, as Veena (same Llama-3.2-3B codec LM; measured there: c64 76.7 / 77.1 ->
-# 79.5 / 80.0 aps). Not re-measured on Orpheus.
-env = { PLOW_VMM_PREFIX = "0", PLOW_LT_RUNG_ALGOS = "true" }
+env = { PLOW_VMM_PREFIX = "1", PLOW_LT_RUNG_ALGOS = "true" }
 
 [bench]
 kind = "speech"

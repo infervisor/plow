@@ -100,8 +100,6 @@ env = { PYTHONPATH = "" }
 rel_l2_max = 1e-3
 timeout_s = 1800
 
-# VMM prefix cache off: requested on (c240cf01) it cost ~9% of served throughput at c200 on H100
-# (tts_bench c200 --n 800 stream, release bundle PLOW_VMM_PREFIX=1 vs 0, h100-speech 09e53e76:
-# 70.8 -> 77.6 aps; same finding as chatterbox-mtl).
+# VMM-backed KV prefix cache on every request path (sessions, shared system prompts, replays).
 [serve.env]
-PLOW_VMM_PREFIX = "0"
+PLOW_VMM_PREFIX = "1"

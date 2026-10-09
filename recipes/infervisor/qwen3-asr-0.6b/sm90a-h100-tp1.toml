@@ -10,7 +10,7 @@
 # step_bench A/B was run for 0.6B on H100 (time-boxed bring-up); gate + smoke only.
 # Gate (H100, 09e53e76, packet f7dd071e34c0): WER on the 73-clip LibriSpeech dummy
 # set c1 4.435% / c16 4.261% (L40S/L4 4.261% at both; the B=1 decode path differs). Served c1 p50
-# 42 ms, RTFx 138; c16 RTFx 508 with the VMM prefix cache on (see [serve.env]).
+# 42 ms, RTFx 138; c16 RTFx 508; open loop 80 req/s holds the 1 s SLO for only 74% (L40S 99.4%).
 
 schema = "plow.recipe.v1"
 namespace = "infervisor"
@@ -81,9 +81,6 @@ manifest = "{env:ASR_MANIFEST}"
 conc = "1,16"
 wer_max = 0.045
 
-# VMM prefix cache off: requested on (c240cf01) it cost a quarter of the batched throughput on H100
-# (served_bench, release bundle with PLOW_VMM_PREFIX=1 vs 0, two runs each, h100-speech 09e53e76:
-# c16 RTFx 522 / 532 -> 709 / 720; open loop 80 req/s within 1 s 78.8 / 77.3% -> 100 / 100%, p99
-# 2.16-2.24 s -> 0.42 s; c1 and WER c1 4.435% / c16 4.261% unchanged).
+# VMM-backed KV prefix cache on every request path (sessions, shared system prompts, replays).
 [serve.env]
-PLOW_VMM_PREFIX = "0"
+PLOW_VMM_PREFIX = "1"

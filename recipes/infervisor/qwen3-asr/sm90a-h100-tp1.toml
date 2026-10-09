@@ -78,9 +78,6 @@ manifest = "{env:ASR_MANIFEST}"
 conc = "1,16"
 wer_max = 0.045
 
-# VMM prefix cache off: requested on (c240cf01) it cost a quarter of the batched throughput on H100
-# (served_bench, release bundle with PLOW_VMM_PREFIX=1 vs 0, two runs each, h100-speech 09e53e76:
-# c16 RTFx 427.5 / 428.7 -> 537.0 / 534.1, p50 215 -> 167 ms; open loop 40 req/s p99 422-435 -> 329-330
-# ms; c1 and WER 3.913% unchanged). The e53e48f4 bundle (no VMM) served c16 RTFx 527.
+# VMM-backed KV prefix cache on every request path (sessions, shared system prompts, replays).
 [serve.env]
-PLOW_VMM_PREFIX = "0"
+PLOW_VMM_PREFIX = "1"
