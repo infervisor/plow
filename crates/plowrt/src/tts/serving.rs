@@ -553,6 +553,7 @@ async fn speech_with(
         turn: ids.turn_key.clone(),
         continuing: run.continuing(),
         prefix: None,
+        mm: None,
     };
     let job = crate::serve::mux::Job { prompt_ids: first.prompt_ids, gen: first.gen, arrived: Instant::now(), respond: tx, opts };
     if let Err(err) = mux.submit_arrived(job, t_arrive, Some(mux.ingress())) {
@@ -754,7 +755,7 @@ impl Later {
             s.gen.seed = Some(s.gen.seed.unwrap_or(self.seed ^ k as u64) ^ ((attempt as u64) << 48));
         }
         let (tx, rx) = stream_mod::channel();
-        let opts = crate::serve::mux::JobOpts { class: self.class, raw_tokens: true, speech: None, session: None, turn: None, continuing: false, prefix: None };
+        let opts = crate::serve::mux::JobOpts { class: self.class, raw_tokens: true, speech: None, session: None, turn: None, continuing: false, prefix: None, mm: None };
         let job = crate::serve::mux::Job { prompt_ids: s.prompt_ids, gen: s.gen, arrived: Instant::now(), respond: tx, opts };
         self.mux.submit(job).map(|()| rx).map_err(|e| match e {
             crate::serve::mux::SubmitError::Full(_) => "model request queue full".to_string(),

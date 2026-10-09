@@ -226,6 +226,24 @@ pub struct EmitConfig {
     #[arg(long = "emit-asr-packed-max-chunks", env = "PLOW_ASR_PACKED_MAX_CHUNKS")]
     pub asr_packed_max_chunks: Option<u32>,
 
+    /// Emit the checkpoint's vision/audio towers as encoder sidecars and give the text packet
+    /// soft-token rows (`MmRowsBf16`, `in.mm_slab`, the `plow.multimodal.v1` contract). Off: the
+    /// text packet is unchanged.
+    #[arg(long = "emit-multimodal", env = "PLOW_EMIT_MULTIMODAL", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub multimodal: bool,
+
+    /// Encoder rows of in-flight prompts the text packet holds (`in.mm_slab`, default 8192).
+    #[arg(long = "emit-mm-slab-rows", env = "PLOW_EMIT_MM_SLAB_ROWS")]
+    pub mm_slab_rows: Option<u32>,
+
+    /// Vision encoder rungs: images per launch (default `1,2`).
+    #[arg(long = "emit-mm-vision-ladder", env = "PLOW_EMIT_MM_VISION_LADDER")]
+    pub mm_vision_ladder: Option<String>,
+
+    /// Audio encoder rungs: log-mel frames per clip, multiples of 4 (default `400,1000,2000,3000`).
+    #[arg(long = "emit-mm-audio-ladder", env = "PLOW_EMIT_MM_AUDIO_LADDER")]
+    pub mm_audio_ladder: Option<String>,
+
     /// Rows a request may WRITE per launch when the chunk is staged, which is what the sliding
     /// ring is sized against (`window + stage - 1`) instead of the whole chunk.
     ///
@@ -1483,6 +1501,10 @@ impl EmitConfig {
             max_chunk: env_u32("PLOW_MAX_CHUNK"),
             max_request_chunk: env_u32("PLOW_MAX_REQUEST_CHUNK"),
             asr_packed_max_chunks: env_u32("PLOW_ASR_PACKED_MAX_CHUNKS"),
+            multimodal: env_bool("PLOW_EMIT_MULTIMODAL"),
+            mm_slab_rows: env_u32("PLOW_EMIT_MM_SLAB_ROWS"),
+            mm_vision_ladder: env_str("PLOW_EMIT_MM_VISION_LADDER"),
+            mm_audio_ladder: env_str("PLOW_EMIT_MM_AUDIO_LADDER"),
             stage_rows: env_u32("PLOW_STAGE_ROWS"),
             gemv_split: env_u32("PLOW_GEMV_SPLIT").unwrap_or(1),
             decode_tiled: env_bool("PLOW_DECODE_TILED"),

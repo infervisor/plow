@@ -209,6 +209,10 @@ pub(crate) struct Cfg {
     // Maximum FP32 encoder rows that may replace token embeddings during prefill. Zero means a
     // text-only model. The replacement map and operation remain generic packet data.
     pub(crate) encoder_overlay_rows: u32,
+    // Multimodal soft-token rows (`PLOW_EMIT_MULTIMODAL`): rows of `in.mm_slab` and the pad token
+    // their ids embed as. Zero rows: no soft tokens, the text packet is unchanged.
+    pub(crate) mm_slab_rows: u32,
+    pub(crate) mm_pad: u32,
     // Learned speech-position rows added to the DECODE token embedding (Chatterbox T3:
     // speech_emb[tok] + speech_pos_emb[pos - in.pos_base]). Zero means a plain Embed.
     pub(crate) speech_pos_rows: u32,
@@ -407,6 +411,8 @@ fn cfg_gemma(v: &Value, flat: bool) -> Cfg {
         }
         .to_string(),
         encoder_overlay_rows: 0,
+        mm_slab_rows: 0,
+        mm_pad: 0,
         speech_pos_rows: 0,
         speech_params: Vec::new(),
         tp: 1,
@@ -495,6 +501,8 @@ fn cfg_gemma3(v: &Value) -> Cfg {
         rope_frac_full: 1.0,
         rope_scale,
         encoder_overlay_rows: 0,
+        mm_slab_rows: 0,
+        mm_pad: 0,
         speech_pos_rows: 0,
         speech_params: Vec::new(),
         attn_scale: (t["query_pre_attn_scalar"]
@@ -596,6 +604,8 @@ fn cfg_llama_qwen(v: &Value, arch: Arch) -> Cfg {
         tied: v["tie_word_embeddings"].as_bool().unwrap_or(false),
         prefix: "model.".to_string(),
         encoder_overlay_rows: 0,
+        mm_slab_rows: 0,
+        mm_pad: 0,
         speech_pos_rows: 0,
         speech_params: Vec::new(),
         tp: 1,
@@ -646,6 +656,8 @@ fn cfg_bert(v: &Value) -> Cfg {
         tied: v["tie_word_embeddings"].as_bool().unwrap_or(true),
         prefix: if v.get("bert").is_some() { "bert.".into() } else { "model.".into() },
         encoder_overlay_rows: 0,
+        mm_slab_rows: 0,
+        mm_pad: 0,
         speech_pos_rows: 0,
         speech_params: Vec::new(),
         tp: 1,
@@ -700,6 +712,8 @@ fn cfg_modernbert(v: &Value) -> Cfg {
         tied: v["tie_word_embeddings"].as_bool().unwrap_or(true),
         prefix: "model.".to_string(),
         encoder_overlay_rows: 0,
+        mm_slab_rows: 0,
+        mm_pad: 0,
         speech_pos_rows: 0,
         speech_params: Vec::new(),
         tp: 1,

@@ -306,6 +306,9 @@ pub fn classify(op: DevOp) -> OpClass {
         DevOp::Q8GemmF32 => a_rows("i0=M, dense FP32 rows"),
         DevOp::LayerNormF32 => a_rows("i0=rows"),
         DevOp::RowStatsF32 => a_rows("i0=rows"),
+        DevOp::RmsNormF32 => a_rows("i0=rows"),
+        DevOp::RopeAxialF32 => a_rows("i0=rows, t1=positions per row"),
+        DevOp::MmRowsBf16 => a_rows("i0=rows, t1=ids per row"),
         DevOp::ScaledAddF32 => a_elem("i0=n"),
         DevOp::GluF32 => a_rows("i0=rows"),
         DevOp::SiluF32 => a_elem("i0=n"),
@@ -329,7 +332,7 @@ pub fn classify(op: DevOp) -> OpClass {
             cls_c("causal rows belong to one sequence"),
             "run once per request span until a span descriptor is bound",
         ),
-        DevOp::RelativeAttentionF32 | DevOp::GroupedAttentionF32 | DevOp::AttentionF32 => note(
+        DevOp::RelativeAttentionF32 | DevOp::GroupedAttentionF32 | DevOp::AttentionF32 | DevOp::ChunkAttentionF32 => note(
             cls_c("attention rows belong to one sequence"),
             "run once per request span until a span descriptor is bound",
         ),
