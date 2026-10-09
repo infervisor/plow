@@ -541,6 +541,27 @@ repro 834d0b6c (base), two interleaved runs each, p50/p95 ms and underrun turns:
   expense. 200 calls need a share policy, e.g. render a stream only as far ahead of its playback
   clock as needed and give the freed turns to first tokens and ASR finals.
 
+### Live sliding rings in `voice-core` (2026-10-09, exploration, not promoted)
+
+`PLOW_VMM_LIVE_RINGS_MODELS=gemma-4-e4b` commits a 160 MiB ring slot per admitted request. In
+prefix mode (`vmm_bringup`) the rings never enable handle recycling, so every admission pays
+40 x `cuMemCreate`+map+`set_access` and every retire 40 x unmap+`cuMemRelease`. Candidate: recycle
+units (`enable_handle_recycling(slot_charge)`) and keep the lowest parked slots within the cap
+when the rings go idle. One rep each (plowrt 249050c1 + candidate, kit3 bundles, H100):
+
+| arm | E4B c1 TTFT p50 | E4B c64 out tok/s (TPOT p50) | E4B mem load/after | voice 32 calls E2E p50/p95 | voice 64 calls E2E p50/p95 (ASR final p95) |
+|---|---|---|---|---|---|
+| flat rings (`=none`) | 20.7 ms | 4058 (14.76) | 42.0 / 37.9 GiB | - | - |
+| live rings, HEAD | 27.7 ms | 3253 (18.62) | 21.6 / 17.4 GiB | 1087 / 2009 | 1510 / 2563 (525) |
+| live rings + recycling | 20.8 ms | 3920 (14.79) | 21.7 / 17.4 GiB | 1097 / 2041 | 1675 / 2914 (590) |
+| + `PLOW_PF_ATTN_GEMM=0` | 15.1 ms | 4681 (12.30) | 21.5 / 17.2 GiB | 1158 / 2289 | 1673 / 3137 (560) |
+
+* Recycling recovers 83% of the E4B c64 loss and all of the c1 TTFT loss at the same memory.
+  `PLOW_PF_ATTN_GEMM=0` is +19% on top at ISL 1000 (c64 TTFT p50 107 -> 76 ms).
+* The voice-agent mix did not follow in one rep: 64-call E2E p95 rose 2563 -> 2914 / 3137 ms
+  and ASR final p95 stayed over 500 ms. Needs REPS=2 and the E4B gate before either change is
+  promoted. Raw evidence: `/opt/dlami/nvme/lava-tts/e4bvc/r1`, patch `e4bvc/lever1.patch`.
+
 ## Kernel work and where the time goes
 
 B=1 op costs (`step_bench --sweep`, instruction-cap deltas, earlier build of the same program):
