@@ -186,6 +186,12 @@ pub struct RuntimeConfig {
     #[arg(long = "asr-request-timeout-ms", env = "PLOW_ASR_REQUEST_TIMEOUT_MS", default_value_t = 120_000, global = true)]
     pub asr_request_timeout_ms: u64,
 
+    /// Upper bound (tokens) on an audio-LM request's context (`prompt`). The context is otherwise
+    /// sized per request to what the window leaves after the template, the audio and the output
+    /// reserve, trimmed from its oldest words. 0 = no bound beyond the window.
+    #[arg(long = "asr-context-max-tokens", env = "PLOW_ASR_CONTEXT_MAX_TOKENS", default_value_t = 0, global = true)]
+    pub asr_context_max_tokens: usize,
+
     /// API keys a request must present as `Authorization: Bearer <key>` or `x-api-key: <key>`.
     /// Repeatable; the environment form is comma-separated. `/health` and `/healthz` stay open.
     /// Unset = no authentication.
