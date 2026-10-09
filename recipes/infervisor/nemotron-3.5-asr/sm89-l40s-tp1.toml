@@ -39,7 +39,8 @@ stream_rows = 4
 interp_sm89_speech = "-DPLOW_SPEECH_OPS=0x20000ffffull"
 
 [serve]
-# plowrt serve --asr-packet <served name>=<dir>/nemotron.pkt,tokenizer=<dir>/tokenizer.q8_0.gguf,backend=cuda
+# plowrt serve --asr-packet <served name>=<dir>/nemotron.pkt,backend=cuda
+# (speech contract 1: the packet carries its vocabulary and language; no tokenizer file)
 served_name = "nemotron-3.5-asr"
 backend = "cuda"
 
