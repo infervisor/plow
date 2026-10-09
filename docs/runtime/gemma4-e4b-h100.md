@@ -75,7 +75,23 @@ The flag adds `mm_vision.pkt` (SigLIP-style tower, 16 layers, plus `embed_vision
     the logit softcap.
   * Clipped linears are lowered as clamp → dense → clamp. The depthwise conv is lowered as 5
     shifted gathers × per-channel taps.
-* **Parity.** See "Multimodal parity" below.
+* **Parity vs HF transformers (bf16, H100).** Harness: `scripts/mm/hf_ref.py`,
+  `crates/plowrt/examples/mm_check.rs` and `scripts/mm/gate.py`.
+  * **Preprocessing.**
+    * Log-mel: max abs 5e-7.
+    * Pixels: ≤ 2 levels (PNG), ≤ 3 levels (JPEG decoder rounding). Mean ≤ 0.026 levels.
+    * Soft-token counts are identical.
+  * **Projected soft tokens (4 images, 3 clips).**
+    * Image: cosine ≥ 0.9996, relL2 ≤ 0.028.
+    * Audio: cosine ≥ 0.9999, relL2 ≤ 0.011.
+  * **Served greedy (10 chat cases: image, two images, ASR, audio Q&A, image+audio).**
+    * Prompt token counts all equal.
+    * 9/10 completions identical; image+audio diverges after 20 words.
+    * A repeat (prefix-cache hit) is identical.
+    * Same-text/different-media pairs differ as in HF.
+  * **Text-only with the flag on.**
+    * `gemma_logit_parity`: top1 0.990, KL mean 7.4e-4.
+    * Greedy tokens identical to the release packet on all 9 cases.
 
 ## Logprobs API
 
