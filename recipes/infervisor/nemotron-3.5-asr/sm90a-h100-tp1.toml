@@ -1,0 +1,53 @@
+# Nemotron-3.5-ASR-streaming-0.6B on H100 (sm_90a, 132 SMs): the L4/L40S recipes' `rnnt.greedy.v1`
+# packet pipeline from the Q8_0 GGUF (offline encoder buckets + cache-aware stream programs) compiled
+# for 132 SMs, FP32 speech ops on the sm_90a speech object (specialized to the packet's ops). Not a
+# plowc emit; [build].script is the reproducible build.
+#
+#   PLOW_CAMPAIGN_NO_NIX=1 (this box only) \
+#   scripts/asr/nvidia/nemotron_l4_build.sh <q8_0.gguf> <fresh dir> 132 sm_90a
+#
+# Carried over from L40S unmeasured on H100: buckets, joint_batch 16, stream_rows 4 (no knob is
+# arch-specific here except the speech object, which is rebuilt for sm_90a).
+# Gate: WER on the 73-clip LibriSpeech dummy set; L4/L40S 5.13%.
+
+schema = "plow.recipe.v1"
+namespace = "infervisor"
+name = "nemotron-3.5-asr"
+label = "sm90a-h100-tp1"
+plow_git = "3e2fb6efc3f3d67f5b11649a5bdc057e5ab489da"
+network = "fastconformer-rnnt"
+doc = "docs/runtime/asr.md"
+
+[target]
+vendor = "nvidia"
+isa = "sm_90a"
+sku = "H100 SXM5"
+units = 132
+num_gpus = 1
+parallel = "tp"
+
+[checkpoint]
+source = "hf:nvidia/nemotron-3.5-asr-streaming-0.6b"
+revision = "ea30d66debe3740a08b573244286791d423d6b3e"
+file = "nemotron-3.5-asr-streaming-0.6b.q8_0.gguf"
+
+[build]
+script = "scripts/asr/nvidia/nemotron_l4_build.sh"
+compiler = "crates/plowrt/examples/asr/nemotron_pipeline_compile.rs"
+feature_frames = "200,400,600,800,1000,1200,1400,1600,1800,2000,2200,2400,2600,2800,3000"
+joint_batch = 16
+n_cu = 132
+arch = "sm_90a"
+stream_rows = 4
+[build.objects]
+interp_sm90a_speech = "-DPLOW_SPEECH_OPS=0x20000ffffull"
+
+[serve]
+# plowrt serve --asr-packet <served name>=<dir>/nemotron.pkt,tokenizer=<dir>/tokenizer.q8_0.gguf,backend=cuda
+served_name = "nemotron-3.5-asr"
+backend = "cuda"
+
+[gates.asr_wer]
+manifest = "{env:ASR_MANIFEST}"
+conc = "1"
+wer_max = 0.055

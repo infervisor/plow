@@ -1,0 +1,103 @@
+# Orpheus 3B TTS (orpheus-3b-0.1-ft) on H100 (sm_90a, 132 SMs), BF16: the Veena H100 recipe's
+# codec-LM contract (same Llama-3.2-3B shapes) with the `orpheus` profile, the same way the L40S
+# Orpheus recipe takes the Veena L40S one. SNAC decoder as codec.pkt on the sm_90a speech object.
+#
+#   PLOW_CAMPAIGN_NO_NIX=1 (this box only) PYREF=<python with torch+snac> \
+#   python3 scripts/campaign/campaign.py build recipes/infervisor/orpheus/sm90a-h100-tp1.toml --out <fresh dir>
+#
+# Checkpoint: unsloth/orpheus-3b-0.1-ft, the ungated mirror of canopylabs/orpheus-3b-0.1-ft (gated;
+# no token on the build box). Every decode/prefill knob is the Veena H100 recipe's, measured there on
+# the identical Llama-3.2-3B shapes; none was re-measured on Orpheus (time-boxed bring-up).
+# Gate: Whisper CER median; L40S 0.000 (n=80).
+
+schema = "plow.recipe.v1"
+namespace = "infervisor"
+name = "orpheus"
+label = "sm90a-h100-tp1"
+plow_git = "3e2fb6efc3f3d67f5b11649a5bdc057e5ab489da"
+network = "llama"
+doc = "docs/runtime/tts.md"
+tracker = "docs/runtime/h100-speech-recipes.md"
+
+[target]
+vendor = "nvidia"
+isa = "sm_90a"
+sku = "H100 SXM5"
+units = 132
+num_gpus = 1
+parallel = "tp"
+
+[checkpoint]
+source = "hf:unsloth/orpheus-3b-0.1-ft"
+revision = "eae2b6e5e429c81b95ac42a883ac64f126583d43"
+codec = "hf:hubertsiuzdak/snac_24khz"
+codec_revision = "d73ad176a12188fcf4f360ba3bf2c2fbbe8f58ec"
+
+[cell]
+name = "orpheus-h100"
+hf_dir = "{hf:unsloth/orpheus-3b-0.1-ft@eae2b6e5e429c81b95ac42a883ac64f126583d43}"
+gpu = "h100"
+arch = "sm_90a"
+n_cu = 132
+n_gpu = 1
+max_ctx = 2048
+
+# SNAC decoder export (folded weight norm, torch layouts) read by the codec lowering.
+[[prep]]
+name = "snac-export"
+script = "scripts/tts/snac_export.py"
+args = ["{out}/prep/snac"]
+
+[emit]
+emit = "devblob+cubin"
+# The OpenAI `model` id plowrt serves the bundle under (weights.json served_name).
+args = ["--served-name", "orpheus"]
+[emit.env]
+PLOW_TTS_PROFILE = "orpheus"
+PLOW_TTS_CODEC_DIR = "{out}/prep/snac"
+PLOW_VERIFY_BIN = "{repo}/lean-plow/.lake/build/bin/plow_verify"
+# Speech-shaped rungs: prompts are ~20-60 rows, so prefill 64..512 instead of 128..2048;
+# decode up to 32 concurrent streams (the GV_MM_MAX=32 object keeps B=1 within 1%).
+# Decode ladder: rungs past 32 run the one-pass wide GEMV (`_gw` object); 48/96 pay 5-13% over
+# rounding up to 64/128 (Veena step_bench ctx 1024: 8.21 vs 9.08, 11.56 vs 13.28 ms), 3/6/12/24 < 3%.
+PLOW_MAX_CHUNK = "512"
+PLOW_PF_LADDER_APPEND = "64,256"
+PLOW_DECODE_BATCH_LADDER = "1,2,4,8,16,32,48,64,96,128"
+PLOW_EMIT_PREFILL_CUBLASLT = "1"
+# Decode rungs of 32+ rows run their projections on cuBLASLt, with paired k|v and gate|up,
+# fused q|k|v and light kernels between library calls (step_bench ctx 384 B=32 4.60 -> 4.26 ms;
+# B=16 loses 3.61 -> 3.94). The lm_head runs its 16-aligned columns on cuBLASLt too (B=128 -3%).
+PLOW_EMIT_DECODE_CUBLASLT = "1"
+# hd128 row-group flash decode with merge fold (gated here; changes attention sum order).
+PLOW_NV_FA_FOLD = "1"
+PLOW_EMIT_DECODE_CUBLASLT_MIN_ROWS = "32"
+PLOW_EMIT_DECODE_CUBLASLT_HEAD = "1"
+PLOW_NO_GLU_FUSE = "1"
+PLOW_FUSE_KV_HNR = "1"
+# Opt-ins measured on this model: packed prefill at hd64/hd128, and the dense hd <= 128 decode
+# tuning (gemv_k8 + L2 prefetch, tensor-core decode scores, classic B=1 GEMVs below K 3840).
+PLOW_EMIT_PACKED_PREFILL_SMALL_HD = "1"
+PLOW_NV_DENSE_TUNE = "1"
+
+# Served flags (campaign serve/bench/gate). Scheduling follows the default `auto` objective: the
+# lookahead-1 decode pipeline (greedy c64/c128 +3-5%, c1 TPOT and CER unchanged), adaptive
+# multistep, and a one-frame (7-code) quantum at low load. --lt-rung-algos times cuBLASLt
+# algorithms per rung (step_bench B=32..64 -3..-5%, digests equal).
+[serve]
+# Env, not flags, so every launcher (campaign serve/gate, plowbench.sh probes) applies it.
+env = { PLOW_VMM_PREFIX = "1", PLOW_LT_RUNG_ALGOS = "true" }
+
+[bench]
+kind = "speech"
+client = "scripts/tts/tts_bench.py"
+arms = ["--conc 1 --stream --wav --n 16 --prompt-set chatterbox --voice tara", "--conc 1 --n 16 --prompt-set chatterbox --voice tara", "--conc 8 --stream --n 32 --prompt-set chatterbox --voice tara", "--conc 32 --stream --n 64 --prompt-set chatterbox --voice tara"]
+reference = "scripts/tts/vllm_speech_probe.sh"
+
+# `campaign.py gate <recipe> --assets <dir> --out <dir>`: Whisper CER of served speech (python with
+# transformers + jiwer + librosa). English prompts on an Orpheus voice (Veena voices are not in
+# prompt.voices: 400).
+[gates]
+python = "{env:PYREF}"
+[gates.tts_cer]
+arms = ["--conc 1 --stream --wav --n 16 --prompt-set chatterbox --voice tara", "--conc 32 --stream --wav --n 64 --prompt-set chatterbox --voice tara"]
+cer_median_max = 0.05
