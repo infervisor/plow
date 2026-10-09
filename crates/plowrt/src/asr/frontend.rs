@@ -23,8 +23,8 @@ pub enum AudioError {
     Invalid(String),
     #[error("{0}")]
     Unsupported(String),
-    #[error("audio exceeds 30 seconds")]
-    TooLong,
+    #[error("audio exceeds {0} seconds")]
+    TooLong(usize),
 }
 
 /// Input sample rates accepted (WAV and the WebSocket stream); audio is resampled to 16 kHz.
@@ -32,7 +32,12 @@ pub const MIN_INPUT_RATE: u32 = 8_000;
 pub const MAX_INPUT_RATE: u32 = 48_000;
 
 pub fn decode_wav(bytes: &[u8]) -> std::result::Result<Vec<f32>, AudioError> {
-    let (samples, rate) = read_wav(bytes)?;
+    decode_wav_within(bytes, MAX_SAMPLES)
+}
+
+/// [`decode_wav`] of audio up to `max_samples` (16 kHz) long.
+pub fn decode_wav_within(bytes: &[u8], max_samples: usize) -> std::result::Result<Vec<f32>, AudioError> {
+    let (samples, rate) = read_wav(bytes, max_samples)?;
     let samples = if rate == SAMPLE_RATE {
         samples
     } else {
@@ -50,7 +55,7 @@ pub fn decode_wav(bytes: &[u8]) -> std::result::Result<Vec<f32>, AudioError> {
 /// [`decode_wav`] for a piece of a longer recording: any length up to 30 seconds, 16 kHz only
 /// (resampling each piece on its own would put seams at the piece boundaries).
 pub fn decode_wav_chunk(bytes: &[u8]) -> std::result::Result<Vec<f32>, AudioError> {
-    let (samples, rate) = read_wav(bytes)?;
+    let (samples, rate) = read_wav(bytes, MAX_SAMPLES)?;
     if rate != SAMPLE_RATE {
         return Err(AudioError::Unsupported(
             "appended recording pieces must be 16 kHz WAV; the WebSocket stream resamples".into(),
@@ -59,8 +64,8 @@ pub fn decode_wav_chunk(bytes: &[u8]) -> std::result::Result<Vec<f32>, AudioErro
     Ok(samples)
 }
 
-/// Mono samples (stereo averaged) and their rate, at most 30 seconds.
-fn read_wav(bytes: &[u8]) -> std::result::Result<(Vec<f32>, u32), AudioError> {
+/// Mono samples (stereo averaged) and their rate, at most `max_samples` at 16 kHz.
+fn read_wav(bytes: &[u8], max_samples: usize) -> std::result::Result<(Vec<f32>, u32), AudioError> {
     let invalid = |message| AudioError::Invalid(message);
     let mut reader = hound::WavReader::new(Cursor::new(bytes))
         .map_err(|e| invalid(format!("invalid WAV: {e}")))?;
@@ -70,8 +75,8 @@ fn read_wav(bytes: &[u8]) -> std::result::Result<(Vec<f32>, u32), AudioError> {
             "ASR requires 8-48 kHz mono/stereo WAV".into(),
         ));
     }
-    if reader.duration() as u64 * u64::from(SAMPLE_RATE) > MAX_SAMPLES as u64 * u64::from(spec.sample_rate) {
-        return Err(AudioError::TooLong);
+    if reader.duration() as u64 * u64::from(SAMPLE_RATE) > max_samples as u64 * u64::from(spec.sample_rate) {
+        return Err(AudioError::TooLong(max_samples / SAMPLE_RATE as usize));
     }
     let samples: Vec<f32> = match spec.sample_format {
         hound::SampleFormat::Float if spec.bits_per_sample == 32 => reader

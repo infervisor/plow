@@ -192,6 +192,12 @@ pub struct RuntimeConfig {
     #[arg(long = "asr-context-max-tokens", env = "PLOW_ASR_CONTEXT_MAX_TOKENS", default_value_t = 0, global = true)]
     pub asr_context_max_tokens: usize,
 
+    /// A `vad.silero.v1` packet (`asr_silero_vad_compile`), run on the CPU: it serves
+    /// `/v1/audio/vad`, answers uploads without speech with an empty transcript before any model
+    /// runs, and ends streaming turns in place of the energy endpointer. Unset = none of these.
+    #[arg(long = "asr-vad-packet", env = "PLOW_ASR_VAD_PACKET", global = true)]
+    pub asr_vad_packet: Option<std::path::PathBuf>,
+
     /// API keys a request must present as `Authorization: Bearer <key>` or `x-api-key: <key>`.
     /// Repeatable; the environment form is comma-separated. `/health` and `/healthz` stay open.
     /// Unset = no authentication.

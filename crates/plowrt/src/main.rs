@@ -811,6 +811,7 @@ async fn async_main(asset_defaults: Vec<(String, String, String)>) -> Result<(),
                 )?;
                 println!("{}", serde_json::to_string(&result)?);
             } else {
+                plowrt::asr::vad::configured()?;
                 let server = plowrt::asr::serving::AsrServer::new(served_model, engine);
                 serve_asr(server, bind, port.unwrap(), socket, websocket).await?;
             }
@@ -3325,6 +3326,7 @@ async fn bringup_runtime(
         use plowrt::memory::vmm::VmmOps as _;
         use plowrt::serve::placement::{self, ModelSpec, Place};
 
+        plowrt::asr::vad::configured()?;
         // Packet ASR models load first, on device 0: the planner then sees the memory they took.
         let packets = &RuntimeConfig::get().asr_packets;
         let mut packet_bytes = 0u64;

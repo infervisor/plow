@@ -4,6 +4,7 @@
 
 use std::ops::Range;
 use std::path::Path;
+use std::sync::{Arc, OnceLock};
 
 use packet::dev::{DevInst64, DevOp, TENSOR_NONE16};
 
@@ -43,6 +44,22 @@ pub struct VadStream {
 
 fn reject(message: impl Into<String>) -> RuntimeError {
     RuntimeError::Rejected(message.into())
+}
+
+/// The `--asr-vad-packet` VAD, loaded once; `Err` when it is configured but does not load.
+pub fn configured() -> Result<Option<Arc<Vad>>> {
+    static VAD: OnceLock<std::result::Result<Option<Arc<Vad>>, String>> = OnceLock::new();
+    VAD.get_or_init(|| match &crate::config::RuntimeConfig::get().asr_vad_packet {
+        None => Ok(None),
+        Some(path) => Vad::load(path).map(|vad| Some(Arc::new(vad))).map_err(|e| format!("{}: {e}", path.display())),
+    })
+    .clone()
+    .map_err(RuntimeError::Rejected)
+}
+
+/// Total detected speech in `segments`, in samples.
+pub fn speech_samples(segments: &[Range<usize>]) -> usize {
+    segments.iter().map(ExactSizeIterator::len).sum()
 }
 
 impl Vad {
@@ -472,17 +489,21 @@ pub struct SegmentOptions {
     pub min_silence_at_max_speech_ms: u32,
 }
 
+impl SegmentOptions {
+    pub const DEFAULT: Self = Self {
+        threshold: 0.5,
+        neg_threshold: None,
+        min_speech_ms: 250,
+        max_speech_s: f32::INFINITY,
+        min_silence_ms: 100,
+        speech_pad_ms: 30,
+        min_silence_at_max_speech_ms: 98,
+    };
+}
+
 impl Default for SegmentOptions {
     fn default() -> Self {
-        Self {
-            threshold: 0.5,
-            neg_threshold: None,
-            min_speech_ms: 250,
-            max_speech_s: f32::INFINITY,
-            min_silence_ms: 100,
-            speech_pad_ms: 30,
-            min_silence_at_max_speech_ms: 98,
-        }
+        Self::DEFAULT
     }
 }
 
