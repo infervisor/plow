@@ -1,4 +1,4 @@
-"""ref_layer.py <hf_dir> <layer> <ctx> <outdir>: FP32 reference for one Gemma-4 text decoder layer at one decode step.
+"""ref_layer.py <hf_dir> <layer> <ctx> <outdir> [chunk]: FP32 reference for one Gemma-4 text decoder layer at one decode step.
 
 Runs the HF model in FP32 on <ctx> tokens of real text (repo docs), then one decode token, stopping after <layer>.
 Dumps to <outdir>: the layer's BF16 weights, its inputs at the decode step (hidden state, per-layer input, RoPE
@@ -77,10 +77,13 @@ hs.append(layer.register_forward_hook(post_layer, with_kwargs=True))
 from transformers import DynamicCache
 
 cache = DynamicCache(config=cfg)
-try:
-    lm(input_ids=ids[:, :ctx], past_key_values=cache, use_cache=True)
-except Stop:
-    pass
+# chunked prefill ([chunk] tokens, default 8192) keeps the attention masks and scores small at 64K-128K context
+chunk = int(sys.argv[5]) if len(sys.argv) > 5 else 8192
+for c0 in range(0, ctx, chunk):
+    try:
+        lm(input_ids=ids[:, c0:min(ctx, c0 + chunk)], past_key_values=cache, use_cache=True)
+    except Stop:
+        pass
 cap.clear()
 # The layer's cache before the decode step (sliding layers keep window - 1 rows); the decode token attends to these
 # plus its own new row.

@@ -24,6 +24,17 @@
  *   attention combine remains (7 of 8 barriers removed).
  * L2R_BARRIER=diss|hier: dissemination flags, or a per-node arrival counter -> node leaders -> per-node gate (all
  *   lines homed on their node).
+ * P4 KV policy knobs:
+ *   L2R_KV_COPIES=r: r copies of every worker's KV slice, step st reads copy st % r (r x KV > L3 = path A, KV from
+ *     DRAM every step; r = 1 = path B, KV left wherever the previous step put it).
+ *   L2R_KV_TILE_KIB=t: attention in tiles of t KiB of K+V per KV head (online softmax across tiles); 0 = one tile.
+ *   L2R_KV_PFD=d, L2R_KV_PFH=t0|t1|t2|nta: software prefetch of the K / V row d rows ahead (path C, in-loop).
+ *   L2R_KV_EARLY_KIB=n: at the start of the step, before the qkv GEMV, prefetch (L2R_KV_PFH) the first n KiB of this
+ *     step's K and V slice per KV head (path C, staged ahead; its cost is inside the step).
+ *   L2R_SEQS=b (repnt/rep only): b sequences, each with its own KV copy (same contents) and its own attention and
+ *     combine; the GEMVs stay batch 1 (sequence 0), so this models the KV side of concurrency b only.
+ *   L2R_ATTN_ONLY=1: skip every GEMV (timing of attention, combine and sync alone; numerics not checked).
+ * L2R_PERF_CTL=<fifo>: write enable / disable to a `perf stat -D -1 --control fifo:<fifo>` around the timed steps.
  * L2R_NOBCAST=1: after step 0 every worker reads private snapshots of the shared vectors (identical values, since
  * the step repeats), which removes the activation all-gather from the timing; writes are unchanged.
  * Prints one JSON line: per-boundary error vs the FP32 reference (first and last step), step p50/p95/p99,
@@ -53,6 +64,9 @@ static const char* DIR;
 static int NW, STEPS, AMX, REP, NOBCAST;
 static size_t RESKIB;
 static int PLFD = -1;
+static int KVR = 1, TILE_KIB, PFD, PFH, SEQS = 1, ATTN_ONLY;
+static size_t EARLY_KIB;
+static int PERF_FD = -1; /* L2R_PERF_CTL: perf stat --control fifo, enabled for the timed steps only */
 static int BCAST, BARR;               /* L2R_BCAST: 0 direct, 1 rep, 2 repcld, 3 repnt, 4 fid; L2R_BARRIER: 0 diss, 1 hier */
 static int NNODE, nodeof[MAXW], node_first[8], node_count[8];
 /* One broadcast vector: producer w owns elements [off, off + len); in the per-node replicas its segment starts at
@@ -88,6 +102,7 @@ static float *w_in, *w_pa, *w_pf, *w_pff, *w_pn, *w_qn, *w_kn;
 static float *q, *k, *v, *o, *gate, *up, *down, *pg, *pp, *outv;
 static bf16 *attn_b, *act_b, *pact_b;
 static float *pm, *pl, *po; /* partials [NW][NH], [NW][NH], [NW][NH][HD] */
+static float* chk_attn_seq; /* [SEQS][NH*HD], sequences >= 1 */
 static float *chk_qn, *chk_h1, *chk_xn2, *chk_h2, *chk_attn, *chk_act, *chk_pact;
 
 /* ---- per worker ---- */
@@ -98,7 +113,8 @@ typedef struct {
     bf16* ws[9];
     bf16* w[9];
     int p0, p1;           /* KV positions [p0, p1) of 0..CL-1; the last worker also owns the new row */
-    bf16 *kc, *vc;        /* [KVH][p1-p0 (+1)][HD] */
+    bf16 *kv;             /* [KVR][SEQS][K, V][KVH][np][HD] */
+    size_t kvblk;         /* elements of one [KVH][np][HD] block */
     int e0, e1;           /* attention-combine element slice of NH*HD */
     uint32_t lock_id; double held0, held1;
     uint64_t ph[NPH], wt[NPH], pro[NPH]; /* pro: the phase's redundant prologue (reads the shared vectors) */
@@ -345,6 +361,7 @@ static void gemv_amx(const bf16* Wp, int n, int K, const bf16* x, float* y) {
 /* Streamed rows: same math as gemv_avx; the next 4-row block is prefetched non-temporally (into L1, not L2) while the
  * current one is computed, so streaming rows from L3 does not evict the L2-resident part of the slice. */
 static void gemv_nta(const bf16* W, int n, int K, const bf16* x, float* y) {
+    if (ATTN_ONLY) return;
     int r = 0;
     for (; r + 4 <= n; r += 4) {
         const bf16 *w0 = W + (size_t)r * K, *w1 = w0 + K, *w2 = w1 + K, *w3 = w2 + K, *nx = w0 + (size_t)4 * K;
@@ -368,7 +385,7 @@ static void gemv_nta(const bf16* W, int n, int K, const bf16* x, float* y) {
 }
 
 static inline void gemv(const bf16* W, int n, int K, const bf16* x, float* y) {
-    if (n <= 0) return;
+    if (n <= 0 || ATTN_ONLY) return;
     if (AMX) gemv_amx(W, n, K, x, y); else gemv_avx(W, n, K, x, y);
 }
 
@@ -413,52 +430,72 @@ static inline __m512 exp512(__m512 x) {
     return _mm512_scalef_ps(y, n);
 }
 
+static inline void pf_line(const void* a) {
+    switch (PFH) {
+    case 0: _mm_prefetch((const char*)a, _MM_HINT_T0); break;
+    case 1: _mm_prefetch((const char*)a, _MM_HINT_T1); break;
+    case 2: _mm_prefetch((const char*)a, _MM_HINT_T2); break;
+    default: _mm_prefetch((const char*)a, _MM_HINT_NTA);
+    }
+}
+static inline void pf_row(const bf16* r) { for (int i = 0; i < HD; i += 32) pf_line(r + i); }
+
 /* Attention partials of one KV head for its G query heads over np rows: scores in sc[p][G]; per head the max m, the
  * sum l of exp(s - m) and the unnormalised output o = sum exp(s - m) * V. Each K / V row is widened once for all G
  * heads; G is a compile-time constant at every call so the accumulators stay in registers. */
 static inline __attribute__((always_inline)) void attn_group(const int G, const float* q, const bf16* K, const bf16* V,
-                                                              int np, float* sc, float* m, float* l, float* o) {
+                                                              int np, int T, float* sc, float* m, float* l, float* o) {
     for (int j = 0; j < G; j++) m[j] = -INFINITY, l[j] = 0;
-    for (int p = 0; p < np; p++) {
-        __m512 a[G];
-        for (int j = 0; j < G; j++) a[j] = _mm512_setzero_ps();
-        const bf16* kr = K + (size_t)p * HD;
+    for (int t0 = 0; t0 < np; t0 += T) {
+        const int nt = np - t0 < T ? np - t0 : T;
+        float mt[G], sf[G];
+        for (int j = 0; j < G; j++) mt[j] = m[j];
+        for (int p = 0; p < nt; p++) {
+            __m512 a[G];
+            for (int j = 0; j < G; j++) a[j] = _mm512_setzero_ps();
+            const bf16* kr = K + (size_t)(t0 + p) * HD;
+            if (PFD && t0 + p + PFD < np) pf_row(kr + (size_t)PFD * HD);
+            for (int d = 0; d < HD; d += 16) {
+                const __m512 kf = _mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(_mm256_loadu_si256((const __m256i*)(kr + d))), 16));
+                for (int j = 0; j < G; j++) a[j] = _mm512_fmadd_ps(kf, _mm512_loadu_ps(q + j * HD + d), a[j]);
+            }
+            for (int j = 0; j < G; j++) {
+                const float x = _mm512_reduce_add_ps(a[j]);
+                sc[(size_t)p * G + j] = x;
+                if (x > mt[j]) mt[j] = x;
+            }
+        }
+        /* online softmax: rescale the running sum and output by exp(m_old - m_new) */
+        for (int j = 0; j < G; j++) { sf[j] = m[j] == -INFINITY ? 0.f : expf(m[j] - mt[j]); m[j] = mt[j]; l[j] *= sf[j]; }
+        {
+            float mp[16];
+            for (int i = 0; i < 16; i++) mp[i] = m[i % G];
+            const __m512 mv = _mm512_loadu_ps(mp);
+            __m512 lv = _mm512_setzero_ps();
+            const int n = nt * G;
+            for (int i = 0; i < n; i += 16) {
+                const __mmask16 k = n - i >= 16 ? 0xffff : (__mmask16)((1u << (n - i)) - 1);
+                const __m512 w = exp512(_mm512_sub_ps(_mm512_maskz_loadu_ps(k, sc + i), mv));
+                _mm512_mask_storeu_ps(sc + i, k, w);
+                lv = _mm512_add_ps(lv, _mm512_maskz_mov_ps(k, w));
+            }
+            float lp[16];
+            _mm512_storeu_ps(lp, lv);
+            for (int i = 0; i < 16; i++) l[i % G] += lp[i];
+        }
+        const bf16* Vt = V + (size_t)t0 * HD;
         for (int d = 0; d < HD; d += 16) {
-            const __m512 kf = _mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(_mm256_loadu_si256((const __m256i*)(kr + d))), 16));
-            for (int j = 0; j < G; j++) a[j] = _mm512_fmadd_ps(kf, _mm512_loadu_ps(q + j * HD + d), a[j]);
-        }
-        for (int j = 0; j < G; j++) {
-            const float x = _mm512_reduce_add_ps(a[j]);
-            sc[(size_t)p * G + j] = x;
-            if (x > m[j]) m[j] = x;
+            __m512 acc[G];
+            for (int j = 0; j < G; j++) acc[j] = t0 ? _mm512_mul_ps(_mm512_loadu_ps(o + (size_t)j * HD + d), _mm512_set1_ps(sf[j])) : _mm512_setzero_ps();
+            for (int p = 0; p < nt; p++) {
+                if (PFD && !d && t0 + p + PFD < np) pf_row(Vt + (size_t)(p + PFD) * HD);
+                const __m512 vf = _mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(_mm256_loadu_si256((const __m256i*)(Vt + (size_t)p * HD + d))), 16));
+                for (int j = 0; j < G; j++) acc[j] = _mm512_fmadd_ps(_mm512_set1_ps(sc[(size_t)p * G + j]), vf, acc[j]);
+            }
+            for (int j = 0; j < G; j++) _mm512_storeu_ps(o + (size_t)j * HD + d, acc[j]);
         }
     }
-    {
-        float mp[16];
-        for (int i = 0; i < 16; i++) mp[i] = m[i % G];
-        const __m512 mv = _mm512_loadu_ps(mp);
-        __m512 lv = _mm512_setzero_ps();
-        const int n = np * G;
-        for (int i = 0; i < n; i += 16) {
-            const __mmask16 k = n - i >= 16 ? 0xffff : (__mmask16)((1u << (n - i)) - 1);
-            const __m512 w = exp512(_mm512_sub_ps(_mm512_maskz_loadu_ps(k, sc + i), mv));
-            _mm512_mask_storeu_ps(sc + i, k, w);
-            lv = _mm512_add_ps(lv, _mm512_maskz_mov_ps(k, w));
-        }
-        float lp[16];
-        _mm512_storeu_ps(lp, lv);
-        for (int i = 0; i < 16; i++) l[i % G] += lp[i];
-    }
-    for (int d = 0; d < HD; d += 16) {
-        __m512 acc[G];
-        for (int j = 0; j < G; j++) acc[j] = _mm512_setzero_ps();
-        for (int p = 0; p < np; p++) {
-            const __m512 vf = _mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(_mm256_loadu_si256((const __m256i*)(V + (size_t)p * HD + d))), 16));
-            for (int j = 0; j < G; j++) acc[j] = _mm512_fmadd_ps(_mm512_set1_ps(sc[(size_t)p * G + j]), vf, acc[j]);
-        }
-        for (int j = 0; j < G; j++) _mm512_storeu_ps(o + (size_t)j * HD + d, acc[j]);
-    }
-    if (!np) for (int j = 0; j < G; j++) m[j] = -INFINITY;
+    if (!np) for (int j = 0; j < G; j++) { m[j] = -INFINITY; for (int d = 0; d < HD; d++) o[(size_t)j * HD + d] = 0; }
 }
 
 /* ---- the decode step ---- */
@@ -524,13 +561,23 @@ static void* run(void* arg) {
     /* KV slice, node-local */
     me->p0 = (int)((long)CL * id / NW); me->p1 = (int)((long)CL * (id + 1) / NW);
     const int last = id == NW - 1, np = me->p1 - me->p0 + last;
-    me->kc = aligned_alloc(64, (size_t)KVH * (np + 1) * HD * 2);
-    me->vc = aligned_alloc(64, (size_t)KVH * (np + 1) * HD * 2);
-    for (int h = 0; h < KVH; h++)
-        for (int p = me->p0; p < me->p1; p++) {
-            memcpy(me->kc + ((size_t)h * np + p - me->p0) * HD, kc0 + ((size_t)h * CL0 + p % CL0) * HD, HD * 2);
-            memcpy(me->vc + ((size_t)h * np + p - me->p0) * HD, vc0 + ((size_t)h * CL0 + p % CL0) * HD, HD * 2);
-        }
+    me->kvblk = ((size_t)KVH * np * HD + 31) / 32 * 32;
+    {
+        const size_t kb = (size_t)KVR * SEQS * 2 * me->kvblk * 2, ka = (kb + HUGE - 1) / HUGE * HUGE;
+        uint8_t* kraw = mmap(NULL, ka + HUGE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        me->kv = (bf16*)(((uintptr_t)kraw + HUGE - 1) & ~(HUGE - 1));
+        madvise(me->kv, ka, MADV_HUGEPAGE);
+    }
+    for (int c = 0; c < KVR * SEQS; c++) {
+        bf16 *kc = me->kv + (size_t)c * 2 * me->kvblk, *vc = kc + me->kvblk;
+        for (int h = 0; h < KVH; h++)
+            for (int p = me->p0; p < me->p1; p++) {
+                memcpy(kc + ((size_t)h * np + p - me->p0) * HD, kc0 + ((size_t)h * CL0 + p % CL0) * HD, HD * 2);
+                memcpy(vc + ((size_t)h * np + p - me->p0) * HD, vc0 + ((size_t)h * CL0 + p % CL0) * HD, HD * 2);
+            }
+    }
+    int T = TILE_KIB ? (int)(((size_t)TILE_KIB << 10) / (2 * HD * 2)) : np + 1;
+    if (T < 1) T = 1;
     split(NH * HD, 1, id, &me->e0, &me->e1);
 
     float* xn = aligned_alloc(64, (size_t)H * 4); bf16* xb = aligned_alloc(64, (size_t)H * 2 + 64);
@@ -538,7 +585,7 @@ static void* run(void* arg) {
     float* h1 = aligned_alloc(64, (size_t)H * 4); float* h2 = aligned_alloc(64, (size_t)H * 4);
     float* tmp = aligned_alloc(64, (size_t)(H > I ? H : I) * 4);
     bf16* x2b = aligned_alloc(64, (size_t)H * 2 + 64); bf16* h2b = aligned_alloc(64, (size_t)H * 2 + 64);
-    float* sc = aligned_alloc(64, (size_t)(np + 1) * 4 * NH);
+    float* sc = aligned_alloc(64, (size_t)(np + 1) * 4 * NH + 64);
     float fw[MAXW];
     /* read side of every shared vector; L2R_NOBCAST=1 points them at private snapshots after step 0 */
     const float *rq = q, *rk = k, *rv = v, *rpm = pm, *rpl = pl, *rpo = po, *ro = o, *rdown = down;
@@ -552,7 +599,7 @@ static void* run(void* arg) {
     /* attention partials are owner-homed: each worker writes its block into the replica of its own node only and
      * combine readers fetch producer w's block from w's node (one reader per line, so no replication) */
     const float* pow_[MAXW]; const float* pmw[MAXW];
-    float *my_po = po + (size_t)id * NH * HD, *my_pm = pm + id * NH, *my_pl = pl + id * NH;
+    float *my_po = po + (size_t)id * SEQS * NH * HD, *my_pm = pm + id * SEQS * NH, *my_pl = pl + id * SEQS * NH;
     if (BCAST) {
         rq = lq; ro = lo; rdown = ldown; rattn = lattn; ract = lact; rpact = lpact;
         for (int w = 0; w < NW; w++) {
@@ -567,9 +614,19 @@ static void* run(void* arg) {
     pthread_barrier_wait(&pbar);
     uint64_t e = 0;
     for (int st = 0; st < STEPS; st++) {
+        if (id == 0 && PERF_FD >= 0 && st == STEPS / 10 && write(PERF_FD, "enable\n", 7) != 7) perror("perf ctl");
         uint64_t t = __rdtsc(), t0 = t, u;
 #define PHASE(i) do { u = __rdtsc(); me->ph[i] += u - t; ++e; if (BCAST != 4 || (i) == 1) barrier(id, e); t = __rdtsc(); me->wt[i] += t - u; } while (0)
         const uint32_t tag = (uint32_t)st + 1; const int par = st & 1;
+        const bf16* kvs = me->kv + (size_t)(st % KVR) * SEQS * 2 * me->kvblk; /* this step's copy, sequence 0 */
+        if (EARLY_KIB)
+            for (int b = 0; b < SEQS; b++)
+                for (int x = 0; x < 2; x++)
+                    for (int h = 0; h < KVH; h++) {
+                        const uint8_t* a = (const uint8_t*)(kvs + ((size_t)b * 2 + x) * me->kvblk + (size_t)h * np * HD);
+                        const size_t n = (size_t)np * HD * 2 < EARLY_KIB << 10 ? (size_t)np * HD * 2 : EARLY_KIB << 10;
+                        for (size_t i = 0; i < n; i += 64) pf_line(a + i);
+                    }
         /* 0: input norm (redundant), qkv rows */
         rms(x_in, w_in, H, xn); tobf(xn, H, xb);
         gemv(me->w[0], me->r1[0] - me->r0[0], H, xb, q + me->r0[0]);
@@ -587,47 +644,53 @@ static void* run(void* arg) {
             float kn[1024], vn[1024];
             for (int h = 0; h < KVH; h++) {
                 rms(rk + h * HD, w_kn, HD, kn); rope(kn); rms(rv + h * HD, NULL, HD, vn);
-                tobf(kn, HD, me->kc + ((size_t)h * np + np - 1) * HD);
-                tobf(vn, HD, me->vc + ((size_t)h * np + np - 1) * HD);
+                for (int b = 0; b < SEQS; b++) {
+                    tobf(kn, HD, (bf16*)kvs + ((size_t)b * 2) * me->kvblk + ((size_t)h * np + np - 1) * HD);
+                    tobf(vn, HD, (bf16*)kvs + ((size_t)b * 2 + 1) * me->kvblk + ((size_t)h * np + np - 1) * HD);
+                }
             }
         }
-        for (int kh = 0; kh < KVH; kh++) {
-            float* m = my_pm + kh * g; float* l = my_pl + kh * g;
-            float* oh = my_po + (size_t)kh * g * HD;
-            const bf16 *kr = me->kc + (size_t)kh * np * HD, *vr = me->vc + (size_t)kh * np * HD;
-            if (g == 8) attn_group(8, qn + kh * g * HD, kr, vr, np, sc, m, l, oh);
-            else if (g == 4) attn_group(4, qn + kh * g * HD, kr, vr, np, sc, m, l, oh);
-            else if (g == 2) attn_group(2, qn + kh * g * HD, kr, vr, np, sc, m, l, oh);
-            else attn_group(1, qn + kh * g * HD, kr, vr, np, sc, m, l, oh);
-        }
+        for (int b = 0; b < SEQS; b++)
+            for (int kh = 0; kh < KVH; kh++) {
+                float* m = my_pm + b * NH + kh * g; float* l = my_pl + b * NH + kh * g;
+                float* oh = my_po + ((size_t)b * NH + kh * g) * HD;
+                const bf16 *kr = kvs + (size_t)b * 2 * me->kvblk + (size_t)kh * np * HD, *vr = kr + me->kvblk;
+                if (g == 8) attn_group(8, qn + kh * g * HD, kr, vr, np, T, sc, m, l, oh);
+                else if (g == 4) attn_group(4, qn + kh * g * HD, kr, vr, np, T, sc, m, l, oh);
+                else if (g == 2) attn_group(2, qn + kh * g * HD, kr, vr, np, T, sc, m, l, oh);
+                else attn_group(1, qn + kh * g * HD, kr, vr, np, T, sc, m, l, oh);
+            }
         if (BCAST) { /* each line of the partial block goes only to the node(s) whose combine workers read it */
-            const uint8_t* src = (const uint8_t*)(po + (size_t)id * NH * HD);
-            for (int li = 0; li < NH * HD / 16; li++) {
+            const uint8_t* src = (const uint8_t*)(po + (size_t)id * SEQS * NH * HD);
+            for (int li = 0; li < SEQS * NH * HD / 16; li++) {
                 const __m512i v = _mm512_loadu_si512(src + (size_t)li * 64);
                 for (int k = 0; k < NNODE; k++)
-                    if (line_nodes[li] >> k & 1) {
+                    if (line_nodes[li % (NH * HD / 16)] >> k & 1) {
                         uint8_t* d = bc_po.rep[k] + bc_po.seg[id] + (size_t)li * 64;
                         if (BCAST >= 3) _mm512_stream_si512((__m512i*)d, v); else _mm512_store_si512(d, v);
                     }
             }
-            float rec[16];
-            for (int h = 0; h < NH; h++) { rec[h] = pm[id * NH + h]; rec[8 + h] = pl[id * NH + h]; }
+            float rec[16 * 16];
+            for (int b = 0; b < SEQS; b++)
+                for (int h = 0; h < NH; h++) { rec[b * 16 + h] = my_pm[b * NH + h]; rec[b * 16 + 8 + h] = my_pl[b * NH + h]; }
             bc_publish(&bc_pml, id, rec);
         }
         PHASE(1);
         /* 2: combine partials for this worker's slice of NH*HD: one scale per (worker, head) */
+        for (int sq = 0; sq < SEQS; sq++)
         for (int h = me->e0 / HD; me->e1 > me->e0 && h <= (me->e1 - 1) / HD; h++) {
             float M = -INFINITY, den = 0;
-#define PM_(w) (BCAST ? pmw[w][h] : rpm[(w) * NH + h])
-#define PL_(w) (BCAST ? pmw[w][8 + h] : rpl[(w) * NH + h])
+#define PM_(w) (BCAST ? pmw[w][sq * 16 + h] : rpm[(w) * NH + h])
+#define PL_(w) (BCAST ? pmw[w][sq * 16 + 8 + h] : rpl[(w) * NH + h])
             for (int w = 0; w < NW; w++) if (PM_(w) > M) M = PM_(w);
             for (int w = 0; w < NW; w++) { fw[w] = PM_(w) == -INFINITY ? 0.f : expf(PM_(w) - M); den += fw[w] * PL_(w); }
             const int a = h * HD > me->e0 ? h * HD : me->e0, b = (h + 1) * HD < me->e1 ? (h + 1) * HD : me->e1;
             for (int i = a; i < b; i++) {
                 const int d = i - h * HD;
                 float num = 0;
-                if (BCAST) for (int w = 0; w < NW; w++) num += fw[w] * pow_[w][h * HD + d];
+                if (BCAST) for (int w = 0; w < NW; w++) num += fw[w] * pow_[w][((size_t)sq * NH + h) * HD + d];
                 else for (int w = 0; w < NW; w++) num += fw[w] * rpo[((size_t)w * NH + h) * HD + d];
+                if (sq) { if (st == 0) chk_attn_seq[(size_t)sq * NH * HD + i] = num / den; continue; }
                 attn_b[i] = f2bf(num / den);
                 if (st == 0) chk_attn[i] = num / den;
             }
@@ -695,6 +758,7 @@ static void* run(void* arg) {
             SNAP(rattn, attn_b, (size_t)NH * HD * 2); SNAP(ract, act_b, (size_t)I * 2); SNAP(rpact, pact_b, (size_t)PLE * 2);
         }
     }
+    if (id == 0 && PERF_FD >= 0 && write(PERF_FD, "disable\n", 8) != 8) perror("perf ctl");
     if (PLFD >= 0) { struct pl_measure ms = {me->lock_id, 0}; ioctl(PLFD, PL_IOC_MEASURE, &ms); me->held1 = ms.lines ? (double)ms.l1_l2 / ms.lines : -1; }
     if (AMX) _tile_release();
     return NULL;
@@ -725,6 +789,14 @@ int main(int argc, char** argv) {
         if (!RESKIB || AMX) { fprintf(stderr, "L2R_LOCK needs L2R_RESIDENT_KIB and the AVX GEMV\n"); return 1; }
         if ((PLFD = open("/dev/pseudo_lock", O_RDWR)) < 0) { perror("/dev/pseudo_lock"); return 1; }
     }
+#define ENVI(v, n) if (getenv(n)) v = atoi(getenv(n))
+    ENVI(KVR, "L2R_KV_COPIES"); ENVI(TILE_KIB, "L2R_KV_TILE_KIB"); ENVI(PFD, "L2R_KV_PFD"); ENVI(SEQS, "L2R_SEQS");
+    ENVI(ATTN_ONLY, "L2R_ATTN_ONLY");
+    EARLY_KIB = getenv("L2R_KV_EARLY_KIB") ? strtoull(getenv("L2R_KV_EARLY_KIB"), 0, 10) : 0;
+    { const char* h = getenv("L2R_KV_PFH"); PFH = !h || !strcmp(h, "t0") ? 0 : !strcmp(h, "t1") ? 1 : !strcmp(h, "t2") ? 2 : 3; }
+    if (KVR < 1) KVR = 1;
+    if (getenv("L2R_PERF_CTL") && (PERF_FD = open(getenv("L2R_PERF_CTL"), O_WRONLY)) < 0) { perror("L2R_PERF_CTL"); return 1; }
+    if (SEQS < 1 || SEQS > 16 || (SEQS > 1 && (BCAST < 1 || BCAST > 3))) { fprintf(stderr, "L2R_SEQS: 1..16, >1 needs L2R_BCAST=rep|repcld|repnt\n"); return 1; }
     REP = getenv("L2R_CTX_REPEAT") ? atoi(getenv("L2R_CTX_REPEAT")) : 1;
     const char* cl = getenv("L2R_CPUS") ? getenv("L2R_CPUS") : "2-31,34-63,66-95";
     for (const char* p = cl; *p;) {
@@ -757,7 +829,7 @@ int main(int argc, char** argv) {
     const int A = NH * HD;
 #define ZA(p, n) p = aligned_alloc(64, ((size_t)(n) * 4 + 63) / 64 * 64), memset(p, 0, (size_t)(n) * 4)
     ZA(q, A); ZA(k, KVH * HD); ZA(v, KVH * HD); ZA(o, H); ZA(gate, I); ZA(up, I); ZA(down, H); ZA(pg, PLE); ZA(pp, H); ZA(outv, 2 * H);
-    ZA(pm, NW * NH); ZA(pl, NW * NH); ZA(po, (size_t)NW * NH * HD);
+    ZA(pm, NW * SEQS * NH); ZA(pl, NW * SEQS * NH); ZA(po, (size_t)NW * SEQS * NH * HD); ZA(chk_attn_seq, (size_t)SEQS * NH * HD);
     ZA(chk_qn, A); ZA(chk_h1, H); ZA(chk_xn2, H); ZA(chk_h2, H); ZA(chk_attn, A); ZA(chk_act, I); ZA(chk_pact, PLE);
     attn_b = aligned_alloc(64, A * 2 + 64); act_b = aligned_alloc(64, I * 2 + 64); pact_b = aligned_alloc(64, PLE * 2 + 64);
     for (int i = 0; i < NW; i++) {
@@ -778,7 +850,7 @@ int main(int argc, char** argv) {
     if (BCAST) {
         bc_init(&bc_q, 4, A, AMX ? 16 : 4, 0); bc_init(&bc_o, 4, H, AMX ? 16 : 4, 0); bc_init(&bc_down, 4, H, AMX ? 16 : 4, 0);
         bc_init(&bc_attn, 2, A, 1, 0); bc_init(&bc_act, 2, I, AMX ? 16 : 4, 0); bc_init(&bc_pact, 2, PLE, AMX ? 16 : 4, 0);
-        bc_init(&bc_po, 4, A, 0, 1); bc_init(&bc_pml, 4, 16, 0, 1);
+        bc_init(&bc_po, 4, SEQS * A, 0, 1); bc_init(&bc_pml, 4, 16 * SEQS, 0, 1);
         if (BCAST == 4) {
             const int u = AMX ? 16 : 4;
             fv_init(&fv_q, 4, A, u); fv_init(&fv_k, 4, KVH * HD, u); fv_init(&fv_v, 4, KVH * HD, u); fv_init(&fv_attn, 2, A, 1);
@@ -832,6 +904,13 @@ int main(int argc, char** argv) {
     double h0 = 1, h1 = 1;
     for (int w = 0; w < NW; w++) { if (WK[w].held0 < h0) h0 = WK[w].held0; if (WK[w].held1 < h1) h1 = WK[w].held1; }
     printf("]");
+    if (SEQS > 1 && REP == 1) {
+        float* r = load("ref.attn", NULL, NULL); double worst = 0;
+        for (int b = 1; b < SEQS; b++) { err_t e = err(chk_attn_seq + (size_t)b * A, r, A); if (e.rel_rms > worst) worst = e.rel_rms; }
+        printf(",\"attn_seqs_worst_rel_rms\":%.3e", worst); free(r);
+    }
+    printf(",\"kv\":{\"copies\":%d,\"seqs\":%d,\"tile_kib\":%d,\"pfd\":%d,\"pfh\":%d,\"early_kib\":%zu,\"attn_only\":%d,\"bytes_per_step\":%zu}",
+           KVR, SEQS, TILE_KIB, PFD, PFH, EARLY_KIB, ATTN_ONLY, (size_t)SEQS * 2 * KVH * (CL + 1) * HD * 2);
     if (PLFD >= 0) printf(",\"lock\":{\"held_l2_before_min\":%.4f,\"held_l2_after_min\":%.4f}", h0, h1);
     printf(",\"weight_bytes\":%zu,\"weight_bytes_per_worker\":%.0f}\n", wb, (double)wb / NW);
     return 0;
