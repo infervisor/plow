@@ -344,6 +344,10 @@ fn server_error(msg: impl Into<String>) -> Response {
     if msg == super::guided_speech::QUEUE_FULL {
         return crate::serve::api_error(StatusCode::TOO_MANY_REQUESTS, msg, "rate_limit_error", Some("server_overloaded"), None);
     }
+    // The text alone overflows the (narrowed) context: the request, not the server, is at fault.
+    if msg.starts_with("context length exceeded") {
+        return crate::serve::api_error(StatusCode::BAD_REQUEST, msg, "invalid_request_error", Some("context_length_exceeded"), Some("input".into()));
+    }
     crate::serve::api_error(StatusCode::INTERNAL_SERVER_ERROR, msg, "server_error", None, None)
 }
 
@@ -1173,6 +1177,8 @@ mod tests {
         assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
         assert_eq!(speech_failure(SpeechError::Failed(QUEUE_FULL.into())).status(), StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(speech_failure(SpeechError::Failed("render failed".into())).status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let long = crate::RuntimeError::ContextLength("prompt + max_tokens = 1031 exceeds the compiled context 1024".into());
+        assert_eq!(speech_failure(SpeechError::Failed(long.to_string())).status(), StatusCode::BAD_REQUEST);
     }
 
     /// Every frame is emitted exactly once, in order, each with LOOKAHEAD right context until
