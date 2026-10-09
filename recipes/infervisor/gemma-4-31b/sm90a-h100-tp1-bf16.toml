@@ -1,0 +1,131 @@
+# Gemma-4-31B-it BF16 weights, BF16 KV, 16384 context, 8 decode slots, prefix cache on, one H100 SXM5.
+# Production recipe for this model/GPU/precision.
+#
+# Checkpoint: google/gemma-4-31B-it @ 842da3794eaa0b77d5f08bae87a17459d91ff475 (shard sha256
+# eeef8791537bc04f..., 018912220f559f70...; the full snapshot, vision tower included, is kept; the
+# packet loads the language model only).
+#   PLOW_CAMPAIGN_NO_NIX=1 (box without nix only) HF31=<that snapshot> \
+#   python3 scripts/campaign/campaign.py build recipes/infervisor/gemma-4-31b/sm90a-h100-tp1-bf16.toml --out <fresh dir>
+#
+# @@EVIDENCE@@
+#
+# Memory: BF16 weights 57.2 GiB. A staged slot keeps a 2048-row BF16 sliding ring = 1.6 GiB (50 layers x
+# 16 KV heads x 256 x K+V x 2 B), so 8 slots = 12.5 GiB of rings; the full-attention KV (80 KiB/token)
+# gets the remaining ~5 GiB admission budget (~65K rows: 8 x 8K, or 4 x 15K). The cuBLASLt prefill
+# attention route (PLOW_PF_ATTN_GEMM) does not fit beside that budget and stays on FlashPrefill.
+# FP8 KV would double the slots but is not gated here; vLLM 0.28 BF16 holds one 16K request (it sizes
+# the sliding layers at full length) and needs --gpu-memory-utilization 0.97 to start at 16384.
+#
+# Routes:
+#   prefill projections   cuBLASLt BF16 at every Gemma-4-31B projection and rung (route matrix: Lt
+#                         1.0-2.3x faster than the native ws384 body; gate/up within 2% at 64/128 rows)
+#   decode B 4..8         cuBLASLt projections + head (PLOW_EMIT_DECODE_CUBLASLT_MIN_ROWS 4): step_bench
+#                         B4 / B8 25.49 / 26.56 ms vs 26.11 / 27.42 native (ctx 1024), B8 ctx 4096 27.69
+#                         vs 28.55; B1 / B2 native (24.9 / 25.3 ms)
+schema = "plow.recipe.v1"
+namespace = "infervisor"
+name = "gemma-4-31b"
+label = "sm90a-h100-tp1-bf16"
+status = "candidate"
+plow_git = "8e0f7b3be04396a903075b2499649bf58638afee"
+network = "gemma4"
+
+[target]
+vendor = "nvidia"
+isa = "sm_90a"
+sku = "H100 SXM5"
+units = 132
+num_gpus = 1
+parallel = "tp"
+max_ctx = 16384
+toolchain = "cuda-12.9"
+
+[checkpoint]
+source = "google/gemma-4-31B-it@842da3794eaa0b77d5f08bae87a17459d91ff475"
+layout = "hf"
+
+[cell]
+name = "gemma4-31b.h100.bf16-16k-c8"
+model = "google/gemma-4-31B-it"
+revision = "842da3794eaa0b77d5f08bae87a17459d91ff475"
+hf_dir = "{env:HF31}"
+gpu = "H100 SXM5"
+arch = "sm_90a"
+n_cu = 132
+max_ctx = 16384
+precision = "bf16"
+
+[emit]
+args = ["--segmented", "--served-name", "gemma-4-31b-it"]
+[emit.env]
+PLOW_TMA_GEMM = "1"
+PLOW_FA_MMAQK = "3"
+PLOW_MAX_CHUNK = "4096"
+PLOW_MAX_REQUEST_CHUNK = "4096"
+PLOW_DECODE_BATCH_LADDER = "1,2,4,8"
+PLOW_PF_LADDER_APPEND = "256,1088,1152,2112,4160,4224"
+PLOW_FUSE_ARGMAX = "1"
+PLOW_EMIT_PREFILL_CUBLASLT = "1"
+PLOW_EMIT_DECODE_CUBLASLT = "1"
+PLOW_EMIT_DECODE_CUBLASLT_MIN_ROWS = "4"
+PLOW_EMIT_DECODE_CUBLASLT_HEAD = "1"
+
+[objects]
+script = "scripts/build_sm90a_gemma4_segments.sh"
+role_files = [
+  "interp_sm90a_pfattn_hd512.cubin",
+  "interp_sm90a_pfattn_hd256_gqa2_bkv32.cubin",
+  "interp_sm90a_pfattn_hd256_bkv32.cubin",
+  "gen_sm90a_attn_pf_hd256_sliding.cubin",
+]
+[objects.env]
+PLOW_BUILD_GEN_KERNELS = "attn_pf_hd256_sliding"
+PLOW_BUILD_FA_GQA2_PAIR = "1"
+PLOW_BUILD_PFATTN_HD256_BKV32 = "1"
+PLOW_BUILD_PFATTN_HD256_GQA2_BKV32 = "1"
+
+[emit_roles.env]
+PLOW_GEMMA4_SM90_HD256_GQA2_ROLE = "1"
+PLOW_GEMMA4_SM90_HD512_PX4_BQ64_ROLE = "0"
+PLOW_EMIT_GEN_KERNELS = "attn_pf_hd256_sliding"
+
+[serve.env]
+PLOW_PREFIX_CACHE = "1"
+PLOW_VMM_LIVE_RINGS = "0"
+PLOW_MULTISTEP = "0"
+PLOW_DECODE_MAX_RUNG = "8"
+PLOW_TOKEN_BATCH = "1"
+
+[bench]
+backend = "openai"
+in_lens = "128 1024 4096"
+concs = "1"
+nprompt = 32
+outlen = 128
+warmups = 2
+seed = 42
+tokenizer = "{env:HF31}"
+model_id = "gemma-4-31b-it"
+gate_prompt = "<bos><|turn>user\nWhat is the capital of France? Answer in one short sentence.<turn|>\n<|turn>model\n<|channel>thought\n<channel|>"
+
+[measured]
+tok_s = 0.0
+p50_tpot_ms = 0.0
+concurrency = 32
+input_len = 4096
+output_len = 128
+client = "@@MEASURED@@"
+
+# FP32-reference gate (scripts/llm/fp32_ref_gate.py; repro_gemma31b_h100.sh gate runs it). The
+# reference is BF16 -> FP32 on one GPU with `reference --device offload` (33 decoder layers in BF16 on
+# the GPU, 27 in pinned host memory, materialized in FP32 per forward):
+#   llm_fp32_ref       G31_BF16_FP32_REF = the 46-case reference (prompts sha256 103024034dce0594,
+#                      ref fcbe988e44513db7...), G31_BF16_FP32_VLLM = the vLLM 0.28 capture against it
+# Thresholds: fp32_ref_gate.py DEFAULTS (docs/bringup/agent-tools.md section 5).
+[gates]
+python = "{env:PYREF}"
+[gates.llm_fp32_ref]
+reference = "{env:G31_BF16_FP32_REF}"
+vllm_capture = "{env:G31_BF16_FP32_VLLM}"
+concurrency = 8
+timeout_s = 2400
