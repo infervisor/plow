@@ -408,6 +408,12 @@ fn audio(bytes: &[u8], m: &MmModality, limits: &Limits, kind: &str) -> Result<Pr
     Ok(Prepared::Audio(mel, tokens, digest(kind, &raw)))
 }
 
+/// Round-to-nearest-even bf16 (the checkpoint's projection output dtype).
+fn bf16_bits(v: f32) -> u16 {
+    let bits = v.to_bits();
+    (bits.wrapping_add(0x7FFF + ((bits >> 16) & 1)) >> 16) as u16
+}
+
 /// Expand `prompt_ids` for the media parts of `messages` and encode them: each placeholder the
 /// template rendered becomes `begin, rows.., end`. `None` when the conversation has no media.
 pub async fn prepare(
@@ -522,7 +528,7 @@ pub async fn prepare(
     let mut job_rows = Vec::with_capacity(total * hidden);
     for (ids, r) in ids_all.iter().zip(rows) {
         job_ids.extend(ids);
-        job_rows.extend(r.unwrap_or_default().iter().map(|v| (v.to_bits() >> 16) as u16));
+        job_rows.extend(r.unwrap_or_default().iter().map(|v| bf16_bits(*v)));
     }
     let n = total as u32;
     if !mm.slab.reserve(n) {

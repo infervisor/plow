@@ -95,8 +95,8 @@ def generate(model, proc, cases, items, max_new):
             g = model.generate(**inputs, max_new_tokens=max_new, do_sample=False)
         new = g[0][inputs["input_ids"].shape[1]:].tolist()
         out.append(dict(c, prompt_tokens=int(inputs["input_ids"].shape[1]), tokens=new,
-                        text=proc.tokenizer.decode(new, skip_special_tokens=True)))
-        print(c["name"], repr(out[-1]["text"][:120]), flush=True)
+                        output=proc.tokenizer.decode(new, skip_special_tokens=True)))
+        print(c["name"], repr(out[-1]["output"][:120]), flush=True)
     return out
 
 

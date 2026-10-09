@@ -39,21 +39,21 @@ def main():
     for c in ref["cases"]:
         text, ptok = chat(args.base, args.model, c["messages"], args.max_new)
         again, _ = chat(args.base, args.model, c["messages"], args.max_new)
-        n, m = common_words(text, c["text"])
-        exact = text.strip() == c["text"].strip()
+        n, m = common_words(text, c["output"])
+        exact = text.strip() == c["output"].strip()
         passed = ptok == c["prompt_tokens"] and again == text and (exact or n >= min(args.min_prefix, m))
         ok &= passed
         got[c["name"]] = text
         print(json.dumps({"case": c["name"], "pass": passed, "exact": exact, "prompt_tokens": ptok,
                           "hf_prompt_tokens": c["prompt_tokens"], "common_words": n, "repeat_equal": again == text,
-                          "plow": text[:160], "hf": c["text"][:160]}), flush=True)
+                          "plow": text[:160], "hf": c["output"][:160]}), flush=True)
     by_text = {}
     for c in ref["cases"]:
         by_text.setdefault(c["messages"][0]["content"][-1]["text"], []).append(c)
     for group in by_text.values():
         for a in group:
             for b in group:
-                if a["name"] < b["name"] and a["media"] != b["media"] and (a["text"] != b["text"]) and got[a["name"]] == got[b["name"]]:
+                if a["name"] < b["name"] and a["media"] != b["media"] and a["output"] != b["output"] and got[a["name"]] == got[b["name"]]:
                     ok = False
                     print(json.dumps({"media_collision": [a["name"], b["name"]]}), flush=True)
     print(json.dumps({"gate": "pass" if ok else "fail"}))
