@@ -310,6 +310,72 @@ The same at 12 ways:
    * At 12 ways plowc gives those layers TP8 / TP16, which moves the B=1 bottleneck back to the sliding layers.
    * At B=16 the TP8 full layer stays the bottleneck (predicted).
 
+## P6.8 MoE: experts resident in L2 + L3 SRAM
+
+Every expert stays on chip; experts that no token routes to simply don't run. The 13-group design (P6.3) does this
+from L2 alone and needs 13 sockets per layer for 1.52 GB of experts (11.9 MB each), 390 of 437 sockets. L3 is SRAM
+too.
+
+**Fast tier capacity.** `l2r_bw` AMX stream on the 90 workers, THP, by per-core footprint:
+
+| per core | 3 MiB | 4.5 | 6.5 | 8 | 9 | 12 | 16 | 24 | 32 | 64 (P0, DRAM) |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| TB/s | 1.35 | 1.29 | 1.31 | 1.33 | 1.30 | 1.05 | 0.88 | 0.76 | 0.71 | 0.66 |
+
+* Up to ~9 MiB per core (~800 MiB per socket), streaming holds L3 speed.
+* That is more than L2 + L3 (≈ 660 MiB): L3 is non-inclusive and keeps part of a looping stream.
+
+**Expert sockets at 2 and 3 per layer.** 26B L0, groups of 64 (760 MB per socket) and 42-43 experts (507 MB), rows
+o0-o15. `ref_layer.py ... moe:2|moe:3`; `/tmp/g4c/l2r/results/m_moe23{,ctr}`.
+
+* `L2R_EXPERTS_ROTATE=37` shifts every step's expert indices, except the first and last steps, which the gate checks.
+  Each step therefore reads a different subset of the socket's experts, as a pipeline does.
+* Without rotation the same experts are read every step and stay in L2. At B=1 that is 2-4x optimistic.
+* Every run passes the gate.
+
+The stage time is the slowest group (AVX, rotating):
+
+| experts | sockets / layer | per socket | B=1 µs | B=16 µs | DRAM per step B=1 / B=16 (slowest group) | AMX B=16 µs |
+|---|---:|---:|---:|---:|---|---:|
+| L2 only (P6.3) | 13 | 119 MB | 18.5 | 65.3 | ~0 | 40.6 |
+| L2 + L3 | 3 | 507 MB | 50.7 | 270.0 | 1.2 / 10.3 MiB (≈ 96% of L2 misses served on chip) | 387.6 |
+| L2 + L3 + DRAM | 2 | 760 MB | 72.3 | 522.2 | 21.0 / 121.5 MiB (≈ 27% from DRAM) | 522.3 |
+
+* **AVX beats AMX once the experts stream.** It is 1.3-1.4x faster at B=16, because AMX's 16-row tiles leave a
+  1.7x per-core imbalance.
+* **At 3 sockets per layer the experts are SRAM-resident.** At B=16 the layer's 82 touched experts (~980 MB) stream
+  as ~330 MB per socket at ~1.2 TB/s, 270 µs, under the head socket's 463 µs.
+
+**Cluster** (projection, same model as P6.7):
+
+* Heads use the 12-way plan: 1 socket per sliding layer and TP2 for the 5 full layers (predicted).
+* The LM head takes 12 sockets (predicted).
+
+| experts | sockets | bottleneck B=16 | tok/s at B=16 | tok/s / socket | TPOT at saturation B=1 / B=16 |
+|---|---:|---|---:|---:|---|
+| L2 only (13 / layer) | 437 | head 463 µs | 34,200 | 78 | 5.2 / 28.5 ms |
+| **L2 + L3 (3 / layer)** | **137** | head 463 µs | 34,200 | **250** | 5.2 / 28.5 ms |
+| L2 + L3 + DRAM (2 / layer) | 107 | experts 522 µs | 30,300 | 284 | 5.2 / 32.2 ms |
+| one socket, whole model (plowrt c32 / c1) | 1 | | | 220 | 16.8 ms (c1) / 146 ms (c32) |
+
+**3 expert sockets per layer is the GO candidate.**
+
+* Same throughput and TPOT as the 13-group design on 31% of the sockets.
+* 1.14x one socket's throughput per socket, and 3.2x lower TPOT at B=1.
+
+Still needed to qualify it:
+
+1. **Routing balance.**
+   * The slowest of 3 groups sets the stage, and this is measured on 16 rows of one layer.
+   * Needs a routing trace over many tokens and all 30 layers: per-group pair counts and their p99.
+   * Then assign experts to groups by load, not by index.
+2. **The head-to-expert transfers**: per MoE layer, h1 to the 3 expert sockets and their partial sums back. That is
+   B × 2816 × 4 B, 176 KiB at B=16, each way per socket. It adds latency, not throughput.
+3. **Full-layer heads as TP2**: predicted only. On one socket the full-layer head is 590 µs at B=16, which would be
+   the bottleneck (27k tok/s, 205 per socket on 132 sockets).
+4. **plowc**: an expert tier (L2 + L3 bytes per core from the measured curve, AVX partition) instead of L2-only
+   expert packing. Today it plans 13 groups.
+
 ## Go / no-go
 
 | item | status |
@@ -322,14 +388,18 @@ The same at 12 ways:
 | stability | 3 × 10 min, no drift > 5%, every run gated PASS |
 | cluster design from measured stages | projections above. 90-98% of stages measured for 12B / 26B / 31B; E2B 1 of 28 (row-split layers) |
 
-**Recommendation: GO for a two-server dense pipeline (12B TP4 stages over 2 × 2 sockets, then a 4-stage chain). NO-GO
-for MoE (26B-A4B) and for long-context full-attention layers until sequence-parallel attention exists.**
+**Recommendation: GO for a two-server dense pipeline (12B TP4 stages over 2 × 2 sockets, then a 4-stage chain). MoE
+(26B-A4B): NO-GO for the L2-only expert layout, GO candidate with experts in L2 + L3 at 3 sockets per layer (P6.8),
+pending a routing-balance trace. NO-GO for long-context full-attention layers until sequence-parallel attention
+exists.**
 
 * **Dense models:**
   * 12B projects 4.1 ms TPOT at B=1 (11x below one socket) and parity or better per socket at B=16.
   * The measured parts cover 48 of 49 stages.
-* **MoE:** the L2-resident design spends 9 of 10 sockets on experts that are idle 90% of the step. A hybrid is the
-  next experiment: L2-resident head sockets, experts streamed from DRAM or L3 on fewer sockets.
+* **MoE:**
+  * The L2-only design spends 9 of 10 sockets on experts that are idle 90% of the step.
+  * Holding the experts in L2 + L3 (P6.8) keeps every expert in on-chip SRAM on 3 sockets per layer: 137 sockets,
+    250 tok/s per socket at B=16.
 * **Unmeasured, and the two-server experiment must measure:**
   1. the hop and the 2-per-layer all-reduce at B = 1 and 16 (payloads above);
   2. a TP group across a UPI link and across servers;

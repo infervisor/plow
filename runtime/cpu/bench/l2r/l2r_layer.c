@@ -112,7 +112,7 @@ static double tsc_ghz;
 static int H, NH, KVH, HD, I, PLE, WIN, CL0, CL; /* CL0: dumped cache rows, CL: rows attended before the new token */
 static int KVEQ, TP, STAGE; /* STAGE: 0 layer, 1 MoE head, 2 MoE experts */
 static float *moe_rest, *w_pf1, *w_pf2, *w_rsc, *rs; /* head: [NB][H] experts' sum, norms, router scale, scores */
-static int NE, EI, TOPK, NP, *pb, *pel, *el_p0, *el_n; static float *pw, *h1x, *part, *chk_xn3, *chk_eact;
+static int NE, EI, TOPK, NP, ROT, *pb, *pel, *el_p0, *el_n; static float *pw, *h1x, *part, *chk_xn3, *chk_eact;
 static bf16 *Wgu, *Wdn, *eact_b; static bc_t bc_eact, bc_part;
 static float *o_rest, *down_rest; /* [NB][H], TP > 1 */
 static float EPS, SCALAR;
@@ -982,6 +982,8 @@ static void* run_experts(void* arg) {
     for (int st = 0; st < STEPS; st++) {
         if (id == 0 && PERF_FD >= 0 && st == STEPS / 10 && write(PERF_FD, "enable\n", 7) != 7) perror("perf ctl");
         uint64_t t = __rdtsc(), t0 = t, u_;
+        /* L2R_EXPERTS_ROTATE: steps between the first and the last read other local experts' weights (timing only) */
+        const int rot = ROT && st && st < STEPS - 1 ? (int)((size_t)st * ROT % NE) : 0;
 #undef PHASE
 #define PHASE(i) do { u_ = __rdtsc(); me->ph[i] += u_ - t; ++e; barrier(id, e); t = __rdtsc(); me->wt[i] += t - u_; } while (0)
         /* 0: pre-FFN-2 norm of every row (redundant), gate / up rows of every picked expert, gelu * up */
@@ -994,7 +996,7 @@ static void* run_experts(void* arg) {
             const int m = el_n[el], p0 = el_p0[el];
             if (!m || !ng) continue;
             for (int i = 0; i < m; i++) memcpy(xe + (size_t)i * H, xb + (size_t)pb[p0 + i] * H, (size_t)H * 2);
-            const bf16* a = arena + (size_t)el * per;
+            const bf16* a = arena + (size_t)((el + rot) % NE) * per;
             gemvn(a, ng, H, xe, m, gb, ng); gemvn(a + eg, ng, H, xe, m, ub, ng);
             for (int i = 0; i < m; i++)
                 gelu_mul(gb + (size_t)i * ng, ub + (size_t)i * ng, ng, eact_b + (size_t)(p0 + i) * EI + ga,
@@ -1009,7 +1011,7 @@ static void* run_experts(void* arg) {
         for (int el = 0; el < NE; el++) {
             const int m = el_n[el], p0 = el_p0[el];
             if (!m || !ndn) continue;
-            gemvn(arena + (size_t)el * per + 2 * eg, ndn, EI, lact + (size_t)p0 * EI, m, yb, ndn);
+            gemvn(arena + (size_t)((el + rot) % NE) * per + 2 * eg, ndn, EI, lact + (size_t)p0 * EI, m, yb, ndn);
             for (int i = 0; i < m; i++) {
                 float* d = part + (size_t)pb[p0 + i] * H + da;
                 const float w = pw[p0 + i];
@@ -1043,7 +1045,7 @@ static void print_err(const char* dir, const char* name, const float* a, int n, 
 
 static int experts_main(const char* js) {
     H = meta_int(js, "hidden"); EPS = (float)meta_f(js, "eps"); NE = meta_int(js, "experts"); EI = meta_int(js, "moe_inter");
-    TOPK = meta_int(js, "top_k");
+    TOPK = meta_int(js, "top_k"); ROT = getenv("L2R_EXPERTS_ROTATE") ? atoi(getenv("L2R_EXPERTS_ROTATE")) : 0;
     const int E0 = meta_int(js, "e0");
     if (!BCAST || BCAST == 4 || NOBCAST || RESKIB) { fprintf(stderr, "experts stage: L2R_BCAST=rep|repcld|repnt, no L2R_NOBCAST / L2R_RESIDENT_KIB\n"); return 1; }
     Wgu = load("w.experts.gate_up_proj", NULL, NULL); Wdn = load("w.experts.down_proj", NULL, NULL);
