@@ -1233,24 +1233,10 @@ async fn trace_handler(
 async fn healthz(
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
 ) -> (axum::http::StatusCode, String) {
-    let dead: Vec<String> = state
-        .model_metrics
-        .read()
-        .iter()
-        .filter(|(_, m)| m.engine_dead.load(std::sync::atomic::Ordering::Relaxed))
-        .map(|(slug, _)| slug.clone())
-        .collect();
-    #[cfg(feature = "cuda")]
-    let dead = [dead, crate::asr::serving::dead_encoders()].concat();
     if *state.shutdown.borrow() {
         return (axum::http::StatusCode::SERVICE_UNAVAILABLE, "shutting down".into());
     }
-    // A DP model with a live rank still serves: report the dead ranks, answer 200.
-    let (degraded, dead): (Vec<String>, Vec<String>) = dead.into_iter().partition(|key| {
-        state
-            .dp_rank(key)
-            .is_some_and(|(set, _)| set.ranks.iter().any(|r| !dead_rank(&r.metrics)))
-    });
+    let (dead, degraded) = dead_engines(&state);
     if dead.is_empty() && !degraded.is_empty() {
         return (axum::http::StatusCode::OK, format!("degraded: DP ranks dead: {}", degraded.join(",")));
     }
@@ -1262,6 +1248,27 @@ async fn healthz(
             format!("engine dead (fatal device fault or ASR encoder exit): {}", dead.join(",")),
         )
     }
+}
+
+/// Models that can no longer serve (a fatal device fault or an ASR encoder exit), and DP ranks
+/// that died while their set still has a live rank.
+pub fn dead_engines(state: &AppState) -> (Vec<String>, Vec<String>) {
+    let dead: Vec<String> = state
+        .model_metrics
+        .read()
+        .iter()
+        .filter(|(_, m)| m.engine_dead.load(std::sync::atomic::Ordering::Relaxed))
+        .map(|(slug, _)| slug.clone())
+        .collect();
+    #[cfg(feature = "cuda")]
+    let dead = [dead, crate::asr::serving::dead_encoders()].concat();
+    // A DP model with a live rank still serves: report the dead ranks, answer 200.
+    let (degraded, dead): (Vec<String>, Vec<String>) = dead.into_iter().partition(|key| {
+        state
+            .dp_rank(key)
+            .is_some_and(|(set, _)| set.ranks.iter().any(|r| !dead_rank(&r.metrics)))
+    });
+    (dead, degraded)
 }
 
 fn dp_metrics(out: &mut String, router: &dp::DpRouter, state: &AppState) {
@@ -1526,7 +1533,10 @@ mod health_tests {
         let metrics = state.model_metrics("m");
         let (code, _) = healthz(axum::extract::State(Arc::clone(&state))).await;
         assert_eq!(code, StatusCode::OK);
+        assert!(super::dead_engines(&state).0.is_empty());
         metrics.engine_dead.store(true, Ordering::Relaxed);
+        // What `--exit-on-engine-death` watches.
+        assert_eq!(super::dead_engines(&state).0, ["m"]);
         let (code, body) = healthz(axum::extract::State(state)).await;
         assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE);
         assert!(body.contains('m'));
@@ -1546,6 +1556,8 @@ mod health_tests {
         let (code, body) = healthz(axum::extract::State(Arc::clone(&state))).await;
         assert_eq!(code, StatusCode::OK);
         assert!(body.starts_with("degraded") && body.contains("g#0"), "{body}");
+        // A degraded DP set still serves: no exit for it.
+        assert!(super::dead_engines(&state).0.is_empty());
         set.ranks[1].metrics.engine_dead.store(true, Ordering::Relaxed);
         let (code, _) = healthz(axum::extract::State(state)).await;
         assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE);

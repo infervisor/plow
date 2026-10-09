@@ -1111,6 +1111,7 @@ Removed (a set value is ignored with a startup warning; recipes and scripts may 
 | `PLOW_SHARE_CKPT` | on | shared (vs per-rank) checkpoint mapping across TP ranks; `=0` restores per-rank. |
 | `PLOW_VRAM_BUDGET_MIB=M` | unset | CUDA: cap each device group ModelManager VRAM budget (MiB). |
 | `PLOW_PIN_RESIDENT=1` / `--pin-resident` | off | CUDA multi-model serve: every registered model must fit at startup (else startup fails naming the model that does not), and no model is ever evicted, neither for an S1 switch nor for another model's KV growth. For a fixed co-resident set sized with `--live-ctx-models` / `--vmm-live-rings-models`. |
+| `PLOW_EXIT_ON_ENGINE_DEATH=1` / `--exit-on-engine-death` | off | `plowrt serve`: once an engine is dead from a fatal device fault (`/health` 503), drain for at most 5 s and exit 1 so a supervisor (systemd `Restart=always`) restarts the process. Off: the process stays up answering 503. |
 | `PLOW_WEIGHT_VMM` (`--weight-vmm`) | unset = CUDA on, AMD off | VMM (reserve+map) weight slab on either vendor; `=0` falls back to one flat allocation, `=1` opts AMD in. One knob for both backends. |
 | `PLOW_SLAB_KEEP` | multi-model on | park evicted models' 256 MiB slab chunks in a per-device pool for the next load; `=0` releases them (`=1` forces on for single-model). |
 | `PLOW_KV_POOL_MIB=N` | 512 | per-engine KV physical-block reuse pool cap (MiB); `0` disables pooling. |

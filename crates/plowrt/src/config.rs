@@ -410,6 +410,12 @@ pub struct RuntimeConfig {
     )]
     pub drain_timeout_ms: Option<u64>,
 
+    /// `plowrt serve`: exit non-zero (after a drain of at most 5 s) once an engine is dead from a
+    /// fatal device fault, so a supervisor restarts the process. Off: `/health` answers 503 and
+    /// the process stays up.
+    #[arg(long = "exit-on-engine-death", env = "PLOW_EXIT_ON_ENGINE_DEATH", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub exit_on_engine_death: bool,
+
     /// How long a request waits (ms) for another model switch to release the switch lock before
     /// it is shed with 503 + Retry-After. 0 = unbounded; unset = 600 000.
     #[arg(long = "switch-timeout-ms", env = "PLOW_SWITCH_TIMEOUT_MS", global = true)]
@@ -2731,6 +2737,11 @@ mod tests {
         assert_eq!(replay.get("PLOW_API_KEYS").map(String::as_str), Some("<redacted>"));
         assert_eq!(replay.get("PLOW_SESSION_TTL_MS").map(String::as_str), Some("5000"));
         assert!(!format!("{replay:?}").contains("sk-live-123"));
+        let exit = super::RuntimeConfig::augment_args(clap::Command::new("plowrt"));
+        use clap::FromArgMatches;
+        let parse = |args: &[&str]| super::RuntimeConfig::from_arg_matches(&exit.clone().try_get_matches_from(args).unwrap()).unwrap();
+        assert!(!parse(&["plowrt"]).exit_on_engine_death);
+        assert!(parse(&["plowrt", "--exit-on-engine-death"]).exit_on_engine_death);
         for secret in ["PLOW_API_KEYS", "HF_TOKEN", "AWS_SECRET_ACCESS_KEY", "DB_PASSWORD", "X_KEY"] {
             assert!(super::is_secret_env(secret), "{secret}");
         }

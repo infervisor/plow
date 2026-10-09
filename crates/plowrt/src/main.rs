@@ -4105,9 +4105,32 @@ async fn serve(
             None => std::future::pending().await,
         }
     };
+    let death_state = Arc::clone(&shutdown_state);
+    let engine_death = async move {
+        if !plowrt::config::RuntimeConfig::get().exit_on_engine_death {
+            return std::future::pending().await;
+        }
+        loop {
+            let (dead, _) = plowrt::serve::dead_engines(&death_state);
+            if !dead.is_empty() {
+                return dead;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        }
+    };
     tokio::select! {
         r = tcp_task => { if let Err(e) = r { tracing::error!(error = %e, "TCP task join"); } }
         r = uds => { if let Err(e) = r { tracing::error!(error = %e, "UDS task join"); } }
+        dead = engine_death => {
+            tracing::error!(dead = %dead.join(","), "engine dead: draining for at most 5 s, then exiting 1 for the supervisor to restart (--exit-on-engine-death)");
+            shutdown_state.shutdown.send_replace(true);
+            // A faulted context can leave a mux that never drains: the exit must not wait on it.
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(5), drain_for_shutdown(&shutdown_state)).await;
+            if let Some(path) = shutdown_socket {
+                let _ = std::fs::remove_file(path);
+            }
+            std::process::exit(1);
+        }
         signal = shutdown_signal() => {
             tracing::info!(signal, "shutdown: draining in-flight requests");
             // `/health` turns 503 and the ASR front refuses new work before the muxes drain.

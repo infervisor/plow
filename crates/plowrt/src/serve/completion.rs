@@ -89,6 +89,9 @@ async fn completions_with(
     if let Some(canonical) = state.registry.resolve(&req.model) {
         req.model = canonical;
     }
+    if let Some(r) = crate::serve::models::refuse_unserved(&state, &req.model, "completions") {
+        return r;
+    }
 
     if let Err(error) = validate_return_token_ids(req.stream, req.return_token_ids) {
         return crate::serve::api_error(
@@ -176,6 +179,10 @@ async fn completions_with(
                 };
             }
         }
+    }
+    // Again once a switch has bound the model (see `chat`).
+    if let Some(r) = crate::serve::models::refuse_unserved(&state, &req.model, "completions") {
+        return r;
     }
 
     if let Err(e) = req

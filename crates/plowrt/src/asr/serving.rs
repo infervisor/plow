@@ -3341,4 +3341,34 @@ mod tests {
         assert!(!dead_encoders().contains(&"packet-host-test".to_owned()));
         assert!(packet_models_idle());
     }
+
+    /// A text route on an audio model is refused before submission: on a co-resident GPU a speech
+    /// or audio LM fed text ids faults the context and kills every engine on it.
+    #[cfg(feature = "cuda")]
+    #[tokio::test]
+    async fn text_routes_refuse_a_model_that_does_not_serve_them() {
+        let backend: Arc<dyn crate::device::Backend> = Arc::new(crate::device::cpu::CpuBackend::new(1));
+        let execset = Arc::new(crate::exec::ExecutorSet::bringup(backend).unwrap());
+        let state = Arc::new(crate::serve::AppState::new(crate::orch::Registry::new(), execset));
+        host_packet_model(&state, "packet-route-test".into(), Box::new(Fake));
+        let app = crate::serve::app(Arc::clone(&state));
+        let post = |path: &str, body: serde_json::Value| {
+            Request::post(path).header("content-type", "application/json").body(Body::from(body.to_string())).unwrap()
+        };
+        for (path, body) in [
+            ("/v1/completions", json!({"model": "packet-route-test", "prompt": "<bos>The capital of France is", "max_tokens": 3})),
+            ("/v1/chat/completions", json!({"model": "packet-route-test", "messages": [{"role": "user", "content": "hi"}]})),
+        ] {
+            let response = app.clone().oneshot(post(path, body)).await.unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{path}");
+            let err: serde_json::Value = serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
+            assert_eq!(err["error"]["code"], "model_not_supported_for_endpoint", "{path}");
+            assert_eq!(err["error"]["param"], "model");
+            assert!(err["error"]["message"].as_str().unwrap().contains("/v1/audio/transcriptions"), "{err}");
+        }
+        assert_eq!(state.model_metrics("packet-route-test").serving.asr.completed.load(Ordering::Relaxed), 0);
+        // An unknown model is not refused here: the handler's own 404 answers it.
+        let unknown = app.oneshot(post("/v1/completions", json!({"model": "nope", "prompt": "x"}))).await.unwrap();
+        assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
+    }
 }

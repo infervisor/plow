@@ -606,7 +606,7 @@ pub(super) async fn route(
             let ingress = Arc::new(parking_lot::Mutex::new(Some(ingress)));
             Ok((Route::Shared(asr, mux, ingress), finalization))
         }
-        Ok(None) => Err(failure(StatusCode::NOT_FOUND, "model declares no ASR pipeline")),
+        Ok(None) => Err(crate::serve::models::unserved(&slug, "audio/transcriptions", &crate::serve::models::endpoints(state, &slug))),
         Err(e) => Err(failure(StatusCode::INTERNAL_SERVER_ERROR, e)),
     }
 }

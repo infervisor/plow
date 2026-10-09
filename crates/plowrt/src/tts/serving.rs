@@ -479,7 +479,7 @@ async fn speech_with(
     let model = match pipeline {
         Some(Pipeline::Guided(g)) => return speech_on_guided(g, mux, req, t_arrive, ids, in_flight, report, report_rx.take(), run).await,
         Some(Pipeline::Speech(m)) => m,
-        Some(Pipeline::None) => return bad(format!("model '{}' declares no speech pipeline", req.model), "model"),
+        Some(Pipeline::None) => return crate::serve::models::unserved(&req.model, "audio/speech", &crate::serve::models::endpoints(&state, &req.model)),
         // Unmanaged (single-model) serve: bind on first use.
         None => {
             match tokio::task::block_in_place(|| guided_model(&bundle.dir, state.downstream(&req.model), state.ordinal_of(&req.model))) {
@@ -489,7 +489,7 @@ async fn speech_with(
             }
             match tokio::task::block_in_place(|| speech_model(&bundle.dir, state.downstream(&req.model), state.ordinal_of(&req.model))) {
                 Ok(Some(m)) => m,
-                Ok(None) => return bad(format!("model '{}' declares no speech pipeline", req.model), "model"),
+                Ok(None) => return crate::serve::models::unserved(&req.model, "audio/speech", &crate::serve::models::endpoints(&state, &req.model)),
                 Err(e) => return server_error(format!("speech pipeline: {e}")),
             }
         }

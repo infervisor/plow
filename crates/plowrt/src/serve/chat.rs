@@ -92,6 +92,9 @@ async fn chat_completions_with(
     // template choice below sees the engine. Resident models pass through on
     // the manager's lock-free fast path. A switch that cannot fit sheds with
     // 503 + Retry-After (the client should back off, not hammer the planner).
+    if let Some(r) = crate::serve::models::refuse_unserved(&state, &req.model, "chat/completions") {
+        return r;
+    }
     if !state.residency(&req.model).admits() {
         return crate::serve::api_error(axum::http::StatusCode::SERVICE_UNAVAILABLE,
             "Model is explicitly unloaded or unloading", "server_error", Some("model_unloaded"), Some("model".into()));
@@ -131,6 +134,10 @@ async fn chat_completions_with(
                 };
             }
         }
+    }
+    // Again once a switch has bound the model: a non-resident one read as text above.
+    if let Some(r) = crate::serve::models::refuse_unserved(&state, &req.model, "chat/completions") {
+        return r;
     }
 
     // REFUSE WHAT THIS SERVER CANNOT HONOR, rather than dropping it.
