@@ -134,6 +134,31 @@ receipt pins the packet image's sha256) cannot be rewritten: plowrt would refuse
 applies to the plowc-emitted audio-LM bundles (Qwen3-ASR `model.pkt`); the VAD and RNNT packets
 carry no receipts.
 
+## Validation (H100, 2026-10-09)
+
+Packets: Silero `silero_vad.pkt` 1a2ac957 (fresh emit = upgrade of 4b8fae6c, byte-identical),
+Nemotron `nemotron.pkt` aa060872 (fresh emit = upgrade of the 09e53e76 packet), Qwen3-ASR
+`model.pkt` df140272 / 0.6B 1da8ea9f (re-emitted at 11c4a5bb; byte-identical to the metadata
+upgrade; `encoder.pkt` and the 09e53e76 objects unchanged). One `plowrt serve` with all three ASR
+models and the VAD, `PLOW_VMM_PREFIX=1`, 73-clip LibriSpeech set (`served_bench.py`), base =
+09e53e76 plowrt + packets, two base runs around the contract-1 run:
+
+| model | conc | WER base / new | p50 ms base (2 runs) / new | RTFx base (2 runs) / new |
+|---|---|---|---|---|
+| qwen3-asr | 1 | 3.913% / 3.913% | 65.8, 67.8 / 70.4 | 86.2, 83.2 / 83.4 |
+| qwen3-asr | 16 | 3.913% / 3.913% | 180.1, 185.5 / 187.4 | 500.5, 493.4 / 498.8 |
+| qwen3-asr-0.6b | 1 | 4.435% / 4.435% | 52.5, 54.7 / 53.8 | 108.3, 105.8 / 105.1 |
+| qwen3-asr-0.6b | 16 | 4.261% / 4.261% | 132.4, 144.6 / 144.7 | 645.7, 611.6 / 628.0 |
+| nemotron-3.5-asr | 1 | 5.13% / 5.13% | 59.5, 61.1 / 60.7 | 101.9, 97.9 / 98.2 |
+| nemotron-3.5-asr | 4 | 5.13% / 5.13% | 185.2, 186.5 / 184.7 | 137.6, 136.5 / 136.5 |
+
+- `vad_parity` (79 clips, 17,321 frames): max |dp| 1.967e-6, agree 1.000, 0 flips (unchanged).
+- VAD host cost, 256 streams, one EPYC 7R13 core: 17.67-17.72 ms per 32 ms tick (base 17.88-17.98).
+- Realtime `server_vad` smoke: pauses 3/3 turns, continuous 8/10 single-turn, WER 4.72% (= base).
+  `/v1/audio/vad` segments identical to base, with defaults and with overrides.
+- A contract-0 Qwen bundle is refused at startup ("audio LM packet contract 0 predates 1"); a
+  contract-0 VAD packet is refused at load.
+
 ## Audit (2026-10-09): model logic that was in plowrt
 
 Class (a) = generic runtime mechanism, kept; (b) = model knowledge, moved to the packet.
