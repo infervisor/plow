@@ -157,8 +157,8 @@ pub fn check_contract(parameter: Option<u64>, implemented: u64, what: &str) -> R
     }
     if version < implemented {
         return Err(format!(
-            "{what} packet contract {version} predates {implemented}: re-emit it, or upgrade its metadata with \
-             asr_packet_upgrade (programs and weights are unchanged)"
+            "{what} packet contract {version} predates {implemented}: re-emit it (bundles with compiler check \
+             receipts), or upgrade its metadata with asr_packet_upgrade (programs and weights are unchanged)"
         ));
     }
     Ok(version)

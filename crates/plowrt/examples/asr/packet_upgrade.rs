@@ -20,6 +20,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some("rnnt") if args.len() == 5 => ("rnnt", &args[2], &args[4]),
         _ => return Err(usage.into()),
     };
+    // Compiler check receipts bind the whole packet image; a rewritten packet needs a re-emit.
+    let packet = std::path::Path::new(input);
+    for receipt in [
+        packet.with_file_name(plow_asset::certificates::PACKET_CHECKS_FILE),
+        plow_asset::certificates::sidecar_checks_file(packet),
+    ] {
+        if receipt.exists() {
+            return Err(format!("{} binds {input} to its compiler checks: re-emit the bundle", receipt.display()).into());
+        }
+    }
     let blob = std::fs::read(input)?;
     let parsed = plowrt::asset::devblob::DevBlob::parse(&blob)?;
     let raw = parsed.reserved_metadata(&blob, SECTION)?.ok_or("packet has no pipeline section")?;

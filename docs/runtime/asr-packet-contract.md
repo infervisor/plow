@@ -122,11 +122,17 @@ emitters now write.
 cargo build --release -p plowrt --features gguf --example asr_packet_upgrade
 asr_packet_upgrade vad      silero_vad.pkt               silero_vad.v1.pkt
 asr_packet_upgrade rnnt     nemotron.pkt MODEL.gguf      nemotron.v1.pkt     # also parakeet.pkt
-asr_packet_upgrade audio-lm qwen3-asr/model.pkt          model.v1.pkt        # 1.7B and 0.6B
+asr_packet_upgrade audio-lm model.pkt                   model.v1.pkt        # receipt-less audio-LM packets only
 ```
 
 `encoder.pkt` sidecars need no change. A kit carrying upgraded packets needs new sha256 entries
 (`PAIRING.txt`, `SHA256SUMS`, `MANIFEST.json`).
+
+A packet bound to compiler check receipts (`lean-checks.json` / `<stem>.lean-checks.json`: the
+receipt pins the packet image's sha256) cannot be rewritten: plowrt would refuse the receipt.
+`asr_packet_upgrade` refuses such a packet; re-emit the bundle from its recipe instead. This
+applies to the plowc-emitted audio-LM bundles (Qwen3-ASR `model.pkt`); the VAD and RNNT packets
+carry no receipts.
 
 ## Audit (2026-10-09): model logic that was in plowrt
 

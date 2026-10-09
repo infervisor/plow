@@ -61,7 +61,7 @@ source=...` for each bundle.
 | packet records no pins (old emit) | warning; tensors are still checked by byte size at bind |
 | bundle needs cuBLASLt >= X and the runtime loads an older one, or none | startup error naming the model, the requirement and why, and the library found |
 | bundle needs a newer runtime contract | startup error |
-| ASR/VAD packet with another speech contract (e.g. a contract-0 `vad.silero.v1` or GGUF-vocabulary RNNT packet), or a required speech op/parameter missing | startup error; `asr_packet_upgrade` rewrites contract-0 metadata in place of a re-emit |
+| ASR/VAD packet with another speech contract (e.g. a contract-0 `vad.silero.v1` or GGUF-vocabulary RNNT packet), or a required speech op/parameter missing | startup error; re-emit, or `asr_packet_upgrade` for receipt-less packets (VAD, RNNT) |
 | `--assets` value with an unknown key, or two different checkpoints for one bundle | startup error |
 | packet/object pairing hash mismatch | module refused at load |
 | a model listed by the profile is not in the kit, or its mapped checkpoint dir is missing | `plow-voice.sh` refuses to start |
