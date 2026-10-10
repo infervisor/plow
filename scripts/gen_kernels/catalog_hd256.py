@@ -35,4 +35,16 @@ ENTRIES = {
         "tune": lambda: _mod.tune_row(fp8=True),
         "classes": [(h, kv, rows) for h, kv, w, rows in _mod.CLASSES if w == 1024],
     },
+    # The FP8-KV twin for media-span sites (GEN_MEDIA_SPAN=1): rows of one bidirectional media
+    # span also attend that span's later rows. A separate object keeps the causal one unchanged.
+    "attn_pf_hd256_sliding_fp8kv_span": {
+        "signature": {"op": "flash_prefill", "head_dim": 256, "mask": "causal_media_span",
+                      "window": 1024, "window_any": True, "gqa": [2, 16], "gqa_even": True,
+                      "ring_kv": True, "dtype": "bf16", "kv_dtype": "fp8_e4m3_rowscale",
+                      "arch": "sm_90a"},
+        "object": "gen_sm90a_attn_pf_hd256_sliding_fp8kv_span.cubin",
+        "build": lambda cfg, out: _mod.catalog_build(cfg, out, fp8=True, span=True),
+        "tune": lambda: _mod.tune_row(fp8=True, span=True),
+        "classes": [(h, kv, rows) for h, kv, w, rows in _mod.CLASSES if w == 1024],
+    },
 }

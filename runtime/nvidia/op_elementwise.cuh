@@ -65,6 +65,19 @@ static __device__ void d_mm_rows(__nv_bfloat16* __restrict__ out, const unsigned
     }
 }
 
+/* MmSpanExtent (op 210): out[r] = rows after r in r's run of span ids (bits 31 and 30), 0 for any
+ * other row. Runs are one media item (<= a few hundred rows), so each row scans its own tail. */
+static __device__ void d_mm_span_extent(unsigned* __restrict__ out, const unsigned* __restrict__ ids,
+                                        unsigned rows, unsigned slice, unsigned nblk) {
+    const unsigned span = 0xC0000000u;
+    for (unsigned r = slice * PLOW_NV_THREADS + threadIdx.x; r < rows; r += nblk * PLOW_NV_THREADS) {
+        unsigned n = 0;
+        if ((ids[r] & span) == span)
+            while (r + n + 1 < rows && (ids[r + n + 1] & span) == span) n++;
+        out[r] = n;
+    }
+}
+
 /* EmbedOverlayBf16 (op 179): a row is table[tokens[r]] unless overlay_index[r] names an
  * overlay row, which is BF16-rounded in (the CPU golden's plow_f2bf: round-to-nearest-even). */
 static __device__ void d_embed_overlay(__nv_bfloat16* __restrict__ out, const __nv_bfloat16* __restrict__ table,

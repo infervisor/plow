@@ -1542,7 +1542,7 @@ impl StageProgram {
             || stage.q_rows == 0
             || stage.kv_rows == 0
             || stage.heads == 0
-            || !matches!(stage.head_width, 64 | 128)
+            || !(stage.head_width == 64 || (stage.head_width % 8 == 0 && stage.head_width <= 128))
         {
             return Err("invalid attention geometry".into());
         }

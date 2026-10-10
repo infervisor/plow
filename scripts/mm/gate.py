@@ -90,7 +90,7 @@ def main():
                           "plow": text[:160], "hf": c["output"][:160]}), flush=True)
     by_text = {}
     for c in ref["cases"]:
-        by_text.setdefault(c["messages"][0]["content"][-1]["text"], []).append(c)
+        by_text.setdefault(json.dumps([m["content"][-1]["text"] for m in c["messages"]]), []).append(c)
     for group in by_text.values():
         for a in group:
             for b in group:

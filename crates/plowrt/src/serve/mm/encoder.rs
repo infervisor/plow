@@ -29,8 +29,9 @@ enum Inputs {
         shift: f32,
         posx: PacketTensor,
         posy: PacketTensor,
-        rope: PacketTensor,
-        valid: PacketTensor,
+        /// Tower inputs; an encoder-free embedder (one row per soft token) has none of them.
+        rope: Option<PacketTensor>,
+        valid: Option<PacketTensor>,
         pools: Vec<PacketTensor>,
     },
     Audio {
@@ -80,9 +81,11 @@ impl Encoder {
                     shift: f32_param(&packet, "input.shift_f32").unwrap_or(0.0),
                     posx: pipeline.tensor("posx")?,
                     posy: pipeline.tensor("posy")?,
-                    rope: pipeline.tensor("rope")?,
-                    valid: pipeline.tensor("valid")?,
-                    pools: (0..pool * pool).map(|j| pipeline.tensor(&format!("pool.{j}"))).collect::<Result<_>>()?,
+                    rope: pipeline.optional_tensor("rope"),
+                    valid: pipeline.optional_tensor("valid"),
+                    pools: (0..pool * pool)
+                        .map_while(|j| pipeline.optional_tensor(&format!("pool.{j}")))
+                        .collect(),
                 }
             }
             Some("audio") => Inputs::Audio {
@@ -192,9 +195,9 @@ impl Encoder {
                 (self.input, bytemuck::cast_slice(&px).to_vec()),
                 (posx, bytemuck::cast_slice(&xs).to_vec()),
                 (posy, bytemuck::cast_slice(&ys).to_vec()),
-                (rope, bytemuck::cast_slice(&rp).to_vec()),
-                (valid, bytemuck::cast_slice(&counts).to_vec()),
             ];
+            writes.extend(rope.map(|t| (t, bytemuck::cast_slice(&rp).to_vec())));
+            writes.extend(valid.map(|t| (t, bytemuck::cast_slice(&counts).to_vec())));
             for (j, t) in pools.iter().enumerate() {
                 writes.push((*t, bytemuck::cast_slice(&taps[j]).to_vec()));
             }

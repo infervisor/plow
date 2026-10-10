@@ -1758,20 +1758,23 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
             q_pos0 = 0;
         }
 #endif
+        /* i7 = nsplit | MmSpanExtent handle << 16 (0: causal). */
+        const unsigned nsplit = in->i[7] & 0xFFFFu, span_h = in->i[7] >> 16;
+        const unsigned* span = span_h ? (const unsigned*)T[span_h] : nullptr;
         if (in->i[6] == 256)
             d_flash_prefill_fp8_mux<256>(
                 req, (float*)TEN(0), (float*)TEN(1), (const __nv_bfloat16*)TEN(2),
                 (const uint8_t*)TEN(3), (const uint8_t*)TEN(4), (__nv_bfloat16*)TEN(5),
                 (const float*)TEN(6), (const float*)TEN(7),
-                in->i[0], in->i[1], in->i[2], in->i[3], q_pos0, in->i[5], in->i[7],
-                in->fj[1].u, in->fj[2].u, in->fj[0].f, slice, nblk, arena);
+                in->i[0], in->i[1], in->i[2], in->i[3], q_pos0, in->i[5], nsplit,
+                in->fj[1].u, in->fj[2].u, in->fj[0].f, slice, nblk, arena, span);
         else if (in->i[6] == 512)
             d_flash_prefill_fp8_mux<512>(
                 req, (float*)TEN(0), (float*)TEN(1), (const __nv_bfloat16*)TEN(2),
                 (const uint8_t*)TEN(3), (const uint8_t*)TEN(4), (__nv_bfloat16*)TEN(5),
                 (const float*)TEN(6), (const float*)TEN(7),
-                in->i[0], in->i[1], in->i[2], in->i[3], q_pos0, in->i[5], in->i[7],
-                in->fj[1].u, in->fj[2].u, in->fj[0].f, slice, nblk, arena);
+                in->i[0], in->i[1], in->i[2], in->i[3], q_pos0, in->i[5], nsplit,
+                in->fj[1].u, in->fj[2].u, in->fj[0].f, slice, nblk, arena, span);
         else
             __trap();
 #else
@@ -1788,6 +1791,7 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
 #if PLOW_NV_GEMMA
 #if PLOW_NV_FA_PIPE
 #if PLOW_NV_FA_FP8MMA && PLOW_FP8_KV
+        if (in->i[7] >> 16) { __trap(); break; } /* media spans: only the PIPE=0 arm masks them */
         /* beat-fp8-mma: the PIPE=1 fp8 prefill is the px4/px8 fp8-mma arm at hd512 (FULL layers)
          * and the PX-23 arm at hd256 (SLIDING layers). Both are gated on the same
          * PLOW_NV_FA_PIPE && PLOW_NV_FA_FP8MMA, so there is no build in which one exists without
@@ -1821,20 +1825,27 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
         __trap(); /* fp8 prefill needs PIPE=0 or the fp8-mma arm; neither is in this object */
 #endif
 #else
+        {
+        /* i7 = nsplit | MmSpanExtent handle << 16 (0: causal). */
+        const unsigned nsplit = in->i[7] & 0xFFFFu, span_h = in->i[7] >> 16;
+        const unsigned* span = span_h ? (const unsigned*)T[span_h] : nullptr;
         if (in->i[6] == 256)
             d_flash_prefill<256, 64, 32, true>(
                 (float*)TEN(0), (float*)TEN(1), (const __nv_bfloat16*)TEN(2),
                 (const __nv_bfloat16*)TEN(3), (const __nv_bfloat16*)TEN(4), (__nv_bfloat16*)TEN(5),
-                in->i[0], in->i[1], in->i[2], in->i[3], in->i[4], in->i[5], in->i[7], in->fj[1].u,
-                in->fj[2].u, in->fj[0].f, slice, nblk, arena, (const float*)TEN(6), (const float*)TEN(7));
+                in->i[0], in->i[1], in->i[2], in->i[3], in->i[4], in->i[5], nsplit, in->fj[1].u,
+                in->fj[2].u, in->fj[0].f, slice, nblk, arena, (const float*)TEN(6), (const float*)TEN(7),
+                span);
         else if (in->i[6] == 512)
             d_flash_prefill<512, 32, 16, true>(
                 (float*)TEN(0), (float*)TEN(1), (const __nv_bfloat16*)TEN(2),
                 (const __nv_bfloat16*)TEN(3), (const __nv_bfloat16*)TEN(4), (__nv_bfloat16*)TEN(5),
-                in->i[0], in->i[1], in->i[2], in->i[3], in->i[4], in->i[5], in->i[7], in->fj[1].u,
-                in->fj[2].u, in->fj[0].f, slice, nblk, arena, (const float*)TEN(6), (const float*)TEN(7));
+                in->i[0], in->i[1], in->i[2], in->i[3], in->i[4], in->i[5], nsplit, in->fj[1].u,
+                in->fj[2].u, in->fj[0].f, slice, nblk, arena, (const float*)TEN(6), (const float*)TEN(7),
+                span);
         else
             __trap();
+        }
 #endif
 #else
         __trap();
@@ -1973,6 +1984,10 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
     case PLOW_DOP_MM_ROWS_BF16:
         d_mm_rows((__nv_bfloat16*)TEN(0), (const unsigned*)TEN(1), (const unsigned*)TEN(2),
                   (const __nv_bfloat16*)TEN(3), in->i[0], in->i[1], in->i[2], in->i[3], slice, nblk);
+        break;
+
+    case PLOW_DOP_MM_SPAN_EXTENT:
+        d_mm_span_extent((unsigned*)TEN(0), (const unsigned*)TEN(1), in->i[0], slice, nblk);
         break;
 
     case PLOW_DOP_EMBED_OVERLAY_BF16:

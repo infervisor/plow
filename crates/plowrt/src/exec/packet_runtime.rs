@@ -585,6 +585,10 @@ impl BoundPacketPipeline {
         })
     }
 
+    pub fn optional_tensor(&self, role: &str) -> Option<PacketTensor> {
+        self.tensors.get(role).copied()
+    }
+
     pub fn tensor_sequence(&self, role: &str) -> Result<Vec<PacketTensor>> {
         let prefix = format!("{role}.");
         let mut sequence = Vec::new();

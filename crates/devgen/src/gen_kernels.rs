@@ -60,6 +60,9 @@ pub(crate) struct Entry {
     pub pair_heads: bool,
     /// Smallest prefill rung (rows) bound to the entry; narrower rungs keep their existing route.
     pub min_rows: u32,
+    /// Claims exactly the media-span sites (`FlashPrefillFp8` i[7] high half); the object exports
+    /// `plow_attention_media_span = 1`.
+    pub media_span: bool,
 }
 
 /// The table build_catalog.py builds from and `tune` writes: the one source of every entry's
@@ -68,11 +71,12 @@ const TABLE: &str = include_str!("../../../tuning/nvidia/sm_90a/h100-sxm5/gen_ke
 
 /// Devgen's binding policy per table entry, which the table does not carry: the role ID (a new
 /// entry takes the next generated ID) and the smallest prefill rung it binds.
-const POLICY: [(&str, u8, u32); 4] = [
+const POLICY: [(&str, u8, u32); 5] = [
     ("attn_pf_hd512", GENERATED_FIRST, 1024),
     ("attn_pf_hd256_sliding", GENERATED_FIRST + 1, 1024),
     ("attn_pf_hd256_sliding_fp8kv", GENERATED_FIRST + 2, 128),
     ("attn_pf_hd512_fp8kv", GENERATED_FIRST + 3, 128),
+    ("attn_pf_hd256_sliding_fp8kv_span", GENERATED_FIRST + 4, 128),
 ];
 
 fn table_entry(name: &str, role: u8, min_rows: u32, row: &serde_json::Value) -> Result<Entry, String> {
@@ -85,9 +89,12 @@ fn table_entry(name: &str, role: u8, min_rows: u32, row: &serde_json::Value) -> 
             .and_then(|v| u32::try_from(v).ok())
             .ok_or(format!("{name}: signature lacks {key}"))
     };
-    if (text("op"), text("mask"), text("dtype"), text("arch"))
-        != ("flash_prefill", "causal", "bf16", "sm_90a")
-    {
+    let media_span = match text("mask") {
+        "causal" => false,
+        "causal_media_span" => true,
+        other => return Err(format!("{name}: unknown mask {other:?}")),
+    };
+    if (text("op"), text("dtype"), text("arch")) != ("flash_prefill", "bf16", "sm_90a") {
         return Err(format!("{name}: unsupported signature {sig}"));
     }
     let kv = match text("kv_dtype") {
@@ -105,6 +112,7 @@ fn table_entry(name: &str, role: u8, min_rows: u32, row: &serde_json::Value) -> 
         ring_kv: flag("ring_kv"),
         pair_heads: flag("gqa_even"),
         min_rows,
+        media_span,
     })
 }
 
@@ -167,7 +175,8 @@ impl Entry {
         op.op == self.kv.op() as u16
             && op.i[6] == self.head_dim
             && heads_and_window_match(op, self.window, self.pair_heads)
-            && op.i[7] == 1
+            && packet::dev::flash_nsplit(op.i[7]) == 1
+            && packet::dev::flash_span(op.i[7]).is_some() == self.media_span
             && (self.ring_kv || op.j[1] == u32::MAX)
             // FP8-KV roles need the per-row K/V scales; gen_flash_prefill.cu reads t[6]/t[7] unchecked.
             && (self.kv == KvDtype::Bf16 || (op.t[6] != TENSOR_NONE && op.t[7] != TENSOR_NONE))
@@ -194,6 +203,7 @@ impl Entry {
             || global("plow_gen_flash_prefill_abi") != Some(self.kv.object_abi())
             || global("plow_attention_head_dim") != Some(self.head_dim)
             || global("plow_pf_request_abi") != Some(2)
+            || (global("plow_attention_media_span") == Some(1)) != self.media_span
         {
             return Err(format!(
                 "{} is not a generated {} flash-prefill object",
@@ -330,6 +340,12 @@ mod tests {
         assert!(bf16.matches(&op) && !fp8.matches(&op));
         op.op = DevOp::FlashPrefillFp8 as u16;
         assert!(!bf16.matches(&op) && fp8.matches(&op));
+        // Media-span sites (i7 high half) belong to the span twin only.
+        let span = entry("attn_pf_hd256_sliding_fp8kv_span");
+        assert!(!span.matches(&op));
+        op.i[7] = 1 | 900 << 16;
+        assert!(!fp8.matches(&op) && span.matches(&op));
+        op.i[7] = 1;
         // FP8-KV global attention has its own entry; the bf16 one does not claim it.
         op.i[5] = 0;
         op.i[6] = 512;
@@ -352,15 +368,25 @@ mod tests {
     fn catalog_signatures_come_from_the_table() {
         let got: Vec<_> = CATALOG
             .iter()
-            .map(|e| (e.name.as_str(), e.file.as_str(), e.kv, e.head_dim, e.window, e.ring_kv, e.pair_heads))
+            .map(|e| (e.name.as_str(), e.file.as_str(), e.kv, e.head_dim, e.window, e.ring_kv, e.pair_heads, e.media_span))
             .collect();
         assert_eq!(
             got,
             [
-                ("attn_pf_hd512", "gen_sm90a_attn_pf_hd512.cubin", KvDtype::Bf16, 512, 0, false, false),
-                ("attn_pf_hd256_sliding", "gen_sm90a_attn_pf_hd256_sliding.cubin", KvDtype::Bf16, 256, ANY_SLIDING, true, true),
-                ("attn_pf_hd256_sliding_fp8kv", "gen_sm90a_attn_pf_hd256_sliding_fp8kv.cubin", KvDtype::Fp8, 256, ANY_SLIDING, true, true),
-                ("attn_pf_hd512_fp8kv", "gen_sm90a_attn_pf_hd512_fp8kv.cubin", KvDtype::Fp8, 512, 0, false, false),
+                ("attn_pf_hd512", "gen_sm90a_attn_pf_hd512.cubin", KvDtype::Bf16, 512, 0, false, false, false),
+                ("attn_pf_hd256_sliding", "gen_sm90a_attn_pf_hd256_sliding.cubin", KvDtype::Bf16, 256, ANY_SLIDING, true, true, false),
+                ("attn_pf_hd256_sliding_fp8kv", "gen_sm90a_attn_pf_hd256_sliding_fp8kv.cubin", KvDtype::Fp8, 256, ANY_SLIDING, true, true, false),
+                ("attn_pf_hd512_fp8kv", "gen_sm90a_attn_pf_hd512_fp8kv.cubin", KvDtype::Fp8, 512, 0, false, false, false),
+                (
+                    "attn_pf_hd256_sliding_fp8kv_span",
+                    "gen_sm90a_attn_pf_hd256_sliding_fp8kv_span.cubin",
+                    KvDtype::Fp8,
+                    256,
+                    ANY_SLIDING,
+                    true,
+                    true,
+                    true,
+                ),
             ]
         );
     }

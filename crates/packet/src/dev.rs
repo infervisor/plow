@@ -434,6 +434,10 @@ pub enum DevOp {
     FlashDecodeFp8 = 38,
     /// FP8 KV twin of [`DevOp::FlashPrefill`]: dequantizes the e4m3 cache at the LDS stage, so the
     /// MFMA is unchanged. `t3=K(fp8) t4=V(fp8) t6=k_scale t7=v_scale`; else as [`DevOp::FlashPrefill`].
+    /// `i7 = nsplit | span << 16`: a non-zero `span` names a `u32[n_q]` [`DevOp::MmSpanExtent`]
+    /// output, and query row `r` (absolute position `q`) then also attends keys up to
+    /// `min(q + span[r], n_kv - 1)` (bidirectional within a media item); 0 = causal, as before.
+    /// Read the halves with [`flash_nsplit`] / [`flash_span`].
     FlashPrefillFp8 = 39,
 
     // ===== MoE data-dependent counter-gate ops =====
@@ -2193,7 +2197,8 @@ pub enum DevOp {
     /// `in_stride` 0 = `heads*head_width`). Score `f0 * q.k + bias[h*bias_head_stride +
     /// r*kv_rows + j]`, softmax over keys `j < key_lengths[b]` (and `j <= r` with flag bit 0); a
     /// row with no visible key is zero. Output is dense `[batch,q_rows,heads*head_width]`.
-    /// `head_width` is 64 or 128. Flag bit 1 allows 3xTF32 tensor cores (FP32-accurate).
+    /// `head_width` is 64, or a multiple of 8 up to 128 (e.g. 72). Flag bit 1 allows 3xTF32 tensor
+    /// cores at 64 (FP32-accurate).
     /// With `prefix` (a cached key prefix), item `b`'s keys are rows `[0, i7)` of block
     /// `prefix_index[b]` of `prefix` (`[blocks][i7][K | V]`, `2*heads*head_width` wide) followed
     /// by its `kv_rows` own rows (key lengths count both; `i7` is the prefix row count; no bias,
@@ -2247,6 +2252,23 @@ pub enum DevOp {
     /// `t0=x(bf16[rows][width]) t1=ids(u32[rows]) t2=table(u32[cap][2]) t3=slab(bf16[slab_rows][width])`
     /// · `i0=rows i1=width i2=cap i3=slab_rows`.
     MmRowsBf16 = 209,
+    /// Multimodal span extents for bidirectional-span media: `out[r]` = the number of rows after
+    /// `r` (below `rows`) in the same run of ids carrying both bit 31 and bit 30
+    /// (`plow_asset::multimodal::SPAN_ID_BIT`) when `ids[r]` carries both, else 0. The marked
+    /// [`DevOp::FlashPrefillFp8`] sites read it (their `i7` high half).
+    /// `t0=out(u32[rows]) t1=ids(u32[rows])` · `i0=rows`.
+    MmSpanExtent = 210,
+}
+
+/// [`DevOp::FlashPrefillFp8`]'s split count (`i7` low half).
+pub fn flash_nsplit(i7: u32) -> u32 {
+    i7 & 0xFFFF
+}
+
+/// [`DevOp::FlashPrefillFp8`]'s span-extent tensor (`i7` high half), `None` when causal.
+pub fn flash_span(i7: u32) -> Option<u16> {
+    let h = (i7 >> 16) as u16;
+    (h != 0).then_some(h)
 }
 
 /// Activation codes shared by [`DevOp::UnaryF32`] (`kind`) and the convolution input/output
@@ -2504,6 +2526,7 @@ impl DevOp {
         DevOp::RopeAxialF32,
         DevOp::ChunkAttentionF32,
         DevOp::MmRowsBf16,
+        DevOp::MmSpanExtent,
     ];
 
     /// Recover the opcode from its wire discriminant, or `None` for a value no
@@ -2734,6 +2757,7 @@ impl DevOp {
             DevOp::RopeAxialF32 => "PLOW_DOP_ROPE_AXIAL_F32",
             DevOp::ChunkAttentionF32 => "PLOW_DOP_CHUNK_ATTENTION_F32",
             DevOp::MmRowsBf16 => "PLOW_DOP_MM_ROWS_BF16",
+            DevOp::MmSpanExtent => "PLOW_DOP_MM_SPAN_EXTENT",
         }
     }
 
@@ -2791,7 +2815,8 @@ impl DevOp {
     /// 205 -> 206 for `GluStrided = 205` (Gemma-4 E-series per-layer input gate on CUDA).
     /// 206 -> 210 for `RmsNormF32 = 206` .. `MmRowsBf16 = 209` (multimodal towers and LM
     /// soft-token rows).
-    pub const COUNT: u16 = 210;
+    /// 210 -> 211 for `MmSpanExtent = 210` (bidirectional media spans).
+    pub const COUNT: u16 = 211;
 
     /// The `(M, N, K, quant)` a decode-GEMV opcode carries, or `None` if this is not one.
     ///

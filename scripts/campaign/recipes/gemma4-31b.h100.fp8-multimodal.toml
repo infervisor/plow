@@ -1,0 +1,171 @@
+# EXPERIMENTAL multimodal variant of recipes/infervisor/gemma-4-31b/sm90a-h100-tp1-fp8.toml: adds the gemma4_vision tower
+# (mm_vision.pkt, head_dim 72) and bidirectional attention within each image on the sliding
+# layers (PLOW_EMIT_MULTIMODAL=1; docs/serving-openai-compat.md 2c). Everything else is the
+# production recipe, except the sliding prefill attention runs the media-span twin
+# attn_pf_hd256_sliding_fp8kv_span.
+#
+# Gemma-4-31B-it FP8 on one H100 SXM5: W8A8 weights, FP8 per-token-head KV, 16384 context, 32 decode
+# slots, prefix cache on. Production recipe for this model/GPU/precision.
+#
+# Checkpoint: hub RedHatAI/gemma-4-31B-it-FP8-dynamic @ d4ab4f579dd3516f97d8a6a4c98d0653480bad15
+# (compressed-tensors W8 per-channel / A8 dynamic per-token, vision tower and lm_head unquantized;
+# shard sha256 144030ca3dd3d1cc..., 1cc6bb1df5374a98...), re-keyed to plow's fp8/ contract without
+# requantizing:
+#   python3 scripts/gemma4_fp8_hub_rekey.py <hub snapshot> <re-keyed dir>
+#   PLOW_CAMPAIGN_NO_NIX=1 (box without nix only) PLOW_FP8_CKPT=<re-keyed dir> \
+#   python3 scripts/campaign/campaign.py build recipes/infervisor/gemma-4-31b/sm90a-h100-tp1-fp8.toml --out <fresh dir>
+#
+# Measured (2026-10-10) on packet a18768d2ad68 = this recipe at max_ctx 131072 (plowrt 8818de12):
+# campaign.py report MATCHED + EQUIVALENT vs vLLM 0.28 fp8_per_token_head KV at --max-model-len 65536
+# (the largest it fits at 0.9), 2 repeats. FP32-reference gate PASS twice (kl_mean 0.048 / 0.064 vs
+# vLLM 0.063, kl_p99 0.94 / 1.23 vs 1.42, needle 1.0). Total tok/s vs vLLM: 4K c32/c128
+# 1.57x / 1.55x, 15K 2.26x / 2.28x, agentic c32/c64/c128 2.35x / 2.05x / 1.98x,
+# 32K c1/c4/c16 2.20x / 2.45x / 2.49x; loses latency c1/c4
+# (0.84x / 0.92x: B=1 decode 19.7 ms vs vLLM TPOT 16.1 ms, 50% of the HBM roofline).
+# docs/bringup/results/gemma31b-h100-20261010/comparison.md.
+#
+# max_ctx 16384: the long FP32 gate (20 cases to 32768 tokens) FAILS twice on cont_frac only (0.511 /
+# 0.548, limit 0.558) while kl_mean / kl_p99 / top1_decisive beat vLLM's; needles 36/36 at 8192..130000.
+# This packet (3be48e1f5bf8, plowrt 071d8f13, same emit at 16384): std gate PASS 1 of 2 (kl_mean
+# 0.0494 PASS, 0.0812 FAIL by 0.0002 vs limit 0.0811; run-to-run kl_mean spread 0.048-0.081 across the
+# four std runs on both packets, gate served at concurrency 16; cause not isolated); 4K c32 out tok/s 255.2 vs
+# 256.4 at 131072 (one repeat). Not run: the open-loop production mix.
+#
+# Memory: FP8 weights 29.9 GiB; a staged slot keeps a 2048-row FP8 sliding ring = 800 MiB (50 layers x
+# 16 KV heads x 256 x K+V), so 32 slots = 25 GiB of rings; the full-attention KV (10 layers x 4 heads
+# x 512, 40 KiB/token) gets the remaining ~16 GiB admission budget (~420K rows). 64 slots would leave
+# no full-attention KV.
+#
+# Routes (per-rung evidence: docs/bringup/results/gemma31b-h100-20261010/comparison.md "rung gates"):
+#   prefill projections   cuBLASLt FP8 OUTER_VEC (segment_roles CUBLASLT_PREFILL_GEMMA4_31B_SHAPES),
+#                         native ws384 FP8 down_proj at 512 and >= 2048 rows (route matrix: 7-15% faster)
+#   prefill attention     generated FP8-KV hd256 sliding + hd512 global (FlashPrefillFp8, rungs >= 128)
+#   decode B 1..32        native interpreter GEMV at every rung: step_bench B16 / B32 27.2 / 36.2 ms vs
+#                         40.0 / 34.6 ms with cuBLASLt projections from 16 rows (ctx 1024), 30.2 / 42.3 vs
+#                         37.6 / 46.2 at ctx 4096; B1..B8 identical
+schema = "plow.recipe.v1"
+namespace = "infervisor"
+name = "gemma-4-31b"
+label = "sm90a-h100-tp1-fp8-multimodal"
+status = "experimental"
+plow_git = "071d8f13cd546dc052d2e4702ac6c4aed1af1ff0"
+network = "gemma4"
+
+[target]
+vendor = "nvidia"
+isa = "sm_90a"
+sku = "H100 SXM5"
+units = 132
+num_gpus = 1
+parallel = "tp"
+max_ctx = 16384
+toolchain = "cuda-12.9"
+
+[checkpoint]
+source = "RedHatAI/gemma-4-31B-it-FP8-dynamic@d4ab4f579dd3516f97d8a6a4c98d0653480bad15"
+layout = "plow-fp8-hub-rekey"
+
+[cell]
+name = "gemma4-31b.h100.fp8-16k-c32"
+model = "gemma-4-31b-it-fp8 (RedHatAI compressed-tensors, re-keyed)"
+revision = "d4ab4f579dd3516f97d8a6a4c98d0653480bad15"
+hf_dir = "{env:PLOW_FP8_CKPT}"
+gpu = "H100 SXM5"
+arch = "sm_90a"
+n_cu = 132
+max_ctx = 16384
+precision = "w8a8"
+
+[emit]
+args = ["--segmented", "--served-name", "gemma-4-31b-it-fp8"]
+[emit.env]
+# Experimental: encoder sidecar (mm_vision.pkt) + MmRowsBf16 + media-span attention.
+PLOW_EMIT_MULTIMODAL = "1"
+PLOW_GLU_QUANT_FUSE = "1"
+NVCC_APPEND_FLAGS = "-DPLOW_NV_GLU_QUANT_CACHE=1 -DPLOW_NV_GLU_QUANT_WPR=1 -DPLOW_NV_LIGHT_FP8_ATTN=1 -DPLOW_FP8_LD16=1 -DPLOW_FP8_FAST=1"
+PLOW_FP8 = "1"
+PLOW_W8A8 = "1"
+PLOW_FP8_KV = "1"
+PLOW_EMIT_PACKED_PREFILL = "1"
+PLOW_SEG_PURE_GEMM = "fp8"
+PLOW_SEG_FA512 = "1"
+PLOW_SEG_FA256_GQA2 = "1"
+PLOW_TMA_GEMM = "1"
+PLOW_MAX_CHUNK = "4096"
+PLOW_MAX_REQUEST_CHUNK = "4096"
+PLOW_SLIDING_NS_CAP = "1"
+PLOW_SLIDING_NS_GRID = "1"
+PLOW_ATTENTION_DECODE_BALANCE_GF = "4"
+PLOW_FA_MMAQK = "3"
+PLOW_DECODE_BATCH_LADDER = "1,2,4,8,16,32"
+PLOW_EMIT_DECODE_CUBLASLT = "0"
+PLOW_EMIT_PREFILL_CUBLASLT = "1"
+PLOW_PF_LADDER_APPEND = "256,1088,1152,2112,4160,4224"
+PLOW_FUSE_ARGMAX = "1"
+
+[objects]
+script = "scripts/build_sm90a_gemma4_segments.sh"
+role_files = ["gen_sm90a_attn_pf_hd256_sliding_fp8kv_span.cubin", "gen_sm90a_attn_pf_hd512_fp8kv.cubin"]
+[objects.env]
+PLOW_BUILD_FATLITE = "1"
+NVCC_APPEND_FLAGS = "-DPLOW_NV_GLU_QUANT_CACHE=1 -DPLOW_NV_GLU_QUANT_WPR=1"
+PLOW_BUILD_W8A8 = "1"
+PLOW_BUILD_FP8KV_GEMM = "1"
+PLOW_BUILD_FA_GQA2_PAIR = "0"
+PLOW_BUILD_PFATTN_HD256_BKV32 = "0"
+PLOW_BUILD_PFATTN_HD256_GQA2_BKV32 = "0"
+PLOW_BUILD_PFATTN_HD512_PX4_BQ64 = "0"
+PLOW_BUILD_GEN_KERNELS = "attn_pf_hd256_sliding_fp8kv_span,attn_pf_hd512_fp8kv"
+
+[emit_roles.env]
+PLOW_GEMMA4_SM90_W8A8_GEMM_GLU_ROLE = "0"
+PLOW_GEMMA4_SM90_HD512_PX4_BQ64_ROLE = "0"
+PLOW_GEMMA4_SM90_HD256_GQA2_ROLE = "0"
+PLOW_EMIT_GEN_KERNELS = "attn_pf_hd256_sliding_fp8kv_span,attn_pf_hd512_fp8kv"
+
+[serve.env]
+PLOW_PREFIX_CACHE = "1"
+PLOW_VMM_PREFIX = "1"
+PLOW_PF_SEG_PURE = "fp8"
+PLOW_PF_SEG_FA512 = "1"
+PLOW_VMM_LIVE_RINGS = "0"
+PLOW_MULTISTEP = "0"
+PLOW_DECODE_MAX_RUNG = "32"
+PLOW_TOKEN_BATCH = "1"
+PLOW_LT_FP8_FAST_ACCUM_MAX_K = "8192"
+
+[bench]
+backend = "openai"
+in_lens = "128 1024 4096"
+concs = "1"
+nprompt = 32
+outlen = 128
+warmups = 2
+seed = 42
+tokenizer = "{env:PLOW_FP8_CKPT}"
+model_id = "gemma-4-31b-it-fp8"
+gate_prompt = "<bos><|turn>user\nWhat is the capital of France? Answer in one short sentence.<turn|>\n<|turn>model\n<|channel>thought\n<channel|>"
+
+[measured]
+tok_s = 255.2
+p50_tpot_ms = 115.9
+concurrency = 32
+input_len = 4096
+output_len = 128
+client = "vllm 0.28.0 bench serve (repro_gemma31b_h100.sh st4k, 1 repeat, packet 3be48e1f5bf8)"
+
+# FP32-reference gate (scripts/llm/fp32_ref_gate.py; repro_gemma31b_h100.sh gate runs it). The reference
+# is the served checkpoint dequantized to FP32 on one GPU with `reference --device offload` (decoder
+# layers kept in FP8 and materialized in FP32 per forward):
+#   llm_fp32_ref       G31_FP8_FP32_REF = the 46-case reference (prompts sha256 103024034dce0594,
+#                      ref 8036119d1498abd7...), G31_FP8_FP32_VLLM = the vLLM 0.28 capture against it
+# No llm_fp32_ref_long here: its prompts reach 32768 tokens, past this packet's max_ctx (the runs on the
+# 131072 packet are recorded in the header).
+# Thresholds: fp32_ref_gate.py DEFAULTS (docs/bringup/agent-tools.md section 5).
+[gates]
+python = "{env:PYREF}"
+[gates.llm_fp32_ref]
+reference = "{env:G31_FP8_FP32_REF}"
+vllm_capture = "{env:G31_FP8_FP32_VLLM}"
+concurrency = 16
+timeout_s = 2400
