@@ -170,17 +170,19 @@ vllm_capture = "{env:GEMMA12B_FP32_VLLM}"
 [reference]
 csv = "perf-data/campaign/gemma4-12b.h100.reference-vllm028-fp8.csv"
 
-# 2026-10-10 (mm-harden a00d40f2, packet built from this recipe): mm_parity PASS 3/3 cases,
-# refusals 11/11, encoders 10/10; llm_fp32_ref PASS KL mean 0.093 vs vLLM 0.128.
-# Media parity, audio only (vision is not emitted for 12B): GEMMA12B_MM_REF = a scripts/mm/hf_ref.py
-# reference dir; building it needs a transformers-loadable checkpoint (GEMMA12B_HF_BF16, the FP8
-# checkpoint dequantized to bf16). MM_MEDIA as in gemma4-e4b.h100.multimodal.toml.
+# 2026-10-10 (mm-harden a00d40f2, audio-only cases): mm_parity PASS 3/3 cases, refusals 11/11,
+# encoders 10/10; llm_fp32_ref PASS KL mean 0.093 vs vLLM 0.128. Not yet run on the image cases.
+# Media parity, image + audio, plus a follow-up turn and images near the stage / chunk boundaries:
+# GEMMA12B_MM_REF = a scripts/mm/hf_ref.py reference dir built from these cases (an audio-only dir
+# from before is stale); building it needs a transformers-loadable checkpoint (GEMMA12B_HF_BF16, the
+# FP8 checkpoint dequantized to bf16). MM_MEDIA as in gemma4-e4b.h100.multimodal.toml.
 [gates.mm_parity]
 python = "python3"
 hf_python = "{env:PYREF}"
 reference = "{env:GEMMA12B_MM_REF}"
 hf_dir = "{env:GEMMA12B_HF_BF16}"
-cases = "scripts/mm/cases/audio.json"
+cases = "scripts/mm/cases/image_audio_spans.json"
+images = ["{env:MM_MEDIA}/cats.png", "{env:MM_MEDIA}/stop_small.png", "{env:MM_MEDIA}/coco_000000000285.jpg", "{env:MM_MEDIA}/coco_000000000632.jpg"]
 audio = ["{env:MM_MEDIA}/ls00.wav", "{env:MM_MEDIA}/ls01.wav", "{env:MM_MEDIA}/ls02.wav"]
 refusal_image = "{env:MM_MEDIA}/cats.png"
 refusal_audio = "{env:MM_MEDIA}/ls01.wav"

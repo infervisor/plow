@@ -171,3 +171,18 @@ reference = "{env:G26_FP8_FP32_REF_LONG}"
 vllm_capture = "{env:G26_FP8_FP32_VLLM_LONG}"
 concurrency = 4
 timeout_s = 7200
+
+# Media parity, vision only (no audio tower; refusals.py expects audio to be refused): G26_MM_REF = a
+# scripts/mm/hf_ref.py reference dir (built in the lease when ref.json is missing; needs a
+# transformers-loadable checkpoint, G26_HF_BF16 = the FP8 checkpoint dequantized to bf16). image.json
+# covers multi-image, a follow-up turn and images straddling row 960 / 4000, near the stage and
+# 4096-row chunk boundaries (no stage or chunk may end inside a media span). MM_MEDIA as in gemma4-e4b.h100.multimodal.toml.
+[gates.mm_parity]
+python = "python3"
+hf_python = "{env:PYREF}"
+reference = "{env:G26_MM_REF}"
+hf_dir = "{env:G26_HF_BF16}"
+cases = "scripts/mm/cases/image.json"
+images = ["{env:MM_MEDIA}/cats.png", "{env:MM_MEDIA}/stop_small.png", "{env:MM_MEDIA}/coco_000000000285.jpg", "{env:MM_MEDIA}/coco_000000000632.jpg"]
+refusal_image = "{env:MM_MEDIA}/cats.png"
+refusal_audio = "{env:MM_MEDIA}/ls01.wav"

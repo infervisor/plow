@@ -169,3 +169,15 @@ reference = "{env:G31_FP8_FP32_REF}"
 vllm_capture = "{env:G31_FP8_FP32_VLLM}"
 concurrency = 16
 timeout_s = 2400
+
+# Media parity, vision only, as in gemma4-26b-a4b.h100.fp8-multimodal.toml: G31_MM_REF = a
+# scripts/mm/hf_ref.py reference dir, G31_HF_BF16 = the FP8 checkpoint dequantized to bf16.
+[gates.mm_parity]
+python = "python3"
+hf_python = "{env:PYREF}"
+reference = "{env:G31_MM_REF}"
+hf_dir = "{env:G31_HF_BF16}"
+cases = "scripts/mm/cases/image.json"
+images = ["{env:MM_MEDIA}/cats.png", "{env:MM_MEDIA}/stop_small.png", "{env:MM_MEDIA}/coco_000000000285.jpg", "{env:MM_MEDIA}/coco_000000000632.jpg"]
+refusal_image = "{env:MM_MEDIA}/cats.png"
+refusal_audio = "{env:MM_MEDIA}/ls01.wav"
