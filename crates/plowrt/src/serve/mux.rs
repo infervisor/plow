@@ -1622,14 +1622,13 @@ pub fn spawn(
                 let device_quantum = 0;
 
                 if device_quantum > 1
-                    && (freed_last_tick
-                        || !waiting.is_empty()
-                        || slots.iter().flatten().any(|s| s.step == 0))
+                    && quantum_yields(
+                        slots.iter().flatten().any(|s| s.step == 0),
+                        freed_last_tick,
+                        !waiting.is_empty(),
+                        || waiter_seatable(&waiting, &slots, admission_limit, kv_budget, downstream.full()),
+                    )
                 {
-                    // Prefill is pending, so the next chunk must not wait behind a K-step
-                    // quantum. A slot freed last tick counts: its successor is usually a round
-                    // trip away, and a K-step quantum here lets the next completion land in the
-                    // same wave (two prefills back to back). 15000/C4 TTFT 1099 -> 627 ms.
                     1
                 } else if device_quantum > 1 {
                     group_aligned(device_quantum.max(MultiStep::for_batch(live as i64).steps), token_group)
@@ -1990,6 +1989,41 @@ fn queue_verdict(closed: bool, waited_ms: f64, slo_ms: f64, class: JobClass) -> 
     } else {
         Queued::Retry
     }
+}
+
+/// Whether the decode quantum drops to one step. Prefill is pending, so the next chunk must not
+/// wait behind a K-step quantum. With nothing queued, a slot freed last tick counts too: its
+/// successor is usually a round trip away, and a K-step quantum lets the next completion land in
+/// the same wave (two prefills back to back; 15000/C4 TTFT 1099 -> 627 ms). With a queue, only a
+/// waiter that can be seated now is worth the single step: at saturation there is always a queue,
+/// and dropping to one step for it alone meant the K = 8 quantum never ran. A slot the quantum
+/// would finish needs nothing here: the engine already ends the quantum at the first row's
+/// `max_tokens`, so its seat frees at the end of the quantum.
+fn quantum_yields(prefilling: bool, freed_last_tick: bool, queued: bool, seatable: impl FnOnce() -> bool) -> bool {
+    prefilling || if queued { seatable() } else { freed_last_tick }
+}
+
+/// The queue head could take an idle slot inside the admission window now: the KV budget (live
+/// sequences; retained rows give way) and the downstream stage both have room for it.
+fn waiter_seatable(
+    waiting: &std::collections::VecDeque<(Job, Instant)>,
+    slots: &[Option<Slot>],
+    admission_limit: usize,
+    kv_budget: Option<crate::sched::admission::KvBudget>,
+    downstream_full: bool,
+) -> bool {
+    let Some((head, _)) = waiting.front() else { return false };
+    if downstream_full || !slots[..admission_limit.min(slots.len())].iter().any(Option::is_none) {
+        return false;
+    }
+    let pair = head.opts.speech.as_ref().is_some_and(|s| s.cfg.is_some());
+    let want = reserved_kv_rows(head.prompt_ids.len(), head.gen.max_tokens, 0) * (1 + pair as u64);
+    kv_budget.is_none_or(|b| {
+        let live = slots.iter().flatten().map(|s| {
+            reserved_kv_rows(s.prompt_ids.len(), s.gen.max_tokens, s.out_ids.len()) * (1 + s.cfg.is_some() as u64)
+        });
+        b.fits_requests(live.chain(std::iter::once(want)))
+    })
 }
 
 /// Seat order of a queued request: class first; within a class, every request that has waited
@@ -7364,6 +7398,33 @@ mod tests {
         )
         .is_none());
         (metrics, slots, budget, vec![rx])
+    }
+
+    /// A standing queue alone keeps the K-step quantum; prefill, a seatable waiter, or (with no
+    /// queue) a slot freed last tick drop it to one step.
+    #[test]
+    fn the_quantum_yields_only_to_work_that_can_start() {
+        let never = || -> bool { panic!("not consulted") };
+        assert!(quantum_yields(true, false, true, never));
+        assert!(!quantum_yields(false, true, true, || false), "saturated: a freed slot went to a waiter");
+        assert!(quantum_yields(false, false, true, || true));
+        assert!(quantum_yields(false, true, false, never));
+        assert!(!quantum_yields(false, false, false, never));
+
+        let (_metrics, mut slots, budget, mut keep) = starvation_fixture();
+        let mut waiting = std::collections::VecDeque::new();
+        assert!(!waiter_seatable(&waiting, &slots, 8, Some(budget), false));
+        let (entry, rx) = queued_job(700, Instant::now());
+        keep.push(rx);
+        waiting.push_back(entry);
+        assert!(!waiter_seatable(&waiting, &slots, 8, Some(budget), false), "701 rows behind 301 of 1000");
+        waiting[0].0.prompt_ids.truncate(100);
+        assert!(waiter_seatable(&waiting, &slots, 8, Some(budget), false));
+        assert!(waiter_seatable(&waiting, &slots, 8, None, false));
+        assert!(!waiter_seatable(&waiting, &slots, 8, Some(budget), true), "downstream full");
+        assert!(!waiter_seatable(&waiting, &slots, 1, Some(budget), false), "no idle slot in the window");
+        slots.truncate(1);
+        assert!(!waiter_seatable(&waiting, &slots, 8, Some(budget), false));
     }
 
     /// The backfill is a throughput win and stays on until the head has actually waited. Both
