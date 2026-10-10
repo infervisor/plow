@@ -372,7 +372,7 @@ fn unsupported_version(v: u32) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+mod contract_tests {
     use super::*;
 
     fn params(kv: &[(&str, u64)]) -> BTreeMap<String, u64> {
@@ -388,6 +388,7 @@ mod tests {
             end: Some(9),
             processor: "aspect_patches".into(),
             parameters: params(&[("patch_size", 16), ("pool", 3), ("max_soft_tokens", 280), ("resample", 3)]),
+            attention: MediaAttention::Causal,
         }
     }
 
@@ -400,6 +401,7 @@ mod tests {
             end: None,
             processor: "waveform_frames".into(),
             parameters: params(&[("sample_rate", 16_000), ("frame_samples", 640), ("max_soft_tokens", 750)]),
+            attention: MediaAttention::Causal,
         }
     }
 
