@@ -1,7 +1,9 @@
 # Deploy runtime contract
 
 One `plowrt` binary and one set of runtime libraries serve every bundle of a release. Switching
-models changes the assets and the profile, never the binary or a per-model runtime directory.
+models changes the `--assets` arguments, never the binary or a per-model runtime directory. The
+repo carries no per-model or per-customer launch profiles: a bundle's `serve.json` holds its serve
+defaults, and the command line names the bundles.
 
 ## One runtime per release
 
@@ -33,7 +35,6 @@ A bundle is a directory of compiled assets: packets (`*.pkt`), cubins, `objects/
 | minimum plowrt | `build.json` `runtime_requires.plowrt_contract` (integer); this plowrt implements contract 1. Absent = 1 | plowrt at startup, per bundle |
 | speech contract (ASR, VAD) | packet pipeline parameter `contract` (+ the driver name), per pipeline: `vad.frame.v1` 1, `rnnt.greedy.v1` 1, audio-LM `causal.v1` 1 ([ASR/VAD packet contract](runtime/asr-packet-contract.md)) | plowrt when it loads the packet (`--assets`, `--asr-packet`, `--asr-vad-packet`): newer or older than implemented = refusal |
 | serve settings | `serve.json` `serve_defaults` (registered `PLOW_*` knobs; the environment overrides) | plowrt at startup (unknown knob = refusal) |
-| kit pairing | `KIT.json` / `PAIRING.txt`: the plowrt sha256 and the sha256 of every packet it was qualified with | `plow-voice.sh preflight` |
 
 ## Assets + HF checkpoint
 
@@ -64,27 +65,32 @@ source=...` for each bundle.
 | ASR/VAD packet with another speech contract (e.g. a contract-0 `vad.silero.v1` or GGUF-vocabulary RNNT packet), or a required speech op/parameter missing | startup error; re-emit, or `asr_packet_upgrade` for receipt-less packets (VAD, RNNT) |
 | `--assets` value with an unknown key, or two different checkpoints for one bundle | startup error |
 | packet/object pairing hash mismatch | module refused at load |
-| a model listed by the profile is not in the kit, or its mapped checkpoint dir is missing | `plow-voice.sh` refuses to start |
-| plowrt, a runtime library or a packet differs from `plowrt.sha256` / `PAIRING.txt`; an extra `*.so*` in `plowrt/` | `plow-voice.sh preflight` fails (`install` runs it) |
 
-## Kit layout
+## Running
 
-```
-<kit>/
-  plowrt/                plowrt, libcublasLt.so.13, plow_verify, BUILD.json, plowrt.sha256
-  models/<name>/         compiled assets only
-  hf/<org>--<repo>@<rev>/  HF snapshots; hf/<name>@<content id>/ for converted checkpoints;
-                         deduplicated by content (bundles with identical checkpoints share one)
-  deploy/                plow-voice.sh, plow-voice.service, profiles/*.profile, checkpoints.map
-  KIT.json PAIRING.txt SHA256SUMS
+```bash
+<runtime>/plowrt serve --bind 0.0.0.0 --port 8000 \
+  --assets <bundle A>[,checkpoint=<hf dir>] --assets <bundle B> \
+  [--asr-packet NAME=<packet>.pkt] [--asr-vad-packet <silero_vad.pkt>]
 ```
 
-`deploy/checkpoints.map` (`<model> <dir>`) pairs every model with its `hf/` directory;
-`CHECKPOINTS=model=dir,...` in a profile or the config overrides it. A profile names a model set
-(`MODELS`), context bounds and serve flags; switching models is `PROFILE=<name>` in the config plus
-a restart of the one unit, `plow-voice`.
+No `PLOW_*` environment and no `LD_LIBRARY_PATH` are needed: serve settings come from each
+bundle's `serve.json`, cuBLASLt from beside the binary. `PLOW_API_KEYS=k1,k2` turns on bearer auth
+(every route except `/health`, `/healthz`). `/health` answers `ok` once every bundle is loaded;
+SIGTERM drains. Run it under any supervisor (`--exit-on-engine-death` for restart-on-fault); the
+API is [serving-openai-compat.md](serving-openai-compat.md).
 
-`make_kit.sh <runtime dir> <audio dir> <out> <name>=<bundle>...` builds a kit. A kit update ships
-only what changed: `plow-voice.sh adopt <old kit> <other bundle dir>...` hard-links every missing
-file whose sha256 another directory's `SHA256SUMS` lists, then `preflight --full` re-hashes all of
-it.
+Check a runtime + bundle set before handing it over (GPU through the queue):
+
+```bash
+scripts/bench/gpuq.py submit smoke 1 scripts/serve_test/smoke.sh <runtime>/plowrt <out> \
+    --assets <bundle A> --assets <bundle B> [--asr-vad-packet <vad.pkt>]
+```
+
+`smoke.sh` starts that command line in a clean environment (`env -i`), runs
+`scripts/serve_test/smoke_client.py` against every endpoint `/v1/models` advertises
+(`x_plow_endpoints`: chat/completions, audio/transcriptions incl. SSE, WebSocket and Realtime,
+audio/speech, plus `/v1/audio/vad`), records the cuBLASLt it mapped, and stops it. `ASR_MANIFEST`
+enables the ASR legs, `TTS_CHECK=1` Whisper-checks the speech output, `EVAL=all` adds
+`scripts/serve_test/eval.py` (ASR WER, TTS round-trip CER, LLM checks). The voice-agent load
+client is `scripts/voice/call_sim.py` (`scripts/voice/serve_voice_agent.sh calls`).

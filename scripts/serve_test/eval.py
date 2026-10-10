@@ -1,22 +1,25 @@
 #!/usr/bin/env python3
-"""Quality evaluation against a running plow-voice server.
+"""Quality evaluation against a running `plowrt serve` (models found by their advertised endpoints).
 
-  python eval/eval.py asr  [--manifest M] [--models qwen3-asr,...]      WER (default: bundled LibriSpeech set)
-  python eval/eval.py tts  [--models chatterbox-mtl,...] [--whisper-device cuda|cpu]
-                                                                        Whisper round-trip CER per language
-  python eval/eval.py llm  [--model gemma-4-e4b]                        E4B functional sanity checks
-  python eval/eval.py all  --out results/eval-<date>                    all three; writes eval.json + eval.md
+  eval.py asr  --manifest M [--models a,b]          WER per ASR model
+  eval.py tts  [--models a,b] [--whisper-device cuda|cpu]
+                                                    Whisper round-trip CER per TTS model and language
+  eval.py llm  [--models m]                         functional checks of one chat model
+  eval.py all  --manifest M --out DIR               all three; writes eval.json + eval.md
 
-ASR: every clip of the manifest ([{path, text, dur}], paths relative to it) is transcribed at
-concurrency 16; WER uses the same normalization as the release gates (lowercase, [a-z0-9'] words).
-A LibriSpeech split can be used with --librispeech <dir with *.trans.txt and .flac> (needs soundfile).
-TTS: the model's prompt set (perf/prompts.py: the gate sentences) is synthesized as WAV, then
-transcribed by Whisper large-v3-turbo (pip install -r requirements-whisper.txt); CER is computed
-after Unicode punctuation stripping, without spaces for zh/ja. Whisper downloads from the Hugging
-Face hub unless --whisper names a local copy.
+$PLOW_URL (default http://127.0.0.1:8000) names the server, $PLOW_API_KEY a bearer token.
+ASR: every clip of the manifest ([{path, text, dur}], paths relative to it; default $ASR_MANIFEST)
+is transcribed at concurrency 16; WER uses the release-gate normalization (lowercase,
+[a-z0-9'] words). --librispeech <dir with *.trans.txt and .flac> reads a LibriSpeech split instead
+(needs soundfile).
+TTS: the gate prompt set of the repo harnesses (scripts/tts/{mtl_prompts,veena_ref,chatterbox_ref}.py;
+--tts-prompts, default by model name) is synthesized as WAV, then transcribed by Whisper
+large-v3-turbo (needs torch, transformers, jiwer); CER after Unicode punctuation stripping, without
+spaces for zh/ja.
 LLM: deterministic answers, chat template, streaming, stop strings, logprobs, raw <bos> completions,
-the context limit, and error envelopes.
-Reference values from the release gates (BASELINE.md) are printed beside each result.
+the context limit (from the card's max_model_len), and error envelopes.
+Thresholds are the recipes' [gates] (campaign.py gate): this reports numbers, and exits 1 only on
+request errors or a failed LLM check.
 """
 import argparse
 import concurrent.futures as cf
@@ -33,16 +36,14 @@ import urllib.error
 import urllib.request
 import wave
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-KIT = os.path.dirname(HERE)
-sys.path.insert(0, os.path.join(KIT, "perf"))
-from prompts import CBX_TEXTS, MTL_PROMPTS, VEENA_PROMPTS  # noqa: E402
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "tts"))
+from chatterbox_ref import PROMPTS as CBX_TEXTS  # noqa: E402
+from mtl_prompts import PROMPTS as MTL_PROMPTS  # noqa: E402
+from veena_ref import PROMPTS as VEENA_PROMPTS  # noqa: E402
 
 URL = os.environ.get("PLOW_URL", "http://127.0.0.1:8000").rstrip("/")
 AUTH = {"Authorization": f"Bearer {os.environ['PLOW_API_KEY']}"} if os.environ.get("PLOW_API_KEY") else {}
-REF_WER = {"qwen3-asr": 0.03913, "qwen3-asr-0.6b": 0.04435, "nemotron-3.5-asr": 0.0513}
-REF_CER = {"chatterbox-mtl": "gate median 0.009 (n=32, 8 languages; worst fr 0.148)", "chatterbox": "gate median 0.000",
-           "veena": "gate median 0.000", "orpheus": "gate median 0.000 (7/80 > 0.3)"}
+
 
 
 def call(method, path, body=None, headers=None, timeout=600):
@@ -61,11 +62,11 @@ def call(method, path, body=None, headers=None, timeout=600):
 
 def models_by_kind():
     st, b = call("GET", "/v1/models")
-    cards = json.loads(b)["data"]
+    cards = [c for c in json.loads(b)["data"] if not c.get("parent")]
     asr = [c["id"] for c in cards if "audio/transcriptions" in c.get("x_plow_endpoints", [])]
     tts = [c["id"] for c in cards if "audio/speech" in c.get("x_plow_endpoints", [])]
-    llm = [c["id"] for c in cards if c["id"] not in asr and c["id"] not in tts]
-    return asr, tts, llm
+    llm = [c["id"] for c in cards if "chat/completions" in c.get("x_plow_endpoints", [])]
+    return asr, tts, llm, {c["id"]: c.get("max_model_len") for c in cards}
 
 
 # ------------------------------------------------------------------ ASR
@@ -108,7 +109,9 @@ def eval_asr(a, models):
         clips = librispeech_manifest(a.librispeech, a.limit)
         src = a.librispeech
     else:
-        man = a.manifest or os.path.join(KIT, "data", "librispeech-dummy", "manifest.json")
+        man = a.manifest
+        if not man:
+            sys.exit("asr: --manifest (or $ASR_MANIFEST) or --librispeech is required")
         base = os.path.dirname(os.path.abspath(man))
         clips = [dict(data=open(os.path.join(base, m["path"]), "rb").read(), text=m["text"], dur=m["dur"],
                       name=os.path.basename(m["path"])) for m in json.load(open(man))[: a.limit or None]]
@@ -128,11 +131,9 @@ def eval_asr(a, models):
         errs = [r[1] for r in res if r[1]]
         w = jiwer.wer([norm_en(c["text"]) for c in clips], [norm_en(h) for h in hyps])
         results[m] = dict(clips=len(clips), errors=len(errs), first_error=errs[0] if errs else None, wer=round(w, 5),
-                          reference_wer=REF_WER.get(m), audio_s=round(sum(c["dur"] for c in clips), 1),
+                          audio_s=round(sum(c["dur"] for c in clips), 1),
                           rtfx=round(sum(c["dur"] for c in clips) / wall, 1), source=src)
-        ref = REF_WER.get(m)
-        print(f"ASR {m}: WER {100 * w:.3f}% on {len(clips)} clips ({len(errs)} errors)"
-              + (f"; release gate {100 * ref:.3f}% on the bundled set" if ref else ""), flush=True)
+        print(f"ASR {m}: WER {100 * w:.3f}% on {len(clips)} clips ({len(errs)} errors)", flush=True)
     return results
 
 
@@ -146,13 +147,16 @@ def norm_lang(s, lang):
     return "".join(s.split()) if lang in ("zh", "ja") else " ".join(s.split())
 
 
-def prompt_set(model):
-    if model == "chatterbox-mtl":
-        return [("default", t, lang) for lang, t in MTL_PROMPTS]
-    if model in ("veena", "orpheus"):
-        voice = None if model == "veena" else "tara"
-        return [(voice or v, t, None) for v, t in VEENA_PROMPTS if model == "veena" or all(ord(ch) < 128 for ch in t)]
-    return [("default", t, None) for t in CBX_TEXTS]
+def prompt_set(model, kind="auto", voice=None):
+    if kind == "auto":
+        kind = "mtl" if "mtl" in model else "veena" if "veena" in model else "orpheus" if "orpheus" in model else "cbx"
+    if kind == "mtl":
+        return [(voice or "default", t, lang) for lang, t in MTL_PROMPTS]
+    if kind == "veena":
+        return [(voice or v, t, None) for v, t in VEENA_PROMPTS]
+    if kind == "orpheus":
+        return [(voice or "tara", t, None) for v, t in VEENA_PROMPTS if all(ord(ch) < 128 for ch in t)]
+    return [(voice or "default", t, None) for t in CBX_TEXTS]
 
 
 def eval_tts(a, models, outdir):
@@ -168,7 +172,7 @@ def eval_tts(a, models, outdir):
         rows = []
         wavdir = os.path.join(outdir, f"tts-{m}")
         os.makedirs(wavdir, exist_ok=True)
-        for i, (voice, text, lang) in enumerate(prompt_set(m)):
+        for i, (voice, text, lang) in enumerate(prompt_set(m, a.tts_prompts, a.voice)):
             body = {"model": m, "input": text, "voice": voice, "response_format": "wav", "seed": 1 + i}
             if lang:
                 body["language"] = lang
@@ -194,16 +198,16 @@ def eval_tts(a, models, outdir):
         res = dict(n=len(rows), errors=len(rows) - len(ok), cer_median=round(statistics.median(r["cer"] for r in ok), 4) if ok else None,
                    cer_mean=round(sum(r["cer"] for r in ok) / len(ok), 4) if ok else None,
                    cer_by_language={k: round(statistics.median(v), 4) for k, v in sorted(by_lang.items())},
-                   reference=REF_CER.get(m), wavs=wavdir, rows=rows)
+                   wavs=wavdir, rows=rows)
         json.dump(rows, open(os.path.join(wavdir, "cer.json"), "w"), ensure_ascii=False, indent=1)
         results[m] = res
         print(f"TTS {m}: Whisper CER median {res['cer_median']} mean {res['cer_mean']} over {len(ok)} prompts "
-              f"({res['errors']} errors); by language {res['cer_by_language']}; release {REF_CER.get(m)}", flush=True)
+              f"({res['errors']} errors); by language {res['cer_by_language']}", flush=True)
     return results
 
 
 # ------------------------------------------------------------------ LLM
-def eval_llm(a, model):
+def eval_llm(a, model, max_len):
     checks = []
 
     def check(name, ok, detail=""):
@@ -257,7 +261,7 @@ def eval_llm(a, model):
                     first = first or time.perf_counter() - t0
                     parts.append(d)
     check("streamed chat", len(parts) > 1 and first is not None, f"TTFT {1000 * (first or 0):.0f} ms: {''.join(parts)}")
-    st, b = call("POST", "/v1/completions", {"model": model, "prompt": "<bos>" + "hello " * 9000, "max_tokens": 4})
+    st, b = call("POST", "/v1/completions", {"model": model, "prompt": "<bos>" + "hello " * ((max_len or 8192) + 512), "max_tokens": 4})
     err = json.loads(b).get("error", {}) if b[:1] == b"{" else {}
     check("context limit -> 400 context_length_exceeded", st == 400 and "context" in json.dumps(err), f"{st} {err}")
     st, b = call("POST", "/v1/chat/completions", {"model": "no-such-model", "messages": [{"role": "user", "content": "hi"}]})
@@ -269,37 +273,39 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("what", choices=["asr", "tts", "llm", "all"])
     ap.add_argument("--models", default=None, help="comma-separated (default: every served model of that kind)")
-    ap.add_argument("--manifest", default=None)
+    ap.add_argument("--manifest", default=os.environ.get("ASR_MANIFEST"))
     ap.add_argument("--librispeech", default=None, help="LibriSpeech split dir (e.g. test-clean) instead of a manifest")
     ap.add_argument("--limit", type=int, default=0, help="first N clips only")
     ap.add_argument("--language-hint", action="store_true", help="send language=en with each clip")
+    ap.add_argument("--tts-prompts", default="auto", choices=["auto", "mtl", "veena", "orpheus", "cbx"])
+    ap.add_argument("--voice", default=None, help="TTS voice for every prompt (default: the prompt set's)")
     ap.add_argument("--whisper", default="openai/whisper-large-v3-turbo")
     ap.add_argument("--whisper-device", default=None)
     ap.add_argument("--out", default="results/eval")
     a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
-    asr, tts, llm = models_by_kind()
+    asr, tts, llm, max_len = models_by_kind()
     pick = lambda found: [m for m in a.models.split(",") if m in found] if a.models else found  # noqa: E731
     report = {"url": URL, "date": time.strftime("%Y-%m-%dT%H:%M:%S%z")}
     if a.what in ("asr", "all"):
         report["asr"] = eval_asr(a, pick(asr))
     if a.what in ("llm", "all") and llm:
-        report["llm"] = eval_llm(a, pick(llm)[0] if pick(llm) else llm[0])
+        m = pick(llm)[0] if pick(llm) else llm[0]
+        report["llm"] = eval_llm(a, m, max_len.get(m))
     if a.what in ("tts", "all"):
         report["tts"] = eval_tts(a, pick(tts), a.out)
     json.dump(report, open(os.path.join(a.out, "eval.json"), "w"), ensure_ascii=False, indent=1)
-    md = [f"# plow-voice quality evaluation\n\nServer {URL}, {report['date']}.\n"]
+    md = [f"# plowrt quality evaluation\n\nServer {URL}, {report['date']}.\n"]
     if "asr" in report:
-        md += ["| ASR model | clips | WER | release gate WER | errors |", "|---|---|---|---|---|"]
+        md += ["| ASR model | clips | WER | errors |", "|---|---|---|---|"]
         for m, r in report["asr"].items():
-            ref = "-" if r["reference_wer"] is None else "%.3f%%" % (100 * r["reference_wer"])
-            md.append(f"| {m} | {r['clips']} | {100 * r['wer']:.3f}% | {ref} | {r['errors']} |")
+            md.append(f"| {m} | {r['clips']} | {100 * r['wer']:.3f}% | {r['errors']} |")
         md.append("")
     if "tts" in report:
-        md += ["| TTS model | prompts | Whisper CER median | mean | by language | release | errors |", "|---|---|---|---|---|---|---|"]
+        md += ["| TTS model | prompts | Whisper CER median | mean | by language | errors |", "|---|---|---|---|---|---|"]
         for m, r in report["tts"].items():
             langs = ", ".join("%s %s" % kv for kv in r["cer_by_language"].items())
-            md.append(f"| {m} | {r['n']} | {r['cer_median']} | {r['cer_mean']} | {langs} | {r['reference']} | {r['errors']} |")
+            md.append(f"| {m} | {r['n']} | {r['cer_median']} | {r['cer_mean']} | {langs} | {r['errors']} |")
         md.append("")
     if "llm" in report:
         r = report["llm"]
