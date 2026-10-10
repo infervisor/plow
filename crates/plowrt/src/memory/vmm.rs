@@ -596,8 +596,10 @@ impl VmmRings {
                     self.unpark(parked);
                 }
             }
-            while self.spare_bytes() > self.spare_cap {
-                let (_, handle) = self.spare.pop().expect("spare over cap");
+            let mut spare = self.spare_bytes();
+            while spare > self.spare_cap {
+                let (bytes, handle) = self.spare.pop().expect("spare over cap");
+                spare -= bytes;
                 self.ops.release(handle);
             }
         }
@@ -1513,6 +1515,14 @@ impl VmmKv {
                 break;
             }
             freed = true;
+        }
+        // Under deferred reclaim the evictions are only queued; the caller retries its allocation
+        // as soon as this returns, so wait for the pool thread to release them (lock dropped
+        // first: the thread's jobs take it).
+        let deferred = inner.release_queued != queued;
+        drop(inner);
+        if deferred {
+            self.sync_reclaim();
         }
         freed
     }
@@ -5119,7 +5129,7 @@ mod tests {
     /// included). One rank holds half the prompt, so every rank is probed. Run with
     /// `cargo test --release -p plowrt --features cuda --lib dp_route_microbench -- --ignored --nocapture`.
     #[test]
-    #[ignore]
+    #[ignore = "microbench; run with --ignored"]
     fn dp_route_microbench() {
         use crate::serve::dp::{DpSet, RouteCfg};
         fn pct(mut v: Vec<u64>) -> (u64, u64) {
@@ -5276,7 +5286,7 @@ mod tests {
     /// unchanged and with it moved (handler keys present).
     /// `cargo test --release -p plowrt --features cuda --lib admission_pass_microbench -- --ignored --nocapture`
     #[test]
-    #[ignore]
+    #[ignore = "microbench; run with --ignored"]
     fn admission_pass_microbench() {
         use crate::serve::mux::{refresh_cached_rows, Job, JobOpts};
         let ops = Arc::new(MockVmm::default());

@@ -863,7 +863,7 @@ mod tests {
 
     /// Host cost of the ASR request frontend (release, `--ignored --nocapture`).
     #[test]
-    #[ignore]
+    #[ignore = "microbench; run with --ignored"]
     fn frontend_microbench() {
         let seconds = 5;
         for rate in [24_000u32, 44_100, 48_000] {

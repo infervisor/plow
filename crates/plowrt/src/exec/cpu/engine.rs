@@ -605,6 +605,22 @@ fn validate_cpu_blob(blob: &DevBlob, language_model: bool) -> Result<()> {
                  emit CPU bundles with PLOW_NV_FA_FOLD_WIDE=0"
             )));
         }
+        // The CPU kernels have no ops 206-210 and EMBED ignores the pad immediate, so a
+        // multimodal packet (soft-token rows, bit-31 ids) is refused before it embeds garbage.
+        let multimodal = [
+            DevOp::RmsNormF32,
+            DevOp::RopeAxialF32,
+            DevOp::ChunkAttentionF32,
+            DevOp::MmRowsBf16,
+            DevOp::MmSpanExtent,
+        ];
+        if multimodal.into_iter().any(has) || blob.tensors.iter().any(|t| t.name == plow_asset::multimodal::SLAB_TENSOR) {
+            return Err(RuntimeError::Device(format!(
+                "program {pi} is multimodal (ops 206-210 / `{}`), which the CPU engine does not implement; \
+                 emit CPU bundles without PLOW_EMIT_MULTIMODAL",
+                plow_asset::multimodal::SLAB_TENSOR
+            )));
+        }
         for (ii, inst) in p.insts.iter().enumerate() {
             if inst.op as usize >= ffi::DOP_TABLE {
                 return Err(RuntimeError::Device(format!(

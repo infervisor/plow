@@ -703,8 +703,6 @@ impl ModelMux {
     ) -> std::result::Result<(), SubmitError> {
         Metrics::inc(&self.metrics.requests);
         self.metrics.serving.max_tokens.tokens(job.gen.max_tokens);
-        // Released before the send: a dispatcher that dequeues this job must not see it as a peer.
-        drop(ingress);
         if !self.reserve_queue() {
             Metrics::inc(&self.metrics.rejected);
             return Err(if self.tx.is_closed() { SubmitError::Closed(job) } else { SubmitError::Full(job) });
@@ -712,6 +710,9 @@ impl ModelMux {
         let urgent = job.opts.class != JobClass::Bulk;
         match self.tx.try_send(MuxMsg::Job(job, arrived)) {
             Ok(()) => {
+                // Released only once the job is on the channel: a graceful drain held by this
+                // request must find the job when the count reaches zero, not an empty queue.
+                drop(ingress);
                 if urgent {
                     self.arrival_notify.notify_one();
                 }
@@ -3256,7 +3257,7 @@ fn run_one_tick(
                         // The decode launch embeds the last prompt row at its position base.
                         if let Some(base) = s.speech.as_ref().and_then(|sp| sp.pos_base) {
                             let written = [i, i + 1][..1 + pair as usize].iter().try_for_each(|&row| {
-                                e.write_tensor("in.pos_base", (row * 4) as u64, &base.to_le_bytes())
+                                e.write_tensor_ordered("in.pos_base", (row * 4) as u64, &base.to_le_bytes())
                             });
                             if let Err(err) = written {
                                 note_fault(&mut tick_fault, &err);
@@ -5531,7 +5532,7 @@ fn gpu_prefill_batched_pass(
                     if fresh && request.speech.as_ref().is_some_and(|sp| sp.pos_base.is_some()) {
                         // A decode launch covering this row before its prompt is in must not find
                         // a stale base above the reset position (`EmbedPosBf16` traps on pos < base).
-                        e.write_tensor("in.pos_base", (row * 4) as u64, &0u32.to_le_bytes())?;
+                        e.write_tensor_ordered("in.pos_base", (row * 4) as u64, &0u32.to_le_bytes())?;
                     }
                     match request.cfg.as_mut().filter(|_| row != i) {
                         Some(run) => run.partner_pf = frontier,
@@ -5931,7 +5932,7 @@ fn gpu_prefill_advance(
             }
             e.logits_row(0, &mut run.uncond)?;
             if let Some(base) = sp.pos_base {
-                e.write_tensor("in.pos_base", (partner * 4) as u64, &base.to_le_bytes())?;
+                e.write_tensor_ordered("in.pos_base", (partner * 4) as u64, &base.to_le_bytes())?;
             }
         }
         gpu_speech_prefill_inputs(e, slot_idx, slot.pf_pos, &sp.overlay, &sp.overlay_pos, sp.pos_base)?;
@@ -5999,7 +6000,7 @@ fn gpu_prefill_advance(
         "gpu: prompt consumed"
     );
     if let Some(base) = slot.speech.as_ref().and_then(|s| s.pos_base) {
-        e.write_tensor("in.pos_base", (slot_idx * 4) as u64, &base.to_le_bytes())?;
+        e.write_tensor_ordered("in.pos_base", (slot_idx * 4) as u64, &base.to_le_bytes())?;
     }
     if let Some(run) = slot.cfg.as_mut() {
         e.logits_row(0, &mut run.cond)?;
@@ -6053,7 +6054,7 @@ fn gpu_speech_prefill_inputs(
     // A decode launch covering this row before the prompt is in must not find a stale base above
     // its reset position (`EmbedPosBf16` traps on pos < base); the real base lands at Done.
     if c0 == 0 && pos_base.is_some() {
-        e.write_tensor("in.pos_base", (slot_idx * 4) as u64, &0u32.to_le_bytes())?;
+        e.write_tensor_ordered("in.pos_base", (slot_idx * 4) as u64, &0u32.to_le_bytes())?;
     }
     if overlay_pos.is_empty() {
         return Ok(());
@@ -6207,7 +6208,7 @@ fn gpu_speech_prompt_done(
     let Some(owner) = owner else { return Ok(None) };
     let Some(slot) = slots[owner].as_mut() else { return Ok(None) };
     if let Some(base) = slot.speech.as_ref().and_then(|sp| sp.pos_base) {
-        e.write_tensor("in.pos_base", (i * 4) as u64, &base.to_le_bytes())?;
+        e.write_tensor_ordered("in.pos_base", (i * 4) as u64, &base.to_le_bytes())?;
     }
     let Some(run) = slot.cfg.as_mut() else { return Ok(Some((owner, false))) };
     e.logits_row(row, if partner { &mut run.uncond } else { &mut run.cond })?;
@@ -7503,6 +7504,25 @@ mod tests {
         drop(held);
         tokio::time::timeout(std::time::Duration::from_secs(5), draining).await.expect("drain never woke").unwrap();
         assert!(!mux.preempted());
+    }
+
+    /// A request holding ingress through a graceful drain submits into a live dispatcher: the
+    /// count reaches zero only once its job is on the channel, so the drain serves it.
+    #[cfg(feature = "cuda")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn graceful_drain_serves_the_job_that_held_ingress() {
+        let mux = idle_test_mux("drain-ingress-submits");
+        let held = mux.ingress();
+        let draining = {
+            let mux = mux.clone();
+            tokio::spawn(async move { mux.drain().await })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(!draining.is_finished());
+        let ((job, arrived), _rx) = queued_job(1, Instant::now());
+        assert!(mux.submit_arrived(job, arrived, Some(held)).is_ok(), "the drain closed on a request past model lookup");
+        assert_eq!(mux.ingress.pending(), 0);
+        tokio::time::timeout(std::time::Duration::from_secs(5), draining).await.expect("drain never finished").unwrap();
     }
 
     #[test]

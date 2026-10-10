@@ -201,7 +201,7 @@ fn request(prompt: &str, max_tokens: usize, stream: bool) -> Vec<u8> {
 }
 
 #[test]
-#[ignore]
+#[ignore = "microbench; run with --ignored"]
 fn host_serve_bench() {
     let dir = std::env::temp_dir().join(format!("plowrt_hostserve_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);

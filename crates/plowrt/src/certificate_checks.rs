@@ -31,10 +31,13 @@ fn read_optional(path: &Path) -> Result<Option<Vec<u8>>> {
     }
 }
 
-/// `model.pkt`, or any packet whose `lean-checks.json` binds its bytes, carries compiler
-/// receipts; every other packet (`encoder.pkt`, `codec.pkt`, ...) is a sidecar with its own file.
-fn is_compiler_packet(blob_path: &Path, raw: &[u8], receipts: Option<&[u8]>) -> bool {
+/// `model.pkt`, a language-model packet under any name (`DevBlob::find_in_dir` loads one; it is
+/// the only packet with `in.ids`), or any packet whose `lean-checks.json` binds its bytes,
+/// carries compiler receipts; every other packet (`encoder.pkt`, `codec.pkt`, ...) is a sidecar
+/// with its own file.
+fn is_compiler_packet(blob_path: &Path, raw: &[u8], blob: &DevBlob, receipts: Option<&[u8]>) -> bool {
     blob_path.file_stem().is_some_and(|stem| stem == "model")
+        || blob.tensors.iter().any(|t| t.name == "in.ids")
         || receipts
             .and_then(|bytes| serde_json::from_slice::<PacketCheckReceipts>(bytes).ok())
             .is_some_and(|r| r.packet_sha256 == image_sha256(raw))
@@ -52,7 +55,7 @@ fn check_packet_with(
 ) -> Result<()> {
     let path = blob_path.with_file_name(PACKET_CHECKS_FILE);
     let bytes = read_optional(&path)?;
-    if !is_compiler_packet(blob_path, raw, bytes.as_deref()) {
+    if !is_compiler_packet(blob_path, raw, blob, bytes.as_deref()) {
         return check_sidecar_with(blob_path, raw, blob, policy);
     }
     let rejected = |reason: String| RuntimeError::Rejected(format!("{}: {reason}", path.display()));
@@ -485,7 +488,7 @@ impl MediaInfo {
 fn qualify_loaded(blob_path: &Path, raw: &[u8], blob: &DevBlob, replay_checks: bool) -> Result<Qualification> {
     let path = blob_path.with_file_name(PACKET_CHECKS_FILE);
     let bytes = read_optional(&path)?;
-    if is_compiler_packet(blob_path, raw, bytes.as_deref()) {
+    if is_compiler_packet(blob_path, raw, blob, bytes.as_deref()) {
         let receipts = bytes
             .as_deref()
             .map(serde_json::from_slice::<PacketCheckReceipts>)
@@ -884,6 +887,25 @@ mod tests {
         assert!(error.to_string().contains("no sidecar check receipts"), "{error}");
         let blob = DevBlob::parse(&model).unwrap();
         check_packet_with(&dir.join("model.pkt"), &model, &blob, VerificationPolicy::Off).unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A language-model packet under another name (`find_in_dir` loads it) is still the compiler
+    /// packet: receipts that do not bind its bytes reject it instead of demoting it to a sidecar.
+    #[test]
+    fn a_renamed_language_model_packet_keeps_its_receipt_binding() {
+        let mut model = residual_model(false);
+        model.tensors.push(packet::devbuild::TensorDecl { name: "in.ids".into(), bytes: 16, init: None });
+        let raw = model.to_blob();
+        let blob = DevBlob::parse(&raw).unwrap();
+        let dir = scratch("renamed-main");
+        let receipts = PacketCheckReceipts { schema: 1, packet_sha256: "b".repeat(64),
+            compiler_sha256: "a".repeat(64), checks: vec![] };
+        std::fs::write(dir.join(PACKET_CHECKS_FILE), serde_json::to_vec(&receipts).unwrap()).unwrap();
+        let path = dir.join("gemma.pkt");
+        let error = check_packet_with(&path, &raw, &blob, VerificationPolicy::Off).unwrap_err();
+        assert!(error.to_string().contains("does not match loaded packet"), "{error}");
+        assert!(check_packet_with(&path, &raw, &blob, VerificationPolicy::Strict).is_err());
         std::fs::remove_dir_all(dir).unwrap();
     }
 

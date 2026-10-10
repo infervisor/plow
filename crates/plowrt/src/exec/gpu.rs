@@ -7088,6 +7088,11 @@ impl GpuEngine {
             )));
         }
         self.reset_packed_admission(b);
+        // A retirement deferred behind a step that then failed (queue cleared) must not fire
+        // against the request seated here now.
+        if let Some(p) = self.pipe.as_mut() {
+            p.queue.forget(b);
+        }
         self.slot_generations[b] = self.slot_generations[b].wrapping_add(1);
         if let Some(state) = &self.recurrent {
             for &(index, stride) in &state.tensors {
@@ -7193,7 +7198,9 @@ impl GpuEngine {
         self.pos[b] = 0;
         self.vmm_attached[b] = 0;
         // A retired row decodes as an idle lane from position 0: a stale learned-position base
-        // above it traps `EmbedPosBf16` (`in.pos_base`, speech packets).
+        // above it traps `EmbedPosBf16` (`in.pos_base`, speech packets). The mux writes bases in
+        // the same stream order (`write_tensor_ordered`), so this reset never lands after a
+        // later base.
         if let Some(base) = self.handle_of("in.pos_base").map(|i| self.devp[i].base + b as u64 * 4) {
             if let Err(e) = self.be.memset_d8_async(base, 0, 4, &self.stream) {
                 tracing::warn!(slot = b, error = %e, "retire: pos_base reset failed");
@@ -10216,7 +10223,7 @@ impl GpuEngine {
         if !self.mm_spans {
             return Ok((bi, real));
         }
-        let safe = plow_asset::multimodal::span_chunk_rows(prompt, c0, real, cap, 0);
+        let safe = plow_asset::multimodal::span_chunk_rows(prompt, c0, real, cap, self.pf_stage_rows());
         if safe == 0 {
             return Err(RuntimeError::Rejected("a media span does not fit one prefill chunk".into()));
         }
@@ -10467,6 +10474,14 @@ impl GpuEngine {
                     return Err(RuntimeError::Rejected(
                         "generated attention object does not mask media spans".into(),
                     ));
+                }
+                if let Some(span) = span {
+                    let rows = u64::from(inst.i[0]) * 4;
+                    if !self.devp.get(span as usize).is_some_and(|m| m.len >= rows) {
+                        return Err(RuntimeError::Rejected(
+                            "direct attention media span extent".into(),
+                        ));
+                    }
                 }
                 return Ok(Some((
                     function,

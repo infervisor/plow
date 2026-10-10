@@ -97,10 +97,20 @@ impl Metrics {
             other.cache_first_admissions.load(Ordering::Relaxed),
             Ordering::Relaxed,
         );
+        self.kv_budget_denials.fetch_add(
+            other.kv_budget_denials.load(Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
     }
 
     pub fn accumulate(&self, other: &Self) {
         self.accumulate_counters(other);
+        self.slots_active
+            .fetch_add(other.slots_active.load(Ordering::Relaxed), Ordering::Relaxed);
+        self.slots_capacity
+            .fetch_add(other.slots_capacity.load(Ordering::Relaxed), Ordering::Relaxed);
+        self.kv_used_milli
+            .fetch_max(other.kv_used_milli.load(Ordering::Relaxed), Ordering::Relaxed);
         self.queued_requests.fetch_add(
             other.queued_requests.load(Ordering::Relaxed),
             Ordering::Relaxed,
@@ -230,7 +240,19 @@ impl Metrics {
              plowrt_prefill_launch_rows {}\n\
              # HELP plowrt_cache_first_admissions_total Admissions seated ahead of the queue head for their cached prefix.\n\
              # TYPE plowrt_cache_first_admissions_total counter\n\
-             plowrt_cache_first_admissions_total {}\n",
+             plowrt_cache_first_admissions_total {}\n\
+             # HELP plowrt_slots_active Occupied engine slots at the dispatcher's last loop top.\n\
+             # TYPE plowrt_slots_active gauge\n\
+             plowrt_slots_active {}\n\
+             # HELP plowrt_slots_capacity Engine slots the dispatcher can seat.\n\
+             # TYPE plowrt_slots_capacity gauge\n\
+             plowrt_slots_capacity {}\n\
+             # HELP plowrt_kv_budget_denials_total Admissions held back by the KV budget (memory, not slots).\n\
+             # TYPE plowrt_kv_budget_denials_total counter\n\
+             plowrt_kv_budget_denials_total {}\n\
+             # HELP plowrt_kv_used Admitted sequences' reserved KV rows over the KV budget; zero without a budget.\n\
+             # TYPE plowrt_kv_used gauge\n\
+             plowrt_kv_used {:.3}\n",
             g(&self.requests),
             g(&self.tokens),
             g(&self.rejected),
@@ -252,6 +274,10 @@ impl Metrics {
             g(&self.serve_mode_switches),
             g(&self.prefill_launch_rows),
             g(&self.cache_first_admissions),
+            g(&self.slots_active),
+            g(&self.slots_capacity),
+            g(&self.kv_budget_denials),
+            g(&self.kv_used_milli) as f64 / 1000.0,
         )
     }
 }

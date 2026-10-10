@@ -185,7 +185,7 @@ fn run(case: &Case, toks: &[String], strip: &Arc<SpecialText>, head: &FrameHead)
 }
 
 #[test]
-#[ignore]
+#[ignore = "microbench; run with --ignored"]
 fn tool_stream_per_token_cost() {
     let strip = specials();
     let head = FrameHead::new("chatcmpl-1", "chat.completion.chunk", 1, "m");
