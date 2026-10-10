@@ -895,9 +895,8 @@ async fn async_main(asset_defaults: Vec<(String, String, String)>) -> Result<(),
                 MuxConfig {
                     max_hold_ms,
                     slo_ms,
-                    // A packet's serve default lands in the environment before the CLI is parsed.
                     max_queued_requests: match max_queued_requests {
-                        0 => std::env::var("PLOW_MAX_QUEUED_REQUESTS").ok().and_then(|v| v.parse().ok()).unwrap_or(0),
+                        0 => RuntimeConfig::get().serve_max_queued_requests.unwrap_or(0),
                         n => n,
                     },
                     ..MuxConfig::default()

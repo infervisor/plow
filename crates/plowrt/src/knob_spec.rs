@@ -509,6 +509,7 @@ pub const RUNTIME: &[KnobSpec] = &[
     KnobSpec::new("rt.route_prefix_slack", Some("PLOW_ROUTE_PREFIX_SLACK"), Layer::Runtime, Domain::Str, Default::Static(Val::Str("0.5")), OPT_IN),
     KnobSpec::new("rt.co_sched", Some("PLOW_CO_SCHED"), Layer::Runtime, Domain::Str, UNSET, DIAG),
     KnobSpec::new("rt.cosched_max_wait_ms", Some("PLOW_COSCHED_MAX_WAIT_MS"), Layer::Runtime, U32, UNSET, DIAG),
+    KnobSpec::new("rt.serve_max_queued_requests", Some("PLOW_MAX_QUEUED_REQUESTS"), Layer::Runtime, USIZE, UNSET, OPT_IN),
     KnobSpec::new("rt.models_root", Some("PLOW_MODELS_ROOT"), Layer::Runtime, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("rt.preload", Some("PLOW_PRELOAD"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
     KnobSpec::new("rt.kv_pool_mib", Some("PLOW_KV_POOL_MIB"), Layer::Runtime, USIZE, Default::Static(Val::Nat(512)), OPT_IN),
@@ -749,7 +750,6 @@ pub const RAW_ENV: &[KnobSpec] = &[
     KnobSpec::new("env.PLOW_VMM_PUBLISH_SHARED", Some("PLOW_VMM_PUBLISH_SHARED"), Layer::RawEnv, Domain::Str, UNSET, DIAG),
     KnobSpec::new("env.PLOW_VMM_LIVE", Some("PLOW_VMM_LIVE"), Layer::RawEnv, Domain::Str, UNSET, DIAG),
     KnobSpec::new("env.PLOW_VMM_LIVE_RINGS", Some("PLOW_VMM_LIVE_RINGS"), Layer::RawEnv, Domain::Str, UNSET, DIAG),
-    KnobSpec::new("env.PLOW_MAX_QUEUED_REQUESTS", Some("PLOW_MAX_QUEUED_REQUESTS"), Layer::RawEnv, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("env.PLOW_VMM_PREFIX", Some("PLOW_VMM_PREFIX"), Layer::RawEnv, Domain::Str, UNSET, DIAG),
 ];
 

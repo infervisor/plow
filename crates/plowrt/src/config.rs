@@ -537,6 +537,10 @@ pub struct RuntimeConfig {
     #[arg(long = "cosched-max-wait-ms", env = "PLOW_COSCHED_MAX_WAIT_MS", hide = true, global = true)]
     pub cosched_max_wait_ms: Option<u32>,
 
+    /// `serve --max-queued-requests` when that flag is 0 (a packet serve default lands here).
+    #[arg(long = "serve-max-queued-requests", env = "PLOW_MAX_QUEUED_REQUESTS", global = true)]
+    pub serve_max_queued_requests: Option<usize>,
+
     /// Directories under which `POST /v1/models/load` may take an assets dir.
     /// Repeatable; `PLOW_MODELS_ROOT` takes a `:`-separated list.
     ///
