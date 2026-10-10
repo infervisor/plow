@@ -17,6 +17,7 @@ echo "verifier: $(sha256sum "$PLOW_VERIFY_BIN" | cut -d' ' -f1)"
 # One suite per line: <cargo args> -- <exact test names>. `--include-ignored` also runs the
 # suite's ordinary tests; `--exact` keeps the selection explicit.
 suites=(
+  "-p lean_verify --test approved_verifier -- built_verifier_is_approved_for_current_sources"
   "-p lean_verify --test end_to_end -- checkpoint_d_accepts_safe_schedule batch_preserves_individual_verdicts_and_envelopes checkpoint_d_rejects_missing_counter checkpoint_d_accepts_disjoint_bytes checkpoint_d_rejects_unordered_dependency_without_address_entries checkpoint_d_rejects_malformed_access_sets checkpoint_d_checks_removed_edge_witnesses checkpoint_f_reuses_d_verifier checkpoint_d_checks_address_paths_without_graph_saturation all_checkpoints_are_wired"
   "-p lean_verify --test measured_policy -- measured_policy_proves_only_supplied_domain_coverage_and_minimum"
   "-p lean_verify --test logical_effects -- packet_derived_effects_reject_missing_raw_war_waw speech_effects_order_noise_war_bands_and_splitk_scratch"
@@ -42,7 +43,7 @@ suites=(
   "-p plowc --test lean_verify_lds_fit -- accepts_fitting_staged_ops rejects_the_task9_shape"
   "-p plowc --test lean_verify_negative -- verifier_rejects_unordered_byte_overlap stripping_waits_alone_is_not_a_corruption"
   "-p plowc --test lean_verify_wire -- accepts_valid_round_trip accepts_empty_program rejects_encode_frames_diverges_from_raw rejects_length_mismatch rejects_truncated_stream json_u8_boundary_round_trips_through_lean abstract_framing_shape_matches_packet_body_ordering"
-  "-p plowrt --lib -- certificate_checks::tests::selected_gemm_receipt_reconstructs_wire_after_packet_hash_changes certificate_checks::tests::logical_effect_receipt_is_reconstructed_from_loaded_packet certificate_checks::tests::packet_receipts_replay_at_load_and_reject_tampering certificate_checks::tests::layout_receipt_is_reconstructed_from_loaded_packet"
+  "-p plowrt --lib -- certificate_checks::tests::selected_gemm_receipt_reconstructs_wire_after_packet_hash_changes certificate_checks::tests::logical_effect_receipt_is_reconstructed_from_loaded_packet certificate_checks::tests::packet_receipts_replay_at_load_and_reject_tampering certificate_checks::tests::layout_receipt_is_reconstructed_from_loaded_packet certificate_checks::tests::strict_policy_replays_complete_receipts_and_rejects_substituted_evidence"
 )
 
 fail=0

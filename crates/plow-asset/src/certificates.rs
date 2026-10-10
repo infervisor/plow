@@ -203,7 +203,7 @@ impl ExecutionIdentity {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SemanticScope {
     RewriteNameCatalog,
@@ -215,6 +215,9 @@ pub enum SemanticScope {
     SelectedGemmPolicy,
     LayoutMapping,
     LogicalTensorEffects,
+    /// `media_geometry.v1`: speech/multimodal contract geometry of a bundle, checked at
+    /// qualification (`plowrt qualify`), not carried as a compiler receipt.
+    MediaGeometry,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -466,6 +469,349 @@ impl PacketCheckReceipts {
         }
         Ok(())
     }
+}
+
+/// How load and artifact qualification treat compiler receipts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VerificationPolicy {
+    /// Pre-policy behavior: absent receipts or an unavailable/changed verifier load unverified.
+    Off,
+    /// Derive the full obligation set and report every gap; reject only what `Off` rejects.
+    Report,
+    /// Any gap rejects: missing/unrunnable/unapproved verifier, absent, unused, duplicated or
+    /// wrong-program receipts, and uncovered required obligations.
+    Strict,
+}
+
+impl VerificationPolicy {
+    pub const VALUES: &'static [&'static str] = &["off", "report", "strict"];
+
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "off" => Ok(Self::Off),
+            "report" => Ok(Self::Report),
+            "strict" => Ok(Self::Strict),
+            other => Err(format!("unknown verification policy {other:?} (off, report, strict)")),
+        }
+    }
+}
+
+/// One verifier executable approved for receipts: the sha256 of the immutable `plow_verify` image
+/// built from Lean sources whose digest is `lean_sources_sha256`. `commit` is traceability only.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ApprovedVerifier {
+    pub sha256: String,
+    pub lean_sources_sha256: String,
+    pub toolchain: String,
+    pub commit: String,
+    pub note: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ApprovedVerifiers {
+    pub schema: u32,
+    pub verifiers: Vec<ApprovedVerifier>,
+}
+
+pub const APPROVED_VERIFIERS_JSON: &str =
+    include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../lean-plow/approved-verifiers.json"));
+
+pub fn approved_verifiers() -> Result<ApprovedVerifiers, String> {
+    let list: ApprovedVerifiers =
+        serde_json::from_str(APPROVED_VERIFIERS_JSON).map_err(|error| error.to_string())?;
+    if list.schema != 1
+        || list.verifiers.is_empty()
+        || list.verifiers.iter().any(|v| {
+            !is_sha256(&v.sha256) || !is_sha256(&v.lean_sources_sha256) || v.toolchain.is_empty()
+        })
+    {
+        return Err("invalid approved verifier list".into());
+    }
+    Ok(list)
+}
+
+pub fn is_approved_verifier(sha256: &str) -> bool {
+    approved_verifiers().is_ok_and(|list| list.verifiers.iter().any(|v| v.sha256 == sha256))
+}
+
+/// One required check: a scope, its endpoint and the packet subject it covers.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+pub struct Obligation {
+    pub scope: SemanticScope,
+    pub checkpoint: &'static str,
+    pub program: Option<usize>,
+    /// The producing instruction, for per-site scopes (layout).
+    pub site: Option<usize>,
+}
+
+/// Completeness of one packet's receipts against the obligations derived from its programs.
+/// It does not run the verifier; replay results are added by the caller as gaps.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct Qualification {
+    pub packet_sha256: String,
+    pub programs: usize,
+    pub required: BTreeSet<Obligation>,
+    pub satisfied: BTreeSet<Obligation>,
+    /// Measured/GEMM policy receipts: bound to the wire when present, never required.
+    pub policy_receipts: usize,
+    pub receipt_verifiers: BTreeSet<String>,
+    pub gaps: Vec<String>,
+}
+
+impl Qualification {
+    fn new(packet: &[u8], programs: usize, required: BTreeSet<Obligation>) -> Self {
+        Self {
+            packet_sha256: crate::decode_objects::image_sha256(packet),
+            programs,
+            required,
+            satisfied: BTreeSet::new(),
+            policy_receipts: 0,
+            receipt_verifiers: BTreeSet::new(),
+            gaps: Vec::new(),
+        }
+    }
+
+    pub fn qualified(&self) -> bool {
+        self.gaps.is_empty() && self.satisfied == self.required
+    }
+
+    /// Digest of the required scope set; replay caches key on it so a verdict for one scope set
+    /// is never reused for another.
+    pub fn scope_set_sha256(&self) -> String {
+        let bytes = serde_json::to_vec(&self.required).expect("obligations serialize");
+        crate::decode_objects::image_sha256(&bytes)
+    }
+
+    fn satisfy(&mut self, obligation: Obligation, what: &str) {
+        if !self.required.contains(&obligation) {
+            self.gaps.push(format!("{what}: unused receipt {obligation:?}"));
+        } else if !self.satisfied.insert(obligation.clone()) {
+            self.gaps.push(format!("{what}: duplicate receipt {obligation:?}"));
+        }
+    }
+
+    fn missing(&mut self, packet: &crate::program::Packet<'_>) {
+        let mut by_scope: BTreeMap<SemanticScope, Vec<Option<usize>>> = BTreeMap::new();
+        for obligation in self.required.difference(&self.satisfied) {
+            by_scope.entry(obligation.scope).or_default().push(obligation.program);
+        }
+        for (scope, programs) in by_scope {
+            let reason = match (scope, programs.iter().flatten().next()) {
+                (SemanticScope::LogicalTensorEffects, Some(&p)) => {
+                    crate::logical_effects::obligation(packet, p).err()
+                }
+                _ => None,
+            };
+            let programs: Vec<_> = programs.iter().map(|p| p.map_or(-1, |p| p as i64)).collect();
+            self.gaps.push(format!(
+                "{scope:?} missing for {} of {} programs {programs:?}{}",
+                programs.len(),
+                self.programs,
+                reason.map(|r| format!(" (first: {r})")).unwrap_or_default()
+            ));
+        }
+    }
+}
+
+fn layout_sites(program: &crate::program::Program<'_>) -> Vec<usize> {
+    use packet::dev::DevOp;
+    program
+        .insts
+        .iter()
+        .enumerate()
+        .filter(|(_, d)| d.op == DevOp::FlashMerge as u16 && d.i[4] == 1024)
+        .map(|(i, _)| i)
+        .collect()
+}
+
+/// Every obligation a compiler (`plowc` devblob) packet must carry: rewrite bodies once; coarse
+/// dependency preservation and logical tensor effects for every program; the padded layout
+/// mapping for every padded MLA producer.
+pub fn required_packet_obligations(packet: &crate::program::Packet<'_>) -> BTreeSet<Obligation> {
+    let mut required = BTreeSet::from([Obligation {
+        scope: SemanticScope::RewriteBodyExpansion,
+        checkpoint: "A",
+        program: None,
+        site: None,
+    }]);
+    for (p, program) in packet.programs.iter().enumerate() {
+        for (scope, checkpoint) in [
+            (SemanticScope::CoarseDependencyPreservation, "D"),
+            (SemanticScope::LogicalTensorEffects, "D"),
+        ] {
+            required.insert(Obligation { scope, checkpoint, program: Some(p), site: None });
+        }
+        for site in layout_sites(program) {
+            required.insert(Obligation {
+                scope: SemanticScope::LayoutMapping,
+                checkpoint: "L",
+                program: Some(p),
+                site: Some(site),
+            });
+        }
+    }
+    required
+}
+
+/// Reconstruct a receipt's obligation from the loaded packet. `Err` = the receipt does not
+/// describe these bytes.
+pub fn bind_packet_receipt(
+    packet: &crate::program::Packet<'_>,
+    check: &CompileCheckReceipt,
+) -> Result<Option<Obligation>, String> {
+    let program = match check.program {
+        None => None,
+        Some(index) => Some((index, packet.programs.get(index).ok_or("receipt program is absent from packet")?)),
+    };
+    let obligation = |scope, checkpoint, site| {
+        Ok(Some(Obligation { scope, checkpoint, program: check.program, site }))
+    };
+    match (check.scope, program) {
+        (SemanticScope::RewriteBodyExpansion, None) => obligation(check.scope, "A", None),
+        (SemanticScope::MeasuredPolicy, None) => Ok(None),
+        (SemanticScope::SelectedGemmPolicy, Some((index, _))) => {
+            let expected = crate::gemm_policy::binding(packet, index, &check.request)?;
+            if check.request.get("wire_binding") != Some(&expected) {
+                return Err("GEMM policy differs from loaded instruction/placement".into());
+            }
+            Ok(None)
+        }
+        (SemanticScope::CoarseDependencyPreservation, Some((_, program))) => {
+            let expected = crate::logical_effects::coarse_protocol(program)?;
+            if check.request.get("protocol") != Some(&expected)
+                || check.request.pointer("/task_graph/n").and_then(serde_json::Value::as_u64)
+                    != Some(program.insts.len() as u64)
+            {
+                return Err("dependency receipt differs from loaded wire counters".into());
+            }
+            obligation(check.scope, "D", None)
+        }
+        (SemanticScope::LogicalTensorEffects, Some((index, _))) => {
+            if check.request != crate::logical_effects::obligation(packet, index)? {
+                return Err("logical effects differ from loaded operands/counters".into());
+            }
+            obligation(check.scope, "D", None)
+        }
+        (SemanticScope::LayoutMapping, Some((_, program))) => {
+            let site = check
+                .request
+                .get("producer_instruction")
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|n| usize::try_from(n).ok())
+                .ok_or("layout producer index missing")?;
+            let producer = program.insts.get(site).ok_or("layout producer absent")?;
+            let consumer = site
+                .checked_add(1)
+                .and_then(|i| program.insts.get(i))
+                .ok_or("layout consumer absent")?;
+            let capacity = packet
+                .tensors
+                .get(producer.t[0] as usize)
+                .ok_or("layout output absent")?
+                .bytes;
+            if check.request != mla_layout_obligation(site, producer, consumer, capacity)? {
+                return Err("layout obligation differs from loaded instructions".into());
+            }
+            obligation(check.scope, "L", Some(site))
+        }
+        (scope, _) => Err(format!("unsupported receipt scope {scope:?} for this program binding")),
+    }
+}
+
+/// Completeness of a compiler packet's receipts. Binding failures are gaps here; the runtime's
+/// legacy path reports them as rejections.
+pub fn qualify_packet(
+    receipts: Option<&PacketCheckReceipts>,
+    raw: &[u8],
+    packet: &crate::program::Packet<'_>,
+) -> Qualification {
+    let mut q = Qualification::new(raw, packet.programs.len(), required_packet_obligations(packet));
+    let Some(receipts) = receipts else {
+        q.gaps.push("no compiler check receipts".into());
+        q.missing(packet);
+        return q;
+    };
+    if let Err(error) = receipts.validate_packet(raw) {
+        q.gaps.push(error);
+        q.missing(packet);
+        return q;
+    }
+    for (index, check) in receipts.checks.iter().enumerate() {
+        let what = format!("receipt {index} ({:?}, program {:?})", check.scope, check.program);
+        q.receipt_verifiers.insert(check.verifier_sha256.clone());
+        if !is_approved_verifier(&check.verifier_sha256) {
+            q.gaps.push(format!("{what}: verifier {} is not approved", check.verifier_sha256));
+        }
+        match bind_packet_receipt(packet, check) {
+            Ok(Some(obligation)) => q.satisfy(obligation, &what),
+            Ok(None) => q.policy_receipts += 1,
+            Err(error) => q.gaps.push(format!("{what}: {error}")),
+        }
+    }
+    q.missing(packet);
+    q
+}
+
+/// Completeness of a sidecar packet's receipts: every program maps to a check whose request is
+/// that program's reconstructed logical-effects obligation.
+pub fn qualify_sidecar(
+    receipts: Option<&SidecarCheckReceipts>,
+    raw: &[u8],
+    packet: &crate::program::Packet<'_>,
+) -> Qualification {
+    let required = (0..packet.programs.len())
+        .map(|p| Obligation {
+            scope: SemanticScope::LogicalTensorEffects,
+            checkpoint: "D",
+            program: Some(p),
+            site: None,
+        })
+        .collect();
+    let mut q = Qualification::new(raw, packet.programs.len(), required);
+    let Some(receipts) = receipts else {
+        q.gaps.push("no sidecar check receipts".into());
+        q.missing(packet);
+        return q;
+    };
+    if let Err(error) = receipts.validate_packet(raw) {
+        q.gaps.push(error);
+        q.missing(packet);
+        return q;
+    }
+    if receipts.program_checks.len() != packet.programs.len() {
+        q.gaps.push(format!(
+            "program_checks covers {} of {} programs",
+            receipts.program_checks.len(),
+            packet.programs.len()
+        ));
+    }
+    for check in &receipts.checks {
+        q.receipt_verifiers.insert(check.verifier_sha256.clone());
+        if !is_approved_verifier(&check.verifier_sha256) {
+            q.gaps.push(format!("sidecar verifier {} is not approved", check.verifier_sha256));
+        }
+    }
+    for (p, entry) in receipts.program_checks.iter().enumerate().take(packet.programs.len()) {
+        let Some(index) = *entry else { continue };
+        let Some(check) = receipts.checks.get(index) else { continue };
+        match crate::logical_effects::obligation(packet, p) {
+            Ok(request) if request == check.request => q.satisfy(
+                Obligation {
+                    scope: SemanticScope::LogicalTensorEffects,
+                    checkpoint: "D",
+                    program: Some(p),
+                    site: None,
+                },
+                &format!("program {p}"),
+            ),
+            Ok(_) => q.gaps.push(format!("program {p}: check {index} is not this program's obligation")),
+            Err(error) => q.gaps.push(format!("program {p}: {error}")),
+        }
+    }
+    q.missing(packet);
+    q
 }
 
 pub fn mla_layout_obligation(
@@ -772,6 +1118,182 @@ mod tests {
         let mut invalid = domain;
         invalid.n_tail = 257;
         assert!(invalid.validate().is_err());
+    }
+
+    fn residual_program(extra: bool) -> packet::devbuild::Program {
+        use packet::dev::DevOp;
+        let mut b = packet::devbuild::Builder::new(1);
+        let x = b.tensor("x", 16);
+        let y = b.tensor("y", 16);
+        let first = b.emit(DevOp::Residual, vec![0], &[], |d| {
+            d.t[..3].copy_from_slice(&[y, x, x]);
+            d.i[0] = 8;
+        });
+        let second = b.emit(DevOp::Residual, vec![0], &[first], |d| {
+            d.t[..3].copy_from_slice(&[x, y, y]);
+            d.i[0] = 8;
+        });
+        if extra {
+            b.emit(DevOp::Residual, vec![0], &[second], |d| {
+                d.t[..3].copy_from_slice(&[y, x, x]);
+                d.i[0] = 8;
+            });
+        }
+        b.finish()
+    }
+
+    fn two_program_model() -> packet::devbuild::Model {
+        let first = residual_program(false);
+        packet::devbuild::Model {
+            n_cu: 1,
+            target: 0,
+            tensors: first.tensors.clone(),
+            progs: vec![first, residual_program(true)],
+            kv_row_insts: vec![],
+            prog_t: vec![1, 1],
+            gen: vec![],
+        }
+    }
+
+    fn approved() -> String {
+        approved_verifiers().unwrap().verifiers[0].sha256.clone()
+    }
+
+    fn receipt(program: Option<usize>, scope: SemanticScope, checkpoint: &str, request: serde_json::Value) -> CompileCheckReceipt {
+        CompileCheckReceipt {
+            program,
+            scope,
+            checkpoint: checkpoint.into(),
+            request_sha256: request_sha256(&request).unwrap(),
+            verifier_sha256: approved(),
+            request,
+            response: serde_json::json!({"ok": true, "checkpoint": checkpoint}),
+        }
+    }
+
+    fn complete_receipts(model: &packet::devbuild::Model) -> (Vec<u8>, PacketCheckReceipts) {
+        let raw = model.to_blob();
+        let rewrite = serde_json::json!({"rules": ["r"], "source_sha256": "c".repeat(64),
+            "bodies": [{"name": "r", "lhs": [], "rhs": []}]});
+        let mut checks = vec![receipt(None, SemanticScope::RewriteBodyExpansion, "A", rewrite)];
+        crate::program::with_model(model, |packet| {
+            for (p, program) in packet.programs.iter().enumerate() {
+                let coarse = serde_json::json!({"task_graph": {"n": program.insts.len(), "edges": []},
+                    "protocol": crate::logical_effects::coarse_protocol(program).unwrap(),
+                    "dependency_paths": [], "address_map": []});
+                checks.push(receipt(Some(p), SemanticScope::CoarseDependencyPreservation, "D", coarse));
+                let effects = crate::logical_effects::obligation(packet, p).unwrap();
+                checks.push(receipt(Some(p), SemanticScope::LogicalTensorEffects, "D", effects));
+            }
+        });
+        let receipts = PacketCheckReceipts {
+            schema: 1,
+            packet_sha256: crate::decode_objects::image_sha256(&raw),
+            compiler_sha256: "a".repeat(64),
+            checks,
+        };
+        (raw, receipts)
+    }
+
+    fn qualify(model: &packet::devbuild::Model, raw: &[u8], receipts: Option<&PacketCheckReceipts>) -> Qualification {
+        crate::program::with_model(model, |packet| qualify_packet(receipts, raw, packet))
+    }
+
+    #[test]
+    fn strict_qualification_requires_every_obligation_once_from_an_approved_verifier() {
+        let model = two_program_model();
+        let (raw, receipts) = complete_receipts(&model);
+        let q = qualify(&model, &raw, Some(&receipts));
+        assert!(q.qualified(), "{:?}", q.gaps);
+        assert_eq!(q.required.len(), 1 + 2 * 2);
+        assert!(!qualify(&model, &raw, None).qualified());
+        for mutation in 0..8 {
+            let mut bad = receipts.clone();
+            match mutation {
+                0 => { bad.checks.pop(); }
+                1 => bad.checks[2].program = Some(7),
+                2 => bad.checks[1].verifier_sha256 = "b".repeat(64),
+                3 => {
+                    bad.checks[2].request["accesses"] = serde_json::json!([]);
+                    bad.checks[2].request_sha256 = request_sha256(&bad.checks[2].request).unwrap();
+                }
+                4 => {
+                    // Same obligation twice under a different request digest.
+                    let mut copy = bad.checks[1].clone();
+                    copy.request["address_map"] = serde_json::json!([[]]);
+                    copy.request_sha256 = request_sha256(&copy.request).unwrap();
+                    bad.checks.push(copy);
+                }
+                5 => bad.checks[1].program = None,
+                6 => bad.packet_sha256 = "b".repeat(64),
+                _ => {
+                    // A program's effects receipt relabelled as the other program's.
+                    bad.checks[2].program = Some(1);
+                    bad.checks.remove(4);
+                }
+            }
+            assert!(!qualify(&model, &raw, Some(&bad)).qualified(), "mutation {mutation}");
+        }
+        let mut changed = two_program_model();
+        changed.progs[1].insts[2].t[0] = changed.progs[1].insts[2].t[1];
+        let raw = changed.to_blob();
+        let mut rebound = receipts;
+        rebound.packet_sha256 = crate::decode_objects::image_sha256(&raw);
+        assert!(!qualify(&changed, &raw, Some(&rebound)).qualified(),
+            "an updated packet hash cannot reuse receipts for changed operands");
+    }
+
+    #[test]
+    fn sidecar_qualification_maps_every_program_to_its_own_obligation() {
+        let model = two_program_model();
+        let raw = model.to_blob();
+        let checks = crate::program::with_model(&model, |packet| {
+            (0..2).map(|p| receipt(Some(p), SemanticScope::LogicalTensorEffects, "D",
+                crate::logical_effects::obligation(packet, p).unwrap())).collect::<Vec<_>>()
+        });
+        let receipts = SidecarCheckReceipts {
+            schema: 1,
+            packet_sha256: crate::decode_objects::image_sha256(&raw),
+            compiler_sha256: "a".repeat(64),
+            checks,
+            program_checks: vec![Some(0), Some(1)],
+        };
+        let q = |r: Option<&SidecarCheckReceipts>| {
+            crate::program::with_model(&model, |packet| qualify_sidecar(r, &raw, packet))
+        };
+        assert!(q(Some(&receipts)).qualified(), "{:?}", q(Some(&receipts)).gaps);
+        assert!(!q(None).qualified());
+        for mutation in 0..4 {
+            let mut bad = receipts.clone();
+            match mutation {
+                0 => bad.program_checks[1] = None,
+                1 => { bad.program_checks.pop(); }
+                2 => bad.program_checks = vec![Some(1), Some(0)],
+                _ => bad.checks[1].verifier_sha256 = "b".repeat(64),
+            }
+            assert!(!q(Some(&bad)).qualified(), "mutation {mutation}");
+        }
+    }
+
+    #[test]
+    fn scope_set_digest_changes_with_the_required_obligations() {
+        let model = two_program_model();
+        let (raw, receipts) = complete_receipts(&model);
+        let two = qualify(&model, &raw, Some(&receipts)).scope_set_sha256();
+        let mut one = two_program_model();
+        one.progs.truncate(1);
+        one.prog_t.truncate(1);
+        let raw = one.to_blob();
+        assert_ne!(two, qualify(&one, &raw, None).scope_set_sha256());
+    }
+
+    #[test]
+    fn approved_verifier_list_is_well_formed() {
+        let list = approved_verifiers().unwrap();
+        assert!(list.verifiers.iter().all(|v| is_approved_verifier(&v.sha256)));
+        assert!(!is_approved_verifier(&"0".repeat(64)));
+        assert_eq!(VerificationPolicy::parse("strict"), Ok(VerificationPolicy::Strict));
+        assert!(VerificationPolicy::parse("on").is_err());
     }
 
     #[test]

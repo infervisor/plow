@@ -195,3 +195,68 @@ unrelated to this work and are not chased.
 | Object capability model | Phase 2 support checker (not started) |
 | Serving trace / tool chunking | Phase 7 (not started) |
 | CI: no Lean build, audit or ignored CPU tests | `lean-correctness` job (Phase 8) |
+
+## 9. Strict qualification policy
+
+`plow_asset::certificates` derives each packet's required obligations from its programs. It then
+matches receipts to them and records a `Qualification`: required and satisfied obligations, policy
+receipts, receipt verifiers, and gaps. `plowrt certificate_checks` adds the replay.
+
+- **Required set.**
+  - Compiler packet (`model.pkt`, or any packet whose `lean-checks.json` binds its bytes): A once;
+    coarse D and logical-effects D for every program; L for every padded-MLA producer.
+  - Any other packet is a sidecar: logical-effects D for every program, through `program_checks`.
+  - Policy receipts (R) bind to the wire when present. They are never required.
+- **Gaps.** Each of these is a gap:
+  - receipts absent, or `packet_sha256` not matching the loaded bytes;
+  - a receipt that does not rebind (request ≠ reconstruction from the loaded packet);
+  - a wrong or absent program, a duplicate or unused receipt, or an unsupported scope;
+  - a `None` or out-of-range `program_checks` entry, or `program_checks` shorter than the
+    program count;
+  - a receipt verifier that is not approved;
+  - a current verifier that is unavailable or not approved, a replay rejection, or a changed
+    envelope.
+- **Verifier identity.** `lean-plow/approved-verifiers.json` pairs each approved `plow_verify`
+  sha256 with the digest of the Lean sources it was built from (`lean_verify::lean_sources_sha256`).
+  The commit is recorded but not matched. `lean_verify` tests fail when the current sources have no
+  entry, and (ignored, CPU lane) when the built binary is not the entry for them. Receipts from
+  `becacc81…` (the baseline that signed the production bundles) replay on the current verifier with
+  identical envelopes.
+- **Cache.** Replay results are cached per (receipts digest, verifier, required-scope-set digest),
+  so a verdict is never reused for a different scope set.
+- **Entry points.**
+  - `plowrt qualify --assets DIR...` qualifies every `*.pkt` with replay (`--no-replay` skips the
+    verifier and then cannot qualify). It exits non-zero on any gap.
+  - At load, `PLOW_LEAN_QUALIFY` applies to `check_packet` (CUDA/HSA/CPU engines) and to
+    `check_sidecar` (`CudaPacketRuntime`, i.e. encoder/codec/s3gen on CUDA).
+- **Knob.** `PLOW_LEAN_QUALIFY` (`rt.lean_qualify`, `--lean-qualify`, opt-in) takes `off`, `report` or
+  `strict`. The default is `off`.
+  - `off` is the pre-policy load path, with one fix: a sidecar now reads `<stem>.lean-checks.json`,
+    never the compiler packet's receipts.
+  - `report` also logs every gap.
+  - `strict` refuses any packet with a gap.
+  - The default stays `off` because `strict` refuses all 14 production bundles: 12 have the
+    logical-effects gap and 2 have no receipts. `report` re-reads sidecar obligations at load
+    (s3gen has 1931 programs), so it is not free either.
+
+Strict results for the 14 H100 production bundles (`plowrt qualify`, replay on), at 4de53bf6:
+
+| Bundle | Packet | Verdict | Gap |
+| --- | --- | --- | --- |
+| gemma-4-12b | model.pkt | 20/39 | logical effects 0/19 (first: Embed) |
+| gemma-4-26b-fp8 | model.pkt | 21/41 | logical effects 0/20 (Embed) |
+| gemma-4-26b-bf16 | model.pkt | 19/37 | logical effects 0/18 (Embed) |
+| gemma-4-31b-fp8 | model.pkt | 19/37 | logical effects 0/18 (Embed) |
+| gemma-4-31b-bf16 | model.pkt | 17/33 | logical effects 0/16 (Embed) |
+| gemma-4-e4b | model.pkt | 19/37 | logical effects 0/18 (Embed) |
+| qwen3-asr | model.pkt / encoder.pkt | 15/29 / **qualified 460/460** | logical effects 0/14 (HeadNormRope) |
+| qwen3-asr-0.6b | model.pkt / encoder.pkt | 15/29 / **qualified 360/360** | logical effects 0/14 (HeadNormRope) |
+| veena | model.pkt / codec.pkt | 15/29 / **qualified 19/19** | logical effects 0/14 (Embed) |
+| orpheus | model.pkt / codec.pkt | 15/29 / **qualified 19/19** | logical effects 0/14 (Embed) |
+| chatterbox | model.pkt / s3gen.pkt | 15/29 / **qualified 1931/1931** | logical effects 0/14 (HeadNormRope) |
+| chatterbox-mtl | model.pkt / s3gen.pkt | 15/29 / **qualified 1931/1931** | logical effects 0/14 (HeadNormRope) |
+| nemotron-3.5-asr | nemotron.pkt | 0/81 | no receipts (the example builder has no verify gate; all 81 obligations derive) |
+| silero-vad | silero_vad.pkt | 0/2 | no receipts (as nemotron; both obligations derive) |
+
+Every receipt that is present binds and replays. The only gaps are the 34 unaudited opcodes in §3
+and the two receipt-less example builders.

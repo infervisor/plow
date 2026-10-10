@@ -1,103 +1,224 @@
-//! Load-time replay of compiler obligations. This is not execution-identity,
-//! floating-point implementation, runtime-rewrite, or empirical qualification.
+//! Load-time replay of compiler obligations and the qualification policy. This is not
+//! execution-identity, floating-point implementation, runtime-rewrite, or empirical qualification.
+//!
+//! `PLOW_LEAN_QUALIFY` selects the [`VerificationPolicy`]: `off` (default) keeps the pre-policy
+//! behavior, `report` also derives every required obligation and logs the gaps, `strict` rejects
+//! a packet with any gap. `plowrt qualify` runs the same checks offline.
 
 use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::Mutex;
 
-use plow_asset::certificates::{PacketCheckReceipts, PACKET_CHECKS_FILE};
+use plow_asset::certificates::{
+    bind_packet_receipt, is_approved_verifier, qualify_packet, qualify_sidecar, sidecar_checks_file,
+    CompileCheckReceipt, PacketCheckReceipts, Qualification, SidecarCheckReceipts,
+    VerificationPolicy, PACKET_CHECKS_FILE,
+};
 use plow_asset::decode_objects::image_sha256;
 
 use crate::asset::devblob::DevBlob;
 use crate::{Result, RuntimeError};
 
+pub(crate) fn load_policy() -> Result<VerificationPolicy> {
+    VerificationPolicy::parse(&crate::config::RuntimeConfig::get().lean_qualify).map_err(RuntimeError::Rejected)
+}
+
+fn read_optional(path: &Path) -> Result<Option<Vec<u8>>> {
+    match std::fs::read(path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(source) => Err(RuntimeError::Io { path: path.to_path_buf(), source }),
+    }
+}
+
+/// `model.pkt`, or any packet whose `lean-checks.json` binds its bytes, carries compiler
+/// receipts; every other packet (`encoder.pkt`, `codec.pkt`, ...) is a sidecar with its own file.
+fn is_compiler_packet(blob_path: &Path, raw: &[u8], receipts: Option<&[u8]>) -> bool {
+    blob_path.file_stem().is_some_and(|stem| stem == "model")
+        || receipts
+            .and_then(|bytes| serde_json::from_slice::<PacketCheckReceipts>(bytes).ok())
+            .is_some_and(|r| r.packet_sha256 == image_sha256(raw))
+}
+
 pub(crate) fn check_packet(blob_path: &Path, raw: &[u8], blob: &DevBlob) -> Result<()> {
+    check_packet_with(blob_path, raw, blob, load_policy()?)
+}
+
+fn check_packet_with(
+    blob_path: &Path,
+    raw: &[u8],
+    blob: &DevBlob,
+    policy: VerificationPolicy,
+) -> Result<()> {
     let path = blob_path.with_file_name(PACKET_CHECKS_FILE);
-    let bytes = match std::fs::read(&path) {
-        Ok(bytes) => bytes,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(source) => return Err(RuntimeError::Io { path, source }),
-    };
+    let bytes = read_optional(&path)?;
+    if !is_compiler_packet(blob_path, raw, bytes.as_deref()) {
+        return check_sidecar_with(blob_path, raw, blob, policy);
+    }
     let rejected = |reason: String| RuntimeError::Rejected(format!("{}: {reason}", path.display()));
-    let receipts: PacketCheckReceipts =
-        serde_json::from_slice(&bytes).map_err(|error| rejected(error.to_string()))?;
-    receipts.validate_packet(raw).map_err(rejected)?;
-    for check in &receipts.checks {
-        let Some(index) = check.program else {
-            continue;
-        };
-        let program = blob
-            .progs
-            .get(index)
-            .ok_or_else(|| rejected("receipt program is absent from packet".into()))?;
-        if check.scope == plow_asset::certificates::SemanticScope::SelectedGemmPolicy {
-            let expected = blob.with_packet_view(|packet|
-                plow_asset::gemm_policy::binding(packet, index, &check.request)).map_err(rejected)?;
-            if check.request.get("wire_binding") != Some(&expected) {
-                return Err(rejected("GEMM policy differs from loaded instruction/placement".into()));
-            }
-            continue;
+    let receipts: Option<PacketCheckReceipts> = bytes
+        .as_deref()
+        .map(serde_json::from_slice)
+        .transpose()
+        .map_err(|error| rejected(error.to_string()))?;
+    match policy {
+        VerificationPolicy::Off => legacy_check(&path, bytes.as_deref(), receipts.as_ref(), raw, blob),
+        VerificationPolicy::Report => {
+            let q = blob.with_packet_view(|packet| qualify_packet(receipts.as_ref(), raw, packet));
+            report(blob_path, &q);
+            legacy_check(&path, bytes.as_deref(), receipts.as_ref(), raw, blob)
         }
-        if check.scope == plow_asset::certificates::SemanticScope::CoarseDependencyPreservation {
-            let expected = blob.with_packet_view(|packet|
-                plow_asset::logical_effects::coarse_protocol(&packet.programs[index]))
-                .map_err(rejected)?;
-            if check.request.get("protocol") != Some(&expected) {
-                return Err(rejected("dependency receipt differs from loaded wire counters".into()));
-            }
+        VerificationPolicy::Strict => {
+            let q = qualify_compiler(receipts.as_ref(), bytes.as_deref(), raw, blob, true);
+            enforce(blob_path, &q)
         }
-        if check.scope == plow_asset::certificates::SemanticScope::LogicalTensorEffects {
-            let expected = blob.with_packet_view(|packet|
-                plow_asset::logical_effects::obligation(packet, index)).map_err(rejected)?;
-            if check.request != expected {
-                return Err(rejected("logical effects differ from loaded operands/counters".into()));
-            }
-            continue;
+    }
+}
+
+/// Sidecar packets loaded by the packet runtimes (`encoder.pkt`, `codec.pkt`, `s3gen.pkt`,
+/// `mm_*.pkt`) and any non-compiler packet. `off` does not read their receipts.
+pub(crate) fn check_sidecar(blob_path: &Path, raw: &[u8], blob: &DevBlob) -> Result<()> {
+    check_sidecar_with(blob_path, raw, blob, load_policy()?)
+}
+
+fn check_sidecar_with(
+    blob_path: &Path,
+    raw: &[u8],
+    blob: &DevBlob,
+    policy: VerificationPolicy,
+) -> Result<()> {
+    if policy == VerificationPolicy::Off {
+        return Ok(());
+    }
+    let path = sidecar_checks_file(blob_path);
+    let receipts: Option<SidecarCheckReceipts> = read_optional(&path)?
+        .map(|bytes| serde_json::from_slice(&bytes))
+        .transpose()
+        .map_err(|error| RuntimeError::Rejected(format!("{}: {error}", path.display())))?;
+    let q = qualify_sidecar_blob(receipts.as_ref(), raw, blob, policy == VerificationPolicy::Strict);
+    match policy {
+        VerificationPolicy::Strict => enforce(blob_path, &q),
+        _ => {
+            report(blob_path, &q);
+            Ok(())
         }
-        if check.scope == plow_asset::certificates::SemanticScope::LayoutMapping {
-            let producer_index = check
-                .request
-                .get("producer_instruction")
-                .and_then(serde_json::Value::as_u64)
-                .and_then(|n| usize::try_from(n).ok())
-                .ok_or_else(|| rejected("layout producer index missing".into()))?;
-            let producer = program
-                .insts
-                .get(producer_index)
-                .ok_or_else(|| rejected("layout producer absent".into()))?;
-            let consumer = producer_index
-                .checked_add(1)
-                .and_then(|index| program.insts.get(index))
-                .ok_or_else(|| rejected("layout consumer absent".into()))?;
-            let capacity = blob
-                .tensors
-                .get(producer.t[0] as usize)
-                .ok_or_else(|| rejected("layout output absent".into()))?
-                .bytes;
-            let expected = plow_asset::certificates::mla_layout_obligation(
-                producer_index,
-                producer,
-                consumer,
-                capacity,
-            )
-            .map_err(rejected)?;
-            if check.request != expected {
-                return Err(rejected(
-                    "layout obligation differs from loaded instructions".into(),
-                ));
-            }
-            continue;
+    }
+}
+
+fn report(packet: &Path, q: &Qualification) {
+    if q.qualified() {
+        tracing::info!(packet = %packet.display(), obligations = q.required.len(),
+            "lean qualification complete (structural scopes only)");
+    } else {
+        tracing::warn!(packet = %packet.display(), satisfied = q.satisfied.len(),
+            required = q.required.len(), gaps = ?q.gaps, "lean qualification incomplete");
+    }
+}
+
+fn enforce(packet: &Path, q: &Qualification) -> Result<()> {
+    if q.qualified() {
+        report(packet, q);
+        return Ok(());
+    }
+    Err(RuntimeError::Rejected(format!(
+        "{}: strict lean qualification failed ({} of {} obligations): {}",
+        packet.display(),
+        q.satisfied.len(),
+        q.required.len(),
+        q.gaps.join("; ")
+    )))
+}
+
+pub(crate) fn qualify_compiler(
+    receipts: Option<&PacketCheckReceipts>,
+    bytes: Option<&[u8]>,
+    raw: &[u8],
+    blob: &DevBlob,
+    replay_checks: bool,
+) -> Qualification {
+    let mut q = blob.with_packet_view(|packet| qualify_packet(receipts, raw, packet));
+    if let (true, Some(receipts), Some(bytes)) = (replay_checks, receipts, bytes) {
+        if let Err(gap) = replay(&receipts.checks, bytes, &q.scope_set_sha256()) {
+            q.gaps.push(gap);
         }
-        if check
-            .request
-            .pointer("/task_graph/n")
-            .and_then(serde_json::Value::as_u64)
-            != Some(program.insts.len() as u64)
-        {
-            return Err(rejected(
-                "receipt instruction domain differs from packet".into(),
+    }
+    q
+}
+
+pub(crate) fn qualify_sidecar_blob(
+    receipts: Option<&SidecarCheckReceipts>,
+    raw: &[u8],
+    blob: &DevBlob,
+    replay_checks: bool,
+) -> Qualification {
+    let mut q = blob.with_packet_view(|packet| qualify_sidecar(receipts, raw, packet));
+    if let (true, Some(receipts)) = (replay_checks, receipts) {
+        let key = serde_json::to_vec(receipts).unwrap_or_default();
+        if let Err(gap) = replay(&receipts.checks, &key, &q.scope_set_sha256()) {
+            q.gaps.push(gap);
+        }
+    }
+    q
+}
+
+/// Re-run every receipt's request on the current verifier, which must be approved, and require
+/// the identical accepted envelope. Cached per (receipts, verifier, required scope set).
+fn replay(checks: &[CompileCheckReceipt], key: &[u8], scope_set: &str) -> std::result::Result<(), String> {
+    replay_approved(checks, key, scope_set, is_approved_verifier)
+}
+
+fn replay_approved(
+    checks: &[CompileCheckReceipt],
+    key: &[u8],
+    scope_set: &str,
+    approved: impl Fn(&str) -> bool,
+) -> std::result::Result<(), String> {
+    if checks.is_empty() {
+        return Ok(());
+    }
+    let verifier = lean_verify::verifier_sha256().map_err(|e| format!("no verifier identity: {e}"))?;
+    if !approved(&verifier) {
+        return Err(format!("current verifier {verifier} is not approved"));
+    }
+    static CHECKED: Mutex<BTreeSet<(String, String, String)>> = Mutex::new(BTreeSet::new());
+    let cache = (image_sha256(key), verifier.clone(), scope_set.to_string());
+    if CHECKED.lock().unwrap().contains(&cache) {
+        return Ok(());
+    }
+    let requests: Vec<_> = checks.iter().map(|c| (c.checkpoint.as_str(), c.request.clone())).collect();
+    let (certs, executed) = lean_verify::call_batch_bound(&requests).map_err(|e| format!("verifier: {e}"))?;
+    if executed != verifier {
+        return Err("verifier changed while replaying obligations".into());
+    }
+    for (receipt, cert) in checks.iter().zip(certs) {
+        let envelope = serde_json::to_value(&cert).map_err(|e| e.to_string())?;
+        if !cert.ok || envelope != receipt.response {
+            return Err(format!(
+                "program {:?} {:?}: obligation rejected or envelope changed: {:?}",
+                receipt.program, receipt.scope, cert.reason
             ));
         }
+    }
+    CHECKED.lock().unwrap().insert(cache);
+    Ok(())
+}
+
+/// The pre-policy load check (`PLOW_LEAN_QUALIFY=off`): binding is fatal; absent receipts and
+/// an unavailable or changed verifier load unverified.
+fn legacy_check(
+    path: &Path,
+    bytes: Option<&[u8]>,
+    receipts: Option<&PacketCheckReceipts>,
+    raw: &[u8],
+    blob: &DevBlob,
+) -> Result<()> {
+    let (Some(bytes), Some(receipts)) = (bytes, receipts) else {
+        return Ok(());
+    };
+    let rejected = |reason: String| RuntimeError::Rejected(format!("{}: {reason}", path.display()));
+    receipts.validate_packet(raw).map_err(rejected)?;
+    for check in &receipts.checks {
+        blob.with_packet_view(|packet| bind_packet_receipt(packet, check)).map_err(rejected)?;
     }
     if receipts.checks.is_empty() {
         return Ok(());
@@ -121,7 +242,7 @@ pub(crate) fn check_packet(blob_path: &Path, raw: &[u8], blob: &DevBlob) -> Resu
     }
     // Shared TP ranks validate identical obligations once at load; no token-loop work.
     static CHECKED: Mutex<BTreeSet<(String, String)>> = Mutex::new(BTreeSet::new());
-    let key = (image_sha256(&bytes), verifier.clone());
+    let key = (image_sha256(bytes), verifier.clone());
     let mut checked = CHECKED.lock().unwrap();
     if checked.contains(&key) {
         return Ok(());
@@ -159,6 +280,46 @@ pub(crate) fn check_packet(blob_path: &Path, raw: &[u8], blob: &DevBlob) -> Resu
     tracing::info!(checks = receipts.checks.len(),
         "packet-bound compiler obligations rechecked; supplied coarse-graph/measured-policy scope only, no performance qualification");
     Ok(())
+}
+
+/// `plowrt qualify`: every `*.pkt` in `dir`, in name order, with its qualification.
+pub fn qualify_dir(dir: &Path, replay_checks: bool) -> Result<Vec<(std::path::PathBuf, Qualification)>> {
+    let entries = std::fs::read_dir(dir).map_err(|source| RuntimeError::Io { path: dir.to_path_buf(), source })?;
+    let mut packets: Vec<_> = entries
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|x| x == "pkt"))
+        .collect();
+    packets.sort();
+    if packets.is_empty() {
+        return Err(RuntimeError::Rejected(format!("{}: no packets", dir.display())));
+    }
+    packets
+        .into_iter()
+        .map(|p| qualify_file(&p, replay_checks).map(|q| (p, q)))
+        .collect()
+}
+
+/// One packet's qualification for `plowrt qualify`.
+pub(crate) fn qualify_file(blob_path: &Path, replay_checks: bool) -> Result<Qualification> {
+    let raw = std::fs::read(blob_path)
+        .map_err(|source| RuntimeError::Io { path: blob_path.to_path_buf(), source })?;
+    let blob = DevBlob::parse(&raw)?;
+    let path = blob_path.with_file_name(PACKET_CHECKS_FILE);
+    let bytes = read_optional(&path)?;
+    if is_compiler_packet(blob_path, &raw, bytes.as_deref()) {
+        let receipts = bytes
+            .as_deref()
+            .map(serde_json::from_slice::<PacketCheckReceipts>)
+            .transpose()
+            .map_err(|e| RuntimeError::Rejected(format!("{}: {e}", path.display())))?;
+        return Ok(qualify_compiler(receipts.as_ref(), bytes.as_deref(), &raw, &blob, replay_checks));
+    }
+    let path = sidecar_checks_file(blob_path);
+    let receipts = read_optional(&path)?
+        .map(|bytes| serde_json::from_slice::<SidecarCheckReceipts>(&bytes))
+        .transpose()
+        .map_err(|e| RuntimeError::Rejected(format!("{}: {e}", path.display())))?;
+    Ok(qualify_sidecar_blob(receipts.as_ref(), &raw, &blob, replay_checks))
 }
 
 #[cfg(test)]
@@ -479,5 +640,138 @@ mod tests {
             );
         }
         std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    fn residual_model(extra: bool) -> Model {
+        let mut b = Builder::new(1);
+        let x = b.tensor("x", 16);
+        let y = b.tensor("y", 16);
+        let first = b.emit(DevOp::Residual, vec![0], &[], |d| {
+            d.t[..3].copy_from_slice(&[y, x, x]);
+            d.i[0] = 8;
+        });
+        let second = b.emit(DevOp::Residual, vec![0], &[first], |d| {
+            d.t[..3].copy_from_slice(&[x, y, y]);
+            d.i[0] = 8;
+        });
+        if extra {
+            b.emit(DevOp::Residual, vec![0], &[second], |d| {
+                d.t[..3].copy_from_slice(&[y, x, x]);
+                d.i[0] = 8;
+            });
+        }
+        let p = b.finish();
+        Model { n_cu: 1, target: 0, tensors: p.tensors.clone(), progs: vec![p],
+            kv_row_insts: vec![], prog_t: vec![1], gen: vec![] }
+    }
+
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("plow-{name}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn strict_policy_rejects_absent_receipts_that_off_and_report_load() {
+        let raw = residual_model(false).to_blob();
+        let blob = DevBlob::parse(&raw).unwrap();
+        let dir = scratch("strict-absent");
+        let packet = dir.join("model.pkt");
+        check_packet_with(&packet, &raw, &blob, VerificationPolicy::Off).unwrap();
+        check_packet_with(&packet, &raw, &blob, VerificationPolicy::Report).unwrap();
+        let error = check_packet_with(&packet, &raw, &blob, VerificationPolicy::Strict).unwrap_err();
+        assert!(error.to_string().contains("no compiler check receipts"), "{error}");
+        let sidecar = dir.join("codec.pkt");
+        check_sidecar_with(&sidecar, &raw, &blob, VerificationPolicy::Off).unwrap();
+        check_sidecar_with(&sidecar, &raw, &blob, VerificationPolicy::Report).unwrap();
+        assert!(check_sidecar_with(&sidecar, &raw, &blob, VerificationPolicy::Strict).is_err());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// `encoder.pkt` beside `model.pkt` must read `encoder.lean-checks.json`, never the compiler
+    /// packet's `lean-checks.json` (whose hash binding would reject the encoder).
+    #[test]
+    fn a_sidecar_beside_compiler_receipts_reads_its_own_receipts() {
+        let model = residual_model(false).to_blob();
+        let encoder = residual_model(true).to_blob();
+        let dir = scratch("sidecar-file");
+        let receipts = PacketCheckReceipts { schema: 1, packet_sha256: image_sha256(&model),
+            compiler_sha256: "a".repeat(64), checks: vec![] };
+        std::fs::write(dir.join(PACKET_CHECKS_FILE), serde_json::to_vec(&receipts).unwrap()).unwrap();
+        let path = dir.join("encoder.pkt");
+        let blob = DevBlob::parse(&encoder).unwrap();
+        check_packet_with(&path, &encoder, &blob, VerificationPolicy::Off).unwrap();
+        let error = check_packet_with(&path, &encoder, &blob, VerificationPolicy::Strict).unwrap_err();
+        assert!(error.to_string().contains("no sidecar check receipts"), "{error}");
+        let blob = DevBlob::parse(&model).unwrap();
+        check_packet_with(&dir.join("model.pkt"), &model, &blob, VerificationPolicy::Off).unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    fn lean_receipts(raw: &[u8], model: &Model) -> PacketCheckReceipts {
+        let var = |name: &str| json!(["variable", name, []]);
+        let node = |head: &str, args: Vec<serde_json::Value>| json!(["call", head, args]);
+        let lhs = node("Linear", vec![node("RmsNorm", vec![var("x"), var("w"), var("eps")]), var("wl"), var("out")]);
+        let rhs = node("FusedNormLinear", vec![var("x"), var("w"), var("wl"), var("eps"), var("out")]);
+        let mut requests = vec![(None, SemanticScope::RewriteBodyExpansion, "A",
+            json!({"rules": ["rmsnorm-linear-fuse"], "source_sha256": "c".repeat(64),
+                "bodies": [{"name": "rmsnorm-linear-fuse", "lhs": lhs, "rhs": rhs}]}))];
+        plow_asset::program::with_model(model, |packet| {
+            for (p, program) in packet.programs.iter().enumerate() {
+                requests.push((Some(p), SemanticScope::CoarseDependencyPreservation, "D",
+                    json!({"task_graph": {"n": program.insts.len(), "edges": []},
+                        "protocol": plow_asset::logical_effects::coarse_protocol(program).unwrap(),
+                        "dependency_paths": [], "address_map": []})));
+                requests.push((Some(p), SemanticScope::LogicalTensorEffects, "D",
+                    plow_asset::logical_effects::obligation(packet, p).unwrap()));
+            }
+        });
+        let batch: Vec<_> = requests.iter().map(|(_, _, cp, r)| (*cp, r.clone())).collect();
+        let (certs, verifier) = lean_verify::call_batch_bound(&batch).unwrap();
+        let checks = requests.into_iter().zip(certs).map(|((program, scope, cp, request), cert)| {
+            assert!(cert.ok, "{scope:?}: {:?}", cert.reason);
+            CompileCheckReceipt { program, scope, checkpoint: cp.into(),
+                request_sha256: plow_asset::certificates::request_sha256(&request).unwrap(),
+                verifier_sha256: verifier.clone(), request,
+                response: serde_json::to_value(cert).unwrap() }
+        }).collect();
+        PacketCheckReceipts { schema: 1, packet_sha256: image_sha256(raw),
+            compiler_sha256: "a".repeat(64), checks }
+    }
+
+    #[test]
+    #[ignore = "requires built plow_verify listed in lean-plow/approved-verifiers.json; CPU-only"]
+    fn strict_policy_replays_complete_receipts_and_rejects_substituted_evidence() {
+        let model = residual_model(false);
+        let raw = model.to_blob();
+        let blob = DevBlob::parse(&raw).unwrap();
+        let receipts = lean_receipts(&raw, &model);
+        let dir = scratch("strict-replay");
+        let packet = dir.join("model.pkt");
+        let write = |r: &PacketCheckReceipts| {
+            std::fs::write(dir.join(PACKET_CHECKS_FILE), serde_json::to_vec(r).unwrap()).unwrap()
+        };
+        write(&receipts);
+        check_packet_with(&packet, &raw, &blob, VerificationPolicy::Strict).unwrap();
+        let bytes = serde_json::to_vec(&receipts).unwrap();
+        let denied = replay_approved(&receipts.checks, &bytes, "fresh-scope-set", |_| false).unwrap_err();
+        assert!(denied.contains("not approved"), "{denied}");
+        for mutation in 0..4 {
+            let mut bad = receipts.clone();
+            match mutation {
+                0 => bad.checks[1].response["notes"] = json!("invented proof"),
+                1 => {
+                    let response = bad.checks[1].response.clone();
+                    bad.checks[1].response = bad.checks[2].response.clone();
+                    bad.checks[2].response = response;
+                }
+                2 => { bad.checks.remove(2); }
+                _ => bad.checks[0].verifier_sha256 = "b".repeat(64),
+            }
+            write(&bad);
+            assert!(check_packet_with(&packet, &raw, &blob, VerificationPolicy::Strict).is_err(),
+                "mutation {mutation}");
+        }
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }
