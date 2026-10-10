@@ -1,0 +1,45 @@
+{
+  "schema": 1,
+  "allowed_axioms": ["propext", "Classical.choice", "Quot.sound"],
+  "endpoints": [
+    {"id": "A", "scope": "rewrite_body_expansion", "soundness": [
+      {"theorem": "Plow.RewriteBody.check_sound", "checker": "Plow.RewriteBody.check"},
+      {"theorem_prefix": "Plow.Rewrite.rule_"}]},
+    {"id": "B", "scope": "tile_partition", "soundness": [
+      {"theorem": "Plow.TilePartition.check_sound", "checker": "Plow.TilePartition.checkPartition"}]},
+    {"id": "C", "scope": "sram_temporal_fit", "soundness": [
+      {"theorem": "Plow.Sram.occupancy_le_of_temporal_fit", "checker": "Plow.Sram.temporalFitSafe"}]},
+    {"id": "D", "scope": "coarse_dependency_preservation+logical_tensor_effects", "soundness": [
+      {"theorem": "Plow.Verify.verifyDependencies_sound", "checker": "Plow.Verify.verifyDependencies"},
+      {"theorem": "Plow.Verify.checkPaths_sound", "checker": "Plow.Verify.checkPaths"},
+      {"theorem": "Plow.Verify.verifyAddressMap_sound_strict", "checker": "Plow.Verify.verifyAddressMap"},
+      {"theorem": "Plow.Verify.verifyAddressMapVia_sound", "checker": "Plow.Verify.verifyAddressMapVia"},
+      {"theorem": "Plow.Verify.treeBefore_sound", "checker": "Plow.Verify.treeBefore"},
+      {"theorem": "Plow.Effects.checkConflicts_sound", "checker": "Plow.Effects.checkConflicts"},
+      {"theorem": "Plow.Effects.checkAccesses_sound", "checker": "Plow.Effects.checkAccesses"},
+      {"theorem": "Plow.Effects.checkReuse_sound", "checker": "Plow.Effects.checkReuse"},
+      {"theorem": "Plow.Effects.cancellation_retired", "checker": "Plow.Effects.checkRetirements"}]},
+    {"id": "E", "scope": "wire_round_trip", "soundness": [
+      {"theorem": "Plow.Wire.decodeProgram_encodeProgram", "checker": "Plow.Wire.decodeProgram"}]},
+    {"id": "F", "scope": "allocation_safety", "soundness": [
+      {"theorem": "Plow.Verify.verifyAddressMap_sound_strict", "checker": "Plow.Verify.verifyAddressMap"},
+      {"theorem": "Plow.Verify.verifyAddressMapVia_sound", "checker": "Plow.Verify.verifyAddressMapVia"}]},
+    {"id": "G", "scope": "staged_lds_fit", "soundness": [
+      {"theorem": "Plow.LdsFit.fits_of_check_ok", "checker": "Plow.LdsFit.checkLdsFit"}]},
+    {"id": "K", "scope": "knob_consistency", "soundness": [
+      {"theorem": "Plow.Knobs.checkK_sound", "checker": "Plow.Knobs.checkK"}]},
+    {"id": "S", "scope": "knob_scope", "soundness": [
+      {"theorem": "Plow.Knobs.Scope.checkS_sound", "checker": "Plow.Knobs.Scope.checkS"},
+      {"theorem": "Plow.Knobs.Scope.diff_complete"},
+      {"theorem": "Plow.Knobs.Scope.untouched_rungs", "checker": "Plow.Knobs.Scope.checkS"},
+      {"theorem": "Plow.Knobs.Scope.route_untouched", "checker": "Plow.Knobs.Scope.checkS"}]},
+    {"id": "P", "scope": "perf_floor", "soundness": [
+      {"theorem": "Plow.Knobs.Ledger.checkP_sound", "checker": "Plow.Knobs.Ledger.checkP"}]},
+    {"id": "R", "scope": "measured_policy+selected_gemm_policy", "soundness": [
+      {"theorem": "Plow.MeasuredPolicy.check_sound", "checker": "Plow.MeasuredPolicy.check"}]},
+    {"id": "L", "scope": "layout_mapping", "soundness": [
+      {"theorem": "Plow.MlaLayout.address_in_bounds"},
+      {"theorem": "Plow.MlaLayout.ignored_padding"},
+      {"theorem": "Plow.MlaLayout.same_consumer_output"}]}
+  ]
+}

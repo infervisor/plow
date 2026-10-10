@@ -37,3 +37,4 @@ import Plow.Layout
 import Plow.Weight
 import Plow.FusionSavings
 import Plow.Speech
+import Plow.MlpInterleave
