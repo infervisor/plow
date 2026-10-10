@@ -35,13 +35,14 @@ fn main() {
     let contract = plowrt::asset::serve::read_multimodal(&pkt).expect("contract").expect("packet has no multimodal contract");
     let mut ok = true;
     let mut encoders: std::collections::HashMap<String, plowrt::serve::mm::encoder::Encoder> = Default::default();
+    let mut firsts: Vec<(String, plow_asset::multimodal::MmModality, Box<Input>, Vec<f32>)> = Vec::new();
     for (i, item) in reference["items"].as_array().unwrap().iter().enumerate() {
         let kind = item["kind"].as_str().unwrap();
         let path = item["path"].as_str().unwrap();
         let m = contract.modality(kind).expect("modality");
         let bytes = std::fs::read(path).unwrap();
         let mut line = serde_json::json!({ "item": i, "kind": kind, "path": path });
-        let (ours, theirs_input): (Box<dyn std::any::Any>, Box<dyn std::any::Any>);
+        let (ours, theirs_input): (Box<Input>, Box<Input>);
         if kind == "image" {
             let p = media::PatchParams {
                 patch: m.param("patch_size").unwrap() as u32,
@@ -78,7 +79,7 @@ fn main() {
             let hf_pt = media::Patches { values: hf, positions, grid: pt.grid, soft_tokens: item["soft_tokens"].as_u64().unwrap() as u32 };
             ours = Box::new(pt);
             theirs_input = Box::new(hf_pt);
-        } else if m.processor == "waveform_frames" {
+        } else if m.processor() == Ok(plow_asset::multimodal::Processor::WaveformFrames) {
             let frame = m.param("frame_samples").unwrap() as usize;
             let (samples, rate) = media::decode_wav(&bytes).unwrap();
             let samples = media::resample(&samples, rate, m.param("sample_rate").unwrap() as u32);
@@ -123,28 +124,78 @@ fn main() {
                 plowrt::serve::mm::encoder::Encoder::load(&pkt.with_file_name(&m.packet), 0).expect("encoder")
             });
             let hf_rows = read_f32(&dir, &item["encoded"]);
-            let mut run = |label: &str, input: &dyn std::any::Any| {
-                let rows = if kind == "image" {
-                    let p = input.downcast_ref::<media::Patches>().unwrap();
-                    enc.encode_images(&[p]).unwrap().remove(0)
-                } else {
-                    let mel = input.downcast_ref::<media::Mel>().unwrap();
-                    let tokens = if m.processor == "waveform_frames" { mel.valid_frames } else { media::audio_tokens(mel.valid_frames, m.param("subsample").unwrap_or(4) as usize) };
-                    enc.encode_audio(mel, tokens).unwrap()
-                };
+            let mut run = |label: &str, input: &Input| {
+                let rows = encode_one(enc, m, input);
                 let same = rows.len() == hf_rows.len();
                 let (cos, rel, maxd) = if same { stats(&rows, &hf_rows) } else { (0.0, f64::NAN, f64::NAN) };
                 // bf16 towers: rows agree to bf16 noise accumulated over the layers.
                 let pass = same && cos > 0.995 && rel < 0.1;
                 line[label] = serde_json::json!({ "pass": pass, "rows": rows.len() / contract.hidden as usize, "cosine": cos, "rel_l2": rel, "max_abs": maxd });
-                pass
+                (pass, rows)
             };
-            ok &= run("encode_hf_input", theirs_input.as_ref());
-            ok &= run("encode_own_input", ours.as_ref());
+            ok &= run("encode_hf_input", theirs_input.as_ref()).0;
+            let (pass, rows) = run("encode_own_input", ours.as_ref());
+            ok &= pass;
+            firsts.push((kind.to_string(), m.clone(), ours, rows));
         }
         println!("{line}");
+    }
+    if encode {
+        // Rows are a function of the input alone: the same bits re-encoded in reverse order (after
+        // other rungs ran), and with every modality's encoder running concurrently on its own
+        // thread, as the server runs them.
+        drop(encoders);
+        let mut reverse_equal = true;
+        let mut fresh: std::collections::HashMap<String, plowrt::serve::mm::encoder::Encoder> = Default::default();
+        for (kind, m, input, rows) in firsts.iter().rev() {
+            let enc = fresh.entry(kind.clone()).or_insert_with(|| {
+                plowrt::serve::mm::encoder::Encoder::load(&pkt.with_file_name(&m.packet), 0).expect("encoder")
+            });
+            reverse_equal &= bits(&encode_one(enc, m, input.as_ref())) == bits(rows);
+        }
+        drop(fresh);
+        let kinds: std::collections::BTreeSet<&str> = firsts.iter().map(|f| f.0.as_str()).collect();
+        let concurrent_equal = std::thread::scope(|s| {
+            let handles: Vec<_> = kinds
+                .iter()
+                .map(|&kind| {
+                    let (firsts, pkt) = (&firsts, &pkt);
+                    s.spawn(move || {
+                        let mut enc: Option<plowrt::serve::mm::encoder::Encoder> = None;
+                        firsts.iter().filter(|f| f.0 == kind).all(|(_, m, input, rows)| {
+                            let e = enc.get_or_insert_with(|| {
+                                plowrt::serve::mm::encoder::Encoder::load(&pkt.with_file_name(&m.packet), 0).expect("encoder")
+                            });
+                            bits(&encode_one(e, m, input.as_ref())) == bits(rows)
+                        })
+                    })
+                })
+                .collect();
+            handles.into_iter().all(|h| h.join().unwrap())
+        });
+        ok &= reverse_equal && concurrent_equal;
+        println!("{}", serde_json::json!({ "determinism": { "pass": reverse_equal && concurrent_equal, "reverse_order_identical": reverse_equal, "concurrent_identical": concurrent_equal } }));
     }
     if !ok {
         std::process::exit(1);
     }
+}
+
+type Input = dyn std::any::Any + Send + Sync;
+
+fn bits(v: &[f32]) -> Vec<u32> {
+    v.iter().map(|x| x.to_bits()).collect()
+}
+
+fn encode_one(enc: &mut plowrt::serve::mm::encoder::Encoder, m: &plow_asset::multimodal::MmModality, input: &Input) -> Vec<f32> {
+    if let Some(p) = input.downcast_ref::<media::Patches>() {
+        return enc.encode_images(&[p]).unwrap().remove(0);
+    }
+    let mel = input.downcast_ref::<media::Mel>().unwrap();
+    let tokens = if m.processor() == Ok(plow_asset::multimodal::Processor::WaveformFrames) {
+        mel.valid_frames
+    } else {
+        media::audio_tokens(mel.valid_frames, m.param("subsample").unwrap_or(4) as usize)
+    };
+    enc.encode_audio(mel, tokens).unwrap()
 }

@@ -20,10 +20,11 @@ pub mod media;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use parking_lot::Mutex;
-use plow_asset::multimodal::{MmContract, MmModality, ROW_ID_BIT, SLAB_TENSOR, TABLE_TENSOR};
+use plow_asset::multimodal::{MmContract, MmModality, Processor, ROW_ID_BIT, SLAB_TENSOR, TABLE_TENSOR};
 use sha2::{Digest, Sha256};
 
 use crate::serve::openai::{ContentPart, Message};
@@ -100,6 +101,12 @@ impl Slab {
                 ..Default::default()
             }),
         }
+    }
+
+    /// (rows reserved by admitted requests, rows staged on the device, slab rows).
+    pub fn occupancy(&self) -> (u32, u32, u32) {
+        let s = self.state.lock();
+        (s.reserved, s.live.len() as u32, self.rows)
     }
 
     fn reserve(&self, n: u32) -> bool {
@@ -222,13 +229,25 @@ struct Worker {
 }
 
 impl Worker {
-    fn spawn(path: PathBuf, device: u8) -> crate::Result<Self> {
+    fn spawn(path: PathBuf, device: u8, processor: Processor) -> crate::Result<Self> {
         let (tx, rx) = std::sync::mpsc::channel::<Work>();
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
         std::thread::Builder::new()
             .name("mm-encoder".into())
             .spawn(move || {
-                let mut enc = match encoder::Encoder::load(&path, device) {
+                let loaded = encoder::Encoder::load(&path, device).and_then(|e| {
+                    if e.processor() == processor {
+                        Ok(e)
+                    } else {
+                        Err(crate::RuntimeError::Rejected(format!(
+                            "{}: encoder takes {} input but the contract preprocesses with {}; rebuild the packet",
+                            path.display(),
+                            e.processor().name(),
+                            processor.name()
+                        )))
+                    }
+                });
+                let mut enc = match loaded {
                     Ok(e) => {
                         let _ = ready_tx.send(Ok(()));
                         e
@@ -265,6 +284,30 @@ pub struct MmModel {
     device: u8,
     slab: Arc<Slab>,
     workers: Mutex<HashMap<String, Arc<Mutex<Option<Worker>>>>>,
+    pub stats: MmStats,
+}
+
+/// Per-engine media counters for `/metrics` (per request, never per token).
+#[derive(Default)]
+pub struct MmStats {
+    /// Requests refused with 503 because the slab had no room.
+    pub slab_full: AtomicU64,
+    pub image: EncodeStats,
+    pub audio: EncodeStats,
+}
+
+/// Encoder calls and their wall time from submit to rows ready (queueing included), µs.
+#[derive(Default)]
+pub struct EncodeStats {
+    pub calls: AtomicU64,
+    pub micros: AtomicU64,
+}
+
+impl MmStats {
+    fn record(&self, s: &EncodeStats, since: std::time::Instant) {
+        s.calls.fetch_add(1, Ordering::Relaxed);
+        s.micros.fetch_add(since.elapsed().as_micros() as u64, Ordering::Relaxed);
+    }
 }
 
 impl MmModel {
@@ -275,6 +318,7 @@ impl MmModel {
             device,
             slab: Arc::new(Slab::new(contract)),
             workers: Mutex::new(HashMap::new()),
+            stats: MmStats::default(),
         }
     }
 
@@ -290,7 +334,8 @@ impl MmModel {
         let cell = Arc::clone(self.workers.lock().entry(m.kind.clone()).or_default());
         let mut w = cell.lock();
         if w.is_none() {
-            *w = Some(Worker::spawn(self.dir.join(&m.packet), self.device)?);
+            let processor = m.processor().map_err(crate::RuntimeError::Rejected)?;
+            *w = Some(Worker::spawn(self.dir.join(&m.packet), self.device, processor)?);
         }
         Ok(w.as_ref().unwrap().tx.clone())
     }
@@ -370,8 +415,13 @@ fn prepare_one(part: &ContentPart, contract: &MmContract, limits: &Limits) -> Re
     let modality = contract
         .modality(kind)
         .ok_or_else(|| MmError::bad(format!("unsupported content type for this model: {kind}")))?;
-    match part {
-        ContentPart::ImageUrl { image_url: crate::serve::openai::ImageUrl { url, .. } } | ContentPart::InputImage { image_url: url } => {
+    // Validated when the packet loaded; the kind of each processor matches its modality's.
+    let processor = modality.processor().map_err(|e| MmError { status: 500, message: e })?;
+    match (part, processor) {
+        (
+            ContentPart::ImageUrl { image_url: crate::serve::openai::ImageUrl { url, .. } } | ContentPart::InputImage { image_url: url },
+            Processor::AspectPatches,
+        ) => {
             if url.starts_with("http://") || url.starts_with("https://") {
                 return Err(MmError::bad("image URLs must be data: URLs; this server does not fetch http(s) media"));
             }
@@ -380,29 +430,27 @@ fn prepare_one(part: &ContentPart, contract: &MmContract, limits: &Limits) -> Re
             let patches = media::image_patches(&img, &patch_params(modality)?).map_err(MmError::bad)?;
             Ok(Prepared::Image(patches, digest(kind, &img.data)))
         }
-        ContentPart::InputAudio { input_audio } => {
+        (ContentPart::InputAudio { input_audio }, Processor::SemicausalLogMel | Processor::WaveformFrames) => {
             let format = input_audio.format.as_deref().unwrap_or("wav").to_ascii_lowercase();
-            if format != "wav" {
-                return Err(MmError::bad(format!("input_audio format {format:?} is not supported; send wav")));
-            }
             let bytes = media::base64_decode(&input_audio.data).map_err(MmError::bad)?;
-            audio(&bytes, modality, limits, kind)
+            let (samples, rate) = media::decode_audio(&bytes, &format, limits.max_audio_seconds).map_err(MmError::bad)?;
+            audio(samples, rate, modality, processor, limits, kind)
         }
-        ContentPart::AudioUrl { audio_url } => {
+        (ContentPart::AudioUrl { audio_url }, Processor::SemicausalLogMel | Processor::WaveformFrames) => {
             if audio_url.url.starts_with("http://") || audio_url.url.starts_with("https://") {
                 return Err(MmError::bad("audio URLs must be data: URLs; this server does not fetch http(s) media"));
             }
-            let (_, bytes) = media::data_url(&audio_url.url).map_err(MmError::bad)?;
-            audio(&bytes, modality, limits, kind)
+            let (mime, bytes) = media::data_url(&audio_url.url).map_err(MmError::bad)?;
+            let (samples, rate) = media::decode_audio(&bytes, media::mime_audio_format(&mime), limits.max_audio_seconds).map_err(MmError::bad)?;
+            audio(samples, rate, modality, processor, limits, kind)
         }
-        _ => Err(MmError::bad("not a media part")),
+        (_, p) => Err(MmError::bad(format!("a {kind} part cannot use the {} processor", p.name()))),
     }
 }
 
-fn audio(bytes: &[u8], m: &MmModality, limits: &Limits, kind: &str) -> Result<Prepared, MmError> {
-    let (samples, rate) = media::decode_wav(bytes).map_err(MmError::bad)?;
+fn audio(samples: Vec<f32>, rate: u32, m: &MmModality, processor: Processor, limits: &Limits, kind: &str) -> Result<Prepared, MmError> {
     let seconds = samples.len() as f64 / f64::from(rate.max(1));
-    if m.processor == "waveform_frames" {
+    if processor == Processor::WaveformFrames {
         let u = |k: &str| m.param(k).map(|v| v as usize).ok_or_else(|| MmError::bad(format!("audio contract lacks {k}")));
         let (sample_rate, frame) = (u("sample_rate")? as u32, u("frame_samples")?);
         let cap = (u("max_soft_tokens")? * frame) as f64 / f64::from(sample_rate);
@@ -534,54 +582,72 @@ pub async fn expand(
     Ok(Some(Pending { prepared, ids }))
 }
 
-/// Encode `pending` on `mm`'s encoders (its engine's device) and reserve its rows in `mm`'s slab.
+/// Reserve `pending`'s rows in `mm`'s slab, then encode it on `mm`'s encoders (its engine's
+/// device). The reservation is taken first so a full slab refuses before any encoder work, and
+/// it is held by the job from then on: a cancelled or failed request returns it on drop.
 pub async fn encode(mm: &MmModel, pending: Pending) -> Result<Box<MmJob>, MmError> {
     let Pending { prepared, ids } = pending;
     let contract = &mm.contract;
-    // All images in one batch per launch rung, each clip on its own.
-    let mut rows: Vec<Option<Vec<f32>>> = vec![None; prepared.len()];
-    let image_items: Vec<(usize, media::Patches)> = prepared
-        .iter()
-        .enumerate()
-        .filter_map(|(i, p)| match p {
-            Prepared::Image(patches, _) => Some((
-                i,
-                media::Patches {
-                    values: patches.values.clone(),
-                    positions: patches.positions.clone(),
-                    grid: patches.grid,
-                    soft_tokens: patches.soft_tokens,
-                },
-            )),
-            _ => None,
-        })
-        .collect();
+    let total: usize = ids.iter().map(Vec::len).sum();
+    let n = u32::try_from(total).unwrap_or(u32::MAX);
+    if n > mm.slab.rows {
+        return Err(MmError::bad(format!(
+            "the media need {total} soft-token rows; this model holds at most {} per request; send fewer or smaller items",
+            mm.slab.rows
+        )));
+    }
+    if !mm.slab.reserve(n) {
+        mm.stats.slab_full.fetch_add(1, Ordering::Relaxed);
+        return Err(MmError::busy(format!("multimodal rows are full ({} rows in flight); retry", mm.slab.rows)));
+    }
+    let mut job = Box::new(MmJob { ids: Vec::new(), rows: Vec::new(), slab: Arc::clone(&mm.slab), reserved: n, staged: false });
     let encode_err = |e: crate::RuntimeError| MmError { status: 500, message: format!("encoder failed: {e}") };
-    if !image_items.is_empty() {
-        let m = contract.modality("image").unwrap();
-        let tx = mm.worker(m).map_err(encode_err)?;
+    // All images in one batch per launch rung, each clip on its own; both encoders start before
+    // either is awaited.
+    let mut image_index = Vec::new();
+    let mut images = Vec::new();
+    let mut clips = Vec::new();
+    for (i, p) in prepared.into_iter().enumerate() {
+        match p {
+            Prepared::Image(patches, _) => {
+                image_index.push(i);
+                images.push(patches);
+            }
+            Prepared::Audio(mel, tokens, _) => clips.push((i, mel, tokens)),
+        }
+    }
+    let started = std::time::Instant::now();
+    let image_rx = match images.is_empty() {
+        true => None,
+        false => {
+            let tx = mm.worker(contract.modality("image").unwrap()).map_err(encode_err)?;
+            let (reply, rx) = tokio::sync::oneshot::channel();
+            tx.send(Work::Images(images, reply)).map_err(|_| MmError::busy("image encoder is unavailable"))?;
+            Some(rx)
+        }
+    };
+    let mut clip_rx = Vec::with_capacity(clips.len());
+    for (i, mel, tokens) in clips {
+        let tx = mm.worker(contract.modality("audio").unwrap()).map_err(encode_err)?;
         let (reply, rx) = tokio::sync::oneshot::channel();
-        let (index, items): (Vec<usize>, Vec<media::Patches>) = image_items.into_iter().unzip();
-        tx.send(Work::Images(items, reply)).map_err(|_| MmError::busy("image encoder is unavailable"))?;
+        tx.send(Work::Audio(mel, tokens, reply)).map_err(|_| MmError::busy("audio encoder is unavailable"))?;
+        clip_rx.push((i, rx));
+    }
+    let mut rows: Vec<Option<Vec<f32>>> = vec![None; ids.len()];
+    if let Some(rx) = image_rx {
         let out = rx.await.map_err(|_| MmError::busy("image encoder is unavailable"))?.map_err(encode_err)?;
-        for (i, r) in index.into_iter().zip(out) {
+        mm.stats.record(&mm.stats.image, started);
+        for (i, r) in image_index.into_iter().zip(out) {
             rows[i] = Some(r);
         }
     }
-    for (i, p) in prepared.iter().enumerate() {
-        if let Prepared::Audio(mel, tokens, _) = p {
-            let m = contract.modality("audio").unwrap();
-            let tx = mm.worker(m).map_err(encode_err)?;
-            let (reply, rx) = tokio::sync::oneshot::channel();
-            let mel = media::Mel { values: mel.values.clone(), frames: mel.frames, valid_frames: mel.valid_frames };
-            tx.send(Work::Audio(mel, *tokens, reply)).map_err(|_| MmError::busy("audio encoder is unavailable"))?;
-            rows[i] = Some(rx.await.map_err(|_| MmError::busy("audio encoder is unavailable"))?.map_err(encode_err)?);
-        }
+    for (i, rx) in clip_rx {
+        rows[i] = Some(rx.await.map_err(|_| MmError::busy("audio encoder is unavailable"))?.map_err(encode_err)?);
+        mm.stats.record(&mm.stats.audio, started);
     }
     let hidden = contract.hidden as usize;
-    let total: usize = ids.iter().map(Vec::len).sum();
-    let mut job_ids = Vec::with_capacity(total);
-    let mut job_rows = Vec::with_capacity(total * hidden);
+    job.ids.reserve_exact(total);
+    job.rows.reserve_exact(total * hidden);
     for (ids, r) in ids.iter().zip(rows) {
         let r = r.unwrap_or_default();
         if r.len() != ids.len() * hidden {
@@ -590,14 +656,10 @@ pub async fn encode(mm: &MmModel, pending: Pending) -> Result<Box<MmJob>, MmErro
                 message: format!("encoder returned {} values for {} soft tokens of width {hidden}", r.len(), ids.len()),
             });
         }
-        job_ids.extend(ids);
-        job_rows.extend(r.iter().map(|v| bf16_bits(*v)));
+        job.ids.extend(ids);
+        job.rows.extend(r.iter().map(|v| bf16_bits(*v)));
     }
-    let n = total as u32;
-    if !mm.slab.reserve(n) {
-        return Err(MmError::busy(format!("multimodal rows are full ({} in flight); retry", mm.slab.rows)));
-    }
-    Ok(Box::new(MmJob { ids: job_ids, rows: job_rows, slab: Arc::clone(&mm.slab), reserved: n, staged: false }))
+    Ok(job)
 }
 
 #[cfg(test)]
@@ -712,6 +774,42 @@ mod tests {
         assert!(!rank1.reserve(4), "the new engine holds it");
         rank1.stage(&mut j, &[id, 1], write_to(&dev1)).unwrap();
         assert_eq!(&dev1.borrow().0[10..12], &[id, 0]);
+    }
+
+    fn run<T>(f: impl std::future::Future<Output = T>) -> T {
+        tokio::runtime::Builder::new_current_thread().build().unwrap().block_on(f)
+    }
+
+    #[test]
+    fn slab_refusals_come_before_encoder_work_and_return_their_rows() {
+        let mm = MmModel::new(Path::new("/nonexistent"), &contract(), 0);
+        let pending = |n: usize| Pending { prepared: Vec::new(), ids: vec![(0..n as u32).map(|k| ROW_ID_BIT | (k + 2)).collect()] };
+        let err = run(encode(&mm, pending(5))).err().unwrap();
+        assert_eq!(err.status, 400, "more rows than the slab holds never fit: {}", err.message);
+        assert!(mm.slab.reserve(3));
+        let err = run(encode(&mm, pending(2))).err().unwrap();
+        assert_eq!((err.status, mm.stats.slab_full.load(Ordering::Relaxed)), (503, 1), "{}", err.message);
+        mm.slab.release(&[], false, 3);
+        // Admitted, then the encoder step fails (no rows here): the reservation is returned.
+        let err = run(encode(&mm, pending(4))).err().unwrap();
+        assert_eq!(err.status, 500, "{}", err.message);
+        assert_eq!(mm.slab.occupancy(), (0, 0, 4));
+    }
+
+    #[test]
+    fn occupancy_tracks_reservations_and_staged_rows() {
+        let slab = Arc::new(Slab::new(&contract()));
+        let dev = device();
+        let mut a = job(&slab, &[0x8000_0005, 0x8000_0006]);
+        assert_eq!(slab.occupancy(), (2, 0, 4));
+        slab.stage(&mut a, &[], write_to(&dev)).unwrap();
+        let mut b = job(&slab, &[0x8000_0006]);
+        slab.stage(&mut b, &[], write_to(&dev)).unwrap();
+        assert_eq!(slab.occupancy(), (3, 2, 4), "a shared id stages once");
+        drop(a);
+        assert_eq!(slab.occupancy(), (1, 1, 4));
+        drop(b);
+        assert_eq!(slab.occupancy(), (0, 0, 4), "no rows leak");
     }
 
     #[test]

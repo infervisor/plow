@@ -27,10 +27,9 @@ pub fn read_section(pkt: &Path) -> Result<Option<Vec<u8>>> {
 /// The packet's multimodal contract, when it carries one.
 pub fn read_multimodal(pkt: &Path) -> Result<Option<plow_asset::multimodal::MmContract>> {
     let Some(bytes) = read_named_section(pkt, plow_asset::multimodal::SECTION)? else { return Ok(None) };
-    let contract: plow_asset::multimodal::MmContract = serde_json::from_slice(&bytes)
-        .map_err(|e| RuntimeError::Device(format!("{}: multimodal contract: {e}", pkt.display())))?;
-    contract.validate().map_err(|e| RuntimeError::Device(format!("{}: {e}", pkt.display())))?;
-    Ok(Some(contract))
+    plow_asset::multimodal::MmContract::from_json(&bytes)
+        .map(Some)
+        .map_err(|e| RuntimeError::Device(format!("{}: {e}", pkt.display())))
 }
 
 /// A metadata section's bytes, read from the section directory without loading the packet.

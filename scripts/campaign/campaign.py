@@ -80,6 +80,29 @@ def sha(path: Path) -> str:
     return h.hexdigest()
 
 
+def private_runtime(plowrt: Path, out: Path) -> Path:
+    """Copy plowrt to out/plowrt with the shared libraries beside it (and in ../lib), which plowrt
+    loads before the system's: a bundle's cuBLASLt (the 26B packets require >= 13.4) lives there.
+    Libraries are hardlinked when the filesystem allows (cuBLASLt is ~500 MB)."""
+    private = out / "plowrt"
+    if private.exists() and private.resolve() == plowrt.resolve():
+        return private
+    if private.exists():
+        private.unlink()
+    shutil.copy2(plowrt, private)
+    private.chmod(0o755)
+    for d in (plowrt.parent, plowrt.parent.parent / "lib"):
+        for lib in sorted(d.glob("lib*.so*")) if d.is_dir() else []:
+            dest = out / lib.name
+            if dest.exists() or not lib.is_file():
+                continue
+            try:
+                os.link(lib.resolve(), dest)
+            except OSError:
+                shutil.copy2(lib, dest)
+    return private
+
+
 def execution_artifacts(runtime: Path, assets: Path, recipe: Path, env: dict) -> dict:
     """Observed files/configuration, not a claim of complete kernel/precision identity."""
     objects = assets.parent / "objects"
@@ -775,9 +798,7 @@ def cmd_bench(a: argparse.Namespace) -> None:
         die(f"{assets}/model.pkt missing")
     plowrt = Path(serve.get("plowrt", str(REPO / "target" / "release" / "plowrt"))).resolve()
     # A private copy: the shared target/release binary can be rebuilt by another agent mid-run.
-    private = out / "plowrt"
-    private.write_bytes(plowrt.read_bytes())
-    private.chmod(0o755)
+    private = private_runtime(plowrt, out)
 
     env = env_with(os.environ, serve.get("env", {}))
     # The one variable of an A/B, named on the command line so the record carries it.
@@ -941,13 +962,10 @@ def cmd_probe(a: argparse.Namespace) -> None:
     selected = out / "cublaslt_selected.jsonl"
     selected.unlink(missing_ok=True)
     plowrt = Path(getattr(a, "plowrt", None) or serve.get("plowrt", str(REPO / "target" / "release" / "plowrt"))).resolve()
-    private = out / "plowrt"
-    private.write_bytes(plowrt.read_bytes())
-    private.chmod(0o755)
     # plowrt binds the cuBLASLt beside it first: the probe must select with the library it serves with.
-    for lib in sorted({*plowrt.parent.glob("libcublasLt.so*"), *(plowrt.parent.parent / "lib").glob("libcublasLt.so*")}):
-        (out / lib.name).unlink(missing_ok=True)
-        shutil.copy2(lib, out / lib.name)
+    for lib in out.glob("lib*.so*"):
+        lib.unlink()
+    private = private_runtime(plowrt, out)
     env = env_with(os.environ, serve.get("env", {}))
     objects = assets.parent / "objects"
     if "objects" in r and "PLOW_LT_ALGOS_WRITE" not in env and objects.is_dir():
@@ -1371,7 +1389,15 @@ def cmd_sweep(a: argparse.Namespace) -> None:
 # `timeout_s`. Placeholders as in `build`, plus {assets}, {target} (cargo target dir) and {out}.
 # A table named <kind>_<suffix> (e.g. [gates.llm_fp32_ref_long], a second reference set) runs as
 # another gate of that kind, in out/<kind>_<suffix>/.
-GATE_KINDS = ("llm_logit_parity", "llm_fp32_ref", "asr_wer", "tts_cer", "s3gen_rel_l2", "vad_parity")
+#   mm_parity         reference (dir of `scripts/mm/hf_ref.py all`: ref.json + arrays; built in this
+#                     lease before the server starts when ref.json is missing, from hf_dir, images,
+#                     audio, cases [, hf_python]); served chat cases vs HF (`scripts/mm/gate.py`:
+#                     prompt-token equality, greedy match, repeat stability, media collisions;
+#                     min_prefix, tie_margin, repeats, max_new), error paths (`scripts/mm/refusals.py`:
+#                     refusal_image, refusal_audio, compressed), and after the server stops the encoder
+#                     sidecars vs HF rows (`mm_check`, `runner`; encoder = false skips it):
+#                     cases_pass_min (default all), refusals, encoder
+GATE_KINDS = ("llm_logit_parity", "llm_fp32_ref", "asr_wer", "tts_cer", "s3gen_rel_l2", "vad_parity", "mm_parity")
 
 
 def gate_kind(key: str) -> str | None:
@@ -1433,7 +1459,41 @@ def gate_steps(key: str, g: dict, py: str, out: Path, assets: Path) -> tuple[lis
                     f"--threshold {float(g.get('threshold', 0.5))} "
                     f"--max-dp {float(g.get('max_dp_max', 1e-4))} --min-agree {float(g.get('agree_min', 0.999))} {args} "
                     f"> {d}/check.log 2>&1"]
+    if kind == "mm_parity":
+        ref = q(g["reference"])
+        flags = " ".join(f"--{k.replace('_', '-')} {q(str(g[k]))}" for k in ("min_prefix", "tie_margin", "repeats", "max_new") if k in g)
+        up = [f"{q(py)} {sc('scripts/mm/gate.py')} {ref}/ref.json --base \"http://127.0.0.1:$PB_SERVER_PORT\" --model \"$MODEL\" "
+              f"{flags} {args} > {d}/gate.jsonl 2> {d}/gate.log"]
+        media = "".join(f" --{m} {q(g['refusal_' + m])}" for m in ("image", "audio") if g.get("refusal_" + m))
+        if media or g.get("compressed"):
+            comp = " --compressed " + " ".join(q(p) for p in g["compressed"]) if g.get("compressed") else ""
+            up.append(f"{q(py)} {sc('scripts/mm/refusals.py')} \"http://127.0.0.1:$PB_SERVER_PORT\" \"$MODEL\"{media}{comp} "
+                      f"> {d}/refusals.jsonl 2>&1")
+        if not g.get("encoder", True):
+            return up, []
+        runner = g.get("runner") or os.environ.get("CARGO_TARGET_DIR", str(REPO / "target")) + "/release/examples/mm_check"
+        if not Path(runner).exists():
+            die(f"{runner} missing: cargo build --release -p plowrt --features cuda --example mm_check")
+        return up, [f"{q(runner)} {ref} {q(str(assets / 'model.pkt'))} --encode > {d}/mm_check.jsonl 2> {d}/mm_check.err"]
     die(f"unknown gate kind {kind}")
+
+
+def gate_pre(key: str, g: dict, out: Path) -> list[str]:
+    """Steps before the server starts (the GPU is free): an mm_parity HF reference not yet built."""
+    if gate_kind(key) != "mm_parity":
+        return []
+    q = shlex.quote
+    ref = Path(g["reference"])
+    if (ref / "ref.json").is_file():
+        return []
+    missing = [k for k in ("hf_dir", "cases") if not g.get(k)] + ([] if g.get("images") or g.get("audio") else ["images/audio"])
+    if missing:
+        die(f"[gates.{key}] {ref}/ref.json missing and no {', '.join(missing)} to build it (scripts/mm/hf_ref.py all)")
+    py = q(g.get("hf_python") or "python3")
+    media = "".join(f" --image {q(p)}" for p in g.get("images", [])) + "".join(f" --audio {q(p)}" for p in g.get("audio", []))
+    cases = g["cases"] if Path(g["cases"]).is_absolute() else str(REPO / g["cases"])
+    return [f"{py} {q(str(REPO / 'scripts/mm/hf_ref.py'))} all --ckpt {q(g['hf_dir'])} --out {q(str(ref))}{media} "
+            f"--cases {q(cases)} --max-new {int(g.get('max_new', 48))} > {q(str(out / key / 'hf_ref.log'))} 2>&1"]
 
 
 def fp32_ref_module():
@@ -1508,6 +1568,37 @@ def gate_score(key: str, g: dict, d: Path) -> dict:
         lim("max_dp", par["max_dp"], "max_dp_max")
         lim("agree", par["agree"], "agree_min", upper=False)
         res.update(mean_dp=par["mean_dp"], flips=len(par["flips"]), frames=par["frames"], clips=len(par["clips"]))
+    elif kind == "mm_parity":
+        rows = [json.loads(ln) for ln in txt("gate.jsonl").splitlines() if ln.startswith("{")]
+        cases = [r for r in rows if "case" in r]
+        if not cases:
+            return {"pass": False, "why": ["no gate.py cases (see gate.log)"]}
+        res.update(cases=len(cases), cases_pass=sum(r["pass"] for r in cases),
+                   prompt_tokens_equal=sum(r["prompt_tokens"] == r["hf_prompt_tokens"] for r in cases),
+                   exact=sum(r["exact"] for r in cases), repeat_stable=sum(r.get("repeat_stable", r.get("repeat_equal")) for r in cases))
+        lim("cases_pass", res["cases_pass"], "cases_pass_min", upper=False)
+        if "cases_pass_min" not in g and res["cases_pass"] < len(cases):
+            why.append("failed cases: " + ", ".join(r["case"] for r in cases if not r["pass"]))
+        if any("media_collision" in r for r in rows):
+            why.append("media collisions: " + ", ".join("/".join(r["media_collision"]) for r in rows if "media_collision" in r))
+        if (d / "refusals.jsonl").is_file() or g.get("refusal_image") or g.get("refusal_audio") or g.get("compressed"):
+            ref_rows = [json.loads(ln) for ln in txt("refusals.jsonl").splitlines() if ln.startswith("{")]
+            res["refusals_pass"] = sum(r["pass"] for r in ref_rows)
+            res["refusals"] = len(ref_rows)
+            if not ref_rows or res["refusals_pass"] < len(ref_rows):
+                why.append("refusals: " + (", ".join(r["case"] for r in ref_rows if not r["pass"]) or "none ran (see refusals.jsonl)"))
+        if g.get("encoder", True):
+            items = [json.loads(ln) for ln in txt("mm_check.jsonl").splitlines() if ln.startswith("{")]
+            checks = [v for it in items for k, v in it.items() if isinstance(v, dict) and "pass" in v]
+            res["encoder_checks_pass"] = sum(c["pass"] for c in checks)
+            res["encoder_checks"] = len(checks)
+            cos = [c["cosine"] for c in checks if "cosine" in c]
+            if cos:
+                res["encoder_cosine_min"] = min(cos)
+            if not checks or res["encoder_checks_pass"] < len(checks):
+                why.append("encoder parity: " + (", ".join(f"item {it['item']}" for it in items
+                                                           if not all(v["pass"] for v in it.values() if isinstance(v, dict) and "pass" in v))
+                                                  or "no mm_check output (see mm_check.err)"))
     res["pass"] = not why
     res["why"] = why
     return res
@@ -1544,10 +1635,10 @@ def cmd_gate(a: argparse.Namespace) -> None:
         packet_env(r, assets, full)
         env.update({k: full[k] for k in ("PLOW_PF_SEG_DIR", "PLOW_LT_ALGOS") if k in full})
         plowrt = Path(a.plowrt or serve.get("plowrt") or Path(target) / "release" / "plowrt").resolve()
-        shutil.copy2(plowrt, out / "plowrt")
+        private_runtime(plowrt, out)
         lines = ["#!/usr/bin/env bash", "set -u", "source " + shlex.quote(str(REPO / "scripts/bench/plowbench.sh"))]
         lines += [f"export {k}={shlex.quote(v)}" for k, v in sorted(env.items())]
-        up, down = [], []
+        before, up, down = [], [], []
         for k in kinds:
             (out / k).mkdir(exist_ok=True)
             py = x(cfg[k].get("python") or gates.get("python") or "python3")
@@ -1557,8 +1648,10 @@ def cmd_gate(a: argparse.Namespace) -> None:
             genv = " ".join(f"{q}={shlex.quote(x(v))}" for q, v in cfg[k].get("env", {}).items())
             pre = f"env {genv} " if genv else ""
             tag = lambda step: f"{pre}{step} || echo 'GATE_STEP_FAIL {k}'"
+            before += [tag(s) for s in gate_pre(k, cfg[k], out)]
             up += [tag(s) for s in s1]
             down += [tag(s) for s in s2]
+        lines += before
         if up:
             lines += ["PB_SERVER_PORT=$(pb_free_port)",
                       "PB_SERVER_LOG=" + shlex.quote(str(out / "serve.log")),

@@ -301,12 +301,22 @@ only that metadata. It has no per-model code, so adding a model means emitting i
 - **Request parts.**
   - `image_url` and `input_image` accept `data:` URLs only. `http(s)` URLs get 400; the server has
     no fetcher.
-  - `input_audio` accepts `format: "wav"` (any rate, resampled; channels mixed to mono). Other
-    formats get 400.
+  - `input_audio` accepts `format` `wav` (hound), `mp3`, `flac` and `ogg` (Vorbis), the last three
+    decoded by symphonia (pure Rust). Any rate is resampled, and channels are mixed to mono. The
+    label is a hint: the container decides, and an `audio_url` data URL with no known mime type is
+    sniffed. Other formats (`opus`, `aac`, `webm`, ...) get 400. Compressed clips stop decoding at
+    `PLOW_MM_MAX_AUDIO_SECONDS`, so a small body cannot expand without bound.
   - Text-only requests render the template exactly as before.
 - **Unsupported.** A model without a matching tower answers 400
   `unsupported content type for this model: <kind>`.
 - **Discovery.** `/v1/models` cards carry `x_plow_modalities` (`["text","image","audio"]`).
+- **The contract fails closed.** The packet loads only if every modality names a processor plowrt
+  implements for its kind (`aspect_patches` for images; `semicausal_log_mel` or `waveform_frames`
+  for audio), with every required parameter and no parameter plowrt does not implement. Resample
+  must be PIL bicubic, and the version must be 1. The version is read before the body. Each
+  refusal names the fix: upgrade plowrt or rebuild the packet. The encoder sidecar must take the
+  input its processor makes (vision, log-mel or frames); this is checked when the encoder first
+  loads. Request handling dispatches on the validated processor, never on a string.
 - **Preprocessing** runs on the CPU from the contract's parameters. Images get an
   aspect-preserving resize (Pillow bicubic, fixed point), then patches. Audio becomes a
   semicausal log-mel spectrogram. The template's placeholder expands to
@@ -315,14 +325,26 @@ only that metadata. It has no per-model code, so adding a model means emitting i
   (kind, media bytes, row). The LM's `Embed` maps those ids to the pad row. `MmRowsBf16` then
   replaces each of those rows with the encoder's projected row, which a per-engine slab holds
   (`in.mm_slab` plus the hash table `in.mm_table`).
-  - Rows are reserved at submit, staged before the launch and released when the job ends. A full
-    slab answers 503.
+  - Rows are reserved at submit, before any encoder work, staged before the launch, and released
+    when the job ends. Cancelled and failed requests release them too.
+  - A full slab answers 503 with `Retry-After: 1`. A request whose media need more rows than the
+    whole slab answers 400, since a retry cannot succeed.
+  - `/metrics` reports, per engine: `plowrt_mm_slab_rows`, `_slab_rows_reserved`,
+    `_slab_rows_staged`, `plowrt_mm_slab_full_total`, and `plowrt_mm_encode_total` /
+    `plowrt_mm_encode_seconds_total{kind}`. Encode time is measured from submit to rows ready,
+    queueing included. When idle, both occupancy gauges must read 0.
+  - Images and audio of one request are encoded concurrently, on their own encoder threads.
   - Each engine instance (a model, or one DP rank) owns its slab and its encoders. Encoding runs
     after rank selection, on that rank's device. Both are dropped when the engine unloads.
   - Before launch, every bit-31 id in the prompt must be in the serving engine's table. Otherwise
     the request fails; it is never served the pad row.
   - Because the ids hash the media, the prefix cache and session keys see different images as
     different prompts. Token-batch, mixed-step and the VMM prefix cache all keep working.
+  - A cached prompt reuses the KV of its media rows, so its encoder rows are not read again.
+    Greedy tokens depend on how the prompt was split into prefill chunks (cold, or after a cache
+    hit of N blocks), exactly as for text. The same split gives bit-identical logprobs; a
+    different split moves them by bf16 rounding (|Δlogprob| ≤ 0.17 measured), which flips a
+    near-tie token ([gemma4-e4b-h100.md](runtime/gemma4-e4b-h100.md#images-and-audio-experimental-plow_emit_multimodal1)).
 - **Limits.** These answer 400: `PLOW_MM_MAX_IMAGES` (8), `PLOW_MM_MAX_AUDIO` (4),
   `PLOW_MM_MAX_IMAGE_PIXELS` (40M) and `PLOW_MM_MAX_AUDIO_SECONDS` (30).
 - **Streaming, logprobs and tools** are unchanged: media only changes prompt ids.
