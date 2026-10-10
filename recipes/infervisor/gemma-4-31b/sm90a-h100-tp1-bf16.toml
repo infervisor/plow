@@ -95,6 +95,8 @@ PLOW_VMM_LIVE_RINGS = "0"
 PLOW_MULTISTEP = "0"
 PLOW_DECODE_MAX_RUNG = "8"
 PLOW_TOKEN_BATCH = "1"
+# The default queue is four batches (32 here): c128 clients got 351/384 requests refused with 429.
+PLOW_MAX_QUEUED_REQUESTS = "512"
 
 [bench]
 backend = "openai"

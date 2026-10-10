@@ -742,6 +742,7 @@ pub const RAW_ENV: &[KnobSpec] = &[
     KnobSpec::new("env.PLOW_VMM_PUBLISH_SHARED", Some("PLOW_VMM_PUBLISH_SHARED"), Layer::RawEnv, Domain::Str, UNSET, DIAG),
     KnobSpec::new("env.PLOW_VMM_LIVE", Some("PLOW_VMM_LIVE"), Layer::RawEnv, Domain::Str, UNSET, DIAG),
     KnobSpec::new("env.PLOW_VMM_LIVE_RINGS", Some("PLOW_VMM_LIVE_RINGS"), Layer::RawEnv, Domain::Str, UNSET, DIAG),
+    KnobSpec::new("env.PLOW_MAX_QUEUED_REQUESTS", Some("PLOW_MAX_QUEUED_REQUESTS"), Layer::RawEnv, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("env.PLOW_VMM_PREFIX", Some("PLOW_VMM_PREFIX"), Layer::RawEnv, Domain::Str, UNSET, DIAG),
 ];
 
