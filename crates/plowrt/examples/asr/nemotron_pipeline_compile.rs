@@ -260,7 +260,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &frame_transform,
         trailing_encoder_frames,
     )?;
-    std::fs::write(&args[3], packets.model.to_blob_v6(&[section, packets.vocabulary_section()?]))?;
+    devgen::install_sidecar_verifier(Box::new(|requests| match lean_verify::call_batch_bound(requests) {
+        Ok((certs, verifier)) => Ok(Some((
+            certs.iter().map(serde_json::to_value).collect::<Result<_, _>>().map_err(|e| e.to_string())?,
+            verifier,
+        ))),
+        Err(e) if e.is_binary_unusable() => {
+            eprintln!("lean checks skipped: {e}");
+            Ok(None)
+        }
+        Err(e) => Err(e.to_string()),
+    }));
+    // The packet plus `<stem>.lean-checks.json` (logical tensor effects per program).
+    devgen::write_sidecar_packet(Path::new(&args[3]), &packets.model, &[section, packets.vocabulary_section()?]);
     println!(
         "{}",
         serde_json::json!({

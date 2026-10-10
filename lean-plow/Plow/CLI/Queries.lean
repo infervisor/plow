@@ -99,8 +99,8 @@ private def longestPath (edges : List (Nat × Nat)) (durations : List Nat) : Exc
   for (a, b) in edges do
     unless a < n && b < n do
       throw s!"edge ({a}, {b}) is outside {n} tasks"
-    successors := successors.setD a ((successors.getD a #[]).push b)
-    indegree := indegree.setD b (indegree.getD b 0 + 1)
+    successors := successors.setIfInBounds a ((successors.getD a #[]).push b)
+    indegree := indegree.setIfInBounds b (indegree.getD b 0 + 1)
   let mut ready := (Array.range n).filter fun i => indegree.getD i 0 == 0
   let mut cursor := 0
   let mut finish := durArr
@@ -110,10 +110,10 @@ private def longestPath (edges : List (Nat × Nat)) (durations : List Nat) : Exc
     cursor := cursor + 1
     ms := Nat.max ms (finish.getD a 0)
     for b in successors.getD a #[] do
-      finish := finish.setD b (Nat.max (finish.getD b 0)
+      finish := finish.setIfInBounds b (Nat.max (finish.getD b 0)
         (finish.getD a 0 + durArr.getD b 0))
       let remaining := indegree.getD b 0 - 1
-      indegree := indegree.setD b remaining
+      indegree := indegree.setIfInBounds b remaining
       if remaining == 0 then ready := ready.push b
   unless cursor == n do throw "task graph contains a cycle"
   return ms

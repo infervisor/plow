@@ -57,6 +57,21 @@ echo
 echo "[4] artifacts"
 if [ -n "$ASSETS" ]; then
     pb_check_assets "$ASSETS" "${PB_PACKET_SHA16:-}"
+    # Lean qualification (`campaign.py build` writes it; `campaign.py qualify --assets` refreshes).
+    LQ="$ASSETS/../lean-qualification.json"
+    if [ -f "$LQ" ]; then
+        lq=$(python3 -c 'import json,sys
+d=json.load(open(sys.argv[1]))
+if not d.get("checked"): print("unchecked", d.get("reason","")[:120]); sys.exit()
+p=d["packets"]; bad=[e for e in p if not e["qualified"]]
+print("ok" if not bad else "gaps", f"{len(p)-len(bad)}/{len(p)} packets qualify;", "; ".join(e["packet"].rsplit("/",1)[-1]+": "+e["qualification"]["gaps"][0][:100] for e in bad[:3]))' "$LQ")
+        case "$lq" in
+            ok*) pb_ok "lean qualification: ${lq#ok }" ;;
+            *) pb_warn "lean qualification: $lq (structural evidence only; PLOW_LEAN_QUALIFY=strict would refuse)" ;;
+        esac
+    else
+        pb_warn "no lean-qualification.json beside $ASSETS — run campaign.py qualify --assets $ASSETS"
+    fi
 else
     pb_warn "no assets dir given — pass one, or set PB_ASSETS, to check the packet"
 fi

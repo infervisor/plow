@@ -687,6 +687,7 @@ def cmd_build(a: argparse.Namespace) -> None:
     rec["cublaslt"] = lt_record(r, assets) if nvidia else None
     (out / "build-record.json").write_text(json.dumps(rec, indent=1))
     print(f"built {assets}\nrecord {out / 'build-record.json'}", file=sys.stderr)
+    lean_qualify(assets, out / "lean-qualification.json", strict=False)
     if not nvidia:
         return
     # plowc packetized the tune store's rows for the bundle's cuBLASLt shapes. With the GPU on
@@ -749,6 +750,42 @@ def store_cell(r: dict) -> str:
     if not sku:
         die("recipe has no [target].sku; pass --store-cell")
     return re.sub(r"[^a-z0-9]+", "-", sku.lower()).strip("-")
+
+
+def lean_qualify(assets: Path, report: Path, strict: bool) -> bool:
+    """`plowrt qualify` over a bundle's packets (receipts, approved verifier, replay, media
+    geometry; docs/bringup/lean-correctness-inventory.md §9-10), written to `report`. Recorded,
+    not fatal, unless `strict`; a missing plowrt or verifier is recorded as not checked."""
+    plowrt = Path(os.environ.get("CARGO_TARGET_DIR", REPO / "target")) / "release" / "plowrt"
+    if not plowrt.exists():
+        report.write_text(json.dumps({"checked": False, "reason": f"{plowrt} missing"}, indent=1))
+        print(f"lean qualify: not checked ({plowrt} missing)", file=sys.stderr)
+        return not strict
+    p = subprocess.run([str(plowrt), "qualify", "--assets", str(assets), "--format", "json"],
+                       capture_output=True, text=True, env=env_with(os.environ, {"RUST_LOG": "warn"}))
+    try:
+        packets = json.loads(p.stdout)
+    except json.JSONDecodeError:
+        packets = None
+    if packets is None:
+        report.write_text(json.dumps({"checked": False, "reason": p.stderr[-2000:]}, indent=1))
+        print(f"lean qualify: failed to run: {p.stderr.strip()[-300:]}", file=sys.stderr)
+        return not strict
+    report.write_text(json.dumps({"checked": True, "packets": packets}, indent=1))
+    for e in packets:
+        q = e["qualification"]
+        verdict = "qualified" if e["qualified"] else "UNQUALIFIED"
+        print(f"lean qualify: {Path(e['packet']).name} {verdict} {len(q['satisfied'])}/{len(q['required'])}"
+              + "".join(f"\n    gap: {g[:200]}" for g in q["gaps"]), file=sys.stderr)
+    ok = all(e["qualified"] for e in packets)
+    return ok or not strict
+
+
+def cmd_qualify(a: argparse.Namespace) -> None:
+    assets = Path(a.assets).resolve()
+    report = Path(a.out) if a.out else assets.parent / "lean-qualification.json"
+    if not lean_qualify(assets, report, strict=a.strict):
+        die(f"lean qualification failed; see {report}")
 
 
 def gpu_matches(recipe_gpu: str) -> bool:
@@ -1786,6 +1823,10 @@ def main() -> None:
     b.add_argument("--store-cell", help="tune-store SKU cell for the probe (default: [target].sku folded, e.g. h100-sxm5)")
     b.add_argument("--hf-dir", help="checkpoint snapshot on this host, replacing [cell].hf_dir; recorded")
     b.set_defaults(f=cmd_build)
+    q = sp.add_parser("qualify", help="Lean receipt/media qualification of a bundle (plowrt qualify)")
+    q.add_argument("--assets", required=True); q.add_argument("--out", help="report (default <assets>/../lean-qualification.json)")
+    q.add_argument("--strict", action="store_true", help="exit non-zero unless every packet qualifies")
+    q.set_defaults(f=cmd_qualify)
     s = sp.add_parser("serve"); s.add_argument("recipe"); s.add_argument("--assets", required=True)
     s.add_argument("--profile", required=True, help="serving policy from [bench.profiles.*] (e.g. realtime, high_concurrency)")
     s.add_argument("--port", type=int, default=8080); s.add_argument("--plowrt", help="plowrt binary (default target/release/plowrt)")

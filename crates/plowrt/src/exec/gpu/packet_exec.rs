@@ -115,6 +115,7 @@ impl CudaPacketRuntime {
         let ordinal = be.device_ordinal;
         let raw = std::fs::read(path).map_err(|source| RuntimeError::Io { path: path.to_path_buf(), source })?;
         let blob = DevBlob::parse(&raw)?;
+        crate::certificate_checks::check_sidecar(path, &raw, &blob)?;
         if !blob.gen.is_empty() || blob.tp.is_some() {
             return Err(RuntimeError::Rejected(format!("{}: generated tensors or TP are not supported by the CUDA packet runtime", path.display())));
         }

@@ -197,6 +197,11 @@ pub struct RuntimeConfig {
     #[arg(long = "asr-request-timeout-ms", env = "PLOW_ASR_REQUEST_TIMEOUT_MS", default_value_t = 120_000, global = true)]
     pub asr_request_timeout_ms: u64,
 
+    /// Lean receipt qualification at packet load (`certificate_checks`): `off` keeps the
+    /// pre-policy behavior, `report` logs every gap, `strict` refuses a packet with any gap.
+    #[arg(long = "lean-qualify", env = "PLOW_LEAN_QUALIFY", default_value = "off", value_parser = ["off", "report", "strict"], global = true)]
+    pub lean_qualify: String,
+
     /// Upper bound (tokens) on an audio-LM request's context (`prompt`). The context is otherwise
     /// sized per request to what the window leaves after the template, the audio and the output
     /// reserve, trimmed from its oldest words. 0 = no bound beyond the window.

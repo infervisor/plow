@@ -67,6 +67,12 @@ jobs:
       # #[ignore]d) and run without a GPU.
       - name: Test engine host paths (cuda,hsa)
         run: "nix develop --command cargo test -p plowrt --features cuda,hsa --lib exec::"
+      # Required lean-correctness lane (CPU only): build the pinned plow_verify, audit every
+      # endpoint's acceptance theorems for sorry/unapproved axioms, check the binary against
+      # lean-plow/approved-verifiers.json, and run the explicit list of ignored CPU-verifier tests
+      # (docs/bringup/lean-correctness-inventory.md).
+      - name: Lean correctness (build, proof audit, CPU verifier suites)
+        run: nix develop --command scripts/lean_correctness_ci.sh
       # Checkpoint S for every knob this change touches (scripts/knob_scope_ci.sh): the production
       # recipe and its one-layer cut, compared against the knob's declared scope. Passes at once
       # when no knob is touched; otherwise it needs the runner's KNOB_SCOPE_HF_DIR,
