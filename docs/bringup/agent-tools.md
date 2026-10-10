@@ -283,6 +283,7 @@ Knobs it reads: `PLOW_CKPT` (the **prepped** checkpoint — a raw-HF dir will re
 | `scripts/bench_vllm_rocm.sh`, `scripts/bench_plow_rocm.sh` | the ROCm-side pair. |
 | `scripts/plow_vs_vllm_rocm.py` | the comparison itself. |
 | `scripts/glm53_bench_table.py` | render a result table. |
+| `scripts/serve_test/smoke.sh <plowrt> <out> <serve args...>` | one `plowrt serve` (any `--assets` set, clean env) smoked on every endpoint `/v1/models` advertises: chat, transcription (HTTP/SSE/WebSocket/Realtime), speech, VAD (`smoke_client.py`). `EVAL=all` adds `eval.py` (ASR WER, TTS Whisper CER, LLM checks; also usable alone against `PLOW_URL`). Run through `gpuq.py`. See [serving-deploy-runtime.md](../serving-deploy-runtime.md#running). |
 | `scripts/bench/plowbench.sh` | **source** this in any new probe. Gives `pb_free_port`, `pb_serve_start <plowrt> <assets> <objdir> <port> <log> [timeout]`, `pb_serve_wait [secs]`, `pb_serve_stop`, `pb_bench <resdir> <tag> <model> <conc> <nprompts> <isl> <osl> [extra…]`, `pb_cell` (pb_bench + cells.log markers), `pb_metrics_start/stop` (reference `/metrics`), `pb_result <resdir> <tag>`, `pb_model_id`, `pb_detect_arch`, and the artifact checks (`pb_require_nix`, `pb_hazard_env`, `pb_check_plowrt/assets/objects/vllm`). Do not re-implement the readiness poll or the result parsing again. |
 
 ### The result-path trap

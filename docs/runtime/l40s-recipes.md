@@ -39,8 +39,8 @@ scripts/asr/nvidia/nemotron_l4_build.sh nemotron-3.5-asr-streaming-0.6b.q8_0.ggu
 ```
 
 The runtime CMake takes nvcc from `$PLOW_NVCC` (the dev shell's toolkit) when it is set.
-`scripts/asr/nvidia/l4_asr_deploy.sh` installs the three L40S ASR builds the same way as the L4
-ones (same objects, same layout).
+The three L40S ASR builds serve with the same `plowrt serve` command line as the L4 ones
+([asr.md](asr.md)).
 
 The recipes keep the L4 contracts at 48 GB sizes: decode ladders to 32 rows and the default
 192-chunk packed encoder buckets. One `plowrt serve --assets <1.7B> --assets <0.6B>
