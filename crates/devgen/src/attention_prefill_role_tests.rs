@@ -737,7 +737,7 @@ fn generated_entry_binds_matching_wide_rungs_and_leaves_short_ones() {
     ];
     let image =
         plow_asset::cubin::synthetic_elf(crate::gen_kernels::ENTRY_SYMBOL, &globals, 90);
-    std::fs::write(directory.join(crate::gen_kernels::CATALOG[0].file), image).unwrap();
+    std::fs::write(directory.join(&crate::gen_kernels::CATALOG[0].file), image).unwrap();
     let wide = |rows: u32| {
         let mut model = fixture(512, false, true);
         model.prog_t[0] = rows;

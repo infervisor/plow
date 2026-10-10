@@ -5,12 +5,16 @@
                                                the table (the only command that changes it)
   build_catalog.py bench OBJDIR [--px4 CUBIN]  GPU: standalone us / rel-L2 of built objects, packed
                                                multi-request contract check
+  build_catalog.py check [--entries a,b]       no TileLang: ENTRIES' signature/object == table
 
 The table (TABLE) records each entry's signature, the chosen config, the generated body's sha256
-and per-shape-class measurements. `build` fails when the generator no longer reproduces the
-recorded body (generator drift): retune or pin the generator. Python runs only here; the runtime
-loads the cubin as a packet role object (devgen `gen_kernels.rs`, plowrt role path).
-Needs TileLang (+ torch for tune/bench), nvcc 12.9.
+and per-shape-class measurements. It is the one source of the signatures: devgen
+`gen_kernels.rs` binds packet ops from it, and `build` refuses entries that disagree with it.
+`build` fails when the generator no longer reproduces the recorded body (generator drift): the
+body digest, not a commit, is the key, so any checkout reproducing it builds the entry.
+Python runs only here; the runtime loads the cubin as a packet role object (plowrt role path).
+`nix develop .#tilelang` provides the pinned generator (TileLang 0.1.12) and nvcc 12.9 for
+`build`; tune/bench also need a CUDA torch (that shell's torch is CPU-only).
 """
 import argparse, ctypes, hashlib, json, math, os, re, subprocess, sys, tempfile
 from pathlib import Path
@@ -153,8 +157,9 @@ def flash_prefill_body_fp8kv(D, BM, BN, stages, threads):
     return attn_pf
 
 
-# Catalog entries. `signature` is what devgen matches packet ops against (crates/devgen/src/
-# gen_kernels.rs mirrors it); `classes` are the tuning shape classes (heads, kv heads, rows).
+# Catalog entries. `signature` is what devgen matches packet ops against (`tune` writes it to the
+# table, which crates/devgen/src/gen_kernels.rs reads); `classes` are the tuning shape classes
+# (heads, kv heads, rows).
 ENTRIES = {
     "attn_pf_hd512": {
         "signature": {"op": "flash_prefill", "head_dim": 512, "mask": "causal", "window": 0,
@@ -287,8 +292,32 @@ def load_table():
     return json.loads(TABLE.read_text()) if TABLE.exists() else {"version": 1, "entries": {}}
 
 
+def table_mismatches(table, names):
+    """Entries whose signature or object differs from the table row (devgen gen_kernels.rs binds
+    from the table, so the two must agree)."""
+    return [f"{n}: {k}" for n in names if n in table["entries"]
+            for k in ("signature", "object") if ENTRIES[n][k] != table["entries"][n][k]]
+
+
+def cmd_check(a):
+    bad = table_mismatches(load_table(), a.entries)
+    if bad:
+        sys.exit("catalog entries disagree with the table (retune): " + ", ".join(bad))
+    print(f"{len(a.entries)} entries agree with {TABLE.relative_to(REPO)}")
+
+
 def cmd_build(a):
     table = load_table()
+    bad = table_mismatches(table, a.entries)
+    if bad:
+        sys.exit("catalog entries disagree with the table (retune): " + ", ".join(bad))
+    # The body digest is the build key; a different generator release cannot be expected to
+    # reproduce it (`nix develop .#tilelang` pins the tuned one).
+    import tilelang
+    pinned = table.get("generator", {}).get("version")
+    if any("build" not in ENTRIES[n] for n in a.entries) and tilelang.__version__ != pinned:
+        sys.exit(f"tilelang {tilelang.__version__} != table generator {pinned}; "
+                 "run under `nix develop .#tilelang`")
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
     for name in a.entries:
@@ -616,14 +645,15 @@ def main():
     be.add_argument("objdir")
     be.add_argument("--px4")
     be.add_argument("--rows", nargs="*", default=[])
-    for p in (b, t, be):
+    c = sub.add_parser("check")
+    for p in (b, t, be, c):
         p.add_argument("--entries", default=",".join(ENTRIES),
                        type=lambda s: [x for x in s.split(",") if x])
     a = ap.parse_args()
     for name in a.entries:
         if name not in ENTRIES:
             sys.exit(f"unknown catalog entry {name}; known: {', '.join(ENTRIES)}")
-    {"build": cmd_build, "tune": cmd_tune, "bench": cmd_bench}[a.cmd](a)
+    {"build": cmd_build, "tune": cmd_tune, "bench": cmd_bench, "check": cmd_check}[a.cmd](a)
 
 
 if __name__ == "__main__":
