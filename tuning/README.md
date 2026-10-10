@@ -19,6 +19,7 @@ tuning/<vendor>/<isa>/<sku>/kernel_measurement.jsonl
 tuning/<vendor>/<isa>/<sku>/decode_measurement.jsonl
 tuning/<vendor>/<isa>/<sku>/object_measurement.jsonl
 tuning/<vendor>/<isa>/<sku>/attention_measurement.jsonl
+tuning/<vendor>/<isa>/<sku>/cublaslt_algos.jsonl
 ```
 
 The path comes from `HardwareFingerprint::tuning_path()`, so two GPUs cannot
@@ -64,8 +65,41 @@ which is the whole argument for the check.
 |---|---|---|
 | `amd/gfx950/mi350x` | dense BF16/MXFP4 GEMM tiles plus exact-cell decode MLA split count | 242 GEMM cells and B1/B8 8K attention qualified |
 | `nvidia/sm_90a/h100-nvl` | interpreter dispatch floor | measured, see below |
-| `nvidia/sm_90a/h100-sxm5` | Gemma-4 HD256 BKV32 BF16 prefill attention at M4096/M8192 | 21 exact packet cells qualified |
+| `nvidia/sm_90a/h100-sxm5` | Gemma-4 HD256 BKV32 BF16 prefill attention at M4096/M8192; cuBLASLt algorithms (`cublaslt_algos.jsonl`) | 21 exact packet cells qualified; cuBLASLt rows below |
 | `nvidia/sm_120a/rtx-5090` | prefill GEMM tile (`prefill_tile_measurement.jsonl`) | measured, see below |
+
+## cuBLASLt algorithm store (`cublaslt_algos.jsonl`)
+
+The exact-shape cuBLASLt algorithm plowrt pins for each BF16 projection plan, so a serve does not
+time eight heuristic candidates per shape at load.
+
+- **Row**: `device::cuda::lt::StoredAlgo` — `m, n, k, dtype ("bf16"), gpu` (cuDevice name), the
+  opaque 64-byte `cublasLtMatmulAlgo_t` as 8 hex words, `workspace`, `matmul_us`; `pair: true` for a
+  two-projection strided-batch plan (k/v, gate/up); `ns` when the plan serves instruction N other
+  than `n` (fused q|k|v `n = nq+nk+nv`, an lm_head on its first `n & !15` columns); `rows` when the
+  pick was timed across every routed decode rung (the widest rung's plan pinned for the narrower
+  ones, `PLOW_LT_RUNG_ALGOS` off). Probe rows add `commit`, `recipe`, `utc` as provenance only.
+- **Key**: `(m, n, k, dtype, pair, rows)`. A per-rung pick never pins a cross-rung plan: on Gemma-4
+  E4B that substitution cost 25% C1 TPOT. Rows are reused across commits, bundles and models with the same
+  shape: plowrt re-validates each pinned row with `cublasLtMatmulAlgoCheck` against the live layout
+  and library and re-selects on refusal, so a stale row costs load time, never a wrong launch. The
+  commit is recorded, never matched.
+- **Writer**: `campaign.py build` (or `probe`) on a host with the recipe's GPU, under `gpulease`. It
+  runs `plowrt serve` with the bundle's table pinned and `PLOW_LT_ALGOS_WRITE`, waits for the load
+  (every plan is selected before ready) and the coherence gate when the recipe has one, merges the
+  new selections into `<assets>/cublaslt_algos.jsonl` and appends them here
+  (`tuning/nvidia/<arch>/<[target].sku folded>/`). It runs when a projection shape of the bundle has
+  no serving row (`build.json` `cublaslt.shapes`; only the widest decode rung unless the recipe
+  serves `PLOW_LT_RUNG_ALGOS=true`). `--no-probe` skips it. Commit rows only from a clean,
+  uncontended run of a qualified recipe.
+- **Readers**: devgen packetizes every row of `tuning/nvidia/<arch>/*/cublaslt_algos.jsonl` that
+  serves one of the packet's projection shapes into `<assets>/cublaslt_algos.jsonl`; plowrt loads it
+  as `PLOW_LT_ALGOS`. `build-record.json` `cublaslt` records the table's sha256, its rows and the
+  shapes still unserved.
+- **FP8 is not stored.** cuBLASLt 13.4 returns a single heuristic algorithm for the W8A8 e4m3
+  OUTER_VEC_32F descriptor at every Gemma-4 12B/26B/31B prefill rung and at m=128 decode, with and
+  without fast accumulation (H100 SXM5, 2026-10-10, 289 shapes): timing or pinning has nothing to
+  select, so FP8 plans take heuristic[0] at load. Revisit if a cuBLASLt returns more candidates.
 
 ### `amd/gfx950/mi350x`
 

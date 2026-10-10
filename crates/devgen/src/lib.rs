@@ -1843,6 +1843,8 @@ struct Tn {
     // Multimodal soft-token rows: `(id, slab row)` table and the bf16 slab (TENSOR_NONE: off).
     mm_table: u32,
     mm_slab: u32,
+    // Per prefill row, the rows after it in its bidirectional media span (`MmSpanExtent`).
+    mm_span: u32,
     // Chatterbox T3 decode: per-slot speech start and the learned speech-position table.
     pos_base: u32,
     speech_pos: u32,
@@ -2191,6 +2193,11 @@ fn declare(
         },
         mm_slab: if c.mm_slab_rows > 0 {
             b.tensor(plow_asset::multimodal::SLAB_TENSOR, u64::from(c.mm_slab_rows) * u64::from(c.hidden) * BF16)
+        } else {
+            TENSOR_NONE
+        },
+        mm_span: if c.mm_spans {
+            b.tensor("act.mm_span", rows as u64 * I32)
         } else {
             TENSOR_NONE
         },
@@ -4229,6 +4236,12 @@ fn emit_phase(
             d.t[..4].copy_from_slice(&[n.x, n.ids, n.mm_table, n.mm_slab]);
             d.i[..4].copy_from_slice(&[t, c.hidden, mm_table_capacity(c), c.mm_slab_rows]);
         });
+        if c.mm_spans {
+            dep = b.emit(DevOp::MmSpanExtent, rows.clone(), &[dep], |d| {
+                d.t[..2].copy_from_slice(&[n.mm_span, n.ids]);
+                d.i[0] = t;
+            });
+        }
     }
     // Gemma-4 E-series PER-LAYER INPUTS (dev_isa.h op 155), once per token for all layers:
     // ple_raw = embed_per_layer[ids] * sqrt(P); ple_pp = x . Wproj^T (the 1/sqrt(H) is dropped:
@@ -5782,6 +5795,17 @@ fn emit_phase(
             };
             let fa_tm = (tma_gemm && !fp8_kv && (hd == 256 || hd == 512) && !gemv_family)
                 .then(|| tmap_kv(n.kc[l], n.vc[l], kvr, hd, kvh, box_rows));
+            // Bidirectional media spans attend on the sliding layers only (Gemma-4: the full
+            // layers stay causal), through the span-extent rows in i7's high half.
+            let span_attention = if c.mm_spans && win > 0 {
+                assert!(
+                    fp8_kv && fused && ns == 1 && n.mm_span != 0 && n.mm_span < TENSOR_NONE,
+                    "bidirectional media spans need the fused FP8-KV prefill attention (PLOW_FP8_KV)"
+                );
+                n.mm_span
+            } else {
+                0
+            };
             let fa_deps: Vec<u32> = if shared {
                 vec![c_qn]
             } else if c_vn == c_kn {
@@ -5818,7 +5842,7 @@ fn emit_phase(
                 d.i[4] = 0;
                 d.i[5] = win;
                 d.i[6] = hd;
-                d.i[7] = ns;
+                d.i[7] = ns | span_attention << 16;
                 d.f[0] = c.attn_scale;
                 d.j[0] = kvr;
                 d.j[1] = kvm; // head-major; RING on a sliding layer
@@ -9698,16 +9722,14 @@ fn emit_dense_gqa(
     c.tp = tp;
     let mm_towers = (ecfg_multimodal() && block_spec.is_none()).then(|| {
         let towers = mm::Towers::from_checkpoint(&dir).unwrap_or_else(|e| panic!("multimodal: {e}"));
-        for why in &towers.skipped {
-            eprintln!("  multimodal: skipping {why}");
-        }
-        assert!(!towers.is_empty(), "PLOW_EMIT_MULTIMODAL=1: no tower to emit (skipped: {:?})", towers.skipped);
+        assert!(!towers.is_empty(), "PLOW_EMIT_MULTIMODAL=1: the checkpoint declares no tower");
         assert!(tp == 1, "PLOW_EMIT_MULTIMODAL=1 is single-GPU");
         c.mm_slab_rows = emit_config::active().mm_slab_rows.unwrap_or(mm::DEFAULT_SLAB_ROWS).max(1);
         let contract = towers.contract(c.mm_slab_rows).unwrap_or_else(|e| panic!("multimodal: {e}"));
         assert_eq!(contract.hidden, c.hidden, "multimodal contract width");
         assert_eq!(contract.table_capacity, mm_table_capacity(&c));
         c.mm_pad = contract.pad_token;
+        c.mm_spans = contract.has_spans();
         (towers, contract)
     });
     // Resolve the block range now that layer count is known. `l` -> l..l+1;
@@ -10327,21 +10349,6 @@ fn emit_dense_gqa(
         if selected > 0 {
             eprintln!("  cuBLASLt prefill: {selected} projection segments");
         }
-        // Packetize the exact-shape algorithm selection from the tune store when one exists;
-        // a host with the GPU refreshes it through the campaign probe, and the runtime
-        // re-validates every entry with AlgoCheck before use.
-        if let Some(root) = ecfg.tunedb_root() {
-            match dense_cublaslt::packetize_algo_table(
-                &m,
-                &arch,
-                std::path::Path::new(&root),
-                std::path::Path::new(&out),
-            ) {
-                Ok(0) => eprintln!("  cuBLASLt algorithms: no tune-store rows for this target; the runtime selects at load"),
-                Ok(n) => eprintln!("  cuBLASLt algorithms: {n} shape(s) packetized from the tune store"),
-                Err(error) => eprintln!("  cuBLASLt algorithms: not packetized: {error}"),
-            }
-        }
     }
     if ecfg.moe_pf_lt {
         let selected = dense_cublaslt::apply_moe_prefill(&mut m, &mut sections, &arch)
@@ -10880,6 +10887,33 @@ fn emit_dense_gqa(
         let mut man = manifest::build_for_packet(&m, &arch, &lean, &sections);
         if speech_ops != 0 {
             man["speech_ops"] = speech_ops.into();
+        }
+        // Every cuBLASLt projection shape of the final packet (prefill and decode rungs), and the
+        // tune store's exact-shape algorithm rows for them; `campaign.py build` probes the shapes
+        // no row serves, and the runtime re-validates every entry with AlgoCheck before use.
+        let lt_shapes = dense_cublaslt::lt_shapes(&m, &sections);
+        if !lt_shapes.is_empty() {
+            let packetized = match ecfg.tunedb_root() {
+                Some(root) => dense_cublaslt::packetize_algo_table(
+                    &lt_shapes,
+                    &arch,
+                    std::path::Path::new(&root),
+                    std::path::Path::new(&out),
+                )
+                .unwrap_or_else(|error| {
+                    eprintln!("  cuBLASLt algorithms: not packetized: {error}");
+                    0
+                }),
+                None => 0,
+            };
+            eprintln!(
+                "  cuBLASLt algorithms: {packetized} tune-store row(s) packetized for {} projection shape(s)",
+                lt_shapes.len()
+            );
+            man["cublaslt"] = serde_json::json!({
+                "shapes": lt_shapes.iter().map(dense_cublaslt::LtShape::json).collect::<Vec<_>>(),
+                "packetized": packetized,
+            });
         }
         report_dispatch_audit(&man);
         report_segment_resource(&man);

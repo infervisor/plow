@@ -64,7 +64,7 @@ after a kernel change. Existing serving evidence can prioritize work but cannot 
 | 1 | preflight (CPU) | `plowbench-doctor.sh <assets> <objdir> <plowrt> <arch>`: env, hazards, binaries, packet, lean qualification, objects, lease, disk, **stale harness/recipe copies vs HEAD** |
 | 2 | build from the recipe | `campaign.py build recipes/<ns>/<model>/<cell>.toml --out <fresh dir>`; it ends with `plowrt qualify` into `<out>/lean-qualification.json` (receipts, approved verifier, replay, media geometry). `campaign.py qualify --assets <out>/assets [--strict]` reruns it |
 | 3 | per-rung accuracy, resources + measured roofline | `scripts/bench/step_grid.sh <assets> <out>` (step_bench B × ctx; instruction-cap sweeps for native decode only), then `scripts/bench/op_roof.py <out>/disasm.txt --ctx N --sweep B=<jsonl>` (bytes, FLOPs, floor, measured, % roof per op). Library-routed decode needs `op_roof.py --nsys` with JSON disassembly and a measured CUDA trace; prefill CUDA graphs use `--nsys-correlation <id>` for exact packet-segment mapping, while `--segtime` covers per-chunk prefill diagnostics. No measurement = floor only. Use block/route harnesses below for other kernels; GLM/MLA/MoE: `scripts/campaign/op_roofline.py` |
-| 4 | full-model accuracy gates | `campaign.py gate <recipe> --assets <out>/assets --out <dir>` runs the recipe's `[gates]` in one lease (logit parity top1/KL, ASR WER, TTS CER per language, S3Gen rel-L2); `--score-only` re-scores, `--dry-run` prints `run.sh` |
+| 4 | full-model accuracy gates | `campaign.py gate <recipe> --assets <out>/assets --out <dir>` runs the recipe's `[gates]` in one lease (logit parity top1/KL, ASR WER, TTS CER per language, S3Gen rel-L2, media parity `mm_parity`); `--score-only` re-scores, `--dry-run` prints `run.sh` (under `gpuq.py`, queue `bash <out>/run.sh` from the dry run, then `--score-only`: `gate` itself leases) |
 | 5 | serving grid vs the reference | `scripts/bench/llm_grid.sh plow\|vllm <res>` (same client, unique prompts per cell and repeat, greedy + sampled, 2 repeats, prefill-only and decode-only cells, vLLM `/metrics`, plow PACKLOG); agentic multi-turn with prefix caching on both sides: `llm_grid.sh plow\|vllm <res> --agentic` (`agentic_turns.py`, c32/64/128 x 10 turns to ~16K); open-loop production mix (Poisson sessions, think time, sampled turns/lengths, goodput): `PROD_RATES='0.5 1' llm_grid.sh plow\|vllm <res> --prod` (`agentic_turns.py --open-loop`, cells `q<1000*rate>`); speech: `scripts/tts/tts_bench.py`, `scripts/asr/nvidia/served_bench.py`; voice: `scripts/voice/serve_voice_agent.sh calls` |
 | 6 | audit waterfall | `scripts/bench/waterfall.py <res>/plow <res>/vllm`: grid with spread, reference prefix-cache hits (fails > 5%), wall ms/request split (mixed, prefill-only, decode, host gap, idle, padding, riders), decode ms/step side by side. `vllm_metrics.py cells`, `packlog_audit.py`, `nsys_busy.py` are its parts |
 | 7 | fix, one variable | kernel/runtime change in your own detached worktree |
@@ -283,6 +283,7 @@ Knobs it reads: `PLOW_CKPT` (the **prepped** checkpoint — a raw-HF dir will re
 | `scripts/bench_vllm_rocm.sh`, `scripts/bench_plow_rocm.sh` | the ROCm-side pair. |
 | `scripts/plow_vs_vllm_rocm.py` | the comparison itself. |
 | `scripts/glm53_bench_table.py` | render a result table. |
+| `scripts/serve_test/smoke.sh <plowrt> <out> <serve args...>` | one `plowrt serve` (any `--assets` set, clean env) smoked on every endpoint `/v1/models` advertises: chat, transcription (HTTP/SSE/WebSocket/Realtime), speech, VAD (`smoke_client.py`). `EVAL=all` adds `eval.py` (ASR WER, TTS Whisper CER, LLM checks; also usable alone against `PLOW_URL`). Run through `gpuq.py`. See [serving-deploy-runtime.md](../serving-deploy-runtime.md#running). |
 | `scripts/bench/plowbench.sh` | **source** this in any new probe. Gives `pb_free_port`, `pb_serve_start <plowrt> <assets> <objdir> <port> <log> [timeout]`, `pb_serve_wait [secs]`, `pb_serve_stop`, `pb_bench <resdir> <tag> <model> <conc> <nprompts> <isl> <osl> [extra…]`, `pb_cell` (pb_bench + cells.log markers), `pb_metrics_start/stop` (reference `/metrics`), `pb_result <resdir> <tag>`, `pb_model_id`, `pb_detect_arch`, and the artifact checks (`pb_require_nix`, `pb_hazard_env`, `pb_check_plowrt/assets/objects/vllm`). Do not re-implement the readiness poll or the result parsing again. |
 
 ### The result-path trap
@@ -374,6 +375,24 @@ The in-lease vLLM server needs `nvcc` (CUDA toolkit on `PATH`, or `CUDA_HOME`), 
 leaves a stop token out of completions logprobs.
 
 Unit tests: `cd scripts/llm && python3 -m unittest test_fp32_ref_gate`.
+
+**Media (images, audio) are gated by `mm_parity`** (`campaign.py gate`, experimental recipes
+`scripts/campaign/recipes/gemma4-e4b.h100.multimodal.toml` and `gemma4-12b.h100.fp8-multimodal.toml`).
+One lease runs:
+
+- before the server: the HF reference (`scripts/mm/hf_ref.py all`: processor outputs, projected
+  rows, greedy chat cases from `scripts/mm/cases/*.json`), only when `reference/ref.json` is
+  missing;
+- served: `scripts/mm/gate.py` (prompt-token equality, greedy match vs HF, repeat stability across
+  cold and cached prefill, media-collision check) and `scripts/mm/refusals.py` (400s for limits,
+  bad media and unsupported formats; mp3/flac/ogg accepted; streaming with logprobs);
+- after the server stops: `mm_check --encode` (preprocessing and encoder rows vs HF; build it with
+  `cargo build --release -p plowrt --features cuda --example mm_check`).
+
+A cold and a cached prefill split the prompt differently, so their bf16 rounding differs
+(|Δlogprob| ≈ 0.1, as on text). The gate accepts a divergence only at a near tie (top-2 margin
+≤ `tie_margin`, default 0.25). The served load test (`scripts/mm/load.py`: concurrency, cancel,
+slab exhaustion, slab leaks) is a separate run.
 
 ---
 

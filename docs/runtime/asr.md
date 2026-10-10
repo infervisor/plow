@@ -300,7 +300,7 @@ Every transcription (uploads, Realtime and WebSocket turns) passes `Route::submi
   no language and was detected in another is transcribed again in the first listed (a caller
   opening in Hindi otherwise gets the whole segment in Devanagari). Names are the packet's
   `languages` (Qwen3-ASR: `English`, `Spanish`, ...). A deployment choice, not a runtime default:
-  the L4 unit (`scripts/asr/nvidia/plow-asr.service`) sets `English,Spanish`.
+  the L4 ASR host serves with `English,Spanish` (command below).
 - Uploads under 0.5 s are padded with silence to the minimum instead of refused.
 
 On the customer's 49-call set with their `transcribe.py`/`score.py` (Gemini references), English
@@ -615,8 +615,20 @@ plowrt asr --packet <dir>/nemotron.pkt --tokenizer model.q8_0.gguf --backend cud
 An unspecialized speech object (all 42 arms) spends over 40 minutes in ptxas; specialize it.
 
 Production recipes: `recipes/infervisor/{qwen3-asr,qwen3-asr-0.6b,nemotron-3.5-asr}/sm89-l4-tp1.toml`.
-`scripts/asr/nvidia/nemotron_l4_build.sh` builds the Nemotron one; `scripts/asr/nvidia/l4_asr_deploy.sh`
-installs all three into `/opt/plow-asr` and (re)starts `plow-asr.service` (`scripts/asr/nvidia/plow-asr.service`).
+`scripts/asr/nvidia/nemotron_l4_build.sh` builds the Nemotron one; `scripts/asr/silero_vad_build.sh`
+the VAD packet. The L4 host serves them with the one `plowrt` binary (cuBLASLt beside it, see
+[serving-deploy-runtime.md](../serving-deploy-runtime.md)):
+
+```bash
+plowrt serve --bind 0.0.0.0 --port 8000 \
+  --assets <qwen3-asr build>/assets --assets <qwen3-asr-0.6b build>/assets \
+  --asr-packet nemotron-3.5-asr=<dir>/nemotron.pkt \
+  --asr-vad-packet <silero-vad dir>/silero_vad.pkt --asr-auto-languages English,Spanish
+```
+
+`PLOW_API_KEYS=k1,k2` turns on bearer auth for every route except `/health` and `/healthz`.
+`scripts/serve_test/smoke.sh` runs the same command line in a clean environment and smokes every
+advertised endpoint.
 
 The L4 recipes compile `max_ctx` 1024 (KV 3.5 GiB at 32 slots) and cap packed encoder buckets at
 64 chunks (`PLOW_ASR_PACKED_MAX_CHUNKS`; the 192-chunk default holds ~5.7 GB of encoder

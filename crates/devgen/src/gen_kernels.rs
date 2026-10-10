@@ -45,9 +45,9 @@ impl KvDtype {
 }
 
 pub(crate) struct Entry {
-    pub name: &'static str,
+    pub name: String,
     pub role: u8,
-    pub file: &'static str,
+    pub file: String,
     pub kv: KvDtype,
     /// Causal flash prefill over one head width.
     pub head_dim: u32,
@@ -60,55 +60,82 @@ pub(crate) struct Entry {
     pub pair_heads: bool,
     /// Smallest prefill rung (rows) bound to the entry; narrower rungs keep their existing route.
     pub min_rows: u32,
+    /// Claims exactly the media-span sites (`FlashPrefillFp8` i[7] high half); the object exports
+    /// `plow_attention_media_span = 1`.
+    pub media_span: bool,
 }
 
-/// Mirrors the build_catalog.py entries; a new entry takes the next generated role ID.
-pub(crate) const CATALOG: [Entry; 4] = [
-    Entry {
-        name: "attn_pf_hd512",
-        role: GENERATED_FIRST,
-        file: "gen_sm90a_attn_pf_hd512.cubin",
-        kv: KvDtype::Bf16,
-        head_dim: 512,
-        window: 0,
-        ring_kv: false,
-        pair_heads: false,
-        min_rows: 1024,
-    },
-    Entry {
-        name: "attn_pf_hd256_sliding",
-        role: GENERATED_FIRST + 1,
-        file: "gen_sm90a_attn_pf_hd256_sliding.cubin",
-        kv: KvDtype::Bf16,
-        head_dim: 256,
-        window: ANY_SLIDING,
-        ring_kv: true,
-        pair_heads: true,
-        min_rows: 1024,
-    },
-    Entry {
-        name: "attn_pf_hd256_sliding_fp8kv",
-        role: GENERATED_FIRST + 2,
-        file: "gen_sm90a_attn_pf_hd256_sliding_fp8kv.cubin",
-        kv: KvDtype::Fp8,
-        head_dim: 256,
-        window: ANY_SLIDING,
-        ring_kv: true,
-        pair_heads: true,
-        min_rows: 128,
-    },
-    Entry {
-        name: "attn_pf_hd512_fp8kv",
-        role: GENERATED_FIRST + 3,
-        file: "gen_sm90a_attn_pf_hd512_fp8kv.cubin",
-        kv: KvDtype::Fp8,
-        head_dim: 512,
-        window: 0,
-        ring_kv: false,
-        pair_heads: false,
-        min_rows: 128,
-    },
+/// The table build_catalog.py builds from and `tune` writes: the one source of every entry's
+/// signature and object name.
+const TABLE: &str = include_str!("../../../tuning/nvidia/sm_90a/h100-sxm5/gen_kernels.json");
+
+/// Devgen's binding policy per table entry, which the table does not carry: the role ID (a new
+/// entry takes the next generated ID) and the smallest prefill rung it binds.
+const POLICY: [(&str, u8, u32); 5] = [
+    ("attn_pf_hd512", GENERATED_FIRST, 1024),
+    ("attn_pf_hd256_sliding", GENERATED_FIRST + 1, 1024),
+    ("attn_pf_hd256_sliding_fp8kv", GENERATED_FIRST + 2, 128),
+    ("attn_pf_hd512_fp8kv", GENERATED_FIRST + 3, 128),
+    ("attn_pf_hd256_sliding_fp8kv_span", GENERATED_FIRST + 4, 128),
 ];
+
+fn table_entry(name: &str, role: u8, min_rows: u32, row: &serde_json::Value) -> Result<Entry, String> {
+    let sig = &row["signature"];
+    let text = |key: &str| sig[key].as_str().unwrap_or_default();
+    let flag = |key: &str| sig[key].as_bool().unwrap_or(false);
+    let number = |key: &str| {
+        sig[key]
+            .as_u64()
+            .and_then(|v| u32::try_from(v).ok())
+            .ok_or(format!("{name}: signature lacks {key}"))
+    };
+    let media_span = match text("mask") {
+        "causal" => false,
+        "causal_media_span" => true,
+        other => return Err(format!("{name}: unknown mask {other:?}")),
+    };
+    if (text("op"), text("dtype"), text("arch")) != ("flash_prefill", "bf16", "sm_90a") {
+        return Err(format!("{name}: unsupported signature {sig}"));
+    }
+    let kv = match text("kv_dtype") {
+        "bf16" => KvDtype::Bf16,
+        "fp8_e4m3_rowscale" => KvDtype::Fp8,
+        other => return Err(format!("{name}: unknown kv_dtype {other:?}")),
+    };
+    Ok(Entry {
+        name: name.into(),
+        role,
+        file: row["object"].as_str().ok_or(format!("{name}: no object"))?.into(),
+        kv,
+        head_dim: number("head_dim")?,
+        window: if flag("window_any") { ANY_SLIDING } else { number("window")? },
+        ring_kv: flag("ring_kv"),
+        pair_heads: flag("gqa_even"),
+        min_rows,
+        media_span,
+    })
+}
+
+fn load_catalog(table: &str) -> Result<Vec<Entry>, String> {
+    let table: serde_json::Value =
+        serde_json::from_str(table).map_err(|e| format!("gen_kernels.json: {e}"))?;
+    let rows = table["entries"].as_object().ok_or("gen_kernels.json: no entries")?;
+    let unbound: Vec<_> = rows.keys().filter(|n| !POLICY.iter().any(|(p, ..)| p == n)).collect();
+    if !unbound.is_empty() {
+        return Err(format!("gen_kernels.json entries without a devgen role: {unbound:?}"));
+    }
+    POLICY
+        .iter()
+        .map(|&(name, role, min_rows)| {
+            let row = rows.get(name).ok_or(format!("{name}: not in gen_kernels.json"))?;
+            table_entry(name, role, min_rows, row)
+        })
+        .collect()
+}
+
+pub(crate) static CATALOG: std::sync::LazyLock<Vec<Entry>> = std::sync::LazyLock::new(|| {
+    load_catalog(TABLE).unwrap_or_else(|e| panic!("generated-kernel catalog: {e}"))
+});
 
 pub(crate) const ANY_SLIDING: u32 = u32::MAX;
 
@@ -128,7 +155,7 @@ pub(crate) fn parse(list: &str) -> Result<Vec<&'static Entry>, String> {
     let mut out: Vec<&'static Entry> = Vec::new();
     for name in list.split(',').map(str::trim).filter(|s| !s.is_empty()) {
         let entry = CATALOG.iter().find(|e| e.name == name).ok_or_else(|| {
-            let known: Vec<_> = CATALOG.iter().map(|e| e.name).collect();
+            let known: Vec<_> = CATALOG.iter().map(|e| e.name.as_str()).collect();
             format!(
                 "unknown generated-kernel entry {name:?} (catalog: {})",
                 known.join(", ")
@@ -148,14 +175,15 @@ impl Entry {
         op.op == self.kv.op() as u16
             && op.i[6] == self.head_dim
             && heads_and_window_match(op, self.window, self.pair_heads)
-            && op.i[7] == 1
+            && packet::dev::flash_nsplit(op.i[7]) == 1
+            && packet::dev::flash_span(op.i[7]).is_some() == self.media_span
             && (self.ring_kv || op.j[1] == u32::MAX)
             // FP8-KV roles need the per-row K/V scales; gen_flash_prefill.cu reads t[6]/t[7] unchecked.
             && (self.kv == KvDtype::Bf16 || (op.t[6] != TENSOR_NONE && op.t[7] != TENSOR_NONE))
     }
 
     fn object(&self, directory: &Path, profile: &str, gpu: &str) -> Result<Selection, String> {
-        let path = directory.join(self.file);
+        let path = directory.join(&self.file);
         let image = std::fs::read(&path).map_err(|error| format!("{}: {error}", path.display()))?;
         let info = plow_asset::cubin::inspect(&image)
             .ok_or_else(|| format!("{} is not a valid cubin", path.display()))?;
@@ -175,6 +203,7 @@ impl Entry {
             || global("plow_gen_flash_prefill_abi") != Some(self.kv.object_abi())
             || global("plow_attention_head_dim") != Some(self.head_dim)
             || global("plow_pf_request_abi") != Some(2)
+            || (global("plow_attention_media_span") == Some(1)) != self.media_span
         {
             return Err(format!(
                 "{} is not a generated {} flash-prefill object",
@@ -185,7 +214,7 @@ impl Entry {
         attention_prefill_role::validate_hardware_resources(gpu, profile, block, warps, smem)?;
         let abi = GeneratedAbi {
             family: self.kv.abi_family().into(),
-            entry: self.name.into(),
+            entry: self.name.clone(),
             block,
             smem,
         };
@@ -199,7 +228,7 @@ impl Entry {
             shape: None,
         };
         Ok(Selection::generated(
-            self.file.into(),
+            self.file.clone(),
             &image,
             attention_prefill_role::Generated {
                 role: self.role,
@@ -311,6 +340,12 @@ mod tests {
         assert!(bf16.matches(&op) && !fp8.matches(&op));
         op.op = DevOp::FlashPrefillFp8 as u16;
         assert!(!bf16.matches(&op) && fp8.matches(&op));
+        // Media-span sites (i7 high half) belong to the span twin only.
+        let span = entry("attn_pf_hd256_sliding_fp8kv_span");
+        assert!(!span.matches(&op));
+        op.i[7] = 1 | 900 << 16;
+        assert!(!fp8.matches(&op) && span.matches(&op));
+        op.i[7] = 1;
         // FP8-KV global attention has its own entry; the bf16 one does not claim it.
         op.i[5] = 0;
         op.i[6] = 512;
@@ -323,9 +358,49 @@ mod tests {
     #[test]
     fn catalog_roles_are_distinct_generated_ids() {
         let mut roles = BTreeSet::new();
-        for entry in &CATALOG {
+        for entry in CATALOG.iter() {
             assert!(plow_asset::segment_roles::is_generated(entry.role));
             assert!(roles.insert(entry.role));
         }
+    }
+
+    #[test]
+    fn catalog_signatures_come_from_the_table() {
+        let got: Vec<_> = CATALOG
+            .iter()
+            .map(|e| (e.name.as_str(), e.file.as_str(), e.kv, e.head_dim, e.window, e.ring_kv, e.pair_heads, e.media_span))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("attn_pf_hd512", "gen_sm90a_attn_pf_hd512.cubin", KvDtype::Bf16, 512, 0, false, false, false),
+                ("attn_pf_hd256_sliding", "gen_sm90a_attn_pf_hd256_sliding.cubin", KvDtype::Bf16, 256, ANY_SLIDING, true, true, false),
+                ("attn_pf_hd256_sliding_fp8kv", "gen_sm90a_attn_pf_hd256_sliding_fp8kv.cubin", KvDtype::Fp8, 256, ANY_SLIDING, true, true, false),
+                ("attn_pf_hd512_fp8kv", "gen_sm90a_attn_pf_hd512_fp8kv.cubin", KvDtype::Fp8, 512, 0, false, false, false),
+                (
+                    "attn_pf_hd256_sliding_fp8kv_span",
+                    "gen_sm90a_attn_pf_hd256_sliding_fp8kv_span.cubin",
+                    KvDtype::Fp8,
+                    256,
+                    ANY_SLIDING,
+                    true,
+                    true,
+                    true,
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn table_and_policy_must_agree() {
+        let mut table: serde_json::Value = serde_json::from_str(TABLE).unwrap();
+        let rows = table["entries"].as_object_mut().unwrap();
+        let row = rows["attn_pf_hd512"].clone();
+        rows.insert("attn_pf_new".into(), row);
+        assert!(matches!(load_catalog(&table.to_string()), Err(e) if e.contains("attn_pf_new")));
+        let rows = table["entries"].as_object_mut().unwrap();
+        rows.remove("attn_pf_new");
+        rows.remove("attn_pf_hd512_fp8kv");
+        assert!(matches!(load_catalog(&table.to_string()), Err(e) if e.contains("attn_pf_hd512_fp8kv")));
     }
 }

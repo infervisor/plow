@@ -327,6 +327,7 @@ const DOC: &[S] = &[
     S { op: DevOp::RopeAxialF32, t: &["x", "pos"], i: &["rows", "heads", "head_width", "stride", "axes", "head_stride", "flags"], f: &["theta"], j: &[] },
     S { op: DevOp::ChunkAttentionF32, t: &["out", "q", "k", "v", "rel_k", "qscale?", "valid?"], i: &["rows", "heads", "head_width", "chunk", "past", "future", "positions", "left"], f: &["kscale", "cap"], j: &[] },
     S { op: DevOp::MmRowsBf16, t: &["x", "ids", "table", "slab"], i: &["rows", "width", "cap", "slab_rows"], f: &[], j: &[] },
+    S { op: DevOp::MmSpanExtent, t: &["out", "ids"], i: &["rows"], f: &[], j: &[] },
 ];
 
 /// Ops that say "As [`DevOp::X`]" / "twin of [`DevOp::X`]" / "Same operands as

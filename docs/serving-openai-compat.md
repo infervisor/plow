@@ -146,16 +146,18 @@ the eos set came from the `config.json` fallback rather than `generation_config.
 
 ## 2b. Tool calling
 
-`tools`, `tool_choice` (`"auto"` / `"none"`), `parallel_tool_calls`, assistant `tool_calls` and
-`role: "tool"` results are served on `/v1/chat/completions`, streamed and not, for any model whose
-own chat template renders tools in a call syntax the server parses (`crates/plowrt/src/serve/tools/`).
-Nothing is keyed on the model name.
+`tools`, `tool_choice` (`"auto"`, `"none"`, `"required"`, a named function), `parallel_tool_calls`,
+`strict` function schemas, assistant `tool_calls` and `role: "tool"` results are served on
+`/v1/chat/completions`, streamed and not, for any model whose own chat template renders tools in a
+call syntax the server parses (`crates/plowrt/src/serve/tools/`). Nothing is keyed on the model
+name. The server never executes a tool; it renders the conversation and parses the reply.
 
 **Is it supported?** Decided per model at load: the template is rendered once with a probe tool
-(`ToolSupport::probe`). A template that never prints it ignores `tools` (Mixtral, DeepSeek-V3.x
-whose templates have no tools block) and the request is refused (400, `param: tools`) instead of
-answered without them. A model served without a template (built-in builders: Kimi-K3, DeepSeek-V4
-with its Python-only `encoding_dsv4.py`) refuses `tools` and assistant `tool_calls` history.
+(`ToolSupport::probe`). A template that never prints it ignores `tools` (Mixtral, and DeepSeek's
+own V3 / R1 / V3.1 / V3.2 templates, which have no tools block) and the request is refused (400,
+`param: tools`) instead of answered without them. A model served without a template (built-in
+builders: Kimi-K3, DeepSeek-V4 with its Python-only `encoding_dsv4.py`) refuses `tools` and
+assistant `tool_calls` history.
 
 **Call syntax**, read from the template's own markers (`ToolFormat::detect`), with one streaming
 parser each:
@@ -163,55 +165,126 @@ parser each:
 | format | families (template checked) | model output |
 |---|---|---|
 | `gemma4` | Gemma 4 E4B / 12B / 26B / 31B | `<\|tool_call>call:NAME{k:<\|"\|>v<\|"\|>,n:1}<tool_call\|>` |
-| `hermes` | Qwen3, Qwen2.5, Hermes | `<tool_call>{"name": .., "arguments": {..}}</tool_call>` (after any `<think>` trace) |
+| `hermes` | Qwen3, Qwen2.5, Hermes 3 (`tool_use` template) | `<tool_call>{"name": .., "arguments": {..}}</tool_call>` (after any `<think>` trace) |
 | `qwen3_xml` | Qwen3.5, Qwen3-Coder | `<tool_call><function=NAME><parameter=K>V</parameter></function></tool_call>`; values typed by the tool's JSON schema |
 | `glm45` | GLM-4.5 / 4.6 / 5 / 5.3 | `<tool_call>NAME<arg_key>K</arg_key><arg_value>V</arg_value></tool_call>` |
 | `llama3_json` | Llama 3.1 / 3.2 / 3.3 | an answer that opens with `{"name": .., "parameters": {..}}` (or `<\|python_tag\|>`), `;`-separated |
 | `mistral` | Mistral v0.3 (`[TOOL_CALLS] [..]`) and v11+ (`[TOOL_CALLS]NAME[ARGS]{..}`) | ids are 9 alphanumerics, as the template requires |
 | `kimi_k2` | Kimi-K2 | `<\|tool_call_begin\|>functions.NAME:IDX<\|tool_call_argument_begin\|>{..}`; the id is kept |
 | `harmony` | gpt-oss | `commentary to=functions.NAME` messages; `analysis` → `reasoning_content` |
+| `deepseek_v3` | DeepSeek V3 / R1 with a tools template (vLLM's `tool_chat_template_deepseek{v3,r1}.jinja`) | `<｜tool▁call▁begin｜>function<｜tool▁sep｜>NAME\n```json\n{..}\n```<｜tool▁call▁end｜>` |
+| `deepseek_v31` | DeepSeek V3.1 with a tools template (vLLM's `tool_chat_template_deepseekv31.jinja`) | `<｜tool▁call▁begin｜>NAME<｜tool▁sep｜>{..}<｜tool▁call▁end｜>` |
 
 A template that renders tools in any other syntax refuses `tools` (400) rather than returning
-unparsed calls as text.
+unparsed calls as text. Llama 3.2's pythonic form (`[f(a=1)]`) is not parsed: only vLLM's
+alternative template asks for it; the checkpoint's own template uses JSON.
 
 **Request mapping** (`tools::request`), matching vLLM's hand-off to `apply_chat_template`:
 `tools` is passed through unchanged; `tool_calls[].function.arguments` strings become objects
 (a template that concatenates strings, DeepSeek's, is re-rendered with the original strings);
 a tool-call turn's `content: null` becomes `""` (gpt-oss's template fails on `None`, GLM-4.5's
 prints the word `None`); `tool_call_id`, `name`, `reasoning_content` pass through. Validation:
-function tools only, names `^[a-zA-Z0-9_-]{1,64}$`, unique; `tool` messages need
-`tool_call_id`; history `tool_calls` need `id`, `function.name` and JSON-object `arguments`.
-The renderer now matches `transformers`' Jinja environment: `trim_blocks`/`lstrip_blocks`,
+function tools only, names `^[a-zA-Z0-9_-]{1,64}$`, unique, `strict` a boolean; `tool` messages
+need `tool_call_id`; history `tool_calls` need `id`, `function.name` and JSON-object `arguments`.
+The renderer matches `transformers`' Jinja environment: `trim_blocks`/`lstrip_blocks`,
 insertion-ordered maps, `loop.previtem`/`nextitem`, `none is iterable` false, `tojson` as
 Python's `json.dumps` (`", "` / `": "` spacing, `ensure_ascii`, `indent`, `separators`,
 `sort_keys`, float `repr`), and `strip`/`split`/`replace` with Python's arguments.
 
-**Refused** (400): `tool_choice: "required"` and a forced function (no constrained decoding, so
-the call cannot be guaranteed); the deprecated `functions` / `function_call` (use `tools`);
-non-function tool types. `tool_choice: "none"` renders the conversation without `tools` and
-does not parse. `parallel_tool_calls: false` keeps only the first call. An empty `tools: []`
-is the same as none.
+**`tool_choice`.**
+
+- `"auto"` (default) renders the tools and parses whatever the model writes.
+- `"none"` renders the conversation without `tools` and does not parse.
+- `"required"` and `{"type": "function", "function": {"name": ..}}` (also the Responses-API
+  `{"type": "function", "name": ..}`) append the format's call opener to the prompt
+  (`ToolFormat::opener`): up to the function name for `required` (`<|tool_call>call:`), through it
+  for a named function (`<|tool_call>call:get_weather{`). A trace the prompt left open is closed
+  first (`</think>`, `<channel|>`). The generation therefore starts inside a call, in the model's
+  own syntax, and is then validated: every call must name a declared function (the named one, for
+  a named choice) and carry a JSON-object `arguments`; a turn that ends (`stop`) without such a
+  call fails. A named choice keeps one call. This is not constrained decoding: the opener is
+  forced, the rest is the model's and is checked, so the guarantee is "a valid call or an error",
+  never prose with `finish_reason: "stop"`. vLLM's Gemma 4 parser does not serve `required` /
+  named at all (`supports_required_and_named = False`).
+- A named function not in `tools`, or a forcing choice with no `tools`, is 400 `invalid_value`;
+  other `tool_choice` types (`allowed_tools`, custom) are 400 `unsupported_parameter`.
+
+**`strict: true`** validates that function's arguments against its `parameters` schema when the
+call ends (`tools::schema`: `type`, `enum`, `const`, `properties`, `required`,
+`additionalProperties`, `items`/`prefixItems`, length / item / numeric bounds, `anyOf`/`oneOf`/
+`allOf`, local `$ref`; `pattern` and `format` are not checked). Validation, not constrained
+decoding: a violation fails the request. On the streamed path a strict call's arguments are held
+back until they validate and then sent in one delta (the head with `id` and name goes out at once).
+
+**Validation failures** (forced choice or strict) are HTTP 500 `{"error": {"type":
+"server_error", "code": "invalid_tool_call", "message": <the violation>}}` on the buffered path, and
+the same error object in its own SSE frame with no `[DONE]` on the streamed path. A turn cut by
+`max_tokens` is not validated: it returns what was generated with `finish_reason: "length"`.
 
 **Response.** For these requests the generation is decoded with special tokens KEPT (the call
 markers are special tokens in most vocabularies), split for reasoning, parsed, and only then
-stripped of the remaining special tokens. `message.tool_calls` carries
-`{id, type: "function", function: {name, arguments: <JSON string>}}`, `content` is the text
-before the calls or `null`, and `finish_reason` is `"tool_calls"` when the turn ended on its own
-(a turn cut by `max_tokens` stays `"length"`). Streaming sends, per completed call, one delta with
-`index`, `id`, `type`, `name` and empty `arguments`, then one with the full `arguments`; markers
-never reach `delta.content`. A call is emitted once it is complete, so arguments arrive per call,
-not per token. A malformed or truncated call falls back to text, stripped as before.
+stripped of the remaining special tokens (a token split across pieces is still removed).
+`message.tool_calls` carries `{id, type: "function", function: {name, arguments: <JSON string>}}`,
+`content` is the text around the calls or `null`, and `finish_reason` is `"tool_calls"` when the
+turn ended on its own (a turn cut by `max_tokens` stays `"length"`).
+
+Streaming sends calls the way OpenAI and vLLM do: the first delta of a call carries `index`, `id`,
+`type` and `function.name`; later deltas carry `function.arguments` fragments as the model writes
+them, so a client sees the arguments grow token by token. JSON-native formats stream the model's
+own argument text; Gemma 4, Qwen3 XML and GLM bodies are transcoded to JSON on the fly (strings
+stream as they are written; a schema-typed non-string value goes out when it is complete). The
+buffered `arguments` is exactly the concatenation of the streamed fragments. Markers never reach
+`delta.content`. With `logprobs: true` each token's entry rides the frame that token produced,
+tool-call deltas included.
+
+Once a call's name is read the call stands: arguments cut off by `max_tokens` are returned as
+generated (possibly incomplete JSON, `finish_reason: "length"`), as OpenAI returns them; a
+transcoded body that breaks its format's syntax is closed into valid JSON at the break. A call
+head that does not parse (no name, wrong syntax) is returned as text, markers stripped.
+
+**Reasoning.** The split runs before the call parser, so a trace never reaches `content` or a
+call: `<think>` (Qwen3, DeepSeek-R1, GLM; from the packet's `serve.json`), Gemma 4's thought
+channel (`<|channel>thought` … `<channel|>`, read from the chat template when the packet declares
+no markers; its markers are special tokens, so these requests decode with special tokens kept),
+and gpt-oss's `analysis` channel (the harmony parser, with or without tools). This fixes the
+Gemma 4 leak where, after a tool result, the model's own `<|channel>thought\n<channel|>` came
+back as `thought\n` at the start of `content`. vLLM's `include_reasoning: false` drops
+`reasoning_content` from the response; the trace is still split out and counted in
+`reasoning_tokens`.
+
+**Cost.** `tests/tool_stream_bench.rs` (release, `--ignored --nocapture`) measures the per-token
+host path: reasoning split, parser, special-token strip and SSE frame build. The parsers scan each
+byte once and reuse their buffers; the steady state allocates one buffer per frame (the plain path
+allocates two). Measured on the shared H100 host (min of 9 trials, ns per token):
+
+| case | 4978bf03 | tool-perf |
+|---|---|---|
+| plain text, no tools | 153–173 | 154–169 |
+| Gemma 4, no tools (thought-channel split) | — (leaked) | 197–217 |
+| tools declared, text answer | 363–398 | 234–261 |
+| Gemma 4 call, 16 KB arguments | 600–647 | 309–355 |
+| Gemma 4 call, 64 KB arguments | 1603–1794 | 327–366 |
+| Hermes call, 16 KB arguments | 671–739 | 306–365 |
+
+The baseline rescanned the buffered call on every token (cost grew with the arguments) and sent
+them in one piece at the end; the parsers are now O(1) per token and stream them.
 
 **Parity.** `scripts/llm/toolcall_fixtures.py` renders 7 conversations per family with
 `transformers` (`render_jinja_template`, the `apply_chat_template` code path) into
 `crates/plowrt/tests/fixtures/toolcall/`; `serve::tools::parity_tests` renders the same
 OpenAI-shaped requests through the handler's mapping and must match the text, and the token ids
-where the family's `tokenizer.json` is on the host. 15 families: gemma4-e4b, gemma4-12b, qwen3,
-qwen2.5, qwen3.5, qwen3-coder, llama3.1, llama3.2, mistral-v0.3, glm4.5, glm5.3, kimi-k2,
-gpt-oss, and the two refused (deepseek-v3.1, mixtral).
+where the family's `tokenizer.json` is on the host. 23 families: gemma4-e4b, gemma4-12b,
+gemma4-31b, qwen3, qwen2.5, qwen3.5, qwen3-coder, llama3.1, llama3.2, llama3.3, mistral-v0.3,
+glm4.5, glm5, glm5.3, kimi-k2, gpt-oss, hermes3 (`tool_use` template, tool requests only),
+deepseek-v3-tools, deepseek-r1-tools, deepseek-v3.1-tools (vLLM's templates), and the refused
+deepseek-v3.1, deepseek-r1 and mixtral. `serve::tools::http_tests` drives
+`/v1/chat/completions` end to end over the production router with a scripted dispatcher (tools
+streamed and not, parallel calls, every `tool_choice` mode, `strict`, logprobs, reasoning, a tool
+loop). `scripts/llm/toolcall_live_check.py` is the live battery (OpenAI Python SDK) against a
+serving model.
 
-**No packet re-emit is needed**: the format comes from the chat template the packet already
-carries in `serve.json`.
+**No packet re-emit is needed**: the format and the Gemma 4 reasoning markers come from the chat
+template the packet already carries in `serve.json`.
 - `/health` added alongside `/healthz`; `/tokenize` reports `count`; model cards carry
   `created`; request ids are seeded per process instead of starting at zero; CUDA reads the
   same stop-id sources as the AMD and CPU engines.
@@ -228,12 +301,22 @@ only that metadata. It has no per-model code, so adding a model means emitting i
 - **Request parts.**
   - `image_url` and `input_image` accept `data:` URLs only. `http(s)` URLs get 400; the server has
     no fetcher.
-  - `input_audio` accepts `format: "wav"` (any rate, resampled; channels mixed to mono). Other
-    formats get 400.
+  - `input_audio` accepts `format` `wav` (hound), `mp3`, `flac` and `ogg` (Vorbis), the last three
+    decoded by symphonia (pure Rust). Any rate is resampled, and channels are mixed to mono. The
+    label is a hint: the container decides, and an `audio_url` data URL with no known mime type is
+    sniffed. Other formats (`opus`, `aac`, `webm`, ...) get 400. Compressed clips stop decoding at
+    `PLOW_MM_MAX_AUDIO_SECONDS`, so a small body cannot expand without bound.
   - Text-only requests render the template exactly as before.
 - **Unsupported.** A model without a matching tower answers 400
   `unsupported content type for this model: <kind>`.
 - **Discovery.** `/v1/models` cards carry `x_plow_modalities` (`["text","image","audio"]`).
+- **The contract fails closed.** The packet loads only if every modality names a processor plowrt
+  implements for its kind (`aspect_patches` for images; `semicausal_log_mel` or `waveform_frames`
+  for audio), with every required parameter and no parameter plowrt does not implement. Resample
+  must be PIL bicubic, and the version must be 1. The version is read before the body. Each
+  refusal names the fix: upgrade plowrt or rebuild the packet. The encoder sidecar must take the
+  input its processor makes (vision, log-mel or frames); this is checked when the encoder first
+  loads. Request handling dispatches on the validated processor, never on a string.
 - **Preprocessing** runs on the CPU from the contract's parameters. Images get an
   aspect-preserving resize (Pillow bicubic, fixed point), then patches. Audio becomes a
   semicausal log-mel spectrogram. The template's placeholder expands to
@@ -242,14 +325,26 @@ only that metadata. It has no per-model code, so adding a model means emitting i
   (kind, media bytes, row). The LM's `Embed` maps those ids to the pad row. `MmRowsBf16` then
   replaces each of those rows with the encoder's projected row, which a per-engine slab holds
   (`in.mm_slab` plus the hash table `in.mm_table`).
-  - Rows are reserved at submit, staged before the launch and released when the job ends. A full
-    slab answers 503.
+  - Rows are reserved at submit, before any encoder work, staged before the launch, and released
+    when the job ends. Cancelled and failed requests release them too.
+  - A full slab answers 503 with `Retry-After: 1`. A request whose media need more rows than the
+    whole slab answers 400, since a retry cannot succeed.
+  - `/metrics` reports, per engine: `plowrt_mm_slab_rows`, `_slab_rows_reserved`,
+    `_slab_rows_staged`, `plowrt_mm_slab_full_total`, and `plowrt_mm_encode_total` /
+    `plowrt_mm_encode_seconds_total{kind}`. Encode time is measured from submit to rows ready,
+    queueing included. When idle, both occupancy gauges must read 0.
+  - Images and audio of one request are encoded concurrently, on their own encoder threads.
   - Each engine instance (a model, or one DP rank) owns its slab and its encoders. Encoding runs
     after rank selection, on that rank's device. Both are dropped when the engine unloads.
   - Before launch, every bit-31 id in the prompt must be in the serving engine's table. Otherwise
     the request fails; it is never served the pad row.
   - Because the ids hash the media, the prefix cache and session keys see different images as
     different prompts. Token-batch, mixed-step and the VMM prefix cache all keep working.
+  - A cached prompt reuses the KV of its media rows, so its encoder rows are not read again.
+    Greedy tokens depend on how the prompt was split into prefill chunks (cold, or after a cache
+    hit of N blocks), exactly as for text. The same split gives bit-identical logprobs; a
+    different split moves them by bf16 rounding (|Δlogprob| ≤ 0.17 measured), which flips a
+    near-tie token ([gemma4-e4b-h100.md](runtime/gemma4-e4b-h100.md#images-and-audio-experimental-plow_emit_multimodal1)).
 - **Limits.** These answer 400: `PLOW_MM_MAX_IMAGES` (8), `PLOW_MM_MAX_AUDIO` (4),
   `PLOW_MM_MAX_IMAGE_PIXELS` (40M) and `PLOW_MM_MAX_AUDIO_SECONDS` (30).
 - **Streaming, logprobs and tools** are unchanged: media only changes prompt ids.
@@ -257,14 +352,28 @@ only that metadata. It has no per-model code, so adding a model means emitting i
 
   | model | image | audio |
   |---|---|---|
-  | E4B | yes: gemma4_vision tower | yes: USM conformer |
-  | 12B | not emitted | yes: encoder-free 640-sample frames → `embed_audio` |
-  | 26B-A4B, 31B | not emitted | none in the checkpoint |
+  | E4B | yes: gemma4_vision tower (causal LM attention) | yes: USM conformer |
+  | 12B | yes: encoder-free 48×48 patches → `vision_embedder` → `embed_vision` | yes: encoder-free 640-sample frames → `embed_audio` |
+  | 26B-A4B, 31B | yes: gemma4_vision tower (head_dim 72) | none in the checkpoint |
 
-  - Vision is skipped (with a logged reason) on every checkpoint whose text config sets
-    `use_bidirectional_attention: "vision"`. Those LMs attend bidirectionally within each image on
-    their sliding layers, and the LM attention kernels are causal-only.
-  - 26B/31B vision also needs head_dim 72 in the tower's attention, which supports only 64 and 128.
+- **Bidirectional media spans.** A checkpoint whose text config sets
+  `use_bidirectional_attention: "vision"` gets `attention: "bidirectional_span"` on its image
+  modality. Rows of one image then also attend that image's later rows on the sliding layers, as
+  HF does (full-attention layers stay causal; audio stays causal).
+  - Span soft-token ids also set bit 30 (30-bit hash). `MmSpanExtent` (op 210) turns the prompt
+    ids into each row's remaining run length. `FlashPrefillFp8` i[7] bits 16..31 name that tensor
+    on the sliding layers; a row attends keys up to `min(q + extent, kvlen - 1)`.
+  - FP8-KV prefill only. Rungs ≥128 run the catalog entry `attn_pf_hd256_sliding_fp8kv_span`
+    (`GEN_MEDIA_SPAN=1`). Narrower rungs run the PIPE=0 interpreter path. The causal release
+    object is unchanged, so packets built without the flag are byte-identical.
+  - Chunking: no prefill chunk and no sliding stage (`stage_rows` from the chunk start) may end
+    strictly inside a span. The scheduler cuts the chunk back to the span start; a span that
+    starts a chunk is taken whole (it fits: 280 rows max vs 1024-row stages). A prefix-cache hit
+    may still end inside a span: those KV rows were computed with the whole span, and the ids
+    hash the media.
+  - Text-only requests on such a packet run the span object with no spans: about 2% slower in
+    that kernel than the causal object (`scripts/gen_kernels/attn_pf_hd256_sliding.py bench`).
+- `AttentionF32` (the tower attention) takes head widths of 64 or a multiple of 8 up to 128.
 
 ## 3. Refusing to serve from the CPU by accident
 

@@ -171,7 +171,7 @@ async fn chat_completions_with(
     }
     // TOOLS: served when the model's own template renders them and its call syntax is one
     // `serve::tools` parses; refused otherwise (see `tools::request::plan`).
-    let tool_support = if state.has_gpu_engine(&req.model) {
+    let tool_support = if state.chat_templated(&req.model) {
         state.registry.get(&req.model).ok().and_then(|b| b.chat_template().map(|t| t.tools))
     } else {
         None
@@ -235,8 +235,8 @@ async fn chat_completions_with(
         continue_final_message: req.continue_final_message.unwrap_or(false),
         tools: tool_plan.template_tools.clone(),
     };
-    let prompt = crate::obs::ttft::timed(&crate::obs::ttft::TEMPLATE, || {
-        if state.has_gpu_engine(&req.model) {
+    let mut prompt = crate::obs::ttft::timed(&crate::obs::ttft::TEMPLATE, || {
+        if state.chat_templated(&req.model) {
             let tok = state.registry.get(&req.model).ok();
             // THE CHECKPOINT'S OWN TEMPLATE FIRST. The built-in per-family
             // builders are the fallback for checkpoints that ship none — they
@@ -368,7 +368,6 @@ async fn chat_completions_with(
     }
     gen.min_tokens = req.sampling.min_tokens.unwrap_or(0) as usize;
     gen.stop_token_ids = req.sampling.stop_token_ids.clone().unwrap_or_default();
-    gen.keep_special_tokens = tool_plan.parse.is_some();
     if gen.min_tokens > gen.max_tokens {
         return crate::serve::api_error(
             axum::http::StatusCode::BAD_REQUEST,
@@ -436,10 +435,20 @@ async fn chat_completions_with(
     // only whether the trace is already open (GLM leaves it dangling; Qwen3 and DeepSeek-R1 emit
     // the marker themselves).
     let reasoning_mode = crate::serve::reasoning::ReasoningMode::for_bundle(&bundle);
-    let reasoning_open = reasoning_mode.prompt_opens(&prompt);
-    let tool_stream = tool_plan.parse.as_ref().map(|spec| {
-        crate::serve::tools::stream::ToolStream::new(spec, reasoning_mode, reasoning_open, bundle.special_text().clone())
-    });
+    let mut reasoning_open = reasoning_mode.prompt_opens(&prompt);
+    // A forced `tool_choice` writes the call's opener for the model, so the generation starts
+    // inside the call (after closing a trace the prompt left open), and is validated at the end.
+    let opener = tool_plan.parse.as_ref().and_then(|s| s.opener());
+    if let Some(o) = &opener {
+        if reasoning_open {
+            prompt.push_str(reasoning_mode.close_marker().unwrap_or_default());
+            reasoning_open = false;
+        }
+        prompt.push_str(o);
+    }
+    let tool_stream = response_stream(&tool_plan, tool_support, reasoning_mode, reasoning_open, &bundle, req.stream, opener.as_deref());
+    gen.keep_special_tokens = tool_stream.is_some();
+    let include_reasoning = req.include_reasoning.unwrap_or(true);
     if let Some(e) = crate::serve::prompt_bytes_overflow(state.max_ctx(&req.model), bundle.tokenizer().max_token_bytes(), prompt.len()) {
         return crate::serve::api_error_for(&e);
     }
@@ -576,6 +585,7 @@ async fn chat_completions_with(
             created,
             reasoning_mode,
             reasoning_open,
+            include_reasoning,
             lp_fmt,
             tool_stream,
             run,
@@ -591,6 +601,7 @@ async fn chat_completions_with(
             created,
             reasoning_mode,
             reasoning_open,
+            include_reasoning,
             lp_fmt,
             tool_stream,
             run,
@@ -603,14 +614,51 @@ async fn chat_completions_with(
     response
 }
 
+/// The response-side state machine when the plain reasoning split is not enough: the request
+/// declares tools, the format frames every answer (harmony), or the reasoning markers are special
+/// tokens (Gemma 4's thought channel) and must be decoded to be seen.
+fn response_stream(
+    plan: &crate::serve::tools::request::Plan,
+    support: Option<crate::serve::tools::ToolSupport>,
+    mode: crate::serve::reasoning::ReasoningMode,
+    reasoning_open: bool,
+    bundle: &crate::asset::ModelBundle,
+    stream: bool,
+    opener: Option<&str>,
+) -> Option<crate::serve::tools::stream::ToolStream> {
+    use crate::serve::tools::{request::ParseSpec, ToolFormat, ToolSupport};
+    let spec = plan.parse.clone().or(match support {
+        Some(ToolSupport::Format(f @ ToolFormat::Harmony)) => Some(ParseSpec::plain(f)),
+        _ => None,
+    });
+    if spec.is_none() && !bundle.reasoning_in_specials() {
+        return None;
+    }
+    let mut ts = crate::serve::tools::stream::ToolStream::new(spec.as_ref(), mode, reasoning_open, bundle.special_text().clone(), stream);
+    if let Some(o) = opener {
+        ts.prime(o);
+    }
+    Some(ts)
+}
+
+/// The model's tool call failed validation (`strict`, or a forced `tool_choice`).
+fn tool_call_error(message: &str) -> crate::serve::openai::ApiErrorBody {
+    crate::serve::openai::ApiErrorBody::new(message, "server_error", Some("invalid_tool_call"), None)
+}
+
 fn mm_error(e: crate::serve::mm::MmError) -> Response {
-    crate::serve::api_error(
+    let mut r = crate::serve::api_error(
         axum::http::StatusCode::from_u16(e.status).unwrap_or(axum::http::StatusCode::BAD_REQUEST),
         e.message,
         if e.status == 400 { "invalid_request_error" } else { "server_error" },
         (e.status == 400).then_some("invalid_value"),
         Some("messages[].content".into()),
-    )
+    );
+    // Transient refusals (full slab, encoder restarting): rows free as in-flight requests finish.
+    if e.status == 503 {
+        r.headers_mut().insert(axum::http::header::RETRY_AFTER, axum::http::HeaderValue::from_static("1"));
+    }
+    r
 }
 
 /// No rank of a data-parallel model is serving (all unloading, or each refused the request).
@@ -871,6 +919,7 @@ async fn buffer_and_reply(
     created: u64,
     reasoning_mode: crate::serve::reasoning::ReasoningMode,
     reasoning_open: bool,
+    include_reasoning: bool,
     lp_fmt: Option<crate::serve::logprobs::TokenText>,
     mut tools: Option<crate::serve::tools::stream::ToolStream>,
     mut run: crate::serve::turns::StageRun,
@@ -903,16 +952,21 @@ async fn buffer_and_reply(
                     lp_content.push(crate::serve::logprobs::chat_entry(fmt, id, lp));
                 }
                 text.push_str(&delta);
-                let (r, c) = match tools.as_mut() {
+                match tools.as_mut() {
                     Some(ts) => {
                         let st = ts.push(&delta);
-                        calls.extend(st.calls.into_iter().map(|(_, c)| c));
-                        (st.reasoning, st.content)
+                        reasoning_buf.push_str(st.reasoning.unwrap_or_default());
+                        answer_buf.push_str(st.content.unwrap_or_default());
+                        if let Some(e) = ts.error() {
+                            return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, Json(tool_call_error(e))).into_response();
+                        }
                     }
-                    None => split.push(&delta),
-                };
-                reasoning_buf.push_str(&r.unwrap_or_default());
-                answer_buf.push_str(&c.unwrap_or_default());
+                    None => {
+                        let (r, c) = split.push(&delta);
+                        reasoning_buf.push_str(&r.unwrap_or_default());
+                        answer_buf.push_str(&c.unwrap_or_default());
+                    }
+                }
             }
             StreamChunk::Done {
                 reason, usage: u, ..
@@ -955,19 +1009,25 @@ async fn buffer_and_reply(
     // and the trace goes to `reasoning_content`, which is where a reasoning
     // model's clients look for it. A model that never opened a trace is
     // unaffected — `split_reasoning` returns the whole string as the answer.
-    let (r, c) = match tools.as_mut() {
+    match tools.as_mut() {
         Some(ts) => {
-            let st = ts.finish();
-            calls.extend(st.calls.into_iter().map(|(_, c)| c));
-            (st.reasoning, st.content)
+            let st = ts.finish(!matches!(finish, stream_mod::FinishReason::Stop));
+            reasoning_buf.push_str(st.reasoning.unwrap_or_default());
+            answer_buf.push_str(st.content.unwrap_or_default());
+            if let Some(e) = ts.error() {
+                return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, Json(tool_call_error(e))).into_response();
+            }
+            calls = ts.take_calls();
         }
-        None => split.finish(),
-    };
-    reasoning_buf.push_str(&r.unwrap_or_default());
-    answer_buf.push_str(&c.unwrap_or_default());
+        None => {
+            let (r, c) = split.finish();
+            reasoning_buf.push_str(&r.unwrap_or_default());
+            answer_buf.push_str(&c.unwrap_or_default());
+        }
+    }
     let reasoning = {
         let t = reasoning_buf.trim();
-        (!t.is_empty()).then(|| t.to_string())
+        (include_reasoning && !t.is_empty()).then(|| t.to_string())
     };
     // A turn that is only calls answers `content: null`, as OpenAI does.
     let answer = (calls.is_empty() || !answer_buf.trim().is_empty()).then_some(answer_buf);
@@ -1015,45 +1075,11 @@ async fn buffer_and_reply(
     response
 }
 
-/// Streamed form of complete calls: the head deltas (`index`, `id`, `type`, `name`, empty
-/// `arguments`) for the token's own frame, then one `arguments` delta per call for frames of
-/// their own — the OpenAI shape clients accumulate by `index`.
-fn call_deltas(
-    calls: Vec<(u32, crate::serve::openai::ToolCall)>,
-) -> (Option<Vec<ToolCallDelta>>, Vec<ToolCallDelta>) {
-    if calls.is_empty() {
-        return (None, Vec::new());
-    }
-    let mut heads = Vec::with_capacity(calls.len());
-    let mut args = Vec::with_capacity(calls.len());
-    for (index, c) in calls {
-        heads.push(ToolCallDelta {
-            index,
-            id: Some(c.id),
-            kind: Some("function"),
-            function: FunctionDelta { name: Some(c.function.name), arguments: Some(String::new()) },
-        });
-        args.push(ToolCallDelta { index, id: None, kind: None, function: FunctionDelta { name: None, arguments: Some(c.function.arguments) } });
-    }
-    (Some(heads), args)
-}
-
-fn tool_frame(id: &str, created: u64, model: &str, d: ToolCallDelta, finish: Option<&'static str>) -> Bytes {
-    let ch = ChatChunk {
-        id: id.to_string(),
-        object: "chat.completion.chunk",
-        created,
-        model: model.to_string(),
-        choices: vec![ChunkChoice {
-            index: 0,
-            delta: Delta { role: None, content: None, reasoning_content: None, tool_calls: Some(vec![d]) },
-            logprobs: None,
-            finish_reason: finish,
-            x_plow_finish_reason: None,
-        }],
-        usage: None,
-    };
-    stream_mod::sse_data(&stream_mod::chunk_data(&ch))
+/// An error object in its own SSE frame; the stream then ends without `[DONE]`.
+fn sse_error(body: &crate::serve::openai::ApiErrorBody) -> Bytes {
+    let data = serde_json::to_string(body)
+        .unwrap_or_else(|_| "{\"error\":{\"message\":\"stream error\",\"type\":\"server_error\"}}".to_string());
+    stream_mod::sse_data(&data)
 }
 
 /// Streaming path: one SSE `chat.completion.chunk` frame per produced token,
@@ -1086,6 +1112,7 @@ fn sse_response(
     created: u64,
     reasoning_mode: crate::serve::reasoning::ReasoningMode,
     reasoning_open: bool,
+    include_reasoning: bool,
     lp_fmt: Option<crate::serve::logprobs::TokenText>,
     tools: Option<crate::serve::tools::stream::ToolStream>,
     run: crate::serve::turns::StageRun,
@@ -1096,10 +1123,12 @@ fn sse_response(
     struct SseState {
         rx: stream_mod::ChunkReceiver,
         done: bool,
-        /// Tool-call frames a token produced beyond its own, sent before the next receive.
+        /// Frames the finish produced beyond its own, sent before the next receive.
         queued: std::collections::VecDeque<Bytes>,
-        /// Set for a tool-calling request; replaces `split`.
+        /// Set when the response needs more than the reasoning split (tools, harmony, special
+        /// reasoning markers); replaces `split`.
         tools: Option<crate::serve::tools::stream::ToolStream>,
+        include_reasoning: bool,
         /// The `role` delta has not been sent yet — it rides the FIRST token.
         role_pending: bool,
         /// Routes each delta to `reasoning_content` or `content`. The SAME
@@ -1119,6 +1148,7 @@ fn sse_response(
             done: false,
             queued: std::collections::VecDeque::new(),
             tools,
+            include_reasoning,
             role_pending: true,
             split: crate::serve::reasoning::ReasoningSplit::new(reasoning_mode, reasoning_open),
             pending: std::collections::VecDeque::new(),
@@ -1180,62 +1210,49 @@ fn sse_response(
                                 crate::obs::host::first_frame(n_prompt, t_arrive.elapsed());
                             }
                         }
-                        let (reasoning, content, calls) = match st.tools.as_mut() {
+                        let frame = match st.tools.as_mut() {
                             Some(ts) => {
-                                let s = ts.push(&text);
-                                (s.reasoning, s.content, s.calls)
+                                let f = ts.push(&text).frame(&st.head, role, logprobs.as_ref(), st.include_reasoning, None);
+                                if let Some(e) = ts.error() {
+                                    tracing::warn!(model = %st.model, error = %e, "chat: tool call failed validation");
+                                    st.done = true;
+                                    return Some((sse_error(&tool_call_error(e)), st));
+                                }
+                                f
                             }
                             None => {
-                                let (r, c) = st.split.push(&text);
-                                (r, c, Vec::new())
+                                let (reasoning, content) = st.split.push(&text);
+                                st.head.frame(&ChunkChoice {
+                                    index: 0,
+                                    delta: Delta {
+                                        role,
+                                        content,
+                                        reasoning_content: reasoning.filter(|_| st.include_reasoning),
+                                        tool_calls: None,
+                                    },
+                                    logprobs,
+                                    finish_reason: None,
+                                    x_plow_finish_reason: None,
+                                })
                             }
                         };
-                        let (heads, args) = call_deltas(calls);
-                        let frame = st.head.frame(&ChunkChoice {
-                            index: 0,
-                            delta: Delta {
-                                role,
-                                content,
-                                reasoning_content: reasoning,
-                                tool_calls: heads,
-                            },
-                            logprobs,
-                            finish_reason: None,
-                            x_plow_finish_reason: None,
-                        });
-                        for a in args {
-                            st.queued.push_back(tool_frame(&st.request_id, created, &st.model, a, None));
-                        }
                         (frame, false)
                     }
                     StreamChunk::Done { reason, usage, .. } if st.tools.is_some() => {
                         let ts = st.tools.as_mut().expect("checked");
-                        let s = ts.finish();
+                        let s = ts.finish(!matches!(reason, stream_mod::FinishReason::Stop));
+                        let tail = (!s.is_empty(st.include_reasoning)).then(|| s.frame(&st.head, None, None, st.include_reasoning, None));
+                        if let Some(e) = ts.error() {
+                            tracing::warn!(model = %st.model, error = %e, "chat: tool call failed validation");
+                            st.done = true;
+                            return Some((sse_error(&tool_call_error(e)), st));
+                        }
                         let finish = match reason {
                             stream_mod::FinishReason::Stop if ts.calls() > 0 => "tool_calls",
                             r => r.as_openai(),
                         };
                         let trace_tokens = ts.split.trace_tokens;
-                        let (heads, args) = call_deltas(s.calls);
-                        let mut frames = Vec::new();
-                        if s.content.is_some() || s.reasoning.is_some() || heads.is_some() {
-                            let ch = ChatChunk {
-                                id: st.request_id.clone(),
-                                object: "chat.completion.chunk",
-                                created,
-                                model: st.model.clone(),
-                                choices: vec![ChunkChoice {
-                                    index: 0,
-                                    delta: Delta { role: None, content: s.content, reasoning_content: s.reasoning, tool_calls: heads },
-                                    logprobs: None,
-                                    finish_reason: None,
-                                    x_plow_finish_reason: None,
-                                }],
-                                usage: None,
-                            };
-                            frames.push(stream_mod::sse_data(&stream_mod::chunk_data(&ch)));
-                        }
-                        frames.extend(args.into_iter().map(|a| tool_frame(&st.request_id, created, &st.model, a, None)));
+                        let mut frames: Vec<Bytes> = tail.into_iter().collect();
                         let mut last = ChatChunk {
                             id: st.request_id.clone(),
                             object: "chat.completion.chunk",
@@ -1275,7 +1292,7 @@ fn sse_response(
                                 delta: Delta {
                                     role: None,
                                     content: flushed_c,
-                                    reasoning_content: flushed_r,
+                                    reasoning_content: flushed_r.filter(|_| st.include_reasoning),
                                     tool_calls: None,
                                 },
                                 logprobs: None,
@@ -1338,13 +1355,8 @@ fn sse_response(
                             None,
                             None,
                         );
-                        let data = serde_json::to_string(&body)
-                            .unwrap_or_else(|_| {
-                                "{\"error\":{\"message\":\"stream error\",\"type\":\"server_error\"}}"
-                                    .to_string()
-                            });
                         st.done = true;
-                        return Some((stream_mod::sse_data(&data), st));
+                        return Some((sse_error(&body), st));
                     }
                 };
                 if terminate {

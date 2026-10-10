@@ -64,6 +64,7 @@ pub struct ModelBundle {
     reasoning: crate::serve::reasoning::ReasoningMode,
     /// Built on the first tool-calling request.
     special_text: std::sync::OnceLock<Arc<crate::serve::tools::SpecialText>>,
+    reasoning_specials: std::sync::OnceLock<bool>,
 }
 
 impl ModelBundle {
@@ -121,6 +122,7 @@ impl ModelBundle {
             ),
         }
 
+        let reasoning = crate::serve::reasoning::ReasoningMode::resolve(&serve, chat_template.as_ref().and_then(|t| t.reasoning));
         Ok(ModelBundle {
             dir,
             manifest,
@@ -128,9 +130,10 @@ impl ModelBundle {
             tokenizer,
             chat_template,
             serving,
-            reasoning: crate::serve::reasoning::ReasoningMode::from_serve(&serve),
+            reasoning,
             serve,
             special_text: std::sync::OnceLock::new(),
+            reasoning_specials: std::sync::OnceLock::new(),
         })
     }
 
@@ -138,6 +141,17 @@ impl ModelBundle {
     pub fn special_text(&self) -> &Arc<crate::serve::tools::SpecialText> {
         self.special_text
             .get_or_init(|| Arc::new(crate::serve::tools::SpecialText::new(self.tokenizer.special_tokens())))
+    }
+
+    /// Whether the reasoning markers are special tokens: the generation must then be decoded with
+    /// special tokens kept for the split to see them (Gemma 4's `<|channel>` / `<channel|>`).
+    pub fn reasoning_in_specials(&self) -> bool {
+        *self.reasoning_specials.get_or_init(|| {
+            self.reasoning.markers().is_some_and(|(open, close)| {
+                let s = self.special_text();
+                s.any_in(open) || s.any_in(close)
+            })
+        })
     }
 
     /// The checkpoint's serving config (sampling defaults + reasoning framing).

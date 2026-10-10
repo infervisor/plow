@@ -5,6 +5,10 @@
   all         + GPU: projected soft tokens per item (get_image_features / get_audio_features) and
               greedy completions of chat cases (`--cases`: [{name, media: [item index], text}])
 
+A case may also carry `history` (earlier turns, [{role, media?, text}]) and `image_at` (pad the
+last user turn with leading filler text until its first image soft token sits at that prompt
+position, e.g. just before a prefill chunk or sliding-stage boundary).
+
 Writes `<out>/ref.json` plus raw little-endian f32 arrays (`<out>/<name>.f32`); `crates/plowrt/
 examples/mm_check.rs` and `scripts/mm/gate.py` read them. WAV input is 16-bit PCM.
 """
@@ -76,18 +80,58 @@ def media_part(it):
     return {"type": "input_audio", "input_audio": {"data": b64, "format": "wav"}}
 
 
+def turns(c):
+    return c.get("history", []) + [{"role": "user", "media": c["media"], "text": c["text"],
+                                    "lead": c.get("lead", "")}]
+
+
+def messages(c, items, part):
+    """Chat messages of a case; `part(item)` renders one media item."""
+    out = []
+    for t in turns(c):
+        lead = [{"type": "text", "text": t["lead"]}] if t.get("lead") else []
+        media = [part(items[k]) for k in t.get("media", [])]
+        out.append({"role": t["role"], "content": lead + media + [{"type": "text", "text": t["text"]}]})
+    return out
+
+
+def proc_inputs(proc, c, items):
+    from PIL import Image
+    text = proc.apply_chat_template(messages(c, items, lambda it: {"type": it["kind"]}),
+                                    add_generation_prompt=True, tokenize=False)
+    media = [items[k] for t in turns(c) for k in t.get("media", [])]
+    images = [Image.open(it["path"]).convert("RGB") for it in media if it["kind"] == "image"]
+    audio = [read_wav(it["path"])[0] for it in media if it["kind"] == "audio"]
+    return proc(text=[text], images=[images] if images else None, audio=audio or None, return_tensors="pt")
+
+
+def place_image(proc, c, items):
+    """Sets c["lead"] to the longest filler that keeps the first image soft token at or before
+    c["image_at"]."""
+    image_id = proc.tokenizer.convert_tokens_to_ids(proc.image_token)
+    word = " The quick brown fox jumps over the lazy dog."
+
+    def first(n):
+        c["lead"] = (word * n).strip()
+        ids = proc_inputs(proc, c, items)["input_ids"][0].tolist()
+        return ids.index(image_id)
+
+    lo, hi = 0, 1
+    while first(hi) <= c["image_at"]:
+        lo, hi = hi, hi * 2
+    while hi - lo > 1:
+        mid = (lo + hi) // 2
+        lo, hi = (mid, hi) if first(mid) <= c["image_at"] else (lo, mid)
+    c["image_start"] = first(lo)
+
+
 def generate(model, proc, cases, items, max_new):
     import torch
-    from PIL import Image
     out = []
     for c in cases:
-        media = [items[k] for k in c["media"]]
-        content = [{"type": it["kind"]} for it in media] + [{"type": "text", "text": c["text"]}]
-        text = proc.apply_chat_template([{"role": "user", "content": content}], add_generation_prompt=True, tokenize=False)
-        images = [Image.open(it["path"]).convert("RGB") for it in media if it["kind"] == "image"]
-        audio = [read_wav(it["path"])[0] for it in media if it["kind"] == "audio"]
-        inputs = proc(text=[text], images=[images] if images else None, audio=audio or None,
-                      return_tensors="pt").to(model.device)
+        if "image_at" in c:
+            place_image(proc, c, items)
+        inputs = proc_inputs(proc, c, items).to(model.device)
         for k in ("pixel_values", "input_features"):
             if k in inputs:
                 inputs[k] = inputs[k].to(model.dtype)
@@ -125,8 +169,7 @@ def main():
             cases = json.load(open(args.cases))
             ref["cases"] = generate(model, proc, cases, ref["items"], args.max_new)
             for c in ref["cases"]:
-                c["messages"] = [{"role": "user", "content": [media_part(ref["items"][k]) for k in c["media"]] +
-                                  [{"type": "text", "text": c["text"]}]}]
+                c["messages"] = messages(c, ref["items"], media_part)
     json.dump(ref, open(os.path.join(args.out, "ref.json"), "w"), indent=1)
 
 

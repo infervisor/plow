@@ -574,57 +574,163 @@ fn apply_program(model: &mut Model, index: usize, head: bool) -> Result<Vec<u8>,
     Ok(roles)
 }
 
-/// Copy the tune store's exact-shape cuBLASLt algorithm rows for every prefill projection this
-/// packet routes to Lt into `<out>/cublaslt_algos.jsonl`, the table `plowrt --lt-algos` pins.
+/// One packet instruction the CUDA runtime serves as a cuBLASLt projection: the routed
+/// instruction of a [`CUBLASLT`] segment (`projection_segments` in plowrt). Ordered and
+/// deduplicated, so every layer's copy of a shape collapses to one entry per rung.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct LtShape {
+    pub decode: bool,
+    pub rows: u32,
+    pub m: u32,
+    pub n: u32,
+    pub k: u32,
+    pub fp8: bool,
+}
+
+impl LtShape {
+    pub(crate) fn json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "phase": if self.decode { "decode" } else { "prefill" },
+            "rows": self.rows, "m": self.m, "n": self.n, "k": self.k,
+            "dtype": if self.fp8 { "e4m3" } else { "bf16" },
+        })
+    }
+}
+
+fn final_roles(sections: &[SectionData]) -> Option<SegmentRoles> {
+    sections
+        .iter()
+        .find(|section| section.kind == SECT_METADATA && section.name == SECTION)
+        .and_then(|section| SegmentRoles::from_bytes(&section.data).ok())
+}
+
+/// The cuBLASLt projection shapes of the emitted packet, read back from its final segment roles.
+pub(crate) fn lt_shapes(model: &Model, sections: &[SectionData]) -> Vec<LtShape> {
+    let Some(roles) = final_roles(sections) else {
+        return Vec::new();
+    };
+    let decode_lo = packet::devbuild::decode_rung_lo(&model.prog_t);
+    let mut shapes = std::collections::BTreeSet::new();
+    for program in &roles.programs {
+        let Some(prog) = model.progs.get(program.index) else { continue };
+        for (segment, &role) in program.roles.iter().enumerate() {
+            if role != CUBLASLT {
+                continue;
+            }
+            let Some(op) = prog
+                .gq_seg_ofs
+                .get(segment)
+                .and_then(|&lo| prog.gq_stream.get(lo as usize))
+                .and_then(|entry| prog.insts.get(entry.inst as usize))
+            else {
+                continue;
+            };
+            let fp8 = match DevOp::from_u16(op.op) {
+                Some(DevOp::GemmFp8 | DevOp::GemmMedFp8 | DevOp::GemmSmallFp8) => true,
+                Some(DevOp::Gemv | DevOp::Gemm | DevOp::GemmMed | DevOp::GemmSmall) => false,
+                _ => continue,
+            };
+            shapes.insert(LtShape {
+                decode: program.index >= decode_lo,
+                rows: packet::devbuild::program_rows(model.prog_t[program.index]),
+                m: op.i[0],
+                n: op.i[1],
+                k: op.i[2],
+                fp8,
+            });
+        }
+    }
+    shapes.into_iter().collect()
+}
+
+/// `build.json` `runtime_requires`: the runtime contract, and the oldest cuBLASLt that serves
+/// every library route the packet emits (grouped MoE 13.4, FP8 projections 12.9, BF16 12.0).
+pub(crate) fn runtime_requires(model: &Model, sections: &[SectionData]) -> serde_json::Value {
+    use plow_asset::segment_roles::{CUBLASLT_BF16_MIN, CUBLASLT_FP8_MIN, CUBLASLT_GROUPED_MIN};
+    let grouped = final_roles(sections).is_some_and(|roles| {
+        roles.programs.iter().any(|p| {
+            p.roles.iter().any(|&r| r == MOE_PREFILL_CUBLASLT || r == MOE_DECODE_CUBLASLT)
+        })
+    });
+    let shapes = lt_shapes(model, sections);
+    let cublaslt = if grouped {
+        Some(CUBLASLT_GROUPED_MIN)
+    } else if shapes.iter().any(|s| s.fp8) {
+        Some(CUBLASLT_FP8_MIN)
+    } else if !shapes.is_empty() {
+        Some(CUBLASLT_BF16_MIN)
+    } else {
+        None
+    };
+    let mut out = serde_json::json!({ "plowrt_contract": plow_asset::RUNTIME_CONTRACT });
+    if let Some(version) = cublaslt {
+        out["cublaslt"] = version.into();
+    }
+    out
+}
+
+/// The packet shapes a stored row serves (`device::cuda::lt::StoredAlgo` in plowrt): `(m, n_i, k)`
+/// for each instruction N in `ns` (default `[n]`).
+fn row_shapes(row: &serde_json::Value) -> Vec<(u32, u32, u32)> {
+    let field = |key: &str| row[key].as_u64().unwrap_or(0) as u32;
+    let (m, n, k) = (field("m"), field("n"), field("k"));
+    match row["ns"].as_array() {
+        Some(ns) if !ns.is_empty() => ns
+            .iter()
+            .map(|v| (m, v.as_u64().unwrap_or(0) as u32, k))
+            .collect(),
+        _ => vec![(m, n, k)],
+    }
+}
+
+/// Copy every tune-store cuBLASLt row that serves one of the packet's BF16 projection `shapes`
+/// into `<out>/cublaslt_algos.jsonl`, the table plowrt pins (`PLOW_LT_ALGOS`).
 ///
-/// The store is `<tunedb_root>/nvidia/<profile without '_'>/<cell>/cublaslt_algos.jsonl`, the
-/// JSONL `plowrt --lt-algos-write` produces (`device::cuda::lt::StoredAlgo`); rows are matched on
-/// `(m, n, k, dtype)` only. Over-inclusion is safe: the runtime re-validates each entry with
-/// `cublasLtMatmulAlgoCheck` and falls back to its heuristic, so a row from another cell of the
-/// same architecture can at worst cost the load-time re-selection it would have paid anyway.
-/// Returns how many shapes were packetized; `Ok(0)` when the store has nothing for the target.
+/// The store is `<tunedb_root>/nvidia/<profile>/<sku>/cublaslt_algos.jsonl`, written by
+/// `campaign.py probe` from `plowrt --lt-algos-write`. A row is keyed `(m, n, k, pair, rows)` and is
+/// selected when one of its served shapes ([`row_shapes`]) is a packet shape. Over-inclusion is
+/// safe: the runtime re-validates each entry with `cublasLtMatmulAlgoCheck` and falls back to its
+/// heuristic, so a row from another cell of the same architecture can at worst cost the
+/// load-time re-selection it would have paid anyway. FP8 projections are not stored: cuBLASLt
+/// returns one heuristic candidate for their descriptor (`tuning/README.md`).
+/// Returns how many rows were packetized; `Ok(0)` when the store has none for the packet.
 pub(crate) fn packetize_algo_table(
-    model: &Model,
+    shapes: &[LtShape],
     profile: &str,
     tune_root: &std::path::Path,
     out: &std::path::Path,
 ) -> Result<usize, String> {
-    let mut shapes = std::collections::BTreeSet::new();
-    for index in 0..packet::devbuild::decode_rung_lo(&model.prog_t) {
-        let rows = model.prog_t[index];
-        for op in &model.progs[index].insts {
-            if matches!(DevOp::from_u16(op.op), Some(DevOp::Gemm | DevOp::GemmMed | DevOp::GemmSmall))
-                && prefill_eligible(model, op, rows, profile) {
-                shapes.insert((op.i[0], op.i[1], op.i[2]));
-            }
-        }
-    }
-    if shapes.is_empty() {
+    let wanted: std::collections::BTreeSet<_> = shapes
+        .iter()
+        .filter(|s| !s.fp8)
+        .map(|s| (s.m, s.n, s.k))
+        .collect();
+    if wanted.is_empty() {
         return Ok(0);
     }
-    let arch_dir = tune_root.join("nvidia").join(profile.replace('_', ""));
-    let Ok(cells) = std::fs::read_dir(&arch_dir) else {
+    let Ok(cells) = std::fs::read_dir(tune_root.join("nvidia").join(profile)) else {
         return Ok(0);
     };
-    let mut rows: std::collections::BTreeMap<(u32, u32, u32), String> = Default::default();
-    for cell in cells.flatten() {
-        let table = cell.path().join("cublaslt_algos.jsonl");
-        let Ok(text) = std::fs::read_to_string(&table) else {
-            continue;
-        };
+    let mut tables: Vec<_> = cells
+        .flatten()
+        .map(|cell| cell.path().join("cublaslt_algos.jsonl"))
+        .filter(|table| table.is_file())
+        .collect();
+    tables.sort();
+    let mut rows: std::collections::BTreeMap<(u64, u64, u64, bool, String), String> = Default::default();
+    for table in tables {
+        let text = std::fs::read_to_string(&table).map_err(|e| format!("{}: {e}", table.display()))?;
         for line in text.lines().filter(|l| !l.trim().is_empty()) {
-            let value: serde_json::Value = serde_json::from_str(line)
+            let row: serde_json::Value = serde_json::from_str(line)
                 .map_err(|e| format!("{}: {e}", table.display()))?;
-            let key = (
-                value["m"].as_u64().unwrap_or(0) as u32,
-                value["n"].as_u64().unwrap_or(0) as u32,
-                value["k"].as_u64().unwrap_or(0) as u32,
-            );
-            if value["dtype"] == "bf16" && shapes.contains(&key) {
-                // Later cells override earlier ones for the same shape; the runtime's
-                // AlgoCheck decides whether the row applies to the GPU it runs on.
-                rows.insert(key, line.to_string());
+            if row["dtype"] != "bf16" || !row_shapes(&row).iter().any(|s| wanted.contains(s)) {
+                continue;
             }
+            let field = |key: &str| row[key].as_u64().unwrap_or(0);
+            let key = (field("m"), field("n"), field("k"), row["pair"] == true, row["rows"].to_string());
+            // Later cells and rows override earlier ones for the same key; the runtime's
+            // AlgoCheck decides whether the row applies to the GPU it runs on.
+            rows.insert(key, line.to_string());
         }
     }
     if rows.is_empty() {
@@ -874,6 +980,43 @@ mod tests {
         let mut m = model();
         m.progs[1].insts[1].i[4] = 1;
         assert!(apply(&mut m).err().unwrap().contains("ordinary BF16"));
+    }
+
+    #[test]
+    fn lt_shapes_packetize_the_rows_that_serve_them() {
+        let mut ladder = model_rows(&[128, 1, 4, 8]);
+        let sections = vec![apply(&mut ladder).unwrap()];
+        let shapes = lt_shapes(&ladder, &sections);
+        assert_eq!(
+            shapes.iter().map(|s| (s.decode, s.rows, s.m, s.n, s.k, s.fp8)).collect::<Vec<_>>(),
+            [(true, 1, 1, 64, 64, false), (true, 4, 4, 64, 64, false), (true, 8, 8, 64, 64, false)]
+        );
+        assert_eq!(
+            runtime_requires(&ladder, &sections),
+            serde_json::json!({"plowrt_contract": plow_asset::RUNTIME_CONTRACT, "cublaslt": "12.0"})
+        );
+        assert_eq!(
+            runtime_requires(&ladder, &[]),
+            serde_json::json!({"plowrt_contract": plow_asset::RUNTIME_CONTRACT})
+        );
+        let root = std::env::temp_dir().join(format!("devgen-lt-store-{}", std::process::id()));
+        let out = root.join("out");
+        let cell = root.join("nvidia/sm_90a/h100-sxm5");
+        std::fs::create_dir_all(&out).unwrap();
+        std::fs::create_dir_all(&cell).unwrap();
+        let rows = [
+            r#"{"m":8,"n":64,"k":64,"dtype":"bf16","gpu":"H100","algo":[],"workspace":0,"matmul_us":1}"#,
+            r#"{"m":4,"n":96,"k":64,"dtype":"bf16","ns":[64,32],"gpu":"H100","algo":[],"workspace":0,"matmul_us":1}"#,
+            r#"{"m":8,"n":64,"k":64,"dtype":"bf16","pair":true,"gpu":"H100","algo":[],"workspace":0,"matmul_us":1}"#,
+            r#"{"m":2,"n":64,"k":64,"dtype":"bf16","gpu":"H100","algo":[],"workspace":0,"matmul_us":1}"#,
+            r#"{"m":1,"n":64,"k":64,"dtype":"e4m3","gpu":"H100","algo":[],"workspace":0,"matmul_us":1}"#,
+        ];
+        std::fs::write(cell.join("cublaslt_algos.jsonl"), rows.join("\n")).unwrap();
+        assert_eq!(packetize_algo_table(&shapes, "sm_90a", &root, &out), Ok(3));
+        let table = std::fs::read_to_string(out.join("cublaslt_algos.jsonl")).unwrap();
+        assert_eq!(table.lines().collect::<Vec<_>>(), [rows[1], rows[0], rows[2]]);
+        assert_eq!(packetize_algo_table(&shapes, "sm_100a", &root, &out), Ok(0));
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]

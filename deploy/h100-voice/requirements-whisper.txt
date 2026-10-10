@@ -1,6 +1,0 @@
-# Whisper round-trip CER for `eval/eval.py tts`, on top of requirements.txt (Python 3.10+).
-#   .venv/bin/pip install -r requirements.txt -r requirements-whisper.txt
-# torch from PyPI bundles its own CUDA runtime (no toolkit needed); Whisper then runs on the GPU
-# beside the server (~3 GB) or, with --whisper-device cpu, on the CPU.
-torch==2.14.1
-transformers==5.19.0

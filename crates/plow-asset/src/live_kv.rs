@@ -657,6 +657,7 @@ fn direct_operands(op: DevOp, d: &DevInst64, packet: &Packet<'_>) -> Result<()> 
                 | DevOp::EmbedOverlayBf16
                 | DevOp::EmbedPosBf16
                 | DevOp::MmRowsBf16
+                | DevOp::MmSpanExtent
                 | DevOp::Argmax
                 | DevOp::ArgmaxFin
                 | DevOp::SoftCap

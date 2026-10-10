@@ -2865,10 +2865,21 @@ fn run_one_tick(
                         if available == 0 {
                             continue;
                         }
-                        let take = available
+                        let mut take = available
                             .min(remaining)
                             .min(pf_chunk_rows())
                             .min(e.pf_request_max_rows());
+                        if request.mm.as_deref().is_some_and(|j| j.spans()) {
+                            take = plow_asset::multimodal::span_safe_rows(
+                                &request.prompt_ids,
+                                start,
+                                take,
+                                e.pf_stage_rows(),
+                            );
+                            if take == 0 {
+                                continue;
+                            }
+                        }
                         pack.push((i, start, take));
                         remaining -= take;
                     }
@@ -5330,6 +5341,7 @@ fn gpu_prefill_batched_pass(
     // Bound each candidate before fair sharing. Short requests return unused
     // rows to later candidates in the same launch.
     let chunk_cap = pf_chunk_rows().min(e.pf_request_max_rows());
+    let stage = e.pf_stage_rows();
     let adaptive = crate::serve::policy::adaptive_packing();
     loop {
         let host_t = packlog::on().then(Instant::now);
@@ -5404,10 +5416,18 @@ fn gpu_prefill_batched_pass(
                 if !e.packed_slot_ready(i) || s.step != 0 || n == 0 || pf_pos + withheld >= n {
                     return None;
                 }
-                let remaining = e
-                    .pf_plan_slice(n - withheld - pf_pos, chunk_cap)
-                    .min(e.pf_publish_cap(i, pf_pos));
-                let n_rows = u32::try_from(remaining).ok()?;
+                let publish = e.pf_publish_cap(i, pf_pos);
+                let mut remaining = e.pf_plan_slice(n - withheld - pf_pos, chunk_cap).min(publish);
+                if s.mm.as_deref().is_some_and(|j| j.spans()) {
+                    remaining = plow_asset::multimodal::span_chunk_rows(
+                        &s.prompt_ids[..n - withheld],
+                        pf_pos,
+                        remaining,
+                        chunk_cap.min(publish),
+                        stage,
+                    );
+                }
+                let n_rows = u32::try_from(remaining).ok().filter(|&r| r > 0)?;
                 let slot_u32 = u32::try_from(i).ok()?;
                 let kv_row0 = u32::try_from(pf_pos).ok()?;
                 let span = packet::dev::PrefillSpan {
@@ -5490,6 +5510,15 @@ fn gpu_prefill_batched_pass(
             .unwrap_or(&[])
             .iter()
             .map(|span| (span.slot as usize, span.kv_row0 as usize, span.n_rows as usize))
+            .filter_map(|(i, c0, len)| {
+                // A share cut by the planner must still not split a media span.
+                let s = slots[i].as_ref()?;
+                if !s.mm.as_deref().is_some_and(|j| j.spans()) {
+                    return Some((i, c0, len));
+                }
+                let len = plow_asset::multimodal::span_safe_rows(&s.prompt_ids, c0, len, stage);
+                (len > 0).then_some((i, c0, len))
+            })
             .collect();
         if pack.is_empty() {
             return tick_fault;
@@ -6794,6 +6823,39 @@ fn stop_prefix_held(tail: &str, stops: &[String], delta_len: usize) -> usize {
         .max()
         .unwrap_or(0)
         .min(delta_len)
+}
+
+/// A dispatcher with no engine: each job is answered with `script(&job)`'s pieces, one token
+/// each, then `Done` (`length` when the pieces reach `max_tokens`). For HTTP-level tests of
+/// the handlers.
+#[cfg(test)]
+pub(crate) fn scripted_mux(script: impl Fn(&Job) -> Vec<String> + Send + Sync + 'static) -> ModelMux {
+    let (tx, mut rx) = mpsc::channel::<MuxMsg>(64);
+    tokio::spawn(async move {
+        while let Some(msg) = rx.recv().await {
+            let MuxMsg::Job(job, _) = msg else { continue };
+            let pieces = script(&job);
+            let n = pieces.len();
+            for text in pieces {
+                let logprobs = job.gen.params.logprobs.map(|_| Box::new(crate::text::logprobs::TokenLogprobs { logprob: -0.25, top: Vec::new() }));
+                if job.respond.send(StreamChunk::Token { id: 7, text, logprobs }).await.is_err() {
+                    break;
+                }
+            }
+            let reason = if n >= job.gen.max_tokens { FinishReason::Length } else { FinishReason::Stop };
+            let usage = crate::serve::stream::TokenUsage { prompt_tokens: job.prompt_ids.len(), cached_tokens: 0, completion_tokens: n };
+            let _ = job.respond.send(StreamChunk::Done { executed: n, reason, usage }).await;
+        }
+    });
+    ModelMux {
+        tx,
+        metrics: Arc::new(Metrics::default()),
+        preempt: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        preempt_notify: Arc::new(tokio::sync::Notify::new()),
+        arrival_notify: Arc::new(tokio::sync::Notify::new()),
+        ingress: Arc::default(),
+        preempted: Arc::default(),
+    }
 }
 
 #[cfg(test)]

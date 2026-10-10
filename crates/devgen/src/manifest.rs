@@ -1839,6 +1839,7 @@ pub fn build_for_packet(
             && section.name == plow_asset::packed_prefill::SECTION
     });
     let mut manifest = build_with_packed_prefill(m, arch, lean, packed_prefill.is_some());
+    manifest["runtime_requires"] = crate::dense_cublaslt::runtime_requires(m, sections);
     if let Some(section) = packed_prefill {
         let packed: plow_asset::packed_prefill::Manifest =
             serde_json::from_slice(&section.data).expect("emitted packed request manifest");

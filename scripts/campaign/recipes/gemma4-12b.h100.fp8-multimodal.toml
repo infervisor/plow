@@ -1,5 +1,7 @@
 # EXPERIMENTAL multimodal variant of recipes/infervisor/gemma-4-12b/sm90a-h100-tp1.toml: adds the
-# encoder-free audio sidecar (PLOW_EMIT_MULTIMODAL=1; vision is skipped, see docs/serving-openai-compat.md 2c).
+# encoder-free audio and vision sidecars (PLOW_EMIT_MULTIMODAL=1; docs/serving-openai-compat.md 2c)
+# and bidirectional attention within each image on the sliding layers, served by the media-span
+# twin attn_pf_hd256_sliding_fp8kv_span. Everything else is the production recipe.
 #
 # Gemma-4-12B-it FP8 (hub checkpoint, re-keyed) on H100 SXM5: FP8 W8A8 weights, FP8 per-token-head
 # KV, 16K context, 128 decode slots, prefix cache on. Production recipe for this model/GPU/precision.
@@ -18,7 +20,7 @@
 #                         native FP8 GEMM where the route matrix measured native faster (down_proj
 #                         at M = 1088 and >= 2048, the 4160/2112 exceptions), on the ws384 FP8-KV
 #                         GEMM object (PLOW_BUILD_FP8KV_GEMM; the base generic body was 4-5x slower)
-#   prefill hd256 sliding generated attn_pf_hd256_sliding_fp8kv (FlashPrefillFp8, every rung >= 128)
+#   prefill hd256 sliding generated attn_pf_hd256_sliding_fp8kv_span (FlashPrefillFp8, every rung >= 128)
 #   prefill hd512 global  generated attn_pf_hd512_fp8kv (TileLang, FlashPrefillFp8, every rung >= 128)
 #   decode B=128          cuBLASLt output head, light FP8 attention with 16-byte loads, direct
 #                         V conversion and the segmented FlashDecode grid (the light attention
@@ -96,7 +98,7 @@ PLOW_FUSE_ARGMAX = "1"
 
 [objects]
 script = "scripts/build_sm90a_gemma4_segments.sh"
-role_files = ["gen_sm90a_attn_pf_hd256_sliding_fp8kv.cubin", "gen_sm90a_attn_pf_hd512_fp8kv.cubin"]
+role_files = ["gen_sm90a_attn_pf_hd256_sliding_fp8kv_span.cubin", "gen_sm90a_attn_pf_hd512_fp8kv.cubin"]
 [objects.env]
 PLOW_BUILD_FATLITE = "1"
 NVCC_APPEND_FLAGS = "-DPLOW_NV_GLU_QUANT_CACHE=1 -DPLOW_NV_GLU_QUANT_WPR=1"
@@ -106,13 +108,13 @@ PLOW_BUILD_FA_GQA2_PAIR = "0"
 PLOW_BUILD_PFATTN_HD256_BKV32 = "0"
 PLOW_BUILD_PFATTN_HD256_GQA2_BKV32 = "0"
 PLOW_BUILD_PFATTN_HD512_PX4_BQ64 = "0"
-PLOW_BUILD_GEN_KERNELS = "attn_pf_hd256_sliding_fp8kv,attn_pf_hd512_fp8kv"
+PLOW_BUILD_GEN_KERNELS = "attn_pf_hd256_sliding_fp8kv_span,attn_pf_hd512_fp8kv"
 
 [emit_roles.env]
 PLOW_GEMMA4_SM90_W8A8_GEMM_GLU_ROLE = "0"
 PLOW_GEMMA4_SM90_HD512_PX4_BQ64_ROLE = "0"
 PLOW_GEMMA4_SM90_HD256_GQA2_ROLE = "0"
-PLOW_EMIT_GEN_KERNELS = "attn_pf_hd256_sliding_fp8kv,attn_pf_hd512_fp8kv"
+PLOW_EMIT_GEN_KERNELS = "attn_pf_hd256_sliding_fp8kv_span,attn_pf_hd512_fp8kv"
 
 [serve.env]
 PLOW_PREFIX_CACHE = "1"
@@ -167,3 +169,19 @@ vllm_capture = "{env:GEMMA12B_FP32_VLLM}"
 
 [reference]
 csv = "perf-data/campaign/gemma4-12b.h100.reference-vllm028-fp8.csv"
+
+# 2026-10-10 (mm-harden a00d40f2, packet built from this recipe): mm_parity PASS 3/3 cases,
+# refusals 11/11, encoders 10/10; llm_fp32_ref PASS KL mean 0.093 vs vLLM 0.128.
+# Media parity, audio only (vision is not emitted for 12B): GEMMA12B_MM_REF = a scripts/mm/hf_ref.py
+# reference dir; building it needs a transformers-loadable checkpoint (GEMMA12B_HF_BF16, the FP8
+# checkpoint dequantized to bf16). MM_MEDIA as in gemma4-e4b.h100.multimodal.toml.
+[gates.mm_parity]
+python = "python3"
+hf_python = "{env:PYREF}"
+reference = "{env:GEMMA12B_MM_REF}"
+hf_dir = "{env:GEMMA12B_HF_BF16}"
+cases = "scripts/mm/cases/audio.json"
+audio = ["{env:MM_MEDIA}/ls00.wav", "{env:MM_MEDIA}/ls01.wav", "{env:MM_MEDIA}/ls02.wav"]
+refusal_image = "{env:MM_MEDIA}/cats.png"
+refusal_audio = "{env:MM_MEDIA}/ls01.wav"
+compressed = ["{env:MM_MEDIA}/ls01.mp3", "{env:MM_MEDIA}/ls01.flac", "{env:MM_MEDIA}/ls01.ogg"]

@@ -7,7 +7,7 @@
 use std::collections::BTreeMap;
 
 use packet::dev::{DevOp, ACT_CLAMP, ACT_GELU_TANH, ACT_RELU, ACT_ROUND_BF16, ACT_SCALE_SHIFT, ACT_SILU, TENSOR_NONE};
-use plow_asset::multimodal::{MmContract, MmModality};
+use plow_asset::multimodal::{MediaAttention, MmContract, MmModality};
 use plow_asset::packet_pipeline::{PacketPipeline, PacketPipelines, PipelineDType, PipelineTensor};
 use serde_json::Value;
 
@@ -364,6 +364,37 @@ pub struct VisionTower {
     embed: String,
 }
 
+/// Encoder-free vision (`gemma4_unified_vision`): each soft token is one `pool*patch` square of
+/// raw pixels, embedded by LayerNorm, Linear, LayerNorm, a factorized (x, y) position table,
+/// LayerNorm, then `embed_vision` (scale-free RMSNorm, Linear).
+#[derive(Clone, Debug)]
+pub struct VisionEmbedder {
+    /// Side of one soft token's pixel square (`patch_size * pooling_kernel_size`).
+    side: u32,
+    embed_dim: u32,
+    pos_size: u32,
+    eps: f32,
+    text_hidden: u32,
+    max_soft_tokens: u32,
+    prefix: String,
+    embed: String,
+}
+
+#[derive(Clone, Debug)]
+pub enum Vision {
+    Tower(VisionTower),
+    Embedder(VisionEmbedder),
+}
+
+impl Vision {
+    fn max_soft_tokens(&self) -> u32 {
+        match self {
+            Vision::Tower(v) => v.max_soft_tokens,
+            Vision::Embedder(v) => v.max_soft_tokens,
+        }
+    }
+}
+
 /// Gemma-4 USM conformer audio tower (`gemma4_audio`) and its `embed_audio` projection.
 #[derive(Clone, Debug)]
 pub struct AudioTower {
@@ -403,10 +434,10 @@ pub enum Audio {
 }
 
 pub struct Towers {
-    pub vision: Option<VisionTower>,
+    pub vision: Option<Vision>,
+    /// The LM attends bidirectionally within each image (on the layers the emitter marks).
+    image_spans: bool,
     pub audio: Option<Audio>,
-    /// Declared towers this build leaves out, with why (logged; their modality answers 400).
-    pub skipped: Vec<String>,
     config: Value,
     processor: Value,
 }
@@ -430,14 +461,30 @@ impl Towers {
         let processor = json("processor_config.json").unwrap_or(Value::Null);
         let text = &config["text_config"];
         let text_hidden = u(text, "hidden_size")?;
-        let mut skipped = Vec::new();
+        // The LM attends bidirectionally within each image on its sliding layers (HF
+        // `use_bidirectional_attention: "vision"`); any other value keeps images causal.
+        let image_spans = match text["use_bidirectional_attention"].as_str() {
+            None => false,
+            Some("vision") => true,
+            Some(other) => return Err(format!("use_bidirectional_attention {other:?} has no multimodal lowering")),
+        };
         let vision = match config["vision_config"]["model_type"].as_str() {
             None => None,
-            // The LM attends bidirectionally within each image on its sliding layers; the LM
-            // attention kernels are causal-only, so image prompts would diverge from the checkpoint.
-            Some(t) if text["use_bidirectional_attention"].as_str() == Some("vision") => {
-                skipped.push(format!("vision ({t}): the LM needs bidirectional attention within images"));
-                None
+            Some("gemma4_unified_vision") => {
+                let v = &config["vision_config"];
+                let image = &processor["image_processor"];
+                let patch = u(v, "patch_size")?;
+                let pool = u(v, "pooling_kernel_size")?;
+                Some(Vision::Embedder(VisionEmbedder {
+                    side: patch * pool,
+                    embed_dim: u(v, "mm_embed_dim")?,
+                    pos_size: u(v, "mm_posemb_size")?,
+                    eps: f(v, "rms_norm_eps")?,
+                    text_hidden,
+                    max_soft_tokens: u(image, "max_soft_tokens").or_else(|_| u(v, "num_soft_tokens"))?,
+                    prefix: "model.vision_embedder.".into(),
+                    embed: "model.embed_vision.".into(),
+                }))
             }
             Some("gemma4_vision") => {
                 let v = &config["vision_config"];
@@ -445,7 +492,7 @@ impl Towers {
                 if v["rope_parameters"]["rope_type"].as_str().is_some_and(|t| t != "default" && t != "axial") {
                     return Err("gemma4_vision: unsupported rope type".into());
                 }
-                Some(VisionTower {
+                Some(Vision::Tower(VisionTower {
                     hidden: u(v, "hidden_size")?,
                     layers: u(v, "num_hidden_layers")?,
                     heads: u(v, "num_attention_heads")?,
@@ -462,7 +509,7 @@ impl Towers {
                     max_soft_tokens: u(image, "max_soft_tokens").or_else(|_| u(&config, "vision_soft_tokens_per_image"))?,
                     prefix: "model.vision_tower.".into(),
                     embed: "model.embed_vision.".into(),
-                })
+                }))
             }
             Some(other) => return Err(format!("vision tower {other:?} has no multimodal lowering")),
         };
@@ -514,12 +561,13 @@ impl Towers {
                 return Err("gemma4_audio geometry is unsupported".into());
             }
         }
-        if let Some(v) = &vision {
-            if !matches!(v.head_dim, 64 | 128) || v.hidden != v.heads * v.head_dim {
-                return Err(format!("vision head_dim {} has no attention lowering (64 or 128)", v.head_dim));
+        if let Some(Vision::Tower(v)) = &vision {
+            let width_ok = v.head_dim == 64 || (v.head_dim % 8 == 0 && v.head_dim <= 128);
+            if !width_ok || v.hidden != v.heads * v.head_dim {
+                return Err(format!("vision head_dim {} has no attention lowering (64, or a multiple of 8 up to 128)", v.head_dim));
             }
         }
-        Ok(Self { vision, audio, skipped, config, processor })
+        Ok(Self { vision, image_spans, audio, config, processor })
     }
 
     pub fn is_empty(&self) -> bool {
@@ -535,9 +583,15 @@ impl Towers {
         if let Some(v) = &self.vision {
             let image = &self.processor["image_processor"];
             let mut params = BTreeMap::new();
-            params.insert("patch_size".into(), u64::from(v.patch));
-            params.insert("pool".into(), u64::from(v.pool));
-            params.insert("max_soft_tokens".into(), u64::from(v.max_soft_tokens));
+            // The embedder's token is one `side` square: the same resize (sides multiples of
+            // `side`, at most `max_soft_tokens` squares) with the patch already merged.
+            let (patch, pool) = match v {
+                Vision::Tower(t) => (t.patch, t.pool),
+                Vision::Embedder(e) => (e.side, 1),
+            };
+            params.insert("patch_size".into(), u64::from(patch));
+            params.insert("pool".into(), u64::from(pool));
+            params.insert("max_soft_tokens".into(), u64::from(v.max_soft_tokens()));
             let rescale = image["rescale_factor"].as_f64().unwrap_or(1.0 / 255.0) as f32;
             params.insert("rescale_f32".into(), u64::from(rescale.to_bits()));
             params.insert("resample".into(), image["resample"].as_u64().unwrap_or(3));
@@ -556,6 +610,7 @@ impl Towers {
                 end: id("eoi_token_id"),
                 processor: "aspect_patches".into(),
                 parameters: params,
+                attention: if self.image_spans { MediaAttention::BidirectionalSpan } else { MediaAttention::Causal },
             });
         }
         if let Some(Audio::Frames(a)) = &self.audio {
@@ -572,6 +627,7 @@ impl Towers {
                 end: id("eoa_token_id").or_else(|| id("eoa_token_index")),
                 processor: "waveform_frames".into(),
                 parameters: params,
+                attention: MediaAttention::Causal,
             });
         }
         if let Some(Audio::Conformer(a)) = &self.audio {
@@ -606,6 +662,7 @@ impl Towers {
                 end: id("eoa_token_id").or_else(|| id("eoa_token_index")),
                 processor: "semicausal_log_mel".into(),
                 parameters: params,
+                attention: MediaAttention::Causal,
             });
         }
         let pad = text["pad_token_id"].as_u64().unwrap_or(0) as u32;
@@ -621,11 +678,14 @@ impl Towers {
     }
 
     pub fn lower_vision(&self, dir: &std::path::Path, n_cu: u32, target: u32, images: &[u32]) -> Result<Sidecar, String> {
-        let v = self.vision.as_ref().ok_or("checkpoint has no vision tower")?;
         let ckpt = Ckpt { reader: TensorReader::open(dir)? };
         let mut images: Vec<u32> = images.to_vec();
         images.sort_unstable_by(|a, b| b.cmp(a));
         images.dedup();
+        let v = match self.vision.as_ref().ok_or("checkpoint has no vision tower")? {
+            Vision::Tower(v) => v,
+            Vision::Embedder(e) => return lower_embedder(e, &ckpt, n_cu, target, &images),
+        };
         let mut seq = new_seq(n_cu, target);
         let mut programs = BTreeMap::new();
         for &n in &images {
@@ -723,6 +783,73 @@ fn lower_frames(a: &FrameAudio, ckpt: &Ckpt, n_cu: u32, target: u32, frames: &[u
         let p = &mut pipeline.parameters;
         p.insert("frame_samples".into(), u64::from(a.samples));
         p.insert("output_width".into(), u64::from(a.text_hidden));
+        p.insert("input.round_bf16".into(), 1);
+        Ok(())
+    })
+}
+
+/// Encoder-free vision: rungs hold `images` images of `max_soft_tokens` pixel squares each, one
+/// soft token per square (posx/posy u32::MAX on padding rows, which the runtime never reads).
+fn lower_embedder(v: &VisionEmbedder, ckpt: &Ckpt, n_cu: u32, target: u32, images: &[u32]) -> Result<Sidecar, String> {
+    const LN_EPS: f32 = 1e-5; // torch.nn.LayerNorm's default, which the checkpoint keeps
+    let values = 3 * v.side * v.side;
+    let (pre, d) = (&v.prefix, v.embed_dim);
+    let table = ckpt.f32s(&format!("{pre}pos_embedding"))?;
+    if table.len() != (2 * v.pos_size * d) as usize {
+        return Err("vision position table shape".into());
+    }
+    // `[pos][axis][dim]` -> one `[pos][dim]` table per axis.
+    let axis = |a: usize| -> Vec<f32> {
+        table.chunks_exact(d as usize).skip(a).step_by(2).flatten().copied().collect()
+    };
+    let (tx_values, ty_values) = (axis(0), axis(1));
+    let mut seq = new_seq(n_cu, target);
+    let mut programs = BTreeMap::new();
+    for &n in images {
+        let first = seq.prefix.as_ref().map_or(0, |p| p.programs.len());
+        let rows = n * v.max_soft_tokens;
+        seq.tag = rows;
+        let px = seq.t("in.mm.v.pixels", u64::from(rows * values));
+        let posx = seq.p().declare("in.mm.v.posx", u64::from(rows) * 4);
+        let posy = seq.p().declare("in.mm.v.posy", u64::from(rows) * 4);
+        let ln = |name: &str| (format!("{pre}{name}.weight"), format!("{pre}{name}.bias"));
+        let (g1, b1) = ln("patch_ln1");
+        let x = seq.layer_norm(px, "act.mm.v.ln1", rows, values, Some(&g1), Some(&b1), LN_EPS, 0)?;
+        let x = seq.dense(x, "act.mm.v.h", rows, values, d, &format!("{pre}patch_dense.weight"), Some(&format!("{pre}patch_dense.bias")))?;
+        let (g2, b2) = ln("patch_ln2");
+        let mut x = seq.layer_norm(x, "act.mm.v.ln2", rows, d, Some(&g2), Some(&b2), LN_EPS, 0)?;
+        let tx = seq.constant(&format!("{pre}pos_embedding.x"), tx_values.clone());
+        let ty = seq.constant(&format!("{pre}pos_embedding.y"), ty_values.clone());
+        let pos = seq.t("act.mm.v.pos", u64::from(rows * d));
+        seq.gather(pos, tx, v.pos_size, posx, rows, d, false)?;
+        seq.gather(pos, ty, v.pos_size, posy, rows, d, true)?;
+        seq.round(pos, rows, d)?;
+        x = seq.add(x, pos, rows, d)?;
+        let (g3, b3) = ln("pos_norm");
+        let x = seq.layer_norm(x, "act.mm.v.ln3", rows, d, Some(&g3), Some(&b3), LN_EPS, 0)?;
+        seq.rms(x, None, rows, 1, d, None, v.eps)?;
+        let out = seq.dense(x, "act.mm.v.out", rows, d, v.text_hidden, &format!("{}embedding_projection.weight", v.embed), None)?;
+        seq.cut();
+        let prefix = seq.prefix.as_mut().unwrap();
+        prefix.output = out;
+        prefix.input = px;
+        prefix.input_shape = vec![u64::from(rows), u64::from(values)];
+        programs.insert(n, prefix.programs[first..].to_vec());
+    }
+    finish_sidecar(seq, ckpt, programs, "vision", |pipeline, prefix| {
+        let rows = u64::from(images[0] * v.max_soft_tokens);
+        let tensors = [
+            ("posx", "in.mm.v.posx", PipelineDType::U32, vec![rows]),
+            ("posy", "in.mm.v.posy", PipelineDType::U32, vec![rows]),
+        ];
+        add_tensors(pipeline, prefix, &tensors)?;
+        let p = &mut pipeline.parameters;
+        p.insert("item_rows".into(), u64::from(v.max_soft_tokens));
+        p.insert("item_tokens".into(), u64::from(v.max_soft_tokens));
+        p.insert("patch_values".into(), u64::from(values));
+        p.insert("pool".into(), 1);
+        p.insert("output_width".into(), u64::from(v.text_hidden));
+        p.insert("position_limit".into(), u64::from(v.pos_size));
         p.insert("input.round_bf16".into(), 1);
         Ok(())
     })

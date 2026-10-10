@@ -19,8 +19,10 @@ import json
 import os
 import sys
 
+VLLM_TPL = os.environ.get("VLLM_TOOL_TEMPLATES", "/opt/dlami/nvme/lava-tts/toolperf/scratch/vllm_tpl/")
+
 FAMILIES = {
-    # name: (hub repo, local template override or None)
+    # name: (hub repo, local dir or None[, template file override[, named template]])
     "gemma4-e4b": ("google/gemma-4-E4B-it", None),
     "gemma4-12b": ("google/gemma-4-12b-it", "/opt/dlami/nvme/hf-cache/hub/gemma-4-12b-it-fp8"),
     "gemma4-31b": ("google/gemma-4-31B-it",
@@ -37,7 +39,17 @@ FAMILIES = {
     "kimi-k2": ("moonshotai/Kimi-K2-Instruct", None),
     "gpt-oss": ("openai/gpt-oss-20b", None),
     "deepseek-v3.1": ("deepseek-ai/DeepSeek-V3.1", None),
+    "deepseek-r1": ("deepseek-ai/DeepSeek-R1-0528", None),
     "mixtral": ("mistralai/Mixtral-8x7B-Instruct-v0.1", None),
+    "llama3.3": ("unsloth/Llama-3.3-70B-Instruct", None),
+    "glm5": ("zai-org/GLM-5", None),
+    # The checkpoint's named `tool_use` template, which transformers picks when `tools` are passed.
+    "hermes3": ("NousResearch/Hermes-3-Llama-3.1-8B", None, None, "tool_use"),
+    # DeepSeek's own templates render no `tools`; vLLM ships tool templates for them
+    # (examples/tool_chat_template_deepseek*.jinja, v0.11.0), rendered with each checkpoint's tokens.
+    "deepseek-v3-tools": ("deepseek-ai/DeepSeek-V3-0324", None, VLLM_TPL + "deepseekv3.jinja"),
+    "deepseek-r1-tools": ("deepseek-ai/DeepSeek-R1-0528", None, VLLM_TPL + "deepseekr1.jinja"),
+    "deepseek-v3.1-tools": ("deepseek-ai/DeepSeek-V3.1", None, VLLM_TPL + "deepseekv31.jinja"),
 }
 
 TOOLS = [
@@ -119,7 +131,7 @@ def render(render_jinja_template, tpl, req, bos, eos):
         return render_jinja_template([hf_messages(req["messages"], False)], tools=req.get("tools"), **kw)[0][0]
 
 
-def load_template(d):
+def load_template(d, tpl_file=None, variant=None):
     from transformers.utils.chat_template_utils import render_jinja_template  # noqa: F401
     cfg = json.load(open(os.path.join(d, "tokenizer_config.json")))
     if os.path.exists(os.path.join(d, "chat_template.jinja")):
@@ -127,7 +139,10 @@ def load_template(d):
     else:
         tpl = cfg.get("chat_template")
         if isinstance(tpl, list):
-            tpl = next((e["template"] for e in tpl if e["name"] == "default"), tpl[0]["template"])
+            want = variant or "default"
+            tpl = next((e["template"] for e in tpl if e["name"] == want), tpl[0]["template"])
+    if tpl_file:
+        tpl = open(tpl_file).read()
     tok = lambda k: (cfg.get(k)["content"] if isinstance(cfg.get(k), dict) else cfg.get(k))
     return tpl, tok("bos_token"), tok("eos_token")
 
@@ -149,11 +164,11 @@ def main():
     ap.add_argument("--only", nargs="*")
     a = ap.parse_args()
     from transformers.utils.chat_template_utils import render_jinja_template
-    for fam, (repo, local) in FAMILIES.items():
+    for fam, (repo, local, *extra) in FAMILIES.items():
         if a.only and fam not in a.only:
             continue
         d = local or fetch(repo, a.cache)
-        tpl, bos, eos = load_template(d)
+        tpl, bos, eos = load_template(d, *extra)
         tokjs = os.path.join(d, "tokenizer.json")
         tokz = None
         if os.path.exists(tokjs):
@@ -161,6 +176,9 @@ def main():
             tokz = Tokenizer.from_file(tokjs)
         out = []
         for name, req in cases():
+            # transformers renders a request without tools with the default template, not the named one.
+            if len(extra) > 1 and "tools" not in req:
+                continue
             rec = {"name": name, "request": req}
             try:
                 text = render(render_jinja_template, tpl, req, bos, eos)

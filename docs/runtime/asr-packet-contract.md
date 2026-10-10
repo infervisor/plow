@@ -125,8 +125,8 @@ asr_packet_upgrade rnnt     nemotron.pkt MODEL.gguf      nemotron.v1.pkt     # a
 asr_packet_upgrade audio-lm model.pkt                   model.v1.pkt        # receipt-less audio-LM packets only
 ```
 
-`encoder.pkt` sidecars need no change. A kit carrying upgraded packets needs new sha256 entries
-(`PAIRING.txt`, `SHA256SUMS`, `MANIFEST.json`).
+`encoder.pkt` sidecars need no change. A bundle carrying upgraded packets needs new sha256 entries
+in its `MANIFEST.json`.
 
 A packet bound to compiler check receipts (`lean-checks.json` / `<stem>.lean-checks.json`: the
 receipt pins the packet image's sha256) cannot be rewritten: plowrt would refuse the receipt.

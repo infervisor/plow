@@ -27,10 +27,9 @@ pub fn read_section(pkt: &Path) -> Result<Option<Vec<u8>>> {
 /// The packet's multimodal contract, when it carries one.
 pub fn read_multimodal(pkt: &Path) -> Result<Option<plow_asset::multimodal::MmContract>> {
     let Some(bytes) = read_named_section(pkt, plow_asset::multimodal::SECTION)? else { return Ok(None) };
-    let contract: plow_asset::multimodal::MmContract = serde_json::from_slice(&bytes)
-        .map_err(|e| RuntimeError::Device(format!("{}: multimodal contract: {e}", pkt.display())))?;
-    contract.validate().map_err(|e| RuntimeError::Device(format!("{}: {e}", pkt.display())))?;
-    Ok(Some(contract))
+    plow_asset::multimodal::MmContract::from_json(&bytes)
+        .map(Some)
+        .map_err(|e| RuntimeError::Device(format!("{}: {e}", pkt.display())))
 }
 
 /// A metadata section's bytes, read from the section directory without loading the packet.
@@ -324,7 +323,7 @@ pub fn asset_env_defaults(
 
 /// The runtime contract this plowrt implements. A bundle whose `build.json`
 /// `runtime_requires.plowrt_contract` is higher needs a newer plowrt.
-pub const RUNTIME_CONTRACT: u32 = 1;
+pub const RUNTIME_CONTRACT: u32 = plow_asset::RUNTIME_CONTRACT;
 
 /// The cuBLASLt release grouped matmul (`cublasLtGroupedMatrixLayoutCreate`) needs on Hopper.
 const GROUPED_LT: usize = 130400;
@@ -419,10 +418,10 @@ pub fn check_runtime(
         Err(e) => e.clone(),
     };
     Err(RuntimeError::Rejected(format!(
-        "model {} needs cuBLASLt >= {} ({why}); this runtime loads {have}. Ship libcublasLt.so.13 \
-         from cuBLAS 13.4 or newer beside plowrt.",
+        "model {} needs cuBLASLt >= {need} ({why}); this runtime loads {have}. Ship a libcublasLt \
+         of cuBLAS {need} or newer beside plowrt.",
         asset_dir.display(),
-        show_version(*need)
+        need = show_version(*need)
     )))
 }
 
