@@ -405,7 +405,13 @@ static __global__ void plow_moe_slot_glu_fp8_blk(bf16* __restrict__ fu, const bf
  * register-bound at 174 regs / 1 block per SM — spilling there would cost every other op. The
  * channel-major order buys the same HBM reduction through L2 at zero register cost. Explicit
  * register reuse is the next lever if L2 miss counters ever say otherwise.                    */
+/* Per-CTA row scratch (inv[] / rms_w[], the fp8 dedupe slot tables) covers the packet's widest
+ * decode rung (> 32 only on packets whose ladder reaches 64/128 rows). */
+#if defined(PLOW_PACKET_DECODE_BATCH) && PLOW_PACKET_DECODE_BATCH > 32
+#define PLOW_MOE_MAXB (PLOW_PACKET_DECODE_BATCH + 0u)
+#else
 #define PLOW_MOE_MAXB 32u
+#endif
 
 /* ---- ROW-BLOCKED DECODE GEMV (H100 campaign E2) -----------------------------------------
  * At the megakernel's 1 block/SM a warp that owns ONE output row keeps only UN weight loads
@@ -555,7 +561,7 @@ __device__ __forceinline__ void plow_moe_row_rms(float* __restrict__ inv, float*
         return;
     }
     if (PLOW_NV_GEMV_RB && (H & 7u) == 0u) {
-        __shared__ float rms_w[PLOW_MOE_MAXB * PLOW_NV_WARPS];
+        __shared__ float rms_w[32u * PLOW_NV_WARPS]; /* nrow <= 1 here: wider batches returned above */
         const unsigned nvec = H >> 3;
         for (unsigned r = 0; r < nrow; r++) {
             const bf16* rr = resid + (size_t)r * H;
@@ -1532,11 +1538,29 @@ __shared__ unsigned plow_dd_cnt[PLOW_DD_MAXE + 1];
 __shared__ unsigned short plow_dd_start[PLOW_DD_MAXE + 1];
 __shared__ unsigned short plow_dd_uofs[PLOW_DD_MAXE + 2];
 __shared__ unsigned char plow_dd_uexp[PLOW_DD_MAXE];
+#if PLOW_MOE_MAXB > 32u
+/* Wide ladders (64/128 rows): the per-slot tables (8 B a slot) live in the dynamic arena past
+ * the tensor-core GEMV's K-split reduction; the decode object's static smem is at its 48 KiB cap.
+ * interp_sm120.cu adds PLOW_DD_DYN_BYTES to the launch claim. */
+#ifdef PLOW_FP8TC_ARENA_BYTES
+#define PLOW_DD_DYN_OFF PLOW_FP8TC_ARENA_BYTES
+#else
+#define PLOW_DD_DYN_OFF 0u
+#endif
+#define PLOW_DD_DYN_BYTES (PLOW_DD_MAXS * 8u)
+extern __shared__ __align__(16) unsigned char plow_dd_dyn[];
+#define plow_dd_slot ((unsigned short*)(plow_dd_dyn + PLOW_DD_DYN_OFF))
+#define plow_dd_bkt (plow_dd_slot + PLOW_DD_MAXS)
+#define plow_dd_gofs (plow_dd_bkt + PLOW_DD_MAXS)   /* group -> first slot-list index */
+#define plow_dd_glen ((unsigned char*)(plow_dd_gofs + PLOW_DD_MAXS))
+#define plow_dd_gexp (plow_dd_glen + PLOW_DD_MAXS)
+#else
 __shared__ unsigned short plow_dd_slot[PLOW_DD_MAXS];
 __shared__ unsigned short plow_dd_bkt[PLOW_DD_MAXS];
 __shared__ unsigned short plow_dd_gofs[PLOW_DD_MAXS];   /* group -> first slot-list index */
 __shared__ unsigned char plow_dd_glen[PLOW_DD_MAXS];
 __shared__ unsigned char plow_dd_gexp[PLOW_DD_MAXS];
+#endif
 __shared__ unsigned plow_dd_nu, plow_dd_ng;
 
 /* Fills uexp[0..nu) (ascending expert id), uofs[0..nu] and the grouped slot list; slots with no
@@ -2834,10 +2858,107 @@ static __device__ void d_moe_router_gemma_pf(unsigned char* __restrict__ table,
  * (token, part-row, gate) into expert-contiguous gathered rows. Atomic scatter is order-safe:
  * per-row GEMM math is independent and the combine order is fixed by (token,slot). */
 #define PLOW_MOE_MAXE 256u
+#define MOE_ALIGN_U 8u
+/* nblk blocks: every block histograms all slots (and the slots before its own range), so each
+ * derives the same padded prefix; block j scatters only slot range j, at cursors past the earlier
+ * ranges' rows, and pads experts e == j mod nblk. The blocks write disjoint gathered rows. */
+static __device__ void d_moe_align_gemma_pf_multi(int* __restrict__ meta,
+                                                  const unsigned char* __restrict__ table,
+                                                  unsigned* __restrict__ row_token,
+                                                  unsigned* __restrict__ row_partidx,
+                                                  float* __restrict__ row_gate, unsigned T,
+                                                  unsigned n_exp, unsigned k, unsigned slice,
+                                                  unsigned nblk) {
+    const unsigned tid = threadIdx.x, nth = blockDim.x;
+#if defined(PLOW_NV_HOPPER) && MOE90_HALF
+    const unsigned BM = (unsigned)PGM_BM / 2u;
+#else
+    const unsigned BM = (unsigned)PGM_BM;
+#endif
+    __shared__ unsigned cnt[PLOW_MOE_MAXE];
+    __shared__ unsigned cur[PLOW_MOE_MAXE];
+    __shared__ unsigned start[PLOW_MOE_MAXE];
+    __shared__ unsigned s_tiles;
+    const unsigned nslot = T * k;
+    const unsigned span = (nslot + nblk - 1u) / nblk;
+    const unsigned lo = min(nslot, slice * span), hi = min(nslot, lo + span);
+
+    for (unsigned e = tid; e < n_exp; e += nth) cnt[e] = cur[e] = 0u;
+    __syncthreads();
+    for (unsigned base = 0; base < nslot; base += nth * MOE_ALIGN_U) {
+        unsigned eid[MOE_ALIGN_U];
+#pragma unroll
+        for (unsigned j = 0; j < MOE_ALIGN_U; j++) {
+            const unsigned idx = base + j * nth + tid;
+            eid[j] = idx < nslot ? plow_moe_slot_expert(table, idx) : ~0u;
+        }
+#pragma unroll
+        for (unsigned j = 0; j < MOE_ALIGN_U; j++)
+            if (eid[j] < n_exp) {
+                atomicAdd(&cnt[eid[j]], 1u);
+                if (base + j * nth + tid < lo) atomicAdd(&cur[eid[j]], 1u);
+            }
+    }
+    __syncthreads();
+
+    if (tid == 0) {
+        int* rowoff = meta;
+        int* mcnt = meta + n_exp;
+        int* tilep = meta + 2u * n_exp;
+        unsigned tp = 0u;
+        for (unsigned e = 0; e < n_exp; e++) {
+            if (slice == 0) {
+                tilep[e] = (int)tp;
+                rowoff[e] = (int)(tp * BM);
+                mcnt[e] = (int)cnt[e];
+            }
+            start[e] = tp * BM;
+            cur[e] += tp * BM;
+            tp += (cnt[e] + BM - 1u) / BM;
+        }
+        if (slice == 0) tilep[n_exp] = (int)tp;
+        s_tiles = tp;
+    }
+    __syncthreads();
+
+    /* pad rows: owned experts' tile tails, and (block 0) the PGM_BM round-up past the last tile. */
+    for (unsigned e = slice; e < n_exp; e += nblk) {
+        const unsigned a = start[e] + cnt[e];
+        const unsigned b = start[e] + (cnt[e] + BM - 1u) / BM * BM;
+        for (unsigned r = a + tid; r < b; r += nth) {
+            row_token[r] = PLOW_EXPERT_UNUSED;
+            row_partidx[r] = PLOW_EXPERT_UNUSED;
+            row_gate[r] = 0.0f;
+        }
+    }
+    if (slice == 0) {
+        const unsigned a = s_tiles * BM;
+        const unsigned b = (a + (unsigned)PGM_BM - 1u) / (unsigned)PGM_BM * (unsigned)PGM_BM;
+        for (unsigned r = a + tid; r < b; r += nth) {
+            row_token[r] = PLOW_EXPERT_UNUSED;
+            row_partidx[r] = PLOW_EXPERT_UNUSED;
+            row_gate[r] = 0.0f;
+        }
+    }
+
+    for (unsigned idx = lo + tid; idx < hi; idx += nth) {
+        const uint2 slot = *(const uint2*)(table + (size_t)idx * 8);
+        if (slot.x >= n_exp) continue;
+        const unsigned pos = atomicAdd(&cur[slot.x], 1u);
+        row_token[pos] = idx / k;
+        row_partidx[pos] = idx;
+        row_gate[pos] = __uint_as_float(slot.y);
+    }
+}
 static __device__ void d_moe_align_gemma_pf(int* __restrict__ meta, const unsigned char* __restrict__ table,
                                      unsigned* __restrict__ row_token, unsigned* __restrict__ row_partidx,
                                      float* __restrict__ row_gate, unsigned T, unsigned n_exp,
-                                     unsigned k, unsigned slice) {
+                                     unsigned k, unsigned slice, unsigned nblk) {
+    if (nblk > 1u) {
+        d_moe_align_gemma_pf_multi(meta, table, row_token, row_partidx, row_gate, T, n_exp, k,
+                                   slice, nblk);
+        return;
+    }
     if (slice != 0) return; /* single block */
     const unsigned tid = threadIdx.x, nth = blockDim.x;
 #if defined(PLOW_NV_HOPPER) && MOE90_HALF
@@ -2852,10 +2973,19 @@ static __device__ void d_moe_align_gemma_pf(int* __restrict__ meta, const unsign
     for (unsigned e = tid; e < n_exp; e += nth) cnt[e] = 0u;
     __syncthreads();
 
+    /* One block walks every slot twice: issue MOE_ALIGN_U slot loads before the first
+     * atomic, or each pass is one dependent global load per iteration. */
     const unsigned nslot = T * k;
-    for (unsigned idx = tid; idx < nslot; idx += nth) {
-        const unsigned eid = plow_moe_slot_expert(table, idx);
-        if (eid < n_exp) atomicAdd(&cnt[eid], 1u);
+    for (unsigned base = 0; base < nslot; base += nth * MOE_ALIGN_U) {
+        unsigned eid[MOE_ALIGN_U];
+#pragma unroll
+        for (unsigned j = 0; j < MOE_ALIGN_U; j++) {
+            const unsigned idx = base + j * nth + tid;
+            eid[j] = idx < nslot ? plow_moe_slot_expert(table, idx) : ~0u;
+        }
+#pragma unroll
+        for (unsigned j = 0; j < MOE_ALIGN_U; j++)
+            if (eid[j] < n_exp) atomicAdd(&cnt[eid[j]], 1u);
     }
     __syncthreads();
 
@@ -2888,13 +3018,22 @@ static __device__ void d_moe_align_gemma_pf(int* __restrict__ meta, const unsign
     __syncthreads();
 
     /* scatter. */
-    for (unsigned idx = tid; idx < nslot; idx += nth) {
-        const unsigned eid = plow_moe_slot_expert(table, idx);
-        if (eid >= n_exp) continue;
-        const unsigned pos = atomicAdd(&cur[eid], 1u);
-        row_token[pos] = idx / k;   /* source token */
-        row_partidx[pos] = idx;     /* destination row of part[T*k, H] = token*k + slot */
-        row_gate[pos] = plow_moe_slot_gate(table, idx);
+    for (unsigned base = 0; base < nslot; base += nth * MOE_ALIGN_U) {
+        uint2 slot[MOE_ALIGN_U]; /* expert id, gate bits */
+#pragma unroll
+        for (unsigned j = 0; j < MOE_ALIGN_U; j++) {
+            const unsigned idx = base + j * nth + tid;
+            slot[j] = idx < nslot ? *(const uint2*)(table + (size_t)idx * 8) : make_uint2(~0u, 0u);
+        }
+#pragma unroll
+        for (unsigned j = 0; j < MOE_ALIGN_U; j++) {
+            if (slot[j].x >= n_exp) continue;
+            const unsigned idx = base + j * nth + tid;
+            const unsigned pos = atomicAdd(&cur[slot[j].x], 1u);
+            row_token[pos] = idx / k;   /* source token */
+            row_partidx[pos] = idx;     /* destination row of part[T*k, H] = token*k + slot */
+            row_gate[pos] = __uint_as_float(slot[j].y);
+        }
     }
 }
 

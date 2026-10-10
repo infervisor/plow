@@ -41,6 +41,7 @@ use crate::{DeviceErrorInfo, Result, RuntimeError};
 
 pub(crate) mod cutlass_fp8;
 pub(crate) mod lt;
+pub use lt::library as cublaslt_library;
 pub(crate) mod qwen_gdn;
 
 // Driver ABI types (bindgen-equivalent, transcribed from cuda.h).
@@ -128,6 +129,9 @@ const ATTR_MULTIPROCESSOR_COUNT: i32 = 16;
 const ATTR_COMPUTE_CAPABILITY_MAJOR: i32 = 75;
 const ATTR_COMPUTE_CAPABILITY_MINOR: i32 = 76;
 const ATTR_COOPERATIVE_LAUNCH: i32 = 95;
+const ATTR_PCI_BUS_ID: i32 = 33;
+const ATTR_PCI_DEVICE_ID: i32 = 34;
+const ATTR_PCI_DOMAIN_ID: i32 = 50;
 const ATTR_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN: i32 = 97;
 /// `CU_DEVICE_ATTRIBUTE_PAGEABLE_MEMORY_ACCESS_USES_HOST_PAGE_TABLES`: 1 only
 /// on hardware-coherent platforms (Grace-Hopper ATS), where the DMA engines
@@ -309,6 +313,23 @@ thread_local! {
 }
 
 static NEXT_CONTEXT_ID: AtomicU64 = AtomicU64::new(1);
+
+/// A context synchronize waits on every stream of its context, so one issued while another
+/// thread captures a graph there fails both (`CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED`) — e.g. a
+/// speech pipeline binding its graphs during a model switch while resident models serve.
+/// Captures hold their device's lock exclusively. One lock per device (its primary context, which
+/// every backend on it shares): a capture on one GPU never delays a synchronize on another.
+fn capture_exclusion(dev: CUdevice) -> Arc<parking_lot::RwLock<()>> {
+    static BY_DEVICE: std::sync::OnceLock<Mutex<FxHashMap<CUdevice, Arc<parking_lot::RwLock<()>>>>> =
+        std::sync::OnceLock::new();
+    BY_DEVICE.get_or_init(Default::default).lock().entry(dev).or_default().clone()
+}
+
+thread_local! {
+    /// The capture exclusion this thread holds for a capture, by address (0: none): its own
+    /// synchronize on that device fails, not blocks.
+    static CAPTURING: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
 // Cache the retained lifetime, not a driver handle that can be recycled on
 // another thread. Every context mutation must update this cache.
@@ -586,6 +607,8 @@ pub struct CudaBackend {
     ctx: usize,
     /// Handed to every owned `DeviceMem`; its Drop releases the primary ctx.
     freer: Arc<CudaFreer>,
+    /// This device's [`capture_exclusion`].
+    capture_exclusion: Arc<parking_lot::RwLock<()>>,
     pub device_ordinal: u8,
     /// `cuDriverGetVersion` (e.g. 12080 = CUDA 12.8) — the load-time ceiling
     /// on cubin toolkit versions; surfaced in the `module_load` error.
@@ -598,6 +621,8 @@ pub struct CudaBackend {
     /// Hardware-coherent pageable access (attr 100) — see
     /// [`Backend::coherent_host_dma`].
     coherent_host_dma: bool,
+    /// PCI address (`0000:41:00.0`), for host-thread placement on the device's socket.
+    pci_bdf: Option<String>,
     /// Real loaded modules by placeholder-exclusive id (id 0 = "no module",
     /// handed out for an empty image so `ExecutorSet::bringup` works before
     /// any real cubin exists — the engine loads its module explicitly).
@@ -626,6 +651,11 @@ unsafe impl Send for CudaBackend {}
 unsafe impl Sync for CudaBackend {}
 
 impl CudaBackend {
+    /// PCI address of this device, when the driver reports it.
+    pub fn pci_bdf(&self) -> Option<&str> {
+        self.pci_bdf.as_deref()
+    }
+
     /// `dlopen` the driver, `cuInit`, retain the device's primary context, and
     /// read the device geometry. Fails cleanly on a host without a CUDA driver
     /// — the runtime then falls back to another backend.
@@ -762,6 +792,10 @@ impl CudaBackend {
                     (api.cuDeviceGetAttribute)(&mut v, ATTR_PAGEABLE_USES_HOST_PAGE_TABLES, dev);
                 rc == 0 && v == 1
             };
+            let pci_bdf = match (attr(ATTR_PCI_DOMAIN_ID, "pci"), attr(ATTR_PCI_BUS_ID, "pci"), attr(ATTR_PCI_DEVICE_ID, "pci")) {
+                (Ok(d), Ok(b), Ok(s)) => Some(format!("{d:04x}:{b:02x}:{s:02x}.0")),
+                _ => None,
+            };
             let coop = attr(ATTR_COOPERATIVE_LAUNCH, "attr cooperative")?;
             if coop == 0 {
                 return Err(RuntimeError::Device(format!(
@@ -793,6 +827,7 @@ impl CudaBackend {
                 tmap_encode,
                 ctx: ctx as usize,
                 freer,
+                capture_exclusion: capture_exclusion(dev),
                 device_ordinal,
                 driver_version,
                 name,
@@ -801,6 +836,7 @@ impl CudaBackend {
                 compute_capability,
                 smem_optin,
                 coherent_host_dma,
+                pci_bdf,
                 modules: Mutex::new(FxHashMap::default()),
                 module_images: Mutex::new(FxHashMap::default()),
                 next_module: AtomicU64::new(1),
@@ -1458,14 +1494,18 @@ impl CudaBackend {
         enqueue: impl FnOnce() -> Result<()>,
     ) -> Result<GraphExec> {
         self.bind()?;
+        let exclusive = self.capture_exclusion.write();
+        let outer = CAPTURING.replace(Arc::as_ptr(&self.capture_exclusion) as usize);
         // Thread-local capture; callers enqueue only immutable same-stream operations.
-        self.check(
+        let begun = self.check(
             unsafe { (self.api.cuStreamBeginCapture)(stream.raw as CUstream, 1) },
             "cuStreamBeginCapture",
-        )?;
-        let result = enqueue();
+        );
+        let result = begun.and_then(|()| enqueue());
         let mut graph = std::ptr::null_mut();
         let ended = unsafe { (self.api.cuStreamEndCapture)(stream.raw as CUstream, &mut graph) };
+        CAPTURING.set(outer);
+        drop(exclusive);
         if let Err(e) = result {
             if !graph.is_null() {
                 unsafe {
@@ -1629,6 +1669,8 @@ impl CudaBackend {
     /// load/unload and error-path quiesce.
     pub fn synchronize(&self) -> Result<()> {
         self.bind()?;
+        let lock = &self.capture_exclusion;
+        let _shared = (CAPTURING.get() != Arc::as_ptr(lock) as usize).then(|| lock.read());
         // SAFETY: no arguments.
         self.check(unsafe { (self.api.cuCtxSynchronize)() }, "cuCtxSynchronize")
     }
@@ -2359,6 +2401,17 @@ impl Backend for CudaBackend {
 
 #[cfg(test)]
 mod tests {
+    /// A capture holds only its own device's exclusion; the same device shares one.
+    #[test]
+    fn capture_exclusion_is_per_device() {
+        let (a, b) = (super::capture_exclusion(0), super::capture_exclusion(1));
+        assert!(std::sync::Arc::ptr_eq(&a, &super::capture_exclusion(0)));
+        let capturing = b.write();
+        assert!(a.try_read().is_some(), "a capture on device 1 blocked a synchronize on device 0");
+        assert!(super::capture_exclusion(1).try_read().is_none());
+        drop(capturing);
+    }
+
     use super::is_cuda_fatal;
 
     #[test]

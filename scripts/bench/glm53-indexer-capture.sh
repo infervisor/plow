@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
-source /home/lava/plow/scripts/bench/plowbench.sh
+source "$(dirname "${BASH_SOURCE[0]}")/plowbench.sh"
 pb_require_nix
 pb_hazard_env
 capture=$(realpath "${1:?usage: glm53-indexer-capture.sh frozen-capture-directory}")

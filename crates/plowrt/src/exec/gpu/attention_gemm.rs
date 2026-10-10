@@ -49,16 +49,13 @@ const STAGING: usize = 4;
 /// Shape arrays per wave block: hd, m, n8, ld_s, ld_p.
 const DIMS: usize = 5;
 
-/// The softmax object the route loads (`--pf-seg-dir`, then the asset dir), or `None` when the
-/// route is off: `PLOW_PF_ATTN_GEMM=0`, or unset and the packet carries no object. `=1` names
-/// the object whether or not it exists, so a missing one fails the load.
+/// The softmax object the route loads (the bundle's object dir, then the asset dir), or `None`
+/// when the route is off: `PLOW_PF_ATTN_GEMM=0`, or unset and the packet carries no object.
+/// `=1` names the object whether or not it exists, so a missing one fails the load.
 pub(super) fn object(assets_dir: &Path) -> Option<std::path::PathBuf> {
     let config = &crate::config::RuntimeConfig::get().nv;
-    let path = config
-        .pf_seg_dir
-        .as_deref()
-        .filter(|dir| !dir.is_empty())
-        .map(|dir| Path::new(dir).join(SOFTMAX_OBJECT))
+    let path = crate::asset::serve::objects_dir(assets_dir)
+        .map(|dir| dir.join(SOFTMAX_OBJECT))
         .filter(|path| path.exists())
         .unwrap_or_else(|| assets_dir.join(SOFTMAX_OBJECT));
     match config.pf_attn_gemm {
@@ -74,10 +71,20 @@ fn tile_rows(max_rows: u32) -> u32 {
     crate::config::RuntimeConfig::get().nv.pf_attn_gemm_tile.clamp(1, max_rows.max(1))
 }
 
-/// The score scratch `load` allocates: one tile of every head at the widest KV pitch.
+/// KV columns the score scratch is sized for. A longer extent runs proportionally shorter tiles
+/// (`AttentionGemm::tile`) instead of growing the scratch with the context: f32 scores at a
+/// 262144 context would take 16 GiB.
+const SCRATCH_COLS: usize = 16384;
+
+/// The context the scratch holds whole tiles of.
+pub(super) fn scratch_ctx(max_ctx: usize) -> usize {
+    max_ctx.min(SCRATCH_COLS)
+}
+
+/// The score scratch `load` allocates: one tile of every head at the widest KV pitch it holds.
 pub(super) fn scratch_bytes(max_heads: u32, max_ctx: usize, max_rows: u32) -> u64 {
     let element = if crate::config::RuntimeConfig::get().nv.pf_attn_gemm_s32 { 4 } else { 2 };
-    let pitch = (max_ctx as u64).next_multiple_of(u64::from(PITCH));
+    let pitch = (scratch_ctx(max_ctx) as u64).next_multiple_of(u64::from(PITCH));
     u64::from(tile_rows(max_rows)) * u64::from(max_heads) * pitch * element
 }
 
@@ -332,6 +339,15 @@ pub(super) struct AttentionGemm {
 /// the buckets steer the heuristic.
 type GroupedKey = (Gemm, usize, u32, u32, u32, u32);
 
+/// Measured grouped-attention picks by device model: every engine of one GPU model in the
+/// process (DP ranks) runs the first one's pick, so their outputs agree; timing near-tied
+/// candidates on each made temperature-0 output differ by rank.
+fn grouped_selections() -> &'static parking_lot::Mutex<std::collections::HashMap<(String, GroupedKey), [u64; 8]>> {
+    static S: std::sync::OnceLock<parking_lot::Mutex<std::collections::HashMap<(String, GroupedKey), [u64; 8]>>> =
+        std::sync::OnceLock::new();
+    S.get_or_init(Default::default)
+}
+
 impl AttentionGemm {
     /// `max_sites` routed segments per launch, `batch` slots, `max_rows` the largest routed
     /// bucket.
@@ -447,6 +463,20 @@ impl AttentionGemm {
     /// `m` counts rows of one GEMM batch: every head's rows (one KV head, `group == 1`) or one
     /// query head's (a batch of `group` query heads).
     #[allow(clippy::too_many_arguments)]
+    /// Query rows of the next tile after `past` KV rows: the knob's tile, shortened while its
+    /// score rows would not fit the scratch.
+    fn tile(&self, heads: u32, past: u32, left: u32, element: u64) -> u32 {
+        let mut tile = self.tile_rows.min(left);
+        loop {
+            let pitch = (past + tile).next_multiple_of(8).next_multiple_of(PITCH);
+            let fit = self.scratch.len / (u64::from(heads) * u64::from(pitch) * element);
+            if u64::from(tile) <= fit || tile == 1 {
+                return tile;
+            }
+            tile = (fit as u32).max(1);
+        }
+    }
+
     fn plan(
         &mut self,
         kind: Gemm,
@@ -507,7 +537,7 @@ impl AttentionGemm {
             let v = site.v + u64::from(slot) * site.slot_bytes;
             let mut done = 0;
             while done < qlen {
-                let tile = self.tile_rows.min(qlen - done);
+                let tile = self.tile(site.heads, past + done, qlen - done, element);
                 let m = tile * site.heads;
                 // One GEMM batch: every head's rows, or one query head's of a KV head's group.
                 let (gm, batch) = if site.kv_heads == 1 { (m, 1) } else { (tile, group) };
@@ -624,7 +654,7 @@ impl AttentionGemm {
             }
             let mut done = 0;
             while done < qlen {
-                let tile = self.tile_rows.min(qlen - done);
+                let tile = self.tile(site.heads, past + done, qlen - done, element);
                 let m = tile * site.heads;
                 let n8 = (past + done + tile).next_multiple_of(8);
                 let pitch = n8.next_multiple_of(PITCH);
@@ -920,6 +950,11 @@ impl AttentionGemm {
         if plan.candidates() == 0 {
             return plan.run(a, w, c, stream);
         }
+        let memo_key = (self.be.device_name().to_string(), key);
+        let known = grouped_selections().lock().get(&memo_key).copied();
+        if known.is_some_and(|data| plan.select_algo(&data)) {
+            return plan.run(a, w, c, stream);
+        }
         let start = self.be.event_create(true)?;
         let end = self.be.event_create(true)?;
         let mut times = Vec::with_capacity(plan.candidates());
@@ -948,6 +983,7 @@ impl AttentionGemm {
         let (ms, index) = best.filter(|(ms, _)| ms.is_finite()).ok_or_else(|| {
             RuntimeError::Device("no runnable grouped attention candidate".into())
         })?;
+        grouped_selections().lock().entry(memo_key).or_insert(plan.candidate_algo(index));
         plan.select(index);
         tracing::info!(
             ?key,
@@ -1170,6 +1206,8 @@ mod tests {
         assert_eq!(scratch_bytes(16, 16384, 4224), 1 << 30);
         // No request of a 1024-row bucket runs a longer tile.
         assert_eq!(scratch_bytes(16, 15000, 1024), 1024 * 16 * 15104 * 2);
+        // A longer context keeps the 16k scratch and runs shorter tiles.
+        assert_eq!(scratch_bytes(16, 262144, 4224), 1 << 30);
     }
 
     #[test]

@@ -7,3 +7,6 @@ trace-dump	scripts/glm53_dsa_run.sh	checkpoint	Decode-only DSA/dense packet trac
 performance	scripts/k3_block_sweep.sh	checkpoint	Truncated-model context sweep with real weights; never use as served-model performance.
 synthetic-probe	scripts/l1_ab.sh	synthetic	Unbound packet/kernel A/B migrated to amd-probe; never use as served-model performance.
 correctness	scripts/mfma_numerics_ab.sh	checkpoint	Dump control/candidate logits for numerical agreement and ragged-batch width independence.
+correctness	scripts/bench/glm53-logit-capture.sh	checkpoint	Frozen-capture GLM-5.3 logit dump through gpuq for accuracy gates; a correctness consumer, not a performance comparator.
+trace-dump	scripts/bench/glm53-mxfp4-trace-ladder.sh	checkpoint	Rank-0 device traces of one GLM-5.3 MXFP4 packet per rung for op_roofline.py attribution; not an end-to-end performance comparator.
+prefill-sweep	scripts/glm53_mxfp4_mi350x.sh	checkpoint	The validate arm sweeps prefill rungs and a decode ladder on the direct runner as a recipe diagnostic; the serve arm (glm53-mxfp4-plow.sh) carries the comparison.

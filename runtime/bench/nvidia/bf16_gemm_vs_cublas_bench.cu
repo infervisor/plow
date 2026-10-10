@@ -98,6 +98,14 @@ static const Shape SHAPES[] = {
     {"m26_local_o",2816,4096,0}, {"m26_global_q",8192,2816,0},
     {"m26_global_k",1024,2816,0}, {"m26_global_o",2816,8192,0},
 #endif
+#ifdef PLOW_BENCH_GEMMA4_31B
+    /* segment_roles::CUBLASLT_PREFILL_GEMMA4_31B_SHAPES — Gemma-4-31B dense projections
+     * (hidden 5376, inter 21504, 32 heads; sliding 16 KV x 256, full 4 K x 512, k_eq_v). */
+    {"m31_gate_or_up",21504,5376,0}, {"m31_down",5376,21504,0},
+    {"m31_local_q",8192,5376,0}, {"m31_local_k_or_v",4096,5376,0},
+    {"m31_local_o",5376,8192,0}, {"m31_global_q",16384,5376,0},
+    {"m31_global_k",2048,5376,0}, {"m31_global_o",5376,16384,0},
+#endif
 #elif defined(PLOW_BENCH_GEMM_ODOWN)
     {"g12_o_local",3840,4096,0}, {"g12_o_full",3840,8192,0}, {"g12_down",3840,15360,0},
     {"g31_o_local",5376,8192,0}, {"g31_o_full",5376,16384,0}, {"g31_down",5376,21504,0},

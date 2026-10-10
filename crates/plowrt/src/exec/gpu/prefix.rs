@@ -23,9 +23,10 @@ pub(crate) struct VmmPrefixLayout {
 /// backing every FULL layer's `kv.{l}.k/v` tensor with per-sequence VA
 /// windows. Live mode can retain demand-mapped whole-slot rings; prefix
 /// mode snapshots the rings' last `window` rows and keeps them flat unless
-/// `PLOW_VMM_LIVE_RINGS=1` commits them per admitted slot.
+/// `PLOW_VMM_LIVE_RINGS=1` commits them per admitted slot. `kv` is `None` when live full caches
+/// ride `rings` slot by slot (a head window below one VMM granule).
 pub(super) struct VmmServe {
-    pub(super) kv: crate::memory::vmm::VmmKv,
+    pub(super) kv: Option<crate::memory::vmm::VmmKv>,
     pub(super) rings: Option<crate::memory::vmm::VmmRings>,
     pub(super) tensor_tracks: Vec<(usize, u32, u32)>,
     pub(super) cache_tensors: Vec<usize>,
@@ -46,6 +47,32 @@ pub(super) struct VmmServe {
     /// Sliding ring rows (`min(max_ctx, KV_RING)`), a power of two.
     pub(super) ring: u64,
     pub(super) snap_row_bytes: u64,
+}
+
+impl VmmServe {
+    pub(super) fn prefix_kv(&self) -> Option<&crate::memory::vmm::VmmKv> {
+        self.kv.as_ref().filter(|kv| kv.prefix_reuse())
+    }
+
+    /// Full-cache row mapping; slot-granular rings commit at admission instead.
+    pub(super) fn ensure_rows(&self, seq: usize, rows: u32) -> Result<()> {
+        match &self.kv {
+            Some(kv) if kv.mapped_rows(seq) < rows => kv.ensure_rows(seq, rows),
+            _ => Ok(()),
+        }
+    }
+
+    pub(super) fn advise(&self, seq: usize, pos: u32) {
+        if let Some(kv) = &self.kv {
+            kv.advise(seq, pos);
+        }
+    }
+
+    pub(super) fn begin_seq(&self, seq: usize) {
+        if let Some(kv) = &self.kv {
+            kv.begin_seq(seq);
+        }
+    }
 }
 
 impl VmmPrefixLayout {
@@ -86,6 +113,34 @@ impl GpuEngine {
             layout.geometry.max_ctx = aligned_ctx.min(layout.geometry.max_ctx);
         }
         let block_hint = (config.vmm_block_mib() as u64) << 20;
+        let ops = Arc::clone(be) as Arc<dyn crate::memory::vmm::VmmOps>;
+        if let Some(full) = layout.slot_granular_full(blob, ops.granularity()?, block_hint) {
+            // Every cache commits per admitted slot; idle rows write shared scratch.
+            let tensors: Vec<_> = full.into_iter().chain(layout.ring_tensors).collect();
+            let mut rings = crate::memory::vmm::VmmRings::new_idle_backed(
+                ops,
+                &tensors,
+                layout.geometry.batch as usize,
+            )?;
+            rings.enable_handle_recycling(crate::memory::vmm::kv_pool_cap());
+            tracing::info!(
+                slot_mib = rings.slot_charge() >> 20,
+                resident_mib = rings.stats().resident_bytes >> 20,
+                reserved_gib = rings.stats().reserved_bytes as f64 / (1u64 << 30) as f64,
+                "vmm live: full KV committed per slot (head window below one granule)"
+            );
+            return Ok(VmmServe {
+                kv: None,
+                rings: Some(rings),
+                tensor_tracks: Vec::new(),
+                cache_tensors: layout.cache_tensors,
+                slide: Vec::new(),
+                slide_scale: Vec::new(),
+                full_scale: Vec::new(),
+                ring: 0,
+                snap_row_bytes: 0,
+            });
+        }
         let rings = if live_rings && !layout.ring_tensors.is_empty() {
             Some(crate::memory::vmm::VmmRings::new(
                 Arc::clone(be) as Arc<dyn crate::memory::vmm::VmmOps>,
@@ -112,7 +167,7 @@ impl GpuEngine {
             })
             .collect();
         Ok(VmmServe {
-            kv,
+            kv: Some(kv),
             rings,
             tensor_tracks,
             cache_tensors: layout.cache_tensors,
@@ -125,7 +180,11 @@ impl GpuEngine {
     }
 
     pub(crate) fn vmm_prefix_enabled(&self) -> bool {
-        self.vmm.as_ref().is_some_and(|v| v.kv.prefix_reuse())
+        self.vmm_prefix().is_some()
+    }
+
+    pub(super) fn vmm_prefix(&self) -> Option<(&VmmServe, &crate::memory::vmm::VmmKv)> {
+        self.vmm.as_ref().and_then(|v| Some((v, v.prefix_kv()?)))
     }
 
     pub(crate) fn select_vmm_prefix_layout(
@@ -422,7 +481,7 @@ impl GpuEngine {
                     })
                     .collect(),
                 cache_tensors: Vec::new(),
-                kv: {
+                kv: Some({
                     kv.enable_block_pool(crate::memory::vmm::kv_pool_cap());
                     if rt.vmm_deferred_reclaim() {
                         kv.enable_deferred_reclaim();
@@ -438,7 +497,7 @@ impl GpuEngine {
                         kv.enable_strict_publish();
                     }
                     kv
-                },
+                }),
                 slide,
                 slide_scale,
                 full_scale,
@@ -458,11 +517,11 @@ impl GpuEngine {
     /// ordered by absolute position `p_a-window..p_a`; each head is at most
     /// two runs (ring wrap).
     pub(super) fn vmm_slide_copy(&self, b: usize, p_a: u32, buf: u64, to_snap: bool) -> Result<()> {
-        let v = self.vmm.as_ref().expect("vmm_slide_copy without vmm");
+        let (v, kv) = self.vmm_prefix().expect("vmm_slide_copy without prefix vmm");
         if v.slide.is_empty() {
             return Ok(());
         }
-        let g = v.kv.geometry();
+        let g = kv.geometry();
         let span = RingWindow::new(p_a.into(), g.window.into(), v.ring);
         let w = span.rows;
         let hd_b = (g.hd_slide * g.elem_slide) as u64;
@@ -505,8 +564,8 @@ impl GpuEngine {
     /// cudaMalloc `[batch][kvh][max_ctx]` f32 and slot reuse overwrites them,
     /// so the shared prefix's scales can only survive in the snapshot.
     pub(super) fn vmm_scale_copy(&self, b: usize, p_a: u32, buf: u64, to_snap: bool) -> Result<()> {
-        let v = self.vmm.as_ref().expect("vmm_scale_copy without vmm");
-        let g = v.kv.geometry();
+        let (v, kv) = self.vmm_prefix().expect("vmm_scale_copy without prefix vmm");
+        let g = kv.geometry();
         let ring = v.ring;
         let mut off = buf;
         let mut blit = |dev: u64, snap: u64, bytes: u64| -> Result<()> {
@@ -547,15 +606,15 @@ impl GpuEngine {
     /// Bytes region 3 occupies for a boundary at `p_a` rows (0 unless the
     /// full layers are fp8).
     pub(super) fn vmm_full_scale_bytes(&self, p_a: u32) -> u64 {
-        let Some(v) = &self.vmm else { return 0 };
-        let g = v.kv.geometry();
+        let Some((v, kv)) = self.vmm_prefix() else { return 0 };
+        let g = kv.geometry();
         v.full_scale.len() as u64 * 2 * g.kvh_full as u64 * p_a as u64 * 4
     }
 
     pub(super) fn vmm_snap_bytes(&self, rows: u32) -> u64 {
-        let v = self.vmm.as_ref().expect("prefix snapshot without VMM");
-        let g = v.kv.geometry();
-        let partial = u64::from(rows % v.kv.block_rows());
+        let (v, kv) = self.vmm_prefix().expect("prefix snapshot without VMM");
+        let g = kv.geometry();
+        let partial = u64::from(rows % kv.block_rows());
         (v.snap_row_bytes * u64::from(g.window.min(rows))
             + self.vmm_full_scale_bytes(rows)
             + v.tensor_tracks.len() as u64
@@ -572,9 +631,9 @@ impl GpuEngine {
         mut buf: u64,
         to_snap: bool,
     ) -> Result<()> {
-        let v = self.vmm.as_ref().unwrap();
-        let g = v.kv.geometry();
-        let partial = rows % v.kv.block_rows();
+        let (v, kv) = self.vmm_prefix().expect("partial copy without prefix vmm");
+        let g = kv.geometry();
+        let partial = rows % kv.block_rows();
         if partial == 0 {
             return Ok(());
         }
@@ -603,9 +662,9 @@ impl GpuEngine {
     pub(super) fn vmm_snap_copy(&self, b: usize, p_a: u32, buf: u64, to_snap: bool) -> Result<()> {
         let copied = (|| {
             self.vmm_slide_copy(b, p_a, buf, to_snap)?;
-            let v = self.vmm.as_ref().expect("vmm_snap_copy without vmm");
+            let (v, kv) = self.vmm_prefix().expect("vmm_snap_copy without prefix vmm");
             if !v.slide_scale.is_empty() || !v.full_scale.is_empty() {
-                let g = v.kv.geometry();
+                let g = kv.geometry();
                 let rings = v.slide.len() as u64
                     * 2
                     * g.kvh_slide as u64
@@ -614,7 +673,7 @@ impl GpuEngine {
                 self.vmm_scale_copy(b, p_a, buf + rings, to_snap)?;
             }
             let partial = buf
-                + v.snap_row_bytes * u64::from(v.kv.geometry().window.min(p_a))
+                + v.snap_row_bytes * u64::from(kv.geometry().window.min(p_a))
                 + self.vmm_full_scale_bytes(p_a);
             self.vmm_partial_copy(b, p_a, partial, to_snap)
         })();
@@ -626,11 +685,12 @@ impl GpuEngine {
     /// Consult the prefix cache for slot `b`'s prompt and attach a published
     /// prefix: multi-map the shared full-layer blocks, restore the sliding
     /// windows and private partial block, then advance the prefill frontier.
-    pub(super) fn vmm_attach(&mut self, b: usize, prompt: &[u32]) -> Result<()> {
-        let Some(v) = self.vmm.as_ref().filter(|v| v.kv.prefix_reuse()) else {
+    pub(super) fn vmm_attach(&mut self, b: usize, prompt: &[u32], key: Option<crate::memory::vmm::PrefixKey>) -> Result<()> {
+        let staged = self.staged_prefix[b].take();
+        let Some((_, kv)) = self.vmm_prefix() else {
             return Ok(());
         };
-        let att = v.kv.try_attach(b, prompt)?;
+        let att = kv.try_attach_keyed(b, prompt, key.or(staged))?;
         let attached = att.is_some();
         let att_rows = att.as_ref().map(|a| a.rows).unwrap_or(0);
         tracing::info!(slot = b, prompt = prompt.len(), attached, att_rows, "vmm_attach query");
@@ -645,16 +705,16 @@ impl GpuEngine {
                     a.snap_bytes
                 )));
             }
-            if a.rows % v.kv.block_rows() != 0 {
-                v.kv.ensure_rows(b, a.rows + 1)?;
+            if a.rows % kv.block_rows() != 0 {
+                kv.ensure_rows(b, a.rows + 1)?;
             }
             self.vmm_snap_copy(b, a.rows, a.snap_va, false)
         })();
         if let Err(error) = restored {
-            self.vmm.as_ref().unwrap().kv.begin_seq(b);
+            kv.begin_seq(b);
             return Err(error);
         }
-        self.vmm.as_ref().unwrap().kv.finish_attach(b);
+        kv.finish_attach(b);
         self.pos[b] = a.rows;
         self.vmm_attached[b] = a.rows;
         // Seed the row-token record with the attached prefix — the tail is
@@ -672,7 +732,7 @@ impl GpuEngine {
 
     /// VMM prefix-sharing counters; `None` when `PLOW_VMM_PREFIX` is off.
     pub fn vmm_stats(&self) -> Option<crate::memory::vmm::VmmStats> {
-        self.vmm.as_ref().map(|v| v.kv.stats())
+        self.vmm.as_ref().and_then(|v| v.kv.as_ref()).map(|kv| kv.stats())
     }
 
     pub fn live_ring_stats(&self) -> Option<crate::memory::vmm::LiveRingStats> {
@@ -685,12 +745,12 @@ impl GpuEngine {
     /// Engine-lock-free stats reader for `/metrics`; `None` when
     /// `PLOW_VMM_PREFIX` is off.
     pub fn vmm_stats_handle(&self) -> Option<crate::memory::vmm::VmmStatsHandle> {
-        self.vmm.as_ref().map(|v| v.kv.stats_handle())
+        self.vmm.as_ref().and_then(|v| v.kv.as_ref()).map(|kv| kv.stats_handle())
     }
 
     /// Engine-lock-free attach probe for the mux's admission order; `None` without prefix reuse.
     pub fn vmm_prefix_probe(&self) -> Option<crate::memory::vmm::PrefixProbe> {
-        self.vmm.as_ref().and_then(|v| v.kv.prefix_probe())
+        self.vmm.as_ref().and_then(|v| v.kv.as_ref()?.prefix_probe())
     }
 
     /// Rows slot `b`'s current sequence attached from the prefix cache
@@ -704,19 +764,29 @@ impl GpuEngine {
     /// ring and full scales, and sets `pos[b]` to the matched rows. Returns
     /// the new position (`> 0` on attach, `0` on miss).
     pub fn attach_prompt(&mut self, b: usize, prompt: &[u32]) -> Result<usize> {
+        self.attach_prompt_keyed(b, prompt, None)
+    }
+
+    /// Stage `key` for slot `b`'s next attach inside [`Self::prefill_chunk`]; `None` clears it.
+    pub fn stage_prefix_key(&mut self, b: usize, key: Option<crate::memory::vmm::PrefixKey>) {
+        self.staged_prefix[b] = key;
+    }
+
+    /// [`Self::attach_prompt`] with the prompt's block hashes already computed.
+    pub fn attach_prompt_keyed(&mut self, b: usize, prompt: &[u32], key: Option<crate::memory::vmm::PrefixKey>) -> Result<usize> {
         if self.pos[b] == 0 && self.vmm_prefix_enabled() {
-            self.vmm_attach(b, prompt)?;
+            self.vmm_attach(b, prompt, key)?;
         }
         Ok(self.pos[b] as usize)
     }
 
     fn publish_boundary(&self, b: usize, p_a: u32) -> bool {
-        let Some(v) = self.vmm.as_ref().filter(|v| v.kv.prefix_reuse()) else {
+        let Some((v, kv)) = self.vmm_prefix() else {
             return false;
         };
         let rows = self.pos[b];
         let toks = &self.seq_tokens[b];
-        let g = v.kv.geometry();
+        let g = kv.geometry();
         if rows == 0 || toks.len() != rows as usize || p_a == 0 {
             return false;
         }
@@ -733,12 +803,12 @@ impl GpuEngine {
             );
             return false;
         }
-        if !v.kv.resolve_prefix_hazard(b, toks, p_a) {
+        if !kv.resolve_prefix_hazard(b, toks, p_a) {
             tracing::debug!(slot = b, p_a, "vmm: publish_boundary skipped: orphaned blocks");
             return false;
         }
         let snap_bytes = self.vmm_snap_bytes(p_a);
-        if let Err(e) = v.kv.publish_at(b, toks, p_a, snap_bytes, |dst| {
+        if let Err(e) = kv.publish_at(b, toks, p_a, snap_bytes, |dst| {
             self.vmm_snap_copy(b, p_a, dst, true)
         }) {
             tracing::info!(error = %e, slot = b, p_a, "vmm: publish_boundary skipped");
@@ -755,14 +825,14 @@ impl GpuEngine {
     /// block-aligned boundary has no tail, so any prompt sharing those blocks attaches to
     /// it), or every `PLOW_AMD_PREFIX_FINE_ROWS` rows when that is set.
     pub(super) fn vmm_publish(&self, b: usize, max_rows: u32) {
-        let Some(v) = self.vmm.as_ref().filter(|v| v.kv.prefix_reuse()) else {
+        let Some((v, kv)) = self.vmm_prefix() else {
             return;
         };
         let rows = self.pos[b];
         let toks = &self.seq_tokens[b];
-        let g = v.kv.geometry();
+        let g = kv.geometry();
         let session = self.session_pin[b].is_some();
-        let prompt = v.kv.prompt_rows(b);
+        let prompt = kv.prompt_rows(b);
         let prompt_end = is_prompt_end(rows, max_rows, prompt);
         let max_rows = if session && prompt_end { session_prompt_end(prompt) } else { max_rows };
         let p_a = (rows.min(max_rows) / 32) * 32;
@@ -785,23 +855,23 @@ impl GpuEngine {
             return;
         }
         if session {
-            v.kv.note_session(b, toks);
+            kv.note_session(b, toks);
         }
         let step = crate::config::RuntimeConfig::get()
             .amd_prefix_fine_rows()
-            .map_or(v.kv.block_rows(), |step| step.max(32));
+            .map_or(kv.block_rows(), |step| step.max(32));
         // A session's next turn attaches to its prompt end, which retires every checkpoint and
         // chunk end inside the prompt (`retire_superseded`), and its reply rows are re-rendered:
         // those snapshots are transient, and each one's trim evicts another session's boundary.
         // Publish them only for a request waiting on this prefill (`inflight_prefix`).
         let mut p = step;
         while p < p_a {
-            if !session || v.kv.checkpoint_awaited(toks, p) {
+            if !session || kv.checkpoint_awaited(toks, p) {
                 self.publish_boundary(b, p);
             }
             p += step;
         }
-        if session && !prompt_end && rows < prompt && !v.kv.checkpoint_awaited(toks, p_a) {
+        if session && !prompt_end && rows < prompt && !kv.checkpoint_awaited(toks, p_a) {
             return;
         }
         // Only the prompt-end publish retires (a chunk-end publish also caps `max_rows` below
@@ -812,8 +882,8 @@ impl GpuEngine {
         if let Some(ttl) = self.session_pin[b].filter(|_| published && prompt_end) {
             // Pinned now, not at retire: while this turn decodes, other sessions' publishes
             // must not evict it ahead of idle sessions' boundaries.
-            v.kv.pin_prefix(&toks[..p_a as usize], std::time::Instant::now() + ttl);
-            let freed = v.kv.retire_superseded(toks, p_a);
+            kv.pin_prefix(&toks[..p_a as usize], std::time::Instant::now() + ttl);
+            let freed = kv.retire_superseded(toks, p_a);
             if freed > 0 {
                 tracing::debug!(slot = b, p_a, freed, "vmm: session retired superseded snapshots");
             }
@@ -831,10 +901,10 @@ impl GpuEngine {
     /// another sequence also sent) once the prefill chunk that started at `c0` passed it,
     /// while the rings still hold its window.
     pub(super) fn vmm_publish_shared(&self, b: usize, c0: u32) {
-        let Some(v) = self.vmm.as_ref().filter(|v| v.kv.prefix_reuse()) else {
+        let Some((_, kv)) = self.vmm_prefix() else {
             return;
         };
-        let rows = v.kv.share_rows(b);
+        let rows = kv.share_rows(b);
         if rows > c0 && rows <= self.pos[b] {
             self.publish_boundary(b, rows);
         }
@@ -844,20 +914,20 @@ impl GpuEngine {
     /// the rings hold only `ring - window` rows past a boundary (`publish_boundary`), and a
     /// request slice may be wider than that.
     pub fn pf_publish_cap(&self, b: usize, c0: usize) -> usize {
-        let Some(v) = self.vmm.as_ref().filter(|v| v.kv.prefix_reuse() && !v.slide.is_empty()) else {
+        let Some((v, kv)) = self.vmm_prefix().filter(|(v, _)| !v.slide.is_empty()) else {
             return usize::MAX;
         };
-        let share = v.kv.share_rows(b) as usize;
+        let share = kv.share_rows(b) as usize;
         if share <= c0 {
             return usize::MAX;
         }
-        share + (v.ring as usize).saturating_sub(v.kv.geometry().window as usize) - c0
+        share + (v.ring as usize).saturating_sub(kv.geometry().window as usize) - c0
     }
 
     /// Slot `b`'s prompt is prefilled and its prompt-end publish has run.
     pub(super) fn vmm_prefill_done(&self, b: usize) {
-        if let Some(v) = self.vmm.as_ref().filter(|v| v.kv.prefix_reuse()) {
-            v.kv.prefill_done(b);
+        if let Some((_, kv)) = self.vmm_prefix() {
+            kv.prefill_done(b);
         }
     }
 
@@ -865,13 +935,13 @@ impl GpuEngine {
     /// `prompt` than the cache can attach now: `(owner slot, rows)`. A boundary is only
     /// publishable while the sliding rings still hold its window (`publish_boundary`).
     pub(super) fn vmm_inflight_prefix(&self, b: usize, prompt: &[u32]) -> Option<(usize, u32)> {
-        let v = self.vmm.as_ref().filter(|v| v.kv.prefix_reuse())?;
+        let (v, kv) = self.vmm_prefix()?;
         let lookback = if v.slide.is_empty() {
             u32::MAX
         } else {
-            v.ring as u32 - v.kv.geometry().window
+            v.ring as u32 - kv.geometry().window
         };
-        v.kv.inflight_prefix(b, prompt, lookback, &self.pos)
+        kv.inflight_prefix(b, prompt, lookback, &self.pos)
     }
 }
 

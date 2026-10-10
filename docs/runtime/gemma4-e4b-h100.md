@@ -12,16 +12,22 @@ python3 scripts/campaign/campaign.py build recipes/infervisor/gemma-4-e4b/sm90a-
 PLOW_HSACO=$OUT/assets plowrt serve --assets $OUT/assets
 ```
 
-The recipe runs base emit -> `scripts/build_sm90a_gemma4_segments.sh` -> role emit and keeps only
-the two flash objects (`interp_sm90a_pffa.cubin`, `interp_sm90a_pfpackedfa.cubin`). Knobs:
+The recipe runs base emit -> `scripts/build_sm90a_gemma4_segments.sh` -> role emit and takes five
+objects from the segment build (`[objects].role_files`): the flash objects
+`interp_sm90a_pffa.cubin` and `interp_sm90a_pfpackedfa.cubin`, the FATLITE light object
+`interp_sm90a_pfpackedseg.cubin`, and the generated prefill attention roles
+`gen_sm90a_attn_pf_hd256_sliding.cubin` and `gen_sm90a_attn_pf_hd512.cubin`. Knobs (the full
+list, with measurements, is in the recipe's comments):
 
 | knob | why |
 |---|---|
 | `PLOW_DECODE_BATCH_LADDER=1,2,4,8,16,32,48,64,96,128` | decode rungs up to 128 concurrent turns |
-| `PLOW_MAX_CHUNK=2048`, `PLOW_PF_LADDER_APPEND=64,256` | prefill rungs 64..2048 (prompts 200-2000) |
+| `PLOW_MAX_CHUNK=2048`, `PLOW_MAX_REQUEST_CHUNK=2048`, `PLOW_PF_LADDER_APPEND=64,256` | prefill rungs 64..2048 (prompts 200-2000) plus the 8192 packed rung; one request capped at 2048 rows per launch keeps the sliding ring at 4096 |
 | `PLOW_EMIT_PREFILL_CUBLASLT=1` | dense prefill projections on cuBLASLt (E4B shapes in `segment_roles.rs`) |
+| `PLOW_EMIT_DECODE_CUBLASLT=1`, `PLOW_EMIT_DECODE_CUBLASLT_MIN_ROWS=1`, `PLOW_EMIT_DECODE_CUBLASLT_HEAD=1` | every decode rung runs its layer projections, lm_head and the PLE projection as cuBLASLt matmuls inside the rung's graph |
 | `PLOW_SEG_FA512=all` | every prefill flash segment (hd256 sliding and hd512 full) isolated in `pffa` |
-| `[serve] PLOW_MULTISTEP_ADAPTIVE=true` | single-step while anything prefills, 8-step quanta otherwise |
+| `PLOW_BUILD_GEN_KERNELS` / `PLOW_EMIT_GEN_KERNELS=attn_pf_hd256_sliding,attn_pf_hd512` | generated-kernel prefill attention on the 1024+ row rungs |
+| `[serve] env PLOW_VMM_PREFIX=1, PLOW_LT_RUNG_ALGOS=true` | VMM prefix cache; per-rung cuBLASLt algorithm selection. Token batching and adaptive multistep are not recipe knobs: the default `auto` objective derives them |
 
 Two builds from the same recipe (shared tree and a clean worktree) produce a byte-identical
 `model.pkt`.
@@ -44,6 +50,176 @@ Two builds from the same recipe (shared tree and a clean worktree) produce a byt
 * **Prefix cache.** VMM prefix caching is on by default for window 512 as well as 1024
   (`prefix.rs`). Cached and cold prompts give the same tokens (see below). Sessions
   (`X-Session-Id`) are served from the prefix cache (`X-Session-Cache: prefix-cache`).
+
+## Images and audio (experimental: `PLOW_EMIT_MULTIMODAL=1`)
+
+```sh
+python3 scripts/campaign/campaign.py build recipes/infervisor/gemma-4-e4b/sm90a-h100-tp1.toml --out $OUT \
+  --env PLOW_EMIT_MULTIMODAL=1
+```
+
+The flag adds `mm_vision.pkt` (SigLIP-style tower, 16 layers, plus `embed_vision`) and `mm_audio.pkt`
+(USM conformer, 12 layers, plus `embed_audio`) next to `model.pkt`. It also adds `MmRowsBf16` after
+`Embed` in every prefill program, and the `plow.multimodal.v1` contract. Without the flag,
+`model.pkt` is byte-identical. The request surface is described in
+[serving-openai-compat.md](../serving-openai-compat.md) §2c.
+
+* **Rungs.**
+  * Vision: `PLOW_EMIT_MM_VISION_LADDER` images per launch (default `1,2`). Each image is padded
+    to 2520 patches, as in HF.
+  * Audio: `PLOW_EMIT_MM_AUDIO_LADDER` log-mel frames (default `400,1000,2000,3000`, i.e. 4 to 30 s).
+  * The speech interpreter (`interp_sm90a_speech.cubin`) runs both sidecars.
+* **Preprocessing (CPU, from the contract).**
+  * Images: aspect-preserving resize to at most 280 soft tokens (sides multiples of 48), Pillow
+    bicubic, then 16×16 patches.
+  * Audio: 16 kHz, semicausal log-mel (128 HTK bins, frame 320, hop 160, fft 512). Tokens =
+    ⌈⌈valid/2⌉/2⌉.
+* **New ops.**
+  * `RmsNormF32` (206): grouped RMSNorm, optional gamma.
+  * `RopeAxialF32` (207): 2-D axial rotate-half.
+  * `ChunkAttentionF32` (208): USM chunked local attention with the relative-position term and
+    the logit softcap.
+  * Clipped linears are lowered as clamp → dense → clamp. The depthwise conv is lowered as 5
+    shifted gathers × per-channel taps.
+* **Parity vs HF transformers (bf16, H100).** Harness: `scripts/mm/hf_ref.py`,
+  `crates/plowrt/examples/mm_check.rs` and `scripts/mm/gate.py`.
+  * **Preprocessing.**
+    * Log-mel: max abs 5e-7.
+    * Pixels: ≤ 2 levels (PNG), ≤ 3 levels (JPEG decoder rounding). Mean ≤ 0.026 levels.
+    * Soft-token counts are identical.
+  * **Projected soft tokens (4 images, 3 clips).**
+    * Image: cosine ≥ 0.9996, relL2 ≤ 0.028.
+    * Audio: cosine ≥ 0.9999, relL2 ≤ 0.011.
+  * **Served greedy (10 chat cases: image, two images, ASR, audio Q&A, image+audio).**
+    * Prompt token counts all equal.
+    * 9/10 completions identical; image+audio diverges after 20 words.
+    * Repeats with the same prefill split are bit-identical. A cached repeat of image+audio can
+      fork at a near tie (see "Cold vs cached prefill" below).
+    * Same-text/different-media pairs differ as in HF.
+  * **Campaign gate.** The recipe `scripts/campaign/recipes/gemma4-e4b.h100.multimodal.toml`
+    (production plus the flag) carries `[gates.mm_parity]`. On 2026-10-10 (mm-harden build) both
+    gates passed:
+    * `mm_parity` PASS: 10/10 cases, prompt tokens 10/10, exact 9, repeat-stable 10, refusals
+      11/11, encoder checks 22/22 (cosine ≥ 0.9996), encoder determinism identical;
+    * `llm_logit_parity` PASS: top1 0.9948, KL mean 7.5e-4.
+  * **Text-only with the flag on.**
+    * `gemma_logit_parity`: top1 0.990, KL mean 7.4e-4.
+    * Greedy tokens identical to the release packet on all 9 cases.
+
+### Cold vs cached prefill (2026-10-10)
+
+On a fresh server, the first image+audio answer differed from its repeat (a prefix-cache hit),
+and later rounds were stable. This is prefill numerics, not media handling: the tokens depend on
+how the prompt is split into prefill work. Probes are in `/opt/dlami/nvme/lava-tts/mmharden/det`
+(greedy, top-5 logprobs).
+
+| sequence | cached tokens | first fork | answer |
+|---|---|---|---|
+| fresh server: image+audio ×2 | 0, 0 | none (Δlogprob 0) | "A pink blanket is covered with two cats…" |
+| … third request | 384 | token 0: cold `A` −1.615 / `The` −1.740; cached `The` −1.626 / `A` −1.876 | "The image shows two cats…" |
+| after `cats` ran: image+audio | 256 | | "…a tabby with a mix of gray…" |
+| … repeat | 384 | token 23: cold ` a` and ` black` tie exactly (−1.6349 each) | "…with black and gray stripes…" |
+
+* **Same split: bit-identical.** Δlogprob = 0 across repeats, servers and binaries, given the same
+  cuBLASLt. Text behaves the same way: a 195-token prompt, cold vs 192 tokens cached, moves by
+  Δlogprob ≤ 0.10 with the same tokens.
+* **What changes with the split.** A cached request prefills only the prompt's tail. Its GEMMs
+  run at a small row count (other shapes and cuBLASLt algorithms), and it reads the prefix from
+  the KV cache instead of attending within the chunk.
+* **Evidence that the difference is in that path.** Swapping only the cuBLASLt library (12.9 vs
+  13.1) moves every cached run's logprobs by up to 0.12, text and media alike. Every cold run
+  stays bit-identical.
+* **Ruled out.**
+  * Encoder nondeterminism: `mm_check` re-encodes every item in reverse order, then with both
+    encoders running concurrently, and the rows are bitwise identical.
+  * Lazy encoder load: the first and second cold requests are identical.
+  * Staging races: a cached request never reads the rows of its cached span. The rows it does
+    read are identical across runs.
+  * `PLOW_LT_RUNG_ALGOS`: turning it off gives the same results.
+  * bf16 rounding on one path only: there is a single `bf16_bits` at encode.
+* **What would fix it.** Bitwise agreement between cold and cached runs needs split-invariant
+  prefill kernels, with a reduction order that depends neither on the row count nor on where the
+  prefix lives. This is not done. `scripts/mm/gate.py` therefore accepts a cold/cached fork only
+  at a near tie (top-2 margin ≤ 0.25).
+* **Second request still cold.** The prefix cache publishes a prompt from its second sighting.
+  An identical second request is still cold (`cached_tokens` 0), and the third attaches.
+
+### Served load with media (2026-10-10)
+
+Setup: `scripts/mm/load.py`, one H100, the `gemma4-e4b.h100.multimodal` packet built at mm-harden
+(`campaign.py build --no-probe`), plowrt mm-harden with cuBLASLt 13.4 beside it, greedy, 64 max
+tokens. Raw results: `/opt/dlami/nvme/lava-tts/mmharden/res/e4b-mm{,-text}`.
+
+The mix rotates nine kinds of request, streaming and non-streaming alternately (every request
+streams at c1):
+
+* 4 text prompts;
+* shared media, the same bytes in every request: `image` (266 soft tokens), `audio` (a 7.6 s
+  clip, 121 tokens), and `image_audio`;
+* unique media, minted per request: `uimage` (a 320×240 PNG) and `uaudio` (the clip with
+  perturbed low bits).
+
+**Encoder time.** Measured from submit to rows ready, queueing included, as mean ms per call
+(`plowrt_mm_encode_seconds_total / plowrt_mm_encode_total`).
+
+| concurrency | image (266 tokens) | audio (7.6 s) |
+|---|---|---|
+| c1 | 44 | 25 |
+| c8 | 57 | 36 |
+| c32 | 79 | 56 |
+
+**TTFT p50 / p90, ms.** The text-only column is the same four text prompts with no media in the
+mix.
+
+| | text-only | text in the mix | audio | image | image+audio | unique image | unique audio |
+|---|---|---|---|---|---|---|---|
+| c1 | 10 / 12 | 10 / 12 | 64 / 104 | 93 / 143 | 137 / 225 | 83 / 118 | 77 / 103 |
+| c8 | 17 / 23 | 18 / 81 | 146 / 146 | 173 / 269 | 290 / 298 | 167 / 168 | 185 / 200 |
+| c32 | 22 / 29 | 26 / 116 | 252 / 596 | 311 / 560 | 339 / 643 | 232 / 577 | 243 / 599 |
+
+**Throughput.**
+
+| | text-only req/s | text-only out tok/s | mix req/s | mix out tok/s |
+|---|---|---|---|---|
+| c1 | 2.5 | 155 | 3.0 | 134 |
+| c8 | 16.8 | 1042 | 12.9 | 602 |
+| c32 | 53.5 | 3318 | 24.6 | 1194 |
+
+The mix has longer prompts (137–409 tokens with media) and shorter answers (transcripts), so its
+tok/s is not comparable to text tok/s.
+
+* **Media TTFT is encoder time plus prefill.** At c1, an image adds about 80 ms over text: 44 ms
+  of encoding and the prefill of about 270 rows. A shared image is re-encoded even when its rows
+  are cached in the prefix cache; see Gaps.
+* **Media slows concurrent text.** In the c32 mix, text TTFT p90 is 116 ms vs 29 ms text-only.
+  Media prompts' prefill and the encoders' launches share the GPU.
+* **Correctness under load.** Each shared request's answer equals its single-request answer, or
+  forks from it only at a near tie (top-2 margin ≤ 0.25). There were 0 other forks. Tie forks
+  were 0/45 at c1, 7/72 at c8 and 30/144 at c32; text-only had 11/72 and 24/144. Concurrent
+  requests share prefill launches and cached prefixes, so the split differs, as in "Cold vs
+  cached prefill" above. Unique requests all got their expected prompt length. There were no
+  errors.
+* **Cancellation.** Eight streaming image+audio requests were dropped, half right after sending
+  (during encoding) and half after the first token. The slab drained to reserved 0 / staged 0.
+* **Slab exhaustion.** A burst of 40 unique image+audio requests (about 390 rows each against
+  8192 slab rows) produced 35 × 200 and 5 × 503 with `Retry-After: 1`
+  (`plowrt_mm_slab_full_total` 5). An earlier binary run produced 26 × 200 and 14 × 503. The
+  slab then drained.
+* **Leaks.** At the end, `/metrics` shows `plowrt_mm_slab_rows_reserved` 0 and
+  `plowrt_mm_slab_rows_staged` 0.
+
+**Gemma-4 12B FP8, audio only.** Same harness, run on the `gemma4-12b.h100.fp8-multimodal` packet
+(raw: `res/g12-mm-r2` and `res/g12-mm`). The mix is the 4 text prompts, a shared 7.6 s clip and
+unique clips. The encoder-free embedder costs 1.8 / 4.6 / 3.7 ms per clip at c1 / c8 / c32.
+
+| | text-only TTFT p50/p90 | text in mix | audio | unique audio | text-only req/s | mix req/s |
+|---|---|---|---|---|---|---|
+| c1 | 15 / 19 | 16 / 25 | 45 / 50 | 35 / 39 | 1.65 | 1.62 |
+| c8 | 29 / 34 | 26 / 54 | 64 / 72 | 60 / 63 | 12.3 | 10.7 |
+| c32 | 34 / 43 | 96 / 161 | 101 / 159 | 113 / 163 | 33.2 | 27.0 |
+
+There were no errors or non-tie forks. Cancellation drained the slab and nothing leaked. The
+40-request burst fits the slab (about 121 rows per clip), so it returned no 503.
 
 ## Logprobs API
 
@@ -541,6 +717,27 @@ repro 834d0b6c (base), two interleaved runs each, p50/p95 ms and underrun turns:
   expense. 200 calls need a share policy, e.g. render a stream only as far ahead of its playback
   clock as needed and give the freed turns to first tokens and ASR finals.
 
+### Live sliding rings in `voice-core` (2026-10-09, exploration, not promoted)
+
+`PLOW_VMM_LIVE_RINGS_MODELS=gemma-4-e4b` commits a 160 MiB ring slot per admitted request. In
+prefix mode (`vmm_bringup`) the rings never enable handle recycling, so every admission pays
+40 x `cuMemCreate`+map+`set_access` and every retire 40 x unmap+`cuMemRelease`. Candidate: recycle
+units (`enable_handle_recycling(slot_charge)`) and keep the lowest parked slots within the cap
+when the rings go idle. One rep each (plowrt 249050c1 + candidate, kit3 bundles, H100):
+
+| arm | E4B c1 TTFT p50 | E4B c64 out tok/s (TPOT p50) | E4B mem load/after | voice 32 calls E2E p50/p95 | voice 64 calls E2E p50/p95 (ASR final p95) |
+|---|---|---|---|---|---|
+| flat rings (`=none`) | 20.7 ms | 4058 (14.76) | 42.0 / 37.9 GiB | - | - |
+| live rings, HEAD | 27.7 ms | 3253 (18.62) | 21.6 / 17.4 GiB | 1087 / 2009 | 1510 / 2563 (525) |
+| live rings + recycling | 20.8 ms | 3920 (14.79) | 21.7 / 17.4 GiB | 1097 / 2041 | 1675 / 2914 (590) |
+| + `PLOW_PF_ATTN_GEMM=0` | 15.1 ms | 4681 (12.30) | 21.5 / 17.2 GiB | 1158 / 2289 | 1673 / 3137 (560) |
+
+* Recycling recovers 83% of the E4B c64 loss and all of the c1 TTFT loss at the same memory.
+  `PLOW_PF_ATTN_GEMM=0` is +19% on top at ISL 1000 (c64 TTFT p50 107 -> 76 ms).
+* The voice-agent mix did not follow in one rep: 64-call E2E p95 rose 2563 -> 2914 / 3137 ms
+  and ASR final p95 stayed over 500 ms. Needs REPS=2 and the E4B gate before either change is
+  promoted. Raw evidence: `/opt/dlami/nvme/lava-tts/e4bvc/r1`, patch `e4bvc/lever1.patch`.
+
 ## Kernel work and where the time goes
 
 B=1 op costs (`step_bench --sweep`, instruction-cap deltas, earlier build of the same program):
@@ -846,6 +1043,10 @@ but loses (the PLE input gate runs at 2% of roofline natively at B>=96).
   exposed over HTTP (the top 20 logits only).
 * **Unused segment objects.** The segment script's pfseg/pfgemm objects fault on this packet
   (`CUDA_ERROR_LAUNCH_FAILED`). Only the flash objects are used.
+* **Cached media is re-encoded.** A request whose media span the prefix cache already holds, such
+  as later turns of a chat about one image, still runs its encoders: 44–79 ms per image, which
+  is most of a media request's TTFT. Skipping it needs the attach length before encoding, and a
+  fallback to encoding when admission attaches less than the probe promised.
 
 ## Decode step campaign: routed rungs (B=48..128), H100
 

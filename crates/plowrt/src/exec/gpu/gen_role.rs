@@ -53,6 +53,7 @@ pub(super) fn load_generated_role(
     }
     let function = be.get_function(&module, "plow_gen_flash_prefill")?;
     let direct = be.get_function(&module, "plow_gen_flash_prefill_direct")?;
+    let media_span = be.module_global_u32(&module, "plow_attention_media_span")? == Some(1);
     for f in [function, direct] {
         be.set_max_dynamic_smem(f, abi.smem)?;
         if be.occupancy_blocks_per_sm(f, abi.block, abi.smem as usize)? * be.sm_count() != n_cu {
@@ -63,6 +64,7 @@ pub(super) fn load_generated_role(
     Ok(PacketRole {
         function,
         direct_gen: Some((direct, attention.head_dim, abi.fp8_kv())),
+        media_span,
         direct_hd512: None,
         direct_hd256_gqa2: None,
         direct_w8a8_glu: None,

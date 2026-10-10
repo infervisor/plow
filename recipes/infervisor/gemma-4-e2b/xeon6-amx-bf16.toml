@@ -24,6 +24,7 @@ namespace = "infervisor"
 name = "gemma-4-e2b"
 label = "xeon6-amx-bf16"
 status = "validated"
+plow_git = "59a36e3ddaab2591277765db233e619619bd8faa"
 network = "gemma4"
 
 [target]
@@ -80,3 +81,10 @@ python = "{env:PYREF}"
 reference = "{env:GEMMA4_E2B_FP32_REF}"
 vllm_capture = "{env:GEMMA4_E2B_FP32_VLLM}"
 concurrency = 8
+
+[measured]
+tok_s = 4046.3
+concurrency = 32
+input_len = 1000
+output_len = 128
+client = "vllm 0.30.0+cpu bench serve (campaign.py report c32, 2 repeats, packet 4fea6d8c3932)"

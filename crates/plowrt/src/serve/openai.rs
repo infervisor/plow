@@ -212,16 +212,24 @@ pub struct ChatRequest {
     pub return_tokens_as_token_ids: Option<bool>,
     #[serde(default)]
     pub n: Option<u32>,
+    /// OpenAI tool calling; validated and mapped by `serve::tools::request`.
     #[serde(default)]
     pub tools: Option<serde_json::Value>,
     #[serde(default)]
     pub tool_choice: Option<serde_json::Value>,
+    #[serde(default)]
+    pub parallel_tool_calls: Option<bool>,
+    /// Deprecated OpenAI function calling: refused in favour of `tools`.
     #[serde(default)]
     pub functions: Option<serde_json::Value>,
     #[serde(default)]
     pub function_call: Option<serde_json::Value>,
     #[serde(default)]
     pub response_format: Option<serde_json::Value>,
+    /// vLLM's `include_reasoning`: `false` leaves the trace out of the response (it is still
+    /// split from `content` and counted in `reasoning_tokens`).
+    #[serde(default)]
+    pub include_reasoning: Option<bool>,
 }
 
 /// Stop matching runs on the serialized dispatcher for every generated token, in time
@@ -344,7 +352,8 @@ pub struct StreamOptions {
     pub include_usage: bool,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+/// A request message.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct Message {
     pub role: String,
     /// OPTIONAL. An assistant turn that carried a tool call has `content: null`,
@@ -358,6 +367,60 @@ pub struct Message {
     /// the whole trace landed in `content` as literal text.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_content: Option<String>,
+    /// An assistant turn's calls, validated by `serve::tools::request`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<serde_json::Value>,
+    /// A `role: "tool"` result's call.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
+
+/// The assistant message of a non-streamed response. `content` is `null` (not absent) when the
+/// turn is only tool calls, as OpenAI returns it.
+#[derive(Clone, Debug, Serialize)]
+pub struct ResponseMessage {
+    pub role: &'static str,
+    pub content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<ToolCall>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct ToolCall {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub kind: &'static str,
+    pub function: FunctionCall,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct FunctionCall {
+    pub name: String,
+    /// A JSON object, serialized.
+    pub arguments: String,
+}
+
+/// One streamed `delta.tool_calls` entry.
+#[derive(Clone, Debug, Serialize)]
+pub struct ToolCallDelta {
+    pub index: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    pub kind: Option<&'static str>,
+    pub function: FunctionDelta,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct FunctionDelta {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub arguments: Option<String>,
 }
 
 impl Message {
@@ -369,6 +432,29 @@ impl Message {
     /// Whether this message carries an image part.
     pub fn has_image(&self) -> bool {
         self.content.as_ref().is_some_and(Content::has_image)
+    }
+
+    /// Whether this message carries an image or audio part.
+    pub fn has_media(&self) -> bool {
+        self.content.as_ref().is_some_and(Content::has_media)
+    }
+
+    /// The content as the chat template sees it: the text, or, when the message carries media,
+    /// its parts with each image as `{"type": "image"}` and each audio clip as `{"type": "audio"}`
+    /// (the template renders the model's placeholder for each, in order).
+    pub fn template_content(&self) -> serde_json::Value {
+        match &self.content {
+            Some(c @ Content::Parts(parts)) if c.has_media() => serde_json::Value::Array(
+                parts
+                    .iter()
+                    .map(|p| match p.media_kind() {
+                        Some(kind) => serde_json::json!({ "type": kind }),
+                        None => serde_json::json!({ "type": "text", "text": p.text().unwrap_or_default() }),
+                    })
+                    .collect(),
+            ),
+            _ => serde_json::Value::String(self.text()),
+        }
     }
 }
 
@@ -387,10 +473,7 @@ impl Content {
             Content::Text(s) => s.clone(),
             Content::Parts(parts) => parts
                 .iter()
-                .filter_map(|p| match p {
-                    ContentPart::Text { text } => Some(text.as_str()),
-                    _ => None,
-                })
+                .filter_map(ContentPart::text)
                 .collect::<Vec<_>>()
                 .join(""),
         }
@@ -398,16 +481,52 @@ impl Content {
 
     /// Whether any part is an image (routes through the vision stage).
     pub fn has_image(&self) -> bool {
-        matches!(self, Content::Parts(parts)
-            if parts.iter().any(|p| matches!(p, ContentPart::ImageUrl { .. })))
+        matches!(self, Content::Parts(parts) if parts.iter().any(|p| p.media_kind() == Some("image")))
+    }
+
+    /// Whether any part is an image or audio clip.
+    pub fn has_media(&self) -> bool {
+        matches!(self, Content::Parts(parts) if parts.iter().any(|p| p.media_kind().is_some()))
     }
 }
 
+/// A chat content part. Images: Chat Completions `image_url` (`{"url": ...}`) and Responses
+/// `input_image` (`"image_url": "..."`); audio: `input_audio` (`{"data": base64, "format"}`) and
+/// `audio_url` (`{"url": ...}`).
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ContentPart {
     Text { text: String },
+    InputText { text: String },
     ImageUrl { image_url: ImageUrl },
+    InputImage { image_url: String },
+    InputAudio { input_audio: InputAudio },
+    AudioUrl { audio_url: ImageUrl },
+}
+
+impl ContentPart {
+    pub fn text(&self) -> Option<&str> {
+        match self {
+            ContentPart::Text { text } | ContentPart::InputText { text } => Some(text),
+            _ => None,
+        }
+    }
+
+    /// `image` / `audio` for a media part.
+    pub fn media_kind(&self) -> Option<&'static str> {
+        match self {
+            ContentPart::ImageUrl { .. } | ContentPart::InputImage { .. } => Some("image"),
+            ContentPart::InputAudio { .. } | ContentPart::AudioUrl { .. } => Some("audio"),
+            ContentPart::Text { .. } | ContentPart::InputText { .. } => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct InputAudio {
+    pub data: String,
+    #[serde(default)]
+    pub format: Option<String>,
 }
 
 #[cfg(test)]
@@ -521,6 +640,7 @@ mod tests {
             ContentPart::ImageUrl {
                 image_url: ImageUrl {
                     url: "image".into(),
+                    detail: None,
                 },
             },
             ContentPart::Text {
@@ -534,6 +654,8 @@ mod tests {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ImageUrl {
     pub url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
 }
 
 // --- responses ---
@@ -595,7 +717,7 @@ impl From<crate::serve::stream::TokenUsage> for Usage {
 #[derive(Clone, Debug, Serialize)]
 pub struct Choice {
     pub index: u32,
-    pub message: Message,
+    pub message: ResponseMessage,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub logprobs: Option<crate::serve::logprobs::ChatLogprobs>,
     pub finish_reason: Option<&'static str>,
@@ -643,6 +765,8 @@ pub struct Delta {
     /// Streamed thinking trace, before the answer starts.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<ToolCallDelta>>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -687,6 +811,9 @@ pub struct ModelList {
 #[derive(Clone, Debug, Serialize)]
 pub struct ModelCard {
     pub x_plow_endpoints: Vec<&'static str>,
+    /// Chat input modalities: `text`, plus `image` / `audio` when the packet carries encoders.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub x_plow_modalities: Vec<String>,
     pub id: String,
     pub object: &'static str,
     pub created: u64,
@@ -775,6 +902,7 @@ mod image_refusal_tests {
             ContentPart::ImageUrl {
                 image_url: ImageUrl {
                     url: "data:image/png;base64,AAAA".into(),
+                    detail: None,
                 },
             },
             ContentPart::Text {

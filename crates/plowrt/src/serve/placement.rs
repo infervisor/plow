@@ -43,10 +43,13 @@ impl std::str::FromStr for Place {
     }
 }
 
-/// One model, as the planner sees it.
+/// One model instance (a DP rank), as the planner sees it.
 #[derive(Clone, Debug)]
 pub struct ModelSpec {
+    /// Instance key: the model's slug, or `slug#rank` for a data-parallel rank.
     pub slug: String,
+    /// The served model. Ranks of one model never share a group.
+    pub model: String,
     /// Tensor-parallel fan-out from the blob (`DevBlob.tp.n_gpu`), at least 1.
     pub tp: u32,
     /// Planner requirement in bytes: tensors + overhead + reserve.
@@ -107,6 +110,10 @@ pub enum PlacementError {
     DegreeMismatch { slug: String, tp: u32, degree: u32 },
     /// Nothing on the node has room for this model, even empty.
     WontFitAnywhere { slug: String, required: u64, capacity: u64 },
+    /// More DP ranks than device groups: two would share a GPU.
+    TooManyRanks { model: String, dp: usize, groups: usize },
+    /// Two DP ranks of one model pinned to the same group.
+    RanksShareDevice { model: String, device: u32 },
 }
 
 impl fmt::Display for PlacementError {
@@ -138,6 +145,14 @@ impl fmt::Display for PlacementError {
                 "{slug} needs {} MiB but a whole group holds only {} MiB",
                 required >> 20,
                 capacity >> 20
+            ),
+            PlacementError::TooManyRanks { model, dp, groups } => write!(
+                f,
+                "{model}: --dp {dp} needs {dp} device groups, but only {groups} exist"
+            ),
+            PlacementError::RanksShareDevice { model, device } => write!(
+                f,
+                "{model}: two DP ranks are pinned to device {device}"
             ),
         }
     }
@@ -177,10 +192,23 @@ pub fn assign(
     if groups.is_empty() {
         return Err(PlacementError::NoDevices);
     }
+    for (i, m) in models.iter().enumerate() {
+        if models[..i].iter().any(|o| o.model == m.model) {
+            continue;
+        }
+        let dp = models.iter().filter(|o| o.model == m.model).count();
+        if dp > groups.len() {
+            return Err(PlacementError::TooManyRanks { model: m.model.clone(), dp, groups: groups.len() });
+        }
+    }
     let mut assignment = vec![usize::MAX; models.len()];
     // Bytes already promised to each group, so `spread` can pick the emptiest
     // and `pack` can tell when one is full.
     let mut used = vec![0u64; groups.len()];
+    // A group already holding a rank of this model is not a candidate for another.
+    let taken = |assignment: &[usize], model: &str, g: usize| {
+        models.iter().zip(assignment).any(|(o, &a)| a == g && o.model == model)
+    };
 
     // Pass 1: explicit pins.
     for (i, m) in models.iter().enumerate() {
@@ -199,6 +227,9 @@ pub fn assign(
                 degree: groups[g].degree(),
             });
         }
+        if taken(&assignment, &m.model, g) {
+            return Err(PlacementError::RanksShareDevice { model: m.model.clone(), device: dev });
+        }
         assignment[i] = g;
         used[g] += m.required;
     }
@@ -213,7 +244,7 @@ pub fn assign(
         // against `groups[0]` rejected one that fits a larger card, and let
         // `spread` drop a model onto a card too small to hold it — a startup
         // failure at load time instead of a placement decision.
-        let fits = |g: usize| m.required <= groups[g].capacity;
+        let fits = |g: usize| m.required <= groups[g].capacity && !taken(&assignment, &m.model, g);
         let biggest = groups.iter().map(|g| g.capacity).max().unwrap_or(0);
         if !(0..groups.len()).any(fits) {
             return Err(PlacementError::WontFitAnywhere {
@@ -297,6 +328,70 @@ pub fn parse_pins(pins: &[String]) -> Result<Vec<(String, u32)>, String> {
     Ok(out)
 }
 
+/// One `--dp` value: a rank count, or one rank per device group.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Dp {
+    N(usize),
+    All,
+}
+
+/// `--dp`: a default for every managed model and per-model overrides.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DpSpec {
+    default: Option<Dp>,
+    per_model: Vec<(String, Dp)>,
+}
+
+impl DpSpec {
+    /// Ranks for `model` on a node of `groups` device groups (at least 1).
+    pub fn ranks(&self, model: &str, groups: usize) -> usize {
+        let dp = self
+            .per_model
+            .iter()
+            .find(|(m, _)| m == model)
+            .map(|(_, d)| *d)
+            .or(self.default);
+        match dp {
+            Some(Dp::N(n)) => n,
+            Some(Dp::All) => groups.max(1),
+            None => 1,
+        }
+    }
+
+    /// Models named by an override, to refuse one this server does not serve.
+    pub fn named(&self) -> impl Iterator<Item = &str> {
+        self.per_model.iter().map(|(m, _)| m.as_str())
+    }
+}
+
+/// Parse `--dp 8`, `--dp all`, `--dp gemma=4,asr=all`.
+pub fn parse_dp(entries: &[String]) -> Result<DpSpec, String> {
+    let value = |v: &str, entry: &str| match v {
+        "all" => Ok(Dp::All),
+        n => match n.parse::<usize>() {
+            Ok(n) if n >= 1 => Ok(Dp::N(n)),
+            _ => Err(format!("--dp {entry:?}: {v:?} is not a rank count or \"all\"")),
+        },
+    };
+    let mut spec = DpSpec::default();
+    for entry in entries.iter().map(|e| e.trim()).filter(|e| !e.is_empty()) {
+        match entry.rsplit_once('=') {
+            Some((model, v)) => {
+                if model.is_empty() {
+                    return Err(format!("--dp {entry:?} names no model"));
+                }
+                if spec.per_model.iter().any(|(m, _)| m == model) {
+                    return Err(format!("--dp names {model} twice"));
+                }
+                spec.per_model.push((model.to_string(), value(v, entry)?));
+            }
+            None if spec.default.is_some() => return Err("--dp gives two defaults".into()),
+            None => spec.default = Some(value(entry, entry)?),
+        }
+    }
+    Ok(spec)
+}
+
 /// The maximum TP degree across models — the grouping width (see [`plan_groups`]).
 pub fn grouping_width(models: &[ModelSpec], visible: usize) -> Result<u32, PlacementError> {
     let width = models.iter().map(|m| m.tp.max(1)).max().unwrap_or(1);
@@ -323,6 +418,7 @@ mod tests {
     fn spec(slug: &str, required: u64) -> ModelSpec {
         ModelSpec {
             slug: slug.into(),
+            model: slug.into(),
             tp: 1,
             required,
             device: None,
@@ -572,6 +668,79 @@ mod tests {
                 parse_pins(&[bad.to_string()]).is_err(),
                 "{bad:?} should be refused"
             );
+        }
+    }
+
+    fn ranks(model: &str, n: usize, required: u64) -> Vec<ModelSpec> {
+        (0..n)
+            .map(|r| ModelSpec { slug: format!("{model}#{r}"), ..spec(model, required) })
+            .collect()
+    }
+
+    #[test]
+    fn dp_ranks_take_one_group_each() {
+        let l = assign(&ranks("g", 8, 10 * GIB), &groups(8, 48 * GIB), Place::Spread).unwrap();
+        let mut got = l.assignment.clone();
+        got.sort_unstable();
+        assert_eq!(got, (0..8).collect::<Vec<_>>());
+        // Pack would stack them; anti-affinity wins.
+        let l = assign(&ranks("g", 4, 10 * GIB), &groups(8, 48 * GIB), Place::Pack).unwrap();
+        let mut got = l.assignment.clone();
+        got.dedup();
+        assert_eq!(got.len(), 4);
+    }
+
+    #[test]
+    fn more_ranks_than_groups_is_refused() {
+        assert_eq!(
+            assign(&ranks("g", 9, GIB), &groups(8, 48 * GIB), Place::Spread).unwrap_err(),
+            PlacementError::TooManyRanks { model: "g".into(), dp: 9, groups: 8 }
+        );
+    }
+
+    #[test]
+    fn pinned_ranks_keep_their_devices_and_may_not_share_one() {
+        let mut m = ranks("g", 3, GIB);
+        m[0].device = Some(5);
+        m[1].device = Some(2);
+        let l = assign(&m, &groups(8, 48 * GIB), Place::Spread).unwrap();
+        assert_eq!(&l.assignment[..2], &[5, 2]);
+        assert!(![5, 2].contains(&l.assignment[2]));
+        m[1].device = Some(5);
+        assert_eq!(
+            assign(&m, &groups(8, 48 * GIB), Place::Spread).unwrap_err(),
+            PlacementError::RanksShareDevice { model: "g".into(), device: 5 }
+        );
+    }
+
+    /// A DP model beside an ordinary one: the ranks spread, and the other model takes the
+    /// emptiest group as before (co-resident with a rank once every group holds one).
+    #[test]
+    fn a_dp_model_and_a_plain_one_share_the_node() {
+        let mut m = ranks("g", 4, 10 * GIB);
+        m.push(spec("asr", 5 * GIB));
+        let l = assign(&m, &groups(4, 48 * GIB), Place::Spread).unwrap();
+        let mut g: Vec<usize> = l.assignment[..4].to_vec();
+        g.sort_unstable();
+        assert_eq!(g, vec![0, 1, 2, 3]);
+        assert!(l.assignment[4] < 4);
+        let l = assign(&m, &groups(5, 48 * GIB), Place::Spread).unwrap();
+        assert_eq!(l.assignment[4], 4, "a free group goes to the plain model");
+    }
+
+    #[test]
+    fn dp_specs_parse_defaults_overrides_and_all() {
+        let s = |v: &[&str]| parse_dp(&v.iter().map(|x| x.to_string()).collect::<Vec<_>>());
+        let d = s(&["8"]).unwrap();
+        assert_eq!((d.ranks("a", 8), d.ranks("b", 4)), (8, 8));
+        let d = s(&["all", "asr=2"]).unwrap();
+        assert_eq!((d.ranks("gemma", 6), d.ranks("asr", 6)), (6, 2));
+        let d = s(&["gemma=all"]).unwrap();
+        assert_eq!((d.ranks("gemma", 3), d.ranks("other", 3)), (3, 1));
+        assert_eq!(d.named().collect::<Vec<_>>(), vec!["gemma"]);
+        assert_eq!(s(&[]).unwrap().ranks("x", 8), 1);
+        for bad in [&["0"][..], &["x"], &["2", "3"], &["=2"], &["a=2", "a=3"], &["a=0"]] {
+            assert!(s(bad).is_err(), "{bad:?}");
         }
     }
 

@@ -8,7 +8,10 @@ set, and the candidate passes if it is within the peer's distance to FP32 plus a
 
   prompts   --hf DIR --corpus NAME=FILE ... --out prompts.json     fixed token-id prompt set (CPU)
   reference --hf DIR --prompts prompts.json --out ref.json         FP32 greedy continuation + top-20
-            [--device cpu]                                         (default cuda)
+            [--device cpu|offload]                                 (default cuda; offload keeps
+                                                                   what fits on the GPU and streams
+                                                                   the other decoder layers from
+                                                                   pinned host memory, e.g. 31B)
   capture   --url URL --ref ref.json --arm NAME --out cap.json     a served stack, teacher-forced
   score     --ref ref.json CAP...                                  metrics per capture
   gate      --ref ref.json --cand CAP --peer CAP [thresholds]      verdict (exit 1 on fail)
@@ -284,67 +287,225 @@ def cmd_prompts(a):
 
 
 # ---------------------------------------------------------------- FP32 reference (GPU)
-def fp32_attention(module, query, key, value, attention_mask, dropout=0.0, scaling=None, **_):
+# Keys past this take the long-context path of fp32_attention; SCORE_BYTES bounds one score chunk.
+LONG_KV = 32768
+SCORE_BYTES = 4 << 30
+
+
+def fp32_attention(module, query, key, value, attention_mask, dropout=0.0, scaling=None, sliding_window=None, **_):
     """Exact FP32 attention in query chunks (head_dim 512 rules out the fused kernels at 16K).
-    attention_mask is the sdpa-style mask: None = causal, bool = keep, float = additive."""
+    attention_mask is the sdpa-style mask: None = causal (plus `sliding_window`; cmd_reference
+    passes None masks for long prompts), bool = keep, float = additive. Long keys take narrower
+    query chunks and a broadcast GQA product, so 262144 keys fit beside the weights."""
     import torch
     b, h, q, _d = query.shape
     kl = key.shape[2]
-    rep = h // key.shape[1]
-    key = key.repeat_interleave(rep, 1)
-    value = value.repeat_interleave(rep, 1)
+    kvh = key.shape[1]
+    rep = h // kvh
+    long_kv = kl > LONG_KV
+    if not long_kv:
+        key = key.repeat_interleave(rep, 1)
+        value = value.repeat_interleave(rep, 1)
     out = torch.empty(b, h, q, value.shape[-1], dtype=torch.float32, device=query.device)
     kpos = torch.arange(kl, device=query.device)
-    for s in range(0, q, 1024):
-        e = min(q, s + 1024)
-        sc = torch.matmul(query[:, :, s:e], key.transpose(2, 3)) * scaling
+    step = 1024 if not long_kv else max(16, min(1024, SCORE_BYTES // (h * kl * 4)))
+    for s in range(0, q, step):
+        e = min(q, s + step)
+        if long_kv:
+            qg = query[:, :, s:e].reshape(b, kvh, rep, e - s, _d)
+            sc = torch.matmul(qg, key[:, :, None].transpose(3, 4)).reshape(b, h, e - s, kl) * scaling
+        else:
+            sc = torch.matmul(query[:, :, s:e], key.transpose(2, 3)) * scaling
         if attention_mask is None:
             qpos = torch.arange(s, e, device=query.device) + (kl - q)
             sc.masked_fill_(kpos[None, :] > qpos[:, None], float("-inf"))
+            if sliding_window:
+                sc.masked_fill_(kpos[None, :] <= qpos[:, None] - sliding_window, float("-inf"))
         elif attention_mask.dtype == torch.bool:
             sc.masked_fill_(~attention_mask[:, :, s:e], float("-inf"))
         else:
             sc += attention_mask[:, :, s:e]
-        out[:, :, s:e] = torch.matmul(torch.softmax(sc, -1), value)
+        p = torch.softmax(sc, -1)
+        del sc
+        if long_kv:
+            out[:, :, s:e] = torch.matmul(p.reshape(b, kvh, rep, e - s, kl), value[:, :, None]).reshape(b, h, e - s, -1)
+        else:
+            out[:, :, s:e] = torch.matmul(p, value)
     return out.transpose(1, 2).contiguous(), None
 
 
-def load_fp32(hf, device="cuda"):
+def compact_experts_class():
+    """Gemma-4 MoE experts kept in checkpoint storage (BF16, or FP8 + per-channel scale) and
+    dequantized per expert to FP32 inside forward: the FP32 26B-A4B (103 GB) does not fit one GPU,
+    and bf16 -> fp32 and fp8 x scale in fp32 are the exact weights a full-FP32 copy would hold."""
+    import torch
+    from torch import nn
+    from transformers.activations import ACT2FN
+
+    class CompactExperts(nn.Module):
+        def __init__(self, config):
+            super().__init__()
+            self.num_experts = config.num_experts
+            self.act_fn = ACT2FN[config.hidden_activation]
+            self.w, self.s = {}, {}
+            # Empty stand-ins for the dense parameters transformers' init touches.
+            self.register_buffer("gate_up_proj", torch.empty(0), persistent=False)
+            self.register_buffer("down_proj", torch.empty(0), persistent=False)
+
+        def load(self, which, w, scale):
+            self.w[which] = w
+            self.s[which] = None if scale is None else scale.to(torch.float32).reshape(w.shape[0], w.shape[1], 1)
+
+        def weight(self, which, e):
+            w = self.w[which][e].to(torch.float32)
+            return w if self.s[which] is None else w * self.s[which][e]
+
+        def forward(self, hidden_states, top_k_index, top_k_weights):
+            out = torch.zeros_like(hidden_states)
+            mask = torch.nn.functional.one_hot(top_k_index, num_classes=self.num_experts).permute(2, 1, 0)
+            for e in torch.greater(mask.sum(dim=(-1, -2)), 0).nonzero()[:, 0].tolist():
+                pos, tok = torch.where(mask[e])
+                gate, up = nn.functional.linear(hidden_states[tok], self.weight("gate_up_proj", e)).chunk(2, dim=-1)
+                h = nn.functional.linear(self.act_fn(gate) * up, self.weight("down_proj", e))
+                out.index_add_(0, tok, h * top_k_weights[tok, pos, None])
+            return out
+
+    return CompactExperts
+
+
+def scaled_tensors(files, device="cuda"):
+    """Yield (key, tensor, scale or None) for each language-model tensor. Scales are resolved
+    checkpoint-wide (a shard boundary may split a tensor from its scale); an FP8 tensor with no
+    scale anywhere is refused rather than loaded as raw e4m3/e5m2 codes."""
+    import contextlib
     import torch
     from safetensors import safe_open
+    with contextlib.ExitStack() as stack:
+        shards = [stack.enter_context(safe_open(str(p), "pt", device=device)) for p in files]
+        where = {k: f for f in shards for k in f.keys()}
+        for f in shards:
+            for k in sorted(f.keys()):
+                if not k.startswith("model.language_model.") or k.endswith("weight_scale"):
+                    continue
+                # Experts: <...>.experts.gate_up_proj + ".weight_scale"; dense: <...>.weight + "_scale".
+                sk = k + (".weight_scale" if k.rpartition(".")[0].endswith(".experts") else "_scale")
+                w = f.get_tensor(k)
+                scale = where[sk].get_tensor(sk) if sk in where else None
+                if scale is None and w.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+                    raise SystemExit(f"FP8 tensor {k} has no scale {sk} in any checkpoint shard")
+                yield k, w, scale
+
+
+def offload_layers(model, compact, headroom_gib):
+    """Decoder layers kept in checkpoint precision (`compact`: name -> (weight, scale or None),
+    on the GPU while it fits beside `headroom_gib` of activations, else in pinned host memory) and
+    materialized in FP32 on the GPU per forward with the same `w.float() * scale.float()` as the
+    resident load, so the reference is bit-identical to an all-FP32 model. Everything else lives
+    on the GPU in FP32."""
+    import torch
+    layers = model.model.layers
+    for name, child in model.model.named_children():
+        if name != "layers":
+            child.to("cuda")
+    model.lm_head.to("cuda")
+    named = []
+    for i, layer in enumerate(layers):
+        ps = [(p, tuple(p.shape), compact.pop(f"model.layers.{i}.{n}")) for n, p in layer.named_parameters()]
+        for p, *_ in ps:
+            p.data = torch.empty(0)
+        layer.to("cuda")  # buffers; the parameters are placeholders
+        named.append(ps)
+    per = max(sum(w.numel() * w.element_size() for _, _, (w, _) in ps) for ps in named)
+    free = torch.cuda.mem_get_info()[0] - int(headroom_gib * 2**30)
+    on_gpu = max(0, min(len(layers), free // per))
+    store = []
+    for i, ps in enumerate(named):
+        dev = "cuda" if i < on_gpu else None
+        row = []
+        for p, shape, (w, scale) in ps:
+            w = w.to("cuda") if dev else w.contiguous().pin_memory()
+            scale = None if scale is None else scale.to("cuda", torch.float32)
+            row.append((p, shape, w, scale))
+        store.append(row)
+    torch.cuda.empty_cache()
+
+    def pre(j):
+        def hook(_m, _a):
+            for p, shape, w, scale in store[j]:
+                d = w.to("cuda", non_blocking=True).to(torch.float32)
+                if scale is not None:
+                    d = d * scale
+                p.data = d.reshape(shape)
+        return hook
+
+    def post(j):
+        def hook(_m, _a, _o):
+            for p, *_ in store[j]:
+                p.data = torch.empty(0, device="cuda")
+        return hook
+
+    for j, layer in enumerate(layers):
+        layer.register_forward_pre_hook(pre(j))
+        layer.register_forward_hook(post(j))
+    print(f"offload: {on_gpu}/{len(layers)} decoder layers in checkpoint precision on the GPU, "
+          f"{len(layers) - on_gpu} in pinned host memory ({per / 2**30:.2f} GiB each)", flush=True)
+
+
+def load_fp32(hf, device="cuda", compact=None, headroom_gib=40.0):
+    import torch
+    if device == "offload":
+        compact = {}
+        model, weights = load_fp32(hf, "cpu", compact)
+        offload_layers(model, compact, headroom_gib)
+        return model, weights
     from transformers import AutoConfig
     from transformers.modeling_utils import AttentionInterface
     AttentionInterface.register("sdpa", fp32_attention)
     cfg = AutoConfig.from_pretrained(hf).text_config
-    if cfg.model_type == "gemma4_text":  # hub Gemma-4 (E2B/E4B per-layer inputs, 26B MoE, 31B)
-        from transformers.models.gemma4.modeling_gemma4 import Gemma4ForCausalLM as Gemma4UnifiedForCausalLM
+    moe = bool(getattr(cfg, "enable_moe_block", False))
+    if moe or cfg.model_type == "gemma4_text":  # hub Gemma-4 (E2B/E4B per-layer inputs, 26B MoE, 31B)
+        from transformers.models.gemma4 import modeling_gemma4
+        if moe:
+            modeling_gemma4.Gemma4TextExperts = compact_experts_class()
+        model_class = modeling_gemma4.Gemma4ForCausalLM
     else:
-        from transformers.models.gemma4_unified.modeling_gemma4_unified import Gemma4UnifiedForCausalLM
+        from transformers.models.gemma4_unified.modeling_gemma4_unified import Gemma4UnifiedForCausalLM as model_class
     cfg._attn_implementation = "sdpa"
     cfg.dtype = torch.float32
     torch.set_default_dtype(torch.float32)
     with torch.device(device):
-        model = Gemma4UnifiedForCausalLM(cfg).eval()
+        model = model_class(cfg).eval()
     params = dict(model.named_parameters())
+    weights_of = set(params)
     params.update(dict(model.named_buffers()))
     loaded, unused = set(), []
+    experts = 0
     files = sorted(Path(hf).glob("*.safetensors"))
-    for path in files:
-        with safe_open(str(path), "pt", device=device) as f:
-            keys = set(f.keys())
-            for k in sorted(keys):
-                # `<w>_scale` beside `<w>` is an FP8 companion; `router.per_expert_scale` is a parameter.
-                if not k.startswith("model.language_model.") or (k.endswith("_scale") and k[: -len("_scale")] in keys):
-                    continue
-                name = "model." + k.removeprefix("model.language_model.")
-                if name not in params:  # e.g. k/v of KV-shared layers: the model never reads them
-                    unused.append(k)
-                    continue
-                w = f.get_tensor(k).to(torch.float32)
-                if k + "_scale" in keys:  # FP8 per-output-channel: dequantize exactly in FP32
-                    w = w * f.get_tensor(k + "_scale").to(torch.float32)
-                params[name].data.copy_(w.reshape(params[name].shape))
-                loaded.add(name)
+    for k, w, scale in scaled_tensors(files, device):
+        name = "model." + k.removeprefix("model.language_model.")
+        parent, _, leaf = name.rpartition(".")
+        if moe and leaf in ("gate_up_proj", "down_proj") and parent.endswith(".experts"):
+            model.get_submodule(parent).load(leaf, w, scale)
+            experts += 1
+            continue
+        if name not in params:  # e.g. k/v of KV-shared layers: the model never reads them
+            unused.append(k)
+            continue
+        if compact is not None:  # offload: keep checkpoint precision, materialize per forward
+            if name.startswith("model.layers.") and name in weights_of:
+                compact[name] = (w, scale)
+            else:
+                w = w.to(torch.float32)
+                if scale is not None:
+                    w = w * scale.to(torch.float32)
+                params[name].data = w.reshape(params[name].shape)
+            loaded.add(name)
+            continue
+        w = w.to(torch.float32)
+        if scale is not None:  # FP8 per-output-channel: dequantize exactly in FP32
+            w = w * scale.to(torch.float32)
+        params[name].data.copy_(w.reshape(params[name].shape))
+        loaded.add(name)
     model.tie_weights()
     loaded.add("lm_head.weight")
     unset = [n for n, _ in model.named_parameters() if n not in loaded]
@@ -352,20 +513,36 @@ def load_fp32(hf, device="cuda"):
         raise SystemExit(f"FP32 parameters not loaded from the checkpoint: {unset[:8]}")
     if unused:
         print(f"{len(unused)} checkpoint tensors have no FP32 model slot (unused by the model): {unused[:4]} ...")
+    if moe and experts != 2 * cfg.num_hidden_layers:
+        raise SystemExit(f"expert tensors loaded: {experts}, expected {2 * cfg.num_hidden_layers}")
     return model, [dict(file=str(p), sha256=file_sha(p)) for p in files]
 
 
 def cmd_reference(a):
     import torch
     import transformers
-    dev = a.device
+    dev = "cuda" if a.device == "offload" else a.device
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
     torch.set_float32_matmul_precision("highest")
     from transformers import AutoTokenizer
     tok = AutoTokenizer.from_pretrained(a.hf, local_files_only=True)
     prompts = json.loads(Path(a.prompts).read_text())
-    model, weights = load_fp32(a.hf, dev)
+    model, weights = load_fp32(a.hf, a.device, headroom_gib=a.offload_headroom_gib)
+    # HF's sliding cache keeps its last-window slice as a view of the whole prefill K/V, so every
+    # sliding layer pins prompt-length K/V (31B at 32K: 54 GB in FP32). Copy the window out.
+    from transformers import cache_utils
+    window_update = cache_utils.DynamicSlidingWindowLayer.update
+
+    def update_owning_window(self, *args, **kwargs):
+        out = window_update(self, *args, **kwargs)
+        if getattr(self.keys, "_base", None) is not None:
+            self.keys, self.values = self.keys.clone(), self.values.clone()
+        return out
+    cache_utils.DynamicSlidingWindowLayer.update = update_owning_window
+    # Long prompts compute their masks inside fp32_attention (causal + sliding window): HF would
+    # materialize a q x kv mask per layer type, 64 GiB at 262144 tokens.
+    no_masks = {t: None for t in set(getattr(model.config, "layer_types", None) or ["full_attention"])}
     cases = []
     t0 = time.time()
     with torch.no_grad():
@@ -374,17 +551,20 @@ def cmd_reference(a):
                 continue
             ids = c["prompt_ids"]
             x = torch.tensor([ids], device=dev)
-            out = model(input_ids=x, use_cache=True, logits_to_keep=1)
+            masks = no_masks if len(ids) > LONG_KV else None
+            out = model(input_ids=x, attention_mask=masks, use_cache=True, logits_to_keep=1)
             cont = []
             while True:
                 t = int(out.logits[0, -1].argmax())
                 cont.append(t)
                 if t in EOS or len(cont) == c["max_new"]:
                     break
-                out = model(input_ids=torch.tensor([[t]], device=dev), past_key_values=out.past_key_values, use_cache=True)
+                out = model(input_ids=torch.tensor([[t]], device=dev), past_key_values=out.past_key_values,
+                            attention_mask=masks, use_cache=True)
             del out
             # Teacher-forced pass over the full sequence: the scored distributions.
-            logits = model(input_ids=torch.tensor([ids + cont[:-1]], device=dev), logits_to_keep=len(cont)).logits[0]
+            logits = model(input_ids=torch.tensor([ids + cont[:-1]], device=dev), attention_mask=masks,
+                           logits_to_keep=len(cont)).logits[0]
             lsm = torch.log_softmax(logits.float(), -1)
             v, i = lsm.topk(TOP)
             pos = [dict(top=[[int(t), float(l)] for t, l in zip(i[k].tolist(), v[k].tolist())],
@@ -402,7 +582,7 @@ def cmd_reference(a):
     meta = dict(schema="plow.fp32ref.v1", prompts=str(Path(a.prompts).resolve()), prompts_sha256=file_sha(a.prompts),
                 weights=weights, dtype="float32", tf32=False, attention="fp32 chunked math",
                 dequant="fp8_e4m3 weight x per-channel scale in fp32", torch=torch.__version__,
-                transformers=transformers.__version__, device=torch.cuda.get_device_name() if dev == "cuda" else f"cpu ({torch.get_num_threads()} threads)",
+                transformers=transformers.__version__, device=(torch.cuda.get_device_name() + (" + host offload" if a.device == "offload" else "")) if dev == "cuda" else f"cpu ({torch.get_num_threads()} threads)",
                 utc=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), top=TOP)
     Path(a.out).write_text(json.dumps(dict(meta=meta, cases=cases)))
     print(f"reference: {len(cases)} cases -> {a.out} sha256 {file_sha(a.out)}")
@@ -560,7 +740,9 @@ def main():
     rf.add_argument("--hf", required=True)
     rf.add_argument("--prompts", required=True)
     rf.add_argument("--only", help="comma-separated case ids (debug)")
-    rf.add_argument("--device", default="cuda", help="torch device for the FP32 model (cuda or cpu)")
+    rf.add_argument("--device", default="cuda", help="torch device for the FP32 model (cuda, cpu, or offload: GPU + pinned host layers)")
+    rf.add_argument("--offload-headroom-gib", type=float, default=40.0,
+                    help="offload: GPU memory left for activations (16K prompts fit in 40; 32K needs ~56)")
     rf.add_argument("--out", required=True)
     rf.set_defaults(f=cmd_reference)
     cp = sp.add_parser("capture")

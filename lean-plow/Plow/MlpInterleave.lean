@@ -136,7 +136,7 @@ theorem srcRow_hi (n0 H br : Nat) (hlo : H ≤ br) (hhi : br < 2 * H) :
 
 /-- The de-interleave map is a **bijection** from tile rows `[0, 2H)` onto the fused rows of the
     columns `[n0, n0+H)`: it is injective (no two tile rows read the same weight row). -/
-theorem srcRow_injective (n0 H : Nat) (hH : 0 < H)
+theorem srcRow_injective (n0 H : Nat) (_hH : 0 < H)
     {a b : Nat} (ha : a < 2 * H) (hb : b < 2 * H)
     (heq : srcRow n0 H a = srcRow n0 H b) : a = b := by
   unfold srcRow at heq

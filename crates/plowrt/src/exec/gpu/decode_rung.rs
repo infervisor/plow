@@ -70,6 +70,14 @@ pub(super) fn validate_cublaslt_ladder(blob: &DevBlob, metadata: &SegmentRoles) 
             program.check_coarse_single_segment()?;
             continue;
         };
+        // A grouped-MoE rung below the projection rungs: served on its own, like the MoE ladder.
+        if native
+            && !roles.iter().copied().any(plow_asset::segment_roles::is_projection)
+            && roles.contains(&plow_asset::segment_roles::MOE_DECODE_CUBLASLT)
+        {
+            moe_lt::decode_segments(program, &blob.tensors, roles)?;
+            continue;
+        }
         native = false;
         routed.push(index);
         if !roles

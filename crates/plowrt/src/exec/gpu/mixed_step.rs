@@ -437,7 +437,9 @@ impl GpuEngine {
                     if let Some(rings) = &mut vmm.rings {
                         rings.ensure_slot(slot as usize)?;
                     }
-                    vmm.kv.ensure_rows(slot as usize, end)?;
+                    if let Some(kv) = &vmm.kv {
+                        kv.ensure_rows(slot as usize, end)?;
+                    }
                 }
             }
             mixed.host.fill(plan)?;
@@ -537,14 +539,12 @@ impl GpuEngine {
                     self.seq_tokens[request.slot as usize].extend_from_slice(request.tokens);
                 }
             }
-            if let Some(vmm) = &self.vmm {
+            if let Some(kv) = self.vmm.as_ref().and_then(|v| v.kv.as_ref()) {
                 for request in decode {
-                    vmm.kv
-                        .advise(request.slot as usize, self.pos[request.slot as usize]);
+                    kv.advise(request.slot as usize, self.pos[request.slot as usize]);
                 }
                 for request in prefill {
-                    vmm.kv
-                        .advise(request.slot as usize, self.pos[request.slot as usize]);
+                    kv.advise(request.slot as usize, self.pos[request.slot as usize]);
                 }
             }
             Ok(())

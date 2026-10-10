@@ -81,6 +81,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             feed_forward_width: first.feed_forward1.expand.n().try_into()?,
             heads: first.attention.heads.try_into()?,
             convolution_kernel: first.convolution.kernel.try_into()?,
+            causal_convolution: true,
             chunk_size: chunk_size.try_into()?,
             left_chunks: left_chunks.try_into()?,
             position_table: "encoder.pos_enc.pe",

@@ -7,7 +7,8 @@ package «plow» where
   -- against the `Plow` library or invoke the `plow_verify` CLI binary.
   leanOptions := #[
     ⟨`autoImplicit, false⟩,
-    ⟨`relaxedAutoImplicit, false⟩
+    ⟨`relaxedAutoImplicit, false⟩,
+    ⟨`warningAsError, true⟩
   ]
 
 @[default_target]
@@ -21,6 +22,11 @@ lean_lib «Plow» where
 @[default_target]
 lean_exe plow_verify where
   root := `Main
+
+/-- Axiom audit of the acceptance theorems named in `proof-manifest.json`. -/
+lean_exe proof_audit where
+  root := `ProofAudit
+  supportInterpreter := true
 
 lean_exe bench where
   root := `Bench

@@ -146,6 +146,14 @@ serve_env = { PLOW_DECODE_MAX_RUNG = "128" }
 
 # FP32-reference gate (scripts/llm/fp32_ref_gate.py): GEMMA12B_FP32_REF = the cached FP32 ref.json,
 # GEMMA12B_FP32_VLLM = the vLLM 0.28 capture against it (this box: /opt/dlami/nvme/lava-tts/fp32gate/).
+[measured]
+tok_s = 622.7
+p50_tpot_ms = 97.3
+concurrency = 128
+input_len = 4096
+output_len = 128
+client = "vllm 0.28.0 bench serve (campaign.py report st4k-fp8, 2 repeats 622.9 / 622.4, packet 5fbe627c02af)"
+
 [gates]
 python = "{env:PYREF}"
 [gates.llm_fp32_ref]

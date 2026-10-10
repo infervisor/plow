@@ -31,8 +31,21 @@ use crate::{Result, RuntimeError};
 
 pub const QUEUE_FULL: &str = "speech request queue full";
 
+/// Why a speech request failed.
+#[derive(Debug)]
+pub enum SpeechError {
+    /// The request itself cannot be served (unknown voice, text past the tables): a 400, with
+    /// the request field at fault.
+    Invalid(String, &'static str),
+    /// Anything else ([`QUEUE_FULL`] is the retryable one).
+    Failed(String),
+}
+
 /// The vocoder packet beside the LM packet.
 pub const VOCODER: &str = "s3gen.pkt";
+
+/// Longest a whole (non-streamed) reply waits for stream windows once its tokens are complete.
+const WHOLE_MAX_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 
 #[derive(Clone, Copy, Debug)]
 struct Schedule {
@@ -228,6 +241,16 @@ impl Utterance {
         Window { seam: (self.emitted - span.start * spt) as u32, next_seam: next as u32, phase }
     }
 
+    /// A whole reply whose speech tokens have been complete for [`WHOLE_MAX_WAIT`]. It has no
+    /// playback clock, but under steady stream load some stream window is always due, and
+    /// windows-first rendering held whole replies for minutes.
+    fn overdue_whole(&self, now: std::time::Instant) -> bool {
+        matches!(self.reply, Reply::Whole(_))
+            && self.t3_ms.is_some_and(|ms| {
+                now.saturating_duration_since(self.opened).as_secs_f64() * 1e3 - ms >= WHOLE_MAX_WAIT.as_secs_f64() * 1e3
+            })
+    }
+
     /// Audio sent but not yet played on a real-time client (zero before the first audio).
     fn buffered(&self, now: std::time::Instant, sc: &Schedule) -> std::time::Duration {
         self.started.map_or(std::time::Duration::ZERO, |t| {
@@ -395,7 +418,10 @@ fn render_loop(vocoder: &Codec, cost_id: usize, base: Schedule, rx: mpsc::Receiv
             (class, u.rendered as isize - u.tokens.len() as isize, *k)
         });
         let stream = |u: &Utterance| matches!(u.reply, Reply::Stream(_));
-        if sc.windowed() && due.iter().any(|k| stream(&live[k])) {
+        let now = std::time::Instant::now();
+        if due.iter().any(|k| live[k].overdue_whole(now)) {
+            due.retain(|k| !stream(&live[k]));
+        } else if sc.windowed() && due.iter().any(|k| stream(&live[k])) {
             // Stream windows are short and a launch costs a large floor, so due windows (first
             // chunks too) share one launch, whole utterances wait for none, and a started stream
             // with audio to spare waits for more windows to join. Once a launch goes, streams
@@ -569,7 +595,7 @@ impl GuidedSpeech {
     /// Bind the packet's prompt tables and start the render thread. `credit` is the serving
     /// model's downstream credit: the vocoder's backlog gates the model's admission, and a render
     /// holding a first chunk holds its ticks.
-    pub fn start(assets: &Path, credit: Arc<DownstreamCredit>) -> Result<Self> {
+    pub fn start(assets: &Path, credit: Arc<DownstreamCredit>, device: u8) -> Result<Self> {
         let c = GuidedLmContract::load(assets)?
             .ok_or_else(|| RuntimeError::Rejected(format!("{} declares no guided LM pipeline", assets.display())))?;
         let tables = PromptTables::load(assets, c.hidden)?;
@@ -581,7 +607,7 @@ impl GuidedSpeech {
         std::thread::Builder::new()
             .name("plow-tts-render".into())
             .spawn(move || {
-                let mut vocoder = match Codec::load_packet(&vocoder_path) {
+                let mut vocoder = match Codec::load_packet_on(&vocoder_path, device) {
                     Ok(v) => v,
                     Err(e) => return drop(s_ready_tx.send(Err(RuntimeError::Device(e)))),
                 };
@@ -656,6 +682,11 @@ impl GuidedSpeech {
                     // Streams only: a whole reply's first audio needs every token.
                     first_tokens: if class == JobClass::Critical { self.first_tokens } else { 0 },
                 })),
+                prefix: None,
+                tenant: None,
+                round: 0,
+                cached: None,
+                mm: None,
             },
         })
     }
@@ -670,24 +701,31 @@ impl GuidedSpeech {
         reply: Reply,
         ids: &crate::serve::session::RequestIds,
         report: Option<crate::serve::session::Report>,
-    ) -> std::result::Result<(), String> {
+    ) -> std::result::Result<(), SpeechError> {
+        if !self.tables.voices().any(|v| v == voice) {
+            let mut known: Vec<_> = self.tables.voices().collect();
+            known.sort_unstable();
+            return Err(SpeechError::Invalid(format!("unknown voice {voice:?}; voices: {}", known.join(", ")), "voice"));
+        }
         let (respond, mut tokens) = crate::serve::stream::channel();
         let probe = match &reply {
             Reply::Stream(tx) => Some(tx.clone()),
             Reply::Whole(_) => None,
         };
         let class = if probe.is_some() { JobClass::Critical } else { JobClass::Normal };
-        let job = self.job(&voice, &text, lang, seed, class, respond, ids, report).map_err(|e| e.to_string())?;
+        let job = self
+            .job(&voice, &text, lang, seed, class, respond, ids, report)
+            .map_err(|e| SpeechError::Invalid(e.to_string(), "input"))?;
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let render = self.render.lock().clone();
         let turn = ids.turn_key.as_ref().and_then(|k| crate::serve::turns::table().times(k));
         let _ = render.send(S3Msg::Open { id, voice, seed, reply, turn });
         if let Err(e) = mux.submit(job) {
             let _ = render.send(S3Msg::Drop { id });
-            return Err(match e {
+            return Err(SpeechError::Failed(match e {
                 SubmitError::Full(_) => QUEUE_FULL.to_string(),
                 SubmitError::Closed(_) => "speech model dispatcher unavailable".to_string(),
-            });
+            }));
         }
         let valid_below = self.c.valid_below;
         let t0 = std::time::Instant::now();
@@ -729,10 +767,10 @@ impl GuidedSpeech {
         seed: u64,
         ids: &crate::serve::session::RequestIds,
         report: Option<crate::serve::session::Report>,
-    ) -> std::result::Result<SpeechAudio, String> {
+    ) -> std::result::Result<SpeechAudio, SpeechError> {
         let (reply, rx) = tokio::sync::oneshot::channel();
         self.submit(mux, voice, text, lang, seed, Reply::Whole(reply), ids, report)?;
-        rx.await.map_err(|_| "chatterbox render dropped the request".to_string())?
+        rx.await.map_err(|_| "chatterbox render dropped the request".to_string()).and_then(|r| r).map_err(SpeechError::Failed)
     }
 
     pub fn synthesize_stream(
@@ -744,7 +782,7 @@ impl GuidedSpeech {
         seed: u64,
         ids: &crate::serve::session::RequestIds,
         report: Option<crate::serve::session::Report>,
-    ) -> std::result::Result<tokio::sync::mpsc::UnboundedReceiver<StreamEvent>, String> {
+    ) -> std::result::Result<tokio::sync::mpsc::UnboundedReceiver<StreamEvent>, SpeechError> {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         self.submit(mux, voice, text, lang, seed, Reply::Stream(tx), ids, report)?;
         Ok(rx)
@@ -837,6 +875,21 @@ mod tests {
         }
         assert!(done);
         assert_eq!(next, total * sc.samples_per_token);
+    }
+
+    #[test]
+    fn whole_reply_is_overdue_after_its_wait() {
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        let (mut u, _) = stream(40);
+        u.reply = Reply::Whole(tx);
+        let now = u.opened + std::time::Duration::from_millis(500);
+        assert!(!u.overdue_whole(now + WHOLE_MAX_WAIT), "LM still generating");
+        u.t3_ms = Some(500.0);
+        assert!(!u.overdue_whole(now));
+        assert!(u.overdue_whole(now + WHOLE_MAX_WAIT));
+        let (mut s, _) = stream(40);
+        s.t3_ms = Some(0.0);
+        assert!(!s.overdue_whole(s.opened + 10 * WHOLE_MAX_WAIT), "streams run on their playback clock");
     }
 
     #[test]

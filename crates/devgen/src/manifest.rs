@@ -366,6 +366,9 @@ struct Shapes {
     /// tagged publish (PLOW_XR_COMBINE_FOLD). An object without the arm publishes the unwritten
     /// plain slot: finite, stale, wrong.
     xr_combine_fold: bool,
+    /// Widest head dim of a merge-folded `FlashDecode` (`j2` != 0; nv_decode_merge_fold), 0 if
+    /// none. The fold traps in an object without the row-group body for that width.
+    flash_fold_hd: u32,
     /// Any `KdaStateStepG` with flags bit 2 — the f_b GEMV folded into the step's prologue
     /// (PLOW_KDA_FB_FOLD). An object without the arm reads `f_a` as the gate logits.
     kda_fb_fold: bool,
@@ -503,6 +506,9 @@ fn shapes(m: &Model) -> Shapes {
                 DevOp::FlashDecode | DevOp::FlashDecodeFp8 => {
                     let (hd, nh, kvh, nb) = (inst.i[6], inst.i[1], inst.i[2], inst.i[0]);
                     s.hd.insert(hd);
+                    if op == DevOp::FlashDecode && inst.j[1] != 0 {
+                        s.flash_fold_hd = s.flash_fold_hd.max(hd);
+                    }
                     s.kv_heads.insert(kvh);
                     s.kv_dtype.insert(
                         hd,
@@ -1043,6 +1049,12 @@ fn tuning(s: &Shapes, arch: &str) -> Map<String, Value> {
         && crate::emit_config::active().nv_fa_fold
     {
         t.insert("fa_rg".into(), json!(1));
+    }
+    // * `fa_rg_wide`: an hd256/512 merge fold needs the row-group body on every NVIDIA object
+    //   (sm_90a also selects it below as a tuning; sm_89 relies on this).
+    if arch.starts_with("sm_") && s.flash_fold_hd > 128 {
+        t.insert("fa_rg".into(), json!(1));
+        t.insert("fa_rg_wide".into(), json!(1));
     }
     // * `fa_v3_splitkv`: the fused v3 flash prefill carries the split-KV workspace (`fa_ws`).
     if s.fa_ws_slots > 0 {
@@ -1827,6 +1839,7 @@ pub fn build_for_packet(
             && section.name == plow_asset::packed_prefill::SECTION
     });
     let mut manifest = build_with_packed_prefill(m, arch, lean, packed_prefill.is_some());
+    manifest["runtime_requires"] = crate::dense_cublaslt::runtime_requires(m, sections);
     if let Some(section) = packed_prefill {
         let packed: plow_asset::packed_prefill::Manifest =
             serde_json::from_slice(&section.data).expect("emitted packed request manifest");
@@ -2962,9 +2975,17 @@ pub fn config_header(manifest: &Value) -> String {
             // sm_90a: BATCH>=2 decode rungs walk the weights on the tensor cores
             // (op_gemv_mma.cuh). The dot8 walk is compute-bound above MM=1 — 100–366 GB/s at
             // M=16 vs 1.4–2.6 TB/s (experiments/gemv_mma_batch_h100.cu) — and the B=1 rung is
-            // untouched, so a packet whose ladder reaches 2 turns it on for its objects.
-            if v >= 2 && manifest.get("arch").and_then(Value::as_str) == Some("sm_90a") {
+            // untouched, so a packet whose ladder reaches 2 turns it on for its objects. The walk is
+            // mma.sync m16n8k16 + 16-byte loads, so Ada (sm_89) takes it too, except in the speech
+            // object: its static reduction smem on top of the 96 KiB speech arena passes sm_89's
+            // 99 KiB block limit, and speech packets run no batched decode GEMVs.
+            let arch = manifest.get("arch").and_then(Value::as_str);
+            if v >= 2 && arch == Some("sm_90a") {
                 out.push_str("#ifndef PLOW_NV_GEMV_MMA\n#define PLOW_NV_GEMV_MMA 1\n#endif\n");
+            } else if v >= 2 && arch == Some("sm_89") {
+                out.push_str(
+                    "#if !PLOW_NV_SPEECH\n#ifndef PLOW_NV_GEMV_MMA\n#define PLOW_NV_GEMV_MMA 1\n#endif\n#endif\n",
+                );
             }
         }
         if let Some(v) = t.get("gf256").and_then(Value::as_u64) {
@@ -2988,6 +3009,13 @@ pub fn config_header(manifest: &Value) -> String {
         }
         if t.get("moe_dec_group").is_some() {
             out.push_str("#ifndef PLOW_MOE_DEC_GROUP\n#define PLOW_MOE_DEC_GROUP 1\n#endif\n");
+        }
+        // The merge fold's row-group body (tuning sets these on NVIDIA targets only): every arch.
+        if t.get("fa_rg").is_some() {
+            out.push_str("#ifndef PLOW_NV_FA_RG\n#define PLOW_NV_FA_RG 1\n#endif\n");
+        }
+        if t.get("fa_rg_wide").is_some() {
+            out.push_str("#ifndef PLOW_NV_FA_RG_WIDE\n#define PLOW_NV_FA_RG_WIDE 1\n#endif\n");
         }
         if manifest.get("arch").and_then(Value::as_str) == Some("sm_90a") {
             if let Some(ks) = t.get("xreg_k").and_then(Value::as_array) {
@@ -3018,12 +3046,6 @@ pub fn config_header(manifest: &Value) -> String {
             }
             if t.get("gemv_k8").is_some() {
                 out.push_str("#ifndef PLOW_NV_GEMV_K8\n#define PLOW_NV_GEMV_K8 1\n#endif\n");
-            }
-            if t.get("fa_rg").is_some() {
-                out.push_str("#ifndef PLOW_NV_FA_RG\n#define PLOW_NV_FA_RG 1\n#endif\n");
-            }
-            if t.get("fa_rg_wide").is_some() {
-                out.push_str("#ifndef PLOW_NV_FA_RG_WIDE\n#define PLOW_NV_FA_RG_WIDE 1\n#endif\n");
             }
             if let Some(v) = t.get("fa_v3_splitkv").and_then(Value::as_u64) {
                 out.push_str(&format!(

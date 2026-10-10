@@ -72,12 +72,23 @@ def recipe_requires(recipe: dict) -> str:
 # --- 2. build ----------------------------------------------------------------
 
 
-def check_compiler_provenance(recipe_git: str, release_git: str) -> None:
+def check_compiler_provenance(recipe_git: str, release_git: str, recipe: dict | None = None,
+                              roots: tuple[Path, ...] = ()) -> None:
     """The compiler's SOURCE must match the recipe, not merely its version.
 
     Two builds of `plowc` can report the same version string and emit different
-    packets; the commit is what identifies the emitter.
+    packets. A release from another commit is accepted only on content evidence: every
+    artifact the recipe records is present under `roots` with that sha256, so the bytes
+    being released are the ones the recipe qualified. The commit stays a recorded field.
     """
+    artifacts = (recipe or {}).get("artifacts") or {}
+    def matches(name: str, want: str) -> bool:
+        found = next((r / name for r in roots if (r / name).is_file()), None)
+        return found is not None and pd.sha256_file(found) == want
+    if recipe_git != release_git and artifacts and roots and all(matches(n, w) for n, w in artifacts.items()):
+        print(f"  plow_git {recipe_git[:12]} != release {release_git[:12]}; "
+              f"all {len(artifacts)} recorded artifacts match by sha256")
+        return
     if recipe_git != release_git:
         pd.die(
             f"recipe pins plow_git {recipe_git[:12]} but this release resolves to "
@@ -238,7 +249,8 @@ def run() -> None:
         print(f"\n=== {ns}/{name}  {label} ===")
 
         # 2. Provenance: the recipe pins the compiler source.
-        check_compiler_provenance(recipe_requires(recipe), release_git)
+        roots = tuple(Path(p) for p in (args.assets, args.objects) if p)
+        check_compiler_provenance(recipe_requires(recipe), release_git, recipe, roots)
         print("  compiler provenance matches the recipe")
 
         if not args.assets or not args.objects:
@@ -302,6 +314,15 @@ def self_test() -> None:
     except pd.Fail as e:
         assert "Update the recipe" in str(e)
     check_compiler_provenance("a" * 40, "a" * 40)
+    with tempfile.TemporaryDirectory() as td:
+        (Path(td) / "model.pkt").write_bytes(b"packet")
+        same = {"artifacts": {"model.pkt": pd.sha256_file(Path(td) / "model.pkt")}}
+        check_compiler_provenance("a" * 40, "b" * 40, same, (Path(td),))
+        try:
+            check_compiler_provenance("a" * 40, "b" * 40, {"artifacts": {"model.pkt": "0" * 64}}, (Path(td),))
+            raise AssertionError("accepted a provenance mismatch with different bytes")
+        except pd.Fail:
+            pass
 
     # A validated claim needs a measurement.
     objset = {

@@ -195,5 +195,49 @@ class CampaignScoreTests(unittest.TestCase):
             self.assertEqual(down, [])
 
 
+class ScaledTensorTests(unittest.TestCase):
+    """Synthetic 2-shard FP8 checkpoint; skipped without torch + safetensors."""
+
+    def shards(self, tmp, drop=()):
+        try:
+            import torch
+            from safetensors.torch import save_file
+        except ImportError:
+            self.skipTest("torch + safetensors required")
+        p = "model.language_model.layers.0."
+        w = torch.tensor([[1.0, -2.0], [0.5, 4.0]]).to(torch.float8_e4m3fn)
+        ex = torch.tensor([[[1.0, 2.0], [3.0, -1.0]]]).to(torch.float8_e4m3fn)
+        a = {p + "mlp.down_proj.weight": w, p + "experts.down_proj": ex,
+             p + "input_layernorm.weight": torch.ones(2, dtype=torch.bfloat16)}
+        b = {p + "mlp.down_proj.weight_scale": torch.tensor([[2.0], [0.25]]),
+             p + "experts.down_proj.weight_scale": torch.tensor([[[3.0], [0.5]]])}
+        for k in drop:
+            b.pop(p + k)
+        files = [Path(tmp) / "model-00001-of-00002.safetensors", Path(tmp) / "model-00002-of-00002.safetensors"]
+        save_file(a, str(files[0]))
+        save_file(b, str(files[1]))
+        return torch, p, files
+
+    def test_scale_in_other_shard_dequantizes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            torch, p, files = self.shards(tmp)
+            got = {k: (w, s) for k, w, s in g.scaled_tensors(files, device="cpu")}
+            self.assertEqual(sorted(got), sorted([p + "mlp.down_proj.weight", p + "experts.down_proj",
+                                                  p + "input_layernorm.weight"]))
+            w, s = got[p + "mlp.down_proj.weight"]
+            self.assertTrue(torch.equal(w.float() * s, torch.tensor([[2.0, -4.0], [0.125, 1.0]])))
+            w, s = got[p + "experts.down_proj"]
+            self.assertTrue(torch.equal(w.float() * s, torch.tensor([[[3.0, 6.0], [1.5, -0.5]]])))
+            self.assertIsNone(got[p + "input_layernorm.weight"][1])
+
+    def test_missing_scale_refused(self):
+        for k in ("mlp.down_proj.weight_scale", "experts.down_proj.weight_scale"):
+            with tempfile.TemporaryDirectory() as tmp:
+                _, _, files = self.shards(tmp, drop=(k,))
+                with self.assertRaises(SystemExit) as e:
+                    list(g.scaled_tensors(files, device="cpu"))
+                self.assertIn(k, str(e.exception))
+
+
 if __name__ == "__main__":
     unittest.main()

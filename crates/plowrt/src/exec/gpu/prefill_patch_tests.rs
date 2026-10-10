@@ -19,14 +19,14 @@ fn packed_admission_retries_after_retirement_and_preserves_waiter_priority() {
     }
     assert!(!ready.is_empty() && !waiting.is_empty());
     let epoch = e.kv_admission_epoch;
-    let created = e.vmm.as_ref().unwrap().kv.stats().blocks_created;
+    let created = e.vmm.as_ref().unwrap().kv.as_ref().unwrap().stats().blocks_created;
     for _ in 0..16 {
         for &slot in &waiting {
             assert!(e.admit_packed_slot(slot, &[1, 2], total).unwrap().is_none());
         }
     }
     assert_eq!(e.kv_admission_epoch, epoch);
-    assert_eq!(e.vmm.as_ref().unwrap().kv.stats().blocks_created, created);
+    assert_eq!(e.vmm.as_ref().unwrap().kv.as_ref().unwrap().stats().blocks_created, created);
     let freed = ready[0];
     e.retire_slot(freed, false);
     assert!(e
@@ -124,7 +124,7 @@ fn packed_segmented_block_matches_serialized() -> Result<()> {
     let mut e = GpuEngine::load(be, &assets, &assets.join("checkpoint"))?;
     assert!(e.packed_prefill.is_some() && e.pf_batch.is_some() && e.batch >= 16);
     assert_eq!(
-        e.vmm.as_ref().is_some_and(|v| !v.kv.prefix_reuse()),
+        e.vmm.as_ref().is_some_and(|v| v.prefix_kv().is_none()),
         live_requested
     );
     assert!(e.prefill.iter().all(|b| b.seg_class.len() > 1));

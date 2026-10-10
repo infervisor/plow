@@ -9,7 +9,7 @@ use std::sync::mpsc;
 
 use parking_lot::Mutex;
 
-use crate::exec::packet_runtime::{load_packet_runtime, PacketAsset, PacketTensor};
+use crate::exec::packet_runtime::{load_packet_runtime_on, PacketAsset, PacketTensor};
 
 pub const PACKET: &str = "codec.pkt";
 const DRIVER: &str = "codec.v1";
@@ -159,15 +159,24 @@ struct Bound {
 
 impl Codec {
     pub fn load(assets: &Path) -> Result<Self, String> {
+        Self::load_on(assets, 0)
+    }
+
+    /// As [`Self::load`], on CUDA device `device`.
+    pub fn load_on(assets: &Path, device: u8) -> Result<Self, String> {
         let path = crate::exec::packet_runtime::stage_packet(&assets.join("model.pkt"), "codec.packet", PACKET)
             .map_err(|e| e.to_string())?;
         if !path.is_file() {
             return Err(format!("{} missing: emit it with PLOW_TTS_CODEC_DIR (docs/runtime/tts.md)", path.display()));
         }
-        Self::load_packet(&path)
+        Self::load_packet_on(&path, device)
     }
 
     pub fn load_packet(path: &Path) -> Result<Self, String> {
+        Self::load_packet_on(path, 0)
+    }
+
+    pub fn load_packet_on(path: &Path, device: u8) -> Result<Self, String> {
         let path = path.to_path_buf();
         let (tx, rx) = mpsc::channel::<Job>();
         let (ready_tx, ready_rx) = mpsc::channel();
@@ -176,7 +185,7 @@ impl Codec {
         std::thread::Builder::new()
             .name("plow-tts-codec".into())
             .spawn(move || {
-                let mut bound = match bind(&path) {
+                let mut bound = match bind(&path, device) {
                     Ok(b) => b,
                     Err(e) => return drop(ready_tx.send(Err(e))),
                 };
@@ -267,9 +276,9 @@ impl Codec {
     }
 }
 
-fn bind(path: &Path) -> Result<Bound, String> {
+fn bind(path: &Path, device: u8) -> Result<Bound, String> {
     let e = |x: crate::RuntimeError| x.to_string();
-    let loaded = load_packet_runtime(path, "cuda").map_err(e)?;
+    let loaded = load_packet_runtime_on(path, "cuda", device).map_err(e)?;
     let runtime = loaded.runtime;
     let asset = PacketAsset::load(path).map_err(e)?;
     let pipeline = asset.bind_driver(DRIVER, runtime.as_ref()).map_err(e)?;

@@ -7,7 +7,8 @@ import json
 import sys
 
 COLS = (("asr_final", "ASR final", "slo_asr_ms"), ("asr_partial_p50", "ASR partial", None),
-        ("llm_ttft", "LLM TTFT", "slo_ttft_ms"), ("tts_ttfa", "TTS TTFA", "slo_ttfa_ms"))
+        ("llm_ttft", "LLM TTFT", "slo_ttft_ms"), ("tts_ttfa", "TTS TTFA", "slo_ttfa_ms"),
+        ("e2e_first_audio", "E2E first audio", None))
 
 
 def row(path):

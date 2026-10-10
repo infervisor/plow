@@ -19,6 +19,8 @@ struct Ledger {
     handles: BTreeMap<u64, u64>,
     mapped: BTreeMap<u64, (u64, u64, bool)>,
     multi_map: bool,
+    /// Successful driver calls, as `vmm_trace.v1` events (lean-plow `Plow/KvRing.lean`).
+    trace: Vec<serde_json::Value>,
 }
 struct Mock(Mutex<Ledger>, u64);
 impl Default for Mock {
@@ -65,12 +67,14 @@ impl VmmOps for Mock {
         let va = 0x10000000 + s.next_va;
         s.next_va += bytes;
         assert_eq!(s.reserved.insert(va, bytes), None);
+        s.trace.push(serde_json::json!({"op": "reserve", "va": va, "bytes": bytes}));
         Ok(va)
     }
     fn address_free(&self, va: u64, bytes: u64) {
         let mut s = self.0.lock().unwrap();
         assert!(!s.mapped.keys().any(|&p| p >= va && p < va + bytes));
         assert_eq!(s.reserved.remove(&va), Some(bytes));
+        s.trace.push(serde_json::json!({"op": "address_free", "va": va, "bytes": bytes}));
     }
     fn create(&self, bytes: u64) -> Result<u64> {
         self.call(Call::Create)?;
@@ -78,12 +82,14 @@ impl VmmOps for Mock {
         s.next_handle += 1;
         let handle = s.next_handle;
         assert_eq!(s.handles.insert(handle, bytes), None);
+        s.trace.push(serde_json::json!({"op": "create", "handle": handle, "bytes": bytes}));
         Ok(handle)
     }
     fn release(&self, handle: u64) {
         let mut s = self.0.lock().unwrap();
         assert!(!s.mapped.values().any(|&(_, h, _)| h == handle));
         assert!(s.handles.remove(&handle).is_some());
+        s.trace.push(serde_json::json!({"op": "release", "handle": handle}));
     }
     fn map(&self, va: u64, bytes: u64, handle: u64) -> Result<()> {
         self.call(Call::Map)?;
@@ -99,12 +105,14 @@ impl VmmOps for Mock {
             .iter()
             .any(|(&p, &(n, h, _))| (h == handle && !multi) || (va < p + n && p < va + bytes)));
         assert_eq!(s.mapped.insert(va, (bytes, handle, false)), None);
+        s.trace.push(serde_json::json!({"op": "map", "va": va, "bytes": bytes, "handle": handle}));
         Ok(())
     }
     fn unmap(&self, va: u64, bytes: u64) {
         let mut s = self.0.lock().unwrap();
         let (n, _, _) = s.mapped.remove(&va).expect("exact mapped range");
         assert_eq!(n, bytes);
+        s.trace.push(serde_json::json!({"op": "unmap", "va": va, "bytes": bytes}));
     }
     fn set_access(&self, va: u64, bytes: u64) -> Result<()> {
         self.call(Call::Access)?;
@@ -112,6 +120,7 @@ impl VmmOps for Mock {
         let m = s.mapped.get_mut(&va).expect("mapped before access");
         assert_eq!(m.0, bytes);
         m.2 = true;
+        s.trace.push(serde_json::json!({"op": "access", "va": va, "bytes": bytes}));
         Ok(())
     }
     fn alloc(&self, _: u64) -> Result<u64> {
@@ -570,4 +579,154 @@ fn idle_rows_inside_the_launch_stay_mapped() {
     assert_eq!(rings.stats().resident_bytes, 4 * 384);
     drop(rings);
     ops.empty();
+}
+
+#[test]
+fn slot_granular_full_caches_commit_on_admission_only() {
+    let ops = Arc::new(Mock::with_granularity(64));
+    ops.0.lock().unwrap().multi_map = true;
+    let committed = |ops: &Mock| ops.0.lock().unwrap().handles.values().sum::<u64>();
+    // Two layers' K/V at two granules per slot, plus a sub-granule scale committed whole.
+    let mut tensors: Vec<_> = (0..4).map(|tensor| LiveRingTensor { tensor, slot_bytes: 128 }).collect();
+    tensors.push(LiveRingTensor { tensor: 9, slot_bytes: 16 });
+    let batch = 8;
+    let mut rings = VmmRings::new_idle_backed(ops.clone(), &tensors, batch).unwrap();
+    let startup = VmmRings::idle_backed_startup_bytes(&tensors, batch, 64);
+    assert_eq!(startup, 128 + 128);
+    assert_eq!(committed(&ops), startup);
+    assert_eq!(rings.slot_charge(), 4 * 128);
+    all_mapped(&ops, 4 * batch + 2);
+
+    rings.ensure_prefix(batch).unwrap();
+    assert_eq!(committed(&ops), startup, "padded and idle rows land on scratch");
+    for slot in [5, 0] {
+        rings.ensure_slot(slot).unwrap();
+    }
+    assert_eq!(committed(&ops), startup + 2 * rings.slot_charge());
+
+    // A slot short of memory fails whole and leaves its rows on scratch.
+    ops.fail(Call::Create, 3);
+    assert!(matches!(rings.ensure_slot(2), Err(RuntimeError::Oom(_))));
+    assert_eq!(committed(&ops), startup + 2 * rings.slot_charge());
+    all_mapped(&ops, 4 * batch + 2);
+
+    rings.release_slot(5);
+    rings.release_idle(0);
+    assert_eq!(committed(&ops), startup);
+    assert_eq!(rings.stats().mapped_slots, 0);
+
+    // Recycled units: kept while any slot is mapped, trimmed to the idle cap when none is.
+    rings.enable_handle_recycling(rings.slot_charge());
+    let creates = |ops: &Mock| ops.0.lock().unwrap().calls.iter().filter(|&&c| c == Call::Create).count();
+    for slot in [1, 3, 4] {
+        rings.ensure_slot(slot).unwrap();
+    }
+    rings.release_slot(1);
+    rings.release_slot(3);
+    assert_eq!(committed(&ops), startup + 3 * rings.slot_charge(), "busy rings keep every unit");
+    let before = creates(&ops);
+    rings.ensure_slot(6).unwrap();
+    assert_eq!(creates(&ops), before, "a recycled slot creates nothing");
+    rings.release_slot(6);
+    rings.release_slot(4);
+    assert_eq!(committed(&ops), startup + rings.slot_charge(), "idle rings keep the cap");
+    assert_eq!(rings.stats().resident_bytes, 128);
+    drop(rings);
+    ops.empty();
+}
+
+/// The driver traces of real `VmmRings` slot/prefix lifecycles, including an injected failure at
+/// every stage, are accepted by `vmm_trace.v1` (`Plow.KvRing.traceOk_sound`: mappings stay on live
+/// handles inside reservations, never overlap, and everything is returned once); mutated traces
+/// that release a mapped handle, release twice, map outside a reservation, access an unmapped
+/// range or leak a reservation are rejected.
+#[test]
+#[ignore = "requires built plow_verify; CPU-only"]
+fn vmm_ring_driver_traces_satisfy_the_lean_lifecycle_model() {
+    let granularity = 2 << 20;
+    let mut traces = Vec::new();
+    let mut run = |ops: Arc<Mock>, body: &dyn Fn(&Arc<Mock>)| {
+        body(&ops);
+        ops.empty();
+        traces.push(std::mem::take(&mut ops.0.lock().unwrap().trace));
+    };
+    run(Arc::new(Mock::with_granularity(granularity)), &|ops| {
+        let tensors = [LiveRingTensor { tensor: 3, slot_bytes: 1 << 20 }];
+        let mut rings = VmmRings::new(ops.clone(), &tensors, 3).unwrap();
+        for slot in [0, 1, 2] {
+            rings.ensure_slot(slot).unwrap();
+        }
+        for slot in [1, 0, 2] {
+            rings.release_slot(slot);
+        }
+        rings.ensure_slot(1).unwrap();
+        rings.release_slot(1);
+    });
+    for stage in [Call::Create, Call::Map, Call::Access] {
+        for nth in 1..=2 {
+            run(Arc::new(Mock::default()), &|ops| {
+                let mut rings = VmmRings::new(ops.clone(), &tensors(), 16).unwrap();
+                rings.ensure_slot(0).unwrap();
+                ops.fail(stage, nth);
+                assert!(rings.ensure_slot(3).is_err());
+                rings.ensure_prefix(4).unwrap();
+                rings.release_slot(2);
+            });
+        }
+    }
+    run(Arc::new(Mock::with_granularity(granularity)), &|ops| {
+        let tensors = [
+            LiveRingTensor { tensor: 3, slot_bytes: 1 << 20 },
+            LiveRingTensor { tensor: 8, slot_bytes: granularity },
+        ];
+        let mut rings = VmmRings::new(ops.clone(), &tensors, 2).unwrap();
+        rings.ensure_slot(0).unwrap();
+        ops.fail(Call::Create, 1);
+        assert!(rings.ensure_slot(1).is_err());
+        rings.release_slot(0);
+    });
+    for nth in 1..=2 {
+        run(Arc::new(Mock::default()), &|ops| {
+            ops.fail(Call::Reserve, nth);
+            assert!(VmmRings::new(ops.clone(), &tensors(), 16).is_err());
+        });
+    }
+    let payload = |events: &[serde_json::Value]| serde_json::json!({"schema": 1, "quiesce": true, "events": events});
+    let mut cases: Vec<(String, serde_json::Value, bool)> = traces
+        .iter()
+        .enumerate()
+        .map(|(i, t)| (format!("trace {i}"), payload(t), true))
+        .collect();
+    let base = &traces[0];
+    let op = |e: &serde_json::Value| e["op"].as_str().unwrap().to_string();
+    let first = |name: &str| base.iter().position(|e| op(e) == name).unwrap();
+    let mut mutations: Vec<(&str, Vec<serde_json::Value>)> = Vec::new();
+    let release = first("release");
+    let unmap = base[..release].iter().rposition(|e| op(e) == "unmap").unwrap();
+    let mut t = base.clone();
+    t.remove(unmap);
+    mutations.push(("release while mapped", t));
+    let mut t = base.clone();
+    t.insert(release + 1, base[release].clone());
+    mutations.push(("double release", t));
+    let mut t = base.clone();
+    let map = first("map");
+    t[map]["va"] = serde_json::json!(t[map]["va"].as_u64().unwrap() + (1u64 << 40));
+    mutations.push(("map outside reservation", t));
+    let mut t = base.clone();
+    let access = first("access");
+    t.insert(map, serde_json::json!({"op": "access", "va": base[access]["va"], "bytes": base[access]["bytes"]}));
+    mutations.push(("access before map", t));
+    let mut t = base.clone();
+    t.pop();
+    mutations.push(("leaked reservation", t));
+    for (what, t) in mutations {
+        cases.push((what.to_string(), payload(&t), false));
+    }
+    assert!(cases.iter().filter(|c| c.2).count() >= 10);
+    let requests: Vec<_> = cases.iter().map(|(_, p, _)| ("vmm_trace.v1", p.clone())).collect();
+    let certs = lean_verify::call_batch(&requests).unwrap();
+    for ((what, _, ok), cert) in cases.iter().zip(certs) {
+        assert_eq!(cert.ok, *ok, "{what}: {:?}", cert.reason);
+    }
 }

@@ -19,6 +19,10 @@ pub mod certificates;
 pub mod logical_effects;
 pub mod gemm_policy;
 
+/// The plowrt runtime contract a bundle emitted by this tree declares (`build.json`
+/// `runtime_requires.plowrt_contract`); plowrt refuses a bundle that declares a higher one.
+pub const RUNTIME_CONTRACT: u32 = 1;
+
 // --- Shared domain enums -----------------------------------------------------
 
 /// Which inference phase a bucket serves.
@@ -706,6 +710,11 @@ pub mod packed_prefill;
 pub mod kv_shared_tail;
 
 pub mod packet_pipeline;
+pub mod speech_contract;
+pub mod multimodal;
+pub mod media_geometry;
+pub mod kv_ring;
+pub mod speech_fusion;
 pub mod serve_manifest;
 
 pub mod hetero;

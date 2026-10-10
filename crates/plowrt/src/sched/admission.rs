@@ -215,6 +215,11 @@ impl DownstreamCredit {
         self.limit.store(limit, std::sync::atomic::Ordering::Relaxed);
     }
 
+    /// Work handed to the stage and not finished.
+    pub fn pending(&self) -> usize {
+        self.backlog.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     pub fn full(&self) -> bool {
         let limit = self.limit.load(std::sync::atomic::Ordering::Relaxed);
         limit != 0 && self.backlog.load(std::sync::atomic::Ordering::Relaxed) >= limit

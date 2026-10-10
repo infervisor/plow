@@ -143,8 +143,9 @@ def cost(op, p, rows, ctx, wb, kvb):
     if op == "FlashMerge":
         n, hh, ns, hd = g("n_batch", rows), g("n_head"), g("nsplit", 1), g("hd")
         return 4 * n * hh * hd * ns + 2 * n * hh * hd, 0
-    if op in ("RmsNorm", "NormResidual", "NormResidualNorm"):
-        tensors = {"RmsNorm": 2, "NormResidual": 3, "NormResidualNorm": 4}[op]
+    if op in ("RmsNorm", "NormResidual", "NormResidualNorm", "AddNorm"):
+        # AddNorm: reads a and b, writes the residual sum and its norm.
+        tensors = {"RmsNorm": 2, "NormResidual": 3, "NormResidualNorm": 4, "AddNorm": 4}[op]
         return 2 * tensors * g("rows", rows) * g("feat"), 0
     if op == "GluStrided":
         return 6 * g("rows", rows) * g("width"), 0
@@ -156,6 +157,12 @@ def cost(op, p, rows, ctx, wb, kvb):
         row_count = g("ntok") * g("nhead")
         # BF16 input, FP8 cache output, and one FP32 scale per cache row.
         return 3 * row_count * g("hd") + 4 * row_count, 0
+    if op == "EmbedOverlayBf16":
+        # Per row: a token-table or overlay (encoder) row read, BF16 row written.
+        return 4 * g("rows", rows) * g("width"), 0
+    if op == "EmbedPosBf16":
+        # Token row + position row read, BF16 row written.
+        return 6 * g("rows", rows) * g("width"), 0
     if op == "Embed":
         return 4 * g("ntok") * g("hidden"), 0
     if op == "SoftCap":

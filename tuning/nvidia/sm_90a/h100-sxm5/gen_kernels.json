@@ -566,7 +566,7 @@
    "spill_bytes": 0
   },
   "attn_pf_hd256_sliding_fp8kv": {
-   "body_sha256": "89e4d75000ccd31f567ad568319298c79e0dfdf3d3f6d2acb40a8a2b31935781",
+   "body_sha256": "faaedeb6da66a920f9618f33c931240176531bd007ede3f4dc9b438be3acbc9c",
    "classes": {
     "h16kv8_w1024_rows1024": {
      "best": {
@@ -763,6 +763,212 @@
     "head_dim": 256,
     "kv_dtype": "fp8_e4m3_rowscale",
     "mask": "causal",
+    "op": "flash_prefill",
+    "ring_kv": true,
+    "window": 1024,
+    "window_any": true
+   },
+   "spill_bytes": 0
+  },
+  "attn_pf_hd256_sliding_fp8kv_span": {
+   "body_sha256": "db696e842ab96c1742d44b1234edc207a243df437112210b8bb53499c72246e3",
+   "classes": {
+    "h16kv8_w1024_rows1024": {
+     "best": {
+      "bn": 64,
+      "kstages": 2,
+      "preg": 72,
+      "vstages": 2
+     },
+     "measured": [
+      {
+       "config": {
+        "bn": 64,
+        "kstages": 2,
+        "preg": 64,
+        "vstages": 2
+       },
+       "floor_us": 8.7,
+       "rel_l2": 0.00231,
+       "tflops": 127,
+       "us": 67.8
+      },
+      {
+       "config": {
+        "bn": 64,
+        "kstages": 2,
+        "preg": 72,
+        "vstages": 2
+       },
+       "floor_us": 8.7,
+       "rel_l2": 0.00231,
+       "tflops": 130,
+       "us": 66.0
+      }
+     ]
+    },
+    "h16kv8_w1024_rows4096": {
+     "best": {
+      "bn": 64,
+      "kstages": 2,
+      "preg": 72,
+      "vstages": 2
+     },
+     "measured": [
+      {
+       "config": {
+        "bn": 64,
+        "kstages": 2,
+        "preg": 64,
+        "vstages": 2
+       },
+       "floor_us": 60.8,
+       "rel_l2": 0.00228,
+       "tflops": 236,
+       "us": 255.1
+      },
+      {
+       "config": {
+        "bn": 64,
+        "kstages": 2,
+        "preg": 72,
+        "vstages": 2
+       },
+       "floor_us": 60.8,
+       "rel_l2": 0.00228,
+       "tflops": 244,
+       "us": 246.2
+      }
+     ]
+    },
+    "h16kv8_w1024_rows8192": {
+     "best": {
+      "bn": 64,
+      "kstages": 2,
+      "preg": 72,
+      "vstages": 2
+     },
+     "measured": [
+      {
+       "config": {
+        "bn": 64,
+        "kstages": 2,
+        "preg": 64,
+        "vstages": 2
+       },
+       "floor_us": 130.3,
+       "rel_l2": 0.00231,
+       "tflops": 258,
+       "us": 499.0
+      },
+      {
+       "config": {
+        "bn": 64,
+        "kstages": 2,
+        "preg": 72,
+        "vstages": 2
+       },
+       "floor_us": 130.3,
+       "rel_l2": 0.00231,
+       "tflops": 272,
+       "us": 473.4
+      }
+     ]
+    },
+    "h8kv2_w512_rows1000": {
+     "best": {
+      "bn": 64,
+      "kstages": 2,
+      "preg": 72,
+      "vstages": 2
+     },
+     "measured": [
+      {
+       "config": {
+        "bn": 64,
+        "kstages": 2,
+        "preg": 64,
+        "vstages": 2
+       },
+       "floor_us": 3.2,
+       "rel_l2": 0.00221,
+       "tflops": 75,
+       "us": 41.8
+      },
+      {
+       "config": {
+        "bn": 64,
+        "kstages": 2,
+        "preg": 72,
+        "vstages": 2
+       },
+       "floor_us": 3.2,
+       "rel_l2": 0.00221,
+       "tflops": 78,
+       "us": 39.9
+      }
+     ]
+    },
+    "h8kv2_w512_rows2000": {
+     "best": {
+      "bn": 64,
+      "kstages": 2,
+      "preg": 72,
+      "vstages": 2
+     },
+     "measured": [
+      {
+       "config": {
+        "bn": 64,
+        "kstages": 2,
+        "preg": 64,
+        "vstages": 2
+       },
+       "floor_us": 7.4,
+       "rel_l2": 0.00239,
+       "tflops": 158,
+       "us": 46.4
+      },
+      {
+       "config": {
+        "bn": 64,
+        "kstages": 2,
+        "preg": 72,
+        "vstages": 2
+       },
+       "floor_us": 7.4,
+       "rel_l2": 0.00239,
+       "tflops": 168,
+       "us": 43.5
+      }
+     ]
+    }
+   },
+   "config": {
+    "bn": 64,
+    "kstages": 2,
+    "preg": 72,
+    "vstages": 2
+   },
+   "object": "gen_sm90a_attn_pf_hd256_sliding_fp8kv_span.cubin",
+   "packed_check": {
+    "finite": true,
+    "rel_l2": 0.00233,
+    "span_rel_l2": 0.00231,
+    "tail_zero": true
+   },
+   "selection": "min total us over classes",
+   "signature": {
+    "arch": "sm_90a",
+    "dtype": "bf16",
+    "gqa": [
+     2,
+     16
+    ],
+    "gqa_even": true,
+    "head_dim": 256,
+    "kv_dtype": "fp8_e4m3_rowscale",
+    "mask": "causal_media_span",
     "op": "flash_prefill",
     "ring_kv": true,
     "window": 1024,

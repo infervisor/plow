@@ -1,0 +1,663 @@
+{
+ "repo": "mistralai/Mixtral-8x7B-Instruct-v0.1",
+ "template_sha256": "796853172235ab3aaa4810013ddfe2eab481bda3306dad4f700c00d436eed596",
+ "tokenizer": "/opt/dlami/nvme/lava-tts/toolcalls/tpl/mistralai__Mixtral-8x7B-Instruct-v0.1/tokenizer.json",
+ "cases": [
+  {
+   "name": "tools_first_turn",
+   "request": {
+    "messages": [
+     {
+      "role": "system",
+      "content": "You are a helpful travel assistant."
+     },
+     {
+      "role": "user",
+      "content": "What's the weather in Paris?"
+     }
+    ],
+    "tools": [
+     {
+      "type": "function",
+      "function": {
+       "name": "get_weather",
+       "description": "Get the current weather for a city.",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "city": {
+          "type": "string",
+          "description": "City name"
+         },
+         "unit": {
+          "type": "string",
+          "enum": [
+           "celsius",
+           "fahrenheit"
+          ],
+          "description": "Temperature unit"
+         }
+        },
+        "required": [
+         "city"
+        ]
+       }
+      }
+     },
+     {
+      "type": "function",
+      "function": {
+       "name": "search_flights",
+       "description": "Search flights between two airports.",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "origin": {
+          "type": "string",
+          "description": "Origin airport"
+         },
+         "destination": {
+          "type": "string",
+          "description": "Destination airport"
+         },
+         "passengers": {
+          "type": "integer",
+          "description": "Number of passengers"
+         },
+         "filters": {
+          "type": "object",
+          "description": "Optional filters",
+          "properties": {
+           "max_price": {
+            "type": "number",
+            "description": "Price cap"
+           },
+           "airlines": {
+            "type": "array",
+            "items": {
+             "type": "string"
+            },
+            "description": "Allowed airlines"
+           }
+          }
+         }
+        },
+        "required": [
+         "origin",
+         "destination"
+        ]
+       }
+      }
+     }
+    ]
+   },
+   "expected": "<s> [INST] You are a helpful travel assistant.\n\nWhat's the weather in Paris? [/INST]",
+   "ids": [
+    1,
+    733,
+    16289,
+    28793,
+    995,
+    460,
+    264,
+    10865,
+    4530,
+    13892,
+    28723,
+    13,
+    13,
+    3195,
+    28742,
+    28713,
+    272,
+    8086,
+    297,
+    5465,
+    28804,
+    733,
+    28748,
+    16289,
+    28793
+   ]
+  },
+  {
+   "name": "tools_no_system",
+   "request": {
+    "messages": [
+     {
+      "role": "user",
+      "content": "What's the weather in Paris?"
+     }
+    ],
+    "tools": [
+     {
+      "type": "function",
+      "function": {
+       "name": "get_weather",
+       "description": "Get the current weather for a city.",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "city": {
+          "type": "string",
+          "description": "City name"
+         },
+         "unit": {
+          "type": "string",
+          "enum": [
+           "celsius",
+           "fahrenheit"
+          ],
+          "description": "Temperature unit"
+         }
+        },
+        "required": [
+         "city"
+        ]
+       }
+      }
+     },
+     {
+      "type": "function",
+      "function": {
+       "name": "search_flights",
+       "description": "Search flights between two airports.",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "origin": {
+          "type": "string",
+          "description": "Origin airport"
+         },
+         "destination": {
+          "type": "string",
+          "description": "Destination airport"
+         },
+         "passengers": {
+          "type": "integer",
+          "description": "Number of passengers"
+         },
+         "filters": {
+          "type": "object",
+          "description": "Optional filters",
+          "properties": {
+           "max_price": {
+            "type": "number",
+            "description": "Price cap"
+           },
+           "airlines": {
+            "type": "array",
+            "items": {
+             "type": "string"
+            },
+            "description": "Allowed airlines"
+           }
+          }
+         }
+        },
+        "required": [
+         "origin",
+         "destination"
+        ]
+       }
+      }
+     }
+    ]
+   },
+   "expected": "<s> [INST] What's the weather in Paris? [/INST]",
+   "ids": [
+    1,
+    733,
+    16289,
+    28793,
+    1824,
+    28742,
+    28713,
+    272,
+    8086,
+    297,
+    5465,
+    28804,
+    733,
+    28748,
+    16289,
+    28793
+   ]
+  },
+  {
+   "name": "tool_loop",
+   "request": {
+    "messages": [
+     {
+      "role": "user",
+      "content": "What's the weather in Paris?"
+     },
+     {
+      "role": "assistant",
+      "content": null,
+      "tool_calls": [
+       {
+        "id": "a1B2c3D4e",
+        "type": "function",
+        "function": {
+         "name": "get_weather",
+         "arguments": "{\"city\": \"Paris\", \"unit\": \"celsius\"}"
+        }
+       }
+      ]
+     },
+     {
+      "role": "tool",
+      "tool_call_id": "a1B2c3D4e",
+      "content": "{\"temp\": 18, \"sky\": \"clear\"}"
+     }
+    ],
+    "tools": [
+     {
+      "type": "function",
+      "function": {
+       "name": "get_weather",
+       "description": "Get the current weather for a city.",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "city": {
+          "type": "string",
+          "description": "City name"
+         },
+         "unit": {
+          "type": "string",
+          "enum": [
+           "celsius",
+           "fahrenheit"
+          ],
+          "description": "Temperature unit"
+         }
+        },
+        "required": [
+         "city"
+        ]
+       }
+      }
+     },
+     {
+      "type": "function",
+      "function": {
+       "name": "search_flights",
+       "description": "Search flights between two airports.",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "origin": {
+          "type": "string",
+          "description": "Origin airport"
+         },
+         "destination": {
+          "type": "string",
+          "description": "Destination airport"
+         },
+         "passengers": {
+          "type": "integer",
+          "description": "Number of passengers"
+         },
+         "filters": {
+          "type": "object",
+          "description": "Optional filters",
+          "properties": {
+           "max_price": {
+            "type": "number",
+            "description": "Price cap"
+           },
+           "airlines": {
+            "type": "array",
+            "items": {
+             "type": "string"
+            },
+            "description": "Allowed airlines"
+           }
+          }
+         }
+        },
+        "required": [
+         "origin",
+         "destination"
+        ]
+       }
+      }
+     }
+    ]
+   },
+   "error": "TemplateError: After the optional system message, conversation roles must alternate user/assistant/user/assistant/..."
+  },
+  {
+   "name": "parallel_calls",
+   "request": {
+    "messages": [
+     {
+      "role": "user",
+      "content": "Weather in Paris, and flights from O'Hare to Zürich for 2?"
+     },
+     {
+      "role": "assistant",
+      "content": null,
+      "tool_calls": [
+       {
+        "id": "a1B2c3D4e",
+        "type": "function",
+        "function": {
+         "name": "get_weather",
+         "arguments": "{\"city\": \"Paris\", \"unit\": \"celsius\"}"
+        }
+       },
+       {
+        "id": "f5G6h7I8j",
+        "type": "function",
+        "function": {
+         "name": "search_flights",
+         "arguments": "{\"origin\": \"O'Hare \\\"Intl\\\"\", \"destination\": \"Z\\u00fcrich\", \"passengers\": 2, \"filters\": {\"max_price\": 450.5, \"airlines\": [\"LX\", \"UA\"]}}"
+        }
+       }
+      ]
+     },
+     {
+      "role": "tool",
+      "tool_call_id": "a1B2c3D4e",
+      "content": "{\"temp\": 18, \"sky\": \"clear\"}"
+     },
+     {
+      "role": "tool",
+      "tool_call_id": "f5G6h7I8j",
+      "content": "[{\"flight\": \"LX9\", \"price\": 420}]"
+     }
+    ],
+    "tools": [
+     {
+      "type": "function",
+      "function": {
+       "name": "get_weather",
+       "description": "Get the current weather for a city.",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "city": {
+          "type": "string",
+          "description": "City name"
+         },
+         "unit": {
+          "type": "string",
+          "enum": [
+           "celsius",
+           "fahrenheit"
+          ],
+          "description": "Temperature unit"
+         }
+        },
+        "required": [
+         "city"
+        ]
+       }
+      }
+     },
+     {
+      "type": "function",
+      "function": {
+       "name": "search_flights",
+       "description": "Search flights between two airports.",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "origin": {
+          "type": "string",
+          "description": "Origin airport"
+         },
+         "destination": {
+          "type": "string",
+          "description": "Destination airport"
+         },
+         "passengers": {
+          "type": "integer",
+          "description": "Number of passengers"
+         },
+         "filters": {
+          "type": "object",
+          "description": "Optional filters",
+          "properties": {
+           "max_price": {
+            "type": "number",
+            "description": "Price cap"
+           },
+           "airlines": {
+            "type": "array",
+            "items": {
+             "type": "string"
+            },
+            "description": "Allowed airlines"
+           }
+          }
+         }
+        },
+        "required": [
+         "origin",
+         "destination"
+        ]
+       }
+      }
+     }
+    ]
+   },
+   "error": "TemplateError: After the optional system message, conversation roles must alternate user/assistant/user/assistant/..."
+  },
+  {
+   "name": "multi_turn",
+   "request": {
+    "messages": [
+     {
+      "role": "system",
+      "content": "You are a helpful travel assistant."
+     },
+     {
+      "role": "user",
+      "content": "What's the weather in Paris?"
+     },
+     {
+      "role": "assistant",
+      "content": null,
+      "tool_calls": [
+       {
+        "id": "a1B2c3D4e",
+        "type": "function",
+        "function": {
+         "name": "get_weather",
+         "arguments": "{\"city\": \"Paris\", \"unit\": \"celsius\"}"
+        }
+       }
+      ]
+     },
+     {
+      "role": "tool",
+      "tool_call_id": "a1B2c3D4e",
+      "content": "{\"temp\": 18, \"sky\": \"clear\"}"
+     },
+     {
+      "role": "assistant",
+      "content": "It is 18°C and clear in Paris."
+     },
+     {
+      "role": "user",
+      "content": "And tomorrow?"
+     }
+    ],
+    "tools": [
+     {
+      "type": "function",
+      "function": {
+       "name": "get_weather",
+       "description": "Get the current weather for a city.",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "city": {
+          "type": "string",
+          "description": "City name"
+         },
+         "unit": {
+          "type": "string",
+          "enum": [
+           "celsius",
+           "fahrenheit"
+          ],
+          "description": "Temperature unit"
+         }
+        },
+        "required": [
+         "city"
+        ]
+       }
+      }
+     },
+     {
+      "type": "function",
+      "function": {
+       "name": "search_flights",
+       "description": "Search flights between two airports.",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "origin": {
+          "type": "string",
+          "description": "Origin airport"
+         },
+         "destination": {
+          "type": "string",
+          "description": "Destination airport"
+         },
+         "passengers": {
+          "type": "integer",
+          "description": "Number of passengers"
+         },
+         "filters": {
+          "type": "object",
+          "description": "Optional filters",
+          "properties": {
+           "max_price": {
+            "type": "number",
+            "description": "Price cap"
+           },
+           "airlines": {
+            "type": "array",
+            "items": {
+             "type": "string"
+            },
+            "description": "Allowed airlines"
+           }
+          }
+         }
+        },
+        "required": [
+         "origin",
+         "destination"
+        ]
+       }
+      }
+     }
+    ]
+   },
+   "error": "TemplateError: After the optional system message, conversation roles must alternate user/assistant/user/assistant/..."
+  },
+  {
+   "name": "history_without_tools",
+   "request": {
+    "messages": [
+     {
+      "role": "user",
+      "content": "What's the weather in Paris?"
+     },
+     {
+      "role": "assistant",
+      "content": null,
+      "tool_calls": [
+       {
+        "id": "a1B2c3D4e",
+        "type": "function",
+        "function": {
+         "name": "get_weather",
+         "arguments": "{\"city\": \"Paris\", \"unit\": \"celsius\"}"
+        }
+       }
+      ]
+     },
+     {
+      "role": "tool",
+      "tool_call_id": "a1B2c3D4e",
+      "content": "{\"temp\": 18, \"sky\": \"clear\"}"
+     }
+    ]
+   },
+   "error": "TemplateError: After the optional system message, conversation roles must alternate user/assistant/user/assistant/..."
+  },
+  {
+   "name": "plain_chat",
+   "request": {
+    "messages": [
+     {
+      "role": "system",
+      "content": "You are a helpful travel assistant."
+     },
+     {
+      "role": "user",
+      "content": "What's the weather in Paris?"
+     },
+     {
+      "role": "assistant",
+      "content": "Sunny."
+     },
+     {
+      "role": "user",
+      "content": "Thanks!"
+     }
+    ]
+   },
+   "expected": "<s> [INST] You are a helpful travel assistant.\n\nWhat's the weather in Paris? [/INST] Sunny.</s> [INST] Thanks! [/INST]",
+   "ids": [
+    1,
+    733,
+    16289,
+    28793,
+    995,
+    460,
+    264,
+    10865,
+    4530,
+    13892,
+    28723,
+    13,
+    13,
+    3195,
+    28742,
+    28713,
+    272,
+    8086,
+    297,
+    5465,
+    28804,
+    733,
+    28748,
+    16289,
+    28793,
+    7057,
+    1780,
+    28723,
+    2,
+    733,
+    16289,
+    28793,
+    8868,
+    28808,
+    733,
+    28748,
+    16289,
+    28793
+   ]
+  }
+ ]
+}

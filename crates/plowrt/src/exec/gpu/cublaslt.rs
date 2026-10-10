@@ -1230,6 +1230,32 @@ fn glue_kernels<'a>(routes: impl Iterator<Item = &'a LibraryRoute>) -> Vec<Kerne
         .collect()
 }
 
+/// One decode program's projection routes and MoE routes, which own disjoint segments.
+pub(super) fn merge_routes(
+    projections: Vec<Option<LibraryRoute>>,
+    moe: Vec<Option<LibraryRoute>>,
+) -> Result<Vec<Option<LibraryRoute>>> {
+    if moe.is_empty() {
+        return Ok(projections);
+    }
+    if projections.is_empty() {
+        return Ok(moe);
+    }
+    if projections.len() != moe.len() {
+        return Err(RuntimeError::Rejected("projection and MoE decode segments disagree".into()));
+    }
+    projections
+        .into_iter()
+        .zip(moe)
+        .map(|pair| match pair {
+            (Some(_), Some(_)) => Err(RuntimeError::Rejected(
+                "a decode segment is both a projection and a MoE route".into(),
+            )),
+            (a, b) => Ok(a.or(b)),
+        })
+        .collect()
+}
+
 pub(super) fn library_routes(routes: Vec<Option<CublasLtDecodeRoute>>) -> Vec<Option<LibraryRoute>> {
     routes
         .into_iter()
@@ -1542,7 +1568,8 @@ pub(super) fn prepare_routes(
             if u64::from(segment.m) * u64::from(fusion.n_total) * 2 > scratch.len {
                 return Err(RuntimeError::Rejected("fused q|k|v scratch too small".into()));
             }
-            let plan = lt.plan(segment.m, fusion.n_total, segment.k, weight, template.filter(|_| pin), rows)?;
+            let ns: Vec<u32> = segments[index..index + 3].iter().flatten().map(|s| s.n).collect();
+            let plan = lt.plan(segment.m, fusion.n_total, segment.k, weight, template.filter(|_| pin), rows, &ns)?;
             for next in segments[index + 1..index + 3].iter().flatten() {
                 insts[next.instruction].op = DevOp::Nop as u16;
             }
@@ -1626,7 +1653,7 @@ pub(super) fn prepare_routes(
                                 )),
                             })
                             .transpose()?;
-                        ProjectionPlan::Lt(lt.plan(key.0, key.1, key.2, weight, template.filter(|_| pin), rows)?)
+                        ProjectionPlan::Lt(lt.plan(key.0, key.1, key.2, weight, template.filter(|_| pin), rows, &[segment.n])?)
                     }
                     ProjectionBackend::Native(native) => {
                         let template = template
@@ -2004,6 +2031,13 @@ mod tests {
     use packet::dev::{DevInst64, StreamEnt};
 
     #[test]
+    fn merge_routes_keeps_either_side_when_the_other_is_absent() {
+        assert_eq!(merge_routes(vec![None, None], Vec::new()).unwrap().len(), 2);
+        assert_eq!(merge_routes(Vec::new(), vec![None, None, None]).unwrap().len(), 3);
+        assert!(merge_routes(vec![None], vec![None, None]).is_err());
+    }
+
+    #[test]
     fn norm_quant_pair_requires_complete_interleaved_slices_and_shared_output() {
         let (mut g, _) = fixture(4);
         let none = packet::dev::TENSOR_NONE16;
@@ -2298,8 +2332,8 @@ mod tests {
     #[test]
     fn accepts_only_measured_sm90_bf16_prefill_cells() {
         use plow_asset::segment_roles::{
-            CUBLASLT_PREFILL_GEMMA4_26B_SHAPES, CUBLASLT_PREFILL_GEMMA4_SHAPES,
-            CUBLASLT_PREFILL_ROWS, CUBLASLT_PREFILL_SPEECH_ROWS, CUBLASLT_PREFILL_WIDE_ROWS,
+            CUBLASLT_PREFILL_GEMMA4_26B_SHAPES, CUBLASLT_PREFILL_GEMMA4_31B_SHAPES,
+            CUBLASLT_PREFILL_GEMMA4_SHAPES, CUBLASLT_PREFILL_ROWS, CUBLASLT_PREFILL_SPEECH_ROWS, CUBLASLT_PREFILL_WIDE_ROWS,
         };
         for &rows in CUBLASLT_PREFILL_ROWS
             .iter()
@@ -2309,6 +2343,7 @@ mod tests {
             for &(n, k) in CUBLASLT_PREFILL_GEMMA4_SHAPES
                 .iter()
                 .chain(&CUBLASLT_PREFILL_GEMMA4_26B_SHAPES)
+                .chain(&CUBLASLT_PREFILL_GEMMA4_31B_SHAPES)
             {
                 let (program, tensors) = prefill_fixture(rows, n, k);
                 let routes = prefill_segments(&program, &tensors, &roles(), "sm90a").unwrap();

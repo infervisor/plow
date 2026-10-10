@@ -21,28 +21,14 @@ verifier rejection / query failure.
 -/
 import Lean.Data.Json
 import Plow.CLI.Schema
-import Plow.CLI.Checkpoints
+import Plow.CLI.Dispatch
 import Plow.CLI.Queries
 
 open Lean (Json)
 open Plow.CLI
 
-def runCheckpoint (cp : String) (payload : Json) : IO Certificate := do
-  match cp with
-  | "A" => return Checkpoints.checkA payload
-  | "B" => return Checkpoints.checkB payload
-  | "C" => return Checkpoints.checkC payload
-  | "D" => Checkpoints.checkD payload
-  | "E" => return Checkpoints.checkE payload
-  | "F" => Checkpoints.checkF payload
-  | "G" => return Checkpoints.checkG payload
-  | "K" => return Checkpoints.checkK payload
-  | "S" => return Checkpoints.checkS payload
-  | "P" => return Checkpoints.checkP payload
-  | "R" => return Checkpoints.checkR payload
-  | "L" => return Checkpoints.checkL payload
-  | _   => return { ok := false, checkpoint := cp,
-                    notes := none, reason := some s!"unknown checkpoint '{cp}'" }
+def runCheckpoint (cp : String) (payload : Json) : IO Certificate :=
+  Dispatch.run cp payload
 
 def runQuery (qt : String) (payload : Json) : IO Queries.QueryResultJ := do
   match qt with

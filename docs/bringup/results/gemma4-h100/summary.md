@@ -8,8 +8,10 @@ rows marked "grid" come from `llm_grid.sh` or earlier same-client grids and are 
 |---|---|---|---|---|---|---|
 | E4B | BF16 | [`recipes/infervisor/gemma-4-e4b/sm90a-h100-tp1.toml`](../../../../recipes/infervisor/gemma-4-e4b/sm90a-h100-tp1.toml) | main `fc0271e8` (repro) | `llm_logit_parity` PASS | grid only | no strict report |
 | 12B | FP8 W8A8, FP8 per-token-head KV | [`recipes/infervisor/gemma-4-12b/sm90a-h100-tp1.toml`](../../../../recipes/infervisor/gemma-4-12b/sm90a-h100-tp1.toml) | `ee57f7b7` | `llm_fp32_ref` PASS | strict, 10 cells | **yes**, vs vLLM 0.28 FP8 KV |
-| 12B, 26B-A4B | BF16 | `scripts/campaign/recipes/gemma4-{12b,26b-a4b}.h100.bf16-*.toml` | | | ledgers only | no |
-| 31B | BF16 / FP8 | frozen release, no recipe | `3ca64e9` / `25fb3d7` | functional | none on H100 | no |
+| 12B | BF16 | `scripts/campaign/recipes/gemma4-12b.h100.bf16-*.toml` (trial) | | | ledgers only | no |
+| 26B-A4B | BF16; FP8 W8A8, FP8 per-token-head KV | [`recipes/infervisor/gemma-4-26b-a4b/sm90a-h100-tp1-{bf16,fp8}.toml`](../../../../recipes/infervisor/gemma-4-26b-a4b/) | `2cc23e9e` (16K), `80097064` (FP8, max_ctx 131072) | FP32-reference gate PASS x2 per packet | strict | **yes**, vs vLLM 0.28: [gemma26b-h100-20261007](../gemma26b-h100-20261007/comparison.md) (BF16 agentic16k; FP8 4K/15K/agentic16k), [gemma26b-h100-20261009](../gemma26b-h100-20261009/comparison.md) (FP8 at max_ctx 131072) |
+| 31B | FP8 W8A8, FP8 per-token-head KV | [`recipes/infervisor/gemma-4-31b/sm90a-h100-tp1-fp8.toml`](../../../../recipes/infervisor/gemma-4-31b/sm90a-h100-tp1-fp8.toml) | `8818de12` | `llm_fp32_ref` PASS x2 (long gate fails cont_frac; ships 16384) | strict, 12 cells | **yes**, vs vLLM 0.28 FP8 KV (4K/15K/32K/agentic; loses c1/c4) |
+| 31B | BF16 | [`recipes/infervisor/gemma-4-31b/sm90a-h100-tp1-bf16.toml`](../../../../recipes/infervisor/gemma-4-31b/sm90a-h100-tp1-bf16.toml) | `071d8f13` | `llm_fp32_ref` FAIL (kl_mean vs vLLM; transformers-BF16 parity) | strict, NOT EQUIVALENT | no |
 
 ## Gemma-4 E4B (voice-agent LLM)
 
@@ -18,6 +20,9 @@ rows marked "grid" come from `llm_grid.sh` or earlier same-client grids and are 
   Mechanisms: [gemma4-e4b-h100.md](../../../runtime/gemma4-e4b-h100.md).
 - Latest reproduction: main `fc0271e8`, packet `62408e49`, 2026-10-03, one H100 SXM, 2 repeats.
   Gate `llm_logit_parity` PASS: top1 0.9897, KL mean 7.4e-4, KL max 0.014 (gate top1 >= 0.98).
+- 2026-10-09 per-rung routes (fd0fe175): cuBLASLt decode from 2 rows and generated prefill
+  attention on the 1024+ rungs; gate top1 0.9819; voice bench c1 TTFT 21 -> 14.6 ms, c32 out
+  tok/s +32%: [native-kernels-20261009.md](native-kernels-20261009.md) (grid only).
 - Baseline: vLLM 0.28, same client, `llm_grid.sh` ISL 128 / OSL 512, greedy, per-cell seeds.
   No strict `campaign.py report` exists for E4B.
 
@@ -128,20 +133,37 @@ SHA256s). Per-rung route notes:
   `PLOW_EMIT_DECODE_CUBLASLT_HEAD` unset for `-lt`). The 4K/128-slot BF16-KV trial failed
   allocation on an 80 GB H100 and was dropped.
 
-## Gemma-4 12B and 26B-A4B BF16
+## Gemma-4 12B BF16
 
 No strict report and no qualified win is recorded. Trial recipes:
-`scripts/campaign/recipes/gemma4-12b.h100.bf16-*.toml` and `gemma4-26b-a4b.h100.*.toml`.
-`campaign.py ledger` rows: `perf-data/campaign/gemma4-12b.h100.bf16*.csv` and
-`gemma4-26b-a4b.h100.bf16-{ctx16k,c32-16k}.csv`. They are compared against the vLLM 0.28
-reference CSVs `perf-data/campaign/*.reference-vllm028-{bf16,bf16-high-concurrency,fp8}.csv`
-that the recipes' `[reference]` sections name. Packet recreate records:
+`scripts/campaign/recipes/gemma4-12b.h100.bf16-*.toml`. The remaining `campaign.py ledger` is
+`perf-data/campaign/gemma4-12b.h100.bf16.csv`, compared against the vLLM 0.28 reference
+`perf-data/campaign/gemma4-12b.h100.reference-vllm028-bf16.csv` that the recipes' `[reference]`
+sections name (the per-trial ledgers were dropped). Packet recreate records:
 [perf-data/packets](../../../../perf-data/packets/README.md). Campaign notes:
-`plans/gemma4-dense-realtime-tracker.md`, `plans/gemma4-26b-a4b-h100-tracker.md`.
+`plans/gemma4-dense-realtime-tracker.md`.
+
+## Gemma-4 26B-A4B
+
+Qualified wins vs vLLM 0.28 (strict `campaign.py report`, MATCHED + EQUIVALENT):
+
+- BF16 and FP8 at 16K: [gemma26b-h100-20261007/comparison.md](../gemma26b-h100-20261007/comparison.md),
+  every matched row in [comparison.csv](../gemma26b-h100-20261007/comparison.csv). plowrt
+  `2cc23e9e`, packets from `recipes/infervisor/gemma-4-26b-a4b/sm90a-h100-tp1-{bf16,fp8}.toml`.
+- FP8 at max_ctx 131072: [gemma26b-h100-20261009/comparison.md](../gemma26b-h100-20261009/comparison.md),
+  [comparison.csv](../gemma26b-h100-20261009/comparison.csv). plowrt `80097064`.
+- Reproduce: `scripts/campaign/repro_gemma26b_h100.sh`.
+
+Earlier trial recipes `scripts/campaign/recipes/gemma4-26b-a4b.h100.*.toml` and the ledger
+`perf-data/campaign/gemma4-26b-a4b.h100.bf16-ctx16k.csv` (vs the
+`gemma4-26b-a4b.h100.reference-vllm028-{bf16,bf16-high-concurrency,fp8}.csv` references) are
+history, not qualified. Campaign notes: `plans/gemma4-26b-a4b-h100-tracker.md`.
 
 ## Gemma-4 31B
 
-- H100: frozen release `/opt/dlami/nvme/plow-releases/gemma4-31b-h100-20260909`, functionally
+- H100 2026-10-10: FP8 and BF16 recipes and the strict comparison vs vLLM 0.28:
+  [gemma31b-h100-20261010/comparison.md](../gemma31b-h100-20261010/comparison.md).
+- H100 (earlier): frozen release `/opt/dlami/nvme/plow-releases/gemma4-31b-h100-20260909`, functionally
   validated profiles only ([gemma4-h100-release.md](../../../runtime/gemma4-h100-release.md),
   [gemma4-h100-checkpoint.md](../../../runtime/gemma4-h100-checkpoint.md)). No serving
   comparison is recorded.

@@ -381,6 +381,16 @@ impl ServeEngine {
         }
     }
 
+    /// KV commits that waited for device memory so far (a growth signal for the planner).
+    pub fn kv_pressure_events(&self) -> u64 {
+        match self {
+            #[cfg(feature = "cuda")]
+            ServeEngine::Cuda(e) => e.kv_pressure_events(),
+            #[allow(unreachable_patterns)]
+            _ => 0,
+        }
+    }
+
     /// What the device can back, so the mux admits on KV bytes instead of free slots alone.
     /// `None` = admit on slots, the behaviour every non-AMD engine keeps.
     pub fn kv_admission_budget(&self) -> Option<crate::sched::admission::KvBudget> {

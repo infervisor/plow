@@ -23,10 +23,7 @@ fn packet_capabilities_are_explicit() {
         assert!(capabilities.dense_packet_contracts);
         assert_eq!(capabilities.gemma, model_type.starts_with("gemma"));
         assert!(capabilities.decode_objects);
-        assert_eq!(
-            capabilities.cublaslt_decode,
-            model_type.starts_with("gemma") || model_type == "llama"
-        );
+        assert!(capabilities.cublaslt_decode);
         assert!(capabilities.decode_ladder);
     }
     let qwen = emit_capabilities("qwen3_5");

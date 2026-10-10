@@ -65,6 +65,8 @@ pub(super) fn supports(insts: &[DevInst64]) -> bool {
                         .and_then(|chunks| inst.i[3].checked_mul(chunks))
                         .is_some_and(|window| window <= 64)
                     && tensors(inst, &[0, 1, 2, 3, 4, 5, 6])
+                    // The fused Metal kernel has no stream key mask (t7).
+                    && inst.t[7] == packet::dev::TENSOR_NONE16
             }
             _ => false,
         })

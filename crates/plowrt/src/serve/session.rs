@@ -80,6 +80,17 @@ pub struct RequestIds {
     pub playback: Option<crate::serve::turns::Playback>,
     /// The turn this request joined (`serve::turns::StageRun::start`), for the mux job.
     pub turn_key: Option<crate::serve::turns::TurnKey>,
+    /// Whose request this is for the mux's round-robin: the session, else the API key.
+    pub tenant: Option<u64>,
+}
+
+/// [`RequestIds::tenant`] of a session id or an API key; the two never collide.
+fn tenant_of(kind: u8, id: &[u8]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = rustc_hash::FxHasher::default();
+    kind.hash(&mut h);
+    id.hash(&mut h);
+    h.finish()
 }
 
 /// An id of 1..=`max` visible ASCII bytes.
@@ -108,14 +119,20 @@ impl RequestIds {
             Some(v) => Some(budget_ms(v).ok_or_else(|| format!("{TURN_BUDGET_HEADER} must be 1..=600000 ms"))?),
             None => None,
         };
+        let session = read(&SESSION_HEADER, MAX_SESSION_BYTES)?;
+        let tenant = match &session {
+            Some(s) => Some(tenant_of(0, s.as_bytes())),
+            None => crate::serve::auth::presented_key(headers).map(|key| tenant_of(1, key)),
+        };
         Ok(Self {
             request: read(&REQUEST_HEADER, MAX_ID_BYTES)?.unwrap_or_else(|| generate_id().into()),
-            session: read(&SESSION_HEADER, MAX_SESSION_BYTES)?,
+            session,
             trace: text(&TRACEPARENT_HEADER).and_then(TraceParent::parse),
             turn: read(&TURN_ID_HEADER, MAX_ID_BYTES)?,
             budget_ms,
             playback: text(&PLAYBACK_HEADER).and_then(crate::serve::turns::Playback::parse),
             turn_key: None,
+            tenant,
         })
     }
 
@@ -129,6 +146,7 @@ impl RequestIds {
                 return Err(format!("session_id must be 1..={MAX_SESSION_BYTES} visible ASCII characters"));
             }
             self.session = Some(s.into());
+            self.tenant = Some(tenant_of(0, s.as_bytes()));
         }
         if self.trace.is_none() {
             self.trace = body.trace.as_ref().and_then(TraceParent::from_body);
@@ -156,7 +174,7 @@ impl RequestIds {
 
     /// A generated request id and no session.
     pub fn generated() -> Self {
-        Self { request: generate_id().into(), session: None, trace: None, turn: None, budget_ms: None, playback: None, turn_key: None }
+        Self { request: generate_id().into(), session: None, trace: None, turn: None, budget_ms: None, playback: None, turn_key: None, tenant: None }
     }
 
     /// The same identity under a fresh request id (one request of a multi-request connection).

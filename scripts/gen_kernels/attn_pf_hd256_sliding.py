@@ -85,24 +85,29 @@ def wgmma_inc():
     return head + "".join(qk(n) for n in (32, 64)) + "".join(pv(bn) for bn in (32, 64))
 
 
-def digest(cfg, fp8=False):
+def digest(cfg, fp8=False, span=False):
     """Generator identity of one config: the template sources plus the defines."""
     import hashlib
     h = hashlib.sha256()
     for path in (SOURCE_FP8 if fp8 else SOURCE, SOURCE.with_name("gen_attn_pf_hd256_wgmma.inc")):
         h.update(path.read_bytes())
     h.update(json.dumps(cfg, sort_keys=True).encode())
+    if span:
+        h.update(b"GEN_MEDIA_SPAN=1")
     return h.hexdigest()
 
 
-def build(out, cfg, fp8=False):
+def build(out, cfg, fp8=False, span=False):
+    """`span` compiles the FP8-KV media-span twin (GEN_MEDIA_SPAN=1)."""
+    assert fp8 or not span, "media spans are FP8-KV only"
     nvcc = os.environ.get("PLOW_NVCC", "/usr/local/cuda-12.9/bin/nvcc")
     cmd = [nvcc, "-ccbin", os.environ.get("PLOW_CXX", "/usr/bin/g++-14"), "-std=c++17",
            "-gencode", "arch=compute_90a,code=sm_90a", "-O3", "-cubin", "-Xptxas=-v",
            f"-I{REPO / 'runtime/common'}", f"-I{REPO / 'runtime/nvidia'}",
            f"-DGEN_BN={cfg['bn']}", f"-DGEN_KSTAGES={cfg['kstages']}",
            f"-DGEN_VSTAGES={cfg['vstages']}", f"-DGEN_PREG={cfg['preg']}",
-           f"-DGEN_CREG={creg(cfg['preg'])}", "-o", str(out), str(SOURCE_FP8 if fp8 else SOURCE)]
+           f"-DGEN_CREG={creg(cfg['preg'])}", *(["-DGEN_MEDIA_SPAN=1"] if span else []),
+           "-o", str(out), str(SOURCE_FP8 if fp8 else SOURCE)]
     res = subprocess.run(cmd, capture_output=True, text=True)
     if res.returncode:
         raise RuntimeError(f"nvcc failed {cfg}:\n{res.stderr[-3000:]}")
@@ -180,9 +185,12 @@ class Case:
     of a request at ring row p & kv_mask; requests (q0, qlen, slot, kvlen) packed in order."""
 
     def __init__(self, drv, H, KVH, window, requests, seq_q=None, kv_stride=None, ring=True,
-                 slots=None, seed=0, qscale=None, fp8=False):
+                 slots=None, seed=0, qscale=None, fp8=False, spans=None):
         torch = drv.torch
         self.drv, self.H, self.KVH, self.window, self.requests = drv, H, KVH, window, requests
+        # Media spans per request, absolute [start, end) positions: rows of one span also attend
+        # its later rows (FP8 objects only; the span-extent rows ride the direct ABI's 8th slot).
+        self.spans = spans
         real = requests[-1][0] + requests[-1][1]
         self.seq_q = seq_q or real
         need = max(kvlen for _, _, _, kvlen in requests)
@@ -230,6 +238,19 @@ class Case:
                 self.v[slot][:, :kvlen] = vl.transpose(0, 1).to(bf)
             self.lin.append((kl, vl))
         self.o = torch.full((self.seq_q, H, D), float("nan"), device="cuda", dtype=bf)
+        self.ext = None
+        if spans is not None:
+            # MmSpanExtent over the packed ids: a run continuing into the next request's rows
+            # counts them too; the kernel clips it to the request.
+            tagged = [False] * self.seq_q
+            for (q0, qlen, _, kvlen), sp in zip(requests, spans):
+                for a, b in sp:
+                    for p in range(max(a, kvlen - qlen), min(b, kvlen)):
+                        tagged[q0 + p - (kvlen - qlen)] = True
+            ext = [0] * self.seq_q
+            for r in range(self.seq_q - 2, -1, -1):
+                ext[r] = ext[r + 1] + 1 if tagged[r] and tagged[r + 1] else 0
+            self.ext = torch.tensor(ext, device="cuda", dtype=torch.int32)
         flat = [len(requests)] + [x for r in requests for x in r]
         self.req = torch.tensor(flat, device="cuda", dtype=torch.int32)
         self.entries = torch.zeros(4096 * 24, device="cuda", dtype=torch.uint8)
@@ -260,8 +281,9 @@ class Case:
         mapkv = self.map_table() if tma else 0
         if self.fp8:
             # plow_gen_flash_prefill_abi 2: k_scale / v_scale in the opart / mlpart slots.
+            span = self.ext.data_ptr() if self.ext is not None else 0
             return pack([p(self.req), p(self.ks), p(self.vs), p(self.q), p(self.k8), p(self.v8),
-                         p(self.o), ("p", 0), p(self.entries), p(self.counters), p(self.counters),
+                         p(self.o), ("p", span), p(self.entries), p(self.counters), p(self.counters),
                          ("u", self.seq_q), ("u", 0), ("u", 0), ("u", self.kv_stride),
                          ("u", self.kv_mask), ("f", scale), ("u", self.H), ("u", self.KVH),
                          ("u", self.window), ("u", 0)])
@@ -287,12 +309,14 @@ class Case:
         torch = self.drv.torch
         num = den = 0.0
         g = self.H // self.KVH
-        for (q0, qlen, slot, kvlen), (kl, vl) in zip(self.requests, self.lin):
+        for i, ((q0, qlen, slot, kvlen), (kl, vl)) in enumerate(zip(self.requests, self.lin)):
             pos = torch.arange(kvlen - qlen, kvlen, device="cuda")[:, None]
             kv = torch.arange(kvlen, device="cuda")[None, :]
             mask = kv <= pos
             if self.window:
                 mask &= pos - kv < self.window
+            for a, b in (self.spans[i] if self.spans else []):
+                mask |= (pos >= a) & (pos < b) & (kv > pos) & (kv < b)
             for h in range(self.H):
                 q = self.q[q0:q0 + qlen, h].float()
                 s = (q @ kl[:, h // g].float().T) * scale
@@ -409,13 +433,32 @@ def check_cases():
     ]
 
 
+def span_cases():
+    """FP8 objects: media spans (bidirectional within the span) across query and KV tiles; a
+    chunk ending on a span end with the next packed request resuming inside another span (the
+    run the extent op sees continues across both); a span in a chunk after 7K with the ring
+    wrapped; one-row spans on a tile edge."""
+    return [
+        ("spans 4096, two images", 16, 8, 1024, [(0, 4096, 0, 4096)],
+         {"spans": [[(1000, 1280), (2001, 2281)]]}),
+        ("spans packed, run across requests", 16, 8, 1024,
+         [(0, 1280, 0, 1280), (1280, 700, 1, 900), (1980, 300, 2, 300)],
+         {"seq_q": 2304, "spans": [[(1000, 1280)], [(150, 420)], [(10, 290)]]}),
+        ("span chunk after 7K, ring wraps", 16, 8, 1024, [(0, 2048, 0, 9000)],
+         {"kv_stride": 4096, "spans": [[(8000, 8280)]]}),
+        ("span one row and tile edge", 16, 8, 1024, [(0, 700, 0, 700)],
+         {"spans": [[(63, 64), (65, 67), (127, 400)]]}),
+        ("E4B-class span", 8, 2, 512, [(0, 1000, 0, 1000)], {"spans": [[(300, 580)]]}),
+    ]
+
+
 def cmd_check(a):
     drv = Driver()
     kern = Kernel(drv, a.cubin)
     kerns = {"cp.async": kern} if kern.fp8 else {"cp.async": kern, "tma": Kernel(drv, a.cubin, True)}
     worst = 0.0
     ok_all = True
-    for name, H, KVH, W, reqs, kw in check_cases():
+    for name, H, KVH, W, reqs, kw in check_cases() + (span_cases() if kern.fp8 else []):
         c = Case(drv, H, KVH, W, reqs, fp8=kern.fp8, **kw)
         for mode, kern in kerns.items():
             c.o.fill_(float("nan"))
@@ -538,7 +581,15 @@ def packed_check(drv, kern):
     return {"rel_l2": float(f"{err:.2e}"), "tail_zero": tail, "finite": finite}
 
 
-def tune_row(log=print, fp8=False):
+def span_check(drv, kern, H, KVH, W, reqs, kw):
+    c = Case(drv, H, KVH, W, reqs, fp8=True, **kw)
+    c.o.fill_(float("nan"))
+    kern(c)
+    drv.torch.cuda.synchronize()
+    return c.reference_error()
+
+
+def tune_row(log=print, fp8=False, span=False):
     """Sweep every config over every shape class with the packet's KV maps (the TMA staging the
     role runs in-model), pick the least total time, and return the catalog row (minus signature
     and object) for build_catalog.py's table."""
@@ -548,7 +599,7 @@ def tune_row(log=print, fp8=False):
         for cfg in sweep(fp8):
             out = Path(tmp) / "k.cubin"
             try:
-                spill = build(out, cfg, fp8)
+                spill = build(out, cfg, fp8, span)
             except RuntimeError as e:
                 log(f"{cfg}: build failed: {str(e).splitlines()[0]}")
                 continue
@@ -562,6 +613,10 @@ def tune_row(log=print, fp8=False):
             pack = packed_check(drv, kern)
             ok = (pack["tail_zero"] and pack["finite"] and pack["rel_l2"] < 1e-2
                   and all(v["rel_l2"] < 1e-2 for v in res.values()))
+            if span:
+                spans = [span_check(drv, kern, *case[1:]) for case in span_cases()]
+                pack["span_rel_l2"] = float(f"{max(e for e, _, _ in spans):.2e}")
+                ok = ok and all(e < 2e-2 and t and f for e, t, f in spans)
             log(f"{cfg}: {json.dumps(res)} packed {pack}")
             if ok:
                 trials.append((cfg, res, pack))
@@ -573,21 +628,21 @@ def tune_row(log=print, fp8=False):
         key = class_key(*cl)
         meas = [{"config": c, **r[key]} for c, r, _ in trials]
         classes[key] = {"best": min(meas, key=lambda m: m["us"])["config"], "measured": meas}
-    return {"config": best[0], "body_sha256": digest(best[0], fp8),
+    return {"config": best[0], "body_sha256": digest(best[0], fp8, span),
             "selection": "min total us over classes" + ("" if fp8 else ", TMA staging"),
             "classes": classes,
             "packed_check": best[2], "spill_bytes": 0}
 
 
-def catalog_build(cfg, out, fp8=False):
+def catalog_build(cfg, out, fp8=False, span=False):
     """build_catalog.py hook: compile one config, return its generator digest."""
-    if build(out, cfg, fp8):
+    if build(out, cfg, fp8, span):
         raise RuntimeError(f"attn_pf_hd256_sliding{'_fp8kv' if fp8 else ''} {cfg} spills")
-    return digest(cfg, fp8)
+    return digest(cfg, fp8, span)
 
 
 def cmd_tune(a):
-    row = tune_row(fp8=a.fp8kv)
+    row = tune_row(fp8=a.fp8kv or a.span, span=a.span)
     Path(a.out).write_text(json.dumps(row, indent=1) + "\n")
 
 
@@ -599,6 +654,7 @@ def main():
     b.add_argument("out")
     b.add_argument("--config", default="")
     b.add_argument("--fp8kv", action="store_true")
+    b.add_argument("--span", action="store_true", help="FP8-KV media-span twin")
     c = sub.add_parser("check")
     c.add_argument("cubin")
     c.add_argument("--role14")
@@ -612,6 +668,7 @@ def main():
     t = sub.add_parser("tune")
     t.add_argument("out")
     t.add_argument("--fp8kv", action="store_true")
+    t.add_argument("--span", action="store_true", help="FP8-KV media-span twin")
     sub.add_parser("wgmma-inc")
     a = ap.parse_args()
     if a.cmd == "wgmma-inc":
@@ -622,7 +679,7 @@ def main():
         for kv in filter(None, a.config.split(",")):
             k, v = kv.split("=")
             cfg[k] = int(v)
-        print(f"spill bytes {build(a.out, cfg, a.fp8kv)}")
+        print(f"spill bytes {build(a.out, cfg, a.fp8kv or a.span, a.span)}")
         return 0
     return {"check": cmd_check, "bench": cmd_bench, "tune": cmd_tune}[a.cmd](a) or 0
 

@@ -1,13 +1,15 @@
 pub mod conformer;
+pub mod endpoint;
 pub mod frontend;
+pub mod numerals;
 #[cfg(feature = "gguf")]
 pub mod nemotron;
-#[cfg(feature = "gguf")]
 mod packet;
 pub mod audio_lm;
 pub mod rnnt;
 pub mod serving;
 pub mod subsampling;
+pub mod vad;
 
 use std::path::Path;
 
@@ -59,6 +61,38 @@ pub trait Transcriber: Send {
         cancel: &std::sync::atomic::AtomicBool,
     ) -> crate::Result<Transcript>;
 
+    /// `transcribe`, reporting the transcript so far each time it grows (streamed deltas). An
+    /// engine that decodes in one step reports the final text once.
+    fn transcribe_streaming(
+        &mut self,
+        samples: &[f32],
+        language: Option<&str>,
+        context: &str,
+        cancel: &std::sync::atomic::AtomicBool,
+        on_text: &mut dyn FnMut(&str),
+    ) -> crate::Result<Transcript> {
+        let transcript = self.transcribe(samples, language, context, cancel)?;
+        on_text(&transcript.text);
+        Ok(transcript)
+    }
+
+    /// Open an incremental (cache-aware) stream, or `None` when the engine has none: then partial
+    /// transcripts re-run [`Transcriber::transcribe`] on the audio so far.
+    fn stream_open(&mut self) -> crate::Result<Option<u64>> {
+        Ok(None)
+    }
+
+    /// Append audio to stream `id`; returns the transcript of the audio decoded so far (it trails
+    /// the audio by the encoder's lookahead), reporting each growth through `on_text`.
+    fn stream_push(&mut self, id: u64, samples: &[f32], on_text: &mut dyn FnMut(&str)) -> crate::Result<String> {
+        let _ = (id, samples, on_text);
+        Err(crate::RuntimeError::Rejected("this ASR engine has no incremental stream".into()))
+    }
+
+    fn stream_close(&mut self, id: u64) {
+        let _ = id;
+    }
+
     fn transcribe_batch(
         &mut self,
         requests: &[TranscriptionInput<'_>],
@@ -106,6 +140,29 @@ impl<T: Transcriber + ?Sized> Transcriber for Box<T> {
         (**self).transcribe(samples, language, context, cancel)
     }
 
+    fn transcribe_streaming(
+        &mut self,
+        samples: &[f32],
+        language: Option<&str>,
+        context: &str,
+        cancel: &std::sync::atomic::AtomicBool,
+        on_text: &mut dyn FnMut(&str),
+    ) -> crate::Result<Transcript> {
+        (**self).transcribe_streaming(samples, language, context, cancel, on_text)
+    }
+
+    fn stream_open(&mut self) -> crate::Result<Option<u64>> {
+        (**self).stream_open()
+    }
+
+    fn stream_push(&mut self, id: u64, samples: &[f32], on_text: &mut dyn FnMut(&str)) -> crate::Result<String> {
+        (**self).stream_push(id, samples, on_text)
+    }
+
+    fn stream_close(&mut self, id: u64) {
+        (**self).stream_close(id)
+    }
+
     fn transcribe_batch(
         &mut self,
         requests: &[TranscriptionInput<'_>],
@@ -142,7 +199,11 @@ pub fn load_packet_transcriber(
     let pipeline_name = pipeline.name.clone();
     let driver = pipeline.driver.clone();
     let (engine, loaded_backend) = match driver.as_str() {
-        "rnnt.greedy.v1" => load_rnnt_transcriber(packet, tokenizer, backend)?,
+        "rnnt.greedy.v1" => {
+            let engine = packet::PacketRnntTranscriber::load(packet, backend)?;
+            let loaded_backend = engine.backend();
+            (Box::new(engine) as Box<dyn Transcriber>, loaded_backend)
+        }
         "causal.v1" => load_causal_transcriber(packet, tokenizer, backend)?,
         _ => unreachable!(),
     };
@@ -152,28 +213,6 @@ pub fn load_packet_transcriber(
         backend: loaded_backend,
         engine,
     })
-}
-
-#[cfg(feature = "gguf")]
-fn load_rnnt_transcriber(
-    packet: &Path,
-    tokenizer: &Path,
-    backend: &str,
-) -> crate::Result<(Box<dyn Transcriber>, &'static str)> {
-    let engine = packet::PacketRnntTranscriber::load(packet, tokenizer, backend)?;
-    let loaded_backend = engine.backend();
-    Ok((Box::new(engine), loaded_backend))
-}
-
-#[cfg(not(feature = "gguf"))]
-fn load_rnnt_transcriber(
-    _packet: &Path,
-    _tokenizer: &Path,
-    _backend: &str,
-) -> crate::Result<(Box<dyn Transcriber>, &'static str)> {
-    Err(crate::RuntimeError::Rejected(
-        "RNNT ASR packets require the gguf feature".into(),
-    ))
 }
 
 fn load_causal_transcriber(

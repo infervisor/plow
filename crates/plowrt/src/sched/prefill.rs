@@ -1,6 +1,7 @@
 //! Backend-neutral admission for one cross-request prefill launch.
 
 use packet::dev::PrefillSpan;
+use smallvec::SmallVec;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SpanPolicy {
@@ -16,28 +17,18 @@ pub enum SpanPolicy {
     Greedy,
 }
 
-const MAX_SLOTS: usize = u128::BITS as usize;
+/// Spans a pack holds without spilling to the heap.
+const INLINE_SPANS: usize = 32;
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Debug, Default, Eq, PartialEq)]
 pub struct PrefillPack {
-    spans: [PrefillSpan; MAX_SLOTS],
-    len: usize,
+    spans: SmallVec<[PrefillSpan; INLINE_SPANS]>,
     pub bucket_rows: u32,
-}
-
-impl Default for PrefillPack {
-    fn default() -> Self {
-        Self {
-            spans: [PrefillSpan::default(); MAX_SLOTS],
-            len: 0,
-            bucket_rows: 0,
-        }
-    }
 }
 
 impl PrefillPack {
     pub fn spans(&self) -> &[PrefillSpan] {
-        &self.spans[..self.len]
+        &self.spans
     }
 
     pub fn dense_rows(&self) -> u32 {
@@ -61,7 +52,33 @@ impl PrefillPack {
     /// been staged is the silently-short answer §9 forbids; that case is refused at
     /// `stage_packed_prefill` instead.
     pub fn limit_spans(&mut self, max: usize) {
-        self.len = self.len.min(max);
+        self.spans.truncate(max);
+    }
+}
+
+/// One bit per slot of a slot table of any capacity.
+#[derive(Clone, Debug, Default)]
+pub struct SlotSet(SmallVec<[u64; 4]>);
+
+impl SlotSet {
+    pub fn with_capacity(slots: usize) -> Self {
+        SlotSet(smallvec::smallvec![0; slots.div_ceil(64)])
+    }
+
+    /// `false` for a slot past the capacity.
+    pub fn contains(&self, slot: usize) -> bool {
+        self.0.get(slot / 64).is_some_and(|w| w & (1 << (slot % 64)) != 0)
+    }
+
+    /// Adds `slot`; `false` when it was present or is past the capacity.
+    pub fn insert(&mut self, slot: usize) -> bool {
+        match self.0.get_mut(slot / 64) {
+            Some(w) if *w & (1 << (slot % 64)) == 0 => {
+                *w |= 1 << (slot % 64);
+                true
+            }
+            _ => false,
+        }
     }
 }
 
@@ -75,12 +92,13 @@ pub fn admit(
     policy: SpanPolicy,
     program_rows: impl FnMut(u32) -> Option<u32>,
 ) -> PrefillPack {
-    if row_limit == 0 || capacity == 0 || capacity > MAX_SLOTS {
+    if row_limit == 0 || capacity == 0 {
         return PrefillPack::default();
     }
-    let by_slot = valid_by_slot(candidates.into_iter().map(|span| (0, span)), row_limit, capacity, policy).0;
-    let start = start % capacity;
-    pack_in_order(&by_slot, (0..capacity).map(|offset| (start + offset) % capacity), row_limit, policy, program_rows)
+    let mut valid = valid_spans(candidates.into_iter().map(|span| (0, span)), row_limit, capacity, policy);
+    let start = (start % capacity) as u32;
+    valid.sort_unstable_by_key(|&(_, span)| (span.slot < start, span.slot));
+    pack_in_order(valid.iter().map(|&(_, span)| span), row_limit, policy, program_rows)
 }
 
 /// [`admit`] in arrival order instead of slot rotation: the oldest candidate (smallest
@@ -92,66 +110,45 @@ pub fn admit_oldest_first(
     policy: SpanPolicy,
     program_rows: impl FnMut(u32) -> Option<u32>,
 ) -> PrefillPack {
-    if row_limit == 0 || capacity == 0 || capacity > MAX_SLOTS {
+    if row_limit == 0 || capacity == 0 {
         return PrefillPack::default();
     }
-    let (by_slot, arrival) = valid_by_slot(candidates, row_limit, capacity, policy);
-    let mut order = [0usize; MAX_SLOTS];
-    let mut n = 0;
-    for slot in (0..capacity).filter(|&slot| by_slot[slot].is_some()) {
-        order[n] = slot;
-        n += 1;
-    }
-    order[..n].sort_unstable_by_key(|&slot| (arrival[slot], slot));
-    pack_in_order(&by_slot, order[..n].iter().copied(), row_limit, policy, program_rows)
+    let mut valid = valid_spans(candidates, row_limit, capacity, policy);
+    valid.sort_unstable_by_key(|&(arrival, span)| (arrival, span.slot));
+    pack_in_order(valid.iter().map(|&(_, span)| span), row_limit, policy, program_rows)
 }
 
-type BySlot = [Option<PrefillSpan>; MAX_SLOTS];
+type Valid = SmallVec<[(u64, PrefillSpan); INLINE_SPANS]>;
 
-fn valid_by_slot(
+/// The candidates a pack may take, the first one per slot, in input order.
+fn valid_spans(
     candidates: impl IntoIterator<Item = (u64, PrefillSpan)>,
     row_limit: u32,
     capacity: usize,
     policy: SpanPolicy,
-) -> (BySlot, [u64; MAX_SLOTS]) {
-    let mut by_slot = [None; MAX_SLOTS];
-    let mut arrival = [0u64; MAX_SLOTS];
-    let mut occupied = 0u128;
-    for (at, span) in candidates {
-        let Ok(slot) = usize::try_from(span.slot) else {
-            continue;
-        };
-        if slot >= capacity {
-            continue;
-        }
-        let bit = 1u128 << slot;
-        let valid = span.n_rows != 0
-            && occupied & bit == 0
-            && span.state_slot == span.slot
-            && span.kv_row0.checked_add(span.n_rows) == Some(span.kv_len)
-            && (policy != SpanPolicy::Whole || span.n_rows <= row_limit);
-        if valid {
-            by_slot[slot] = Some(span);
-            arrival[slot] = at;
-            occupied |= bit;
-        }
-    }
-    (by_slot, arrival)
+) -> Valid {
+    let mut occupied = SlotSet::with_capacity(capacity);
+    candidates
+        .into_iter()
+        .filter(|&(_, span)| {
+            span.n_rows != 0
+                && span.state_slot == span.slot
+                && span.kv_row0.checked_add(span.n_rows) == Some(span.kv_len)
+                && (policy != SpanPolicy::Whole || span.n_rows <= row_limit)
+                && usize::try_from(span.slot).is_ok_and(|slot| slot < capacity && occupied.insert(slot))
+        })
+        .collect()
 }
 
-/// Select the first candidate's program in `slots` order and pack that program's candidates in
+/// Select the first candidate's program in `ordered` and pack that program's candidates in
 /// the same order.
 fn pack_in_order(
-    by_slot: &BySlot,
-    slots: impl Iterator<Item = usize> + Clone,
+    ordered: impl Iterator<Item = PrefillSpan> + Clone,
     row_limit: u32,
     policy: SpanPolicy,
     mut program_rows: impl FnMut(u32) -> Option<u32>,
 ) -> PrefillPack {
-    let Some(program) = slots
-        .clone()
-        .find_map(|slot| by_slot[slot].map(|span| span.program))
-    else {
+    let Some(program) = ordered.clone().next().map(|span| span.program) else {
         return PrefillPack::default();
     };
     let Some(bucket_rows) = program_rows(program).map(|rows| rows.min(row_limit)) else {
@@ -161,20 +158,14 @@ fn pack_in_order(
         return PrefillPack::default();
     }
 
-    let count = slots
-        .clone()
-        .filter(|&slot| by_slot[slot].is_some_and(|span| span.program == program))
-        .count();
+    let ordered = ordered.filter(move |span| span.program == program);
+    let count = ordered.clone().count();
     let mut rows = 0u32;
     let mut pack = PrefillPack {
         bucket_rows,
         ..PrefillPack::default()
     };
-    for (index, mut span) in slots
-        .filter_map(|slot| by_slot[slot])
-        .filter(|span| span.program == program)
-        .enumerate()
-    {
+    for (index, mut span) in ordered.clone().enumerate() {
         let remaining = bucket_rows - rows;
         if remaining == 0 {
             break;
@@ -192,18 +183,15 @@ fn pack_in_order(
         span.n_rows = take;
         span.kv_len = span.kv_row0 + take;
         rows += take;
-        pack.spans[pack.len] = span;
-        pack.len += 1;
+        pack.spans.push(span);
     }
     if policy == SpanPolicy::FairSplit && rows < bucket_rows {
-        // Preserve each initial share; reclaim unused rows in rotation order.
+        // Preserve each initial share; reclaim unused rows in rotation order. FairSplit takes
+        // every candidate in order until the bucket is full, so span k is candidate k.
         let mut spare = bucket_rows - rows;
         let mut row0 = 0;
-        for span in &mut pack.spans[..pack.len] {
-            let offered = by_slot[span.slot as usize]
-                .expect("admitted candidate")
-                .n_rows;
-            let extra = spare.min(offered - span.n_rows);
+        for (span, offered) in pack.spans.iter_mut().zip(ordered) {
+            let extra = spare.min(offered.n_rows - span.n_rows);
             spare -= extra;
             span.n_rows += extra;
             span.row0 = row0;
@@ -413,16 +401,21 @@ mod tests {
         );
         assert_eq!(pack.spans().len(), 1);
         assert_eq!(pack.spans()[0].slot, 0);
-        assert!(admit(
-            [span(0, 0, 1, 0)],
-            1,
-            0,
-            MAX_SLOTS + 1,
-            SpanPolicy::FairSplit,
-            |_| Some(1),
-        )
-        .spans()
-        .is_empty());
+        assert!(admit([span(5, 0, 1, 0)], 1, 0, 5, SpanPolicy::FairSplit, |_| Some(1)).spans().is_empty());
+    }
+
+    /// Slots past 128 (an E4B/26B table of 256) are packed like any other, in both orders.
+    #[test]
+    fn slots_past_128_are_admitted() {
+        let cands = || [span(200, 0, 64, 0), span(129, 0, 64, 0), span(3, 0, 64, 0), span(255, 0, 64, 0)];
+        let pack = admit(cands(), 192, 130, 256, SpanPolicy::Whole, |_| Some(256));
+        assert_eq!(pack.spans().iter().map(|s| s.slot).collect::<Vec<_>>(), [200, 255, 3]);
+        let aged = [(9, span(200, 0, 64, 0)), (1, span(255, 0, 64, 0)), (5, span(129, 0, 64, 0))];
+        let pack = admit_oldest_first(aged, 256, 256, SpanPolicy::Greedy, |_| Some(256));
+        assert_eq!(pack.spans().iter().map(|s| (s.slot, s.row0)).collect::<Vec<_>>(), [(255, 0), (129, 64), (200, 128)]);
+        let wide = admit((0..300).map(|slot| span(slot, 0, 1, 0)), 300, 0, 300, SpanPolicy::Whole, |_| Some(300));
+        assert_eq!(wide.spans().len(), 300);
+        assert_eq!(wide.last_slot(), Some(299));
     }
 
     #[test]

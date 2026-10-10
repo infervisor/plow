@@ -394,7 +394,7 @@ fi
 # Glue kernels of the cuBLASLt grouped-GEMM MoE prefill route (PLOW_MOE_PF_LT): only for a packet
 # that carries the grouped expert GEMMs.
 if [ -n "${PLOW_CUBIN_CONFIG:-}" ] &&
-   grep -qx '#define PLOW_PACKET_HAS_MOE_GROUP_GLU_GEMMA_PF 1' "$PLOW_CUBIN_CONFIG"; then
+   grep -qx '#define PLOW_PACKET_HAS_MOE_GROUP_GLU_GEMMA_PF\(_W8A8\)\? 1' "$PLOW_CUBIN_CONFIG"; then
   "${gemma_nvenv[@]}" "$gemma_nvcc" \
     -std=c++17 -arch=sm_90a -O3 -cubin -Xptxas=-v -I runtime/common -I runtime/nvidia \
     -o "$gemma_out/interp_sm90a_moe_lt.cubin" runtime/nvidia/moe_lt_sm90.cu

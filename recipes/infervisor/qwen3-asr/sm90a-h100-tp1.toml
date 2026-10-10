@@ -8,6 +8,11 @@
 #
 # Gate: WER on the 73-clip LibriSpeech dummy set (scripts/asr/nvidia/get_audio.py) = 3.913%
 # (vLLM reference scripts/asr/nvidia/ref_bench.py: 3.913%).
+#
+# Speech contract 1 (docs/runtime/asr-packet-contract.md): plowrt >= asr-packets refuses the
+# contract-0 model.pkt of earlier emits; re-emit (the receipts pin the packet). Re-emitted at
+# 11c4a5bb: model.pkt df140272a79f (only its metadata differs from 09e53e76's), encoder.pkt unchanged;
+# with the 09e53e76 objects, H100 WER 3.913% c1 and c16 as before.
 
 schema = "plow.recipe.v1"
 namespace = "infervisor"
@@ -53,6 +58,12 @@ PLOW_PF_LADDER_APPEND = "256,384"
 # rounding up to 64/128 (Veena step_bench ctx 1024: 8.21 vs 9.08, 11.56 vs 13.28 ms), 3/6/12/24 < 3%.
 PLOW_DECODE_BATCH_LADDER = "1,2,4,8,16,32,48,64,96,128"
 PLOW_EMIT_PREFILL_CUBLASLT = "1"
+# Decode rungs of 32+ rows as cuBLASLt matmuls in the captured graph (narrower ones lose: step_bench
+# ctx 384 B=8/16 2.22/2.49 -> 2.45/2.57 ms; B=32/64 3.19/5.49 -> 2.91/3.46). Served, 2 passes, WER
+# 3.913% unchanged: c1 RTFx 107 = 107, c16 552/554 -> 562/564, c128 (292 clips) 794/811 -> 915/930
+# (nativek/res/asrserve, built at fd0fe175).
+PLOW_EMIT_DECODE_CUBLASLT = "1"
+PLOW_EMIT_DECODE_CUBLASLT_MIN_ROWS = "32"
 PLOW_NO_GLU_FUSE = "1"
 # One-row decode rung on the gemv_k8 walk: step_bench ctx 128 B=1 2.105 -> 2.005 ms, B=2/4 -50 us.
 PLOW_NV_GEMV_K8_B1 = "1"
@@ -77,3 +88,7 @@ python = "{env:PYREF}"
 manifest = "{env:ASR_MANIFEST}"
 conc = "1,16"
 wer_max = 0.045
+
+# VMM-backed KV prefix cache on every request path (sessions, shared system prompts, replays).
+[serve.env]
+PLOW_VMM_PREFIX = "1"

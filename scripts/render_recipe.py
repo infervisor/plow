@@ -113,6 +113,17 @@ def block_gates(r: dict) -> str:
     if not gates:
         return "# This recipe declares no gates."
     out = []
+    if isinstance(gates, dict):
+        # `[gates]` table: scalar keys are shared settings, `[gates.<kind>]` sub-tables the gates.
+        for k, v in gates.items():
+            if not isinstance(v, dict):
+                out.append(f"# gates.{k} = {v}")
+        for kind, g in gates.items():
+            if isinstance(g, dict):
+                out.append(f"# {kind}")
+                out.extend(f"#   {k} = {v}" for k, v in g.items())
+                out.append("")
+        return "\n".join(out).rstrip()
     for g in gates:
         out.append(f"# {g['name']}")
         if g.get("cmd"):

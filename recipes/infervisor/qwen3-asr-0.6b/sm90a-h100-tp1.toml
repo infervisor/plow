@@ -1,0 +1,91 @@
+# Qwen3-ASR-0.6B on H100 (sm_90a, 132 SMs): the Qwen3-ASR-1.7B H100 recipe's contract (encoder.pkt
+# on the speech object, Qwen3 decoder as a causal.v1 audio-LM packet) for the 0.6B checkpoint, the
+# same way the 0.6B L40S/L4 recipes take the 1.7B ones.
+#
+#   PLOW_CAMPAIGN_NO_NIX=1 (this box only) \
+#   python3 scripts/campaign/campaign.py build recipes/infervisor/qwen3-asr-0.6b/sm90a-h100-tp1.toml --out <fresh dir>
+#
+# Carried over from the 1.7B H100 recipe UNMEASURED on 0.6B: PLOW_NV_GEMV_K8_B1, PLOW_NV_DENSE_TUNE,
+# PLOW_NV_FA_FOLD, the `_gw` decode rungs past 32, the speech-shaped prefill ladder. No per-rung
+# step_bench A/B was run for 0.6B on H100 (time-boxed bring-up); gate + smoke only.
+# Gate (H100, 09e53e76, packet f7dd071e34c0): WER on the 73-clip LibriSpeech dummy
+# set c1 4.435% / c16 4.261% (L40S/L4 4.261% at both; the B=1 decode path differs). Served c1 p50
+# 42 ms, RTFx 138; c16 RTFx 508; open loop 80 req/s holds the 1 s SLO for only 74% (L40S 99.4%).
+#
+# Speech contract 1 (docs/runtime/asr-packet-contract.md): plowrt >= asr-packets refuses the
+# contract-0 model.pkt of earlier emits; re-emit (the receipts pin the packet). Re-emitted at
+# 11c4a5bb: model.pkt 1da8ea9f49d7 (only its metadata differs from 09e53e76's), encoder.pkt unchanged;
+# with the 09e53e76 objects, H100 WER c1 4.435% / c16 4.261% as before.
+
+schema = "plow.recipe.v1"
+namespace = "infervisor"
+name = "qwen3-asr-0.6b"
+label = "sm90a-h100-tp1"
+plow_git = "3e2fb6efc3f3d67f5b11649a5bdc057e5ab489da"
+network = "qwen3"
+doc = "docs/runtime/tts.md"
+tracker = "docs/runtime/h100-speech-recipes.md"
+
+[target]
+vendor = "nvidia"
+isa = "sm_90a"
+sku = "H100 SXM5"
+units = 132
+num_gpus = 1
+parallel = "tp"
+
+[checkpoint]
+source = "hf:Qwen/Qwen3-ASR-0.6B"
+revision = "5eb144179a02acc5e5ba31e748d22b0cf3e303b0"
+
+[cell]
+name = "qwen3-asr-0.6b-h100"
+hf_dir = "{hf:Qwen/Qwen3-ASR-0.6B@5eb144179a02acc5e5ba31e748d22b0cf3e303b0}"
+gpu = "h100"
+arch = "sm_90a"
+n_cu = 132
+n_gpu = 1
+max_ctx = 2048
+
+[emit]
+emit = "devblob+cubin"
+# The OpenAI `model` id plowrt serves the bundle under (weights.json served_name).
+args = ["--served-name", "qwen3-asr-0.6b"]
+[emit.env]
+PLOW_VERIFY_BIN = "{repo}/lean-plow/.lake/build/bin/plow_verify"
+# Speech-shaped rungs: prefill rows = audio rows (13 per second) + prompt (~60-420), so
+# 128/256/384/512; decode 1..16. Encoder buckets 400..3000 frames come from the lowering.
+PLOW_MAX_CHUNK = "512"
+PLOW_PF_LADDER_APPEND = "256,384"
+# Decode ladder: rungs past 32 run the one-pass wide GEMV (`_gw` object); 48/96 pay 5-13% over
+# rounding up to 64/128 (Veena step_bench ctx 1024: 8.21 vs 9.08, 11.56 vs 13.28 ms), 3/6/12/24 < 3%.
+PLOW_DECODE_BATCH_LADDER = "1,2,4,8,16,32,48,64,96,128"
+PLOW_EMIT_PREFILL_CUBLASLT = "1"
+PLOW_NO_GLU_FUSE = "1"
+# One-row decode rung on the gemv_k8 walk: step_bench ctx 128 B=1 2.105 -> 2.005 ms, B=2/4 -50 us.
+PLOW_NV_GEMV_K8_B1 = "1"
+# hd128 row-group flash decode with merge fold (gated here; changes attention sum order).
+PLOW_NV_FA_FOLD = "1"
+# Opt-ins measured on this model: packed prefill at hd64/hd128, and the dense hd <= 128 decode
+# tuning (gemv_k8 + L2 prefetch, tensor-core decode scores, classic B=1 GEMVs below K 3840).
+PLOW_EMIT_PACKED_PREFILL_SMALL_HD = "1"
+PLOW_NV_DENSE_TUNE = "1"
+
+[bench]
+kind = "asr"
+client = "crates/plowrt/examples/asr/packet_dataset.rs"
+manifest = "scripts/asr/nvidia/get_audio.py"
+reference = "scripts/asr/nvidia/ref_bench.py"
+
+# `campaign.py gate <recipe> --assets <dir> --out <dir>`. ASR_MANIFEST: the 73-clip set
+# (scripts/asr/nvidia/get_audio.py). L40S/L4 WER 4.261%.
+[gates]
+python = "{env:PYREF}"
+[gates.asr_wer]
+manifest = "{env:ASR_MANIFEST}"
+conc = "1,16"
+wer_max = 0.045
+
+# VMM-backed KV prefix cache on every request path (sessions, shared system prompts, replays).
+[serve.env]
+PLOW_VMM_PREFIX = "1"

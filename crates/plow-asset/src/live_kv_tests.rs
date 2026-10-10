@@ -246,7 +246,14 @@ fn writer(cache: u16, rows: u32) -> DevInst64 {
 }
 
 fn validate_prefill(prefill: &[DevInst64]) -> Result<()> {
-    let tensors = [
+    validate_prefill_with(prefill, |_, _| {})
+}
+
+fn validate_prefill_with(
+    prefill: &[DevInst64],
+    mutate: impl FnOnce(&mut Vec<DevInst64>, &mut Vec<Tensor<'_>>),
+) -> Result<()> {
+    let mut tensors = [
         ("in.pos", 16),
         ("in.kvlen", 8),
         ("kv.k", 4096),
@@ -259,11 +266,13 @@ fn validate_prefill(prefill: &[DevInst64]) -> Result<()> {
         name,
         bytes,
         initialized: false,
-    });
+    })
+    .to_vec();
     let mut decode = inst(DevOp::FlashDecode);
     decode.t[..6].copy_from_slice(&[5, 6, 4, 2, 3, 1]);
     decode.i = [2, 1, 1, 4, 0, 1, 256, u32::MAX];
-    let decode = [decode, writer(2, 2), writer(3, 2)];
+    let mut decode = vec![decode, writer(2, 2), writer(3, 2)];
+    mutate(&mut decode, &mut tensors);
     let program = |rows, role, insts| Program {
         rows,
         role,
@@ -310,6 +319,83 @@ fn an_unstaged_prefill_cache_has_one_writer() {
         .contains("cache writer contract"));
     // Repeated readers over one writer pair (KV sharing) stay valid.
     validate_prefill(&[writer(2, 0), writer(3, 0), read, read]).unwrap();
+}
+
+#[test]
+fn fp8_prefill_media_span_operand_is_audited() {
+    let fp8_writer = |cache, scale| {
+        let mut d = writer(cache, 0);
+        d.op = DevOp::HeadNormRopeFp8 as u16;
+        d.t[6] = scale;
+        d
+    };
+    let mut read = inst(DevOp::FlashPrefillFp8);
+    read.t[..6].copy_from_slice(&[5, 6, 4, 2, 3, 1]);
+    read.t[6..8].copy_from_slice(&[7, 8]);
+    read.i = [2, 2, 1, 1, 0, 0, 256, 1];
+    read.fj = [0, 4, u32::MAX];
+    let validate = |span: u32, span_bytes: u64| {
+        let mut read = read;
+        read.i[7] = 1 | span << 16;
+        validate_prefill_with(&[fp8_writer(2, 7), fp8_writer(3, 8), read], |ds, ts| {
+            fp8_cache(ds, ts);
+            ts.push(Tensor {
+                name: "act.span",
+                bytes: span_bytes,
+                initialized: false,
+            });
+        })
+    };
+    validate(0, 8).unwrap();
+    validate(9, 8).unwrap();
+    assert!(validate(9, 4).unwrap_err().contains("media span operand"));
+    assert!(validate(2, 8).unwrap_err().contains("media span operand"));
+    assert!(validate(100, 8)
+        .unwrap_err()
+        .contains("operand handle out of range"));
+}
+
+#[test]
+fn multimodal_rows_operands_are_bounded() {
+    let validate = |mutate: fn(&mut DevInst64, &mut Vec<Tensor<'_>>)| {
+        validate_all(None, |ops, ts| {
+            let base = ts.len() as u16;
+            for (name, bytes) in [
+                ("act.x", 2 * 4 * 2),
+                ("act.ids", 2 * 4),
+                ("in.mm_table", 16 * 8),
+                ("in.mm_slab", 8 * 4 * 2),
+            ] {
+                ts.push(Tensor {
+                    name,
+                    bytes,
+                    initialized: false,
+                });
+            }
+            let mut d = inst(DevOp::MmRowsBf16);
+            d.t[..4].copy_from_slice(&[base, base + 1, base + 2, base + 3]);
+            d.i[..4].copy_from_slice(&[2, 4, 16, 8]);
+            mutate(&mut d, ts);
+            ops.push(d);
+        })
+    };
+    validate(|_, _| {}).unwrap();
+    let mutations: &[fn(&mut DevInst64, &mut Vec<Tensor<'_>>)] = &[
+        |d, _| d.i[2] = 12,
+        |d, _| d.i[2] = 32,
+        |d, _| d.i[3] = 9,
+        |d, _| d.i[1] = 8,
+        |d, _| d.t[2] = 100,
+        |d, ts| ts[d.t[3] as usize].bytes -= 2,
+    ];
+    for (i, mutate) in mutations.iter().enumerate() {
+        assert!(
+            validate(*mutate)
+                .unwrap_err()
+                .contains("multimodal row operands"),
+            "mutation {i}"
+        );
+    }
 }
 
 #[test]

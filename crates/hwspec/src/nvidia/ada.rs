@@ -54,3 +54,54 @@ pub const RTX_4090: GpuSpec = GpuSpec {
     clock_boost: Hertz::from_mhz(2520),
     soc: None,
 };
+
+/// L4 — AD104, 58 SMs, 24 GB GDDR6 (192-bit), 300 GB/s, 72 W PCIe.
+pub const L4: GpuSpec = GpuSpec {
+    name: "L4",
+    vendor: Vendor::Nvidia,
+    arch: Arch::AdaLovelace,
+    compute_cap: (8, 9),
+    sm_count: 58,
+    sm: ADA_SM,
+    dsm: None,
+    l2: Bytes::mib(48),
+    mem: MemorySpec {
+        kind: MemKind::Gddr6,
+        capacity: Bytes::gib(24),
+        bandwidth: GBps(300.0),
+        bandwidth_measured: None,
+        bus_width_bits: 192,
+    },
+    copy_engines: 2,
+    interconnect: None,
+    chiplet: None,
+    l2_partitioning: None,
+    clock_boost: Hertz::from_mhz(2040),
+    soc: None,
+};
+
+/// L40S — AD102, 142 SMs, 48 GB GDDR6 (384-bit), 864 GB/s, 350 W PCIe.
+pub const L40S: GpuSpec = GpuSpec {
+    name: "L40S",
+    vendor: Vendor::Nvidia,
+    arch: Arch::AdaLovelace,
+    compute_cap: (8, 9),
+    sm_count: 142,
+    sm: ADA_SM,
+    dsm: None,
+    l2: Bytes::mib(96),
+    mem: MemorySpec {
+        kind: MemKind::Gddr6,
+        capacity: Bytes::gib(48),
+        bandwidth: GBps(864.0),
+        // scripts/tts/hbm_bw.py read-reduce, 4 GiB buffers (copy: 761 GB/s).
+        bandwidth_measured: Some(GBps(841.0)),
+        bus_width_bits: 384,
+    },
+    copy_engines: 2,
+    interconnect: None,
+    chiplet: None,
+    l2_partitioning: None,
+    clock_boost: Hertz::from_mhz(2520),
+    soc: None,
+};

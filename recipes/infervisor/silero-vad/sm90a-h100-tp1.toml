@@ -1,0 +1,70 @@
+# Silero VAD v5 (16 kHz) for the H100 speech serve: a `vad.frame.v1` packet (speech contract 1,
+# docs/runtime/asr-packet-contract.md; devgen::vad, two LSTM-state-bank programs of generic FP32
+# ops, Silero's segment policy as packet parameters) run by plowrt's generic host executor
+# (asr::vad, CPU, AVX2/FMA picked at runtime). No device object: the packet is device-agnostic; this recipe pins the
+# build, the gate and the H100 host numbers. Not a plowc emit; [build].script is the build.
+#
+#   scripts/asr/silero_vad_build.sh <python with torch, silero-vad 5.1.2, safetensors> <fresh dir>
+#
+# Serve: plowrt serve --assets <ASR bundle> --asr-vad-packet <dir>/silero_vad.pkt
+#   (PLOW_ASR_VAD_PACKET): POST /v1/audio/vad, the no-speech upload gate, and Silero turn ends for
+#   continuous WebSocket sessions and Realtime `server_vad` (docs/runtime/asr.md, Voice activity).
+# H100 host (AMD EPYC 7R13): 70 us per stream-frame on one core; 256 streams 17.7 ms per 32 ms tick
+# on one core, 3.7 ms on 8 threads (asr_vad_check bench).
+# Gate (host executor vs the TorchScript model): 79 clips, 17,321 frames, max |dp| 2.0e-6,
+# mean 2.6e-8, decisions at 0.5 agree 100% (0 flips). Contract 1 (f0766b0d): packet sha256
+# 1a2ac957..., the same gate numbers; 256 streams 17.7 ms per tick on one core (base 17.9).
+
+schema = "plow.recipe.v1"
+namespace = "infervisor"
+name = "silero-vad"
+label = "sm90a-h100-tp1"
+plow_git = "f0766b0d1c6fa9d6a68d8910fea2133670e204c0"
+network = "silero-vad-v5"
+doc = "docs/runtime/asr.md"
+
+[target]
+vendor = "nvidia"
+isa = "sm_90a"
+sku = "H100 SXM5"
+units = 132
+num_gpus = 1
+parallel = "tp"
+# The packet executes on the host CPU of this target.
+executor = "host"
+
+[checkpoint]
+# snakers4/silero-vad (MIT), pip package silero-vad 5.1.2 (its TorchScript silero_vad.jit).
+source = "pip:silero-vad==5.1.2"
+url = "https://files.pythonhosted.org/packages/py3/s/silero-vad/silero_vad-5.1.2-py3-none-any.whl"
+wheel_sha256 = "93b41953d7774b165407fda6b533c119c5803864e367d5034dc626c82cfdf661"
+file = "silero_vad/data/silero_vad.jit"
+sha256 = "85c48e1f0ecb604e5d2a268f3ccfb912d4f7e935acdc86af5a3fc5b0aea7b29a"
+license = "MIT"
+
+[build]
+script = "scripts/asr/silero_vad_build.sh"
+exporter = "scripts/asr/silero_export.py"
+compiler = "crates/plowrt/examples/asr/silero_vad_compile.rs"
+output = "silero_vad.pkt"
+
+[serve]
+attach = "--asr-vad-packet"
+env_var = "PLOW_ASR_VAD_PACKET"
+
+[bench]
+kind = "vad"
+# asr_vad_check <dir>/silero_vad.pkt bench <streams> <frames> [threads]
+client = "crates/plowrt/examples/asr/vad_check.rs"
+
+# campaign.py gate <recipe> --assets <build dir> --out <dir>   (no server, no GPU)
+[gates]
+python = "{env:PYREF}"
+packet = "silero_vad.pkt"
+[gates.vad_parity]
+jit = "{env:SILERO_VAD_JIT}"
+manifest = "{env:ASR_MANIFEST}"
+threshold = 0.5
+max_dp_max = 1e-4
+agree_min = 0.999
+timeout_s = 600

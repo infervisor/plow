@@ -21,7 +21,8 @@ schema = "plow.recipe.v1"
 namespace = "infervisor"
 name = "gemma-4-31b"
 label = "xeon6-amx-bf16"
-status = "candidate"
+status = "emits"
+plow_git = "878dac7b767742d38b6f3158f114d2f976597e79"
 network = "gemma4"
 
 [target]

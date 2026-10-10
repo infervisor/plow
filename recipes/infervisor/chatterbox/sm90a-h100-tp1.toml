@@ -99,3 +99,7 @@ python = "{env:CBX_PY}"
 env = { PYTHONPATH = "" }
 rel_l2_max = 1e-3
 timeout_s = 1800
+
+# VMM-backed KV prefix cache on every request path (sessions, shared system prompts, replays).
+[serve.env]
+PLOW_VMM_PREFIX = "1"

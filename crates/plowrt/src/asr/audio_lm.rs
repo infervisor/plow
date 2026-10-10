@@ -85,7 +85,11 @@ impl AudioChunking {
 
 impl PacketAudioEncoder {
     pub(crate) fn load(path: &std::path::Path, backend: &str) -> Result<Self> {
-        let packet = ForwardPacket::load(path, "audio.encode", backend)?;
+        Self::load_on(path, backend, 0)
+    }
+
+    pub(crate) fn load_on(path: &std::path::Path, backend: &str, device: u8) -> Result<Self> {
+        let packet = ForwardPacket::load_on(path, "audio.encode", backend, device)?;
         let chunking = AudioChunking::from_pipeline(|name| packet.optional_parameter(name))?;
         let usize_param = |name: &str| {
             usize::try_from(packet.parameter(name)?)
@@ -358,7 +362,6 @@ struct AudioLmContract {
     placeholder: u32,
     stop: Vec<u32>,
     max_tokens: usize,
-    context_max_tokens: usize,
     messages: serde_json::Value,
     marker: String,
     language_suffix: String,
@@ -369,6 +372,7 @@ struct AudioLmContract {
     languages: Vec<String>,
     aliases: Vec<(String, String)>,
     chunking: AudioChunking,
+    policy: plow_asset::speech_contract::AudioLmPolicy,
 }
 
 impl AudioLmContract {
@@ -386,6 +390,11 @@ impl AudioLmContract {
                 .copied()
                 .ok_or_else(|| RuntimeError::Rejected(format!("audio LM parameter {name:?} is missing")))
         };
+        use plow_asset::speech_contract as contract;
+        contract::check_contract(decoder.parameters.get(contract::CONTRACT).copied(), contract::ASR_CONTRACT, "audio LM")
+            .map_err(RuntimeError::Rejected)?;
+        let policy = contract::AudioLmPolicy::from_parameters(|name| decoder.parameters.get(name).copied())
+            .map_err(RuntimeError::Rejected)?;
         let text = |name: &str| {
             decoder
                 .strings
@@ -445,7 +454,8 @@ impl AudioLmContract {
                 placeholder: u32::try_from(param("audio.token_id")?).map_err(|_| RuntimeError::Rejected("audio token overflows".into()))?,
                 stop,
                 max_tokens: to_usize(param("output.max_tokens")?)?,
-                context_max_tokens: to_usize(param("prompt.context_max_tokens")?)?,
+                // `prompt.context_max_tokens` (older packets) is not read: the context is fitted
+                // to each request's window instead.
                 messages,
                 marker: text("audio.marker")?,
                 language_suffix: text("prompt.language_suffix")?,
@@ -459,6 +469,7 @@ impl AudioLmContract {
                     .filter_map(|l| l.split_once('=').map(|(a, b)| (a.to_owned(), b.to_owned())))
                     .collect(),
                 chunking,
+                policy,
             },
             frontend,
         ))
@@ -553,8 +564,8 @@ impl AudioLmPrompt {
 
     pub fn finalization_policy(&self) -> super::FinalizationPolicy {
         super::FinalizationPolicy {
-            final_padding_samples: super::frontend::SAMPLE_RATE as usize,
-            final_padding_amplitude: 100.0 / 32768.0,
+            final_padding_samples: self.contract.policy.final_padding_samples as usize,
+            final_padding_amplitude: self.contract.policy.final_padding_amplitude,
         }
     }
 
@@ -587,47 +598,70 @@ impl AudioLmPrompt {
         max_context: usize,
     ) -> Result<AudioLmRequest> {
         let language = self.language(language)?;
-        self.check_context(context)?;
         let features = self.features(samples)?;
         let rows = self.contract.chunking.rows(features.frames);
         let (ids, audio_positions) = self.prompt(rows, language.as_deref(), context, max_context)?;
         Ok(AudioLmRequest { features, ids, audio_positions, language })
     }
 
-    fn check_context(&self, context: &str) -> Result<()> {
-        let c = &self.contract;
-        if self.tokenizer.encode(context).len() > c.context_max_tokens
-            || c.forbidden.iter().any(|marker| context.contains(marker.as_str()))
-        {
-            return Err(RuntimeError::Rejected(format!(
-                "ASR prompt exceeds {} tokens or contains control markers",
-                c.context_max_tokens
-            )));
+    /// Its length is not checked here: [`Self::prompt`] fits the context to each request's window.
+    /// `context` without the template's control markers: a client's text cannot open or close
+    /// a turn of the prompt. Removal repeats until none remains (a removal can join a new one).
+    fn clean_context<'a>(&self, context: &'a str) -> std::borrow::Cow<'a, str> {
+        let mut context = std::borrow::Cow::Borrowed(context);
+        while let Some(marker) = self.contract.forbidden.iter().find(|m| !m.is_empty() && context.contains(m.as_str())) {
+            context = context.replace(marker.as_str(), " ").into();
         }
-        Ok(())
+        context
     }
 
-    /// The encoder's input for one recording: `[bin][frame]` log-mel features.
-    pub fn features(&self, samples: &[f32]) -> Result<MelFeatures> {
-        let log_mel = self.frontend.extract(samples)?;
-        let mut features = MelFeatures { values: vec![0.0; log_mel.values.len()], frames: log_mel.frames };
-        for frame in 0..log_mel.frames {
-            for bin in 0..log_mel.bins {
-                features.values[bin * log_mel.frames + frame] = log_mel.values[frame * log_mel.bins + bin];
-            }
-        }
-        Ok(features)
+    /// Positions kept free for the transcript (packet `output.reserve_per_row` / `_extra`).
+    fn output_reserve(&self, rows: usize) -> usize {
+        let p = &self.contract.policy;
+        rows * p.output_reserve_per_row as usize + p.output_reserve_extra as usize
     }
 
-    /// Prompt ids around `rows` audio placeholders, and the placeholders' positions. `language`
-    /// is the resolved name ([`Self::language`]).
-    pub fn prompt(
+    /// `context` cut to what the window leaves after the template, the audio and the output
+    /// reserve (and `PLOW_ASR_CONTEXT_MAX_TOKENS` when set), keeping its most recent words.
+    fn fit_context<'a>(
         &self,
         rows: usize,
         language: Option<&str>,
-        context: &str,
+        context: &'a str,
         max_context: usize,
-    ) -> Result<(Vec<u32>, Vec<usize>)> {
+    ) -> Result<&'a str> {
+        if context.is_empty() {
+            return Ok(context);
+        }
+        let base = self.encode_prompt(rows, language, "")?.len();
+        let window = max_context.saturating_sub(base + self.output_reserve(rows));
+        let cap = crate::config::RuntimeConfig::get().asr_context_max_tokens;
+        let budget = if cap == 0 { window } else { window.min(cap) };
+        let fits = |text: &str| self.tokenizer.encode(text).len() <= budget;
+        if fits(context) {
+            return Ok(context);
+        }
+        // Word starts; dropping more leading words never adds tokens, so bisect the first fit.
+        let starts: Vec<usize> = context
+            .char_indices()
+            .filter(|&(i, ch)| !ch.is_whitespace() && (i == 0 || context[..i].ends_with(char::is_whitespace)))
+            .map(|(i, _)| i)
+            .collect();
+        let (mut lo, mut hi) = (0, starts.len());
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            if fits(&context[starts[mid]..]) {
+                hi = mid;
+            } else {
+                lo = mid + 1;
+            }
+        }
+        let kept = starts.get(lo).map_or("", |&start| &context[start..]);
+        tracing::debug!(budget, dropped_words = lo, kept_words = starts.len() - lo, "ASR context trimmed to its window");
+        Ok(kept)
+    }
+
+    fn encode_prompt(&self, rows: usize, language: Option<&str>, context: &str) -> Result<Vec<u32>> {
         let c = &self.contract;
         let mut messages = c.messages.clone();
         fill_context(&mut messages, context);
@@ -640,7 +674,38 @@ impl AudioLmPrompt {
         if let Some(language) = language {
             prompt.push_str(&c.language_suffix.replace("{language}", language));
         }
-        let ids = self.tokenizer.encode(&prompt);
+        Ok(self.tokenizer.encode(&prompt))
+    }
+
+    /// The encoder's input for one recording: `[bin][frame]` log-mel features.
+    pub fn frontend(&self) -> &PacketLogMelFrontend {
+        &self.frontend
+    }
+
+    pub fn features(&self, samples: &[f32]) -> Result<MelFeatures> {
+        let log_mel = self.frontend.extract(samples)?;
+        let mut features = MelFeatures { values: vec![0.0; log_mel.values.len()], frames: log_mel.frames };
+        for frame in 0..log_mel.frames {
+            for bin in 0..log_mel.bins {
+                features.values[bin * log_mel.frames + frame] = log_mel.values[frame * log_mel.bins + bin];
+            }
+        }
+        Ok(features)
+    }
+
+    /// Prompt ids around `rows` audio placeholders, and the placeholders' positions. `language`
+    /// is the resolved name ([`Self::language`]); `context` is fitted to `max_context`.
+    pub fn prompt(
+        &self,
+        rows: usize,
+        language: Option<&str>,
+        context: &str,
+        max_context: usize,
+    ) -> Result<(Vec<u32>, Vec<usize>)> {
+        let c = &self.contract;
+        let cleaned = self.clean_context(context);
+        let context = self.fit_context(rows, language, &cleaned, max_context)?;
+        let ids = self.encode_prompt(rows, language, context)?;
         // Served, the transcript budget (`max_tokens`) is fitted to the context by the mux, so a
         // narrowed bound (`--live-ctx-models`) caps long transcripts instead of refusing audio.
         if ids.len() >= max_context {
@@ -661,11 +726,9 @@ impl AudioLmPrompt {
         Ok((ids, audio_positions))
     }
 
-    /// Resolve `language` and check `context` once for a stream of partial prompts.
-    pub fn stream_language(&self, language: Option<&str>, context: &str) -> Result<Option<String>> {
-        let language = self.language(language)?;
-        self.check_context(context)?;
-        Ok(language)
+    /// Resolve `language` once for a stream of partial prompts.
+    pub fn stream_language(&self, language: Option<&str>, _context: &str) -> Result<Option<String>> {
+        self.language(language)
     }
 
     pub(crate) fn chunking(&self) -> AudioChunking {
@@ -730,10 +793,12 @@ impl AudioLmAsr {
             }
         };
         cancelled()?;
-        let AudioLmRequest { features, ids, audio_positions: positions, language } =
-            self.prompt.request(samples, language, context, self.execution.max_context())?;
-        // This loop decodes the whole `max_tokens` budget itself, so it needs the room up front.
+        // This loop decodes the whole `max_tokens` budget itself, so it needs the room up front:
+        // the prompt (and its context) gets the rest of the window.
         let max_tokens = self.prompt.contract.max_tokens;
+        let window = self.execution.max_context().saturating_sub(max_tokens).saturating_add(1);
+        let AudioLmRequest { features, ids, audio_positions: positions, language } =
+            self.prompt.request(samples, language, context, window)?;
         if ids.len() + max_tokens > self.execution.max_context() {
             return Err(RuntimeError::ContextLength(format!(
                 "ASR needs {} prompt + {max_tokens} output positions; bundle has {}",
@@ -1009,6 +1074,30 @@ fn fill_context(value: &mut serde_json::Value, context: &str) {
 mod contract_tests {
     use super::*;
 
+    /// A context longer than the window is cut to its most recent words, not refused; one that
+    /// fits is kept whole. Needs a Qwen3-ASR bundle (the L4 deploy's); skipped without one.
+    #[test]
+    fn context_is_fitted_to_the_window_keeping_its_latest_words() {
+        let dir = std::path::Path::new("/opt/plow-asr/models/qwen3-asr");
+        let Ok(prompt) = AudioLmPrompt::load(&dir.join("model.pkt"), &dir.join("checkpoint")) else {
+            eprintln!("no Qwen3-ASR bundle at {} — skipping", dir.display());
+            return;
+        };
+        let rows = 390; // 30 s of audio
+        let short = "Thank you for calling Gorospe Law Group.";
+        let (ids, _) = prompt.prompt(rows, None, short, 2048).unwrap();
+        let (bare, _) = prompt.prompt(rows, None, "", 2048).unwrap();
+        assert!(ids.len() > bare.len(), "a short context is kept whole");
+        let long: String = (0..3000).map(|i| format!("word{i} ")).collect();
+        let (ids, _) = prompt.prompt(rows, None, &long, 2048).unwrap();
+        assert!(ids.len() + prompt.output_reserve(rows) <= 2048);
+        let kept = prompt.fit_context(rows, None, &long, 2048).unwrap();
+        assert!(kept.starts_with("word") && kept.trim_end().ends_with("word2999"), "the latest words stay");
+        assert!(kept.split_whitespace().count() > 100, "far more than the old 256-token cap allowed");
+        // A window the audio alone fills leaves no context, which is still a valid prompt.
+        assert_eq!(prompt.fit_context(rows, None, &long, bare.len() + 10).unwrap(), "");
+    }
+
     /// Chunked rows equal three stride-2 convolutions over each 100-frame chunk.
     #[test]
     fn chunked_rows_cover_all_tails() {
@@ -1035,7 +1124,6 @@ mod contract_tests {
             placeholder: 0,
             stop: vec![],
             max_tokens: 1,
-            context_max_tokens: 1,
             messages: serde_json::Value::Null,
             marker: String::new(),
             language_suffix: String::new(),
@@ -1046,6 +1134,12 @@ mod contract_tests {
             languages: vec![],
             aliases: vec![],
             chunking: AudioChunking { chunk_frames: 1, frame_stride: 1, round_bf16: false },
+            policy: plow_asset::speech_contract::AudioLmPolicy {
+                final_padding_samples: 0,
+                final_padding_amplitude: 0.0,
+                output_reserve_per_row: 1,
+                output_reserve_extra: 0,
+            },
         };
         let result = c.parse("language English<asr_text>Hello.", None).unwrap();
         assert_eq!(result.language.as_deref(), Some("English"));

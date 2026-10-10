@@ -487,14 +487,26 @@ G_K(g_relative_attention_f32) {
     const float* bias_v = PLOW_CPU_TEN(in, T, 6);
     const uint32_t rows = in->i[0], width = in->i[1], heads = in->i[2];
     const uint32_t chunk = in->i[3], left_chunks = in->i[4], head_width = width / heads;
-    for (uint32_t item = slice; item < rows * heads; item += nblk) {
+    /* t7 (optional): chunked, keys before this row are not filled yet (a stream's first chunks);
+     * full context, the valid rows of a padded bucket (later keys masked, later rows zero). */
+    const uint32_t t7 = in->t[7] != PLOW_TENSOR_NONE ? *(const uint32_t*)T[in->t[7]] : UINT32_MAX;
+    const uint32_t key0 = left_chunks != UINT32_MAX && t7 != UINT32_MAX ? t7 : 0u;
+    const uint32_t valid = left_chunks == UINT32_MAX && t7 < rows ? t7 : rows;
+    /* i5: only query rows from here on are wanted (a stream step's new rows). */
+    for (uint32_t item = in->i[5] * heads + slice; item < rows * heads; item += nblk) {
         const uint32_t qr = item / heads, head = item % heads;
-        uint32_t first = 0, last = rows;
+        if (qr >= valid) {
+            for (uint32_t col = 0; col < head_width; col++)
+                context[(size_t)qr * width + head * head_width + col] = 0.0f;
+            continue;
+        }
+        uint32_t first = 0, last = valid;
         if (left_chunks != UINT32_MAX) {
             const uint32_t qc = qr / chunk;
             first = (qc > left_chunks ? qc - left_chunks : 0u) * chunk;
             last = (qc + 1u) * chunk; if (last > rows) last = rows;
         }
+        if (first < key0) first = key0 < last ? key0 : last - 1u;
         float scores[rows];
         float maximum = -INFINITY;
         const float* q = query + (size_t)qr * width + head * head_width;
@@ -597,6 +609,7 @@ static float g_act_f32(uint32_t kind, float x, float p0, float p1) {
     case 13: return fminf(fmaxf(x, p0), p1);
     case 14: return x * p0 + p1;
     case 15: return x > 0.0f ? x : 0.0f;
+    case 16: return sqrtf(x);
     default: return x;
     }
 }

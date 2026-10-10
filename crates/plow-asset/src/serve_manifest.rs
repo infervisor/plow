@@ -129,12 +129,12 @@ impl ServeManifest {
         serde_json::to_vec(self).expect("serve manifest serializes")
     }
 
-    /// What the HF files beside the weights say: `asset_dir` (and its `checkpoint/`) for the chat
-    /// template and sampling defaults, `checkpoint_dir` for the stop set and KV geometry — the
-    /// places the runtime has always read them from. No serve defaults and no weight pins.
+    /// What the HF files beside the weights say: `asset_dir` (and its `checkpoint/`), then
+    /// `checkpoint_dir`, for the chat template and sampling defaults; `checkpoint_dir` for the stop
+    /// set and KV geometry. No serve defaults and no weight pins.
     pub fn from_checkpoint(asset_dir: &Path, checkpoint_dir: &Path) -> Self {
-        let chat = find_chat_template(asset_dir).map(|t| ChatSpec {
-            reasoning: think_tags_in(asset_dir).then(ReasoningTags::think),
+        let chat = find_chat_template(asset_dir).or_else(|| find_chat_template(checkpoint_dir)).map(|t| ChatSpec {
+            reasoning: think_tags_in(asset_dir, checkpoint_dir).then(ReasoningTags::think),
             template: Some(t.text),
             source: Some(t.source),
             builtin: None,
@@ -149,7 +149,7 @@ impl ServeManifest {
             version: VERSION,
             chat,
             stop_token_ids,
-            sampling: read_sampling(asset_dir),
+            sampling: read_sampling(asset_dir).or_else(|| read_sampling(checkpoint_dir)),
             kv: KvGeometry::from_config(checkpoint_dir),
             serve_defaults: BTreeMap::new(),
             weights: Vec::new(),
@@ -159,8 +159,8 @@ impl ServeManifest {
 
 /// Whether the tokenizer declares `<think>` and `</think>` as added tokens: the checkpoint frames
 /// reasoning with them (Qwen3, GLM, DeepSeek-R1).
-fn think_tags_in(asset_dir: &Path) -> bool {
-    [asset_dir.join("tokenizer.json"), asset_dir.join("checkpoint").join("tokenizer.json")]
+fn think_tags_in(asset_dir: &Path, checkpoint_dir: &Path) -> bool {
+    [asset_dir.join("tokenizer.json"), asset_dir.join("checkpoint").join("tokenizer.json"), checkpoint_dir.join("tokenizer.json")]
         .iter()
         .find_map(|p| std::fs::read(p).ok())
         .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())

@@ -80,6 +80,29 @@ def sha(path: Path) -> str:
     return h.hexdigest()
 
 
+def private_runtime(plowrt: Path, out: Path) -> Path:
+    """Copy plowrt to out/plowrt with the shared libraries beside it (and in ../lib), which plowrt
+    loads before the system's: a bundle's cuBLASLt (the 26B packets require >= 13.4) lives there.
+    Libraries are hardlinked when the filesystem allows (cuBLASLt is ~500 MB)."""
+    private = out / "plowrt"
+    if private.exists() and private.resolve() == plowrt.resolve():
+        return private
+    if private.exists():
+        private.unlink()
+    shutil.copy2(plowrt, private)
+    private.chmod(0o755)
+    for d in (plowrt.parent, plowrt.parent.parent / "lib"):
+        for lib in sorted(d.glob("lib*.so*")) if d.is_dir() else []:
+            dest = out / lib.name
+            if dest.exists() or not lib.is_file():
+                continue
+            try:
+                os.link(lib.resolve(), dest)
+            except OSError:
+                shutil.copy2(lib, dest)
+    return private
+
+
 def execution_artifacts(runtime: Path, assets: Path, recipe: Path, env: dict) -> dict:
     """Observed files/configuration, not a claim of complete kernel/precision identity."""
     objects = assets.parent / "objects"
@@ -657,23 +680,112 @@ def cmd_build(a: argparse.Namespace) -> None:
         "nix": os.environ.get("PLOW_CAMPAIGN_NO_NIX") != "1",
         "prep": [s.get("name") for s in r.get("prep", [])],
         "utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "hashes": {p.name: sha(p) for p in sorted(assets.glob("*")) if p.is_file() and p.suffix in (".pkt", ".cubin", ".elf", ".co", ".json", ".h")},
+        "hashes": {p.name: sha(p) for p in sorted(assets.glob("*")) if p.is_file() and (p.suffix in (".pkt", ".cubin", ".elf", ".co", ".json", ".h") or p.name == "cublaslt_algos.jsonl")},
         "objects": {p.name: sha(p) for p in sorted((out / "objects").glob("*")) if p.is_file() and p.suffix in (".cubin", ".elf", ".co", ".so")} if (out / "objects").exists() else {},
     }
+    nvidia = cell["arch"].startswith("sm_")
+    rec["cublaslt"] = lt_record(r, assets) if nvidia else None
     (out / "build-record.json").write_text(json.dumps(rec, indent=1))
     print(f"built {assets}\nrecord {out / 'build-record.json'}", file=sys.stderr)
-    # With the GPU on this box, select the exact-shape cuBLASLt algorithms now and packetize
-    # them (leased); without it, plowc has already packetized the tune store's rows.
-    # Speech/ASR recipes carry no completion gate to probe against.
-    if not a.no_probe and "gate_prompt" in r.get("bench", {}) and (assets / "build.json").exists() and gpu_matches(cell.get("gpu", "")):
-        if (assets / "cublaslt_algos.jsonl").exists():
-            print("probe: table already packetized from the tune store; skipping", file=sys.stderr)
-        else:
-            a.assets = str(assets)
-            a.store_cell = a.store_cell or "h100"
-            a.force = False
-            a.label = None
-            cmd_probe(a)
+    lean_qualify(assets, out / "lean-qualification.json", strict=False)
+    if not nvidia:
+        return
+    # plowc packetized the tune store's rows for the bundle's cuBLASLt shapes. With the GPU on
+    # this box, probe the shapes no row serves (leased) and record the final table.
+    missing = rec["cublaslt"]["missing"]
+    if not a.no_probe and missing and gpu_matches(cell.get("gpu", "")):
+        print(f"probe: {len(missing)} cuBLASLt shape(s) without a tune-store row", file=sys.stderr)
+        a.assets = str(assets)
+        a.force = False
+        a.label = None
+        cmd_probe(a)
+    elif rec["cublaslt"]["shapes"] and not missing:
+        print(f"probe: all {rec['cublaslt']['shapes']} cuBLASLt shape(s) served by the packetized table", file=sys.stderr)
+
+
+def lt_rung_algos(r: dict) -> bool:
+    """`PLOW_LT_RUNG_ALGOS` as the recipe serves it: every decode rung selects its own algorithms."""
+    value = str(r.get("serve", {}).get("env", {}).get("PLOW_LT_RUNG_ALGOS", "false"))
+    return value.strip().lower() in ("1", "true", "yes", "on")
+
+
+def lt_missing(assets: Path, rung_algos: bool) -> tuple[list[dict], int]:
+    """The bundle's BF16 cuBLASLt projection shapes (`build.json` `cublaslt.shapes`) that no row
+    of its `cublaslt_algos.jsonl` serves, and how many shapes plowrt plans. A row serves
+    `(m, n_i, k)` for each instruction N in its `ns` (default `[n]`). Narrower decode rungs pin the
+    widest rung's algorithms unless `rung_algos`, so only the widest rung's shapes count then, and
+    only a row timed across every routed rung (`rows`) serves them; otherwise a row's `rows` is empty."""
+    build = assets / "build.json"
+    shapes = json.loads(build.read_text()).get("cublaslt", {}).get("shapes", []) if build.is_file() else []
+    shapes = [x for x in shapes if x["dtype"] == "bf16"]
+    decode = sorted({x["rows"] for x in shapes if x["phase"] == "decode"})
+    rungs = () if rung_algos or len(decode) < 2 else tuple(decode)
+    if decode and not rung_algos:
+        shapes = [x for x in shapes if x["phase"] != "decode" or x["rows"] == decode[-1]]
+    served = set()
+    table = assets / "cublaslt_algos.jsonl"
+    for row in (json.loads(ln) for ln in (table.read_text().splitlines() if table.is_file() else []) if ln.strip()):
+        if row.get("dtype") == "bf16":
+            served.update((row["m"], n, row["k"], tuple(row.get("rows", ()))) for n in (row.get("ns") or [row["n"]]))
+    want = lambda x: (x["m"], x["n"], x["k"], rungs if x["phase"] == "decode" else ())
+    return [x for x in shapes if want(x) not in served], len(shapes)
+
+
+def lt_record(r: dict, assets: Path) -> dict:
+    """`build-record.json` `cublaslt`: the packetized table's sha256 and rows, and the shapes no row serves."""
+    missing, shapes = lt_missing(assets, lt_rung_algos(r))
+    table = assets / "cublaslt_algos.jsonl"
+    rows = [json.loads(ln) for ln in table.read_text().splitlines() if ln.strip()] if table.is_file() else []
+    return {
+        "shapes": shapes,
+        "missing": missing,
+        "table_sha256": sha(table) if table.is_file() else None,
+        "rows": [{k: x.get(k) for k in ("m", "n", "k", "dtype", "pair", "ns", "rows", "gpu", "commit")} for x in rows],
+    }
+
+
+def store_cell(r: dict) -> str:
+    """The tune-store SKU segment, `HardwareFingerprint::tuning_path` style: `H100 SXM5` -> `h100-sxm5`."""
+    sku = r.get("target", {}).get("sku")
+    if not sku:
+        die("recipe has no [target].sku; pass --store-cell")
+    return re.sub(r"[^a-z0-9]+", "-", sku.lower()).strip("-")
+
+
+def lean_qualify(assets: Path, report: Path, strict: bool) -> bool:
+    """`plowrt qualify` over a bundle's packets (receipts, approved verifier, replay, media
+    geometry; docs/bringup/lean-correctness-inventory.md §9-10), written to `report`. Recorded,
+    not fatal, unless `strict`; a missing plowrt or verifier is recorded as not checked."""
+    plowrt = Path(os.environ.get("CARGO_TARGET_DIR", REPO / "target")) / "release" / "plowrt"
+    if not plowrt.exists():
+        report.write_text(json.dumps({"checked": False, "reason": f"{plowrt} missing"}, indent=1))
+        print(f"lean qualify: not checked ({plowrt} missing)", file=sys.stderr)
+        return not strict
+    p = subprocess.run([str(plowrt), "qualify", "--assets", str(assets), "--format", "json"],
+                       capture_output=True, text=True, env=env_with(os.environ, {"RUST_LOG": "warn"}))
+    try:
+        packets = json.loads(p.stdout)
+    except json.JSONDecodeError:
+        packets = None
+    if packets is None:
+        report.write_text(json.dumps({"checked": False, "reason": p.stderr[-2000:]}, indent=1))
+        print(f"lean qualify: failed to run: {p.stderr.strip()[-300:]}", file=sys.stderr)
+        return not strict
+    report.write_text(json.dumps({"checked": True, "packets": packets}, indent=1))
+    for e in packets:
+        q = e["qualification"]
+        verdict = "qualified" if e["qualified"] else "UNQUALIFIED"
+        print(f"lean qualify: {Path(e['packet']).name} {verdict} {len(q['satisfied'])}/{len(q['required'])}"
+              + "".join(f"\n    gap: {g[:200]}" for g in q["gaps"]), file=sys.stderr)
+    ok = all(e["qualified"] for e in packets)
+    return ok or not strict
+
+
+def cmd_qualify(a: argparse.Namespace) -> None:
+    assets = Path(a.assets).resolve()
+    report = Path(a.out) if a.out else assets.parent / "lean-qualification.json"
+    if not lean_qualify(assets, report, strict=a.strict):
+        die(f"lean qualification failed; see {report}")
 
 
 def gpu_matches(recipe_gpu: str) -> bool:
@@ -723,9 +835,7 @@ def cmd_bench(a: argparse.Namespace) -> None:
         die(f"{assets}/model.pkt missing")
     plowrt = Path(serve.get("plowrt", str(REPO / "target" / "release" / "plowrt"))).resolve()
     # A private copy: the shared target/release binary can be rebuilt by another agent mid-run.
-    private = out / "plowrt"
-    private.write_bytes(plowrt.read_bytes())
-    private.chmod(0o755)
+    private = private_runtime(plowrt, out)
 
     env = env_with(os.environ, serve.get("env", {}))
     # The one variable of an A/B, named on the command line so the record carries it.
@@ -873,9 +983,11 @@ def cmd_serve(a: argparse.Namespace) -> None:
 
 # ---------------------------------------------------------------- probe
 def cmd_probe(a: argparse.Namespace) -> None:
-    """Serve the packet once under the lease with `--lt-algos-write`, answer the coherence
-    gate, and stop. Leaves `<assets>/cublaslt_algos.jsonl` (consumed by `bench`) and copies it
-    into the tune store, so an emit on a GPU-less host can packetize the same selection."""
+    """Serve the packet once under the lease with `--lt-algos-write`, wait until it has loaded
+    (every cuBLASLt plan is selected at load), answer the coherence gate when the recipe has one,
+    and stop. The bundle's packetized rows stay pinned (`--force` re-selects every shape), so only
+    unserved shapes are timed; their rows are merged into `<assets>/cublaslt_algos.jsonl` and
+    appended to the tune store, so the next emit packetizes them."""
     r = load(a.recipe)
     cell, bench, serve = r["cell"], r["bench"], dict(r.get("serve", {}))
     assets = Path(a.assets).resolve()
@@ -884,22 +996,23 @@ def cmd_probe(a: argparse.Namespace) -> None:
     out = assets.parent / "probe"
     out.mkdir(exist_ok=True)
     table = assets / "cublaslt_algos.jsonl"
-    if table.exists() and not a.force:
-        die(f"{table} exists; pass --force to re-probe")
-    plowrt = Path(serve.get("plowrt", str(REPO / "target" / "release" / "plowrt"))).resolve()
-    private = out / "plowrt"
-    private.write_bytes(plowrt.read_bytes())
-    private.chmod(0o755)
+    selected = out / "cublaslt_selected.jsonl"
+    selected.unlink(missing_ok=True)
+    plowrt = Path(getattr(a, "plowrt", None) or serve.get("plowrt", str(REPO / "target" / "release" / "plowrt"))).resolve()
+    # plowrt binds the cuBLASLt beside it first: the probe must select with the library it serves with.
+    for lib in out.glob("lib*.so*"):
+        lib.unlink()
+    private = private_runtime(plowrt, out)
     env = env_with(os.environ, serve.get("env", {}))
     objects = assets.parent / "objects"
     if "objects" in r and "PLOW_LT_ALGOS_WRITE" not in env and objects.is_dir():
         env.setdefault("PLOW_PF_SEG_DIR", str(objects))
     env.update(dict(kv.split("=", 1) for kv in (a.env or [])))
-    env["PLOW_LT_ALGOS_WRITE"] = str(table)
+    env["PLOW_LT_ALGOS_WRITE"] = str(selected)
     env.pop("PLOW_LT_ALGOS", None)
+    if table.is_file() and not a.force:
+        env["PLOW_LT_ALGOS"] = str(table)
     port = str(bench.get("port", 8765))
-    model_id = bench.get("model_id") or cell["revision"]
-    gate = json.dumps({"model": model_id, "prompt": bench["gate_prompt"], "max_tokens": 16, "temperature": 0})
     script = out / "probe.sh"
     lines = ["#!/usr/bin/env bash", "set -uo pipefail"]
     for k, v in sorted(env.items()):
@@ -912,38 +1025,57 @@ def cmd_probe(a: argparse.Namespace) -> None:
         "trap 'kill -TERM -\"$SRV\" 2>/dev/null; sleep 2; kill -KILL -\"$SRV\" 2>/dev/null' EXIT",
         f"for i in $(seq 1 {bench.get('ready_s', 1200)}); do kill -0 $SRV 2>/dev/null || {{ echo 'server died'; tail -20 {shlex.quote(str(out / 'server.log'))}; exit 1; }}; "
         f"curl -sf --max-time 2 http://127.0.0.1:{port}/v1/models >/dev/null 2>&1 && break; sleep 1; done",
-        f"curl -s --max-time 300 http://127.0.0.1:{port}/v1/completions -H 'Content-Type: application/json' --data-binary {shlex.quote(gate)} | grep -qi paris || {{ echo 'gate FAIL'; exit 1; }}",
-        "echo 'gate PASS'",
+        f"curl -sf --max-time 2 http://127.0.0.1:{port}/v1/models >/dev/null || {{ echo 'server not ready'; exit 1; }}",
     ]
+    # Without a completion gate (speech, ASR, multimodal) the probe is the load: plowrt selects
+    # every cuBLASLt plan before it reports ready.
+    if "gate_prompt" in bench:
+        model_id = bench.get("model_id") or cell["revision"]
+        gate = json.dumps({"model": model_id, "prompt": bench["gate_prompt"], "max_tokens": 16, "temperature": 0})
+        lines.append(f"curl -s --max-time 300 http://127.0.0.1:{port}/v1/completions -H 'Content-Type: application/json' "
+                     f"--data-binary {shlex.quote(gate)} | grep -qi paris || {{ echo 'gate FAIL'; exit 1; }}")
+    lines.append("echo 'probe PASS'")
     script.write_text("\n".join(lines) + "\n")
     script.chmod(0o755)
     log = out / "probe.log"
     log.write_bytes(b"")
     label = a.label or f"{cell['name']}-probe"
-    rc = run([str(GPULEASE), "-n", str(cell.get("n_gpu", 1)), label, str(script)], dict(os.environ), log)
+    # A gpuq job already holds the lease; a nested gpulease would wait on itself.
+    lease = [] if getattr(a, "leased", False) else [str(GPULEASE), "-n", str(cell.get("n_gpu", 1)), label]
+    rc = run([*lease, str(script)], dict(os.environ), log)
     text = log.read_text(errors="replace")
-    if rc != 0 or "gate PASS" not in text or not table.is_file():
+    if rc != 0 or "probe PASS" not in text:
         die("probe failed; see probe/probe.log and probe/server.log")
-    rows = [ln for ln in table.read_text().splitlines() if ln.strip()]
-    store = REPO / "tuning" / "nvidia" / cell["arch"].replace("_", "") / a.store_cell / "cublaslt_algos.jsonl"
+    # Provenance rides on each row; reuse keys on the shape, the GPU and AlgoCheck, never on it.
+    stamp = {"commit": git("rev-parse", "HEAD"), "recipe": cell["name"],
+             "utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+    new = [{**json.loads(ln), **stamp} for ln in (selected.read_text().splitlines() if selected.is_file() else []) if ln.strip()]
+    key = lambda d: (d["m"], d["n"], d["k"], d["dtype"], bool(d.get("pair")), tuple(d.get("rows", ())))
+    merged = {} if a.force else {key(d): d for d in (json.loads(ln) for ln in (table.read_text().splitlines() if table.is_file() else []) if ln.strip())}
+    merged.update((key(d), d) for d in new)
+    if merged:
+        table.write_text("".join(json.dumps(d) + "\n" for _, d in sorted(merged.items())))
+    store = REPO / "tuning" / "nvidia" / cell["arch"] / (getattr(a, "store_cell", None) or store_cell(r)) / "cublaslt_algos.jsonl"
     store.parent.mkdir(parents=True, exist_ok=True)
     seen = set()
     if store.exists():
-        for ln in store.read_text().splitlines():
-            if ln.strip():
-                d = json.loads(ln)
-                seen.add((d["m"], d["n"], d["k"], d["dtype"], d["gpu"]))
+        seen = {(*key(d), d["gpu"]) for d in (json.loads(ln) for ln in store.read_text().splitlines() if ln.strip())}
     added = 0
     with open(store, "a") as f:
-        for ln in rows:
-            d = json.loads(ln)
-            key = (d["m"], d["n"], d["k"], d["dtype"], d["gpu"])
-            if key in seen:
+        for d in new:
+            if (*key(d), d["gpu"]) in seen and not a.force:
                 continue
-            seen.add(key)
-            f.write(ln + "\n")
+            seen.add((*key(d), d["gpu"]))
+            f.write(json.dumps(d) + "\n")
             added += 1
-    print(f"probe: {len(rows)} shape(s) selected -> {table}\n       {added} new row(s) -> {store}", file=sys.stderr)
+    print(f"probe: {len(new)} shape(s) selected -> {table} ({len(merged)} rows)\n       {added} new row(s) -> {store}", file=sys.stderr)
+    record = assets.parent / "build-record.json"
+    if record.is_file():
+        rec = json.loads(record.read_text())
+        rec["cublaslt"] = lt_record(r, assets)
+        rec.setdefault("hashes", {})["cublaslt_algos.jsonl"] = rec["cublaslt"]["table_sha256"]
+        record.write_text(json.dumps(rec, indent=1))
+        print(f"probe: {len(rec['cublaslt']['missing'])} shape(s) still unserved; record {record}", file=sys.stderr)
 
 
 # ---------------------------------------------------------------- cert
@@ -1166,12 +1298,12 @@ def cmd_loop(a: argparse.Namespace) -> None:
         print("  Doctor check passed.", file=sys.stderr)
 
     # 3. Probe (if applicable and not skipped)
-    if not a.no_probe and not (assets_dir / "cublaslt_algos.jsonl").exists():
+    if not a.no_probe and lt_missing(assets_dir, lt_rung_algos(r))[0]:
         print("[3/5] Probing cuBLASLt algorithms...", file=sys.stderr)
         probe_args = argparse.Namespace(
             recipe=str(recipe_path),
             assets=str(assets_dir),
-            store_cell=getattr(a, "store_cell", "h100") or "h100",
+            store_cell=getattr(a, "store_cell", None),
             label=f"{cell['name']}-probe",
             force=False,
             env=a.env or [],
@@ -1281,6 +1413,10 @@ def cmd_sweep(a: argparse.Namespace) -> None:
 #   asr_wer           /v1/audio/transcriptions over a manifest (served_bench.py): wer_max
 #   tts_cer           tts_bench.py --wav arms, Whisper round trip (asr_check.py): cer_median_max, cer_lang_max
 #   s3gen_rel_l2      s3gen.pkt vs torch (s3gen_packet_check.py, packet_run): rel_l2_max
+#   vad_parity        silero_vad.pkt per-frame speech probability vs the Silero TorchScript reference
+#                     (silero_vad_parity.py, asr_vad_check, host executor): max_dp_max, agree_min;
+#                     `jit`, `manifest`.
+#                     A packet-only bundle names its packet in [gates] `packet` (default model.pkt).
 #   llm_fp32_ref      plow AND vLLM vs a cached FP32 reference (scripts/llm/fp32_ref_gate.py); plow must
 #                     stay within vLLM's distance to FP32. `reference` (ref.json), then `vllm_capture` (cached)
 #                     or `vllm_hf` [+ `vllm_args`, `vllm_python`] to capture vLLM in the same lease:
@@ -1288,12 +1424,27 @@ def cmd_sweep(a: argparse.Namespace) -> None:
 #                     needle_min, tie_margin (docs/bringup/agent-tools.md §5)
 # Each may set `python` (default [gates].python, else python3), `args` (extra client args) and
 # `timeout_s`. Placeholders as in `build`, plus {assets}, {target} (cargo target dir) and {out}.
-GATE_KINDS = ("llm_logit_parity", "llm_fp32_ref", "asr_wer", "tts_cer", "s3gen_rel_l2")
+# A table named <kind>_<suffix> (e.g. [gates.llm_fp32_ref_long], a second reference set) runs as
+# another gate of that kind, in out/<kind>_<suffix>/.
+#   mm_parity         reference (dir of `scripts/mm/hf_ref.py all`: ref.json + arrays; built in this
+#                     lease before the server starts when ref.json is missing, from hf_dir, images,
+#                     audio, cases [, hf_python]); served chat cases vs HF (`scripts/mm/gate.py`:
+#                     prompt-token equality, greedy match, repeat stability, media collisions;
+#                     min_prefix, tie_margin, repeats, max_new), error paths (`scripts/mm/refusals.py`:
+#                     refusal_image, refusal_audio, compressed), and after the server stops the encoder
+#                     sidecars vs HF rows (`mm_check`, `runner`; encoder = false skips it):
+#                     cases_pass_min (default all), refusals, encoder
+GATE_KINDS = ("llm_logit_parity", "llm_fp32_ref", "asr_wer", "tts_cer", "s3gen_rel_l2", "vad_parity", "mm_parity")
 
 
-def gate_steps(kind: str, g: dict, py: str, out: Path, assets: Path) -> tuple[list[str], list[str]]:
-    """(steps while the server is up, steps after it stops); each writes into out/<kind>/."""
-    d = shlex.quote(str(out / kind))
+def gate_kind(key: str) -> str | None:
+    return next((k for k in GATE_KINDS if key == k or key.startswith(k + "_")), None)
+
+
+def gate_steps(key: str, g: dict, py: str, out: Path, assets: Path) -> tuple[list[str], list[str]]:
+    """(steps while the server is up, steps after it stops); each writes into out/<key>/."""
+    d = shlex.quote(str(out / key))
+    kind = gate_kind(key)
     q = shlex.quote
     sc = lambda rel: q(str(REPO / rel))
     args = " ".join(q(x) for x in g.get("args", []))
@@ -1336,7 +1487,50 @@ def gate_steps(kind: str, g: dict, py: str, out: Path, assets: Path) -> tuple[li
                     f"--runner {q(runner)} "
                     f"--out {d} --skip-cer {args} "
                     f"> {d}/check.log 2>&1"]
+    if kind == "vad_parity":
+        runner = g.get("runner") or os.environ.get("CARGO_TARGET_DIR", str(REPO / "target")) + "/release/examples/asr_vad_check"
+        if not Path(runner).exists():
+            die(f"{runner} missing: cargo build --release -p plowrt --example asr_vad_check")
+        return [], [f"{q(py)} {sc('scripts/asr/silero_vad_parity.py')} --packet {q(str(assets / 'silero_vad.pkt'))} "
+                    f"--jit {q(g['jit'])} --manifest {q(g['manifest'])} --runner {q(runner)} --out {d} "
+                    f"--threshold {float(g.get('threshold', 0.5))} "
+                    f"--max-dp {float(g.get('max_dp_max', 1e-4))} --min-agree {float(g.get('agree_min', 0.999))} {args} "
+                    f"> {d}/check.log 2>&1"]
+    if kind == "mm_parity":
+        ref = q(g["reference"])
+        flags = " ".join(f"--{k.replace('_', '-')} {q(str(g[k]))}" for k in ("min_prefix", "tie_margin", "repeats", "max_new") if k in g)
+        up = [f"{q(py)} {sc('scripts/mm/gate.py')} {ref}/ref.json --base \"http://127.0.0.1:$PB_SERVER_PORT\" --model \"$MODEL\" "
+              f"{flags} {args} > {d}/gate.jsonl 2> {d}/gate.log"]
+        media = "".join(f" --{m} {q(g['refusal_' + m])}" for m in ("image", "audio") if g.get("refusal_" + m))
+        if media or g.get("compressed"):
+            comp = " --compressed " + " ".join(q(p) for p in g["compressed"]) if g.get("compressed") else ""
+            up.append(f"{q(py)} {sc('scripts/mm/refusals.py')} \"http://127.0.0.1:$PB_SERVER_PORT\" \"$MODEL\"{media}{comp} "
+                      f"> {d}/refusals.jsonl 2>&1")
+        if not g.get("encoder", True):
+            return up, []
+        runner = g.get("runner") or os.environ.get("CARGO_TARGET_DIR", str(REPO / "target")) + "/release/examples/mm_check"
+        if not Path(runner).exists():
+            die(f"{runner} missing: cargo build --release -p plowrt --features cuda --example mm_check")
+        return up, [f"{q(runner)} {ref} {q(str(assets / 'model.pkt'))} --encode > {d}/mm_check.jsonl 2> {d}/mm_check.err"]
     die(f"unknown gate kind {kind}")
+
+
+def gate_pre(key: str, g: dict, out: Path) -> list[str]:
+    """Steps before the server starts (the GPU is free): an mm_parity HF reference not yet built."""
+    if gate_kind(key) != "mm_parity":
+        return []
+    q = shlex.quote
+    ref = Path(g["reference"])
+    if (ref / "ref.json").is_file():
+        return []
+    missing = [k for k in ("hf_dir", "cases") if not g.get(k)] + ([] if g.get("images") or g.get("audio") else ["images/audio"])
+    if missing:
+        die(f"[gates.{key}] {ref}/ref.json missing and no {', '.join(missing)} to build it (scripts/mm/hf_ref.py all)")
+    py = q(g.get("hf_python") or "python3")
+    media = "".join(f" --image {q(p)}" for p in g.get("images", [])) + "".join(f" --audio {q(p)}" for p in g.get("audio", []))
+    cases = g["cases"] if Path(g["cases"]).is_absolute() else str(REPO / g["cases"])
+    return [f"{py} {q(str(REPO / 'scripts/mm/hf_ref.py'))} all --ckpt {q(g['hf_dir'])} --out {q(str(ref))}{media} "
+            f"--cases {q(cases)} --max-new {int(g.get('max_new', 48))} > {q(str(out / key / 'hf_ref.log'))} 2>&1"]
 
 
 def fp32_ref_module():
@@ -1346,8 +1540,9 @@ def fp32_ref_module():
     return mod
 
 
-def gate_score(kind: str, g: dict, d: Path) -> dict:
+def gate_score(key: str, g: dict, d: Path) -> dict:
     """{metric: value, ..., "pass": bool, "why": [...]} from the files gate_steps wrote."""
+    kind = gate_kind(key)
     txt = lambda name: (d / name).read_text(errors="replace") if (d / name).is_file() else ""
     res, why = {}, []
     def lim(metric, value, key, upper=True):
@@ -1403,6 +1598,44 @@ def gate_score(kind: str, g: dict, d: Path) -> dict:
         if not rels:
             return {"pass": False, "why": ["no numerics rows (see check.log)"]}
         lim("mel_rel_l2_max", max(rels), "rel_l2_max")
+    elif kind == "vad_parity":
+        if not (d / "parity.json").is_file():
+            return {"pass": False, "why": ["no parity.json (see check.log)"]}
+        par = json.loads((d / "parity.json").read_text())
+        lim("max_dp", par["max_dp"], "max_dp_max")
+        lim("agree", par["agree"], "agree_min", upper=False)
+        res.update(mean_dp=par["mean_dp"], flips=len(par["flips"]), frames=par["frames"], clips=len(par["clips"]))
+    elif kind == "mm_parity":
+        rows = [json.loads(ln) for ln in txt("gate.jsonl").splitlines() if ln.startswith("{")]
+        cases = [r for r in rows if "case" in r]
+        if not cases:
+            return {"pass": False, "why": ["no gate.py cases (see gate.log)"]}
+        res.update(cases=len(cases), cases_pass=sum(r["pass"] for r in cases),
+                   prompt_tokens_equal=sum(r["prompt_tokens"] == r["hf_prompt_tokens"] for r in cases),
+                   exact=sum(r["exact"] for r in cases), repeat_stable=sum(r.get("repeat_stable", r.get("repeat_equal")) for r in cases))
+        lim("cases_pass", res["cases_pass"], "cases_pass_min", upper=False)
+        if "cases_pass_min" not in g and res["cases_pass"] < len(cases):
+            why.append("failed cases: " + ", ".join(r["case"] for r in cases if not r["pass"]))
+        if any("media_collision" in r for r in rows):
+            why.append("media collisions: " + ", ".join("/".join(r["media_collision"]) for r in rows if "media_collision" in r))
+        if (d / "refusals.jsonl").is_file() or g.get("refusal_image") or g.get("refusal_audio") or g.get("compressed"):
+            ref_rows = [json.loads(ln) for ln in txt("refusals.jsonl").splitlines() if ln.startswith("{")]
+            res["refusals_pass"] = sum(r["pass"] for r in ref_rows)
+            res["refusals"] = len(ref_rows)
+            if not ref_rows or res["refusals_pass"] < len(ref_rows):
+                why.append("refusals: " + (", ".join(r["case"] for r in ref_rows if not r["pass"]) or "none ran (see refusals.jsonl)"))
+        if g.get("encoder", True):
+            items = [json.loads(ln) for ln in txt("mm_check.jsonl").splitlines() if ln.startswith("{")]
+            checks = [v for it in items for k, v in it.items() if isinstance(v, dict) and "pass" in v]
+            res["encoder_checks_pass"] = sum(c["pass"] for c in checks)
+            res["encoder_checks"] = len(checks)
+            cos = [c["cosine"] for c in checks if "cosine" in c]
+            if cos:
+                res["encoder_cosine_min"] = min(cos)
+            if not checks or res["encoder_checks_pass"] < len(checks):
+                why.append("encoder parity: " + (", ".join(f"item {it['item']}" for it in items
+                                                           if not all(v["pass"] for v in it.values() if isinstance(v, dict) and "pass" in v))
+                                                  or "no mm_check output (see mm_check.err)"))
     res["pass"] = not why
     res["why"] = why
     return res
@@ -1412,7 +1645,8 @@ def cmd_gate(a: argparse.Namespace) -> None:
     with open(a.recipe, "rb") as f:
         r = tomllib.load(f)
     gates = dict(r.get("gates", {}))
-    kinds = [k for k in GATE_KINDS if k in gates and (not a.only or k in a.only.split(","))]
+    kinds = [k for k in gates if isinstance(gates[k], dict) and gate_kind(k)
+             and (not a.only or k in a.only.split(","))]
     if not kinds:
         die(f"{a.recipe}: no [gates.<kind>] tables ({', '.join(GATE_KINDS)})")
     assets = Path(a.assets).resolve()
@@ -1422,13 +1656,13 @@ def cmd_gate(a: argparse.Namespace) -> None:
         return expand(str(v).replace("{assets}", str(assets)).replace("{target}", target), out, lenient=a.score_only)
     cfg = {k: {kk: ([x(i) for i in vv] if isinstance(vv, list) else x(vv) if isinstance(vv, str) else vv)
                for kk, vv in gates[k].items()} for k in kinds}
-    pkt = assets / "model.pkt"
+    pkt = assets / gates.get("packet", "model.pkt")
     # serving_comparison.py render accepts the gate only for the exact packet the Infervisor arm served,
     # so the packet hash is the one captured with the run, never the --assets of a later re-score.
     pkt_rec = out / "packet.sha256"
     if not a.score_only:
         if not pkt.exists():
-            die(f"{assets}/model.pkt missing")
+            die(f"{pkt} missing")
         out.mkdir(parents=True, exist_ok=True)
         pkt_rec.write_text(sha(pkt) + "\n")
         serve = dict(r.get("serve", {}))
@@ -1438,10 +1672,10 @@ def cmd_gate(a: argparse.Namespace) -> None:
         packet_env(r, assets, full)
         env.update({k: full[k] for k in ("PLOW_PF_SEG_DIR", "PLOW_LT_ALGOS") if k in full})
         plowrt = Path(a.plowrt or serve.get("plowrt") or Path(target) / "release" / "plowrt").resolve()
-        shutil.copy2(plowrt, out / "plowrt")
+        private_runtime(plowrt, out)
         lines = ["#!/usr/bin/env bash", "set -u", "source " + shlex.quote(str(REPO / "scripts/bench/plowbench.sh"))]
         lines += [f"export {k}={shlex.quote(v)}" for k, v in sorted(env.items())]
-        up, down = [], []
+        before, up, down = [], [], []
         for k in kinds:
             (out / k).mkdir(exist_ok=True)
             py = x(cfg[k].get("python") or gates.get("python") or "python3")
@@ -1451,8 +1685,10 @@ def cmd_gate(a: argparse.Namespace) -> None:
             genv = " ".join(f"{q}={shlex.quote(x(v))}" for q, v in cfg[k].get("env", {}).items())
             pre = f"env {genv} " if genv else ""
             tag = lambda step: f"{pre}{step} || echo 'GATE_STEP_FAIL {k}'"
+            before += [tag(s) for s in gate_pre(k, cfg[k], out)]
             up += [tag(s) for s in s1]
             down += [tag(s) for s in s2]
+        lines += before
         if up:
             lines += ["PB_SERVER_PORT=$(pb_free_port)",
                       "PB_SERVER_LOG=" + shlex.quote(str(out / "serve.log")),
@@ -1582,9 +1818,15 @@ def main() -> None:
     b.add_argument("--env", action="append", metavar="K=V", help="one-variable override for the emit env; recorded")
     b.add_argument("--object-env", action="append", metavar="K=V", help="object-build-only env over [objects.env]: *_FLAGS append, other keys replace; recorded")
     b.add_argument("--no-probe", action="store_true", help="skip the leased cuBLASLt algorithm probe even with the GPU present")
-    b.add_argument("--store-cell", help="tune-store cell for the probe (default h100)")
+    b.add_argument("--leased", action="store_true", help="the probe runs inside the caller's GPU lease (a gpuq job)")
+    b.add_argument("--plowrt", help="plowrt the probe serves with (default [serve].plowrt, else target/release/plowrt)")
+    b.add_argument("--store-cell", help="tune-store SKU cell for the probe (default: [target].sku folded, e.g. h100-sxm5)")
     b.add_argument("--hf-dir", help="checkpoint snapshot on this host, replacing [cell].hf_dir; recorded")
     b.set_defaults(f=cmd_build)
+    q = sp.add_parser("qualify", help="Lean receipt/media qualification of a bundle (plowrt qualify)")
+    q.add_argument("--assets", required=True); q.add_argument("--out", help="report (default <assets>/../lean-qualification.json)")
+    q.add_argument("--strict", action="store_true", help="exit non-zero unless every packet qualifies")
+    q.set_defaults(f=cmd_qualify)
     s = sp.add_parser("serve"); s.add_argument("recipe"); s.add_argument("--assets", required=True)
     s.add_argument("--profile", required=True, help="serving policy from [bench.profiles.*] (e.g. realtime, high_concurrency)")
     s.add_argument("--port", type=int, default=8080); s.add_argument("--plowrt", help="plowrt binary (default target/release/plowrt)")
@@ -1601,8 +1843,9 @@ def main() -> None:
     n.add_argument("--profile", help="named workload from [bench.profiles.*] (e.g. realtime, throughput)")
     n.set_defaults(f=cmd_bench)
     pr = sp.add_parser("probe"); pr.add_argument("recipe"); pr.add_argument("--assets", required=True)
-    pr.add_argument("--store-cell", default="h100", help="tune-store cell under tuning/nvidia/<arch>/")
-    pr.add_argument("--label"); pr.add_argument("--force", action="store_true")
+    pr.add_argument("--store-cell", help="tune-store SKU cell under tuning/nvidia/<arch>/ (default: [target].sku folded)")
+    pr.add_argument("--label"); pr.add_argument("--force", action="store_true"); pr.add_argument("--plowrt")
+    pr.add_argument("--leased", action="store_true", help="the caller holds the GPU lease (a gpuq job): no nested gpulease")
     pr.add_argument("--env", action="append", metavar="K=V"); pr.set_defaults(f=cmd_probe)
     ce = sp.add_parser("cert"); ce.add_argument("--knob", required=True); ce.add_argument("--job", required=True)
     ce.add_argument("--cell", required=True, help="cell name used in rung digests, e.g. gemma4-12b.h100.bf16")

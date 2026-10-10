@@ -40,7 +40,15 @@ __device__ __forceinline__ constexpr bool sp_op_on(unsigned op) {
 /* Covers the GEMM ring, AttentionF32's Q/K/V stages (SpfShape), and
  * GroupedAttention's K stage for group_rows*(head_width+1) <= SP_ARENA_FLOATS - 2048 (larger
  * groups read K from global instead). */
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 890
+/* sm_89 caps one block at 99 KiB of shared memory, static included. The hd128 AttentionF32
+ * stage (25856 floats) does not fit; that arm traps there. */
+#define SP_ARENA_FLOATS 24576
+#define SPF_HD128 0
+#else
 #define SP_ARENA_FLOATS 25856
+#define SPF_HD128 1
+#endif
 static_assert(SP_ARENA_FLOATS >= SPG_SMEM_FLOATS, "speech arena");
 
 /* The arena is the dynamic shared memory base (interp_sm120.cu's `arena`, the test kernel's). The
@@ -57,6 +65,11 @@ __device__ __forceinline__ float sp_sigmoid(float x) {
     return __fdiv_rn(1.0f, __fadd_rn(1.0f, sp_expf(-x)));
 }
 __device__ __forceinline__ float sp_silu(float x) { return __fdiv_rn(x, __fadd_rn(1.0f, sp_expf(-x))); }
+/* torch gelu(approximate="tanh"). */
+__device__ __forceinline__ float sp_gelu_tanh(float x) {
+    const float inner = __fmul_rn(0.7978845608028654f, __fadd_rn(x, __fmul_rn(0.044715f, __fmul_rn(x, __fmul_rn(x, x)))));
+    return __fmul_rn(__fmul_rn(0.5f, x), __fadd_rn(1.0f, tanhf(inner)));
+}
 
 /* bf16(x) -> erf-GELU (Abramowitz-Stegun 7.1.26) -> bf16, exactly as the golden spells it. */
 __device__ __forceinline__ float sp_gelu_erf_bf16(float value) {
@@ -266,16 +279,18 @@ __device__ __forceinline__ void sp_conv_table(SpConvTab* tab, const SpConvGeom& 
     __syncthreads();
 }
 
-/* One 128x128 output tile at (m0, n0). */
-template <class LA, class LB, class EP>
+/* One (16 TM)x(16 TN) output tile at (m0, n0): 128x128 by default. Every output sums its K terms in
+ * the same fmaf order whatever the tile, so the tile shape never changes a result. */
+template <class LA, class LB, class EP, int TM = SPG_TM, int TN = SPG_TN>
 static __device__ __forceinline__ void sp_gemm_tile(unsigned m0, unsigned n0, unsigned M, unsigned N,
                                                     unsigned K, const LA& la, const LB& lb,
                                                     const EP& ep, float* arena) {
+    constexpr unsigned BM = 16 * TM, BN = 16 * TN, LDA = BM + 4, LDB = BN + 4;
     constexpr unsigned KT = SPG_BK / 4, RPP = PLOW_NV_THREADS / KT;
-    constexpr unsigned AP = SPG_BM / RPP, BP = SPG_BN / RPP;
-    static_assert(AP * RPP == SPG_BM && BP * RPP == SPG_BN, "loader coverage");
+    constexpr unsigned AP = BM / RPP, BP = BN / RPP;
+    static_assert(AP * RPP == BM && BP * RPP == BN, "loader coverage");
     float* As = arena;
-    float* Bs = arena + 2 * SPG_BK * SPG_LDA;
+    float* Bs = arena + 2 * SPG_BK * LDA;
     const unsigned tid = threadIdx.x, tx = tid & 15u, ty = tid >> 4;
     const unsigned lr = tid / KT, lk = (tid % KT) * 4u;
     const unsigned nk = (K + SPG_BK - 1) / SPG_BK;
@@ -286,23 +301,23 @@ static __device__ __forceinline__ void sp_gemm_tile(unsigned m0, unsigned n0, un
     for (unsigned p = 0; p < AP; p++) { ra[p] = la.row(m0 + lr + p * RPP, M); va[p] = la.load4(ra[p], lk); }
 #pragma unroll
     for (unsigned p = 0; p < BP; p++) { rb[p] = lb.row(n0 + lr + p * RPP, N); vb[p] = lb.load4(rb[p], lk); }
-    float acc[SPG_TM][SPG_TN];
+    float acc[TM][TN];
 #pragma unroll
-    for (int i = 0; i < SPG_TM; i++)
+    for (int i = 0; i < TM; i++)
 #pragma unroll
-        for (int j = 0; j < SPG_TN; j++) acc[i][j] = 0.f;
+        for (int j = 0; j < TN; j++) acc[i][j] = 0.f;
     for (unsigned kt = 0; kt < nk; kt++) {
-        float* as = As + (kt & 1u) * SPG_BK * SPG_LDA;
-        float* bs = Bs + (kt & 1u) * SPG_BK * SPG_LDB;
+        float* as = As + (kt & 1u) * SPG_BK * LDA;
+        float* bs = Bs + (kt & 1u) * SPG_BK * LDB;
 #pragma unroll
         for (unsigned p = 0; p < AP; p++) {
-            float* d = as + lk * SPG_LDA + lr + p * RPP;
-            d[0] = va[p].x; d[SPG_LDA] = va[p].y; d[2 * SPG_LDA] = va[p].z; d[3 * SPG_LDA] = va[p].w;
+            float* d = as + lk * LDA + lr + p * RPP;
+            d[0] = va[p].x; d[LDA] = va[p].y; d[2 * LDA] = va[p].z; d[3 * LDA] = va[p].w;
         }
 #pragma unroll
         for (unsigned p = 0; p < BP; p++) {
-            float* d = bs + lk * SPG_LDB + lr + p * RPP;
-            d[0] = vb[p].x; d[SPG_LDB] = vb[p].y; d[2 * SPG_LDB] = vb[p].z; d[3 * SPG_LDB] = vb[p].w;
+            float* d = bs + lk * LDB + lr + p * RPP;
+            d[0] = vb[p].x; d[LDB] = vb[p].y; d[2 * LDB] = vb[p].z; d[3 * LDB] = vb[p].w;
         }
         __syncthreads();
         if (kt + 1 < nk) {
@@ -311,43 +326,44 @@ static __device__ __forceinline__ void sp_gemm_tile(unsigned m0, unsigned n0, un
 #pragma unroll
             for (unsigned p = 0; p < BP; p++) vb[p] = lb.load4(rb[p], (kt + 1) * SPG_BK + lk);
         }
-        const float* a = as + ty * SPG_TM;
-        const float* b = bs + tx * SPG_TN;
+        const float* a = as + ty * TM;
+        const float* b = bs + tx * TN;
 #pragma unroll
         for (int k = 0; k < SPG_BK; k++) {
-            float av[SPG_TM], bv[SPG_TN];
+            float av[TM], bv[TN];
 #pragma unroll
-            for (int i = 0; i < SPG_TM; i += 4) *(float4*)(av + i) = *(const float4*)(a + k * SPG_LDA + i);
+            for (int i = 0; i < TM; i += 4) *(float4*)(av + i) = *(const float4*)(a + k * LDA + i);
 #pragma unroll
-            for (int j = 0; j < SPG_TN; j += 4) *(float4*)(bv + j) = *(const float4*)(b + k * SPG_LDB + j);
+            for (int j = 0; j < TN; j += 4) *(float4*)(bv + j) = *(const float4*)(b + k * LDB + j);
 #pragma unroll
-            for (int i = 0; i < SPG_TM; i++)
+            for (int i = 0; i < TM; i++)
 #pragma unroll
-                for (int j = 0; j < SPG_TN; j++) acc[i][j] = fmaf(av[i], bv[j], acc[i][j]);
+                for (int j = 0; j < TN; j++) acc[i][j] = fmaf(av[i], bv[j], acc[i][j]);
         }
     }
     /* The next tile's first store targets buffer 0, which the last odd k-tile may still read. */
     __syncthreads();
 #pragma unroll
-    for (int i = 0; i < SPG_TM; i++) {
-        const unsigned m = m0 + ty * SPG_TM + i;
+    for (int i = 0; i < TM; i++) {
+        const unsigned m = m0 + ty * TM + i;
         if (m >= M) break;
 #pragma unroll
-        for (int j = 0; j < SPG_TN; j++) {
-            const unsigned n = n0 + tx * SPG_TN + j;
+        for (int j = 0; j < TN; j++) {
+            const unsigned n = n0 + tx * TN + j;
             if (n < N) ep(m, n, acc[i][j]);
         }
     }
 }
 
-template <class LA, class LB, class EP>
+template <int TM = SPG_TM, int TN = SPG_TN, class LA, class LB, class EP>
 static __device__ __forceinline__ void sp_gemm(unsigned M, unsigned N, unsigned K, const LA& la,
                                                const LB& lb, const EP& ep, unsigned slice,
                                                unsigned nblk, float* arena) {
-    const unsigned tn = (N + SPG_BN - 1) / SPG_BN;
-    const unsigned ntiles = ((M + SPG_BM - 1) / SPG_BM) * tn;
+    constexpr unsigned BM = 16 * TM, BN = 16 * TN;
+    const unsigned tn = (N + BN - 1) / BN;
+    const unsigned ntiles = ((M + BM - 1) / BM) * tn;
     for (unsigned tile = slice; tile < ntiles; tile += nblk)
-        sp_gemm_tile((tile / tn) * SPG_BM, (tile % tn) * SPG_BN, M, N, K, la, lb, ep, arena);
+        sp_gemm_tile<LA, LB, EP, TM, TN>((tile / tn) * BM, (tile % tn) * BN, M, N, K, la, lb, ep, arena);
 }
 
 __device__ __forceinline__ bool sp_aligned(const void* p, unsigned bytes) {
@@ -1351,6 +1367,47 @@ struct SpQ8Epi {
         out[(size_t)m * n + c] = silu ? sp_silu(v) : v;
     }
 };
+/* At most this many rows (a stream step, the RNNT predictor and joint) take the GEMV walk. */
+#define SPQ_GEMV_ROWS 8u
+/* A warp per output column walks K in Q8_0 blocks (lane = element), every row's sum in a register,
+ * then one fixed-order warp reduction: bandwidth-bound on the weights, every slice's warps sharing
+ * the columns. */
+static __device__ __forceinline__ void sp_q8_gemv(const float* __restrict__ x, const uint8_t* __restrict__ w,
+                                                  const SpQ8Epi& ep, unsigned m, unsigned n, unsigned k,
+                                                  unsigned slice, unsigned nblk) {
+    const unsigned lane = threadIdx.x & 31u, warp = threadIdx.x >> 5, blocks = k / 32u;
+    /* Every warp reads all rows of x: stage them in shared memory once when they fit. */
+    const bool staged = (size_t)m * k <= SP_ARENA_FLOATS;
+    if (staged) {
+        for (unsigned i = threadIdx.x; i < m * k; i += PLOW_NV_THREADS) sp_smem[i] = x[i];
+        __syncthreads();
+        x = sp_smem;
+    }
+    for (unsigned c = slice * PLOW_NV_WARPS + warp; c < n; c += nblk * PLOW_NV_WARPS) {
+        const uint8_t* row = w + (size_t)c * blocks * 34u;
+        float acc[SPQ_GEMV_ROWS];
+#pragma unroll
+        for (unsigned r = 0; r < SPQ_GEMV_ROWS; r++) acc[r] = 0.f;
+#pragma unroll 4
+        for (unsigned b = 0; b < blocks; b++) {
+            const uint8_t* block = row + b * 34u;
+            const float wv = __fmul_rn(sp_f16(*(const uint16_t*)block), (float)((const int8_t*)(block + 2))[lane]);
+            const float* xk = x + b * 32u + lane;
+#pragma unroll
+            for (unsigned r = 0; r < SPQ_GEMV_ROWS; r++)
+                if (r < m) acc[r] = fmaf(xk[(size_t)r * k], wv, acc[r]);
+        }
+#pragma unroll
+        for (unsigned r = 0; r < SPQ_GEMV_ROWS; r++) {
+            if (r >= m) break;
+            float v = acc[r];
+            for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
+            if (lane == 0) ep(r, c, v);
+        }
+    }
+    if (staged) __syncthreads(); /* the next op may reuse the arena */
+}
+
 static __device__ __noinline__ void d_q8_gemm_f32(float* __restrict__ out, const float* __restrict__ x,
                                      const uint8_t* __restrict__ w, const float* __restrict__ bias,
                                      unsigned m, unsigned n, unsigned k, unsigned activation,
@@ -1358,8 +1415,18 @@ static __device__ __noinline__ void d_q8_gemm_f32(float* __restrict__ out, const
     arena = sp_smem;
     if (k & 31u) { __trap(); return; }
     x += (size_t)a_row0 * k;
-    sp_gemm(m, n, k, SpRowF32{x, k, sp_aligned(x, 16)}, SpRowQ8{w, k},
-            SpQ8Epi{out, bias, n, activation == 1u}, slice, nblk, arena);
+    const SpRowF32 la{x, k, sp_aligned(x, 16)};
+    const SpRowQ8 lb{w, k};
+    const SpQ8Epi ep{out, bias, n, activation == 1u};
+    if (m <= SPQ_GEMV_ROWS) {
+        sp_q8_gemv(x, w, ep, m, n, k, slice, nblk);
+        return;
+    }
+    /* 64x64 tiles when 128x128 ones leave slices idle (the small-M conformer rows). */
+    if (((m + SPG_BM - 1) / SPG_BM) * ((n + SPG_BN - 1) / SPG_BN) < nblk)
+        sp_gemm<4, 4>(m, n, k, la, lb, ep, slice, nblk, arena);
+    else
+        sp_gemm(m, n, k, la, lb, ep, slice, nblk, arena);
 }
 
 /* Conv2dF32 (176). flags (fj1): 1 depthwise, 2 relu, [3:2] out layout, [5:4] in layout,
@@ -2108,14 +2175,90 @@ __device__ __forceinline__ float sp_rel_score(const float* q, const float* k, co
     return (float)((content + relative) / sqrt((double)hw));
 }
 #define SPR_COLS 8
+/* A block per (row, head): a stream step's few query rows (i5 > 0), and full-context attention
+ * (left_chunks = u32::MAX), whose window is too wide for the warp-per-item body. Its warps split the
+ * keys' scores (the same sp_rel_score), then the softmax and the context sums run in key order
+ * exactly as the warp-per-item body does, so the rows match the offline encoder's bit for bit. */
+#define SPR_MAX_KEYS (SP_ARENA_FLOATS / 2u)
+static __device__ __forceinline__ void sp_relative_attention_rows(
+    float* __restrict__ context, const float* __restrict__ query, const float* __restrict__ key,
+    const float* __restrict__ value, const float* __restrict__ position, const float* __restrict__ bias_u,
+    const float* __restrict__ bias_v, unsigned rows, unsigned width, unsigned heads, unsigned chunk,
+    unsigned left_chunks, unsigned key0, unsigned query_row0, unsigned slice, unsigned nblk, unsigned valid) {
+    const unsigned lane = threadIdx.x & 31u, warp = threadIdx.x >> 5, hw = width / heads;
+    float* scores = sp_smem;
+    float* probs = sp_smem + SPR_MAX_KEYS;
+    for (unsigned item = query_row0 * heads + slice; item < rows * heads; item += nblk) {
+        const unsigned qr = item / heads, head = item - qr * heads;
+        if (qr >= valid) {
+            /* A padded row: nothing reads it, but it must not hold a stale or non-finite value. */
+            for (unsigned c = threadIdx.x; c < hw; c += PLOW_NV_THREADS)
+                context[(size_t)qr * width + (size_t)head * hw + c] = 0.f;
+            continue;
+        }
+        unsigned first = 0, last = valid;
+        if (left_chunks != 0xFFFFFFFFu) {
+            const unsigned qc = qr / chunk;
+            first = (qc > left_chunks ? qc - left_chunks : 0u) * chunk;
+            last = (qc + 1u) * chunk;
+            if (last > rows) last = rows;
+        }
+        if (first < key0) first = key0 < last ? key0 : last - 1u;
+        if (last - first > SPR_MAX_KEYS) { __trap(); return; }
+        const size_t ho = (size_t)head * hw;
+        const float* q = query + (size_t)qr * width + ho;
+        for (unsigned kr = first + warp; kr < last; kr += PLOW_NV_WARPS) {
+            const float s = sp_rel_score(q, key + (size_t)kr * width + ho,
+                                         position + (size_t)(rows - 1u + kr - qr) * width + ho, bias_u + ho,
+                                         bias_v + ho, hw, lane);
+            if (lane == 0) scores[kr - first] = s;
+        }
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            float mx = -INFINITY;
+            for (unsigned kr = first; kr < last; kr++) mx = fmaxf(mx, scores[kr - first]);
+            float den = 0.f;
+            for (unsigned kr = first; kr < last; kr++) den = __fadd_rn(den, sp_expf(__fsub_rn(scores[kr - first], mx)));
+            for (unsigned kr = first; kr < last; kr++)
+                probs[kr - first] = __fdiv_rn(sp_expf(__fsub_rn(scores[kr - first], mx)), den);
+        }
+        __syncthreads();
+        for (unsigned c = threadIdx.x; c < hw; c += PLOW_NV_THREADS) {
+            float acc = 0.f;
+            for (unsigned kr = first; kr < last; kr++)
+                acc = __fadd_rn(acc, __fmul_rn(probs[kr - first], value[(size_t)kr * width + ho + c]));
+            context[(size_t)qr * width + ho + c] = acc;
+        }
+        __syncthreads();
+    }
+}
 static __device__ __noinline__ void d_relative_attention_f32(float* __restrict__ context, const float* __restrict__ query,
                                                 const float* __restrict__ key, const float* __restrict__ value,
                                                 const float* __restrict__ position, const float* __restrict__ bias_u,
                                                 const float* __restrict__ bias_v, unsigned rows, unsigned width,
                                                 unsigned heads, unsigned chunk, unsigned left_chunks,
-                                                unsigned slice, unsigned nblk) {
+                                                unsigned slice, unsigned nblk,
+                                                const unsigned* __restrict__ key_start = nullptr,
+                                                unsigned query_row0 = 0) {
     const unsigned lane = threadIdx.x & 31u, warp = threadIdx.x >> 5, hw = width / heads;
-    for (unsigned item = slice * PLOW_NV_WARPS + warp; item < rows * heads; item += nblk * PLOW_NV_WARPS) {
+    if (left_chunks == 0xFFFFFFFFu) {
+        /* Full context, t7 (optional): the valid rows of a padded bucket. Later keys are masked
+         * and later query rows written as zeros. */
+        const unsigned valid = key_start && *key_start < rows ? *key_start : rows;
+        sp_relative_attention_rows(context, query, key, value, position, bias_u, bias_v, rows, width, heads, chunk,
+                                   left_chunks, 0u, query_row0, slice, nblk, valid);
+        return;
+    }
+    /* t7 (optional): keys before this row are not filled yet (a stream's first chunks). */
+    const unsigned key0 = key_start ? *key_start : 0u;
+    if (query_row0 != 0u) {
+        sp_relative_attention_rows(context, query, key, value, position, bias_u, bias_v, rows, width, heads, chunk,
+                                   left_chunks, key0, query_row0, slice, nblk, rows);
+        return;
+    }
+    /* i5: only query rows from here on are wanted (a stream step's new rows). */
+    for (unsigned item = query_row0 * heads + slice * PLOW_NV_WARPS + warp; item < rows * heads;
+         item += nblk * PLOW_NV_WARPS) {
         const unsigned qr = item / heads, head = item - qr * heads;
         unsigned first = 0, last = rows;
         if (left_chunks != 0xFFFFFFFFu) {
@@ -2124,6 +2267,7 @@ static __device__ __noinline__ void d_relative_attention_f32(float* __restrict__
             last = (qc + 1u) * chunk;
             if (last > rows) last = rows;
         }
+        if (first < key0) first = key0 < last ? key0 : last - 1u;
         const size_t ho = (size_t)head * hw;
         const float* q = query + (size_t)qr * width + ho;
         const float* u = bias_u + ho;
@@ -2197,6 +2341,9 @@ __device__ __forceinline__ void sp_with_act(unsigned kind, float p1, const B& bo
     case 13: body([p1](float x, float p0) { return fminf(fmaxf(x, p0), p1); }); break;
     case 14: body([p1](float x, float p0) { return __fadd_rn(__fmul_rn(x, p0), p1); }); break;
     case 15: body([](float x, float) { return x > 0.0f ? x : 0.0f; }); break;
+    case 16: body([](float x, float) { return sqrtf(x); }); break;
+    case 17: body([](float x, float) { return sp_gelu_tanh(x); }); break;
+    case 18: body([](float x, float) { return sp_bf16(x); }); break;
     default: body([](float x, float) { return x; }); break;
     }
 }
@@ -2217,6 +2364,9 @@ __device__ __forceinline__ float sp_act(unsigned kind, float x, float p0, float 
     case 13: return fminf(fmaxf(x, p0), p1);
     case 14: return __fadd_rn(__fmul_rn(x, p0), p1);
     case 15: return x > 0.0f ? x : 0.0f;
+    case 16: return sqrtf(x);
+    case 17: return sp_gelu_tanh(x);
+    case 18: return sp_bf16(x);
     default: return x;
     }
 }
@@ -3459,7 +3609,8 @@ static __device__ __noinline__ void d_conv1d_f32(const PlowDevInst* in, void* co
  * One block per (item, head, 64-query tile); BK-key
  * tiles staged through smem; a thread owns 4 query
  * rows x 4*BK/64 keys of S and 4 rows x head_width/16 columns of O, with the row statistics
- * reduced over its 16-lane group. */
+ * reduced over its 16-lane group. RAGGED: head_width i4 < HW (a multiple of 8, e.g. 72) in the
+ * HW layout, zero-padded columns staged, unused output columns not stored. */
 #define SPF_BQ 64
 #define SPF_LDP (SPF_BQ + 4)
 template <int HW, int BK>
@@ -3469,10 +3620,10 @@ struct SpfShape {
     static constexpr int LDK = BK + 4 > (BK * SPF_LDP + HW - 1) / HW ? BK + 4 : (BK * SPF_LDP + HW - 1) / HW;
     static constexpr int FLOATS = HW * LDQ + HW * LDK + BK * LDV;
 };
-static_assert(SP_ARENA_FLOATS >= SpfShape<128, 64>::FLOATS && SP_ARENA_FLOATS >= SpfShape<64, 128>::FLOATS,
-              "attention stages");
+static_assert(SP_ARENA_FLOATS >= SpfShape<64, 128>::FLOATS, "attention stages");
+static_assert(!SPF_HD128 || SP_ARENA_FLOATS >= SpfShape<128, 64>::FLOATS, "attention stages");
 
-template <int HW, int BK>
+template <int HW, int BK, bool RAGGED = false>
 static __device__ __noinline__ void sp_attention_f32(const PlowDevInst* in, void* const* T, unsigned slice,
                                         unsigned nblk, float* arena) {
     arena = sp_smem;
@@ -3492,7 +3643,8 @@ static __device__ __noinline__ void sp_attention_f32(const PlowDevInst* in, void
     const unsigned pre = prefix ? in->i[7] : 0u;
     const float* bias = prefix ? nullptr : (const float*)SP_TEN(5);
     const unsigned batch = in->i[0], q_rows = in->i[1], kv_rows = in->i[2], heads = in->i[3];
-    const unsigned width = heads * HW, stride = in->i[5] ? in->i[5] : width;
+    const unsigned hw = RAGGED ? in->i[4] : (unsigned)HW;
+    const unsigned width = heads * hw, stride = in->i[5] ? in->i[5] : width;
     const bool causal = in->i[6] & 1u;
     const unsigned bias_hs = in->i[7], k_col0 = in->fj[1].u, v_col0 = in->fj[2].u;
     const float scale = in->fj[0].f;
@@ -3515,7 +3667,8 @@ static __device__ __noinline__ void sp_attention_f32(const PlowDevInst* in, void
             for (unsigned p = 0; p < QPER; p++) {
                 const unsigned e = tid + p * PLOW_NV_THREADS, r = e / D4, d = (e - r * D4) * 4u;
                 qv[p] = make_float4(0.f, 0.f, 0.f, 0.f);
-                if (q0 + r < q_rows) qv[p] = sp_ld4(query + ((size_t)b * q_rows + q0 + r) * stride + h * HW + d, vec);
+                if (q0 + r < q_rows && (!RAGGED || d < hw))
+                    qv[p] = sp_ld4(query + ((size_t)b * q_rows + q0 + r) * stride + h * hw + d, vec);
             }
             __syncthreads();
 #pragma unroll
@@ -3540,12 +3693,13 @@ static __device__ __noinline__ void sp_attention_f32(const PlowDevInst* in, void
             for (unsigned p = 0; p < PER; p++) {
                 const unsigned e = tid + p * PLOW_NV_THREADS, j = e / D4, d = (e - j * D4) * 4u;
                 kr[p] = vr[p] = make_float4(0.f, 0.f, 0.f, 0.f);
-                if (k0 + j < pre && k0 + j < kend) {
-                    const size_t pb = ((size_t)pidx[b] * pre + k0 + j) * (2u * width) + h * HW + d;
+                if (RAGGED && d >= hw) {
+                } else if (k0 + j < pre && k0 + j < kend) {
+                    const size_t pb = ((size_t)pidx[b] * pre + k0 + j) * (2u * width) + h * hw + d;
                     kr[p] = sp_ld4(prefix + pb, vec);
                     vr[p] = sp_ld4(prefix + pb + width, vec);
                 } else if (k0 + j < kend) {
-                    const size_t base = ((size_t)b * kv_rows + k0 + j - pre) * stride + h * HW + d;
+                    const size_t base = ((size_t)b * kv_rows + k0 + j - pre) * stride + h * hw + d;
                     kr[p] = sp_ld4(key + base + k_col0, vec);
                     vr[p] = sp_ld4(value + base + v_col0, vec);
                 }
@@ -3565,7 +3719,7 @@ static __device__ __noinline__ void sp_attention_f32(const PlowDevInst* in, void
 #pragma unroll
                 for (int j = 0; j < 4 * KG; j++) s[i][j] = 0.f;
 #pragma unroll 8
-            for (int d = 0; d < HW; d++) {
+            for (int d = 0; d < (int)hw; d++) {
                 const float4 qa = *(const float4*)(Qs + d * LDQ + ty * 4);
                 const float av[4] = {qa.x, qa.y, qa.z, qa.w};
 #pragma unroll
@@ -3641,9 +3795,10 @@ static __device__ __noinline__ void sp_attention_f32(const PlowDevInst* in, void
             const unsigned r = q0 + ty * 4 + i;
             if (r >= q_rows) continue;
             const float inv = lrow[i] > 0.f ? 1.0f / lrow[i] : 0.f;
-            float* orow = out + ((size_t)b * q_rows + r) * width + h * HW;
+            float* orow = out + ((size_t)b * q_rows + r) * width + h * hw;
 #pragma unroll
             for (int cb = 0; cb < CB; cb++)
+                if (!RAGGED || cb * 64 + tx * 4 < hw)
                 *(float4*)(orow + cb * 64 + tx * 4) =
                     make_float4(o[i][cb * 4] * inv, o[i][cb * 4 + 1] * inv, o[i][cb * 4 + 2] * inv,
                                 o[i][cb * 4 + 3] * inv);
@@ -4499,7 +4654,185 @@ static __device__ __noinline__ void d_attention_f32(const PlowDevInst* in, void*
         else sp_attention_tc64(in, T, slice, nblk, arena);
     }
     else if (in->i[4] == 64u) sp_attention_f32<64, 128>(in, T, slice, nblk, arena);
-    else if (in->i[4] == 128u) sp_attention_f32<128, 64>(in, T, slice, nblk, arena);
+    else if (in->i[4] == 128u) {
+#if SPF_HD128
+        sp_attention_f32<128, 64>(in, T, slice, nblk, arena);
+#else
+        __trap();
+#endif
+    }
+    else if (in->i[4] < 128u && in->i[4] % 8u == 0u) {
+#if SPF_HD128
+        sp_attention_f32<128, 64, true>(in, T, slice, nblk, arena);
+#else
+        __trap();
+#endif
+    } else {
+        __trap();
+    }
+}
+
+/* ---- multimodal encoder primitives (206-208): contracts in packet::dev::DevOp ----------------- */
+
+/* RmsNormF32 (206): grouped RMSNorm, `out[r][g*gs + c] = x * (mean_c x^2 + eps)^-1/2 * gamma`. */
+static __device__ __noinline__ void d_rmsnorm_f32(const PlowDevInst* in, void* const* T, unsigned slice, unsigned nblk) {
+    float* out = (float*)SP_TEN(0);
+    const float* x = (const float*)SP_TEN(1);
+    const float* gamma = (const float*)SP_TEN(2);
+    const unsigned rows = in->i[0], groups = in->i[1], gw = in->i[2], flags = in->i[4];
+    const unsigned gs = in->i[5] ? in->i[5] : gw;
+    const unsigned stride = in->i[3] ? in->i[3] : groups * gs;
+    const float eps = in->fj[0].f;
+    const unsigned lane = threadIdx.x & 31u, warp = threadIdx.x >> 5;
+    const unsigned units = rows * groups;
+    for (unsigned u = slice * PLOW_NV_WARPS + warp; u < units; u += nblk * PLOW_NV_WARPS) {
+        const unsigned r = u / groups, g = u - r * groups;
+        const float* xr = x + (size_t)r * stride + (size_t)g * gs;
+        float* orow = out + (size_t)r * stride + (size_t)g * gs;
+        float s = 0.f;
+        for (unsigned c = lane; c < gw; c += 32u) s = fmaf(xr[c], xr[c], s);
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) s += __shfl_xor_sync(0xffffffffu, s, o);
+        const float inv = __frcp_rn(sqrtf(__fadd_rn(__fdiv_rn(s, (float)gw), eps)));
+        for (unsigned c = lane; c < gw; c += 32u) {
+            float v = __fmul_rn(xr[c], inv);
+            if (gamma) v = __fmul_rn(v, gamma[(flags & 1u) ? g * gw + c : c]);
+            orow[c] = (flags & 2u) ? sp_bf16(v) : v;
+        }
+    }
+}
+
+/* RopeAxialF32 (207): in-place rotate-half RoPE per axis segment of each head. */
+static __device__ __noinline__ void d_rope_axial_f32(const PlowDevInst* in, void* const* T, unsigned slice, unsigned nblk) {
+    float* x = (float*)SP_TEN(0);
+    const unsigned* pos = (const unsigned*)SP_TEN(1);
+    const unsigned rows = in->i[0], heads = in->i[1], hw = in->i[2], axes = in->i[4], flags = in->i[6];
+    const unsigned hs = in->i[5] ? in->i[5] : hw;
+    const unsigned stride = in->i[3] ? in->i[3] : heads * hs;
+    if (!axes || hw % (2u * axes)) return;
+    const unsigned seg = hw / axes, half = seg / 2u;
+    const float theta = in->fj[0].f;
+    const unsigned n = rows * heads * axes * half;
+    const bool b16 = flags & 1u;
+    for (unsigned e = slice * PLOW_NV_THREADS + threadIdx.x; e < n; e += nblk * PLOW_NV_THREADS) {
+        unsigned rest = e;
+        const unsigned i = rest % half;
+        rest /= half;
+        const unsigned a = rest % axes;
+        rest /= axes;
+        const unsigned h = rest % heads;
+        const unsigned r = rest / heads;
+        const float inv = __fdiv_rn(1.0f, powf(theta, __fdiv_rn((float)(2u * i), (float)seg)));
+        const float ang = __fmul_rn((float)pos[(size_t)r * axes + a], inv);
+        float c = cosf(ang), s = sinf(ang);
+        float* p = x + (size_t)r * stride + (size_t)h * hs + (size_t)a * seg + i;
+        const float x1 = p[0], x2 = p[half];
+        if (b16) {
+            c = sp_bf16(c);
+            s = sp_bf16(s);
+            p[0] = sp_bf16(__fadd_rn(sp_bf16(__fmul_rn(x1, c)), sp_bf16(__fmul_rn(-x2, s))));
+            p[half] = sp_bf16(__fadd_rn(sp_bf16(__fmul_rn(x2, c)), sp_bf16(__fmul_rn(x1, s))));
+        } else {
+            p[0] = __fsub_rn(__fmul_rn(x1, c), __fmul_rn(x2, s));
+            p[half] = __fadd_rn(__fmul_rn(x2, c), __fmul_rn(x1, s));
+        }
+    }
+}
+
+/* ChunkAttentionF32 (208): blocked local attention with a Transformer-XL relative term and a tanh
+ * logit cap (the USM / Gemma-4 audio conformer). One unit per (chunk, head). */
+static __device__ __noinline__ void d_chunk_attention_f32(const PlowDevInst* in, void* const* T, unsigned slice,
+                                                          unsigned nblk, float* arena) {
+    float* out = (float*)SP_TEN(0);
+    const float* q = (const float*)SP_TEN(1);
+    const float* k = (const float*)SP_TEN(2);
+    const float* v = (const float*)SP_TEN(3);
+    const float* relk = (const float*)SP_TEN(4);
+    const float* qscale = (const float*)SP_TEN(5);
+    const unsigned* valid_p = (const unsigned*)SP_TEN(6);
+    const unsigned rows = in->i[0], heads = in->i[1], D = in->i[2], C = in->i[3];
+    const unsigned past = in->i[4], future = in->i[5], P = in->i[6];
+    const unsigned left = in->i[7] & 0xFFFFu, right = in->i[7] >> 16;
+    const float kscale = in->fj[0].f, cap = in->fj[1].f;
+    const unsigned W = C + past + future, width = heads * D;
+    const unsigned valid = valid_p ? min(valid_p[0], rows) : rows;
+    arena = sp_smem;
+    float* sq = arena;
+    float* sk = sq + C * D;
+    float* sv = sk + W * D;
+    float* sr = sv + W * D;
+    float* sbd = sr + P * D;
+    float* sl = sbd + C * P;
+    if ((size_t)(sl + C * W - arena) > SP_ARENA_FLOATS) {
+        __trap();
+        return;
+    }
+    const unsigned chunks = (rows + C - 1u) / C;
+    for (unsigned u = slice; u < chunks * heads; u += nblk) {
+        const unsigned b = u / heads, h = u - b * heads;
+        __syncthreads();
+        for (unsigned e = threadIdx.x; e < C * D; e += PLOW_NV_THREADS) {
+            const unsigned i = e / D, d = e - i * D, row = b * C + i;
+            sq[e] = row < rows ? __fmul_rn(q[(size_t)row * width + h * D + d], qscale ? qscale[d] : 1.f) : 0.f;
+        }
+        for (unsigned e = threadIdx.x; e < W * D; e += PLOW_NV_THREADS) {
+            const unsigned j = e / D, d = e - j * D;
+            const int row = (int)(b * C + j) - (int)past;
+            const bool ok = row >= 0 && (unsigned)row < rows;
+            sk[e] = ok ? __fmul_rn(k[(size_t)row * width + h * D + d], kscale) : 0.f;
+            sv[e] = ok ? v[(size_t)row * width + h * D + d] : 0.f;
+        }
+        for (unsigned e = threadIdx.x; e < P * D; e += PLOW_NV_THREADS) {
+            const unsigned p = e / D, d = e - p * D;
+            sr[e] = relk[(size_t)p * width + h * D + d];
+        }
+        __syncthreads();
+        for (unsigned e = threadIdx.x; e < C * P; e += PLOW_NV_THREADS) {
+            const unsigned i = e / P, p = e - i * P;
+            float s = 0.f;
+            for (unsigned d = 0; d < D; d++) s = fmaf(sq[i * D + d], sr[p * D + d], s);
+            sbd[e] = s;
+        }
+        __syncthreads();
+        for (unsigned e = threadIdx.x; e < C * W; e += PLOW_NV_THREADS) {
+            const unsigned i = e / W, j = e - i * W;
+            float s = 0.f;
+            for (unsigned d = 0; d < D; d++) s = fmaf(sq[i * D + d], sk[j * D + d], s);
+            /* rel_shift: row i of the [C][P] term padded to W + 1 columns, read flat at i*W + j. */
+            const unsigned f = i * W + j, rr = f / (W + 1u), cc = f - rr * (W + 1u);
+            s = __fadd_rn(s, cc < P ? sbd[rr * P + cc] : 0.f);
+            s = __fmul_rn(tanhf(__fdiv_rn(s, cap)), cap);
+            const int qa = (int)(b * C + i), ka = (int)(b * C + j) - (int)past, dist = qa - ka;
+            const bool ok = ka >= 0 && (unsigned)ka < valid &&
+                            ((dist >= 0 && (unsigned)dist < left) || (dist < 0 && (unsigned)(-dist) < right));
+            sl[e] = ok ? s : -INFINITY;
+        }
+        __syncthreads();
+        const unsigned lane = threadIdx.x & 31u, warp = threadIdx.x >> 5;
+        for (unsigned i = warp; i < C; i += PLOW_NV_WARPS) {
+            float m = -INFINITY;
+            for (unsigned j = lane; j < W; j += 32u) m = fmaxf(m, sl[i * W + j]);
+            m = sp_warp_max(m);
+            float z = 0.f;
+            for (unsigned j = lane; j < W; j += 32u) {
+                const float p = m == -INFINITY ? 0.f : expf(sl[i * W + j] - m);
+                sl[i * W + j] = p;
+                z += p;
+            }
+#pragma unroll
+            for (int o = 16; o > 0; o >>= 1) z += __shfl_xor_sync(0xffffffffu, z, o);
+            const float inv = z > 0.f ? __frcp_rn(z) : 0.f;
+            __syncwarp();
+            const unsigned row = b * C + i;
+            if (row >= rows) continue;
+            for (unsigned d = lane; d < D; d += 32u) {
+                float acc = 0.f;
+                for (unsigned j = 0; j < W; j++) acc = fmaf(sl[i * W + j], sv[j * D + d], acc);
+                out[(size_t)row * width + h * D + d] = __fmul_rn(acc, inv);
+            }
+        }
+    }
+    __syncthreads();
 }
 
 /* An op outside PLOW_SPEECH_OPS traps; its arm is dead code. */
@@ -4536,7 +4869,7 @@ static __device__ __noinline__ void d_speech_f32(const PlowDevInst* in, void* co
         d_relative_attention_f32((float*)SP_TEN(0), (const float*)SP_TEN(1), (const float*)SP_TEN(2),
                                  (const float*)SP_TEN(3), (const float*)SP_TEN(4), (const float*)SP_TEN(5),
                                  (const float*)SP_TEN(6), in->i[0], in->i[1], in->i[2], in->i[3], in->i[4],
-                                 slice, nblk);
+                                 slice, nblk, (const unsigned*)SP_TEN(7), in->i[5]);
         break;
     SP_CASE(SILU_F32)
         d_silu_f32((float*)SP_TEN(0), (const float*)SP_TEN(1), in->i[0], slice, nblk);
@@ -4606,6 +4939,9 @@ static __device__ __noinline__ void d_speech_f32(const PlowDevInst* in, void* co
     SP_CASE(CUMSUM_F64) d_cumsum_f64(in, T, slice, nblk, arena); break;
     SP_CASE(RAND_F32) d_rand_f32(in, T, slice, nblk); break;
     SP_CASE(ATTENTION_F32) d_attention_f32(in, T, slice, nblk, arena); break;
+    case PLOW_DOP_RMSNORM_F32: d_rmsnorm_f32(in, T, slice, nblk); break;
+    case PLOW_DOP_ROPE_AXIAL_F32: d_rope_axial_f32(in, T, slice, nblk); break;
+    case PLOW_DOP_CHUNK_ATTENTION_F32: d_chunk_attention_f32(in, T, slice, nblk, arena); break;
     SP_CASE(ROW_STATS_F32)
         d_layernorm_f32(nullptr, (const float*)SP_TEN(1), nullptr, nullptr, in->i[0], in->i[1], in->i[2], in->fj[0].f,
                         slice, nblk, arena, (float*)SP_TEN(0));

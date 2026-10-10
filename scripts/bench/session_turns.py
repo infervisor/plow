@@ -14,7 +14,7 @@ resends the whole history. Prints per-turn prompt tokens, TTFT and usage cached_
 --dump writes every turn's tokens and logprobs; --compare REF diffs them against a dump from a
 cache-off (cold) server: cached and cold greedy logprobs must be identical.
 """
-import argparse, json, os, random, statistics, time, urllib.request, uuid
+import argparse, json, os, random, statistics, time, urllib.error, urllib.request, uuid
 from concurrent.futures import ThreadPoolExecutor
 
 WORDS = ("the quick brown fox jumps over the lazy dog while a gentle breeze moves through the tall "
@@ -46,7 +46,11 @@ def stream_turn(url, body, headers):
                                  headers={"Content-Type": "application/json", **headers})
     t0 = time.perf_counter()
     ttft, text, tokens, lps, usage = None, [], [], [], None
-    with urllib.request.urlopen(req, timeout=600) as r:
+    try:
+        r = urllib.request.urlopen(req, timeout=600)
+    except urllib.error.HTTPError as e:
+        raise RuntimeError(f"HTTP {e.code}: {e.read()[:300]!r} (prompt chars {len(body['prompt'])})") from None
+    with r:
         for line in r:
             line = line.decode().strip()
             if not line.startswith("data:") or line == "data: [DONE]":

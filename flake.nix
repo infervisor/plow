@@ -661,6 +661,69 @@
             '';
           };
         }
+        # The generated-kernel catalog's generator (scripts/gen_kernels/build_catalog.py).
+        # gen_kernels.json pins each body by sha256, so the generator must be exactly the one
+        # that tuned it: TileLang 0.1.12 with its tested apache-tvm-ffi 0.1.11 and z3 4.15.4
+        # (nixpkgs carries newer ones, outside tilelang's declared bounds), all PyPI wheels by
+        # hash. torch is only imported (tilelang preloads it); no GPU is needed for `build`.
+        #   nix develop .#tilelang --command python3 scripts/gen_kernels/build_catalog.py build OUT
+        // pkgs.lib.optionalAttrs isGpuHost {
+          tilelang = let
+            py = pkgs.python3Packages;
+            wheel = { pname, version, url, sha256, deps ? [ ], libs ? [ ] }:
+              py.buildPythonPackage {
+                inherit pname version;
+                format = "wheel";
+                src = pkgs.fetchurl { inherit url sha256; };
+                nativeBuildInputs = [ pkgs.autoPatchelfHook ];
+                buildInputs = [ pkgs.stdenv.cc.cc.lib pkgs.zlib ] ++ libs;
+                dependencies = deps;
+                # The wheels' RUNPATHs reach sibling packages through $ORIGIN/../../<pkg>/lib,
+                # which separate store paths break; resolve them explicitly instead.
+                preFixup = pkgs.lib.concatMapStrings (d: ''
+                  addAutoPatchelfSearchPath ${d}/${pkgs.python3.sitePackages}
+                '') libs;
+                dontCheckRuntimeDeps = true;
+                pythonImportsCheck = [ ];
+              };
+            tvmFfi = wheel {
+              pname = "apache-tvm-ffi";
+              version = "0.1.11";
+              url = "https://files.pythonhosted.org/packages/4d/18/95569107ee83619d61a3bb0d28743a0599f85c5161981e3e098c82c2b185/apache_tvm_ffi-0.1.11-cp312-abi3-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl";
+              sha256 = "2843f084cdc94dedacd8b257a395a2b71b8a3dc7fc99711b148bf1d161983128";
+              deps = [ py.typing-extensions ];
+            };
+            z3 = wheel {
+              pname = "z3-solver";
+              version = "4.15.4.0";
+              url = "https://files.pythonhosted.org/packages/21/c9/bb51a96af0091324c81b803f16c49f719f9f6ea0b0bb52200f5c97ec4892/z3_solver-4.15.4.0-py3-none-manylinux_2_17_x86_64.manylinux2014_x86_64.whl";
+              sha256 = "7e103a6f203f505b8b8b8e5c931cc407c95b61556512d4921c1ddc0b3f41b08e";
+            };
+            tilelang = wheel {
+              pname = "tilelang";
+              version = "0.1.12";
+              url = "https://files.pythonhosted.org/packages/d1/53/f281a0bd9ee7e03d6a97828fc0e443321ed26ea2b0bd74bf9f1d9451d30f/tilelang-0.1.12-cp38-abi3-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl";
+              sha256 = "bbeb5573cbe2544a51a5c9a6cc737c5e3b5c2d95411caa3687fd9b08eb9d5f97";
+              deps = [ tvmFfi z3 py.torch py.cloudpickle py.ml-dtypes py.numpy py.psutil py.tqdm py.typing-extensions ];
+              libs = [ tvmFfi z3 ];
+            };
+          in pkgs.mkShell {
+            name = "plow-tilelang";
+            packages = [ (pkgs.python3.withPackages (_: [ tilelang ])) gpu.cudatoolkit ];
+            shellHook = ''
+              export PLOW_NVCC=${gpu.cudatoolkit}/bin/nvcc
+              export PLOW_NVCC_PATH=${gpu.nvccPath}
+              export NVCC_PREPEND_FLAGS='${gpu.nvccCcbin}'
+              export CUDA_HOME=${gpu.cudatoolkit}
+              # tilelang.compile's own nvcc call takes its host compiler from CXX.
+              export CXX=${gpu.cuda.backendStdenv.cc}/bin/c++
+              export TILELANG_DISABLE_CACHE=1
+              # torch-c-dlpack-ext is an optional, torch-ABI-specific accelerator; not used here.
+              export TVM_FFI_DISABLE_TORCH_C_DLPACK=1
+              echo "plow tilelang shell — tilelang $(python3 -c 'import importlib.metadata as m; print(m.version("tilelang"))')"
+            '';
+          };
+        }
         # vllm is OPTIONAL: a comparison/baseline tool, not a build input, and
         # its closure is torch-sized. Same per-task-shell rule as `quantize`:
         #   nix develop .#vllm

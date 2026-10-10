@@ -2896,7 +2896,10 @@ __device__ void d_flash_prefill(float* __restrict__ Opart, float* __restrict__ m
                                 unsigned kv_stride, unsigned kv_mask, float scale, unsigned slice,
                                 unsigned nblk, float* lds,
                                 const float* __restrict__ k_scale = nullptr,
-                                const float* __restrict__ v_scale = nullptr) {
+                                const float* __restrict__ v_scale = nullptr,
+                                const unsigned* __restrict__ span = nullptr) {
+    /* `span` (MmSpanExtent, indexed by this call's query row): row r also attends keys up to
+     * min(q + span[r], seq_kv - 1), i.e. the rest of its media item. Null = causal. */
     static_assert(HD % 32 == 0, "HD must be a multiple of the warp width");
     static_assert(HD % 16 == 0 && BQ % 16 == 0 && BKV % 16 == 0, "mma m16n8k16 tiling");
     constexpr int PAD = FA_PRE_PAD;
@@ -2995,6 +2998,14 @@ __device__ void d_flash_prefill(float* __restrict__ Opart, float* __restrict__ m
         /* Newest absolute query position in this q-tile (upper bound; pad rows are dropped in the
          * epilogue). Drives whole-tile skips so a sliding layer is O(window), not O(ctx). */
         const int qabs_max = (int)(q_pos0 + q0 + BQ - 1);
+        /* Exclusive key bound of the tile: span rows reach past the diagonal. Their bound is
+         * monotone in the row (a span's rows share one end), so the last real row has the max. */
+        int kv_end = qabs_max + 1;
+        if (span) {
+            const unsigned last = (q0 + BQ < seq_q ? q0 + BQ : seq_q) - 1;
+            const int reach = (int)min(q_pos0 + last + 1 + span[last], seq_kv);
+            if (reach > kv_end) kv_end = reach;
+        }
         /* Jump straight to the first attended tile on a sliding layer: the OLDEST query in the tile
          * (qabs_min = q_pos0+q0) attends nothing below qabs_min-window+1, so start the loop there.
          * Align down to BKV, never below `lo`. The union of every query's window over the tile is the
@@ -3007,7 +3018,7 @@ __device__ void d_flash_prefill(float* __restrict__ Opart, float* __restrict__ m
         }
         for (unsigned kv0 = eff_lo; kv0 < hi; kv0 += BKV) {
             /* CAUSAL: once a KV tile starts beyond the newest query, no later tile is attended. */
-            if ((int)kv0 > qabs_max) break;
+            if ((int)kv0 >= kv_end) break;
             /* NO per-tile sliding skip here: the earlier "skip a tile below the NEWEST query's window
              * floor (qabs_max - (kv0+BKV-1) >= window)" was WRONG — it dropped tiles the OLDER queries
              * in the tile still attend (the trailing-window edge, ~BQ positions), silently corrupting
@@ -3075,6 +3086,9 @@ __device__ void d_flash_prefill(float* __restrict__ Opart, float* __restrict__ m
             for (int rr = 0; rr < RPW_S; rr++) {
                 const int row = warp * RPW_S + rr;
                 const int qabs = (int)(q_pos0 + q0 + row);
+                int lim = qabs + 1;
+                if (span && q0 + row < seq_q)
+                    lim = max(lim, (int)min(q_pos0 + q0 + row + 1 + span[q0 + row], seq_kv));
                 float sv[SOFT_COLS];
                 bool active[SOFT_COLS];
 #pragma unroll
@@ -3084,8 +3098,8 @@ __device__ void d_flash_prefill(float* __restrict__ Opart, float* __restrict__ m
                     const unsigned col = lane + sc * 32;
                     if (col < rmax) {
                         const int kv = (int)kv0 + col;
-                        bool masked = (kv > qabs);
-                        if (window) masked |= ((unsigned)(qabs - kv) >= window);
+                        bool masked = (kv >= lim);
+                        if (window && kv <= qabs) masked |= ((unsigned)(qabs - kv) >= window);
                         if (!masked) { sv[sc] = Ss[row * BKV + col]; active[sc] = true; }
                     }
                 }
@@ -5333,10 +5347,14 @@ __device__ void d_flash_prefill_fp8_mux(
     const float* __restrict__ k_scale, const float* __restrict__ v_scale,
     unsigned seq_q, unsigned seq_kv, unsigned n_head, unsigned n_kv_head,
     unsigned q_pos0, unsigned window, unsigned nsplit, unsigned kv_stride,
-    unsigned kv_mask, float scale, unsigned slice, unsigned nblk, float* lds) {
+    unsigned kv_mask, float scale, unsigned slice, unsigned nblk, float* lds,
+    const unsigned* __restrict__ span = nullptr) {
     const unsigned count = req ? (unsigned)req[0] : 1;
+#if PLOW_NV_FA_PIPE
+    if (span) __trap(); /* bidirectional media spans: only the PIPE=0 arm masks them */
+#endif
 #if PLOW_NV_FP8_PACKED_VARLEN && (!PLOW_NV_FA_PIPE || PLOW_NV_FA_FP8MMA)
-    if (HD == 256 && req && O && nsplit == 1) {
+    if (HD == 256 && req && O && nsplit == 1 && !span) {
         unsigned total = 0;
         for (unsigned r = 0; r < count; ++r)
             total += ((unsigned)req[2 + 4*r] + 63) / 64 * n_head;
@@ -5397,7 +5415,8 @@ __device__ void d_flash_prefill_fp8_mux(
         __trap();
 #endif
 #else
-        d_flash_prefill<HD, HD == 256 ? 64 : 32, HD == 256 ? 32 : 16, true>(PLOW_FP8_REQUEST_ARGS);
+        d_flash_prefill<HD, HD == 256 ? 64 : 32, HD == 256 ? 32 : 16, true>(
+            PLOW_FP8_REQUEST_ARGS, span ? span + q0 : nullptr);
 #endif
 #undef PLOW_FP8_REQUEST_ARGS
         __syncthreads();

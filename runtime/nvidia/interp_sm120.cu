@@ -229,8 +229,8 @@ extern "C" __device__ unsigned plow_pdl_wait_1 = 1;
 #endif
 #if PLOW_NV_PACKED_REQUEST
 #define PLOW_PF_REQ_ARG , (const int*)TEN(7)
-#if !defined(PLOW_NV_HOPPER) || !PLOW_NV_HOPPER || !PLOW_NV_PREFILL
-#error "packed request ABI requires Hopper prefill"
+#if !((defined(PLOW_NV_HOPPER) && PLOW_NV_HOPPER) || (defined(PLOW_NV_ADA) && PLOW_NV_ADA)) || !PLOW_NV_PREFILL
+#error "packed request ABI requires Hopper or Ada prefill"
 #endif
 extern "C" __device__ __constant__ unsigned plow_pf_request_abi = 2;
 #if defined(PLOW_NV_MASKED_PADDING) && PLOW_NV_MASKED_PADDING
@@ -1067,8 +1067,23 @@ static_assert(PLOW_NV_GEMV_STAGING_BYTES <= PLOW_NV_BASE_ARENA_FLOATS * sizeof(f
 #endif
 #define PLOW_NV_NON_FP8_ARENA_FLOATS                                                          \
     (PLOW_NV_BASE_ARENA_FLOATS > PLOW_NV_M16_ARENA_FLOATS ? PLOW_NV_BASE_ARENA_FLOATS : PLOW_NV_M16_ARENA_FLOATS)
-#define PLOW_NV_ARENA_FLOATS00                                                                \
+/* The tensor-core W8A16 GEMV's K-split reduction joins the launch claim (the 26B-A4B decode
+ * attention arena is smaller than the 12B's, which covered it), and behind it the wide-ladder
+ * fp8 MoE dedupe slot tables (op_moe.cuh PLOW_DD_DYN_OFF). */
+#ifdef PLOW_DD_DYN_BYTES
+#define PLOW_NV_DD_DYN_BYTES PLOW_DD_DYN_BYTES
+#else
+#define PLOW_NV_DD_DYN_BYTES 0u
+#endif
+#if PLOW_NV_FP8_DECODE_TC_ACTIVE
+#define PLOW_NV_FP8TC_ARENA_FLOATS ((PLOW_FP8TC_ARENA_BYTES + PLOW_NV_DD_DYN_BYTES + 3u) / 4u)
+#else
+#define PLOW_NV_FP8TC_ARENA_FLOATS ((PLOW_NV_DD_DYN_BYTES + 3u) / 4u)
+#endif
+#define PLOW_NV_ARENA_FLOATS000                                                               \
     (PLOW_NV_NON_FP8_ARENA_FLOATS > PLOW_NV_FP8_DECODE_WGMMA_ARENA_FLOATS ? PLOW_NV_NON_FP8_ARENA_FLOATS : PLOW_NV_FP8_DECODE_WGMMA_ARENA_FLOATS)
+#define PLOW_NV_ARENA_FLOATS00                                                                \
+    (PLOW_NV_ARENA_FLOATS000 > PLOW_NV_FP8TC_ARENA_FLOATS ? PLOW_NV_ARENA_FLOATS000 : PLOW_NV_FP8TC_ARENA_FLOATS)
 #define PLOW_NV_ARENA_FLOATS0                                                                 \
     (PLOW_NV_ARENA_FLOATS00 > PLOW_NV_K8_ARENA_FLOATS ? PLOW_NV_ARENA_FLOATS00 : PLOW_NV_K8_ARENA_FLOATS)
 #if PLOW_NV_SPEECH
@@ -1576,7 +1591,7 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
     case PLOW_DOP_MOE_ALIGN_GEMMA_PF:
         d_moe_align_gemma_pf((int*)TEN(0), (const unsigned char*)TEN(1), (unsigned*)TEN(2),
                              (unsigned*)TEN(3), (float*)TEN(4), in->i[0], in->i[1], in->i[2],
-                             slice);
+                             slice, nblk);
         break;
 
     case PLOW_DOP_MOE_GROUP_GLU_GEMMA_PF:
@@ -1743,20 +1758,23 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
             q_pos0 = 0;
         }
 #endif
+        /* i7 = nsplit | MmSpanExtent handle << 16 (0: causal). */
+        const unsigned nsplit = in->i[7] & 0xFFFFu, span_h = in->i[7] >> 16;
+        const unsigned* span = span_h ? (const unsigned*)T[span_h] : nullptr;
         if (in->i[6] == 256)
             d_flash_prefill_fp8_mux<256>(
                 req, (float*)TEN(0), (float*)TEN(1), (const __nv_bfloat16*)TEN(2),
                 (const uint8_t*)TEN(3), (const uint8_t*)TEN(4), (__nv_bfloat16*)TEN(5),
                 (const float*)TEN(6), (const float*)TEN(7),
-                in->i[0], in->i[1], in->i[2], in->i[3], q_pos0, in->i[5], in->i[7],
-                in->fj[1].u, in->fj[2].u, in->fj[0].f, slice, nblk, arena);
+                in->i[0], in->i[1], in->i[2], in->i[3], q_pos0, in->i[5], nsplit,
+                in->fj[1].u, in->fj[2].u, in->fj[0].f, slice, nblk, arena, span);
         else if (in->i[6] == 512)
             d_flash_prefill_fp8_mux<512>(
                 req, (float*)TEN(0), (float*)TEN(1), (const __nv_bfloat16*)TEN(2),
                 (const uint8_t*)TEN(3), (const uint8_t*)TEN(4), (__nv_bfloat16*)TEN(5),
                 (const float*)TEN(6), (const float*)TEN(7),
-                in->i[0], in->i[1], in->i[2], in->i[3], q_pos0, in->i[5], in->i[7],
-                in->fj[1].u, in->fj[2].u, in->fj[0].f, slice, nblk, arena);
+                in->i[0], in->i[1], in->i[2], in->i[3], q_pos0, in->i[5], nsplit,
+                in->fj[1].u, in->fj[2].u, in->fj[0].f, slice, nblk, arena, span);
         else
             __trap();
 #else
@@ -1773,6 +1791,7 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
 #if PLOW_NV_GEMMA
 #if PLOW_NV_FA_PIPE
 #if PLOW_NV_FA_FP8MMA && PLOW_FP8_KV
+        if (in->i[7] >> 16) { __trap(); break; } /* media spans: only the PIPE=0 arm masks them */
         /* beat-fp8-mma: the PIPE=1 fp8 prefill is the px4/px8 fp8-mma arm at hd512 (FULL layers)
          * and the PX-23 arm at hd256 (SLIDING layers). Both are gated on the same
          * PLOW_NV_FA_PIPE && PLOW_NV_FA_FP8MMA, so there is no build in which one exists without
@@ -1806,20 +1825,27 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
         __trap(); /* fp8 prefill needs PIPE=0 or the fp8-mma arm; neither is in this object */
 #endif
 #else
+        {
+        /* i7 = nsplit | MmSpanExtent handle << 16 (0: causal). */
+        const unsigned nsplit = in->i[7] & 0xFFFFu, span_h = in->i[7] >> 16;
+        const unsigned* span = span_h ? (const unsigned*)T[span_h] : nullptr;
         if (in->i[6] == 256)
             d_flash_prefill<256, 64, 32, true>(
                 (float*)TEN(0), (float*)TEN(1), (const __nv_bfloat16*)TEN(2),
                 (const __nv_bfloat16*)TEN(3), (const __nv_bfloat16*)TEN(4), (__nv_bfloat16*)TEN(5),
-                in->i[0], in->i[1], in->i[2], in->i[3], in->i[4], in->i[5], in->i[7], in->fj[1].u,
-                in->fj[2].u, in->fj[0].f, slice, nblk, arena, (const float*)TEN(6), (const float*)TEN(7));
+                in->i[0], in->i[1], in->i[2], in->i[3], in->i[4], in->i[5], nsplit, in->fj[1].u,
+                in->fj[2].u, in->fj[0].f, slice, nblk, arena, (const float*)TEN(6), (const float*)TEN(7),
+                span);
         else if (in->i[6] == 512)
             d_flash_prefill<512, 32, 16, true>(
                 (float*)TEN(0), (float*)TEN(1), (const __nv_bfloat16*)TEN(2),
                 (const __nv_bfloat16*)TEN(3), (const __nv_bfloat16*)TEN(4), (__nv_bfloat16*)TEN(5),
-                in->i[0], in->i[1], in->i[2], in->i[3], in->i[4], in->i[5], in->i[7], in->fj[1].u,
-                in->fj[2].u, in->fj[0].f, slice, nblk, arena, (const float*)TEN(6), (const float*)TEN(7));
+                in->i[0], in->i[1], in->i[2], in->i[3], in->i[4], in->i[5], nsplit, in->fj[1].u,
+                in->fj[2].u, in->fj[0].f, slice, nblk, arena, (const float*)TEN(6), (const float*)TEN(7),
+                span);
         else
             __trap();
+        }
 #endif
 #else
         __trap();
@@ -1952,7 +1978,16 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
     /* ---- pointwise ---- */
     case PLOW_DOP_EMBED:
         d_embed((__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1), (const int*)TEN(2),
-                in->i[0], in->i[1], in->fj[0].f, slice, nblk);
+                in->i[0], in->i[1], in->fj[0].f, slice, nblk, in->i[2]);
+        break;
+
+    case PLOW_DOP_MM_ROWS_BF16:
+        d_mm_rows((__nv_bfloat16*)TEN(0), (const unsigned*)TEN(1), (const unsigned*)TEN(2),
+                  (const __nv_bfloat16*)TEN(3), in->i[0], in->i[1], in->i[2], in->i[3], slice, nblk);
+        break;
+
+    case PLOW_DOP_MM_SPAN_EXTENT:
+        d_mm_span_extent((unsigned*)TEN(0), (const unsigned*)TEN(1), in->i[0], slice, nblk);
         break;
 
     case PLOW_DOP_EMBED_OVERLAY_BF16:
@@ -1988,6 +2023,9 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
     case PLOW_DOP_RAND_F32:
     case PLOW_DOP_ATTENTION_F32:
     case PLOW_DOP_ROW_STATS_F32:
+    case PLOW_DOP_RMSNORM_F32:
+    case PLOW_DOP_ROPE_AXIAL_F32:
+    case PLOW_DOP_CHUNK_ATTENTION_F32:
 #if defined(PLOW_NV_HOPPER)
         if (sp_wg_conv1d(in, T, slice, nblk)) break;
 #endif
@@ -2899,7 +2937,7 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
         if (in->i[0] >= in->i[3])
             d_moe_align_gemma_pf((int*)TEN(0), (const unsigned char*)TEN(1), (unsigned*)TEN(2),
                                  (unsigned*)TEN(3), (float*)TEN(4), in->i[0], in->i[1], in->i[2],
-                                 slice);
+                                 slice, 1u);
         break;
 #endif
 
@@ -4030,7 +4068,9 @@ extern "C" __global__ void __launch_bounds__(PLOW_NV_THREADS, 1)
     }
 }
 extern "C" __device__ unsigned PLOW_SYM(plow_light_attn_hd) = PLOW_NV_FA_HD;
-#if PLOW_NV_FA_HD == 128 && PLOW_NV_FA_RG && PLOW_NV_FA_RG_U == 4
+/* The streamed body (cp.async.bulk + mbarrier) is sm_90+; Ada folds on the interpreter's item. */
+#if PLOW_NV_FA_HD == 128 && PLOW_NV_FA_RG && PLOW_NV_FA_RG_U == 4 && \
+    (!defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 900)
 /* A light attention segment's merge-folded hd128 FlashDecode (nsplit 1, no window, no ring wrap)
  * on the streamed body, bit-identical to the row-group one (d_flash_decode_stream). `hnr[0..3]`
  * = the q, k, v HeadNormRope instructions it folds in (~0u: none, Q is already roped); their x

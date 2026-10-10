@@ -1,0 +1,5 @@
+[
+ {"name": "asr0", "media": [0], "text": "Transcribe this audio."},
+ {"name": "asr1", "media": [1], "text": "Transcribe this audio."},
+ {"name": "audio_q", "media": [2], "text": "What is the speaker talking about? Answer in one sentence."}
+]

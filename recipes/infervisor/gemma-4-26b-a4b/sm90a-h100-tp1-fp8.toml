@@ -1,0 +1,165 @@
+# Gemma-4-26B-A4B-it FP8 on one H100 SXM5: W8A8 weights, FP8 per-token-head KV, 131072 context,
+# 128 decode slots, prefix cache on. Production recipe for this model/GPU/precision.
+#
+# Checkpoint: hub LargitData/gemma-4-26b-a4b-it-fp8 @ 2398f3b38d1b2e56d14498f7da3a74bada8cddff
+# (compressed-tensors W8 per-channel / A8 dynamic per-token; shard sha256 aeb3c810..., e5efcdd2...),
+# re-keyed to plow's fp8/ contract without requantizing:
+#   python3 scripts/gemma4_fp8_hub_rekey.py <hub snapshot> <re-keyed dir>
+#   PLOW_CAMPAIGN_NO_NIX=1 (box without nix only) PLOW_FP8_CKPT=<re-keyed dir> \
+#   python3 scripts/campaign/campaign.py build recipes/infervisor/gemma-4-26b-a4b/sm90a-h100-tp1-fp8.toml --out <fresh dir>
+#
+# Qualified (2026-10-09, packet 5ce87bd28db1, plowrt 80097064 and its pre-rebase build, whose 26B
+# step_bench digests are identical): campaign.py report MATCHED + EQUIVALENT vs vLLM 0.28 fp8_per_token_head KV
+# at --max-model-len 131072, 2 repeats. FP32-reference gate PASS twice (kl_mean 0.192 / 0.201 vs vLLM
+# 0.202, kl_p99 3.14 / 3.83 vs 3.73, needle 1.0). Total tok/s vs vLLM: 4K c32/c128 1.27x / 1.30x,
+# 15K 1.88x / 1.92x, agentic c32/c64/c128 1.20x / 1.13x / 3.30x, 32K c1/c4/c16 2.25x / 2.18x / 2.28x,
+# 128K 3.18x / 3.19x / 3.26x, latency c1 1.02x; loses latency c4 (0.95x).
+# docs/bringup/results/gemma26b-h100-20261009/comparison.md.
+#
+# max_ctx 131072 is gated by: the long FP32 gate (20 cases to 32768 tokens; PASS once, kl_mean 0.133
+# vs vLLM 0.165, kl_p99 2.86 vs 3.56; an FP32 reference past 32768 does not fit one 80 GiB GPU) and
+# needles 54/54 at 8192..130000 tokens on this packet. Agentic c128 tok/s 75965 / 76154 / 66707 at
+# max_ctx 16384 / 131072 / 262144 (262144 costs 12% of the KV budget to flat FP8-KV scales and RoPE
+# tables); st4k / st15k / latency unchanged across max_ctx. Not run: the open-loop production mix.
+#
+# Routes: prefill projections cuBLASLt FP8 where the prefill roles pick it, native FP8 TMA GEMM
+# only at K % 128 == 0; grouped MoE prefill on cuBLASLt (moe_lt W8A8 chain, ABI 6 glue); decode
+# MoE >= 4 rows on cuBLASLt with the routed_fp8kv decode object; generated FP8-KV prefill attention
+# (hd256 sliding, hd512 global) from 128 rows.
+schema = "plow.recipe.v1"
+namespace = "infervisor"
+name = "gemma-4-26b-a4b"
+label = "sm90a-h100-tp1-fp8"
+status = "validated"
+plow_git = "800970648b1a3ac7e8acb6535924dd0af2dfa734"
+network = "gemma4"
+
+[target]
+vendor = "nvidia"
+isa = "sm_90a"
+sku = "H100 SXM5"
+units = 132
+num_gpus = 1
+parallel = "tp"
+max_ctx = 131072
+toolchain = "cuda-12.9"
+
+[checkpoint]
+source = "gemma-4-26b-a4b-it-fp8"
+layout = "plow-fp8-hub-rekey"
+
+[cell]
+name = "gemma4-26b-a4b.h100.fp8-16k-c128"
+model = "gemma-4-26b-a4b-it-fp8 (compressed-tensors, re-keyed)"
+revision = "local"
+hf_dir = "{env:PLOW_FP8_CKPT}"
+gpu = "H100 SXM5"
+arch = "sm_90a"
+n_cu = 132
+max_ctx = 131072
+precision = "w8a8"
+
+[emit]
+args = ["--segmented", "--served-name", "gemma-4-26b-a4b-it-fp8"]
+[emit.env]
+PLOW_FP8 = "1"
+PLOW_W8A8 = "1"
+PLOW_FP8_KV = "1"
+PLOW_EMIT_PACKED_PREFILL = "1"
+PLOW_SEG_PURE_GEMM = "fp8"
+PLOW_SEG_FA512 = "1"
+PLOW_SEG_FA256_GQA2 = "1"
+PLOW_TMA_GEMM = "1"
+PLOW_MAX_CHUNK = "4096"
+PLOW_MAX_REQUEST_CHUNK = "4096"
+PLOW_SLIDING_NS_CAP = "1"
+PLOW_SLIDING_NS_GRID = "1"
+PLOW_ATTENTION_DECODE_BALANCE_GF = "4"
+PLOW_FA_MMAQK = "3"
+PLOW_DECODE_BATCH_LADDER = "1,2,4,8,16,32,64,128"
+PLOW_EMIT_DECODE_CUBLASLT = "1"
+PLOW_EMIT_DECODE_CUBLASLT_MIN_ROWS = "64"
+PLOW_EMIT_DECODE_CUBLASLT_HEAD = "1"
+PLOW_EMIT_PREFILL_CUBLASLT = "1"
+PLOW_PF_LADDER_APPEND = "256,1088,1152,2112,4160,4224"
+PLOW_FUSE_ARGMAX = "0"
+PLOW_GEMMA_MOE_ROUTER_EXACT = "0"
+# Emit-time on purpose: plowc compiles the decode interpreters (interp_sm90a{,_fp8kv,_gw}.cubin,
+# whose hashes change with it) and nvcc appends this; the [objects] script builds no op_moe object.
+# step_bench decode with vs without: B4/B8/B16 6.74/8.21/12.25 vs 7.15/9.36/16.24 ms, B1/B2 +1.5%.
+NVCC_APPEND_FLAGS = "-DPLOW_MOE_FP8_DEDUP=1"
+PLOW_EMIT_MOE_PF_LT = "1"
+
+[objects]
+script = "scripts/build_sm90a_gemma4_segments.sh"
+role_files = ["gen_sm90a_attn_pf_hd256_sliding_fp8kv.cubin", "gen_sm90a_attn_pf_hd512_fp8kv.cubin"]
+[objects.env]
+PLOW_BUILD_FATLITE = "1"
+PLOW_BUILD_W8A8 = "1"
+PLOW_BUILD_FP8KV_GEMM = "1"
+PLOW_BUILD_FA_GQA2_PAIR = "0"
+PLOW_BUILD_PFATTN_HD256_BKV32 = "0"
+PLOW_BUILD_PFATTN_HD256_GQA2_BKV32 = "0"
+PLOW_BUILD_PFATTN_HD512_PX4_BQ64 = "0"
+PLOW_BUILD_GEN_KERNELS = "attn_pf_hd256_sliding_fp8kv,attn_pf_hd512_fp8kv"
+
+[emit_roles.env]
+PLOW_GEMMA4_SM90_W8A8_GEMM_GLU_ROLE = "0"
+PLOW_GEMMA4_SM90_HD512_PX4_BQ64_ROLE = "0"
+PLOW_GEMMA4_SM90_HD256_GQA2_ROLE = "0"
+PLOW_EMIT_GEN_KERNELS = "attn_pf_hd256_sliding_fp8kv,attn_pf_hd512_fp8kv"
+PLOW_EMIT_MOE_PF_LT = "1"
+
+[serve.env]
+PLOW_PREFIX_CACHE = "1"
+PLOW_VMM_PREFIX = "1"
+PLOW_PF_SEG_PURE = "fp8"
+PLOW_PF_SEG_FA512 = "1"
+# Pinned wide (8192 launches). The auto width objective measured TTFT p50 -20..40% but tok/s -2..3%
+# at 4K c16/c32, TTFT p99 +9..16% and FP8 agentic c128 -11% tok/s (p99 3.6x): narrow 4096 launches
+# cost ~8% more per row (2026-10-08 auto-vs-pin A/B, docs/bringup/results/gemma26b-h100-20261009).
+PLOW_PF_INTERLEAVE = "0"
+PLOW_VMM_LIVE_RINGS = "0"
+PLOW_MULTISTEP = "0"
+PLOW_DECODE_MAX_RUNG = "128"
+PLOW_TOKEN_BATCH = "1"
+PLOW_LT_FP8_FAST_ACCUM_MAX_K = "8192"
+
+[bench]
+backend = "openai"
+in_lens = "128 1024 4096"
+concs = "1"
+nprompt = 32
+outlen = 128
+warmups = 2
+seed = 42
+tokenizer = "{env:PLOW_FP8_CKPT}"
+model_id = "gemma-4-26b-a4b-it-fp8"
+gate_prompt = "<bos><|turn>user\nWhat is the capital of France? Answer in one short sentence.<turn|>\n<|turn>model\n<|channel>thought\n<channel|>"
+
+[measured]
+tok_s = 951.5
+p50_tpot_ms = 123.4
+concurrency = 128
+input_len = 4096
+output_len = 128
+client = "vllm 0.28.0 bench serve (repro_gemma26b_h100.sh st4k, 2 repeats, packet 5ce87bd28db1)"
+
+# FP32-reference gates (scripts/llm/fp32_ref_gate.py; repro_gemma26b_h100.sh gate runs these):
+#   llm_fp32_ref       G26_FP8_FP32_REF = the 46-case FP32 reference (prompts sha256 103024034dce0594,
+#                      ref 33d40bc35d09f4d9...), G26_FP8_FP32_VLLM = the vLLM 0.28 capture against it (8a926298ee6ff3e5...)
+#   llm_fp32_ref_long  G26_FP8_FP32_REF_LONG = the 20-case long-context reference to 32768 tokens
+#                      (prompts sha256 0edf0983b7428138), G26_FP8_FP32_VLLM_LONG = vLLM at --max-model-len 131072
+# Thresholds: fp32_ref_gate.py DEFAULTS (docs/bringup/agent-tools.md section 5).
+[gates]
+python = "{env:PYREF}"
+[gates.llm_fp32_ref]
+reference = "{env:G26_FP8_FP32_REF}"
+vllm_capture = "{env:G26_FP8_FP32_VLLM}"
+concurrency = 16
+timeout_s = 2400
+[gates.llm_fp32_ref_long]
+reference = "{env:G26_FP8_FP32_REF_LONG}"
+vllm_capture = "{env:G26_FP8_FP32_VLLM_LONG}"
+concurrency = 4
+timeout_s = 7200

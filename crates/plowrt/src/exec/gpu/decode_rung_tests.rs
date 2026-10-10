@@ -1225,7 +1225,7 @@ fn gpu_fp8_kv_cached_rungs_match_uncached_suffix_logits() {
         let mut reference = Vec::new();
         for (pass, slot) in [15, 0, 1, 3, 7, 15].into_iter().enumerate() {
             e.begin_slot(slot, length + 8).unwrap();
-            assert_eq!(e.vmm.as_ref().unwrap().kv.mapped_rows(slot), 0);
+            assert_eq!(e.vmm.as_ref().unwrap().kv.as_ref().unwrap().mapped_rows(slot), 0);
             let cached = e.attach_prompt(slot, &prompt).unwrap();
             assert_eq!(cached, if pass == 0 { 0 } else { (length - 1) / 32 * 32 });
             let mut next = e.prefill_slot(slot, &prompt).unwrap();
@@ -1488,7 +1488,7 @@ fn check_gpu_decode_rungs(library: bool) {
                 e.retire_slot(slot, true);
                 if let Some(vmm) = &e.vmm {
                     assert_eq!(e.pos[slot], 0);
-                    assert_eq!(vmm.kv.mapped_rows(slot), 0);
+                    assert_eq!(vmm.kv.as_ref().unwrap().mapped_rows(slot), 0);
                 }
             }
         }

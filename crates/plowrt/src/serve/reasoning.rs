@@ -56,7 +56,7 @@ impl ReasoningMode {
         bundle.reasoning()
     }
 
-    fn markers(self) -> Option<(&'static str, &'static str)> {
+    pub fn markers(self) -> Option<(&'static str, &'static str)> {
         match self {
             ReasoningMode::None => None,
             ReasoningMode::ThinkTag => Some((OPEN, CLOSE)),
@@ -75,7 +75,25 @@ impl ReasoningMode {
     /// A request that turned thinking off renders the pair CLOSED
     /// (`<think></think>`) and so correctly reads as not-open here.
     pub fn prompt_opens(self, prompt: &str) -> bool {
-        self.markers().is_some_and(|(open, _)| prompt.ends_with(open))
+        // Whitespace after the marker is the template's (Qwen3.5 `<think>\n`, Gemma 4
+        // `<|channel>thought\n`).
+        self.markers().is_some_and(|(open, _)| prompt.trim_end().ends_with(open))
+    }
+
+    /// The marker that closes a trace, when the mode splits one.
+    pub fn close_marker(self) -> Option<&'static str> {
+        self.markers().map(|(_, close)| close)
+    }
+
+    /// The packet's declared framing, else the one the chat template's model writes (a packet
+    /// that declares none and whose template has a known trace channel, e.g. Gemma 4).
+    pub fn resolve(serve: &crate::asset::serve::ServeInfo, template: Option<(&'static str, &'static str)>) -> Self {
+        let declared = serve.from_packet && serve.manifest.chat.as_ref().is_some_and(|c| c.reasoning.is_some());
+        match template {
+            // `<think>` stays the packet's call: its emit reads the tokenizer for it.
+            Some((open, close)) if !declared && (open, close) != (OPEN, CLOSE) => ReasoningMode::Tags { open, close },
+            _ => Self::from_serve(serve),
+        }
     }
 }
 
@@ -135,7 +153,7 @@ impl ReasoningSplit {
         self.state != State::Answer
     }
 
-    /// Emit a piece of trace.
+    /// Emit a piece of trace into `dst`; whether it carried any.
     ///
     /// Whitespace is trimmed only at the OUTER boundaries of the trace — the
     /// start of the first piece and the end of the last. Trimming each piece
@@ -143,24 +161,27 @@ impl ReasoningSplit {
     /// `"...should be"` + `" four."` came back as `"...should befour."`, a
     /// silent corruption of the model's own words that only shows up when the
     /// close marker lands in its own token.
-    fn emit_reasoning(&mut self, piece: &str) -> Option<String> {
+    fn emit_reasoning(&mut self, piece: &str, dst: &mut String) -> bool {
         let piece = if self.started_reasoning {
             piece
         } else {
             piece.trim_start()
         };
         if piece.is_empty() {
-            return None;
+            return false;
         }
         self.started_reasoning = true;
-        Some(piece.to_string())
+        dst.push_str(piece);
+        true
     }
 
     /// Emit a piece of answer. Only the first piece AFTER a trace is trimmed;
-    /// a generation with no trace is passed through byte for byte.
-    fn emit_answer(&mut self, piece: &str) -> Option<String> {
+    /// a generation with no trace is passed through byte for byte (an empty
+    /// piece still counts as emitted).
+    fn emit_answer(&mut self, piece: &str, dst: &mut String) -> bool {
         if !self.had_trace {
-            return Some(piece.to_string());
+            dst.push_str(piece);
+            return true;
         }
         let piece = if self.started_answer {
             piece
@@ -168,22 +189,30 @@ impl ReasoningSplit {
             piece.trim_start()
         };
         if piece.is_empty() {
-            return None;
+            return false;
         }
         self.started_answer = true;
-        Some(piece.to_string())
+        dst.push_str(piece);
+        true
     }
 
     /// Feed one token's text. Returns whatever can be attributed now; bytes
     /// that could still be part of a marker stay held until a later token or
     /// [`Self::finish`] settles them.
     pub fn push(&mut self, text: &str) -> (Option<String>, Option<String>) {
+        let (mut r, mut c) = (String::new(), String::new());
+        let (hr, hc) = self.push_into(text, &mut r, &mut c);
+        (hr.then_some(r), hc.then_some(c))
+    }
+
+    /// [`Self::push`], appending to `r` / `c` (no allocation of its own once the hold has
+    /// grown); returns whether each side was emitted.
+    pub fn push_into(&mut self, text: &str, r: &mut String, c: &mut String) -> (bool, bool) {
         if self.state == State::Answer {
-            // Some("") rather than None even for an empty delta when there was
-            // no trace: a partial UTF-8 token still gets a chunk, so the
-            // client's token count stays accurate. That is the streamed path's
-            // existing contract.
-            return (None, self.emit_answer(text));
+            // An empty delta is still emitted when there was no trace: a
+            // partial UTF-8 token still gets a chunk, so the client's token
+            // count stays accurate. That is the streamed path's existing contract.
+            return (false, self.emit_answer(text, c));
         }
         self.trace_tokens += 1;
         self.hold.push_str(text);
@@ -206,27 +235,30 @@ impl ReasoningSplit {
                 // is `<think>` never opens a trace at all, and the whole thing
                 // leaks into `content`. Qwen3 happens to emit `<think>` as one
                 // whole first token; nothing guarantees that tokenization.
-                return (None, None);
+                return (false, false);
             } else {
                 // Settled: this generation has no trace. Everything held is
                 // answer, and nothing is withheld from here on.
                 self.state = State::Answer;
                 self.trace_tokens = 0;
                 let out = std::mem::take(&mut self.hold);
-                return (None, self.emit_answer(&out));
+                let e = self.emit_answer(&out, c);
+                self.hold = out;
+                self.hold.clear();
+                return (false, e);
             }
         }
 
         match self.hold.find(self.close) {
             Some(i) => {
                 // Last piece of the trace: trim only its END.
-                let before = self.hold[..i].trim_end().to_string();
-                let after = self.hold[i + self.close.len()..].to_string();
-                self.hold.clear();
+                let hold = std::mem::take(&mut self.hold);
+                let er = self.emit_reasoning(hold[..i].trim_end(), r);
                 self.state = State::Answer;
-                let r = self.emit_reasoning(&before);
-                let c = self.emit_answer(&after);
-                (r, c)
+                let ec = self.emit_answer(&hold[i + self.close.len()..], c);
+                self.hold = hold;
+                self.hold.clear();
+                (er, ec)
             }
             None => {
                 // Withhold only what could still begin the close marker.
@@ -236,9 +268,11 @@ impl ReasoningSplit {
                     .map(|k| self.hold.len() - k)
                     .find(|&c| self.hold.is_char_boundary(c))
                     .unwrap_or(self.hold.len());
-                let emit = self.hold[..cut].to_string();
+                let hold = std::mem::take(&mut self.hold);
+                let er = self.emit_reasoning(&hold[..cut], r);
+                self.hold = hold;
                 self.hold.drain(..cut);
-                (self.emit_reasoning(&emit), None)
+                (er, false)
             }
         }
     }
@@ -250,27 +284,28 @@ impl ReasoningSplit {
     /// `len("</think>") - 1` bytes of `reasoning_content` — and disagreed with
     /// the buffered path about the same generation.
     pub fn finish(&mut self) -> (Option<String>, Option<String>) {
+        let (mut r, mut c) = (String::new(), String::new());
+        let (hr, hc) = self.finish_into(&mut r, &mut c);
+        (hr.then_some(r), (hc && !c.is_empty()).then_some(c))
+    }
+
+    /// [`Self::finish`], appending to `r` / `c`.
+    pub fn finish_into(&mut self, r: &mut String, c: &mut String) -> (bool, bool) {
         let out = std::mem::take(&mut self.hold);
         match self.state {
             // Opened and never closed: the generation ran out inside its own
             // trace, so all of it is trace and there is no answer yet.
-            State::Open => {
-                let t = out.trim_end().to_string();
-                (self.emit_reasoning(&t), None)
-            }
+            State::Open => (self.emit_reasoning(out.trim_end(), r), false),
             // Never got enough bytes to tell — it was never a trace.
             State::Deciding => {
                 self.trace_tokens = 0;
-                (None, self.emit_answer(&out))
+                (false, self.emit_answer(&out, c))
             }
             // Settled. `trace_tokens` is already right: `push` zeroed it if the
             // generation turned out to have no trace, and otherwise it is the
             // real count. Zeroing here too threw away every closed trace's
             // count, which is what `completion_tokens_details` reports.
-            State::Answer => {
-                let c = self.emit_answer(&out);
-                (None, c.filter(|s| !s.is_empty()))
-            }
+            State::Answer => (false, self.emit_answer(&out, c)),
         }
     }
 }
