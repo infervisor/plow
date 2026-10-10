@@ -82,7 +82,7 @@ fn main() {
         } else if m.processor() == Ok(plow_asset::multimodal::Processor::WaveformFrames) {
             let frame = m.param("frame_samples").unwrap() as usize;
             let (samples, rate) = media::decode_wav(&bytes).unwrap();
-            let samples = media::resample(&samples, rate, m.param("sample_rate").unwrap() as u32);
+            let samples = media::resample(&samples, rate, m.param("sample_rate").unwrap() as u32).unwrap();
             let frames = media::waveform_frames(&samples, frame);
             let hf = read_f32(&dir, &item["mel"]);
             let valid = item["valid_frames"].as_u64().unwrap() as usize;
@@ -106,7 +106,7 @@ fn main() {
                 pad_multiple: m.param("pad_multiple").unwrap_or(1) as usize,
             };
             let (samples, rate) = media::decode_wav(&bytes).unwrap();
-            let samples = media::resample(&samples, rate, p.sample_rate);
+            let samples = media::resample(&samples, rate, p.sample_rate).unwrap();
             let mel = media::log_mel(&samples, &p);
             let hf = read_f32(&dir, &item["mel"]);
             let valid = item["valid_frames"].as_u64().unwrap() as usize;

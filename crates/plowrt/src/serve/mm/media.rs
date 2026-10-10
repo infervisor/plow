@@ -73,24 +73,24 @@ pub struct Patches {
 }
 
 /// The largest `pool*patch`-multiple size with at most `max_soft_tokens * pool^2` patches that
-/// keeps the aspect ratio (Gemma-4's `get_aspect_ratio_preserving_size`, verbatim arithmetic).
+/// keeps the aspect ratio (Gemma-4's `get_aspect_ratio_preserving_size`, verbatim arithmetic,
+/// except that its one-pool fallback for extreme aspect ratios is refused).
 pub fn aspect_size(height: u32, width: u32, p: &PatchParams) -> MediaResult<(u32, u32)> {
     let max_patches = f64::from(p.max_soft_tokens * p.pool * p.pool);
     let target_px = max_patches * f64::from(p.patch * p.patch);
     let factor = (target_px / (f64::from(height) * f64::from(width))).sqrt();
     let side = f64::from(p.pool * p.patch);
-    let mut th = ((factor * f64::from(height)) / side).floor() * side;
-    let mut tw = ((factor * f64::from(width)) / side).floor() * side;
-    if th == 0.0 && tw == 0.0 {
-        return Err("image resizes to 0x0".into());
-    }
-    let max_side = f64::from(p.max_soft_tokens) * side;
-    if th == 0.0 {
-        th = side;
-        tw = ((f64::from(width) / f64::from(height)).floor() * side).min(max_side);
-    } else if tw == 0.0 {
-        tw = side;
-        th = ((f64::from(height) / f64::from(width)).floor() * side).min(max_side);
+    let th = ((factor * f64::from(height)) / side).floor() * side;
+    let tw = ((factor * f64::from(width)) / side).floor() * side;
+    // An axis floors to zero exactly when the aspect ratio exceeds 1:max_soft_tokens. The
+    // processor then pads it to one pool, breaking the aspect ratio; for a tall image that makes
+    // the separable resize's intermediate (`h * tw`) scale with the input height instead of
+    // staying at `sqrt(input px * target px)`, so a 1x40M PNG would cost gigabytes. Refuse.
+    if th == 0.0 || tw == 0.0 {
+        return Err(format!(
+            "image of {height}x{width} is too elongated; aspect ratios up to 1:{} are accepted",
+            p.max_soft_tokens
+        ));
     }
     if th * tw > target_px {
         return Err(format!("image of {height}x{width} does not fit the patch budget"));
@@ -239,7 +239,19 @@ pub fn decode_wav(bytes: &[u8]) -> MediaResult<(Vec<f32>, u32)> {
         }
     };
     let mono = interleaved.chunks(channels).map(|c| c.iter().sum::<f32>() / c.len() as f32).collect();
-    Ok((mono, spec.sample_rate))
+    Ok((mono, audio_rate(spec.sample_rate, "WAV")?))
+}
+
+/// Sample rates a clip may carry; containers accept 0 and other nonsense (hound 3.5 does), which
+/// would make resampling divide by zero.
+pub const AUDIO_RATES: std::ops::RangeInclusive<u32> = 8_000..=192_000;
+
+fn audio_rate(rate: u32, format: &str) -> MediaResult<u32> {
+    if AUDIO_RATES.contains(&rate) {
+        Ok(rate)
+    } else {
+        Err(format!("{format} audio sample rate {rate} Hz is outside {}..={} Hz", AUDIO_RATES.start(), AUDIO_RATES.end()))
+    }
 }
 
 /// The audio format a data URL's mime type names; empty (sniff the bytes) when it names none.
@@ -312,7 +324,7 @@ fn decode_compressed(bytes: &[u8], format: &str, max_seconds: f64) -> MediaResul
             Err(e) => return Err(unreadable(e)),
         };
         let spec = *decoded.spec();
-        rate = spec.rate;
+        rate = audio_rate(spec.rate, format)?;
         let channels = spec.channels.count().max(1);
         let b = match &mut buf {
             Some(b) if b.capacity() >= decoded.capacity() * channels => b,
@@ -331,11 +343,18 @@ fn decode_compressed(bytes: &[u8], format: &str, max_seconds: f64) -> MediaResul
 }
 
 /// Band-limited resampling (Kaiser-windowed sinc, 32 zero crossings).
-pub fn resample(x: &[f32], from: u32, to: u32) -> Vec<f32> {
+pub fn resample(x: &[f32], from: u32, to: u32) -> MediaResult<Vec<f32>> {
     if from == to || x.is_empty() {
-        return x.to_vec();
+        return Ok(x.to_vec());
+    }
+    if from == 0 || to == 0 {
+        return Err(format!("cannot resample {from} Hz to {to} Hz"));
     }
     let ratio = f64::from(to) / f64::from(from);
+    // Within AUDIO_RATES the ratio is at most 24; anything larger means a bogus rate slipped by.
+    if ratio > 1024.0 {
+        return Err(format!("cannot resample {from} Hz to {to} Hz"));
+    }
     let cutoff = ratio.min(1.0);
     let zeros = 32.0;
     let half = zeros / cutoff;
@@ -351,7 +370,7 @@ pub fn resample(x: &[f32], from: u32, to: u32) -> Vec<f32> {
     };
     let norm = bessel_i0(beta);
     let n_out = ((x.len() as f64) * ratio).round() as usize;
-    (0..n_out)
+    let out = (0..n_out)
         .map(|i| {
             let t = i as f64 / ratio;
             let lo = ((t - half).ceil() as i64).max(0);
@@ -367,7 +386,8 @@ pub fn resample(x: &[f32], from: u32, to: u32) -> Vec<f32> {
             }
             acc as f32
         })
-        .collect()
+        .collect();
+    Ok(out)
 }
 
 /// Parameters of the `semicausal_log_mel` processor (contract `audio` modality).
@@ -513,6 +533,34 @@ mod tests {
     }
 
     #[test]
+    fn extreme_aspect_ratios_are_refused_and_the_rest_stay_cheap() {
+        let p = params();
+        // 1:280 is the last ratio with a non-zero axis; beyond it the processor's fallback would
+        // make the horizontal pass of a 1x40M image allocate h * tw * 3 = 5.8 GB.
+        assert_eq!(aspect_size(1, 280, &p).unwrap(), (48, 13440));
+        assert_eq!(aspect_size(280, 1, &p).unwrap(), (13440, 48));
+        for (h, w) in [(1, 281), (281, 1), (40_000_000, 1), (1, 40_000_000), (120_000, 300)] {
+            let err = aspect_size(h, w, &p).unwrap_err();
+            assert!(err.contains("too elongated"), "{h}x{w}: {err}");
+        }
+        for (h, w) in [(100_000, 1), (1, 100_000)] {
+            let img = Rgb { width: w, height: h, data: vec![7; (w * h * 3) as usize] };
+            let t = std::time::Instant::now();
+            assert!(image_patches(&img, &p).err().is_some_and(|e| e.contains("too elongated")));
+            assert!(t.elapsed() < std::time::Duration::from_secs(1));
+        }
+        // Accepted shapes: the intermediate of the separable resize (`h * tw` pixels, horizontal
+        // pass first) never exceeds sqrt(input px * target px), i.e. ~5.1 Mpx at 40 Mpx input.
+        let target = f64::from(p.max_soft_tokens * p.pool * p.pool * p.patch * p.patch);
+        for (h, w) in [(378, 105_000), (105_000, 378), (6324, 6324), (480, 640), (1, 280), (280, 1), (30_000, 1333)] {
+            let (_, tw) = aspect_size(h, w, &p).unwrap_or_else(|e| panic!("{h}x{w}: {e}"));
+            let intermediate = f64::from(h) * f64::from(tw);
+            let bound = (f64::from(h) * f64::from(w) * target).sqrt();
+            assert!(intermediate <= bound * 1.001, "{h}x{w}: {intermediate} > {bound}");
+        }
+    }
+
+    #[test]
     fn identity_resize_and_patch_order() {
         let (w, h) = (96u32, 48u32);
         let data: Vec<u8> = (0..w * h * 3).map(|i| (i % 251) as u8).collect();
@@ -582,7 +630,31 @@ mod tests {
         let (samples, rate) = decode_audio(&fixture("tone_stereo44k.mp3"), "mp3", 30.0).unwrap();
         assert_eq!(rate, 44_100);
         assert_tone(&samples, rate, "stereo mp3");
-        assert_tone(&resample(&samples, rate, 16_000), 16_000, "stereo mp3 at 16 kHz");
+        assert_tone(&resample(&samples, rate, 16_000).unwrap(), 16_000, "stereo mp3 at 16 kHz");
+    }
+
+    #[test]
+    fn zero_and_absurd_sample_rates_are_refused() {
+        let mut wav = std::io::Cursor::new(Vec::new());
+        let spec = hound::WavSpec { channels: 1, sample_rate: 16_000, bits_per_sample: 16, sample_format: hound::SampleFormat::Int };
+        let mut w = hound::WavWriter::new(&mut wav, spec).unwrap();
+        for _ in 0..4 {
+            w.write_sample(1000i16).unwrap();
+        }
+        w.finalize().unwrap();
+        let mut bytes = wav.into_inner();
+        assert_eq!(decode_wav(&bytes).unwrap().1, 16_000);
+        // fmt chunk: nSamplesPerSec at 24..28, nAvgBytesPerSec at 28..32 (hound checks they agree).
+        bytes[24..32].fill(0);
+        let err = decode_wav(&bytes).unwrap_err();
+        assert!(err.contains("sample rate 0 Hz"), "{err}");
+        bytes[24..28].copy_from_slice(&1_000_000u32.to_le_bytes());
+        bytes[28..32].copy_from_slice(&2_000_000u32.to_le_bytes());
+        assert!(decode_wav(&bytes).unwrap_err().contains("sample rate 1000000 Hz"));
+        assert!(resample(&[0.5; 4], 0, 16_000).is_err());
+        assert!(resample(&[0.5; 4], 16_000, 0).is_err());
+        assert!(resample(&[0.5; 4], 1, 16_000).is_err());
+        assert_eq!(resample(&[0.5; 4], 16_000, 16_000).unwrap().len(), 4);
     }
 
     #[test]

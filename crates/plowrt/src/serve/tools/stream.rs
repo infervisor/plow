@@ -346,7 +346,8 @@ impl ToolStream {
             self.end_call(i, false);
         }
         let Some(spec) = &self.spec else { return };
-        if !spec.parallel && !self.calls.is_empty() {
+        // No `tools` (or `tool_choice: none`): a call the model writes anyway is never surfaced.
+        if spec.tools.is_empty() || (!spec.parallel && !self.calls.is_empty()) {
             return;
         }
         self.ws.clear();
@@ -697,6 +698,12 @@ mod tests {
         let (g, _) = run_spec(&ParseSpec::plain(ToolFormat::Harmony), ReasoningMode::None, false,
             &["<|channel|>analysis<|message|>Hm.<|end|><|start|>assistant<|channel|>final<|message|>Four."], None);
         assert_eq!(g, Got { reasoning: "Hm.".into(), content: Some("Four.".into()), calls: vec![] });
+        // without tools, a call the model writes anyway is dropped, never a `tool_calls`
+        let (g, err) = run_spec(&ParseSpec::plain(ToolFormat::Harmony), ReasoningMode::None, false,
+            &["<|channel|>commentary to=functions.foo <|constrain|>json<|message|>{\"x\": 1}<|call|>",
+              "<|start|>assistant<|channel|>final<|message|>Four."], None);
+        assert_eq!(g, Got { reasoning: String::new(), content: Some("Four.".into()), calls: vec![] });
+        assert!(err.is_none());
     }
 
     #[test]

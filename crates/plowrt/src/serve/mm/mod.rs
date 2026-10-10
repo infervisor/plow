@@ -372,14 +372,24 @@ impl MmModel {
         &self.slab
     }
 
-    fn worker(&self, m: &MmModality) -> crate::Result<std::sync::mpsc::Sender<Work>> {
+    async fn worker(&self, m: &MmModality) -> crate::Result<std::sync::mpsc::Sender<Work>> {
         let cell = Arc::clone(self.workers.lock().entry(m.kind.clone()).or_default());
-        let mut w = cell.lock();
-        if w.is_none() {
-            let processor = m.processor().map_err(crate::RuntimeError::Rejected)?;
-            *w = Some(Worker::spawn(self.dir.join(&m.packet), self.device, processor)?);
+        if let Some(w) = cell.lock().as_ref() {
+            return Ok(w.tx.clone());
         }
-        Ok(w.as_ref().unwrap().tx.clone())
+        // First use loads the encoder packet (seconds): off the runtime threads, and the cell's
+        // lock serialises concurrent first users there too.
+        let processor = m.processor().map_err(crate::RuntimeError::Rejected)?;
+        let (path, device) = (self.dir.join(&m.packet), self.device);
+        tokio::task::spawn_blocking(move || {
+            let mut w = cell.lock();
+            if w.is_none() {
+                *w = Some(Worker::spawn(path, device, processor)?);
+            }
+            Ok(w.as_ref().unwrap().tx.clone())
+        })
+        .await
+        .map_err(|e| crate::RuntimeError::Rejected(format!("encoder spawn: {e}")))?
     }
 }
 
@@ -514,7 +524,7 @@ fn audio(samples: Vec<f32>, rate: u32, m: &MmModality, processor: Processor, lim
         if samples.is_empty() {
             return Err(MmError::bad("audio clip is empty"));
         }
-        let samples = media::resample(&samples, rate, sample_rate);
+        let samples = media::resample(&samples, rate, sample_rate).map_err(MmError::bad)?;
         let raw: Vec<u8> = samples.iter().flat_map(|v| v.to_le_bytes()).collect();
         let frames = media::waveform_frames(&samples, frame);
         let tokens = frames.valid_frames;
@@ -531,7 +541,7 @@ fn audio(samples: Vec<f32>, rate: u32, m: &MmModality, processor: Processor, lim
     if samples.is_empty() {
         return Err(MmError::bad("audio clip is empty"));
     }
-    let samples = media::resample(&samples, rate, p.sample_rate);
+    let samples = media::resample(&samples, rate, p.sample_rate).map_err(MmError::bad)?;
     let mel = media::log_mel(&samples, &p);
     let tokens = media::audio_tokens(mel.valid_frames, m.param("subsample").unwrap_or(4) as usize);
     if tokens == 0 {
@@ -559,6 +569,13 @@ fn soft_tokens(p: &Prepared) -> usize {
         Prepared::Image(patches, _) => patches.soft_tokens as usize,
         Prepared::Audio(_, tokens, _) => *tokens,
     }
+}
+
+/// Concurrent media decodes, process-wide. Each is up to `max_images` 40 Mpx images (hundreds of
+/// MB transient apiece) on the blocking pool, whose 512 threads would otherwise be the only bound.
+fn media_permits() -> &'static tokio::sync::Semaphore {
+    static PERMITS: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
+    PERMITS.get_or_init(|| tokio::sync::Semaphore::new(std::thread::available_parallelism().map_or(1, usize::from)))
 }
 
 /// Expand `prompt_ids` for the media parts of `messages`: each placeholder the template rendered
@@ -590,9 +607,14 @@ pub async fn expand(
     }
     let prepared = {
         let contract = contract.clone();
-        tokio::task::spawn_blocking(move || parts.iter().map(|p| prepare_one(p, &contract, &limits)).collect::<Result<Vec<_>, _>>())
-            .await
-            .map_err(|e| MmError::bad(format!("media preprocessing failed: {e}")))??
+        let permit = media_permits().acquire().await.map_err(|e| MmError::busy(format!("media preprocessing unavailable: {e}")))?;
+        tokio::task::spawn_blocking(move || {
+            // Held by the blocking task itself: a dropped request must not free the slot early.
+            let _permit = permit;
+            parts.iter().map(|p| prepare_one(p, &contract, &limits)).collect::<Result<Vec<_>, _>>()
+        })
+        .await
+        .map_err(|e| MmError::bad(format!("media preprocessing failed: {e}")))??
     };
     // The template's placeholders, in order, must be exactly the media parts.
     let mut slots: Vec<(usize, &MmModality)> = Vec::new();
@@ -672,7 +694,7 @@ pub async fn encode(mm: &MmModel, pending: Pending) -> Result<Box<MmJob>, MmErro
     let image_rx = match images.is_empty() {
         true => None,
         false => {
-            let tx = mm.worker(contract.modality("image").unwrap()).map_err(encode_err)?;
+            let tx = mm.worker(contract.modality("image").unwrap()).await.map_err(encode_err)?;
             let (reply, rx) = tokio::sync::oneshot::channel();
             tx.send(Work::Images(images, reply)).map_err(|_| MmError::busy("image encoder is unavailable"))?;
             Some(rx)
@@ -680,7 +702,7 @@ pub async fn encode(mm: &MmModel, pending: Pending) -> Result<Box<MmJob>, MmErro
     };
     let mut clip_rx = Vec::with_capacity(clips.len());
     for (i, mel, tokens) in clips {
-        let tx = mm.worker(contract.modality("audio").unwrap()).map_err(encode_err)?;
+        let tx = mm.worker(contract.modality("audio").unwrap()).await.map_err(encode_err)?;
         let (reply, rx) = tokio::sync::oneshot::channel();
         tx.send(Work::Audio(mel, tokens, reply)).map_err(|_| MmError::busy("audio encoder is unavailable"))?;
         clip_rx.push((i, rx));
@@ -908,5 +930,12 @@ mod tests {
         let wide = image_digest("image", &media::Rgb { width: 2, height: 1, data: vec![1; 6] });
         let tall = image_digest("image", &media::Rgb { width: 1, height: 2, data: vec![1; 6] });
         assert_ne!(row_ids(&wide, 2, true), row_ids(&tall, 2, true));
+    }
+
+    #[test]
+    fn media_decoding_is_capped_at_the_core_count() {
+        let cores = std::thread::available_parallelism().map_or(1, usize::from);
+        assert_eq!(media_permits().available_permits(), cores);
+        assert!(cores >= 1);
     }
 }

@@ -104,6 +104,8 @@ mod tests {
         assert_eq!(status(Some(("authorization", "Bearer k1")), "/v1/models").await, StatusCode::OK);
         assert_eq!(status(Some(("authorization", "bearer secret-2")), "/v1/models").await, StatusCode::OK);
         assert_eq!(status(Some(("x-api-key", "k1")), "/v1/models").await, StatusCode::OK);
+        assert_eq!(status(Some(("sec-websocket-protocol", "realtime, openai-insecure-api-key.k1")), "/v1/models").await, StatusCode::OK);
+        assert_eq!(status(Some(("sec-websocket-protocol", "openai-insecure-api-key.k1x")), "/v1/models").await, StatusCode::UNAUTHORIZED);
         assert_eq!(status(None, "/health").await, StatusCode::OK);
         let open = require(Router::new().route("/v1/models", get(|| async { "ok" })), &[]);
         let response = open.oneshot(Request::get("/v1/models").body(Body::empty()).unwrap()).await.unwrap();
