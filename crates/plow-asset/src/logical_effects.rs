@@ -8,7 +8,7 @@ use serde_json::{json, Value};
 
 use crate::program::{Packet, Program};
 
-fn outputs(d: &DevInst64) -> Result<&'static [usize], String> {
+pub(crate) fn outputs(d: &DevInst64) -> Result<&'static [usize], String> {
     use DevOp::*;
     let op = DevOp::from_u16(d.op).ok_or("unknown kernel effects")?;
     let required = match op {

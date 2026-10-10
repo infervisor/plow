@@ -97,7 +97,7 @@ siblings, `l2_domains`, fine counters and `@` aliases. Unaudited opcodes in prod
 | qwen3-asr(-0.6b), veena, orpheus | Argmax ArgmaxFin Embed FlashDecode FlashPrefill GemvGlu GemvQkv HeadNormRope |
 | chatterbox(-mtl) | Argmax ArgmaxFin EmbedPosBf16 FlashDecode FlashMerge FlashPrefill GemvGlu GemvQkv HeadNormRope |
 
-That is 34 distinct opcodes. Every main-packet program is a logical-effects gap today. The sidecars
+That is 34 distinct opcodes. Every main-packet program is a logical-effects gap today. Since the 3d0b6948 merge, op 210 `MmSpanExtent` (multimodal Gemma main packets) is a 35th. The sidecars
 (encoder, codec, s3gen) are fully covered.
 
 ## 4. Obligations per program
@@ -108,13 +108,14 @@ empty input is not complete.
 | Packet kind | Required obligations | Today |
 | --- | --- | --- |
 | plowc main packet | A once; per program: coarse D, logical-effects D; L per padded-MLA producer | A + coarse D complete; logical effects 0 of N |
-| plowc sidecar | per program: logical-effects D via `program_checks` | complete for all 4 production sidecar kinds; never checked at load |
+| plowc sidecar | per program: logical-effects D via `program_checks` | complete for all 4 production sidecar kinds; checked at load under `PLOW_LEAN_QUALIFY` |
+| multimodal sidecars (`mm_vision.pkt`, `mm_audio.pkt`, merged from mm-vision at 3d0b6948) | sidecar route (not named `model`), receipts through `write_sidecar_packet`; `media_geometry.v1` multimodal family on the main packet | no built bundle yet; the 4de53bf6 baseline predates them |
 | policy receipts (R) | none required. They bind when present (selection evidence, not structure) | — |
 | example-built ASR/VAD packets | per program: logical-effects D, or a recorded exemption | no gate, no receipts |
 | runtime transforms (decode rung, prefill patch, packed descriptors, mixed step) | separate execution subjects (Phase 3) | none |
-| KV ring / VMM lifecycle | ring addressing + lifecycle invariants (Phase 5) | addressing facts in `KvPool.lean` only |
+| KV ring / VMM lifecycle | `kv_ring.v1` per packet with packed prefill over a sliding ring; `vmm_trace.v1` on runtime traces (CPU lane) | done (§11) |
 | multimodal slab lifecycle | reserve/stage/release/unload invariants (Phase 4) | Rust tests only |
-| speech fusions | `Speech.lean` preconditions bound to emitted operands (Phase 6) | theorems only, unbound |
+| speech fusions | `speech_fusion.v1` per packet with a fused site | done (§12); no production packet has one |
 
 ## 5. Proof roots
 
@@ -190,11 +191,11 @@ unrelated to this work and are not chased.
 | KV ring / shared backing lifecycle | Done: `kv_ring.v1`, `vmm_trace.v1` (§11) |
 | mm slab lifecycle | `Plow/Multimodal.lean` + `serve/mm` traces (Phase 4) |
 | ASR/TTS/mm capacity and shape contracts | Done: `media_geometry.v1` (§10) |
-| Speech fusion preconditions unbound | Precondition endpoint over emitted LN/conv instructions (Phase 6) |
+| Speech fusion preconditions unbound | Done: `speech_fusion.v1` (§12) |
 | Runtime patch/rung transforms unchecked | Phase 3 (not started) |
 | Object capability model | Phase 2 support checker (not started) |
 | Serving trace / tool chunking | Phase 7 (not started) |
-| CI: no Lean build, audit or ignored CPU tests | `lean-correctness` job (Phase 8) |
+| CI: no Lean build, audit or ignored CPU tests | Done: `scripts/lean_correctness_ci.sh` step in `.github/workflows/build.yml` (nix-build job) |
 
 ## 9. Strict qualification policy
 
@@ -346,3 +347,41 @@ obligation to the packet that owns the pipeline. Load-time `strict` does not re-
 - **Out of scope.** Device completion before reuse: `VmmOps` carries no retirement events, and
   checkpoint D memory effects cover retirement. Live-context growth beyond the packet `max_ctx` is
   not covered either: capacity is the packet's `max_ctx`, and the ring bound does not depend on it.
+
+## 12. Speech fusion preconditions (`speech_fusion.v1`)
+
+`Plow/SpeechFusion.lean` binds the hypotheses of `Plow.Speech` to emitted instructions.
+`plow_asset::speech_fusion` derives one site per fused instruction.
+
+- **LayerNorm prologue** (`DenseGemmF32`, flag bit 5).
+  - **Contract (`LnSite.Contract`).**
+    - The last earlier writer of `stats`, in (program, pc) order, is `RowStatsF32`.
+    - It sits in an earlier program, and its `x` is the GEMM's A.
+    - It covers `a_row0 + M ≤ rows`, with `feat = K`.
+    - The stats tensor holds `8 × rows` bytes. gamma and beta are absent or `4K` bytes.
+    - No write of A or of stats occurs from the writer's program through the GEMM's. Same-program
+      writes count whatever their pc.
+  - **`ln_site_stats`.** Turns the contract into `ln_prologue_eq`'s hypothesis `hstats`, given two
+    instruction-semantics premises: RowStatsF32 writes its input's statistics, and an unwritten
+    tensor is unchanged.
+  - **`ln_site_gemm_eq`.** Gives the full GEMM equivalence.
+- **Conv1dF32 `row_scale`.**
+  - **Contract (`ConvSite.Contract`).** Lean recomputes `out_rows` from the raw fields `in_rows`,
+    `pads` (`j0`), `kernel`, `dilation` and `stride`. Then:
+    - `row_scale = 4·batch·out_rows` bytes;
+    - `out = 4·batch·out_rows·out_channels` bytes;
+    - the residual is present at the output's size;
+    - the scale aliases neither the output nor the residual.
+  - **`conv_site_in_bounds`.** Every `(b, t, c)` index into the scale and the residual is in bounds.
+  - **`conv_site_eq`.** Lifts `conv_row_scale_residual_eq` to every element.
+- **Qualification.** `plowrt qualify` adds the obligation to any packet with a fused site.
+  - None of the 14 production bundles has one: Qwen's `fuse_layer_norm` is off, and no production
+    builder emits `row_scale`.
+  - The ignored test `certificate_checks::tests::emitted_speech_fusion_sites_meet_the_lean_preconditions`
+    checks devgen's actual emitters: a two-layer fused Qwen audio tower and `conv1d_f32_row_scaled`.
+    Both are accepted.
+  - It rejects nine single-field mutations, one per bound precondition. It also checks that a GEMM
+    whose stats writer is removed cannot be derived.
+- **Assumptions.**
+  - Programs run in index order, one after another. This holds for forward-pipeline sequences.
+  - The arithmetic premises are those of `Plow.Speech`.

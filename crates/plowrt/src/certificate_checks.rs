@@ -11,7 +11,7 @@ use std::sync::Mutex;
 
 use plow_asset::certificates::{
     bind_packet_receipt, is_approved_verifier, qualify_packet, qualify_sidecar, sidecar_checks_file,
-    CompileCheckReceipt, PacketCheckReceipts, Qualification, SidecarCheckReceipts,
+    CompileCheckReceipt, PacketCheckReceipts, Qualification, SemanticScope, SidecarCheckReceipts,
     VerificationPolicy, PACKET_CHECKS_FILE,
 };
 use plow_asset::decode_objects::image_sha256;
@@ -284,7 +284,8 @@ fn legacy_check(
 
 /// `plowrt qualify`: every `*.pkt` in `dir`, in name order, with its qualification. A packet
 /// with a speech or multimodal pipeline also owes the bundle's `media_geometry.v1` obligation, and one
-/// with packed prefill over a sliding ring owes `kv_ring.v1`.
+/// with packed prefill over a sliding ring owes `kv_ring.v1`, and one with fused speech sites
+/// owes `speech_fusion.v1`.
 pub fn qualify_dir(dir: &Path, replay_checks: bool) -> Result<Vec<(std::path::PathBuf, Qualification)>> {
     let entries = std::fs::read_dir(dir).map_err(|source| RuntimeError::Io { path: dir.to_path_buf(), source })?;
     let mut packets: Vec<_> = entries
@@ -302,6 +303,7 @@ pub fn qualify_dir(dir: &Path, replay_checks: bool) -> Result<Vec<(std::path::Pa
         let blob = DevBlob::parse(&raw)?;
         let mut q = qualify_loaded(&path, &raw, &blob, replay_checks)?;
         kv_ring_obligation(&raw, &blob, replay_checks, &mut q);
+        speech_fusion_obligation(&blob, replay_checks, &mut q);
         media.push(MediaInfo::read(&path, &raw, &blob));
         out.push((path, q));
     }
@@ -347,12 +349,6 @@ fn media_obligation() -> plow_asset::certificates::Obligation {
 
 /// `kv_ring.v1` for a packet with a packed prefill section and a sliding ring.
 fn kv_ring_obligation(raw: &[u8], blob: &DevBlob, replay_checks: bool, q: &mut Qualification) {
-    let obligation = plow_asset::certificates::Obligation {
-        scope: plow_asset::certificates::SemanticScope::KvRing,
-        checkpoint: plow_asset::kv_ring::ENDPOINT,
-        program: None,
-        site: None,
-    };
     let request = (|| -> std::result::Result<Option<serde_json::Value>, String> {
         let Some(pf) = blob.reserved_metadata(raw, plow_asset::packed_prefill::SECTION).map_err(|e| e.to_string())? else {
             return Ok(None);
@@ -368,21 +364,41 @@ fn kv_ring_obligation(raw: &[u8], blob: &DevBlob, replay_checks: bool, q: &mut Q
             plow_asset::kv_ring::request(&pf, &live, &rungs)
         })
     })();
+    packet_obligation(SemanticScope::KvRing, plow_asset::kv_ring::ENDPOINT, "kv ring", request, replay_checks, q);
+}
+
+/// `speech_fusion.v1` for a packet with a fused speech site.
+fn speech_fusion_obligation(blob: &DevBlob, replay_checks: bool, q: &mut Qualification) {
+    let request = blob.with_packet_view(plow_asset::speech_fusion::request);
+    packet_obligation(SemanticScope::SpeechFusion, plow_asset::speech_fusion::ENDPOINT, "speech fusion", request, replay_checks, q);
+}
+
+/// Adds a packet-level qualification obligation: none for `Ok(None)`, a gap for a derivation
+/// error or a rejection.
+fn packet_obligation(
+    scope: SemanticScope,
+    endpoint: &'static str,
+    what: &str,
+    request: std::result::Result<Option<serde_json::Value>, String>,
+    replay_checks: bool,
+    q: &mut Qualification,
+) {
+    let obligation = plow_asset::certificates::Obligation { scope, checkpoint: endpoint, program: None, site: None };
     let request = match request {
         Ok(None) => return,
         Ok(Some(request)) => request,
         Err(error) => {
             q.required.insert(obligation);
-            q.gaps.push(format!("kv ring: {error}"));
+            q.gaps.push(format!("{what}: {error}"));
             return;
         }
     };
     q.required.insert(obligation.clone());
-    match check_endpoint(plow_asset::kv_ring::ENDPOINT, request, replay_checks) {
+    match check_endpoint(endpoint, request, replay_checks) {
         Ok(()) => {
             q.satisfied.insert(obligation);
         }
-        Err(gap) => q.gaps.push(format!("kv ring: {gap}")),
+        Err(gap) => q.gaps.push(format!("{what}: {gap}")),
     }
 }
 
@@ -936,5 +952,126 @@ mod tests {
                 "mutation {mutation}");
         }
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    fn empty_prefix(tensors: &[(&str, u64)]) -> (devgen::pipeline::PacketPrefix, Vec<u32>) {
+        let mut builder = Builder::new(4);
+        let handles: Vec<u32> = tensors.iter().map(|&(name, bytes)| builder.tensor(name, bytes)).collect();
+        let model = Model {
+            n_cu: 4,
+            target: 0,
+            tensors: builder.tensors(),
+            progs: Vec::new(),
+            kv_row_insts: Vec::new(),
+            prog_t: Vec::new(),
+            gen: Vec::new(),
+        };
+        let prefix = devgen::pipeline::PacketPrefix { model, programs: Vec::new(), input: handles[0], output: handles[0], input_shape: vec![] };
+        (prefix, handles)
+    }
+
+    /// `speech_fusion.v1` on the sites devgen actually emits: the fused Qwen audio LayerNorm
+    /// prologue (two layers) and a row-scaled Conv1dF32 epilogue are accepted; mutating any bound
+    /// precondition rejects, and a GEMM whose stats tensor has no earlier writer cannot be derived.
+    #[test]
+    #[ignore = "requires built plow_verify; CPU-only"]
+    fn emitted_speech_fusion_sites_meet_the_lean_preconditions() {
+        use devgen::asr::qwen::{append_audio_transformer_layers, AudioTransformerSpec};
+        use devgen::pipeline::{Activation, Conv1dF32Stage, DenseSplit, PadMode, TensorRef};
+        let (prefix, _) = empty_prefix(&[("positioned", 2 * 4 * 4)]);
+        let ln = append_audio_transformer_layers(
+            prefix,
+            AudioTransformerSpec {
+                rows: 2,
+                width: 4,
+                ffn_width: 8,
+                head_width: 2,
+                group_rows: 2,
+                valid_rows: None,
+                group_table: false,
+                split: DenseSplit::Parallel,
+                first_layer: 0,
+                layers: 2,
+                weight_prefix: "tower",
+                activation_prefix: "act.audio",
+                fuse_layer_norm: true,
+            },
+        )
+        .unwrap();
+        let (prefix, h) = empty_prefix(&[("x", 2 * 10 * 8 * 4), ("scale", 2 * 10 * 4)]);
+        let mut p = prefix.program();
+        p.conv1d_f32_row_scaled(
+            h[0],
+            &[],
+            Conv1dF32Stage {
+                output: TensorRef::Named("y"),
+                weight: TensorRef::Named("w"),
+                bias: Some(TensorRef::Named("b")),
+                alpha: None,
+                residual: Some(h[0]),
+                lengths: None,
+                batch: 2,
+                in_rows: 10,
+                in_channels: 8,
+                out_channels: 8,
+                kernel: 3,
+                stride: 1,
+                dilation_or_output_padding: 1,
+                groups: 1,
+                pad_before: 1,
+                pad_after: 1,
+                pad_mode: PadMode::Zero,
+                input_activation: Activation::None,
+                output_activation: Activation::None,
+                slope: 0.0,
+                weight_f16: false,
+                split_bf16: false,
+                weight_tap_major: false,
+                wgmma: false,
+                weight_split: false,
+            },
+            h[1],
+        )
+        .unwrap();
+        let conv = p.finish(10);
+        let derive = |m: &Model| plow_asset::program::with_model(m, plow_asset::speech_fusion::request);
+        let ln_req = derive(&ln.model).unwrap().expect("fused LayerNorm sites");
+        let conv_req = derive(&conv.model).unwrap().expect("row-scaled conv site");
+        let ln_sites = ln_req["sites"].as_array().unwrap().len();
+        assert!(ln_sites >= 4, "two layers, attention and FFN prologues: {ln_sites}");
+        assert_eq!(conv_req["sites"].as_array().unwrap().len(), 1);
+
+        let mutate = |req: &serde_json::Value, field: &str, value: serde_json::Value| {
+            let mut req = req.clone();
+            req["sites"][0][field] = value;
+            req
+        };
+        let ln0 = &ln_req["sites"][0];
+        let conv0 = &conv_req["sites"][0];
+        let cases = vec![
+            ("ln", ln_req.clone(), true),
+            ("conv", conv_req.clone(), true),
+            ("A written between", mutate(&ln_req, "a_writes_between", json!(1)), false),
+            ("stats rewritten", mutate(&ln_req, "stats_writes_between", json!(1)), false),
+            ("stats of another tensor", mutate(&ln_req, "writer_x", json!(ln0["gemm_a"].as_u64().unwrap() + 1)), false),
+            ("writer not RowStats", mutate(&ln_req, "writer_row_stats", json!(false)), false),
+            ("rows not covered", mutate(&ln_req, "m", json!(ln0["writer_rows"].as_u64().unwrap() + 1)), false),
+            ("width mismatch", mutate(&ln_req, "writer_feat", json!(ln0["gemm_k"].as_u64().unwrap() + 1)), false),
+            ("same program", mutate(&ln_req, "writer_program", ln0["gemm_program"].clone()), false),
+            ("scale short", mutate(&conv_req, "row_scale_bytes", json!(conv0["row_scale_bytes"].as_u64().unwrap() - 4)), false),
+            ("no residual", mutate(&conv_req, "residual_bytes", json!(0)), false),
+            ("stride changes out_rows", mutate(&conv_req, "stride", json!(2)), false),
+            ("scale aliases out", mutate(&conv_req, "row_scale_is_out", json!(true)), false),
+        ];
+        let requests: Vec<_> = cases.iter().map(|(_, r, _)| (plow_asset::speech_fusion::ENDPOINT, r.clone())).collect();
+        let certs = lean_verify::call_batch(&requests).unwrap();
+        for ((what, _, ok), cert) in cases.iter().zip(certs) {
+            assert_eq!(cert.ok, *ok, "{what}: {:?}", cert.reason);
+        }
+
+        let mut orphan = ln.model;
+        orphan.progs.remove(0);
+        orphan.prog_t.remove(0);
+        assert!(derive(&orphan).unwrap_err().contains("no earlier writer"));
     }
 }

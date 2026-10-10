@@ -221,6 +221,9 @@ pub enum SemanticScope {
     /// `kv_ring.v1`: packed prefill writes never overwrite a ring row their own queries read,
     /// checked at qualification from the packet's `live_kv`/`packed_prefill` sections.
     KvRing,
+    /// `speech_fusion.v1`: the emitted operands of fused speech sites (LayerNorm prologue,
+    /// Conv1dF32 row_scale) meet `Plow.Speech`'s preconditions, checked at qualification.
+    SpeechFusion,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

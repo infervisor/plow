@@ -58,6 +58,12 @@
     {"id": "vmm_trace.v1", "scope": "vmm_lifecycle", "soundness": [
       {"theorem": "Plow.KvRing.traceOk_sound", "checker": "Plow.KvRing.traceOk"},
       {"theorem": "Plow.KvRing.step_preserves", "checker": "Plow.KvRing.step"},
-      {"theorem": "Plow.KvRing.run_preserves", "checker": "Plow.KvRing.run"}]}
+      {"theorem": "Plow.KvRing.run_preserves", "checker": "Plow.KvRing.run"}]},
+    {"id": "speech_fusion.v1", "scope": "speech_fusion", "soundness": [
+      {"theorem": "Plow.SpeechFusion.check_sound", "checker": "Plow.SpeechFusion.check"},
+      {"theorem": "Plow.SpeechFusion.ln_site_stats", "checker": "Plow.SpeechFusion.LnSite.Contract"},
+      {"theorem": "Plow.SpeechFusion.ln_site_gemm_eq", "checker": "Plow.SpeechFusion.LnSite.Contract"},
+      {"theorem": "Plow.SpeechFusion.conv_site_in_bounds", "checker": "Plow.SpeechFusion.ConvSite.Contract"},
+      {"theorem": "Plow.SpeechFusion.conv_site_eq", "checker": "Plow.SpeechFusion.ConvSite.Contract"}]}
   ]
 }

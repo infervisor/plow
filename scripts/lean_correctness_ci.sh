@@ -45,7 +45,7 @@ suites=(
   "-p plowc --test lean_verify_lds_fit -- accepts_fitting_staged_ops rejects_the_task9_shape"
   "-p plowc --test lean_verify_negative -- verifier_rejects_unordered_byte_overlap stripping_waits_alone_is_not_a_corruption"
   "-p plowc --test lean_verify_wire -- accepts_valid_round_trip accepts_empty_program rejects_encode_frames_diverges_from_raw rejects_length_mismatch rejects_truncated_stream json_u8_boundary_round_trips_through_lean abstract_framing_shape_matches_packet_body_ordering"
-  "-p plowrt --features cuda,hsa --lib -- certificate_checks::tests::selected_gemm_receipt_reconstructs_wire_after_packet_hash_changes certificate_checks::tests::logical_effect_receipt_is_reconstructed_from_loaded_packet certificate_checks::tests::packet_receipts_replay_at_load_and_reject_tampering certificate_checks::tests::layout_receipt_is_reconstructed_from_loaded_packet certificate_checks::tests::strict_policy_replays_complete_receipts_and_rejects_substituted_evidence memory::vmm::ring_tests::vmm_ring_driver_traces_satisfy_the_lean_lifecycle_model"
+  "-p plowrt --features cuda,hsa --lib -- certificate_checks::tests::selected_gemm_receipt_reconstructs_wire_after_packet_hash_changes certificate_checks::tests::logical_effect_receipt_is_reconstructed_from_loaded_packet certificate_checks::tests::packet_receipts_replay_at_load_and_reject_tampering certificate_checks::tests::layout_receipt_is_reconstructed_from_loaded_packet certificate_checks::tests::strict_policy_replays_complete_receipts_and_rejects_substituted_evidence memory::vmm::ring_tests::vmm_ring_driver_traces_satisfy_the_lean_lifecycle_model certificate_checks::tests::emitted_speech_fusion_sites_meet_the_lean_preconditions"
 )
 
 fail=0

@@ -9,6 +9,7 @@ import Plow.CLI.Schema
 import Plow.CLI.Checkpoints
 import Plow.MediaGeometry
 import Plow.KvRing
+import Plow.SpeechFusion
 
 namespace Plow.CLI.Dispatch
 
@@ -36,7 +37,8 @@ def endpoints : List (String × (Json → IO Certificate)) := [
   ("L", fun p => return Checkpoints.checkL p),
   ("media_geometry.v1", versioned "media_geometry.v1" Plow.MediaGeometry.run),
   ("kv_ring.v1", versioned "kv_ring.v1" Plow.KvRing.runRing),
-  ("vmm_trace.v1", versioned "vmm_trace.v1" Plow.KvRing.runTrace)
+  ("vmm_trace.v1", versioned "vmm_trace.v1" Plow.KvRing.runTrace),
+  ("speech_fusion.v1", versioned "speech_fusion.v1" Plow.SpeechFusion.run)
 ]
 
 def endpointIds : List String := endpoints.map (·.1)

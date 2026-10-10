@@ -714,6 +714,7 @@ pub mod speech_contract;
 pub mod multimodal;
 pub mod media_geometry;
 pub mod kv_ring;
+pub mod speech_fusion;
 pub mod serve_manifest;
 
 pub mod hetero;
