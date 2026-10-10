@@ -2701,11 +2701,16 @@ fn run_one_tick(
                 }
             }
 
-            // Multimodal soft-token rows reach the LM's slab before any launch this tick reads them.
+            // Multimodal soft-token rows reach this engine's slab before any launch this tick reads
+            // them; a prompt row the table does not hold fails the request instead of reading pad.
             for i in 0..cap.min(slots.len()) {
-                let Some(mm) = slots[i].as_mut().and_then(|s| s.mm.as_mut()) else { continue };
-                let slab = mm.slab();
-                if let Err(err) = slab.stage(mm, |t, off, b| e.write_tensor_ordered(t, off, b)) {
+                let Some(s) = slots[i].as_mut() else { continue };
+                let Some(mm) = s.mm.as_mut().filter(|mm| !mm.staged()) else { continue };
+                let staged = match state.mm_model(slug) {
+                    Some(own) => own.slab().stage(mm, &s.prompt_ids, |t, off, b| e.write_tensor_ordered(t, off, b)),
+                    None => Err(crate::RuntimeError::Rejected("multimodal request on an engine without multimodal state".into())),
+                };
+                if let Err(err) = staged {
                     tracing::warn!(%err, "multimodal rows not staged");
                     if let Some(taken) = slots[i].take() {
                         release_kv(&arena, taken.kv);

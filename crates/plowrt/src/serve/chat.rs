@@ -386,19 +386,20 @@ async fn chat_completions_with(
     // packet carries and replace the placeholders its own template renders. A part the model
     // has no encoder for is refused before it becomes a token: dropping it (`Content::as_text`
     // keeps only text) would answer about the wrong question, fluently.
-    let mm_model = match crate::serve::mm::media_parts(&req.messages).as_slice() {
+    // Encoding waits for the rank: its encoders and slab are that engine's own.
+    let mm_contract = match crate::serve::mm::media_parts(&req.messages).as_slice() {
         [] => None,
         parts => {
-            let model = state
+            let contract = state
                 .registry
                 .get(&req.model)
                 .ok()
                 .filter(|_| state.has_gpu_engine(&req.model))
-                .and_then(|b| b.serve().multimodal.as_ref().map(|c| crate::serve::mm::model(&b.dir, c, 0)));
+                .and_then(|b| b.serve().multimodal.clone());
             let missing = parts
                 .iter()
                 .filter_map(|p| p.media_kind())
-                .find(|k| model.as_ref().is_none_or(|m| m.contract.modality(k).is_none()));
+                .find(|k| contract.as_ref().is_none_or(|c| c.modality(k).is_none()));
             if let Some(kind) = missing {
                 return crate::serve::api_error(
                     axum::http::StatusCode::BAD_REQUEST,
@@ -408,7 +409,7 @@ async fn chat_completions_with(
                     Some("messages[].content".into()),
                 );
             }
-            model
+            contract
         }
     };
 
@@ -445,18 +446,10 @@ async fn chat_completions_with(
     let mut prompt_ids = crate::obs::ttft::timed(&crate::obs::ttft::ENCODE, || {
         crate::serve::encode_prompt(&prompt, |p| bundle.tokenizer().encode(p))
     });
-    let mm_job = match &mm_model {
-        Some(m) => match crate::serve::mm::prepare(m, &req.messages, &mut prompt_ids, crate::serve::mm::Limits::from_env()).await {
-            Ok(job) => job,
-            Err(e) => {
-                return crate::serve::api_error(
-                    axum::http::StatusCode::from_u16(e.status).unwrap_or(axum::http::StatusCode::BAD_REQUEST),
-                    e.message,
-                    if e.status == 400 { "invalid_request_error" } else { "server_error" },
-                    (e.status == 400).then_some("invalid_value"),
-                    Some("messages[].content".into()),
-                )
-            }
+    let mm_pending = match &mm_contract {
+        Some(c) => match crate::serve::mm::expand(c, &req.messages, &mut prompt_ids, crate::serve::mm::Limits::from_env()).await {
+            Ok(p) => p,
+            Err(e) => return mm_error(e),
         },
         None => None,
     };
@@ -495,6 +488,18 @@ async fn chat_completions_with(
         (None, None) => unreachable!("checked at lookup"),
     };
     let key = dp.map_or(req.model.as_str(), |set| set.ranks[rank].key.as_str());
+    let mm_job = match mm_pending {
+        Some(p) => {
+            let Some(mm) = state.mm_model(key) else {
+                return mm_error(crate::serve::mm::MmError { status: 503, message: "model is not loaded; retry".into() });
+            };
+            match crate::serve::mm::encode(&mm, p).await {
+                Ok(job) => Some(job),
+                Err(e) => return mm_error(e),
+            }
+        }
+        None => None,
+    };
     let (tx, rx) = stream_mod::channel();
     let Some(in_flight) = ids.begin(&req.model) else {
         return crate::serve::api_error(
@@ -596,6 +601,16 @@ async fn chat_completions_with(
         cache.stamp(&mut response);
     }
     response
+}
+
+fn mm_error(e: crate::serve::mm::MmError) -> Response {
+    crate::serve::api_error(
+        axum::http::StatusCode::from_u16(e.status).unwrap_or(axum::http::StatusCode::BAD_REQUEST),
+        e.message,
+        if e.status == 400 { "invalid_request_error" } else { "server_error" },
+        (e.status == 400).then_some("invalid_value"),
+        Some("messages[].content".into()),
+    )
 }
 
 /// No rank of a data-parallel model is serving (all unloading, or each refused the request).

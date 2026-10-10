@@ -450,6 +450,9 @@ pub struct AppState {
     /// prefix sharing up) — a scrape must never queue behind a tick.
     #[cfg(feature = "cuda")]
     vmm_stats: RwLock<FxHashMap<String, crate::memory::vmm::VmmStatsHandle>>,
+    /// Per-instance multimodal runtime (encoders on the instance's device, slab mirroring its
+    /// engine's table): installed and removed with the engine.
+    mm: RwLock<FxHashMap<String, Arc<mm::MmModel>>>,
     /// One S1 residency manager per device group (residency + VRAM planner).
     /// Installed once at startup; empty on CPU-only serves.
     ///
@@ -553,6 +556,7 @@ impl AppState {
             gpu: RwLock::new(FxHashMap::default()),
             #[cfg(feature = "cuda")]
             vmm_stats: RwLock::new(FxHashMap::default()),
+            mm: RwLock::new(FxHashMap::default()),
             #[cfg(feature = "cuda")]
             managers: std::sync::OnceLock::new(),
             slug_group: RwLock::new(FxHashMap::default()),
@@ -669,6 +673,12 @@ impl AppState {
             job = match refused {
                 mux::SubmitError::Full(j) | mux::SubmitError::Closed(j) => j,
             };
+            // Media rows are staged into the serving engine's own slab: move the reservation.
+            if let Some(mm) = job.opts.mm.as_mut() {
+                if !self.mm_model(&set.ranks[r].key).is_some_and(|m| mm.rebind(m.slab())) {
+                    return Err(mux::SubmitError::Full(job));
+                }
+            }
             rank = r;
             next = Some(m);
             held = Some(pick);
@@ -712,7 +722,22 @@ impl AppState {
             #[cfg(not(feature = "cuda"))]
             let _ = r;
         }
+        if let Ok(bundle) = self.registry.get(self.model_of(&slug)) {
+            if let Some(c) = bundle.serve().multimodal.as_ref() {
+                self.install_mm(&slug, &bundle.dir, c, self.ordinal_of(&slug));
+            }
+        }
         self.gpu.write().insert(slug, Arc::new(Mutex::new(engine)));
+    }
+
+    /// Give instance `key` its own multimodal runtime on `device`, replacing any earlier one.
+    pub fn install_mm(&self, key: &str, dir: &std::path::Path, contract: &plow_asset::multimodal::MmContract, device: u8) {
+        self.mm.write().insert(key.to_string(), Arc::new(mm::MmModel::new(dir, contract, device)));
+    }
+
+    /// Instance `key`'s multimodal runtime, while its engine is installed.
+    pub fn mm_model(&self, key: &str) -> Option<Arc<mm::MmModel>> {
+        self.mm.read().get(key).cloned()
     }
 
     #[cfg(feature = "cpu")]
@@ -783,6 +808,8 @@ impl AppState {
         if let Some((set, r)) = self.dp_rank(slug) {
             set.set_probe(r, None);
         }
+        // Its encoder threads exit (and free their packets) once in-flight encodes let go.
+        self.mm.write().remove(slug);
         self.gpu.write().remove(slug)
     }
 
@@ -1521,6 +1548,50 @@ pub(crate) fn api_error_for(err: &RuntimeError) -> axum::response::Response {
         _ => ("server_error", None),
     };
     api_error(status, err.to_string(), kind, code, None)
+}
+
+#[cfg(test)]
+mod mm_state_tests {
+    use super::AppState;
+    use std::sync::Arc;
+
+    fn state() -> AppState {
+        let backend: Arc<dyn crate::device::Backend> = Arc::new(crate::device::cpu::CpuBackend::new(1));
+        AppState::new(crate::orch::Registry::new(), Arc::new(crate::exec::ExecutorSet::bringup(backend).unwrap()))
+    }
+
+    fn contract() -> plow_asset::multimodal::MmContract {
+        plow_asset::multimodal::MmContract { version: 1, hidden: 2, pad_token: 0, slab_rows: 4, table_capacity: 8, modalities: Vec::new() }
+    }
+
+    /// Each rank's encoders sit on its own device and its slab mirrors its own table.
+    #[test]
+    fn each_instance_gets_its_device_and_its_own_slab() {
+        let state = state();
+        let dir = std::path::Path::new("/assets/m");
+        state.install_mm("m@dp0", dir, &contract(), 1);
+        state.install_mm("m@dp1", dir, &contract(), 3);
+        let (r0, r1) = (state.mm_model("m@dp0").unwrap(), state.mm_model("m@dp1").unwrap());
+        assert_eq!((r0.device(), r1.device()), (1, 3));
+        assert!(!Arc::ptr_eq(r0.slab(), r1.slab()));
+        assert!(state.mm_model("m").is_none());
+    }
+
+    #[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu"))]
+    #[test]
+    fn unload_releases_the_instance_multimodal_state() {
+        let state = state();
+        let dir = std::path::Path::new("/assets/m");
+        state.install_mm("m@dp0", dir, &contract(), 0);
+        state.install_mm("m@dp1", dir, &contract(), 1);
+        let model = Arc::downgrade(&state.mm_model("m@dp0").unwrap());
+        let slab = Arc::downgrade(state.mm_model("m@dp0").unwrap().slab());
+        assert!(state.remove_gpu_engine("m@dp0").is_none());
+        assert!(state.mm_model("m@dp0").is_none());
+        assert!(model.upgrade().is_none(), "encoders are owned by the instance and drop with it");
+        assert!(slab.upgrade().is_none());
+        assert!(state.mm_model("m@dp1").is_some(), "other ranks keep theirs");
+    }
 }
 
 #[cfg(test)]
