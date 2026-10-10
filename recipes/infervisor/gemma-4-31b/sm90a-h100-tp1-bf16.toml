@@ -7,14 +7,24 @@
 #   PLOW_CAMPAIGN_NO_NIX=1 (box without nix only) HF31=<that snapshot> \
 #   python3 scripts/campaign/campaign.py build recipes/infervisor/gemma-4-31b/sm90a-h100-tp1-bf16.toml --out <fresh dir>
 #
-# @@EVIDENCE@@
+# Not qualified (2026-10-10, packet 87176bdcb0f1, plowrt 071d8f13). FP32-reference gate FAILS twice on
+# kl_mean only (0.0215 / 0.0252 vs vLLM 0.0084, limit 0.0124); kl_p99 0.079 / 0.083, top1_decisive
+# 0.996 / 0.997, cont_frac 0.84 / 0.89 and needles 1.0 pass. transformers BF16 on the same reference
+# scores kl_mean 0.0219: plow BF16 is at transformers-BF16 parity; vLLM 0.28 BF16 is unusually close
+# to FP32 here. The excess sits in repetition-loop positions of the natural-text cases. campaign.py
+# report vs vLLM 0.28 BF16 (0.97 memory, --max-model-len 16384) is therefore NOT EQUIVALENT; total tok/s:
+# latency c1/c4 0.97x / 0.99x, 4K c32/c128 0.81x / 0.81x (8 slots vs vLLM's ~13 windowed requests),
+# 15K c32/c128 1.06x / 1.05x. docs/bringup/results/gemma31b-h100-20261010/comparison.md.
+# Not run: agentic, the open-loop production mix. PLOW_TOKEN_BATCH=0 is numerically broken on this
+# packet (keep 1).
 #
 # Memory: BF16 weights 57.2 GiB. A staged slot keeps a 2048-row BF16 sliding ring = 1.6 GiB (50 layers x
 # 16 KV heads x 256 x K+V x 2 B), so 8 slots = 12.5 GiB of rings; the full-attention KV (80 KiB/token)
 # gets the remaining ~5 GiB admission budget (~65K rows: 8 x 8K, or 4 x 15K). The cuBLASLt prefill
 # attention route (PLOW_PF_ATTN_GEMM) does not fit beside that budget and stays on FlashPrefill.
-# FP8 KV would double the slots but is not gated here; vLLM 0.28 BF16 holds one 16K request (it sizes
-# the sliding layers at full length) and needs --gpu-memory-utilization 0.97 to start at 16384.
+# FP8 KV would double the slots but is not gated here. vLLM 0.28 BF16 sizes the sliding layers at full
+# length for its startup check and needs --gpu-memory-utilization 0.97 to start at 16384; in steady
+# state it keeps only the window and holds ~13 4K requests.
 #
 # Routes:
 #   prefill projections   cuBLASLt BF16 at every Gemma-4-31B projection and rung (route matrix: Lt
@@ -26,8 +36,8 @@ schema = "plow.recipe.v1"
 namespace = "infervisor"
 name = "gemma-4-31b"
 label = "sm90a-h100-tp1-bf16"
-status = "candidate"
-plow_git = "8e0f7b3be04396a903075b2499649bf58638afee"
+status = "emits"
+plow_git = "071d8f13cd546dc052d2e4702ac6c4aed1af1ff0"
 network = "gemma4"
 
 [target]
@@ -111,12 +121,12 @@ model_id = "gemma-4-31b-it"
 gate_prompt = "<bos><|turn>user\nWhat is the capital of France? Answer in one short sentence.<turn|>\n<|turn>model\n<|channel>thought\n<channel|>"
 
 [measured]
-tok_s = 0.0
-p50_tpot_ms = 0.0
+tok_s = 145.0
+p50_tpot_ms = 51.7
 concurrency = 32
 input_len = 4096
 output_len = 128
-client = "@@MEASURED@@"
+client = "vllm 0.28.0 bench serve (repro_gemma31b_h100.sh st4k, 2 repeats, packet 87176bdcb0f1)"
 
 # FP32-reference gate (scripts/llm/fp32_ref_gate.py; repro_gemma31b_h100.sh gate runs it). The
 # reference is BF16 -> FP32 on one GPU with `reference --device offload` (33 decoder layers in BF16 on

@@ -9,7 +9,8 @@ rows marked "grid" come from `llm_grid.sh` or earlier same-client grids and are 
 | E4B | BF16 | [`recipes/infervisor/gemma-4-e4b/sm90a-h100-tp1.toml`](../../../../recipes/infervisor/gemma-4-e4b/sm90a-h100-tp1.toml) | main `fc0271e8` (repro) | `llm_logit_parity` PASS | grid only | no strict report |
 | 12B | FP8 W8A8, FP8 per-token-head KV | [`recipes/infervisor/gemma-4-12b/sm90a-h100-tp1.toml`](../../../../recipes/infervisor/gemma-4-12b/sm90a-h100-tp1.toml) | `ee57f7b7` | `llm_fp32_ref` PASS | strict, 10 cells | **yes**, vs vLLM 0.28 FP8 KV |
 | 12B, 26B-A4B | BF16 | `scripts/campaign/recipes/gemma4-{12b,26b-a4b}.h100.bf16-*.toml` | | | ledgers only | no |
-| 31B | BF16 / FP8 | frozen release, no recipe | `3ca64e9` / `25fb3d7` | functional | none on H100 | no |
+| 31B | FP8 W8A8, FP8 per-token-head KV | [`recipes/infervisor/gemma-4-31b/sm90a-h100-tp1-fp8.toml`](../../../../recipes/infervisor/gemma-4-31b/sm90a-h100-tp1-fp8.toml) | `8818de12` | `llm_fp32_ref` PASS x2 (long gate fails cont_frac; ships 16384) | strict, 12 cells | **yes**, vs vLLM 0.28 FP8 KV (4K/15K/32K/agentic; loses c1/c4) |
+| 31B | BF16 | [`recipes/infervisor/gemma-4-31b/sm90a-h100-tp1-bf16.toml`](../../../../recipes/infervisor/gemma-4-31b/sm90a-h100-tp1-bf16.toml) | `071d8f13` | `llm_fp32_ref` FAIL (kl_mean vs vLLM; transformers-BF16 parity) | strict, NOT EQUIVALENT | no |
 
 ## Gemma-4 E4B (voice-agent LLM)
 
@@ -144,7 +145,9 @@ that the recipes' `[reference]` sections name. Packet recreate records:
 
 ## Gemma-4 31B
 
-- H100: frozen release `/opt/dlami/nvme/plow-releases/gemma4-31b-h100-20260909`, functionally
+- H100 2026-10-10: FP8 and BF16 recipes and the strict comparison vs vLLM 0.28:
+  [gemma31b-h100-20261010/comparison.md](../gemma31b-h100-20261010/comparison.md).
+- H100 (earlier): frozen release `/opt/dlami/nvme/plow-releases/gemma4-31b-h100-20260909`, functionally
   validated profiles only ([gemma4-h100-release.md](../../../runtime/gemma4-h100-release.md),
   [gemma4-h100-checkpoint.md](../../../runtime/gemma4-h100-checkpoint.md)). No serving
   comparison is recorded.
