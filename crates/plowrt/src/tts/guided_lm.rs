@@ -17,6 +17,7 @@ use std::path::Path;
 
 use plow_asset::packet_pipeline::PacketPipeline;
 
+#[cfg(feature = "cuda")]
 use crate::exec::gpu::{GpuEngine, PrefillStep};
 pub use crate::text::sample::{sample_cfg, CfgParams, SplitMix};
 use crate::{Result, RuntimeError};
@@ -92,8 +93,9 @@ impl GuidedLmContract {
         let Some(pkt) = crate::asset::devblob::DevBlob::find_in_dir(assets)? else {
             return Ok(None);
         };
-        let Some(asset) = crate::exec::packet_runtime::PacketAsset::load_if_present(&pkt)? else {
-            return Ok(None);
+        let asset = match crate::exec::packet_runtime::PacketAsset::load_if_present(&pkt) {
+            Ok(Some(a)) => a,
+            _ => return Ok(None),
         };
         let mut found = asset.pipelines().iter().filter(|p| p.driver == DRIVER);
         match (found.next(), found.next()) {
@@ -126,7 +128,7 @@ impl PromptTables {
     pub fn load(assets: &Path, hidden: usize) -> Result<Self> {
         let path = assets.join("model.pkt");
         let raw = std::fs::read(&path).map_err(|source| RuntimeError::Io { path: path.clone(), source })?;
-        let blob = crate::asset::devblob::DevBlob::parse(&raw)?;
+        let blob = crate::asset::devblob::DevBlob::parse_l2(&raw, true)?;
         let host = |name: &str| -> Option<Vec<f32>> {
             let t = blob.tensors.iter().find(|t| t.name == name)?;
             Some(le_f32s(&blob.init[t.init.clone()?]))
@@ -221,6 +223,7 @@ impl PromptTables {
 
 /// T3 on a `GpuEngine` it owns, one CFG pair at a time: the numerics gate (`examples/t3_check`).
 /// Serving runs T3 on the model's mux (`tts::guided_speech`).
+#[cfg(feature = "cuda")]
 pub struct GuidedLm {
     pub e: GpuEngine,
     pub c: GuidedLmContract,
@@ -231,6 +234,7 @@ pub struct GuidedLm {
     raw: Vec<u8>,
 }
 
+#[cfg(feature = "cuda")]
 impl GuidedLm {
     pub fn load(assets: &Path, device: u8) -> Result<Self> {
         let c = GuidedLmContract::load(assets)?

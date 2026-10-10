@@ -6,14 +6,13 @@
 //! served engine's continuous-batching mux like any causal model; the codes it emits are decoded
 //! by the codec stage the contract names ([`codec`]). See docs/arch/24-tts-pipelines.md.
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "hsa"))]
 pub mod codec;
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "hsa"))]
 pub mod serving;
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "hsa"))]
 pub mod guided_lm;
-#[cfg(feature = "cuda")]
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "hsa"))]
 pub mod guided_speech;
 
 use std::path::Path;
@@ -89,8 +88,9 @@ impl SpeechContract {
         let Some(pkt) = crate::asset::devblob::DevBlob::find_in_dir(assets)? else {
             return Ok(None);
         };
-        let Some(asset) = crate::exec::packet_runtime::PacketAsset::load_if_present(&pkt)? else {
-            return Ok(None);
+        let asset = match crate::exec::packet_runtime::PacketAsset::load_if_present(&pkt) {
+            Ok(Some(a)) => a,
+            _ => return Ok(None),
         };
         let mut found = asset.pipelines().iter().filter(|p| p.driver == DRIVER);
         match (found.next(), found.next()) {

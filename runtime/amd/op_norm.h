@@ -23,6 +23,7 @@
 #include "token_batch.h"
 
 #include "amd_common.h"
+#include "op_elementwise.h"
 #include "packed_prefill.h"
 #include "mixed_step.h"
 
@@ -375,7 +376,7 @@ __device__ void d_rmsnorm(bf16* __restrict__ out, const bf16* __restrict__ x,
  * QuantFp8Block128 over `out` produces (same amax floor, scale, and PLOW_GM_FP8_PACK2 on the
  * ROUNDED outputs), so the pair becomes one packet. A 128-group is 16 consecutive lanes' 8-element
  * chunks of rn_index. Requires the register-resident row (`fits`) and feat % 128 == 0. */
-#ifdef PLOW_GM_FP8_PACK2
+#if defined(PLOW_GM_FP8_PACK2) && (rn_groups == 1)
 __device__ void d_rmsnorm_q128(bf16* __restrict__ out, const bf16* __restrict__ x,
                                const bf16* __restrict__ gamma, unsigned rows, unsigned feat,
                                float eps, unsigned slice, unsigned nblk, float* part,
@@ -1320,6 +1321,159 @@ __device__ void d_norm_residual_norm(bf16* __restrict__ out, bf16* resid, const 
                 st_act1(&out[base + i], f2bf(bf2f(resid[base + i]) * invr * g));
             }
         }
+    }
+}
+
+/* PerLayerInput (op 155): Gemma-4 E-series per-layer input block. */
+__device__ void d_per_layer_input(
+    bf16* __restrict__ x,
+    const bf16* __restrict__ wg,
+    const bf16* __restrict__ wp,
+    const bf16* __restrict__ gamma,
+    const bf16* __restrict__ ple,
+    bf16* __restrict__ hn,
+    const bf16* __restrict__ gnext,
+    unsigned rows, unsigned H, unsigned P, unsigned col0, unsigned stride,
+    float eps, float ls,
+    unsigned slice, unsigned nblk,
+    float* __restrict__ scratch
+) {
+    if (P > 1024u || H > 8192u) {
+        __builtin_trap();
+        return;
+    }
+
+    float* a = scratch;
+    float* y = a + P;
+    float* part = y + H;
+
+    const unsigned wave_id = threadIdx.x >> 6;
+    const unsigned lane_id = threadIdx.x & 63;
+
+    for (unsigned t = slice; t < rows; t += nblk) {
+        bf16* xr = x + (size_t)t * H;
+        const bf16* pr = ple + (size_t)t * stride + col0;
+
+        // 1. Gate: a[p] = f2bf(gelu(Wg[p, :] * xr) * pr[p])
+        for (unsigned p = wave_id; p < P; p += PLOW_WAVES) {
+            const bf16* w_row = wg + (size_t)p * H;
+            float s = 0.0f;
+            if ((H & 7u) == 0) {
+                const auto* wg_ptr = as_glob(w_row);
+                const auto* xr_ptr = as_glob(xr);
+                for (unsigned h = lane_id * 8; h < H; h += 64 * 8) {
+                    bf16v8 vw = ld_glob8(wg_ptr + h);
+                    bf16v8 vx = ld_glob8(xr_ptr + h);
+#pragma unroll
+                    for (int j = 0; j < 8; j++) {
+                        s += bf2f(vw[j]) * bf2f(vx[j]);
+                    }
+                }
+            } else {
+                for (unsigned h = lane_id; h < H; h += 64) {
+                    s += bf2f(w_row[h]) * bf2f(xr[h]);
+                }
+            }
+            s = wave_sum(s);
+            if (lane_id == 0) {
+                const float s_bf = bf2f(f2bf(s));
+                const float g = bf2f(f2bf(act_gelu_tanh(s_bf)));
+                a[p] = bf2f(f2bf(g * bf2f(pr[p])));
+            }
+        }
+        __syncthreads();
+
+        // 2. Projection: y[h] = Wp[h, :] * a
+        float local_ss = 0.0f;
+        for (unsigned h = wave_id; h < H; h += PLOW_WAVES) {
+            const bf16* w_row = wp + (size_t)h * P;
+            float s = 0.0f;
+            if ((P & 7u) == 0) {
+                const auto* wp_ptr = as_glob(w_row);
+                for (unsigned p = lane_id * 8; p < P; p += 64 * 8) {
+                    bf16v8 vw = ld_glob8(wp_ptr + p);
+#pragma unroll
+                    for (int j = 0; j < 8; j++) {
+                        s += bf2f(vw[j]) * a[p + j];
+                    }
+                }
+            } else {
+                for (unsigned p = lane_id; p < P; p += 64) {
+                    s += bf2f(w_row[p]) * a[p];
+                }
+            }
+            s = wave_sum(s);
+            if (lane_id == 0) {
+                const float y_val = bf2f(f2bf(s));
+                y[h] = y_val;
+                local_ss += y_val * y_val;
+            }
+        }
+        __syncthreads();
+
+        // 3. RMSNorm of y: ss = sum(y^2), inv = rsqrt(ss / H + eps)
+        float ss = block_sum(local_ss, part);
+        float inv = rsqrtf(ss / (float)H + eps);
+
+        // 4. Update xr: xr = (xr + rmsnorm(y) * gamma) * ls
+        float local_ss2 = 0.0f;
+        if ((H & 7u) == 0) {
+            auto* xr_ptr = as_glob(xr);
+            const auto* gam_ptr = as_glob(gamma);
+            for (unsigned h = threadIdx.x * 8; h < H; h += PLOW_THREADS * 8) {
+                bf16v8 vx = ld_glob8(xr_ptr + h);
+                bf16v8 vg = gamma ? ld_glob8(gam_ptr + h) : bf16v8_zero();
+                bf16v8 vout;
+#pragma unroll
+                for (int j = 0; j < 8; j++) {
+                    const float g = gamma ? bf2f(vg[j]) : 1.0f;
+                    const float n = bf2f(f2bf(y[h + j] * inv * g));
+                    const bf16 v = f2bf(bf2f(f2bf(bf2f(vx[j]) + n)) * ls);
+                    vout[j] = v;
+                    const float vf = bf2f(v);
+                    local_ss2 += vf * vf;
+                }
+                st_glob8(xr_ptr + h, vout);
+            }
+        } else {
+            for (unsigned h = threadIdx.x; h < H; h += PLOW_THREADS) {
+                const float g = gamma ? bf2f(gamma[h]) : 1.0f;
+                const float n = bf2f(f2bf(y[h] * inv * g));
+                const bf16 v = f2bf(bf2f(f2bf(bf2f(xr[h]) + n)) * ls);
+                xr[h] = v;
+                const float vf = bf2f(v);
+                local_ss2 += vf * vf;
+            }
+        }
+
+        // 5. Optional next-layer norm: hn = rmsnorm(xr) * gnext
+        if (hn) {
+            float ss2 = block_sum(local_ss2, part);
+            float inv2 = rsqrtf(ss2 / (float)H + eps);
+            bf16* o = hn + (size_t)t * H;
+            if ((H & 7u) == 0) {
+                auto* o_ptr = as_glob(o);
+                const auto* xr_ptr = as_glob(xr);
+                const auto* gn_ptr = as_glob(gnext);
+                for (unsigned h = threadIdx.x * 8; h < H; h += PLOW_THREADS * 8) {
+                    bf16v8 vx = ld_glob8(xr_ptr + h);
+                    bf16v8 vgn = gnext ? ld_glob8(gn_ptr + h) : bf16v8_zero();
+                    bf16v8 vout;
+#pragma unroll
+                    for (int j = 0; j < 8; j++) {
+                        const float g = gnext ? bf2f(vgn[j]) : 1.0f;
+                        vout[j] = f2bf(bf2f(vx[j]) * inv2 * g);
+                    }
+                    st_glob8(o_ptr + h, vout);
+                }
+            } else {
+                for (unsigned h = threadIdx.x; h < H; h += PLOW_THREADS) {
+                    const float g = gnext ? bf2f(gnext[h]) : 1.0f;
+                    o[h] = f2bf(bf2f(xr[h]) * inv2 * g);
+                }
+            }
+        }
+        __syncthreads();
     }
 }
 

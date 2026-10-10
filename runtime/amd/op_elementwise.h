@@ -278,6 +278,77 @@ __device__ void d_embed(bf16* __restrict__ out, const bf16* __restrict__ table,
     }
 }
 
+/* EmbedOverlayBf16 (op 179): a row is table[tokens[r]] unless overlay_index[r] names an
+ * overlay row, which is BF16-rounded in. */
+__device__ void d_embed_overlay(bf16* __restrict__ out, const bf16* __restrict__ table,
+                                const unsigned* __restrict__ tokens, const float* __restrict__ overlay,
+                                const unsigned* __restrict__ overlay_index, unsigned rows, unsigned width,
+                                unsigned vocab, unsigned overlay_rows, unsigned slice, unsigned nblk) {
+    const auto* tg = as_glob(table);
+    auto* og = as_glob(out);
+    for (unsigned r = slice; r < rows; r += nblk) {
+        const unsigned sel = overlay_index[r];
+        if (sel == 0xFFFFFFFFu) {
+            if (tokens[r] >= vocab) { __builtin_trap(); return; }
+            const size_t src = (size_t)tokens[r] * width, dst = (size_t)r * width;
+            if ((width & 7u) == 0) {
+                for (unsigned i = threadIdx.x * 8; i < width; i += PLOW_THREADS * 8)
+                    st_glob8(og + dst + i, ld_glob8(tg + src + i));
+            } else {
+                for (unsigned i = threadIdx.x; i < width; i += PLOW_THREADS)
+                    out[dst + i] = table[src + i];
+            }
+        } else {
+            if (sel >= overlay_rows) { __builtin_trap(); return; }
+            const float* src = overlay + (size_t)sel * width;
+            const size_t dst = (size_t)r * width;
+            if ((width & 7u) == 0) {
+                for (unsigned i = threadIdx.x * 8; i < width; i += PLOW_THREADS * 8) {
+                    bf16v8 v;
+#pragma unroll
+                    for (int j = 0; j < 8; j++) v[j] = f2bf(src[i + j]);
+                    st_glob8(og + dst + i, v);
+                }
+            } else {
+                for (unsigned i = threadIdx.x; i < width; i += PLOW_THREADS)
+                    out[dst + i] = f2bf(src[i]);
+            }
+        }
+    }
+}
+
+/* EmbedPosBf16 (op 194): out[r] = bf16(table[tokens[r]] + pos_table[pos[r] - base[r]]). */
+__device__ void d_embed_pos(bf16* __restrict__ out, const bf16* __restrict__ table,
+                            const unsigned* __restrict__ tokens, const bf16* __restrict__ pos_table,
+                            const unsigned* __restrict__ pos, const unsigned* __restrict__ base,
+                            unsigned rows, unsigned width, unsigned vocab, unsigned pos_rows,
+                            unsigned slice, unsigned nblk) {
+    const auto* tg = as_glob(table);
+    const auto* ptg = as_glob(pos_table);
+    auto* og = as_glob(out);
+    for (unsigned r = slice; r < rows; r += nblk) {
+        if (pos[r] < base[r]) { __builtin_trap(); return; }
+        const unsigned p = pos[r] - base[r];
+        if (tokens[r] >= vocab || p >= pos_rows) { __builtin_trap(); return; }
+        const size_t src_a = (size_t)tokens[r] * width;
+        const size_t src_b = (size_t)p * width;
+        const size_t dst = (size_t)r * width;
+        if ((width & 7u) == 0) {
+            for (unsigned i = threadIdx.x * 8; i < width; i += PLOW_THREADS * 8) {
+                bf16v8 va = ld_glob8(tg + src_a + i);
+                bf16v8 vb = ld_glob8(ptg + src_b + i);
+                bf16v8 vo;
+#pragma unroll
+                for (int j = 0; j < 8; j++) vo[j] = f2bf(bf2f(va[j]) + bf2f(vb[j]));
+                st_glob8(og + dst + i, vo);
+            }
+        } else {
+            for (unsigned i = threadIdx.x; i < width; i += PLOW_THREADS)
+                out[dst + i] = f2bf(bf2f(table[src_a + i]) + bf2f(pos_table[src_b + i]));
+        }
+    }
+}
+
 /* Compact hidden-row gather — the unified token batch's terminal row selection.
  *
  * out[s][h] = x[rows[s]][h], for s in [0, S), over H features.

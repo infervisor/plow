@@ -118,7 +118,7 @@ fn native(inst: &DevInst64) -> bool {
 }
 
 pub(super) fn program_candidate(prog: &DevProg) -> bool {
-    if prog.l2_domains != 0 || !matches!(prog.t, 1024 | 2048 | 4096 | 8192) {
+    if prog.l2_domains != 0 || !matches!(prog.t, 512 | 1024 | 2048 | 4096 | 8192) {
         return false;
     }
     let segments = prog
@@ -210,7 +210,7 @@ pub(super) fn routes(
 ) -> Result<Vec<Option<Route>>> {
     let mut out = vec![None; segments];
     if prog.l2_domains != 0
-        || !matches!(prog.t, 1024 | 2048 | 4096 | 8192)
+        || !matches!(prog.t, 512 | 1024 | 2048 | 4096 | 8192)
         || !prog.insts.iter().any(native)
     {
         return Ok(out);
@@ -223,7 +223,7 @@ pub(super) fn routes(
         let (model, kind) = classify(inst).unwrap();
         if inst.i[0] != prog.t {
             return Err(err(
-                "requires an exact 1K/2K/4K/8K bias-free Gemma projection",
+                "requires an exact 512/1K/2K/4K/8K bias-free Gemma projection",
             ));
         }
         let mut handles = BTreeSet::new();
@@ -967,7 +967,7 @@ mod tests {
             (15_360, 3_840, Model::Gemma12),
             (21_504, 5_376, Model::Gemma31),
         ] {
-            for rows in [1024, 2048, 4096, 8192] {
+            for rows in [512, 1024, 2048, 4096, 8192] {
                 type Fixture = fn(u32, u32, u32) -> (DevProg, Vec<DevTensor>);
                 for (precision, fixture) in [
                     (Precision::Bf16, fixture as Fixture),
@@ -995,7 +995,7 @@ mod tests {
 
     #[test]
     fn gemma12_bf16_output_projections_are_serial_candidates() {
-        for rows in [1024, 2048, 4096, 8192] {
+        for rows in [512, 1024, 2048, 4096, 8192] {
             for k in [4096, 8192] {
                 let (prog, tensors) = down_fixture(rows, 3840, k, Precision::Bf16);
                 assert!(program_candidate(&prog));
@@ -1072,7 +1072,7 @@ mod tests {
         for case in 0..10 {
             let (mut prog, mut tensors) = fixture(8192, 15_360, 3_840);
             match case {
-                0 => prog.t = 512,
+                0 => prog.t = 256,
                 1 => prog.insts[0].i[0] = 4096,
                 2 => prog.insts[0].i[5] = 1,
                 3 => prog.insts[0].fj[0] = 1,
@@ -1099,7 +1099,7 @@ mod tests {
             (5_376, 21_504, Model::Gemma31),
         ] {
             for precision in [Precision::Bf16, Precision::Fp8] {
-                for rows in [1024, 2048, 4096, 8192] {
+                for rows in [512, 1024, 2048, 4096, 8192] {
                     let (prog, tensors) = down_fixture(rows, n, k, precision);
                     assert!(program_down_candidate(&prog));
                     assert_eq!(program_fp8_candidate(&prog), precision == Precision::Fp8);

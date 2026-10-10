@@ -39,64 +39,33 @@ struct Encode {
 /// final's encode wait out other models' ticks, 52 -> 212 ms p50 at 50 calls, where running
 /// alongside them costs less.)
 /// `cost_id`: the encoder's id in [`crate::sched::cost`]; launches are sized at a 10 ms mel hop.
-fn encode_loop(rx: std::sync::mpsc::Receiver<Encode>, mut encoder: PacketAudioEncoder, cost_id: usize) {
-    let max_chunks = encoder.max_packed_chunks();
-    let mut pending: std::collections::VecDeque<Encode> = Default::default();
-    while let Ok(first) = rx.recv() {
-        pending.push_back(first);
-        while !pending.is_empty() {
-            pending.extend(rx.try_iter());
-            pending.make_contiguous().sort_by_key(|job| !job.urgent);
-            let mut chunks = 0;
-            let n = pending
-                .iter()
-                .take_while(|job| {
-                    chunks += encoder.chunks(job.features.frames);
-                    chunks <= max_chunks
-                })
-                .count();
-            // One utterance runs its single-utterance capacity: the same bits, a shorter launch.
-            if n <= 1 {
-                let job = pending.pop_front().unwrap();
-                let started = Instant::now();
-                let rows = encoder.encode(&job.features);
-                tracing::debug!(
-                    frames = job.features.frames,
-                    urgent = job.urgent,
-                    queued = pending.len(),
-                    wall_ms = started.elapsed().as_secs_f64() * 1e3,
-                    "asr: single encoder launch"
-                );
-                crate::sched::cost::record_id(cost_id, crate::sched::cost::Op::Encode { audio_ms: job.features.frames as u32 * 10 }, started.elapsed());
-                let _ = job.respond.send(rows);
-                continue;
+fn encode_worker_loop(
+    rx: Arc<Mutex<std::sync::mpsc::Receiver<Encode>>>,
+    mut encoder: PacketAudioEncoder,
+    cost_id: usize,
+) {
+    loop {
+        let job = {
+            let guard = rx.lock();
+            match guard.recv() {
+                Ok(job) => job,
+                Err(_) => break,
             }
-            let batch: Vec<Encode> = pending.drain(..n).collect();
-            let features: Vec<&MelFeatures> = batch.iter().map(|job| &job.features).collect();
-            let started = Instant::now();
-            let encoded = encoder.encode_packed(&features);
-            tracing::debug!(
-                items = n,
-                finals = batch.iter().filter(|job| job.urgent).count(),
-                chunks = features.iter().map(|f| encoder.chunks(f.frames)).sum::<usize>(),
-                gpu_ms = encoder.last_gpu_us() / 1e3,
-                wall_ms = started.elapsed().as_secs_f64() * 1e3,
-                "asr: packed encoder launch"
-            );
-            crate::sched::cost::record_id(cost_id, crate::sched::cost::Op::Encode { audio_ms: features.iter().map(|f| f.frames as u32 * 10).sum() }, started.elapsed());
-            match encoded {
-                Ok(rows) => {
-                    for (job, rows) in batch.into_iter().zip(rows) {
-                        let _ = job.respond.send(Ok(rows));
-                    }
-                }
-                Err(e) => {
-                    for job in batch {
-                        let _ = job.respond.send(Err(RuntimeError::Msg(format!("ASR encoder: {e}"))));
-                    }
-                }
-            }
-        }
+        };
+        let started = Instant::now();
+        let rows = encoder.encode(&job.features);
+        tracing::info!(
+            frames = job.features.frames,
+            urgent = job.urgent,
+            wall_ms = started.elapsed().as_secs_f64() * 1e3,
+            "asr: single encoder launch"
+        );
+        crate::sched::cost::record_id(
+            cost_id,
+            crate::sched::cost::Op::Encode { audio_ms: job.features.frames as u32 * 10 },
+            started.elapsed(),
+        );
+        let _ = job.respond.send(rows);
     }
 }
 
@@ -117,8 +86,9 @@ impl SharedAsr {
         let checkpoint = if checkpoint.is_dir() { checkpoint } else { dir.to_path_buf() };
         let prompt = AudioLmPrompt::load(&dir.join("model.pkt"), &checkpoint)?;
         let encoder_path =
-            crate::exec::packet_runtime::stage_packet(&dir.join("model.pkt"), "encoder.packet", "encoder.pkt")?;
-        let mut encoder = PacketAudioEncoder::load(&encoder_path, "cuda")?;
+            crate::exec::packet_runtime::stage_packet(&dir.join("model.pkt"), "encoder.packet", "encoder.pkt")
+                .unwrap_or_else(|_| dir.join("encoder.pkt"));
+        let mut encoder = PacketAudioEncoder::load(&encoder_path, "auto")?;
         let warm = Instant::now();
         encoder.warm()?;
         tracing::info!(ms = warm.elapsed().as_millis() as u64, packed_chunks = encoder.max_packed_chunks(), "asr: encoder graphs warmed");
@@ -126,13 +96,39 @@ impl SharedAsr {
             return Err(RuntimeError::Rejected("audio packet output width does not match the decoder".into()));
         }
         let chunking = prompt.chunking();
-        let window_frames = encoder.window_rows() / chunking.chunk_frames.div_ceil(chunking.frame_stride) * chunking.chunk_frames;
+        let window_frames = if encoder.window_rows() > 0 {
+            encoder.window_rows() / chunking.chunk_frames.div_ceil(chunking.frame_stride) * chunking.chunk_frames
+        } else {
+            chunking.chunk_frames
+        };
         let (encode, rx) = std::sync::mpsc::channel::<Encode>();
         let cost_id = crate::sched::cost::id(&encoder_path.to_string_lossy());
-        std::thread::Builder::new()
-            .name("plow-asr-encoder".into())
-            .spawn(move || encode_loop(rx, encoder, cost_id))
-            .map_err(|e| RuntimeError::Msg(format!("spawn ASR encoder thread: {e}")))?;
+        let shared_rx = Arc::new(Mutex::new(rx));
+        let num_workers = 4;
+        let mut encoders = vec![encoder];
+        let workers_needed = num_workers - 1;
+        let warm_handles: Vec<_> = (0..workers_needed)
+            .map(|i| {
+                let path = encoder_path.clone();
+                std::thread::spawn(move || {
+                    let mut e = PacketAudioEncoder::load(&path, "auto")?;
+                    let warm = Instant::now();
+                    e.warm()?;
+                    tracing::info!(worker = i + 1, ms = warm.elapsed().as_millis() as u64, "asr: worker encoder warmed");
+                    Ok::<_, RuntimeError>(e)
+                })
+            })
+            .collect();
+        for h in warm_handles {
+            encoders.push(h.join().map_err(|_| RuntimeError::Msg("worker warm thread panicked".into()))??);
+        }
+        for (i, enc) in encoders.into_iter().enumerate() {
+            let rx = Arc::clone(&shared_rx);
+            std::thread::Builder::new()
+                .name(format!("plow-asr-enc-{i}"))
+                .spawn(move || encode_worker_loop(rx, enc, cost_id))
+                .map_err(|e| RuntimeError::Msg(format!("spawn ASR encoder thread {i}: {e}")))?;
+        }
         Ok(Self {
             prompt: Arc::new(prompt),
             encode,
@@ -155,7 +151,7 @@ impl SharedAsr {
         let (mut tx, rx) = oneshot::channel();
         let this = Arc::clone(self);
         tokio::spawn(async move {
-            let result = match opts.windows.clone().filter(|_| !opts.final_pass) {
+            let result = match opts.windows.clone() {
                 Some(windows) => this.run_partial(mux, samples, windows, language, context, &cancel, opts, &mut tx).await,
                 None => this.run(mux, samples, language, context, &cancel, opts, &mut tx).await,
             };
@@ -196,7 +192,7 @@ impl SharedAsr {
         cancelled(cancel)?;
         let frames = features.frames;
         let overlay = self.encode_rows(features, opts.final_pass).await?;
-        tracing::debug!(
+        tracing::info!(
             final_pass = opts.final_pass,
             frames,
             frontend_ms = front.as_secs_f64() * 1e3,
@@ -235,8 +231,7 @@ impl SharedAsr {
         .map_err(|e| RuntimeError::Msg(format!("ASR prompt task: {e}")))??;
         cancelled(cancel)?;
         let wf = self.window_frames;
-        // A window is final once the frames after it cover the STFT's right context.
-        let stable = if wf == 0 { 0 } else { features.frames.saturating_sub(STABLE_MARGIN_FRAMES) / wf };
+        let stable = if wf == 0 { 0 } else { features.frames / wf };
         let cached: Vec<Arc<[f32]>> = {
             let mut w = windows.lock();
             w.rows.truncate(stable);
@@ -246,7 +241,8 @@ impl SharedAsr {
         if stable * wf < features.frames {
             pieces.push((stable * wf, features.frames));
         }
-        let encoded = futures::future::try_join_all(pieces.iter().map(|&(a, b)| self.encode_rows(slice_frames(&features, a, b), false))).await?;
+        let urgent = opts.final_pass;
+        let encoded = futures::future::try_join_all(pieces.iter().map(|&(a, b)| self.encode_rows(slice_frames(&features, a, b), urgent))).await?;
         cancelled(cancel)?;
         let fresh = stable - cached.len();
         let hidden = self.prompt.hidden();
@@ -265,12 +261,22 @@ impl SharedAsr {
         }
         let rows = overlay.len() / hidden;
         let (ids, audio_positions) = self.prompt.prompt(rows, language.as_deref(), &context, self.max_context)?;
-        tracing::debug!(frames = features.frames, windows_cached = cached.len(), windows_encoded = fresh, open_frames = features.frames - stable * wf, "asr: partial encode");
+        tracing::info!(
+            final_pass = opts.final_pass,
+            frames = features.frames,
+            windows_cached = cached.len(),
+            windows_encoded = fresh,
+            open_frames = features.frames - stable * wf,
+            encode_ms = arrived.elapsed().as_secs_f64() * 1e3,
+            "asr: window encode"
+        );
         // Local agreement: the previous partial's transcript, less its last DRAFT_TAIL tokens, is
         // forced as prompt rows (one prefill, and resumed from the session's retained rows)
         // instead of decoded token by token again. Partials are revisable; the final decodes the
         // whole recording from scratch.
-        let forced = {
+        let forced = if opts.final_pass {
+            Vec::new()
+        } else {
             let w = windows.lock();
             w.draft[..w.draft.len().saturating_sub(DRAFT_TAIL)].to_vec()
         };
@@ -327,7 +333,7 @@ impl SharedAsr {
                 session,
                 turn: opts.ids.as_ref().and_then(|i| i.turn_key.clone()),
                 continuing: false,
-                speech: Some(Box::new(SpeechJob { overlay, overlay_pos, pos_base: None, cfg: None, first_tokens: 0 })),
+                speech: Some(Box::new(SpeechJob { overlay, overlay_pos, pos_base: None, cfg: None, first_tokens: 0, codebook: None })),
             },
         };
         mux.submit_wait(job).await.map_err(|e| match e {
@@ -418,14 +424,19 @@ fn is_audio_lm(dir: &Path) -> Result<bool> {
     if !packet.is_file() {
         return Ok(false);
     }
-    let Some(asset) = crate::exec::packet_runtime::PacketAsset::load_if_present(&packet)? else {
-        return Ok(false);
+    let asset = match crate::exec::packet_runtime::PacketAsset::load_if_present(&packet) {
+        Ok(Some(a)) => a,
+        _ => return Ok(false),
     };
-    Ok(asset
+    let has_pipeline = asset
         .pipelines()
         .iter()
-        .any(|p| p.driver == "causal.v1" && p.parameters.get("overlay_rows").is_some_and(|&r| r > 0))
-        && dir.join(asset.stage_file("encoder.packet", "encoder.pkt")?).is_file())
+        .any(|p| p.driver == "causal.v1" && p.parameters.get("overlay_rows").is_some_and(|&r| r > 0));
+    if !has_pipeline {
+        return Ok(false);
+    }
+    let stage_file = asset.stage_file("encoder.packet", "encoder.pkt").unwrap_or_else(|_| "encoder.pkt".into());
+    Ok(dir.join(stage_file).is_file())
 }
 
 fn shared_asr(state: &AppState, slug: &str, dir: &Path) -> Result<Option<Arc<SharedAsr>>> {
@@ -468,6 +479,7 @@ pub(super) async fn route(
     model: &str,
 ) -> std::result::Result<(Route, FinalizationPolicy), Response> {
     let slug = state.registry.resolve(model).unwrap_or_else(|| model.to_owned());
+    #[cfg(feature = "cuda")]
     if let Some(mgr) = state.manager_for(&slug) {
         if mgr.manages(&slug) {
             if let Err(e) = mgr.ensure_resident(&slug).await {
