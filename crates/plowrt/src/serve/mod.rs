@@ -438,6 +438,9 @@ pub struct AppState {
     /// Per-slug bucket muxer handles. Populated at startup by `main::serve`
     /// after the registry is loaded; read (Sender-clone) on the request path.
     muxes: RwLock<FxHashMap<String, mux::ModelMux>>,
+    /// Models answered by a scripted dispatcher that chat-render like GPU-served ones.
+    #[cfg(test)]
+    pub(crate) scripted: RwLock<Vec<String>>,
     /// Per-slug backlog of the stage the model's output feeds; outlives reloads so a stage
     /// bound once keeps gating every later dispatcher.
     downstream: RwLock<FxHashMap<String, Arc<crate::sched::admission::DownstreamCredit>>>,
@@ -551,6 +554,8 @@ impl AppState {
             metrics: Arc::new(Metrics::default()),
             model_metrics: RwLock::new(FxHashMap::default()),
             muxes: RwLock::new(FxHashMap::default()),
+            #[cfg(test)]
+            scripted: RwLock::new(Vec::new()),
             downstream: RwLock::new(FxHashMap::default()),
             #[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu"))]
             gpu: RwLock::new(FxHashMap::default()),
@@ -775,6 +780,16 @@ impl AppState {
 
     /// Whether `slug` is served by a GPU engine (drives e.g. the chat-template
     /// choice). Always `false` without a vendor backend feature.
+    /// Whether chat requests for `slug` render the checkpoint's chat template: the GPU-served
+    /// models (the CPU reference path flattens roles instead).
+    pub fn chat_templated(&self, slug: &str) -> bool {
+        #[cfg(test)]
+        if self.scripted.read().iter().any(|s| s == slug) {
+            return true;
+        }
+        self.has_gpu_engine(slug)
+    }
+
     pub fn has_gpu_engine(&self, slug: &str) -> bool {
         #[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu"))]
         {

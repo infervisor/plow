@@ -30,8 +30,12 @@ fn expected_support(family: &str) -> ToolSupport {
         f if f.starts_with("glm") => Glm45,
         "kimi-k2" => KimiK2,
         "gpt-oss" => Harmony,
-        // Their templates never render `tools`.
-        "deepseek-v3.1" | "mixtral" => return ToolSupport::None,
+        "hermes3" => Hermes,
+        // vLLM's tool templates for the DeepSeek checkpoints.
+        "deepseek-v3-tools" | "deepseek-r1-tools" => DeepSeekV3,
+        "deepseek-v3.1-tools" => DeepSeekV31,
+        // Their own templates never render `tools`.
+        f if f.starts_with("deepseek") || f == "mixtral" => return ToolSupport::None,
         f => panic!("no expectation for fixture family {f}"),
     })
 }
