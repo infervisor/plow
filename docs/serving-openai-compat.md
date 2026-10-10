@@ -244,6 +244,10 @@ only that metadata. It has no per-model code, so adding a model means emitting i
   (`in.mm_slab` plus the hash table `in.mm_table`).
   - Rows are reserved at submit, staged before the launch and released when the job ends. A full
     slab answers 503.
+  - Each engine instance (a model, or one DP rank) owns its slab and its encoders. Encoding runs
+    after rank selection, on that rank's device. Both are dropped when the engine unloads.
+  - Before launch, every bit-31 id in the prompt must be in the serving engine's table. Otherwise
+    the request fails; it is never served the pad row.
   - Because the ids hash the media, the prefix cache and session keys see different images as
     different prompts. Token-batch, mixed-step and the VMM prefix cache all keep working.
 - **Limits.** These answer 400: `PLOW_MM_MAX_IMAGES` (8), `PLOW_MM_MAX_AUDIO` (4),

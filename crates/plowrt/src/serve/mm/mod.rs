@@ -10,6 +10,10 @@
 //! the row index, so every prefix-cache and session key over token ids tells two images (or clips)
 //! apart even when the text around them is identical. The rows themselves sit in the LM's
 //! `in.mm_slab` from admission until the request ends; `in.mm_table` maps id -> slab row.
+//!
+//! Each engine instance (a model, or one DP rank) owns its [`MmModel`]: its encoders run on that
+//! engine's device and its [`Slab`] mirrors that engine's table. It is created with the engine and
+//! dropped with it ([`crate::serve::AppState::install_mm`]).
 
 pub mod encoder;
 pub mod media;
@@ -107,11 +111,20 @@ impl Slab {
         true
     }
 
-    /// Put `job`'s rows on the device through `write(tensor, offset, bytes)`, in stream order:
-    /// slab rows before the table entries that name them.
-    pub fn stage(&self, job: &mut MmJob, mut write: impl FnMut(&str, u64, &[u8]) -> crate::Result<()>) -> crate::Result<()> {
+    /// Put `job`'s rows on this engine's device through `write(tensor, offset, bytes)`, in stream
+    /// order: slab rows before the table entries that name them. Then every bit-31 id of `prompt`
+    /// must be in this table: a missing one would be served as the pad row, silently.
+    pub fn stage(
+        self: &Arc<Self>,
+        job: &mut MmJob,
+        prompt: &[u32],
+        mut write: impl FnMut(&str, u64, &[u8]) -> crate::Result<()>,
+    ) -> crate::Result<()> {
         if job.staged {
             return Ok(());
+        }
+        if !Arc::ptr_eq(&job.slab, self) {
+            return Err(crate::RuntimeError::Rejected("multimodal rows were reserved on another engine".into()));
         }
         let mut s = self.state.lock();
         let tombs = std::mem::take(&mut s.tombs);
@@ -138,7 +151,10 @@ impl Slab {
             s.live.insert(id, (slot, row, 1));
         }
         job.staged = true;
-        Ok(())
+        match prompt.iter().find(|&&id| id & ROW_ID_BIT != 0 && !s.live.contains_key(&id)) {
+            Some(id) => Err(crate::RuntimeError::Rejected(format!("multimodal row {id:#010x} is not resident on this engine"))),
+            None => Ok(()),
+        }
     }
 
     fn release(&self, ids: &[u32], staged: bool, reserved: u32) {
@@ -170,8 +186,22 @@ pub struct MmJob {
 }
 
 impl MmJob {
-    pub fn slab(&self) -> Arc<Slab> {
-        Arc::clone(&self.slab)
+    pub fn staged(&self) -> bool {
+        self.staged
+    }
+
+    /// Move the reservation to `slab` (the job was routed to another engine). `false` when it is full.
+    pub fn rebind(&mut self, slab: &Arc<Slab>) -> bool {
+        if Arc::ptr_eq(&self.slab, slab) {
+            return true;
+        }
+        debug_assert!(!self.staged, "a staged job is not rerouted");
+        if !slab.reserve(self.reserved) {
+            return false;
+        }
+        self.slab.release(&[], false, self.reserved);
+        self.slab = Arc::clone(slab);
+        true
     }
 }
 
@@ -227,7 +257,8 @@ impl Worker {
     }
 }
 
-/// A model's multimodal runtime: its contract, slab and encoders (loaded on first use).
+/// One engine's multimodal runtime: its contract, slab and encoders (loaded on first use, on the
+/// engine's device). Dropping it stops the encoder threads, which free their packets.
 pub struct MmModel {
     pub contract: MmContract,
     dir: PathBuf,
@@ -237,6 +268,24 @@ pub struct MmModel {
 }
 
 impl MmModel {
+    pub fn new(dir: &Path, contract: &MmContract, device: u8) -> Self {
+        Self {
+            contract: contract.clone(),
+            dir: dir.to_path_buf(),
+            device,
+            slab: Arc::new(Slab::new(contract)),
+            workers: Mutex::new(HashMap::new()),
+        }
+    }
+
+    pub fn device(&self) -> u8 {
+        self.device
+    }
+
+    pub fn slab(&self) -> &Arc<Slab> {
+        &self.slab
+    }
+
     fn worker(&self, m: &MmModality) -> crate::Result<std::sync::mpsc::Sender<Work>> {
         let cell = Arc::clone(self.workers.lock().entry(m.kind.clone()).or_default());
         let mut w = cell.lock();
@@ -245,21 +294,6 @@ impl MmModel {
         }
         Ok(w.as_ref().unwrap().tx.clone())
     }
-}
-
-/// The multimodal runtime of the bundle in `dir` with `contract`, created once per bundle.
-pub fn model(dir: &Path, contract: &MmContract, device: u8) -> Arc<MmModel> {
-    static MODELS: std::sync::OnceLock<Mutex<HashMap<PathBuf, Arc<MmModel>>>> = std::sync::OnceLock::new();
-    let mut map = MODELS.get_or_init(Default::default).lock();
-    Arc::clone(map.entry(dir.to_path_buf()).or_insert_with(|| {
-        Arc::new(MmModel {
-            contract: contract.clone(),
-            dir: dir.to_path_buf(),
-            device,
-            slab: Arc::new(Slab::new(contract)),
-            workers: Mutex::new(HashMap::new()),
-        })
-    }))
 }
 
 /// Content parts with media, in conversation order (the order the template renders them).
@@ -414,19 +448,33 @@ fn bf16_bits(v: f32) -> u16 {
     (bits.wrapping_add(0x7FFF + ((bits >> 16) & 1)) >> 16) as u16
 }
 
-/// Expand `prompt_ids` for the media parts of `messages` and encode them: each placeholder the
-/// template rendered becomes `begin, rows.., end`. `None` when the conversation has no media.
-pub async fn prepare(
-    mm: &Arc<MmModel>,
+/// A request's preprocessed media and the soft-token ids its prompt was expanded with, waiting
+/// for the engine it is routed to ([`encode`]).
+pub struct Pending {
+    prepared: Vec<Prepared>,
+    ids: Vec<Vec<u32>>,
+}
+
+fn soft_tokens(p: &Prepared) -> usize {
+    match p {
+        Prepared::Image(patches, _) => patches.soft_tokens as usize,
+        Prepared::Audio(_, tokens, _) => *tokens,
+    }
+}
+
+/// Expand `prompt_ids` for the media parts of `messages`: each placeholder the template rendered
+/// becomes `begin, rows.., end`. Host work only, so the prompt can route before any encoder runs.
+/// `None` when the conversation has no media.
+pub async fn expand(
+    contract: &MmContract,
     messages: &[Message],
     prompt_ids: &mut Vec<u32>,
     limits: Limits,
-) -> Result<Option<Box<MmJob>>, MmError> {
+) -> Result<Option<Pending>, MmError> {
     let parts: Vec<ContentPart> = media_parts(messages).into_iter().cloned().collect();
     if parts.is_empty() {
         return Ok(None);
     }
-    let contract = mm.contract.clone();
     let images = parts.iter().filter(|p| p.media_kind() == Some("image")).count();
     let clips = parts.len() - images;
     if images > limits.max_images {
@@ -463,7 +511,34 @@ pub async fn prepare(
             kinds.len()
         )));
     }
-    // Encode: all images in one batch per launch rung, each clip on its own.
+    let ids: Vec<Vec<u32>> = prepared
+        .iter()
+        .map(|p| {
+            let d = match p {
+                Prepared::Image(_, d) | Prepared::Audio(_, _, d) => d,
+            };
+            row_ids(d, soft_tokens(p))
+        })
+        .collect();
+    // Expand placeholders back to front so earlier positions stay valid.
+    for ((pos, m), ids) in slots.iter().zip(&ids).rev() {
+        let mut with: Vec<u32> = Vec::with_capacity(ids.len() + 2);
+        with.extend(m.begin);
+        with.extend(ids);
+        with.extend(m.end);
+        prompt_ids.splice(*pos..pos + 1, with);
+    }
+    if prompt_ids.last().is_some_and(|&t| t & ROW_ID_BIT != 0) {
+        return Err(MmError::bad("a conversation may not end on a media item"));
+    }
+    Ok(Some(Pending { prepared, ids }))
+}
+
+/// Encode `pending` on `mm`'s encoders (its engine's device) and reserve its rows in `mm`'s slab.
+pub async fn encode(mm: &MmModel, pending: Pending) -> Result<Box<MmJob>, MmError> {
+    let Pending { prepared, ids } = pending;
+    let contract = &mm.contract;
+    // All images in one batch per launch rung, each clip on its own.
     let mut rows: Vec<Option<Vec<f32>>> = vec![None; prepared.len()];
     let image_items: Vec<(usize, media::Patches)> = prepared
         .iter()
@@ -503,38 +578,26 @@ pub async fn prepare(
             rows[i] = Some(rx.await.map_err(|_| MmError::busy("audio encoder is unavailable"))?.map_err(encode_err)?);
         }
     }
-    // Expand placeholders back to front so earlier positions stay valid.
     let hidden = contract.hidden as usize;
-    let mut ids_all: Vec<Vec<u32>> = Vec::with_capacity(prepared.len());
-    for (p, r) in prepared.iter().zip(&rows) {
-        let n = r.as_ref().map_or(0, |r| r.len() / hidden);
-        let d = match p {
-            Prepared::Image(_, d) | Prepared::Audio(_, _, d) => d,
-        };
-        ids_all.push(row_ids(d, n));
-    }
-    for ((pos, m), ids) in slots.iter().zip(&ids_all).rev() {
-        let mut with: Vec<u32> = Vec::with_capacity(ids.len() + 2);
-        with.extend(m.begin);
-        with.extend(ids);
-        with.extend(m.end);
-        prompt_ids.splice(*pos..pos + 1, with);
-    }
-    if prompt_ids.last().is_some_and(|&t| t & ROW_ID_BIT != 0) {
-        return Err(MmError::bad("a conversation may not end on a media item"));
-    }
-    let total: usize = ids_all.iter().map(Vec::len).sum();
+    let total: usize = ids.iter().map(Vec::len).sum();
     let mut job_ids = Vec::with_capacity(total);
     let mut job_rows = Vec::with_capacity(total * hidden);
-    for (ids, r) in ids_all.iter().zip(rows) {
+    for (ids, r) in ids.iter().zip(rows) {
+        let r = r.unwrap_or_default();
+        if r.len() != ids.len() * hidden {
+            return Err(MmError {
+                status: 500,
+                message: format!("encoder returned {} values for {} soft tokens of width {hidden}", r.len(), ids.len()),
+            });
+        }
         job_ids.extend(ids);
-        job_rows.extend(r.unwrap_or_default().iter().map(|v| bf16_bits(*v)));
+        job_rows.extend(r.iter().map(|v| bf16_bits(*v)));
     }
     let n = total as u32;
     if !mm.slab.reserve(n) {
         return Err(MmError::busy(format!("multimodal rows are full ({} in flight); retry", mm.slab.rows)));
     }
-    Ok(Some(Box::new(MmJob { ids: job_ids, rows: job_rows, slab: Arc::clone(&mm.slab), reserved: n, staged: false })))
+    Ok(Box::new(MmJob { ids: job_ids, rows: job_rows, slab: Arc::clone(&mm.slab), reserved: n, staged: false }))
 }
 
 #[cfg(test)]
@@ -572,22 +635,93 @@ mod tests {
         };
         assert!(slab.reserve(2));
         let mut a = MmJob { ids: vec![0x8000_0005, 0x8000_000d], rows: vec![1, 2, 3, 4], slab: slab.clone(), reserved: 2, staged: false };
-        slab.stage(&mut a, write).unwrap();
+        slab.stage(&mut a, &[], write).unwrap();
         // Both ids home at slot 5; the second probes to 6. Rows come off the free list from 0.
         assert_eq!(&table.borrow()[10..14], &[0x8000_0005, 0, 0x8000_000d, 1]);
         assert_eq!(&slab_rows.borrow()[0..4], &[1, 2, 3, 4]);
         assert!(slab.reserve(2));
         assert!(!slab.reserve(1));
         let mut b = MmJob { ids: vec![0x8000_000d], rows: vec![3, 4], slab: slab.clone(), reserved: 2, staged: false };
-        slab.stage(&mut b, write).unwrap();
+        slab.stage(&mut b, &[], write).unwrap();
         drop(a);
         // 0x...d is still held by `b`; 0x...5 is a tombstone at the next stage.
         assert!(slab.reserve(1));
         let mut c = MmJob { ids: vec![0x8000_0105], rows: vec![9, 9], slab: slab.clone(), reserved: 1, staged: false };
-        slab.stage(&mut c, write).unwrap();
+        slab.stage(&mut c, &[], write).unwrap();
         assert_eq!(table.borrow()[10], 0x8000_0105, "a freed slot is reused");
         drop(b);
         drop(c);
         assert!(slab.reserve(4));
+    }
+
+    /// A device table the writes land in, as `(table words, slab halves)`.
+    type Device = std::cell::RefCell<(Vec<u32>, Vec<u16>)>;
+
+    fn device() -> Device {
+        std::cell::RefCell::new((vec![0; 16], vec![0; 8]))
+    }
+
+    fn write_to(d: &Device) -> impl FnMut(&str, u64, &[u8]) -> crate::Result<()> + '_ {
+        move |t, off, b| {
+            let mut d = d.borrow_mut();
+            if t == TABLE_TENSOR {
+                let words: &[u32] = bytemuck::cast_slice(b);
+                d.0[off as usize / 4..off as usize / 4 + words.len()].copy_from_slice(words);
+            } else {
+                let h: &[u16] = bytemuck::cast_slice(b);
+                d.1[off as usize / 2..off as usize / 2 + h.len()].copy_from_slice(h);
+            }
+            Ok(())
+        }
+    }
+
+    fn job(slab: &Arc<Slab>, ids: &[u32]) -> MmJob {
+        assert!(slab.reserve(ids.len() as u32));
+        MmJob { ids: ids.to_vec(), rows: vec![7; ids.len() * 2], slab: slab.clone(), reserved: ids.len() as u32, staged: false }
+    }
+
+    #[test]
+    fn each_rank_stages_the_same_media_into_its_own_table() {
+        let c = contract();
+        let (rank0, rank1) = (Arc::new(Slab::new(&c)), Arc::new(Slab::new(&c)));
+        let (dev0, dev1) = (device(), device());
+        let id = 0x8000_0005;
+        let prompt = [2, id, 3];
+        let mut a = job(&rank0, &[id]);
+        rank0.stage(&mut a, &prompt, write_to(&dev0)).unwrap();
+        // Same image, concurrently on the other rank: its own table must get the row too.
+        let mut b = job(&rank1, &[id]);
+        rank1.stage(&mut b, &prompt, write_to(&dev1)).unwrap();
+        for d in [&dev0, &dev1] {
+            assert_eq!(&d.borrow().0[10..12], &[id, 0]);
+            assert_eq!(&d.borrow().1[0..2], &[7, 7]);
+        }
+    }
+
+    #[test]
+    fn rows_reserved_on_another_engine_are_refused_until_rebound() {
+        let c = contract();
+        let (rank0, rank1) = (Arc::new(Slab::new(&c)), Arc::new(Slab::new(&c)));
+        let dev1 = device();
+        let id = 0x8000_0005;
+        let mut j = job(&rank0, &[id]);
+        assert!(rank1.stage(&mut j, &[id, 1], write_to(&dev1)).is_err());
+        assert_eq!(dev1.borrow().0, vec![0; 16], "nothing reaches the other engine's table");
+        assert!(j.rebind(&rank1));
+        assert!(rank0.reserve(4), "the old engine's reservation is returned");
+        assert!(!rank1.reserve(4), "the new engine holds it");
+        rank1.stage(&mut j, &[id, 1], write_to(&dev1)).unwrap();
+        assert_eq!(&dev1.borrow().0[10..12], &[id, 0]);
+    }
+
+    #[test]
+    fn a_prompt_row_missing_from_the_table_fails_the_request() {
+        let slab = Arc::new(Slab::new(&contract()));
+        let dev = device();
+        let mut j = job(&slab, &[0x8000_0005]);
+        let err = slab.stage(&mut j, &[1, 0x8000_0005, 0x8000_0009, 2], write_to(&dev)).unwrap_err();
+        assert!(err.to_string().contains("0x80000009"), "{err}");
+        drop(j);
+        assert!(slab.reserve(4), "the failed job releases what it staged");
     }
 }
