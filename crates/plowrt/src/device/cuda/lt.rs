@@ -162,7 +162,25 @@ pub(crate) struct StoredAlgo {
     /// checks a bundle's projection shapes against these.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ns: Vec<u32>,
+    /// The decode rung widths the selection was timed across, ascending (a widest-rung plan
+    /// pinned for every narrower rung, `PLOW_LT_RUNG_ALGOS` off); empty = `m` alone. A row pins
+    /// only a plan timed over the same widths: a per-rung pick is not a cross-rung pick.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rows: Vec<u32>,
 }
+
+/// [`StoredAlgo::rows`] of a plan at `m` timed across `rows`.
+fn rung_key(m: u32, rows: &[u32]) -> Vec<u32> {
+    let mut key = rows.to_vec();
+    key.sort_unstable();
+    key.dedup();
+    if key == [m] {
+        key.clear();
+    }
+    key
+}
+
+type StoredKey = (u32, u32, u32, bool, Vec<u32>);
 
 impl StoredAlgo {
     fn to_algo(&self) -> Option<Algo> {
@@ -179,8 +197,8 @@ pub(crate) struct Lt {
     api: Api,
     handle: usize,
     workspace: DeviceMem,
-    /// `PLOW_LT_ALGOS`: `(m, n, k, pair)` whose algorithm is pinned by the table.
-    stored: std::collections::HashMap<(u32, u32, u32, bool), Algo>,
+    /// `PLOW_LT_ALGOS`: `(m, n, k, pair, rows)` whose algorithm is pinned by the table.
+    stored: std::collections::HashMap<StoredKey, Algo>,
     /// `PLOW_LT_ALGOS_WRITE`: append every load-time selection here.
     write: Option<std::path::PathBuf>,
     /// `PLOW_CUTLASS_FP8_DECODE`: small-M FP8 decode projections.
@@ -213,7 +231,8 @@ impl Lt {
                     continue;
                 }
                 if let Some(algo) = rec.to_algo() {
-                    stored.insert((rec.m, rec.n, rec.k, rec.pair), algo);
+                    let rows = rung_key(rec.m, &rec.rows);
+                    stored.insert((rec.m, rec.n, rec.k, rec.pair, rows), algo);
                 }
             }
             tracing::info!(
@@ -251,7 +270,7 @@ impl Lt {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn record(&self, m: u32, n: u32, k: u32, pair: bool, ns: &[u32], algo: &Algo, workspace: usize, matmul_us: f32) {
+    fn record(&self, (m, n, k): (u32, u32, u32), pair: bool, ns: &[u32], rows: &[u32], algo: &Algo, workspace: usize, matmul_us: f32) {
         let Some(path) = &self.write else { return };
         let rec = StoredAlgo {
             m,
@@ -264,6 +283,7 @@ impl Lt {
             matmul_us,
             pair,
             ns: if ns == [n] { Vec::new() } else { ns.to_vec() },
+            rows: rung_key(m, rows),
         };
         let line = match serde_json::to_string(&rec) {
             Ok(s) => s,
@@ -528,7 +548,7 @@ impl Lt {
             // A rung template pins the widest rung's algorithm; a stored table pins the shape's.
             // Both go through AlgoCheck, so a stale or foreign entry is refused here rather
             // than at launch.
-            let stored = self.stored.get(&(m, n, k, pair.is_some())).copied();
+            let stored = self.stored.get(&(m, n, k, pair.is_some(), rung_key(m, rows))).copied();
             let pinned = template.map(|t| t.algo).or(stored);
             if let Some(algo) = pinned {
                 plan.algo = algo;
@@ -1205,7 +1225,7 @@ impl Plan {
             "cuBLASLt load-time algorithm selected"
         );
         self.lt
-            .record(m, n, k, false, ns, &self.algo, candidates[index].workspace, matmul_ms * 1000.0);
+            .record((m, n, k), false, ns, rows, &self.algo, candidates[index].workspace, matmul_ms * 1000.0);
         Ok(())
     }
 
@@ -1295,7 +1315,7 @@ impl Plan {
             "cuBLASLt pair algorithm selected"
         );
         self.lt
-            .record(m, n, k, true, &[n], &self.algo, candidates[index].workspace, matmul_ms * 1000.0);
+            .record((m, n, k), true, &[n], rows, &self.algo, candidates[index].workspace, matmul_ms * 1000.0);
         Ok(())
     }
 

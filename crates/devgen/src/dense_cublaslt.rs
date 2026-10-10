@@ -687,7 +687,7 @@ fn row_shapes(row: &serde_json::Value) -> Vec<(u32, u32, u32)> {
 /// into `<out>/cublaslt_algos.jsonl`, the table plowrt pins (`PLOW_LT_ALGOS`).
 ///
 /// The store is `<tunedb_root>/nvidia/<profile>/<sku>/cublaslt_algos.jsonl`, written by
-/// `campaign.py probe` from `plowrt --lt-algos-write`. A row is keyed `(m, n, k, pair)` and is
+/// `campaign.py probe` from `plowrt --lt-algos-write`. A row is keyed `(m, n, k, pair, rows)` and is
 /// selected when one of its served shapes ([`row_shapes`]) is a packet shape. Over-inclusion is
 /// safe: the runtime re-validates each entry with `cublasLtMatmulAlgoCheck` and falls back to its
 /// heuristic, so a row from another cell of the same architecture can at worst cost the
@@ -717,7 +717,7 @@ pub(crate) fn packetize_algo_table(
         .filter(|table| table.is_file())
         .collect();
     tables.sort();
-    let mut rows: std::collections::BTreeMap<(u64, u64, u64, bool), String> = Default::default();
+    let mut rows: std::collections::BTreeMap<(u64, u64, u64, bool, String), String> = Default::default();
     for table in tables {
         let text = std::fs::read_to_string(&table).map_err(|e| format!("{}: {e}", table.display()))?;
         for line in text.lines().filter(|l| !l.trim().is_empty()) {
@@ -727,7 +727,7 @@ pub(crate) fn packetize_algo_table(
                 continue;
             }
             let field = |key: &str| row[key].as_u64().unwrap_or(0);
-            let key = (field("m"), field("n"), field("k"), row["pair"] == true);
+            let key = (field("m"), field("n"), field("k"), row["pair"] == true, row["rows"].to_string());
             // Later cells and rows override earlier ones for the same key; the runtime's
             // AlgoCheck decides whether the row applies to the GPU it runs on.
             rows.insert(key, line.to_string());

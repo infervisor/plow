@@ -689,19 +689,22 @@ def lt_missing(assets: Path, rung_algos: bool) -> tuple[list[dict], int]:
     """The bundle's BF16 cuBLASLt projection shapes (`build.json` `cublaslt.shapes`) that no row
     of its `cublaslt_algos.jsonl` serves, and how many shapes plowrt plans. A row serves
     `(m, n_i, k)` for each instruction N in its `ns` (default `[n]`). Narrower decode rungs pin the
-    widest rung's algorithms unless `rung_algos`, so only the widest rung's shapes count then."""
+    widest rung's algorithms unless `rung_algos`, so only the widest rung's shapes count then, and
+    only a row timed across every routed rung (`rows`) serves them; otherwise a row's `rows` is empty."""
     build = assets / "build.json"
     shapes = json.loads(build.read_text()).get("cublaslt", {}).get("shapes", []) if build.is_file() else []
     shapes = [x for x in shapes if x["dtype"] == "bf16"]
-    decode = [x["rows"] for x in shapes if x["phase"] == "decode"]
+    decode = sorted({x["rows"] for x in shapes if x["phase"] == "decode"})
+    rungs = () if rung_algos or len(decode) < 2 else tuple(decode)
     if decode and not rung_algos:
-        shapes = [x for x in shapes if x["phase"] != "decode" or x["rows"] == max(decode)]
+        shapes = [x for x in shapes if x["phase"] != "decode" or x["rows"] == decode[-1]]
     served = set()
     table = assets / "cublaslt_algos.jsonl"
     for row in (json.loads(ln) for ln in (table.read_text().splitlines() if table.is_file() else []) if ln.strip()):
         if row.get("dtype") == "bf16":
-            served.update((row["m"], n, row["k"]) for n in (row.get("ns") or [row["n"]]))
-    return [x for x in shapes if (x["m"], x["n"], x["k"]) not in served], len(shapes)
+            served.update((row["m"], n, row["k"], tuple(row.get("rows", ()))) for n in (row.get("ns") or [row["n"]]))
+    want = lambda x: (x["m"], x["n"], x["k"], rungs if x["phase"] == "decode" else ())
+    return [x for x in shapes if want(x) not in served], len(shapes)
 
 
 def lt_record(r: dict, assets: Path) -> dict:
@@ -713,7 +716,7 @@ def lt_record(r: dict, assets: Path) -> dict:
         "shapes": shapes,
         "missing": missing,
         "table_sha256": sha(table) if table.is_file() else None,
-        "rows": [{k: x.get(k) for k in ("m", "n", "k", "dtype", "pair", "ns", "gpu", "commit")} for x in rows],
+        "rows": [{k: x.get(k) for k in ("m", "n", "k", "dtype", "pair", "ns", "rows", "gpu", "commit")} for x in rows],
     }
 
 
@@ -992,7 +995,7 @@ def cmd_probe(a: argparse.Namespace) -> None:
     stamp = {"commit": git("rev-parse", "HEAD"), "recipe": cell["name"],
              "utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
     new = [{**json.loads(ln), **stamp} for ln in (selected.read_text().splitlines() if selected.is_file() else []) if ln.strip()]
-    key = lambda d: (d["m"], d["n"], d["k"], d["dtype"], bool(d.get("pair")))
+    key = lambda d: (d["m"], d["n"], d["k"], d["dtype"], bool(d.get("pair")), tuple(d.get("rows", ())))
     merged = {} if a.force else {key(d): d for d in (json.loads(ln) for ln in (table.read_text().splitlines() if table.is_file() else []) if ln.strip())}
     merged.update((key(d), d) for d in new)
     if merged:

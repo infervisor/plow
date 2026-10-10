@@ -116,13 +116,20 @@ class CampaignBuildTests(unittest.TestCase):
                 shape("decode", 64, 64, 1024, 2816), shape("decode", 64, 64, 512, 2816),
                 shape("decode", 64, 64, 262144, 2816), shape("decode", 32, 32, 1024, 2816)]}}))
             self.assertEqual(len(campaign.lt_missing(assets, False)[0]), 4)
+            # Rung algorithms off: the widest rung's rows are timed across every routed rung.
             rows = [{"m": 512, "n": 4096, "k": 2816, "dtype": "bf16", "pair": True},
-                    {"m": 64, "n": 1536, "k": 2816, "dtype": "bf16", "ns": [1024, 512]},
-                    {"m": 64, "n": 262144, "k": 2816, "dtype": "bf16"}]
-            (assets / "cublaslt_algos.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows))
+                    {"m": 64, "n": 1536, "k": 2816, "dtype": "bf16", "ns": [1024, 512], "rows": [32, 64]},
+                    {"m": 64, "n": 262144, "k": 2816, "dtype": "bf16", "rows": [32, 64]}]
+            write = lambda rows: (assets / "cublaslt_algos.jsonl").write_text(
+                "".join(json.dumps(r) + "\n" for r in rows))
+            write(rows)
             self.assertEqual(campaign.lt_missing(assets, False), ([], 4))
+            self.assertEqual(len(campaign.lt_missing(assets, True)[0]), 4)
+            # Rung algorithms on: every rung is its own plan, timed alone.
+            write([rows[0], {**rows[1], "rows": []}, {**rows[2], "rows": []}])
             missing, shapes = campaign.lt_missing(assets, True)
             self.assertEqual((shapes, [(x["m"], x["n"]) for x in missing]), (5, [(32, 1024)]))
+            self.assertEqual(len(campaign.lt_missing(assets, False)[0]), 3)
             self.assertEqual(campaign.store_cell({"target": {"sku": "H100 SXM5"}}), "h100-sxm5")
 
     def test_object_env_appends_flags_and_replaces_scalars(self):
