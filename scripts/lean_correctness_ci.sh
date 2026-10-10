@@ -14,8 +14,8 @@ cd "$(dirname "$0")/.."
 export PLOW_VERIFY_BIN="$PWD/lean-plow/.lake/build/bin/plow_verify"
 echo "verifier: $(sha256sum "$PLOW_VERIFY_BIN" | cut -d' ' -f1)"
 
-# One suite per line: <cargo args> -- <exact test names>. `--include-ignored` also runs the
-# suite's ordinary tests; `--exact` keeps the selection explicit.
+# One suite per line: <cargo args> -- <exact test names>. `--ignored --exact` runs only the
+# listed ignored tests, not the suite's ordinary ones.
 suites=(
   "-p lean_verify --test approved_verifier -- built_verifier_is_approved_for_current_sources"
   "-p lean_verify --test end_to_end -- checkpoint_d_accepts_safe_schedule batch_preserves_individual_verdicts_and_envelopes checkpoint_d_rejects_missing_counter checkpoint_d_accepts_disjoint_bytes checkpoint_d_rejects_unordered_dependency_without_address_entries checkpoint_d_rejects_malformed_access_sets checkpoint_d_checks_removed_edge_witnesses checkpoint_f_reuses_d_verifier checkpoint_d_checks_address_paths_without_graph_saturation all_checkpoints_are_wired"

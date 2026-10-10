@@ -11,6 +11,9 @@ Only tokenizer/template files are downloaded (no weights):
 
     python3 scripts/llm/toolcall_fixtures.py --out crates/plowrt/tests/fixtures/toolcall \
         [--cache DIR] [--only qwen3 ...]
+
+`--cache` defaults to `$PLOW_TOOLCALL_CACHE`, else `~/.cache/plow/toolcall-tpl`. The `*-tools`
+families need `VLLM_TOOL_TEMPLATES` (see below).
 """
 import argparse
 import copy
@@ -19,10 +22,14 @@ import json
 import os
 import sys
 
-VLLM_TPL = os.environ.get("VLLM_TOOL_TEMPLATES", "/opt/dlami/nvme/lava-tts/toolperf/scratch/vllm_tpl/")
+# Directory holding deepseekv3.jinja, deepseekr1.jinja, deepseekv31.jinja (vLLM v0.11.0
+# examples/tool_chat_template_<name>.jinja). Required only for the `*-tools` families.
+VLLM_TPL = os.environ.get("VLLM_TOOL_TEMPLATES")
+DEFAULT_CACHE = os.environ.get("PLOW_TOOLCALL_CACHE") or os.path.join(
+    os.environ.get("XDG_CACHE_HOME") or os.path.join(os.path.expanduser("~"), ".cache"), "plow", "toolcall-tpl")
 
 FAMILIES = {
-    # name: (hub repo, local dir or None[, template file override[, named template]])
+    # name: (hub repo, local snapshot (used when present, else fetched)[, template file override[, named template]])
     "gemma4-e4b": ("google/gemma-4-E4B-it", None),
     "gemma4-12b": ("google/gemma-4-12b-it", "/opt/dlami/nvme/hf-cache/hub/gemma-4-12b-it-fp8"),
     "gemma4-31b": ("google/gemma-4-31B-it",
@@ -47,10 +54,19 @@ FAMILIES = {
     "hermes3": ("NousResearch/Hermes-3-Llama-3.1-8B", None, None, "tool_use"),
     # DeepSeek's own templates render no `tools`; vLLM ships tool templates for them
     # (examples/tool_chat_template_deepseek*.jinja, v0.11.0), rendered with each checkpoint's tokens.
-    "deepseek-v3-tools": ("deepseek-ai/DeepSeek-V3-0324", None, VLLM_TPL + "deepseekv3.jinja"),
-    "deepseek-r1-tools": ("deepseek-ai/DeepSeek-R1-0528", None, VLLM_TPL + "deepseekr1.jinja"),
-    "deepseek-v3.1-tools": ("deepseek-ai/DeepSeek-V3.1", None, VLLM_TPL + "deepseekv31.jinja"),
+    "deepseek-v3-tools": ("deepseek-ai/DeepSeek-V3-0324", None, "vllm:deepseekv3.jinja"),
+    "deepseek-r1-tools": ("deepseek-ai/DeepSeek-R1-0528", None, "vllm:deepseekr1.jinja"),
+    "deepseek-v3.1-tools": ("deepseek-ai/DeepSeek-V3.1", None, "vllm:deepseekv31.jinja"),
 }
+
+
+def resolve_tpl(fam, tpl_file):
+    if not (tpl_file and tpl_file.startswith("vllm:")):
+        return tpl_file
+    if not VLLM_TPL:
+        sys.exit(f"{fam}: set VLLM_TOOL_TEMPLATES to the directory holding {tpl_file[5:]} "
+                 "(vLLM examples/tool_chat_template_*.jinja), or exclude the *-tools families with --only")
+    return os.path.join(VLLM_TPL, tpl_file[5:])
 
 TOOLS = [
     {"type": "function", "function": {
@@ -160,14 +176,16 @@ def fetch(repo, cache):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", required=True)
-    ap.add_argument("--cache", default="/opt/dlami/nvme/lava-tts/toolcalls/tpl")
+    ap.add_argument("--cache", default=DEFAULT_CACHE, help="template download dir (PLOW_TOOLCALL_CACHE)")
     ap.add_argument("--only", nargs="*")
     a = ap.parse_args()
     from transformers.utils.chat_template_utils import render_jinja_template
     for fam, (repo, local, *extra) in FAMILIES.items():
         if a.only and fam not in a.only:
             continue
-        d = local or fetch(repo, a.cache)
+        if extra:
+            extra[0] = resolve_tpl(fam, extra[0])
+        d = local if local and os.path.isdir(local) else fetch(repo, a.cache)
         tpl, bos, eos = load_template(d, *extra)
         tokjs = os.path.join(d, "tokenizer.json")
         tokz = None

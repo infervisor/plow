@@ -12,16 +12,22 @@ python3 scripts/campaign/campaign.py build recipes/infervisor/gemma-4-e4b/sm90a-
 PLOW_HSACO=$OUT/assets plowrt serve --assets $OUT/assets
 ```
 
-The recipe runs base emit -> `scripts/build_sm90a_gemma4_segments.sh` -> role emit and keeps only
-the two flash objects (`interp_sm90a_pffa.cubin`, `interp_sm90a_pfpackedfa.cubin`). Knobs:
+The recipe runs base emit -> `scripts/build_sm90a_gemma4_segments.sh` -> role emit and takes five
+objects from the segment build (`[objects].role_files`): the flash objects
+`interp_sm90a_pffa.cubin` and `interp_sm90a_pfpackedfa.cubin`, the FATLITE light object
+`interp_sm90a_pfpackedseg.cubin`, and the generated prefill attention roles
+`gen_sm90a_attn_pf_hd256_sliding.cubin` and `gen_sm90a_attn_pf_hd512.cubin`. Knobs (the full
+list, with measurements, is in the recipe's comments):
 
 | knob | why |
 |---|---|
 | `PLOW_DECODE_BATCH_LADDER=1,2,4,8,16,32,48,64,96,128` | decode rungs up to 128 concurrent turns |
-| `PLOW_MAX_CHUNK=2048`, `PLOW_PF_LADDER_APPEND=64,256` | prefill rungs 64..2048 (prompts 200-2000) |
+| `PLOW_MAX_CHUNK=2048`, `PLOW_MAX_REQUEST_CHUNK=2048`, `PLOW_PF_LADDER_APPEND=64,256` | prefill rungs 64..2048 (prompts 200-2000) plus the 8192 packed rung; one request capped at 2048 rows per launch keeps the sliding ring at 4096 |
 | `PLOW_EMIT_PREFILL_CUBLASLT=1` | dense prefill projections on cuBLASLt (E4B shapes in `segment_roles.rs`) |
+| `PLOW_EMIT_DECODE_CUBLASLT=1`, `PLOW_EMIT_DECODE_CUBLASLT_MIN_ROWS=1`, `PLOW_EMIT_DECODE_CUBLASLT_HEAD=1` | every decode rung runs its layer projections, lm_head and the PLE projection as cuBLASLt matmuls inside the rung's graph |
 | `PLOW_SEG_FA512=all` | every prefill flash segment (hd256 sliding and hd512 full) isolated in `pffa` |
-| `[serve] PLOW_MULTISTEP_ADAPTIVE=true` | single-step while anything prefills, 8-step quanta otherwise |
+| `PLOW_BUILD_GEN_KERNELS` / `PLOW_EMIT_GEN_KERNELS=attn_pf_hd256_sliding,attn_pf_hd512` | generated-kernel prefill attention on the 1024+ row rungs |
+| `[serve] env PLOW_VMM_PREFIX=1, PLOW_LT_RUNG_ALGOS=true` | VMM prefix cache; per-rung cuBLASLt algorithm selection. Token batching and adaptive multistep are not recipe knobs: the default `auto` objective derives them |
 
 Two builds from the same recipe (shared tree and a clean worktree) produce a byte-identical
 `model.pkt`.
