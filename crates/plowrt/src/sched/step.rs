@@ -13,7 +13,7 @@
 //! [`Backend::split_spans`] = false a chunk wider than what is left waits for the next tick,
 //! which is what keeps a request on the compiled rungs its cursor was planned against.
 
-use super::prefill::{admit, admit_oldest_first, SpanPolicy};
+use super::prefill::{admit, admit_oldest_first, SlotSet, SpanPolicy};
 use packet::dev::PrefillSpan;
 
 /// What a backend declares about the steps it can run. Static per engine.
@@ -133,11 +133,9 @@ pub fn plan(
     let full_budget = budget;
     // No ladder to budget against: one launch per tick, as before the budget existed.
     let max_launches = if backend.step_budget == u32::MAX { 1 } else { usize::MAX };
-    let slots = tick.slots.min(u128::BITS as usize);
-    let mut advanced = 0u128;
-    let taken = |advanced: u128, span: &PrefillSpan| {
-        (span.slot as usize) >= slots || advanced & (1u128 << span.slot) != 0
-    };
+    let slots = tick.slots;
+    let mut advanced = SlotSet::with_capacity(slots);
+    let taken = |advanced: &SlotSet, span: &PrefillSpan| (span.slot as usize) >= slots || advanced.contains(span.slot as usize);
     let mut launches: Vec<Launch> = Vec::new();
     while budget > 0 && launches.len() < max_launches {
         if backend.packing && tick.packing {
@@ -146,7 +144,7 @@ pub fn plan(
             } else {
                 SpanPolicy::Whole
             });
-            let open = candidates.iter().filter(|c| c.packable && !taken(advanced, &c.span));
+            let open = candidates.iter().filter(|c| c.packable && !taken(&advanced, &c.span));
             let mut pack = if tick.rotate {
                 admit(open.map(|c| c.span), budget, tick.turn, slots, policy, &program_rows)
             } else {
@@ -163,7 +161,7 @@ pub fn plan(
                     spans: pack.spans().to_vec(),
                 };
                 for span in &launch.spans {
-                    advanced |= 1u128 << span.slot;
+                    advanced.insert(span.slot as usize);
                 }
                 budget = budget.saturating_sub(launch.rows().max(1));
                 launches.push(launch);
@@ -182,7 +180,7 @@ pub fn plan(
         };
         let pick = candidates
             .iter()
-            .filter(|c| c.span.n_rows > 0 && !taken(advanced, &c.span) && fits(c))
+            .filter(|c| c.span.n_rows > 0 && !taken(&advanced, &c.span) && fits(c))
             .min_by_key(|c| {
                 if tick.rotate {
                     let slot = c.span.slot as usize;
@@ -196,7 +194,7 @@ pub fn plan(
         span.row0 = 0;
         span.n_rows = span.n_rows.min(budget);
         span.kv_len = span.kv_row0 + span.n_rows;
-        advanced |= 1u128 << span.slot;
+        advanced.insert(span.slot as usize);
         budget = budget.saturating_sub(span.n_rows.max(1));
         launches.push(Launch { spans: vec![span] });
     }
@@ -380,6 +378,27 @@ mod tests {
         assert_eq!(spans, [(2, 3000), (1, 1096)]);
         let rotating = plan(backend, Tick { rotate: true, ..t }, [], &candidates, |_| Some(4096), |_| u32::MAX);
         assert_eq!(rotating.launches[0].spans[0].slot, 3, "rotation starts at the turn slot");
+    }
+
+    /// A 256-slot table: requests seated past slot 128 are planned, packed and isolated, and none
+    /// advances twice.
+    #[test]
+    fn slots_past_128_are_planned() {
+        let backend = Backend {
+            step_budget: 4096,
+            packing: true,
+            split_spans: true,
+            decode_rows_join_prefill: false,
+            span_policy: Some(crate::sched::prefill::SpanPolicy::Greedy),
+        };
+        let candidates: Vec<Candidate> = [(250, 1), (130, 2), (7, 3)].iter().map(|&(s, a)| cand(s, a, 0, 1000, true, true)).collect();
+        let t = Tick { slots: 256, ..tick(true) };
+        let got = plan(backend, t, [], &candidates, |_| Some(4096), |_| u32::MAX);
+        assert_eq!(got.launches[0].spans.iter().map(|s| s.slot).collect::<Vec<_>>(), [250, 130, 7]);
+        let isolated: Vec<Candidate> = [(200, 1), (140, 2)].iter().map(|&(s, a)| cand(s, a, 0, 2048, false, true)).collect();
+        let got = plan(amd(), t, [], &isolated, rung_2048, |_| u32::MAX);
+        assert_eq!(got.launches.iter().map(|l| l.spans[0].slot).collect::<Vec<_>>(), [200, 140]);
+        assert!(plan(amd(), Tick { slots: 200, ..t }, [], &isolated, rung_2048, |_| u32::MAX).launches.iter().all(|l| l.spans[0].slot != 200));
     }
 
     #[test]

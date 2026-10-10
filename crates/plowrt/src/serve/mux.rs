@@ -4174,7 +4174,7 @@ fn run_one_tick(
             // dispatch below. What the engine cannot run it refuses by name; the plan is never
             // narrowed here.
             let pf_batch = true;
-            let cap = b.min(slots.len()).min(u128::BITS as usize);
+            let cap = b.min(slots.len());
             let backend = e.step_backend();
             let now = Instant::now();
             let full_budget = tick_max.min(backend.step_budget);
