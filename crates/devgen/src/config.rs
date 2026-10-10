@@ -213,6 +213,9 @@ pub(crate) struct Cfg {
     // their ids embed as. Zero rows: no soft tokens, the text packet is unchanged.
     pub(crate) mm_slab_rows: u32,
     pub(crate) mm_pad: u32,
+    /// The contract has a bidirectional-span modality: prefill emits `MmSpanExtent` and marks the
+    /// sliding attention sites.
+    pub(crate) mm_spans: bool,
     // Learned speech-position rows added to the DECODE token embedding (Chatterbox T3:
     // speech_emb[tok] + speech_pos_emb[pos - in.pos_base]). Zero means a plain Embed.
     pub(crate) speech_pos_rows: u32,
@@ -413,6 +416,7 @@ fn cfg_gemma(v: &Value, flat: bool) -> Cfg {
         encoder_overlay_rows: 0,
         mm_slab_rows: 0,
         mm_pad: 0,
+        mm_spans: false,
         speech_pos_rows: 0,
         speech_params: Vec::new(),
         tp: 1,
@@ -503,6 +507,7 @@ fn cfg_gemma3(v: &Value) -> Cfg {
         encoder_overlay_rows: 0,
         mm_slab_rows: 0,
         mm_pad: 0,
+        mm_spans: false,
         speech_pos_rows: 0,
         speech_params: Vec::new(),
         attn_scale: (t["query_pre_attn_scalar"]
@@ -606,6 +611,7 @@ fn cfg_llama_qwen(v: &Value, arch: Arch) -> Cfg {
         encoder_overlay_rows: 0,
         mm_slab_rows: 0,
         mm_pad: 0,
+        mm_spans: false,
         speech_pos_rows: 0,
         speech_params: Vec::new(),
         tp: 1,
@@ -658,6 +664,7 @@ fn cfg_bert(v: &Value) -> Cfg {
         encoder_overlay_rows: 0,
         mm_slab_rows: 0,
         mm_pad: 0,
+        mm_spans: false,
         speech_pos_rows: 0,
         speech_params: Vec::new(),
         tp: 1,
@@ -714,6 +721,7 @@ fn cfg_modernbert(v: &Value) -> Cfg {
         encoder_overlay_rows: 0,
         mm_slab_rows: 0,
         mm_pad: 0,
+        mm_spans: false,
         speech_pos_rows: 0,
         speech_params: Vec::new(),
         tp: 1,

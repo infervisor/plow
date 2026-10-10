@@ -211,6 +211,9 @@ pub fn class_of(op: DevOp) -> RowClass {
         RowStatsF32 | RmsNormF32 => RowClass::A,
         // Positions come from a per-row tensor; soft-token rows are found by their own id.
         RopeAxialF32 | MmRowsBf16 => RowClass::A,
+        // Reads the following rows' ids, but a run that continues into the next packed request
+        // is clipped by the attention to its own request's KV length.
+        MmSpanExtent => RowClass::A,
         ChunkAttentionF32 => RowClass::C,
         UnaryF32 => RowClass::A,
 

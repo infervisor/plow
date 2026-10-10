@@ -923,6 +923,9 @@ struct PacketRole {
     /// Generated flash-prefill direct entry, the head width its packet ops must carry, and
     /// whether it reads an FP8 KV cache (`FlashPrefillFp8` operands).
     direct_gen: Option<(KernelFn, u32, bool)>,
+    /// The generated object masks media spans (`plow_attention_media_span`; `FlashPrefillFp8` i7
+    /// high half, passed in the direct ABI's 8th pointer).
+    media_span: bool,
     direct_hd512: Option<KernelFn>,
     direct_hd256_gqa2: Option<KernelFn>,
     direct_w8a8_glu: Option<KernelFn>,
@@ -2419,6 +2422,8 @@ pub struct GpuEngine {
     /// Segmented-prefill object pair (PLOW_PF_SEG_DIR); None = single-object prefill.
     seg_pf: Option<SegPf>,
     qwen_prefill: Option<crate::device::cuda::qwen_gdn::NativeGdn>,
+    /// The packet carries `act.mm_span` (bidirectional media spans): chunks must not split them.
+    mm_spans: bool,
     packet_roles: [Option<PacketRole>; plow_asset::segment_roles::MAX_ROLE as usize],
     decode_packet_roles: Vec<u8>,
     cublaslt_decode: Vec<Option<LibraryRoute>>,
@@ -6346,6 +6351,7 @@ impl GpuEngine {
             packet_roles[id as usize - 1] = Some(PacketRole {
                 function,
                 direct_gen: None,
+                media_span: false,
                 direct_hd512,
                 direct_hd256_gqa2,
                 direct_w8a8_glu,
@@ -6560,6 +6566,7 @@ impl GpuEngine {
             f_pf,
             seg_pf,
             qwen_prefill,
+            mm_spans: false,
             packet_roles,
             cublaslt_decode,
             cublaslt_decode_graph: None,
@@ -6666,6 +6673,7 @@ impl GpuEngine {
                 .unwrap_or(0),
             slot_generations: vec![0; batch],
         };
+        engine.mm_spans = engine.handle_of("act.mm_span").is_some();
         engine.packed_terminal = packed_terminal::PackedTerminal::load(&engine)?;
         engine.shared_tail =
             shared_tail::SharedTail::load(&engine, &blob, kv_shared_tail_metadata.as_ref())?;
@@ -8743,6 +8751,12 @@ impl GpuEngine {
             .map_or_else(|| self.pf_max_rows(), |rows| rows as usize)
     }
 
+    /// Rows a request writes per sliding stage of a packed launch (0: unstaged); media spans must
+    /// not cross a stage boundary either.
+    pub fn pf_stage_rows(&self) -> usize {
+        self.packed_prefill.as_ref().and_then(|p| p.stage_rows).map_or(0, |rows| rows as usize)
+    }
+
     /// Packed padding rows mask to slot -1 (the objects skip them) instead of continuing a
     /// request's rows.
     fn packed_padding_limit(&self) -> Option<u32> {
@@ -10187,6 +10201,34 @@ impl GpuEngine {
     /// bucket pick, instruction patch, ids/pos/kvlen upload, one cooperative
     /// launch. KV lands wherever the tensor table currently points
     /// (`bind_kv_slot`). Returns the number of real rows consumed.
+    /// The serialized chunk's bucket and real rows. A packet with bidirectional media spans
+    /// (`act.mm_span`) never ends a chunk inside a run of span ids: it cuts back to the run, or
+    /// takes the smallest bucket holding a run that starts the chunk.
+    fn span_safe_chunk(
+        &self,
+        bi: usize,
+        prompt: &[u32],
+        c0: usize,
+        rem: usize,
+        cap: usize,
+    ) -> Result<(usize, usize)> {
+        let real = rem.min(self.prefill[bi].t as usize);
+        if !self.mm_spans {
+            return Ok((bi, real));
+        }
+        let safe = plow_asset::multimodal::span_chunk_rows(prompt, c0, real, cap, 0);
+        if safe == 0 {
+            return Err(RuntimeError::Rejected("a media span does not fit one prefill chunk".into()));
+        }
+        if safe <= real {
+            return Ok((bi, safe));
+        }
+        let wider = self.prefill.iter().position(|p| p.t as usize >= safe);
+        wider.map(|wider| (wider, safe)).ok_or_else(|| {
+            RuntimeError::Rejected("a media span does not fit one prefill bucket".into())
+        })
+    }
+
     fn run_one_prefill_chunk(
         &mut self,
         f_pf: KernelFn,
@@ -10209,8 +10251,8 @@ impl GpuEngine {
         } else {
             self.pick_prefill_bucket(rem, cap)
         };
+        let (bi, real) = self.span_safe_chunk(bi, prompt, c0, rem, cap)?;
         let tc = self.prefill[bi].t as usize;
-        let real = rem.min(tc);
 
         // VMM: the bucket writes all tc rows (pad rows write garbage past
         // `real`) — map the chunk's full row span before launching.
@@ -10420,6 +10462,12 @@ impl GpuEngine {
                 * std::mem::size_of::<packet::dev::StreamEnt>() as u64;
         if let Some((function, _, _)) = role.direct_gen {
             if let Some(requests) = fp8_requests {
+                let span = packet::dev::flash_span(inst.i[7]);
+                if span.is_some() && !role.media_span {
+                    return Err(RuntimeError::Rejected(
+                        "generated attention object does not mask media spans".into(),
+                    ));
+                }
                 return Ok(Some((
                     function,
                     DirectSegmentArgs::Generated(GenFlashPrefillArgs {
@@ -10430,7 +10478,11 @@ impl GpuEngine {
                         k: tensor(inst.t[3])?,
                         v: tensor(inst.t[4])?,
                         output: tensor(inst.t[5])?,
-                        mapkv: 0,
+                        // FP8-KV objects read this slot as the MmSpanExtent rows (0 = causal).
+                        mapkv: match span {
+                            Some(span) => tensor(span)?,
+                            None => 0,
+                        },
                         entries,
                         succs: arg.succs,
                         counters: arg.counters,

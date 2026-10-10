@@ -8,7 +8,10 @@
 //!
 //! Soft-token rows travel as prompt ids with bit 31 set whose low bits hash the media content and
 //! the row index, so every prefix-cache and session key over token ids tells two images (or clips)
-//! apart even when the text around them is identical. The rows themselves sit in the LM's
+//! apart even when the text around them is identical. Ids of a modality the LM attends
+//! bidirectionally within (`attention = "bidirectional_span"`) also carry bit 30; prefill chunks
+//! are cut so that no chunk or sliding stage boundary splits a run of them
+//! ([`plow_asset::multimodal::span_safe_rows`]). The rows themselves sit in the LM's
 //! `in.mm_slab` from admission until the request ends; `in.mm_table` maps id -> slab row.
 //!
 //! Each engine instance (a model, or one DP rank) owns its [`MmModel`]: its encoders run on that
@@ -23,7 +26,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use parking_lot::Mutex;
-use plow_asset::multimodal::{MmContract, MmModality, ROW_ID_BIT, SLAB_TENSOR, TABLE_TENSOR};
+use plow_asset::multimodal::{MmContract, MmModality, ROW_ID_BIT, SLAB_TENSOR, SPAN_ID_BIT, TABLE_TENSOR};
 use sha2::{Digest, Sha256};
 
 use crate::serve::openai::{ContentPart, Message};
@@ -190,6 +193,11 @@ impl MmJob {
         self.staged
     }
 
+    /// The prompt holds bidirectional-span rows: its prefill chunks must not split them.
+    pub fn spans(&self) -> bool {
+        self.ids.iter().any(|&id| plow_asset::multimodal::is_span_id(id))
+    }
+
     /// Move the reservation to `slab` (the job was routed to another engine). `false` when it is full.
     pub fn rebind(&mut self, slab: &Arc<Slab>) -> bool {
         if Arc::ptr_eq(&self.slab, slab) {
@@ -352,15 +360,17 @@ fn digest(kind: &str, bytes: &[u8]) -> [u8; 32] {
     h.finalize().into()
 }
 
-/// Bit-31 ids of `rows` soft-token rows of the item with `digest`.
-pub fn row_ids(digest: &[u8; 32], rows: usize) -> Vec<u32> {
+/// Bit-31 ids of `rows` soft-token rows of the item with `digest`; bit 30 marks a
+/// bidirectional-span item (30-bit hash either way).
+pub fn row_ids(digest: &[u8; 32], rows: usize, span: bool) -> Vec<u32> {
+    let tag = if span { ROW_ID_BIT | SPAN_ID_BIT } else { ROW_ID_BIT };
     (0..rows as u32)
         .map(|k| {
             let mut h = Sha256::new();
             h.update(digest);
             h.update(k.to_le_bytes());
             let d = h.finalize();
-            ROW_ID_BIT | (u32::from_le_bytes([d[0], d[1], d[2], d[3]]) & !ROW_ID_BIT)
+            tag | (u32::from_le_bytes([d[0], d[1], d[2], d[3]]) & !(ROW_ID_BIT | SPAN_ID_BIT))
         })
         .collect()
 }
@@ -513,11 +523,12 @@ pub async fn expand(
     }
     let ids: Vec<Vec<u32>> = prepared
         .iter()
-        .map(|p| {
+        .zip(&slots)
+        .map(|(p, (_, m))| {
             let d = match p {
                 Prepared::Image(_, d) | Prepared::Audio(_, _, d) => d,
             };
-            row_ids(d, soft_tokens(p))
+            row_ids(d, soft_tokens(p), !m.attention.is_causal())
         })
         .collect();
     // Expand placeholders back to front so earlier positions stay valid.
@@ -610,12 +621,15 @@ mod tests {
 
     #[test]
     fn row_ids_are_content_keyed_and_tagged() {
-        let a = row_ids(&digest("image", b"one"), 3);
-        let b = row_ids(&digest("image", b"two"), 3);
-        assert!(a.iter().chain(&b).all(|&id| id & ROW_ID_BIT != 0 && id > TOMBSTONE));
+        let a = row_ids(&digest("image", b"one"), 3, false);
+        let b = row_ids(&digest("image", b"two"), 3, false);
+        assert!(a.iter().chain(&b).all(|&id| id & ROW_ID_BIT != 0 && id & SPAN_ID_BIT == 0 && id > TOMBSTONE));
         assert_ne!(a, b);
-        assert_eq!(a, row_ids(&digest("image", b"one"), 3));
+        assert_eq!(a, row_ids(&digest("image", b"one"), 3, false));
         assert_ne!(a[0], a[1]);
+        let s = row_ids(&digest("image", b"one"), 3, true);
+        assert!(s.iter().all(|&id| plow_asset::multimodal::is_span_id(id)));
+        assert_eq!(s.iter().map(|id| id & !SPAN_ID_BIT).collect::<Vec<_>>(), a, "the span bit only tags");
     }
 
     #[test]

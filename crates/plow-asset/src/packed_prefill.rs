@@ -369,7 +369,7 @@ impl Manifest {
                         need(!d.t[..5].contains(&merge.t[0]), "merge output alias")?;
                     } else {
                         need(
-                            d.i[7] == 1 && !d.t[..5].contains(&d.t[5]),
+                            packet::dev::flash_nsplit(d.i[7]) == 1 && !d.t[..5].contains(&d.t[5]),
                             "fused attention extent/alias",
                         )?;
                         extent(d.t[5], qbytes)?;

@@ -8,6 +8,11 @@
 // the op's i[4] handle (bit 31), as the interpreter reads it. Rows past the last request zeroed,
 // successor counters signalled on exit. No tensor maps.
 //
+// GEN_MEDIA_SPAN=1 builds the media-span twin (catalog entry attn_pf_hd256_sliding_fp8kv_span):
+// the op's i[7] high half (direct ABI: the 8th pointer, the bf16 kernel's mapkv) names the
+// MmSpanExtent rows, and query row r also attends keys up to min(q + span[r], kvlen - 1), the
+// rest of its media item. GEN_MEDIA_SPAN=0 compiles the causal object unchanged.
+//
 // Staging: WG0 cp.asyncs each raw e4m3 K/V tile into a private per-thread staging slot (two
 // threads per KV row, 128 B each), converts it exactly to bf16 (e4m3 -> f16 -> f32 -> bf16 is
 // lossless) into the same 128B-swizzled stage layout the bf16 kernel's TMA writes, and records the
@@ -16,6 +21,9 @@
 // the stored quantization and the bf16 P the bf16 kernel also has.
 #include "dev_isa.h"
 #define PLOW_NV_HOPPER 1
+#ifndef GEN_MEDIA_SPAN
+#define GEN_MEDIA_SPAN 0
+#endif
 #include "sm90_wgmma.cuh"
 
 #ifndef GEN_BN
@@ -77,6 +85,9 @@ extern "C" __device__ unsigned plow_attention_head_dim = hd256::HD;
 extern "C" __device__ unsigned plow_attention_query_tile = hd256::BM;
 extern "C" __device__ unsigned plow_attention_kv_tile = hd256::BN;
 extern "C" __device__ unsigned plow_attention_warps = hd256::THREADS / 32;
+#if GEN_MEDIA_SPAN
+extern "C" __device__ unsigned plow_attention_media_span = 1;
+#endif
 
 typedef struct {
     const int* requests;
@@ -86,7 +97,11 @@ typedef struct {
     const uint8_t* k;
     const uint8_t* v;
     __nv_bfloat16* output;
+#if GEN_MEDIA_SPAN
+    const unsigned* span;
+#else
     const void* mapkv;
+#endif
     const PlowStreamEnt* entries;
     const unsigned* succs;
     unsigned* counters;
@@ -192,6 +207,16 @@ struct Item {
     unsigned t0, t1;  // KV tiles [t0, t1)
 };
 
+#if GEN_MEDIA_SPAN
+// Exclusive key bound of query row `r` of the item: the causal diagonal, or the end of its media
+// span (clipped to the request: a run never continues into the next packed request's rows).
+__device__ __forceinline__ unsigned row_end(const PlowGenFlashPrefill& a, const Item& it,
+                                            unsigned r) {
+    const unsigned end = it.pos + r + 1;
+    return a.span && r < it.nrows ? max(end, min(end + a.span[it.qrow + r], it.kvlen)) : end;
+}
+#endif
+
 // Items run heaviest-first inside each request (descending query tile, heads inner) and are
 // dealt to the persistent CTAs in zig-zag rounds.
 __device__ __forceinline__ bool item_at(const PlowGenFlashPrefill& a, unsigned round, Item& it) {
@@ -217,7 +242,12 @@ __device__ __forceinline__ bool item_at(const PlowGenFlashPrefill& a, unsigned r
         it.pos = rq.w - rq.y + tile * BM;
         it.lo = (a.window && it.pos + 1 > a.window) ? it.pos + 1 - a.window : 0u;
         it.t0 = it.lo / BN;
+#if GEN_MEDIA_SPAN
+        // A span's rows share its end, so row ends are monotone and the last row's is the max.
+        it.t1 = (row_end(a, it, it.nrows - 1) - 1) / BN + 1;
+#else
         it.t1 = (it.pos + it.nrows - 1) / BN + 1;
+#endif
         return true;
     }
     return false;
@@ -277,14 +307,28 @@ __device__ __forceinline__ void issue_pv(float* o, const uint32_t* pa, const PvD
 // diagonal or the window edge; a row with nothing visible yet keeps max -inf and adds zeros.
 struct Softmax {
     unsigned row, col, window, pos;
+#if GEN_MEDIA_SPAN
+    unsigned end0, end1;  // this lane's two rows' exclusive key bounds (row_end)
+#endif
     float sl, m0, m1, l0, l1;
+#if GEN_MEDIA_SPAN
+    __device__ __forceinline__ void reset(const PlowGenFlashPrefill& a, const Item& it) {
+        pos = it.pos;
+        end0 = row_end(a, it, row);
+        end1 = row_end(a, it, row + 8);
+#else
     __device__ __forceinline__ void reset(unsigned p) {
         pos = p;
+#endif
         m0 = m1 = -INFINITY;
         l0 = l1 = 0.f;
     }
     __device__ __forceinline__ void step(float* sc, unsigned kv0, float& c0, float& c1) {
+#if GEN_MEDIA_SPAN
+        const bool diag = kv0 + BN > end0;
+#else
         const bool diag = kv0 + BN - 1 > pos;
+#endif
         const bool edge = window && pos + BM - 1 - kv0 >= window;
         if (diag || edge) {
 #pragma unroll
@@ -293,7 +337,12 @@ struct Softmax {
                 for (int e = 0; e < 4; ++e) {
                     const unsigned q = pos + row + 8 * (e >> 1);
                     const unsigned kv = kv0 + 8 * j + col + (e & 1);
+#if GEN_MEDIA_SPAN
+                    if (kv >= ((e >> 1) ? end1 : end0) || (window && kv <= q && q - kv >= window))
+                        sc[4 * j + e] = -INFINITY;
+#else
                     if (kv > q || (window && q - kv >= window)) sc[4 * j + e] = -INFINITY;
+#endif
                 }
         }
         float mx0 = m0, mx1 = m1;
@@ -487,7 +536,11 @@ __device__ __forceinline__ void consume(const PlowGenFlashPrefill& a, uint32_t b
         float o[HD / 2];
 #pragma unroll
         for (int i = 0; i < HD / 2; ++i) o[i] = 0.f;
+#if GEN_MEDIA_SPAN
+        sm.reset(a, it);
+#else
         sm.reset(it.pos);
+#endif
         float sc[BN / 2];
         uint32_t pa[BN / 4];
         // First tile: scores and softmax only; O is still zero.
@@ -709,7 +762,11 @@ void plow_gen_flash_prefill(PlowProgram prog) {
         a.v = static_cast<const uint8_t*>(t[in->t[4]]);
         a.output = in->t[5] == PLOW_TENSOR_NONE ? nullptr
                                                 : static_cast<__nv_bfloat16*>(t[in->t[5]]);
+#if GEN_MEDIA_SPAN
+        a.span = (in->i[7] >> 16) ? static_cast<const unsigned*>(t[in->i[7] >> 16]) : nullptr;
+#else
         a.mapkv = nullptr;
+#endif
         a.seq_q = in->i[0];
         a.seq_kv = in->i[1];
         a.q_pos0 = packed ? 0u : q_pos0;
@@ -721,7 +778,11 @@ void plow_gen_flash_prefill(PlowProgram prog) {
         a.window = in->i[5];
     }
     __syncthreads();
+#if GEN_MEDIA_SPAN
+    if (in->op != PLOW_DOP_FLASH_PREFILL_FP8 || in->i[6] != hd256::HD || (in->i[7] & 0xFFFFu) != 1 ||
+#else
     if (in->op != PLOW_DOP_FLASH_PREFILL_FP8 || in->i[6] != hd256::HD || in->i[7] != 1 ||
+#endif
         ((in->i[4] & (1u << 31)) && !a.requests) || !hd256::valid(a))
         __trap();
     hd256::run(a, hd256::arena(hd256::ARG_BYTES), prog.gq_stream + index, prog.succs, prog.counters);

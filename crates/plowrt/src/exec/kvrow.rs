@@ -232,6 +232,7 @@ pub(crate) enum RowField {
 pub(crate) const PREFILL_ROW_FIELDS: &[(DevOp, RowField)] = &[
     (DevOp::Embed, RowField::Rows(0)),
     (DevOp::MmRowsBf16, RowField::Rows(0)),
+    (DevOp::MmSpanExtent, RowField::Rows(0)),
     (DevOp::RmsNorm, RowField::Rows(0)),
     (DevOp::LayerNorm, RowField::Rows(0)),
     (DevOp::HeadNormRope, RowField::Rows(0)),

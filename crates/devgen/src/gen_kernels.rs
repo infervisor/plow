@@ -60,10 +60,13 @@ pub(crate) struct Entry {
     pub pair_heads: bool,
     /// Smallest prefill rung (rows) bound to the entry; narrower rungs keep their existing route.
     pub min_rows: u32,
+    /// Claims exactly the media-span sites (`FlashPrefillFp8` i[7] high half); the object exports
+    /// `plow_attention_media_span = 1`.
+    pub media_span: bool,
 }
 
 /// Mirrors the build_catalog.py entries; a new entry takes the next generated role ID.
-pub(crate) const CATALOG: [Entry; 4] = [
+pub(crate) const CATALOG: [Entry; 5] = [
     Entry {
         name: "attn_pf_hd512",
         role: GENERATED_FIRST,
@@ -74,6 +77,7 @@ pub(crate) const CATALOG: [Entry; 4] = [
         ring_kv: false,
         pair_heads: false,
         min_rows: 1024,
+        media_span: false,
     },
     Entry {
         name: "attn_pf_hd256_sliding",
@@ -85,6 +89,7 @@ pub(crate) const CATALOG: [Entry; 4] = [
         ring_kv: true,
         pair_heads: true,
         min_rows: 1024,
+        media_span: false,
     },
     Entry {
         name: "attn_pf_hd256_sliding_fp8kv",
@@ -96,6 +101,7 @@ pub(crate) const CATALOG: [Entry; 4] = [
         ring_kv: true,
         pair_heads: true,
         min_rows: 128,
+        media_span: false,
     },
     Entry {
         name: "attn_pf_hd512_fp8kv",
@@ -107,6 +113,19 @@ pub(crate) const CATALOG: [Entry; 4] = [
         ring_kv: false,
         pair_heads: false,
         min_rows: 128,
+        media_span: false,
+    },
+    Entry {
+        name: "attn_pf_hd256_sliding_fp8kv_span",
+        role: GENERATED_FIRST + 4,
+        file: "gen_sm90a_attn_pf_hd256_sliding_fp8kv_span.cubin",
+        kv: KvDtype::Fp8,
+        head_dim: 256,
+        window: ANY_SLIDING,
+        ring_kv: true,
+        pair_heads: true,
+        min_rows: 128,
+        media_span: true,
     },
 ];
 
@@ -148,7 +167,8 @@ impl Entry {
         op.op == self.kv.op() as u16
             && op.i[6] == self.head_dim
             && heads_and_window_match(op, self.window, self.pair_heads)
-            && op.i[7] == 1
+            && packet::dev::flash_nsplit(op.i[7]) == 1
+            && packet::dev::flash_span(op.i[7]).is_some() == self.media_span
             && (self.ring_kv || op.j[1] == u32::MAX)
             // FP8-KV roles need the per-row K/V scales; gen_flash_prefill.cu reads t[6]/t[7] unchecked.
             && (self.kv == KvDtype::Bf16 || (op.t[6] != TENSOR_NONE && op.t[7] != TENSOR_NONE))
@@ -175,6 +195,7 @@ impl Entry {
             || global("plow_gen_flash_prefill_abi") != Some(self.kv.object_abi())
             || global("plow_attention_head_dim") != Some(self.head_dim)
             || global("plow_pf_request_abi") != Some(2)
+            || (global("plow_attention_media_span") == Some(1)) != self.media_span
         {
             return Err(format!(
                 "{} is not a generated {} flash-prefill object",
@@ -311,6 +332,12 @@ mod tests {
         assert!(bf16.matches(&op) && !fp8.matches(&op));
         op.op = DevOp::FlashPrefillFp8 as u16;
         assert!(!bf16.matches(&op) && fp8.matches(&op));
+        // Media-span sites (i7 high half) belong to the span twin only.
+        let span = entry("attn_pf_hd256_sliding_fp8kv_span");
+        assert!(!span.matches(&op));
+        op.i[7] = 1 | 900 << 16;
+        assert!(!fp8.matches(&op) && span.matches(&op));
+        op.i[7] = 1;
         // FP8-KV global attention has its own entry; the bf16 one does not claim it.
         op.i[5] = 0;
         op.i[6] = 512;

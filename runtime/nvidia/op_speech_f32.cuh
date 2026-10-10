@@ -3609,7 +3609,8 @@ static __device__ __noinline__ void d_conv1d_f32(const PlowDevInst* in, void* co
  * One block per (item, head, 64-query tile); BK-key
  * tiles staged through smem; a thread owns 4 query
  * rows x 4*BK/64 keys of S and 4 rows x head_width/16 columns of O, with the row statistics
- * reduced over its 16-lane group. */
+ * reduced over its 16-lane group. RAGGED: head_width i4 < HW (a multiple of 8, e.g. 72) in the
+ * HW layout, zero-padded columns staged, unused output columns not stored. */
 #define SPF_BQ 64
 #define SPF_LDP (SPF_BQ + 4)
 template <int HW, int BK>
@@ -3622,7 +3623,7 @@ struct SpfShape {
 static_assert(SP_ARENA_FLOATS >= SpfShape<64, 128>::FLOATS, "attention stages");
 static_assert(!SPF_HD128 || SP_ARENA_FLOATS >= SpfShape<128, 64>::FLOATS, "attention stages");
 
-template <int HW, int BK>
+template <int HW, int BK, bool RAGGED = false>
 static __device__ __noinline__ void sp_attention_f32(const PlowDevInst* in, void* const* T, unsigned slice,
                                         unsigned nblk, float* arena) {
     arena = sp_smem;
@@ -3642,7 +3643,8 @@ static __device__ __noinline__ void sp_attention_f32(const PlowDevInst* in, void
     const unsigned pre = prefix ? in->i[7] : 0u;
     const float* bias = prefix ? nullptr : (const float*)SP_TEN(5);
     const unsigned batch = in->i[0], q_rows = in->i[1], kv_rows = in->i[2], heads = in->i[3];
-    const unsigned width = heads * HW, stride = in->i[5] ? in->i[5] : width;
+    const unsigned hw = RAGGED ? in->i[4] : (unsigned)HW;
+    const unsigned width = heads * hw, stride = in->i[5] ? in->i[5] : width;
     const bool causal = in->i[6] & 1u;
     const unsigned bias_hs = in->i[7], k_col0 = in->fj[1].u, v_col0 = in->fj[2].u;
     const float scale = in->fj[0].f;
@@ -3665,7 +3667,8 @@ static __device__ __noinline__ void sp_attention_f32(const PlowDevInst* in, void
             for (unsigned p = 0; p < QPER; p++) {
                 const unsigned e = tid + p * PLOW_NV_THREADS, r = e / D4, d = (e - r * D4) * 4u;
                 qv[p] = make_float4(0.f, 0.f, 0.f, 0.f);
-                if (q0 + r < q_rows) qv[p] = sp_ld4(query + ((size_t)b * q_rows + q0 + r) * stride + h * HW + d, vec);
+                if (q0 + r < q_rows && (!RAGGED || d < hw))
+                    qv[p] = sp_ld4(query + ((size_t)b * q_rows + q0 + r) * stride + h * hw + d, vec);
             }
             __syncthreads();
 #pragma unroll
@@ -3690,12 +3693,13 @@ static __device__ __noinline__ void sp_attention_f32(const PlowDevInst* in, void
             for (unsigned p = 0; p < PER; p++) {
                 const unsigned e = tid + p * PLOW_NV_THREADS, j = e / D4, d = (e - j * D4) * 4u;
                 kr[p] = vr[p] = make_float4(0.f, 0.f, 0.f, 0.f);
-                if (k0 + j < pre && k0 + j < kend) {
-                    const size_t pb = ((size_t)pidx[b] * pre + k0 + j) * (2u * width) + h * HW + d;
+                if (RAGGED && d >= hw) {
+                } else if (k0 + j < pre && k0 + j < kend) {
+                    const size_t pb = ((size_t)pidx[b] * pre + k0 + j) * (2u * width) + h * hw + d;
                     kr[p] = sp_ld4(prefix + pb, vec);
                     vr[p] = sp_ld4(prefix + pb + width, vec);
                 } else if (k0 + j < kend) {
-                    const size_t base = ((size_t)b * kv_rows + k0 + j - pre) * stride + h * HW + d;
+                    const size_t base = ((size_t)b * kv_rows + k0 + j - pre) * stride + h * hw + d;
                     kr[p] = sp_ld4(key + base + k_col0, vec);
                     vr[p] = sp_ld4(value + base + v_col0, vec);
                 }
@@ -3715,7 +3719,7 @@ static __device__ __noinline__ void sp_attention_f32(const PlowDevInst* in, void
 #pragma unroll
                 for (int j = 0; j < 4 * KG; j++) s[i][j] = 0.f;
 #pragma unroll 8
-            for (int d = 0; d < HW; d++) {
+            for (int d = 0; d < (int)hw; d++) {
                 const float4 qa = *(const float4*)(Qs + d * LDQ + ty * 4);
                 const float av[4] = {qa.x, qa.y, qa.z, qa.w};
 #pragma unroll
@@ -3791,9 +3795,10 @@ static __device__ __noinline__ void sp_attention_f32(const PlowDevInst* in, void
             const unsigned r = q0 + ty * 4 + i;
             if (r >= q_rows) continue;
             const float inv = lrow[i] > 0.f ? 1.0f / lrow[i] : 0.f;
-            float* orow = out + ((size_t)b * q_rows + r) * width + h * HW;
+            float* orow = out + ((size_t)b * q_rows + r) * width + h * hw;
 #pragma unroll
             for (int cb = 0; cb < CB; cb++)
+                if (!RAGGED || cb * 64 + tx * 4 < hw)
                 *(float4*)(orow + cb * 64 + tx * 4) =
                     make_float4(o[i][cb * 4] * inv, o[i][cb * 4 + 1] * inv, o[i][cb * 4 + 2] * inv,
                                 o[i][cb * 4 + 3] * inv);
@@ -4655,6 +4660,15 @@ static __device__ __noinline__ void d_attention_f32(const PlowDevInst* in, void*
 #else
         __trap();
 #endif
+    }
+    else if (in->i[4] < 128u && in->i[4] % 8u == 0u) {
+#if SPF_HD128
+        sp_attention_f32<128, 64, true>(in, T, slice, nblk, arena);
+#else
+        __trap();
+#endif
+    } else {
+        __trap();
     }
 }
 
