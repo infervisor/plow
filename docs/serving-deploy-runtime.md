@@ -31,8 +31,9 @@ A bundle is a directory of compiled assets: packets (`*.pkt`), cubins, `objects/
 |---|---|---|
 | packet ↔ object pairing | `build.json` `pairing.hash`, stamped into each specialised cubin | plowrt refuses a module whose stamp disagrees |
 | checkpoint identity | `serve.json` (a `model.pkt` section) `weights`: per shard, size + sha256 of the safetensors header (every tensor's name, dtype, shape, offset), recorded at emit | plowrt at load, before any weight is read |
-| cuBLASLt minimum | `build.json` `runtime_requires.cublaslt` (`"13.4"`) when declared; otherwise derived from the emit knobs in `build.json` `knobs.values`: `emit.moe_pf_lt` or `emit.moe_dec_lt` (grouped cuBLASLt MoE routes) need 13.4. Bundles emitted before the field exist get the derived default | plowrt at startup, per bundle |
-| minimum plowrt | `build.json` `runtime_requires.plowrt_contract` (integer); this plowrt implements contract 1. Absent = 1 | plowrt at startup, per bundle |
+| cuBLASLt minimum | `build.json` `runtime_requires.cublaslt`, written by devgen from the library routes the packet emits: grouped MoE roles `"13.4"`, FP8 projections `"12.9"`, BF16 projections `"12.0"`, none without a cuBLASLt route. Bundles emitted before the field get it derived from the emit knobs in `build.json` `knobs.values` (`emit.moe_pf_lt` / `emit.moe_dec_lt` need 13.4) | plowrt at startup, per bundle |
+| minimum plowrt | `build.json` `runtime_requires.plowrt_contract` (integer, `plow_asset::RUNTIME_CONTRACT`, written by devgen); this plowrt implements contract 1. Absent = 1 | plowrt at startup, per bundle |
+| cuBLASLt algorithms | `cublaslt_algos.jsonl` (optional; [tune store](../tuning/README.md#cublaslt-algorithm-store-cublaslt_algosjsonl)); its sha256 is in `build-record.json` | plowrt pins each row after AlgoCheck, else selects at load |
 | speech contract (ASR, VAD) | packet pipeline parameter `contract` (+ the driver name), per pipeline: `vad.frame.v1` 1, `rnnt.greedy.v1` 1, audio-LM `causal.v1` 1 ([ASR/VAD packet contract](runtime/asr-packet-contract.md)) | plowrt when it loads the packet (`--assets`, `--asr-packet`, `--asr-vad-packet`): newer or older than implemented = refusal |
 | serve settings | `serve.json` `serve_defaults` (registered `PLOW_*` knobs; the environment overrides) | plowrt at startup (unknown knob = refusal) |
 

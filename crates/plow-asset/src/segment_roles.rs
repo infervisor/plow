@@ -146,6 +146,13 @@ pub const NATIVE_DECODE_BF16_SHAPES: [[u32; 5]; 54] = [
     [32, 262144, 3840, 256, 1],
 ];
 
+/// Oldest cuBLASLt each library route runs on (`build.json` `runtime_requires.cublaslt`): the
+/// grouped matmul of the MoE roles needs 13.4 on Hopper, the FP8 projections' outer-vector scale
+/// mode 12.9, a BF16 projection any 12.x.
+pub const CUBLASLT_GROUPED_MIN: &str = "13.4";
+pub const CUBLASLT_FP8_MIN: &str = "12.9";
+pub const CUBLASLT_BF16_MIN: &str = "12.0";
+
 pub const CUBLASLT_PREFILL_MAX_ROWS: u32 = 16384;
 /// Widest decode rung whose projections may run as cuBLASLt segments.
 pub const CUBLASLT_DECODE_MAX_ROWS: u32 = 128;

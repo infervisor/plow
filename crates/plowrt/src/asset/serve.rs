@@ -324,7 +324,7 @@ pub fn asset_env_defaults(
 
 /// The runtime contract this plowrt implements. A bundle whose `build.json`
 /// `runtime_requires.plowrt_contract` is higher needs a newer plowrt.
-pub const RUNTIME_CONTRACT: u32 = 1;
+pub const RUNTIME_CONTRACT: u32 = plow_asset::RUNTIME_CONTRACT;
 
 /// The cuBLASLt release grouped matmul (`cublasLtGroupedMatrixLayoutCreate`) needs on Hopper.
 const GROUPED_LT: usize = 130400;
@@ -419,10 +419,10 @@ pub fn check_runtime(
         Err(e) => e.clone(),
     };
     Err(RuntimeError::Rejected(format!(
-        "model {} needs cuBLASLt >= {} ({why}); this runtime loads {have}. Ship libcublasLt.so.13 \
-         from cuBLAS 13.4 or newer beside plowrt.",
+        "model {} needs cuBLASLt >= {need} ({why}); this runtime loads {have}. Ship a libcublasLt \
+         of cuBLAS {need} or newer beside plowrt.",
         asset_dir.display(),
-        show_version(*need)
+        need = show_version(*need)
     )))
 }
 

@@ -153,7 +153,34 @@ pub(crate) struct StoredAlgo {
     pub algo: [String; 8],
     pub workspace: usize,
     pub matmul_us: f32,
+    /// A [`Lt::pair_plan`] selection (two projections of one input as a strided batch of 2). Its
+    /// strides are not keyed: AlgoCheck validates the row against the live layout.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub pair: bool,
+    /// The packet instructions' N this plan serves when it differs from `[n]`: a fused q|k|v
+    /// plan (`n = nq + nk + nv`) or an lm_head served on its first `n & !15` columns. The build
+    /// checks a bundle's projection shapes against these.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ns: Vec<u32>,
+    /// The decode rung widths the selection was timed across, ascending (a widest-rung plan
+    /// pinned for every narrower rung, `PLOW_LT_RUNG_ALGOS` off); empty = `m` alone. A row pins
+    /// only a plan timed over the same widths: a per-rung pick is not a cross-rung pick.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rows: Vec<u32>,
 }
+
+/// [`StoredAlgo::rows`] of a plan at `m` timed across `rows`.
+fn rung_key(m: u32, rows: &[u32]) -> Vec<u32> {
+    let mut key = rows.to_vec();
+    key.sort_unstable();
+    key.dedup();
+    if key == [m] {
+        key.clear();
+    }
+    key
+}
+
+type StoredKey = (u32, u32, u32, bool, Vec<u32>);
 
 impl StoredAlgo {
     fn to_algo(&self) -> Option<Algo> {
@@ -170,8 +197,8 @@ pub(crate) struct Lt {
     api: Api,
     handle: usize,
     workspace: DeviceMem,
-    /// `PLOW_LT_ALGOS`: shapes whose algorithm is pinned by the table.
-    stored: std::collections::HashMap<(u32, u32, u32), Algo>,
+    /// `PLOW_LT_ALGOS`: `(m, n, k, pair, rows)` whose algorithm is pinned by the table.
+    stored: std::collections::HashMap<StoredKey, Algo>,
     /// `PLOW_LT_ALGOS_WRITE`: append every load-time selection here.
     write: Option<std::path::PathBuf>,
     /// `PLOW_CUTLASS_FP8_DECODE`: small-M FP8 decode projections.
@@ -204,7 +231,8 @@ impl Lt {
                     continue;
                 }
                 if let Some(algo) = rec.to_algo() {
-                    stored.insert((rec.m, rec.n, rec.k), algo);
+                    let rows = rung_key(rec.m, &rec.rows);
+                    stored.insert((rec.m, rec.n, rec.k, rec.pair, rows), algo);
                 }
             }
             tracing::info!(
@@ -241,7 +269,8 @@ impl Lt {
         self.cutlass_fp8.as_ref()
     }
 
-    fn record(&self, m: u32, n: u32, k: u32, algo: &Algo, workspace: usize, matmul_us: f32) {
+    #[allow(clippy::too_many_arguments)]
+    fn record(&self, (m, n, k): (u32, u32, u32), pair: bool, ns: &[u32], rows: &[u32], algo: &Algo, workspace: usize, matmul_us: f32) {
         let Some(path) = &self.write else { return };
         let rec = StoredAlgo {
             m,
@@ -252,6 +281,9 @@ impl Lt {
             algo: std::array::from_fn(|i| format!("{:016x}", algo.data[i])),
             workspace,
             matmul_us,
+            pair,
+            ns: if ns == [n] { Vec::new() } else { ns.to_vec() },
+            rows: rung_key(m, rows),
         };
         let line = match serde_json::to_string(&rec) {
             Ok(s) => s,
@@ -272,7 +304,9 @@ impl Lt {
     }
 
     /// `rows`: the routed decode rungs the plan's algorithm will serve (it is pinned for all of
-    /// them); load-time timing then sums over those widths instead of timing `m` alone.
+    /// them); load-time timing then sums over those widths instead of timing `m` alone. `ns`: the
+    /// packet instructions' N it serves (recorded with the selection, see [`StoredAlgo::ns`]).
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn plan(
         self: &Arc<Self>,
         m: u32,
@@ -281,8 +315,9 @@ impl Lt {
         weight: u64,
         template: Option<&Plan>,
         rows: &[u32],
+        ns: &[u32],
     ) -> Result<Arc<Plan>> {
-        self.plan_impl(m, n, k, weight, template, None, rows)
+        self.plan_impl(m, n, k, weight, template, None, rows, ns)
     }
 
     pub(crate) fn fp8_plan(
@@ -421,7 +456,7 @@ impl Lt {
         template: Option<&Plan>,
         rows: &[u32],
     ) -> Result<Arc<Plan>> {
-        self.plan_impl(m, n, k, weight, template, Some(pair), rows)
+        self.plan_impl(m, n, k, weight, template, Some(pair), rows, &[n])
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -434,6 +469,7 @@ impl Lt {
         template: Option<&Plan>,
         pair: Option<Pair>,
         rows: &[u32],
+        ns: &[u32],
     ) -> Result<Arc<Plan>> {
         if template.is_some_and(|p| {
             !Arc::ptr_eq(self, &p.lt) || p.shape.0 < m || (p.shape.1, p.shape.2) != (n, k)
@@ -511,8 +547,8 @@ impl Lt {
             }
             // A rung template pins the widest rung's algorithm; a stored table pins the shape's.
             // Both go through AlgoCheck, so a stale or foreign entry is refused here rather
-            // than at launch. The table holds single GEMMs only.
-            let stored = self.stored.get(&(m, n, k)).copied().filter(|_| pair.is_none());
+            // than at launch.
+            let stored = self.stored.get(&(m, n, k, pair.is_some(), rung_key(m, rows))).copied();
             let pinned = template.map(|t| t.algo).or(stored);
             if let Some(algo) = pinned {
                 plan.algo = algo;
@@ -599,6 +635,7 @@ impl Lt {
                     weight,
                     pair,
                     rows,
+                    ns,
                 )?;
                 Ok(())
             })();
@@ -1076,6 +1113,7 @@ impl Plan {
         weight: u64,
         pair: Option<Pair>,
         rows: &[u32],
+        ns: &[u32],
     ) -> Result<()> {
         let key: Selection = (
             self.lt.be.device_name().to_string(),
@@ -1097,7 +1135,7 @@ impl Plan {
         }
         match pair {
             Some(pair) => self.select_pair(candidates, m, n, k, weight, pair, rows)?,
-            None => self.select_timed(candidates, m, n, k, weight, rows)?,
+            None => self.select_timed(candidates, m, n, k, weight, rows, ns)?,
         }
         selections().lock().entry(key).or_insert(self.algo.data);
         Ok(())
@@ -1111,6 +1149,7 @@ impl Plan {
         k: u32,
         weight: u64,
         rows: &[u32],
+        ns: &[u32],
     ) -> Result<()> {
         let be = Arc::clone(&self.lt.be);
         let bytes_w = n as u64 * k as u64 * 2;
@@ -1186,7 +1225,7 @@ impl Plan {
             "cuBLASLt load-time algorithm selected"
         );
         self.lt
-            .record(m, n, k, &self.algo, candidates[index].workspace, matmul_ms * 1000.0);
+            .record((m, n, k), false, ns, rows, &self.algo, candidates[index].workspace, matmul_ms * 1000.0);
         Ok(())
     }
 
@@ -1263,6 +1302,7 @@ impl Plan {
         let index = selected
             .ok_or_else(|| RuntimeError::Device("no runnable cuBLASLt pair candidate".into()))?;
         self.algo = candidates[index].algo;
+        let matmul_ms = best / 16.0 / rows.len().max(1) as f32;
         tracing::info!(
             m,
             n,
@@ -1271,9 +1311,11 @@ impl Plan {
             w_stride = pair.w_stride,
             c_stride = pair.c_stride,
             ?rows,
-            matmul_ms = best / 16.0 / rows.len().max(1) as f32,
+            matmul_ms,
             "cuBLASLt pair algorithm selected"
         );
+        self.lt
+            .record((m, n, k), true, &[n], rows, &self.algo, candidates[index].workspace, matmul_ms * 1000.0);
         Ok(())
     }
 
@@ -1294,7 +1336,7 @@ impl Plan {
         rows.iter()
             .map(|&r| match r == m {
                 true => Ok(None),
-                false => self.lt.plan_impl(r, n, k, weight, Some(self), pair, &[]).map(Some),
+                false => self.lt.plan_impl(r, n, k, weight, Some(self), pair, &[], &[]).map(Some),
             })
             .collect()
     }
