@@ -21,6 +21,18 @@ def save(path, value):
     temporary.replace(path)
 
 
+def tenant_blocks(audit, ngpu):
+    """True unless `ngpu` NVIDIA cards are free of foreign processes (gpulease leases around them)."""
+    if audit.strip() == "GPU: no foreign compute procs":
+        return False
+    smi = subprocess.run(["nvidia-smi", "-L"], capture_output=True, text=True) if Path("/dev/nvidiactl").exists() else None
+    if smi is None or smi.returncode:
+        return True
+    busy = {line.split(":")[0] for line in audit.splitlines() if line.startswith("gpu")}
+    total = len(smi.stdout.splitlines())
+    return ngpu >= total or total - len(busy) < ngpu
+
+
 def work(root):
     render_nodes = list(Path("/dev/dri").glob("renderD*"))
     if Path("/dev/kfd").exists() and (not render_nodes or not all(os.access(p, os.R_OK | os.W_OK) for p in render_nodes)):
@@ -44,10 +56,10 @@ def work(root):
             # Do not run a benchmark alongside a server that bypassed the lease locks.
             metal = platform.system() == "Darwin"
             audit = None if metal else subprocess.run([str(LEASE), "--audit"], capture_output=True, text=True)
-            if audit is not None and (audit.returncode or audit.stdout.strip() != "GPU: no foreign compute procs"):
+            path, job = pending[0]
+            if audit is not None and (audit.returncode or tenant_blocks(audit.stdout, job["ngpu"])):
                 time.sleep(5)
                 continue
-            path, job = pending[0]
             job.update(state="running", runner_pid=os.getpid(), started=time.time())
             save(path, job)
             with (root / (path.stem + ".log")).open("ab") as log:

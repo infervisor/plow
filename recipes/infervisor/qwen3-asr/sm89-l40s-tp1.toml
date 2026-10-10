@@ -1,0 +1,81 @@
+# Qwen3-ASR-1.7B on L40S (sm_89, 142 SMs, 48 GB): the H100 recipe minus the Hopper-only decode
+# knobs (gemv_k8, FA fold, dense tune) and the wgmma `_gw` rungs past 32. Decoder prefill
+# projections go through cuBLASLt (bf16, segment_roles sm89 policy); batched decode GEMVs walk the
+# tensor cores (PLOW_NV_GEMV_MMA). Co-served with the other ASR models on one card.
+#
+#   nix develop --command python3 scripts/campaign/campaign.py build \
+#     recipes/infervisor/qwen3-asr/sm89-l40s-tp1.toml --out <fresh dir>
+#
+# Gate: WER on the 73-clip LibriSpeech dummy set (scripts/asr/nvidia/get_audio.py) = 3.826%
+# (c1 and c16). Decode ctx 1024 B=1/16/32 5.04/7.32/9.68 ms = 84/88/90% of the 841 GB/s roofline;
+# served c1 p50 125 ms, c16 RTFx 284 (docs/runtime/l40s-recipes.md).
+
+schema = "plow.recipe.v1"
+namespace = "infervisor"
+name = "qwen3-asr"
+label = "sm89-l40s-tp1"
+plow_git = "abb00b818378f4c09a2b53192d49cf192bc69f62"
+network = "qwen3"
+doc = "docs/runtime/asr.md"
+
+[target]
+vendor = "nvidia"
+isa = "sm_89"
+sku = "L40S"
+units = 142
+num_gpus = 1
+parallel = "tp"
+
+[checkpoint]
+source = "hf:Qwen/Qwen3-ASR-1.7B"
+revision = "7278e1e70fe206f11671096ffdd38061171dd6e5"
+
+[cell]
+name = "qwen3-asr-l40s"
+hf_dir = "{hf:Qwen/Qwen3-ASR-1.7B@7278e1e70fe206f11671096ffdd38061171dd6e5}"
+gpu = "l40s"
+arch = "sm_89"
+n_cu = 142
+n_gpu = 1
+max_ctx = 2048
+
+[emit]
+emit = "devblob+cubin"
+args = ["--served-name", "qwen3-asr"]
+[emit.env]
+PLOW_VERIFY_BIN = "{repo}/lean-plow/.lake/build/bin/plow_verify"
+PLOW_MAX_CHUNK = "512"
+PLOW_PF_LADDER_APPEND = "256,384"
+# Decode ladder to the 128-row clamp: slots are the widest rung and `auto` picks the rung per
+# tick. Rungs past 32 take ceil(B/32) mma walks, so their projections (and lm_head) run on
+# cuBLASLt from 64 rows, reading the weights once: B=64/128 ctx 1024 16.44/29.93 -> 14.36/23.86 ms.
+PLOW_DECODE_BATCH_LADDER = "1,2,4,8,16,32,64,128"
+PLOW_EMIT_DECODE_CUBLASLT = "1"
+PLOW_EMIT_DECODE_CUBLASLT_MIN_ROWS = "64"
+PLOW_EMIT_DECODE_CUBLASLT_HEAD = "1"
+PLOW_EMIT_PREFILL_CUBLASLT = "1"
+PLOW_NO_GLU_FUSE = "1"
+# hd128 row-group flash decode with merge fold (no FlashMerge level; changes attention sum
+# order): 0.6B / 1.7B / Orpheus B=16 ctx 1024 4.57/7.57/11.81 -> 4.40/7.30/11.37 ms.
+PLOW_NV_FA_FOLD = "1"
+# Packed prefill (several requests' prompts per launch; weights read once): 1.7B c16 RTFx
+# 74.1 -> 85.2, WER unchanged. The packed-request objects build for Ada (PLOW_NV_ADA).
+PLOW_EMIT_PACKED_PREFILL = "1"
+PLOW_EMIT_PACKED_PREFILL_SMALL_HD = "1"
+
+[bench]
+kind = "asr"
+client = "crates/plowrt/examples/asr/packet_dataset.rs"
+manifest = "scripts/asr/nvidia/get_audio.py"
+reference = "scripts/asr/nvidia/ref_bench.py"
+
+[gates]
+python = "{env:PYREF}"
+[gates.asr_wer]
+manifest = "{env:ASR_MANIFEST}"
+conc = "1,16,64"
+wer_max = 0.045
+
+# VMM-backed KV prefix cache on every request path (sessions, shared system prompts, replays).
+[serve.env]
+PLOW_VMM_PREFIX = "1"

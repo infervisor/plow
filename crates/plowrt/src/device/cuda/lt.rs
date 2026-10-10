@@ -24,6 +24,52 @@ struct Heuristic {
     reserved: [i32; 4],
 }
 
+/// cuBLASLt, first match wins: beside the binary (`<exe>/../lib`, `<exe>`: a deploy bundle ships it
+/// there), the system loader's sonames, then the toolkit plowrt was built against.
+fn cublaslt_candidates() -> Vec<std::path::PathBuf> {
+    use std::path::{Path, PathBuf};
+    const NAMES: [&str; 3] = ["libcublasLt.so.13", "libcublasLt.so.12", "libcublasLt.so"];
+    let beside: Vec<PathBuf> = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(Path::to_path_buf))
+        .map(|dir| vec![dir.join("../lib"), dir])
+        .unwrap_or_default();
+    let mut paths: Vec<PathBuf> =
+        beside.iter().flat_map(|dir| NAMES.map(|n| dir.join(n))).filter(|p| p.is_file()).collect();
+    paths.extend(NAMES.map(PathBuf::from));
+    if let Some(dir) = option_env!("PLOW_BUILD_CUDA_LIB") {
+        paths.extend(NAMES.map(|n| Path::new(dir).join(n)));
+    }
+    paths
+}
+
+/// The cuBLASLt this process binds (the first loadable [`cublaslt_candidates`] entry, as
+/// [`Api::load`] picks it) and its `cublasLtGetVersion` (13.4.2 = 130402).
+pub fn library() -> std::result::Result<(std::path::PathBuf, usize), String> {
+    static LIB: std::sync::OnceLock<std::result::Result<(std::path::PathBuf, usize), String>> =
+        std::sync::OnceLock::new();
+    LIB.get_or_init(|| {
+        let mut last = String::from("no candidate");
+        for path in cublaslt_candidates() {
+            // SAFETY: optional NVIDIA host library; only its version query is called.
+            let lib = match unsafe { libloading::Library::new(&path) } {
+                Ok(lib) => lib,
+                Err(e) => {
+                    last = e.to_string();
+                    continue;
+                }
+            };
+            // SAFETY: `size_t cublasLtGetVersion(void)`, every cuBLASLt release.
+            let version = unsafe { lib.get::<unsafe extern "C" fn() -> usize>(b"cublasLtGetVersion\0") }
+                .map(|f| unsafe { f() })
+                .map_err(|e| format!("{}: cublasLtGetVersion: {e}", path.display()))?;
+            return Ok((path, version));
+        }
+        Err(format!("no loadable cuBLASLt ({last})"))
+    })
+    .clone()
+}
+
 macro_rules! api {
     ($($name:ident: fn($($arg:ty),*) -> Status),+ ;
      optional $($oname:ident: fn($($oarg:ty),*) -> Status),+ $(,)?) => {
@@ -37,7 +83,7 @@ macro_rules! api {
             #[allow(non_snake_case)]
             fn load() -> Result<Self> {
                 let mut last = String::new();
-                for path in ["libcublasLt.so.13", "libcublasLt.so.12", "libcublasLt.so"] {
+                for path in cublaslt_candidates() {
                     // SAFETY: optional NVIDIA host library, retained with its symbols.
                     let lib = match unsafe { libloading::Library::new(path) } {
                         Ok(lib) => lib,
@@ -107,7 +153,34 @@ pub(crate) struct StoredAlgo {
     pub algo: [String; 8],
     pub workspace: usize,
     pub matmul_us: f32,
+    /// A [`Lt::pair_plan`] selection (two projections of one input as a strided batch of 2). Its
+    /// strides are not keyed: AlgoCheck validates the row against the live layout.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub pair: bool,
+    /// The packet instructions' N this plan serves when it differs from `[n]`: a fused q|k|v
+    /// plan (`n = nq + nk + nv`) or an lm_head served on its first `n & !15` columns. The build
+    /// checks a bundle's projection shapes against these.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ns: Vec<u32>,
+    /// The decode rung widths the selection was timed across, ascending (a widest-rung plan
+    /// pinned for every narrower rung, `PLOW_LT_RUNG_ALGOS` off); empty = `m` alone. A row pins
+    /// only a plan timed over the same widths: a per-rung pick is not a cross-rung pick.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rows: Vec<u32>,
 }
+
+/// [`StoredAlgo::rows`] of a plan at `m` timed across `rows`.
+fn rung_key(m: u32, rows: &[u32]) -> Vec<u32> {
+    let mut key = rows.to_vec();
+    key.sort_unstable();
+    key.dedup();
+    if key == [m] {
+        key.clear();
+    }
+    key
+}
+
+type StoredKey = (u32, u32, u32, bool, Vec<u32>);
 
 impl StoredAlgo {
     fn to_algo(&self) -> Option<Algo> {
@@ -124,8 +197,8 @@ pub(crate) struct Lt {
     api: Api,
     handle: usize,
     workspace: DeviceMem,
-    /// `PLOW_LT_ALGOS`: shapes whose algorithm is pinned by the table.
-    stored: std::collections::HashMap<(u32, u32, u32), Algo>,
+    /// `PLOW_LT_ALGOS`: `(m, n, k, pair, rows)` whose algorithm is pinned by the table.
+    stored: std::collections::HashMap<StoredKey, Algo>,
     /// `PLOW_LT_ALGOS_WRITE`: append every load-time selection here.
     write: Option<std::path::PathBuf>,
     /// `PLOW_CUTLASS_FP8_DECODE`: small-M FP8 decode projections.
@@ -133,7 +206,9 @@ pub(crate) struct Lt {
 }
 
 impl Lt {
-    pub(crate) fn load(be: &Arc<CudaBackend>) -> Result<Arc<Self>> {
+    /// `objects`: the serving bundle's object dir (`asset::serve::objects_dir`), where the
+    /// `PLOW_CUTLASS_FP8_DECODE` library lives.
+    pub(crate) fn load(be: &Arc<CudaBackend>, objects: Option<&std::path::Path>) -> Result<Arc<Self>> {
         be.bind()?;
         let api = Api::load()?;
         let workspace = be.alloc(0, 256 * 1024 * 1024)?;
@@ -156,7 +231,8 @@ impl Lt {
                     continue;
                 }
                 if let Some(algo) = rec.to_algo() {
-                    stored.insert((rec.m, rec.n, rec.k), algo);
+                    let rows = rung_key(rec.m, &rec.rows);
+                    stored.insert((rec.m, rec.n, rec.k, rec.pair, rows), algo);
                 }
             }
             tracing::info!(
@@ -170,10 +246,12 @@ impl Lt {
             .cutlass_fp8_decode
             .as_deref()
             .map(|pins| {
-                let dir = nv.pf_seg_dir.as_deref().ok_or_else(|| {
-                    RuntimeError::Rejected("PLOW_CUTLASS_FP8_DECODE requires PLOW_PF_SEG_DIR".into())
+                let dir = objects.ok_or_else(|| {
+                    RuntimeError::Rejected(
+                        "PLOW_CUTLASS_FP8_DECODE requires PLOW_PF_SEG_DIR or the bundle's objects/".into(),
+                    )
                 })?;
-                super::cutlass_fp8::CutlassFp8::load(be, std::path::Path::new(dir), pins)
+                super::cutlass_fp8::CutlassFp8::load(be, dir, pins)
             })
             .transpose()?;
         Ok(Arc::new(Self {
@@ -191,7 +269,8 @@ impl Lt {
         self.cutlass_fp8.as_ref()
     }
 
-    fn record(&self, m: u32, n: u32, k: u32, algo: &Algo, workspace: usize, matmul_us: f32) {
+    #[allow(clippy::too_many_arguments)]
+    fn record(&self, (m, n, k): (u32, u32, u32), pair: bool, ns: &[u32], rows: &[u32], algo: &Algo, workspace: usize, matmul_us: f32) {
         let Some(path) = &self.write else { return };
         let rec = StoredAlgo {
             m,
@@ -202,6 +281,9 @@ impl Lt {
             algo: std::array::from_fn(|i| format!("{:016x}", algo.data[i])),
             workspace,
             matmul_us,
+            pair,
+            ns: if ns == [n] { Vec::new() } else { ns.to_vec() },
+            rows: rung_key(m, rows),
         };
         let line = match serde_json::to_string(&rec) {
             Ok(s) => s,
@@ -222,7 +304,9 @@ impl Lt {
     }
 
     /// `rows`: the routed decode rungs the plan's algorithm will serve (it is pinned for all of
-    /// them); load-time timing then sums over those widths instead of timing `m` alone.
+    /// them); load-time timing then sums over those widths instead of timing `m` alone. `ns`: the
+    /// packet instructions' N it serves (recorded with the selection, see [`StoredAlgo::ns`]).
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn plan(
         self: &Arc<Self>,
         m: u32,
@@ -231,8 +315,9 @@ impl Lt {
         weight: u64,
         template: Option<&Plan>,
         rows: &[u32],
+        ns: &[u32],
     ) -> Result<Arc<Plan>> {
-        self.plan_impl(m, n, k, weight, template, None, rows)
+        self.plan_impl(m, n, k, weight, template, None, rows, ns)
     }
 
     pub(crate) fn fp8_plan(
@@ -371,7 +456,7 @@ impl Lt {
         template: Option<&Plan>,
         rows: &[u32],
     ) -> Result<Arc<Plan>> {
-        self.plan_impl(m, n, k, weight, template, Some(pair), rows)
+        self.plan_impl(m, n, k, weight, template, Some(pair), rows, &[n])
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -384,6 +469,7 @@ impl Lt {
         template: Option<&Plan>,
         pair: Option<Pair>,
         rows: &[u32],
+        ns: &[u32],
     ) -> Result<Arc<Plan>> {
         if template.is_some_and(|p| {
             !Arc::ptr_eq(self, &p.lt) || p.shape.0 < m || (p.shape.1, p.shape.2) != (n, k)
@@ -461,8 +547,8 @@ impl Lt {
             }
             // A rung template pins the widest rung's algorithm; a stored table pins the shape's.
             // Both go through AlgoCheck, so a stale or foreign entry is refused here rather
-            // than at launch. The table holds single GEMMs only.
-            let stored = self.stored.get(&(m, n, k)).copied().filter(|_| pair.is_none());
+            // than at launch.
+            let stored = self.stored.get(&(m, n, k, pair.is_some(), rung_key(m, rows))).copied();
             let pinned = template.map(|t| t.algo).or(stored);
             if let Some(algo) = pinned {
                 plan.algo = algo;
@@ -549,6 +635,7 @@ impl Lt {
                     weight,
                     pair,
                     rows,
+                    ns,
                 )?;
                 Ok(())
             })();
@@ -726,6 +813,8 @@ pub(crate) struct GroupedDims {
     pub k_array: u64,
     /// Expected `m_g`; only steers the heuristic.
     pub average_rows: u32,
+    /// e4m3 `W` and `A` (unit scales, fast accumulation) instead of bf16; `C` stays bf16.
+    pub fp8: bool,
 }
 
 /// Device `i32[groups]` arrays of a grouped attention GEMM's per-group shapes (see
@@ -753,15 +842,20 @@ impl Lt {
         self.api.cublasLtGroupedMatrixLayoutCreate.is_some()
     }
 
-    pub(crate) fn grouped_plan(self: &Arc<Self>, dims: &GroupedDims) -> Result<Arc<GroupedPlan>> {
+    /// The plan comes back unselected: every runnable heuristic candidate is a
+    /// [`GroupedPlan::candidates`] entry, best-first by the heuristic.
+    pub(crate) fn grouped_plan(self: &Arc<Self>, dims: &GroupedDims) -> Result<GroupedPlan> {
         // Column-major views of the row-major operands: W is k x n, A is k x m_g, C is n x m_g.
-        let mut plan = self.grouped_plan_raw(
+        // CUDA_R_8F_E4M3 = 28, CUDA_R_16BF = 14.
+        let input = if dims.fp8 { 28 } else { 14 };
+        let plan = self.grouped_plan_raw(
             true,
+            dims.fp8,
             1.0,
             dims.groups,
             [
-                (14, dims.k_array, dims.n_array, dims.k_array),
-                (14, dims.k_array, dims.rows, dims.k_array),
+                (input, dims.k_array, dims.n_array, dims.k_array),
+                (input, dims.k_array, dims.rows, dims.k_array),
                 (14, dims.n_array, dims.rows, dims.n_array),
             ],
             [
@@ -770,14 +864,7 @@ impl Lt {
                 u64::from(dims.average_rows.max(1)),
             ],
         )?;
-        plan.select(0);
-        tracing::info!(
-            groups = dims.groups,
-            n = dims.n,
-            k = dims.k,
-            "cuBLASLt grouped algorithm selected"
-        );
-        Ok(Arc::new(plan))
+        Ok(plan)
     }
 
     /// The grouped form of [`Self::attention_plan`]: `alpha` scales the scores. The plan comes
@@ -808,7 +895,7 @@ impl Lt {
                 [u64::from(dims.average_n), hd, u64::from(dims.average_m)],
             ),
         };
-        self.grouped_plan_raw(kind == AttentionGemm::Scores, alpha, dims.groups, layouts, averages)
+        self.grouped_plan_raw(kind == AttentionGemm::Scores, false, alpha, dims.groups, layouts, averages)
     }
 
     /// `layouts` = `[W, A, C]`; `averages` = `[reduction dim, D rows, D cols]` for the heuristic.
@@ -816,6 +903,7 @@ impl Lt {
     fn grouped_plan_raw(
         self: &Arc<Self>,
         transpose_w: bool,
+        fast_accum: bool,
         alpha: f32,
         groups: u32,
         layouts: [GroupedLayout; 3],
@@ -865,6 +953,18 @@ impl Lt {
                         size_of::<i32>(),
                     ),
                     "Lt grouped descriptor attribute",
+                )?;
+            }
+            // CUBLASLT_MATMUL_DESC_FAST_ACCUM = 25 (int8).
+            if fast_accum {
+                check(
+                    (self.api.cublasLtMatmulDescSetAttribute)(
+                        raw,
+                        25,
+                        &1i8 as *const _ as *const c_void,
+                        size_of::<i8>(),
+                    ),
+                    "Lt grouped fast accumulation",
                 )?;
             }
             for (dst, (dtype, rows, cols, ld)) in
@@ -990,6 +1090,18 @@ pub(crate) struct Plan {
     algo: Algo,
 }
 
+/// Load-time selections by device model and problem: a second engine of the same model on a
+/// same-model GPU (a DP rank) takes the first one's pick instead of re-timing. Timing picks among
+/// near-tied candidates, and ranks timing concurrently picked differently, which made temperature-0
+/// output differ by rank.
+type Selection = (String, u32, u32, u32, Vec<u32>, Option<(i64, i64, bool)>);
+
+fn selections() -> &'static parking_lot::Mutex<std::collections::HashMap<Selection, [u64; 8]>> {
+    static S: std::sync::OnceLock<parking_lot::Mutex<std::collections::HashMap<Selection, [u64; 8]>>> =
+        std::sync::OnceLock::new();
+    S.get_or_init(Default::default)
+}
+
 impl Plan {
     #[allow(clippy::too_many_arguments)]
     fn select(
@@ -1001,10 +1113,44 @@ impl Plan {
         weight: u64,
         pair: Option<Pair>,
         rows: &[u32],
+        ns: &[u32],
     ) -> Result<()> {
-        if let Some(pair) = pair {
-            return self.select_pair(candidates, m, n, k, weight, pair, rows);
+        let key: Selection = (
+            self.lt.be.device_name().to_string(),
+            m,
+            n,
+            k,
+            rows.to_vec(),
+            pair.as_ref().map(|p| (p.w_stride, p.c_stride, p.cold)),
+        );
+        let known = selections().lock().get(&key).copied();
+        if let Some(c) = known.and_then(|data| {
+            candidates
+                .iter()
+                .find(|c| c.algo.data == data && c.state == 0 && c.workspace <= self.lt.workspace.len as usize)
+        }) {
+            self.algo = c.algo;
+            tracing::debug!(m, n, k, ?rows, "cuBLASLt algorithm reused from an earlier load");
+            return Ok(());
         }
+        match pair {
+            Some(pair) => self.select_pair(candidates, m, n, k, weight, pair, rows)?,
+            None => self.select_timed(candidates, m, n, k, weight, rows, ns)?,
+        }
+        selections().lock().entry(key).or_insert(self.algo.data);
+        Ok(())
+    }
+
+    fn select_timed(
+        &mut self,
+        candidates: &[Heuristic],
+        m: u32,
+        n: u32,
+        k: u32,
+        weight: u64,
+        rows: &[u32],
+        ns: &[u32],
+    ) -> Result<()> {
         let be = Arc::clone(&self.lt.be);
         let bytes_w = n as u64 * k as u64 * 2;
         let repeats = ((700 * 1024 * 1024u64).div_ceil(bytes_w)).clamp(2, 16);
@@ -1079,7 +1225,7 @@ impl Plan {
             "cuBLASLt load-time algorithm selected"
         );
         self.lt
-            .record(m, n, k, &self.algo, candidates[index].workspace, matmul_ms * 1000.0);
+            .record((m, n, k), false, ns, rows, &self.algo, candidates[index].workspace, matmul_ms * 1000.0);
         Ok(())
     }
 
@@ -1156,6 +1302,7 @@ impl Plan {
         let index = selected
             .ok_or_else(|| RuntimeError::Device("no runnable cuBLASLt pair candidate".into()))?;
         self.algo = candidates[index].algo;
+        let matmul_ms = best / 16.0 / rows.len().max(1) as f32;
         tracing::info!(
             m,
             n,
@@ -1164,9 +1311,11 @@ impl Plan {
             w_stride = pair.w_stride,
             c_stride = pair.c_stride,
             ?rows,
-            matmul_ms = best / 16.0 / rows.len().max(1) as f32,
+            matmul_ms,
             "cuBLASLt pair algorithm selected"
         );
+        self.lt
+            .record((m, n, k), true, &[n], rows, &self.algo, candidates[index].workspace, matmul_ms * 1000.0);
         Ok(())
     }
 
@@ -1187,7 +1336,7 @@ impl Plan {
         rows.iter()
             .map(|&r| match r == m {
                 true => Ok(None),
-                false => self.lt.plan_impl(r, n, k, weight, Some(self), pair, &[]).map(Some),
+                false => self.lt.plan_impl(r, n, k, weight, Some(self), pair, &[], &[]).map(Some),
             })
             .collect()
     }
@@ -1268,6 +1417,22 @@ impl GroupedPlan {
     pub(crate) fn select(&mut self, index: usize) {
         self.algo = self.candidates[index];
         self.candidates.clear();
+    }
+
+    /// The opaque algorithm of candidate `index`, to hand another engine (see `select_algo`).
+    pub(crate) fn candidate_algo(&self, index: usize) -> [u64; 8] {
+        self.candidates[index].data
+    }
+
+    /// Select the candidate whose algorithm is `data`; `false` when the heuristic did not offer it.
+    pub(crate) fn select_algo(&mut self, data: &[u64; 8]) -> bool {
+        match self.candidates.iter().position(|c| c.data == *data) {
+            Some(index) => {
+                self.select(index);
+                true
+            }
+            None => false,
+        }
     }
 
     /// `a`, `w`, `c` are device arrays of `groups` matrix pointers.
@@ -1360,7 +1525,7 @@ mod tests {
     #[ignore = "requires a leased SM90 GPU and cuBLASLt 12.9 or newer"]
     fn fp8_vector_scales_follow_rows_channels_and_plan_identity() -> Result<()> {
         let be = Arc::new(CudaBackend::new(0)?);
-        let lt = Lt::load(&be)?;
+        let lt = Lt::load(&be, None)?;
         let stream = be.stream_create()?;
         let (m, n, k) = (128usize, 512usize, 3840usize);
         let input = be.alloc(0, (m * k) as u64)?;

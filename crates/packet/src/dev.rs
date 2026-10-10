@@ -123,7 +123,8 @@ pub enum DevOp {
     /// everything to 0). The same code and immediates apply on every GLU-family op
     /// ([`DevOp::GemvGlu`], [`DevOp::GemmGlu`], [`DevOp::MoeGluMx`], ...). See `dev_isa.h` op 5.
     Glu = 5,
-    /// `t0=out t1=table t2=ids(i32)` · `i0=ntok i1=hidden` · `f0=scale`.
+    /// `t0=out t1=table t2=ids(i32)` · `i0=ntok i1=hidden i2=pad` · `f0=scale`.
+    /// A negative id (a multimodal soft-token row, bit 31) reads row `pad`.
     /// `scale` must be the BF16-ROUNDED `sqrt(hidden)`: 73.5 (31B), 62.0 (12B).
     Embed = 6,
     /// `t0=out t1=x` · `i0=n` · `f0=cap`, computing `cap * tanh(x / cap)`.
@@ -433,6 +434,10 @@ pub enum DevOp {
     FlashDecodeFp8 = 38,
     /// FP8 KV twin of [`DevOp::FlashPrefill`]: dequantizes the e4m3 cache at the LDS stage, so the
     /// MFMA is unchanged. `t3=K(fp8) t4=V(fp8) t6=k_scale t7=v_scale`; else as [`DevOp::FlashPrefill`].
+    /// `i7 = nsplit | span << 16`: a non-zero `span` names a `u32[n_q]` [`DevOp::MmSpanExtent`]
+    /// output, and query row `r` (absolute position `q`) then also attends keys up to
+    /// `min(q + span[r], n_kv - 1)` (bidirectional within a media item); 0 = causal, as before.
+    /// Read the halves with [`flash_nsplit`] / [`flash_span`].
     FlashPrefillFp8 = 39,
 
     // ===== MoE data-dependent counter-gate ops =====
@@ -1954,9 +1959,13 @@ pub enum DevOp {
     CausalDepthwiseConv1dF32 = 167,
     /// FP32 relative-position attention. Q/K/V/position/context are `[rows,width]`, position has
     /// `2*rows-1` rows, and u/v are `[heads,width/heads]`. `left_chunks = u32::MAX` selects full
-    /// attention; otherwise keys span the query chunk and `left_chunks` preceding chunks.
-    /// `t0=context t1=query t2=key t3=value t4=position t5=bias_u t6=bias_v` ·
-    /// `i0=rows i1=width i2=heads i3=chunk_size i4=left_chunks`.
+    /// attention; otherwise keys span the query chunk and `left_chunks` preceding chunks. Optional
+    /// `t7` (u32), chunked: keys before that row are excluded (a cache-aware stream's unfilled
+    /// window); full attention: the valid rows of a padded input, so later keys are excluded and
+    /// later context rows are written as zeros.
+    /// `i5` (0 = all) skips the query rows before it; their context rows are not written.
+    /// `t0=context t1=query t2=key t3=value t4=position t5=bias_u t6=bias_v t7=key_start?` ·
+    /// `i0=rows i1=width i2=heads i3=chunk_size i4=left_chunks i5=query_row0`.
     RelativeAttentionF32 = 168,
     /// Elementwise FP32 SiLU: `out = x / (1 + exp(-x))`; output may alias input.
     /// `t0=out t1=x` · `i0=n`.
@@ -2188,7 +2197,8 @@ pub enum DevOp {
     /// `in_stride` 0 = `heads*head_width`). Score `f0 * q.k + bias[h*bias_head_stride +
     /// r*kv_rows + j]`, softmax over keys `j < key_lengths[b]` (and `j <= r` with flag bit 0); a
     /// row with no visible key is zero. Output is dense `[batch,q_rows,heads*head_width]`.
-    /// `head_width` is 64 or 128. Flag bit 1 allows 3xTF32 tensor cores (FP32-accurate).
+    /// `head_width` is 64, or a multiple of 8 up to 128 (e.g. 72). Flag bit 1 allows 3xTF32 tensor
+    /// cores at 64 (FP32-accurate).
     /// With `prefix` (a cached key prefix), item `b`'s keys are rows `[0, i7)` of block
     /// `prefix_index[b]` of `prefix` (`[blocks][i7][K | V]`, `2*heads*head_width` wide) followed
     /// by its `kv_rows` own rows (key lengths count both; `i7` is the prefix row count; no bias,
@@ -2210,6 +2220,55 @@ pub enum DevOp {
     /// the `[T][layers*P]` per-layer input table, `col0 = layer*P`.
     /// `t0=out t1=gate t2=up` · `i0=rows i1=width i2=col0 i3=stride i4=act`.
     GluStrided = 205,
+    /// Grouped FP32 RMSNorm: for row `r < rows` and group `g < groups`, the `group_width`
+    /// elements at `r*stride + g*group_stride` become `x * (mean(x^2) + eps)^-1/2 * gamma[c]`
+    /// (`gamma[g*group_width + c]` with flag bit 0; no scale when absent); flag bit 1 rounds the
+    /// result to bf16. `group_stride` 0 = `group_width`, `stride` 0 = `groups*group_stride`.
+    /// In place when `out == x`. Gemma-4 tower norms and per-head q/k/v norms.
+    /// `t0=out t1=x t2=gamma?` · `i0=rows i1=groups i2=group_width i3=stride i4=flags
+    /// i5=group_stride` · `f0=eps`.
+    RmsNormF32 = 206,
+    /// In-place axial rotate-half RoPE: each head (at `h*head_stride`, `head_stride` 0 =
+    /// `head_width`, row stride `stride` 0 = `heads*head_stride`) splits into `axes` segments of
+    /// `head_width/axes`; segment `a` rotates its halves by `pos[r][a] * theta^(-2i/segment)`.
+    /// Flag bit 0 rounds cos/sin, the products and the sums to bf16 (torch's bf16 arithmetic).
+    /// `t0=x t1=pos(u32[rows][axes])` · `i0=rows i1=heads i2=head_width i3=stride i4=axes
+    /// i5=head_stride i6=flags` · `f0=theta`.
+    RopeAxialF32 = 207,
+    /// Blocked local attention (USM / Gemma-4 audio): query chunk `b` (`chunk` rows) attends to
+    /// key rows `b*chunk - past .. b*chunk + chunk + future`; score `cap * tanh((s_ac + s_bd) /
+    /// cap)` with `s_ac = (q*qscale) . (k*kscale)` and `s_bd` the Transformer-XL term: row `i` of
+    /// `(q*qscale) . rel_k[p]` (`p < positions`) padded to `W+1` columns and read flat at `i*W + j`
+    /// (`W = chunk + past + future`). Keys at or past `valid[0]` and outside the window
+    /// `0 <= q - k < left`, `0 < k - q < right` are masked. Rows `[rows][heads*head_width]`.
+    /// `t0=out t1=q t2=k t3=v t4=rel_k(f32[positions][heads*head_width]) t5=qscale(f32[head_width])?
+    /// t6=valid(u32[1])?` · `i0=rows i1=heads i2=head_width i3=chunk i4=past i5=future
+    /// i6=positions i7=left|right<<16` · `f0=kscale f1=cap`.
+    ChunkAttentionF32 = 208,
+    /// Multimodal soft tokens into the LM's embedded rows: row `r` whose id has bit 31 set takes
+    /// slab row `table[h].row` where `table` is an open-addressed `(id, row)` u32 pair table of
+    /// `cap` (a power of two) entries probed linearly from `id & (cap-1)` (key 0 = empty); other
+    /// rows are untouched. [`DevOp::Embed`] embeds such rows as its `i2` pad token.
+    /// `t0=x(bf16[rows][width]) t1=ids(u32[rows]) t2=table(u32[cap][2]) t3=slab(bf16[slab_rows][width])`
+    /// · `i0=rows i1=width i2=cap i3=slab_rows`.
+    MmRowsBf16 = 209,
+    /// Multimodal span extents for bidirectional-span media: `out[r]` = the number of rows after
+    /// `r` (below `rows`) in the same run of ids carrying both bit 31 and bit 30
+    /// (`plow_asset::multimodal::SPAN_ID_BIT`) when `ids[r]` carries both, else 0. The marked
+    /// [`DevOp::FlashPrefillFp8`] sites read it (their `i7` high half).
+    /// `t0=out(u32[rows]) t1=ids(u32[rows])` · `i0=rows`.
+    MmSpanExtent = 210,
+}
+
+/// [`DevOp::FlashPrefillFp8`]'s split count (`i7` low half).
+pub fn flash_nsplit(i7: u32) -> u32 {
+    i7 & 0xFFFF
+}
+
+/// [`DevOp::FlashPrefillFp8`]'s span-extent tensor (`i7` high half), `None` when causal.
+pub fn flash_span(i7: u32) -> Option<u16> {
+    let h = (i7 >> 16) as u16;
+    (h != 0).then_some(h)
 }
 
 /// Activation codes shared by [`DevOp::UnaryF32`] (`kind`) and the convolution input/output
@@ -2234,6 +2293,12 @@ pub const ACT_CLAMP: u32 = 13;
 /// `x * p0 + p1`.
 pub const ACT_SCALE_SHIFT: u32 = 14;
 pub const ACT_RELU: u32 = 15;
+/// `sqrt(x)` ([`DevOp::UnaryF32`] only; a convolution's activations stop at [`ACT_RELU`]).
+pub const ACT_SQRT: u32 = 16;
+/// torch `gelu(approximate="tanh")` ([`DevOp::UnaryF32`] only).
+pub const ACT_GELU_TANH: u32 = 17;
+/// Round to bf16, round-to-nearest-even ([`DevOp::UnaryF32`] only).
+pub const ACT_ROUND_BF16: u32 = 18;
 
 /// GLU-family `act` code for GPT-OSS's `swiglu_oai` (pair form, `f0 = alpha`, `f1 = limit`).
 /// Codes 0/1/2 are gelu_tanh / silu / situ; see [`DevOp::Glu`].
@@ -2457,6 +2522,11 @@ impl DevOp {
         DevOp::AttentionF32,
         DevOp::RowStatsF32,
         DevOp::GluStrided,
+        DevOp::RmsNormF32,
+        DevOp::RopeAxialF32,
+        DevOp::ChunkAttentionF32,
+        DevOp::MmRowsBf16,
+        DevOp::MmSpanExtent,
     ];
 
     /// Recover the opcode from its wire discriminant, or `None` for a value no
@@ -2683,6 +2753,11 @@ impl DevOp {
             DevOp::AttentionF32 => "PLOW_DOP_ATTENTION_F32",
             DevOp::RowStatsF32 => "PLOW_DOP_ROW_STATS_F32",
             DevOp::GluStrided => "PLOW_DOP_GLU_STRIDED",
+            DevOp::RmsNormF32 => "PLOW_DOP_RMSNORM_F32",
+            DevOp::RopeAxialF32 => "PLOW_DOP_ROPE_AXIAL_F32",
+            DevOp::ChunkAttentionF32 => "PLOW_DOP_CHUNK_ATTENTION_F32",
+            DevOp::MmRowsBf16 => "PLOW_DOP_MM_ROWS_BF16",
+            DevOp::MmSpanExtent => "PLOW_DOP_MM_SPAN_EXTENT",
         }
     }
 
@@ -2738,7 +2813,10 @@ impl DevOp {
     /// 195 -> 204 for `GatherRowsF32 = 195` .. `AttentionF32 = 203` (generic FP32 signal ops).
     /// 204 -> 205 for `RowStatsF32 = 204` (DenseGemmF32's LayerNorm prologue statistics).
     /// 205 -> 206 for `GluStrided = 205` (Gemma-4 E-series per-layer input gate on CUDA).
-    pub const COUNT: u16 = 206;
+    /// 206 -> 210 for `RmsNormF32 = 206` .. `MmRowsBf16 = 209` (multimodal towers and LM
+    /// soft-token rows).
+    /// 210 -> 211 for `MmSpanExtent = 210` (bidirectional media spans).
+    pub const COUNT: u16 = 211;
 
     /// The `(M, N, K, quant)` a decode-GEMV opcode carries, or `None` if this is not one.
     ///

@@ -9,6 +9,10 @@ X-Session-Id session that loops turns of
       --llm-model gemma-4-e4b --tts-model chatterbox-mtl --voice default \
       --manifest audio/manifest.json --out results/calls200.json
 
+--url defaults to $PLOW_URL, $PLOW_API_KEY is sent as a bearer token, manifest paths resolve
+relative to the manifest. Each turn also records e2e_first_audio (end of the user's speech -> first
+agent audio = ASR final + LLM reply + TTS TTFA; the whole reply is synthesized at once).
+
 SLOs (per turn, p95 over all turns): ASR final latency (last chunk sent -> final transcript),
 LLM TTFT, TTS time to first audio, and playback underrun (audio not there when the player needs
 it). Without --llm-model the agent replies with --reply text; without --asr-model the user speaks
@@ -18,7 +22,7 @@ Each turn sends `X-Turn-Id: <call>.<turn>` and a W3C `traceparent` (one trace pe
 the server's `Server-Timing` per stage (`srv_asr` / `srv_llm` / `srv_tts`: queue, wait-turn,
 device, first, total, slack ms; the LLM's from the stream's final `: server-timing` comment).
 """
-import argparse, asyncio, io, json, random, statistics, time, uuid
+import argparse, asyncio, io, json, os, random, statistics, time, uuid
 
 import aiohttp
 import numpy as np
@@ -158,6 +162,8 @@ async def call(s, a, idx, clips, rec):
             history.append({"role": "assistant", "content": reply})
             (row["tts_ttfa_s"], row["tts_audio_s"], row["tts_underrun_s"],
              row["srv_tts"]) = await tts_turn(s, a, sid, reply or "Okay.", t)
+            if row["tts_ttfa_s"] is not None:
+                row["e2e_first_audio_s"] = (row.get("asr_final_s") or 0) + (row.get("llm_total_s") or 0) + row["tts_ttfa_s"]
             await asyncio.sleep(row["tts_audio_s"] + a.think_s)  # the user listens, then answers
         except Exception as e:  # noqa: BLE001 — every failure is a data point
             row["error"] = str(e)[:300]
@@ -168,20 +174,22 @@ async def main_async(a):
     m = json.load(open(a.manifest)) if a.asr_model else []
     clips = []
     for c in m[: a.clips]:
-        x, sr = sf.read(c["path"], dtype="float32")
+        x, sr = sf.read(os.path.join(os.path.dirname(os.path.abspath(a.manifest)), c["path"]), dtype="float32")
         assert sr == ASR_SR, c["path"]
         clips.append(x)
     rec = []
     conn = aiohttp.TCPConnector(limit=0)
     timeout = aiohttp.ClientTimeout(total=None, sock_read=300)
     t0 = time.perf_counter()
-    async with aiohttp.ClientSession(connector=conn, timeout=timeout) as s:
+    auth = {"Authorization": f"Bearer {os.environ['PLOW_API_KEY']}"} if os.environ.get("PLOW_API_KEY") else {}
+    async with aiohttp.ClientSession(connector=conn, timeout=timeout, headers=auth) as s:
         await asyncio.gather(*(call(s, a, i, clips, rec) for i in range(a.calls)))
     wall = time.perf_counter() - t0
     ok = [r for r in rec if "error" not in r]
     summ = dict(calls=a.calls, turns=len(rec), errors=len(rec) - len(ok), wall_s=round(wall, 1),
                 first_error=next((r["error"] for r in rec if "error" in r), None))
-    for k in ("asr_final_s", "asr_partial_p50_s", "llm_ttft_s", "llm_total_s", "tts_ttfa_s", "tts_underrun_s"):
+    for k in ("asr_final_s", "asr_partial_p50_s", "llm_ttft_s", "llm_total_s", "tts_ttfa_s", "tts_underrun_s",
+              "e2e_first_audio_s"):
         v = [r.get(k) for r in ok]
         if any(x is not None for x in v):
             summ[k.replace("_s", "") + "_p50_ms"] = round(1e3 * pct(v, 0.5), 1)
@@ -212,7 +220,7 @@ async def main_async(a):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--url", required=True)
+    ap.add_argument("--url", default=os.environ.get("PLOW_URL", "http://127.0.0.1:8000"))
     ap.add_argument("--calls", type=int, default=200)
     ap.add_argument("--turns", type=int, default=3)
     ap.add_argument("--ramp-s", type=float, default=10.0, help="stagger call starts over this window")

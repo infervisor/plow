@@ -1235,6 +1235,8 @@ pub(super) fn run(
         m.to_blob()
     };
     std::fs::write(out, bytes).expect("write Qwen blob");
+    let mut man = man;
+    man["runtime_requires"] = crate::dense_cublaslt::runtime_requires(&m, &sections);
     manifest::write_config_header(&out.with_file_name("plow_config.h"), &man)
         .expect("Qwen config header");
     std::fs::write(

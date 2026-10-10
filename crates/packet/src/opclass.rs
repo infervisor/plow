@@ -54,7 +54,8 @@ pub fn op_classes(op: DevOp) -> &'static [&'static str] {
         | DsaQQuant
         | RelativeAttentionF32
         | GroupedAttentionF32
-        | AttentionF32 => &["attention"],
+        | AttentionF32
+        | ChunkAttentionF32 => &["attention"],
         FlashMlaPrefillFp8 => &["attention", "native_route"],
 
         IndexScore | IndexSelect | IndexScorePf | IndexSelectPf | IndexUnionPf
@@ -115,7 +116,7 @@ pub fn op_classes(op: DevOp) -> &'static [&'static str] {
         | GemvAffineQ4 => &["gemv"],
 
         RmsNorm | RowRms | NormResidual | AddNorm | NormResidualNorm | LayerNorm | QwenRmsNorm
-        | QwenGatedNorm | KdaGatedNorm | LayerNormF32 | RowStatsF32 => &["norm"],
+        | QwenGatedNorm | KdaGatedNorm | LayerNormF32 | RowStatsF32 | RmsNormF32 => &["norm"],
 
         KdaConv | KdaGate | Mamba2Scan | KdaStateStep | KdaConv3 | KdaStateStepG
         | KdaConvStateStepG | KdaChunkPrepare | KdaChunkIntra | KdaChunkWu | KdaChunkCarry
@@ -128,7 +129,7 @@ pub fn op_classes(op: DevOp) -> &'static [&'static str] {
         Nop | Residual | Sum4Bf16 | Glu | Embed | SoftCap | QuantFp8 | SituGlu | ZeroF32 | CastF32Bf16
         | PerLayerInput | GluStrided | ScaledAddF32 | GluF32 | SiluF32 | ReluF32 | BroadcastAddF32 | EmbedF16F32
         | EmbedOverlayBf16 | EmbedPosBf16 | PackNcfwRowsF32 | QuantFp8Block128 | GatherRowsF32
-        | CopyColsF32 | UnaryF32 | BinaryF32 | RandF32 => &["elementwise"],
+        | CopyColsF32 | UnaryF32 | BinaryF32 | RandF32 | RopeAxialF32 | MmRowsBf16 | MmSpanExtent => &["elementwise"],
     }
 }
 

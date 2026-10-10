@@ -1,0 +1,15 @@
+[
+ {"name": "cats", "media": [0], "text": "Describe this image in one sentence."},
+ {"name": "cats_count", "media": [0], "text": "How many cats are in the picture? Answer with a number."},
+ {"name": "stop", "media": [1], "text": "What does the sign say?"},
+ {"name": "bear", "media": [2], "text": "What animal is this?"},
+ {"name": "room", "media": [3], "text": "What room is shown? Answer briefly."},
+ {"name": "two_images", "media": [0, 2], "text": "What animals are in these two images?"},
+ {"name": "asr0", "media": [4], "text": "Transcribe this audio."},
+ {"name": "asr1", "media": [5], "text": "Transcribe this audio."},
+ {"name": "audio_q", "media": [6], "text": "What is the speaker talking about? Answer in one sentence."},
+ {"name": "image_audio", "media": [0, 5], "text": "Describe the image, then transcribe the audio."},
+ {"name": "followup", "history": [{"role": "user", "media": [0], "text": "Describe this image in one sentence."}, {"role": "assistant", "text": "Two cats are lying on a pink blanket next to two remote controls."}], "media": [], "text": "What colors are the cats?"},
+ {"name": "near_stage", "media": [3], "image_at": 960, "text": "What room is shown? Answer briefly."},
+ {"name": "near_chunk", "media": [0], "image_at": 4000, "text": "How many cats are in the picture? Answer with a number."}
+]

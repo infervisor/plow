@@ -4,10 +4,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use axum::extract::State;
-use axum::response::sse::{Event, Sse};
+use axum::body::Bytes;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
-use futures::stream::{self, Stream};
+use futures::stream;
 
 use crate::serve::openai::*;
 use crate::serve::stream::{self as stream_mod, StreamChunk};
@@ -89,6 +89,9 @@ async fn completions_with(
     if let Some(canonical) = state.registry.resolve(&req.model) {
         req.model = canonical;
     }
+    if let Some(r) = crate::serve::models::refuse_unserved(&state, &req.model, "completions") {
+        return r;
+    }
 
     if let Err(error) = validate_return_token_ids(req.stream, req.return_token_ids) {
         return crate::serve::api_error(
@@ -144,10 +147,17 @@ async fn completions_with(
             "Model is explicitly unloaded or unloading", "server_error", Some("model_unloaded"), Some("model".into()));
     }
     #[cfg(feature = "cuda")]
-    if let Some(mgr) = state.manager_for(&req.model) {
-        if mgr.manages(&req.model) {
-            use crate::serve::manager::EnsureError;
-            if let Err(e) = mgr.ensure_resident(&req.model).await {
+    {
+        use crate::serve::manager::EnsureError;
+        let ensured = match state.dp_set(&req.model) {
+            Some(set) => Some(state.dp_admit(set).await),
+            None => match state.manager_for(&req.model) {
+                Some(mgr) if mgr.manages(&req.model) => Some(mgr.ensure_resident(&req.model).await),
+                _ => None,
+            },
+        };
+        {
+            if let Some(Err(e)) = ensured {
                 return match e {
                     EnsureError::WontFit { .. } | EnsureError::SwitchTimeout(_) => (
                         axum::http::StatusCode::SERVICE_UNAVAILABLE,
@@ -169,6 +179,10 @@ async fn completions_with(
                 };
             }
         }
+    }
+    // Again once a switch has bound the model (see `chat`).
+    if let Some(r) = crate::serve::models::refuse_unserved(&state, &req.model, "completions") {
+        return r;
     }
 
     if let Err(e) = req
@@ -224,7 +238,9 @@ async fn completions_with(
         );
     }
 
-    let (Some(mux), Ok(bundle)) = (state.mux(&req.model), state.registry.get(&req.model)) else {
+    let dp = state.dp_set(&req.model);
+    let direct = if dp.is_some() { None } else { state.mux(&req.model) };
+    let (true, Ok(bundle)) = (dp.is_some() || direct.is_some(), state.registry.get(&req.model)) else {
         return crate::serve::api_error(
             axum::http::StatusCode::NOT_FOUND,
             format!("no model registered for '{}'.", req.model),
@@ -233,7 +249,7 @@ async fn completions_with(
             Some("model".into()),
         );
     };
-    let ingress = mux.ingress();
+    let ingress = direct.as_ref().map(|m| m.ingress());
     // OpenAI's four prompt forms. Token-id prompts skip the tokenizer entirely;
     // batches are refused explicitly rather than silently serving element 0.
     let batch_refusal = || {
@@ -306,6 +322,24 @@ async fn completions_with(
     if let Some(e) = crate::serve::context_overflow(state.max_ctx(&req.model), n_prompt, gen.max_tokens) {
         return crate::serve::api_error_for(&e);
     }
+    let routed;
+    let (mut rank, mut prefix, mut _pick) = (0, None, None);
+    let mux = match (&direct, dp) {
+        (Some(m), _) => m,
+        (None, Some(set)) => match state.dp_route(set, ids.session.as_deref(), Some(&prompt_ids), 0) {
+            Some((r, m, key, pick)) => {
+                (rank, prefix, _pick) = (r, key, Some(pick));
+                routed = m;
+                &routed
+            }
+            None => return crate::serve::chat::dp_unavailable(&req.model),
+        },
+        (None, None) => unreachable!("checked at lookup"),
+    };
+    if prefix.is_none() {
+        prefix = mux.prefix_key(&prompt_ids);
+    }
+    let key = dp.map_or(req.model.as_str(), |set| set.ranks[rank].key.as_str());
     let (tx, rx) = stream_mod::channel();
     let response_prompt_ids = req.return_token_ids.then(|| prompt_ids.clone());
     let lp_fmt = logprobs.map(|_| crate::serve::logprobs::TokenText {
@@ -325,7 +359,7 @@ async fn completions_with(
         ids,
         crate::serve::turns::Kind::Llm,
         &req.model,
-        Some(state.model_metrics(&req.model)),
+        Some(state.model_metrics(key)),
         t_arrive,
         true,
     );
@@ -340,13 +374,15 @@ async fn completions_with(
             session,
             turn: run.key(),
             continuing: run.continuing(),
+            tenant: ids.tenant,
+            prefix: prefix.take(),
             ..Default::default()
         },
     };
     if crate::obs::host::on() {
         crate::obs::host::submitted(n_prompt, t_arrive.elapsed());
     }
-    if let Err(err) = mux.submit_arrived(job, t_arrive, Some(ingress)) {
+    if let Err(err) = state.submit_routed(dp.map(|s| (&**s, rank)), ids.session.as_deref(), mux, job, t_arrive, ingress) {
         return match err {
             crate::serve::mux::SubmitError::Full(_) => {
                 crate::serve::api_error(
@@ -482,15 +518,19 @@ fn sse_response(
     created: u64,
     lp_fmt: Option<crate::serve::logprobs::TokenText>,
     run: crate::serve::turns::StageRun,
-) -> Sse<impl Stream<Item = Result<Event, std::convert::Infallible>>> {
+) -> Response {
     struct SseState {
         rx: stream_mod::ChunkReceiver,
         /// Streamed text length so far (`text_offset`).
         offset: usize,
         first: bool,
         done: bool,
-        pending: std::collections::VecDeque<Event>,
+        pending: std::collections::VecDeque<Bytes>,
         run: crate::serve::turns::StageRun,
+        head: stream_mod::FrameHead,
+        request_id: String,
+        model: String,
+        lp_fmt: Option<crate::serve::logprobs::TokenText>,
     }
     let body = stream::unfold(
         SseState {
@@ -500,126 +540,104 @@ fn sse_response(
             done: false,
             pending: std::collections::VecDeque::new(),
             run,
+            head: stream_mod::FrameHead::new(&request_id, "text_completion", created, &model),
+            request_id,
+            model,
+            lp_fmt,
         },
-        move |mut st| {
-            let model = model.clone();
-            let request_id = request_id.clone();
-            let lp_fmt = lp_fmt.clone();
-            async move {
-                if st.done {
+        move |mut st| async move {
+            if st.done {
+                return None;
+            }
+            if let Some(ev) = st.pending.pop_front() {
+                st.done = st.pending.is_empty();
+                return Some((ev, st));
+            }
+            let chunk = match st.rx.recv().await {
+                Some(c) => c,
+                None => {
+                    tracing::warn!(model = %st.model, "completion SSE stream ended without terminal chunk");
                     return None;
                 }
-                if let Some(ev) = st.pending.pop_front() {
-                    st.done = st.pending.is_empty();
-                    return Some((Ok(ev), st));
-                }
-                let chunk = match st.rx.recv().await {
-                    Some(c) => c,
-                    None => {
-                        tracing::warn!(%model, "completion SSE stream ended without terminal chunk");
-                        return None;
-                    }
-                };
-                let (choice, tail_usage, terminate) = match chunk {
-                    StreamChunk::Token { id, text, logprobs } => {
-                        let logprobs = lp_fmt.as_ref().map(|fmt| {
-                            let mut lps = crate::serve::logprobs::CompletionLogprobs::default();
-                            if let Some(lp) = &logprobs {
-                                lps.push(fmt, id, lp, st.offset);
-                            }
-                            serde_json::to_value(lps).unwrap_or_default()
-                        });
-                        st.offset += text.len();
-                        if st.first {
-                            st.first = false;
-                            st.run.first();
-                            crate::obs::ttft::dump(t_arrive.elapsed().as_nanos() as u64, n_prompt);
-                            crate::obs::pfx::report();
-                            if crate::obs::host::on() {
-                                crate::obs::host::first_frame(n_prompt, t_arrive.elapsed());
-                            }
+            };
+            let (choice, tail_usage, terminate) = match chunk {
+                StreamChunk::Token { id, text, logprobs } => {
+                    let logprobs = st.lp_fmt.as_ref().map(|fmt| {
+                        let mut lps = crate::serve::logprobs::CompletionLogprobs::default();
+                        if let Some(lp) = &logprobs {
+                            lps.push(fmt, id, lp, st.offset);
                         }
-                        (
-                            vec![CompletionChoice {
-                                index: 0,
-                                text,
-                                logprobs,
-                                finish_reason: None,
-                                x_plow_finish_reason: None,
-                            }],
-                            None,
-                            false,
-                        )
+                        serde_json::to_value(lps).unwrap_or_default()
+                    });
+                    st.offset += text.len();
+                    if st.first {
+                        st.first = false;
+                        st.run.first();
+                        crate::obs::ttft::dump(t_arrive.elapsed().as_nanos() as u64, n_prompt);
+                        crate::obs::pfx::report();
+                        if crate::obs::host::on() {
+                            crate::obs::host::first_frame(n_prompt, t_arrive.elapsed());
+                        }
                     }
-                    StreamChunk::Done { reason, usage, .. } => (
-                        vec![CompletionChoice {
+                    (
+                        CompletionChoice {
                             index: 0,
-                            text: String::new(),
-                            logprobs: None,
-                            finish_reason: Some(reason.as_openai()),
-                            x_plow_finish_reason: reason
-                                .is_vendor_specific()
-                                .then(|| reason.as_str()),
-                        }],
-                        include_usage.then(|| usage.into()),
-                        true,
-                    ),
-                    StreamChunk::Err(e) => {
-                        // An error object in its own frame and NO `[DONE]`, not
-                        // the error text dressed as generated output with
-                        // `finish_reason: "stop"` — see the matching comment on
-                        // the chat endpoint for why that scored as success.
-                        tracing::warn!(%model, error = %e, "completion SSE stream error");
-                        let body = crate::serve::openai::ApiErrorBody::new(
-                            e.to_string(),
-                            "server_error",
-                            None,
-                            None,
-                        );
-                        let data = serde_json::to_string(&body).unwrap_or_else(|_| {
-                            "{\"error\":{\"message\":\"stream error\",\"type\":\"server_error\"}}"
-                                .to_string()
-                        });
-                        st.done = true;
-                        return Some((Ok(Event::default().data(data)), st));
-                    }
-                };
-                let frame = CompletionResponse {
-                    id: request_id,
+                            text,
+                            logprobs,
+                            finish_reason: None,
+                            x_plow_finish_reason: None,
+                        },
+                        None,
+                        false,
+                    )
+                }
+                StreamChunk::Done { reason, usage, .. } => (
+                    CompletionChoice {
+                        index: 0,
+                        text: String::new(),
+                        logprobs: None,
+                        finish_reason: Some(reason.as_openai()),
+                        x_plow_finish_reason: reason.is_vendor_specific().then(|| reason.as_str()),
+                    },
+                    include_usage.then(|| usage.into()),
+                    true,
+                ),
+                StreamChunk::Err(e) => {
+                    // An error object in its own frame and NO `[DONE]`, not
+                    // the error text dressed as generated output with
+                    // `finish_reason: "stop"` — see the matching comment on
+                    // the chat endpoint for why that scored as success.
+                    tracing::warn!(model = %st.model, error = %e, "completion SSE stream error");
+                    let body = crate::serve::openai::ApiErrorBody::new(e.to_string(), "server_error", None, None);
+                    let data = serde_json::to_string(&body).unwrap_or_else(|_| {
+                        "{\"error\":{\"message\":\"stream error\",\"type\":\"server_error\"}}".to_string()
+                    });
+                    st.done = true;
+                    return Some((stream_mod::sse_data(&data), st));
+                }
+            };
+            if let Some(usage) = tail_usage {
+                let usage_frame = CompletionResponse {
+                    id: st.request_id.clone(),
                     object: "text_completion",
                     created,
-                    model: model.clone(),
-                    choices: choice,
-                    usage: None,
+                    model: st.model.clone(),
+                    choices: Vec::new(),
+                    usage: Some(usage),
                     token_ids: None,
                 };
-                if let Some(usage) = tail_usage {
-                    let usage_frame = CompletionResponse {
-                        id: frame.id.clone(),
-                        object: "text_completion",
-                        created,
-                        model,
-                        choices: Vec::new(),
-                        usage: Some(usage),
-                        token_ids: None,
-                    };
-                    st.pending
-                        .push_back(Event::default().data(stream_mod::chunk_data(&usage_frame)));
-                }
-                if terminate {
-                    st.run.done();
-                    st.pending.push_back(st.run.sse_comment());
-                    st.pending
-                        .push_back(Event::default().data(stream_mod::DONE));
-                }
-                Some((
-                    Ok(Event::default().data(stream_mod::chunk_data(&frame))),
-                    st,
-                ))
+                st.pending.push_back(stream_mod::sse_data(&stream_mod::chunk_data(&usage_frame)));
             }
+            if terminate {
+                st.run.done();
+                st.pending.push_back(st.run.sse_comment_frame());
+                st.pending.push_back(stream_mod::sse_data(stream_mod::DONE));
+            }
+            let frame = st.head.frame(&choice);
+            Some((frame, st))
         },
     );
-    Sse::new(body)
+    stream_mod::sse_response(body)
 }
 
 #[cfg(test)]

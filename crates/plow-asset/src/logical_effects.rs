@@ -8,7 +8,7 @@ use serde_json::{json, Value};
 
 use crate::program::{Packet, Program};
 
-fn outputs(d: &DevInst64) -> Result<&'static [usize], String> {
+pub(crate) fn outputs(d: &DevInst64) -> Result<&'static [usize], String> {
     use DevOp::*;
     let op = DevOp::from_u16(d.op).ok_or("unknown kernel effects")?;
     let required = match op {
@@ -23,7 +23,8 @@ fn outputs(d: &DevInst64) -> Result<&'static [usize], String> {
         | RelativeAttentionF32 | SiluF32 | DenseGemmF32 | EmbedF16F32 | ArgmaxF32 | ReluF32
         | BroadcastAddF32 | Conv2dF32 | PackNcfwRowsF32 | GroupedAttentionF32 | EmbedOverlayBf16
         | GemmF32 | GatherRowsF32 | CopyColsF32 | Conv1dF32 | ConvTranspose1dF32 | UnaryF32
-        | BinaryF32 | CumSumF64 | RandF32 | AttentionF32 | RowStatsF32 => 2,
+        | BinaryF32 | CumSumF64 | RandF32 | AttentionF32 | RowStatsF32 | RmsNormF32 | RopeAxialF32 => 2,
+        ChunkAttentionF32 => 5,
         LstmCellF32 => 3,
         _ => return Err(format!("unaudited logical effects for {op:?}")),
     };
@@ -47,7 +48,8 @@ fn outputs(d: &DevInst64) -> Result<&'static [usize], String> {
         | RelativeAttentionF32 | SiluF32 | DenseGemmF32 | EmbedF16F32 | ArgmaxF32 | ReluF32
         | BroadcastAddF32 | Conv2dF32 | PackNcfwRowsF32 | GroupedAttentionF32 | EmbedOverlayBf16
         | GemmF32 | GatherRowsF32 | CopyColsF32 | Conv1dF32 | ConvTranspose1dF32 | UnaryF32
-        | BinaryF32 | CumSumF64 | RandF32 | AttentionF32 | RowStatsF32 => Ok(&[0]),
+        | BinaryF32 | CumSumF64 | RandF32 | AttentionF32 | RowStatsF32 | RmsNormF32 | RopeAxialF32
+        | ChunkAttentionF32 => Ok(&[0]),
         op => Err(format!("unaudited logical effects for {op:?}")),
     }
 }

@@ -48,6 +48,10 @@ pub struct LoadRequest {
     /// half-loaded model behind.
     #[serde(default)]
     pub aliases: Vec<String>,
+    /// A data-parallel model's rank to load (default: every rank). `device` also selects the
+    /// rank placed there.
+    #[serde(default)]
+    pub rank: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -58,6 +62,13 @@ pub struct UnloadRequest {
     /// can be loaded again by name alone.
     #[serde(default)]
     pub deregister: bool,
+    /// A data-parallel model's rank to unload (default: every rank). Its in-flight work drains
+    /// (bounded by `PLOW_DRAIN_TIMEOUT_MS`, 30 s unset) while new work routes to the others.
+    #[serde(default)]
+    pub rank: Option<usize>,
+    /// Select the rank by the device its group starts at.
+    #[serde(default)]
+    pub device: Option<u32>,
 }
 
 #[derive(Debug, Serialize)]
@@ -101,6 +112,26 @@ pub struct ModelStatus {
     /// Index of its device group.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub group: Option<usize>,
+    /// Data-parallel ranks, when the model has more than one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dp: Option<Vec<RankStatus>>,
+}
+
+/// One DP rank of a model.
+#[derive(Debug, Serialize)]
+pub struct RankStatus {
+    pub rank: usize,
+    /// Its instance key (`model#rank`); also accepted as `model` by load/unload.
+    pub key: String,
+    pub device: u32,
+    pub group: usize,
+    pub residency: &'static str,
+    pub resident: bool,
+    pub serving: bool,
+    pub queued: u64,
+    pub active: u64,
+    pub capacity: u64,
+    pub load: f32,
 }
 
 /// One device group: its ordinals, its memory, and what is resident on it.
@@ -186,6 +217,13 @@ pub async fn load(State(state): State<Arc<AppState>>, Json(req): Json<LoadReques
 }
 async fn load_inner(state: Arc<AppState>, mut req: LoadRequest) -> Response {
     req.model = state.registry.resolve(&req.model).unwrap_or(req.model);
+    #[cfg(feature = "cuda")]
+    if let Some(keys) = dp_targets(&state, &req.model, req.rank, req.device) {
+        return match keys {
+            Ok(keys) => dp_load(&state, keys, req.evict).await,
+            Err(refusal) => refusal,
+        };
+    }
     let _control = state.control_lock(&req.model).await;
     // The path check comes FIRST, before any backend or slug lookup. It is a
     // security boundary, and a boundary that only fires on builds which happen
@@ -258,6 +296,13 @@ async fn load_inner(state: Arc<AppState>, mut req: LoadRequest) -> Response {
                 }
             }
             if newly_registered {
+                // The pairing is recorded first so the bundle's pin check and every HF-file read
+                // at load see the requested checkpoint.
+                if let Some(c) = &req.checkpoint {
+                    if let Err(e) = crate::asset::serve::set_checkpoint(&dir, std::path::Path::new(c)) {
+                        return err(StatusCode::CONFLICT, e);
+                    }
+                }
                 if let Err(e) = state.registry.load(&dir, Some(req.model.clone())) {
                     return err(StatusCode::BAD_REQUEST, e);
                 }
@@ -266,7 +311,7 @@ async fn load_inner(state: Arc<AppState>, mut req: LoadRequest) -> Response {
                 .checkpoint
                 .as_ref()
                 .map(PathBuf::from)
-                .unwrap_or_else(|| dir.join("checkpoint"));
+                .unwrap_or_else(|| crate::asset::serve::checkpoint_dir(&dir));
             if let Err(e) = mgr.register(&req.model, dir, ckpt) {
                 if newly_registered {
                     let _ = state.registry.unload(&req.model);
@@ -331,6 +376,16 @@ pub async fn unload(
 }
 async fn unload_inner(state: Arc<AppState>, mut req: UnloadRequest) -> Response {
     req.model = state.registry.resolve(&req.model).unwrap_or(req.model);
+    #[cfg(feature = "cuda")]
+    if let Some(keys) = dp_targets(&state, &req.model, req.rank, req.device) {
+        if req.deregister {
+            return err(StatusCode::BAD_REQUEST, "a data-parallel model cannot be deregistered while serving");
+        }
+        return match keys {
+            Ok(keys) => dp_unload(&state, keys).await,
+            Err(refusal) => refusal,
+        };
+    }
     let _control = state.control_lock(&req.model).await;
     #[cfg(feature = "cpu")]
     if let Some(manager) = state.portable_manager() {
@@ -377,15 +432,92 @@ async fn unload_inner(state: Arc<AppState>, mut req: UnloadRequest) -> Response 
     }
 }
 
+/// The instance keys a load/unload of `model` addresses, when it is a DP model or one of its
+/// ranks: `None` for an ordinary model.
+#[cfg(feature = "cuda")]
+fn dp_targets(
+    state: &AppState,
+    model: &str,
+    rank: Option<usize>,
+    device: Option<u32>,
+) -> Option<std::result::Result<Vec<String>, Response>> {
+    if let Some((set, r)) = state.dp_rank(model) {
+        return Some(Ok(vec![set.ranks[r].key.clone()]));
+    }
+    let set = state.dp_set(model)?;
+    let keys: Vec<String> = set
+        .ranks
+        .iter()
+        .filter(|r| rank.is_none_or(|n| r.rank == n) && device.is_none_or(|d| r.ordinal == d))
+        .map(|r| r.key.clone())
+        .collect();
+    Some(if keys.is_empty() {
+        Err(err(StatusCode::NOT_FOUND, format_args!("{model} has no DP rank matching rank {rank:?} device {device:?}")))
+    } else {
+        Ok(keys)
+    })
+}
+
+#[cfg(feature = "cuda")]
+async fn dp_load(state: &Arc<AppState>, keys: Vec<String>, evict: bool) -> Response {
+    use crate::serve::manager::EnsureError;
+    let mut load_ms = 0f64;
+    for key in &keys {
+        let _control = state.control_lock(key).await;
+        let Some(mgr) = state.manager_for(key).cloned() else {
+            return err(StatusCode::NOT_FOUND, format_args!("no model manager serves {key:?}"));
+        };
+        match mgr.load(key, evict).await {
+            Ok(ms) => load_ms = load_ms.max(ms),
+            Err(e @ (EnsureError::WontFit { .. } | EnsureError::Unloaded)) => return err(StatusCode::CONFLICT, format_args!("{key}: {e}")),
+            Err(e @ EnsureError::SwitchTimeout(_)) => return err(StatusCode::SERVICE_UNAVAILABLE, format_args!("{key}: {e}")),
+            Err(EnsureError::Load(e)) => return err(StatusCode::INTERNAL_SERVER_ERROR, format_args!("{key}: {e}")),
+        }
+    }
+    Json(LoadResponse { model: keys.join(","), state: "resident", load_ms }).into_response()
+}
+
+#[cfg(feature = "cuda")]
+async fn dp_unload(state: &Arc<AppState>, keys: Vec<String>) -> Response {
+    let bound = std::time::Duration::from_millis(crate::config::RuntimeConfig::get().drain_timeout_ms().unwrap_or(30_000));
+    let mut total = UnloadResponse {
+        model: keys.join(","),
+        state: "unloaded",
+        stop_ms: 0.0,
+        unload_ms: 0.0,
+        freed_mib: 0,
+        pool_trimmed_mib: 0,
+        deregistered: false,
+    };
+    for key in &keys {
+        let _control = state.control_lock(key).await;
+        let Some(mgr) = state.manager_for(key).cloned() else {
+            return err(StatusCode::NOT_FOUND, format_args!("no model manager serves {key:?}"));
+        };
+        match mgr.unload_rank(key, bound).await {
+            Ok(r) => {
+                total.stop_ms = total.stop_ms.max(r.stop_ms);
+                total.unload_ms += r.unload_ms;
+                total.freed_mib += r.freed / MIB;
+                total.pool_trimmed_mib += r.pool_trimmed / MIB;
+            }
+            Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, format_args!("{key}: {e}")),
+        }
+    }
+    Json(total).into_response()
+}
+
 /// `GET /v1/models/status` — residency and footprint per registered slug.
 pub async fn status(State(state): State<Arc<AppState>>) -> Response {
     let mut models = Vec::new();
     for slug in state.registry.slugs() {
         let residency = state.residency(&slug).as_str();
+        let dp = state.dp_set(&slug);
         #[allow(unused_mut)]
         let mut entry = ModelStatus {
             resident: state.has_gpu_engine(&slug),
-            serving: state.mux(&slug).is_some() && state.residency(&slug).admits(),
+            serving: state.mux(&slug).is_some() && state.residency(&slug).admits()
+                || dp.is_some_and(|set| set.ranks.iter().any(|r| r.is_up())),
             residency,
             required_mib: None,
             weights_mib: None,
@@ -393,7 +525,36 @@ pub async fn status(State(state): State<Arc<AppState>>) -> Response {
             devices: None,
             group: None,
             model: slug.clone(),
+            dp: dp.map(|set| {
+                set.ranks
+                    .iter()
+                    .map(|r| {
+                        let c = r.cand();
+                        RankStatus {
+                            rank: r.rank,
+                            key: r.key.clone(),
+                            device: r.ordinal,
+                            group: r.group,
+                            residency: state.residency(&r.key).as_str(),
+                            resident: state.has_gpu_engine(&r.key),
+                            serving: r.is_up(),
+                            queued: c.pending.into(),
+                            active: c.active.into(),
+                            capacity: c.capacity.into(),
+                            load: crate::serve::dp::load(&c),
+                        }
+                    })
+                    .collect()
+            }),
         };
+        #[cfg(feature = "cuda")]
+        if let Some(set) = dp {
+            let mgr = state.manager_for(&set.ranks[0].key);
+            entry.required_mib = mgr.and_then(|m| m.required(&set.ranks[0].key)).map(|b| b / MIB);
+            entry.devices = Some(set.ranks.iter().map(|r| r.ordinal).collect());
+            models.push(entry);
+            continue;
+        }
         #[cfg(feature = "cuda")]
         if let Some(mgr) = state.manager_for(&slug) {
             entry.required_mib = mgr.required(&slug).map(|b| b / MIB);

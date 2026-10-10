@@ -108,6 +108,7 @@ impl LayerNames {
                 pointwise_in: &self.pointwise_in,
                 depthwise: &self.depthwise,
                 channel_norm: norm(&self.channel_norm_weight, &self.channel_norm_bias),
+                depthwise_bias: None,
                 pointwise_out: &self.pointwise_out,
             },
             feed_forward2: FeedForwardWeights {
@@ -125,4 +126,45 @@ fn norm<'a>(weight: &'a str, bias: &'a str) -> devgen::conformer::NormWeights<'a
         gamma: weight,
         beta: bias,
     }
+}
+
+/// The output contract of a NeMo ASR GGUF: its SentencePiece vocabulary and, for a prompted
+/// model, the language of prompt `prompt_index` (`asr.rnnt.prompt_dictionary` `LANG:INDEX`).
+#[allow(dead_code)]
+pub fn token_output(
+    gguf: &plowrt::asset::gguf::GgufFile,
+    prompt_index: Option<usize>,
+) -> Result<plow_asset::speech_contract::TokenOutput, String> {
+    let mut output = plow_asset::speech_contract::TokenOutput::sentencepiece(
+        string_array(gguf, "asr.tokenizer.vocab")?,
+        &[".", "?", "!", "\u{964}", "\u{965}"],
+    );
+    if let Some(index) = prompt_index {
+        let language = string_array(gguf, "asr.rnnt.prompt_dictionary")?
+            .iter()
+            .filter_map(|entry| entry.rsplit_once(':'))
+            .find_map(|(language, i)| (i.parse::<usize>().ok() == Some(index)).then(|| language.to_owned()))
+            .ok_or_else(|| format!("prompt dictionary has no index {index}"))?;
+        if language.eq_ignore_ascii_case("en-US") {
+            output.language_aliases = vec![("en".into(), language.clone()), ("english".into(), language.clone())];
+        }
+        output.language = Some(language);
+    }
+    Ok(output)
+}
+
+#[allow(dead_code)]
+fn string_array(gguf: &plowrt::asset::gguf::GgufFile, key: &str) -> Result<Vec<String>, String> {
+    use gguf_rs_lib::format::metadata::MetadataValue;
+    let Some(MetadataValue::Array(values)) = gguf.metadata().data.get(key) else {
+        return Err(format!("missing {key}"));
+    };
+    values
+        .values
+        .iter()
+        .map(|value| match value {
+            MetadataValue::String(value) => Ok(value.clone()),
+            _ => Err(format!("{key} contains a non-string")),
+        })
+        .collect()
 }

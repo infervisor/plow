@@ -8,6 +8,7 @@ use crate::exec::packet_runtime::{
     load_packet_runtime, BoundPacketPipeline, PacketAsset, PacketRuntime, PacketTensor,
 };
 use crate::{Result, RuntimeError};
+use plow_asset::speech_contract::{self, TokenOutput};
 
 /// Device-side RNNT data path. Implementations dispatch packet programs and retain encoder and
 /// predictor tensors on their selected backend.
@@ -15,6 +16,10 @@ pub trait RnntExecution: Send {
     fn frames(&self) -> usize;
     fn predict(&mut self, previous_token: u32) -> Result<()>;
     fn joint_argmax(&mut self, first_frame: usize, output: &mut [u32]) -> Result<usize>;
+    /// TDT: the duration-logit argmax of each row the last [`Self::joint_argmax`] evaluated.
+    fn joint_durations(&self) -> &[u32] {
+        &[]
+    }
     fn commit_prediction(&mut self);
 }
 
@@ -23,6 +28,8 @@ pub struct GreedyRnnt {
     max_symbols_per_frame: usize,
     previous_token: u32,
     predictor_valid: bool,
+    /// TDT: frames each duration logit advances; empty for plain RNNT.
+    tdt_durations: Vec<u32>,
 }
 
 pub struct PacketRnnt {
@@ -42,12 +49,57 @@ pub struct PacketRnnt {
     joint_batch_max: usize,
     blank_id: u32,
     max_symbols_per_frame: usize,
+    /// TDT packets: `joint.duration_ids` and the frames each duration logit advances.
+    duration_ids: Option<PacketTensor>,
+    tdt_durations: Vec<u32>,
+    /// Full-context encoders: the valid frame count of the padded bucket, written per run.
+    valid_rows: Option<PacketTensor>,
     state_zeros: Vec<u8>,
     input_frames: Option<usize>,
     frame_transform: Vec<[usize; 4]>,
     trailing_frames: usize,
     profiling: bool,
     last_profile: Option<RnntProfile>,
+    stream: Option<StreamBinding>,
+    /// Vocabulary, detokenizer and language (ASR contract >= 1).
+    output: Option<TokenOutput>,
+}
+
+/// A cache-aware encoder stream (`stream.*` pipeline roles): each step turns one mel window into
+/// `rows` encoder frames whose joint rows the ordinary greedy loop decodes.
+struct StreamBinding {
+    first: Vec<usize>,
+    step: Vec<usize>,
+    input: PacketTensor,
+    key_start: PacketTensor,
+    /// The packet's live stream caches, then the predictor banks: what a session saves.
+    states: Vec<PacketTensor>,
+    rows: usize,
+    left_rows: usize,
+    first_input_frames: usize,
+    step_input_frames: usize,
+    history_input_frames: usize,
+    bins: usize,
+    /// Released sessions' state copies, reused by the next open.
+    pool: Vec<Vec<PacketTensor>>,
+}
+
+/// One open stream: a device copy of its state and the greedy decoder's position.
+pub struct RnntStream {
+    saved: Vec<PacketTensor>,
+    previous_token: u32,
+    active_bank: usize,
+    steps: usize,
+}
+
+/// Mel frames the stream reads per step: the first window, later windows, and how many of a later
+/// window's leading frames repeat the previous step's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StreamWindows {
+    pub first: usize,
+    pub step: usize,
+    pub history: usize,
+    pub bins: usize,
 }
 
 #[derive(Clone, Copy, Debug, Default, serde::Serialize)]
@@ -138,7 +190,79 @@ impl PacketRnnt {
                 "packet RNNT tensor geometry is inconsistent".into(),
             ));
         }
+        let (duration_ids, tdt_durations) = match pipeline.optional_parameter("tdt.durations") {
+            None => (None, Vec::new()),
+            Some(count) => {
+                let durations = (0..count)
+                    .map(|index| {
+                        u32::try_from(pipeline.parameter(&format!("tdt.duration.{index}"))?)
+                            .map_err(|_| RuntimeError::Rejected("TDT duration overflows".into()))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                let tensor = pipeline.tensor("joint.duration_ids")?;
+                if durations.is_empty() || tensor.bytes != ids.bytes {
+                    return Err(RuntimeError::Rejected("packet TDT geometry is inconsistent".into()));
+                }
+                (Some(tensor), durations)
+            }
+        };
+        let valid_rows = pipeline.tensor("encoder.valid_rows").ok();
+        if valid_rows.is_some_and(|tensor| tensor.bytes != std::mem::size_of::<u32>()) {
+            return Err(RuntimeError::Rejected("packet encoder valid-rows tensor is not a u32".into()));
+        }
+        let stream = if backend == "cuda" && pipeline.program("stream.init").is_ok() {
+            let usize_param = |name| usize_parameter(&pipeline, name);
+            let input_tensor = pipeline.tensor("stream.input")?;
+            let bins = usize_param("audio.frontend.bins")?;
+            let mut stream_states = pipeline.tensor_sequence("stream.state")?;
+            stream_states.extend(states.iter().copied());
+            let binding = StreamBinding {
+                first: pipeline.program_sequence("stream.first")?,
+                step: pipeline.program_sequence("stream.step")?,
+                input: input_tensor,
+                key_start: pipeline.tensor("stream.key_start")?,
+                states: stream_states,
+                rows: usize_param("stream.rows")?,
+                left_rows: usize_param("stream.left_rows")?,
+                first_input_frames: usize_param("stream.first_input_frames")?,
+                step_input_frames: usize_param("stream.step_input_frames")?,
+                history_input_frames: usize_param("stream.history_input_frames")?,
+                bins,
+                pool: Vec::new(),
+            };
+            if binding.rows == 0
+                || binding.rows > frames
+                || bins == 0
+                || binding.step_input_frames.max(binding.first_input_frames) * bins * 4 > input_tensor.bytes
+                || binding.key_start.bytes != 4
+            {
+                return Err(RuntimeError::Rejected("packet stream geometry is invalid".into()));
+            }
+            // The per-layer position projections are input independent: fill them once.
+            runtime.run(pipeline.program("stream.init")?)?;
+            Some(binding)
+        } else {
+            None
+        };
         let state_zeros = vec![0; states.iter().map(|state| state.bytes).max().unwrap_or(0)];
+        let output = match pipeline.optional_parameter(speech_contract::CONTRACT) {
+            None => None,
+            Some(_) => {
+                let vocabulary = asset
+                    .metadata(speech_contract::VOCABULARY_SECTION)
+                    .ok_or_else(|| RuntimeError::Rejected(format!("packet is missing {}", speech_contract::VOCABULARY_SECTION)))?;
+                let output = TokenOutput::from_pipeline(
+                    |name| pipeline.optional_parameter(name),
+                    |name| pipeline.optional_string(name).map(str::to_owned),
+                    vocabulary,
+                )
+                .map_err(RuntimeError::Rejected)?;
+                if output.word_boundary.is_empty() {
+                    return Err(RuntimeError::Rejected("ASR output word boundary is empty".into()));
+                }
+                Some(output)
+            }
+        };
         runtime.end_execution()?;
         Ok(Self {
             backend,
@@ -157,17 +281,147 @@ impl PacketRnnt {
             joint_batch_max,
             blank_id,
             max_symbols_per_frame,
+            duration_ids,
+            tdt_durations,
+            valid_rows,
             state_zeros,
             input_frames,
             frame_transform,
             trailing_frames,
             profiling: false,
             last_profile: None,
+            stream,
+            output,
         })
+    }
+
+    /// The packet's output contract; `None` for a contract-0 packet.
+    pub fn output(&self) -> Option<&TokenOutput> {
+        self.output.as_ref()
     }
 
     pub fn backend(&self) -> &'static str {
         self.backend
+    }
+
+    /// The mel windows of the packet's encoder stream, if it carries one this backend can run.
+    pub fn stream_windows(&self) -> Option<StreamWindows> {
+        self.stream.as_ref().map(|s| StreamWindows {
+            first: s.first_input_frames,
+            step: s.step_input_frames,
+            history: s.history_input_frames,
+            bins: s.bins,
+        })
+    }
+
+    /// Open a stream: zeroed caches and predictor, the decoder at the blank token.
+    pub fn stream_open(&mut self) -> Result<RnntStream> {
+        let binding = self.stream.as_mut().ok_or_else(|| RuntimeError::Rejected("packet has no encoder stream".into()))?;
+        let saved = match binding.pool.pop() {
+            Some(saved) => {
+                for &tensor in &saved {
+                    self.runtime.write_tensor(tensor, &vec![0; tensor.bytes])?;
+                }
+                saved
+            }
+            None => binding
+                .states
+                .iter()
+                .map(|state| self.runtime.create_tensor(state.bytes))
+                .collect::<Result<_>>()?,
+        };
+        Ok(RnntStream { saved, previous_token: self.blank_id, active_bank: 0, steps: 0 })
+    }
+
+    pub fn stream_close(&mut self, stream: RnntStream) {
+        if let Some(binding) = &mut self.stream {
+            binding.pool.push(stream.saved);
+        }
+    }
+
+    /// One stream step: `window` holds `StreamWindows::first` mel frames on the stream's first step
+    /// and `StreamWindows::step` after (its leading `history` frames repeat the previous window's
+    /// last ones). Returns the tokens the step's encoder rows decode to, reporting each through
+    /// `on_emit` as it is emitted (with this step's tokens so far).
+    pub fn stream_step(
+        &mut self,
+        stream: &mut RnntStream,
+        window: &[f32],
+        on_emit: &mut dyn FnMut(&[u32]),
+    ) -> Result<Vec<u32>> {
+        let binding = self.stream.take().ok_or_else(|| RuntimeError::Rejected("packet has no encoder stream".into()))?;
+        self.runtime.begin_execution()?;
+        let result = self.stream_step_active(&binding, stream, window, on_emit);
+        let ended = self.runtime.end_execution();
+        self.stream = Some(binding);
+        let tokens = result?;
+        ended?;
+        stream.steps += 1;
+        Ok(tokens)
+    }
+
+    fn stream_step_active(
+        &mut self,
+        binding: &StreamBinding,
+        stream: &mut RnntStream,
+        window: &[f32],
+        on_emit: &mut dyn FnMut(&[u32]),
+    ) -> Result<Vec<u32>> {
+        let first = stream.steps == 0;
+        let frames = if first { binding.first_input_frames } else { binding.step_input_frames };
+        if window.len() != frames * binding.bins || stream.saved.len() != binding.states.len() {
+            return Err(RuntimeError::Rejected(format!(
+                "stream window has {} values, expected {}",
+                window.len(),
+                frames * binding.bins
+            )));
+        }
+        self.runtime.write_tensor_at(binding.input, 0, bytemuck::cast_slice(window))?;
+        for (&live, &saved) in binding.states.iter().zip(&stream.saved) {
+            self.runtime.copy_tensor(saved, 0, live, 0, live.bytes)?;
+        }
+        // Keys before this window row are not filled yet: the stream's first chunks.
+        let key_start = binding.left_rows.saturating_sub(stream.steps.saturating_mul(binding.rows)) as u32;
+        self.runtime.write_tensor(binding.key_start, &key_start.to_ne_bytes())?;
+        let started = Instant::now();
+        self.runtime.run_sequence(if first { &binding.first } else { &binding.step })?;
+        let encoder_us = self.runtime.last_run_us();
+        let encoder_wall = started.elapsed();
+        let mut execution = PacketRnntExecution {
+            runtime: &mut *self.runtime,
+            pipeline: &self.pipeline,
+            frames: binding.rows,
+            token: self.token,
+            ids: self.ids,
+            encoder_joint: self.encoder_joint,
+            encoder_window: self.encoder_window,
+            row_bytes: self.row_bytes,
+            predictor_programs: self.predictor_programs,
+            active_bank: stream.active_bank,
+            pending_predictor: None,
+            all_ids: vec![0; self.joint_batch_max],
+            duration_ids: self.duration_ids,
+            all_durations: vec![0; self.joint_batch_max],
+            profile: None,
+        };
+        // The predictor reruns from the saved bank each step (idempotent), so only its banks persist.
+        let mut decoder = GreedyRnnt::new(self.blank_id, self.max_symbols_per_frame)?.with_tdt_durations(&self.tdt_durations);
+        decoder.previous_token = stream.previous_token;
+        let tokens = decoder.decode_with(&mut execution, on_emit)?;
+        stream.active_bank = execution.active_bank;
+        stream.previous_token = decoder.previous_token;
+        tracing::debug!(
+            step = stream.steps,
+            encoder_us,
+            encoder_wall_us = encoder_wall.as_micros() as u64,
+            decode_us = (started.elapsed() - encoder_wall).as_micros() as u64,
+            tokens = tokens.len(),
+            "rnnt stream step"
+        );
+        for (&live, &saved) in binding.states.iter().zip(&stream.saved) {
+            self.runtime.copy_tensor(live, 0, saved, 0, live.bytes)?;
+        }
+        Ok(tokens)
     }
 
     pub fn input_elements(&self) -> usize {
@@ -198,13 +452,20 @@ impl PacketRnnt {
             input,
             self.frames,
             self.encoder_programs.len() - 1,
+            &mut |_| {},
         )
     }
 
-    pub fn transcribe_input_frames(
+    pub fn transcribe_input_frames(&mut self, input: &[f32], valid_input_frames: usize) -> Result<Vec<u32>> {
+        self.transcribe_input_frames_with(input, valid_input_frames, &mut |_| {})
+    }
+
+    /// [`Self::transcribe_input_frames`], reporting the tokens emitted so far after each one.
+    pub fn transcribe_input_frames_with(
         &mut self,
         input: &[f32],
         valid_input_frames: usize,
+        on_emit: &mut dyn FnMut(&[u32]),
     ) -> Result<Vec<u32>> {
         let encoder = self
             .encoder_programs
@@ -217,7 +478,7 @@ impl PacketRnnt {
             })?;
         let frames =
             self.valid_encoder_frames(valid_input_frames, self.encoder_programs[encoder].0)?;
-        self.transcribe_input_with_encoder_frames(input, frames, encoder)
+        self.transcribe_input_with_encoder_frames(input, frames, encoder, on_emit)
     }
 
     fn transcribe_input_with_encoder_frames(
@@ -225,9 +486,10 @@ impl PacketRnnt {
         input: &[f32],
         frames: usize,
         encoder: usize,
+        on_emit: &mut dyn FnMut(&[u32]),
     ) -> Result<Vec<u32>> {
         self.runtime.begin_execution()?;
-        let result = self.transcribe_active(input, frames, encoder);
+        let result = self.transcribe_active(input, frames, encoder, on_emit);
         let ended = self.runtime.end_execution();
         result.and_then(|tokens| ended.map(|()| tokens))
     }
@@ -237,6 +499,7 @@ impl PacketRnnt {
         input: &[f32],
         frames: usize,
         encoder: usize,
+        on_emit: &mut dyn FnMut(&[u32]),
     ) -> Result<Vec<u32>> {
         if input.len() != self.input_elements() {
             return Err(RuntimeError::Rejected(format!(
@@ -251,6 +514,11 @@ impl PacketRnnt {
         }
         self.runtime
             .write_tensor(self.input, bytemuck::cast_slice(input))?;
+        if let Some(valid_rows) = self.valid_rows {
+            let valid = u32::try_from(frames)
+                .map_err(|_| RuntimeError::Rejected("encoder frame count overflows".into()))?;
+            self.runtime.write_tensor(valid_rows, &valid.to_ne_bytes())?;
+        }
         self.runtime
             .run_sequence(&self.encoder_programs[encoder].1)?;
         let mut profile = self.profiling.then(|| RnntProfile {
@@ -270,10 +538,12 @@ impl PacketRnnt {
             active_bank: 0,
             pending_predictor: None,
             all_ids: vec![0; self.joint_batch_max],
+            duration_ids: self.duration_ids,
+            all_durations: vec![0; self.joint_batch_max],
             profile: profile.as_mut(),
         };
         let result =
-            GreedyRnnt::new(self.blank_id, self.max_symbols_per_frame)?.decode(&mut execution);
+            GreedyRnnt::new(self.blank_id, self.max_symbols_per_frame)?.with_tdt_durations(&self.tdt_durations).decode_with(&mut execution, on_emit);
         self.last_profile = profile;
         result
     }
@@ -320,6 +590,9 @@ struct PacketRnntExecution<'a> {
     active_bank: usize,
     pending_predictor: Option<usize>,
     all_ids: Vec<u32>,
+    /// TDT: `joint.duration_ids`, read beside the token ids.
+    duration_ids: Option<PacketTensor>,
+    all_durations: Vec<u32>,
     profile: Option<&'a mut RnntProfile>,
 }
 
@@ -383,11 +656,19 @@ impl RnntExecution for PacketRnntExecution<'_> {
         let transfer = self.profile.is_some().then(Instant::now);
         self.runtime
             .read_tensor(self.ids, bytemuck::cast_slice_mut(&mut self.all_ids))?;
+        if let Some(durations) = self.duration_ids {
+            self.runtime
+                .read_tensor(durations, bytemuck::cast_slice_mut(&mut self.all_durations))?;
+        }
         if let (Some(profile), Some(transfer)) = (&mut self.profile, transfer) {
             profile.transfer_us += transfer.elapsed().as_secs_f64() * 1e6;
         }
         output[..rows].copy_from_slice(&self.all_ids[..rows]);
         Ok(rows)
+    }
+
+    fn joint_durations(&self) -> &[u32] {
+        &self.all_durations
     }
 
     fn commit_prediction(&mut self) {
@@ -473,7 +754,15 @@ impl GreedyRnnt {
             max_symbols_per_frame,
             previous_token: blank_id,
             predictor_valid: false,
+            tdt_durations: Vec::new(),
         })
+    }
+
+    /// Token-and-duration transducer decoding: each joint row also picks how many frames to
+    /// advance, `durations[argmax]`.
+    pub fn with_tdt_durations(mut self, durations: &[u32]) -> Self {
+        self.tdt_durations = durations.to_vec();
+        self
     }
 
     pub fn reset(&mut self) {
@@ -484,6 +773,18 @@ impl GreedyRnnt {
     /// Decode one encoder chunk. A fixed predictor state evaluates every remaining frame in one
     /// packet dispatch; the first nonblank token invalidates that speculative tail.
     pub fn decode(&mut self, execution: &mut dyn RnntExecution) -> Result<Vec<u32>> {
+        self.decode_with(execution, &mut |_| {})
+    }
+
+    /// [`Self::decode`], calling `on_emit` with every token emitted so far after each one.
+    pub fn decode_with(
+        &mut self,
+        execution: &mut dyn RnntExecution,
+        on_emit: &mut dyn FnMut(&[u32]),
+    ) -> Result<Vec<u32>> {
+        if !self.tdt_durations.is_empty() {
+            return self.decode_tdt(execution, on_emit);
+        }
         let frames = execution.frames();
         let mut emitted = Vec::new();
         let mut ids = vec![self.blank_id; frames];
@@ -514,6 +815,7 @@ impl GreedyRnnt {
             frame += offset;
             let token = ids[offset];
             emitted.push(token);
+            on_emit(&emitted);
             execution.commit_prediction();
             self.previous_token = token;
             self.predictor_valid = false;
@@ -525,22 +827,80 @@ impl GreedyRnnt {
         }
         Ok(emitted)
     }
+
+    /// NeMo's greedy TDT loop, walked over one joint evaluation per predictor state: the rows
+    /// past `frame` share the predictor, so blanks jump by their duration without another
+    /// dispatch. A blank that predicts 0 frames would repeat unchanged until the symbol limit,
+    /// so it advances one frame; a token that predicts 0 stays on its frame up to that limit.
+    fn decode_tdt(
+        &mut self,
+        execution: &mut dyn RnntExecution,
+        on_emit: &mut dyn FnMut(&[u32]),
+    ) -> Result<Vec<u32>> {
+        let frames = execution.frames();
+        let mut emitted = Vec::new();
+        let mut ids = vec![self.blank_id; frames];
+        let mut frame = 0;
+        let mut symbols_at_frame = 0;
+        while frame < frames {
+            if !self.predictor_valid {
+                execution.predict(self.previous_token)?;
+                self.predictor_valid = true;
+            }
+            let window = frame;
+            let evaluated = execution.joint_argmax(window, &mut ids[..frames - window])?;
+            if evaluated == 0 || evaluated > frames - window || execution.joint_durations().len() < evaluated {
+                return Err(RuntimeError::Device("TDT joint returned an invalid frame count".into()));
+            }
+            while frame < window + evaluated {
+                let row = frame - window;
+                let skip = *self
+                    .tdt_durations
+                    .get(execution.joint_durations()[row] as usize)
+                    .ok_or_else(|| RuntimeError::Device("TDT duration index is out of range".into()))?
+                    as usize;
+                let token = ids[row];
+                // NeMo counts every step at a frame, blanks included; a step that lands on the
+                // limit advances one frame more than its duration.
+                symbols_at_frame += 1;
+                let at_limit = usize::from(symbols_at_frame == self.max_symbols_per_frame);
+                if token == self.blank_id {
+                    frame += if skip == 0 { 1 } else { skip + at_limit };
+                    symbols_at_frame = 0;
+                    continue;
+                }
+                emitted.push(token);
+                on_emit(&emitted);
+                execution.commit_prediction();
+                self.previous_token = token;
+                self.predictor_valid = false;
+                if skip > 0 || at_limit == 1 {
+                    frame += skip + at_limit;
+                    symbols_at_frame = 0;
+                }
+                break;
+            }
+        }
+        Ok(emitted)
+    }
 }
 
-pub fn detokenize_sentencepiece(vocabulary: &[String], ids: &[u32]) -> String {
+/// Text of `ids` under the packet's [`TokenOutput`] rules (`output.detokenizer` sentencepiece).
+pub fn detokenize(output: &TokenOutput, ids: &[u32]) -> String {
+    let boundary = output.word_boundary.as_str();
     let mut text = String::new();
     for &id in ids {
-        let Some(piece) = vocabulary.get(id as usize) else {
+        let Some(piece) = output.pieces.get(id as usize) else {
             continue;
         };
-        if piece.starts_with('<') && piece.ends_with('>') {
+        if output.skip_bracketed && piece.starts_with('<') && piece.ends_with('>') {
             continue;
         }
-        let value = piece.strip_prefix('▁').unwrap_or(piece);
-        if piece.starts_with('▁') && !matches!(value, "." | "?" | "!" | "।" | "॥") {
+        let value = piece.strip_prefix(boundary).unwrap_or(piece);
+        if piece.starts_with(boundary) && !output.no_space_before.iter().any(|p| p == value) {
             text.push(' ');
         }
-        text.push_str(&value.replace('▁', " "));
+        text.push_str(&value.replace(boundary, " "));
     }
     text.trim().to_owned()
 }
@@ -599,6 +959,74 @@ mod tests {
         assert_eq!(execution.commits, 1);
     }
 
+    /// Per predictor state (0, 1, ...): `(token, duration index)` for every frame.
+    struct ScriptedTdt {
+        rows: Vec<Vec<(u32, u32)>>,
+        prediction: usize,
+        calls: Vec<usize>,
+        durations: Vec<u32>,
+    }
+
+    impl RnntExecution for ScriptedTdt {
+        fn frames(&self) -> usize {
+            self.rows[0].len()
+        }
+
+        fn predict(&mut self, _previous_token: u32) -> Result<()> {
+            self.prediction += 1;
+            Ok(())
+        }
+
+        fn joint_argmax(&mut self, first_frame: usize, output: &mut [u32]) -> Result<usize> {
+            self.calls.push(first_frame);
+            let rows = &self.rows[self.prediction - 1][first_frame..];
+            for (out, &(token, _)) in output.iter_mut().zip(rows) {
+                *out = token;
+            }
+            self.durations = rows.iter().map(|&(_, d)| d).collect();
+            Ok(rows.len())
+        }
+
+        fn joint_durations(&self) -> &[u32] {
+            &self.durations
+        }
+
+        fn commit_prediction(&mut self) {}
+    }
+
+    #[test]
+    fn tdt_jumps_blanks_by_duration_and_stays_on_zero_duration_tokens() {
+        const B: u32 = 13;
+        // Durations [0, 1, 2, 3, 4]: index = frames advanced.
+        let mut execution = ScriptedTdt {
+            rows: vec![
+                // Blank skips 2 to frame 2, which emits 7 and stays (duration 0).
+                vec![(B, 2), (9, 1), (7, 0), (B, 1), (B, 1), (B, 1)],
+                // Same frame: 8 advances 1 to frame 3; frame 3's blank with duration 0 moves 1.
+                vec![(B, 1), (B, 1), (8, 1), (B, 0), (B, 4), (5, 1)],
+                // Frame 4 blank jumps 4, past the end.
+                vec![(B, 1), (B, 1), (B, 1), (B, 1), (B, 4), (5, 1)],
+            ],
+            prediction: 0,
+            calls: Vec::new(),
+            durations: Vec::new(),
+        };
+        let mut decoder = GreedyRnnt::new(B, 10).unwrap().with_tdt_durations(&[0, 1, 2, 3, 4]);
+        assert_eq!(decoder.decode(&mut execution).unwrap(), [7, 8]);
+        assert_eq!(execution.calls, [0, 2, 3]);
+
+        // A zero-duration token at the symbol limit moves one frame on.
+        let mut limited = ScriptedTdt {
+            rows: vec![vec![(4, 0), (B, 4)], vec![(4, 0), (B, 4)], vec![(4, 0), (B, 4)]],
+            prediction: 0,
+            calls: Vec::new(),
+            durations: Vec::new(),
+        };
+        let mut decoder = GreedyRnnt::new(B, 2).unwrap().with_tdt_durations(&[0, 1, 2, 3, 4]);
+        assert_eq!(decoder.decode(&mut limited).unwrap(), [4, 4]);
+        assert_eq!(limited.calls, [0, 0, 1]);
+    }
+
     #[test]
     fn symbol_limit_advances_a_frame() {
         let mut execution = Scripted {
@@ -622,7 +1050,7 @@ mod tests {
             "<en-US>".into(),
         ];
         assert_eq!(
-            detokenize_sentencepiece(&vocabulary, &[0, 1, 2, 3]),
+            detokenize(&TokenOutput::sentencepiece(vocabulary, &[".", "?", "!"]), &[0, 1, 2, 3]),
             "hello world!"
         );
     }

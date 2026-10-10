@@ -13,7 +13,7 @@ use std::sync::Arc;
 use plow_asset::Manifest;
 pub use plow_asset::Phase;
 
-use crate::text::tokenizer::{load_tokenizer, Tokenize};
+use crate::text::tokenizer::{load_tokenizer_with, Tokenize};
 use crate::{Result, RuntimeError};
 
 mod bucket;
@@ -62,6 +62,9 @@ pub struct ModelBundle {
     serving: crate::serve::config::ServingConfig,
     serve: Arc<serve::ServeInfo>,
     reasoning: crate::serve::reasoning::ReasoningMode,
+    /// Built on the first tool-calling request.
+    special_text: std::sync::OnceLock<Arc<crate::serve::tools::SpecialText>>,
+    reasoning_specials: std::sync::OnceLock<bool>,
 }
 
 impl ModelBundle {
@@ -81,8 +84,9 @@ impl ModelBundle {
 
         // Load the model's tokenizer from `tokenizer.json` (byte fallback if
         // absent / feature off). Loaded once at startup, shared per request.
-        let tokenizer = load_tokenizer(&dir);
-        let serve = Arc::new(serve::resolve(&dir, &serve::checkpoint_dir(&dir))?);
+        let checkpoint = serve::checkpoint_dir(&dir);
+        let tokenizer = load_tokenizer_with(&dir, &checkpoint);
+        let serve = Arc::new(serve::resolve(&dir, &checkpoint)?);
         let chat_template = if serve.from_packet {
             serve.manifest.chat.as_ref().and_then(|c| {
                 let text = c.template.clone()?;
@@ -95,6 +99,7 @@ impl ModelBundle {
             })
         } else {
             crate::serve::template::ChatTemplate::load(&dir)
+                .or_else(|| crate::serve::template::ChatTemplate::load(&checkpoint))
         };
         let serving = crate::serve::config::ServingConfig::from_defaults(serve.manifest.sampling.as_ref());
         tracing::info!(
@@ -117,6 +122,7 @@ impl ModelBundle {
             ),
         }
 
+        let reasoning = crate::serve::reasoning::ReasoningMode::resolve(&serve, chat_template.as_ref().and_then(|t| t.reasoning));
         Ok(ModelBundle {
             dir,
             manifest,
@@ -124,8 +130,27 @@ impl ModelBundle {
             tokenizer,
             chat_template,
             serving,
-            reasoning: crate::serve::reasoning::ReasoningMode::from_serve(&serve),
+            reasoning,
             serve,
+            special_text: std::sync::OnceLock::new(),
+            reasoning_specials: std::sync::OnceLock::new(),
+        })
+    }
+
+    /// The tokenizer's special-token text, for stripping after tool-call parsing.
+    pub fn special_text(&self) -> &Arc<crate::serve::tools::SpecialText> {
+        self.special_text
+            .get_or_init(|| Arc::new(crate::serve::tools::SpecialText::new(self.tokenizer.special_tokens())))
+    }
+
+    /// Whether the reasoning markers are special tokens: the generation must then be decoded with
+    /// special tokens kept for the split to see them (Gemma 4's `<|channel>` / `<channel|>`).
+    pub fn reasoning_in_specials(&self) -> bool {
+        *self.reasoning_specials.get_or_init(|| {
+            self.reasoning.markers().is_some_and(|(open, close)| {
+                let s = self.special_text();
+                s.any_in(open) || s.any_in(close)
+            })
         })
     }
 

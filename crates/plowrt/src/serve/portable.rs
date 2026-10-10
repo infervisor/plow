@@ -74,7 +74,7 @@ impl PortableManager {
             .as_ref()
             .map(PathBuf::from)
             .or(saved.clone())
-            .unwrap_or_else(|| dir.join("checkpoint"));
+            .unwrap_or_else(|| crate::asset::serve::checkpoint_dir(&dir));
         if saved.as_ref().is_some_and(|p| p != &checkpoint) {
             return err(
                 StatusCode::CONFLICT,

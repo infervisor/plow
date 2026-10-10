@@ -1,0 +1,147 @@
+# EXPERIMENTAL multimodal variant of recipes/infervisor/gemma-4-e4b/sm90a-h100-tp1.toml (kept in sync
+# with it): adds the vision + audio encoder sidecars (PLOW_EMIT_MULTIMODAL=1) and the mm_parity gate.
+#
+# Gemma 4 E4B-it (google/gemma-4-E4B-it) on H100: text LLM of the voice-agent server (co-served
+# with Qwen3-ASR and Chatterbox). Per-layer input embeddings (E-series PLE), 5:1 sliding(512):full
+# attention, 18 trailing KV-shared layers, final-logit softcap 30. Served with logprobs.
+#
+#   PLOW_CAMPAIGN_NO_NIX=1 (this box only) \
+#   python3 scripts/campaign/campaign.py build recipes/infervisor/gemma-4-e4b/sm90a-h100-tp1.toml --out <fresh dir>
+#
+# Gates: scripts/llm/gemma_logit_parity.py (served logprobs vs HF transformers bf16);
+# bench: scripts/llm/gemma_voice_bench.sh (plowbench conventions, vLLM reference same client).
+
+schema = "plow.recipe.v1"
+namespace = "infervisor"
+name = "gemma-4-e4b"
+label = "sm90a-h100-tp1-multimodal"
+status = "experimental"
+plow_git = "1972fa37ac7a6f632cd5ece0b32fe37ab76eec75"
+network = "gemma4"
+doc = "docs/runtime/gemma4-e4b-h100.md"
+tracker = "docs/runtime/h100-speech-recipes.md"
+
+[target]
+vendor = "nvidia"
+isa = "sm_90a"
+sku = "H100 SXM5"
+units = 132
+num_gpus = 1
+parallel = "tp"
+
+[checkpoint]
+source = "hf:google/gemma-4-E4B-it"
+revision = "ee0ef6023621cff504d758262d4e04895a5af4a2"
+
+[cell]
+name = "gemma-4-e4b-h100"
+hf_dir = "{hf:google/gemma-4-E4B-it@ee0ef6023621cff504d758262d4e04895a5af4a2}"
+gpu = "h100"
+arch = "sm_90a"
+n_cu = 132
+n_gpu = 1
+max_ctx = 8192
+
+[emit]
+emit = "devblob+cubin"
+args = ["--served-name", "gemma-4-e4b"]
+[emit.env]
+# Experimental: encoder sidecars (mm_vision.pkt / mm_audio.pkt) + MmRowsBf16 (docs/serving-openai-compat.md 2c).
+PLOW_EMIT_MULTIMODAL = "1"
+PLOW_VERIFY_BIN = "{repo}/lean-plow/.lake/build/bin/plow_verify"
+# Voice-agent turns: prompts ~200-2000 rows -> prefill 64..2048; decode up to 128 concurrent.
+PLOW_MAX_CHUNK = "2048"
+# The 8192 rung ships whenever ctx reaches it; capping one request at 2048 rows per launch keeps
+# the sliding ring at next_pow2(512 + 2047) = 4096 (uncapped: 8192, KV 36 -> 56 GiB) and makes
+# 8192 a packed launch of up to four requests. KV-shared layers: no staging (PLOW_STAGE_ROWS auto = off).
+# At 15925e5b: ring 4096, KV 36.00 GiB (uncapped 56.00), activations 1.60 GiB (the 8192 rung).
+# Served 1000/128 vs uncapped, same packet otherwise: c64/c128 tok/s 3965/4890 vs 3945/4836, TTFT
+# p50 246/259 vs 248/260 ms (REPS=2 vs 1). Vs the 2048-top ladder (main 3233d1f2): tok/s +1/+2%,
+# TTFT p99 -8/-10%, but TTFT p50 108/118 -> 246/259 ms, from the 4096/8192 rungs, cap or not.
+PLOW_MAX_REQUEST_CHUNK = "2048"
+PLOW_PF_LADDER_APPEND = "64,256"
+PLOW_DECODE_BATCH_LADDER = "1,2,4,8,16,32,48,64,96,128"
+PLOW_EMIT_PREFILL_CUBLASLT = "1"
+# Every decode rung runs each layer projection as a cuBLASLt matmul inside the rung's captured
+# graph (light launches between them). step_bench ctx 1024 B=48/64/96/128 11.0/11.9/15.6/16.4 ->
+# 9.9/10.2/12.3/12.8 ms (48); from 2 rows (fd0fe175): B=2/4/8/16/32 5.75/5.86/6.17/6.77/8.62 ->
+# 5.62/5.68/5.93/6.24/6.78 ms, 48+ unchanged (docs/bringup/results/gemma4-h100/native-kernels-20261009.md);
+# from 1 row: B=1 5.715 -> 5.63 ms, token digest unchanged (nativek/res/rungs3).
+PLOW_EMIT_DECODE_CUBLASLT = "1"
+PLOW_EMIT_DECODE_CUBLASLT_MIN_ROWS = "1"
+# lm_head and per_layer_model_projection of the routed rungs as cuBLASLt matmuls (vocab 262144,
+# 16-aligned: no head tail): step_bench ctx 1024 B=64/128 7.78/10.12 -> 7.75/9.91 ms (lm_head);
+# the PLE projection leaves the head interpreter window, 92 -> 39 us + a 29 us matmul at B=64.
+PLOW_EMIT_DECODE_CUBLASLT_HEAD = "1"
+# Every flash segment isolated: hd256 sliding + hd512 full attention run in interp_sm90a_pffa
+# (prefill 2000 rows 70 -> 48 ms). Needs the pffa/pfpackedfa role objects below.
+PLOW_SEG_FA512 = "all"
+# TMA K/V maps feed the v3 flash body; class slicing gives the occ-2 GEMM objects 2*n_cu
+# slices, and SLICE_ALL the occ-2 light (FATLITE) object too (half its blocks idled on n_cu).
+PLOW_TMA_GEMM = "1"
+PLOW_SEG_CLASS_SLICE = "1"
+PLOW_SEG_SLICE_ALL = "1"
+# Prefill sandwich seams as one NormResidualNorm (row-team body): 1000 rows 13.9 -> 13.7 ms.
+PLOW_PF_GFUSE = "1"
+
+# base emit -> segment objects (PLOW_NVCC / NVCC_PREPEND_FLAGS pick the toolkit) -> role emit.
+# Only the flash objects (v3 body), the FATLITE light object and the generated prefill attention
+# roles are taken.
+[objects]
+script = "scripts/build_sm90a_gemma4_segments.sh"
+role_files = ["interp_sm90a_pffa.cubin", "interp_sm90a_pfpackedfa.cubin", "interp_sm90a_pfpackedseg.cubin",
+              "gen_sm90a_attn_pf_hd256_sliding.cubin", "gen_sm90a_attn_pf_hd512.cubin"]
+[objects.env]
+PLOW_BUILD_FA_V3 = "2"
+# GQA-packed short requests (token-batch riders): 64 one-row requests hd512 kv 1024 360 -> 115 us.
+PLOW_BUILD_FA_V3_PACK = "1"
+# Generated-kernel catalog prefill attention (hd256 sliding, hd512 global) on the 1024+ row rungs;
+# needs PYREF with TileLang. Packed prefill 1x1000 / 1x2000 / 4x1000 rows 19.3/32.7/62.2 ->
+# 18.3/31.7/60.3 ms; 500 rows unchanged (native-kernels-20261009.md).
+PLOW_BUILD_GEN_KERNELS = "attn_pf_hd256_sliding,attn_pf_hd512"
+
+[emit_roles.env]
+PLOW_EMIT_GEN_KERNELS = "attn_pf_hd256_sliding,attn_pf_hd512"
+
+# Voice-agent turns (X-Session-Id, cached prefix + short suffix): unified token batching with
+# adaptive multistep, both derived by the default `auto` objective; 64 calls x 6 turns later-turn
+# TTFT p50 39 ms vs 143 ms with PLOW_TOKEN_BATCH=0. Cold 1000-token prompts: 2719 out tok/s at
+# c64, 3555 at c200 (sampled rows draw on the device; decode rows ride a prefill launch only while
+# that is cheaper than a step, `sched::ride`). The lookahead-1 decode pipeline is on wherever the
+# decode mode allows it (c64/c128 tok/s +1/+3%). docs/runtime/gemma4-e4b-h100.md.
+# Served: per-rung cuBLASLt algorithms (step_bench B=48/64 7.29/7.52 -> 7.13/7.41 ms; the chosen
+# algorithm, and so the B<128 rung digests, can differ between loads).
+[serve]
+env = { PLOW_VMM_PREFIX = "1", PLOW_LT_RUNG_ALGOS = "true" }
+
+[bench]
+kind = "chat"
+
+# `campaign.py gate <recipe> --assets <dir> --out <dir>` (one lease). PYREF: python with torch +
+# transformers. Measured at 820aa3ba: top1 0.9867 (371/376), KL mean 7.1e-4, max 1.6e-2.
+# 15925e5b + request cap 2048: top1 0.9845 (381/387), KL mean 7.4e-4, max 1.4e-2. One load in two
+# (shipped main bundle too) ends cmpl0 at 18 tokens: 0.9795 (334/341), load-to-load variance.
+[gates]
+python = "{env:PYREF}"
+[gates.llm_logit_parity]
+hf_dir = "{hf:google/gemma-4-E4B-it@ee0ef6023621cff504d758262d4e04895a5af4a2}"
+top1_min = 0.98
+kl_mean_max = 2e-3
+
+# 2026-10-10 (mm-harden a00d40f2, packet built from this recipe): mm_parity PASS 10/10 cases,
+# refusals 11/11, encoders 22/22 (cos >= 0.9996); llm_logit_parity PASS top1 0.9948, KL 7.5e-4.
+# Media parity (scripts/mm/gate.py + refusals.py + mm_check): E4B_MM_REF = a scripts/mm/hf_ref.py
+# reference dir (built in the lease from hf_dir and the media below when its ref.json is missing),
+# MM_MEDIA = the images, the LibriSpeech clips and their mp3/flac/ogg transcodes. mm_check comes
+# from $CARGO_TARGET_DIR/release/examples/mm_check.
+[gates.mm_parity]
+python = "python3"
+hf_python = "{env:PYREF}"
+reference = "{env:E4B_MM_REF}"
+hf_dir = "{hf:google/gemma-4-E4B-it@ee0ef6023621cff504d758262d4e04895a5af4a2}"
+cases = "scripts/mm/cases/image_audio.json"
+images = ["{env:MM_MEDIA}/cats.png", "{env:MM_MEDIA}/stop_small.png", "{env:MM_MEDIA}/coco_000000000285.jpg", "{env:MM_MEDIA}/coco_000000000632.jpg"]
+audio = ["{env:MM_MEDIA}/ls00.wav", "{env:MM_MEDIA}/ls01.wav", "{env:MM_MEDIA}/ls02.wav"]
+refusal_image = "{env:MM_MEDIA}/cats.png"
+refusal_audio = "{env:MM_MEDIA}/ls01.wav"
+compressed = ["{env:MM_MEDIA}/ls01.mp3", "{env:MM_MEDIA}/ls01.flac", "{env:MM_MEDIA}/ls01.ogg"]

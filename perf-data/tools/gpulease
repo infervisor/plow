@@ -87,12 +87,14 @@ pid_ns_ok() {
 gpu_procs() {
   case "$VENDOR" in
     nvidia)
-      # nvidia-smi cannot attribute a pid to an index in one query; the NVIDIA
-      # boxes this harness came from are single-GPU, so report index 0.
-      nvidia-smi --query-compute-apps=pid,used_memory --format=csv,noheader 2>/dev/null |
-        while IFS=, read -r p mem; do
-          p=$(echo "$p" | tr -d ' '); [ -z "$p" ] && continue
-          echo "0 $p $(echo "$mem" | tr -d ' ')"
+      # Compute apps report a GPU UUID, not an index; join through the GPU list.
+      local idx
+      idx=$(nvidia-smi --query-gpu=uuid,index --format=csv,noheader 2>/dev/null | tr -d ' ')
+      nvidia-smi --query-compute-apps=gpu_uuid,pid,used_memory --format=csv,noheader 2>/dev/null |
+        while IFS=, read -r u p mem; do
+          u=$(echo "$u" | tr -d ' '); p=$(echo "$p" | tr -d ' '); [ -z "$p" ] && continue
+          g=$(echo "$idx" | awk -F, -v u="$u" '$1 == u {print $2}')
+          echo "${g:-0} $p $(echo "$mem" | tr -d ' ')"
         done ;;
     amd)
       amd-smi process --json 2>/dev/null | python3 -c '
@@ -255,10 +257,17 @@ release_all() {
   for fd in $(seq $FD_BASE $((FD - 1))); do eval "exec $fd>&-" 2>/dev/null; done
   GOT=""; NGOT=0; FD=$FD_BASE
 }
+# NVIDIA cards hosting a process that bypassed the lease; a partial lease skips them.
+tenant_cards() {
+  [ "$VENDOR" = nvidia ] && [ "$WANT" -lt "$NGPU" ] || return 0
+  foreign | sed -n 's/^gpu\([0-9]*\):.*/\1/p' | sort -u | tr '\n' ' '
+}
 try_acquire() {
-  local i f
+  local i f tenants
+  tenants=" $(tenant_cards) "
   for ((i = 0; i < NGPU; i++)); do
     [ "$NGOT" -ge "$WANT" ] && break
+    case "$tenants" in *" $i "*) continue ;; esac
     f="$LEASE_DIR/gpu.$i.lease"
     [ -e "$f" ] || : >"$f" 2>/dev/null || continue
     # The lease directory is shared across users. Existing lock files may be readable but
@@ -274,8 +283,10 @@ try_acquire() {
 }
 
 free_cards() {
-  local i f n=0
+  local i f n=0 tenants
+  tenants=" $(tenant_cards) "
   for ((i = 0; i < NGPU; i++)); do
+    case "$tenants" in *" $i "*) continue ;; esac
     f="$LEASE_DIR/gpu.$i.lease"
     [ -e "$f" ] || : >"$f" 2>/dev/null || continue
     flock -n "$f" true 2>/dev/null && n=$((n + 1))

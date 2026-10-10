@@ -2182,7 +2182,9 @@ fn build_cubin_from_manifest(
     let _ = t3;
     args.push("-DPLOW_TTS_S3GEN=OFF".into());
     // An ASR packet's audio encoder runs the FP32 speech arms, which only the _speech object has.
-    let asr = ["encoder.pkt", "codec.pkt", "s3gen.pkt"].iter().any(|f| pkt.with_file_name(f).is_file());
+    let asr = ["encoder.pkt", "codec.pkt", "s3gen.pkt", "mm_vision.pkt", "mm_audio.pkt"]
+        .iter()
+        .any(|f| pkt.with_file_name(f).is_file());
     args.push(format!("-DPLOW_CUBIN_SPEECH={}", if asr { "ON" } else { "OFF" }));
 
     let out_dir = pkt.parent().map(PathBuf::from).unwrap_or_default();
@@ -2270,6 +2272,7 @@ fn cubin_arch_option(arch: &str) -> Result<&'static str, String> {
     match arch {
         "sm_90a" => Ok("-DPLOW_SM90A_CUBIN=ON"),
         "sm_120a" => Ok("-DPLOW_SM120_CUBIN=ON"),
+        "sm_89" => Ok("-DPLOW_SM89_CUBIN=ON"),
         _ if devgen::target_is_cpu(arch, "") => Err(format!(
             "--emit devblob+cubin: --arch {arch} is a CPU target; the CPU engine needs no \
              interpreter object, use --emit devblob."
@@ -2280,7 +2283,7 @@ fn cubin_arch_option(arch: &str) -> Result<&'static str, String> {
         )),
         _ => Err(format!(
             "--emit devblob+cubin: no served interpreter object is defined for --arch {arch}; \
-             supported CUDA architectures are sm_90a and sm_120a."
+             supported CUDA architectures are sm_90a, sm_120a and sm_89."
         )),
     }
 }
@@ -3170,6 +3173,7 @@ mod cli_tests {
             cubin_arch_option("sm_120a").unwrap(),
             "-DPLOW_SM120_CUBIN=ON"
         );
+        assert_eq!(cubin_arch_option("sm_89").unwrap(), "-DPLOW_SM89_CUBIN=ON");
         assert!(cubin_arch_option("sm_100a")
             .unwrap_err()
             .contains("no served interpreter"));

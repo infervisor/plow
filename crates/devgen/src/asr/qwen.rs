@@ -21,6 +21,7 @@ pub struct AudioEncoderPackets {
     pub first_output: u32,
     pub transformer_output: u32,
     pub output_shape: [u32; 4],
+    output_width: u32,
     feature_frames: u32,
     valid_rows: u32,
     groups: u32,
@@ -51,6 +52,7 @@ impl AudioEncoderPackets {
             || programs.contains_key(&capacity)
             || bucket.rows > self.rows
             || bucket.prefix.model.n_cu != self.prefix.model.n_cu
+            || bucket.output_width != self.output_width
             || bucket.prefix.model.target != self.prefix.model.target
             || !bucket.prefix.model.gen.is_empty()
             || bucket.prefix.model.tensors.len() != self.prefix.model.tensors.len()
@@ -171,7 +173,7 @@ impl AudioEncoderPackets {
             "audio.encode",
             PipelineDType::F32,
             PipelineDType::F32,
-            vec![u64::from(self.rows), 2048],
+            vec![u64::from(self.rows), u64::from(self.output_width)],
         )?;
         let mut metadata: PacketPipelines =
             serde_json::from_slice(&section.data).map_err(|error| error.to_string())?;
@@ -215,7 +217,7 @@ impl AudioEncoderPackets {
             .parameters
             .insert("output_rows".into(), u64::from(self.rows));
         pipeline.parameters.insert("feature_bins".into(), 128);
-        pipeline.parameters.insert("output_width".into(), 2048);
+        pipeline.parameters.insert("output_width".into(), u64::from(self.output_width));
         pipeline.parameters.insert("qwen_audio_graph_v1".into(), 1);
         pipeline
             .parameters
@@ -274,23 +276,61 @@ impl AudioEncoderPackets {
     }
 }
 
-pub fn lower_audio_encoder(feature_frames: u32, n_cu: u32) -> Result<AudioEncoderPackets, String> {
+/// The audio tower's widths; every Qwen3-ASR size shares the conv front end and 64-wide heads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AudioDims {
+    pub width: u32,
+    pub ffn_width: u32,
+    pub layers: u32,
+    pub output_width: u32,
+}
+
+impl AudioDims {
+    pub const QWEN3_ASR_1_7B: Self = Self { width: 1024, ffn_width: 4096, layers: 24, output_width: 2048 };
+
+    /// `thinker_config.audio_config` of a checkpoint's `config.json`.
+    pub fn from_checkpoint(checkpoint: &std::path::Path) -> Result<Self, String> {
+        let path = checkpoint.join("config.json");
+        let text = std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+        let config: serde_json::Value = serde_json::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
+        let audio = &config["thinker_config"]["audio_config"];
+        let field = |key: &str| {
+            audio[key]
+                .as_u64()
+                .and_then(|v| u32::try_from(v).ok())
+                .ok_or_else(|| format!("{}: audio_config.{key} missing", path.display()))
+        };
+        let dims = Self {
+            width: field("d_model")?,
+            ffn_width: field("encoder_ffn_dim")?,
+            layers: field("encoder_layers")?,
+            output_width: field("output_dim")?,
+        };
+        if field("encoder_attention_heads")? * 64 != dims.width || dims.layers == 0 {
+            return Err(format!("{}: audio tower is not 64-wide heads", path.display()));
+        }
+        Ok(dims)
+    }
+}
+
+pub fn lower_audio_encoder(feature_frames: u32, n_cu: u32, dims: AudioDims) -> Result<AudioEncoderPackets, String> {
     if !(50..=3000).contains(&feature_frames) {
         return Err("invalid Qwen audio encoder geometry".into());
     }
-    lower(feature_frames, n_cu, false)
+    lower(feature_frames, n_cu, false, dims)
 }
 
 /// `chunks` 100-frame chunks of any number of utterances, each starting on a chunk; the `groups`
 /// table lists every utterance's attention windows `(first row, valid rows)`.
-pub fn lower_packed_audio_encoder(chunks: u32, n_cu: u32) -> Result<AudioEncoderPackets, String> {
+pub fn lower_packed_audio_encoder(chunks: u32, n_cu: u32, dims: AudioDims) -> Result<AudioEncoderPackets, String> {
     if chunks == 0 || chunks > 1024 {
         return Err("invalid packed Qwen audio encoder geometry".into());
     }
-    lower(chunks * 100, n_cu, true)
+    lower(chunks * 100, n_cu, true, dims)
 }
 
-fn lower(feature_frames: u32, n_cu: u32, packed: bool) -> Result<AudioEncoderPackets, String> {
+fn lower(feature_frames: u32, n_cu: u32, packed: bool, dims: AudioDims) -> Result<AudioEncoderPackets, String> {
+    let AudioDims { width, ffn_width, layers, output_width } = dims;
     if n_cu == 0 {
         return Err("invalid Qwen audio encoder geometry".into());
     }
@@ -361,7 +401,7 @@ fn lower(feature_frames: u32, n_cu: u32, packed: bool) -> Result<AudioEncoderPac
             weight: "thinker.audio_tower.conv_out.weight",
             bias: None,
             input_width: 7680,
-            output_width: 1024,
+            output_width: width,
             activation: DenseActivation::None,
             round_bf16: true,
             weight_type: DenseWeight::Bf16,
@@ -371,7 +411,7 @@ fn lower(feature_frames: u32, n_cu: u32, packed: bool) -> Result<AudioEncoderPac
         },
     )?;
     let projection = prefix.output;
-    let positions = qwen_positions(rows as usize, 1024, output_shape[3] as usize);
+    let positions = qwen_positions(rows as usize, width as usize, output_shape[3] as usize);
     prefix = prefix.append_initialized_add_f32(InitializedAddF32Stage {
         output: "act.qwen.positioned",
         addend: "const.qwen.audio_position",
@@ -386,7 +426,7 @@ fn lower(feature_frames: u32, n_cu: u32, packed: bool) -> Result<AudioEncoderPac
             output: "act.qwen.layers.0.self_attn_norm",
             gamma: Some("thinker.audio_tower.layers.0.self_attn_layer_norm.weight"),
             beta: Some("thinker.audio_tower.layers.0.self_attn_layer_norm.bias"),
-            width: 1024,
+            width,
             epsilon: 1e-5,
             round_bf16: true,
             ordered_statistics: true,
@@ -408,8 +448,8 @@ fn lower(feature_frames: u32, n_cu: u32, packed: bool) -> Result<AudioEncoderPac
                 bias: Some(&format!(
                     "thinker.audio_tower.layers.0.self_attn.{name}.bias"
                 )),
-                input_width: 1024,
-                output_width: 1024,
+                input_width: width,
+                output_width: width,
                 activation: DenseActivation::None,
                 round_bf16: true,
                 weight_type: DenseWeight::Bf16,
@@ -429,7 +469,7 @@ fn lower(feature_frames: u32, n_cu: u32, packed: bool) -> Result<AudioEncoderPac
             output: "act.qwen.layers.0.attention",
             valid_rows: Some(attention_rows),
             group_table: packed,
-            width: 1024,
+            width,
             head_width: 64,
             group_rows: output_shape[3] * 8,
             round_score_bf16: true,
@@ -444,8 +484,8 @@ fn lower(feature_frames: u32, n_cu: u32, packed: bool) -> Result<AudioEncoderPac
             output: "act.qwen.layers.0.attention_projection",
             weight: "thinker.audio_tower.layers.0.self_attn.out_proj.weight",
             bias: Some("thinker.audio_tower.layers.0.self_attn.out_proj.bias"),
-            input_width: 1024,
-            output_width: 1024,
+            input_width: width,
+            output_width: width,
             activation: DenseActivation::None,
             round_bf16: true,
             weight_type: DenseWeight::Bf16,
@@ -458,7 +498,7 @@ fn lower(feature_frames: u32, n_cu: u32, packed: bool) -> Result<AudioEncoderPac
     prefix = prefix.append_scaled_add_f32(
         positioned,
         attention_projection,
-        rows * 1024,
+        rows * width,
         ScaledAddF32Stage {
             output: "act.qwen.layers.0.attention_residual",
             scale: 1.0,
@@ -472,7 +512,7 @@ fn lower(feature_frames: u32, n_cu: u32, packed: bool) -> Result<AudioEncoderPac
             output: "act.qwen.layers.0.final_norm",
             gamma: Some("thinker.audio_tower.layers.0.final_layer_norm.weight"),
             beta: Some("thinker.audio_tower.layers.0.final_layer_norm.bias"),
-            width: 1024,
+            width,
             epsilon: 1e-5,
             round_bf16: true,
             ordered_statistics: true,
@@ -484,8 +524,8 @@ fn lower(feature_frames: u32, n_cu: u32, packed: bool) -> Result<AudioEncoderPac
             output: "act.qwen.layers.0.fc1",
             weight: "thinker.audio_tower.layers.0.fc1.weight",
             bias: Some("thinker.audio_tower.layers.0.fc1.bias"),
-            input_width: 1024,
-            output_width: 4096,
+            input_width: width,
+            output_width: ffn_width,
             activation: DenseActivation::GeluErfBf16,
             round_bf16: true,
             weight_type: DenseWeight::Bf16,
@@ -500,8 +540,8 @@ fn lower(feature_frames: u32, n_cu: u32, packed: bool) -> Result<AudioEncoderPac
             output: "act.qwen.layers.0.fc2",
             weight: "thinker.audio_tower.layers.0.fc2.weight",
             bias: Some("thinker.audio_tower.layers.0.fc2.bias"),
-            input_width: 4096,
-            output_width: 1024,
+            input_width: ffn_width,
+            output_width: width,
             activation: DenseActivation::None,
             round_bf16: true,
             weight_type: DenseWeight::Bf16,
@@ -514,7 +554,7 @@ fn lower(feature_frames: u32, n_cu: u32, packed: bool) -> Result<AudioEncoderPac
     prefix = prefix.append_scaled_add_f32(
         attention_residual,
         fc2,
-        rows * 1024,
+        rows * width,
         ScaledAddF32Stage {
             output: "act.qwen.layers.0.output",
             scale: 1.0,
@@ -526,15 +566,15 @@ fn lower(feature_frames: u32, n_cu: u32, packed: bool) -> Result<AudioEncoderPac
         prefix,
         AudioTransformerSpec {
             rows,
-            width: 1024,
-            ffn_width: 4096,
+            width,
+            ffn_width,
             head_width: 64,
             group_rows: output_shape[3] * 8,
             valid_rows: Some(attention_rows),
             group_table: packed,
             split,
             first_layer: 1,
-            layers: 23,
+            layers: layers - 1,
             weight_prefix: "thinker.audio_tower",
             activation_prefix: "act.qwen",
             fuse_layer_norm: false,
@@ -547,7 +587,7 @@ fn lower(feature_frames: u32, n_cu: u32, packed: bool) -> Result<AudioEncoderPac
             output: "act.qwen.ln_post",
             gamma: Some("thinker.audio_tower.ln_post.weight"),
             beta: Some("thinker.audio_tower.ln_post.bias"),
-            width: 1024,
+            width,
             epsilon: 1e-5,
             round_bf16: true,
             ordered_statistics: true,
@@ -559,8 +599,8 @@ fn lower(feature_frames: u32, n_cu: u32, packed: bool) -> Result<AudioEncoderPac
             output: "act.qwen.proj1",
             weight: "thinker.audio_tower.proj1.weight",
             bias: Some("thinker.audio_tower.proj1.bias"),
-            input_width: 1024,
-            output_width: 1024,
+            input_width: width,
+            output_width: width,
             activation: DenseActivation::GeluErfBf16,
             round_bf16: true,
             weight_type: DenseWeight::Bf16,
@@ -575,8 +615,8 @@ fn lower(feature_frames: u32, n_cu: u32, packed: bool) -> Result<AudioEncoderPac
             output: "act.qwen.audio_features",
             weight: "thinker.audio_tower.proj2.weight",
             bias: Some("thinker.audio_tower.proj2.bias"),
-            input_width: 1024,
-            output_width: 2048,
+            input_width: width,
+            output_width,
             activation: DenseActivation::None,
             round_bf16: true,
             weight_type: DenseWeight::Bf16,
@@ -598,6 +638,7 @@ fn lower(feature_frames: u32, n_cu: u32, packed: bool) -> Result<AudioEncoderPac
         first_output,
         transformer_output,
         output_shape,
+        output_width,
         feature_frames,
         valid_rows,
         groups,
@@ -1062,7 +1103,7 @@ mod tests {
 
     #[test]
     fn lowers_complete_audio_encoder_as_backend_neutral_packets() {
-        let packets = lower_audio_encoder(50, 4).unwrap();
+        let packets = lower_audio_encoder(50, 4, AudioDims::QWEN3_ASR_1_7B).unwrap();
         assert_eq!(packets.rows, 7);
         assert_eq!(packets.output_shape, [1, 480, 16, 7]);
         assert_eq!(packets.prefix.input_shape, [1, 128, 50]);
@@ -1100,9 +1141,9 @@ mod tests {
 
     #[test]
     fn merges_audio_capacities_with_one_tensor_table() {
-        let mut packets = lower_audio_encoder(200, 4).unwrap();
+        let mut packets = lower_audio_encoder(200, 4, AudioDims::QWEN3_ASR_1_7B).unwrap();
         packets
-            .merge_capacity(lower_audio_encoder(100, 4).unwrap())
+            .merge_capacity(lower_audio_encoder(100, 4, AudioDims::QWEN3_ASR_1_7B).unwrap())
             .unwrap();
         assert_eq!(packets.prefix.model.progs.len(), 2 * 271usize.div_ceil(FUSED_OPS));
         let section = packets.pipeline_section(200).unwrap();
@@ -1116,11 +1157,11 @@ mod tests {
 
     #[test]
     fn packed_buckets_share_the_largest_tensor_table() {
-        let mut packets = lower_packed_audio_encoder(4, 4).unwrap();
-        packets.merge_capacity(lower_packed_audio_encoder(2, 4).unwrap()).unwrap();
-        packets.merge_capacity(lower_audio_encoder(300, 4).unwrap()).unwrap();
-        packets.merge_capacity(lower_audio_encoder(100, 4).unwrap()).unwrap();
-        assert!(packets.merge_capacity(lower_audio_encoder(100, 4).unwrap()).is_err());
+        let mut packets = lower_packed_audio_encoder(4, 4, AudioDims::QWEN3_ASR_1_7B).unwrap();
+        packets.merge_capacity(lower_packed_audio_encoder(2, 4, AudioDims::QWEN3_ASR_1_7B).unwrap()).unwrap();
+        packets.merge_capacity(lower_audio_encoder(300, 4, AudioDims::QWEN3_ASR_1_7B).unwrap()).unwrap();
+        packets.merge_capacity(lower_audio_encoder(100, 4, AudioDims::QWEN3_ASR_1_7B).unwrap()).unwrap();
+        assert!(packets.merge_capacity(lower_audio_encoder(100, 4, AudioDims::QWEN3_ASR_1_7B).unwrap()).is_err());
         let attention = packets
             .prefix
             .model
@@ -1219,6 +1260,16 @@ pub fn whisper_frontend(checkpoint: &std::path::Path) -> Result<WhisperFrontend,
 
 pub const ENCODER_PACKET: &str = "encoder.pkt";
 
+/// Qwen3-ASR's host policy: a stream's last piece gets 1 s of -50 dBFS noise so the model hears
+/// it end; one transcript position per audio row (about 13 a second, where speech rarely needs
+/// 6 tokens a second) plus 64.
+pub const AUDIO_LM_POLICY: plow_asset::speech_contract::AudioLmPolicy = plow_asset::speech_contract::AudioLmPolicy {
+    final_padding_samples: 16_000,
+    final_padding_amplitude: 100.0 / 32768.0,
+    output_reserve_per_row: 1,
+    output_reserve_extra: 64,
+};
+
 /// Host contract of the Qwen3-ASR decoder for the generic audio-LM driver: prompt layout,
 /// audio marker, output markers, languages and stop ids, as packet strings and parameters.
 pub fn audio_lm_contract(
@@ -1268,6 +1319,7 @@ pub fn audio_lm_contract(
     for (i, id) in stops.iter().enumerate() {
         parameters.insert(format!("stop.{i}"), *id);
     }
+    AUDIO_LM_POLICY.to_parameters(&mut parameters);
     let strings = BTreeMap::from([
         (
             "prompt.messages".into(),

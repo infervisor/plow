@@ -4,10 +4,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use axum::extract::State;
-use axum::response::sse::{Event, Sse};
+use axum::body::Bytes;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
-use futures::stream::{self, Stream};
+use futures::stream;
 
 use crate::serve::openai::*;
 use crate::serve::stream::{self as stream_mod, StreamChunk};
@@ -92,15 +92,25 @@ async fn chat_completions_with(
     // template choice below sees the engine. Resident models pass through on
     // the manager's lock-free fast path. A switch that cannot fit sheds with
     // 503 + Retry-After (the client should back off, not hammer the planner).
+    if let Some(r) = crate::serve::models::refuse_unserved(&state, &req.model, "chat/completions") {
+        return r;
+    }
     if !state.residency(&req.model).admits() {
         return crate::serve::api_error(axum::http::StatusCode::SERVICE_UNAVAILABLE,
             "Model is explicitly unloaded or unloading", "server_error", Some("model_unloaded"), Some("model".into()));
     }
     #[cfg(feature = "cuda")]
-    if let Some(mgr) = state.manager_for(&req.model) {
-        if mgr.manages(&req.model) {
-            use crate::serve::manager::EnsureError;
-            if let Err(e) = mgr.ensure_resident(&req.model).await {
+    {
+        use crate::serve::manager::EnsureError;
+        let ensured = match state.dp_set(&req.model) {
+            Some(set) => Some(state.dp_admit(set).await),
+            None => match state.manager_for(&req.model) {
+                Some(mgr) if mgr.manages(&req.model) => Some(mgr.ensure_resident(&req.model).await),
+                _ => None,
+            },
+        };
+        {
+            if let Some(Err(e)) = ensured {
                 return match e {
                     EnsureError::WontFit { .. } | EnsureError::SwitchTimeout(_) => (
                         axum::http::StatusCode::SERVICE_UNAVAILABLE,
@@ -125,6 +135,10 @@ async fn chat_completions_with(
             }
         }
     }
+    // Again once a switch has bound the model: a non-resident one read as text above.
+    if let Some(r) = crate::serve::models::refuse_unserved(&state, &req.model, "chat/completions") {
+        return r;
+    }
 
     // REFUSE WHAT THIS SERVER CANNOT HONOR, rather than dropping it.
     //
@@ -145,26 +159,35 @@ async fn chat_completions_with(
             );
         }
     }
-    for (val, field) in [
-        (&req.tools, "tools"),
-        (&req.tool_choice, "tool_choice"),
-        (&req.functions, "functions"),
-        (&req.function_call, "function_call"),
-        (&req.response_format, "response_format"),
-    ] {
-        if val.as_ref().is_some_and(|v| !v.is_null()) {
+    if req.response_format.as_ref().is_some_and(|v| !v.is_null()) {
+        return crate::serve::api_error(
+            axum::http::StatusCode::BAD_REQUEST,
+            "`response_format` is not implemented by this server; it is refused rather than \
+             ignored, because ignoring it returns a confidently wrong answer",
+            "invalid_request_error",
+            Some("unsupported_parameter"),
+            Some("response_format".into()),
+        );
+    }
+    // TOOLS: served when the model's own template renders them and its call syntax is one
+    // `serve::tools` parses; refused otherwise (see `tools::request::plan`).
+    let tool_support = if state.chat_templated(&req.model) {
+        state.registry.get(&req.model).ok().and_then(|b| b.chat_template().map(|t| t.tools))
+    } else {
+        None
+    };
+    let tool_plan = match crate::serve::tools::request::plan(&req, tool_support) {
+        Ok(p) => p,
+        Err(r) => {
             return crate::serve::api_error(
                 axum::http::StatusCode::BAD_REQUEST,
-                format!(
-                    "`{field}` is not implemented by this server; it is refused rather than \
-                     ignored, because ignoring it returns a confidently wrong answer"
-                ),
+                r.message,
                 "invalid_request_error",
-                Some("unsupported_parameter"),
-                Some(field.into()),
-            );
+                Some(r.code),
+                Some(r.param.into()),
+            )
         }
-    }
+    };
 
     // OpenAI's schema requires at least one message, and answering an empty
     // conversation means generating from a bare generation prompt: the model
@@ -204,38 +227,35 @@ async fn chat_completions_with(
     // reference path keeps the simple role-prefix flatten — its logits are a
     // stand-in, so a template would be costume jewelry there.
     let mut template_error: Option<String> = None;
+    let mut request_error: Option<crate::serve::tools::request::Refusal> = None;
     let mut no_template: Option<String> = None;
     let render_opts = crate::serve::template::RenderOpts {
         kwargs: req.chat_template_kwargs.clone().unwrap_or_default(),
         reasoning_effort: req.reasoning_effort.clone(),
         continue_final_message: req.continue_final_message.unwrap_or(false),
+        tools: tool_plan.template_tools.clone(),
     };
-    let prompt = crate::obs::ttft::timed(&crate::obs::ttft::TEMPLATE, || {
-        if state.has_gpu_engine(&req.model) {
+    let mut prompt = crate::obs::ttft::timed(&crate::obs::ttft::TEMPLATE, || {
+        if state.chat_templated(&req.model) {
             let tok = state.registry.get(&req.model).ok();
             // THE CHECKPOINT'S OWN TEMPLATE FIRST. The built-in per-family
             // builders are the fallback for checkpoints that ship none — they
             // are an approximation of a file the weights already carry, and
             // every divergence between the two is a wrong prompt.
             if let Some(t) = tok.as_deref().and_then(|b| b.chat_template()) {
-                let msgs: Vec<serde_json::Value> = req
-                    .messages
-                    .iter()
-                    .map(|m| {
-                        serde_json::json!({
-                            "role": m.role,
-                            "content": m.text(),
-                        })
-                    })
-                    .collect();
-                match t.render_with(&msgs, &render_opts) {
+                use crate::serve::tools::request::{render, RenderError};
+                match render(t, &req.messages, &render_opts) {
                     Ok(p) => return p,
-                    Err(e) => {
-                        // The template REFUSED this conversation (HF templates
-                        // call `raise_exception` for shapes they cannot render,
-                        // e.g. an out-of-order role sequence). Surface it as a
-                        // 400 rather than silently rendering something else.
+                    // The template REFUSED this conversation (HF templates call
+                    // `raise_exception` for shapes they cannot render, e.g. an
+                    // out-of-order role sequence). Surface it as a 400 rather than
+                    // silently rendering something else.
+                    Err(RenderError::Template(e)) => {
                         template_error = Some(e);
+                        return String::new();
+                    }
+                    Err(RenderError::Request(r)) => {
+                        request_error = Some(r);
                         return String::new();
                     }
                 }
@@ -276,6 +296,15 @@ async fn chat_completions_with(
             "invalid_request_error",
             Some("chat_template_missing"),
             Some("messages".into()),
+        );
+    }
+    if let Some(r) = request_error {
+        return crate::serve::api_error(
+            axum::http::StatusCode::BAD_REQUEST,
+            r.message,
+            "invalid_request_error",
+            Some(r.code),
+            Some(r.param.into()),
         );
     }
     if let Some(e) = template_error {
@@ -352,35 +381,43 @@ async fn chat_completions_with(
         );
     }
 
-    // NO VISION PATH EXISTS. `Content::as_text()` flattens a multipart message by
-    // keeping the `Text` parts and dropping everything else, so an `image_url`
-    // part is discarded and the model answers from the surrounding text alone —
-    // fluently, and about the wrong question. `Content::has_image` was written
-    // for exactly this check and had NO CALLERS, so the drop was silent.
-    //
-    // This is the same failure the compile-time refusals guard against
-    // (`nn-graph`'s kimi_k3 builder and `plowc`'s `synth_kimi_k3` both refuse a
-    // `vision_config` rather than build a text tower that is "silently wrong on
-    // every image prompt"). Those cover the COMPILER. Nothing covered the
-    // SERVER, so a text-tower build of any multimodal checkpoint — Kimi-K3,
-    // Gemma-4, Qwen-VL — would take an image request and quietly ignore it.
-    //
-    // Refused rather than errored later: the request never becomes a token, so
-    // it is not counted, not tokenized and not admitted.
-    if req.messages.iter().any(|m| m.has_image()) {
-        return crate::serve::api_error(
-            axum::http::StatusCode::BAD_REQUEST,
-            "this build serves the TEXT tower only and has no vision stage; an image part \
-             would be silently dropped, so the request is refused",
-            "invalid_request_error",
-            Some("unsupported_parameter"),
-            Some("messages[].content".into()),
-        );
-    }
+    // MEDIA PARTS (`serve::mm`): image and audio parts are encoded by the encoders the model's
+    // packet carries and replace the placeholders its own template renders. A part the model
+    // has no encoder for is refused before it becomes a token: dropping it (`Content::as_text`
+    // keeps only text) would answer about the wrong question, fluently.
+    // Encoding waits for the rank: its encoders and slab are that engine's own.
+    let mm_contract = match crate::serve::mm::media_parts(&req.messages).as_slice() {
+        [] => None,
+        parts => {
+            let contract = state
+                .registry
+                .get(&req.model)
+                .ok()
+                .filter(|_| state.has_gpu_engine(&req.model))
+                .and_then(|b| b.serve().multimodal.clone());
+            let missing = parts
+                .iter()
+                .filter_map(|p| p.media_kind())
+                .find(|k| contract.as_ref().is_none_or(|c| c.modality(k).is_none()));
+            if let Some(kind) = missing {
+                return crate::serve::api_error(
+                    axum::http::StatusCode::BAD_REQUEST,
+                    format!("unsupported content type for this model: {kind}"),
+                    "invalid_request_error",
+                    Some("unsupported_parameter"),
+                    Some("messages[].content".into()),
+                );
+            }
+            contract
+        }
+    };
 
     // Route to the per-model muxer. Tokens stream back as `StreamChunk`s over
     // an mpsc — the muxer produces one per generated token, ending with `Done`.
-    let (Some(mux), Ok(bundle)) = (state.mux(&req.model), state.registry.get(&req.model)) else {
+    // A data-parallel model picks its rank after tokenizing (the prefix probe needs the ids).
+    let dp = state.dp_set(&req.model);
+    let direct = if dp.is_some() { None } else { state.mux(&req.model) };
+    let (true, Ok(bundle)) = (dp.is_some() || direct.is_some(), state.registry.get(&req.model)) else {
         return crate::serve::api_error(
             axum::http::StatusCode::NOT_FOUND,
             format!("no model registered for '{}'.", req.model),
@@ -389,7 +426,7 @@ async fn chat_completions_with(
             Some("model".into()),
         );
     };
-    let ingress = mux.ingress();
+    let ingress = direct.as_ref().map(|m| m.ingress());
     // Tokenize HERE, on the handler task — the dispatcher loop is the
     // serialized decode critical path and must never encode a long prompt.
     // The packet's reasoning markers (`<think>` for a legacy packet): the splitter's own
@@ -398,13 +435,33 @@ async fn chat_completions_with(
     // only whether the trace is already open (GLM leaves it dangling; Qwen3 and DeepSeek-R1 emit
     // the marker themselves).
     let reasoning_mode = crate::serve::reasoning::ReasoningMode::for_bundle(&bundle);
-    let reasoning_open = reasoning_mode.prompt_opens(&prompt);
+    let mut reasoning_open = reasoning_mode.prompt_opens(&prompt);
+    // A forced `tool_choice` writes the call's opener for the model, so the generation starts
+    // inside the call (after closing a trace the prompt left open), and is validated at the end.
+    let opener = tool_plan.parse.as_ref().and_then(|s| s.opener());
+    if let Some(o) = &opener {
+        if reasoning_open {
+            prompt.push_str(reasoning_mode.close_marker().unwrap_or_default());
+            reasoning_open = false;
+        }
+        prompt.push_str(o);
+    }
+    let tool_stream = response_stream(&tool_plan, tool_support, reasoning_mode, reasoning_open, &bundle, req.stream, opener.as_deref());
+    gen.keep_special_tokens = tool_stream.is_some();
+    let include_reasoning = req.include_reasoning.unwrap_or(true);
     if let Some(e) = crate::serve::prompt_bytes_overflow(state.max_ctx(&req.model), bundle.tokenizer().max_token_bytes(), prompt.len()) {
         return crate::serve::api_error_for(&e);
     }
-    let prompt_ids = crate::obs::ttft::timed(&crate::obs::ttft::ENCODE, || {
+    let mut prompt_ids = crate::obs::ttft::timed(&crate::obs::ttft::ENCODE, || {
         crate::serve::encode_prompt(&prompt, |p| bundle.tokenizer().encode(p))
     });
+    let mm_pending = match &mm_contract {
+        Some(c) => match crate::serve::mm::expand(c, &req.messages, &mut prompt_ids, crate::serve::mm::Limits::from_env()).await {
+            Ok(p) => p,
+            Err(e) => return mm_error(e),
+        },
+        None => None,
+    };
     let n_prompt = prompt_ids.len();
     if prompt_ids.is_empty() {
         return crate::serve::api_error(
@@ -425,6 +482,36 @@ async fn chat_completions_with(
         tok: bundle.tokenizer().clone(),
         as_ids: req.return_tokens_as_token_ids.unwrap_or(false),
     });
+    let routed;
+    let (mut rank, mut prefix, mut _pick) = (0, None, None);
+    let mux = match (&direct, dp) {
+        (Some(m), _) => m,
+        (None, Some(set)) => match state.dp_route(set, ids.session.as_deref(), Some(&prompt_ids), 0) {
+            Some((r, m, key, pick)) => {
+                (rank, prefix, _pick) = (r, key, Some(pick));
+                routed = m;
+                &routed
+            }
+            None => return dp_unavailable(&req.model),
+        },
+        (None, None) => unreachable!("checked at lookup"),
+    };
+    if prefix.is_none() {
+        prefix = mux.prefix_key(&prompt_ids);
+    }
+    let key = dp.map_or(req.model.as_str(), |set| set.ranks[rank].key.as_str());
+    let mm_job = match mm_pending {
+        Some(p) => {
+            let Some(mm) = state.mm_model(key) else {
+                return mm_error(crate::serve::mm::MmError { status: 503, message: "model is not loaded; retry".into() });
+            };
+            match crate::serve::mm::encode(&mm, p).await {
+                Ok(job) => Some(job),
+                Err(e) => return mm_error(e),
+            }
+        }
+        None => None,
+    };
     let (tx, rx) = stream_mod::channel();
     let Some(in_flight) = ids.begin(&req.model) else {
         return crate::serve::api_error(
@@ -439,7 +526,7 @@ async fn chat_completions_with(
         ids,
         crate::serve::turns::Kind::Llm,
         &req.model,
-        Some(state.model_metrics(&req.model)),
+        Some(state.model_metrics(key)),
         t_arrive,
         true,
     );
@@ -454,13 +541,16 @@ async fn chat_completions_with(
             session,
             turn: run.key(),
             continuing: run.continuing(),
+            tenant: ids.tenant,
+            prefix: prefix.take(),
+            mm: mm_job,
             ..Default::default()
         },
     };
     if crate::obs::host::on() {
         crate::obs::host::submitted(n_prompt, t_arrive.elapsed());
     }
-    if let Err(err) = mux.submit_arrived(job, t_arrive, Some(ingress)) {
+    if let Err(err) = state.submit_routed(dp.map(|s| (&**s, rank)), ids.session.as_deref(), mux, job, t_arrive, ingress) {
         return match err {
             crate::serve::mux::SubmitError::Full(_) => {
                 crate::serve::api_error(
@@ -499,7 +589,9 @@ async fn chat_completions_with(
             created,
             reasoning_mode,
             reasoning_open,
+            include_reasoning,
             lp_fmt,
+            tool_stream,
             run,
         );
         let mut response = crate::serve::session::hold_until_sent(sse.into_response(), in_flight);
@@ -513,7 +605,9 @@ async fn chat_completions_with(
             created,
             reasoning_mode,
             reasoning_open,
+            include_reasoning,
             lp_fmt,
+            tool_stream,
             run,
         )
         .await
@@ -522,6 +616,64 @@ async fn chat_completions_with(
         cache.stamp(&mut response);
     }
     response
+}
+
+/// The response-side state machine when the plain reasoning split is not enough: the request
+/// declares tools, the format frames every answer (harmony), or the reasoning markers are special
+/// tokens (Gemma 4's thought channel) and must be decoded to be seen.
+fn response_stream(
+    plan: &crate::serve::tools::request::Plan,
+    support: Option<crate::serve::tools::ToolSupport>,
+    mode: crate::serve::reasoning::ReasoningMode,
+    reasoning_open: bool,
+    bundle: &crate::asset::ModelBundle,
+    stream: bool,
+    opener: Option<&str>,
+) -> Option<crate::serve::tools::stream::ToolStream> {
+    use crate::serve::tools::{request::ParseSpec, ToolFormat, ToolSupport};
+    let spec = plan.parse.clone().or(match support {
+        Some(ToolSupport::Format(f @ ToolFormat::Harmony)) => Some(ParseSpec::plain(f)),
+        _ => None,
+    });
+    if spec.is_none() && !bundle.reasoning_in_specials() {
+        return None;
+    }
+    let mut ts = crate::serve::tools::stream::ToolStream::new(spec.as_ref(), mode, reasoning_open, bundle.special_text().clone(), stream);
+    if let Some(o) = opener {
+        ts.prime(o);
+    }
+    Some(ts)
+}
+
+/// The model's tool call failed validation (`strict`, or a forced `tool_choice`).
+fn tool_call_error(message: &str) -> crate::serve::openai::ApiErrorBody {
+    crate::serve::openai::ApiErrorBody::new(message, "server_error", Some("invalid_tool_call"), None)
+}
+
+fn mm_error(e: crate::serve::mm::MmError) -> Response {
+    let mut r = crate::serve::api_error(
+        axum::http::StatusCode::from_u16(e.status).unwrap_or(axum::http::StatusCode::BAD_REQUEST),
+        e.message,
+        if e.status == 400 { "invalid_request_error" } else { "server_error" },
+        (e.status == 400).then_some("invalid_value"),
+        Some("messages[].content".into()),
+    );
+    // Transient refusals (full slab, encoder restarting): rows free as in-flight requests finish.
+    if e.status == 503 {
+        r.headers_mut().insert(axum::http::header::RETRY_AFTER, axum::http::HeaderValue::from_static("1"));
+    }
+    r
+}
+
+/// No rank of a data-parallel model is serving (all unloading, or each refused the request).
+pub(crate) fn dp_unavailable(model: &str) -> Response {
+    crate::serve::api_error(
+        axum::http::StatusCode::SERVICE_UNAVAILABLE,
+        format!("no data-parallel rank of '{model}' is serving; retry"),
+        "server_error",
+        None,
+        None,
+    )
 }
 
 /// Pick the chat template a GPU-served model wants.
@@ -771,9 +923,12 @@ async fn buffer_and_reply(
     created: u64,
     reasoning_mode: crate::serve::reasoning::ReasoningMode,
     reasoning_open: bool,
+    include_reasoning: bool,
     lp_fmt: Option<crate::serve::logprobs::TokenText>,
+    mut tools: Option<crate::serve::tools::stream::ToolStream>,
     mut run: crate::serve::turns::StageRun,
 ) -> Response {
+    let mut calls: Vec<crate::serve::openai::ToolCall> = Vec::new();
     let mut text = String::new();
     let mut lp_content = Vec::new();
     // Driven PER TOKEN, exactly as the streamed path drives it — same type,
@@ -801,9 +956,21 @@ async fn buffer_and_reply(
                     lp_content.push(crate::serve::logprobs::chat_entry(fmt, id, lp));
                 }
                 text.push_str(&delta);
-                let (r, c) = split.push(&delta);
-                reasoning_buf.push_str(&r.unwrap_or_default());
-                answer_buf.push_str(&c.unwrap_or_default());
+                match tools.as_mut() {
+                    Some(ts) => {
+                        let st = ts.push(&delta);
+                        reasoning_buf.push_str(st.reasoning.unwrap_or_default());
+                        answer_buf.push_str(st.content.unwrap_or_default());
+                        if let Some(e) = ts.error() {
+                            return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, Json(tool_call_error(e))).into_response();
+                        }
+                    }
+                    None => {
+                        let (r, c) = split.push(&delta);
+                        reasoning_buf.push_str(&r.unwrap_or_default());
+                        answer_buf.push_str(&c.unwrap_or_default());
+                    }
+                }
             }
             StreamChunk::Done {
                 reason, usage: u, ..
@@ -846,21 +1013,41 @@ async fn buffer_and_reply(
     // and the trace goes to `reasoning_content`, which is where a reasoning
     // model's clients look for it. A model that never opened a trace is
     // unaffected — `split_reasoning` returns the whole string as the answer.
-    let (r, c) = split.finish();
-    reasoning_buf.push_str(&r.unwrap_or_default());
-    answer_buf.push_str(&c.unwrap_or_default());
+    match tools.as_mut() {
+        Some(ts) => {
+            let st = ts.finish(!matches!(finish, stream_mod::FinishReason::Stop));
+            reasoning_buf.push_str(st.reasoning.unwrap_or_default());
+            answer_buf.push_str(st.content.unwrap_or_default());
+            if let Some(e) = ts.error() {
+                return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, Json(tool_call_error(e))).into_response();
+            }
+            calls = ts.take_calls();
+        }
+        None => {
+            let (r, c) = split.finish();
+            reasoning_buf.push_str(&r.unwrap_or_default());
+            answer_buf.push_str(&c.unwrap_or_default());
+        }
+    }
     let reasoning = {
         let t = reasoning_buf.trim();
-        (!t.is_empty()).then(|| t.to_string())
+        (include_reasoning && !t.is_empty()).then(|| t.to_string())
     };
-    let answer = answer_buf;
-    if split.trace_tokens > 0 {
+    // A turn that is only calls answers `content: null`, as OpenAI does.
+    let answer = (calls.is_empty() || !answer_buf.trim().is_empty()).then_some(answer_buf);
+    let trace_tokens = tools.as_ref().map_or(split.trace_tokens, |ts| ts.split.trace_tokens);
+    if trace_tokens > 0 {
         if let Some(u) = usage.as_mut() {
             u.completion_tokens_details = Some(CompletionTokensDetails {
-                reasoning_tokens: split.trace_tokens,
+                reasoning_tokens: trace_tokens,
             });
         }
     }
+    // `tool_calls` only for a turn that ended on its own: a cut-off turn stays "length".
+    let finish_reason = match finish {
+        stream_mod::FinishReason::Stop if !calls.is_empty() => "tool_calls",
+        f => f.as_openai(),
+    };
     run.done();
     let mut response = Json(ChatResponse {
         id: request_id.clone(),
@@ -869,10 +1056,11 @@ async fn buffer_and_reply(
         model,
         choices: vec![Choice {
             index: 0,
-            message: Message {
-                role: "assistant".into(),
-                content: Some(Content::Text(answer)),
+            message: ResponseMessage {
+                role: "assistant",
+                content: answer,
                 reasoning_content: reasoning,
+                tool_calls: (!calls.is_empty()).then_some(calls),
             },
             logprobs: lp_fmt.map(|_| crate::serve::logprobs::ChatLogprobs { content: lp_content }),
             // The WIRE value, which is not always the internal one: a
@@ -881,7 +1069,7 @@ async fn buffer_and_reply(
             // sight. Collapsing it to "stop" would be worse still — a
             // truncated answer claiming to be complete — so the real cause
             // rides along in `x_plow_finish_reason`.
-            finish_reason: Some(finish.as_openai()),
+            finish_reason: Some(finish_reason),
             x_plow_finish_reason: finish.is_vendor_specific().then(|| finish.as_str()),
         }],
         usage,
@@ -889,6 +1077,13 @@ async fn buffer_and_reply(
     .into_response();
     run.stamp(&mut response);
     response
+}
+
+/// An error object in its own SSE frame; the stream then ends without `[DONE]`.
+fn sse_error(body: &crate::serve::openai::ApiErrorBody) -> Bytes {
+    let data = serde_json::to_string(body)
+        .unwrap_or_else(|_| "{\"error\":{\"message\":\"stream error\",\"type\":\"server_error\"}}".to_string());
+    stream_mod::sse_data(&data)
 }
 
 /// Streaming path: one SSE `chat.completion.chunk` frame per produced token,
@@ -921,44 +1116,63 @@ fn sse_response(
     created: u64,
     reasoning_mode: crate::serve::reasoning::ReasoningMode,
     reasoning_open: bool,
+    include_reasoning: bool,
     lp_fmt: Option<crate::serve::logprobs::TokenText>,
+    tools: Option<crate::serve::tools::stream::ToolStream>,
     run: crate::serve::turns::StageRun,
-) -> Sse<impl Stream<Item = Result<Event, std::convert::Infallible>>> {
+) -> Response {
 
     // State threaded through the unfold: the receiver, and the tail frames
     // (optional usage-only chunk, then [DONE]) drained one per poll.
     struct SseState {
         rx: stream_mod::ChunkReceiver,
         done: bool,
+        /// Frames the finish produced beyond its own, sent before the next receive.
+        queued: std::collections::VecDeque<Bytes>,
+        /// Set when the response needs more than the reasoning split (tools, harmony, special
+        /// reasoning markers); replaces `split`.
+        tools: Option<crate::serve::tools::stream::ToolStream>,
+        include_reasoning: bool,
         /// The `role` delta has not been sent yet — it rides the FIRST token.
         role_pending: bool,
         /// Routes each delta to `reasoning_content` or `content`. The SAME
         /// type the buffered path uses, so the two cannot disagree about one
         /// generation.
         split: crate::serve::reasoning::ReasoningSplit,
-        pending: std::collections::VecDeque<Event>,
+        pending: std::collections::VecDeque<Bytes>,
         run: crate::serve::turns::StageRun,
+        head: stream_mod::FrameHead,
+        request_id: String,
+        model: String,
+        lp_fmt: Option<crate::serve::logprobs::TokenText>,
     }
     let body = stream::unfold(
         SseState {
             rx,
             done: false,
+            queued: std::collections::VecDeque::new(),
+            tools,
+            include_reasoning,
             role_pending: true,
             split: crate::serve::reasoning::ReasoningSplit::new(reasoning_mode, reasoning_open),
             pending: std::collections::VecDeque::new(),
             run,
+            head: stream_mod::FrameHead::new(&request_id, "chat.completion.chunk", created, &model),
+            request_id,
+            model,
+            lp_fmt,
         },
         move |mut st| {
-            let model = model.clone();
-            let request_id = request_id.clone();
-            let lp_fmt = lp_fmt.clone();
             async move {
                 if st.done {
                     return None;
                 }
+                if let Some(ev) = st.queued.pop_front() {
+                    return Some((ev, st));
+                }
                 if let Some(ev) = st.pending.pop_front() {
                     st.done = st.pending.is_empty();
-                    return Some((Ok(ev), st));
+                    return Some((ev, st));
                 }
                 let chunk = match st.rx.recv().await {
                     Some(c) => c,
@@ -972,7 +1186,7 @@ fn sse_response(
                         // server-side, because a bench client scores this as a
                         // successful request with fewer output tokens.
                         tracing::warn!(
-                            %model,
+                            model = %st.model,
                             "chat: SSE stream ended with no terminal chunk (slot cut) \
                              — no finish_reason, no [DONE]"
                         );
@@ -981,7 +1195,7 @@ fn sse_response(
                 };
                 let (frame, terminate) = match chunk {
                     StreamChunk::Token { id, text, logprobs } => {
-                        let logprobs = lp_fmt.as_ref().map(|fmt| crate::serve::logprobs::ChatLogprobs {
+                        let logprobs = st.lp_fmt.as_ref().map(|fmt| crate::serve::logprobs::ChatLogprobs {
                             content: logprobs
                                 .iter()
                                 .map(|lp| crate::serve::logprobs::chat_entry(fmt, id, lp))
@@ -1000,43 +1214,90 @@ fn sse_response(
                                 crate::obs::host::first_frame(n_prompt, t_arrive.elapsed());
                             }
                         }
-                        let (reasoning, content) = st.split.push(&text);
-                        let ch = ChatChunk {
-                            id: request_id.clone(),
+                        let frame = match st.tools.as_mut() {
+                            Some(ts) => {
+                                let f = ts.push(&text).frame(&st.head, role, logprobs.as_ref(), st.include_reasoning, None);
+                                if let Some(e) = ts.error() {
+                                    tracing::warn!(model = %st.model, error = %e, "chat: tool call failed validation");
+                                    st.done = true;
+                                    return Some((sse_error(&tool_call_error(e)), st));
+                                }
+                                f
+                            }
+                            None => {
+                                let (reasoning, content) = st.split.push(&text);
+                                st.head.frame(&ChunkChoice {
+                                    index: 0,
+                                    delta: Delta {
+                                        role,
+                                        content,
+                                        reasoning_content: reasoning.filter(|_| st.include_reasoning),
+                                        tool_calls: None,
+                                    },
+                                    logprobs,
+                                    finish_reason: None,
+                                    x_plow_finish_reason: None,
+                                })
+                            }
+                        };
+                        (frame, false)
+                    }
+                    StreamChunk::Done { reason, usage, .. } if st.tools.is_some() => {
+                        let ts = st.tools.as_mut().expect("checked");
+                        let s = ts.finish(!matches!(reason, stream_mod::FinishReason::Stop));
+                        let tail = (!s.is_empty(st.include_reasoning)).then(|| s.frame(&st.head, None, None, st.include_reasoning, None));
+                        if let Some(e) = ts.error() {
+                            tracing::warn!(model = %st.model, error = %e, "chat: tool call failed validation");
+                            st.done = true;
+                            return Some((sse_error(&tool_call_error(e)), st));
+                        }
+                        let finish = match reason {
+                            stream_mod::FinishReason::Stop if ts.calls() > 0 => "tool_calls",
+                            r => r.as_openai(),
+                        };
+                        let trace_tokens = ts.split.trace_tokens;
+                        let mut frames: Vec<Bytes> = tail.into_iter().collect();
+                        let mut last = ChatChunk {
+                            id: st.request_id.clone(),
                             object: "chat.completion.chunk",
                             created,
-                            model,
+                            model: st.model.clone(),
                             choices: vec![ChunkChoice {
                                 index: 0,
-                                delta: Delta {
-                                    role,
-                                    content,
-                                    reasoning_content: reasoning,
-                                },
-                                logprobs,
-                                finish_reason: None,
-                                x_plow_finish_reason: None,
+                                delta: Delta { role: None, content: None, reasoning_content: None, tool_calls: None },
+                                logprobs: None,
+                                finish_reason: Some(finish),
+                                x_plow_finish_reason: reason.is_vendor_specific().then(|| reason.as_str()),
                             }],
                             usage: None,
                         };
-                        (Event::default().data(stream_mod::chunk_data(&ch)), false)
+                        frames.push(stream_mod::sse_data(&stream_mod::chunk_data(&last)));
+                        if include_usage {
+                            let mut u: Usage = usage.into();
+                            if trace_tokens > 0 {
+                                u.completion_tokens_details = Some(CompletionTokensDetails { reasoning_tokens: trace_tokens });
+                            }
+                            last.choices.clear();
+                            last.usage = Some(u);
+                            st.pending.push_back(stream_mod::sse_data(&stream_mod::chunk_data(&last)));
+                        }
+                        let mut frames = frames.into_iter();
+                        let first = frames.next().expect("the finish frame");
+                        st.queued.extend(frames);
+                        (first, true)
                     }
                     StreamChunk::Done { reason, usage, .. } => {
                         // FLUSH. Whatever the splitter still holds belongs to
                         // this generation; abandoning it truncated the streamed
                         // `reasoning_content` against the buffered path.
                         let (flushed_r, flushed_c) = st.split.finish();
-                        let ch = ChatChunk {
-                            id: request_id.clone(),
-                            object: "chat.completion.chunk",
-                            created,
-                            model: model.clone(),
-                            choices: vec![ChunkChoice {
+                        let ch = ChunkChoice {
                                 index: 0,
                                 delta: Delta {
                                     role: None,
                                     content: flushed_c,
-                                    reasoning_content: flushed_r,
+                                    reasoning_content: flushed_r.filter(|_| st.include_reasoning),
+                                    tool_calls: None,
                                 },
                                 logprobs: None,
                                 // The wire value: "preempted" is not an OpenAI
@@ -1047,17 +1308,15 @@ fn sse_response(
                                 x_plow_finish_reason: reason
                                     .is_vendor_specific()
                                     .then(|| reason.as_str()),
-                            }],
-                            usage: None,
                         };
                         if include_usage {
                             // OpenAI stream-usage shape: a separate chunk with
                             // EMPTY choices carries usage, never the finish chunk.
                             let uch = ChatChunk {
-                                id: request_id.clone(),
+                                id: st.request_id.clone(),
                                 object: "chat.completion.chunk",
                                 created,
-                                model,
+                                model: st.model.clone(),
                                 choices: Vec::new(),
                                 usage: Some({
                                     let mut u: Usage = usage.into();
@@ -1071,9 +1330,9 @@ fn sse_response(
                                 }),
                             };
                             st.pending
-                                .push_back(Event::default().data(stream_mod::chunk_data(&uch)));
+                                .push_back(stream_mod::sse_data(&stream_mod::chunk_data(&uch)));
                         }
-                        (Event::default().data(stream_mod::chunk_data(&ch)), true)
+                        (st.head.frame(&ch), true)
                     }
                     StreamChunk::Err(e) => {
                         // AN ERROR IS AN ERROR OBJECT, NOT ASSISTANT TEXT.
@@ -1093,34 +1352,28 @@ fn sse_response(
                         // in its own frame, and NO `[DONE]` — a client that
                         // sees the stream end without `[DONE]` knows it was
                         // cut. This is the shape vLLM uses for the same case.
-                        tracing::warn!(%model, error = %e, "chat: SSE stream error");
+                        tracing::warn!(model = %st.model, error = %e, "chat: SSE stream error");
                         let body = crate::serve::openai::ApiErrorBody::new(
                             e.to_string(),
                             "server_error",
                             None,
                             None,
                         );
-                        let data = serde_json::to_string(&body)
-                            .unwrap_or_else(|_| {
-                                "{\"error\":{\"message\":\"stream error\",\"type\":\"server_error\"}}"
-                                    .to_string()
-                            });
                         st.done = true;
-                        return Some((Ok(Event::default().data(data)), st));
+                        return Some((sse_error(&body), st));
                     }
                 };
                 if terminate {
                     st.run.done();
-                    st.pending.push_back(st.run.sse_comment());
-                    st.pending
-                        .push_back(Event::default().data(stream_mod::DONE));
+                    st.pending.push_back(st.run.sse_comment_frame());
+                    st.pending.push_back(stream_mod::sse_data(stream_mod::DONE));
                 }
-                Some((Ok(frame), st))
+                Some((frame, st))
             }
         },
     );
 
-    Sse::new(body)
+    stream_mod::sse_response(body)
 }
 
 #[cfg(test)]
@@ -1136,7 +1389,7 @@ mod tests {
         Message {
             role: role.into(),
             content: Some(crate::serve::openai::Content::Text(text.into())),
-            reasoning_content: None,
+            ..Default::default()
         }
     }
 

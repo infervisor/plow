@@ -85,10 +85,12 @@ pub mod manifest;
 pub mod modular;
 mod mxfp4_moe_role;
 pub mod pipeline;
+pub mod mm;
 mod projection_rewrite;
 mod rewrite_lower;
 pub mod rnnt;
 pub mod tts;
+pub mod vad;
 pub mod codec;
 pub mod s3gen;
 pub mod tune_demand;
@@ -1838,6 +1840,11 @@ struct Tn {
     ids: u32,
     encoder_overlay: u32,
     encoder_overlay_index: u32,
+    // Multimodal soft-token rows: `(id, slab row)` table and the bf16 slab (TENSOR_NONE: off).
+    mm_table: u32,
+    mm_slab: u32,
+    // Per prefill row, the rows after it in its bidirectional media span (`MmSpanExtent`).
+    mm_span: u32,
     // Chatterbox T3 decode: per-slot speech start and the learned speech-position table.
     pos_base: u32,
     speech_pos: u32,
@@ -1939,9 +1946,12 @@ struct Tn {
     moe_fug: u32,
     // beat26b w8a8 grouped-MoE prefill: fp8 twin of the gathered GLU output `fug` (uint8
     // [total_pad*moe_inter] e4m3 + f32 fscale[total_pad]), quantized by QuantFp8 between the w8a8
-    // GLU and DOWN. TENSOR_NONE unless moe_pf && w8a8. (xn2 reuses xqh/ash — same hidden width.)
+    // GLU and DOWN. TENSOR_NONE unless moe_pf && w8a8. xn2's e4m3 rows also land in `fuq` (their
+    // scales in `xas`), never in xqh/ash: the dense GLU reads xqh/ash on a branch that does not
+    // order against the MoE one.
     moe_fuq: u32,
     moe_fus: u32,
+    moe_xas: u32,
     // T8 w8a8: reused-per-layer fp8 ACTIVATION quant scratch (uint8 xq + f32 row a_scale), one pair
     // per distinct activation width. Emitted only under PLOW_W8A8; TENSOR_NONE otherwise.
     //   xqh/ash  — hidden-width (q/k/v read n.hn; gate/up read n.hn again).
@@ -2173,6 +2183,21 @@ fn declare(
         },
         encoder_overlay_index: if c.encoder_overlay_rows > 0 {
             b.tensor("in.encoder_overlay_index", ctx as u64 * I32)
+        } else {
+            TENSOR_NONE
+        },
+        mm_table: if c.mm_slab_rows > 0 {
+            b.tensor(plow_asset::multimodal::TABLE_TENSOR, u64::from(mm_table_capacity(c)) * 8)
+        } else {
+            TENSOR_NONE
+        },
+        mm_slab: if c.mm_slab_rows > 0 {
+            b.tensor(plow_asset::multimodal::SLAB_TENSOR, u64::from(c.mm_slab_rows) * u64::from(c.hidden) * BF16)
+        } else {
+            TENSOR_NONE
+        },
+        mm_span: if c.mm_spans {
+            b.tensor("act.mm_span", rows as u64 * I32)
         } else {
             TENSOR_NONE
         },
@@ -2486,6 +2511,11 @@ fn declare(
         },
         moe_fus: if moe_pf_on && w8a8 {
             ac(b, "moe.fus", total_pad as u64 * F32)
+        } else {
+            TENSOR_NONE
+        },
+        moe_xas: if moe_pf_on && w8a8 {
+            ac(b, "moe.xas", rows as u64 * F32)
         } else {
             TENSOR_NONE
         },
@@ -4195,9 +4225,24 @@ fn emit_phase(
             d.t[2] = n.ids;
             d.i[0] = t;
             d.i[1] = c.hidden;
+            d.i[2] = c.mm_pad;
             d.f[0] = escale;
         })
     };
+    // Multimodal soft-token rows replace their embedded rows before anything reads `x` (the
+    // E-series per-layer projection reads the merged rows; its token part embeds them as pad).
+    if !decode && !block_mode && c.mm_slab_rows > 0 {
+        dep = b.emit(DevOp::MmRowsBf16, rows.clone(), &[dep], |d| {
+            d.t[..4].copy_from_slice(&[n.x, n.ids, n.mm_table, n.mm_slab]);
+            d.i[..4].copy_from_slice(&[t, c.hidden, mm_table_capacity(c), c.mm_slab_rows]);
+        });
+        if c.mm_spans {
+            dep = b.emit(DevOp::MmSpanExtent, rows.clone(), &[dep], |d| {
+                d.t[..2].copy_from_slice(&[n.mm_span, n.ids]);
+                d.i[0] = t;
+            });
+        }
+    }
     // Gemma-4 E-series PER-LAYER INPUTS (dev_isa.h op 155), once per token for all layers:
     // ple_raw = embed_per_layer[ids] * sqrt(P); ple_pp = x . Wproj^T (the 1/sqrt(H) is dropped:
     // the RMSNorm that follows is scale-invariant); ple = (RMSNorm_P(ple_pp) * gamma + ple_raw) / sqrt(2).
@@ -4216,6 +4261,7 @@ fn emit_phase(
             d.t[2] = n.ids;
             d.i[0] = t;
             d.i[1] = lp;
+            d.i[2] = c.mm_pad;
             // HF casts the scale to the weight dtype (bf16) before multiplying.
             d.f[0] = crate::config::bf16_round((c.ple as f32).sqrt());
         });
@@ -4434,9 +4480,12 @@ fn emit_phase(
             // sm_90a TMA (see `tmap` above): w8a8 only — both operands are e4m3 tensors
             // the TMA e4m3 maps can describe. The w8a16 body keeps cp.async (its A is
             // bf16 and its weight is dequanted in-kernel; no TMA arm exists for it).
+            // The e4m3 maps use a 128-wide inner box: K = 2112 (26B-A4B down_proj) keeps
+            // cp.async, as the live-KV manifest requires.
             let tm8 = (tma_gemm
                 && !fp8_lt_decode
                 && w8a8
+                && k % 128 == 0
                 && matches!(op, DevOp::GemmFp8 | DevOp::GemmMedFp8 | DevOp::GemmSmallFp8))
             .then(|| (tmap8(xq, m, k), tmap8(w8, nn, k)));
             return b.emit(op, cus, deps, |d| {
@@ -5746,6 +5795,17 @@ fn emit_phase(
             };
             let fa_tm = (tma_gemm && !fp8_kv && (hd == 256 || hd == 512) && !gemv_family)
                 .then(|| tmap_kv(n.kc[l], n.vc[l], kvr, hd, kvh, box_rows));
+            // Bidirectional media spans attend on the sliding layers only (Gemma-4: the full
+            // layers stay causal), through the span-extent rows in i7's high half.
+            let span_attention = if c.mm_spans && win > 0 {
+                assert!(
+                    fp8_kv && fused && ns == 1 && n.mm_span != 0 && n.mm_span < TENSOR_NONE,
+                    "bidirectional media spans need the fused FP8-KV prefill attention (PLOW_FP8_KV)"
+                );
+                n.mm_span
+            } else {
+                0
+            };
             let fa_deps: Vec<u32> = if shared {
                 vec![c_qn]
             } else if c_vn == c_kn {
@@ -5782,7 +5842,7 @@ fn emit_phase(
                 d.i[4] = 0;
                 d.i[5] = win;
                 d.i[6] = hd;
-                d.i[7] = ns;
+                d.i[7] = ns | span_attention << 16;
                 d.f[0] = c.attn_scale;
                 d.j[0] = kvr;
                 d.j[1] = kvm; // head-major; RING on a sliding layer
@@ -6399,8 +6459,8 @@ fn emit_phase(
             // an expert read that expert's weight rows once from HBM (op_moe.cuh ordering note).
             let nb = if decode && t > 1 { t } else { 0 };
             assert!(
-                !decode || t <= 32,
-                "MoE decode batch is capped at 32 (per-CTA inv[] scratch, PLOW_MOE_MAXB)"
+                !decode || t <= 128,
+                "MoE decode batch is capped at 128 (per-CTA inv[] scratch, PLOW_MOE_MAXB)"
             );
             if decode {
                 // h1 = post_feedforward_layernorm_1(dense MLP output)
@@ -6692,8 +6752,15 @@ fn emit_phase(
                     d.f[0] = root;
                     d.f[1] = c.eps;
                 });
-                // align/sort (SINGLE block): histogram -> padded prefix -> scatter gather maps.
-                let c_align = b.emit(DevOp::MoeAlignGemmaPf, vec![0], &[c_rt], |d| {
+                // align/sort: histogram -> padded prefix -> scatter gather maps. BF16 CUDA scatters
+                // across every block from 1024 rows: every block histograms all T*k slots, and
+                // below that the single block measured the same (26B H100 packed prefill, 128-512
+                // tie; 1024 / 4096 / 15K -0.4 / -2.0 / -6.9 ms multi-block). The AMD op is
+                // single-block; on W8A8 a full-width align lets the shared-expert GEMMs interleave
+                // into the MoE cuBLASLt chain's stream window.
+                let align_cus =
+                    if emit_is_amd() || w8a8 || t < 1024 { vec![0] } else { all.clone() };
+                let c_align = b.emit(DevOp::MoeAlignGemmaPf, align_cus, &[c_rt], |d| {
                     d.t[0] = n.moe_meta;
                     d.t[1] = n.moe_tab;
                     d.t[2] = n.moe_rowtok;
@@ -6705,23 +6772,23 @@ fn emit_phase(
                 });
                 // grouped gate/up GEMM + GeGLU (gathered A, expert-selected B) -> fu_gathered.
                 // beat26b: w8a8 arm = native fp8 tensor-core GEMM (both operands e4m3). xn2 is quantized
-                // to e4m3 (xqh/ash, hidden width) once; the grouped GLU gathers e4m3 rows and dequants
+                // to e4m3 (fuq/xas, hidden width) once; the grouped GLU gathers e4m3 rows and dequants
                 // with a_scale[token]*w_scale[chan] in the epilogue. bf16 arm unchanged.
                 let c_dn = if w8a8 {
                     // total_pad rows the align op touched for THIS bucket (matches align's write extent).
                     let moe_total_pad = t * c.top_k + c.n_exp * 128;
-                    let c_xn2q = quant(b, n.xqh, n.ash, n.moe_xn2, c.hidden, c_xn2);
+                    let c_xn2q = quant(b, n.moe_fuq, n.moe_xas, n.moe_xn2, c.hidden, c_xn2);
                     let c_glu = b.emit(
                         DevOp::MoeGroupGluGemmaPfW8a8,
                         all.clone(),
                         &[c_align, c_xn2q],
                         |d| {
                             d.t[0] = n.moe_fug;
-                            d.t[1] = n.xqh; // xn2 e4m3
+                            d.t[1] = n.moe_fuq; // xn2 e4m3
                             d.t[2] = w.ewt; // fp8 expert weights
                             d.t[3] = n.moe_meta;
                             d.t[4] = n.moe_rowtok;
-                            d.t[5] = n.ash; // per-token a_scale
+                            d.t[5] = n.moe_xas; // per-token a_scale
                             d.t[6] = w.est; // per-channel weight scales
                             d.i[0] = c.moe_inter;
                             d.i[1] = c.hidden;
@@ -7552,7 +7619,7 @@ pub fn install_sidecar_verifier(verify: SidecarVerifier) {
 /// The sidecar's logical-effect obligations (one Lean check per distinct obligation), verified
 /// BEFORE its blob is written (a rejection aborts emission), then the blob and
 /// `<stem>.lean-checks.json`.
-fn write_sidecar_packet(
+pub fn write_sidecar_packet(
     path: &std::path::Path,
     model: &packet::devbuild::Model,
     sections: &[packet::devbuild::SectionData],
@@ -7754,6 +7821,15 @@ impl EmitArgs {
             whole_graph_fusions: WholeGraphFusionDecisions::default(),
         }
     }
+}
+
+fn ecfg_multimodal() -> bool {
+    emit_config::active().multimodal
+}
+
+/// `in.mm_table` entries for `c.mm_slab_rows` slab rows (load factor at most 1/2).
+fn mm_table_capacity(c: &Cfg) -> u32 {
+    (2 * c.mm_slab_rows).next_power_of_two()
 }
 
 /// Uniform surface for lowering a checkpoint into a PLOWDEV program set, per model
@@ -8164,7 +8240,7 @@ fn emit_capabilities(model_type: &str) -> EmitCapabilities {
         gemma,
         dense_packet_contracts: dense,
         decode_objects: dense || model_type == "qwen3_5",
-        cublaslt_decode: gemma || matches!(model_type, "llama" | "qwen3_5"),
+        cublaslt_decode: gemma || matches!(model_type, "llama" | "qwen3" | "qwen3_asr" | "qwen3_5"),
         decode_ladder: dense || model_type == "gpt_oss",
         packed_prefill_siblings: matches!(model_type, "glm_moe_dsa" | "glm5_next"),
         glm: matches!(model_type, "glm_moe_dsa" | "glm5_next"),
@@ -8441,7 +8517,7 @@ fn cublaslt_emit_supported(
     tp: u32,
     has_decode_objects: bool,
 ) -> bool {
-    capabilities.cublaslt_decode && arch == "sm_90a" && tp == 1 && !has_decode_objects
+    capabilities.cublaslt_decode && matches!(arch, "sm_90a" | "sm_89") && tp == 1 && !has_decode_objects
 }
 
 /// [`run`] plus an optional pre-write verification gate (see [`VerifyHook`]).
@@ -8592,13 +8668,15 @@ pub fn run_verified(args: EmitArgs, verify: Option<VerifyHook>) {
     }
     if emit_config::active().prefill_cublaslt {
         assert!(
-            (model_type.starts_with("gemma4") || model_type == "llama" || model_type == "qwen3_asr")
+            ((model_type.starts_with("gemma4") || model_type == "llama" || model_type == "qwen3_asr")
                 && arch == "sm_90a"
+                || (model_type == "qwen3_asr" || model_type == "llama" || model_type.starts_with("gemma4"))
+                    && arch == "sm_89")
                 && tp == 1
                 && (!emit_config::active().any_fp8_weights()
                     || (model_type.starts_with("gemma4") && emit_config::active().w8a8))
                 && !emit_config::active().mxfp4,
-            "cuBLASLt prefill emission requires Gemma 4 W8A8 or supported BF16 on single-GPU SM90"
+            "cuBLASLt prefill emission requires Gemma 4 W8A8 or supported BF16 on single-GPU SM90 (Qwen3-ASR and Llama BF16 also on SM89)"
         );
     }
     if emit_config::active().gemma4_sm90_gemm_glu_role {
@@ -9642,6 +9720,18 @@ fn emit_dense_gqa(
     }
     assert!(tp >= 1, "--tp must be >= 1");
     c.tp = tp;
+    let mm_towers = (ecfg_multimodal() && block_spec.is_none()).then(|| {
+        let towers = mm::Towers::from_checkpoint(&dir).unwrap_or_else(|e| panic!("multimodal: {e}"));
+        assert!(!towers.is_empty(), "PLOW_EMIT_MULTIMODAL=1: the checkpoint declares no tower");
+        assert!(tp == 1, "PLOW_EMIT_MULTIMODAL=1 is single-GPU");
+        c.mm_slab_rows = emit_config::active().mm_slab_rows.unwrap_or(mm::DEFAULT_SLAB_ROWS).max(1);
+        let contract = towers.contract(c.mm_slab_rows).unwrap_or_else(|e| panic!("multimodal: {e}"));
+        assert_eq!(contract.hidden, c.hidden, "multimodal contract width");
+        assert_eq!(contract.table_capacity, mm_table_capacity(&c));
+        c.mm_pad = contract.pad_token;
+        c.mm_spans = contract.has_spans();
+        (towers, contract)
+    });
     // Resolve the block range now that layer count is known. `l` -> l..l+1;
     // `l..r` -> that half-open range. Absent => the full model (0..layers),
     // which makes every gated site below byte-identical to the pre-block path.
@@ -9878,13 +9968,14 @@ fn emit_dense_gqa(
     // slot `s`'s offset into the KV cache is `s * (kv_head*ring*hd)` — INVARIANT in B — so a
     // sequence keeps its slot while the program under it changes rung to rung.
     let mut dbatch: u32 = *rungs.last().expect("decode_rungs is non-empty");
-    // 26B-A4B MoE decode is BATCHED (B in 1..=32): the router family, the flat expert GLU/down
+    // 26B-A4B MoE decode is BATCHED (B in 1..=128): the router family, the flat expert GLU/down
     // and the combine all carry a batch row count and index [B][k] routing slots. See the
     // work-item ordering note in runtime/nvidia/op_moe.cuh for the weight-reuse design.
     // (The fp8 batch refusal is gone: the fp8 GEMV arms are batched as of the B=32 work.)
+    // PLOW_MOE_MAXB follows PLOW_PACKET_DECODE_BATCH above 32 rows.
     assert!(
-        !(c.moe && dbatch > 32),
-        "MoE decode batch is capped at 32 (per-CTA inv[] scratch, PLOW_MOE_MAXB)"
+        !(c.moe && dbatch > 128),
+        "MoE decode batch is capped at 128 (per-CTA inv[] scratch, PLOW_MOE_MAXB)"
     );
 
     // Grouped-MoE PREFILL: token-sorted grouped expert GEMM buckets.
@@ -10148,8 +10239,10 @@ fn emit_dense_gqa(
     let mut sections = Vec::new();
     if ecfg.decode_cublaslt || ecfg.decode_native_tc {
         assert!(
-            !c.moe && !amd && (!fp8 || (c.arch == Arch::Gemma4 && ecfg.w8a8 && !ecfg.decode_native_tc)),
-            "Gemma cuBLASLt decode requires dense BF16 or Gemma 4 W8A8 CUDA"
+            !amd
+                && (!c.moe || c.arch == Arch::Gemma4)
+                && (!fp8 || (c.arch == Arch::Gemma4 && ecfg.w8a8 && !ecfg.decode_native_tc)),
+            "Gemma cuBLASLt decode requires dense BF16 or Gemma 4 CUDA (MoE: Gemma 4 only)"
         );
         sections.push(
             if ecfg.decode_native_tc {
@@ -10255,21 +10348,6 @@ fn emit_dense_gqa(
         }
         if selected > 0 {
             eprintln!("  cuBLASLt prefill: {selected} projection segments");
-        }
-        // Packetize the exact-shape algorithm selection from the tune store when one exists;
-        // a host with the GPU refreshes it through the campaign probe, and the runtime
-        // re-validates every entry with AlgoCheck before use.
-        if let Some(root) = ecfg.tunedb_root() {
-            match dense_cublaslt::packetize_algo_table(
-                &m,
-                &arch,
-                std::path::Path::new(&root),
-                std::path::Path::new(&out),
-            ) {
-                Ok(0) => eprintln!("  cuBLASLt algorithms: no tune-store rows for this target; the runtime selects at load"),
-                Ok(n) => eprintln!("  cuBLASLt algorithms: {n} shape(s) packetized from the tune store"),
-                Err(error) => eprintln!("  cuBLASLt algorithms: not packetized: {error}"),
-            }
         }
     }
     if ecfg.moe_pf_lt {
@@ -10643,6 +10721,9 @@ fn emit_dense_gqa(
                 .unwrap_or_else(|error| panic!("serve manifest: {error}")),
         );
     }
+    if let Some((_, contract)) = &mm_towers {
+        sections.push(mm::contract_section(contract).unwrap_or_else(|e| panic!("multimodal contract: {e}")));
+    }
     let lean = apply_verify_gate(&m, verify.as_ref());
     modular::update_section_with_lean(&mut sections, &lean);
     let blob = if sections.is_empty() {
@@ -10712,20 +10793,24 @@ fn emit_dense_gqa(
         } else {
             (&[], &[400, 800, 1200, 1600, 2000])
         };
+        let max_chunks = emit_config::active().asr_packed_max_chunks.unwrap_or(u32::MAX);
+        let packed: Vec<u32> = packed.iter().copied().filter(|&chunks| chunks <= max_chunks).collect();
+        let audio_dims = asr::qwen::AudioDims::from_checkpoint(&dir)
+            .unwrap_or_else(|error| panic!("Qwen audio encoder dims: {error}"));
         let mut encoder = match packed.first() {
-            Some(&chunks) => asr::qwen::lower_packed_audio_encoder(chunks, n_cu),
-            None => asr::qwen::lower_audio_encoder(3000, n_cu),
+            Some(&chunks) => asr::qwen::lower_packed_audio_encoder(chunks, n_cu, audio_dims),
+            None => asr::qwen::lower_audio_encoder(3000, n_cu, audio_dims),
         }
         .unwrap_or_else(|error| panic!("Qwen audio packet lowering: {error}"));
         for chunks in packed.iter().skip(1) {
-            let bucket = asr::qwen::lower_packed_audio_encoder(*chunks, n_cu)
+            let bucket = asr::qwen::lower_packed_audio_encoder(*chunks, n_cu, audio_dims)
                 .unwrap_or_else(|error| panic!("Qwen audio packet lowering: {error}"));
             encoder
                 .merge_capacity(bucket)
                 .unwrap_or_else(|error| panic!("Qwen audio packet capacity: {error}"));
         }
         for &capacity in single {
-            let bucket = asr::qwen::lower_audio_encoder(capacity, n_cu)
+            let bucket = asr::qwen::lower_audio_encoder(capacity, n_cu, audio_dims)
                 .unwrap_or_else(|error| panic!("Qwen audio packet lowering: {error}"));
             encoder
                 .merge_capacity(bucket)
@@ -10761,6 +10846,20 @@ fn emit_dense_gqa(
         write_sidecar_packet(&path, &model, &[section]);
         eprintln!("  s3gen packet -> {}", path.display());
     }
+    if let Some((towers, _)) = &mm_towers {
+        let (images, frames) = mm::ladders();
+        let lowered = [
+            towers.vision.is_some().then(|| (mm::VISION_PACKET, towers.lower_vision(&dir, n_cu, m.target, &images))),
+            towers.audio.is_some().then(|| (mm::AUDIO_PACKET, towers.lower_audio(&dir, n_cu, m.target, &frames))),
+        ];
+        for (file, sidecar) in lowered.into_iter().flatten() {
+            let sidecar = sidecar.unwrap_or_else(|e| panic!("multimodal {file}: {e}"));
+            let path = std::path::Path::new(&out).with_file_name(file);
+            speech_ops |= manifest::speech_ops(&sidecar.model);
+            write_sidecar_packet(&path, &sidecar.model, &[sidecar.section]);
+            eprintln!("  multimodal encoder packet -> {}", path.display());
+        }
+    }
     if let Some((model, section)) = audio_blob {
         let path = std::path::Path::new(&out).with_file_name(asr::qwen::ENCODER_PACKET);
         speech_ops |= manifest::speech_ops(&model);
@@ -10788,6 +10887,33 @@ fn emit_dense_gqa(
         let mut man = manifest::build_for_packet(&m, &arch, &lean, &sections);
         if speech_ops != 0 {
             man["speech_ops"] = speech_ops.into();
+        }
+        // Every cuBLASLt projection shape of the final packet (prefill and decode rungs), and the
+        // tune store's exact-shape algorithm rows for them; `campaign.py build` probes the shapes
+        // no row serves, and the runtime re-validates every entry with AlgoCheck before use.
+        let lt_shapes = dense_cublaslt::lt_shapes(&m, &sections);
+        if !lt_shapes.is_empty() {
+            let packetized = match ecfg.tunedb_root() {
+                Some(root) => dense_cublaslt::packetize_algo_table(
+                    &lt_shapes,
+                    &arch,
+                    std::path::Path::new(&root),
+                    std::path::Path::new(&out),
+                )
+                .unwrap_or_else(|error| {
+                    eprintln!("  cuBLASLt algorithms: not packetized: {error}");
+                    0
+                }),
+                None => 0,
+            };
+            eprintln!(
+                "  cuBLASLt algorithms: {packetized} tune-store row(s) packetized for {} projection shape(s)",
+                lt_shapes.len()
+            );
+            man["cublaslt"] = serde_json::json!({
+                "shapes": lt_shapes.iter().map(dense_cublaslt::LtShape::json).collect::<Vec<_>>(),
+                "packetized": packetized,
+            });
         }
         report_dispatch_audit(&man);
         report_segment_resource(&man);

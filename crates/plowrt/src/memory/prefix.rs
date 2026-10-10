@@ -255,6 +255,23 @@ impl PrefixCache {
         placed
     }
 
+    /// How many leading blocks of `hashes` [`Self::peek`] would match, without collecting them.
+    pub fn matched_blocks(&self, hashes: &[BlockHash], tokens: &[u32]) -> usize {
+        let mut cur: Option<NodeId> = None;
+        for (i, h) in hashes.iter().enumerate() {
+            let next = match cur {
+                None => self.roots.get(h).copied(),
+                Some(p) => self.nodes[p as usize].children.get(h).copied(),
+            };
+            let Some(n) = next else { return i };
+            if self.block_slice(tokens, i) != Some(&self.nodes[n as usize].tokens) {
+                return i;
+            }
+            cur = Some(n);
+        }
+        hashes.len()
+    }
+
     /// Resolve placed blocks to coalesced per-`(kv, head)` runs. Split out so the
     /// coalescing is testable without touching the tree.
     fn runs_for(&self, placed: &[(u32, u32)]) -> Vec<Run> {

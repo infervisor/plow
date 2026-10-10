@@ -5,17 +5,20 @@
 //! (`prefill_slot` to build ctx, then one `step_slots` per token).
 //!
 //! Usage:
-//!   step_bench <assets_dir> [slots] [ctx] [steps] [--same] [--warmup N] [--multistep] [--packed-prefill]
+//!   step_bench <assets_dir> [slots] [ctx] [steps] [--same | --spread] [--warmup N] [--multistep] [--packed-prefill]
 //!              [--dump-tensors name,name --dump-dir dir | --dump-prefill-logits dir]
 //!              [--max-inst N | --max-segments N]
 //! `--same` feeds every slot the SAME prompt and reports how many slots' greedy
-//! streams agree with slot 0 (a within-batch consistency check). `--packed-prefill`
+//! streams agree with slot 0 (a within-batch consistency check). `--spread` gives each slot a
+//! pseudo-random prompt over 64K ids, so a MoE model routes a decode batch the way served
+//! traffic does (the default prompts share one 1000-id cycle). `--packed-prefill`
 //! initializes prompts through packed request chunks and the compact terminal, printing each
 //! launch's wall ms; `--pf-chunk N` caps the per-request slice below the packet's request chunk and
 //! `--pf-reps N` repeats the whole packed prefill (the first pass pays graph capture).
 //! `--dump-tensors`
 //! writes the named tensors raw after the last step (block_run's format), which
-//! with `--max-inst N`, one step and zero warmup gives partial decode activations.
+//! with `--max-inst N`, one step and zero warmup gives partial decode activations;
+//! with 0 steps and zero warmup it gives the activations right after prefill (the last layer's).
 //! Instruction caps require native decode routes. `--multistep` times the
 //! engine's device multi-step quanta (`PLOW_MULTISTEP=K`) instead of single steps; the digest
 //! covers the same tokens in the same order, so it compares directly with a single-step run.
@@ -56,6 +59,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ctx: usize = args.next().map(|v| v.parse()).transpose()?.unwrap_or(4137);
     let steps: usize = args.next().map(|v| v.parse()).transpose()?.unwrap_or(128);
     let mut same = false;
+    let mut spread = false;
     let mut multistep = false;
     let mut packed_prefill = false;
     let mut pf_chunk = usize::MAX;
@@ -74,6 +78,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "--max-segments" => max_segments = Some(args.next().ok_or("--max-segments N")?.parse()?),
             "--max-inst" => max_inst = Some(args.next().ok_or("--max-inst N")?.parse()?),
             "--same" => same = true,
+            "--spread" => spread = true,
             "--packed-prefill" => packed_prefill = true,
             "--pf-chunk" => pf_chunk = args.next().ok_or("--pf-chunk N")?.parse()?,
             "--pf-reps" => pf_reps = args.next().ok_or("--pf-reps N")?.parse()?,
@@ -167,6 +172,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .transpose()?;
     let prompt_for = |b: usize| -> Vec<u32> {
         let bb = if same { 0 } else { b as u32 };
+        if spread {
+            let mut x = 0x9e37_79b9u32 ^ (bb + 1).wrapping_mul(0x85eb_ca6b);
+            return (0..ctx)
+                .map(|_| {
+                    x ^= x << 13;
+                    x ^= x >> 17;
+                    x ^= x << 5;
+                    1000 + x % 65536
+                })
+                .collect();
+        }
         (0..ctx as u32).map(|i| 100 + ((i + 131 * bb) % 1000)).collect()
     };
     if packed_prefill {
@@ -386,24 +402,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     }
-    ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    let mean = ms.iter().sum::<f64>() / ms.len() as f64;
-    let median = ms[ms.len() / 2];
-    let sd = if ms.len() > 1 {
-        (ms.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / (ms.len() - 1) as f64).sqrt()
-    } else {
-        0.0
-    };
-    let measurement = if partial { "PARTIAL_STEP" } else { "RAW_STEP" };
-    println!(
-        "{measurement} slots={slots} ctx={ctx} n={} mean_ms={mean:.3} median_ms={median:.3} \
-         sd_ms={sd:.3} min_ms={:.3} max_ms={:.3} per_user_tok_s={:.1} aggregate_tok_s={:.1}",
-        ms.len(),
-        ms[0],
-        ms[ms.len() - 1],
-        1000.0 / mean,
-        1000.0 / mean * slots as f64,
-    );
+    // 0 steps: no timing; a dump then holds the allocations right after prefill.
+    if !ms.is_empty() {
+        ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let mean = ms.iter().sum::<f64>() / ms.len() as f64;
+        let median = ms[ms.len() / 2];
+        let sd = if ms.len() > 1 {
+            (ms.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / (ms.len() - 1) as f64).sqrt()
+        } else {
+            0.0
+        };
+        let measurement = if partial { "PARTIAL_STEP" } else { "RAW_STEP" };
+        println!(
+            "{measurement} slots={slots} ctx={ctx} n={} mean_ms={mean:.3} median_ms={median:.3} \
+             sd_ms={sd:.3} min_ms={:.3} max_ms={:.3} per_user_tok_s={:.1} aggregate_tok_s={:.1}",
+            ms.len(),
+            ms[0],
+            ms[ms.len() - 1],
+            1000.0 / mean,
+            1000.0 / mean * slots as f64,
+        );
+    }
 
     if let Some((names, dir)) = dumps {
         std::fs::create_dir_all(&dir)?;
@@ -422,6 +441,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             dir.join("manifest.json"),
             serde_json::to_vec_pretty(&serde_json::json!({
                 "scope": if partial { "raw allocations after partial decode; outputs may be stale" }
+                    else if steps == 0 { "raw complete allocations after prefill" }
                     else { "raw complete allocations after the last decode step" },
                 "max_inst": max_inst, "max_segments": max_segments,
                 "slots": slots, "ctx": ctx, "steps": steps, "warmup": warmup,

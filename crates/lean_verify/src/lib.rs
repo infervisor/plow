@@ -301,6 +301,39 @@ fn verifier_digest(bin: &std::path::Path) -> Option<[u8; 32]> {
     Some(Sha256::digest(std::fs::read(resolved).ok()?).into())
 }
 
+/// Digest of the Lean sources a verifier is built from: every `*.lean` file under `dir` (outside
+/// `.lake`), the lakefile, toolchain and lake manifest, as sorted `path NUL sha256 LF` lines.
+/// `lean-plow/approved-verifiers.json` pairs it with the executable digest.
+pub fn lean_sources_sha256(dir: &std::path::Path) -> std::io::Result<String> {
+    use sha2::{Digest, Sha256};
+    fn walk(root: &std::path::Path, dir: &std::path::Path, out: &mut Vec<(String, String)>) -> std::io::Result<()> {
+        for entry in std::fs::read_dir(dir)? {
+            let path = entry?.path();
+            let rel = path.strip_prefix(root).expect("walk stays under root");
+            if rel.starts_with(".lake") || rel.starts_with("build") {
+                continue;
+            }
+            if path.is_dir() {
+                walk(root, &path, out)?;
+                continue;
+            }
+            let name = rel.to_string_lossy().replace('\\', "/");
+            if name.ends_with(".lean") || matches!(name.as_str(), "lean-toolchain" | "lake-manifest.json") {
+                out.push((name, format!("{:x}", Sha256::digest(std::fs::read(&path)?))));
+            }
+        }
+        Ok(())
+    }
+    let mut files = Vec::new();
+    walk(dir, dir, &mut files)?;
+    files.sort();
+    let mut hasher = Sha256::new();
+    for (name, digest) in files {
+        hasher.update(format!("{name}\0{digest}\n"));
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
 pub fn verifier_sha256() -> Result<String, VerifyError> {
     let bin = locate_binary()?;
     verifier_digest(&bin).map(|digest| digest.iter().map(|b| format!("{b:02x}")).collect())

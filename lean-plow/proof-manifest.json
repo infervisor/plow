@@ -1,0 +1,69 @@
+{
+  "schema": 1,
+  "allowed_axioms": ["propext", "Classical.choice", "Quot.sound"],
+  "endpoints": [
+    {"id": "A", "scope": "rewrite_body_expansion", "soundness": [
+      {"theorem": "Plow.RewriteBody.check_sound", "checker": "Plow.RewriteBody.check"},
+      {"theorem_prefix": "Plow.Rewrite.rule_"}]},
+    {"id": "B", "scope": "tile_partition", "soundness": [
+      {"theorem": "Plow.TilePartition.check_sound", "checker": "Plow.TilePartition.checkPartition"}]},
+    {"id": "C", "scope": "sram_temporal_fit", "soundness": [
+      {"theorem": "Plow.Sram.occupancy_le_of_temporal_fit", "checker": "Plow.Sram.temporalFitSafe"}]},
+    {"id": "D", "scope": "coarse_dependency_preservation+logical_tensor_effects", "soundness": [
+      {"theorem": "Plow.Verify.verifyDependencies_sound", "checker": "Plow.Verify.verifyDependencies"},
+      {"theorem": "Plow.Verify.checkPaths_sound", "checker": "Plow.Verify.checkPaths"},
+      {"theorem": "Plow.Verify.verifyAddressMap_sound_strict", "checker": "Plow.Verify.verifyAddressMap"},
+      {"theorem": "Plow.Verify.verifyAddressMapVia_sound", "checker": "Plow.Verify.verifyAddressMapVia"},
+      {"theorem": "Plow.Verify.treeBefore_sound", "checker": "Plow.Verify.treeBefore"},
+      {"theorem": "Plow.Effects.checkConflicts_sound", "checker": "Plow.Effects.checkConflicts"},
+      {"theorem": "Plow.Effects.checkAccesses_sound", "checker": "Plow.Effects.checkAccesses"},
+      {"theorem": "Plow.Effects.checkReuse_sound", "checker": "Plow.Effects.checkReuse"},
+      {"theorem": "Plow.Effects.cancellation_retired", "checker": "Plow.Effects.checkRetirements"}]},
+    {"id": "E", "scope": "wire_round_trip", "soundness": [
+      {"theorem": "Plow.Wire.decodeProgram_encodeProgram", "checker": "Plow.Wire.decodeProgram"}]},
+    {"id": "F", "scope": "allocation_safety", "soundness": [
+      {"theorem": "Plow.Verify.verifyAddressMap_sound_strict", "checker": "Plow.Verify.verifyAddressMap"},
+      {"theorem": "Plow.Verify.verifyAddressMapVia_sound", "checker": "Plow.Verify.verifyAddressMapVia"}]},
+    {"id": "G", "scope": "staged_lds_fit", "soundness": [
+      {"theorem": "Plow.LdsFit.fits_of_check_ok", "checker": "Plow.LdsFit.checkLdsFit"}]},
+    {"id": "K", "scope": "knob_consistency", "soundness": [
+      {"theorem": "Plow.Knobs.checkK_sound", "checker": "Plow.Knobs.checkK"}]},
+    {"id": "S", "scope": "knob_scope", "soundness": [
+      {"theorem": "Plow.Knobs.Scope.checkS_sound", "checker": "Plow.Knobs.Scope.checkS"},
+      {"theorem": "Plow.Knobs.Scope.diff_complete"},
+      {"theorem": "Plow.Knobs.Scope.untouched_rungs", "checker": "Plow.Knobs.Scope.checkS"},
+      {"theorem": "Plow.Knobs.Scope.route_untouched", "checker": "Plow.Knobs.Scope.checkS"}]},
+    {"id": "P", "scope": "perf_floor", "soundness": [
+      {"theorem": "Plow.Knobs.Ledger.checkP_sound", "checker": "Plow.Knobs.Ledger.checkP"}]},
+    {"id": "R", "scope": "measured_policy+selected_gemm_policy", "soundness": [
+      {"theorem": "Plow.MeasuredPolicy.check_sound", "checker": "Plow.MeasuredPolicy.check"}]},
+    {"id": "L", "scope": "layout_mapping", "soundness": [
+      {"theorem": "Plow.MlaLayout.address_in_bounds"},
+      {"theorem": "Plow.MlaLayout.ignored_padding"},
+      {"theorem": "Plow.MlaLayout.same_consumer_output"}]},
+    {"id": "media_geometry.v1", "scope": "media_geometry", "soundness": [
+      {"theorem": "Plow.MediaGeometry.check_sound", "checker": "Plow.MediaGeometry.check"},
+      {"theorem": "Plow.MediaGeometry.AudioLm.every_recording_fits", "checker": "Plow.MediaGeometry.AudioLm.Contract"},
+      {"theorem": "Plow.MediaGeometry.Rnnt.every_input_fits", "checker": "Plow.MediaGeometry.Rnnt.Contract"},
+      {"theorem": "Plow.MediaGeometry.Rnnt.decode_steps_bounded"},
+      {"theorem": "Plow.MediaGeometry.CodecLm.addresses_in_bounds", "checker": "Plow.MediaGeometry.CodecLm.Contract"},
+      {"theorem": "Plow.MediaGeometry.CodecLm.token_decodes", "checker": "Plow.MediaGeometry.CodecLm.Contract"},
+      {"theorem": "Plow.MediaGeometry.Multimodal.soft_ids_disjoint", "checker": "Plow.MediaGeometry.Multimodal.Contract"}]},
+    {"id": "kv_ring.v1", "scope": "kv_ring", "soundness": [
+      {"theorem": "Plow.KvRing.checkLaunch_sound", "checker": "Plow.KvRing.checkLaunch"},
+      {"theorem": "Plow.KvRing.launch_safe", "checker": "Plow.KvRing.Launch.Contract"},
+      {"theorem": "Plow.KvRing.launch_safe_masked", "checker": "Plow.KvRing.Launch.Contract"},
+      {"theorem": "Plow.KvRing.slots_distinct", "checker": "Plow.KvRing.Launch.Contract"},
+      {"theorem": "Plow.KvRing.mask_eq_mod"}]},
+    {"id": "vmm_trace.v1", "scope": "vmm_lifecycle", "soundness": [
+      {"theorem": "Plow.KvRing.traceOk_sound", "checker": "Plow.KvRing.traceOk"},
+      {"theorem": "Plow.KvRing.step_preserves", "checker": "Plow.KvRing.step"},
+      {"theorem": "Plow.KvRing.run_preserves", "checker": "Plow.KvRing.run"}]},
+    {"id": "speech_fusion.v1", "scope": "speech_fusion", "soundness": [
+      {"theorem": "Plow.SpeechFusion.check_sound", "checker": "Plow.SpeechFusion.check"},
+      {"theorem": "Plow.SpeechFusion.ln_site_stats", "checker": "Plow.SpeechFusion.LnSite.Contract"},
+      {"theorem": "Plow.SpeechFusion.ln_site_gemm_eq", "checker": "Plow.SpeechFusion.LnSite.Contract"},
+      {"theorem": "Plow.SpeechFusion.conv_site_in_bounds", "checker": "Plow.SpeechFusion.ConvSite.Contract"},
+      {"theorem": "Plow.SpeechFusion.conv_site_eq", "checker": "Plow.SpeechFusion.ConvSite.Contract"}]}
+  ]
+}
