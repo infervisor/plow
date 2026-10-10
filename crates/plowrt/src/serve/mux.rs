@@ -241,6 +241,8 @@ pub struct JobOpts {
     pub tenant: Option<u64>,
     /// [`Fair`]'s start round, set when the job is first ordered in the queue (0: not yet).
     pub(crate) round: u64,
+    /// Prefix rows the cache would attach, and the cache generation they were read at.
+    pub(crate) cached: Option<(u64, u32)>,
     /// The prompt's prefix-cache block hashes, when the DP router already computed them.
     pub prefix: Option<crate::memory::vmm::PrefixKey>,
     /// Multimodal soft-token rows the prompt's bit-31 ids name (`serve::mm`).
@@ -492,6 +494,8 @@ pub struct ModelMux {
     /// Requests that may wait outside the slot table (`--serve-max-queued-requests`), counted by
     /// `metrics.queued_requests` from submit until the job is seated or leaves.
     queue_cap: usize,
+    /// The engine prefix cache's block rows (0: no prefix cache), for [`Self::prefix_key`].
+    prefix_block_rows: u32,
 }
 
 /// Channel room past [`ModelMux::queue_cap`] jobs, for control messages.
@@ -659,6 +663,12 @@ impl ModelMux {
     /// The dispatcher has exited (a drain finished).
     pub fn is_closed(&self) -> bool {
         self.tx.is_closed()
+    }
+
+    /// `prompt`'s prefix-cache block hashes, for [`JobOpts::prefix`]: hashed on the caller's
+    /// thread, they serve cache-aware admission and the attach without hashing on the dispatcher.
+    pub fn prefix_key(&self, prompt: &[u32]) -> Option<crate::memory::vmm::PrefixKey> {
+        (self.prefix_block_rows > 0).then(|| crate::memory::vmm::PrefixKey::new(prompt, self.prefix_block_rows))
     }
 
     /// Requests submitted and not yet in an engine slot.
@@ -989,6 +999,7 @@ pub fn spawn(
     let prefix_probe = state.gpu_engine(&slug).and_then(|e| e.lock().vmm_prefix_probe());
     #[cfg(not(feature = "cuda"))]
     let prefix_probe: Option<crate::memory::vmm::PrefixProbe> = None;
+    let prefix_block_rows = prefix_probe.as_ref().map_or(0, |p| p.block_rows());
     #[cfg(feature = "cuda")]
     let (resume_supported, prefix_cache, kv_row_bytes) = state.gpu_engine(&slug).map_or((false, false, 0), |e| {
         let e = e.lock();
@@ -1879,6 +1890,7 @@ pub fn spawn(
         ingress,
         preempted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         queue_cap: ingress_capacity,
+        prefix_block_rows,
     }
 }
 
@@ -2120,6 +2132,24 @@ fn cache_first(heads: &[(JobClass, f64)], rows: &[u32], block: u32) -> Option<us
     (best > 0 && best_rows >= head_rows.saturating_add(block)).then_some(best)
 }
 
+/// Each waiter's attachable prefix rows ([`JobOpts::cached`]), recomputed only when the cache
+/// moved since: under one lock, from block hashes each job carries (handler-hashed, or hashed
+/// here once with no lock held).
+pub(crate) fn refresh_cached_rows(waiting: &mut std::collections::VecDeque<(Job, Instant)>, probe: &crate::memory::vmm::PrefixProbe) {
+    let gen = probe.generation();
+    let stale = |job: &Job| job.opts.cached.is_none_or(|(g, _)| g != gen);
+    if !waiting.iter().any(|(job, _)| stale(job)) {
+        return;
+    }
+    for (job, _) in waiting.iter_mut().filter(|(job, _)| job.opts.prefix.is_none()) {
+        job.opts.prefix = Some(probe.key(&job.prompt_ids));
+    }
+    let held = probe.rows_locked();
+    for (job, _) in waiting.iter_mut().filter(|(job, _)| stale(job)) {
+        job.opts.cached = Some((gen, held.rows(&job.prompt_ids, job.opts.prefix.as_ref())));
+    }
+}
+
 #[inline]
 fn waited_ms(now: Instant, arrived: Instant) -> f64 {
     now.saturating_duration_since(arrived).as_secs_f64() * 1e3
@@ -2230,8 +2260,16 @@ fn drain_waiting_session(
             && slots[..admission_limit.min(slots.len())].iter().any(Option::is_none)
     });
     let mut rows: std::collections::VecDeque<u32> = probe
-        .map(|p| waiting.iter().map(|(job, _)| p.cached_rows_keyed(&job.prompt_ids, job.opts.prefix.as_ref())).collect())
+        .map(|p| {
+            refresh_cached_rows(waiting, p);
+            waiting.iter().map(|(job, _)| job.opts.cached.map_or(0, |(_, rows)| rows)).collect()
+        })
         .unwrap_or_default();
+    let mut heads: std::collections::VecDeque<(JobClass, f64)> = if probe.is_some() {
+        waiting.iter().map(|(job, arrived)| (job.opts.class, waited_ms(now, *arrived))).collect()
+    } else {
+        Default::default()
+    };
     let mut still: std::collections::VecDeque<(Job, Instant)> =
         std::collections::VecDeque::new();
     while slots[..admission_limit.min(slots.len())]
@@ -2239,17 +2277,18 @@ fn drain_waiting_session(
         .any(Option::is_none)
     {
         if let Some(p) = probe {
-            let heads: Vec<(JobClass, f64)> =
-                waiting.iter().map(|(job, arrived)| (job.opts.class, waited_ms(now, *arrived))).collect();
-            if let Some(i) = cache_first(&heads, rows.make_contiguous(), p.block_rows()) {
+            if let Some(i) = cache_first(heads.make_contiguous(), rows.make_contiguous(), p.block_rows()) {
                 let entry = waiting.remove(i).expect("in range");
                 waiting.push_front(entry);
                 let r = rows.remove(i).expect("in range");
                 rows.push_front(r);
+                let h = heads.remove(i).expect("in range");
+                heads.push_front(h);
                 Metrics::inc(&metrics.cache_first_admissions);
             }
         }
         rows.pop_front();
+        heads.pop_front();
         let Some((job, arrived)) = waiting.pop_front() else {
             break;
         };
@@ -6972,6 +7011,7 @@ pub(crate) fn scripted_mux(script: impl Fn(&Job) -> Vec<String> + Send + Sync + 
         ingress: Arc::default(),
         preempted: Arc::default(),
         queue_cap: usize::MAX,
+        prefix_block_rows: 0,
     }
 }
 
@@ -7296,6 +7336,7 @@ mod tests {
             ingress: Arc::default(),
             preempted: Arc::default(),
             queue_cap: 1,
+            prefix_block_rows: 0,
         };
 
         let (a, b) = (mux.ingress(), mux.ingress());
@@ -7336,6 +7377,7 @@ mod tests {
             ingress: Arc::default(),
             preempted: Arc::default(),
             queue_cap: 3,
+            prefix_block_rows: 0,
         };
         let (mut waiting, mut load) = (std::collections::VecDeque::new(), LoadEstimator::default());
         let (mut draining, mut drain_done, mut late) = (false, None, Vec::new());

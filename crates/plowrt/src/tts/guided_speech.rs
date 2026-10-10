@@ -685,6 +685,7 @@ impl GuidedSpeech {
                 prefix: None,
                 tenant: None,
                 round: 0,
+                cached: None,
                 mm: None,
             },
         })

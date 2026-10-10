@@ -336,6 +336,9 @@ async fn completions_with(
         },
         (None, None) => unreachable!("checked at lookup"),
     };
+    if prefix.is_none() {
+        prefix = mux.prefix_key(&prompt_ids);
+    }
     let key = dp.map_or(req.model.as_str(), |set| set.ranks[rank].key.as_str());
     let (tx, rx) = stream_mod::channel();
     let response_prompt_ids = req.return_token_ids.then(|| prompt_ids.clone());
