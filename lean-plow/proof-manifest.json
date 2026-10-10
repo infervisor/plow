@@ -48,6 +48,16 @@
       {"theorem": "Plow.MediaGeometry.Rnnt.decode_steps_bounded"},
       {"theorem": "Plow.MediaGeometry.CodecLm.addresses_in_bounds", "checker": "Plow.MediaGeometry.CodecLm.Contract"},
       {"theorem": "Plow.MediaGeometry.CodecLm.token_decodes", "checker": "Plow.MediaGeometry.CodecLm.Contract"},
-      {"theorem": "Plow.MediaGeometry.Multimodal.soft_ids_disjoint", "checker": "Plow.MediaGeometry.Multimodal.Contract"}]}
+      {"theorem": "Plow.MediaGeometry.Multimodal.soft_ids_disjoint", "checker": "Plow.MediaGeometry.Multimodal.Contract"}]},
+    {"id": "kv_ring.v1", "scope": "kv_ring", "soundness": [
+      {"theorem": "Plow.KvRing.checkLaunch_sound", "checker": "Plow.KvRing.checkLaunch"},
+      {"theorem": "Plow.KvRing.launch_safe", "checker": "Plow.KvRing.Launch.Contract"},
+      {"theorem": "Plow.KvRing.launch_safe_masked", "checker": "Plow.KvRing.Launch.Contract"},
+      {"theorem": "Plow.KvRing.slots_distinct", "checker": "Plow.KvRing.Launch.Contract"},
+      {"theorem": "Plow.KvRing.mask_eq_mod"}]},
+    {"id": "vmm_trace.v1", "scope": "vmm_lifecycle", "soundness": [
+      {"theorem": "Plow.KvRing.traceOk_sound", "checker": "Plow.KvRing.traceOk"},
+      {"theorem": "Plow.KvRing.step_preserves", "checker": "Plow.KvRing.step"},
+      {"theorem": "Plow.KvRing.run_preserves", "checker": "Plow.KvRing.run"}]}
   ]
 }

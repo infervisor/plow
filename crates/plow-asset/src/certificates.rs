@@ -218,6 +218,9 @@ pub enum SemanticScope {
     /// `media_geometry.v1`: speech/multimodal contract geometry of a bundle, checked at
     /// qualification (`plowrt qualify`), not carried as a compiler receipt.
     MediaGeometry,
+    /// `kv_ring.v1`: packed prefill writes never overwrite a ring row their own queries read,
+    /// checked at qualification from the packet's `live_kv`/`packed_prefill` sections.
+    KvRing,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

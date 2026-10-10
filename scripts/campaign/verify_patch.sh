@@ -67,7 +67,7 @@ else
 fi
 # Lean correctness: the patched verifier is built in this tree (never the repo's shared .lake),
 # proof-audited, checked against approved-verifiers.json, and the CPU-verifier suites run on it.
-LEAN='^(lean-plow/|crates/(lean_verify|plowc)/|crates/plow-asset/src/(certificates|logical_effects|media_geometry|gemm_policy|program)\.rs|crates/plowrt/src/certificate_checks\.rs|crates/devgen/src/lib\.rs|scripts/lean_correctness_ci\.sh)'
+LEAN='^(lean-plow/|crates/(lean_verify|plowc)/|crates/plow-asset/src/(certificates|logical_effects|media_geometry|kv_ring|packed_prefill|live_kv|gemm_policy|program)\.rs|crates/plowrt/src/(certificate_checks|memory/vmm|memory/vmm_ring_tests)\.rs|crates/devgen/src/lib\.rs|scripts/lean_correctness_ci\.sh)'
 if want lean && touches "$LEAN"; then
     rm -f "$T/src/lean-plow/.lake"
     step lean cargo_run bash scripts/lean_correctness_ci.sh

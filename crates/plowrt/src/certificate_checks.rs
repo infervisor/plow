@@ -283,7 +283,8 @@ fn legacy_check(
 }
 
 /// `plowrt qualify`: every `*.pkt` in `dir`, in name order, with its qualification. A packet
-/// with a speech or multimodal pipeline also owes the bundle's `media_geometry.v1` obligation.
+/// with a speech or multimodal pipeline also owes the bundle's `media_geometry.v1` obligation, and one
+/// with packed prefill over a sliding ring owes `kv_ring.v1`.
 pub fn qualify_dir(dir: &Path, replay_checks: bool) -> Result<Vec<(std::path::PathBuf, Qualification)>> {
     let entries = std::fs::read_dir(dir).map_err(|source| RuntimeError::Io { path: dir.to_path_buf(), source })?;
     let mut packets: Vec<_> = entries
@@ -299,7 +300,8 @@ pub fn qualify_dir(dir: &Path, replay_checks: bool) -> Result<Vec<(std::path::Pa
     for path in packets {
         let raw = std::fs::read(&path).map_err(|source| RuntimeError::Io { path: path.clone(), source })?;
         let blob = DevBlob::parse(&raw)?;
-        let q = qualify_loaded(&path, &raw, &blob, replay_checks)?;
+        let mut q = qualify_loaded(&path, &raw, &blob, replay_checks)?;
+        kv_ring_obligation(&raw, &blob, replay_checks, &mut q);
         media.push(MediaInfo::read(&path, &raw, &blob));
         out.push((path, q));
     }
@@ -324,7 +326,7 @@ pub fn qualify_dir(dir: &Path, replay_checks: bool) -> Result<Vec<(std::path::Pa
             }
         };
         q.required.insert(media_obligation());
-        match check_media(request, replay_checks) {
+        match check_endpoint(plow_asset::media_geometry::ENDPOINT, request, replay_checks) {
             Ok(()) => {
                 q.satisfied.insert(media_obligation());
             }
@@ -343,7 +345,48 @@ fn media_obligation() -> plow_asset::certificates::Obligation {
     }
 }
 
-fn check_media(request: serde_json::Value, replay_checks: bool) -> std::result::Result<(), String> {
+/// `kv_ring.v1` for a packet with a packed prefill section and a sliding ring.
+fn kv_ring_obligation(raw: &[u8], blob: &DevBlob, replay_checks: bool, q: &mut Qualification) {
+    let obligation = plow_asset::certificates::Obligation {
+        scope: plow_asset::certificates::SemanticScope::KvRing,
+        checkpoint: plow_asset::kv_ring::ENDPOINT,
+        program: None,
+        site: None,
+    };
+    let request = (|| -> std::result::Result<Option<serde_json::Value>, String> {
+        let Some(pf) = blob.reserved_metadata(raw, plow_asset::packed_prefill::SECTION).map_err(|e| e.to_string())? else {
+            return Ok(None);
+        };
+        let pf: plow_asset::packed_prefill::Manifest =
+            serde_json::from_slice(pf).map_err(|e| format!("packed prefill metadata: {e}"))?;
+        let live = crate::memory::vmm::LiveKvLayout::manifest(blob, raw)
+            .map_err(|e| e.to_string())?
+            .ok_or("packed prefill without a live KV manifest")?;
+        blob.with_packet_view(|p| {
+            pf.validate(p, &live)?;
+            let rungs: Vec<u32> = p.programs[..p.prefill_count].iter().map(|g| g.rows).collect();
+            plow_asset::kv_ring::request(&pf, &live, &rungs)
+        })
+    })();
+    let request = match request {
+        Ok(None) => return,
+        Ok(Some(request)) => request,
+        Err(error) => {
+            q.required.insert(obligation);
+            q.gaps.push(format!("kv ring: {error}"));
+            return;
+        }
+    };
+    q.required.insert(obligation.clone());
+    match check_endpoint(plow_asset::kv_ring::ENDPOINT, request, replay_checks) {
+        Ok(()) => {
+            q.satisfied.insert(obligation);
+        }
+        Err(gap) => q.gaps.push(format!("kv ring: {gap}")),
+    }
+}
+
+fn check_endpoint(endpoint: &str, request: serde_json::Value, replay_checks: bool) -> std::result::Result<(), String> {
     if !replay_checks {
         return Err("not checked (--no-replay)".into());
     }
@@ -351,7 +394,7 @@ fn check_media(request: serde_json::Value, replay_checks: bool) -> std::result::
     if !is_approved_verifier(&verifier) {
         return Err(format!("current verifier {verifier} is not approved"));
     }
-    let (certs, executed) = lean_verify::call_batch_bound(&[(plow_asset::media_geometry::ENDPOINT, request)])
+    let (certs, executed) = lean_verify::call_batch_bound(&[(endpoint, request)])
         .map_err(|e| format!("verifier: {e}"))?;
     let cert = certs.into_iter().next().ok_or("verifier returned no certificate")?;
     if executed != verifier {

@@ -39,4 +39,5 @@ import Plow.FusionSavings
 import Plow.Speech
 import Plow.MlpInterleave
 import Plow.MediaGeometry
+import Plow.KvRing
 import Plow.CLI.Dispatch

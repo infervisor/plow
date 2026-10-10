@@ -8,6 +8,7 @@ import Lean.Data.Json
 import Plow.CLI.Schema
 import Plow.CLI.Checkpoints
 import Plow.MediaGeometry
+import Plow.KvRing
 
 namespace Plow.CLI.Dispatch
 
@@ -33,7 +34,9 @@ def endpoints : List (String × (Json → IO Certificate)) := [
   ("P", fun p => return Checkpoints.checkP p),
   ("R", fun p => return Checkpoints.checkR p),
   ("L", fun p => return Checkpoints.checkL p),
-  ("media_geometry.v1", versioned "media_geometry.v1" Plow.MediaGeometry.run)
+  ("media_geometry.v1", versioned "media_geometry.v1" Plow.MediaGeometry.run),
+  ("kv_ring.v1", versioned "kv_ring.v1" Plow.KvRing.runRing),
+  ("vmm_trace.v1", versioned "vmm_trace.v1" Plow.KvRing.runTrace)
 ]
 
 def endpointIds : List String := endpoints.map (·.1)

@@ -9,11 +9,11 @@
       "note": "gemma12b-next baseline; signs the 4de53bf6 H100 production bundles"
     },
     {
-      "sha256": "b8660da95a8b62b93a6c3ee1ce3f69f39d06deb384bfa57335aec23e8f715d28",
-      "lean_sources_sha256": "ff2aa68484ec9e22cae98c3a6fd78e5f74a0ce9ae2bdbb2f7c892a395ab624fc",
+      "sha256": "add0e47827f90d5094f00d02a68e8cc9d0f30ffb09f60ecdcb5a8c6fd27456ba",
+      "lean_sources_sha256": "47355746f30126ca8d15dfd2078a10890e72fb9a7570805f5eb34b7259178cc6",
       "toolchain": "leanprover/lean4:v4.15.0",
       "commit": "lean-correctness",
-      "note": "dispatch table, proof audit, media_geometry.v1"
+      "note": "dispatch table, proof audit, media_geometry.v1, kv_ring.v1, vmm_trace.v1"
     }
   ]
 }

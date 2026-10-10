@@ -187,9 +187,9 @@ unrelated to this work and are not chased.
 | Sidecar receipts unchecked at load; encoder receipt-file hazard | Sidecar route in `certificate_checks`, `program_checks` completeness (Phase 1) |
 | 34 unaudited opcodes in main packets | Extend `logical_effects` footprints (Phase 2 follow-up). Until then a listed gap per bundle |
 | Example-built ASR/VAD packets have no receipts | Route their builders through the sidecar verifier hook, or record an exemption |
-| KV ring / shared backing lifecycle | `Plow/KvRing.lean` + VMM mock traces (Phase 5) |
+| KV ring / shared backing lifecycle | Done: `kv_ring.v1`, `vmm_trace.v1` (§11) |
 | mm slab lifecycle | `Plow/Multimodal.lean` + `serve/mm` traces (Phase 4) |
-| ASR/TTS/mm capacity and shape contracts | Speech/media contract endpoint bound to packet metadata (Phase 6) |
+| ASR/TTS/mm capacity and shape contracts | Done: `media_geometry.v1` (§10) |
 | Speech fusion preconditions unbound | Precondition endpoint over emitted LN/conv instructions (Phase 6) |
 | Runtime patch/rung transforms unchecked | Phase 3 (not started) |
 | Object capability model | Phase 2 support checker (not started) |
@@ -243,12 +243,12 @@ Strict results for the 14 H100 production bundles (`plowrt qualify`, replay on),
 
 | Bundle | Packet | Verdict | Gap |
 | --- | --- | --- | --- |
-| gemma-4-12b | model.pkt | 20/39 | logical effects 0/19 (first: Embed) |
-| gemma-4-26b-fp8 | model.pkt | 21/41 | logical effects 0/20 (Embed) |
-| gemma-4-26b-bf16 | model.pkt | 19/37 | logical effects 0/18 (Embed) |
-| gemma-4-31b-fp8 | model.pkt | 19/37 | logical effects 0/18 (Embed) |
-| gemma-4-31b-bf16 | model.pkt | 17/33 | logical effects 0/16 (Embed) |
-| gemma-4-e4b | model.pkt | 19/37 | logical effects 0/18 (Embed) |
+| gemma-4-12b | model.pkt | 21/40 | logical effects 0/19 (first: Embed) |
+| gemma-4-26b-fp8 | model.pkt | 22/42 | logical effects 0/20 (Embed) |
+| gemma-4-26b-bf16 | model.pkt | 20/38 | logical effects 0/18 (Embed) |
+| gemma-4-31b-fp8 | model.pkt | 20/38 | logical effects 0/18 (Embed) |
+| gemma-4-31b-bf16 | model.pkt | 18/34 | logical effects 0/16 (Embed) |
+| gemma-4-e4b | model.pkt | 20/38 | logical effects 0/18 (Embed) |
 | qwen3-asr | model.pkt / encoder.pkt | 16/30 / **qualified 460/460** | logical effects 0/14 (HeadNormRope) |
 | qwen3-asr-0.6b | model.pkt / encoder.pkt | 16/30 / **qualified 360/360** | logical effects 0/14 (HeadNormRope) |
 | veena | model.pkt / codec.pkt | 16/30 / **qualified 19/19** | logical effects 0/14 (Embed) |
@@ -259,7 +259,8 @@ Strict results for the 14 H100 production bundles (`plowrt qualify`, replay on),
 | silero-vad | silero_vad.pkt | 1/3 | no receipts. Fixed the same way: rebuild byte-identical, 3/3 |
 
 Every receipt that is present binds and replays. Counts include the `media_geometry.v1`
-obligation (§10), which every speech bundle satisfies. The remaining gaps are the 34 unaudited
+obligation (§10), which every speech bundle satisfies, and the `kv_ring.v1` obligation (§11),
+which every Gemma packet satisfies. The remaining gaps are the 34 unaudited
 opcodes in §3, and a rebuild for nemotron and silero. Their builders
 (`examples/asr/{nemotron_pipeline_compile,silero_vad_compile}.rs`) now write through
 `devgen::write_sidecar_packet`. Rebuilt into scratch from the same inputs, both packets are
@@ -286,3 +287,62 @@ which `PacketAsset` validates against the tensor bytes, and from `asr_vocabulary
 multimodal contract. A missing parameter, an absent referenced sidecar, or an overflowing shape
 product rejects. Unknown fields and kinds are rejected on the Lean side. `plowrt qualify` adds the
 obligation to the packet that owns the pipeline. Load-time `strict` does not re-run it.
+
+## 11. KV ring and VMM lifecycle (`kv_ring.v1`, `vmm_trace.v1`)
+
+`Plow/KvRing.lean` holds both endpoints.
+
+- **`kv_ring.v1`.**
+  - **Input.** Launches of the form `{ring_log, window, capacity, spans:[{slot, start, len}]}`.
+  - **Contract.** `0 < window`, `ring_log < 32`, `capacity < 2^32`. Every non-empty span has
+    `window + len ≤ ring + 1` and `start + len ≤ capacity`. Non-idle slots are distinct.
+  - **Theorems.**
+    - `checkLaunch_sound`
+    - `launch_safe`: no row a span writes lands on a ring row that one of its own queries reads,
+      for absolute positions across any number of wraps.
+    - `launch_safe_masked`: the same for the kernel's `pos & (ring − 1)`, via `mask_eq_mod`.
+    - `slots_distinct`
+- **Derivation.** `plow_asset::kv_ring` builds launches from the packet's `live_kv` caches: sliding
+  rings, power-of-two stride, `mask = stride − 1`. It reads the request limit and stage rows from the
+  `packed_prefill` section. Launches come from the runtime planner itself (`plan_with_limit`,
+  `stage_slots`), run on boundary mixes:
+  - one full request ending at the context;
+  - staggered requests that wrap the ring;
+  - one one-row request, whose padding writes the rest of the bucket on an unmasked plan.
+  A span is a maximal run of one slot at consecutive positions. A negative position rejects. A slot
+  split into two runs is rejected by Lean. `plowrt qualify` adds the obligation to every packet with
+  packed prefill over a sliding ring. Production: all six Gemma packets pass.
+  - 12B, 26B and 31B: ring 2048, window 1024, staged 1024 of 4096.
+  - E4B: ring 4096, window 512, unstaged 2048.
+- **Rejected mutations.** `lean_verify` test `kv_ring` checks that these are rejected:
+  - 12B unstaged;
+  - 12B unmasked;
+  - E4B at half the ring;
+  - E4B with a wider window;
+  - a split slot;
+  - a context overrun.
+- **`vmm_trace.v1`.**
+  - **Input.** Driver events: `reserve`, `address_free`, `create`, `release`, `map`, `unmap`,
+    `access`, plus `quiesce`.
+  - **Transition relation.** `step`.
+  - **Invariant (`State.Inv`).** Mappings reference live handles, are pairwise disjoint, and lie
+    inside reservations.
+  - **Theorems.**
+    - `step_preserves`, `run_preserves`.
+    - `traceOk_sound`: every prefix of an accepted trace satisfies the invariant. With `quiesce`,
+      everything is returned.
+- **Trace source.** Real `VmmRings` traces, from `memory::vmm::ring_tests` (the mock `VmmOps`
+  records every successful call). They cover:
+  - sub-granularity shared backing, released out of order and remapped;
+  - injected create, map and access failures with prefix growth afterwards;
+  - a failure on the second tensor;
+  - reserve failures in the constructor.
+  All are accepted. These mutations are rejected:
+  - release while mapped;
+  - double release;
+  - map outside the reservation;
+  - access before map;
+  - a leaked reservation.
+- **Out of scope.** Device completion before reuse: `VmmOps` carries no retirement events, and
+  checkpoint D memory effects cover retirement. Live-context growth beyond the packet `max_ctx` is
+  not covered either: capacity is the packet's `max_ctx`, and the ring bound does not depend on it.

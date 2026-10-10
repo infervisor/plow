@@ -309,7 +309,8 @@ for exactly this.
 
 **Lean checks a change must keep green.** `scripts/lean_correctness_ci.sh` (lake build, `lake exe
 proof_audit`, approved-verifier identity, the explicit ignored CPU-verifier suites) and `plowrt
-qualify --assets <dir>` on the affected bundles. A new Lean endpoint lands with its manifest entry in
+qualify --assets <dir>` on the affected bundles (receipts plus the bundle obligations
+`media_geometry.v1` and `kv_ring.v1`). A new Lean endpoint lands with its manifest entry in
 `lean-plow/proof-manifest.json` (the audit fails otherwise), an `approved-verifiers.json` entry for the
 rebuilt verifier (a `lean_verify` test fails otherwise), and its ignored test listed in the CI script.
 New perf gates go through checkpoint P (`perf_cert.py`, `perf_gate_ci.sh`) and S (`knob_scope_ci.sh`);
