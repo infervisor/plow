@@ -261,6 +261,7 @@ impl Endpointer {
             let (index, start, speech) = (open.index, open.start, open.speech);
             open.index = self.next_index;
             open.start = cut;
+            open.last_speech_end = open.last_speech_end.max(cut);
             open.speech = 0;
             open.offered = None;
             open.recent.retain(|&(t, _)| t >= cut);
@@ -339,6 +340,30 @@ mod tests {
         assert!(segments.iter().all(|s| s.end - s.start <= 25 * 16_000));
         assert!(segments.windows(2).all(|w| w[0].end == w[1].start));
         assert_eq!(segments.last().unwrap().end, audio.len() as u64);
+    }
+
+    #[test]
+    fn a_pause_at_the_segment_limit_cuts_without_panicking() {
+        // Speech ends 24.9 s in; the limit (from 0.3 s) is crossed 0.4 s into a faint, fading pause,
+        // whose quietest frame lies past the ended speech and its context.
+        let mut audio = silence(0.5);
+        audio.extend(tone(24.4));
+        let pause = 8_000;
+        audio.extend((0..pause).map(|i| 0.001 * (1.0 - i as f32 / pause as f32) * ((i * 7919 % 1000) as f32 / 500.0 - 1.0)));
+        audio.extend(silence(1.5));
+        let mut e = Endpointer::new(CONFIG);
+        let mut segments = Vec::new();
+        for chunk in audio.chunks(320) {
+            segments.extend(e.push(chunk));
+            segments.extend(e.tentative());
+        }
+        segments.extend(e.finish());
+        assert!(segments.len() >= 2);
+        for s in &segments {
+            assert!(s.start <= s.end && s.end <= audio.len() as u64);
+            assert_eq!(s.samples.len() as u64, s.end - s.start);
+        }
+        assert!(segments.windows(2).all(|w| w[0].end <= w[1].end));
     }
 
     #[test]

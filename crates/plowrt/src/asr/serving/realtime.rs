@@ -306,6 +306,7 @@ async fn session(state: Arc<AsrServer>, mut socket: WebSocket, ids: RequestIds, 
                     if !send(&mut socket, failed).await {
                         return;
                     }
+                    break;
                 }
                 Err(SubmitError::Closed) => {
                     going_away(&mut socket, &mut out, "unavailable", "ASR engine unavailable").await;

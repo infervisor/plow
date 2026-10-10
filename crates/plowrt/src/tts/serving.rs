@@ -945,8 +945,11 @@ async fn stream_task(
                                 }
                             }
                             Some(StreamChunk::Done { .. }) => break,
-                            Some(StreamChunk::Err(e)) => return tracing::warn!(error = %e, "tts: stream LM error"),
-                            None => return,
+                            Some(StreamChunk::Err(e)) => {
+                                tracing::warn!(error = %e, "tts: stream LM error");
+                                return drop(ftx.send(SegMsg::Err(e.to_string())));
+                            }
+                            None => return drop(ftx.send(SegMsg::Err("stream LM ended before its segment".into()))),
                         }
                     }
                     drop(rx);
