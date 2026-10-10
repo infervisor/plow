@@ -320,6 +320,7 @@ async fn strict_arguments_are_validated() {
     assert_eq!(arg_frames, 1);
 }
 
+#[cfg(any(feature = "cuda", feature = "cpu"))]
 #[tokio::test]
 async fn logprobs_ride_tool_call_deltas() {
     let h = harness();
