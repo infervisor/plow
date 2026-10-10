@@ -76,9 +76,11 @@ time eight heuristic candidates per shape at load.
 - **Row**: `device::cuda::lt::StoredAlgo` — `m, n, k, dtype ("bf16"), gpu` (cuDevice name), the
   opaque 64-byte `cublasLtMatmulAlgo_t` as 8 hex words, `workspace`, `matmul_us`; `pair: true` for a
   two-projection strided-batch plan (k/v, gate/up); `ns` when the plan serves instruction N other
-  than `n` (fused q|k|v `n = nq+nk+nv`, an lm_head on its first `n & !15` columns). Probe rows add
-  `commit`, `recipe`, `utc` as provenance only.
-- **Key**: `(m, n, k, dtype, pair)`. Rows are reused across commits, bundles and models with the same
+  than `n` (fused q|k|v `n = nq+nk+nv`, an lm_head on its first `n & !15` columns); `rows` when the
+  pick was timed across every routed decode rung (the widest rung's plan pinned for the narrower
+  ones, `PLOW_LT_RUNG_ALGOS` off). Probe rows add `commit`, `recipe`, `utc` as provenance only.
+- **Key**: `(m, n, k, dtype, pair, rows)`. A per-rung pick never pins a cross-rung plan: on Gemma-4
+  E4B that substitution cost 25% C1 TPOT. Rows are reused across commits, bundles and models with the same
   shape: plowrt re-validates each pinned row with `cublasLtMatmulAlgoCheck` against the live layout
   and library and re-selects on refusal, so a stale row costs load time, never a wrong launch. The
   commit is recorded, never matched.
