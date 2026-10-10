@@ -587,7 +587,6 @@ impl AudioLmPrompt {
         max_context: usize,
     ) -> Result<AudioLmRequest> {
         let language = self.language(language)?;
-        self.check_context(context)?;
         let features = self.features(samples)?;
         let rows = self.contract.chunking.rows(features.frames);
         let (ids, audio_positions) = self.prompt(rows, language.as_deref(), context, max_context)?;
@@ -595,11 +594,14 @@ impl AudioLmPrompt {
     }
 
     /// Its length is not checked here: [`Self::prompt`] fits the context to each request's window.
-    fn check_context(&self, context: &str) -> Result<()> {
-        if self.contract.forbidden.iter().any(|marker| context.contains(marker.as_str())) {
-            return Err(RuntimeError::Rejected("ASR prompt contains control markers".into()));
+    /// `context` without the template's control markers: a client's text cannot open or close
+    /// a turn of the prompt. Removal repeats until none remains (a removal can join a new one).
+    fn clean_context<'a>(&self, context: &'a str) -> std::borrow::Cow<'a, str> {
+        let mut context = std::borrow::Cow::Borrowed(context);
+        while let Some(marker) = self.contract.forbidden.iter().find(|m| !m.is_empty() && context.contains(m.as_str())) {
+            context = context.replace(marker.as_str(), " ").into();
         }
-        Ok(())
+        context
     }
 
     /// Positions kept free for the transcript: one per audio row (about 13 a second, where speech
@@ -686,7 +688,8 @@ impl AudioLmPrompt {
         max_context: usize,
     ) -> Result<(Vec<u32>, Vec<usize>)> {
         let c = &self.contract;
-        let context = self.fit_context(rows, language, context, max_context)?;
+        let cleaned = self.clean_context(context);
+        let context = self.fit_context(rows, language, &cleaned, max_context)?;
         let ids = self.encode_prompt(rows, language, context)?;
         // Served, the transcript budget (`max_tokens`) is fitted to the context by the mux, so a
         // narrowed bound (`--live-ctx-models`) caps long transcripts instead of refusing audio.
@@ -708,11 +711,9 @@ impl AudioLmPrompt {
         Ok((ids, audio_positions))
     }
 
-    /// Resolve `language` and check `context` once for a stream of partial prompts.
-    pub fn stream_language(&self, language: Option<&str>, context: &str) -> Result<Option<String>> {
-        let language = self.language(language)?;
-        self.check_context(context)?;
-        Ok(language)
+    /// Resolve `language` once for a stream of partial prompts.
+    pub fn stream_language(&self, language: Option<&str>, _context: &str) -> Result<Option<String>> {
+        self.language(language)
     }
 
     pub(crate) fn chunking(&self) -> AudioChunking {

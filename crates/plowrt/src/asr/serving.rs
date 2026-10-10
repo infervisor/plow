@@ -114,9 +114,12 @@ pub(crate) struct AsrOpts {
 }
 
 impl Route {
-    /// [`Self::submit_once`], then the transcript's output policy: spoken digits as numerals
-    /// (`--asr-numerals`) and, for a final pass that named no language, one retry in the first
-    /// `--asr-auto-languages` language when the model detected another.
+    /// [`Self::submit_once`], then the transcript's output policy, on a final pass:
+    /// - with the client's context: once more without it when the transcript reads the context back
+    ///   ([`echoes`]), loops ([`collapse_repeats`]) or overruns its token limit;
+    /// - with no language named: once more in the first `--asr-auto-languages` language when the
+    ///   model detected another.
+    /// Then repeats are collapsed and spoken digits written as numerals (`--asr-numerals`).
     fn submit(
         &self,
         samples: Vec<f32>,
@@ -127,31 +130,50 @@ impl Route {
     ) -> Result<oneshot::Receiver<crate::Result<Transcript>>, SubmitError> {
         let config = crate::config::RuntimeConfig::get();
         let allowed: Vec<String> = config.asr_auto_languages.iter().map(|l| l.trim().to_owned()).filter(|l| !l.is_empty()).collect();
-        let retry = (language.is_none() && opts.final_pass && !allowed.is_empty())
-            .then(|| (samples.clone(), context.clone(), cancel.clone()));
+        let second_pass = opts.final_pass && (!context.is_empty() || language.is_none() && !allowed.is_empty());
+        let saved = second_pass.then(|| (samples.clone(), language.clone(), context.clone(), cancel.clone()));
         let numerals = config.asr_numerals;
         let first = self.submit_once(samples, language, context, cancel, opts)?;
-        if retry.is_none() && !numerals {
-            return Ok(first);
-        }
         let route = self.clone();
         let (tx, rx) = oneshot::channel();
         tokio::spawn(async move {
             let Ok(mut result) = first.await else { return };
-            let detected = result.as_ref().ok().and_then(|t| t.language.clone());
-            if let (Some((samples, context, cancel)), Some(detected)) = (retry, detected) {
-                if !allowed.iter().any(|l| l.eq_ignore_ascii_case(&detected)) {
-                    tracing::debug!(%detected, retry = %allowed[0], "ASR language outside --asr-auto-languages");
+            if let Some((samples, language, mut context, cancel)) = saved {
+                let again = |language: Option<String>, context: String| {
                     let opts = AsrOpts { final_pass: true, ..Default::default() };
-                    if let Ok(again) = route.submit_once(samples, Some(allowed[0].clone()), context, cancel, opts) {
-                        if let Ok(again) = again.await {
-                            result = again;
+                    route.submit_once(samples.clone(), language, context, cancel.clone(), opts).ok()
+                };
+                let misled = !context.is_empty()
+                    && match &result {
+                        Ok(t) => echoes(&context, &t.text) || collapse_repeats(&t.text).is_some(),
+                        Err(error) => error.to_string().contains("output token limit"),
+                    };
+                if misled {
+                    tracing::debug!("ASR transcript followed its context; transcribing without it");
+                    context.clear();
+                    if let Some(rx) = again(language.clone(), String::new()) {
+                        if let Ok(retried) = rx.await {
+                            result = retried;
+                        }
+                    }
+                }
+                let detected = result.as_ref().ok().and_then(|t| t.language.clone());
+                if let (None, Some(detected)) = (&language, detected) {
+                    if !allowed.is_empty() && !allowed.iter().any(|l| l.eq_ignore_ascii_case(&detected)) {
+                        tracing::debug!(%detected, retry = %allowed[0], "ASR language outside --asr-auto-languages");
+                        if let Some(rx) = again(Some(allowed[0].clone()), context) {
+                            if let Ok(retried) = rx.await {
+                                result = retried;
+                            }
                         }
                     }
                 }
             }
-            if numerals {
-                if let Ok(transcript) = &mut result {
+            if let Ok(transcript) = &mut result {
+                if let Some(collapsed) = collapse_repeats(&transcript.text) {
+                    transcript.text = collapsed;
+                }
+                if numerals {
                     transcript.text = crate::asr::numerals::spoken_digits_to_numerals(&transcript.text);
                 }
             }
@@ -190,6 +212,53 @@ impl Route {
         }
         false
     }
+}
+
+fn words(text: &str) -> Vec<String> {
+    text.split_whitespace()
+        .map(|w| w.chars().filter(|c| c.is_alphanumeric()).collect::<String>().to_lowercase())
+        .filter(|w| !w.is_empty())
+        .collect()
+}
+
+/// Whether `text` reads back `context`: eight consecutive context words in it.
+fn echoes(context: &str, text: &str) -> bool {
+    const RUN: usize = 8;
+    let context = words(context);
+    let seen: std::collections::HashSet<&[String]> = context.windows(RUN).collect();
+    words(text).windows(RUN).any(|w| seen.contains(w))
+}
+
+/// `text` with every phrase (one to eight words) said five or more times in a row kept once:
+/// the shape of a decoder loop, not of speech. `None` when nothing repeats so.
+fn collapse_repeats(text: &str) -> Option<String> {
+    const TIMES: usize = 5;
+    let tokens: Vec<&str> = text.split_whitespace().collect();
+    let keys: Vec<String> = tokens.iter().map(|t| words(t).concat()).collect();
+    let mut keep = Vec::with_capacity(tokens.len());
+    let mut i = 0;
+    let mut collapsed = false;
+    'scan: while i < tokens.len() {
+        for n in 1..=8 {
+            let unit = &keys[i..(i + n).min(keys.len())];
+            if unit.len() < n || unit.iter().all(String::is_empty) {
+                break;
+            }
+            let mut times = 1;
+            while keys.get(i + times * n..i + (times + 1) * n) == Some(unit) {
+                times += 1;
+            }
+            if times >= TIMES {
+                keep.extend_from_slice(&tokens[i..i + n]);
+                i += times * n;
+                collapsed = true;
+                continue 'scan;
+            }
+        }
+        keep.push(tokens[i]);
+        i += 1;
+    }
+    collapsed.then(|| keep.join(" "))
 }
 
 #[derive(Clone)]
@@ -2439,6 +2508,58 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let response = app.oneshot(upload("/v1/audio/transcriptions", &[("model", "test")], &[])).await.unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn echoes_need_eight_consecutive_context_words() {
+        let context = "A phone call to the front desk of a US law firm. Callers give their name.";
+        assert!(echoes(context, "Okay. A phone call to the front desk of a US law firm."));
+        assert!(!echoes(context, "I'm calling the law firm about my phone call to the front office."));
+        assert!(!echoes("", "anything at all here in this text"));
+    }
+
+    #[test]
+    fn decoder_loops_collapse_and_speech_stays() {
+        assert_eq!(collapse_repeats("Beep. Beep. Beep. Beep. Beep. Beep. Hello?").as_deref(), Some("Beep. Hello?"));
+        assert_eq!(
+            collapse_repeats("I said thank you, thank you, thank you, thank you, thank you, thank you bye").as_deref(),
+            Some("I said thank you, bye")
+        );
+        for speech in ["No, no, no, I didn't.", "Okay. Okay. Thank you.", "nine one one", ""] {
+            assert_eq!(collapse_repeats(speech), None);
+        }
+    }
+
+    /// Reads back any context it is given (a short or near-silent turn under a forced language);
+    /// without one, transcribes; with `loop` as the language, overruns its token limit.
+    struct Echo(Arc<std::sync::atomic::AtomicUsize>);
+    impl Transcriber for Echo {
+        fn language(&self, language: Option<&str>) -> crate::Result<Option<String>> {
+            Ok(language.map(str::to_owned))
+        }
+        fn transcribe(&mut self, _: &[f32], language: Option<&str>, context: &str, _: &AtomicBool) -> crate::Result<Transcript> {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            if !context.is_empty() && language == Some("loop") {
+                return Err(crate::RuntimeError::Rejected("ASR exceeded output token limit".into()));
+            }
+            let text = if context.is_empty() { "Yes, please." } else { context };
+            Ok(Transcript { text: text.into(), language: language.map(str::to_owned) })
+        }
+    }
+
+    #[tokio::test]
+    async fn a_transcript_misled_by_its_context_is_redone_without_it() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let app = AsrServer::new("test".into(), Echo(calls.clone())).router(false);
+        let prompt = "A phone call to the front desk of a US law firm. Callers give their name.";
+        let body = |r: Response| async { r.into_body().collect().await.unwrap().to_bytes() };
+        for language in ["English", "loop"] {
+            let before = calls.load(Ordering::Relaxed);
+            let fields = [("model", "test"), ("language", language), ("prompt", prompt)];
+            let response = app.clone().oneshot(upload("/v1/audio/transcriptions", &fields, &[0.1; 16_000])).await.unwrap();
+            assert_eq!(&body(response).await[..], br#"{"text":"Yes, please."}"#, "{language}");
+            assert_eq!(calls.load(Ordering::Relaxed) - before, 2);
+        }
     }
 
     #[tokio::test]
