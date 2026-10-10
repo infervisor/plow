@@ -44,7 +44,11 @@ pub fn require(router: Router, keys: &[ApiKey]) -> Router {
 /// `Authorization: Bearer <key>`, else `x-api-key: <key>`, else (browsers cannot set WebSocket
 /// headers) the OpenAI Realtime subprotocol `openai-insecure-api-key.<key>`.
 fn presented(request: &Request) -> Option<&[u8]> {
-    let headers = request.headers();
+    presented_key(request.headers())
+}
+
+/// [`presented`] from the headers alone.
+pub(crate) fn presented_key(headers: &axum::http::HeaderMap) -> Option<&[u8]> {
     if let Some(value) = headers.get(header::AUTHORIZATION) {
         let value = value.as_bytes();
         return (value.len() > 7 && value[..7].eq_ignore_ascii_case(b"bearer ")).then(|| value[7..].trim_ascii());

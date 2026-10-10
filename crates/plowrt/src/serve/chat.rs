@@ -538,6 +538,7 @@ async fn chat_completions_with(
             session,
             turn: run.key(),
             continuing: run.continuing(),
+            tenant: ids.tenant,
             prefix: prefix.take(),
             mm: mm_job,
             ..Default::default()

@@ -371,6 +371,7 @@ async fn completions_with(
             session,
             turn: run.key(),
             continuing: run.continuing(),
+            tenant: ids.tenant,
             prefix: prefix.take(),
             ..Default::default()
         },

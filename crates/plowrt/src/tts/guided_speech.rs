@@ -683,6 +683,8 @@ impl GuidedSpeech {
                     first_tokens: if class == JobClass::Critical { self.first_tokens } else { 0 },
                 })),
                 prefix: None,
+                tenant: None,
+                round: 0,
                 mm: None,
             },
         })

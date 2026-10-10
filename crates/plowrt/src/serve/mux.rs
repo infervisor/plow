@@ -236,6 +236,11 @@ pub struct JobOpts {
     /// A later turn of a session that already had one: seated ahead of requests opening a
     /// session, until either has waited [`crate::serve::cosched::max_wait`].
     pub continuing: bool,
+    /// Whose request this is ([`crate::serve::session::RequestIds::tenant`]): within a class, queued
+    /// tenants are seated round-robin ([`Fair`]); `None` is a tenant of its own.
+    pub tenant: Option<u64>,
+    /// [`Fair`]'s start round, set when the job is first ordered in the queue (0: not yet).
+    pub(crate) round: u64,
     /// The prompt's prefix-cache block hashes, when the DP router already computed them.
     pub prefix: Option<crate::memory::vmm::PrefixKey>,
     /// Multimodal soft-token rows the prompt's bit-31 ids name (`serve::mm`).
@@ -484,7 +489,13 @@ pub struct ModelMux {
     ingress: Arc<Ingress>,
     /// Set by [`ModelMux::preempt`] and never cleared: held work submitting later fails retryably.
     preempted: Arc<std::sync::atomic::AtomicBool>,
+    /// Requests that may wait outside the slot table (`--serve-max-queued-requests`), counted by
+    /// `metrics.queued_requests` from submit until the job is seated or leaves.
+    queue_cap: usize,
 }
+
+/// Channel room past [`ModelMux::queue_cap`] jobs, for control messages.
+const CONTROL_SLACK: usize = 8;
 
 /// What a request submitting to a preempted mux is told (503-class).
 pub const PREEMPTED: &str = "model preempted — retry";
@@ -661,6 +672,19 @@ impl ModelMux {
         self.submit_arrived(job, arrived, None)
     }
 
+    /// Counts one request against [`Self::queue_cap`]; `false` (nothing counted) when it is full.
+    fn reserve_queue(&self) -> bool {
+        let queued = &self.metrics.queued_requests;
+        let mut n = queued.load(Ordering::Relaxed);
+        while n < self.queue_cap as u64 {
+            match queued.compare_exchange_weak(n, n + 1, Ordering::AcqRel, Ordering::Relaxed) {
+                Ok(_) => return true,
+                Err(now) => n = now,
+            }
+        }
+        false
+    }
+
     pub fn submit_arrived(
         &self,
         job: Job,
@@ -669,9 +693,12 @@ impl ModelMux {
     ) -> std::result::Result<(), SubmitError> {
         Metrics::inc(&self.metrics.requests);
         self.metrics.serving.max_tokens.tokens(job.gen.max_tokens);
-        Metrics::inc(&self.metrics.queued_requests);
         // Released before the send: a dispatcher that dequeues this job must not see it as a peer.
         drop(ingress);
+        if !self.reserve_queue() {
+            Metrics::inc(&self.metrics.rejected);
+            return Err(if self.tx.is_closed() { SubmitError::Closed(job) } else { SubmitError::Full(job) });
+        }
         let urgent = job.opts.class != JobClass::Bulk;
         match self.tx.try_send(MuxMsg::Job(job, arrived)) {
             Ok(()) => {
@@ -699,7 +726,15 @@ impl ModelMux {
     pub async fn submit_wait(&self, job: Job) -> std::result::Result<(), SubmitError> {
         Metrics::inc(&self.metrics.requests);
         self.metrics.serving.max_tokens.tokens(job.gen.max_tokens);
-        Metrics::inc(&self.metrics.queued_requests);
+        while !self.reserve_queue() {
+            tokio::select! {
+                _ = self.tx.closed() => {
+                    Metrics::inc(&self.metrics.rejected);
+                    return Err(SubmitError::Closed(job));
+                }
+                _ = tokio::time::sleep(std::time::Duration::from_millis(2)) => {}
+            }
+        }
         let arrived = job.arrived;
         let urgent = job.opts.class != JobClass::Bulk;
         self.tx.send(MuxMsg::Job(job, arrived)).await.map_err(|mpsc::error::SendError(msg)| {
@@ -934,7 +969,7 @@ pub fn spawn(
     } else {
         cfg.max_queued_requests
     };
-    let (tx, mut rx) = mpsc::channel::<MuxMsg>(ingress_capacity);
+    let (tx, mut rx) = mpsc::channel::<MuxMsg>(ingress_capacity + CONTROL_SLACK);
     tracing::info!(%slug, capacity, ingress_capacity, "mux capacity resolved");
     metrics.slots_capacity.store(capacity as u64, Ordering::Relaxed);
 
@@ -973,17 +1008,15 @@ pub fn spawn(
             "mux: KV-capacity admission armed"
         );
     }
-    // Jobs the KV budget could not back yet. Retried in arrival order ahead of anything
-    // newer, so the budget never reorders the queue.
+    // Every queued job: the dispatcher moves each one off the channel as it arrives, and seats
+    // them in `seat_order`. Its length is bounded at submit (`ModelMux::queue_cap`).
     //
     // NOT a single blocking slot. A large request at the head must not idle slots that a
     // smaller one behind it would fill: with no preemption path, a held request frees nothing
     // by waiting, so refusing to look past it converts "this one does not fit" into "nothing
     // runs". vLLM tolerates the same head-of-line stall only because it preempts a running
     // request to make room; until plow does, backfilling is what keeps the batch full.
-    // The internal deque is capped at `ingress_capacity`; once full, new arrivals stay in the
-    // bounded channel until a waiter is admitted. A request that can never fit is answered, not
-    // parked (see `admit_into`).
+    // A request that can never fit is answered, not parked (see `admit_into`).
     let mut waiting: std::collections::VecDeque<(Job, Instant)> = std::collections::VecDeque::new();
 
     // Per-model KV arena from the first decode bucket that declares paging
@@ -1048,6 +1081,7 @@ pub fn spawn(
 
     let dispatcher = async move {
         let mut slots: Vec<Option<Slot>> = (0..capacity).map(|_| None).collect();
+        let mut fair = Fair::default();
         let mut retention = Retention::new(
             resume_supported,
             prefix_cache,
@@ -1160,13 +1194,9 @@ pub fn spawn(
             // however late its job reached the channel.
             if drained && !preempted {
                 while let Ok(msg) = rx.try_recv() {
-                    note_dequeued(&msg, &metrics);
                     match msg {
                         MuxMsg::Drain(done) => late_drains.push(done),
-                        MuxMsg::Job(job, arrived) => {
-                            Metrics::inc(&metrics.queued_requests);
-                            waiting.push_back((job, arrived));
-                        }
+                        MuxMsg::Job(job, arrived) => waiting.push_back((job, arrived)),
                     }
                 }
             }
@@ -1218,7 +1248,6 @@ pub fn spawn(
                     _ = ingress_seen.idle.notified(), if draining => continue,
                 };
                 let Some(msg) = msg else { break };
-                note_dequeued(&msg, &metrics);
                 match msg {
                     MuxMsg::Job(job, arrived) => {
                         note_arrival(job.arrived, &mut load, &metrics);
@@ -1234,9 +1263,9 @@ pub fn spawn(
                             downstream.full(),
                             &mut retention,
                         );
-                        if let Some(j) = held {
-                            Metrics::inc(&metrics.queued_requests);
-                            waiting.push_back(j);
+                        match held {
+                            Some(j) => waiting.push_back(j),
+                            None => note_left(&metrics),
                         }
                     }
                     // No in-flight work: the drain check at the loop top finishes, after serving
@@ -1249,6 +1278,13 @@ pub fn spawn(
                         }
                     }
                 }
+            }
+
+            // Every job on the channel joins `waiting`: its seat order, the class deadline
+            // (`tick_due`) and the rung controller see the whole queue. A preempt serves nothing
+            // more; its exit answers what is left on the channel.
+            if !preempted {
+                drain_channel(&mut rx, &mut waiting, &mut load, &metrics, &mut draining, &mut drain_done, &mut late_drains);
             }
 
             // A decode ladder controls ADMISSION separately from execution.
@@ -1368,13 +1404,14 @@ pub fn spawn(
                     downstream.full(),
                     &mut retention,
                     prefix_probe.as_ref(),
+                    &mut fair,
                 );
             }
             let idle = slots[..admission_limit]
                 .iter()
                 .filter(|s| s.is_none())
                 .count();
-            if !draining && waiting.len() < ingress_capacity && idle > 0 {
+            if !draining && idle > 0 {
                 let lambda = load.lambda.rate(Instant::now());
                 // Only hold when the slot table is empty (cold-start burst);
                 // if any slot is already live, spinning up the tick delivers
@@ -1395,16 +1432,13 @@ pub fn spawn(
                     Metrics::inc(&metrics.hold_count);
                     let deadline =
                         Instant::now() + std::time::Duration::from_secs_f64(hold_ms / 1000.0);
-                    while waiting.len() < ingress_capacity
-                        && slots[..admission_limit].iter().any(|s| s.is_none())
-                    {
+                    while slots[..admission_limit].iter().any(|s| s.is_none()) {
                         let remaining = deadline.saturating_duration_since(Instant::now());
                         if remaining.is_zero() {
                             break;
                         }
                         match tokio::time::timeout(remaining, rx.recv()).await {
                             Ok(Some(msg)) => {
-                                note_dequeued(&msg, &metrics);
                                 match msg {
                                     MuxMsg::Job(job, arrived) => {
                                         note_arrival(job.arrived, &mut load, &metrics);
@@ -1426,9 +1460,9 @@ pub fn spawn(
                                             queued_behind = true;
                                             Some((job, arrived))
                                         };
-                                        if let Some(j) = held {
-                                            Metrics::inc(&metrics.queued_requests);
-                                            waiting.push_back(j);
+                                        match held {
+                                            Some(j) => waiting.push_back(j),
+                                            None => note_left(&metrics),
                                         }
                                         if cfg.idle_dispatch
                                             && rx.is_empty()
@@ -1438,8 +1472,7 @@ pub fn spawn(
                                         }
                                     }
                                     MuxMsg::Drain(done) => {
-                                        draining = true;
-                                        drain_done = Some(done);
+                                        note_drain(done, &mut draining, &mut drain_done, &mut late_drains);
                                         break;
                                     }
                                 }
@@ -1449,52 +1482,12 @@ pub fn spawn(
                         }
                     }
                 }
-                // Any additional pending arrivals (no wait).
-                while !draining
-                    && waiting.len() < ingress_capacity
-                    && slots[..admission_limit].iter().any(|s| s.is_none())
-                {
-                    match rx.try_recv() {
-                        Ok(msg) => {
-                            note_dequeued(&msg, &metrics);
-                            match msg {
-                                MuxMsg::Job(job, arrived) => {
-                                    note_arrival(job.arrived, &mut load, &metrics);
-                                    let held = if waiting.is_empty() {
-                                        admit_session(
-                                            &mut slots,
-                                            admission_limit,
-                                            job,
-                                            arrived,
-                                            arena.as_ref(),
-                                            &metrics,
-                                            &health,
-                                            kv_budget,
-                                            downstream.full(),
-                                            &mut retention,
-                                        )
-                                    } else {
-                                        queued_behind = true;
-                                        Some((job, arrived))
-                                    };
-                                    if let Some(j) = held {
-                                        Metrics::inc(&metrics.queued_requests);
-                                        waiting.push_back(j);
-                                    }
-                                }
-                                MuxMsg::Drain(done) => {
-                                    draining = true;
-                                    drain_done = Some(done);
-                                    break;
-                                }
-                            }
-                        }
-                        Err(_) => break,
-                    }
-                }
             }
-            // An arrival never takes a slot ahead of an older waiter: it joined the queue, which
-            // is drained again in its seat order.
+            // Arrivals during the hold join the queue, which is drained again in its seat order:
+            // an arrival never takes a slot ahead of an older or more urgent waiter.
+            if !preempted && drain_channel(&mut rx, &mut waiting, &mut load, &metrics, &mut draining, &mut drain_done, &mut late_drains) > 0 {
+                queued_behind = true;
+            }
             if std::mem::take(&mut queued_behind) {
                 drain_waiting_session(
                     &mut waiting,
@@ -1509,28 +1502,8 @@ pub fn spawn(
                     downstream.full(),
                     &mut retention,
                     prefix_probe.as_ref(),
+                    &mut fair,
                 );
-            }
-            // A full slot table leaves arrivals in the channel in arrival order; in `waiting`,
-            // `drain_waiting` seats them by class as slots free.
-            while !draining
-                && waiting.len() < ingress_capacity
-                && !rx.is_empty()
-                && slots[..admission_limit].iter().all(Option::is_some)
-            {
-                let Ok(msg) = rx.try_recv() else { break };
-                note_dequeued(&msg, &metrics);
-                match msg {
-                    MuxMsg::Job(job, arrived) => {
-                        note_arrival(job.arrived, &mut load, &metrics);
-                        Metrics::inc(&metrics.queued_requests);
-                        waiting.push_back((job, arrived));
-                    }
-                    MuxMsg::Drain(done) => {
-                        draining = true;
-                        drain_done = Some(done);
-                    }
-                }
             }
 
             let live = slots.iter().filter(|s| s.is_some()).count();
@@ -1905,13 +1878,60 @@ pub fn spawn(
         arrival_notify,
         ingress,
         preempted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        queue_cap: ingress_capacity,
     }
 }
 
+/// A message leaves the channel without its job being queued or seated (the dispatcher exits).
 fn note_dequeued(msg: &MuxMsg, metrics: &Metrics) {
     if matches!(msg, MuxMsg::Job(_, _)) {
-        metrics.queued_requests.fetch_sub(1, Ordering::Relaxed);
+        note_left(metrics);
     }
+}
+
+/// A job leaves the queue: seated, answered or dropped.
+fn note_left(metrics: &Metrics) {
+    metrics.queued_requests.fetch_sub(1, Ordering::Relaxed);
+}
+
+fn note_drain(
+    done: tokio::sync::oneshot::Sender<()>,
+    draining: &mut bool,
+    drain_done: &mut Option<tokio::sync::oneshot::Sender<()>>,
+    late_drains: &mut Vec<tokio::sync::oneshot::Sender<()>>,
+) {
+    *draining = true;
+    match drain_done {
+        None => *drain_done = Some(done),
+        Some(_) => late_drains.push(done),
+    }
+}
+
+/// Moves every message on the channel into the dispatcher: jobs onto the back of `waiting`
+/// (`drain_waiting_session` seats them in seat order), drains into the drain state. Returns the
+/// jobs moved.
+#[allow(clippy::too_many_arguments)]
+fn drain_channel(
+    rx: &mut mpsc::Receiver<MuxMsg>,
+    waiting: &mut std::collections::VecDeque<(Job, Instant)>,
+    load: &mut LoadEstimator,
+    metrics: &Metrics,
+    draining: &mut bool,
+    drain_done: &mut Option<tokio::sync::oneshot::Sender<()>>,
+    late_drains: &mut Vec<tokio::sync::oneshot::Sender<()>>,
+) -> usize {
+    let mut jobs = 0;
+    while let Ok(msg) = rx.try_recv() {
+        match msg {
+            MuxMsg::Job(job, arrived) => {
+                note_arrival(job.arrived, load, metrics);
+                waiting.push_back((job, arrived));
+                jobs += 1;
+            }
+            MuxMsg::Drain(done) => note_drain(done, draining, drain_done, late_drains),
+        }
+    }
+    jobs
 }
 
 fn note_arrival(now: Instant, load: &mut LoadEstimator, metrics: &Metrics) {
@@ -2028,9 +2048,16 @@ fn waiter_seatable(
 
 /// Seat order of a queued request: class first; within a class, every request that has waited
 /// `bound` oldest first, then continuing session turns, then requests opening a session, each by
-/// arrival. A continuing turn overtakes a new session by at most `bound`.
+/// [`Fair`] round, then arrival. A continuing turn overtakes a new session by at most `bound`.
 #[inline]
-fn seat_order(class: JobClass, continuing: bool, arrived: Instant, now: Instant, bound: std::time::Duration) -> (JobClass, u8, Instant) {
+fn seat_order(
+    class: JobClass,
+    continuing: bool,
+    round: u64,
+    arrived: Instant,
+    now: Instant,
+    bound: std::time::Duration,
+) -> (JobClass, u8, u64, Instant) {
     let tier = if now.saturating_duration_since(arrived) >= bound {
         0
     } else if continuing {
@@ -2038,7 +2065,40 @@ fn seat_order(class: JobClass, continuing: bool, arrived: Instant, now: Instant,
     } else {
         2
     };
-    (class, tier, arrived)
+    (class, tier, if tier == 0 { 0 } else { round }, arrived)
+}
+
+/// Round-robin across tenants (start-time fair queuing, one unit per request): a job's round is
+/// the later of the current round and its tenant's previous job's round + 1, so a tenant with
+/// many queued jobs takes one seat per round while each other tenant takes theirs, and one
+/// tenant's jobs keep their arrival order. Jobs without a tenant start at the current round,
+/// which keeps their arrival order too. The round advances to each seated job's.
+#[derive(Default)]
+struct Fair {
+    round: u64,
+    next: FxHashMap<u64, u64>,
+}
+
+/// Tenants [`Fair`] remembers before it forgets those with no job past the current round.
+const FAIR_TENANTS: usize = 4096;
+
+impl Fair {
+    fn start(&mut self, tenant: Option<u64>) -> u64 {
+        let round = self.round.max(1);
+        let Some(t) = tenant else { return round };
+        if self.next.len() >= FAIR_TENANTS {
+            let now = self.round;
+            self.next.retain(|_, next| *next > now);
+        }
+        let next = self.next.entry(t).or_insert(round);
+        let start = round.max(*next);
+        *next = start + 1;
+        start
+    }
+
+    fn seated(&mut self, round: u64) {
+        self.round = self.round.max(round);
+    }
 }
 
 /// The head of the queue keeps its seat against [`cache_first`] once it has waited this long.
@@ -2072,7 +2132,7 @@ fn waited_ms(now: Instant, arrived: Instant) -> f64 {
 /// * **Sweep.** A disconnected client and a request past its TTL both hold a queue entry they
 ///   will never use. The per-request disconnect check in [`admit_into`] only fires when a slot
 ///   is free, so with a full slot table those entries used to sit in `waiting` indefinitely,
-///   counting against `ingress_capacity` and inflating the backlog the rung controller widens
+///   counting against the queue bound and inflating the backlog the rung controller widens
 ///   against. Sweeping is unconditional and costs one atomic load per queued entry.
 /// * **Aging.** The first request that does not fit and has waited past
 ///   [`queue_aging_ms`] stops the pass. Younger requests keep backfilling until then, so the
@@ -2109,6 +2169,7 @@ fn drain_waiting(
         downstream_full,
         &mut Retention::off(),
         None,
+        &mut Fair::default(),
     )
 }
 
@@ -2126,6 +2187,7 @@ fn drain_waiting_session(
     downstream_full: bool,
     retention: &mut Retention,
     prefix: Option<&crate::memory::vmm::PrefixProbe>,
+    fair: &mut Fair,
 ) {
     waiting.retain(|(job, arrived)| {
         let class = job.opts.class;
@@ -2150,8 +2212,13 @@ fn drain_waiting_session(
         }
     });
 
+    for (job, _) in waiting.iter_mut().filter(|(job, _)| job.opts.round == 0) {
+        job.opts.round = fair.start(job.opts.tenant);
+    }
     let bound = crate::serve::cosched::max_wait();
-    let order = |(job, arrived): &(Job, Instant)| seat_order(job.opts.class, job.opts.continuing, *arrived, now, bound);
+    let order = |(job, arrived): &(Job, Instant)| {
+        seat_order(job.opts.class, job.opts.continuing, job.opts.round, *arrived, now, bound)
+    };
     let queue = waiting.make_contiguous();
     if !queue.is_sorted_by_key(order) {
         queue.sort_by_key(order);
@@ -2186,6 +2253,7 @@ fn drain_waiting_session(
         let Some((job, arrived)) = waiting.pop_front() else {
             break;
         };
+        let round = job.opts.round;
         match admit_session(
             slots,
             admission_limit,
@@ -2208,6 +2276,7 @@ fn drain_waiting_session(
             None => {
                 // Seated: count it active now, not at the next loop top a long prefill tick away,
                 // so a load reader (the DP router) never sees it in neither gauge.
+                fair.seated(round);
                 metrics.queued_requests.fetch_sub(1, Ordering::Relaxed);
                 metrics.slots_active.fetch_add(1, Ordering::Relaxed);
             }
@@ -6902,6 +6971,7 @@ pub(crate) fn scripted_mux(script: impl Fn(&Job) -> Vec<String> + Send + Sync + 
         arrival_notify: Arc::new(tokio::sync::Notify::new()),
         ingress: Arc::default(),
         preempted: Arc::default(),
+        queue_cap: usize::MAX,
     }
 }
 
@@ -7216,7 +7286,7 @@ mod tests {
     #[test]
     fn bounded_ingress_reports_full_closed_and_depth() {
         let metrics = Arc::new(Metrics::default());
-        let (tx, mut rx) = mpsc::channel(1);
+        let (tx, mut rx) = mpsc::channel(1 + CONTROL_SLACK);
         let mux = ModelMux {
             tx,
             metrics: Arc::clone(&metrics),
@@ -7225,6 +7295,7 @@ mod tests {
             arrival_notify: Arc::new(tokio::sync::Notify::new()),
             ingress: Arc::default(),
             preempted: Arc::default(),
+            queue_cap: 1,
         };
 
         let (a, b) = (mux.ingress(), mux.ingress());
@@ -7248,6 +7319,65 @@ mod tests {
             Err(SubmitError::Closed(_))
         ));
         assert_eq!(metrics.queued_requests.load(Ordering::Relaxed), 0);
+    }
+
+    /// `--serve-max-queued-requests N` holds N, however many of them the dispatcher already moved
+    /// off the channel; a job leaving the queue makes room for one more.
+    #[test]
+    fn the_queue_bound_counts_jobs_off_the_channel_too() {
+        let metrics = Arc::new(Metrics::default());
+        let (tx, mut rx) = mpsc::channel(3 + CONTROL_SLACK);
+        let mux = ModelMux {
+            tx,
+            metrics: Arc::clone(&metrics),
+            preempt: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            preempt_notify: Arc::new(tokio::sync::Notify::new()),
+            arrival_notify: Arc::new(tokio::sync::Notify::new()),
+            ingress: Arc::default(),
+            preempted: Arc::default(),
+            queue_cap: 3,
+        };
+        let (mut waiting, mut load) = (std::collections::VecDeque::new(), LoadEstimator::default());
+        let (mut draining, mut drain_done, mut late) = (false, None, Vec::new());
+        for _ in 0..3 {
+            assert!(mux.submit(test_job()).is_ok());
+        }
+        assert!(matches!(mux.submit(test_job()), Err(SubmitError::Full(_))));
+        assert_eq!(drain_channel(&mut rx, &mut waiting, &mut load, &metrics, &mut draining, &mut drain_done, &mut late), 3);
+        assert_eq!((waiting.len(), mux.pending()), (3, 3));
+        assert!(matches!(mux.submit(test_job()), Err(SubmitError::Full(_))), "the channel is empty, the queue is not");
+        waiting.pop_front();
+        note_left(&metrics);
+        assert!(mux.submit(test_job()).is_ok());
+        assert_eq!(mux.pending(), 3);
+        assert_eq!(metrics.rejected.load(Ordering::Relaxed), 2);
+    }
+
+    /// An ASR final submitted behind normal jobs is in `waiting` the same loop: the next free slot
+    /// is its, and the device deadline (`tick_due`) carries its class.
+    #[test]
+    fn a_final_behind_normal_jobs_takes_the_next_slot_and_sets_the_deadline() {
+        use crate::serve::cosched::{Band, Urgency};
+        let metrics = Arc::new(Metrics::default());
+        let (tx, mut rx) = mpsc::channel(8 + CONTROL_SLACK);
+        let (mut waiting, mut load) = (std::collections::VecDeque::new(), LoadEstimator::default());
+        let (mut draining, mut drain_done, mut late) = (false, None, Vec::new());
+        let mut keep = Vec::new();
+        let now = Instant::now();
+        for class in [JobClass::Normal, JobClass::Normal, JobClass::Normal, JobClass::Final] {
+            let ((mut job, arrived), rx) = queued_job(10, now);
+            job.opts.class = class;
+            keep.push(rx);
+            tx.try_send(MuxMsg::Job(job, arrived)).ok().unwrap();
+            Metrics::inc(&metrics.queued_requests);
+        }
+        drain_channel(&mut rx, &mut waiting, &mut load, &metrics, &mut draining, &mut drain_done, &mut late);
+        let mut slots: Vec<Option<Slot>> = (0..1).map(|_| None).collect();
+        let due = tick_due(&slots, &waiting, 0, now);
+        assert_eq!(due.band, Band::from(Urgency::Final));
+        drain_waiting(&mut waiting, &mut slots, 1, now, 250.0, None, &metrics, &EngineHealth::Healthy, None, false);
+        assert_eq!(slots[0].as_ref().map(|s| s.class), Some(JobClass::Final));
+        assert_eq!((waiting.len(), metrics.queued_requests.load(Ordering::Relaxed)), (3, 3));
     }
 
     #[cfg(feature = "cuda")]
@@ -7675,15 +7805,52 @@ mod tests {
         assert_eq!(seat(bound + std::time::Duration::from_millis(1)), 10, "never past the bound");
 
         let o = |continuing, ago_ms| {
-            seat_order(JobClass::Normal, continuing, now - std::time::Duration::from_millis(ago_ms), now, bound)
+            seat_order(JobClass::Normal, continuing, 1, now - std::time::Duration::from_millis(ago_ms), now, bound)
         };
         let aged = bound.as_millis() as u64 + 10;
         assert!(o(false, aged + 5) < o(false, aged), "aged requests are oldest first");
         assert!(o(false, aged) < o(true, 0));
         assert!(o(true, 0) < o(false, 500));
         assert!(o(false, 500) < o(false, 100));
-        let critical = seat_order(JobClass::Critical, false, now, now, bound);
+        let critical = seat_order(JobClass::Critical, false, 9, now, now, bound);
         assert!(critical < o(false, aged), "class still comes first");
+    }
+
+    /// Tenant A queues four jobs, then B and C one each: within the class they are seated A, B, C,
+    /// A, A, A (one seat per tenant per round), A's in arrival order. Untagged jobs keep FIFO.
+    #[test]
+    fn tenants_are_seated_round_robin_within_a_class() {
+        let now = Instant::now();
+        let metrics = Arc::new(Metrics::default());
+        let mut fair = Fair::default();
+        let mut waiting = std::collections::VecDeque::new();
+        let mut keep = Vec::new();
+        for (i, (tenant, class)) in [(1, JobClass::Normal), (1, JobClass::Normal), (1, JobClass::Normal), (1, JobClass::Normal), (2, JobClass::Normal), (3, JobClass::Normal), (4, JobClass::Final)]
+            .into_iter()
+            .enumerate()
+        {
+            let ((mut job, _), rx) = queued_job(1 + i, now);
+            job.opts.tenant = Some(tenant);
+            job.opts.class = class;
+            keep.push(rx);
+            waiting.push_back((job, now - std::time::Duration::from_millis(100 - i as u64)));
+        }
+        let mut seated = Vec::new();
+        for _ in 0..7 {
+            let mut slots: Vec<Option<Slot>> = (0..1).map(|_| None).collect();
+            drain_waiting_session(
+                &mut waiting, &mut slots, 1, now, 250.0, None, &metrics, &EngineHealth::Healthy, None, false,
+                &mut Retention::off(), None, &mut fair,
+            );
+            seated.push(slots[0].as_ref().unwrap().prompt_ids.len());
+        }
+        assert_eq!(seated, [7, 1, 5, 6, 2, 3, 4], "the final first, then A B C A A A");
+
+        let mut fifo = Fair::default();
+        let rounds: Vec<u64> = (0..4).map(|_| fifo.start(None)).collect();
+        assert!(rounds.windows(2).all(|w| w[0] <= w[1]));
+        fifo.seated(rounds[3]);
+        assert_eq!(fifo.start(Some(9)), fifo.start(None), "a new tenant starts at the current round");
     }
 
     fn cfg_job(prompt: usize) -> ((Job, Instant), crate::serve::stream::ChunkReceiver) {
