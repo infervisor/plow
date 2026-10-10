@@ -604,13 +604,18 @@ async fn chat_completions_with(
 }
 
 fn mm_error(e: crate::serve::mm::MmError) -> Response {
-    crate::serve::api_error(
+    let mut r = crate::serve::api_error(
         axum::http::StatusCode::from_u16(e.status).unwrap_or(axum::http::StatusCode::BAD_REQUEST),
         e.message,
         if e.status == 400 { "invalid_request_error" } else { "server_error" },
         (e.status == 400).then_some("invalid_value"),
         Some("messages[].content".into()),
-    )
+    );
+    // Transient refusals (full slab, encoder restarting): rows free as in-flight requests finish.
+    if e.status == 503 {
+        r.headers_mut().insert(axum::http::header::RETRY_AFTER, axum::http::HeaderValue::from_static("1"));
+    }
+    r
 }
 
 /// No rank of a data-parallel model is serving (all unloading, or each refused the request).

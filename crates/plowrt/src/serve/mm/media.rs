@@ -242,6 +242,94 @@ pub fn decode_wav(bytes: &[u8]) -> MediaResult<(Vec<f32>, u32)> {
     Ok((mono, spec.sample_rate))
 }
 
+/// The audio format a data URL's mime type names; empty (sniff the bytes) when it names none.
+pub fn mime_audio_format(mime: &str) -> &'static str {
+    match mime {
+        "audio/wav" | "audio/x-wav" | "audio/wave" | "audio/vnd.wave" => "wav",
+        "audio/mpeg" | "audio/mp3" => "mp3",
+        "audio/flac" | "audio/x-flac" => "flac",
+        "audio/ogg" | "audio/vorbis" => "ogg",
+        _ => "",
+    }
+}
+
+/// Decode an audio clip to mono f32 samples and its rate. `format` is the request's label
+/// (`input_audio.format`); empty sniffs the container. Compressed clips stop decoding past
+/// `max_seconds`, so a small body cannot expand without bound.
+pub fn decode_audio(bytes: &[u8], format: &str, max_seconds: f64) -> MediaResult<(Vec<f32>, u32)> {
+    let format = match format {
+        "" => match bytes {
+            [b'R', b'I', b'F', b'F', ..] => "wav",
+            [b'f', b'L', b'a', b'C', ..] => "flac",
+            [b'O', b'g', b'g', b'S', ..] => "ogg",
+            [b'I', b'D', b'3', ..] => "mp3",
+            [0xFF, b, ..] if b & 0xE0 == 0xE0 => "mp3",
+            _ => return Err("unrecognized audio data; send wav, mp3, flac or ogg (vorbis)".into()),
+        },
+        f => f,
+    };
+    match format {
+        "wav" => decode_wav(bytes),
+        "mp3" | "flac" | "ogg" => decode_compressed(bytes, format, max_seconds),
+        other => Err(format!("input_audio format {other:?} is not supported; send wav, mp3, flac or ogg (vorbis)")),
+    }
+}
+
+fn decode_compressed(bytes: &[u8], format: &str, max_seconds: f64) -> MediaResult<(Vec<f32>, u32)> {
+    use symphonia::core::{audio::SampleBuffer, codecs::DecoderOptions, errors::Error, io::MediaSourceStream, probe::Hint};
+    let unreadable = |e: Error| format!("unreadable {format} audio: {e}");
+    let mss = MediaSourceStream::new(Box::new(std::io::Cursor::new(bytes.to_vec())), Default::default());
+    let mut hint = Hint::new();
+    hint.with_extension(format);
+    let probed = symphonia::default::get_probe()
+        .format(&hint, mss, &Default::default(), &Default::default())
+        .map_err(unreadable)?;
+    let mut reader = probed.format;
+    let track = reader
+        .tracks()
+        .iter()
+        .find(|t| t.codec_params.codec != symphonia::core::codecs::CODEC_TYPE_NULL)
+        .ok_or_else(|| format!("{format} audio has no decodable track (ogg carries vorbis only, not opus)"))?;
+    let (id, mut rate) = (track.id, track.codec_params.sample_rate.unwrap_or(0));
+    let mut decoder = symphonia::default::get_codecs()
+        .make(&track.codec_params, &DecoderOptions::default())
+        .map_err(|e| format!("{format} audio codec is not supported (ogg carries vorbis only, not opus): {e}"))?;
+    let mut mono: Vec<f32> = Vec::new();
+    let mut buf: Option<SampleBuffer<f32>> = None;
+    loop {
+        let packet = match reader.next_packet() {
+            Ok(p) => p,
+            Err(Error::IoError(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+            Err(e) => return Err(unreadable(e)),
+        };
+        if packet.track_id() != id {
+            continue;
+        }
+        let decoded = match decoder.decode(&packet) {
+            Ok(d) => d,
+            // A corrupt frame is skipped, as players do; the rest of the clip still decodes.
+            Err(Error::DecodeError(_)) => continue,
+            Err(e) => return Err(unreadable(e)),
+        };
+        let spec = *decoded.spec();
+        rate = spec.rate;
+        let channels = spec.channels.count().max(1);
+        let b = match &mut buf {
+            Some(b) if b.capacity() >= decoded.capacity() * channels => b,
+            _ => buf.insert(SampleBuffer::new(decoded.capacity() as u64, spec)),
+        };
+        b.copy_interleaved_ref(decoded);
+        mono.extend(b.samples().chunks(channels).map(|c| c.iter().sum::<f32>() / channels as f32));
+        if mono.len() as f64 > max_seconds * f64::from(rate.max(1)) {
+            return Err(format!("audio clip is longer than {max_seconds:.1} s"));
+        }
+    }
+    if rate == 0 {
+        return Err(format!("{format} audio has no sample rate"));
+    }
+    Ok((mono, rate))
+}
+
 /// Band-limited resampling (Kaiser-windowed sinc, 32 zero crossings).
 pub fn resample(x: &[f32], from: u32, to: u32) -> Vec<f32> {
     if from == to || x.is_empty() {
@@ -462,5 +550,52 @@ mod tests {
             assert_eq!(mel.valid_frames, frames, "{n}");
             assert_eq!(audio_tokens(frames, 4), frames.div_ceil(2).div_ceil(2));
         }
+    }
+
+    fn fixture(name: &str) -> Vec<u8> {
+        std::fs::read(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/audio").join(name)).unwrap()
+    }
+
+    /// 0.4 s of a 0.5-amplitude 440 Hz tone (libsndfile 1.2.2): RMS 0.354, 880 zero crossings/s.
+    fn assert_tone(samples: &[f32], rate: u32, what: &str) {
+        let seconds = samples.len() as f64 / f64::from(rate);
+        assert!((0.38..0.56).contains(&seconds), "{what}: {seconds} s (codec padding at most ~0.15 s)");
+        let rms = (samples.iter().map(|v| f64::from(*v).powi(2)).sum::<f64>() / samples.len() as f64).sqrt();
+        assert!((0.25..0.40).contains(&rms), "{what}: rms {rms}");
+        // Over the middle half: codec padding at the edges is near-silent noise.
+        let mid = &samples[samples.len() / 4..samples.len() * 3 / 4];
+        let crossings = mid.windows(2).filter(|w| (w[0] < 0.0) != (w[1] < 0.0)).count() as f64 * 2.0 / seconds;
+        assert!((700.0..900.0).contains(&crossings), "{what}: {crossings} crossings/s");
+    }
+
+    #[test]
+    fn compressed_audio_decodes_by_label_and_by_sniffing() {
+        for (file, format) in [("tone.mp3", "mp3"), ("tone.flac", "flac"), ("tone.ogg", "ogg")] {
+            let bytes = fixture(file);
+            for label in [format, ""] {
+                let (samples, rate) = decode_audio(&bytes, label, 30.0).unwrap_or_else(|e| panic!("{file} {label:?}: {e}"));
+                assert_eq!(rate, 16_000, "{file}");
+                assert_tone(&samples, rate, file);
+            }
+        }
+        // Stereo 44.1 kHz is mixed to mono at its own rate; the request path resamples it.
+        let (samples, rate) = decode_audio(&fixture("tone_stereo44k.mp3"), "mp3", 30.0).unwrap();
+        assert_eq!(rate, 44_100);
+        assert_tone(&samples, rate, "stereo mp3");
+        assert_tone(&resample(&samples, rate, 16_000), 16_000, "stereo mp3 at 16 kHz");
+    }
+
+    #[test]
+    fn unsupported_corrupt_and_long_audio_is_refused() {
+        let mp3 = fixture("tone.mp3");
+        assert!(decode_audio(&mp3, "opus", 30.0).unwrap_err().contains("send wav, mp3, flac or ogg"));
+        assert!(decode_audio(b"not audio at all", "", 30.0).unwrap_err().contains("unrecognized audio"));
+        assert!(decode_audio(b"not audio at all", "mp3", 30.0).unwrap_err().contains("unreadable mp3"));
+        // A mislabelled clip decodes as what it is: the label is a hint, the container decides.
+        assert_tone(&decode_audio(&mp3, "flac", 30.0).unwrap().0, 16_000, "mp3 labelled flac");
+        assert!(decode_audio(&fixture("tone.flac"), "flac", 0.1).unwrap_err().contains("longer than 0.1 s"));
+        assert_eq!(mime_audio_format("audio/mpeg"), "mp3");
+        assert_eq!(mime_audio_format("audio/x-wav"), "wav");
+        assert_eq!(mime_audio_format("application/octet-stream"), "");
     }
 }

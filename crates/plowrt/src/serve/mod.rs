@@ -1414,6 +1414,50 @@ async fn metrics_snapshot_handler(
     axum::Json(crate::obs::serving::snapshot(&metrics_models(&state)))
 }
 
+/// Multimodal slab occupancy and encoder counters, one series per engine with media.
+fn mm_metrics(out: &mut String, state: &AppState) {
+    use std::fmt::Write;
+    use std::sync::atomic::Ordering::Relaxed;
+    let mm = state.mm.read();
+    let mut engines: Vec<_> = mm.iter().map(|(k, m)| (crate::obs::serving::model_labels(k), m)).collect();
+    if engines.is_empty() {
+        return;
+    }
+    engines.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+    type Value = fn(&mm::MmModel) -> u64;
+    let plain: [(&str, &str, &str, Value); 4] = [
+        ("plowrt_mm_slab_rows", "gauge", "Soft-token rows the engine's multimodal slab holds.", |m| m.slab().occupancy().2.into()),
+        ("plowrt_mm_slab_rows_reserved", "gauge", "Slab rows reserved by admitted media requests.", |m| m.slab().occupancy().0.into()),
+        ("plowrt_mm_slab_rows_staged", "gauge", "Slab rows staged on the device for in-flight prompts.", |m| m.slab().occupancy().1.into()),
+        ("plowrt_mm_slab_full_total", "counter", "Media requests refused with 503 because the slab had no room.", |m| {
+            m.stats.slab_full.load(Relaxed)
+        }),
+    ];
+    for (name, kind, help, value) in plain {
+        crate::obs::serving::family(out, name, kind, help);
+        for (labels, m) in &engines {
+            let _ = writeln!(out, "{name}{{{labels}}} {}", value(m));
+        }
+    }
+    crate::obs::serving::family(out, "plowrt_mm_encode_total", "counter", "Encoder calls (one image batch or one audio clip).");
+    for (labels, m) in &engines {
+        for (kind, s) in [("image", &m.stats.image), ("audio", &m.stats.audio)] {
+            let _ = writeln!(out, "plowrt_mm_encode_total{{{labels},kind=\"{kind}\"}} {}", s.calls.load(Relaxed));
+        }
+    }
+    crate::obs::serving::family(
+        out,
+        "plowrt_mm_encode_seconds_total",
+        "counter",
+        "Encoder wall time from submit to rows ready, queueing included.",
+    );
+    for (labels, m) in &engines {
+        for (kind, s) in [("image", &m.stats.image), ("audio", &m.stats.audio)] {
+            let _ = writeln!(out, "plowrt_mm_encode_seconds_total{{{labels},kind=\"{kind}\"}} {}", s.micros.load(Relaxed) as f64 / 1e6);
+        }
+    }
+}
+
 async fn metrics_handler(
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
 ) -> axum::response::Response {
@@ -1445,6 +1489,7 @@ async fn metrics_handler(
     if let Some(router) = state.dp() {
         dp_metrics(&mut out, router, &state);
     }
+    mm_metrics(&mut out, &state);
     // Prefix-cache (VMM) counters, one block per GPU-served model, read
     // through the engine-lock-free stats handles — series stay continuous
     // under sustained inference (only the pool mutex is taken, µs holds).

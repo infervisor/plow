@@ -96,6 +96,16 @@ impl Encoder {
         Ok(Self { packet, rungs, input, output, output_width, round_input, inputs })
     }
 
+    /// The host processor whose output this encoder's inputs take.
+    pub fn processor(&self) -> plow_asset::multimodal::Processor {
+        use plow_asset::multimodal::Processor;
+        match self.inputs {
+            Inputs::Vision { .. } => Processor::AspectPatches,
+            Inputs::Audio { .. } => Processor::SemicausalLogMel,
+            Inputs::Frames { .. } => Processor::WaveformFrames,
+        }
+    }
+
     /// Items one launch holds (vision: images; audio: always 1).
     pub fn max_items(&self) -> usize {
         match self.inputs {
