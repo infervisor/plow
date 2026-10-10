@@ -360,6 +360,9 @@ impl SharedAsr {
                 continuing: false,
                 speech: Some(Box::new(SpeechJob { overlay, overlay_pos, pos_base: None, cfg: None, first_tokens: 0 })),
                 prefix: None,
+                tenant: None,
+                round: 0,
+                cached: None,
                 mm: None,
             },
         };

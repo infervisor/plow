@@ -1162,6 +1162,13 @@ struct Shared {
     /// Per-seq mapped-row frontier, readable lock-free on the decode path.
     frontier: Vec<AtomicU32>,
     generation: Vec<AtomicU64>,
+    /// Bumped by every change to what [`rows_for`] can match (published blocks and snapshots), so
+    /// a [`PrefixProbe`] reader may keep a prompt's rows until it moves.
+    cache_gen: AtomicU64,
+}
+
+fn cache_changed(s: &Shared) {
+    s.cache_gen.fetch_add(1, Ordering::Release);
 }
 
 /// The VMM-backed KV pool + prefix cache. One per engine; owns the VA
@@ -1317,6 +1324,7 @@ impl VmmKv {
             }),
             frontier: (0..batch).map(|_| AtomicU32::new(0)).collect(),
             generation: (0..batch).map(|_| AtomicU64::new(0)).collect(),
+            cache_gen: AtomicU64::new(0),
         });
         let mut pool = VmmKv {
             prefix_reuse,
@@ -1588,6 +1596,7 @@ impl VmmKv {
         let chain = &tokens[..rows as usize];
         let hashes = hash_blocks(chain, s.block_rows);
         let mut inner = s.inner.lock();
+        cache_changed(s);
         let m = inner.cache.lookup(&hashes, &chain[..hashes.len() * br]);
         inner.cache.release(&hashes, m.blocks);
         let waits = inner.awaited.clone();
@@ -2315,6 +2324,7 @@ impl VmmKv {
             return;
         }
         let mut inner = self.shared.inner.lock();
+        cache_changed(&self.shared);
         inner.fine_rows = fine_rows;
         inner.fine_ceiling = ceiling;
         inner.fine_cache = Some(
@@ -2365,6 +2375,7 @@ impl VmmKv {
             return true;
         }
         let hashes = hash_blocks(&tokens[..rows as usize], s.block_rows);
+        cache_changed(s);
         let held = inner.seqs[seq].held;
         let m = inner.cache.lookup(&hashes, tokens);
         inner.cache.release(&hashes, m.blocks);
@@ -2556,6 +2567,16 @@ impl PrefixProbe {
         PrefixKey::new(prompt, self.0.block_rows)
     }
 
+    /// The cache generation: rows a probe returned stay right until it moves.
+    pub fn generation(&self) -> u64 {
+        self.0.cache_gen.load(Ordering::Acquire)
+    }
+
+    /// [`Self::cached_rows_keyed`] for many prompts under one lock.
+    pub fn rows_locked(&self) -> PrefixRows<'_> {
+        PrefixRows { s: &self.0, inner: self.0.inner.lock() }
+    }
+
     /// Leading prompt rows whose blocks this cache holds (whole blocks; an upper bound on what an
     /// attach restores, without walking its snapshots), or `None` when the cache lock is held: a
     /// router must not wait on an engine.
@@ -2573,6 +2594,22 @@ impl PrefixProbe {
 
     pub fn block_rows(&self) -> u32 {
         self.0.block_rows
+    }
+}
+
+/// The cache lock held by [`PrefixProbe::rows_locked`].
+pub struct PrefixRows<'a> {
+    s: &'a Shared,
+    inner: parking_lot::MutexGuard<'a, Inner>,
+}
+
+impl PrefixRows<'_> {
+    /// Rows `prompt` attaches; hashes it (under the lock) unless `key` fits.
+    pub fn rows(&self, prompt: &[u32], key: Option<&PrefixKey>) -> u32 {
+        match key {
+            Some(k) if k.fits(self.s.block_rows, prompt) => rows_for(self.s, &self.inner, prompt, &k.hashes),
+            _ => rows_for(self.s, &self.inner, prompt, &hash_blocks(prompt, self.s.block_rows)),
+        }
     }
 }
 
@@ -2726,6 +2763,7 @@ fn publish_locked(
     {
         return Err(RuntimeError::Rejected("vmm: unpublished rows or empty snapshot".into()));
     }
+    cache_changed(s);
     let prior = &inner.seqs[seq].tokens;
     let overlap = prior.len().min(tokens.len());
     if tokens[..overlap] != prior[..overlap] {
@@ -3282,6 +3320,7 @@ fn evict_dead_leaf(s: &Shared, inner: &mut Inner) -> bool {
     let Some(key) = inner.cache.evict_lru_where(|key| !published.contains_key(&Some(key))) else {
         return false;
     };
+    cache_changed(s);
     if let Some(ids) = inner.node_blocks.remove(&key) {
         inner.stats.cache_blocks -= ids.len() as u64;
         inner.stats.cache_bytes -= ids.len() as u64 * s.block_bytes;
@@ -3298,6 +3337,7 @@ fn evict_dead_leaf(s: &Shared, inner: &mut Inner) -> bool {
 /// previous usable boundary), shared boundaries last, then whole LRU entries. `false` when
 /// pinned.
 fn evict_one(s: &Shared, inner: &mut Inner, preserve_hot: bool) -> bool {
+    cache_changed(s);
     if evict_one_fine(s, inner) {
         return true;
     }
@@ -3401,6 +3441,7 @@ fn evict_one(s: &Shared, inner: &mut Inner, preserve_hot: bool) -> bool {
 }
 
 fn remove_snapshot(s: &Shared, inner: &mut Inner, node: Option<(u32, u32)>, index: usize) {
+    cache_changed(s);
     let snap = inner.published.get_mut(&node).unwrap().swap_remove(index);
     if inner.published[&node].is_empty() { inner.published.remove(&node); }
     free_snapshot(s, inner, snap);
@@ -5182,6 +5223,102 @@ mod tests {
         p.ensure_rows(1, 1).unwrap();
         let a = p.try_attach_keyed(1, &pr, Some(key)).unwrap().expect("keyed attach");
         assert_eq!(a.rows, 16);
+    }
+
+    /// The cache generation moves with every publish and retirement and with nothing a probe or
+    /// an attach does, and the mux's per-waiter rows follow it: unchanged rows are not re-read
+    /// (no lock, no hashing), changed ones are re-read under one lock.
+    #[test]
+    fn cached_rows_are_reread_only_when_the_cache_moves() {
+        use crate::serve::mux::{refresh_cached_rows, Job, JobOpts};
+        let ops = Arc::new(MockVmm::default());
+        let p = uniform_pool(ops.clone());
+        let probe = p.prefix_probe().expect("prefix reuse");
+        let pr = prompt(17);
+        let job = |prompt: Vec<u32>, prefix| {
+            let (respond, rx) = crate::serve::stream::channel();
+            let opts = JobOpts { prefix, ..Default::default() };
+            ((Job { prompt_ids: prompt, gen: Default::default(), arrived: std::time::Instant::now(), respond, opts }, std::time::Instant::now()), rx)
+        };
+        let (a, _ra) = job(pr.clone(), Some(probe.key(&pr)));
+        let (b, _rb) = job(prompt(9), None);
+        let mut waiting: std::collections::VecDeque<_> = [a, b].into_iter().collect();
+        let g0 = probe.generation();
+        refresh_cached_rows(&mut waiting, &probe);
+        assert_eq!(waiting.iter().map(|(j, _)| j.opts.cached).collect::<Vec<_>>(), [Some((g0, 0)), Some((g0, 0))]);
+        assert!(waiting[1].0.opts.prefix.is_some(), "an unkeyed waiter is hashed once and keeps the key");
+
+        assert!(p.try_attach(0, &pr).unwrap().is_none());
+        p.ensure_rows(0, 17).unwrap();
+        assert_eq!(probe.generation(), g0, "attaching and mapping change nothing a probe matches");
+        p.publish(0, &pr, 4, |_va| Ok(())).unwrap();
+        let g1 = probe.generation();
+        assert_ne!(g1, g0);
+        {
+            let (mut c, _rc) = job(pr.clone(), None);
+            c.0.opts.cached = Some((g1, 7));
+            let mut current: std::collections::VecDeque<_> = [c].into_iter().collect();
+            let _held = p.shared.inner.lock();
+            refresh_cached_rows(&mut current, &probe); // rows at the current generation take no lock
+            assert_eq!(current[0].0.opts.cached, Some((g1, 7)));
+            assert!(current[0].0.opts.prefix.is_none(), "nor hash anything");
+        }
+        refresh_cached_rows(&mut waiting, &probe);
+        assert_eq!(waiting[0].0.opts.cached, Some((g1, 16)));
+        let locked = probe.rows_locked().rows(&pr, None);
+        assert_eq!(locked, p.cached_rows(&pr));
+        p.retire_superseded(&pr, 16);
+        assert_ne!(probe.generation(), g1);
+    }
+
+    /// Host time of one cache-aware admission pass over `n` waiters of `len`-token prompts:
+    /// the per-waiter rehash-and-lock it replaced, against `refresh_cached_rows` with the cache
+    /// unchanged and with it moved (handler keys present).
+    /// `cargo test --release -p plowrt --features cuda --lib admission_pass_microbench -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn admission_pass_microbench() {
+        use crate::serve::mux::{refresh_cached_rows, Job, JobOpts};
+        let ops = Arc::new(MockVmm::default());
+        let p = uniform_pool(ops.clone());
+        let probe = p.prefix_probe().expect("prefix reuse");
+        let pr = prompt(17);
+        assert!(p.try_attach(0, &pr).unwrap().is_none());
+        p.ensure_rows(0, 17).unwrap();
+        p.publish(0, &pr, 4, |_va| Ok(())).unwrap();
+        let median = |mut v: Vec<f64>| {
+            v.sort_by(|a, b| a.total_cmp(b));
+            v[v.len() / 2]
+        };
+        println!("{:>5} {:>6} {:>12} {:>14} {:>12}", "n", "len", "rehash_us", "unchanged_us", "moved_us");
+        for (n, len) in [(128, 1024), (256, 2048), (512, 2048), (256, 8192)] {
+            let mut keep = Vec::new();
+            let mut waiting: std::collections::VecDeque<_> = (0..n)
+                .map(|i| {
+                    let (respond, rx) = crate::serve::stream::channel();
+                    keep.push(rx);
+                    let mut toks = prompt(len);
+                    toks[len - 1] = i as u32;
+                    let opts = JobOpts { prefix: Some(probe.key(&toks)), ..Default::default() };
+                    let job = Job { prompt_ids: toks, gen: Default::default(), arrived: std::time::Instant::now(), respond, opts };
+                    (job, std::time::Instant::now())
+                })
+                .collect();
+            let time = |f: &mut dyn FnMut()| {
+                median((0..15).map(|_| { let t = std::time::Instant::now(); f(); t.elapsed().as_secs_f64() * 1e6 }).collect())
+            };
+            let rehash = time(&mut || {
+                let rows: Vec<u32> = waiting.iter().map(|(j, _)| probe.cached_rows_keyed(&j.prompt_ids, None)).collect();
+                std::hint::black_box(rows);
+            });
+            refresh_cached_rows(&mut waiting, &probe);
+            let unchanged = time(&mut || refresh_cached_rows(&mut waiting, &probe));
+            let moved = time(&mut || {
+                cache_changed(&p.shared);
+                refresh_cached_rows(&mut waiting, &probe);
+            });
+            println!("{n:>5} {len:>6} {rehash:>12.1} {unchanged:>14.1} {moved:>12.1}");
+        }
     }
 
     /// `enable_shared_publish`: a lead seen on one sequence only never snapshots; the

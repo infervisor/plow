@@ -236,6 +236,13 @@ pub struct JobOpts {
     /// A later turn of a session that already had one: seated ahead of requests opening a
     /// session, until either has waited [`crate::serve::cosched::max_wait`].
     pub continuing: bool,
+    /// Whose request this is ([`crate::serve::session::RequestIds::tenant`]): within a class, queued
+    /// tenants are seated round-robin ([`Fair`]); `None` is a tenant of its own.
+    pub tenant: Option<u64>,
+    /// [`Fair`]'s start round, set when the job is first ordered in the queue (0: not yet).
+    pub(crate) round: u64,
+    /// Prefix rows the cache would attach, and the cache generation they were read at.
+    pub(crate) cached: Option<(u64, u32)>,
     /// The prompt's prefix-cache block hashes, when the DP router already computed them.
     pub prefix: Option<crate::memory::vmm::PrefixKey>,
     /// Multimodal soft-token rows the prompt's bit-31 ids name (`serve::mm`).
@@ -484,7 +491,15 @@ pub struct ModelMux {
     ingress: Arc<Ingress>,
     /// Set by [`ModelMux::preempt`] and never cleared: held work submitting later fails retryably.
     preempted: Arc<std::sync::atomic::AtomicBool>,
+    /// Requests that may wait outside the slot table (`--serve-max-queued-requests`), counted by
+    /// `metrics.queued_requests` from submit until the job is seated or leaves.
+    queue_cap: usize,
+    /// The engine prefix cache's block rows (0: no prefix cache), for [`Self::prefix_key`].
+    prefix_block_rows: u32,
 }
+
+/// Channel room past [`ModelMux::queue_cap`] jobs, for control messages.
+const CONTROL_SLACK: usize = 8;
 
 /// What a request submitting to a preempted mux is told (503-class).
 pub const PREEMPTED: &str = "model preempted — retry";
@@ -650,6 +665,12 @@ impl ModelMux {
         self.tx.is_closed()
     }
 
+    /// `prompt`'s prefix-cache block hashes, for [`JobOpts::prefix`]: hashed on the caller's
+    /// thread, they serve cache-aware admission and the attach without hashing on the dispatcher.
+    pub fn prefix_key(&self, prompt: &[u32]) -> Option<crate::memory::vmm::PrefixKey> {
+        (self.prefix_block_rows > 0).then(|| crate::memory::vmm::PrefixKey::new(prompt, self.prefix_block_rows))
+    }
+
     /// Requests submitted and not yet in an engine slot.
     pub fn pending(&self) -> usize {
         self.metrics.queued_requests.load(Ordering::Relaxed) as usize
@@ -661,6 +682,19 @@ impl ModelMux {
         self.submit_arrived(job, arrived, None)
     }
 
+    /// Counts one request against [`Self::queue_cap`]; `false` (nothing counted) when it is full.
+    fn reserve_queue(&self) -> bool {
+        let queued = &self.metrics.queued_requests;
+        let mut n = queued.load(Ordering::Relaxed);
+        while n < self.queue_cap as u64 {
+            match queued.compare_exchange_weak(n, n + 1, Ordering::AcqRel, Ordering::Relaxed) {
+                Ok(_) => return true,
+                Err(now) => n = now,
+            }
+        }
+        false
+    }
+
     pub fn submit_arrived(
         &self,
         job: Job,
@@ -669,9 +703,12 @@ impl ModelMux {
     ) -> std::result::Result<(), SubmitError> {
         Metrics::inc(&self.metrics.requests);
         self.metrics.serving.max_tokens.tokens(job.gen.max_tokens);
-        Metrics::inc(&self.metrics.queued_requests);
         // Released before the send: a dispatcher that dequeues this job must not see it as a peer.
         drop(ingress);
+        if !self.reserve_queue() {
+            Metrics::inc(&self.metrics.rejected);
+            return Err(if self.tx.is_closed() { SubmitError::Closed(job) } else { SubmitError::Full(job) });
+        }
         let urgent = job.opts.class != JobClass::Bulk;
         match self.tx.try_send(MuxMsg::Job(job, arrived)) {
             Ok(()) => {
@@ -699,7 +736,15 @@ impl ModelMux {
     pub async fn submit_wait(&self, job: Job) -> std::result::Result<(), SubmitError> {
         Metrics::inc(&self.metrics.requests);
         self.metrics.serving.max_tokens.tokens(job.gen.max_tokens);
-        Metrics::inc(&self.metrics.queued_requests);
+        while !self.reserve_queue() {
+            tokio::select! {
+                _ = self.tx.closed() => {
+                    Metrics::inc(&self.metrics.rejected);
+                    return Err(SubmitError::Closed(job));
+                }
+                _ = tokio::time::sleep(std::time::Duration::from_millis(2)) => {}
+            }
+        }
         let arrived = job.arrived;
         let urgent = job.opts.class != JobClass::Bulk;
         self.tx.send(MuxMsg::Job(job, arrived)).await.map_err(|mpsc::error::SendError(msg)| {
@@ -934,7 +979,7 @@ pub fn spawn(
     } else {
         cfg.max_queued_requests
     };
-    let (tx, mut rx) = mpsc::channel::<MuxMsg>(ingress_capacity);
+    let (tx, mut rx) = mpsc::channel::<MuxMsg>(ingress_capacity + CONTROL_SLACK);
     tracing::info!(%slug, capacity, ingress_capacity, "mux capacity resolved");
     metrics.slots_capacity.store(capacity as u64, Ordering::Relaxed);
 
@@ -954,6 +999,7 @@ pub fn spawn(
     let prefix_probe = state.gpu_engine(&slug).and_then(|e| e.lock().vmm_prefix_probe());
     #[cfg(not(feature = "cuda"))]
     let prefix_probe: Option<crate::memory::vmm::PrefixProbe> = None;
+    let prefix_block_rows = prefix_probe.as_ref().map_or(0, |p| p.block_rows());
     #[cfg(feature = "cuda")]
     let (resume_supported, prefix_cache, kv_row_bytes) = state.gpu_engine(&slug).map_or((false, false, 0), |e| {
         let e = e.lock();
@@ -973,17 +1019,15 @@ pub fn spawn(
             "mux: KV-capacity admission armed"
         );
     }
-    // Jobs the KV budget could not back yet. Retried in arrival order ahead of anything
-    // newer, so the budget never reorders the queue.
+    // Every queued job: the dispatcher moves each one off the channel as it arrives, and seats
+    // them in `seat_order`. Its length is bounded at submit (`ModelMux::queue_cap`).
     //
     // NOT a single blocking slot. A large request at the head must not idle slots that a
     // smaller one behind it would fill: with no preemption path, a held request frees nothing
     // by waiting, so refusing to look past it converts "this one does not fit" into "nothing
     // runs". vLLM tolerates the same head-of-line stall only because it preempts a running
     // request to make room; until plow does, backfilling is what keeps the batch full.
-    // The internal deque is capped at `ingress_capacity`; once full, new arrivals stay in the
-    // bounded channel until a waiter is admitted. A request that can never fit is answered, not
-    // parked (see `admit_into`).
+    // A request that can never fit is answered, not parked (see `admit_into`).
     let mut waiting: std::collections::VecDeque<(Job, Instant)> = std::collections::VecDeque::new();
 
     // Per-model KV arena from the first decode bucket that declares paging
@@ -1048,6 +1092,7 @@ pub fn spawn(
 
     let dispatcher = async move {
         let mut slots: Vec<Option<Slot>> = (0..capacity).map(|_| None).collect();
+        let mut fair = Fair::default();
         let mut retention = Retention::new(
             resume_supported,
             prefix_cache,
@@ -1160,13 +1205,9 @@ pub fn spawn(
             // however late its job reached the channel.
             if drained && !preempted {
                 while let Ok(msg) = rx.try_recv() {
-                    note_dequeued(&msg, &metrics);
                     match msg {
                         MuxMsg::Drain(done) => late_drains.push(done),
-                        MuxMsg::Job(job, arrived) => {
-                            Metrics::inc(&metrics.queued_requests);
-                            waiting.push_back((job, arrived));
-                        }
+                        MuxMsg::Job(job, arrived) => waiting.push_back((job, arrived)),
                     }
                 }
             }
@@ -1218,7 +1259,6 @@ pub fn spawn(
                     _ = ingress_seen.idle.notified(), if draining => continue,
                 };
                 let Some(msg) = msg else { break };
-                note_dequeued(&msg, &metrics);
                 match msg {
                     MuxMsg::Job(job, arrived) => {
                         note_arrival(job.arrived, &mut load, &metrics);
@@ -1234,9 +1274,9 @@ pub fn spawn(
                             downstream.full(),
                             &mut retention,
                         );
-                        if let Some(j) = held {
-                            Metrics::inc(&metrics.queued_requests);
-                            waiting.push_back(j);
+                        match held {
+                            Some(j) => waiting.push_back(j),
+                            None => note_left(&metrics),
                         }
                     }
                     // No in-flight work: the drain check at the loop top finishes, after serving
@@ -1249,6 +1289,13 @@ pub fn spawn(
                         }
                     }
                 }
+            }
+
+            // Every job on the channel joins `waiting`: its seat order, the class deadline
+            // (`tick_due`) and the rung controller see the whole queue. A preempt serves nothing
+            // more; its exit answers what is left on the channel.
+            if !preempted {
+                drain_channel(&mut rx, &mut waiting, &mut load, &metrics, &mut draining, &mut drain_done, &mut late_drains);
             }
 
             // A decode ladder controls ADMISSION separately from execution.
@@ -1368,13 +1415,14 @@ pub fn spawn(
                     downstream.full(),
                     &mut retention,
                     prefix_probe.as_ref(),
+                    &mut fair,
                 );
             }
             let idle = slots[..admission_limit]
                 .iter()
                 .filter(|s| s.is_none())
                 .count();
-            if !draining && waiting.len() < ingress_capacity && idle > 0 {
+            if !draining && idle > 0 {
                 let lambda = load.lambda.rate(Instant::now());
                 // Only hold when the slot table is empty (cold-start burst);
                 // if any slot is already live, spinning up the tick delivers
@@ -1395,16 +1443,13 @@ pub fn spawn(
                     Metrics::inc(&metrics.hold_count);
                     let deadline =
                         Instant::now() + std::time::Duration::from_secs_f64(hold_ms / 1000.0);
-                    while waiting.len() < ingress_capacity
-                        && slots[..admission_limit].iter().any(|s| s.is_none())
-                    {
+                    while slots[..admission_limit].iter().any(|s| s.is_none()) {
                         let remaining = deadline.saturating_duration_since(Instant::now());
                         if remaining.is_zero() {
                             break;
                         }
                         match tokio::time::timeout(remaining, rx.recv()).await {
                             Ok(Some(msg)) => {
-                                note_dequeued(&msg, &metrics);
                                 match msg {
                                     MuxMsg::Job(job, arrived) => {
                                         note_arrival(job.arrived, &mut load, &metrics);
@@ -1426,9 +1471,9 @@ pub fn spawn(
                                             queued_behind = true;
                                             Some((job, arrived))
                                         };
-                                        if let Some(j) = held {
-                                            Metrics::inc(&metrics.queued_requests);
-                                            waiting.push_back(j);
+                                        match held {
+                                            Some(j) => waiting.push_back(j),
+                                            None => note_left(&metrics),
                                         }
                                         if cfg.idle_dispatch
                                             && rx.is_empty()
@@ -1438,8 +1483,7 @@ pub fn spawn(
                                         }
                                     }
                                     MuxMsg::Drain(done) => {
-                                        draining = true;
-                                        drain_done = Some(done);
+                                        note_drain(done, &mut draining, &mut drain_done, &mut late_drains);
                                         break;
                                     }
                                 }
@@ -1449,52 +1493,12 @@ pub fn spawn(
                         }
                     }
                 }
-                // Any additional pending arrivals (no wait).
-                while !draining
-                    && waiting.len() < ingress_capacity
-                    && slots[..admission_limit].iter().any(|s| s.is_none())
-                {
-                    match rx.try_recv() {
-                        Ok(msg) => {
-                            note_dequeued(&msg, &metrics);
-                            match msg {
-                                MuxMsg::Job(job, arrived) => {
-                                    note_arrival(job.arrived, &mut load, &metrics);
-                                    let held = if waiting.is_empty() {
-                                        admit_session(
-                                            &mut slots,
-                                            admission_limit,
-                                            job,
-                                            arrived,
-                                            arena.as_ref(),
-                                            &metrics,
-                                            &health,
-                                            kv_budget,
-                                            downstream.full(),
-                                            &mut retention,
-                                        )
-                                    } else {
-                                        queued_behind = true;
-                                        Some((job, arrived))
-                                    };
-                                    if let Some(j) = held {
-                                        Metrics::inc(&metrics.queued_requests);
-                                        waiting.push_back(j);
-                                    }
-                                }
-                                MuxMsg::Drain(done) => {
-                                    draining = true;
-                                    drain_done = Some(done);
-                                    break;
-                                }
-                            }
-                        }
-                        Err(_) => break,
-                    }
-                }
             }
-            // An arrival never takes a slot ahead of an older waiter: it joined the queue, which
-            // is drained again in its seat order.
+            // Arrivals during the hold join the queue, which is drained again in its seat order:
+            // an arrival never takes a slot ahead of an older or more urgent waiter.
+            if !preempted && drain_channel(&mut rx, &mut waiting, &mut load, &metrics, &mut draining, &mut drain_done, &mut late_drains) > 0 {
+                queued_behind = true;
+            }
             if std::mem::take(&mut queued_behind) {
                 drain_waiting_session(
                     &mut waiting,
@@ -1509,28 +1513,8 @@ pub fn spawn(
                     downstream.full(),
                     &mut retention,
                     prefix_probe.as_ref(),
+                    &mut fair,
                 );
-            }
-            // A full slot table leaves arrivals in the channel in arrival order; in `waiting`,
-            // `drain_waiting` seats them by class as slots free.
-            while !draining
-                && waiting.len() < ingress_capacity
-                && !rx.is_empty()
-                && slots[..admission_limit].iter().all(Option::is_some)
-            {
-                let Ok(msg) = rx.try_recv() else { break };
-                note_dequeued(&msg, &metrics);
-                match msg {
-                    MuxMsg::Job(job, arrived) => {
-                        note_arrival(job.arrived, &mut load, &metrics);
-                        Metrics::inc(&metrics.queued_requests);
-                        waiting.push_back((job, arrived));
-                    }
-                    MuxMsg::Drain(done) => {
-                        draining = true;
-                        drain_done = Some(done);
-                    }
-                }
             }
 
             let live = slots.iter().filter(|s| s.is_some()).count();
@@ -1622,14 +1606,13 @@ pub fn spawn(
                 let device_quantum = 0;
 
                 if device_quantum > 1
-                    && (freed_last_tick
-                        || !waiting.is_empty()
-                        || slots.iter().flatten().any(|s| s.step == 0))
+                    && quantum_yields(
+                        slots.iter().flatten().any(|s| s.step == 0),
+                        freed_last_tick,
+                        !waiting.is_empty(),
+                        || waiter_seatable(&waiting, &slots, admission_limit, kv_budget, downstream.full()),
+                    )
                 {
-                    // Prefill is pending, so the next chunk must not wait behind a K-step
-                    // quantum. A slot freed last tick counts: its successor is usually a round
-                    // trip away, and a K-step quantum here lets the next completion land in the
-                    // same wave (two prefills back to back). 15000/C4 TTFT 1099 -> 627 ms.
                     1
                 } else if device_quantum > 1 {
                     group_aligned(device_quantum.max(MultiStep::for_batch(live as i64).steps), token_group)
@@ -1715,6 +1698,7 @@ pub fn spawn(
                     cfg.multi_step,
                     co_scheduled,
                     quantum_cut,
+                    std::time::Duration::from_secs_f64(queue_aging_ms(cfg.slo_ms) / 1e3),
                 );
                 (out, t_body.map_or(0, |t| t.elapsed().as_nanos() as u64))
             };
@@ -1905,13 +1889,61 @@ pub fn spawn(
         arrival_notify,
         ingress,
         preempted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        queue_cap: ingress_capacity,
+        prefix_block_rows,
     }
 }
 
+/// A message leaves the channel without its job being queued or seated (the dispatcher exits).
 fn note_dequeued(msg: &MuxMsg, metrics: &Metrics) {
     if matches!(msg, MuxMsg::Job(_, _)) {
-        metrics.queued_requests.fetch_sub(1, Ordering::Relaxed);
+        note_left(metrics);
     }
+}
+
+/// A job leaves the queue: seated, answered or dropped.
+fn note_left(metrics: &Metrics) {
+    metrics.queued_requests.fetch_sub(1, Ordering::Relaxed);
+}
+
+fn note_drain(
+    done: tokio::sync::oneshot::Sender<()>,
+    draining: &mut bool,
+    drain_done: &mut Option<tokio::sync::oneshot::Sender<()>>,
+    late_drains: &mut Vec<tokio::sync::oneshot::Sender<()>>,
+) {
+    *draining = true;
+    match drain_done {
+        None => *drain_done = Some(done),
+        Some(_) => late_drains.push(done),
+    }
+}
+
+/// Moves every message on the channel into the dispatcher: jobs onto the back of `waiting`
+/// (`drain_waiting_session` seats them in seat order), drains into the drain state. Returns the
+/// jobs moved.
+#[allow(clippy::too_many_arguments)]
+fn drain_channel(
+    rx: &mut mpsc::Receiver<MuxMsg>,
+    waiting: &mut std::collections::VecDeque<(Job, Instant)>,
+    load: &mut LoadEstimator,
+    metrics: &Metrics,
+    draining: &mut bool,
+    drain_done: &mut Option<tokio::sync::oneshot::Sender<()>>,
+    late_drains: &mut Vec<tokio::sync::oneshot::Sender<()>>,
+) -> usize {
+    let mut jobs = 0;
+    while let Ok(msg) = rx.try_recv() {
+        match msg {
+            MuxMsg::Job(job, arrived) => {
+                note_arrival(job.arrived, load, metrics);
+                waiting.push_back((job, arrived));
+                jobs += 1;
+            }
+            MuxMsg::Drain(done) => note_drain(done, draining, drain_done, late_drains),
+        }
+    }
+    jobs
 }
 
 fn note_arrival(now: Instant, load: &mut LoadEstimator, metrics: &Metrics) {
@@ -1991,11 +2023,53 @@ fn queue_verdict(closed: bool, waited_ms: f64, slo_ms: f64, class: JobClass) -> 
     }
 }
 
+/// Whether the decode quantum drops to one step. Prefill is pending, so the next chunk must not
+/// wait behind a K-step quantum. With nothing queued, a slot freed last tick counts too: its
+/// successor is usually a round trip away, and a K-step quantum lets the next completion land in
+/// the same wave (two prefills back to back; 15000/C4 TTFT 1099 -> 627 ms). With a queue, only a
+/// waiter that can be seated now is worth the single step: at saturation there is always a queue,
+/// and dropping to one step for it alone meant the K = 8 quantum never ran. A slot the quantum
+/// would finish needs nothing here: the engine already ends the quantum at the first row's
+/// `max_tokens`, so its seat frees at the end of the quantum.
+fn quantum_yields(prefilling: bool, freed_last_tick: bool, queued: bool, seatable: impl FnOnce() -> bool) -> bool {
+    prefilling || if queued { seatable() } else { freed_last_tick }
+}
+
+/// The queue head could take an idle slot inside the admission window now: the KV budget (live
+/// sequences; retained rows give way) and the downstream stage both have room for it.
+fn waiter_seatable(
+    waiting: &std::collections::VecDeque<(Job, Instant)>,
+    slots: &[Option<Slot>],
+    admission_limit: usize,
+    kv_budget: Option<crate::sched::admission::KvBudget>,
+    downstream_full: bool,
+) -> bool {
+    let Some((head, _)) = waiting.front() else { return false };
+    if downstream_full || !slots[..admission_limit.min(slots.len())].iter().any(Option::is_none) {
+        return false;
+    }
+    let pair = head.opts.speech.as_ref().is_some_and(|s| s.cfg.is_some());
+    let want = reserved_kv_rows(head.prompt_ids.len(), head.gen.max_tokens, 0) * (1 + pair as u64);
+    kv_budget.is_none_or(|b| {
+        let live = slots.iter().flatten().map(|s| {
+            reserved_kv_rows(s.prompt_ids.len(), s.gen.max_tokens, s.out_ids.len()) * (1 + s.cfg.is_some() as u64)
+        });
+        b.fits_requests(live.chain(std::iter::once(want)))
+    })
+}
+
 /// Seat order of a queued request: class first; within a class, every request that has waited
 /// `bound` oldest first, then continuing session turns, then requests opening a session, each by
-/// arrival. A continuing turn overtakes a new session by at most `bound`.
+/// [`Fair`] round, then arrival. A continuing turn overtakes a new session by at most `bound`.
 #[inline]
-fn seat_order(class: JobClass, continuing: bool, arrived: Instant, now: Instant, bound: std::time::Duration) -> (JobClass, u8, Instant) {
+fn seat_order(
+    class: JobClass,
+    continuing: bool,
+    round: u64,
+    arrived: Instant,
+    now: Instant,
+    bound: std::time::Duration,
+) -> (JobClass, u8, u64, Instant) {
     let tier = if now.saturating_duration_since(arrived) >= bound {
         0
     } else if continuing {
@@ -2003,7 +2077,40 @@ fn seat_order(class: JobClass, continuing: bool, arrived: Instant, now: Instant,
     } else {
         2
     };
-    (class, tier, arrived)
+    (class, tier, if tier == 0 { 0 } else { round }, arrived)
+}
+
+/// Round-robin across tenants (start-time fair queuing, one unit per request): a job's round is
+/// the later of the current round and its tenant's previous job's round + 1, so a tenant with
+/// many queued jobs takes one seat per round while each other tenant takes theirs, and one
+/// tenant's jobs keep their arrival order. Jobs without a tenant start at the current round,
+/// which keeps their arrival order too. The round advances to each seated job's.
+#[derive(Default)]
+struct Fair {
+    round: u64,
+    next: FxHashMap<u64, u64>,
+}
+
+/// Tenants [`Fair`] remembers before it forgets those with no job past the current round.
+const FAIR_TENANTS: usize = 4096;
+
+impl Fair {
+    fn start(&mut self, tenant: Option<u64>) -> u64 {
+        let round = self.round.max(1);
+        let Some(t) = tenant else { return round };
+        if self.next.len() >= FAIR_TENANTS {
+            let now = self.round;
+            self.next.retain(|_, next| *next > now);
+        }
+        let next = self.next.entry(t).or_insert(round);
+        let start = round.max(*next);
+        *next = start + 1;
+        start
+    }
+
+    fn seated(&mut self, round: u64) {
+        self.round = self.round.max(round);
+    }
 }
 
 /// The head of the queue keeps its seat against [`cache_first`] once it has waited this long.
@@ -2025,6 +2132,24 @@ fn cache_first(heads: &[(JobClass, f64)], rows: &[u32], block: u32) -> Option<us
     (best > 0 && best_rows >= head_rows.saturating_add(block)).then_some(best)
 }
 
+/// Each waiter's attachable prefix rows ([`JobOpts::cached`]), recomputed only when the cache
+/// moved since: under one lock, from block hashes each job carries (handler-hashed, or hashed
+/// here once with no lock held).
+pub(crate) fn refresh_cached_rows(waiting: &mut std::collections::VecDeque<(Job, Instant)>, probe: &crate::memory::vmm::PrefixProbe) {
+    let gen = probe.generation();
+    let stale = |job: &Job| job.opts.cached.is_none_or(|(g, _)| g != gen);
+    if !waiting.iter().any(|(job, _)| stale(job)) {
+        return;
+    }
+    for (job, _) in waiting.iter_mut().filter(|(job, _)| job.opts.prefix.is_none()) {
+        job.opts.prefix = Some(probe.key(&job.prompt_ids));
+    }
+    let held = probe.rows_locked();
+    for (job, _) in waiting.iter_mut().filter(|(job, _)| stale(job)) {
+        job.opts.cached = Some((gen, held.rows(&job.prompt_ids, job.opts.prefix.as_ref())));
+    }
+}
+
 #[inline]
 fn waited_ms(now: Instant, arrived: Instant) -> f64 {
     now.saturating_duration_since(arrived).as_secs_f64() * 1e3
@@ -2037,7 +2162,7 @@ fn waited_ms(now: Instant, arrived: Instant) -> f64 {
 /// * **Sweep.** A disconnected client and a request past its TTL both hold a queue entry they
 ///   will never use. The per-request disconnect check in [`admit_into`] only fires when a slot
 ///   is free, so with a full slot table those entries used to sit in `waiting` indefinitely,
-///   counting against `ingress_capacity` and inflating the backlog the rung controller widens
+///   counting against the queue bound and inflating the backlog the rung controller widens
 ///   against. Sweeping is unconditional and costs one atomic load per queued entry.
 /// * **Aging.** The first request that does not fit and has waited past
 ///   [`queue_aging_ms`] stops the pass. Younger requests keep backfilling until then, so the
@@ -2074,6 +2199,7 @@ fn drain_waiting(
         downstream_full,
         &mut Retention::off(),
         None,
+        &mut Fair::default(),
     )
 }
 
@@ -2091,6 +2217,7 @@ fn drain_waiting_session(
     downstream_full: bool,
     retention: &mut Retention,
     prefix: Option<&crate::memory::vmm::PrefixProbe>,
+    fair: &mut Fair,
 ) {
     waiting.retain(|(job, arrived)| {
         let class = job.opts.class;
@@ -2115,8 +2242,13 @@ fn drain_waiting_session(
         }
     });
 
+    for (job, _) in waiting.iter_mut().filter(|(job, _)| job.opts.round == 0) {
+        job.opts.round = fair.start(job.opts.tenant);
+    }
     let bound = crate::serve::cosched::max_wait();
-    let order = |(job, arrived): &(Job, Instant)| seat_order(job.opts.class, job.opts.continuing, *arrived, now, bound);
+    let order = |(job, arrived): &(Job, Instant)| {
+        seat_order(job.opts.class, job.opts.continuing, job.opts.round, *arrived, now, bound)
+    };
     let queue = waiting.make_contiguous();
     if !queue.is_sorted_by_key(order) {
         queue.sort_by_key(order);
@@ -2128,8 +2260,16 @@ fn drain_waiting_session(
             && slots[..admission_limit.min(slots.len())].iter().any(Option::is_none)
     });
     let mut rows: std::collections::VecDeque<u32> = probe
-        .map(|p| waiting.iter().map(|(job, _)| p.cached_rows_keyed(&job.prompt_ids, job.opts.prefix.as_ref())).collect())
+        .map(|p| {
+            refresh_cached_rows(waiting, p);
+            waiting.iter().map(|(job, _)| job.opts.cached.map_or(0, |(_, rows)| rows)).collect()
+        })
         .unwrap_or_default();
+    let mut heads: std::collections::VecDeque<(JobClass, f64)> = if probe.is_some() {
+        waiting.iter().map(|(job, arrived)| (job.opts.class, waited_ms(now, *arrived))).collect()
+    } else {
+        Default::default()
+    };
     let mut still: std::collections::VecDeque<(Job, Instant)> =
         std::collections::VecDeque::new();
     while slots[..admission_limit.min(slots.len())]
@@ -2137,20 +2277,22 @@ fn drain_waiting_session(
         .any(Option::is_none)
     {
         if let Some(p) = probe {
-            let heads: Vec<(JobClass, f64)> =
-                waiting.iter().map(|(job, arrived)| (job.opts.class, waited_ms(now, *arrived))).collect();
-            if let Some(i) = cache_first(&heads, rows.make_contiguous(), p.block_rows()) {
+            if let Some(i) = cache_first(heads.make_contiguous(), rows.make_contiguous(), p.block_rows()) {
                 let entry = waiting.remove(i).expect("in range");
                 waiting.push_front(entry);
                 let r = rows.remove(i).expect("in range");
                 rows.push_front(r);
+                let h = heads.remove(i).expect("in range");
+                heads.push_front(h);
                 Metrics::inc(&metrics.cache_first_admissions);
             }
         }
         rows.pop_front();
+        heads.pop_front();
         let Some((job, arrived)) = waiting.pop_front() else {
             break;
         };
+        let round = job.opts.round;
         match admit_session(
             slots,
             admission_limit,
@@ -2173,6 +2315,7 @@ fn drain_waiting_session(
             None => {
                 // Seated: count it active now, not at the next loop top a long prefill tick away,
                 // so a load reader (the DP router) never sees it in neither gauge.
+                fair.seated(round);
                 metrics.queued_requests.fetch_sub(1, Ordering::Relaxed);
                 metrics.slots_active.fetch_add(1, Ordering::Relaxed);
             }
@@ -2634,6 +2777,8 @@ fn run_one_tick(
     )]
     co_scheduled: bool,
     #[cfg_attr(not(feature = "cuda"), allow(unused_variables))] quantum_cut: QuantumCut,
+    // A prefill candidate that has waited this long is served oldest-first ([`queue_aging_ms`]).
+    #[cfg_attr(not(feature = "cuda"), allow(unused_variables))] aging: std::time::Duration,
 ) -> (
     Vec<Option<Slot>>,
     Option<BucketBufs>,
@@ -3007,7 +3152,7 @@ fn run_one_tick(
                 if let Some(f) = gpu_prefill_batched_pass(
                     &mut *e, &mut slots, cap, &arena, feeds.is_empty(), co_scheduled, &mut completed,
                     &mut feeds, &mut obs.host.token_batch_tokens, &mut dev_sampled,
-                    &mut obs.host.ride,
+                    &mut obs.host.ride, aging,
                 ) {
                     if tick_fault.is_none() {
                         tick_fault = Some(f);
@@ -4174,7 +4319,7 @@ fn run_one_tick(
             // dispatch below. What the engine cannot run it refuses by name; the plan is never
             // narrowed here.
             let pf_batch = true;
-            let cap = b.min(slots.len()).min(u128::BITS as usize);
+            let cap = b.min(slots.len());
             let backend = e.step_backend();
             let now = Instant::now();
             let full_budget = tick_max.min(backend.step_budget);
@@ -4907,7 +5052,8 @@ fn kv_used(kv_budget: Option<crate::sched::admission::KvBudget>, slots: &[Option
 
 /// Prefill rows for one launch, from the queue (the latency objective's packing).
 ///
-/// `rows` are the waiting prompts' offered rows, oldest first. A launch costs a fixed
+/// `rows` are the waiting prompts' offered rows, in serve order (shortest remaining prompt first,
+/// `sched::step::shortest_first_key`). A launch costs a fixed
 /// `chunk_cost` rows of time plus its rows, and every prompt packed into it finishes when the
 /// launch does. So packing prompt `j + 1` (r rows) delays the `j` prompts already in by r rows and
 /// saves the `n - j` prompts not yet in one fixed cost each: it joins while
@@ -4916,15 +5062,19 @@ fn kv_used(kv_budget: Option<crate::sched::admission::KvBudget>, slots: &[Option
 /// 128/512/1024/2048/4096 rows 16.8/26.6/45.2/86.6/172.3: four 1024-row prompts packed all finish
 /// at 172 ms, alone they finish at 45/90/135/180.
 ///
-/// A prompt no launch can hold whole (`r >= bound`) still FILLS this one, as the static bound
-/// does: stopping short there ran a long prompt's tail as two padded launches instead of one full
-/// one (12B 15000 in, C4: TPOT 25.1 -> 26.6 ms, 105.8 -> 102.0 tok/s). A shorter prompt that does
-/// not fit waits for the next launch: splitting it costs it a launch.
+/// A prompt no launch can hold whole (`r >= bound`), wherever it waits, still FILLS this one, as
+/// the static bound does: stopping short there ran a long prompt's tail as two padded launches
+/// instead of one full one (12B 15000 in, C4: TPOT 25.1 -> 26.6 ms, 105.8 -> 102.0 tok/s). The
+/// shorter prompts ahead of it take their rows first. A shorter prompt that does not fit waits for
+/// the next launch: splitting it costs it a launch.
 #[cfg(feature = "cuda")]
 fn queue_pack_rows(rows: &[usize], chunk_cost: usize, bound: usize) -> usize {
     let Some((&first, rest)) = rows.split_first() else {
         return bound;
     };
+    if rows.iter().any(|&r| r >= bound) {
+        return bound;
+    }
     let mut total = first.min(bound);
     for (j, &r) in rest.iter().enumerate() {
         let (packed, waiting) = (j + 1, rows.len() - (j + 1));
@@ -5306,6 +5456,7 @@ fn gpu_prefill_batched_pass(
     unified_output: &mut Vec<(u32, u32)>,
     dev_sampled: &mut bool,
     ride: &mut crate::sched::ride::RideCost,
+    aging: std::time::Duration,
 ) -> Option<crate::DeviceErrorInfo> {
     use crate::exec::gpu::PfBatchReq;
 
@@ -5441,7 +5592,11 @@ fn gpu_prefill_batched_pass(
                     program: 0,
                 };
                 Some(crate::sched::step::Candidate {
-                    arrival: arrival_key(s.arrived, now),
+                    arrival: crate::sched::step::shortest_first_key(
+                        n - withheld - pf_pos,
+                        now.saturating_duration_since(s.arrived),
+                        aging,
+                    ),
                     span,
                     packable: true,
                     planned: true,
@@ -6855,6 +7010,8 @@ pub(crate) fn scripted_mux(script: impl Fn(&Job) -> Vec<String> + Send + Sync + 
         arrival_notify: Arc::new(tokio::sync::Notify::new()),
         ingress: Arc::default(),
         preempted: Arc::default(),
+        queue_cap: usize::MAX,
+        prefix_block_rows: 0,
     }
 }
 
@@ -6957,6 +7114,8 @@ mod tests {
         // A prompt that a later launch holds whole is not split to top this one up.
         assert_eq!(super::queue_pack_rows(&[1024; 16], 512, 4224), 4096);
         assert_eq!(super::queue_pack_rows(&[4096, 4096], 512, 4224), 4096);
+        // Shortest first: a long prompt behind short ones still fills the launch they lead.
+        assert_eq!(super::queue_pack_rows(&[128, 128, 1024, 8192], 512, 4224), 4224);
     }
 
     /// A held prefix that turns out not to begin a match is released, not dropped.
@@ -7167,7 +7326,7 @@ mod tests {
     #[test]
     fn bounded_ingress_reports_full_closed_and_depth() {
         let metrics = Arc::new(Metrics::default());
-        let (tx, mut rx) = mpsc::channel(1);
+        let (tx, mut rx) = mpsc::channel(1 + CONTROL_SLACK);
         let mux = ModelMux {
             tx,
             metrics: Arc::clone(&metrics),
@@ -7176,6 +7335,8 @@ mod tests {
             arrival_notify: Arc::new(tokio::sync::Notify::new()),
             ingress: Arc::default(),
             preempted: Arc::default(),
+            queue_cap: 1,
+            prefix_block_rows: 0,
         };
 
         let (a, b) = (mux.ingress(), mux.ingress());
@@ -7199,6 +7360,66 @@ mod tests {
             Err(SubmitError::Closed(_))
         ));
         assert_eq!(metrics.queued_requests.load(Ordering::Relaxed), 0);
+    }
+
+    /// `--serve-max-queued-requests N` holds N, however many of them the dispatcher already moved
+    /// off the channel; a job leaving the queue makes room for one more.
+    #[test]
+    fn the_queue_bound_counts_jobs_off_the_channel_too() {
+        let metrics = Arc::new(Metrics::default());
+        let (tx, mut rx) = mpsc::channel(3 + CONTROL_SLACK);
+        let mux = ModelMux {
+            tx,
+            metrics: Arc::clone(&metrics),
+            preempt: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            preempt_notify: Arc::new(tokio::sync::Notify::new()),
+            arrival_notify: Arc::new(tokio::sync::Notify::new()),
+            ingress: Arc::default(),
+            preempted: Arc::default(),
+            queue_cap: 3,
+            prefix_block_rows: 0,
+        };
+        let (mut waiting, mut load) = (std::collections::VecDeque::new(), LoadEstimator::default());
+        let (mut draining, mut drain_done, mut late) = (false, None, Vec::new());
+        for _ in 0..3 {
+            assert!(mux.submit(test_job()).is_ok());
+        }
+        assert!(matches!(mux.submit(test_job()), Err(SubmitError::Full(_))));
+        assert_eq!(drain_channel(&mut rx, &mut waiting, &mut load, &metrics, &mut draining, &mut drain_done, &mut late), 3);
+        assert_eq!((waiting.len(), mux.pending()), (3, 3));
+        assert!(matches!(mux.submit(test_job()), Err(SubmitError::Full(_))), "the channel is empty, the queue is not");
+        waiting.pop_front();
+        note_left(&metrics);
+        assert!(mux.submit(test_job()).is_ok());
+        assert_eq!(mux.pending(), 3);
+        assert_eq!(metrics.rejected.load(Ordering::Relaxed), 2);
+    }
+
+    /// An ASR final submitted behind normal jobs is in `waiting` the same loop: the next free slot
+    /// is its, and the device deadline (`tick_due`) carries its class.
+    #[test]
+    fn a_final_behind_normal_jobs_takes_the_next_slot_and_sets_the_deadline() {
+        use crate::serve::cosched::{Band, Urgency};
+        let metrics = Arc::new(Metrics::default());
+        let (tx, mut rx) = mpsc::channel(8 + CONTROL_SLACK);
+        let (mut waiting, mut load) = (std::collections::VecDeque::new(), LoadEstimator::default());
+        let (mut draining, mut drain_done, mut late) = (false, None, Vec::new());
+        let mut keep = Vec::new();
+        let now = Instant::now();
+        for class in [JobClass::Normal, JobClass::Normal, JobClass::Normal, JobClass::Final] {
+            let ((mut job, arrived), rx) = queued_job(10, now);
+            job.opts.class = class;
+            keep.push(rx);
+            tx.try_send(MuxMsg::Job(job, arrived)).ok().unwrap();
+            Metrics::inc(&metrics.queued_requests);
+        }
+        drain_channel(&mut rx, &mut waiting, &mut load, &metrics, &mut draining, &mut drain_done, &mut late);
+        let mut slots: Vec<Option<Slot>> = (0..1).map(|_| None).collect();
+        let due = tick_due(&slots, &waiting, 0, now);
+        assert_eq!(due.band, Band::from(Urgency::Final));
+        drain_waiting(&mut waiting, &mut slots, 1, now, 250.0, None, &metrics, &EngineHealth::Healthy, None, false);
+        assert_eq!(slots[0].as_ref().map(|s| s.class), Some(JobClass::Final));
+        assert_eq!((waiting.len(), metrics.queued_requests.load(Ordering::Relaxed)), (3, 3));
     }
 
     #[cfg(feature = "cuda")]
@@ -7349,6 +7570,33 @@ mod tests {
         )
         .is_none());
         (metrics, slots, budget, vec![rx])
+    }
+
+    /// A standing queue alone keeps the K-step quantum; prefill, a seatable waiter, or (with no
+    /// queue) a slot freed last tick drop it to one step.
+    #[test]
+    fn the_quantum_yields_only_to_work_that_can_start() {
+        let never = || -> bool { panic!("not consulted") };
+        assert!(quantum_yields(true, false, true, never));
+        assert!(!quantum_yields(false, true, true, || false), "saturated: a freed slot went to a waiter");
+        assert!(quantum_yields(false, false, true, || true));
+        assert!(quantum_yields(false, true, false, never));
+        assert!(!quantum_yields(false, false, false, never));
+
+        let (_metrics, mut slots, budget, mut keep) = starvation_fixture();
+        let mut waiting = std::collections::VecDeque::new();
+        assert!(!waiter_seatable(&waiting, &slots, 8, Some(budget), false));
+        let (entry, rx) = queued_job(700, Instant::now());
+        keep.push(rx);
+        waiting.push_back(entry);
+        assert!(!waiter_seatable(&waiting, &slots, 8, Some(budget), false), "701 rows behind 301 of 1000");
+        waiting[0].0.prompt_ids.truncate(100);
+        assert!(waiter_seatable(&waiting, &slots, 8, Some(budget), false));
+        assert!(waiter_seatable(&waiting, &slots, 8, None, false));
+        assert!(!waiter_seatable(&waiting, &slots, 8, Some(budget), true), "downstream full");
+        assert!(!waiter_seatable(&waiting, &slots, 1, Some(budget), false), "no idle slot in the window");
+        slots.truncate(1);
+        assert!(!waiter_seatable(&waiting, &slots, 8, Some(budget), false));
     }
 
     /// The backfill is a throughput win and stays on until the head has actually waited. Both
@@ -7599,15 +7847,52 @@ mod tests {
         assert_eq!(seat(bound + std::time::Duration::from_millis(1)), 10, "never past the bound");
 
         let o = |continuing, ago_ms| {
-            seat_order(JobClass::Normal, continuing, now - std::time::Duration::from_millis(ago_ms), now, bound)
+            seat_order(JobClass::Normal, continuing, 1, now - std::time::Duration::from_millis(ago_ms), now, bound)
         };
         let aged = bound.as_millis() as u64 + 10;
         assert!(o(false, aged + 5) < o(false, aged), "aged requests are oldest first");
         assert!(o(false, aged) < o(true, 0));
         assert!(o(true, 0) < o(false, 500));
         assert!(o(false, 500) < o(false, 100));
-        let critical = seat_order(JobClass::Critical, false, now, now, bound);
+        let critical = seat_order(JobClass::Critical, false, 9, now, now, bound);
         assert!(critical < o(false, aged), "class still comes first");
+    }
+
+    /// Tenant A queues four jobs, then B and C one each: within the class they are seated A, B, C,
+    /// A, A, A (one seat per tenant per round), A's in arrival order. Untagged jobs keep FIFO.
+    #[test]
+    fn tenants_are_seated_round_robin_within_a_class() {
+        let now = Instant::now();
+        let metrics = Arc::new(Metrics::default());
+        let mut fair = Fair::default();
+        let mut waiting = std::collections::VecDeque::new();
+        let mut keep = Vec::new();
+        for (i, (tenant, class)) in [(1, JobClass::Normal), (1, JobClass::Normal), (1, JobClass::Normal), (1, JobClass::Normal), (2, JobClass::Normal), (3, JobClass::Normal), (4, JobClass::Final)]
+            .into_iter()
+            .enumerate()
+        {
+            let ((mut job, _), rx) = queued_job(1 + i, now);
+            job.opts.tenant = Some(tenant);
+            job.opts.class = class;
+            keep.push(rx);
+            waiting.push_back((job, now - std::time::Duration::from_millis(100 - i as u64)));
+        }
+        let mut seated = Vec::new();
+        for _ in 0..7 {
+            let mut slots: Vec<Option<Slot>> = (0..1).map(|_| None).collect();
+            drain_waiting_session(
+                &mut waiting, &mut slots, 1, now, 250.0, None, &metrics, &EngineHealth::Healthy, None, false,
+                &mut Retention::off(), None, &mut fair,
+            );
+            seated.push(slots[0].as_ref().unwrap().prompt_ids.len());
+        }
+        assert_eq!(seated, [7, 1, 5, 6, 2, 3, 4], "the final first, then A B C A A A");
+
+        let mut fifo = Fair::default();
+        let rounds: Vec<u64> = (0..4).map(|_| fifo.start(None)).collect();
+        assert!(rounds.windows(2).all(|w| w[0] <= w[1]));
+        fifo.seated(rounds[3]);
+        assert_eq!(fifo.start(Some(9)), fifo.start(None), "a new tenant starts at the current round");
     }
 
     fn cfg_job(prompt: usize) -> ((Job, Instant), crate::serve::stream::ChunkReceiver) {

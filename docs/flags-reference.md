@@ -1026,13 +1026,14 @@ per-request cap after 2 s with no request waiting and KV under 75% (`plowrt_pref
 | mechanism | latency | throughput | capability gate |
 |---|---|---|---|
 | decode quantum K (rows the pipeline does not carry) | CUDA one token group (1; Veena 7); AMD 4 | 8 | off under decode objects, roles, all-cuBLASLt ladders, recurrent state; AMD TP needs `PLOW_TP_AGREE_EVERY>1`; CPU 1 |
-| single-step while prefill, an arrival or a freed slot is pending | on | on | K > 1 |
+| single-step while prefill is pending, a queued request can be seated now, or (nothing queued) a slot freed last tick; a standing queue alone keeps K | on | on | K > 1 |
 | lookahead-1 decode pipeline | on | on | CUDA greedy rows; same gate as K |
 | prefill rows per launch while requests decode | the per-request cap (`PLOW_MAX_REQUEST_CHUNK`) | widest launch | CUDA packed prefill; `PLOW_TBT_SLO_MS` plans it on AMD |
-| prefill packing | queue-sized (oldest prompt whole) | fill the launch | CUDA packed-prefill metadata; AMD packed siblings |
+| prefill packing | queue-sized (first prompt whole) | fill the launch | CUDA packed-prefill metadata; AMD packed siblings |
+| CUDA prefill order | shortest remaining prompt first; a request waiting `--slo-ms` x 4 (at least 1 s) goes first, oldest first | same | CUDA packed prefill |
 | decode riding a prefill launch | `sched::ride` cost model | same | token batch |
 | rung fast probe | off | on | a rung ladder |
-| admission order of waiting requests | class, then arrival | the waiter attaching the most cached prefix rows first when it beats the head by a KV block; the head keeps its seat after 30 s (`plowrt_cache_first_admissions_total`) | VMM prefix cache |
+| admission order of waiting requests | class, then round-robin across tenants (`X-Session-Id`, else API key), then arrival | the waiter attaching the most cached prefix rows first when it beats the head by a KV block; the head keeps its seat after 30 s (`plowrt_cache_first_admissions_total`) | VMM prefix cache |
 | queue TTL | `--slo-ms` x 40, at least 30 s | never shed | |
 | co-tenant turns (several models) | CUDA `deadline`, AMD `rr` | `rr` | one model: `free` |
 
@@ -1097,7 +1098,7 @@ Removed (a set value is ignored with a startup warning; recipes and scripts may 
 | `PLOW_AMD_TAIL_SPARSE_MIN_PAIRS=<pairs>` / `--amd-tail-sparse-min-pairs` | unset (off) | AMD, with `PLOW_AMD_TAIL_SPARSE_CTX`: the dense final chunk moves to the sparse bucket only when `prior x tail rows` (the query-key pairs its dense attention scores) is at least this many. The sparse 8192 bucket has a ~110 ms fixed cost at these priors, so a small, shallow tail is faster dense. GLM-5.3 TP8 served tails through a prefix-cache resume (`pfroute-t3-tail`, chunk ms dense -> sparse): R 2112: S 128 99.4 -> 110.0, S 512 133.2 -> 133.9, S 2048 255.2 -> 234.6; R 4160: S 128 102.0 -> 110.3, S 512 143.2 -> 134.7, S 2048 285.4 -> 225.6; R 6208: S 512 153.1 -> 135.2, S 2048 343.4 -> 244.0. The crossover sits near 1.3M pairs at every prior measured (S ~ 583 / 319 / ~207 rows). `PLOW_AMD_TAIL_SPARSE_CTX=2048` with `=1500000` keeps every measured win and no measured loss; unset keeps the prior-only floor. |
 | `PLOW_AMD_DECODE_DENSE_EXACT=1` / `--amd-decode-dense-exact` | off | AMD TP decode: while every row the chosen rung advances has kv_len ≤ 2048 (the DSA selection keeps all keys), run the packet's dense-exact rung of that width (rungs ≥ 8 only) instead of the DSA rung; requires a packet emitted with `PLOW_GLM_DECODE_DENSE_EXACT=1` and batch > 1 (otherwise warns and stays off). Not bit-identical: dense attention reads the same key set but not in the selection's order, which reassociates the softmax (floor-bounded). |
 | `PLOW_DECODE_MIN_RUNG=<slots>` / `--decode-min-rung` | TP engines 8 (`1` = off); single-GPU unset | **Expert.** Narrowest decode rung a serving engine admits, on every backend: a lone TP request decodes on the rung-8 program instead of rung 1 (GLM-5.3 TP8 41.4 vs 51.9 ms). Formerly `PLOW_AMD_DECODE_MIN_RUNG`. |
-| `PLOW_MAX_QUEUED_REQUESTS=<n>` / `--serve-max-queued-requests` (`serve --max-queued-requests`) | 0 = four engine batches | Requests allowed to wait outside the engine slot table before new ones get 429 `model request queue full`. The flag wins; the env (or a packet serve default) applies when the flag is 0. A packet with few slots (Gemma-4-31B BF16: 8) needs it above its client concurrency. |
+| `PLOW_MAX_QUEUED_REQUESTS=<n>` / `--serve-max-queued-requests` (`serve --max-queued-requests`) | 0 = four engine batches | Requests allowed to wait outside the engine slot table (counted from submit until seated, wherever they wait) before new ones get 429 `model request queue full`. The flag wins; the env (or a packet serve default) applies when the flag is 0. A packet with few slots (Gemma-4-31B BF16: 8) needs it above its client concurrency. |
 | `PLOW_NV_SCHED=1` | **on** | global-queue interpreter scheduler; the static per-block-stream path is the build-time A/B. |
 | `PLOW_GLOBAL_QUEUE=0` | on | force the static per-block-stream scheduler (AMD runtime read; build-time A/B otherwise). |
 | `PLOW_STATIC=both\|decode\|prefill` (`--amd-static`) | unset | force the static scheduler for both phases (`1`/`true` = `both`), decode only or prefill only; unset keeps the global queue where the blob carries its appendix. |
