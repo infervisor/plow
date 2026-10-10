@@ -204,7 +204,10 @@ def check_artifacts(recipe: dict, roots: list[Path]) -> list[str]:
     return notes
 
 
-def check_provenance(recipe: dict, strict: bool) -> list[str]:
+def check_provenance(recipe: dict, strict: bool, verified: bool = False) -> list[str]:
+    """`plow_git` is a record. A commit this checkout lacks refuses under `strict` only when no
+    content evidence stands in for it: with `verified` (every recorded artifact present and
+    matching its sha256) the bytes, not the commit, qualify the recipe."""
     git = recipe.get("plow_git")
     if not git:
         raise Invalid("recipe has no `plow_git`")
@@ -219,6 +222,8 @@ def check_provenance(recipe: dict, strict: bool) -> list[str]:
             f"plow_git {git[:12]} is not an ancestor of HEAD — this recipe describes a build "
             f"from a commit this checkout does not contain"
         )
+        if verified:
+            return [f"info: {msg}; its artifacts match by sha256, so the commit stays a record"]
         if strict:
             raise Invalid(msg)
         return [msg]
@@ -235,7 +240,6 @@ def check(recipe_path: Path, bundle: Path | None, objects: Path | None, strict: 
     if recipe.get("status", "emits") == "refused":
         return check_provenance(recipe, strict)
 
-    notes += check_provenance(recipe, strict)
     notes += check_lowrung_tiers(recipe)
 
     if bundle:
@@ -248,9 +252,9 @@ def check(recipe_path: Path, bundle: Path | None, objects: Path | None, strict: 
         notes += check_objects(recipe, pd.load_json(dp) if dp.exists() else {})
 
     roots = [p for p in (bundle, objects) if p]
-    if roots:
-        notes += check_artifacts(recipe, roots)
-    return notes
+    artifact_notes = check_artifacts(recipe, roots) if roots else []
+    verified = bool(roots and recipe.get("artifacts") and not artifact_notes)
+    return check_provenance(recipe, strict, verified) + notes + artifact_notes
 
 
 def run() -> None:
@@ -282,7 +286,7 @@ def run() -> None:
             print(f"{p}: OK")
             for n in notes:
                 print(f"  note: {n}")
-                if args.strict:
+                if args.strict and not n.startswith("info:"):
                     failed += 1
         except pd.Fail as e:
             print(f"{p}: FAIL\n  {e}")

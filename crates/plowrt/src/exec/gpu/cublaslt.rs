@@ -1568,7 +1568,8 @@ pub(super) fn prepare_routes(
             if u64::from(segment.m) * u64::from(fusion.n_total) * 2 > scratch.len {
                 return Err(RuntimeError::Rejected("fused q|k|v scratch too small".into()));
             }
-            let plan = lt.plan(segment.m, fusion.n_total, segment.k, weight, template.filter(|_| pin), rows)?;
+            let ns: Vec<u32> = segments[index..index + 3].iter().flatten().map(|s| s.n).collect();
+            let plan = lt.plan(segment.m, fusion.n_total, segment.k, weight, template.filter(|_| pin), rows, &ns)?;
             for next in segments[index + 1..index + 3].iter().flatten() {
                 insts[next.instruction].op = DevOp::Nop as u16;
             }
@@ -1652,7 +1653,7 @@ pub(super) fn prepare_routes(
                                 )),
                             })
                             .transpose()?;
-                        ProjectionPlan::Lt(lt.plan(key.0, key.1, key.2, weight, template.filter(|_| pin), rows)?)
+                        ProjectionPlan::Lt(lt.plan(key.0, key.1, key.2, weight, template.filter(|_| pin), rows, &[segment.n])?)
                     }
                     ProjectionBackend::Native(native) => {
                         let template = template

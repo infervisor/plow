@@ -657,23 +657,72 @@ def cmd_build(a: argparse.Namespace) -> None:
         "nix": os.environ.get("PLOW_CAMPAIGN_NO_NIX") != "1",
         "prep": [s.get("name") for s in r.get("prep", [])],
         "utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "hashes": {p.name: sha(p) for p in sorted(assets.glob("*")) if p.is_file() and p.suffix in (".pkt", ".cubin", ".elf", ".co", ".json", ".h")},
+        "hashes": {p.name: sha(p) for p in sorted(assets.glob("*")) if p.is_file() and (p.suffix in (".pkt", ".cubin", ".elf", ".co", ".json", ".h") or p.name == "cublaslt_algos.jsonl")},
         "objects": {p.name: sha(p) for p in sorted((out / "objects").glob("*")) if p.is_file() and p.suffix in (".cubin", ".elf", ".co", ".so")} if (out / "objects").exists() else {},
     }
+    nvidia = cell["arch"].startswith("sm_")
+    rec["cublaslt"] = lt_record(r, assets) if nvidia else None
     (out / "build-record.json").write_text(json.dumps(rec, indent=1))
     print(f"built {assets}\nrecord {out / 'build-record.json'}", file=sys.stderr)
-    # With the GPU on this box, select the exact-shape cuBLASLt algorithms now and packetize
-    # them (leased); without it, plowc has already packetized the tune store's rows.
-    # Speech/ASR recipes carry no completion gate to probe against.
-    if not a.no_probe and "gate_prompt" in r.get("bench", {}) and (assets / "build.json").exists() and gpu_matches(cell.get("gpu", "")):
-        if (assets / "cublaslt_algos.jsonl").exists():
-            print("probe: table already packetized from the tune store; skipping", file=sys.stderr)
-        else:
-            a.assets = str(assets)
-            a.store_cell = a.store_cell or "h100"
-            a.force = False
-            a.label = None
-            cmd_probe(a)
+    if not nvidia:
+        return
+    # plowc packetized the tune store's rows for the bundle's cuBLASLt shapes. With the GPU on
+    # this box, probe the shapes no row serves (leased) and record the final table.
+    missing = rec["cublaslt"]["missing"]
+    if not a.no_probe and missing and gpu_matches(cell.get("gpu", "")):
+        print(f"probe: {len(missing)} cuBLASLt shape(s) without a tune-store row", file=sys.stderr)
+        a.assets = str(assets)
+        a.force = False
+        a.label = None
+        cmd_probe(a)
+    elif rec["cublaslt"]["shapes"] and not missing:
+        print(f"probe: all {rec['cublaslt']['shapes']} cuBLASLt shape(s) served by the packetized table", file=sys.stderr)
+
+
+def lt_rung_algos(r: dict) -> bool:
+    """`PLOW_LT_RUNG_ALGOS` as the recipe serves it: every decode rung selects its own algorithms."""
+    value = str(r.get("serve", {}).get("env", {}).get("PLOW_LT_RUNG_ALGOS", "false"))
+    return value.strip().lower() in ("1", "true", "yes", "on")
+
+
+def lt_missing(assets: Path, rung_algos: bool) -> tuple[list[dict], int]:
+    """The bundle's BF16 cuBLASLt projection shapes (`build.json` `cublaslt.shapes`) that no row
+    of its `cublaslt_algos.jsonl` serves, and how many shapes plowrt plans. A row serves
+    `(m, n_i, k)` for each instruction N in its `ns` (default `[n]`). Narrower decode rungs pin the
+    widest rung's algorithms unless `rung_algos`, so only the widest rung's shapes count then."""
+    build = assets / "build.json"
+    shapes = json.loads(build.read_text()).get("cublaslt", {}).get("shapes", []) if build.is_file() else []
+    shapes = [x for x in shapes if x["dtype"] == "bf16"]
+    decode = [x["rows"] for x in shapes if x["phase"] == "decode"]
+    if decode and not rung_algos:
+        shapes = [x for x in shapes if x["phase"] != "decode" or x["rows"] == max(decode)]
+    served = set()
+    table = assets / "cublaslt_algos.jsonl"
+    for row in (json.loads(ln) for ln in (table.read_text().splitlines() if table.is_file() else []) if ln.strip()):
+        if row.get("dtype") == "bf16":
+            served.update((row["m"], n, row["k"]) for n in (row.get("ns") or [row["n"]]))
+    return [x for x in shapes if (x["m"], x["n"], x["k"]) not in served], len(shapes)
+
+
+def lt_record(r: dict, assets: Path) -> dict:
+    """`build-record.json` `cublaslt`: the packetized table's sha256 and rows, and the shapes no row serves."""
+    missing, shapes = lt_missing(assets, lt_rung_algos(r))
+    table = assets / "cublaslt_algos.jsonl"
+    rows = [json.loads(ln) for ln in table.read_text().splitlines() if ln.strip()] if table.is_file() else []
+    return {
+        "shapes": shapes,
+        "missing": missing,
+        "table_sha256": sha(table) if table.is_file() else None,
+        "rows": [{k: x.get(k) for k in ("m", "n", "k", "dtype", "pair", "ns", "gpu", "commit")} for x in rows],
+    }
+
+
+def store_cell(r: dict) -> str:
+    """The tune-store SKU segment, `HardwareFingerprint::tuning_path` style: `H100 SXM5` -> `h100-sxm5`."""
+    sku = r.get("target", {}).get("sku")
+    if not sku:
+        die("recipe has no [target].sku; pass --store-cell")
+    return re.sub(r"[^a-z0-9]+", "-", sku.lower()).strip("-")
 
 
 def gpu_matches(recipe_gpu: str) -> bool:
@@ -873,9 +922,11 @@ def cmd_serve(a: argparse.Namespace) -> None:
 
 # ---------------------------------------------------------------- probe
 def cmd_probe(a: argparse.Namespace) -> None:
-    """Serve the packet once under the lease with `--lt-algos-write`, answer the coherence
-    gate, and stop. Leaves `<assets>/cublaslt_algos.jsonl` (consumed by `bench`) and copies it
-    into the tune store, so an emit on a GPU-less host can packetize the same selection."""
+    """Serve the packet once under the lease with `--lt-algos-write`, wait until it has loaded
+    (every cuBLASLt plan is selected at load), answer the coherence gate when the recipe has one,
+    and stop. The bundle's packetized rows stay pinned (`--force` re-selects every shape), so only
+    unserved shapes are timed; their rows are merged into `<assets>/cublaslt_algos.jsonl` and
+    appended to the tune store, so the next emit packetizes them."""
     r = load(a.recipe)
     cell, bench, serve = r["cell"], r["bench"], dict(r.get("serve", {}))
     assets = Path(a.assets).resolve()
@@ -884,22 +935,26 @@ def cmd_probe(a: argparse.Namespace) -> None:
     out = assets.parent / "probe"
     out.mkdir(exist_ok=True)
     table = assets / "cublaslt_algos.jsonl"
-    if table.exists() and not a.force:
-        die(f"{table} exists; pass --force to re-probe")
-    plowrt = Path(serve.get("plowrt", str(REPO / "target" / "release" / "plowrt"))).resolve()
+    selected = out / "cublaslt_selected.jsonl"
+    selected.unlink(missing_ok=True)
+    plowrt = Path(getattr(a, "plowrt", None) or serve.get("plowrt", str(REPO / "target" / "release" / "plowrt"))).resolve()
     private = out / "plowrt"
     private.write_bytes(plowrt.read_bytes())
     private.chmod(0o755)
+    # plowrt binds the cuBLASLt beside it first: the probe must select with the library it serves with.
+    for lib in sorted({*plowrt.parent.glob("libcublasLt.so*"), *(plowrt.parent.parent / "lib").glob("libcublasLt.so*")}):
+        (out / lib.name).unlink(missing_ok=True)
+        shutil.copy2(lib, out / lib.name)
     env = env_with(os.environ, serve.get("env", {}))
     objects = assets.parent / "objects"
     if "objects" in r and "PLOW_LT_ALGOS_WRITE" not in env and objects.is_dir():
         env.setdefault("PLOW_PF_SEG_DIR", str(objects))
     env.update(dict(kv.split("=", 1) for kv in (a.env or [])))
-    env["PLOW_LT_ALGOS_WRITE"] = str(table)
+    env["PLOW_LT_ALGOS_WRITE"] = str(selected)
     env.pop("PLOW_LT_ALGOS", None)
+    if table.is_file() and not a.force:
+        env["PLOW_LT_ALGOS"] = str(table)
     port = str(bench.get("port", 8765))
-    model_id = bench.get("model_id") or cell["revision"]
-    gate = json.dumps({"model": model_id, "prompt": bench["gate_prompt"], "max_tokens": 16, "temperature": 0})
     script = out / "probe.sh"
     lines = ["#!/usr/bin/env bash", "set -uo pipefail"]
     for k, v in sorted(env.items()):
@@ -912,38 +967,57 @@ def cmd_probe(a: argparse.Namespace) -> None:
         "trap 'kill -TERM -\"$SRV\" 2>/dev/null; sleep 2; kill -KILL -\"$SRV\" 2>/dev/null' EXIT",
         f"for i in $(seq 1 {bench.get('ready_s', 1200)}); do kill -0 $SRV 2>/dev/null || {{ echo 'server died'; tail -20 {shlex.quote(str(out / 'server.log'))}; exit 1; }}; "
         f"curl -sf --max-time 2 http://127.0.0.1:{port}/v1/models >/dev/null 2>&1 && break; sleep 1; done",
-        f"curl -s --max-time 300 http://127.0.0.1:{port}/v1/completions -H 'Content-Type: application/json' --data-binary {shlex.quote(gate)} | grep -qi paris || {{ echo 'gate FAIL'; exit 1; }}",
-        "echo 'gate PASS'",
+        f"curl -sf --max-time 2 http://127.0.0.1:{port}/v1/models >/dev/null || {{ echo 'server not ready'; exit 1; }}",
     ]
+    # Without a completion gate (speech, ASR, multimodal) the probe is the load: plowrt selects
+    # every cuBLASLt plan before it reports ready.
+    if "gate_prompt" in bench:
+        model_id = bench.get("model_id") or cell["revision"]
+        gate = json.dumps({"model": model_id, "prompt": bench["gate_prompt"], "max_tokens": 16, "temperature": 0})
+        lines.append(f"curl -s --max-time 300 http://127.0.0.1:{port}/v1/completions -H 'Content-Type: application/json' "
+                     f"--data-binary {shlex.quote(gate)} | grep -qi paris || {{ echo 'gate FAIL'; exit 1; }}")
+    lines.append("echo 'probe PASS'")
     script.write_text("\n".join(lines) + "\n")
     script.chmod(0o755)
     log = out / "probe.log"
     log.write_bytes(b"")
     label = a.label or f"{cell['name']}-probe"
-    rc = run([str(GPULEASE), "-n", str(cell.get("n_gpu", 1)), label, str(script)], dict(os.environ), log)
+    # A gpuq job already holds the lease; a nested gpulease would wait on itself.
+    lease = [] if getattr(a, "leased", False) else [str(GPULEASE), "-n", str(cell.get("n_gpu", 1)), label]
+    rc = run([*lease, str(script)], dict(os.environ), log)
     text = log.read_text(errors="replace")
-    if rc != 0 or "gate PASS" not in text or not table.is_file():
+    if rc != 0 or "probe PASS" not in text:
         die("probe failed; see probe/probe.log and probe/server.log")
-    rows = [ln for ln in table.read_text().splitlines() if ln.strip()]
-    store = REPO / "tuning" / "nvidia" / cell["arch"].replace("_", "") / a.store_cell / "cublaslt_algos.jsonl"
+    # Provenance rides on each row; reuse keys on the shape, the GPU and AlgoCheck, never on it.
+    stamp = {"commit": git("rev-parse", "HEAD"), "recipe": cell["name"],
+             "utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+    new = [{**json.loads(ln), **stamp} for ln in (selected.read_text().splitlines() if selected.is_file() else []) if ln.strip()]
+    key = lambda d: (d["m"], d["n"], d["k"], d["dtype"], bool(d.get("pair")))
+    merged = {} if a.force else {key(d): d for d in (json.loads(ln) for ln in (table.read_text().splitlines() if table.is_file() else []) if ln.strip())}
+    merged.update((key(d), d) for d in new)
+    if merged:
+        table.write_text("".join(json.dumps(d) + "\n" for _, d in sorted(merged.items())))
+    store = REPO / "tuning" / "nvidia" / cell["arch"] / (getattr(a, "store_cell", None) or store_cell(r)) / "cublaslt_algos.jsonl"
     store.parent.mkdir(parents=True, exist_ok=True)
     seen = set()
     if store.exists():
-        for ln in store.read_text().splitlines():
-            if ln.strip():
-                d = json.loads(ln)
-                seen.add((d["m"], d["n"], d["k"], d["dtype"], d["gpu"]))
+        seen = {(*key(d), d["gpu"]) for d in (json.loads(ln) for ln in store.read_text().splitlines() if ln.strip())}
     added = 0
     with open(store, "a") as f:
-        for ln in rows:
-            d = json.loads(ln)
-            key = (d["m"], d["n"], d["k"], d["dtype"], d["gpu"])
-            if key in seen:
+        for d in new:
+            if (*key(d), d["gpu"]) in seen and not a.force:
                 continue
-            seen.add(key)
-            f.write(ln + "\n")
+            seen.add((*key(d), d["gpu"]))
+            f.write(json.dumps(d) + "\n")
             added += 1
-    print(f"probe: {len(rows)} shape(s) selected -> {table}\n       {added} new row(s) -> {store}", file=sys.stderr)
+    print(f"probe: {len(new)} shape(s) selected -> {table} ({len(merged)} rows)\n       {added} new row(s) -> {store}", file=sys.stderr)
+    record = assets.parent / "build-record.json"
+    if record.is_file():
+        rec = json.loads(record.read_text())
+        rec["cublaslt"] = lt_record(r, assets)
+        rec.setdefault("hashes", {})["cublaslt_algos.jsonl"] = rec["cublaslt"]["table_sha256"]
+        record.write_text(json.dumps(rec, indent=1))
+        print(f"probe: {len(rec['cublaslt']['missing'])} shape(s) still unserved; record {record}", file=sys.stderr)
 
 
 # ---------------------------------------------------------------- cert
@@ -1166,12 +1240,12 @@ def cmd_loop(a: argparse.Namespace) -> None:
         print("  Doctor check passed.", file=sys.stderr)
 
     # 3. Probe (if applicable and not skipped)
-    if not a.no_probe and not (assets_dir / "cublaslt_algos.jsonl").exists():
+    if not a.no_probe and lt_missing(assets_dir, lt_rung_algos(r))[0]:
         print("[3/5] Probing cuBLASLt algorithms...", file=sys.stderr)
         probe_args = argparse.Namespace(
             recipe=str(recipe_path),
             assets=str(assets_dir),
-            store_cell=getattr(a, "store_cell", "h100") or "h100",
+            store_cell=getattr(a, "store_cell", None),
             label=f"{cell['name']}-probe",
             force=False,
             env=a.env or [],
@@ -1611,7 +1685,9 @@ def main() -> None:
     b.add_argument("--env", action="append", metavar="K=V", help="one-variable override for the emit env; recorded")
     b.add_argument("--object-env", action="append", metavar="K=V", help="object-build-only env over [objects.env]: *_FLAGS append, other keys replace; recorded")
     b.add_argument("--no-probe", action="store_true", help="skip the leased cuBLASLt algorithm probe even with the GPU present")
-    b.add_argument("--store-cell", help="tune-store cell for the probe (default h100)")
+    b.add_argument("--leased", action="store_true", help="the probe runs inside the caller's GPU lease (a gpuq job)")
+    b.add_argument("--plowrt", help="plowrt the probe serves with (default [serve].plowrt, else target/release/plowrt)")
+    b.add_argument("--store-cell", help="tune-store SKU cell for the probe (default: [target].sku folded, e.g. h100-sxm5)")
     b.add_argument("--hf-dir", help="checkpoint snapshot on this host, replacing [cell].hf_dir; recorded")
     b.set_defaults(f=cmd_build)
     s = sp.add_parser("serve"); s.add_argument("recipe"); s.add_argument("--assets", required=True)
@@ -1630,8 +1706,9 @@ def main() -> None:
     n.add_argument("--profile", help="named workload from [bench.profiles.*] (e.g. realtime, throughput)")
     n.set_defaults(f=cmd_bench)
     pr = sp.add_parser("probe"); pr.add_argument("recipe"); pr.add_argument("--assets", required=True)
-    pr.add_argument("--store-cell", default="h100", help="tune-store cell under tuning/nvidia/<arch>/")
-    pr.add_argument("--label"); pr.add_argument("--force", action="store_true")
+    pr.add_argument("--store-cell", help="tune-store SKU cell under tuning/nvidia/<arch>/ (default: [target].sku folded)")
+    pr.add_argument("--label"); pr.add_argument("--force", action="store_true"); pr.add_argument("--plowrt")
+    pr.add_argument("--leased", action="store_true", help="the caller holds the GPU lease (a gpuq job): no nested gpulease")
     pr.add_argument("--env", action="append", metavar="K=V"); pr.set_defaults(f=cmd_probe)
     ce = sp.add_parser("cert"); ce.add_argument("--knob", required=True); ce.add_argument("--job", required=True)
     ce.add_argument("--cell", required=True, help="cell name used in rung digests, e.g. gemma4-12b.h100.bf16")

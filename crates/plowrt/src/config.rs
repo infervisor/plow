@@ -1175,8 +1175,9 @@ pub struct NvidiaRuntimeConfig {
     pub ladder_debug: bool,
 
     /// Per-shape cuBLASLt algorithm table (JSONL, see `device::cuda::lt::StoredAlgo`): each
-    /// `(m, n, k)` BF16 shape uses the pinned algorithm after `cublasLtMatmulAlgoCheck` accepts
-    /// it; a rejected entry falls back to the heuristic plus load-time timing.
+    /// `(m, n, k)` BF16 shape (single or pair plan) uses the pinned algorithm after
+    /// `cublasLtMatmulAlgoCheck` accepts it; a rejected entry falls back to the heuristic plus
+    /// load-time timing.
     #[arg(long = "lt-algos", env = "PLOW_LT_ALGOS", global = true)]
     pub lt_algos: Option<String>,
 

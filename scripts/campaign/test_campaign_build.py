@@ -106,6 +106,25 @@ class CampaignBuildTests(unittest.TestCase):
             self.assertEqual(record["compilation"]["object_env"]["NVCC_APPEND_FLAGS"],
                              "-DPLOW_NV_GLU_QUANT_CACHE=1 -ccbin=/usr/bin/g++-14")
 
+    def test_lt_missing_counts_served_shapes(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            assets = Path(temporary)
+            shape = lambda phase, rows, m, n, k, dtype="bf16": {
+                "phase": phase, "rows": rows, "m": m, "n": n, "k": k, "dtype": dtype}
+            (assets / "build.json").write_text(json.dumps({"cublaslt": {"shapes": [
+                shape("prefill", 512, 512, 4096, 2816), shape("prefill", 512, 512, 2048, 2816, "e4m3"),
+                shape("decode", 64, 64, 1024, 2816), shape("decode", 64, 64, 512, 2816),
+                shape("decode", 64, 64, 262144, 2816), shape("decode", 32, 32, 1024, 2816)]}}))
+            self.assertEqual(len(campaign.lt_missing(assets, False)[0]), 4)
+            rows = [{"m": 512, "n": 4096, "k": 2816, "dtype": "bf16", "pair": True},
+                    {"m": 64, "n": 1536, "k": 2816, "dtype": "bf16", "ns": [1024, 512]},
+                    {"m": 64, "n": 262144, "k": 2816, "dtype": "bf16"}]
+            (assets / "cublaslt_algos.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows))
+            self.assertEqual(campaign.lt_missing(assets, False), ([], 4))
+            missing, shapes = campaign.lt_missing(assets, True)
+            self.assertEqual((shapes, [(x["m"], x["n"]) for x in missing]), (5, [(32, 1024)]))
+            self.assertEqual(campaign.store_cell({"target": {"sku": "H100 SXM5"}}), "h100-sxm5")
+
     def test_object_env_appends_flags_and_replaces_scalars(self):
         recipe = {"NVCC_APPEND_FLAGS": "-DPLOW_NV_GLU_QUANT_CACHE=1 -DPLOW_NV_GLU_QUANT_WPR=1",
                   "PLOW_BUILD_W8A8": "1", "PLOW_BUILD_FATLITE": 1}

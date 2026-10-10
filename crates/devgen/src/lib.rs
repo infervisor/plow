@@ -10327,21 +10327,6 @@ fn emit_dense_gqa(
         if selected > 0 {
             eprintln!("  cuBLASLt prefill: {selected} projection segments");
         }
-        // Packetize the exact-shape algorithm selection from the tune store when one exists;
-        // a host with the GPU refreshes it through the campaign probe, and the runtime
-        // re-validates every entry with AlgoCheck before use.
-        if let Some(root) = ecfg.tunedb_root() {
-            match dense_cublaslt::packetize_algo_table(
-                &m,
-                &arch,
-                std::path::Path::new(&root),
-                std::path::Path::new(&out),
-            ) {
-                Ok(0) => eprintln!("  cuBLASLt algorithms: no tune-store rows for this target; the runtime selects at load"),
-                Ok(n) => eprintln!("  cuBLASLt algorithms: {n} shape(s) packetized from the tune store"),
-                Err(error) => eprintln!("  cuBLASLt algorithms: not packetized: {error}"),
-            }
-        }
     }
     if ecfg.moe_pf_lt {
         let selected = dense_cublaslt::apply_moe_prefill(&mut m, &mut sections, &arch)
@@ -10880,6 +10865,33 @@ fn emit_dense_gqa(
         let mut man = manifest::build_for_packet(&m, &arch, &lean, &sections);
         if speech_ops != 0 {
             man["speech_ops"] = speech_ops.into();
+        }
+        // Every cuBLASLt projection shape of the final packet (prefill and decode rungs), and the
+        // tune store's exact-shape algorithm rows for them; `campaign.py build` probes the shapes
+        // no row serves, and the runtime re-validates every entry with AlgoCheck before use.
+        let lt_shapes = dense_cublaslt::lt_shapes(&m, &sections);
+        if !lt_shapes.is_empty() {
+            let packetized = match ecfg.tunedb_root() {
+                Some(root) => dense_cublaslt::packetize_algo_table(
+                    &lt_shapes,
+                    &arch,
+                    std::path::Path::new(&root),
+                    std::path::Path::new(&out),
+                )
+                .unwrap_or_else(|error| {
+                    eprintln!("  cuBLASLt algorithms: not packetized: {error}");
+                    0
+                }),
+                None => 0,
+            };
+            eprintln!(
+                "  cuBLASLt algorithms: {packetized} tune-store row(s) packetized for {} projection shape(s)",
+                lt_shapes.len()
+            );
+            man["cublaslt"] = serde_json::json!({
+                "shapes": lt_shapes.iter().map(dense_cublaslt::LtShape::json).collect::<Vec<_>>(),
+                "packetized": packetized,
+            });
         }
         report_dispatch_audit(&man);
         report_segment_resource(&man);
