@@ -1417,7 +1417,7 @@ fn validate_fp8_kv_attention_role_inst(
         || heads == 0
         || kv_heads == 0
         || heads % kv_heads != 0
-        || d.i[7] != 1
+        || packet::dev::flash_nsplit(d.i[7]) != 1
         || hd == 0
         || !f32::from_bits(d.fj[0]).is_finite()
     {

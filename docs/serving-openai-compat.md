@@ -257,14 +257,28 @@ only that metadata. It has no per-model code, so adding a model means emitting i
 
   | model | image | audio |
   |---|---|---|
-  | E4B | yes: gemma4_vision tower | yes: USM conformer |
-  | 12B | not emitted | yes: encoder-free 640-sample frames → `embed_audio` |
-  | 26B-A4B, 31B | not emitted | none in the checkpoint |
+  | E4B | yes: gemma4_vision tower (causal LM attention) | yes: USM conformer |
+  | 12B | yes: encoder-free 48×48 patches → `vision_embedder` → `embed_vision` | yes: encoder-free 640-sample frames → `embed_audio` |
+  | 26B-A4B, 31B | yes: gemma4_vision tower (head_dim 72) | none in the checkpoint |
 
-  - Vision is skipped (with a logged reason) on every checkpoint whose text config sets
-    `use_bidirectional_attention: "vision"`. Those LMs attend bidirectionally within each image on
-    their sliding layers, and the LM attention kernels are causal-only.
-  - 26B/31B vision also needs head_dim 72 in the tower's attention, which supports only 64 and 128.
+- **Bidirectional media spans.** A checkpoint whose text config sets
+  `use_bidirectional_attention: "vision"` gets `attention: "bidirectional_span"` on its image
+  modality. Rows of one image then also attend that image's later rows on the sliding layers, as
+  HF does (full-attention layers stay causal; audio stays causal).
+  - Span soft-token ids also set bit 30 (30-bit hash). `MmSpanExtent` (op 210) turns the prompt
+    ids into each row's remaining run length. `FlashPrefillFp8` i[7] bits 16..31 name that tensor
+    on the sliding layers; a row attends keys up to `min(q + extent, kvlen - 1)`.
+  - FP8-KV prefill only. Rungs ≥128 run the catalog entry `attn_pf_hd256_sliding_fp8kv_span`
+    (`GEN_MEDIA_SPAN=1`). Narrower rungs run the PIPE=0 interpreter path. The causal release
+    object is unchanged, so packets built without the flag are byte-identical.
+  - Chunking: no prefill chunk and no sliding stage (`stage_rows` from the chunk start) may end
+    strictly inside a span. The scheduler cuts the chunk back to the span start; a span that
+    starts a chunk is taken whole (it fits: 280 rows max vs 1024-row stages). A prefix-cache hit
+    may still end inside a span: those KV rows were computed with the whole span, and the ids
+    hash the media.
+  - Text-only requests on such a packet run the span object with no spans: about 2% slower in
+    that kernel than the causal object (`scripts/gen_kernels/attn_pf_hd256_sliding.py bench`).
+- `AttentionF32` (the tower attention) takes head widths of 64 or a multiple of 8 up to 128.
 
 ## 3. Refusing to serve from the CPU by accident
 

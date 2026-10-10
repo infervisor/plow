@@ -511,7 +511,7 @@ fn eligible_for(op: &packet::dev::DevInst, n_cu: u16, selection: &Selection) -> 
                 && op.i[2] % op.i[3] == 0
                 && op.i[6] == g.attention.head_dim
                 && crate::gen_kernels::heads_and_window_match(op, g.window, g.pair_heads)
-                && op.i[7] == 1
+                && packet::dev::flash_nsplit(op.i[7]) == 1
                 // FP8 KV: t[6] / t[7] are the k / v scale vectors (packed requests ride i[4]).
                 && match g.kv {
                     crate::gen_kernels::KvDtype::Bf16 => op.t[6] == TENSOR_NONE,
@@ -905,7 +905,7 @@ pub(crate) fn apply(
                 let output_head_dim = u64::from(selection.head_dim());
                 eligible_for(op, n_cu, selection)
                     && (!selection.requires_fused_output
-                        || (op.t[5] != TENSOR_NONE && op.i[7] == 1))
+                        || (op.t[5] != TENSOR_NONE && packet::dev::flash_nsplit(op.i[7]) == 1))
                     && (selection.kind == Kind::Generated
                         || tensor_bytes
                             .get(op.t[7] as usize)
