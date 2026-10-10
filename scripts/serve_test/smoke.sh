@@ -4,12 +4,13 @@
 # run smoke_client.py against every endpoint it advertises, stop it. GPU: run under the queue,
 #   scripts/bench/gpuq.py submit smoke 1 scripts/serve_test/smoke.sh <plowrt> <out> \
 #       --assets <bundle>[,checkpoint=<hf dir>] [--assets ...] [--asr-vad-packet <vad.pkt>]
-# Env: PY (python3 for the clients), ASR_MANIFEST ([{path, text}] 16 kHz WAVs; ASR legs skip
+# Env: SERVE_ENV ("K=V ..." added to the server's clean env, e.g. PLOW_LIVE_CTX_MODELS for a
+# co-served set), PY (python3 for the clients), ASR_MANIFEST ([{path, text}] 16 kHz WAVs; ASR legs skip
 # without it), VAD_WAV, SMOKE_ARGS (extra smoke_client.py args, e.g. "--tts veena=kavya"),
 # TTS_CHECK=1 (Whisper CER of the TTS WAVs via scripts/tts/asr_check.py, --max-cer TTS_MAX_CER),
 # EVAL=asr|tts|llm|all (also run eval.py into <outdir>/eval), READY_S (1200).
 set -u
-[ $# -ge 3 ] || { sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
+[ $# -ge 3 ] || { sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
 plowrt=$1 out=$2; shift 2
 HERE=$(cd "$(dirname "$0")" && pwd)
 REPO=$(cd "$HERE/../.." && pwd)
@@ -18,8 +19,9 @@ rm -rf "$out"; mkdir -p "$out"
 source "$REPO/scripts/bench/plowbench.sh"
 PB_SERVER_PORT=$(pb_free_port); PB_SERVER_LOG=$out/server.log
 URL=http://127.0.0.1:$PB_SERVER_PORT
-echo "env -i PATH=/usr/bin:/bin HOME=$HOME $plowrt serve $* --port $PB_SERVER_PORT" > "$out/cmd.txt"
-env -i PATH=/usr/bin:/bin HOME="$HOME" "$plowrt" serve "$@" --port "$PB_SERVER_PORT" > "$PB_SERVER_LOG" 2>&1 &
+echo "env -i PATH=/usr/bin:/bin HOME=$HOME ${SERVE_ENV:-} $plowrt serve $* --port $PB_SERVER_PORT" > "$out/cmd.txt"
+# shellcheck disable=SC2086
+env -i PATH=/usr/bin:/bin HOME="$HOME" ${SERVE_ENV:-} "$plowrt" serve "$@" --port "$PB_SERVER_PORT" > "$PB_SERVER_LOG" 2>&1 &
 PB_SERVER_PID=$!
 trap pb_serve_stop EXIT
 if ! pb_serve_wait "${READY_S:-1200}"; then echo "SMOKE rc=3 (not ready)"; tail -30 "$PB_SERVER_LOG"; exit 3; fi
