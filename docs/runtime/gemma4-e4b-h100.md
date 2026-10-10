@@ -202,6 +202,19 @@ tok/s is not comparable to text tok/s.
 * **Leaks.** At the end, `/metrics` shows `plowrt_mm_slab_rows_reserved` 0 and
   `plowrt_mm_slab_rows_staged` 0.
 
+**Gemma-4 12B FP8, audio only.** Same harness, run on the `gemma4-12b.h100.fp8-multimodal` packet
+(raw: `res/g12-mm-r2` and `res/g12-mm`). The mix is the 4 text prompts, a shared 7.6 s clip and
+unique clips. The encoder-free embedder costs 1.8 / 4.6 / 3.7 ms per clip at c1 / c8 / c32.
+
+| | text-only TTFT p50/p90 | text in mix | audio | unique audio | text-only req/s | mix req/s |
+|---|---|---|---|---|---|---|
+| c1 | 15 / 19 | 16 / 25 | 45 / 50 | 35 / 39 | 1.65 | 1.62 |
+| c8 | 29 / 34 | 26 / 54 | 64 / 72 | 60 / 63 | 12.3 | 10.7 |
+| c32 | 34 / 43 | 96 / 161 | 101 / 159 | 113 / 163 | 33.2 | 27.0 |
+
+There were no errors or non-tie forks. Cancellation drained the slab and nothing leaked. The
+40-request burst fits the slab (about 121 rows per clip), so it returned no 503.
+
 ## Logprobs API
 
 Served on the CUDA engine. Other backends return 400.

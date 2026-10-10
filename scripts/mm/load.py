@@ -222,7 +222,7 @@ def main():
     report["cells"] = []
     for conc, n in zip(map(int, args.concs.split(",")), map(int, args.requests.split(","))):
         before = cl.metrics()
-        specs = [(mix[i % len(mix)], conc == 1 or i % 2 == 0) for i in range(n)]
+        specs = [(mix[i % len(mix)], conc == 1 or (i + i // len(mix)) % 2 == 0) for i in range(n)]
         msgs = [shared[k] if k in shared else unique(k) for k, _ in specs]
         t0 = time.perf_counter()
         with ThreadPoolExecutor(conc) as ex:

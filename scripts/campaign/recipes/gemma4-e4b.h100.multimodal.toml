@@ -128,6 +128,8 @@ hf_dir = "{hf:google/gemma-4-E4B-it@ee0ef6023621cff504d758262d4e04895a5af4a2}"
 top1_min = 0.98
 kl_mean_max = 2e-3
 
+# 2026-10-10 (mm-harden a00d40f2, packet built from this recipe): mm_parity PASS 10/10 cases,
+# refusals 11/11, encoders 22/22 (cos >= 0.9996); llm_logit_parity PASS top1 0.9948, KL 7.5e-4.
 # Media parity (scripts/mm/gate.py + refusals.py + mm_check): E4B_MM_REF = a scripts/mm/hf_ref.py
 # reference dir (built in the lease from hf_dir and the media below when its ref.json is missing),
 # MM_MEDIA = the images, the LibriSpeech clips and their mp3/flac/ogg transcodes. mm_check comes
