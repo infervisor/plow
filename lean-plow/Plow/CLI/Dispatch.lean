@@ -7,11 +7,18 @@ a soundness entry in `proof-manifest.json`, and every manifest entry to name an 
 import Lean.Data.Json
 import Plow.CLI.Schema
 import Plow.CLI.Checkpoints
+import Plow.MediaGeometry
 
 namespace Plow.CLI.Dispatch
 
 open Lean (Json)
 open Plow.CLI
+
+/-- A versioned endpoint backed by `run : Json → Except String String`. -/
+def versioned (id : String) (run : Json → Except String String) (p : Json) : IO Certificate :=
+  return match run p with
+  | .ok notes => ok id notes
+  | .error reason => reject id reason
 
 def endpoints : List (String × (Json → IO Certificate)) := [
   ("A", fun p => return Checkpoints.checkA p),
@@ -25,7 +32,8 @@ def endpoints : List (String × (Json → IO Certificate)) := [
   ("S", fun p => return Checkpoints.checkS p),
   ("P", fun p => return Checkpoints.checkP p),
   ("R", fun p => return Checkpoints.checkR p),
-  ("L", fun p => return Checkpoints.checkL p)
+  ("L", fun p => return Checkpoints.checkL p),
+  ("media_geometry.v1", versioned "media_geometry.v1" Plow.MediaGeometry.run)
 ]
 
 def endpointIds : List String := endpoints.map (·.1)

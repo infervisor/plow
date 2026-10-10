@@ -282,7 +282,8 @@ fn legacy_check(
     Ok(())
 }
 
-/// `plowrt qualify`: every `*.pkt` in `dir`, in name order, with its qualification.
+/// `plowrt qualify`: every `*.pkt` in `dir`, in name order, with its qualification. A packet
+/// with a speech or multimodal pipeline also owes the bundle's `media_geometry.v1` obligation.
 pub fn qualify_dir(dir: &Path, replay_checks: bool) -> Result<Vec<(std::path::PathBuf, Qualification)>> {
     let entries = std::fs::read_dir(dir).map_err(|source| RuntimeError::Io { path: dir.to_path_buf(), source })?;
     let mut packets: Vec<_> = entries
@@ -293,33 +294,152 @@ pub fn qualify_dir(dir: &Path, replay_checks: bool) -> Result<Vec<(std::path::Pa
     if packets.is_empty() {
         return Err(RuntimeError::Rejected(format!("{}: no packets", dir.display())));
     }
-    packets
-        .into_iter()
-        .map(|p| qualify_file(&p, replay_checks).map(|q| (p, q)))
-        .collect()
+    let mut out = Vec::new();
+    let mut media = Vec::new();
+    for path in packets {
+        let raw = std::fs::read(&path).map_err(|source| RuntimeError::Io { path: path.clone(), source })?;
+        let blob = DevBlob::parse(&raw)?;
+        let q = qualify_loaded(&path, &raw, &blob, replay_checks)?;
+        media.push(MediaInfo::read(&path, &raw, &blob));
+        out.push((path, q));
+    }
+    let packets: Vec<_> = media.iter().filter_map(|m| m.as_ref().ok().and_then(Option::as_ref)).map(MediaInfo::packet).collect();
+    for (index, (path, q)) in out.iter_mut().enumerate() {
+        let main = match &media[index] {
+            Ok(Some(main)) => main,
+            Ok(None) => continue,
+            Err(error) => {
+                q.required.insert(media_obligation());
+                q.gaps.push(format!("media geometry: {}: {error}", path.display()));
+                continue;
+            }
+        };
+        let request = match plow_asset::media_geometry::request(&main.packet(), &packets) {
+            Ok(Some(request)) => request,
+            Ok(None) => continue,
+            Err(error) => {
+                q.required.insert(media_obligation());
+                q.gaps.push(format!("media geometry: {error}"));
+                continue;
+            }
+        };
+        q.required.insert(media_obligation());
+        match check_media(request, replay_checks) {
+            Ok(()) => {
+                q.satisfied.insert(media_obligation());
+            }
+            Err(gap) => q.gaps.push(format!("media geometry: {gap}")),
+        }
+    }
+    Ok(out)
 }
 
-/// One packet's qualification for `plowrt qualify`.
-pub(crate) fn qualify_file(blob_path: &Path, replay_checks: bool) -> Result<Qualification> {
-    let raw = std::fs::read(blob_path)
-        .map_err(|source| RuntimeError::Io { path: blob_path.to_path_buf(), source })?;
-    let blob = DevBlob::parse(&raw)?;
+fn media_obligation() -> plow_asset::certificates::Obligation {
+    plow_asset::certificates::Obligation {
+        scope: plow_asset::certificates::SemanticScope::MediaGeometry,
+        checkpoint: plow_asset::media_geometry::ENDPOINT,
+        program: None,
+        site: None,
+    }
+}
+
+fn check_media(request: serde_json::Value, replay_checks: bool) -> std::result::Result<(), String> {
+    if !replay_checks {
+        return Err("not checked (--no-replay)".into());
+    }
+    let verifier = lean_verify::verifier_sha256().map_err(|e| format!("no verifier identity: {e}"))?;
+    if !is_approved_verifier(&verifier) {
+        return Err(format!("current verifier {verifier} is not approved"));
+    }
+    let (certs, executed) = lean_verify::call_batch_bound(&[(plow_asset::media_geometry::ENDPOINT, request)])
+        .map_err(|e| format!("verifier: {e}"))?;
+    let cert = certs.into_iter().next().ok_or("verifier returned no certificate")?;
+    if executed != verifier {
+        return Err("verifier changed while checking".into());
+    }
+    if !cert.ok {
+        return Err(cert.reason.unwrap_or_default());
+    }
+    Ok(())
+}
+
+/// A packet's pipeline section, vocabulary size and multimodal contract, for the media obligation.
+struct MediaInfo {
+    file: String,
+    pipelines: Vec<plow_asset::packet_pipeline::PacketPipeline>,
+    vocabulary: Option<usize>,
+    multimodal: Option<plow_asset::multimodal::MmContract>,
+    mm_tensors: Option<(u64, u64)>,
+}
+
+impl MediaInfo {
+    /// `Ok(None)` for a packet without a pipeline section or multimodal contract.
+    fn read(path: &Path, raw: &[u8], blob: &DevBlob) -> std::result::Result<Option<Self>, String> {
+        use plow_asset::multimodal::{MmContract, SECTION as MM, SLAB_TENSOR, TABLE_TENSOR};
+        let file = path.file_name().and_then(|f| f.to_str()).ok_or("packet file name")?.to_owned();
+        let has_pipelines = blob
+            .reserved_metadata(raw, plow_asset::packet_pipeline::SECTION)
+            .map_err(|e| e.to_string())?
+            .is_some();
+        let multimodal = blob
+            .reserved_metadata(raw, MM)
+            .map_err(|e| e.to_string())?
+            .map(|bytes| serde_json::from_slice::<MmContract>(bytes).map_err(|e| format!("{MM}: {e}")))
+            .transpose()?;
+        if let Some(mm) = &multimodal {
+            mm.validate()?;
+        }
+        if !has_pipelines && multimodal.is_none() {
+            return Ok(None);
+        }
+        let (pipelines, vocabulary) = if has_pipelines {
+            let asset = crate::exec::packet_runtime::PacketAsset::from_bytes(raw).map_err(|e| e.to_string())?;
+            let vocabulary = asset
+                .metadata(plow_asset::speech_contract::VOCABULARY_SECTION)
+                .map(|bytes| {
+                    serde_json::from_slice::<plow_asset::speech_contract::Vocabulary>(bytes)
+                        .map(|v| v.pieces.len())
+                        .map_err(|e| e.to_string())
+                })
+                .transpose()?;
+            (asset.pipelines().to_vec(), vocabulary)
+        } else {
+            (Vec::new(), None)
+        };
+        let bytes = |name: &str| blob.tensors.iter().find(|t| t.name == name).map(|t| t.bytes);
+        let mm_tensors = bytes(SLAB_TENSOR).zip(bytes(TABLE_TENSOR));
+        Ok(Some(Self { file, pipelines, vocabulary, multimodal, mm_tensors }))
+    }
+
+    fn packet(&self) -> plow_asset::media_geometry::MediaPacket<'_> {
+        plow_asset::media_geometry::MediaPacket {
+            file: &self.file,
+            pipelines: &self.pipelines,
+            vocabulary: self.vocabulary,
+            multimodal: self.multimodal.as_ref(),
+            mm_tensors: self.mm_tensors,
+        }
+    }
+}
+
+/// One loaded packet's receipt qualification for `plowrt qualify`.
+fn qualify_loaded(blob_path: &Path, raw: &[u8], blob: &DevBlob, replay_checks: bool) -> Result<Qualification> {
     let path = blob_path.with_file_name(PACKET_CHECKS_FILE);
     let bytes = read_optional(&path)?;
-    if is_compiler_packet(blob_path, &raw, bytes.as_deref()) {
+    if is_compiler_packet(blob_path, raw, bytes.as_deref()) {
         let receipts = bytes
             .as_deref()
             .map(serde_json::from_slice::<PacketCheckReceipts>)
             .transpose()
             .map_err(|e| RuntimeError::Rejected(format!("{}: {e}", path.display())))?;
-        return Ok(qualify_compiler(receipts.as_ref(), bytes.as_deref(), &raw, &blob, replay_checks));
+        return Ok(qualify_compiler(receipts.as_ref(), bytes.as_deref(), raw, blob, replay_checks));
     }
     let path = sidecar_checks_file(blob_path);
     let receipts = read_optional(&path)?
         .map(|bytes| serde_json::from_slice::<SidecarCheckReceipts>(&bytes))
         .transpose()
         .map_err(|e| RuntimeError::Rejected(format!("{}: {e}", path.display())))?;
-    Ok(qualify_sidecar_blob(receipts.as_ref(), &raw, &blob, replay_checks))
+    Ok(qualify_sidecar_blob(receipts.as_ref(), raw, blob, replay_checks))
 }
 
 #[cfg(test)]

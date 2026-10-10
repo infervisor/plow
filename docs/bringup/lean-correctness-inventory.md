@@ -249,14 +249,40 @@ Strict results for the 14 H100 production bundles (`plowrt qualify`, replay on),
 | gemma-4-31b-fp8 | model.pkt | 19/37 | logical effects 0/18 (Embed) |
 | gemma-4-31b-bf16 | model.pkt | 17/33 | logical effects 0/16 (Embed) |
 | gemma-4-e4b | model.pkt | 19/37 | logical effects 0/18 (Embed) |
-| qwen3-asr | model.pkt / encoder.pkt | 15/29 / **qualified 460/460** | logical effects 0/14 (HeadNormRope) |
-| qwen3-asr-0.6b | model.pkt / encoder.pkt | 15/29 / **qualified 360/360** | logical effects 0/14 (HeadNormRope) |
-| veena | model.pkt / codec.pkt | 15/29 / **qualified 19/19** | logical effects 0/14 (Embed) |
-| orpheus | model.pkt / codec.pkt | 15/29 / **qualified 19/19** | logical effects 0/14 (Embed) |
-| chatterbox | model.pkt / s3gen.pkt | 15/29 / **qualified 1931/1931** | logical effects 0/14 (HeadNormRope) |
-| chatterbox-mtl | model.pkt / s3gen.pkt | 15/29 / **qualified 1931/1931** | logical effects 0/14 (HeadNormRope) |
-| nemotron-3.5-asr | nemotron.pkt | 0/81 | no receipts (the example builder has no verify gate; all 81 obligations derive) |
-| silero-vad | silero_vad.pkt | 0/2 | no receipts (as nemotron; both obligations derive) |
+| qwen3-asr | model.pkt / encoder.pkt | 16/30 / **qualified 460/460** | logical effects 0/14 (HeadNormRope) |
+| qwen3-asr-0.6b | model.pkt / encoder.pkt | 16/30 / **qualified 360/360** | logical effects 0/14 (HeadNormRope) |
+| veena | model.pkt / codec.pkt | 16/30 / **qualified 19/19** | logical effects 0/14 (Embed) |
+| orpheus | model.pkt / codec.pkt | 16/30 / **qualified 19/19** | logical effects 0/14 (Embed) |
+| chatterbox | model.pkt / s3gen.pkt | 16/30 / **qualified 1931/1931** | logical effects 0/14 (HeadNormRope) |
+| chatterbox-mtl | model.pkt / s3gen.pkt | 16/30 / **qualified 1931/1931** | logical effects 0/14 (HeadNormRope) |
+| nemotron-3.5-asr | nemotron.pkt | 1/82 | no receipts. Fixed: the builder now writes them, and a rebuild is byte-identical and qualifies 82/82 |
+| silero-vad | silero_vad.pkt | 1/3 | no receipts. Fixed the same way: rebuild byte-identical, 3/3 |
 
-Every receipt that is present binds and replays. The only gaps are the 34 unaudited opcodes in §3
-and the two receipt-less example builders.
+Every receipt that is present binds and replays. Counts include the `media_geometry.v1`
+obligation (§10), which every speech bundle satisfies. The remaining gaps are the 34 unaudited
+opcodes in §3, and a rebuild for nemotron and silero. Their builders
+(`examples/asr/{nemotron_pipeline_compile,silero_vad_compile}.rs`) now write through
+`devgen::write_sidecar_packet`. Rebuilt into scratch from the same inputs, both packets are
+byte-identical to production, and their new receipts qualify. Parakeet uses the same pattern but
+has no production recipe, so it is not converted.
+
+## 10. Media geometry (`media_geometry.v1`)
+
+`Plow/MediaGeometry.lean` defines one contract per speech/multimodal family over `Nat`. The acceptance
+theorem is `check_sound`. The lemmas give what an accepted contract implies for every input up to the
+declared maxima.
+
+| Family | Contract (abridged) | Lemmas |
+| --- | --- | --- |
+| audio_lm (qwen3-asr) | Encoder and LM agree on sample rate and max samples; LM hidden equals encoder width; rows of the longest recording ≤ overlay rows and ≤ encoder output rows; rows + reserve < context; rows + max tokens ≤ context; audio/stop ids < 2^31 and distinct | `AudioLm.every_recording_fits` (via `audioRows_mono`) |
+| rnnt (nemotron) | `max_samples/hop + 1 ≤ input_frames`; the strided-conv chain maps `input_frames` to `frames ≤ joint_rows`; transforms well formed; blank ≤ vocab < 2^31; positive symbol bound | `Rnnt.every_input_fits` (via `chain_mono`), `Rnnt.decode_steps_bounded` |
+| codec_lm (veena/orpheus) | LM and codec agree on rate, codebook, frame codes and samples; code tensor holds whole frames; PCM ≥ frames × samples; window + lookahead ≤ frames; audio token range < 2^31, with stops outside it; max new + fixed prompt < context | `CodecLm.addresses_in_bounds`, `CodecLm.token_decodes` |
+| guided_lm (chatterbox) | speech/text control ids inside their vocabularies; `max_speech_tokens + 2 ≤` speech positions; overlay ≤ context | — |
+| vad (silero) | frame + context = input elements; 2 × banks equal, positive state tensors; min speech ≤ max duration | — |
+| multimodal (`plow.multimodal.v1`) | contract hidden equals encoder output width; pad/placeholder/begin/end < 2^31; table capacity a power of two ≥ slab rows; slab and table tensor bytes match | `Multimodal.soft_ids_disjoint` |
+
+`plow_asset::media_geometry::request` derives the input from the bundle's packet pipeline sections,
+which `PacketAsset` validates against the tensor bytes, and from `asr_vocabulary.json` and the
+multimodal contract. A missing parameter, an absent referenced sidecar, or an overflowing shape
+product rejects. Unknown fields and kinds are rejected on the Lean side. `plowrt qualify` adds the
+obligation to the packet that owns the pipeline. Load-time `strict` does not re-run it.

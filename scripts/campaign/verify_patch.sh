@@ -10,6 +10,10 @@
 #   plowrt    cargo test -p plowrt --features cuda,hsa --lib
 #   knob      cargo test -p devgen --lib knob; cargo test -p plowrt --features cuda,hsa --lib knob
 #   asset     cargo test -p plow-asset; cargo test -p packet
+#   lean      scripts/lean_correctness_ci.sh on a verifier built in the tree (lean-plow, receipt,
+#             certificate and Lean-client changes): lake build, proof audit, approved verifier,
+#             explicit CPU-verifier suites
+#   perf      scripts/perf_gate_ci.sh <base> (checkpoint P) when a knob registry changes
 #   scripts   python3 -m py_compile / bash -n / TOML parse of every touched .py / .sh / .toml
 # Env: CARGO_TARGET_DIR (give each agent its own; default <tmp>/target), VERIFY_STEPS (subset,
 # e.g. "apply scripts knob"), VERIFY_KEEP=1 (keep the temp tree), PLOW_CAMPAIGN_NO_NIX=1 (run cargo
@@ -21,7 +25,7 @@ REPO=$(git rev-parse --show-toplevel)
 T=$(mktemp -d "${TMPDIR:-/tmp}/verify-patch.XXXXXX")
 [ "${VERIFY_KEEP:-0}" = 1 ] || trap 'rm -rf "$T"' EXIT
 export CARGO_TARGET_DIR=${CARGO_TARGET_DIR:-$T/target}
-STEPS=${VERIFY_STEPS:-apply build tests plowrt knob asset scripts}
+STEPS=${VERIFY_STEPS:-apply build tests plowrt knob asset lean perf scripts}
 declare -a SUM
 res() { SUM+=("$(printf '%-8s %-5s %6ss  %s' "$1" "$2" "$3" "$4")"); }
 want() { case " $STEPS " in *" $1 "*) return 0 ;; *) return 1 ;; esac; }
@@ -60,6 +64,19 @@ if touches "$RUST"; then
     want asset && step asset cargo_run sh -c 'cargo test -p plow-asset && cargo test -p packet'
 else
     res cargo skip 0 "no crates/ runtime/ Cargo changes (VERIFY_ALL=1 to force)"
+fi
+# Lean correctness: the patched verifier is built in this tree (never the repo's shared .lake),
+# proof-audited, checked against approved-verifiers.json, and the CPU-verifier suites run on it.
+LEAN='^(lean-plow/|crates/(lean_verify|plowc)/|crates/plow-asset/src/(certificates|logical_effects|media_geometry|gemm_policy|program)\.rs|crates/plowrt/src/certificate_checks\.rs|crates/devgen/src/lib\.rs|scripts/lean_correctness_ci\.sh)'
+if want lean && touches "$LEAN"; then
+    rm -f "$T/src/lean-plow/.lake"
+    step lean cargo_run bash scripts/lean_correctness_ci.sh
+fi
+# Checkpoint P: a registry default/status flip needs an accepted perf certificate.
+if want perf && touches '^crates/(devgen|plowrt)/src/knob_spec\.rs'; then
+    # The exported tree has no .git; the base side of the diff comes from the repo's object store.
+    step perf cargo_run env GIT_DIR="$(git -C "$REPO" rev-parse --absolute-git-dir)" \
+        bash scripts/perf_gate_ci.sh "$(git -C "$REPO" rev-parse "$BASE")"
 fi
 if want scripts; then
     t0=$SECONDS; bad=""; n=0

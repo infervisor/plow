@@ -7595,7 +7595,7 @@ pub fn install_sidecar_verifier(verify: SidecarVerifier) {
 /// The sidecar's logical-effect obligations (one Lean check per distinct obligation), verified
 /// BEFORE its blob is written (a rejection aborts emission), then the blob and
 /// `<stem>.lean-checks.json`.
-fn write_sidecar_packet(
+pub fn write_sidecar_packet(
     path: &std::path::Path,
     model: &packet::devbuild::Model,
     sections: &[packet::devbuild::SectionData],

@@ -40,6 +40,14 @@
     {"id": "L", "scope": "layout_mapping", "soundness": [
       {"theorem": "Plow.MlaLayout.address_in_bounds"},
       {"theorem": "Plow.MlaLayout.ignored_padding"},
-      {"theorem": "Plow.MlaLayout.same_consumer_output"}]}
+      {"theorem": "Plow.MlaLayout.same_consumer_output"}]},
+    {"id": "media_geometry.v1", "scope": "media_geometry", "soundness": [
+      {"theorem": "Plow.MediaGeometry.check_sound", "checker": "Plow.MediaGeometry.check"},
+      {"theorem": "Plow.MediaGeometry.AudioLm.every_recording_fits", "checker": "Plow.MediaGeometry.AudioLm.Contract"},
+      {"theorem": "Plow.MediaGeometry.Rnnt.every_input_fits", "checker": "Plow.MediaGeometry.Rnnt.Contract"},
+      {"theorem": "Plow.MediaGeometry.Rnnt.decode_steps_bounded"},
+      {"theorem": "Plow.MediaGeometry.CodecLm.addresses_in_bounds", "checker": "Plow.MediaGeometry.CodecLm.Contract"},
+      {"theorem": "Plow.MediaGeometry.CodecLm.token_decodes", "checker": "Plow.MediaGeometry.CodecLm.Contract"},
+      {"theorem": "Plow.MediaGeometry.Multimodal.soft_ids_disjoint", "checker": "Plow.MediaGeometry.Multimodal.Contract"}]}
   ]
 }

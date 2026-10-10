@@ -12,8 +12,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut packets = devgen::vad::lower(1)?;
     packets.embed_weights(|name| tensors.get(name).cloned().ok_or_else(|| format!("{name} is missing")))?;
     let section = packets.pipeline_section()?;
-    std::fs::write(&args[2], packets.model.to_blob_v6(&[section]))?;
+    devgen::install_sidecar_verifier(lean_sidecar_verifier());
+    // The packet plus `silero_vad.lean-checks.json` (logical tensor effects per program).
+    devgen::write_sidecar_packet(std::path::Path::new(&args[2]), &packets.model, &[section]);
     Ok(())
+}
+
+/// `plow_verify` for the packet's obligations; an unusable verifier skips them (no receipts).
+fn lean_sidecar_verifier() -> devgen::SidecarVerifier {
+    Box::new(|requests| match lean_verify::call_batch_bound(requests) {
+        Ok((certs, verifier)) => Ok(Some((
+            certs.iter().map(serde_json::to_value).collect::<Result<_, _>>().map_err(|e| e.to_string())?,
+            verifier,
+        ))),
+        Err(e) if e.is_binary_unusable() => {
+            eprintln!("lean checks skipped: {e}");
+            Ok(None)
+        }
+        Err(e) => Err(e.to_string()),
+    })
 }
 
 fn read_f32_safetensors(bytes: &[u8]) -> Result<BTreeMap<String, Vec<u8>>, String> {

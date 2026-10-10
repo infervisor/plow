@@ -61,14 +61,14 @@ after a kernel change. Existing serving evidence can prioritize work but cannot 
 
 | # | step | tool |
 |---|---|---|
-| 1 | preflight (CPU) | `plowbench-doctor.sh <assets> <objdir> <plowrt> <arch>`: env, hazards, binaries, packet, objects, lease, disk, **stale harness/recipe copies vs HEAD** |
-| 2 | build from the recipe | `campaign.py build recipes/<ns>/<model>/<cell>.toml --out <fresh dir>` |
+| 1 | preflight (CPU) | `plowbench-doctor.sh <assets> <objdir> <plowrt> <arch>`: env, hazards, binaries, packet, lean qualification, objects, lease, disk, **stale harness/recipe copies vs HEAD** |
+| 2 | build from the recipe | `campaign.py build recipes/<ns>/<model>/<cell>.toml --out <fresh dir>`; it ends with `plowrt qualify` into `<out>/lean-qualification.json` (receipts, approved verifier, replay, media geometry). `campaign.py qualify --assets <out>/assets [--strict]` reruns it |
 | 3 | per-rung accuracy, resources + measured roofline | `scripts/bench/step_grid.sh <assets> <out>` (step_bench B × ctx; instruction-cap sweeps for native decode only), then `scripts/bench/op_roof.py <out>/disasm.txt --ctx N --sweep B=<jsonl>` (bytes, FLOPs, floor, measured, % roof per op). Library-routed decode needs `op_roof.py --nsys` with JSON disassembly and a measured CUDA trace; prefill CUDA graphs use `--nsys-correlation <id>` for exact packet-segment mapping, while `--segtime` covers per-chunk prefill diagnostics. No measurement = floor only. Use block/route harnesses below for other kernels; GLM/MLA/MoE: `scripts/campaign/op_roofline.py` |
 | 4 | full-model accuracy gates | `campaign.py gate <recipe> --assets <out>/assets --out <dir>` runs the recipe's `[gates]` in one lease (logit parity top1/KL, ASR WER, TTS CER per language, S3Gen rel-L2); `--score-only` re-scores, `--dry-run` prints `run.sh` |
 | 5 | serving grid vs the reference | `scripts/bench/llm_grid.sh plow\|vllm <res>` (same client, unique prompts per cell and repeat, greedy + sampled, 2 repeats, prefill-only and decode-only cells, vLLM `/metrics`, plow PACKLOG); agentic multi-turn with prefix caching on both sides: `llm_grid.sh plow\|vllm <res> --agentic` (`agentic_turns.py`, c32/64/128 x 10 turns to ~16K); open-loop production mix (Poisson sessions, think time, sampled turns/lengths, goodput): `PROD_RATES='0.5 1' llm_grid.sh plow\|vllm <res> --prod` (`agentic_turns.py --open-loop`, cells `q<1000*rate>`); speech: `scripts/tts/tts_bench.py`, `scripts/asr/nvidia/served_bench.py`; voice: `scripts/voice/serve_voice_agent.sh calls` |
 | 6 | audit waterfall | `scripts/bench/waterfall.py <res>/plow <res>/vllm`: grid with spread, reference prefix-cache hits (fails > 5%), wall ms/request split (mixed, prefill-only, decode, host gap, idle, padding, riders), decode ms/step side by side. `vllm_metrics.py cells`, `packlog_audit.py`, `nsys_busy.py` are its parts |
 | 7 | fix, one variable | kernel/runtime change in your own detached worktree |
-| 8 | verify the patch | `scripts/campaign/verify_patch.sh <patch>`: applies to HEAD in a private index, archives `git write-tree`, builds bins/examples/tests, plowrt lib (cuda+hsa), knob tests, plow-asset + packet tests, py_compile / `bash -n` / TOML of touched scripts |
+| 8 | verify the patch | `scripts/campaign/verify_patch.sh <patch>`: applies to HEAD in a private index, archives `git write-tree`, builds bins/examples/tests, plowrt lib (cuda+hsa), knob tests, plow-asset + packet tests, `lean` (in-tree verifier build, proof audit, approved verifier, CPU-verifier suites via `scripts/lean_correctness_ci.sh`) for Lean/receipt changes, `perf` (checkpoint P, `perf_gate_ci.sh`) for knob registry changes, py_compile / `bash -n` / TOML of touched scripts |
 | 9 | re-measure | repeat steps 3–6 for affected rungs and the selected full model; A/B scoring as in §7 |
 
 ### Per-rung gate and recipe selection
@@ -306,6 +306,15 @@ built from scratch loads fine until the first MLA decode segment, then dies with
 `mla_a16w16_qh8_qseqlen1_gqaratio8_v3.co: No such file or directory`. Copy them from a known-good
 set; they are byte-identical across sets from the same vendor drop. `plowbench-doctor.sh` checks
 for exactly this.
+
+**Lean checks a change must keep green.** `scripts/lean_correctness_ci.sh` (lake build, `lake exe
+proof_audit`, approved-verifier identity, the explicit ignored CPU-verifier suites) and `plowrt
+qualify --assets <dir>` on the affected bundles. A new Lean endpoint lands with its manifest entry in
+`lean-plow/proof-manifest.json` (the audit fails otherwise), an `approved-verifiers.json` entry for the
+rebuilt verifier (a `lean_verify` test fails otherwise), and its ignored test listed in the CI script.
+New perf gates go through checkpoint P (`perf_cert.py`, `perf_gate_ci.sh`) and S (`knob_scope_ci.sh`);
+`verify_patch.sh` runs `lean` and `perf` for the files they cover. Coverage and gaps:
+`docs/bringup/lean-correctness-inventory.md`.
 
 **Emit needs `PLOW_VERIFY_BIN`.** Without it the emit aborts rc=134 with "checkpoint K rejected the
 knob configuration: spawn failed". Do not reach for `--no-knob-verify` to get past it — that marks
