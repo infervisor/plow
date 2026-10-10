@@ -7,6 +7,7 @@ outside the repo (CLAUDE.md, "Performance campaign evidence and promotion").
 | Family | Summary | Qualified win |
 |---|---|---|
 | Gemma-4 (E4B, 12B, 26B-A4B, 31B) | [gemma4-h100/summary.md](gemma4-h100/summary.md) | 12B FP8 vs vLLM 0.28 FP8 KV: [comparison.md](gemma12b-fp8-20260930/comparison.md), [comparison.csv](gemma12b-fp8-20260930/comparison.csv); 31B FP8: [comparison.md](gemma31b-h100-20261010/comparison.md), [comparison.csv](gemma31b-h100-20261010/comparison.csv) |
+| Gemma-4 26B-A4B (H100) | [gemma4-h100/summary.md](gemma4-h100/summary.md) | BF16 + FP8 16K vs vLLM 0.28: [comparison.md](gemma26b-h100-20261007/comparison.md), [comparison.csv](gemma26b-h100-20261007/comparison.csv); FP8 at max_ctx 131072: [comparison.md](gemma26b-h100-20261009/comparison.md), [comparison.csv](gemma26b-h100-20261009/comparison.csv) |
 | Gemma-4 BF16 on Xeon 6975P-C (CPU engine) | [comparison.md](gemma4-xeon6-bf16-20261006/comparison.md) | E2B, E4B, 12B vs vLLM 0.30 CPU: [comparison.md](gemma4-xeon6-bf16-20261006/comparison.md), [comparison.csv](gemma4-xeon6-bf16-20261006/comparison.csv); 26B-A4B gate miss, 31B pending |
 | Qwen3-ASR | [qwen3-asr-h100/summary.md](qwen3-asr-h100/summary.md) | none (no recorded baseline) |
 | TTS (Veena, Chatterbox, Chatterbox MTL) | [tts-h100/summary.md](tts-h100/summary.md) | none (no strict speech report) |
