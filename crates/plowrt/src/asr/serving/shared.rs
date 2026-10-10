@@ -400,8 +400,11 @@ impl SharedAsr {
                         }
                     }
                 }
-                Some(StreamChunk::Done { reason: FinishReason::Length, .. }) => {
-                    return Err(RuntimeError::Rejected("ASR exceeded output token limit".into()))
+                // A runaway transcript (the model looping): what it decoded is the answer; the
+                // serving layer collapses the repeats, or retries without the client's context.
+                Some(StreamChunk::Done { reason: FinishReason::Length, usage, .. }) => {
+                    tracing::warn!(output_tokens = output.len(), "ASR transcript reached its token limit");
+                    break usage.cached_tokens;
                 }
                 // A preempted slot's tokens so far are not the transcript.
                 Some(StreamChunk::Done { reason: FinishReason::Preempted, .. }) => return Err(preempted()),
