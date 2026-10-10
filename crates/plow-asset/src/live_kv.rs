@@ -426,7 +426,10 @@ impl Manifest {
                     require(valid, "attention reader contract")?;
                     reads.insert(pair);
                 }
-                for (slot, &h) in d.t.iter().enumerate() {
+                let span = (op == DevOp::FlashPrefillFp8)
+                    .then(|| packet::dev::flash_span(d.i[7]))
+                    .flatten();
+                for (slot, h) in d.t.iter().copied().enumerate().chain(span.map(|h| (8, h))) {
                     require(
                         h == TENSOR_NONE16 || (h as usize) < packet.tensors.len(),
                         "operand handle out of range",
@@ -618,6 +621,38 @@ fn direct_operands(op: DevOp, d: &DevInst64, packet: &Packet<'_>) -> Result<()> 
             return require(d.fj[2] == 0, "unaudited FP8 GLU folded operands");
         }
         DevOp::GemvFp8 | DevOp::QuantFp8 => return Ok(()),
+        // The media-span extent (`i7` high half) is a `u32[rows]` operand outside `t`.
+        DevOp::FlashPrefillFp8 => {
+            if let Some(span) = packet::dev::flash_span(d.i[7]) {
+                let t = packet
+                    .tensors
+                    .get(span as usize)
+                    .ok_or("operand handle out of range")?;
+                require(
+                    !d.t.contains(&span) && !t.initialized && t.bytes >= u64::from(d.i[0]) * 4,
+                    "media span operand",
+                )?;
+            }
+        }
+        // The kernel probes `table[id & (cap-1)]` and gathers `slab[row]`.
+        DevOp::MmRowsBf16 => {
+            let [rows, width, cap, slab_rows] = [d.i[0], d.i[1], d.i[2], d.i[3]].map(u64::from);
+            let extent = |h: u16, bytes: Option<u64>| {
+                packet
+                    .tensors
+                    .get(h as usize)
+                    .zip(bytes)
+                    .is_some_and(|(t, bytes)| t.bytes >= bytes)
+            };
+            require(
+                cap.is_power_of_two()
+                    && extent(d.t[0], rows.checked_mul(width * 2))
+                    && extent(d.t[1], Some(rows * 4))
+                    && extent(d.t[2], Some(cap * 8))
+                    && extent(d.t[3], slab_rows.checked_mul(width * 2)),
+                "multimodal row operands",
+            )?;
+        }
         _ => {}
     }
     require(

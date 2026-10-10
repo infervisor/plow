@@ -238,6 +238,7 @@ impl Entry {
                 ring_kv: self.ring_kv,
                 pair_heads: self.pair_heads,
                 kv: self.kv,
+                media_span: self.media_span,
             },
         ))
     }

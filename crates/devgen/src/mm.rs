@@ -24,6 +24,20 @@ pub const PIPELINE: &str = "mm.encode";
 /// Encoder rows the runtime may hold for in-flight requests (`in.mm_slab`), default.
 pub const DEFAULT_SLAB_ROWS: u32 = 8192;
 
+/// Multimodal packets need ops 206-210 and the `Embed` pad immediate, which only the NVIDIA
+/// `sm_` interpreters implement; the CPU, AMD and Metal lanes embed bit-31 ids as rows.
+pub fn check_target(arch: &str, gpu: &str) -> Result<(), String> {
+    let nvidia = arch.starts_with("sm_")
+        || hwspec::registry::lookup(gpu).is_some_and(|s| s.vendor == hwspec::Vendor::Nvidia);
+    if nvidia && !crate::target_is_amd(arch, gpu) && !crate::target_is_cpu(arch, gpu) {
+        return Ok(());
+    }
+    Err(format!(
+        "PLOW_EMIT_MULTIMODAL=1 needs an NVIDIA sm_ target (ops 206-210, Embed pad); \
+         --arch {arch:?} --gpu {gpu:?} does not implement them"
+    ))
+}
+
 fn f32_le(values: &[f32]) -> Vec<u8> {
     values.iter().flat_map(|v| v.to_le_bytes()).collect()
 }
@@ -1403,6 +1417,16 @@ pub fn ladders() -> (Vec<u32>, Vec<u32>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn multimodal_emission_is_refused_off_nvidia() {
+        check_target("sm_90a", "h100").unwrap();
+        check_target("sm_120a", "").unwrap();
+        for (arch, gpu) in [("gfx942", "mi300x"), ("gfx950", ""), ("avx512", ""), ("sm_120a", "xeon6975p"), ("metal3", ""), ("", "")] {
+            let error = check_target(arch, gpu).unwrap_err();
+            assert!(error.contains(&format!("--arch {arch:?} --gpu {gpu:?}")), "{error}");
+        }
+    }
 
     #[test]
     fn audio_positions_match_the_reference_layout() {

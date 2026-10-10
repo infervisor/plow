@@ -6777,6 +6777,13 @@ fn emit_phase(
                 let c_dn = if w8a8 {
                     // total_pad rows the align op touched for THIS bucket (matches align's write extent).
                     let moe_total_pad = t * c.top_k + c.n_exp * 128;
+                    let fuq_bytes = b.tensor_bytes(n.moe_fuq);
+                    let xn2_bytes = t as u64 * c.hidden as u64;
+                    assert!(
+                        xn2_bytes <= fuq_bytes,
+                        "moe.fuq ({fuq_bytes} B = total_pad*moe_inter) cannot stage xn2 e4m3 ({t} rows x {} = {xn2_bytes} B)",
+                        c.hidden
+                    );
                     let c_xn2q = quant(b, n.moe_fuq, n.moe_xas, n.moe_xn2, c.hidden, c_xn2);
                     let c_glu = b.emit(
                         DevOp::MoeGroupGluGemmaPfW8a8,
@@ -9721,6 +9728,7 @@ fn emit_dense_gqa(
     assert!(tp >= 1, "--tp must be >= 1");
     c.tp = tp;
     let mm_towers = (ecfg_multimodal() && block_spec.is_none()).then(|| {
+        mm::check_target(&arch, &gpu).unwrap_or_else(|e| panic!("multimodal: {e}"));
         let towers = mm::Towers::from_checkpoint(&dir).unwrap_or_else(|e| panic!("multimodal: {e}"));
         assert!(!towers.is_empty(), "PLOW_EMIT_MULTIMODAL=1: the checkpoint declares no tower");
         assert!(tp == 1, "PLOW_EMIT_MULTIMODAL=1 is single-GPU");
@@ -10788,32 +10796,23 @@ fn emit_dense_gqa(
         // Single-utterance buckets (forward.v1); on CUDA also packed buckets (chunks of several
         // utterances, each attending in its own windows and splitting K as its single bucket
         // would), the largest sizing every shared tensor.
-        let (packed, single): (&[u32], &[u32]) = if arch.starts_with("sm_") || target_is_cpu(&arch, &gpu) {
-            (&[192, 160, 128, 96, 80, 64, 48, 40, 32, 24, 16, 12, 8, 4], &[3000, 400, 800, 1200, 1600, 2000])
+        let packed: &[u32] = if arch.starts_with("sm_") || target_is_cpu(&arch, &gpu) {
+            &[192, 160, 128, 96, 80, 64, 48, 40, 32, 24, 16, 12, 8, 4]
         } else {
-            (&[], &[400, 800, 1200, 1600, 2000])
+            &[]
         };
-        let max_chunks = emit_config::active().asr_packed_max_chunks.unwrap_or(u32::MAX);
-        let packed: Vec<u32> = packed.iter().copied().filter(|&chunks| chunks <= max_chunks).collect();
+        let single: &[u32] = &[3000, 400, 800, 1200, 1600, 2000];
+        let buckets = asr::qwen::audio_buckets(packed, single, emit_config::active().asr_packed_max_chunks);
         let audio_dims = asr::qwen::AudioDims::from_checkpoint(&dir)
             .unwrap_or_else(|error| panic!("Qwen audio encoder dims: {error}"));
-        let mut encoder = match packed.first() {
-            Some(&chunks) => asr::qwen::lower_packed_audio_encoder(chunks, n_cu, audio_dims),
-            None => asr::qwen::lower_audio_encoder(3000, n_cu, audio_dims),
-        }
-        .unwrap_or_else(|error| panic!("Qwen audio packet lowering: {error}"));
-        for chunks in packed.iter().skip(1) {
-            let bucket = asr::qwen::lower_packed_audio_encoder(*chunks, n_cu, audio_dims)
-                .unwrap_or_else(|error| panic!("Qwen audio packet lowering: {error}"));
+        let lower = |bucket: &asr::qwen::AudioBucket| {
+            bucket.lower(n_cu, audio_dims).unwrap_or_else(|error| panic!("Qwen audio packet lowering: {error}"))
+        };
+        let (base, rest) = buckets.split_first().expect("single-utterance capacities");
+        let mut encoder = lower(base);
+        for bucket in rest {
             encoder
-                .merge_capacity(bucket)
-                .unwrap_or_else(|error| panic!("Qwen audio packet capacity: {error}"));
-        }
-        for &capacity in single {
-            let bucket = asr::qwen::lower_audio_encoder(capacity, n_cu, audio_dims)
-                .unwrap_or_else(|error| panic!("Qwen audio packet lowering: {error}"));
-            encoder
-                .merge_capacity(bucket)
+                .merge_capacity(lower(bucket))
                 .unwrap_or_else(|error| panic!("Qwen audio packet capacity: {error}"));
         }
         encoder.prefix.model.target = m.target;
@@ -10824,7 +10823,7 @@ fn emit_dense_gqa(
             asr::qwen::whisper_frontend(&dir).unwrap_or_else(|error| panic!("Qwen audio frontend: {error}")),
         );
         let section = encoder
-            .pipeline_section(packed.first().map_or(3000, |chunks| chunks * 100))
+            .pipeline_section(base.feature_frames())
             .unwrap_or_else(|error| panic!("Qwen audio packet metadata: {error}"));
         (encoder.prefix.model, section)
     });

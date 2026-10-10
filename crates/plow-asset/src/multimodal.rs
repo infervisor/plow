@@ -108,12 +108,12 @@ pub fn span_safe_rows(prompt: &[u32], start: usize, rows: usize, stage: usize) -
 }
 
 /// As [`span_safe_rows`], but a run that begins at `start` and does not fit is taken whole when
-/// it fits `limit` rows (a request must make progress past its own span).
+/// it fits `limit` rows and one stage (a request must make progress past its own span).
 pub fn span_chunk_rows(prompt: &[u32], start: usize, rows: usize, limit: usize, stage: usize) -> usize {
     match span_safe_rows(prompt, start, rows, stage) {
         0 => {
             let run = prompt[start..].iter().take_while(|&&id| is_span_id(id)).count();
-            if run <= limit { run } else { 0 }
+            if run <= limit && (stage == 0 || run <= stage) { run } else { 0 }
         }
         safe => safe,
     }
@@ -344,6 +344,29 @@ mod tests {
         // A span past the chunk end does not matter.
         let r = [1, 2, 3, 4, 5, 6, S, S];
         assert_eq!(span_safe_rows(&r, 0, 6, 4), 6);
+    }
+
+    #[test]
+    fn a_span_starting_the_chunk_is_taken_whole_only_within_one_stage() {
+        // span 4..8 fits stage 4 exactly.
+        let p = [1, 2, 3, 4, S, S, S, S, 5, 6];
+        assert_eq!(span_chunk_rows(&p, 4, 2, 4096, 4), 4);
+        assert_eq!(span_chunk_rows(&p, 4, 10, 4096, 4), 6);
+        // span 4..9 would straddle the boundary at 8 (counted from the chunk start).
+        let q = [1, 2, 3, 4, S, S, S, S, S, 5];
+        assert_eq!(span_chunk_rows(&q, 4, 2, 4096, 4), 0);
+        assert_eq!(span_chunk_rows(&q, 4, 6, 4096, 4), 0);
+        assert_eq!(span_chunk_rows(&q, 4, 2, 4096, 8), 5, "a wider stage holds it");
+        assert_eq!(span_chunk_rows(&q, 4, 2, 4096, 0), 5);
+        // A span starting exactly on a later boundary is a plain safe cut, not the whole-run case.
+        let r = [1, 2, 3, 4, S, S, S, 5];
+        assert_eq!(span_chunk_rows(&r, 0, 8, 4096, 4), 8);
+        assert_eq!(span_chunk_rows(&r, 0, 6, 4096, 4), 4);
+        // A 600-row item never fits a 512-row stage, whatever the request may hold.
+        let mut big = vec![S; 600];
+        big.push(1);
+        assert_eq!(span_chunk_rows(&big, 0, 601, 1024, 512), 0);
+        assert_eq!(span_chunk_rows(&big, 0, 601, 1024, 0), 601);
     }
 
     #[test]

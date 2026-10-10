@@ -357,6 +357,12 @@ impl Manifest {
                         d.t[..5].iter().copied().collect::<BTreeSet<_>>().len() == 5,
                         "attention operand alias",
                     )?;
+                    if op == DevOp::FlashPrefillFp8 {
+                        if let Some(span) = packet::dev::flash_span(d.i[7]) {
+                            need(!d.t.contains(&span), "attention operand alias")?;
+                            extent(span, u64::from(g.rows) * 4)?;
+                        }
+                    }
                     if d.t[5] == TENSOR_NONE16 {
                         extent(d.t[0], product(&[g.rows, d.i[2], d.i[6], d.i[7]], 4)?)?;
                         extent(d.t[1], product(&[g.rows, d.i[2], d.i[7]], 8)?)?;

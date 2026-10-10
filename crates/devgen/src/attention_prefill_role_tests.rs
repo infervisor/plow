@@ -773,3 +773,72 @@ fn generated_entry_binds_matching_wide_rungs_and_leaves_short_ones() {
     assert!(apply(&mut wide(4096), &mut Vec::new(), true).is_err());
     std::fs::remove_dir_all(directory).unwrap();
 }
+
+/// A causal entry binds per site: a program that also carries a media-span site fails closed
+/// instead of running the causal object over it.
+#[test]
+fn generated_entry_rejects_media_span_sites_it_does_not_mask() {
+    let directory = output_dir("generated-span");
+    let output = directory.join("model.pkt");
+    let globals = [
+        ("plow_gen_flash_prefill_abi", 1),
+        ("plow_gen_block", 256),
+        ("plow_gen_arena_bytes", 206_848),
+        ("plow_attention_head_dim", 512),
+        ("plow_attention_query_tile", 64),
+        ("plow_attention_kv_tile", 64),
+        ("plow_attention_warps", 8),
+        ("plow_pf_request_abi", 2),
+    ];
+    let image =
+        plow_asset::cubin::synthetic_elf(crate::gen_kernels::ENTRY_SYMBOL, &globals, 90);
+    std::fs::write(directory.join(&crate::gen_kernels::CATALOG[0].file), image).unwrap();
+    let rows = 4096u32;
+    let two_sites = |second_span: bool| {
+        let mut builder = Builder::new(132);
+        let q = builder.tensor("q", u64::from(rows) * 16 * 512 * 2);
+        let k = builder.tensor("k", 65536 * 512 * 2);
+        let v = builder.tensor("v", 65536 * 512 * 2);
+        let partial = builder.tensor("partial", u64::from(rows) * 16 * 512 * 4);
+        let ml = builder.tensor("ml", u64::from(rows) * 16 * 8);
+        let out = builder.tensor("out", u64::from(rows) * 16 * 512 * 2);
+        let span = builder.tensor("span", u64::from(rows) * 4);
+        let mut dep = builder.emit(DevOp::Nop, builder.all(), &[], |_| {});
+        for i7 in [1, if second_span { 1 | u32::from(span) << 16 } else { 1 }] {
+            dep = builder.emit(DevOp::FlashPrefill, builder.all(), &[dep], |op| {
+                op.t[..6].copy_from_slice(&[partial, ml, q, k, v, out]);
+                op.i = [rows, rows, 16, 1, 0, 0, 512, i7];
+                op.j[0] = 65536;
+                op.j[1] = u32::MAX;
+                op.f[0] = 1.0;
+            });
+        }
+        builder.emit(DevOp::Nop, builder.all(), &[dep], |_| {});
+        let prefill = builder.finish();
+        let mut decode = Builder::new(132);
+        decode.adopt_tensors(prefill.tensors.clone());
+        decode.emit(DevOp::Nop, decode.all(), &[], |_| {});
+        Model {
+            n_cu: 132,
+            target: 0,
+            tensors: prefill.tensors.clone(),
+            progs: vec![prefill, decode.finish()],
+            kv_row_insts: vec![],
+            prog_t: vec![rows, 1],
+            gen: vec![],
+        }
+    };
+    let apply = |model: &mut Model, sections: &mut Vec<SectionData>| {
+        crate::gen_kernels::apply_output_objects(
+            model, sections, "sm_90a", &output, "h100", true, "attn_pf_hd512", false,
+        )
+    };
+    let mut sections = Vec::new();
+    apply(&mut two_sites(false), &mut sections).unwrap();
+    let roles = SegmentRoles::from_bytes(&sections[0].data).unwrap();
+    assert_eq!(roles.programs[0].roles, [0, 18, 18, 0]);
+    assert!(apply(&mut two_sites(true), &mut Vec::new())
+        .unwrap_err()
+        .contains("incompatible generated prefill attention operand contract"));
+    std::fs::remove_dir_all(directory).unwrap();
+}

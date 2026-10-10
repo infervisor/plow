@@ -320,6 +320,42 @@ pub fn lower_audio_encoder(feature_frames: u32, n_cu: u32, dims: AudioDims) -> R
     lower(feature_frames, n_cu, false, dims)
 }
 
+/// One encoder capacity rung: a packed bucket of 100-frame chunks or a single-utterance bucket.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AudioBucket {
+    Packed(u32),
+    Single(u32),
+}
+
+impl AudioBucket {
+    pub fn feature_frames(self) -> u32 {
+        match self {
+            AudioBucket::Packed(chunks) => chunks * 100,
+            AudioBucket::Single(frames) => frames,
+        }
+    }
+
+    pub fn lower(self, n_cu: u32, dims: AudioDims) -> Result<AudioEncoderPackets, String> {
+        match self {
+            AudioBucket::Packed(chunks) => lower_packed_audio_encoder(chunks, n_cu, dims),
+            AudioBucket::Single(frames) => lower_audio_encoder(frames, n_cu, dims),
+        }
+    }
+}
+
+/// The encoder rungs in lowering order: the packed buckets at most `max_chunks` chunks
+/// (`PLOW_ASR_PACKED_MAX_CHUNKS`), then the single-utterance capacities. The first rung is the
+/// base program and the rest merge into it, so a capacity is never both.
+pub fn audio_buckets(packed: &[u32], single: &[u32], max_chunks: Option<u32>) -> Vec<AudioBucket> {
+    let max_chunks = max_chunks.unwrap_or(u32::MAX);
+    packed
+        .iter()
+        .filter(|&&chunks| chunks <= max_chunks)
+        .map(|&chunks| AudioBucket::Packed(chunks))
+        .chain(single.iter().map(|&frames| AudioBucket::Single(frames)))
+        .collect()
+}
+
 /// `chunks` 100-frame chunks of any number of utterances, each starting on a chunk; the `groups`
 /// table lists every utterance's attention windows `(first row, valid rows)`.
 pub fn lower_packed_audio_encoder(chunks: u32, n_cu: u32, dims: AudioDims) -> Result<AudioEncoderPackets, String> {
@@ -983,6 +1019,24 @@ mod tests {
     use super::*;
     use packet::dev::DevOp;
     use packet::devbuild::{Builder, Model};
+
+    /// `PLOW_ASR_PACKED_MAX_CHUNKS` below the smallest packed bucket leaves the single 3000-frame
+    /// capacity as the base program instead of merging it into itself.
+    #[test]
+    fn audio_buckets_under_the_packed_cap_keep_one_base() {
+        use AudioBucket::{Packed, Single};
+        let packed = [8, 4];
+        let single = [3000, 400];
+        assert_eq!(audio_buckets(&packed, &single, None), [Packed(8), Packed(4), Single(3000), Single(400)]);
+        assert_eq!(audio_buckets(&packed, &single, Some(4)), [Packed(4), Single(3000), Single(400)]);
+        for cap in [Some(3), Some(0)] {
+            let buckets = audio_buckets(&packed, &single, cap);
+            assert_eq!(buckets, [Single(3000), Single(400)]);
+            assert_eq!(buckets[0].feature_frames(), 3000);
+        }
+        assert_eq!(audio_buckets(&[], &single, Some(2)), [Single(3000), Single(400)]);
+        assert_eq!(Packed(4).feature_frames(), 400);
+    }
 
     #[test]
     fn fused_layer_norm_emits_row_stats_and_dense_prologue() {

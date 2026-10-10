@@ -98,6 +98,7 @@ pub(crate) struct Generated {
     pub ring_kv: bool,
     pub pair_heads: bool,
     pub kv: crate::gen_kernels::KvDtype,
+    pub media_span: bool,
 }
 
 struct Hd256Qualification {
@@ -512,6 +513,7 @@ fn eligible_for(op: &packet::dev::DevInst, n_cu: u16, selection: &Selection) -> 
                 && op.i[6] == g.attention.head_dim
                 && crate::gen_kernels::heads_and_window_match(op, g.window, g.pair_heads)
                 && packet::dev::flash_nsplit(op.i[7]) == 1
+                && packet::dev::flash_span(op.i[7]).is_some() == g.media_span
                 // FP8 KV: t[6] / t[7] are the k / v scale vectors (packed requests ride i[4]).
                 && match g.kv {
                     crate::gen_kernels::KvDtype::Bf16 => op.t[6] == TENSOR_NONE,
