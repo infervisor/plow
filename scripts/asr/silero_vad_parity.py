@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Per-frame speech-probability parity of a `vad.silero.v1` packet (plowrt's host executor,
+"""Per-frame speech-probability parity of a `vad.frame.v1` packet (plowrt's host executor,
 `--asr-vad-packet`) vs the Silero VAD TorchScript reference, on a fixed audio set: LibriSpeech clips (an ASR manifest), the first clips
 joined by pauses of silence and of noise, and pure silence / noise segments.
 

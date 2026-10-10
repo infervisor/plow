@@ -243,7 +243,7 @@ impl GuidedLm {
         let c = GuidedLmContract::load(assets)?
             .ok_or_else(|| RuntimeError::Rejected(format!("{} declares no {DRIVER} pipeline", assets.display())))?;
         let be = std::sync::Arc::new(crate::device::cuda::CudaBackend::new(device)?);
-        let e = GpuEngine::load(be, assets, &assets.join("checkpoint"))?;
+        let e = GpuEngine::load(be, assets, &crate::asset::serve::checkpoint_dir(assets))?;
         if e.vocab() != c.speech_vocab {
             return Err(RuntimeError::Rejected("T3 engine vocab disagrees with the contract".into()));
         }

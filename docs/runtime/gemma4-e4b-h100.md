@@ -45,6 +45,54 @@ Two builds from the same recipe (shared tree and a clean worktree) produce a byt
   (`prefix.rs`). Cached and cold prompts give the same tokens (see below). Sessions
   (`X-Session-Id`) are served from the prefix cache (`X-Session-Cache: prefix-cache`).
 
+## Images and audio (experimental: `PLOW_EMIT_MULTIMODAL=1`)
+
+```sh
+python3 scripts/campaign/campaign.py build recipes/infervisor/gemma-4-e4b/sm90a-h100-tp1.toml --out $OUT \
+  --env PLOW_EMIT_MULTIMODAL=1
+```
+
+The flag adds `mm_vision.pkt` (SigLIP-style tower, 16 layers, plus `embed_vision`) and `mm_audio.pkt`
+(USM conformer, 12 layers, plus `embed_audio`) next to `model.pkt`. It also adds `MmRowsBf16` after
+`Embed` in every prefill program, and the `plow.multimodal.v1` contract. Without the flag,
+`model.pkt` is byte-identical. The request surface is described in
+[serving-openai-compat.md](../serving-openai-compat.md) §2c.
+
+* **Rungs.**
+  * Vision: `PLOW_EMIT_MM_VISION_LADDER` images per launch (default `1,2`). Each image is padded
+    to 2520 patches, as in HF.
+  * Audio: `PLOW_EMIT_MM_AUDIO_LADDER` log-mel frames (default `400,1000,2000,3000`, i.e. 4 to 30 s).
+  * The speech interpreter (`interp_sm90a_speech.cubin`) runs both sidecars.
+* **Preprocessing (CPU, from the contract).**
+  * Images: aspect-preserving resize to at most 280 soft tokens (sides multiples of 48), Pillow
+    bicubic, then 16×16 patches.
+  * Audio: 16 kHz, semicausal log-mel (128 HTK bins, frame 320, hop 160, fft 512). Tokens =
+    ⌈⌈valid/2⌉/2⌉.
+* **New ops.**
+  * `RmsNormF32` (206): grouped RMSNorm, optional gamma.
+  * `RopeAxialF32` (207): 2-D axial rotate-half.
+  * `ChunkAttentionF32` (208): USM chunked local attention with the relative-position term and
+    the logit softcap.
+  * Clipped linears are lowered as clamp → dense → clamp. The depthwise conv is lowered as 5
+    shifted gathers × per-channel taps.
+* **Parity vs HF transformers (bf16, H100).** Harness: `scripts/mm/hf_ref.py`,
+  `crates/plowrt/examples/mm_check.rs` and `scripts/mm/gate.py`.
+  * **Preprocessing.**
+    * Log-mel: max abs 5e-7.
+    * Pixels: ≤ 2 levels (PNG), ≤ 3 levels (JPEG decoder rounding). Mean ≤ 0.026 levels.
+    * Soft-token counts are identical.
+  * **Projected soft tokens (4 images, 3 clips).**
+    * Image: cosine ≥ 0.9996, relL2 ≤ 0.028.
+    * Audio: cosine ≥ 0.9999, relL2 ≤ 0.011.
+  * **Served greedy (10 chat cases: image, two images, ASR, audio Q&A, image+audio).**
+    * Prompt token counts all equal.
+    * 9/10 completions identical; image+audio diverges after 20 words.
+    * A repeat (prefix-cache hit) is identical.
+    * Same-text/different-media pairs differ as in HF.
+  * **Text-only with the flag on.**
+    * `gemma_logit_parity`: top1 0.990, KL mean 7.4e-4.
+    * Greedy tokens identical to the release packet on all 9 cases.
+
 ## Logprobs API
 
 Served on the CUDA engine. Other backends return 400.

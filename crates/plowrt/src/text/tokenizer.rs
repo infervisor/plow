@@ -20,6 +20,11 @@ pub trait Tokenize: Send + Sync {
     fn decode_keep_special(&self, ids: &[u32]) -> String {
         self.decode(ids)
     }
+    /// Append `decode` (or `decode_keep_special`) of `ids` to `out`; the per-token detokenize
+    /// calls this into reused buffers.
+    fn decode_append(&self, ids: &[u32], keep_special: bool, out: &mut String) {
+        out.push_str(&if keep_special { self.decode_keep_special(ids) } else { self.decode(ids) });
+    }
     /// The text of every token `decode` drops as special.
     fn special_tokens(&self) -> Vec<String> {
         Vec::new()
@@ -53,6 +58,17 @@ impl Tokenize for ByteTokenizer {
         String::from_utf8_lossy(&bytes).into_owned()
     }
 
+    fn decode_append(&self, ids: &[u32], _keep_special: bool, out: &mut String) {
+        thread_local! {
+            static BYTES: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+        }
+        BYTES.with_borrow_mut(|bytes| {
+            bytes.clear();
+            bytes.extend(ids.iter().filter_map(|&id| u8::try_from(id).ok()));
+            out.push_str(&String::from_utf8_lossy(bytes));
+        });
+    }
+
     fn vocab_size(&self) -> usize {
         256
     }
@@ -71,9 +87,18 @@ impl Tokenize for ByteTokenizer {
 /// fallback. Never fails — a missing/broken tokenizer degrades to bytes with a
 /// warning, so serving still works.
 pub fn load_tokenizer(dir: &Path) -> Arc<dyn Tokenize> {
+    load_tokenizer_with(dir, &dir.join("checkpoint"))
+}
+
+/// [`load_tokenizer`] for a bundle whose HF files live in `checkpoint` (see
+/// `asset::serve::checkpoint_dir`): `dir` first, then `checkpoint`.
+pub fn load_tokenizer_with(dir: &Path, checkpoint: &Path) -> Arc<dyn Tokenize> {
     #[cfg(feature = "hf-tokenizer")]
     {
-        let path = dir.join("tokenizer.json");
+        let path = [dir.join("tokenizer.json"), checkpoint.join("tokenizer.json")]
+            .into_iter()
+            .find(|p| p.exists())
+            .unwrap_or_else(|| dir.join("tokenizer.json"));
         if path.exists() {
             match HfTokenizer::from_file(&path) {
                 Ok(t) => {
@@ -85,16 +110,16 @@ pub fn load_tokenizer(dir: &Path) -> Arc<dyn Tokenize> {
                 }
             }
         }
-        for base in [dir.to_path_buf(), dir.join("checkpoint")] {
+        for base in [dir, checkpoint] {
             if base.join("vocab.json").is_file() && base.join("merges.txt").is_file() {
-                match HfTokenizer::from_qwen2_files(&base) {
+                match HfTokenizer::from_qwen2_files(base) {
                     Ok(t) => return Arc::new(t),
                     Err(e) => tracing::warn!(error = %e, "Qwen2 tokenizer failed to load"),
                 }
             }
         }
     }
-    let _ = dir;
+    let _ = (dir, checkpoint);
     Arc::new(ByteTokenizer)
 }
 
@@ -109,6 +134,8 @@ pub struct HfTokenizer {
     fast: bool,
     /// Smallest split-encode piece in bytes; `None` encodes serially.
     split_min: Option<usize>,
+    /// Allocation-free exact decode for the decoder chains it emulates.
+    table: Option<super::detok::DecodeTable>,
 }
 
 /// Pre-tokenizer patterns under which a single ASCII space between two ASCII letters always ends
@@ -319,6 +346,7 @@ impl HfTokenizer {
         HfTokenizer {
             vocab_size: inner.get_vocab_size(true),
             max_token_bytes,
+            table: super::detok::DecodeTable::build(&inner),
             inner,
             fast: rt.encode_fast,
             split_min: split.then_some(floor),
@@ -396,11 +424,32 @@ impl Tokenize for HfTokenizer {
     }
 
     fn decode(&self, ids: &[u32]) -> String {
-        self.inner.decode(ids, true).unwrap_or_default()
+        match &self.table {
+            Some(t) => {
+                let mut s = String::new();
+                t.decode_into(ids, true, &mut s);
+                s
+            }
+            None => self.inner.decode(ids, true).unwrap_or_default(),
+        }
     }
 
     fn decode_keep_special(&self, ids: &[u32]) -> String {
-        self.inner.decode(ids, false).unwrap_or_default()
+        match &self.table {
+            Some(t) => {
+                let mut s = String::new();
+                t.decode_into(ids, false, &mut s);
+                s
+            }
+            None => self.inner.decode(ids, false).unwrap_or_default(),
+        }
+    }
+
+    fn decode_append(&self, ids: &[u32], keep_special: bool, out: &mut String) {
+        match &self.table {
+            Some(t) => t.decode_into(ids, !keep_special, out),
+            None => out.push_str(&self.inner.decode(ids, !keep_special).unwrap_or_default()),
+        }
     }
 
     fn special_tokens(&self) -> Vec<String> {

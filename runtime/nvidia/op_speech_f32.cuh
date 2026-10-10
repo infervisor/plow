@@ -65,6 +65,11 @@ __device__ __forceinline__ float sp_sigmoid(float x) {
     return __fdiv_rn(1.0f, __fadd_rn(1.0f, sp_expf(-x)));
 }
 __device__ __forceinline__ float sp_silu(float x) { return __fdiv_rn(x, __fadd_rn(1.0f, sp_expf(-x))); }
+/* torch gelu(approximate="tanh"). */
+__device__ __forceinline__ float sp_gelu_tanh(float x) {
+    const float inner = __fmul_rn(0.7978845608028654f, __fadd_rn(x, __fmul_rn(0.044715f, __fmul_rn(x, __fmul_rn(x, x)))));
+    return __fmul_rn(__fmul_rn(0.5f, x), __fadd_rn(1.0f, tanhf(inner)));
+}
 
 /* bf16(x) -> erf-GELU (Abramowitz-Stegun 7.1.26) -> bf16, exactly as the golden spells it. */
 __device__ __forceinline__ float sp_gelu_erf_bf16(float value) {
@@ -2337,6 +2342,8 @@ __device__ __forceinline__ void sp_with_act(unsigned kind, float p1, const B& bo
     case 14: body([p1](float x, float p0) { return __fadd_rn(__fmul_rn(x, p0), p1); }); break;
     case 15: body([](float x, float) { return x > 0.0f ? x : 0.0f; }); break;
     case 16: body([](float x, float) { return sqrtf(x); }); break;
+    case 17: body([](float x, float) { return sp_gelu_tanh(x); }); break;
+    case 18: body([](float x, float) { return sp_bf16(x); }); break;
     default: body([](float x, float) { return x; }); break;
     }
 }
@@ -2358,6 +2365,8 @@ __device__ __forceinline__ float sp_act(unsigned kind, float x, float p0, float 
     case 14: return __fadd_rn(__fmul_rn(x, p0), p1);
     case 15: return x > 0.0f ? x : 0.0f;
     case 16: return sqrtf(x);
+    case 17: return sp_gelu_tanh(x);
+    case 18: return sp_bf16(x);
     default: return x;
     }
 }
@@ -4649,6 +4658,169 @@ static __device__ __noinline__ void d_attention_f32(const PlowDevInst* in, void*
     }
 }
 
+/* ---- multimodal encoder primitives (206-208): contracts in packet::dev::DevOp ----------------- */
+
+/* RmsNormF32 (206): grouped RMSNorm, `out[r][g*gs + c] = x * (mean_c x^2 + eps)^-1/2 * gamma`. */
+static __device__ __noinline__ void d_rmsnorm_f32(const PlowDevInst* in, void* const* T, unsigned slice, unsigned nblk) {
+    float* out = (float*)SP_TEN(0);
+    const float* x = (const float*)SP_TEN(1);
+    const float* gamma = (const float*)SP_TEN(2);
+    const unsigned rows = in->i[0], groups = in->i[1], gw = in->i[2], flags = in->i[4];
+    const unsigned gs = in->i[5] ? in->i[5] : gw;
+    const unsigned stride = in->i[3] ? in->i[3] : groups * gs;
+    const float eps = in->fj[0].f;
+    const unsigned lane = threadIdx.x & 31u, warp = threadIdx.x >> 5;
+    const unsigned units = rows * groups;
+    for (unsigned u = slice * PLOW_NV_WARPS + warp; u < units; u += nblk * PLOW_NV_WARPS) {
+        const unsigned r = u / groups, g = u - r * groups;
+        const float* xr = x + (size_t)r * stride + (size_t)g * gs;
+        float* orow = out + (size_t)r * stride + (size_t)g * gs;
+        float s = 0.f;
+        for (unsigned c = lane; c < gw; c += 32u) s = fmaf(xr[c], xr[c], s);
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) s += __shfl_xor_sync(0xffffffffu, s, o);
+        const float inv = __frcp_rn(sqrtf(__fadd_rn(__fdiv_rn(s, (float)gw), eps)));
+        for (unsigned c = lane; c < gw; c += 32u) {
+            float v = __fmul_rn(xr[c], inv);
+            if (gamma) v = __fmul_rn(v, gamma[(flags & 1u) ? g * gw + c : c]);
+            orow[c] = (flags & 2u) ? sp_bf16(v) : v;
+        }
+    }
+}
+
+/* RopeAxialF32 (207): in-place rotate-half RoPE per axis segment of each head. */
+static __device__ __noinline__ void d_rope_axial_f32(const PlowDevInst* in, void* const* T, unsigned slice, unsigned nblk) {
+    float* x = (float*)SP_TEN(0);
+    const unsigned* pos = (const unsigned*)SP_TEN(1);
+    const unsigned rows = in->i[0], heads = in->i[1], hw = in->i[2], axes = in->i[4], flags = in->i[6];
+    const unsigned hs = in->i[5] ? in->i[5] : hw;
+    const unsigned stride = in->i[3] ? in->i[3] : heads * hs;
+    if (!axes || hw % (2u * axes)) return;
+    const unsigned seg = hw / axes, half = seg / 2u;
+    const float theta = in->fj[0].f;
+    const unsigned n = rows * heads * axes * half;
+    const bool b16 = flags & 1u;
+    for (unsigned e = slice * PLOW_NV_THREADS + threadIdx.x; e < n; e += nblk * PLOW_NV_THREADS) {
+        unsigned rest = e;
+        const unsigned i = rest % half;
+        rest /= half;
+        const unsigned a = rest % axes;
+        rest /= axes;
+        const unsigned h = rest % heads;
+        const unsigned r = rest / heads;
+        const float inv = __fdiv_rn(1.0f, powf(theta, __fdiv_rn((float)(2u * i), (float)seg)));
+        const float ang = __fmul_rn((float)pos[(size_t)r * axes + a], inv);
+        float c = cosf(ang), s = sinf(ang);
+        float* p = x + (size_t)r * stride + (size_t)h * hs + (size_t)a * seg + i;
+        const float x1 = p[0], x2 = p[half];
+        if (b16) {
+            c = sp_bf16(c);
+            s = sp_bf16(s);
+            p[0] = sp_bf16(__fadd_rn(sp_bf16(__fmul_rn(x1, c)), sp_bf16(__fmul_rn(-x2, s))));
+            p[half] = sp_bf16(__fadd_rn(sp_bf16(__fmul_rn(x2, c)), sp_bf16(__fmul_rn(x1, s))));
+        } else {
+            p[0] = __fsub_rn(__fmul_rn(x1, c), __fmul_rn(x2, s));
+            p[half] = __fadd_rn(__fmul_rn(x2, c), __fmul_rn(x1, s));
+        }
+    }
+}
+
+/* ChunkAttentionF32 (208): blocked local attention with a Transformer-XL relative term and a tanh
+ * logit cap (the USM / Gemma-4 audio conformer). One unit per (chunk, head). */
+static __device__ __noinline__ void d_chunk_attention_f32(const PlowDevInst* in, void* const* T, unsigned slice,
+                                                          unsigned nblk, float* arena) {
+    float* out = (float*)SP_TEN(0);
+    const float* q = (const float*)SP_TEN(1);
+    const float* k = (const float*)SP_TEN(2);
+    const float* v = (const float*)SP_TEN(3);
+    const float* relk = (const float*)SP_TEN(4);
+    const float* qscale = (const float*)SP_TEN(5);
+    const unsigned* valid_p = (const unsigned*)SP_TEN(6);
+    const unsigned rows = in->i[0], heads = in->i[1], D = in->i[2], C = in->i[3];
+    const unsigned past = in->i[4], future = in->i[5], P = in->i[6];
+    const unsigned left = in->i[7] & 0xFFFFu, right = in->i[7] >> 16;
+    const float kscale = in->fj[0].f, cap = in->fj[1].f;
+    const unsigned W = C + past + future, width = heads * D;
+    const unsigned valid = valid_p ? min(valid_p[0], rows) : rows;
+    arena = sp_smem;
+    float* sq = arena;
+    float* sk = sq + C * D;
+    float* sv = sk + W * D;
+    float* sr = sv + W * D;
+    float* sbd = sr + P * D;
+    float* sl = sbd + C * P;
+    if ((size_t)(sl + C * W - arena) > SP_ARENA_FLOATS) {
+        __trap();
+        return;
+    }
+    const unsigned chunks = (rows + C - 1u) / C;
+    for (unsigned u = slice; u < chunks * heads; u += nblk) {
+        const unsigned b = u / heads, h = u - b * heads;
+        __syncthreads();
+        for (unsigned e = threadIdx.x; e < C * D; e += PLOW_NV_THREADS) {
+            const unsigned i = e / D, d = e - i * D, row = b * C + i;
+            sq[e] = row < rows ? __fmul_rn(q[(size_t)row * width + h * D + d], qscale ? qscale[d] : 1.f) : 0.f;
+        }
+        for (unsigned e = threadIdx.x; e < W * D; e += PLOW_NV_THREADS) {
+            const unsigned j = e / D, d = e - j * D;
+            const int row = (int)(b * C + j) - (int)past;
+            const bool ok = row >= 0 && (unsigned)row < rows;
+            sk[e] = ok ? __fmul_rn(k[(size_t)row * width + h * D + d], kscale) : 0.f;
+            sv[e] = ok ? v[(size_t)row * width + h * D + d] : 0.f;
+        }
+        for (unsigned e = threadIdx.x; e < P * D; e += PLOW_NV_THREADS) {
+            const unsigned p = e / D, d = e - p * D;
+            sr[e] = relk[(size_t)p * width + h * D + d];
+        }
+        __syncthreads();
+        for (unsigned e = threadIdx.x; e < C * P; e += PLOW_NV_THREADS) {
+            const unsigned i = e / P, p = e - i * P;
+            float s = 0.f;
+            for (unsigned d = 0; d < D; d++) s = fmaf(sq[i * D + d], sr[p * D + d], s);
+            sbd[e] = s;
+        }
+        __syncthreads();
+        for (unsigned e = threadIdx.x; e < C * W; e += PLOW_NV_THREADS) {
+            const unsigned i = e / W, j = e - i * W;
+            float s = 0.f;
+            for (unsigned d = 0; d < D; d++) s = fmaf(sq[i * D + d], sk[j * D + d], s);
+            /* rel_shift: row i of the [C][P] term padded to W + 1 columns, read flat at i*W + j. */
+            const unsigned f = i * W + j, rr = f / (W + 1u), cc = f - rr * (W + 1u);
+            s = __fadd_rn(s, cc < P ? sbd[rr * P + cc] : 0.f);
+            s = __fmul_rn(tanhf(__fdiv_rn(s, cap)), cap);
+            const int qa = (int)(b * C + i), ka = (int)(b * C + j) - (int)past, dist = qa - ka;
+            const bool ok = ka >= 0 && (unsigned)ka < valid &&
+                            ((dist >= 0 && (unsigned)dist < left) || (dist < 0 && (unsigned)(-dist) < right));
+            sl[e] = ok ? s : -INFINITY;
+        }
+        __syncthreads();
+        const unsigned lane = threadIdx.x & 31u, warp = threadIdx.x >> 5;
+        for (unsigned i = warp; i < C; i += PLOW_NV_WARPS) {
+            float m = -INFINITY;
+            for (unsigned j = lane; j < W; j += 32u) m = fmaxf(m, sl[i * W + j]);
+            m = sp_warp_max(m);
+            float z = 0.f;
+            for (unsigned j = lane; j < W; j += 32u) {
+                const float p = m == -INFINITY ? 0.f : expf(sl[i * W + j] - m);
+                sl[i * W + j] = p;
+                z += p;
+            }
+#pragma unroll
+            for (int o = 16; o > 0; o >>= 1) z += __shfl_xor_sync(0xffffffffu, z, o);
+            const float inv = z > 0.f ? __frcp_rn(z) : 0.f;
+            __syncwarp();
+            const unsigned row = b * C + i;
+            if (row >= rows) continue;
+            for (unsigned d = lane; d < D; d += 32u) {
+                float acc = 0.f;
+                for (unsigned j = 0; j < W; j++) acc = fmaf(sl[i * W + j], sv[j * D + d], acc);
+                out[(size_t)row * width + h * D + d] = __fmul_rn(acc, inv);
+            }
+        }
+    }
+    __syncthreads();
+}
+
 /* An op outside PLOW_SPEECH_OPS traps; its arm is dead code. */
 #define SP_CASE(op)                                                                                  \
     case PLOW_DOP_##op:                                                                              \
@@ -4753,6 +4925,9 @@ static __device__ __noinline__ void d_speech_f32(const PlowDevInst* in, void* co
     SP_CASE(CUMSUM_F64) d_cumsum_f64(in, T, slice, nblk, arena); break;
     SP_CASE(RAND_F32) d_rand_f32(in, T, slice, nblk); break;
     SP_CASE(ATTENTION_F32) d_attention_f32(in, T, slice, nblk, arena); break;
+    case PLOW_DOP_RMSNORM_F32: d_rmsnorm_f32(in, T, slice, nblk); break;
+    case PLOW_DOP_ROPE_AXIAL_F32: d_rope_axial_f32(in, T, slice, nblk); break;
+    case PLOW_DOP_CHUNK_ATTENTION_F32: d_chunk_attention_f32(in, T, slice, nblk, arena); break;
     SP_CASE(ROW_STATS_F32)
         d_layernorm_f32(nullptr, (const float*)SP_TEN(1), nullptr, nullptr, in->i[0], in->i[1], in->i[2], in->fj[0].f,
                         slice, nblk, arena, (float*)SP_TEN(0));

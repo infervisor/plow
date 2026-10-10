@@ -227,7 +227,7 @@ pub fn template_messages(messages: &[Message], args_as_objects: bool) -> Result<
         .iter()
         .enumerate()
         .map(|(i, m)| {
-            let mut v = json!({"role": m.role, "content": m.text()});
+            let mut v = json!({"role": m.role, "content": m.template_content()});
             if let Some(r) = &m.reasoning_content {
                 v["reasoning_content"] = json!(r);
             }

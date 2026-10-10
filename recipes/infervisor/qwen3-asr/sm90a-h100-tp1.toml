@@ -8,6 +8,11 @@
 #
 # Gate: WER on the 73-clip LibriSpeech dummy set (scripts/asr/nvidia/get_audio.py) = 3.913%
 # (vLLM reference scripts/asr/nvidia/ref_bench.py: 3.913%).
+#
+# Speech contract 1 (docs/runtime/asr-packet-contract.md): plowrt >= asr-packets refuses the
+# contract-0 model.pkt of earlier emits; re-emit (the receipts pin the packet). Re-emitted at
+# 11c4a5bb: model.pkt df140272a79f (only its metadata differs from 09e53e76's), encoder.pkt unchanged;
+# with the 09e53e76 objects, H100 WER 3.913% c1 and c16 as before.
 
 schema = "plow.recipe.v1"
 namespace = "infervisor"

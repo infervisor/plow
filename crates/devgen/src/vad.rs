@@ -1,11 +1,15 @@
-//! Silero VAD v5 (16 kHz) lowered to a `vad.silero.v1` packet: one program per LSTM state bank,
-//! each turning one window (the previous frame's last `CONTEXT` samples, then `FRAME` new ones)
-//! into a speech probability. The host keeps the context samples and alternates the banks.
+//! Silero VAD v5 (16 kHz) lowered to a `vad.frame.v1` packet (contract in
+//! `plow_asset::speech_contract`): one program per LSTM state bank, each turning one window (the
+//! previous frame's last `CONTEXT` samples, then `FRAME` new ones) into a speech probability. The
+//! host keeps the context samples and rotates the banks. Silero's segment policy
+//! (`get_speech_timestamps` defaults, hysteresis) rides along as packet parameters.
 
 use packet::dev::{DevOp, ACT_RELU, ACT_SIGMOID, ACT_SQRT, TENSOR_NONE};
 use packet::devbuild::{Builder, Model, SectionData, TensorDecl};
 
-pub const DRIVER: &str = "vad.silero.v1";
+use plow_asset::speech_contract::{VadBounds, VadContract, VadGate, VadPolicy};
+
+pub const DRIVER: &str = plow_asset::speech_contract::VAD_DRIVER;
 pub const SAMPLE_RATE: u32 = 16_000;
 pub const FRAME: u32 = 512;
 pub const CONTEXT: u32 = 64;
@@ -17,6 +21,23 @@ const STFT_ROWS: u32 = (WINDOW + CONTEXT - FFT) / HOP + 1;
 const HIDDEN: u32 = 128;
 /// `(in, out, stride)`; kernel 3, padding 1, ReLU.
 const ENCODER: [(u32, u32, u32); 4] = [(BINS, 128, 1), (128, 64, 2), (64, 64, 2), (64, HIDDEN, 1)];
+
+/// Silero's `get_speech_timestamps` defaults (silero-vad 5.1.2) and its streaming hysteresis
+/// (silence below `threshold - 0.15`, at least 0.01); the upload gate keeps short speech unpadded.
+pub const POLICY: VadContract = VadContract {
+    policy: VadPolicy {
+        threshold: 0.5,
+        release_offset: 0.15,
+        release_floor: 0.01,
+        min_speech_ms: 250,
+        min_silence_ms: 100,
+        speech_pad_ms: 30,
+        max_speech_ms: 0,
+        min_silence_at_max_speech_ms: 98,
+    },
+    gate: VadGate { min_speech_ms: 150, min_silence_ms: 150, speech_pad_ms: 0, min_total_speech_ms: 250 },
+    bounds: VadBounds { max_duration_ms: 600_000 },
+};
 
 pub const INPUT: &str = "in.vad.window";
 pub const PROBABILITY: &str = "act.vad.probability";
@@ -180,11 +201,19 @@ impl VadPackets {
                 driver: DRIVER.into(),
                 programs: BTreeMap::from([("step.0".into(), self.steps[0] as u32), ("step.1".into(), self.steps[1] as u32)]),
                 tensors,
-                parameters: BTreeMap::from([
-                    ("sample_rate".into(), u64::from(SAMPLE_RATE)),
-                    ("frame_samples".into(), u64::from(FRAME)),
-                    ("context_samples".into(), u64::from(CONTEXT)),
-                ]),
+                parameters: {
+                    use plow_asset::speech_contract::{CONTRACT, EXECUTOR_HOST, VAD_CONTRACT};
+                    let mut parameters = BTreeMap::from([
+                        (CONTRACT.into(), VAD_CONTRACT),
+                        ("executor".into(), EXECUTOR_HOST),
+                        ("state_banks".into(), 2),
+                        ("sample_rate".into(), u64::from(SAMPLE_RATE)),
+                        ("frame_samples".into(), u64::from(FRAME)),
+                        ("context_samples".into(), u64::from(CONTEXT)),
+                    ]);
+                    POLICY.to_parameters(&mut parameters);
+                    parameters
+                },
                 strings: Default::default(),
             }],
         };

@@ -1,5 +1,5 @@
 //! Silero VAD v5 from the safetensors `scripts/asr/silero_export.py` writes to a
-//! `vad.silero.v1` packet.
+//! `vad.frame.v1` packet (contract: plow_asset::speech_contract).
 
 use std::collections::BTreeMap;
 

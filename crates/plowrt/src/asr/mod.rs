@@ -1,9 +1,9 @@
 pub mod conformer;
 pub mod endpoint;
 pub mod frontend;
+pub mod numerals;
 #[cfg(feature = "gguf")]
 pub mod nemotron;
-#[cfg(feature = "gguf")]
 mod packet;
 pub mod audio_lm;
 pub mod rnnt;
@@ -199,7 +199,11 @@ pub fn load_packet_transcriber(
     let pipeline_name = pipeline.name.clone();
     let driver = pipeline.driver.clone();
     let (engine, loaded_backend) = match driver.as_str() {
-        "rnnt.greedy.v1" => load_rnnt_transcriber(packet, tokenizer, backend)?,
+        "rnnt.greedy.v1" => {
+            let engine = packet::PacketRnntTranscriber::load(packet, backend)?;
+            let loaded_backend = engine.backend();
+            (Box::new(engine) as Box<dyn Transcriber>, loaded_backend)
+        }
         "causal.v1" => load_causal_transcriber(packet, tokenizer, backend)?,
         _ => unreachable!(),
     };
@@ -209,28 +213,6 @@ pub fn load_packet_transcriber(
         backend: loaded_backend,
         engine,
     })
-}
-
-#[cfg(feature = "gguf")]
-fn load_rnnt_transcriber(
-    packet: &Path,
-    tokenizer: &Path,
-    backend: &str,
-) -> crate::Result<(Box<dyn Transcriber>, &'static str)> {
-    let engine = packet::PacketRnntTranscriber::load(packet, tokenizer, backend)?;
-    let loaded_backend = engine.backend();
-    Ok((Box::new(engine), loaded_backend))
-}
-
-#[cfg(not(feature = "gguf"))]
-fn load_rnnt_transcriber(
-    _packet: &Path,
-    _tokenizer: &Path,
-    _backend: &str,
-) -> crate::Result<(Box<dyn Transcriber>, &'static str)> {
-    Err(crate::RuntimeError::Rejected(
-        "RNNT ASR packets require the gguf feature".into(),
-    ))
 }
 
 fn load_causal_transcriber(

@@ -121,14 +121,17 @@ impl GpuEngine {
             RuntimeError::Rejected("CUDA unified token-batch capability unavailable".into())
         })?;
         let mut body_enqueued = false;
+        // Multimodal soft-token rows (bit 31): the prefill buckets this batch runs replace them
+        // from the slab (MmRowsBf16).
+        let mm_rows = self.handle_of(plow_asset::multimodal::TABLE_TENSOR).is_some();
         let result = (|| {
             if requests.iter().any(|request| {
                 request.state_slot != request.slot
                     || request.selection != Selection::default()
-                    || request
-                        .tokens
-                        .iter()
-                        .any(|&token| token as usize >= self.vocab)
+                    || request.tokens.iter().any(|&token| {
+                        token as usize >= self.vocab
+                            && !(mm_rows && token & plow_asset::multimodal::ROW_ID_BIT != 0)
+                    })
             }) {
                 return Err(RuntimeError::Rejected(
                     "CUDA token batch requires direct slots, valid tokens and greedy selection"

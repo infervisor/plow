@@ -37,5 +37,8 @@ LIBCUDA=
 # Override the profile's model list / per-model context bounds (space-separated / name=ctx,...).
 MODELS=
 LIVE_CTX=
+# Override a model's HF checkpoint directory (name=dir,...; kit-relative or absolute). Default:
+# deploy/checkpoints.map, which pairs every model with its directory under hf/.
+CHECKPOINTS=
 # Extra plowrt serve flags, space-separated.
 EXTRA_ARGS=

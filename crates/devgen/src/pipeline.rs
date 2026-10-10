@@ -1125,6 +1125,23 @@ impl StageProgram {
         Ok(Emitted { output, done })
     }
 
+    /// Any op with explicit operands, sliced over `units` blocks (ops without a stage helper).
+    pub(crate) fn raw(
+        &mut self,
+        op: DevOp,
+        units: u64,
+        deps: &[u32],
+        output: u32,
+        fill: impl FnOnce(&mut packet::dev::DevInst),
+    ) -> Result<Emitted, String> {
+        self.emit(op, units, deps, output, fill)
+    }
+
+    /// Declare (or re-declare, keeping the larger size) a tensor by name.
+    pub(crate) fn declare(&mut self, name: &str, bytes: u64) -> u32 {
+        self.builder.tensor(name, bytes)
+    }
+
     /// Handle of an already-declared tensor.
     pub fn handle_of(&self, name: &str) -> Option<u32> {
         (0..self.builder.n_tensors() as u32).find(|&h| self.builder.tensor_name(h) == name)

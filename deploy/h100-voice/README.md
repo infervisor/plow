@@ -8,7 +8,8 @@ Speech recognition, an LLM and speech synthesis served together on **one NVIDIA 
 |---|---|
 | ASR | Qwen3-ASR 1.7B (`qwen3-asr`), Qwen3-ASR 0.6B, Nemotron 3.5 streaming ASR; Silero VAD (CPU) |
 | LLM | Gemma-4 E4B-it (`gemma-4-e4b`), 8K context |
-| TTS | Chatterbox Multilingual V3 (`chatterbox-mtl`, 23 languages), Veena (Indic + English), Chatterbox (English); Orpheus under `experimental/` |
+| TTS | Chatterbox Multilingual V3 (`chatterbox-mtl`, 23 languages), Veena (Indic + English), Chatterbox (English) |
+| LLM (own profile) | Gemma-4 26B-A4B-it FP8 (`gemma-4-26b-a4b-it-fp8`), 131072 context, tool calls: `PROFILE=gemma-26b-fp8` |
 | Server | `plowrt/`: one binary plus the cuBLASLt library it loads; no Python, CUDA toolkit or container needed (NVIDIA driver, glibc >= 2.34) |
 
 ## Quick start
@@ -39,8 +40,9 @@ server in the foreground.
 | `deploy/` | `plow-voice.sh` (hostcheck, preflight, install, run), the systemd unit, config sample, profiles, nginx / Caddy samples |
 | `clients/` | curl and Python examples for every endpoint, incl. WebSocket, Realtime, streaming TTS to file and a voice-agent round trip |
 | `eval/`, `perf/` | the evaluation and benchmark scripts; `data/` holds 73 LibriSpeech clips for them |
-| `models/`, `experimental/` | the model bundles (each with `SHIP.md` and `MANIFEST.json`: provenance, hashes, gate results) |
-| `plowrt/` | the server: `plowrt`, `libcublasLt.so.12`, `plow_verify` (load-time check of the packets' compiler receipts), `BUILD.json` |
+| `models/` | the compiled model bundles (each with `SHIP.md` and `MANIFEST.json`: provenance, hashes, gate results) |
+| `hf/` | the HF checkpoints the bundles serve against, one directory per distinct checkpoint (`deploy/checkpoints.map`) |
+| `plowrt/` | the one runtime for every model: `plowrt`, `libcublasLt.so.13` (cuBLAS 13.4), `plow_verify` (load-time check of the packets' compiler receipts), `BUILD.json` |
 | `KIT.json`, `PAIRING.txt`, `SHA256SUMS` | build provenance, the binary/packet pairing, hashes of every file |
 | `BASELINE.md` | single-model H100 baseline of the bundles |
 

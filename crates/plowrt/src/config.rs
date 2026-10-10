@@ -39,13 +39,15 @@ impl std::fmt::Debug for ApiKey {
     }
 }
 
-/// `--asr-packet NAME=PATH.pkt[,tokenizer=PATH][,backend=NAME]`: a packet ASR model (Nemotron
-/// RNNT, or a Qwen audio-LM packet) served by `plowrt serve` on its own cohort engine.
+/// `--asr-packet NAME=PATH.pkt[,tokenizer=PATH|,checkpoint=PATH][,backend=NAME]`: a packet ASR
+/// model (Nemotron RNNT, or a Qwen audio-LM packet) served by `plowrt serve` on its own cohort
+/// engine. `checkpoint=` (alias `tokenizer=`) names the HF directory an audio-LM packet reads its
+/// tokenizer and chat template from; an RNNT packet carries its vocabulary and ignores it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AsrPacket {
     pub name: String,
     pub packet: std::path::PathBuf,
-    /// The tokenizer (a GGUF for Nemotron); default `<packet dir>/checkpoint`.
+    /// The tokenizer (a GGUF for Nemotron) or HF checkpoint dir; default `<packet dir>/checkpoint`.
     pub tokenizer: std::path::PathBuf,
     pub backend: String,
 }
@@ -58,7 +60,10 @@ fn asr_packet_specs_parse() {
         ("nemo", Some("/m/nemo.pkt"), Some("/m/t.gguf"), "cuda"));
     let p: AsrPacket = "q=/a/model.pkt,backend=cpu".parse().unwrap();
     assert_eq!((p.tokenizer.to_str(), p.backend.as_str()), (Some("/a/checkpoint"), "cpu"));
-    for bad in ["", "nemo", "=/x.pkt", "n=", "n=/x.pkt,tok=/y", "n=/x.pkt,tokenizer="] {
+    let p: AsrPacket = "q=/a/model.pkt,checkpoint=/hf/qwen3-asr".parse().unwrap();
+    assert_eq!(p.tokenizer.to_str(), Some("/hf/qwen3-asr"));
+    for bad in ["", "nemo", "=/x.pkt", "n=", "n=/x.pkt,tok=/y", "n=/x.pkt,tokenizer=", "n=/x.pkt,checkpoint=",
+        "n=/x.pkt,tokenizer=/a,checkpoint=/b"] {
         assert!(bad.parse::<AsrPacket>().is_err(), "{bad}");
     }
 }
@@ -66,7 +71,9 @@ fn asr_packet_specs_parse() {
 impl std::str::FromStr for AsrPacket {
     type Err = String;
     fn from_str(s: &str) -> Result<Self, String> {
-        let usage = || format!("--asr-packet {s:?}: expected NAME=PATH.pkt[,tokenizer=PATH][,backend=NAME]");
+        let usage = || {
+            format!("--asr-packet {s:?}: expected NAME=PATH.pkt[,tokenizer=PATH|,checkpoint=PATH][,backend=NAME]")
+        };
         let mut fields = s.trim().split(',');
         let (name, packet) = fields.next().and_then(|f| f.split_once('=')).ok_or_else(usage)?;
         if name.is_empty() || packet.is_empty() {
@@ -74,10 +81,14 @@ impl std::str::FromStr for AsrPacket {
         }
         let packet = std::path::PathBuf::from(packet);
         let mut tokenizer = packet.parent().unwrap_or(std::path::Path::new(".")).join("checkpoint");
+        let mut named = false;
         let mut backend = "cuda".to_owned();
         for field in fields {
             match field.split_once('=') {
-                Some(("tokenizer", path)) if !path.is_empty() => tokenizer = path.into(),
+                Some(("tokenizer" | "checkpoint", path)) if !path.is_empty() && !named => {
+                    tokenizer = path.into();
+                    named = true;
+                }
                 Some(("backend", name)) if !name.is_empty() => backend = name.to_owned(),
                 _ => return Err(usage()),
             }
@@ -192,11 +203,22 @@ pub struct RuntimeConfig {
     #[arg(long = "asr-context-max-tokens", env = "PLOW_ASR_CONTEXT_MAX_TOKENS", default_value_t = 0, global = true)]
     pub asr_context_max_tokens: usize,
 
-    /// A `vad.silero.v1` packet (`asr_silero_vad_compile`), run on the CPU: it serves
+    /// A `vad.frame.v1` VAD packet (`asr_silero_vad_compile`), run on the CPU: it serves
     /// `/v1/audio/vad`, answers uploads without speech with an empty transcript before any model
     /// runs, and ends streaming turns in place of the energy endpointer. Unset = none of these.
     #[arg(long = "asr-vad-packet", env = "PLOW_ASR_VAD_PACKET", global = true)]
     pub asr_vad_packet: Option<std::path::PathBuf>,
+
+    /// Write spoken digit runs in transcripts as numerals (`asr::numerals`): "nine one eight seven
+    /// three four one five three eight" becomes "918-734-1538".
+    #[arg(long = "asr-numerals", env = "PLOW_ASR_NUMERALS", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub asr_numerals: bool,
+
+    /// Languages (as the model's packet names them, its `languages` string) a transcript may be
+    /// detected in when the request names none: a final transcript detected in another is
+    /// transcribed again in the first of these. A deployment's choice; comma-separated; unset = any.
+    #[arg(long = "asr-auto-languages", env = "PLOW_ASR_AUTO_LANGUAGES", value_delimiter = ',', global = true)]
+    pub asr_auto_languages: Vec<String>,
 
     /// API keys a request must present as `Authorization: Bearer <key>` or `x-api-key: <key>`.
     /// Repeatable; the environment form is comma-separated. `/health` and `/healthz` stay open.
@@ -241,6 +263,22 @@ pub struct RuntimeConfig {
     /// the stream's whole prefix with the prompt.
     #[arg(long = "tts-stream-windows", env = "PLOW_TTS_STREAM_WINDOWS", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub tts_stream_windows: bool,
+
+    /// Most images one multimodal request may carry (more answers 400).
+    #[arg(long = "mm-max-images", env = "PLOW_MM_MAX_IMAGES", default_value_t = 8, global = true)]
+    pub mm_max_images: usize,
+
+    /// Most audio clips one multimodal request may carry (more answers 400).
+    #[arg(long = "mm-max-audio", env = "PLOW_MM_MAX_AUDIO", default_value_t = 4, global = true)]
+    pub mm_max_audio: usize,
+
+    /// Largest decoded image accepted, in pixels (larger answers 400 before resizing).
+    #[arg(long = "mm-max-image-pixels", env = "PLOW_MM_MAX_IMAGE_PIXELS", default_value_t = 40_000_000, global = true)]
+    pub mm_max_image_pixels: u64,
+
+    /// Longest audio clip accepted, in seconds (also capped by the model's processor).
+    #[arg(long = "mm-max-audio-seconds", env = "PLOW_MM_MAX_AUDIO_SECONDS", default_value_t = 30, global = true)]
+    pub mm_max_audio_seconds: u64,
 
     /// How long a finished `X-Session-Id` request's KV (and an ASR session's audio and encoder
     /// windows) stays retained for the session's next request, in ms. 0 disables retention.

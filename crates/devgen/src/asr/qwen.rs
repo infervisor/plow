@@ -1260,6 +1260,16 @@ pub fn whisper_frontend(checkpoint: &std::path::Path) -> Result<WhisperFrontend,
 
 pub const ENCODER_PACKET: &str = "encoder.pkt";
 
+/// Qwen3-ASR's host policy: a stream's last piece gets 1 s of -50 dBFS noise so the model hears
+/// it end; one transcript position per audio row (about 13 a second, where speech rarely needs
+/// 6 tokens a second) plus 64.
+pub const AUDIO_LM_POLICY: plow_asset::speech_contract::AudioLmPolicy = plow_asset::speech_contract::AudioLmPolicy {
+    final_padding_samples: 16_000,
+    final_padding_amplitude: 100.0 / 32768.0,
+    output_reserve_per_row: 1,
+    output_reserve_extra: 64,
+};
+
 /// Host contract of the Qwen3-ASR decoder for the generic audio-LM driver: prompt layout,
 /// audio marker, output markers, languages and stop ids, as packet strings and parameters.
 pub fn audio_lm_contract(
@@ -1309,6 +1319,7 @@ pub fn audio_lm_contract(
     for (i, id) in stops.iter().enumerate() {
         parameters.insert(format!("stop.{i}"), *id);
     }
+    AUDIO_LM_POLICY.to_parameters(&mut parameters);
     let strings = BTreeMap::from([
         (
             "prompt.messages".into(),

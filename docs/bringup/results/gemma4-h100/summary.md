@@ -18,6 +18,9 @@ rows marked "grid" come from `llm_grid.sh` or earlier same-client grids and are 
   Mechanisms: [gemma4-e4b-h100.md](../../../runtime/gemma4-e4b-h100.md).
 - Latest reproduction: main `fc0271e8`, packet `62408e49`, 2026-10-03, one H100 SXM, 2 repeats.
   Gate `llm_logit_parity` PASS: top1 0.9897, KL mean 7.4e-4, KL max 0.014 (gate top1 >= 0.98).
+- 2026-10-09 per-rung routes (fd0fe175): cuBLASLt decode from 2 rows and generated prefill
+  attention on the 1024+ rungs; gate top1 0.9819; voice bench c1 TTFT 21 -> 14.6 ms, c32 out
+  tok/s +32%: [native-kernels-20261009.md](native-kernels-20261009.md) (grid only).
 - Baseline: vLLM 0.28, same client, `llm_grid.sh` ISL 128 / OSL 512, greedy, per-cell seeds.
   No strict `campaign.py report` exists for E4B.
 

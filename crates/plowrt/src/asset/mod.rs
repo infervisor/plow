@@ -13,7 +13,7 @@ use std::sync::Arc;
 use plow_asset::Manifest;
 pub use plow_asset::Phase;
 
-use crate::text::tokenizer::{load_tokenizer, Tokenize};
+use crate::text::tokenizer::{load_tokenizer_with, Tokenize};
 use crate::{Result, RuntimeError};
 
 mod bucket;
@@ -83,8 +83,9 @@ impl ModelBundle {
 
         // Load the model's tokenizer from `tokenizer.json` (byte fallback if
         // absent / feature off). Loaded once at startup, shared per request.
-        let tokenizer = load_tokenizer(&dir);
-        let serve = Arc::new(serve::resolve(&dir, &serve::checkpoint_dir(&dir))?);
+        let checkpoint = serve::checkpoint_dir(&dir);
+        let tokenizer = load_tokenizer_with(&dir, &checkpoint);
+        let serve = Arc::new(serve::resolve(&dir, &checkpoint)?);
         let chat_template = if serve.from_packet {
             serve.manifest.chat.as_ref().and_then(|c| {
                 let text = c.template.clone()?;
@@ -97,6 +98,7 @@ impl ModelBundle {
             })
         } else {
             crate::serve::template::ChatTemplate::load(&dir)
+                .or_else(|| crate::serve::template::ChatTemplate::load(&checkpoint))
         };
         let serving = crate::serve::config::ServingConfig::from_defaults(serve.manifest.sampling.as_ref());
         tracing::info!(

@@ -43,6 +43,33 @@ fn cublaslt_candidates() -> Vec<std::path::PathBuf> {
     paths
 }
 
+/// The cuBLASLt this process binds (the first loadable [`cublaslt_candidates`] entry, as
+/// [`Api::load`] picks it) and its `cublasLtGetVersion` (13.4.2 = 130402).
+pub fn library() -> std::result::Result<(std::path::PathBuf, usize), String> {
+    static LIB: std::sync::OnceLock<std::result::Result<(std::path::PathBuf, usize), String>> =
+        std::sync::OnceLock::new();
+    LIB.get_or_init(|| {
+        let mut last = String::from("no candidate");
+        for path in cublaslt_candidates() {
+            // SAFETY: optional NVIDIA host library; only its version query is called.
+            let lib = match unsafe { libloading::Library::new(&path) } {
+                Ok(lib) => lib,
+                Err(e) => {
+                    last = e.to_string();
+                    continue;
+                }
+            };
+            // SAFETY: `size_t cublasLtGetVersion(void)`, every cuBLASLt release.
+            let version = unsafe { lib.get::<unsafe extern "C" fn() -> usize>(b"cublasLtGetVersion\0") }
+                .map(|f| unsafe { f() })
+                .map_err(|e| format!("{}: cublasLtGetVersion: {e}", path.display()))?;
+            return Ok((path, version));
+        }
+        Err(format!("no loadable cuBLASLt ({last})"))
+    })
+    .clone()
+}
+
 macro_rules! api {
     ($($name:ident: fn($($arg:ty),*) -> Status),+ ;
      optional $($oname:ident: fn($($oarg:ty),*) -> Status),+ $(,)?) => {

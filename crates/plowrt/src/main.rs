@@ -99,7 +99,8 @@ enum Cmd {
     #[command(group(clap::ArgGroup::new("model_source").required(true).multiple(true)
         .args(["assets", "model", "asr_packets"])))]
     Serve {
-        /// One or more compiled-model directories.
+        /// One or more compiled-model directories, each `DIR[,checkpoint=PATH]`: the HF
+        /// checkpoint defaults to `DIR/checkpoint`, then `PLOW_CHECKPOINT`.
         #[arg(long = "assets")]
         assets: Vec<PathBuf>,
         /// One or more model references, resolved from the LOCAL store.
@@ -733,7 +734,14 @@ fn apply_asset_env_defaults() -> Vec<(String, String, String)> {
     let Cmd::Serve { assets, .. } = &cli.cmd else {
         return Vec::new();
     };
-    match plowrt::asset::serve::asset_env_defaults(assets, |k| {
+    let assets = match assets.iter().map(|a| plowrt::asset::serve::take_asset_arg(a)).collect::<Result<Vec<_>, _>>() {
+        Ok(assets) => assets,
+        Err(e) => {
+            eprintln!("plowrt serve: {e}");
+            std::process::exit(2);
+        }
+    };
+    match plowrt::asset::serve::asset_env_defaults(&assets, |k| {
         std::env::var(k).ok().filter(|v| !v.is_empty())
     }) {
         Ok(defaults) => {
@@ -846,10 +854,14 @@ async fn async_main(asset_defaults: Vec<(String, String, String)>) -> Result<(),
             slo_ms,
             max_queued_requests,
         } => {
-            let mut assets = assets;
+            let mut assets = assets
+                .iter()
+                .map(|a| plowrt::asset::serve::take_asset_arg(a))
+                .collect::<Result<Vec<_>, _>>()?;
             for m in &model {
                 assets.push(dist_cmd::resolve_local(m)?);
             }
+            plowrt::asset::serve::log_checkpoints(&assets);
             tracing::info!(
                 assets = ?assets,
                 port,
@@ -3343,6 +3355,14 @@ async fn bringup_runtime(
         use plowrt::memory::vmm::VmmOps as _;
         use plowrt::serve::placement::{self, ModelSpec, Place};
 
+        let lt = device::cuda::cublaslt_library();
+        match &lt {
+            Ok((path, version)) => tracing::info!(path = %path.display(), version, "cuBLASLt"),
+            Err(e) => tracing::warn!(%e, "cuBLASLt not loadable"),
+        }
+        for dir in &assets {
+            plowrt::asset::serve::check_runtime(dir, &plowrt::asset::serve::runtime_requires(dir)?, &lt)?;
+        }
         plowrt::asr::vad::configured()?;
         // Packet ASR models load first, on device 0: the planner then sees the memory they took.
         let packets = &RuntimeConfig::get().asr_packets;
@@ -3370,11 +3390,7 @@ async fn bringup_runtime(
             if plowrt::asset::devblob::DevBlob::find_in_dir(&bundle.dir)?.is_none() {
                 continue;
             }
-            let ckpt = RuntimeConfig::get()
-                .checkpoint
-                .clone()
-                .map(PathBuf::from)
-                .unwrap_or_else(|| bundle.dir.join("checkpoint"));
+            let ckpt = plowrt::asset::serve::checkpoint_dir(&bundle.dir);
             managed_slugs.insert(slug.clone());
             models.push((slug, bundle.dir.clone(), ckpt));
         }
@@ -3710,11 +3726,7 @@ async fn bringup_runtime(
                 .clone()
                 .map(PathBuf::from)
                 .unwrap_or_else(|| bundle.dir.join("hsaco"));
-            let ckpt = RuntimeConfig::get()
-                .checkpoint
-                .clone()
-                .map(PathBuf::from)
-                .unwrap_or_else(|| bundle.dir.join("checkpoint"));
+            let ckpt = plowrt::asset::serve::checkpoint_dir(&bundle.dir);
             tracing::info!(
                 %slug, blob = %blob.display(), hsaco = %hsaco.display(),
                 checkpoint = %ckpt.display(), "loading AMD engine"
@@ -3748,11 +3760,7 @@ async fn bringup_runtime(
                 )
                 .into());
             }
-            let ckpt = RuntimeConfig::get()
-                .checkpoint
-                .clone()
-                .map(PathBuf::from)
-                .unwrap_or_else(|| bundle.dir.join("checkpoint"));
+            let ckpt = plowrt::asset::serve::checkpoint_dir(&bundle.dir);
             let eng = plowrt::serve::portable::load_engine(&blob, &ckpt)?;
             portable.register(slug.clone(), ckpt);
             state.install_gpu_engine(slug, plowrt::serve::engine::ServeEngine::Cpu(eng));

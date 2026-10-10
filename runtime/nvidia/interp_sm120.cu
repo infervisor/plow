@@ -1967,7 +1967,12 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
     /* ---- pointwise ---- */
     case PLOW_DOP_EMBED:
         d_embed((__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1), (const int*)TEN(2),
-                in->i[0], in->i[1], in->fj[0].f, slice, nblk);
+                in->i[0], in->i[1], in->fj[0].f, slice, nblk, in->i[2]);
+        break;
+
+    case PLOW_DOP_MM_ROWS_BF16:
+        d_mm_rows((__nv_bfloat16*)TEN(0), (const unsigned*)TEN(1), (const unsigned*)TEN(2),
+                  (const __nv_bfloat16*)TEN(3), in->i[0], in->i[1], in->i[2], in->i[3], slice, nblk);
         break;
 
     case PLOW_DOP_EMBED_OVERLAY_BF16:
@@ -2003,6 +2008,9 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
     case PLOW_DOP_RAND_F32:
     case PLOW_DOP_ATTENTION_F32:
     case PLOW_DOP_ROW_STATS_F32:
+    case PLOW_DOP_RMSNORM_F32:
+    case PLOW_DOP_ROPE_AXIAL_F32:
+    case PLOW_DOP_CHUNK_ATTENTION_F32:
 #if defined(PLOW_NV_HOPPER)
         if (sp_wg_conv1d(in, T, slice, nblk)) break;
 #endif

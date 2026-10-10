@@ -5,11 +5,12 @@
 #
 #   deploy/plow-voice.sh hostcheck [config]          GPU, driver, glibc, disk, port, python
 #   deploy/plow-voice.sh preflight [--full]          kit pairing hashes (--full: every file in SHA256SUMS)
+#   deploy/plow-voice.sh adopt DIR...                hard-link missing kit files from older kits by sha256
 #   sudo deploy/plow-voice.sh install [options]      copy the kit, write the config, install + start the unit
 #        --prefix DIR   install root (default /opt/plow-voice; the kit goes to DIR/<kit name>, DIR/current links it)
 #        --config FILE  config path (default /etc/plow-voice/plow-voice.conf; kept if it exists)
 #        --user NAME    service user (default plow-voice, created as a system user if missing)
-#        --no-systemd   copy + config only; start it with `plow-voice.sh run`
+#        --no-systemd   copy + config only (no root needed); start it with `plow-voice.sh run`
 #        --no-start     install the unit but do not start it
 #   deploy/plow-voice.sh run [config]                foreground server (the unit's ExecStart)
 #   deploy/plow-voice.sh print-cmd [config]          the plowrt command `run` would exec
@@ -51,11 +52,11 @@ load_config() {
     CFG_PROFILE=voice-core CFG_BIND=127.0.0.1 CFG_PORT=8000 CFG_API_KEYS= CFG_MODELS= CFG_LIVE_CTX= \
         CFG_EXTRA_ARGS= CFG_LOG_LEVEL=info CFG_LOG_FILE= CFG_DRAIN_TIMEOUT_MS=30000 \
         CFG_ASR_REQUEST_TIMEOUT_MS=120000 CFG_SESSION_TTL_MS=60000 CFG_HTTP_MAX_CONNECTIONS=4096 \
-        CFG_CUDA_VISIBLE_DEVICES= CFG_LIBCUDA=
+        CFG_CUDA_VISIBLE_DEVICES= CFG_LIBCUDA= CFG_CHECKPOINTS=
     load_kv "$cfg" CFG_
     local prof=$KIT/deploy/profiles/$CFG_PROFILE.profile
     [ -r "$prof" ] || die "profile '$CFG_PROFILE' not found ($(ls "$KIT/deploy/profiles" | sed 's/\.profile$//' | tr '\n' ' '))"
-    PROF_MODELS= PROF_LIVE_CTX= PROF_ENV= PROF_ARGS=
+    PROF_MODELS= PROF_LIVE_CTX= PROF_ENV= PROF_ARGS= PROF_CHECKPOINTS=
     load_kv "$prof" PROF_
     MODELS=${CFG_MODELS:-$PROF_MODELS}
     LIVE_CTX=${CFG_LIVE_CTX:-$PROF_LIVE_CTX}
@@ -69,9 +70,25 @@ model_dir() {
     die "model '$m' is not in this kit ($(ls "$KIT/models" | tr '\n' ' '))"
 }
 
+# The HF checkpoint a model serves against: CHECKPOINTS=model=dir,... from the config, then the
+# profile, then deploy/checkpoints.map (`<model> <dir>`, written by make_kit); relative dirs are
+# kit-relative. Empty: the bundle's own checkpoint/ (or none, for packet-only models).
+checkpoint_for() {
+    local m=$1 spec kv dir=
+    for spec in "${CFG_CHECKPOINTS:-}" "${PROF_CHECKPOINTS:-}"; do
+        IFS=, read -ra kv <<<"$spec"
+        for spec in "${kv[@]}"; do [ "${spec%%=*}" = "$m" ] && { dir=${spec#*=}; break 2; }; done
+    done
+    [ -n "$dir" ] || [ ! -r "$KIT/deploy/checkpoints.map" ] || dir=$(awk -v m="$m" '$1==m{print $2; exit}' "$KIT/deploy/checkpoints.map")
+    [ -z "$dir" ] && return 0
+    [[ $dir == /* ]] || dir=$KIT/$dir
+    [ -d "$dir" ] || die "model '$m': checkpoint $dir does not exist"
+    echo "$dir"
+}
+
 build_cmd() {
     CMD=("$KIT/plowrt/plowrt" serve)
-    local m d
+    local m d ck
     for m in $MODELS; do
         d=$(model_dir "$m")
         if [ -f "$d/nemotron.pkt" ]; then
@@ -79,7 +96,8 @@ build_cmd() {
         elif [ -f "$d/silero_vad.pkt" ]; then
             CMD+=(--asr-vad-packet "$d/silero_vad.pkt")
         else
-            CMD+=(--assets "$d")
+            ck=$(checkpoint_for "$m") || exit 2
+            CMD+=(--assets "$d${ck:+,checkpoint=$ck}")
         fi
     done
     CMD+=(--bind "$CFG_BIND" --port "$CFG_PORT" --session-ttl-ms "$CFG_SESSION_TTL_MS"
@@ -157,7 +175,9 @@ cmd_hostcheck() {
     else
         local q; q=$(nvidia-smi --query-gpu=index,name,memory.total,driver_version --format=csv,noheader,nounits 2>/dev/null) || q=
         [ -n "$q" ] || fail "nvidia-smi cannot query a GPU"
-        local idx name mem drv h100=0
+        local idx name mem drv h100=0 min_drv
+        min_drv=$(sed -n 's/.*"min_driver": *"\([0-9.]*\)".*/\1/p' "$KIT/plowrt/BUILD.json" 2>/dev/null | head -1)
+        min_drv=${min_drv:-580}
         while IFS=, read -r idx name mem drv; do
             name=$(echo "$name" | xargs); mem=$(echo "$mem" | xargs); drv=$(echo "$drv" | xargs)
             if [[ $name == *H100* ]] && [ "${mem:-0}" -ge 79000 ]; then
@@ -165,9 +185,8 @@ cmd_hostcheck() {
             else
                 warn "GPU $idx: $name, $mem MiB (the bundles target H100 80GB, sm_90a, 132 SMs)"
             fi
-            if vercmp_ge "$drv" 575; then ok "driver $drv (tested 595.91.07)"
-            elif vercmp_ge "$drv" 525.60; then warn "driver $drv: CUDA 12 minor-version compatibility only; tested 595.91.07, recommended >= 575"
-            else fail "driver $drv < 525.60 (CUDA 12.x needs >= 525.60)"; fi
+            if vercmp_ge "$drv" "$min_drv"; then ok "driver $drv (>= $min_drv; tested 595.91.07)"
+            else fail "driver $drv < $min_drv (the cuBLAS in plowrt/ needs a CUDA 13 driver)"; fi
         done <<<"$q"
         [ $h100 = 1 ] || fail "no H100 80GB visible"
         local used; used=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits | head -1 | xargs)
@@ -202,17 +221,18 @@ cmd_preflight() {
     echo "preflight (kit $KIT)"
     [ -f "$KIT/PAIRING.txt" ] || fail "PAIRING.txt missing"
     local want got
-    want=$(awk '$2=="plowrt"{print $1}' "$KIT/plowrt/plowrt.sha256")
-    got=$(sha_of "$KIT/plowrt/plowrt")
-    [ "$want" = "$got" ] && ok "plowrt ${got:0:12}" || fail "plowrt sha256 $got != plowrt.sha256 $want"
-    want=$(awk '$2=="libcublasLt.so.12"{print $1}' "$KIT/plowrt/plowrt.sha256")
-    got=$(sha_of "$KIT/plowrt/libcublasLt.so.12")
-    [ "$want" = "$got" ] && ok "libcublasLt.so.12 ${got:0:12}" || fail "libcublasLt.so.12 sha256 mismatch"
-    want=$(awk '$2=="plow_verify"{print $1}' "$KIT/plowrt/plowrt.sha256")
-    if [ -n "$want" ]; then
-        got=$(sha_of "$KIT/plowrt/plow_verify")
-        [ "$want" = "$got" ] && ok "plow_verify ${got:0:12}" || fail "plow_verify sha256 mismatch"
-    fi
+    # The one runtime: plowrt and every library beside it, by sha256 (plowrt.sha256).
+    local want got name
+    while read -r want name; do
+        [ -n "$want" ] || continue
+        if [ ! -f "$KIT/plowrt/$name" ]; then fail "plowrt/$name missing"; continue; fi
+        got=$(sha_of "$KIT/plowrt/$name")
+        [ "$want" = "$got" ] && ok "$name ${got:0:12}" || fail "$name sha256 $got != plowrt.sha256 $want"
+    done < "$KIT/plowrt/plowrt.sha256"
+    for name in "$KIT"/plowrt/*.so*; do
+        [ -e "$name" ] || continue
+        grep -q " $(basename "$name")\$" "$KIT/plowrt/plowrt.sha256" || fail "plowrt/$(basename "$name") is not part of this runtime (plowrt.sha256)"
+    done
     # Pairing: every packet qualified with this plowrt (PAIRING.txt), by sha256.
     local m f sha
     want=$(sed -n 's/^# .*qualified with plowrt \([0-9a-f]*\).*/\1/p' "$KIT/PAIRING.txt" 2>/dev/null)
@@ -234,6 +254,34 @@ cmd_preflight() {
     [ $FAILS = 0 ]
 }
 
+# ---------------------------------------------------------------- adopt
+# Fill this kit's missing files (models/, hf/) by hard-linking files with the same sha256 out of
+# other installed kits or bundles that carry a SHA256SUMS (e.g. /opt/plow-voice/kit3 and
+# /opt/plow-voice/llm26): a kit update ships only what changed. Run `preflight --full` after.
+cmd_adopt() {
+    [ $# -ge 1 ] || die "adopt: name at least one directory with a SHA256SUMS"
+    declare -A have
+    local src sha path from n=0 miss=0
+    for src in "$@"; do
+        [ -r "$src/SHA256SUMS" ] || die "adopt: $src/SHA256SUMS not readable"
+        src=$(cd "$src" && pwd)
+        while read -r sha path; do
+            [ -n "$sha" ] && [ -z "${have[$sha]:-}" ] && have[$sha]=$src/${path#./}
+        done < "$src/SHA256SUMS"
+    done
+    while read -r sha path; do
+        path=${path#./}
+        [ -e "$KIT/$path" ] && continue
+        from=${have[$sha]:-}
+        if [ -z "$from" ] || [ ! -f "$from" ]; then note "no source for $path"; miss=$((miss + 1)); continue; fi
+        mkdir -p "$(dirname "$KIT/$path")"
+        ln "$from" "$KIT/$path" || die "adopt: cannot hard-link $from into $KIT (same filesystem needed)"
+        n=$((n + 1))
+    done < "$KIT/SHA256SUMS"
+    note "adopted $n files by hard link; $miss without a source"
+    [ $miss = 0 ] || die "adopt: $miss files missing; copy them in, then run preflight --full"
+}
+
 # ---------------------------------------------------------------- install
 cmd_install() {
     local prefix=/opt/plow-voice config=$DEFAULT_CONFIG user=plow-voice systemd=1 start=1
@@ -247,12 +295,13 @@ cmd_install() {
             *) die "install: unknown option $1" ;;
         esac
     done
-    [ "$(id -u)" = 0 ] || die "install needs root (sudo)"
+    local root=0; [ "$(id -u)" = 0 ] && root=1
+    [ $root = 1 ] || [ $systemd = 0 ] || die "install needs root (sudo); --no-systemd installs unprivileged into a writable --prefix"
     ( cmd_hostcheck ) || die "host check failed; not installing"
     ( cmd_preflight ) || die "preflight failed; not installing"
     local name; name=$(basename "$KIT")
     local dest=$prefix/$name
-    id "$user" >/dev/null 2>&1 || useradd --system --no-create-home --home-dir "$prefix" --shell /usr/sbin/nologin "$user"
+    [ $root = 0 ] || id "$user" >/dev/null 2>&1 || useradd --system --no-create-home --home-dir "$prefix" --shell /usr/sbin/nologin "$user"
     if [ $systemd = 1 ] && systemctl is-active --quiet plow-voice.service; then
         note "stopping plow-voice.service (graceful drain)"
         systemctl stop plow-voice.service
@@ -268,9 +317,12 @@ cmd_install() {
         chmod -R a-w "$dest"
     fi
     ln -sfn "$dest" "$prefix/current"
-    mkdir -p "$(dirname "$config")" /var/log/plow-voice
-    chown "$user": /var/log/plow-voice
-    if [ ! -f "$config" ]; then
+    mkdir -p "$(dirname "$config")"
+    [ $root = 0 ] || { mkdir -p /var/log/plow-voice; chown "$user": /var/log/plow-voice; }
+    if [ ! -f "$config" ] && [ $root = 0 ]; then
+        install -m 600 "$dest/deploy/plow-voice.conf.sample" "$config"
+        note "wrote $config"
+    elif [ ! -f "$config" ]; then
         install -m 640 -o root -g "$(id -gn "$user")" "$dest/deploy/plow-voice.conf.sample" "$config"
         note "wrote $config (edit PROFILE, BIND, PORT, API_KEYS; then systemctl restart plow-voice)"
     else
@@ -295,10 +347,11 @@ cmd_install() {
 case ${1:-} in
     hostcheck) shift; cmd_hostcheck "$@" ;;
     preflight) shift; cmd_preflight "$@" ;;
+    adopt) shift; cmd_adopt "$@" ;;
     install) shift; cmd_install "$@" ;;
     run) shift; cmd_run "$@" ;;
     print-cmd) shift; cmd_print "$@" ;;
     wait-ready) shift; cmd_wait_ready "$@" ;;
-    -h|--help|help|"") sed -n '2,21p' "$0" | sed 's/^# \{0,1\}//' ;;
+    -h|--help|help|"") sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//' ;;
     *) die "unknown command $1 (try --help)" ;;
 esac

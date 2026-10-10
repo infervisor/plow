@@ -85,6 +85,7 @@ pub mod manifest;
 pub mod modular;
 mod mxfp4_moe_role;
 pub mod pipeline;
+pub mod mm;
 mod projection_rewrite;
 mod rewrite_lower;
 pub mod rnnt;
@@ -1839,6 +1840,9 @@ struct Tn {
     ids: u32,
     encoder_overlay: u32,
     encoder_overlay_index: u32,
+    // Multimodal soft-token rows: `(id, slab row)` table and the bf16 slab (TENSOR_NONE: off).
+    mm_table: u32,
+    mm_slab: u32,
     // Chatterbox T3 decode: per-slot speech start and the learned speech-position table.
     pos_base: u32,
     speech_pos: u32,
@@ -2177,6 +2181,16 @@ fn declare(
         },
         encoder_overlay_index: if c.encoder_overlay_rows > 0 {
             b.tensor("in.encoder_overlay_index", ctx as u64 * I32)
+        } else {
+            TENSOR_NONE
+        },
+        mm_table: if c.mm_slab_rows > 0 {
+            b.tensor(plow_asset::multimodal::TABLE_TENSOR, u64::from(mm_table_capacity(c)) * 8)
+        } else {
+            TENSOR_NONE
+        },
+        mm_slab: if c.mm_slab_rows > 0 {
+            b.tensor(plow_asset::multimodal::SLAB_TENSOR, u64::from(c.mm_slab_rows) * u64::from(c.hidden) * BF16)
         } else {
             TENSOR_NONE
         },
@@ -4204,9 +4218,18 @@ fn emit_phase(
             d.t[2] = n.ids;
             d.i[0] = t;
             d.i[1] = c.hidden;
+            d.i[2] = c.mm_pad;
             d.f[0] = escale;
         })
     };
+    // Multimodal soft-token rows replace their embedded rows before anything reads `x` (the
+    // E-series per-layer projection reads the merged rows; its token part embeds them as pad).
+    if !decode && !block_mode && c.mm_slab_rows > 0 {
+        dep = b.emit(DevOp::MmRowsBf16, rows.clone(), &[dep], |d| {
+            d.t[..4].copy_from_slice(&[n.x, n.ids, n.mm_table, n.mm_slab]);
+            d.i[..4].copy_from_slice(&[t, c.hidden, mm_table_capacity(c), c.mm_slab_rows]);
+        });
+    }
     // Gemma-4 E-series PER-LAYER INPUTS (dev_isa.h op 155), once per token for all layers:
     // ple_raw = embed_per_layer[ids] * sqrt(P); ple_pp = x . Wproj^T (the 1/sqrt(H) is dropped:
     // the RMSNorm that follows is scale-invariant); ple = (RMSNorm_P(ple_pp) * gamma + ple_raw) / sqrt(2).
@@ -4225,6 +4248,7 @@ fn emit_phase(
             d.t[2] = n.ids;
             d.i[0] = t;
             d.i[1] = lp;
+            d.i[2] = c.mm_pad;
             // HF casts the scale to the weight dtype (bf16) before multiplying.
             d.f[0] = crate::config::bf16_round((c.ple as f32).sqrt());
         });
@@ -7775,6 +7799,15 @@ impl EmitArgs {
     }
 }
 
+fn ecfg_multimodal() -> bool {
+    emit_config::active().multimodal
+}
+
+/// `in.mm_table` entries for `c.mm_slab_rows` slab rows (load factor at most 1/2).
+fn mm_table_capacity(c: &Cfg) -> u32 {
+    (2 * c.mm_slab_rows).next_power_of_two()
+}
+
 /// Uniform surface for lowering a checkpoint into a PLOWDEV program set, per model
 /// family. Phase 0: only the dense-GQA family
 /// implements it, and only the `emit_phase` call sites are routed through it —
@@ -9663,6 +9696,20 @@ fn emit_dense_gqa(
     }
     assert!(tp >= 1, "--tp must be >= 1");
     c.tp = tp;
+    let mm_towers = (ecfg_multimodal() && block_spec.is_none()).then(|| {
+        let towers = mm::Towers::from_checkpoint(&dir).unwrap_or_else(|e| panic!("multimodal: {e}"));
+        for why in &towers.skipped {
+            eprintln!("  multimodal: skipping {why}");
+        }
+        assert!(!towers.is_empty(), "PLOW_EMIT_MULTIMODAL=1: no tower to emit (skipped: {:?})", towers.skipped);
+        assert!(tp == 1, "PLOW_EMIT_MULTIMODAL=1 is single-GPU");
+        c.mm_slab_rows = emit_config::active().mm_slab_rows.unwrap_or(mm::DEFAULT_SLAB_ROWS).max(1);
+        let contract = towers.contract(c.mm_slab_rows).unwrap_or_else(|e| panic!("multimodal: {e}"));
+        assert_eq!(contract.hidden, c.hidden, "multimodal contract width");
+        assert_eq!(contract.table_capacity, mm_table_capacity(&c));
+        c.mm_pad = contract.pad_token;
+        (towers, contract)
+    });
     // Resolve the block range now that layer count is known. `l` -> l..l+1;
     // `l..r` -> that half-open range. Absent => the full model (0..layers),
     // which makes every gated site below byte-identical to the pre-block path.
@@ -10667,6 +10714,9 @@ fn emit_dense_gqa(
                 .unwrap_or_else(|error| panic!("serve manifest: {error}")),
         );
     }
+    if let Some((_, contract)) = &mm_towers {
+        sections.push(mm::contract_section(contract).unwrap_or_else(|e| panic!("multimodal contract: {e}")));
+    }
     let lean = apply_verify_gate(&m, verify.as_ref());
     modular::update_section_with_lean(&mut sections, &lean);
     let blob = if sections.is_empty() {
@@ -10788,6 +10838,20 @@ fn emit_dense_gqa(
         speech_ops |= manifest::speech_ops(&model);
         write_sidecar_packet(&path, &model, &[section]);
         eprintln!("  s3gen packet -> {}", path.display());
+    }
+    if let Some((towers, _)) = &mm_towers {
+        let (images, frames) = mm::ladders();
+        let lowered = [
+            towers.vision.is_some().then(|| (mm::VISION_PACKET, towers.lower_vision(&dir, n_cu, m.target, &images))),
+            towers.audio.is_some().then(|| (mm::AUDIO_PACKET, towers.lower_audio(&dir, n_cu, m.target, &frames))),
+        ];
+        for (file, sidecar) in lowered.into_iter().flatten() {
+            let sidecar = sidecar.unwrap_or_else(|e| panic!("multimodal {file}: {e}"));
+            let path = std::path::Path::new(&out).with_file_name(file);
+            speech_ops |= manifest::speech_ops(&sidecar.model);
+            write_sidecar_packet(&path, &sidecar.model, &[sidecar.section]);
+            eprintln!("  multimodal encoder packet -> {}", path.display());
+        }
     }
     if let Some((model, section)) = audio_blob {
         let path = std::path::Path::new(&out).with_file_name(asr::qwen::ENCODER_PACKET);

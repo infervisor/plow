@@ -19,7 +19,7 @@ use tokio::sync::{mpsc, oneshot, watch, OwnedSemaphorePermit, Semaphore};
 
 use super::{
     endpoint::{EndpointConfig, Endpointer, Segment},
-    vad::{speech_samples, speech_segments, SegmentOptions},
+    vad::{speech_samples, speech_segments},
     frontend::{decode_wav, decode_wav_chunk, decode_wav_within, AudioError, Resampler, MAX_SAMPLES, SAMPLE_RATE},
     FinalizationPolicy, Transcriber, Transcript, TranscriptionInput,
 };
@@ -113,8 +113,61 @@ pub(crate) struct AsrOpts {
     pub ingress: Option<crate::serve::mux::OwnedIngress>,
 }
 
+/// The language to transcribe again in when `detected` is outside `allowed` (names as the model's
+/// packet reports them; empty = any language).
+fn auto_language_retry<'a>(detected: &str, allowed: &'a [String]) -> Option<&'a str> {
+    let first = allowed.first()?;
+    (!allowed.iter().any(|l| l.eq_ignore_ascii_case(detected))).then_some(first.as_str())
+}
+
 impl Route {
+    /// [`Self::submit_once`], then the transcript's output policy: spoken digits as numerals
+    /// (`--asr-numerals`) and, for a final pass that named no language, one retry in the first
+    /// `--asr-auto-languages` language when the model detected another.
     fn submit(
+        &self,
+        samples: Vec<f32>,
+        language: Option<String>,
+        context: String,
+        cancel: Arc<AtomicBool>,
+        opts: AsrOpts,
+    ) -> Result<oneshot::Receiver<crate::Result<Transcript>>, SubmitError> {
+        let config = crate::config::RuntimeConfig::get();
+        let allowed: Vec<String> = config.asr_auto_languages.iter().map(|l| l.trim().to_owned()).filter(|l| !l.is_empty()).collect();
+        let retry = (language.is_none() && opts.final_pass && !allowed.is_empty())
+            .then(|| (samples.clone(), context.clone(), cancel.clone()));
+        let numerals = config.asr_numerals;
+        let first = self.submit_once(samples, language, context, cancel, opts)?;
+        if retry.is_none() && !numerals {
+            return Ok(first);
+        }
+        let route = self.clone();
+        let (tx, rx) = oneshot::channel();
+        tokio::spawn(async move {
+            let Ok(mut result) = first.await else { return };
+            let detected = result.as_ref().ok().and_then(|t| t.language.clone());
+            if let (Some((samples, context, cancel)), Some(detected)) = (retry, detected) {
+                if let Some(retry) = auto_language_retry(&detected, &allowed) {
+                    tracing::debug!(%detected, %retry, "ASR language outside --asr-auto-languages");
+                    let opts = AsrOpts { final_pass: true, ..Default::default() };
+                    if let Ok(again) = route.submit_once(samples, Some(retry.to_owned()), context, cancel, opts) {
+                        if let Ok(again) = again.await {
+                            result = again;
+                        }
+                    }
+                }
+            }
+            if numerals {
+                if let Ok(transcript) = &mut result {
+                    transcript.text = crate::asr::numerals::spoken_digits_to_numerals(&transcript.text);
+                }
+            }
+            let _ = tx.send(result);
+        });
+        Ok(rx)
+    }
+
+    fn submit_once(
         &self,
         samples: Vec<f32>,
         language: Option<String>,
@@ -465,8 +518,9 @@ impl AsrServer {
         self
     }
 
-    /// A stream endpointer: Silero at `threshold` when a VAD packet is loaded, else energy.
-    fn endpointer(&self, config: EndpointConfig, threshold: f32) -> Endpointer {
+    /// A stream endpointer: the VAD packet at `threshold` (default: the packet's) when one is
+    /// loaded, else energy.
+    fn endpointer(&self, config: EndpointConfig, threshold: Option<f32>) -> Endpointer {
         match &self.vad {
             Some(vad) => Endpointer::with_vad(config, vad.clone(), threshold),
             None => Endpointer::new(config),
@@ -888,7 +942,8 @@ async fn transcribe_upload(state: Arc<AsrServer>, mut multipart: Multipart, ids:
             let samples = if recorded { decode_wav_chunk(&file) } else { decode_wav(&file) }?;
             let speech = vad.map(|vad| {
                 let probabilities = vad.probabilities(&samples);
-                speech_samples(&speech_segments(&probabilities, vad.frame, vad.sample_rate, samples.len(), GATE_SEGMENTS))
+                let (options, least) = vad.gate();
+                (speech_samples(&speech_segments(&probabilities, vad.frame, vad.sample_rate, samples.len(), options)), least)
             });
             Ok((samples, speech))
         })
@@ -900,9 +955,9 @@ async fn transcribe_upload(state: Arc<AsrServer>, mut multipart: Multipart, ids:
         },
     };
     drop(upload);
-    if speech.is_some_and(|speech| speech < GATE_MIN_SPEECH) {
+    if speech.is_some_and(|(speech, least)| speech < least) {
         // No speech: an audio-LM would transcribe the noise (or echo its prompt); nothing runs.
-        tracing::debug!(speech_ms = speech.unwrap_or(0) / 16, "upload has no speech");
+        tracing::debug!(speech_ms = speech.map_or(0, |(s, _)| s) / 16, "upload has no speech");
         return if stream {
             sse_events(vec![transcript_event("transcript.text.done", ids, json!({"text": "", "language": language, "final": true}))])
         } else if format == "text" {
@@ -1036,11 +1091,6 @@ async fn transcribe_upload(state: Arc<AsrServer>, mut multipart: Multipart, ids:
     response
 }
 
-/// Speech regions the upload gate counts: Silero's, with short speech kept and no padding.
-const GATE_SEGMENTS: SegmentOptions =
-    SegmentOptions { min_speech_ms: 150, min_silence_ms: 150, speech_pad_ms: 0, ..SegmentOptions::DEFAULT };
-/// An upload with less detected speech (250 ms) is answered with an empty transcript.
-const GATE_MIN_SPEECH: usize = SAMPLE_RATE as usize / 4;
 /// Longest audio `/v1/audio/vad` takes.
 const VAD_MAX_SAMPLES: usize = 10 * 60 * SAMPLE_RATE as usize;
 
@@ -1066,7 +1116,7 @@ async fn detect_speech(State(state): State<Arc<AsrServer>>, mut multipart: Multi
     let Ok(_upload) = state.uploads.clone().try_acquire_owned() else {
         return busy("too many ASR uploads");
     };
-    let (mut file, mut options) = (None, SegmentOptions::DEFAULT);
+    let (mut file, mut options, bound) = (None, vad.segment_options(), vad.max_override_ms() as f32);
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     loop {
         let field = match tokio::time::timeout_at(deadline, multipart.next_field()).await {
@@ -1093,9 +1143,9 @@ async fn detect_speech(State(state): State<Arc<AsrServer>>, mut multipart: Multi
         };
         match name.as_str() {
             "threshold" if number <= 1.0 => options.threshold = number,
-            "min_speech_duration_ms" => options.min_speech_ms = number as u32,
-            "min_silence_duration_ms" => options.min_silence_ms = number as u32,
-            "speech_pad_ms" => options.speech_pad_ms = number as u32,
+            "min_speech_duration_ms" if number <= bound => options.min_speech_ms = number as u32,
+            "min_silence_duration_ms" if number <= bound => options.min_silence_ms = number as u32,
+            "speech_pad_ms" if number <= bound => options.speech_pad_ms = number as u32,
             "max_speech_duration_s" if number > 0.0 => options.max_speech_s = number,
             _ => return failure(StatusCode::BAD_REQUEST, format!("unknown or invalid field {name:?}")),
         }
@@ -1725,7 +1775,7 @@ async fn continuous(
     let session = ids.session.clone().unwrap_or_default();
     let rate = start.sample_rate as usize;
     let mut resampler = Resampler::new(start.sample_rate).expect("a listed stream rate");
-    let mut endpointer = state.endpointer(EndpointConfig { min_silence_ms, max_segment_ms }, 0.5);
+    let mut endpointer = state.endpointer(EndpointConfig { min_silence_ms, max_segment_ms }, None);
     if !send(&mut socket, json!({"type":"ready","version":1,"session_id":&*session,"request_id":&*ids.request,
         "sample_rate":start.sample_rate,"format":"pcm_s16le","max_chunk_bytes":32000,"credit_samples":rate,
         "max_audio_samples":null,"partial_mode":if start.partials {"revision"} else {"final_only"},
@@ -2368,6 +2418,51 @@ mod tests {
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
+    /// Detects Hindi unless told the language; reads out a phone number.
+    struct Codeswitch(Arc<std::sync::atomic::AtomicUsize>);
+    impl Transcriber for Codeswitch {
+        fn language(&self, language: Option<&str>) -> crate::Result<Option<String>> {
+            Ok(language.map(str::to_owned))
+        }
+        fn transcribe(&mut self, _: &[f32], language: Option<&str>, _: &str, _: &AtomicBool) -> crate::Result<Transcript> {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            Ok(match language {
+                None => Transcript { text: "मेरा नंबर".into(), language: Some("Hindi".into()) },
+                Some(l) => Transcript { text: "My number is nine one eight seven three four one five three eight.".into(), language: Some(l.into()) },
+            })
+        }
+    }
+
+    #[test]
+    fn outside_auto_languages_retries_in_the_first() {
+        let allowed = ["English".to_owned(), "Spanish".to_owned()];
+        assert_eq!(auto_language_retry("Hindi", &allowed), Some("English"));
+        assert_eq!(auto_language_retry("spanish", &allowed), None);
+        assert_eq!(auto_language_retry("Hindi", &[]), None);
+    }
+
+    #[tokio::test]
+    async fn default_accepts_any_language_and_writes_numerals() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let app = AsrServer::new("test".into(), Codeswitch(calls.clone())).router(false);
+        let body = |r: Response| async { r.into_body().collect().await.unwrap().to_bytes() };
+        let response = app.clone().oneshot(upload("/v1/audio/transcriptions", &[("model", "test")], &[0.1; 16_000])).await.unwrap();
+        assert_eq!(&body(response).await[..], r#"{"text":"मेरा नंबर"}"#.as_bytes());
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        let response = app.clone().oneshot(upload("/v1/audio/transcriptions", &[("model", "test"), ("language", "English")], &[0.1; 16_000])).await.unwrap();
+        assert_eq!(&body(response).await[..], br#"{"text":"My number is 918-734-1538."}"#);
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
+    async fn clips_under_half_a_second_are_padded_not_refused() {
+        let app = AsrServer::new("test".into(), Fake).router(false);
+        let response = app.clone().oneshot(upload("/v1/audio/transcriptions", &[("model", "test")], &[0.0; 1_600])).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = app.oneshot(upload("/v1/audio/transcriptions", &[("model", "test")], &[])).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
     #[tokio::test]
     async fn vad_route_is_absent_without_a_packet() {
         let app = AsrServer::new("test".into(), Fake).router(false);
@@ -2419,7 +2514,7 @@ mod tests {
         );
         for (rate, samples, status) in [
             (7000, 7000, StatusCode::UNSUPPORTED_MEDIA_TYPE),
-            (16000, 7999, StatusCode::BAD_REQUEST),
+            (16000, 7999, StatusCode::OK),
             (16000, 480001, StatusCode::PAYLOAD_TOO_LARGE),
         ] {
             assert_eq!(

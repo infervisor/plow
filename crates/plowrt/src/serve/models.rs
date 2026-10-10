@@ -21,8 +21,22 @@ use crate::serve::AppState;
 /// and how a router discovers the relationship.
 fn card(state: &AppState, id: String, canonical: &str) -> ModelCard {
     let is_alias = id != canonical;
+    let x_plow_endpoints = endpoints(state, canonical);
+    let x_plow_modalities = if x_plow_endpoints.contains(&"chat/completions") {
+        let media = state
+            .registry
+            .get(canonical)
+            .ok()
+            .filter(|_| state.has_gpu_engine(canonical))
+            .and_then(|b| b.serve().multimodal.as_ref().map(|c| c.modalities.iter().map(|m| m.kind.clone()).collect::<Vec<_>>()))
+            .unwrap_or_default();
+        std::iter::once("text".to_string()).chain(media).collect()
+    } else {
+        Vec::new()
+    };
     ModelCard {
-        x_plow_endpoints: endpoints(state, canonical),
+        x_plow_endpoints,
+        x_plow_modalities,
         max_model_len: state.max_ctx(canonical),
         root: canonical.to_string(),
         parent: is_alias.then(|| canonical.to_string()),
@@ -76,6 +90,7 @@ pub(crate) fn unserved(model: &str, endpoint: &str, served: &[&str]) -> Response
 fn audio_card(state: &AppState, id: String) -> ModelCard {
     ModelCard {
         x_plow_endpoints: vec!["audio/transcriptions", "audio/transcriptions/stream"],
+        x_plow_modalities: Vec::new(),
         max_model_len: None,
         root: id.clone(),
         parent: None,

@@ -1,4 +1,4 @@
-//! Speech probabilities and step cost of a `vad.silero.v1` packet on the host executor
+//! Speech probabilities and step cost of a `vad.frame.v1` packet on the host executor
 //! (`plowrt::asr::vad`, what `--asr-vad-packet` serves).
 //!
 //!   asr_vad_check PACKET probs OUT.json AUDIO.f32...   one stream per raw 16 kHz f32le file;

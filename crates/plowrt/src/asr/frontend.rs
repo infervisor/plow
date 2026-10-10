@@ -8,8 +8,11 @@ use crate::{Result, RuntimeError};
 
 pub const SAMPLE_RATE: u32 = 16_000;
 pub const MEL_BINS: usize = 128;
+#[cfg(any(test, all(feature = "metal", target_os = "macos")))]
 const FFT: usize = 400;
+#[cfg(any(test, all(feature = "metal", target_os = "macos")))]
 const HOP: usize = 160;
+#[cfg(any(test, all(feature = "metal", target_os = "macos")))]
 const BINS: usize = FFT / 2 + 1;
 pub const MAX_SAMPLES: usize = 30 * SAMPLE_RATE as usize;
 
@@ -54,9 +57,12 @@ pub fn decode_wav_within(bytes: &[u8], max_samples: usize) -> std::result::Resul
         out.extend(resampler.finish());
         out
     };
-    if samples.len() < SAMPLE_RATE as usize / 2 {
-        return Err(AudioError::Invalid("audio must contain at least 0.5 seconds".into()));
+    if samples.is_empty() {
+        return Err(AudioError::Invalid("audio is empty".into()));
     }
+    // Shorter clips (a recording's tail) are padded with silence to the models' minimum.
+    let mut samples = samples;
+    samples.resize(samples.len().max(SAMPLE_RATE as usize / 2), 0.0);
     Ok(samples)
 }
 
@@ -203,14 +209,45 @@ impl Resampler {
     fn drain(&mut self, flush: bool) -> Vec<f32> {
         // Outputs n with n M / L < received; without flush, also all `half` right taps present.
         let total = (self.received * self.up).div_ceil(self.down);
-        let mut out = Vec::new();
+        let mut out = Vec::with_capacity(total.saturating_sub(self.produced) as usize);
+        let width = 2 * self.half;
+        // (center input index, tap phase) of output `n`.
+        let at = |n: u64| {
+            let pos = n * self.down;
+            (pos / self.up, (pos % self.up) as usize)
+        };
         while self.produced < total {
-            let pos = self.produced * self.down;
-            let (center, phase) = (pos / self.up, (pos % self.up) as usize);
+            // LANES outputs whose windows all lie inside the buffered input run together: each
+            // keeps its own accumulator and adds its taps in order, so every sum is the one the
+            // single-output loop forms, while the LANES dependency chains overlap.
+            const LANES: usize = 8;
+            let last = self.produced + LANES as u64 - 1;
+            if last < total {
+                let (c0, cl) = (at(self.produced).0, at(last).0);
+                let ready = flush || cl + (self.half as u64) < self.received;
+                if ready && c0 + 1 >= self.half as u64 + self.base && cl + 1 + self.half as u64 <= self.received {
+                    let mut acc = [0f32; LANES];
+                    let lanes: [(&[f32], &[f32]); LANES] = std::array::from_fn(|j| {
+                        let (center, phase) = at(self.produced + j as u64);
+                        let start = (center + 1 - self.half as u64 - self.base) as usize;
+                        (&self.taps[phase * width..][..width], &self.input[start..][..width])
+                    });
+                    for i in 0..width {
+                        for (a, (taps, x)) in acc.iter_mut().zip(&lanes) {
+                            // SAFETY: both slices were cut to exactly `width` elements above.
+                            *a += unsafe { taps.get_unchecked(i) * x.get_unchecked(i) };
+                        }
+                    }
+                    out.extend_from_slice(&acc);
+                    self.produced += LANES as u64;
+                    continue;
+                }
+            }
+            let (center, phase) = at(self.produced);
             if !flush && center + self.half as u64 >= self.received {
                 break;
             }
-            let taps = &self.taps[phase * 2 * self.half..(phase + 1) * 2 * self.half];
+            let taps = &self.taps[phase * width..(phase + 1) * width];
             let first = center as i64 - self.half as i64 + 1;
             let mut acc = 0f32;
             for (i, &w) in taps.iter().enumerate() {
@@ -378,6 +415,17 @@ impl PacketLogMelFrontend {
 
     pub fn sample_rate(&self) -> usize {
         self.sample_rate
+    }
+
+    /// Microseconds of audio per feature frame (the packet's hop).
+    pub fn frame_us(&self) -> u32 {
+        (self.inner.config.hop as u64 * 1_000_000 / self.sample_rate as u64) as u32
+    }
+
+    /// Frames past a frame its analysis window reaches (centred, `fft / 2` samples), plus two of
+    /// slack: earlier frames no longer change as audio arrives.
+    pub fn reach_frames(&self) -> usize {
+        (self.inner.config.fft / 2).div_ceil(self.inner.config.hop) + 2
     }
 
     pub fn extract(&self, samples: &[f32]) -> Result<LogMelFeatures> {
@@ -610,6 +658,9 @@ impl LogMelFrontend {
     }
 }
 
+/// Qwen3-ASR's Whisper log-mel, hand-written: the Metal reference path and the oracle the
+/// packet-driven [`LogMelFrontend`] is tested against. Serving uses the packet's frontend.
+#[cfg(any(test, all(feature = "metal", target_os = "macos")))]
 pub struct QwenFrontend {
     fft: Arc<dyn Fft<f32>>,
     window: [f32; FFT],
@@ -617,6 +668,7 @@ pub struct QwenFrontend {
     filter_ranges: [std::ops::Range<usize>; MEL_BINS],
 }
 
+#[cfg(any(test, all(feature = "metal", target_os = "macos")))]
 impl Default for QwenFrontend {
     fn default() -> Self {
         let hz_to_mel = |hz: f64| {
@@ -663,6 +715,7 @@ impl Default for QwenFrontend {
     }
 }
 
+#[cfg(any(test, all(feature = "metal", target_os = "macos")))]
 impl QwenFrontend {
     pub fn extract(&self, samples: &[f32]) -> Result<MelFeatures> {
         if samples.len() < SAMPLE_RATE as usize / 2
@@ -775,6 +828,65 @@ mod tests {
         }
         assert_eq!(resample(16_000, &input), input);
         assert!(Resampler::new(7_999).is_err() && Resampler::new(48_001).is_err());
+    }
+
+    /// The resampler's sums as first written: every tap bounds-checked, over the whole input.
+    fn resample_per_tap(rate: u32, input: &[f32]) -> Vec<f32> {
+        let r = Resampler::new(rate).unwrap();
+        let total = (input.len() as u64 * r.up).div_ceil(r.down);
+        (0..total)
+            .map(|n| {
+                let pos = n * r.down;
+                let (center, phase) = (pos / r.up, (pos % r.up) as usize);
+                let taps = &r.taps[phase * 2 * r.half..(phase + 1) * 2 * r.half];
+                let first = center as i64 - r.half as i64 + 1;
+                let mut acc = 0f32;
+                for (i, &w) in taps.iter().enumerate() {
+                    let index = first + i as i64;
+                    if index >= 0 && (index as usize) < input.len() {
+                        acc += w * input[index as usize];
+                    }
+                }
+                acc
+            })
+            .collect()
+    }
+
+    #[test]
+    fn resampler_matches_the_per_tap_reference() {
+        let input: Vec<f32> = (0..50_021u32).map(|i| ((i * 7919) % 2003) as f32 / 1001.0 - 1.0).collect();
+        for rate in [8_000, 11_025, 22_050, 24_000, 44_100, 48_000] {
+            let (got, want) = (resample(rate, &input), resample_per_tap(rate, &input));
+            assert!(got.len() == want.len() && got.iter().zip(&want).all(|(a, b)| a.to_bits() == b.to_bits()), "{rate}");
+        }
+    }
+
+    /// Host cost of the ASR request frontend (release, `--ignored --nocapture`).
+    #[test]
+    #[ignore]
+    fn frontend_microbench() {
+        let seconds = 5;
+        for rate in [24_000u32, 44_100, 48_000] {
+            let input: Vec<f32> = (0..rate * seconds).map(|i| ((i * 7919) % 2003) as f32 / 1001.0 - 1.0).collect();
+            let t = std::time::Instant::now();
+            for _ in 0..10 {
+                std::hint::black_box(resample(rate, &input));
+            }
+            let fast = t.elapsed().as_secs_f64() * 1e3 / 10.0;
+            let t = std::time::Instant::now();
+            for _ in 0..10 {
+                std::hint::black_box(resample_per_tap(rate, &input));
+            }
+            let per_tap = t.elapsed().as_secs_f64() * 1e3 / 10.0;
+            println!("FRONTEND resample {rate}->16k {seconds}s: {fast:.3} ms (per-tap bounds checks {per_tap:.3})");
+        }
+        let samples: Vec<f32> = (0..SAMPLE_RATE * seconds).map(|i| ((i * 17 % 101) as i32 - 50) as f32 / 500.0).collect();
+        let qwen = QwenFrontend::default();
+        let t = std::time::Instant::now();
+        for _ in 0..10 {
+            std::hint::black_box(qwen.extract(&samples).unwrap());
+        }
+        println!("FRONTEND qwen log-mel {seconds}s: {:.3} ms", t.elapsed().as_secs_f64() * 1e3 / 10.0);
     }
 
     #[test]

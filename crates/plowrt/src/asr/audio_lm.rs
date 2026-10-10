@@ -372,6 +372,7 @@ struct AudioLmContract {
     languages: Vec<String>,
     aliases: Vec<(String, String)>,
     chunking: AudioChunking,
+    policy: plow_asset::speech_contract::AudioLmPolicy,
 }
 
 impl AudioLmContract {
@@ -389,6 +390,11 @@ impl AudioLmContract {
                 .copied()
                 .ok_or_else(|| RuntimeError::Rejected(format!("audio LM parameter {name:?} is missing")))
         };
+        use plow_asset::speech_contract as contract;
+        contract::check_contract(decoder.parameters.get(contract::CONTRACT).copied(), contract::ASR_CONTRACT, "audio LM")
+            .map_err(RuntimeError::Rejected)?;
+        let policy = contract::AudioLmPolicy::from_parameters(|name| decoder.parameters.get(name).copied())
+            .map_err(RuntimeError::Rejected)?;
         let text = |name: &str| {
             decoder
                 .strings
@@ -463,6 +469,7 @@ impl AudioLmContract {
                     .filter_map(|l| l.split_once('=').map(|(a, b)| (a.to_owned(), b.to_owned())))
                     .collect(),
                 chunking,
+                policy,
             },
             frontend,
         ))
@@ -557,8 +564,8 @@ impl AudioLmPrompt {
 
     pub fn finalization_policy(&self) -> super::FinalizationPolicy {
         super::FinalizationPolicy {
-            final_padding_samples: super::frontend::SAMPLE_RATE as usize,
-            final_padding_amplitude: 100.0 / 32768.0,
+            final_padding_samples: self.contract.policy.final_padding_samples as usize,
+            final_padding_amplitude: self.contract.policy.final_padding_amplitude,
         }
     }
 
@@ -606,10 +613,10 @@ impl AudioLmPrompt {
         Ok(())
     }
 
-    /// Positions kept free for the transcript: one per audio row (about 13 a second, where speech
-    /// rarely needs 6 tokens a second) and 64 more.
-    fn output_reserve(rows: usize) -> usize {
-        rows + 64
+    /// Positions kept free for the transcript (packet `output.reserve_per_row` / `_extra`).
+    fn output_reserve(&self, rows: usize) -> usize {
+        let p = &self.contract.policy;
+        rows * p.output_reserve_per_row as usize + p.output_reserve_extra as usize
     }
 
     /// `context` cut to what the window leaves after the template, the audio and the output
@@ -625,7 +632,7 @@ impl AudioLmPrompt {
             return Ok(context);
         }
         let base = self.encode_prompt(rows, language, "")?.len();
-        let window = max_context.saturating_sub(base + Self::output_reserve(rows));
+        let window = max_context.saturating_sub(base + self.output_reserve(rows));
         let cap = crate::config::RuntimeConfig::get().asr_context_max_tokens;
         let budget = if cap == 0 { window } else { window.min(cap) };
         let fits = |text: &str| self.tokenizer.encode(text).len() <= budget;
@@ -669,6 +676,10 @@ impl AudioLmPrompt {
     }
 
     /// The encoder's input for one recording: `[bin][frame]` log-mel features.
+    pub fn frontend(&self) -> &PacketLogMelFrontend {
+        &self.frontend
+    }
+
     pub fn features(&self, samples: &[f32]) -> Result<MelFeatures> {
         let log_mel = self.frontend.extract(samples)?;
         let mut features = MelFeatures { values: vec![0.0; log_mel.values.len()], frames: log_mel.frames };
@@ -1078,7 +1089,7 @@ mod contract_tests {
         assert!(ids.len() > bare.len(), "a short context is kept whole");
         let long: String = (0..3000).map(|i| format!("word{i} ")).collect();
         let (ids, _) = prompt.prompt(rows, None, &long, 2048).unwrap();
-        assert!(ids.len() + AudioLmPrompt::output_reserve(rows) <= 2048);
+        assert!(ids.len() + prompt.output_reserve(rows) <= 2048);
         let kept = prompt.fit_context(rows, None, &long, 2048).unwrap();
         assert!(kept.starts_with("word") && kept.trim_end().ends_with("word2999"), "the latest words stay");
         assert!(kept.split_whitespace().count() > 100, "far more than the old 256-token cap allowed");
@@ -1122,6 +1133,12 @@ mod contract_tests {
             languages: vec![],
             aliases: vec![],
             chunking: AudioChunking { chunk_frames: 1, frame_stride: 1, round_bf16: false },
+            policy: plow_asset::speech_contract::AudioLmPolicy {
+                final_padding_samples: 0,
+                final_padding_amplitude: 0.0,
+                output_reserve_per_row: 1,
+                output_reserve_extra: 0,
+            },
         };
         let result = c.parse("language English<asr_text>Hello.", None).unwrap();
         assert_eq!(result.language.as_deref(), Some("English"));

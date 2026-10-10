@@ -8,6 +8,7 @@ use crate::exec::packet_runtime::{
     load_packet_runtime, BoundPacketPipeline, PacketAsset, PacketRuntime, PacketTensor,
 };
 use crate::{Result, RuntimeError};
+use plow_asset::speech_contract::{self, TokenOutput};
 
 /// Device-side RNNT data path. Implementations dispatch packet programs and retain encoder and
 /// predictor tensors on their selected backend.
@@ -60,6 +61,8 @@ pub struct PacketRnnt {
     profiling: bool,
     last_profile: Option<RnntProfile>,
     stream: Option<StreamBinding>,
+    /// Vocabulary, detokenizer and language (ASR contract >= 1).
+    output: Option<TokenOutput>,
 }
 
 /// A cache-aware encoder stream (`stream.*` pipeline roles): each step turns one mel window into
@@ -242,6 +245,24 @@ impl PacketRnnt {
             None
         };
         let state_zeros = vec![0; states.iter().map(|state| state.bytes).max().unwrap_or(0)];
+        let output = match pipeline.optional_parameter(speech_contract::CONTRACT) {
+            None => None,
+            Some(_) => {
+                let vocabulary = asset
+                    .metadata(speech_contract::VOCABULARY_SECTION)
+                    .ok_or_else(|| RuntimeError::Rejected(format!("packet is missing {}", speech_contract::VOCABULARY_SECTION)))?;
+                let output = TokenOutput::from_pipeline(
+                    |name| pipeline.optional_parameter(name),
+                    |name| pipeline.optional_string(name).map(str::to_owned),
+                    vocabulary,
+                )
+                .map_err(RuntimeError::Rejected)?;
+                if output.word_boundary.is_empty() {
+                    return Err(RuntimeError::Rejected("ASR output word boundary is empty".into()));
+                }
+                Some(output)
+            }
+        };
         runtime.end_execution()?;
         Ok(Self {
             backend,
@@ -270,7 +291,13 @@ impl PacketRnnt {
             profiling: false,
             last_profile: None,
             stream,
+            output,
         })
+    }
+
+    /// The packet's output contract; `None` for a contract-0 packet.
+    pub fn output(&self) -> Option<&TokenOutput> {
+        self.output.as_ref()
     }
 
     pub fn backend(&self) -> &'static str {
@@ -858,20 +885,22 @@ impl GreedyRnnt {
     }
 }
 
-pub fn detokenize_sentencepiece(vocabulary: &[String], ids: &[u32]) -> String {
+/// Text of `ids` under the packet's [`TokenOutput`] rules (`output.detokenizer` sentencepiece).
+pub fn detokenize(output: &TokenOutput, ids: &[u32]) -> String {
+    let boundary = output.word_boundary.as_str();
     let mut text = String::new();
     for &id in ids {
-        let Some(piece) = vocabulary.get(id as usize) else {
+        let Some(piece) = output.pieces.get(id as usize) else {
             continue;
         };
-        if piece.starts_with('<') && piece.ends_with('>') {
+        if output.skip_bracketed && piece.starts_with('<') && piece.ends_with('>') {
             continue;
         }
-        let value = piece.strip_prefix('▁').unwrap_or(piece);
-        if piece.starts_with('▁') && !matches!(value, "." | "?" | "!" | "।" | "॥") {
+        let value = piece.strip_prefix(boundary).unwrap_or(piece);
+        if piece.starts_with(boundary) && !output.no_space_before.iter().any(|p| p == value) {
             text.push(' ');
         }
-        text.push_str(&value.replace('▁', " "));
+        text.push_str(&value.replace(boundary, " "));
     }
     text.trim().to_owned()
 }
@@ -1021,7 +1050,7 @@ mod tests {
             "<en-US>".into(),
         ];
         assert_eq!(
-            detokenize_sentencepiece(&vocabulary, &[0, 1, 2, 3]),
+            detokenize(&TokenOutput::sentencepiece(vocabulary, &[".", "?", "!"]), &[0, 1, 2, 3]),
             "hello world!"
         );
     }

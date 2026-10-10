@@ -4,10 +4,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use axum::extract::State;
-use axum::response::sse::{Event, Sse};
+use axum::body::Bytes;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
-use futures::stream::{self, Stream};
+use futures::stream;
 
 use crate::serve::openai::*;
 use crate::serve::stream::{self as stream_mod, StreamChunk};
@@ -382,31 +382,35 @@ async fn chat_completions_with(
         );
     }
 
-    // NO VISION PATH EXISTS. `Content::as_text()` flattens a multipart message by
-    // keeping the `Text` parts and dropping everything else, so an `image_url`
-    // part is discarded and the model answers from the surrounding text alone —
-    // fluently, and about the wrong question. `Content::has_image` was written
-    // for exactly this check and had NO CALLERS, so the drop was silent.
-    //
-    // This is the same failure the compile-time refusals guard against
-    // (`nn-graph`'s kimi_k3 builder and `plowc`'s `synth_kimi_k3` both refuse a
-    // `vision_config` rather than build a text tower that is "silently wrong on
-    // every image prompt"). Those cover the COMPILER. Nothing covered the
-    // SERVER, so a text-tower build of any multimodal checkpoint — Kimi-K3,
-    // Gemma-4, Qwen-VL — would take an image request and quietly ignore it.
-    //
-    // Refused rather than errored later: the request never becomes a token, so
-    // it is not counted, not tokenized and not admitted.
-    if req.messages.iter().any(|m| m.has_image()) {
-        return crate::serve::api_error(
-            axum::http::StatusCode::BAD_REQUEST,
-            "this build serves the TEXT tower only and has no vision stage; an image part \
-             would be silently dropped, so the request is refused",
-            "invalid_request_error",
-            Some("unsupported_parameter"),
-            Some("messages[].content".into()),
-        );
-    }
+    // MEDIA PARTS (`serve::mm`): image and audio parts are encoded by the encoders the model's
+    // packet carries and replace the placeholders its own template renders. A part the model
+    // has no encoder for is refused before it becomes a token: dropping it (`Content::as_text`
+    // keeps only text) would answer about the wrong question, fluently.
+    let mm_model = match crate::serve::mm::media_parts(&req.messages).as_slice() {
+        [] => None,
+        parts => {
+            let model = state
+                .registry
+                .get(&req.model)
+                .ok()
+                .filter(|_| state.has_gpu_engine(&req.model))
+                .and_then(|b| b.serve().multimodal.as_ref().map(|c| crate::serve::mm::model(&b.dir, c, 0)));
+            let missing = parts
+                .iter()
+                .filter_map(|p| p.media_kind())
+                .find(|k| model.as_ref().is_none_or(|m| m.contract.modality(k).is_none()));
+            if let Some(kind) = missing {
+                return crate::serve::api_error(
+                    axum::http::StatusCode::BAD_REQUEST,
+                    format!("unsupported content type for this model: {kind}"),
+                    "invalid_request_error",
+                    Some("unsupported_parameter"),
+                    Some("messages[].content".into()),
+                );
+            }
+            model
+        }
+    };
 
     // Route to the per-model muxer. Tokens stream back as `StreamChunk`s over
     // an mpsc — the muxer produces one per generated token, ending with `Done`.
@@ -438,9 +442,24 @@ async fn chat_completions_with(
     if let Some(e) = crate::serve::prompt_bytes_overflow(state.max_ctx(&req.model), bundle.tokenizer().max_token_bytes(), prompt.len()) {
         return crate::serve::api_error_for(&e);
     }
-    let prompt_ids = crate::obs::ttft::timed(&crate::obs::ttft::ENCODE, || {
+    let mut prompt_ids = crate::obs::ttft::timed(&crate::obs::ttft::ENCODE, || {
         crate::serve::encode_prompt(&prompt, |p| bundle.tokenizer().encode(p))
     });
+    let mm_job = match &mm_model {
+        Some(m) => match crate::serve::mm::prepare(m, &req.messages, &mut prompt_ids, crate::serve::mm::Limits::from_env()).await {
+            Ok(job) => job,
+            Err(e) => {
+                return crate::serve::api_error(
+                    axum::http::StatusCode::from_u16(e.status).unwrap_or(axum::http::StatusCode::BAD_REQUEST),
+                    e.message,
+                    if e.status == 400 { "invalid_request_error" } else { "server_error" },
+                    (e.status == 400).then_some("invalid_value"),
+                    Some("messages[].content".into()),
+                )
+            }
+        },
+        None => None,
+    };
     let n_prompt = prompt_ids.len();
     if prompt_ids.is_empty() {
         return crate::serve::api_error(
@@ -506,6 +525,7 @@ async fn chat_completions_with(
             turn: run.key(),
             continuing: run.continuing(),
             prefix: prefix.take(),
+            mm: mm_job,
             ..Default::default()
         },
     };
@@ -1003,7 +1023,7 @@ fn call_deltas(
     (Some(heads), args)
 }
 
-fn tool_frame(id: &str, created: u64, model: &str, d: ToolCallDelta, finish: Option<&'static str>) -> Event {
+fn tool_frame(id: &str, created: u64, model: &str, d: ToolCallDelta, finish: Option<&'static str>) -> Bytes {
     let ch = ChatChunk {
         id: id.to_string(),
         object: "chat.completion.chunk",
@@ -1018,7 +1038,7 @@ fn tool_frame(id: &str, created: u64, model: &str, d: ToolCallDelta, finish: Opt
         }],
         usage: None,
     };
-    Event::default().data(stream_mod::chunk_data(&ch))
+    stream_mod::sse_data(&stream_mod::chunk_data(&ch))
 }
 
 /// Streaming path: one SSE `chat.completion.chunk` frame per produced token,
@@ -1054,7 +1074,7 @@ fn sse_response(
     lp_fmt: Option<crate::serve::logprobs::TokenText>,
     tools: Option<crate::serve::tools::stream::ToolStream>,
     run: crate::serve::turns::StageRun,
-) -> Sse<impl Stream<Item = Result<Event, std::convert::Infallible>>> {
+) -> Response {
 
     // State threaded through the unfold: the receiver, and the tail frames
     // (optional usage-only chunk, then [DONE]) drained one per poll.
@@ -1062,7 +1082,7 @@ fn sse_response(
         rx: stream_mod::ChunkReceiver,
         done: bool,
         /// Tool-call frames a token produced beyond its own, sent before the next receive.
-        queued: std::collections::VecDeque<Event>,
+        queued: std::collections::VecDeque<Bytes>,
         /// Set for a tool-calling request; replaces `split`.
         tools: Option<crate::serve::tools::stream::ToolStream>,
         /// The `role` delta has not been sent yet — it rides the FIRST token.
@@ -1071,8 +1091,12 @@ fn sse_response(
         /// type the buffered path uses, so the two cannot disagree about one
         /// generation.
         split: crate::serve::reasoning::ReasoningSplit,
-        pending: std::collections::VecDeque<Event>,
+        pending: std::collections::VecDeque<Bytes>,
         run: crate::serve::turns::StageRun,
+        head: stream_mod::FrameHead,
+        request_id: String,
+        model: String,
+        lp_fmt: Option<crate::serve::logprobs::TokenText>,
     }
     let body = stream::unfold(
         SseState {
@@ -1084,21 +1108,22 @@ fn sse_response(
             split: crate::serve::reasoning::ReasoningSplit::new(reasoning_mode, reasoning_open),
             pending: std::collections::VecDeque::new(),
             run,
+            head: stream_mod::FrameHead::new(&request_id, "chat.completion.chunk", created, &model),
+            request_id,
+            model,
+            lp_fmt,
         },
         move |mut st| {
-            let model = model.clone();
-            let request_id = request_id.clone();
-            let lp_fmt = lp_fmt.clone();
             async move {
                 if st.done {
                     return None;
                 }
                 if let Some(ev) = st.queued.pop_front() {
-                    return Some((Ok(ev), st));
+                    return Some((ev, st));
                 }
                 if let Some(ev) = st.pending.pop_front() {
                     st.done = st.pending.is_empty();
-                    return Some((Ok(ev), st));
+                    return Some((ev, st));
                 }
                 let chunk = match st.rx.recv().await {
                     Some(c) => c,
@@ -1112,7 +1137,7 @@ fn sse_response(
                         // server-side, because a bench client scores this as a
                         // successful request with fewer output tokens.
                         tracing::warn!(
-                            %model,
+                            model = %st.model,
                             "chat: SSE stream ended with no terminal chunk (slot cut) \
                              — no finish_reason, no [DONE]"
                         );
@@ -1121,7 +1146,7 @@ fn sse_response(
                 };
                 let (frame, terminate) = match chunk {
                     StreamChunk::Token { id, text, logprobs } => {
-                        let logprobs = lp_fmt.as_ref().map(|fmt| crate::serve::logprobs::ChatLogprobs {
+                        let logprobs = st.lp_fmt.as_ref().map(|fmt| crate::serve::logprobs::ChatLogprobs {
                             content: logprobs
                                 .iter()
                                 .map(|lp| crate::serve::logprobs::chat_entry(fmt, id, lp))
@@ -1151,29 +1176,22 @@ fn sse_response(
                             }
                         };
                         let (heads, args) = call_deltas(calls);
-                        let ch = ChatChunk {
-                            id: request_id.clone(),
-                            object: "chat.completion.chunk",
-                            created,
-                            model: model.clone(),
-                            choices: vec![ChunkChoice {
-                                index: 0,
-                                delta: Delta {
-                                    role,
-                                    content,
-                                    reasoning_content: reasoning,
-                                    tool_calls: heads,
-                                },
-                                logprobs,
-                                finish_reason: None,
-                                x_plow_finish_reason: None,
-                            }],
-                            usage: None,
-                        };
+                        let frame = st.head.frame(&ChunkChoice {
+                            index: 0,
+                            delta: Delta {
+                                role,
+                                content,
+                                reasoning_content: reasoning,
+                                tool_calls: heads,
+                            },
+                            logprobs,
+                            finish_reason: None,
+                            x_plow_finish_reason: None,
+                        });
                         for a in args {
-                            st.queued.push_back(tool_frame(&request_id, created, &model, a, None));
+                            st.queued.push_back(tool_frame(&st.request_id, created, &st.model, a, None));
                         }
-                        (Event::default().data(stream_mod::chunk_data(&ch)), false)
+                        (frame, false)
                     }
                     StreamChunk::Done { reason, usage, .. } if st.tools.is_some() => {
                         let ts = st.tools.as_mut().expect("checked");
@@ -1187,10 +1205,10 @@ fn sse_response(
                         let mut frames = Vec::new();
                         if s.content.is_some() || s.reasoning.is_some() || heads.is_some() {
                             let ch = ChatChunk {
-                                id: request_id.clone(),
+                                id: st.request_id.clone(),
                                 object: "chat.completion.chunk",
                                 created,
-                                model: model.clone(),
+                                model: st.model.clone(),
                                 choices: vec![ChunkChoice {
                                     index: 0,
                                     delta: Delta { role: None, content: s.content, reasoning_content: s.reasoning, tool_calls: heads },
@@ -1200,14 +1218,14 @@ fn sse_response(
                                 }],
                                 usage: None,
                             };
-                            frames.push(Event::default().data(stream_mod::chunk_data(&ch)));
+                            frames.push(stream_mod::sse_data(&stream_mod::chunk_data(&ch)));
                         }
-                        frames.extend(args.into_iter().map(|a| tool_frame(&request_id, created, &model, a, None)));
+                        frames.extend(args.into_iter().map(|a| tool_frame(&st.request_id, created, &st.model, a, None)));
                         let mut last = ChatChunk {
-                            id: request_id.clone(),
+                            id: st.request_id.clone(),
                             object: "chat.completion.chunk",
                             created,
-                            model: model.clone(),
+                            model: st.model.clone(),
                             choices: vec![ChunkChoice {
                                 index: 0,
                                 delta: Delta { role: None, content: None, reasoning_content: None, tool_calls: None },
@@ -1217,7 +1235,7 @@ fn sse_response(
                             }],
                             usage: None,
                         };
-                        frames.push(Event::default().data(stream_mod::chunk_data(&last)));
+                        frames.push(stream_mod::sse_data(&stream_mod::chunk_data(&last)));
                         if include_usage {
                             let mut u: Usage = usage.into();
                             if trace_tokens > 0 {
@@ -1225,7 +1243,7 @@ fn sse_response(
                             }
                             last.choices.clear();
                             last.usage = Some(u);
-                            st.pending.push_back(Event::default().data(stream_mod::chunk_data(&last)));
+                            st.pending.push_back(stream_mod::sse_data(&stream_mod::chunk_data(&last)));
                         }
                         let mut frames = frames.into_iter();
                         let first = frames.next().expect("the finish frame");
@@ -1237,12 +1255,7 @@ fn sse_response(
                         // this generation; abandoning it truncated the streamed
                         // `reasoning_content` against the buffered path.
                         let (flushed_r, flushed_c) = st.split.finish();
-                        let ch = ChatChunk {
-                            id: request_id.clone(),
-                            object: "chat.completion.chunk",
-                            created,
-                            model: model.clone(),
-                            choices: vec![ChunkChoice {
+                        let ch = ChunkChoice {
                                 index: 0,
                                 delta: Delta {
                                     role: None,
@@ -1259,17 +1272,15 @@ fn sse_response(
                                 x_plow_finish_reason: reason
                                     .is_vendor_specific()
                                     .then(|| reason.as_str()),
-                            }],
-                            usage: None,
                         };
                         if include_usage {
                             // OpenAI stream-usage shape: a separate chunk with
                             // EMPTY choices carries usage, never the finish chunk.
                             let uch = ChatChunk {
-                                id: request_id.clone(),
+                                id: st.request_id.clone(),
                                 object: "chat.completion.chunk",
                                 created,
-                                model,
+                                model: st.model.clone(),
                                 choices: Vec::new(),
                                 usage: Some({
                                     let mut u: Usage = usage.into();
@@ -1283,9 +1294,9 @@ fn sse_response(
                                 }),
                             };
                             st.pending
-                                .push_back(Event::default().data(stream_mod::chunk_data(&uch)));
+                                .push_back(stream_mod::sse_data(&stream_mod::chunk_data(&uch)));
                         }
-                        (Event::default().data(stream_mod::chunk_data(&ch)), true)
+                        (st.head.frame(&ch), true)
                     }
                     StreamChunk::Err(e) => {
                         // AN ERROR IS AN ERROR OBJECT, NOT ASSISTANT TEXT.
@@ -1305,7 +1316,7 @@ fn sse_response(
                         // in its own frame, and NO `[DONE]` — a client that
                         // sees the stream end without `[DONE]` knows it was
                         // cut. This is the shape vLLM uses for the same case.
-                        tracing::warn!(%model, error = %e, "chat: SSE stream error");
+                        tracing::warn!(model = %st.model, error = %e, "chat: SSE stream error");
                         let body = crate::serve::openai::ApiErrorBody::new(
                             e.to_string(),
                             "server_error",
@@ -1318,21 +1329,20 @@ fn sse_response(
                                     .to_string()
                             });
                         st.done = true;
-                        return Some((Ok(Event::default().data(data)), st));
+                        return Some((stream_mod::sse_data(&data), st));
                     }
                 };
                 if terminate {
                     st.run.done();
-                    st.pending.push_back(st.run.sse_comment());
-                    st.pending
-                        .push_back(Event::default().data(stream_mod::DONE));
+                    st.pending.push_back(st.run.sse_comment_frame());
+                    st.pending.push_back(stream_mod::sse_data(stream_mod::DONE));
                 }
-                Some((Ok(frame), st))
+                Some((frame, st))
             }
         },
     );
 
-    Sse::new(body)
+    stream_mod::sse_response(body)
 }
 
 #[cfg(test)]

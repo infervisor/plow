@@ -61,7 +61,14 @@ fn every_family_renders_tool_conversations_like_transformers() {
             let opts = RenderOpts { tools: req.tools.clone(), ..Default::default() };
             let got = render(&t, &req.messages, &opts);
             match (case.get("expected").and_then(Value::as_str), got) {
-                (Some(want), Ok(got)) => {
+                (Some(want), Ok(mut got)) => {
+                    // `strftime_now` renders today; the fixture holds the day it was captured.
+                    let dated = |s: &str| {
+                        s.split('\n').find(|l| l.starts_with("Current date: ") || l.starts_with("Today Date: ")).map(str::to_owned)
+                    };
+                    if let (Some(today), Some(captured)) = (dated(&got), dated(want)) {
+                        got = got.replacen(&today, &captured, 1);
+                    }
                     assert!(got == want, "{family}/{name}: render differs\n--- plowrt\n{got}\n--- transformers\n{want}");
                     #[cfg(feature = "hf-tokenizer")]
                     if let (Some(tok), Some(ids)) = (&tok, case.get("ids")) {
