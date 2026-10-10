@@ -146,16 +146,18 @@ the eos set came from the `config.json` fallback rather than `generation_config.
 
 ## 2b. Tool calling
 
-`tools`, `tool_choice` (`"auto"` / `"none"`), `parallel_tool_calls`, assistant `tool_calls` and
-`role: "tool"` results are served on `/v1/chat/completions`, streamed and not, for any model whose
-own chat template renders tools in a call syntax the server parses (`crates/plowrt/src/serve/tools/`).
-Nothing is keyed on the model name.
+`tools`, `tool_choice` (`"auto"`, `"none"`, `"required"`, a named function), `parallel_tool_calls`,
+`strict` function schemas, assistant `tool_calls` and `role: "tool"` results are served on
+`/v1/chat/completions`, streamed and not, for any model whose own chat template renders tools in a
+call syntax the server parses (`crates/plowrt/src/serve/tools/`). Nothing is keyed on the model
+name. The server never executes a tool; it renders the conversation and parses the reply.
 
 **Is it supported?** Decided per model at load: the template is rendered once with a probe tool
-(`ToolSupport::probe`). A template that never prints it ignores `tools` (Mixtral, DeepSeek-V3.x
-whose templates have no tools block) and the request is refused (400, `param: tools`) instead of
-answered without them. A model served without a template (built-in builders: Kimi-K3, DeepSeek-V4
-with its Python-only `encoding_dsv4.py`) refuses `tools` and assistant `tool_calls` history.
+(`ToolSupport::probe`). A template that never prints it ignores `tools` (Mixtral, and DeepSeek's
+own V3 / R1 / V3.1 / V3.2 templates, which have no tools block) and the request is refused (400,
+`param: tools`) instead of answered without them. A model served without a template (built-in
+builders: Kimi-K3, DeepSeek-V4 with its Python-only `encoding_dsv4.py`) refuses `tools` and
+assistant `tool_calls` history.
 
 **Call syntax**, read from the template's own markers (`ToolFormat::detect`), with one streaming
 parser each:
@@ -163,55 +165,126 @@ parser each:
 | format | families (template checked) | model output |
 |---|---|---|
 | `gemma4` | Gemma 4 E4B / 12B / 26B / 31B | `<\|tool_call>call:NAME{k:<\|"\|>v<\|"\|>,n:1}<tool_call\|>` |
-| `hermes` | Qwen3, Qwen2.5, Hermes | `<tool_call>{"name": .., "arguments": {..}}</tool_call>` (after any `<think>` trace) |
+| `hermes` | Qwen3, Qwen2.5, Hermes 3 (`tool_use` template) | `<tool_call>{"name": .., "arguments": {..}}</tool_call>` (after any `<think>` trace) |
 | `qwen3_xml` | Qwen3.5, Qwen3-Coder | `<tool_call><function=NAME><parameter=K>V</parameter></function></tool_call>`; values typed by the tool's JSON schema |
 | `glm45` | GLM-4.5 / 4.6 / 5 / 5.3 | `<tool_call>NAME<arg_key>K</arg_key><arg_value>V</arg_value></tool_call>` |
 | `llama3_json` | Llama 3.1 / 3.2 / 3.3 | an answer that opens with `{"name": .., "parameters": {..}}` (or `<\|python_tag\|>`), `;`-separated |
 | `mistral` | Mistral v0.3 (`[TOOL_CALLS] [..]`) and v11+ (`[TOOL_CALLS]NAME[ARGS]{..}`) | ids are 9 alphanumerics, as the template requires |
 | `kimi_k2` | Kimi-K2 | `<\|tool_call_begin\|>functions.NAME:IDX<\|tool_call_argument_begin\|>{..}`; the id is kept |
 | `harmony` | gpt-oss | `commentary to=functions.NAME` messages; `analysis` → `reasoning_content` |
+| `deepseek_v3` | DeepSeek V3 / R1 with a tools template (vLLM's `tool_chat_template_deepseek{v3,r1}.jinja`) | `<｜tool▁call▁begin｜>function<｜tool▁sep｜>NAME\n```json\n{..}\n```<｜tool▁call▁end｜>` |
+| `deepseek_v31` | DeepSeek V3.1 with a tools template (vLLM's `tool_chat_template_deepseekv31.jinja`) | `<｜tool▁call▁begin｜>NAME<｜tool▁sep｜>{..}<｜tool▁call▁end｜>` |
 
 A template that renders tools in any other syntax refuses `tools` (400) rather than returning
-unparsed calls as text.
+unparsed calls as text. Llama 3.2's pythonic form (`[f(a=1)]`) is not parsed: only vLLM's
+alternative template asks for it; the checkpoint's own template uses JSON.
 
 **Request mapping** (`tools::request`), matching vLLM's hand-off to `apply_chat_template`:
 `tools` is passed through unchanged; `tool_calls[].function.arguments` strings become objects
 (a template that concatenates strings, DeepSeek's, is re-rendered with the original strings);
 a tool-call turn's `content: null` becomes `""` (gpt-oss's template fails on `None`, GLM-4.5's
 prints the word `None`); `tool_call_id`, `name`, `reasoning_content` pass through. Validation:
-function tools only, names `^[a-zA-Z0-9_-]{1,64}$`, unique; `tool` messages need
-`tool_call_id`; history `tool_calls` need `id`, `function.name` and JSON-object `arguments`.
-The renderer now matches `transformers`' Jinja environment: `trim_blocks`/`lstrip_blocks`,
+function tools only, names `^[a-zA-Z0-9_-]{1,64}$`, unique, `strict` a boolean; `tool` messages
+need `tool_call_id`; history `tool_calls` need `id`, `function.name` and JSON-object `arguments`.
+The renderer matches `transformers`' Jinja environment: `trim_blocks`/`lstrip_blocks`,
 insertion-ordered maps, `loop.previtem`/`nextitem`, `none is iterable` false, `tojson` as
 Python's `json.dumps` (`", "` / `": "` spacing, `ensure_ascii`, `indent`, `separators`,
 `sort_keys`, float `repr`), and `strip`/`split`/`replace` with Python's arguments.
 
-**Refused** (400): `tool_choice: "required"` and a forced function (no constrained decoding, so
-the call cannot be guaranteed); the deprecated `functions` / `function_call` (use `tools`);
-non-function tool types. `tool_choice: "none"` renders the conversation without `tools` and
-does not parse. `parallel_tool_calls: false` keeps only the first call. An empty `tools: []`
-is the same as none.
+**`tool_choice`.**
+
+- `"auto"` (default) renders the tools and parses whatever the model writes.
+- `"none"` renders the conversation without `tools` and does not parse.
+- `"required"` and `{"type": "function", "function": {"name": ..}}` (also the Responses-API
+  `{"type": "function", "name": ..}`) append the format's call opener to the prompt
+  (`ToolFormat::opener`): up to the function name for `required` (`<|tool_call>call:`), through it
+  for a named function (`<|tool_call>call:get_weather{`). A trace the prompt left open is closed
+  first (`</think>`, `<channel|>`). The generation therefore starts inside a call, in the model's
+  own syntax, and is then validated: every call must name a declared function (the named one, for
+  a named choice) and carry a JSON-object `arguments`; a turn that ends (`stop`) without such a
+  call fails. A named choice keeps one call. This is not constrained decoding: the opener is
+  forced, the rest is the model's and is checked, so the guarantee is "a valid call or an error",
+  never prose with `finish_reason: "stop"`. vLLM's Gemma 4 parser does not serve `required` /
+  named at all (`supports_required_and_named = False`).
+- A named function not in `tools`, or a forcing choice with no `tools`, is 400 `invalid_value`;
+  other `tool_choice` types (`allowed_tools`, custom) are 400 `unsupported_parameter`.
+
+**`strict: true`** validates that function's arguments against its `parameters` schema when the
+call ends (`tools::schema`: `type`, `enum`, `const`, `properties`, `required`,
+`additionalProperties`, `items`/`prefixItems`, length / item / numeric bounds, `anyOf`/`oneOf`/
+`allOf`, local `$ref`; `pattern` and `format` are not checked). Validation, not constrained
+decoding: a violation fails the request. On the streamed path a strict call's arguments are held
+back until they validate and then sent in one delta (the head with `id` and name goes out at once).
+
+**Validation failures** (forced choice or strict) are HTTP 500 `{"error": {"type":
+"server_error", "code": "invalid_tool_call", "message": <the violation>}}` on the buffered path, and
+the same error object in its own SSE frame with no `[DONE]` on the streamed path. A turn cut by
+`max_tokens` is not validated: it returns what was generated with `finish_reason: "length"`.
 
 **Response.** For these requests the generation is decoded with special tokens KEPT (the call
 markers are special tokens in most vocabularies), split for reasoning, parsed, and only then
-stripped of the remaining special tokens. `message.tool_calls` carries
-`{id, type: "function", function: {name, arguments: <JSON string>}}`, `content` is the text
-before the calls or `null`, and `finish_reason` is `"tool_calls"` when the turn ended on its own
-(a turn cut by `max_tokens` stays `"length"`). Streaming sends, per completed call, one delta with
-`index`, `id`, `type`, `name` and empty `arguments`, then one with the full `arguments`; markers
-never reach `delta.content`. A call is emitted once it is complete, so arguments arrive per call,
-not per token. A malformed or truncated call falls back to text, stripped as before.
+stripped of the remaining special tokens (a token split across pieces is still removed).
+`message.tool_calls` carries `{id, type: "function", function: {name, arguments: <JSON string>}}`,
+`content` is the text around the calls or `null`, and `finish_reason` is `"tool_calls"` when the
+turn ended on its own (a turn cut by `max_tokens` stays `"length"`).
+
+Streaming sends calls the way OpenAI and vLLM do: the first delta of a call carries `index`, `id`,
+`type` and `function.name`; later deltas carry `function.arguments` fragments as the model writes
+them, so a client sees the arguments grow token by token. JSON-native formats stream the model's
+own argument text; Gemma 4, Qwen3 XML and GLM bodies are transcoded to JSON on the fly (strings
+stream as they are written; a schema-typed non-string value goes out when it is complete). The
+buffered `arguments` is exactly the concatenation of the streamed fragments. Markers never reach
+`delta.content`. With `logprobs: true` each token's entry rides the frame that token produced,
+tool-call deltas included.
+
+Once a call's name is read the call stands: arguments cut off by `max_tokens` are returned as
+generated (possibly incomplete JSON, `finish_reason: "length"`), as OpenAI returns them; a
+transcoded body that breaks its format's syntax is closed into valid JSON at the break. A call
+head that does not parse (no name, wrong syntax) is returned as text, markers stripped.
+
+**Reasoning.** The split runs before the call parser, so a trace never reaches `content` or a
+call: `<think>` (Qwen3, DeepSeek-R1, GLM; from the packet's `serve.json`), Gemma 4's thought
+channel (`<|channel>thought` … `<channel|>`, read from the chat template when the packet declares
+no markers; its markers are special tokens, so these requests decode with special tokens kept),
+and gpt-oss's `analysis` channel (the harmony parser, with or without tools). This fixes the
+Gemma 4 leak where, after a tool result, the model's own `<|channel>thought\n<channel|>` came
+back as `thought\n` at the start of `content`. vLLM's `include_reasoning: false` drops
+`reasoning_content` from the response; the trace is still split out and counted in
+`reasoning_tokens`.
+
+**Cost.** `tests/tool_stream_bench.rs` (release, `--ignored --nocapture`) measures the per-token
+host path: reasoning split, parser, special-token strip and SSE frame build. The parsers scan each
+byte once and reuse their buffers; the steady state allocates one buffer per frame (the plain path
+allocates two). Measured on the shared H100 host (min of 9 trials, ns per token):
+
+| case | 4978bf03 | tool-perf |
+|---|---|---|
+| plain text, no tools | 153–173 | 154–169 |
+| Gemma 4, no tools (thought-channel split) | — (leaked) | 197–217 |
+| tools declared, text answer | 363–398 | 234–261 |
+| Gemma 4 call, 16 KB arguments | 600–647 | 309–355 |
+| Gemma 4 call, 64 KB arguments | 1603–1794 | 327–366 |
+| Hermes call, 16 KB arguments | 671–739 | 306–365 |
+
+The baseline rescanned the buffered call on every token (cost grew with the arguments) and sent
+them in one piece at the end; the parsers are now O(1) per token and stream them.
 
 **Parity.** `scripts/llm/toolcall_fixtures.py` renders 7 conversations per family with
 `transformers` (`render_jinja_template`, the `apply_chat_template` code path) into
 `crates/plowrt/tests/fixtures/toolcall/`; `serve::tools::parity_tests` renders the same
 OpenAI-shaped requests through the handler's mapping and must match the text, and the token ids
-where the family's `tokenizer.json` is on the host. 15 families: gemma4-e4b, gemma4-12b, qwen3,
-qwen2.5, qwen3.5, qwen3-coder, llama3.1, llama3.2, mistral-v0.3, glm4.5, glm5.3, kimi-k2,
-gpt-oss, and the two refused (deepseek-v3.1, mixtral).
+where the family's `tokenizer.json` is on the host. 23 families: gemma4-e4b, gemma4-12b,
+gemma4-31b, qwen3, qwen2.5, qwen3.5, qwen3-coder, llama3.1, llama3.2, llama3.3, mistral-v0.3,
+glm4.5, glm5, glm5.3, kimi-k2, gpt-oss, hermes3 (`tool_use` template, tool requests only),
+deepseek-v3-tools, deepseek-r1-tools, deepseek-v3.1-tools (vLLM's templates), and the refused
+deepseek-v3.1, deepseek-r1 and mixtral. `serve::tools::http_tests` drives
+`/v1/chat/completions` end to end over the production router with a scripted dispatcher (tools
+streamed and not, parallel calls, every `tool_choice` mode, `strict`, logprobs, reasoning, a tool
+loop). `scripts/llm/toolcall_live_check.py` is the live battery (OpenAI Python SDK) against a
+serving model.
 
-**No packet re-emit is needed**: the format comes from the chat template the packet already
-carries in `serve.json`.
+**No packet re-emit is needed**: the format and the Gemma 4 reasoning markers come from the chat
+template the packet already carries in `serve.json`.
 - `/health` added alongside `/healthz`; `/tokenize` reports `count`; model cards carry
   `created`; request ids are seeded per process instead of starting at zero; CUDA reads the
   same stop-id sources as the AMD and CPU engines.
