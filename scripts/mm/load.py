@@ -16,9 +16,12 @@ many requests, so the same bit-31 ids and prefix-cache hits). Unique media are m
   4. exhaust   a burst of unique image+audio requests larger than the slab: 503 + Retry-After
   5. leaks     /metrics plowrt_mm_slab_rows_reserved and _staged return to 0
 
+--text-only runs only the text requests of the mix (steps 1-2, DIR/load-text.json): the baseline
+that media TTFT and throughput are read against.
+
 Writes DIR/load.json (and prints a summary); exits 1 when a check fails.
 """
-import argparse, base64, http.client, io, json, random, re, statistics, struct, sys, threading, time, urllib.parse, wave, zlib
+import argparse, base64, http.client, io, json, random, re, struct, sys, time, urllib.parse, wave, zlib
 from concurrent.futures import ThreadPoolExecutor
 
 TEXTS = [
@@ -161,6 +164,7 @@ def main():
     ap.add_argument("--max-tokens", type=int, default=64)
     ap.add_argument("--tie-margin", type=float, default=0.25)
     ap.add_argument("--burst", type=int, default=40, help="exhaustion burst size (unique image+audio requests)")
+    ap.add_argument("--text-only", action="store_true", help="the text requests of the mix only (a baseline for the cells)")
     args = ap.parse_args()
     ref = json.load(open(args.ref))
     cl = Client(args.base, args.model)
@@ -198,6 +202,8 @@ def main():
 
     mix = ["text0", "text1", "text2", "text3"] + [k for k in ("image", "audio", "image_audio") if k in shared]
     mix += [k for k, ok in (("uimage", has_image), ("uaudio", audio is not None)) if ok]
+    if args.text_only:
+        mix = [k for k in mix if k.startswith("text")]
     report = {"model": args.model, "mix": mix, "checks": {}}
     fail = []
 
@@ -259,6 +265,11 @@ def main():
         cell["encoder"] = enc
         report["cells"].append(cell)
         print(json.dumps(cell), flush=True)
+    if args.text_only:
+        report["fail"] = fail
+        json.dump(report, open(f"{args.out}/load-text.json", "w"), indent=1)
+        print("load", "pass" if not fail else "fail: " + "; ".join(fail[:5]))
+        return 0 if not fail else 1
 
     def drained(timeout=30.0):
         end = time.time() + timeout
