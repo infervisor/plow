@@ -175,6 +175,20 @@ Generated kernels ship as packet role objects keyed by op signature, never by mo
   `runtime/nvidia/gen_flash_prefill.cu`. It needs no GPU. It fails on generator drift, i.e.
   when the body digest differs from the table. `tune` (GPU, under `gpulease`) is the only
   command that rewrites the table; `bench` measures built objects.
+  - The generator is pinned: `nix develop .#tilelang --command python3
+    scripts/gen_kernels/build_catalog.py build OUT` runs TileLang 0.1.12 with apache-tvm-ffi
+    0.1.11 and z3 4.15.4 (PyPI wheels by sha256) and nix nvcc 12.9. `build` refuses another
+    TileLang release. The body digest is the key, not the commit: any checkout that reproduces
+    it builds the entry.
+  - The digest, not the object sha256, is the identity. TileLang's reduction-scratch slot
+    assignment varies run to run (not fixed by `PYTHONHASHSEED=0` or disabling ASLR), and the
+    digest masks it. The two TileLang entries therefore build one of a few equivalent objects:
+    `attn_pf_hd512` `d22ad1e8…` or `0dbd334f…`, `attn_pf_hd512_fp8kv` `6cfdd085…` or
+    `97c88ffe…`, in the nix shell and under the lab `PYREF` alike. The hand-written hd256
+    entries are byte-stable (`c07d6993…`, `2f372f2a…`). A bundle pins the object it shipped
+    (role sha256), so rebuilding may move that pin without changing the kernel.
+  - `build_catalog.py check` (no TileLang) verifies that the Python entries' signatures and
+    objects equal the table's.
   - The objects script runs `build` when `PLOW_BUILD_GEN_KERNELS` lists entries.
   - The recipe lists the cubin in `role_files`.
   - The role emit sets `PLOW_EMIT_GEN_KERNELS` to the same list.
@@ -249,11 +263,12 @@ In-model, Gemma-4 12B, realtime profile, C1, ABAB, 2 reps, 32 prompts per cell. 
    - params by name: `Q K V O heads qlen kvlen scale [window kv_mask]`;
    - K/V are one KV head's rows, with position p at row `p & kv_mask`;
    - no `blockIdx.z`, `gridDim` or TMA.
-2. Add a row to `CATALOG` in `crates/devgen/src/gen_kernels.rs`: next role ID, object name,
-   head width, window, ring KV, `min_rows`. The row for `attn_pf_hd256_sliding` (role 19,
-   window 1024, ring KV) is already registered.
-3. Run `build_catalog.py tune --entries <name>` under `gpulease -n 1`, then build a packet
-   with the three switches above and gate it.
+2. Run `build_catalog.py tune --entries <name>` under `gpulease -n 1`. It writes the entry's
+   row (signature, object, config, body digest) to the table.
+3. Add the entry to `POLICY` in `crates/devgen/src/gen_kernels.rs`: next role ID and
+   `min_rows`. Devgen reads object name, head width, window, ring KV and KV dtype from the
+   table; `cargo test -p devgen --lib gen_kernels` fails while a table entry has no policy.
+4. Build a packet with the three switches above and gate it.
 
 ### attn_pf_hd256_sliding (hand CUDA FA3-style, 384 threads, TMA/cp.async + wgmma)
 
