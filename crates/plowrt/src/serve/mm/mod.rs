@@ -137,28 +137,11 @@ impl Slab {
             return Err(crate::RuntimeError::Rejected("multimodal rows were reserved on another engine".into()));
         }
         let mut s = self.state.lock();
-        let tombs = std::mem::take(&mut s.tombs);
-        for slot in tombs {
-            if !s.used[slot as usize] {
-                write(TABLE_TENSOR, u64::from(slot) * 8, &TOMBSTONE.to_le_bytes())?;
-            }
-        }
-        let row_bytes = self.hidden * 2;
-        for (i, &id) in job.ids.iter().enumerate() {
-            if let Some(e) = s.live.get_mut(&id) {
-                e.2 += 1;
-                continue;
-            }
-            let row = s.free.pop().ok_or_else(|| crate::RuntimeError::Rejected("multimodal slab exhausted".into()))?;
-            let mut slot = id & (self.cap - 1);
-            while s.used[slot as usize] {
-                slot = (slot + 1) & (self.cap - 1);
-            }
-            write(SLAB_TENSOR, u64::from(row) * row_bytes as u64, bytemuck::cast_slice(&job.rows[i * self.hidden..(i + 1) * self.hidden]))?;
-            let entry: [u32; 2] = [id, row];
-            write(TABLE_TENSOR, u64::from(slot) * 8, bytemuck::cast_slice(&entry))?;
-            s.used[slot as usize] = true;
-            s.live.insert(id, (slot, row, 1));
+        // `release` only undoes a staged job, so a failed stage drops the holds it took itself.
+        let mut held = 0;
+        if let Err(e) = self.stage_rows(&mut s, job, &mut held, &mut write) {
+            s.drop_holds(&job.ids[..held]);
+            return Err(e);
         }
         job.staged = true;
         match prompt.iter().find(|&&id| id & ROW_ID_BIT != 0 && !s.live.contains_key(&id)) {
@@ -167,20 +150,71 @@ impl Slab {
         }
     }
 
+    /// Takes one hold per id of `job`, counting them in `held`; on error the holds already counted
+    /// stay for the caller to drop.
+    fn stage_rows(
+        &self,
+        s: &mut SlabState,
+        job: &MmJob,
+        held: &mut usize,
+        write: &mut impl FnMut(&str, u64, &[u8]) -> crate::Result<()>,
+    ) -> crate::Result<()> {
+        let tombs = std::mem::take(&mut s.tombs);
+        for (k, &slot) in tombs.iter().enumerate() {
+            if !s.used[slot as usize] {
+                if let Err(e) = write(TABLE_TENSOR, u64::from(slot) * 8, &TOMBSTONE.to_le_bytes()) {
+                    s.tombs.extend_from_slice(&tombs[k..]);
+                    return Err(e);
+                }
+            }
+        }
+        let row_bytes = self.hidden * 2;
+        for (i, &id) in job.ids.iter().enumerate() {
+            if let Some(e) = s.live.get_mut(&id) {
+                e.2 += 1;
+                *held += 1;
+                continue;
+            }
+            let row = s.free.pop().ok_or_else(|| crate::RuntimeError::Rejected("multimodal slab exhausted".into()))?;
+            let mut slot = id & (self.cap - 1);
+            while s.used[slot as usize] {
+                slot = (slot + 1) & (self.cap - 1);
+            }
+            let entry: [u32; 2] = [id, row];
+            let staged = write(SLAB_TENSOR, u64::from(row) * row_bytes as u64, bytemuck::cast_slice(&job.rows[i * self.hidden..(i + 1) * self.hidden]))
+                .and_then(|()| write(TABLE_TENSOR, u64::from(slot) * 8, bytemuck::cast_slice(&entry)));
+            if let Err(e) = staged {
+                // The table entry may have landed: tombstone the slot so no probe trusts it.
+                s.free.push(row);
+                s.tombs.push(slot);
+                return Err(e);
+            }
+            s.used[slot as usize] = true;
+            s.live.insert(id, (slot, row, 1));
+            *held += 1;
+        }
+        Ok(())
+    }
+
     fn release(&self, ids: &[u32], staged: bool, reserved: u32) {
         let mut s = self.state.lock();
         s.reserved -= reserved;
-        if !staged {
-            return;
+        if staged {
+            s.drop_holds(ids);
         }
+    }
+}
+
+impl SlabState {
+    fn drop_holds(&mut self, ids: &[u32]) {
         for id in ids {
-            let Some(e) = s.live.get_mut(id) else { continue };
+            let Some(e) = self.live.get_mut(id) else { continue };
             e.2 -= 1;
             if e.2 == 0 {
-                let (slot, row, _) = s.live.remove(id).unwrap();
-                s.used[slot as usize] = false;
-                s.free.push(row);
-                s.tombs.push(slot);
+                let (slot, row, _) = self.live.remove(id).unwrap();
+                self.used[slot as usize] = false;
+                self.free.push(row);
+                self.tombs.push(slot);
             }
         }
     }
@@ -397,12 +431,19 @@ enum Prepared {
     Audio(media::Mel, usize, [u8; 32]),
 }
 
-fn digest(kind: &str, bytes: &[u8]) -> [u8; 32] {
+fn digest(kind: &str, parts: &[&[u8]]) -> [u8; 32] {
     let mut h = Sha256::new();
     h.update(kind.as_bytes());
     h.update([0u8]);
-    h.update(bytes);
+    for p in parts {
+        h.update(p);
+    }
     h.finalize().into()
+}
+
+/// Same RGB bytes at another shape preprocess to different patches.
+fn image_digest(kind: &str, img: &media::Rgb) -> [u8; 32] {
+    digest(kind, &[&img.width.to_le_bytes(), &img.height.to_le_bytes(), &img.data])
 }
 
 /// Bit-31 ids of `rows` soft-token rows of the item with `digest`; bit 30 marks a
@@ -438,7 +479,7 @@ fn prepare_one(part: &ContentPart, contract: &MmContract, limits: &Limits) -> Re
             let (_, bytes) = media::data_url(url).map_err(MmError::bad)?;
             let img = media::decode_image(&bytes, limits.max_image_pixels).map_err(MmError::bad)?;
             let patches = media::image_patches(&img, &patch_params(modality)?).map_err(MmError::bad)?;
-            Ok(Prepared::Image(patches, digest(kind, &img.data)))
+            Ok(Prepared::Image(patches, image_digest(kind, &img)))
         }
         (ContentPart::InputAudio { input_audio }, Processor::SemicausalLogMel | Processor::WaveformFrames) => {
             let format = input_audio.format.as_deref().unwrap_or("wav").to_ascii_lowercase();
@@ -477,7 +518,7 @@ fn audio(samples: Vec<f32>, rate: u32, m: &MmModality, processor: Processor, lim
         let raw: Vec<u8> = samples.iter().flat_map(|v| v.to_le_bytes()).collect();
         let frames = media::waveform_frames(&samples, frame);
         let tokens = frames.valid_frames;
-        return Ok(Prepared::Audio(frames, tokens, digest(kind, &raw)));
+        return Ok(Prepared::Audio(frames, tokens, digest(kind, &[&raw])));
     }
     let p = mel_params(m)?;
     let cap = m.param("max_samples").map_or(f64::INFINITY, |s| s as f64 / f64::from(p.sample_rate));
@@ -497,7 +538,7 @@ fn audio(samples: Vec<f32>, rate: u32, m: &MmModality, processor: Processor, lim
         return Err(MmError::bad("audio clip is too short"));
     }
     let raw: Vec<u8> = samples.iter().flat_map(|v| v.to_le_bytes()).collect();
-    Ok(Prepared::Audio(mel, tokens, digest(kind, &raw)))
+    Ok(Prepared::Audio(mel, tokens, digest(kind, &[&raw])))
 }
 
 /// Round-to-nearest-even bf16 (the checkpoint's projection output dtype).
@@ -683,13 +724,13 @@ mod tests {
 
     #[test]
     fn row_ids_are_content_keyed_and_tagged() {
-        let a = row_ids(&digest("image", b"one"), 3, false);
-        let b = row_ids(&digest("image", b"two"), 3, false);
+        let a = row_ids(&digest("image", &[b"one"]), 3, false);
+        let b = row_ids(&digest("image", &[b"two"]), 3, false);
         assert!(a.iter().chain(&b).all(|&id| id & ROW_ID_BIT != 0 && id & SPAN_ID_BIT == 0 && id > TOMBSTONE));
         assert_ne!(a, b);
-        assert_eq!(a, row_ids(&digest("image", b"one"), 3, false));
+        assert_eq!(a, row_ids(&digest("image", &[b"one"]), 3, false));
         assert_ne!(a[0], a[1]);
-        let s = row_ids(&digest("image", b"one"), 3, true);
+        let s = row_ids(&digest("image", &[b"one"]), 3, true);
         assert!(s.iter().all(|&id| plow_asset::multimodal::is_span_id(id)));
         assert_eq!(s.iter().map(|id| id & !SPAN_ID_BIT).collect::<Vec<_>>(), a, "the span bit only tags");
     }
@@ -835,5 +876,37 @@ mod tests {
         assert!(err.to_string().contains("0x80000009"), "{err}");
         drop(j);
         assert!(slab.reserve(4), "the failed job releases what it staged");
+    }
+
+    #[test]
+    fn a_failed_write_rolls_back_partial_staging() {
+        let slab = Arc::new(Slab::new(&contract()));
+        let dev = device();
+        let mut shared = job(&slab, &[0x8000_0006]);
+        slab.stage(&mut shared, &[], write_to(&dev)).unwrap();
+        // Shares 0x...6 (a hold), stages 0x...5 (2 writes), then fails on 0x...7's slab write.
+        let mut j = job(&slab, &[0x8000_0006, 0x8000_0005, 0x8000_0007]);
+        let mut n = 0;
+        let mut inner = write_to(&dev);
+        let failing = |t: &str, off: u64, b: &[u8]| {
+            n += 1;
+            if n == 3 {
+                return Err(crate::RuntimeError::Rejected("injected".into()));
+            }
+            inner(t, off, b)
+        };
+        assert!(slab.stage(&mut j, &[], failing).is_err());
+        assert_eq!(slab.occupancy(), (4, 1, 4), "only the earlier job's row stays live");
+        drop(j);
+        drop(shared);
+        assert_eq!(slab.occupancy(), (0, 0, 4));
+        assert_eq!(slab.state.lock().free.len(), 4, "every row is free again");
+    }
+
+    #[test]
+    fn image_digest_includes_dimensions() {
+        let wide = image_digest("image", &media::Rgb { width: 2, height: 1, data: vec![1; 6] });
+        let tall = image_digest("image", &media::Rgb { width: 1, height: 2, data: vec![1; 6] });
+        assert_ne!(row_ids(&wide, 2, true), row_ids(&tall, 2, true));
     }
 }
