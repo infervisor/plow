@@ -2331,8 +2331,8 @@ mod tests {
     #[test]
     fn accepts_only_measured_sm90_bf16_prefill_cells() {
         use plow_asset::segment_roles::{
-            CUBLASLT_PREFILL_GEMMA4_26B_SHAPES, CUBLASLT_PREFILL_GEMMA4_SHAPES,
-            CUBLASLT_PREFILL_ROWS, CUBLASLT_PREFILL_SPEECH_ROWS, CUBLASLT_PREFILL_WIDE_ROWS,
+            CUBLASLT_PREFILL_GEMMA4_26B_SHAPES, CUBLASLT_PREFILL_GEMMA4_31B_SHAPES,
+            CUBLASLT_PREFILL_GEMMA4_SHAPES, CUBLASLT_PREFILL_ROWS, CUBLASLT_PREFILL_SPEECH_ROWS, CUBLASLT_PREFILL_WIDE_ROWS,
         };
         for &rows in CUBLASLT_PREFILL_ROWS
             .iter()
@@ -2342,6 +2342,7 @@ mod tests {
             for &(n, k) in CUBLASLT_PREFILL_GEMMA4_SHAPES
                 .iter()
                 .chain(&CUBLASLT_PREFILL_GEMMA4_26B_SHAPES)
+                .chain(&CUBLASLT_PREFILL_GEMMA4_31B_SHAPES)
             {
                 let (program, tensors) = prefill_fixture(rows, n, k);
                 let routes = prefill_segments(&program, &tensors, &roles(), "sm90a").unwrap();

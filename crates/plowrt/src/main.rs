@@ -895,7 +895,10 @@ async fn async_main(asset_defaults: Vec<(String, String, String)>) -> Result<(),
                 MuxConfig {
                     max_hold_ms,
                     slo_ms,
-                    max_queued_requests,
+                    max_queued_requests: match max_queued_requests {
+                        0 => RuntimeConfig::get().serve_max_queued_requests.unwrap_or(0),
+                        n => n,
+                    },
                     ..MuxConfig::default()
                 },
             )

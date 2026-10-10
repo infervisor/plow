@@ -192,6 +192,20 @@ pub const CUBLASLT_PREFILL_GEMMA4_26B_SHAPES: [(u32, u32); 8] = [
     (2816, 2112),
 ];
 
+/// Gemma-4-31B (hidden 5376, inter 21504, 32 q heads). Sliding layers: q (8192), k/v (4096),
+/// o (5376 x 8192). Full layers: q (16384), k (2048), o (5376 x 16384), no v_proj
+/// (attention_k_eq_v). Dense MLP: unfused gate/up (21504), down (5376 x 21504).
+pub const CUBLASLT_PREFILL_GEMMA4_31B_SHAPES: [(u32, u32); 8] = [
+    (8192, 5376),
+    (4096, 5376),
+    (5376, 8192),
+    (16384, 5376),
+    (2048, 5376),
+    (5376, 16384),
+    (21504, 5376),
+    (5376, 21504),
+];
+
 /// Gemma-4 E4B (hidden 2560, 8 q / 2 kv heads, sliding hd 256, full hd 512, inter 10240, 42
 /// layers x 256 per-layer inputs): q/k/v/o for both layer kinds, unfused gate/up, down, the
 /// per-layer input gate/projection and the per-layer model projection.
@@ -233,8 +247,12 @@ pub fn cublaslt_prefill_fp8(profile: &str, m: u32, n: u32, k: u32) -> bool {
     matches!(profile, "sm90a" | "sm_90a")
         && [64, 128, 256, 512, 1024, 1088, 1152, 2048, 2112, 2176, 4096, 4160, 4224, 8192].contains(&m)
         && (CUBLASLT_PREFILL_GEMMA4_SHAPES.contains(&(n, k))
-            || CUBLASLT_PREFILL_GEMMA4_26B_SHAPES.contains(&(n, k)))
+            || CUBLASLT_PREFILL_GEMMA4_26B_SHAPES.contains(&(n, k))
+            || CUBLASLT_PREFILL_GEMMA4_31B_SHAPES.contains(&(n, k)))
         && !((n, k) == (3840, 15360) && m >= 2048)
+        // 31B down_proj: the native ws384 FP8 body measured 7-15% faster at 512 and >= 2048 rows
+        // (route matrix, H100 2026-10-09: 0.122 vs 0.136 ms at 512, 1.336 vs 1.573 at 8192).
+        && !((n, k) == (5376, 21504) && (m == 512 || m >= 2048))
         && !(m == 2112 && [(3840, 4096), (3840, 8192)].contains(&(n, k)))
 }
 
@@ -253,6 +271,7 @@ pub fn cublaslt_prefill_bf16(profile: &str, m: u32, n: u32, k: u32) -> bool {
         "sm90a" | "sm_90a" => {
             rows && (CUBLASLT_PREFILL_GEMMA4_SHAPES.contains(&(n, k))
                 || CUBLASLT_PREFILL_GEMMA4_26B_SHAPES.contains(&(n, k))
+                || CUBLASLT_PREFILL_GEMMA4_31B_SHAPES.contains(&(n, k))
                 || CUBLASLT_PREFILL_GEMMA4_E4B_SHAPES.contains(&(n, k))
                 || CUBLASLT_PREFILL_LLAMA_TTS_SHAPES.contains(&(n, k))
                 || CUBLASLT_PREFILL_QWEN3_1_7B_SHAPES.contains(&(n, k)))
@@ -758,6 +777,17 @@ mod tests {
         }
         assert!(!super::cublaslt_prefill_fp8("sm120", 1152, 4096, 3840));
         assert!(!super::cublaslt_prefill_fp8("sm90a", 1216, 4096, 3840));
+    }
+
+    #[test]
+    fn fp8_31b_down_stays_native_where_measured_faster() {
+        for m in [128, 256, 512, 1024, 1088, 2048, 4096, 4224, 8192] {
+            for (n, k) in super::CUBLASLT_PREFILL_GEMMA4_31B_SHAPES {
+                let native = (n, k) == (5376, 21504) && (m == 512 || m >= 2048);
+                assert_eq!(super::cublaslt_prefill_fp8("sm90a", m, n, k), !native);
+                assert!(super::cublaslt_prefill_bf16("sm90a", m, n, k));
+            }
+        }
     }
 
     use super::*;
