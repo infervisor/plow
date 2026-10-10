@@ -1715,6 +1715,7 @@ pub fn spawn(
                     cfg.multi_step,
                     co_scheduled,
                     quantum_cut,
+                    std::time::Duration::from_secs_f64(queue_aging_ms(cfg.slo_ms) / 1e3),
                 );
                 (out, t_body.map_or(0, |t| t.elapsed().as_nanos() as u64))
             };
@@ -2634,6 +2635,8 @@ fn run_one_tick(
     )]
     co_scheduled: bool,
     #[cfg_attr(not(feature = "cuda"), allow(unused_variables))] quantum_cut: QuantumCut,
+    // A prefill candidate that has waited this long is served oldest-first ([`queue_aging_ms`]).
+    #[cfg_attr(not(feature = "cuda"), allow(unused_variables))] aging: std::time::Duration,
 ) -> (
     Vec<Option<Slot>>,
     Option<BucketBufs>,
@@ -3007,7 +3010,7 @@ fn run_one_tick(
                 if let Some(f) = gpu_prefill_batched_pass(
                     &mut *e, &mut slots, cap, &arena, feeds.is_empty(), co_scheduled, &mut completed,
                     &mut feeds, &mut obs.host.token_batch_tokens, &mut dev_sampled,
-                    &mut obs.host.ride,
+                    &mut obs.host.ride, aging,
                 ) {
                     if tick_fault.is_none() {
                         tick_fault = Some(f);
@@ -4907,7 +4910,8 @@ fn kv_used(kv_budget: Option<crate::sched::admission::KvBudget>, slots: &[Option
 
 /// Prefill rows for one launch, from the queue (the latency objective's packing).
 ///
-/// `rows` are the waiting prompts' offered rows, oldest first. A launch costs a fixed
+/// `rows` are the waiting prompts' offered rows, in serve order (shortest remaining prompt first,
+/// `sched::step::shortest_first_key`). A launch costs a fixed
 /// `chunk_cost` rows of time plus its rows, and every prompt packed into it finishes when the
 /// launch does. So packing prompt `j + 1` (r rows) delays the `j` prompts already in by r rows and
 /// saves the `n - j` prompts not yet in one fixed cost each: it joins while
@@ -4916,15 +4920,19 @@ fn kv_used(kv_budget: Option<crate::sched::admission::KvBudget>, slots: &[Option
 /// 128/512/1024/2048/4096 rows 16.8/26.6/45.2/86.6/172.3: four 1024-row prompts packed all finish
 /// at 172 ms, alone they finish at 45/90/135/180.
 ///
-/// A prompt no launch can hold whole (`r >= bound`) still FILLS this one, as the static bound
-/// does: stopping short there ran a long prompt's tail as two padded launches instead of one full
-/// one (12B 15000 in, C4: TPOT 25.1 -> 26.6 ms, 105.8 -> 102.0 tok/s). A shorter prompt that does
-/// not fit waits for the next launch: splitting it costs it a launch.
+/// A prompt no launch can hold whole (`r >= bound`), wherever it waits, still FILLS this one, as
+/// the static bound does: stopping short there ran a long prompt's tail as two padded launches
+/// instead of one full one (12B 15000 in, C4: TPOT 25.1 -> 26.6 ms, 105.8 -> 102.0 tok/s). The
+/// shorter prompts ahead of it take their rows first. A shorter prompt that does not fit waits for
+/// the next launch: splitting it costs it a launch.
 #[cfg(feature = "cuda")]
 fn queue_pack_rows(rows: &[usize], chunk_cost: usize, bound: usize) -> usize {
     let Some((&first, rest)) = rows.split_first() else {
         return bound;
     };
+    if rows.iter().any(|&r| r >= bound) {
+        return bound;
+    }
     let mut total = first.min(bound);
     for (j, &r) in rest.iter().enumerate() {
         let (packed, waiting) = (j + 1, rows.len() - (j + 1));
@@ -5306,6 +5314,7 @@ fn gpu_prefill_batched_pass(
     unified_output: &mut Vec<(u32, u32)>,
     dev_sampled: &mut bool,
     ride: &mut crate::sched::ride::RideCost,
+    aging: std::time::Duration,
 ) -> Option<crate::DeviceErrorInfo> {
     use crate::exec::gpu::PfBatchReq;
 
@@ -5441,7 +5450,11 @@ fn gpu_prefill_batched_pass(
                     program: 0,
                 };
                 Some(crate::sched::step::Candidate {
-                    arrival: arrival_key(s.arrived, now),
+                    arrival: crate::sched::step::shortest_first_key(
+                        n - withheld - pf_pos,
+                        now.saturating_duration_since(s.arrived),
+                        aging,
+                    ),
                     span,
                     packable: true,
                     planned: true,
@@ -6957,6 +6970,8 @@ mod tests {
         // A prompt that a later launch holds whole is not split to top this one up.
         assert_eq!(super::queue_pack_rows(&[1024; 16], 512, 4224), 4096);
         assert_eq!(super::queue_pack_rows(&[4096, 4096], 512, 4224), 4096);
+        // Shortest first: a long prompt behind short ones still fills the launch they lead.
+        assert_eq!(super::queue_pack_rows(&[128, 128, 1024, 8192], 512, 4224), 4224);
     }
 
     /// A held prefix that turns out not to begin a match is released, not dropped.

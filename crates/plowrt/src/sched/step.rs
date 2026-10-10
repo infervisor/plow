@@ -112,6 +112,20 @@ impl Plan {
     }
 }
 
+/// [`Candidate::arrival`] for shortest-remaining-prefill-first: a request that has waited `aging`
+/// goes first, oldest first; the rest by the prompt rows they still owe, then oldest first. The
+/// deadline-free form of `slo`'s EDF order (prompts this tick completes go first): a long prompt
+/// filling every launch no longer holds back the short ones seated after it, and the aging bound
+/// keeps a stream of short ones from starving it.
+pub fn shortest_first_key(remaining: usize, waited: std::time::Duration, aging: std::time::Duration) -> u64 {
+    if waited >= aging {
+        return (u64::MAX >> 1) - u64::try_from(waited.as_nanos()).unwrap_or(u64::MAX >> 1).min(u64::MAX >> 1);
+    }
+    let rows = remaining.min(u32::MAX as usize >> 1) as u64;
+    let younger = u32::MAX - u32::try_from(waited.as_micros()).unwrap_or(u32::MAX);
+    (1 << 63) | (rows << 32) | u64::from(younger)
+}
+
 /// Plan one tick.
 ///
 /// `program_rows(program)` is the compiled row count of a packed program and
@@ -399,6 +413,33 @@ mod tests {
         let got = plan(amd(), t, [], &isolated, rung_2048, |_| u32::MAX);
         assert_eq!(got.launches.iter().map(|l| l.spans[0].slot).collect::<Vec<_>>(), [200, 140]);
         assert!(plan(amd(), Tick { slots: 200, ..t }, [], &isolated, rung_2048, |_| u32::MAX).launches.iter().all(|l| l.spans[0].slot != 200));
+    }
+
+    #[test]
+    fn shortest_first_orders_aged_then_by_remaining_rows() {
+        use std::time::Duration;
+        let aging = Duration::from_millis(1000);
+        let ms = Duration::from_millis;
+        let long_old = shortest_first_key(15_000, ms(300), aging);
+        let short_new = shortest_first_key(100, ms(5), aging);
+        let short_older = shortest_first_key(100, ms(50), aging);
+        let mid = shortest_first_key(2_000, ms(900), aging);
+        assert!(short_older < short_new && short_new < mid && mid < long_old);
+        let long_aged = shortest_first_key(15_000, ms(1000), aging);
+        let older_aged = shortest_first_key(9_000, ms(4000), aging);
+        assert!(older_aged < long_aged && long_aged < short_older, "aged requests first, oldest first");
+        assert!(shortest_first_key(usize::MAX, Duration::MAX, aging) < shortest_first_key(1, ms(0), aging));
+        // The CUDA pack (Greedy): the short prompt seated after the long one gets its rows first.
+        let backend = Backend {
+            step_budget: 4096,
+            packing: true,
+            split_spans: true,
+            decode_rows_join_prefill: false,
+            span_policy: Some(crate::sched::prefill::SpanPolicy::Greedy),
+        };
+        let candidates = [cand(0, long_old, 0, 4096, true, true), cand(1, short_new, 0, 100, true, true)];
+        let got = plan(backend, Tick { slots: 2, ..tick(true) }, [], &candidates, |_| Some(4096), |_| u32::MAX);
+        assert_eq!(got.launches[0].spans.iter().map(|s| (s.slot, s.n_rows)).collect::<Vec<_>>(), [(1, 100), (0, 3996)]);
     }
 
     #[test]
