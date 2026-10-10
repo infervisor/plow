@@ -209,6 +209,17 @@ pub struct RuntimeConfig {
     #[arg(long = "asr-vad-packet", env = "PLOW_ASR_VAD_PACKET", global = true)]
     pub asr_vad_packet: Option<std::path::PathBuf>,
 
+    /// Write spoken digit runs in transcripts as numerals (`asr::numerals`): "nine one eight seven
+    /// three four one five three eight" becomes "918-734-1538".
+    #[arg(long = "asr-numerals", env = "PLOW_ASR_NUMERALS", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub asr_numerals: bool,
+
+    /// Languages (as the model's packet names them, its `languages` string) a transcript may be
+    /// detected in when the request names none: a final transcript detected in another is
+    /// transcribed again in the first of these. A deployment's choice; comma-separated; unset = any.
+    #[arg(long = "asr-auto-languages", env = "PLOW_ASR_AUTO_LANGUAGES", value_delimiter = ',', global = true)]
+    pub asr_auto_languages: Vec<String>,
+
     /// API keys a request must present as `Authorization: Bearer <key>` or `x-api-key: <key>`.
     /// Repeatable; the environment form is comma-separated. `/health` and `/healthz` stay open.
     /// Unset = no authentication.

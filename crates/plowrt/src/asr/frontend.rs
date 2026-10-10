@@ -57,9 +57,12 @@ pub fn decode_wav_within(bytes: &[u8], max_samples: usize) -> std::result::Resul
         out.extend(resampler.finish());
         out
     };
-    if samples.len() < SAMPLE_RATE as usize / 2 {
-        return Err(AudioError::Invalid("audio must contain at least 0.5 seconds".into()));
+    if samples.is_empty() {
+        return Err(AudioError::Invalid("audio is empty".into()));
     }
+    // Shorter clips (a recording's tail) are padded with silence to the models' minimum.
+    let mut samples = samples;
+    samples.resize(samples.len().max(SAMPLE_RATE as usize / 2), 0.0);
     Ok(samples)
 }
 

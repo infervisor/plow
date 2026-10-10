@@ -240,7 +240,7 @@ Auth: the usual key headers, or the browser subprotocol `openai-insecure-api-key
   answered by `transcription_session.updated` (`session.updated`). An unknown model fails the
   update (`model_not_found`). Audio needs a model, from `?model=` or the update.
 - `input_audio_buffer.append` {`audio`: base64}. With `turn_detection: {type: "server_vad"}` (the
-  default; `silence_duration_ms` 200..=2000, default 500) the continuous-mode endpointer cuts
+  default; `silence_duration_ms` 200..=2000, default 300) the continuous-mode endpointer cuts
   turns: `input_audio_buffer.speech_started` {`audio_start_ms`, `item_id`},
   `.speech_stopped` {`audio_end_ms`, `item_id`}, `.committed` {`item_id`, `previous_item_id`}.
   `threshold` (0..=1) is the Silero speech probability when a VAD packet is loaded (see
@@ -279,11 +279,32 @@ PyTorch model to 6e-7. A configured packet that does not load fails startup.
 - Uploads (`/v1/audio/transcriptions`, not `append`/`final` pieces) with under
   `gate.min_total_speech_ms` (Silero: 250 ms) of detected speech are answered with an empty
   transcript before any model runs: an audio-LM otherwise transcribes noise or echoes its prompt.
-- Continuous WebSocket sessions and Realtime `server_vad` end turns on the VAD's speech
+- Continuous WebSocket sessions and Realtime `server_vad` decide speech with the VAD packet
   (hysteresis `threshold` / `max(threshold - policy.release_offset, policy.release_floor)`,
-  Silero 0.15 / 0.01) instead of the energy endpointer; turn timing
-  (`min_silence_ms` / `silence_duration_ms`, 200 ms context, overlong cuts at the least-speech
-  frame) is unchanged.
+  Silero 0.15 / 0.01) instead of the energy endpointer. Where speech ends is timed by energy in
+  8 ms slices (only confident frames time a turn too quiet for energy): Silero's probability decays
+  about 60 ms after the voice stops. On the customer calls turns close 520/540 ms (p50/p95) after
+  the voice at a 500 ms silence, against 500/500 for energy and 580/640 when Silero timed the end
+  itself. A Realtime turn with less confident speech than `policy.min_speech_ms` (Silero 250 ms)
+  gets an empty transcript. Turn timing (`min_silence_ms` / `silence_duration_ms`, 200 ms context,
+  overlong cuts at the least-speech frame) is otherwise unchanged.
+
+## Transcript output policy
+
+Every transcription (uploads, Realtime and WebSocket turns) passes `Route::submit`, which applies:
+
+- `--asr-numerals` (`PLOW_ASR_NUMERALS`, on): runs of three or more spoken digits become numerals,
+  ten digits as `918-734-1538`, seven as `734-1538`, others plain; "double five" is `55`. Runs need
+  two digits other than "oh", and "oh" at a run's ends stays a word, so interjections survive.
+- `--asr-auto-languages` (`PLOW_ASR_AUTO_LANGUAGES`, unset = any language): a final pass that named
+  no language and was detected in another is transcribed again in the first listed (a caller
+  opening in Hindi otherwise gets the whole segment in Devanagari). Names are the packet's
+  `languages` (Qwen3-ASR: `English`, `Spanish`, ...). A deployment choice, not a runtime default:
+  the L4 unit (`scripts/asr/nvidia/plow-asr.service`) sets `English,Spanish`.
+- Uploads under 0.5 s are padded with silence to the minimum instead of refused.
+
+On the customer's 49-call set with their `transcribe.py`/`score.py` (Gemini references), English
+caller WER went 12.03% → 9.94% and caller digit recall 31.8% → 50.0% (language auto).
 
 H100 serving host (`recipes/infervisor/silero-vad/sm90a-h100-tp1.toml`; the packet is
 device-agnostic and runs beside any ASR bundle): on one EPYC 7R13 core 70 us per stream-frame,

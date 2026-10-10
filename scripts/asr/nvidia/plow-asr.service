@@ -11,7 +11,8 @@ Environment=LD_LIBRARY_PATH=/opt/plow-asr/lib
 EnvironmentFile=-/etc/plow-asr.env
 ExecStart=/opt/plow-asr/bin/plowrt serve --bind 0.0.0.0 --port 8000 \
   --assets /opt/plow-asr/models/qwen3-asr \
-  --asr-vad-packet /opt/plow-asr/models/silero-vad/silero_vad.pkt
+  --asr-vad-packet /opt/plow-asr/models/silero-vad/silero_vad.pkt \
+  --asr-auto-languages English,Spanish
 Restart=always
 RestartSec=5
 KillSignal=SIGTERM

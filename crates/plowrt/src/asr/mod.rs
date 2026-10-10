@@ -1,6 +1,7 @@
 pub mod conformer;
 pub mod endpoint;
 pub mod frontend;
+pub mod numerals;
 #[cfg(feature = "gguf")]
 pub mod nemotron;
 mod packet;

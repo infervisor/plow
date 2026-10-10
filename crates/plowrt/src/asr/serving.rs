@@ -113,8 +113,61 @@ pub(crate) struct AsrOpts {
     pub ingress: Option<crate::serve::mux::OwnedIngress>,
 }
 
+/// The language to transcribe again in when `detected` is outside `allowed` (names as the model's
+/// packet reports them; empty = any language).
+fn auto_language_retry<'a>(detected: &str, allowed: &'a [String]) -> Option<&'a str> {
+    let first = allowed.first()?;
+    (!allowed.iter().any(|l| l.eq_ignore_ascii_case(detected))).then_some(first.as_str())
+}
+
 impl Route {
+    /// [`Self::submit_once`], then the transcript's output policy: spoken digits as numerals
+    /// (`--asr-numerals`) and, for a final pass that named no language, one retry in the first
+    /// `--asr-auto-languages` language when the model detected another.
     fn submit(
+        &self,
+        samples: Vec<f32>,
+        language: Option<String>,
+        context: String,
+        cancel: Arc<AtomicBool>,
+        opts: AsrOpts,
+    ) -> Result<oneshot::Receiver<crate::Result<Transcript>>, SubmitError> {
+        let config = crate::config::RuntimeConfig::get();
+        let allowed: Vec<String> = config.asr_auto_languages.iter().map(|l| l.trim().to_owned()).filter(|l| !l.is_empty()).collect();
+        let retry = (language.is_none() && opts.final_pass && !allowed.is_empty())
+            .then(|| (samples.clone(), context.clone(), cancel.clone()));
+        let numerals = config.asr_numerals;
+        let first = self.submit_once(samples, language, context, cancel, opts)?;
+        if retry.is_none() && !numerals {
+            return Ok(first);
+        }
+        let route = self.clone();
+        let (tx, rx) = oneshot::channel();
+        tokio::spawn(async move {
+            let Ok(mut result) = first.await else { return };
+            let detected = result.as_ref().ok().and_then(|t| t.language.clone());
+            if let (Some((samples, context, cancel)), Some(detected)) = (retry, detected) {
+                if let Some(retry) = auto_language_retry(&detected, &allowed) {
+                    tracing::debug!(%detected, %retry, "ASR language outside --asr-auto-languages");
+                    let opts = AsrOpts { final_pass: true, ..Default::default() };
+                    if let Ok(again) = route.submit_once(samples, Some(retry.to_owned()), context, cancel, opts) {
+                        if let Ok(again) = again.await {
+                            result = again;
+                        }
+                    }
+                }
+            }
+            if numerals {
+                if let Ok(transcript) = &mut result {
+                    transcript.text = crate::asr::numerals::spoken_digits_to_numerals(&transcript.text);
+                }
+            }
+            let _ = tx.send(result);
+        });
+        Ok(rx)
+    }
+
+    fn submit_once(
         &self,
         samples: Vec<f32>,
         language: Option<String>,
@@ -2365,6 +2418,51 @@ mod tests {
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
+    /// Detects Hindi unless told the language; reads out a phone number.
+    struct Codeswitch(Arc<std::sync::atomic::AtomicUsize>);
+    impl Transcriber for Codeswitch {
+        fn language(&self, language: Option<&str>) -> crate::Result<Option<String>> {
+            Ok(language.map(str::to_owned))
+        }
+        fn transcribe(&mut self, _: &[f32], language: Option<&str>, _: &str, _: &AtomicBool) -> crate::Result<Transcript> {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            Ok(match language {
+                None => Transcript { text: "मेरा नंबर".into(), language: Some("Hindi".into()) },
+                Some(l) => Transcript { text: "My number is nine one eight seven three four one five three eight.".into(), language: Some(l.into()) },
+            })
+        }
+    }
+
+    #[test]
+    fn outside_auto_languages_retries_in_the_first() {
+        let allowed = ["English".to_owned(), "Spanish".to_owned()];
+        assert_eq!(auto_language_retry("Hindi", &allowed), Some("English"));
+        assert_eq!(auto_language_retry("spanish", &allowed), None);
+        assert_eq!(auto_language_retry("Hindi", &[]), None);
+    }
+
+    #[tokio::test]
+    async fn default_accepts_any_language_and_writes_numerals() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let app = AsrServer::new("test".into(), Codeswitch(calls.clone())).router(false);
+        let body = |r: Response| async { r.into_body().collect().await.unwrap().to_bytes() };
+        let response = app.clone().oneshot(upload("/v1/audio/transcriptions", &[("model", "test")], &[0.1; 16_000])).await.unwrap();
+        assert_eq!(&body(response).await[..], r#"{"text":"मेरा नंबर"}"#.as_bytes());
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        let response = app.clone().oneshot(upload("/v1/audio/transcriptions", &[("model", "test"), ("language", "English")], &[0.1; 16_000])).await.unwrap();
+        assert_eq!(&body(response).await[..], br#"{"text":"My number is 918-734-1538."}"#);
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
+    async fn clips_under_half_a_second_are_padded_not_refused() {
+        let app = AsrServer::new("test".into(), Fake).router(false);
+        let response = app.clone().oneshot(upload("/v1/audio/transcriptions", &[("model", "test")], &[0.0; 1_600])).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = app.oneshot(upload("/v1/audio/transcriptions", &[("model", "test")], &[])).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
     #[tokio::test]
     async fn vad_route_is_absent_without_a_packet() {
         let app = AsrServer::new("test".into(), Fake).router(false);
@@ -2416,7 +2514,7 @@ mod tests {
         );
         for (rate, samples, status) in [
             (7000, 7000, StatusCode::UNSUPPORTED_MEDIA_TYPE),
-            (16000, 7999, StatusCode::BAD_REQUEST),
+            (16000, 7999, StatusCode::OK),
             (16000, 480001, StatusCode::PAYLOAD_TOO_LARGE),
         ] {
             assert_eq!(
