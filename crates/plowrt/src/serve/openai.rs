@@ -226,6 +226,10 @@ pub struct ChatRequest {
     pub function_call: Option<serde_json::Value>,
     #[serde(default)]
     pub response_format: Option<serde_json::Value>,
+    /// vLLM's `include_reasoning`: `false` leaves the trace out of the response (it is still
+    /// split from `content` and counted in `reasoning_tokens`).
+    #[serde(default)]
+    pub include_reasoning: Option<bool>,
 }
 
 /// Stop matching runs on the serialized dispatcher for every generated token, in time

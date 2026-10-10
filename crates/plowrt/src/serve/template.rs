@@ -47,6 +47,8 @@ pub struct ChatTemplate {
     pub source: String,
     /// Whether the template renders `tools`, and the call syntax its model answers in.
     pub tools: crate::serve::tools::ToolSupport,
+    /// The reasoning-trace markers its model writes, when the template shows any.
+    pub reasoning: Option<(&'static str, &'static str)>,
 }
 
 impl std::fmt::Debug for ChatTemplate {
@@ -261,6 +263,7 @@ impl ChatTemplate {
             eos_token,
             source,
             tools: crate::serve::tools::ToolSupport::None,
+            reasoning: crate::serve::tools::reasoning_markers(&text),
         };
         t.tools = crate::serve::tools::ToolSupport::probe(&t, &text);
         tracing::info!(source = %t.source, tools = ?t.tools, "chat template tool support");

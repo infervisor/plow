@@ -6796,6 +6796,39 @@ fn stop_prefix_held(tail: &str, stops: &[String], delta_len: usize) -> usize {
         .min(delta_len)
 }
 
+/// A dispatcher with no engine: each job is answered with `script(&job)`'s pieces, one token
+/// each, then `Done` (`length` when the pieces reach `max_tokens`). For HTTP-level tests of
+/// the handlers.
+#[cfg(test)]
+pub(crate) fn scripted_mux(script: impl Fn(&Job) -> Vec<String> + Send + Sync + 'static) -> ModelMux {
+    let (tx, mut rx) = mpsc::channel::<MuxMsg>(64);
+    tokio::spawn(async move {
+        while let Some(msg) = rx.recv().await {
+            let MuxMsg::Job(job, _) = msg else { continue };
+            let pieces = script(&job);
+            let n = pieces.len();
+            for text in pieces {
+                let logprobs = job.gen.params.logprobs.map(|_| Box::new(crate::text::logprobs::TokenLogprobs { logprob: -0.25, top: Vec::new() }));
+                if job.respond.send(StreamChunk::Token { id: 7, text, logprobs }).await.is_err() {
+                    break;
+                }
+            }
+            let reason = if n >= job.gen.max_tokens { FinishReason::Length } else { FinishReason::Stop };
+            let usage = crate::serve::stream::TokenUsage { prompt_tokens: job.prompt_ids.len(), cached_tokens: 0, completion_tokens: n };
+            let _ = job.respond.send(StreamChunk::Done { executed: n, reason, usage }).await;
+        }
+    });
+    ModelMux {
+        tx,
+        metrics: Arc::new(Metrics::default()),
+        preempt: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        preempt_notify: Arc::new(tokio::sync::Notify::new()),
+        arrival_notify: Arc::new(tokio::sync::Notify::new()),
+        ingress: Arc::default(),
+        preempted: Arc::default(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     /// The reported defect: a stop string split across two deltas leaked its own prefix.

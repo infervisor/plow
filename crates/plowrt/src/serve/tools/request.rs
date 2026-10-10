@@ -34,20 +34,61 @@ fn unsupported(param: &'static str, message: impl Into<String>) -> Refusal {
     Refusal { message: message.into(), param, code: "unsupported_parameter" }
 }
 
+/// One declared function.
+#[derive(Clone, Debug)]
+pub struct ToolDef {
+    pub name: String,
+    /// The `parameters` JSON schema (`null` when absent).
+    pub params: Value,
+    /// `function.strict`: the arguments are validated against `params`.
+    pub strict: bool,
+}
+
+/// What `tool_choice` asks of the turn.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum Force {
+    #[default]
+    Auto,
+    /// At least one call, to any declared function.
+    Required,
+    /// Exactly one call, to this function.
+    Named(String),
+}
+
 /// What the response parser needs to know about the request.
 #[derive(Clone, Debug)]
 pub struct ParseSpec {
     pub format: ToolFormat,
-    /// `(name, parameters schema)` per declared tool, for typing string-valued formats.
-    pub tools: Arc<Vec<(String, Value)>>,
+    pub tools: Arc<Vec<ToolDef>>,
     /// `parallel_tool_calls: false` keeps only the first call.
     pub parallel: bool,
+    pub force: Force,
+    /// Calls already in the conversation (Kimi-K2 numbers its ids across the conversation).
+    pub history_calls: usize,
 }
 
 impl ParseSpec {
+    /// A spec with no declared tools, for a format whose parser also splits plain answers.
+    pub fn plain(format: ToolFormat) -> Self {
+        ParseSpec { format, tools: Arc::new(Vec::new()), parallel: true, force: Force::Auto, history_calls: 0 }
+    }
+
+    pub fn tool(&self, name: &str) -> Option<&ToolDef> {
+        self.tools.iter().find(|t| t.name == name)
+    }
+
+    /// The call opener a forced `tool_choice` appends to the prompt.
+    pub fn opener(&self) -> Option<String> {
+        match &self.force {
+            Force::Auto => None,
+            Force::Required => Some(self.format.opener(None, self.history_calls)),
+            Force::Named(n) => Some(self.format.opener(Some(n), self.history_calls)),
+        }
+    }
+
     /// The JSON-schema `type` of `tool`'s parameter `param`, when declared.
     pub fn param_type(&self, tool: &str, param: &str) -> Option<&str> {
-        let (_, params) = self.tools.iter().find(|(n, _)| n == tool)?;
+        let params = &self.tool(tool)?.params;
         let ty = params.get("properties")?.get(param)?.get("type")?;
         match ty {
             Value::String(s) => Some(s),
@@ -66,11 +107,6 @@ pub struct Plan {
     pub parse: Option<ParseSpec>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Choice {
-    Auto,
-    None,
-}
 
 /// Validate the request's tool fields against what the model's template can do. `support` is
 /// `None` when the model is served without a chat template (built-in prompt builders).
@@ -84,26 +120,40 @@ pub fn plan(req: &ChatRequest, support: Option<ToolSupport>) -> Result<Plan, Ref
         }
     }
     let tools = validate_tools(req.tools.as_ref())?;
-    let choice = match req.tool_choice.as_ref() {
-        None | Some(Value::Null) => Choice::Auto,
-        Some(Value::String(s)) if s == "auto" => Choice::Auto,
-        Some(Value::String(s)) if s == "none" => Choice::None,
-        Some(Value::String(s)) if s == "required" => {
-            return Err(unsupported(
-                "tool_choice",
-                "`tool_choice: \"required\"` is not served: this server does not constrain decoding, so it \
-                 cannot guarantee a call; use \"auto\"",
-            ))
-        }
+    // `None`: the turn renders and parses no tools.
+    let force = match req.tool_choice.as_ref() {
+        None | Some(Value::Null) => Some(Force::Auto),
+        Some(Value::String(s)) if s == "auto" => Some(Force::Auto),
+        Some(Value::String(s)) if s == "none" => None,
+        Some(Value::String(s)) if s == "required" => Some(Force::Required),
         Some(Value::Object(o)) if o.get("type").and_then(Value::as_str) == Some("function") => {
-            return Err(unsupported(
+            // Chat Completions nests the name under `function`; the Responses API puts it at the top.
+            let name = o.get("function").and_then(|f| f.get("name")).or_else(|| o.get("name")).and_then(Value::as_str);
+            let Some(name) = name else {
+                return Err(invalid("tool_choice", "`tool_choice.function.name` is required"));
+            };
+            Some(Force::Named(name.to_string()))
+        }
+        Some(Value::Object(o)) if o.get("type").and_then(Value::as_str).is_some() => {
+            return Err(unsupported("tool_choice", format!("`tool_choice` type {} is not served", o["type"])))
+        }
+        Some(v) => {
+            return Err(invalid(
                 "tool_choice",
-                "forcing a specific function is not served: this server does not constrain decoding, so it \
-                 cannot guarantee the call; use \"auto\"",
+                format!("invalid `tool_choice` {v}; expected \"auto\", \"none\", \"required\" or a function"),
             ))
         }
-        Some(v) => return Err(invalid("tool_choice", format!("invalid `tool_choice` {v}; expected \"auto\" or \"none\""))),
     };
+    if let Some(Force::Required | Force::Named(_)) = &force {
+        let Some(list) = tools.as_ref() else {
+            return Err(invalid("tool_choice", "`tool_choice` forces a call but the request declares no `tools`"));
+        };
+        if let Some(Force::Named(n)) = &force {
+            if !list.iter().any(|t| t["function"]["name"].as_str() == Some(n.as_str())) {
+                return Err(invalid("tool_choice", format!("`tool_choice` names `{n}`, which is not in `tools`")));
+            }
+        }
+    }
     let history_calls = req.messages.iter().any(|m| m.tool_calls.as_ref().is_some_and(|v| !v.is_null()));
     if support.is_none() && history_calls {
         return Err(unsupported(
@@ -112,7 +162,7 @@ pub fn plan(req: &ChatRequest, support: Option<ToolSupport>) -> Result<Plan, Ref
              cannot be rendered",
         ));
     }
-    let Some(tools) = tools.filter(|_| choice == Choice::Auto) else {
+    let (Some(tools), Some(force)) = (tools, force) else {
         return Ok(Plan::default());
     };
     let format = match support {
@@ -137,16 +187,28 @@ pub fn plan(req: &ChatRequest, support: Option<ToolSupport>) -> Result<Plan, Ref
             ))
         }
     };
-    let schemas = tools
+    let defs = tools
         .iter()
         .map(|t| {
             let f = &t["function"];
-            (f["name"].as_str().unwrap_or_default().to_string(), f.get("parameters").cloned().unwrap_or(Value::Null))
+            ToolDef {
+                name: f["name"].as_str().unwrap_or_default().to_string(),
+                params: f.get("parameters").cloned().unwrap_or(Value::Null),
+                strict: f.get("strict").and_then(Value::as_bool).unwrap_or(false),
+            }
         })
         .collect();
+    let history_calls = req
+        .messages
+        .iter()
+        .filter_map(|m| m.tool_calls.as_ref().and_then(Value::as_array))
+        .map(Vec::len)
+        .sum();
+    // A named function is one call.
+    let parallel = req.parallel_tool_calls.unwrap_or(true) && !matches!(force, Force::Named(_));
     Ok(Plan {
         template_tools: Some(Value::Array(tools)),
-        parse: Some(ParseSpec { format, tools: Arc::new(schemas), parallel: req.parallel_tool_calls.unwrap_or(true) }),
+        parse: Some(ParseSpec { format, tools: Arc::new(defs), parallel, force, history_calls }),
     })
 }
 
@@ -184,6 +246,9 @@ fn validate_tools(tools: Option<&Value>) -> Result<Option<Vec<Value>>, Refusal> 
         }
         if f.get("description").is_some_and(|d| !d.is_string() && !d.is_null()) {
             return Err(invalid("tools", format!("tools[{i}]: `description` must be a string")));
+        }
+        if f.get("strict").is_some_and(|d| !d.is_boolean() && !d.is_null()) {
+            return Err(invalid("tools", format!("tools[{i}]: `strict` must be a boolean")));
         }
     }
     Ok(Some(list.clone()))
@@ -328,12 +393,16 @@ mod tests {
     fn what_cannot_be_honored_is_refused() {
         let code = |body: Value, s: Option<ToolSupport>| plan(&req(body), s).err().map(|r| (r.param, r.code));
         let t = || json!([tool("f")]);
-        assert_eq!(code(json!({"tools": t(), "tool_choice": "required"}), GEMMA), Some(("tool_choice", "unsupported_parameter")));
-        assert_eq!(
-            code(json!({"tools": t(), "tool_choice": {"type": "function", "function": {"name": "f"}}}), GEMMA),
-            Some(("tool_choice", "unsupported_parameter"))
-        );
         assert_eq!(code(json!({"tools": t(), "tool_choice": "sometimes"}), GEMMA), Some(("tool_choice", "invalid_value")));
+        assert_eq!(code(json!({"tool_choice": "required"}), GEMMA), Some(("tool_choice", "invalid_value")));
+        assert_eq!(
+            code(json!({"tools": t(), "tool_choice": {"type": "function", "function": {"name": "g"}}}), GEMMA),
+            Some(("tool_choice", "invalid_value"))
+        );
+        assert_eq!(code(json!({"tools": t(), "tool_choice": {"type": "function"}}), GEMMA), Some(("tool_choice", "invalid_value")));
+        assert_eq!(code(json!({"tools": t(), "tool_choice": {"type": "allowed_tools"}}), GEMMA), Some(("tool_choice", "unsupported_parameter")));
+        assert_eq!(code(json!({"tools": t(), "tool_choice": "required"}), Some(ToolSupport::None)), Some(("tools", "unsupported_parameter")));
+        assert_eq!(code(json!({"tools": [{"type": "function", "function": {"name": "f", "strict": "yes"}}]}), GEMMA), Some(("tools", "invalid_value")));
         assert_eq!(code(json!({"functions": [{"name": "f"}]}), GEMMA), Some(("functions", "unsupported_parameter")));
         assert_eq!(code(json!({"function_call": "auto"}), GEMMA), Some(("function_call", "unsupported_parameter")));
         assert_eq!(code(json!({"tools": t()}), Some(ToolSupport::None)), Some(("tools", "unsupported_parameter")));
@@ -351,6 +420,35 @@ mod tests {
             {"role": "assistant", "content": null, "tool_calls": [{"id": "c1", "type": "function", "function": {"name": "f", "arguments": "{}"}}]}]});
         assert_eq!(code(hist.clone(), None), Some(("messages", "unsupported_parameter")));
         assert!(plan(&req(hist), Some(ToolSupport::None)).is_ok());
+    }
+
+    #[test]
+    fn forced_tool_choice_carries_its_opener() {
+        let p = plan(&req(json!({"tools": [tool("f"), tool("g")], "tool_choice": "required"})), GEMMA).unwrap();
+        let spec = p.parse.unwrap();
+        assert_eq!((spec.force.clone(), spec.parallel), (Force::Required, true));
+        assert_eq!(spec.opener().as_deref(), Some("<|tool_call>call:"));
+        let named = json!({"tools": [tool("f"), tool("g")], "tool_choice": {"type": "function", "function": {"name": "g"}}});
+        let spec = plan(&req(named), GEMMA).unwrap().parse.unwrap();
+        assert_eq!((spec.force.clone(), spec.parallel), (Force::Named("g".into()), false), "a named function is one call");
+        assert_eq!(spec.opener().as_deref(), Some("<|tool_call>call:g{"));
+        // the Responses API shape
+        let spec = plan(&req(json!({"tools": [tool("f")], "tool_choice": {"type": "function", "name": "f"}})), GEMMA).unwrap().parse.unwrap();
+        assert_eq!(spec.force, Force::Named("f".into()));
+        assert_eq!(plan(&req(json!({"tools": [tool("f")]})), GEMMA).unwrap().parse.unwrap().opener(), None);
+        // Kimi-K2 numbers its ids across the conversation
+        let kimi = Some(ToolSupport::Format(ToolFormat::KimiK2));
+        let hist = json!({"tools": [tool("f")], "tool_choice": {"type": "function", "function": {"name": "f"}}, "messages": [
+            {"role": "user", "content": "q"},
+            {"role": "assistant", "content": null, "tool_calls": [
+                {"id": "functions.f:0", "type": "function", "function": {"name": "f", "arguments": "{}"}},
+                {"id": "functions.f:1", "type": "function", "function": {"name": "f", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": "functions.f:0", "content": "1"},
+            {"role": "tool", "tool_call_id": "functions.f:1", "content": "2"}]});
+        let spec = plan(&req(hist), kimi).unwrap().parse.unwrap();
+        assert!(spec.opener().unwrap().ends_with("functions.f:2<|tool_call_argument_begin|>"));
+        let strict = json!({"tools": [{"type": "function", "function": {"name": "f", "strict": true, "parameters": {"type": "object"}}}]});
+        assert!(plan(&req(strict), GEMMA).unwrap().parse.unwrap().tools[0].strict);
     }
 
     #[test]

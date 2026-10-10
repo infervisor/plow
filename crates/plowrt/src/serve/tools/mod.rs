@@ -16,8 +16,11 @@
 pub mod parse;
 pub mod pyjson;
 pub mod request;
+pub mod schema;
 pub mod stream;
 
+#[cfg(test)]
+mod http_tests;
 #[cfg(test)]
 mod parity_tests;
 
@@ -44,6 +47,10 @@ pub enum ToolFormat {
     KimiK2,
     /// gpt-oss harmony: `<|channel|>commentary to=functions.NAME <|constrain|>json<|message|>{..}`.
     Harmony,
+    /// DeepSeek V3 / R1: `<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>function<｜tool▁sep｜>NAME\n```json\n{..}\n```<｜tool▁call▁end｜>`.
+    DeepSeekV3,
+    /// DeepSeek V3.1: `<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>NAME<｜tool▁sep｜>{..}<｜tool▁call▁end｜>`.
+    DeepSeekV31,
 }
 
 impl ToolFormat {
@@ -57,6 +64,8 @@ impl ToolFormat {
             ToolFormat::Mistral => "mistral",
             ToolFormat::KimiK2 => "kimi_k2",
             ToolFormat::Harmony => "harmony",
+            ToolFormat::DeepSeekV3 => "deepseek_v3",
+            ToolFormat::DeepSeekV31 => "deepseek_v31",
         }
     }
 
@@ -74,6 +83,10 @@ impl ToolFormat {
             ToolFormat::Hermes
         } else if has("<|tool_calls_section_begin|>") {
             ToolFormat::KimiK2
+        } else if has("<｜tool▁calls▁begin｜>") && has("```json") {
+            ToolFormat::DeepSeekV3
+        } else if has("<｜tool▁calls▁begin｜>") {
+            ToolFormat::DeepSeekV31
         } else if has("[TOOL_CALLS]") {
             ToolFormat::Mistral
         } else if has("<|channel|>") && has("functions.") {
@@ -85,6 +98,36 @@ impl ToolFormat {
         })
     }
 
+    /// The text that opens a call in this syntax, up to the function name, and through it when
+    /// `name` is given: appended to the prompt it makes the generation a call
+    /// (`tool_choice: "required"` / a named function). `call_index` numbers Kimi-K2's ids.
+    pub fn opener(self, name: Option<&str>, call_index: usize) -> String {
+        let n = name.unwrap_or("");
+        match (self, name.is_some()) {
+            (ToolFormat::Gemma4, false) => "<|tool_call>call:".into(),
+            (ToolFormat::Gemma4, true) => format!("<|tool_call>call:{n}{{"),
+            (ToolFormat::Hermes, false) => "<tool_call>\n{\"name\": \"".into(),
+            (ToolFormat::Hermes, true) => format!("<tool_call>\n{{\"name\": \"{n}\", \"arguments\": "),
+            (ToolFormat::Qwen3Xml, false) => "<tool_call>\n<function=".into(),
+            (ToolFormat::Qwen3Xml, true) => format!("<tool_call>\n<function={n}>\n"),
+            (ToolFormat::Glm45, _) => format!("<tool_call>{n}"),
+            (ToolFormat::Llama3Json, false) => "{\"name\": \"".into(),
+            (ToolFormat::Llama3Json, true) => format!("{{\"name\": \"{n}\", \"parameters\": "),
+            (ToolFormat::Mistral, false) => "[TOOL_CALLS] [{\"name\": \"".into(),
+            (ToolFormat::Mistral, true) => format!("[TOOL_CALLS] [{{\"name\": \"{n}\", \"arguments\": "),
+            (ToolFormat::KimiK2, false) => "<|tool_calls_section_begin|><|tool_call_begin|>functions.".into(),
+            (ToolFormat::KimiK2, true) => {
+                format!("<|tool_calls_section_begin|><|tool_call_begin|>functions.{n}:{call_index}<|tool_call_argument_begin|>")
+            }
+            (ToolFormat::Harmony, false) => "<|channel|>commentary to=functions.".into(),
+            (ToolFormat::Harmony, true) => format!("<|channel|>commentary to=functions.{n} <|constrain|>json<|message|>"),
+            (ToolFormat::DeepSeekV3, false) => "<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>function<｜tool▁sep｜>".into(),
+            (ToolFormat::DeepSeekV3, true) => format!("<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>function<｜tool▁sep｜>{n}\n```json\n"),
+            (ToolFormat::DeepSeekV31, false) => "<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>".into(),
+            (ToolFormat::DeepSeekV31, true) => format!("<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>{n}<｜tool▁sep｜>"),
+        }
+    }
+
     /// The `id` a parsed call gets on the wire.
     pub fn call_id(self) -> String {
         match self {
@@ -92,6 +135,18 @@ impl ToolFormat {
             ToolFormat::Mistral => random_alnum(9),
             _ => format!("call_{}", random_alnum(24)),
         }
+    }
+}
+
+/// The reasoning-trace markers a template's model writes, read from the template:
+/// Gemma 4's thought channel and `<think>`. Harmony's channels are its parser's.
+pub fn reasoning_markers(template: &str) -> Option<(&'static str, &'static str)> {
+    if template.contains("<|channel>thought") && template.contains("<channel|>") {
+        Some(("<|channel>thought", "<channel|>"))
+    } else if template.contains("<think>") && template.contains("</think>") {
+        Some(("<think>", "</think>"))
+    } else {
+        None
     }
 }
 
@@ -134,6 +189,7 @@ pub struct SpecialText {
     /// Longest first, so a token that prefixes another does not cut it short.
     tokens: Vec<String>,
     first: [bool; 256],
+    longest: usize,
 }
 
 impl SpecialText {
@@ -145,15 +201,24 @@ impl SpecialText {
         for t in &tokens {
             first[t.as_bytes()[0] as usize] = true;
         }
-        SpecialText { tokens, first }
+        let longest = tokens.first().map_or(0, String::len);
+        SpecialText { tokens, first, longest }
     }
 
     pub fn strip(&self, s: &str) -> String {
-        if !s.bytes().any(|b| self.first[b as usize]) {
-            return s.to_string();
-        }
         let mut out = String::with_capacity(s.len());
-        let mut i = 0;
+        self.strip_into(s, &mut out);
+        out
+    }
+
+    /// [`Self::strip`], appended to `out`.
+    pub fn strip_into(&self, s: &str, out: &mut String) {
+        let Some(first) = s.bytes().position(|b| self.first[b as usize]) else {
+            out.push_str(s);
+            return;
+        };
+        out.push_str(&s[..first]);
+        let mut i = first;
         'outer: while i < s.len() {
             if self.first[s.as_bytes()[i] as usize] {
                 for t in &self.tokens {
@@ -163,11 +228,46 @@ impl SpecialText {
                     }
                 }
             }
-            let c = s[i..].chars().next().expect("in bounds");
-            out.push(c);
-            i += c.len_utf8();
+            // A token's first byte is never a UTF-8 continuation byte, so `next` is a char boundary.
+            let next = s.as_bytes()[i + 1..].iter().position(|&b| self.first[b as usize]).map_or(s.len(), |k| i + 1 + k);
+            out.push_str(&s[i..next]);
+            i = next;
         }
-        out
+    }
+
+    /// [`Self::strip_into`] over a stream of pieces: `hold` carries a tail that may begin a token
+    /// into the next piece (`last` flushes it), so a token split across pieces is still removed.
+    pub fn strip_stream(&self, hold: &mut String, s: &str, out: &mut String, last: bool) {
+        if hold.is_empty() {
+            let keep = if last { 0 } else { self.partial_tail(s) };
+            self.strip_into(&s[..s.len() - keep], out);
+            hold.push_str(&s[s.len() - keep..]);
+            return;
+        }
+        hold.push_str(s);
+        let w = std::mem::take(hold);
+        let keep = if last { 0 } else { self.partial_tail(&w) };
+        self.strip_into(&w[..w.len() - keep], out);
+        hold.push_str(&w[w.len() - keep..]);
+    }
+
+    /// Bytes at the end of `s` that are a proper prefix of some token.
+    fn partial_tail(&self, s: &str) -> usize {
+        let b = s.as_bytes();
+        let from = b.len().saturating_sub(self.longest.saturating_sub(1));
+        (from..b.len())
+            .find(|&p| {
+                self.first[b[p] as usize] && {
+                    let rest = &s[p..];
+                    self.tokens.iter().any(|t| t.len() > rest.len() && t.starts_with(rest))
+                }
+            })
+            .map_or(0, |p| b.len() - p)
+    }
+
+    /// Whether `s` contains any special token's text.
+    pub fn any_in(&self, s: &str) -> bool {
+        self.tokens.iter().any(|t| s.contains(t.as_str()))
     }
 }
 
