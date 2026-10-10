@@ -5271,6 +5271,56 @@ mod tests {
         assert_ne!(probe.generation(), g1);
     }
 
+    /// Host time of one cache-aware admission pass over `n` waiters of `len`-token prompts:
+    /// the per-waiter rehash-and-lock it replaced, against `refresh_cached_rows` with the cache
+    /// unchanged and with it moved (handler keys present).
+    /// `cargo test --release -p plowrt --features cuda --lib admission_pass_microbench -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn admission_pass_microbench() {
+        use crate::serve::mux::{refresh_cached_rows, Job, JobOpts};
+        let ops = Arc::new(MockVmm::default());
+        let p = uniform_pool(ops.clone());
+        let probe = p.prefix_probe().expect("prefix reuse");
+        let pr = prompt(17);
+        assert!(p.try_attach(0, &pr).unwrap().is_none());
+        p.ensure_rows(0, 17).unwrap();
+        p.publish(0, &pr, 4, |_va| Ok(())).unwrap();
+        let median = |mut v: Vec<f64>| {
+            v.sort_by(|a, b| a.total_cmp(b));
+            v[v.len() / 2]
+        };
+        println!("{:>5} {:>6} {:>12} {:>14} {:>12}", "n", "len", "rehash_us", "unchanged_us", "moved_us");
+        for (n, len) in [(128, 1024), (256, 2048), (512, 2048), (256, 8192)] {
+            let mut keep = Vec::new();
+            let mut waiting: std::collections::VecDeque<_> = (0..n)
+                .map(|i| {
+                    let (respond, rx) = crate::serve::stream::channel();
+                    keep.push(rx);
+                    let mut toks = prompt(len);
+                    toks[len - 1] = i as u32;
+                    let opts = JobOpts { prefix: Some(probe.key(&toks)), ..Default::default() };
+                    let job = Job { prompt_ids: toks, gen: Default::default(), arrived: std::time::Instant::now(), respond, opts };
+                    (job, std::time::Instant::now())
+                })
+                .collect();
+            let time = |f: &mut dyn FnMut()| {
+                median((0..15).map(|_| { let t = std::time::Instant::now(); f(); t.elapsed().as_secs_f64() * 1e6 }).collect())
+            };
+            let rehash = time(&mut || {
+                let rows: Vec<u32> = waiting.iter().map(|(j, _)| probe.cached_rows_keyed(&j.prompt_ids, None)).collect();
+                std::hint::black_box(rows);
+            });
+            refresh_cached_rows(&mut waiting, &probe);
+            let unchanged = time(&mut || refresh_cached_rows(&mut waiting, &probe));
+            let moved = time(&mut || {
+                cache_changed(&p.shared);
+                refresh_cached_rows(&mut waiting, &probe);
+            });
+            println!("{n:>5} {len:>6} {rehash:>12.1} {unchanged:>14.1} {moved:>12.1}");
+        }
+    }
+
     /// `enable_shared_publish`: a lead seen on one sequence only never snapshots; the
     /// second sequence with that lead publishes and the third attaches. Another lead
     /// stays unpublished.
