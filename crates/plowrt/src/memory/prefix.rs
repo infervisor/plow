@@ -495,7 +495,12 @@ impl PrefixCache {
     /// The targeted counterpart of [`Self::evict_lru`]'s global pick: used when a SPECIFIC
     /// path's tail must go (an "orphaned" suffix this caller does not hold and cannot trust),
     /// not whichever leaf happens to be globally least-recently-used elsewhere in the tree.
-    pub fn evict_tail(&mut self, hashes: &[BlockHash], from_depth: usize, keep: usize) -> Vec<(u32, u32)> {
+    pub fn evict_tail(
+        &mut self,
+        hashes: &[BlockHash],
+        from_depth: usize,
+        keep: usize,
+    ) -> Vec<(u32, u32)> {
         let mut path: Vec<NodeId> = Vec::with_capacity(from_depth);
         let mut cur: Option<NodeId> = None;
         for h in hashes.iter().take(from_depth) {
@@ -686,9 +691,17 @@ mod tests {
         c.release(&[1], 1);
         c.release(&[2], 1);
         // Block 1 is older (the LRU pick) but a session pins it.
-        c.pin(&[1], &toks(&[1]), std::time::Instant::now() + std::time::Duration::from_secs(60));
+        c.pin(
+            &[1],
+            &toks(&[1]),
+            std::time::Instant::now() + std::time::Duration::from_secs(60),
+        );
         assert_eq!(c.evict_lru(), Some((1, 0)), "the unpinned leaf goes first");
-        assert_eq!(c.evict_lru(), Some((0, 0)), "a pin orders eviction, it never refuses it");
+        assert_eq!(
+            c.evict_lru(),
+            Some((0, 0)),
+            "a pin orders eviction, it never refuses it"
+        );
         // An expired pin is no pin.
         c.insert(&[3], &toks(&[3]), 2, 0);
         c.insert(&[4], &toks(&[4]), 3, 0);
@@ -722,7 +735,11 @@ mod tests {
             vec![(1, 3), (1, 2)],
             "stops at block 1: it is still referenced, so blocks 0-1 must survive"
         );
-        assert_eq!(c.lookup(&h, &toks(&h)).blocks, 2, "the referenced prefix is intact");
+        assert_eq!(
+            c.lookup(&h, &toks(&h)).blocks,
+            2,
+            "the referenced prefix is intact"
+        );
         c.release(held_path, 2);
     }
 

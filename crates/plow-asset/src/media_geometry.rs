@@ -21,16 +21,27 @@ pub struct MediaPacket<'a> {
 }
 
 fn param(p: &PacketPipeline, name: &str) -> Result<u64, String> {
-    p.parameters.get(name).copied().ok_or_else(|| format!("{}: parameter {name:?} is missing", p.name))
+    p.parameters
+        .get(name)
+        .copied()
+        .ok_or_else(|| format!("{}: parameter {name:?} is missing", p.name))
 }
 
 fn elements(p: &PacketPipeline, role: &str) -> Result<u64, String> {
-    let t = p.tensors.get(role).ok_or_else(|| format!("{}: tensor {role:?} is missing", p.name))?;
-    t.shape.iter().try_fold(1u64, |n, &d| n.checked_mul(d)).ok_or_else(|| format!("{}: {role:?} overflows", p.name))
+    let t = p
+        .tensors
+        .get(role)
+        .ok_or_else(|| format!("{}: tensor {role:?} is missing", p.name))?;
+    t.shape
+        .iter()
+        .try_fold(1u64, |n, &d| n.checked_mul(d))
+        .ok_or_else(|| format!("{}: {role:?} overflows", p.name))
 }
 
 fn listed(p: &PacketPipeline, prefix: &str) -> Result<Vec<u64>, String> {
-    (0..param(p, &format!("{prefix}.count"))?).map(|i| param(p, &format!("{prefix}.{i}"))).collect()
+    (0..param(p, &format!("{prefix}.count"))?)
+        .map(|i| param(p, &format!("{prefix}.{i}")))
+        .collect()
 }
 
 fn sidecar<'a>(
@@ -39,7 +50,10 @@ fn sidecar<'a>(
     sidecars: &'a [MediaPacket<'a>],
     pick: impl Fn(&PacketPipeline) -> bool,
 ) -> Result<&'a PacketPipeline, String> {
-    let file = main.strings.get(key).ok_or_else(|| format!("{}: string {key:?} is missing", main.name))?;
+    let file = main
+        .strings
+        .get(key)
+        .ok_or_else(|| format!("{}: string {key:?} is missing", main.name))?;
     sidecars
         .iter()
         .find(|s| s.file == file)
@@ -100,7 +114,10 @@ fn rnnt(p: &PacketPipeline, vocabulary: Option<usize>) -> Result<Value, String> 
                 "pad_before": f("pad_before")?, "pad_after": f("pad_after")?}))
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let joint = p.tensors.get("encoder.joint").ok_or("rnnt: tensor \"encoder.joint\" is missing")?;
+    let joint = p
+        .tensors
+        .get("encoder.joint")
+        .ok_or("rnnt: tensor \"encoder.joint\" is missing")?;
     Ok(json!({"kind": "rnnt",
         "hop": param(p, "audio.frontend.hop")?, "max_samples": param(p, "audio.max_samples")?,
         "input_frames": param(p, "input_frames")?, "transforms": transforms, "frames": param(p, "frames")?,
@@ -120,8 +137,13 @@ fn vad(p: &PacketPipeline) -> Result<Value, String> {
         "min_speech_ms": param(p, "policy.min_speech_ms")?, "max_duration_ms": param(p, "bounds.max_duration_ms")?}))
 }
 
-fn multimodal(mm: &MmContract, tensors: Option<(u64, u64)>, sidecars: &[MediaPacket<'_>]) -> Result<Value, String> {
-    let (slab_bytes, table_bytes) = tensors.ok_or("multimodal: in.mm_slab/in.mm_table are missing")?;
+fn multimodal(
+    mm: &MmContract,
+    tensors: Option<(u64, u64)>,
+    sidecars: &[MediaPacket<'_>],
+) -> Result<Value, String> {
+    let (slab_bytes, table_bytes) =
+        tensors.ok_or("multimodal: in.mm_slab/in.mm_table are missing")?;
     let mut tokens = Vec::new();
     let mut widths = Vec::new();
     for m in &mm.modalities {
@@ -137,23 +159,35 @@ fn multimodal(mm: &MmContract, tensors: Option<(u64, u64)>, sidecars: &[MediaPac
             .iter()
             .find_map(|p| p.tensors.get("output"))
             .ok_or_else(|| format!("{}: no output tensor", m.packet))?;
-        widths.push(*output.shape.last().ok_or("multimodal: empty output shape")?);
+        widths.push(
+            *output
+                .shape
+                .last()
+                .ok_or("multimodal: empty output shape")?,
+        );
     }
     let width = widths[0];
     if widths.iter().any(|&w| w != width) {
         return Err("multimodal: encoder output widths differ".into());
     }
-    Ok(json!({"kind": "multimodal", "hidden": mm.hidden, "lm_hidden": width, "pad_token": mm.pad_token,
+    Ok(
+        json!({"kind": "multimodal", "hidden": mm.hidden, "lm_hidden": width, "pad_token": mm.pad_token,
         "tokens": tokens, "slab_rows": mm.slab_rows, "table_capacity": mm.table_capacity,
-        "slab_bytes": slab_bytes, "table_bytes": table_bytes}))
+        "slab_bytes": slab_bytes, "table_bytes": table_bytes}),
+    )
 }
 
 /// The bundle's media obligation, or `None` when `main` has no speech or multimodal pipeline.
-pub fn request(main: &MediaPacket<'_>, sidecars: &[MediaPacket<'_>]) -> Result<Option<Value>, String> {
+pub fn request(
+    main: &MediaPacket<'_>,
+    sidecars: &[MediaPacket<'_>],
+) -> Result<Option<Value>, String> {
     let mut families = Vec::new();
     for p in main.pipelines {
         let family = match p.driver.as_str() {
-            "causal.v1" if p.parameters.get("overlay_rows").is_some_and(|&r| r > 0) => audio_lm(p, sidecars)?,
+            "causal.v1" if p.parameters.get("overlay_rows").is_some_and(|&r| r > 0) => {
+                audio_lm(p, sidecars)?
+            }
             "tts.codec_lm.v1" => codec_lm(p, sidecars)?,
             "tts.guided_lm.v1" => guided_lm(p)?,
             "rnnt.greedy.v1" => rnnt(p, main.vocabulary)?,
@@ -174,40 +208,92 @@ mod tests {
     use crate::packet_pipeline::{PipelineDType, PipelineTensor};
     use std::collections::BTreeMap;
 
-    fn pipeline(name: &str, driver: &str, params: &[(&str, u64)], strings: &[(&str, &str)],
-        tensors: &[(&str, Vec<u64>)]) -> PacketPipeline {
+    fn pipeline(
+        name: &str,
+        driver: &str,
+        params: &[(&str, u64)],
+        strings: &[(&str, &str)],
+        tensors: &[(&str, Vec<u64>)],
+    ) -> PacketPipeline {
         PacketPipeline {
             name: name.into(),
             driver: driver.into(),
             programs: BTreeMap::from([("forward".into(), 0)]),
-            tensors: tensors.iter().map(|(role, shape)| (role.to_string(),
-                PipelineTensor { name: format!("t.{role}"), dtype: PipelineDType::U32, shape: shape.clone() })).collect(),
+            tensors: tensors
+                .iter()
+                .map(|(role, shape)| {
+                    (
+                        role.to_string(),
+                        PipelineTensor {
+                            name: format!("t.{role}"),
+                            dtype: PipelineDType::U32,
+                            shape: shape.clone(),
+                        },
+                    )
+                })
+                .collect(),
             parameters: params.iter().map(|(k, v)| (k.to_string(), *v)).collect(),
-            strings: strings.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
+            strings: strings
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
         }
     }
 
     fn codec_lm() -> (Vec<PacketPipeline>, Vec<PacketPipeline>) {
-        let lm = pipeline("speech", "tts.codec_lm.v1", &[("audio.sample_rate", 24000), ("codec.codebook", 4096),
-            ("codec.frame_codes", 7), ("codec.frame_samples", 2048), ("audio.token_base", 128266),
-            ("tokens.max_new_cap", 1400), ("prompt.prefix.count", 1), ("prompt.suffix.count", 3),
-            ("max_context", 2048), ("stop.count", 1), ("stop.0", 128258)],
-            &[("codec.packet", "codec.pkt"), ("prompt.voice_token", "<v>")], &[]);
-        let codec = pipeline("codec.decode", "codec.v1", &[("audio.sample_rate", 24000), ("codec.codebook", 4096),
-            ("codec.frame_codes", 7), ("codec.frame_samples", 2048), ("stream.window_frames", 6),
-            ("stream.lookahead_frames", 2)], &[], &[("codes", vec![3584]), ("pcm", vec![1024, 1024])]);
+        let lm = pipeline(
+            "speech",
+            "tts.codec_lm.v1",
+            &[
+                ("audio.sample_rate", 24000),
+                ("codec.codebook", 4096),
+                ("codec.frame_codes", 7),
+                ("codec.frame_samples", 2048),
+                ("audio.token_base", 128266),
+                ("tokens.max_new_cap", 1400),
+                ("prompt.prefix.count", 1),
+                ("prompt.suffix.count", 3),
+                ("max_context", 2048),
+                ("stop.count", 1),
+                ("stop.0", 128258),
+            ],
+            &[("codec.packet", "codec.pkt"), ("prompt.voice_token", "<v>")],
+            &[],
+        );
+        let codec = pipeline(
+            "codec.decode",
+            "codec.v1",
+            &[
+                ("audio.sample_rate", 24000),
+                ("codec.codebook", 4096),
+                ("codec.frame_codes", 7),
+                ("codec.frame_samples", 2048),
+                ("stream.window_frames", 6),
+                ("stream.lookahead_frames", 2),
+            ],
+            &[],
+            &[("codes", vec![3584]), ("pcm", vec![1024, 1024])],
+        );
         (vec![lm], vec![codec])
     }
 
     fn packet<'a>(file: &'a str, pipelines: &'a [PacketPipeline]) -> MediaPacket<'a> {
-        MediaPacket { file, pipelines, vocabulary: None, multimodal: None, mm_tensors: None }
+        MediaPacket {
+            file,
+            pipelines,
+            vocabulary: None,
+            multimodal: None,
+            mm_tensors: None,
+        }
     }
 
     #[test]
     fn codec_lm_request_reads_both_packets() {
         let (lm, codec) = codec_lm();
         let sidecars = [packet("model.pkt", &lm), packet("codec.pkt", &codec)];
-        let request = request(&packet("model.pkt", &lm), &sidecars).unwrap().unwrap();
+        let request = request(&packet("model.pkt", &lm), &sidecars)
+            .unwrap()
+            .unwrap();
         let family = &request["families"][0];
         assert_eq!(family["kind"], "codec_lm");
         assert_eq!(family["prompt_tokens"], 5);
@@ -220,14 +306,32 @@ mod tests {
     fn missing_parameters_sidecars_and_overflow_reject() {
         let (mut lm, codec) = codec_lm();
         let sidecars = [packet("codec.pkt", &codec)];
-        assert!(request(&packet("model.pkt", &lm), &[]).is_err(), "absent sidecar");
+        assert!(
+            request(&packet("model.pkt", &lm), &[]).is_err(),
+            "absent sidecar"
+        );
         lm[0].parameters.remove("tokens.max_new_cap");
-        assert!(request(&packet("model.pkt", &lm), &sidecars).is_err(), "missing parameter");
-        let text = vec![pipeline("decode", "causal.v1", &[("overlay_rows", 0)], &[], &[])];
-        assert!(request(&packet("model.pkt", &text), &[]).unwrap().is_none(), "plain LM owes nothing");
+        assert!(
+            request(&packet("model.pkt", &lm), &sidecars).is_err(),
+            "missing parameter"
+        );
+        let text = vec![pipeline(
+            "decode",
+            "causal.v1",
+            &[("overlay_rows", 0)],
+            &[],
+            &[],
+        )];
+        assert!(
+            request(&packet("model.pkt", &text), &[]).unwrap().is_none(),
+            "plain LM owes nothing"
+        );
         let mut wide = codec.clone();
         wide[0].tensors.get_mut("pcm").unwrap().shape = vec![u64::MAX, 2];
         let (lm, _) = codec_lm();
-        assert!(request(&packet("model.pkt", &lm), &[packet("codec.pkt", &wide)]).is_err(), "overflow");
+        assert!(
+            request(&packet("model.pkt", &lm), &[packet("codec.pkt", &wide)]).is_err(),
+            "overflow"
+        );
     }
 }

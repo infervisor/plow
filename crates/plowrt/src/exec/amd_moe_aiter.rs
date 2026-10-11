@@ -70,23 +70,24 @@ pub(super) struct Route {
 
 impl Route {
     pub fn launches(self) -> u64 {
-        u64::from(self.inst.fj[1] != 0) * 4 + match self.mode {
-            Mode::Sorted => {
-                if self.inst.i[7] == 1 {
-                    3
-                } else {
-                    4
+        u64::from(self.inst.fj[1] != 0) * 4
+            + match self.mode {
+                Mode::Sorted => {
+                    if self.inst.i[7] == 1 {
+                        3
+                    } else {
+                        4
+                    }
+                }
+                Mode::Flat => 2,
+                Mode::SortedBf16 | Mode::SharedBf16 => {
+                    if self.inst.i[7] == 1 {
+                        2
+                    } else {
+                        3
+                    }
                 }
             }
-            Mode::Flat => 2,
-            Mode::SortedBf16 | Mode::SharedBf16 => {
-                if self.inst.i[7] == 1 {
-                    2
-                } else {
-                    3
-                }
-            }
-        }
     }
 
     /// Expert-table length. Under the shared-expert fold the last entry is the shared expert.
@@ -113,7 +114,11 @@ impl Route {
 /// The native-align form of a sorted prefill instruction: `fj[1]` = routing table + 1, `fj[2]` =
 /// the align's partition count. GLM's 256/8 routing only.
 fn native_align_form(inst: &DevInst64, flat: bool) -> bool {
-    !flat && inst.fj[0] == 0 && inst.fj[1] != 0 && matches!(inst.fj[2], 64 | 304) && inst.i[3..5] == [256, 8]
+    !flat
+        && inst.fj[0] == 0
+        && inst.fj[1] != 0
+        && matches!(inst.fj[2], 64 | 304)
+        && inst.i[3..5] == [256, 8]
 }
 
 pub(super) fn routes(
@@ -144,7 +149,16 @@ pub(super) fn routes(
         let geometry = if flat {
             [prog.t, 6144, 256, n_exp, 8, 0, 1, u32::from(resident)]
         } else {
-            [prog.t, 6144, 256, n_exp, topk, 64, inst.i[6], u32::from(resident)]
+            [
+                prog.t,
+                6144,
+                256,
+                n_exp,
+                topk,
+                64,
+                inst.i[6],
+                u32::from(resident),
+            ]
         };
         let shaped = if flat {
             GEOMETRIES.iter().any(|&(e, _)| e == n_exp)
@@ -155,11 +169,10 @@ pub(super) fn routes(
         // row-agnostic over the dense live rows (the align maps sort real tokens; parked rows
         // route to nothing a live row reads), which is what lets the packet pack requests.
         if !(if flat {
-                matches!(prog.t, 2 | 4 | 8) || (resident && matches!(prog.t, 1 | 16 | 32))
-            } else {
-                (1..=8192).contains(&prog.t)
-            })
-            || !shaped
+            matches!(prog.t, 2 | 4 | 8) || (resident && matches!(prog.t, 1 | 16 | 32))
+        } else {
+            (1..=8192).contains(&prog.t)
+        }) || !shaped
             || inst.i != geometry
             || !(inst.fj == [0; 3] || native_align_form(inst, flat))
         {
@@ -287,7 +300,12 @@ pub(super) fn routes(
             ]
         } else {
             [
-                rows * 6144 * if matches!(mode, Mode::SortedBf16 | Mode::SharedBf16) { 2 } else { 4 },
+                rows * 6144
+                    * if matches!(mode, Mode::SortedBf16 | Mode::SharedBf16) {
+                        2
+                    } else {
+                        4
+                    },
                 rows * 6144 * 2,
                 n_exp * 3 * 8,
                 n_exp * 3 * 8,
@@ -759,8 +777,11 @@ impl MoeAiter {
             Ok(image) if super::amd::elf_symbol_names(&image).contains(&"plow_moe_align_abi_1") => {
                 let module = EngineDevice::module_load(be, &image)?;
                 let kernel = EngineDevice::get_function(be, &module, "plow_moe_align")?;
-                if ![64, 320].contains(&kernel.kernarg_size()) || kernel.private_segment_size() != 0 {
-                    return Err(RuntimeError::Device("native MoE align adapter resource ABI mismatch".into()));
+                if ![64, 320].contains(&kernel.kernarg_size()) || kernel.private_segment_size() != 0
+                {
+                    return Err(RuntimeError::Device(
+                        "native MoE align adapter resource ABI mismatch".into(),
+                    ));
                 }
                 modules.push(module);
                 let meta = EngineDevice::alloc(
@@ -1148,13 +1169,22 @@ mod tests {
         let obj = std::env::var("PLOW_TEST_ALIGN_OBJ").unwrap();
         let cap = std::env::var("PLOW_TEST_ALIGN_CAPTURE").unwrap();
         let read = |n: &str| std::fs::read(format!("{cap}/{n}.prefill.bin")).unwrap();
-        let (tab, meta, rt, rp, rg) =
-            (read("tab"), read("meta"), read("row_token"), read("row_partidx"), read("row_gate"));
+        let (tab, meta, rt, rp, rg) = (
+            read("tab"),
+            read("meta"),
+            read("row_token"),
+            read("row_partidx"),
+            read("row_gate"),
+        );
         let be = HsaBackend::new(0).unwrap();
         let image = std::fs::read(&obj).unwrap();
         let module = EngineDevice::module_load(&be, &image).unwrap();
         let kernel = EngineDevice::get_function(&be, &module, "plow_moe_align").unwrap();
-        assert!([64, 320].contains(&kernel.kernarg_size()), "kernarg {}", kernel.kernarg_size());
+        assert!(
+            [64, 320].contains(&kernel.kernarg_size()),
+            "kernarg {}",
+            kernel.kernarg_size()
+        );
         let upload = |bytes: &[u8]| {
             let m = EngineDevice::alloc(&be, bytes.len() as u64).unwrap();
             EngineDevice::upload(&be, &m, 0, bytes).unwrap();
@@ -1191,7 +1221,8 @@ mod tests {
                     npart,
                     pad: 0,
                 };
-                be.launch(kernel, grid, 512, 0, bytemuck::bytes_of(&a)).unwrap();
+                be.launch(kernel, grid, 512, 0, bytemuck::bytes_of(&a))
+                    .unwrap();
                 if split {
                     be.synchronize().unwrap();
                     laps.push(t0.elapsed().as_secs_f64() * 1e6);
@@ -1210,7 +1241,11 @@ mod tests {
         let at = (3 * N_EXP) as usize * 4;
         let tiles = u32::from_le_bytes(meta[at..at + 4].try_into().unwrap()) as usize;
         let pad = tiles * 64;
-        for (name, d, want) in [("row_token", &d_rt, &rt), ("row_partidx", &d_rp, &rp), ("row_gate", &d_rg, &rg)] {
+        for (name, d, want) in [
+            ("row_token", &d_rt, &rt),
+            ("row_partidx", &d_rp, &rp),
+            ("row_gate", &d_rg, &rg),
+        ] {
             let mut g = vec![0u8; want.len()];
             EngineDevice::download(&be, d, 0, &mut g).unwrap();
             assert!(g[..pad * 4] == want[..pad * 4], "{name} differs");
@@ -1232,7 +1267,10 @@ mod tests {
             }
         }
         let (p10, p50, p90) = med(&mut total);
-        let ph: Vec<String> = phases.iter_mut().map(|v| format!("{:.1}", med(v).1)).collect();
+        let ph: Vec<String> = phases
+            .iter_mut()
+            .map(|v| format!("{:.1}", med(v).1))
+            .collect();
         eprintln!(
             "NATIVE_ALIGN rows={ROWS} slots={} tiles={tiles} byte-exact meta+partials+row maps; total us p10 {p10:.1} p50 {p50:.1} p90 {p90:.1}; split phase1..4 + sync us {}",
             ROWS * TOPK,
@@ -1252,7 +1290,9 @@ mod tests {
 
     #[test]
     fn sorted_prefill_routes_cover_the_full_append_ladder() {
-        for rows in [1,2,4,8,16,20,32,64,128,256,512,1024,2048,4096,8192] {
+        for rows in [
+            1, 2, 4, 8, 16, 20, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192,
+        ] {
             let (mut prog, tensors) = fixture();
             prog.t = rows;
             prog.insts[0].i[0] = rows;
@@ -1390,7 +1430,16 @@ mod tests {
             0,
             DevInst64 {
                 op: DevOp::GemmLtPf as u16,
-                t: [0, 8, 2, TENSOR_NONE16, TENSOR_NONE16, TENSOR_NONE16, TENSOR_NONE16, TENSOR_NONE16],
+                t: [
+                    0,
+                    8,
+                    2,
+                    TENSOR_NONE16,
+                    TENSOR_NONE16,
+                    TENSOR_NONE16,
+                    TENSOR_NONE16,
+                    TENSOR_NONE16,
+                ],
                 i: [128, 6144, 256, 0, 0, 0, 0, 0],
                 ..Default::default()
             },
@@ -1409,7 +1458,16 @@ mod tests {
             i: [6144, 1, 128, 0, 0, 0, 0, 1],
             ..Default::default()
         };
-        combine.t = [8, TENSOR_NONE16, TENSOR_NONE16, 0, TENSOR_NONE16, TENSOR_NONE16, TENSOR_NONE16, TENSOR_NONE16];
+        combine.t = [
+            8,
+            TENSOR_NONE16,
+            TENSOR_NONE16,
+            0,
+            TENSOR_NONE16,
+            TENSOR_NONE16,
+            TENSOR_NONE16,
+            TENSOR_NONE16,
+        ];
         prog.insts.push(combine);
         assert!(routes(&prog, &tensors, 2).is_err());
     }
@@ -1596,7 +1654,16 @@ mod tests {
         prog.t = rows;
         let router = DevInst64 {
             op: DevOp::MoeRouterTopkPf as u16,
-            t: [8, TENSOR_NONE16, TENSOR_NONE16, TENSOR_NONE16, TENSOR_NONE16, TENSOR_NONE16, TENSOR_NONE16, TENSOR_NONE16],
+            t: [
+                8,
+                TENSOR_NONE16,
+                TENSOR_NONE16,
+                TENSOR_NONE16,
+                TENSOR_NONE16,
+                TENSOR_NONE16,
+                TENSOR_NONE16,
+                TENSOR_NONE16,
+            ],
             i: [0, 256, 8, 7, rows, 1, 1, 1],
             ..Default::default()
         };
@@ -1606,7 +1673,16 @@ mod tests {
         prog.stream[0].inst = 2;
         prog.insts.push(DevInst64 {
             op: DevOp::MoeCombinePf as u16,
-            t: [8, TENSOR_NONE16, TENSOR_NONE16, 0, TENSOR_NONE16, TENSOR_NONE16, TENSOR_NONE16, TENSOR_NONE16],
+            t: [
+                8,
+                TENSOR_NONE16,
+                TENSOR_NONE16,
+                0,
+                TENSOR_NONE16,
+                TENSOR_NONE16,
+                TENSOR_NONE16,
+                TENSOR_NONE16,
+            ],
             i: [6144, 1, rows, 0, 0, 0, 0, 1],
             ..Default::default()
         });
@@ -1620,7 +1696,10 @@ mod tests {
             for resident in [false, true] {
                 let (prog, tensors) = fold_fixture(rows, resident);
                 let route = routes(&prog, &tensors, 2).unwrap()[1].unwrap();
-                assert_eq!((route.n_exp(), route.topk(), route.mode), (257, 9, Mode::SortedBf16));
+                assert_eq!(
+                    (route.n_exp(), route.topk(), route.mode),
+                    (257, 9, Mode::SortedBf16)
+                );
             }
         }
         for bad in 0..9 {
@@ -1670,7 +1749,10 @@ mod tests {
         };
         let (p, t) = folded();
         let route = routes(&p, &t, 2).unwrap()[1].unwrap();
-        assert_eq!((route.n_exp(), route.topk(), route.mode), (257, 8, Mode::Flat));
+        assert_eq!(
+            (route.n_exp(), route.topk(), route.mode),
+            (257, 8, Mode::Flat)
+        );
         // Decode never appends the fold's slot and never routes top-9.
         for bad in 0..2 {
             let (mut p, t) = folded();
@@ -1714,7 +1796,10 @@ mod tests {
     fn resident_table_addresses_cover_the_shared_expert_slot() {
         let (base, stride) = (4096, 256 * 6144);
         let table = resident_expert_table(base, stride, 257);
-        let mut offsets = table.iter().map(|p| (*p - base) / stride).collect::<Vec<_>>();
+        let mut offsets = table
+            .iter()
+            .map(|p| (*p - base) / stride)
+            .collect::<Vec<_>>();
         offsets.sort_unstable();
         assert_eq!(offsets, (0..771).collect::<Vec<_>>());
         let w = ResidentWeights::new(base, 8192, 257);
@@ -1743,7 +1828,17 @@ mod tests {
         let be = HsaBackend::new(0).unwrap();
         let mut modules = Vec::new();
         let dir = std::env::var("PLOW_TEST_AITER_DIR").unwrap();
-        let kernel = MoeAiter::load(&be, Path::new(&dir), 128, 256, false, false, false, &mut modules).unwrap();
+        let kernel = MoeAiter::load(
+            &be,
+            Path::new(&dir),
+            128,
+            256,
+            false,
+            false,
+            false,
+            &mut modules,
+        )
+        .unwrap();
         let upload = |bytes: &[u8]| {
             let m = EngineDevice::alloc(&be, bytes.len() as u64).unwrap();
             EngineDevice::upload(&be, &m, 0, bytes).unwrap();
@@ -1827,7 +1922,10 @@ mod tests {
             native_scales[256 * 192 + e * 96..256 * 192 + (e + 1) * 96].fill(scale);
         }
         let scales = upload(bytemuck::cast_slice(&native_scales));
-        kernel.bind_resident(vec![(2, ResidentWeights::new(weights.base, scales.base, 256))]);
+        kernel.bind_resident(vec![(
+            2,
+            ResidentWeights::new(weights.base, scales.base, 256),
+        )]);
         vec![weights, scales]
     }
 
@@ -1835,8 +1933,17 @@ mod tests {
         let be = HsaBackend::new(0).unwrap();
         let mut modules = Vec::new();
         let dir = std::env::var("PLOW_TEST_AITER_DIR").unwrap();
-        let mut kernel =
-            MoeAiter::load(&be, Path::new(&dir), 128, 256, true, resident, false, &mut modules).unwrap();
+        let mut kernel = MoeAiter::load(
+            &be,
+            Path::new(&dir),
+            128,
+            256,
+            true,
+            resident,
+            false,
+            &mut modules,
+        )
+        .unwrap();
         let upload = |bytes: &[u8]| {
             let m = EngineDevice::alloc(&be, bytes.len() as u64).unwrap();
             EngineDevice::upload(&be, &m, 0, bytes).unwrap();
@@ -1955,7 +2062,13 @@ mod tests {
     /// count / 64-row group per expert, total groups at 768), padded row_token / row_part /
     /// row_weight, and each row's (expert, gate) list. Every row picks 8 distinct experts
     /// spread over all 256; group counts vary.
-    type Routing = (Vec<u32>, Vec<u32>, Vec<u32>, Vec<f32>, Vec<Vec<(usize, f32)>>);
+    type Routing = (
+        Vec<u32>,
+        Vec<u32>,
+        Vec<u32>,
+        Vec<f32>,
+        Vec<Vec<(usize, f32)>>,
+    );
     fn random_routing(rows: u32, next: &mut impl FnMut() -> u64) -> Routing {
         let mut per_expert: Vec<Vec<(u32, u32, f32)>> = vec![Vec::new(); 256];
         let mut row_experts: Vec<Vec<(usize, f32)>> = vec![Vec::new(); rows as usize];
@@ -1999,12 +2112,21 @@ mod tests {
 
     #[test]
     fn xcd_swizzle_is_a_same_xcd_block_permutation() {
-        for (block_m, blocks) in [(64u32, 1024u32), (64, 1030), (32, 2048), (32, 2059), (64, 7)] {
+        for (block_m, blocks) in [
+            (64u32, 1024u32),
+            (64, 1030),
+            (32, 2048),
+            (32, 2059),
+            (64, 7),
+        ] {
             let k = 256 / block_m;
             let mut seen = vec![false; blocks as usize];
             for p in 0..blocks {
                 let b = xcd_swizzled_block(p, block_m, blocks);
-                assert!(!std::mem::replace(&mut seen[b as usize], true), "{p} -> {b} twice");
+                assert!(
+                    !std::mem::replace(&mut seen[b as usize], true),
+                    "{p} -> {b} twice"
+                );
                 // The k consecutive blocks starting at a k-aligned block share p % 8 and lie
                 // within one 8k chunk, unless the chunk is the partial tail (identity).
                 let chunk = 8 * k;
@@ -2018,7 +2140,10 @@ mod tests {
                     assert_eq!(b, p);
                 }
             }
-            assert!(seen.iter().all(|s| *s), "not a permutation at {block_m}/{blocks}");
+            assert!(
+                seen.iter().all(|s| *s),
+                "not a permutation at {block_m}/{blocks}"
+            );
         }
     }
 
@@ -2033,8 +2158,10 @@ mod tests {
         let mut modules = Vec::new();
         let dir = std::env::var("PLOW_TEST_AITER_DIR").unwrap();
         let dir = Path::new(&dir);
-        let mut k32 = MoeAiter::load(&be, dir, 8192, 256, false, false, false, &mut modules).unwrap();
-        let mut k64 = MoeAiter::load(&be, dir, 8192, 256, false, false, true, &mut modules).unwrap();
+        let mut k32 =
+            MoeAiter::load(&be, dir, 8192, 256, false, false, false, &mut modules).unwrap();
+        let mut k64 =
+            MoeAiter::load(&be, dir, 8192, 256, false, false, true, &mut modules).unwrap();
         let upload = |bytes: &[u8]| {
             let m = EngineDevice::alloc(&be, bytes.len() as u64).unwrap();
             EngineDevice::upload(&be, &m, 0, bytes).unwrap();
@@ -2118,8 +2245,13 @@ mod tests {
                     let mut ids = vec![0u8; padded * 4];
                     let mut experts = vec![0u8; blocks as usize * 4];
                     let scratch = &kernel._scratch;
-                    EngineDevice::download(&be, scratch, kernel.buffers[7] - scratch.base, &mut ids)
-                        .unwrap();
+                    EngineDevice::download(
+                        &be,
+                        scratch,
+                        kernel.buffers[7] - scratch.base,
+                        &mut ids,
+                    )
+                    .unwrap();
                     EngineDevice::download(
                         &be,
                         scratch,
@@ -2130,12 +2262,24 @@ mod tests {
                     let ids: &[u32] = bytemuck::cast_slice(&ids);
                     let experts: &[u32] = bytemuck::cast_slice(&experts);
                     for p in 0..blocks {
-                        let b = if swizzled { xcd_swizzled_block(p, block_m, blocks) } else { p };
+                        let b = if swizzled {
+                            xcd_swizzled_block(p, block_m, blocks)
+                        } else {
+                            p
+                        };
                         let group = (b * block_m / 64) as usize;
-                        let expert = (0..256).find(|e| meta[512 + e + 1] as usize > group).unwrap();
-                        assert_eq!(experts[p as usize], expert as u32, "block_m={block_m} p={p}");
+                        let expert = (0..256)
+                            .find(|e| meta[512 + e + 1] as usize > group)
+                            .unwrap();
+                        assert_eq!(
+                            experts[p as usize], expert as u32,
+                            "block_m={block_m} p={p}"
+                        );
                         for r in 0..block_m as usize {
-                            let (pos, src) = (p as usize * block_m as usize + r, b as usize * block_m as usize + r);
+                            let (pos, src) = (
+                                p as usize * block_m as usize + r,
+                                b as usize * block_m as usize + r,
+                            );
                             let expect = if rt[src] < rows {
                                 rt[src] | ((rp[src] % 8) << 24)
                             } else {
@@ -2191,7 +2335,10 @@ mod tests {
                 }
                 let rel = (num / den).sqrt();
                 eprintln!("rows={rows} tile{block_m}: swizzled vs unswizzled rel_l2={rel:.3e}");
-                assert!(rel < 5e-3, "rows={rows} tile{block_m}: swizzle changed the result");
+                assert!(
+                    rel < 5e-3,
+                    "rows={rows} tile{block_m}: swizzle changed the result"
+                );
             }
         }
     }
@@ -2464,15 +2611,20 @@ mod tests {
         };
         // 257 experts x 3 projections: routed 0..255, shared = 256.
         let per = 256 * 6144;
-        let weight_bytes: Vec<u8> =
-            (0..3 * 257 * per).map(|_| fp8((next() % 17) as i32 - 8)).collect();
+        let weight_bytes: Vec<u8> = (0..3 * 257 * per)
+            .map(|_| fp8((next() % 17) as i32 - 8))
+            .collect();
         let weight = upload(&weight_bytes);
         let scales: Vec<f32> = (0..3 * 257 * 96)
             .map(|_| 0.002 * (1.0 + (next() % 1000) as f32 / 1000.0))
             .collect();
         let scale = upload(bytemuck::cast_slice(&scales));
-        let wt_ptrs: Vec<u64> = (0..257 * 3).map(|i| weight.base + (i * per) as u64).collect();
-        let st_ptrs: Vec<u64> = (0..257 * 3).map(|i| scale.base + (i * 96 * 4) as u64).collect();
+        let wt_ptrs: Vec<u64> = (0..257 * 3)
+            .map(|i| weight.base + (i * per) as u64)
+            .collect();
+        let st_ptrs: Vec<u64> = (0..257 * 3)
+            .map(|i| scale.base + (i * 96 * 4) as u64)
+            .collect();
         let wt = upload(bytemuck::cast_slice(&wt_ptrs));
         let st = upload(bytemuck::cast_slice(&st_ptrs));
         let decode = |byte: u8| -> f64 {
@@ -2525,35 +2677,39 @@ mod tests {
             }
             // The align/sort's output for one routing: plow's meta layout, 64-row padded groups,
             // `row_partidx = token * topk + slot`.
-            let sort = |n_exp: usize, topk: usize, slots_of: &dyn Fn(usize) -> Vec<(usize, f32)>| {
-                let mut per_expert = vec![Vec::new(); n_exp];
-                for row in 0..rows as usize {
-                    let all = slots_of(row);
-                    assert_eq!(all.len(), topk);
-                    for (slot, &(e, g)) in all.iter().enumerate() {
-                        per_expert[e].push((row as u32, (row * topk + slot) as u32, g));
+            let sort =
+                |n_exp: usize, topk: usize, slots_of: &dyn Fn(usize) -> Vec<(usize, f32)>| {
+                    let mut per_expert = vec![Vec::new(); n_exp];
+                    for row in 0..rows as usize {
+                        let all = slots_of(row);
+                        assert_eq!(all.len(), topk);
+                        for (slot, &(e, g)) in all.iter().enumerate() {
+                            per_expert[e].push((row as u32, (row * topk + slot) as u32, g));
+                        }
                     }
-                }
-                let mut meta = vec![0u32; 3 * n_exp + 1];
-                let (mut rt, mut rp, mut rg) = (Vec::new(), Vec::new(), Vec::new());
-                let mut groups = 0u32;
-                for e in 0..n_exp {
-                    meta[e] = rt.len() as u32;
-                    meta[n_exp + e] = per_expert[e].len() as u32;
-                    meta[2 * n_exp + e] = groups;
-                    let padded = (per_expert[e].len() as u32).div_ceil(64) * 64;
-                    groups += padded / 64;
-                    for i in 0..padded as usize {
-                        let (t, p, g) =
-                            per_expert[e].get(i).copied().unwrap_or((u32::MAX, u32::MAX, 0.0));
-                        rt.push(t);
-                        rp.push(p);
-                        rg.push(g);
+                    let mut meta = vec![0u32; 3 * n_exp + 1];
+                    let (mut rt, mut rp, mut rg) = (Vec::new(), Vec::new(), Vec::new());
+                    let mut groups = 0u32;
+                    for e in 0..n_exp {
+                        meta[e] = rt.len() as u32;
+                        meta[n_exp + e] = per_expert[e].len() as u32;
+                        meta[2 * n_exp + e] = groups;
+                        let padded = (per_expert[e].len() as u32).div_ceil(64) * 64;
+                        groups += padded / 64;
+                        for i in 0..padded as usize {
+                            let (t, p, g) =
+                                per_expert[e]
+                                    .get(i)
+                                    .copied()
+                                    .unwrap_or((u32::MAX, u32::MAX, 0.0));
+                            rt.push(t);
+                            rp.push(p);
+                            rg.push(g);
+                        }
                     }
-                }
-                meta[3 * n_exp] = groups;
-                (meta, rt, rp, rg)
-            };
+                    meta[3 * n_exp] = groups;
+                    (meta, rt, rp, rg)
+                };
             let x_bits: Vec<u16> = (0..rows as usize * 6144)
                 .map(|_| (((next() % 2001) as f32 / 1000.0 - 1.0).to_bits() >> 16) as u16)
                 .collect();
@@ -2572,8 +2728,16 @@ mod tests {
                     upload(bytemuck::cast_slice(&rg)),
                 );
                 let out = upload(&vec![0xa5; output_bytes + 512]);
-                let table =
-                    [out.base + 256, x.base, wt.base, st.base, meta.base, rt.base, rp.base, rg.base];
+                let table = [
+                    out.base + 256,
+                    x.base,
+                    wt.base,
+                    st.base,
+                    meta.base,
+                    rt.base,
+                    rp.base,
+                    rg.base,
+                ];
                 let route = Route {
                     inst: DevInst64 {
                         t: [0, 1, 2, 3, 4, 5, 6, 7],
@@ -2583,12 +2747,17 @@ mod tests {
                     rows,
                     mode: Mode::SortedBf16,
                 };
-                kernel.enqueue(&be, route, bytemuck::cast_slice(&table)).unwrap();
+                kernel
+                    .enqueue(&be, route, bytemuck::cast_slice(&table))
+                    .unwrap();
                 be.synchronize().unwrap();
                 let mut bytes = vec![0u8; output_bytes + 512];
                 EngineDevice::download(&be, &out, 0, &mut bytes).unwrap();
                 assert!(
-                    bytes[..256].iter().chain(&bytes[256 + output_bytes..]).all(|&b| b == 0xa5),
+                    bytes[..256]
+                        .iter()
+                        .chain(&bytes[256 + output_bytes..])
+                        .all(|&b| b == 0xa5),
                     "n_exp={n_exp} topk={topk} rows={rows}: guard bytes overwritten"
                 );
                 bytes[256..256 + output_bytes]
@@ -2606,11 +2775,16 @@ mod tests {
                 s
             });
             let shared_a8 = run(&k257, 257, 1, &|_| vec![(256usize, 1.0f32)]);
-            assert!(folded.iter().all(|v| v.is_finite()), "rows={rows}: non-finite fold output");
+            assert!(
+                folded.iter().all(|v| v.is_finite()),
+                "rows={rows}: non-finite fold output"
+            );
             // bf16 round-to-nearest-even, for the production-like two-path reference.
             let bf = |v: f64| -> f64 {
                 let b = (v as f32).to_bits();
-                f64::from(f32::from_bits(b.wrapping_add(0x7fff + ((b >> 16) & 1)) & 0xffff_0000))
+                f64::from(f32::from_bits(
+                    b.wrapping_add(0x7fff + ((b >> 16) & 1)) & 0xffff_0000,
+                ))
             };
             // The shared expert as the two-path serves it today: the lite prep's bf16 dequant of
             // the same fp8 bytes, bf16 activations, wide accumulation, bf16 GLU and output.
@@ -2623,7 +2797,8 @@ mod tests {
                         let sg = f64::from(scales[(e * 3) * 96 + (n / 128) * 48 + k / 128]);
                         let su = f64::from(scales[(e * 3 + 1) * 96 + (n / 128) * 48 + k / 128]);
                         gate += bf(decode(weight_bytes[(e * 3) * per + n * 6144 + k]) * sg) * xr[k];
-                        up += bf(decode(weight_bytes[(e * 3 + 1) * per + n * 6144 + k]) * su) * xr[k];
+                        up +=
+                            bf(decode(weight_bytes[(e * 3 + 1) * per + n * 6144 + k]) * su) * xr[k];
                     }
                     *a = bf(gate / (1.0 + (-gate).exp()) * up);
                 }
@@ -2631,8 +2806,10 @@ mod tests {
                     .map(|n| {
                         bf((0..256)
                             .map(|k| {
-                                let sd = f64::from(scales[(e * 3 + 2) * 96 + (n / 128) * 2 + k / 128]);
-                                bf(decode(weight_bytes[(e * 3 + 2) * per + n * 256 + k]) * sd) * act[k]
+                                let sd =
+                                    f64::from(scales[(e * 3 + 2) * 96 + (n / 128) * 2 + k / 128]);
+                                bf(decode(weight_bytes[(e * 3 + 2) * per + n * 256 + k]) * sd)
+                                    * act[k]
                             })
                             .sum())
                     })
@@ -2753,18 +2930,38 @@ mod tests {
             // the per-expert A8 quantisation; the routed sum of 8 averages independent errors.
             let floor = worst[5].max(worst[7]);
             let checks = [
-                (worst[0] < 0.1, format!("fold {:.3e} exceeds the A8 screening threshold 0.1", worst[0])),
-                (worst[4] < 5e-3, format!("fold != routed + shared_a8 ({:.3e}, bound 5e-3)", worst[4])),
+                (
+                    worst[0] < 0.1,
+                    format!(
+                        "fold {:.3e} exceeds the A8 screening threshold 0.1",
+                        worst[0]
+                    ),
+                ),
+                (
+                    worst[4] < 5e-3,
+                    format!("fold != routed + shared_a8 ({:.3e}, bound 5e-3)", worst[4]),
+                ),
                 (
                     worst[0] <= 1.1 * floor,
-                    format!("fold {:.3e} exceeds 1.1 x the A8 floor of its parts {floor:.3e}", worst[0]),
+                    format!(
+                        "fold {:.3e} exceeds 1.1 x the A8 floor of its parts {floor:.3e}",
+                        worst[0]
+                    ),
                 ),
                 (
                     worst[5] <= 1.25 * worst[7],
-                    format!("shared_a8 {:.3e} exceeds 1.25 x routed_a8 {:.3e}", worst[5], worst[7]),
+                    format!(
+                        "shared_a8 {:.3e} exceeds 1.25 x routed_a8 {:.3e}",
+                        worst[5], worst[7]
+                    ),
                 ),
             ];
-            verdicts.extend(checks.into_iter().filter(|(ok, _)| !ok).map(|(_, why)| format!("rows={rows}: {why}")));
+            verdicts.extend(
+                checks
+                    .into_iter()
+                    .filter(|(ok, _)| !ok)
+                    .map(|(_, why)| format!("rows={rows}: {why}")),
+            );
         }
         assert!(verdicts.is_empty(), "{}", verdicts.join("\n"));
     }

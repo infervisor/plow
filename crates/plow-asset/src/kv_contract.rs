@@ -122,5 +122,4 @@ mod tests {
         let b = vec![ct("kv.0.k", 1), ct("kv.0.ab", 1)];
         assert_ne!(digest(&a), digest(&b));
     }
-
 }

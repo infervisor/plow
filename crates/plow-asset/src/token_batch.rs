@@ -830,7 +830,11 @@ impl Capabilities {
     /// arm on AMD writes nothing and does not trap.
     ///
     /// The output tail gathers explicitly named terminal rows before final norm and LM head.
-    pub fn amd_dense_gqa(target: impl Into<String>, row_capacity: u32, sample_capacity: u32) -> Self {
+    pub fn amd_dense_gqa(
+        target: impl Into<String>,
+        row_capacity: u32,
+        sample_capacity: u32,
+    ) -> Self {
         Capabilities {
             target: target.into(),
             descriptor_version: TOKEN_BATCH_VERSION,

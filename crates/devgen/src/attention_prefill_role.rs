@@ -582,7 +582,10 @@ pub(crate) fn apply_output_object(
                     .iter()
                     .filter(|(&id, object)| {
                         plow_asset::segment_roles::is_generated(id)
-                            && object.attention.as_ref().is_some_and(|a| a.head_dim == head_dim)
+                            && object
+                                .attention
+                                .as_ref()
+                                .is_some_and(|a| a.head_dim == head_dim)
                     })
                     .map(|(&id, _)| id)
                     .collect();
@@ -719,7 +722,9 @@ pub(crate) fn apply_output_object(
             None
         };
         if let Some(mut qualification) = qualification {
-            qualification.programs.retain(|index| !generated_hd256.contains(index));
+            qualification
+                .programs
+                .retain(|index| !generated_hd256.contains(index));
             if !qualification.programs.is_empty() {
                 apply_qualified_hd256(model, sections, profile, gpu, directory, &qualification)?;
                 applied = true;
@@ -830,9 +835,12 @@ pub(crate) fn apply(
         },
         Kind::Hd512 => capability(selection.query_tile, selection.kv_tile),
         Kind::Hd512Px4Bq64 => px4_bq64_capability(),
-        Kind::Generated => {
-            selection.generated.as_ref().ok_or("generated selection")?.attention.clone()
-        }
+        Kind::Generated => selection
+            .generated
+            .as_ref()
+            .ok_or("generated selection")?
+            .attention
+            .clone(),
     };
     let role = selection.role();
     let object = SegmentObject {
@@ -841,7 +849,13 @@ pub(crate) fn apply(
             Kind::Hd256Gqa2Bkv32 => PREFILL_ATTENTION_HD256_GQA2_BKV32_ABI,
             Kind::Hd512 => PREFILL_ATTENTION_HD512_WG32_ABI,
             Kind::Hd512Px4Bq64 => PREFILL_ATTENTION_HD512_PX4_BQ64_ABI,
-            Kind::Generated => &selection.generated.as_ref().ok_or("generated selection")?.abi,
+            Kind::Generated => {
+                &selection
+                    .generated
+                    .as_ref()
+                    .ok_or("generated selection")?
+                    .abi
+            }
         }
         .into(),
         file: selection.file.clone(),
@@ -952,9 +966,8 @@ pub(crate) fn apply(
                         op.op == g.kv.op() as u16 && op.i[6] == selection.head_dim()
                     } else {
                         !selection.is_hd512() || is_hd512_attention(op)
-                    })
-                        && (!matches!(selection.kind, Kind::Hd256Bkv32 | Kind::Hd256Gqa2Bkv32)
-                            || op.is_hd256_gqa2_sliding_prefill())
+                    }) && (!matches!(selection.kind, Kind::Hd256Bkv32 | Kind::Hd256Gqa2Bkv32)
+                        || op.is_hd256_gqa2_sliding_prefill())
                         && if op.op == DevOp::FlashPrefill as u16
                             || op.op == DevOp::FlashPrefillFp8 as u16
                         {

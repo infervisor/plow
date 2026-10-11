@@ -239,14 +239,21 @@ impl Manifest {
         // stage's rows.
         for (i, stage) in self.stages.iter().enumerate() {
             for (h, name, bytes) in [
-                (stage.slot, format!("pf.request.slot.{i}"), u64::from(rows) * 4),
+                (
+                    stage.slot,
+                    format!("pf.request.slot.{i}"),
+                    u64::from(rows) * 4,
+                ),
                 (
                     stage.request,
                     format!("pf.request.table.{i}"),
                     (1 + 4 * u64::from(live.batch)) * 4,
                 ),
             ] {
-                let t = p.tensors.get(h as usize).ok_or("packed stage table handle")?;
+                let t = p
+                    .tensors
+                    .get(h as usize)
+                    .ok_or("packed stage table handle")?;
                 need(
                     h != TENSOR_NONE16
                         && handles.insert(h)
@@ -478,16 +485,34 @@ fn validate_stages(
     stage_rows: u32,
 ) -> Result<()> {
     let stages = request_rows.div_ceil(stage_rows) as usize;
-    let ring = |pair: [u16; 2]| live.caches.iter().any(|c| c.pair == pair && c.window > 0 && c.stride < live.max_ctx);
+    let ring = |pair: [u16; 2]| {
+        live.caches
+            .iter()
+            .any(|c| c.pair == pair && c.window > 0 && c.stride < live.max_ctx)
+    };
     // `stage_map` binds stage tables to every pair read more than once; only sliding rings are
     // proven below, so a repeated reader of any other cache (KV sharing) cannot be staged.
     let mut seen = BTreeSet::new();
-    for pair in g.insts.iter().filter(|d| is_attention(d)).map(|d| [d.t[3], d.t[4]]) {
-        need(seen.insert(pair) || ring(pair), "staged packet reads a non-ring cache more than once")?;
+    for pair in g
+        .insts
+        .iter()
+        .filter(|d| is_attention(d))
+        .map(|d| [d.t[3], d.t[4]])
+    {
+        need(
+            seen.insert(pair) || ring(pair),
+            "staged packet reads a non-ring cache more than once",
+        )?;
     }
-    for c in live.caches.iter().filter(|c| c.window > 0 && c.stride < live.max_ctx) {
+    for c in live
+        .caches
+        .iter()
+        .filter(|c| c.window > 0 && c.stride < live.max_ctx)
+    {
         let readers: Vec<usize> = (0..g.insts.len())
-            .filter(|&pc| is_attention(&g.insts[pc]) && [g.insts[pc].t[3], g.insts[pc].t[4]] == c.pair)
+            .filter(|&pc| {
+                is_attention(&g.insts[pc]) && [g.insts[pc].t[3], g.insts[pc].t[4]] == c.pair
+            })
             .collect();
         if readers.len() <= 1 {
             need(
@@ -496,8 +521,14 @@ fn validate_stages(
             )?;
             continue;
         }
-        need(readers.len() == stages, "one writer pair and one reader per stage")?;
-        let (wk, wv) = (cache_writers(g.insts, c.pair[0]), cache_writers(g.insts, c.pair[1]));
+        need(
+            readers.len() == stages,
+            "one writer pair and one reader per stage",
+        )?;
+        let (wk, wv) = (
+            cache_writers(g.insts, c.pair[0]),
+            cache_writers(g.insts, c.pair[1]),
+        );
         check_stage_order(g, &readers, &wk, &wv)?;
     }
     Ok(())
@@ -557,7 +588,10 @@ pub fn repeated_writers(g: &crate::program::Program<'_>) -> Result<Vec<bool>> {
         readers.entry([d.t[3], d.t[4]]).or_default().push(pc);
     }
     for (pair, pcs) in &readers {
-        let (wk, wv) = (cache_writers(g.insts, pair[0]), cache_writers(g.insts, pair[1]));
+        let (wk, wv) = (
+            cache_writers(g.insts, pair[0]),
+            cache_writers(g.insts, pair[1]),
+        );
         if wk.len() <= 1 && wv.len() <= 1 {
             continue;
         }
@@ -572,7 +606,10 @@ pub fn repeated_writers(g: &crate::program::Program<'_>) -> Result<Vec<bool>> {
 pub fn has_repeated_writers(p: &Packet<'_>) -> bool {
     p.programs[..p.prefill_count].iter().any(|g| {
         let mut seen = BTreeSet::new();
-        g.insts.iter().filter(|d| is_cache_writer(d)).any(|d| !seen.insert(d.t[0]))
+        g.insts
+            .iter()
+            .filter(|d| is_cache_writer(d))
+            .any(|d| !seen.insert(d.t[0]))
     })
 }
 
@@ -695,7 +732,9 @@ pub fn plan_with_limit(
 /// guards this: its per-request work count is 0 when `qlen <= 0`.
 pub fn plan_stage(plan: &Plan, stage: usize, stage_rows: usize) -> Result<Vec<i32>> {
     let nreq = stage_table_reqs(&plan.table, stage_rows)?;
-    let skip = stage.checked_mul(stage_rows).ok_or("stage offset overflow")?;
+    let skip = stage
+        .checked_mul(stage_rows)
+        .ok_or("stage offset overflow")?;
     let mut out = Vec::with_capacity(plan.table.len());
     out.push(plan.table[0]);
     for r in 0..nreq {
@@ -728,7 +767,9 @@ pub fn plan_stage(plan: &Plan, stage: usize, stage_rows: usize) -> Result<Vec<i3
 /// KV write covers, and the object must also advertise `plow_pf_masked_padding_abi`.
 pub fn stage_slots(plan: &Plan, stage: usize, stage_rows: usize) -> Result<Vec<i32>> {
     let nreq = stage_table_reqs(&plan.table, stage_rows)?;
-    let skip = stage.checked_mul(stage_rows).ok_or("stage offset overflow")?;
+    let skip = stage
+        .checked_mul(stage_rows)
+        .ok_or("stage offset overflow")?;
     let covered: usize = (0..nreq)
         .map(|r| plan.table[2 + 4 * r].max(0) as usize)
         .sum();
@@ -762,7 +803,10 @@ pub fn stages_needed(plan: &Plan, stage_rows: usize) -> Result<usize> {
 
 fn stage_table_reqs(table: &[i32], stage_rows: usize) -> Result<usize> {
     need(stage_rows > 0, "stage_rows must be non-zero")?;
-    need(!table.is_empty() && table.len() % 4 == 1, "span table shape")?;
+    need(
+        !table.is_empty() && table.len() % 4 == 1,
+        "span table shape",
+    )?;
     let nreq = table[0].max(0) as usize;
     need(table.len() == 1 + 4 * nreq, "span table request count")?;
     Ok(nreq)
@@ -1083,8 +1127,18 @@ mod tests {
         plan_with_limit(
             &[
                 // a long request continuing a 5000-token prefix, and a short fresh one
-                Request { slot: 0, start: 5000, len: 4000, prompt: 9000 },
-                Request { slot: 1, start: 0, len: 96, prompt: 96 },
+                Request {
+                    slot: 0,
+                    start: 5000,
+                    len: 4000,
+                    prompt: 9000,
+                },
+                Request {
+                    slot: 1,
+                    start: 0,
+                    len: 96,
+                    prompt: 96,
+                },
             ],
             &[5000, 0],
             4096,
@@ -1114,7 +1168,10 @@ mod tests {
                 next += slen;
                 total += slen;
             }
-            assert_eq!(total, qlen, "every row of the request is covered exactly once");
+            assert_eq!(
+                total, qlen,
+                "every row of the request is covered exactly once"
+            );
         }
     }
 
@@ -1132,7 +1189,11 @@ mod tests {
                 let t = plan_stage(&plan, stage, s).unwrap();
                 let (slen, skvlen) = (t[2 + 4 * r], t[4 + 4 * r]);
                 let taken = qlen.min((stage * s) as i32);
-                assert_eq!(skvlen - slen, start + taken, "stage {stage} request {r} qp0");
+                assert_eq!(
+                    skvlen - slen,
+                    start + taken,
+                    "stage {stage} request {r} qp0"
+                );
                 // KV visible to this stage is exactly what has been written by the end of it.
                 assert_eq!(skvlen, start + taken + slen);
             }
@@ -1145,7 +1206,11 @@ mod tests {
         // request 1 is 96 rows, so it is exhausted after stage 0.
         for stage in 1..4 {
             let t = plan_stage(&plan, stage, 1024).unwrap();
-            assert_eq!(t[2 + 4 * 1], 0, "stage {stage} leaves the short request empty");
+            assert_eq!(
+                t[2 + 4 * 1],
+                0,
+                "stage {stage} leaves the short request empty"
+            );
             // entry index still addresses request 1, and its slot is still intact
             assert_eq!(t[3 + 4 * 1], plan.table[3 + 4 * 1]);
         }
@@ -1179,7 +1244,10 @@ mod tests {
         }
         for (row, &n) in writes.iter().enumerate() {
             let expected = u32::from(plan.slots[row] >= 0);
-            assert_eq!(n, expected, "row {row} written {n} times, expected {expected}");
+            assert_eq!(
+                n, expected,
+                "row {row} written {n} times, expected {expected}"
+            );
         }
     }
 
@@ -1189,7 +1257,10 @@ mod tests {
             max_request_rows: Some(4096),
             stage_rows,
             stages: (0..stages)
-                .map(|i| Stage { slot: 10 + 2 * i as u16, request: 11 + 2 * i as u16 })
+                .map(|i| Stage {
+                    slot: 10 + 2 * i as u16,
+                    request: 11 + 2 * i as u16,
+                })
                 .collect(),
             slot: 0,
             request: 1,
@@ -1204,7 +1275,10 @@ mod tests {
     #[test]
     fn staging_sizes_the_ring_against_the_stage_not_the_chunk() {
         assert_eq!(staged_manifest(None, 0).write_rows(4096).unwrap(), 4096);
-        assert_eq!(staged_manifest(Some(1024), 4).write_rows(4096).unwrap(), 1024);
+        assert_eq!(
+            staged_manifest(Some(1024), 4).write_rows(4096).unwrap(),
+            1024
+        );
         // and the ring each implies, at window 1024
         let ring = |w: u32| (1024u32 + w - 1).next_power_of_two();
         assert_eq!(ring(4096), 8192);
@@ -1229,9 +1303,15 @@ mod tests {
         assert!(staged_manifest(Some(0), 4).write_rows(4096).is_err());
         assert!(staged_manifest(Some(8192), 1).write_rows(4096).is_err());
         // an exact single stage is legal and is just the unstaged width
-        assert_eq!(staged_manifest(Some(4096), 1).write_rows(4096).unwrap(), 4096);
+        assert_eq!(
+            staged_manifest(Some(4096), 1).write_rows(4096).unwrap(),
+            4096
+        );
         // a width that does not divide the limit still needs a covering stage count
-        assert_eq!(staged_manifest(Some(1536), 3).write_rows(4096).unwrap(), 1536);
+        assert_eq!(
+            staged_manifest(Some(1536), 3).write_rows(4096).unwrap(),
+            1536
+        );
         assert!(staged_manifest(Some(1536), 2).write_rows(4096).is_err());
     }
 
@@ -1241,7 +1321,12 @@ mod tests {
     fn manifest_stage_count_agrees_with_stages_needed() {
         for (limit, stage_rows) in [(4096u32, 1024u32), (4096, 1536), (4096, 4096), (1024, 256)] {
             let p = plan_with_limit(
-                &[Request { slot: 0, start: 0, len: limit as usize, prompt: 16384 }],
+                &[Request {
+                    slot: 0,
+                    start: 0,
+                    len: limit as usize,
+                    prompt: 16384,
+                }],
                 &[0],
                 limit as usize,
                 16384,
@@ -1252,12 +1337,22 @@ mod tests {
             let m = staged_manifest(Some(stage_rows), needed);
             let mut m = m;
             m.max_request_rows = Some(limit);
-            assert_eq!(m.write_rows(limit).unwrap(), stage_rows, "limit {limit} stage {stage_rows}");
+            assert_eq!(
+                m.write_rows(limit).unwrap(),
+                stage_rows,
+                "limit {limit} stage {stage_rows}"
+            );
         }
     }
 
     fn inst(op: DevOp) -> DevInst64 {
-        DevInst64 { op: op as u16, blocks: 1, fj: [0; 3], t: [TENSOR_NONE16; 8], i: [0; 8] }
+        DevInst64 {
+            op: op as u16,
+            blocks: 1,
+            fj: [0; 3],
+            t: [TENSOR_NONE16; 8],
+            i: [0; 8],
+        }
     }
 
     /// A staged site binds its own stage's tables in packed mode and is restored unpacked.
@@ -1316,7 +1411,18 @@ mod tests {
         ];
         assert_eq!(
             stage_map(&insts),
-            [None, Some(0), Some(0), Some(0), Some(1), Some(1), Some(1), None, None, None]
+            [
+                None,
+                Some(0),
+                Some(0),
+                Some(0),
+                Some(1),
+                Some(1),
+                Some(1),
+                None,
+                None,
+                None
+            ]
         );
     }
 
@@ -1325,7 +1431,12 @@ mod tests {
         // No max_request_rows => padding rows carry a real slot, and masking them would change
         // what the KV write covers.
         let unmasked = plan(
-            &[Request { slot: 0, start: 0, len: 100, prompt: 4096 }],
+            &[Request {
+                slot: 0,
+                start: 0,
+                len: 100,
+                prompt: 4096,
+            }],
             &[0],
             4096,
             16384,
@@ -1339,7 +1450,10 @@ mod tests {
     fn stage_rejects_a_malformed_table_and_a_zero_width() {
         let plan = staged_plan();
         assert!(plan_stage(&plan, 0, 0).is_err());
-        let bad = Plan { table: vec![2, 0, 1, 0, 1], ..staged_plan() };
+        let bad = Plan {
+            table: vec![2, 0, 1, 0, 1],
+            ..staged_plan()
+        };
         assert!(plan_stage(&bad, 0, 1024).is_err(), "count/length disagree");
         assert!(stages_needed(&bad, 1024).is_err());
     }

@@ -68,7 +68,19 @@ fn o_form_group_major_carries_heads_per_group() {
     let dst = b.tensor("act.oat", 8192 * 8 * 512 * 2);
     let mut xgate = 0;
     let c = emit_xalltoall_heads(
-        &mut b, &mut xgate, &[0, 1, 2, 3], &[], dst, 1024, 8, 512, 64, 8, 33_554_432, 1, 16,
+        &mut b,
+        &mut xgate,
+        &[0, 1, 2, 3],
+        &[],
+        dst,
+        1024,
+        8,
+        512,
+        64,
+        8,
+        33_554_432,
+        1,
+        16,
     );
     let p = b.finish();
     let inst = &p.insts[c as usize];
@@ -82,7 +94,21 @@ fn rejects_inconsistent_head_count() {
     let mut b = Builder::new(8);
     let dst = b.tensor("act.bad", 4);
     let mut xgate = 0;
-    emit_xalltoall_heads(&mut b, &mut xgate, &[0], &[], dst, 1024, 8, 576, 63, 8, 0, 0, 63);
+    emit_xalltoall_heads(
+        &mut b,
+        &mut xgate,
+        &[0],
+        &[],
+        dst,
+        1024,
+        8,
+        576,
+        63,
+        8,
+        0,
+        0,
+        63,
+    );
 }
 
 #[test]
@@ -91,7 +117,21 @@ fn rejects_bad_dir() {
     let mut b = Builder::new(8);
     let dst = b.tensor("act.bad", 4);
     let mut xgate = 0;
-    emit_xalltoall_heads(&mut b, &mut xgate, &[0], &[], dst, 1024, 8, 576, 64, 8, 0, 2, 64);
+    emit_xalltoall_heads(
+        &mut b,
+        &mut xgate,
+        &[0],
+        &[],
+        dst,
+        1024,
+        8,
+        576,
+        64,
+        8,
+        0,
+        2,
+        64,
+    );
 }
 
 #[test]
@@ -100,7 +140,21 @@ fn rejects_heads_per_group_not_dividing_nh_total() {
     let mut b = Builder::new(8);
     let dst = b.tensor("act.bad", 4);
     let mut xgate = 0;
-    emit_xalltoall_heads(&mut b, &mut xgate, &[0], &[], dst, 1024, 8, 512, 64, 8, 0, 1, 24);
+    emit_xalltoall_heads(
+        &mut b,
+        &mut xgate,
+        &[0],
+        &[],
+        dst,
+        1024,
+        8,
+        512,
+        64,
+        8,
+        0,
+        1,
+        24,
+    );
 }
 
 #[test]
@@ -109,5 +163,19 @@ fn rejects_heads_per_group_not_a_multiple_of_nh_l() {
     let mut b = Builder::new(8);
     let dst = b.tensor("act.bad", 4);
     let mut xgate = 0;
-    emit_xalltoall_heads(&mut b, &mut xgate, &[0], &[], dst, 1024, 8, 512, 64, 8, 0, 1, 12);
+    emit_xalltoall_heads(
+        &mut b,
+        &mut xgate,
+        &[0],
+        &[],
+        dst,
+        1024,
+        8,
+        512,
+        64,
+        8,
+        0,
+        1,
+        12,
+    );
 }

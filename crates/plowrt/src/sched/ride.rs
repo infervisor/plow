@@ -62,7 +62,10 @@ impl RideCost {
         let i = match self.buckets.iter().position(|b| b.rows == rows) {
             Some(i) => i,
             None => {
-                self.buckets.push(Bucket { rows, ..Default::default() });
+                self.buckets.push(Bucket {
+                    rows,
+                    ..Default::default()
+                });
                 self.buckets.len() - 1
             }
         };
@@ -139,10 +142,17 @@ mod tests {
     fn a_missing_pure_sample_is_measured_first_and_explores_the_other_arm() {
         let mut c = RideCost::default();
         c.set_widths(&[64]);
-        assert!(!c.ride(1024, 10), "no pure sample yet: run the launch without riders");
+        assert!(
+            !c.ride(1024, 10),
+            "no pure sample yet: run the launch without riders"
+        );
         warm(&mut c, 45.0, 0.16, 14.0);
         let arms: Vec<bool> = (0..EXPLORE).map(|_| c.ride(2048, 50)).collect();
-        assert_eq!(arms.iter().filter(|&&r| !r).count(), 1, "one explored non-ride per window");
+        assert_eq!(
+            arms.iter().filter(|&&r| !r).count(),
+            1,
+            "one explored non-ride per window"
+        );
     }
 
     #[test]

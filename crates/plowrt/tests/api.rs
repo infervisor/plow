@@ -79,13 +79,19 @@ async fn token_prompt(app: &axum::Router, prompt: serde_json::Value) -> (StatusC
 #[tokio::test]
 async fn token_id_prompts_outside_the_vocabulary_are_refused() {
     let app = make_app();
-    for prompt in [serde_json::json!([65, 256]), serde_json::json!([[4294967295u32]])] {
+    for prompt in [
+        serde_json::json!([65, 256]),
+        serde_json::json!([[4294967295u32]]),
+    ] {
         let (status, body) = token_prompt(&app, prompt).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
         assert!(body.contains("outside the vocabulary size 256"), "{body}");
         assert!(body.contains("invalid_prompt"), "{body}");
     }
-    assert_eq!(token_prompt(&app, serde_json::json!([65, 255])).await.0, StatusCode::OK);
+    assert_eq!(
+        token_prompt(&app, serde_json::json!([65, 255])).await.0,
+        StatusCode::OK
+    );
 }
 
 #[cfg(feature = "hf-tokenizer")]
@@ -98,8 +104,14 @@ async fn hf_tokenizer_vocab_bounds_token_id_prompts() {
     for _ in 0..2 {
         let (status, body) = token_prompt(&app, serde_json::json!([0, 3])).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
-        assert!(body.contains("prompt token id 3 is outside the vocabulary size 3"), "{body}");
-        assert_eq!(token_prompt(&app, serde_json::json!([0, 2])).await.0, StatusCode::OK);
+        assert!(
+            body.contains("prompt token id 3 is outside the vocabulary size 3"),
+            "{body}"
+        );
+        assert_eq!(
+            token_prompt(&app, serde_json::json!([0, 2])).await.0,
+            StatusCode::OK
+        );
     }
 }
 
@@ -526,7 +538,10 @@ async fn the_model_card_created_stamp_is_stable_across_scrapes() {
             .unwrap();
         body_string(resp).await
     };
-    assert_eq!(first, second, "the catalogue must not change between scrapes");
+    assert_eq!(
+        first, second,
+        "the catalogue must not change between scrapes"
+    );
 }
 
 /// The host sampler implements these; serde used to drop them, so the request
@@ -579,7 +594,10 @@ async fn out_of_range_sampling_is_a_400() {
             StatusCode::BAD_REQUEST,
             "{field}={value} should be refused, got {status}: {text}"
         );
-        assert!(text.contains(field), "the error must name the field: {text}");
+        assert!(
+            text.contains(field),
+            "the error must name the field: {text}"
+        );
     }
 }
 
@@ -736,8 +754,14 @@ async fn an_empty_messages_array_is_a_400() {
 #[tokio::test]
 async fn typed_runtime_metrics_report_completed_model_work() {
     let app = make_app();
-    assert_eq!(token_prompt(&app, serde_json::json!([65])).await.0, StatusCode::OK);
-    let response = app.oneshot(Request::get("/v1/metrics").body(Body::empty()).unwrap()).await.unwrap();
+    assert_eq!(
+        token_prompt(&app, serde_json::json!([65])).await.0,
+        StatusCode::OK
+    );
+    let response = app
+        .oneshot(Request::get("/v1/metrics").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     let value: serde_json::Value = serde_json::from_str(&body_string(response).await).unwrap();
     assert_eq!(value["object"], "runtime.metrics");

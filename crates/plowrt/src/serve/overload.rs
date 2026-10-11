@@ -36,11 +36,20 @@ impl Config {
     fn from_runtime() -> Config {
         let rt = crate::config::RuntimeConfig::get();
         let mut up = [0.05, 0.10, 0.20];
-        for (slot, x) in up.iter_mut().zip(rt.overload_miss.split(',').filter_map(|x| x.trim().parse::<f64>().ok())) {
+        for (slot, x) in up.iter_mut().zip(
+            rt.overload_miss
+                .split(',')
+                .filter_map(|x| x.trim().parse::<f64>().ok()),
+        ) {
             *slot = x;
         }
-        let window = Duration::from_millis(rt.overload_window_ms).max(Duration::from_millis(BUCKETS as u64));
-        Config { enabled: rt.overload, window, up }
+        let window =
+            Duration::from_millis(rt.overload_window_ms).max(Duration::from_millis(BUCKETS as u64));
+        Config {
+            enabled: rt.overload,
+            window,
+            up,
+        }
     }
 
     fn dwell(&self) -> Duration {
@@ -70,18 +79,28 @@ struct Window {
 
 impl Window {
     fn new(now: Instant) -> Window {
-        Window { start: now, buckets: [Bucket::default(); BUCKETS], level: 0, changed: now, over_since: None }
+        Window {
+            start: now,
+            buckets: [Bucket::default(); BUCKETS],
+            level: 0,
+            changed: now,
+            over_since: None,
+        }
     }
 
     fn epoch(&self, cfg: &Config, now: Instant) -> u64 {
-        (now.saturating_duration_since(self.start).as_nanos() / (cfg.window / BUCKETS as u32).as_nanos().max(1)) as u64
+        (now.saturating_duration_since(self.start).as_nanos()
+            / (cfg.window / BUCKETS as u32).as_nanos().max(1)) as u64
     }
 
     fn observe(&mut self, cfg: &Config, missed: bool, now: Instant) {
         let epoch = self.epoch(cfg, now);
         let b = &mut self.buckets[epoch as usize % BUCKETS];
         if b.epoch != epoch {
-            *b = Bucket { epoch, ..Bucket::default() };
+            *b = Bucket {
+                epoch,
+                ..Bucket::default()
+            };
         }
         b.total += 1;
         b.missed += u32::from(missed);
@@ -98,15 +117,25 @@ impl Window {
     /// Step the level per the window; returns the new level when it changed.
     fn refresh(&mut self, cfg: &Config, now: Instant) -> Option<u8> {
         let (total, missed) = self.counts(cfg, now);
-        let frac = if total == 0 { 0.0 } else { f64::from(missed) / f64::from(total) };
+        let frac = if total == 0 {
+            0.0
+        } else {
+            f64::from(missed) / f64::from(total)
+        };
         let l = self.level as usize;
         let over = l < 3 && total >= MIN_SAMPLES && frac >= cfg.up[l];
-        self.over_since = if over { Some(self.over_since.unwrap_or(now)) } else { None };
+        self.over_since = if over {
+            Some(self.over_since.unwrap_or(now))
+        } else {
+            None
+        };
         let held = now.saturating_duration_since(self.changed);
         if held < cfg.dwell() {
             return None;
         }
-        let sustained = self.over_since.is_some_and(|t| now.saturating_duration_since(t) >= cfg.dwell());
+        let sustained = self
+            .over_since
+            .is_some_and(|t| now.saturating_duration_since(t) >= cfg.dwell());
         let next = if sustained && (l < 2 || held >= cfg.window) {
             l + 1
         } else if total == 0 {
@@ -134,11 +163,16 @@ static LEVEL: AtomicU8 = AtomicU8::new(0);
 
 fn state() -> &'static State {
     static S: OnceLock<State> = OnceLock::new();
-    S.get_or_init(|| State { cfg: Config::from_runtime(), window: Mutex::new(Window::new(Instant::now())) })
+    S.get_or_init(|| State {
+        cfg: Config::from_runtime(),
+        window: Mutex::new(Window::new(Instant::now())),
+    })
 }
 
 fn enabled(cfg: &Config) -> bool {
-    cfg.enabled.unwrap_or_else(|| crate::serve::policy::installed_co_sched() == crate::serve::cosched::CoSched::Deadline)
+    cfg.enabled.unwrap_or_else(|| {
+        crate::serve::policy::installed_co_sched() == crate::serve::cosched::CoSched::Deadline
+    })
 }
 
 fn publish(stage: Option<Stage>, level: Option<u8>) {
@@ -193,7 +227,10 @@ pub fn gate(ids: &crate::serve::session::RequestIds) -> Option<axum::response::R
         return None;
     }
     let table = crate::serve::turns::table();
-    let new = ids.session.as_deref().is_none_or(|id| !table.knows_session(id));
+    let new = ids
+        .session
+        .as_deref()
+        .is_none_or(|id| !table.knows_session(id));
     let Err(retry) = admit(new) else {
         if let (true, Some(id)) = (new, &ids.session) {
             table.note_session(id);
@@ -207,7 +244,10 @@ pub fn gate(ids: &crate::serve::session::RequestIds) -> Option<axum::response::R
         Some("overloaded"),
         None,
     );
-    r.headers_mut().insert(axum::http::header::RETRY_AFTER, axum::http::HeaderValue::from(retry.as_secs()));
+    r.headers_mut().insert(
+        axum::http::header::RETRY_AFTER,
+        axum::http::HeaderValue::from(retry.as_secs()),
+    );
     Some(r)
 }
 
@@ -216,7 +256,11 @@ mod tests {
     use super::*;
 
     fn cfg() -> Config {
-        Config { enabled: Some(true), window: Duration::from_secs(5), up: [0.05, 0.10, 0.20] }
+        Config {
+            enabled: Some(true),
+            window: Duration::from_secs(5),
+            up: [0.05, 0.10, 0.20],
+        }
     }
 
     /// Feed `n` deadlines with `missed` of them missed at `at`, then step the level.
@@ -237,8 +281,16 @@ mod tests {
         // Too few samples: no rise however many miss.
         assert_eq!(feed(&mut w, &c, 10, 10, t0 + dwell), 0);
         // 30% missed: a burst is not overload; misses sustained over a dwell are.
-        assert_eq!(feed(&mut w, &c, 100, 30, t0 + dwell), 0, "not sustained yet");
-        assert_eq!(feed(&mut w, &c, 0, 0, t0 + dwell + dwell / 2), 0, "within the dwell");
+        assert_eq!(
+            feed(&mut w, &c, 100, 30, t0 + dwell),
+            0,
+            "not sustained yet"
+        );
+        assert_eq!(
+            feed(&mut w, &c, 0, 0, t0 + dwell + dwell / 2),
+            0,
+            "within the dwell"
+        );
         assert_eq!(feed(&mut w, &c, 100, 30, t0 + 2 * dwell), 1);
         // One step per sustained dwell.
         assert_eq!(feed(&mut w, &c, 100, 30, t0 + 3 * dwell), 1);
@@ -272,7 +324,21 @@ mod tests {
         assert_eq!(shed(2, true, &c), Ok(()));
         assert_eq!(shed(3, false, &c), Ok(()));
         assert_eq!(shed(3, true, &c), Err(Duration::from_secs(5)));
-        assert_eq!(Config { window: Duration::from_millis(1500), ..c }.retry_after(), Duration::from_secs(2));
-        assert_eq!(Config { window: Duration::from_millis(200), ..c }.retry_after(), Duration::from_secs(1));
+        assert_eq!(
+            Config {
+                window: Duration::from_millis(1500),
+                ..c
+            }
+            .retry_after(),
+            Duration::from_secs(2)
+        );
+        assert_eq!(
+            Config {
+                window: Duration::from_millis(200),
+                ..c
+            }
+            .retry_after(),
+            Duration::from_secs(1)
+        );
     }
 }

@@ -128,7 +128,9 @@ impl Registry {
         // Otherwise the alias outlives its target and resolves to a slug that
         // is no longer registered — a 404 naming a model the client never asked
         // for.
-        self.aliases.write().retain(|_, canonical| canonical != slug);
+        self.aliases
+            .write()
+            .retain(|_, canonical| canonical != slug);
         Ok(bundle)
     }
 

@@ -87,7 +87,10 @@ fn main() {
             "op", "packets", "busy ms", "busy/thr", "span ms"
         );
         // PROF_TOP=n: the n instructions with the most busy time (index, op, packets, busy, max packet).
-        if let Some(n) = std::env::var("PROF_TOP").ok().and_then(|v| v.parse::<usize>().ok()) {
+        if let Some(n) = std::env::var("PROF_TOP")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+        {
             let mut per_inst: BTreeMap<u32, (usize, u64, u64, u64, u64)> = BTreeMap::new();
             for e in evs {
                 let d = e.t1_ns - e.t0_ns;

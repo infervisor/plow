@@ -205,14 +205,17 @@ pub struct DownstreamWork(std::sync::Arc<DownstreamCredit>);
 
 impl Drop for DownstreamWork {
     fn drop(&mut self) {
-        self.0.backlog.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        self.0
+            .backlog
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
         self.0.released.notify_one();
     }
 }
 
 impl DownstreamCredit {
     pub fn set_limit(&self, limit: usize) {
-        self.limit.store(limit, std::sync::atomic::Ordering::Relaxed);
+        self.limit
+            .store(limit, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Work handed to the stage and not finished.
@@ -226,12 +229,14 @@ impl DownstreamCredit {
     }
 
     pub fn work(self: &std::sync::Arc<Self>) -> DownstreamWork {
-        self.backlog.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.backlog
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         DownstreamWork(std::sync::Arc::clone(self))
     }
 
     pub fn set_urgent(&self, urgent: bool) {
-        self.urgent.store(urgent, std::sync::atomic::Ordering::Release);
+        self.urgent
+            .store(urgent, std::sync::atomic::Ordering::Release);
         if !urgent {
             self.released.notify_one();
         }
@@ -288,7 +293,10 @@ pub fn seat(
     let slot = free_slot.ok_or(Denied::NoFreeSlot)?;
     if budget.is_some_and(|b| !b.fits_requests([want_rows])) {
         let max_rows = budget.map_or(0, |b| b.max_rows());
-        return Err(Denied::ExceedsWholeBudget { want: want_rows, max_rows });
+        return Err(Denied::ExceedsWholeBudget {
+            want: want_rows,
+            max_rows,
+        });
     }
     if downstream_full {
         return Err(Denied::DownstreamFull);
@@ -357,7 +365,9 @@ impl KvBudget {
     pub fn bytes_for_rows(&self, rows: u64) -> u64 {
         let fixed = if rows == 0 { 0 } else { self.request_bytes };
         if self.block_group_count == 0 {
-            return rows.saturating_mul(self.bytes_per_token).saturating_add(fixed);
+            return rows
+                .saturating_mul(self.bytes_per_token)
+                .saturating_add(fixed);
         }
         self.block_groups[..self.block_group_count as usize]
             .iter()
@@ -441,8 +451,14 @@ mod seat_tests {
     /// rather than a misleading 429.
     #[test]
     fn liveness_is_decided_before_capacity() {
-        assert_eq!(seat(true, None, 1, [], None, false), Err(Denied::EngineDead));
-        assert_eq!(seat(false, None, 1, [], None, false), Err(Denied::NoFreeSlot));
+        assert_eq!(
+            seat(true, None, 1, [], None, false),
+            Err(Denied::EngineDead)
+        );
+        assert_eq!(
+            seat(false, None, 1, [], None, false),
+            Err(Denied::NoFreeSlot)
+        );
         assert_eq!(seat(false, Some(3), 1, [], None, false), Ok(3));
     }
 
@@ -467,7 +483,10 @@ mod seat_tests {
         assert_eq!(err, Denied::KvBudgetFull { want: 70_700 });
         assert!(err.is_retryable());
         // 11 already seated leaves room for the twelfth.
-        assert_eq!(seat(false, Some(0), 70_700, [70_700; 11], Some(b), false), Ok(0));
+        assert_eq!(
+            seat(false, Some(0), 70_700, [70_700; 11], Some(b), false),
+            Ok(0)
+        );
     }
 
     /// A behind downstream stage queues the request; a request that can never fit is still
@@ -492,7 +511,10 @@ mod seat_tests {
     /// Without a budget the seat decision is slots alone — the pre-KV-admission behaviour.
     #[test]
     fn no_budget_means_slots_alone() {
-        assert_eq!(seat(false, Some(0), u64::MAX, [u64::MAX; 4], None, false), Ok(0));
+        assert_eq!(
+            seat(false, Some(0), u64::MAX, [u64::MAX; 4], None, false),
+            Ok(0)
+        );
     }
 }
 
@@ -581,7 +603,12 @@ mod kv_budget_tests {
         // 448 MiB per 15K sequence: 102 fit in 45 GiB, where the rows alone would back 360.
         assert!(b.fits_requests(std::iter::repeat_n(15_128, 102)));
         assert!(!b.fits_requests(std::iter::repeat_n(15_128, 103)));
-        assert!(b.fits(4_096, 4_096) && !KvBudget::linear(1, ring).with_request_bytes(ring).fits(1, 1));
+        assert!(
+            b.fits(4_096, 4_096)
+                && !KvBudget::linear(1, ring)
+                    .with_request_bytes(ring)
+                    .fits(1, 1)
+        );
     }
 }
 

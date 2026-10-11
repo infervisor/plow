@@ -91,19 +91,47 @@ pub fn class_of(op: DevOp) -> RowClass {
         // Nothing here reads a position or couples two rows. Dense projections, norms,
         // elementwise, quantization, argmax, the collectives, and the whole MoE routing /
         // grouping / combine chain, whose row maps are built from the batch it is given.
-        Nop | RmsNorm | RowRms | Residual | Sum4Bf16 | Glu | SituGlu | SoftCap | LayerNorm | NormResidual
-        | AddNorm | NormResidualNorm | PerLayerInput | GluStrided | QuantFp8 | ZeroF32 | CastF32Bf16
-        | MlaOutGate | KdaGatedNorm | QwenGatedNorm | QwenQGateSplit | QwenSigmoidGate
-        | QwenRmsNorm | LayerNormF32 | ScaledAddF32 | GluF32 | EmbedF16F32 | EmbedOverlayBf16 | EmbedPosBf16
-        | LstmCellF32 | ReluF32 | BroadcastAddF32 | QuantFp8Block128 => RowClass::A,
+        Nop | RmsNorm | RowRms | Residual | Sum4Bf16 | Glu | SituGlu | SoftCap | LayerNorm
+        | NormResidual | AddNorm | NormResidualNorm | PerLayerInput | GluStrided | QuantFp8
+        | ZeroF32 | CastF32Bf16 | MlaOutGate | KdaGatedNorm | QwenGatedNorm | QwenQGateSplit
+        | QwenSigmoidGate | QwenRmsNorm | LayerNormF32 | ScaledAddF32 | GluF32 | EmbedF16F32
+        | EmbedOverlayBf16 | EmbedPosBf16 | LstmCellF32 | ReluF32 | BroadcastAddF32
+        | QuantFp8Block128 => RowClass::A,
         // `Embed` gathers rows of the EMBEDDING TABLE by token id — one id per row, no
         // position, no cross-row coupling. It is not a hidden-row gather; `RowGather` is.
         Embed => RowClass::A,
-        Gemm | GemmSmall | GemmMed | GemmF32 | GemmLtPf | GemmBlkPf | GemmWide | GemmC5
-        | GemmNorm | GemmGlu | GemmSplitK | GemmFp8 | GemmMedFp8 | GemmSmallFp8 | GemmGluFp8
-        | GemmWideFp8 | GemmC5Fp8 | GemmFp8Blk | GemmMxfp4 | GemmMedMxfp4 | GemmSmallMxfp4
-        | GemmWideMxfp4 | GemmC5Mxfp4 | GemmGluMxfp4 | DenseGluFp8Blk | GemmAffineQ4
-        | Q8GemmF32 | DenseGemmF32 | SiluF32 | GemmFp8Block128 | GemmFp8Block128Split4 | MlaBmmFp8 => RowClass::A,
+        Gemm
+        | GemmSmall
+        | GemmMed
+        | GemmF32
+        | GemmLtPf
+        | GemmBlkPf
+        | GemmWide
+        | GemmC5
+        | GemmNorm
+        | GemmGlu
+        | GemmSplitK
+        | GemmFp8
+        | GemmMedFp8
+        | GemmSmallFp8
+        | GemmGluFp8
+        | GemmWideFp8
+        | GemmC5Fp8
+        | GemmFp8Blk
+        | GemmMxfp4
+        | GemmMedMxfp4
+        | GemmSmallMxfp4
+        | GemmWideMxfp4
+        | GemmC5Mxfp4
+        | GemmGluMxfp4
+        | DenseGluFp8Blk
+        | GemmAffineQ4
+        | Q8GemmF32
+        | DenseGemmF32
+        | SiluF32
+        | GemmFp8Block128
+        | GemmFp8Block128Split4
+        | MlaBmmFp8 => RowClass::A,
         Gemv | GemvSz | GemvGlu | GemvGluSz | GemvArgmax | GemvQkv | GemvQkvg | GemvF32
         | GemvFp8 | GemvGluFp8 | GemvFp8Blk | GemvQkvFp8 | GemvMxfp4 | GemvGluMxfp4
         | GemvQkvMxfp4 | GemvAffineQ4 => RowClass::A,
@@ -124,8 +152,8 @@ pub fn class_of(op: DevOp) -> RowClass {
         MoeRouter | MoeRouterTopk | MoeRouterTopkPf | MoeAlignPf | MoeExpertGlu | MoeExpertDown
         | MoeCombine | MoeCombinePf | MoeGroupGluPf | MoeGroupDownPf | MoeExpertGluFp8Blk
         | MoeExpertDownFp8Blk | MoeGroupGluFp8Blk | MoeGroupDownFp8Blk | MoeGluMx | MoeDownMx
-        | MoeGluMxPf | MoeDownMxPf | MoeAiterFp8Pf
-        | MoeGluFp8Block128 | MoeQuantFp8Block128 | MoeDownFp8Block128 => RowClass::A,
+        | MoeGluMxPf | MoeDownMxPf | MoeAiterFp8Pf | MoeGluFp8Block128 | MoeQuantFp8Block128
+        | MoeDownFp8Block128 => RowClass::A,
         MoeRouterGemma
         | MoeRouterGemmaScore
         | MoeRouterGemmaScoreFast
@@ -198,7 +226,8 @@ pub fn class_of(op: DevOp) -> RowClass {
         // wrong for every row outside the last span, with no trap — and DSA already needs its
         // own capability marker because a legal packet otherwise runs dense and ignores `t7`.
         IndexScore | IndexScorePf | IndexScoreKpool | IndexSelect | IndexSelectPf
-        | IndexUnionPf | IndexTpPf | IndexFp8Decode | IndexFp8Prefill | DsaPoolExpand | DsaPoolCompress => RowClass::C,
+        | IndexUnionPf | IndexTpPf | IndexFp8Decode | IndexFp8Prefill | DsaPoolExpand
+        | DsaPoolCompress => RowClass::C,
 
         // Attention couples rows within one sequence. Packed request spans require per-span
         // execution until the op gains an explicit span descriptor.

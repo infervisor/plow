@@ -53,8 +53,16 @@ fn snac_fuses_every_snake_residual_and_the_tanh_head() {
         // The noise block `x + n * (x·Wn)` is the generic gated residual.
         assert!(has(&s, "FusedGatedResidual", &format!("blk{i}.noise.w")));
         for j in 0..3 {
-            assert!(has(&s, "FusedParamActConv1d", &format!("blk{i}.ru{j}.dw.w")));
-            assert!(has(&s, "FusedParamActConv1dResidual", &format!("blk{i}.ru{j}.pw.w")));
+            assert!(has(
+                &s,
+                "FusedParamActConv1d",
+                &format!("blk{i}.ru{j}.dw.w")
+            ));
+            assert!(has(
+                &s,
+                "FusedParamActConv1dResidual",
+                &format!("blk{i}.ru{j}.pw.w")
+            ));
         }
     }
     assert!(has(&s, "FusedParamActConv1dAct", "out.w"));
@@ -66,24 +74,47 @@ fn s3gen_fuses_conv_and_projection_epilogues() {
     let s = fused_sites_for_codec_config(S3GEN).unwrap();
     for l in 0..10 {
         for w in ["out", "ff2"] {
-            assert!(has(&s, "FusedLinearBiasResidual", &format!("enc.L{l}.{w}.w")));
+            assert!(has(
+                &s,
+                "FusedLinearBiasResidual",
+                &format!("enc.L{l}.{w}.w")
+            ));
         }
-        assert!(has(&s, "FusedLayerNormLinearBiasAct", &format!("enc.L{l}.ff1.w")));
+        assert!(has(
+            &s,
+            "FusedLayerNormLinearBiasAct",
+            &format!("enc.L{l}.ff1.w")
+        ));
     }
     for k in 0..56 {
         for w in ["out", "ff2"] {
-            assert!(has(&s, "FusedLinearBiasResidual", &format!("cfm.tb{k}.{w}.w")));
+            assert!(has(
+                &s,
+                "FusedLinearBiasResidual",
+                &format!("cfm.tb{k}.{w}.w")
+            ));
         }
-        assert!(has(&s, "FusedLayerNormLinearBiasAct", &format!("cfm.tb{k}.ff1.w")));
+        assert!(has(
+            &s,
+            "FusedLayerNormLinearBiasAct",
+            &format!("cfm.tb{k}.ff1.w")
+        ));
     }
     for j in 0..14 {
         assert!(has(&s, "FusedConv1dResidual", &format!("cfm.r{j}.res.w")));
     }
     assert!(has(&s, "FusedConv1dResidual", "enc.la2.w"));
-    for pre in (0..9).map(|i| format!("hift.rb{i}")).chain((0..3).map(|i| format!("hift.sr{i}"))) {
+    for pre in (0..9)
+        .map(|i| format!("hift.rb{i}"))
+        .chain((0..3).map(|i| format!("hift.sr{i}")))
+    {
         for d in 0..3 {
             assert!(has(&s, "FusedParamActConv1d", &format!("{pre}.d{d}.c1.w")));
-            assert!(has(&s, "FusedParamActConv1dResidual", &format!("{pre}.d{d}.c2.w")));
+            assert!(has(
+                &s,
+                "FusedParamActConv1dResidual",
+                &format!("{pre}.d{d}.c2.w")
+            ));
         }
     }
     assert!(has(&s, "FusedActConv1dResidual", "hift.up1.w"));
@@ -95,7 +126,22 @@ fn s3gen_fuses_conv_and_projection_epilogues() {
     // An activation between two convs is fused into exactly one of them.
     for (producer, consumer) in [("enc.la1.w", "enc.la2.w"), ("hift.pre.w", "hift.up0.w")]
         .into_iter()
-        .chain((0..4).map(|i| (["hift.f0.c0.w", "hift.f0.c1.w", "hift.f0.c2.w", "hift.f0.c3.w"][i], ["hift.f0.c1.w", "hift.f0.c2.w", "hift.f0.c3.w", "hift.f0.c4.w"][i])))
+        .chain((0..4).map(|i| {
+            (
+                [
+                    "hift.f0.c0.w",
+                    "hift.f0.c1.w",
+                    "hift.f0.c2.w",
+                    "hift.f0.c3.w",
+                ][i],
+                [
+                    "hift.f0.c1.w",
+                    "hift.f0.c2.w",
+                    "hift.f0.c3.w",
+                    "hift.f0.c4.w",
+                ][i],
+            )
+        }))
     {
         let at_producer = has(&s, "FusedConv1dAct", producer);
         let at_consumer = any(&s, INPUT_ACT, consumer);

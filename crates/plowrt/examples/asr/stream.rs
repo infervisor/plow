@@ -38,9 +38,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Some("ready" | "credit") if !finished => {
                 let mut credit = event["credit_samples"].as_u64().ok_or("missing credit")? as usize;
                 while credit > 0 && offset < samples.len() {
-                    let count = credit.min(if realtime { 1600 } else { 16000 }).min(samples.len() - offset);
+                    let count = credit
+                        .min(if realtime { 1600 } else { 16000 })
+                        .min(samples.len() - offset);
                     if realtime {
-                        let due = std::time::Duration::from_secs_f64((offset + count) as f64 / 16000.0);
+                        let due =
+                            std::time::Duration::from_secs_f64((offset + count) as f64 / 16000.0);
                         tokio::time::sleep(due.saturating_sub(started.elapsed())).await;
                     }
                     let mut bytes = Vec::with_capacity(8 + count * 2);

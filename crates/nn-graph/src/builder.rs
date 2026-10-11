@@ -699,7 +699,13 @@ impl Nn {
     }
 
     /// Embedding lookup in a checkpoint table named exactly `table` (`[vocab, hidden]`).
-    pub fn embedding_named(&mut self, table: &str, ids: TensorId, vocab: i64, hidden: i64) -> TensorId {
+    pub fn embedding_named(
+        &mut self,
+        table: &str,
+        ids: TensorId,
+        vocab: i64,
+        hidden: i64,
+    ) -> TensorId {
         let t = self.param(table, [Dim::stat(vocab), Dim::stat(hidden)]);
         self.emit(Op::Embedding, vec![ids, t])
     }

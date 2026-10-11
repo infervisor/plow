@@ -4,11 +4,11 @@
 //! out-of-band channel, and brings the persistent kernels up once. The hot path
 //! (enqueue packet, poll counter) touches only lock-free structures here.
 
+#[cfg(feature = "hsa")]
+mod chain_admission;
 #[cfg(any(feature = "hsa", feature = "cuda"))]
 mod kv_layout;
 pub(crate) mod tensor_bindings;
-#[cfg(feature = "hsa")]
-mod chain_admission;
 
 /// The AMD/gfx950 serving engine — a port of the proven `gemma4_chat.c` driver,
 /// deliberately separate from the CUDA engine because the two differ in kind
@@ -18,37 +18,37 @@ pub mod amd;
 #[cfg(feature = "hsa")]
 mod amd_gemm_blk;
 #[cfg(feature = "hsa")]
-mod amd_gemma4_glu;
-#[cfg(feature = "hsa")]
 mod amd_gemm_lt;
 #[cfg(feature = "hsa")]
-mod amd_index_tp;
+mod amd_gemma4_glu;
 #[cfg(feature = "hsa")]
 mod amd_index_fp8;
 #[cfg(feature = "hsa")]
 mod amd_index_fp8_prefill;
 #[cfg(feature = "hsa")]
-mod amd_mla_fold;
+mod amd_index_tp;
 #[cfg(feature = "hsa")]
 mod amd_mla_bf16;
 #[cfg(feature = "hsa")]
-mod amd_rope;
+mod amd_mla_fold;
 #[cfg(feature = "hsa")]
 mod amd_moe_aiter;
+#[cfg(feature = "hsa")]
+mod amd_rope;
 #[cfg(feature = "hsa")]
 mod amd_sparse_mla;
 #[cfg(feature = "hsa")]
 pub(crate) use amd_sparse_mla::{skippable_unions, SPAN_MIN_PRIOR};
-/// N [`amd::AmdEngine`] ranks stepped as one: the host half of the inline
-/// collective. Decode is launch-all-then-drain-all; prefill is per-segment,
-/// all-ranks, with a host barrier — see the module note for why the two differ.
-#[cfg(feature = "hsa")]
-pub mod amd_tp;
 /// Core reservation and thread priority for the CPU prefill-head pool. Gated on
 /// `cpu` because a head runs on `exec::cpu`, so a build without it has no head
 /// to place — and that is also where `libc` enters the dependency set.
 #[cfg(feature = "cpu")]
 pub mod affinity;
+/// N [`amd::AmdEngine`] ranks stepped as one: the host half of the inline
+/// collective. Decode is launch-all-then-drain-all; prefill is per-segment,
+/// all-ranks, with a host barrier — see the module note for why the two differ.
+#[cfg(feature = "hsa")]
+pub mod amd_tp;
 /// Apple Neural Engine executor: CoreML programs built from plow weights, run at segment
 /// boundaries of the Metal walk. See `plans/apple-silicon-backend.md` §4.5.
 #[cfg(all(feature = "ane", target_os = "macos"))]
@@ -60,12 +60,12 @@ pub mod ane_mlp;
 #[cfg(all(feature = "metal", target_os = "macos"))]
 pub mod apple;
 pub mod counters;
-/// Narrows a loaded packet from its emitted context CEILING to the live bound
-/// this server serves (`PLOW_LIVE_CTX`).
-pub mod ctx_bound;
 /// CPU engine: device-ISA interpreter on persistent pinned worker threads,
 /// C kernels via `cpu::ffi`. See `plans/cpu-backend.md`.
 pub mod cpu;
+/// Narrows a loaded packet from its emitted context CEILING to the live bound
+/// this server serves (`PLOW_LIVE_CTX`).
+pub mod ctx_bound;
 /// The device surface the interpreter engine drives, as a trait — the step
 /// that lets `gpu` stop being CUDA-only. Not gated on a vendor feature: it is
 /// the definition both backends implement.
@@ -78,16 +78,16 @@ pub mod gpu;
 pub mod health;
 pub mod host;
 pub mod indirection;
-/// KV write-row sites + prefill-chunk rebasing, shared by the AMD and CPU engines.
-// Prefill-chunk helpers are only exercised by an engine with a prefill path (AMD today).
-#[cfg_attr(not(feature = "hsa"), allow(dead_code))]
-pub mod kvrow;
 /// Byte-copy planning for a CPU-prefilled head's KV rows.
 // Allowed dead until the head pool calls it. The planning rules are tested on
 // their own and land with the KV contract they depend on, rather than arriving
 // in the same commit as the pool that drives them.
 #[allow(dead_code)]
 pub mod kv_handoff;
+/// KV write-row sites + prefill-chunk rebasing, shared by the AMD and CPU engines.
+// Prefill-chunk helpers are only exercised by an engine with a prefill path (AMD today).
+#[cfg_attr(not(feature = "hsa"), allow(dead_code))]
+pub mod kvrow;
 pub mod mixed_packet;
 #[cfg(feature = "hsa")]
 pub(crate) mod mixed_program;

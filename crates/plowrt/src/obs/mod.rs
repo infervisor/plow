@@ -105,12 +105,18 @@ impl Metrics {
 
     pub fn accumulate(&self, other: &Self) {
         self.accumulate_counters(other);
-        self.slots_active
-            .fetch_add(other.slots_active.load(Ordering::Relaxed), Ordering::Relaxed);
-        self.slots_capacity
-            .fetch_add(other.slots_capacity.load(Ordering::Relaxed), Ordering::Relaxed);
-        self.kv_used_milli
-            .fetch_max(other.kv_used_milli.load(Ordering::Relaxed), Ordering::Relaxed);
+        self.slots_active.fetch_add(
+            other.slots_active.load(Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
+        self.slots_capacity.fetch_add(
+            other.slots_capacity.load(Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
+        self.kv_used_milli.fetch_max(
+            other.kv_used_milli.load(Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
         self.queued_requests.fetch_add(
             other.queued_requests.load(Ordering::Relaxed),
             Ordering::Relaxed,
@@ -135,8 +141,10 @@ impl Metrics {
         );
         self.serve_mode
             .fetch_max(other.serve_mode.load(Ordering::Relaxed), Ordering::Relaxed);
-        self.prefill_launch_rows
-            .fetch_max(other.prefill_launch_rows.load(Ordering::Relaxed), Ordering::Relaxed);
+        self.prefill_launch_rows.fetch_max(
+            other.prefill_launch_rows.load(Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
     }
 
     #[inline]

@@ -160,10 +160,16 @@ fn history_replay() {
 #[test]
 #[ignore = "requires plow_verify binary"]
 fn empty_and_failed_gate_never_qualify() {
-    assert_eq!(verdict(&json!({"ledger": [], "touched": [], "untouched": [],
-        "tier4": false, "numeric": false})), "insufficient_evidence");
+    assert_eq!(
+        verdict(&json!({"ledger": [], "touched": [], "untouched": [],
+        "tier4": false, "numeric": false})),
+        "insufficient_evidence"
+    );
     let failed = json!([{"kind": "gate", "pass": false, "evidence": "numerical mismatch"}]);
-    assert_eq!(verdict(&flip(&[638., 640., 642.], false, false, failed)), "reject");
+    assert_eq!(
+        verdict(&flip(&[638., 640., 642.], false, false, failed)),
+        "reject"
+    );
 }
 
 #[test]
@@ -174,7 +180,10 @@ fn repeated_treatment_and_both_spreads_are_required() {
     p["ledger"][3]["samples"] = json!(vec![650.; 30]);
     assert_eq!(verdict(&p), "insufficient_evidence");
     let mut p = flip(&fast, false, false, json!([]));
-    p["ledger"][2].as_object_mut().unwrap().remove("repeat_treatment_of");
+    p["ledger"][2]
+        .as_object_mut()
+        .unwrap()
+        .remove("repeat_treatment_of");
     assert_eq!(verdict(&p), "insufficient_evidence");
     let mut p = flip(&fast, false, false, json!([]));
     p["ledger"][3]["samples"] = json!(vec![640.; 29]);

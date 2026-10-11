@@ -34,7 +34,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "--iters" => iters = value.parse()?,
             "--before" => before = Some(pipeline.program_sequence(value)?),
             "--in" | "--out" | "--before-in" => {
-                let (name, file) = value.split_once('=').ok_or(format!("{flag} {value}: expected NAME=FILE"))?;
+                let (name, file) = value
+                    .split_once('=')
+                    .ok_or(format!("{flag} {value}: expected NAME=FILE"))?;
                 let tensor: PacketTensor = match pipeline.tensor(name) {
                     Ok(t) => t,
                     Err(_) => rt.tensor(name).ok_or(format!("no tensor {name}"))?,
@@ -48,11 +50,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             _ => return Err(format!("unknown flag {flag}").into()),
         }
     }
-    let write = |rt: &mut Box<dyn plowrt::exec::packet_runtime::PacketRuntime>, inputs: &[(PacketTensor, String)]| -> Result<(), Box<dyn std::error::Error>> {
+    let write = |rt: &mut Box<dyn plowrt::exec::packet_runtime::PacketRuntime>,
+                 inputs: &[(PacketTensor, String)]|
+     -> Result<(), Box<dyn std::error::Error>> {
         for (tensor, file) in inputs {
             let mut bytes = std::fs::read(file)?;
             if bytes.len() > tensor.bytes {
-                return Err(format!("{file}: {} bytes exceed the tensor ({})", bytes.len(), tensor.bytes).into());
+                return Err(format!(
+                    "{file}: {} bytes exceed the tensor ({})",
+                    bytes.len(),
+                    tensor.bytes
+                )
+                .into());
             }
             bytes.resize(tensor.bytes, 0);
             rt.write_tensor(*tensor, &bytes)?;
@@ -75,7 +84,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for (k, t) in us.iter_mut().enumerate() {
         t.sort_by(f64::total_cmp);
         total += t[t.len() / 2];
-        println!("stage {k} program {} median_us {:.1}", programs[k], t[t.len() / 2]);
+        println!(
+            "stage {k} program {} median_us {:.1}",
+            programs[k],
+            t[t.len() / 2]
+        );
     }
     println!("total_us {total:.1}");
     for (tensor, file) in &outputs {

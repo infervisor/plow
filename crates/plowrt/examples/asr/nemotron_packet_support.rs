@@ -143,10 +143,15 @@ pub fn token_output(
         let language = string_array(gguf, "asr.rnnt.prompt_dictionary")?
             .iter()
             .filter_map(|entry| entry.rsplit_once(':'))
-            .find_map(|(language, i)| (i.parse::<usize>().ok() == Some(index)).then(|| language.to_owned()))
+            .find_map(|(language, i)| {
+                (i.parse::<usize>().ok() == Some(index)).then(|| language.to_owned())
+            })
             .ok_or_else(|| format!("prompt dictionary has no index {index}"))?;
         if language.eq_ignore_ascii_case("en-US") {
-            output.language_aliases = vec![("en".into(), language.clone()), ("english".into(), language.clone())];
+            output.language_aliases = vec![
+                ("en".into(), language.clone()),
+                ("english".into(), language.clone()),
+            ];
         }
         output.language = Some(language);
     }

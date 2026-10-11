@@ -149,14 +149,23 @@ fn speech_effects_order_noise_war_bands_and_splitk_scratch() {
     check("disjoint column bands", banded_writes(1), true);
     check("same column band", banded_writes(0), false);
     check("split-K scratch ordered", shared_splitk_scratch(true), true);
-    check("split-K scratch shared unordered", shared_splitk_scratch(false), false);
+    check(
+        "split-K scratch shared unordered",
+        shared_splitk_scratch(false),
+        false,
+    );
     // Forged parent-pointer certificates: a self parent (not decreasing) or a non-edge.
     for forge in [0u64, 1] {
         let mut request = rand_noise(true);
         let trees = request["address_trees"].as_array_mut().unwrap();
         let mut forged = false;
         for tree in trees.iter_mut() {
-            for (node, parent) in tree["parent"].as_array_mut().unwrap().iter_mut().enumerate() {
+            for (node, parent) in tree["parent"]
+                .as_array_mut()
+                .unwrap()
+                .iter_mut()
+                .enumerate()
+            {
                 if parent.is_u64() && parent.as_u64() != Some(0) {
                     *parent = serde_json::json!(if forge == 0 { node as u64 } else { 0 });
                     forged = true;

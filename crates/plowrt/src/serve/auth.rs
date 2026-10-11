@@ -19,26 +19,31 @@ pub fn require(router: Router, keys: &[ApiKey]) -> Router {
         return router;
     }
     let keys: Arc<[Vec<u8>]> = keys.iter().map(|k| k.0.as_bytes().to_vec()).collect();
-    router.layer(axum::middleware::from_fn(move |request: Request, next: Next| {
-        let keys = Arc::clone(&keys);
-        async move {
-            let presented = presented(&request);
-            if OPEN.contains(&request.uri().path())
-                || presented.is_some_and(|p| keys.iter().fold(false, |hit, key| hit | same(key, p)))
-            {
-                return next.run(request).await;
+    router.layer(axum::middleware::from_fn(
+        move |request: Request, next: Next| {
+            let keys = Arc::clone(&keys);
+            async move {
+                let presented = presented(&request);
+                if OPEN.contains(&request.uri().path())
+                    || presented
+                        .is_some_and(|p| keys.iter().fold(false, |hit, key| hit | same(key, p)))
+                {
+                    return next.run(request).await;
+                }
+                let mut response = crate::serve::api_error(
+                    StatusCode::UNAUTHORIZED,
+                    "missing or invalid API key",
+                    "invalid_request_error",
+                    Some("invalid_api_key"),
+                    None,
+                );
+                response
+                    .headers_mut()
+                    .insert(header::WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"));
+                response
             }
-            let mut response = crate::serve::api_error(
-                StatusCode::UNAUTHORIZED,
-                "missing or invalid API key",
-                "invalid_request_error",
-                Some("invalid_api_key"),
-                None,
-            );
-            response.headers_mut().insert(header::WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"));
-            response
-        }
-    }))
+        },
+    ))
 }
 
 /// `Authorization: Bearer <key>`, else `x-api-key: <key>`, else (browsers cannot set WebSocket
@@ -51,7 +56,8 @@ fn presented(request: &Request) -> Option<&[u8]> {
 pub(crate) fn presented_key(headers: &axum::http::HeaderMap) -> Option<&[u8]> {
     if let Some(value) = headers.get(header::AUTHORIZATION) {
         let value = value.as_bytes();
-        return (value.len() > 7 && value[..7].eq_ignore_ascii_case(b"bearer ")).then(|| value[7..].trim_ascii());
+        return (value.len() > 7 && value[..7].eq_ignore_ascii_case(b"bearer "))
+            .then(|| value[7..].trim_ascii());
     }
     if let Some(value) = headers.get("x-api-key") {
         return Some(value.as_bytes().trim_ascii());
@@ -85,7 +91,12 @@ mod tests {
 
     fn app() -> Router {
         let keys = ["k1".parse().unwrap(), "secret-2".parse().unwrap()];
-        require(Router::new().route("/v1/models", get(|| async { "ok" })).route("/health", get(|| async { "ok" })), &keys)
+        require(
+            Router::new()
+                .route("/v1/models", get(|| async { "ok" }))
+                .route("/health", get(|| async { "ok" })),
+            &keys,
+        )
     }
 
     async fn status(header: Option<(&str, &str)>, path: &str) -> StatusCode {
@@ -93,24 +104,69 @@ mod tests {
         if let Some((name, value)) = header {
             request = request.header(name, value);
         }
-        app().oneshot(request.body(Body::empty()).unwrap()).await.unwrap().status()
+        app()
+            .oneshot(request.body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+            .status()
     }
 
     #[tokio::test]
     async fn keys_gate_every_route_but_health() {
         assert_eq!(status(None, "/v1/models").await, StatusCode::UNAUTHORIZED);
-        assert_eq!(status(Some(("authorization", "Bearer nope")), "/v1/models").await, StatusCode::UNAUTHORIZED);
-        assert_eq!(status(Some(("authorization", "Basic k1")), "/v1/models").await, StatusCode::UNAUTHORIZED);
-        assert_eq!(status(Some(("authorization", "Bearer k1")), "/v1/models").await, StatusCode::OK);
-        assert_eq!(status(Some(("authorization", "bearer secret-2")), "/v1/models").await, StatusCode::OK);
-        assert_eq!(status(Some(("x-api-key", "k1")), "/v1/models").await, StatusCode::OK);
-        assert_eq!(status(Some(("sec-websocket-protocol", "realtime, openai-insecure-api-key.k1")), "/v1/models").await, StatusCode::OK);
-        assert_eq!(status(Some(("sec-websocket-protocol", "openai-insecure-api-key.k1x")), "/v1/models").await, StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            status(Some(("authorization", "Bearer nope")), "/v1/models").await,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            status(Some(("authorization", "Basic k1")), "/v1/models").await,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            status(Some(("authorization", "Bearer k1")), "/v1/models").await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            status(Some(("authorization", "bearer secret-2")), "/v1/models").await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            status(Some(("x-api-key", "k1")), "/v1/models").await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            status(
+                Some((
+                    "sec-websocket-protocol",
+                    "realtime, openai-insecure-api-key.k1"
+                )),
+                "/v1/models"
+            )
+            .await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            status(
+                Some(("sec-websocket-protocol", "openai-insecure-api-key.k1x")),
+                "/v1/models"
+            )
+            .await,
+            StatusCode::UNAUTHORIZED
+        );
         assert_eq!(status(None, "/health").await, StatusCode::OK);
-        let open = require(Router::new().route("/v1/models", get(|| async { "ok" })), &[]);
-        let response = open.oneshot(Request::get("/v1/models").body(Body::empty()).unwrap()).await.unwrap();
+        let open = require(
+            Router::new().route("/v1/models", get(|| async { "ok" })),
+            &[],
+        );
+        let response = open
+            .oneshot(Request::get("/v1/models").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         assert!("".parse::<ApiKey>().is_err());
-        assert_eq!(format!("{:?}", "k1".parse::<ApiKey>().unwrap()), "ApiKey(<redacted>)");
+        assert_eq!(
+            format!("{:?}", "k1".parse::<ApiKey>().unwrap()),
+            "ApiKey(<redacted>)"
+        );
     }
 }

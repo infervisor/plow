@@ -2,9 +2,9 @@ use crate::conv2d::{
     self, Conv2dSpec, Conv2dStage, ConvActivation, ConvKind, ConvLayout, ConvWeight,
 };
 use crate::pipeline::{
-    DenseActivation, DenseF32Stage, DenseLayerNorm, DenseSplit, DenseWeight, GroupedAttentionF32Stage,
-    InitializedAddF32Stage, LayerNormF32Stage, PacketPrefix, RowStatsF32Stage, ScaledAddF32Stage,
-    TensorRef,
+    DenseActivation, DenseF32Stage, DenseLayerNorm, DenseSplit, DenseWeight,
+    GroupedAttentionF32Stage, InitializedAddF32Stage, LayerNormF32Stage, PacketPrefix,
+    RowStatsF32Stage, ScaledAddF32Stage, TensorRef,
 };
 use std::collections::BTreeMap;
 
@@ -181,9 +181,15 @@ impl AudioEncoderPackets {
             .pipelines
             .first_mut()
             .ok_or("Qwen audio packet has no pipeline")?;
-        let own = if self.packed { format!("packed.{}", feature_frames / 100) } else { format!("forward.{feature_frames}") };
+        let own = if self.packed {
+            format!("packed.{}", feature_frames / 100)
+        } else {
+            format!("forward.{feature_frames}")
+        };
         for (stage, &program) in self.prefix.programs.iter().enumerate() {
-            pipeline.programs.insert(format!("{own}.{stage}"), program as u32);
+            pipeline
+                .programs
+                .insert(format!("{own}.{stage}"), program as u32);
         }
         for (&capacity, programs) in &self.capacity_programs {
             for (stage, &program) in programs.iter().enumerate() {
@@ -207,7 +213,9 @@ impl AudioEncoderPackets {
                 .last_key_value()
                 .ok_or("packed Qwen audio packet has no single-utterance capacity")?;
             for (stage, &program) in largest.iter().enumerate() {
-                pipeline.programs.insert(format!("forward.{stage}"), program as u32);
+                pipeline
+                    .programs
+                    .insert(format!("forward.{stage}"), program as u32);
             }
         }
         pipeline
@@ -217,11 +225,14 @@ impl AudioEncoderPackets {
             .parameters
             .insert("output_rows".into(), u64::from(self.rows));
         pipeline.parameters.insert("feature_bins".into(), 128);
-        pipeline.parameters.insert("output_width".into(), u64::from(self.output_width));
-        pipeline.parameters.insert("qwen_audio_graph_v1".into(), 1);
         pipeline
             .parameters
-            .insert("attention.window_rows".into(), u64::from(self.output_shape[3] * 8));
+            .insert("output_width".into(), u64::from(self.output_width));
+        pipeline.parameters.insert("qwen_audio_graph_v1".into(), 1);
+        pipeline.parameters.insert(
+            "attention.window_rows".into(),
+            u64::from(self.output_shape[3] * 8),
+        );
         pipeline.tensors.insert(
             "valid_rows".into(),
             plow_asset::packet_pipeline::PipelineTensor {
@@ -235,7 +246,9 @@ impl AudioEncoderPackets {
         pipeline.tensors.insert(
             "split_rows".into(),
             plow_asset::packet_pipeline::PipelineTensor {
-                name: self.prefix.model.tensors[self.split_rows as usize].name.clone(),
+                name: self.prefix.model.tensors[self.split_rows as usize]
+                    .name
+                    .clone(),
                 dtype: PipelineDType::U32,
                 shape: vec![self.prefix.model.tensors[self.split_rows as usize].bytes / 4],
             },
@@ -249,7 +262,9 @@ impl AudioEncoderPackets {
             },
         );
         if let Some((tensor, parameters, shape)) = &self.frontend {
-            pipeline.parameters.extend(parameters.iter().map(|(k, v)| (k.clone(), *v)));
+            pipeline
+                .parameters
+                .extend(parameters.iter().map(|(k, v)| (k.clone(), *v)));
             pipeline.tensors.insert(
                 "audio.frontend.filterbank".into(),
                 plow_asset::packet_pipeline::PipelineTensor {
@@ -265,14 +280,25 @@ impl AudioEncoderPackets {
 
     /// Embed the host frontend (its parameters and filterbank) in the encoder packet.
     pub fn embed_frontend(&mut self, frontend: WhisperFrontend) {
-        let bytes: Vec<u8> = frontend.filterbank.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let bytes: Vec<u8> = frontend
+            .filterbank
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
         let tensor = self.prefix.model.tensors.len() as u32;
-        self.prefix.model.tensors.push(packet::devbuild::TensorDecl {
-            name: "const.audio.log_mel_filterbank".into(),
-            bytes: bytes.len() as u64,
-            init: Some(bytes),
-        });
-        self.frontend = Some((tensor, frontend.parameters, [u64::from(frontend.bins), u64::from(frontend.spectrum_bins)]));
+        self.prefix
+            .model
+            .tensors
+            .push(packet::devbuild::TensorDecl {
+                name: "const.audio.log_mel_filterbank".into(),
+                bytes: bytes.len() as u64,
+                init: Some(bytes),
+            });
+        self.frontend = Some((
+            tensor,
+            frontend.parameters,
+            [u64::from(frontend.bins), u64::from(frontend.spectrum_bins)],
+        ));
     }
 }
 
@@ -286,13 +312,20 @@ pub struct AudioDims {
 }
 
 impl AudioDims {
-    pub const QWEN3_ASR_1_7B: Self = Self { width: 1024, ffn_width: 4096, layers: 24, output_width: 2048 };
+    pub const QWEN3_ASR_1_7B: Self = Self {
+        width: 1024,
+        ffn_width: 4096,
+        layers: 24,
+        output_width: 2048,
+    };
 
     /// `thinker_config.audio_config` of a checkpoint's `config.json`.
     pub fn from_checkpoint(checkpoint: &std::path::Path) -> Result<Self, String> {
         let path = checkpoint.join("config.json");
-        let text = std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
-        let config: serde_json::Value = serde_json::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
+        let text =
+            std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+        let config: serde_json::Value =
+            serde_json::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
         let audio = &config["thinker_config"]["audio_config"];
         let field = |key: &str| {
             audio[key]
@@ -307,13 +340,20 @@ impl AudioDims {
             output_width: field("output_dim")?,
         };
         if field("encoder_attention_heads")? * 64 != dims.width || dims.layers == 0 {
-            return Err(format!("{}: audio tower is not 64-wide heads", path.display()));
+            return Err(format!(
+                "{}: audio tower is not 64-wide heads",
+                path.display()
+            ));
         }
         Ok(dims)
     }
 }
 
-pub fn lower_audio_encoder(feature_frames: u32, n_cu: u32, dims: AudioDims) -> Result<AudioEncoderPackets, String> {
+pub fn lower_audio_encoder(
+    feature_frames: u32,
+    n_cu: u32,
+    dims: AudioDims,
+) -> Result<AudioEncoderPackets, String> {
     if !(50..=3000).contains(&feature_frames) {
         return Err("invalid Qwen audio encoder geometry".into());
     }
@@ -358,15 +398,29 @@ pub fn audio_buckets(packed: &[u32], single: &[u32], max_chunks: Option<u32>) ->
 
 /// `chunks` 100-frame chunks of any number of utterances, each starting on a chunk; the `groups`
 /// table lists every utterance's attention windows `(first row, valid rows)`.
-pub fn lower_packed_audio_encoder(chunks: u32, n_cu: u32, dims: AudioDims) -> Result<AudioEncoderPackets, String> {
+pub fn lower_packed_audio_encoder(
+    chunks: u32,
+    n_cu: u32,
+    dims: AudioDims,
+) -> Result<AudioEncoderPackets, String> {
     if chunks == 0 || chunks > 1024 {
         return Err("invalid packed Qwen audio encoder geometry".into());
     }
     lower(chunks * 100, n_cu, true, dims)
 }
 
-fn lower(feature_frames: u32, n_cu: u32, packed: bool, dims: AudioDims) -> Result<AudioEncoderPackets, String> {
-    let AudioDims { width, ffn_width, layers, output_width } = dims;
+fn lower(
+    feature_frames: u32,
+    n_cu: u32,
+    packed: bool,
+    dims: AudioDims,
+) -> Result<AudioEncoderPackets, String> {
+    let AudioDims {
+        width,
+        ffn_width,
+        layers,
+        output_width,
+    } = dims;
     if n_cu == 0 {
         return Err("invalid Qwen audio encoder geometry".into());
     }
@@ -428,7 +482,11 @@ fn lower(feature_frames: u32, n_cu: u32, packed: bool, dims: AudioDims) -> Resul
     // Per row: the rows of its utterance's single-utterance capacity, whose split-K it reproduces.
     let split_rows = builder.tensor("in.qwen.audio_split_rows", 4 * u64::from(rows));
     let attention_rows = if packed { groups } else { valid_rows };
-    let split = if packed { DenseSplit::Reference(split_rows) } else { DenseSplit::Parallel };
+    let split = if packed {
+        DenseSplit::Reference(split_rows)
+    } else {
+        DenseSplit::Parallel
+    };
     prefix.model.tensors = builder.tensors();
     prefix = prefix.append_dense_f32(
         rows,
@@ -712,7 +770,10 @@ fn fuse_programs(prefix: &mut PacketPrefix, ops: usize) -> Result<(), String> {
         let mut previous: Option<u32> = None;
         for &p in run.iter() {
             let program = &model.progs[p];
-            if program.gq_seg_ofs.len() != 2 || program.l2_domains != 0 || program.stream_ofs.len() < n_cu {
+            if program.gq_seg_ofs.len() != 2
+                || program.l2_domains != 0
+                || program.stream_ofs.len() < n_cu
+            {
                 return Err("Qwen audio program is not a single unplaced segment".into());
             }
             for (k, inst) in program.insts.iter().enumerate() {
@@ -721,7 +782,8 @@ fn fuse_programs(prefix: &mut PacketPrefix, ops: usize) -> Result<(), String> {
                     let start = program.stream_ofs[cu] as usize;
                     for entry in &program.stream[start..start + program.stream_len[cu] as usize] {
                         if entry.inst as usize == k {
-                            *cus.get_mut(entry.slice as usize).ok_or("Qwen audio slice out of range")? = cu as u32;
+                            *cus.get_mut(entry.slice as usize)
+                                .ok_or("Qwen audio slice out of range")? = cu as u32;
                         }
                     }
                 }
@@ -1027,14 +1089,23 @@ mod tests {
         use AudioBucket::{Packed, Single};
         let packed = [8, 4];
         let single = [3000, 400];
-        assert_eq!(audio_buckets(&packed, &single, None), [Packed(8), Packed(4), Single(3000), Single(400)]);
-        assert_eq!(audio_buckets(&packed, &single, Some(4)), [Packed(4), Single(3000), Single(400)]);
+        assert_eq!(
+            audio_buckets(&packed, &single, None),
+            [Packed(8), Packed(4), Single(3000), Single(400)]
+        );
+        assert_eq!(
+            audio_buckets(&packed, &single, Some(4)),
+            [Packed(4), Single(3000), Single(400)]
+        );
         for cap in [Some(3), Some(0)] {
             let buckets = audio_buckets(&packed, &single, cap);
             assert_eq!(buckets, [Single(3000), Single(400)]);
             assert_eq!(buckets[0].feature_frames(), 3000);
         }
-        assert_eq!(audio_buckets(&[], &single, Some(2)), [Single(3000), Single(400)]);
+        assert_eq!(
+            audio_buckets(&[], &single, Some(2)),
+            [Single(3000), Single(400)]
+        );
         assert_eq!(Packed(4).feature_frames(), 400);
     }
 
@@ -1076,8 +1147,12 @@ mod tests {
             },
         )
         .unwrap();
-        let ops: Vec<_> =
-            prefix.model.progs.iter().map(|p| DevOp::from_u16(p.insts[0].op).unwrap()).collect();
+        let ops: Vec<_> = prefix
+            .model
+            .progs
+            .iter()
+            .map(|p| DevOp::from_u16(p.insts[0].op).unwrap())
+            .collect();
         assert_eq!(ops[0], DevOp::RowStatsF32);
         assert!(!ops.contains(&DevOp::LayerNormF32));
         let stats = prefix.model.progs[0].insts[0].t[0];
@@ -1162,7 +1237,12 @@ mod tests {
         assert_eq!(packets.output_shape, [1, 480, 16, 7]);
         assert_eq!(packets.prefix.input_shape, [1, 128, 50]);
         assert_eq!(packets.prefix.programs.len(), 271usize.div_ceil(FUSED_OPS));
-        let ops: usize = packets.prefix.programs.iter().map(|&p| packets.prefix.model.progs[p].insts.len()).sum();
+        let ops: usize = packets
+            .prefix
+            .programs
+            .iter()
+            .map(|&p| packets.prefix.model.progs[p].insts.len())
+            .sum();
         assert_eq!(ops, 273);
         assert_eq!(
             packets.prefix.model.tensors[packets.input as usize].name,
@@ -1199,7 +1279,10 @@ mod tests {
         packets
             .merge_capacity(lower_audio_encoder(100, 4, AudioDims::QWEN3_ASR_1_7B).unwrap())
             .unwrap();
-        assert_eq!(packets.prefix.model.progs.len(), 2 * 271usize.div_ceil(FUSED_OPS));
+        assert_eq!(
+            packets.prefix.model.progs.len(),
+            2 * 271usize.div_ceil(FUSED_OPS)
+        );
         let section = packets.pipeline_section(200).unwrap();
         let metadata: plow_asset::packet_pipeline::PacketPipelines =
             serde_json::from_slice(&section.data).unwrap();
@@ -1212,10 +1295,18 @@ mod tests {
     #[test]
     fn packed_buckets_share_the_largest_tensor_table() {
         let mut packets = lower_packed_audio_encoder(4, 4, AudioDims::QWEN3_ASR_1_7B).unwrap();
-        packets.merge_capacity(lower_packed_audio_encoder(2, 4, AudioDims::QWEN3_ASR_1_7B).unwrap()).unwrap();
-        packets.merge_capacity(lower_audio_encoder(300, 4, AudioDims::QWEN3_ASR_1_7B).unwrap()).unwrap();
-        packets.merge_capacity(lower_audio_encoder(100, 4, AudioDims::QWEN3_ASR_1_7B).unwrap()).unwrap();
-        assert!(packets.merge_capacity(lower_audio_encoder(100, 4, AudioDims::QWEN3_ASR_1_7B).unwrap()).is_err());
+        packets
+            .merge_capacity(lower_packed_audio_encoder(2, 4, AudioDims::QWEN3_ASR_1_7B).unwrap())
+            .unwrap();
+        packets
+            .merge_capacity(lower_audio_encoder(300, 4, AudioDims::QWEN3_ASR_1_7B).unwrap())
+            .unwrap();
+        packets
+            .merge_capacity(lower_audio_encoder(100, 4, AudioDims::QWEN3_ASR_1_7B).unwrap())
+            .unwrap();
+        assert!(packets
+            .merge_capacity(lower_audio_encoder(100, 4, AudioDims::QWEN3_ASR_1_7B).unwrap())
+            .is_err());
         let attention = packets
             .prefix
             .model
@@ -1231,7 +1322,9 @@ mod tests {
             .flat_map(|&p| &packets.prefix.model.progs[p].insts)
             .filter(|i| DevOp::from_u16(i.op) == Some(DevOp::DenseGemmF32))
             .collect();
-        assert!(dense.iter().all(|i| i.i[7] & 128 != 0 && i.t[4] == packets.split_rows && i.j[0] == 4));
+        assert!(dense
+            .iter()
+            .all(|i| i.i[7] & 128 != 0 && i.t[4] == packets.split_rows && i.j[0] == 4));
         let single = &packets.prefix.model.progs[packets.capacity_programs[&300][0]].insts[4];
         assert_eq!(DevOp::from_u16(single.op), Some(DevOp::DenseGemmF32));
         assert_eq!(single.i[7] & 128, 0);
@@ -1241,9 +1334,15 @@ mod tests {
         let pipeline = &metadata.pipelines[0];
         let last = 271usize.div_ceil(FUSED_OPS) - 1;
         for role in ["packed.4", "packed.2", "forward.300", "forward.100"] {
-            assert!(pipeline.programs.contains_key(&format!("{role}.{last}")), "{role}");
+            assert!(
+                pipeline.programs.contains_key(&format!("{role}.{last}")),
+                "{role}"
+            );
         }
-        assert_eq!(pipeline.programs["forward.0"], pipeline.programs["forward.300.0"]);
+        assert_eq!(
+            pipeline.programs["forward.0"],
+            pipeline.programs["forward.300.0"]
+        );
         assert_eq!(pipeline.tensors["groups"].shape, [9]);
         assert_eq!(pipeline.parameters["output_rows"], 52);
     }
@@ -1259,26 +1358,52 @@ pub struct WhisperFrontend {
 }
 
 pub fn whisper_frontend(checkpoint: &std::path::Path) -> Result<WhisperFrontend, String> {
-    let text = std::fs::read(checkpoint.join("preprocessor_config.json")).map_err(|e| e.to_string())?;
+    let text =
+        std::fs::read(checkpoint.join("preprocessor_config.json")).map_err(|e| e.to_string())?;
     let v: serde_json::Value = serde_json::from_slice(&text).map_err(|e| e.to_string())?;
-    if v["feature_extractor_type"] != "WhisperFeatureExtractor" || v["dither"].as_f64().unwrap_or(0.0) != 0.0 {
+    if v["feature_extractor_type"] != "WhisperFeatureExtractor"
+        || v["dither"].as_f64().unwrap_or(0.0) != 0.0
+    {
         return Err("audio frontend is not a dither-free WhisperFeatureExtractor".into());
     }
-    let get = |k: &str| v[k].as_u64().ok_or(format!("preprocessor_config.json: {k} missing"));
-    let (bins, hop, fft, samples) = (get("feature_size")?, get("hop_length")?, get("n_fft")?, get("n_samples")?);
+    let get = |k: &str| {
+        v[k].as_u64()
+            .ok_or(format!("preprocessor_config.json: {k} missing"))
+    };
+    let (bins, hop, fft, samples) = (
+        get("feature_size")?,
+        get("hop_length")?,
+        get("n_fft")?,
+        get("n_samples")?,
+    );
     let rate = v["sampling_rate"].as_u64().unwrap_or(16_000);
     let spectrum = fft / 2 + 1;
-    let hz_to_mel = |hz: f64| if hz < 1000.0 { hz * 3.0 / 200.0 } else { 15.0 + (hz / 1000.0).ln() * 27.0 / 6.4f64.ln() };
-    let mel_to_hz = |mel: f64| if mel < 15.0 { mel * 200.0 / 3.0 } else { 1000.0 * ((mel - 15.0) * 6.4f64.ln() / 27.0).exp() };
+    let hz_to_mel = |hz: f64| {
+        if hz < 1000.0 {
+            hz * 3.0 / 200.0
+        } else {
+            15.0 + (hz / 1000.0).ln() * 27.0 / 6.4f64.ln()
+        }
+    };
+    let mel_to_hz = |mel: f64| {
+        if mel < 15.0 {
+            mel * 200.0 / 3.0
+        } else {
+            1000.0 * ((mel - 15.0) * 6.4f64.ln() / 27.0).exp()
+        }
+    };
     let top = hz_to_mel(rate as f64 / 2.0);
-    let points: Vec<f64> = (0..bins + 2).map(|i| mel_to_hz(top * i as f64 / (bins + 1) as f64)).collect();
+    let points: Vec<f64> = (0..bins + 2)
+        .map(|i| mel_to_hz(top * i as f64 / (bins + 1) as f64))
+        .collect();
     let mut filterbank = vec![0f32; (bins * spectrum) as usize];
     for m in 0..bins as usize {
         for k in 0..spectrum as usize {
             let hz = k as f64 * rate as f64 / fft as f64;
             let rise = (hz - points[m]) / (points[m + 1] - points[m]);
             let fall = (points[m + 2] - hz) / (points[m + 2] - points[m + 1]);
-            filterbank[m * spectrum as usize + k] = (rise.min(fall).max(0.0) * 2.0 / (points[m + 2] - points[m])) as f32;
+            filterbank[m * spectrum as usize + k] =
+                (rise.min(fall).max(0.0) * 2.0 / (points[m + 2] - points[m])) as f32;
         }
     }
     let f = |x: f32| u64::from(x.to_bits());
@@ -1309,7 +1434,12 @@ pub fn whisper_frontend(checkpoint: &std::path::Path) -> Result<WhisperFrontend,
         ("input.round_bf16".into(), 1),
         ("encoder.frame_stride".into(), 8),
     ]);
-    Ok(WhisperFrontend { parameters, filterbank, bins: bins as u32, spectrum_bins: spectrum as u32 })
+    Ok(WhisperFrontend {
+        parameters,
+        filterbank,
+        bins: bins as u32,
+        spectrum_bins: spectrum as u32,
+    })
 }
 
 pub const ENCODER_PACKET: &str = "encoder.pkt";
@@ -1317,12 +1447,13 @@ pub const ENCODER_PACKET: &str = "encoder.pkt";
 /// Qwen3-ASR's host policy: a stream's last piece gets 1 s of -50 dBFS noise so the model hears
 /// it end; one transcript position per audio row (about 13 a second, where speech rarely needs
 /// 6 tokens a second) plus 64.
-pub const AUDIO_LM_POLICY: plow_asset::speech_contract::AudioLmPolicy = plow_asset::speech_contract::AudioLmPolicy {
-    final_padding_samples: 16_000,
-    final_padding_amplitude: 100.0 / 32768.0,
-    output_reserve_per_row: 1,
-    output_reserve_extra: 64,
-};
+pub const AUDIO_LM_POLICY: plow_asset::speech_contract::AudioLmPolicy =
+    plow_asset::speech_contract::AudioLmPolicy {
+        final_padding_samples: 16_000,
+        final_padding_amplitude: 100.0 / 32768.0,
+        output_reserve_per_row: 1,
+        output_reserve_extra: 64,
+    };
 
 /// Host contract of the Qwen3-ASR decoder for the generic audio-LM driver: prompt layout,
 /// audio marker, output markers, languages and stop ids, as packet strings and parameters.
@@ -1330,12 +1461,16 @@ pub fn audio_lm_contract(
     checkpoint: &std::path::Path,
 ) -> Result<(BTreeMap<String, u64>, BTreeMap<String, String>), String> {
     let json = |file: &str| -> Result<serde_json::Value, String> {
-        serde_json::from_slice(&std::fs::read(checkpoint.join(file)).map_err(|e| format!("{file}: {e}"))?)
-            .map_err(|e| format!("{file}: {e}"))
+        serde_json::from_slice(
+            &std::fs::read(checkpoint.join(file)).map_err(|e| format!("{file}: {e}"))?,
+        )
+        .map_err(|e| format!("{file}: {e}"))
     };
     let config = json("config.json")?;
     let thinker = &config["thinker_config"];
-    let audio_token = thinker["audio_token_id"].as_u64().ok_or("audio_token_id missing")?;
+    let audio_token = thinker["audio_token_id"]
+        .as_u64()
+        .ok_or("audio_token_id missing")?;
     let mut stops = Vec::new();
     for file in ["generation_config.json", "config.json"] {
         let Ok(v) = json(file) else { continue };
@@ -1351,21 +1486,51 @@ pub fn audio_lm_contract(
     if stops.is_empty() {
         return Err("no EOS ids".into());
     }
-    let languages: Vec<String> =
-        serde_json::from_value(config["support_languages"].clone()).map_err(|e| format!("support_languages: {e}"))?;
+    let languages: Vec<String> = serde_json::from_value(config["support_languages"].clone())
+        .map_err(|e| format!("support_languages: {e}"))?;
     const ALIASES: &[(&str, &str)] = &[
-        ("zh", "Chinese"), ("en", "English"), ("yue", "Cantonese"), ("ar", "Arabic"), ("de", "German"),
-        ("fr", "French"), ("es", "Spanish"), ("pt", "Portuguese"), ("id", "Indonesian"), ("it", "Italian"),
-        ("ko", "Korean"), ("ru", "Russian"), ("th", "Thai"), ("vi", "Vietnamese"), ("ja", "Japanese"),
-        ("tr", "Turkish"), ("hi", "Hindi"), ("ms", "Malay"), ("nl", "Dutch"), ("sv", "Swedish"),
-        ("da", "Danish"), ("fi", "Finnish"), ("pl", "Polish"), ("cs", "Czech"), ("fil", "Filipino"),
-        ("fa", "Persian"), ("el", "Greek"), ("hu", "Hungarian"), ("mk", "Macedonian"), ("ro", "Romanian"),
+        ("zh", "Chinese"),
+        ("en", "English"),
+        ("yue", "Cantonese"),
+        ("ar", "Arabic"),
+        ("de", "German"),
+        ("fr", "French"),
+        ("es", "Spanish"),
+        ("pt", "Portuguese"),
+        ("id", "Indonesian"),
+        ("it", "Italian"),
+        ("ko", "Korean"),
+        ("ru", "Russian"),
+        ("th", "Thai"),
+        ("vi", "Vietnamese"),
+        ("ja", "Japanese"),
+        ("tr", "Turkish"),
+        ("hi", "Hindi"),
+        ("ms", "Malay"),
+        ("nl", "Dutch"),
+        ("sv", "Swedish"),
+        ("da", "Danish"),
+        ("fi", "Finnish"),
+        ("pl", "Polish"),
+        ("cs", "Czech"),
+        ("fil", "Filipino"),
+        ("fa", "Persian"),
+        ("el", "Greek"),
+        ("hu", "Hungarian"),
+        ("mk", "Macedonian"),
+        ("ro", "Romanian"),
     ];
     let pre = json("preprocessor_config.json").unwrap_or_default();
     let mut parameters = BTreeMap::from([
         ("audio.token_id".into(), audio_token),
-        ("audio.sample_rate".into(), pre["sampling_rate"].as_u64().unwrap_or(16_000)),
-        ("audio.max_seconds".into(), pre["chunk_length"].as_u64().unwrap_or(30)),
+        (
+            "audio.sample_rate".into(),
+            pre["sampling_rate"].as_u64().unwrap_or(16_000),
+        ),
+        (
+            "audio.max_seconds".into(),
+            pre["chunk_length"].as_u64().unwrap_or(30),
+        ),
         ("output.max_tokens".into(), 1024),
         ("prompt.context_max_tokens".into(), 256),
         ("stop.count".into(), stops.len() as u64),
@@ -1401,8 +1566,12 @@ pub fn extend_pipeline_section(
     let mut metadata: plow_asset::packet_pipeline::PacketPipelines =
         serde_json::from_slice(&section.data).map_err(|e| e.to_string())?;
     for pipeline in &mut metadata.pipelines {
-        pipeline.parameters.extend(parameters.iter().map(|(k, v)| (k.clone(), *v)));
-        pipeline.strings.extend(strings.iter().map(|(k, v)| (k.clone(), v.clone())));
+        pipeline
+            .parameters
+            .extend(parameters.iter().map(|(k, v)| (k.clone(), *v)));
+        pipeline
+            .strings
+            .extend(strings.iter().map(|(k, v)| (k.clone(), v.clone())));
     }
     section.data = serde_json::to_vec(&metadata).map_err(|e| e.to_string())?;
     Ok(())

@@ -3,8 +3,8 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use axum::extract::State;
 use axum::body::Bytes;
+use axum::extract::State;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use futures::stream;
@@ -48,11 +48,26 @@ pub async fn completions(
     let mut ids = match crate::serve::session::RequestIds::from_headers(&headers) {
         Ok(ids) => ids,
         Err(e) => {
-            return crate::serve::api_error(axum::http::StatusCode::BAD_REQUEST, e, "invalid_request_error", Some("invalid_value"), None)
+            return crate::serve::api_error(
+                axum::http::StatusCode::BAD_REQUEST,
+                e,
+                "invalid_request_error",
+                Some("invalid_value"),
+                None,
+            )
         }
     };
-    if let Err(e) = req.as_ref().map_or(Ok(()), |Json(r)| ids.apply_body(&r.route)) {
-        return crate::serve::api_error(axum::http::StatusCode::BAD_REQUEST, e, "invalid_request_error", Some("invalid_value"), Some("session_id".into()));
+    if let Err(e) = req
+        .as_ref()
+        .map_or(Ok(()), |Json(r)| ids.apply_body(&r.route))
+    {
+        return crate::serve::api_error(
+            axum::http::StatusCode::BAD_REQUEST,
+            e,
+            "invalid_request_error",
+            Some("invalid_value"),
+            Some("session_id".into()),
+        );
     }
     if let Some(r) = crate::serve::overload::gate(&ids) {
         return r;
@@ -121,7 +136,10 @@ async fn completions_with(
             Some("echo".into()),
         );
     }
-    let logprobs = match crate::serve::logprobs::parse_completion(req.logprobs.as_ref(), req.logprobs_mode.as_deref()) {
+    let logprobs = match crate::serve::logprobs::parse_completion(
+        req.logprobs.as_ref(),
+        req.logprobs_mode.as_deref(),
+    ) {
         Ok(lp) => lp,
         Err((msg, param)) => {
             return crate::serve::api_error(
@@ -143,8 +161,13 @@ async fn completions_with(
         );
     }
     if !state.residency(&req.model).admits() {
-        return crate::serve::api_error(axum::http::StatusCode::SERVICE_UNAVAILABLE,
-            "Model is explicitly unloaded or unloading", "server_error", Some("model_unloaded"), Some("model".into()));
+        return crate::serve::api_error(
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "Model is explicitly unloaded or unloading",
+            "server_error",
+            Some("model_unloaded"),
+            Some("model".into()),
+        );
     }
     #[cfg(feature = "cuda")]
     {
@@ -239,8 +262,15 @@ async fn completions_with(
     }
 
     let dp = state.dp_set(&req.model);
-    let direct = if dp.is_some() { None } else { state.mux(&req.model) };
-    let (true, Ok(bundle)) = (dp.is_some() || direct.is_some(), state.registry.get(&req.model)) else {
+    let direct = if dp.is_some() {
+        None
+    } else {
+        state.mux(&req.model)
+    };
+    let (true, Ok(bundle)) = (
+        dp.is_some() || direct.is_some(),
+        state.registry.get(&req.model),
+    ) else {
         return crate::serve::api_error(
             axum::http::StatusCode::NOT_FOUND,
             format!("no model registered for '{}'.", req.model),
@@ -264,7 +294,9 @@ async fn completions_with(
     let encode = |text: &str| {
         crate::obs::ttft::timed(&crate::obs::ttft::ENCODE, || {
             crate::serve::encode_prompt(text, |t| {
-                bundle.tokenizer().encode_with_special_tokens(t, req.add_special_tokens)
+                bundle
+                    .tokenizer()
+                    .encode_with_special_tokens(t, req.add_special_tokens)
             })
         })
     };
@@ -273,7 +305,11 @@ async fn completions_with(
         PromptSpec::Batch(v) => v.iter().map(String::len).sum(),
         PromptSpec::Tokens(_) | PromptSpec::TokenBatch(_) => 0,
     };
-    if let Some(e) = crate::serve::prompt_bytes_overflow(state.max_ctx(&req.model), bundle.tokenizer().max_token_bytes(), text_bytes) {
+    if let Some(e) = crate::serve::prompt_bytes_overflow(
+        state.max_ctx(&req.model),
+        bundle.tokenizer().max_token_bytes(),
+        text_bytes,
+    ) {
         return crate::serve::api_error_for(&e);
     }
     let prompt_ids = match &req.prompt {
@@ -317,23 +353,28 @@ async fn completions_with(
     }
     let n_prompt = prompt_ids.len();
     if req.max_tokens.is_none() {
-        gen.max_tokens = crate::serve::default_max_tokens(gen.max_tokens, state.max_ctx(&req.model), n_prompt);
+        gen.max_tokens =
+            crate::serve::default_max_tokens(gen.max_tokens, state.max_ctx(&req.model), n_prompt);
     }
-    if let Some(e) = crate::serve::context_overflow(state.max_ctx(&req.model), n_prompt, gen.max_tokens) {
+    if let Some(e) =
+        crate::serve::context_overflow(state.max_ctx(&req.model), n_prompt, gen.max_tokens)
+    {
         return crate::serve::api_error_for(&e);
     }
     let routed;
     let (mut rank, mut prefix, mut _pick) = (0, None, None);
     let mux = match (&direct, dp) {
         (Some(m), _) => m,
-        (None, Some(set)) => match state.dp_route(set, ids.session.as_deref(), Some(&prompt_ids), 0) {
-            Some((r, m, key, pick)) => {
-                (rank, prefix, _pick) = (r, key, Some(pick));
-                routed = m;
-                &routed
+        (None, Some(set)) => {
+            match state.dp_route(set, ids.session.as_deref(), Some(&prompt_ids), 0) {
+                Some((r, m, key, pick)) => {
+                    (rank, prefix, _pick) = (r, key, Some(pick));
+                    routed = m;
+                    &routed
+                }
+                None => return crate::serve::chat::dp_unavailable(&req.model),
             }
-            None => return crate::serve::chat::dp_unavailable(&req.model),
-        },
+        }
         (None, None) => unreachable!("checked at lookup"),
     };
     if prefix.is_none() {
@@ -349,7 +390,10 @@ async fn completions_with(
     let Some(in_flight) = ids.begin(&req.model) else {
         return crate::serve::api_error(
             axum::http::StatusCode::CONFLICT,
-            format!("request {} is already in flight in this session", ids.request),
+            format!(
+                "request {} is already in flight in this session",
+                ids.request
+            ),
             "invalid_request_error",
             Some("duplicate_request_id"),
             None,
@@ -364,7 +408,12 @@ async fn completions_with(
         true,
     );
     let (report, report_rx) = ids.report();
-    let session = ids.session.as_ref().and_then(|_| ids.ticket(crate::serve::session::row_keys(&prompt_ids, &[], &[]), report));
+    let session = ids.session.as_ref().and_then(|_| {
+        ids.ticket(
+            crate::serve::session::row_keys(&prompt_ids, &[], &[]),
+            report,
+        )
+    });
     let job = crate::serve::mux::Job {
         prompt_ids,
         gen,
@@ -382,17 +431,22 @@ async fn completions_with(
     if crate::obs::host::on() {
         crate::obs::host::submitted(n_prompt, t_arrive.elapsed());
     }
-    if let Err(err) = state.submit_routed(dp.map(|s| (&**s, rank)), ids.session.as_deref(), mux, job, t_arrive, ingress) {
+    if let Err(err) = state.submit_routed(
+        dp.map(|s| (&**s, rank)),
+        ids.session.as_deref(),
+        mux,
+        job,
+        t_arrive,
+        ingress,
+    ) {
         return match err {
-            crate::serve::mux::SubmitError::Full(_) => {
-                crate::serve::api_error(
-                    axum::http::StatusCode::TOO_MANY_REQUESTS,
-                    "model request queue full",
-                    "rate_limit_error",
-                    Some("server_overloaded"),
-                    None,
-                )
-            }
+            crate::serve::mux::SubmitError::Full(_) => crate::serve::api_error(
+                axum::http::StatusCode::TOO_MANY_REQUESTS,
+                "model request queue full",
+                "rate_limit_error",
+                Some("server_overloaded"),
+                None,
+            ),
             crate::serve::mux::SubmitError::Closed(_) => crate::serve::api_error(
                 axum::http::StatusCode::SERVICE_UNAVAILABLE,
                 "model dispatcher unavailable",
@@ -425,7 +479,16 @@ async fn completions_with(
         response.headers_mut().extend(stamped);
         response
     } else {
-        buffer_and_reply(id, requested_model, rx, response_prompt_ids, created, lp_fmt, run).await
+        buffer_and_reply(
+            id,
+            requested_model,
+            rx,
+            response_prompt_ids,
+            created,
+            lp_fmt,
+            run,
+        )
+        .await
     };
     if let Some(cache) = cache {
         cache.stamp(&mut response);
@@ -449,7 +512,11 @@ async fn buffer_and_reply(
     let mut usage = None;
     while let Some(chunk) = rx.recv().await {
         match chunk {
-            StreamChunk::Token { id, text: delta, logprobs } => {
+            StreamChunk::Token {
+                id,
+                text: delta,
+                logprobs,
+            } => {
                 run.first();
                 if let (Some(fmt), Some(lp)) = (&lp_fmt, &logprobs) {
                     lps.push(fmt, id, lp, text.len());
@@ -608,9 +675,15 @@ fn sse_response(
                     // `finish_reason: "stop"` — see the matching comment on
                     // the chat endpoint for why that scored as success.
                     tracing::warn!(model = %st.model, error = %e, "completion SSE stream error");
-                    let body = crate::serve::openai::ApiErrorBody::new(e.to_string(), "server_error", None, None);
+                    let body = crate::serve::openai::ApiErrorBody::new(
+                        e.to_string(),
+                        "server_error",
+                        None,
+                        None,
+                    );
                     let data = serde_json::to_string(&body).unwrap_or_else(|_| {
-                        "{\"error\":{\"message\":\"stream error\",\"type\":\"server_error\"}}".to_string()
+                        "{\"error\":{\"message\":\"stream error\",\"type\":\"server_error\"}}"
+                            .to_string()
                     });
                     st.done = true;
                     return Some((stream_mod::sse_data(&data), st));
@@ -626,7 +699,8 @@ fn sse_response(
                     usage: Some(usage),
                     token_ids: None,
                 };
-                st.pending.push_back(stream_mod::sse_data(&stream_mod::chunk_data(&usage_frame)));
+                st.pending
+                    .push_back(stream_mod::sse_data(&stream_mod::chunk_data(&usage_frame)));
             }
             if terminate {
                 st.run.done();
@@ -670,7 +744,11 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(req.route.session_id.as_deref(), Some("s"));
-        assert!(req.route.metadata.as_ref().is_some_and(|m| m["turn_id"] == "t"));
+        assert!(req
+            .route
+            .metadata
+            .as_ref()
+            .is_some_and(|m| m["turn_id"] == "t"));
         assert_eq!(req.sampling.temperature, Some(0.0));
         assert!(matches!(&req.prompt, PromptSpec::Text(t) if t == "raw prompt"));
         assert_eq!(req.max_tokens, Some(1024));

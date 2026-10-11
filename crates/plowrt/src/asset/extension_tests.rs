@@ -332,25 +332,25 @@ fn an_extension_states_its_roles_because_it_has_no_position_to_imply_them() {
     );
     // A lone program is `prog_t.len() - 1`, so the positional rule would call EVERY extension's
     // single program a decode rung. Unmarked means prefill bucket; the rung says so.
-    let bucket = DevBlob::parse_extension(
-        &ext_model(1, vec![4096]).to_ext_blob(&pref, &[]),
-        false,
-    )
-    .unwrap();
+    let bucket =
+        DevBlob::parse_extension(&ext_model(1, vec![4096]).to_ext_blob(&pref, &[]), false).unwrap();
     assert!(!bucket.progs[0].role.is_decode_rung());
     assert_eq!(
         bucket.program_roles(),
         vec![ProgramRole::PrefillBucket { rows: 4096 }]
     );
 
-    let r = DevBlob::parse_extension(
-        &ext_model(1, vec![rung(12)]).to_ext_blob(&pref, &[]),
-        false,
-    )
-    .unwrap();
+    let r = DevBlob::parse_extension(&ext_model(1, vec![rung(12)]).to_ext_blob(&pref, &[]), false)
+        .unwrap();
     assert!(r.progs[0].role.is_decode_rung());
-    assert_eq!(r.progs[0].t, 12, "the role bit is masked out of the row count");
-    assert_eq!(r.program_roles(), vec![ProgramRole::DecodeRung { rows: 12 }]);
+    assert_eq!(
+        r.progs[0].t, 12,
+        "the role bit is masked out of the row count"
+    );
+    assert_eq!(
+        r.program_roles(),
+        vec![ProgramRole::DecodeRung { rows: 12 }]
+    );
 
     // A parent never sets the bit, and its ladder is still the positional one: the same
     // `prog_t` read as an extension would call every program a bucket.
@@ -403,7 +403,10 @@ fn parent_facts_come_out_of_the_files_the_contract_names() {
     );
     assert!(f.arenas.growable);
     assert_eq!(f.arenas.segment_ceiling, 2048);
-    assert_eq!(f.arenas.reserved.counters, 14, "the widest program's counters");
+    assert_eq!(
+        f.arenas.reserved.counters, 14,
+        "the widest program's counters"
+    );
 }
 
 #[test]
@@ -551,7 +554,10 @@ fn requires_json_must_pin_the_extensions_own_packet_hash() {
         Some(0x0000_0000_dead_beef),
     );
     let e = err(load_one(&d, false));
-    assert!(e.contains("requires.json pins packet 0x00000000deadbeef"), "{e}");
+    assert!(
+        e.contains("requires.json pins packet 0x00000000deadbeef"),
+        "{e}"
+    );
     assert!(e.contains("0x00000000cafef00d"), "{e}");
 }
 

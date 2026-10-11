@@ -226,7 +226,9 @@ pub fn slice_for<'a>(
     if let Some((_, suffix)) = name.split_once(".derived.mla_fp8_tp") {
         let prepared_tp = suffix.split('.').next().and_then(|s| s.parse::<u32>().ok());
         if prepared_tp != Some(tp) {
-            return Err(bad(format!("MLA FP8 weights prepared for {prepared_tp:?}, runtime tp={tp}")));
+            return Err(bad(format!(
+                "MLA FP8 weights prepared for {prepared_tp:?}, runtime tp={tp}"
+            )));
         }
     }
 
@@ -941,8 +943,12 @@ mod glm_shard_tests {
     #[test]
     fn glm_qkva_fp8_weights_and_scales_are_replicated() {
         for suffix in ["weight_fp8", "weight_scale_inv"] {
-            assert_eq!(shard_of(&format!("model.layers.3.self_attn.fused_qkv_a_proj.{suffix}")),
-                       Shard::Replicated);
+            assert_eq!(
+                shard_of(&format!(
+                    "model.layers.3.self_attn.fused_qkv_a_proj.{suffix}"
+                )),
+                Shard::Replicated
+            );
         }
     }
 
@@ -952,17 +958,30 @@ mod glm_shard_tests {
         for suffix in ["weight_fp8", "weight_scale_inv"] {
             let name = format!("model.layers.3.self_attn.q_b_proj.{suffix}");
             assert_eq!(shard_of(&name), Shard::Column);
-            assert_eq!(slice_for(&name, &bytes, &[8, 8], 8, 3, 8).unwrap().as_ref(), &bytes[24..32]);
+            assert_eq!(
+                slice_for(&name, &bytes, &[8, 8], 8, 3, 8).unwrap().as_ref(),
+                &bytes[24..32]
+            );
         }
         for tag in ["wk", "wv"] {
             let name = format!("model.layers.3.self_attn.derived.mla_fp8_tp8.{tag}.weight");
             assert_eq!(shard_of(&name), Shard::Column);
-            assert_eq!(slice_for(&name, &bytes, &[8, 2, 4], 8, 3, 8).unwrap().as_ref(), &bytes[24..32]);
+            assert_eq!(
+                slice_for(&name, &bytes, &[8, 2, 4], 8, 3, 8)
+                    .unwrap()
+                    .as_ref(),
+                &bytes[24..32]
+            );
             for tp in [1, 4, 16] {
                 assert!(slice_for(&name, &bytes, &[8, 2, 4], 64 / tp as u64, 0, tp).is_err());
             }
             let scale = format!("model.layers.3.self_attn.derived.mla_fp8_tp8.{tag}.weight_scale");
-            assert_eq!(slice_for(&scale, &bytes[..32], &[8, 1], 4, 3, 8).unwrap().as_ref(), &bytes[12..16]);
+            assert_eq!(
+                slice_for(&scale, &bytes[..32], &[8, 1], 4, 3, 8)
+                    .unwrap()
+                    .as_ref(),
+                &bytes[12..16]
+            );
         }
     }
 }

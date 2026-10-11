@@ -461,7 +461,10 @@ impl Requires {
                 || std::path::Path::new(&o.stem).components().count() != 1
                 || o.stem.contains('/')
             {
-                return Err(format!("requires.json object stem `{}` is not a bare name", o.stem));
+                return Err(format!(
+                    "requires.json object stem `{}` is not a bare name",
+                    o.stem
+                ));
             }
             if o.sha256.len() != 64 || !o.sha256.bytes().all(|b| b.is_ascii_hexdigit()) {
                 return Err(format!("requires.json object `{}` has no sha256", o.stem));
@@ -761,7 +764,11 @@ pub fn merge(parent: &ParentFacts, exts: &[ExtensionFacts]) -> Result<Merged, Re
             }
         }
 
-        programs.extend(e.programs.iter().map(|r| (Origin::Extension(e.name.clone()), *r)));
+        programs.extend(
+            e.programs
+                .iter()
+                .map(|r| (Origin::Extension(e.name.clone()), *r)),
+        );
 
         // 5 — ladder well-formedness AFTER this extension is merged, so the refusal names the
         // extension that broke it rather than the last one in the directory.

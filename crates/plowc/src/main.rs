@@ -636,7 +636,10 @@ fn run_knob_scope(k: &KnobScopeCli) -> Result<PathBuf, String> {
             .chain(devgen::knob_spec::RAW_ENV)
             .find(|s| s.id == k.knob)
             .ok_or_else(|| format!("{} is not a registered emit knob", k.knob))?;
-        Some(spec.env.ok_or_else(|| format!("{} has no env var to set", k.knob))?)
+        Some(
+            spec.env
+                .ok_or_else(|| format!("{} has no env var to set", k.knob))?,
+        )
     };
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     std::fs::create_dir_all(&k.dir).map_err(|e| format!("{}: {e}", k.dir.display()))?;
@@ -651,7 +654,9 @@ fn run_knob_scope(k: &KnobScopeCli) -> Result<PathBuf, String> {
                 cmd.env(env, value);
             }
         }
-        let status = cmd.status().map_err(|e| format!("{}: {e}", exe.display()))?;
+        let status = cmd
+            .status()
+            .map_err(|e| format!("{}: {e}", exe.display()))?;
         if status.success() {
             Ok(out)
         } else {
@@ -664,7 +669,10 @@ fn run_knob_scope(k: &KnobScopeCli) -> Result<PathBuf, String> {
     } else {
         (emit_one("off", off)?, emit_one("on", on)?)
     };
-    let plowrt = k.plowrt.clone().unwrap_or_else(|| exe.with_file_name("plowrt"));
+    let plowrt = k
+        .plowrt
+        .clone()
+        .unwrap_or_else(|| exe.with_file_name("plowrt"));
     let report = k.dir.join(format!("scope-{}.json", k.knob));
     let mut cmd = std::process::Command::new(&plowrt);
     cmd.args(["knob-scope", "--knob", &k.knob, "--values", &k.values])
@@ -677,11 +685,17 @@ fn run_knob_scope(k: &KnobScopeCli) -> Result<PathBuf, String> {
     if let Some(w) = &k.workload {
         cmd.arg("--workload").arg(w);
     }
-    let status = cmd.status().map_err(|e| format!("{}: {e}", plowrt.display()))?;
+    let status = cmd
+        .status()
+        .map_err(|e| format!("{}: {e}", plowrt.display()))?;
     if status.success() {
         Ok(report)
     } else {
-        Err(format!("checkpoint S rejected {} (report: {})", k.knob, report.display()))
+        Err(format!(
+            "checkpoint S rejected {} (report: {})",
+            k.knob,
+            report.display()
+        ))
     }
 }
 
@@ -828,7 +842,9 @@ fn main() -> ExitCode {
     let cpu_target = devgen::target_is_cpu(&cli.arch, &cli.gpu);
     // The CPU flash-decode kernels need FLASH_MERGE; the NVIDIA hd256/512 decode merge-fold
     // removes it and the CPU loader refuses the packet. Off by default for CPU targets.
-    if cpu_target && matches.value_source("nv_fa_fold_wide") == Some(clap::parser::ValueSource::DefaultValue) {
+    if cpu_target
+        && matches.value_source("nv_fa_fold_wide") == Some(clap::parser::ValueSource::DefaultValue)
+    {
         cli.emit_cfg.nv_fa_fold_wide = false;
         devgen::emit_config::note_production_default("nv_fa_fold_wide", "false".into());
     }
@@ -1130,8 +1146,8 @@ fn lean_unavailable_reason() -> Option<&'static str> {
 /// ordering certificate's degrade. `--no-knob-verify` is the way past it.
 #[cfg(feature = "lean-verify")]
 fn install_knob_verifier() {
-    devgen::knob_spec::install_verifier(|payload| {
-        match lean_verify::checkpoints::knobs::check_knobs(payload) {
+    devgen::knob_spec::install_verifier(
+        |payload| match lean_verify::checkpoints::knobs::check_knobs(payload) {
             Ok(cert) if cert.ok => Ok(cert.notes.unwrap_or_default()),
             Ok(cert) => Err(cert.reason.unwrap_or_else(|| "no reason given".into())),
             Err(e) if e.is_binary_unusable() => Err(format!(
@@ -1139,16 +1155,18 @@ fn install_knob_verifier() {
                  --no-knob-verify (bring-up only)"
             )),
             Err(e) => Err(e.to_string()),
-        }
-    });
+        },
+    );
 }
 
 #[cfg(not(feature = "lean-verify"))]
 fn install_knob_verifier() {
     devgen::knob_spec::install_verifier(|_| {
-        Err("plowc was built without the `lean-verify` feature; pass --no-knob-verify \
+        Err(
+            "plowc was built without the `lean-verify` feature; pass --no-knob-verify \
              (bring-up only)"
-            .into())
+                .into(),
+        )
     });
 }
 
@@ -1162,19 +1180,22 @@ fn devblob_verify_hook(
 ) -> Result<devgen::VerifyHook, Box<dyn std::error::Error>> {
     use lean_verify::checkpoints::schedule as lv;
     if do_verify {
-        devgen::install_sidecar_verifier(Box::new(|requests| {
-            match lean_verify::call_batch_bound(requests) {
-                Ok((certs, verifier_sha256)) => Ok(Some((
-                    certs.iter().map(serde_json::to_value).collect::<Result<_, _>>()
-                        .map_err(|error| error.to_string())?,
-                    verifier_sha256,
-                ))),
-                Err(e) if e.is_binary_unusable() => {
-                    warn!(error = %e, "sidecar lean checks skipped: verifier not runnable");
-                    Ok(None)
-                }
-                Err(e) => Err(e.to_string()),
+        devgen::install_sidecar_verifier(Box::new(|requests| match lean_verify::call_batch_bound(
+            requests,
+        ) {
+            Ok((certs, verifier_sha256)) => Ok(Some((
+                certs
+                    .iter()
+                    .map(serde_json::to_value)
+                    .collect::<Result<_, _>>()
+                    .map_err(|error| error.to_string())?,
+                verifier_sha256,
+            ))),
+            Err(e) if e.is_binary_unusable() => {
+                warn!(error = %e, "sidecar lean checks skipped: verifier not runnable");
+                Ok(None)
             }
+            Err(e) => Err(e.to_string()),
         }));
     }
     Ok(Box::new(move |m: &packet::devbuild::Model| {
@@ -1202,35 +1223,37 @@ fn devblob_verify_hook(
         }
         {
             match plowc::rewrite_body_request(rewrite::rules_source()) {
-                Ok(req) => {
-                    match lean_verify::call_batch_bound(&[("A", req.clone())]) {
-                        Ok((mut certs, verifier_sha256)) => {
-                            let cert = certs.remove(0);
-                            if !cert.ok {
-                                return Err(format!(
-                                    "Checkpoint A (rewrite rules soundness) REJECTED: {}",
-                                    cert.reason.unwrap_or_default()
-                                ));
-                            }
-                            rep.rewrite_verified = true;
-                            rep.compile_checks.push(plow_asset::certificates::CompileCheckReceipt {
+                Ok(req) => match lean_verify::call_batch_bound(&[("A", req.clone())]) {
+                    Ok((mut certs, verifier_sha256)) => {
+                        let cert = certs.remove(0);
+                        if !cert.ok {
+                            return Err(format!(
+                                "Checkpoint A (rewrite rules soundness) REJECTED: {}",
+                                cert.reason.unwrap_or_default()
+                            ));
+                        }
+                        rep.rewrite_verified = true;
+                        rep.compile_checks
+                            .push(plow_asset::certificates::CompileCheckReceipt {
                                 program: None,
-                                scope: plow_asset::certificates::SemanticScope::RewriteBodyExpansion,
+                                scope:
+                                    plow_asset::certificates::SemanticScope::RewriteBodyExpansion,
                                 checkpoint: "A".into(),
                                 request_sha256: plow_asset::certificates::request_sha256(&req)?,
-                                verifier_sha256, request: req,
-                                response: serde_json::to_value(&cert).map_err(|error| error.to_string())?,
+                                verifier_sha256,
+                                request: req,
+                                response: serde_json::to_value(&cert)
+                                    .map_err(|error| error.to_string())?,
                             });
-                            info!("lean actual rewrite bodies checked against full-arity syntax expansion; not a floating-point kernel implementation proof");
-                        }
-                        Err(e) if e.is_binary_unusable() => {
-                            warn!(error = %e, "lean rewrite verification skipped: verifier not runnable");
-                            rep.rewrite_verified = false;
-                            rep.reason = Some(format!("verifier not runnable: {e}"));
-                        }
-                        Err(e) => return Err(format!("Checkpoint A rewrite check failed: {e}")),
+                        info!("lean actual rewrite bodies checked against full-arity syntax expansion; not a floating-point kernel implementation proof");
                     }
-                }
+                    Err(e) if e.is_binary_unusable() => {
+                        warn!(error = %e, "lean rewrite verification skipped: verifier not runnable");
+                        rep.rewrite_verified = false;
+                        rep.reason = Some(format!("verifier not runnable: {e}"));
+                    }
+                    Err(e) => return Err(format!("Checkpoint A rewrite check failed: {e}")),
+                },
                 Err(e) => {
                     return Err(format!("failed to parse egglog rule catalog: {e}"));
                 }
@@ -1239,7 +1262,10 @@ fn devblob_verify_hook(
         let mut dependency_programs = Vec::new();
         let mut dependency_requests = Vec::new();
         let wire_protocols = plow_asset::program::with_model(m, |packet| {
-            packet.programs.iter().map(plow_asset::logical_effects::coarse_protocol)
+            packet
+                .programs
+                .iter()
+                .map(plow_asset::logical_effects::coarse_protocol)
                 .collect::<Vec<_>>()
         });
         for (pi, p) in m.progs.iter().enumerate() {
@@ -1254,12 +1280,15 @@ fn devblob_verify_hook(
                     }
                 };
                 dependency_programs.push(pi);
-                dependency_requests.push(("D", serde_json::json!({
-                    "task_graph": { "n": n, "edges": witness.original },
-                    "protocol": protocol,
-                    "dependency_paths": witness.paths,
-                    "address_map": [],
-                })));
+                dependency_requests.push((
+                    "D",
+                    serde_json::json!({
+                        "task_graph": { "n": n, "edges": witness.original },
+                        "protocol": protocol,
+                        "dependency_paths": witness.paths,
+                        "address_map": [],
+                    }),
+                ));
             }
         }
         let policy_requests = devgen::measured_policy_requests();
@@ -1267,31 +1296,49 @@ fn devblob_verify_hook(
         plow_asset::program::with_model(m, |packet| {
             for request in policy_requests {
                 let bound = if request["policy_kind"] == plow_asset::gemm_policy::KIND {
-                    (0..packet.programs.len()).filter_map(|program|
-                        plow_asset::gemm_policy::bind(packet, program, &request).ok()
-                            .map(|request| (program, request))).collect::<Vec<_>>()
-                } else { Vec::new() };
+                    (0..packet.programs.len())
+                        .filter_map(|program| {
+                            plow_asset::gemm_policy::bind(packet, program, &request)
+                                .ok()
+                                .map(|request| (program, request))
+                        })
+                        .collect::<Vec<_>>()
+                } else {
+                    Vec::new()
+                };
                 if !bound.is_empty() {
                     for (program, request) in bound {
                         dependency_requests.push(("R", request));
-                        extra_scopes.push((Some(program), plow_asset::certificates::SemanticScope::SelectedGemmPolicy));
+                        extra_scopes.push((
+                            Some(program),
+                            plow_asset::certificates::SemanticScope::SelectedGemmPolicy,
+                        ));
                     }
                     continue;
                 }
                 dependency_requests.push(("R", request));
-                extra_scopes.push((None, plow_asset::certificates::SemanticScope::MeasuredPolicy));
+                extra_scopes.push((
+                    None,
+                    plow_asset::certificates::SemanticScope::MeasuredPolicy,
+                ));
             }
         });
         for (program, request) in devgen::mla_layout_requests(m)? {
             dependency_requests.push(("L", request));
-            extra_scopes.push((Some(program), plow_asset::certificates::SemanticScope::LayoutMapping));
+            extra_scopes.push((
+                Some(program),
+                plow_asset::certificates::SemanticScope::LayoutMapping,
+            ));
         }
         plow_asset::program::with_model(m, |packet| {
             for program in 0..packet.programs.len() {
                 match plow_asset::logical_effects::obligation(packet, program) {
                     Ok(request) => {
                         dependency_requests.push(("D", request));
-                        extra_scopes.push((Some(program), plow_asset::certificates::SemanticScope::LogicalTensorEffects));
+                        extra_scopes.push((
+                            Some(program),
+                            plow_asset::certificates::SemanticScope::LogicalTensorEffects,
+                        ));
                     }
                     Err(reason) => {
                         info!(program, %reason, "logical tensor effects not covered; no physical lifetime qualification");
@@ -1300,7 +1347,9 @@ fn devblob_verify_hook(
                 }
             }
         });
-        let (dependency_certs, dependency_verifier) = match lean_verify::call_batch_bound(&dependency_requests) {
+        let (dependency_certs, dependency_verifier) = match lean_verify::call_batch_bound(
+            &dependency_requests,
+        ) {
             Ok(certs) => certs,
             Err(e) if e.is_binary_unusable() => {
                 warn!(error = %e, "lean dependency certificates skipped: verifier not runnable");
@@ -1314,36 +1363,50 @@ fn devblob_verify_hook(
         let mut certificates = dependency_certs.into_iter();
         let mut requests = dependency_requests.into_iter();
         for pi in dependency_programs {
-            let cert = certificates.next().expect("batch validated certificate count");
+            let cert = certificates
+                .next()
+                .expect("batch validated certificate count");
             let (_, request) = requests.next().expect("dependency request count");
             if !cert.ok {
-                return Err(format!("program {pi}: coarse dependency preservation rejected: {}",
-                    cert.reason.unwrap_or_default()));
+                return Err(format!(
+                    "program {pi}: coarse dependency preservation rejected: {}",
+                    cert.reason.unwrap_or_default()
+                ));
             }
             if let Some(verifier_sha256) = &dependency_verifier {
-                rep.compile_checks.push(plow_asset::certificates::CompileCheckReceipt {
-                    program: Some(pi),
-                    scope: plow_asset::certificates::SemanticScope::CoarseDependencyPreservation,
-                    checkpoint: "D".into(),
-                    request_sha256: plow_asset::certificates::request_sha256(&request)?,
-                    verifier_sha256: verifier_sha256.clone(),
-                    request,
-                    response: serde_json::to_value(&cert).map_err(|error| error.to_string())?,
-                });
+                rep.compile_checks
+                    .push(plow_asset::certificates::CompileCheckReceipt {
+                        program: Some(pi),
+                        scope:
+                            plow_asset::certificates::SemanticScope::CoarseDependencyPreservation,
+                        checkpoint: "D".into(),
+                        request_sha256: plow_asset::certificates::request_sha256(&request)?,
+                        verifier_sha256: verifier_sha256.clone(),
+                        request,
+                        response: serde_json::to_value(&cert).map_err(|error| error.to_string())?,
+                    });
             }
         }
-        for ((cert, (checkpoint, request)), (program, scope)) in certificates.zip(requests).zip(extra_scopes) {
+        for ((cert, (checkpoint, request)), (program, scope)) in
+            certificates.zip(requests).zip(extra_scopes)
+        {
             if !cert.ok {
-                return Err(format!("checkpoint {checkpoint} {scope:?} rejected: {}", cert.reason.unwrap_or_default()));
+                return Err(format!(
+                    "checkpoint {checkpoint} {scope:?} rejected: {}",
+                    cert.reason.unwrap_or_default()
+                ));
             }
             if let Some(verifier_sha256) = &dependency_verifier {
-                rep.compile_checks.push(plow_asset::certificates::CompileCheckReceipt {
-                    program, scope,
-                    checkpoint: checkpoint.into(),
-                    request_sha256: plow_asset::certificates::request_sha256(&request)?,
-                    verifier_sha256: verifier_sha256.clone(), request,
-                    response: serde_json::to_value(&cert).map_err(|error| error.to_string())?,
-                });
+                rep.compile_checks
+                    .push(plow_asset::certificates::CompileCheckReceipt {
+                        program,
+                        scope,
+                        checkpoint: checkpoint.into(),
+                        request_sha256: plow_asset::certificates::request_sha256(&request)?,
+                        verifier_sha256: verifier_sha256.clone(),
+                        request,
+                        response: serde_json::to_value(&cert).map_err(|error| error.to_string())?,
+                    });
             }
         }
         if !rep.compile_checks.is_empty() {
@@ -1471,11 +1534,12 @@ fn devblob_verify_hook(
                         // which reads x from global (and, on sm_90a, from the tensor-core walk).
                         // The demand model is the kernel's own arithmetic, so report the rows
                         // the kernel actually stages; AMD's op_gemm.h stages every row.
-                        let staged_rows = if nvidia_target && (name == "GemvQkv" || name == "GemvGlu") {
-                            inst.i[0].min(1)
-                        } else {
-                            inst.i[0]
-                        };
+                        let staged_rows =
+                            if nvidia_target && (name == "GemvQkv" || name == "GemvGlu") {
+                                inst.i[0].min(1)
+                            } else {
+                                inst.i[0]
+                            };
                         Some(serde_json::json!({
                             "op": name,
                             "idx": ix,
@@ -1493,8 +1557,10 @@ fn devblob_verify_hook(
                 let n_staged = staged.len();
                 let arena = devgen::decode_arena_halves();
                 // Bound peak payload memory to one program while sharing verifier startup.
-                let requests = [("D", serde_json::to_value(&req).map_err(|e| e.to_string())?),
-                    ("G", serde_json::json!({ "arena": arena, "ops": staged }))];
+                let requests = [
+                    ("D", serde_json::to_value(&req).map_err(|e| e.to_string())?),
+                    ("G", serde_json::json!({ "arena": arena, "ops": staged })),
+                ];
                 let certs = match lean_verify::call_batch(&requests) {
                     Ok(c) => c,
                     Err(e) if e.is_binary_unusable() => {
@@ -1510,8 +1576,10 @@ fn devblob_verify_hook(
                     }
                 };
                 if !certs[0].ok {
-                    return Err(format!("program {pi} (T={t}): GQ order not topological over counter edges: {}",
-                        certs[0].reason.as_deref().unwrap_or_default()));
+                    return Err(format!(
+                        "program {pi} (T={t}): GQ order not topological over counter edges: {}",
+                        certs[0].reason.as_deref().unwrap_or_default()
+                    ));
                 }
                 if !certs[1].ok {
                     return Err(format!(
@@ -1519,8 +1587,12 @@ fn devblob_verify_hook(
                         certs[1].reason.as_deref().unwrap_or_default()
                     ));
                 }
-                info!(program = pi, t, entries = n,
-                    "lean ordering certificate: GQ order topological over counter edges");
+                info!(
+                    program = pi,
+                    t,
+                    entries = n,
+                    "lean ordering certificate: GQ order topological over counter edges"
+                );
                 info!(
                     program = pi,
                     t,
@@ -1567,8 +1639,13 @@ fn devblob_verify_hook(
         // Every program certified. `verified` claims exactly that and nothing more.
         rep.verified = true;
         let all_corr = rep.verified && rep.rewrite_verified;
-        let all_perf = !rep.modular_blocks.is_empty() && rep.modular_blocks.iter().all(|block|
-            block.lean_performance.as_ref().is_some_and(|perf| perf.structural_bound_certified));
+        let all_perf = !rep.modular_blocks.is_empty()
+            && rep.modular_blocks.iter().all(|block| {
+                block
+                    .lean_performance
+                    .as_ref()
+                    .is_some_and(|perf| perf.structural_bound_certified)
+            });
         let total_cp: u64 = rep
             .modular_blocks
             .iter()
@@ -1644,7 +1721,8 @@ fn devblob_oracle_prog(
     let res = lb::query_lower_bound(&req)?;
     let mut cost_inputs = devgen::cost_inputs::program(m, p);
     cost_inputs["topological_depth"] = serde_json::json!(res.critical_path);
-    cost_inputs["legacy_timing_fields"] = serde_json::json!("zero means unavailable, not a measured or predicted duration");
+    cost_inputs["legacy_timing_fields"] =
+        serde_json::json!("zero means unavailable, not a measured or predicted duration");
     let _ = clock_hz;
     let certified = false;
     info!(
@@ -1661,7 +1739,8 @@ fn devblob_oracle_prog(
         bw_bound_cycles: 0,
         lower_bound_cycles: 0,
         lower_bound_us: 0.0,
-        binding_constraint: "unavailable_without_measured_kernel_durations_and_physical_traffic".into(),
+        binding_constraint: "unavailable_without_measured_kernel_durations_and_physical_traffic"
+            .into(),
         touched_bytes: bytes,
         cost_inputs: Some(cost_inputs),
         structural_bound_certified: certified,
@@ -1975,7 +2054,13 @@ fn run_devblob(cli: &Cli) -> Result<PathBuf, Box<dyn std::error::Error>> {
                 .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
                 .is_some_and(|v| v.get("chatterbox_t3").is_some())
         });
-        build_cubin_from_manifest(&pkt, &cli.arch, cli.segmented, cli.emit_cfg.tts_profile.is_some(), t3)?;
+        build_cubin_from_manifest(
+            &pkt,
+            &cli.arch,
+            cli.segmented,
+            cli.emit_cfg.tts_profile.is_some(),
+            t3,
+        )?;
     }
 
     // Bare-blob mode (`--out foo.pkt`) stops here: no manifest, exactly the
@@ -1987,7 +2072,10 @@ fn run_devblob(cli: &Cli) -> Result<PathBuf, Box<dyn std::error::Error>> {
         // the hand-written stub the build scripts used to emit.
         let manifest = plow_asset::Manifest {
             network: slug.clone(),
-            served_name: cli.served_name.clone().or_else(|| plowc::hf_config::hub_repo_id(&dir)),
+            served_name: cli
+                .served_name
+                .clone()
+                .or_else(|| plowc::hf_config::hub_repo_id(&dir)),
             gpu: cli.gpu.clone(),
             num_gpus: cli.num_gpus,
             parallel: format!("{:?}", cli.parallel).to_lowercase(),
@@ -2152,7 +2240,11 @@ fn build_cubin_from_manifest(
     if man.pointer("/tuning/gemv_wide").is_some() {
         args.push("-DPLOW_CUBIN_GEMV_WIDE=ON".into());
     }
-    if man.pointer("/tuning/fp8_decode_tc64").and_then(serde_json::Value::as_bool) == Some(true) {
+    if man
+        .pointer("/tuning/fp8_decode_tc64")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true)
+    {
         args.push("-DPLOW_CUBIN_FP8_TC64_DEPTH2=ON".into());
     }
     if segmented || manifest_requires_segmented_prefill(&man) {
@@ -2182,10 +2274,19 @@ fn build_cubin_from_manifest(
     let _ = t3;
     args.push("-DPLOW_TTS_S3GEN=OFF".into());
     // An ASR packet's audio encoder runs the FP32 speech arms, which only the _speech object has.
-    let asr = ["encoder.pkt", "codec.pkt", "s3gen.pkt", "mm_vision.pkt", "mm_audio.pkt"]
-        .iter()
-        .any(|f| pkt.with_file_name(f).is_file());
-    args.push(format!("-DPLOW_CUBIN_SPEECH={}", if asr { "ON" } else { "OFF" }));
+    let asr = [
+        "encoder.pkt",
+        "codec.pkt",
+        "s3gen.pkt",
+        "mm_vision.pkt",
+        "mm_audio.pkt",
+    ]
+    .iter()
+    .any(|f| pkt.with_file_name(f).is_file());
+    args.push(format!(
+        "-DPLOW_CUBIN_SPEECH={}",
+        if asr { "ON" } else { "OFF" }
+    ));
 
     let out_dir = pkt.parent().map(PathBuf::from).unwrap_or_default();
     let config = pkt.with_file_name("plow_config.h");
@@ -2224,7 +2325,13 @@ fn build_cubin_from_manifest(
     Ok(())
 }
 
-fn effective_uniseg(arch: &str, cpu: bool, configured: bool, segmented: bool, env_present: bool) -> bool {
+fn effective_uniseg(
+    arch: &str,
+    cpu: bool,
+    configured: bool,
+    segmented: bool,
+    env_present: bool,
+) -> bool {
     if segmented {
         false
     } else if (arch.starts_with("sm_120") || arch == "metal3" || cpu) && !env_present {
@@ -2587,19 +2694,35 @@ fn resolve_intel_sram_budgets(profile: &str, l2_override: u64, l3_override: u64)
         _ => {
             let l2_k = std::fs::read_to_string("/sys/devices/system/cpu/cpu0/cache/index2/size")
                 .ok()
-                .and_then(|s| s.trim().strip_suffix('K').and_then(|v| v.parse::<u64>().ok()))
+                .and_then(|s| {
+                    s.trim()
+                        .strip_suffix('K')
+                        .and_then(|v| v.parse::<u64>().ok())
+                })
                 .unwrap_or(2048);
             let l3_k = std::fs::read_to_string("/sys/devices/system/cpu/cpu0/cache/index3/size")
                 .ok()
-                .and_then(|s| s.trim().strip_suffix('K').and_then(|v| v.parse::<u64>().ok()))
+                .and_then(|s| {
+                    s.trim()
+                        .strip_suffix('K')
+                        .and_then(|v| v.parse::<u64>().ok())
+                })
                 .unwrap_or(491520);
             let l2 = (l2_k * 15) / 16;
             let l3 = ((l3_k / 1024) * 14) / 16;
             (l2.max(512), l3.max(16))
         }
     };
-    let l2 = if l2_override > 0 { l2_override } else { detected_l2 };
-    let l3 = if l3_override > 0 { l3_override } else { detected_l3 };
+    let l2 = if l2_override > 0 {
+        l2_override
+    } else {
+        detected_l2
+    };
+    let l3 = if l3_override > 0 {
+        l3_override
+    } else {
+        detected_l3
+    };
     (l2, l3)
 }
 
@@ -2972,21 +3095,30 @@ mod cli_tests {
             let x = b.tensor("x", 16);
             let y = b.tensor("y", 16);
             let first = b.emit(DevOp::Residual, vec![0], &[], |d| {
-                d.t[..3].copy_from_slice(&[y,x,x]); d.i[0] = 8;
+                d.t[..3].copy_from_slice(&[y, x, x]);
+                d.i[0] = 8;
             });
             let deps = if ordered { vec![first] } else { vec![] };
             b.emit(DevOp::Residual, vec![0], &deps, |d| {
-                d.t[..3].copy_from_slice(&[x,y,y]); d.i[0] = 8;
+                d.t[..3].copy_from_slice(&[x, y, y]);
+                d.i[0] = 8;
             });
             let p = b.finish();
-            let model = Model { n_cu:1,target:0,tensors:p.tensors.clone(),progs:vec![p],
-                kv_row_insts:vec![],prog_t:vec![1],gen:vec![] };
+            let model = Model {
+                n_cu: 1,
+                target: 0,
+                tensors: p.tensors.clone(),
+                progs: vec![p],
+                kv_row_insts: vec![],
+                prog_t: vec![1],
+                gen: vec![],
+            };
             let result = hook(&model);
             if ordered {
                 let report = result.unwrap();
                 assert!(report.logical_effect_gaps.is_empty());
-                assert!(report.compile_checks.iter().any(|check|
-                    check.scope == plow_asset::certificates::SemanticScope::LogicalTensorEffects));
+                assert!(report.compile_checks.iter().any(|check| check.scope
+                    == plow_asset::certificates::SemanticScope::LogicalTensorEffects));
             } else {
                 assert!(result.unwrap_err().contains("LogicalTensorEffects"));
             }
@@ -3006,41 +3138,77 @@ mod cli_tests {
         let p = builder.finish();
         let witness = p.reduction_witness.as_ref().unwrap();
         assert!(witness.original.len() > witness.retained.len());
-        let mut model = Model { n_cu: 1, target: 0, tensors: p.tensors.clone(),
-            progs: vec![p], kv_row_insts: vec![], prog_t: vec![1], gen: vec![] };
+        let mut model = Model {
+            n_cu: 1,
+            target: 0,
+            tensors: p.tensors.clone(),
+            progs: vec![p],
+            kv_row_insts: vec![],
+            prog_t: vec![1],
+            gen: vec![],
+        };
         let hook = super::devblob_verify_hook(true, false, 1024, 1_000_000_000, false).unwrap();
         let report = hook(&model).unwrap();
         assert!(report.verified);
         assert_eq!(report.compile_checks.len(), 2);
-        let rewrite = report.compile_checks.iter().find(|check|
-            check.scope == plow_asset::certificates::SemanticScope::RewriteBodyExpansion).unwrap();
+        let rewrite = report
+            .compile_checks
+            .iter()
+            .find(|check| {
+                check.scope == plow_asset::certificates::SemanticScope::RewriteBodyExpansion
+            })
+            .unwrap();
         assert!(rewrite.request["bodies"].as_array().unwrap().len() > 20);
-        let receipt = report.compile_checks.iter().find(|check|
-            check.scope == plow_asset::certificates::SemanticScope::CoarseDependencyPreservation).unwrap();
-        assert_eq!(receipt.request["task_graph"]["edges"].as_array().unwrap().len(), 3);
+        let receipt = report
+            .compile_checks
+            .iter()
+            .find(|check| {
+                check.scope == plow_asset::certificates::SemanticScope::CoarseDependencyPreservation
+            })
+            .unwrap();
+        assert_eq!(
+            receipt.request["task_graph"]["edges"]
+                .as_array()
+                .unwrap()
+                .len(),
+            3
+        );
         assert_eq!(receipt.response["ok"], true);
-        assert_eq!(receipt.verifier_sha256, lean_verify::verifier_sha256().unwrap());
+        assert_eq!(
+            receipt.verifier_sha256,
+            lean_verify::verifier_sha256().unwrap()
+        );
         let saved = model.progs[0].stream.clone();
         let saved_gq = model.progs[0].gq_stream.clone();
         let program = &mut model.progs[0];
-        for entry in program.stream.iter_mut().chain(program.gq_stream.iter_mut()) {
+        for entry in program
+            .stream
+            .iter_mut()
+            .chain(program.gq_stream.iter_mut())
+        {
             entry.wait_len = 0;
         }
-        assert!(hook(&model).unwrap_err().contains("coarse dependency"),
-            "stale builder witnesses cannot certify removed wire waits");
+        assert!(
+            hook(&model).unwrap_err().contains("coarse dependency"),
+            "stale builder witnesses cannot certify removed wire waits"
+        );
         model.progs[0].stream = saved;
         model.progs[0].gq_stream = saved_gq;
         model.progs[0].reduction_witness.as_mut().unwrap().paths[0] = None;
         assert!(hook(&model).unwrap_err().contains("coarse dependency"));
         let program = &mut model.progs[0];
-        for entry in program.stream.iter_mut().chain(program.gq_stream.iter_mut()) {
+        for entry in program
+            .stream
+            .iter_mut()
+            .chain(program.gq_stream.iter_mut())
+        {
             entry.succ_len = 0;
             entry.wait_len = 0;
         }
         let uncovered = hook(&model).unwrap();
         assert_eq!(uncovered.dependency_binding_gaps.len(), 1);
-        assert!(!uncovered.compile_checks.iter().any(|check|
-            check.scope == plow_asset::certificates::SemanticScope::CoarseDependencyPreservation));
+        assert!(!uncovered.compile_checks.iter().any(|check| check.scope
+            == plow_asset::certificates::SemanticScope::CoarseDependencyPreservation));
     }
 
     #[cfg(feature = "lean-verify")]
@@ -3061,16 +3229,28 @@ mod cli_tests {
             d.i[..6].copy_from_slice(&[16, 8, 256, 512, 0, 1024]);
         });
         let p = builder.finish();
-        let mut model = Model { n_cu: 1, target: 0, tensors: p.tensors.clone(),
-            progs: vec![p], kv_row_insts: vec![], prog_t: vec![16], gen: vec![] };
+        let mut model = Model {
+            n_cu: 1,
+            target: 0,
+            tensors: p.tensors.clone(),
+            progs: vec![p],
+            kv_row_insts: vec![],
+            prog_t: vec![16],
+            gen: vec![],
+        };
         let hook = super::devblob_verify_hook(true, false, 1024, 1_000_000_000, false).unwrap();
         let report = hook(&model).unwrap();
-        assert!(report.compile_checks.iter().any(|check| check.checkpoint == "L"));
+        assert!(report
+            .compile_checks
+            .iter()
+            .any(|check| check.checkpoint == "L"));
         model.progs[0].insts[1].i[2] = 255;
         assert!(hook(&model).unwrap_err().contains("LayoutMapping"));
         model.progs[0].insts[1].i[2] = 256;
         model.progs[0].insts[0].i[4] = 0;
-        assert!(hook(&model).unwrap_err().contains("matching padded producer"));
+        assert!(hook(&model)
+            .unwrap_err()
+            .contains("matching padded producer"));
     }
     use super::*;
     use clap::Parser;

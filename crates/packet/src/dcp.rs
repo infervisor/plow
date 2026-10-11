@@ -156,7 +156,14 @@ impl DcpLayout {
         let (full, tail) = (len / p, len % p);
         let (q, r) = (full / d, full % d);
         let s = u64::from(shard);
-        q * p + if s < r { p } else if s == r { tail } else { 0 }
+        q * p
+            + if s < r {
+                p
+            } else if s == r {
+                tail
+            } else {
+                0
+            }
     }
 
     /// The most any one shard holds of a `len`-row sequence. THIS, not `len / degree`, is the
@@ -225,7 +232,10 @@ impl DcpLayout {
     /// The merge's split-axis index for `(shard, local split)`. Rank-major and ascending, which
     /// is what makes the fold order fixed and therefore reproducible run to run.
     pub fn split_index(self, shard: u32, split: u32, ns_local: u32) -> u32 {
-        assert!(shard < self.degree && split < ns_local, "split out of range");
+        assert!(
+            shard < self.degree && split < ns_local,
+            "split out of range"
+        );
         shard * ns_local + split
     }
 
@@ -306,11 +316,7 @@ pub fn merge_partials(parts: &[Partial<'_>], out: &mut [f32]) -> (f32, f32) {
     }
     let mut gl = 0.0f32;
     for p in parts {
-        let w = if p.is_dead() {
-            0.0
-        } else {
-            exp2f(p.m - gm)
-        };
+        let w = if p.is_dead() { 0.0 } else { exp2f(p.m - gm) };
         if w == 0.0 {
             continue;
         }
@@ -393,7 +399,11 @@ mod tests {
             for len in 0..1024u64 {
                 for shard in 0..l.degree {
                     let brute = (0..len).filter(|&r| l.shard_of_row(r) == shard).count() as u64;
-                    assert_eq!(l.local_rows(len, shard), brute, "{l:?} len {len} shard {shard}");
+                    assert_eq!(
+                        l.local_rows(len, shard),
+                        brute,
+                        "{l:?} len {len} shard {shard}"
+                    );
                 }
             }
         }
@@ -500,14 +510,19 @@ mod tests {
         assert!(DcpLayout::replicated(1).validate(None).is_ok());
         assert!(DcpLayout::new(8, 3, 64).validate(None).is_err(), "3 ∤ 8");
         assert!(DcpLayout::new(8, 0, 64).validate(None).is_err());
-        assert!(DcpLayout::new(8, 8, 16).validate(None).is_err(), "below FA_BKV");
+        assert!(
+            DcpLayout::new(8, 8, 16).validate(None).is_err(),
+            "below FA_BKV"
+        );
         assert!(DcpLayout::new(8, 8, 96).validate(None).is_err(), "not pow2");
         assert!(
             DcpLayout::new(8, 8, 64).validate(Some(96)).is_err(),
             "page must divide block rows"
         );
         // 81920 / 8 = 10240 rows, a whole number of 4096-row blocks? No: 10240 % 4096 = 2048.
-        assert!(DcpLayout::new(8, 8, 64).validate_pool(4096, 81_920).is_err());
+        assert!(DcpLayout::new(8, 8, 64)
+            .validate_pool(4096, 81_920)
+            .is_err());
         assert!(DcpLayout::new(8, 8, 64).validate_pool(2048, 81_920).is_ok());
         assert!(DcpLayout::replicated(8).validate_pool(4096, 81_920).is_ok());
     }
@@ -572,7 +587,12 @@ mod tests {
     }
 
     /// Fold `scores`/`values` into `n` contiguous pieces, mimicking one shard per piece.
-    fn partials(scores: &[f32], values: &[Vec<f32>], n: usize, dim: usize) -> Vec<(f32, f32, Vec<f32>)> {
+    fn partials(
+        scores: &[f32],
+        values: &[Vec<f32>],
+        n: usize,
+        dim: usize,
+    ) -> Vec<(f32, f32, Vec<f32>)> {
         let mut out = Vec::new();
         for i in 0..n {
             let idx: Vec<usize> = (0..scores.len()).filter(|k| k % n == i).collect();
@@ -580,7 +600,10 @@ mod tests {
                 out.push((DCP_NEG_INF, 0.0, vec![0.0; dim]));
                 continue;
             }
-            let m = idx.iter().map(|&k| scores[k]).fold(f32::NEG_INFINITY, f32::max);
+            let m = idx
+                .iter()
+                .map(|&k| scores[k])
+                .fold(f32::NEG_INFINITY, f32::max);
             let mut l = 0.0f32;
             let mut acc = vec![0.0f32; dim];
             for &k in &idx {
@@ -667,9 +690,21 @@ mod tests {
         let dead_acc = vec![7.0f32; dim]; // poison: must never be read
         let mut out = vec![0.0f32; dim];
         let parts = [
-            Partial { m: DCP_NEG_INF, l: 0.0, acc: &dead_acc },
-            Partial { m: 3.0, l: 2.0, acc: &live_acc },
-            Partial { m: DCP_NEG_INF, l: 0.0, acc: &dead_acc },
+            Partial {
+                m: DCP_NEG_INF,
+                l: 0.0,
+                acc: &dead_acc,
+            },
+            Partial {
+                m: 3.0,
+                l: 2.0,
+                acc: &live_acc,
+            },
+            Partial {
+                m: DCP_NEG_INF,
+                l: 0.0,
+                acc: &dead_acc,
+            },
         ];
         let (m, l) = merge_partials(&parts, &mut out);
         assert_eq!(m, 3.0);
@@ -684,7 +719,11 @@ mod tests {
         let dim = 4;
         let acc = vec![5.0f32; dim];
         let mut out = vec![9.0f32; dim];
-        let parts = [Partial { m: DCP_NEG_INF, l: 0.0, acc: &acc }];
+        let parts = [Partial {
+            m: DCP_NEG_INF,
+            l: 0.0,
+            acc: &acc,
+        }];
         let (m, l) = merge_partials(&parts, &mut out);
         assert_eq!((m, l), (DCP_NEG_INF, 0.0));
         assert!(out.iter().all(|v| *v == 0.0 && v.is_finite()));
@@ -697,8 +736,16 @@ mod tests {
         let cold = vec![1e30f32; dim];
         let mut out = vec![0.0f32; dim];
         let parts = [
-            Partial { m: 1000.0, l: 1.0, acc: &hot },
-            Partial { m: -1000.0, l: 1.0, acc: &cold },
+            Partial {
+                m: 1000.0,
+                l: 1.0,
+                acc: &hot,
+            },
+            Partial {
+                m: -1000.0,
+                l: 1.0,
+                acc: &cold,
+            },
         ];
         let (_, l) = merge_partials(&parts, &mut out);
         assert!(l.is_finite() && l > 0.0);

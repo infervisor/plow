@@ -34,8 +34,11 @@ fn cublaslt_candidates() -> Vec<std::path::PathBuf> {
         .and_then(|exe| exe.parent().map(Path::to_path_buf))
         .map(|dir| vec![dir.join("../lib"), dir])
         .unwrap_or_default();
-    let mut paths: Vec<PathBuf> =
-        beside.iter().flat_map(|dir| NAMES.map(|n| dir.join(n))).filter(|p| p.is_file()).collect();
+    let mut paths: Vec<PathBuf> = beside
+        .iter()
+        .flat_map(|dir| NAMES.map(|n| dir.join(n)))
+        .filter(|p| p.is_file())
+        .collect();
     paths.extend(NAMES.map(PathBuf::from));
     if let Some(dir) = option_env!("PLOW_BUILD_CUDA_LIB") {
         paths.extend(NAMES.map(|n| Path::new(dir).join(n)));
@@ -60,9 +63,10 @@ pub fn library() -> std::result::Result<(std::path::PathBuf, usize), String> {
                 }
             };
             // SAFETY: `size_t cublasLtGetVersion(void)`, every cuBLASLt release.
-            let version = unsafe { lib.get::<unsafe extern "C" fn() -> usize>(b"cublasLtGetVersion\0") }
-                .map(|f| unsafe { f() })
-                .map_err(|e| format!("{}: cublasLtGetVersion: {e}", path.display()))?;
+            let version =
+                unsafe { lib.get::<unsafe extern "C" fn() -> usize>(b"cublasLtGetVersion\0") }
+                    .map(|f| unsafe { f() })
+                    .map_err(|e| format!("{}: cublasLtGetVersion: {e}", path.display()))?;
             return Ok((path, version));
         }
         Err(format!("no loadable cuBLASLt ({last})"))
@@ -208,7 +212,10 @@ pub(crate) struct Lt {
 impl Lt {
     /// `objects`: the serving bundle's object dir (`asset::serve::objects_dir`), where the
     /// `PLOW_CUTLASS_FP8_DECODE` library lives.
-    pub(crate) fn load(be: &Arc<CudaBackend>, objects: Option<&std::path::Path>) -> Result<Arc<Self>> {
+    pub(crate) fn load(
+        be: &Arc<CudaBackend>,
+        objects: Option<&std::path::Path>,
+    ) -> Result<Arc<Self>> {
         be.bind()?;
         let api = Api::load()?;
         let workspace = be.alloc(0, 256 * 1024 * 1024)?;
@@ -224,9 +231,8 @@ impl Lt {
                 RuntimeError::Device(format!("PLOW_LT_ALGOS {}: {e}", path.display()))
             })?;
             for line in text.lines().filter(|l| !l.trim().is_empty()) {
-                let rec: StoredAlgo = serde_json::from_str(line).map_err(|e| {
-                    RuntimeError::Device(format!("PLOW_LT_ALGOS: bad record: {e}"))
-                })?;
+                let rec: StoredAlgo = serde_json::from_str(line)
+                    .map_err(|e| RuntimeError::Device(format!("PLOW_LT_ALGOS: bad record: {e}")))?;
                 if rec.dtype != "bf16" {
                     continue;
                 }
@@ -248,7 +254,8 @@ impl Lt {
             .map(|pins| {
                 let dir = objects.ok_or_else(|| {
                     RuntimeError::Rejected(
-                        "PLOW_CUTLASS_FP8_DECODE requires PLOW_PF_SEG_DIR or the bundle's objects/".into(),
+                        "PLOW_CUTLASS_FP8_DECODE requires PLOW_PF_SEG_DIR or the bundle's objects/"
+                            .into(),
                     )
                 })?;
                 super::cutlass_fp8::CutlassFp8::load(be, dir, pins)
@@ -270,7 +277,16 @@ impl Lt {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn record(&self, (m, n, k): (u32, u32, u32), pair: bool, ns: &[u32], rows: &[u32], algo: &Algo, workspace: usize, matmul_us: f32) {
+    fn record(
+        &self,
+        (m, n, k): (u32, u32, u32),
+        pair: bool,
+        ns: &[u32],
+        rows: &[u32],
+        algo: &Algo,
+        workspace: usize,
+        matmul_us: f32,
+    ) {
         let Some(path) = &self.write else { return };
         let rec = StoredAlgo {
             m,
@@ -433,7 +449,9 @@ impl Lt {
                     .iter()
                     .find(|r| r.state == 0 && r.workspace <= bytes)
                     .ok_or_else(|| {
-                        RuntimeError::Device("no supported FP8 vector-scale cuBLASLt algorithm".into())
+                        RuntimeError::Device(
+                            "no supported FP8 vector-scale cuBLASLt algorithm".into(),
+                        )
                     })?
                     .algo;
                 Ok(())
@@ -548,7 +566,10 @@ impl Lt {
             // A rung template pins the widest rung's algorithm; a stored table pins the shape's.
             // Both go through AlgoCheck, so a stale or foreign entry is refused here rather
             // than at launch.
-            let stored = self.stored.get(&(m, n, k, pair.is_some(), rung_key(m, rows))).copied();
+            let stored = self
+                .stored
+                .get(&(m, n, k, pair.is_some(), rung_key(m, rows)))
+                .copied();
             let pinned = template.map(|t| t.algo).or(stored);
             if let Some(algo) = pinned {
                 plan.algo = algo;
@@ -569,7 +590,13 @@ impl Lt {
                 let fits = result.state == 0 && result.workspace <= self.workspace.len as usize;
                 if fits {
                     if template.is_none() {
-                        tracing::info!(m, n, k, workspace = result.workspace, "cuBLASLt stored algorithm pinned");
+                        tracing::info!(
+                            m,
+                            n,
+                            k,
+                            workspace = result.workspace,
+                            "cuBLASLt stored algorithm pinned"
+                        );
                     }
                     return Ok(Arc::new(plan));
                 }
@@ -580,7 +607,12 @@ impl Lt {
                 }
                 // A stored entry from another GPU or library version: fall through to the
                 // heuristic + load-time timing, which is exactly what produced the table.
-                tracing::warn!(m, n, k, "cuBLASLt stored algorithm rejected by AlgoCheck; re-selecting");
+                tracing::warn!(
+                    m,
+                    n,
+                    k,
+                    "cuBLASLt stored algorithm rejected by AlgoCheck; re-selecting"
+                );
                 plan.algo = Algo::default();
             }
             let mut pref = std::ptr::null_mut();
@@ -676,7 +708,11 @@ impl Lt {
             algo: Algo::default(),
         };
         let (m, n, ld, hd) = (m as u64, n as u64, ld as i64, hd as u64);
-        let (batch, rows) = if group > 1 { (group as i32, heads as i64) } else { (1, 1) };
+        let (batch, rows) = if group > 1 {
+            (group as i32, heads as i64)
+        } else {
+            (1, 1)
+        };
         // (dtype, rows, cols, ld, batch stride); CUDA header dtypes: BF16 = 14, FP32 = 0.
         let layouts = match kind {
             AttentionGemm::Scores => [
@@ -710,8 +746,9 @@ impl Lt {
                     "Lt attention transpose",
                 )?;
             }
-            for (dst, (dtype, rows, cols, pitch, stride)) in
-                [&mut plan.w, &mut plan.a, &mut plan.c].into_iter().zip(layouts)
+            for (dst, (dtype, rows, cols, pitch, stride)) in [&mut plan.w, &mut plan.a, &mut plan.c]
+                .into_iter()
+                .zip(layouts)
             {
                 raw = std::ptr::null_mut();
                 check(
@@ -895,7 +932,14 @@ impl Lt {
                 [u64::from(dims.average_n), hd, u64::from(dims.average_m)],
             ),
         };
-        self.grouped_plan_raw(kind == AttentionGemm::Scores, false, alpha, dims.groups, layouts, averages)
+        self.grouped_plan_raw(
+            kind == AttentionGemm::Scores,
+            false,
+            alpha,
+            dims.groups,
+            layouts,
+            averages,
+        )
     }
 
     /// `layouts` = `[W, A, C]`; `averages` = `[reduction dim, D rows, D cols]` for the heuristic.
@@ -967,8 +1011,9 @@ impl Lt {
                     "Lt grouped fast accumulation",
                 )?;
             }
-            for (dst, (dtype, rows, cols, ld)) in
-                [&mut plan.w, &mut plan.a, &mut plan.c].into_iter().zip(layouts)
+            for (dst, (dtype, rows, cols, ld)) in [&mut plan.w, &mut plan.a, &mut plan.c]
+                .into_iter()
+                .zip(layouts)
             {
                 raw = std::ptr::null_mut();
                 check(
@@ -1097,8 +1142,9 @@ pub(crate) struct Plan {
 type Selection = (String, u32, u32, u32, Vec<u32>, Option<(i64, i64, bool)>);
 
 fn selections() -> &'static parking_lot::Mutex<std::collections::HashMap<Selection, [u64; 8]>> {
-    static S: std::sync::OnceLock<parking_lot::Mutex<std::collections::HashMap<Selection, [u64; 8]>>> =
-        std::sync::OnceLock::new();
+    static S: std::sync::OnceLock<
+        parking_lot::Mutex<std::collections::HashMap<Selection, [u64; 8]>>,
+    > = std::sync::OnceLock::new();
     S.get_or_init(Default::default)
 }
 
@@ -1125,12 +1171,18 @@ impl Plan {
         );
         let known = selections().lock().get(&key).copied();
         if let Some(c) = known.and_then(|data| {
-            candidates
-                .iter()
-                .find(|c| c.algo.data == data && c.state == 0 && c.workspace <= self.lt.workspace.len as usize)
+            candidates.iter().find(|c| {
+                c.algo.data == data && c.state == 0 && c.workspace <= self.lt.workspace.len as usize
+            })
         }) {
             self.algo = c.algo;
-            tracing::debug!(m, n, k, ?rows, "cuBLASLt algorithm reused from an earlier load");
+            tracing::debug!(
+                m,
+                n,
+                k,
+                ?rows,
+                "cuBLASLt algorithm reused from an earlier load"
+            );
             return Ok(());
         }
         match pair {
@@ -1176,7 +1228,12 @@ impl Plan {
                 let mut total = 0.0;
                 for plan in widths.iter().map(|w| w.as_deref().unwrap_or(&*self)) {
                     let run = |i: u64| {
-                        plan.run(input.base, copies.base + i % repeats * bytes_w, output.base, &stream)
+                        plan.run(
+                            input.base,
+                            copies.base + i % repeats * bytes_w,
+                            output.base,
+                            &stream,
+                        )
                     };
                     for i in 0..repeats {
                         run(i)?;
@@ -1224,8 +1281,15 @@ impl Plan {
             matmul_ms,
             "cuBLASLt load-time algorithm selected"
         );
-        self.lt
-            .record((m, n, k), false, ns, rows, &self.algo, candidates[index].workspace, matmul_ms * 1000.0);
+        self.lt.record(
+            (m, n, k),
+            false,
+            ns,
+            rows,
+            &self.algo,
+            candidates[index].workspace,
+            matmul_ms * 1000.0,
+        );
         Ok(())
     }
 
@@ -1248,7 +1312,11 @@ impl Plan {
         // Cold: a ring of copies of the pair's weight span when it is small enough, else the live
         // (L2-warm) operands.
         let span = (pair.w_stride as u64 + n as u64 * k as u64) * 2;
-        let repeats = if pair.cold { (700 * 1024 * 1024u64).div_ceil(span).clamp(2, 16) } else { 4 };
+        let repeats = if pair.cold {
+            (700 * 1024 * 1024u64).div_ceil(span).clamp(2, 16)
+        } else {
+            4
+        };
         let ring = if pair.cold && span <= 256 * 1024 * 1024 {
             let ring = be.alloc(0, repeats * span)?;
             for i in 0..repeats {
@@ -1258,8 +1326,10 @@ impl Plan {
         } else {
             None
         };
-        let weight_at =
-            |i: u64| ring.as_ref().map_or(weight, |ring| ring.base + i % repeats * span);
+        let weight_at = |i: u64| {
+            ring.as_ref()
+                .map_or(weight, |ring| ring.base + i % repeats * span)
+        };
         let mut best = f32::INFINITY;
         let mut selected = None;
         for (index, candidate) in candidates.iter().enumerate() {
@@ -1267,22 +1337,24 @@ impl Plan {
                 continue;
             }
             self.algo = candidate.algo;
-            let result = self.widths(rows, m, n, k, weight, Some(pair)).and_then(|widths| {
-                let mut total = 0.0;
-                for plan in widths.iter().map(|w| w.as_deref().unwrap_or(&*self)) {
-                    for i in 0..repeats {
-                        plan.run(pair.input, weight_at(i), pair.output, &stream)?;
+            let result = self
+                .widths(rows, m, n, k, weight, Some(pair))
+                .and_then(|widths| {
+                    let mut total = 0.0;
+                    for plan in widths.iter().map(|w| w.as_deref().unwrap_or(&*self)) {
+                        for i in 0..repeats {
+                            plan.run(pair.input, weight_at(i), pair.output, &stream)?;
+                        }
+                        be.event_record(&start, &stream)?;
+                        for i in 0..16 {
+                            plan.run(pair.input, weight_at(i), pair.output, &stream)?;
+                        }
+                        be.event_record(&end, &stream)?;
+                        be.event_synchronize(&end)?;
+                        total += be.event_elapsed_ms(&start, &end)?;
                     }
-                    be.event_record(&start, &stream)?;
-                    for i in 0..16 {
-                        plan.run(pair.input, weight_at(i), pair.output, &stream)?;
-                    }
-                    be.event_record(&end, &stream)?;
-                    be.event_synchronize(&end)?;
-                    total += be.event_elapsed_ms(&start, &end)?;
-                }
-                Ok(total)
-            });
+                    Ok(total)
+                });
             match result {
                 Ok(ms) if ms < best => {
                     best = ms;
@@ -1314,8 +1386,15 @@ impl Plan {
             matmul_ms,
             "cuBLASLt pair algorithm selected"
         );
-        self.lt
-            .record((m, n, k), true, &[n], rows, &self.algo, candidates[index].workspace, matmul_ms * 1000.0);
+        self.lt.record(
+            (m, n, k),
+            true,
+            &[n],
+            rows,
+            &self.algo,
+            candidates[index].workspace,
+            matmul_ms * 1000.0,
+        );
         Ok(())
     }
 
@@ -1336,7 +1415,10 @@ impl Plan {
         rows.iter()
             .map(|&r| match r == m {
                 true => Ok(None),
-                false => self.lt.plan_impl(r, n, k, weight, Some(self), pair, &[], &[]).map(Some),
+                false => self
+                    .lt
+                    .plan_impl(r, n, k, weight, Some(self), pair, &[], &[])
+                    .map(Some),
             })
             .collect()
     }

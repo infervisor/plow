@@ -79,7 +79,12 @@ const POLICY: [(&str, u8, u32); 5] = [
     ("attn_pf_hd256_sliding_fp8kv_span", GENERATED_FIRST + 4, 128),
 ];
 
-fn table_entry(name: &str, role: u8, min_rows: u32, row: &serde_json::Value) -> Result<Entry, String> {
+fn table_entry(
+    name: &str,
+    role: u8,
+    min_rows: u32,
+    row: &serde_json::Value,
+) -> Result<Entry, String> {
     let sig = &row["signature"];
     let text = |key: &str| sig[key].as_str().unwrap_or_default();
     let flag = |key: &str| sig[key].as_bool().unwrap_or(false);
@@ -105,10 +110,17 @@ fn table_entry(name: &str, role: u8, min_rows: u32, row: &serde_json::Value) -> 
     Ok(Entry {
         name: name.into(),
         role,
-        file: row["object"].as_str().ok_or(format!("{name}: no object"))?.into(),
+        file: row["object"]
+            .as_str()
+            .ok_or(format!("{name}: no object"))?
+            .into(),
         kv,
         head_dim: number("head_dim")?,
-        window: if flag("window_any") { ANY_SLIDING } else { number("window")? },
+        window: if flag("window_any") {
+            ANY_SLIDING
+        } else {
+            number("window")?
+        },
         ring_kv: flag("ring_kv"),
         pair_heads: flag("gqa_even"),
         min_rows,
@@ -119,15 +131,24 @@ fn table_entry(name: &str, role: u8, min_rows: u32, row: &serde_json::Value) -> 
 fn load_catalog(table: &str) -> Result<Vec<Entry>, String> {
     let table: serde_json::Value =
         serde_json::from_str(table).map_err(|e| format!("gen_kernels.json: {e}"))?;
-    let rows = table["entries"].as_object().ok_or("gen_kernels.json: no entries")?;
-    let unbound: Vec<_> = rows.keys().filter(|n| !POLICY.iter().any(|(p, ..)| p == n)).collect();
+    let rows = table["entries"]
+        .as_object()
+        .ok_or("gen_kernels.json: no entries")?;
+    let unbound: Vec<_> = rows
+        .keys()
+        .filter(|n| !POLICY.iter().any(|(p, ..)| p == n))
+        .collect();
     if !unbound.is_empty() {
-        return Err(format!("gen_kernels.json entries without a devgen role: {unbound:?}"));
+        return Err(format!(
+            "gen_kernels.json entries without a devgen role: {unbound:?}"
+        ));
     }
     POLICY
         .iter()
         .map(|&(name, role, min_rows)| {
-            let row = rows.get(name).ok_or(format!("{name}: not in gen_kernels.json"))?;
+            let row = rows
+                .get(name)
+                .ok_or(format!("{name}: not in gen_kernels.json"))?;
             table_entry(name, role, min_rows, row)
         })
         .collect()
@@ -306,7 +327,10 @@ mod tests {
 
     #[test]
     fn sliding_entry_takes_any_window_and_paired_heads() {
-        let entry = CATALOG.iter().find(|e| e.name == "attn_pf_hd256_sliding").unwrap();
+        let entry = CATALOG
+            .iter()
+            .find(|e| e.name == "attn_pf_hd256_sliding")
+            .unwrap();
         let mut op = DevInst {
             op: DevOp::FlashPrefill as u16,
             ..Default::default()
@@ -331,7 +355,10 @@ mod tests {
     #[test]
     fn kv_dtype_is_part_of_the_signature() {
         let entry = |name| CATALOG.iter().find(|e| e.name == name).unwrap();
-        let (bf16, fp8) = (entry("attn_pf_hd256_sliding"), entry("attn_pf_hd256_sliding_fp8kv"));
+        let (bf16, fp8) = (
+            entry("attn_pf_hd256_sliding"),
+            entry("attn_pf_hd256_sliding_fp8kv"),
+        );
         let mut op = DevInst {
             op: DevOp::FlashPrefill as u16,
             ..Default::default()
@@ -369,15 +396,62 @@ mod tests {
     fn catalog_signatures_come_from_the_table() {
         let got: Vec<_> = CATALOG
             .iter()
-            .map(|e| (e.name.as_str(), e.file.as_str(), e.kv, e.head_dim, e.window, e.ring_kv, e.pair_heads, e.media_span))
+            .map(|e| {
+                (
+                    e.name.as_str(),
+                    e.file.as_str(),
+                    e.kv,
+                    e.head_dim,
+                    e.window,
+                    e.ring_kv,
+                    e.pair_heads,
+                    e.media_span,
+                )
+            })
             .collect();
         assert_eq!(
             got,
             [
-                ("attn_pf_hd512", "gen_sm90a_attn_pf_hd512.cubin", KvDtype::Bf16, 512, 0, false, false, false),
-                ("attn_pf_hd256_sliding", "gen_sm90a_attn_pf_hd256_sliding.cubin", KvDtype::Bf16, 256, ANY_SLIDING, true, true, false),
-                ("attn_pf_hd256_sliding_fp8kv", "gen_sm90a_attn_pf_hd256_sliding_fp8kv.cubin", KvDtype::Fp8, 256, ANY_SLIDING, true, true, false),
-                ("attn_pf_hd512_fp8kv", "gen_sm90a_attn_pf_hd512_fp8kv.cubin", KvDtype::Fp8, 512, 0, false, false, false),
+                (
+                    "attn_pf_hd512",
+                    "gen_sm90a_attn_pf_hd512.cubin",
+                    KvDtype::Bf16,
+                    512,
+                    0,
+                    false,
+                    false,
+                    false
+                ),
+                (
+                    "attn_pf_hd256_sliding",
+                    "gen_sm90a_attn_pf_hd256_sliding.cubin",
+                    KvDtype::Bf16,
+                    256,
+                    ANY_SLIDING,
+                    true,
+                    true,
+                    false
+                ),
+                (
+                    "attn_pf_hd256_sliding_fp8kv",
+                    "gen_sm90a_attn_pf_hd256_sliding_fp8kv.cubin",
+                    KvDtype::Fp8,
+                    256,
+                    ANY_SLIDING,
+                    true,
+                    true,
+                    false
+                ),
+                (
+                    "attn_pf_hd512_fp8kv",
+                    "gen_sm90a_attn_pf_hd512_fp8kv.cubin",
+                    KvDtype::Fp8,
+                    512,
+                    0,
+                    false,
+                    false,
+                    false
+                ),
                 (
                     "attn_pf_hd256_sliding_fp8kv_span",
                     "gen_sm90a_attn_pf_hd256_sliding_fp8kv_span.cubin",
@@ -402,6 +476,8 @@ mod tests {
         let rows = table["entries"].as_object_mut().unwrap();
         rows.remove("attn_pf_new");
         rows.remove("attn_pf_hd512_fp8kv");
-        assert!(matches!(load_catalog(&table.to_string()), Err(e) if e.contains("attn_pf_hd512_fp8kv")));
+        assert!(
+            matches!(load_catalog(&table.to_string()), Err(e) if e.contains("attn_pf_hd512_fp8kv"))
+        );
     }
 }

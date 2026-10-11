@@ -21,7 +21,6 @@
 
 pub mod analysis;
 pub mod asr;
-pub mod tts;
 pub mod asset;
 pub mod certificate_checks;
 pub mod config;
@@ -42,6 +41,7 @@ pub mod sched;
 pub mod serve;
 pub mod sim;
 pub mod text;
+pub mod tts;
 
 mod error;
 pub use error::{DeviceErrorInfo, Result, RuntimeError};

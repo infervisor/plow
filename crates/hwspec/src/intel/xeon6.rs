@@ -1,7 +1,9 @@
 //! Intel Xeon 6 P-core (Granite Rapids). Core/cache figures from `lscpu` on a 6975P-C; memory
 //! bandwidth is the DDR5-6400 x 12-channel datasheet peak (not measured on this part).
 
-use crate::spec::{Arch, ChipletGrouping, GpuSpec, MatrixThroughput, MemKind, MemorySpec, SmSpec, Vendor};
+use crate::spec::{
+    Arch, ChipletGrouping, GpuSpec, MatrixThroughput, MemKind, MemorySpec, SmSpec, Vendor,
+};
 use crate::units::{Bytes, GBps, Hertz};
 
 /// AMX TMUL per core: 1024 int8 / 512 bf16 / 512 fp16 (AMX-FP16) MACs per cycle. No fp8/fp4.

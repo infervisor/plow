@@ -56,14 +56,22 @@ pub struct RouteCfg {
 
 impl Default for RouteCfg {
     fn default() -> Self {
-        RouteCfg { prefix: true, spill: None, slack: 0.5 }
+        RouteCfg {
+            prefix: true,
+            spill: None,
+            slack: 0.5,
+        }
     }
 }
 
 impl RouteCfg {
     pub fn from_config() -> Self {
         let c = crate::config::RuntimeConfig::get();
-        RouteCfg { prefix: c.route_prefix, spill: c.route_spill, slack: c.route_prefix_slack as f32 }
+        RouteCfg {
+            prefix: c.route_prefix,
+            spill: c.route_spill,
+            slack: c.route_prefix_slack as f32,
+        }
     }
 }
 
@@ -80,7 +88,13 @@ pub enum Reason {
 }
 
 impl Reason {
-    pub const ALL: [Reason; 5] = [Reason::Session, Reason::Prefix, Reason::LeastLoaded, Reason::Spill, Reason::Retry];
+    pub const ALL: [Reason; 5] = [
+        Reason::Session,
+        Reason::Prefix,
+        Reason::LeastLoaded,
+        Reason::Spill,
+        Reason::Retry,
+    ];
 
     pub fn as_str(self) -> &'static str {
         match self {
@@ -158,7 +172,8 @@ pub fn choose(
         let mut hit: Option<usize> = None;
         for (i, c) in cands.iter().enumerate() {
             let saved = c.cached as f32 / prompt_rows as f32;
-            if !c.up || c.cached < block_rows || load(c) > l_min + SPILL_MARGIN + cfg.slack * saved {
+            if !c.up || c.cached < block_rows || load(c) > l_min + SPILL_MARGIN + cfg.slack * saved
+            {
                 continue;
             }
             let better = hit.is_none_or(|h| {
@@ -173,7 +188,14 @@ pub fn choose(
             return Some((h, Reason::Prefix));
         }
     }
-    Some((least, if sticky.is_some() { Reason::Spill } else { Reason::LeastLoaded }))
+    Some((
+        least,
+        if sticky.is_some() {
+            Reason::Spill
+        } else {
+            Reason::LeastLoaded
+        },
+    ))
 }
 
 const SHARDS: usize = 64;
@@ -224,8 +246,12 @@ struct Sessions {
 impl Sessions {
     fn new() -> Self {
         Sessions {
-            shards: (0..SHARDS).map(|_| CachePadded::new(Mutex::new(FxHashMap::default()))).collect(),
-            counts: (0..MAX_DP).map(|_| CachePadded::new(AtomicU32::new(0))).collect(),
+            shards: (0..SHARDS)
+                .map(|_| CachePadded::new(Mutex::new(FxHashMap::default())))
+                .collect(),
+            counts: (0..MAX_DP)
+                .map(|_| CachePadded::new(AtomicU32::new(0)))
+                .collect(),
             epoch: Instant::now(),
         }
     }
@@ -286,7 +312,10 @@ impl Sessions {
                 }
             }
             let (i, s, _) = best?;
-            if self.counts[i].compare_exchange_weak(s, s + 1, Relaxed, Relaxed).is_ok() {
+            if self.counts[i]
+                .compare_exchange_weak(s, s + 1, Relaxed, Relaxed)
+                .is_ok()
+            {
                 return Some(i);
             }
         }
@@ -331,7 +360,9 @@ impl Sessions {
     /// [`Self::get`] for the router's tail walk: `None` also when the shard is busy, never waits.
     fn peek(&self, h: u64, now: u32) -> Option<usize> {
         let s = self.shard(h).try_lock()?;
-        s.get(&h).filter(|&&(_, t)| now.wrapping_sub(t) < SESSION_TTL_S).map(|&(r, _)| r as usize)
+        s.get(&h)
+            .filter(|&&(_, t)| now.wrapping_sub(t) < SESSION_TTL_S)
+            .map(|&(r, _)| r as usize)
     }
 
     /// A prompt tail routed to `rank`. A tail that reaches two ranks is a shared prefix (a system
@@ -472,7 +503,10 @@ pub struct DpSet {
 impl DpSet {
     /// `ranks[r] = (ordinal, group, metrics)`.
     pub fn new(model: &str, ranks: Vec<(u32, usize, Arc<Metrics>)>) -> Self {
-        assert!(!ranks.is_empty() && ranks.len() <= MAX_DP, "DP rank count out of range");
+        assert!(
+            !ranks.is_empty() && ranks.len() <= MAX_DP,
+            "DP rank count out of range"
+        );
         DpSet {
             model: model.to_string(),
             ranks: ranks
@@ -530,7 +564,8 @@ impl DpSet {
         let session = session.map(|s| (Sessions::hash(s), self.sessions.now()));
         let stored = session.and_then(|(h, now)| self.sessions.get(h, now));
         let sticky = stored.map(|(r, _)| r).filter(|&r| r < n);
-        let sticky_ok = sticky.is_some_and(|i| cands[i].up && cands[i].pending <= spill(cfg, &cands[i]));
+        let sticky_ok =
+            sticky.is_some_and(|i| cands[i].up && cands[i].pending <= spill(cfg, &cands[i]));
         if session.is_some() && !sticky_ok {
             for (i, c) in cands[..n].iter_mut().enumerate() {
                 c.sessions = self.sessions.count(i);
@@ -548,7 +583,11 @@ impl DpSet {
                 let now = self.tails.now();
                 let mut shared = false;
                 for i in (0..blocks).rev().take(TAIL_WALK) {
-                    if let Some(r) = self.tails.peek(chain[i], now).filter(|&r| r < n && cands[r].up) {
+                    if let Some(r) = self
+                        .tails
+                        .peek(chain[i], now)
+                        .filter(|&r| r < n && cands[r].up)
+                    {
                         // Ending exactly on a routed tail adds nothing to it: a prefix many
                         // prompts share (a system prompt), not a conversation going on.
                         shared = i == blocks - 1;
@@ -575,7 +614,9 @@ impl DpSet {
                         self.stats.probe_contended.fetch_add(1, Relaxed);
                         continue;
                     };
-                    let Some(probe) = guard.as_ref() else { continue };
+                    let Some(probe) = guard.as_ref() else {
+                        continue;
+                    };
                     self.stats.probes.fetch_add(1, Relaxed);
                     match probe.try_matched_rows(&k, p) {
                         Some(rows) => {
@@ -611,10 +652,12 @@ impl DpSet {
         }
         let reason = if retry { Reason::Retry } else { reason };
         if let Some((last, now, shared)) = tail {
-            self.tails.put_tail(last, if shared { SHARED_TAIL as usize } else { rank }, now);
+            self.tails
+                .put_tail(last, if shared { SHARED_TAIL as usize } else { rank }, now);
         }
         if let Some((h, now)) = session {
-            let fresh = stored.is_some_and(|(r, t)| r == rank && now.wrapping_sub(t) < SESSION_REFRESH_S);
+            let fresh =
+                stored.is_some_and(|(r, t)| r == rank && now.wrapping_sub(t) < SESSION_REFRESH_S);
             if !fresh {
                 self.sessions.put(h, rank, now, reserved);
             }
@@ -624,10 +667,16 @@ impl DpSet {
             self.stats.retries.fetch_add(1, Relaxed);
         }
         let ns = t0.elapsed().as_nanos() as u64;
-        self.stats.route_ns[(64 - ns.max(1).leading_zeros() as usize).min(31)].fetch_add(1, Relaxed);
+        self.stats.route_ns[(64 - ns.max(1).leading_zeros() as usize).min(31)]
+            .fetch_add(1, Relaxed);
         let picked = &self.ranks[rank].picked;
         picked.fetch_add(1, Relaxed);
-        Some(Routed { rank, reason, key, pick: Pick(picked) })
+        Some(Routed {
+            rank,
+            reason,
+            key,
+            pick: Pick(picked),
+        })
     }
 }
 
@@ -641,13 +690,17 @@ pub struct DpRouter {
 
 impl DpRouter {
     pub fn new(cfg: RouteCfg) -> Self {
-        DpRouter { cfg, ..Default::default() }
+        DpRouter {
+            cfg,
+            ..Default::default()
+        }
     }
 
     pub fn add(&mut self, set: DpSet) {
         let set = Arc::new(set);
         for r in &set.ranks {
-            self.by_key.insert(r.key.clone(), (Arc::clone(&set), r.rank));
+            self.by_key
+                .insert(r.key.clone(), (Arc::clone(&set), r.rank));
         }
         self.sets.insert(set.model.clone(), set);
     }
@@ -675,7 +728,13 @@ mod tests {
     use super::*;
 
     fn c(pending: u32, active: u32, capacity: u32) -> Cand {
-        Cand { up: true, pending, active, capacity, ..Default::default() }
+        Cand {
+            up: true,
+            pending,
+            active,
+            capacity,
+            ..Default::default()
+        }
     }
 
     #[test]
@@ -692,9 +751,14 @@ mod tests {
     fn least_loaded_wins_and_ties_rotate() {
         let cfg = RouteCfg::default();
         let cands = [c(2, 8, 16), c(0, 3, 16), c(1, 8, 16)];
-        assert_eq!(choose(&cands, None, 0, 0, &cfg, 0), Some((1, Reason::LeastLoaded)));
+        assert_eq!(
+            choose(&cands, None, 0, 0, &cfg, 0),
+            Some((1, Reason::LeastLoaded))
+        );
         let even = [c(0, 0, 16); 4];
-        let picks: Vec<usize> = (0..4).map(|rr| choose(&even, None, 0, 0, &cfg, rr).unwrap().0).collect();
+        let picks: Vec<usize> = (0..4)
+            .map(|rr| choose(&even, None, 0, 0, &cfg, rr).unwrap().0)
+            .collect();
         assert_eq!(picks, vec![0, 1, 2, 3]);
     }
 
@@ -703,7 +767,10 @@ mod tests {
         let cfg = RouteCfg::default();
         let mut cands = [c(0, 0, 16), c(9, 9, 16)];
         cands[0].up = false;
-        assert_eq!(choose(&cands, Some(0), 0, 0, &cfg, 0), Some((1, Reason::Spill)));
+        assert_eq!(
+            choose(&cands, Some(0), 0, 0, &cfg, 0),
+            Some((1, Reason::Spill))
+        );
         cands[1].up = false;
         assert_eq!(choose(&cands, None, 0, 0, &cfg, 0), None);
     }
@@ -712,11 +779,23 @@ mod tests {
     fn a_session_sticks_until_its_rank_is_past_the_spill_depth() {
         let cfg = RouteCfg::default();
         let cands = [c(4, 16, 16), c(0, 0, 16)];
-        assert_eq!(choose(&cands, Some(0), 0, 0, &cfg, 0), Some((0, Reason::Session)));
+        assert_eq!(
+            choose(&cands, Some(0), 0, 0, &cfg, 0),
+            Some((0, Reason::Session))
+        );
         let deep = [c(5, 16, 16), c(0, 0, 16)];
-        assert_eq!(choose(&deep, Some(0), 0, 0, &cfg, 0), Some((1, Reason::Spill)));
-        let pinned = RouteCfg { spill: Some(64), ..cfg };
-        assert_eq!(choose(&deep, Some(0), 0, 0, &pinned, 0), Some((0, Reason::Session)));
+        assert_eq!(
+            choose(&deep, Some(0), 0, 0, &cfg, 0),
+            Some((1, Reason::Spill))
+        );
+        let pinned = RouteCfg {
+            spill: Some(64),
+            ..cfg
+        };
+        assert_eq!(
+            choose(&deep, Some(0), 0, 0, &pinned, 0),
+            Some((0, Reason::Session))
+        );
     }
 
     #[test]
@@ -725,15 +804,30 @@ mod tests {
         let mut cands = [c(0, 2, 16), c(0, 4, 16)];
         cands[1].cached = 1024;
         // 4/16 vs 2/16: 0.125 extra load, within the margin (0.5) plus the slack the hit buys (0.25).
-        assert_eq!(choose(&cands, None, 2048, 32, &cfg, 0), Some((1, Reason::Prefix)));
+        assert_eq!(
+            choose(&cands, None, 2048, 32, &cfg, 0),
+            Some((1, Reason::Prefix))
+        );
         cands[1].active = 16;
-        assert_eq!(choose(&cands, None, 2048, 32, &cfg, 0), Some((0, Reason::LeastLoaded)));
-        let off = RouteCfg { prefix: false, ..cfg };
+        assert_eq!(
+            choose(&cands, None, 2048, 32, &cfg, 0),
+            Some((0, Reason::LeastLoaded))
+        );
+        let off = RouteCfg {
+            prefix: false,
+            ..cfg
+        };
         cands[1].active = 4;
-        assert_eq!(choose(&cands, None, 2048, 32, &off, 0), Some((0, Reason::LeastLoaded)));
+        assert_eq!(
+            choose(&cands, None, 2048, 32, &off, 0),
+            Some((0, Reason::LeastLoaded))
+        );
         // Less than one block is not a hit.
         cands[1].cached = 16;
-        assert_eq!(choose(&cands, None, 2048, 32, &cfg, 0), Some((0, Reason::LeastLoaded)));
+        assert_eq!(
+            choose(&cands, None, 2048, 32, &cfg, 0),
+            Some((0, Reason::LeastLoaded))
+        );
     }
 
     #[test]
@@ -743,7 +837,10 @@ mod tests {
         cands[0].cached = 64;
         cands[1].cached = 512;
         cands[2].cached = 1024;
-        assert_eq!(choose(&cands, None, 1100, 32, &cfg, 0), Some((1, Reason::Prefix)));
+        assert_eq!(
+            choose(&cands, None, 1100, 32, &cfg, 0),
+            Some((1, Reason::Prefix))
+        );
     }
 
     #[test]
@@ -757,7 +854,12 @@ mod tests {
     }
 
     fn set(n: usize) -> DpSet {
-        DpSet::new("m", (0..n).map(|r| (r as u32, r, Arc::new(Metrics::default()))).collect())
+        DpSet::new(
+            "m",
+            (0..n)
+                .map(|r| (r as u32, r, Arc::new(Metrics::default())))
+                .collect(),
+        )
     }
 
     fn up(set: &DpSet) {
@@ -781,7 +883,11 @@ mod tests {
         assert_eq!(s.sessions(), 1);
         let h = Sessions::hash("abc");
         let stale = s.sessions.now() + SESSION_TTL_S;
-        assert_eq!(s.sessions.get(h, stale), None, "an idle session forgets its rank");
+        assert_eq!(
+            s.sessions.get(h, stale),
+            None,
+            "an idle session forgets its rank"
+        );
     }
 
     /// New sessions spread by how many each rank already holds, not only by the instant's load:
@@ -799,14 +905,34 @@ mod tests {
         }
         let counts: Vec<u32> = (0..8).map(|r| s.sessions.count(r)).collect();
         assert_eq!(counts.iter().sum::<u32>(), 64);
-        assert_eq!(counts[6], 0, "a rank with KV near full takes none: {counts:?}");
-        assert!(counts[5] >= 9, "a momentary queue does not unbalance sessions: {counts:?}");
-        let live = counts.iter().enumerate().filter(|&(r, _)| r != 6).map(|(_, &c)| c);
-        assert!(live.clone().max().unwrap() - live.min().unwrap() <= 1, "{counts:?}");
+        assert_eq!(
+            counts[6], 0,
+            "a rank with KV near full takes none: {counts:?}"
+        );
+        assert!(
+            counts[5] >= 9,
+            "a momentary queue does not unbalance sessions: {counts:?}"
+        );
+        let live = counts
+            .iter()
+            .enumerate()
+            .filter(|&(r, _)| r != 6)
+            .map(|(_, &c)| c);
+        assert!(
+            live.clone().max().unwrap() - live.min().unwrap() <= 1,
+            "{counts:?}"
+        );
         let h = Sessions::hash("sess-0");
         let before = counts.iter().sum::<u32>();
-        assert!(s.sessions.get(h, s.sessions.now() + SESSION_TTL_S).is_none());
-        assert_eq!((0..8).map(|r| s.sessions.count(r)).sum::<u32>(), before - 1, "expiry uncounts");
+        assert!(s
+            .sessions
+            .get(h, s.sessions.now() + SESSION_TTL_S)
+            .is_none());
+        assert_eq!(
+            (0..8).map(|r| s.sessions.count(r)).sum::<u32>(),
+            before - 1,
+            "expiry uncounts"
+        );
     }
 
     /// First turns placing concurrently each claim a distinct share: no rank ends more than one
@@ -836,7 +962,11 @@ mod tests {
     fn a_full_session_shard_sweeps_expired_entries_only() {
         let s = Sessions::new();
         let shard_of = |h: u64| (h >> 58) as usize % SHARDS;
-        let mut same: Vec<u64> = (0u64..).map(|i| i << 58 | i).filter(|&h| shard_of(h) == 0).take(SHARD_CAP + 1).collect();
+        let mut same: Vec<u64> = (0u64..)
+            .map(|i| i << 58 | i)
+            .filter(|&h| shard_of(h) == 0)
+            .take(SHARD_CAP + 1)
+            .collect();
         let last = same.pop().unwrap();
         for &h in &same[..SHARD_CAP / 2] {
             s.put(h, 1, 0, false);
@@ -846,7 +976,10 @@ mod tests {
         }
         s.put(last, 2, SESSION_TTL_S + 10, false);
         assert_eq!(s.shards[0].lock().len(), SHARD_CAP / 2 + 1);
-        assert_eq!(s.get(last, SESSION_TTL_S + 10), Some((2, SESSION_TTL_S + 10)));
+        assert_eq!(
+            s.get(last, SESSION_TTL_S + 10),
+            Some((2, SESSION_TTL_S + 10))
+        );
     }
 
     #[test]
@@ -857,7 +990,11 @@ mod tests {
         let r = s.route(&cfg, None, None, 0b01).unwrap();
         assert_eq!((r.rank, r.reason), (1, Reason::Retry));
         assert!(s.route(&cfg, None, None, 0b11).is_none());
-        assert_eq!(s.stats.retries.load(Relaxed), 1, "a refused route is not a retry");
+        assert_eq!(
+            s.stats.retries.load(Relaxed),
+            1,
+            "a refused route is not a retry"
+        );
     }
 
     /// A prompt that extends one routed before goes to that prompt's rank, even before the rank's
@@ -874,7 +1011,10 @@ mod tests {
         let r1 = s.route(&cfg, None, Some(&next), 0).unwrap();
         assert_eq!((r1.rank, r1.reason), (rank, Reason::Prefix));
         let other: Vec<u32> = (1000..1700).collect();
-        assert_eq!(s.route(&cfg, None, Some(&other), 0).unwrap().reason, Reason::LeastLoaded);
+        assert_eq!(
+            s.route(&cfg, None, Some(&other), 0).unwrap().reason,
+            Reason::LeastLoaded
+        );
     }
 
     /// A tail two ranks routed (a shared system prompt) attracts nothing.
@@ -886,7 +1026,12 @@ mod tests {
         s.tails.put_tail(tail_hash(&shared), 0, s.tails.now());
         s.tails.put_tail(tail_hash(&shared), 1, s.tails.now());
         let next: Vec<u32> = (0..300).collect();
-        assert_eq!(s.route(&RouteCfg::default(), None, Some(&next), 0).unwrap().reason, Reason::LeastLoaded);
+        assert_eq!(
+            s.route(&RouteCfg::default(), None, Some(&next), 0)
+                .unwrap()
+                .reason,
+            Reason::LeastLoaded
+        );
     }
 
     /// First turns that end inside a common system prompt do not pile onto the first one's rank.
@@ -902,7 +1047,10 @@ mod tests {
             assert_eq!(r.reason, Reason::LeastLoaded, "turn {k}");
             s.ranks[r.rank].metrics.slots_active.fetch_add(1, Relaxed);
         }
-        assert!(s.ranks.iter().all(|r| r.metrics.slots_active.load(Relaxed) == 2));
+        assert!(s
+            .ranks
+            .iter()
+            .all(|r| r.metrics.slots_active.load(Relaxed) == 2));
     }
 
     fn tail_hash(p: &[u32]) -> u64 {
@@ -915,7 +1063,9 @@ mod tests {
     fn no_probe_without_a_resident_cache() {
         let s = set(2);
         up(&s);
-        let r = s.route(&RouteCfg::default(), None, Some(&[1; 4096]), 0).unwrap();
+        let r = s
+            .route(&RouteCfg::default(), None, Some(&[1; 4096]), 0)
+            .unwrap();
         assert!(r.key.is_none(), "no block size known yet: nothing hashed");
         assert_eq!(s.stats.probes.load(Relaxed), 0);
     }

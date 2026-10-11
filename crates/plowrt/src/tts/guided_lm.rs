@@ -48,13 +48,15 @@ pub struct GuidedLmContract {
 impl GuidedLmContract {
     pub fn from_pipeline(p: &PacketPipeline) -> Result<Self> {
         if p.driver != DRIVER {
-            return Err(RuntimeError::Rejected(format!("pipeline {} is {}, not {DRIVER}", p.name, p.driver)));
+            return Err(RuntimeError::Rejected(format!(
+                "pipeline {} is {}, not {DRIVER}",
+                p.name, p.driver
+            )));
         }
         let get = |k: &str| {
-            p.parameters
-                .get(k)
-                .copied()
-                .ok_or_else(|| RuntimeError::Rejected(format!("guided LM pipeline lacks parameter {k}")))
+            p.parameters.get(k).copied().ok_or_else(|| {
+                RuntimeError::Rejected(format!("guided LM pipeline lacks parameter {k}"))
+            })
         };
         let f = |k: &str| get(k).map(|v| f32::from_bits(v as u32));
         Ok(GuidedLmContract {
@@ -74,7 +76,11 @@ impl GuidedLmContract {
             min_p: f("lm.min_p_f32")?,
             top_p: f("lm.top_p_f32")?,
             repetition_penalty: f("lm.repetition_penalty_f32")?,
-            trim_tail_tokens: p.parameters.get("lm.trim_tail_tokens").copied().unwrap_or(0) as usize,
+            trim_tail_tokens: p
+                .parameters
+                .get("lm.trim_tail_tokens")
+                .copied()
+                .unwrap_or(0) as usize,
         })
     }
 
@@ -99,14 +105,18 @@ impl GuidedLmContract {
         match (found.next(), found.next()) {
             (None, _) => Ok(None),
             (Some(p), None) => Self::from_pipeline(p).map(Some),
-            (Some(_), Some(_)) => Err(RuntimeError::Rejected("ambiguous: several T3 pipelines".into())),
+            (Some(_), Some(_)) => Err(RuntimeError::Rejected(
+                "ambiguous: several T3 pipelines".into(),
+            )),
         }
     }
 }
 
 /// Little-endian f32s from bytes of any alignment (mmap'd safetensors data need not be aligned).
 fn le_f32s(b: &[u8]) -> Vec<f32> {
-    b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()
+    b.chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect()
 }
 
 /// Host tables for prefill rows (`in.prompt.*` packet tensors) and the packet's text rules.
@@ -125,22 +135,40 @@ pub struct PromptTables {
 impl PromptTables {
     pub fn load(assets: &Path, hidden: usize) -> Result<Self> {
         let path = assets.join("model.pkt");
-        let raw = std::fs::read(&path).map_err(|source| RuntimeError::Io { path: path.clone(), source })?;
+        let raw = std::fs::read(&path).map_err(|source| RuntimeError::Io {
+            path: path.clone(),
+            source,
+        })?;
         let blob = crate::asset::devblob::DevBlob::parse(&raw)?;
         let host = |name: &str| -> Option<Vec<f32>> {
             let t = blob.tensors.iter().find(|t| t.name == name)?;
             Some(le_f32s(&blob.init[t.init.clone()?]))
         };
-        let need = |name: &str| host(name).ok_or_else(|| RuntimeError::Rejected(format!("packet lacks {name}")));
-        let (text_emb, text_pos, bos) = (need("in.prompt.text_table")?, need("in.prompt.text_pos")?, need("in.prompt.bos_row")?);
+        let need = |name: &str| {
+            host(name).ok_or_else(|| RuntimeError::Rejected(format!("packet lacks {name}")))
+        };
+        let (text_emb, text_pos, bos) = (
+            need("in.prompt.text_table")?,
+            need("in.prompt.text_pos")?,
+            need("in.prompt.bos_row")?,
+        );
         if bos.len() != hidden || text_emb.len() % hidden != 0 || text_pos.len() % hidden != 0 {
-            return Err(RuntimeError::Rejected("T3 host tables disagree with hidden".into()));
+            return Err(RuntimeError::Rejected(
+                "T3 host tables disagree with hidden".into(),
+            ));
         }
         let mut voices = HashMap::new();
-        for t in blob.tensors.iter().filter(|t| t.name.starts_with("in.prompt.voice.")) {
+        for t in blob
+            .tensors
+            .iter()
+            .filter(|t| t.name.starts_with("in.prompt.voice."))
+        {
             let rows = host(&t.name).unwrap_or_default();
             if rows.is_empty() || rows.len() % hidden != 0 {
-                return Err(RuntimeError::Rejected(format!("{}: not [rows][{hidden}] f32", t.name)));
+                return Err(RuntimeError::Rejected(format!(
+                    "{}: not [rows][{hidden}] f32",
+                    t.name
+                )));
             }
             voices.insert(t.name["in.prompt.voice.".len()..].to_string(), rows);
         }
@@ -157,8 +185,12 @@ impl PromptTables {
         const LANG: &str = "text.rules.lang.";
         let rules = crate::text::rules::TextRules::compile(
             pipe.strings.get("text.rules").map_or("", String::as_str),
-            pipe.strings.iter().filter_map(|(k, v)| Some((k.strip_prefix(LANG)?, v.as_str()))),
-            pipe.strings.get("text.default_language").map(String::as_str),
+            pipe.strings
+                .iter()
+                .filter_map(|(k, v)| Some((k.strip_prefix(LANG)?, v.as_str()))),
+            pipe.strings
+                .get("text.default_language")
+                .map(String::as_str),
             &tables,
         )?;
         let tk = assets.join("tokenizer.json");
@@ -169,8 +201,17 @@ impl PromptTables {
             text_emb,
             text_pos,
             bos,
-            bos_repeat: pipe.parameters.get("prompt.bos_repeat").copied().unwrap_or(1) as usize,
-            uncond_drops_text: pipe.parameters.get("cfg.uncond_drops_text").copied().unwrap_or(0) == 1,
+            bos_repeat: pipe
+                .parameters
+                .get("prompt.bos_repeat")
+                .copied()
+                .unwrap_or(1) as usize,
+            uncond_drops_text: pipe
+                .parameters
+                .get("cfg.uncond_drops_text")
+                .copied()
+                .unwrap_or(0)
+                == 1,
             voices,
             rules,
             tokenizer,
@@ -189,15 +230,30 @@ impl PromptTables {
     /// Tokenize after the packet's text rules; `lang` as resolved by [`Self::language`].
     pub fn text_ids(&self, text: &str, lang: Option<&str>) -> Result<Vec<u32>> {
         let t = self.rules.apply(text, lang)?;
-        let enc = self.tokenizer.encode(t, true).map_err(|e| RuntimeError::Rejected(format!("tokenize: {e}")))?;
+        let enc = self
+            .tokenizer
+            .encode(t, true)
+            .map_err(|e| RuntimeError::Rejected(format!("tokenize: {e}")))?;
         Ok(enc.get_ids().to_vec())
     }
 
     /// The prefill rows ([rows][hidden] f32) for one CFG member.
-    pub fn prefill_rows(&self, c: &GuidedLmContract, voice: &str, text_ids: &[u32], uncond: bool) -> Result<Vec<f32>> {
+    pub fn prefill_rows(
+        &self,
+        c: &GuidedLmContract,
+        voice: &str,
+        text_ids: &[u32],
+        uncond: bool,
+    ) -> Result<Vec<f32>> {
         let h = self.hidden;
-        let cond = self.voices.get(voice).ok_or_else(|| RuntimeError::Rejected(format!("unknown voice {voice:?}")))?;
-        let ids: Vec<u32> = std::iter::once(c.start_text).chain(text_ids.iter().copied()).chain(std::iter::once(c.stop_text)).collect();
+        let cond = self
+            .voices
+            .get(voice)
+            .ok_or_else(|| RuntimeError::Rejected(format!("unknown voice {voice:?}")))?;
+        let ids: Vec<u32> = std::iter::once(c.start_text)
+            .chain(text_ids.iter().copied())
+            .chain(std::iter::once(c.stop_text))
+            .collect();
         if ids.len() * h > self.text_pos.len() {
             let max = (self.text_pos.len() / h).saturating_sub(2);
             return Err(RuntimeError::Rejected(format!(
@@ -206,7 +262,9 @@ impl PromptTables {
             )));
         }
         if ids.iter().any(|&i| i as usize >= c.text_vocab) {
-            return Err(RuntimeError::Rejected("text exceeds the T3 text tables".into()));
+            return Err(RuntimeError::Rejected(
+                "text exceeds the T3 text tables".into(),
+            ));
         }
         let mut rows = Vec::with_capacity(cond.len() + (ids.len() + self.bos_repeat) * h);
         rows.extend_from_slice(cond);
@@ -240,15 +298,29 @@ pub struct GuidedLm {
 
 impl GuidedLm {
     pub fn load(assets: &Path, device: u8) -> Result<Self> {
-        let c = GuidedLmContract::load(assets)?
-            .ok_or_else(|| RuntimeError::Rejected(format!("{} declares no {DRIVER} pipeline", assets.display())))?;
+        let c = GuidedLmContract::load(assets)?.ok_or_else(|| {
+            RuntimeError::Rejected(format!(
+                "{} declares no {DRIVER} pipeline",
+                assets.display()
+            ))
+        })?;
         let be = std::sync::Arc::new(crate::device::cuda::CudaBackend::new(device)?);
         let e = GpuEngine::load(be, assets, &crate::asset::serve::checkpoint_dir(assets))?;
         if e.vocab() != c.speech_vocab {
-            return Err(RuntimeError::Rejected("T3 engine vocab disagrees with the contract".into()));
+            return Err(RuntimeError::Rejected(
+                "T3 engine vocab disagrees with the contract".into(),
+            ));
         }
         let tables = PromptTables::load(assets, c.hidden)?;
-        Ok(GuidedLm { e, c, tables, logits: Vec::new(), uncond: Vec::new(), scratch: Vec::new(), raw: Vec::new() })
+        Ok(GuidedLm {
+            e,
+            c,
+            tables,
+            logits: Vec::new(),
+            uncond: Vec::new(),
+            scratch: Vec::new(),
+            raw: Vec::new(),
+        })
     }
 
     /// Prefill one CFG member on `slot`; returns its last-row logits in `self.logits`.
@@ -256,19 +328,33 @@ impl GuidedLm {
         let h = self.c.hidden;
         let n = rows.len() / h;
         if n > self.c.overlay_rows {
-            return Err(RuntimeError::ContextLength(format!("T3 prompt {n} rows > overlay capacity {}", self.c.overlay_rows)));
+            return Err(RuntimeError::ContextLength(format!(
+                "T3 prompt {n} rows > overlay capacity {}",
+                self.c.overlay_rows
+            )));
         }
         self.e.begin_slot(slot, n + self.c.max_speech_tokens + 2)?;
-        self.e.write_tensor("in.pos_base", (slot * 4) as u64, &((n - 1) as u32).to_le_bytes())?;
+        self.e.write_tensor(
+            "in.pos_base",
+            (slot * 4) as u64,
+            &((n - 1) as u32).to_le_bytes(),
+        )?;
         let ids = vec![0u32; n];
         // Chunk-relative overlay rows, as the mux stages them: launch row r reads overlay row r.
         let window = self.c.overlay_rows.min(self.e.pf_max_rows().max(1));
         let mut c0 = 0;
         loop {
             let hi = n.min(c0 + window);
-            self.e.write_tensor("in.encoder_overlay", 0, bytemuck::cast_slice(&rows[c0 * h..hi * h]))?;
-            let index: Vec<u32> = (0..self.c.overlay_rows).map(|r| if c0 + r < hi { r as u32 } else { u32::MAX }).collect();
-            self.e.write_tensor("in.encoder_overlay_index", 0, bytemuck::cast_slice(&index))?;
+            self.e.write_tensor(
+                "in.encoder_overlay",
+                0,
+                bytemuck::cast_slice(&rows[c0 * h..hi * h]),
+            )?;
+            let index: Vec<u32> = (0..self.c.overlay_rows)
+                .map(|r| if c0 + r < hi { r as u32 } else { u32::MAX })
+                .collect();
+            self.e
+                .write_tensor("in.encoder_overlay_index", 0, bytemuck::cast_slice(&index))?;
             match self.e.prefill_chunk(slot, &ids, n)? {
                 PrefillStep::Done(_) => break,
                 PrefillStep::Progress(p) => c0 = p,
@@ -280,7 +366,8 @@ impl GuidedLm {
     fn read_logits_row(&mut self, row: usize) -> Result<()> {
         let v = self.c.speech_vocab;
         self.raw.resize(v * 2, 0);
-        self.e.read_tensor_range("act.logits", (row * v * 2) as u64, &mut self.raw)?;
+        self.e
+            .read_tensor_range("act.logits", (row * v * 2) as u64, &mut self.raw)?;
         self.logits.resize(v, 0.0);
         for (o, b) in self.logits.iter_mut().zip(self.raw.chunks_exact(2)) {
             *o = f32::from_bits(u32::from(u16::from_le_bytes([b[0], b[1]])) << 16);
@@ -289,7 +376,12 @@ impl GuidedLm {
     }
 
     /// Numerics probe: text ids and the (cond, uncond) last-prefill logits on slot pair 0.
-    pub fn probe_prefill(&mut self, voice: &str, text: &str, lang: Option<&str>) -> Result<(Vec<u32>, Vec<f32>, Vec<f32>)> {
+    pub fn probe_prefill(
+        &mut self,
+        voice: &str,
+        text: &str,
+        lang: Option<&str>,
+    ) -> Result<(Vec<u32>, Vec<f32>, Vec<f32>)> {
         let lang = self.tables.language(lang)?;
         let ids = self.tables.text_ids(text, lang.as_deref())?;
         let rows = self.tables.prefill_rows(&self.c, voice, &ids, false)?;
@@ -301,7 +393,13 @@ impl GuidedLm {
     }
 
     /// Greedy guided decoding of one request on slot pair 0: speech tokens, stop excluded.
-    pub fn greedy(&mut self, voice: &str, text: &str, lang: Option<&str>, max_tokens: usize) -> Result<Vec<u32>> {
+    pub fn greedy(
+        &mut self,
+        voice: &str,
+        text: &str,
+        lang: Option<&str>,
+        max_tokens: usize,
+    ) -> Result<Vec<u32>> {
         let lang = self.tables.language(lang)?;
         let ids = self.tables.text_ids(text, lang.as_deref())?;
         let rows = self.tables.prefill_rows(&self.c, voice, &ids, true)?;
@@ -379,7 +477,10 @@ mod tests {
         let mut s = Vec::new();
         for i in 0..1000 {
             let u = Some(i as f32 / 1000.0);
-            assert_eq!(sample_cfg(&c, &cond, &uncond, [1, 1, 1, 5, 5], u, &mut s), sample_cfg(&c, &cond, &uncond, [1, 5], u, &mut s));
+            assert_eq!(
+                sample_cfg(&c, &cond, &uncond, [1, 1, 1, 5, 5], u, &mut s),
+                sample_cfg(&c, &cond, &uncond, [1, 5], u, &mut s)
+            );
         }
     }
 }

@@ -31,23 +31,34 @@ fn bytes(p: &Packet<'_>, handle: u16) -> Result<u64, String> {
     if handle == TENSOR_NONE16 {
         return Ok(0);
     }
-    p.tensors.get(handle as usize).map(|t| t.bytes).ok_or_else(|| format!("tensor handle {handle} out of range"))
+    p.tensors
+        .get(handle as usize)
+        .map(|t| t.bytes)
+        .ok_or_else(|| format!("tensor handle {handle} out of range"))
 }
 
 fn ln_site(p: &Packet<'_>, gp: usize, gpc: usize) -> Result<Value, String> {
     let g = &p.programs[gp].insts[gpc];
     let (a, stats) = (g.t[1], g.t[5]);
     if stats == TENSOR_NONE16 {
-        return Err(format!("program {gp} pc {gpc}: LayerNorm prologue without stats"));
+        return Err(format!(
+            "program {gp} pc {gpc}: LayerNorm prologue without stats"
+        ));
     }
-    let order = p.programs.iter().enumerate().flat_map(|(i, prog)| (0..prog.insts.len()).map(move |pc| (i, pc)));
+    let order = p
+        .programs
+        .iter()
+        .enumerate()
+        .flat_map(|(i, prog)| (0..prog.insts.len()).map(move |pc| (i, pc)));
     let mut writer = None;
     for (i, pc) in order.take_while(|&(i, pc)| (i, pc) < (gp, gpc)) {
         if writes(&p.programs[i].insts[pc], stats)? {
             writer = Some((i, pc));
         }
     }
-    let (wp, wpc) = writer.ok_or_else(|| format!("program {gp} pc {gpc}: stats tensor {stats} has no earlier writer"))?;
+    let (wp, wpc) = writer.ok_or_else(|| {
+        format!("program {gp} pc {gpc}: stats tensor {stats} has no earlier writer")
+    })?;
     let w = &p.programs[wp].insts[wpc];
     let (mut a_writes, mut stats_writes) = (0u32, 0u32);
     for i in wp..=gp {
@@ -90,7 +101,9 @@ pub fn request(p: &Packet<'_>) -> Result<Option<Value>, String> {
     for (gp, prog) in p.programs.iter().enumerate() {
         for (pc, d) in prog.insts.iter().enumerate() {
             match op(d) {
-                Some(DevOp::DenseGemmF32) if d.i[7] & LN_PROLOGUE != 0 => sites.push(ln_site(p, gp, pc)?),
+                Some(DevOp::DenseGemmF32) if d.i[7] & LN_PROLOGUE != 0 => {
+                    sites.push(ln_site(p, gp, pc)?)
+                }
                 Some(DevOp::Conv1dF32) if d.t[7] != TENSOR_NONE16 => sites.push(conv_site(p, d)?),
                 _ => {}
             }

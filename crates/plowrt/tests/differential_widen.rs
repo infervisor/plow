@@ -1,6 +1,6 @@
-use std::path::Path;
 use plowrt::asset::devblob::DevBlob;
 use plowrt::exec::ctx_bound::widen;
+use std::path::Path;
 
 #[test]
 fn gemma4_differential_widen_8k_to_32k_matches_native_32k() {
@@ -12,14 +12,24 @@ fn gemma4_differential_widen_8k_to_32k_matches_native_32k() {
         if !p8.exists() {
             let status = std::process::Command::new("cargo")
                 .args([
-                    "run", "-p", "plowc", "--",
-                    "--hf-dir", hf_dir.to_str().unwrap(),
-                    "--gpu", "H100 SXM5",
-                    "--arch", "sm_90a",
-                    "--n-cu", "132",
-                    "--emit", "devblob",
-                    "--max-ctx", "8192",
-                    "--out", "/tmp/gemma4_test_8k",
+                    "run",
+                    "-p",
+                    "plowc",
+                    "--",
+                    "--hf-dir",
+                    hf_dir.to_str().unwrap(),
+                    "--gpu",
+                    "H100 SXM5",
+                    "--arch",
+                    "sm_90a",
+                    "--n-cu",
+                    "132",
+                    "--emit",
+                    "devblob",
+                    "--max-ctx",
+                    "8192",
+                    "--out",
+                    "/tmp/gemma4_test_8k",
                     "--segmented",
                 ])
                 .status()
@@ -29,14 +39,24 @@ fn gemma4_differential_widen_8k_to_32k_matches_native_32k() {
         if !p32.exists() {
             let status = std::process::Command::new("cargo")
                 .args([
-                    "run", "-p", "plowc", "--",
-                    "--hf-dir", hf_dir.to_str().unwrap(),
-                    "--gpu", "H100 SXM5",
-                    "--arch", "sm_90a",
-                    "--n-cu", "132",
-                    "--emit", "devblob",
-                    "--max-ctx", "32768",
-                    "--out", "/tmp/gemma4_test_32k",
+                    "run",
+                    "-p",
+                    "plowc",
+                    "--",
+                    "--hf-dir",
+                    hf_dir.to_str().unwrap(),
+                    "--gpu",
+                    "H100 SXM5",
+                    "--arch",
+                    "sm_90a",
+                    "--n-cu",
+                    "132",
+                    "--emit",
+                    "devblob",
+                    "--max-ctx",
+                    "32768",
+                    "--out",
+                    "/tmp/gemma4_test_32k",
                     "--segmented",
                 ])
                 .status()
@@ -46,7 +66,9 @@ fn gemma4_differential_widen_8k_to_32k_matches_native_32k() {
     }
 
     if !p8.exists() || !p32.exists() {
-        eprintln!("skip: test packets /tmp/gemma4_test_8k or 32k not present and hf-cache not found");
+        eprintln!(
+            "skip: test packets /tmp/gemma4_test_8k or 32k not present and hf-cache not found"
+        );
         return;
     }
 
@@ -64,7 +86,11 @@ fn gemma4_differential_widen_8k_to_32k_matches_native_32k() {
 
     // 1. Live KV manifest caches match
     let m8_widened = b8.with_packet_view(plow_asset::live_kv::emit).unwrap();
-    assert_eq!(m8_widened.caches.len(), m32.caches.len(), "cache count matches");
+    assert_eq!(
+        m8_widened.caches.len(),
+        m32.caches.len(),
+        "cache count matches"
+    );
     assert_eq!(m8_widened.caches, m32.caches, "all live KV caches match");
 
     // 2. Tensor names, sizes, and layout match
@@ -98,7 +124,12 @@ fn gemma4_differential_widen_8k_to_32k_matches_native_32k() {
     assert_eq!(b8.progs.len(), b32.progs.len(), "program count matches");
     for (p_idx, (p_w, p_n)) in b8.progs.iter().zip(b32.progs.iter()).enumerate() {
         assert_eq!(p_w.t, p_n.t, "prog {} T matches", p_idx);
-        assert_eq!(p_w.insts.len(), p_n.insts.len(), "prog {} inst len matches", p_idx);
+        assert_eq!(
+            p_w.insts.len(),
+            p_n.insts.len(),
+            "prog {} inst len matches",
+            p_idx
+        );
 
         for (i_idx, (inst_w, inst_n)) in p_w.insts.iter().zip(p_n.insts.iter()).enumerate() {
             let op = inst_w.op;
@@ -107,17 +138,20 @@ fn gemma4_differential_widen_8k_to_32k_matches_native_32k() {
             if op == flash_decode || op == flash_decode_fp8 {
                 assert_eq!(
                     inst_w.i[3], inst_n.i[3],
-                    "prog {} inst {} FlashDecode kv_stride matches", p_idx, i_idx
+                    "prog {} inst {} FlashDecode kv_stride matches",
+                    p_idx, i_idx
                 );
             } else if op == flash_prefill || op == flash_prefill_fp8 {
                 assert_eq!(
                     inst_w.fj[1], inst_n.fj[1],
-                    "prog {} inst {} FlashPrefill kv_stride matches", p_idx, i_idx
+                    "prog {} inst {} FlashPrefill kv_stride matches",
+                    p_idx, i_idx
                 );
             } else if op == head_norm_rope {
                 assert_eq!(
                     inst_w.fj[1], inst_n.fj[1],
-                    "prog {} inst {} HeadNormRope out_stride matches", p_idx, i_idx
+                    "prog {} inst {} HeadNormRope out_stride matches",
+                    p_idx, i_idx
                 );
             }
         }
@@ -126,13 +160,30 @@ fn gemma4_differential_widen_8k_to_32k_matches_native_32k() {
     // 5. Ladder programs match
     for (p_idx, (p_w, p_n)) in b8.progs.iter().zip(b32.progs.iter()).enumerate() {
         assert_eq!(p_w.t, p_n.t);
-        assert_eq!(p_w.gq_seg_ofs, p_n.gq_seg_ofs, "prog {} gq_seg_ofs matches", p_idx);
-        assert_eq!(p_w.insts.len(), p_n.insts.len(), "prog {} inst len matches", p_idx);
+        assert_eq!(
+            p_w.gq_seg_ofs, p_n.gq_seg_ofs,
+            "prog {} gq_seg_ofs matches",
+            p_idx
+        );
+        assert_eq!(
+            p_w.insts.len(),
+            p_n.insts.len(),
+            "prog {} inst len matches",
+            p_idx
+        );
 
         for (i_idx, (iw, inat)) in p_w.insts.iter().zip(p_n.insts.iter()).enumerate() {
             assert_eq!(iw.op, inat.op, "prog {} inst {} op matches", p_idx, i_idx);
-            assert_eq!(iw.blocks, inat.blocks, "prog {} inst {} blocks match", p_idx, i_idx);
-            assert_eq!(iw.t, inat.t, "prog {} inst {} tensor operands match", p_idx, i_idx);
+            assert_eq!(
+                iw.blocks, inat.blocks,
+                "prog {} inst {} blocks match",
+                p_idx, i_idx
+            );
+            assert_eq!(
+                iw.t, inat.t,
+                "prog {} inst {} tensor operands match",
+                p_idx, i_idx
+            );
 
             if iw.op == flash_decode || iw.op == flash_decode_fp8 {
                 // FlashDecode: i[0..5] = [batch, heads, kvh, kv_stride, window, nsplit]
@@ -160,9 +211,13 @@ fn gemma4_differential_widen_8k_to_32k_matches_native_32k() {
             } else {
                 // All other instructions must match bit-for-bit
                 assert_eq!(
-                    iw, inat,
+                    iw,
+                    inat,
                     "prog {} (T={}) inst {} (op={:?}) differs between widened and native",
-                    p_idx, p_w.t, i_idx, packet::dev::DevOp::from_u16(iw.op)
+                    p_idx,
+                    p_w.t,
+                    i_idx,
+                    packet::dev::DevOp::from_u16(iw.op)
                 );
             }
         }

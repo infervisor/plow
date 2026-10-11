@@ -6,15 +6,18 @@
 //! wrapping, the processor parameters and the sidecar names; each sidecar carries its own inputs.
 use std::collections::BTreeMap;
 
-use packet::dev::{DevOp, ACT_CLAMP, ACT_GELU_TANH, ACT_RELU, ACT_ROUND_BF16, ACT_SCALE_SHIFT, ACT_SILU, TENSOR_NONE};
+use packet::dev::{
+    DevOp, ACT_CLAMP, ACT_GELU_TANH, ACT_RELU, ACT_ROUND_BF16, ACT_SCALE_SHIFT, ACT_SILU,
+    TENSOR_NONE,
+};
 use plow_asset::multimodal::{MediaAttention, MmContract, MmModality};
 use plow_asset::packet_pipeline::{PacketPipeline, PacketPipelines, PipelineDType, PipelineTensor};
 use serde_json::Value;
 
 use crate::checkpoint::TensorReader;
 use crate::pipeline::{
-    AttentionF32Stage, DenseActivation, DenseF32ProgramStage, DenseWeight, GatherRowsF32Stage, PacketPrefix,
-    StageProgram, TensorRef,
+    AttentionF32Stage, DenseActivation, DenseF32ProgramStage, DenseWeight, GatherRowsF32Stage,
+    PacketPrefix, StageProgram, TensorRef,
 };
 
 pub const VISION_PACKET: &str = "mm_vision.pkt";
@@ -43,7 +46,10 @@ fn f32_le(values: &[f32]) -> Vec<u8> {
 }
 
 fn bf16_to_f32(bytes: &[u8]) -> Vec<f32> {
-    bytes.chunks_exact(2).map(|b| f32::from_bits(u32::from(u16::from_le_bytes([b[0], b[1]])) << 16)).collect()
+    bytes
+        .chunks_exact(2)
+        .map(|b| f32::from_bits(u32::from(u16::from_le_bytes([b[0], b[1]])) << 16))
+        .collect()
 }
 
 fn round_bf16(v: f32) -> f32 {
@@ -59,12 +65,18 @@ impl Ckpt {
         let (dtype, bytes) = self.reader.read(name)?;
         match dtype {
             "BF16" => Ok(bf16_to_f32(&bytes)),
-            "F32" => Ok(bytes.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect()),
+            "F32" => Ok(bytes
+                .chunks_exact(4)
+                .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                .collect()),
             other => Err(format!("{name}: unsupported encoder dtype {other}")),
         }
     }
     fn scalar(&self, name: &str) -> Result<f32, String> {
-        self.f32s(name)?.first().copied().ok_or_else(|| format!("{name} is empty"))
+        self.f32s(name)?
+            .first()
+            .copied()
+            .ok_or_else(|| format!("{name} is empty"))
     }
     fn bf16_raw(&self, name: &str) -> Result<Vec<u8>, String> {
         let (dtype, bytes) = self.reader.read(name)?;
@@ -72,7 +84,11 @@ impl Ckpt {
             "BF16" => Ok(bytes),
             "F32" => Ok(bytes
                 .chunks_exact(4)
-                .flat_map(|b| ((round_bf16(f32::from_le_bytes([b[0], b[1], b[2], b[3]])).to_bits() >> 16) as u16).to_le_bytes())
+                .flat_map(|b| {
+                    ((round_bf16(f32::from_le_bytes([b[0], b[1], b[2], b[3]])).to_bits() >> 16)
+                        as u16)
+                        .to_le_bytes()
+                })
                 .collect()),
             other => Err(format!("{name}: unsupported encoder dtype {other}")),
         }
@@ -129,26 +145,34 @@ impl Seq {
     }
 
     fn weight_bf16(&mut self, name: &str, elements: u64) -> u32 {
-        self.init.entry(name.to_string()).or_insert_with(|| Init::Bf16(name.to_string()));
+        self.init
+            .entry(name.to_string())
+            .or_insert_with(|| Init::Bf16(name.to_string()));
         self.p().declare(name, elements * 2)
     }
 
     fn weight_f32(&mut self, ckpt_name: &str, elements: u64) -> u32 {
         let name = format!("{ckpt_name}.f32");
-        self.init.entry(name.clone()).or_insert_with(|| Init::F32(ckpt_name.to_string()));
+        self.init
+            .entry(name.clone())
+            .or_insert_with(|| Init::F32(ckpt_name.to_string()));
         self.p().declare(&name, elements * 4)
     }
 
     fn constant(&mut self, name: &str, values: Vec<f32>) -> u32 {
         let bytes = values.len() as u64 * 4;
-        self.init.entry(name.to_string()).or_insert_with(|| Init::Bytes(f32_le(&values)));
+        self.init
+            .entry(name.to_string())
+            .or_insert_with(|| Init::Bytes(f32_le(&values)));
         self.p().declare(name, bytes)
     }
 
     fn constant_u32(&mut self, name: &str, values: &[u32]) -> u32 {
         let bytes = values.len() as u64 * 4;
         let raw: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
-        self.init.entry(name.to_string()).or_insert_with(|| Init::Bytes(raw));
+        self.init
+            .entry(name.to_string())
+            .or_insert_with(|| Init::Bytes(raw));
         self.p().declare(name, bytes)
     }
 
@@ -157,18 +181,33 @@ impl Seq {
         e.output
     }
 
-    fn unary(&mut self, x: u32, out: Option<&str>, rows: u32, width: u32, kind: u32, p0: f32, p1: f32) -> Result<u32, String> {
+    fn unary(
+        &mut self,
+        x: u32,
+        out: Option<&str>,
+        rows: u32,
+        width: u32,
+        kind: u32,
+        p0: f32,
+        p1: f32,
+    ) -> Result<u32, String> {
         let deps = self.deps();
         let output = match out {
             Some(name) => self.t(name, u64::from(rows) * u64::from(width)),
             None => x,
         };
         let elements = u64::from(rows) * u64::from(width);
-        let e = self.p().raw(DevOp::UnaryF32, elements.div_ceil(2048), &deps, output, |d| {
-            d.t[..3].copy_from_slice(&[output, x, TENSOR_NONE]);
-            d.i[..5].copy_from_slice(&[rows, width, kind, 0, 0]);
-            d.f = [p0, p1];
-        })?;
+        let e = self.p().raw(
+            DevOp::UnaryF32,
+            elements.div_ceil(2048),
+            &deps,
+            output,
+            |d| {
+                d.t[..3].copy_from_slice(&[output, x, TENSOR_NONE]);
+                d.i[..5].copy_from_slice(&[rows, width, kind, 0, 0]);
+                d.f = [p0, p1];
+            },
+        )?;
         Ok(self.done(e))
     }
 
@@ -176,7 +215,14 @@ impl Seq {
         self.unary(x, None, rows, width, ACT_ROUND_BF16, 0.0, 0.0)
     }
 
-    fn clamp(&mut self, x: u32, out: Option<&str>, rows: u32, width: u32, clip: Option<Clip>) -> Result<u32, String> {
+    fn clamp(
+        &mut self,
+        x: u32,
+        out: Option<&str>,
+        rows: u32,
+        width: u32,
+        clip: Option<Clip>,
+    ) -> Result<u32, String> {
         match clip {
             Some(c) => self.unary(x, out, rows, width, ACT_CLAMP, c.lo, c.hi),
             None => Ok(x),
@@ -185,7 +231,16 @@ impl Seq {
 
     /// `out = x . W^T (+ bias)`, bf16 weights, rounded to bf16 like a bf16 torch Linear.
     #[allow(clippy::too_many_arguments)]
-    fn dense(&mut self, x: u32, out: &str, rows: u32, k: u32, n: u32, weight: &str, bias: Option<&str>) -> Result<u32, String> {
+    fn dense(
+        &mut self,
+        x: u32,
+        out: &str,
+        rows: u32,
+        k: u32,
+        n: u32,
+        weight: &str,
+        bias: Option<&str>,
+    ) -> Result<u32, String> {
         let deps = self.deps();
         let w = self.weight_bf16(weight, u64::from(n) * u64::from(k));
         let b = bias.map(|name| self.weight_f32(name, u64::from(n)));
@@ -212,7 +267,16 @@ impl Seq {
 
     /// Dense with a computed f32 weight (`[n][k]`, rounded to bf16 by the caller when it must be).
     #[allow(clippy::too_many_arguments)]
-    fn dense_f32w(&mut self, x: u32, out: &str, rows: u32, k: u32, n: u32, weight: u32, bf16_exact: bool) -> Result<u32, String> {
+    fn dense_f32w(
+        &mut self,
+        x: u32,
+        out: &str,
+        rows: u32,
+        k: u32,
+        n: u32,
+        weight: u32,
+        bf16_exact: bool,
+    ) -> Result<u32, String> {
         let deps = self.deps();
         let e = self.p().dense_f32(
             x,
@@ -255,13 +319,24 @@ impl Seq {
 
     /// Grouped RMSNorm (RmsNormF32), bf16-rounded output.
     #[allow(clippy::too_many_arguments)]
-    fn rms(&mut self, x: u32, out: Option<&str>, rows: u32, groups: u32, width: u32, gamma: Option<&str>, eps: f32) -> Result<u32, String> {
+    fn rms(
+        &mut self,
+        x: u32,
+        out: Option<&str>,
+        rows: u32,
+        groups: u32,
+        width: u32,
+        gamma: Option<&str>,
+        eps: f32,
+    ) -> Result<u32, String> {
         let deps = self.deps();
         let output = match out {
             Some(name) => self.t(name, u64::from(rows) * u64::from(groups * width)),
             None => x,
         };
-        let g = gamma.map(|name| self.weight_f32(name, u64::from(width))).unwrap_or(TENSOR_NONE);
+        let g = gamma
+            .map(|name| self.weight_f32(name, u64::from(width)))
+            .unwrap_or(TENSOR_NONE);
         let units = (u64::from(rows) * u64::from(groups)).div_ceil(8);
         let e = self.p().raw(DevOp::RmsNormF32, units, &deps, output, |d| {
             d.t[..3].copy_from_slice(&[output, x, g]);
@@ -286,32 +361,70 @@ impl Seq {
     ) -> Result<u32, String> {
         let deps = self.deps();
         let output = self.t(out, u64::from(rows) * u64::from(width));
-        let g = gamma.map(|n| self.weight_f32(n, u64::from(width))).unwrap_or(TENSOR_NONE);
-        let b = beta.map(|n| self.weight_f32(n, u64::from(width))).unwrap_or(TENSOR_NONE);
-        let e = self.p().raw(DevOp::LayerNormF32, u64::from(rows).div_ceil(8), &deps, output, |d| {
-            d.t[..5].copy_from_slice(&[output, x, g, b, TENSOR_NONE]);
-            d.i[..3].copy_from_slice(&[rows, width, 1 | (act << 4)]);
-            d.f[0] = eps;
-        })?;
+        let g = gamma
+            .map(|n| self.weight_f32(n, u64::from(width)))
+            .unwrap_or(TENSOR_NONE);
+        let b = beta
+            .map(|n| self.weight_f32(n, u64::from(width)))
+            .unwrap_or(TENSOR_NONE);
+        let e = self.p().raw(
+            DevOp::LayerNormF32,
+            u64::from(rows).div_ceil(8),
+            &deps,
+            output,
+            |d| {
+                d.t[..5].copy_from_slice(&[output, x, g, b, TENSOR_NONE]);
+                d.i[..3].copy_from_slice(&[rows, width, 1 | (act << 4)]);
+                d.f[0] = eps;
+            },
+        )?;
         Ok(self.done(e))
     }
 
     /// `out = a op b` over `[items][rows][width]` with `b` strided; bf16-rounded afterwards.
     #[allow(clippy::too_many_arguments)]
-    fn binary(&mut self, a: u32, b: u32, out: Option<&str>, op: u32, dims: [u32; 3], b_strides: [u32; 3], round: bool) -> Result<u32, String> {
+    fn binary(
+        &mut self,
+        a: u32,
+        b: u32,
+        out: Option<&str>,
+        op: u32,
+        dims: [u32; 3],
+        b_strides: [u32; 3],
+        round: bool,
+    ) -> Result<u32, String> {
         let deps = self.deps();
         let elements = dims.iter().map(|&v| u64::from(v)).product::<u64>();
         let output = match out {
             Some(name) => self.t(name, elements),
             None => a,
         };
-        let e = self.p().raw(DevOp::BinaryF32, elements.div_ceil(2048), &deps, output, |d| {
-            d.t[..3].copy_from_slice(&[output, a, b]);
-            d.i = [dims[0], dims[1], dims[2], op, b_strides[0], b_strides[1], b_strides[2], 0];
-        })?;
+        let e = self.p().raw(
+            DevOp::BinaryF32,
+            elements.div_ceil(2048),
+            &deps,
+            output,
+            |d| {
+                d.t[..3].copy_from_slice(&[output, a, b]);
+                d.i = [
+                    dims[0],
+                    dims[1],
+                    dims[2],
+                    op,
+                    b_strides[0],
+                    b_strides[1],
+                    b_strides[2],
+                    0,
+                ];
+            },
+        )?;
         let y = self.done(e);
         if round {
-            self.round(y, 1, u32::try_from(elements).map_err(|_| "binary too large")?)
+            self.round(
+                y,
+                1,
+                u32::try_from(elements).map_err(|_| "binary too large")?,
+            )
         } else {
             Ok(y)
         }
@@ -457,10 +570,16 @@ pub struct Towers {
 }
 
 fn u(v: &Value, key: &str) -> Result<u32, String> {
-    v[key].as_u64().and_then(|x| u32::try_from(x).ok()).ok_or_else(|| format!("config field {key} missing"))
+    v[key]
+        .as_u64()
+        .and_then(|x| u32::try_from(x).ok())
+        .ok_or_else(|| format!("config field {key} missing"))
 }
 fn f(v: &Value, key: &str) -> Result<f32, String> {
-    v[key].as_f64().map(|x| x as f32).ok_or_else(|| format!("config field {key} missing"))
+    v[key]
+        .as_f64()
+        .map(|x| x as f32)
+        .ok_or_else(|| format!("config field {key} missing"))
 }
 
 impl Towers {
@@ -468,8 +587,10 @@ impl Towers {
     /// never a silent text-only build.
     pub fn from_checkpoint(dir: &std::path::Path) -> Result<Self, String> {
         let json = |file: &str| -> Result<Value, String> {
-            serde_json::from_slice(&std::fs::read(dir.join(file)).map_err(|e| format!("{file}: {e}"))?)
-                .map_err(|e| format!("{file}: {e}"))
+            serde_json::from_slice(
+                &std::fs::read(dir.join(file)).map_err(|e| format!("{file}: {e}"))?,
+            )
+            .map_err(|e| format!("{file}: {e}"))
         };
         let config = json("config.json")?;
         let processor = json("processor_config.json").unwrap_or(Value::Null);
@@ -480,7 +601,11 @@ impl Towers {
         let image_spans = match text["use_bidirectional_attention"].as_str() {
             None => false,
             Some("vision") => true,
-            Some(other) => return Err(format!("use_bidirectional_attention {other:?} has no multimodal lowering")),
+            Some(other) => {
+                return Err(format!(
+                    "use_bidirectional_attention {other:?} has no multimodal lowering"
+                ))
+            }
         };
         let vision = match config["vision_config"]["model_type"].as_str() {
             None => None,
@@ -495,7 +620,8 @@ impl Towers {
                     pos_size: u(v, "mm_posemb_size")?,
                     eps: f(v, "rms_norm_eps")?,
                     text_hidden,
-                    max_soft_tokens: u(image, "max_soft_tokens").or_else(|_| u(v, "num_soft_tokens"))?,
+                    max_soft_tokens: u(image, "max_soft_tokens")
+                        .or_else(|_| u(v, "num_soft_tokens"))?,
                     prefix: "model.vision_embedder.".into(),
                     embed: "model.embed_vision.".into(),
                 }))
@@ -503,7 +629,10 @@ impl Towers {
             Some("gemma4_vision") => {
                 let v = &config["vision_config"];
                 let image = &processor["image_processor"];
-                if v["rope_parameters"]["rope_type"].as_str().is_some_and(|t| t != "default" && t != "axial") {
+                if v["rope_parameters"]["rope_type"]
+                    .as_str()
+                    .is_some_and(|t| t != "default" && t != "axial")
+                {
                     return Err("gemma4_vision: unsupported rope type".into());
                 }
                 Some(Vision::Tower(VisionTower {
@@ -520,19 +649,23 @@ impl Towers {
                     clipped: v["use_clipped_linears"].as_bool().unwrap_or(false),
                     standardize: v["standardize"].as_bool().unwrap_or(false),
                     text_hidden,
-                    max_soft_tokens: u(image, "max_soft_tokens").or_else(|_| u(&config, "vision_soft_tokens_per_image"))?,
+                    max_soft_tokens: u(image, "max_soft_tokens")
+                        .or_else(|_| u(&config, "vision_soft_tokens_per_image"))?,
                     prefix: "model.vision_tower.".into(),
                     embed: "model.embed_vision.".into(),
                 }))
             }
-            Some(other) => return Err(format!("vision tower {other:?} has no multimodal lowering")),
+            Some(other) => {
+                return Err(format!("vision tower {other:?} has no multimodal lowering"))
+            }
         };
         let audio = match config["audio_config"]["model_type"].as_str() {
             None => None,
             Some("gemma4_unified_audio") => {
                 let a = &config["audio_config"];
                 Some(Audio::Frames(FrameAudio {
-                    samples: u(&processor["feature_extractor"], "audio_samples_per_token").or_else(|_| u(a, "audio_embed_dim"))?,
+                    samples: u(&processor["feature_extractor"], "audio_samples_per_token")
+                        .or_else(|_| u(a, "audio_embed_dim"))?,
                     eps: f(a, "rms_norm_eps")?,
                     text_hidden,
                     embed: "model.embed_audio.".into(),
@@ -581,7 +714,13 @@ impl Towers {
                 return Err(format!("vision head_dim {} has no attention lowering (64, or a multiple of 8 up to 128)", v.head_dim));
             }
         }
-        Ok(Self { vision, image_spans, audio, config, processor })
+        Ok(Self {
+            vision,
+            image_spans,
+            audio,
+            config,
+            processor,
+        })
     }
 
     pub fn is_empty(&self) -> bool {
@@ -609,10 +748,17 @@ impl Towers {
             let rescale = image["rescale_factor"].as_f64().unwrap_or(1.0 / 255.0) as f32;
             params.insert("rescale_f32".into(), u64::from(rescale.to_bits()));
             params.insert("resample".into(), image["resample"].as_u64().unwrap_or(3));
-            params.insert("normalize".into(), u64::from(image["do_normalize"].as_bool().unwrap_or(false)));
+            params.insert(
+                "normalize".into(),
+                u64::from(image["do_normalize"].as_bool().unwrap_or(false)),
+            );
             for (k, key) in [("mean", "image_mean"), ("std", "image_std")] {
                 for ch in 0..3 {
-                    let value = image[key][ch].as_f64().unwrap_or(if k == "mean" { 0.0 } else { 1.0 }) as f32;
+                    let value =
+                        image[key][ch]
+                            .as_f64()
+                            .unwrap_or(if k == "mean" { 0.0 } else { 1.0 })
+                            as f32;
                     params.insert(format!("{k}{ch}_f32"), u64::from(value.to_bits()));
                 }
             }
@@ -624,15 +770,25 @@ impl Towers {
                 end: id("eoi_token_id"),
                 processor: "aspect_patches".into(),
                 parameters: params,
-                attention: if self.image_spans { MediaAttention::BidirectionalSpan } else { MediaAttention::Causal },
+                attention: if self.image_spans {
+                    MediaAttention::BidirectionalSpan
+                } else {
+                    MediaAttention::Causal
+                },
             });
         }
         if let Some(Audio::Frames(a)) = &self.audio {
             let fe = &self.processor["feature_extractor"];
             let mut params = BTreeMap::new();
-            params.insert("sample_rate".into(), fe["sampling_rate"].as_u64().unwrap_or(16_000));
+            params.insert(
+                "sample_rate".into(),
+                fe["sampling_rate"].as_u64().unwrap_or(16_000),
+            );
             params.insert("frame_samples".into(), u64::from(a.samples));
-            params.insert("max_soft_tokens".into(), self.processor["audio_seq_length"].as_u64().unwrap_or(750));
+            params.insert(
+                "max_soft_tokens".into(),
+                self.processor["audio_seq_length"].as_u64().unwrap_or(750),
+            );
             modalities.push(MmModality {
                 kind: "audio".into(),
                 packet: AUDIO_PACKET.into(),
@@ -648,7 +804,9 @@ impl Towers {
             let fe = &self.processor["feature_extractor"];
             let mut params = BTreeMap::new();
             let get = |key: &str, default: u64| fe[key].as_u64().unwrap_or(default);
-            let getf = |key: &str, default: f64| u64::from((fe[key].as_f64().unwrap_or(default) as f32).to_bits());
+            let getf = |key: &str, default: f64| {
+                u64::from((fe[key].as_f64().unwrap_or(default) as f32).to_bits())
+            };
             params.insert("sample_rate".into(), get("sampling_rate", 16_000));
             params.insert("frame_length".into(), get("frame_length", 320));
             params.insert("hop_length".into(), get("hop_length", 160));
@@ -660,7 +818,10 @@ impl Towers {
             params.insert("pad_multiple".into(), 128);
             params.insert("max_samples".into(), 480_000);
             params.insert("subsample".into(), 4);
-            params.insert("max_soft_tokens".into(), self.processor["audio_seq_length"].as_u64().unwrap_or(750));
+            params.insert(
+                "max_soft_tokens".into(),
+                self.processor["audio_seq_length"].as_u64().unwrap_or(750),
+            );
             if fe["preemphasis"].as_f64().unwrap_or(0.0) != 0.0
                 || fe["dither"].as_f64().unwrap_or(0.0) != 0.0
                 || !fe["per_bin_mean"].is_null()
@@ -691,12 +852,24 @@ impl Towers {
         })
     }
 
-    pub fn lower_vision(&self, dir: &std::path::Path, n_cu: u32, target: u32, images: &[u32]) -> Result<Sidecar, String> {
-        let ckpt = Ckpt { reader: TensorReader::open(dir)? };
+    pub fn lower_vision(
+        &self,
+        dir: &std::path::Path,
+        n_cu: u32,
+        target: u32,
+        images: &[u32],
+    ) -> Result<Sidecar, String> {
+        let ckpt = Ckpt {
+            reader: TensorReader::open(dir)?,
+        };
         let mut images: Vec<u32> = images.to_vec();
         images.sort_unstable_by(|a, b| b.cmp(a));
         images.dedup();
-        let v = match self.vision.as_ref().ok_or("checkpoint has no vision tower")? {
+        let v = match self
+            .vision
+            .as_ref()
+            .ok_or("checkpoint has no vision tower")?
+        {
             Vision::Tower(v) => v,
             Vision::Embedder(e) => return lower_embedder(e, &ckpt, n_cu, target, &images),
         };
@@ -713,19 +886,52 @@ impl Towers {
             let max = images[0];
             let patches = max * v.max_soft_tokens * v.pool * v.pool;
             let tensors = [
-                ("posx", "in.mm.v.posx", PipelineDType::U32, vec![u64::from(patches)]),
-                ("posy", "in.mm.v.posy", PipelineDType::U32, vec![u64::from(patches)]),
-                ("rope", "in.mm.v.rope", PipelineDType::U32, vec![u64::from(patches), 2]),
-                ("valid", "in.mm.v.valid", PipelineDType::U32, vec![u64::from(max)]),
+                (
+                    "posx",
+                    "in.mm.v.posx",
+                    PipelineDType::U32,
+                    vec![u64::from(patches)],
+                ),
+                (
+                    "posy",
+                    "in.mm.v.posy",
+                    PipelineDType::U32,
+                    vec![u64::from(patches)],
+                ),
+                (
+                    "rope",
+                    "in.mm.v.rope",
+                    PipelineDType::U32,
+                    vec![u64::from(patches), 2],
+                ),
+                (
+                    "valid",
+                    "in.mm.v.valid",
+                    PipelineDType::U32,
+                    vec![u64::from(max)],
+                ),
             ];
             add_tensors(pipeline, prefix, &tensors)?;
-            let pools: Vec<(String, String)> =
-                (0..v.pool * v.pool).map(|j| (format!("pool.{j}"), format!("in.mm.v.pool.{j}"))).collect();
+            let pools: Vec<(String, String)> = (0..v.pool * v.pool)
+                .map(|j| (format!("pool.{j}"), format!("in.mm.v.pool.{j}")))
+                .collect();
             for (key, name) in &pools {
-                add_tensors(pipeline, prefix, &[(key, name, PipelineDType::U32, vec![u64::from(max * v.max_soft_tokens)])])?;
+                add_tensors(
+                    pipeline,
+                    prefix,
+                    &[(
+                        key,
+                        name,
+                        PipelineDType::U32,
+                        vec![u64::from(max * v.max_soft_tokens)],
+                    )],
+                )?;
             }
             let p = &mut pipeline.parameters;
-            p.insert("item_rows".into(), u64::from(v.max_soft_tokens * v.pool * v.pool));
+            p.insert(
+                "item_rows".into(),
+                u64::from(v.max_soft_tokens * v.pool * v.pool),
+            );
             p.insert("item_tokens".into(), u64::from(v.max_soft_tokens));
             p.insert("patch_values".into(), u64::from(3 * v.patch * v.patch));
             p.insert("pool".into(), u64::from(v.pool));
@@ -739,8 +945,16 @@ impl Towers {
         })
     }
 
-    pub fn lower_audio(&self, dir: &std::path::Path, n_cu: u32, target: u32, frames: &[u32]) -> Result<Sidecar, String> {
-        let ckpt = Ckpt { reader: TensorReader::open(dir)? };
+    pub fn lower_audio(
+        &self,
+        dir: &std::path::Path,
+        n_cu: u32,
+        target: u32,
+        frames: &[u32],
+    ) -> Result<Sidecar, String> {
+        let ckpt = Ckpt {
+            reader: TensorReader::open(dir)?,
+        };
         let a = match self.audio.as_ref().ok_or("checkpoint has no audio tower")? {
             Audio::Conformer(a) => a,
             Audio::Frames(a) => return lower_frames(a, &ckpt, n_cu, target, frames),
@@ -760,7 +974,12 @@ impl Towers {
         finish_sidecar(seq, &ckpt, programs, "audio", |pipeline, prefix| {
             let max = frames[0];
             let tensors = [
-                ("mask1", "in.mm.a.mask1", PipelineDType::F32, vec![u64::from(max / 2)]),
+                (
+                    "mask1",
+                    "in.mm.a.mask1",
+                    PipelineDType::F32,
+                    vec![u64::from(max / 2)],
+                ),
                 ("valid", "in.mm.a.valid", PipelineDType::U32, vec![1]),
             ];
             add_tensors(pipeline, prefix, &tensors)?;
@@ -775,7 +994,13 @@ impl Towers {
 }
 
 /// Encoder-free audio: rungs hold `mel frames / 4` tokens (the conformer's seconds per rung).
-fn lower_frames(a: &FrameAudio, ckpt: &Ckpt, n_cu: u32, target: u32, frames: &[u32]) -> Result<Sidecar, String> {
+fn lower_frames(
+    a: &FrameAudio,
+    ckpt: &Ckpt,
+    n_cu: u32,
+    target: u32,
+    frames: &[u32],
+) -> Result<Sidecar, String> {
     let mut tokens: Vec<u32> = frames.iter().map(|f| f.div_ceil(4).max(1)).collect();
     tokens.sort_unstable_by(|a, b| b.cmp(a));
     tokens.dedup();
@@ -786,7 +1011,15 @@ fn lower_frames(a: &FrameAudio, ckpt: &Ckpt, n_cu: u32, target: u32, frames: &[u
         seq.tag = n;
         let x = seq.t("in.mm.a.frames", u64::from(n * a.samples));
         seq.rms(x, None, n, 1, a.samples, None, a.eps)?;
-        let out = seq.dense(x, "act.mm.a.out", n, a.samples, a.text_hidden, &format!("{}embedding_projection.weight", a.embed), None)?;
+        let out = seq.dense(
+            x,
+            "act.mm.a.out",
+            n,
+            a.samples,
+            a.text_hidden,
+            &format!("{}embedding_projection.weight", a.embed),
+            None,
+        )?;
         seq.cut();
         let prefix = seq.prefix.as_mut().unwrap();
         prefix.output = out;
@@ -804,7 +1037,13 @@ fn lower_frames(a: &FrameAudio, ckpt: &Ckpt, n_cu: u32, target: u32, frames: &[u
 
 /// Encoder-free vision: rungs hold `images` images of `max_soft_tokens` pixel squares each, one
 /// soft token per square (posx/posy u32::MAX on padding rows, which the runtime never reads).
-fn lower_embedder(v: &VisionEmbedder, ckpt: &Ckpt, n_cu: u32, target: u32, images: &[u32]) -> Result<Sidecar, String> {
+fn lower_embedder(
+    v: &VisionEmbedder,
+    ckpt: &Ckpt,
+    n_cu: u32,
+    target: u32,
+    images: &[u32],
+) -> Result<Sidecar, String> {
     const LN_EPS: f32 = 1e-5; // torch.nn.LayerNorm's default, which the checkpoint keeps
     let values = 3 * v.side * v.side;
     let (pre, d) = (&v.prefix, v.embed_dim);
@@ -814,7 +1053,13 @@ fn lower_embedder(v: &VisionEmbedder, ckpt: &Ckpt, n_cu: u32, target: u32, image
     }
     // `[pos][axis][dim]` -> one `[pos][dim]` table per axis.
     let axis = |a: usize| -> Vec<f32> {
-        table.chunks_exact(d as usize).skip(a).step_by(2).flatten().copied().collect()
+        table
+            .chunks_exact(d as usize)
+            .skip(a)
+            .step_by(2)
+            .flatten()
+            .copied()
+            .collect()
     };
     let (tx_values, ty_values) = (axis(0), axis(1));
     let mut seq = new_seq(n_cu, target);
@@ -828,8 +1073,25 @@ fn lower_embedder(v: &VisionEmbedder, ckpt: &Ckpt, n_cu: u32, target: u32, image
         let posy = seq.p().declare("in.mm.v.posy", u64::from(rows) * 4);
         let ln = |name: &str| (format!("{pre}{name}.weight"), format!("{pre}{name}.bias"));
         let (g1, b1) = ln("patch_ln1");
-        let x = seq.layer_norm(px, "act.mm.v.ln1", rows, values, Some(&g1), Some(&b1), LN_EPS, 0)?;
-        let x = seq.dense(x, "act.mm.v.h", rows, values, d, &format!("{pre}patch_dense.weight"), Some(&format!("{pre}patch_dense.bias")))?;
+        let x = seq.layer_norm(
+            px,
+            "act.mm.v.ln1",
+            rows,
+            values,
+            Some(&g1),
+            Some(&b1),
+            LN_EPS,
+            0,
+        )?;
+        let x = seq.dense(
+            x,
+            "act.mm.v.h",
+            rows,
+            values,
+            d,
+            &format!("{pre}patch_dense.weight"),
+            Some(&format!("{pre}patch_dense.bias")),
+        )?;
         let (g2, b2) = ln("patch_ln2");
         let mut x = seq.layer_norm(x, "act.mm.v.ln2", rows, d, Some(&g2), Some(&b2), LN_EPS, 0)?;
         let tx = seq.constant(&format!("{pre}pos_embedding.x"), tx_values.clone());
@@ -842,7 +1104,15 @@ fn lower_embedder(v: &VisionEmbedder, ckpt: &Ckpt, n_cu: u32, target: u32, image
         let (g3, b3) = ln("pos_norm");
         let x = seq.layer_norm(x, "act.mm.v.ln3", rows, d, Some(&g3), Some(&b3), LN_EPS, 0)?;
         seq.rms(x, None, rows, 1, d, None, v.eps)?;
-        let out = seq.dense(x, "act.mm.v.out", rows, d, v.text_hidden, &format!("{}embedding_projection.weight", v.embed), None)?;
+        let out = seq.dense(
+            x,
+            "act.mm.v.out",
+            rows,
+            d,
+            v.text_hidden,
+            &format!("{}embedding_projection.weight", v.embed),
+            None,
+        )?;
         seq.cut();
         let prefix = seq.prefix.as_mut().unwrap();
         prefix.output = out;
@@ -886,7 +1156,13 @@ fn new_seq(n_cu: u32, target: u32) -> Seq {
         gen: Vec::new(),
     };
     Seq {
-        prefix: Some(PacketPrefix { model, programs: Vec::new(), input: 0, output: 0, input_shape: Vec::new() }),
+        prefix: Some(PacketPrefix {
+            model,
+            programs: Vec::new(),
+            input: 0,
+            output: 0,
+            input_shape: Vec::new(),
+        }),
         program: None,
         last: None,
         init: BTreeMap::new(),
@@ -903,7 +1179,14 @@ fn add_tensors(
         if !prefix.model.tensors.iter().any(|t| t.name == *name) {
             return Err(format!("encoder tensor {name} was never declared"));
         }
-        pipeline.tensors.insert((*key).into(), PipelineTensor { name: (*name).into(), dtype: *dtype, shape: shape.clone() });
+        pipeline.tensors.insert(
+            (*key).into(),
+            PipelineTensor {
+                name: (*name).into(),
+                dtype: *dtype,
+                shape: shape.clone(),
+            },
+        );
     }
     Ok(())
 }
@@ -918,14 +1201,21 @@ fn finish_sidecar(
     let Seq { prefix, init, .. } = seq;
     let mut prefix = prefix.ok_or("encoder has no programs")?;
     for tensor in &mut prefix.model.tensors {
-        let Some(source) = init.get(&tensor.name) else { continue };
+        let Some(source) = init.get(&tensor.name) else {
+            continue;
+        };
         let bytes = match source {
             Init::Bf16(name) => ckpt.bf16_raw(name)?,
             Init::F32(name) => f32_le(&ckpt.f32s(name)?),
             Init::Bytes(bytes) => bytes.clone(),
         };
         if bytes.len() as u64 != tensor.bytes {
-            return Err(format!("{}: {} bytes, the encoder expects {}", tensor.name, bytes.len(), tensor.bytes));
+            return Err(format!(
+                "{}: {} bytes, the encoder expects {}",
+                tensor.name,
+                bytes.len(),
+                tensor.bytes
+            ));
         }
         tensor.init = Some(bytes);
     }
@@ -935,30 +1225,52 @@ fn finish_sidecar(
     // Flat shapes over the largest rung's (shared, max-sized) tensors.
     prefix.input_shape = vec![prefix.model.tensors[prefix.input as usize].bytes / 4];
     let output_shape = vec![prefix.model.tensors[prefix.output as usize].bytes / 4];
-    let section = prefix.forward_pipeline_section(PIPELINE, PipelineDType::F32, PipelineDType::F32, output_shape)?;
-    let mut metadata: PacketPipelines = serde_json::from_slice(&section.data).map_err(|e| e.to_string())?;
-    let pipeline = metadata.pipelines.first_mut().ok_or("encoder pipeline missing")?;
+    let section = prefix.forward_pipeline_section(
+        PIPELINE,
+        PipelineDType::F32,
+        PipelineDType::F32,
+        output_shape,
+    )?;
+    let mut metadata: PacketPipelines =
+        serde_json::from_slice(&section.data).map_err(|e| e.to_string())?;
+    let pipeline = metadata
+        .pipelines
+        .first_mut()
+        .ok_or("encoder pipeline missing")?;
     for (capacity, programs) in &programs {
         for (stage, &program) in programs.iter().enumerate() {
-            pipeline.programs.insert(format!("forward.{capacity}.{stage}"), program as u32);
+            pipeline
+                .programs
+                .insert(format!("forward.{capacity}.{stage}"), program as u32);
         }
     }
     pipeline.strings.insert("modality".into(), modality.into());
     extra(pipeline, &prefix)?;
     let mut section = section;
     section.data = serde_json::to_vec(&metadata).map_err(|e| e.to_string())?;
-    Ok(Sidecar { model: prefix.model, section })
+    Ok(Sidecar {
+        model: prefix.model,
+        section,
+    })
 }
 
 fn clip(ckpt: &Ckpt, on: bool, linear: &str, side: &str) -> Result<Option<Clip>, String> {
     if !on {
         return Ok(None);
     }
-    Ok(Some(Clip { lo: ckpt.scalar(&format!("{linear}.{side}_min"))?, hi: ckpt.scalar(&format!("{linear}.{side}_max"))? }))
+    Ok(Some(Clip {
+        lo: ckpt.scalar(&format!("{linear}.{side}_min"))?,
+        hi: ckpt.scalar(&format!("{linear}.{side}_max"))?,
+    }))
 }
 
 /// One vision rung: `images` images of `max_soft_tokens * pool^2` patch rows each.
-fn lower_vision_capacity(seq: &mut Seq, v: &VisionTower, ckpt: &Ckpt, images: u32) -> Result<(), String> {
+fn lower_vision_capacity(
+    seq: &mut Seq,
+    v: &VisionTower,
+    ckpt: &Ckpt,
+    images: u32,
+) -> Result<(), String> {
     let item = v.max_soft_tokens * v.pool * v.pool;
     let rows = images * item;
     let out_rows = images * v.max_soft_tokens;
@@ -970,10 +1282,22 @@ fn lower_vision_capacity(seq: &mut Seq, v: &VisionTower, ckpt: &Ckpt, images: u3
     let posy = seq.p().declare("in.mm.v.posy", u64::from(rows) * 4);
     let rope = seq.p().declare("in.mm.v.rope", u64::from(rows) * 8);
     let valid = seq.p().declare("in.mm.v.valid", u64::from(images) * 4);
-    let pool_index: Vec<u32> =
-        (0..v.pool * v.pool).map(|j| seq.p().declare(&format!("in.mm.v.pool.{j}"), u64::from(out_rows) * 4)).collect();
+    let pool_index: Vec<u32> = (0..v.pool * v.pool)
+        .map(|j| {
+            seq.p()
+                .declare(&format!("in.mm.v.pool.{j}"), u64::from(out_rows) * 4)
+        })
+        .collect();
     let pre = &v.prefix;
-    let mut x = seq.dense(px, "act.mm.v.h", rows, pv, h, &format!("{pre}patch_embedder.input_proj.weight"), None)?;
+    let mut x = seq.dense(
+        px,
+        "act.mm.v.h",
+        rows,
+        pv,
+        h,
+        &format!("{pre}patch_embedder.input_proj.weight"),
+        None,
+    )?;
     // Position table halves as f32 [pos_size][hidden] (x then y).
     let table_name = format!("{pre}patch_embedder.position_embedding_table");
     let table = ckpt.f32s(&table_name)?;
@@ -993,7 +1317,15 @@ fn lower_vision_capacity(seq: &mut Seq, v: &VisionTower, ckpt: &Ckpt, images: u3
     for l in 0..v.layers {
         let lp = format!("{pre}encoder.layers.{l}.");
         let attn = format!("{lp}self_attn.");
-        let n1 = seq.rms(x, Some("act.mm.v.n1"), rows, 1, h, Some(&format!("{lp}input_layernorm.weight")), v.eps)?;
+        let n1 = seq.rms(
+            x,
+            Some("act.mm.v.n1"),
+            rows,
+            1,
+            h,
+            Some(&format!("{lp}input_layernorm.weight")),
+            v.eps,
+        )?;
         let mut qkv = [0u32; 3];
         for (i, name) in ["q_proj", "k_proj", "v_proj"].iter().enumerate() {
             let linear = format!("{attn}{name}");
@@ -1008,16 +1340,38 @@ fn lower_vision_capacity(seq: &mut Seq, v: &VisionTower, ckpt: &Ckpt, images: u3
                 clip(ckpt, v.clipped, &linear, "output")?,
             )?;
         }
-        seq.rms(qkv[0], None, rows, nh, hd, Some(&format!("{attn}q_norm.weight")), v.eps)?;
-        seq.rms(qkv[1], None, rows, nh, hd, Some(&format!("{attn}k_norm.weight")), v.eps)?;
+        seq.rms(
+            qkv[0],
+            None,
+            rows,
+            nh,
+            hd,
+            Some(&format!("{attn}q_norm.weight")),
+            v.eps,
+        )?;
+        seq.rms(
+            qkv[1],
+            None,
+            rows,
+            nh,
+            hd,
+            Some(&format!("{attn}k_norm.weight")),
+            v.eps,
+        )?;
         seq.rms(qkv[2], None, rows, nh, hd, None, v.eps)?;
         for &t in &qkv[..2] {
             let deps = seq.deps();
-            let e = seq.p().raw(DevOp::RopeAxialF32, u64::from(rows * nh * hd / 2).div_ceil(2048), &deps, t, |d| {
-                d.t[..2].copy_from_slice(&[t, rope]);
-                d.i[..7].copy_from_slice(&[rows, nh, hd, 0, 2, 0, 1]);
-                d.f[0] = v.theta;
-            })?;
+            let e = seq.p().raw(
+                DevOp::RopeAxialF32,
+                u64::from(rows * nh * hd / 2).div_ceil(2048),
+                &deps,
+                t,
+                |d| {
+                    d.t[..2].copy_from_slice(&[t, rope]);
+                    d.i[..7].copy_from_slice(&[rows, nh, hd, 0, 2, 0, 1]);
+                    d.f[0] = v.theta;
+                },
+            )?;
             seq.done(e);
         }
         let deps = seq.deps();
@@ -1059,9 +1413,25 @@ fn lower_vision_capacity(seq: &mut Seq, v: &VisionTower, ckpt: &Ckpt, images: u3
             clip(ckpt, v.clipped, &linear, "input")?,
             clip(ckpt, v.clipped, &linear, "output")?,
         )?;
-        seq.rms(o, None, rows, 1, h, Some(&format!("{lp}post_attention_layernorm.weight")), v.eps)?;
+        seq.rms(
+            o,
+            None,
+            rows,
+            1,
+            h,
+            Some(&format!("{lp}post_attention_layernorm.weight")),
+            v.eps,
+        )?;
         x = seq.add(x, o, rows, h)?;
-        let n2 = seq.rms(x, Some("act.mm.v.n2"), rows, 1, h, Some(&format!("{lp}pre_feedforward_layernorm.weight")), v.eps)?;
+        let n2 = seq.rms(
+            x,
+            Some("act.mm.v.n2"),
+            rows,
+            1,
+            h,
+            Some(&format!("{lp}pre_feedforward_layernorm.weight")),
+            v.eps,
+        )?;
         let mlp = format!("{lp}mlp.");
         let mut gu = [0u32; 2];
         for (i, name) in ["gate_proj", "up_proj"].iter().enumerate() {
@@ -1079,7 +1449,15 @@ fn lower_vision_capacity(seq: &mut Seq, v: &VisionTower, ckpt: &Ckpt, images: u3
         }
         seq.unary(gu[0], None, rows, v.inter, ACT_GELU_TANH, 0.0, 0.0)?;
         seq.round(gu[0], rows, v.inter)?;
-        let m = seq.binary(gu[0], gu[1], None, 2, [1, rows, v.inter], [0, v.inter, 1], true)?;
+        let m = seq.binary(
+            gu[0],
+            gu[1],
+            None,
+            2,
+            [1, rows, v.inter],
+            [0, v.inter, 1],
+            true,
+        )?;
         let linear = format!("{mlp}down_proj");
         let d = seq.clipped(
             m,
@@ -1091,7 +1469,15 @@ fn lower_vision_capacity(seq: &mut Seq, v: &VisionTower, ckpt: &Ckpt, images: u3
             clip(ckpt, v.clipped, &linear, "input")?,
             clip(ckpt, v.clipped, &linear, "output")?,
         )?;
-        seq.rms(d, None, rows, 1, h, Some(&format!("{lp}post_feedforward_layernorm.weight")), v.eps)?;
+        seq.rms(
+            d,
+            None,
+            rows,
+            1,
+            h,
+            Some(&format!("{lp}post_feedforward_layernorm.weight")),
+            v.eps,
+        )?;
         x = seq.add(x, d, rows, h)?;
         seq.cut();
     }
@@ -1123,9 +1509,25 @@ fn lower_vision_capacity(seq: &mut Seq, v: &VisionTower, ckpt: &Ckpt, images: u3
         )?;
         seq.done(e);
     }
-    seq.unary(pooled, None, out_rows, h, ACT_SCALE_SHIFT, 1.0 / k2 as f32, 0.0)?;
+    seq.unary(
+        pooled,
+        None,
+        out_rows,
+        h,
+        ACT_SCALE_SHIFT,
+        1.0 / k2 as f32,
+        0.0,
+    )?;
     seq.round(pooled, out_rows, h)?;
-    seq.unary(pooled, None, out_rows, h, ACT_SCALE_SHIFT, (h as f32).sqrt(), 0.0)?;
+    seq.unary(
+        pooled,
+        None,
+        out_rows,
+        h,
+        ACT_SCALE_SHIFT,
+        (h as f32).sqrt(),
+        0.0,
+    )?;
     if v.standardize {
         let bias = seq.weight_f32(&format!("{pre}std_bias"), u64::from(h));
         let scale = seq.weight_f32(&format!("{pre}std_scale"), u64::from(h));
@@ -1134,7 +1536,15 @@ fn lower_vision_capacity(seq: &mut Seq, v: &VisionTower, ckpt: &Ckpt, images: u3
     }
     seq.round(pooled, out_rows, h)?;
     seq.rms(pooled, None, out_rows, 1, h, None, v.eps)?;
-    let out = seq.dense(pooled, "act.mm.v.out", out_rows, h, v.text_hidden, &format!("{}embedding_projection.weight", v.embed), None)?;
+    let out = seq.dense(
+        pooled,
+        "act.mm.v.out",
+        out_rows,
+        h,
+        v.text_hidden,
+        &format!("{}embedding_projection.weight", v.embed),
+        None,
+    )?;
     seq.cut();
     let prefix = seq.prefix.as_mut().unwrap();
     prefix.output = out;
@@ -1168,7 +1578,12 @@ fn softplus(x: f32) -> f32 {
 }
 
 /// One audio rung: `frames` log-mel frames (a multiple of 4) of one clip.
-fn lower_audio_capacity(seq: &mut Seq, a: &AudioTower, ckpt: &Ckpt, frames: u32) -> Result<(), String> {
+fn lower_audio_capacity(
+    seq: &mut Seq,
+    a: &AudioTower,
+    ckpt: &Ckpt,
+    frames: u32,
+) -> Result<(), String> {
     let pre = &a.prefix;
     let (c0, c1) = (a.channels[0], a.channels[1]);
     let (f0, f1, f2) = (a.mel_bins, a.mel_bins / 2, a.mel_bins / 4);
@@ -1187,19 +1602,27 @@ fn lower_audio_capacity(seq: &mut Seq, a: &AudioTower, ckpt: &Ckpt, frames: u32)
                 for dt in 0..3i64 {
                     for df in 0..3i64 {
                         let (ti, fi) = (2 * i64::from(t) + dt - 1, 2 * i64::from(fo) + df - 1);
-                        index.push(if ti < 0 || fi < 0 || ti >= i64::from(t_in) || fi >= i64::from(f_in) {
-                            u32::MAX
-                        } else {
-                            (ti * i64::from(f_in) + fi) as u32
-                        });
+                        index.push(
+                            if ti < 0 || fi < 0 || ti >= i64::from(t_in) || fi >= i64::from(f_in) {
+                                u32::MAX
+                            } else {
+                                (ti * i64::from(f_in) + fi) as u32
+                            },
+                        );
                     }
                 }
             }
         }
         index
     };
-    let idx0 = seq.constant_u32(&format!("const.mm.a.im2col0.{frames}"), &taps(t1, f1, frames, f0));
-    let idx1 = seq.constant_u32(&format!("const.mm.a.im2col1.{frames}"), &taps(t2, f2, t1, f1));
+    let idx0 = seq.constant_u32(
+        &format!("const.mm.a.im2col0.{frames}"),
+        &taps(t1, f1, frames, f0),
+    );
+    let idx1 = seq.constant_u32(
+        &format!("const.mm.a.im2col1.{frames}"),
+        &taps(t2, f2, t1, f1),
+    );
     // Conv weights `[out][in][3][3]` as `[out][(dt*3 + df)*in + i]`, bf16 values in f32.
     let conv_weight = |name: &str, cout: u32, cin: u32| -> Result<Vec<f32>, String> {
         let w = ckpt.f32s(name)?;
@@ -1207,25 +1630,58 @@ fn lower_audio_capacity(seq: &mut Seq, a: &AudioTower, ckpt: &Ckpt, frames: u32)
         for o in 0..cout {
             for i in 0..cin {
                 for k in 0..9 {
-                    out[(o * cin * 9 + k * cin + i) as usize] = w[(o * cin * 9 + i * 9 + k) as usize];
+                    out[(o * cin * 9 + k * cin + i) as usize] =
+                        w[(o * cin * 9 + i * 9 + k) as usize];
                 }
             }
         }
         Ok(out)
     };
     let sub = format!("{pre}subsample_conv_projection.");
-    let w0 = seq.constant(&format!("{sub}layer0.conv.weight.taps"), conv_weight(&format!("{sub}layer0.conv.weight"), c0, 1)?);
-    let w1 = seq.constant(&format!("{sub}layer1.conv.weight.taps"), conv_weight(&format!("{sub}layer1.conv.weight"), c1, c0)?);
+    let w0 = seq.constant(
+        &format!("{sub}layer0.conv.weight.taps"),
+        conv_weight(&format!("{sub}layer0.conv.weight"), c0, 1)?,
+    );
+    let w1 = seq.constant(
+        &format!("{sub}layer1.conv.weight.taps"),
+        conv_weight(&format!("{sub}layer1.conv.weight"), c1, c0)?,
+    );
     let col0 = seq.t("act.mm.a.col0", u64::from(t1 * f1 * 9));
     seq.gather(col0, mel, frames * f0, idx0, t1 * f1 * 9, 1, false)?;
     let y0 = seq.dense_f32w(col0, "act.mm.a.conv0", t1 * f1, 9, c0, w0, true)?;
-    let y0 = seq.layer_norm(y0, "act.mm.a.ln0", t1 * f1, c0, Some(&format!("{sub}layer0.norm.weight")), None, a.eps, ACT_RELU)?;
+    let y0 = seq.layer_norm(
+        y0,
+        "act.mm.a.ln0",
+        t1 * f1,
+        c0,
+        Some(&format!("{sub}layer0.norm.weight")),
+        None,
+        a.eps,
+        ACT_RELU,
+    )?;
     seq.binary(y0, mask1, None, 2, [t1, f1, c0], [1, 0, 0], false)?;
     let col1 = seq.t("act.mm.a.col1", u64::from(t2 * f2 * 9 * c0));
     seq.gather(col1, y0, t1 * f1, idx1, t2 * f2 * 9, c0, false)?;
     let y1 = seq.dense_f32w(col1, "act.mm.a.conv1", t2 * f2, 9 * c0, c1, w1, true)?;
-    let y1 = seq.layer_norm(y1, "act.mm.a.ln1", t2 * f2, c1, Some(&format!("{sub}layer1.norm.weight")), None, a.eps, ACT_RELU)?;
-    let mut x = seq.dense(y1, "act.mm.a.x", t2, f2 * c1, h, &format!("{sub}input_proj_linear.weight"), None)?;
+    let y1 = seq.layer_norm(
+        y1,
+        "act.mm.a.ln1",
+        t2 * f2,
+        c1,
+        Some(&format!("{sub}layer1.norm.weight")),
+        None,
+        a.eps,
+        ACT_RELU,
+    )?;
+    let mut x = seq.dense(
+        y1,
+        "act.mm.a.x",
+        t2,
+        f2 * c1,
+        h,
+        &format!("{sub}input_proj_linear.weight"),
+        None,
+    )?;
     seq.cut();
     let positions = audio_positions(a);
     let npos = (positions.len() / h as usize) as u32;
@@ -1233,7 +1689,15 @@ fn lower_audio_capacity(seq: &mut Seq, a: &AudioTower, ckpt: &Ckpt, frames: u32)
     let q_scale = (dh as f32).powf(-0.5) / std::f32::consts::LN_2;
     let k_scale = (1.0f32 + std::f32::consts::E).ln() / std::f32::consts::LN_2;
     let ffw = |seq: &mut Seq, x: u32, block: &str| -> Result<u32, String> {
-        let n = seq.rms(x, Some("act.mm.a.ffn_in"), t2, 1, h, Some(&format!("{block}pre_layer_norm.weight")), a.eps)?;
+        let n = seq.rms(
+            x,
+            Some("act.mm.a.ffn_in"),
+            t2,
+            1,
+            h,
+            Some(&format!("{block}pre_layer_norm.weight")),
+            a.eps,
+        )?;
         let l1 = format!("{block}ffw_layer_1");
         let y = seq.clipped(
             n,
@@ -1258,7 +1722,15 @@ fn lower_audio_capacity(seq: &mut Seq, a: &AudioTower, ckpt: &Ckpt, frames: u32)
             clip(ckpt, a.clipped, &l2, "input")?,
             clip(ckpt, a.clipped, &l2, "output")?,
         )?;
-        seq.rms(y, None, t2, 1, h, Some(&format!("{block}post_layer_norm.weight")), a.eps)?;
+        seq.rms(
+            y,
+            None,
+            t2,
+            1,
+            h,
+            Some(&format!("{block}post_layer_norm.weight")),
+            a.eps,
+        )?;
         seq.unary(y, None, t2, h, ACT_SCALE_SHIFT, a.residual_weight, 0.0)?;
         seq.round(y, t2, h)?;
         seq.add(x, y, t2, h)
@@ -1267,7 +1739,15 @@ fn lower_audio_capacity(seq: &mut Seq, a: &AudioTower, ckpt: &Ckpt, frames: u32)
         let lp = format!("{pre}layers.{l}.");
         x = ffw(seq, x, &format!("{lp}feed_forward1."))?;
         let attn = format!("{lp}self_attn.");
-        let n = seq.rms(x, Some("act.mm.a.attn_in"), t2, 1, h, Some(&format!("{lp}norm_pre_attn.weight")), a.eps)?;
+        let n = seq.rms(
+            x,
+            Some("act.mm.a.attn_in"),
+            t2,
+            1,
+            h,
+            Some(&format!("{lp}norm_pre_attn.weight")),
+            a.eps,
+        )?;
         let mut qkv = [0u32; 3];
         for (i, name) in ["q_proj", "k_proj", "v_proj"].iter().enumerate() {
             let linear = format!("{attn}{name}");
@@ -1296,16 +1776,34 @@ fn lower_audio_capacity(seq: &mut Seq, a: &AudioTower, ckpt: &Ckpt, frames: u32)
         }
         let relk = seq.constant(&format!("{attn}relative_k.f32"), relk);
         let pds = ckpt.f32s(&format!("{attn}per_dim_scale"))?;
-        let qs: Vec<f32> = pds.iter().map(|&p| q_scale * round_bf16(softplus(p))).collect();
+        let qs: Vec<f32> = pds
+            .iter()
+            .map(|&p| q_scale * round_bf16(softplus(p)))
+            .collect();
         let qs = seq.constant(&format!("{attn}q_scale.f32"), qs);
         let out = seq.t("act.mm.a.attn", u64::from(t2 * h));
         let deps = seq.deps();
         let window = (a.context_left - 1) | (a.context_right << 16);
-        let e = seq.p().raw(DevOp::ChunkAttentionF32, u64::from(t2.div_ceil(a.chunk) * a.heads), &deps, out, |d| {
-            d.t[..7].copy_from_slice(&[out, qkv[0], qkv[1], qkv[2], relk, qs, valid]);
-            d.i = [t2, a.heads, dh, a.chunk, a.context_left - 1, a.context_right, npos, window];
-            d.f = [k_scale, a.softcap];
-        })?;
+        let e = seq.p().raw(
+            DevOp::ChunkAttentionF32,
+            u64::from(t2.div_ceil(a.chunk) * a.heads),
+            &deps,
+            out,
+            |d| {
+                d.t[..7].copy_from_slice(&[out, qkv[0], qkv[1], qkv[2], relk, qs, valid]);
+                d.i = [
+                    t2,
+                    a.heads,
+                    dh,
+                    a.chunk,
+                    a.context_left - 1,
+                    a.context_right,
+                    npos,
+                    window,
+                ];
+                d.f = [k_scale, a.softcap];
+            },
+        )?;
         seq.done(e);
         seq.round(out, t2, h)?;
         let linear = format!("{attn}post");
@@ -1319,11 +1817,27 @@ fn lower_audio_capacity(seq: &mut Seq, a: &AudioTower, ckpt: &Ckpt, frames: u32)
             clip(ckpt, a.clipped, &linear, "input")?,
             clip(ckpt, a.clipped, &linear, "output")?,
         )?;
-        seq.rms(o, None, t2, 1, h, Some(&format!("{lp}norm_post_attn.weight")), a.eps)?;
+        seq.rms(
+            o,
+            None,
+            t2,
+            1,
+            h,
+            Some(&format!("{lp}norm_post_attn.weight")),
+            a.eps,
+        )?;
         x = seq.add(x, o, t2, h)?;
         // Light conv: norm, linear_start, GLU, causal depthwise conv, norm, SiLU, linear_end.
         let lc = format!("{lp}lconv1d.");
-        let n = seq.rms(x, Some("act.mm.a.lc_in"), t2, 1, h, Some(&format!("{lc}pre_layer_norm.weight")), a.eps)?;
+        let n = seq.rms(
+            x,
+            Some("act.mm.a.lc_in"),
+            t2,
+            1,
+            h,
+            Some(&format!("{lc}pre_layer_norm.weight")),
+            a.eps,
+        )?;
         let linear = format!("{lc}linear_start");
         let y = seq.clipped(
             n,
@@ -1337,10 +1851,16 @@ fn lower_audio_capacity(seq: &mut Seq, a: &AudioTower, ckpt: &Ckpt, frames: u32)
         )?;
         let g = seq.t("act.mm.a.lc_glu", u64::from(t2 * h));
         let deps = seq.deps();
-        let e = seq.p().raw(DevOp::GluF32, u64::from(t2 * h).div_ceil(2048), &deps, g, |d| {
-            d.t[..2].copy_from_slice(&[g, y]);
-            d.i[..2].copy_from_slice(&[t2, h]);
-        })?;
+        let e = seq.p().raw(
+            DevOp::GluF32,
+            u64::from(t2 * h).div_ceil(2048),
+            &deps,
+            g,
+            |d| {
+                d.t[..2].copy_from_slice(&[g, y]);
+                d.i[..2].copy_from_slice(&[t2, h]);
+            },
+        )?;
         seq.done(e);
         seq.round(g, t2, h)?;
         // Causal depthwise conv as shifted row gathers times per-channel taps, accumulated in f32
@@ -1352,7 +1872,9 @@ fn lower_audio_capacity(seq: &mut Seq, a: &AudioTower, ckpt: &Ckpt, frames: u32)
         let tap = seq.t("act.mm.a.lc_tap", u64::from(t2 * h));
         for k in 0..kn {
             let shift = kn - 1 - k;
-            let index: Vec<u32> = (0..t2).map(|t| if t >= shift { t - shift } else { u32::MAX }).collect();
+            let index: Vec<u32> = (0..t2)
+                .map(|t| if t >= shift { t - shift } else { u32::MAX })
+                .collect();
             let index = seq.constant_u32(&format!("const.mm.a.shift{shift}.{t2}"), &index);
             let w: Vec<f32> = (0..h).map(|c| wk[(c * kn + k) as usize]).collect();
             let w = seq.constant(&format!("{lc}depthwise_conv1d.tap{k}"), w);
@@ -1364,7 +1886,15 @@ fn lower_audio_capacity(seq: &mut Seq, a: &AudioTower, ckpt: &Ckpt, frames: u32)
             }
         }
         seq.round(cv, t2, h)?;
-        seq.rms(cv, None, t2, 1, h, Some(&format!("{lc}conv_norm.weight")), a.eps)?;
+        seq.rms(
+            cv,
+            None,
+            t2,
+            1,
+            h,
+            Some(&format!("{lc}conv_norm.weight")),
+            a.eps,
+        )?;
         seq.unary(cv, None, t2, h, ACT_SILU, 0.0, 0.0)?;
         seq.round(cv, t2, h)?;
         let linear = format!("{lc}linear_end");
@@ -1380,12 +1910,36 @@ fn lower_audio_capacity(seq: &mut Seq, a: &AudioTower, ckpt: &Ckpt, frames: u32)
         )?;
         x = seq.add(x, y, t2, h)?;
         x = ffw(seq, x, &format!("{lp}feed_forward2."))?;
-        seq.rms(x, None, t2, 1, h, Some(&format!("{lp}norm_out.weight")), a.eps)?;
+        seq.rms(
+            x,
+            None,
+            t2,
+            1,
+            h,
+            Some(&format!("{lp}norm_out.weight")),
+            a.eps,
+        )?;
         seq.cut();
     }
-    let y = seq.dense(x, "act.mm.a.proj", t2, h, a.output_dims, &format!("{pre}output_proj.weight"), Some(&format!("{pre}output_proj.bias")))?;
+    let y = seq.dense(
+        x,
+        "act.mm.a.proj",
+        t2,
+        h,
+        a.output_dims,
+        &format!("{pre}output_proj.weight"),
+        Some(&format!("{pre}output_proj.bias")),
+    )?;
     seq.rms(y, None, t2, 1, a.output_dims, None, a.eps)?;
-    let out = seq.dense(y, "act.mm.a.out", t2, a.output_dims, a.text_hidden, &format!("{}embedding_projection.weight", a.embed), None)?;
+    let out = seq.dense(
+        y,
+        "act.mm.a.out",
+        t2,
+        a.output_dims,
+        a.text_hidden,
+        &format!("{}embedding_projection.weight", a.embed),
+        None,
+    )?;
     seq.cut();
     let prefix = seq.prefix.as_mut().unwrap();
     prefix.output = out;
@@ -1406,12 +1960,20 @@ pub fn contract_section(contract: &MmContract) -> Result<packet::devbuild::Secti
 /// Vision rungs (images per launch) and audio rungs (mel frames), from the emit knobs.
 pub fn ladders() -> (Vec<u32>, Vec<u32>) {
     let parse = |s: Option<&str>, default: &[u32]| -> Vec<u32> {
-        s.map(|s| s.split(',').filter_map(|v| v.trim().parse().ok()).filter(|&v| v > 0).collect())
-            .filter(|v: &Vec<u32>| !v.is_empty())
-            .unwrap_or_else(|| default.to_vec())
+        s.map(|s| {
+            s.split(',')
+                .filter_map(|v| v.trim().parse().ok())
+                .filter(|&v| v > 0)
+                .collect()
+        })
+        .filter(|v: &Vec<u32>| !v.is_empty())
+        .unwrap_or_else(|| default.to_vec())
     };
     let cfg = crate::emit_config::active();
-    (parse(cfg.mm_vision_ladder.as_deref(), &[1, 2]), parse(cfg.mm_audio_ladder.as_deref(), &[400, 1000, 2000, 3000]))
+    (
+        parse(cfg.mm_vision_ladder.as_deref(), &[1, 2]),
+        parse(cfg.mm_audio_ladder.as_deref(), &[400, 1000, 2000, 3000]),
+    )
 }
 
 #[cfg(test)]
@@ -1422,9 +1984,19 @@ mod tests {
     fn multimodal_emission_is_refused_off_nvidia() {
         check_target("sm_90a", "h100").unwrap();
         check_target("sm_120a", "").unwrap();
-        for (arch, gpu) in [("gfx942", "mi300x"), ("gfx950", ""), ("avx512", ""), ("sm_120a", "xeon6975p"), ("metal3", ""), ("", "")] {
+        for (arch, gpu) in [
+            ("gfx942", "mi300x"),
+            ("gfx950", ""),
+            ("avx512", ""),
+            ("sm_120a", "xeon6975p"),
+            ("metal3", ""),
+            ("", ""),
+        ] {
             let error = check_target(arch, gpu).unwrap_err();
-            assert!(error.contains(&format!("--arch {arch:?} --gpu {gpu:?}")), "{error}");
+            assert!(
+                error.contains(&format!("--arch {arch:?} --gpu {gpu:?}")),
+                "{error}"
+            );
         }
     }
 

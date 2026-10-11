@@ -82,7 +82,12 @@ struct Schedule {
 
 impl Schedule {
     fn from_codec(c: &Codec, trim_tail: usize) -> std::result::Result<Self, String> {
-        let p = |k: &str| c.parameters.get(k).map(|&v| v as usize).ok_or(format!("vocoder packet lacks {k}"));
+        let p = |k: &str| {
+            c.parameters
+                .get(k)
+                .map(|&v| v as usize)
+                .ok_or(format!("vocoder packet lacks {k}"))
+        };
         Ok(Self {
             first: p("stream.first_tokens")?,
             chunk: p("stream.chunk_tokens")?,
@@ -90,18 +95,52 @@ impl Schedule {
             fade: p("stream.fade_samples")?,
             samples_per_token: c.frame_samples,
             max_tokens: c.max_frames,
-            min_batch: c.parameters.get("render.min_batch").map_or(1, |&v| v as usize),
-            batch_hold: std::time::Duration::from_millis(c.parameters.get("render.hold_ms").copied().unwrap_or(0)),
+            min_batch: c
+                .parameters
+                .get("render.min_batch")
+                .map_or(1, |&v| v as usize),
+            batch_hold: std::time::Duration::from_millis(
+                c.parameters.get("render.hold_ms").copied().unwrap_or(0),
+            ),
             trim_tail,
-            context: c.parameters.get("stream.context_tokens").map_or(0, |&v| v as usize),
-            max_window: if crate::config::RuntimeConfig::get().tts_stream_windows { c.max_window } else { 0 },
-            harmonics: c.parameters.get("vocoder.harmonics").map_or(0, |&v| v as usize),
-            slack: std::time::Duration::from_millis(c.parameters.get("render.slack_ms").copied().unwrap_or(600)),
-            window_hold: std::time::Duration::from_millis(c.parameters.get("render.window_hold_ms").copied().unwrap_or(500)),
-            window_batch: c.parameters.get("render.window_batch").map_or(c.max_batch, |&v| v as usize),
-            launch_frames: c.parameters.get("render.launch_frames").map_or(370, |&v| v as usize),
-            item_frames: c.parameters.get("render.item_frames").map_or(4, |&v| v as usize),
-            sample_rate: c.parameters.get("audio.sample_rate").map_or(24000.0, |&v| v as f64),
+            context: c
+                .parameters
+                .get("stream.context_tokens")
+                .map_or(0, |&v| v as usize),
+            max_window: if crate::config::RuntimeConfig::get().tts_stream_windows {
+                c.max_window
+            } else {
+                0
+            },
+            harmonics: c
+                .parameters
+                .get("vocoder.harmonics")
+                .map_or(0, |&v| v as usize),
+            slack: std::time::Duration::from_millis(
+                c.parameters.get("render.slack_ms").copied().unwrap_or(600),
+            ),
+            window_hold: std::time::Duration::from_millis(
+                c.parameters
+                    .get("render.window_hold_ms")
+                    .copied()
+                    .unwrap_or(500),
+            ),
+            window_batch: c
+                .parameters
+                .get("render.window_batch")
+                .map_or(c.max_batch, |&v| v as usize),
+            launch_frames: c
+                .parameters
+                .get("render.launch_frames")
+                .map_or(370, |&v| v as usize),
+            item_frames: c
+                .parameters
+                .get("render.item_frames")
+                .map_or(4, |&v| v as usize),
+            sample_rate: c
+                .parameters
+                .get("audio.sample_rate")
+                .map_or(24000.0, |&v| v as f64),
         })
     }
 
@@ -116,8 +155,19 @@ impl Schedule {
 /// padding beyond the windows too short to fill it.
 fn fit_window(caps: &[(usize, usize)], jobs: &[(usize, usize, bool)], sc: &Schedule) -> usize {
     let mut best = (0.0, sc.max_window);
-    for f in caps.iter().map(|c| c.1).collect::<std::collections::BTreeSet<_>>() {
-        let Some(batch) = caps.iter().filter(|c| c.1 == f && c.0 >= jobs.len()).map(|c| c.0).min() else { continue };
+    for f in caps
+        .iter()
+        .map(|c| c.1)
+        .collect::<std::collections::BTreeSet<_>>()
+    {
+        let Some(batch) = caps
+            .iter()
+            .filter(|c| c.1 == f && c.0 >= jobs.len())
+            .map(|c| c.0)
+            .min()
+        else {
+            continue;
+        };
         let new: usize = jobs
             .iter()
             .map(|&(avail, ctx, closed)| {
@@ -143,7 +193,11 @@ pub struct SpeechAudio {
 
 pub enum StreamEvent {
     Pcm(Vec<f32>),
-    Done { tokens: usize, t3_ms: f64, s3gen_ms: f64 },
+    Done {
+        tokens: usize,
+        t3_ms: f64,
+        s3gen_ms: f64,
+    },
     Err(String),
 }
 
@@ -154,13 +208,30 @@ enum Reply {
 
 enum S3Msg {
     /// `turn`: the voice turn's times, looked up once at submit (render deadlines).
-    Open { id: usize, voice: String, seed: u64, reply: Reply, turn: Option<crate::serve::turns::TurnTimes> },
-    Token { id: usize, token: u32 },
-    Close { id: usize, t3_ms: f64 },
+    Open {
+        id: usize,
+        voice: String,
+        seed: u64,
+        reply: Reply,
+        turn: Option<crate::serve::turns::TurnTimes>,
+    },
+    Token {
+        id: usize,
+        token: u32,
+    },
+    Close {
+        id: usize,
+        t3_ms: f64,
+    },
     /// The LM failed the request.
-    Fail { id: usize, error: String },
+    Fail {
+        id: usize,
+        error: String,
+    },
     /// The client went away: forget the utterance.
-    Drop { id: usize },
+    Drop {
+        id: usize,
+    },
 }
 
 /// The host side of a guided speech model: prompt tables and contract (from the packet) and the
@@ -215,7 +286,11 @@ impl Utterance {
             (Reply::Whole(_), None) => false,
             (Reply::Stream(_), None) => {
                 let n = self.tokens.len();
-                if self.rendered == 0 { n >= sc.first } else { n >= self.rendered + sc.chunk }
+                if self.rendered == 0 {
+                    n >= sc.first
+                } else {
+                    n >= self.rendered + sc.chunk
+                }
             }
         }
     }
@@ -225,20 +300,40 @@ impl Utterance {
     fn span(&self, sc: &Schedule, limit: usize) -> Span {
         let n = self.tokens.len();
         if !(sc.windowed() && matches!(self.reply, Reply::Stream(_))) {
-            return Span { start: 0, end: n.min(sc.max_tokens), last: self.t3_ms.is_some() };
+            return Span {
+                start: 0,
+                end: n.min(sc.max_tokens),
+                last: self.t3_ms.is_some(),
+            };
         }
         let start = (self.emitted / sc.samples_per_token).saturating_sub(sc.context);
         let end = n.min(start + limit.min(sc.max_window));
-        Span { start, end, last: self.t3_ms.is_some() && end == n }
+        Span {
+            start,
+            end,
+            last: self.t3_ms.is_some() && end == n,
+        }
     }
 
     /// The window of `span`: phase at the seam (where this render's audio starts to be heard) and
     /// the sample of the next seam, both relative to the window start.
     fn window(&self, span: Span, sc: &Schedule) -> Window {
         let spt = sc.samples_per_token;
-        let next = if span.last { 0 } else { span.end.saturating_sub(sc.hold).saturating_sub(span.start) * spt };
-        let phase = if self.rendered == 0 { initial_phase(self.seed, sc.harmonics) } else { self.phase.clone() };
-        Window { seam: (self.emitted - span.start * spt) as u32, next_seam: next as u32, phase }
+        let next = if span.last {
+            0
+        } else {
+            span.end.saturating_sub(sc.hold).saturating_sub(span.start) * spt
+        };
+        let phase = if self.rendered == 0 {
+            initial_phase(self.seed, sc.harmonics)
+        } else {
+            self.phase.clone()
+        };
+        Window {
+            seam: (self.emitted - span.start * spt) as u32,
+            next_seam: next as u32,
+            phase,
+        }
     }
 
     /// A whole reply whose speech tokens have been complete for [`WHOLE_MAX_WAIT`]. It has no
@@ -247,14 +342,16 @@ impl Utterance {
     fn overdue_whole(&self, now: std::time::Instant) -> bool {
         matches!(self.reply, Reply::Whole(_))
             && self.t3_ms.is_some_and(|ms| {
-                now.saturating_duration_since(self.opened).as_secs_f64() * 1e3 - ms >= WHOLE_MAX_WAIT.as_secs_f64() * 1e3
+                now.saturating_duration_since(self.opened).as_secs_f64() * 1e3 - ms
+                    >= WHOLE_MAX_WAIT.as_secs_f64() * 1e3
             })
     }
 
     /// Audio sent but not yet played on a real-time client (zero before the first audio).
     fn buffered(&self, now: std::time::Instant, sc: &Schedule) -> std::time::Duration {
         self.started.map_or(std::time::Duration::ZERO, |t| {
-            std::time::Duration::from_secs_f64(self.emitted as f64 / sc.sample_rate).saturating_sub(now - t)
+            std::time::Duration::from_secs_f64(self.emitted as f64 / sc.sample_rate)
+                .saturating_sub(now - t)
         })
     }
 
@@ -262,19 +359,28 @@ impl Utterance {
     fn take(&mut self, d: Decoded, span: Span, ms: f64, sc: &Schedule) -> bool {
         self.s3gen_ms += ms;
         self.rendered = span.end;
-        self.phase = d.phase.iter().map(|p| p.rem_euclid(std::f32::consts::TAU)).collect();
+        self.phase = d
+            .phase
+            .iter()
+            .map(|p| p.rem_euclid(std::f32::consts::TAU))
+            .collect();
         let last = span.last;
         let base = span.start * sc.samples_per_token;
         let pcm = &d.pcm[..];
         let pcm = if last {
-            &pcm[..pcm.len().min((self.tokens.len().saturating_sub(sc.trim_tail).max(1) * sc.samples_per_token).saturating_sub(base))]
+            &pcm[..pcm.len().min(
+                (self.tokens.len().saturating_sub(sc.trim_tail).max(1) * sc.samples_per_token)
+                    .saturating_sub(base),
+            )]
         } else {
             pcm
         };
         match &self.reply {
             Reply::Whole(_) => {
-                let Reply::Whole(tx) = std::mem::replace(&mut self.reply, Reply::Stream(tokio::sync::mpsc::unbounded_channel().0))
-                else {
+                let Reply::Whole(tx) = std::mem::replace(
+                    &mut self.reply,
+                    Reply::Stream(tokio::sync::mpsc::unbounded_channel().0),
+                ) else {
                     unreachable!()
                 };
                 let _ = tx.send(Ok(SpeechAudio {
@@ -286,7 +392,11 @@ impl Utterance {
                 false
             }
             Reply::Stream(tx) => {
-                let end = if last { pcm.len() } else { pcm.len().saturating_sub(sc.hold * sc.samples_per_token) };
+                let end = if last {
+                    pcm.len()
+                } else {
+                    pcm.len().saturating_sub(sc.hold * sc.samples_per_token)
+                };
                 if base + end > self.emitted {
                     let mut chunk = pcm[self.emitted - base..end].to_vec();
                     for (i, (o, t)) in chunk.iter_mut().zip(&self.tail).enumerate() {
@@ -331,28 +441,62 @@ fn initial_phase(seed: u64, harmonics: usize) -> Vec<f32> {
             z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
             z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
             z ^= z >> 31;
-            if h == 0 { 0.0 } else { ((z >> 40) as f32 / (1u64 << 24) as f32 - 0.5) * std::f32::consts::TAU }
+            if h == 0 {
+                0.0
+            } else {
+                ((z >> 40) as f32 / (1u64 << 24) as f32 - 0.5) * std::f32::consts::TAU
+            }
         })
         .collect()
 }
 
 /// `cost_id`: the vocoder's id in [`crate::sched::cost`].
-fn render_loop(vocoder: &Codec, cost_id: usize, base: Schedule, rx: mpsc::Receiver<S3Msg>, credit: &DownstreamCredit) {
+fn render_loop(
+    vocoder: &Codec,
+    cost_id: usize,
+    base: Schedule,
+    rx: mpsc::Receiver<S3Msg>,
+    credit: &DownstreamCredit,
+) {
     let max_batch = vocoder.max_batch;
     // More live streams than one launch holds: the device is the bottleneck, so a started stream
     // waits for a window filling the widest capacity at the full batch (lowest cost per token).
-    let full = vocoder.window_capacities.iter().filter(|c| c.0 >= max_batch).map(|c| c.1).max().unwrap_or(0);
-    let wide = Schedule { chunk: base.chunk.max(full.saturating_sub(base.context + base.hold)), ..base };
+    let full = vocoder
+        .window_capacities
+        .iter()
+        .filter(|c| c.0 >= max_batch)
+        .map(|c| c.1)
+        .max()
+        .unwrap_or(0);
+    let wide = Schedule {
+        chunk: base
+            .chunk
+            .max(full.saturating_sub(base.context + base.hold)),
+        ..base
+    };
     let turn_batch = crate::config::RuntimeConfig::get().tts_turn_batch;
-    let launch = if credit.device_turn().is_some() && turn_batch > 0 { turn_batch } else { max_batch };
+    let launch = if credit.device_turn().is_some() && turn_batch > 0 {
+        turn_batch
+    } else {
+        max_batch
+    };
     let held: super::codec::HeldTurn = Default::default();
     if let Some(dt) = credit.device_turn() {
-        vocoder.set_yield(Some(super::codec::turn_yield(Arc::clone(dt), Arc::clone(&held))));
+        vocoder.set_yield(Some(super::codec::turn_yield(
+            Arc::clone(dt),
+            Arc::clone(&held),
+        )));
     }
     let mut live: HashMap<usize, Utterance> = HashMap::new();
     let mut held_since: Option<std::time::Instant> = None;
     let apply = |live: &mut HashMap<usize, Utterance>, m: S3Msg| match m {
-        S3Msg::Open { id, voice, seed, reply, turn } => {
+        S3Msg::Open {
+            id,
+            voice,
+            seed,
+            reply,
+            turn,
+        } => {
             live.insert(
                 id,
                 Utterance {
@@ -392,8 +536,19 @@ fn render_loop(vocoder: &Codec, cost_id: usize, base: Schedule, rx: mpsc::Receiv
         }
     };
     loop {
-        let sc = if base.windowed() && live.len() > max_batch { wide } else { base };
-        let sc = if crate::serve::overload::level() >= 2 { Schedule { slack: sc.slack / 2, ..sc } } else { sc };
+        let sc = if base.windowed() && live.len() > max_batch {
+            wide
+        } else {
+            base
+        };
+        let sc = if crate::serve::overload::level() >= 2 {
+            Schedule {
+                slack: sc.slack / 2,
+                ..sc
+            }
+        } else {
+            sc
+        };
         if !live.values().any(|u| u.due(&sc)) {
             match rx.recv() {
                 Ok(m) => apply(&mut live, m),
@@ -403,7 +558,11 @@ fn render_loop(vocoder: &Codec, cost_id: usize, base: Schedule, rx: mpsc::Receiv
         while let Ok(m) = rx.try_recv() {
             apply(&mut live, m);
         }
-        let empty: Vec<usize> = live.iter().filter(|(_, u)| u.t3_ms.is_some() && u.tokens.is_empty()).map(|(&k, _)| k).collect();
+        let empty: Vec<usize> = live
+            .iter()
+            .filter(|(_, u)| u.t3_ms.is_some() && u.tokens.is_empty())
+            .map(|(&k, _)| k)
+            .collect();
         for id in empty {
             if let Some(u) = live.remove(&id) {
                 u.fail("T3 produced no speech tokens".into());
@@ -411,10 +570,20 @@ fn render_loop(vocoder: &Codec, cost_id: usize, base: Schedule, rx: mpsc::Receiv
         }
         // First chunks of streams first (time to first audio), then closed utterances, then the
         // streams furthest behind.
-        let mut due: Vec<usize> = live.iter().filter(|(_, u)| u.due(&sc)).map(|(&k, _)| k).collect();
+        let mut due: Vec<usize> = live
+            .iter()
+            .filter(|(_, u)| u.due(&sc))
+            .map(|(&k, _)| k)
+            .collect();
         due.sort_by_key(|k| {
             let u = &live[k];
-            let class = if u.first_chunk() { 0 } else if u.t3_ms.is_some() { 1 } else { 2 };
+            let class = if u.first_chunk() {
+                0
+            } else if u.t3_ms.is_some() {
+                1
+            } else {
+                2
+            };
             (class, u.rendered as isize - u.tokens.len() as isize, *k)
         });
         let stream = |u: &Utterance| matches!(u.reply, Reply::Stream(_));
@@ -428,12 +597,26 @@ fn render_loop(vocoder: &Codec, cost_id: usize, base: Schedule, rx: mpsc::Receiv
             // halfway to their next window ride along.
             due.retain(|k| stream(&live[k]));
             let now = std::time::Instant::now();
-            let spare = |u: &Utterance| u.started.is_some() && u.t3_ms.is_none() && u.buffered(now, &sc) > sc.slack;
+            let spare = |u: &Utterance| {
+                u.started.is_some() && u.t3_ms.is_none() && u.buffered(now, &sc) > sc.slack
+            };
             // Loaded (most live streams not yet due): hold for a wider launch.
             let loaded = live.len() > 2 * due.len();
-            let hold_left = if loaded { sc.window_hold.saturating_sub(held_since.get_or_insert(now).elapsed()) } else { std::time::Duration::ZERO };
-            if due.len() < sc.window_batch && (due.iter().all(|k| spare(&live[k])) || !hold_left.is_zero()) {
-                let wait = due.iter().map(|k| live[k].buffered(now, &sc).saturating_sub(sc.slack)).min().unwrap_or_default().max(hold_left);
+            let hold_left = if loaded {
+                sc.window_hold
+                    .saturating_sub(held_since.get_or_insert(now).elapsed())
+            } else {
+                std::time::Duration::ZERO
+            };
+            if due.len() < sc.window_batch
+                && (due.iter().all(|k| spare(&live[k])) || !hold_left.is_zero())
+            {
+                let wait = due
+                    .iter()
+                    .map(|k| live[k].buffered(now, &sc).saturating_sub(sc.slack))
+                    .min()
+                    .unwrap_or_default()
+                    .max(hold_left);
                 match rx.recv_timeout(wait) {
                     Ok(m) => apply(&mut live, m),
                     Err(mpsc::RecvTimeoutError::Timeout) => {}
@@ -444,7 +627,12 @@ fn render_loop(vocoder: &Codec, cost_id: usize, base: Schedule, rx: mpsc::Receiv
             let half = sc.chunk / 2;
             let mut riders: Vec<usize> = live
                 .iter()
-                .filter(|(k, u)| stream(u) && u.rendered > 0 && !due.contains(k) && u.tokens.len() >= u.rendered + half)
+                .filter(|(k, u)| {
+                    stream(u)
+                        && u.rendered > 0
+                        && !due.contains(k)
+                        && u.tokens.len() >= u.rendered + half
+                })
                 .map(|(&k, _)| k)
                 .collect();
             riders.sort_by_key(|k| (live[k].buffered(now, &sc), *k));
@@ -458,9 +646,17 @@ fn render_loop(vocoder: &Codec, cost_id: usize, base: Schedule, rx: mpsc::Receiv
         if due.is_empty() {
             continue;
         }
-        let batchable = if sc.windowed() { !stream(&live[&due[0]]) } else { !live[&due[0]].first_chunk() };
+        let batchable = if sc.windowed() {
+            !stream(&live[&due[0]])
+        } else {
+            !live[&due[0]].first_chunk()
+        };
         if batchable && due.len() < sc.min_batch.min(max_batch) && live.len() > due.len() {
-            let left = sc.batch_hold.saturating_sub(held_since.get_or_insert_with(std::time::Instant::now).elapsed());
+            let left = sc.batch_hold.saturating_sub(
+                held_since
+                    .get_or_insert_with(std::time::Instant::now)
+                    .elapsed(),
+            );
             if !left.is_zero() {
                 match rx.recv_timeout(left) {
                     Ok(m) => apply(&mut live, m),
@@ -477,7 +673,11 @@ fn render_loop(vocoder: &Codec, cost_id: usize, base: Schedule, rx: mpsc::Receiv
                 .iter()
                 .map(|k| {
                     let (u, s) = (&live[k], live[k].span(&sc, sc.max_window));
-                    (u.tokens.len() - s.start, u.emitted / sc.samples_per_token - s.start, u.t3_ms.is_some())
+                    (
+                        u.tokens.len() - s.start,
+                        u.emitted / sc.samples_per_token - s.start,
+                        u.t3_ms.is_some(),
+                    )
                 })
                 .collect();
             limit = fit_window(&vocoder.window_capacities, &jobs, &sc);
@@ -507,8 +707,15 @@ fn render_loop(vocoder: &Codec, cost_id: usize, base: Schedule, rx: mpsc::Receiv
         let mut turn = crate::serve::cosched::Turn::default();
         if let Some(dt) = credit.device_turn() {
             let now = std::time::Instant::now();
-            let due_now = first || due.iter().any(|k| live[k].started.is_some() && live[k].buffered(now, &sc) <= sc.slack);
-            let urgency = if due_now { crate::serve::cosched::Urgency::Deadline } else { crate::serve::cosched::Urgency::Normal };
+            let due_now = first
+                || due
+                    .iter()
+                    .any(|k| live[k].started.is_some() && live[k].buffered(now, &sc) <= sc.slack);
+            let urgency = if due_now {
+                crate::serve::cosched::Urgency::Deadline
+            } else {
+                crate::serve::cosched::Urgency::Normal
+            };
             // Turn streams: first audio by the turn's end, started ones by their playback clock;
             // the rest keep the class deadline. Best rank wins.
             let cost = crate::serve::deadlines::render_cost(cost_id, due.len());
@@ -519,23 +726,33 @@ fn render_loop(vocoder: &Codec, cost_id: usize, base: Schedule, rx: mpsc::Receiv
                     let t = u.turn.as_ref()?;
                     Some(match u.started {
                         None => crate::serve::deadlines::first_audio(t, u.opened, cost),
-                        Some(_) => crate::serve::deadlines::playback(now, u.buffered(now, &sc), cost),
+                        Some(_) => {
+                            crate::serve::deadlines::playback(now, u.buffered(now, &sc), cost)
+                        }
                     })
                 })
-                .chain(
-                    due.iter()
-                        .any(|k| live[k].turn.is_none())
-                        .then(|| {
-                            let legacy_now = due.iter().any(|k| {
-                                let u = &live[k];
-                                u.turn.is_none() && (u.first_chunk() || (u.started.is_some() && u.buffered(now, &sc) <= sc.slack))
-                            });
-                            let u = if legacy_now { crate::serve::cosched::Urgency::Deadline } else { crate::serve::cosched::Urgency::Normal };
-                            crate::serve::cosched::Due { cost, ..crate::serve::cosched::Due::from_urgency(u, now) }
-                        }),
-                )
+                .chain(due.iter().any(|k| live[k].turn.is_none()).then(|| {
+                    let legacy_now = due.iter().any(|k| {
+                        let u = &live[k];
+                        u.turn.is_none()
+                            && (u.first_chunk()
+                                || (u.started.is_some() && u.buffered(now, &sc) <= sc.slack))
+                    });
+                    let u = if legacy_now {
+                        crate::serve::cosched::Urgency::Deadline
+                    } else {
+                        crate::serve::cosched::Urgency::Normal
+                    };
+                    crate::serve::cosched::Due {
+                        cost,
+                        ..crate::serve::cosched::Due::from_urgency(u, now)
+                    }
+                }))
                 .min_by_key(|d| d.rank(now))
-                .unwrap_or_else(|| crate::serve::cosched::Due { cost, ..crate::serve::cosched::Due::from_urgency(urgency, now) });
+                .unwrap_or_else(|| crate::serve::cosched::Due {
+                    cost,
+                    ..crate::serve::cosched::Due::from_urgency(urgency, now)
+                });
             futures::executor::block_on(turn.take_due(dt, super::codec::serial_due(render_due)));
             *held.lock() = Some((std::mem::take(&mut turn), render_due));
         } else if first && live.len() <= sc.min_batch.max(1) {
@@ -551,15 +768,29 @@ fn render_loop(vocoder: &Codec, cost_id: usize, base: Schedule, rx: mpsc::Receiv
             .map(|(k, &span)| {
                 let u = &live[k];
                 let voice = vocoder.voices.iter().position(|v| *v == u.voice);
-                let codes: Vec<i32> = u.tokens[span.start..span.end].iter().map(|&t| t as i32).collect();
-                let window = (sc.windowed() && matches!(u.reply, Reply::Stream(_))).then(|| u.window(span, &sc));
+                let codes: Vec<i32> = u.tokens[span.start..span.end]
+                    .iter()
+                    .map(|&t| t as i32)
+                    .collect();
+                let window = (sc.windowed() && matches!(u.reply, Reply::Stream(_)))
+                    .then(|| u.window(span, &sc));
                 // Windows draw fresh noise: their frames are keyed from the window start.
                 let seed = u.seed ^ (span.start as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
                 let frames = span.end - span.start;
                 async move {
                     match (voice, window) {
-                        (Some(v), Some(w)) => vocoder.decode_window(codes, frames, seed, v as u32, w).await,
-                        (Some(v), None) => vocoder.decode_voice(codes, frames, seed, v as u32).await.map(|pcm| Decoded { pcm, phase: Vec::new() }),
+                        (Some(v), Some(w)) => {
+                            vocoder
+                                .decode_window(codes, frames, seed, v as u32, w)
+                                .await
+                        }
+                        (Some(v), None) => vocoder
+                            .decode_voice(codes, frames, seed, v as u32)
+                            .await
+                            .map(|pcm| Decoded {
+                                pcm,
+                                phase: Vec::new(),
+                            }),
                         (None, _) => Err(format!("unknown voice {:?}", u.voice)),
                     }
                 }
@@ -572,7 +803,11 @@ fn render_loop(vocoder: &Codec, cost_id: usize, base: Schedule, rx: mpsc::Receiv
         drop((guard, turn));
         let ms = t.elapsed().as_secs_f64() * 1e3;
         tracing::debug!(renders = due.len(), tokens = ?spans.iter().map(|s| s.end - s.start).collect::<Vec<_>>(), ms, "vocoder render");
-        crate::sched::cost::record_id(cost_id, crate::sched::cost::Op::Render { streams: due.len() }, t.elapsed());
+        crate::sched::cost::record_id(
+            cost_id,
+            crate::sched::cost::Op::Render { streams: due.len() },
+            t.elapsed(),
+        );
         for ((k, pcm), span) in due.into_iter().zip(results).zip(spans) {
             match pcm {
                 Err(e) => {
@@ -596,14 +831,21 @@ impl GuidedSpeech {
     /// model's downstream credit: the vocoder's backlog gates the model's admission, and a render
     /// holding a first chunk holds its ticks.
     pub fn start(assets: &Path, credit: Arc<DownstreamCredit>, device: u8) -> Result<Self> {
-        let c = GuidedLmContract::load(assets)?
-            .ok_or_else(|| RuntimeError::Rejected(format!("{} declares no guided LM pipeline", assets.display())))?;
+        let c = GuidedLmContract::load(assets)?.ok_or_else(|| {
+            RuntimeError::Rejected(format!(
+                "{} declares no guided LM pipeline",
+                assets.display()
+            ))
+        })?;
         let tables = PromptTables::load(assets, c.hidden)?;
         let trim_tail = c.trim_tail_tokens;
         let (s_tx, s_rx) = mpsc::channel::<S3Msg>();
         let (s_ready_tx, s_ready_rx) = mpsc::channel::<Result<usize>>();
-        let vocoder_path =
-            crate::exec::packet_runtime::stage_packet(&assets.join("model.pkt"), "vocoder.packet", VOCODER)?;
+        let vocoder_path = crate::exec::packet_runtime::stage_packet(
+            &assets.join("model.pkt"),
+            "vocoder.packet",
+            VOCODER,
+        )?;
         std::thread::Builder::new()
             .name("plow-tts-render".into())
             .spawn(move || {
@@ -617,10 +859,18 @@ impl GuidedSpeech {
                     Err(e) => return drop(s_ready_tx.send(Err(RuntimeError::Rejected(e)))),
                 };
                 let _ = s_ready_tx.send(Ok(sc.first));
-                render_loop(&vocoder, crate::sched::cost::id(&vocoder_path.to_string_lossy()), sc, s_rx, &credit);
+                render_loop(
+                    &vocoder,
+                    crate::sched::cost::id(&vocoder_path.to_string_lossy()),
+                    sc,
+                    s_rx,
+                    &credit,
+                );
             })
             .map_err(|e| RuntimeError::Device(e.to_string()))?;
-        let first_tokens = s_ready_rx.recv().map_err(|e| RuntimeError::Device(e.to_string()))??;
+        let first_tokens = s_ready_rx
+            .recv()
+            .map_err(|e| RuntimeError::Device(e.to_string()))??;
         Ok(GuidedSpeech {
             c,
             tables,
@@ -660,7 +910,10 @@ impl GuidedSpeech {
         let overlay_pos: Vec<u32> = (0..n as u32).collect();
         // Both CFG members' rows key a position: a session reuses the voice conditioning prefix.
         let session = request.session.as_ref().and_then(|_| {
-            request.ticket(crate::serve::session::row_keys(&prompt_ids, &overlay_pos, &[&cond, &uncond]), report)
+            request.ticket(
+                crate::serve::session::row_keys(&prompt_ids, &overlay_pos, &[&cond, &uncond]),
+                report,
+            )
         });
         Ok(Job {
             prompt_ids,
@@ -678,9 +931,18 @@ impl GuidedSpeech {
                     overlay_pos,
                     // Decode token k takes speech_pos[k + 1]: base = prefill rows - 1.
                     pos_base: Some(n as u32 - 1),
-                    cfg: Some(CfgJob { uncond_overlay: uncond, params: c.cfg(), history: vec![c.start_speech], seed: Some(seed) }),
+                    cfg: Some(CfgJob {
+                        uncond_overlay: uncond,
+                        params: c.cfg(),
+                        history: vec![c.start_speech],
+                        seed: Some(seed),
+                    }),
                     // Streams only: a whole reply's first audio needs every token.
-                    first_tokens: if class == JobClass::Critical { self.first_tokens } else { 0 },
+                    first_tokens: if class == JobClass::Critical {
+                        self.first_tokens
+                    } else {
+                        0
+                    },
                 })),
                 prefix: None,
                 tenant: None,
@@ -705,21 +967,37 @@ impl GuidedSpeech {
         if !self.tables.voices().any(|v| v == voice) {
             let mut known: Vec<_> = self.tables.voices().collect();
             known.sort_unstable();
-            return Err(SpeechError::Invalid(format!("unknown voice {voice:?}; voices: {}", known.join(", ")), "voice"));
+            return Err(SpeechError::Invalid(
+                format!("unknown voice {voice:?}; voices: {}", known.join(", ")),
+                "voice",
+            ));
         }
         let (respond, mut tokens) = crate::serve::stream::channel();
         let probe = match &reply {
             Reply::Stream(tx) => Some(tx.clone()),
             Reply::Whole(_) => None,
         };
-        let class = if probe.is_some() { JobClass::Critical } else { JobClass::Normal };
+        let class = if probe.is_some() {
+            JobClass::Critical
+        } else {
+            JobClass::Normal
+        };
         let job = self
             .job(&voice, &text, lang, seed, class, respond, ids, report)
             .map_err(|e| SpeechError::Invalid(e.to_string(), "input"))?;
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let render = self.render.lock().clone();
-        let turn = ids.turn_key.as_ref().and_then(|k| crate::serve::turns::table().times(k));
-        let _ = render.send(S3Msg::Open { id, voice, seed, reply, turn });
+        let turn = ids
+            .turn_key
+            .as_ref()
+            .and_then(|k| crate::serve::turns::table().times(k));
+        let _ = render.send(S3Msg::Open {
+            id,
+            voice,
+            seed,
+            reply,
+            turn,
+        });
         if let Err(e) = mux.submit(job) {
             let _ = render.send(S3Msg::Drop { id });
             return Err(SpeechError::Failed(match e {
@@ -742,9 +1020,18 @@ impl GuidedSpeech {
                         }
                         continue;
                     }
-                    Some(StreamChunk::Done { .. }) => S3Msg::Close { id, t3_ms: t0.elapsed().as_secs_f64() * 1e3 },
-                    Some(StreamChunk::Err(e)) => S3Msg::Fail { id, error: e.to_string() },
-                    None => S3Msg::Fail { id, error: "speech LM stream ended without a result".into() },
+                    Some(StreamChunk::Done { .. }) => S3Msg::Close {
+                        id,
+                        t3_ms: t0.elapsed().as_secs_f64() * 1e3,
+                    },
+                    Some(StreamChunk::Err(e)) => S3Msg::Fail {
+                        id,
+                        error: e.to_string(),
+                    },
+                    None => S3Msg::Fail {
+                        id,
+                        error: "speech LM stream ended without a result".into(),
+                    },
                 };
                 break msg;
             };
@@ -769,8 +1056,20 @@ impl GuidedSpeech {
         report: Option<crate::serve::session::Report>,
     ) -> std::result::Result<SpeechAudio, SpeechError> {
         let (reply, rx) = tokio::sync::oneshot::channel();
-        self.submit(mux, voice, text, lang, seed, Reply::Whole(reply), ids, report)?;
-        rx.await.map_err(|_| "chatterbox render dropped the request".to_string()).and_then(|r| r).map_err(SpeechError::Failed)
+        self.submit(
+            mux,
+            voice,
+            text,
+            lang,
+            seed,
+            Reply::Whole(reply),
+            ids,
+            report,
+        )?;
+        rx.await
+            .map_err(|_| "chatterbox render dropped the request".to_string())
+            .and_then(|r| r)
+            .map_err(SpeechError::Failed)
     }
 
     pub fn synthesize_stream(
@@ -844,8 +1143,18 @@ mod tests {
             while u.due(sc) {
                 let span = u.span(sc, sc.max_window);
                 let base = span.start * sc.samples_per_token;
-                let pcm: Vec<f32> = (base..span.end * sc.samples_per_token).map(|i| (i % 1024) as f32).collect();
-                let more = u.take(Decoded { pcm, phase: vec![0.0; sc.harmonics] }, span, 1.0, sc);
+                let pcm: Vec<f32> = (base..span.end * sc.samples_per_token)
+                    .map(|i| (i % 1024) as f32)
+                    .collect();
+                let more = u.take(
+                    Decoded {
+                        pcm,
+                        phase: vec![0.0; sc.harmonics],
+                    },
+                    span,
+                    1.0,
+                    sc,
+                );
                 assert_eq!(more, !span.last);
                 if !more {
                     return;
@@ -854,7 +1163,11 @@ mod tests {
         }
     }
 
-    fn collect(rx: &mut tokio::sync::mpsc::UnboundedReceiver<StreamEvent>, total: usize, sc: &Schedule) {
+    fn collect(
+        rx: &mut tokio::sync::mpsc::UnboundedReceiver<StreamEvent>,
+        total: usize,
+        sc: &Schedule,
+    ) {
         let mut next = 0usize;
         let mut done = false;
         while let Ok(ev) = rx.try_recv() {
@@ -862,7 +1175,10 @@ mod tests {
                 StreamEvent::Pcm(p) => {
                     // Identical renders: the crossfade is the identity.
                     for v in p {
-                        assert!((v - (next % 1024) as f32).abs() < 1e-3, "sample {next} = {v}");
+                        assert!(
+                            (v - (next % 1024) as f32).abs() < 1e-3,
+                            "sample {next} = {v}"
+                        );
                         next += 1;
                     }
                 }
@@ -883,19 +1199,28 @@ mod tests {
         let (mut u, _) = stream(40);
         u.reply = Reply::Whole(tx);
         let now = u.opened + std::time::Duration::from_millis(500);
-        assert!(!u.overdue_whole(now + WHOLE_MAX_WAIT), "LM still generating");
+        assert!(
+            !u.overdue_whole(now + WHOLE_MAX_WAIT),
+            "LM still generating"
+        );
         u.t3_ms = Some(500.0);
         assert!(!u.overdue_whole(now));
         assert!(u.overdue_whole(now + WHOLE_MAX_WAIT));
         let (mut s, _) = stream(40);
         s.t3_ms = Some(0.0);
-        assert!(!s.overdue_whole(s.opened + 10 * WHOLE_MAX_WAIT), "streams run on their playback clock");
+        assert!(
+            !s.overdue_whole(s.opened + 10 * WHOLE_MAX_WAIT),
+            "streams run on their playback clock"
+        );
     }
 
     #[test]
     fn fitted_window_trades_padding_for_length() {
         let caps = [(1, 32), (8, 32), (8, 64), (64, 32), (64, 64)];
-        let sc = Schedule { max_window: 64, ..SC };
+        let sc = Schedule {
+            max_window: 64,
+            ..SC
+        };
         // Long backlogs fill the widest window; short ones would pad it.
         assert_eq!(fit_window(&caps, &[(70, 8, false); 40], &sc), 64);
         assert_eq!(fit_window(&caps, &[(34, 8, false); 40], &sc), 32);
@@ -906,7 +1231,12 @@ mod tests {
     /// Windows of `context` left tokens (capped at `max_window`) emit every sample exactly once.
     #[test]
     fn stream_windows_cover_each_sample_once() {
-        let sc = Schedule { context: 8, max_window: 32, harmonics: 9, ..SC };
+        let sc = Schedule {
+            context: 8,
+            max_window: 32,
+            harmonics: 9,
+            ..SC
+        };
         for total in [5, 20, 21, 44, 90, 200] {
             let (mut u, mut rx) = stream(0);
             drive(&mut u, &sc, total);
@@ -925,8 +1255,18 @@ mod tests {
                 u.t3_ms = Some(1.0);
             }
             if u.due(&SC) {
-                let pcm: Vec<f32> = (0..n * SC.samples_per_token).map(|i| (i % 1024) as f32).collect();
-                let more = u.take(Decoded { pcm, phase: Vec::new() }, u.span(&SC, SC.max_window), 1.0, &SC);
+                let pcm: Vec<f32> = (0..n * SC.samples_per_token)
+                    .map(|i| (i % 1024) as f32)
+                    .collect();
+                let more = u.take(
+                    Decoded {
+                        pcm,
+                        phase: Vec::new(),
+                    },
+                    u.span(&SC, SC.max_window),
+                    1.0,
+                    &SC,
+                );
                 assert_eq!(more, n != 90);
             }
         }
@@ -936,7 +1276,10 @@ mod tests {
                 StreamEvent::Pcm(p) => {
                     // Identical renders: the crossfade is the identity.
                     for v in p {
-                        assert!((v - (next % 1024) as f32).abs() < 1e-3, "sample {next} = {v}");
+                        assert!(
+                            (v - (next % 1024) as f32).abs() < 1e-3,
+                            "sample {next} = {v}"
+                        );
                         next += 1;
                     }
                 }

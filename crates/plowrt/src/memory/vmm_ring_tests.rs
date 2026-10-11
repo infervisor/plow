@@ -67,14 +67,16 @@ impl VmmOps for Mock {
         let va = 0x10000000 + s.next_va;
         s.next_va += bytes;
         assert_eq!(s.reserved.insert(va, bytes), None);
-        s.trace.push(serde_json::json!({"op": "reserve", "va": va, "bytes": bytes}));
+        s.trace
+            .push(serde_json::json!({"op": "reserve", "va": va, "bytes": bytes}));
         Ok(va)
     }
     fn address_free(&self, va: u64, bytes: u64) {
         let mut s = self.0.lock().unwrap();
         assert!(!s.mapped.keys().any(|&p| p >= va && p < va + bytes));
         assert_eq!(s.reserved.remove(&va), Some(bytes));
-        s.trace.push(serde_json::json!({"op": "address_free", "va": va, "bytes": bytes}));
+        s.trace
+            .push(serde_json::json!({"op": "address_free", "va": va, "bytes": bytes}));
     }
     fn create(&self, bytes: u64) -> Result<u64> {
         self.call(Call::Create)?;
@@ -82,14 +84,16 @@ impl VmmOps for Mock {
         s.next_handle += 1;
         let handle = s.next_handle;
         assert_eq!(s.handles.insert(handle, bytes), None);
-        s.trace.push(serde_json::json!({"op": "create", "handle": handle, "bytes": bytes}));
+        s.trace
+            .push(serde_json::json!({"op": "create", "handle": handle, "bytes": bytes}));
         Ok(handle)
     }
     fn release(&self, handle: u64) {
         let mut s = self.0.lock().unwrap();
         assert!(!s.mapped.values().any(|&(_, h, _)| h == handle));
         assert!(s.handles.remove(&handle).is_some());
-        s.trace.push(serde_json::json!({"op": "release", "handle": handle}));
+        s.trace
+            .push(serde_json::json!({"op": "release", "handle": handle}));
     }
     fn map(&self, va: u64, bytes: u64, handle: u64) -> Result<()> {
         self.call(Call::Map)?;
@@ -105,14 +109,16 @@ impl VmmOps for Mock {
             .iter()
             .any(|(&p, &(n, h, _))| (h == handle && !multi) || (va < p + n && p < va + bytes)));
         assert_eq!(s.mapped.insert(va, (bytes, handle, false)), None);
-        s.trace.push(serde_json::json!({"op": "map", "va": va, "bytes": bytes, "handle": handle}));
+        s.trace
+            .push(serde_json::json!({"op": "map", "va": va, "bytes": bytes, "handle": handle}));
         Ok(())
     }
     fn unmap(&self, va: u64, bytes: u64) {
         let mut s = self.0.lock().unwrap();
         let (n, _, _) = s.mapped.remove(&va).expect("exact mapped range");
         assert_eq!(n, bytes);
-        s.trace.push(serde_json::json!({"op": "unmap", "va": va, "bytes": bytes}));
+        s.trace
+            .push(serde_json::json!({"op": "unmap", "va": va, "bytes": bytes}));
     }
     fn set_access(&self, va: u64, bytes: u64) -> Result<()> {
         self.call(Call::Access)?;
@@ -120,7 +126,8 @@ impl VmmOps for Mock {
         let m = s.mapped.get_mut(&va).expect("mapped before access");
         assert_eq!(m.0, bytes);
         m.2 = true;
-        s.trace.push(serde_json::json!({"op": "access", "va": va, "bytes": bytes}));
+        s.trace
+            .push(serde_json::json!({"op": "access", "va": va, "bytes": bytes}));
         Ok(())
     }
     fn alloc(&self, _: u64) -> Result<u64> {
@@ -568,7 +575,11 @@ fn idle_rows_inside_the_launch_stay_mapped() {
         }
         rings.ensure_prefix(16).unwrap();
     }
-    assert_eq!(ops.calls(), calls, "idle rung rows must not call the driver");
+    assert_eq!(
+        ops.calls(),
+        calls,
+        "idle rung rows must not call the driver"
+    );
     assert_eq!(rings.stats().mapped_prefix, 16);
 
     rings.ensure_prefix(4).unwrap();
@@ -587,8 +598,16 @@ fn slot_granular_full_caches_commit_on_admission_only() {
     ops.0.lock().unwrap().multi_map = true;
     let committed = |ops: &Mock| ops.0.lock().unwrap().handles.values().sum::<u64>();
     // Two layers' K/V at two granules per slot, plus a sub-granule scale committed whole.
-    let mut tensors: Vec<_> = (0..4).map(|tensor| LiveRingTensor { tensor, slot_bytes: 128 }).collect();
-    tensors.push(LiveRingTensor { tensor: 9, slot_bytes: 16 });
+    let mut tensors: Vec<_> = (0..4)
+        .map(|tensor| LiveRingTensor {
+            tensor,
+            slot_bytes: 128,
+        })
+        .collect();
+    tensors.push(LiveRingTensor {
+        tensor: 9,
+        slot_bytes: 16,
+    });
     let batch = 8;
     let mut rings = VmmRings::new_idle_backed(ops.clone(), &tensors, batch).unwrap();
     let startup = VmmRings::idle_backed_startup_bytes(&tensors, batch, 64);
@@ -598,7 +617,11 @@ fn slot_granular_full_caches_commit_on_admission_only() {
     all_mapped(&ops, 4 * batch + 2);
 
     rings.ensure_prefix(batch).unwrap();
-    assert_eq!(committed(&ops), startup, "padded and idle rows land on scratch");
+    assert_eq!(
+        committed(&ops),
+        startup,
+        "padded and idle rows land on scratch"
+    );
     for slot in [5, 0] {
         rings.ensure_slot(slot).unwrap();
     }
@@ -617,19 +640,35 @@ fn slot_granular_full_caches_commit_on_admission_only() {
 
     // Recycled units: kept while any slot is mapped, trimmed to the idle cap when none is.
     rings.enable_handle_recycling(rings.slot_charge());
-    let creates = |ops: &Mock| ops.0.lock().unwrap().calls.iter().filter(|&&c| c == Call::Create).count();
+    let creates = |ops: &Mock| {
+        ops.0
+            .lock()
+            .unwrap()
+            .calls
+            .iter()
+            .filter(|&&c| c == Call::Create)
+            .count()
+    };
     for slot in [1, 3, 4] {
         rings.ensure_slot(slot).unwrap();
     }
     rings.release_slot(1);
     rings.release_slot(3);
-    assert_eq!(committed(&ops), startup + 3 * rings.slot_charge(), "busy rings keep every unit");
+    assert_eq!(
+        committed(&ops),
+        startup + 3 * rings.slot_charge(),
+        "busy rings keep every unit"
+    );
     let before = creates(&ops);
     rings.ensure_slot(6).unwrap();
     assert_eq!(creates(&ops), before, "a recycled slot creates nothing");
     rings.release_slot(6);
     rings.release_slot(4);
-    assert_eq!(committed(&ops), startup + rings.slot_charge(), "idle rings keep the cap");
+    assert_eq!(
+        committed(&ops),
+        startup + rings.slot_charge(),
+        "idle rings keep the cap"
+    );
     assert_eq!(rings.stats().resident_bytes, 128);
     drop(rings);
     ops.empty();
@@ -651,7 +690,10 @@ fn vmm_ring_driver_traces_satisfy_the_lean_lifecycle_model() {
         traces.push(std::mem::take(&mut ops.0.lock().unwrap().trace));
     };
     run(Arc::new(Mock::with_granularity(granularity)), &|ops| {
-        let tensors = [LiveRingTensor { tensor: 3, slot_bytes: 1 << 20 }];
+        let tensors = [LiveRingTensor {
+            tensor: 3,
+            slot_bytes: 1 << 20,
+        }];
         let mut rings = VmmRings::new(ops.clone(), &tensors, 3).unwrap();
         for slot in [0, 1, 2] {
             rings.ensure_slot(slot).unwrap();
@@ -676,8 +718,14 @@ fn vmm_ring_driver_traces_satisfy_the_lean_lifecycle_model() {
     }
     run(Arc::new(Mock::with_granularity(granularity)), &|ops| {
         let tensors = [
-            LiveRingTensor { tensor: 3, slot_bytes: 1 << 20 },
-            LiveRingTensor { tensor: 8, slot_bytes: granularity },
+            LiveRingTensor {
+                tensor: 3,
+                slot_bytes: 1 << 20,
+            },
+            LiveRingTensor {
+                tensor: 8,
+                slot_bytes: granularity,
+            },
         ];
         let mut rings = VmmRings::new(ops.clone(), &tensors, 2).unwrap();
         rings.ensure_slot(0).unwrap();
@@ -702,7 +750,10 @@ fn vmm_ring_driver_traces_satisfy_the_lean_lifecycle_model() {
     let first = |name: &str| base.iter().position(|e| op(e) == name).unwrap();
     let mut mutations: Vec<(&str, Vec<serde_json::Value>)> = Vec::new();
     let release = first("release");
-    let unmap = base[..release].iter().rposition(|e| op(e) == "unmap").unwrap();
+    let unmap = base[..release]
+        .iter()
+        .rposition(|e| op(e) == "unmap")
+        .unwrap();
     let mut t = base.clone();
     t.remove(unmap);
     mutations.push(("release while mapped", t));
@@ -724,7 +775,10 @@ fn vmm_ring_driver_traces_satisfy_the_lean_lifecycle_model() {
         cases.push((what.to_string(), payload(&t), false));
     }
     assert!(cases.iter().filter(|c| c.2).count() >= 10);
-    let requests: Vec<_> = cases.iter().map(|(_, p, _)| ("vmm_trace.v1", p.clone())).collect();
+    let requests: Vec<_> = cases
+        .iter()
+        .map(|(_, p, _)| ("vmm_trace.v1", p.clone()))
+        .collect();
     let certs = lean_verify::call_batch(&requests).unwrap();
     for ((what, _, ok), cert) in cases.iter().zip(certs) {
         assert_eq!(cert.ok, *ok, "{what}: {:?}", cert.reason);

@@ -309,11 +309,7 @@ pub(super) fn routes(
         if inst.t[0] == inst.t[1] || inst.t[0] == inst.t[2] || inst.t[1] == inst.t[2] {
             return Err(err("operands alias"));
         }
-        let [m, n, k] = [
-            u64::from(rows),
-            u64::from(inst.i[1]),
-            u64::from(inst.i[2]),
-        ];
+        let [m, n, k] = [u64::from(rows), u64::from(inst.i[1]), u64::from(inst.i[2])];
         for (&handle, bytes) in inst.t[..3].iter().zip([m * n * 2, m * k * 2, n * k * 2]) {
             if handle == TENSOR_NONE16
                 || tensors.get(handle as usize).is_none_or(|t| t.bytes < bytes)
@@ -748,7 +744,10 @@ mod tests {
                     .flatten()
                     .count();
             }
-            println!("{path}: {} programs, {native} hipBLASLt routes", blob.progs.len());
+            println!(
+                "{path}: {} programs, {native} hipBLASLt routes",
+                blob.progs.len()
+            );
         }
     }
 
@@ -803,7 +802,14 @@ mod tests {
         let specs = all_specs();
         for t in [2048u32, 8192] {
             let band = t / 8;
-            for (n, k) in [(2048, 6144), (512, 6144), (256, 6144), (128, 6144), (64, 6144), (32, 6144)] {
+            for (n, k) in [
+                (2048, 6144),
+                (512, 6144),
+                (256, 6144),
+                (128, 6144),
+                (64, 6144),
+                (32, 6144),
+            ] {
                 let (mut p, tn) = fixture();
                 p.t = t;
                 p.insts[0].i = [band, n, k, 2, 0, 0, 0, 0];
@@ -845,7 +851,11 @@ mod tests {
             assert_eq!(args.dims[4..6], [n, 1024]);
         }
         let (index, _) = band_choice(1024, 6144, 16384).unwrap();
-        assert_eq!((specs[index].mt_i, specs[index].mt_j), (160, 160), "kernel 116 of the sweep");
+        assert_eq!(
+            (specs[index].mt_i, specs[index].mt_j),
+            (160, 160),
+            "kernel 116 of the sweep"
+        );
     }
 
     const DECODE_SHAPES: [(u32, u32); 11] = [
@@ -907,7 +917,10 @@ mod tests {
                 p.insts[0].i = [rows, n, k, 1, 0, 0, 0, 0];
                 let route = routes(&p, &t, 1).unwrap()[0].unwrap();
                 let args = arguments(route, [0x100000000000, 32, 64], spec, info1);
-                assert_eq!(args.dims[3], n.div_ceil(spec.mt_i) * rows.div_ceil(spec.mt_j));
+                assert_eq!(
+                    args.dims[3],
+                    n.div_ceil(spec.mt_i) * rows.div_ceil(spec.mt_j)
+                );
                 assert_eq!(args.dims[4..6], [n, rows]);
             }
         }

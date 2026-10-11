@@ -59,7 +59,10 @@ pub(crate) struct HeadMajorLayout {
 pub(crate) fn check_transferable(insts: &[DevInst64], names: &[String]) -> Result<()> {
     for d in insts {
         if d.op == DevOp::QwenHeadNormRope as u16 {
-            let dst = names.get(d.t[0] as usize).map(String::as_str).unwrap_or("?");
+            let dst = names
+                .get(d.t[0] as usize)
+                .map(String::as_str)
+                .unwrap_or("?");
             return Err(RuntimeError::Device(format!(
                 "QwenHeadNormRope KV cache `{dst}` is not supported by KV handoff"
             )));
@@ -67,7 +70,10 @@ pub(crate) fn check_transferable(insts: &[DevInst64], names: &[String]) -> Resul
         let is_hn = d.op == DevOp::HeadNormRope as u16 || d.op == DevOp::HeadNormRopeFp8 as u16;
         if is_hn && d.fj[1] != 0 {
             if d.i[1] == 0 {
-                let dst = names.get(d.t[0] as usize).map(String::as_str).unwrap_or("?");
+                let dst = names
+                    .get(d.t[0] as usize)
+                    .map(String::as_str)
+                    .unwrap_or("?");
                 return Err(RuntimeError::Device(format!(
                     "head-major KV cache `{dst}` has zero heads in instruction"
                 )));
@@ -75,7 +81,10 @@ pub(crate) fn check_transferable(insts: &[DevInst64], names: &[String]) -> Resul
             if d.op == DevOp::HeadNormRopeFp8 as u16 {
                 let scale_handle = d.t[6] as usize;
                 if d.t[6] == packet::dev::TENSOR_NONE16 || scale_handle >= names.len() {
-                    let dst = names.get(d.t[0] as usize).map(String::as_str).unwrap_or("?");
+                    let dst = names
+                        .get(d.t[0] as usize)
+                        .map(String::as_str)
+                        .unwrap_or("?");
                     return Err(RuntimeError::Device(format!(
                         "head-major fp8 KV cache `{dst}` missing valid scale tensor in t[6]"
                     )));
@@ -176,8 +185,7 @@ pub(crate) fn plan(
     }
     let mut plan = Vec::with_capacity(tensors.len());
     for t in tensors {
-        if packet::ctx_bound::tensor_scaling(&t.name)
-            == packet::ctx_bound::Scaling::IndexerBlock16
+        if packet::ctx_bound::tensor_scaling(&t.name) == packet::ctx_bound::Scaling::IndexerBlock16
         {
             if rows_per_slot % 16 != 0
                 || t.per_slot_bytes != packet::ctx_bound::indexer_prefix_bytes(rows_per_slot)
@@ -185,17 +193,22 @@ pub(crate) fn plan(
                 || head_majors.iter().any(|(name, _)| *name == t.name)
             {
                 return Err(RuntimeError::Device(format!(
-                    "packed FP8 indexer `{}` has incompatible slot geometry", t.name
+                    "packed FP8 indexer `{}` has incompatible slot geometry",
+                    t.name
                 )));
             }
             plan.push(CopySpan {
                 handle: t.handle,
-                src_off: u64::from(src_slot).checked_mul(t.per_slot_bytes).ok_or_else(|| {
-                    RuntimeError::Device("packed indexer source offset overflows".into())
-                })?,
-                dst_off: u64::from(dst_slot).checked_mul(t.per_slot_bytes).ok_or_else(|| {
-                    RuntimeError::Device("packed indexer destination offset overflows".into())
-                })?,
+                src_off: u64::from(src_slot)
+                    .checked_mul(t.per_slot_bytes)
+                    .ok_or_else(|| {
+                        RuntimeError::Device("packed indexer source offset overflows".into())
+                    })?,
+                dst_off: u64::from(dst_slot)
+                    .checked_mul(t.per_slot_bytes)
+                    .ok_or_else(|| {
+                        RuntimeError::Device("packed indexer destination offset overflows".into())
+                    })?,
                 bytes: packet::ctx_bound::indexer_prefix_bytes(rows),
             });
             continue;
@@ -320,25 +333,60 @@ mod tests {
     #[test]
     fn packed_indexer_handoff_copies_whole_blocks_into_the_selected_slot() {
         let cache = [t(4, "kv.6.kidx_fp8", 64 * 132)];
-        for (rows, bytes) in [(1, 2112), (15, 2112), (16, 2112), (17, 4224), (63, 8448), (64, 8448)] {
+        for (rows, bytes) in [
+            (1, 2112),
+            (15, 2112),
+            (16, 2112),
+            (17, 4224),
+            (63, 8448),
+            (64, 8448),
+        ] {
             let p = plan_seq(&cache, 64, &[], 2, 5, rows).unwrap();
-            assert_eq!(p, [CopySpan { handle: 4, src_off: 2 * 8448,
-                dst_off: 5 * 8448, bytes }]);
+            assert_eq!(
+                p,
+                [CopySpan {
+                    handle: 4,
+                    src_off: 2 * 8448,
+                    dst_off: 5 * 8448,
+                    bytes
+                }]
+            );
             let source = vec![0xa5; 3 * 8448];
             let mut dest = vec![0x55; 7 * 8448];
             let span = &p[0];
             dest[span.dst_off as usize..(span.dst_off + bytes) as usize]
                 .copy_from_slice(&source[span.src_off as usize..(span.src_off + bytes) as usize]);
             assert!(dest[..5 * 8448].iter().all(|&b| b == 0x55));
-            assert!(dest[5 * 8448..5 * 8448 + bytes as usize].iter().all(|&b| b == 0xa5));
+            assert!(dest[5 * 8448..5 * 8448 + bytes as usize]
+                .iter()
+                .all(|&b| b == 0xa5));
             assert!(dest[5 * 8448 + bytes as usize..].iter().all(|&b| b == 0x55));
         }
         assert!(plan_seq(&cache, 63, &[], 0, 0, 1).is_err());
         assert!(plan_seq(&[t(4, "kv.6.kidx_fp8", 8447)], 64, &[], 0, 0, 1).is_err());
         assert!(plan_seq(&cache, 64, &[("kv.6.kidx_fp8".into(), 2)], 0, 0, 16).is_err());
-        assert!(plan(&cache, 64, &[], &[("kv.6.kidx_fp8".into(), HeadMajorLayout { heads: 1, stride: 64 })], 0, 0, 16).is_err());
+        assert!(plan(
+            &cache,
+            64,
+            &[],
+            &[(
+                "kv.6.kidx_fp8".into(),
+                HeadMajorLayout {
+                    heads: 1,
+                    stride: 64
+                }
+            )],
+            0,
+            0,
+            16
+        )
+        .is_err());
         let ctx = u32::MAX - 15;
-        let huge = [t(4, "kv.6.kidx_fp8", packet::ctx_bound::indexer_prefix_bytes(ctx))];
+        let huge = [t(
+            4,
+            "kv.6.kidx_fp8",
+            packet::ctx_bound::indexer_prefix_bytes(ctx),
+        )];
         assert!(plan_seq(&huge, ctx, &[], u32::MAX, 0, 1).is_err());
         assert!(plan_seq(&huge, ctx, &[], 0, u32::MAX, 1).is_err());
     }
@@ -349,8 +397,18 @@ mod tests {
         assert_eq!(
             p,
             vec![
-                CopySpan { handle: 3, src_off: 0, dst_off: 0, bytes: 3 * 512 * 2 },
-                CopySpan { handle: 4, src_off: 0, dst_off: 0, bytes: 3 * 64 * 2 },
+                CopySpan {
+                    handle: 3,
+                    src_off: 0,
+                    dst_off: 0,
+                    bytes: 3 * 512 * 2
+                },
+                CopySpan {
+                    handle: 4,
+                    src_off: 0,
+                    dst_off: 0,
+                    bytes: 3 * 64 * 2
+                },
             ]
         );
     }
@@ -396,7 +454,9 @@ mod tests {
     fn a_head_must_end_on_a_pool_boundary() {
         let pooled = vec![t(7, "kv.0.kidx", 2 * 64)];
         let pools = [("kv.0.kidx".to_string(), 4u32)];
-        let err = plan_seq(&pooled, 8, &pools, 0, 0, 6).unwrap_err().to_string();
+        let err = plan_seq(&pooled, 8, &pools, 0, 0, 6)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("pool boundary"), "{err}");
         assert!(err.contains("kv.0.kidx"), "{err}");
     }
@@ -494,10 +554,34 @@ mod tests {
         assert_eq!(
             hm,
             vec![
-                ("kv.0.k".to_string(), HeadMajorLayout { heads: 8, stride: 4096 }),
-                ("kv.0.k_scale".to_string(), HeadMajorLayout { heads: 8, stride: 4096 }),
-                ("kv.0.v".to_string(), HeadMajorLayout { heads: 8, stride: 4096 }),
-                ("kv.0.v_scale".to_string(), HeadMajorLayout { heads: 8, stride: 4096 }),
+                (
+                    "kv.0.k".to_string(),
+                    HeadMajorLayout {
+                        heads: 8,
+                        stride: 4096
+                    }
+                ),
+                (
+                    "kv.0.k_scale".to_string(),
+                    HeadMajorLayout {
+                        heads: 8,
+                        stride: 4096
+                    }
+                ),
+                (
+                    "kv.0.v".to_string(),
+                    HeadMajorLayout {
+                        heads: 8,
+                        stride: 4096
+                    }
+                ),
+                (
+                    "kv.0.v_scale".to_string(),
+                    HeadMajorLayout {
+                        heads: 8,
+                        stride: 4096
+                    }
+                ),
             ]
         );
     }
@@ -513,8 +597,20 @@ mod tests {
         assert_eq!(
             hm,
             vec![
-                ("kv.0.k".to_string(), HeadMajorLayout { heads: 8, stride: 4096 }),
-                ("kv.0.v".to_string(), HeadMajorLayout { heads: 8, stride: 4096 }),
+                (
+                    "kv.0.k".to_string(),
+                    HeadMajorLayout {
+                        heads: 8,
+                        stride: 4096
+                    }
+                ),
+                (
+                    "kv.0.v".to_string(),
+                    HeadMajorLayout {
+                        heads: 8,
+                        stride: 4096
+                    }
+                ),
             ]
         );
     }

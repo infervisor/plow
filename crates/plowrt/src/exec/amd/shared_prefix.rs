@@ -286,7 +286,10 @@ pub(super) fn attach_ranks<T>(
         0
     };
     let evicted_before: (u64, u64) = if tick {
-        ranks.iter_mut().map(|rank| cache(rank).evicted()).fold((0, 0), |(n, s), (dn, ds)| (n + dn, s + ds))
+        ranks
+            .iter_mut()
+            .map(|rank| cache(rank).evicted())
+            .fold((0, 0), |(n, s), (dn, ds)| (n + dn, s + ds))
     } else {
         (0, 0)
     };
@@ -426,16 +429,21 @@ impl SharedPrefix {
         for g in &mut groups {
             g.pool.enable_strict_publish();
         }
-        let (fine_rows, fine_ceiling) = match crate::config::RuntimeConfig::get().amd_prefix_fine_rows() {
-            Some(fine_rows) if fine_rows > 0 => {
-                let ceiling = groups.iter().map(|g| g.pool.block_rows()).max().unwrap_or(0);
-                for g in &mut groups {
-                    g.pool.enable_fine_matching(fine_rows, ceiling);
+        let (fine_rows, fine_ceiling) =
+            match crate::config::RuntimeConfig::get().amd_prefix_fine_rows() {
+                Some(fine_rows) if fine_rows > 0 => {
+                    let ceiling = groups
+                        .iter()
+                        .map(|g| g.pool.block_rows())
+                        .max()
+                        .unwrap_or(0);
+                    for g in &mut groups {
+                        g.pool.enable_fine_matching(fine_rows, ceiling);
+                    }
+                    (fine_rows, ceiling)
                 }
-                (fine_rows, ceiling)
-            }
-            _ => (0, 0),
-        };
+                _ => (0, 0),
+            };
         Ok(Self {
             groups,
             scales: layout.scales,
@@ -500,9 +508,12 @@ impl SharedPrefix {
     /// group — so eviction under the static `cache_cap` or `enable_pressure_eviction`'s real
     /// free-memory floor is a number in the log, not an inference from the miss rate.
     pub fn evicted(&self) -> (u64, u64) {
-        self.groups.iter().map(|g| g.pool.stats()).fold((0, 0), |(n, s), stats| {
-            (n + stats.nodes_evicted, s + stats.snapshots_evicted)
-        })
+        self.groups
+            .iter()
+            .map(|g| g.pool.stats())
+            .fold((0, 0), |(n, s), stats| {
+                (n + stats.nodes_evicted, s + stats.snapshots_evicted)
+            })
     }
 
     /// Private block mappings made by `ensure_rows` so far (one driver map each).
@@ -645,15 +656,28 @@ impl SharedPrefix {
     /// request's overall matched depth ends). Same per-tensor-then-scales layout and order
     /// as `copy_snapshot`, so a chunk this creates is a valid segment for
     /// `restore_fine_segments`.
-    fn copy_fine_chunk(&self, group: usize, slot: usize, chunk_start: u32, mut snapshot: u64, to_snapshot: bool) -> Result<()> {
+    fn copy_fine_chunk(
+        &self,
+        group: usize,
+        slot: usize,
+        chunk_start: u32,
+        mut snapshot: u64,
+        to_snapshot: bool,
+    ) -> Result<()> {
         let g = &self.groups[group];
         let fine_rows = self.fine_rows;
         let mut pairs = Vec::new();
         let mut copy = |tensor: &CacheTensor, start: u32, count: u32| {
             let bytes = u64::from(count) * tensor.row_bytes;
             if bytes != 0 {
-                let address = tensor.base + slot as u64 * tensor.slot_bytes + u64::from(start) * tensor.row_bytes;
-                let (dst, src) = if to_snapshot { (snapshot, address) } else { (address, snapshot) };
+                let address = tensor.base
+                    + slot as u64 * tensor.slot_bytes
+                    + u64::from(start) * tensor.row_bytes;
+                let (dst, src) = if to_snapshot {
+                    (snapshot, address)
+                } else {
+                    (address, snapshot)
+                };
                 pairs.push((dst, src, bytes));
                 snapshot += bytes;
             }
@@ -673,7 +697,12 @@ impl SharedPrefix {
     /// one independently-owned chunk (built by [`Self::copy_fine_chunk`], possibly published
     /// by a completely different request that happened to share this prefix), laid end to
     /// end in row order — never one contiguous buffer the way `snap_va` is.
-    fn restore_fine_segments(&self, group: usize, slot: usize, segments: &[(u64, u64)]) -> Result<()> {
+    fn restore_fine_segments(
+        &self,
+        group: usize,
+        slot: usize,
+        segments: &[(u64, u64)],
+    ) -> Result<()> {
         let g = &self.groups[group];
         let fine_rows = u64::from(self.fine_rows);
         let mut pairs = Vec::new();
@@ -683,7 +712,9 @@ impl SharedPrefix {
             let mut copy = |tensor: &CacheTensor, cursor: &mut u64| {
                 let bytes = fine_rows * tensor.row_bytes;
                 if bytes != 0 {
-                    let address = tensor.base + slot as u64 * tensor.slot_bytes + row_offset * tensor.row_bytes;
+                    let address = tensor.base
+                        + slot as u64 * tensor.slot_bytes
+                        + row_offset * tensor.row_bytes;
                     pairs.push((address, *cursor, bytes));
                     *cursor += bytes;
                 }
@@ -773,9 +804,13 @@ impl SharedPrefix {
                     continue;
                 }
                 let chunk_bytes = self.fine_snapshot_bytes(index);
-                group.pool.publish_fine(prompt, self.fine_rows, depth, chunk_bytes, |chunk, va| {
-                    self.copy_fine_chunk(index, slot, chunk * self.fine_rows, va, true)
-                })?;
+                group.pool.publish_fine(
+                    prompt,
+                    self.fine_rows,
+                    depth,
+                    chunk_bytes,
+                    |chunk, va| self.copy_fine_chunk(index, slot, chunk * self.fine_rows, va, true),
+                )?;
             } else {
                 group.pool.publish_at(
                     slot,
@@ -806,7 +841,10 @@ impl SharedPrefix {
     /// prompt's end, or where every cache group ends on a whole block.
     pub fn publishes_at(&self, prompt_len: usize, frontier: u32) -> bool {
         frontier as usize >= prompt_len
-            || self.groups.iter().all(|g| frontier % g.pool.block_rows() == 0)
+            || self
+                .groups
+                .iter()
+                .all(|g| frontier % g.pool.block_rows() == 0)
     }
 
     /// [`Self::publish_completed_chunk`], run at the next [`Self::flush_publish`] instead of now,
@@ -822,7 +860,11 @@ impl SharedPrefix {
     pub fn defer_publish(&mut self, slot: usize, prompt: Arc<[u32]>, frontier: u32) -> Result<()> {
         self.flush_publish()?;
         if self.publishes_at(prompt.len(), frontier) {
-            self.deferred = Some(DeferredPublish { slot, prompt, frontier });
+            self.deferred = Some(DeferredPublish {
+                slot,
+                prompt,
+                frontier,
+            });
         }
         Ok(())
     }
@@ -1333,7 +1375,11 @@ mod tests {
         // The release-retire default maps its spare copy targets at load, off the reuse pool: no
         // window or cache block exists yet and nothing is pooled.
         cache.sync_reclaim();
-        let spares: u64 = cache.groups.iter().map(|g| g.pool.stats().blocks_created).sum();
+        let spares: u64 = cache
+            .groups
+            .iter()
+            .map(|g| g.pool.stats().blocks_created)
+            .sum();
         assert!(cache.groups.iter().all(|g| {
             let stats = g.pool.stats();
             stats.blocks_live == 0 && stats.blocks_pooled == 0
@@ -1500,7 +1546,10 @@ mod tests {
         cache.ensure_rows(0, 200).unwrap();
         fill(&ops, &bases, 0, 128, 17);
         cache.defer_publish(0, prompt.clone(), 100).unwrap();
-        assert!(cache.deferred.is_none(), "a chunk that publishes nothing stashes nothing");
+        assert!(
+            cache.deferred.is_none(),
+            "a chunk that publishes nothing stashes nothing"
+        );
         cache.defer_publish(0, prompt.clone(), 128).unwrap();
         assert!(cache.deferred.is_some());
         {
@@ -1511,7 +1560,10 @@ mod tests {
             }
         }
         cache.begin_slot(1).unwrap();
-        assert!(cache.deferred.is_none(), "admission flushes the deferred publish");
+        assert!(
+            cache.deferred.is_none(),
+            "admission flushes the deferred publish"
+        );
         assert_eq!(cache.stage_attach(1, &prompt).unwrap(), 128);
         cache.commit_attach(1, 128).unwrap();
         assert_rows(&ops, &bases, 1, 128, 17);
@@ -1533,7 +1585,10 @@ mod tests {
         fill(&ops, &bases, 0, 200, 29);
         cache.begin_slot(1).unwrap();
         let rows = cache.stage_attach(1, &prompt).unwrap();
-        assert!(rows >= 128, "the old prompt's publish is in the cache ({rows} rows)");
+        assert!(
+            rows >= 128,
+            "the old prompt's publish is in the cache ({rows} rows)"
+        );
         cache.commit_attach(1, rows).unwrap();
         assert_rows(&ops, &bases, 1, u64::from(rows), 17);
         cache.release(1);

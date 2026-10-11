@@ -1,6 +1,5 @@
 use packet::dev::{
-    DevOp, PrefillSpan, PREFILL_SPAN_DECODE, PREFILL_SPAN_RESET_STATE,
-    PREFILL_SPAN_SAMPLE,
+    DevOp, PrefillSpan, PREFILL_SPAN_DECODE, PREFILL_SPAN_RESET_STATE, PREFILL_SPAN_SAMPLE,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -364,7 +363,9 @@ where
     let (mut plain, mut tb) = (false, false);
     for (packed_only, body, ops) in progs {
         if packed_only || body {
-            let mla = ops.into_iter().any(|op| MLA.iter().any(|&m| m as u16 == op));
+            let mla = ops
+                .into_iter()
+                .any(|op| MLA.iter().any(|&m| m as u16 == op));
             plain |= packed_only && mla;
             tb |= body && mla;
         }
@@ -380,14 +381,26 @@ mod tests {
     /// siblings was refused at load for want of the plain pair it never dispatches to.
     #[test]
     fn packed_mla_families_are_required_only_by_the_programs_that_use_them() {
-        let mla = vec![DevOp::HeadNormRopeFp8 as u16, DevOp::FlashMlaPrefillFp8 as u16];
+        let mla = vec![
+            DevOp::HeadNormRopeFp8 as u16,
+            DevOp::FlashMlaPrefillFp8 as u16,
+        ];
         // (packed_prefill_only, token_batch_body, ops)
         let body = || (false, true, mla.clone());
         let sibling = || (true, false, mla.clone());
         let ordinary = || (false, false, mla.clone());
-        assert_eq!(packed_mla_families_needed([ordinary(), body()]), (false, true));
-        assert_eq!(packed_mla_families_needed([ordinary(), sibling()]), (true, false));
-        assert_eq!(packed_mla_families_needed([sibling(), body()]), (true, true));
+        assert_eq!(
+            packed_mla_families_needed([ordinary(), body()]),
+            (false, true)
+        );
+        assert_eq!(
+            packed_mla_families_needed([ordinary(), sibling()]),
+            (true, false)
+        );
+        assert_eq!(
+            packed_mla_families_needed([sibling(), body()]),
+            (true, true)
+        );
         // Only a packed program's MLA ops count, and a body without MLA ops needs neither.
         assert_eq!(packed_mla_families_needed([ordinary()]), (false, false));
         assert_eq!(
@@ -409,12 +422,7 @@ mod tests {
         }
     }
 
-    fn tb_sample_span(
-        row0: u32,
-        slot: u32,
-        kv_row0: u32,
-        decode: bool,
-    ) -> PrefillSpan {
+    fn tb_sample_span(row0: u32, slot: u32, kv_row0: u32, decode: bool) -> PrefillSpan {
         let mut span = tb_span(row0, 1, slot, kv_row0);
         span.flags |= PREFILL_SPAN_SAMPLE | u32::from(decode) * PREFILL_SPAN_DECODE;
         span
@@ -431,17 +439,13 @@ mod tests {
     fn sampled_prefill_terminal_preserves_natural_row_order() {
         let mut prefill = tb_span(1, 50, 2, 70);
         prefill.flags |= PREFILL_SPAN_SAMPLE;
-        let spans = [tb_sample_span(0, 0, 100, true), prefill, tb_span(51, 80, 3, 0)];
-        let rows = validate_token_batch_rows(
-            3,
-            256,
-            4,
-            2,
-            &[0, 50],
-            &spans,
-            &parked(131, 256),
-        )
-        .unwrap();
+        let spans = [
+            tb_sample_span(0, 0, 100, true),
+            prefill,
+            tb_span(51, 80, 3, 0),
+        ];
+        let rows =
+            validate_token_batch_rows(3, 256, 4, 2, &[0, 50], &spans, &parked(131, 256)).unwrap();
         assert_eq!((rows.n_spans, rows.real_rows), (3, 131));
     }
 
@@ -484,16 +488,9 @@ mod tests {
 
         let mut missing_sample = tb_span(0, 1, 0, 7);
         missing_sample.flags |= PREFILL_SPAN_DECODE;
-        assert!(validate_token_batch_rows(
-            3,
-            64,
-            4,
-            0,
-            &[],
-            &[missing_sample],
-            &parked(1, 64)
-        )
-        .is_err());
+        assert!(
+            validate_token_batch_rows(3, 64, 4, 0, &[], &[missing_sample], &parked(1, 64)).is_err()
+        );
     }
 
     #[test]

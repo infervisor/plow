@@ -26,7 +26,9 @@ pub fn read_section(pkt: &Path) -> Result<Option<Vec<u8>>> {
 
 /// The packet's multimodal contract, when it carries one.
 pub fn read_multimodal(pkt: &Path) -> Result<Option<plow_asset::multimodal::MmContract>> {
-    let Some(bytes) = read_named_section(pkt, plow_asset::multimodal::SECTION)? else { return Ok(None) };
+    let Some(bytes) = read_named_section(pkt, plow_asset::multimodal::SECTION)? else {
+        return Ok(None);
+    };
     plow_asset::multimodal::MmContract::from_json(&bytes)
         .map(Some)
         .map_err(|e| RuntimeError::Device(format!("{}: {e}", pkt.display())))
@@ -34,7 +36,10 @@ pub fn read_multimodal(pkt: &Path) -> Result<Option<plow_asset::multimodal::MmCo
 
 /// A metadata section's bytes, read from the section directory without loading the packet.
 pub fn read_named_section(pkt: &Path, section: &str) -> Result<Option<Vec<u8>>> {
-    let io = |source| RuntimeError::Io { path: pkt.to_path_buf(), source };
+    let io = |source| RuntimeError::Io {
+        path: pkt.to_path_buf(),
+        source,
+    };
     let bad = |what: &str| RuntimeError::Device(format!("{}: {what}", pkt.display()));
     let mut f = std::fs::File::open(pkt).map_err(io)?;
     let len = f.metadata().map_err(io)?.len();
@@ -76,7 +81,9 @@ pub fn read_named_section(pkt: &Path, section: &str) -> Result<Option<Vec<u8>>> 
             found = Some((off, size));
         }
     }
-    let Some((off, size)) = found else { return Ok(None) };
+    let Some((off, size)) = found else {
+        return Ok(None);
+    };
     f.seek(SeekFrom::Start(off)).map_err(io)?;
     let mut data = vec![0u8; size as usize];
     f.read_exact(&mut data).map_err(io)?;
@@ -97,7 +104,11 @@ pub fn resolve(asset_dir: &Path, checkpoint_dir: &Path) -> Result<ServeInfo> {
         None => None,
     };
     let Some(bytes) = section else {
-        return Ok(ServeInfo { manifest: ServeManifest::from_checkpoint(asset_dir, checkpoint_dir), multimodal, from_packet: false });
+        return Ok(ServeInfo {
+            manifest: ServeManifest::from_checkpoint(asset_dir, checkpoint_dir),
+            multimodal,
+            from_packet: false,
+        });
     };
     let manifest = ServeManifest::parse(&bytes).map_err(RuntimeError::Device)?;
     if !manifest.weights.is_empty() {
@@ -117,7 +128,11 @@ pub fn resolve(asset_dir: &Path, checkpoint_dir: &Path) -> Result<ServeInfo> {
             "the packet records no weight pins: checkpoint identity is checked only by tensor byte \
              sizes at bind");
     }
-    Ok(ServeInfo { manifest, multimodal, from_packet: true })
+    Ok(ServeInfo {
+        manifest,
+        multimodal,
+        from_packet: true,
+    })
 }
 
 /// Where a bundle's checkpoint came from (see [`checkpoint_dir`]).
@@ -215,12 +230,19 @@ pub fn checkpoint_dir(asset_dir: &Path) -> PathBuf {
 }
 
 pub fn checkpoint_source(asset_dir: &Path) -> (PathBuf, CheckpointSource) {
-    let explicit = explicit_checkpoints().read().get(&map_key(asset_dir)).cloned();
+    let explicit = explicit_checkpoints()
+        .read()
+        .get(&map_key(asset_dir))
+        .cloned();
     let process = crate::config::RuntimeConfig::get().checkpoint.clone();
     checkpoint_with(explicit, asset_dir, process.as_deref())
 }
 
-fn checkpoint_with(explicit: Option<PathBuf>, asset_dir: &Path, process: Option<&str>) -> (PathBuf, CheckpointSource) {
+fn checkpoint_with(
+    explicit: Option<PathBuf>,
+    asset_dir: &Path,
+    process: Option<&str>,
+) -> (PathBuf, CheckpointSource) {
     if let Some(path) = explicit {
         return (path, CheckpointSource::Explicit);
     }
@@ -244,11 +266,13 @@ pub fn log_checkpoints(asset_dirs: &[PathBuf]) {
         tracing::info!(model = %dir.display(), checkpoint = %path.display(), %source, "bundle checkpoint");
         match source {
             CheckpointSource::Process => via_process.push(dir.display().to_string()),
-            CheckpointSource::Bundled if process.as_deref().is_some_and(|p| !p.is_empty()) => tracing::warn!(
-                model = %dir.display(),
-                "PLOW_CHECKPOINT is ignored for this bundle: its own checkpoint/ wins (pass \
-                 `--assets DIR,checkpoint=PATH` to pair it explicitly)"
-            ),
+            CheckpointSource::Bundled if process.as_deref().is_some_and(|p| !p.is_empty()) => {
+                tracing::warn!(
+                    model = %dir.display(),
+                    "PLOW_CHECKPOINT is ignored for this bundle: its own checkpoint/ wins (pass \
+                     `--assets DIR,checkpoint=PATH` to pair it explicitly)"
+                )
+            }
             _ => {}
         }
     }
@@ -263,14 +287,20 @@ pub fn log_checkpoints(asset_dirs: &[PathBuf]) {
 /// applies to every bundle of the process), else the bundle's own `objects/`. Never derived
 /// from another bundle, so co-served bundles each pair with their own specialised objects.
 pub fn objects_dir(assets_dir: &Path) -> Option<PathBuf> {
-    objects_dir_with(crate::config::RuntimeConfig::get().nv.pf_seg_dir.as_deref(), assets_dir)
+    objects_dir_with(
+        crate::config::RuntimeConfig::get().nv.pf_seg_dir.as_deref(),
+        assets_dir,
+    )
 }
 
 fn objects_dir_with(explicit: Option<&str>, assets_dir: &Path) -> Option<PathBuf> {
-    explicit.filter(|dir| !dir.is_empty()).map(PathBuf::from).or_else(|| {
-        let own = assets_dir.join("objects");
-        own.is_dir().then_some(own)
-    })
+    explicit
+        .filter(|dir| !dir.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            let own = assets_dir.join("objects");
+            own.is_dir().then_some(own)
+        })
 }
 
 /// `serve.json` serve-knob defaults of the bundles in `asset_dirs`, plus the cuBLASLt table a
@@ -283,7 +313,11 @@ pub fn asset_env_defaults(
     env: impl Fn(&str) -> Option<String>,
 ) -> Result<Vec<(String, String, String)>> {
     let mut out: Vec<(String, String, String)> = Vec::new();
-    let mut put = |key: &str, value: String, source: String, out: &mut Vec<(String, String, String)>| -> Result<()> {
+    let mut put = |key: &str,
+                   value: String,
+                   source: String,
+                   out: &mut Vec<(String, String, String)>|
+     -> Result<()> {
         if env(key).is_some() {
             return Ok(());
         }
@@ -315,7 +349,12 @@ pub fn asset_env_defaults(
         }
         let lt = dir.join("cublaslt_algos.jsonl");
         if lt.is_file() && env("PLOW_LT_ALGOS_WRITE").is_none() {
-            put("PLOW_LT_ALGOS", lt.display().to_string(), dir.display().to_string(), &mut out)?;
+            put(
+                "PLOW_LT_ALGOS",
+                lt.display().to_string(),
+                dir.display().to_string(),
+                &mut out,
+            )?;
         }
     }
     Ok(out)
@@ -343,17 +382,24 @@ pub struct RuntimeRequires {
 /// `build.json` requires nothing.
 pub fn runtime_requires(asset_dir: &Path) -> Result<RuntimeRequires> {
     let path = asset_dir.join("build.json");
-    let Ok(bytes) = std::fs::read(&path) else { return Ok(RuntimeRequires::default()) };
+    let Ok(bytes) = std::fs::read(&path) else {
+        return Ok(RuntimeRequires::default());
+    };
     let build: serde_json::Value = serde_json::from_slice(&bytes)
         .map_err(|e| RuntimeError::Rejected(format!("{}: {e}", path.display())))?;
-    runtime_requires_from(&build).map_err(|e| RuntimeError::Rejected(format!("{}: {e}", path.display())))
+    runtime_requires_from(&build)
+        .map_err(|e| RuntimeError::Rejected(format!("{}: {e}", path.display())))
 }
 
-fn runtime_requires_from(build: &serde_json::Value) -> std::result::Result<RuntimeRequires, String> {
+fn runtime_requires_from(
+    build: &serde_json::Value,
+) -> std::result::Result<RuntimeRequires, String> {
     let mut out = RuntimeRequires::default();
     if let Some(declared) = build.get("runtime_requires") {
         if let Some(v) = declared.get("cublaslt") {
-            let text = v.as_str().ok_or("runtime_requires.cublaslt must be a version string")?;
+            let text = v
+                .as_str()
+                .ok_or("runtime_requires.cublaslt must be a version string")?;
             out.cublaslt = Some((parse_version(text)?, "declared in build.json".into()));
         }
         if let Some(v) = declared.get("plowrt_contract") {
@@ -364,10 +410,18 @@ fn runtime_requires_from(build: &serde_json::Value) -> std::result::Result<Runti
         }
         return Ok(out);
     }
-    let knob = |k: &str| build.pointer(&format!("/knobs/values/{}", k.replace('/', "~1"))) == Some(&true.into());
-    let grouped: Vec<&str> = ["emit.moe_pf_lt", "emit.moe_dec_lt"].into_iter().filter(|k| knob(k)).collect();
+    let knob = |k: &str| {
+        build.pointer(&format!("/knobs/values/{}", k.replace('/', "~1"))) == Some(&true.into())
+    };
+    let grouped: Vec<&str> = ["emit.moe_pf_lt", "emit.moe_dec_lt"]
+        .into_iter()
+        .filter(|k| knob(k))
+        .collect();
     if !grouped.is_empty() {
-        out.cublaslt = Some((GROUPED_LT, format!("grouped cuBLASLt MoE route ({})", grouped.join(", "))));
+        out.cublaslt = Some((
+            GROUPED_LT,
+            format!("grouped cuBLASLt MoE route ({})", grouped.join(", ")),
+        ));
     }
     Ok(out)
 }
@@ -377,12 +431,17 @@ fn parse_version(text: &str) -> std::result::Result<usize, String> {
     let parts: Vec<usize> = text
         .trim()
         .split('.')
-        .map(|p| p.parse().map_err(|_| format!("bad cuBLASLt version {text:?}")))
+        .map(|p| {
+            p.parse()
+                .map_err(|_| format!("bad cuBLASLt version {text:?}"))
+        })
         .collect::<std::result::Result<_, _>>()?;
     match parts[..] {
         [major] => Ok(major * 10000),
         [major, minor] if minor < 100 => Ok(major * 10000 + minor * 100),
-        [major, minor, patch] if minor < 100 && patch < 100 => Ok(major * 10000 + minor * 100 + patch),
+        [major, minor, patch] if minor < 100 && patch < 100 => {
+            Ok(major * 10000 + minor * 100 + patch)
+        }
         _ => Err(format!("bad cuBLASLt version {text:?}")),
     }
 }
@@ -407,7 +466,9 @@ pub fn check_runtime(
             req.plowrt_contract
         )));
     }
-    let Some((need, why)) = &req.cublaslt else { return Ok(()) };
+    let Some((need, why)) = &req.cublaslt else {
+        return Ok(());
+    };
     let have = match lt {
         Ok((path, v)) if v >= need => {
             tracing::info!(model = %asset_dir.display(), cublaslt = %path.display(), version = %show_version(*v),
@@ -436,10 +497,21 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let arg = format!("{},checkpoint=/hf/model@abc", dir.display());
-        assert_eq!(split_asset_arg(Path::new(&arg)).unwrap(), (dir.clone(), Some(PathBuf::from("/hf/model@abc"))));
+        assert_eq!(
+            split_asset_arg(Path::new(&arg)).unwrap(),
+            (dir.clone(), Some(PathBuf::from("/hf/model@abc")))
+        );
         assert_eq!(split_asset_arg(&dir).unwrap(), (dir.clone(), None));
-        for bad in [",checkpoint=", ",ckpt=/x", ",checkpoint=/a,checkpoint=/b", ","] {
-            assert!(split_asset_arg(Path::new(&format!("{}{bad}", dir.display()))).is_err(), "{bad}");
+        for bad in [
+            ",checkpoint=",
+            ",ckpt=/x",
+            ",checkpoint=/a,checkpoint=/b",
+            ",",
+        ] {
+            assert!(
+                split_asset_arg(Path::new(&format!("{}{bad}", dir.display()))).is_err(),
+                "{bad}"
+            );
         }
         // An existing path is literal even with a comma in its name.
         let comma = dir.join("a,checkpoint=b");
@@ -447,7 +519,10 @@ mod tests {
         assert_eq!(split_asset_arg(&comma).unwrap(), (comma.clone(), None));
 
         assert_eq!(take_asset_arg(Path::new(&arg)).unwrap(), dir);
-        assert_eq!(checkpoint_source(&dir), (PathBuf::from("/hf/model@abc"), CheckpointSource::Explicit));
+        assert_eq!(
+            checkpoint_source(&dir),
+            (PathBuf::from("/hf/model@abc"), CheckpointSource::Explicit)
+        );
         assert!(set_checkpoint(&dir, Path::new("/hf/model@abc")).is_ok());
         assert!(set_checkpoint(&dir, Path::new("/hf/other")).is_err());
         std::fs::remove_dir_all(dir).unwrap();
@@ -459,39 +534,86 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let explicit = Some(PathBuf::from("/hf/x"));
-        assert_eq!(checkpoint_with(None, &dir, None), (dir.join("checkpoint"), CheckpointSource::Missing));
-        assert_eq!(checkpoint_with(None, &dir, Some("/p")), (PathBuf::from("/p"), CheckpointSource::Process));
+        assert_eq!(
+            checkpoint_with(None, &dir, None),
+            (dir.join("checkpoint"), CheckpointSource::Missing)
+        );
+        assert_eq!(
+            checkpoint_with(None, &dir, Some("/p")),
+            (PathBuf::from("/p"), CheckpointSource::Process)
+        );
         std::fs::create_dir_all(dir.join("checkpoint")).unwrap();
-        assert_eq!(checkpoint_with(None, &dir, Some("/p")), (dir.join("checkpoint"), CheckpointSource::Bundled));
-        assert_eq!(checkpoint_with(explicit, &dir, Some("/p")), (PathBuf::from("/hf/x"), CheckpointSource::Explicit));
+        assert_eq!(
+            checkpoint_with(None, &dir, Some("/p")),
+            (dir.join("checkpoint"), CheckpointSource::Bundled)
+        );
+        assert_eq!(
+            checkpoint_with(explicit, &dir, Some("/p")),
+            (PathBuf::from("/hf/x"), CheckpointSource::Explicit)
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
     fn runtime_requirements_come_from_build_json() {
-        let none = runtime_requires_from(&serde_json::json!({"knobs": {"values": {"emit.moe_pf_lt": false}}})).unwrap();
+        let none = runtime_requires_from(
+            &serde_json::json!({"knobs": {"values": {"emit.moe_pf_lt": false}}}),
+        )
+        .unwrap();
         assert_eq!(none, RuntimeRequires::default());
-        let moe = runtime_requires_from(&serde_json::json!({"knobs": {"values": {"emit.moe_pf_lt": true}}})).unwrap();
+        let moe = runtime_requires_from(
+            &serde_json::json!({"knobs": {"values": {"emit.moe_pf_lt": true}}}),
+        )
+        .unwrap();
         assert_eq!(moe.cublaslt.as_ref().map(|c| c.0), Some(130400));
         let declared = serde_json::json!({"runtime_requires": {"cublaslt": "13.4.2", "plowrt_contract": 1},
             "knobs": {"values": {"emit.moe_pf_lt": true}}});
         let declared = runtime_requires_from(&declared).unwrap();
-        assert_eq!((declared.cublaslt.map(|c| c.0), declared.plowrt_contract), (Some(130402), 1));
-        assert!(runtime_requires_from(&serde_json::json!({"runtime_requires": {"cublaslt": 13}})).is_err());
-        assert!(runtime_requires_from(&serde_json::json!({"runtime_requires": {"cublaslt": "13.x"}})).is_err());
+        assert_eq!(
+            (declared.cublaslt.map(|c| c.0), declared.plowrt_contract),
+            (Some(130402), 1)
+        );
+        assert!(
+            runtime_requires_from(&serde_json::json!({"runtime_requires": {"cublaslt": 13}}))
+                .is_err()
+        );
+        assert!(runtime_requires_from(
+            &serde_json::json!({"runtime_requires": {"cublaslt": "13.x"}})
+        )
+        .is_err());
         assert_eq!(parse_version("12").unwrap(), 120000);
     }
 
     #[test]
     fn runtime_check_fails_closed() {
         let dir = Path::new("/m/gemma-26b");
-        let req = RuntimeRequires { cublaslt: Some((130400, "grouped".into())), plowrt_contract: 1 };
-        assert!(check_runtime(dir, &req, &Ok((PathBuf::from("/rt/libcublasLt.so.13"), 130402))).is_ok());
-        let old = check_runtime(dir, &req, &Ok((PathBuf::from("/rt/libcublasLt.so.12"), 120901))).unwrap_err().to_string();
-        assert!(old.contains("/m/gemma-26b") && old.contains("13.4.0") && old.contains("12.9.1"), "{old}");
+        let req = RuntimeRequires {
+            cublaslt: Some((130400, "grouped".into())),
+            plowrt_contract: 1,
+        };
+        assert!(check_runtime(
+            dir,
+            &req,
+            &Ok((PathBuf::from("/rt/libcublasLt.so.13"), 130402))
+        )
+        .is_ok());
+        let old = check_runtime(
+            dir,
+            &req,
+            &Ok((PathBuf::from("/rt/libcublasLt.so.12"), 120901)),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            old.contains("/m/gemma-26b") && old.contains("13.4.0") && old.contains("12.9.1"),
+            "{old}"
+        );
         assert!(check_runtime(dir, &req, &Err("no loadable cuBLASLt".into())).is_err());
         assert!(check_runtime(dir, &RuntimeRequires::default(), &Err("none".into())).is_ok());
-        let newer = RuntimeRequires { plowrt_contract: RUNTIME_CONTRACT + 1, ..Default::default() };
+        let newer = RuntimeRequires {
+            plowrt_contract: RUNTIME_CONTRACT + 1,
+            ..Default::default()
+        };
         assert!(check_runtime(dir, &newer, &Ok((PathBuf::new(), 130402))).is_err());
     }
 
@@ -499,7 +621,11 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("plowrt-serve-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let mut sections = vec![SectionData { kind: packet::devbuild::SECT_METADATA, name: "other".into(), data: b"{}".to_vec() }];
+        let mut sections = vec![SectionData {
+            kind: packet::devbuild::SECT_METADATA,
+            name: "other".into(),
+            data: b"{}".to_vec(),
+        }];
         if let Some(m) = serve {
             sections.push(SectionData {
                 kind: packet::devbuild::SECT_METADATA,
@@ -522,7 +648,11 @@ mod tests {
 
     #[test]
     fn packet_section_wins_and_a_legacy_packet_reads_the_checkpoint() {
-        let m = ServeManifest { version: 1, stop_token_ids: vec![7], ..Default::default() };
+        let m = ServeManifest {
+            version: 1,
+            stop_token_ids: vec![7],
+            ..Default::default()
+        };
         let dir = bundle("section", Some(&m));
         let info = resolve(&dir, &dir.join("checkpoint")).unwrap();
         assert!(info.from_packet);
@@ -530,7 +660,11 @@ mod tests {
 
         let legacy = bundle("legacy", None);
         std::fs::create_dir_all(legacy.join("checkpoint")).unwrap();
-        std::fs::write(legacy.join("checkpoint/generation_config.json"), r#"{"eos_token_id":[3,2]}"#).unwrap();
+        std::fs::write(
+            legacy.join("checkpoint/generation_config.json"),
+            r#"{"eos_token_id":[3,2]}"#,
+        )
+        .unwrap();
         let info = resolve(&legacy, &legacy.join("checkpoint")).unwrap();
         assert!(!info.from_packet);
         assert_eq!(info.manifest.stop_token_ids, [2, 3]);
@@ -540,8 +674,16 @@ mod tests {
 
     #[test]
     fn weight_pins_are_checked_at_resolve() {
-        let pin = plow_asset::serve_manifest::WeightPin { file: "w.safetensors".into(), bytes: 1, header_sha256: "x".into() };
-        let m = ServeManifest { version: 1, weights: vec![pin], ..Default::default() };
+        let pin = plow_asset::serve_manifest::WeightPin {
+            file: "w.safetensors".into(),
+            bytes: 1,
+            header_sha256: "x".into(),
+        };
+        let m = ServeManifest {
+            version: 1,
+            weights: vec![pin],
+            ..Default::default()
+        };
         let dir = bundle("pins", Some(&m));
         let err = resolve(&dir, &dir).unwrap_err().to_string();
         assert!(err.contains("does not match the packet"), "{err}");
@@ -557,8 +699,14 @@ mod tests {
         assert_eq!(objects_dir_with(None, &without), None);
         assert_eq!(objects_dir_with(Some(""), &without), None);
         // An explicit directory overrides every bundle's own.
-        assert_eq!(objects_dir_with(Some("/explicit"), &with), Some(PathBuf::from("/explicit")));
-        assert_eq!(objects_dir_with(Some("/explicit"), &without), Some(PathBuf::from("/explicit")));
+        assert_eq!(
+            objects_dir_with(Some("/explicit"), &with),
+            Some(PathBuf::from("/explicit"))
+        );
+        assert_eq!(
+            objects_dir_with(Some("/explicit"), &without),
+            Some(PathBuf::from("/explicit"))
+        );
         // Co-serving does not leak one bundle's objects/ into the process environment.
         let got = asset_env_defaults(&[with.clone(), without.clone()], |_| None).unwrap();
         assert!(!got.iter().any(|(k, _, _)| k == "PLOW_PF_SEG_DIR"));
@@ -568,18 +716,29 @@ mod tests {
 
     #[test]
     fn serve_defaults_yield_to_the_environment_and_must_be_runtime_knobs() {
-        let mut m = ServeManifest { version: 1, ..Default::default() };
-        m.serve_defaults.insert("PLOW_PF_INTERLEAVE".into(), "2048".into());
+        let mut m = ServeManifest {
+            version: 1,
+            ..Default::default()
+        };
+        m.serve_defaults
+            .insert("PLOW_PF_INTERLEAVE".into(), "2048".into());
         m.serve_defaults.insert("PLOW_MULTISTEP".into(), "0".into());
         let dir = bundle("defaults", Some(&m));
         std::fs::create_dir_all(dir.join("objects")).unwrap();
-        let got = asset_env_defaults(&[dir.clone()], |k| (k == "PLOW_MULTISTEP").then(|| "4".into())).unwrap();
-        let keys: Vec<_> = got.iter().map(|(k, v, _)| (k.as_str(), v.clone())).collect();
+        let got = asset_env_defaults(&[dir.clone()], |k| {
+            (k == "PLOW_MULTISTEP").then(|| "4".into())
+        })
+        .unwrap();
+        let keys: Vec<_> = got
+            .iter()
+            .map(|(k, v, _)| (k.as_str(), v.clone()))
+            .collect();
         assert!(keys.contains(&("PLOW_PF_INTERLEAVE", "2048".into())));
         assert!(!keys.iter().any(|(k, _)| *k == "PLOW_PF_SEG_DIR"));
         assert!(!keys.iter().any(|(k, _)| *k == "PLOW_MULTISTEP"));
 
-        m.serve_defaults.insert("PLOW_NOT_A_KNOB".into(), "1".into());
+        m.serve_defaults
+            .insert("PLOW_NOT_A_KNOB".into(), "1".into());
         let bad = bundle("defaults-bad", Some(&m));
         assert!(asset_env_defaults(&[bad.clone()], |_| None).is_err());
         std::fs::remove_dir_all(dir).unwrap();

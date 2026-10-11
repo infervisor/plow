@@ -129,7 +129,11 @@ const CDNA4: [MmaShape; 2] = [
 const APPLE: &[MmaShape] = &[MmaShape { m: 8, n: 8, k: 8 }];
 
 /// AMX `TDPBF16PS`: a 16x16 fp32 accumulator tile from 16x32 / 32x16 bf16 operand tiles.
-const AMX: &[MmaShape] = &[MmaShape { m: 16, n: 16, k: 32 }];
+const AMX: &[MmaShape] = &[MmaShape {
+    m: 16,
+    n: 16,
+    k: 32,
+}];
 
 pub fn shapes_for(arch: Arch) -> &'static [MmaShape] {
     match arch {

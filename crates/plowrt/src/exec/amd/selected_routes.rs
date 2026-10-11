@@ -471,12 +471,10 @@ mod tests {
                     .unwrap();
                 assert!(digests.insert(manifest.scoped_digest().unwrap()));
                 assert_eq!(manifest.packet_sha256, packet);
-                assert!(
-                    manifest
-                        .launches
-                        .iter()
-                        .all(|l| l.caller_abi_sha256.is_some())
-                );
+                assert!(manifest
+                    .launches
+                    .iter()
+                    .all(|l| l.caller_abi_sha256.is_some()));
                 let mut changed = variants.clone();
                 for v in &mut changed {
                     for l in &mut v.launches {

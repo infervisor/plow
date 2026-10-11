@@ -40,7 +40,12 @@ struct Encode {
 /// alongside them costs less.)
 /// `cost_id`: the encoder's id in [`crate::sched::cost`]; launches are sized at `frame_us` of
 /// audio per feature frame.
-fn encode_loop(rx: std::sync::mpsc::Receiver<Encode>, mut encoder: PacketAudioEncoder, cost_id: usize, frame_us: u32) {
+fn encode_loop(
+    rx: std::sync::mpsc::Receiver<Encode>,
+    mut encoder: PacketAudioEncoder,
+    cost_id: usize,
+    frame_us: u32,
+) {
     let audio_ms = |frames: usize| (frames as u64 * u64::from(frame_us) / 1000) as u32;
     let max_chunks = encoder.max_packed_chunks();
     let mut pending: std::collections::VecDeque<Encode> = Default::default();
@@ -69,7 +74,13 @@ fn encode_loop(rx: std::sync::mpsc::Receiver<Encode>, mut encoder: PacketAudioEn
                     wall_ms = started.elapsed().as_secs_f64() * 1e3,
                     "asr: single encoder launch"
                 );
-                crate::sched::cost::record_id(cost_id, crate::sched::cost::Op::Encode { audio_ms: audio_ms(job.features.frames) }, started.elapsed());
+                crate::sched::cost::record_id(
+                    cost_id,
+                    crate::sched::cost::Op::Encode {
+                        audio_ms: audio_ms(job.features.frames),
+                    },
+                    started.elapsed(),
+                );
                 let _ = job.respond.send(rows);
                 continue;
             }
@@ -80,12 +91,21 @@ fn encode_loop(rx: std::sync::mpsc::Receiver<Encode>, mut encoder: PacketAudioEn
             tracing::debug!(
                 items = n,
                 finals = batch.iter().filter(|job| job.urgent).count(),
-                chunks = features.iter().map(|f| encoder.chunks(f.frames)).sum::<usize>(),
+                chunks = features
+                    .iter()
+                    .map(|f| encoder.chunks(f.frames))
+                    .sum::<usize>(),
                 gpu_ms = encoder.last_gpu_us() / 1e3,
                 wall_ms = started.elapsed().as_secs_f64() * 1e3,
                 "asr: packed encoder launch"
             );
-            crate::sched::cost::record_id(cost_id, crate::sched::cost::Op::Encode { audio_ms: features.iter().map(|f| audio_ms(f.frames)).sum() }, started.elapsed());
+            crate::sched::cost::record_id(
+                cost_id,
+                crate::sched::cost::Op::Encode {
+                    audio_ms: features.iter().map(|f| audio_ms(f.frames)).sum(),
+                },
+                started.elapsed(),
+            );
             match encoded {
                 Ok(rows) => {
                     for (job, rows) in batch.into_iter().zip(rows) {
@@ -94,7 +114,9 @@ fn encode_loop(rx: std::sync::mpsc::Receiver<Encode>, mut encoder: PacketAudioEn
                 }
                 Err(e) => {
                     for job in batch {
-                        let _ = job.respond.send(Err(RuntimeError::Msg(format!("ASR encoder: {e}"))));
+                        let _ = job
+                            .respond
+                            .send(Err(RuntimeError::Msg(format!("ASR encoder: {e}"))));
                     }
                 }
             }
@@ -134,19 +156,34 @@ impl SharedAsr {
 
     fn load(slug: &str, dir: &Path, max_context: usize, batch: usize, device: u8) -> Result<Self> {
         let checkpoint = crate::asset::serve::checkpoint_dir(dir);
-        let checkpoint = if checkpoint.is_dir() { checkpoint } else { dir.to_path_buf() };
+        let checkpoint = if checkpoint.is_dir() {
+            checkpoint
+        } else {
+            dir.to_path_buf()
+        };
         let prompt = AudioLmPrompt::load(&dir.join("model.pkt"), &checkpoint)?;
-        let encoder_path =
-            crate::exec::packet_runtime::stage_packet(&dir.join("model.pkt"), "encoder.packet", "encoder.pkt")?;
+        let encoder_path = crate::exec::packet_runtime::stage_packet(
+            &dir.join("model.pkt"),
+            "encoder.packet",
+            "encoder.pkt",
+        )?;
         let mut encoder = PacketAudioEncoder::load_on(&encoder_path, "cuda", device)?;
         let warm = Instant::now();
         encoder.warm()?;
-        tracing::info!(ms = warm.elapsed().as_millis() as u64, packed_chunks = encoder.max_packed_chunks(), "asr: encoder graphs warmed");
+        tracing::info!(
+            ms = warm.elapsed().as_millis() as u64,
+            packed_chunks = encoder.max_packed_chunks(),
+            "asr: encoder graphs warmed"
+        );
         if encoder.output_width() != prompt.hidden() {
-            return Err(RuntimeError::Rejected("audio packet output width does not match the decoder".into()));
+            return Err(RuntimeError::Rejected(
+                "audio packet output width does not match the decoder".into(),
+            ));
         }
         let chunking = prompt.chunking();
-        let window_frames = encoder.window_rows() / chunking.chunk_frames.div_ceil(chunking.frame_stride) * chunking.chunk_frames;
+        let window_frames = encoder.window_rows()
+            / chunking.chunk_frames.div_ceil(chunking.frame_stride)
+            * chunking.chunk_frames;
         let (encode, rx) = std::sync::mpsc::channel::<Encode>();
         let cost_id = crate::sched::cost::id(&encoder_path.to_string_lossy());
         let frame_us = prompt.frontend().frame_us();
@@ -179,15 +216,29 @@ impl SharedAsr {
         cancel: Arc<AtomicBool>,
         opts: AsrOpts,
     ) -> std::result::Result<oneshot::Receiver<Result<Transcript>>, SubmitError> {
-        let permit = self.inflight.clone().try_acquire_owned().map_err(|_| SubmitError::Full)?;
+        let permit = self
+            .inflight
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| SubmitError::Full)?;
         let (mut tx, rx) = oneshot::channel();
         let this = Arc::clone(self);
         tokio::spawn(async move {
             let result = match opts.windows.clone().filter(|_| !opts.final_pass) {
                 // Work held across a preempt (an idle session's next turn) is told so up front.
-                _ if mux.preempted() => Err(RuntimeError::Unavailable(crate::serve::mux::PREEMPTED.into())),
-                Some(windows) => this.run_partial(mux, samples, windows, language, context, &cancel, opts, &mut tx).await,
-                None => this.run(mux, samples, language, context, &cancel, opts, &mut tx).await,
+                _ if mux.preempted() => Err(RuntimeError::Unavailable(
+                    crate::serve::mux::PREEMPTED.into(),
+                )),
+                Some(windows) => {
+                    this.run_partial(
+                        mux, samples, windows, language, context, &cancel, opts, &mut tx,
+                    )
+                    .await
+                }
+                None => {
+                    this.run(mux, samples, language, context, &cancel, opts, &mut tx)
+                        .await
+                }
             };
             drop(permit);
             let _ = tx.send(result);
@@ -197,11 +248,20 @@ impl SharedAsr {
 
     async fn encode_rows(&self, features: MelFeatures, urgent: bool) -> Result<Vec<f32>> {
         let (tx, rx) = oneshot::channel();
-        let encode = self.encode.lock().clone().ok_or_else(|| RuntimeError::Unavailable("ASR front released; retry".into()))?;
+        let encode = self
+            .encode
+            .lock()
+            .clone()
+            .ok_or_else(|| RuntimeError::Unavailable("ASR front released; retry".into()))?;
         encode
-            .send(Encode { features, urgent, respond: tx })
+            .send(Encode {
+                features,
+                urgent,
+                respond: tx,
+            })
             .map_err(|_| RuntimeError::Unavailable("ASR encoder thread is gone".into()))?;
-        rx.await.map_err(|_| RuntimeError::Unavailable("ASR encoder thread is gone".into()))?
+        rx.await
+            .map_err(|_| RuntimeError::Unavailable("ASR encoder thread is gone".into()))?
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -218,7 +278,12 @@ impl SharedAsr {
         let arrived = Instant::now();
         let prompt = Arc::clone(&self.prompt);
         let max_context = self.max_context;
-        let AudioLmRequest { features, ids, audio_positions, language } = tokio::task::spawn_blocking(move || {
+        let AudioLmRequest {
+            features,
+            ids,
+            audio_positions,
+            language,
+        } = tokio::task::spawn_blocking(move || {
             prompt.request(&samples, language.as_deref(), &context, max_context)
         })
         .await
@@ -235,8 +300,20 @@ impl SharedAsr {
             "asr: front + encode"
         );
         cancelled(cancel)?;
-        let (result, _) =
-            self.decode(mux, ids, audio_positions, overlay, Vec::new(), language, cancel, opts, answer, arrived).await?;
+        let (result, _) = self
+            .decode(
+                mux,
+                ids,
+                audio_positions,
+                overlay,
+                Vec::new(),
+                language,
+                cancel,
+                opts,
+                answer,
+                arrived,
+            )
+            .await?;
         Ok(result)
     }
 
@@ -267,17 +344,31 @@ impl SharedAsr {
         cancelled(cancel)?;
         let wf = self.window_frames;
         // A window is final once the frames after it cover the STFT's right context.
-        let stable = if wf == 0 { 0 } else { features.frames.saturating_sub(self.prompt.frontend().reach_frames()) / wf };
+        let stable = if wf == 0 {
+            0
+        } else {
+            features
+                .frames
+                .saturating_sub(self.prompt.frontend().reach_frames())
+                / wf
+        };
         let cached: Vec<Arc<[f32]>> = {
             let mut w = windows.lock();
             w.rows.truncate(stable);
             w.rows.clone()
         };
-        let mut pieces: Vec<(usize, usize)> = (cached.len()..stable).map(|w| (w * wf, (w + 1) * wf)).collect();
+        let mut pieces: Vec<(usize, usize)> = (cached.len()..stable)
+            .map(|w| (w * wf, (w + 1) * wf))
+            .collect();
         if stable * wf < features.frames {
             pieces.push((stable * wf, features.frames));
         }
-        let encoded = futures::future::try_join_all(pieces.iter().map(|&(a, b)| self.encode_rows(slice_frames(&features, a, b), false))).await?;
+        let encoded = futures::future::try_join_all(
+            pieces
+                .iter()
+                .map(|&(a, b)| self.encode_rows(slice_frames(&features, a, b), false)),
+        )
+        .await?;
         cancelled(cancel)?;
         let fresh = stable - cached.len();
         let hidden = self.prompt.hidden();
@@ -291,12 +382,24 @@ impl SharedAsr {
         {
             let mut w = windows.lock();
             if w.rows.len() == cached.len() {
-                w.rows.extend(encoded[..fresh].iter().map(|rows| Arc::from(rows.as_slice())));
+                w.rows.extend(
+                    encoded[..fresh]
+                        .iter()
+                        .map(|rows| Arc::from(rows.as_slice())),
+                );
             }
         }
         let rows = overlay.len() / hidden;
-        let (ids, audio_positions) = self.prompt.prompt(rows, language.as_deref(), &context, self.max_context)?;
-        tracing::debug!(frames = features.frames, windows_cached = cached.len(), windows_encoded = fresh, open_frames = features.frames - stable * wf, "asr: partial encode");
+        let (ids, audio_positions) =
+            self.prompt
+                .prompt(rows, language.as_deref(), &context, self.max_context)?;
+        tracing::debug!(
+            frames = features.frames,
+            windows_cached = cached.len(),
+            windows_encoded = fresh,
+            open_frames = features.frames - stable * wf,
+            "asr: partial encode"
+        );
         // Local agreement: the previous partial's transcript, less its last DRAFT_TAIL tokens, is
         // forced as prompt rows (one prefill, and resumed from the session's retained rows)
         // instead of decoded token by token again. Partials are revisable; the final decodes the
@@ -305,8 +408,20 @@ impl SharedAsr {
             let w = windows.lock();
             w.draft[..w.draft.len().saturating_sub(DRAFT_TAIL)].to_vec()
         };
-        let (result, output) =
-            self.decode(mux, ids, audio_positions, overlay, forced, language, cancel, opts, answer, arrived).await?;
+        let (result, output) = self
+            .decode(
+                mux,
+                ids,
+                audio_positions,
+                overlay,
+                forced,
+                language,
+                cancel,
+                opts,
+                answer,
+                arrived,
+            )
+            .await?;
         windows.lock().draft = output;
         Ok(result)
     }
@@ -343,9 +458,16 @@ impl SharedAsr {
         let prompt_tokens = ids.len();
         let overlay_pos: Vec<u32> = audio_positions.into_iter().map(|p| p as u32).collect();
         let report = opts.report.take();
-        let session = opts.ids.as_ref().filter(|i| i.session.is_some()).and_then(|i| {
-            i.ticket(crate::serve::session::row_keys(&ids, &overlay_pos, &[&overlay]), report)
-        });
+        let session = opts
+            .ids
+            .as_ref()
+            .filter(|i| i.session.is_some())
+            .and_then(|i| {
+                i.ticket(
+                    crate::serve::session::row_keys(&ids, &overlay_pos, &[&overlay]),
+                    report,
+                )
+            });
         let (respond, mut stream) = stream_mod::channel();
         let job = Job {
             prompt_ids: ids,
@@ -353,12 +475,22 @@ impl SharedAsr {
             arrived,
             respond,
             opts: JobOpts {
-                class: if opts.final_pass { JobClass::Final } else { JobClass::Bulk },
+                class: if opts.final_pass {
+                    JobClass::Final
+                } else {
+                    JobClass::Bulk
+                },
                 raw_tokens: true,
                 session,
                 turn: opts.ids.as_ref().and_then(|i| i.turn_key.clone()),
                 continuing: false,
-                speech: Some(Box::new(SpeechJob { overlay, overlay_pos, pos_base: None, cfg: None, first_tokens: 0 })),
+                speech: Some(Box::new(SpeechJob {
+                    overlay,
+                    overlay_pos,
+                    pos_base: None,
+                    cfg: None,
+                    first_tokens: 0,
+                })),
                 prefix: None,
                 tenant: None,
                 round: 0,
@@ -374,9 +506,13 @@ impl SharedAsr {
             return Err(preempted());
         }
         mux.submit_wait(job).await.map_err(|e| match e {
-            crate::serve::mux::SubmitError::Full(_) => RuntimeError::Overloaded("ASR queue full".into()),
+            crate::serve::mux::SubmitError::Full(_) => {
+                RuntimeError::Overloaded("ASR queue full".into())
+            }
             crate::serve::mux::SubmitError::Closed(_) if mux.preempted() => preempted(),
-            crate::serve::mux::SubmitError::Closed(_) => RuntimeError::Unavailable("model dispatcher unavailable".into()),
+            crate::serve::mux::SubmitError::Closed(_) => {
+                RuntimeError::Unavailable("model dispatcher unavailable".into())
+            }
         })?;
         drop(ingress);
         let mut output = forced;
@@ -405,19 +541,36 @@ impl SharedAsr {
                 }
                 // A runaway transcript (the model looping): what it decoded is the answer; the
                 // serving layer collapses the repeats, or retries without the client's context.
-                Some(StreamChunk::Done { reason: FinishReason::Length, usage, .. }) => {
-                    tracing::warn!(output_tokens = output.len(), "ASR transcript reached its token limit");
+                Some(StreamChunk::Done {
+                    reason: FinishReason::Length,
+                    usage,
+                    ..
+                }) => {
+                    tracing::warn!(
+                        output_tokens = output.len(),
+                        "ASR transcript reached its token limit"
+                    );
                     break usage.cached_tokens;
                 }
                 // A preempted slot's tokens so far are not the transcript.
-                Some(StreamChunk::Done { reason: FinishReason::Preempted, .. }) => return Err(preempted()),
+                Some(StreamChunk::Done {
+                    reason: FinishReason::Preempted,
+                    ..
+                }) => return Err(preempted()),
                 Some(StreamChunk::Done { usage, .. }) => break usage.cached_tokens,
                 Some(StreamChunk::Err(_)) if mux.preempted() => return Err(preempted()),
                 Some(StreamChunk::Err(e)) => return Err(e),
-                None => return Err(RuntimeError::Msg("ASR stream ended without a result".into())),
+                None => {
+                    return Err(RuntimeError::Msg(
+                        "ASR stream ended without a result".into(),
+                    ))
+                }
             }
         };
-        let result = self.prompt.transcript(&output, language.as_deref()).map(|t| (t, output.clone()));
+        let result = self
+            .prompt
+            .transcript(&output, language.as_deref())
+            .map(|t| (t, output.clone()));
         tracing::debug!(
             prompt_tokens,
             cached_tokens,
@@ -450,9 +603,14 @@ fn slice_frames(features: &MelFeatures, a: usize, b: usize) -> MelFeatures {
     let bins = features.values.len() / features.frames.max(1);
     let mut values = Vec::with_capacity(bins * (b - a));
     for bin in 0..bins {
-        values.extend_from_slice(&features.values[bin * features.frames + a..bin * features.frames + b]);
+        values.extend_from_slice(
+            &features.values[bin * features.frames + a..bin * features.frames + b],
+        );
     }
-    MelFeatures { values, frames: b - a }
+    MelFeatures {
+        values,
+        frames: b - a,
+    }
 }
 
 type Fronts = Mutex<HashMap<(PathBuf, u8), Option<Arc<SharedAsr>>>>;
@@ -471,11 +629,11 @@ fn is_audio_lm(dir: &Path) -> Result<bool> {
     let Some(asset) = crate::exec::packet_runtime::PacketAsset::load_if_present(&packet)? else {
         return Ok(false);
     };
-    Ok(asset
-        .pipelines()
-        .iter()
-        .any(|p| p.driver == "causal.v1" && p.parameters.get("overlay_rows").is_some_and(|&r| r > 0))
-        && dir.join(asset.stage_file("encoder.packet", "encoder.pkt")?).is_file())
+    Ok(asset.pipelines().iter().any(|p| {
+        p.driver == "causal.v1" && p.parameters.get("overlay_rows").is_some_and(|&r| r > 0)
+    }) && dir
+        .join(asset.stage_file("encoder.packet", "encoder.pkt")?)
+        .is_file())
 }
 
 /// `slug` is an instance key: the front binds on its engine's device.
@@ -517,8 +675,13 @@ pub(super) fn dead_encoders() -> Vec<String> {
 /// Whether `slug` is a bound audio LM on any device (preload binds every resident one); never
 /// loads.
 pub(super) fn serves_audio(state: &AppState, slug: &str) -> bool {
-    let Ok(bundle) = state.registry.get(slug) else { return false };
-    models().lock().iter().any(|((dir, _), m)| *dir == bundle.dir && m.is_some())
+    let Ok(bundle) = state.registry.get(slug) else {
+        return false;
+    };
+    models()
+        .lock()
+        .iter()
+        .any(|((dir, _), m)| *dir == bundle.dir && m.is_some())
 }
 
 /// Bind instance `slug`'s front-end now (a no-op for a model that is not an audio LM or is bound).
@@ -542,8 +705,9 @@ pub fn preload(state: &AppState) -> Result<()> {
         let (Some(_), Ok(bundle)) = (state.mux(&slug), state.registry.get(&slug)) else {
             continue;
         };
-        shared_asr(state, &slug, &bundle.dir)
-            .map_err(|e| RuntimeError::Rejected(format!("{slug}: asr front-end failed to load: {e}")))?;
+        shared_asr(state, &slug, &bundle.dir).map_err(|e| {
+            RuntimeError::Rejected(format!("{slug}: asr front-end failed to load: {e}"))
+        })?;
     }
     Ok(())
 }
@@ -555,7 +719,10 @@ pub(super) async fn route(
     model: &str,
     session: Option<&str>,
 ) -> std::result::Result<(Route, FinalizationPolicy), Response> {
-    let slug = state.registry.resolve(model).unwrap_or_else(|| model.to_owned());
+    let slug = state
+        .registry
+        .resolve(model)
+        .unwrap_or_else(|| model.to_owned());
     let dp = state.dp_set(&slug).cloned();
     let managed = dp.is_some() || state.manager_for(&slug).is_some_and(|m| m.manages(&slug));
     // A managed model's front binds with its engine and leaves with it: an eviction between the
@@ -579,7 +746,12 @@ pub(super) async fn route(
             }
             None => {
                 if managed {
-                    if let Err(e) = state.manager_for(&slug).expect("managed").ensure_resident(&slug).await {
+                    if let Err(e) = state
+                        .manager_for(&slug)
+                        .expect("managed")
+                        .ensure_resident(&slug)
+                        .await
+                    {
                         return Err(failure(StatusCode::SERVICE_UNAVAILABLE, e));
                     }
                 }
@@ -596,10 +768,19 @@ pub(super) async fn route(
         // point drains with the request counted, so the request's submission is served.
         let ingress = mux.ingress_owned();
         let at = (bundle.dir.clone(), state.ordinal_of(&key));
-        let bound = models().lock().get(&at).cloned().filter(|_| state.mux(&key).is_some());
+        let bound = models()
+            .lock()
+            .get(&at)
+            .cloned()
+            .filter(|_| state.mux(&key).is_some());
         match bound {
             None if managed && attempts < 3 => continue,
-            None if managed => return Err(failure(StatusCode::SERVICE_UNAVAILABLE, "ASR front is switching; retry")),
+            None if managed => {
+                return Err(failure(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "ASR front is switching; retry",
+                ))
+            }
             bound => break (key, mux, bundle, bound, ingress),
         }
     };
@@ -613,7 +794,11 @@ pub(super) async fn route(
             let ingress = Arc::new(parking_lot::Mutex::new(Some(ingress)));
             Ok((Route::Shared(asr, mux, ingress), finalization))
         }
-        Ok(None) => Err(crate::serve::models::unserved(&slug, "audio/transcriptions", &crate::serve::models::endpoints(state, &slug))),
+        Ok(None) => Err(crate::serve::models::unserved(
+            &slug,
+            "audio/transcriptions",
+            &crate::serve::models::endpoints(state, &slug),
+        )),
         Err(e) => Err(failure(StatusCode::INTERNAL_SERVER_ERROR, e)),
     }
 }

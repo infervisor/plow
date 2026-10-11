@@ -32,9 +32,16 @@ pub fn build(cfg: &SnacConfig) -> Graph {
     let mut z: Option<TensorId> = None;
     for (level, &stride) in cfg.vq_strides.iter().enumerate() {
         let codes = f.mul(&Dim::stat(rows / stride));
-        let ids = nn.input(&format!("codes.{level}"), nn.shape([b.clone(), codes.clone()]), DType::I32);
+        let ids = nn.input(
+            &format!("codes.{level}"),
+            nn.shape([b.clone(), codes.clone()]),
+            DType::I32,
+        );
         let e = nn.embedding_named(&format!("q.P{level}"), ids, cfg.codebook_size, latent);
-        let e = nn.reshape(e, [b.clone(), codes.clone(), Dim::stat(1), Dim::stat(latent)]);
+        let e = nn.reshape(
+            e,
+            [b.clone(), codes.clone(), Dim::stat(1), Dim::stat(latent)],
+        );
         let e = nn.broadcast(e, [b.clone(), codes, Dim::stat(stride), Dim::stat(latent)]);
         let e = nn.reshape(e, [b.clone(), f.mul(&Dim::stat(rows)), Dim::stat(latent)]);
         z = Some(match z {
@@ -44,9 +51,25 @@ pub fn build(cfg: &SnacConfig) -> Graph {
     }
     let z = z.expect("SNAC has at least one codebook level");
 
-    let x = nn.conv1d("pre.dw.w", Some("pre.dw.b"), z, latent, latent, 7, conv(1, 1, latent as u32, 3));
+    let x = nn.conv1d(
+        "pre.dw.w",
+        Some("pre.dw.b"),
+        z,
+        latent,
+        latent,
+        7,
+        conv(1, 1, latent as u32, 3),
+    );
     let mut c = cfg.blocks.first().map_or(latent, |blk| blk.cin);
-    let mut x = nn.conv1d("pre.pw.w", Some("pre.pw.b"), x, latent, c, 1, conv(1, 1, 1, 0));
+    let mut x = nn.conv1d(
+        "pre.pw.w",
+        Some("pre.pw.b"),
+        x,
+        latent,
+        c,
+        1,
+        conv(1, 1, 1, 0),
+    );
     let mut t = f.mul(&Dim::stat(rows));
     for (i, blk) in cfg.blocks.iter().enumerate() {
         let p = format!("blk{i}");
@@ -58,23 +81,53 @@ pub fn build(cfg: &SnacConfig) -> Graph {
             crop: (blk.padding, blk.padding),
             output_padding: blk.output_padding,
         };
-        x = nn.conv1d(&format!("{p}.up.w"), Some(&format!("{p}.up.b")), s, blk.cin, blk.cout, i64::from(blk.kernel), up);
+        x = nn.conv1d(
+            &format!("{p}.up.w"),
+            Some(&format!("{p}.up.b")),
+            s,
+            blk.cin,
+            blk.cout,
+            i64::from(blk.kernel),
+            up,
+        );
         c = blk.cout;
         t = t
             .sub(&Dim::stat(1))
             .mul(&Dim::stat(i64::from(blk.stride)))
-            .add(&Dim::stat(i64::from(blk.kernel + blk.output_padding) - 2 * i64::from(blk.padding)));
+            .add(&Dim::stat(
+                i64::from(blk.kernel + blk.output_padding) - 2 * i64::from(blk.padding),
+            ));
         // Noise injection: x + n * (x · Wn).
-        let noise = nn.input(&format!("noise.{p}"), nn.shape([b.clone(), t.clone(), Dim::stat(1)]), DType::F32);
+        let noise = nn.input(
+            &format!("noise.{p}"),
+            nn.shape([b.clone(), t.clone(), Dim::stat(1)]),
+            DType::F32,
+        );
         let h = nn.conv1d(&format!("{p}.noise.w"), None, x, c, c, 1, conv(1, 1, 1, 0));
         let n = nn.mul(h, noise);
         x = nn.add(x, n);
         for (j, &d) in blk.dilations.iter().enumerate() {
             let r = format!("{p}.ru{j}");
             let y = nn.snake(&format!("{r}.a1"), x, c);
-            let y = nn.conv1d(&format!("{r}.dw.w"), Some(&format!("{r}.dw.b")), y, c, c, 7, conv(1, d, c as u32, 3 * d));
+            let y = nn.conv1d(
+                &format!("{r}.dw.w"),
+                Some(&format!("{r}.dw.b")),
+                y,
+                c,
+                c,
+                7,
+                conv(1, d, c as u32, 3 * d),
+            );
             let y = nn.snake(&format!("{r}.a2"), y, c);
-            let y = nn.conv1d(&format!("{r}.pw.w"), Some(&format!("{r}.pw.b")), y, c, c, 1, conv(1, 1, 1, 0));
+            let y = nn.conv1d(
+                &format!("{r}.pw.w"),
+                Some(&format!("{r}.pw.b")),
+                y,
+                c,
+                c,
+                1,
+                conv(1, 1, 1, 0),
+            );
             x = nn.add(x, y);
         }
         nn.end_block();

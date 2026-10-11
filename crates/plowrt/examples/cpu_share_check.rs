@@ -25,9 +25,18 @@ fn main() {
     }
     let (f, id) = gate.expect("--gate prompts.json id");
     let j: serde_json::Value = serde_json::from_slice(&std::fs::read(f).unwrap()).unwrap();
-    let case = j["cases"].as_array().unwrap().iter().find(|c| c["id"] == id.as_str()).expect("case");
-    let prompt: Vec<u32> =
-        case["prompt_ids"].as_array().unwrap().iter().map(|v| v.as_u64().unwrap() as u32).collect();
+    let case = j["cases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["id"] == id.as_str())
+        .expect("case");
+    let prompt: Vec<u32> = case["prompt_ids"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_u64().unwrap() as u32)
+        .collect();
 
     let mut serve = CpuServe::load(&blob, &ckpt, &CpuEngineOpts::default()).expect("load");
     let logits = |serve: &CpuServe| {
@@ -35,7 +44,12 @@ fn main() {
         assert!(serve.engine().logits_row(0, &mut v));
         v
     };
-    let diff = |a: &[f32], b: &[f32]| a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
+    let diff = |a: &[f32], b: &[f32]| {
+        a.iter()
+            .zip(b)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max)
+    };
     let shared = |serve: &mut CpuServe, slot: usize, p: &[u32]| loop {
         if let Some(t) = serve.prefill_chunk(slot, p, u32::MAX).expect("prefill") {
             break t;
@@ -57,7 +71,10 @@ fn main() {
             m + v.iter().map(|&x| (x as f64 - m).exp()).sum::<f64>().ln()
         };
         let (la, lb) = (lse(a), lse(b));
-        a.iter().zip(b).map(|(&x, &y)| (x as f64 - la).exp() * ((x as f64 - la) - (y as f64 - lb))).sum::<f64>()
+        a.iter()
+            .zip(b)
+            .map(|(&x, &y)| (x as f64 - la).exp() * ((x as f64 - la) - (y as f64 - lb)))
+            .sum::<f64>()
     };
     let mut check = |serve: &mut CpuServe, name: &str, q: &[u32], slot: usize| {
         let ts = shared(serve, slot, q);
@@ -86,7 +103,12 @@ fn main() {
         t = serve.step(1, t).expect("step");
     }
     serve.release(1);
-    check(&mut serve, "C", &[&qd[..], &gen1[..k / 2], &[gen1[k / 2] ^ 1]].concat(), 3);
+    check(
+        &mut serve,
+        "C",
+        &[&qd[..], &gen1[..k / 2], &[gen1[k / 2] ^ 1]].concat(),
+        3,
+    );
 }
 
 #[cfg(not(feature = "cpu"))]

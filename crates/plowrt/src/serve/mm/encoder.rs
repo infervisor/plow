@@ -10,7 +10,10 @@ fn bad(what: impl Into<String>) -> RuntimeError {
 }
 
 fn f32_param(packet: &ForwardPacket, key: &str) -> Option<f32> {
-    packet.optional_parameter(key).and_then(|v| u32::try_from(v).ok()).map(f32::from_bits)
+    packet
+        .optional_parameter(key)
+        .and_then(|v| u32::try_from(v).ok())
+        .map(f32::from_bits)
 }
 
 fn round_bf16(v: f32) -> f32 {
@@ -40,9 +43,7 @@ enum Inputs {
         valid: PacketTensor,
     },
     /// Encoder-free audio: rungs count tokens, each a row of `frame_samples` raw samples.
-    Frames {
-        frame_samples: usize,
-    },
+    Frames { frame_samples: usize },
 }
 
 pub struct Encoder {
@@ -93,10 +94,25 @@ impl Encoder {
                 mask1: pipeline.tensor("mask1")?,
                 valid: pipeline.tensor("valid")?,
             },
-            Some("frames") => Inputs::Frames { frame_samples: param("frame_samples")? },
-            other => return Err(bad(format!("{}: unknown encoder modality {other:?}", path.display()))),
+            Some("frames") => Inputs::Frames {
+                frame_samples: param("frame_samples")?,
+            },
+            other => {
+                return Err(bad(format!(
+                    "{}: unknown encoder modality {other:?}",
+                    path.display()
+                )))
+            }
         };
-        Ok(Self { packet, rungs, input, output, output_width, round_input, inputs })
+        Ok(Self {
+            packet,
+            rungs,
+            input,
+            output,
+            output_width,
+            round_input,
+            inputs,
+        })
     }
 
     /// The host processor whose output this encoder's inputs take.
@@ -122,7 +138,12 @@ impl Encoder {
         self.rungs.last().map_or(0, |r| r.0 as usize)
     }
 
-    fn run(&mut self, programs: &[usize], writes: &[(PacketTensor, Vec<u8>)], rows: usize) -> Result<Vec<f32>> {
+    fn run(
+        &mut self,
+        programs: &[usize],
+        writes: &[(PacketTensor, Vec<u8>)],
+        rows: usize,
+    ) -> Result<Vec<f32>> {
         let mut out = vec![0f32; rows * self.output_width];
         let runtime = self.packet.runtime_mut();
         runtime.begin_execution()?;
@@ -140,8 +161,19 @@ impl Encoder {
 
     /// Project images: one `[soft_tokens][output_width]` block per item, in order.
     pub fn encode_images(&mut self, items: &[&Patches]) -> Result<Vec<Vec<f32>>> {
-        let Inputs::Vision { item_rows, item_tokens, patch_values, pool, scale, shift, posx, posy, rope, valid, ref pools } =
-            self.inputs
+        let Inputs::Vision {
+            item_rows,
+            item_tokens,
+            patch_values,
+            pool,
+            scale,
+            shift,
+            posx,
+            posy,
+            rope,
+            valid,
+            ref pools,
+        } = self.inputs
         else {
             return Err(bad("not a vision encoder"));
         };
@@ -165,7 +197,10 @@ impl Encoder {
             let mut taps = vec![vec![u32::MAX; cap * item_tokens]; k2];
             for (i, p) in chunk.iter().enumerate() {
                 let n = p.positions.len();
-                if n > item_rows || p.values.len() != n * patch_values || p.soft_tokens as usize > item_tokens {
+                if n > item_rows
+                    || p.values.len() != n * patch_values
+                    || p.soft_tokens as usize > item_tokens
+                {
                     return Err(bad("image patches exceed the vision rung"));
                 }
                 counts[i] = n as u32;
@@ -216,7 +251,12 @@ impl Encoder {
         if let Inputs::Frames { frame_samples } = self.inputs {
             return self.encode_frames(mel, frame_samples);
         }
-        let Inputs::Audio { mel_bins, mask1, valid } = self.inputs else {
+        let Inputs::Audio {
+            mel_bins,
+            mask1,
+            valid,
+        } = self.inputs
+        else {
             return Err(bad("not an audio encoder"));
         };
         let need = mel.valid_frames.next_multiple_of(4).max(4);
@@ -234,7 +274,9 @@ impl Encoder {
             }
         }
         let t1 = mel.valid_frames.div_ceil(2);
-        let mask: Vec<f32> = (0..cap / 2).map(|t| if t < t1 { 1.0 } else { 0.0 }).collect();
+        let mask: Vec<f32> = (0..cap / 2)
+            .map(|t| if t < t1 { 1.0 } else { 0.0 })
+            .collect();
         let writes = vec![
             (self.input, bytemuck::cast_slice(&input).to_vec()),
             (mask1, bytemuck::cast_slice(&mask).to_vec()),
@@ -255,10 +297,17 @@ impl Encoder {
             .map(|(c, p)| (*c as usize, p.clone()))
             .ok_or_else(|| bad("audio clip is longer than the largest audio rung"))?;
         let mut input = vec![0f32; cap * frame_samples];
-        for (dst, &v) in input.iter_mut().zip(&frames.values[..tokens * frame_samples]) {
+        for (dst, &v) in input
+            .iter_mut()
+            .zip(&frames.values[..tokens * frame_samples])
+        {
             *dst = if self.round_input { round_bf16(v) } else { v };
         }
-        let mut flat = self.run(&programs, &[(self.input, bytemuck::cast_slice(&input).to_vec())], cap)?;
+        let mut flat = self.run(
+            &programs,
+            &[(self.input, bytemuck::cast_slice(&input).to_vec())],
+            cap,
+        )?;
         flat.truncate(tokens * self.output_width);
         Ok(flat)
     }

@@ -37,7 +37,12 @@ pub fn formation_window_ms(lambda: f64, max_hold_ms: f64) -> f64 {
 /// The hold for an arrival into an empty slot table. `pending` counts requests queued behind it
 /// or still inside a handler (tokenizing). With `idle_dispatch`, a lone arrival dispatches at once;
 /// a burst's first arrival still sees its peers in `pending` and holds as before.
-pub fn cold_start_hold_ms(lambda: f64, max_hold_ms: f64, idle_dispatch: bool, pending: usize) -> f64 {
+pub fn cold_start_hold_ms(
+    lambda: f64,
+    max_hold_ms: f64,
+    idle_dispatch: bool,
+    pending: usize,
+) -> f64 {
     if idle_dispatch && pending == 0 {
         return 0.0;
     }

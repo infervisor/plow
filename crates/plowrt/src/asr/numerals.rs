@@ -19,7 +19,10 @@ fn digit(word: &str) -> Option<u8> {
     if let [d @ b'0'..=b'9'] = word.as_bytes() {
         return Some(*d);
     }
-    DIGITS.iter().find(|(name, _)| name.eq_ignore_ascii_case(word)).map(|&(_, d)| d)
+    DIGITS
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case(word))
+        .map(|&(_, d)| d)
 }
 
 /// One digit word ("double five" counts as one): its span, digits, and whether it is a bare "oh".
@@ -62,12 +65,22 @@ pub fn spoken_digits_to_numerals(text: &str) -> String {
         };
         if repeat > 1 {
             if let Some(d) = words.get(i + 1).and_then(|&(s, e)| digit(&text[s..e])) {
-                tokens.push(Some(Token { start, end: words[i + 1].1, digits: vec![d; repeat], oh: false }));
+                tokens.push(Some(Token {
+                    start,
+                    end: words[i + 1].1,
+                    digits: vec![d; repeat],
+                    oh: false,
+                }));
                 i += 2;
                 continue;
             }
         }
-        tokens.push(digit(word).map(|d| Token { start, end, digits: vec![d], oh: word.eq_ignore_ascii_case("oh") }));
+        tokens.push(digit(word).map(|d| Token {
+            start,
+            end,
+            digits: vec![d],
+            oh: word.eq_ignore_ascii_case("oh"),
+        }));
         i += 1;
     }
 
@@ -96,7 +109,9 @@ pub fn spoken_digits_to_numerals(text: &str) -> String {
         match token {
             Some(t) => {
                 let joined = run.last().is_some_and(|prev| {
-                    text[prev.end..t.start].chars().all(|c| c.is_whitespace() || matches!(c, ',' | '.' | '-'))
+                    text[prev.end..t.start]
+                        .chars()
+                        .all(|c| c.is_whitespace() || matches!(c, ',' | '.' | '-'))
                 });
                 if !joined {
                     flush(&mut run, &mut out, &mut copied);
@@ -121,12 +136,24 @@ mod tests {
 
     #[test]
     fn phone_and_account_numbers_become_numerals() {
-        assert_eq!(f("My number is nine one eight seven three four one five three eight."), "My number is 918-734-1538.");
-        assert_eq!(f("Eight one seven, seven six nine, zero zero six four"), "817-769-0064");
-        assert_eq!(f("It's seven three four, double five, one two."), "It's 734-5512.");
+        assert_eq!(
+            f("My number is nine one eight seven three four one five three eight."),
+            "My number is 918-734-1538."
+        );
+        assert_eq!(
+            f("Eight one seven, seven six nine, zero zero six four"),
+            "817-769-0064"
+        );
+        assert_eq!(
+            f("It's seven three four, double five, one two."),
+            "It's 734-5512."
+        );
         assert_eq!(f("case two zero two four"), "case 2024");
         assert_eq!(f("8 1 7 seven six nine"), "817769");
-        assert_eq!(f("oh eight one three five five five oh one seven five oh"), "oh 813-555-0175 oh");
+        assert_eq!(
+            f("oh eight one three five five five oh one seven five oh"),
+            "oh 813-555-0175 oh"
+        );
     }
 
     #[test]

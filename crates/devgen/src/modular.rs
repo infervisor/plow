@@ -160,15 +160,14 @@ pub fn modular_pipeline_section(manifest: &ModularPipelineManifest) -> SectionDa
 }
 
 /// Update sections with Lean certificates and summary from a `LeanReport`.
-pub fn update_section_with_lean(
-    sections: &mut Vec<SectionData>,
-    lean: &crate::LeanReport,
-) {
+pub fn update_section_with_lean(sections: &mut Vec<SectionData>, lean: &crate::LeanReport) {
     if let Some(pos) = sections
         .iter()
         .position(|s| s.kind == SECT_METADATA && s.name == MODULAR_MANIFEST_SECTION)
     {
-        if let Ok(mut manifest) = serde_json::from_slice::<ModularPipelineManifest>(&sections[pos].data) {
+        if let Ok(mut manifest) =
+            serde_json::from_slice::<ModularPipelineManifest>(&sections[pos].data)
+        {
             manifest.lean_summary = lean.modular_summary.clone();
             for certified_block in &lean.modular_blocks {
                 if let Some(target) = manifest
@@ -233,8 +232,12 @@ mod tests {
 
         let manifest = build_modular_manifest(40, vec![b1, b2], &[128], &[1]);
         assert_eq!(manifest.blocks.len(), 2);
-        assert!(manifest.egg_rules_applied.contains(&"rmsnorm-linear-fuse".to_string()));
-        assert!(manifest.egg_rules_applied.contains(&"gated-mlp-fuse".to_string()));
+        assert!(manifest
+            .egg_rules_applied
+            .contains(&"rmsnorm-linear-fuse".to_string()));
+        assert!(manifest
+            .egg_rules_applied
+            .contains(&"gated-mlp-fuse".to_string()));
 
         let sect = modular_pipeline_section(&manifest);
         assert_eq!(sect.name, MODULAR_MANIFEST_SECTION);
@@ -270,6 +273,8 @@ mod tests {
         let manifest = build_modular_manifest(32, vec![b1, b2], &[128], &[1]);
         assert_eq!(manifest.blocks.len(), 2);
         assert_eq!(manifest.blocks[1].name, "moe_t128");
-        assert!(manifest.egg_rules_applied.contains(&"residual3-rmsnorm-fuse".to_string()));
+        assert!(manifest
+            .egg_rules_applied
+            .contains(&"residual3-rmsnorm-fuse".to_string()));
     }
 }

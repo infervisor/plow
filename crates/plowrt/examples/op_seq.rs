@@ -13,19 +13,22 @@ fn main() {
     let p = &blob.progs[pi];
     for (k, d) in p.insts.iter().enumerate().skip(lo).take(hi - lo) {
         let n = DevOp::from_u16(d.op).map(|o| o.c_name()).unwrap_or("?");
-        let t: Vec<String> = d
-            .t
+        let t: Vec<String> =
+            d.t.iter()
+                .enumerate()
+                .map(|(j, &t)| {
+                    let nm = blob
+                        .tensors
+                        .get(t as usize)
+                        .map_or("-".to_string(), |x| format!("{}[{}B]", x.name, x.bytes));
+                    format!("t{j}={t}:{nm}")
+                })
+                .collect();
+        let seg = p
+            .stream
             .iter()
-            .enumerate()
-            .map(|(j, &t)| {
-                let nm = blob
-                    .tensors
-                    .get(t as usize)
-                    .map_or("-".to_string(), |x| format!("{}[{}B]", x.name, x.bytes));
-                format!("t{j}={t}:{nm}")
-            })
-            .collect();
-        let seg = p.stream.iter().find(|e| e.inst as usize == k).map_or(-1, |e| e.seg as i32);
+            .find(|e| e.inst as usize == k)
+            .map_or(-1, |e| e.seg as i32);
         println!(
             "{k:4} seg={seg:<4} {n:<34} blocks={:<4} i={:?}\n      {}",
             d.blocks,

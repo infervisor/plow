@@ -227,7 +227,9 @@ pub struct Joined {
 
 impl TurnTable {
     fn new() -> Self {
-        Self { sessions: svcache::SvCache::with_ttl_and_limit(ttl(), MAX_SESSIONS) }
+        Self {
+            sessions: svcache::SvCache::with_ttl_and_limit(ttl(), MAX_SESSIONS),
+        }
     }
 
     fn entry(&self, session: &Arc<str>) -> Option<SessionEntry> {
@@ -238,13 +240,20 @@ impl TurnTable {
     fn entry_or_new(&self, session: &Arc<str>) -> SessionEntry {
         self.sessions.get_or_insert_with(
             session.clone(),
-            || SessionEntry { session: session.clone(), turns: Default::default() },
+            || SessionEntry {
+                session: session.clone(),
+                turns: Default::default(),
+            },
             |e| e.clone(),
         )
     }
 
     pub fn times(&self, key: &TurnKey) -> Option<TurnTimes> {
-        self.entry(&key.session)?.turns.lock().get_mut(&key.turn).map(|t| t.times())
+        self.entry(&key.session)?
+            .turns
+            .lock()
+            .get_mut(&key.turn)
+            .map(|t| t.times())
     }
 
     pub fn stamp(&self, key: &TurnKey, stage: Stage, at: Instant) {
@@ -262,7 +271,9 @@ impl TurnTable {
 
     /// Apply `f` to the turn, if it is still tracked, and extend the session's life.
     pub fn update(&self, key: &TurnKey, f: impl FnOnce(&mut Turn)) {
-        let Some(e) = self.entry(&key.session) else { return };
+        let Some(e) = self.entry(&key.session) else {
+            return;
+        };
         if let Some(t) = e.turns.lock().get_mut(&key.turn) {
             f(t);
         }
@@ -282,7 +293,10 @@ impl TurnTable {
 
     /// The session's turns, oldest first.
     pub fn session(&self, session: &str) -> Vec<Turn> {
-        self.sessions.get_by_id(Arc::from(session)).map(|e| e.turns.lock().turns.iter().cloned().collect()).unwrap_or_default()
+        self.sessions
+            .get_by_id(Arc::from(session))
+            .map(|e| e.turns.lock().turns.iter().cloned().collect())
+            .unwrap_or_default()
     }
 
     /// Join (or open) the turn a `kind` request of `session` serves, arriving `at`. `explicit` is
@@ -321,7 +335,9 @@ impl TurnTable {
                     id.clone()
                 }
                 None => {
-                    let open = st.open.clone().filter(|id| kind != Kind::Asr && st.get_mut(id).is_some_and(|t| !t.joined(kind)));
+                    let open = st.open.clone().filter(|id| {
+                        kind != Kind::Asr && st.get_mut(id).is_some_and(|t| !t.joined(kind))
+                    });
                     match open {
                         Some(id) => id,
                         None => {
@@ -353,8 +369,20 @@ impl TurnTable {
             if playback.is_some() {
                 t.playback = playback;
             }
-            t.stages[kind.index()] = StageTiming { arrived: Some(at), ..Default::default() };
-            Joined { key: TurnKey { session: session.clone(), turn: id }, trace_id: t.trace_id, speech_end: t.speech_end, budget: t.budget, continuing }
+            t.stages[kind.index()] = StageTiming {
+                arrived: Some(at),
+                ..Default::default()
+            };
+            Joined {
+                key: TurnKey {
+                    session: session.clone(),
+                    turn: id,
+                },
+                trace_id: t.trace_id,
+                speech_end: t.speech_end,
+                budget: t.budget,
+                continuing,
+            }
         };
         self.sessions.insert(e);
         joined
@@ -372,8 +400,19 @@ use crate::serve::session::minted;
 
 /// Signed latency bounds for slack, µs.
 const SLACK: &[i64] = &[
-    -30_000_000, -10_000_000, -5_000_000, -2_000_000, -1_000_000, -500_000, -200_000, -100_000, 0, 100_000, 200_000,
-    500_000, 1_000_000,
+    -30_000_000,
+    -10_000_000,
+    -5_000_000,
+    -2_000_000,
+    -1_000_000,
+    -500_000,
+    -200_000,
+    -100_000,
+    0,
+    100_000,
+    200_000,
+    500_000,
+    1_000_000,
 ];
 
 #[derive(Default)]
@@ -393,11 +432,22 @@ impl SignedHistogram {
         for (i, bin) in self.bins.iter().enumerate() {
             count += bin.load(Relaxed);
             match SLACK.get(i) {
-                Some(&b) => drop(writeln!(out, "{name}_bucket{{{labels},le=\"{}\"}} {count}", b as f64 / 1e6)),
-                None => drop(writeln!(out, "{name}_bucket{{{labels},le=\"+Inf\"}} {count}")),
+                Some(&b) => drop(writeln!(
+                    out,
+                    "{name}_bucket{{{labels},le=\"{}\"}} {count}",
+                    b as f64 / 1e6
+                )),
+                None => drop(writeln!(
+                    out,
+                    "{name}_bucket{{{labels},le=\"+Inf\"}} {count}"
+                )),
             }
         }
-        let _ = writeln!(out, "{name}_sum{{{labels}}} {}", self.sum.load(Relaxed) as f64 / 1e6);
+        let _ = writeln!(
+            out,
+            "{name}_sum{{{labels}}} {}",
+            self.sum.load(Relaxed) as f64 / 1e6
+        );
         let _ = writeln!(out, "{name}_count{{{labels}}} {count}");
     }
 }
@@ -421,16 +471,37 @@ pub fn write_metrics(out: &mut String) {
     use crate::obs::serving::family;
     let m = metrics();
     family(out, "plowrt_turn_response_seconds", "histogram", "Turn end of speech (ASR final arrival, or the turn's first request) through first TTS audio.");
-    m.response.write_seconds(out, "plowrt_turn_response_seconds", "scope=\"process\"");
+    m.response
+        .write_seconds(out, "plowrt_turn_response_seconds", "scope=\"process\"");
     family(out, "plowrt_tts_underrun_seconds", "histogram", "Worst playback underrun per TTS stream on the server's clock (playback starts at the first audio).");
-    m.underrun.write_seconds(out, "plowrt_tts_underrun_seconds", "scope=\"process\"");
-    family(out, "plowrt_deadline_slack_seconds", "histogram", "Stage target minus time to first output (negative = missed); targets PLOW_TURN_*_MS.");
+    m.underrun
+        .write_seconds(out, "plowrt_tts_underrun_seconds", "scope=\"process\"");
+    family(
+        out,
+        "plowrt_deadline_slack_seconds",
+        "histogram",
+        "Stage target minus time to first output (negative = missed); targets PLOW_TURN_*_MS.",
+    );
     for k in Kind::ALL {
-        m.slack[k.index()].write(out, "plowrt_deadline_slack_seconds", &format!("stage=\"{}\"", k.stage()));
+        m.slack[k.index()].write(
+            out,
+            "plowrt_deadline_slack_seconds",
+            &format!("stage=\"{}\"", k.stage()),
+        );
     }
-    family(out, "plowrt_deadline_missed_total", "counter", "Requests whose first output missed the stage target.");
+    family(
+        out,
+        "plowrt_deadline_missed_total",
+        "counter",
+        "Requests whose first output missed the stage target.",
+    );
     for k in Kind::ALL {
-        let _ = writeln!(out, "plowrt_deadline_missed_total{{stage=\"{}\"}} {}", k.stage(), m.missed[k.index()].load(Relaxed));
+        let _ = writeln!(
+            out,
+            "plowrt_deadline_missed_total{{stage=\"{}\"}} {}",
+            k.stage(),
+            m.missed[k.index()].load(Relaxed)
+        );
     }
 }
 
@@ -500,13 +571,33 @@ pub struct StageRun {
 impl StageRun {
     /// Start a `kind` request arriving `arrived` for `model`; joins its turn when it has a session.
     /// `turn_stage` = false for requests that are no stage of a turn (ASR partials).
-    pub fn start(ids: &RequestIds, kind: Kind, model: &str, metrics: Option<Arc<Metrics>>, arrived: Instant, turn_stage: bool) -> Self {
+    pub fn start(
+        ids: &RequestIds,
+        kind: Kind,
+        model: &str,
+        metrics: Option<Arc<Metrics>>,
+        arrived: Instant,
+        turn_stage: bool,
+    ) -> Self {
         let client_trace = ids.trace.map(|t| t.trace_id);
         let joined = ids.session.as_ref().filter(|_| turn_stage).map(|s| {
-            table().join(s, ids.turn.as_ref(), kind, arrived, client_trace, ids.budget(), ids.playback)
+            table().join(
+                s,
+                ids.turn.as_ref(),
+                kind,
+                arrived,
+                client_trace,
+                ids.budget(),
+                ids.playback,
+            )
         });
-        let trace_id = client_trace.or(joined.as_ref().map(|j| j.trace_id)).unwrap_or_else(|| minted::trace_id(minted::turn().0));
-        let turn_id = joined.as_ref().map(|j| j.key.turn.clone()).or_else(|| ids.turn.clone());
+        let trace_id = client_trace
+            .or(joined.as_ref().map(|j| j.trace_id))
+            .unwrap_or_else(|| minted::trace_id(minted::turn().0));
+        let turn_id = joined
+            .as_ref()
+            .map(|j| j.key.turn.clone())
+            .or_else(|| ids.turn.clone());
         let span = tracing::debug_span!(
             "request",
             request_id = %ids.request,
@@ -586,7 +677,8 @@ impl StageRun {
                 Kind::Tts => Stage::TtsFirst,
             };
             if self.kind == Kind::Tts {
-                m.response.duration(now.saturating_duration_since(j.speech_end));
+                m.response
+                    .duration(now.saturating_duration_since(j.speech_end));
             }
             let (kind, admitted) = (self.kind, self.admitted.map(|a| a.0));
             table().update(&j.key, |turn| {
@@ -606,7 +698,10 @@ impl StageRun {
     /// TTS: `samples` at `rate` just went out; advances the server's playback clock.
     pub fn audio(&mut self, samples: usize, rate: f64) {
         if let Some((first, _)) = self.first {
-            let behind = Instant::now().saturating_duration_since(first).as_secs_f64() - self.audio_s;
+            let behind = Instant::now()
+                .saturating_duration_since(first)
+                .as_secs_f64()
+                - self.audio_s;
             self.underrun_s = self.underrun_s.max(behind);
         } else {
             self.first();
@@ -622,7 +717,9 @@ impl StageRun {
         let now = Instant::now();
         self.done = Some(now);
         if self.kind == Kind::Tts && self.first.is_some() && self.observed {
-            metrics().underrun.duration(Duration::from_secs_f64(self.underrun_s.max(0.0)));
+            metrics()
+                .underrun
+                .duration(Duration::from_secs_f64(self.underrun_s.max(0.0)));
         }
         if let Some(j) = &self.joined {
             let (kind, audio_s, underrun_s) = (self.kind, self.audio_s, self.underrun_s);
@@ -643,7 +740,9 @@ impl StageRun {
             t.queue = Some(ms(at.saturating_duration_since(self.arrived)));
         }
         if let Some((first, dev_first)) = self.first {
-            let (from, dev_from) = self.admitted.unwrap_or((self.arrived, self.device_at_arrival));
+            let (from, dev_from) = self
+                .admitted
+                .unwrap_or((self.arrived, self.device_at_arrival));
             let device = dev_first.saturating_sub(dev_from) as f64 / 1e3;
             let span = ms(first.saturating_duration_since(from));
             if self.metrics.is_some() {
@@ -665,7 +764,10 @@ impl StageRun {
 
     /// `00-<trace>-<this request's span>-<flags>`.
     pub fn traceparent(&self) -> String {
-        format!("00-{:032x}-{:016x}-{:02x}", self.trace_id, self.span_id, self.flags)
+        format!(
+            "00-{:032x}-{:016x}-{:02x}",
+            self.trace_id, self.span_id, self.flags
+        )
     }
 
     /// `X-Turn-Id`, `traceparent`, and `Server-Timing` (when anything is measured yet).
@@ -675,7 +777,11 @@ impl StageRun {
 
     pub fn headers(&self) -> axum::http::HeaderMap {
         let mut h = axum::http::HeaderMap::new();
-        if let Some(v) = self.turn_id.as_deref().and_then(|t| HeaderValue::from_str(t).ok()) {
+        if let Some(v) = self
+            .turn_id
+            .as_deref()
+            .and_then(|t| HeaderValue::from_str(t).ok())
+        {
             h.insert(TURN_HEADER, v);
         }
         if let Ok(v) = HeaderValue::from_str(&self.traceparent()) {
@@ -692,7 +798,8 @@ impl StageRun {
 
     /// The final SSE comment of a streamed response: `: server-timing <metrics>`.
     pub fn sse_comment(&self) -> axum::response::sse::Event {
-        axum::response::sse::Event::default().comment(format!("server-timing {}", self.timing().header()))
+        axum::response::sse::Event::default()
+            .comment(format!("server-timing {}", self.timing().header()))
     }
 
     /// [`Self::sse_comment`] as its wire bytes.
@@ -706,9 +813,13 @@ fn ms(d: Duration) -> f64 {
 }
 
 /// `GET /v1/turns/{session}`: the call's turns, times in ms from each turn's end of speech.
-pub async fn session_turns(axum::extract::Path(session): axum::extract::Path<String>) -> axum::Json<serde_json::Value> {
+pub async fn session_turns(
+    axum::extract::Path(session): axum::extract::Path<String>,
+) -> axum::Json<serde_json::Value> {
     let turns = table().session(&session);
-    let rel = |base: Instant, t: Option<Instant>| t.map(|t| (ms(t.saturating_duration_since(base)) * 10.0).round() / 10.0);
+    let rel = |base: Instant, t: Option<Instant>| {
+        t.map(|t| (ms(t.saturating_duration_since(base)) * 10.0).round() / 10.0)
+    };
     let rows: Vec<serde_json::Value> = turns
         .iter()
         .map(|t| {
@@ -767,7 +878,15 @@ mod tests {
                     let (t, s, barrier) = (&t, &s, &barrier);
                     sc.spawn(move || {
                         barrier.wait();
-                        t.join(s, Some(&sid(turn)), Kind::Llm, Instant::now(), None, None, None);
+                        t.join(
+                            s,
+                            Some(&sid(turn)),
+                            Kind::Llm,
+                            Instant::now(),
+                            None,
+                            None,
+                            None,
+                        );
                     });
                 }
             });
@@ -781,8 +900,24 @@ mod tests {
         let s = sid("call-a");
         let t0 = Instant::now();
         let a = t.join(&s, None, Kind::Asr, t0, None, None, None);
-        let l = t.join(&s, None, Kind::Llm, t0 + Duration::from_millis(300), None, None, None);
-        let v = t.join(&s, None, Kind::Tts, t0 + Duration::from_millis(900), None, None, None);
+        let l = t.join(
+            &s,
+            None,
+            Kind::Llm,
+            t0 + Duration::from_millis(300),
+            None,
+            None,
+            None,
+        );
+        let v = t.join(
+            &s,
+            None,
+            Kind::Tts,
+            t0 + Duration::from_millis(900),
+            None,
+            None,
+            None,
+        );
         // A minted turn id is an 11-char svid, and the trace id's high half is that svid.
         assert_eq!(a.key.turn.len(), 11);
         assert_ne!(a.trace_id >> 64, 0);
@@ -791,10 +926,26 @@ mod tests {
         assert_eq!(a.trace_id, v.trace_id);
         assert_eq!(v.speech_end, t0);
         // Next utterance: a new turn with its own trace.
-        let a2 = t.join(&s, None, Kind::Asr, t0 + Duration::from_secs(5), None, None, None);
+        let a2 = t.join(
+            &s,
+            None,
+            Kind::Asr,
+            t0 + Duration::from_secs(5),
+            None,
+            None,
+            None,
+        );
         assert_ne!(a2.key, a.key);
         assert_ne!(a2.trace_id, a.trace_id);
-        let l2 = t.join(&s, None, Kind::Llm, t0 + Duration::from_secs(6), None, None, None);
+        let l2 = t.join(
+            &s,
+            None,
+            Kind::Llm,
+            t0 + Duration::from_secs(6),
+            None,
+            None,
+            None,
+        );
         assert_eq!(l2.key, a2.key);
         assert_eq!(l2.speech_end, t0 + Duration::from_secs(5));
     }
@@ -805,7 +956,15 @@ mod tests {
         let s = sid("tts-only");
         let t0 = Instant::now();
         let v1 = t.join(&s, None, Kind::Tts, t0, None, None, None);
-        let v2 = t.join(&s, None, Kind::Tts, t0 + Duration::from_millis(10), None, None, None);
+        let v2 = t.join(
+            &s,
+            None,
+            Kind::Tts,
+            t0 + Duration::from_millis(10),
+            None,
+            None,
+            None,
+        );
         assert_ne!(v1.key, v2.key);
         assert_eq!(v2.speech_end, t0 + Duration::from_millis(10));
         // Chat-only: each chat opens a turn; a chat after a chat is a new turn.
@@ -823,7 +982,15 @@ mod tests {
         let s = sid("call-b");
         let id: Arc<str> = "t7".into();
         let t0 = Instant::now();
-        let l = t.join(&s, Some(&id), Kind::Llm, t0, None, Some(Duration::from_millis(900)), None);
+        let l = t.join(
+            &s,
+            Some(&id),
+            Kind::Llm,
+            t0,
+            None,
+            Some(Duration::from_millis(900)),
+            None,
+        );
         let v = t.join(&s, Some(&id), Kind::Tts, t0, Some(42), None, None);
         assert_eq!(l.key, v.key);
         assert_eq!(&*v.key.turn, "t7");
@@ -851,8 +1018,19 @@ mod tests {
 
     #[test]
     fn server_timing_is_valid_syntax() {
-        let st = ServerTiming { queue: Some(1.25), wait_turn: Some(0.0), device: Some(30.04), first: Some(50.0), total: None, slack: Some(-12.5), turn: None };
-        assert_eq!(st.header(), "queue;dur=1.2, wait-turn;dur=0.0, device;dur=30.0, first;dur=50.0, slack;dur=-12.5");
+        let st = ServerTiming {
+            queue: Some(1.25),
+            wait_turn: Some(0.0),
+            device: Some(30.04),
+            first: Some(50.0),
+            total: None,
+            slack: Some(-12.5),
+            turn: None,
+        };
+        assert_eq!(
+            st.header(),
+            "queue;dur=1.2, wait-turn;dur=0.0, device;dur=30.0, first;dur=50.0, slack;dur=-12.5"
+        );
         assert_eq!(ServerTiming::default().header(), "");
     }
 
@@ -860,18 +1038,31 @@ mod tests {
     fn a_stage_run_stamps_turn_trace_and_timing() {
         let mut ids = RequestIds::generated();
         ids.session = Some("stage-run-test".into());
-        ids.trace = crate::serve::session::TraceParent::parse("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01");
+        ids.trace = crate::serve::session::TraceParent::parse(
+            "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+        );
         let mut run = StageRun::start(&ids, Kind::Llm, "m", None, Instant::now(), true);
         run.first();
         run.done();
         let h = run.headers();
         let tp = h[TRACEPARENT].to_str().unwrap();
-        assert!(tp.starts_with("00-4bf92f3577b34da6a3ce929d0e0e4736-") && tp.ends_with("-01") && tp.len() == 55, "{tp}");
-        assert!(!tp.contains("00f067aa0ba902b7"), "a request gets its own span id");
+        assert!(
+            tp.starts_with("00-4bf92f3577b34da6a3ce929d0e0e4736-")
+                && tp.ends_with("-01")
+                && tp.len() == 55,
+            "{tp}"
+        );
+        assert!(
+            !tp.contains("00f067aa0ba902b7"),
+            "a request gets its own span id"
+        );
         let turn = h[TURN_HEADER].to_str().unwrap().to_owned();
         assert_eq!(turn.len(), 11);
         let st = h[SERVER_TIMING].to_str().unwrap();
-        assert!(st.contains("first;dur=") && st.contains("total;dur=") && st.contains("slack;dur="), "{st}");
+        assert!(
+            st.contains("first;dur=") && st.contains("total;dur=") && st.contains("slack;dur="),
+            "{st}"
+        );
         // The TTS of the same turn shares its trace without sending one.
         let mut ids = RequestIds::generated();
         ids.session = Some("stage-run-test".into());
@@ -884,8 +1075,14 @@ mod tests {
 
     #[test]
     fn playback_header_parses() {
-        assert_eq!(Playback::parse("started=1700000000000"), Some(Playback::Started(1_700_000_000_000)));
-        assert_eq!(Playback::parse(" buffered_ms = 250"), Some(Playback::Buffered(250)));
+        assert_eq!(
+            Playback::parse("started=1700000000000"),
+            Some(Playback::Started(1_700_000_000_000))
+        );
+        assert_eq!(
+            Playback::parse(" buffered_ms = 250"),
+            Some(Playback::Buffered(250))
+        );
         assert_eq!(Playback::parse("bogus=1"), None);
         assert_eq!(Playback::parse("started"), None);
     }
@@ -898,7 +1095,10 @@ mod tests {
         let mut out = String::new();
         h.write(&mut out, "x", "stage=\"s\"");
         assert!(out.contains("x_bucket{stage=\"s\",le=\"-1\"} 1\n"), "{out}");
-        assert!(out.contains("x_bucket{stage=\"s\",le=\"0.1\"} 2\n"), "{out}");
+        assert!(
+            out.contains("x_bucket{stage=\"s\",le=\"0.1\"} 2\n"),
+            "{out}"
+        );
         assert!(out.contains("x_count{stage=\"s\"} 2\n"));
     }
 }

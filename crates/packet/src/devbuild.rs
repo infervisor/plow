@@ -1960,10 +1960,10 @@ impl Builder {
             for op in &mut self.ops {
                 let inst = &op.inst;
                 let rows = matches!(inst.i[0], 1024 | 2048 | 4096 | 8192);
-                let glu_shape = rows
-                    && matches!((inst.i[1], inst.i[2]), (15_360, 3_840) | (21_504, 5_376));
-                let down_shape = rows
-                    && matches!((inst.i[1], inst.i[2]), (3_840, 15_360) | (5_376, 21_504));
+                let glu_shape =
+                    rows && matches!((inst.i[1], inst.i[2]), (15_360, 3_840) | (21_504, 5_376));
+                let down_shape =
+                    rows && matches!((inst.i[1], inst.i[2]), (3_840, 15_360) | (5_376, 21_504));
                 let output12_shape =
                     rows && matches!((inst.i[1], inst.i[2]), (3_840, 4_096) | (3_840, 8_192));
                 let output31_shape = matches!(inst.i[0], 4096 | 8192)
@@ -2027,11 +2027,17 @@ impl Builder {
             );
         }
 
-        let original_coarse: Vec<_> = self.ops.iter().enumerate().flat_map(|(consumer, op)|
-            op.deps.iter().filter_map(move |dep| match dep {
-                Dep::Coarse(producer) => Some((*producer, consumer as u32)),
-                Dep::Fine { .. } => None,
-            })).collect();
+        let original_coarse: Vec<_> = self
+            .ops
+            .iter()
+            .enumerate()
+            .flat_map(|(consumer, op)| {
+                op.deps.iter().filter_map(move |dep| match dep {
+                    Dep::Coarse(producer) => Some((*producer, consumer as u32)),
+                    Dep::Fine { .. } => None,
+                })
+            })
+            .collect();
 
         // CHAIN-BYPASS — a MEASUREMENT INSTRUMENT, numerically WRONG, never shipped.
         //
@@ -2301,10 +2307,14 @@ impl Builder {
                 pair[0].inst.op == DevOp::FlashMlaDecode as u16
                     && pair[1].inst.op == DevOp::MlaMergeFold as u16
             });
-        let bf16_pair = |i: usize| self.ops.get(i..i + 2).is_some_and(|pair| {
-            matches!(DevOp::from_u16(pair[0].inst.op), Some(DevOp::FlashMlaDecode | DevOp::FlashGatherDecode))
-                && pair[1].inst.op == DevOp::FlashMerge as u16
-        });
+        let bf16_pair = |i: usize| {
+            self.ops.get(i..i + 2).is_some_and(|pair| {
+                matches!(
+                    DevOp::from_u16(pair[0].inst.op),
+                    Some(DevOp::FlashMlaDecode | DevOp::FlashGatherDecode)
+                ) && pair[1].inst.op == DevOp::FlashMerge as u16
+            })
+        };
         let decode_mla_bf16 = !uniseg && self.decode_mla_bf16_segments;
         let decode_grouped_moe = !uniseg
             && (self.decode_grouped_moe_segments || knobs.moe_decode_standalone)
@@ -2575,14 +2585,14 @@ impl Builder {
                 seg_of[i] = cur_seg;
                 continue;
             }
-            let is_flash = |op: u16| {
-                op == DevOp::FlashPrefill as u16 || op == DevOp::FlashPrefillFp8 as u16
-            };
+            let is_flash =
+                |op: u16| op == DevOp::FlashPrefill as u16 || op == DevOp::FlashPrefillFp8 as u16;
             if i > 0
                 && (wave_class(i) != wave_class(i - 1)
                     || self.ops[i].inst.op == DevOp::QwenGdnPrefill as u16
                     || self.ops[i - 1].inst.op == DevOp::QwenGdnPrefill as u16
-                    || (!uniseg && (is_flash(self.ops[i].inst.op) || is_flash(self.ops[i - 1].inst.op)))
+                    || (!uniseg
+                        && (is_flash(self.ops[i].inst.op) || is_flash(self.ops[i - 1].inst.op)))
                     || self.ops[i].isolated
                     || self.ops[i - 1].isolated
                     || self.ops[i].join != self.ops[i - 1].join)
@@ -2626,7 +2636,8 @@ impl Builder {
                 decode_grouped_moe && wave_class(consumer) == 20 && wave_class(producer) == 20;
             let raw_mla_pair_edge =
                 decode_mla_bf16 && wave_class(consumer) == 27 && wave_class(producer) == 27;
-            !raw_moe_pair_edge && !raw_mla_pair_edge
+            !raw_moe_pair_edge
+                && !raw_mla_pair_edge
                 && (!raw_segmented || seg_of[consumer] == seg_of[producer])
         };
         let mut same_segment_consumer = vec![false; self.ops.len()];
@@ -3242,35 +3253,42 @@ impl ReductionWitness {
         for &(a, b) in &retained {
             next[a as usize].push(b);
         }
-        let paths = original.iter().map(|&(source, target)| {
-            if retained.contains(&(source, target)) {
-                return Some(Vec::new());
-            }
-            let mut parent = vec![u32::MAX; n];
-            let mut queue = std::collections::VecDeque::from([source]);
-            parent[source as usize] = source;
-            while let Some(at) = queue.pop_front() {
-                for &to in &next[at as usize] {
-                    if parent[to as usize] != u32::MAX {
-                        continue;
-                    }
-                    parent[to as usize] = at;
-                    if to == target {
-                        let mut path = Vec::new();
-                        let mut node = at;
-                        while node != source {
-                            path.push(node);
-                            node = parent[node as usize];
-                        }
-                        path.reverse();
-                        return Some(path);
-                    }
-                    queue.push_back(to);
+        let paths = original
+            .iter()
+            .map(|&(source, target)| {
+                if retained.contains(&(source, target)) {
+                    return Some(Vec::new());
                 }
-            }
-            None
-        }).collect();
-        Self { original, retained: retained.into_iter().collect(), paths }
+                let mut parent = vec![u32::MAX; n];
+                let mut queue = std::collections::VecDeque::from([source]);
+                parent[source as usize] = source;
+                while let Some(at) = queue.pop_front() {
+                    for &to in &next[at as usize] {
+                        if parent[to as usize] != u32::MAX {
+                            continue;
+                        }
+                        parent[to as usize] = at;
+                        if to == target {
+                            let mut path = Vec::new();
+                            let mut node = at;
+                            while node != source {
+                                path.push(node);
+                                node = parent[node as usize];
+                            }
+                            path.reverse();
+                            return Some(path);
+                        }
+                        queue.push_back(to);
+                    }
+                }
+                None
+            })
+            .collect();
+        Self {
+            original,
+            retained: retained.into_iter().collect(),
+            paths,
+        }
     }
 }
 
@@ -3284,8 +3302,16 @@ mod reduction_witness_tests {
         let kept = transitive_reduction(4, &original.iter().copied().collect());
         let witness = ReductionWitness::new(4, original.clone(), kept);
         assert_eq!(witness.original, original);
-        assert_eq!(witness.paths, vec![Some(vec![]), Some(vec![]), Some(vec![1]),
-            Some(vec![]), Some(vec![1, 2])]);
+        assert_eq!(
+            witness.paths,
+            vec![
+                Some(vec![]),
+                Some(vec![]),
+                Some(vec![1]),
+                Some(vec![]),
+                Some(vec![1, 2])
+            ]
+        );
         let invalid = ReductionWitness::new(2, vec![(0, 1)], BTreeSet::new());
         assert_eq!(invalid.paths, [None]);
     }
@@ -3448,7 +3474,11 @@ pub fn is_modular_block_program(t: u32) -> bool {
 }
 
 pub fn modular_block_program_t(rows: u32) -> u32 {
-    assert_eq!(rows & PROGRAM_ROLE_BITS, 0, "program row count exceeds 26 bits");
+    assert_eq!(
+        rows & PROGRAM_ROLE_BITS,
+        0,
+        "program row count exceeds 26 bits"
+    );
     rows | MODULAR_BLOCK_PROG
 }
 
@@ -3457,7 +3487,11 @@ pub fn is_dense_exact_program(t: u32) -> bool {
 }
 
 pub fn dense_exact_program_t(rows: u32) -> u32 {
-    assert_eq!(rows & PROGRAM_ROLE_BITS, 0, "program row count exceeds 26 bits");
+    assert_eq!(
+        rows & PROGRAM_ROLE_BITS,
+        0,
+        "program row count exceeds 26 bits"
+    );
     rows | DENSE_EXACT_PROG
 }
 
@@ -3478,7 +3512,11 @@ pub fn is_rowsplit_prefill_program(t: u32) -> bool {
 }
 
 pub fn rowsplit_prefill_program_t(rows: u32) -> u32 {
-    assert_eq!(rows & PROGRAM_ROLE_BITS, 0, "program row count exceeds 26 bits");
+    assert_eq!(
+        rows & PROGRAM_ROLE_BITS,
+        0,
+        "program row count exceeds 26 bits"
+    );
     rows | ROWSPLIT_PREFILL_PROG
 }
 
@@ -4126,7 +4164,11 @@ impl Model {
         // produces would leave the tail of the buffer uninitialised on device.
         for g in &self.gen {
             let want = self.tensors[g.tensor as usize].bytes;
-            let got = if g.amd_rope_bf16() { Some(g.byte_len()) } else { g.generate().map(|d| d.len() as u64) };
+            let got = if g.amd_rope_bf16() {
+                Some(g.byte_len())
+            } else {
+                g.generate().map(|d| d.len() as u64)
+            };
             assert_eq!(
                 Some(want),
                 got,
@@ -4265,17 +4307,25 @@ impl Model {
 /// the GQ01 appendix and the section directory (as [`Model::to_blob_v6`] writes them).
 pub fn replace_metadata_sections(blob: &[u8], set: &[SectionData]) -> Result<Vec<u8>, String> {
     let ent = size_of::<BlobSectionEntry>();
-    let dir = blob.get(40..48).map(|b| u64::from_le_bytes(b.try_into().unwrap()) as usize).ok_or("truncated blob")?;
+    let dir = blob
+        .get(40..48)
+        .map(|b| u64::from_le_bytes(b.try_into().unwrap()) as usize)
+        .ok_or("truncated blob")?;
     if dir == 0 || blob.get(dir..dir + 4) != Some(&SECT_MAGIC[..]) {
         return Err("blob has no v6 section directory".into());
     }
-    let count = blob.get(dir + 4..dir + 8).map(|b| u32::from_le_bytes(b.try_into().unwrap()) as usize).ok_or("truncated directory")?;
+    let count = blob
+        .get(dir + 4..dir + 8)
+        .map(|b| u32::from_le_bytes(b.try_into().unwrap()) as usize)
+        .ok_or("truncated directory")?;
     if blob.len() != dir + 8 + count * ent {
         return Err("section directory is not at the end of the blob".into());
     }
     let entries: Vec<BlobSectionEntry> = (0..count)
         // SAFETY: in bounds (checked above); BlobSectionEntry is plain old data.
-        .map(|i| unsafe { core::ptr::read_unaligned(blob[dir + 8 + i * ent..].as_ptr() as *const BlobSectionEntry) })
+        .map(|i| unsafe {
+            core::ptr::read_unaligned(blob[dir + 8 + i * ent..].as_ptr() as *const BlobSectionEntry)
+        })
         .collect();
     let start = entries.first().map_or(dir, |e| e.offset as usize);
     let mut at = start;
@@ -4292,15 +4342,27 @@ pub fn replace_metadata_sections(blob: &[u8], set: &[SectionData]) -> Result<Vec
         let end = e.name.iter().position(|&c| c == 0).unwrap_or(SECT_NAME_LEN);
         String::from_utf8_lossy(&e.name[..end]).into_owned()
     };
-    if set.iter().any(|s| s.kind != SECT_METADATA || s.name.is_empty() || s.name.len() >= SECT_NAME_LEN) {
+    if set
+        .iter()
+        .any(|s| s.kind != SECT_METADATA || s.name.is_empty() || s.name.len() >= SECT_NAME_LEN)
+    {
         return Err("only named metadata sections can be replaced".into());
     }
     let mut sections: Vec<(u32, String, &[u8])> = entries
         .iter()
-        .map(|e| (e.kind, name_of(e), &blob[e.offset as usize..(e.offset + e.size) as usize]))
+        .map(|e| {
+            (
+                e.kind,
+                name_of(e),
+                &blob[e.offset as usize..(e.offset + e.size) as usize],
+            )
+        })
         .collect();
     for s in set {
-        match sections.iter_mut().find(|(kind, name, _)| *kind == SECT_METADATA && *name == s.name) {
+        match sections
+            .iter_mut()
+            .find(|(kind, name, _)| *kind == SECT_METADATA && *name == s.name)
+        {
             Some(slot) => slot.2 = &s.data,
             None => sections.push((SECT_METADATA, s.name.clone(), &s.data)),
         }
@@ -4310,7 +4372,13 @@ pub fn replace_metadata_sections(blob: &[u8], set: &[SectionData]) -> Result<Vec
     for (kind, name, data) in &sections {
         let mut fixed = [0u8; SECT_NAME_LEN];
         fixed[..name.len()].copy_from_slice(name.as_bytes());
-        dir_entries.push(BlobSectionEntry { kind: *kind, _pad: 0, offset: out.len() as u64, size: data.len() as u64, name: fixed });
+        dir_entries.push(BlobSectionEntry {
+            kind: *kind,
+            _pad: 0,
+            offset: out.len() as u64,
+            size: data.len() as u64,
+            name: fixed,
+        });
         out.extend_from_slice(data);
     }
     let new_dir = out.len() as u64;
@@ -4318,7 +4386,9 @@ pub fn replace_metadata_sections(blob: &[u8], set: &[SectionData]) -> Result<Vec
     out.extend_from_slice(&(dir_entries.len() as u32).to_le_bytes());
     for e in &dir_entries {
         // SAFETY: BlobSectionEntry is repr(C) plain old data.
-        out.extend_from_slice(unsafe { std::slice::from_raw_parts(e as *const BlobSectionEntry as *const u8, ent) });
+        out.extend_from_slice(unsafe {
+            std::slice::from_raw_parts(e as *const BlobSectionEntry as *const u8, ent)
+        });
     }
     out[40..48].copy_from_slice(&new_dir.to_le_bytes());
     Ok(out)
@@ -6136,7 +6206,9 @@ mod decode_mla_segment_tests {
         for op in [DevOp::FlashMlaDecode, DevOp::FlashGatherDecode] {
             for enabled in [false, true] {
                 let mut b = Builder::new(4);
-                if enabled { b.set_decode_mla_bf16_segments(); }
+                if enabled {
+                    b.set_decode_mla_bf16_segments();
+                }
                 let all = b.all();
                 let before = b.emit(DevOp::Nop, all.clone(), &[], |_| {});
                 let flash = b.emit(op, all.clone(), &[before], |_| {});
@@ -6145,10 +6217,20 @@ mod decode_mla_segment_tests {
                 let p = b.finish();
                 let seg = |i| p.stream.iter().find(|e| e.inst == i).unwrap().seg;
                 if enabled {
-                    assert_ne!(seg(0), seg(1)); assert_eq!(seg(1), seg(2)); assert_ne!(seg(2), seg(3));
-                    for e in p.stream.iter().chain(&p.gq_stream).filter(|e| e.seg == seg(1)) {
+                    assert_ne!(seg(0), seg(1));
+                    assert_eq!(seg(1), seg(2));
+                    assert_ne!(seg(2), seg(3));
+                    for e in p
+                        .stream
+                        .iter()
+                        .chain(&p.gq_stream)
+                        .filter(|e| e.seg == seg(1))
+                    {
                         assert!(matches!(e.inst, 1 | 2));
-                        assert_eq!((e.wait_len, e.succ_len, e.flags & crate::dev::SE_XCTR), (0, 0, 0));
+                        assert_eq!(
+                            (e.wait_len, e.succ_len, e.flags & crate::dev::SE_XCTR),
+                            (0, 0, 0)
+                        );
                     }
                 } else {
                     assert_eq!(seg(0), seg(3));
@@ -6455,9 +6537,23 @@ mod v6_tests {
     #[test]
     fn replacing_metadata_keeps_everything_else() {
         let m = tiny_model();
-        let section = |kind, name: &str, data: &[u8]| SectionData { kind, name: name.into(), data: data.to_vec() };
-        let old = m.to_blob_v6(&[section(SECT_CUBIN, "cubin", b"\x01\x02"), section(SECT_METADATA, "meta", b"old")]);
-        let new = replace_metadata_sections(&old, &[section(SECT_METADATA, "meta", b"newer"), section(SECT_METADATA, "added", b"x")]).unwrap();
+        let section = |kind, name: &str, data: &[u8]| SectionData {
+            kind,
+            name: name.into(),
+            data: data.to_vec(),
+        };
+        let old = m.to_blob_v6(&[
+            section(SECT_CUBIN, "cubin", b"\x01\x02"),
+            section(SECT_METADATA, "meta", b"old"),
+        ]);
+        let new = replace_metadata_sections(
+            &old,
+            &[
+                section(SECT_METADATA, "meta", b"newer"),
+                section(SECT_METADATA, "added", b"x"),
+            ],
+        )
+        .unwrap();
         let want = m.to_blob_v6(&[
             section(SECT_CUBIN, "cubin", b"\x01\x02"),
             section(SECT_METADATA, "meta", b"newer"),
@@ -6809,7 +6905,11 @@ mod v6_tests {
             };
             assert_eq!(role, want, "at {i}");
             assert_eq!(role.is_decode_rung(), i >= side, "at {i}");
-            assert_eq!(role.is_dense_exact_rung(), (side..lo).contains(&i), "at {i}");
+            assert_eq!(
+                role.is_dense_exact_rung(),
+                (side..lo).contains(&i),
+                "at {i}"
+            );
             assert_eq!(role.is_prefill_side(), i < side, "at {i}");
         }
         assert_eq!(
@@ -6867,7 +6967,11 @@ mod isolated_segment_tests {
 
     #[test]
     fn native_moe_boundary_orders_segments_without_counter_obligations() {
-        for native in [DevOp::MoeAiterFp8Pf, DevOp::IndexFp8Decode, DevOp::IndexFp8Prefill] {
+        for native in [
+            DevOp::MoeAiterFp8Pf,
+            DevOp::IndexFp8Decode,
+            DevOp::IndexFp8Prefill,
+        ] {
             let mut b = Builder::new(4);
             b.force_uniseg();
             let first = b.emit(DevOp::Nop, b.all(), &[], |_| {});

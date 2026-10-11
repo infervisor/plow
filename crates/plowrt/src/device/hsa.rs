@@ -49,8 +49,8 @@ use crate::{DeviceErrorInfo, Result, RuntimeError};
 
 #[path = "hsa_evidence.rs"]
 mod evidence;
-pub use evidence::{LoadedObjectEvidence, ResolvedKernelEvidence, SelectedKernelEvidence};
 use evidence::LoadedObjects;
+pub use evidence::{LoadedObjectEvidence, ResolvedKernelEvidence, SelectedKernelEvidence};
 
 // ─── HSA ABI constants ───────────────────────────────────────────────────────
 
@@ -1383,10 +1383,15 @@ impl HsaBackend {
 
 impl Drop for HsaBackend {
     fn drop(&mut self) {
-        let kernargs_retired = self.kernarg_retirement.completion_ticket().and_then(|ticket| {
-            let value = unsafe { (self.shared.drv.hsa_signal_load_scacquire)(self.done_signal) };
-            self.kernarg_retirement.complete(ticket, value)
-        }).is_ok();
+        let kernargs_retired = self
+            .kernarg_retirement
+            .completion_ticket()
+            .and_then(|ticket| {
+                let value =
+                    unsafe { (self.shared.drv.hsa_signal_load_scacquire)(self.done_signal) };
+                self.kernarg_retirement.complete(ticket, value)
+            })
+            .is_ok();
         if !kernargs_retired {
             // Fault/cancellation may leave packet consumers alive. Retain only
             // this ring, its completion signal and runtime; not all kernel operands.
@@ -2347,7 +2352,9 @@ impl HsaBackend {
             let expected = self.reserve_kernargs(1, size)?;
             let idx = unsafe { (self.shared.drv.hsa_queue_add_write_index_screlease)(q, 1) };
             if idx != expected {
-                return Err(RuntimeError::Rejected("AQL/kernarg generation mismatch".into()));
+                return Err(RuntimeError::Rejected(
+                    "AQL/kernarg generation mismatch".into(),
+                ));
             }
             while idx
                 .wrapping_sub(unsafe { (self.shared.drv.hsa_queue_load_read_index_scacquire)(q) })
@@ -2473,13 +2480,17 @@ impl HsaBackend {
 
         // Immediate batches retain ordinary per-dispatch doorbells. Deferred
         // chains ring once after every TP rank has been prepared.
-        if super::kernarg_retirement::ring_on_dispatch(chain_end != CHAIN_IDLE, || self.chain_immediate.load(Ordering::Relaxed)) {
+        if super::kernarg_retirement::ring_on_dispatch(chain_end != CHAIN_IDLE, || {
+            self.chain_immediate.load(Ordering::Relaxed)
+        }) {
             unsafe {
                 (self.shared.drv.hsa_signal_store_screlease)((*q).doorbell_signal, idx as i64);
             }
         }
         if chain_end == CHAIN_IDLE {
-            self.kernarg_retirement.publish(idx + 1).map_err(kernarg_retirement_error)?;
+            self.kernarg_retirement
+                .publish(idx + 1)
+                .map_err(kernarg_retirement_error)?;
         }
 
         Ok(())
@@ -2764,17 +2775,28 @@ impl HsaUploadRing {
             // the slot must NOT be marked busy — a later `drain` would hang on
             // it. Drain what really is in flight, then report.
             unsafe { (self.shared.drv.hsa_signal_store_screlease)(slot.sig, 0) };
-            slot.retirement.not_submitted(ticket).map_err(super::retirement_error)?;
+            slot.retirement
+                .not_submitted(ticket)
+                .map_err(super::retirement_error)?;
             self.drain()?;
             return Err(hsa_fault(rc, "hsa_amd_memory_async_copy (upload ring)"));
         }
-        self.slots[i].retirement.submitted(ticket).map_err(super::retirement_error)?;
+        self.slots[i]
+            .retirement
+            .submitted(ticket)
+            .map_err(super::retirement_error)?;
         self.next += 1;
         Ok(())
     }
 
     fn wait_slot(&mut self, i: usize) -> Result<()> {
-        let Some(ticket) = self.slots[i].retirement.event_ticket().map_err(super::retirement_error)? else { return Ok(()) };
+        let Some(ticket) = self.slots[i]
+            .retirement
+            .event_ticket()
+            .map_err(super::retirement_error)?
+        else {
+            return Ok(());
+        };
         let value = unsafe {
             (self.shared.drv.hsa_signal_wait_scacquire)(
                 self.slots[i].sig,
@@ -2784,7 +2806,10 @@ impl HsaUploadRing {
                 HSA_WAIT_STATE_BLOCKED,
             )
         };
-        self.slots[i].retirement.complete_signal(ticket, value).map_err(super::retirement_error)?;
+        self.slots[i]
+            .retirement
+            .complete_signal(ticket, value)
+            .map_err(super::retirement_error)?;
         Ok(())
     }
 
@@ -2796,7 +2821,9 @@ impl HsaUploadRing {
     pub fn drain(&mut self) -> Result<()> {
         let mut error = None;
         for i in 0..self.slots.len() {
-            if let Err(e) = self.wait_slot(i) { error.get_or_insert(e); }
+            if let Err(e) = self.wait_slot(i) {
+                error.get_or_insert(e);
+            }
         }
         error.map_or(Ok(()), Err)
     }
@@ -2976,30 +3003,42 @@ impl HsaBackend {
         // counting signal before publication and the device decrements it on
         // completion, so zero is the exact queue-tail completion condition.
         self.guard()?;
-        let ticket = self.kernarg_retirement.completion_ticket().map_err(kernarg_retirement_error)?;
+        let ticket = self
+            .kernarg_retirement
+            .completion_ticket()
+            .map_err(kernarg_retirement_error)?;
         let value = self.wait_counting_signal()?;
-        self.kernarg_retirement.complete(ticket, value).map_err(kernarg_retirement_error)
+        self.kernarg_retirement
+            .complete(ticket, value)
+            .map_err(kernarg_retirement_error)
     }
 
     pub(crate) fn require_quiescent(&self) -> Result<()> {
         self.guard()?;
-        self.kernarg_retirement.quiescent().map_err(kernarg_retirement_error)
+        self.kernarg_retirement
+            .quiescent()
+            .map_err(kernarg_retirement_error)
     }
 
     pub(crate) fn synchronize_native_lap(&self) -> Result<()> {
         self.guard()?;
         let end = self.chain_end.load(Ordering::Acquire);
-        if end == CHAIN_IDLE { return self.synchronize(); }
-        let ticket = self.kernarg_retirement.prefix(
-            self.chain_base.load(Ordering::Acquire),
-            self.chain_next.load(Ordering::Acquire),
-            end,
-            self.chain_immediate.load(Ordering::Relaxed),
-        ).map_err(kernarg_retirement_error)?;
+        if end == CHAIN_IDLE {
+            return self.synchronize();
+        }
+        let ticket = self
+            .kernarg_retirement
+            .prefix(
+                self.chain_base.load(Ordering::Acquire),
+                self.chain_next.load(Ordering::Acquire),
+                end,
+                self.chain_immediate.load(Ordering::Relaxed),
+            )
+            .map_err(kernarg_retirement_error)?;
         let value = self.wait_counting_signal()?;
-        self.kernarg_retirement.complete_prefix(
-            ticket, self.chain_next.load(Ordering::Acquire), value,
-        ).map_err(kernarg_retirement_error)
+        self.kernarg_retirement
+            .complete_prefix(ticket, self.chain_next.load(Ordering::Acquire), value)
+            .map_err(kernarg_retirement_error)
     }
 
     fn wait_counting_signal(&self) -> Result<i64> {
@@ -3383,10 +3422,19 @@ impl HsaBackend {
         self.loaded_objects.lock().snapshot()
     }
 
-    pub(crate) fn selected_kernel_evidence(&self, kernel: HsaKernel) -> Result<SelectedKernelEvidence> {
-        self.loaded_objects.lock().selected(
-            kernel.kernel_object, kernel.kernarg_size, kernel.group_segment_size, kernel.private_segment_size,
-        ).map_err(RuntimeError::Device)
+    pub(crate) fn selected_kernel_evidence(
+        &self,
+        kernel: HsaKernel,
+    ) -> Result<SelectedKernelEvidence> {
+        self.loaded_objects
+            .lock()
+            .selected(
+                kernel.kernel_object,
+                kernel.kernarg_size,
+                kernel.group_segment_size,
+                kernel.private_segment_size,
+            )
+            .map_err(RuntimeError::Device)
     }
 
     /// Destroy a loaded executable.
@@ -3644,7 +3692,10 @@ impl HsaBackend {
         self.begin_dispatch_chain_admitted(ticket)
     }
 
-    pub(crate) fn preflight_dispatch_chain(&self, packets: usize) -> Result<super::kernarg_retirement::Admission> {
+    pub(crate) fn preflight_dispatch_chain(
+        &self,
+        packets: usize,
+    ) -> Result<super::kernarg_retirement::Admission> {
         self.guard()?;
         if packets == 0 {
             return Err(RuntimeError::Device(
@@ -3658,40 +3709,59 @@ impl HsaBackend {
             )));
         }
         if self.chain_end.load(Ordering::Acquire) != CHAIN_IDLE {
-            return Err(RuntimeError::Rejected("an AQL chain is already active".into()));
+            return Err(RuntimeError::Rejected(
+                "an AQL chain is already active".into(),
+            ));
         }
-        self.kernarg_retirement.preflight(packets as u64, size as u64, || unsafe {
-            (self.shared.drv.hsa_signal_load_scacquire)(self.done_signal)
-        }).map_err(kernarg_retirement_error)
+        self.kernarg_retirement
+            .preflight(packets as u64, size as u64, || unsafe {
+                (self.shared.drv.hsa_signal_load_scacquire)(self.done_signal)
+            })
+            .map_err(kernarg_retirement_error)
     }
 
-    pub(crate) fn begin_dispatch_chain_admitted(&self, ticket: super::kernarg_retirement::Admission) -> Result<()> {
+    pub(crate) fn begin_dispatch_chain_admitted(
+        &self,
+        ticket: super::kernarg_retirement::Admission,
+    ) -> Result<()> {
         self.begin_dispatch_reservation(ticket, false)
     }
 
-    pub(crate) fn begin_dispatch_batch_admitted(&self, ticket: super::kernarg_retirement::Admission) -> Result<()> {
+    pub(crate) fn begin_dispatch_batch_admitted(
+        &self,
+        ticket: super::kernarg_retirement::Admission,
+    ) -> Result<()> {
         self.begin_dispatch_reservation(ticket, true)
     }
 
-    fn begin_dispatch_reservation(&self, ticket: super::kernarg_retirement::Admission, immediate: bool) -> Result<()> {
+    fn begin_dispatch_reservation(
+        &self,
+        ticket: super::kernarg_retirement::Admission,
+        immediate: bool,
+    ) -> Result<()> {
         self.guard()?;
         let packets = ticket.count();
         let size = unsafe { (*self.queue).size } as u64;
         self.chain_end
             .compare_exchange(CHAIN_IDLE, CHAIN_SETUP, Ordering::AcqRel, Ordering::Acquire)
             .map_err(|_| RuntimeError::Device("an AQL chain is already active".into()))?;
-        let expected = match self.kernarg_retirement.reserve_admitted(ticket).map_err(kernarg_retirement_error) {
+        let expected = match self
+            .kernarg_retirement
+            .reserve_admitted(ticket)
+            .map_err(kernarg_retirement_error)
+        {
             Ok(base) => base,
             Err(error) => {
                 self.chain_end.store(CHAIN_IDLE, Ordering::Release);
                 return Err(error);
             }
         };
-        let base = unsafe {
-            (self.shared.drv.hsa_queue_add_write_index_screlease)(self.queue, packets)
-        };
+        let base =
+            unsafe { (self.shared.drv.hsa_queue_add_write_index_screlease)(self.queue, packets) };
         if base != expected {
-            return Err(RuntimeError::Rejected("AQL/kernarg generation mismatch".into()));
+            return Err(RuntimeError::Rejected(
+                "AQL/kernarg generation mismatch".into(),
+            ));
         }
         let end = base + packets;
         while (end - 1).wrapping_sub(unsafe {
@@ -3714,10 +3784,15 @@ impl HsaBackend {
         let end = self.chain_end.load(Ordering::Acquire);
         if super::kernarg_retirement::ring_on_commit(self.chain_immediate.load(Ordering::Relaxed)) {
             unsafe {
-                (self.shared.drv.hsa_signal_store_screlease)((*self.queue).doorbell_signal, (end - 1) as i64);
+                (self.shared.drv.hsa_signal_store_screlease)(
+                    (*self.queue).doorbell_signal,
+                    (end - 1) as i64,
+                );
             }
         }
-        self.kernarg_retirement.publish(end).map_err(kernarg_retirement_error)?;
+        self.kernarg_retirement
+            .publish(end)
+            .map_err(kernarg_retirement_error)?;
         self.chain_end.store(CHAIN_IDLE, Ordering::Release);
         Ok(())
     }
@@ -3764,16 +3839,23 @@ impl HsaBackend {
     fn reserve_kernargs(&self, packets: u64, capacity: u64) -> Result<u64> {
         match self.kernarg_retirement.reserve(packets, capacity) {
             Ok(base) => return Ok(base),
-            Err(super::kernarg_retirement::Error::Capacity) => {},
+            Err(super::kernarg_retirement::Error::Capacity) => {}
             Err(error) => return Err(kernarg_retirement_error(error)),
         }
-        let ticket = self.kernarg_retirement.completion_ticket().map_err(kernarg_retirement_error)?;
+        let ticket = self
+            .kernarg_retirement
+            .completion_ticket()
+            .map_err(kernarg_retirement_error)?;
         let value = unsafe { (self.shared.drv.hsa_signal_load_scacquire)(self.done_signal) };
         // Never block here: another TP rank may still need its chain published.
         // Rejection precedes this queue's reservation. A TP caller must coordinate
         // other ranks' reservations before attempting any retry.
-        self.kernarg_retirement.complete(ticket, value).map_err(kernarg_retirement_error)?;
-        self.kernarg_retirement.reserve(packets, capacity).map_err(kernarg_retirement_error)
+        self.kernarg_retirement
+            .complete(ticket, value)
+            .map_err(kernarg_retirement_error)?;
+        self.kernarg_retirement
+            .reserve(packets, capacity)
+            .map_err(kernarg_retirement_error)
     }
 
     /// Launch `f` over `grid` workgroups of `block` threads.
@@ -3901,7 +3983,11 @@ impl HsaBackend {
 ///   by construction; the CUDA path encodes the same intent in
 ///   `CUmemAllocationProp::location`.
 impl crate::memory::vmm::VmmOps for HsaBackend {
-    fn allocation_provenance(&self, va: u64, bytes: u64) -> Option<super::provenance::MemoryRegion> {
+    fn allocation_provenance(
+        &self,
+        va: u64,
+        bytes: u64,
+    ) -> Option<super::provenance::MemoryRegion> {
         self.vmm_provenance.lock().region(va, bytes)
     }
 
@@ -4157,22 +4243,30 @@ mod tests {
     #[test]
     #[ignore = "requires queued gfx950 and PLOW_TEST_AITER_DIR with frozen retirement test object"]
     fn kernarg_admission_gpu_regression() {
+        use super::{HsaBackend, CHAIN_IDLE, QUEUE_SIZE};
         use crate::exec::device_api::EngineDevice;
-        use super::{HsaBackend, QUEUE_SIZE, CHAIN_IDLE};
         use std::sync::atomic::Ordering;
         let dir = std::path::PathBuf::from(std::env::var("PLOW_TEST_AITER_DIR").unwrap());
         let image = std::fs::read(dir.join("test_kernels.elf")).unwrap();
         let be = HsaBackend::new(0).unwrap();
         assert_eq!(be.device_name(), "gfx950");
         let module = EngineDevice::module_load(&be, &image).unwrap();
-        let kernel = EngineDevice::get_function(&be, &module, "hsa_kernarg_retirement_test").unwrap();
+        let kernel =
+            EngineDevice::get_function(&be, &module, "hsa_kernarg_retirement_test").unwrap();
         let n = 2 + 2 * QUEUE_SIZE as usize;
         let mut output = be.host_alloc_pinned(n * 8).unwrap();
         output.as_mut_slice().fill(0);
         let ptr = output.as_ptr() as u64;
         let value = |index: usize| 0xdade_1357_cafe_0000u64 ^ index as u64;
         let launch = |index: usize, delay| {
-            be.launch(kernel, 1, 256, 0, bytemuck::cast_slice(&[ptr, index as u64, value(index), delay])).unwrap();
+            be.launch(
+                kernel,
+                1,
+                256,
+                0,
+                bytemuck::cast_slice(&[ptr, index as u64, value(index), delay]),
+            )
+            .unwrap();
         };
         let old = be.preflight_dispatch_chain(1).unwrap();
         launch(0, 1_000_000_000);
@@ -4181,7 +4275,10 @@ mod tests {
         assert!(pending > 0, "bounded delay completed before capacity test");
         assert!(be.begin_dispatch_chain(QUEUE_SIZE as usize).is_err());
         assert_eq!(be.chain_end.load(Ordering::Acquire), CHAIN_IDLE);
-        assert_eq!(be.kernarg_retirement.completion_ticket().unwrap(), generation);
+        assert_eq!(
+            be.kernarg_retirement.completion_ticket().unwrap(),
+            generation
+        );
         be.synchronize().unwrap();
         assert!(be.begin_dispatch_chain_admitted(old).is_err());
         assert_eq!(be.chain_end.load(Ordering::Acquire), CHAIN_IDLE);
@@ -4209,7 +4306,9 @@ mod tests {
                     assert!(be.preflight_dispatch_chain(1).is_err());
                 }
             }
-            if immediate { be.synchronize_native_lap().unwrap(); }
+            if immediate {
+                be.synchronize_native_lap().unwrap();
+            }
             // Even a zero signal cannot retire a reservation before its batch is published.
             assert!(be.synchronize().is_err());
             be.commit_dispatch_chain().unwrap();
@@ -4218,7 +4317,11 @@ mod tests {
             eprintln!("HSA_RETIREMENT_WRAP immediate={immediate} packets={QUEUE_SIZE} pass");
         }
         for (index, bytes) in output.as_slice().chunks_exact(8).enumerate() {
-            assert_eq!(u64::from_ne_bytes(bytes.try_into().unwrap()), value(index), "index={index}");
+            assert_eq!(
+                u64::from_ne_bytes(bytes.try_into().unwrap()),
+                value(index),
+                "index={index}"
+            );
         }
 
         // Trigger a real admission error only after all GPU work has completed.
@@ -4226,18 +4329,26 @@ mod tests {
         assert!(be.commit_dispatch_chain().is_err());
         assert!(be.is_poisoned());
         assert!(be.memcpy_htod(ptr, &[0u8; 8]).is_err());
-        assert!(be.launch(kernel, 1, 256, 0, bytemuck::cast_slice(&[ptr, 0, 0, 0u64])).is_err());
-        assert_eq!(u64::from_ne_bytes(output.as_slice()[..8].try_into().unwrap()), value(0));
-        eprintln!("HSA_RETIREMENT_RESULT {}", serde_json::json!({
-            "passed": true, "scope": "single-rank gfx950 HSA admission correctness",
-            "kernel_object_sha256": plow_asset::decode_objects::image_sha256(&image),
-            "checked_outputs": n, "ring_capacity": QUEUE_SIZE,
-            "capacity_pending_signal": pending, "stale_ticket_rejected": true,
-            "post_error_upload_rejected_after_quiescence": true,
-            "immediate_prefix_completion_without_retirement": true,
-            "deferred_prefix_refused": true,
-            "gpu_overhead_measured": false, "tp8_or_fault_teardown_qualified": false
-        }));
+        assert!(be
+            .launch(kernel, 1, 256, 0, bytemuck::cast_slice(&[ptr, 0, 0, 0u64]))
+            .is_err());
+        assert_eq!(
+            u64::from_ne_bytes(output.as_slice()[..8].try_into().unwrap()),
+            value(0)
+        );
+        eprintln!(
+            "HSA_RETIREMENT_RESULT {}",
+            serde_json::json!({
+                "passed": true, "scope": "single-rank gfx950 HSA admission correctness",
+                "kernel_object_sha256": plow_asset::decode_objects::image_sha256(&image),
+                "checked_outputs": n, "ring_capacity": QUEUE_SIZE,
+                "capacity_pending_signal": pending, "stale_ticket_rejected": true,
+                "post_error_upload_rejected_after_quiescence": true,
+                "immediate_prefix_completion_without_retirement": true,
+                "deferred_prefix_refused": true,
+                "gpu_overhead_measured": false, "tp8_or_fault_teardown_qualified": false
+            })
+        );
     }
 
     #[test]

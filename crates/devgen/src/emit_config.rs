@@ -223,7 +223,10 @@ pub struct EmitConfig {
 
     /// Largest packed Qwen audio-encoder bucket, in 100-frame chunks (default 192). The largest
     /// bucket sizes every shared encoder tensor; a smaller GPU trades encoder passes for memory.
-    #[arg(long = "emit-asr-packed-max-chunks", env = "PLOW_ASR_PACKED_MAX_CHUNKS")]
+    #[arg(
+        long = "emit-asr-packed-max-chunks",
+        env = "PLOW_ASR_PACKED_MAX_CHUNKS"
+    )]
     pub asr_packed_max_chunks: Option<u32>,
 
     /// Emit the checkpoint's vision/audio towers as encoder sidecars and give the text packet
@@ -1312,7 +1315,10 @@ pub struct EmitConfig {
 
     /// With `decode_cublaslt`: only decode rungs of at least this many rows take the route; the
     /// narrower rungs keep the fused interpreter program. Unset = every rung.
-    #[arg(long = "emit-decode-cublaslt-min-rows", env = "PLOW_EMIT_DECODE_CUBLASLT_MIN_ROWS")]
+    #[arg(
+        long = "emit-decode-cublaslt-min-rows",
+        env = "PLOW_EMIT_DECODE_CUBLASLT_MIN_ROWS"
+    )]
     pub decode_cublaslt_min_rows: Option<u32>,
 
     /// With `decode_cublaslt`: the routed rungs' lm_head is a library segment too.
@@ -1899,7 +1905,8 @@ impl EmitConfig {
     }
 
     pub fn glm_moe_resident(&self) -> bool {
-        self.glm_moe_resident.unwrap_or(self.glm_production_defaults)
+        self.glm_moe_resident
+            .unwrap_or(self.glm_production_defaults)
     }
 
     pub fn glm_index_tp(&self) -> bool {
@@ -1907,7 +1914,8 @@ impl EmitConfig {
     }
 
     pub fn glm_select_local(&self) -> bool {
-        self.glm_select_local.unwrap_or(self.glm_production_defaults)
+        self.glm_select_local
+            .unwrap_or(self.glm_production_defaults)
     }
 
     pub fn glm_select_split(&self) -> Option<u32> {
@@ -1915,7 +1923,8 @@ impl EmitConfig {
     }
 
     pub fn glm_decode_norm_rows(&self) -> bool {
-        self.glm_decode_norm_rows.unwrap_or(self.glm_production_defaults)
+        self.glm_decode_norm_rows
+            .unwrap_or(self.glm_production_defaults)
     }
 
     pub fn glm_gemm_lt(&self) -> bool {
@@ -1923,11 +1932,13 @@ impl EmitConfig {
     }
 
     pub fn glm_gemm_lt_decode(&self) -> bool {
-        self.glm_gemm_lt_decode.unwrap_or(self.glm_production_defaults)
+        self.glm_gemm_lt_decode
+            .unwrap_or(self.glm_production_defaults)
     }
 
     pub fn glm_decode_gemm_group(&self) -> bool {
-        self.glm_decode_gemm_group.unwrap_or(self.glm_production_defaults)
+        self.glm_decode_gemm_group
+            .unwrap_or(self.glm_production_defaults)
     }
 
     /// Which prefill interpreter GEMM groups take the hipBLASLt route. The qualified GLM target
@@ -1936,12 +1947,17 @@ impl EmitConfig {
     pub fn glm_gemm_lt_pf_ext_spec(&self) -> &str {
         self.glm_gemm_lt_pf_ext
             .as_deref()
-            .unwrap_or(if self.glm_production_defaults { GLM_GEMM_LT_PF_EXT_QUALIFIED } else { "" })
+            .unwrap_or(if self.glm_production_defaults {
+                GLM_GEMM_LT_PF_EXT_QUALIFIED
+            } else {
+                ""
+            })
     }
 
     /// Only widens [`Self::glm_gemm_lt_decode`]: with that off it changes nothing.
     pub fn glm_gemm_lt_decode_ext(&self) -> bool {
-        self.glm_gemm_lt_decode_ext.unwrap_or(self.glm_production_defaults)
+        self.glm_gemm_lt_decode_ext
+            .unwrap_or(self.glm_production_defaults)
     }
 
     pub fn glm_fold_lt(&self) -> bool {
@@ -2029,21 +2045,61 @@ impl EmitConfig {
     pub fn glm_recipe_unset(&self) -> [(&'static str, bool, bool); 13] {
         [
             ("glm_fp8_kv", self.glm_fp8_kv.is_none(), self.glm_fp8_kv()),
-            ("glm_moe_aiter", self.glm_moe_aiter.is_none(), self.glm_moe_aiter()),
-            ("glm_moe_resident", self.glm_moe_resident.is_none(), self.glm_moe_resident()),
-            ("glm_index_tp", self.glm_index_tp.is_none(), self.glm_index_tp()),
-            ("glm_select_local", self.glm_select_local.is_none(), self.glm_select_local()),
-            ("glm_decode_norm_rows", self.glm_decode_norm_rows.is_none(), self.glm_decode_norm_rows()),
-            ("glm_gemm_lt", self.glm_gemm_lt.is_none(), self.glm_gemm_lt()),
-            ("glm_gemm_lt_decode", self.glm_gemm_lt_decode.is_none(), self.glm_gemm_lt_decode()),
+            (
+                "glm_moe_aiter",
+                self.glm_moe_aiter.is_none(),
+                self.glm_moe_aiter(),
+            ),
+            (
+                "glm_moe_resident",
+                self.glm_moe_resident.is_none(),
+                self.glm_moe_resident(),
+            ),
+            (
+                "glm_index_tp",
+                self.glm_index_tp.is_none(),
+                self.glm_index_tp(),
+            ),
+            (
+                "glm_select_local",
+                self.glm_select_local.is_none(),
+                self.glm_select_local(),
+            ),
+            (
+                "glm_decode_norm_rows",
+                self.glm_decode_norm_rows.is_none(),
+                self.glm_decode_norm_rows(),
+            ),
+            (
+                "glm_gemm_lt",
+                self.glm_gemm_lt.is_none(),
+                self.glm_gemm_lt(),
+            ),
+            (
+                "glm_gemm_lt_decode",
+                self.glm_gemm_lt_decode.is_none(),
+                self.glm_gemm_lt_decode(),
+            ),
             (
                 "glm_gemm_lt_decode_ext",
                 self.glm_gemm_lt_decode_ext.is_none(),
                 self.glm_gemm_lt_decode_ext(),
             ),
-            ("glm_fold_lt", self.glm_fold_lt.is_none(), self.glm_fold_lt()),
-            ("glm_seq_par", self.glm_seq_par.is_none(), self.glm_seq_par()),
-            ("glm_seq_par_proj", self.glm_seq_par_proj.is_none(), self.glm_seq_par_proj()),
+            (
+                "glm_fold_lt",
+                self.glm_fold_lt.is_none(),
+                self.glm_fold_lt(),
+            ),
+            (
+                "glm_seq_par",
+                self.glm_seq_par.is_none(),
+                self.glm_seq_par(),
+            ),
+            (
+                "glm_seq_par_proj",
+                self.glm_seq_par_proj.is_none(),
+                self.glm_seq_par_proj(),
+            ),
             (
                 "glm_decode_gemm_group",
                 self.glm_decode_gemm_group.is_none(),
@@ -2423,14 +2479,18 @@ mod tests {
         let _guard = crate::test_env::env_guard();
         let _scope = crate::test_env::EnvScope::set(&[("PLOW_EMIT_PREFILL_CUBLASLT", "0")]);
         assert!(!EmitConfig::from_env().prefill_cublaslt);
-        assert!(!TestArgs::try_parse_from(["test"])
-            .unwrap()
-            .emit
-            .prefill_cublaslt);
-        assert!(TestArgs::try_parse_from(["test", "--emit-prefill-cublaslt"])
-            .unwrap()
-            .emit
-            .prefill_cublaslt);
+        assert!(
+            !TestArgs::try_parse_from(["test"])
+                .unwrap()
+                .emit
+                .prefill_cublaslt
+        );
+        assert!(
+            TestArgs::try_parse_from(["test", "--emit-prefill-cublaslt"])
+                .unwrap()
+                .emit
+                .prefill_cublaslt
+        );
     }
 
     #[test]
@@ -2438,14 +2498,18 @@ mod tests {
         let _guard = crate::test_env::env_guard();
         let _scope = crate::test_env::EnvScope::set(&[("PLOW_GEMMA_GEMM_LT", "0")]);
         assert!(!EmitConfig::from_env().gemma_gemm_lt);
-        assert!(!TestArgs::try_parse_from(["test"])
-            .unwrap()
-            .emit
-            .gemma_gemm_lt);
-        assert!(TestArgs::try_parse_from(["test", "--emit-gemma-gemm-lt"])
-            .unwrap()
-            .emit
-            .gemma_gemm_lt);
+        assert!(
+            !TestArgs::try_parse_from(["test"])
+                .unwrap()
+                .emit
+                .gemma_gemm_lt
+        );
+        assert!(
+            TestArgs::try_parse_from(["test", "--emit-gemma-gemm-lt"])
+                .unwrap()
+                .emit
+                .gemma_gemm_lt
+        );
     }
 
     #[test]
@@ -2470,10 +2534,8 @@ mod tests {
     #[test]
     fn gemma4_sm90_w8a8_gemm_glu_role_is_explicit_and_default_off() {
         let _guard = crate::test_env::env_guard();
-        let _scope = crate::test_env::EnvScope::set(&[(
-            "PLOW_GEMMA4_SM90_W8A8_GEMM_GLU_ROLE",
-            "0",
-        )]);
+        let _scope =
+            crate::test_env::EnvScope::set(&[("PLOW_GEMMA4_SM90_W8A8_GEMM_GLU_ROLE", "0")]);
         assert!(!EmitConfig::from_env().gemma4_sm90_w8a8_gemm_glu_role);
         assert!(
             !TestArgs::try_parse_from(["test"])
@@ -2511,10 +2573,8 @@ mod tests {
     #[test]
     fn gemma4_sm90_hd512_px4_bq64_role_is_explicit_and_default_off() {
         let _guard = crate::test_env::env_guard();
-        let _scope = crate::test_env::EnvScope::set(&[(
-            "PLOW_GEMMA4_SM90_HD512_PX4_BQ64_ROLE",
-            "0",
-        )]);
+        let _scope =
+            crate::test_env::EnvScope::set(&[("PLOW_GEMMA4_SM90_HD512_PX4_BQ64_ROLE", "0")]);
         assert!(!EmitConfig::from_env().gemma4_sm90_hd512_px4_bq64_role);
         assert!(
             TestArgs::try_parse_from(["test", "--gemma4-sm90-hd512-px4-bq64-role"])

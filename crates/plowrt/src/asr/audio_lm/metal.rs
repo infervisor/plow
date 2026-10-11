@@ -4,7 +4,10 @@ use crate::exec::apple::{asr::QwenAudioEncoder, DecodeTuning, MetalEngine};
 use crate::exec::packet_runtime::{BoundPacketPipeline, PacketAsset};
 use crate::{Result, RuntimeError};
 
-use super::{PacketAudioEncoder, AudioLmAsr, AudioLmDecode, AudioLmExecution, AudioLmPrefill, AudioLmPrefilled};
+use super::{
+    AudioLmAsr, AudioLmDecode, AudioLmExecution, AudioLmPrefill, AudioLmPrefilled,
+    PacketAudioEncoder,
+};
 
 struct MetalAudioLmExecution {
     encoder: Option<QwenAudioEncoder>,
@@ -55,7 +58,8 @@ impl MetalAudioLmExecution {
                 "causal packet geometry does not match the checkpoint".into(),
             ));
         }
-        let encoder_packet = crate::exec::packet_runtime::stage_packet(blob, "encoder.packet", "encoder.pkt")?;
+        let encoder_packet =
+            crate::exec::packet_runtime::stage_packet(blob, "encoder.packet", "encoder.pkt")?;
         let packet_encoder = encoder_packet
             .is_file()
             .then(|| PacketAudioEncoder::load(&encoder_packet, "metal"))

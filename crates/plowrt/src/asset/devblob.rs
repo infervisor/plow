@@ -339,7 +339,12 @@ impl DevBlob {
         // would trap on it at the first launch and poison the device context mid-serve.
         let known = known_ops();
         for (p, prog) in progs.iter().enumerate() {
-            if let Some((i, d)) = prog.insts.iter().enumerate().find(|(_, d)| !known[d.op as usize]) {
+            if let Some((i, d)) = prog
+                .insts
+                .iter()
+                .enumerate()
+                .find(|(_, d)| !known[d.op as usize])
+            {
                 return Err(RuntimeError::Device(format!(
                     "devblob: program {p} instruction {i} uses opcode {}, which this plowrt does not \
                      know; the packet needs a matching plowrt",
@@ -642,17 +647,15 @@ impl DevBlob {
 
     /// The largest demand over every program in this container.
     pub fn budget(&self) -> plow_asset::extension::Budget {
-        self.progs
-            .iter()
-            .map(|p| self.program_budget(p))
-            .fold(plow_asset::extension::Budget::default(), |a, b| {
-                plow_asset::extension::Budget {
-                    inst_stream_bytes: a.inst_stream_bytes.max(b.inst_stream_bytes),
-                    counters: a.counters.max(b.counters),
-                    segments: a.segments.max(b.segments),
-                    workspace_bytes: a.workspace_bytes.max(b.workspace_bytes),
-                }
-            })
+        self.progs.iter().map(|p| self.program_budget(p)).fold(
+            plow_asset::extension::Budget::default(),
+            |a, b| plow_asset::extension::Budget {
+                inst_stream_bytes: a.inst_stream_bytes.max(b.inst_stream_bytes),
+                counters: a.counters.max(b.counters),
+                segments: a.segments.max(b.segments),
+                workspace_bytes: a.workspace_bytes.max(b.workspace_bytes),
+            },
+        )
     }
 
     /// Get a section by kind and architecture-specific name.
@@ -804,7 +807,10 @@ impl DevBlob {
 
     /// Every modular block program in table order.
     pub fn modular_block_progs(&self) -> Vec<&DevProg> {
-        self.progs.iter().filter(|p| p.role.is_modular_block()).collect()
+        self.progs
+            .iter()
+            .filter(|p| p.role.is_modular_block())
+            .collect()
     }
 
     /// Decode rung programs in ascending width order; dense-exact rungs are not ladder rungs.
@@ -848,7 +854,10 @@ impl DevBlob {
         let main = dir.join("model.pkt");
         if main.is_file() {
             let mut magic = [0u8; 8];
-            if std::fs::File::open(&main).and_then(|mut f| std::io::Read::read_exact(&mut f, &mut magic)).is_ok() {
+            if std::fs::File::open(&main)
+                .and_then(|mut f| std::io::Read::read_exact(&mut f, &mut magic))
+                .is_ok()
+            {
                 if is_blob_magic(&magic) {
                     return Ok(Some(main));
                 }
@@ -959,7 +968,13 @@ impl DevProg {
             .zip(&other_for_gemm)
             .any(|(&present, &other)| present && !other);
         SegmentClassPolicy {
-            pure_mode: if w8a16 { 3 } else if pure { 1 } else { 0 },
+            pure_mode: if w8a16 {
+                3
+            } else if pure {
+                1
+            } else {
+                0
+            },
             // Every flash segment isolated, hd256 ones included: the packet was emitted
             // `PLOW_SEG_FA512=all` (the loader downgrades to 1 when the object has no hd256 arm).
             fa512_mode: if flash.iter().zip(&other_for_flash).all(|(&f, &o)| !f || !o)
@@ -1202,13 +1217,16 @@ mod tests {
 
     #[test]
     fn packet_segments_recover_safe_cuda_object_routing() {
-        let mut insts = vec![DevInst64 {
-            op: DevOp::Embed as u16,
-            blocks: 1,
-            fj: [0; 3],
-            t: [0; 8],
-            i: [0; 8],
-        }; 4];
+        let mut insts = vec![
+            DevInst64 {
+                op: DevOp::Embed as u16,
+                blocks: 1,
+                fj: [0; 3],
+                t: [0; 8],
+                i: [0; 8],
+            };
+            4
+        ];
         insts[1].op = DevOp::Gemm as u16;
         insts[1].i[6] = 1;
         insts[1].i[7] = 2;
@@ -1509,8 +1527,14 @@ mod tests {
     fn an_opcode_this_build_does_not_know_is_refused_at_parse() {
         let mut m = tiny_model();
         assert!(DevBlob::parse(&m.to_blob()).is_ok());
-        m.progs[1].insts.push(DevInst { op: 0xfffe, blocks: 1, ..Default::default() });
-        let Err(err) = DevBlob::parse(&m.to_blob()) else { panic!("unknown opcode accepted") };
+        m.progs[1].insts.push(DevInst {
+            op: 0xfffe,
+            blocks: 1,
+            ..Default::default()
+        });
+        let Err(err) = DevBlob::parse(&m.to_blob()) else {
+            panic!("unknown opcode accepted")
+        };
         assert!(err.to_string().contains("opcode 65534"), "{err}");
     }
 
@@ -1587,27 +1611,41 @@ mod tests {
 
     #[test]
     fn v7_device_rope_recipe_roundtrips_without_host_materialization() {
-        use packet::rope::{GEN_AMD_ROPE_BF16_COS, GEN_AMD_ROPE_BF16_SIN,
-            GEN_AMD_ROPE_IDX_BF16_COS, GEN_AMD_ROPE_IDX_BF16_SIN, RopeScale};
-        for indexer in [false, true] {
-        let mut m = tiny_model();
-        let (mut recipes, kinds, names) = if indexer {
-            (GenTensor::rope_idx_pair(8192, 64, 128, 8000000.0),
-                [GEN_AMD_ROPE_IDX_BF16_COS, GEN_AMD_ROPE_IDX_BF16_SIN], ["in.icos", "in.isin"])
-        } else {
-            (GenTensor::rope_pair(8192, 64, 8000000.0, 1.0, RopeScale::None),
-                [GEN_AMD_ROPE_BF16_COS, GEN_AMD_ROPE_BF16_SIN], ["in.cos", "in.sin"])
+        use packet::rope::{
+            RopeScale, GEN_AMD_ROPE_BF16_COS, GEN_AMD_ROPE_BF16_SIN, GEN_AMD_ROPE_IDX_BF16_COS,
+            GEN_AMD_ROPE_IDX_BF16_SIN,
         };
-        for (i, kind) in kinds.into_iter().enumerate() {
-            recipes[i].kind = kind;
-            recipes[i].tensor = m.tensors.len() as u32;
-            m.tensors.push(TensorDecl { name: names[i].into(), bytes: recipes[i].byte_len(), init: None });
-        }
-        m.gen = recipes.to_vec();
-        let parsed = DevBlob::parse(&m.to_blob()).unwrap();
-        assert_eq!(parsed.gen, recipes);
-        assert!(parsed.gen.iter().all(|g| g.generate().is_none()));
-        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| m.bake_gen())).is_err());
+        for indexer in [false, true] {
+            let mut m = tiny_model();
+            let (mut recipes, kinds, names) = if indexer {
+                (
+                    GenTensor::rope_idx_pair(8192, 64, 128, 8000000.0),
+                    [GEN_AMD_ROPE_IDX_BF16_COS, GEN_AMD_ROPE_IDX_BF16_SIN],
+                    ["in.icos", "in.isin"],
+                )
+            } else {
+                (
+                    GenTensor::rope_pair(8192, 64, 8000000.0, 1.0, RopeScale::None),
+                    [GEN_AMD_ROPE_BF16_COS, GEN_AMD_ROPE_BF16_SIN],
+                    ["in.cos", "in.sin"],
+                )
+            };
+            for (i, kind) in kinds.into_iter().enumerate() {
+                recipes[i].kind = kind;
+                recipes[i].tensor = m.tensors.len() as u32;
+                m.tensors.push(TensorDecl {
+                    name: names[i].into(),
+                    bytes: recipes[i].byte_len(),
+                    init: None,
+                });
+            }
+            m.gen = recipes.to_vec();
+            let parsed = DevBlob::parse(&m.to_blob()).unwrap();
+            assert_eq!(parsed.gen, recipes);
+            assert!(parsed.gen.iter().all(|g| g.generate().is_none()));
+            assert!(
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| m.bake_gen())).is_err()
+            );
         }
     }
 

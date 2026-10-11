@@ -164,7 +164,13 @@ impl ConvFusions<'_> {
     /// An activation between two convolutions: the rewrite fuses it into one of them (the two
     /// forms tie at extraction, see rules.egg), and a consumer placement still passes
     /// [`Self::input_act`]'s cost model.
-    pub(crate) fn between(self, producer: &str, consumer: &str, consumer_kernel: u32, hand: ActAt) -> ActAt {
+    pub(crate) fn between(
+        self,
+        producer: &str,
+        consumer: &str,
+        consumer_kernel: u32,
+        hand: ActAt,
+    ) -> ActAt {
         if self.0.is_none() {
             return hand;
         }
@@ -238,7 +244,11 @@ pub(crate) fn active_sites() -> Option<RewriteSites> {
 #[allow(dead_code)]
 pub(crate) fn query_lowering_rules(b: &Builder, lowering: Lowering, anchor: u32) -> Vec<String> {
     if let Some(true) = fused(b, lowering, anchor) {
-        lowering.egg_rules().iter().map(|&s| s.to_string()).collect()
+        lowering
+            .egg_rules()
+            .iter()
+            .map(|&s| s.to_string())
+            .collect()
     } else {
         Vec::new()
     }
@@ -287,17 +297,26 @@ mod tests {
         ]);
         let f = ConvFusions(Some(&s));
         assert!(f.input_act("w.blk0.up.w", 16, false));
-        assert!(!f.input_act("w.blk0.ru0.pw.w", 1, true), "pointwise input activation stays a pass");
+        assert!(
+            !f.input_act("w.blk0.ru0.pw.w", 1, true),
+            "pointwise input activation stays a pass"
+        );
         assert!(f.residual("w.blk0.ru0.pw.w", false));
         assert!(!f.residual("w.blk0.up.w", true));
         assert_eq!(
             f.between("w.hift.pre.w", "w.hift.up0.w", 16, ActAt::ConsumerInput),
             ActAt::ProducerOutput
         );
-        assert_eq!(f.between("w.a.w", "w.b.w", 3, ActAt::ConsumerInput), ActAt::Separate);
+        assert_eq!(
+            f.between("w.a.w", "w.b.w", 3, ActAt::ConsumerInput),
+            ActAt::Separate
+        );
         let hand = ConvFusions(None);
         assert!(hand.residual("w.a.w", true) && !hand.output_act("w.a.w", false));
-        assert_eq!(hand.between("w.a.w", "w.b.w", 3, ActAt::ConsumerInput), ActAt::ConsumerInput);
+        assert_eq!(
+            hand.between("w.a.w", "w.b.w", 3, ActAt::ConsumerInput),
+            ActAt::ConsumerInput
+        );
     }
 
     #[test]

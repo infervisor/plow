@@ -751,5 +751,6 @@ fn dropping_a_conversion_refuses_the_program_naming_the_opcode() {
 #[test]
 fn the_dense_gqa_pair_claims_its_output_segment() {
     let caps = Capabilities::amd_dense_gqa("gfx942", 4096, 3);
-    caps.can_run_output().expect("RowGather is descriptor-aware");
+    caps.can_run_output()
+        .expect("RowGather is descriptor-aware");
 }

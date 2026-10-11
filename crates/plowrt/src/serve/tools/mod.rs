@@ -107,24 +107,40 @@ impl ToolFormat {
             (ToolFormat::Gemma4, false) => "<|tool_call>call:".into(),
             (ToolFormat::Gemma4, true) => format!("<|tool_call>call:{n}{{"),
             (ToolFormat::Hermes, false) => "<tool_call>\n{\"name\": \"".into(),
-            (ToolFormat::Hermes, true) => format!("<tool_call>\n{{\"name\": \"{n}\", \"arguments\": "),
+            (ToolFormat::Hermes, true) => {
+                format!("<tool_call>\n{{\"name\": \"{n}\", \"arguments\": ")
+            }
             (ToolFormat::Qwen3Xml, false) => "<tool_call>\n<function=".into(),
             (ToolFormat::Qwen3Xml, true) => format!("<tool_call>\n<function={n}>\n"),
             (ToolFormat::Glm45, _) => format!("<tool_call>{n}"),
             (ToolFormat::Llama3Json, false) => "{\"name\": \"".into(),
             (ToolFormat::Llama3Json, true) => format!("{{\"name\": \"{n}\", \"parameters\": "),
             (ToolFormat::Mistral, false) => "[TOOL_CALLS] [{\"name\": \"".into(),
-            (ToolFormat::Mistral, true) => format!("[TOOL_CALLS] [{{\"name\": \"{n}\", \"arguments\": "),
-            (ToolFormat::KimiK2, false) => "<|tool_calls_section_begin|><|tool_call_begin|>functions.".into(),
+            (ToolFormat::Mistral, true) => {
+                format!("[TOOL_CALLS] [{{\"name\": \"{n}\", \"arguments\": ")
+            }
+            (ToolFormat::KimiK2, false) => {
+                "<|tool_calls_section_begin|><|tool_call_begin|>functions.".into()
+            }
             (ToolFormat::KimiK2, true) => {
                 format!("<|tool_calls_section_begin|><|tool_call_begin|>functions.{n}:{call_index}<|tool_call_argument_begin|>")
             }
             (ToolFormat::Harmony, false) => "<|channel|>commentary to=functions.".into(),
-            (ToolFormat::Harmony, true) => format!("<|channel|>commentary to=functions.{n} <|constrain|>json<|message|>"),
-            (ToolFormat::DeepSeekV3, false) => "<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>function<｜tool▁sep｜>".into(),
-            (ToolFormat::DeepSeekV3, true) => format!("<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>function<｜tool▁sep｜>{n}\n```json\n"),
-            (ToolFormat::DeepSeekV31, false) => "<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>".into(),
-            (ToolFormat::DeepSeekV31, true) => format!("<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>{n}<｜tool▁sep｜>"),
+            (ToolFormat::Harmony, true) => {
+                format!("<|channel|>commentary to=functions.{n} <|constrain|>json<|message|>")
+            }
+            (ToolFormat::DeepSeekV3, false) => {
+                "<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>function<｜tool▁sep｜>".into()
+            }
+            (ToolFormat::DeepSeekV3, true) => format!(
+                "<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>function<｜tool▁sep｜>{n}\n```json\n"
+            ),
+            (ToolFormat::DeepSeekV31, false) => {
+                "<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>".into()
+            }
+            (ToolFormat::DeepSeekV31, true) => {
+                format!("<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>{n}<｜tool▁sep｜>")
+            }
         }
     }
 
@@ -171,7 +187,10 @@ impl ToolSupport {
             "name": PROBE_NAME, "description": "probe",
             "parameters": {"type": "object", "properties": {"x": {"type": "string", "description": "x"}}, "required": ["x"]}
         }}]);
-        let opts = crate::serve::template::RenderOpts { tools: Some(tools), ..Default::default() };
+        let opts = crate::serve::template::RenderOpts {
+            tools: Some(tools),
+            ..Default::default()
+        };
         let msgs = [serde_json::json!({"role": "user", "content": "hi"})];
         match t.render_with(&msgs, &opts) {
             Ok(p) if p.contains(PROBE_NAME) => match ToolFormat::detect(text) {
@@ -202,7 +221,11 @@ impl SpecialText {
             first[t.as_bytes()[0] as usize] = true;
         }
         let longest = tokens.first().map_or(0, String::len);
-        SpecialText { tokens, first, longest }
+        SpecialText {
+            tokens,
+            first,
+            longest,
+        }
     }
 
     pub fn strip(&self, s: &str) -> String {
@@ -229,7 +252,10 @@ impl SpecialText {
                 }
             }
             // A token's first byte is never a UTF-8 continuation byte, so `next` is a char boundary.
-            let next = s.as_bytes()[i + 1..].iter().position(|&b| self.first[b as usize]).map_or(s.len(), |k| i + 1 + k);
+            let next = s.as_bytes()[i + 1..]
+                .iter()
+                .position(|&b| self.first[b as usize])
+                .map_or(s.len(), |k| i + 1 + k);
             out.push_str(&s[i..next]);
             i = next;
         }
@@ -259,7 +285,9 @@ impl SpecialText {
             .find(|&p| {
                 self.first[b[p] as usize] && {
                     let rest = &s[p..];
-                    self.tokens.iter().any(|t| t.len() > rest.len() && t.starts_with(rest))
+                    self.tokens
+                        .iter()
+                        .any(|t| t.len() > rest.len() && t.starts_with(rest))
                 }
             })
             .map_or(0, |p| b.len() - p)
@@ -271,9 +299,8 @@ impl SpecialText {
     }
 }
 
-static ID_SEQ: std::sync::LazyLock<AtomicU64> = std::sync::LazyLock::new(|| {
-    AtomicU64::new(rand::random::<u64>())
-});
+static ID_SEQ: std::sync::LazyLock<AtomicU64> =
+    std::sync::LazyLock::new(|| AtomicU64::new(rand::random::<u64>()));
 
 fn random_alnum(n: usize) -> String {
     const A: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
@@ -296,7 +323,11 @@ mod tests {
 
     #[test]
     fn special_text_strips_only_whole_tokens() {
-        let s = SpecialText::new(vec!["<|tool_call>".into(), "<|\"|>".into(), "<|turn>".into()]);
+        let s = SpecialText::new(vec![
+            "<|tool_call>".into(),
+            "<|\"|>".into(),
+            "<|turn>".into(),
+        ]);
         assert_eq!(s.strip("a<|\"|>b<|tool_call>c<|tool"), "abc<|tool");
         assert_eq!(s.strip("plain"), "plain");
         assert_eq!(s.strip("é<|turn>ü"), "éü");

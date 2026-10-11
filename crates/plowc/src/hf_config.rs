@@ -250,7 +250,11 @@ pub fn hub_repo_id(dir: &Path) -> Option<String> {
     if snapshots.file_name()? != "snapshots" {
         return None;
     }
-    let repo = snapshots.parent()?.file_name()?.to_str()?.strip_prefix("models--")?;
+    let repo = snapshots
+        .parent()?
+        .file_name()?
+        .to_str()?
+        .strip_prefix("models--")?;
     Some(repo.replacen("--", "/", 1))
 }
 
@@ -2486,11 +2490,19 @@ mod tests {
 
     #[test]
     fn hub_repo_id_from_hub_snapshot_only() {
-        assert_eq!(dir_slug(Path::new("/hf/hub/models--HuggingFaceTB--SmolLM2-360M-Instruct/snapshots/abcdef")), "smollm2-360m-instruct");
+        assert_eq!(
+            dir_slug(Path::new(
+                "/hf/hub/models--HuggingFaceTB--SmolLM2-360M-Instruct/snapshots/abcdef"
+            )),
+            "smollm2-360m-instruct"
+        );
         assert_eq!(dir_slug(Path::new("/models/Qwen3-0.6B")), "qwen3-0.6b");
         use std::path::Path;
         assert_eq!(
-            hub_repo_id(Path::new("/hf/hub/models--Qwen--Qwen3-ASR-1.7B/snapshots/7278e1e")).as_deref(),
+            hub_repo_id(Path::new(
+                "/hf/hub/models--Qwen--Qwen3-ASR-1.7B/snapshots/7278e1e"
+            ))
+            .as_deref(),
             Some("Qwen/Qwen3-ASR-1.7B")
         );
         assert_eq!(hub_repo_id(Path::new("/work/prep/t3")), None);

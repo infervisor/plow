@@ -156,7 +156,10 @@ mod tests {
         let d = dcp();
         assert_eq!(d.seat_bytes(0), Some(0));
         assert!(d.fits([], 0));
-        assert_eq!(KvBudget::new(0, PER_TOKEN, DcpLayout::new(8, 8, 64)).seats(8192), 0);
+        assert_eq!(
+            KvBudget::new(0, PER_TOKEN, DcpLayout::new(8, 8, 64)).seats(8192),
+            0
+        );
         assert_eq!(d.bytes_per_token(0), 0.0);
     }
 

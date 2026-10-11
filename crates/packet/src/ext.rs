@@ -148,7 +148,9 @@ mod tests {
 
         let mut bad = r.to_bytes();
         bad[0] = b'X';
-        assert!(BlobParentRef::from_bytes(&bad).unwrap_err().contains("magic"));
+        assert!(BlobParentRef::from_bytes(&bad)
+            .unwrap_err()
+            .contains("magic"));
 
         let mut ver = r.to_bytes();
         ver[4] = 9;

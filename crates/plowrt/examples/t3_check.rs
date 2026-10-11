@@ -16,8 +16,10 @@ fn main() {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     use plowrt::tts::guided_lm::GuidedLm;
     let mut args = std::env::args().skip(1);
-    let assets = std::path::PathBuf::from(args.next().ok_or("usage: t3_check <assets> <ref.json>")?);
-    let reference: serde_json::Value = serde_json::from_slice(&std::fs::read(args.next().ok_or("ref.json")?)?)?;
+    let assets =
+        std::path::PathBuf::from(args.next().ok_or("usage: t3_check <assets> <ref.json>")?);
+    let reference: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(args.next().ok_or("ref.json")?)?)?;
     let mut t3 = GuidedLm::load(&assets, 0)?;
     println!("T3 engine: contract={:?}", t3.c);
     let rel = |a: &[f32], b: &[f64]| {
@@ -28,7 +30,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         (num / den).sqrt()
     };
-    let argmax = |v: &[f64]| (0..v.len()).max_by(|&i, &j| v[i].total_cmp(&v[j])).unwrap_or(0);
+    let argmax = |v: &[f64]| {
+        (0..v.len())
+            .max_by(|&i, &j| v[i].total_cmp(&v[j]))
+            .unwrap_or(0)
+    };
     let mut ok = true;
     for r in reference.as_array().ok_or("ref is a list")? {
         let text = r["text"].as_str().ok_or("text")?;
@@ -38,7 +44,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let lang = r["language"].as_str();
         let (ids, cond, uncond) = t3.probe_prefill("default", text, lang)?;
         let (rc, ru) = (rel(&cond, &cref), rel(&uncond, &uref));
-        let am = |v: &[f32]| (0..v.len()).max_by(|&i, &j| v[i].total_cmp(&v[j])).unwrap_or(0);
+        let am = |v: &[f32]| {
+            (0..v.len())
+                .max_by(|&i, &j| v[i].total_cmp(&v[j]))
+                .unwrap_or(0)
+        };
         let top1 = am(&cond) == argmax(&cref) && am(&uncond) == argmax(&uref);
         let want: Vec<u32> = serde_json::from_value(r["greedy_cfg"].clone())?;
         let got = t3.greedy("default", text, lang, want.len())?;

@@ -20,7 +20,10 @@ fn main() {
             "--steps" => steps = args.next().unwrap().parse().unwrap(),
             "--gate" => {
                 let f = args.next().unwrap().into();
-                gate = Some((f, args.next().unwrap().split(',').map(String::from).collect()))
+                gate = Some((
+                    f,
+                    args.next().unwrap().split(',').map(String::from).collect(),
+                ))
             }
             other => panic!("unknown arg {other}"),
         }
@@ -31,19 +34,35 @@ fn main() {
     let prompts: Vec<Vec<u32>> = ids
         .iter()
         .map(|id| {
-            let c = cases.iter().find(|c| c["id"] == id.as_str()).expect("gate case id");
-            c["prompt_ids"].as_array().unwrap().iter().map(|v| v.as_u64().unwrap() as u32).collect()
+            let c = cases
+                .iter()
+                .find(|c| c["id"] == id.as_str())
+                .expect("gate case id");
+            c["prompt_ids"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_u64().unwrap() as u32)
+                .collect()
         })
         .collect();
 
     let mut eng = CpuEngine::load(&blob, &ckpt, &CpuEngineOpts::default()).expect("load");
     let batch = eng.model().batch;
     let n = prompts.len();
-    assert!(2 * n <= batch, "{n} prompts need {} slots, packet has {batch}", 2 * n);
+    assert!(
+        2 * n <= batch,
+        "{n} prompts need {} slots, packet has {batch}",
+        2 * n
+    );
     let narrow = eng.model().decode_prog_for(n);
     let wide = eng.model().decode_prog_for(batch);
     let rung = |eng: &CpuEngine, p: usize| eng.model().blob.progs[p].t;
-    println!("rungs: narrow {} wide {}", rung(&eng, narrow), rung(&eng, wide));
+    println!(
+        "rungs: narrow {} wide {}",
+        rung(&eng, narrow),
+        rung(&eng, wide)
+    );
 
     // Decode `prompts` from slots `slots`, on program `dp`; `force` = the tokens to feed (None =
     // greedy). Returns per step the tokens and each sequence's logits.
@@ -67,7 +86,9 @@ fn main() {
                 }
             }
             let kv: Vec<u32> = pos.iter().map(|p| p + 1).collect();
-            let next = eng.decode_step_batched_at(&pos, &kv, &ids, dp).expect("decode");
+            let next = eng
+                .decode_step_batched_at(&pos, &kv, &ids, dp)
+                .expect("decode");
             let mut row_lg = Vec::new();
             for &s in slots {
                 let mut v = Vec::new();
@@ -83,7 +104,12 @@ fn main() {
         }
         (toks, lgs)
     };
-    let diff = |a: &[f32], b: &[f32]| a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
+    let diff = |a: &[f32], b: &[f32]| {
+        a.iter()
+            .zip(b)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max)
+    };
 
     let low: Vec<usize> = (0..n).collect();
     let high: Vec<usize> = (batch - n..batch).collect();
@@ -92,8 +118,12 @@ fn main() {
     let (_, lh) = run(&mut eng, &high, wide, Some(&tl));
     let mut worst = (0.0f32, 0.0f32);
     for step in 0..steps {
-        let dm = (0..n).map(|i| diff(&ll[step][i], &lm[step][i])).fold(0.0f32, f32::max);
-        let dh = (0..n).map(|i| diff(&ll[step][i], &lh[step][i])).fold(0.0f32, f32::max);
+        let dm = (0..n)
+            .map(|i| diff(&ll[step][i], &lm[step][i]))
+            .fold(0.0f32, f32::max);
+        let dh = (0..n)
+            .map(|i| diff(&ll[step][i], &lh[step][i]))
+            .fold(0.0f32, f32::max);
         worst = (worst.0.max(dm), worst.1.max(dh));
         println!("step {step:>2}: wide rung, low slots max|dlogit| {dm:.4}   wide rung, top slots {dh:.4}");
     }

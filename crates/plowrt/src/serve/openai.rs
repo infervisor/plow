@@ -77,9 +77,21 @@ impl SamplingFields {
         range(self.temperature, "temperature", 0.0, 2.0, false)?;
         range(self.top_p, "top_p", 0.0, 1.0, true)?;
         range(self.min_p, "min_p", 0.0, 1.0, false)?;
-        range(self.repetition_penalty, "repetition_penalty", 0.0, 2.0, true)?;
+        range(
+            self.repetition_penalty,
+            "repetition_penalty",
+            0.0,
+            2.0,
+            true,
+        )?;
         range(self.presence_penalty, "presence_penalty", -2.0, 2.0, false)?;
-        range(self.frequency_penalty, "frequency_penalty", -2.0, 2.0, false)?;
+        range(
+            self.frequency_penalty,
+            "frequency_penalty",
+            -2.0,
+            2.0,
+            false,
+        )?;
         if let Some(k) = self.top_k {
             if k < -1 {
                 return Err(ParamError {
@@ -88,7 +100,11 @@ impl SamplingFields {
                 });
             }
         }
-        if self.stop_token_ids.as_ref().is_some_and(|ids| ids.len() > MAX_STOP_TOKEN_IDS) {
+        if self
+            .stop_token_ids
+            .as_ref()
+            .is_some_and(|ids| ids.len() > MAX_STOP_TOKEN_IDS)
+        {
             return Err(ParamError {
                 field: "stop_token_ids",
                 message: format!("at most {MAX_STOP_TOKEN_IDS} `stop_token_ids` are accepted"),
@@ -243,7 +259,10 @@ pub const MAX_STOP_TOKEN_IDS: usize = 1024;
 /// dispatcher cannot afford to scan per token are refused with a 400.
 pub fn validate_limits(max_tokens: Option<u32>, stop: Option<&StopSpec>) -> Result<(), ParamError> {
     if max_tokens == Some(0) {
-        return Err(ParamError { field: "max_tokens", message: "`max_tokens` must be at least 1".into() });
+        return Err(ParamError {
+            field: "max_tokens",
+            message: "`max_tokens` must be at least 1".into(),
+        });
     }
     let stops: &[String] = match stop {
         Some(StopSpec::One(s)) => std::slice::from_ref(s),
@@ -251,7 +270,10 @@ pub fn validate_limits(max_tokens: Option<u32>, stop: Option<&StopSpec>) -> Resu
         None => &[],
     };
     if stops.len() > MAX_STOP_STRINGS {
-        return Err(ParamError { field: "stop", message: format!("at most {MAX_STOP_STRINGS} `stop` strings are accepted") });
+        return Err(ParamError {
+            field: "stop",
+            message: format!("at most {MAX_STOP_STRINGS} `stop` strings are accepted"),
+        });
     }
     if stops.iter().any(|s| s.len() > MAX_STOP_STRING_BYTES) {
         return Err(ParamError {
@@ -426,7 +448,10 @@ pub struct FunctionDelta {
 impl Message {
     /// The message's text, empty when absent.
     pub fn text(&self) -> String {
-        self.content.as_ref().map(Content::as_text).unwrap_or_default()
+        self.content
+            .as_ref()
+            .map(Content::as_text)
+            .unwrap_or_default()
     }
 
     /// Whether this message carries an image part.
@@ -535,14 +560,33 @@ mod tests {
 
     #[test]
     fn stop_sets_and_zero_budget_are_bounded() {
-        assert!(validate_limits(Some(1), Some(&StopSpec::Many(vec!["a".into(); MAX_STOP_STRINGS]))).is_ok());
-        assert_eq!(validate_limits(Some(0), None).err().map(|e| e.field), Some("max_tokens"));
+        assert!(validate_limits(
+            Some(1),
+            Some(&StopSpec::Many(vec!["a".into(); MAX_STOP_STRINGS]))
+        )
+        .is_ok());
+        assert_eq!(
+            validate_limits(Some(0), None).err().map(|e| e.field),
+            Some("max_tokens")
+        );
         let many = StopSpec::Many(vec!["a".into(); MAX_STOP_STRINGS + 1]);
-        assert_eq!(validate_limits(None, Some(&many)).err().map(|e| e.field), Some("stop"));
+        assert_eq!(
+            validate_limits(None, Some(&many)).err().map(|e| e.field),
+            Some("stop")
+        );
         let long = StopSpec::One("x".repeat(MAX_STOP_STRING_BYTES + 1));
-        assert_eq!(validate_limits(None, Some(&long)).err().map(|e| e.field), Some("stop"));
-        let ids = SamplingFields { stop_token_ids: Some(vec![1; MAX_STOP_TOKEN_IDS + 1]), ..Default::default() };
-        assert_eq!(ids.validate().err().map(|e| e.field), Some("stop_token_ids"));
+        assert_eq!(
+            validate_limits(None, Some(&long)).err().map(|e| e.field),
+            Some("stop")
+        );
+        let ids = SamplingFields {
+            stop_token_ids: Some(vec![1; MAX_STOP_TOKEN_IDS + 1]),
+            ..Default::default()
+        };
+        assert_eq!(
+            ids.validate().err().map(|e| e.field),
+            Some("stop_token_ids")
+        );
     }
 
     /// THE POINT OF `SamplingFields`, asserted end to end: the wire form has to
@@ -580,7 +624,10 @@ mod tests {
         assert_eq!(p.frequency_penalty, 0.5);
         assert_eq!(p.logit_bias, vec![(7u32, -3.5f32)]);
         assert_eq!(req.sampling.min_tokens, Some(3));
-        assert_eq!(req.sampling.stop_token_ids.as_deref(), Some(&[11u32, 22][..]));
+        assert_eq!(
+            req.sampling.stop_token_ids.as_deref(),
+            Some(&[11u32, 22][..])
+        );
     }
 
     /// `flatten` changes how serde drives the WHOLE struct, so the fields that

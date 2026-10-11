@@ -40,13 +40,9 @@ pub(super) fn small_gemm_segments(g: &DevProg, classes: &[u8], abi: u32) -> Resu
             continue;
         }
         // Fine successors describe tile ownership; only complete coarse packets may change tiles.
-        if entries
-            .iter()
-            .any(|e| {
-                e.flags != 0
-                    || !compatible(&g.insts[e.inst as usize], if abi == 4 { 512 } else { 128 })
-            })
-        {
+        if entries.iter().any(|e| {
+            e.flags != 0 || !compatible(&g.insts[e.inst as usize], if abi == 4 { 512 } else { 128 })
+        }) {
             continue;
         }
         let mut slices = std::collections::BTreeMap::<u32, Vec<u32>>::new();

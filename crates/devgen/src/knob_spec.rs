@@ -148,7 +148,10 @@ const C_GLM_ROPE_BF16: &[Constraint] = &[Constraint {
     id: "glm_rope_bf16_contract",
     formula: F::Implies(
         &F::Atom("emit.glm_rope_bf16", Cmp::Eq, TRUE),
-        &F::And(&[F::Target(T::Arch("gfx950")), F::Atom("emit.glm_mla_w8a8", Cmp::Eq, TRUE)]),
+        &F::And(&[
+            F::Target(T::Arch("gfx950")),
+            F::Atom("emit.glm_mla_w8a8", Cmp::Eq, TRUE),
+        ]),
     ),
     site: "crates/devgen/src/mla.rs: PLOW_GLM_ROPE_BF16 requires PLOW_GLM_MLA_W8A8 on gfx950",
     check: Check::Site,
@@ -158,7 +161,10 @@ const C_INDEXER_WQ_W8A8: &[Constraint] = &[Constraint {
     id: "indexer_wq_w8a8_contract",
     formula: F::Implies(
         &F::Atom("emit.glm_indexer_wq_w8a8", Cmp::Eq, TRUE),
-        &F::And(&[F::Target(T::Arch("gfx950")), F::Atom("emit.glm_mla_w8a8", Cmp::Eq, TRUE)]),
+        &F::And(&[
+            F::Target(T::Arch("gfx950")),
+            F::Atom("emit.glm_mla_w8a8", Cmp::Eq, TRUE),
+        ]),
     ),
     site: "crates/devgen/src/mla.rs: PLOW_GLM_INDEXER_WQ_W8A8 requires PLOW_GLM_MLA_W8A8 on gfx950",
     check: Check::Site,
@@ -629,7 +635,8 @@ const C_STAGE_ROWS: &[Constraint] = &[Constraint {
         ]),
         &F::Atom("emit.max_request_chunk", Cmp::Ne, Val::Unset),
     ),
-    site: "crates/plow-asset/src/packed_prefill.rs: stage_slots refuses an unmasked plan — a stage \
+    site:
+        "crates/plow-asset/src/packed_prefill.rs: stage_slots refuses an unmasked plan — a stage \
 masks the rows outside it to -1, and only plan_with_limit (max_request_chunk) has its padding \
 already masked. Manifest::validate refuses the pairing too",
     check: Check::Load,
@@ -656,7 +663,10 @@ const GLM53_RECIPE: &[(&str, Val)] = &[
     ("emit.decode_ladder", Val::Str("1,2,4,8,16,32")),
     ("emit.emit_packed_prefill", TRUE),
     ("emit.uniseg", FALSE),
-    ("emit.mla_prefill", Val::Str(crate::emit_config::GLM53_MLA_PREFILL)),
+    (
+        "emit.mla_prefill",
+        Val::Str(crate::emit_config::GLM53_MLA_PREFILL),
+    ),
     ("emit.moe_pf_det", TRUE),
     ("emit.glm_dsa", Val::Str("1")),
     ("emit.glm_shard_head", TRUE),
@@ -774,7 +784,12 @@ const FUSE_POST_SCOPE: &[Allow] = &[
         topology: Some("ordinary"),
         model: Some("glm_moe_dsa"),
         ops: OpSel::In(&["gemm", "kv_write"]),
-        fields: &[ScopeField::Op, ScopeField::Operands, ScopeField::Segments, ScopeField::TensorBytes],
+        fields: &[
+            ScopeField::Op,
+            ScopeField::Operands,
+            ScopeField::Segments,
+            ScopeField::TensorBytes,
+        ],
         ..Allow::ANY
     },
     Allow {
@@ -826,7 +841,12 @@ const NATIVE_ALIGN_SCOPE: &[Allow] = &[Allow {
     topology: Some("ordinary"),
     model: Some("glm_moe_dsa"),
     ops: OpSel::In(&["moe"]),
-    fields: &[ScopeField::Op, ScopeField::Operands, ScopeField::Segments, ScopeField::TensorBytes],
+    fields: &[
+        ScopeField::Op,
+        ScopeField::Operands,
+        ScopeField::Segments,
+        ScopeField::TensorBytes,
+    ],
     ..Allow::ANY
 }];
 
@@ -847,7 +867,12 @@ const FUSE_SEAM_RN_SCOPE: &[Allow] = &[
         topology: Some("ordinary"),
         model: Some("glm_moe_dsa"),
         ops: OpSel::In(&["norm", "elementwise"]),
-        fields: &[ScopeField::Op, ScopeField::Operands, ScopeField::Segments, ScopeField::TensorBytes],
+        fields: &[
+            ScopeField::Op,
+            ScopeField::Operands,
+            ScopeField::Segments,
+            ScopeField::TensorBytes,
+        ],
         ..Allow::ANY
     },
     Allow {
@@ -876,7 +901,11 @@ const DENSE_EXACT_SCOPE: &[Allow] = &[Allow {
     kinds: &["decode"],
     rows: (8, 20),
     topology: Some("dense_exact"),
-    fields: &[ScopeField::ProgramSet, ScopeField::Op, ScopeField::ObjectFacts],
+    fields: &[
+        ScopeField::ProgramSet,
+        ScopeField::Op,
+        ScopeField::ObjectFacts,
+    ],
     ..Allow::ANY
 }];
 
@@ -2665,9 +2694,24 @@ mod tests {
             let mut target = TARGETS[0].target();
             target.arch = arch.into();
             for projections in [FALSE, TRUE] {
-                let recipe = [("emit.glm_rope_bf16", TRUE), ("emit.glm_mla_w8a8", projections)];
-                let expected = if arch == "gfx950" && projections == TRUE { "ok" } else { "glm_rope_bf16_contract" };
-                assert_eq!(verdict(&specs, &[&C_GLM_ROPE_BF16[0]], &recipe_sources(&recipe), &target), expected);
+                let recipe = [
+                    ("emit.glm_rope_bf16", TRUE),
+                    ("emit.glm_mla_w8a8", projections),
+                ];
+                let expected = if arch == "gfx950" && projections == TRUE {
+                    "ok"
+                } else {
+                    "glm_rope_bf16_contract"
+                };
+                assert_eq!(
+                    verdict(
+                        &specs,
+                        &[&C_GLM_ROPE_BF16[0]],
+                        &recipe_sources(&recipe),
+                        &target
+                    ),
+                    expected
+                );
             }
         }
     }
@@ -2679,9 +2723,24 @@ mod tests {
             let mut target = TARGETS[0].target();
             target.arch = arch.into();
             for projections in [FALSE, TRUE] {
-                let recipe = [("emit.glm_indexer_wq_w8a8", TRUE), ("emit.glm_mla_w8a8", projections)];
-                let expected = if arch == "gfx950" && projections == TRUE { "ok" } else { "indexer_wq_w8a8_contract" };
-                assert_eq!(verdict(&specs, &[&C_INDEXER_WQ_W8A8[0]], &recipe_sources(&recipe), &target), expected);
+                let recipe = [
+                    ("emit.glm_indexer_wq_w8a8", TRUE),
+                    ("emit.glm_mla_w8a8", projections),
+                ];
+                let expected = if arch == "gfx950" && projections == TRUE {
+                    "ok"
+                } else {
+                    "indexer_wq_w8a8_contract"
+                };
+                assert_eq!(
+                    verdict(
+                        &specs,
+                        &[&C_INDEXER_WQ_W8A8[0]],
+                        &recipe_sources(&recipe),
+                        &target
+                    ),
+                    expected
+                );
             }
         }
     }
@@ -2690,14 +2749,29 @@ mod tests {
     fn indexer_fp8_knob_requires_both_phases_and_original_query() {
         let specs = emit_specs();
         for arch in ["gfx950", "gfx942", "sm_90a"] {
-            let mut target = TARGETS[0].target(); target.arch = arch.into();
+            let mut target = TARGETS[0].target();
+            target.arch = arch.into();
             for mask in 0..8 {
                 let value = |bit| if mask & bit != 0 { TRUE } else { FALSE };
-                let recipe = [("emit.glm_indexer_fp8", TRUE),
+                let recipe = [
+                    ("emit.glm_indexer_fp8", TRUE),
                     ("emit.glm_indexer_wq_w8a8", value(1)),
-                    ("emit.glm_mla_bf16_ps", value(2)), ("emit.glm_dsa_pf", value(4))];
-                assert_eq!(verdict(&specs, &[&C_INDEXER_FP8[0]], &recipe_sources(&recipe), &target),
-                    if arch == "gfx950" && mask == 7 { "ok" } else { "indexer_fp8_contract" });
+                    ("emit.glm_mla_bf16_ps", value(2)),
+                    ("emit.glm_dsa_pf", value(4)),
+                ];
+                assert_eq!(
+                    verdict(
+                        &specs,
+                        &[&C_INDEXER_FP8[0]],
+                        &recipe_sources(&recipe),
+                        &target
+                    ),
+                    if arch == "gfx950" && mask == 7 {
+                        "ok"
+                    } else {
+                        "indexer_fp8_contract"
+                    }
+                );
             }
         }
     }
@@ -2708,10 +2782,25 @@ mod tests {
         let target = TARGETS[0].target();
         for cache in [Val::Unset, FALSE, TRUE] {
             for projections in [FALSE, TRUE] {
-                let recipe = [("emit.glm_mla_bf16_ps", TRUE),
-                    ("emit.glm_mla_w8a8", projections), ("emit.glm_fp8_kv", cache)];
-                let expected = if projections == TRUE && cache != TRUE { "ok" } else { "mla_bf16_ps_contract" };
-                assert_eq!(verdict(&specs, &[&C_MLA_BF16_PS[0]], &recipe_sources(&recipe), &target), expected);
+                let recipe = [
+                    ("emit.glm_mla_bf16_ps", TRUE),
+                    ("emit.glm_mla_w8a8", projections),
+                    ("emit.glm_fp8_kv", cache),
+                ];
+                let expected = if projections == TRUE && cache != TRUE {
+                    "ok"
+                } else {
+                    "mla_bf16_ps_contract"
+                };
+                assert_eq!(
+                    verdict(
+                        &specs,
+                        &[&C_MLA_BF16_PS[0]],
+                        &recipe_sources(&recipe),
+                        &target
+                    ),
+                    expected
+                );
             }
         }
     }

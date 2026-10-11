@@ -234,12 +234,20 @@ impl AmdEngine {
             PackedSegmentRoute::MlaNorm => (
                 norm.unwrap(),
                 WG_THREADS_8,
-                if body { "packed_mla_norm_tb" } else { "packed_mla_norm" },
+                if body {
+                    "packed_mla_norm_tb"
+                } else {
+                    "packed_mla_norm"
+                },
             ),
             PackedSegmentRoute::MlaFlash => (
                 flash.unwrap(),
                 WG_THREADS_4,
-                if body { "packed_mla_flash_tb" } else { "packed_mla_flash" },
+                if body {
+                    "packed_mla_flash_tb"
+                } else {
+                    "packed_mla_flash"
+                },
             ),
             PackedSegmentRoute::Kda => (self.k_packed_kda.unwrap(), WG_THREADS_8, "kda_family_raw"),
             // The widest decode rung's object: the band is exactly that wide.

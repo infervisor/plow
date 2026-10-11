@@ -3,7 +3,10 @@ use super::*;
 fn step(slots: &[usize]) -> PipeStep {
     PipeStep {
         buf: 0,
-        rows: slots.iter().map(|&slot| PipeRow { slot, carry: true }).collect(),
+        rows: slots
+            .iter()
+            .map(|&slot| PipeRow { slot, carry: true })
+            .collect(),
         compact: false,
     }
 }

@@ -77,8 +77,12 @@ fn server_cpu_ms() -> f64 {
     let tick = 100.0; // USER_HZ
     let mut ms = 0.0;
     for e in std::fs::read_dir("/proc/self/task").unwrap().flatten() {
-        let Ok(raw) = std::fs::read_to_string(e.path().join("stat")) else { continue };
-        let (Some(a), Some(b)) = (raw.find('('), raw.rfind(')')) else { continue };
+        let Ok(raw) = std::fs::read_to_string(e.path().join("stat")) else {
+            continue;
+        };
+        let (Some(a), Some(b)) = (raw.find('('), raw.rfind(')')) else {
+            continue;
+        };
         if raw[a + 1..b].starts_with("cli") {
             continue;
         }
@@ -132,12 +136,20 @@ async fn one(s: &mut tokio::net::TcpStream, req: &[u8], stream: bool, st: &mut S
     s.write_all(req).await.unwrap();
     let mut buf = Vec::with_capacity(16 * 1024);
     let head = read_head(s, &mut buf).await;
-    let head_s = std::str::from_utf8(&buf[..head]).unwrap().to_ascii_lowercase();
+    let head_s = std::str::from_utf8(&buf[..head])
+        .unwrap()
+        .to_ascii_lowercase();
     assert!(head_s.starts_with("http/1.1 200"), "{head_s}");
     let mut body = buf.split_off(head);
     let mut tmp = vec![0u8; 64 * 1024];
     if let Some(i) = head_s.find("content-length:") {
-        let len: usize = head_s[i + 15..].lines().next().unwrap().trim().parse().unwrap();
+        let len: usize = head_s[i + 15..]
+            .lines()
+            .next()
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
         while body.len() < len {
             let n = s.read(&mut tmp).await.unwrap();
             body.extend_from_slice(&tmp[..n]);
@@ -154,8 +166,14 @@ async fn one(s: &mut tokio::net::TcpStream, req: &[u8], stream: bool, st: &mut S
         let mut progressed = true;
         while progressed {
             progressed = false;
-            let Some(eol) = body[pos..].windows(2).position(|w| w == b"\r\n") else { break };
-            let size = usize::from_str_radix(std::str::from_utf8(&body[pos..pos + eol]).unwrap().trim(), 16).unwrap();
+            let Some(eol) = body[pos..].windows(2).position(|w| w == b"\r\n") else {
+                break;
+            };
+            let size = usize::from_str_radix(
+                std::str::from_utf8(&body[pos..pos + eol]).unwrap().trim(),
+                16,
+            )
+            .unwrap();
             if body.len() < pos + eol + 2 + size + 2 {
                 break;
             }
@@ -165,7 +183,10 @@ async fn one(s: &mut tokio::net::TcpStream, req: &[u8], stream: bool, st: &mut S
                 return;
             }
             let chunk = &body[pos + eol + 2..pos + eol + 2 + size];
-            let toks = chunk.windows(20).filter(|w| w == b"\"finish_reason\":null").count();
+            let toks = chunk
+                .windows(20)
+                .filter(|w| w == b"\"finish_reason\":null")
+                .count();
             if toks > 0 && stream {
                 let now = Instant::now();
                 match first {
@@ -173,7 +194,9 @@ async fn one(s: &mut tokio::net::TcpStream, req: &[u8], stream: bool, st: &mut S
                         first = Some(now);
                         st.ttft_us.push((now - t0).as_secs_f64() * 1e6);
                     }
-                    Some(_) => st.itl_us.push((now - last).as_secs_f64() * 1e6 / toks as f64),
+                    Some(_) => st
+                        .itl_us
+                        .push((now - last).as_secs_f64() * 1e6 / toks as f64),
                 }
                 last = now;
                 n_tok += toks;
@@ -209,24 +232,38 @@ fn host_serve_bench() {
     if let Ok(tok) = std::env::var("HOSTBENCH_TOKENIZER") {
         std::fs::copy(tok, dir.join("tokenizer.json")).unwrap();
     }
-    let scale: f64 = std::env::var("HOSTBENCH_SCALE").ok().and_then(|s| s.parse().ok()).unwrap_or(1.0);
+    let scale: f64 = std::env::var("HOSTBENCH_SCALE")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1.0);
 
-    let srv = tokio::runtime::Builder::new_multi_thread().enable_all().thread_name("srv").build().unwrap();
+    let srv = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_name("srv")
+        .build()
+        .unwrap();
     let addr = srv.block_on(async {
-        let backend: Arc<dyn plowrt::device::Backend> = Arc::new(plowrt::device::cpu::CpuBackend::new(4));
+        let backend: Arc<dyn plowrt::device::Backend> =
+            Arc::new(plowrt::device::cpu::CpuBackend::new(4));
         let execset = Arc::new(plowrt::exec::ExecutorSet::bringup(backend).unwrap());
         let registry = plowrt::orch::Registry::new();
         registry.load(&dir, None).unwrap();
         let state = Arc::new(plowrt::serve::AppState::new(registry, execset));
         for slug in state.registry.slugs() {
             let bundle = state.registry.get(&slug).unwrap();
-            let m = plowrt::serve::mux::spawn(slug.clone(), bundle, Arc::clone(&state), plowrt::serve::mux::MuxConfig::default());
+            let m = plowrt::serve::mux::spawn(
+                slug.clone(),
+                bundle,
+                Arc::clone(&state),
+                plowrt::serve::mux::MuxConfig::default(),
+            );
             state.install_mux(slug, m);
         }
         let router = plowrt::serve::app(state);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let mut builder = hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new());
+        let mut builder =
+            hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new());
         builder
             .http1()
             .timer(hyper_util::rt::TokioTimer::new())
@@ -239,7 +276,9 @@ fn host_serve_bench() {
                 let _ = stream.set_nodelay(true);
                 let (builder, svc) = (Arc::clone(&builder), svc.clone());
                 tokio::spawn(async move {
-                    let _ = builder.serve_connection_with_upgrades(hyper_util::rt::TokioIo::new(stream), svc).await;
+                    let _ = builder
+                        .serve_connection_with_upgrades(hyper_util::rt::TokioIo::new(stream), svc)
+                        .await;
                 });
             }
         });
@@ -254,25 +293,88 @@ fn host_serve_bench() {
         .build()
         .unwrap();
     // ~1000 tokens of English-like text for a real tokenizer; the byte tokenizer sees 4-5x that.
-    let words = ["the", "quick", "brown", "fox", "jumps", "over", "lazy", "dog", "serving", "token"];
-    let prompt: String = (0..1000).map(|i| words[(i * 7 + i / 3) % words.len()]).collect::<Vec<_>>().join(" ");
+    let words = [
+        "the", "quick", "brown", "fox", "jumps", "over", "lazy", "dog", "serving", "token",
+    ];
+    let prompt: String = (0..1000)
+        .map(|i| words[(i * 7 + i / 3) % words.len()])
+        .collect::<Vec<_>>()
+        .join(" ");
     let short = "Say hello.";
     // Streams use a short prompt: the reference walk hashes the whole prompt per token, which at
     // ~1000 tokens would dominate the tick. The long prompt is measured on its own (request path).
     let cells = [
-        Cell_ { name: "warm", conc: 8, requests: 64, max_tokens: 16, stream: true, long: false },
-        Cell_ { name: "req_c16_t1", conc: 16, requests: 4000, max_tokens: 1, stream: false, long: false },
-        Cell_ { name: "req_c16_isl1k_t1", conc: 16, requests: 2000, max_tokens: 1, stream: false, long: true },
-        Cell_ { name: "req_c1_isl1k_t1", conc: 1, requests: 400, max_tokens: 1, stream: false, long: true },
-        Cell_ { name: "req_c4_isl1k_t1", conc: 4, requests: 1000, max_tokens: 1, stream: false, long: true },
-        Cell_ { name: "stream_c1_t128", conc: 1, requests: 80, max_tokens: 128, stream: true, long: false },
-        Cell_ { name: "stream_c64_t128", conc: 64, requests: 1280, max_tokens: 128, stream: true, long: false },
+        Cell_ {
+            name: "warm",
+            conc: 8,
+            requests: 64,
+            max_tokens: 16,
+            stream: true,
+            long: false,
+        },
+        Cell_ {
+            name: "req_c16_t1",
+            conc: 16,
+            requests: 4000,
+            max_tokens: 1,
+            stream: false,
+            long: false,
+        },
+        Cell_ {
+            name: "req_c16_isl1k_t1",
+            conc: 16,
+            requests: 2000,
+            max_tokens: 1,
+            stream: false,
+            long: true,
+        },
+        Cell_ {
+            name: "req_c1_isl1k_t1",
+            conc: 1,
+            requests: 400,
+            max_tokens: 1,
+            stream: false,
+            long: true,
+        },
+        Cell_ {
+            name: "req_c4_isl1k_t1",
+            conc: 4,
+            requests: 1000,
+            max_tokens: 1,
+            stream: false,
+            long: true,
+        },
+        Cell_ {
+            name: "stream_c1_t128",
+            conc: 1,
+            requests: 80,
+            max_tokens: 128,
+            stream: true,
+            long: false,
+        },
+        Cell_ {
+            name: "stream_c64_t128",
+            conc: 64,
+            requests: 1280,
+            max_tokens: 128,
+            stream: true,
+            long: false,
+        },
     ];
     println!("HOSTSERVE cell req tok wall_s req/s tok/s srv_cpu_us/req srv_cpu_us/tok allocs/req allocs/tok ttft_p50_us itl_p50_us e2e_p50_us");
     let only = std::env::var("HOSTBENCH_CELLS").ok();
-    for cell in cells.iter().filter(|c| c.name == "warm" || only.as_deref().map_or(true, |o| o.split(',').any(|n| n == c.name))) {
+    for cell in cells.iter().filter(|c| {
+        c.name == "warm"
+            || only
+                .as_deref()
+                .map_or(true, |o| o.split(',').any(|n| n == c.name))
+    }) {
         let requests = ((cell.requests as f64 * scale) as usize).max(cell.conc);
-        let req = Arc::new(request(if cell.long { &prompt } else { short }, cell.max_tokens, cell.stream));
+        let req = Arc::new(request(
+            if cell.long { &prompt } else { short },
+            cell.max_tokens,
+            cell.stream,
+        ));
         let (cpu0, a0) = (server_cpu_ms(), allocs());
         let t0 = Instant::now();
         let left = Arc::new(AtomicU64::new(requests as u64));
@@ -284,7 +386,10 @@ fn host_serve_bench() {
                     let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
                     s.set_nodelay(true).unwrap();
                     let mut st = Stats::default();
-                    while left.fetch_update(Relaxed, Relaxed, |n| n.checked_sub(1)).is_ok() {
+                    while left
+                        .fetch_update(Relaxed, Relaxed, |n| n.checked_sub(1))
+                        .is_ok()
+                    {
                         one(&mut s, &req, stream, &mut st).await;
                     }
                     st

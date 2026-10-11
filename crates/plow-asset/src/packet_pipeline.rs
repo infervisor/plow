@@ -102,7 +102,10 @@ impl PacketPipelines {
                 return Err("invalid packet pipeline parameter".into());
             }
             if pipeline.strings.len() > 64
-                || pipeline.strings.iter().any(|(name, value)| !identifier(name, 64) || value.len() > 16384)
+                || pipeline
+                    .strings
+                    .iter()
+                    .any(|(name, value)| !identifier(name, 64) || value.len() > 16384)
             {
                 return Err("invalid packet pipeline string".into());
             }

@@ -82,12 +82,15 @@ impl ChatTemplate {
         // none as empty. `tools is iterable and tools | length > 0` (Qwen3-Coder) depends on it.
         env.add_test("iterable", |v: Value| !v.is_none() && v.try_iter().is_ok());
         // HF templates call `raise_exception` to reject a conversation shape.
-        env.add_function("raise_exception", |msg: String| -> Result<Value, minijinja::Error> {
-            Err(minijinja::Error::new(
-                minijinja::ErrorKind::InvalidOperation,
-                msg,
-            ))
-        });
+        env.add_function(
+            "raise_exception",
+            |msg: String| -> Result<Value, minijinja::Error> {
+                Err(minijinja::Error::new(
+                    minijinja::ErrorKind::InvalidOperation,
+                    msg,
+                ))
+            },
+        );
         // PYTHON STRING METHODS. HF templates are written for Jinja2 running on
         // Python, so they call real `str` methods on content — GLM's calls
         // `.strip()` on an assistant turn. minijinja has filters, not methods,
@@ -139,9 +142,7 @@ impl ChatTemplate {
                 }
             }
             let Some(s) = value.as_str() else {
-                return Err(minijinja::Error::from(
-                    minijinja::ErrorKind::UnknownMethod,
-                ));
+                return Err(minijinja::Error::from(minijinja::ErrorKind::UnknownMethod));
             };
             // Python's optional `chars` argument (`content.rstrip('\n')` in Qwen3's template).
             let strip_set = |chars: Option<&str>| -> Box<dyn Fn(char) -> bool> {
@@ -212,29 +213,33 @@ impl ChatTemplate {
         // "26 Jul 2024"; Muse-Glimmer guards it and drops its "Current date:"
         // line. The two guarded ones are worse than the loud one — the model is
         // told the wrong day and nothing anywhere says so.
-        env.add_function("strftime_now", |format: String| -> Result<String, minijinja::Error> {
-            // Parsed rather than formatted straight through: chrono's `Display`
-            // errors on an unknown specifier, and `to_string()` on that panics
-            // — inside a request handler.
-            let parsed = chrono::format::StrftimeItems::new(&format)
-                .parse()
-                .map_err(|e| {
-                    minijinja::Error::new(
-                        minijinja::ErrorKind::InvalidOperation,
-                        format!("strftime_now({format:?}): {e}"),
-                    )
-                })?;
-            Ok(chrono::Local::now()
-                .format_with_items(parsed.iter())
-                .to_string())
-        });
+        env.add_function(
+            "strftime_now",
+            |format: String| -> Result<String, minijinja::Error> {
+                // Parsed rather than formatted straight through: chrono's `Display`
+                // errors on an unknown specifier, and `to_string()` on that panics
+                // — inside a request handler.
+                let parsed = chrono::format::StrftimeItems::new(&format)
+                    .parse()
+                    .map_err(|e| {
+                        minijinja::Error::new(
+                            minijinja::ErrorKind::InvalidOperation,
+                            format!("strftime_now({format:?}): {e}"),
+                        )
+                    })?;
+                Ok(chrono::Local::now()
+                    .format_with_items(parsed.iter())
+                    .to_string())
+            },
+        );
         // `tojson` as `transformers` defines it: Python's `json.dumps`, keyword arguments
         // (`ensure_ascii=False` by default, `indent`, `separators`, `sort_keys`) and spacing
         // (`", "` / `": "`) included, so a tool schema renders byte for byte as the reference.
         env.add_filter(
             "tojson",
             |v: Value, kwargs: minijinja::value::Kwargs| -> Result<String, minijinja::Error> {
-                let err = |m: String| minijinja::Error::new(minijinja::ErrorKind::InvalidOperation, m);
+                let err =
+                    |m: String| minijinja::Error::new(minijinja::ErrorKind::InvalidOperation, m);
                 let mut opts = crate::serve::tools::pyjson::Opts {
                     ensure_ascii: kwargs.get::<Option<bool>>("ensure_ascii")?.unwrap_or(false),
                     indent: kwargs.get::<Option<usize>>("indent")?,
@@ -286,10 +291,7 @@ impl ChatTemplate {
         messages: &[serde_json::Value],
         opts: &RenderOpts,
     ) -> Result<String, String> {
-        let tmpl = self
-            .env
-            .get_template("chat")
-            .map_err(|e| e.to_string())?;
+        let tmpl = self.env.get_template("chat").map_err(|e| e.to_string())?;
 
         // The base variables `transformers` always binds, then the caller's
         // `chat_template_kwargs` on top. Merged rather than fixed because
@@ -310,7 +312,9 @@ impl ChatTemplate {
         ctx.insert("eos_token".into(), Value::from(self.eos_token.clone()));
         ctx.insert(
             "tools".into(),
-            opts.tools.as_ref().map_or(Value::from(()), Value::from_serialize),
+            opts.tools
+                .as_ref()
+                .map_or(Value::from(()), Value::from_serialize),
         );
         if let Some(effort) = &opts.reasoning_effort {
             ctx.insert("reasoning_effort".into(), Value::from(effort.clone()));
@@ -319,8 +323,7 @@ impl ChatTemplate {
             ctx.insert(k.clone(), Value::from_serialize(v));
         }
 
-        tmpl.render(Value::from_serialize(&ctx))
-        .map_err(|e| {
+        tmpl.render(Value::from_serialize(&ctx)).map_err(|e| {
             // minijinja chains the cause; the innermost is the template's own
             // `raise_exception` message, which is the useful half.
             let mut msg = e.to_string();
@@ -409,7 +412,10 @@ mod tests {
         let out = t.render(&msgs).expect("renders");
         let (turns, items) = out.split_once('|').expect("both halves rendered");
         assert_eq!(turns, "user=dflt;bot=dflt;");
-        assert!(items.contains("[role]") && items.contains("[content]"), "{items}");
+        assert!(
+            items.contains("[role]") && items.contains("[content]"),
+            "{items}"
+        );
     }
 
     /// `strftime_now` stamps the current date into the system prompt. gpt-oss

@@ -595,8 +595,10 @@ impl TuneStore {
         let mut stale = Vec::new();
 
         for rec in self.load_kernels(hardware)? {
-            if !rec.state.is_selectable() || !rec.qualification_blockers().is_empty()
-                || rec.hardware != hardware {
+            if !rec.state.is_selectable()
+                || !rec.qualification_blockers().is_empty()
+                || rec.hardware != hardware
+            {
                 continue;
             }
             let changed = rec.digests.stale_against(want);

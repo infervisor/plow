@@ -27,12 +27,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         plow_asset::certificates::sidecar_checks_file(packet),
     ] {
         if receipt.exists() {
-            return Err(format!("{} binds {input} to its compiler checks: re-emit the bundle", receipt.display()).into());
+            return Err(format!(
+                "{} binds {input} to its compiler checks: re-emit the bundle",
+                receipt.display()
+            )
+            .into());
         }
     }
     let blob = std::fs::read(input)?;
     let parsed = plowrt::asset::devblob::DevBlob::parse(&blob)?;
-    let raw = parsed.reserved_metadata(&blob, SECTION)?.ok_or("packet has no pipeline section")?;
+    let raw = parsed
+        .reserved_metadata(&blob, SECTION)?
+        .ok_or("packet has no pipeline section")?;
     let mut pipelines: PacketPipelines = serde_json::from_slice(raw)?;
     let mut sections = Vec::new();
     let mut upgraded = 0;
@@ -43,8 +49,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         match (kind, p.driver.as_str()) {
             ("vad", contract::VAD_DRIVER_V0) => {
                 p.driver = contract::VAD_DRIVER.into();
-                p.parameters.insert(contract::CONTRACT.into(), contract::VAD_CONTRACT);
-                p.parameters.insert("executor".into(), contract::EXECUTOR_HOST);
+                p.parameters
+                    .insert(contract::CONTRACT.into(), contract::VAD_CONTRACT);
+                p.parameters
+                    .insert("executor".into(), contract::EXECUTOR_HOST);
                 p.parameters.insert("state_banks".into(), 2);
                 devgen::vad::POLICY.to_parameters(&mut p.parameters);
             }
@@ -52,7 +60,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let gguf = plowrt::asset::gguf::GgufFile::open(std::path::Path::new(&args[3]))?;
                 let prompted = p.parameters.get("prompt_count").copied().unwrap_or(0) > 0;
                 let index = p.parameters.get("prompt_index").copied().unwrap_or(0) as usize;
-                let output = nemotron_packet_support::token_output(&gguf, prompted.then_some(index))?;
+                let output =
+                    nemotron_packet_support::token_output(&gguf, prompted.then_some(index))?;
                 output.apply(&mut p.parameters, &mut p.strings);
                 sections.push(packet::devbuild::SectionData {
                     kind: packet::devbuild::SECT_METADATA,
@@ -60,7 +69,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     data: output.vocabulary_section(),
                 });
             }
-            ("audio-lm", "causal.v1") if p.parameters.get("overlay_rows").is_some_and(|&r| r > 0) => {
+            ("audio-lm", "causal.v1")
+                if p.parameters.get("overlay_rows").is_some_and(|&r| r > 0) =>
+            {
                 devgen::asr::qwen::AUDIO_LM_POLICY.to_parameters(&mut p.parameters);
             }
             _ => continue,
@@ -70,13 +81,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if upgraded == 0 {
         return Err(format!("{input}: no contract-0 {kind} pipeline to upgrade").into());
     }
-    pipelines.validate(parsed.progs.len(), |name| parsed.tensors.iter().find(|t| t.name == name).map(|t| t.bytes as u64))?;
+    pipelines.validate(parsed.progs.len(), |name| {
+        parsed
+            .tensors
+            .iter()
+            .find(|t| t.name == name)
+            .map(|t| t.bytes as u64)
+    })?;
     sections.push(packet::devbuild::SectionData {
         kind: packet::devbuild::SECT_METADATA,
         name: SECTION.into(),
         data: serde_json::to_vec(&pipelines)?,
     });
-    std::fs::write(output, packet::devbuild::replace_metadata_sections(&blob, &sections)?)?;
-    println!("{}", serde_json::json!({"upgraded": upgraded, "kind": kind, "output": output}));
+    std::fs::write(
+        output,
+        packet::devbuild::replace_metadata_sections(&blob, &sections)?,
+    )?;
+    println!(
+        "{}",
+        serde_json::json!({"upgraded": upgraded, "kind": kind, "output": output})
+    );
     Ok(())
 }

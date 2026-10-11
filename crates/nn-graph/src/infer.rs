@@ -132,7 +132,10 @@ impl Ctx<'_> {
                 self.expect_arity(inputs, 2)?;
                 let x = self.input_shape(inputs, 0)?;
                 let alpha = self.input_shape(inputs, 1)?;
-                let c = x.dims().last().ok_or_else(|| self.err("snake input must have rank >= 1"))?;
+                let c = x
+                    .dims()
+                    .last()
+                    .ok_or_else(|| self.err("snake input must have rank >= 1"))?;
                 if alpha.rank() != 1 || alpha.dim(0).provably_ne(c) {
                     return Err(self.err(format!("snake alpha must be [{c}], got {alpha:?}")));
                 }
@@ -483,13 +486,15 @@ impl Ctx<'_> {
             } => {
                 let (x, k, out_c) = self.conv1d_operands(inputs, 1, *groups)?;
                 let span = i64::from(*dilation) * (k - 1) + 1;
-                let padded = x
-                    .dim(1)
-                    .add(&Dim::stat(i64::from(padding.0) + i64::from(padding.1) - span));
+                let padded = x.dim(1).add(&Dim::stat(
+                    i64::from(padding.0) + i64::from(padding.1) - span,
+                ));
                 let out_t = padded
                     .div_static(i64::from(*stride))
                     .ok_or_else(|| {
-                        self.err(format!("stride {stride} does not divide the padded length {padded}"))
+                        self.err(format!(
+                            "stride {stride} does not divide the padded length {padded}"
+                        ))
                     })?
                     .add(&Dim::stat(1));
                 Ok(Shape::new([x.dim(0).clone(), out_t, out_c]))
@@ -502,11 +507,13 @@ impl Ctx<'_> {
                 output_padding,
             } => {
                 let (x, k, out_c) = self.conv1d_operands(inputs, 0, *groups)?;
-                let out_t = x.dim(1).sub(&Dim::stat(1)).mul(&Dim::stat(i64::from(*stride))).add(
-                    &Dim::stat(
+                let out_t = x
+                    .dim(1)
+                    .sub(&Dim::stat(1))
+                    .mul(&Dim::stat(i64::from(*stride)))
+                    .add(&Dim::stat(
                         k + i64::from(*output_padding) - i64::from(crop.0) - i64::from(crop.1),
-                    ),
-                );
+                    ));
                 Ok(Shape::new([x.dim(0).clone(), out_t, out_c]))
             }
 

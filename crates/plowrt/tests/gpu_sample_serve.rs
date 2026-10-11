@@ -175,26 +175,52 @@ fn device_rows_match_host_sampler_distribution() {
     let mut logits = Vec::new();
     e.logits_row(0, &mut logits).expect("logits");
     const N: usize = 4096;
-    for (temp, top_k, top_p) in [(1.0f32, 64i32, 0.95f32), (0.7, 0, 0.9), (1.3, 40, 1.0), (1.0, 0, 0.99)] {
-        let params = SamplingParams { temperature: temp, top_k: top_k as usize, top_p, ..Default::default() };
+    for (temp, top_k, top_p) in [
+        (1.0f32, 64i32, 0.95f32),
+        (0.7, 0, 0.9),
+        (1.3, 40, 1.0),
+        (1.0, 0, 0.99),
+    ] {
+        let params = SamplingParams {
+            temperature: temp,
+            top_k: top_k as usize,
+            top_p,
+            ..Default::default()
+        };
         let mut host = std::collections::HashMap::<u32, usize>::new();
         let mut dev = std::collections::HashMap::<u32, usize>::new();
         let mut tok = [0u32];
         for i in 0..N {
             let u = (i as f32 + 0.5) / N as f32;
             *host.entry(sample(&logits, &params, None, u)).or_default() += 1;
-            let spec = DevSample { temp, top_k, top_p, min_p: 0.0, rng01: u };
-            e.sample_rows_on_device(&[spec], &mut tok).expect("device draw");
+            let spec = DevSample {
+                temp,
+                top_k,
+                top_p,
+                min_p: 0.0,
+                rng01: u,
+            };
+            e.sample_rows_on_device(&[spec], &mut tok)
+                .expect("device draw");
             *dev.entry(tok[0]).or_default() += 1;
         }
-        let keys: std::collections::BTreeSet<u32> = host.keys().chain(dev.keys()).copied().collect();
+        let keys: std::collections::BTreeSet<u32> =
+            host.keys().chain(dev.keys()).copied().collect();
         let tv = keys
             .iter()
-            .map(|k| host.get(k).copied().unwrap_or(0).abs_diff(dev.get(k).copied().unwrap_or(0)))
+            .map(|k| {
+                host.get(k)
+                    .copied()
+                    .unwrap_or(0)
+                    .abs_diff(dev.get(k).copied().unwrap_or(0))
+            })
             .sum::<usize>() as f64
             / (2 * N) as f64;
         let bound = keys.len() as f64 / N as f64 + 0.01;
         eprintln!("T={temp} top_k={top_k} top_p={top_p}: {} tokens kept, TV(host, device) {tv:.4} (bound {bound:.4})", keys.len());
-        assert!(tv <= bound, "device and host samplers disagree: TV {tv} > {bound}");
+        assert!(
+            tv <= bound,
+            "device and host samplers disagree: TV {tv} > {bound}"
+        );
     }
 }

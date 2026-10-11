@@ -36,9 +36,18 @@ impl PacketRnntTranscriber {
             "rnnt.greedy.v1",
         )
         .map_err(rejected)?;
-        let output = execution.output().cloned().ok_or_else(|| rejected("packet declares no output contract"))?;
+        let output = execution
+            .output()
+            .cloned()
+            .ok_or_else(|| rejected("packet declares no output contract"))?;
         let frontend = execution.log_mel_frontend()?;
-        Ok(Self { frontend, execution, output, streams: Default::default(), next_stream: 0 })
+        Ok(Self {
+            frontend,
+            execution,
+            output,
+            streams: Default::default(),
+            next_stream: 0,
+        })
     }
 
     pub fn backend(&self) -> &'static str {
@@ -54,19 +63,42 @@ impl Transcriber for PacketRnntTranscriber {
         let rnnt = self.execution.stream_open()?;
         let id = self.next_stream;
         self.next_stream += 1;
-        self.streams.insert(id, TranscriberStream { rnnt, samples: Vec::new(), steps: 0, tokens: Vec::new() });
+        self.streams.insert(
+            id,
+            TranscriberStream {
+                rnnt,
+                samples: Vec::new(),
+                steps: 0,
+                tokens: Vec::new(),
+            },
+        );
         Ok(Some(id))
     }
 
     /// Runs one encoder step per whole window of final mel frames the new audio completes.
-    fn stream_push(&mut self, id: u64, samples: &[f32], on_text: &mut dyn FnMut(&str)) -> Result<String> {
-        let windows = self.execution.stream_windows().ok_or_else(|| rejected("packet has no encoder stream"))?;
-        let stream = self.streams.get_mut(&id).ok_or_else(|| rejected("unknown ASR stream"))?;
+    fn stream_push(
+        &mut self,
+        id: u64,
+        samples: &[f32],
+        on_text: &mut dyn FnMut(&str),
+    ) -> Result<String> {
+        let windows = self
+            .execution
+            .stream_windows()
+            .ok_or_else(|| rejected("packet has no encoder stream"))?;
+        let stream = self
+            .streams
+            .get_mut(&id)
+            .ok_or_else(|| rejected("unknown ASR stream"))?;
         stream.samples.extend_from_slice(samples);
         let new_per_step = windows.step - windows.history;
         let end = |steps: usize| windows.first + steps * new_per_step;
         // Frames from the next window's start: earlier ones were consumed.
-        let from = if stream.steps == 0 { 0 } else { end(stream.steps) - windows.step };
+        let from = if stream.steps == 0 {
+            0
+        } else {
+            end(stream.steps) - windows.step
+        };
         let mut mel = None;
         loop {
             let (features, complete) = match &mel {
@@ -77,16 +109,22 @@ impl Transcriber for PacketRnntTranscriber {
             if *complete < stop {
                 break;
             }
-            let start = if stream.steps == 0 { 0 } else { stop - windows.step };
+            let start = if stream.steps == 0 {
+                0
+            } else {
+                stop - windows.step
+            };
             let window = features
                 .values
                 .get((start - from) * windows.bins..(stop - from) * windows.bins)
                 .ok_or_else(|| rejected("stream window is outside the computed mel frames"))?;
             let (output, before) = (&self.output, &stream.tokens);
-            let tokens = self.execution.stream_step(&mut stream.rnnt, window, &mut |emitted| {
-                let all: Vec<u32> = before.iter().chain(emitted).copied().collect();
-                on_text(&detokenize(output, &all));
-            })?;
+            let tokens = self
+                .execution
+                .stream_step(&mut stream.rnnt, window, &mut |emitted| {
+                    let all: Vec<u32> = before.iter().chain(emitted).copied().collect();
+                    on_text(&detokenize(output, &all));
+                })?;
             stream.tokens.extend(tokens);
             stream.steps += 1;
         }
@@ -109,10 +147,16 @@ impl Transcriber for PacketRnntTranscriber {
             return Ok(Some(compiled.clone()));
         };
         let compatible = requested.eq_ignore_ascii_case(compiled)
-            || self.output.language_aliases.iter().any(|(alias, l)| alias.eq_ignore_ascii_case(requested) && l == compiled);
-        compatible
-            .then(|| Some(compiled.clone()))
-            .ok_or_else(|| rejected(format!("packet was compiled for {compiled}, not {requested}")))
+            || self
+                .output
+                .language_aliases
+                .iter()
+                .any(|(alias, l)| alias.eq_ignore_ascii_case(requested) && l == compiled);
+        compatible.then(|| Some(compiled.clone())).ok_or_else(|| {
+            rejected(format!(
+                "packet was compiled for {compiled}, not {requested}"
+            ))
+        })
     }
 
     fn transcribe(
@@ -153,9 +197,11 @@ impl Transcriber for PacketRnntTranscriber {
         let mut input = features.values;
         input.resize(expected, 0.0);
         let output = &self.output;
-        let tokens = self.execution.transcribe_input_frames_with(&input, valid_frames, &mut |emitted| {
-            on_text(&detokenize(output, emitted))
-        })?;
+        let tokens =
+            self.execution
+                .transcribe_input_frames_with(&input, valid_frames, &mut |emitted| {
+                    on_text(&detokenize(output, emitted))
+                })?;
         if cancel.load(Ordering::Relaxed) {
             return Err(rejected("ASR cancelled"));
         }

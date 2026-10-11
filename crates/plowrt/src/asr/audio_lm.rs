@@ -68,7 +68,9 @@ impl AudioChunking {
             parameter(name)
                 .and_then(|v| usize::try_from(v).ok())
                 .filter(|&v| v > 0)
-                .ok_or_else(|| RuntimeError::Rejected(format!("audio packet parameter {name:?} is missing")))
+                .ok_or_else(|| {
+                    RuntimeError::Rejected(format!("audio packet parameter {name:?} is missing"))
+                })
         };
         Ok(Self {
             chunk_frames: get("input.chunk_frames")?,
@@ -92,8 +94,9 @@ impl PacketAudioEncoder {
         let packet = ForwardPacket::load_on(path, "audio.encode", backend, device)?;
         let chunking = AudioChunking::from_pipeline(|name| packet.optional_parameter(name))?;
         let usize_param = |name: &str| {
-            usize::try_from(packet.parameter(name)?)
-                .map_err(|_| RuntimeError::Rejected(format!("audio packet parameter {name:?} overflows")))
+            usize::try_from(packet.parameter(name)?).map_err(|_| {
+                RuntimeError::Rejected(format!("audio packet parameter {name:?} overflows"))
+            })
         };
         let input_frames = usize_param("input_frames")?;
         let output_rows = usize_param("output_rows")?;
@@ -108,12 +111,16 @@ impl PacketAudioEncoder {
             .collect();
         let groups = pipeline.tensor("groups").ok();
         let split_rows = pipeline.tensor("split_rows").ok();
-        let window_rows = packet.optional_parameter("attention.window_rows").unwrap_or(0) as usize;
-        let feature_frames = single.last().map_or(input_frames, |&(frames, _)| frames as usize);
+        let window_rows = packet
+            .optional_parameter("attention.window_rows")
+            .unwrap_or(0) as usize;
+        let feature_frames = single
+            .last()
+            .map_or(input_frames, |&(frames, _)| frames as usize);
         let max_chunks = input_frames.div_ceil(chunking.chunk_frames);
-        let input_bytes = max_chunks
-            .checked_mul(feature_bins)
-            .and_then(|elements| elements.checked_mul(chunking.chunk_frames * std::mem::size_of::<f32>()));
+        let input_bytes = max_chunks.checked_mul(feature_bins).and_then(|elements| {
+            elements.checked_mul(chunking.chunk_frames * std::mem::size_of::<f32>())
+        });
         let output_bytes = output_rows
             .checked_mul(output_width)
             .and_then(|elements| elements.checked_mul(std::mem::size_of::<f32>()));
@@ -124,13 +131,17 @@ impl PacketAudioEncoder {
             || output_rows != chunking.rows(input_frames)
             || input_bytes != Some(packet.input_bytes())
             || output_bytes != Some(packet.output_bytes())
-            || packed.last().is_some_and(|&(chunks, _)| chunks > max_chunks)
+            || packed
+                .last()
+                .is_some_and(|&(chunks, _)| chunks > max_chunks)
             || (!packed.is_empty()
                 && (window_rows == 0
                     || groups.is_none_or(|g| g.bytes < 4 * (1 + 2 * packed.last().unwrap().0))
                     || split_rows.is_none_or(|t| t.bytes < 4 * output_rows)))
         {
-            return Err(RuntimeError::Rejected("audio packet geometry is inconsistent".into()));
+            return Err(RuntimeError::Rejected(
+                "audio packet geometry is inconsistent".into(),
+            ));
         }
         Ok(Self {
             input: pipeline.tensor("input")?,
@@ -169,7 +180,9 @@ impl PacketAudioEncoder {
                 .checked_mul(features.frames)
                 .is_none_or(|elements| features.values.len() != elements)
         {
-            return Err(RuntimeError::Rejected("audio features do not match packet capacity".into()));
+            return Err(RuntimeError::Rejected(
+                "audio features do not match packet capacity".into(),
+            ));
         }
         Ok(())
     }
@@ -179,7 +192,8 @@ impl PacketAudioEncoder {
         let chunk = self.chunking.chunk_frames;
         for batch in 0..self.chunks(features.frames) {
             for bin in 0..self.feature_bins {
-                let row = &mut input[((first + batch) * self.feature_bins + bin) * chunk..][..chunk];
+                let row =
+                    &mut input[((first + batch) * self.feature_bins + bin) * chunk..][..chunk];
                 let source = &features.values[bin * features.frames..][..features.frames];
                 for (frame, value) in row.iter_mut().enumerate() {
                     *value = match source.get(batch * chunk + frame) {
@@ -192,7 +206,12 @@ impl PacketAudioEncoder {
         }
     }
 
-    fn launch(&mut self, programs: &[usize], writes: &[(PacketTensor, &[u8])], output: &mut [u8]) -> Result<()> {
+    fn launch(
+        &mut self,
+        programs: &[usize],
+        writes: &[(PacketTensor, &[u8])],
+        output: &mut [u8],
+    ) -> Result<()> {
         let runtime = self.packet.runtime_mut();
         runtime.begin_execution()?;
         let result = (|| {
@@ -215,7 +234,9 @@ impl PacketAudioEncoder {
             .iter()
             .find(|(capacity, _)| *capacity >= requested)
             .map(|(capacity, programs)| (*capacity as usize, programs.clone()))
-            .ok_or_else(|| RuntimeError::Rejected("audio features do not match packet capacity".into()))?;
+            .ok_or_else(|| {
+                RuntimeError::Rejected("audio features do not match packet capacity".into())
+            })?;
         let chunk = self.chunking.chunk_frames;
         let mut input = vec![0.0f32; self.chunks(capacity) * self.feature_bins * chunk];
         self.stage(features, &mut input, 0);
@@ -223,7 +244,10 @@ impl PacketAudioEncoder {
         let valid_rows_u32 = u32::try_from(valid_rows)
             .map_err(|_| RuntimeError::Rejected("audio packet row count overflows".into()))?;
         let mut output = vec![0.0f32; valid_rows * self.output_width];
-        let writes = [(self.input, bytemuck::cast_slice(&input)), (self.valid_rows, &valid_rows_u32.to_le_bytes()[..])];
+        let writes = [
+            (self.input, bytemuck::cast_slice(&input)),
+            (self.valid_rows, &valid_rows_u32.to_le_bytes()[..]),
+        ];
         self.launch(&programs, &writes, bytemuck::cast_slice_mut(&mut output))?;
         Ok(output)
     }
@@ -233,7 +257,8 @@ impl PacketAudioEncoder {
     /// rows bit for bit as [`Self::encode`] gives them. Together they must fit
     /// [`Self::max_packed_chunks`].
     pub(crate) fn encode_packed(&mut self, items: &[&MelFeatures]) -> Result<Vec<Vec<f32>>> {
-        let (Some(groups), Some(split_rows), Some(&(max_chunks, _))) = (self.groups, self.split_rows, self.packed.last())
+        let (Some(groups), Some(split_rows), Some(&(max_chunks, _))) =
+            (self.groups, self.split_rows, self.packed.last())
         else {
             return items.iter().map(|features| self.encode(features)).collect();
         };
@@ -242,9 +267,16 @@ impl PacketAudioEncoder {
         }
         let total: usize = items.iter().map(|f| self.chunks(f.frames)).sum();
         if total == 0 || total > max_chunks {
-            return Err(RuntimeError::Rejected(format!("{total} audio chunks exceed the packed encoder")));
+            return Err(RuntimeError::Rejected(format!(
+                "{total} audio chunks exceed the packed encoder"
+            )));
         }
-        let programs = self.packed.iter().find(|&&(chunks, _)| chunks >= total).map(|(_, p)| p.clone()).unwrap();
+        let programs = self
+            .packed
+            .iter()
+            .find(|&&(chunks, _)| chunks >= total)
+            .map(|(_, p)| p.clone())
+            .unwrap();
         let chunk = self.chunking.chunk_frames;
         let chunk_rows = chunk.div_ceil(self.chunking.frame_stride);
         let mut input = vec![0.0f32; total * self.feature_bins * chunk];
@@ -258,13 +290,18 @@ impl PacketAudioEncoder {
                 .iter()
                 .map(|&(frames, _)| frames as usize)
                 .find(|&frames| frames >= features.frames)
-                .ok_or_else(|| RuntimeError::Rejected("audio exceeds every single-utterance capacity".into()))?;
+                .ok_or_else(|| {
+                    RuntimeError::Rejected("audio exceeds every single-utterance capacity".into())
+                })?;
             reference[first * chunk_rows..(first + self.chunks(features.frames)) * chunk_rows]
                 .fill(self.chunking.rows(capacity) as u32);
             self.stage(features, &mut input, first);
             let (row, rows) = (first * chunk_rows, self.chunking.rows(features.frames));
             for window in (0..rows).step_by(self.window_rows) {
-                table.extend([(row + window) as u32, (rows - window).min(self.window_rows) as u32]);
+                table.extend([
+                    (row + window) as u32,
+                    (rows - window).min(self.window_rows) as u32,
+                ]);
             }
             spans.push((row, rows));
             first += self.chunks(features.frames);
@@ -278,7 +315,10 @@ impl PacketAudioEncoder {
         ];
         self.launch(&programs, &writes, bytemuck::cast_slice_mut(&mut output))?;
         let width = self.output_width;
-        Ok(spans.into_iter().map(|(row, rows)| output[row * width..(row + rows) * width].to_vec()).collect())
+        Ok(spans
+            .into_iter()
+            .map(|(row, rows)| output[row * width..(row + rows) * width].to_vec())
+            .collect())
     }
 
     /// Run every capacity once (no valid rows): each sequence's CUDA graph is captured now, not
@@ -288,8 +328,12 @@ impl PacketAudioEncoder {
         if let Some(groups) = self.groups {
             writes.push((groups, &[0u8; 4][..]));
         }
-        let sequences: Vec<Vec<usize>> =
-            self.single.iter().map(|(_, p)| p.clone()).chain(self.packed.iter().map(|(_, p)| p.clone())).collect();
+        let sequences: Vec<Vec<usize>> = self
+            .single
+            .iter()
+            .map(|(_, p)| p.clone())
+            .chain(self.packed.iter().map(|(_, p)| p.clone()))
+            .collect();
         for programs in sequences {
             self.launch(&programs, &writes, &mut [])?;
         }
@@ -381,32 +425,38 @@ impl AudioLmContract {
         let decoder = asset
             .pipelines()
             .iter()
-            .find(|p| p.driver == "causal.v1" && p.parameters.get("overlay_rows").is_some_and(|&r| r > 0))
+            .find(|p| {
+                p.driver == "causal.v1" && p.parameters.get("overlay_rows").is_some_and(|&r| r > 0)
+            })
             .ok_or_else(|| RuntimeError::Rejected("packet has no causal audio pipeline".into()))?;
         let param = |name: &str| {
-            decoder
-                .parameters
-                .get(name)
-                .copied()
-                .ok_or_else(|| RuntimeError::Rejected(format!("audio LM parameter {name:?} is missing")))
+            decoder.parameters.get(name).copied().ok_or_else(|| {
+                RuntimeError::Rejected(format!("audio LM parameter {name:?} is missing"))
+            })
         };
         use plow_asset::speech_contract as contract;
-        contract::check_contract(decoder.parameters.get(contract::CONTRACT).copied(), contract::ASR_CONTRACT, "audio LM")
-            .map_err(RuntimeError::Rejected)?;
-        let policy = contract::AudioLmPolicy::from_parameters(|name| decoder.parameters.get(name).copied())
-            .map_err(RuntimeError::Rejected)?;
+        contract::check_contract(
+            decoder.parameters.get(contract::CONTRACT).copied(),
+            contract::ASR_CONTRACT,
+            "audio LM",
+        )
+        .map_err(RuntimeError::Rejected)?;
+        let policy =
+            contract::AudioLmPolicy::from_parameters(|name| decoder.parameters.get(name).copied())
+                .map_err(RuntimeError::Rejected)?;
         let text = |name: &str| {
-            decoder
-                .strings
-                .get(name)
-                .cloned()
-                .ok_or_else(|| RuntimeError::Rejected(format!("audio LM string {name:?} is missing")))
+            decoder.strings.get(name).cloned().ok_or_else(|| {
+                RuntimeError::Rejected(format!("audio LM string {name:?} is missing"))
+            })
         };
         // The serving frontend decodes 16 kHz audio into windows of at most 30 s. A packet that
         // declares other audio is refused here instead of being fed the wrong signal.
         for (name, have) in [
             ("audio.sample_rate", u64::from(super::frontend::SAMPLE_RATE)),
-            ("audio.max_seconds", (super::frontend::MAX_SAMPLES / super::frontend::SAMPLE_RATE as usize) as u64),
+            (
+                "audio.max_seconds",
+                (super::frontend::MAX_SAMPLES / super::frontend::SAMPLE_RATE as usize) as u64,
+            ),
         ] {
             if let Some(&want) = decoder.parameters.get(name) {
                 if want != have {
@@ -417,28 +467,48 @@ impl AudioLmContract {
             }
         }
         let lines = |name: &str| -> Result<Vec<String>> {
-            Ok(text(name)?.lines().filter(|l| !l.is_empty()).map(str::to_owned).collect())
+            Ok(text(name)?
+                .lines()
+                .filter(|l| !l.is_empty())
+                .map(str::to_owned)
+                .collect())
         };
-        let to_usize = |v: u64| usize::try_from(v).map_err(|_| RuntimeError::Rejected("audio LM parameter overflows".into()));
+        let to_usize = |v: u64| {
+            usize::try_from(v)
+                .map_err(|_| RuntimeError::Rejected("audio LM parameter overflows".into()))
+        };
         let stop = (0..param("stop.count")?)
-            .map(|i| param(&format!("stop.{i}")).and_then(|id| u32::try_from(id).map_err(|_| RuntimeError::Rejected("stop id overflows".into()))))
+            .map(|i| {
+                param(&format!("stop.{i}")).and_then(|id| {
+                    u32::try_from(id)
+                        .map_err(|_| RuntimeError::Rejected("stop id overflows".into()))
+                })
+            })
             .collect::<Result<Vec<_>>>()?;
         let messages: serde_json::Value = serde_json::from_str(&text("prompt.messages")?)
             .map_err(|e| RuntimeError::Rejected(format!("audio LM prompt.messages: {e}")))?;
 
-        let encoder_path = crate::exec::packet_runtime::stage_packet(packet, "encoder.packet", "encoder.pkt")?;
+        let encoder_path =
+            crate::exec::packet_runtime::stage_packet(packet, "encoder.packet", "encoder.pkt")?;
         let encoder = crate::exec::packet_runtime::PacketAsset::load(&encoder_path)?;
         let audio = encoder
             .pipelines()
             .iter()
             .find(|p| p.name == "audio.encode")
-            .ok_or_else(|| RuntimeError::Rejected("encoder packet has no audio.encode pipeline".into()))?;
+            .ok_or_else(|| {
+                RuntimeError::Rejected("encoder packet has no audio.encode pipeline".into())
+            })?;
         let chunking = AudioChunking::from_pipeline(|name| audio.parameters.get(name).copied())?;
         let filterbank = audio
             .tensors
             .get("audio.frontend.filterbank")
-            .ok_or_else(|| RuntimeError::Rejected("encoder packet has no frontend filterbank".into()))?;
-        let raw = std::fs::read(&encoder_path).map_err(|source| RuntimeError::Io { path: encoder_path.clone(), source })?;
+            .ok_or_else(|| {
+                RuntimeError::Rejected("encoder packet has no frontend filterbank".into())
+            })?;
+        let raw = std::fs::read(&encoder_path).map_err(|source| RuntimeError::Io {
+            path: encoder_path.clone(),
+            source,
+        })?;
         let blob = crate::asset::devblob::DevBlob::parse(&raw)?;
         let bytes = blob
             .tensors
@@ -447,11 +517,15 @@ impl AudioLmContract {
             .and_then(|t| t.init.clone())
             .map(|range| blob.init[range].to_vec())
             .ok_or_else(|| RuntimeError::Rejected("frontend filterbank has no data".into()))?;
-        let frontend = PacketLogMelFrontend::from_parameters(|name| audio.parameters.get(name).copied(), &bytes)?;
+        let frontend = PacketLogMelFrontend::from_parameters(
+            |name| audio.parameters.get(name).copied(),
+            &bytes,
+        )?;
         Ok((
             Self {
                 hidden: to_usize(param("hidden")?)?,
-                placeholder: u32::try_from(param("audio.token_id")?).map_err(|_| RuntimeError::Rejected("audio token overflows".into()))?,
+                placeholder: u32::try_from(param("audio.token_id")?)
+                    .map_err(|_| RuntimeError::Rejected("audio token overflows".into()))?,
                 stop,
                 max_tokens: to_usize(param("output.max_tokens")?)?,
                 // `prompt.context_max_tokens` (older packets) is not read: the context is fitted
@@ -479,7 +553,10 @@ impl AudioLmContract {
     fn parse(&self, output: &str, forced_language: Option<&str>) -> Result<Transcript> {
         let output = output.trim();
         if output.is_empty() {
-            return Ok(Transcript { text: String::new(), language: None });
+            return Ok(Transcript {
+                text: String::new(),
+                language: None,
+            });
         }
         let (language, text) = if let Some(language) = forced_language {
             (Some(language.to_owned()), output)
@@ -489,11 +566,17 @@ impl AudioLmContract {
                 .filter(|s| !s.trim().is_empty())
                 .ok_or_else(|| RuntimeError::Rejected("invalid ASR language header".into()))?;
             let language = language.lines().next().unwrap_or_default().trim();
-            ((!language.eq_ignore_ascii_case(&self.language_none)).then(|| language.to_owned()), text)
+            (
+                (!language.eq_ignore_ascii_case(&self.language_none)).then(|| language.to_owned()),
+                text,
+            )
         } else {
             return Err(RuntimeError::Rejected("missing ASR text marker".into()));
         };
-        Ok(Transcript { text: text.trim().to_owned(), language })
+        Ok(Transcript {
+            text: text.trim().to_owned(),
+            language,
+        })
     }
 }
 
@@ -540,14 +623,24 @@ impl AudioLmPrompt {
         let (contract, frontend) = AudioLmContract::load(packet)?;
         let tokenizer = load_tokenizer(checkpoint);
         if tokenizer.is_byte_fallback() {
-            return Err(RuntimeError::Rejected("ASR requires a real tokenizer".into()));
+            return Err(RuntimeError::Rejected(
+                "ASR requires a real tokenizer".into(),
+            ));
         }
         if tokenizer.encode(&contract.marker) != [contract.placeholder] {
-            return Err(RuntimeError::Rejected("ASR audio marker does not tokenize to the packet's audio token".into()));
+            return Err(RuntimeError::Rejected(
+                "ASR audio marker does not tokenize to the packet's audio token".into(),
+            ));
         }
-        let template = ChatTemplate::load(checkpoint)
-            .ok_or_else(|| RuntimeError::Rejected("ASR requires the checkpoint chat template".into()))?;
-        Ok(Self { frontend, tokenizer, template, contract })
+        let template = ChatTemplate::load(checkpoint).ok_or_else(|| {
+            RuntimeError::Rejected("ASR requires the checkpoint chat template".into())
+        })?;
+        Ok(Self {
+            frontend,
+            tokenizer,
+            template,
+            contract,
+        })
     }
 
     pub fn hidden(&self) -> usize {
@@ -585,7 +678,9 @@ impl AudioLmPrompt {
             .find(|name| name.eq_ignore_ascii_case(requested))
             .cloned()
             .map(Some)
-            .ok_or_else(|| RuntimeError::Rejected(format!("unsupported ASR language {requested:?}")))
+            .ok_or_else(|| {
+                RuntimeError::Rejected(format!("unsupported ASR language {requested:?}"))
+            })
     }
 
     /// Features, prompt ids and placeholder positions for one recording; the prompt must leave
@@ -600,8 +695,14 @@ impl AudioLmPrompt {
         let language = self.language(language)?;
         let features = self.features(samples)?;
         let rows = self.contract.chunking.rows(features.frames);
-        let (ids, audio_positions) = self.prompt(rows, language.as_deref(), context, max_context)?;
-        Ok(AudioLmRequest { features, ids, audio_positions, language })
+        let (ids, audio_positions) =
+            self.prompt(rows, language.as_deref(), context, max_context)?;
+        Ok(AudioLmRequest {
+            features,
+            ids,
+            audio_positions,
+            language,
+        })
     }
 
     /// Its length is not checked here: [`Self::prompt`] fits the context to each request's window.
@@ -609,7 +710,12 @@ impl AudioLmPrompt {
     /// a turn of the prompt. Removal repeats until none remains (a removal can join a new one).
     fn clean_context<'a>(&self, context: &'a str) -> std::borrow::Cow<'a, str> {
         let mut context = std::borrow::Cow::Borrowed(context);
-        while let Some(marker) = self.contract.forbidden.iter().find(|m| !m.is_empty() && context.contains(m.as_str())) {
+        while let Some(marker) = self
+            .contract
+            .forbidden
+            .iter()
+            .find(|m| !m.is_empty() && context.contains(m.as_str()))
+        {
             context = context.replace(marker.as_str(), " ").into();
         }
         context
@@ -644,7 +750,9 @@ impl AudioLmPrompt {
         // Word starts; dropping more leading words never adds tokens, so bisect the first fit.
         let starts: Vec<usize> = context
             .char_indices()
-            .filter(|&(i, ch)| !ch.is_whitespace() && (i == 0 || context[..i].ends_with(char::is_whitespace)))
+            .filter(|&(i, ch)| {
+                !ch.is_whitespace() && (i == 0 || context[..i].ends_with(char::is_whitespace))
+            })
             .map(|(i, _)| i)
             .collect();
         let (mut lo, mut hi) = (0, starts.len());
@@ -657,18 +765,33 @@ impl AudioLmPrompt {
             }
         }
         let kept = starts.get(lo).map_or("", |&start| &context[start..]);
-        tracing::debug!(budget, dropped_words = lo, kept_words = starts.len() - lo, "ASR context trimmed to its window");
+        tracing::debug!(
+            budget,
+            dropped_words = lo,
+            kept_words = starts.len() - lo,
+            "ASR context trimmed to its window"
+        );
         Ok(kept)
     }
 
-    fn encode_prompt(&self, rows: usize, language: Option<&str>, context: &str) -> Result<Vec<u32>> {
+    fn encode_prompt(
+        &self,
+        rows: usize,
+        language: Option<&str>,
+        context: &str,
+    ) -> Result<Vec<u32>> {
         let c = &self.contract;
         let mut messages = c.messages.clone();
         fill_context(&mut messages, context);
         let messages = messages.as_array().cloned().unwrap_or_default();
-        let prompt = self.template.render(&messages).map_err(RuntimeError::Rejected)?;
+        let prompt = self
+            .template
+            .render(&messages)
+            .map_err(RuntimeError::Rejected)?;
         if prompt.matches(c.marker.as_str()).count() != 1 {
-            return Err(RuntimeError::Rejected("ASR template needs exactly one audio marker".into()));
+            return Err(RuntimeError::Rejected(
+                "ASR template needs exactly one audio marker".into(),
+            ));
         }
         let mut prompt = prompt.replace(c.marker.as_str(), &c.marker.repeat(rows));
         if let Some(language) = language {
@@ -684,10 +807,14 @@ impl AudioLmPrompt {
 
     pub fn features(&self, samples: &[f32]) -> Result<MelFeatures> {
         let log_mel = self.frontend.extract(samples)?;
-        let mut features = MelFeatures { values: vec![0.0; log_mel.values.len()], frames: log_mel.frames };
+        let mut features = MelFeatures {
+            values: vec![0.0; log_mel.values.len()],
+            frames: log_mel.frames,
+        };
         for frame in 0..log_mel.frames {
             for bin in 0..log_mel.bins {
-                features.values[bin * log_mel.frames + frame] = log_mel.values[frame * log_mel.bins + bin];
+                features.values[bin * log_mel.frames + frame] =
+                    log_mel.values[frame * log_mel.bins + bin];
             }
         }
         Ok(features)
@@ -721,13 +848,19 @@ impl AudioLmPrompt {
             .filter_map(|(i, &id)| (id == c.placeholder).then_some(i))
             .collect();
         if audio_positions.len() != rows {
-            return Err(RuntimeError::Rejected("ASR placeholder count mismatch".into()));
+            return Err(RuntimeError::Rejected(
+                "ASR placeholder count mismatch".into(),
+            ));
         }
         Ok((ids, audio_positions))
     }
 
     /// Resolve `language` once for a stream of partial prompts.
-    pub fn stream_language(&self, language: Option<&str>, _context: &str) -> Result<Option<String>> {
+    pub fn stream_language(
+        &self,
+        language: Option<&str>,
+        _context: &str,
+    ) -> Result<Option<String>> {
         self.language(language)
     }
 
@@ -749,7 +882,8 @@ impl AudioLmPrompt {
 
     /// The transcript of generated ids (stop token excluded).
     pub fn transcript(&self, output: &[u32], language: Option<&str>) -> Result<Transcript> {
-        self.contract.parse(&self.tokenizer.decode(output), language)
+        self.contract
+            .parse(&self.tokenizer.decode(output), language)
     }
 }
 
@@ -764,7 +898,8 @@ impl AudioLmAsr {
         backend: &str,
     ) -> Result<(Self, &'static str)> {
         let prompt = AudioLmPrompt::load(packet, checkpoint)?;
-        let (execution, loaded_backend) = load_execution(packet, checkpoint, backend, prompt.contract.hidden)?;
+        let (execution, loaded_backend) =
+            load_execution(packet, checkpoint, backend, prompt.contract.hidden)?;
         Ok((Self { execution, prompt }, loaded_backend))
     }
 
@@ -796,9 +931,17 @@ impl AudioLmAsr {
         // This loop decodes the whole `max_tokens` budget itself, so it needs the room up front:
         // the prompt (and its context) gets the rest of the window.
         let max_tokens = self.prompt.contract.max_tokens;
-        let window = self.execution.max_context().saturating_sub(max_tokens).saturating_add(1);
-        let AudioLmRequest { features, ids, audio_positions: positions, language } =
-            self.prompt.request(samples, language, context, window)?;
+        let window = self
+            .execution
+            .max_context()
+            .saturating_sub(max_tokens)
+            .saturating_add(1);
+        let AudioLmRequest {
+            features,
+            ids,
+            audio_positions: positions,
+            language,
+        } = self.prompt.request(samples, language, context, window)?;
         if ids.len() + max_tokens > self.execution.max_context() {
             return Err(RuntimeError::ContextLength(format!(
                 "ASR needs {} prompt + {max_tokens} output positions; bundle has {}",
@@ -857,8 +1000,10 @@ impl AudioLmAsr {
         for step in 0..max_tokens {
             cancelled()?;
             if self.prompt.contract.stop.contains(&token) {
-                let result =
-                    self.prompt.contract.parse(&self.prompt.tokenizer.decode(&output), language.as_deref())?;
+                let result = self
+                    .prompt
+                    .contract
+                    .parse(&self.prompt.tokenizer.decode(&output), language.as_deref())?;
                 let elapsed = started.elapsed().as_secs_f64();
                 let audio_seconds = samples.len() as f64 / super::frontend::SAMPLE_RATE as f64;
                 tracing::info!(
@@ -1079,7 +1224,8 @@ mod contract_tests {
     #[test]
     fn context_is_fitted_to_the_window_keeping_its_latest_words() {
         let dir = std::path::Path::new("/opt/plow-asr/models/qwen3-asr");
-        let Ok(prompt) = AudioLmPrompt::load(&dir.join("model.pkt"), &dir.join("checkpoint")) else {
+        let Ok(prompt) = AudioLmPrompt::load(&dir.join("model.pkt"), &dir.join("checkpoint"))
+        else {
             eprintln!("no Qwen3-ASR bundle at {} — skipping", dir.display());
             return;
         };
@@ -1092,16 +1238,31 @@ mod contract_tests {
         let (ids, _) = prompt.prompt(rows, None, &long, 2048).unwrap();
         assert!(ids.len() + prompt.output_reserve(rows) <= 2048);
         let kept = prompt.fit_context(rows, None, &long, 2048).unwrap();
-        assert!(kept.starts_with("word") && kept.trim_end().ends_with("word2999"), "the latest words stay");
-        assert!(kept.split_whitespace().count() > 100, "far more than the old 256-token cap allowed");
+        assert!(
+            kept.starts_with("word") && kept.trim_end().ends_with("word2999"),
+            "the latest words stay"
+        );
+        assert!(
+            kept.split_whitespace().count() > 100,
+            "far more than the old 256-token cap allowed"
+        );
         // A window the audio alone fills leaves no context, which is still a valid prompt.
-        assert_eq!(prompt.fit_context(rows, None, &long, bare.len() + 10).unwrap(), "");
+        assert_eq!(
+            prompt
+                .fit_context(rows, None, &long, bare.len() + 10)
+                .unwrap(),
+            ""
+        );
     }
 
     /// Chunked rows equal three stride-2 convolutions over each 100-frame chunk.
     #[test]
     fn chunked_rows_cover_all_tails() {
-        let chunking = AudioChunking { chunk_frames: 100, frame_stride: 8, round_bf16: true };
+        let chunking = AudioChunking {
+            chunk_frames: 100,
+            frame_stride: 8,
+            round_bf16: true,
+        };
         for frames in 0usize..=3000 {
             let expected: usize = (0..frames)
                 .step_by(100)
@@ -1133,7 +1294,11 @@ mod contract_tests {
             language_none: "none".into(),
             languages: vec![],
             aliases: vec![],
-            chunking: AudioChunking { chunk_frames: 1, frame_stride: 1, round_bf16: false },
+            chunking: AudioChunking {
+                chunk_frames: 1,
+                frame_stride: 1,
+                round_bf16: false,
+            },
             policy: plow_asset::speech_contract::AudioLmPolicy {
                 final_padding_samples: 0,
                 final_padding_amplitude: 0.0,
@@ -1146,7 +1311,11 @@ mod contract_tests {
         assert_eq!(result.text, "Hello.");
         assert_eq!(c.parse("你好", Some("Chinese")).unwrap().text, "你好");
         assert!(c.parse("Hello.", None).is_err());
-        assert!(c.parse("language None<asr_text>", None).unwrap().language.is_none());
+        assert!(c
+            .parse("language None<asr_text>", None)
+            .unwrap()
+            .language
+            .is_none());
         assert_eq!(c.parse("", None).unwrap().text, "");
     }
 

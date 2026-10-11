@@ -120,10 +120,17 @@ impl Variant {
                 if i.op == DevOp::GemvFp8 as u16 && v != Variant::Mxfp4 {
                     v = Variant::Fp8;
                 }
-                if matches!(DevOp::from_u16(i.op), Some(
-                    DevOp::GemvMxfp4 | DevOp::GemvGluMxfp4 | DevOp::GemvQkvMxfp4
-                    | DevOp::GemmMxfp4 | DevOp::GemmSmallMxfp4 | DevOp::GemmGluMxfp4
-                )) {
+                if matches!(
+                    DevOp::from_u16(i.op),
+                    Some(
+                        DevOp::GemvMxfp4
+                            | DevOp::GemvGluMxfp4
+                            | DevOp::GemvQkvMxfp4
+                            | DevOp::GemmMxfp4
+                            | DevOp::GemmSmallMxfp4
+                            | DevOp::GemmGluMxfp4
+                    )
+                ) {
                     v = Variant::Mxfp4;
                 }
             }
@@ -296,7 +303,11 @@ pub fn object_name(phase: Phase, variant: Variant, arm: PrefillArm, sched: Sched
         _ => PrefillArm::None,
     };
     let variant_infix = match (variant, arm, phase) {
-        (Variant::Mxfp4, PrefillArm::MlaMoeA4w4 | PrefillArm::K3 | PrefillArm::K3Moe | PrefillArm::K3MoeA4w4, _) => "",
+        (
+            Variant::Mxfp4,
+            PrefillArm::MlaMoeA4w4 | PrefillArm::K3 | PrefillArm::K3Moe | PrefillArm::K3MoeA4w4,
+            _,
+        ) => "",
         _ => variant.infix(),
     };
     format!(
@@ -454,11 +465,23 @@ pub(super) const COMPILED_OPCODE_MARKERS: &[(DevOp, &str)] = &[
     (DevOp::MoeCombinePf, "plow_cap_d_moe_router_topk_pf_1"),
     (DevOp::QuantFp8Block128, "plow_opcode_quant_fp8_block128_1"),
     (DevOp::GemmFp8Block128, "plow_opcode_gemm_fp8_block128_1"),
-    (DevOp::GemmFp8Block128Split4, "plow_opcode_gemm_fp8_block128_split4_1"),
+    (
+        DevOp::GemmFp8Block128Split4,
+        "plow_opcode_gemm_fp8_block128_split4_1",
+    ),
     (DevOp::Sum4Bf16, "plow_opcode_sum4_bf16_1"),
-    (DevOp::MoeGluFp8Block128, "plow_opcode_moe_glu_fp8_block128_1"),
-    (DevOp::MoeQuantFp8Block128, "plow_opcode_moe_quant_fp8_block128_1"),
-    (DevOp::MoeDownFp8Block128, "plow_opcode_moe_down_fp8_block128_1"),
+    (
+        DevOp::MoeGluFp8Block128,
+        "plow_opcode_moe_glu_fp8_block128_1",
+    ),
+    (
+        DevOp::MoeQuantFp8Block128,
+        "plow_opcode_moe_quant_fp8_block128_1",
+    ),
+    (
+        DevOp::MoeDownFp8Block128,
+        "plow_opcode_moe_down_fp8_block128_1",
+    ),
     (DevOp::MlaBmmFp8, "plow_opcode_mla_bmm_fp8_1"),
     (DevOp::ZeroF32, "plow_opcode_zero_f32_1"),
     (DevOp::KdaConv, "plow_opcode_kda_conv_1"),
@@ -521,30 +544,57 @@ pub(super) fn check_compiled_opcode_markers<'a>(
                 }
             }
             let shape = match DevOp::from_u16(inst.op) {
-                Some(DevOp::MoeGluFp8Block128) => Some((inst.i[0], inst.i[1], inst.i[2], 1, inst.i[3], 7, 4)),
-                Some(DevOp::MoeQuantFp8Block128) => Some((inst.i[0], inst.i[4], inst.i[1], inst.i[2], inst.i[3], 6, 5)),
-                Some(DevOp::MoeDownFp8Block128) => Some((inst.i[0], inst.i[1], inst.i[2], inst.i[3], inst.i[4], 8, 5)),
+                Some(DevOp::MoeGluFp8Block128) => {
+                    Some((inst.i[0], inst.i[1], inst.i[2], 1, inst.i[3], 7, 4))
+                }
+                Some(DevOp::MoeQuantFp8Block128) => {
+                    Some((inst.i[0], inst.i[4], inst.i[1], inst.i[2], inst.i[3], 6, 5))
+                }
+                Some(DevOp::MoeDownFp8Block128) => {
+                    Some((inst.i[0], inst.i[1], inst.i[2], inst.i[3], inst.i[4], 8, 5))
+                }
                 _ => None,
             };
             if let Some((inter, h, experts, topk, rows, tensors, immediates)) = shape {
-                if inter == 0 || inter % 128 != 0 || h == 0 || h % 128 != 0
-                    || experts == 0 || experts > 1024 || topk == 0 || topk > 8 || rows == 0
-                    || rows.checked_mul(topk).and_then(|v| v.checked_mul(h.max(inter))).is_none()
+                if inter == 0
+                    || inter % 128 != 0
+                    || h == 0
+                    || h % 128 != 0
+                    || experts == 0
+                    || experts > 1024
+                    || topk == 0
+                    || topk > 8
+                    || rows == 0
+                    || rows
+                        .checked_mul(topk)
+                        .and_then(|v| v.checked_mul(h.max(inter)))
+                        .is_none()
                     || inst.t[..tensors].contains(&packet::dev::TENSOR_NONE16)
                     || inst.i[immediates..].iter().any(|&v| v != 0)
                 {
                     return Err(RuntimeError::Device(format!(
-                        "invalid routed block128 geometry or operands in {}", path.display()
+                        "invalid routed block128 geometry or operands in {}",
+                        path.display()
                     )));
                 }
             }
         }
-        for inst in prog.insts.iter().filter(|inst| inst.op == DevOp::GemmFp8Block128 as u16) {
+        for inst in prog
+            .insts
+            .iter()
+            .filter(|inst| inst.op == DevOp::GemmFp8Block128 as u16)
+        {
             if inst.i[6] != 0 || inst.i[7] != 0 {
                 let [m, n, k, mfma, n0, n1, selector, reserved] = inst.i;
                 let shape = (selector == 1 && n == 2048) || (selector == 2 && m == 1 && n == 6144);
-                if m == 0 || m.checked_mul(n).is_none() || !shape || k != 2048
-                    || mfma != 16 || n0 != 0 || n1 != 0 || reserved != 0
+                if m == 0
+                    || m.checked_mul(n).is_none()
+                    || !shape
+                    || k != 2048
+                    || mfma != 16
+                    || n0 != 0
+                    || n1 != 0
+                    || reserved != 0
                     || inst.t[..5].contains(&packet::dev::TENSOR_NONE16)
                     || !syms.contains(&"plow_gemm_fp8_block128_qb_1")
                 {
@@ -555,9 +605,16 @@ pub(super) fn check_compiled_opcode_markers<'a>(
             }
             if inst.i[4] != 0 || inst.i[5] != 0 {
                 let [m, n, k, mfma, n0, n1, i6, i7] = inst.i;
-                if mfma != 16 || m == 0 || k == 0 || k % 128 != 0 || n0 == 0 || n1 == 0
+                if mfma != 16
+                    || m == 0
+                    || k == 0
+                    || k % 128 != 0
+                    || n0 == 0
+                    || n1 == 0
                     || n0.checked_add(n1).is_none_or(|s| s >= n)
-                    || m.checked_mul(n.max(k)).is_none() || i6 != 0 || i7 != 0
+                    || m.checked_mul(n.max(k)).is_none()
+                    || i6 != 0
+                    || i7 != 0
                     || inst.t[..7].contains(&packet::dev::TENSOR_NONE16)
                     || !syms.contains(&"plow_gemm_fp8_block128_split3_1")
                 {
@@ -576,19 +633,31 @@ pub(super) fn check_compiled_opcode_markers<'a>(
                 ))),
             }
         }
-        for inst in prog.insts.iter().filter(|inst| inst.op == DevOp::MlaBmmFp8 as u16) {
+        for inst in prog
+            .insts
+            .iter()
+            .filter(|inst| inst.op == DevOp::MlaBmmFp8 as u16)
+        {
             let [m, heads, n, k, rope, i5, i6, i7] = inst.i;
-            if m == 0 || m.checked_mul(8 * 512).is_none() || heads != 8
+            if m == 0
+                || m.checked_mul(8 * 512).is_none()
+                || heads != 8
                 || !matches!((n, k, rope), (512, 192, 1) | (256, 512, 0))
-                || (i5 != 0 && !(i5 == 1024 && rope == 0 && m < 32)) || i6 != 0 || i7 != 0
+                || (i5 != 0 && !(i5 == 1024 && rope == 0 && m < 32))
+                || i6 != 0
+                || i7 != 0
                 || inst.t[..if rope == 1 { 5 } else { 4 }].contains(&packet::dev::TENSOR_NONE16)
             {
                 return Err(RuntimeError::Device(format!(
-                    "invalid MLA FP8 BMM geometry or operands in {}", path.display()
+                    "invalid MLA FP8 BMM geometry or operands in {}",
+                    path.display()
                 )));
             }
         }
-        if prog.insts.iter().any(|inst| inst.op == DevOp::Glu as u16 && inst.i[1] == 5)
+        if prog
+            .insts
+            .iter()
+            .any(|inst| inst.op == DevOp::Glu as u16 && inst.i[1] == 5)
             && !syms.contains(&"plow_glu_silu_bf16_1")
         {
             return Err(RuntimeError::Device(format!(
@@ -596,7 +665,9 @@ pub(super) fn check_compiled_opcode_markers<'a>(
                 path.display()
             )));
         }
-        let required = prog.insts.iter()
+        let required = prog
+            .insts
+            .iter()
             .filter_map(|inst| DevOp::ALL.iter().copied().find(|op| *op as u16 == inst.op));
         check_compiled_opcode_marker_set(syms, path, required)?;
     }
@@ -2116,7 +2187,9 @@ pub(super) fn check_dsa_select_local(
                 let idx_bytes = u64::from(rows) * 2048 * 4;
                 let len_bytes = u64::from(rows) * 4;
                 let capacity = |slot: u16, need: u64| {
-                    tensors.get(usize::from(slot)).is_some_and(|t| t.bytes >= need)
+                    tensors
+                        .get(usize::from(slot))
+                        .is_some_and(|t| t.bytes >= need)
                 };
                 if arch != "gfx950"
                     || !tp8
@@ -2171,7 +2244,9 @@ pub(super) fn check_dsa_select_local(
                 || !(2048..=131072).contains(&d.i[0])
                 || d.i[1..] != geometry
                 || d.fj != [0; 3]
-                || unbound.iter().any(|&i| d.t[i] != packet::dev::TENSOR_NONE16)
+                || unbound
+                    .iter()
+                    .any(|&i| d.t[i] != packet::dev::TENSOR_NONE16)
             {
                 return Err(err());
             }
@@ -2190,7 +2265,13 @@ pub(super) fn check_dsa_select_local(
                     (d.t[6], rows * ctx * 8),
                 ]);
             }
-            if operands.iter().map(|(h, _)| h).collect::<BTreeSet<_>>().len() != operands.len() {
+            if operands
+                .iter()
+                .map(|(h, _)| h)
+                .collect::<BTreeSet<_>>()
+                .len()
+                != operands.len()
+            {
                 return Err(err());
             }
             for (handle, bytes) in operands {
@@ -2226,7 +2307,11 @@ pub(super) fn check_xalltoall_heads(
         )
     };
     for p in progs {
-        for d in p.insts.iter().filter(|d| d.op == DevOp::XAllToAllHeads as u16) {
+        for d in p
+            .insts
+            .iter()
+            .filter(|d| d.op == DevOp::XAllToAllHeads as u16)
+        {
             let (rpr, nh_l, dsz, nh_total, n_gpu, dir, hg) =
                 (d.i[0], d.i[1], d.i[2], d.i[3], d.i[5], d.i[7], d.fj[1]);
             if arch != "gfx942"
@@ -2244,10 +2329,7 @@ pub(super) fn check_xalltoall_heads(
                 return Err(err());
             }
             let bytes = u64::from(rpr) * u64::from(nh_total) * u64::from(dsz) * 2;
-            if tensors
-                .get(d.t[0] as usize)
-                .is_none_or(|t| t.bytes < bytes)
-            {
+            if tensors.get(d.t[0] as usize).is_none_or(|t| t.bytes < bytes) {
                 return Err(err());
             }
         }
@@ -2295,8 +2377,7 @@ pub(super) fn check_sparse_fp8_packet(
             || ctx > 81920
             || rows == 0
             || (decode
-                && (!matches!(rows, 1 | 2 | 4 | 8 | 16 | 32)
-                    && !(gfx950 && rows == 64)
+                && (!matches!(rows, 1 | 2 | 4 | 8 | 16 | 32) && !(gfx950 && rows == 64)
                     || d.i[6] != 2048
                     || d.i[7] != 4))
             || (!decode
@@ -2310,8 +2391,7 @@ pub(super) fn check_sparse_fp8_packet(
                     || !mla_pf_v2_enabled()))
         {
             return Err(RuntimeError::Device(
-                "sparse FP8 MLA requires supported QH8 geometry and V2 prefill routing"
-                    .into(),
+                "sparse FP8 MLA requires supported QH8 geometry and V2 prefill routing".into(),
             ));
         }
         let slots = u64::from(d.i[0]);

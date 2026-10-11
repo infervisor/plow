@@ -67,7 +67,9 @@ impl SlotSet {
 
     /// `false` for a slot past the capacity.
     pub fn contains(&self, slot: usize) -> bool {
-        self.0.get(slot / 64).is_some_and(|w| w & (1 << (slot % 64)) != 0)
+        self.0
+            .get(slot / 64)
+            .is_some_and(|w| w & (1 << (slot % 64)) != 0)
     }
 
     /// Adds `slot`; `false` when it was present or is past the capacity.
@@ -95,10 +97,20 @@ pub fn admit(
     if row_limit == 0 || capacity == 0 {
         return PrefillPack::default();
     }
-    let mut valid = valid_spans(candidates.into_iter().map(|span| (0, span)), row_limit, capacity, policy);
+    let mut valid = valid_spans(
+        candidates.into_iter().map(|span| (0, span)),
+        row_limit,
+        capacity,
+        policy,
+    );
     let start = (start % capacity) as u32;
     valid.sort_unstable_by_key(|&(_, span)| (span.slot < start, span.slot));
-    pack_in_order(valid.iter().map(|&(_, span)| span), row_limit, policy, program_rows)
+    pack_in_order(
+        valid.iter().map(|&(_, span)| span),
+        row_limit,
+        policy,
+        program_rows,
+    )
 }
 
 /// [`admit`] in arrival order instead of slot rotation: the oldest candidate (smallest
@@ -115,7 +127,12 @@ pub fn admit_oldest_first(
     }
     let mut valid = valid_spans(candidates, row_limit, capacity, policy);
     valid.sort_unstable_by_key(|&(arrival, span)| (arrival, span.slot));
-    pack_in_order(valid.iter().map(|&(_, span)| span), row_limit, policy, program_rows)
+    pack_in_order(
+        valid.iter().map(|&(_, span)| span),
+        row_limit,
+        policy,
+        program_rows,
+    )
 }
 
 type Valid = SmallVec<[(u64, PrefillSpan); INLINE_SPANS]>;
@@ -135,7 +152,8 @@ fn valid_spans(
                 && span.state_slot == span.slot
                 && span.kv_row0.checked_add(span.n_rows) == Some(span.kv_len)
                 && (policy != SpanPolicy::Whole || span.n_rows <= row_limit)
-                && usize::try_from(span.slot).is_ok_and(|slot| slot < capacity && occupied.insert(slot))
+                && usize::try_from(span.slot)
+                    .is_ok_and(|slot| slot < capacity && occupied.insert(slot))
         })
         .collect()
 }
@@ -248,7 +266,12 @@ mod tests {
     #[test]
     fn oldest_first_orders_by_arrival_then_slot() {
         let pack = admit_oldest_first(
-            [(5, span(0, 0, 100, 7)), (1, span(1, 0, 100, 7)), (1, span(2, 0, 100, 7)), (0, span(3, 0, 100, 9))],
+            [
+                (5, span(0, 0, 100, 7)),
+                (1, span(1, 0, 100, 7)),
+                (1, span(2, 0, 100, 7)),
+                (0, span(3, 0, 100, 9)),
+            ],
             150,
             4,
             SpanPolicy::Greedy,
@@ -257,14 +280,21 @@ mod tests {
         // Slot 3 is the oldest and fixes the program; only its program's candidates pack.
         assert_eq!(pack.spans().iter().map(|s| s.slot).collect::<Vec<_>>(), [3]);
         let pack = admit_oldest_first(
-            [(5, span(0, 0, 100, 7)), (1, span(2, 0, 100, 7)), (1, span(1, 0, 100, 7))],
+            [
+                (5, span(0, 0, 100, 7)),
+                (1, span(2, 0, 100, 7)),
+                (1, span(1, 0, 100, 7)),
+            ],
             150,
             4,
             SpanPolicy::Greedy,
             |_| Some(256),
         );
         assert_eq!(
-            pack.spans().iter().map(|s| (s.slot, s.row0, s.n_rows)).collect::<Vec<_>>(),
+            pack.spans()
+                .iter()
+                .map(|s| (s.slot, s.row0, s.n_rows))
+                .collect::<Vec<_>>(),
             [(1, 0, 100), (2, 100, 50)]
         );
     }
@@ -401,19 +431,55 @@ mod tests {
         );
         assert_eq!(pack.spans().len(), 1);
         assert_eq!(pack.spans()[0].slot, 0);
-        assert!(admit([span(5, 0, 1, 0)], 1, 0, 5, SpanPolicy::FairSplit, |_| Some(1)).spans().is_empty());
+        assert!(admit(
+            [span(5, 0, 1, 0)],
+            1,
+            0,
+            5,
+            SpanPolicy::FairSplit,
+            |_| Some(1)
+        )
+        .spans()
+        .is_empty());
     }
 
     /// Slots past 128 (an E4B/26B table of 256) are packed like any other, in both orders.
     #[test]
     fn slots_past_128_are_admitted() {
-        let cands = || [span(200, 0, 64, 0), span(129, 0, 64, 0), span(3, 0, 64, 0), span(255, 0, 64, 0)];
+        let cands = || {
+            [
+                span(200, 0, 64, 0),
+                span(129, 0, 64, 0),
+                span(3, 0, 64, 0),
+                span(255, 0, 64, 0),
+            ]
+        };
         let pack = admit(cands(), 192, 130, 256, SpanPolicy::Whole, |_| Some(256));
-        assert_eq!(pack.spans().iter().map(|s| s.slot).collect::<Vec<_>>(), [200, 255, 3]);
-        let aged = [(9, span(200, 0, 64, 0)), (1, span(255, 0, 64, 0)), (5, span(129, 0, 64, 0))];
+        assert_eq!(
+            pack.spans().iter().map(|s| s.slot).collect::<Vec<_>>(),
+            [200, 255, 3]
+        );
+        let aged = [
+            (9, span(200, 0, 64, 0)),
+            (1, span(255, 0, 64, 0)),
+            (5, span(129, 0, 64, 0)),
+        ];
         let pack = admit_oldest_first(aged, 256, 256, SpanPolicy::Greedy, |_| Some(256));
-        assert_eq!(pack.spans().iter().map(|s| (s.slot, s.row0)).collect::<Vec<_>>(), [(255, 0), (129, 64), (200, 128)]);
-        let wide = admit((0..300).map(|slot| span(slot, 0, 1, 0)), 300, 0, 300, SpanPolicy::Whole, |_| Some(300));
+        assert_eq!(
+            pack.spans()
+                .iter()
+                .map(|s| (s.slot, s.row0))
+                .collect::<Vec<_>>(),
+            [(255, 0), (129, 64), (200, 128)]
+        );
+        let wide = admit(
+            (0..300).map(|slot| span(slot, 0, 1, 0)),
+            300,
+            0,
+            300,
+            SpanPolicy::Whole,
+            |_| Some(300),
+        );
         assert_eq!(wide.spans().len(), 300);
         assert_eq!(wide.last_slot(), Some(299));
     }
@@ -487,10 +553,7 @@ mod tests {
 
     #[test]
     fn greedy_allocates_full_capacity_to_first_candidate() {
-        let candidates = [
-            span(0, 0, 4096, 0),
-            span(1, 0, 4096, 0),
-        ];
+        let candidates = [span(0, 0, 4096, 0), span(1, 0, 4096, 0)];
         let pack = admit(candidates, 4096, 0, 2, SpanPolicy::Greedy, |_| Some(4096));
         assert_eq!(pack.spans().len(), 1);
         assert_eq!(pack.spans()[0].slot, 0);
@@ -499,10 +562,7 @@ mod tests {
 
     #[test]
     fn greedy_spills_leftover_to_next_candidate() {
-        let candidates = [
-            span(0, 0, 1500, 0),
-            span(1, 0, 4096, 0),
-        ];
+        let candidates = [span(0, 0, 1500, 0), span(1, 0, 4096, 0)];
         let pack = admit(candidates, 4096, 0, 2, SpanPolicy::Greedy, |_| Some(4096));
         assert_eq!(pack.spans().len(), 2);
         assert_eq!(pack.spans()[0].slot, 0);

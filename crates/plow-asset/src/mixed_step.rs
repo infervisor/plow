@@ -1,7 +1,7 @@
 use crate::aux_program;
 use packet::dev::{
-    DevOp, PrefillSpan, PREFILL_SPAN_DECODE, PREFILL_SPAN_RESET_STATE,
-    PREFILL_SPAN_SAMPLE, TENSOR_NONE16,
+    DevOp, PrefillSpan, PREFILL_SPAN_DECODE, PREFILL_SPAN_RESET_STATE, PREFILL_SPAN_SAMPLE,
+    TENSOR_NONE16,
 };
 use packet::devbuild::{SECT_CUBIN, SECT_HSACO, SECT_NAME_LEN, SECT_PROGRAMS};
 use serde::{Deserialize, Serialize};
@@ -293,11 +293,7 @@ fn plan_into_inner(
         .ok_or("mixed step: active request overflow")?;
     // PrefixFree turns every request into exactly one span.
     let prefix_free = cover == SpanCover::PrefixFree;
-    let span_capacity = if prefix_free {
-        active
-    } else {
-        prefill.len()
-    };
+    let span_capacity = if prefix_free { active } else { prefill.len() };
     let leading_capacity = if prefix_free { active } else { decode.len() };
     require(
         out.rows.capacity() >= capacity
@@ -471,8 +467,8 @@ fn plan_into_inner(
             .ok_or("mixed step: padding owner mapping")?;
         end.1 = padded_end;
     }
-    out.decode_rows = u32::try_from(out.decode_slots.len())
-        .map_err(|_| "mixed step: sampled row count")?;
+    out.decode_rows =
+        u32::try_from(out.decode_slots.len()).map_err(|_| "mixed step: sampled row count")?;
     out.real_rows = real_rows;
     Ok(())
 }
@@ -493,7 +489,10 @@ fn plan_slot_band_inner(
     band: u32,
     out: &mut Plan,
 ) -> Result<()> {
-    require(band > 0 && band <= rows, "slot band width outside the row capacity")?;
+    require(
+        band > 0 && band <= rows,
+        "slot band width outside the row capacity",
+    )?;
     let capacity = usize::try_from(rows).map_err(|_| "mixed step: row capacity")?;
     let band_rows = band as usize;
     let active = decode
@@ -753,7 +752,10 @@ pub fn validate_slot_band(plan: &Plan, slot_capacity: usize, max_ctx: u32) -> Re
     )?;
     let mut row = band;
     for (index, span) in plan.prefill_spans.iter().enumerate() {
-        require(span.row0 == row && span.n_rows > 0, "span is not dense after the band")?;
+        require(
+            span.row0 == row && span.n_rows > 0,
+            "span is not dense after the band",
+        )?;
         require(
             span.flags & !PREFILL_SPAN_RESET_STATE == 0
                 && (span.flags & PREFILL_SPAN_RESET_STATE != 0) == (span.kv_row0 == 0),
@@ -801,7 +803,9 @@ pub fn validate_slot_band(plan: &Plan, slot_capacity: usize, max_ctx: u32) -> Re
     require(row as usize == real, "spans do not end at real_rows")?;
     require(
         plan.parked[real..].iter().all(|&v| v == 1)
-            && plan.rows[real..].iter().all(|r| r.phase == RowPhase::Parked),
+            && plan.rows[real..]
+                .iter()
+                .all(|r| r.phase == RowPhase::Parked),
         "padding is not parked",
     )?;
     Ok(())
@@ -1534,11 +1538,14 @@ pub fn dense_amd_capacity_consumer_contract(
                 require(inst.i[0] == program.rows, "mixed dynamic body row capacity")?;
             }
             Some(DevOp::RmsNorm) => {
-                let gathered = program.insts.get(index.wrapping_sub(1)).is_some_and(|gather| {
-                    gather.op == DevOp::RowGather as u16
-                        && gather.t[0] == inst.t[1]
-                        && gather.i[0] == decode_capacity
-                });
+                let gathered = program
+                    .insts
+                    .get(index.wrapping_sub(1))
+                    .is_some_and(|gather| {
+                        gather.op == DevOp::RowGather as u16
+                            && gather.t[0] == inst.t[1]
+                            && gather.i[0] == decode_capacity
+                    });
                 require(
                     inst.i[0] == program.rows || (inst.i[0] == decode_capacity && gathered),
                     "mixed dynamic norm row capacity",

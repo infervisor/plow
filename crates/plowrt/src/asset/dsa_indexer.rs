@@ -276,17 +276,27 @@ fn f32_to_bf16_bits(x: f32) -> u16 {
 mod tests {
     use super::*;
 
-    fn indexer_checkpoint(name: &str, scale_shape: Option<[usize; 2]>, scale_dtype: &str) -> Checkpoint {
+    fn indexer_checkpoint(
+        name: &str,
+        scale_shape: Option<[usize; 2]>,
+        scale_dtype: &str,
+    ) -> Checkpoint {
         let mut header = serde_json::Map::new();
-        header.insert(name.into(), serde_json::json!({
-            "dtype": "F8_E4M3", "shape": [128, 256], "data_offsets": [0, 32768]
-        }));
+        header.insert(
+            name.into(),
+            serde_json::json!({
+                "dtype": "F8_E4M3", "shape": [128, 256], "data_offsets": [0, 32768]
+            }),
+        );
         let mut payload = vec![0x38; 32768];
         if let Some(shape) = scale_shape {
             let size = shape.iter().product::<usize>() * if scale_dtype == "F32" { 4 } else { 2 };
-            header.insert(format!("{name}_scale_inv"), serde_json::json!({
-                "dtype": scale_dtype, "shape": shape, "data_offsets": [32768, 32768 + size]
-            }));
+            header.insert(
+                format!("{name}_scale_inv"),
+                serde_json::json!({
+                    "dtype": scale_dtype, "shape": shape, "data_offsets": [32768, 32768 + size]
+                }),
+            );
             payload.resize(32768 + size, 0);
         }
         let mut encoded = serde_json::to_vec(&header).unwrap();
@@ -294,8 +304,14 @@ mod tests {
         let mut bytes = (encoded.len() as u64).to_le_bytes().to_vec();
         bytes.extend(encoded);
         bytes.extend(payload);
-        let dir = std::env::temp_dir().join(format!("plow-indexer-fixture-{}-{}",
-            std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        let dir = std::env::temp_dir().join(format!(
+            "plow-indexer-fixture-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
         std::fs::create_dir(&dir).unwrap();
         let path = dir.join("test.safetensors");
         std::fs::write(&path, bytes).unwrap();
@@ -309,8 +325,14 @@ mod tests {
     fn native_wq_keeps_original_bytes_and_validates_scales() {
         let name = "model.layers.6.self_attn.indexer.wq_b.weight";
         let ckpt = indexer_checkpoint(name, Some([1, 2]), "F32");
-        assert!(matches!(plan(&ckpt, name, 32768).unwrap().unwrap(), Plan::AsIs));
-        assert!(matches!(plan(&ckpt, name, 65536).unwrap().unwrap(), Plan::Upcast { .. }));
+        assert!(matches!(
+            plan(&ckpt, name, 32768).unwrap().unwrap(),
+            Plan::AsIs
+        ));
+        assert!(matches!(
+            plan(&ckpt, name, 65536).unwrap().unwrap(),
+            Plan::Upcast { .. }
+        ));
         assert!(plan(&ckpt, name, 32767).unwrap().is_err());
         for (shape, dtype) in [(None, "F32"), (Some([2, 1]), "F32"), (Some([1, 2]), "BF16")] {
             let invalid = indexer_checkpoint(name, shape, dtype);
@@ -320,7 +342,10 @@ mod tests {
         let name = "model.layers.6.self_attn.indexer.wk.weight";
         let ckpt = indexer_checkpoint(name, Some([1, 2]), "F32");
         assert!(plan(&ckpt, name, 32768).unwrap().is_err());
-        assert!(matches!(plan(&ckpt, name, 65536).unwrap().unwrap(), Plan::Upcast { .. }));
+        assert!(matches!(
+            plan(&ckpt, name, 65536).unwrap().unwrap(),
+            Plan::Upcast { .. }
+        ));
     }
 
     #[test]
@@ -328,19 +353,30 @@ mod tests {
     fn native_wq_binds_every_full_glm_layer_without_upcast() {
         let dir = std::env::var("PLOW_DSA_VERIFY_CKPT").expect("set PLOW_DSA_VERIFY_CKPT");
         let path = std::path::Path::new(&dir);
-        let config: serde_json::Value = serde_json::from_slice(&std::fs::read(path.join("config.json")).unwrap()).unwrap();
-        let layers = config["indexer_types"].as_array().expect("GLM indexer layer types");
+        let config: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path.join("config.json")).unwrap()).unwrap();
+        let layers = config["indexer_types"]
+            .as_array()
+            .expect("GLM indexer layer types");
         let ckpt = Checkpoint::open(path).unwrap();
         let mut full = 0;
         for (layer, kind) in layers.iter().enumerate() {
-            if kind.as_str() != Some("full") { continue; }
+            if kind.as_str() != Some("full") {
+                continue;
+            }
             let name = format!("model.layers.{layer}.self_attn.indexer.wq_b.weight");
             let (bytes, shape) = ckpt.tensor_ex(&name).unwrap();
             assert_eq!(ckpt.dtype(&name), Some(Dtype::F8_E4M3));
             assert_eq!(shape, &[4096, 2048]);
             assert_eq!(bytes.len(), 4096 * 2048);
-            assert!(matches!(plan(&ckpt, &name, 4096 * 2048).unwrap().unwrap(), Plan::AsIs));
-            assert_eq!(crate::asset::shard::shard_of(&name), crate::asset::shard::Shard::Replicated);
+            assert!(matches!(
+                plan(&ckpt, &name, 4096 * 2048).unwrap().unwrap(),
+                Plan::AsIs
+            ));
+            assert_eq!(
+                crate::asset::shard::shard_of(&name),
+                crate::asset::shard::Shard::Replicated
+            );
             full += 1;
         }
         assert_eq!(full, 21);
@@ -380,7 +416,11 @@ mod tests {
                 continue;
             }
             let back = f32::from_bits((f32_to_bf16_bits(v) as u32) << 16);
-            assert_eq!(v.to_bits(), back.to_bits(), "{b:#04x} = {v} lost bits in bf16");
+            assert_eq!(
+                v.to_bits(),
+                back.to_bits(),
+                "{b:#04x} = {v} lost bits in bf16"
+            );
         }
         // Anchors, read off the format rather than off this implementation.
         assert_eq!(t[0x00], 0.0);

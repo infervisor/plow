@@ -109,11 +109,24 @@ pub fn span_safe_rows(prompt: &[u32], start: usize, rows: usize, stage: usize) -
 
 /// As [`span_safe_rows`], but a run that begins at `start` and does not fit is taken whole when
 /// it fits `limit` rows and one stage (a request must make progress past its own span).
-pub fn span_chunk_rows(prompt: &[u32], start: usize, rows: usize, limit: usize, stage: usize) -> usize {
+pub fn span_chunk_rows(
+    prompt: &[u32],
+    start: usize,
+    rows: usize,
+    limit: usize,
+    stage: usize,
+) -> usize {
     match span_safe_rows(prompt, start, rows, stage) {
         0 => {
-            let run = prompt[start..].iter().take_while(|&&id| is_span_id(id)).count();
-            if run <= limit && (stage == 0 || run <= stage) { run } else { 0 }
+            let run = prompt[start..]
+                .iter()
+                .take_while(|&&id| is_span_id(id))
+                .count();
+            if run <= limit && (stage == 0 || run <= stage) {
+                run
+            } else {
+                0
+            }
         }
         safe => safe,
     }
@@ -131,7 +144,13 @@ pub enum Processor {
 }
 
 /// (processor, name, modality kind, required parameters, optional parameters).
-type ProcessorSpec = (Processor, &'static str, &'static str, &'static [&'static str], &'static [&'static str]);
+type ProcessorSpec = (
+    Processor,
+    &'static str,
+    &'static str,
+    &'static [&'static str],
+    &'static [&'static str],
+);
 
 impl Processor {
     /// Every implemented processor. A contract naming anything else, or a parameter outside these
@@ -142,7 +161,17 @@ impl Processor {
             "aspect_patches",
             "image",
             &["patch_size", "pool", "max_soft_tokens"],
-            &["rescale_f32", "resample", "normalize", "mean0_f32", "mean1_f32", "mean2_f32", "std0_f32", "std1_f32", "std2_f32"],
+            &[
+                "rescale_f32",
+                "resample",
+                "normalize",
+                "mean0_f32",
+                "mean1_f32",
+                "mean2_f32",
+                "std0_f32",
+                "std1_f32",
+                "std2_f32",
+            ],
         ),
         (
             Processor::SemicausalLogMel,
@@ -158,9 +187,20 @@ impl Processor {
                 "max_frequency_f32",
                 "mel_floor_f32",
             ],
-            &["pad_multiple", "max_samples", "subsample", "max_soft_tokens"],
+            &[
+                "pad_multiple",
+                "max_samples",
+                "subsample",
+                "max_soft_tokens",
+            ],
         ),
-        (Processor::WaveformFrames, "waveform_frames", "audio", &["sample_rate", "frame_samples", "max_soft_tokens"], &[]),
+        (
+            Processor::WaveformFrames,
+            "waveform_frames",
+            "audio",
+            &["sample_rate", "frame_samples", "max_soft_tokens"],
+            &[],
+        ),
     ];
 
     pub fn name(self) -> &'static str {
@@ -177,14 +217,25 @@ impl MmModality {
     }
 
     pub fn param_f32(&self, key: &str) -> Option<f32> {
-        self.param(key).and_then(|v| u32::try_from(v).ok()).map(f32::from_bits)
+        self.param(key)
+            .and_then(|v| u32::try_from(v).ok())
+            .map(f32::from_bits)
     }
 
     /// The processor this modality names, with its parameters checked. `Err` only on a contract
     /// [`MmContract::validate`] refuses.
     pub fn processor(&self) -> Result<Processor, String> {
-        let known = |kind: &str| Processor::ALL.iter().filter(|p| p.2 == kind).map(|p| p.1).collect::<Vec<_>>().join(", ");
-        let Some(&(p, _, kind, required, optional)) = Processor::ALL.iter().find(|p| p.1 == self.processor) else {
+        let known = |kind: &str| {
+            Processor::ALL
+                .iter()
+                .filter(|p| p.2 == kind)
+                .map(|p| p.1)
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let Some(&(p, _, kind, required, optional)) =
+            Processor::ALL.iter().find(|p| p.1 == self.processor)
+        else {
             return Err(format!(
                 "{} processor {:?} is not implemented by this runtime (it knows: {}); upgrade plowrt, or rebuild the \
                  packet with a plowc whose emitter names a known processor",
@@ -208,24 +259,40 @@ impl MmModality {
                 self.kind, self.processor
             ));
         }
-        if let Some(key) = self.parameters.keys().find(|k| !required.contains(&k.as_str()) && !optional.contains(&k.as_str())) {
+        if let Some(key) = self
+            .parameters
+            .keys()
+            .find(|k| !required.contains(&k.as_str()) && !optional.contains(&k.as_str()))
+        {
             return Err(format!(
                 "{} processor {:?} has parameter {key:?}, which this runtime does not implement; upgrade plowrt",
                 self.kind, self.processor
             ));
         }
-        if let Some(r) = self.param("resample").filter(|&r| p == Processor::AspectPatches && r != RESAMPLE_BICUBIC) {
+        if let Some(r) = self
+            .param("resample")
+            .filter(|&r| p == Processor::AspectPatches && r != RESAMPLE_BICUBIC)
+        {
             return Err(format!(
                 "image resample filter {r} is not implemented (only PIL bicubic, {RESAMPLE_BICUBIC}); upgrade plowrt"
             ));
         }
         let positive: &[&str] = match p {
             Processor::AspectPatches => &["patch_size", "pool", "max_soft_tokens"],
-            Processor::SemicausalLogMel => &["sample_rate", "frame_length", "hop_length", "fft_length", "mel_bins"],
+            Processor::SemicausalLogMel => &[
+                "sample_rate",
+                "frame_length",
+                "hop_length",
+                "fft_length",
+                "mel_bins",
+            ],
             Processor::WaveformFrames => &["sample_rate", "frame_samples", "max_soft_tokens"],
         };
         if let Some(key) = positive.iter().find(|k| self.param(k) == Some(0)) {
-            return Err(format!("{} processor {:?} has {key} = 0; rebuild the packet", self.kind, self.processor));
+            return Err(format!(
+                "{} processor {:?} has {key} = 0; rebuild the packet",
+                self.kind, self.processor
+            ));
         }
         Ok(p)
     }
@@ -239,13 +306,15 @@ impl MmContract {
         struct Version {
             version: Option<u32>,
         }
-        let v: Version = serde_json::from_slice(bytes).map_err(|e| format!("multimodal contract: {e}"))?;
+        let v: Version =
+            serde_json::from_slice(bytes).map_err(|e| format!("multimodal contract: {e}"))?;
         match v.version {
             Some(VERSION) => {}
             Some(other) => return Err(unsupported_version(other)),
             None => return Err("multimodal contract has no version; rebuild the packet".into()),
         }
-        let c: Self = serde_json::from_slice(bytes).map_err(|e| format!("multimodal contract: {e}"))?;
+        let c: Self =
+            serde_json::from_slice(bytes).map_err(|e| format!("multimodal contract: {e}"))?;
         c.validate()?;
         Ok(c)
     }
@@ -254,12 +323,22 @@ impl MmContract {
         if self.version != VERSION {
             return Err(unsupported_version(self.version));
         }
-        let bad = |what: String| Err(format!("invalid multimodal contract: {what}; rebuild the packet"));
+        let bad = |what: String| {
+            Err(format!(
+                "invalid multimodal contract: {what}; rebuild the packet"
+            ))
+        };
         if self.hidden == 0 || self.slab_rows == 0 {
-            return bad(format!("hidden {} and slab_rows {} must be positive", self.hidden, self.slab_rows));
+            return bad(format!(
+                "hidden {} and slab_rows {} must be positive",
+                self.hidden, self.slab_rows
+            ));
         }
         if !self.table_capacity.is_power_of_two() || self.table_capacity < self.slab_rows {
-            return bad(format!("table_capacity {} must be a power of two >= slab_rows {}", self.table_capacity, self.slab_rows));
+            return bad(format!(
+                "table_capacity {} must be a power of two >= slab_rows {}",
+                self.table_capacity, self.slab_rows
+            ));
         }
         if self.modalities.is_empty() {
             return bad("no modalities".into());
@@ -269,19 +348,35 @@ impl MmContract {
                 return bad(format!("modality kind {:?} (known: image, audio)", m.kind));
             }
             if !m.attention.is_causal() && (m.begin.is_none() || m.end.is_none()) {
-                return bad(format!("the {} modality attends within spans but has no begin/end tokens", m.kind));
+                return bad(format!(
+                    "the {} modality attends within spans but has no begin/end tokens",
+                    m.kind
+                ));
             }
             if self.modalities[..i].iter().any(|o| o.kind == m.kind) {
                 return bad(format!("two {} modalities", m.kind));
             }
-            if self.modalities[..i].iter().any(|o| o.placeholder == m.placeholder) {
-                return bad(format!("placeholder {} serves two modalities", m.placeholder));
+            if self.modalities[..i]
+                .iter()
+                .any(|o| o.placeholder == m.placeholder)
+            {
+                return bad(format!(
+                    "placeholder {} serves two modalities",
+                    m.placeholder
+                ));
             }
             if m.packet.is_empty() {
                 return bad(format!("the {} modality names no encoder packet", m.kind));
             }
-            if [Some(m.placeholder), m.begin, m.end].into_iter().flatten().any(|t| t & ROW_ID_BIT != 0) {
-                return bad(format!("{} placeholder/begin/end ids may not set bit 31", m.kind));
+            if [Some(m.placeholder), m.begin, m.end]
+                .into_iter()
+                .flatten()
+                .any(|t| t & ROW_ID_BIT != 0)
+            {
+                return bad(format!(
+                    "{} placeholder/begin/end ids may not set bit 31",
+                    m.kind
+                ));
             }
             m.processor()?;
         }
@@ -317,10 +412,22 @@ mod tests {
         let p = [1, 2, 3, 4, S, S, S, S, 5, 6];
         assert_eq!(span_safe_rows(&p, 0, 10, 0), 10);
         assert_eq!(span_safe_rows(&p, 0, 6, 0), 4, "cut back to the span start");
-        assert_eq!(span_safe_rows(&p, 0, 8, 0), 8, "ending at the span end is safe");
+        assert_eq!(
+            span_safe_rows(&p, 0, 8, 0),
+            8,
+            "ending at the span end is safe"
+        );
         assert_eq!(span_safe_rows(&p, 0, 4, 0), 4);
-        assert_eq!(span_safe_rows(&p, 4, 2, 0), 0, "a span at the start needs the whole run");
-        assert_eq!(span_safe_rows(&p, 5, 5, 0), 5, "a prefix-cache hit inside the span continues it");
+        assert_eq!(
+            span_safe_rows(&p, 4, 2, 0),
+            0,
+            "a span at the start needs the whole run"
+        );
+        assert_eq!(
+            span_safe_rows(&p, 5, 5, 0),
+            5,
+            "a prefix-cache hit inside the span continues it"
+        );
         // Causal media ids never constrain.
         let q = [1, A, A, A, 2];
         assert_eq!(span_safe_rows(&q, 0, 2, 0), 2);
@@ -356,7 +463,11 @@ mod tests {
         let q = [1, 2, 3, 4, S, S, S, S, S, 5];
         assert_eq!(span_chunk_rows(&q, 4, 2, 4096, 4), 0);
         assert_eq!(span_chunk_rows(&q, 4, 6, 4096, 4), 0);
-        assert_eq!(span_chunk_rows(&q, 4, 2, 4096, 8), 5, "a wider stage holds it");
+        assert_eq!(
+            span_chunk_rows(&q, 4, 2, 4096, 8),
+            5,
+            "a wider stage holds it"
+        );
         assert_eq!(span_chunk_rows(&q, 4, 2, 4096, 0), 5);
         // A span starting exactly on a later boundary is a plain safe cut, not the whole-run case.
         let r = [1, 2, 3, 4, S, S, S, 5];
@@ -382,8 +493,13 @@ mod tests {
             attention: MediaAttention::Causal,
         };
         assert!(!serde_json::to_string(&m).unwrap().contains("attention"));
-        let span = MmModality { attention: MediaAttention::BidirectionalSpan, ..m };
-        assert!(serde_json::to_string(&span).unwrap().contains("\"attention\":\"bidirectional_span\""));
+        let span = MmModality {
+            attention: MediaAttention::BidirectionalSpan,
+            ..m
+        };
+        assert!(serde_json::to_string(&span)
+            .unwrap()
+            .contains("\"attention\":\"bidirectional_span\""));
     }
 }
 
@@ -410,7 +526,12 @@ mod contract_tests {
             begin: Some(8),
             end: Some(9),
             processor: "aspect_patches".into(),
-            parameters: params(&[("patch_size", 16), ("pool", 3), ("max_soft_tokens", 280), ("resample", 3)]),
+            parameters: params(&[
+                ("patch_size", 16),
+                ("pool", 3),
+                ("max_soft_tokens", 280),
+                ("resample", 3),
+            ]),
             attention: MediaAttention::Causal,
         }
     }
@@ -423,13 +544,24 @@ mod contract_tests {
             begin: None,
             end: None,
             processor: "waveform_frames".into(),
-            parameters: params(&[("sample_rate", 16_000), ("frame_samples", 640), ("max_soft_tokens", 750)]),
+            parameters: params(&[
+                ("sample_rate", 16_000),
+                ("frame_samples", 640),
+                ("max_soft_tokens", 750),
+            ]),
             attention: MediaAttention::Causal,
         }
     }
 
     fn contract(modalities: Vec<MmModality>) -> MmContract {
-        MmContract { version: VERSION, hidden: 4, pad_token: 0, slab_rows: 8, table_capacity: 16, modalities }
+        MmContract {
+            version: VERSION,
+            hidden: 4,
+            pad_token: 0,
+            slab_rows: 8,
+            table_capacity: 16,
+            modalities,
+        }
     }
 
     fn refused(c: &MmContract, needle: &str) {
@@ -441,8 +573,14 @@ mod contract_tests {
     fn known_processors_validate_and_dispatch() {
         let c = contract(vec![image(), frames()]);
         c.validate().unwrap();
-        assert_eq!(c.modality("image").unwrap().processor(), Ok(Processor::AspectPatches));
-        assert_eq!(c.modality("audio").unwrap().processor(), Ok(Processor::WaveformFrames));
+        assert_eq!(
+            c.modality("image").unwrap().processor(),
+            Ok(Processor::AspectPatches)
+        );
+        assert_eq!(
+            c.modality("audio").unwrap().processor(),
+            Ok(Processor::WaveformFrames)
+        );
         assert_eq!(Processor::SemicausalLogMel.name(), "semicausal_log_mel");
     }
 
@@ -450,7 +588,10 @@ mod contract_tests {
     fn unknown_or_mislabelled_processors_are_refused() {
         let mut m = frames();
         m.processor = "log_mel_v2".into();
-        refused(&contract(vec![m]), "not implemented by this runtime (it knows: semicausal_log_mel, waveform_frames)");
+        refused(
+            &contract(vec![m]),
+            "not implemented by this runtime (it knows: semicausal_log_mel, waveform_frames)",
+        );
         let mut m = image();
         m.processor = "waveform_frames".into();
         refused(&contract(vec![m]), "serves audio parts, not image");
@@ -463,10 +604,16 @@ mod contract_tests {
     fn missing_unknown_and_unsupported_parameters_are_refused() {
         let mut m = frames();
         m.parameters.remove("frame_samples");
-        refused(&contract(vec![m]), "lacks required parameter \"frame_samples\"");
+        refused(
+            &contract(vec![m]),
+            "lacks required parameter \"frame_samples\"",
+        );
         let mut m = frames();
         m.parameters.insert("preemphasis_f32".into(), 1);
-        refused(&contract(vec![m]), "parameter \"preemphasis_f32\", which this runtime does not implement");
+        refused(
+            &contract(vec![m]),
+            "parameter \"preemphasis_f32\", which this runtime does not implement",
+        );
         let mut m = image();
         m.parameters.insert("resample".into(), 2);
         refused(&contract(vec![m]), "only PIL bicubic");
@@ -480,7 +627,10 @@ mod contract_tests {
         refused(&contract(vec![image(), image()]), "two image modalities");
         let mut a = frames();
         a.placeholder = 7;
-        refused(&contract(vec![image(), a]), "placeholder 7 serves two modalities");
+        refused(
+            &contract(vec![image(), a]),
+            "placeholder 7 serves two modalities",
+        );
         let mut a = frames();
         a.end = Some(ROW_ID_BIT | 3);
         refused(&contract(vec![a]), "may not set bit 31");
@@ -493,15 +643,23 @@ mod contract_tests {
     #[test]
     fn versions_are_read_before_the_body() {
         let c = contract(vec![image(), frames()]);
-        assert_eq!(MmContract::from_json(&serde_json::to_vec(&c).unwrap()).unwrap(), c);
+        assert_eq!(
+            MmContract::from_json(&serde_json::to_vec(&c).unwrap()).unwrap(),
+            c
+        );
         let mut v2 = serde_json::to_value(&c).unwrap();
         v2["version"] = 2.into();
         v2["new_field"] = true.into();
         let err = MmContract::from_json(&serde_json::to_vec(&v2).unwrap()).unwrap_err();
-        assert!(err.contains("version 2 is not supported (this runtime reads version 1)"), "{err}");
+        assert!(
+            err.contains("version 2 is not supported (this runtime reads version 1)"),
+            "{err}"
+        );
         let mut c0 = c.clone();
         c0.version = 0;
         assert!(c0.validate().unwrap_err().contains("version 0"));
-        assert!(MmContract::from_json(b"{}").unwrap_err().contains("no version"));
+        assert!(MmContract::from_json(b"{}")
+            .unwrap_err()
+            .contains("no version"));
     }
 }

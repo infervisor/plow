@@ -81,7 +81,8 @@ impl Cell {
             None => (size, ms),
         };
         self.size.store(s.to_bits(), Ordering::Relaxed);
-        self.ms.store(m.max(f64::MIN_POSITIVE).to_bits(), Ordering::Relaxed);
+        self.ms
+            .store(m.max(f64::MIN_POSITIVE).to_bits(), Ordering::Relaxed);
     }
 }
 
@@ -102,7 +103,10 @@ pub fn id(model: &str) -> usize {
     if let Some(i) = w.iter().position(|m| &*m.name == model) {
         return i;
     }
-    w.push(Box::leak(Box::new(Model { name: model.into(), cells: Default::default() })));
+    w.push(Box::leak(Box::new(Model {
+        name: model.into(),
+        cells: Default::default(),
+    })));
     w.len() - 1
 }
 
@@ -143,14 +147,20 @@ pub fn estimate_id(id: usize, op: Op) -> Duration {
 fn estimate_ms(cells: &[Cell; BUCKETS + 1], op: Op) -> f64 {
     let x = op.size();
     if x <= 0.0 {
-        return cells[ANY].get().map_or_else(|| op.cold_ms(op.cold().2), |(_, ms)| ms);
+        return cells[ANY]
+            .get()
+            .map_or_else(|| op.cold_ms(op.cold().2), |(_, ms)| ms);
     }
     let b = bucket(x);
-    let lo = (0..=b).rev().find_map(|i| cells[i].get().filter(|&(s, _)| s <= x));
+    let lo = (0..=b)
+        .rev()
+        .find_map(|i| cells[i].get().filter(|&(s, _)| s <= x));
     let hi = (b..BUCKETS).find_map(|i| cells[i].get().filter(|&(s, _)| s >= x));
     let shaped = |(s, ms): (f64, f64)| ms * op.cold_ms(x) / op.cold_ms(s);
     match (lo, hi) {
-        (Some(l), Some(h)) if h.0 - l.0 > f64::EPSILON => l.1 + (h.1 - l.1) * (x - l.0) / (h.0 - l.0),
+        (Some(l), Some(h)) if h.0 - l.0 > f64::EPSILON => {
+            l.1 + (h.1 - l.1) * (x - l.0) / (h.0 - l.0)
+        }
         (Some(p), _) | (None, Some(p)) => shaped(p),
         (None, None) => op.cold_ms(x),
     }
@@ -169,7 +179,10 @@ mod tests {
         let m = "cost-test-cold";
         assert!((ms(estimate(m, Op::Render { streams: 16 })) - 440.0).abs() < 1e-6);
         assert!((ms(estimate(m, Op::Prefill { rows: 1000 })) - 44.0).abs() < 1e-6);
-        assert!((ms(estimate(m, Op::Prefill { rows: 0 })) - op_typical(Op::Prefill { rows: 0 })).abs() < 1e-6);
+        assert!(
+            (ms(estimate(m, Op::Prefill { rows: 0 })) - op_typical(Op::Prefill { rows: 0 })).abs()
+                < 1e-6
+        );
     }
 
     fn op_typical(op: Op) -> f64 {
@@ -181,9 +194,15 @@ mod tests {
         let m = "cost-test-ewma";
         let op = Op::DecodeTick { width: 8 };
         record(m, op, Duration::from_millis(20));
-        assert!((ms(estimate(m, op)) - 20.0).abs() < 1e-6, "first sample seeds the mean");
+        assert!(
+            (ms(estimate(m, op)) - 20.0).abs() < 1e-6,
+            "first sample seeds the mean"
+        );
         record(m, op, Duration::from_millis(28));
-        assert!((ms(estimate(m, op)) - 21.0).abs() < 1e-6, "one sample moves it by ALPHA");
+        assert!(
+            (ms(estimate(m, op)) - 21.0).abs() < 1e-6,
+            "one sample moves it by ALPHA"
+        );
         for _ in 0..200 {
             record(m, op, Duration::from_millis(12));
         }
@@ -216,6 +235,10 @@ mod tests {
         assert_ne!(id(a), id(b));
         assert!((ms(estimate(b, Op::Prefill { rows: 1000 })) - 44.0).abs() < 1e-6);
         // Encode samples never leak into another op's cells.
-        assert!((ms(estimate(a, Op::Encode { audio_ms: 0 })) - op_typical(Op::Encode { audio_ms: 0 })).abs() < 1e-6);
+        assert!(
+            (ms(estimate(a, Op::Encode { audio_ms: 0 })) - op_typical(Op::Encode { audio_ms: 0 }))
+                .abs()
+                < 1e-6
+        );
     }
 }

@@ -636,7 +636,10 @@ pub fn registry_json(
 
 /// sha256 over the canonical registry JSON: specs, constraints, targets.
 pub fn sha256_hex(bytes: &[u8]) -> String {
-    Sha256::digest(bytes).iter().map(|b| format!("{b:02x}")).collect()
+    Sha256::digest(bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 pub fn registry_digest(

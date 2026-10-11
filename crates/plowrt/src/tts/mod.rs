@@ -9,14 +9,14 @@
 #[cfg(feature = "cuda")]
 pub mod codec;
 #[cfg(feature = "cuda")]
-pub mod serving;
-#[cfg(feature = "cuda")]
-pub mod realtime;
-#[cfg(feature = "cuda")]
 pub mod guided_lm;
 #[cfg(feature = "cuda")]
 #[cfg(feature = "cuda")]
 pub mod guided_speech;
+#[cfg(feature = "cuda")]
+pub mod realtime;
+#[cfg(feature = "cuda")]
+pub mod serving;
 
 use std::path::Path;
 
@@ -54,23 +54,39 @@ pub struct SpeechContract {
 impl SpeechContract {
     pub fn from_pipeline(p: &PacketPipeline) -> Result<Self> {
         if p.driver != DRIVER {
-            return Err(RuntimeError::Rejected(format!("pipeline {} is {}, not {DRIVER}", p.name, p.driver)));
+            return Err(RuntimeError::Rejected(format!(
+                "pipeline {} is {}, not {DRIVER}",
+                p.name, p.driver
+            )));
         }
         let get = |k: &str| {
-            p.parameters
-                .get(k)
-                .copied()
-                .ok_or_else(|| RuntimeError::Rejected(format!("speech pipeline lacks parameter {k}")))
+            p.parameters.get(k).copied().ok_or_else(|| {
+                RuntimeError::Rejected(format!("speech pipeline lacks parameter {k}"))
+            })
         };
         let list = |k: &str| -> Result<Vec<u32>> {
-            (0..get(&format!("{k}.count"))?).map(|i| get(&format!("{k}.{i}")).map(|v| v as u32)).collect()
+            (0..get(&format!("{k}.count"))?)
+                .map(|i| get(&format!("{k}.{i}")).map(|v| v as u32))
+                .collect()
         };
         let f32p = |k: &str| get(k).map(|v| f32::from_bits(v as u32));
         let c = SpeechContract {
             pipeline: p.name.clone(),
-            prompt_template: p.strings.get("prompt.template").cloned().ok_or_else(|| RuntimeError::Rejected("speech pipeline lacks prompt.template".into()))?,
-            voice_token: p.strings.get("prompt.voice_token").cloned().ok_or_else(|| RuntimeError::Rejected("speech pipeline lacks prompt.voice_token".into()))?,
-            voices: p.strings.get("prompt.voices").map(|v| v.lines().map(str::to_owned).collect()).unwrap_or_default(),
+            prompt_template: p.strings.get("prompt.template").cloned().ok_or_else(|| {
+                RuntimeError::Rejected("speech pipeline lacks prompt.template".into())
+            })?,
+            voice_token: p
+                .strings
+                .get("prompt.voice_token")
+                .cloned()
+                .ok_or_else(|| {
+                    RuntimeError::Rejected("speech pipeline lacks prompt.voice_token".into())
+                })?,
+            voices: p
+                .strings
+                .get("prompt.voices")
+                .map(|v| v.lines().map(str::to_owned).collect())
+                .unwrap_or_default(),
             prefix: list("prompt.prefix")?,
             suffix: list("prompt.suffix")?,
             stops: list("stop")?,
@@ -85,7 +101,9 @@ impl SpeechContract {
             top_p: f32p("sampling.top_p_f32")?,
         };
         if !c.prompt_template.contains("{input}") || !c.voice_token.contains("{voice}") {
-            return Err(RuntimeError::Rejected("speech prompt templates need {input} and {voice}".into()));
+            return Err(RuntimeError::Rejected(
+                "speech prompt templates need {input} and {voice}".into(),
+            ));
         }
         Ok(c)
     }
@@ -102,13 +120,17 @@ impl SpeechContract {
         match (found.next(), found.next()) {
             (None, _) => Ok(None),
             (Some(p), None) => Self::from_pipeline(p).map(Some),
-            (Some(_), Some(_)) => Err(RuntimeError::Rejected("ambiguous: several speech pipelines".into())),
+            (Some(_), Some(_)) => Err(RuntimeError::Rejected(
+                "ambiguous: several speech pipelines".into(),
+            )),
         }
     }
 
     /// The packet's prompt template; the tokenizer encodes it between prefix and suffix.
     pub fn prompt_text(&self, voice: &str, input: &str) -> String {
-        self.prompt_template.replace("{voice}", voice).replace("{input}", input)
+        self.prompt_template
+            .replace("{voice}", voice)
+            .replace("{input}", input)
     }
 
     /// The voice's token; it must be one vocabulary token, which is how a voice is known to exist.
@@ -140,7 +162,9 @@ impl SpeechContract {
     /// position expects (dropped, as the reference decoder drops out-of-range ids).
     pub fn code_of(&self, n: usize, tok: u32) -> Option<i32> {
         let lo = self.audio_token_base + (n % self.frame_codes) as u32 * self.codebook;
-        (lo..lo + self.codebook).contains(&tok).then(|| (tok - lo) as i32)
+        (lo..lo + self.codebook)
+            .contains(&tok)
+            .then(|| (tok - lo) as i32)
     }
 }
 
@@ -198,7 +222,11 @@ fn split_piece(text: &str, r: (usize, usize), max: usize, cut: Cut, out: &mut Ve
         }
         return out.push((s, r.1));
     }
-    let next = if cut == Cut::Clause { Cut::Word } else { Cut::Char };
+    let next = if cut == Cut::Clause {
+        Cut::Word
+    } else {
+        Cut::Char
+    };
     let mut parts = Vec::new();
     for sub in cuts(text, r, cut) {
         split_piece(text, sub, max, next, &mut parts);
@@ -210,14 +238,18 @@ fn split_piece(text: &str, r: (usize, usize), max: usize, cut: Cut, out: &mut Ve
 /// most `max`: greedy packing left a sentence's last word or two as a segment of its own, and
 /// Orpheus goes mute on such a fragment ("busy.") whatever the seed.
 fn balance(text: &str, parts: &[(usize, usize)], max: usize, out: &mut Vec<(usize, usize)>) {
-    let (Some(&(s0, _)), Some(&(_, e0))) = (parts.first(), parts.last()) else { return };
+    let (Some(&(s0, _)), Some(&(_, e0))) = (parts.first(), parts.last()) else {
+        return;
+    };
     let total = text[s0..e0].chars().count();
     let groups = total.div_ceil(max);
     let target = total.div_ceil(groups);
     let mut cur: Option<(usize, usize)> = None;
     for &(s, e) in parts {
         cur = match cur {
-            Some((cs, ce)) if text[cs..ce].chars().count() >= target || text[cs..e].chars().count() > max => {
+            Some((cs, ce))
+                if text[cs..ce].chars().count() >= target || text[cs..e].chars().count() > max =>
+            {
                 out.push((cs, ce));
                 Some((s, e))
             }
@@ -247,7 +279,10 @@ fn cuts(text: &str, r: (usize, usize), cut: Cut) -> Vec<(usize, usize)> {
             Cut::Sentence if matches!(c, '\n' | '।' | '॥' | '。' | '！' | '？') => true,
             Cut::Sentence if matches!(c, '.' | '!' | '?' | '…') => {
                 while let Some(&(_, n)) = it.peek() {
-                    if !matches!(n, '.' | '!' | '?' | '…' | '"' | '\'' | '”' | '’' | ')' | ']' | '»') {
+                    if !matches!(
+                        n,
+                        '.' | '!' | '?' | '…' | '"' | '\'' | '”' | '’' | ')' | ']' | '»'
+                    ) {
                         break;
                     }
                     it.next();
@@ -347,7 +382,11 @@ impl Joins {
             let rms = ms.sqrt();
             if rms >= Self::SILENCE {
                 self.loud += b.len();
-                let room = if self.speech || self.first { self.held.len() } else { samples(Self::JOIN_PAUSE_S).saturating_sub(self.sent) };
+                let room = if self.speech || self.first {
+                    self.held.len()
+                } else {
+                    samples(Self::JOIN_PAUSE_S).saturating_sub(self.sent)
+                };
                 out.extend_from_slice(&self.held[self.held.len().saturating_sub(room)..]);
                 self.held.clear();
                 self.sent = 0;
@@ -359,7 +398,9 @@ impl Joins {
                 self.quiet += b.len();
             }
             let held_s = (self.held.len() + b.len()) as f64 / self.rate;
-            let hold = (self.speech || !self.first) && self.sent >= samples(Self::KEEP_S) && lead_s - held_s > Self::HOLD_LEAD_S;
+            let hold = (self.speech || !self.first)
+                && self.sent >= samples(Self::KEEP_S)
+                && lead_s - held_s > Self::HOLD_LEAD_S;
             if hold {
                 self.held.extend_from_slice(b);
             } else {
@@ -383,7 +424,12 @@ impl Joins {
         }
         if self.env.len() == points && self.env.iter().all(|&e| e >= Self::SILENCE) {
             let mean = self.env.iter().sum::<f32>() / points as f32;
-            let var = self.env.iter().map(|e| (e - mean) * (e - mean)).sum::<f32>() / points as f32;
+            let var = self
+                .env
+                .iter()
+                .map(|e| (e - mean) * (e - mean))
+                .sum::<f32>()
+                / points as f32;
             self.droned |= var.sqrt() < Self::DRONE_CV * mean;
         }
     }
@@ -417,7 +463,9 @@ impl Joins {
 
     /// Whether `pcm` holds a quarter second of sound.
     pub(crate) fn speaks(&self, pcm: &[f32]) -> bool {
-        let loud = pcm.chunks(Self::BLOCK).filter(|b| (b.iter().map(|x| x * x).sum::<f32>() / b.len() as f32).sqrt() >= Self::SILENCE);
+        let loud = pcm.chunks(Self::BLOCK).filter(|b| {
+            (b.iter().map(|x| x * x).sum::<f32>() / b.len() as f32).sqrt() >= Self::SILENCE
+        });
         loud.map(<[f32]>::len).sum::<usize>() as f64 >= 0.25 * self.rate
     }
 }
@@ -518,7 +566,10 @@ mod tests {
     fn max_tokens_matches_reference_formula() {
         let c = SpeechContract::from_pipeline(&pipeline()).unwrap();
         // scripts/tts/veena_ref.py max_new: min(int(len*1.3)*7+21, 700)
-        assert_eq!(c.max_new_tokens("Hello, how are you doing today?"), 40 * 7 + 21);
+        assert_eq!(
+            c.max_new_tokens("Hello, how are you doing today?"),
+            40 * 7 + 21
+        );
         assert_eq!(c.max_new_tokens(&"x".repeat(200)), 700);
     }
 
@@ -530,7 +581,11 @@ mod tests {
         for s in &segs {
             assert!(!s.is_empty() && s.chars().count() <= max, "{s:?}");
             let off = s.as_ptr() as usize - text.as_ptr() as usize;
-            assert!(off >= at && text[at..off].trim().is_empty(), "gap {:?}", &text[at..off]);
+            assert!(
+                off >= at && text[at..off].trim().is_empty(),
+                "gap {:?}",
+                &text[at..off]
+            );
             at = off + s.len();
         }
         assert!(text[at..].trim().is_empty());
@@ -545,11 +600,31 @@ mod tests {
     #[test]
     fn sentences_pack_up_to_the_limit() {
         let t = "One two three. Four five six! Seven eight nine? Ten eleven.";
-        assert_eq!(check_cover(t, 30), ["One two three. Four five six!", "Seven eight nine? Ten eleven."]);
-        assert_eq!(check_cover(t, 17), ["One two three.", "Four five six!", "Seven eight nine?", "Ten eleven."]);
+        assert_eq!(
+            check_cover(t, 30),
+            [
+                "One two three. Four five six!",
+                "Seven eight nine? Ten eleven."
+            ]
+        );
+        assert_eq!(
+            check_cover(t, 17),
+            [
+                "One two three.",
+                "Four five six!",
+                "Seven eight nine?",
+                "Ten eleven."
+            ]
+        );
         // No whitespace after the point: a number, not a sentence end.
-        assert_eq!(check_cover("It costs 3.5 dollars. Then more.", 22), ["It costs 3.5 dollars.", "Then more."]);
-        assert_eq!(check_cover("\"Stop!\" she said. Go on.", 18), ["\"Stop!\" she said.", "Go on."]);
+        assert_eq!(
+            check_cover("It costs 3.5 dollars. Then more.", 22),
+            ["It costs 3.5 dollars.", "Then more."]
+        );
+        assert_eq!(
+            check_cover("\"Stop!\" she said. Go on.", 18),
+            ["\"Stop!\" she said.", "Go on."]
+        );
     }
 
     #[test]
@@ -562,7 +637,13 @@ mod tests {
     #[test]
     fn long_sentences_split_at_clauses_then_words_then_chars() {
         let t = "alpha beta gamma, delta epsilon zeta, eta theta iota kappa lambda mu";
-        assert_eq!(check_cover(t, 40), ["alpha beta gamma, delta epsilon zeta,", "eta theta iota kappa lambda mu"]);
+        assert_eq!(
+            check_cover(t, 40),
+            [
+                "alpha beta gamma, delta epsilon zeta,",
+                "eta theta iota kappa lambda mu"
+            ]
+        );
         let w = check_cover("aaaa bbbb cccc dddd eeee", 10);
         assert_eq!(w, ["aaaa bbbb", "cccc dddd", "eeee"]);
         // A sentence just over the limit splits in about equal halves, not into a lone tail word.
@@ -574,7 +655,10 @@ mod tests {
         let c = check_cover(&x, 10);
         assert_eq!(c.iter().map(|s| s.len()).collect::<Vec<_>>(), [10, 10, 5]);
         for max in [1, 7, 33, 151] {
-            check_cover(&"The quick brown fox, jumps over; the lazy dog. ".repeat(40), max);
+            check_cover(
+                &"The quick brown fox, jumps over; the lazy dog. ".repeat(40),
+                max,
+            );
         }
     }
 
@@ -590,7 +674,9 @@ mod tests {
     const SR: u32 = 24000;
 
     fn tone(s: f64) -> Vec<f32> {
-        (0..(s * f64::from(SR)) as usize).map(|i| 0.3 * (i as f32 * 0.05).sin()).collect()
+        (0..(s * f64::from(SR)) as usize)
+            .map(|i| 0.3 * (i as f32 * 0.05).sin())
+            .collect()
     }
 
     fn quiet(s: f64) -> Vec<f32> {
@@ -609,14 +695,22 @@ mod tests {
         for p in [quiet(1.5), tone(1.0), quiet(2.0), tone(1.0), quiet(1.2)] {
             j.push(&p, f64::INFINITY, &mut out);
         }
-        assert!((secs(&out) - (1.5 + 1.0 + 2.0 + 1.0 + 0.3)).abs() < 0.02, "{}", secs(&out));
+        assert!(
+            (secs(&out) - (1.5 + 1.0 + 2.0 + 1.0 + 0.3)).abs() < 0.02,
+            "{}",
+            secs(&out)
+        );
         // Next segment opens with 2 s of silence: the join pause is 0.5 s in all.
         j.next_segment();
         let before = out.len();
         for p in [quiet(2.0), tone(1.0)] {
             j.push(&p, f64::INFINITY, &mut out);
         }
-        assert!((secs(&out[before..]) - (0.2 + 1.0)).abs() < 0.02, "{}", secs(&out[before..]));
+        assert!(
+            (secs(&out[before..]) - (0.2 + 1.0)).abs() < 0.02,
+            "{}",
+            secs(&out[before..])
+        );
         assert!(!j.runaway());
         j.push(&quiet(3.1), f64::INFINITY, &mut out);
         assert!(j.runaway() && !j.mute());
@@ -624,7 +718,9 @@ mod tests {
         j.push(&quiet(2.9), f64::INFINITY, &mut out);
         assert!(!j.mute());
         j.push(&quiet(0.2), f64::INFINITY, &mut out);
-        assert!(j.mute() && !j.speaks(&quiet(1.0)) && !j.speaks(&tone(0.1)) && j.speaks(&tone(0.3)));
+        assert!(
+            j.mute() && !j.speaks(&quiet(1.0)) && !j.speaks(&tone(0.1)) && j.speaks(&tone(0.3))
+        );
     }
 
     /// A steady drone is a failed segment; speech-like modulation (4 Hz syllables) is not.
@@ -634,7 +730,9 @@ mod tests {
         let syllables: Vec<f32> = tone(3.0)
             .iter()
             .enumerate()
-            .map(|(i, x)| x * (0.55 + 0.45 * (i as f32 * 4.0 * std::f32::consts::TAU / SR as f32).sin()))
+            .map(|(i, x)| {
+                x * (0.55 + 0.45 * (i as f32 * 4.0 * std::f32::consts::TAU / SR as f32).sin())
+            })
             .collect();
         assert!(!j.failed(&syllables));
         assert!(j.failed(&tone(2.5)));
@@ -647,7 +745,10 @@ mod tests {
         s.push(&tone(2.2), f64::INFINITY, &mut Vec::new());
         assert!(s.drone() && s.segment_failed());
         s.next_segment();
-        assert!(!s.drone() && s.segment_failed(), "nothing pushed yet: no speech");
+        assert!(
+            !s.drone() && s.segment_failed(),
+            "nothing pushed yet: no speech"
+        );
         s.push(&quiet(1.0), f64::INFINITY, &mut Vec::new());
         assert!(s.segment_failed());
     }

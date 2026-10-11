@@ -232,7 +232,10 @@ mod tests {
     fn a_xeon_resolves_to_the_amx_cpu_level() {
         let x = lookup("xeon6975p").unwrap();
         assert_eq!(x.vendor, crate::spec::Vendor::Intel);
-        assert_eq!(crate::isa::IsaLevel::from_spec(x), Some(crate::isa::IsaLevel::Amx));
+        assert_eq!(
+            crate::isa::IsaLevel::from_spec(x),
+            Some(crate::isa::IsaLevel::Amx)
+        );
         assert!(crate::isa::IsaLevel::Amx.is_cpu() && !crate::isa::IsaLevel::Sm120a.is_cpu());
         assert_eq!(x.sm.warp_lanes, crate::isa::IsaLevel::Amx.caps().warp_lanes);
     }

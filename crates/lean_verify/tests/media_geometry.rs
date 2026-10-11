@@ -77,7 +77,10 @@ fn production_media_contracts_hold_and_each_mutation_rejects() {
         cases.push((field, payload(fs)));
     }
     cases.push(("empty", payload(vec![])));
-    let requests: Vec<_> = cases.iter().map(|(_, p)| ("media_geometry.v1", p.clone())).collect();
+    let requests: Vec<_> = cases
+        .iter()
+        .map(|(_, p)| ("media_geometry.v1", p.clone()))
+        .collect();
     let certs = lean_verify::call_batch(&requests).unwrap();
     assert!(certs[0].ok, "{:?}", certs[0].reason);
     for ((what, _), cert) in cases.iter().zip(&certs).skip(1) {

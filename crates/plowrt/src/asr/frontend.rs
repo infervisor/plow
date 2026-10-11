@@ -47,7 +47,10 @@ pub fn decode_wav(bytes: &[u8]) -> std::result::Result<Vec<f32>, AudioError> {
 }
 
 /// [`decode_wav`] of audio up to `max_samples` (16 kHz) long.
-pub fn decode_wav_within(bytes: &[u8], max_samples: usize) -> std::result::Result<Vec<f32>, AudioError> {
+pub fn decode_wav_within(
+    bytes: &[u8],
+    max_samples: usize,
+) -> std::result::Result<Vec<f32>, AudioError> {
     let (samples, rate) = read_wav(bytes, max_samples)?;
     let samples = if rate == SAMPLE_RATE {
         samples
@@ -84,12 +87,16 @@ fn read_wav(bytes: &[u8], max_samples: usize) -> std::result::Result<(Vec<f32>, 
     let mut reader = hound::WavReader::new(Cursor::new(bytes))
         .map_err(|e| invalid(format!("invalid WAV: {e}")))?;
     let spec = reader.spec();
-    if !(MIN_INPUT_RATE..=MAX_INPUT_RATE).contains(&spec.sample_rate) || !(1..=2).contains(&spec.channels) {
+    if !(MIN_INPUT_RATE..=MAX_INPUT_RATE).contains(&spec.sample_rate)
+        || !(1..=2).contains(&spec.channels)
+    {
         return Err(AudioError::Unsupported(
             "ASR requires 8-48 kHz mono/stereo WAV".into(),
         ));
     }
-    if reader.duration() as u64 * u64::from(SAMPLE_RATE) > max_samples as u64 * u64::from(spec.sample_rate) {
+    if reader.duration() as u64 * u64::from(SAMPLE_RATE)
+        > max_samples as u64 * u64::from(spec.sample_rate)
+    {
         return Err(AudioError::TooLong(max_samples / SAMPLE_RATE as usize));
     }
     let samples: Vec<f32> = match spec.sample_format {
@@ -117,10 +124,13 @@ fn read_wav(bytes: &[u8], max_samples: usize) -> std::result::Result<(Vec<f32>, 
     if spec.channels == 1 {
         return Ok((samples, spec.sample_rate));
     }
-    Ok((samples
-        .chunks_exact(2)
-        .map(|s| s[0] * 0.5 + s[1] * 0.5)
-        .collect(), spec.sample_rate))
+    Ok((
+        samples
+            .chunks_exact(2)
+            .map(|s| s[0] * 0.5 + s[1] * 0.5)
+            .collect(),
+        spec.sample_rate,
+    ))
 }
 
 /// Windowed-sinc resampling to 16 kHz, fed in pieces. Polyphase over the exact rational ratio
@@ -148,7 +158,9 @@ impl Resampler {
 
     pub fn new(rate: u32) -> std::result::Result<Self, String> {
         if !(MIN_INPUT_RATE..=MAX_INPUT_RATE).contains(&rate) {
-            return Err(format!("sample rate {rate} is outside {MIN_INPUT_RATE}..={MAX_INPUT_RATE} Hz"));
+            return Err(format!(
+                "sample rate {rate} is outside {MIN_INPUT_RATE}..={MAX_INPUT_RATE} Hz"
+            ));
         }
         let gcd = |mut a: u64, mut b: u64| {
             while b != 0 {
@@ -159,7 +171,16 @@ impl Resampler {
         let g = gcd(u64::from(rate), u64::from(SAMPLE_RATE));
         let (up, down) = (u64::from(SAMPLE_RATE) / g, u64::from(rate) / g);
         if up == down {
-            return Ok(Self { up, down, half: 0, taps: Vec::new(), input: Vec::new(), base: 0, received: 0, produced: 0 });
+            return Ok(Self {
+                up,
+                down,
+                half: 0,
+                taps: Vec::new(),
+                input: Vec::new(),
+                base: 0,
+                received: 0,
+                produced: 0,
+            });
         }
         // Cutoff in cycles per input sample (Nyquist = 0.5), below both rates' Nyquist.
         let cutoff = 0.5 * (up as f64 / down as f64).min(1.0) * Self::ROLLOFF;
@@ -171,12 +192,17 @@ impl Resampler {
                 .map(|i| {
                     let t = (i as f64 - half as f64 + 1.0) - frac;
                     let x = 2.0 * cutoff * t;
-                    let sinc = if x == 0.0 { 1.0 } else { (std::f64::consts::PI * x).sin() / (std::f64::consts::PI * x) };
+                    let sinc = if x == 0.0 {
+                        1.0
+                    } else {
+                        (std::f64::consts::PI * x).sin() / (std::f64::consts::PI * x)
+                    };
                     let u = t / half as f64;
                     let window = if u.abs() >= 1.0 {
                         0.0
                     } else {
-                        0.42 + 0.5 * (std::f64::consts::PI * u).cos() + 0.08 * (2.0 * std::f64::consts::PI * u).cos()
+                        0.42 + 0.5 * (std::f64::consts::PI * u).cos()
+                            + 0.08 * (2.0 * std::f64::consts::PI * u).cos()
                     };
                     sinc * window
                 })
@@ -185,7 +211,16 @@ impl Resampler {
             let sum: f64 = row.iter().sum();
             taps.extend(row.iter().map(|v| (v / sum) as f32));
         }
-        Ok(Self { up, down, half, taps, input: Vec::new(), base: 0, received: 0, produced: 0 })
+        Ok(Self {
+            up,
+            down,
+            half,
+            taps,
+            input: Vec::new(),
+            base: 0,
+            received: 0,
+            produced: 0,
+        })
     }
 
     /// Outputs `samples` completes: every one whose right context has arrived.
@@ -225,12 +260,18 @@ impl Resampler {
             if last < total {
                 let (c0, cl) = (at(self.produced).0, at(last).0);
                 let ready = flush || cl + (self.half as u64) < self.received;
-                if ready && c0 + 1 >= self.half as u64 + self.base && cl + 1 + self.half as u64 <= self.received {
+                if ready
+                    && c0 + 1 >= self.half as u64 + self.base
+                    && cl + 1 + self.half as u64 <= self.received
+                {
                     let mut acc = [0f32; LANES];
                     let lanes: [(&[f32], &[f32]); LANES] = std::array::from_fn(|j| {
                         let (center, phase) = at(self.produced + j as u64);
                         let start = (center + 1 - self.half as u64 - self.base) as usize;
-                        (&self.taps[phase * width..][..width], &self.input[start..][..width])
+                        (
+                            &self.taps[phase * width..][..width],
+                            &self.input[start..][..width],
+                        )
                     });
                     for i in 0..width {
                         for (a, (taps, x)) in acc.iter_mut().zip(&lanes) {
@@ -308,7 +349,15 @@ pub struct LogMelShaping {
 
 impl Default for LogMelShaping {
     fn default() -> Self {
-        Self { pad_reflect: false, drop_last_frame: false, log10: false, log_floor: false, dynamic_range: 0.0, scale: 1.0, shift: 0.0 }
+        Self {
+            pad_reflect: false,
+            drop_last_frame: false,
+            log10: false,
+            log_floor: false,
+            dynamic_range: 0.0,
+            scale: 1.0,
+            shift: 0.0,
+        }
     }
 }
 
@@ -342,7 +391,10 @@ impl PacketLogMelFrontend {
     }
 
     /// From packet parameters and the raw FP32 filterbank bytes.
-    pub fn from_parameters(parameter: impl Fn(&str) -> Option<u64>, filterbank: &[u8]) -> Result<Self> {
+    pub fn from_parameters(
+        parameter: impl Fn(&str) -> Option<u64>,
+        filterbank: &[u8],
+    ) -> Result<Self> {
         let required = |name: &str| {
             parameter(name).ok_or_else(|| invalid(format!("packet parameter {name:?} is missing")))
         };
@@ -381,7 +433,8 @@ impl PacketLogMelFrontend {
             log_guard: f32_param("audio.frontend.log_guard_f32")?,
             shaping: {
                 let flag = |name| parameter(name).unwrap_or(0) == 1;
-                let float = |name, default: f32| parameter(name).map_or(Ok(default), |_| f32_param(name));
+                let float =
+                    |name, default: f32| parameter(name).map_or(Ok(default), |_| f32_param(name));
                 LogMelShaping {
                     pad_reflect: flag("audio.frontend.pad_reflect"),
                     drop_last_frame: flag("audio.frontend.drop_last_frame"),
@@ -444,10 +497,18 @@ impl PacketLogMelFrontend {
     /// 0) are final: their analysis window has arrived, so later audio cannot change them (no
     /// per-utterance normalization). Frames are computed from a slice starting `MARGIN` frames
     /// earlier, whose edge (padding, pre-emphasis) only the dropped frames see.
-    pub fn extract_partial(&self, samples: &[f32], from_frame: usize) -> Result<(LogMelFeatures, usize)> {
+    pub fn extract_partial(
+        &self,
+        samples: &[f32],
+        from_frame: usize,
+    ) -> Result<(LogMelFeatures, usize)> {
         const MARGIN: usize = 2;
         let config = self.inner.config;
-        let window_offset = if config.center_window { (config.fft - config.window) / 2 } else { 0 };
+        let window_offset = if config.center_window {
+            (config.fft - config.window) / 2
+        } else {
+            0
+        };
         let reach = window_offset + config.window;
         let pad = config.fft / 2;
         if samples.len() > self.max_samples
@@ -456,12 +517,19 @@ impl PacketLogMelFrontend {
         {
             return Err(invalid("audio cannot be streamed through this frontend"));
         }
-        let complete = (samples.len() + pad).checked_sub(reach).map_or(0, |span| span / config.hop + 1);
+        let complete = (samples.len() + pad)
+            .checked_sub(reach)
+            .map_or(0, |span| span / config.hop + 1);
         let skip = from_frame.saturating_sub(MARGIN);
-        let tail = samples.get(skip * config.hop..).filter(|t| !t.is_empty()).ok_or_else(|| invalid("no audio past the requested frame"))?;
+        let tail = samples
+            .get(skip * config.hop..)
+            .filter(|t| !t.is_empty())
+            .ok_or_else(|| invalid("no audio past the requested frame"))?;
         let mut features = self.inner.extract(tail, true)?;
         let drop = from_frame - skip;
-        features.values.drain(..(drop * features.bins).min(features.values.len()));
+        features
+            .values
+            .drain(..(drop * features.bins).min(features.values.len()));
         features.frames = features.frames.saturating_sub(drop);
         Ok((features, complete))
     }
@@ -549,57 +617,69 @@ impl LogMelFrontend {
                 vec![0.0f32; spectrum_bins],
             )
         };
-        let frame_values = |(spectrum, scratch, power): &mut (Vec<Complex32>, Vec<Complex32>, Vec<f32>),
-                            frame: usize,
-                            out: &mut [f32]| {
-            spectrum.fill(Complex32::default());
-            for index in 0..config.window {
-                let padded_index = frame * config.hop + window_offset + index;
-                let sample = if shaping.pad_reflect {
-                    let n = preemphasized.len() as isize;
-                    let mut i = padded_index as isize - center_pad as isize;
-                    if i < 0 {
-                        i = -i;
-                    }
-                    if i >= n {
-                        i = 2 * n - 2 - i;
-                    }
-                    preemphasized.get(i as usize).copied().unwrap_or(0.0)
-                } else {
-                    padded_index
-                        .checked_sub(center_pad)
-                        .and_then(|index| preemphasized.get(index))
-                        .copied()
-                        .unwrap_or(0.0)
-                };
-                spectrum[window_offset + index].re = sample * self.window[index];
-            }
-            self.fft.process_with_scratch(spectrum, scratch);
-            for (power, value) in power.iter_mut().zip(spectrum.iter()) {
-                *power = value.norm_sqr();
-            }
-            for (bin, out) in out.iter_mut().enumerate() {
-                let range = self.filter_ranges[bin].clone();
-                let energy = self.filters
-                    [bin * spectrum_bins + range.start..bin * spectrum_bins + range.end]
-                    .iter()
-                    .zip(&power[range])
-                    .map(|(filter, power)| filter * power)
-                    .sum::<f32>();
-                let energy = if shaping.log_floor { energy.max(config.log_guard) } else { energy + config.log_guard };
-                *out = if shaping.log10 { log10_f32(energy) } else { energy.ln() };
-            }
-        };
+        let frame_values =
+            |(spectrum, scratch, power): &mut (Vec<Complex32>, Vec<Complex32>, Vec<f32>),
+             frame: usize,
+             out: &mut [f32]| {
+                spectrum.fill(Complex32::default());
+                for index in 0..config.window {
+                    let padded_index = frame * config.hop + window_offset + index;
+                    let sample = if shaping.pad_reflect {
+                        let n = preemphasized.len() as isize;
+                        let mut i = padded_index as isize - center_pad as isize;
+                        if i < 0 {
+                            i = -i;
+                        }
+                        if i >= n {
+                            i = 2 * n - 2 - i;
+                        }
+                        preemphasized.get(i as usize).copied().unwrap_or(0.0)
+                    } else {
+                        padded_index
+                            .checked_sub(center_pad)
+                            .and_then(|index| preemphasized.get(index))
+                            .copied()
+                            .unwrap_or(0.0)
+                    };
+                    spectrum[window_offset + index].re = sample * self.window[index];
+                }
+                self.fft.process_with_scratch(spectrum, scratch);
+                for (power, value) in power.iter_mut().zip(spectrum.iter()) {
+                    *power = value.norm_sqr();
+                }
+                for (bin, out) in out.iter_mut().enumerate() {
+                    let range = self.filter_ranges[bin].clone();
+                    let energy = self.filters
+                        [bin * spectrum_bins + range.start..bin * spectrum_bins + range.end]
+                        .iter()
+                        .zip(&power[range])
+                        .map(|(filter, power)| filter * power)
+                        .sum::<f32>();
+                    let energy = if shaping.log_floor {
+                        energy.max(config.log_guard)
+                    } else {
+                        energy + config.log_guard
+                    };
+                    *out = if shaping.log10 {
+                        log10_f32(energy)
+                    } else {
+                        energy.ln()
+                    };
+                }
+            };
         // Frames are independent: a request's frontend spreads over the rayon pool (c1 latency).
         #[cfg(feature = "hf-tokenizer")]
         {
             use rayon::prelude::*;
             const FRAMES_PER_TASK: usize = 64;
-            values.par_chunks_mut(config.bins * FRAMES_PER_TASK).enumerate().for_each_init(buffers, |b, (task, out)| {
-                for (i, out) in out.chunks_exact_mut(config.bins).enumerate() {
-                    frame_values(b, task * FRAMES_PER_TASK + i, out);
-                }
-            });
+            values
+                .par_chunks_mut(config.bins * FRAMES_PER_TASK)
+                .enumerate()
+                .for_each_init(buffers, |b, (task, out)| {
+                    for (i, out) in out.chunks_exact_mut(config.bins).enumerate() {
+                        frame_values(b, task * FRAMES_PER_TASK + i, out);
+                    }
+                });
         }
         #[cfg(not(feature = "hf-tokenizer"))]
         {
@@ -792,24 +872,38 @@ mod tests {
         for rate in [8_000, 22_050, 24_000, 32_000, 44_100, 48_000] {
             let out = resample(rate, &vec![0.5; rate as usize]);
             assert_eq!(out.len(), 16_000, "{rate}");
-            assert!(out[2_000..14_000].iter().all(|v| (v - 0.5).abs() < 1e-4), "{rate}: DC");
+            assert!(
+                out[2_000..14_000].iter().all(|v| (v - 0.5).abs() < 1e-4),
+                "{rate}: DC"
+            );
             let tone: Vec<f32> = (0..rate)
-                .map(|i| (2.0 * std::f64::consts::PI * 1_000.0 * i as f64 / rate as f64).sin() as f32)
+                .map(|i| {
+                    (2.0 * std::f64::consts::PI * 1_000.0 * i as f64 / rate as f64).sin() as f32
+                })
                 .collect();
             let out = resample(rate, &tone);
             let rms = (out[2_000..14_000].iter().map(|v| v * v).sum::<f32>() / 12_000.0).sqrt();
-            assert!((rms - std::f32::consts::FRAC_1_SQRT_2).abs() < 5e-3, "{rate}: 1 kHz rms {rms}");
+            assert!(
+                (rms - std::f32::consts::FRAC_1_SQRT_2).abs() < 5e-3,
+                "{rate}: 1 kHz rms {rms}"
+            );
             let expected: Vec<f32> = (0..16_000)
                 .map(|n| (2.0 * std::f64::consts::PI * 1_000.0 * n as f64 / 16_000.0).sin() as f32)
                 .collect();
-            let err = out[2_000..14_000].iter().zip(&expected[2_000..14_000]).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+            let err = out[2_000..14_000]
+                .iter()
+                .zip(&expected[2_000..14_000])
+                .map(|(a, b)| (a - b).abs())
+                .fold(0f32, f32::max);
             assert!(err < 5e-3, "{rate}: phase-aligned error {err}");
         }
     }
 
     #[test]
     fn resampler_pieces_match_one_buffer() {
-        let input: Vec<f32> = (0..30_011u32).map(|i| ((i * 7919) % 2001) as f32 / 1000.0 - 1.0).collect();
+        let input: Vec<f32> = (0..30_011u32)
+            .map(|i| ((i * 7919) % 2001) as f32 / 1000.0 - 1.0)
+            .collect();
         for rate in [8_000, 22_050, 44_100, 48_000] {
             let whole = resample(rate, &input);
             let mut r = Resampler::new(rate).unwrap();
@@ -854,10 +948,19 @@ mod tests {
 
     #[test]
     fn resampler_matches_the_per_tap_reference() {
-        let input: Vec<f32> = (0..50_021u32).map(|i| ((i * 7919) % 2003) as f32 / 1001.0 - 1.0).collect();
+        let input: Vec<f32> = (0..50_021u32)
+            .map(|i| ((i * 7919) % 2003) as f32 / 1001.0 - 1.0)
+            .collect();
         for rate in [8_000, 11_025, 22_050, 24_000, 44_100, 48_000] {
             let (got, want) = (resample(rate, &input), resample_per_tap(rate, &input));
-            assert!(got.len() == want.len() && got.iter().zip(&want).all(|(a, b)| a.to_bits() == b.to_bits()), "{rate}");
+            assert!(
+                got.len() == want.len()
+                    && got
+                        .iter()
+                        .zip(&want)
+                        .all(|(a, b)| a.to_bits() == b.to_bits()),
+                "{rate}"
+            );
         }
     }
 
@@ -867,7 +970,9 @@ mod tests {
     fn frontend_microbench() {
         let seconds = 5;
         for rate in [24_000u32, 44_100, 48_000] {
-            let input: Vec<f32> = (0..rate * seconds).map(|i| ((i * 7919) % 2003) as f32 / 1001.0 - 1.0).collect();
+            let input: Vec<f32> = (0..rate * seconds)
+                .map(|i| ((i * 7919) % 2003) as f32 / 1001.0 - 1.0)
+                .collect();
             let t = std::time::Instant::now();
             for _ in 0..10 {
                 std::hint::black_box(resample(rate, &input));
@@ -880,13 +985,18 @@ mod tests {
             let per_tap = t.elapsed().as_secs_f64() * 1e3 / 10.0;
             println!("FRONTEND resample {rate}->16k {seconds}s: {fast:.3} ms (per-tap bounds checks {per_tap:.3})");
         }
-        let samples: Vec<f32> = (0..SAMPLE_RATE * seconds).map(|i| ((i * 17 % 101) as i32 - 50) as f32 / 500.0).collect();
+        let samples: Vec<f32> = (0..SAMPLE_RATE * seconds)
+            .map(|i| ((i * 17 % 101) as i32 - 50) as f32 / 500.0)
+            .collect();
         let qwen = QwenFrontend::default();
         let t = std::time::Instant::now();
         for _ in 0..10 {
             std::hint::black_box(qwen.extract(&samples).unwrap());
         }
-        println!("FRONTEND qwen log-mel {seconds}s: {:.3} ms", t.elapsed().as_secs_f64() * 1e3 / 10.0);
+        println!(
+            "FRONTEND qwen log-mel {seconds}s: {:.3} ms",
+            t.elapsed().as_secs_f64() * 1e3 / 10.0
+        );
     }
 
     #[test]
@@ -927,17 +1037,30 @@ mod tests {
             normalize_per_feature: false,
             mask_invalid_frames: false,
             log_guard: 1e-10,
-            shaping: LogMelShaping { pad_reflect: true, drop_last_frame: true, log10: true, log_floor: true, dynamic_range: 8.0, scale: 0.25, shift: 4.0 },
+            shaping: LogMelShaping {
+                pad_reflect: true,
+                drop_last_frame: true,
+                log10: true,
+                log_floor: true,
+                dynamic_range: 8.0,
+                scale: 0.25,
+                shift: 4.0,
+            },
         };
         let generic = LogMelFrontend::new(config, reference.filters.clone()).unwrap();
-        let samples: Vec<f32> = (0..16_000 * 3 + 123).map(|i| ((i as f32 * 0.013).sin() * 0.3 + (i as f32 * 0.0007).cos() * 0.1)).collect();
+        let samples: Vec<f32> = (0..16_000 * 3 + 123)
+            .map(|i| ((i as f32 * 0.013).sin() * 0.3 + (i as f32 * 0.0007).cos() * 0.1))
+            .collect();
         let want = reference.extract(&samples).unwrap();
         let got = generic.extract(&samples, false).unwrap();
         assert_eq!(got.frames, want.frames);
         let mut worst = 0f32;
         for frame in 0..want.frames {
             for bin in 0..MEL_BINS {
-                worst = worst.max((got.values[frame * MEL_BINS + bin] - want.values[bin * want.frames + frame]).abs());
+                worst = worst.max(
+                    (got.values[frame * MEL_BINS + bin] - want.values[bin * want.frames + frame])
+                        .abs(),
+                );
             }
         }
         assert!(worst <= 1e-6, "max abs diff {worst}");

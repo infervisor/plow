@@ -197,9 +197,7 @@ impl MixedAmdStep {
             .iter()
             .copied()
             .chain(token_markers.into_iter().flatten())
-            .chain(
-                (route == StepRoute::TokenBatch).then_some("plow_row_gather_1"),
-            )
+            .chain((route == StepRoute::TokenBatch).then_some("plow_row_gather_1"))
             .chain(wide_tiles.then_some("plow_token_batch_wide_gemm_1"))
             .chain(
                 (route == StepRoute::TokenBatch && fp8_weights)
@@ -776,10 +774,7 @@ impl AmdEngine {
                     uploads[1],
                     uploads[2],
                     uploads[3],
-                    (
-                        sample_row_base,
-                        slice(&mixed.layout.sample_row, leading),
-                    ),
+                    (sample_row_base, slice(&mixed.layout.sample_row, leading)),
                     uploads[4],
                     uploads[5],
                     uploads[6],

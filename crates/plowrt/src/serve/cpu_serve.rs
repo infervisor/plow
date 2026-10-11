@@ -43,7 +43,9 @@ pub trait SlotEngine: Send {
     }
     /// [`CpuEngine::prefill_packed`].
     fn prefill_packed(&mut self, _members: &[PackMember<'_>]) -> Result<Vec<u32>> {
-        Err(RuntimeError::Rejected("packed prefill is not supported by this engine".into()))
+        Err(RuntimeError::Rejected(
+            "packed prefill is not supported by this engine".into(),
+        ))
     }
 }
 
@@ -173,18 +175,28 @@ impl CpuServe {
         }
         let pf_chunk = crate::config::RuntimeConfig::get().cpu.prefill_chunk;
         // No manifest: only an exact continuation resumes.
-        let ring_slack = eng.model().blob.with_packet_view(plow_asset::live_kv::emit).map_or(0, |m| {
-            m.caches.iter().filter(|c| c.window > 0).map(|c| c.stride.saturating_sub(c.window)).min().unwrap_or(u32::MAX)
-        });
+        let ring_slack = eng
+            .model()
+            .blob
+            .with_packet_view(plow_asset::live_kv::emit)
+            .map_or(0, |m| {
+                m.caches
+                    .iter()
+                    .filter(|c| c.window > 0)
+                    .map(|c| c.stride.saturating_sub(c.window))
+                    .min()
+                    .unwrap_or(u32::MAX)
+            });
         let pack = eng
             .pack_rows()
             .filter(|_| crate::config::RuntimeConfig::get().cpu.pack_prefill && batch > 1)
             .and_then(|rows| buckets.iter().copied().find(|&(_, t)| t == rows));
-        let (share_kv, share_rows) = if crate::config::RuntimeConfig::get().cpu.prefix_share && batch > 1 {
-            prefix_share_layout(eng.model(), batch)
-        } else {
-            (Vec::new(), 0)
-        };
+        let (share_kv, share_rows) =
+            if crate::config::RuntimeConfig::get().cpu.prefix_share && batch > 1 {
+                prefix_share_layout(eng.model(), batch)
+            } else {
+                (Vec::new(), 0)
+            };
         tracing::info!(
             max_ctx,
             batch,
@@ -438,7 +450,11 @@ impl CpuServe {
         let mut best = (0usize, slot);
         for d in (0..self.batch).filter(|&d| d == slot || self.pend[d] == 0) {
             let n = self.intact_rows(d).min(cap);
-            let l = self.hist[d][..n].iter().zip(prompt).take_while(|(a, b)| a == b).count();
+            let l = self.hist[d][..n]
+                .iter()
+                .zip(prompt)
+                .take_while(|(a, b)| a == b)
+                .count();
             if l > best.0 || (l == best.0 && d == slot) {
                 best = (l, d);
             }
@@ -572,7 +588,10 @@ impl SeqEngine for CpuServe {
     }
 
     fn prefill_prog_t(&self, prog: usize) -> Option<u32> {
-        self.buckets.iter().find(|&&(p, _)| p == prog).map(|&(_, t)| t)
+        self.buckets
+            .iter()
+            .find(|&&(p, _)| p == prog)
+            .map(|&(_, t)| t)
     }
 
     fn step_backend(&self) -> crate::sched::step::Backend {
@@ -588,7 +607,12 @@ impl SeqEngine for CpuServe {
 
     /// Seeds the slot's packing cursor (its prompt length) and its prefix share, so a fresh
     /// prompt is a pack candidate in the tick it arrives.
-    fn prepare_packed_prefill_slot(&mut self, slot: usize, prompt: &[u32], _max_rows: u32) -> Result<()> {
+    fn prepare_packed_prefill_slot(
+        &mut self,
+        slot: usize,
+        prompt: &[u32],
+        _max_rows: u32,
+    ) -> Result<()> {
         if self.pack.is_none() || self.live.get(slot) != Some(&false) || self.pend[slot] != 0 {
             return Ok(());
         }
@@ -671,10 +695,16 @@ impl SeqEngine for CpuServe {
     }
 
     /// The widest packed bucket: `prefill_packed` runs the narrowest one holding the rows.
-    fn token_batch_rows(&self, sample_rows: usize, decode_rows: usize, prefill_rows: usize) -> Option<u32> {
+    fn token_batch_rows(
+        &self,
+        sample_rows: usize,
+        decode_rows: usize,
+        prefill_rows: usize,
+    ) -> Option<u32> {
         let (_, widest) = self.pack.filter(|_| self.token_batch)?;
         let real = decode_rows.checked_add(prefill_rows)?;
-        (sample_rows > 0 && sample_rows <= self.batch && real > 0 && real <= widest as usize).then_some(widest)
+        (sample_rows > 0 && sample_rows <= self.batch && real > 0 && real <= widest as usize)
+            .then_some(widest)
     }
 
     fn token_batch_prefill_rows(&self, slot: usize, prompt: &[u32], max_rows: u32) -> u32 {
@@ -716,7 +746,9 @@ impl SeqEngine for CpuServe {
         for &(s, _) in feeds {
             self.check_slot(s)?;
             if !self.live[s] || self.pos[s] as usize + 1 >= self.max_ctx {
-                return Err(RuntimeError::Rejected(format!("token-batch feed slot {s} cannot step")));
+                return Err(RuntimeError::Rejected(format!(
+                    "token-batch feed slot {s} cannot step"
+                )));
             }
         }
         for &(s, prompt, take) in members {
@@ -734,7 +766,12 @@ impl SeqEngine for CpuServe {
         let ids: Vec<u32> = feeds.iter().map(|f| f.1).collect();
         let mut pm = Vec::with_capacity(feeds.len() + members.len());
         for (&(slot, _), id) in feeds.iter().zip(&ids) {
-            pm.push(PackMember { slot, c0: self.pos[slot], rows: std::slice::from_ref(id), sample: true });
+            pm.push(PackMember {
+                slot,
+                c0: self.pos[slot],
+                rows: std::slice::from_ref(id),
+                sample: true,
+            });
         }
         for &(slot, prompt, take) in members {
             let c0 = self.pf_pos[slot];
@@ -848,14 +885,21 @@ mod tests {
     use super::token_batch_share;
 
     fn shares(waiting: &[(usize, u32, u64)], cap: u32) -> Vec<u32> {
-        waiting.iter().map(|w| token_batch_share(&mut waiting.to_vec(), w.0, cap)).collect()
+        waiting
+            .iter()
+            .map(|w| token_batch_share(&mut waiting.to_vec(), w.0, cap))
+            .collect()
     }
 
     #[test]
     fn short_prompts_pass_a_long_one_that_keeps_its_floor() {
         // A 15K prompt (oldest) and two short ones on a 1024-row bucket with 32 live decodes.
         let s = shares(&[(0, 15_000, 0), (1, 300, 1), (2, 400, 2)], 992);
-        assert_eq!(s, vec![292, 300, 400], "the long prompt takes what the short ones leave");
+        assert_eq!(
+            s,
+            vec![292, 300, 400],
+            "the long prompt takes what the short ones leave"
+        );
     }
 
     #[test]
@@ -876,7 +920,10 @@ mod tests {
     #[test]
     fn an_oldest_prompt_that_is_also_shortest_goes_first() {
         // E4B 16K: an 11,985-token prompt and a 15,803-token one a second later.
-        assert_eq!(shares(&[(0, 11_985, 0), (1, 15_803, 1)], 2016), vec![2016, 0]);
+        assert_eq!(
+            shares(&[(0, 11_985, 0), (1, 15_803, 1)], 2016),
+            vec![2016, 0]
+        );
     }
 
     #[test]

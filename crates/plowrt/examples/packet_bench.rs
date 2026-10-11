@@ -19,7 +19,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
     let sweep = args.iter().any(|a| a == "--sweep");
     let each = args.iter().any(|a| a == "--each");
-    let pos: Vec<&String> = args.iter().skip(1).filter(|a| !a.starts_with("--")).collect();
+    let pos: Vec<&String> = args
+        .iter()
+        .skip(1)
+        .filter(|a| !a.starts_with("--"))
+        .collect();
     if !(3..=4).contains(&pos.len()) {
         return Err("usage: packet_bench PACKET PIPELINE ROLE [ITERS] [--sweep|--each]".into());
     }
@@ -33,9 +37,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             for _ in 0..3 {
                 rt.run(program)?;
             }
-            let mut us: Vec<f64> = (0..iters).map(|_| rt.run(program).map(|_| rt.last_run_us())).collect::<Result<_, _>>()?;
+            let mut us: Vec<f64> = (0..iters)
+                .map(|_| rt.run(program).map(|_| rt.last_run_us()))
+                .collect::<Result<_, _>>()?;
             us.sort_by(f64::total_cmp);
-            println!("{{\"role\":\"{}.{n}\",\"program\":{program},\"us\":{:.2}}}", pos[2], us[iters / 2]);
+            println!(
+                "{{\"role\":\"{}.{n}\",\"program\":{program},\"us\":{:.2}}}",
+                pos[2],
+                us[iters / 2]
+            );
         }
         return Ok(());
     }
@@ -45,10 +55,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         for _ in 0..3 {
             rt.run_sequence(&programs)?;
         }
-        let mut us: Vec<f64> =
-            (0..iters).map(|_| rt.run_sequence(&programs).map(|_| rt.last_run_us())).collect::<Result<_, _>>()?;
+        let mut us: Vec<f64> = (0..iters)
+            .map(|_| rt.run_sequence(&programs).map(|_| rt.last_run_us()))
+            .collect::<Result<_, _>>()?;
         us.sort_by(f64::total_cmp);
-        println!("{{\"role\":\"{}\",\"programs\":{},\"us\":{:.2}}}", pos[2], programs.len(), us[iters / 2]);
+        println!(
+            "{{\"role\":\"{}\",\"programs\":{},\"us\":{:.2}}}",
+            pos[2],
+            programs.len(),
+            us[iters / 2]
+        );
         return Ok(());
     }
     let program = pipeline.program(pos[2])?;
@@ -71,7 +87,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     if sweep {
         let raw = std::fs::read(path)?;
-        let n_inst = plowrt::asset::devblob::DevBlob::parse(&raw)?.progs[program].insts.len();
+        let n_inst = plowrt::asset::devblob::DevBlob::parse(&raw)?.progs[program]
+            .insts
+            .len();
         for cap in 0..=n_inst {
             rt.set_debug_max_inst(cap as u32)?;
             println!("{{\"cap\":{cap},\"us\":{:.2}}}", time(&mut rt)?);

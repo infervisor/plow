@@ -119,7 +119,12 @@ fn graft(main: &mut Model, sub: Model, programs: &[usize]) -> Result<Vec<usize>,
                     (_, None) => base.bytes = base.bytes.max(tensor.bytes),
                     (Some(existing), Some(init)) if *existing == init => {}
                     (None, Some(init)) if base.bytes == tensor.bytes => base.init = Some(init),
-                    _ => return Err(format!("grafted tensor {:?} has a different initialization", tensor.name)),
+                    _ => {
+                        return Err(format!(
+                            "grafted tensor {:?} has a different initialization",
+                            tensor.name
+                        ))
+                    }
                 }
                 index
             }
@@ -133,17 +138,26 @@ fn graft(main: &mut Model, sub: Model, programs: &[usize]) -> Result<Vec<usize>,
     let mut progs: Vec<_> = sub.progs.into_iter().map(Some).collect();
     let mut out = Vec::with_capacity(programs.len());
     for &p in programs {
-        let mut program = progs.get_mut(p).and_then(Option::take).ok_or("grafted program is missing")?;
+        let mut program = progs
+            .get_mut(p)
+            .and_then(Option::take)
+            .ok_or("grafted program is missing")?;
         for inst in &mut program.insts {
             for t in &mut inst.t {
                 if *t != packet::dev::TENSOR_NONE {
-                    *t = *map.get(*t as usize).ok_or("grafted instruction names a missing tensor")?;
+                    *t = *map
+                        .get(*t as usize)
+                        .ok_or("grafted instruction names a missing tensor")?;
                 }
             }
         }
         out.push(main.progs.len());
         main.progs.push(program);
-        main.prog_t.push(*sub.prog_t.get(p).ok_or("grafted program shape is missing")?);
+        main.prog_t.push(
+            *sub.prog_t
+                .get(p)
+                .ok_or("grafted program shape is missing")?,
+        );
     }
     Ok(out)
 }
@@ -161,20 +175,34 @@ impl RnntPackets {
         step: PacketPrefix,
         weights: &RnntWeights<'_>,
     ) -> Result<(), String> {
-        let prompt_index = self.compiled_prompt_index.ok_or("a stream needs a compiled RNNT prompt")?;
+        let prompt_index = self
+            .compiled_prompt_index
+            .ok_or("a stream needs a compiled RNNT prompt")?;
         if self.stream.is_some()
             || geometry.rows == 0
             || geometry.rows > self.spec.frames
             || first.input != step.input
-            || first.model.tensors[first.input as usize].name != step.model.tensors[step.input as usize].name
+            || first.model.tensors[first.input as usize].name
+                != step.model.tensors[step.input as usize].name
         {
             return Err("invalid RNNT encoder stream".into());
         }
         let input = first.model.tensors[first.input as usize].name.clone();
-        let spec = RnntSpec { frames: geometry.rows, ..self.spec };
+        let spec = RnntSpec {
+            frames: geometry.rows,
+            ..self.spec
+        };
         let mut variant = |prefix: PacketPrefix| -> Result<Vec<usize>, String> {
             let mut b = builder(prefix.model.n_cu, prefix.model.tensors.clone());
-            emit_encoder(&mut b, spec, weights, EncoderInput::Existing { tensor: prefix.output, prompt_index });
+            emit_encoder(
+                &mut b,
+                spec,
+                weights,
+                EncoderInput::Existing {
+                    tensor: prefix.output,
+                    prompt_index,
+                },
+            );
             let tensors = b.tensors();
             let program = b.finish();
             let mut model = prefix.model;
@@ -188,14 +216,27 @@ impl RnntPackets {
         let first = variant(first)?;
         let step = variant(step)?;
         let init = graft(&mut self.model, init, &[0])?[0];
-        self.stream = Some(StreamPrograms { geometry, init, first, step, input });
+        self.stream = Some(StreamPrograms {
+            geometry,
+            init,
+            first,
+            step,
+            input,
+        });
         Ok(())
     }
 
     /// Vocabulary, detokenizer and language (ASR contract 1); ids past the pieces are dropped.
-    pub fn set_output(&mut self, output: plow_asset::speech_contract::TokenOutput) -> Result<(), String> {
+    pub fn set_output(
+        &mut self,
+        output: plow_asset::speech_contract::TokenOutput,
+    ) -> Result<(), String> {
         if output.pieces.is_empty() || output.pieces.len() > self.spec.vocabulary as usize {
-            return Err(format!("output vocabulary has {} pieces for a joint of {}", output.pieces.len(), self.spec.vocabulary));
+            return Err(format!(
+                "output vocabulary has {} pieces for a joint of {}",
+                output.pieces.len(),
+                self.spec.vocabulary
+            ));
         }
         self.output = Some(output);
         Ok(())
@@ -203,7 +244,10 @@ impl RnntPackets {
 
     /// The `asr_vocabulary.json` section (after [`Self::set_output`]).
     pub fn vocabulary_section(&self) -> Result<packet::devbuild::SectionData, String> {
-        let output = self.output.as_ref().ok_or("RNNT output vocabulary is not set")?;
+        let output = self
+            .output
+            .as_ref()
+            .ok_or("RNNT output vocabulary is not set")?;
         Ok(packet::devbuild::SectionData {
             kind: packet::devbuild::SECT_METADATA,
             name: plow_asset::speech_contract::VOCABULARY_SECTION.into(),
@@ -387,7 +431,9 @@ impl RnntPackets {
             || !prompt_valid(self.spec.prompt_count, prompt_index)
             || self.tdt_durations.len() != self.spec.durations as usize
         {
-            return Err("invalid RNNT decode parameters (TDT packets need set_tdt_durations)".into());
+            return Err(
+                "invalid RNNT decode parameters (TDT packets need set_tdt_durations)".into(),
+            );
         }
         if self
             .compiled_prompt_index
@@ -488,7 +534,12 @@ impl RnntPackets {
             ("joint_batch_max".into(), self.spec.joint_batch as u64),
             ("max_symbols_per_frame".into(), max_symbols_per_frame as u64),
         ]);
-        if self.model.tensors.iter().any(|t| t.name == crate::conformer::VALID_ROWS) {
+        if self
+            .model
+            .tensors
+            .iter()
+            .any(|t| t.name == crate::conformer::VALID_ROWS)
+        {
             tensors.insert(
                 "encoder.valid_rows".into(),
                 PipelineTensor {
@@ -557,20 +608,36 @@ impl RnntPackets {
         if let Some(stream) = &self.stream {
             let g = stream.geometry;
             programs.insert("stream.init".into(), stream.init as u32);
-            for (prefix, sequence) in [("stream.first", &stream.first), ("stream.step", &stream.step)] {
+            for (prefix, sequence) in [
+                ("stream.first", &stream.first),
+                ("stream.step", &stream.step),
+            ] {
                 for (stage, &program) in sequence.iter().enumerate() {
                     programs.insert(format!("{prefix}.{stage}"), program as u32);
                 }
             }
             // The offline encoder input, shared: a step writes its window's leading frames.
             let bins = self.frontend.as_ref().map_or(0, |f| u64::from(f.spec.bins));
-            let input = self.model.tensors.iter().find(|t| t.name == stream.input).ok_or("stream input is missing")?;
-            if bins == 0 || input.bytes % (4 * bins) != 0 || input.bytes / (4 * bins) < u64::from(g.step_input_frames.max(g.first_input_frames)) {
+            let input = self
+                .model
+                .tensors
+                .iter()
+                .find(|t| t.name == stream.input)
+                .ok_or("stream input is missing")?;
+            if bins == 0
+                || input.bytes % (4 * bins) != 0
+                || input.bytes / (4 * bins)
+                    < u64::from(g.step_input_frames.max(g.first_input_frames))
+            {
                 return Err("stream input does not hold the step windows".into());
             }
             tensors.insert(
                 "stream.input".into(),
-                PipelineTensor { name: stream.input.clone(), dtype: PipelineDType::F32, shape: vec![input.bytes / (4 * bins), bins] },
+                PipelineTensor {
+                    name: stream.input.clone(),
+                    dtype: PipelineDType::F32,
+                    shape: vec![input.bytes / (4 * bins), bins],
+                },
             );
             tensors.insert(
                 "stream.key_start".into(),
@@ -580,10 +647,20 @@ impl RnntPackets {
                     shape: vec![1],
                 },
             );
-            for (index, state) in self.model.tensors.iter().filter(|t| t.name.starts_with("state.stream.")).enumerate() {
+            for (index, state) in self
+                .model
+                .tensors
+                .iter()
+                .filter(|t| t.name.starts_with("state.stream."))
+                .enumerate()
+            {
                 tensors.insert(
                     format!("stream.state.{index}"),
-                    PipelineTensor { name: state.name.clone(), dtype: PipelineDType::F32, shape: vec![state.bytes / 4] },
+                    PipelineTensor {
+                        name: state.name.clone(),
+                        dtype: PipelineDType::F32,
+                        shape: vec![state.bytes / 4],
+                    },
                 );
             }
             for (name, value) in [
@@ -867,7 +944,16 @@ fn emit_encoder(b: &mut Builder, s: RnntSpec, w: &RnntWeights<'_>, source: Encod
             unreachable!("validated: an unprompted encoder reads its prefix output");
         };
         let joint = b.tensor("act.rnnt.encoder_joint", bytes3(s.frames, s.joint_width, 4));
-        q8(b, joint, tensor, w.encoder, s.frames, s.joint_width, s.encoder_width, None);
+        q8(
+            b,
+            joint,
+            tensor,
+            w.encoder,
+            s.frames,
+            s.joint_width,
+            s.encoder_width,
+            None,
+        );
         return tensor;
     }
     let full_input_width = s.encoder_width + s.prompt_count;
@@ -1033,10 +1119,19 @@ fn emit_joint(b: &mut Builder, s: RnntSpec, w: &RnntWeights<'_>, bank: usize, fr
     }
     // TDT: each row is `vocabulary` token logits then `durations` duration logits; split them
     // into contiguous rows for the two argmaxes.
-    let tokens = b.tensor("act.rnnt.token_logits", bytes3(s.joint_batch, s.vocabulary, 4));
-    let durations = b.tensor("act.rnnt.duration_logits", bytes3(s.joint_batch, s.durations, 4));
+    let tokens = b.tensor(
+        "act.rnnt.token_logits",
+        bytes3(s.joint_batch, s.vocabulary, 4),
+    );
+    let durations = b.tensor(
+        "act.rnnt.duration_logits",
+        bytes3(s.joint_batch, s.durations, 4),
+    );
     let duration_ids = b.tensor("act.rnnt.duration_ids", u64::from(s.joint_batch) * 4);
-    for (out, cols, offset, result) in [(tokens, s.vocabulary, 0, ids), (durations, s.durations, s.vocabulary, duration_ids)] {
+    for (out, cols, offset, result) in [
+        (tokens, s.vocabulary, 0, ids),
+        (durations, s.durations, s.vocabulary, duration_ids),
+    ] {
         let split = b.emit(DevOp::CopyColsF32, b.all(), &[output], |d| {
             d.t[..2].copy_from_slice(&[out, logits]);
             d.i[..7].copy_from_slice(&[1, frames, cols, outputs, offset, cols, 0]);
@@ -1097,7 +1192,14 @@ fn q8(
     b.emit(
         DevOp::Q8GemmF32,
         // At most 8 rows the kernel walks columns warp by warp (SPQ_GEMV_ROWS): every CU takes a share.
-        repeated(n_cu(b), if m <= 8 { n_cu(b) } else { m.div_ceil(64) * n.div_ceil(64) }),
+        repeated(
+            n_cu(b),
+            if m <= 8 {
+                n_cu(b)
+            } else {
+                m.div_ceil(64) * n.div_ceil(64)
+            },
+        ),
         &dep.into_iter().collect::<Vec<_>>(),
         |d| {
             d.t[..4].copy_from_slice(&[out, input, weight, bias]);
@@ -1421,13 +1523,26 @@ mod tests {
                 input_shape: vec![3, 32],
             }
         };
-        let tdt = RnntSpec { prompt_count: 0, prompt_width: 0, durations: 5, ..appended.spec };
+        let tdt = RnntSpec {
+            prompt_count: 0,
+            prompt_width: 0,
+            durations: 5,
+            ..appended.spec
+        };
         assert!(append(tdt, &weights, prefix(), 1).is_err());
         let mut tdt_packets = append(tdt, &weights, prefix(), 0).unwrap();
-        let encoder_ops: Vec<_> = tdt_packets.model.progs[1].insts.iter().map(|i| DevOp::from_u16(i.op).unwrap()).collect();
+        let encoder_ops: Vec<_> = tdt_packets.model.progs[1]
+            .insts
+            .iter()
+            .map(|i| DevOp::from_u16(i.op).unwrap())
+            .collect();
         assert_eq!(encoder_ops, [DevOp::Q8GemmF32]);
         let joint = &tdt_packets.model.progs[tdt_packets.joint_programs[2].banks[0]];
-        let ops: Vec<_> = joint.insts.iter().map(|i| DevOp::from_u16(i.op).unwrap()).collect();
+        let ops: Vec<_> = joint
+            .insts
+            .iter()
+            .map(|i| DevOp::from_u16(i.op).unwrap())
+            .collect();
         assert_eq!(
             ops,
             [
@@ -1442,14 +1557,20 @@ mod tests {
         );
         assert_eq!(joint.insts[2].i[1], 64 + 5);
         assert_eq!(&joint.insts[5].i[..7], &[1, 3, 5, 69, 64, 5, 0]);
-        assert!(tdt_packets.pipeline_section(63, 10, 0).is_err(), "durations must be set first");
+        assert!(
+            tdt_packets.pipeline_section(63, 10, 0).is_err(),
+            "durations must be set first"
+        );
         assert!(tdt_packets.set_tdt_durations(&[0, 1, 2]).is_err());
         tdt_packets.set_tdt_durations(&[0, 1, 2, 3, 4]).unwrap();
         let section = tdt_packets.pipeline_section(63, 10, 0).unwrap();
         let metadata: plow_asset::packet_pipeline::PacketPipelines =
             serde_json::from_slice(&section.data).unwrap();
         let pipeline = &metadata.pipelines[0];
-        assert_eq!(pipeline.tensors["joint.duration_ids"].name, "act.rnnt.duration_ids");
+        assert_eq!(
+            pipeline.tensors["joint.duration_ids"].name,
+            "act.rnnt.duration_ids"
+        );
         assert_eq!(pipeline.parameters["tdt.durations"], 5);
         assert_eq!(pipeline.parameters["tdt.duration.4"], 4);
         assert_eq!(pipeline.parameters["prompt_count"], 0);

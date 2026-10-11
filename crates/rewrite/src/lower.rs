@@ -153,7 +153,9 @@ fn term_for(
             format!("(Attention {} {} {} {})", e(0)?, e(1)?, e(2)?, quote(&cfg))
         }
         Op::Elementwise(k) => format!("(Ew {} {} {})", quote(ew(*k)), e(0)?, e(1)?),
-        Op::Act(ActKind::Snake) => format!("(ActP {} {} {})", quote(&act(ActKind::Snake)), e(0)?, e(1)?),
+        Op::Act(ActKind::Snake) => {
+            format!("(ActP {} {} {})", quote(&act(ActKind::Snake)), e(0)?, e(1)?)
+        }
         Op::Act(k) => format!("(Act {} {})", quote(&act(*k)), e(0)?),
         Op::Softmax { axis } => format!("(Softmax {} {})", e(0)?, axis),
         Op::Concat { axis } => {

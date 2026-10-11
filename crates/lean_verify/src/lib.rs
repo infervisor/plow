@@ -32,9 +32,9 @@ use std::process::{Command, Stdio};
 use serde::{Deserialize, Serialize};
 
 pub mod checkpoints;
+mod paths;
 pub mod queries;
 mod snapshot;
-mod paths;
 
 /// Certificate returned by the Lean verifier for a single checkpoint call.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -247,7 +247,10 @@ pub fn call(checkpoint: &str, payload: serde_json::Value) -> Result<Certificate,
     let cert: Certificate = serde_json::from_str(stdout.trim())
         .map_err(|e| VerifyError::DeserializeCertificate(e, stdout.clone()))?;
     if cert.checkpoint != checkpoint {
-        return Err(VerifyError::Rejected(format!("expected checkpoint {checkpoint}, got {}", cert.checkpoint)));
+        return Err(VerifyError::Rejected(format!(
+            "expected checkpoint {checkpoint}, got {}",
+            cert.checkpoint
+        )));
     }
     if let Some(key) = df_cache_key {
         *DF_CACHE.lock().unwrap() = Some((key, cert.clone()));
@@ -265,12 +268,18 @@ pub fn call_batch(requests: &[(&str, serde_json::Value)]) -> Result<Vec<Certific
 }
 
 /// Returns the hash of the exact immutable executable image used for this batch.
-pub fn call_batch_bound(requests: &[(&str, serde_json::Value)]) -> Result<(Vec<Certificate>, String), VerifyError> {
+pub fn call_batch_bound(
+    requests: &[(&str, serde_json::Value)],
+) -> Result<(Vec<Certificate>, String), VerifyError> {
     if !cfg!(target_os = "linux") {
-        return Err(VerifyError::BinaryNotFound("immutable verifier-bound receipts require Linux".into()));
+        return Err(VerifyError::BinaryNotFound(
+            "immutable verifier-bound receipts require Linux".into(),
+        ));
     }
     let verifier = snapshot::Snapshot::capture(&locate_binary()?)?;
-    if requests.is_empty() { return Ok((Vec::new(), verifier.sha256())); }
+    if requests.is_empty() {
+        return Ok((Vec::new(), verifier.sha256()));
+    }
     let batch: Vec<_> = requests.iter().map(|(checkpoint, payload)|
         serde_json::json!({ "checkpoint": checkpoint, "payload": payload })).collect();
     let stdout = invoke_with(&verifier.path, &serde_json::json!({ "batch": batch }))?;
@@ -283,9 +292,15 @@ pub fn call_batch_bound(requests: &[(&str, serde_json::Value)]) -> Result<(Vec<C
         .map_err(|e| VerifyError::DeserializeCertificate(e, stdout.clone()))?;
     if result.certificates.len() != requests.len()
         || result.ok != result.certificates.iter().all(|cert| cert.ok)
-        || result.certificates.iter().zip(requests).any(|(cert, (cp, _))| cert.checkpoint != *cp)
+        || result
+            .certificates
+            .iter()
+            .zip(requests)
+            .any(|(cert, (cp, _))| cert.checkpoint != *cp)
     {
-        return Err(VerifyError::Rejected("batch response does not match requested obligations".into()));
+        return Err(VerifyError::Rejected(
+            "batch response does not match requested obligations".into(),
+        ));
     }
     Ok((result.certificates, verifier.sha256()))
 }
@@ -294,7 +309,8 @@ fn verifier_digest(bin: &std::path::Path) -> Option<[u8; 32]> {
     use sha2::{Digest, Sha256};
     let resolved = if bin.components().count() == 1 {
         std::env::split_paths(&std::env::var_os("PATH")?)
-            .map(|dir| dir.join(bin)).find(|path| path.is_file())?
+            .map(|dir| dir.join(bin))
+            .find(|path| path.is_file())?
     } else {
         bin.to_path_buf()
     };
@@ -306,7 +322,11 @@ fn verifier_digest(bin: &std::path::Path) -> Option<[u8; 32]> {
 /// `lean-plow/approved-verifiers.json` pairs it with the executable digest.
 pub fn lean_sources_sha256(dir: &std::path::Path) -> std::io::Result<String> {
     use sha2::{Digest, Sha256};
-    fn walk(root: &std::path::Path, dir: &std::path::Path, out: &mut Vec<(String, String)>) -> std::io::Result<()> {
+    fn walk(
+        root: &std::path::Path,
+        dir: &std::path::Path,
+        out: &mut Vec<(String, String)>,
+    ) -> std::io::Result<()> {
         for entry in std::fs::read_dir(dir)? {
             let path = entry?.path();
             let rel = path.strip_prefix(root).expect("walk stays under root");
@@ -318,7 +338,9 @@ pub fn lean_sources_sha256(dir: &std::path::Path) -> std::io::Result<String> {
                 continue;
             }
             let name = rel.to_string_lossy().replace('\\', "/");
-            if name.ends_with(".lean") || matches!(name.as_str(), "lean-toolchain" | "lake-manifest.json") {
+            if name.ends_with(".lean")
+                || matches!(name.as_str(), "lean-toolchain" | "lake-manifest.json")
+            {
                 out.push((name, format!("{:x}", Sha256::digest(std::fs::read(&path)?))));
             }
         }
@@ -336,7 +358,8 @@ pub fn lean_sources_sha256(dir: &std::path::Path) -> std::io::Result<String> {
 
 pub fn verifier_sha256() -> Result<String, VerifyError> {
     let bin = locate_binary()?;
-    verifier_digest(&bin).map(|digest| digest.iter().map(|b| format!("{b:02x}")).collect())
+    verifier_digest(&bin)
+        .map(|digest| digest.iter().map(|b| format!("{b:02x}")).collect())
         .ok_or_else(|| VerifyError::Rejected("cannot fingerprint verifier executable".into()))
 }
 

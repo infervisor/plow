@@ -482,7 +482,8 @@ mod tests {
 
         let pf = rf.prefill(4096);
         // Suppose measured TTFT is 150.0 ms
-        let (achieved_tf, pct_tf) = pf.attained_compute(150.0, rf.peak_compute_tflops(MmaDtype::Bf16));
+        let (achieved_tf, pct_tf) =
+            pf.attained_compute(150.0, rf.peak_compute_tflops(MmaDtype::Bf16));
         assert!(achieved_tf > 600.0 && achieved_tf < 800.0);
         assert!(pct_tf > 60.0 && pct_tf < 80.0);
     }

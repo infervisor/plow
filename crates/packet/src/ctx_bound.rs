@@ -206,7 +206,10 @@ pub fn tensor_scaling(name: &str) -> Scaling {
 /// that address one must carry a stride site — see [`check_stride_coverage`].
 pub fn is_narrowed_cache(name: &str) -> bool {
     name.starts_with("kv.")
-        && matches!(tensor_scaling(name), Scaling::Linear | Scaling::IndexerBlock16)
+        && matches!(
+            tensor_scaling(name),
+            Scaling::Linear | Scaling::IndexerBlock16
+        )
 }
 
 pub fn indexer_prefix_bytes(rows: u32) -> u64 {
@@ -236,9 +239,18 @@ mod indexer_tests {
         for (rows, bytes) in [(0, 0), (1, 2112), (15, 2112), (16, 2112), (17, 4224)] {
             assert_eq!(indexer_prefix_bytes(rows), bytes);
         }
-        assert_eq!(indexer_rescaled_bytes(64 * 131072 * 132, 131072, 81920), Some(64 * 81920 * 132));
-        for (bytes, from, to) in [(0, 16, 16), (2111, 16, 16), (2112, 0, 16),
-            (2112, 16, 0), (2112, 15, 16), (2112, 16, 17)] {
+        assert_eq!(
+            indexer_rescaled_bytes(64 * 131072 * 132, 131072, 81920),
+            Some(64 * 81920 * 132)
+        );
+        for (bytes, from, to) in [
+            (0, 16, 16),
+            (2111, 16, 16),
+            (2112, 0, 16),
+            (2112, 16, 0),
+            (2112, 15, 16),
+            (2112, 16, 17),
+        ] {
             assert_eq!(indexer_rescaled_bytes(bytes, from, to), None);
         }
         let whole_slots = u64::MAX / 2112 * 2112;
@@ -261,9 +273,14 @@ pub fn linear_bytes(bytes: u64, from: u32, to: u32) -> Option<u64> {
 pub fn is_rope_recipe(g: &GenTensor) -> bool {
     matches!(
         g.kind,
-        GEN_ROPE_COS | GEN_ROPE_SIN | GEN_ROPE_IDX_COS | GEN_ROPE_IDX_SIN
-            | crate::rope::GEN_AMD_ROPE_BF16_COS | crate::rope::GEN_AMD_ROPE_BF16_SIN
-            | crate::rope::GEN_AMD_ROPE_IDX_BF16_COS | crate::rope::GEN_AMD_ROPE_IDX_BF16_SIN
+        GEN_ROPE_COS
+            | GEN_ROPE_SIN
+            | GEN_ROPE_IDX_COS
+            | GEN_ROPE_IDX_SIN
+            | crate::rope::GEN_AMD_ROPE_BF16_COS
+            | crate::rope::GEN_AMD_ROPE_BF16_SIN
+            | crate::rope::GEN_AMD_ROPE_IDX_BF16_COS
+            | crate::rope::GEN_AMD_ROPE_IDX_BF16_SIN
     )
 }
 

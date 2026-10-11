@@ -1614,7 +1614,15 @@ fn s3gen_encoder_estimator_and_vocoder_shapes() {
         .map(|&o| g.tensor(o).shape.clone().unwrap().display_with(&g.syms))
         .collect();
     // mu, the estimator's velocity, F0, and the STFT-frame post conv (120 frames per mel + 1).
-    assert_eq!(shapes, ["[B, 2*S, 80]", "[B, T, 80]", "[B, T, 1]", "[B, 1 + 120*T, 18]"]);
+    assert_eq!(
+        shapes,
+        [
+            "[B, 2*S, 80]",
+            "[B, T, 80]",
+            "[B, T, 1]",
+            "[B, 1 + 120*T, 18]"
+        ]
+    );
     let attention = g.count_ops(|op| matches!(op, nn_graph::Op::Attention { .. }));
     assert_eq!(attention, 10 + 14 * 4);
 }

@@ -62,7 +62,11 @@ pub struct Measure {
 impl Measure {
     /// Fraction of lines still in the locked level.
     pub fn held(&self, level: u32) -> f64 {
-        let hit = if level == 2 { self.l1_l2 } else { self.l1_l2 + self.l3 };
+        let hit = if level == 2 {
+            self.l1_l2
+        } else {
+            self.l1_l2 + self.l3
+        };
         hit as f64 / self.lines.max(1) as f64
     }
 }
@@ -97,7 +101,11 @@ impl PseudoLock {
                 std::io::Error::last_os_error()
             )));
         }
-        Ok(Self { file, caps, gate: Mutex::new(()) })
+        Ok(Self {
+            file,
+            caps,
+            gate: Mutex::new(()),
+        })
     }
 
     /// The process-wide device, opened once; `None` when the driver is not loaded.
@@ -123,14 +131,23 @@ impl PseudoLock {
     /// The range must stay mapped until the process exits: the driver pins its pages.
     pub unsafe fn lock(&self, ptr: *mut u8, len: usize, cpu: u32, level: u32) -> Result<Measure> {
         let _g = self.gate.lock().unwrap_or_else(|e| e.into_inner());
-        let mut req = LockReq { addr: ptr as u64, len: len as u64, cpu: cpu as i32, level, ..Default::default() };
+        let mut req = LockReq {
+            addr: ptr as u64,
+            len: len as u64,
+            cpu: cpu as i32,
+            level,
+            ..Default::default()
+        };
         if unsafe { libc::ioctl(self.file.as_raw_fd(), IOC_LOCK, &mut req) } != 0 {
             return Err(RuntimeError::Device(format!(
                 "pseudo-lock L{level} cpu {cpu} {len} B: {}",
                 std::io::Error::last_os_error()
             )));
         }
-        let mut m = Measure { id: req.id, ..Default::default() };
+        let mut m = Measure {
+            id: req.id,
+            ..Default::default()
+        };
         if unsafe { libc::ioctl(self.file.as_raw_fd(), IOC_MEASURE, &mut m) } != 0 {
             return Err(RuntimeError::Device(format!(
                 "pseudo-lock measure {}: {}",

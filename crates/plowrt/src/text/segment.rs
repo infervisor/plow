@@ -37,24 +37,40 @@ impl CrfSegmenter {
         let lines = |s: &str| -> Result<Vec<&str>> { Ok(t.text(&name(s))?.split('\n').collect()) };
         let bad = |m: &str| RuntimeError::Rejected(format!("{prefix}: {m}"));
         let feats = lines("features")?;
-        let features: HashMap<Box<str>, u32> =
-            feats.iter().enumerate().filter(|(_, f)| !f.is_empty()).map(|(i, f)| ((*f).into(), i as u32)).collect();
+        let features: HashMap<Box<str>, u32> = feats
+            .iter()
+            .enumerate()
+            .filter(|(_, f)| !f.is_empty())
+            .map(|(i, f)| ((*f).into(), i as u32))
+            .collect();
         let tags = lines("tags")?;
         let n_tag = tags.len();
         let wb = t.bytes(&name("weights"))?;
-        let w: Vec<f64> = wb.chunks_exact(8).map(|c| f64::from_le_bytes(c.try_into().unwrap())).collect();
+        let w: Vec<f64> = wb
+            .chunks_exact(8)
+            .map(|c| f64::from_le_bytes(c.try_into().unwrap()))
+            .collect();
         if w.len() != feats.len() * n_tag + n_tag * n_tag || wb.len() % 8 != 0 {
             return Err(bad("weights disagree with features x tags"));
         }
-        let set = |s: &str| -> Result<HashSet<Box<str>>> { Ok(lines(s)?.into_iter().filter(|l| !l.is_empty()).map(Into::into).collect()) };
+        let set = |s: &str| -> Result<HashSet<Box<str>>> {
+            Ok(lines(s)?
+                .into_iter()
+                .filter(|l| !l.is_empty())
+                .map(Into::into)
+                .collect())
+        };
         let mut norm = HashMap::new();
         for l in lines("norm")?.into_iter().filter(|l| !l.is_empty()) {
             let (k, v) = l.split_once('\t').ok_or_else(|| bad("norm line"))?;
             let mut c = k.chars();
-            let (Some(ch), None) = (c.next(), c.next()) else { return Err(bad("norm key")) };
+            let (Some(ch), None) = (c.next(), c.next()) else {
+                return Err(bad("norm key"));
+            };
             norm.insert(ch, v.into());
         }
-        let meta: serde_json::Value = serde_json::from_str(t.text(&name("meta"))?).map_err(|e| bad(&e.to_string()))?;
+        let meta: serde_json::Value =
+            serde_json::from_str(t.text(&name("meta"))?).map_err(|e| bad(&e.to_string()))?;
         let num = |k: &str| meta[k].as_u64().map(|v| v as usize).ok_or_else(|| bad(k));
         Ok(CrfSegmenter {
             features,
@@ -66,7 +82,9 @@ impl CrfSegmenter {
             norm,
             word_min: num("word_min")?,
             word_max: num("word_max")?,
-            word_feature: meta["word_feature"].as_bool().ok_or_else(|| bad("word_feature"))?,
+            word_feature: meta["word_feature"]
+                .as_bool()
+                .ok_or_else(|| bad("word_feature"))?,
         })
     }
 
@@ -81,7 +99,14 @@ impl CrfSegmenter {
 
     fn crf_words(&self, frag: &str) -> Vec<String> {
         let chars: Vec<char> = frag.chars().collect();
-        let nodes: Vec<String> = chars.iter().map(|c| self.norm.get(c).map_or_else(|| c.to_string(), |s| s.to_string())).collect();
+        let nodes: Vec<String> = chars
+            .iter()
+            .map(|c| {
+                self.norm
+                    .get(c)
+                    .map_or_else(|| c.to_string(), |s| s.to_string())
+            })
+            .collect();
         let (n, nt) = (nodes.len(), self.n_tag);
         let mut node = vec![0f64; n * nt];
         let mut key = String::new();
@@ -97,7 +122,9 @@ impl CrfSegmenter {
         }
         let back = self.w.len() - nt * nt;
         // edge[a][b]: tag a at i followed by tag b at i + 1.
-        let edge: Vec<f64> = (0..nt * nt).map(|k| 1.0 + self.w[back + (k % nt) * nt + k / nt]).collect();
+        let edge: Vec<f64> = (0..nt * nt)
+            .map(|k| 1.0 + self.w[back + (k % nt) * nt + k / nt])
+            .collect();
         let mut best = vec![0f64; n * nt];
         let mut prev = vec![0usize; n * nt];
         best[(n - 1) * nt..].copy_from_slice(&node[(n - 1) * nt..]);
@@ -163,7 +190,8 @@ impl CrfSegmenter {
         }
         // get_slice_str: "" unless nodes[start..start + len] lies inside the fragment.
         let slice = |start: isize, len: usize| -> Option<String> {
-            (start >= 0 && (start as usize) < n && start as usize + len <= n).then(|| nodes[start as usize..start as usize + len].concat())
+            (start >= 0 && (start as usize) < n && start as usize + len <= n)
+                .then(|| nodes[start as usize..start as usize + len].concat())
         };
         let word = |s: Option<String>| s.filter(|w| self.unigram.contains(w.as_str()));
         let lens: Vec<usize> = (self.word_min..=self.word_max).rev().collect();
@@ -184,7 +212,10 @@ impl CrfSegmenter {
             }
             post_in.push(w);
         }
-        let pre_ex: Vec<_> = lens.iter().map(|&l| word(slice(ii - l as isize, l))).collect();
+        let pre_ex: Vec<_> = lens
+            .iter()
+            .map(|&l| word(slice(ii - l as isize, l)))
+            .collect();
         let post_ex: Vec<_> = lens.iter().map(|&l| word(slice(ii + 1, l))).collect();
         let s = |w: &Option<String>| w.as_deref().unwrap_or(NO_WORD).to_string();
         for pre in &pre_ex {
@@ -212,7 +243,11 @@ impl CrfSegmenter {
             let mut i = 0;
             while i < end + 1 {
                 let merged = sent[i..i + m].concat();
-                if self.merge.contains(merged.as_str()) && !sent[i..i + m].iter().all(|w| self.merge.contains(w.as_str())) {
+                if self.merge.contains(merged.as_str())
+                    && !sent[i..i + m]
+                        .iter()
+                        .all(|w| self.merge.contains(w.as_str()))
+                {
                     sent.splice(i..i + m, std::iter::once(merged));
                     i += 1;
                     if sent.len() < m {

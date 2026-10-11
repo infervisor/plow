@@ -201,7 +201,9 @@ pub fn sample_with_scratch(
     for (_, v) in probs.iter_mut() {
         *v /= sum;
     }
-    let desc = |a: &(usize, f32), b: &(usize, f32)| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal);
+    let desc = |a: &(usize, f32), b: &(usize, f32)| {
+        b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+    };
     // Top-k first selects, then sorts only the k survivors: a full sort of a 262k vocabulary
     // costs milliseconds per row.
     if params.top_k > 0 && probs.len() > params.top_k {
@@ -278,7 +280,11 @@ pub fn sample_cfg(
     scratch: &mut Vec<f32>,
 ) -> u32 {
     scratch.clear();
-    scratch.extend(cond.iter().zip(uncond).map(|(a, b)| a + p.cfg_weight * (a - b)));
+    scratch.extend(
+        cond.iter()
+            .zip(uncond)
+            .map(|(a, b)| a + p.cfg_weight * (a - b)),
+    );
     sample_guided(p, history, u, scratch)
 }
 
@@ -294,10 +300,14 @@ pub fn sample_cfg_bf16(
 ) -> u32 {
     let f = |b: &[u8]| f32::from_bits(u32::from(u16::from_le_bytes([b[0], b[1]])) << 16);
     scratch.clear();
-    scratch.extend(cond.chunks_exact(2).zip(uncond.chunks_exact(2)).map(|(a, b)| {
-        let (a, b) = (f(a), f(b));
-        a + p.cfg_weight * (a - b)
-    }));
+    scratch.extend(
+        cond.chunks_exact(2)
+            .zip(uncond.chunks_exact(2))
+            .map(|(a, b)| {
+                let (a, b) = (f(a), f(b));
+                a + p.cfg_weight * (a - b)
+            }),
+    );
     sample_guided(p, history, u, scratch)
 }
 
@@ -324,7 +334,11 @@ fn sample_guided(
                 if let (Some(x), Some(s)) = (scratch.get_mut(t as usize), seen.get_mut(w)) {
                     if *s & bit == 0 {
                         *s |= bit;
-                        *x = if *x < 0.0 { *x * p.repetition_penalty } else { *x / p.repetition_penalty };
+                        *x = if *x < 0.0 {
+                            *x * p.repetition_penalty
+                        } else {
+                            *x / p.repetition_penalty
+                        };
                     }
                 }
             }
@@ -376,11 +390,25 @@ mod tests {
 
     #[test]
     fn sample_cfg_bf16_matches_f32_rows() {
-        let p = CfgParams { cfg_weight: 0.5, temperature: 0.8, min_p: 0.05, top_p: 0.9, repetition_penalty: 1.2 };
+        let p = CfgParams {
+            cfg_weight: 0.5,
+            temperature: 0.8,
+            min_p: 0.05,
+            top_p: 0.9,
+            repetition_penalty: 1.2,
+        };
         let bf = |x: f32| (x.to_bits() >> 16) as u16;
-        let cond: Vec<f32> = (0..97).map(|i| f32::from_bits(u32::from(bf(((i * 37) % 97) as f32 * 0.1 - 3.0)) << 16)).collect();
-        let uncond: Vec<f32> = (0..97).map(|i| f32::from_bits(u32::from(bf(((i * 11) % 97) as f32 * 0.07 - 2.0)) << 16)).collect();
-        let raw = |v: &[f32]| v.iter().flat_map(|x| bf(*x).to_le_bytes()).collect::<Vec<u8>>();
+        let cond: Vec<f32> = (0..97)
+            .map(|i| f32::from_bits(u32::from(bf(((i * 37) % 97) as f32 * 0.1 - 3.0)) << 16))
+            .collect();
+        let uncond: Vec<f32> = (0..97)
+            .map(|i| f32::from_bits(u32::from(bf(((i * 11) % 97) as f32 * 0.07 - 2.0)) << 16))
+            .collect();
+        let raw = |v: &[f32]| {
+            v.iter()
+                .flat_map(|x| bf(*x).to_le_bytes())
+                .collect::<Vec<u8>>()
+        };
         let (rc, ru) = (raw(&cond), raw(&uncond));
         let (mut s1, mut s2) = (Vec::new(), Vec::new());
         for i in 0..50 {

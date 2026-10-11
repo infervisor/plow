@@ -735,8 +735,7 @@ fn generated_entry_binds_matching_wide_rungs_and_leaves_short_ones() {
         ("plow_attention_warps", 8),
         ("plow_pf_request_abi", 2),
     ];
-    let image =
-        plow_asset::cubin::synthetic_elf(crate::gen_kernels::ENTRY_SYMBOL, &globals, 90);
+    let image = plow_asset::cubin::synthetic_elf(crate::gen_kernels::ENTRY_SYMBOL, &globals, 90);
     std::fs::write(directory.join(&crate::gen_kernels::CATALOG[0].file), image).unwrap();
     let wide = |rows: u32| {
         let mut model = fixture(512, false, true);
@@ -751,7 +750,14 @@ fn generated_entry_binds_matching_wide_rungs_and_leaves_short_ones() {
     };
     let apply = |model: &mut Model, sections: &mut Vec<SectionData>, px4: bool| {
         crate::gen_kernels::apply_output_objects(
-            model, sections, "sm_90a", &output, "h100", true, "attn_pf_hd512", px4,
+            model,
+            sections,
+            "sm_90a",
+            &output,
+            "h100",
+            true,
+            "attn_pf_hd512",
+            px4,
         )
     };
     let mut model = wide(4096);
@@ -761,11 +767,23 @@ fn generated_entry_binds_matching_wide_rungs_and_leaves_short_ones() {
     assert_eq!(roles.programs[0].roles, [0, 18, 0]);
     let object = &roles.objects[&18];
     let abi = plow_asset::segment_roles::GeneratedAbi::parse(&object.abi).unwrap();
-    assert_eq!((abi.entry.as_str(), abi.block, abi.smem), ("attn_pf_hd512", 256, 206_848));
+    assert_eq!(
+        (abi.entry.as_str(), abi.block, abi.smem),
+        ("attn_pf_hd512", 256, 206_848)
+    );
     assert_eq!(object.attention.as_ref().unwrap().kv_tile, 64);
     // The hand-written HD512 role sees no program left to bind.
     assert!(!apply_output_object(
-        &mut model, &mut sections, "sm90a", &output, "h100", 8192, true, None, false, false,
+        &mut model,
+        &mut sections,
+        "sm90a",
+        &output,
+        "h100",
+        8192,
+        true,
+        None,
+        false,
+        false,
     )
     .unwrap());
     // Below the smallest tuned shape class, and against the px4 role, nothing is bound.
@@ -790,8 +808,7 @@ fn generated_entry_rejects_media_span_sites_it_does_not_mask() {
         ("plow_attention_warps", 8),
         ("plow_pf_request_abi", 2),
     ];
-    let image =
-        plow_asset::cubin::synthetic_elf(crate::gen_kernels::ENTRY_SYMBOL, &globals, 90);
+    let image = plow_asset::cubin::synthetic_elf(crate::gen_kernels::ENTRY_SYMBOL, &globals, 90);
     std::fs::write(directory.join(&crate::gen_kernels::CATALOG[0].file), image).unwrap();
     let rows = 4096u32;
     let two_sites = |second_span: bool| {
@@ -804,7 +821,14 @@ fn generated_entry_rejects_media_span_sites_it_does_not_mask() {
         let out = builder.tensor("out", u64::from(rows) * 16 * 512 * 2);
         let span = builder.tensor("span", u64::from(rows) * 4);
         let mut dep = builder.emit(DevOp::Nop, builder.all(), &[], |_| {});
-        for i7 in [1, if second_span { 1 | u32::from(span) << 16 } else { 1 }] {
+        for i7 in [
+            1,
+            if second_span {
+                1 | u32::from(span) << 16
+            } else {
+                1
+            },
+        ] {
             dep = builder.emit(DevOp::FlashPrefill, builder.all(), &[dep], |op| {
                 op.t[..6].copy_from_slice(&[partial, ml, q, k, v, out]);
                 op.i = [rows, rows, 16, 1, 0, 0, 512, i7];
@@ -830,7 +854,14 @@ fn generated_entry_rejects_media_span_sites_it_does_not_mask() {
     };
     let apply = |model: &mut Model, sections: &mut Vec<SectionData>| {
         crate::gen_kernels::apply_output_objects(
-            model, sections, "sm_90a", &output, "h100", true, "attn_pf_hd512", false,
+            model,
+            sections,
+            "sm_90a",
+            &output,
+            "h100",
+            true,
+            "attn_pf_hd512",
+            false,
         )
     };
     let mut sections = Vec::new();

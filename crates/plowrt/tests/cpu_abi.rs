@@ -50,7 +50,10 @@ fn ctx_layout_matches_c() {
             abi::plow_cpu_abi_offsetof_ctx_reserved(),
             offset_of!(PlowCpuCtx, reserved)
         );
-        assert_eq!(abi::plow_cpu_abi_sizeof_pack(), size_of::<ffi::PlowCpuPack>());
+        assert_eq!(
+            abi::plow_cpu_abi_sizeof_pack(),
+            size_of::<ffi::PlowCpuPack>()
+        );
         assert_eq!(
             abi::plow_cpu_abi_offsetof_pack_split_rows(),
             offset_of!(ffi::PlowCpuPack, split_rows)

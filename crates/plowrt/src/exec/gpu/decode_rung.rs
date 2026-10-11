@@ -64,7 +64,8 @@ pub(super) fn validate_cublaslt_ladder(blob: &DevBlob, metadata: &SegmentRoles) 
         let Some(roles) = metadata.program(index).map(|p| &p.roles) else {
             if !native {
                 return Err(RuntimeError::Rejected(
-                    "cuBLASLt ladder requires roles for every rung above the first routed one".into(),
+                    "cuBLASLt ladder requires roles for every rung above the first routed one"
+                        .into(),
                 ));
             }
             program.check_coarse_single_segment()?;
@@ -72,7 +73,10 @@ pub(super) fn validate_cublaslt_ladder(blob: &DevBlob, metadata: &SegmentRoles) 
         };
         // A grouped-MoE rung below the projection rungs: served on its own, like the MoE ladder.
         if native
-            && !roles.iter().copied().any(plow_asset::segment_roles::is_projection)
+            && !roles
+                .iter()
+                .copied()
+                .any(plow_asset::segment_roles::is_projection)
             && roles.contains(&plow_asset::segment_roles::MOE_DECODE_CUBLASLT)
         {
             moe_lt::decode_segments(program, &blob.tensors, roles)?;
@@ -118,8 +122,9 @@ pub(super) fn validate_cublaslt_ladder(blob: &DevBlob, metadata: &SegmentRoles) 
         Ok(())
     })
     .map_err(RuntimeError::Rejected)?;
-    let classes: Vec<bool> =
-        (start..blob.progs.len()).map(|index| routed.contains(&index)).collect();
+    let classes: Vec<bool> = (start..blob.progs.len())
+        .map(|index| routed.contains(&index))
+        .collect();
     validate_decode_ladder_impl(blob, true, &classes)
 }
 
@@ -215,9 +220,9 @@ fn validate_decode_ladder_impl(blob: &DevBlob, segmented: bool, routed: &[bool])
             d.blocks = 0;
             match DevOp::from_u16(d.op) {
                 Some(DevOp::Nop) => {}
-                Some(DevOp::QuantFp8 | DevOp::GemmFp8 | DevOp::GemmMedFp8 | DevOp::GemmSmallFp8)
-                    if routed.get(index).copied().unwrap_or(false) =>
-                {
+                Some(
+                    DevOp::QuantFp8 | DevOp::GemmFp8 | DevOp::GemmMedFp8 | DevOp::GemmSmallFp8,
+                ) if routed.get(index).copied().unwrap_or(false) => {
                     if d.i[0] != g.t {
                         return Err(reject("FP8 instruction rows disagree with rung width"));
                     }
@@ -454,7 +459,9 @@ fn validate_decode_ladder_impl(blob: &DevBlob, segmented: bool, routed: &[bool])
                 .tensors
                 .get(id as usize)
                 .is_none_or(|t| t.bytes != bytes || t.init.is_some())
-                || caches.insert(id, geometry).is_some_and(|old| old != geometry)
+                || caches
+                    .insert(id, geometry)
+                    .is_some_and(|old| old != geometry)
                 || [pos, kvlen, ids].contains(&(id as usize))
             {
                 return Err(reject("invalid or aliased KV tensor extent"));
@@ -685,7 +692,9 @@ impl DecodeRung {
             library: None,
             rows: g.t as usize,
             group_arena: insts.iter().any(|d| {
-                DevOp::from_u16(d.op) == Some(DevOp::MoeAlignGemmaPf) && d.i[3] != 0 && d.i[0] >= d.i[3]
+                DevOp::from_u16(d.op) == Some(DevOp::MoeAlignGemmaPf)
+                    && d.i[3] != 0
+                    && d.i[0] >= d.i[3]
             }),
             object: None,
             kernarg,
@@ -695,7 +704,6 @@ impl DecodeRung {
         })
     }
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -712,8 +720,14 @@ mod tests {
         let buf = std::fs::read(&path).expect("read blob");
         let blob = DevBlob::parse(&buf).expect("parse devblob");
         eprintln!("decode rungs: {:?}", blob.decode_rungs());
-        eprintln!("segmented=false -> {:?}", validate_decode_ladder_impl(&blob, false, &[]));
-        eprintln!("segmented=true  -> {:?}", validate_decode_ladder_impl(&blob, true, &[]));
+        eprintln!(
+            "segmented=false -> {:?}",
+            validate_decode_ladder_impl(&blob, false, &[])
+        );
+        eprintln!(
+            "segmented=true  -> {:?}",
+            validate_decode_ladder_impl(&blob, true, &[])
+        );
         // Which of the three validators gpu.rs picks is decided here, and picking the
         // non-segmented one makes a perfectly good ladder read as unqualified.
         let prefill = blob.prefill_progs().len();
@@ -733,9 +747,18 @@ mod tests {
                 // The three branches gpu.rs chooses between. Whichever one the runtime takes
                 // is what decides the ladder; calling all three here localizes a silent
                 // fallback without a GPU lease.
-                eprintln!("validate_moe_lt_ladder   -> {:?}", validate_moe_lt_ladder(&blob, &roles));
-                eprintln!("validate_cublaslt_ladder -> {:?}", validate_cublaslt_ladder(&blob, &roles));
-                eprintln!("validate_decode_ladder   -> {:?}", validate_decode_ladder(&blob));
+                eprintln!(
+                    "validate_moe_lt_ladder   -> {:?}",
+                    validate_moe_lt_ladder(&blob, &roles)
+                );
+                eprintln!(
+                    "validate_cublaslt_ladder -> {:?}",
+                    validate_cublaslt_ladder(&blob, &roles)
+                );
+                eprintln!(
+                    "validate_decode_ladder   -> {:?}",
+                    validate_decode_ladder(&blob)
+                );
             }
             Ok(None) => eprintln!("NO segment role metadata -> falls to validate_decode_ladder"),
             Err(e) => eprintln!("segment role metadata error: {e:?}"),

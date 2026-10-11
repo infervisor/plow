@@ -42,15 +42,22 @@ fn expected_support(family: &str) -> ToolSupport {
 
 #[test]
 fn every_family_renders_tool_conversations_like_transformers() {
-    let mut families: Vec<_> = std::fs::read_dir(fixtures()).expect("fixtures").map(|e| e.unwrap().path()).collect();
+    let mut families: Vec<_> = std::fs::read_dir(fixtures())
+        .expect("fixtures")
+        .map(|e| e.unwrap().path())
+        .collect();
     families.sort();
-    assert!(families.len() >= 14, "fixture families missing: {families:?}");
+    assert!(
+        families.len() >= 14,
+        "fixture families missing: {families:?}"
+    );
     let mut id_checked = 0;
     for dir in families {
         let family = dir.file_name().unwrap().to_str().unwrap().to_string();
         let t = ChatTemplate::load(&dir).unwrap_or_else(|| panic!("{family}: template compiles"));
         assert_eq!(t.tools, expected_support(&family), "{family}: tool support");
-        let fx: Value = serde_json::from_slice(&std::fs::read(dir.join("cases.json")).unwrap()).unwrap();
+        let fx: Value =
+            serde_json::from_slice(&std::fs::read(dir.join("cases.json")).unwrap()).unwrap();
         #[cfg(feature = "hf-tokenizer")]
         let tok = fx["tokenizer"]
             .as_str()
@@ -62,13 +69,20 @@ fn every_family_renders_tool_conversations_like_transformers() {
             let mut body = case["request"].clone();
             body["model"] = "m".into();
             let req: ChatRequest = serde_json::from_value(body).unwrap();
-            let opts = RenderOpts { tools: req.tools.clone(), ..Default::default() };
+            let opts = RenderOpts {
+                tools: req.tools.clone(),
+                ..Default::default()
+            };
             let got = render(&t, &req.messages, &opts);
             match (case.get("expected").and_then(Value::as_str), got) {
                 (Some(want), Ok(mut got)) => {
                     // `strftime_now` renders today; the fixture holds the day it was captured.
                     let dated = |s: &str| {
-                        s.split('\n').find(|l| l.starts_with("Current date: ") || l.starts_with("Today Date: ")).map(str::to_owned)
+                        s.split('\n')
+                            .find(|l| {
+                                l.starts_with("Current date: ") || l.starts_with("Today Date: ")
+                            })
+                            .map(str::to_owned)
                     };
                     if let (Some(today), Some(captured)) = (dated(&got), dated(want)) {
                         got = got.replacen(&today, &captured, 1);
@@ -83,7 +97,10 @@ fn every_family_renders_tool_conversations_like_transformers() {
                     }
                 }
                 (None, Err(RenderError::Template(_))) => {}
-                (want, got) => panic!("{family}/{name}: transformers {want:?} vs plowrt {got:?} ({:?})", case.get("error")),
+                (want, got) => panic!(
+                    "{family}/{name}: transformers {want:?} vs plowrt {got:?} ({:?})",
+                    case.get("error")
+                ),
             }
         }
     }

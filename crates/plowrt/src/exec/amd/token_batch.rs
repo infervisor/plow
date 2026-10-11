@@ -222,7 +222,8 @@ mod tests {
             [1, 2, 4, 8, 16, 32, 64, 128]
         );
         let batch = blob.decode_progs().last().unwrap().t as usize;
-        let synthesized = crate::exec::mixed_program::synthesize(&blob, batch, false, true).unwrap();
+        let synthesized =
+            crate::exec::mixed_program::synthesize(&blob, batch, false, true).unwrap();
         assert_eq!(
             synthesized
                 .programs
@@ -318,10 +319,18 @@ mod tests {
                 .enumerate()
                 .filter(|(_, inst)| inst.op == DevOp::RowGather as u16)
                 .collect();
-            assert_eq!(gathers.len(), 1, "bucket {} terminal gather count", program.rows);
+            assert_eq!(
+                gathers.len(),
+                1,
+                "bucket {} terminal gather count",
+                program.rows
+            );
             let (gather_index, gather) = gathers[0];
             let final_norm = &program.insts[gather_index + 1];
-            assert_eq!(gather.i[..3], [spec.decode_rows, final_norm.i[1], program.rows]);
+            assert_eq!(
+                gather.i[..3],
+                [spec.decode_rows, final_norm.i[1], program.rows]
+            );
             assert_eq!(final_norm.op, DevOp::RmsNorm as u16);
             assert_eq!(final_norm.i[0], spec.decode_rows);
             assert_eq!(final_norm.t[1], gather.t[0]);

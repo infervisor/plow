@@ -159,7 +159,14 @@ struct GemmArgs {
 }
 const _: () = assert!(std::mem::size_of::<GemmArgs>() == 144);
 
-fn arguments(rows: u32, heads: u32, weight: u64, input: u64, output: u64, spec: &KernelSpec) -> GemmArgs {
+fn arguments(
+    rows: u32,
+    heads: u32,
+    weight: u64,
+    input: u64,
+    output: u64,
+    spec: &KernelSpec,
+) -> GemmArgs {
     let grid = 256u32.div_ceil(spec.mt_i) * rows.div_ceil(spec.mt_j) * heads;
     GemmArgs {
         dims: [1, 0x20104001, 0x4c080006, grid, 256, rows, heads, 512],
@@ -228,11 +235,16 @@ impl MlaFold {
         let normalize = EngineDevice::get_function(be, &module, "plow_glm_fold_normalize")?;
         let convert = EngineDevice::get_function(be, &module, "plow_glm_fold_convert")?;
         let weight_convert = EngineDevice::get_function(be, &module, "plow_glm_fold_weight")?;
-        let normalize_grouped = if super::amd::elf_symbol_names(&image).contains(&"plow_glm_fold_grouped_abi_1") {
-            Some(EngineDevice::get_function(be, &module, "plow_glm_fold_normalize_grouped")?)
-        } else {
-            None
-        };
+        let normalize_grouped =
+            if super::amd::elf_symbol_names(&image).contains(&"plow_glm_fold_grouped_abi_1") {
+                Some(EngineDevice::get_function(
+                    be,
+                    &module,
+                    "plow_glm_fold_normalize_grouped",
+                )?)
+            } else {
+                None
+            };
         for (k, size) in [(normalize, 36), (convert, 24), (weight_convert, 16)]
             .into_iter()
             .chain(normalize_grouped.map(|k| (k, 40)))
@@ -473,7 +485,12 @@ mod tests {
             let (mut p, mut t) = fixture();
             p.role = role;
             p.insts[0].i = i;
-            let sizes = [1024 * 64 * 256 * 2, 1024 * 64 * 512 * 4, 1024 * 64 * 2 * 4, weight_bytes(64) / 2];
+            let sizes = [
+                1024 * 64 * 256 * 2,
+                1024 * 64 * 512 * 4,
+                1024 * 64 * 2 * 4,
+                weight_bytes(64) / 2,
+            ];
             for (tensor, bytes) in t.iter_mut().zip(sizes) {
                 tensor.bytes = bytes;
             }
@@ -486,14 +503,33 @@ mod tests {
         route.rebase(8192).unwrap();
         assert_eq!(route.rows, 1024, "a band keeps its own rows");
         assert!(route.rebase(4096).is_err(), "a band runs only a full chunk");
-        assert!(band(bucket, [1024, 64, 256, 0, 1, 1, 16, 0]).is_err(), "64 heads only on the sibling");
-        assert!(band(sibling, [1024, 64, 256, 0, 1, 1, 0, 0]).is_err(), "64 heads need the group layout");
-        assert!(band(sibling, [1024, 64, 256, 0, 2, 1, 16, 0]).is_err(), "one split per head");
-        assert!(band(sibling, [8192, 64, 256, 0, 1, 1, 16, 0]).is_err(), "band rows are T/8");
-        let a = arguments(1024, 64, 0, 0, 0, &serde_json::from_str::<Vec<KernelSpec>>(include_str!(
-            "../../../../runtime/amd/glm_fold_lt_gfx942.json"
-        ))
-        .unwrap()[kernel_index(1024)]);
+        assert!(
+            band(bucket, [1024, 64, 256, 0, 1, 1, 16, 0]).is_err(),
+            "64 heads only on the sibling"
+        );
+        assert!(
+            band(sibling, [1024, 64, 256, 0, 1, 1, 0, 0]).is_err(),
+            "64 heads need the group layout"
+        );
+        assert!(
+            band(sibling, [1024, 64, 256, 0, 2, 1, 16, 0]).is_err(),
+            "one split per head"
+        );
+        assert!(
+            band(sibling, [8192, 64, 256, 0, 1, 1, 16, 0]).is_err(),
+            "band rows are T/8"
+        );
+        let a = arguments(
+            1024,
+            64,
+            0,
+            0,
+            0,
+            &serde_json::from_str::<Vec<KernelSpec>>(include_str!(
+                "../../../../runtime/amd/glm_fold_lt_gfx942.json"
+            ))
+            .unwrap()[kernel_index(1024)],
+        );
         assert_eq!(a.dims[6], 64);
         assert_eq!(a.dims[3] % 64, 0);
     }
