@@ -83,7 +83,7 @@ def find_predecessor(idx: dict | None, label: str, generation: int) -> dict | No
     return max(prior, key=lambda v: v["generation"]) if prior else None
 
 
-def source_path_for(digest: str, bundle: dict, objset: dict | None, assets: Path, objdir: Path) -> Path:
+def source_path_for(digest: str, bundle: dict, objset: dict | None, assets: Path, objdir: Path | None) -> Path:
     for f in bundle["files"]:
         if f["sha256"] == digest:
             return assets / f["name"]
@@ -131,7 +131,7 @@ def run() -> None:
     objset = pd.load_json(Path(args.objset)) if args.objset else None
     store = Path(args.store)
     assets = Path(args.assets) if args.assets else Path(args.bundle).parent
-    objdir = Path(args.objects) if args.objects else Path(args.objset).parent
+    objdir = Path(args.objects) if args.objects else (Path(args.objset).parent if args.objset else None)
 
     if args.status == "validated" and args.tok_s is None:
         pd.die(
