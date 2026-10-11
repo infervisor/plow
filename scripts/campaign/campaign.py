@@ -72,6 +72,21 @@ def load(path: str) -> dict:
     return r
 
 
+def newer_source(binary: Path) -> str | None:
+    """A source `binary` was built from that changed after it (cargo's dep-info `<binary>.d`), else
+    None. A stale plowc emits the packet format of its own build, which a newer plowrt refuses."""
+    dep_info = binary.with_name(binary.name + ".d")
+    if not dep_info.exists():
+        return None
+    built = binary.stat().st_mtime
+    _, _, sources = dep_info.read_text().partition("\n")[0].partition(": ")
+    for source in sources.replace("\\ ", "\0").split():
+        path = Path(source.replace("\0", " "))
+        if path.exists() and path.stat().st_mtime > built:
+            return str(path)
+    return None
+
+
 def sha(path: Path) -> str:
     h = hashlib.sha256()
     with open(path, "rb") as f:
@@ -562,6 +577,8 @@ def cmd_build(a: argparse.Namespace) -> None:
     plowc = Path(os.environ.get("CARGO_TARGET_DIR", REPO / "target")) / "release" / "plowc"
     if not plowc.exists():
         die("target/release/plowc missing: nix develop -c cargo build -p plowc --release")
+    if stale := newer_source(plowc):
+        die(f"target/release/plowc is older than {stale}: nix develop -c cargo build -p plowc --release")
     compiler_start = sha(plowc)
 
     base_args = [
