@@ -124,6 +124,17 @@ probe exists. A variant records the *datasheet* capacity while a probe reports
 the *usable pool*, so they are compared with a tolerance rather than `>=`; on a
 live MI300X the gap is 16 MiB.
 
+## Runtime-compiled targets
+
+Apple's Metal shaders are compiled on the serving machine from the packet, so
+an Apple bundle (`target.vendor = "apple"`, `isa = "metal3"`) ships **no
+objset**: the bundle's files are the whole build, `build.objset_id` is empty,
+and there is no pairing hash. `plowrt target --json` on such a machine prints
+the exact `target` a publisher copies into `pack_bundle.py --target-json`;
+`publish_dist.py` and `plowrt pack` take no objset for it. Selection is
+unchanged: the Metal device reports `apple`/`metal3`, the SKU hwspec names,
+its core count and the memory Metal will let it use.
+
 ## Serving is offline
 
 `serve` performs **no network I/O**. `--model` resolves from the local store

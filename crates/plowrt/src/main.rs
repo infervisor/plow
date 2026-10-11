@@ -638,6 +638,14 @@ enum Cmd {
         upgradable: bool,
     },
 
+    /// This machine as the registry sees it: the target a published variant
+    /// must name to be selected here. `--json` is the `target` a bundle
+    /// manifest carries, so a publisher can copy it verbatim.
+    Target {
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+
     /// Move a pin to the newest compatible generation.
     Upgrade {
         /// The model to upgrade. Omit with `--all`.
@@ -687,15 +695,16 @@ enum Cmd {
         /// Bundle manifest, as written by `pack_bundle.py`.
         #[arg(long)]
         bundle: PathBuf,
-        /// Objset manifest, as written by `pack_objset.py`.
+        /// Objset manifest, as written by `pack_objset.py`. Omitted for a
+        /// runtime-compiled target (Apple), whose bundle names none.
         #[arg(long)]
-        objset: PathBuf,
+        objset: Option<PathBuf>,
         /// Directory `bundle.json`'s `files[]` live in.
         #[arg(long)]
         assets: PathBuf,
         /// Directory `objset.json`'s `objects[]` live in.
         #[arg(long)]
-        objects: PathBuf,
+        objects: Option<PathBuf>,
         /// Output archive path.
         #[arg(long)]
         out: PathBuf,
@@ -1061,6 +1070,7 @@ async fn async_main(
         )),
         Cmd::Show { model } => dist_cmd::report(dist_cmd::cmd_show(&model)),
         Cmd::Ls { upgradable } => dist_cmd::report(dist_cmd::cmd_ls(upgradable)),
+        Cmd::Target { json } => dist_cmd::report(dist_cmd::cmd_target(json)),
         Cmd::Upgrade {
             model,
             all,
@@ -1078,7 +1088,11 @@ async fn async_main(
             objects,
             out,
         } => dist_cmd::report(dist_cmd::cmd_pack(
-            &bundle, &objset, &assets, &objects, &out,
+            &bundle,
+            objset.as_deref(),
+            &assets,
+            objects.as_deref(),
+            &out,
         )),
         #[cfg(feature = "hsa")]
         Cmd::AmdBench {

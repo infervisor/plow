@@ -96,6 +96,23 @@ impl Backend for CpuBackend {
         ExecutorClass::Cpu
     }
 
+    /// On Apple Silicon the portable backend drives the Metal engine, so the
+    /// machine identifies as its GPU: `apple`/`metal3`, the SKU from the
+    /// device name, its core count, and the memory Metal will let it use.
+    /// Elsewhere the CPU backend identifies no silicon.
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    fn fingerprint(&self) -> Option<hwspec::isa::HardwareFingerprint> {
+        use objc2_metal::{MTLCreateSystemDefaultDevice, MTLDevice};
+        let device = MTLCreateSystemDefaultDevice()?;
+        let spec = hwspec::registry::lookup(&device.name().to_string())?;
+        hwspec::isa::HardwareFingerprint::from_live(
+            "metal3",
+            spec.sm_count,
+            device.recommendedMaxWorkingSetSize(),
+            None,
+        )
+    }
+
     fn enumerate(&self) -> Vec<ExecutorTarget> {
         (0..self.executors)
             .map(|i| ExecutorTarget {

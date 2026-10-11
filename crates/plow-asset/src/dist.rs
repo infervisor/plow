@@ -50,6 +50,13 @@ pub struct Target {
     pub mem_bytes: u64,
 }
 
+/// Whether a vendor's kernels are compiled on the serving machine from the
+/// packet rather than shipped as device objects. Apple's Metal shaders are:
+/// a bundle for it carries no objset, and `plowrt serve` compiles on load.
+pub fn runtime_compiled(vendor: &str) -> bool {
+    vendor == "apple"
+}
+
 /// How work is spread across GPUs. An object, not a string, so a composite
 /// (`tp4pp2`) is expressible the day `plowc` stops refusing `--parallel pp`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -70,6 +77,9 @@ impl Parallel {
 pub struct Build {
     pub plow_git: String,
     pub plowc: String,
+    /// Empty for a target whose kernels compile at run time (see
+    /// [`runtime_compiled`]): such a variant has no objset.
+    #[serde(default)]
     pub objset_id: String,
     /// `build.json`'s `pairing.hash`, or `None` for a GENERAL objset (every arm
     /// compiled, no `plow_packet_hash_{lo,hi}` stamp) which pairs with any packet.
@@ -199,7 +209,11 @@ pub struct Bundle {
     pub files: Vec<FileRef>,
     pub tokenizer: TokenizerRef,
     pub checkpoint: BundleCheckpoint,
-    pub objset: BundleObjset,
+    /// The device objects. `None` for a target whose kernels compile at run
+    /// time from the packet (see [`runtime_compiled`]): the bundle's files
+    /// are the whole build.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub objset: Option<BundleObjset>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pairing_hash: Option<String>,
     /// The `PLOW_*` settings this bundle was validated with. `serve` applies
@@ -610,6 +624,12 @@ impl Variant {
                 self.label
             ));
         }
+        if self.build.objset_id.is_empty() && !runtime_compiled(&self.target.vendor) {
+            return Err(format!(
+                "variant {}: no objset, and {} kernels do not compile at run time",
+                self.label, self.target.vendor
+            ));
+        }
         Ok(())
     }
 }
@@ -703,6 +723,17 @@ impl Bundle {
         if !self.files.iter().any(|f| f.role == "packet") {
             return Err("bundle: no file with role `packet`".into());
         }
+        if self.objset.is_none() {
+            if !runtime_compiled(&self.target.vendor) {
+                return Err(format!(
+                    "bundle: no objset, and {} kernels do not compile at run time",
+                    self.target.vendor
+                ));
+            }
+            if self.pairing_hash.is_some() {
+                return Err("bundle: a pairing hash with no objset to pair".into());
+            }
+        }
         // A derived tokenizer is a shipped artifact and must be pinned; a
         // checkpoint-sourced one is whatever the snapshot holds.
         match self.tokenizer.source {
@@ -740,7 +771,7 @@ impl Bundle {
             ));
         }
         let mut rungs = std::collections::BTreeSet::new();
-        for l in &self.objset.lowrung {
+        for l in self.objset.iter().flat_map(|o| &o.lowrung) {
             if l.max == 0 || !rungs.insert(l.max) {
                 return Err(format!("bundle: bad or duplicate lowrung max {}", l.max));
             }

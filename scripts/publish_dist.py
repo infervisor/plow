@@ -46,7 +46,7 @@ def variant_id(bundle: dict, generation: int) -> str:
         f"{bundle['parallel']['mode']}{bundle['parallel']['n']}",
         str(bundle["max_ctx"]),
         bundle["plow_git"],
-        bundle["objset"]["objset_id"],
+        (bundle.get("objset") or {}).get("objset_id", ""),
     )
 
 
@@ -55,10 +55,10 @@ def existing_index(store: Path, ns: str, name: str) -> dict | None:
     return pd.load_json(p) if p.exists() else None
 
 
-def blob_inventory(bundle: dict, objset: dict) -> dict[str, int]:
+def blob_inventory(bundle: dict, objset: dict | None) -> dict[str, int]:
     """Every blob a variant needs → its size."""
     inv = {f["sha256"]: f["bytes"] for f in bundle["files"]}
-    for o in objset["objects"]:
+    for o in (objset or {}).get("objects", []):
         inv[o["sha256"]] = o["bytes"]
     return inv
 
@@ -83,11 +83,11 @@ def find_predecessor(idx: dict | None, label: str, generation: int) -> dict | No
     return max(prior, key=lambda v: v["generation"]) if prior else None
 
 
-def source_path_for(digest: str, bundle: dict, objset: dict, assets: Path, objdir: Path) -> Path:
+def source_path_for(digest: str, bundle: dict, objset: dict | None, assets: Path, objdir: Path | None) -> Path:
     for f in bundle["files"]:
         if f["sha256"] == digest:
             return assets / f["name"]
-    for o in objset["objects"]:
+    for o in (objset or {}).get("objects", []):
         if o["sha256"] == digest:
             return objdir / o["name"]
     pd.die(f"no source file for blob {digest}")
@@ -120,15 +120,18 @@ def run() -> None:
         self_test()
         print("publish_dist selftest: PASS")
         return
-    for need in ("bundle", "objset", "store"):
+    for need in ("bundle", "store"):
         if not getattr(args, need):
             pd.die(f"--{need} is required")
 
     bundle = pd.load_json(Path(args.bundle))
-    objset = pd.load_json(Path(args.objset))
+    # A runtime-compiled bundle (Apple) names no objset and is published alone.
+    if bool(args.objset) != bool(bundle.get("objset")):
+        pd.die("--objset must be given exactly when the bundle names an objset")
+    objset = pd.load_json(Path(args.objset)) if args.objset else None
     store = Path(args.store)
     assets = Path(args.assets) if args.assets else Path(args.bundle).parent
-    objdir = Path(args.objects) if args.objects else Path(args.objset).parent
+    objdir = Path(args.objects) if args.objects else (Path(args.objset).parent if args.objset else None)
 
     if args.status == "validated" and args.tok_s is None:
         pd.die(
@@ -159,7 +162,11 @@ def run() -> None:
         prior_manifest = pd.model_dir(store, ns, name) / predecessor["manifest"]
         prior = pd.load_json(prior_manifest) if prior_manifest.exists() else None
         if prior is not None:
-            prior_objset = pd.load_json(pd.objset_path(store, prior["objset"]["objset_id"]))
+            prior_objset = (
+                pd.load_json(pd.objset_path(store, prior["objset"]["objset_id"]))
+                if prior.get("objset")
+                else None
+            )
             prior_inv = blob_inventory(prior, prior_objset)
             upgrade_bytes = sum(n for d, n in inv.items() if d not in prior_inv)
             packet_changed = any(
@@ -168,7 +175,7 @@ def run() -> None:
             delta = "packet" if packet_changed else "objset"
 
     print(f"{ns}/{name}  {label}@g{generation}")
-    print(f"  objset      {objset['objset_id']}")
+    print(f"  objset      {objset['objset_id'] if objset else '(none: runtime-compiled)'}")
     print(f"  blobs       {len(inv)} total, {len(missing)} to upload ({pd.human(sum(missing.values()))})")
     if predecessor:
         print(
@@ -194,9 +201,10 @@ def run() -> None:
             pd.write_atomic(dst, data)
 
     # 2. Immutable manifests.
-    objset_bytes = pd.canonical_json(objset)
-    pd.write_atomic(pd.objset_path(store, objset["objset_id"]), objset_bytes)
-    bundle["objset"]["sha256"] = pd.sha256_bytes(objset_bytes)
+    if objset is not None:
+        objset_bytes = pd.canonical_json(objset)
+        pd.write_atomic(pd.objset_path(store, objset["objset_id"]), objset_bytes)
+        bundle["objset"]["sha256"] = pd.sha256_bytes(objset_bytes)
 
     bundle_bytes = pd.canonical_json(bundle)
     manifest_rel = f"manifests/{label}@g{generation}"
@@ -215,7 +223,7 @@ def run() -> None:
         "build": {
             "plow_git": bundle["plow_git"],
             "plowc": "0.1.0",
-            "objset_id": objset["objset_id"],
+            "objset_id": objset["objset_id"] if objset else "",
             **({"pairing_hash": bundle["pairing_hash"]} if bundle.get("pairing_hash") else {}),
         },
         "manifest": manifest_rel,

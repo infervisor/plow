@@ -26,6 +26,10 @@ import plow_dist as pd
 
 # Files plow produced and therefore distributes. Anything the HF snapshot
 # already carries is linked at prepare time instead; see `--tokenizer`.
+# Vendors whose kernels compile on the serving machine from the packet: a
+# bundle for them carries no objset. Mirrors `plow_asset::dist::runtime_compiled`.
+RUNTIME_COMPILED = {"apple"}
+
 ROLES = {
     "model.pkt": "packet",
     "build.json": "build_manifest",
@@ -46,15 +50,20 @@ def build(args) -> dict:
     assets = Path(args.assets)
     if not assets.is_dir():
         pd.die(f"{assets} is not a directory")
-    objset = pd.load_json(Path(args.objset))
+    # A runtime-compiled target (Apple: Metal shaders compile on the serving
+    # machine from the packet) has no objset; its target comes from
+    # `plowrt target --json` on such a machine.
+    if bool(args.objset) == bool(args.target_json):
+        pd.die("pass exactly one of --objset (device objects) or --target-json (runtime-compiled)")
+    objset = pd.load_json(Path(args.objset)) if args.objset else None
 
     build_json = pd.load_json(assets / "build.json") if (assets / "build.json").exists() else {}
-    pairing = (build_json.get("pairing") or {}).get("hash")
+    pairing = (build_json.get("pairing") or {}).get("hash") if objset is not None else None
 
     # A specialised object pairs only with the packet that produced it; a
     # general one carries no stamp and pairs with any. Catching a mismatch here
     # turns a refusal twenty frames into the loader into an obvious one.
-    for o in objset.get("objects", []):
+    for o in (objset or {}).get("objects", []):
         stamp = o.get("packet_hash")
         if stamp is None:
             continue
@@ -128,7 +137,14 @@ def build(args) -> dict:
             "(it is the registry key `plowrt serve` registers under)"
         )
 
-    target = dict(objset["target"])
+    if objset is not None:
+        target = dict(objset["target"])
+    else:
+        target = pd.load_json(Path(args.target_json))
+        if target.get("vendor") not in RUNTIME_COMPILED:
+            pd.die(f"--target-json names vendor {target.get('vendor')!r}, whose kernels ship as objects: pass --objset")
+        if args.lowrung:
+            pd.die("--lowrung names objsets; a runtime-compiled target has none to override")
     label = args.label or default_label(target, args.parallel, args.max_ctx, build_json)
 
     doc = {
@@ -152,14 +168,15 @@ def build(args) -> dict:
             "layout": args.layout,
             "bytes": args.checkpoint_bytes,
         },
-        "objset": {
+        "runtime_env": parse_env(args.serve_env),
+    }
+    if objset is not None:
+        doc["objset"] = {
             "objset_id": objset["objset_id"],
             "manifest": f"v1/objsets/{objset['objset_id']}.json",
             "sha256": pd.sha256_bytes(pd.canonical_json(objset)),
             "lowrung": lowrung,
-        },
-        "runtime_env": parse_env(args.serve_env),
-    }
+        }
     if pairing:
         doc["pairing_hash"] = pairing
     if args.recipe:
@@ -217,7 +234,8 @@ def default_label(target: dict, n: int, max_ctx: int, build_json: dict) -> str:
     feats = build_json.get("features") or {}
     on = [k for k in ("fp8_kv", "mxfp4_weights", "w8a8", "fp8_weights") if feats.get(k)]
     ctx = f"{max_ctx // 1024}k" if max_ctx % 1024 == 0 else str(max_ctx)
-    parts = [target["isa"], target["sku"].lower(), f"tp{n}", ctx, *on]
+    sku = "-".join(target["sku"].lower().split())
+    parts = [target["isa"], sku, f"tp{n}", ctx, *on]
     return "-".join(parts)
 
 
@@ -225,6 +243,11 @@ def run() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("assets", nargs="?", help="a `plowc --emit devblob` output directory")
     ap.add_argument("--objset", help="objset.json from pack_objset.py")
+    ap.add_argument(
+        "--target-json",
+        help="the `target` from `plowrt target --json` on the serving machine, for a "
+        "runtime-compiled target (Apple) that ships no objset",
+    )
     ap.add_argument("--namespace", default="infervisor")
     ap.add_argument("--name", help="model name within the namespace")
     ap.add_argument("--network", help="serving slug; defaults to weights.json's")
@@ -257,7 +280,7 @@ def run() -> None:
         print("pack_bundle selftest: PASS")
         return
 
-    for need in ("assets", "objset", "name", "hf"):
+    for need in ("assets", "name", "hf"):
         if not getattr(args, need):
             pd.die(f"--{need.replace('_', '-')} is required")
     if args.plow_git is None:
@@ -309,6 +332,7 @@ def self_test() -> None:
         base = dict(
             assets=str(assets),
             objset=str(op),
+            target_json=None,
             namespace="infervisor",
             name="kimi-k3",
             network=None,
@@ -373,6 +397,32 @@ def self_test() -> None:
         doc = build(argparse.Namespace(**derived))
         assert doc["tokenizer"]["source"] == "derived"
         assert any(f["name"] == "tokenizer.json" for f in doc["files"])
+
+        # A runtime-compiled target (Apple) brings a target description instead
+        # of an objset and names none; a vendor that ships objects may not.
+        tp = d / "target.json"
+        tp.write_text(json.dumps({"vendor": "apple", "isa": "metal3", "sku": "Apple M4 Pro", "units": 16, "mem_bytes": 19069665280}))
+        apple = dict(base, objset=None, target_json=str(tp), parallel=1, max_ctx=2048)
+        doc = build(argparse.Namespace(**apple))
+        assert "objset" not in doc and "pairing_hash" not in doc, doc
+        assert doc["label"].startswith("metal3-apple-m4-pro-tp1-2k"), doc["label"]
+        tp.write_text(json.dumps({"vendor": "amd", "isa": "gfx942", "sku": "MI325X", "units": 304, "mem_bytes": 274877906944}))
+        try:
+            build(argparse.Namespace(**apple))
+            raise AssertionError("accepted a target-json for a vendor that ships objects")
+        except pd.Fail as e:
+            assert "pass --objset" in str(e), e
+        tp.write_text(json.dumps({"vendor": "apple", "isa": "metal3", "sku": "Apple M4 Pro", "units": 16, "mem_bytes": 19069665280}))
+        try:
+            build(argparse.Namespace(**dict(apple, lowrung=[f"1:{op}"])))
+            raise AssertionError("accepted low-rung objsets for a runtime-compiled target")
+        except pd.Fail as e:
+            assert "--lowrung" in str(e), e
+        try:
+            build(argparse.Namespace(**dict(base, target_json=str(tp))))
+            raise AssertionError("accepted both --objset and --target-json")
+        except pd.Fail:
+            pass
 
 
 main = pd.main_guard(run)

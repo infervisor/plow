@@ -51,6 +51,30 @@ fn live() -> plow_asset::dist::LiveTarget {
     dist::live_target(&backends)
 }
 
+/// `plowrt target`: the live target, as a line or as the `target` object a
+/// bundle manifest carries (`mem_bytes` is the usable pool the probe reports,
+/// which is what selection compares against).
+pub fn cmd_target(json: bool) -> Result<(), Err> {
+    let t = live();
+    if json {
+        let sku = t
+            .sku
+            .clone()
+            .ok_or("this machine has no GPU fingerprint; nothing to publish for")?;
+        let target = plow_asset::dist::Target {
+            vendor: t.vendor.clone(),
+            isa: t.isa.clone(),
+            sku,
+            units: t.units,
+            mem_bytes: t.mem_bytes,
+        };
+        println!("{}", serde_json::to_string_pretty(&target)?);
+    } else {
+        print_live(&t);
+    }
+    Ok(())
+}
+
 fn print_live(t: &plow_asset::dist::LiveTarget) {
     match &t.sku {
         Some(sku) => println!(
@@ -141,7 +165,12 @@ pub fn cmd_load(
         ckpt
     } else if fetch_weights {
         let c = &resolved.bundle.checkpoint;
-        println!("fetching {} @{} ({})", c.source, c.revision, pull::human(c.bytes));
+        println!(
+            "fetching {} @{} ({})",
+            c.source,
+            c.revision,
+            pull::human(c.bytes)
+        );
         dist::weights::fetch(st.root(), &c.source, &c.revision, c.shards)?
     } else {
         return Err(format!(
@@ -300,9 +329,9 @@ pub fn cmd_upgrade(model: Option<&str>, all: bool, dry_run: bool) -> Result<(), 
 #[cfg(feature = "dist")]
 pub fn cmd_pack(
     bundle_path: &std::path::Path,
-    objset_path: &std::path::Path,
+    objset_path: Option<&std::path::Path>,
     assets: &std::path::Path,
-    objects: &std::path::Path,
+    objects: Option<&std::path::Path>,
     out: &std::path::Path,
 ) -> Result<(), Err> {
     use plow_asset::dist::{Bundle, ObjSet};
@@ -314,15 +343,34 @@ pub fn cmd_pack(
         .validate()
         .map_err(|e| format!("{}: {e}", bundle_path.display()))?;
 
-    let objset_bytes = std::fs::read(objset_path)?;
-    let objset: ObjSet = serde_json::from_slice(&objset_bytes)
-        .map_err(|e| format!("{}: {e}", objset_path.display()))?;
-    objset
-        .validate()
-        .map_err(|e| format!("{}: {e}", objset_path.display()))?;
-    objset
-        .pairs_with(bundle.pairing_hash.as_deref())
-        .map_err(|e| format!("{}: {e}", objset_path.display()))?;
+    // A bundle that names an objset must ship it; a runtime-compiled one
+    // (no objset in the bundle) must not be handed one.
+    let objset = match (&bundle.objset, objset_path) {
+        (Some(_), None) => return Err("the bundle names an objset: pass --objset".into()),
+        (None, Some(p)) => {
+            return Err(format!("{}: the bundle has no objset to pair it with", p.display()).into())
+        }
+        (None, None) => None,
+        (Some(_), Some(objset_path)) => {
+            let objset_bytes = std::fs::read(objset_path)?;
+            let objset: ObjSet = serde_json::from_slice(&objset_bytes)
+                .map_err(|e| format!("{}: {e}", objset_path.display()))?;
+            objset
+                .validate()
+                .map_err(|e| format!("{}: {e}", objset_path.display()))?;
+            objset
+                .pairs_with(bundle.pairing_hash.as_deref())
+                .map_err(|e| format!("{}: {e}", objset_path.display()))?;
+            Some((objset, objset_bytes))
+        }
+    };
+
+    // Every argument is checked before --out is created or truncated.
+    let objects_in = match (&objset, objects) {
+        (Some(_), None) => return Err("the objset's objects need --objects".into()),
+        (Some((objset, _)), Some(dir)) => objset.objects.iter().map(|o| (o, dir)).collect(),
+        (None, _) => Vec::new(),
+    };
 
     let file = std::fs::File::create(out)?;
     let mut zip = zip::ZipWriter::new(file);
@@ -331,11 +379,14 @@ pub fn cmd_pack(
 
     zip.start_file("bundle.json", options)?;
     zip.write_all(&bundle_bytes)?;
-    zip.start_file("objset.json", options)?;
-    zip.write_all(&objset_bytes)?;
-
-    let mut total_bytes: u64 = (bundle_bytes.len() + objset_bytes.len()) as u64;
-    let mut total_files: usize = 2;
+    let mut total_bytes: u64 = bundle_bytes.len() as u64;
+    let mut total_files: usize = 1;
+    if let Some((_, objset_bytes)) = &objset {
+        zip.start_file("objset.json", options)?;
+        zip.write_all(objset_bytes)?;
+        total_bytes += objset_bytes.len() as u64;
+        total_files += 1;
+    }
 
     for f in &bundle.files {
         let path = assets.join(&f.name);
@@ -355,7 +406,7 @@ pub fn cmd_pack(
         total_files += 1;
     }
 
-    for o in &objset.objects {
+    for (o, objects) in objects_in {
         let path = objects.join(&o.name);
         let bytes = std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
         let got = dist::Digest::of(&bytes);

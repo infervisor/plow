@@ -159,18 +159,19 @@ pub fn resolve(
     let bundle: Bundle = parse_json("bundle.json", &raw)?;
     bundle.validate().map_err(RuntimeError::Dist)?;
 
+    // A runtime-compiled target (Apple) ships no objset: the files are the
+    // whole build, and there is nothing to pair.
     let mut objsets = Vec::new();
-    let mut want: Vec<(Option<u32>, String, String)> = vec![(
-        None,
-        bundle.objset.manifest.clone(),
-        bundle.objset.sha256.clone(),
-    )];
-    for l in &bundle.objset.lowrung {
-        want.push((
-            Some(l.max),
-            format!("v1/objsets/{}.json", l.objset_id),
-            l.sha256.clone(),
-        ));
+    let mut want: Vec<(Option<u32>, String, String)> = Vec::new();
+    if let Some(os) = &bundle.objset {
+        want.push((None, os.manifest.clone(), os.sha256.clone()));
+        for l in &os.lowrung {
+            want.push((
+                Some(l.max),
+                format!("v1/objsets/{}.json", l.objset_id),
+                l.sha256.clone(),
+            ));
+        }
     }
     // Every objset manifest is verified, rung overrides included. Skipping the
     // rungs would leave a hole in the chain of custody exactly where the decode

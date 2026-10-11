@@ -516,7 +516,7 @@ fn bundle() -> Bundle {
             layout: "native-mxfp4".into(),
             bytes: 1_590_000_000_000,
         },
-        objset: BundleObjset {
+        objset: Some(BundleObjset {
             objset_id: "obj0".into(),
             manifest: "v1/objsets/amd/gfx942/mi325x/obj0.json".into(),
             sha256: "b".repeat(64),
@@ -532,7 +532,7 @@ fn bundle() -> Bundle {
                     sha256: "2".repeat(64),
                 },
             ],
-        },
+        }),
         pairing_hash: Some("0x9fd0e880fb6fbf09".into()),
         runtime_env: BTreeMap::from([("PLOW_CTR_DBUF".into(), "1".into())]),
         recipe: None,
@@ -541,6 +541,38 @@ fn bundle() -> Bundle {
 
 // K3 ships tiktoken.model and NO tokenizer.json, so plow reconstructs one — the
 // single case where a tokenizer is a shipped artifact.
+/// Apple's Metal shaders compile on the serving machine from the packet, so
+/// an Apple bundle ships no objset; any other vendor without one is a
+/// broken publication.
+#[test]
+fn a_runtime_compiled_target_ships_no_objset_and_nothing_else_may() {
+    let mut b = bundle();
+    b.objset = None;
+    b.pairing_hash = None;
+    let err = b.validate().unwrap_err();
+    assert!(err.contains("no objset"), "{err}");
+
+    b.target = Target {
+        vendor: "apple".into(),
+        isa: "metal3".into(),
+        sku: "Apple M4 Pro".into(),
+        units: 16,
+        mem_bytes: 18 << 30,
+    };
+    b.validate().unwrap();
+    assert!(runtime_compiled("apple") && !runtime_compiled("amd"));
+
+    b.pairing_hash = Some("0x1".into());
+    assert!(b.validate().is_err(), "a pairing hash with nothing to pair");
+
+    let mut v = variant("metal3-apple-m4-pro-tp1-2k", 1, b.target.clone(), "tp", 1);
+    v.build.objset_id = String::new();
+    v.build.pairing_hash = None;
+    v.validate().unwrap();
+    v.target = target("gfx942", "MI325X", 304, MI325X);
+    assert!(v.validate().is_err(), "an AMD variant names its objset");
+}
+
 #[test]
 fn a_derived_tokenizer_must_be_pinned_and_shipped() {
     let mut b = bundle();
@@ -617,18 +649,18 @@ fn bundle_rejects_structural_damage() {
     );
 
     let mut b = base.clone();
-    b.objset.lowrung[1].max = 1;
+    b.objset.as_mut().unwrap().lowrung[1].max = 1;
     assert!(b.validate().is_err(), "duplicate lowrung width");
 
     let mut b = base.clone();
-    b.objset.lowrung[0].max = 0;
+    b.objset.as_mut().unwrap().lowrung[0].max = 0;
     assert!(b.validate().is_err());
 
     // A rung override with no manifest digest is fetched unverified, and its
     // objects are checked against digests that manifest itself names — so an
     // unpinned rung can serve arbitrary decode objects.
     let mut b = base;
-    b.objset.lowrung[0].sha256 = String::new();
+    b.objset.as_mut().unwrap().lowrung[0].sha256 = String::new();
     let err = b.validate().unwrap_err();
     assert!(err.contains("unverified"), "{err}");
 }

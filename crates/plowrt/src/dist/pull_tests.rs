@@ -140,12 +140,12 @@ fn bundle(label: &str, gen: u32, pkt_sha: &str, pkt_bytes: u64, objset_id: &str)
             layout: "native-mxfp4".into(),
             bytes: 1_590_000_000_000,
         },
-        objset: BundleObjset {
+        objset: Some(BundleObjset {
             objset_id: objset_id.into(),
             manifest: format!("v1/objsets/{objset_id}.json"),
             sha256: String::new(), // filled by the publisher below
             lowrung: vec![],
-        },
+        }),
         pairing_hash: Some("0x9fd0e880fb6fbf09".into()),
         runtime_env: BTreeMap::from([("PLOW_CTR_DBUF".into(), "1".into())]),
         recipe: None,
@@ -198,7 +198,7 @@ fn publish(f: &Fixture, label: &str, gen: u32, pkt: &[u8], obj: &[u8]) -> Varian
     );
 
     let mut b = bundle(label, gen, &pkt_sha, pkt_len, &objset_id);
-    b.objset.sha256 = set_sha;
+    b.objset.as_mut().unwrap().sha256 = set_sha;
     let manifest_sha = f.write(
         &format!("v1/infervisor/kimi-k3/manifests/{label}@g{gen}"),
         &serde_json::to_vec(&b).unwrap(),
@@ -264,6 +264,56 @@ fn a_full_pull_materializes_a_servable_directory() {
     let (_, t2) = pull(&store, &*fetch, &resolved).unwrap();
     assert_eq!(t2.fetched_blobs, 0);
     assert_eq!(t2.reused_blobs, 2);
+}
+
+/// An Apple bundle names no objset: the pull fetches the files alone and
+/// lays nothing under `hsaco/`, and the live Metal target selects it.
+#[test]
+fn a_runtime_compiled_bundle_pulls_its_files_and_no_objects() {
+    let f = Fixture::new("apple");
+    let pkt = vec![9u8; 2048];
+    let (pkt_sha, pkt_len) = f.blob(&pkt);
+    let apple = Target {
+        vendor: "apple".into(),
+        isa: "metal3".into(),
+        sku: "Apple M4 Pro".into(),
+        units: 16,
+        mem_bytes: 18 << 30,
+    };
+    let label = "metal3-apple-m4-pro-tp1-2k";
+    let mut b = bundle(label, 1, &pkt_sha, pkt_len, "");
+    b.objset = None;
+    b.pairing_hash = None;
+    b.target = apple.clone();
+    b.parallel.n = 1;
+    let manifest_sha = f.write(
+        &format!("v1/infervisor/kimi-k3/manifests/{label}@g1"),
+        &serde_json::to_vec(&b).unwrap(),
+    );
+    let mut v = variant(label, 1, &manifest_sha, "");
+    v.target = apple.clone();
+    v.parallel.n = 1;
+    v.build.pairing_hash = None;
+    write_index(&f, vec![v]);
+
+    let live = LiveTarget {
+        vendor: "apple".into(),
+        isa: "metal3".into(),
+        sku: Some("Apple M4 Pro".into()),
+        units: 16,
+        mem_bytes: 18 << 30,
+        gpus: 1,
+        toolchain: None,
+    };
+    let store = f.store();
+    let fetch = f.fetch();
+    let r = reference::parse("kimi-k3").unwrap();
+    let resolved = resolve(&*fetch, &r, &live, Constraints::default()).unwrap();
+    assert!(resolved.objsets.is_empty());
+    let (dir, t) = pull(&store, &*fetch, &resolved).unwrap();
+    assert_eq!(t.fetched_blobs, 1);
+    assert_eq!(std::fs::read(dir.join("model.pkt")).unwrap(), pkt);
+    assert!(!dir.join("hsaco").exists());
 }
 
 /// The property the whole layout exists for: a generation that changes only the
@@ -378,7 +428,7 @@ fn an_objset_stamped_for_another_packet_is_refused_before_any_blob_moves() {
     let set = objset("obj-x", &obj_sha, obj_len, Some("0xdeadbeef"));
     let set_sha = f.write("v1/objsets/obj-x.json", &serde_json::to_vec(&set).unwrap());
     let mut b = bundle(LABEL, 1, &pkt_sha, pkt_len, "obj-x");
-    b.objset.sha256 = set_sha;
+    b.objset.as_mut().unwrap().sha256 = set_sha;
     let manifest_sha = f.write(
         &format!("v1/infervisor/kimi-k3/manifests/{LABEL}@g1"),
         &serde_json::to_vec(&b).unwrap(),
