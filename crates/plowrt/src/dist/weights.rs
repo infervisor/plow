@@ -146,6 +146,15 @@ pub fn fetch(store_root: &Path, source: &str, revision: &str, shards: u32) -> Re
     Ok(dir)
 }
 
+/// Without the `dist` feature there is no Hugging Face client to fetch with.
+#[cfg(not(feature = "dist"))]
+pub fn fetch(_store_root: &Path, source: &str, _revision: &str, _shards: u32) -> Result<PathBuf> {
+    Err(RuntimeError::Dist(format!(
+        "{source}: this plowrt was built without the dist feature, so --fetch-weights cannot \
+         download it; pass --checkpoint <dir>"
+    )))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
