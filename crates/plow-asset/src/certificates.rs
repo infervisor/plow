@@ -568,9 +568,11 @@ pub struct ApprovedVerifiers {
     pub verifiers: Vec<ApprovedVerifier>,
 }
 
+// Inside the crate, so a git or vendored dependency on plow-asset (inferos'
+// nix build) carries it; `lean-plow/approved-verifiers.json` links here.
 pub const APPROVED_VERIFIERS_JSON: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/../../lean-plow/approved-verifiers.json"
+    "/approved-verifiers.json"
 ));
 
 pub fn approved_verifiers() -> Result<ApprovedVerifiers, String> {
