@@ -16,6 +16,7 @@ pub mod prepare;
 pub mod pull;
 pub mod reference;
 pub mod store;
+pub mod weights;
 
 pub use fetch::{transport, Fetch};
 pub use pull::{pull, Resolved, Transfer};

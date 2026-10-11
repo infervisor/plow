@@ -137,26 +137,24 @@ pub fn cmd_load(
                 &resolved.bundle.checkpoint.revision,
             )
         });
-    if !ckpt.is_dir() {
-        if !fetch_weights {
-            return Err(format!(
-                "{} needs the {} checkpoint at revision {} ({}), which the distribution does not \
-                 carry.\n  Point at a local snapshot:  --checkpoint <dir>\n  Or consent to \
-                 downloading it:      --fetch-weights",
-                v.label,
-                resolved.bundle.checkpoint.source,
-                resolved.bundle.checkpoint.revision,
-                pull::human(resolved.bundle.checkpoint.bytes),
-            )
-            .into());
-        }
+    let ckpt = if ckpt.is_dir() {
+        ckpt
+    } else if fetch_weights {
+        let c = &resolved.bundle.checkpoint;
+        println!("fetching {} @{} ({})", c.source, c.revision, pull::human(c.bytes));
+        dist::weights::fetch(st.root(), &c.source, &c.revision, c.shards)?
+    } else {
         return Err(format!(
-            "--fetch-weights is not implemented yet; fetch {} at revision {} with \
-             `huggingface-cli download` and pass --checkpoint <dir>",
-            resolved.bundle.checkpoint.source, resolved.bundle.checkpoint.revision
+            "{} needs the {} checkpoint at revision {} ({}), which the distribution does not \
+             carry.\n  Point at a local snapshot:  --checkpoint <dir>\n  Or consent to \
+             downloading it:      --fetch-weights",
+            v.label,
+            resolved.bundle.checkpoint.source,
+            resolved.bundle.checkpoint.revision,
+            pull::human(resolved.bundle.checkpoint.bytes),
         )
         .into());
-    }
+    };
 
     let farm = prepare::build(st.root(), &resolved.bundle, &dir, &ckpt)?;
     st.pin(&r.pin_key(), &v.variant_id)?;

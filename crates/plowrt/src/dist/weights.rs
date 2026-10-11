@@ -1,0 +1,188 @@
+//! `plowrt load --fetch-weights`: the Hugging Face snapshot a bundle was built
+//! against, downloaded into the store so the checkpoint farm can be built
+//! from it. The distribution carries no weights; this is the consent step
+//! that gets them.
+//!
+//! Only `hf:<org>/<repo>` sources can be fetched. The download goes through
+//! `hf-hub` (its cache under `HF_HOME`, its token from `HF_TOKEN`), and the
+//! files are then linked into `snapshots/<org>--<repo>@<revision>/`, the
+//! same flat layout an operator's `--checkpoint` directory has. A snapshot
+//! that is already there with enough shards is reused without a request.
+
+use std::path::{Path, PathBuf};
+
+use crate::{Result, RuntimeError};
+
+/// The repo behind an `hf:` source; anything else cannot be fetched.
+pub fn hf_repo(source: &str) -> Result<&str> {
+    source
+        .strip_prefix("hf:")
+        .filter(|r| r.split('/').count() == 2 && !r.contains(".."))
+        .ok_or_else(|| {
+            RuntimeError::Dist(format!(
+                "{source} is not an hf:<org>/<repo> source, so --fetch-weights cannot get it; \
+                 pass --checkpoint <dir>"
+            ))
+        })
+}
+
+/// Where a fetched snapshot lives in the store.
+pub fn snapshot_path(store_root: &Path, repo: &str, revision: &str) -> PathBuf {
+    store_root
+        .join("snapshots")
+        .join(format!("{}@{revision}", repo.replace('/', "--")))
+}
+
+/// The files the farm reads: every shard, the index and sidecars next to
+/// them, and the tokenizer files. Nothing from subdirectories.
+pub fn wanted(name: &str) -> bool {
+    if name.contains('/') {
+        return false;
+    }
+    name.ends_with(".safetensors")
+        || name == "model.safetensors.index.json"
+        || name == "config.json"
+        || name == "generation_config.json"
+        || name == "tokenizer_config.json"
+        || name == "chat_template.jinja"
+        || name == "tokenizer.json"
+        || name == "tokenizer.model"
+        || name == "special_tokens_map.json"
+        || name == "vocab.json"
+        || name == "merges.txt"
+}
+
+fn count_shards(dir: &Path) -> usize {
+    std::fs::read_dir(dir)
+        .map(|rd| {
+            rd.flatten()
+                .filter(|e| e.file_name().to_string_lossy().ends_with(".safetensors"))
+                .count()
+        })
+        .unwrap_or(0)
+}
+
+/// Fetch the snapshot, or reuse the one already in the store. Returns the
+/// snapshot directory, ready for `prepare::build`.
+#[cfg(feature = "dist")]
+pub fn fetch(store_root: &Path, source: &str, revision: &str, shards: u32) -> Result<PathBuf> {
+    use hf_hub::api::sync::ApiBuilder;
+    use hf_hub::{Repo, RepoType};
+
+    let repo = hf_repo(source)?;
+    let dir = snapshot_path(store_root, repo, revision);
+    if dir.is_dir() && count_shards(&dir) >= shards as usize {
+        return Ok(dir);
+    }
+
+    let api = ApiBuilder::from_env()
+        .with_progress(true)
+        .build()
+        .map_err(|e| RuntimeError::Dist(format!("hugging face client: {e}")))?;
+    let api_repo = api.repo(Repo::with_revision(
+        repo.to_string(),
+        RepoType::Model,
+        revision.to_string(),
+    ));
+    let info = api_repo
+        .info()
+        .map_err(|e| RuntimeError::Dist(format!("{repo}@{revision}: {e}")))?;
+    let mut names: Vec<String> = info
+        .siblings
+        .into_iter()
+        .map(|s| s.rfilename)
+        .filter(|n| wanted(n))
+        .collect();
+    names.sort();
+    let found = names.iter().filter(|n| n.ends_with(".safetensors")).count();
+    if found < shards as usize {
+        return Err(RuntimeError::Dist(format!(
+            "{repo}@{revision} lists {found} safetensors shards, the bundle was built against \
+             {shards}: not the checkpoint this build is joined to"
+        )));
+    }
+
+    // Download into the hub cache, then link into a staging directory that
+    // becomes the snapshot only once every file is there.
+    let staging = dir.with_extension(format!("partial-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&staging);
+    std::fs::create_dir_all(&staging).map_err(|source| RuntimeError::Io {
+        path: staging.clone(),
+        source,
+    })?;
+    for name in &names {
+        let cached = api_repo
+            .get(name)
+            .map_err(|e| RuntimeError::Dist(format!("{repo}@{revision}/{name}: {e}")))?;
+        let cached = std::fs::canonicalize(&cached).map_err(|source| RuntimeError::Io {
+            path: cached.clone(),
+            source,
+        })?;
+        let dst = staging.join(name);
+        if std::fs::hard_link(&cached, &dst).is_err() {
+            std::fs::copy(&cached, &dst).map_err(|source| RuntimeError::Io {
+                path: dst.clone(),
+                source,
+            })?;
+        }
+    }
+    if let Some(parent) = dir.parent() {
+        std::fs::create_dir_all(parent).map_err(|source| RuntimeError::Io {
+            path: parent.to_path_buf(),
+            source,
+        })?;
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::rename(&staging, &dir).map_err(|source| RuntimeError::Io {
+        path: dir.clone(),
+        source,
+    })?;
+    Ok(dir)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_hf_sources_can_be_fetched() {
+        assert_eq!(hf_repo("hf:Qwen/Qwen3-0.6B").unwrap(), "Qwen/Qwen3-0.6B");
+        assert!(hf_repo("Qwen/Qwen3-0.6B").is_err());
+        assert!(hf_repo("hf:Qwen").is_err());
+        assert!(hf_repo("hf:../x/y").is_err());
+    }
+
+    #[test]
+    fn the_snapshot_sits_beside_the_farm_in_the_store() {
+        let p = snapshot_path(Path::new("/s"), "Qwen/Qwen3-0.6B", "abc");
+        assert_eq!(p, PathBuf::from("/s/snapshots/Qwen--Qwen3-0.6B@abc"));
+    }
+
+    #[test]
+    fn shards_sidecars_and_tokenizer_are_wanted_nothing_nested() {
+        assert!(wanted("model-00001-of-00002.safetensors"));
+        assert!(wanted("model.safetensors.index.json"));
+        assert!(wanted("config.json"));
+        assert!(wanted("tokenizer.json"));
+        assert!(wanted("chat_template.jinja"));
+        assert!(!wanted("README.md"));
+        assert!(!wanted("original/consolidated.00.pth"));
+        assert!(!wanted("onnx/model.onnx"));
+    }
+
+    /// Needs the network: `cargo test --features dist -- --ignored fetches_a_small`.
+    #[test]
+    #[ignore]
+    #[cfg(feature = "dist")]
+    fn fetches_a_small_snapshot_once_and_reuses_it() {
+        let root = std::env::temp_dir().join(format!("plow-weights-{}", std::process::id()));
+        let dir = fetch(&root, "hf:HuggingFaceTB/SmolLM2-360M-Instruct", "main", 1).unwrap();
+        assert!(dir.join("model.safetensors").is_file());
+        assert!(dir.join("config.json").is_file());
+        assert!(dir.join("tokenizer.json").is_file());
+        assert!(!dir.join("onnx").exists());
+        let again = fetch(&root, "hf:HuggingFaceTB/SmolLM2-360M-Instruct", "main", 1).unwrap();
+        assert_eq!(again, dir);
+        let _ = std::fs::remove_dir_all(root);
+    }
+}
