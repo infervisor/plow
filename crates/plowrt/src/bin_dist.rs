@@ -365,6 +365,13 @@ pub fn cmd_pack(
         }
     };
 
+    // Every argument is checked before --out is created or truncated.
+    let objects_in = match (&objset, objects) {
+        (Some(_), None) => return Err("the objset's objects need --objects".into()),
+        (Some((objset, _)), Some(dir)) => objset.objects.iter().map(|o| (o, dir)).collect(),
+        (None, _) => Vec::new(),
+    };
+
     let file = std::fs::File::create(out)?;
     let mut zip = zip::ZipWriter::new(file);
     let options = zip::write::SimpleFileOptions::default()
@@ -399,11 +406,6 @@ pub fn cmd_pack(
         total_files += 1;
     }
 
-    let objects_in = match (&objset, objects) {
-        (Some(_), None) => return Err("the objset's objects need --objects".into()),
-        (Some((objset, _)), Some(dir)) => objset.objects.iter().map(|o| (o, dir)).collect(),
-        (None, _) => Vec::new(),
-    };
     for (o, objects) in objects_in {
         let path = objects.join(&o.name);
         let bytes = std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
