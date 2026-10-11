@@ -1200,6 +1200,10 @@ on a non-CUDA backend are rejected.
 Model load/unload/status routes are privileged and are served only on the
 owner-only Unix socket (`--socket`), not the public TCP listener. For example:
 `curl --unix-socket /tmp/plow.sock http://localhost/v1/models/status`.
+A platform on another host reaches them through `--control-bind IP:PORT`, a
+second TCP listener carrying only these routes behind the API keys
+(`--api-key` / `PLOW_API_KEYS`); plowrt refuses to start with `--control-bind`
+and no key. Bind it to a private interface such as the node's overlay address.
 The public `/v1/models` catalogue remains available on both listeners. CUDA
 supports managed demand load, eviction and explicit load/unload. AMD and CPU
 load their native models at startup; control-plane load/unload returns an error.

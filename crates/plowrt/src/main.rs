@@ -128,6 +128,12 @@ enum Cmd {
         /// parallel.
         #[arg(long)]
         socket: Option<PathBuf>,
+        /// Also serve the model control plane (`/v1/models/load`, `unload`,
+        /// `status`) on this TCP address, for a platform on another host.
+        /// Behind the API keys, and refused without one: the control plane
+        /// is never open on TCP. Bind a private interface (the overlay).
+        #[arg(long = "control-bind")]
+        control_bind: Option<std::net::SocketAddr>,
         /// Number of CPU executor threads (reference backend).
         #[arg(long, default_value_t = 8)]
         executors: u32,
@@ -861,6 +867,7 @@ async fn async_main(asset_defaults: Vec<(String, String, String)>) -> Result<(),
             port,
             bind,
             socket,
+            control_bind,
             executors,
             trace,
             max_hold_ms,
@@ -903,6 +910,7 @@ async fn async_main(asset_defaults: Vec<(String, String, String)>) -> Result<(),
                 port,
                 bind,
                 socket,
+                control_bind,
                 executors,
                 trace,
                 MuxConfig {
@@ -4063,6 +4071,7 @@ async fn serve(
     port: u16,
     bind: std::net::IpAddr,
     socket: Option<PathBuf>,
+    control_bind: Option<std::net::SocketAddr>,
     executors: u32,
     trace: bool,
     mux_cfg: MuxConfig,
@@ -4128,7 +4137,7 @@ async fn serve(
             std::fs::set_permissions(&path, perm)?;
         }
         tracing::info!(socket = %path.display(), "plowrt serving OpenAI API over UDS");
-        let uds_router = plowrt::serve::auth::require(router.clone().merge(plowrt::serve::admin_app(state)), keys);
+        let uds_router = plowrt::serve::auth::require(router.clone().merge(plowrt::serve::admin_app(Arc::clone(&state))), keys);
         let http = HttpConns::from_config("UDS");
         conn_slots.extend(http.slots());
         Some(tokio::spawn(async move {
@@ -4149,11 +4158,48 @@ async fn serve(
         None
     };
 
+    // Optional TCP control listener: the privileged routes alone, for a platform on another
+    // host. Never open — without an API key it refuses to start, whatever the bind address.
+    let control_task = if let Some(addr) = control_bind {
+        if keys.is_empty() {
+            return Err("--control-bind needs an API key (--api-key / PLOW_API_KEYS): the model control plane is never open on TCP".into());
+        }
+        let listener = tokio::net::TcpListener::bind(addr).await?;
+        tracing::info!(%addr, "plowrt serving model control over TCP");
+        let control_router = plowrt::serve::auth::require(plowrt::serve::admin_app(Arc::clone(&state)), keys);
+        let http = HttpConns::from_config("CTL");
+        conn_slots.extend(http.slots());
+        Some(tokio::spawn(async move {
+            let svc = hyper_util::service::TowerToHyperService::new(control_router);
+            loop {
+                let permit = http.permit().await;
+                let stream = match listener.accept().await {
+                    Ok((stream, _)) => stream,
+                    Err(e) => {
+                        accept_failed("CTL", &e).await;
+                        continue;
+                    }
+                };
+                http.spawn(stream, svc.clone(), permit);
+            }
+        }))
+    } else {
+        None
+    };
+
     // Run until a listener exits or SIGTERM/SIGINT arrives.
-    let accept_loops: Vec<_> =
-        std::iter::once(tcp_task.abort_handle()).chain(uds_task.as_ref().map(|t| t.abort_handle())).collect();
+    let accept_loops: Vec<_> = std::iter::once(tcp_task.abort_handle())
+        .chain(uds_task.as_ref().map(|t| t.abort_handle()))
+        .chain(control_task.as_ref().map(|t| t.abort_handle()))
+        .collect();
     let uds = async {
         match uds_task {
+            Some(t) => t.await,
+            None => std::future::pending().await,
+        }
+    };
+    let control = async {
+        match control_task {
             Some(t) => t.await,
             None => std::future::pending().await,
         }
@@ -4174,6 +4220,7 @@ async fn serve(
     tokio::select! {
         r = tcp_task => { if let Err(e) = r { tracing::error!(error = %e, "TCP task join"); } }
         r = uds => { if let Err(e) = r { tracing::error!(error = %e, "UDS task join"); } }
+        r = control => { if let Err(e) = r { tracing::error!(error = %e, "control task join"); } }
         dead = engine_death => {
             tracing::error!(dead = %dead.join(","), "engine dead: draining for at most 5 s, then exiting 1 for the supervisor to restart (--exit-on-engine-death)");
             shutdown_state.shutdown.send_replace(true);

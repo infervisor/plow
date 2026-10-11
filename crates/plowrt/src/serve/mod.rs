@@ -1768,7 +1768,8 @@ pub(crate) fn status_for(err: &RuntimeError) -> axum::http::StatusCode {
     }
 }
 
-/// Privileged routes, mounted only on the owner-only Unix socket by the CLI.
+/// Privileged routes: the CLI mounts them on the owner-only Unix socket and,
+/// behind the API keys, on `--control-bind`; never on the public listener.
 pub fn admin_app(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/v1/models/load", post(admin::load))
