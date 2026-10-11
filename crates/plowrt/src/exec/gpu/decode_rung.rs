@@ -146,7 +146,9 @@ pub(super) fn validate_moe_lt_ladder(blob: &DevBlob, metadata: &SegmentRoles) ->
 }
 
 /// `routed[i]`: decode rung `i` runs the cuBLASLt projection program. Rungs are held to the same
-/// normalized program only within their class (fused interpreter vs. routed).
+/// normalized program only within their class: routed, folded (a Qwen3.5 rung whose projections
+/// carry the residual + RMSNorm prologue, devgen PLOW_QWEN_FOLD_NORM up to PLOW_QWEN_FOLD_MAX
+/// slots; wider rungs keep the separate instructions) or plain interpreter.
 fn validate_decode_ladder_impl(blob: &DevBlob, segmented: bool, routed: &[bool]) -> Result<bool> {
     let splitk = blob
         .with_packet_view(plow_asset::splitk::validate)
@@ -203,9 +205,19 @@ fn validate_decode_ladder_impl(blob: &DevBlob, segmented: bool, routed: &[bool])
     let widest = programs.last().expect("multiple programs");
     let mut compatible = true;
     let mut same_shape = true;
-    let mut normalized = [Vec::new(), Vec::new()];
+    let mut normalized = [Vec::new(), Vec::new(), Vec::new()];
     for (index, g) in programs.iter().enumerate() {
-        let normalized = &mut normalized[usize::from(routed.get(index).copied().unwrap_or(false))];
+        let folded = g.insts.iter().any(|d| {
+            matches!(DevOp::from_u16(d.op), Some(DevOp::Gemv | DevOp::GemvGlu)) && d.i[3] == 4
+        });
+        let class = if routed.get(index).copied().unwrap_or(false) {
+            1
+        } else if folded {
+            2
+        } else {
+            0
+        };
+        let normalized = &mut normalized[class];
         let logical = splitk.as_ref().map(|proof| &proof.canonical[index]);
         if let Some(proof) = &splitk {
             if proof.canonical[index].dependencies != proof.canonical[0].dependencies {
@@ -299,6 +311,27 @@ fn validate_decode_ladder_impl(blob: &DevBlob, segmented: bool, routed: &[bool])
                         return Err(reject("invalid norm row extent"));
                     }
                     d.i[0] /= g.t;
+                }
+                // Qwen3.5 hybrid (devgen qwen35.rs): the row count rides a per-op immediate.
+                Some(
+                    op @ (DevOp::QwenRmsNorm
+                    | DevOp::QwenSigmoidGate
+                    | DevOp::QwenGdnConv
+                    | DevOp::QwenGatedNorm
+                    | DevOp::QwenQGateSplit
+                    | DevOp::QwenHeadNormRope
+                    | DevOp::QwenGdnStep),
+                ) => {
+                    let field = match op {
+                        DevOp::QwenRmsNorm | DevOp::QwenSigmoidGate => 1,
+                        DevOp::QwenGdnConv | DevOp::QwenGatedNorm | DevOp::QwenQGateSplit => 2,
+                        DevOp::QwenHeadNormRope => 3,
+                        _ => 4,
+                    };
+                    if d.i[field] != g.t {
+                        return Err(reject("Qwen rows disagree with rung width"));
+                    }
+                    d.i[field] = 1;
                 }
                 Some(
                     DevOp::RmsNorm
@@ -617,6 +650,26 @@ fn validate_decode_ladder_impl(blob: &DevBlob, segmented: bool, routed: &[bool])
                         }
                         if (d.i[1], d.i[2], d.fj[1], d.fj[2]) != (heads, hd, stride, mask) {
                             return Err(reject("fused KV pair writers disagree on addressing"));
+                        }
+                        if !writes.insert(id) {
+                            return Err(reject("duplicate KV writer"));
+                        }
+                    }
+                    // Qwen3.5 k/v writer (devgen qwen35.rs `headnorm` with `cache`): heads i0,
+                    // hd i1, rows i3, ring stride i4 (= max_ctx, full attention: no window),
+                    // position tensor t5; the row comes from `pos[b]` at every rung.
+                    Some(DevOp::QwenHeadNormRope) if operand == 0 => {
+                        if scale.is_some() || pair_mode != 0 {
+                            return Ok(false);
+                        }
+                        if d.i[3] != g.t
+                            || d.t[5] as usize != pos
+                            || (d.i[0], d.i[1], d.i[4]) != (heads, hd, stride)
+                            || mask != u32::MAX
+                        {
+                            return Err(reject(
+                                "Qwen KV writer requires physical-slot position addressing",
+                            ));
                         }
                         if !writes.insert(id) {
                             return Err(reject("duplicate KV writer"));

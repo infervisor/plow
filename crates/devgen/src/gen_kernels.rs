@@ -71,12 +71,15 @@ const TABLE: &str = include_str!("../../../tuning/nvidia/sm_90a/h100-sxm5/gen_ke
 
 /// Devgen's binding policy per table entry, which the table does not carry: the role ID (a new
 /// entry takes the next generated ID) and the smallest prefill rung it binds.
-const POLICY: [(&str, u8, u32); 5] = [
+const POLICY: [(&str, u8, u32); 6] = [
     ("attn_pf_hd512", GENERATED_FIRST, 1024),
     ("attn_pf_hd256_sliding", GENERATED_FIRST + 1, 1024),
     ("attn_pf_hd256_sliding_fp8kv", GENERATED_FIRST + 2, 128),
     ("attn_pf_hd512_fp8kv", GENERATED_FIRST + 3, 128),
     ("attn_pf_hd256_sliding_fp8kv_span", GENERATED_FIRST + 4, 128),
+    // Window 0 over a linear KV (Qwen3.5 full-attention layers). Every bucket: the interpreter's
+    // hd256 body runs at ~8% of peak in that packet (pf object at the 255-register cap).
+    ("attn_pf_hd256_causal", GENERATED_FIRST + 5, 128),
 ];
 
 fn table_entry(
@@ -287,8 +290,10 @@ pub(crate) fn apply_output_objects(
     if entries.is_empty() {
         return Ok(());
     }
-    if !packed {
-        return Err("generated flash-prefill roles require packed prefill metadata".into());
+    // gen_flash_prefill.cu serves an unpacked chunk as one request; only the FP8-KV and
+    // media-span objects read the packed request table.
+    if !packed && entries.iter().any(|e| e.kv == KvDtype::Fp8 || e.media_span) {
+        return Err("FP8-KV / media-span generated roles require packed prefill metadata".into());
     }
     if hd512_px4_role && entries.iter().any(|e| e.head_dim == 512) {
         return Err("PLOW_EMIT_GEN_KERNELS hd512 and the px4 BQ64 role both claim HD512".into());
@@ -462,8 +467,49 @@ mod tests {
                     true,
                     true,
                 ),
+                (
+                    "attn_pf_hd256_causal",
+                    "gen_sm90a_attn_pf_hd256_causal.cubin",
+                    KvDtype::Bf16,
+                    256,
+                    0,
+                    false,
+                    true,
+                    false
+                ),
             ]
         );
+    }
+
+    #[test]
+    fn causal_hd256_entry_takes_global_linear_kv_with_even_gqa() {
+        let entry = CATALOG
+            .iter()
+            .find(|e| e.name == "attn_pf_hd256_causal")
+            .unwrap();
+        let sliding = CATALOG
+            .iter()
+            .find(|e| e.name == "attn_pf_hd256_sliding")
+            .unwrap();
+        let mut op = DevInst {
+            op: DevOp::FlashPrefill as u16,
+            ..Default::default()
+        };
+        // Qwen3.8-27B full-attention layer: 24 / 4 heads, hd256, global, linear KV, one split.
+        op.i = [1024, 1024, 24, 4, 0, 0, 256, 1];
+        op.j[1] = u32::MAX;
+        assert!(entry.matches(&op) && !sliding.matches(&op));
+        op.j[1] = 16383;
+        assert!(!entry.matches(&op), "ring KV");
+        op.j[1] = u32::MAX;
+        op.i[5] = 1024;
+        assert!(!entry.matches(&op), "window");
+        op.i[5] = 0;
+        op.i[2] = 20;
+        assert!(!entry.matches(&op), "odd GQA ratio");
+        op.i[2] = 24;
+        op.i[7] = 2;
+        assert!(!entry.matches(&op), "split launch");
     }
 
     #[test]

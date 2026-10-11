@@ -6002,7 +6002,8 @@ fn gpu_prefill_batched_pass(
         // smallest bucket holding every row.
         let trim = trim_for_riders(
             bucket,
-            e.pf_pack_budget(rows.min(bucket) + decode_rows),
+            e.pf_launch_bucket(rows.min(bucket) + decode_rows)
+                .unwrap_or(usize::MAX),
             decode_rows,
             rows,
             avail - rows,
@@ -7645,6 +7646,17 @@ mod tests {
         assert!(
             super::trim_for_riders(1024, 1088, 3, 1024, 600),
             "the tail joins waiting rows"
+        );
+        // The 128/1024/4096 ladder: 16 riders on a full 1024 launch spill into 4096 (the
+        // pack budget would have planned [1024, 128] and reported no spill).
+        assert!(super::trim_for_riders(1024, 4096, 16, 1024, 3072));
+        assert!(
+            super::trim_for_riders(1024, 4096, 16, 1024, 0),
+            "a 3072-row spill beats a tail launch"
+        );
+        assert!(
+            super::trim_for_riders(1024, usize::MAX, 16, 1024, 0),
+            "no bucket holds the riders"
         );
     }
 

@@ -1136,6 +1136,14 @@ fn tuning(s: &Shapes, arch: &str) -> Map<String, Value> {
             // * `gemv_mma_pair`: its single-stream walks (down, o_proj, lm_head) take two row blocks
             //   per k-step (op_gemv_mma.cuh): 12B B=1/4/16 10.99/11.70/14.25 -> 10.92/11.60/13.94.
             t.insert("gemv_mma_pair".into(), json!(1));
+            // * `gemv_rem_split` (PLOW_NV_GEMV_REM_SPLIT, recipe opt-in): the walks' last wave splits its
+            //   leftover row blocks over K (27B B1/8/16 23.75/27.47/31.50 -> 22.94/26.96/31.20 ms). It
+            //   reorders those sums: the 27B c1 FP32 gate's p99 tail moved 0.0153 -> 0.0166 against its
+            //   0.0162 limit with the trimmed KL unchanged, so it stays off until that tail is judged
+            //   on a robust statistic.
+            if crate::emit_config::active().nv_gemv_rem_split {
+                t.insert("gemv_rem_split".into(), json!(1));
+            }
         }
         // * `gemv_k8`: rungs 2..32 run the tensor-core K-split walk (op_gemv_k8_sm90.cuh), weight
         //   rows as the mma M. Veena (Llama-3.2-3B) ctx 1024 B=1/2/4/8/16/32 3.44/3.86/3.96/4.09/
@@ -1147,10 +1155,16 @@ fn tuning(s: &Shapes, arch: &str) -> Map<String, Value> {
         let k8_small_hd = dense_tune;
         let k8_ple =
             s.ops_present.contains(&op_name(DevOp::GluStrided)) && s.hd.iter().all(|&h| h <= 512);
+        // The Qwen3.5 hybrid (GDN + GQA hd256) takes the walk in its _gw object only
+        // (`gemv_k8_gw_only`, rungs 8..32): 27B h100 ctx 1K B=8/16/32 28.91/33.40/41.56 ->
+        // 27.49/31.49/40.30 ms, greedy tokens unchanged, and at B=1 (where the walk's f32 order
+        // moved the FP32-reference gate's knife-edge tail: kl_p99 0.0186 vs the 0.0162 limit, bulk
+        // KL at parity) the ordinary object keeps the mma.sync walk.
+        let k8_qwen = s.ops_present.contains(&op_name(DevOp::QwenGdnStep));
         if s.moe_down_inter == 0
             && !s.moe_dec_group
             && s.decode_batch >= 2
-            && (k8_small_hd || k8_ple)
+            && (k8_small_hd || k8_ple || k8_qwen)
             && s.decode_gemv_k.iter().all(|k| k % 32 == 0)
         {
             t.insert("gemv_k8".into(), json!(1));
@@ -1167,6 +1181,20 @@ fn tuning(s: &Shapes, arch: &str) -> Map<String, Value> {
                 t.insert("gemv_k8_unb".into(), json!(16));
                 t.insert("gemv_k8_max_gw".into(), json!(64));
             }
+            // Cap 32: the walk beat the wgmma wide arm at B=32 (40.30 vs 41.56 ms); B=48 stays on
+            // the wide arm (`gw_min_rows`). Cap 8 lost 2.5 ms at B=16 against cap 16.
+            if k8_qwen && !k8_small_hd && !k8_ple {
+                // PLOW_NV_GEMV_K8_B1: rungs 1..4 take the walk too (27B B1/8 23.64/28.58 ->
+                // 22.74/27.51 ms); its f32 order moved only the knife-edge p99 tail.
+                if crate::emit_config::active().nv_gemv_k8_b1 {
+                    t.insert("gemv_k8_min".into(), json!(1));
+                } else {
+                    t.insert("gemv_k8_gw_only".into(), json!(1));
+                }
+                t.insert("gemv_k8_unb1".into(), json!(2));
+                t.insert("gemv_k8_unb".into(), json!(16));
+                t.insert("gemv_k8_max_gw".into(), json!(32));
+            }
             // PLOW_NV_GEMV_K8_B1 (hd <= 128): Qwen3-ASR 1.7B ctx 128 B=1/2/4/8/16 2.105/2.086/2.100/
             // 2.204/2.327 -> 2.005/2.042/2.042/2.188/2.325 ms, token digests unchanged.
             if k8_small_hd && crate::emit_config::active().nv_gemv_k8_b1 {
@@ -1177,9 +1205,24 @@ fn tuning(s: &Shapes, arch: &str) -> Map<String, Value> {
         // * `fa_rg_wide`: hd256/512 flash decode on the row-group body (a warp per row, K and V
         //   of 4 rows in flight) instead of the tile body. E4B h100 ctx 1024 B=1/8/32/64/128
         //   6.22/6.83/9.61/12.63/17.75 -> 6.15/6.63/9.05/11.98/16.42 ms. E-series only (measured).
-        if k8_ple && !k8_small_hd {
+        //   The Qwen3.5 hybrid gains 0.8/2.0/2.8 ms at B=16/32/48 (ctx 1K); its bulk KL is at
+        //   parity and only the knife-edge p99 tail moved, so other hd256/512 packets take it by
+        //   recipe opt-in (PLOW_NV_FA_RG_WIDE).
+        let rg_wide_opt_in = crate::emit_config::active().nv_fa_rg_wide
+            && s.hd.iter().any(|&h| h == 256 || h == 512);
+        if (k8_ple && !k8_small_hd) || rg_wide_opt_in {
             t.insert("fa_rg".into(), json!(1));
             t.insert("fa_rg_wide".into(), json!(1));
+        }
+        // Row-group body candidates (PLOW_NV_FA_RG_U / PLOW_NV_FA_RGT): defines on the objects that
+        // take the body; a recipe opts in after its gate.
+        if t.contains_key("fa_rg") {
+            if let Some(u) = crate::emit_config::active().nv_fa_rg_u.filter(|&u| u > 0) {
+                t.insert("fa_rg_u".into(), json!(u));
+            }
+            if crate::emit_config::active().nv_fa_rgt {
+                t.insert("fa_rgt".into(), json!(1));
+            }
         }
         // * `fa_rgm`: hd128 row-group flash decode on the mma.sync item fed by per-warp bulk-copy
         //   rings (PLOW_NV_FA_RGM).
@@ -1207,6 +1250,13 @@ fn tuning(s: &Shapes, arch: &str) -> Map<String, Value> {
             && s.decode_gemv_k.iter().all(|k| k % 64 == 0)
         {
             t.insert("gemv_wide".into(), json!(1));
+            // * `gw_min_rows`: the first rung the wide arm takes (PLOW_NV_GW_MIN_ROWS; plowrt
+            //   launches the full claim from it). Qwen3.8-27B h100 ctx 1K step ms at B16/32/48:
+            //   32.98/46.32/49.84 at the GV_MM_MAX+1 default, 33.04/41.51/50.01 from 32,
+            //   34.02/41.43/49.86 from 16. Recurrent packets only; dense models are unmeasured.
+            if s.ops_present.contains(&op_name(DevOp::QwenGdnStep)) {
+                t.insert("gw_min_rows".into(), json!(32));
+            }
         }
     }
     if sm90a && crate::emit_config::active().w8a8 && crate::emit_config::active().decode_cublaslt {
@@ -3054,6 +3104,14 @@ pub fn config_header(manifest: &Value) -> String {
         if t.get("fa_rg_wide").is_some() {
             out.push_str("#ifndef PLOW_NV_FA_RG_WIDE\n#define PLOW_NV_FA_RG_WIDE 1\n#endif\n");
         }
+        if let Some(u) = t.get("fa_rg_u").and_then(Value::as_u64) {
+            out.push_str(&format!(
+                "#ifndef PLOW_NV_FA_RG_U\n#define PLOW_NV_FA_RG_U {u}\n#endif\n"
+            ));
+        }
+        if t.get("fa_rgt").is_some() {
+            out.push_str("#ifndef PLOW_NV_FA_RGT\n#define PLOW_NV_FA_RGT 1\n#endif\n");
+        }
         if manifest.get("arch").and_then(Value::as_str) == Some("sm_90a") {
             if let Some(ks) = t.get("xreg_k").and_then(Value::as_array) {
                 let any = ks
@@ -3076,8 +3134,18 @@ pub fn config_header(manifest: &Value) -> String {
                     "#ifndef PLOW_NV_GEMV_MMA_PAIR\n#define PLOW_NV_GEMV_MMA_PAIR 1\n#endif\n",
                 );
             }
+            if t.get("gemv_rem_split").is_some() {
+                out.push_str(
+                    "#ifndef PLOW_NV_GEMV_REM_SPLIT\n#define PLOW_NV_GEMV_REM_SPLIT 1\n#endif\n",
+                );
+            }
             if t.get("gemv_wide").is_some() {
                 out.push_str("#ifndef PLOW_NV_GEMV_WIDE\n#define PLOW_NV_GEMV_WIDE 1\n#endif\n");
+            }
+            if let Some(v) = t.get("gw_min_rows").and_then(Value::as_u64) {
+                out.push_str(&format!(
+                    "#ifndef PLOW_NV_GW_MIN_ROWS\n#define PLOW_NV_GW_MIN_ROWS {v}\n#endif\n"
+                ));
             }
             if t.get("fp8_lt_decode").and_then(Value::as_bool) == Some(true) {
                 out.push_str(
@@ -3088,7 +3156,11 @@ pub fn config_header(manifest: &Value) -> String {
                 out.push_str("#if defined(PLOW_NV_GW_OBJECT) && PLOW_NV_GW_OBJECT\n#ifndef PLOW_NV_FP8_DECODE_TC64\n#define PLOW_NV_FP8_DECODE_TC64 1\n#endif\n#endif\n");
             }
             if t.get("gemv_k8").is_some() {
-                out.push_str("#ifndef PLOW_NV_GEMV_K8\n#define PLOW_NV_GEMV_K8 1\n#endif\n");
+                if t.get("gemv_k8_gw_only").is_some() {
+                    out.push_str("#if defined(PLOW_NV_GW_OBJECT) && PLOW_NV_GW_OBJECT\n#ifndef PLOW_NV_GEMV_K8\n#define PLOW_NV_GEMV_K8 1\n#endif\n#endif\n");
+                } else {
+                    out.push_str("#ifndef PLOW_NV_GEMV_K8\n#define PLOW_NV_GEMV_K8 1\n#endif\n");
+                }
             }
             if let Some(v) = t.get("fa_v3_splitkv").and_then(Value::as_u64) {
                 out.push_str(&format!(

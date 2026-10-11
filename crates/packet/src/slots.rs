@@ -141,6 +141,10 @@ const DOC: &[S] = &[
     S { op: DevOp::Embed, t: &["out", "table", "ids"], i: &["ntok", "hidden", "pad"], f: &["scale"], j: &[] },
     S { op: DevOp::SoftCap, t: &["out", "x"], i: &["n"], f: &["cap"], j: &[] },
     S { op: DevOp::Gemm, t: &["C", "A", "B", "", "", "", "", "bias?"], i: &["M", "N", "K"], f: &[], j: &[] },
+    // norm == 4 is the Qwen residual + RMSNorm prologue (NVIDIA decode, PLOW_QWEN_FOLD_NORM):
+    // x is the norm output every block writes before its own walk, t3 the residual stream out,
+    // i5 / i6 / i7 tensor handles of the residual stream in, the delta (0 = none) and gamma,
+    // f0 = eps, f1 = gamma offset. GemvGlu takes the same fold with the stream in at i4.
     S { op: DevOp::Gemv, t: &["C", "x", "W", "rms?", "gamma?", "", "", "bias?"], i: &["M", "N", "K", "norm"], f: &["eps"], j: &[] },
     S { op: DevOp::FlashPrefill, t: &["Opart", "mlpart", "Q", "K", "V", "O_final?"], i: &["n_q", "n_kv", "n_head", "n_kv_head", "q_pos0", "window", "hd", "nsplit"], f: &["scale"], j: &["kv_stride", "kv_mask"] },
     S { op: DevOp::FlashDecode, t: &["Opart", "mlpart", "Q", "K", "V", "kv_len", "decode_slot?"], i: &["n_batch", "n_head", "n_kv_head", "kv_stride", "window", "nsplit", "hd"], f: &["scale"], j: &[] },

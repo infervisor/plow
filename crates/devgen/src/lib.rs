@@ -8837,7 +8837,8 @@ pub fn run_verified(args: EmitArgs, verify: Option<VerifyHook>) {
     }
     if emit_config::active().prefill_cublaslt {
         assert!(
-            ((model_type.starts_with("gemma4") || model_type == "llama" || model_type == "qwen3_asr")
+            ((model_type.starts_with("gemma4") || model_type == "llama" || model_type == "qwen3_asr"
+                || model_type == "qwen3_5")
                 && arch == "sm_90a"
                 || (model_type == "qwen3_asr" || model_type == "llama" || model_type.starts_with("gemma4"))
                     && arch == "sm_89")

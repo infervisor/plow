@@ -87,12 +87,19 @@ def flash_prefill_body(D, BM, BN, stages, threads):
 
 def flash_prefill_body_fp8kv(D, BM, BN, stages, threads):
     """flash_prefill_body over an e4m3 KV cache with one f32 scale per row (FlashPrefillFp8): K/V
-    tiles are staged as e4m3 and converted exactly to bf16; k_scale multiplies the score columns
-    before masking, v_scale the P columns (after the row sum) before the PV."""
+    tiles are staged as e4m3 and converted exactly to fp16 (one cvt per pair on sm_90; bf16 has no
+    e4m3 cvt and ran at 0.7x); k_scale multiplies the f32 score columns before masking, v_scale the
+    V tile rows during the convert, so P stays in [0, 1] (P * v_scale in fp16 would flush at long
+    context). That multiply runs in f32 and rounds once to fp16: v_scale itself cast to fp16 is
+    subnormal below amax 0.027 (real V rows are that small; rel-L2 4.8e-3 at amax 0.002 against
+    2.8e-4 for the f32 product, 7% slower). The exp2 carries +15, so the fp16 P tile holds P * 2^15
+    (<= 32768, subnormal only below P = 2e-9); the row sum l carries the same factor and the final
+    O = Oacc / l cancels it. fp16 bounds: |Q| and |V| < 65504."""
     import tilelang.language as T
     qlen, kvlen, heads = T.dynamic("qlen, kvlen, heads")
-    dt, acc, f8 = "bfloat16", "float", "float8_e4m3"
+    dt, mt, acc, f8 = "bfloat16", "float16", "float", "float8_e4m3"
     log2e = 1.4426950408889634
+    p_exp2 = 15.0
 
     @T.prim_func
     def attn_pf(Q: T.Tensor((qlen, heads, D), dt), K: T.Tensor((kvlen, D), f8),
@@ -100,15 +107,15 @@ def flash_prefill_body_fp8kv(D, BM, BN, stages, threads):
                 VS: T.Tensor((kvlen,), acc), O: T.Tensor((qlen, heads, D), dt),
                 scale: T.float32):
         with T.Kernel(T.ceildiv(qlen, BM), heads, threads=threads) as (qb, h):
-            Q_s = T.alloc_shared((BM, D), dt)
+            Q_s = T.alloc_shared((BM, D), mt)
             K8 = T.alloc_shared((BN, D), f8)
             V8 = T.alloc_shared((BN, D), f8)
-            K_s = T.alloc_shared((BN, D), dt)
-            V_s = T.alloc_shared((BN, D), dt)
+            K_s = T.alloc_shared((BN, D), mt)
+            V_s = T.alloc_shared((BN, D), mt)
             ks = T.alloc_shared((BN,), acc)
             vs = T.alloc_shared((BN,), acc)
             S = T.alloc_fragment((BM, BN), acc)
-            P = T.alloc_shared((BM, BN), dt)
+            P = T.alloc_shared((BM, BN), mt)
             Oacc = T.alloc_fragment((BM, D), acc)
             m = T.alloc_fragment((BM,), acc)
             mp = T.alloc_fragment((BM,), acc)
@@ -138,17 +145,16 @@ def flash_prefill_body_fp8kv(D, BM, BN, stages, threads):
                 for i in T.Parallel(BM):
                     sc[i] = T.exp2(mp[i] * sl - m[i] * sl)
                 for i, j in T.Parallel(BM, BN):
-                    S[i, j] = T.exp2(S[i, j] * sl - m[i] * sl)
+                    S[i, j] = T.exp2(S[i, j] * sl - m[i] * sl + p_exp2)
                 T.reduce_sum(S, ssum, dim=1)
                 for i in T.Parallel(BM):
                     l[i] = l[i] * sc[i] + ssum[i]
-                for i, j in T.Parallel(BM, BN):
-                    P[i, j] = S[i, j] * vs[j]
+                T.copy(S, P)
                 for i, j in T.Parallel(BM, D):
                     Oacc[i, j] *= sc[i]
                 T.copy(V[k * BN:(k + 1) * BN, :], V8)
                 for i, j in T.Parallel(BN, D):
-                    V_s[i, j] = V8[i, j]
+                    V_s[i, j] = V8[i, j] * vs[i]
                 T.gemm(P, V_s, Oacc, policy=T.GemmWarpPolicy.FullRow)
             for i, j in T.Parallel(BM, D):
                 Oacc[i, j] /= l[i]
@@ -172,20 +178,20 @@ ENTRIES = {
         "classes": [(16, 1, 1024), (16, 1, 4096), (16, 1, 8192)],
     },
     # FlashPrefillFp8 global attention (crates/devgen/src/gen_kernels.rs KvDtype::Fp8). The
-    # extra staging tiles leave room for BN <= 32 only.
+    # extra staging tiles leave room for BN <= 48.
     "attn_pf_hd512_fp8kv": {
         "signature": {"op": "flash_prefill", "head_dim": 512, "mask": "causal", "window": 0,
                       "gqa": [1, 16], "dtype": "bf16", "kv_dtype": "fp8_e4m3_rowscale",
                       "arch": "sm_90a"},
         "object": "gen_sm90a_attn_pf_hd512_fp8kv.cubin",
         "fp8": True,
-        # bf16 P times the per-row V scale: the hd256 FP8-KV entry's 2.3e-3 class.
+        # fp16 V tile times the per-row V scale: the hd256 FP8-KV entry's 2.3e-3 class.
         "tol": 4e-3,
         "body": lambda c: flash_prefill_body_fp8kv(512, c["bm"], c["bn"], c["stages"],
                                                    c["threads"]),
         "sweep": [{"bm": bm, "bn": bn, "stages": st, "threads": thr}
-                  for bm, bn, st, thr in [(64, 32, 1, 256), (64, 32, 2, 256), (64, 16, 2, 256),
-                                          (64, 16, 3, 256)]],
+                  for bm, bn, st, thr in [(64, 32, 1, 256), (64, 32, 2, 256), (64, 48, 1, 256),
+                                          (64, 16, 2, 256), (64, 16, 3, 256)]],
         "classes": [(16, 1, 1024), (16, 1, 4096), (16, 1, 1024, 7168), (16, 1, 1024, 14336)],
     },
 }
@@ -312,12 +318,14 @@ def cmd_build(a):
     if bad:
         sys.exit("catalog entries disagree with the table (retune): " + ", ".join(bad))
     # The body digest is the build key; a different generator release cannot be expected to
-    # reproduce it (`nix develop .#tilelang` pins the tuned one).
-    import tilelang
-    pinned = table.get("generator", {}).get("version")
-    if any("build" not in ENTRIES[n] for n in a.entries) and tilelang.__version__ != pinned:
-        sys.exit(f"tilelang {tilelang.__version__} != table generator {pinned}; "
-                 "run under `nix develop .#tilelang`")
+    # reproduce it (`nix develop .#tilelang` pins the tuned one). Hand-parameterized entries
+    # (their own `build` hook) need only nvcc.
+    if any("build" not in ENTRIES[n] for n in a.entries):
+        import tilelang
+        pinned = table.get("generator", {}).get("version")
+        if tilelang.__version__ != pinned:
+            sys.exit(f"tilelang {tilelang.__version__} != table generator {pinned}; "
+                     "run under `nix develop .#tilelang`")
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
     for name in a.entries:

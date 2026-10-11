@@ -2066,18 +2066,19 @@ __device__ void d_flash_decode(float* __restrict__ Opart, float* __restrict__ ml
                     const unsigned kvr = kv0 + r;
                     live[t] = (r < rmax) && (kvr <= qpos) &&
                               (!window || (qpos - kvr) < window);
-                    /* `kvr & kv_mask` always lands on a real ring row, so the load is
-                     * in-bounds even for a masked or past-the-tile r; only the dot and the
-                     * store below are gated. Loading unconditionally keeps all WRB loads
-                     * issued back-to-back, which is the entire point of the batch. */
+                    /* A masked or past-the-tile r re-reads the tile's last live row: live KV
+                     * maps nothing past the sequence's committed block, so a row past rmax
+                     * may be unmapped (a decode one row below a block boundary faulted).
+                     * Only the dot and the store below are gated. Loading unconditionally
+                     * keeps all WRB loads issued back-to-back, the point of the batch. */
+                    const unsigned safe_kvr = kv0 + min(r, rmax - 1u);
 #pragma unroll
                     for (int c = 0; c < NC; c++) {
                         if constexpr (FP8KV) {
-                            const unsigned safe_kvr = kv0 + min(r, rmax - 1u);
                             const unsigned char* krow = kb8 + (size_t)(safe_kvr & kv_mask) * D;
                             k8[t][c] = fp8v8_to_bf16v8(ld_glob_fp8v8(krow + (unsigned)c * 256u + lane * 8u));
                         } else {
-                            const __nv_bfloat16* krow = kbase + (size_t)(kvr & kv_mask) * D;
+                            const __nv_bfloat16* krow = kbase + (size_t)(safe_kvr & kv_mask) * D;
                             k8[t][c] = ld_glob8_cs(krow + (unsigned)c * 256u + lane * 8u);
                         }
                     }

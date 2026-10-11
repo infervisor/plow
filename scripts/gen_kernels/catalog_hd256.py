@@ -24,6 +24,18 @@ ENTRIES = {
         "tune": _mod.tune_row,
         "classes": [(h, kv, rows) for h, kv, w, rows in _mod.CLASSES if w == 1024],
     },
+    # The same template over global attention on a linear KV (window 0; Qwen3.5-class
+    # full-attention layers, 24/4 heads). The sliding entry's config and body digest; its own
+    # object so a packet pins each role to one file.
+    "attn_pf_hd256_causal": {
+        "signature": {"op": "flash_prefill", "head_dim": 256, "mask": "causal", "window": 0,
+                      "gqa": [2, 16], "gqa_even": True, "ring_kv": False,
+                      "dtype": "bf16", "kv_dtype": "bf16", "arch": "sm_90a"},
+        "object": "gen_sm90a_attn_pf_hd256_causal.cubin",
+        "build": _mod.catalog_build,
+        "tune": _mod.tune_row,
+        "classes": [(24, 4, 1024), (24, 4, 4096)],
+    },
     # The FlashPrefillFp8 twin: e4m3 K/V with one f32 scale per (position, KV head) row
     # (crates/devgen/src/gen_kernels.rs KvDtype::Fp8). Same schedule; no tensor maps.
     "attn_pf_hd256_sliding_fp8kv": {

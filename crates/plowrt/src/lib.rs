@@ -30,6 +30,7 @@ pub mod disasm;
 /// what is missing. `serve` reads only the local store and never the network.
 pub mod dist;
 pub mod exec;
+pub mod inventory;
 pub mod knob_scope;
 pub mod knob_spec;
 pub mod memory;

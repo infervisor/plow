@@ -264,6 +264,21 @@ pub const CUBLASLT_PREFILL_QWEN3_0_6B_SHAPES: [(u32, u32); 5] = [
     (3072, 1024),
     (1024, 3072),
 ];
+/// Qwen3.8-27B (qwen3_5 hybrid: hidden 5120, inter 17408, 24/4 heads x 256 with the packed
+/// [q | gate] projection, GDN 16 k x 128 + 48 v x 128): q|gate, k/v, o and GDN out (K = 6144),
+/// gate/up, down, GDN in_proj_qkv, in_proj_z, and the 48-wide a/b projections (the interpreter's
+/// 128-wide tensor-core tiles ran them as eight CTAs per 1024 rows: 17.9 ms of a 122 ms prefill
+/// with their preps, floor 0.9).
+pub const CUBLASLT_PREFILL_QWEN3_8_27B_SHAPES: [(u32, u32); 8] = [
+    (12288, 5120),
+    (1024, 5120),
+    (5120, 6144),
+    (17408, 5120),
+    (5120, 17408),
+    (10240, 5120),
+    (6144, 5120),
+    (48, 5120),
+];
 
 pub fn cublaslt_prefill_fp8(profile: &str, m: u32, n: u32, k: u32) -> bool {
     matches!(profile, "sm90a" | "sm_90a")
@@ -296,7 +311,8 @@ pub fn cublaslt_prefill_bf16(profile: &str, m: u32, n: u32, k: u32) -> bool {
                 || CUBLASLT_PREFILL_GEMMA4_31B_SHAPES.contains(&(n, k))
                 || CUBLASLT_PREFILL_GEMMA4_E4B_SHAPES.contains(&(n, k))
                 || CUBLASLT_PREFILL_LLAMA_TTS_SHAPES.contains(&(n, k))
-                || CUBLASLT_PREFILL_QWEN3_1_7B_SHAPES.contains(&(n, k)))
+                || CUBLASLT_PREFILL_QWEN3_1_7B_SHAPES.contains(&(n, k))
+                || CUBLASLT_PREFILL_QWEN3_8_27B_SHAPES.contains(&(n, k)))
         }
         // Ada has no TMA/wgmma prefill GEMM: the speech LMs (ASR decoders, Llama TTS) and Gemma 4
         // E4B (L40S cold TTFT at 3944 tokens 1121 ms on the interpreter GEMM) are routed.

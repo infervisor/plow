@@ -2140,6 +2140,15 @@ struct PrefillBucket {
     moe_row_sites: Vec<(usize, usize)>,
     /// Row count `moe_row_sites` currently hold on the device.
     moe_rows: u32,
+    /// Qwen3.5 `QwenGdnConvPrefill` sites: patch `i[2] = real`, `i[3] = t`. The conv history
+    /// (the decode step's taps) is rewritten from the chunk's last rows, so a padded chunk must
+    /// end at the real rows; the kernel zeroes the pad rows' outputs. With the native GDN launch
+    /// also sized to the real rows, a Qwen chunk pads like any other bucket instead of running
+    /// the sub-bucket tail token by token through decode steps (a 1000-token prompt on the
+    /// 128/1024/4096 ladder was 7 x 128 + 104 x 24 ms steps = 2.85 s to the first token).
+    qwen_conv_sites: Vec<usize>,
+    /// Qwen3.5 KV writers (`QwenHeadNormRope` with a context): the packed slot table binds t7.
+    qwen_rope_sites: Vec<usize>,
     /// `FlashMerge` sites — neutered (`i[0] = 0`) in PX-1 batched mode, where
     /// the flash op runs the fused (`nsplit=1`, `t5=at`) epilogue per request.
     merge_sites: Vec<usize>,
@@ -2563,6 +2572,9 @@ pub struct GpuEngine {
     vmm_attached: Vec<u32>,
     /// Cache rows the next `begin_slot` keeps (a retained session prefix); 0 = start cold.
     resume_rows: Vec<u32>,
+    /// Bench-only (`snapshot_slot`): a slot's recurrent state at one position, so `rewind_slot`
+    /// back to it restores the GDN/conv state along with the KV length.
+    rewind_snapshots: Vec<Option<(u32, Vec<DeviceMem>)>>,
     /// Smallest `stride - window` over the packet's sliding caches (rings of `stride` rows): a
     /// retained prefix of `rows` is intact only while the sequence stopped within this many rows
     /// past it (the VMM prefix cache's `publish_boundary` rule). None: no sliding cache.
@@ -2623,6 +2635,10 @@ pub struct GpuEngine {
     attention_gemm: Option<attention_gemm::AttentionGemm>,
     /// Request table of the prefill launch being enqueued, for `attention_gemm`.
     attention_requests: Vec<attention_gemm::Request>,
+    /// `act.gdn.initstate`: the packed GDN launch's gathered initial states (N slots).
+    qwen_initstate: Option<usize>,
+    /// The packed launch's Qwen requests as (slot, rows), taken by `launch_prefill_chain`.
+    qwen_pack: Vec<(usize, u32)>,
     mixed_step: Option<mixed_step::MixedCudaStep>,
     token_batch: Option<token_batch::CudaTokenBatch>,
     /// Split attention for decode rows riding a packed prefill launch (`riders.rs`).
@@ -5376,11 +5392,12 @@ impl GpuEngine {
                 .module_global_u32(&module, "plow_arena_bytes_narrow")?
                 .map_or(smem, |narrow| narrow.min(smem)),
         };
-        // Rungs of 8 rows and up launch the `_gw` sibling object; those wider than GV_MM_MAX
-        // with its full claim (the wide-GEMV ring). At 2/4 rows the two objects are within ~1%
-        // either way (Chatterbox's CFG pair is 1% faster on the ordinary one).
+        // Rungs of 8 rows and up launch the `_gw` sibling object; from the object's wide-arm
+        // threshold (plow_gw_min_rows, default GV_MM_MAX + 1) with its full claim (the wide-GEMV
+        // ring). At 2/4 rows the two objects are within ~1% either way (Chatterbox's CFG pair is
+        // 1% faster on the ordinary one).
         let gemv_wide = match gemv_mm_cap {
-            Some(cap)
+            Some(_)
                 if decode_objects.is_none()
                     && nv_config.cubin.is_none()
                     && nv_config.kernel.is_none() =>
@@ -5393,7 +5410,7 @@ impl GpuEngine {
                     &module,
                     grid,
                 )?
-                .map(|object| (cap as usize, object))
+                .map(|(min_rows, object)| (min_rows as usize, object))
             }
             _ => None,
         };
@@ -5406,6 +5423,7 @@ impl GpuEngine {
                 &module,
                 grid,
             )?
+            .map(|(_, object)| object)
         } else {
             None
         };
@@ -5418,7 +5436,9 @@ impl GpuEngine {
             gemv_wide
                 .as_ref()
                 .filter(|_| rows >= 8)
-                .map(|(cap, (narrow, full))| Arc::clone(if rows > *cap { full } else { narrow }))
+                .map(|(min_rows, (narrow, full))| {
+                    Arc::clone(if rows >= *min_rows { full } else { narrow })
+                })
         };
         let decode_rungs = if select_decode_rungs {
             blob.decode_progs()[..blob.decode_progs().len() - 1]
@@ -6451,6 +6471,21 @@ impl GpuEngine {
             None
         };
 
+        let qwen_initstate = blob
+            .tensors
+            .iter()
+            .position(|t| t.name == "act.gdn.initstate");
+        // The Qwen3.5 chain packs when its packet declares the section, carries the gathered
+        // initial-state scratch and the GDN library launches packed sequences.
+        let qwen_packs =
+            qwen_prefill.as_ref().is_some_and(|g| g.varlen()) && qwen_initstate.is_some();
+        if qwen_packs && batch > crate::device::cuda::qwen_gdn::MAX_SEQS {
+            return Err(RuntimeError::Rejected(format!(
+                "packed GDN prefill takes at most {} requests per launch; the ladder tops at {batch} slots",
+                crate::device::cuda::qwen_gdn::MAX_SEQS
+            )));
+        }
+
         // ---- Cross-request prefill mode (finalized once the prefill object is up) ----
         // A validated manifest selects its packet-defined chain without a runtime knob.
         let pf_batch: Option<PfBatch> = match (pf_bufs, pf_handles) {
@@ -6458,9 +6493,10 @@ impl GpuEngine {
                 if f_pf.is_some() && !prefill.is_empty() =>
             {
                 if (vmm.as_ref().is_some_and(|v| v.prefix_kv().is_some()) && !packed_prefix)
-                    || recurrent.is_some()
+                    || (recurrent.is_some() && !qwen_packs)
                     || prefill.iter().any(|b| {
-                        b.seg_class.len() < 2 || b.qwen_segments.iter().any(Option::is_some)
+                        b.seg_class.len() < 2
+                            || (!qwen_packs && b.qwen_segments.iter().any(Option::is_some))
                     })
                 {
                     return Err(RuntimeError::Rejected("packed requests require complete direct-KV segmented chains and a compatible prefix layout".into()));
@@ -6717,6 +6753,7 @@ impl GpuEngine {
             pos: vec![0; batch],
             vmm_attached: vec![0; batch],
             resume_rows: vec![0; batch],
+            rewind_snapshots: (0..batch).map(|_| None).collect(),
             resume_ring_slack,
             session_pin: vec![None; batch],
             vmm_active: vec![false; batch],
@@ -6744,6 +6781,8 @@ impl GpuEngine {
             entry_trace: None,
             attention_gemm,
             attention_requests: Vec::new(),
+            qwen_initstate,
+            qwen_pack: Vec::new(),
             mixed_step,
             token_batch: None,
             riders: None,
@@ -7226,14 +7265,59 @@ impl GpuEngine {
     /// Bench-only: move slot `b` back to position `len` (at most its current one), keeping the
     /// cache rows below it, so repeated timed steps read the same kv length.
     pub fn rewind_slot(&mut self, b: usize, len: usize) -> Result<()> {
-        if self.recurrent.is_some() || len > self.pos[b] as usize {
+        if len > self.pos[b] as usize {
             return Err(RuntimeError::Rejected(
                 "rewind_slot: unsupported slot state".into(),
             ));
         }
+        // Recurrent state only exists at the slot's current position: a rewind needs the
+        // snapshot `snapshot_slot` took at exactly `len`.
+        if let Some(rec) = &self.recurrent {
+            let Some((pos, copies)) = &self.rewind_snapshots[b] else {
+                return Err(RuntimeError::Rejected(
+                    "rewind_slot: no recurrent snapshot".into(),
+                ));
+            };
+            if *pos as usize != len {
+                return Err(RuntimeError::Rejected(
+                    "rewind_slot: snapshot position differs".into(),
+                ));
+            }
+            // On the engine stream: the legacy-stream copy does not order against the
+            // non-blocking stream, and the next step would read slots still being restored.
+            for (&(index, per_slot), mem) in rec.tensors.iter().zip(copies) {
+                self.be.memcpy_dtod_async(
+                    self.devp[index].base + b as u64 * per_slot,
+                    mem.base,
+                    per_slot,
+                    &self.stream,
+                )?;
+            }
+        }
         // VMM rows below the old position stay mapped; only the prefix history shrinks with it.
         self.seq_tokens[b].truncate(len);
         self.pos[b] = len as _;
+        Ok(())
+    }
+
+    /// Bench-only: remember slot `b`'s recurrent state at its current position for `rewind_slot`.
+    /// A no-op without recurrent state.
+    pub fn snapshot_slot(&mut self, b: usize) -> Result<()> {
+        let Some(rec) = &self.recurrent else {
+            return Ok(());
+        };
+        let mut copies = Vec::with_capacity(rec.tensors.len());
+        for &(index, per_slot) in &rec.tensors {
+            let mem = self.be.alloc(0, per_slot)?;
+            self.be.memcpy_dtod_async(
+                mem.base,
+                self.devp[index].base + b as u64 * per_slot,
+                per_slot,
+                &self.stream,
+            )?;
+            copies.push(mem);
+        }
+        self.rewind_snapshots[b] = Some((self.pos[b], copies));
         Ok(())
     }
 
@@ -7685,7 +7769,32 @@ impl GpuEngine {
             self.be.event_record(&t.ev[1], &self.stream)?;
         }
 
-        self.launch_selected_decode(rung)?;
+        if crate::config::RuntimeConfig::get().nv.pf_trace_log {
+            let mapped: Vec<u32> = feeds
+                .iter()
+                .map(|&(b, _)| {
+                    self.vmm
+                        .as_ref()
+                        .and_then(|v| v.kv.as_ref())
+                        .map_or(u32::MAX, |kv| kv.mapped_rows(b))
+                })
+                .collect();
+            let pos: Vec<u32> = feeds.iter().map(|&(b, _)| self.pos[b]).collect();
+            tracing::info!(
+                target: "pf_trace",
+                ?feeds,
+                ?pos,
+                ?mapped,
+                launch_rows,
+                rung = ?rung,
+                "decode step"
+            );
+        }
+        self.launch_selected_decode(rung).map_err(|e| {
+            let pos: Vec<u32> = feeds.iter().map(|&(b, _)| self.pos[b]).collect();
+            tracing::warn!(launch_rows, ?feeds, ?pos, error = %e, "decode launch failed");
+            e
+        })?;
         if let Some(t) = &self.timing {
             self.be.event_record(&t.ev[2], &self.stream)?;
         }
@@ -8998,6 +9107,17 @@ impl GpuEngine {
         self.prefill[self.pick_prefill_bucket(avail, usize::MAX)].t as usize
     }
 
+    /// Rows of the smallest bucket holding `rows` in ONE launch: what the unified token batch
+    /// takes (`CudaTokenBatch::load`). Not the pack budget, whose cost-aware plan splits instead
+    /// (1040 rows: `[1024, 128]`, so it reports no spill where the batch runs 4096). `None`
+    /// when no bucket holds the rows.
+    pub fn pf_launch_bucket(&self, rows: usize) -> Option<usize> {
+        self.prefill
+            .iter()
+            .map(|b| b.t as usize)
+            .find(|&t| t >= rows)
+    }
+
     /// Rows to slice off a request with `rem` prefill rows still unsent, under per-launch
     /// `cap`. Plans the WHOLE remainder, so the slice lands on a rung that fills exactly
     /// instead of leaving a stranded tail: 8192 rows under a 4224 cap runs [4096, 4096]
@@ -9998,7 +10118,15 @@ impl GpuEngine {
             // the first chunk's keys (PX-17 measured exactly that on main).
             let mut fp8_kv = false;
             let mut moe_rows = Vec::new();
+            let mut qwen_conv = Vec::new();
+            let mut qwen_rope = Vec::new();
             for (ix, inst) in g.insts.iter().enumerate() {
+                if inst.op == DevOp::QwenGdnConvPrefill as u16 && inst.i[2] == g.t {
+                    qwen_conv.push(ix);
+                }
+                if inst.op == DevOp::QwenHeadNormRope as u16 && inst.i[4] != 0 {
+                    qwen_rope.push(ix);
+                }
                 if matches!(
                     DevOp::from_u16(inst.op),
                     Some(
@@ -10034,6 +10162,14 @@ impl GpuEngine {
                     || inst.op == DevOp::GemmMed as u16)
                     && inst.i[0] == 1
                 {
+                    lmhead.push(ix);
+                } else if inst.op == DevOp::Gemv as u16
+                    && inst.i[0] == 1
+                    && g.t > 1
+                    && inst.i[4] == g.t - 1
+                {
+                    // Qwen3.5 prefill head (devgen qwen35.rs): one GEMV row at the bucket's
+                    // last row. A padded chunk must read its last REAL row instead.
                     lmhead.push(ix);
                 }
             }
@@ -10138,6 +10274,8 @@ impl GpuEngine {
                         .chain(&flash)
                         .chain(&lmhead)
                         .chain(&merge)
+                        .chain(&qwen_conv)
+                        .chain(&qwen_rope)
                         .copied(),
                 ),
                 rope_sites: rope,
@@ -10146,6 +10284,8 @@ impl GpuEngine {
                 merge_sites: merge,
                 moe_row_sites: moe_rows,
                 moe_rows: g.t,
+                qwen_conv_sites: qwen_conv,
+                qwen_rope_sites: qwen_rope,
                 fp8_kv,
                 batch_patched: false,
                 d_ctr,
@@ -10224,6 +10364,29 @@ impl GpuEngine {
     /// MoE ragged tail (see `PrefillBucket::moe_row_sites`): point the bucket's MoE row operands
     /// at `rows` real rows and enqueue that window on the engine stream, ahead of the launch.
     /// `PLOW_RAGGED_CHUNK=0` keeps the padded bucket width (the control arm).
+    /// Qwen3.5 conv prefill sites of a packed launch: `i[2]` = the real rows, `i[3]` = the bucket.
+    fn patch_qwen_conv(&mut self, bi: usize, rows: u32) -> Result<()> {
+        let sz = std::mem::size_of::<DevInst64>();
+        let b = &mut self.prefill[bi];
+        if b.qwen_conv_sites.is_empty() {
+            return Ok(());
+        }
+        for &ix in &b.qwen_conv_sites {
+            b.h_inst[ix].i[2] = rows;
+            b.h_inst[ix].i[3] = b.t;
+        }
+        let lo = *b.qwen_conv_sites.iter().min().expect("non-empty");
+        let hi = *b.qwen_conv_sites.iter().max().expect("non-empty") + 1;
+        // SAFETY: h_inst lives on self past the launch's stream synchronize.
+        unsafe {
+            self.be.memcpy_htod_async(
+                b.d_inst.base + (lo * sz) as u64,
+                pod_bytes(&b.h_inst[lo..hi]),
+                &self.stream,
+            )
+        }
+    }
+
     fn patch_moe_rows(&mut self, bi: usize, rows: u32) -> Result<()> {
         let sz = std::mem::size_of::<DevInst64>();
         let b = &mut self.prefill[bi];
@@ -10296,22 +10459,6 @@ impl GpuEngine {
         }
         let c0 = self.pos[b] as usize;
         debug_assert!(c0 < n, "prefill_chunk past the prompt end");
-
-        if self.qwen_prefill.is_some()
-            && !self
-                .prefill
-                .iter()
-                .any(|p| p.t as usize <= (n - c0).min(cap))
-        {
-            let end = c0.saturating_add(cap.max(1)).min(n);
-            let mut tokens = Vec::with_capacity(1);
-            let token = self.consume_prompt(b, &prompt[c0..end], &mut tokens)?;
-            return Ok(if end == n {
-                PrefillStep::Done(token)
-            } else {
-                PrefillStep::Progress(end)
-            });
-        }
 
         // The chunk launches against slot b's prebuilt tensor table (the
         // kernarg selects it) — the shared table is never touched, so decode
@@ -10465,16 +10612,7 @@ impl GpuEngine {
         let rem = n - c0;
         let sz = std::mem::size_of::<DevInst64>();
 
-        let bi = if self.qwen_prefill.is_some() {
-            self.prefill
-                .iter()
-                .rposition(|p| p.t as usize <= rem.min(cap))
-                .ok_or_else(|| {
-                    RuntimeError::Rejected("Qwen prefill requires an exact chunk".into())
-                })?
-        } else {
-            self.pick_prefill_bucket(rem, cap)
-        };
+        let bi = self.pick_prefill_bucket(rem, cap);
         let (bi, real) = self.span_safe_chunk(bi, prompt, c0, rem, cap)?;
         let tc = self.prefill[bi].t as usize;
 
@@ -10507,6 +10645,9 @@ impl GpuEngine {
             for &pc in &bucket.merge_sites {
                 pack.bind_request(&mut bucket.h_inst[pc], false);
             }
+            for &pc in bucket.qwen_rope_sites.iter().chain(&bucket.qwen_conv_sites) {
+                pack.bind_request(&mut bucket.h_inst[pc], false);
+            }
             bucket.batch_patched = false;
         }
         // Patch this bucket's instruction stream for the chunk, then enqueue
@@ -10522,6 +10663,10 @@ impl GpuEngine {
             }
             for &ix in &b.lmhead_sites {
                 b.h_inst[ix].i[4] = (real - 1) as u32;
+            }
+            for &ix in &b.qwen_conv_sites {
+                b.h_inst[ix].i[2] = real as u32;
+                b.h_inst[ix].i[3] = tc as u32;
             }
             if !b.inst_range.is_empty() {
                 let bytes = pod_bytes(&b.h_inst[b.inst_range.clone()]);
@@ -11160,6 +11305,7 @@ impl GpuEngine {
         synchronize: bool,
     ) -> Result<()> {
         let synchronize = synchronize || crate::config::RuntimeConfig::get().nv.pf_trace_log;
+        let qwen_pack = std::mem::take(&mut self.qwen_pack);
         // SEGMENTED MODE (SegPf): one launch per wave-class segment, in blob order,
         // alternating the fat (flash) and lean occ-2 (GEMM) objects. Sequential stream
         // launches make cross-segment gates trivially satisfied (dependencies only point
@@ -11185,32 +11331,161 @@ impl GpuEngine {
         // len 1 = a force_uniseg small bucket: ONE launch on the full fat _pf object beats
         // ~480 segment launches (T18) — take the single-launch path below.
         if !self.prefill[bi].qwen_segments.is_empty() {
+            // PLOW_PF_SEG_TIME=1: one event pair per segment, classes 8 = cuBLASLt route,
+            // 5 = host GDN kernel + its (Nop) interpreter segment, 4 = fat interpreter segment.
+            let seg_time = crate::config::RuntimeConfig::get().nv.pf_seg_time;
+            let mut evs: Vec<(usize, u8, CudaEvent, CudaEvent)> = Vec::new();
             for (seg, external) in self.prefill[bi].qwen_segments.iter().enumerate() {
+                let mut e0 = if seg_time {
+                    let e = self.be.event_create(true)?;
+                    self.be.event_record(&e, &self.stream)?;
+                    Some(e)
+                } else {
+                    None
+                };
+                let class = if self.prefill[bi]
+                    .cublaslt_segments
+                    .get(seg)
+                    .is_some_and(Option::is_some)
+                {
+                    8
+                } else if external.is_some() {
+                    5
+                } else {
+                    4
+                };
+                let mut done =
+                    |this: &Self, evs: &mut Vec<(usize, u8, CudaEvent, CudaEvent)>| -> Result<()> {
+                        if let Some(e0) = e0.take() {
+                            let e1 = this.be.event_create(true)?;
+                            this.be.event_record(&e1, &this.stream)?;
+                            evs.push((seg, class, e0, e1));
+                        }
+                        Ok(())
+                    };
                 if let Some(Some(route)) = self.prefill[bi].cublaslt_segments.get(seg) {
                     route.run(&self.stream)?;
+                    done(self, &mut evs)?;
                     continue;
                 }
                 if let Some(inst) = external {
-                    let native = self
-                        .qwen_prefill
-                        .as_mut()
-                        .expect("validated Qwen prefill adapter");
                     let t = &inst.t;
+                    // A padded chunk scans the real rows only: the recurrent state must end at
+                    // the last prompt token. Pad rows of the output are zeroed so the layers
+                    // after it see finite activations. A packed launch's real rows are its
+                    // requests' rows, contiguous from row 0.
+                    let real = if qwen_pack.is_empty() {
+                        (n - c0).min(tc)
+                    } else {
+                        qwen_pack
+                            .iter()
+                            .map(|&(_, rows)| rows as usize)
+                            .sum::<usize>()
+                            .min(tc)
+                    };
+                    if real < tc {
+                        const CORE_ROW_BYTES: usize =
+                            crate::device::cuda::qwen_gdn::CORE_ROW_BYTES as usize;
+                        let core = &self.devp[t[0] as usize];
+                        self.be.memset_d8_async(
+                            core.base + (real * CORE_ROW_BYTES) as u64,
+                            0,
+                            (tc - real) * CORE_ROW_BYTES,
+                            &self.stream,
+                        )?;
+                    }
                     let state = &self.devp[t[6] as usize];
-                    let slot_state = qwen_state_slot(state, b, self.batch)?;
-                    let tensors = [
-                        &self.devp[t[1] as usize],
-                        &self.devp[t[2] as usize],
-                        &self.devp[t[3] as usize],
-                        &self.devp[t[0] as usize],
-                        &self.devp[t[4] as usize],
-                        &self.devp[t[5] as usize],
-                        &self.devp[t[7] as usize],
-                        &slot_state,
-                    ];
-                    // Packet loading validates tensor extents and fixed kernel geometry.
-                    unsafe {
-                        native.launch(tensors, inst.i[0] as usize, &self.stream)?;
+                    if qwen_pack.is_empty() {
+                        let native = self
+                            .qwen_prefill
+                            .as_mut()
+                            .expect("validated Qwen prefill adapter");
+                        let slot_state = qwen_state_slot(state, b, self.batch)?;
+                        let tensors = [
+                            &self.devp[t[1] as usize],
+                            &self.devp[t[2] as usize],
+                            &self.devp[t[3] as usize],
+                            &self.devp[t[0] as usize],
+                            &self.devp[t[4] as usize],
+                            &self.devp[t[5] as usize],
+                            &self.devp[t[7] as usize],
+                            &slot_state,
+                        ];
+                        // Packet loading validates tensor extents and fixed kernel geometry.
+                        unsafe {
+                            native.launch(tensors, real, &self.stream)?;
+                        }
+                    } else {
+                        // Packed: N sequences over N contiguous state slots. Gather the
+                        // requests' slot states into the initial scratch, scan, scatter the
+                        // finals back (stream order, so the next layer's gather is safe).
+                        const STRIDE: u64 = crate::device::cuda::qwen_gdn::STATE_BYTES;
+                        let nseq = qwen_pack.len() as u64;
+                        let init = &self.devp[self
+                            .qwen_initstate
+                            .expect("packed Qwen chain has act.gdn.initstate")];
+                        let out = &self.devp[t[7] as usize];
+                        if init.len < nseq * STRIDE || out.len < nseq * STRIDE {
+                            return Err(RuntimeError::Rejected(
+                                "packed Qwen prefill exceeds the GDN state scratch".into(),
+                            ));
+                        }
+                        for (i, &(slot, _)) in qwen_pack.iter().enumerate() {
+                            let src = qwen_state_slot(state, slot, self.batch)?;
+                            self.be.memcpy_dtod_async(
+                                init.base + i as u64 * STRIDE,
+                                src.base,
+                                STRIDE,
+                                &self.stream,
+                            )?;
+                        }
+                        if synchronize {
+                            self.be.stream_synchronize(&self.stream).map_err(|e| {
+                                tracing::warn!(error = %e, "packed GDN gather failed");
+                                e
+                            })?;
+                        }
+                        let init_view = DeviceMem::view(init.base, nseq * STRIDE);
+                        let out_view = DeviceMem::view(out.base, nseq * STRIDE);
+                        let lens: Vec<u32> = qwen_pack.iter().map(|&(_, rows)| rows).collect();
+                        let native = self
+                            .qwen_prefill
+                            .as_mut()
+                            .expect("validated Qwen prefill adapter");
+                        let tensors = [
+                            &self.devp[t[1] as usize],
+                            &self.devp[t[2] as usize],
+                            &self.devp[t[3] as usize],
+                            &self.devp[t[0] as usize],
+                            &self.devp[t[4] as usize],
+                            &self.devp[t[5] as usize],
+                            &out_view,
+                            &init_view,
+                        ];
+                        unsafe {
+                            native.launch_varlen(tensors, &lens, &self.stream)?;
+                        }
+                        if synchronize {
+                            self.be.stream_synchronize(&self.stream).map_err(|e| {
+                                tracing::warn!(error = %e, "packed GDN scan failed");
+                                e
+                            })?;
+                        }
+                        for (i, &(slot, _)) in qwen_pack.iter().enumerate() {
+                            let dst = qwen_state_slot(state, slot, self.batch)?;
+                            self.be.memcpy_dtod_async(
+                                dst.base,
+                                out.base + i as u64 * STRIDE,
+                                STRIDE,
+                                &self.stream,
+                            )?;
+                        }
+                        if synchronize {
+                            self.be.stream_synchronize(&self.stream).map_err(|e| {
+                                tracing::warn!(error = %e, "packed GDN scatter failed");
+                                e
+                            })?;
+                        }
                     }
                 }
                 let role =
@@ -11221,14 +11496,81 @@ impl GpuEngine {
                     });
                 segment_window(&mut arg, &self.prefill[bi].kernarg, seg, role.is_some());
                 let mut params = [&mut arg as *mut DevProgram as *mut std::ffi::c_void];
-                self.be.launch_cooperative(
-                    role.map_or(f_pf, |r| r.function),
-                    role.map_or(self.grid_pf, |r| r.grid),
-                    BLOCK,
-                    role.map_or(self.smem_pf, |r| r.smem),
-                    &mut params,
-                    Some(&self.stream),
-                )?;
+                self.be
+                    .launch_cooperative(
+                        role.map_or(f_pf, |r| r.function),
+                        role.map_or(self.grid_pf, |r| r.grid),
+                        role.map_or(BLOCK, |r| r.block),
+                        role.map_or(self.smem_pf, |r| r.smem),
+                        &mut params,
+                        Some(&self.stream),
+                    )
+                    // Under CUDA_LAUNCH_BLOCKING a device fault surfaces here: name the segment.
+                    .map_err(|e| {
+                        tracing::warn!(
+                            seg,
+                            class,
+                            role = role.is_some(),
+                            error = %e,
+                            "qwen prefill segment launch failed"
+                        );
+                        e
+                    })?;
+                done(self, &mut evs)?;
+            }
+            if seg_time {
+                self.be.stream_synchronize(&self.stream)?;
+                let mut by_class = [0f64; 3]; // [cuBLASLt(8), GDN(5), fat(4)]
+                let mut n_by = [0u32; 3];
+                let mut per: Vec<(usize, u8, f32)> = Vec::with_capacity(evs.len());
+                for (seg, cls, e0, e1) in &evs {
+                    let ms = self.be.event_elapsed_ms(e0, e1)?;
+                    let ix = match cls {
+                        8 => 0,
+                        5 => 1,
+                        _ => 2,
+                    };
+                    by_class[ix] += ms as f64;
+                    n_by[ix] += 1;
+                    per.push((*seg, *cls, ms));
+                }
+                tracing::info!(
+                    lt_ms = format!("{:.1}", by_class[0]).as_str(),
+                    gdn_ms = format!("{:.1}", by_class[1]).as_str(),
+                    fat_ms = format!("{:.1}", by_class[2]).as_str(),
+                    n_lt = n_by[0],
+                    n_gdn = n_by[1],
+                    n_fat = n_by[2],
+                    "qwen seg-class wall time (chunk)"
+                );
+                per.sort_by(|a, b| b.2.total_cmp(&a.2));
+                let top: Vec<String> = per
+                    .iter()
+                    .take(10)
+                    .map(|(i, c, ms)| format!("seg{i}(c{c})={ms:.2}ms"))
+                    .collect();
+                tracing::info!(top = top.join(" ").as_str(), "slowest segments");
+                let mut by_sites: std::collections::BTreeMap<Vec<(usize, u16)>, (u32, f64)> =
+                    std::collections::BTreeMap::new();
+                for (seg, _, e0, e1) in &evs {
+                    let sites = self.prefill[bi].segment_sites[*seg].clone();
+                    let summary = by_sites.entry(sites).or_default();
+                    summary.0 += 1;
+                    summary.1 += self.be.event_elapsed_ms(e0, e1)? as f64;
+                }
+                for (sites, (count, elapsed_ms)) in by_sites {
+                    let sites = sites
+                        .iter()
+                        .map(|(pc, op)| format!("pc{pc}:{}", devop_name(*op as u32)))
+                        .collect::<Vec<_>>()
+                        .join("+");
+                    tracing::info!(
+                        sites,
+                        count,
+                        elapsed_ms = format!("{elapsed_ms:.3}"),
+                        "segment-site wall time (chunk)"
+                    );
+                }
             }
         } else if uses_segmented_prefill(
             self.seg_pf.is_some(),
@@ -11447,13 +11789,18 @@ impl GpuEngine {
                 let (f, gr, blk, sm) = self.prefill_segment_kernel(bi, seg, cls, fat_only)?;
                 let direct = self.direct_packet_segment(bi, seg, &arg)?;
                 let go = |f: KernelFn, params: &mut [*mut std::ffi::c_void]| -> Result<()> {
-                    if noncoop {
+                    let launched = if noncoop {
                         self.be
                             .launch_kernel(f, gr, blk, sm, params, Some(&self.stream))
                     } else {
                         self.be
                             .launch_cooperative(f, gr, blk, sm, params, Some(&self.stream))
-                    }
+                    };
+                    // Under CUDA_LAUNCH_BLOCKING a device fault surfaces here: name the segment.
+                    launched.map_err(|e| {
+                        tracing::warn!(seg, cls, error = %e, "prefill segment launch failed");
+                        e
+                    })
                 };
                 if seg_time {
                     tracing::debug!(
@@ -11625,6 +11972,9 @@ impl GpuEngine {
             for &pc in &b.merge_sites {
                 pack.bind_request(&mut b.h_inst[pc], true);
             }
+            for &pc in b.qwen_rope_sites.iter().chain(&b.qwen_conv_sites) {
+                pack.bind_request(&mut b.h_inst[pc], true);
+            }
             for &pc in &b.lmhead_sites {
                 b.h_inst[pc].i[4] = 0;
             }
@@ -11715,6 +12065,17 @@ impl GpuEngine {
         self.packed_token_body(&chunks)?;
         for r in reqs {
             self.pos[r.slot] = (r.c0 + r.len) as u32;
+            if crate::config::RuntimeConfig::get().nv.pf_trace_log {
+                tracing::info!(
+                    target: "pf_trace",
+                    slot = r.slot,
+                    c0 = r.c0,
+                    len = r.len,
+                    prompt = r.prompt.len(),
+                    mapped = self.vmm.as_ref().and_then(|v| v.kv.as_ref()).map_or(u32::MAX, |kv| kv.mapped_rows(r.slot)),
+                    "packed prefill request done"
+                );
+            }
             // The history follows every chunk: the prompt's next chunk may ride a token batch,
             // which checks its frontier against it.
             if self.vmm_prefix_enabled() {
@@ -11852,6 +12213,7 @@ impl GpuEngine {
         self.ensure_batch_patch(bi)?;
         // Packed rows are contiguous from row 0, so the first `total` rows are the real ones.
         self.patch_moe_rows(bi, total as u32)?;
+        self.patch_qwen_conv(bi, total as u32)?;
         let tc = self.prefill[bi].t as usize;
         let riding = std::mem::take(&mut self.pf_riders);
         let riding = if riding > 0
@@ -12047,6 +12409,16 @@ impl GpuEngine {
                 q0 += len;
             }
         }
+        // The Qwen3.5 chain's requests (slot, rows): its conv and GDN segments run one
+        // sequence per request; `launch_prefill_chain` takes the list.
+        self.qwen_pack.clear();
+        if !self.prefill[bi].qwen_segments.is_empty() {
+            self.qwen_pack.extend(
+                reqs[riding..]
+                    .iter()
+                    .map(|r| (r.slot, r.tokens.len() as u32)),
+            );
+        }
         // One async fill re-arms the bucket's counters AND its tail GQ cursor.
         let launched = (|| -> Result<()> {
             self.be
@@ -12085,6 +12457,8 @@ impl GpuEngine {
             riders.disarm();
         }
         if let Err(error) = launched {
+            // A pack the chain never took must not feed the next single-request launch.
+            self.qwen_pack.clear();
             let _ = self.be.stream_synchronize(&self.stream);
             return Err(error);
         }

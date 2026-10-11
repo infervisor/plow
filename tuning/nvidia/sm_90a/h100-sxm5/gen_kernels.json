@@ -1,5 +1,33 @@
 {
  "entries": {
+  "attn_pf_hd256_causal": {
+   "body_sha256": "51d22b9fe138947d741efed068f3fe57bf68186fda207c3e4906928a4e54ffa0",
+   "classes": {},
+   "config": {
+    "bn": 64,
+    "kstages": 3,
+    "preg": 56,
+    "vstages": 2
+   },
+   "object": "gen_sm90a_attn_pf_hd256_causal.cubin",
+   "selection": "attn_pf_hd256_sliding config (same template; window is a runtime operand)",
+   "signature": {
+    "arch": "sm_90a",
+    "dtype": "bf16",
+    "gqa": [
+     2,
+     16
+    ],
+    "gqa_even": true,
+    "head_dim": 256,
+    "kv_dtype": "bf16",
+    "mask": "causal",
+    "op": "flash_prefill",
+    "ring_kv": false,
+    "window": 0
+   },
+   "spill_bytes": 0
+  },
   "attn_pf_hd256_sliding": {
    "body_sha256": "51d22b9fe138947d741efed068f3fe57bf68186fda207c3e4906928a4e54ffa0",
    "classes": {
@@ -1218,7 +1246,7 @@
    "spill_bytes": 84
   },
   "attn_pf_hd512_fp8kv": {
-   "body_sha256": "600e9fa8fb6b1fd76d598b55a98f5898cd767922fdd80d787e24893ad46a86d6",
+   "body_sha256": "f782ab7e40fb0f32486d22de2e2b1204a04ab46e00570754797537230c5033e4",
    "classes": {
     "h16kv1_rows1024": {
      "best": {
@@ -1236,9 +1264,9 @@
         "threads": 256
        },
        "floor_us": 17.4,
-       "rel_l2": 0.00136,
-       "tflops": 108,
-       "us": 158.6
+       "rel_l2": 0.00135,
+       "tflops": 127,
+       "us": 135.4
       },
       {
        "config": {
@@ -1248,9 +1276,21 @@
         "threads": 256
        },
        "floor_us": 17.4,
-       "rel_l2": 0.00136,
-       "tflops": 107,
-       "us": 161.2
+       "rel_l2": 0.00135,
+       "tflops": 124,
+       "us": 139.2
+      },
+      {
+       "config": {
+        "bm": 64,
+        "bn": 48,
+        "stages": 1,
+        "threads": 256
+       },
+       "floor_us": 17.4,
+       "rel_l2": 0.00135,
+       "tflops": 109,
+       "us": 157.7
       },
       {
        "config": {
@@ -1260,9 +1300,9 @@
         "threads": 256
        },
        "floor_us": 17.4,
-       "rel_l2": 0.00136,
-       "tflops": 88,
-       "us": 196.0
+       "rel_l2": 0.00135,
+       "tflops": 101,
+       "us": 170.0
       },
       {
        "config": {
@@ -1272,9 +1312,9 @@
         "threads": 256
        },
        "floor_us": 17.4,
-       "rel_l2": 0.00136,
-       "tflops": 85,
-       "us": 201.4
+       "rel_l2": 0.00135,
+       "tflops": 100,
+       "us": 172.6
       }
      ]
     },
@@ -1294,9 +1334,9 @@
         "threads": 256
        },
        "floor_us": 503.8,
-       "rel_l2": 0.00235,
-       "tflops": 145,
-       "us": 3443.5
+       "rel_l2": 0.00169,
+       "tflops": 196,
+       "us": 2539.9
       },
       {
        "config": {
@@ -1306,9 +1346,21 @@
         "threads": 256
        },
        "floor_us": 503.8,
-       "rel_l2": 0.00235,
-       "tflops": 143,
-       "us": 3490.8
+       "rel_l2": 0.00169,
+       "tflops": 183,
+       "us": 2729.5
+      },
+      {
+       "config": {
+        "bm": 64,
+        "bn": 48,
+        "stages": 1,
+        "threads": 256
+       },
+       "floor_us": 503.8,
+       "rel_l2": 0.00169,
+       "tflops": 161,
+       "us": 3090.2
       },
       {
        "config": {
@@ -1318,9 +1370,9 @@
         "threads": 256
        },
        "floor_us": 503.8,
-       "rel_l2": 0.00236,
-       "tflops": 113,
-       "us": 4415.1
+       "rel_l2": 0.00169,
+       "tflops": 143,
+       "us": 3496.2
       },
       {
        "config": {
@@ -1330,9 +1382,9 @@
         "threads": 256
        },
        "floor_us": 503.8,
-       "rel_l2": 0.00236,
-       "tflops": 110,
-       "us": 4530.0
+       "rel_l2": 0.00169,
+       "tflops": 136,
+       "us": 3662.3
       }
      ]
     },
@@ -1352,9 +1404,9 @@
         "threads": 256
        },
        "floor_us": 260.6,
-       "rel_l2": 0.00237,
-       "tflops": 141,
-       "us": 1828.2
+       "rel_l2": 0.00169,
+       "tflops": 192,
+       "us": 1341.7
       },
       {
        "config": {
@@ -1364,9 +1416,21 @@
         "threads": 256
        },
        "floor_us": 260.6,
-       "rel_l2": 0.00237,
-       "tflops": 141,
-       "us": 1829.2
+       "rel_l2": 0.00169,
+       "tflops": 178,
+       "us": 1449.2
+      },
+      {
+       "config": {
+        "bm": 64,
+        "bn": 48,
+        "stages": 1,
+        "threads": 256
+       },
+       "floor_us": 260.6,
+       "rel_l2": 0.00169,
+       "tflops": 156,
+       "us": 1650.6
       },
       {
        "config": {
@@ -1376,9 +1440,9 @@
         "threads": 256
        },
        "floor_us": 260.6,
-       "rel_l2": 0.00237,
-       "tflops": 110,
-       "us": 2344.4
+       "rel_l2": 0.00169,
+       "tflops": 140,
+       "us": 1835.7
       },
       {
        "config": {
@@ -1388,9 +1452,9 @@
         "threads": 256
        },
        "floor_us": 260.6,
-       "rel_l2": 0.00237,
-       "tflops": 109,
-       "us": 2368.1
+       "rel_l2": 0.00169,
+       "tflops": 134,
+       "us": 1918.3
       }
      ]
     },
@@ -1410,9 +1474,9 @@
         "threads": 256
        },
        "floor_us": 278.0,
-       "rel_l2": 0.00123,
-       "tflops": 140,
-       "us": 1962.3
+       "rel_l2": 0.00122,
+       "tflops": 183,
+       "us": 1503.5
       },
       {
        "config": {
@@ -1422,9 +1486,21 @@
         "threads": 256
        },
        "floor_us": 278.0,
-       "rel_l2": 0.00123,
-       "tflops": 139,
-       "us": 1978.4
+       "rel_l2": 0.00122,
+       "tflops": 174,
+       "us": 1577.4
+      },
+      {
+       "config": {
+        "bm": 64,
+        "bn": 48,
+        "stages": 1,
+        "threads": 256
+       },
+       "floor_us": 278.0,
+       "rel_l2": 0.00122,
+       "tflops": 152,
+       "us": 1813.1
       },
       {
        "config": {
@@ -1434,9 +1510,9 @@
         "threads": 256
        },
        "floor_us": 278.0,
-       "rel_l2": 0.00123,
-       "tflops": 111,
-       "us": 2467.5
+       "rel_l2": 0.00122,
+       "tflops": 136,
+       "us": 2021.7
       },
       {
        "config": {
@@ -1446,9 +1522,9 @@
         "threads": 256
        },
        "floor_us": 278.0,
-       "rel_l2": 0.00123,
-       "tflops": 108,
-       "us": 2543.5
+       "rel_l2": 0.00122,
+       "tflops": 130,
+       "us": 2115.9
       }
      ]
     }
@@ -1461,7 +1537,7 @@
    },
    "object": "gen_sm90a_attn_pf_hd512_fp8kv.cubin",
    "packed_check": {
-    "rel_l2": 0.00191,
+    "rel_l2": 0.0019,
     "tail_zero": true
    },
    "selection": "min total us over classes",

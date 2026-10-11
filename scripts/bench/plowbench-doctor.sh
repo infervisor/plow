@@ -6,6 +6,8 @@
 #
 # CPU only. Leases nothing, starts no server, touches no GPU. Run it first; every check here
 # corresponds to a failure that has already cost at least one leased run in this campaign.
+# [8] is the capability inventory: a packet route that is off and not waived in the recipe's
+# [capabilities] table (or PB_CAPABILITY_WAIVERS) fails, so a campaign starts from the full set.
 #
 # Exit 0 = safe to lease. Exit 1 = something will fail after the weights load. Exit 2 = warnings
 # only (the run will work but the number may not mean what you think).
@@ -147,6 +149,24 @@ elif hashlib.sha256(head).hexdigest() != r.get("recipe_sha256"):
 else:
     print(f"  ok    assets built from HEAD's recipes/{rel}")
 PYEOF
+fi
+
+echo
+echo "[8] capability inventory (routes the packet declares; an OFF needs a recipe waiver)"
+# plowrt inventory is static (CPU): buckets, ladder, live KV, packed prefill + compact terminal,
+# segment roles, token batch, generated kernels, sampler, Lt prefill. A campaign starts from the
+# full set and measures removing routes; an unwaived OFF is a route it would rediscover later.
+if [ -n "$ASSETS" ] && [ -x "$PLOWRT" ]; then
+    while IFS=$'\t' read -r lvl msg; do
+        case "$lvl" in
+            ok) pb_ok "$msg" ;;
+            WARN) pb_warn "$msg" ;;
+            FAIL) pb_bad "$msg" ;;
+            *) pb_info "$lvl $msg" ;;
+        esac
+    done < <(python3 "$HERE/capability_check.py" "$PLOWRT" "$ASSETS" 2>&1)
+else
+    pb_warn "capability inventory skipped (needs the assets dir and an executable plowrt)"
 fi
 
 echo

@@ -1151,6 +1151,13 @@ extern "C" __device__ unsigned PLOW_SYM(plow_debug_max_inst) = 999999u;
  * correctness ceiling: M > GV_MM_MAX walks multiple weight passes. The decode loader reads
  * it to report the packet/object pairing and refuses zero, which would make the walk stall. */
 extern "C" __device__ unsigned PLOW_SYM(plow_gemv_mm_cap) = GV_MM_MAX;
+/* First decode rung the wide wgmma GEMV arm (op_gemv_wide_sm90.cuh, the _gw object) takes; the
+ * mma.sync walk serves the rungs below. plowrt launches the arm's full arena claim from this
+ * rung on. Default: the rungs past GV_MM_MAX, where the walk would restream the weights. */
+#ifndef PLOW_NV_GW_MIN_ROWS
+#define PLOW_NV_GW_MIN_ROWS (GV_MM_MAX + 1)
+#endif
+extern "C" __device__ unsigned PLOW_SYM(plow_gw_min_rows) = PLOW_NV_GW_MIN_ROWS;
 #if !PLOW_NV_PREFILL && !PLOW_NV_T17_MIN_ROWS
 extern "C" __device__ unsigned PLOW_SYM(plow_decode_block_norm_abi) = 1;
 #endif
@@ -1309,7 +1316,7 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
             (const __nv_bfloat16*)TEN(2), (const __nv_bfloat16*)TEN(3), TEN(4),
             (const __nv_bfloat16*)TEN(5), (float*)TEN(6), (const int*)TEN(7),
             in->i[0], in->i[1], in->i[2], in->i[3], in->i[4], in->fj[0].f,
-            in->fj[1].f, in->i[5], slice, nblk);
+            in->fj[1].f, in->i[5], slice, nblk, arena, PLOW_NV_ARENA_FLOATS);
         break;
     case PLOW_DOP_QWEN_GATED_NORM:
         d_qwen_gated_norm((__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1),
@@ -1328,18 +1335,19 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
     case PLOW_DOP_QWEN_RMSNORM:
         d_qwen_rmsnorm((__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1),
             (const __nv_bfloat16*)TEN(2), (const int*)TEN(3), in->i[0], in->i[1],
-            in->fj[0].f, in->fj[1].f, slice, nblk);
+            in->fj[0].f, in->fj[1].f, slice, nblk, arena, (const __nv_bfloat16*)TEN(4));
         break;
     case PLOW_DOP_QWEN_HEADNORM_ROPE:
         d_qwen_headnorm_rope((__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1),
             (const __nv_bfloat16*)TEN(2), (const float*)TEN(3), (const float*)TEN(4),
             (const int*)TEN(5), (const int*)TEN(6), in->i[0], in->i[1], in->i[2],
-            in->i[3], in->i[4], in->i[5], in->fj[0].f, in->fj[1].f, slice, nblk, in->i[6]);
+            in->i[3], in->i[4], in->i[5], in->fj[0].f, in->fj[1].f, slice, nblk, in->i[6],
+            (const int*)TEN(7));
         break;
     case PLOW_DOP_QWEN_GDN_CONV_PREFILL:
         d_qwen_gdn_conv_prefill((__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1),
             (const __nv_bfloat16*)TEN(2), (__nv_bfloat16*)TEN(3), in->i[0], in->i[1],
-            in->i[2], slice, nblk);
+            in->i[2], in->i[3], slice, nblk, (const int*)TEN(5));
         break;
     case PLOW_DOP_QWEN_GDN_QKV_PREP:
         d_qwen_gdn_qkv_prep((__nv_bfloat16*)TEN(0), (__nv_bfloat16*)TEN(1),
@@ -2147,6 +2155,29 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
      * every Qwen packet). i3=norm_flag selects the fused-norm GEMV, which this build does
      * NOT carry — trapped rather than silently skipping the norm. */
     case PLOW_DOP_GEMV:
+#if PLOW_NV_QWEN_GDN
+        /* i3 == 4: Qwen residual + RMSNorm prologue (op_qwen_gdn.cuh d_qwen_fold_norm): x (t1) is
+         * the norm output every block writes, t3 the residual stream out, i5 / i6 / i7 the
+         * residual stream in, the delta and gamma. The projection then runs as emitted. */
+        if (in->i[3] == 4u) {
+            /* On the tensor-core walk (rows <= 8) the normalized rows stay in the arena behind
+             * the block_sum scratch and feed the walk through its generic pointer; block 0 alone
+             * stores the global norm output (sibling consumers) and the residual stream. */
+            __nv_bfloat16* xs = (__nv_bfloat16*)(arena + 32);
+            const bool staged = PLOW_NV_QWEN_FOLD_STAGED && in->i[0] <= 4u && (in->i[2] & 31u) == 0u &&
+                (in->i[1] & 7u) == 0u && (size_t)in->i[0] * in->i[2] <= (PLOW_NV_ARENA_FLOATS - 32u) * 2u;
+            d_qwen_fold_norm((__nv_bfloat16*)TEN(1), (__nv_bfloat16*)TEN(3),
+                (const __nv_bfloat16*)TEN_I(5), (const __nv_bfloat16*)TEN_I(6),
+                (const __nv_bfloat16*)T[in->i[7]], in->i[0], in->i[2], in->fj[0].f, in->fj[1].f,
+                (float*)arena, staged ? xs : nullptr, !staged || slice == 0u);
+            __syncthreads();
+            if (staged) {
+                d_gemv((__nv_bfloat16*)TEN(0), xs, (const __nv_bfloat16*)TEN(2), in->i[0], in->i[1],
+                       in->i[2], slice, nblk);
+                break;
+            }
+        } else
+#endif
         if (in->i[3] != 0) {
             d_gemv_nrn((__nv_bfloat16*)TEN(0), (__nv_bfloat16*)TEN(3),
                        (const __nv_bfloat16*)TEN(1), (const __nv_bfloat16*)TEN(4),
@@ -2165,7 +2196,7 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
         }
 #endif
 #if PLOW_NV_GW_ACTIVE
-        if (in->i[0] > GV_MM_MAX && !TEN(7) &&
+        if (in->i[0] >= PLOW_NV_GW_MIN_ROWS && !TEN(7) &&
             d_gemv_wide<GW_PLAIN>(gw_args((const __nv_bfloat16*)TEN(1) + (size_t)in->i[4] * in->i[2],
                                           (const __nv_bfloat16*)TEN(2), nullptr, nullptr,
                                           (__nv_bfloat16*)TEN(0), nullptr, nullptr, in->i[1], 0u, 0u,
@@ -2280,7 +2311,7 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
         }
 #endif
 #if PLOW_NV_GW_ACTIVE
-        if (in->i[0] > GV_MM_MAX && !(in->i[5] && in->i[6] && in->i[7]) &&
+        if (in->i[0] >= PLOW_NV_GW_MIN_ROWS && !(in->i[5] && in->i[6] && in->i[7]) &&
             d_gemv_wide<GW_QKV>(gw_args((const __nv_bfloat16*)TEN(1), (const __nv_bfloat16*)TEN(2),
                                         (const __nv_bfloat16*)TEN(4), (const __nv_bfloat16*)TEN(6),
                                         (__nv_bfloat16*)TEN(0), (__nv_bfloat16*)TEN(3),
@@ -2396,6 +2427,26 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
                            /*store=*/true, in->i[5], slice, nblk, (__nv_bfloat16*)arena);
             break;
         }
+#if PLOW_NV_QWEN_GDN
+        /* i3 == 4: Qwen residual + RMSNorm prologue, as the GEMV arm's; here i4 is the residual
+         * stream in (i5 stays the activation). */
+        if (in->i[3] == 4u) {
+            __nv_bfloat16* xs = (__nv_bfloat16*)(arena + 32);
+            const bool staged = PLOW_NV_QWEN_FOLD_STAGED && in->i[0] <= 4u && (in->i[2] & 31u) == 0u &&
+                (in->i[1] & 7u) == 0u && (size_t)in->i[0] * in->i[2] <= (PLOW_NV_ARENA_FLOATS - 32u) * 2u;
+            d_qwen_fold_norm((__nv_bfloat16*)TEN(1), (__nv_bfloat16*)TEN(3),
+                (const __nv_bfloat16*)TEN_I(4), (const __nv_bfloat16*)TEN_I(6),
+                (const __nv_bfloat16*)T[in->i[7]], in->i[0], in->i[2], in->fj[0].f, in->fj[1].f,
+                (float*)arena, staged ? xs : nullptr, !staged || slice == 0u);
+            __syncthreads();
+            if (staged) {
+                d_gemv_glu((__nv_bfloat16*)TEN(0), xs, (const __nv_bfloat16*)TEN(2),
+                           (const __nv_bfloat16*)TEN(5), in->i[0], in->i[1], in->i[2], in->i[5],
+                           slice, nblk);
+                break;
+            }
+        }
+#endif
 #if defined(PLOW_NV_HOPPER) && !PLOW_NV_PREFILL && PLOW_NV_GEMV_K8
         if (in->i[0] >= PLOW_NV_GEMV_K8_MIN && in->i[0] <= PLOW_NV_GEMV_K8_MAX && k8_split(in->i[1], in->i[2], nblk)) {
             const K8Mats mats{{(const __nv_bfloat16*)TEN(2), (const __nv_bfloat16*)TEN(5), nullptr},
@@ -2405,7 +2456,7 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
         }
 #endif
 #if PLOW_NV_GW_ACTIVE
-        if (in->i[0] > GV_MM_MAX &&
+        if (in->i[0] >= PLOW_NV_GW_MIN_ROWS &&
             d_gemv_wide<GW_GLU>(gw_args((const __nv_bfloat16*)TEN(1), (const __nv_bfloat16*)TEN(2),
                                         (const __nv_bfloat16*)TEN(5), nullptr, (__nv_bfloat16*)TEN(0),
                                         nullptr, nullptr, in->i[1], 0u, 0u, in->i[0], in->i[2],

@@ -526,6 +526,31 @@ impl Manifest {
                                 "cache writer contract",
                             )?;
                         }
+                        // Qwen3.5 KV writer (devgen qwen35.rs `headnorm`, cache = true): t0 = the
+                        // cache, t1 = source, t2 = gamma, t3/t4 = cos/sin, t5 = position,
+                        // t6 = per-slot active flags; i0 = kv heads, i1 = hd, i2 = rotary dims,
+                        // i3 = rows, i4 = per-slot row stride (the context: full attention only,
+                        // no ring), i5 = normalize, i6 = prefill. BF16 cache, one writer per half.
+                        DevOp::QwenHeadNormRope if slot == 0 => {
+                            let c = self
+                                .caches
+                                .iter()
+                                .find(|c| c.pair.contains(&h))
+                                .ok_or("Qwen cache writer targets scale")?;
+                            require(
+                                c.scales.is_none()
+                                    && c.window == 0
+                                    && d.i[0] == c.heads
+                                    && d.i[1] == c.hd
+                                    && d.i[3] == p.rows
+                                    && d.i[4] == c.stride
+                                    && d.i[6] == u32::from(prefill)
+                                    && d.t[5] == self.position
+                                    && d.t[7] == TENSOR_NONE16
+                                    && (writes.insert(h) || staged(pc)),
+                                "Qwen cache writer contract",
+                            )?;
+                        }
                         _ => return Err("unsupported cache operand access".into()),
                     }
                 }
@@ -736,6 +761,21 @@ fn direct_operands(op: DevOp, d: &DevInst64, packet: &Packet<'_>) -> Result<()> 
                 | DevOp::MoeExpertDownGemmaFp8
                 | DevOp::MoeGroupGluGemmaPfW8a8
                 | DevOp::MoeGroupDownGemmaPfW8a8
+                // Qwen3.5 Gated DeltaNet (136-146): activations, weights, the per-slot
+                // `state.qwen.*` recurrent/conv state (slot-strided, never a declared pair),
+                // `in.active` and `in.pos`. QwenHeadNormRope is the one that names a KV cache
+                // (slot 0; the writer arm above audits it). None takes a generated tensor map.
+                | DevOp::QwenGdnConv
+                | DevOp::QwenGdnStep
+                | DevOp::QwenGatedNorm
+                | DevOp::QwenQGateSplit
+                | DevOp::QwenSigmoidGate
+                | DevOp::QwenRmsNorm
+                | DevOp::QwenHeadNormRope
+                | DevOp::QwenGdnConvPrefill
+                | DevOp::QwenGdnQkvPrep
+                | DevOp::QwenGdnGatePrep
+                | DevOp::QwenGdnPrefill
         ),
         "opcode has no audited direct-operand access contract",
     )

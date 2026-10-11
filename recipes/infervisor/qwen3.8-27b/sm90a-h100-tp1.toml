@@ -1,0 +1,183 @@
+# Qwen3.8-27B (qwen3_5 hybrid: 48 Gated DeltaNet + 16 GQA hd256 layers, 27B dense) BF16 on H100
+# SXM5: BF16 weights and KV, 16K context, decode ladder 1..48 slots, live-KV allocation, packed
+# prefill (concurrent prompts share one launch), prefix cache off (recurrent state). Production
+# recipe for this model/GPU/precision.
+#
+#   PYREF=/opt/pytorch/bin/python3 PLOW_CAMPAIGN_NO_NIX=1 (box without nix only) \
+#   python3 scripts/campaign/campaign.py build recipes/infervisor/qwen3.8-27b/sm90a-h100-tp1.toml --out <fresh dir>
+#
+# Qualified (2026-10-11, plowrt 8d25a203, packet a6d706647465f718, pairing 0xc3f74a8e97e4d467): FP32-reference gate PASS at c1,
+# c8 and c32, each against the vLLM 0.28 capture at the same concurrency (kl_mean 0.0016 / 0.0014 /
+# 0.0019 vs 0.0007; trimmed mean 0.00063-0.00070 vs 0.00044-0.00047; p95 0.0033-0.0042 vs
+# 0.0024-0.0028; top1_decisive 1.0 / 1.0 / 0.999; continuation 0.852 / 0.817 / 0.845 vs 0.845 /
+# 0.826 / 0.854; needles 1.0). c1 numerics equal the single-slot packet 949474c1acaffbd9 to the digit
+# (the first token comes from the prefill launch in both). The served comparison (campaign.py report
+# vs vLLM 0.28 BF16) is in docs/bringup/results/qwen38-27b-h100/comparison.md. Re-qualified with the
+# row-group decode attention (plowrt 7ae76221, build48, gate48: c1/c8/c32 PASS, see the route).
+#
+# Routes (per-rung evidence: plans/qwen38-27b-h100.md, step_bench ctx 1K):
+#   prefill projections   cuBLASLt segments on every bucket, the 48-wide GDN a/b included (the
+#                         interpreter GEMM ran the 1024-row bucket at 14% of the roofline floor and the
+#                         a/b as eight CTAs); Lt at ~830 TFLOP/s: 66 / 252 ms at 1024 / 4096 rows
+#   prefill pointwise     residual add riding QwenRmsNorm, width-4 conv prefill over 8 channels x 16
+#                         tokens per thread, two-row gated norm: interpreter segments 53 -> 29 /
+#                         162 -> 93 ms; the 1024 / 4096-row prefill 122 -> 99 / 419 -> 355 ms of segments
+#                         (served 1000-token TTFT p99 135 -> 111 ms)
+#   prefill hd256 causal  generated attn_pf_hd256_causal role (interpreter body: ~8 TFLOP/s,
+#                         50 / 427 ms of the prefill at 1024 / 4096 rows -> 1.0 / 8.6 ms)
+#   prefill GDN scan      host-side FlashInfer CuTe DSL kernel (libplow_gdn_prefill.so); prompts pad
+#                         to the bucket like every model (plowrt 851bbc8d: 1000-token TTFT 2853 -> 131 ms)
+#   packed prefill        concurrent prompts share one bucket launch (masked padding, slot -1 pads;
+#                         per-request state gathered into the init scratch, one varlen GDN scan over
+#                         the pack); the compact terminal (post-norm tail, head as a tiled GEMM at
+#                         M = requests) takes the first token from the prefill launch. Served vs the
+#                         single-slot packet: c8/c32/c64/c128 total tok/s +4/+6/+5/+3%, c32 TTFT p99
+#                         4467 -> 3371 ms, TPOT p99 68.7 -> 63.9 ms; c1 unchanged (grid43full)
+#   decode B 1..4         residual + RMSNorm folded into the consuming projection (the normalized rows
+#                         stay in the arena, one block stores them), MLP as one GEMV_GLU, k/v and
+#                         z/a/b as one multi-output walk each: 580 instructions per step
+#   decode B 8..32        the same fusions with the separate norm; projections on the K-split
+#                         tensor-core walk of the _gw object (manifest gemv_k8_gw_only, gemv_k8_max_gw
+#                         32: the walk is compiled into interp_sm90a_gw only, rungs 1..4 keep the
+#                         plain object; B32 40.3 ms on the walk vs 41.5 on the wide arm)
+#   decode B 48           weights streamed once on the wgmma wide arm (manifest gw_min_rows = 32:
+#                         B32 46.3 -> 41.5 ms before the walk took it; from 16 rows B16 lost 1 ms)
+#   decode GDN step       batched 8-row body with the tile's state rows staged by cp.async
+#                         (PLOW_NV_GDN_STEP_VROWS8 / _SMEM): B8/16/32/48 31.5/38.7/58.1/66.8 ->
+#                         28.9/33.4/47.4/49.8 ms over the one-row body
+#   decode attention      row-group FlashDecode hd256 body, wide rows with 8 rows per warp in flight
+#                         (PLOW_NV_FA_RG_WIDE / PLOW_NV_FA_RG_U = 8, build48): B8/16 x 15K 35.2/47.2 ->
+#                         31.8/40.2 ms, B32 x 8K 55.2 -> 48.1, B48 x 1K 50.3 -> 48.0, B16/32 x 1K
+#                         31.8/40.5 -> 31.0/38.8; 1K digests at B1..B32 and the 15K digests unchanged.
+#                         FP32 gate (gate48) c1/c8/c32 PASS: continuation 0.832 / 0.830 / 0.849 vs the
+#                         vLLM peers 0.845 / 0.826 / 0.854, p95 0.0040 / 0.0034 / 0.0036. The ring-staged
+#                         body (FA_RGT, build49) and the wide body alone (build44) were slower.
+#   step ms B1/8/16/32/48 23.8/27.2/31.0/38.8/48.0 (ctx 1K, build48; build32 23.75/27.46/31.43/
+#                         40.26/50.17; the morning's packet 24.2/31.5/38.7/58.1/66.8)
+#   not taken             the K-split walk on rungs 1..4 (gemv_k8 at B1: -0.9 ms): passes bulk KL but
+#                         fails the FP32 gate's tail at c1 (kl_p99 0.0186 vs the 0.0162 limit when p99
+#                         still gated; untested against the robust verdict)
+# Ladder tops at 48: the 64-slot recurrent state (151 MB per slot) left the planner 0.5 GiB short on
+# the 80 GB part.
+schema = "plow.recipe.v1"
+namespace = "infervisor"
+name = "qwen3.8-27b"
+label = "sm90a-h100-tp1"
+status = "validated"
+plow_git = "7ae762219a32dfd9f4266c4c2634980113895512"
+network = "qwen3.5"
+
+[target]
+vendor = "nvidia"
+isa = "sm_90a"
+sku = "H100 SXM5"
+units = 132
+num_gpus = 1
+parallel = "tp"
+max_ctx = 16384
+toolchain = "cuda-12.9-nix"
+
+[checkpoint]
+source = "hf:Qwen/Qwen3.8-27B"
+layout = "hf-bf16"
+
+[cell]
+name = "qwen38-27b.h100.bf16-16k-c48"
+model = "Qwen/Qwen3.8-27B"
+revision = "local"
+hf_dir = "{env:QWEN38_CHECKPOINT}"
+gpu = "H100 SXM5"
+arch = "sm_90a"
+n_cu = 132
+max_ctx = 16384
+precision = "bf16"
+
+# GDN prefill runs host-side from <assets>/libplow_gdn_prefill.so (exec/gpu.rs NativeGdn); the
+# FlashInfer CuTe DSL export needs the vLLM python (flashinfer 0.6.16 + cutlass 4.6.2).
+[[prep]]
+name = "gdn-prefill-lib"
+script = "scripts/build_sm90a_qwen_gdn.py"
+python = "{env:PYREF}"
+args = ["{out}/assets"]
+
+# The hd256 causal generated prefill-attention role (tuning/nvidia/sm_90a/h100-sxm5/gen_kernels.json).
+# A hand-parameterized entry: nvcc only (PLOW_NVCC), no TileLang.
+[[prep]]
+name = "gen-kernels"
+script = "scripts/gen_kernels/build_catalog.py"
+python = "python3"
+args = ["build", "{out}/assets", "--entries", "attn_pf_hd256_causal"]
+
+[emit]
+emit = "devblob+cubin"
+args = []
+[emit.env]
+PLOW_QWEN_PREFILL = "128,1024,4096"
+PLOW_DECODE_BATCH = "4"
+PLOW_DECODE_BATCH_LADDER = "1,2,4,8,16,32,48"
+PLOW_EMIT_PREFILL_CUBLASLT = "1"
+PLOW_EMIT_GEN_KERNELS = "attn_pf_hd256_causal"
+# Packed prefill for the hybrid chain: the packet declares the packed section (masked padding, pad
+# rows carry slot -1, requests chunk at the widest bucket), the per-row slot / request tables and
+# the LIVE KV contract; the head is emitted as a tiled GEMM so the compact terminal can run it at
+# M = requests (the GEMV arm is M = 1 everywhere).
+PLOW_EMIT_PACKED_PREFILL = "1"
+# Fold on rungs <= PLOW_QWEN_FOLD_MAX (default 4); fusions on every decode rung.
+PLOW_QWEN_FOLD_NORM = "1"
+PLOW_QWEN_FUSE_AB = "1"
+PLOW_QWEN_FUSE_MLP = "1"
+# Row-group FlashDecode body for the hd256 decode attention (routes above, build48).
+PLOW_NV_FA_RG_WIDE = "1"
+PLOW_NV_FA_RG_U = "8"
+
+# plowrt rejects prefix caching with recurrent (GDN) state; the hybrid would need a GDN-state
+# snapshot at the prefix boundary. PLOW_VMM_LIVE: KV reserved virtually at the ceiling, physical
+# commit per admitted slot and rows (flat KV is 1 GiB per slot at 16K).
+[serve.env]
+PLOW_VMM_LIVE = "1"
+PLOW_PREFIX_CACHE = "0"
+
+[bench]
+backend = "openai"
+in_lens = "128 1024 4096"
+concs = "1"
+nprompt = 32
+outlen = 128
+warmups = 2
+seed = 42
+tokenizer = "{env:QWEN38_CHECKPOINT}"
+model_id = "checkpoint"
+gate_prompt = "<|im_start|>user\nWhat is the capital of France? Answer in one short sentence.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+
+# Served c1 (grid43full, docs/bringup/results/qwen38-27b-h100/comparison.md): vLLM 0.28 at the same
+# cell 415 total tok/s, TPOT p99 19.97 ms, TTFT p99 242 ms. Wins TTFT P99 (0.48x) and memory; loses
+# throughput (0.87x) and TPOT (1.19x) here and in every wider cell (c32 0.67x, c64 0.58x: the 40 ms
+# B32 step, ladder tops at 48 slots).
+[measured]
+tok_s = 40.9
+p50_tpot_ms = 23.8
+concurrency = 1
+input_len = 1000
+output_len = 128
+client = "vllm 0.28.0 bench serve (grid43full g1, 2 repeats, packet a6d706647465f718)"
+
+[bench.profiles.realtime]
+in_lens = "128 1024 4096 7000 15000"
+concs = "1 4"
+nprompt = 32
+
+[bench.profiles.high_concurrency]
+in_lens = "128 1024 4096 7000 15000"
+concs = "16 32 64 128"
+nprompt = 384
+
+# FP32-reference gate (scripts/llm/fp32_ref_gate.py, offload reference of the bf16 checkpoint):
+# QWEN38_FP32_REF = ref.json; QWEN38_FP32_VLLM{,_C8,_C32} = the vLLM 0.28 captures against it at
+# c1, c8 and c32. Each plow concurrency is scored against the peer at the SAME concurrency:
+# co-batching moves which rung a row runs on (vLLM's own c1 vs c16 kl_p99 differ by 35%).
+[gates]
+python = "{env:PYREF}"
+[gates.llm_fp32_ref]
+reference = "{env:QWEN38_FP32_REF}"
+concurrency = [1, 8, 32]
+vllm_capture = { c1 = "{env:QWEN38_FP32_VLLM}", c8 = "{env:QWEN38_FP32_VLLM_C8}", c32 = "{env:QWEN38_FP32_VLLM_C32}" }

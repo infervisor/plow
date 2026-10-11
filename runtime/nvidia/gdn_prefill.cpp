@@ -50,14 +50,17 @@ extern "C" int plow_gdn_destroy(PlowGdnHandle* h) {
     return static_cast<int>(rc);
 }
 
-extern "C" int plow_gdn_run(PlowGdnHandle* h, void* q, void* k, void* v, void* out,
+// nseq packed sequences in one launch: offsets holds nseq + 1 cu_seqlens (int64, last = tokens),
+// outstate / initialstate nseq contiguous [48][128][128] f32 slots. No copy-back: the caller
+// scatters the final states to its slots.
+extern "C" int plow_gdn_run_varlen(PlowGdnHandle* h, void* q, void* k, void* v, void* out,
     void* alpha, void* beta, void* outstate, void* initialstate, void* maps,
-    void* offsets, int tokens, void* stream) {
-    if (!h || tokens <= 0 || tokens > 8192 || !q || !k || !v || !out || !alpha ||
-        !beta || !outstate || !initialstate || !maps || !offsets ||
+    void* offsets, int tokens, int nseq, void* stream) {
+    if (!h || tokens <= 0 || tokens > 8192 || nseq <= 0 || nseq > tokens || !q || !k || !v ||
+        !out || !alpha || !beta || !outstate || !initialstate || !maps || !offsets ||
         (reinterpret_cast<uintptr_t>(maps) & 127u))
         return static_cast<int>(cudaErrorInvalidValue);
-    constexpr size_t state_bytes = 48u * 128u * 128u * sizeof(float);
+    const size_t state_bytes = static_cast<size_t>(nseq) * 48u * 128u * 128u * sizeof(float);
     uintptr_t dst = reinterpret_cast<uintptr_t>(initialstate);
     uintptr_t src = reinterpret_cast<uintptr_t>(outstate);
     if ((dst <= src && src - dst < state_bytes) ||
@@ -69,17 +72,24 @@ extern "C" int plow_gdn_run(PlowGdnHandle* h, void* q, void* k, void* v, void* o
     plow_gdn_sm90_Tensor_o_t od{out, {tokens}};
     plow_gdn_sm90_Tensor_alpha_t ad{alpha, {tokens * 48}};
     plow_gdn_sm90_Tensor_beta_t bd{beta, {tokens * 48}};
-    plow_gdn_sm90_Tensor_state_t sd{outstate, {48 * 128 * 128}};
-    plow_gdn_sm90_Tensor_initial_t id{initialstate, {48 * 128 * 128}};
+    plow_gdn_sm90_Tensor_state_t sd{outstate, {static_cast<int64_t>(nseq) * 48 * 128 * 128}};
+    plow_gdn_sm90_Tensor_initial_t id{initialstate, {static_cast<int64_t>(nseq) * 48 * 128 * 128}};
     plow_gdn_sm90_Tensor_maps_t md{maps};
-    plow_gdn_sm90_Tensor_offsets_t cd{offsets, {2}};
+    plow_gdn_sm90_Tensor_offsets_t cd{offsets, {nseq + 1}};
     int rc = cute_dsl_plow_gdn_sm90_wrapper(&h->module, &qd, &kd, &vd, &od,
-        &ad, &bd, &sd, &id, &md, &cd, 0.08838834764831845f,
+        &ad, &bd, &sd, &id, &md, &cd, 0.08838834764831845f, nseq,
         static_cast<cudaStream_t>(stream));
     if (rc) return rc;
-    cudaError_t launch = cudaPeekAtLastError();
-    if (launch != cudaSuccess) return static_cast<int>(launch);
-    // Prefill writes a separate final state; update the persistent V-first state in stream order.
-    return static_cast<int>(cudaMemcpyAsync(initialstate, outstate, state_bytes,
+    return static_cast<int>(cudaPeekAtLastError());
+}
+
+// One sequence, offsets {0, tokens}; the persistent V-first state is updated in stream order.
+extern "C" int plow_gdn_run(PlowGdnHandle* h, void* q, void* k, void* v, void* out,
+    void* alpha, void* beta, void* outstate, void* initialstate, void* maps,
+    void* offsets, int tokens, void* stream) {
+    int rc = plow_gdn_run_varlen(h, q, k, v, out, alpha, beta, outstate, initialstate, maps,
+        offsets, tokens, 1, stream);
+    if (rc) return rc;
+    return static_cast<int>(cudaMemcpyAsync(initialstate, outstate, 48u * 128u * 128u * sizeof(float),
         cudaMemcpyDeviceToDevice, static_cast<cudaStream_t>(stream)));
 }

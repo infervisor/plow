@@ -61,9 +61,10 @@ after a kernel change. Existing serving evidence can prioritize work but cannot 
 
 | # | step | tool |
 |---|---|---|
-| 1 | preflight (CPU) | `plowbench-doctor.sh <assets> <objdir> <plowrt> <arch>`: env, hazards, binaries, packet, lean qualification, objects, lease, disk, **stale harness/recipe copies vs HEAD** |
+| 0 | start from everything on | copy `scripts/campaign/recipes/templates/llm-sm90a-default-on.toml`: the first build carries every route plowrt has (packed prefill + compact terminal, decode ladder, Lt prefill/decode, generated attention roles, live KV, prefix cache, token batch). The campaign measures *removing* routes; a route the packet lacks needs a `[capabilities]` waiver with the measured reason |
+| 1 | preflight (CPU) | `plowbench-doctor.sh <assets> <objdir> <plowrt> <arch>`: env, hazards, binaries, packet, lean qualification, objects, lease, disk, **stale harness/recipe copies vs HEAD**, and the **capability inventory** (`plowrt inventory <assets>`: fails on a route that is off and not waived) |
 | 2 | build from the recipe | `campaign.py build recipes/<ns>/<model>/<cell>.toml --out <fresh dir>`; it ends with `plowrt qualify` into `<out>/lean-qualification.json` (receipts, approved verifier, replay, media geometry). `campaign.py qualify --assets <out>/assets [--strict]` reruns it |
-| 3 | per-rung accuracy, resources + measured roofline | `scripts/bench/step_grid.sh <assets> <out>` (step_bench B × ctx; instruction-cap sweeps for native decode only), then `scripts/bench/op_roof.py <out>/disasm.txt --ctx N --sweep B=<jsonl>` (bytes, FLOPs, floor, measured, % roof per op). Library-routed decode needs `op_roof.py --nsys` with JSON disassembly and a measured CUDA trace; prefill CUDA graphs use `--nsys-correlation <id>` for exact packet-segment mapping, while `--segtime` covers per-chunk prefill diagnostics. No measurement = floor only. Use block/route harnesses below for other kernels; GLM/MLA/MoE: `scripts/campaign/op_roofline.py` |
+| 3 | per-rung accuracy, resources + measured roofline | `scripts/bench/step_grid.sh <assets> <out>` (step_bench B × ctx; instruction-cap sweeps for native decode only), then `scripts/bench/step_boundary.sh <assets> <out>` (ctx 4094/4095/4096/8191/8192 under `CUDA_LAUNCH_BLOCKING`: live KV commits 4096-row blocks and a kernel that stages rows past kv_len faults only there), then `scripts/bench/op_roof.py <out>/disasm.txt --ctx N --sweep B=<jsonl>` (bytes, FLOPs, floor, measured, % roof per op). Library-routed decode needs `op_roof.py --nsys` with JSON disassembly and a measured CUDA trace; prefill CUDA graphs use `--nsys-correlation <id>` for exact packet-segment mapping, while `--segtime` covers per-chunk prefill diagnostics. No measurement = floor only. Use block/route harnesses below for other kernels; GLM/MLA/MoE: `scripts/campaign/op_roofline.py` |
 | 4 | full-model accuracy gates | `campaign.py gate <recipe> --assets <out>/assets --out <dir>` runs the recipe's `[gates]` in one lease (logit parity top1/KL, ASR WER, TTS CER per language, S3Gen rel-L2, media parity `mm_parity`); `--score-only` re-scores, `--dry-run` prints `run.sh` (under `gpuq.py`, queue `bash <out>/run.sh` from the dry run, then `--score-only`: `gate` itself leases) |
 | 5 | serving grid vs the reference | `scripts/bench/llm_grid.sh plow\|vllm <res>` (same client, unique prompts per cell and repeat, greedy + sampled, 2 repeats, prefill-only and decode-only cells, vLLM `/metrics`, plow PACKLOG); agentic multi-turn with prefix caching on both sides: `llm_grid.sh plow\|vllm <res> --agentic` (`agentic_turns.py`, c32/64/128 x 10 turns to ~16K); open-loop production mix (Poisson sessions, think time, sampled turns/lengths, goodput): `PROD_RATES='0.5 1' llm_grid.sh plow\|vllm <res> --prod` (`agentic_turns.py --open-loop`, cells `q<1000*rate>`); speech: `scripts/tts/tts_bench.py`, `scripts/asr/nvidia/served_bench.py`; voice: `scripts/voice/serve_voice_agent.sh calls` |
 | 6 | audit waterfall | `scripts/bench/waterfall.py <res>/plow <res>/vllm`: grid with spread, reference prefix-cache hits (fails > 5%), wall ms/request split (mixed, prefill-only, decode, host gap, idle, padding, riders), decode ms/step side by side. `vllm_metrics.py cells`, `packlog_audit.py`, `nsys_busy.py` are its parts |
@@ -233,8 +234,18 @@ CPU only; leases nothing. Exit 0 = safe to lease, 1 = something will fail after 
 2 = warnings only. It checks, in order: the nix shell (plus `python3`, `curl`); hazardous `PLOW_*`
 overrides left in the environment; the binaries (plowrt, the vLLM client, `plowc`); the packet hash
 and the object set; `gpulease` and the queue runner; scratch space (warn at 85% full, fail at
-95%); and harness/recipe files vs HEAD. Run it first. Each check exists because its absence cost
-a leased run.
+95%); harness/recipe files vs HEAD; and the capability inventory. Run it first. Each check exists
+because its absence cost a leased run.
+
+**Capability inventory ([8]).** `plowrt inventory <assets> [--format json]` is a static (CPU) table
+of the routes the packet declares, each with the reason it is on, off or not applicable: prefill
+buckets, decode ladder, recurrent state, prefix cache, live KV, packed prefill, masked padding,
+compact terminal (the first token from the prefill launch; needs the generic or post-norm terminal
+tail), segment roles, token batch, generated kernels, device sampler, Lt prefill. The doctor
+(`scripts/bench/capability_check.py`) fails on an `OFF` unless the recipe beside the assets waives
+it in `[capabilities]` (`name = "measured reason"`) or `PB_CAPABILITY_WAIVERS=name,...` does. A
+recurrent network's prefix cache and token batch are `n/a`, not `OFF`. The Qwen3.8 campaign ran
+some forty builds before packed prefill was turned on; this check exists so the next model starts there.
 
 **It is arch-aware, not AMD-only.** `pb_detect_arch` resolves gfx942/gfx950/sm_90a/sm_120/sm_89
 from the hint, then `build.json`'s `arch`, then an objdir glob, then `nvidia-smi`/`rocminfo`. On
@@ -344,12 +355,22 @@ distance to FP32:
 
 | metric (vs FP32) | definition | pass if Plow ... (default) |
 |---|---|---|
-| `kl_mean`, `kl_p99` | KL(FP32 ‖ stack) per teacher-forced position, FP32 top-20 + remainder bucket (stack's 20th logprob for a missing token) | ≤ vLLM × `kl_ratio_max` (1.25) + `kl_slack_max` (0.002) |
+| `kl_mean`, `kl_trim_mean`, `kl_p95` | KL(FP32 ‖ stack) per teacher-forced position, FP32 top-20 + remainder bucket (stack's 20th logprob for a missing token); the trimmed mean drops the worst `kl_trim_frac` (1%) | each ≤ vLLM × `kl_ratio_max` (1.25) + `kl_slack_max` (0.002) |
+| `kl_over_frac` | fraction of positions with KL > `kl_over_at` (0.1 nat); `kl_over` is the count | ≤ vLLM + `kl_over_slack` (0.005, 7 of 1414) |
+| `kl_p99`, `kl_max` | reported, not gated: on 1414 positions p99 is the 14th-worst position and one co-batching flip moves it 60% while the trimmed mean and p95 hold | — |
 | `top1_decisive` | top-1 agreement where the FP32 top-1/top-2 margin > `tie_margin` (1.0 nat) | ≥ vLLM − `top1_drop_max` (0.01) |
 | `cont_frac` | stack's own greedy continuation: tokens matching FP32 before the first divergence / reference length | ≥ vLLM − `cont_drop_max` (0.05) |
+| `cont_decisive_frac` | cases whose continuation never diverges where FP32 was decisive (margin > `tie_margin`); a near-tie divergence is rounding luck, after which greedy histories are incomparable | ≥ vLLM − `cont_decisive_drop_max` (0) |
 | `needle_acc` | needle answer contained in the greedy continuation | ≥ vLLM − `needle_drop_max` (0) and ≥ `needle_min` (0.9) |
 
-Any missing scored position fails. Capture is teacher-forced through `/v1/completions` (token-id
+Any missing scored position fails; the position set is the reference's, identical for every arm
+and every run. **Qualify at the serving concurrencies, not only c1**: `concurrency = [1, 8, 32]` in
+`[gates.llm_fp32_ref]` captures plow at each (`plow-c<N>.json`) and scores each against the vLLM
+capture taken at the same concurrency (`vllm_capture = { c1 = ..., c8 = ..., c32 = ... }`; with
+`vllm_hf` the lease captures them). Co-batching changes which decode rung and which kernel a row
+runs on, so a packet's c8 result is not its c1 result: one Qwen3.8 packet scored kl_p99 0.0158,
+0.0181 and 0.0255 on three c8 gates with an identical c1. The headline metrics in `gates.json` are c1's; `by_concurrency` holds the rest and
+every concurrency must pass. Capture is teacher-forced through `/v1/completions` (token-id
 prompt, greedy, `logprobs: 20`): each request starts at prompt + FP32 continuation[:k]; positions up
 to and including the first disagreement have the exact FP32 history, the next request restarts one
 past it (1 + flips requests per case). Prompt set (`prompts`): natural text at 128/1K/4K/8K/15.9K

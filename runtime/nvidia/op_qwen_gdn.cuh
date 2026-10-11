@@ -29,18 +29,41 @@ static __device__ void d_qwen_gdn_conv(__nv_bfloat16* out, const __nv_bfloat16* 
     }
 }
 
+// Default on: H100 27B decode, ms at B1/B16 ctx 1K, one-row body 26.9/39.5 vs this 26.6/34.8.
 #ifndef PLOW_NV_GDN_STEP_VROWS8
-#define PLOW_NV_GDN_STEP_VROWS8 0
+#define PLOW_NV_GDN_STEP_VROWS8 1
 #endif
 #if PLOW_NV_GDN_STEP_VROWS8 != 0 && PLOW_NV_GDN_STEP_VROWS8 != 1
 #error "PLOW_NV_GDN_STEP_VROWS8 must be 0 or 1"
 #endif
+// The 8-row body stages its tile's state rows (8 x kdim fp32, 4 KB) in the warp's slice of the
+// shared arena by cp.async before the gate math, so the eight loads are in flight together
+// instead of one dependent round trip per row. Element ownership and reduction order are those
+// of the direct loads, so the outputs are bit-identical.
+#ifndef PLOW_NV_GDN_STEP_SMEM
+#define PLOW_NV_GDN_STEP_SMEM 1
+#endif
+// Folded residual+norm rungs keep the normalized rows in the arena for the tensor-core walk
+// (interp GEMV / GEMV_GLU arms); needs the mma walk at every folded rung, i.e. its B=1 arm too.
+// Off when the K-split walk (PLOW_NV_GEMV_K8) serves those rungs: it is worth 0.9 ms at B1 on
+// the 27B against the staging's 0.2, and it reads its activations from global memory.
+#ifndef PLOW_NV_QWEN_FOLD_STAGED
+#define PLOW_NV_QWEN_FOLD_STAGED (PLOW_NV_GEMV_MMA && PLOW_NV_GEMV_MMA_B1 && !PLOW_NV_GEMV_K8)
+#endif
 
+__device__ __forceinline__ void qwen_cp16(void* smem, const void* gmem) {
+    const unsigned s = (unsigned)__cvta_generic_to_shared(smem);
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(s), "l"(gmem));
+}
+
+// `stage`/`stage_floats`: the shared arena and its capacity; the body loads straight from the
+// state when the arena cannot hold warps x 8 x kdim floats (or is null).
 static __device__ void d_qwen_gdn_step(__nv_bfloat16* out, const __nv_bfloat16* qkv,
     const __nv_bfloat16* a, const __nv_bfloat16* b, const void* a_log,
     const __nv_bfloat16* dt_bias, float* state, const int* active,
     unsigned hk, unsigned hv, unsigned kdim, unsigned vdim, unsigned batch,
-    float scale, float eps, unsigned alog_f32, unsigned slice, unsigned nblk) {
+    float scale, float eps, unsigned alog_f32, unsigned slice, unsigned nblk,
+    float* stage = nullptr, unsigned stage_floats = 0) {
     if (!hk || !hv || hv % hk || kdim != 128 || !vdim) {
         if (threadIdx.x == 0) __trap(); return;
     }
@@ -48,19 +71,86 @@ static __device__ void d_qwen_gdn_step(__nv_bfloat16* out, const __nv_bfloat16* 
     const unsigned warps = blockDim.x >> 5;
     const unsigned packed = 2 * hk * kdim + hv * vdim;
 #if PLOW_NV_GDN_STEP_VROWS8
+    // A warp owns 8 consecutive V rows of one head: the q/k normalization and gate math run once
+    // per tile and the rows follow serially. H100 27B decode, ms at B1/B16 ctx 1K: one-row body
+    // 26.9/39.5, this 26.6/34.8. Issuing all 8 state-row loads before the first reduction
+    // (h[8][4] in registers) pushed the decode entry to the 255-register cap with 304 B of
+    // stack and measured 27.4/35.7 — slower at every rung, so the serial form stays.
     const unsigned tiles = (vdim + 7u) / 8u;
+#if PLOW_NV_GDN_STEP_SMEM
+    // Prefetching the next tile into a second slice measured the same (B32 46.35 vs 46.14 ms),
+    // so one slice per warp.
+    float* buf = (stage && (size_t)warps * 8u * kdim <= stage_floats) ? stage + (size_t)warp * 8u * kdim : nullptr;
+#else
+    float* buf = nullptr;
+#endif
     for (unsigned tile = slice * warps + warp; tile < batch * hv * tiles; tile += nblk * warps) {
         const unsigned slot = tile / (hv * tiles);
         if (active && active[slot] <= 0) continue;
         const unsigned head = tile / tiles % hv, first_v = (tile % tiles) * 8u;
         const unsigned qhead = head / (hv / hk);
+        const __nv_bfloat16* x = qkv + (size_t)slot * packed;
+        if (buf) {
+            // The previous tile's lanes may still be reading the slice.
+            __syncwarp();
+            const unsigned nrows = vdim - first_v < 8u ? vdim - first_v : 8u;
+            const size_t row0 = ((size_t)slot * hv + head) * vdim + first_v;
+            for (unsigned r = 0; r < nrows; r++)
+                qwen_cp16(buf + r * kdim + lane * 4u, state + (row0 + r) * kdim + lane * 4u);
+            asm volatile("cp.async.commit_group;\n" ::);
+        }
+        float q[4], k[4], h[4], qq = 0.f, kk = 0.f;
+#pragma unroll
+        for (unsigned j = 0; j < 4; j++) {
+            unsigned d = lane + 32 * j;
+            q[j] = __bfloat162float(x[qhead * kdim + d]);
+            k[j] = __bfloat162float(x[hk * kdim + qhead * kdim + d]);
+            qq += q[j] * q[j]; kk += k[j] * k[j];
+        }
+        const float qs = scale / sqrtf(qwen_warp_sum(qq) + eps);
+        const float ks = 1.f / sqrtf(qwen_warp_sum(kk) + eps);
+        const unsigned gate = slot * hv + head;
+        const float dt = __bfloat162float(a[gate]) + __bfloat162float(dt_bias[head]);
+        const float softplus = dt > 20.f ? dt : log1pf(expf(dt));
+        const float al = alog_f32 ? ((const float*)a_log)[head] : __bfloat162float(((const __nv_bfloat16*)a_log)[head]);
+        const float decay = expf(-expf(al) * softplus);
+        // vLLM's packed decode rounds beta to the projection dtype before recurrence.
+        const float beta = __bfloat162float(__float2bfloat16(1.f / (1.f + expf(-__bfloat162float(b[gate])))));
+#pragma unroll
+        for (unsigned j = 0; j < 4; j++) { q[j] *= qs; k[j] *= ks; }
+        if (buf) {
+            asm volatile("cp.async.wait_group 0;\n" ::: "memory");
+            __syncwarp();
+        }
+#pragma unroll 1
+        for (unsigned vcol = first_v; vcol < vdim && vcol < first_v + 8u; vcol++) {
+            const unsigned row = (slot * hv + head) * vdim + vcol;
+            const float* src = buf ? buf + (vcol - first_v) * kdim : state + (size_t)row * kdim;
+            float projection = 0.f;
+#pragma unroll
+            for (unsigned j = 0; j < 4; j++) {
+                h[j] = src[lane + 32 * j] * decay;
+                projection += h[j] * k[j];
+            }
+            const float value = __bfloat162float(x[2 * hk * kdim + head * vdim + vcol]);
+            const float delta = (value - qwen_warp_sum(projection)) * beta;
+            float result = 0.f;
+#pragma unroll
+            for (unsigned j = 0; j < 4; j++) {
+                h[j] = fmaf(delta, k[j], h[j]);
+                state[(size_t)row * kdim + lane + 32 * j] = h[j];
+                result += h[j] * q[j];
+            }
+            result = qwen_warp_sum(result);
+            if (lane == 0) out[row] = __float2bfloat16(result);
+        }
+    }
 #else
     // A warp owns one V row of the V-first state, so no state writers overlap.
     for (unsigned row = slice * warps + warp; row < batch * hv * vdim; row += nblk * warps) {
         const unsigned slot = row / (hv * vdim);
         if (active && active[slot] <= 0) continue;
         const unsigned head = row / vdim % hv, vcol = row % vdim, qhead = head / (hv / hk);
-#endif
         const __nv_bfloat16* x = qkv + (size_t)slot * packed;
         float q[4], k[4], h[4], qq = 0.f, kk = 0.f;
 #pragma unroll
@@ -79,19 +169,10 @@ static __device__ void d_qwen_gdn_step(__nv_bfloat16* out, const __nv_bfloat16* 
         const float decay = expf(-expf(al) * softplus);
         // vLLM's packed decode rounds beta to the projection dtype before recurrence.
         const float beta = __bfloat162float(__float2bfloat16(1.f / (1.f + expf(-__bfloat162float(b[gate])))));
-#if PLOW_NV_GDN_STEP_VROWS8
-#pragma unroll
-        for (unsigned j = 0; j < 4; j++) { q[j] *= qs; k[j] *= ks; }
-#pragma unroll 1
-        for (unsigned vcol = first_v; vcol < vdim && vcol < first_v + 8u; vcol++) {
-        const unsigned row = (slot * hv + head) * vdim + vcol;
-#endif
         float projection = 0.f;
 #pragma unroll
         for (unsigned j = 0; j < 4; j++) {
-#if !PLOW_NV_GDN_STEP_VROWS8
             q[j] *= qs; k[j] *= ks;
-#endif
             h[j] = state[(size_t)row * kdim + lane + 32 * j] * decay;
             projection += h[j] * k[j];
         }
@@ -106,16 +187,74 @@ static __device__ void d_qwen_gdn_step(__nv_bfloat16* out, const __nv_bfloat16* 
         }
         result = qwen_warp_sum(result);
         if (lane == 0) out[row] = __float2bfloat16(result);
-#if PLOW_NV_GDN_STEP_VROWS8
-        }
-#endif
     }
+#endif
 }
 
 static __device__ void d_qwen_gated_norm(__nv_bfloat16* out, const __nv_bfloat16* core,
     const __nv_bfloat16* z, const __nv_bfloat16* gamma, const int* active,
     unsigned heads, unsigned dim, unsigned batch, float eps, unsigned slice, unsigned nblk) {
     const unsigned lane = threadIdx.x & 31u, warp = threadIdx.x >> 5, warps = blockDim.x >> 5;
+#if PLOW_NV_PREFILL
+    if (dim == 128) {
+        // Same lane ownership and accumulation order as the generic loop (bit-identical), with
+        // the four loads per array in flight together: the strided loop ran one dependent load
+        // per step (0.6 ms per op at 4096 rows). Two rows per warp step, all sixteen loads issued
+        // before either row's math: one row at a time was 6.8 / 25.1 ms at 1024 / 4096 prefill
+        // rows (floor 0.5 / 2.2). Prefill objects only: the decode rows are few and its entry
+        // is at the register cap.
+        const unsigned total = batch * heads;
+        for (unsigned row = (slice * warps + warp) * 2u; row < total; row += nblk * warps * 2u) {
+            const bool two = row + 1 < total;
+            const bool on0 = !active || active[row / heads] > 0;
+            const bool on1 = two && (!active || active[(row + 1) / heads] > 0);
+            if (!on0 && !on1) continue;
+            const size_t off0 = (size_t)row * dim, off1 = off0 + dim;
+            float v0[4], v1[4], g0[4], g1[4], s0 = 0.f, s1 = 0.f;
+#pragma unroll
+            for (int j = 0; j < 4; j++) {
+                const unsigned d = lane + 32 * j;
+                v0[j] = on0 ? __bfloat162float(core[off0 + d]) : 0.f;
+                v1[j] = on1 ? __bfloat162float(core[off1 + d]) : 0.f;
+                g0[j] = on0 ? __bfloat162float(z[off0 + d]) : 0.f;
+                g1[j] = on1 ? __bfloat162float(z[off1 + d]) : 0.f;
+            }
+#pragma unroll
+            for (int j = 0; j < 4; j++) { s0 += v0[j] * v0[j]; s1 += v1[j] * v1[j]; }
+            const float inv0 = rsqrtf(qwen_warp_sum(s0) / dim + eps);
+            const float inv1 = rsqrtf(qwen_warp_sum(s1) / dim + eps);
+#pragma unroll
+            for (int j = 0; j < 4; j++) {
+                const unsigned d = lane + 32 * j;
+                const float gm = __bfloat162float(gamma[d]);
+                if (on0) out[off0 + d] = __float2bfloat16(v0[j] * inv0 * gm * (g0[j] / (1.f + expf(-g0[j]))));
+                if (on1) out[off1 + d] = __float2bfloat16(v1[j] * inv1 * gm * (g1[j] / (1.f + expf(-g1[j]))));
+            }
+        }
+        return;
+    }
+#else
+    if (dim == 128) {
+        // Same lane ownership and accumulation order as the generic loop (bit-identical), with
+        // the four loads per array in flight together: the strided loop ran one dependent load
+        // per step (0.6 ms per op at 4096 rows).
+        for (unsigned row = slice * warps + warp; row < batch * heads; row += nblk * warps) {
+            if (active && active[row / heads] <= 0) continue;
+            const size_t off = (size_t)row * dim;
+            float v[4], sum = 0.f;
+#pragma unroll
+            for (int j = 0; j < 4; j++) { v[j] = __bfloat162float(core[off + lane + 32 * j]); sum += v[j] * v[j]; }
+            const float inv = rsqrtf(qwen_warp_sum(sum) / dim + eps);
+#pragma unroll
+            for (int j = 0; j < 4; j++) {
+                const unsigned d = lane + 32 * j;
+                const float g = __bfloat162float(z[off + d]);
+                out[off + d] = __float2bfloat16(v[j] * inv * __bfloat162float(gamma[d]) * (g / (1.f + expf(-g))));
+            }
+        }
+        return;
+    }
+#endif
     for (unsigned row = slice * warps + warp; row < batch * heads; row += nblk * warps) {
         if (active && active[row / heads] <= 0) continue;
         const size_t off = (size_t)row * dim;
@@ -136,6 +275,19 @@ static __device__ void d_qwen_q_gate_split(__nv_bfloat16* q, __nv_bfloat16* gate
     const __nv_bfloat16* packed, const int* active, unsigned heads, unsigned dim,
     unsigned batch, unsigned slice, unsigned nblk) {
     const unsigned cols = heads * dim;
+    if ((dim & 7u) == 0) {
+        // Eight elements (16 bytes) per thread step; the scalar loop was latency-bound at
+        // 4096 x 6144 elements (0.25 ms per op).
+        const unsigned n8 = batch * cols / 8u;
+        for (unsigned i8 = slice * blockDim.x + threadIdx.x; i8 < n8; i8 += nblk * blockDim.x) {
+            const size_t i = (size_t)i8 * 8u;
+            if (active && active[i / cols] <= 0) continue;
+            const size_t src = (i / dim) * 2 * dim + i % dim;
+            *(uint4*)(q + i) = *(const uint4*)(packed + src);
+            *(uint4*)(gate + i) = *(const uint4*)(packed + src + dim);
+        }
+        return;
+    }
     for (unsigned i = slice * blockDim.x + threadIdx.x; i < batch * cols; i += nblk * blockDim.x) {
         if (active && active[i / cols] <= 0) continue;
         const size_t src = (size_t)(i / dim) * 2 * dim + i % dim;
@@ -146,6 +298,26 @@ static __device__ void d_qwen_q_gate_split(__nv_bfloat16* q, __nv_bfloat16* gate
 static __device__ void d_qwen_sigmoid_gate(__nv_bfloat16* out, const __nv_bfloat16* in,
     const __nv_bfloat16* gate, const int* active, unsigned cols, unsigned batch,
     unsigned slice, unsigned nblk) {
+    if ((cols & 7u) == 0) {
+        // Eight elements (16 bytes) per thread step, same per-element math (0.8 ms -> ~0.1 per
+        // op at 4096 x 6144).
+        const unsigned n8 = batch * cols / 8u;
+        for (unsigned i8 = slice * blockDim.x + threadIdx.x; i8 < n8; i8 += nblk * blockDim.x) {
+            const size_t i = (size_t)i8 * 8u;
+            if (active && active[i / cols] <= 0) continue;
+            const uint4 vi = *(const uint4*)(in + i), vg = *(const uint4*)(gate + i);
+            const __nv_bfloat16* pi = (const __nv_bfloat16*)&vi;
+            const __nv_bfloat16* pg = (const __nv_bfloat16*)&vg;
+            __nv_bfloat16 o[8];
+#pragma unroll
+            for (int j = 0; j < 8; j++) {
+                const float g = __bfloat162float(__float2bfloat16(1.f / (1.f + expf(-__bfloat162float(pg[j])))));
+                o[j] = __float2bfloat16(__bfloat162float(pi[j]) * g);
+            }
+            *(uint4*)(out + i) = *(const uint4*)o;
+        }
+        return;
+    }
     for (unsigned i = slice * blockDim.x + threadIdx.x; i < batch * cols; i += nblk * blockDim.x) {
         if (active && active[i / cols] <= 0) continue;
         float g = __bfloat162float(__float2bfloat16(1.f / (1.f + expf(-__bfloat162float(gate[i])))));
@@ -153,21 +325,169 @@ static __device__ void d_qwen_sigmoid_gate(__nv_bfloat16* out, const __nv_bfloat
     }
 }
 
+// One BLOCK per row (block_sum over `part`, the interpreter's shared arena): a 5120-wide row on
+// one warp was a serial 160-step load chain, 71 us per instruction on the 27B decode step
+// (129 norms = 9 of 38 ms). Every thread reads dim/blockDim elements; `active` is per row, so
+// the skip is block-uniform.
+// `radd` (t4, optional): the residual add rides the norm. r = bf16(in + radd) is written back
+// over `in` (the residual stream, in place as the separate Residual instruction wrote it) and
+// normalized: the same rounding as the Residual + QwenRmsNorm pair, one grid-wide dependency
+// round fewer (128 pairs per program). Each lane reads back only the elements it wrote.
 static __device__ void d_qwen_rmsnorm(__nv_bfloat16* out, const __nv_bfloat16* in,
     const __nv_bfloat16* gamma, const int* active, unsigned dim, unsigned batch,
-    float eps, float offset, unsigned slice, unsigned nblk) {
-    const unsigned lane = threadIdx.x & 31u, warp = threadIdx.x >> 5, warps = blockDim.x >> 5;
-    for (unsigned row = slice * warps + warp; row < batch; row += nblk * warps) {
-        if (active && active[row] <= 0) continue;
-        size_t base = (size_t)row * dim;
-        float sum = 0.f;
-        for (unsigned d = lane; d < dim; d += 32) {
-            float x = __bfloat162float(in[base + d]); sum += x * x;
+    float eps, float offset, unsigned slice, unsigned nblk, float* part,
+    const __nv_bfloat16* radd = nullptr) {
+    __nv_bfloat16* rout = (__nv_bfloat16*)in;
+    if (batch > nblk && (dim & 7u) == 0) {
+        // Prefill rows: one warp per row with 16-byte loads (block-per-row ran 4096 rows as 31
+        // serial block reductions per block: 0.45 ms per norm). Decode rows keep the block body.
+        const unsigned lane = threadIdx.x & 31u, warp = threadIdx.x >> 5, warps = blockDim.x >> 5;
+        for (unsigned row = slice * warps + warp; row < batch; row += nblk * warps) {
+            if (active && active[row] <= 0) continue;
+            const size_t base = (size_t)row * dim;
+            float sum = 0.f;
+            for (unsigned d = lane * 8u; d < dim; d += 256u) {
+                uint4 v = *(const uint4*)(in + base + d);
+                __nv_bfloat16* p = (__nv_bfloat16*)&v;
+                if (radd) {
+                    const uint4 a = *(const uint4*)(radd + base + d);
+                    const __nv_bfloat16* pa = (const __nv_bfloat16*)&a;
+#pragma unroll
+                    for (int j = 0; j < 8; j++)
+                        p[j] = __float2bfloat16(__bfloat162float(p[j]) + __bfloat162float(pa[j]));
+                    *(uint4*)(rout + base + d) = v;
+                }
+#pragma unroll
+                for (int j = 0; j < 8; j++) { const float f = __bfloat162float(p[j]); sum += f * f; }
+            }
+            const float inv = rsqrtf(qwen_warp_sum(sum) / dim + eps);
+            for (unsigned d = lane * 8u; d < dim; d += 256u) {
+                const uint4 v = *(const uint4*)(in + base + d), g = *(const uint4*)(gamma + d);
+                const __nv_bfloat16* p = (const __nv_bfloat16*)&v;
+                const __nv_bfloat16* pg = (const __nv_bfloat16*)&g;
+                __nv_bfloat16 o[8];
+#pragma unroll
+                for (int j = 0; j < 8; j++)
+                    o[j] = __float2bfloat16(__bfloat162float(p[j]) * inv * (__bfloat162float(pg[j]) + offset));
+                *(uint4*)(out + base + d) = *(const uint4*)o;
+            }
         }
-        float inv = rsqrtf(qwen_warp_sum(sum) / dim + eps);
-        for (unsigned d = lane; d < dim; d += 32)
+        return;
+    }
+    for (unsigned row = slice; row < batch; row += nblk) {
+        if (active && active[row] <= 0) continue;
+        const size_t base = (size_t)row * dim;
+        float sum = 0.f;
+        for (unsigned d = threadIdx.x; d < dim; d += blockDim.x) {
+            float x = __bfloat162float(in[base + d]);
+            if (radd) {
+                const __nv_bfloat16 r = __float2bfloat16(x + __bfloat162float(radd[base + d]));
+                rout[base + d] = r;
+                x = __bfloat162float(r);
+            }
+            sum += x * x;
+        }
+        const float inv = rsqrtf(block_sum(sum, part) / dim + eps);
+        for (unsigned d = threadIdx.x; d < dim; d += blockDim.x)
             out[base + d] = __float2bfloat16(__bfloat162float(in[base + d]) * inv *
                 (__bfloat162float(gamma[d]) + offset));
+    }
+}
+
+// Residual + RMSNorm prologue of a decode projection (GEMV / GEMV_GLU arms, i3 == 4): every block
+// computes hn = bf16(r * rsqrt(mean(r^2) + eps) * (gamma + offset)) with r = bf16(a + b) (b
+// null: r = a) for all rows, stores r to resid_out (null: no store) and reads hn back after the
+// block barrier. The same per-element math and rounding as the separate Residual + QwenRmsNorm
+// pair the wider rungs run, so a token's numerics do not depend on the rung it lands in
+// (normalizing the fp32 sum instead moved the FP32-gate tail by 25% either way: knife-edge
+// positions, not precision). The writes are identical across blocks, so no block waits for
+// another: the two grid-wide dependency rounds of the separate instructions (~10 us each at this
+// grid, 128 norms per step) are gone. `a` must not alias resid_out — another block may still be
+// reading `a` (the emitter ping-pongs the residual stream). Row sums are a block (few rows) or
+// warp (many rows) reduction. Latency is the whole cost: a warp walking 5120 elements one 16-byte
+// chunk per step, twice, cost 160 us per fold at B1 — the block-wide pass runs the row in three
+// loads per thread. Rungs above the fold cap (devgen PLOW_QWEN_FOLD_MAX) keep the separate
+// instructions.
+static __device__ __forceinline__ void qwen_fold_residual8(const __nv_bfloat16* a,
+    const __nv_bfloat16* b, size_t at, float (&r)[8]) {
+    const uint4 va = *(const uint4*)(a + at);
+    const __nv_bfloat16* pa = (const __nv_bfloat16*)&va;
+#pragma unroll
+    for (int j = 0; j < 8; j++) r[j] = __bfloat162float(pa[j]);
+    if (b) {
+        const uint4 vb = *(const uint4*)(b + at);
+        const __nv_bfloat16* pb = (const __nv_bfloat16*)&vb;
+#pragma unroll
+        for (int j = 0; j < 8; j++)
+            r[j] = __bfloat162float(__float2bfloat16(r[j] + __bfloat162float(pb[j])));
+    }
+}
+static __device__ __forceinline__ void qwen_fold_store8(const float (&r)[8], __nv_bfloat16* out) {
+    __nv_bfloat16 o[8];
+#pragma unroll
+    for (int j = 0; j < 8; j++) o[j] = __float2bfloat16(r[j]);
+    *(uint4*)out = *(const uint4*)o;
+}
+static __device__ __forceinline__ void qwen_fold_norm8(const float (&r)[8],
+    const __nv_bfloat16* gamma, size_t d, float inv, float offset, __nv_bfloat16* hn,
+    __nv_bfloat16* hn2 = nullptr) {
+    const uint4 vg = *(const uint4*)(gamma + d);
+    const __nv_bfloat16* pg = (const __nv_bfloat16*)&vg;
+    __nv_bfloat16 o[8];
+#pragma unroll
+    for (int j = 0; j < 8; j++)
+        o[j] = __float2bfloat16(r[j] * inv * (__bfloat162float(pg[j]) + offset));
+    *(uint4*)(hn + d) = *(const uint4*)o;
+    if (hn2) *(uint4*)(hn2 + d) = *(const uint4*)o;
+}
+// `xs` (shared, rows x dim): the normalized rows also land there, for a projection that reads its
+// activations from the arena; `store` false skips the global hn / resid_out writes (one block
+// keeps them for the sibling consumers and the residual stream: 132 blocks writing the same
+// 20 KB per fold cost more than the walk at B1).
+static __device__ void d_qwen_fold_norm(__nv_bfloat16* hn, __nv_bfloat16* resid_out,
+    const __nv_bfloat16* a, const __nv_bfloat16* b, const __nv_bfloat16* gamma,
+    unsigned rows, unsigned dim, float eps, float offset, float* part,
+    __nv_bfloat16* xs = nullptr, bool store = true) {
+    if (dim & 7u) { if (threadIdx.x == 0) __trap(); return; }
+    const unsigned lane = threadIdx.x & 31u, warp = threadIdx.x >> 5, warps = blockDim.x >> 5;
+    if (!xs) { xs = hn; hn = nullptr; store = true; }
+    if (!store) { hn = nullptr; resid_out = nullptr; }
+    if (rows < warps) {
+        for (unsigned row = 0; row < rows; row++) {
+            const size_t base = (size_t)row * dim;
+            float sum = 0.f;
+            for (unsigned d = threadIdx.x * 8u; d < dim; d += blockDim.x * 8u) {
+                float r[8];
+                qwen_fold_residual8(a, b, base + d, r);
+                if (resid_out) qwen_fold_store8(r, resid_out + base + d);
+#pragma unroll
+                for (int j = 0; j < 8; j++) sum += r[j] * r[j];
+            }
+            const float inv = rsqrtf(block_sum(sum, part) / dim + eps);
+            for (unsigned d = threadIdx.x * 8u; d < dim; d += blockDim.x * 8u) {
+                float r[8];
+                qwen_fold_residual8(a, b, base + d, r);
+                qwen_fold_norm8(r, gamma, d, inv, offset, xs + base, hn ? hn + base : nullptr);
+            }
+        }
+        return;
+    }
+    for (unsigned row = warp; row < rows; row += warps) {
+        const size_t base = (size_t)row * dim;
+        float sum = 0.f;
+        for (unsigned d = lane * 8u; d < dim; d += 256u) {
+            float r[8];
+            qwen_fold_residual8(a, b, base + d, r);
+            if (resid_out) qwen_fold_store8(r, resid_out + base + d);
+#pragma unroll
+            for (int j = 0; j < 8; j++) sum += r[j] * r[j];
+        }
+        const float inv = rsqrtf(qwen_warp_sum(sum) / dim + eps);
+        for (unsigned d = lane * 8u; d < dim; d += 256u) {
+            float r[8];
+            qwen_fold_residual8(a, b, base + d, r);
+            qwen_fold_norm8(r, gamma, d, inv, offset, xs + base, hn ? hn + base : nullptr);
+        }
     }
 }
 
@@ -175,12 +495,15 @@ static __device__ void d_qwen_headnorm_rope(__nv_bfloat16* out, const __nv_bfloa
     const __nv_bfloat16* gamma, const float* cos, const float* sin, const int* positions,
     const int* active, unsigned heads, unsigned dim, unsigned rotary, unsigned batch,
     unsigned context, unsigned normalize, float eps, float offset, unsigned slice, unsigned nblk,
-    unsigned prefill = 0) {
+    unsigned prefill = 0, const int* pfslot = nullptr) {
     if (dim != 256 || (rotary != 0 && rotary != 64)) { if (threadIdx.x == 0) __trap(); return; }
     const unsigned lane = threadIdx.x & 31u, warp = threadIdx.x >> 5, warps = blockDim.x >> 5;
     for (unsigned row = slice * warps + warp; row < batch * heads; row += nblk * warps) {
         const unsigned slot = row / heads, head = row % heads;
         if (active && active[slot] <= 0) continue;
+        // Packed prefill: the row's KV slot from the per-row slot table (unshifted KV tensor).
+        unsigned kvslot = prefill ? 0u : slot;
+        if (pfslot) { const int ps = pfslot[slot]; if (ps < 0) continue; kvslot = (unsigned)ps; }
         const int pos = positions ? positions[slot] : 0;
         if (pos < 0 || (context && (unsigned)pos >= context)) { if (lane == 0) __trap(); continue; }
         float x[8], sum = 0.f;
@@ -203,18 +526,118 @@ static __device__ void d_qwen_headnorm_rope(__nv_bfloat16* out, const __nv_bfloa
             float lo = x[0], hi = x[1];
             x[0] = lo * c - hi * s; x[1] = hi * c + lo * s;
         }
-        size_t dest = context ? ((size_t)(prefill ? 0 : slot) * heads + head) * context * dim + (size_t)pos * dim
+        size_t dest = context ? ((size_t)kvslot * heads + head) * context * dim + (size_t)pos * dim
                               : (size_t)row * dim;
 #pragma unroll
         for (unsigned j = 0; j < 8; j++) out[dest + lane + j * 32] = __float2bfloat16(x[j]);
     }
 }
 
-static __device__ void d_qwen_gdn_conv_prefill(__nv_bfloat16* out, const __nv_bfloat16* in,
+// One sequence of `tokens` rows: taps before row 0 come from `history` (this slot's last
+// width-1 rows), which is rewritten from the sequence's last rows.
+static __device__ void d_qwen_gdn_conv_prefill_seq(__nv_bfloat16* out, const __nv_bfloat16* in,
     const __nv_bfloat16* weight, __nv_bfloat16* history, unsigned channels,
     unsigned width, unsigned tokens, unsigned slice, unsigned nblk) {
-    if (width < 2 || !tokens) { if (threadIdx.x == 0) __trap(); return; }
-    // One thread owns a channel and updates its history only after consuming the chunk.
+    // Tiles of TILE tokens per (channel, tile) thread: a serial per-channel walk left 100 of 132
+    // blocks idle and cost 123 ms for 4096 rows (48 layers). Only the tile-0 thread reads the
+    // history (sources before the chunk) and, once its tile is done, rewrites it from the chunk's
+    // last width-1 rows; every other tile's taps lie inside the chunk. Same fmaf chain per output
+    // as the serial walk below, which chunks shorter than width-1 rows keep.
+#if PLOW_NV_PREFILL
+    // Prefill objects only: the 19 staged rows cost the decode entry (already at the 255-register
+    // cap) 416 B of stack for an op its programs never run.
+    if (width == 4 && (channels & 7u) == 0 && tokens >= 3) {
+        // Width-4 (Qwen3.5) fast path: eight channels (16 B) per thread over 16-token tiles, the
+        // tile's rows loaded before any output is computed. The 2-byte per-channel tile walk was
+        // latency-bound: 12.8 / 50.6 ms at 1024 / 4096 rows against a 0.6 / 2.4 ms byte floor.
+        constexpr unsigned VT = 16;
+        const unsigned cg = channels >> 3, ntiles = (tokens + VT - 1) / VT;
+        for (unsigned i = slice * blockDim.x + threadIdx.x; i < cg * ntiles; i += nblk * blockDim.x) {
+            const unsigned c0 = (i % cg) * 8u, tile = i / cg;
+            const unsigned t0 = tile * VT, t1 = min(t0 + VT, tokens), nt = t1 - t0;
+            float wf[4][8];
+#pragma unroll
+            for (int ch = 0; ch < 8; ch++) {
+                const __nv_bfloat16* w = weight + (size_t)(c0 + ch) * 4u;
+#pragma unroll
+                for (int j = 0; j < 4; j++) wf[j][ch] = __bfloat162float(w[j]);
+            }
+            uint4 rowv[VT + 3];
+            if (tile == 0) {
+#pragma unroll
+                for (int j = 0; j < 3; j++) {
+                    __nv_bfloat16 h[8];
+#pragma unroll
+                    for (int ch = 0; ch < 8; ch++) h[ch] = history[(size_t)(c0 + ch) * 3u + j];
+                    rowv[j] = *(const uint4*)h;
+                }
+            } else {
+#pragma unroll
+                for (int j = 0; j < 3; j++)
+                    rowv[j] = *(const uint4*)(in + (size_t)(t0 + j - 3) * channels + c0);
+            }
+#pragma unroll
+            for (unsigned t = 0; t < VT; t++)
+                if (t < nt) rowv[3 + t] = *(const uint4*)(in + (size_t)(t0 + t) * channels + c0);
+#pragma unroll
+            for (unsigned t = 0; t < VT; t++) {
+                if (t >= nt) break;
+                const __nv_bfloat16* p0 = (const __nv_bfloat16*)&rowv[t];
+                const __nv_bfloat16* p1 = (const __nv_bfloat16*)&rowv[t + 1];
+                const __nv_bfloat16* p2 = (const __nv_bfloat16*)&rowv[t + 2];
+                const __nv_bfloat16* px = (const __nv_bfloat16*)&rowv[t + 3];
+                __nv_bfloat16 o[8];
+#pragma unroll
+                for (int ch = 0; ch < 8; ch++) {
+                    float sum = fmaf(__bfloat162float(p0[ch]), wf[0][ch], 0.f);
+                    sum = fmaf(__bfloat162float(p1[ch]), wf[1][ch], sum);
+                    sum = fmaf(__bfloat162float(p2[ch]), wf[2][ch], sum);
+                    sum = fmaf(__bfloat162float(px[ch]), wf[3][ch], sum);
+                    o[ch] = __float2bfloat16(sum / (1.f + expf(-sum)));
+                }
+                *(uint4*)(out + (size_t)(t0 + t) * channels + c0) = *(const uint4*)o;
+            }
+            if (tile == 0) {
+#pragma unroll
+                for (int j = 0; j < 3; j++)
+                    for (int ch = 0; ch < 8; ch++)
+                        history[(size_t)(c0 + ch) * 3u + j] = in[(size_t)(tokens + j - 3) * channels + c0 + ch];
+            }
+        }
+        return;
+    }
+#endif
+    constexpr unsigned TILE = 64;
+    if (tokens + 1 >= width) {
+        const unsigned ntiles = (tokens + TILE - 1) / TILE;
+        for (unsigned i = slice * blockDim.x + threadIdx.x; i < channels * ntiles;
+             i += nblk * blockDim.x) {
+            const unsigned c = i % channels, tile = i / channels;
+            const unsigned t0 = tile * TILE, t1 = min(t0 + TILE, tokens);
+            const __nv_bfloat16* w = weight + (size_t)c * width;
+            __nv_bfloat16* h = history + (size_t)c * (width - 1);
+            float wf[8], win[8];
+            for (unsigned j = 0; j < width; j++) wf[j] = __bfloat162float(w[j]);
+            for (unsigned j = 0; j + 1 < width; j++) {
+                const int source = (int)t0 + (int)j - (int)(width - 1);
+                win[j] = source < 0 ? __bfloat162float(h[t0 + j])
+                    : __bfloat162float(in[(size_t)source * channels + c]);
+            }
+            for (unsigned t = t0; t < t1; t++) {
+                const float x = __bfloat162float(in[(size_t)t * channels + c]);
+                float sum = 0.f;
+                for (unsigned j = 0; j + 1 < width; j++) sum = fmaf(win[j], wf[j], sum);
+                sum = fmaf(x, wf[width - 1], sum);
+                out[(size_t)t * channels + c] = __float2bfloat16(sum / (1.f + expf(-sum)));
+                for (unsigned j = 0; j + 2 < width; j++) win[j] = win[j + 1];
+                win[width - 2] = x;
+            }
+            if (tile == 0)
+                for (unsigned j = 0; j + 1 < width; j++)
+                    h[j] = in[(size_t)(tokens + j - (width - 1)) * channels + c];
+        }
+        return;
+    }
     for (unsigned c = slice * blockDim.x + threadIdx.x; c < channels; c += nblk * blockDim.x) {
         const __nv_bfloat16* w = weight + (size_t)c * width;
         __nv_bfloat16* h = history + (size_t)c * (width - 1);
@@ -232,6 +655,34 @@ static __device__ void d_qwen_gdn_conv_prefill(__nv_bfloat16* out, const __nv_bf
             int source = (int)tokens + (int)j - (int)(width - 1);
             h[j] = source < 0 ? h[tokens + j] : in[(size_t)source * channels + c];
         }
+    }
+}
+
+// `rows` > `tokens`: a padded chunk (plowrt patches tokens = real rows, rows = bucket); the pad
+// rows' outputs are zeroed so the layers after the conv see finite activations. `req` (packed
+// prefill): the request table [n, (row0, len, slot, end) x n]; each request is its own sequence
+// with its slot's history (history is the unshifted per-slot tensor), tokens = the real rows.
+static __device__ void d_qwen_gdn_conv_prefill(__nv_bfloat16* out, const __nv_bfloat16* in,
+    const __nv_bfloat16* weight, __nv_bfloat16* history, unsigned channels,
+    unsigned width, unsigned tokens, unsigned rows, unsigned slice, unsigned nblk,
+    const int* req = nullptr) {
+    if (width < 2 || width > 8 || !tokens) { if (threadIdx.x == 0) __trap(); return; }
+    if (rows > tokens) {
+        const size_t pad0 = (size_t)tokens * channels, pad1 = (size_t)rows * channels;
+        for (size_t i = pad0 + slice * blockDim.x + threadIdx.x; i < pad1; i += (size_t)nblk * blockDim.x)
+            out[i] = __float2bfloat16(0.f);
+    }
+    if (!req) {
+        d_qwen_gdn_conv_prefill_seq(out, in, weight, history, channels, width, tokens, slice, nblk);
+        return;
+    }
+    const unsigned n = (unsigned)req[0];
+    for (unsigned r = 0; r < n; r++) {
+        const unsigned row0 = (unsigned)req[1 + 4 * r], len = (unsigned)req[2 + 4 * r];
+        const unsigned slot = (unsigned)req[3 + 4 * r];
+        if (!len || row0 + len > tokens) { if (threadIdx.x == 0) __trap(); return; }
+        d_qwen_gdn_conv_prefill_seq(out + (size_t)row0 * channels, in + (size_t)row0 * channels, weight,
+            history + (size_t)slot * channels * (width - 1), channels, width, len, slice, nblk);
     }
 }
 
