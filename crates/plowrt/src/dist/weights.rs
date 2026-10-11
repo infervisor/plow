@@ -53,7 +53,14 @@ pub fn snapshot_path(store_root: &Path, repo: &str, revision: &str) -> Result<Pa
 pub fn safe_repo_path(name: &str) -> bool {
     !name.is_empty()
         && !name.starts_with('/')
-        && name.split('/').all(|seg| !seg.is_empty() && seg != "." && seg != "..")
+        && name
+            .split('/')
+            .all(|seg| !seg.is_empty() && seg != "." && seg != "..")
+}
+
+/// A full 40-hex git commit id: the only revision whose content cannot move.
+pub fn is_commit(revision: &str) -> bool {
+    revision.len() == 40 && revision.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 fn count_shards(dir: &Path) -> usize {
@@ -82,7 +89,10 @@ pub fn fetch(store_root: &Path, source: &str, revision: &str, shards: u32) -> Re
 
     let repo = hf_repo(source)?;
     let dir = snapshot_path(store_root, repo, revision)?;
-    if dir.is_dir() && count_shards(&dir) >= shards as usize {
+    // Only a commit hash names fixed content; a branch such as `main` may
+    // have moved since it was fetched, so it is resolved again (hf-hub's own
+    // cache keeps that cheap when nothing changed).
+    if is_commit(revision) && dir.is_dir() && count_shards(&dir) >= shards as usize {
         return Ok(dir);
     }
 
@@ -159,8 +169,19 @@ mod tests {
         let p = snapshot_path(Path::new("/s"), "Qwen/Qwen3-0.6B", "abc").unwrap();
         assert_eq!(p, PathBuf::from("/s/snapshots/Qwen--Qwen3-0.6B@abc"));
         for bad in ["", ".", "..", "../x", "a/b", "x/..", "a\\b"] {
-            assert!(snapshot_path(Path::new("/s"), "Qwen/Qwen3-0.6B", bad).is_err(), "{bad:?}");
+            assert!(
+                snapshot_path(Path::new("/s"), "Qwen/Qwen3-0.6B", bad).is_err(),
+                "{bad:?}"
+            );
         }
+    }
+
+    #[test]
+    fn only_a_commit_hash_is_reused_without_asking() {
+        assert!(is_commit(&"a".repeat(40)));
+        assert!(!is_commit("main"));
+        assert!(!is_commit(&"a".repeat(7)));
+        assert!(!is_commit(&"g".repeat(40)));
     }
 
     #[test]
