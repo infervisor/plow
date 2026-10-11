@@ -278,7 +278,7 @@ def run() -> None:
         print("pack_bundle selftest: PASS")
         return
 
-    for need in ("assets", "objset", "name", "hf"):
+    for need in ("assets", "name", "hf"):
         if not getattr(args, need):
             pd.die(f"--{need.replace('_', '-')} is required")
     if args.plow_git is None:
