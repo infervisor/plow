@@ -28,11 +28,24 @@ pub fn hf_repo(source: &str) -> Result<&str> {
         })
 }
 
-/// Where a fetched snapshot lives in the store.
-pub fn snapshot_path(store_root: &Path, repo: &str, revision: &str) -> PathBuf {
-    store_root
+/// Where a fetched snapshot lives in the store. The revision comes from the
+/// bundle manifest, so it is checked to be one path component: a `..` in it
+/// would put the snapshot (and the `remove_dir_all` that replaces it) outside
+/// the store.
+pub fn snapshot_path(store_root: &Path, repo: &str, revision: &str) -> Result<PathBuf> {
+    if revision.is_empty()
+        || revision == "."
+        || revision == ".."
+        || revision.contains('/')
+        || revision.contains('\\')
+    {
+        return Err(RuntimeError::Dist(format!(
+            "{repo}: revision {revision:?} is not a plain commit or branch name"
+        )));
+    }
+    Ok(store_root
         .join("snapshots")
-        .join(format!("{}@{revision}", repo.replace('/', "--")))
+        .join(format!("{}@{revision}", repo.replace('/', "--"))))
 }
 
 /// A repository path that may be written under the snapshot: relative,
@@ -68,7 +81,7 @@ pub fn fetch(store_root: &Path, source: &str, revision: &str, shards: u32) -> Re
     use hf_hub::{Repo, RepoType};
 
     let repo = hf_repo(source)?;
-    let dir = snapshot_path(store_root, repo, revision);
+    let dir = snapshot_path(store_root, repo, revision)?;
     if dir.is_dir() && count_shards(&dir) >= shards as usize {
         return Ok(dir);
     }
@@ -143,8 +156,11 @@ mod tests {
 
     #[test]
     fn the_snapshot_sits_beside_the_farm_in_the_store() {
-        let p = snapshot_path(Path::new("/s"), "Qwen/Qwen3-0.6B", "abc");
+        let p = snapshot_path(Path::new("/s"), "Qwen/Qwen3-0.6B", "abc").unwrap();
         assert_eq!(p, PathBuf::from("/s/snapshots/Qwen--Qwen3-0.6B@abc"));
+        for bad in ["", ".", "..", "../x", "a/b", "x/..", "a\\b"] {
+            assert!(snapshot_path(Path::new("/s"), "Qwen/Qwen3-0.6B", bad).is_err(), "{bad:?}");
+        }
     }
 
     #[test]
