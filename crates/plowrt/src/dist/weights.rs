@@ -28,19 +28,15 @@ pub fn hf_repo(source: &str) -> Result<&str> {
         })
 }
 
-/// Where a fetched snapshot lives in the store. The revision comes from the
-/// bundle manifest, so it is checked to be one path component: a `..` in it
-/// would put the snapshot (and the `remove_dir_all` that replaces it) outside
-/// the store.
+/// Where a fetched snapshot lives in the store. A bundle is joined to one
+/// checkpoint, so its revision must be a commit hash: a branch (`main`,
+/// `refs/pr/1`) can move after the build and would hand the farm other
+/// weights. Being hex, a commit also cannot escape the store as a path.
 pub fn snapshot_path(store_root: &Path, repo: &str, revision: &str) -> Result<PathBuf> {
-    if revision.is_empty()
-        || revision == "."
-        || revision == ".."
-        || revision.contains('/')
-        || revision.contains('\\')
-    {
+    if !is_commit(revision) {
         return Err(RuntimeError::Dist(format!(
-            "{repo}: revision {revision:?} is not a plain commit or branch name"
+            "{repo}: revision {revision:?} is not a 40-hex commit; --fetch-weights fetches only \
+             the exact commit a bundle was built against (pass --checkpoint <dir> otherwise)"
         )));
     }
     Ok(store_root
@@ -90,10 +86,7 @@ pub fn fetch(store_root: &Path, source: &str, revision: &str, shards: u32) -> Re
 
     let repo = hf_repo(source)?;
     let dir = snapshot_path(store_root, repo, revision)?;
-    // Only a commit hash names fixed content; a branch such as `main` may
-    // have moved since it was fetched, so it is resolved again (hf-hub's own
-    // cache keeps that cheap when nothing changed).
-    if is_commit(revision) && dir.is_dir() && count_shards(&dir) >= shards as usize {
+    if dir.is_dir() && count_shards(&dir) >= shards as usize {
         return Ok(dir);
     }
 
@@ -167,9 +160,13 @@ mod tests {
 
     #[test]
     fn the_snapshot_sits_beside_the_farm_in_the_store() {
-        let p = snapshot_path(Path::new("/s"), "Qwen/Qwen3-0.6B", "abc").unwrap();
-        assert_eq!(p, PathBuf::from("/s/snapshots/Qwen--Qwen3-0.6B@abc"));
-        for bad in ["", ".", "..", "../x", "a/b", "x/..", "a\\b"] {
+        let rev = "c1899de289a04d12100db370d81485cdf75e47ca";
+        let p = snapshot_path(Path::new("/s"), "Qwen/Qwen3-0.6B", rev).unwrap();
+        assert_eq!(
+            p,
+            PathBuf::from(format!("/s/snapshots/Qwen--Qwen3-0.6B@{rev}"))
+        );
+        for bad in ["", "main", "refs/pr/1", "..", "../x", "a\\b", "abc"] {
             assert!(
                 snapshot_path(Path::new("/s"), "Qwen/Qwen3-0.6B", bad).is_err(),
                 "{bad:?}"
@@ -178,7 +175,7 @@ mod tests {
     }
 
     #[test]
-    fn only_a_commit_hash_is_reused_without_asking() {
+    fn only_a_commit_hash_pins_a_checkpoint() {
         assert!(is_commit(&"a".repeat(40)));
         assert!(!is_commit("main"));
         assert!(!is_commit(&"a".repeat(7)));
@@ -204,14 +201,19 @@ mod tests {
     #[cfg(feature = "dist")]
     fn fetches_a_tiny_repository_whole_once_and_reuses_it() {
         let repo = "hf:hf-internal-testing/tiny-random-LlamaForCausalLM";
+        const REV: &str = "9fb191250dd56d0ba7ec9785a025ed29c03d5998";
+        assert!(
+            fetch(&std::env::temp_dir(), repo, "main", 1).is_err(),
+            "a branch is not a pin"
+        );
         let root = std::env::temp_dir().join(format!("plow-weights-{}", std::process::id()));
-        let dir = fetch(&root, repo, "main", 1).unwrap();
+        let dir = fetch(&root, repo, REV, 1).unwrap();
         assert!(dir.join("model.safetensors").is_file());
         assert!(dir.join("config.json").is_file());
         assert!(dir.join("tokenizer.json").is_file());
         let n = std::fs::read_dir(&dir).unwrap().count();
         assert!(n >= 6, "the whole repository, not a selection: {n} entries");
-        let again = fetch(&root, repo, "main", 1).unwrap();
+        let again = fetch(&root, repo, REV, 1).unwrap();
         assert_eq!(again, dir);
         let _ = std::fs::remove_dir_all(root);
     }

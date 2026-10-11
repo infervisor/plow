@@ -140,7 +140,8 @@ Without a snapshot on the host, `load --fetch-weights` downloads the whole
 repository the bundle names (`hf:<org>/<repo>` at its revision) through
 Hugging Face, with `HF_TOKEN` for a gated repo, into `snapshots/` in the
 store, as `huggingface-cli download` would. Never implicit: a checkpoint can
-be terabytes.
+be terabytes. The bundle's revision must be a full commit hash; a branch can
+move after the build, so `--fetch-weights` refuses one.
 
 ## Producing a release
 
