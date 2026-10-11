@@ -73,6 +73,7 @@ blobs/sha256/<hex>          content-addressed
 refs/<digest>.json          {ref, variant} for one pin
 bundles/<variant_id>/       hard links into blobs/ — what --assets receives
 checkpoints/<org>--<repo>@<rev>/   the farm: links to the snapshot + derived shard
+snapshots/<org>--<repo>@<rev>/     a snapshot `load --fetch-weights` downloaded
 ```
 
 A blob's digest always names the **uncompressed** bytes, so a store may hold
@@ -134,6 +135,13 @@ in the serve-only feature set.
 plowrt load  kimi-k3 --checkpoint /models/Kimi-K3
 plowrt serve --model kimi-k3 --port 8080
 ```
+
+Without a snapshot on the host, `load --fetch-weights` downloads the whole
+repository the bundle names (`hf:<org>/<repo>` at its revision) through
+Hugging Face, with `HF_TOKEN` for a gated repo, into `snapshots/` in the
+store, as `huggingface-cli download` would. Never implicit: a checkpoint can
+be terabytes. The bundle's revision must be a full commit hash; a branch can
+move after the build, so `--fetch-weights` refuses one.
 
 ## Producing a release
 
