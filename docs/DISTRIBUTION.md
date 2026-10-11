@@ -136,10 +136,11 @@ plowrt load  kimi-k3 --checkpoint /models/Kimi-K3
 plowrt serve --model kimi-k3 --port 8080
 ```
 
-Without a snapshot on the host, `load --fetch-weights` downloads the one the
-bundle names (`hf:<org>/<repo>` at its revision) through Hugging Face, with
-`HF_TOKEN` for a gated repo, into `snapshots/` in the store. Never implicit:
-a checkpoint can be terabytes.
+Without a snapshot on the host, `load --fetch-weights` downloads the whole
+repository the bundle names (`hf:<org>/<repo>` at its revision) through
+Hugging Face, with `HF_TOKEN` for a gated repo, into `snapshots/` in the
+store, as `huggingface-cli download` would. Never implicit: a checkpoint can
+be terabytes.
 
 ## Producing a release
 

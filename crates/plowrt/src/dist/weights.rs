@@ -3,11 +3,13 @@
 //! from it. The distribution carries no weights; this is the consent step
 //! that gets them.
 //!
-//! Only `hf:<org>/<repo>` sources can be fetched. The download goes through
-//! `hf-hub` (its cache under `HF_HOME`, its token from `HF_TOKEN`), and the
-//! files are then linked into `snapshots/<org>--<repo>@<revision>/`, the
-//! same flat layout an operator's `--checkpoint` directory has. A snapshot
-//! that is already there with enough shards is reused without a request.
+//! Only `hf:<org>/<repo>` sources can be fetched. The whole repository at the
+//! bundle's revision is downloaded through `hf-hub` (its cache under
+//! `HF_HOME`, its token from `HF_TOKEN`) and linked into
+//! `snapshots/<org>--<repo>@<revision>/`, the layout a `huggingface-cli
+//! download` leaves and an operator's `--checkpoint` directory has. A
+//! snapshot that is already there with enough shards is reused without a
+//! request.
 
 use std::path::{Path, PathBuf};
 
@@ -33,23 +35,12 @@ pub fn snapshot_path(store_root: &Path, repo: &str, revision: &str) -> PathBuf {
         .join(format!("{}@{revision}", repo.replace('/', "--")))
 }
 
-/// The files the farm reads: every shard, the index and sidecars next to
-/// them, and the tokenizer files. Nothing from subdirectories.
-pub fn wanted(name: &str) -> bool {
-    if name.contains('/') {
-        return false;
-    }
-    name.ends_with(".safetensors")
-        || name == "model.safetensors.index.json"
-        || name == "config.json"
-        || name == "generation_config.json"
-        || name == "tokenizer_config.json"
-        || name == "chat_template.jinja"
-        || name == "tokenizer.json"
-        || name == "tokenizer.model"
-        || name == "special_tokens_map.json"
-        || name == "vocab.json"
-        || name == "merges.txt"
+/// A repository path that may be written under the snapshot: relative,
+/// nothing that escapes it.
+pub fn safe_repo_path(name: &str) -> bool {
+    !name.is_empty()
+        && !name.starts_with('/')
+        && name.split('/').all(|seg| !seg.is_empty() && seg != "." && seg != "..")
 }
 
 fn count_shards(dir: &Path) -> usize {
@@ -60,6 +51,13 @@ fn count_shards(dir: &Path) -> usize {
                 .count()
         })
         .unwrap_or(0)
+}
+
+fn io(path: &Path) -> impl FnOnce(std::io::Error) -> RuntimeError + '_ {
+    move |source| RuntimeError::Io {
+        path: path.to_path_buf(),
+        source,
+    }
 }
 
 /// Fetch the snapshot, or reuse the one already in the store. Returns the
@@ -87,14 +85,17 @@ pub fn fetch(store_root: &Path, source: &str, revision: &str, shards: u32) -> Re
     let info = api_repo
         .info()
         .map_err(|e| RuntimeError::Dist(format!("{repo}@{revision}: {e}")))?;
-    let mut names: Vec<String> = info
-        .siblings
-        .into_iter()
-        .map(|s| s.rfilename)
-        .filter(|n| wanted(n))
-        .collect();
+    let mut names: Vec<String> = info.siblings.into_iter().map(|s| s.rfilename).collect();
     names.sort();
-    let found = names.iter().filter(|n| n.ends_with(".safetensors")).count();
+    if let Some(bad) = names.iter().find(|n| !safe_repo_path(n)) {
+        return Err(RuntimeError::Dist(format!(
+            "{repo}@{revision} lists a file path that cannot be written: {bad}"
+        )));
+    }
+    let found = names
+        .iter()
+        .filter(|n| !n.contains('/') && n.ends_with(".safetensors"))
+        .count();
     if found < shards as usize {
         return Err(RuntimeError::Dist(format!(
             "{repo}@{revision} lists {found} safetensors shards, the bundle was built against \
@@ -106,37 +107,25 @@ pub fn fetch(store_root: &Path, source: &str, revision: &str, shards: u32) -> Re
     // becomes the snapshot only once every file is there.
     let staging = dir.with_extension(format!("partial-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&staging);
-    std::fs::create_dir_all(&staging).map_err(|source| RuntimeError::Io {
-        path: staging.clone(),
-        source,
-    })?;
+    std::fs::create_dir_all(&staging).map_err(io(&staging))?;
     for name in &names {
         let cached = api_repo
             .get(name)
             .map_err(|e| RuntimeError::Dist(format!("{repo}@{revision}/{name}: {e}")))?;
-        let cached = std::fs::canonicalize(&cached).map_err(|source| RuntimeError::Io {
-            path: cached.clone(),
-            source,
-        })?;
+        let cached = std::fs::canonicalize(&cached).map_err(io(&cached))?;
         let dst = staging.join(name);
+        if let Some(parent) = dst.parent() {
+            std::fs::create_dir_all(parent).map_err(io(parent))?;
+        }
         if std::fs::hard_link(&cached, &dst).is_err() {
-            std::fs::copy(&cached, &dst).map_err(|source| RuntimeError::Io {
-                path: dst.clone(),
-                source,
-            })?;
+            std::fs::copy(&cached, &dst).map_err(io(&dst))?;
         }
     }
     if let Some(parent) = dir.parent() {
-        std::fs::create_dir_all(parent).map_err(|source| RuntimeError::Io {
-            path: parent.to_path_buf(),
-            source,
-        })?;
+        std::fs::create_dir_all(parent).map_err(io(parent))?;
     }
     let _ = std::fs::remove_dir_all(&dir);
-    std::fs::rename(&staging, &dir).map_err(|source| RuntimeError::Io {
-        path: dir.clone(),
-        source,
-    })?;
+    std::fs::rename(&staging, &dir).map_err(io(&dir))?;
     Ok(dir)
 }
 
@@ -159,15 +148,14 @@ mod tests {
     }
 
     #[test]
-    fn shards_sidecars_and_tokenizer_are_wanted_nothing_nested() {
-        assert!(wanted("model-00001-of-00002.safetensors"));
-        assert!(wanted("model.safetensors.index.json"));
-        assert!(wanted("config.json"));
-        assert!(wanted("tokenizer.json"));
-        assert!(wanted("chat_template.jinja"));
-        assert!(!wanted("README.md"));
-        assert!(!wanted("original/consolidated.00.pth"));
-        assert!(!wanted("onnx/model.onnx"));
+    fn every_repository_path_is_written_unless_it_escapes() {
+        assert!(safe_repo_path("model-00001-of-00002.safetensors"));
+        assert!(safe_repo_path("onnx/model.onnx"));
+        assert!(safe_repo_path("README.md"));
+        assert!(!safe_repo_path("../x"));
+        assert!(!safe_repo_path("a/../b"));
+        assert!(!safe_repo_path("/etc/passwd"));
+        assert!(!safe_repo_path(""));
     }
 
     /// Needs the network: `cargo test --features dist -- --ignored fetches_a_small`.
@@ -180,7 +168,7 @@ mod tests {
         assert!(dir.join("model.safetensors").is_file());
         assert!(dir.join("config.json").is_file());
         assert!(dir.join("tokenizer.json").is_file());
-        assert!(!dir.join("onnx").exists());
+        assert!(dir.join("README.md").is_file(), "the whole repository, not a selection");
         let again = fetch(&root, "hf:HuggingFaceTB/SmolLM2-360M-Instruct", "main", 1).unwrap();
         assert_eq!(again, dir);
         let _ = std::fs::remove_dir_all(root);
