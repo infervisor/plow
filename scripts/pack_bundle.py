@@ -330,6 +330,7 @@ def self_test() -> None:
         base = dict(
             assets=str(assets),
             objset=str(op),
+            target_json=None,
             namespace="infervisor",
             name="kimi-k3",
             network=None,
@@ -394,6 +395,26 @@ def self_test() -> None:
         doc = build(argparse.Namespace(**derived))
         assert doc["tokenizer"]["source"] == "derived"
         assert any(f["name"] == "tokenizer.json" for f in doc["files"])
+
+        # A runtime-compiled target (Apple) brings a target description instead
+        # of an objset and names none; a vendor that ships objects may not.
+        tp = d / "target.json"
+        tp.write_text(json.dumps({"vendor": "apple", "isa": "metal3", "sku": "Apple M4 Pro", "units": 16, "mem_bytes": 19069665280}))
+        apple = dict(base, objset=None, target_json=str(tp), parallel=1, max_ctx=2048)
+        doc = build(argparse.Namespace(**apple))
+        assert "objset" not in doc and "pairing_hash" not in doc, doc
+        assert doc["label"].startswith("metal3-apple-m4-pro-tp1-2k"), doc["label"]
+        tp.write_text(json.dumps({"vendor": "amd", "isa": "gfx942", "sku": "MI325X", "units": 304, "mem_bytes": 274877906944}))
+        try:
+            build(argparse.Namespace(**apple))
+            raise AssertionError("accepted a target-json for a vendor that ships objects")
+        except pd.Fail as e:
+            assert "pass --objset" in str(e), e
+        try:
+            build(argparse.Namespace(**dict(base, target_json=str(tp))))
+            raise AssertionError("accepted both --objset and --target-json")
+        except pd.Fail:
+            pass
 
 
 main = pd.main_guard(run)
