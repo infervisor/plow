@@ -53,6 +53,7 @@ pub fn snapshot_path(store_root: &Path, repo: &str, revision: &str) -> Result<Pa
 pub fn safe_repo_path(name: &str) -> bool {
     !name.is_empty()
         && !name.starts_with('/')
+        && !name.contains('\\')
         && name
             .split('/')
             .all(|seg| !seg.is_empty() && seg != "." && seg != "..")
@@ -193,6 +194,7 @@ mod tests {
         assert!(!safe_repo_path("a/../b"));
         assert!(!safe_repo_path("/etc/passwd"));
         assert!(!safe_repo_path(""));
+        assert!(!safe_repo_path("..\\..\\outside"), "a Windows separator");
     }
 
     /// Needs the network: `cargo test --features dist -- --ignored fetches_a_tiny`.
