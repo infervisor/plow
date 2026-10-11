@@ -143,6 +143,8 @@ def build(args) -> dict:
         target = pd.load_json(Path(args.target_json))
         if target.get("vendor") not in RUNTIME_COMPILED:
             pd.die(f"--target-json names vendor {target.get('vendor')!r}, whose kernels ship as objects: pass --objset")
+        if args.lowrung:
+            pd.die("--lowrung names objsets; a runtime-compiled target has none to override")
     label = args.label or default_label(target, args.parallel, args.max_ctx, build_json)
 
     doc = {
@@ -410,6 +412,12 @@ def self_test() -> None:
             raise AssertionError("accepted a target-json for a vendor that ships objects")
         except pd.Fail as e:
             assert "pass --objset" in str(e), e
+        tp.write_text(json.dumps({"vendor": "apple", "isa": "metal3", "sku": "Apple M4 Pro", "units": 16, "mem_bytes": 19069665280}))
+        try:
+            build(argparse.Namespace(**dict(apple, lowrung=[f"1:{op}"])))
+            raise AssertionError("accepted low-rung objsets for a runtime-compiled target")
+        except pd.Fail as e:
+            assert "--lowrung" in str(e), e
         try:
             build(argparse.Namespace(**dict(base, target_json=str(tp))))
             raise AssertionError("accepted both --objset and --target-json")
