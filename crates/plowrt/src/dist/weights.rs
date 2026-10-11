@@ -158,18 +158,21 @@ mod tests {
         assert!(!safe_repo_path(""));
     }
 
-    /// Needs the network: `cargo test --features dist -- --ignored fetches_a_small`.
+    /// Needs the network: `cargo test --features dist -- --ignored fetches_a_tiny`.
+    /// A few-megabyte test repository, so the whole of it is cheap to pull.
     #[test]
     #[ignore]
     #[cfg(feature = "dist")]
-    fn fetches_a_small_snapshot_once_and_reuses_it() {
+    fn fetches_a_tiny_repository_whole_once_and_reuses_it() {
+        let repo = "hf:hf-internal-testing/tiny-random-LlamaForCausalLM";
         let root = std::env::temp_dir().join(format!("plow-weights-{}", std::process::id()));
-        let dir = fetch(&root, "hf:HuggingFaceTB/SmolLM2-360M-Instruct", "main", 1).unwrap();
+        let dir = fetch(&root, repo, "main", 1).unwrap();
         assert!(dir.join("model.safetensors").is_file());
         assert!(dir.join("config.json").is_file());
         assert!(dir.join("tokenizer.json").is_file());
-        assert!(dir.join("README.md").is_file(), "the whole repository, not a selection");
-        let again = fetch(&root, "hf:HuggingFaceTB/SmolLM2-360M-Instruct", "main", 1).unwrap();
+        let n = std::fs::read_dir(&dir).unwrap().count();
+        assert!(n >= 6, "the whole repository, not a selection: {n} entries");
+        let again = fetch(&root, repo, "main", 1).unwrap();
         assert_eq!(again, dir);
         let _ = std::fs::remove_dir_all(root);
     }
