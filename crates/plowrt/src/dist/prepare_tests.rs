@@ -46,12 +46,12 @@ fn bundle(tokenizer: TokenizerRef, files: Vec<FileRef>) -> Bundle {
             layout: "native-mxfp4".into(),
             bytes: 1_590_000_000_000,
         },
-        objset: BundleObjset {
+        objset: Some(BundleObjset {
             objset_id: "o".into(),
             manifest: "v1/objsets/o.json".into(),
             sha256: "b".repeat(64),
             lowrung: vec![],
-        },
+        }),
         pairing_hash: None,
         runtime_env: BTreeMap::new(),
         recipe: None,
