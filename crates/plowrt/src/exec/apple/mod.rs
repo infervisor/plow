@@ -698,7 +698,11 @@ impl MetalEngine {
         if programs.is_empty() {
             return Ok(());
         }
-        if self.serial || programs.iter().any(|&program| !self.gpu_only_program(program)) {
+        if self.serial
+            || programs
+                .iter()
+                .any(|&program| !self.gpu_only_program(program))
+        {
             for &program in programs {
                 self.run_prog(program)?;
             }
@@ -734,15 +738,17 @@ impl MetalEngine {
                 profile.gpu_device_ms += (cb.GPUEndTime() - cb.GPUStartTime()).max(0.0) * 1e3;
             }
             if cb.status() != MTLCommandBufferStatus::Completed {
-                let error = cb.error().map(|error| error.to_string()).unwrap_or_default();
+                let error = cb
+                    .error()
+                    .map(|error| error.to_string())
+                    .unwrap_or_default();
                 return Err(RuntimeError::Device(format!(
                     "metal: packet sequence command buffer status {:?}: {error}",
                     cb.status()
                 )));
             }
-            let fault = unsafe {
-                std::ptr::read_volatile(self.fault.contents().as_ptr() as *const u32)
-            };
+            let fault =
+                unsafe { std::ptr::read_volatile(self.fault.contents().as_ptr() as *const u32) };
             if fault != 0 {
                 return Err(RuntimeError::Device(format!(
                     "metal: packet sequence fault {fault:#010x}"

@@ -354,7 +354,8 @@ impl Manifest {
             // Only staged writers, proven in segment order, may repeat; the loader also requires
             // the packed-prefill manifest to declare `stage_rows` for them.
             let stages = if prefill {
-                crate::packed_prefill::repeated_writers(p).map_err(|e| format!("cache writer contract: {e}"))?
+                crate::packed_prefill::repeated_writers(p)
+                    .map_err(|e| format!("cache writer contract: {e}"))?
             } else {
                 Vec::new()
             };

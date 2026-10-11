@@ -72,7 +72,11 @@ fn layout(insts: &[DevInst64], rows: u32, logits: usize, ids: usize) -> Option<[
     Some(tail)
 }
 
-pub(super) fn chain(insts: Vec<DevInst64>, grid: u32, rows: u32) -> plow_asset::aux_program::Program {
+pub(super) fn chain(
+    insts: Vec<DevInst64>,
+    grid: u32,
+    rows: u32,
+) -> plow_asset::aux_program::Program {
     let mut per_cu = vec![Vec::new(); grid as usize];
     let mut queue = Vec::new();
     let mut waits = Vec::new();
@@ -678,7 +682,16 @@ mod tests {
         let mut requests = Vec::new();
         for i in 0..2 {
             e.begin_slot(slots[i], prompts[i].len() + 64).unwrap();
-            assert_eq!(e.vmm.as_ref().unwrap().kv.as_ref().unwrap().mapped_rows(slots[i]), 0);
+            assert_eq!(
+                e.vmm
+                    .as_ref()
+                    .unwrap()
+                    .kv
+                    .as_ref()
+                    .unwrap()
+                    .mapped_rows(slots[i]),
+                0
+            );
             let cached = e.attach_prompt(slots[i], &prompts[i]).unwrap();
             assert_eq!(cached, (prompts[i].len() - 1) / 32 * 32);
             requests.push(PfBatchReq {

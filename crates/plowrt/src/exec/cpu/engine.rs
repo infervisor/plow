@@ -183,7 +183,11 @@ fn weight_affinity(
             let d = &p.insts[e.inst as usize];
             let mut add = |t: u16, row: usize, a: u32, b: u32| {
                 if b > a && t != packet::dev::TENSOR_NONE16 {
-                    map.entry(t as usize).or_default().push((a as usize * row, (b - a) as usize * row, node));
+                    map.entry(t as usize).or_default().push((
+                        a as usize * row,
+                        (b - a) as usize * row,
+                        node,
+                    ));
                 }
             };
             match DevOp::from_u16(d.op) {
@@ -231,7 +235,15 @@ impl HostTensor {
             mask[node as usize / 64] |= 1 << (node % 64);
             // SAFETY: a sub-range of our own mapping; only placement policy changes.
             let rc = unsafe {
-                libc::syscall(libc::SYS_mbind, start, end - start, libc::MPOL_BIND, mask.as_ptr(), 257usize, 0u32)
+                libc::syscall(
+                    libc::SYS_mbind,
+                    start,
+                    end - start,
+                    libc::MPOL_BIND,
+                    mask.as_ptr(),
+                    257usize,
+                    0u32,
+                )
             };
             if rc == 0 {
                 bound += end - start;
@@ -343,7 +355,12 @@ impl HostTensor {
             // SAFETY: ptr/size describe our own mapping.
             unsafe { libc::madvise(ptr as *mut c_void, size, advice) };
         }
-        let tensor = HostTensor { ptr, layout, bytes, borrowed: false };
+        let tensor = HostTensor {
+            ptr,
+            layout,
+            bytes,
+            borrowed: false,
+        };
         #[cfg(target_os = "linux")]
         if huge && !nodes.is_empty() {
             let maxnode = nodes.iter().copied().max().unwrap() as usize + 1;
@@ -614,7 +631,12 @@ fn validate_cpu_blob(blob: &DevBlob, language_model: bool) -> Result<()> {
             DevOp::MmRowsBf16,
             DevOp::MmSpanExtent,
         ];
-        if multimodal.into_iter().any(has) || blob.tensors.iter().any(|t| t.name == plow_asset::multimodal::SLAB_TENSOR) {
+        if multimodal.into_iter().any(has)
+            || blob
+                .tensors
+                .iter()
+                .any(|t| t.name == plow_asset::multimodal::SLAB_TENSOR)
+        {
             return Err(RuntimeError::Device(format!(
                 "program {pi} is multimodal (ops 206-210 / `{}`), which the CPU engine does not implement; \
                  emit CPU bundles without PLOW_EMIT_MULTIMODAL",
@@ -948,11 +970,12 @@ impl CpuModel {
         // PLOW_CPU_MMAP_GATHER: a weight read only as an EMBED table (row gather, e.g. Gemma-4
         // E2B/E4B per-layer embeddings: 262144 x 35 x 256 bf16 = 4.7 GB) is served straight from the
         // mmapped checkpoint; only the rows actually gathered become resident.
-        let gather_only: rustc_hash::FxHashSet<usize> = if crate::config::RuntimeConfig::get().cpu.mmap_gather {
-            gather_only_tensors(&blob)
-        } else {
-            Default::default()
-        };
+        let gather_only: rustc_hash::FxHashSet<usize> =
+            if crate::config::RuntimeConfig::get().cpu.mmap_gather {
+                gather_only_tensors(&blob)
+            } else {
+                Default::default()
+            };
         let mut borrowed_bytes = 0usize;
         let mut l3_left: Vec<usize> =
             vec![sram.map_or(0, |d| d.caps.l3_lock_bytes_per_node as usize); lock_nodes.len()];
@@ -1012,7 +1035,8 @@ impl CpuModel {
                     continue;
                 }
                 let lock_len = bytes.next_multiple_of(4096);
-                let hot = td.name.contains(".layers.") && !td.name.contains("embed") && bytes >= HUGE / 8;
+                let hot =
+                    td.name.contains(".layers.") && !td.name.contains("embed") && bytes >= HUGE / 8;
                 let lock_node = (hot && !l3_left.is_empty())
                     .then(|| {
                         (0..l3_left.len())
@@ -1131,7 +1155,9 @@ impl CpuModel {
                         locked += len;
                         held += m.held(3) * len as f64;
                     }
-                    Err(e) => tracing::warn!(tensor = %names[h], node, error = %e, "cpu: L3 pseudo-lock failed"),
+                    Err(e) => {
+                        tracing::warn!(tensor = %names[h], node, error = %e, "cpu: L3 pseudo-lock failed")
+                    }
                 }
             }
             tracing::info!(
@@ -1284,10 +1310,9 @@ impl CpuModel {
     /// from the OTHER packet's declarations, and the whole point of the KV
     /// contract is that the two agreeing is checked rather than assumed.
     pub fn tensor_range(&self, handle: usize, off: u64, len: u64) -> Result<&[u8]> {
-        let t = self
-            .tensors
-            .get(handle)
-            .ok_or_else(|| RuntimeError::Rejected(format!("tensor handle {handle} out of range")))?;
+        let t = self.tensors.get(handle).ok_or_else(|| {
+            RuntimeError::Rejected(format!("tensor handle {handle} out of range"))
+        })?;
         let end = off.checked_add(len).ok_or_else(|| {
             RuntimeError::Rejected(format!("tensor {handle} range {off}+{len} overflows"))
         })?;
@@ -1461,7 +1486,9 @@ impl KernelExec {
                         held += m.held(2);
                         sram_bytes = len as u64;
                     }
-                    Err(e) => tracing::warn!(worker = w, cpu, error = %e, "cpu: L2 pseudo-lock failed"),
+                    Err(e) => {
+                        tracing::warn!(worker = w, cpu, error = %e, "cpu: L2 pseudo-lock failed")
+                    }
                 }
             }
             let mut ctx = PlowCpuCtx::new(w as u32, node);
@@ -1518,12 +1545,24 @@ impl Exec for KernelExec {
         unsafe { f(inst, slice, nblk, self.tensors.as_ptr(), ctx) };
     }
 
-    fn prefetch(&self, d: &DevInst64, slice: u32, nblk: u32, cursor: &mut usize, lines: usize) -> bool {
+    fn prefetch(
+        &self,
+        d: &DevInst64,
+        slice: u32,
+        nblk: u32,
+        cursor: &mut usize,
+        lines: usize,
+    ) -> bool {
         const CAP: usize = 1 << 20;
         // GLU kernels walk gate and up together in 32-row chunks.
         const GLU_ROWS: usize = 32;
         let per = |n: u32| n.div_ceil(nblk.max(1));
-        let range = |n: u32| ((slice * per(n)).min(n) as usize, (slice * per(n) + per(n)).min(n) as usize);
+        let range = |n: u32| {
+            (
+                (slice * per(n)).min(n) as usize,
+                (slice * per(n) + per(n)).min(n) as usize,
+            )
+        };
         let base = |t: u16| self.tensors.get(t as usize) as usize;
         let row = d.i[2] as usize * 2;
         // (byte length of this slice's weight stream, address of stream byte `pos`)
@@ -1535,7 +1574,11 @@ impl Exec for KernelExec {
             }
             Some(DevOp::GemvGlu) if d.t[2] != TENSOR_NONE16 && d.t[5] != TENSOR_NONE16 => {
                 let (a, b) = range(d.i[1]);
-                let (g, u, ch) = (base(d.t[2]) + a * row, base(d.t[5]) + a * row, GLU_ROWS * row);
+                let (g, u, ch) = (
+                    base(d.t[2]) + a * row,
+                    base(d.t[5]) + a * row,
+                    GLU_ROWS * row,
+                );
                 (2 * (b - a) * row, &move |p| {
                     let (c, r) = (p / (2 * ch), p % (2 * ch));
                     (if r < ch { g } else { u }) + c * ch + r % ch
@@ -1545,7 +1588,10 @@ impl Exec for KernelExec {
                 let (nq, nk, nv) = (d.i[1] as usize, d.i[3] as usize, d.i[4] as usize);
                 let (a, b) = range((nq + nk + nv) as u32);
                 let spans = [(d.t[2], 0, nq), (d.t[4], nq, nk), (d.t[6], nq + nk, nv)];
-                if spans.iter().any(|&(t, s, n)| t == TENSOR_NONE16 && a.max(s) < b.min(s + n)) {
+                if spans
+                    .iter()
+                    .any(|&(t, s, n)| t == TENSOR_NONE16 && a.max(s) < b.min(s + n))
+                {
                     return false;
                 }
                 ((b - a) * row, &move |p| {
@@ -1562,7 +1608,9 @@ impl Exec for KernelExec {
             #[cfg(target_arch = "x86_64")]
             // SAFETY: prefetch never faults; the address lies inside a live weight tensor anyway.
             unsafe {
-                std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T1 }>(addr(*cursor) as *const i8)
+                std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T1 }>(
+                    addr(*cursor) as *const i8
+                )
             };
             *cursor += 64;
         }
@@ -2194,7 +2242,10 @@ fn pack_route(model: &CpuModel) -> std::result::Result<PackRoute, String> {
         let (mut flash, mut merges, mut direct) = (0usize, 0usize, false);
         let n = p.insts.len();
         let is = |d: &DevInst64, op: DevOp| d.op == op as u16;
-        let head = n.checked_sub(4).map(|i| &p.insts[i..]).ok_or("empty prefill program")?;
+        let head = n
+            .checked_sub(4)
+            .map(|i| &p.insts[i..])
+            .ok_or("empty prefill program")?;
         if !(is(&head[0], DevOp::Gemm)
             && model.wk.logits == Some(head[0].t[0] as usize)
             && head[0].i[0] == 1
@@ -2218,7 +2269,9 @@ fn pack_route(model: &CpuModel) -> std::result::Result<PackRoute, String> {
                 DevOp::FlashPrefill => {
                     let block = d.i[3] as u64 * d.fj[1] as u64 * d.i[6] as u64 * 2;
                     if slot_bytes(d.t[3]) != Some(block) || slot_bytes(d.t[4]) != Some(block) {
-                        return Err("a flash KV read is not one [slot][head][row] block per slot".into());
+                        return Err(
+                            "a flash KV read is not one [slot][head][row] block per slot".into(),
+                        );
                     }
                     flash += 1;
                     direct |= d.t[5] != TENSOR_NONE16;
@@ -2239,7 +2292,12 @@ fn pack_route(model: &CpuModel) -> std::result::Result<PackRoute, String> {
                 | DevOp::MoeGroupGluGemmaPf
                 | DevOp::MoeGroupDownGemmaPf
                 | DevOp::MoeCombineNormGemmaPf => {}
-                _ => return Err(format!("{} is not known to be row-independent", op.c_name())),
+                _ => {
+                    return Err(format!(
+                        "{} is not known to be row-independent",
+                        op.c_name()
+                    ))
+                }
             }
         }
         lm.push(n - 4);
@@ -2248,7 +2306,12 @@ fn pack_route(model: &CpuModel) -> std::result::Result<PackRoute, String> {
     if !merge.iter().any(|&m| m) {
         return Err("no prefill bucket reduces its attention with FLASH_MERGE".into());
     }
-    Ok(PackRoute { lm, merge, heads_d, heads })
+    Ok(PackRoute {
+        lm,
+        merge,
+        heads_d,
+        heads,
+    })
 }
 
 impl CpuEngine {
@@ -2701,7 +2764,10 @@ impl CpuEngine {
     /// the same bits whether it runs alone, in a pack, or after a reused prefix.
     pub fn prefill_slot_chunk(&mut self, slot: usize, prompt: &[u32], ch: Chunk) -> Result<()> {
         let end = (ch.c0 + ch.clen) as usize;
-        if self.pack.as_ref().is_ok_and(|r| r.merge.get(ch.prog) == Some(&true))
+        if self
+            .pack
+            .as_ref()
+            .is_ok_and(|r| r.merge.get(ch.prog) == Some(&true))
             && ch.clen > 0
             && end <= prompt.len()
         {
@@ -2804,7 +2870,8 @@ impl CpuEngine {
         for mb in members {
             let n = mb.rows.len() as u32;
             for i in 0..n {
-                let tile_end = (mb.c0 + i / ffi::PF_TILE * ffi::PF_TILE + ffi::PF_TILE).min(mb.c0 + n);
+                let tile_end =
+                    (mb.c0 + i / ffi::PF_TILE * ffi::PF_TILE + ffi::PF_TILE).min(mb.c0 + n);
                 row_off.push(row_off.last().unwrap() + tile_end.div_ceil(spl));
             }
         }
@@ -2870,8 +2937,7 @@ impl CpuEngine {
             mlpart,
         };
         let lp = Arc::make_mut(&mut self.progs[prog]);
-        lp.insts
-            .copy_from_slice(&self.model.blob.progs[prog].insts);
+        lp.insts.copy_from_slice(&self.model.blob.progs[prog].insts);
         rebase_chunk_rows(&mut lp.insts, &self.model.names, 0, m, t, Some(t));
         if let [row] = samples[..] {
             lp.insts[lm].i[4] = row;
@@ -2882,10 +2948,13 @@ impl CpuEngine {
         }
         // `desc` and the vectors it points into outlive the run; the cell is cleared before
         // either is dropped, on every path.
-        self.pack_cell
-            .store(&desc as *const ffi::PlowCpuPack as *mut _, Ordering::Relaxed);
+        self.pack_cell.store(
+            &desc as *const ffi::PlowCpuPack as *mut _,
+            Ordering::Relaxed,
+        );
         let ran = self.run_prog(prog);
-        self.pack_cell.store(std::ptr::null_mut(), Ordering::Relaxed);
+        self.pack_cell
+            .store(std::ptr::null_mut(), Ordering::Relaxed);
         ran?;
         if samples.len() >= 2 {
             self.packed_head(prog, lm, &samples)?;
@@ -2917,7 +2986,11 @@ impl CpuEngine {
         unsafe {
             let base = hn_t.as_ptr();
             for (j, &r) in rows.iter().enumerate() {
-                std::ptr::copy_nonoverlapping(base.add(r as usize * row), tmp.as_mut_ptr().add(j * row), row);
+                std::ptr::copy_nonoverlapping(
+                    base.add(r as usize * row),
+                    tmp.as_mut_ptr().add(j * row),
+                    row,
+                );
             }
             std::ptr::copy_nonoverlapping(tmp.as_ptr(), base, s * row);
         }

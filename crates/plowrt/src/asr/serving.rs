@@ -19,8 +19,11 @@ use tokio::sync::{mpsc, oneshot, watch, OwnedSemaphorePermit, Semaphore};
 
 use super::{
     endpoint::{EndpointConfig, Endpointer, Segment},
+    frontend::{
+        decode_wav, decode_wav_chunk, decode_wav_within, AudioError, Resampler, MAX_SAMPLES,
+        SAMPLE_RATE,
+    },
     vad::{speech_samples, speech_segments},
-    frontend::{decode_wav, decode_wav_chunk, decode_wav_within, AudioError, Resampler, MAX_SAMPLES, SAMPLE_RATE},
     FinalizationPolicy, Transcriber, Transcript, TranscriptionInput,
 };
 use crate::serve::session::RequestIds;
@@ -64,7 +67,11 @@ const MAX_RECORDINGS: usize = 1024;
 
 enum Backend {
     /// `plowrt asr`: one model on a private cohort engine.
-    Cohort { model: String, mux: AsrMux, finalization: FinalizationPolicy },
+    Cohort {
+        model: String,
+        mux: AsrMux,
+        finalization: FinalizationPolicy,
+    },
     /// `plowrt serve`: any registry model with a causal audio pipeline, through its text mux.
     #[cfg(feature = "cuda")]
     Serve(Arc<crate::serve::AppState>),
@@ -136,9 +143,22 @@ impl Route {
         opts: AsrOpts,
     ) -> Result<oneshot::Receiver<crate::Result<Transcript>>, SubmitError> {
         let config = crate::config::RuntimeConfig::get();
-        let allowed: Vec<String> = config.asr_auto_languages.iter().map(|l| l.trim().to_owned()).filter(|l| !l.is_empty()).collect();
-        let second_pass = opts.final_pass && (!context.is_empty() || language.is_none() && !allowed.is_empty());
-        let saved = second_pass.then(|| (samples.clone(), language.clone(), context.clone(), cancel.clone()));
+        let allowed: Vec<String> = config
+            .asr_auto_languages
+            .iter()
+            .map(|l| l.trim().to_owned())
+            .filter(|l| !l.is_empty())
+            .collect();
+        let second_pass =
+            opts.final_pass && (!context.is_empty() || language.is_none() && !allowed.is_empty());
+        let saved = second_pass.then(|| {
+            (
+                samples.clone(),
+                language.clone(),
+                context.clone(),
+                cancel.clone(),
+            )
+        });
         let numerals = config.asr_numerals;
         let first = self.submit_once(samples, language, context, cancel, opts)?;
         let route = self.clone();
@@ -147,8 +167,13 @@ impl Route {
             let Ok(mut result) = first.await else { return };
             if let Some((samples, language, mut context, cancel)) = saved {
                 let again = |language: Option<String>, context: String| {
-                    let opts = AsrOpts { final_pass: true, ..Default::default() };
-                    route.submit_once(samples.clone(), language, context, cancel.clone(), opts).ok()
+                    let opts = AsrOpts {
+                        final_pass: true,
+                        ..Default::default()
+                    };
+                    route
+                        .submit_once(samples.clone(), language, context, cancel.clone(), opts)
+                        .ok()
                 };
                 let misled = !context.is_empty()
                     && match &result {
@@ -181,7 +206,8 @@ impl Route {
                     transcript.text = collapsed;
                 }
                 if numerals {
-                    transcript.text = crate::asr::numerals::spoken_digits_to_numerals(&transcript.text);
+                    transcript.text =
+                        crate::asr::numerals::spoken_digits_to_numerals(&transcript.text);
                 }
             }
             let _ = tx.send(result);
@@ -199,13 +225,20 @@ impl Route {
     ) -> Result<oneshot::Receiver<crate::Result<Transcript>>, SubmitError> {
         match self {
             Route::Cohort(mux) => {
-                let stream = opts.windows.as_ref().filter(|_| !opts.final_pass).map(Arc::downgrade);
+                let stream = opts
+                    .windows
+                    .as_ref()
+                    .filter(|_| !opts.final_pass)
+                    .map(Arc::downgrade);
                 mux.submit_with(samples, language, context, cancel, opts.deltas, stream)
             }
             #[cfg(feature = "cuda")]
             Route::Shared(asr, mux, routed) => {
                 let ingress = routed.lock().take().unwrap_or_else(|| mux.ingress_owned());
-                let opts = AsrOpts { ingress: Some(ingress), ..opts };
+                let opts = AsrOpts {
+                    ingress: Some(ingress),
+                    ..opts
+                };
                 asr.submit(mux.clone(), samples, language, context, cancel, opts)
             }
         }
@@ -234,7 +267,12 @@ impl Route {
 
 fn words(text: &str) -> Vec<String> {
     text.split_whitespace()
-        .map(|w| w.chars().filter(|c| c.is_alphanumeric()).collect::<String>().to_lowercase())
+        .map(|w| {
+            w.chars()
+                .filter(|c| c.is_alphanumeric())
+                .collect::<String>()
+                .to_lowercase()
+        })
         .filter(|w| !w.is_empty())
         .collect()
 }
@@ -334,7 +372,12 @@ fn continue_stream(
     let open = &mut streams[index];
     let result = engine.stream_push(open.id, &job.samples[open.pushed..], &mut |_| {});
     open.pushed = job.samples.len();
-    Some(result.and_then(|text| Ok(Transcript { text, language: engine.language(job.language.as_deref())? })))
+    Some(result.and_then(|text| {
+        Ok(Transcript {
+            text,
+            language: engine.language(job.language.as_deref())?,
+        })
+    }))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -403,10 +446,15 @@ impl AsrMux {
                     });
                     for job in std::mem::take(&mut cohort) {
                         match job.stream.clone() {
-                            Some(key) => match continue_stream(&mut *engine, &mut streams, key, &job) {
-                                Some(result) => finish_job(job, result),
-                                None => cohort.push_back(AsrJob { stream: None, ..job }),
-                            },
+                            Some(key) => {
+                                match continue_stream(&mut *engine, &mut streams, key, &job) {
+                                    Some(result) => finish_job(job, result),
+                                    None => cohort.push_back(AsrJob {
+                                        stream: None,
+                                        ..job
+                                    }),
+                                }
+                            }
                             None => cohort.push_back(job),
                         }
                     }
@@ -424,7 +472,9 @@ impl AsrMux {
                                 &job.cancel,
                                 &mut |text| {
                                     // Only text that extends what was sent; the final pass sends any rest.
-                                    if let Some(rest) = text.strip_prefix(shown.as_str()).filter(|r| !r.is_empty()) {
+                                    if let Some(rest) =
+                                        text.strip_prefix(shown.as_str()).filter(|r| !r.is_empty())
+                                    {
                                         let _ = deltas.send(rest.to_owned());
                                         shown.push_str(rest);
                                     }
@@ -485,7 +535,11 @@ impl AsrMux {
         stream: Option<std::sync::Weak<parking_lot::Mutex<WindowCache>>>,
     ) -> Result<oneshot::Receiver<crate::Result<Transcript>>, SubmitError> {
         let permit = self.tx.try_reserve().map_err(|error| {
-            self.metrics.serving.asr.rejected.fetch_add(1, Ordering::Relaxed);
+            self.metrics
+                .serving
+                .asr
+                .rejected
+                .fetch_add(1, Ordering::Relaxed);
             match error {
                 mpsc::error::TrySendError::Full(_) => SubmitError::Full,
                 mpsc::error::TrySendError::Closed(_) => SubmitError::Closed,
@@ -503,8 +557,16 @@ impl AsrMux {
             deltas,
             stream,
         };
-        self.metrics.serving.asr.jobs.fetch_add(1, Ordering::Relaxed);
-        self.metrics.serving.asr.queued.fetch_add(1, Ordering::Relaxed);
+        self.metrics
+            .serving
+            .asr
+            .jobs
+            .fetch_add(1, Ordering::Relaxed);
+        self.metrics
+            .serving
+            .asr
+            .queued
+            .fetch_add(1, Ordering::Relaxed);
         permit.send(job);
         Ok(receive)
     }
@@ -547,15 +609,26 @@ struct AsrSessionMetrics(Option<Arc<crate::obs::Metrics>>);
 impl AsrSessionMetrics {
     fn new(metrics: Option<Arc<crate::obs::Metrics>>) -> Self {
         if let Some(m) = &metrics {
-            m.serving.asr.websocket_sessions.fetch_add(1, Ordering::Relaxed);
-            m.serving.asr.active_sessions.fetch_add(1, Ordering::Relaxed);
+            m.serving
+                .asr
+                .websocket_sessions
+                .fetch_add(1, Ordering::Relaxed);
+            m.serving
+                .asr
+                .active_sessions
+                .fetch_add(1, Ordering::Relaxed);
         }
         Self(metrics)
     }
 }
 impl Drop for AsrSessionMetrics {
     fn drop(&mut self) {
-        if let Some(m) = &self.0 { m.serving.asr.active_sessions.fetch_sub(1, Ordering::Relaxed); }
+        if let Some(m) = &self.0 {
+            m.serving
+                .asr
+                .active_sessions
+                .fetch_sub(1, Ordering::Relaxed);
+        }
     }
 }
 
@@ -570,7 +643,11 @@ impl AsrServer {
     pub fn new(model: String, engine: impl Transcriber + 'static) -> Arc<Self> {
         let (mux, ingress_capacity, finalization) = AsrMux::spawn(Box::new(engine));
         Arc::new(Self {
-            backend: Backend::Cohort { model, mux, finalization },
+            backend: Backend::Cohort {
+                model,
+                mux,
+                finalization,
+            },
             uploads: Arc::new(Semaphore::new(ingress_capacity)),
             sessions: Arc::new(Semaphore::new(ingress_capacity)),
             shutdown: watch::channel(false).0,
@@ -583,7 +660,9 @@ impl AsrServer {
 
     /// Replace the configured transcription deadline; only before the server is shared.
     pub fn with_request_timeout(mut self: Arc<Self>, timeout: Option<Duration>) -> Arc<Self> {
-        Arc::get_mut(&mut self).expect("AsrServer already shared").request_timeout = timeout;
+        Arc::get_mut(&mut self)
+            .expect("AsrServer already shared")
+            .request_timeout = timeout;
         self
     }
 
@@ -598,13 +677,17 @@ impl AsrServer {
 
     #[cfg(test)]
     fn with_vad(mut self: Arc<Self>, vad: Arc<crate::asr::vad::Vad>) -> Arc<Self> {
-        Arc::get_mut(&mut self).expect("AsrServer already shared").vad = Some(vad);
+        Arc::get_mut(&mut self)
+            .expect("AsrServer already shared")
+            .vad = Some(vad);
         self
     }
 
     #[cfg(test)]
     fn with_idle_timeout(mut self: Arc<Self>, timeout: Duration) -> Arc<Self> {
-        Arc::get_mut(&mut self).expect("AsrServer already shared").idle_timeout = timeout;
+        Arc::get_mut(&mut self)
+            .expect("AsrServer already shared")
+            .idle_timeout = timeout;
         self
     }
 
@@ -620,7 +703,9 @@ impl AsrServer {
 
     /// No queued or running job and no open session (the `plowrt asr` drain condition).
     pub fn idle(&self) -> bool {
-        let Some(metrics) = self.metrics("") else { return true };
+        let Some(metrics) = self.metrics("") else {
+            return true;
+        };
         let asr = &metrics.serving.asr;
         asr.queued.load(Ordering::Relaxed) == 0
             && asr.running.load(Ordering::Relaxed) == 0
@@ -685,9 +770,17 @@ impl AsrServer {
         }
     }
 
-    async fn route(&self, model: &str, session: Option<&str>) -> Result<(Route, FinalizationPolicy), Response> {
+    async fn route(
+        &self,
+        model: &str,
+        session: Option<&str>,
+    ) -> Result<(Route, FinalizationPolicy), Response> {
         match &self.backend {
-            Backend::Cohort { model: served, mux, finalization } => {
+            Backend::Cohort {
+                model: served,
+                mux,
+                finalization,
+            } => {
                 if model != served {
                     return Err(failure(StatusCode::NOT_FOUND, "unknown ASR model"));
                 }
@@ -719,39 +812,71 @@ impl AsrServer {
             get(move || {
                 let ready = health.ready();
                 async move {
-                    if ready { (StatusCode::OK, "ok") } else { (StatusCode::SERVICE_UNAVAILABLE, "unavailable") }
+                    if ready {
+                        (StatusCode::OK, "ok")
+                    } else {
+                        (StatusCode::SERVICE_UNAVAILABLE, "unavailable")
+                    }
                 }
             }),
         );
         if let Some((model, metrics)) = metrics {
             let models = vec![(model, metrics, true)];
             let json_models = models.clone();
-            router = router.route("/metrics", get(move || {
-                let mut out = String::new();
-                crate::obs::serving::ServingMetrics::write(&mut out, &models);
-                async move { ([("content-type", "text/plain; version=0.0.4; charset=utf-8")], out) }
-            })).route("/v1/metrics", get(move || {
-                let snapshot = crate::obs::serving::snapshot(&json_models);
-                async move { Json(snapshot) }
-            }));
+            router = router
+                .route(
+                    "/metrics",
+                    get(move || {
+                        let mut out = String::new();
+                        crate::obs::serving::ServingMetrics::write(&mut out, &models);
+                        async move {
+                            (
+                                [("content-type", "text/plain; version=0.0.4; charset=utf-8")],
+                                out,
+                            )
+                        }
+                    }),
+                )
+                .route(
+                    "/v1/metrics",
+                    get(move || {
+                        let snapshot = crate::obs::serving::snapshot(&json_models);
+                        async move { Json(snapshot) }
+                    }),
+                );
         }
         if let Some(model) = model {
             let mut endpoints = vec!["audio/transcriptions"];
-            if websocket { endpoints.push("audio/transcriptions/stream"); }
+            if websocket {
+                endpoints.push("audio/transcriptions/stream");
+            }
             let card = json!({"id": model, "root": model, "object": "model", "created": 0,
                 "owned_by": "plow", "x_plow_endpoints": endpoints,
                 "input_modalities": ["audio"], "output_modalities": ["text"]});
             let list_card = card.clone();
-            router = router.route("/v1/models", get(move || {
-                let card = list_card.clone();
-                async move { Json(json!({"object": "list", "data": [card]})) }
-            })).route("/v1/models/:model", get(move |axum::extract::Path(id): axum::extract::Path<String>| {
-                let card = card.clone();
-                async move {
-                    if card["id"] == id { Json(card).into_response() }
-                    else { failure(StatusCode::NOT_FOUND, "unknown ASR model") }
-                }
-            }));
+            router = router
+                .route(
+                    "/v1/models",
+                    get(move || {
+                        let card = list_card.clone();
+                        async move { Json(json!({"object": "list", "data": [card]})) }
+                    }),
+                )
+                .route(
+                    "/v1/models/:model",
+                    get(
+                        move |axum::extract::Path(id): axum::extract::Path<String>| {
+                            let card = card.clone();
+                            async move {
+                                if card["id"] == id {
+                                    Json(card).into_response()
+                                } else {
+                                    failure(StatusCode::NOT_FOUND, "unknown ASR model")
+                                }
+                            }
+                        },
+                    ),
+                );
         }
         router
     }
@@ -765,7 +890,9 @@ impl AsrServer {
                 .route("/v1/realtime", get(realtime::upgrade));
         }
         // 10 minutes of 16 kHz 16-bit audio is 19 MB.
-        let vad = Router::new().route("/v1/audio/vad", post(detect_speech)).layer(DefaultBodyLimit::max(32 * 1024 * 1024));
+        let vad = Router::new()
+            .route("/v1/audio/vad", post(detect_speech))
+            .layer(DefaultBodyLimit::max(32 * 1024 * 1024));
         router
             .layer(DefaultBodyLimit::max(4 * 1024 * 1024))
             .merge(vad)
@@ -777,15 +904,22 @@ impl AsrServer {
 #[cfg(feature = "cuda")]
 pub fn dead_encoders() -> Vec<String> {
     let mut dead = shared::dead_encoders();
-    dead.extend(packet_models().read().iter().filter(|(_, (mux, _))| mux.tx.is_closed()).map(|(n, _)| n.clone()));
+    dead.extend(
+        packet_models()
+            .read()
+            .iter()
+            .filter(|(_, (mux, _))| mux.tx.is_closed())
+            .map(|(n, _)| n.clone()),
+    );
     dead
 }
 
 /// Packet ASR models `plowrt serve` hosts on their own cohort engines (`--asr-packet`), by name.
 #[cfg(feature = "cuda")]
 fn packet_models() -> &'static parking_lot::RwLock<HashMap<String, (AsrMux, FinalizationPolicy)>> {
-    static MODELS: std::sync::OnceLock<parking_lot::RwLock<HashMap<String, (AsrMux, FinalizationPolicy)>>> =
-        std::sync::OnceLock::new();
+    static MODELS: std::sync::OnceLock<
+        parking_lot::RwLock<HashMap<String, (AsrMux, FinalizationPolicy)>>,
+    > = std::sync::OnceLock::new();
     MODELS.get_or_init(Default::default)
 }
 
@@ -797,8 +931,13 @@ const SERVE_PACKET_QUEUE: usize = 32;
 
 /// Serve `engine` as `name` on `plowrt serve`, counting into that model's serve metrics.
 #[cfg(feature = "cuda")]
-pub fn host_packet_model(state: &crate::serve::AppState, name: String, engine: Box<dyn Transcriber>) {
-    let (mux, _, finalization) = AsrMux::spawn_with(engine, state.model_metrics(&name), SERVE_PACKET_QUEUE);
+pub fn host_packet_model(
+    state: &crate::serve::AppState,
+    name: String,
+    engine: Box<dyn Transcriber>,
+) {
+    let (mux, _, finalization) =
+        AsrMux::spawn_with(engine, state.model_metrics(&name), SERVE_PACKET_QUEUE);
     packet_models().write().insert(name, (mux, finalization));
 }
 
@@ -848,7 +987,10 @@ fn failure(status: StatusCode, message: impl ToString) -> Response {
 /// 429 with `Retry-After`: a full queue, retryable.
 fn busy(message: impl ToString) -> Response {
     let mut response = failure(StatusCode::TOO_MANY_REQUESTS, message);
-    response.headers_mut().insert(axum::http::header::RETRY_AFTER, axum::http::HeaderValue::from_static("1"));
+    response.headers_mut().insert(
+        axum::http::header::RETRY_AFTER,
+        axum::http::HeaderValue::from_static("1"),
+    );
     response
 }
 
@@ -884,15 +1026,29 @@ async fn transcription(
     response
 }
 
-fn form_bool(fields: &std::collections::HashMap<String, String>, name: &str) -> Result<bool, Response> {
-    match fields.get(name).map(|v| v.trim().to_ascii_lowercase()).as_deref() {
+fn form_bool(
+    fields: &std::collections::HashMap<String, String>,
+    name: &str,
+) -> Result<bool, Response> {
+    match fields
+        .get(name)
+        .map(|v| v.trim().to_ascii_lowercase())
+        .as_deref()
+    {
         None | Some("false" | "0") => Ok(false),
         Some("true" | "1") => Ok(true),
-        Some(_) => Err(failure(StatusCode::BAD_REQUEST, format!("{name} must be true or false"))),
+        Some(_) => Err(failure(
+            StatusCode::BAD_REQUEST,
+            format!("{name} must be true or false"),
+        )),
     }
 }
 
-async fn transcribe_upload(state: Arc<AsrServer>, mut multipart: Multipart, ids: &mut RequestIds) -> Response {
+async fn transcribe_upload(
+    state: Arc<AsrServer>,
+    mut multipart: Multipart,
+    ids: &mut RequestIds,
+) -> Response {
     if state.draining() {
         return failure(StatusCode::SERVICE_UNAVAILABLE, SHUTTING_DOWN);
     }
@@ -923,8 +1079,19 @@ async fn transcribe_upload(state: Arc<AsrServer>, mut multipart: Multipart, ids:
         } else {
             if !matches!(
                 name.as_str(),
-                "model" | "language" | "prompt" | "response_format" | "temperature" | "stream" | "append" | "final"
-                    | "offset" | "session_id" | "prompt_cache_key" | "turn_id" | "turn_budget_ms"
+                "model"
+                    | "language"
+                    | "prompt"
+                    | "response_format"
+                    | "temperature"
+                    | "stream"
+                    | "append"
+                    | "final"
+                    | "offset"
+                    | "session_id"
+                    | "prompt_cache_key"
+                    | "turn_id"
+                    | "turn_budget_ms"
             ) || fields.contains_key(&name)
             {
                 return failure(StatusCode::BAD_REQUEST, "unknown or duplicate field");
@@ -965,7 +1132,11 @@ async fn transcribe_upload(state: Arc<AsrServer>, mut multipart: Multipart, ids:
     };
     let metrics = state.metrics(&model);
     if let Some(metrics) = &metrics {
-        metrics.serving.asr.http_requests.fetch_add(1, Ordering::Relaxed);
+        metrics
+            .serving
+            .asr
+            .http_requests
+            .fetch_add(1, Ordering::Relaxed);
     }
     let format = fields
         .remove("response_format")
@@ -982,16 +1153,29 @@ async fn transcribe_upload(state: Arc<AsrServer>, mut multipart: Multipart, ids:
     {
         return failure(StatusCode::BAD_REQUEST, "ASR supports greedy decoding only");
     }
-    let (stream, append, finish) = match (form_bool(&fields, "stream"), form_bool(&fields, "append"), form_bool(&fields, "final")) {
+    let (stream, append, finish) = match (
+        form_bool(&fields, "stream"),
+        form_bool(&fields, "append"),
+        form_bool(&fields, "final"),
+    ) {
         (Ok(s), Ok(a), Ok(f)) => (s, a, f),
         (Err(e), ..) | (_, Err(e), _) | (.., Err(e)) => return e,
     };
     let recorded = append || finish;
     if recorded && (ids.session.is_none() || !route.sessions()) {
-        return failure(StatusCode::BAD_REQUEST, "append/final need an X-Session-Id on plowrt serve");
+        return failure(
+            StatusCode::BAD_REQUEST,
+            "append/final need an X-Session-Id on plowrt serve",
+        );
     }
     let Some(in_flight) = ids.begin(&model) else {
-        return failure(StatusCode::CONFLICT, format!("request {} is already in flight in this session", ids.request));
+        return failure(
+            StatusCode::CONFLICT,
+            format!(
+                "request {} is already in flight in this session",
+                ids.request
+            ),
+        );
     };
     if file.is_none() && !finish {
         return failure(StatusCode::BAD_REQUEST, "file is required");
@@ -999,7 +1183,12 @@ async fn transcribe_upload(state: Arc<AsrServer>, mut multipart: Multipart, ids:
     let offset = match fields.get("offset").map(|v| v.trim().parse::<usize>()) {
         None => None,
         Some(Ok(offset)) if recorded => Some(offset),
-        Some(_) => return failure(StatusCode::BAD_REQUEST, "offset must be a sample count, with append or final"),
+        Some(_) => {
+            return failure(
+                StatusCode::BAD_REQUEST,
+                "offset must be a sample count, with append or final",
+            )
+        }
     };
     let language = fields.remove("language");
     let context = fields.remove("prompt").unwrap_or_default();
@@ -1008,11 +1197,24 @@ async fn transcribe_upload(state: Arc<AsrServer>, mut multipart: Multipart, ids:
     let (samples, speech) = match file {
         None => (Vec::new(), None),
         Some(file) => match tokio::task::spawn_blocking(move || {
-            let samples = if recorded { decode_wav_chunk(&file) } else { decode_wav(&file) }?;
+            let samples = if recorded {
+                decode_wav_chunk(&file)
+            } else {
+                decode_wav(&file)
+            }?;
             let speech = vad.map(|vad| {
                 let probabilities = vad.probabilities(&samples);
                 let (options, least) = vad.gate();
-                (speech_samples(&speech_segments(&probabilities, vad.frame, vad.sample_rate, samples.len(), options)), least)
+                (
+                    speech_samples(&speech_segments(
+                        &probabilities,
+                        vad.frame,
+                        vad.sample_rate,
+                        samples.len(),
+                        options,
+                    )),
+                    least,
+                )
             });
             Ok((samples, speech))
         })
@@ -1026,9 +1228,16 @@ async fn transcribe_upload(state: Arc<AsrServer>, mut multipart: Multipart, ids:
     drop(upload);
     if speech.is_some_and(|(speech, least)| speech < least) {
         // No speech: an audio-LM would transcribe the noise (or echo its prompt); nothing runs.
-        tracing::debug!(speech_ms = speech.map_or(0, |(s, _)| s) / 16, "upload has no speech");
+        tracing::debug!(
+            speech_ms = speech.map_or(0, |(s, _)| s) / 16,
+            "upload has no speech"
+        );
         return if stream {
-            sse_events(vec![transcript_event("transcript.text.done", ids, json!({"text": "", "language": language, "final": true}))])
+            sse_events(vec![transcript_event(
+                "transcript.text.done",
+                ids,
+                json!({"text": "", "language": language, "final": true}),
+            )])
         } else if format == "text" {
             String::new().into_response()
         } else {
@@ -1044,9 +1253,17 @@ async fn transcribe_upload(state: Arc<AsrServer>, mut multipart: Multipart, ids:
         Instant::now(),
         finals,
     );
-    let ids = &RequestIds { turn_key: run.key(), ..ids.clone() };
+    let ids = &RequestIds {
+        turn_key: run.key(),
+        ..ids.clone()
+    };
     let (report, report_rx) = ids.report();
-    let mut opts = AsrOpts { final_pass: finals, ids: Some(ids.clone()), report, ..Default::default() };
+    let mut opts = AsrOpts {
+        final_pass: finals,
+        ids: Some(ids.clone()),
+        report,
+        ..Default::default()
+    };
     // A session recording: append, then transcribe all of it (partial) or finish it (final).
     let mut recorded_samples = 0;
     let (samples, mut recording) = if recorded {
@@ -1066,7 +1283,10 @@ async fn transcribe_upload(state: Arc<AsrServer>, mut multipart: Multipart, ids:
                 .into_response();
         }
         if rec.samples.len() + samples.len() > MAX_SAMPLES {
-            return failure(StatusCode::PAYLOAD_TOO_LARGE, "session audio exceeds 30 seconds");
+            return failure(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "session audio exceeds 30 seconds",
+            );
         }
         rec.samples.extend_from_slice(&samples);
         rec.used = Some(Instant::now());
@@ -1077,9 +1297,17 @@ async fn transcribe_upload(state: Arc<AsrServer>, mut multipart: Multipart, ids:
             std::mem::take(&mut rec.samples)
         } else {
             // Inside the session's partial duty cycle: answer the last partial again.
-            if let Some((text, _)) = rec.partial.as_ref().filter(|(_, next)| !stream && Instant::now() < *next) {
+            if let Some((text, _)) = rec
+                .partial
+                .as_ref()
+                .filter(|(_, next)| !stream && Instant::now() < *next)
+            {
                 let reply = json!({"text": text, "final": false, "offset": recorded_samples});
-                return if format == "text" { text.clone().into_response() } else { Json(reply).into_response() };
+                return if format == "text" {
+                    text.clone().into_response()
+                } else {
+                    Json(reply).into_response()
+                };
             }
             opts.windows = Some(rec.windows.clone());
             rec.samples.clone()
@@ -1110,13 +1338,26 @@ async fn transcribe_upload(state: Arc<AsrServer>, mut multipart: Multipart, ids:
             return failure(StatusCode::SERVICE_UNAVAILABLE, "ASR engine unavailable")
         }
     };
-    let deadline = state.request_timeout.map(|t| tokio::time::Instant::now() + t);
+    let deadline = state
+        .request_timeout
+        .map(|t| tokio::time::Instant::now() + t);
     let offset = recorded.then_some(recorded_samples);
     if stream {
         let cache = crate::serve::session::CacheOutcome::received(report_rx).await;
         run.admitted(cache.and_then(|c| c.at));
         let stamped = run.headers();
-        let mut response = sse_transcript(work, delta_rx, ids.clone(), finals, offset, cache, cancel.0.clone(), deadline, (in_flight, cancel, recording), run);
+        let mut response = sse_transcript(
+            work,
+            delta_rx,
+            ids.clone(),
+            finals,
+            offset,
+            cache,
+            cancel.0.clone(),
+            deadline,
+            (in_flight, cancel, recording),
+            run,
+        );
         response.headers_mut().extend(stamped);
         if let Some(cache) = cache {
             cache.stamp(&mut response);
@@ -1135,7 +1376,14 @@ async fn transcribe_upload(state: Arc<AsrServer>, mut multipart: Multipart, ids:
         None => work.await,
     };
     if let (Some(rec), false, Ok(Ok(result))) = (recording.as_mut(), finals, &result) {
-        let duty = crate::config::RuntimeConfig::get().asr_partial_duty.clamp(0.01, 1.0) * if crate::serve::overload::level() >= 1 { 0.5 } else { 1.0 };
+        let duty = crate::config::RuntimeConfig::get()
+            .asr_partial_duty
+            .clamp(0.01, 1.0)
+            * if crate::serve::overload::level() >= 1 {
+                0.5
+            } else {
+                1.0
+            };
         let rest = started.elapsed().mul_f64(1.0 / duty - 1.0);
         rec.partial = Some((result.text.clone(), Instant::now() + rest));
     }
@@ -1148,7 +1396,10 @@ async fn transcribe_upload(state: Arc<AsrServer>, mut multipart: Multipart, ids:
     }
     let mut response = match result {
         Ok(Ok(result)) if format == "text" => result.text.into_response(),
-        Ok(Ok(result)) if recorded => Json(json!({"text":result.text,"final":finals,"offset":recorded_samples})).into_response(),
+        Ok(Ok(result)) if recorded => {
+            Json(json!({"text":result.text,"final":finals,"offset":recorded_samples}))
+                .into_response()
+        }
         Ok(Ok(result)) => Json(json!({"text":result.text})).into_response(),
         Ok(Err(error)) => return runtime_failure(error),
         Err(error) => return failure(StatusCode::SERVICE_UNAVAILABLE, error),
@@ -1177,7 +1428,10 @@ fn audio_failure(error: AudioError) -> Response {
 /// `max_speech_duration_s`), in seconds.
 async fn detect_speech(State(state): State<Arc<AsrServer>>, mut multipart: Multipart) -> Response {
     let Some(vad) = state.vad.clone() else {
-        return failure(StatusCode::NOT_FOUND, "no VAD packet is loaded (--asr-vad-packet)");
+        return failure(
+            StatusCode::NOT_FOUND,
+            "no VAD packet is loaded (--asr-vad-packet)",
+        );
     };
     if state.draining() {
         return failure(StatusCode::SERVICE_UNAVAILABLE, SHUTTING_DOWN);
@@ -1185,7 +1439,8 @@ async fn detect_speech(State(state): State<Arc<AsrServer>>, mut multipart: Multi
     let Ok(_upload) = state.uploads.clone().try_acquire_owned() else {
         return busy("too many ASR uploads");
     };
-    let (mut file, mut options, bound) = (None, vad.segment_options(), vad.max_override_ms() as f32);
+    let (mut file, mut options, bound) =
+        (None, vad.segment_options(), vad.max_override_ms() as f32);
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     loop {
         let field = match tokio::time::timeout_at(deadline, multipart.next_field()).await {
@@ -1206,9 +1461,15 @@ async fn detect_speech(State(state): State<Arc<AsrServer>>, mut multipart: Multi
             }
             continue;
         }
-        let number = std::str::from_utf8(&value).ok().and_then(|v| v.trim().parse::<f32>().ok()).filter(|v| v.is_finite() && *v >= 0.0);
+        let number = std::str::from_utf8(&value)
+            .ok()
+            .and_then(|v| v.trim().parse::<f32>().ok())
+            .filter(|v| v.is_finite() && *v >= 0.0);
         let Some(number) = number else {
-            return failure(StatusCode::BAD_REQUEST, format!("{name} must be a non-negative number"));
+            return failure(
+                StatusCode::BAD_REQUEST,
+                format!("{name} must be a non-negative number"),
+            );
         };
         match name.as_str() {
             "threshold" if number <= 1.0 => options.threshold = number,
@@ -1216,7 +1477,12 @@ async fn detect_speech(State(state): State<Arc<AsrServer>>, mut multipart: Multi
             "min_silence_duration_ms" if number <= bound => options.min_silence_ms = number as u32,
             "speech_pad_ms" if number <= bound => options.speech_pad_ms = number as u32,
             "max_speech_duration_s" if number > 0.0 => options.max_speech_s = number,
-            _ => return failure(StatusCode::BAD_REQUEST, format!("unknown or invalid field {name:?}")),
+            _ => {
+                return failure(
+                    StatusCode::BAD_REQUEST,
+                    format!("unknown or invalid field {name:?}"),
+                )
+            }
         }
     }
     let Some(file) = file else {
@@ -1225,10 +1491,20 @@ async fn detect_speech(State(state): State<Arc<AsrServer>>, mut multipart: Multi
     let detected = tokio::task::spawn_blocking(move || {
         let samples = decode_wav_within(&file, VAD_MAX_SAMPLES)?;
         let probabilities = vad.probabilities(&samples);
-        Ok::<_, AudioError>((samples.len(), speech_segments(&probabilities, vad.frame, vad.sample_rate, samples.len(), options)))
+        Ok::<_, AudioError>((
+            samples.len(),
+            speech_segments(
+                &probabilities,
+                vad.frame,
+                vad.sample_rate,
+                samples.len(),
+                options,
+            ),
+        ))
     })
     .await;
-    let seconds = |samples: usize| (samples as f64 / f64::from(SAMPLE_RATE) * 1000.0).round() / 1000.0;
+    let seconds =
+        |samples: usize| (samples as f64 / f64::from(SAMPLE_RATE) * 1000.0).round() / 1000.0;
     match detected {
         Ok(Ok((samples, segments))) => Json(json!({
             "duration": seconds(samples),
@@ -1241,7 +1517,11 @@ async fn detect_speech(State(state): State<Arc<AsrServer>>, mut multipart: Multi
     }
 }
 
-fn transcript_event(kind: &str, ids: &RequestIds, mut body: serde_json::Value) -> axum::response::sse::Event {
+fn transcript_event(
+    kind: &str,
+    ids: &RequestIds,
+    mut body: serde_json::Value,
+) -> axum::response::sse::Event {
     body["type"] = kind.into();
     body["request_id"] = ids.request.as_ref().into();
     if let Some(session) = &ids.session {
@@ -1312,12 +1592,29 @@ fn sse_transcript<H: Send + 'static>(
             Ok(Ok(result)) => {
                 while let Ok(delta) = deltas.try_recv() {
                     shown.push_str(&delta);
-                    let _ = tx.send(transcript_event("transcript.text.delta", &ids, json!({"delta": delta}))).await;
+                    let _ = tx
+                        .send(transcript_event(
+                            "transcript.text.delta",
+                            &ids,
+                            json!({"delta": delta}),
+                        ))
+                        .await;
                 }
-                if let Some(rest) = result.text.strip_prefix(shown.as_str()).filter(|r| !r.is_empty()) {
-                    let _ = tx.send(transcript_event("transcript.text.delta", &ids, json!({"delta": rest}))).await;
+                if let Some(rest) = result
+                    .text
+                    .strip_prefix(shown.as_str())
+                    .filter(|r| !r.is_empty())
+                {
+                    let _ = tx
+                        .send(transcript_event(
+                            "transcript.text.delta",
+                            &ids,
+                            json!({"delta": rest}),
+                        ))
+                        .await;
                 }
-                let mut done = json!({"text": result.text, "language": result.language, "final": finals});
+                let mut done =
+                    json!({"text": result.text, "language": result.language, "final": finals});
                 if let Some(offset) = offset {
                     done["offset"] = offset.into();
                 }
@@ -1327,15 +1624,22 @@ fn sse_transcript<H: Send + 'static>(
                 }
                 run.first();
                 run.done();
-                let _ = tx.send(transcript_event("transcript.text.done", &ids, done)).await;
+                let _ = tx
+                    .send(transcript_event("transcript.text.done", &ids, done))
+                    .await;
                 run.sse_comment()
             }
-            Ok(Err(error)) => transcript_event("error", &ids, json!({"message": error.to_string()})),
+            Ok(Err(error)) => {
+                transcript_event("error", &ids, json!({"message": error.to_string()}))
+            }
             Err(error) => transcript_event("error", &ids, json!({"message": error.to_string()})),
         };
         let _ = tx.send(event).await;
     });
-    let stream = futures::stream::poll_fn(move |cx| rx.poll_recv(cx).map(|e| e.map(Ok::<_, std::convert::Infallible>)));
+    let stream = futures::stream::poll_fn(move |cx| {
+        rx.poll_recv(cx)
+            .map(|e| e.map(Ok::<_, std::convert::Infallible>))
+    });
     axum::response::sse::Sse::new(stream).into_response()
 }
 
@@ -1359,7 +1663,8 @@ async fn upgrade(
         Err(_) => return busy("too many ASR sessions"),
     };
     // Each connection is a session: its partials resume the decoder rows the last one retained.
-    ids.session.get_or_insert_with(|| crate::serve::session::minted::session().into());
+    ids.session
+        .get_or_insert_with(|| crate::serve::session::minted::session().into());
     let echo = ids.clone();
     let mut response = ws
         .max_message_size(65536)
@@ -1414,7 +1719,12 @@ const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const PARTIAL_STRIDE: usize = SAMPLE_RATE as usize;
 
 fn common_prefix_bytes(a: &str, b: &str) -> usize {
-    a.char_indices().zip(b.chars()).take_while(|((_, x), y)| x == y).map(|((i, x), _)| i + x.len_utf8()).last().unwrap_or(0)
+    a.char_indices()
+        .zip(b.chars())
+        .take_while(|((_, x), y)| x == y)
+        .map(|((i, x), _)| i + x.len_utf8())
+        .last()
+        .unwrap_or(0)
 }
 
 async fn send(socket: &mut WebSocket, value: serde_json::Value) -> bool {
@@ -1444,7 +1754,11 @@ fn append_final_padding(samples: &mut Vec<f32>, count: usize, amplitude: f32) {
 
 /// A terminal error, then close 1001 (going away).
 async fn going_away(socket: &mut WebSocket, message: &str) {
-    send(socket, json!({"type":"error","message":message,"terminal":true})).await;
+    send(
+        socket,
+        json!({"type":"error","message":message,"terminal":true}),
+    )
+    .await;
     close(socket, 1001, message).await;
 }
 
@@ -1452,14 +1766,21 @@ async fn going_away(socket: &mut WebSocket, message: &str) {
 /// mistaken for a dropped connection.
 async fn idle_close(socket: &mut WebSocket, after: Duration) {
     let message = format!("no audio or control message for {} s", after.as_secs_f32());
-    send(socket, json!({"type":"error","message":message,"code":"timeout","terminal":true})).await;
+    send(
+        socket,
+        json!({"type":"error","message":message,"code":"timeout","terminal":true}),
+    )
+    .await;
     close(socket, 1000, "idle timeout").await;
 }
 
 /// Send a close frame and wait (5 s at most) for the peer's: dropping the socket first resets the
 /// connection under the client's close reply, which clients report as an I/O error.
 pub(super) async fn close(socket: &mut WebSocket, code: u16, reason: &str) {
-    let frame = Message::Close(Some(axum::extract::ws::CloseFrame { code, reason: reason.to_owned().into() }));
+    let frame = Message::Close(Some(axum::extract::ws::CloseFrame {
+        code,
+        reason: reason.to_owned().into(),
+    }));
     let _ = tokio::time::timeout(Duration::from_secs(5), async {
         if socket.send(frame).await.is_ok() {
             while let Some(Ok(message)) = socket.recv().await {
@@ -1472,14 +1793,18 @@ pub(super) async fn close(socket: &mut WebSocket, code: u16, reason: &str) {
     .await;
 }
 
-async fn stream(state: Arc<AsrServer>, mut socket: WebSocket, permit: OwnedSemaphorePermit, ids: RequestIds) {
+async fn stream(
+    state: Arc<AsrServer>,
+    mut socket: WebSocket,
+    permit: OwnedSemaphorePermit,
+    ids: RequestIds,
+) {
     let cancel = Cancellation(Arc::new(AtomicBool::new(false)));
     let mut shutdown = state.shutdown.subscribe();
-    let Some(Ok(Message::Text(text))) =
-        tokio::time::timeout(state.idle_timeout, socket.recv())
-            .await
-            .ok()
-            .flatten()
+    let Some(Ok(Message::Text(text))) = tokio::time::timeout(state.idle_timeout, socket.recv())
+        .await
+        .ok()
+        .flatten()
     else {
         return;
     };
@@ -1490,7 +1815,11 @@ async fn stream(state: Arc<AsrServer>, mut socket: WebSocket, permit: OwnedSemap
                 && STREAM_RATES.contains(&s.sample_rate)
                 && s.format == "pcm_s16le" =>
         {
-            state.route(&s.model, ids.session.as_deref()).await.ok().map(|r| (s, r))
+            state
+                .route(&s.model, ids.session.as_deref())
+                .await
+                .ok()
+                .map(|r| (s, r))
         }
         _ => None,
     };
@@ -1511,9 +1840,15 @@ async fn stream(state: Arc<AsrServer>, mut socket: WebSocket, permit: OwnedSemap
     }
     match start.mode.as_deref() {
         None | Some("utterance") => {}
-        Some("continuous") => return continuous(state, socket, ids, start, route, finalization, cancel).await,
+        Some("continuous") => {
+            return continuous(state, socket, ids, start, route, finalization, cancel).await
+        }
         Some(_) => {
-            send(&mut socket, json!({"type":"error","message":"invalid start","terminal":true})).await;
+            send(
+                &mut socket,
+                json!({"type":"error","message":"invalid start","terminal":true}),
+            )
+            .await;
             return;
         }
     }
@@ -1524,7 +1859,10 @@ async fn stream(state: Arc<AsrServer>, mut socket: WebSocket, permit: OwnedSemap
     let windows: Arc<parking_lot::Mutex<WindowCache>> = Default::default();
     let request = |final_pass, turn_key: Option<crate::serve::turns::TurnKey>| AsrOpts {
         final_pass,
-        ids: Some(RequestIds { turn_key, ..ids.with_new_request() }),
+        ids: Some(RequestIds {
+            turn_key,
+            ..ids.with_new_request()
+        }),
         windows: (!final_pass).then(|| windows.clone()),
         deltas: None,
         report: None,
@@ -1533,7 +1871,8 @@ async fn stream(state: Arc<AsrServer>, mut socket: WebSocket, permit: OwnedSemap
     // Credit and limits count the client's samples; `samples` holds them resampled to 16 kHz.
     let rate = start.sample_rate as usize;
     let mut resampler = Resampler::new(start.sample_rate).expect("a listed stream rate");
-    let max_audio_samples = MAX_SAMPLES.saturating_sub(finalization.final_padding_samples) * rate / SAMPLE_RATE as usize;
+    let max_audio_samples = MAX_SAMPLES.saturating_sub(finalization.final_padding_samples) * rate
+        / SAMPLE_RATE as usize;
     let initial_credit = rate.min(max_audio_samples);
     if !send(&mut socket,json!({"type":"ready","version":1,"session_id":&*session,"request_id":&*ids.request,
         "sample_rate":start.sample_rate,"format":"pcm_s16le","max_chunk_bytes":32000,"credit_samples":initial_credit,
@@ -1545,7 +1884,8 @@ async fn stream(state: Arc<AsrServer>, mut socket: WebSocket, permit: OwnedSemap
     let mut credit = initial_credit;
     let (mut revision, mut last_partial, mut partial_at) = (0u64, String::new(), 0usize);
     let mut pending: Option<oneshot::Receiver<crate::Result<Transcript>>> = None;
-    let mut ping = tokio::time::interval_at(tokio::time::Instant::now() + PING_INTERVAL, PING_INTERVAL);
+    let mut ping =
+        tokio::time::interval_at(tokio::time::Instant::now() + PING_INTERVAL, PING_INTERVAL);
     let mut last_pong = tokio::time::Instant::now();
     let mut idle_at = tokio::time::Instant::now() + state.idle_timeout;
     loop {
@@ -1660,7 +2000,13 @@ async fn stream(state: Arc<AsrServer>, mut socket: WebSocket, permit: OwnedSemap
             if start.deltas {
                 opts.deltas = Some(delta_tx);
             }
-            let mut work = match route.submit(samples, language, start.prompt, cancel.0.clone(), opts) {
+            let mut work = match route.submit(
+                samples,
+                language,
+                start.prompt,
+                cancel.0.clone(),
+                opts,
+            ) {
                 Ok(work) => work,
                 Err(SubmitError::Full) => {
                     send(
@@ -1680,7 +2026,9 @@ async fn stream(state: Arc<AsrServer>, mut socket: WebSocket, permit: OwnedSemap
                 }
             };
             // A final already submitted runs to its answer through shutdown (the drain bounds it).
-            let deadline = state.request_timeout.map(|t| tokio::time::Instant::now() + t);
+            let deadline = state
+                .request_timeout
+                .map(|t| tokio::time::Instant::now() + t);
             let mut shown = String::new();
             let result = loop {
                 tokio::select! {
@@ -1729,7 +2077,11 @@ async fn stream(state: Arc<AsrServer>, mut socket: WebSocket, permit: OwnedSemap
                             shown.push_str(&delta);
                             send(&mut socket, json!({"type":"delta","text":delta})).await;
                         }
-                        if let Some(rest) = result.text.strip_prefix(shown.as_str()).filter(|r| !r.is_empty()) {
+                        if let Some(rest) = result
+                            .text
+                            .strip_prefix(shown.as_str())
+                            .filter(|r| !r.is_empty())
+                        {
                             send(&mut socket, json!({"type":"delta","text":rest})).await;
                         }
                     }
@@ -1766,7 +2118,15 @@ async fn stream(state: Arc<AsrServer>, mut socket: WebSocket, permit: OwnedSemap
         if partials && pending.is_none() && samples.len() >= partial_at + PARTIAL_STRIDE {
             partial_at = samples.len();
             // A full queue skips this partial; the next stride retries.
-            pending = route.submit(samples.clone(), language.clone(), start.prompt.clone(), cancel.0.clone(), request(false, None)).ok();
+            pending = route
+                .submit(
+                    samples.clone(),
+                    language.clone(),
+                    start.prompt.clone(),
+                    cancel.0.clone(),
+                    request(false, None),
+                )
+                .ok();
         }
         let grant = (rate - received % rate)
             .min(max_audio_samples - received)
@@ -1836,7 +2196,11 @@ async fn continuous(
     let min_silence_ms = start.min_silence_ms.unwrap_or(600);
     let max_segment_ms = start.max_segment_ms.unwrap_or(cap_ms.min(25_000));
     if !(200..=2000).contains(&min_silence_ms) || !(4_000..=cap_ms).contains(&max_segment_ms) {
-        send(&mut socket, json!({"type":"error","message":"invalid start","terminal":true})).await;
+        send(
+            &mut socket,
+            json!({"type":"error","message":"invalid start","terminal":true}),
+        )
+        .await;
         return;
     }
     let _metrics = AsrSessionMetrics::new(state.metrics(&start.model));
@@ -1844,7 +2208,13 @@ async fn continuous(
     let session = ids.session.clone().unwrap_or_default();
     let rate = start.sample_rate as usize;
     let mut resampler = Resampler::new(start.sample_rate).expect("a listed stream rate");
-    let mut endpointer = state.endpointer(EndpointConfig { min_silence_ms, max_segment_ms }, None);
+    let mut endpointer = state.endpointer(
+        EndpointConfig {
+            min_silence_ms,
+            max_segment_ms,
+        },
+        None,
+    );
     if !send(&mut socket, json!({"type":"ready","version":1,"session_id":&*session,"request_id":&*ids.request,
         "sample_rate":start.sample_rate,"format":"pcm_s16le","max_chunk_bytes":32000,"credit_samples":rate,
         "max_audio_samples":null,"partial_mode":if start.partials {"revision"} else {"final_only"},
@@ -1854,7 +2224,10 @@ async fn continuous(
     }
     let opts = |final_pass, turn_key, windows, deltas| AsrOpts {
         final_pass,
-        ids: Some(RequestIds { turn_key, ..ids.with_new_request() }),
+        ids: Some(RequestIds {
+            turn_key,
+            ..ids.with_new_request()
+        }),
         windows,
         deltas,
         report: None,
@@ -1865,7 +2238,11 @@ async fn continuous(
         if samples.len() < SAMPLE_RATE as usize / 2 {
             samples.resize(SAMPLE_RATE as usize / 2, 0.0);
         }
-        append_final_padding(&mut samples, finalization.final_padding_samples, finalization.final_padding_amplitude);
+        append_final_padding(
+            &mut samples,
+            finalization.final_padding_samples,
+            finalization.final_padding_amplitude,
+        );
         let run = crate::serve::turns::StageRun::start(
             &ids,
             crate::serve::turns::Kind::Asr,
@@ -1890,7 +2267,9 @@ async fn continuous(
             work,
             deltas,
             shown: String::new(),
-            deadline: state.request_timeout.map(|t| tokio::time::Instant::now() + t),
+            deadline: state
+                .request_timeout
+                .map(|t| tokio::time::Instant::now() + t),
             run,
             _cancel: cancel,
         })
@@ -1901,16 +2280,23 @@ async fn continuous(
     let mut flights: VecDeque<Flight> = VecDeque::new();
     let mut emitted = 0u64;
     let mut finishing = false;
-    let mut partial: Option<(u64, Cancellation, oneshot::Receiver<crate::Result<Transcript>>)> = None;
+    let mut partial: Option<(
+        u64,
+        Cancellation,
+        oneshot::Receiver<crate::Result<Transcript>>,
+    )> = None;
     let (mut partial_segment, mut partial_at, mut revision) = (u64::MAX, 0usize, 0u64);
     let mut last_partial = String::new();
     let mut windows: Arc<parking_lot::Mutex<WindowCache>> = Default::default();
-    let mut ping = tokio::time::interval_at(tokio::time::Instant::now() + PING_INTERVAL, PING_INTERVAL);
+    let mut ping =
+        tokio::time::interval_at(tokio::time::Instant::now() + PING_INTERVAL, PING_INTERVAL);
     let mut last_pong = tokio::time::Instant::now();
     let mut idle_at = tokio::time::Instant::now() + state.idle_timeout;
     loop {
         while flights.len() < MAX_SEGMENTS_IN_FLIGHT {
-            let Some(segment) = waiting.front() else { break };
+            let Some(segment) = waiting.front() else {
+                break;
+            };
             match launch(segment) {
                 Ok(flight) => {
                     waiting.pop_front();
@@ -1929,7 +2315,10 @@ async fn continuous(
         }
         if finishing && flights.is_empty() && waiting.is_empty() {
             send(&mut socket, json!({"type":"done","segments":emitted})).await;
-            let close = Message::Close(Some(axum::extract::ws::CloseFrame { code: 1000, reason: "done".into() }));
+            let close = Message::Close(Some(axum::extract::ws::CloseFrame {
+                code: 1000,
+                reason: "done".into(),
+            }));
             let _ = tokio::time::timeout(Duration::from_secs(5), socket.send(close)).await;
             return;
         }
@@ -2079,37 +2468,52 @@ async fn continuous(
                             last_partial.clear();
                             windows = Default::default();
                         }
-                        if audio.len() >= (partial_at + PARTIAL_STRIDE).max(SAMPLE_RATE as usize / 2) {
+                        if audio.len()
+                            >= (partial_at + PARTIAL_STRIDE).max(SAMPLE_RATE as usize / 2)
+                        {
                             partial_at = audio.len();
                             let cancel = Cancellation(Arc::new(AtomicBool::new(false)));
                             // A full queue skips this partial; the next stride retries.
-                            if let Ok(work) = route.submit(audio.to_vec(), start.language.clone(), start.prompt.clone(),
-                                cancel.0.clone(), opts(false, None, Some(windows.clone()), None)) {
+                            if let Ok(work) = route.submit(
+                                audio.to_vec(),
+                                start.language.clone(),
+                                start.prompt.clone(),
+                                cancel.0.clone(),
+                                opts(false, None, Some(windows.clone()), None),
+                            ) {
                                 partial = Some((segment, cancel, work));
                             }
                         }
                     }
                 }
             }
-            Message::Text(text) if !finishing => match serde_json::from_str::<serde_json::Value>(&text)
-                .ok()
-                .and_then(|v| v["type"].as_str().map(str::to_owned))
-                .as_deref()
+            Message::Text(text) if !finishing => {
+                match serde_json::from_str::<serde_json::Value>(&text)
+                    .ok()
+                    .and_then(|v| v["type"].as_str().map(str::to_owned))
+                    .as_deref()
+                {
+                    Some("finish") => {
+                        finishing = true;
+                        partial = None;
+                        let tail = resampler.finish();
+                        waiting.extend(endpointer.push(&tail));
+                        waiting.extend(endpointer.finish());
+                    }
+                    Some("cancel") => return,
+                    _ => {
+                        send(&mut socket, json!({"type":"error","message":"expected finish or cancel","terminal":true})).await;
+                        return;
+                    }
+                }
+            }
+            Message::Text(text)
+                if serde_json::from_str::<serde_json::Value>(&text)
+                    .ok()
+                    .is_some_and(|v| v["type"] == "cancel") =>
             {
-                Some("finish") => {
-                    finishing = true;
-                    partial = None;
-                    let tail = resampler.finish();
-                    waiting.extend(endpointer.push(&tail));
-                    waiting.extend(endpointer.finish());
-                }
-                Some("cancel") => return,
-                _ => {
-                    send(&mut socket, json!({"type":"error","message":"expected finish or cancel","terminal":true})).await;
-                    return;
-                }
-            },
-            Message::Text(text) if serde_json::from_str::<serde_json::Value>(&text).ok().is_some_and(|v| v["type"] == "cancel") => return,
+                return
+            }
             Message::Pong(_) => last_pong = tokio::time::Instant::now(),
             Message::Ping(_) => {}
             Message::Close(_) => return,
@@ -2223,9 +2627,19 @@ mod tests {
         assert_eq!(*sizes.lock().unwrap(), [4]);
         assert_eq!(*sample_lengths.lock().unwrap(), [4, 3, 2, 1]);
         let stats = mux.metrics.serving.asr.snapshot().unwrap();
-        assert_eq!((stats.jobs, stats.completed, stats.cancelled, stats.errors), (4, 3, 1, 0));
+        assert_eq!(
+            (stats.jobs, stats.completed, stats.cancelled, stats.errors),
+            (4, 3, 1, 0)
+        );
         assert_eq!((stats.queued, stats.running), (0, 0));
-        assert_eq!((stats.e2e.count, stats.queue.count, stats.first_transcript.count), (4, 4, 3));
+        assert_eq!(
+            (
+                stats.e2e.count,
+                stats.queue.count,
+                stats.first_transcript.count
+            ),
+            (4, 4, 3)
+        );
     }
 
     #[tokio::test]
@@ -2241,15 +2655,29 @@ mod tests {
             fn language(&self, _: Option<&str>) -> crate::Result<Option<String>> {
                 Ok(None)
             }
-            fn transcribe(&mut self, samples: &[f32], _: Option<&str>, _: &str, _: &AtomicBool) -> crate::Result<Transcript> {
-                Ok(Transcript { text: format!("final {}", samples.len()), language: None })
+            fn transcribe(
+                &mut self,
+                samples: &[f32],
+                _: Option<&str>,
+                _: &str,
+                _: &AtomicBool,
+            ) -> crate::Result<Transcript> {
+                Ok(Transcript {
+                    text: format!("final {}", samples.len()),
+                    language: None,
+                })
             }
             fn stream_open(&mut self) -> crate::Result<Option<u64>> {
                 let mut log = self.0.lock();
                 log.opened += 1;
                 Ok(Some(log.opened))
             }
-            fn stream_push(&mut self, id: u64, samples: &[f32], _: &mut dyn FnMut(&str)) -> crate::Result<String> {
+            fn stream_push(
+                &mut self,
+                id: u64,
+                samples: &[f32],
+                _: &mut dyn FnMut(&str),
+            ) -> crate::Result<String> {
                 let mut log = self.0.lock();
                 log.pushed.push((id, samples.len()));
                 Ok(format!("stream {id}"))
@@ -2262,15 +2690,43 @@ mod tests {
         let (mux, _, _) = AsrMux::spawn(Box::new(Streaming(log.clone())));
         let recording: Arc<parking_lot::Mutex<WindowCache>> = Default::default();
         let run = |samples: usize, stream| {
-            mux.submit_with(vec![0.0; samples], None, String::new(), Arc::new(AtomicBool::new(false)), None, stream)
-                .unwrap()
+            mux.submit_with(
+                vec![0.0; samples],
+                None,
+                String::new(),
+                Arc::new(AtomicBool::new(false)),
+                None,
+                stream,
+            )
+            .unwrap()
         };
-        assert_eq!(run(100, Some(Arc::downgrade(&recording))).await.unwrap().unwrap().text, "stream 1");
-        assert_eq!(run(250, Some(Arc::downgrade(&recording))).await.unwrap().unwrap().text, "stream 1");
+        assert_eq!(
+            run(100, Some(Arc::downgrade(&recording)))
+                .await
+                .unwrap()
+                .unwrap()
+                .text,
+            "stream 1"
+        );
+        assert_eq!(
+            run(250, Some(Arc::downgrade(&recording)))
+                .await
+                .unwrap()
+                .unwrap()
+                .text,
+            "stream 1"
+        );
         assert_eq!(run(300, None).await.unwrap().unwrap().text, "final 300");
         drop(recording);
         let next: Arc<parking_lot::Mutex<WindowCache>> = Default::default();
-        assert_eq!(run(50, Some(Arc::downgrade(&next))).await.unwrap().unwrap().text, "stream 2");
+        assert_eq!(
+            run(50, Some(Arc::downgrade(&next)))
+                .await
+                .unwrap()
+                .unwrap()
+                .text,
+            "stream 2"
+        );
         let log = log.lock();
         assert_eq!(log.pushed, [(1, 100), (1, 150), (2, 50)]);
         assert_eq!(log.closed, [1]);
@@ -2283,8 +2739,17 @@ mod tests {
             fn language(&self, _: Option<&str>) -> crate::Result<Option<String>> {
                 Ok(None)
             }
-            fn transcribe(&mut self, _: &[f32], _: Option<&str>, _: &str, _: &AtomicBool) -> crate::Result<Transcript> {
-                Ok(Transcript { text: "Hello world".into(), language: None })
+            fn transcribe(
+                &mut self,
+                _: &[f32],
+                _: Option<&str>,
+                _: &str,
+                _: &AtomicBool,
+            ) -> crate::Result<Transcript> {
+                Ok(Transcript {
+                    text: "Hello world".into(),
+                    language: None,
+                })
             }
             fn transcribe_streaming(
                 &mut self,
@@ -2297,13 +2762,23 @@ mod tests {
                 for text in ["Hello", "Hello", "Hello wor", "Hello world"] {
                     on_text(text);
                 }
-                Ok(Transcript { text: "Hello world".into(), language: None })
+                Ok(Transcript {
+                    text: "Hello world".into(),
+                    language: None,
+                })
             }
         }
         let (mux, _, _) = AsrMux::spawn(Box::new(Growing));
         let (tx, mut rx) = mpsc::unbounded_channel();
         let result = mux
-            .submit_with(vec![0.0], None, String::new(), Arc::new(AtomicBool::new(false)), Some(tx), None)
+            .submit_with(
+                vec![0.0],
+                None,
+                String::new(),
+                Arc::new(AtomicBool::new(false)),
+                Some(tx),
+                None,
+            )
             .unwrap()
             .await
             .unwrap()
@@ -2323,12 +2798,20 @@ mod tests {
 
     #[tokio::test]
     async fn serve_packet_mux_queues_a_burst() {
-        let spawn = |e| AsrMux::spawn_with(e, Arc::new(crate::obs::Metrics::default()), SERVE_PACKET_QUEUE);
+        let spawn = |e| {
+            AsrMux::spawn_with(
+                e,
+                Arc::new(crate::obs::Metrics::default()),
+                SERVE_PACKET_QUEUE,
+            )
+        };
         assert_eq!(bounded_queue(spawn).await, SERVE_PACKET_QUEUE);
     }
 
     /// Holds one transcription, fills the queue, checks the next submit is refused; returns the depth.
-    async fn bounded_queue(spawn: impl FnOnce(Box<dyn Transcriber>) -> (AsrMux, usize, FinalizationPolicy)) -> usize {
+    async fn bounded_queue(
+        spawn: impl FnOnce(Box<dyn Transcriber>) -> (AsrMux, usize, FinalizationPolicy),
+    ) -> usize {
         struct Held {
             started: Arc<tokio::sync::Notify>,
             release: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
@@ -2377,7 +2860,10 @@ mod tests {
         let queued: Vec<_> = (0..ingress_capacity).map(|_| submit().unwrap()).collect();
         assert_eq!(submit().unwrap_err(), SubmitError::Full);
         let metrics = mux.metrics.serving.asr.snapshot().unwrap();
-        assert_eq!((metrics.running, metrics.queued, metrics.rejected), (1, ingress_capacity as u64, 1));
+        assert_eq!(
+            (metrics.running, metrics.queued, metrics.rejected),
+            (1, ingress_capacity as u64, 1)
+        );
         *release.0.lock().unwrap() = true;
         release.1.notify_one();
         assert!(active.await.unwrap().is_ok());
@@ -2445,45 +2931,93 @@ mod tests {
 
     fn upload(path: &str, fields: &[(&str, &str)], samples: &[f32]) -> Request<Body> {
         let mut wav = std::io::Cursor::new(Vec::new());
-        let spec = hound::WavSpec { channels: 1, sample_rate: 16_000, bits_per_sample: 16, sample_format: hound::SampleFormat::Int };
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 16_000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
         let mut writer = hound::WavWriter::new(&mut wav, spec).unwrap();
         for &x in samples {
-            writer.write_sample((x.clamp(-1.0, 1.0) * 32767.0) as i16).unwrap();
+            writer
+                .write_sample((x.clamp(-1.0, 1.0) * 32767.0) as i16)
+                .unwrap();
         }
         writer.finalize().unwrap();
         let mut body = Vec::new();
         for (name, value) in fields {
-            body.extend(format!("--audio\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n").bytes());
+            body.extend(
+                format!(
+                    "--audio\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n"
+                )
+                .bytes(),
+            );
         }
         body.extend(b"--audio\r\nContent-Disposition: form-data; name=\"file\"; filename=\"a.wav\"\r\nContent-Type: audio/wav\r\n\r\n");
         body.extend(wav.into_inner());
         body.extend(b"\r\n--audio--\r\n");
-        Request::post(path).header("content-type", "multipart/form-data; boundary=audio").body(Body::from(body)).unwrap()
+        Request::post(path)
+            .header("content-type", "multipart/form-data; boundary=audio")
+            .body(Body::from(body))
+            .unwrap()
     }
 
     #[tokio::test]
     async fn vad_answers_silent_uploads_without_the_model_and_reports_speech() {
         let dir = std::path::Path::new("/home/ssm-user/models/silero-vad-v5");
-        let Ok(vad) = crate::asr::vad::Vad::load(&dir.join("silero_vad.pkt")) else { return };
-        let reference: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.join("reference.json")).unwrap()).unwrap();
-        let signal: Vec<f32> = reference["signal"].as_array().unwrap().iter().map(|v| v.as_f64().unwrap() as f32).collect();
-        let app = AsrServer::new("test".into(), Fake).with_vad(Arc::new(vad)).router(false);
-        let text = |samples: &[f32]| upload("/v1/audio/transcriptions", &[("model", "test")], samples);
+        let Ok(vad) = crate::asr::vad::Vad::load(&dir.join("silero_vad.pkt")) else {
+            return;
+        };
+        let reference: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.join("reference.json")).unwrap()).unwrap();
+        let signal: Vec<f32> = reference["signal"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_f64().unwrap() as f32)
+            .collect();
+        let app = AsrServer::new("test".into(), Fake)
+            .with_vad(Arc::new(vad))
+            .router(false);
+        let text =
+            |samples: &[f32]| upload("/v1/audio/transcriptions", &[("model", "test")], samples);
         let response = app.clone().oneshot(text(&[0.0; 16_000])).await.unwrap();
-        assert_eq!(&response.into_body().collect().await.unwrap().to_bytes()[..], br#"{"text":""}"#);
+        assert_eq!(
+            &response.into_body().collect().await.unwrap().to_bytes()[..],
+            br#"{"text":""}"#
+        );
         let response = app.clone().oneshot(text(&signal)).await.unwrap();
-        assert_eq!(&response.into_body().collect().await.unwrap().to_bytes()[..], br#"{"text":"hello"}"#);
+        assert_eq!(
+            &response.into_body().collect().await.unwrap().to_bytes()[..],
+            br#"{"text":"hello"}"#
+        );
 
-        let response = app.clone().oneshot(upload("/v1/audio/vad", &[("speech_pad_ms", "0")], &signal)).await.unwrap();
+        let response = app
+            .clone()
+            .oneshot(upload("/v1/audio/vad", &[("speech_pad_ms", "0")], &signal))
+            .await
+            .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-        let detected: serde_json::Value = serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
+        let detected: serde_json::Value =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
         assert_eq!(detected["duration"], 4.0);
         let segments = detected["segments"].as_array().unwrap();
         assert_eq!(segments.len(), 1);
         // The tone burst spans 1..2 s of the reference signal.
-        let (start, end) = (segments[0]["start"].as_f64().unwrap(), segments[0]["end"].as_f64().unwrap());
-        assert!((0.9..1.2).contains(&start) && (1.8..2.2).contains(&end), "{segments:?}");
-        let response = app.clone().oneshot(upload("/v1/audio/vad", &[("model", "test")], &signal)).await.unwrap();
+        let (start, end) = (
+            segments[0]["start"].as_f64().unwrap(),
+            segments[0]["end"].as_f64().unwrap(),
+        );
+        assert!(
+            (0.9..1.2).contains(&start) && (1.8..2.2).contains(&end),
+            "{segments:?}"
+        );
+        let response = app
+            .clone()
+            .oneshot(upload("/v1/audio/vad", &[("model", "test")], &signal))
+            .await
+            .unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
@@ -2493,11 +3027,24 @@ mod tests {
         fn language(&self, language: Option<&str>) -> crate::Result<Option<String>> {
             Ok(language.map(str::to_owned))
         }
-        fn transcribe(&mut self, _: &[f32], language: Option<&str>, _: &str, _: &AtomicBool) -> crate::Result<Transcript> {
+        fn transcribe(
+            &mut self,
+            _: &[f32],
+            language: Option<&str>,
+            _: &str,
+            _: &AtomicBool,
+        ) -> crate::Result<Transcript> {
             self.0.fetch_add(1, Ordering::Relaxed);
             Ok(match language {
-                None => Transcript { text: "मेरा नंबर".into(), language: Some("Hindi".into()) },
-                Some(l) => Transcript { text: "My number is nine one eight seven three four one five three eight.".into(), language: Some(l.into()) },
+                None => Transcript {
+                    text: "मेरा नंबर".into(),
+                    language: Some("Hindi".into()),
+                },
+                Some(l) => Transcript {
+                    text: "My number is nine one eight seven three four one five three eight."
+                        .into(),
+                    language: Some(l.into()),
+                },
             })
         }
     }
@@ -2515,39 +3062,93 @@ mod tests {
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let app = AsrServer::new("test".into(), Codeswitch(calls.clone())).router(false);
         let body = |r: Response| async { r.into_body().collect().await.unwrap().to_bytes() };
-        let response = app.clone().oneshot(upload("/v1/audio/transcriptions", &[("model", "test")], &[0.1; 16_000])).await.unwrap();
-        assert_eq!(&body(response).await[..], r#"{"text":"मेरा नंबर"}"#.as_bytes());
+        let response = app
+            .clone()
+            .oneshot(upload(
+                "/v1/audio/transcriptions",
+                &[("model", "test")],
+                &[0.1; 16_000],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            &body(response).await[..],
+            r#"{"text":"मेरा नंबर"}"#.as_bytes()
+        );
         assert_eq!(calls.load(Ordering::Relaxed), 1);
-        let response = app.clone().oneshot(upload("/v1/audio/transcriptions", &[("model", "test"), ("language", "English")], &[0.1; 16_000])).await.unwrap();
-        assert_eq!(&body(response).await[..], br#"{"text":"My number is 918-734-1538."}"#);
+        let response = app
+            .clone()
+            .oneshot(upload(
+                "/v1/audio/transcriptions",
+                &[("model", "test"), ("language", "English")],
+                &[0.1; 16_000],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            &body(response).await[..],
+            br#"{"text":"My number is 918-734-1538."}"#
+        );
         assert_eq!(calls.load(Ordering::Relaxed), 2);
     }
 
     #[tokio::test]
     async fn clips_under_half_a_second_are_padded_not_refused() {
         let app = AsrServer::new("test".into(), Fake).router(false);
-        let response = app.clone().oneshot(upload("/v1/audio/transcriptions", &[("model", "test")], &[0.0; 1_600])).await.unwrap();
+        let response = app
+            .clone()
+            .oneshot(upload(
+                "/v1/audio/transcriptions",
+                &[("model", "test")],
+                &[0.0; 1_600],
+            ))
+            .await
+            .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-        let response = app.oneshot(upload("/v1/audio/transcriptions", &[("model", "test")], &[])).await.unwrap();
+        let response = app
+            .oneshot(upload(
+                "/v1/audio/transcriptions",
+                &[("model", "test")],
+                &[],
+            ))
+            .await
+            .unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     #[test]
     fn echoes_need_eight_consecutive_context_words() {
         let context = "A phone call to the front desk of a US law firm. Callers give their name.";
-        assert!(echoes(context, "Okay. A phone call to the front desk of a US law firm."));
-        assert!(!echoes(context, "I'm calling the law firm about my phone call to the front office."));
+        assert!(echoes(
+            context,
+            "Okay. A phone call to the front desk of a US law firm."
+        ));
+        assert!(!echoes(
+            context,
+            "I'm calling the law firm about my phone call to the front office."
+        ));
         assert!(!echoes("", "anything at all here in this text"));
     }
 
     #[test]
     fn decoder_loops_collapse_and_speech_stays() {
-        assert_eq!(collapse_repeats("Beep. Beep. Beep. Beep. Beep. Beep. Hello?").as_deref(), Some("Beep. Hello?"));
         assert_eq!(
-            collapse_repeats("I said thank you, thank you, thank you, thank you, thank you, thank you bye").as_deref(),
+            collapse_repeats("Beep. Beep. Beep. Beep. Beep. Beep. Hello?").as_deref(),
+            Some("Beep. Hello?")
+        );
+        assert_eq!(
+            collapse_repeats(
+                "I said thank you, thank you, thank you, thank you, thank you, thank you bye"
+            )
+            .as_deref(),
             Some("I said thank you, bye")
         );
-        for speech in ["No, no, no, I didn't.", "Okay. Okay. Thank you.", "nine one one", ""] {
+        for speech in [
+            "No, no, no, I didn't.",
+            "Okay. Okay. Thank you.",
+            "nine one one",
+            "",
+        ] {
             assert_eq!(collapse_repeats(speech), None);
         }
     }
@@ -2559,13 +3160,28 @@ mod tests {
         fn language(&self, language: Option<&str>) -> crate::Result<Option<String>> {
             Ok(language.map(str::to_owned))
         }
-        fn transcribe(&mut self, _: &[f32], language: Option<&str>, context: &str, _: &AtomicBool) -> crate::Result<Transcript> {
+        fn transcribe(
+            &mut self,
+            _: &[f32],
+            language: Option<&str>,
+            context: &str,
+            _: &AtomicBool,
+        ) -> crate::Result<Transcript> {
             self.0.fetch_add(1, Ordering::Relaxed);
             if !context.is_empty() && language == Some("loop") {
-                return Err(crate::RuntimeError::Rejected("ASR exceeded output token limit".into()));
+                return Err(crate::RuntimeError::Rejected(
+                    "ASR exceeded output token limit".into(),
+                ));
             }
-            let text = if context.is_empty() { "Yes, please." } else { context };
-            Ok(Transcript { text: text.into(), language: language.map(str::to_owned) })
+            let text = if context.is_empty() {
+                "Yes, please."
+            } else {
+                context
+            };
+            Ok(Transcript {
+                text: text.into(),
+                language: language.map(str::to_owned),
+            })
         }
     }
 
@@ -2577,9 +3193,21 @@ mod tests {
         let body = |r: Response| async { r.into_body().collect().await.unwrap().to_bytes() };
         for language in ["English", "loop"] {
             let before = calls.load(Ordering::Relaxed);
-            let fields = [("model", "test"), ("language", language), ("prompt", prompt)];
-            let response = app.clone().oneshot(upload("/v1/audio/transcriptions", &fields, &[0.1; 16_000])).await.unwrap();
-            assert_eq!(&body(response).await[..], br#"{"text":"Yes, please."}"#, "{language}");
+            let fields = [
+                ("model", "test"),
+                ("language", language),
+                ("prompt", prompt),
+            ];
+            let response = app
+                .clone()
+                .oneshot(upload("/v1/audio/transcriptions", &fields, &[0.1; 16_000]))
+                .await
+                .unwrap();
+            assert_eq!(
+                &body(response).await[..],
+                br#"{"text":"Yes, please."}"#,
+                "{language}"
+            );
             assert_eq!(calls.load(Ordering::Relaxed) - before, 2);
         }
     }
@@ -2587,21 +3215,49 @@ mod tests {
     #[tokio::test]
     async fn vad_route_is_absent_without_a_packet() {
         let app = AsrServer::new("test".into(), Fake).router(false);
-        let response = app.oneshot(upload("/v1/audio/vad", &[], &[0.0; 16_000])).await.unwrap();
+        let response = app
+            .oneshot(upload("/v1/audio/vad", &[], &[0.0; 16_000]))
+            .await
+            .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
     async fn standalone_discovery_preserves_model_identity_and_audio_capabilities() {
         let app = AsrServer::new("nemotron-asr-0.6b".into(), Fake).router(true);
-        let response = app.clone().oneshot(Request::get("/v1/models").body(Body::empty()).unwrap()).await.unwrap();
+        let response = app
+            .clone()
+            .oneshot(Request::get("/v1/models").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let list: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(list["data"][0]["id"], "nemotron-asr-0.6b");
-        assert_eq!(list["data"][0]["x_plow_endpoints"], json!(["audio/transcriptions", "audio/transcriptions/stream"]));
+        assert_eq!(
+            list["data"][0]["x_plow_endpoints"],
+            json!(["audio/transcriptions", "audio/transcriptions/stream"])
+        );
         for (name, status) in [("nemotron-asr-0.6b", 200), ("transcribe", 404)] {
-            assert_eq!(app.clone().oneshot(Request::get(format!("/v1/models/{name}")).body(Body::empty()).unwrap()).await.unwrap().status(), status);
-            assert_eq!(app.clone().oneshot(request(name, "json")).await.unwrap().status(), status);
+            assert_eq!(
+                app.clone()
+                    .oneshot(
+                        Request::get(format!("/v1/models/{name}"))
+                            .body(Body::empty())
+                            .unwrap()
+                    )
+                    .await
+                    .unwrap()
+                    .status(),
+                status
+            );
+            assert_eq!(
+                app.clone()
+                    .oneshot(request(name, "json"))
+                    .await
+                    .unwrap()
+                    .status(),
+                status
+            );
         }
     }
 
@@ -2678,62 +3334,133 @@ mod tests {
 
     #[tokio::test]
     async fn dropped_http_audio_stream_cancels_engine_work_and_balances_metrics() {
-        struct UntilCancelled(Arc<tokio::sync::Notify>, Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>);
+        struct UntilCancelled(
+            Arc<tokio::sync::Notify>,
+            Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+        );
         impl Transcriber for UntilCancelled {
-            fn language(&self, _: Option<&str>) -> crate::Result<Option<String>> { Ok(None) }
-            fn transcribe(&mut self, _: &[f32], _: Option<&str>, _: &str, cancel: &AtomicBool) -> crate::Result<Transcript> {
-                while !cancel.load(Ordering::Relaxed) { std::thread::sleep(Duration::from_millis(1)); }
+            fn language(&self, _: Option<&str>) -> crate::Result<Option<String>> {
+                Ok(None)
+            }
+            fn transcribe(
+                &mut self,
+                _: &[f32],
+                _: Option<&str>,
+                _: &str,
+                cancel: &AtomicBool,
+            ) -> crate::Result<Transcript> {
+                while !cancel.load(Ordering::Relaxed) {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
                 self.0.notify_one();
-                let mut released = self.1.0.lock().unwrap();
-                while !*released { released = self.1.1.wait(released).unwrap(); }
+                let mut released = self.1 .0.lock().unwrap();
+                while !*released {
+                    released = self.1 .1.wait(released).unwrap();
+                }
                 Err(crate::RuntimeError::Rejected("cancelled".into()))
             }
         }
         let cancelled = Arc::new(tokio::sync::Notify::new());
         let release = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
-        let server = AsrServer::new("test".into(), UntilCancelled(cancelled.clone(), release.clone()));
+        let server = AsrServer::new(
+            "test".into(),
+            UntilCancelled(cancelled.clone(), release.clone()),
+        );
         let (mut parts, body) = request("test", "json").into_parts();
-        parts.headers.insert("x-session-id", "http-cancellation-session".parse().unwrap());
-        parts.headers.insert("x-request-id", "http-cancellation-request".parse().unwrap());
+        parts
+            .headers
+            .insert("x-session-id", "http-cancellation-session".parse().unwrap());
+        parts
+            .headers
+            .insert("x-request-id", "http-cancellation-request".parse().unwrap());
         let ids = RequestIds::from_headers(&parts.headers).unwrap();
         let mut body = body.collect().await.unwrap().to_bytes().to_vec();
         body.truncate(body.len() - b"--audio--\r\n".len());
         body.extend_from_slice(b"--audio\r\nContent-Disposition: form-data; name=\"stream\"\r\n\r\ntrue\r\n--audio--\r\n");
-        let response = server.clone().router(true).oneshot(Request::from_parts(parts, Body::from(body))).await.unwrap();
+        let response = server
+            .clone()
+            .router(true)
+            .oneshot(Request::from_parts(parts, Body::from(body)))
+            .await
+            .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         drop(response);
-        tokio::time::timeout(Duration::from_secs(1), cancelled.notified()).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), cancelled.notified())
+            .await
+            .unwrap();
         let metrics = server.metrics("test").unwrap();
         let retained = ids.begin("test").is_none();
         let running = metrics.serving.asr.running.load(Ordering::Relaxed);
         *release.0.lock().unwrap() = true;
         release.1.notify_one();
-        assert!(retained, "request identity remains in flight until the cancelled worker returns");
+        assert!(
+            retained,
+            "request identity remains in flight until the cancelled worker returns"
+        );
         assert_eq!(running, 1);
         tokio::time::timeout(Duration::from_secs(1), async {
-            while metrics.serving.asr.cancelled.load(Ordering::Relaxed) == 0 { tokio::task::yield_now().await; }
-        }).await.unwrap();
+            while metrics.serving.asr.cancelled.load(Ordering::Relaxed) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
         let stats = metrics.serving.asr.snapshot().unwrap();
-        assert_eq!((stats.jobs, stats.cancelled, stats.running, stats.queued, stats.errors), (1, 1, 0, 0, 0));
+        assert_eq!(
+            (
+                stats.jobs,
+                stats.cancelled,
+                stats.running,
+                stats.queued,
+                stats.errors
+            ),
+            (1, 1, 0, 0, 0)
+        );
     }
 
     #[tokio::test]
     async fn standalone_metrics_count_work_and_publish_the_served_identity() {
         let server = AsrServer::new("named-asr".into(), Fake);
         let app = server.clone().router(true);
-        let ok = app.clone().oneshot(request("named-asr", "json")).await.unwrap();
+        let ok = app
+            .clone()
+            .oneshot(request("named-asr", "json"))
+            .await
+            .unwrap();
         assert_eq!(ok.status(), StatusCode::OK);
-        let bad = app.clone().oneshot(request("named-asr", "xml")).await.unwrap();
+        let bad = app
+            .clone()
+            .oneshot(request("named-asr", "xml"))
+            .await
+            .unwrap();
         assert_eq!(bad.status(), StatusCode::BAD_REQUEST);
-        let Backend::Cohort { mux, .. } = &server.backend else { panic!("cohort") };
-        let error = mux.submit(vec![0.0; 8000], Some("Invalid".into()), String::new(), Arc::new(AtomicBool::new(false))).unwrap().await.unwrap();
+        let Backend::Cohort { mux, .. } = &server.backend else {
+            panic!("cohort")
+        };
+        let error = mux
+            .submit(
+                vec![0.0; 8000],
+                Some("Invalid".into()),
+                String::new(),
+                Arc::new(AtomicBool::new(false)),
+            )
+            .unwrap()
+            .await
+            .unwrap();
         assert!(error.is_err());
-        let response = app.clone().oneshot(Request::get("/v1/metrics").body(Body::empty()).unwrap()).await.unwrap();
+        let response = app
+            .clone()
+            .oneshot(Request::get("/v1/metrics").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let snapshot: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(snapshot["object"], "runtime.metrics");
-        assert!(snapshot["started_at_unix_ms"].as_u64().unwrap() <= snapshot["observed_at_unix_ms"].as_u64().unwrap());
+        assert!(
+            snapshot["started_at_unix_ms"].as_u64().unwrap()
+                <= snapshot["observed_at_unix_ms"].as_u64().unwrap()
+        );
         let model = &snapshot["models"][0];
         assert_eq!(model["id"], "named-asr");
         assert_eq!(model["requests"], 2);
@@ -2742,11 +3469,19 @@ mod tests {
         assert_eq!(model["asr"]["http_requests"], 2);
         assert_eq!(model["asr"]["first_transcript"]["count"], 1);
         assert_eq!(model["asr"]["e2e"]["count"], 2);
-        assert!(model["ttft"]["p95_ms"].is_null(), "audio transcripts must not invent token latency");
-        let response = app.oneshot(Request::get("/metrics").body(Body::empty()).unwrap()).await.unwrap();
+        assert!(
+            model["ttft"]["p95_ms"].is_null(),
+            "audio transcripts must not invent token latency"
+        );
+        let response = app
+            .oneshot(Request::get("/metrics").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let text = String::from_utf8(body.to_vec()).unwrap();
-        assert!(text.contains("plowrt_asr_jobs_errors_total{model_name=\"named-asr\",engine=\"0\"} 1"));
+        assert!(
+            text.contains("plowrt_asr_jobs_errors_total{model_name=\"named-asr\",engine=\"0\"} 1")
+        );
         assert!(text.contains("plowrt_asr_jobs_running{model_name=\"named-asr\",engine=\"0\"} 0"));
     }
 
@@ -2756,7 +3491,10 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let app = AsrServer::new("test".into(), Fake).router(true);
-        let task = tokio::spawn(async move { axum::serve(listener, app).tcp_nodelay(true).await.unwrap() });
+        let task =
+            tokio::spawn(
+                async move { axum::serve(listener, app).tcp_nodelay(true).await.unwrap() },
+            );
         let mut socket = BufReader::new(tokio::net::TcpStream::connect(address).await.unwrap());
         let request = request("test", "json");
         let (parts, body) = request.into_parts();
@@ -2768,7 +3506,9 @@ mod tests {
                 format!("GET /v1/models HTTP/1.1\r\nHost: {address}\r\n\r\n")
             };
             socket.get_mut().write_all(head.as_bytes()).await.unwrap();
-            if transcription { socket.get_mut().write_all(&body).await.unwrap(); }
+            if transcription {
+                socket.get_mut().write_all(&body).await.unwrap();
+            }
             let mut line = String::new();
             socket.read_line(&mut line).await.unwrap();
             assert!(line.starts_with("HTTP/1.1 200"), "{line}");
@@ -2776,16 +3516,23 @@ mod tests {
             loop {
                 line.clear();
                 assert!(socket.read_line(&mut line).await.unwrap() > 0);
-                if line == "\r\n" { break; }
+                if line == "\r\n" {
+                    break;
+                }
                 if let Some((name, value)) = line.split_once(':') {
-                    if name.eq_ignore_ascii_case("content-length") { length = Some(value.trim().parse::<usize>().unwrap()); }
+                    if name.eq_ignore_ascii_case("content-length") {
+                        length = Some(value.trim().parse::<usize>().unwrap());
+                    }
                 }
             }
             let mut response = vec![0; length.expect("bounded JSON response")];
             socket.read_exact(&mut response).await.unwrap();
             let response: serde_json::Value = serde_json::from_slice(&response).unwrap();
-            if transcription { assert_eq!(response["text"], "hello"); }
-            else { assert_eq!(response["data"][0]["id"], "test"); }
+            if transcription {
+                assert_eq!(response["text"], "hello");
+            } else {
+                assert_eq!(response["data"][0]["id"], "test");
+            }
         }
         task.abort();
     }
@@ -2797,13 +3544,25 @@ mod tests {
         let app = AsrServer::new("test".into(), Fake).router(true);
         let task = tokio::spawn(async move {
             hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new())
-                .serve_connection_with_upgrades(hyper_util::rt::TokioIo::new(server), hyper_util::service::TowerToHyperService::new(app))
-                .await.unwrap();
+                .serve_connection_with_upgrades(
+                    hyper_util::rt::TokioIo::new(server),
+                    hyper_util::service::TowerToHyperService::new(app),
+                )
+                .await
+                .unwrap();
         });
-        let (mut socket, _) = tokio_tungstenite::client_async("ws://localhost/v1/audio/transcriptions/stream", client).await.unwrap();
+        let (mut socket, _) = tokio_tungstenite::client_async(
+            "ws://localhost/v1/audio/transcriptions/stream",
+            client,
+        )
+        .await
+        .unwrap();
         socket.send(tokio_tungstenite::tungstenite::Message::Text(json!({"type":"start","version":1,"model":"test","sample_rate":16000,"format":"pcm_s16le"}).to_string())).await.unwrap();
         let ready = socket.next().await.unwrap().unwrap().into_text().unwrap();
-        assert_eq!(serde_json::from_str::<serde_json::Value>(&ready).unwrap()["type"], "ready");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&ready).unwrap()["type"],
+            "ready"
+        );
         socket.close(None).await.unwrap();
         task.await.unwrap();
     }
@@ -2863,15 +3622,26 @@ mod tests {
         use tokio_tungstenite::{connect_async, tungstenite::Message as ClientMessage};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
-        let app = AsrServer::new("test".into(), Fake).with_idle_timeout(Duration::from_millis(300)).router(true);
+        let app = AsrServer::new("test".into(), Fake)
+            .with_idle_timeout(Duration::from_millis(300))
+            .router(true);
         let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let url = format!("ws://{address}/v1/audio/transcriptions/stream");
         for mode in ["utterance", "continuous"] {
             let (mut socket, _) = connect_async(&url).await.unwrap();
-            socket.send(ClientMessage::Text(json!({"type":"start","version":1,"model":"test","sample_rate":16000,
-                "format":"pcm_s16le","mode":mode}).to_string())).await.unwrap();
+            socket
+                .send(ClientMessage::Text(
+                    json!({"type":"start","version":1,"model":"test","sample_rate":16000,
+                "format":"pcm_s16le","mode":mode})
+                    .to_string(),
+                ))
+                .await
+                .unwrap();
             let (mut error, mut close) = (None, None);
-            while let Some(message) = tokio::time::timeout(Duration::from_secs(10), socket.next()).await.unwrap() {
+            while let Some(message) = tokio::time::timeout(Duration::from_secs(10), socket.next())
+                .await
+                .unwrap()
+            {
                 match message.unwrap() {
                     ClientMessage::Text(text) => {
                         let event: serde_json::Value = serde_json::from_str(&text).unwrap();
@@ -2887,7 +3657,11 @@ mod tests {
                 }
             }
             let error = error.expect("a terminal error before the close");
-            assert_eq!((error["code"].as_str(), error["terminal"].as_bool()), (Some("timeout"), Some(true)), "{mode}");
+            assert_eq!(
+                (error["code"].as_str(), error["terminal"].as_bool()),
+                (Some("timeout"), Some(true)),
+                "{mode}"
+            );
             assert_eq!(close, Some(1000), "{mode}");
         }
         task.abort();
@@ -3052,20 +3826,31 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(5), started.notified())
             .await
             .unwrap();
-        socket.send(ClientMessage::Ping(b"alive".to_vec())).await.unwrap();
+        socket
+            .send(ClientMessage::Ping(b"alive".to_vec()))
+            .await
+            .unwrap();
         tokio::time::timeout(Duration::from_secs(1), async {
             loop {
                 match socket.next().await.unwrap().unwrap() {
-                    ClientMessage::Pong(payload) => { assert_eq!(payload, b"alive"); break; }
-                    ClientMessage::Text(_) => {}, // Buffered credit event.
+                    ClientMessage::Pong(payload) => {
+                        assert_eq!(payload, b"alive");
+                        break;
+                    }
+                    ClientMessage::Text(_) => {} // Buffered credit event.
                     message => panic!("unexpected heartbeat reply: {message:?}"),
                 }
             }
-        }).await.unwrap();
+        })
+        .await
+        .unwrap();
         if disconnect {
             drop(socket);
         } else {
-            socket.send(ClientMessage::Text(r#"{"type":"cancel"}"#.into())).await.unwrap();
+            socket
+                .send(ClientMessage::Text(r#"{"type":"cancel"}"#.into()))
+                .await
+                .unwrap();
         }
         let observed = tokio::time::timeout(Duration::from_secs(5), cancelled.notified()).await;
         let held = server.sessions.available_permits() + 1 == session_capacity;
@@ -3086,7 +3871,15 @@ mod tests {
         drop(permits);
         let metrics = server.metrics("test").unwrap();
         let stats = metrics.serving.asr.snapshot().unwrap();
-        assert_eq!((stats.websocket_sessions, stats.active_sessions, stats.cancelled, stats.running), (1, 0, 1, 0));
+        assert_eq!(
+            (
+                stats.websocket_sessions,
+                stats.active_sessions,
+                stats.cancelled,
+                stats.running
+            ),
+            (1, 0, 1, 0)
+        );
         task.abort();
     }
 
@@ -3097,7 +3890,10 @@ mod tests {
         assert_eq!(busy.headers()[axum::http::header::RETRY_AFTER], "1");
         let gone = runtime_failure(crate::RuntimeError::Unavailable("draining".into()));
         assert_eq!(gone.status(), StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(runtime_failure(crate::RuntimeError::Rejected("bad".into())).status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            runtime_failure(crate::RuntimeError::Rejected("bad".into())).status(),
+            StatusCode::BAD_REQUEST
+        );
     }
 
     struct UntilCancelled(Arc<tokio::sync::Notify>);
@@ -3105,7 +3901,13 @@ mod tests {
         fn language(&self, _: Option<&str>) -> crate::Result<Option<String>> {
             Ok(None)
         }
-        fn transcribe(&mut self, _: &[f32], _: Option<&str>, _: &str, cancel: &AtomicBool) -> crate::Result<Transcript> {
+        fn transcribe(
+            &mut self,
+            _: &[f32],
+            _: Option<&str>,
+            _: &str,
+            cancel: &AtomicBool,
+        ) -> crate::Result<Transcript> {
             while !cancel.load(Ordering::Relaxed) {
                 std::thread::sleep(Duration::from_millis(1));
             }
@@ -3119,9 +3921,16 @@ mod tests {
         let cancelled = Arc::new(tokio::sync::Notify::new());
         let server = AsrServer::new("test".into(), UntilCancelled(cancelled.clone()))
             .with_request_timeout(Some(Duration::from_millis(50)));
-        let response = server.clone().router(false).oneshot(request("test", "json")).await.unwrap();
+        let response = server
+            .clone()
+            .router(false)
+            .oneshot(request("test", "json"))
+            .await
+            .unwrap();
         assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
-        tokio::time::timeout(Duration::from_secs(5), cancelled.notified()).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), cancelled.notified())
+            .await
+            .unwrap();
     }
 
     /// A stream's deadline answers while the engine is still stalled; the session's permit stays
@@ -3135,26 +3944,45 @@ mod tests {
             fn language(&self, _: Option<&str>) -> crate::Result<Option<String>> {
                 Ok(None)
             }
-            fn transcribe(&mut self, _: &[f32], _: Option<&str>, _: &str, _: &AtomicBool) -> crate::Result<Transcript> {
+            fn transcribe(
+                &mut self,
+                _: &[f32],
+                _: Option<&str>,
+                _: &str,
+                _: &AtomicBool,
+            ) -> crate::Result<Transcript> {
                 let mut open = self.0 .0.lock().unwrap();
                 while !*open {
                     open = self.0 .1.wait(open).unwrap();
                 }
-                Ok(Transcript { text: "late".into(), language: None })
+                Ok(Transcript {
+                    text: "late".into(),
+                    language: None,
+                })
             }
         }
         let gate: Gate = Default::default();
-        let server = AsrServer::new("test".into(), Stalled(gate.clone())).with_request_timeout(Some(Duration::from_millis(100)));
+        let server = AsrServer::new("test".into(), Stalled(gate.clone()))
+            .with_request_timeout(Some(Duration::from_millis(100)));
         let capacity = server.sessions.available_permits();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let app = server.clone().router(true);
         let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        let (mut socket, _) = connect_async(format!("ws://{address}/v1/audio/transcriptions/stream")).await.unwrap();
+        let (mut socket, _) =
+            connect_async(format!("ws://{address}/v1/audio/transcriptions/stream"))
+                .await
+                .unwrap();
         socket.send(ClientMessage::Text(json!({"type":"start","version":1,"model":"test","sample_rate":16000,"format":"pcm_s16le"}).to_string())).await.unwrap();
         socket.next().await.unwrap().unwrap();
-        socket.send(ClientMessage::Binary(vec![0; 32008])).await.unwrap();
-        socket.send(ClientMessage::Text(r#"{"type":"finish"}"#.into())).await.unwrap();
+        socket
+            .send(ClientMessage::Binary(vec![0; 32008]))
+            .await
+            .unwrap();
+        socket
+            .send(ClientMessage::Text(r#"{"type":"finish"}"#.into()))
+            .await
+            .unwrap();
         let error = tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 if let ClientMessage::Text(text) = socket.next().await.unwrap().unwrap() {
@@ -3167,8 +3995,15 @@ mod tests {
         })
         .await
         .expect("the deadline waited for the stalled engine");
-        assert_eq!((error["code"].as_str(), error["terminal"].as_bool()), (Some("timeout"), Some(true)));
-        assert_eq!(server.sessions.available_permits() + 1, capacity, "the stalled work let go of its permit");
+        assert_eq!(
+            (error["code"].as_str(), error["terminal"].as_bool()),
+            (Some("timeout"), Some(true))
+        );
+        assert_eq!(
+            server.sessions.available_permits() + 1,
+            capacity,
+            "the stalled work let go of its permit"
+        );
         *gate.0.lock().unwrap() = true;
         gate.1.notify_all();
         tokio::time::timeout(Duration::from_secs(5), async {
@@ -3188,7 +4023,13 @@ mod tests {
             fn language(&self, _: Option<&str>) -> crate::Result<Option<String>> {
                 Ok(None)
             }
-            fn transcribe(&mut self, _: &[f32], _: Option<&str>, _: &str, cancel: &AtomicBool) -> crate::Result<Transcript> {
+            fn transcribe(
+                &mut self,
+                _: &[f32],
+                _: Option<&str>,
+                _: &str,
+                cancel: &AtomicBool,
+            ) -> crate::Result<Transcript> {
                 self.0.notify_one();
                 while !cancel.load(Ordering::Relaxed) {
                     std::thread::sleep(Duration::from_millis(1));
@@ -3198,14 +4039,25 @@ mod tests {
         }
         let started = Arc::new(tokio::sync::Notify::new());
         let server = AsrServer::new("test".into(), Blocks(started.clone()));
-        let Backend::Cohort { mux, .. } = &server.backend else { panic!("cohort") };
+        let Backend::Cohort { mux, .. } = &server.backend else {
+            panic!("cohort")
+        };
         let cancel = Arc::new(AtomicBool::new(false));
-        let mut held = vec![mux.submit(vec![0.0; 8000], None, String::new(), cancel.clone()).unwrap()];
-        tokio::time::timeout(Duration::from_secs(5), started.notified()).await.unwrap();
+        let mut held = vec![mux
+            .submit(vec![0.0; 8000], None, String::new(), cancel.clone())
+            .unwrap()];
+        tokio::time::timeout(Duration::from_secs(5), started.notified())
+            .await
+            .unwrap();
         while let Ok(reply) = mux.submit(vec![0.0; 8000], None, String::new(), cancel.clone()) {
             held.push(reply);
         }
-        let response = server.clone().router(false).oneshot(request("test", "json")).await.unwrap();
+        let response = server
+            .clone()
+            .router(false)
+            .oneshot(request("test", "json"))
+            .await
+            .unwrap();
         assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(response.headers()[axum::http::header::RETRY_AFTER], "1");
         cancel.store(true, Ordering::Relaxed);
@@ -3214,21 +4066,33 @@ mod tests {
     #[tokio::test]
     async fn health_and_admission_follow_shutdown_and_engine_exit() {
         let health = |app: Router| async move {
-            app.oneshot(Request::get("/health").body(Body::empty()).unwrap()).await.unwrap().status()
+            app.oneshot(Request::get("/health").body(Body::empty()).unwrap())
+                .await
+                .unwrap()
+                .status()
         };
         let server = AsrServer::new("test".into(), Fake);
         let app = server.clone().router(true);
         assert_eq!(health(app.clone()).await, StatusCode::OK);
         server.begin_shutdown();
         assert_eq!(health(app.clone()).await, StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(app.oneshot(request("test", "json")).await.unwrap().status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            app.oneshot(request("test", "json")).await.unwrap().status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
 
         struct Crashes;
         impl Transcriber for Crashes {
             fn language(&self, _: Option<&str>) -> crate::Result<Option<String>> {
                 Ok(None)
             }
-            fn transcribe(&mut self, _: &[f32], _: Option<&str>, _: &str, _: &AtomicBool) -> crate::Result<Transcript> {
+            fn transcribe(
+                &mut self,
+                _: &[f32],
+                _: Option<&str>,
+                _: &str,
+                _: &AtomicBool,
+            ) -> crate::Result<Transcript> {
                 panic!("engine worker exits");
             }
         }
@@ -3248,20 +4112,31 @@ mod tests {
     #[tokio::test]
     async fn wav_at_48k_is_resampled() {
         let app = AsrServer::new("test".into(), Fake).router(false);
-        let response = app.oneshot(request_wav("test", "json", 48_000, 24_000)).await.unwrap();
+        let response = app
+            .oneshot(request_wav("test", "json", 48_000, 24_000))
+            .await
+            .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
     }
 
-
-    type ClientSocket = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+    type ClientSocket = tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >;
 
     /// The next text event, or `{"type":"close","code":..}`; pings and pongs skipped.
     async fn next_event(socket: &mut ClientSocket) -> serde_json::Value {
         use tokio_tungstenite::tungstenite::Message as ClientMessage;
         loop {
-            match tokio::time::timeout(Duration::from_secs(5), socket.next()).await.unwrap().unwrap().unwrap() {
+            match tokio::time::timeout(Duration::from_secs(5), socket.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap()
+            {
                 ClientMessage::Text(text) => return serde_json::from_str(&text).unwrap(),
-                ClientMessage::Close(frame) => return json!({"type":"close","code":u16::from(frame.unwrap().code)}),
+                ClientMessage::Close(frame) => {
+                    return json!({"type":"close","code":u16::from(frame.unwrap().code)})
+                }
                 _ => {}
             }
         }
@@ -3275,9 +4150,18 @@ mod tests {
             fn language(&self, _: Option<&str>) -> crate::Result<Option<String>> {
                 Ok(None)
             }
-            fn transcribe(&mut self, samples: &[f32], _: Option<&str>, _: &str, _: &AtomicBool) -> crate::Result<Transcript> {
+            fn transcribe(
+                &mut self,
+                samples: &[f32],
+                _: Option<&str>,
+                _: &str,
+                _: &AtomicBool,
+            ) -> crate::Result<Transcript> {
                 self.0.lock().unwrap().push(samples.len());
-                Ok(Transcript { text: "hello".into(), language: None })
+                Ok(Transcript {
+                    text: "hello".into(),
+                    language: None,
+                })
             }
         }
         let lengths = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -3291,25 +4175,44 @@ mod tests {
         let (mut socket, _) = connect_async(&url).await.unwrap();
         socket.send(ClientMessage::Text(json!({"type":"start","version":1,"model":"test","sample_rate":48000,"format":"pcm_s16le","deltas":true}).to_string())).await.unwrap();
         let ready = next_event(&mut socket).await;
-        assert_eq!((ready["type"].as_str(), ready["sample_rate"].as_u64(), ready["credit_samples"].as_u64()), (Some("ready"), Some(48_000), Some(48_000)));
+        assert_eq!(
+            (
+                ready["type"].as_str(),
+                ready["sample_rate"].as_u64(),
+                ready["credit_samples"].as_u64()
+            ),
+            (Some("ready"), Some(48_000), Some(48_000))
+        );
         for sequence in 0u64..3 {
             let mut audio = sequence.to_le_bytes().to_vec();
             audio.resize(32_008, 0);
             socket.send(ClientMessage::Binary(audio)).await.unwrap();
         }
-        socket.send(ClientMessage::Text(r#"{"type":"finish"}"#.into())).await.unwrap();
+        socket
+            .send(ClientMessage::Text(r#"{"type":"finish"}"#.into()))
+            .await
+            .unwrap();
         let mut events = Vec::new();
         loop {
             let event = next_event(&mut socket).await;
             if event["type"] == "credit" {
                 continue;
             }
-            events.push((event["type"].as_str().unwrap().to_owned(), event["text"].as_str().unwrap_or("").to_owned()));
+            events.push((
+                event["type"].as_str().unwrap().to_owned(),
+                event["text"].as_str().unwrap_or("").to_owned(),
+            ));
             if event["type"] == "final" {
                 break;
             }
         }
-        assert_eq!(events, [("delta".to_owned(), "hello".to_owned()), ("final".to_owned(), "hello".to_owned())]);
+        assert_eq!(
+            events,
+            [
+                ("delta".to_owned(), "hello".to_owned()),
+                ("final".to_owned(), "hello".to_owned())
+            ]
+        );
         assert_eq!(*lengths.lock().unwrap(), [16_000]);
 
         let (mut socket, _) = connect_async(&url).await.unwrap();
@@ -3317,15 +4220,29 @@ mod tests {
         assert_eq!(next_event(&mut socket).await["type"], "ready");
         server.begin_shutdown();
         let error = next_event(&mut socket).await;
-        assert_eq!((error["type"].as_str(), error["message"].as_str(), error["terminal"].as_bool()), (Some("error"), Some(SHUTTING_DOWN), Some(true)));
-        assert_eq!(next_event(&mut socket).await, json!({"type":"close","code":1001}));
+        assert_eq!(
+            (
+                error["type"].as_str(),
+                error["message"].as_str(),
+                error["terminal"].as_bool()
+            ),
+            (Some("error"), Some(SHUTTING_DOWN), Some(true))
+        );
+        assert_eq!(
+            next_event(&mut socket).await,
+            json!({"type":"close","code":1001})
+        );
         match connect_async(&url).await {
-            Err(tokio_tungstenite::tungstenite::Error::Http(response)) => assert_eq!(response.status(), 503),
-            other => panic!("a new session after shutdown must be refused: {:?}", other.map(|_| ())),
+            Err(tokio_tungstenite::tungstenite::Error::Http(response)) => {
+                assert_eq!(response.status(), 503)
+            }
+            other => panic!(
+                "a new session after shutdown must be refused: {:?}",
+                other.map(|_| ())
+            ),
         }
         task.abort();
     }
-
 
     /// Numbers each transcription (`seg0`, `seg1`, ...); `gate` holds every call until opened.
     struct Numbered {
@@ -3336,7 +4253,13 @@ mod tests {
         fn language(&self, _: Option<&str>) -> crate::Result<Option<String>> {
             Ok(None)
         }
-        fn transcribe(&mut self, samples: &[f32], _: Option<&str>, _: &str, _: &AtomicBool) -> crate::Result<Transcript> {
+        fn transcribe(
+            &mut self,
+            samples: &[f32],
+            _: Option<&str>,
+            _: &str,
+            _: &AtomicBool,
+        ) -> crate::Result<Transcript> {
             assert!(samples.len() >= 8_000 && samples.len() <= MAX_SAMPLES);
             let (open, wake) = &*self.gate;
             let mut open = open.lock().unwrap();
@@ -3344,20 +4267,35 @@ mod tests {
                 open = wake.wait(open).unwrap();
             }
             let n = self.calls.fetch_add(1, Ordering::Relaxed);
-            Ok(Transcript { text: format!("seg{n}"), language: None })
+            Ok(Transcript {
+                text: format!("seg{n}"),
+                language: None,
+            })
         }
     }
 
     fn numbered(open: bool) -> (Numbered, Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>) {
         let gate = Arc::new((std::sync::Mutex::new(open), std::sync::Condvar::new()));
-        (Numbered { calls: Default::default(), gate: gate.clone() }, gate)
+        (
+            Numbered {
+                calls: Default::default(),
+                gate: gate.clone(),
+            },
+            gate,
+        )
     }
 
     fn tone_or_silence(spans: &[(f32, bool)]) -> Vec<f32> {
         spans
             .iter()
             .flat_map(|&(seconds, tone)| {
-                (0..(seconds * 16_000.0) as usize).map(move |i| if tone { crate::asr::endpoint::speechlike(i) } else { 0.0 })
+                (0..(seconds * 16_000.0) as usize).map(move |i| {
+                    if tone {
+                        crate::asr::endpoint::speechlike(i)
+                    } else {
+                        0.0
+                    }
+                })
             })
             .collect()
     }
@@ -3367,15 +4305,25 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let app = AsrServer::new("test".into(), engine).router(true);
         let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        (format!("ws://{address}/v1/audio/transcriptions/stream"), task)
+        (
+            format!("ws://{address}/v1/audio/transcriptions/stream"),
+            task,
+        )
     }
 
     /// Streams `audio` under credit, then `finish`; every event after `ready` until the close.
     /// `stall` (ms) reports how long the client last waited at zero credit with audio left.
-    async fn run_continuous(url: &str, start: serde_json::Value, audio: &[f32]) -> (serde_json::Value, Vec<serde_json::Value>) {
+    async fn run_continuous(
+        url: &str,
+        start: serde_json::Value,
+        audio: &[f32],
+    ) -> (serde_json::Value, Vec<serde_json::Value>) {
         use tokio_tungstenite::{connect_async, tungstenite::Message as ClientMessage};
         let (mut socket, _) = connect_async(url).await.unwrap();
-        socket.send(ClientMessage::Text(start.to_string())).await.unwrap();
+        socket
+            .send(ClientMessage::Text(start.to_string()))
+            .await
+            .unwrap();
         let ready = next_event(&mut socket).await;
         let mut credit = ready["credit_samples"].as_u64().unwrap() as usize;
         let pcm: Vec<i16> = audio.iter().map(|x| (x * 32767.0) as i16).collect();
@@ -3396,7 +4344,10 @@ mod tests {
             socket.send(ClientMessage::Binary(frame)).await.unwrap();
             (sent, sequence, credit) = (sent + n, sequence + 1, credit - n);
         }
-        socket.send(ClientMessage::Text(r#"{"type":"finish"}"#.into())).await.unwrap();
+        socket
+            .send(ClientMessage::Text(r#"{"type":"finish"}"#.into()))
+            .await
+            .unwrap();
         loop {
             let event = next_event(&mut socket).await;
             if event["type"] == "close" {
@@ -3420,20 +4371,41 @@ mod tests {
         let spans: Vec<_> = (0..7).flat_map(|_| [(8.0, true), (2.0, false)]).collect();
         let start = json!({"type":"start","version":1,"model":"test","sample_rate":16000,"format":"pcm_s16le","mode":"continuous","deltas":true});
         let (ready, events) = run_continuous(&url, start, &tone_or_silence(&spans)).await;
-        assert_eq!((ready["mode"].as_str(), ready["min_silence_ms"].as_u64(), ready["max_audio_samples"].is_null()), (Some("continuous"), Some(600), true));
+        assert_eq!(
+            (
+                ready["mode"].as_str(),
+                ready["min_silence_ms"].as_u64(),
+                ready["max_audio_samples"].is_null()
+            ),
+            (Some("continuous"), Some(600), true)
+        );
         let finals = finals(&events);
         assert_eq!(finals.len(), 7);
         for (i, f) in finals.iter().enumerate() {
-            assert_eq!((f["segment"].as_u64(), f["text"].as_str()), (Some(i as u64), Some(format!("seg{i}").as_str())));
-            let (start_ms, end_ms) = (f["start_ms"].as_u64().unwrap(), f["end_ms"].as_u64().unwrap());
-            assert!(start_ms + 200 >= i as u64 * 10_000 && end_ms <= i as u64 * 10_000 + 8_300, "{f}");
+            assert_eq!(
+                (f["segment"].as_u64(), f["text"].as_str()),
+                (Some(i as u64), Some(format!("seg{i}").as_str()))
+            );
+            let (start_ms, end_ms) = (
+                f["start_ms"].as_u64().unwrap(),
+                f["end_ms"].as_u64().unwrap(),
+            );
+            assert!(
+                start_ms + 200 >= i as u64 * 10_000 && end_ms <= i as u64 * 10_000 + 8_300,
+                "{f}"
+            );
         }
-        assert!(finals.windows(2).all(|w| w[0]["end_ms"].as_u64() <= w[1]["start_ms"].as_u64()));
+        assert!(finals
+            .windows(2)
+            .all(|w| w[0]["end_ms"].as_u64() <= w[1]["start_ms"].as_u64()));
         // Every final is preceded by its whole text as a delta (the cohort route has no token deltas).
         let deltas = events.iter().filter(|e| e["type"] == "delta").count();
         assert_eq!(deltas, 7);
         let n = events.len();
-        assert_eq!((&events[n - 2]["type"], &events[n - 2]["segments"]), (&json!("done"), &json!(7)));
+        assert_eq!(
+            (&events[n - 2]["type"], &events[n - 2]["segments"]),
+            (&json!("done"), &json!(7))
+        );
         assert_eq!(events[n - 1], json!({"type":"close","code":1000}));
         task.abort();
     }
@@ -3443,14 +4415,23 @@ mod tests {
         let (engine, _) = numbered(true);
         let (url, task) = continuous_server(engine).await;
         let start = json!({"type":"start","version":1,"model":"test","sample_rate":16000,"format":"pcm_s16le","mode":"continuous","max_segment_ms":20000});
-        let (_, events) = run_continuous(&url, start.clone(), &tone_or_silence(&[(60.0, true)])).await;
+        let (_, events) =
+            run_continuous(&url, start.clone(), &tone_or_silence(&[(60.0, true)])).await;
         let finals = finals(&events);
         assert!(finals.len() >= 3);
-        assert!(finals.iter().all(|f| f["end_ms"].as_u64().unwrap() - f["start_ms"].as_u64().unwrap() <= 20_000));
+        assert!(finals
+            .iter()
+            .all(|f| f["end_ms"].as_u64().unwrap() - f["start_ms"].as_u64().unwrap() <= 20_000));
         assert_eq!(finals.last().unwrap()["end_ms"].as_u64(), Some(60_000));
 
         let (_, events) = run_continuous(&url, start, &tone_or_silence(&[(10.0, false)])).await;
-        assert_eq!(events, [json!({"type":"done","segments":0}), json!({"type":"close","code":1000})]);
+        assert_eq!(
+            events,
+            [
+                json!({"type":"done","segments":0}),
+                json!({"type":"close","code":1000})
+            ]
+        );
         task.abort();
     }
 
@@ -3460,11 +4441,22 @@ mod tests {
         let (engine, gate) = numbered(false);
         let (url, task) = continuous_server(engine).await;
         let (mut socket, _) = connect_async(&url).await.unwrap();
-        socket.send(ClientMessage::Text(json!({"type":"start","version":1,"model":"test","sample_rate":16000,
-            "format":"pcm_s16le","mode":"continuous"}).to_string())).await.unwrap();
-        let mut credit = next_event(&mut socket).await["credit_samples"].as_u64().unwrap() as usize;
+        socket
+            .send(ClientMessage::Text(
+                json!({"type":"start","version":1,"model":"test","sample_rate":16000,
+            "format":"pcm_s16le","mode":"continuous"})
+                .to_string(),
+            ))
+            .await
+            .unwrap();
+        let mut credit = next_event(&mut socket).await["credit_samples"]
+            .as_u64()
+            .unwrap() as usize;
         let spans: Vec<_> = (0..6).flat_map(|_| [(1.5, true), (1.0, false)]).collect();
-        let pcm: Vec<i16> = tone_or_silence(&spans).iter().map(|x| (x * 32767.0) as i16).collect();
+        let pcm: Vec<i16> = tone_or_silence(&spans)
+            .iter()
+            .map(|x| (x * 32767.0) as i16)
+            .collect();
         let (mut sent, mut sequence) = (0usize, 0u64);
         // With the engine held, credit stops once two segments wait; the stream cannot finish.
         let starved = loop {
@@ -3499,7 +4491,10 @@ mod tests {
                 socket.send(ClientMessage::Binary(frame)).await.unwrap();
                 (sent, sequence, credit) = (sent + n, sequence + 1, credit - n);
                 if sent == pcm.len() {
-                    socket.send(ClientMessage::Text(r#"{"type":"finish"}"#.into())).await.unwrap();
+                    socket
+                        .send(ClientMessage::Text(r#"{"type":"finish"}"#.into()))
+                        .await
+                        .unwrap();
                 }
                 continue;
             }
@@ -3521,13 +4516,28 @@ mod tests {
         let (url, task) = continuous_server(engine).await;
         use tokio_tungstenite::{connect_async, tungstenite::Message as ClientMessage};
         for (start, expect) in [
-            (json!({"type":"start","version":1,"model":"test","sample_rate":16000,"format":"pcm_s16le"}), "ready"),
-            (json!({"type":"start","version":1,"model":"test","sample_rate":16000,"format":"pcm_s16le","mode":"continuous","min_silence_ms":100}), "error"),
-            (json!({"type":"start","version":1,"model":"test","sample_rate":16000,"format":"pcm_s16le","mode":"continuous","max_segment_ms":40000}), "error"),
-            (json!({"type":"start","version":1,"model":"test","sample_rate":16000,"format":"pcm_s16le","mode":"batch"}), "error"),
+            (
+                json!({"type":"start","version":1,"model":"test","sample_rate":16000,"format":"pcm_s16le"}),
+                "ready",
+            ),
+            (
+                json!({"type":"start","version":1,"model":"test","sample_rate":16000,"format":"pcm_s16le","mode":"continuous","min_silence_ms":100}),
+                "error",
+            ),
+            (
+                json!({"type":"start","version":1,"model":"test","sample_rate":16000,"format":"pcm_s16le","mode":"continuous","max_segment_ms":40000}),
+                "error",
+            ),
+            (
+                json!({"type":"start","version":1,"model":"test","sample_rate":16000,"format":"pcm_s16le","mode":"batch"}),
+                "error",
+            ),
         ] {
             let (mut socket, _) = connect_async(&url).await.unwrap();
-            socket.send(ClientMessage::Text(start.to_string())).await.unwrap();
+            socket
+                .send(ClientMessage::Text(start.to_string()))
+                .await
+                .unwrap();
             let event = next_event(&mut socket).await;
             assert_eq!(event["type"], expect, "{start}");
             if expect == "ready" {
@@ -3540,20 +4550,54 @@ mod tests {
     #[cfg(feature = "cuda")]
     #[tokio::test]
     async fn serve_hosts_packet_models_beside_the_registry() {
-        let backend: Arc<dyn crate::device::Backend> = Arc::new(crate::device::cpu::CpuBackend::new(1));
+        let backend: Arc<dyn crate::device::Backend> =
+            Arc::new(crate::device::cpu::CpuBackend::new(1));
         let execset = Arc::new(crate::exec::ExecutorSet::bringup(backend).unwrap());
-        let state = Arc::new(crate::serve::AppState::new(crate::orch::Registry::new(), execset));
+        let state = Arc::new(crate::serve::AppState::new(
+            crate::orch::Registry::new(),
+            execset,
+        ));
         host_packet_model(&state, "packet-host-test".into(), Box::new(Fake));
         assert!(packet_model_names().contains(&"packet-host-test".to_owned()));
         let app = AsrServer::for_serve(Arc::clone(&state)).transcription_router(true);
-        let response = app.clone().oneshot(request("packet-host-test", "text")).await.unwrap();
+        let response = app
+            .clone()
+            .oneshot(request("packet-host-test", "text"))
+            .await
+            .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(&response.into_body().collect().await.unwrap().to_bytes()[..], b"hello");
-        assert_eq!(state.model_metrics("packet-host-test").serving.asr.completed.load(Ordering::Relaxed), 1);
-        assert_eq!(app.oneshot(request("packet-host-missing", "text")).await.unwrap().status(), StatusCode::NOT_FOUND);
-        let list = crate::serve::models::list_models(State(Arc::clone(&state))).await.0;
-        let card = list.data.iter().find(|c| c.id == "packet-host-test").unwrap();
-        assert_eq!(card.x_plow_endpoints, ["audio/transcriptions", "audio/transcriptions/stream"]);
+        assert_eq!(
+            &response.into_body().collect().await.unwrap().to_bytes()[..],
+            b"hello"
+        );
+        assert_eq!(
+            state
+                .model_metrics("packet-host-test")
+                .serving
+                .asr
+                .completed
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            app.oneshot(request("packet-host-missing", "text"))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::NOT_FOUND
+        );
+        let list = crate::serve::models::list_models(State(Arc::clone(&state)))
+            .await
+            .0;
+        let card = list
+            .data
+            .iter()
+            .find(|c| c.id == "packet-host-test")
+            .unwrap();
+        assert_eq!(
+            card.x_plow_endpoints,
+            ["audio/transcriptions", "audio/transcriptions/stream"]
+        );
         assert!(!dead_encoders().contains(&"packet-host-test".to_owned()));
         assert!(packet_models_idle());
     }
@@ -3563,28 +4607,66 @@ mod tests {
     #[cfg(feature = "cuda")]
     #[tokio::test]
     async fn text_routes_refuse_a_model_that_does_not_serve_them() {
-        let backend: Arc<dyn crate::device::Backend> = Arc::new(crate::device::cpu::CpuBackend::new(1));
+        let backend: Arc<dyn crate::device::Backend> =
+            Arc::new(crate::device::cpu::CpuBackend::new(1));
         let execset = Arc::new(crate::exec::ExecutorSet::bringup(backend).unwrap());
-        let state = Arc::new(crate::serve::AppState::new(crate::orch::Registry::new(), execset));
+        let state = Arc::new(crate::serve::AppState::new(
+            crate::orch::Registry::new(),
+            execset,
+        ));
         host_packet_model(&state, "packet-route-test".into(), Box::new(Fake));
         let app = crate::serve::app(Arc::clone(&state));
         let post = |path: &str, body: serde_json::Value| {
-            Request::post(path).header("content-type", "application/json").body(Body::from(body.to_string())).unwrap()
+            Request::post(path)
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap()
         };
         for (path, body) in [
-            ("/v1/completions", json!({"model": "packet-route-test", "prompt": "<bos>The capital of France is", "max_tokens": 3})),
-            ("/v1/chat/completions", json!({"model": "packet-route-test", "messages": [{"role": "user", "content": "hi"}]})),
+            (
+                "/v1/completions",
+                json!({"model": "packet-route-test", "prompt": "<bos>The capital of France is", "max_tokens": 3}),
+            ),
+            (
+                "/v1/chat/completions",
+                json!({"model": "packet-route-test", "messages": [{"role": "user", "content": "hi"}]}),
+            ),
         ] {
             let response = app.clone().oneshot(post(path, body)).await.unwrap();
             assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{path}");
-            let err: serde_json::Value = serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
-            assert_eq!(err["error"]["code"], "model_not_supported_for_endpoint", "{path}");
+            let err: serde_json::Value =
+                serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                    .unwrap();
+            assert_eq!(
+                err["error"]["code"], "model_not_supported_for_endpoint",
+                "{path}"
+            );
             assert_eq!(err["error"]["param"], "model");
-            assert!(err["error"]["message"].as_str().unwrap().contains("/v1/audio/transcriptions"), "{err}");
+            assert!(
+                err["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("/v1/audio/transcriptions"),
+                "{err}"
+            );
         }
-        assert_eq!(state.model_metrics("packet-route-test").serving.asr.completed.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            state
+                .model_metrics("packet-route-test")
+                .serving
+                .asr
+                .completed
+                .load(Ordering::Relaxed),
+            0
+        );
         // An unknown model is not refused here: the handler's own 404 answers it.
-        let unknown = app.oneshot(post("/v1/completions", json!({"model": "nope", "prompt": "x"}))).await.unwrap();
+        let unknown = app
+            .oneshot(post(
+                "/v1/completions",
+                json!({"model": "nope", "prompt": "x"}),
+            ))
+            .await
+            .unwrap();
         assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
     }
 }

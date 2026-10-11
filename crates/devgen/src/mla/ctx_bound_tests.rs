@@ -263,7 +263,11 @@ fn narrowing_to_the_declared_ceiling_is_the_identity() {
     let _guard = crate::test_env::env_guard();
     let e = fixture();
     assert_same(&narrow(&e.live, LIVE, LIVE), &e.live, "81920 -> 81920");
-    assert_same(&narrow(&e.ceiling, CEILING, CEILING), &e.ceiling, "1M -> 1M");
+    assert_same(
+        &narrow(&e.ceiling, CEILING, CEILING),
+        &e.ceiling,
+        "1M -> 1M",
+    );
     // The packet BYTES, so "nothing moved" is not a claim about the three tables
     // this file happens to look at: the emitter is untouched by this change, so
     // two emits of the recipe at the old baked max_ctx hash the same and every
@@ -293,7 +297,11 @@ fn the_ctx_scaled_tensor_set_is_exactly_what_moves_with_ctx() {
         let scaling = ctx_bound::tensor_scaling(n1);
         if b1 == b2 {
             assert_ne!(scaling, Scaling::Linear, "`{n1}` is inert but classified");
-            assert_ne!(scaling, Scaling::IndexerBlock16, "`{n1}` is inert but classified");
+            assert_ne!(
+                scaling,
+                Scaling::IndexerBlock16,
+                "`{n1}` is inert but classified"
+            );
             assert_ne!(scaling, Scaling::Rope, "`{n1}` is inert but classified");
             continue;
         }
@@ -303,7 +311,10 @@ fn the_ctx_scaled_tensor_set_is_exactly_what_moves_with_ctx() {
             "`{n1}` moves with ctx but not linearly"
         );
         assert!(
-            matches!(scaling, Scaling::Linear | Scaling::IndexerBlock16 | Scaling::Rope),
+            matches!(
+                scaling,
+                Scaling::Linear | Scaling::IndexerBlock16 | Scaling::Rope
+            ),
             "`{n1}` moves with ctx and has no rule"
         );
         moved.push(n1.as_str());
@@ -343,7 +354,11 @@ fn the_ctx_derived_attention_constants_saturate_over_the_narrowable_range() {
         let ns = glm_nsplit(16_384, nh_l);
         let gf = glm_gf(16_384, nh_l);
         for ctx in [16_384u32, 32_768, 65_568, 81_920, 131_072, 1_048_576] {
-            assert_eq!(glm_nsplit(ctx, nh_l), ns, "nsplit moved at ctx {ctx}, nh_l {nh_l}");
+            assert_eq!(
+                glm_nsplit(ctx, nh_l),
+                ns,
+                "nsplit moved at ctx {ctx}, nh_l {nh_l}"
+            );
             assert_eq!(glm_gf(ctx, nh_l), gf, "GF moved at ctx {ctx}, nh_l {nh_l}");
         }
         // And the floor of that range is where `nsplit` stops being pinned: one

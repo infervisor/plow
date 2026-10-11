@@ -33,7 +33,12 @@ fn top_count(v: &Value, param: &'static str) -> Result<u8, Invalid> {
     v.as_u64()
         .filter(|&n| n <= u64::from(MAX_TOP_LOGPROBS))
         .map(|n| n as u8)
-        .ok_or_else(|| (format!("`{param}` must be an integer in 0..={MAX_TOP_LOGPROBS}"), param))
+        .ok_or_else(|| {
+            (
+                format!("`{param}` must be an integer in 0..={MAX_TOP_LOGPROBS}"),
+                param,
+            )
+        })
 }
 
 /// Chat: `logprobs` (bool) and `top_logprobs` (int, requires `logprobs: true`).
@@ -44,23 +49,40 @@ pub fn parse_chat(
 ) -> Result<Option<LogprobRequest>, Invalid> {
     let on = match logprobs.filter(|v| !v.is_null()) {
         None => false,
-        Some(v) => v.as_bool().ok_or_else(|| ("`logprobs` must be a boolean".to_string(), "logprobs"))?,
+        Some(v) => v
+            .as_bool()
+            .ok_or_else(|| ("`logprobs` must be a boolean".to_string(), "logprobs"))?,
     };
-    let top = top.filter(|v| !v.is_null()).map(|v| top_count(v, "top_logprobs")).transpose()?;
+    let top = top
+        .filter(|v| !v.is_null())
+        .map(|v| top_count(v, "top_logprobs"))
+        .transpose()?;
     if !on {
         if top.is_some_and(|n| n > 0) {
-            return Err(("`top_logprobs` requires `logprobs: true`".into(), "top_logprobs"));
+            return Err((
+                "`top_logprobs` requires `logprobs: true`".into(),
+                "top_logprobs",
+            ));
         }
         return Ok(None);
     }
-    Ok(Some(LogprobRequest { top: top.unwrap_or(0), raw_logits: mode_raw_logits(mode)? }))
+    Ok(Some(LogprobRequest {
+        top: top.unwrap_or(0),
+        raw_logits: mode_raw_logits(mode)?,
+    }))
 }
 
 /// Completions: `logprobs` is the number of alternatives (0 = the sampled token only).
-pub fn parse_completion(logprobs: Option<&Value>, mode: Option<&str>) -> Result<Option<LogprobRequest>, Invalid> {
+pub fn parse_completion(
+    logprobs: Option<&Value>,
+    mode: Option<&str>,
+) -> Result<Option<LogprobRequest>, Invalid> {
     match logprobs.filter(|v| !v.is_null()) {
         None => Ok(None),
-        Some(v) => Ok(Some(LogprobRequest { top: top_count(v, "logprobs")?, raw_logits: mode_raw_logits(mode)? })),
+        Some(v) => Ok(Some(LogprobRequest {
+            top: top_count(v, "logprobs")?,
+            raw_logits: mode_raw_logits(mode)?,
+        })),
     }
 }
 
@@ -112,7 +134,11 @@ pub fn chat_entry(fmt: &TokenText, id: u32, lp: &TokenLogprobs) -> ChatTokenLogp
             .iter()
             .map(|&(t, v)| {
                 let token = fmt.text(t);
-                ChatTopLogprob { bytes: token.as_bytes().to_vec(), token, logprob: v }
+                ChatTopLogprob {
+                    bytes: token.as_bytes().to_vec(),
+                    token,
+                    logprob: v,
+                }
             })
             .collect(),
     }
@@ -132,7 +158,12 @@ impl CompletionLogprobs {
     pub fn push(&mut self, fmt: &TokenText, id: u32, lp: &TokenLogprobs, offset: usize) {
         self.tokens.push(fmt.text(id));
         self.token_logprobs.push(lp.logprob);
-        self.top_logprobs.push(lp.top.iter().map(|&(t, v)| (fmt.text(t), Value::from(v))).collect());
+        self.top_logprobs.push(
+            lp.top
+                .iter()
+                .map(|&(t, v)| (fmt.text(t), Value::from(v)))
+                .collect(),
+        );
         self.text_offset.push(offset);
     }
 }
@@ -147,18 +178,27 @@ mod tests {
         assert_eq!(parse_chat(None, None, None), Ok(None));
         assert_eq!(
             parse_chat(Some(&json!(true)), Some(&json!(5)), None),
-            Ok(Some(LogprobRequest { top: 5, raw_logits: false }))
+            Ok(Some(LogprobRequest {
+                top: 5,
+                raw_logits: false
+            }))
         );
         assert_eq!(
             parse_chat(Some(&json!(true)), None, Some("raw_logits")),
-            Ok(Some(LogprobRequest { top: 0, raw_logits: true }))
+            Ok(Some(LogprobRequest {
+                top: 0,
+                raw_logits: true
+            }))
         );
         assert!(parse_chat(Some(&json!(false)), Some(&json!(3)), None).is_err());
         assert!(parse_chat(Some(&json!(true)), Some(&json!(21)), None).is_err());
         assert!(parse_chat(Some(&json!(true)), None, Some("processed")).is_err());
         assert_eq!(
             parse_completion(Some(&json!(2)), None),
-            Ok(Some(LogprobRequest { top: 2, raw_logits: false }))
+            Ok(Some(LogprobRequest {
+                top: 2,
+                raw_logits: false
+            }))
         );
         assert!(parse_completion(Some(&json!(true)), None).is_err());
     }

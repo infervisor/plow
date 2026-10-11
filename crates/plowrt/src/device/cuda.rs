@@ -320,9 +320,15 @@ static NEXT_CONTEXT_ID: AtomicU64 = AtomicU64::new(1);
 /// Captures hold their device's lock exclusively. One lock per device (its primary context, which
 /// every backend on it shares): a capture on one GPU never delays a synchronize on another.
 fn capture_exclusion(dev: CUdevice) -> Arc<parking_lot::RwLock<()>> {
-    static BY_DEVICE: std::sync::OnceLock<Mutex<FxHashMap<CUdevice, Arc<parking_lot::RwLock<()>>>>> =
-        std::sync::OnceLock::new();
-    BY_DEVICE.get_or_init(Default::default).lock().entry(dev).or_default().clone()
+    static BY_DEVICE: std::sync::OnceLock<
+        Mutex<FxHashMap<CUdevice, Arc<parking_lot::RwLock<()>>>>,
+    > = std::sync::OnceLock::new();
+    BY_DEVICE
+        .get_or_init(Default::default)
+        .lock()
+        .entry(dev)
+        .or_default()
+        .clone()
 }
 
 thread_local! {
@@ -792,7 +798,11 @@ impl CudaBackend {
                     (api.cuDeviceGetAttribute)(&mut v, ATTR_PAGEABLE_USES_HOST_PAGE_TABLES, dev);
                 rc == 0 && v == 1
             };
-            let pci_bdf = match (attr(ATTR_PCI_DOMAIN_ID, "pci"), attr(ATTR_PCI_BUS_ID, "pci"), attr(ATTR_PCI_DEVICE_ID, "pci")) {
+            let pci_bdf = match (
+                attr(ATTR_PCI_DOMAIN_ID, "pci"),
+                attr(ATTR_PCI_BUS_ID, "pci"),
+                attr(ATTR_PCI_DEVICE_ID, "pci"),
+            ) {
                 (Ok(d), Ok(b), Ok(s)) => Some(format!("{d:04x}:{b:02x}:{s:02x}.0")),
                 _ => None,
             };
@@ -1319,7 +1329,11 @@ impl CudaBackend {
         let attr = |id: i32| {
             let mut value = [0u8; 64];
             value[..4].copy_from_slice(&1i32.to_ne_bytes());
-            CUlaunchAttribute { id, pad: [0; 4], value }
+            CUlaunchAttribute {
+                id,
+                pad: [0; 4],
+                value,
+            }
         };
         let mut attrs = [attr(2), attr(5)];
         let config = CUlaunchConfig {
@@ -1356,9 +1370,8 @@ impl CudaBackend {
         )?;
         let name = std::ffi::CString::new(PDL_WAIT_MARKER).expect("no NUL");
         let (mut ptr, mut bytes): (CUdeviceptr, usize) = (0, 0);
-        let rc = unsafe {
-            (self.api.cuModuleGetGlobal_v2)(&mut ptr, &mut bytes, module, name.as_ptr())
-        };
+        let rc =
+            unsafe { (self.api.cuModuleGetGlobal_v2)(&mut ptr, &mut bytes, module, name.as_ptr()) };
         Ok(rc == 0)
     }
 
@@ -2018,7 +2031,11 @@ impl CudaBackend {
 /// pass-throughs; every entry re-binds the primary context (threads vary —
 /// the pool's pre-mapper thread calls in from its own thread).
 impl crate::memory::vmm::VmmOps for CudaBackend {
-    fn allocation_provenance(&self, va: u64, bytes: u64) -> Option<super::provenance::MemoryRegion> {
+    fn allocation_provenance(
+        &self,
+        va: u64,
+        bytes: u64,
+    ) -> Option<super::provenance::MemoryRegion> {
         self.vmm_provenance.lock().region(va, bytes)
     }
 
@@ -2407,7 +2424,10 @@ mod tests {
         let (a, b) = (super::capture_exclusion(0), super::capture_exclusion(1));
         assert!(std::sync::Arc::ptr_eq(&a, &super::capture_exclusion(0)));
         let capturing = b.write();
-        assert!(a.try_read().is_some(), "a capture on device 1 blocked a synchronize on device 0");
+        assert!(
+            a.try_read().is_some(),
+            "a capture on device 1 blocked a synchronize on device 0"
+        );
         assert!(super::capture_exclusion(1).try_read().is_none());
         drop(capturing);
     }

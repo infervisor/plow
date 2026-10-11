@@ -59,19 +59,26 @@ impl CutlassFp8 {
     /// `pins` = `<cubin sha256>:<host library sha256>`.
     pub(crate) fn load(be: &Arc<CudaBackend>, dir: &Path, pins: &str) -> Result<Arc<Self>> {
         let reject = |why: String| RuntimeError::Rejected(format!("CUTLASS FP8 decode: {why}"));
-        let (cubin_pin, host_pin) =
-            pins.split_once(':').ok_or_else(|| reject("expected <cubin sha256>:<host sha256>".into()))?;
+        let (cubin_pin, host_pin) = pins
+            .split_once(':')
+            .ok_or_else(|| reject("expected <cubin sha256>:<host sha256>".into()))?;
         let cubin = dir.join(CUBIN);
-        let image = std::fs::read(&cubin).map_err(|e| reject(format!("{}: {e}", cubin.display())))?;
+        let image =
+            std::fs::read(&cubin).map_err(|e| reject(format!("{}: {e}", cubin.display())))?;
         let host = dir.join(HOST_LIB);
-        let host_image = std::fs::read(&host).map_err(|e| reject(format!("{}: {e}", host.display())))?;
+        let host_image =
+            std::fs::read(&host).map_err(|e| reject(format!("{}: {e}", host.display())))?;
         for (path, bytes, pin) in [(&cubin, &image, cubin_pin), (&host, &host_image, host_pin)] {
             if plow_asset::decode_objects::image_sha256(bytes) != pin {
-                return Err(reject(format!("{} does not match its pinned sha256", path.display())));
+                return Err(reject(format!(
+                    "{} does not match its pinned sha256",
+                    path.display()
+                )));
             }
         }
         // SAFETY: the host library is a plain C ABI marshaller built from the same source.
-        let lib = unsafe { libloading::Library::new(&host) }.map_err(|e| reject(format!("{}: {e}", host.display())))?;
+        let lib = unsafe { libloading::Library::new(&host) }
+            .map_err(|e| reject(format!("{}: {e}", host.display())))?;
         // SAFETY: symbol type matches `plow_cutlass_fp8_prepare`.
         let prepare = *unsafe { lib.get::<PrepareFn>(b"plow_cutlass_fp8_prepare\0") }
             .map_err(|e| reject(format!("resolve prepare: {e}")))?;
@@ -90,7 +97,8 @@ impl CutlassFp8 {
         }
         let mut lib = lib;
         for cfg in 0..CONFIGS {
-            lib.functions[cfg] = be.get_function(&lib.module, &format!("plow_cutlass_fp8_{cfg}"))?;
+            lib.functions[cfg] =
+                be.get_function(&lib.module, &format!("plow_cutlass_fp8_{cfg}"))?;
             lib.params_bytes[cfg] = be
                 .module_global_u32(&lib.module, &format!("plow_cutlass_fp8_params_bytes_{cfg}"))?
                 .ok_or_else(|| reject(format!("cfg {cfg} params size missing")))?;
@@ -164,8 +172,13 @@ impl CutlassFp8 {
 impl Plan {
     pub(crate) fn run(&self, stream: &CudaStream) -> Result<()> {
         let mut args = [self.params.as_ptr() as *mut c_void];
-        self.lib
-            .be
-            .launch_kernel_grid(self.function, self.grid, self.block, self.smem, &mut args, Some(stream))
+        self.lib.be.launch_kernel_grid(
+            self.function,
+            self.grid,
+            self.block,
+            self.smem,
+            &mut args,
+            Some(stream),
+        )
     }
 }

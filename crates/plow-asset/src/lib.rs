@@ -16,8 +16,8 @@
 use serde::{Deserialize, Serialize};
 
 pub mod certificates;
-pub mod logical_effects;
 pub mod gemm_policy;
+pub mod logical_effects;
 
 /// The plowrt runtime contract a bundle emitted by this tree declares (`build.json`
 /// `runtime_requires.plowrt_contract`); plowrt refuses a bundle that declares a higher one.
@@ -706,21 +706,21 @@ pub mod fp8_m1_role;
 
 pub mod segment_roles;
 
-pub mod packed_prefill;
 pub mod kv_shared_tail;
+pub mod packed_prefill;
 
-pub mod packet_pipeline;
-pub mod speech_contract;
-pub mod multimodal;
-pub mod media_geometry;
 pub mod kv_ring;
-pub mod speech_fusion;
+pub mod media_geometry;
+pub mod multimodal;
+pub mod packet_pipeline;
 pub mod serve_manifest;
+pub mod speech_contract;
+pub mod speech_fusion;
 
 pub mod hetero;
 pub mod hetero_channel;
-pub mod token_batch;
 pub mod modular;
+pub mod token_batch;
 pub use modular::{
     ModularBlockKind, ModularBlockProg, ModularLeanCorrectness, ModularLeanPerformance,
     ModularLeanSummary, ModularPhase, ModularPipelineManifest, MODULAR_MANIFEST_SECTION,

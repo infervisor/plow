@@ -68,7 +68,10 @@ pub struct ReasoningTags {
 
 impl ReasoningTags {
     pub fn think() -> Self {
-        ReasoningTags { open: "<think>".into(), close: "</think>".into() }
+        ReasoningTags {
+            open: "<think>".into(),
+            close: "</think>".into(),
+        }
     }
 }
 
@@ -118,9 +121,13 @@ pub struct WeightPin {
 
 impl ServeManifest {
     pub fn parse(bytes: &[u8]) -> Result<Self, String> {
-        let m: ServeManifest = serde_json::from_slice(bytes).map_err(|e| format!("{SECTION}: {e}"))?;
+        let m: ServeManifest =
+            serde_json::from_slice(bytes).map_err(|e| format!("{SECTION}: {e}"))?;
         if m.version == 0 || m.version > VERSION {
-            return Err(format!("{SECTION}: version {} is not one this reader knows (<= {VERSION})", m.version));
+            return Err(format!(
+                "{SECTION}: version {} is not one this reader knows (<= {VERSION})",
+                m.version
+            ));
         }
         Ok(m)
     }
@@ -133,14 +140,16 @@ impl ServeManifest {
     /// `checkpoint_dir`, for the chat template and sampling defaults; `checkpoint_dir` for the stop
     /// set and KV geometry. No serve defaults and no weight pins.
     pub fn from_checkpoint(asset_dir: &Path, checkpoint_dir: &Path) -> Self {
-        let chat = find_chat_template(asset_dir).or_else(|| find_chat_template(checkpoint_dir)).map(|t| ChatSpec {
-            reasoning: think_tags_in(asset_dir, checkpoint_dir).then(ReasoningTags::think),
-            template: Some(t.text),
-            source: Some(t.source),
-            builtin: None,
-            bos_token: t.bos_token,
-            eos_token: t.eos_token,
-        });
+        let chat = find_chat_template(asset_dir)
+            .or_else(|| find_chat_template(checkpoint_dir))
+            .map(|t| ChatSpec {
+                reasoning: think_tags_in(asset_dir, checkpoint_dir).then(ReasoningTags::think),
+                template: Some(t.text),
+                source: Some(t.source),
+                builtin: None,
+                bos_token: t.bos_token,
+                eos_token: t.eos_token,
+            });
         let mut stop_token_ids = read_eos_ids(checkpoint_dir);
         stop_token_ids.extend(chat_stop_ids(checkpoint_dir, &stop_token_ids));
         stop_token_ids.sort_unstable();
@@ -160,32 +169,52 @@ impl ServeManifest {
 /// Whether the tokenizer declares `<think>` and `</think>` as added tokens: the checkpoint frames
 /// reasoning with them (Qwen3, GLM, DeepSeek-R1).
 fn think_tags_in(asset_dir: &Path, checkpoint_dir: &Path) -> bool {
-    [asset_dir.join("tokenizer.json"), asset_dir.join("checkpoint").join("tokenizer.json"), checkpoint_dir.join("tokenizer.json")]
-        .iter()
-        .find_map(|p| std::fs::read(p).ok())
-        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
-        .and_then(|v| {
-            let added = v.get("added_tokens")?.as_array()?;
-            let has = |t: &str| added.iter().any(|e| e.get("content").and_then(|c| c.as_str()) == Some(t));
-            Some(has("<think>") && has("</think>"))
-        })
-        .unwrap_or(false)
+    [
+        asset_dir.join("tokenizer.json"),
+        asset_dir.join("checkpoint").join("tokenizer.json"),
+        checkpoint_dir.join("tokenizer.json"),
+    ]
+    .iter()
+    .find_map(|p| std::fs::read(p).ok())
+    .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+    .and_then(|v| {
+        let added = v.get("added_tokens")?.as_array()?;
+        let has = |t: &str| {
+            added
+                .iter()
+                .any(|e| e.get("content").and_then(|c| c.as_str()) == Some(t))
+        };
+        Some(has("<think>") && has("</think>"))
+    })
+    .unwrap_or(false)
 }
 
 fn read_json(p: &Path) -> Option<serde_json::Value> {
-    std::fs::read(p).ok().and_then(|b| serde_json::from_slice(&b).ok())
+    std::fs::read(p)
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
 }
 
 /// `generation_config.json` from `dir` or `dir/checkpoint`.
 pub fn read_sampling(dir: &Path) -> Option<SamplingDefaults> {
-    let v = [dir.join("generation_config.json"), dir.join("checkpoint").join("generation_config.json")]
-        .iter()
-        .find_map(|p| read_json(p))?;
-    let f = |k: &str| v.get(k).and_then(serde_json::Value::as_f64).map(|x| x as f32);
+    let v = [
+        dir.join("generation_config.json"),
+        dir.join("checkpoint").join("generation_config.json"),
+    ]
+    .iter()
+    .find_map(|p| read_json(p))?;
+    let f = |k: &str| {
+        v.get(k)
+            .and_then(serde_json::Value::as_f64)
+            .map(|x| x as f32)
+    };
     let s = SamplingDefaults {
         temperature: f("temperature"),
         top_p: f("top_p"),
-        top_k: v.get("top_k").and_then(serde_json::Value::as_u64).map(|k| k as u32),
+        top_k: v
+            .get("top_k")
+            .and_then(serde_json::Value::as_u64)
+            .map(|k| k as u32),
         repetition_penalty: f("repetition_penalty"),
     };
     (s != SamplingDefaults::default()).then_some(s)
@@ -205,7 +234,10 @@ pub fn read_eos_ids(dir: &Path) -> Vec<u32> {
                 }
             }
             Some(serde_json::Value::Array(a)) => {
-                let ids: Vec<u32> = a.iter().filter_map(|x| x.as_u64().map(|v| v as u32)).collect();
+                let ids: Vec<u32> = a
+                    .iter()
+                    .filter_map(|x| x.as_u64().map(|v| v as u32))
+                    .collect();
                 if !ids.is_empty() {
                     return ids;
                 }
@@ -298,7 +330,9 @@ pub struct FoundTemplate {
 }
 
 fn non_empty(p: &Path) -> Option<String> {
-    std::fs::read_to_string(p).ok().filter(|s| !s.trim().is_empty())
+    std::fs::read_to_string(p)
+        .ok()
+        .filter(|s| !s.trim().is_empty())
 }
 
 /// The template text plus the special tokens, from `dir` or `dir/checkpoint`. HF puts the template
@@ -335,8 +369,14 @@ pub fn find_chat_template(dir: &Path) -> Option<FoundTemplate> {
             return Some(found(text, json_path.display().to_string()));
         }
         let entry = cfg.as_ref().and_then(|c| c.get("chat_template"));
-        if let Some(text) = entry.and_then(|v| v.as_str()).filter(|s| !s.trim().is_empty()) {
-            return Some(found(text.to_string(), format!("{}#chat_template", cfg_path.display())));
+        if let Some(text) = entry
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.trim().is_empty())
+        {
+            return Some(found(
+                text.to_string(),
+                format!("{}#chat_template", cfg_path.display()),
+            ));
         }
         if let Some((name, text)) = entry.and_then(|v| v.as_array()).and_then(|entries| {
             let pick = entries
@@ -344,10 +384,17 @@ pub fn find_chat_template(dir: &Path) -> Option<FoundTemplate> {
                 .find(|e| e.get("name").and_then(|n| n.as_str()) == Some("default"))
                 .or_else(|| entries.first())?;
             let text = pick.get("template")?.as_str()?.to_owned();
-            let name = pick.get("name").and_then(|n| n.as_str()).unwrap_or("default").to_owned();
+            let name = pick
+                .get("name")
+                .and_then(|n| n.as_str())
+                .unwrap_or("default")
+                .to_owned();
             (!text.trim().is_empty()).then_some((name, text))
         }) {
-            return Some(found(text, format!("{}#chat_template[{name}]", cfg_path.display())));
+            return Some(found(
+                text,
+                format!("{}#chat_template[{name}]", cfg_path.display()),
+            ));
         }
         let tdir = base.join("chat_templates");
         let named = tdir.join("default.jinja");
@@ -378,7 +425,10 @@ pub fn pin_shard(path: &Path) -> Result<WeightPin, String> {
     f.read_exact(&mut len).map_err(err)?;
     let n = u64::from_le_bytes(len);
     if n > bytes.saturating_sub(8) || n > 512 << 20 {
-        return Err(format!("{}: safetensors header length {n} is out of range", path.display()));
+        return Err(format!(
+            "{}: safetensors header length {n} is out of range",
+            path.display()
+        ));
     }
     let mut header = vec![0u8; n as usize];
     f.read_exact(&mut header).map_err(err)?;
@@ -386,7 +436,10 @@ pub fn pin_shard(path: &Path) -> Result<WeightPin, String> {
     h.update(len);
     h.update(&header);
     Ok(WeightPin {
-        file: path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
+        file: path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default(),
         bytes,
         header_sha256: format!("{:x}", h.finalize()),
     })
@@ -410,17 +463,25 @@ pub fn verify_pins(dir: &Path, pins: &[WeightPin]) -> Result<(), String> {
     for pin in pins {
         match pin_shard(&dir.join(&pin.file)) {
             Ok(got) if got == *pin => {}
-            Ok(got) if got.bytes != pin.bytes => {
-                bad.push(format!("{}: {} bytes, packet pins {}", pin.file, got.bytes, pin.bytes))
-            }
-            Ok(_) => bad.push(format!("{}: tensor header differs from the one the packet was emitted against", pin.file)),
+            Ok(got) if got.bytes != pin.bytes => bad.push(format!(
+                "{}: {} bytes, packet pins {}",
+                pin.file, got.bytes, pin.bytes
+            )),
+            Ok(_) => bad.push(format!(
+                "{}: tensor header differs from the one the packet was emitted against",
+                pin.file
+            )),
             Err(e) => bad.push(e),
         }
     }
     if bad.is_empty() {
         Ok(())
     } else {
-        Err(format!("checkpoint {} does not match the packet: {}", dir.display(), bad.join("; ")))
+        Err(format!(
+            "checkpoint {} does not match the packet: {}",
+            dir.display(),
+            bad.join("; ")
+        ))
     }
 }
 
@@ -429,7 +490,8 @@ mod tests {
     use super::*;
 
     fn tmp(name: &str) -> std::path::PathBuf {
-        let d = std::env::temp_dir().join(format!("plow-serve-manifest-{name}-{}", std::process::id()));
+        let d =
+            std::env::temp_dir().join(format!("plow-serve-manifest-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d
@@ -439,15 +501,35 @@ mod tests {
     fn round_trips_and_refuses_newer_versions() {
         let m = ServeManifest {
             version: VERSION,
-            chat: Some(ChatSpec { template: Some("{{ x }}".into()), reasoning: Some(ReasoningTags::think()), ..Default::default() }),
+            chat: Some(ChatSpec {
+                template: Some("{{ x }}".into()),
+                reasoning: Some(ReasoningTags::think()),
+                ..Default::default()
+            }),
             stop_token_ids: vec![1, 106],
-            sampling: Some(SamplingDefaults { temperature: Some(0.6), top_k: Some(20), ..Default::default() }),
-            kv: Some(KvGeometry { full_layers: vec![5], kv_heads_full: 1, head_dim_full: 512, ..Default::default() }),
+            sampling: Some(SamplingDefaults {
+                temperature: Some(0.6),
+                top_k: Some(20),
+                ..Default::default()
+            }),
+            kv: Some(KvGeometry {
+                full_layers: vec![5],
+                kv_heads_full: 1,
+                head_dim_full: 512,
+                ..Default::default()
+            }),
             serve_defaults: [("PLOW_PF_INTERLEAVE".to_string(), "2048".to_string())].into(),
-            weights: vec![WeightPin { file: "a.safetensors".into(), bytes: 9, header_sha256: "00".into() }],
+            weights: vec![WeightPin {
+                file: "a.safetensors".into(),
+                bytes: 9,
+                header_sha256: "00".into(),
+            }],
         };
         assert_eq!(ServeManifest::parse(&m.to_json()).unwrap(), m);
-        assert_eq!(ServeManifest::parse(br#"{"version":1}"#).unwrap().chat, None);
+        assert_eq!(
+            ServeManifest::parse(br#"{"version":1}"#).unwrap().chat,
+            None
+        );
         assert!(ServeManifest::parse(br#"{"version":2}"#).is_err());
         assert!(ServeManifest::parse(br#"{"version":1,"later":true}"#).is_err());
     }
@@ -456,8 +538,16 @@ mod tests {
     fn synthesizes_the_legacy_reads() {
         let d = tmp("legacy");
         std::fs::write(d.join("chat_template.jinja"), "{{ bos_token }}hi").unwrap();
-        std::fs::write(d.join("tokenizer_config.json"), r#"{"bos_token":{"content":"<bos>"},"eos_token":"<eos>"}"#).unwrap();
-        std::fs::write(d.join("generation_config.json"), r#"{"eos_token_id":[106,1],"temperature":0.6,"top_k":20}"#).unwrap();
+        std::fs::write(
+            d.join("tokenizer_config.json"),
+            r#"{"bos_token":{"content":"<bos>"},"eos_token":"<eos>"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            d.join("generation_config.json"),
+            r#"{"eos_token_id":[106,1],"temperature":0.6,"top_k":20}"#,
+        )
+        .unwrap();
         std::fs::write(
             d.join("config.json"),
             r#"{"text_config":{"layer_types":["sliding_attention","full_attention","sliding_attention"],
@@ -473,8 +563,19 @@ mod tests {
         assert_eq!(m.stop_token_ids, [1, 106]);
         assert_eq!(m.sampling.unwrap().top_k, Some(20));
         let kv = m.kv.unwrap();
-        assert_eq!((kv.full_layers, kv.slide_layers, kv.window), (vec![1], vec![0], 1024));
-        assert_eq!((kv.kv_heads_full, kv.head_dim_full, kv.kv_heads_slide, kv.head_dim_slide), (1, 512, 8, 256));
+        assert_eq!(
+            (kv.full_layers, kv.slide_layers, kv.window),
+            (vec![1], vec![0], 1024)
+        );
+        assert_eq!(
+            (
+                kv.kv_heads_full,
+                kv.head_dim_full,
+                kv.kv_heads_slide,
+                kv.head_dim_slide
+            ),
+            (1, 512, 8, 256)
+        );
         std::fs::remove_dir_all(&d).unwrap();
     }
 
@@ -500,11 +601,21 @@ mod tests {
             b.extend_from_slice(&[0u8; 4]);
             b
         };
-        std::fs::write(d.join("m.safetensors"), shard(r#"{"w":{"dtype":"BF16","shape":[2],"data_offsets":[0,4]}}"#)).unwrap();
+        std::fs::write(
+            d.join("m.safetensors"),
+            shard(r#"{"w":{"dtype":"BF16","shape":[2],"data_offsets":[0,4]}}"#),
+        )
+        .unwrap();
         let pins = pin_checkpoint(&d).unwrap();
         assert!(verify_pins(&d, &pins).is_ok());
-        std::fs::write(d.join("m.safetensors"), shard(r#"{"w":{"dtype":"BF16","shape":[1],"data_offsets":[0,4]}}"#)).unwrap();
-        assert!(verify_pins(&d, &pins).unwrap_err().contains("header differs"));
+        std::fs::write(
+            d.join("m.safetensors"),
+            shard(r#"{"w":{"dtype":"BF16","shape":[1],"data_offsets":[0,4]}}"#),
+        )
+        .unwrap();
+        assert!(verify_pins(&d, &pins)
+            .unwrap_err()
+            .contains("header differs"));
         std::fs::remove_file(d.join("m.safetensors")).unwrap();
         assert!(verify_pins(&d, &pins).is_err());
         std::fs::remove_dir_all(&d).unwrap();

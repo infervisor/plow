@@ -74,7 +74,8 @@ fn batch_preserves_individual_verdicts_and_envelopes() {
         ("D", safe.clone()),
         ("F", serde_json::to_value(unsafe_req).unwrap()),
         ("D", safe),
-    ]).unwrap();
+    ])
+    .unwrap();
     assert_eq!(certs.len(), 3);
     assert!(certs[0].ok && !certs[1].ok && certs[2].ok);
     assert_eq!(certs[1].checkpoint, "F");
@@ -112,7 +113,10 @@ fn checkpoint_d_accepts_disjoint_bytes() {
     req.address_map[1].offset = 4096;
 
     let cert = check_schedule(&req).expect("verifier call failed");
-    assert!(!cert.ok, "disjoint allocations cannot waive data dependencies");
+    assert!(
+        !cert.ok,
+        "disjoint allocations cannot waive data dependencies"
+    );
     req.task_graph.edges.clear();
 
     let cert = check_schedule(&req).expect("verifier call failed");
@@ -138,7 +142,11 @@ fn checkpoint_d_rejects_unordered_dependency_without_address_entries() {
 fn checkpoint_d_rejects_malformed_access_sets() {
     let req = serde_json::to_value(safe_request()).unwrap();
     for field in ["readers", "writers"] {
-        for invalid in [serde_json::json!(["1"]), serde_json::json!(null), serde_json::json!([1, -1])] {
+        for invalid in [
+            serde_json::json!(["1"]),
+            serde_json::json!(null),
+            serde_json::json!([1, -1]),
+        ] {
             let mut bad = req.clone();
             bad["address_map"][0][field] = invalid;
             assert!(!lean_verify::call("D", bad).unwrap().ok);
@@ -156,8 +164,12 @@ fn checkpoint_d_checks_removed_edge_witnesses() {
         "dependency_paths": [[], [], [1]], "address_map": []
     });
     assert!(lean_verify::call("D", payload.clone()).unwrap().ok);
-    for paths in [serde_json::json!([[], [], []]), serde_json::json!([[], []]),
-        serde_json::json!([[], [], [0]]), serde_json::json!([[], [], [3]])] {
+    for paths in [
+        serde_json::json!([[], [], []]),
+        serde_json::json!([[], []]),
+        serde_json::json!([[], [], [0]]),
+        serde_json::json!([[], [], [3]]),
+    ] {
         payload["dependency_paths"] = paths;
         assert!(!lean_verify::call("D", payload.clone()).unwrap().ok);
     }
@@ -184,9 +196,12 @@ fn checkpoint_d_checks_address_paths_without_graph_saturation() {
     payload["dependency_paths"] = serde_json::json!([[], []]);
     payload["address_paths"] = serde_json::json!([{"source": 1, "target": 2, "via": []}]);
     assert!(lean_verify::call("D", payload.clone()).unwrap().ok);
-    for invalid in [serde_json::json!([]), serde_json::json!([{"source": 1, "target": 2, "via": [3]}]),
+    for invalid in [
+        serde_json::json!([]),
+        serde_json::json!([{"source": 1, "target": 2, "via": [3]}]),
         serde_json::json!([{"source": 1, "target": 4, "via": []}]),
-        serde_json::json!([{"source": "1", "target": 2, "via": []}])] {
+        serde_json::json!([{"source": "1", "target": 2, "via": []}]),
+    ] {
         payload["address_paths"] = invalid;
         assert!(!lean_verify::call("D", payload.clone()).unwrap().ok);
     }

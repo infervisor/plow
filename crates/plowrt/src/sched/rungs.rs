@@ -329,7 +329,11 @@ impl RungController {
         // packs all 15 into one launch, which synchronizes the cohort for the whole run (every
         // later wave a 16-burst: mean TTFT 78 -> 107 ms). `fast_probe` keeps the penultimate
         // bootstrap (the 7 + 8 stagger) and probes the widest after ONE sample.
-        let probe_after = if self.fast_probe { 1 } else { MIN_THROUGHPUT_SAMPLES };
+        let probe_after = if self.fast_probe {
+            1
+        } else {
+            MIN_THROUGHPUT_SAMPLES
+        };
         if demand_seat == widest
             && self.rungs.width(widest) > 4
             && self.stats[demand_seat].samples < MIN_THROUGHPUT_SAMPLES
@@ -462,8 +466,15 @@ mod tests {
                 narrowed_at = Some(tick);
             }
         }
-        assert!(narrowed_at.is_some(), "12 s of silence must narrow the window");
-        assert_eq!(c.admission_limit(), 1, "idle must return to the narrowest rung");
+        assert!(
+            narrowed_at.is_some(),
+            "12 s of silence must narrow the window"
+        );
+        assert_eq!(
+            c.admission_limit(),
+            1,
+            "idle must return to the narrowest rung"
+        );
 
         // Control: with λ PINNED at the burst value — the old estimator's behaviour — the same
         // 12 s of silence narrows nothing, because utilization never reaches NARROW_UTIL.
@@ -562,7 +573,10 @@ mod tests {
         c.decide(load(32, 40));
         assert_eq!(c.admission_limit(), 32);
         let d = c.decide(load(32, 0));
-        assert_eq!((c.admission_limit(), d.reason), (16, RungReason::Throughput));
+        assert_eq!(
+            (c.admission_limit(), d.reason),
+            (16, RungReason::Throughput)
+        );
     }
 
     #[test]
@@ -577,11 +591,19 @@ mod tests {
     fn fast_probe_widens_after_one_penultimate_sample() {
         let mut c = controller(&[1, 2, 4, 8, 16]).with_fast_probe(true);
         let d = c.decide(load(1, 15));
-        assert_eq!(c.width(d.admission), 8, "a cold backlog still bootstraps on the penultimate rung");
+        assert_eq!(
+            c.width(d.admission),
+            8,
+            "a cold backlog still bootstraps on the penultimate rung"
+        );
         assert_eq!(d.reason, RungReason::Backlog);
         c.observe_decode(3, 47.0, NonZeroUsize::MIN);
         let admission = c.decide(load(8, 8)).admission;
-        assert_eq!(c.width(admission), 16, "one sample is enough to probe the widest");
+        assert_eq!(
+            c.width(admission),
+            16,
+            "one sample is enough to probe the widest"
+        );
     }
 
     #[test]
@@ -722,14 +744,22 @@ mod tests {
         for _ in 0..128 {
             c.decide(load(4, 0));
         }
-        assert_eq!(c.admission_limit(), 4, "fully occupied target rung must not narrow");
+        assert_eq!(
+            c.admission_limit(),
+            4,
+            "fully occupied target rung must not narrow"
+        );
     }
 
     #[test]
     fn small_batch_ladder_cold_start_does_not_throttle() {
         let mut c = controller(&[1, 2, 4]);
         let d = c.decide(load(1, 3));
-        assert_eq!(c.width(d.admission), 4, "cold start on width 4 ladder must admit width 4 directly");
+        assert_eq!(
+            c.width(d.admission),
+            4,
+            "cold start on width 4 ladder must admit width 4 directly"
+        );
         assert_eq!(d.reason, RungReason::Backlog);
     }
 }

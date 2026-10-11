@@ -157,7 +157,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let compile_capacity = |input_frames| -> Result<_, Box<dyn std::error::Error>> {
         let subsampling = subsample(input_frames)?;
         let frames = subsampling.output_frames;
-        let conformer = conformer::append(conformer_spec(frames)?, &layers, subsampling.into_prefix())?;
+        let conformer =
+            conformer::append(conformer_spec(frames)?, &layers, subsampling.into_prefix())?;
         let prefix: PacketPrefix = conformer.into_prefix();
         Ok((
             rnnt::append(
@@ -187,15 +188,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Cache-aware stream: STREAM_ROWS new encoder frames (whole attention chunks; default one
     // chunk, 0 = no stream) per step. The subsampling is causal and factor 8: a later step's mel
     // window carries 16 frames already seen, enough for its first new output row.
-    let stream_rows = args.get(7).map_or(Ok(u32::try_from(chunk_size)?), |v| v.parse::<u32>())?;
+    let stream_rows = args
+        .get(7)
+        .map_or(Ok(u32::try_from(chunk_size)?), |v| v.parse::<u32>())?;
     if stream_rows != 0 {
         const FACTOR: u32 = 8;
         const HISTORY: u32 = 16;
-        let stream_prefix = |input_frames, keep_row0| -> Result<PacketPrefix, Box<dyn std::error::Error>> {
-            let subsampling = subsample(input_frames)?;
-            let spec = conformer_spec(subsampling.output_frames)?;
-            Ok(conformer::append_stream_step(spec, &layers, subsampling.into_prefix(), keep_row0, stream_rows)?)
-        };
+        let stream_prefix =
+            |input_frames, keep_row0| -> Result<PacketPrefix, Box<dyn std::error::Error>> {
+                let subsampling = subsample(input_frames)?;
+                let spec = conformer_spec(subsampling.output_frames)?;
+                Ok(conformer::append_stream_step(
+                    spec,
+                    &layers,
+                    subsampling.into_prefix(),
+                    keep_row0,
+                    stream_rows,
+                )?)
+            };
         let spec = conformer_spec(stream_rows)?;
         packets.add_stream(
             rnnt::StreamGeometry {
@@ -260,19 +270,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &frame_transform,
         trailing_encoder_frames,
     )?;
-    devgen::install_sidecar_verifier(Box::new(|requests| match lean_verify::call_batch_bound(requests) {
-        Ok((certs, verifier)) => Ok(Some((
-            certs.iter().map(serde_json::to_value).collect::<Result<_, _>>().map_err(|e| e.to_string())?,
-            verifier,
-        ))),
-        Err(e) if e.is_binary_unusable() => {
-            eprintln!("lean checks skipped: {e}");
-            Ok(None)
+    devgen::install_sidecar_verifier(Box::new(|requests| {
+        match lean_verify::call_batch_bound(requests) {
+            Ok((certs, verifier)) => Ok(Some((
+                certs
+                    .iter()
+                    .map(serde_json::to_value)
+                    .collect::<Result<_, _>>()
+                    .map_err(|e| e.to_string())?,
+                verifier,
+            ))),
+            Err(e) if e.is_binary_unusable() => {
+                eprintln!("lean checks skipped: {e}");
+                Ok(None)
+            }
+            Err(e) => Err(e.to_string()),
         }
-        Err(e) => Err(e.to_string()),
     }));
     // The packet plus `<stem>.lean-checks.json` (logical tensor effects per program).
-    devgen::write_sidecar_packet(Path::new(&args[3]), &packets.model, &[section, packets.vocabulary_section()?]);
+    devgen::write_sidecar_packet(
+        Path::new(&args[3]),
+        &packets.model,
+        &[section, packets.vocabulary_section()?],
+    );
     println!(
         "{}",
         serde_json::json!({

@@ -24,7 +24,10 @@ use super::ToolFormat;
 #[derive(Clone, Debug, PartialEq)]
 pub enum Ev {
     /// `id`: an id the format itself carries (Kimi-K2's `functions.NAME:IDX`).
-    Start { name: String, id: Option<String> },
+    Start {
+        name: String,
+        id: Option<String>,
+    },
     /// A fragment of the open call's arguments JSON, as a range of [`Out::args`].
     Args(Range<usize>),
     End,
@@ -50,7 +53,10 @@ impl Out {
     }
 
     fn start(&mut self, name: &str, id: Option<String>) {
-        self.evs.push(Ev::Start { name: name.to_string(), id });
+        self.evs.push(Ev::Start {
+            name: name.to_string(),
+            id,
+        });
     }
 
     /// Answer text, in order with the call events.
@@ -145,9 +151,21 @@ pub fn parser(spec: &ParseSpec) -> Box<dyn Parser> {
         ToolFormat::Glm45 => Framed::boxed("<tool_call>", Glm::default(), spec),
         ToolFormat::KimiK2 => Framed::boxed("<|tool_calls_section_begin|>", Kimi::default(), spec),
         ToolFormat::Mistral => Framed::boxed("[TOOL_CALLS]", Mistral::default(), spec),
-        ToolFormat::DeepSeekV3 | ToolFormat::DeepSeekV31 => Framed::boxed(DS_CALLS_BEGIN, DeepSeek::default(), spec),
-        ToolFormat::Llama3Json => Box::new(Llama3 { buf: String::new(), raw: String::new(), state: LlamaState::Deciding, list: JList::new(None), spec }),
-        ToolFormat::Harmony => Box::new(Harmony { buf: String::new(), head: String::new(), body: None }),
+        ToolFormat::DeepSeekV3 | ToolFormat::DeepSeekV31 => {
+            Framed::boxed(DS_CALLS_BEGIN, DeepSeek::default(), spec)
+        }
+        ToolFormat::Llama3Json => Box::new(Llama3 {
+            buf: String::new(),
+            raw: String::new(),
+            state: LlamaState::Deciding,
+            list: JList::new(None),
+            spec,
+        }),
+        ToolFormat::Harmony => Box::new(Harmony {
+            buf: String::new(),
+            head: String::new(),
+            body: None,
+        }),
     }
 }
 
@@ -239,7 +257,16 @@ struct Framed<B: Body> {
 
 impl<B: Body + 'static> Framed<B> {
     fn boxed(start: &'static str, body: B, spec: ParseSpec) -> Box<dyn Parser> {
-        Box::new(Framed { start, buf: String::new(), in_call: false, started: false, raw: String::new(), body: body.clone(), proto: body, spec })
+        Box::new(Framed {
+            start,
+            buf: String::new(),
+            in_call: false,
+            started: false,
+            raw: String::new(),
+            body: body.clone(),
+            proto: body,
+            spec,
+        })
     }
 
     fn run(&mut self, s: &str, eof: bool, out: &mut Out) -> usize {
@@ -263,7 +290,12 @@ impl<B: Body + 'static> Framed<B> {
                 }
                 continue;
             }
-            let mut cx = Cx { out, spec: &self.spec, started: self.started, eof };
+            let mut cx = Cx {
+                out,
+                spec: &self.spec,
+                started: self.started,
+                eof,
+            };
             let (n, st) = self.body.feed(&s[i..], &mut cx);
             let now_started = cx.started;
             if !self.started {
@@ -417,7 +449,10 @@ struct JList {
 
 impl JList {
     fn new(end: Option<&'static str>) -> Self {
-        JList { end, ..Default::default() }
+        JList {
+            end,
+            ..Default::default()
+        }
     }
 
     fn open_object(&mut self) {
@@ -536,7 +571,11 @@ impl JList {
                         }
                         j += 1;
                     }
-                    let target = if self.st == J::KeyStr { &mut self.key } else { self.name.get_or_insert_with(String::new) };
+                    let target = if self.st == J::KeyStr {
+                        &mut self.key
+                    } else {
+                        self.name.get_or_insert_with(String::new)
+                    };
                     target.push_str(&s[i..j]);
                     if j == b.len() {
                         return (j, St::Going);
@@ -782,7 +821,9 @@ impl Body for Gemma {
                     }
                 }
                 G::Name => {
-                    let j = s[i..].find(|ch: char| ch == '{' || ch == '<' || ch.is_whitespace()).map_or(b.len(), |k| i + k);
+                    let j = s[i..]
+                        .find(|ch: char| ch == '{' || ch == '<' || ch.is_whitespace())
+                        .map_or(b.len(), |k| i + k);
                     self.acc.push_str(&s[i..j]);
                     i = j;
                     if i == b.len() {
@@ -924,7 +965,11 @@ impl Body for Gemma {
                     }
                     match c {
                         b',' => {
-                            self.st = if self.nest.stack.last() == Some(&b'{') { G::Key } else { G::Value };
+                            self.st = if self.nest.stack.last() == Some(&b'{') {
+                                G::Key
+                            } else {
+                                G::Value
+                            };
                             i += 1;
                         }
                         b'}' | b']' => {
@@ -955,7 +1000,9 @@ fn typed(spec: &ParseSpec, tool: &str, param: &str, raw: &str, undeclared_json: 
     let json = || serde_json::from_str::<Value>(raw.trim()).ok();
     match spec.param_type(tool, param) {
         Some("string") => Value::String(raw.to_string()),
-        Some("integer" | "number") => json().filter(Value::is_number).unwrap_or_else(|| Value::String(raw.to_string())),
+        Some("integer" | "number") => json()
+            .filter(Value::is_number)
+            .unwrap_or_else(|| Value::String(raw.to_string())),
         Some("boolean") => match raw.trim().to_ascii_lowercase().as_str() {
             "true" => Value::Bool(true),
             "false" => Value::Bool(false),
@@ -990,7 +1037,8 @@ impl Param {
             escape_into(a, key);
             a.push_str("\":");
         });
-        self.stream = cx.spec.param_type(&self.name, key) == Some("string") || (!undeclared_json && cx.spec.param_type(&self.name, key).is_none());
+        self.stream = cx.spec.param_type(&self.name, key) == Some("string")
+            || (!undeclared_json && cx.spec.param_type(&self.name, key).is_none());
         self.lead = self.trim_nl;
         self.nl_held = false;
         self.raw.clear();
@@ -1078,7 +1126,9 @@ impl Body for QwenXml {
                             self.st = Q::FName;
                         }
                         None => return (i, St::Going),
-                        Some(false) => return (i, if self.calls == 0 { St::Fail } else { St::Done }),
+                        Some(false) => {
+                            return (i, if self.calls == 0 { St::Fail } else { St::Done })
+                        }
                     }
                 }
                 Q::FName => {
@@ -1349,7 +1399,16 @@ impl Body for Kimi {
                         }
                         Hit::At(0, _) => return (i + SE.len(), St::Done),
                         Hit::Need(0) if !cx.eof => return (i, St::Going),
-                        _ => return (i, if self.calls == 0 && !cx.started { St::Fail } else { St::Done }),
+                        _ => {
+                            return (
+                                i,
+                                if self.calls == 0 && !cx.started {
+                                    St::Fail
+                                } else {
+                                    St::Done
+                                },
+                            )
+                        }
                     }
                 }
                 K::Id => match scan(&s[i..], &[A]) {
@@ -1508,7 +1567,11 @@ impl Body for DeepSeek {
                     }
                 }
                 D::V3Args | D::V31Args => {
-                    let marks: &[&str] = if self.st == D::V3Args { &[DS_FENCE_END, DS_CALL_END] } else { &[DS_CALL_END] };
+                    let marks: &[&str] = if self.st == D::V3Args {
+                        &[DS_FENCE_END, DS_CALL_END]
+                    } else {
+                        &[DS_CALL_END]
+                    };
                     match scan(&s[i..], marks) {
                         Hit::At(j, k) => {
                             self.args.piece(&s[i..i + j], cx.out);
@@ -1708,7 +1771,12 @@ impl Llama3 {
                     }
                 }
                 LlamaState::List => {
-                    let mut cx = Cx { out, spec: &self.spec, started: self.list.calls > 0 || self.list.started, eof };
+                    let mut cx = Cx {
+                        out,
+                        spec: &self.spec,
+                        started: self.list.calls > 0 || self.list.started,
+                        eof,
+                    };
                     let before = cx.started;
                     let (n, st) = self.list.feed(&s[i..], &mut cx);
                     let started = cx.started;
@@ -1787,12 +1855,17 @@ impl Harmony {
         let word = |after: &str| -> Option<&str> {
             let i = h.find(after)? + after.len();
             let r = &h[i..];
-            Some(&r[..r.find(|c: char| c.is_whitespace() || c == '<').unwrap_or(r.len())])
+            Some(
+                &r[..r
+                    .find(|c: char| c.is_whitespace() || c == '<')
+                    .unwrap_or(r.len())],
+            )
         };
         match (word("to="), word("<|channel|>")) {
-            (Some(r), _) if r.starts_with("functions.") && r.len() > "functions.".len() => {
-                (HarmonyBody::Call(RawArgs::default()), Some(&r["functions.".len()..]))
-            }
+            (Some(r), _) if r.starts_with("functions.") && r.len() > "functions.".len() => (
+                HarmonyBody::Call(RawArgs::default()),
+                Some(&r["functions.".len()..]),
+            ),
             (None, Some("analysis")) => (HarmonyBody::Analysis, None),
             _ => (HarmonyBody::Final, None),
         }
@@ -1894,7 +1967,14 @@ mod tests {
 
     #[test]
     fn escaping_matches_serde() {
-        for s in ["plain", "q\"b\\s", "nl\n\r\t", "\u{1}\u{1f}\u{7f}", "é日本", ""] {
+        for s in [
+            "plain",
+            "q\"b\\s",
+            "nl\n\r\t",
+            "\u{1}\u{1f}\u{7f}",
+            "é日本",
+            "",
+        ] {
             let mut got = String::new();
             escape_into(&mut got, s);
             assert_eq!(format!("\"{got}\""), serde_json::to_string(s).unwrap());

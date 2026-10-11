@@ -53,11 +53,20 @@ struct Open {
 }
 
 enum Detector {
-    Energy { levels: VecDeque<f32> },
+    Energy {
+        levels: VecDeque<f32>,
+    },
     /// The packet's hysteresis decides speech (onset, and that a turn is still speech): from
     /// `threshold`, until below `release`. Where speech ends is timed by energy, in `SLICE` steps:
     /// a VAD's probability decays some 60 ms after the voice stops.
-    Vad { vad: Arc<Vad>, stream: VadStream, threshold: f32, release: f32, speaking: bool, levels: VecDeque<f32> },
+    Vad {
+        vad: Arc<Vad>,
+        stream: VadStream,
+        threshold: f32,
+        release: f32,
+        speaking: bool,
+        levels: VecDeque<f32>,
+    },
 }
 
 /// Energy slice (8 ms) timing where speech ends inside a VAD frame.
@@ -83,7 +92,13 @@ pub struct Endpointer {
 
 impl Endpointer {
     pub fn new(config: EndpointConfig) -> Self {
-        Self::with_detector(config, Detector::Energy { levels: VecDeque::with_capacity(FLOOR_FRAMES) }, FRAME)
+        Self::with_detector(
+            config,
+            Detector::Energy {
+                levels: VecDeque::with_capacity(FLOOR_FRAMES),
+            },
+            FRAME,
+        )
     }
 
     /// Speech is a VAD frame at or above `threshold` (Realtime `server_vad.threshold`), else the
@@ -97,7 +112,18 @@ impl Endpointer {
         }
         let (threshold, release) = (options.threshold, options.release_threshold());
         let levels = VecDeque::with_capacity(FLOOR_FRAMES * FRAME / SLICE);
-        Self::with_detector(config, Detector::Vad { vad, stream, threshold, release, speaking: false, levels }, frame)
+        Self::with_detector(
+            config,
+            Detector::Vad {
+                vad,
+                stream,
+                threshold,
+                release,
+                speaking: false,
+                levels,
+            },
+            frame,
+        )
     }
 
     fn with_detector(config: EndpointConfig, detector: Detector, frame: usize) -> Self {
@@ -131,7 +157,9 @@ impl Endpointer {
         }
         let keep = match &self.open {
             Some(open) => open.start,
-            None => self.scanned.saturating_sub(((self.onset_frames + 1) * self.frame + CONTEXT) as u64),
+            None => self
+                .scanned
+                .saturating_sub(((self.onset_frames + 1) * self.frame + CONTEXT) as u64),
         };
         if keep > self.base {
             self.buf.drain(..(keep - self.base) as usize);
@@ -163,7 +191,9 @@ impl Endpointer {
 
     /// The open segment's index and audio so far.
     pub fn open_audio(&self) -> Option<(u64, &[f32])> {
-        self.open.as_ref().map(|o| (o.index, &self.buf[(o.start - self.base) as usize..]))
+        self.open
+            .as_ref()
+            .map(|o| (o.index, &self.buf[(o.start - self.base) as usize..]))
     }
 
     fn end(&self) -> u64 {
@@ -188,7 +218,14 @@ impl Endpointer {
                 let (rms, speech) = loud(levels, frame, FLOOR_FRAMES);
                 (rms, speech, speech.then_some(frame.len()), speech)
             }
-            Detector::Vad { vad, stream, threshold, release, speaking, levels } => {
+            Detector::Vad {
+                vad,
+                stream,
+                threshold,
+                release,
+                speaking,
+                levels,
+            } => {
                 let p = vad.step(stream, frame);
                 if p >= *threshold {
                     *speaking = true;
@@ -202,12 +239,24 @@ impl Endpointer {
                     .filter(|(_, slice)| loud(levels, slice, keep).1)
                     .last()
                     .map(|(i, slice)| i * SLICE + slice.len());
-                (p, *speaking, last_loud.filter(|_| *speaking), p >= *threshold)
+                (
+                    p,
+                    *speaking,
+                    last_loud.filter(|_| *speaking),
+                    p >= *threshold,
+                )
             }
         }
     }
 
-    fn frame(&mut self, at: u64, score: f32, speech: bool, loud_end: Option<usize>, confident: bool) -> Option<Segment> {
+    fn frame(
+        &mut self,
+        at: u64,
+        score: f32,
+        speech: bool,
+        loud_end: Option<usize>,
+        confident: bool,
+    ) -> Option<Segment> {
         let frame_end = at + self.frame as u64;
         let Some(open) = &mut self.open else {
             self.run = if speech { self.run + 1 } else { 0 };
@@ -217,7 +266,15 @@ impl Endpointer {
                 let mut recent = VecDeque::with_capacity(self.cut_frames);
                 recent.push_back((at, score));
                 let speech = (self.run * self.frame) as u64;
-                self.open = Some(Open { index: self.next_index, start, last_speech_end: frame_end, loud_seen: false, speech, offered: None, recent });
+                self.open = Some(Open {
+                    index: self.next_index,
+                    start,
+                    last_speech_end: frame_end,
+                    loud_seen: false,
+                    speech,
+                    offered: None,
+                    recent,
+                });
                 self.next_index += 1;
                 self.run = 0;
             }
@@ -273,7 +330,13 @@ impl Endpointer {
 
     fn cut(&self, index: u64, start: u64, end: u64, speech: u64) -> Segment {
         let samples = self.buf[(start - self.base) as usize..(end - self.base) as usize].to_vec();
-        Segment { index, start, end, speech, samples }
+        Segment {
+            index,
+            start,
+            end,
+            speech,
+            samples,
+        }
     }
 }
 
@@ -303,7 +366,10 @@ mod tests {
         out
     }
 
-    const CONFIG: EndpointConfig = EndpointConfig { min_silence_ms: 600, max_segment_ms: 25_000 };
+    const CONFIG: EndpointConfig = EndpointConfig {
+        min_silence_ms: 600,
+        max_segment_ms: 25_000,
+    };
 
     #[test]
     fn bursts_split_at_silences_with_context() {
@@ -319,7 +385,10 @@ mod tests {
         for (i, (s, onset)) in segments.iter().zip(&onsets).enumerate() {
             assert_eq!(s.index, i as u64);
             assert_eq!(s.samples.len() as u64, s.end - s.start);
-            assert!(s.start + CONTEXT as u64 <= *onset + FRAME as u64 && *onset < s.start + CONTEXT as u64 + 2 * FRAME as u64);
+            assert!(
+                s.start + CONTEXT as u64 <= *onset + FRAME as u64
+                    && *onset < s.start + CONTEXT as u64 + 2 * FRAME as u64
+            );
         }
         assert!(segments.windows(2).all(|w| w[0].end <= w[1].start));
     }
@@ -349,7 +418,9 @@ mod tests {
         let mut audio = silence(0.5);
         audio.extend(tone(24.4));
         let pause = 8_000;
-        audio.extend((0..pause).map(|i| 0.001 * (1.0 - i as f32 / pause as f32) * ((i * 7919 % 1000) as f32 / 500.0 - 1.0)));
+        audio.extend((0..pause).map(|i| {
+            0.001 * (1.0 - i as f32 / pause as f32) * ((i * 7919 % 1000) as f32 / 500.0 - 1.0)
+        }));
         audio.extend(silence(1.5));
         let mut e = Endpointer::new(CONFIG);
         let mut segments = Vec::new();
@@ -371,33 +442,70 @@ mod tests {
         let mut audio = tone(2.0);
         audio.extend(silence(1.0));
         audio.extend(tone(3.0));
-        let a: Vec<_> = feed(&mut Endpointer::new(CONFIG), &audio, 160).into_iter().map(|s| (s.start, s.end)).collect();
-        let b: Vec<_> = feed(&mut Endpointer::new(CONFIG), &audio, 48_000).into_iter().map(|s| (s.start, s.end)).collect();
+        let a: Vec<_> = feed(&mut Endpointer::new(CONFIG), &audio, 160)
+            .into_iter()
+            .map(|s| (s.start, s.end))
+            .collect();
+        let b: Vec<_> = feed(&mut Endpointer::new(CONFIG), &audio, 48_000)
+            .into_iter()
+            .map(|s| (s.start, s.end))
+            .collect();
         assert_eq!(a, b);
     }
 
     #[test]
     fn silero_segments_follow_its_speech_frames() {
         let dir = std::path::Path::new("/home/ssm-user/models/silero-vad-v5");
-        let Ok(vad) = Vad::load(&dir.join("silero_vad.pkt")) else { return };
+        let Ok(vad) = Vad::load(&dir.join("silero_vad.pkt")) else {
+            return;
+        };
         let vad = Arc::new(vad);
-        let reference: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.join("reference.json")).unwrap()).unwrap();
-        let signal: Vec<f32> = reference["signal"].as_array().unwrap().iter().map(|v| v.as_f64().unwrap() as f32).collect();
-        let speech: Vec<usize> = vad.probabilities(&signal).iter().enumerate().filter(|(_, &p)| p >= 0.5).map(|(f, _)| f * 512).collect();
-        let segments = feed(&mut Endpointer::with_vad(CONFIG, vad.clone(), None), &signal, 1_000);
+        let reference: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.join("reference.json")).unwrap()).unwrap();
+        let signal: Vec<f32> = reference["signal"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_f64().unwrap() as f32)
+            .collect();
+        let speech: Vec<usize> = vad
+            .probabilities(&signal)
+            .iter()
+            .enumerate()
+            .filter(|(_, &p)| p >= 0.5)
+            .map(|(f, _)| f * 512)
+            .collect();
+        let segments = feed(
+            &mut Endpointer::with_vad(CONFIG, vad.clone(), None),
+            &signal,
+            1_000,
+        );
         assert_eq!(segments.len(), 1);
         let (first, last) = (speech[0] as u64, *speech.last().unwrap() as u64 + 512);
         assert_eq!(segments[0].start, first - CONTEXT as u64);
         assert!(segments[0].end >= last && segments[0].end <= last + CONTEXT as u64 + 512);
-        assert!(feed(&mut Endpointer::with_vad(CONFIG, vad, None), &silence(5.0), 4_000).is_empty());
+        assert!(feed(
+            &mut Endpointer::with_vad(CONFIG, vad, None),
+            &silence(5.0),
+            4_000
+        )
+        .is_empty());
     }
 
     #[test]
     fn silero_turns_close_on_the_voice_not_on_its_decaying_probability() {
         let dir = std::path::Path::new("/home/ssm-user/models/silero-vad-v5");
-        let Ok(vad) = Vad::load(&dir.join("silero_vad.pkt")) else { return };
-        let reference: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.join("reference.json")).unwrap()).unwrap();
-        let audio: Vec<f32> = reference["signal"].as_array().unwrap().iter().map(|v| v.as_f64().unwrap() as f32).collect();
+        let Ok(vad) = Vad::load(&dir.join("silero_vad.pkt")) else {
+            return;
+        };
+        let reference: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.join("reference.json")).unwrap()).unwrap();
+        let audio: Vec<f32> = reference["signal"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_f64().unwrap() as f32)
+            .collect();
         let closed = |mut e: Endpointer| {
             let mut fed = 0u64;
             audio.chunks(160).find_map(|c| {
@@ -406,9 +514,13 @@ mod tests {
             })
         };
         let energy = closed(Endpointer::new(CONFIG)).expect("energy closes the burst");
-        let silero = closed(Endpointer::with_vad(CONFIG, Arc::new(vad), None)).expect("Silero closes the burst");
+        let silero = closed(Endpointer::with_vad(CONFIG, Arc::new(vad), None))
+            .expect("Silero closes the burst");
         // Both time the end by the voice's energy; Silero decides only in 32 ms frames.
-        assert!(silero.abs_diff(energy) <= 512 + 160, "energy closed at {energy}, Silero at {silero}");
+        assert!(
+            silero.abs_diff(energy) <= 512 + 160,
+            "energy closed at {energy}, Silero at {silero}"
+        );
     }
 
     #[test]
@@ -419,19 +531,31 @@ mod tests {
         let mut e = Endpointer::new(CONFIG);
         let (mut offered, mut closed) = (Vec::new(), Vec::new());
         for chunk in audio.chunks(320) {
-            closed.extend(e.push(chunk).into_iter().map(|s| (s.index, s.start, s.end, s.samples.len(), offered.len())));
-            offered.extend(e.tentative().map(|s| (s.index, s.start, s.end, s.samples.len())));
+            closed.extend(
+                e.push(chunk)
+                    .into_iter()
+                    .map(|s| (s.index, s.start, s.end, s.samples.len(), offered.len())),
+            );
+            offered.extend(
+                e.tentative()
+                    .map(|s| (s.index, s.start, s.end, s.samples.len())),
+            );
         }
         assert_eq!(closed.len(), 1);
         let (index, start, end, len, offers_before) = closed[0];
         assert!(offers_before >= 1, "offered before closing");
-        assert_eq!(offered.last().map(|o| (o.0, o.1, o.2, o.3)), Some((index, start, end, len)));
+        assert_eq!(
+            offered.last().map(|o| (o.0, o.1, o.2, o.3)),
+            Some((index, start, end, len))
+        );
         assert!(closed.iter().all(|c| c.3 > 0) && e.tentative().is_none());
     }
 
     #[test]
     fn stationary_noise_is_not_speech() {
-        let noise: Vec<f32> = (0..16_000 * 10).map(|i| 0.01 * ((i * 7919 % 1000) as f32 / 500.0 - 1.0)).collect();
+        let noise: Vec<f32> = (0..16_000 * 10)
+            .map(|i| 0.01 * ((i * 7919 % 1000) as f32 / 500.0 - 1.0))
+            .collect();
         let mut audio = noise.clone();
         for (i, x) in tone(2.0).into_iter().enumerate() {
             audio[16_000 * 4 + i] += x;

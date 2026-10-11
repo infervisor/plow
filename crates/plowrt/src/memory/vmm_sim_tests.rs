@@ -50,7 +50,10 @@ impl VmmOps for SimVmm {
         Ok(2 << 20)
     }
     fn reserve(&self, bytes: u64) -> Result<u64> {
-        Ok(self.next.fetch_add(bytes.div_ceil(1 << 21) + 1, Ordering::SeqCst) << 21)
+        Ok(self
+            .next
+            .fetch_add(bytes.div_ceil(1 << 21) + 1, Ordering::SeqCst)
+            << 21)
     }
     fn address_free(&self, _va: u64, _bytes: u64) {}
     fn create(&self, bytes: u64) -> Result<u64> {
@@ -113,7 +116,11 @@ impl Kv {
     fn boundary_copied(&self, b: usize, toks: &[u32], p_a: u32) -> (bool, bool) {
         let copied = std::cell::Cell::new(false);
         let rows = toks.len() as u32;
-        let ring = if rows > self.kv.prompt_rows(b) { self.ring_decode.get() } else { self.ring };
+        let ring = if rows > self.kv.prompt_rows(b) {
+            self.ring_decode.get()
+        } else {
+            self.ring
+        };
         if rows == 0 || p_a == 0 || rows - p_a > ring - self.window {
             return (false, false);
         }
@@ -132,7 +139,11 @@ impl Kv {
         let rows = toks.len() as u32;
         let prompt = self.kv.prompt_rows(b);
         let slack = env_u64("SIM_PE_SLACK", 8) as u32;
-        let max_rows = if rows == prompt && max_rows < rows { prompt.saturating_sub(1 + slack) } else { max_rows };
+        let max_rows = if rows == prompt && max_rows < rows {
+            prompt.saturating_sub(1 + slack)
+        } else {
+            max_rows
+        };
         let p_a = rows.min(max_rows) / 32 * 32;
         if rows == 0 || p_a == 0 {
             return;
@@ -151,7 +162,8 @@ impl Kv {
         }
         let published = self.boundary(b, toks, p_a);
         if published && rows == prompt && max_rows < rows {
-            self.kv.pin_prefix(&toks[..p_a as usize], std::time::Instant::now() + ttl);
+            self.kv
+                .pin_prefix(&toks[..p_a as usize], std::time::Instant::now() + ttl);
             self.kv.retire_superseded(toks, p_a);
         }
         let end = prompt.saturating_sub(1 + slack) / 32 * 32;
@@ -188,7 +200,14 @@ struct Sess {
     queued_at: f64,
 }
 
-fn tokens_for(cell: u32, s: usize, t: usize, prev: &[u32], prev_len: usize, len: usize) -> Vec<u32> {
+fn tokens_for(
+    cell: u32,
+    s: usize,
+    t: usize,
+    prev: &[u32],
+    prev_len: usize,
+    len: usize,
+) -> Vec<u32> {
     let salt = cell * 130_000_000;
     let mut p: Vec<u32> = if t == 0 {
         (0..1568u32).map(|i| salt + 10 + i).collect()
@@ -206,7 +225,10 @@ fn tokens_for(cell: u32, s: usize, t: usize, prev: &[u32], prev_len: usize, len:
 }
 
 fn env_u64(key: &str, default: u64) -> u64 {
-    std::env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
 }
 
 #[test]
@@ -246,7 +268,10 @@ fn vmm_sim_agentic() {
     });
     // Real-time pacing (`SIM_SCALE` > 0): the reclaimer thread runs against virtual time instead
     // of being drained after every engine call.
-    let scale = std::env::var("SIM_SCALE").ok().and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.0);
+    let scale = std::env::var("SIM_SCALE")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .unwrap_or(0.0);
     let sync = |kv: &VmmKv| {
         if scale == 0.0 {
             kv.sync_reclaim();
@@ -288,7 +313,10 @@ fn vmm_sim_agentic() {
     for (cell, path) in cells.iter().enumerate() {
         let mut per: HashMap<usize, Vec<(usize, usize)>> = HashMap::new();
         for line in std::fs::read_to_string(path).expect("prompt file").lines() {
-            let f: Vec<usize> = line.split_whitespace().map(|x| x.parse().unwrap()).collect();
+            let f: Vec<usize> = line
+                .split_whitespace()
+                .map(|x| x.parse().unwrap())
+                .collect();
             per.entry(f[0]).or_default().push((f[1], f[2]));
         }
         let mut ids: Vec<usize> = per.keys().copied().collect();
@@ -338,11 +366,23 @@ fn vmm_sim_agentic() {
                 let pick = if order && now - sess[head].queued_at < age {
                     if order_max {
                         // The waiting turn that saves the most prefill, if it beats the head by a block.
-                        let rows: Vec<u32> = queue.iter().map(|&i| k.kv.cached_rows(&sess[i].prompt)).collect();
-                        let best = (0..rows.len()).max_by_key(|&i| (rows[i], std::cmp::Reverse(i))).unwrap();
-                        if rows[best] >= rows[0] + k.kv.block_rows() { best } else { 0 }
+                        let rows: Vec<u32> = queue
+                            .iter()
+                            .map(|&i| k.kv.cached_rows(&sess[i].prompt))
+                            .collect();
+                        let best = (0..rows.len())
+                            .max_by_key(|&i| (rows[i], std::cmp::Reverse(i)))
+                            .unwrap();
+                        if rows[best] >= rows[0] + k.kv.block_rows() {
+                            best
+                        } else {
+                            0
+                        }
                     } else {
-                        queue.iter().position(|&i| k.kv.cached_rows(&sess[i].prompt) > order_rows).unwrap_or(0)
+                        queue
+                            .iter()
+                            .position(|&i| k.kv.cached_rows(&sess[i].prompt) > order_rows)
+                            .unwrap_or(0)
                     }
                 } else {
                     0
@@ -388,9 +428,12 @@ fn vmm_sim_agentic() {
                 seqno += 1;
                 s.admitted = seqno;
             }
-            let mut prefilling: Vec<usize> =
-                (0..sess.len()).filter(|&i| sess[i].phase == Phase::Prefill).collect();
-            let decoding: Vec<usize> = (0..sess.len()).filter(|&i| sess[i].phase == Phase::Decode).collect();
+            let mut prefilling: Vec<usize> = (0..sess.len())
+                .filter(|&i| sess[i].phase == Phase::Prefill)
+                .collect();
+            let decoding: Vec<usize> = (0..sess.len())
+                .filter(|&i| sess[i].phase == Phase::Decode)
+                .collect();
             if prefilling.is_empty() && decoding.is_empty() {
                 match arriving.front() {
                     Some(&(t, _)) => {
@@ -474,14 +517,23 @@ fn vmm_sim_agentic() {
                         continue;
                     }
                     let prev_len = s.base_len.take().unwrap_or(s.prompt.len());
-                    s.prompt = tokens_for(cell as u32, id, s.turn, &s.prompt, prev_len, s.prompts[s.turn]);
+                    s.prompt = tokens_for(
+                        cell as u32,
+                        id,
+                        s.turn,
+                        &s.prompt,
+                        prev_len,
+                        s.prompts[s.turn],
+                    );
                     s.phase = Phase::Queued;
                     arriving.push_back((now + gap, id));
                 }
             }
         }
         let st = k.kv.stats();
-        let (a, p, n): (u64, u64, u64) = hit.iter().fold((0, 0, 0), |x, h| (x.0 + h.0, x.1 + h.1, x.2 + h.2));
+        let (a, p, n): (u64, u64, u64) = hit
+            .iter()
+            .fold((0, 0, 0), |x, h| (x.0 + h.0, x.1 + h.1, x.2 + h.2));
         println!(
             "SIM cell={} sessions={} slots={} cached={:.1}% reqs={} sim_s={:.0} out_tok_s={:.0} snaps_evicted={} units={}",
             path.rsplit('/').next().unwrap(),
@@ -494,12 +546,24 @@ fn vmm_sim_agentic() {
             st.snapshots_evicted - stats0.snapshots_evicted,
             st.eviction_units - stats0.eviction_units,
         );
-        let per_turn: Vec<String> =
-            hit.iter().map(|h| format!("{:.0}", 100.0 * h.0 as f64 / h.1.max(1) as f64)).collect();
+        let per_turn: Vec<String> = hit
+            .iter()
+            .map(|h| format!("{:.0}", 100.0 * h.0 as f64 / h.1.max(1) as f64))
+            .collect();
         println!("SIM   per-turn cached% {}", per_turn.join(" "));
         queue_wait.sort_by(f64::total_cmp);
-        let q = |f: f64| queue_wait.get(((queue_wait.len() as f64 * f) as usize).min(queue_wait.len().max(1) - 1)).copied().unwrap_or(0.0);
-        println!("SIM   queue wait s p50={:.1} p99={:.1} max={:.1}", q(0.5), q(0.99), q(1.0));
+        let q = |f: f64| {
+            queue_wait
+                .get(((queue_wait.len() as f64 * f) as usize).min(queue_wait.len().max(1) - 1))
+                .copied()
+                .unwrap_or(0.0)
+        };
+        println!(
+            "SIM   queue wait s p50={:.1} p99={:.1} max={:.1}",
+            q(0.5),
+            q(0.99),
+            q(1.0)
+        );
         let (c, n) = k.republish.replace((0, 0));
         println!("SIM   turn-end re-publish copied {c} of {n} preempted {preempted} admission_waits {waits}");
     }

@@ -65,14 +65,24 @@ fn request_chunks_above_the_window_stage_the_sliding_ring() {
                     let live = plow_asset::live_kv::emit(p).unwrap();
                     let sliding: Vec<_> = live.caches.iter().filter(|c| c.window != 0).collect();
                     assert_eq!(sliding.iter().map(|c| c.stride).collect::<Vec<_>>(), [ring]);
-                    let rows: Vec<u32> =
-                        p.programs[..p.prefill_count].iter().map(|g| g.rows).collect();
+                    let rows: Vec<u32> = p.programs[..p.prefill_count]
+                        .iter()
+                        .map(|g| g.rows)
+                        .collect();
                     assert_eq!(rows, [128, 512, 1024, 2048, 4096, 4160, 4224, 8192]);
                     for g in &p.programs[..p.prefill_count] {
                         let map = plow_asset::packed_prefill::stage_map(g.insts);
-                        let stages = map.iter().flatten().map(|&k| k as u32 + 1).max().unwrap_or(1);
-                        let want =
-                            if stage == Some(0) { 1 } else { g.rows.min(4096).div_ceil(1024) };
+                        let stages = map
+                            .iter()
+                            .flatten()
+                            .map(|&k| k as u32 + 1)
+                            .max()
+                            .unwrap_or(1);
+                        let want = if stage == Some(0) {
+                            1
+                        } else {
+                            g.rows.min(4096).div_ceil(1024)
+                        };
                         assert_eq!(stages, want, "rows {}", g.rows);
                     }
                 });

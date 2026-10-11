@@ -33,7 +33,14 @@ fn main() {
             "--check" => check = true,
             "--all-tiles" => all_tiles = true,
             "--cold" => cold = true,
-            "--m" => ms_list = args.next().unwrap().split(',').map(|v| v.parse().unwrap()).collect(),
+            "--m" => {
+                ms_list = args
+                    .next()
+                    .unwrap()
+                    .split(',')
+                    .map(|v| v.parse().unwrap())
+                    .collect()
+            }
             other => panic!("unknown arg {other}"),
         }
     }
@@ -43,7 +50,9 @@ fn main() {
     let base: Vec<*mut c_void> = (0..n).map(|h| gpu.host_ptr(h) as *mut c_void).collect();
 
     // Distinct GEMM-family instructions of the prefill programs, keyed by (op, N, K, operand handles).
-    let gemm_ops = [8u16, 14, 15, 20, 33, 34, 35, 36, 93, 96, 97, 98, 113, 10, 30, 31, 91, 92];
+    let gemm_ops = [
+        8u16, 14, 15, 20, 33, 34, 35, 36, 93, 96, 97, 98, 113, 10, 30, 31, 91, 92,
+    ];
     let mut cells: BTreeMap<(u16, u32, u32, [u16; 8]), (usize, usize)> = BTreeMap::new();
     // Prefill programs first, then decode (the GEMV forms and the decode-only lm_head).
     for p in 0..gpu.model.blob.progs.len() {
@@ -87,7 +96,11 @@ fn main() {
     println!(
         "cpu tier {isa:?}; {} GEMM shapes; M in {ms_list:?}; reps {reps}{}",
         plan.len(),
-        if check { "; checking against the CPU kernel" } else { "" }
+        if check {
+            "; checking against the CPU kernel"
+        } else {
+            ""
+        }
     );
     println!(
         "{:<22} {:>4} {:>5} {:>6} {:>5} {:>9} {:>8} {:>8}  {}",
@@ -146,7 +159,13 @@ fn main() {
                 if alts.is_empty() {
                     vec![(d, p, i)]
                 } else {
-                    alts.iter().map(|&op| { let mut e = d; e.op = op; (e, p, i) }).collect()
+                    alts.iter()
+                        .map(|&op| {
+                            let mut e = d;
+                            e.op = op;
+                            (e, p, i)
+                        })
+                        .collect()
                 }
             })
             .collect()
@@ -171,87 +190,107 @@ fn main() {
                 continue;
             }
             for &kk in &ks {
-            let k = kk;
-            let nn = std::env::var("PLOW_BENCH_N").ok().and_then(|v| v.parse().ok()).unwrap_or(nn);
-            let mut d = d0;
-            d.i[0] = m;
-            d.i[1] = nn;
-            d.i[2] = k;
-            d.i[4] = 0;
-            d.i[5] = 0;
-            d.blocks = 16;
-            gpu.insts_host_mut(p)[i] = d;
-            let mut best = f64::INFINITY;
-            let layers = alts.get(&(d0.op, d0.i[1], d0.i[2])).cloned().unwrap_or_default();
-            for r in 0..reps {
-                let (p2, i2) = if cold && !layers.is_empty() { layers[r % layers.len()] } else { (p, i) };
-                let saved = gpu.insts_host(p2)[i2];
-                let mut d2 = saved;
-                d2.i = d.i;
-                d2.blocks = d.blocks;
-                gpu.insts_host_mut(p2)[i2] = d2;
-                let t = Instant::now();
-                gpu.run_inst(p2, i2).expect("run_inst");
-                best = best.min(t.elapsed().as_secs_f64() * 1e3);
-                gpu.insts_host_mut(p2)[i2] = saved;
-                if (p2, i2) == (p, i) {
-                    gpu.insts_host_mut(p)[i] = d;
-                }
-            }
-            total_ms += best;
-            let flops = 2.0 * m as f64 * nn as f64 * k as f64 * if glu { 2.0 } else { 1.0 };
-            let wbytes = nn as f64
-                * k as f64
-                * if fp8 { 1.0 } else if mx4 { 0.5 + 1.0 / 32.0 } else { 2.0 }
-                * if glu { 2.0 } else { 1.0 };
-            let mut verdict = String::new();
-            if check {
-                // CPU kernel with its output redirected to a scratch copy, then compare row block [0, m).
-                let c = d.t[0] as usize;
-                let mut table = base.clone();
-                let cur = gpu.tensor_bytes(c).to_vec();
-                let mut tmp = cur.clone();
-                table[c] = tmp.as_mut_ptr() as *mut c_void;
-                let f = ffi::kernel(d.op).expect("cpu kernel");
-                let nblk = 8u32;
-                for s in 0..nblk {
-                    // SAFETY: the kernel contract (validated handles, slice of nblk).
-                    unsafe { f(&d, s, nblk, table.as_ptr(), &mut ctx) };
-                }
-                gpu.run_inst(p, i).expect("run_inst");
-                let g = gpu.tensor_bytes(c);
-                let (mut bad, mut worst, mut cnt) = (0usize, 0f32, 0usize);
-                for e in 0..(m * nn) as usize {
-                    let x = f32::from_bits((u16::from_le_bytes([g[2 * e], g[2 * e + 1]]) as u32) << 16);
-                    let y = f32::from_bits((u16::from_le_bytes([tmp[2 * e], tmp[2 * e + 1]]) as u32) << 16);
-                    cnt += 1;
-                    let dif = (x - y).abs();
-                    if !(dif <= 2e-2 * y.abs() + 2e-2) {
-                        bad += 1;
-                    }
-                    if dif > worst || dif.is_nan() {
-                        worst = dif;
+                let k = kk;
+                let nn = std::env::var("PLOW_BENCH_N")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(nn);
+                let mut d = d0;
+                d.i[0] = m;
+                d.i[1] = nn;
+                d.i[2] = k;
+                d.i[4] = 0;
+                d.i[5] = 0;
+                d.blocks = 16;
+                gpu.insts_host_mut(p)[i] = d;
+                let mut best = f64::INFINITY;
+                let layers = alts
+                    .get(&(d0.op, d0.i[1], d0.i[2]))
+                    .cloned()
+                    .unwrap_or_default();
+                for r in 0..reps {
+                    let (p2, i2) = if cold && !layers.is_empty() {
+                        layers[r % layers.len()]
+                    } else {
+                        (p, i)
+                    };
+                    let saved = gpu.insts_host(p2)[i2];
+                    let mut d2 = saved;
+                    d2.i = d.i;
+                    d2.blocks = d.blocks;
+                    gpu.insts_host_mut(p2)[i2] = d2;
+                    let t = Instant::now();
+                    gpu.run_inst(p2, i2).expect("run_inst");
+                    best = best.min(t.elapsed().as_secs_f64() * 1e3);
+                    gpu.insts_host_mut(p2)[i2] = saved;
+                    if (p2, i2) == (p, i) {
+                        gpu.insts_host_mut(p)[i] = d;
                     }
                 }
-                verdict = if bad == 0 {
-                    format!("ok (worst {worst:.4})")
-                } else {
-                    format!("{bad}/{cnt} OFF, worst {worst:.4}")
-                };
-            }
-            println!(
-                "{:<22} {:>4} {:>5} {:>6} {:>5} {:>9.3} {:>8.0} {:>8.0}  {}",
-                name.trim_start_matches("PLOW_DOP_"),
-                d0.blocks,
-                m,
-                nn,
-                k,
-                best,
-                flops / best / 1e6,
-                wbytes / best / 1e6,
-                verdict
-            );
-            let _ = TENSOR_NONE16;
+                total_ms += best;
+                let flops = 2.0 * m as f64 * nn as f64 * k as f64 * if glu { 2.0 } else { 1.0 };
+                let wbytes = nn as f64
+                    * k as f64
+                    * if fp8 {
+                        1.0
+                    } else if mx4 {
+                        0.5 + 1.0 / 32.0
+                    } else {
+                        2.0
+                    }
+                    * if glu { 2.0 } else { 1.0 };
+                let mut verdict = String::new();
+                if check {
+                    // CPU kernel with its output redirected to a scratch copy, then compare row block [0, m).
+                    let c = d.t[0] as usize;
+                    let mut table = base.clone();
+                    let cur = gpu.tensor_bytes(c).to_vec();
+                    let mut tmp = cur.clone();
+                    table[c] = tmp.as_mut_ptr() as *mut c_void;
+                    let f = ffi::kernel(d.op).expect("cpu kernel");
+                    let nblk = 8u32;
+                    for s in 0..nblk {
+                        // SAFETY: the kernel contract (validated handles, slice of nblk).
+                        unsafe { f(&d, s, nblk, table.as_ptr(), &mut ctx) };
+                    }
+                    gpu.run_inst(p, i).expect("run_inst");
+                    let g = gpu.tensor_bytes(c);
+                    let (mut bad, mut worst, mut cnt) = (0usize, 0f32, 0usize);
+                    for e in 0..(m * nn) as usize {
+                        let x = f32::from_bits(
+                            (u16::from_le_bytes([g[2 * e], g[2 * e + 1]]) as u32) << 16,
+                        );
+                        let y = f32::from_bits(
+                            (u16::from_le_bytes([tmp[2 * e], tmp[2 * e + 1]]) as u32) << 16,
+                        );
+                        cnt += 1;
+                        let dif = (x - y).abs();
+                        if !(dif <= 2e-2 * y.abs() + 2e-2) {
+                            bad += 1;
+                        }
+                        if dif > worst || dif.is_nan() {
+                            worst = dif;
+                        }
+                    }
+                    verdict = if bad == 0 {
+                        format!("ok (worst {worst:.4})")
+                    } else {
+                        format!("{bad}/{cnt} OFF, worst {worst:.4}")
+                    };
+                }
+                println!(
+                    "{:<22} {:>4} {:>5} {:>6} {:>5} {:>9.3} {:>8.0} {:>8.0}  {}",
+                    name.trim_start_matches("PLOW_DOP_"),
+                    d0.blocks,
+                    m,
+                    nn,
+                    k,
+                    best,
+                    flops / best / 1e6,
+                    wbytes / best / 1e6,
+                    verdict
+                );
+                let _ = TENSOR_NONE16;
             }
         }
         gpu.insts_host_mut(p)[i] = d0;

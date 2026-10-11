@@ -41,7 +41,13 @@ unsafe impl GlobalAlloc for Counting {
 static GLOBAL: Counting = Counting;
 
 const MARKERS: &[&str] = &[
-    "<|tool_call>", "<tool_call|>", "<|\"|>", "<|channel>", "<channel|>", "<tool_call>", "</tool_call>",
+    "<|tool_call>",
+    "<tool_call|>",
+    "<|\"|>",
+    "<|channel>",
+    "<channel|>",
+    "<tool_call>",
+    "</tool_call>",
 ];
 
 /// Token-like pieces: every marker its own piece, other text in 4-byte runs (a BPE average).
@@ -87,32 +93,72 @@ fn specials() -> Arc<SpecialText> {
             )
         })
         .unwrap_or_else(|| {
-            ["<|tool_call>", "<tool_call|>", "<|\"|>", "<|tool_response>", "<tool_response|>", "<|channel>", "<channel|>",
-             "<|turn>", "<turn|>", "<bos>", "<eos>", "<pad>", "<|tool>", "<tool|>", "<|image|>", "<|audio|>"]
-                .map(String::from)
-                .to_vec()
+            [
+                "<|tool_call>",
+                "<tool_call|>",
+                "<|\"|>",
+                "<|tool_response>",
+                "<tool_response|>",
+                "<|channel>",
+                "<channel|>",
+                "<|turn>",
+                "<turn|>",
+                "<bos>",
+                "<eos>",
+                "<pad>",
+                "<|tool>",
+                "<tool|>",
+                "<|image|>",
+                "<|audio|>",
+            ]
+            .map(String::from)
+            .to_vec()
         });
     Arc::new(SpecialText::new(list))
 }
 
 fn spec(format: ToolFormat) -> ParseSpec {
-    let tool = |name: &str, params| ToolDef { name: name.into(), params, strict: false };
+    let tool = |name: &str, params| ToolDef {
+        name: name.into(),
+        params,
+        strict: false,
+    };
     let tools = vec![
-        tool("search_flights", serde_json::json!({"type": "object", "properties": {
+        tool(
+            "search_flights",
+            serde_json::json!({"type": "object", "properties": {
             "origin": {"type": "string"}, "destination": {"type": "string"}, "passengers": {"type": "integer"},
-            "filters": {"type": "object"}}})),
-        tool("write_file", serde_json::json!({"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}})),
+            "filters": {"type": "object"}}}),
+        ),
+        tool(
+            "write_file",
+            serde_json::json!({"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}}),
+        ),
     ];
-    ParseSpec { format, tools: Arc::new(tools), parallel: true, force: Force::Auto, history_calls: 0 }
+    ParseSpec {
+        format,
+        tools: Arc::new(tools),
+        parallel: true,
+        force: Force::Auto,
+        history_calls: 0,
+    }
 }
 
 fn prose(n: usize) -> String {
-    let words = ["The ", "weather ", "in ", "Paris ", "is ", "mild, ", "with ", "a ", "light ", "breeze ", "and ", "clear ", "skies. "];
+    let words = [
+        "The ", "weather ", "in ", "Paris ", "is ", "mild, ", "with ", "a ", "light ", "breeze ",
+        "and ", "clear ", "skies. ",
+    ];
     (0..n).map(|i| words[i % words.len()]).collect()
 }
 
 fn code(n: usize) -> String {
-    let lines = ["fn main() {\n", "    let x = vec![1, 2, 3];\n", "    println!(\"{:?}\", x);\n", "}\n"];
+    let lines = [
+        "fn main() {\n",
+        "    let x = vec![1, 2, 3];\n",
+        "    println!(\"{:?}\", x);\n",
+        "}\n",
+    ];
     (0..n).map(|i| lines[i % lines.len()]).collect()
 }
 
@@ -140,13 +186,41 @@ fn cases() -> Vec<Case> {
         serde_json::to_string(&code(400)).unwrap()
     );
     vec![
-        Case { name: "plain_text (no tools)", path: Path::Plain, text: prose(1200) },
-        Case { name: "gemma4 no tools (channel split)", path: Path::NoTools, text: prose(1200) },
-        Case { name: "tools_text_answer gemma4", path: Path::Tools(ToolFormat::Gemma4), text: prose(1200) },
-        Case { name: "gemma4 short call", path: Path::Tools(ToolFormat::Gemma4), text: g_short },
-        Case { name: "gemma4 long call (16 KB args)", path: Path::Tools(ToolFormat::Gemma4), text: g_long },
-        Case { name: "gemma4 huge call (64 KB args)", path: Path::Tools(ToolFormat::Gemma4), text: g_huge },
-        Case { name: "hermes long call (16 KB args)", path: Path::Tools(ToolFormat::Hermes), text: h_long },
+        Case {
+            name: "plain_text (no tools)",
+            path: Path::Plain,
+            text: prose(1200),
+        },
+        Case {
+            name: "gemma4 no tools (channel split)",
+            path: Path::NoTools,
+            text: prose(1200),
+        },
+        Case {
+            name: "tools_text_answer gemma4",
+            path: Path::Tools(ToolFormat::Gemma4),
+            text: prose(1200),
+        },
+        Case {
+            name: "gemma4 short call",
+            path: Path::Tools(ToolFormat::Gemma4),
+            text: g_short,
+        },
+        Case {
+            name: "gemma4 long call (16 KB args)",
+            path: Path::Tools(ToolFormat::Gemma4),
+            text: g_long,
+        },
+        Case {
+            name: "gemma4 huge call (64 KB args)",
+            path: Path::Tools(ToolFormat::Gemma4),
+            text: g_huge,
+        },
+        Case {
+            name: "hermes long call (16 KB args)",
+            path: Path::Tools(ToolFormat::Hermes),
+            text: h_long,
+        },
     ]
 }
 
@@ -160,7 +234,12 @@ fn run(case: &Case, toks: &[String], strip: &Arc<SpecialText>, head: &FrameHead)
                 let (r, c) = split.push(t);
                 let f = head.frame(&ChunkChoice {
                     index: 0,
-                    delta: Delta { role: None, content: c, reasoning_content: r, tool_calls: None },
+                    delta: Delta {
+                        role: None,
+                        content: c,
+                        reasoning_content: r,
+                        tool_calls: None,
+                    },
                     logprobs: None,
                     finish_reason: None,
                     x_plow_finish_reason: None,
@@ -173,7 +252,10 @@ fn run(case: &Case, toks: &[String], strip: &Arc<SpecialText>, head: &FrameHead)
                 Path::Tools(f) => Some(spec(f)),
                 _ => None,
             };
-            let mode = ReasoningMode::Tags { open: "<|channel>thought", close: "<channel|>" };
+            let mode = ReasoningMode::Tags {
+                open: "<|channel>thought",
+                close: "<channel|>",
+            };
             let mut ts = ToolStream::new(sp.as_ref(), mode, false, strip.clone(), true);
             for t in toks {
                 bytes += ts.push(t).frame(head, None, None, true, None).len();
@@ -189,10 +271,16 @@ fn run(case: &Case, toks: &[String], strip: &Arc<SpecialText>, head: &FrameHead)
 fn tool_stream_per_token_cost() {
     let strip = specials();
     let head = FrameHead::new("chatcmpl-1", "chat.completion.chunk", 1, "m");
-    let reps: usize = std::env::var("TOOLBENCH_REPS").ok().and_then(|s| s.parse().ok()).unwrap_or(100);
+    let reps: usize = std::env::var("TOOLBENCH_REPS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(100);
     // The box is shared: each case reports the best and the median of several timed trials.
     let trials = 9;
-    eprintln!("{:<34} {:>7} {:>9} {:>9} {:>12}", "case", "tokens", "min ns/t", "med ns/t", "allocs/token");
+    eprintln!(
+        "{:<34} {:>7} {:>9} {:>9} {:>12}",
+        "case", "tokens", "min ns/t", "med ns/t", "allocs/token"
+    );
     for case in cases() {
         let toks = pieces(&case.text);
         let mut sink = 0;
@@ -210,7 +298,14 @@ fn tool_stream_per_token_cost() {
         }
         let allocs = (ALLOCS.load(Relaxed) - a0) as f64 / (trials * reps * toks.len()) as f64;
         ns.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        eprintln!("{:<34} {:>7} {:>9.1} {:>9.1} {:>12.2}", case.name, toks.len(), ns[0], ns[trials / 2], allocs);
+        eprintln!(
+            "{:<34} {:>7} {:>9.1} {:>9.1} {:>12.2}",
+            case.name,
+            toks.len(),
+            ns[0],
+            ns[trials / 2],
+            allocs
+        );
         assert!(sink > 0);
     }
 }

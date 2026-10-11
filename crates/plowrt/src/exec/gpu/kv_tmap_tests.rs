@@ -128,7 +128,10 @@ fn rejects_invalid_or_conflicting_geometry() {
         assert!(kv_tensor_maps(&tensors, &[bad], 2).is_err());
     }
     let map16 = GenTensor::tmap_kv_pair_box(1, 2, 128, 256, 2, 16);
-    assert_eq!(kv_tensor_maps(&tensors, &[map16], 2).unwrap()[0].box_rows, 16);
+    assert_eq!(
+        kv_tensor_maps(&tensors, &[map16], 2).unwrap()[0].box_rows,
+        16
+    );
     let mut shared = tensors;
     shared.push(DevTensor {
         name: "second_map".into(),

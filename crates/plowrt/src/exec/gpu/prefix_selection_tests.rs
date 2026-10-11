@@ -3,18 +3,8 @@ use crate::asset::devblob::{DevProg, DevSection, DevTensor};
 
 #[test]
 fn long_context_live_kv_uses_reserved_ring_windows() {
-    assert!(!live_rings_for_capacity(
-        None,
-        true,
-        Some(65_536),
-        Some(32)
-    ));
-    assert!(live_rings_for_capacity(
-        None,
-        true,
-        Some(131_072),
-        Some(16)
-    ));
+    assert!(!live_rings_for_capacity(None, true, Some(65_536), Some(32)));
+    assert!(live_rings_for_capacity(None, true, Some(131_072), Some(16)));
     assert!(!live_rings_for_capacity(
         None,
         false,
@@ -26,12 +16,7 @@ fn long_context_live_kv_uses_reserved_ring_windows() {
 
 #[test]
 fn wide_live_kv_uses_reserved_ring_windows_without_changing_b32() {
-    assert!(!live_rings_for_capacity(
-        None,
-        true,
-        Some(20_480),
-        Some(32)
-    ));
+    assert!(!live_rings_for_capacity(None, true, Some(20_480), Some(32)));
     assert!(live_rings_for_capacity(None, true, Some(20_480), Some(64)));
 }
 
@@ -39,7 +24,12 @@ fn wide_live_kv_uses_reserved_ring_windows_without_changing_b32() {
 fn explicit_flat_rings_override_capacity_defaults() {
     for (ctx, batch) in [(8192, 64), (131_072, 16), (131_072, 64)] {
         assert!(live_rings_for_capacity(None, true, Some(ctx), Some(batch)));
-        assert!(!live_rings_for_capacity(Some(false), true, Some(ctx), Some(batch)));
+        assert!(!live_rings_for_capacity(
+            Some(false),
+            true,
+            Some(ctx),
+            Some(batch)
+        ));
     }
 }
 
@@ -155,9 +145,15 @@ fn automatic_prefix_selection_requires_compatible_execution_and_valid_kv_layout(
     blob.tensors[4].bytes /= 2;
     blob.tensors.push(tensor("kv.1.k_scale", 4096 * 4));
     blob.tensors.push(tensor("kv.1.v_scale", 4096 * 4));
-    assert!(selected(&blob, &cfg, (9, 0), 2 << 20), "fp8 full-layer KV is auto-qualified");
+    assert!(
+        selected(&blob, &cfg, (9, 0), 2 << 20),
+        "fp8 full-layer KV is auto-qualified"
+    );
     blob.tensors.pop();
-    assert!(!selected(&blob, &cfg, (9, 0), 2 << 20), "half a scale pair is geometry drift");
+    assert!(
+        !selected(&blob, &cfg, (9, 0), 2 << 20),
+        "half a scale pair is geometry drift"
+    );
     blob.tensors.push(tensor("kv.1.v_scale", 4096 * 4));
     cfg.nv.vmm_prefix = Some(true);
     assert!(selected(&blob, &cfg, (9, 0), 2 << 20));

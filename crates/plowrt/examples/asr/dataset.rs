@@ -1,6 +1,6 @@
 #[cfg(all(feature = "metal", target_os = "macos"))]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    use plowrt::asr::{frontend::decode_wav, audio_lm::AudioLmAsr};
+    use plowrt::asr::{audio_lm::AudioLmAsr, frontend::decode_wav};
     use serde_json::{json, Value};
     use std::{io::Write, path::Path, sync::atomic::AtomicBool, time::Instant};
     tracing_subscriber::fmt()

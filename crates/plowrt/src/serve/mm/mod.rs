@@ -27,7 +27,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use parking_lot::Mutex;
-use plow_asset::multimodal::{MmContract, MmModality, Processor, ROW_ID_BIT, SLAB_TENSOR, SPAN_ID_BIT, TABLE_TENSOR};
+use plow_asset::multimodal::{
+    MmContract, MmModality, Processor, ROW_ID_BIT, SLAB_TENSOR, SPAN_ID_BIT, TABLE_TENSOR,
+};
 use sha2::{Digest, Sha256};
 
 use crate::serve::openai::{ContentPart, Message};
@@ -41,10 +43,16 @@ pub struct MmError {
 
 impl MmError {
     fn bad(message: impl Into<String>) -> Self {
-        Self { status: 400, message: message.into() }
+        Self {
+            status: 400,
+            message: message.into(),
+        }
     }
     fn busy(message: impl Into<String>) -> Self {
-        Self { status: 503, message: message.into() }
+        Self {
+            status: 503,
+            message: message.into(),
+        }
     }
 }
 
@@ -134,7 +142,9 @@ impl Slab {
             return Ok(());
         }
         if !Arc::ptr_eq(&job.slab, self) {
-            return Err(crate::RuntimeError::Rejected("multimodal rows were reserved on another engine".into()));
+            return Err(crate::RuntimeError::Rejected(
+                "multimodal rows were reserved on another engine".into(),
+            ));
         }
         let mut s = self.state.lock();
         // `release` only undoes a staged job, so a failed stage drops the holds it took itself.
@@ -144,8 +154,13 @@ impl Slab {
             return Err(e);
         }
         job.staged = true;
-        match prompt.iter().find(|&&id| id & ROW_ID_BIT != 0 && !s.live.contains_key(&id)) {
-            Some(id) => Err(crate::RuntimeError::Rejected(format!("multimodal row {id:#010x} is not resident on this engine"))),
+        match prompt
+            .iter()
+            .find(|&&id| id & ROW_ID_BIT != 0 && !s.live.contains_key(&id))
+        {
+            Some(id) => Err(crate::RuntimeError::Rejected(format!(
+                "multimodal row {id:#010x} is not resident on this engine"
+            ))),
             None => Ok(()),
         }
     }
@@ -175,14 +190,27 @@ impl Slab {
                 *held += 1;
                 continue;
             }
-            let row = s.free.pop().ok_or_else(|| crate::RuntimeError::Rejected("multimodal slab exhausted".into()))?;
+            let row = s
+                .free
+                .pop()
+                .ok_or_else(|| crate::RuntimeError::Rejected("multimodal slab exhausted".into()))?;
             let mut slot = id & (self.cap - 1);
             while s.used[slot as usize] {
                 slot = (slot + 1) & (self.cap - 1);
             }
             let entry: [u32; 2] = [id, row];
-            let staged = write(SLAB_TENSOR, u64::from(row) * row_bytes as u64, bytemuck::cast_slice(&job.rows[i * self.hidden..(i + 1) * self.hidden]))
-                .and_then(|()| write(TABLE_TENSOR, u64::from(slot) * 8, bytemuck::cast_slice(&entry)));
+            let staged = write(
+                SLAB_TENSOR,
+                u64::from(row) * row_bytes as u64,
+                bytemuck::cast_slice(&job.rows[i * self.hidden..(i + 1) * self.hidden]),
+            )
+            .and_then(|()| {
+                write(
+                    TABLE_TENSOR,
+                    u64::from(slot) * 8,
+                    bytemuck::cast_slice(&entry),
+                )
+            });
             if let Err(e) = staged {
                 // The table entry may have landed: tombstone the slot so no probe trusts it.
                 s.free.push(row);
@@ -208,7 +236,9 @@ impl Slab {
 impl SlabState {
     fn drop_holds(&mut self, ids: &[u32]) {
         for id in ids {
-            let Some(e) = self.live.get_mut(id) else { continue };
+            let Some(e) = self.live.get_mut(id) else {
+                continue;
+            };
             e.2 -= 1;
             if e.2 == 0 {
                 let (slot, row, _) = self.live.remove(id).unwrap();
@@ -236,7 +266,9 @@ impl MmJob {
 
     /// The prompt holds bidirectional-span rows: its prefill chunks must not split them.
     pub fn spans(&self) -> bool {
-        self.ids.iter().any(|&id| plow_asset::multimodal::is_span_id(id))
+        self.ids
+            .iter()
+            .any(|&id| plow_asset::multimodal::is_span_id(id))
     }
 
     /// Move the reservation to `slab` (the job was routed to another engine). `false` when it is full.
@@ -261,8 +293,15 @@ impl Drop for MmJob {
 }
 
 enum Work {
-    Images(Vec<media::Patches>, tokio::sync::oneshot::Sender<crate::Result<Vec<Vec<f32>>>>),
-    Audio(media::Mel, usize, tokio::sync::oneshot::Sender<crate::Result<Vec<f32>>>),
+    Images(
+        Vec<media::Patches>,
+        tokio::sync::oneshot::Sender<crate::Result<Vec<Vec<f32>>>>,
+    ),
+    Audio(
+        media::Mel,
+        usize,
+        tokio::sync::oneshot::Sender<crate::Result<Vec<f32>>>,
+    ),
 }
 
 /// An encoder on its own thread (its own launches; the LM dispatcher never waits on it).
@@ -313,7 +352,9 @@ impl Worker {
                 }
             })
             .map_err(|e| crate::RuntimeError::Rejected(format!("encoder thread: {e}")))?;
-        ready_rx.recv().map_err(|_| crate::RuntimeError::Rejected("encoder thread died".into()))??;
+        ready_rx
+            .recv()
+            .map_err(|_| crate::RuntimeError::Rejected("encoder thread died".into()))??;
         Ok(Self { tx })
     }
 }
@@ -348,7 +389,8 @@ pub struct EncodeStats {
 impl MmStats {
     fn record(&self, s: &EncodeStats, since: std::time::Instant) {
         s.calls.fetch_add(1, Ordering::Relaxed);
-        s.micros.fetch_add(since.elapsed().as_micros() as u64, Ordering::Relaxed);
+        s.micros
+            .fetch_add(since.elapsed().as_micros() as u64, Ordering::Relaxed);
     }
 }
 
@@ -398,7 +440,9 @@ pub fn media_parts(messages: &[Message]) -> Vec<&ContentPart> {
     messages
         .iter()
         .filter_map(|m| match &m.content {
-            Some(crate::serve::openai::Content::Parts(parts)) => Some(parts.iter().filter(|p| p.media_kind().is_some())),
+            Some(crate::serve::openai::Content::Parts(parts)) => {
+                Some(parts.iter().filter(|p| p.media_kind().is_some()))
+            }
             _ => None,
         })
         .flatten()
@@ -406,7 +450,11 @@ pub fn media_parts(messages: &[Message]) -> Vec<&ContentPart> {
 }
 
 fn patch_params(m: &MmModality) -> Result<media::PatchParams, MmError> {
-    let u = |k: &str| m.param(k).map(|v| v as u32).ok_or_else(|| MmError::bad(format!("image contract lacks {k}")));
+    let u = |k: &str| {
+        m.param(k)
+            .map(|v| v as u32)
+            .ok_or_else(|| MmError::bad(format!("image contract lacks {k}")))
+    };
     let f = |k: &str, d: f32| m.param_f32(k).unwrap_or(d);
     Ok(media::PatchParams {
         patch: u("patch_size")?,
@@ -414,14 +462,26 @@ fn patch_params(m: &MmModality) -> Result<media::PatchParams, MmError> {
         max_soft_tokens: u("max_soft_tokens")?,
         rescale: f("rescale_f32", 1.0 / 255.0),
         normalize: m.param("normalize") == Some(1),
-        mean: [f("mean0_f32", 0.0), f("mean1_f32", 0.0), f("mean2_f32", 0.0)],
+        mean: [
+            f("mean0_f32", 0.0),
+            f("mean1_f32", 0.0),
+            f("mean2_f32", 0.0),
+        ],
         std: [f("std0_f32", 1.0), f("std1_f32", 1.0), f("std2_f32", 1.0)],
     })
 }
 
 fn mel_params(m: &MmModality) -> Result<media::MelParams, MmError> {
-    let u = |k: &str| m.param(k).map(|v| v as usize).ok_or_else(|| MmError::bad(format!("audio contract lacks {k}")));
-    let f = |k: &str| m.param_f32(k).map(f64::from).ok_or_else(|| MmError::bad(format!("audio contract lacks {k}")));
+    let u = |k: &str| {
+        m.param(k)
+            .map(|v| v as usize)
+            .ok_or_else(|| MmError::bad(format!("audio contract lacks {k}")))
+    };
+    let f = |k: &str| {
+        m.param_f32(k)
+            .map(f64::from)
+            .ok_or_else(|| MmError::bad(format!("audio contract lacks {k}")))
+    };
     Ok(media::MelParams {
         sample_rate: u("sample_rate")? as u32,
         frame_length: u("frame_length")?,
@@ -453,13 +513,24 @@ fn digest(kind: &str, parts: &[&[u8]]) -> [u8; 32] {
 
 /// Same RGB bytes at another shape preprocess to different patches.
 fn image_digest(kind: &str, img: &media::Rgb) -> [u8; 32] {
-    digest(kind, &[&img.width.to_le_bytes(), &img.height.to_le_bytes(), &img.data])
+    digest(
+        kind,
+        &[
+            &img.width.to_le_bytes(),
+            &img.height.to_le_bytes(),
+            &img.data,
+        ],
+    )
 }
 
 /// Bit-31 ids of `rows` soft-token rows of the item with `digest`; bit 30 marks a
 /// bidirectional-span item (30-bit hash either way).
 pub fn row_ids(digest: &[u8; 32], rows: usize, span: bool) -> Vec<u32> {
-    let tag = if span { ROW_ID_BIT | SPAN_ID_BIT } else { ROW_ID_BIT };
+    let tag = if span {
+        ROW_ID_BIT | SPAN_ID_BIT
+    } else {
+        ROW_ID_BIT
+    };
     (0..rows as u32)
         .map(|k| {
             let mut h = Sha256::new();
@@ -471,48 +542,93 @@ pub fn row_ids(digest: &[u8; 32], rows: usize, span: bool) -> Vec<u32> {
         .collect()
 }
 
-fn prepare_one(part: &ContentPart, contract: &MmContract, limits: &Limits) -> Result<Prepared, MmError> {
+fn prepare_one(
+    part: &ContentPart,
+    contract: &MmContract,
+    limits: &Limits,
+) -> Result<Prepared, MmError> {
     let kind = part.media_kind().unwrap_or_default();
     let modality = contract
         .modality(kind)
         .ok_or_else(|| MmError::bad(format!("unsupported content type for this model: {kind}")))?;
     // Validated when the packet loaded; the kind of each processor matches its modality's.
-    let processor = modality.processor().map_err(|e| MmError { status: 500, message: e })?;
+    let processor = modality.processor().map_err(|e| MmError {
+        status: 500,
+        message: e,
+    })?;
     match (part, processor) {
         (
-            ContentPart::ImageUrl { image_url: crate::serve::openai::ImageUrl { url, .. } } | ContentPart::InputImage { image_url: url },
+            ContentPart::ImageUrl {
+                image_url: crate::serve::openai::ImageUrl { url, .. },
+            }
+            | ContentPart::InputImage { image_url: url },
             Processor::AspectPatches,
         ) => {
             if url.starts_with("http://") || url.starts_with("https://") {
-                return Err(MmError::bad("image URLs must be data: URLs; this server does not fetch http(s) media"));
+                return Err(MmError::bad(
+                    "image URLs must be data: URLs; this server does not fetch http(s) media",
+                ));
             }
             let (_, bytes) = media::data_url(url).map_err(MmError::bad)?;
             let img = media::decode_image(&bytes, limits.max_image_pixels).map_err(MmError::bad)?;
-            let patches = media::image_patches(&img, &patch_params(modality)?).map_err(MmError::bad)?;
+            let patches =
+                media::image_patches(&img, &patch_params(modality)?).map_err(MmError::bad)?;
             Ok(Prepared::Image(patches, image_digest(kind, &img)))
         }
-        (ContentPart::InputAudio { input_audio }, Processor::SemicausalLogMel | Processor::WaveformFrames) => {
-            let format = input_audio.format.as_deref().unwrap_or("wav").to_ascii_lowercase();
+        (
+            ContentPart::InputAudio { input_audio },
+            Processor::SemicausalLogMel | Processor::WaveformFrames,
+        ) => {
+            let format = input_audio
+                .format
+                .as_deref()
+                .unwrap_or("wav")
+                .to_ascii_lowercase();
             let bytes = media::base64_decode(&input_audio.data).map_err(MmError::bad)?;
-            let (samples, rate) = media::decode_audio(&bytes, &format, limits.max_audio_seconds).map_err(MmError::bad)?;
+            let (samples, rate) = media::decode_audio(&bytes, &format, limits.max_audio_seconds)
+                .map_err(MmError::bad)?;
             audio(samples, rate, modality, processor, limits, kind)
         }
-        (ContentPart::AudioUrl { audio_url }, Processor::SemicausalLogMel | Processor::WaveformFrames) => {
+        (
+            ContentPart::AudioUrl { audio_url },
+            Processor::SemicausalLogMel | Processor::WaveformFrames,
+        ) => {
             if audio_url.url.starts_with("http://") || audio_url.url.starts_with("https://") {
-                return Err(MmError::bad("audio URLs must be data: URLs; this server does not fetch http(s) media"));
+                return Err(MmError::bad(
+                    "audio URLs must be data: URLs; this server does not fetch http(s) media",
+                ));
             }
             let (mime, bytes) = media::data_url(&audio_url.url).map_err(MmError::bad)?;
-            let (samples, rate) = media::decode_audio(&bytes, media::mime_audio_format(&mime), limits.max_audio_seconds).map_err(MmError::bad)?;
+            let (samples, rate) = media::decode_audio(
+                &bytes,
+                media::mime_audio_format(&mime),
+                limits.max_audio_seconds,
+            )
+            .map_err(MmError::bad)?;
             audio(samples, rate, modality, processor, limits, kind)
         }
-        (_, p) => Err(MmError::bad(format!("a {kind} part cannot use the {} processor", p.name()))),
+        (_, p) => Err(MmError::bad(format!(
+            "a {kind} part cannot use the {} processor",
+            p.name()
+        ))),
     }
 }
 
-fn audio(samples: Vec<f32>, rate: u32, m: &MmModality, processor: Processor, limits: &Limits, kind: &str) -> Result<Prepared, MmError> {
+fn audio(
+    samples: Vec<f32>,
+    rate: u32,
+    m: &MmModality,
+    processor: Processor,
+    limits: &Limits,
+    kind: &str,
+) -> Result<Prepared, MmError> {
     let seconds = samples.len() as f64 / f64::from(rate.max(1));
     if processor == Processor::WaveformFrames {
-        let u = |k: &str| m.param(k).map(|v| v as usize).ok_or_else(|| MmError::bad(format!("audio contract lacks {k}")));
+        let u = |k: &str| {
+            m.param(k)
+                .map(|v| v as usize)
+                .ok_or_else(|| MmError::bad(format!("audio contract lacks {k}")))
+        };
         let (sample_rate, frame) = (u("sample_rate")? as u32, u("frame_samples")?);
         let cap = (u("max_soft_tokens")? * frame) as f64 / f64::from(sample_rate);
         if seconds > limits.max_audio_seconds.min(cap) {
@@ -531,7 +647,9 @@ fn audio(samples: Vec<f32>, rate: u32, m: &MmModality, processor: Processor, lim
         return Ok(Prepared::Audio(frames, tokens, digest(kind, &[&raw])));
     }
     let p = mel_params(m)?;
-    let cap = m.param("max_samples").map_or(f64::INFINITY, |s| s as f64 / f64::from(p.sample_rate));
+    let cap = m
+        .param("max_samples")
+        .map_or(f64::INFINITY, |s| s as f64 / f64::from(p.sample_rate));
     if seconds > limits.max_audio_seconds.min(cap) {
         return Err(MmError::bad(format!(
             "audio clip is {seconds:.1} s; at most {:.1} s per clip",
@@ -575,7 +693,9 @@ fn soft_tokens(p: &Prepared) -> usize {
 /// MB transient apiece) on the blocking pool, whose 512 threads would otherwise be the only bound.
 fn media_permits() -> &'static tokio::sync::Semaphore {
     static PERMITS: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
-    PERMITS.get_or_init(|| tokio::sync::Semaphore::new(std::thread::available_parallelism().map_or(1, usize::from)))
+    PERMITS.get_or_init(|| {
+        tokio::sync::Semaphore::new(std::thread::available_parallelism().map_or(1, usize::from))
+    })
 }
 
 /// Expand `prompt_ids` for the media parts of `messages`: each placeholder the template rendered
@@ -591,27 +711,44 @@ pub async fn expand(
     if parts.is_empty() {
         return Ok(None);
     }
-    let images = parts.iter().filter(|p| p.media_kind() == Some("image")).count();
+    let images = parts
+        .iter()
+        .filter(|p| p.media_kind() == Some("image"))
+        .count();
     let clips = parts.len() - images;
     if images > limits.max_images {
-        return Err(MmError::bad(format!("{images} images; at most {} per request", limits.max_images)));
+        return Err(MmError::bad(format!(
+            "{images} images; at most {} per request",
+            limits.max_images
+        )));
     }
     if clips > limits.max_audio {
-        return Err(MmError::bad(format!("{clips} audio clips; at most {} per request", limits.max_audio)));
+        return Err(MmError::bad(format!(
+            "{clips} audio clips; at most {} per request",
+            limits.max_audio
+        )));
     }
     for p in &parts {
         let kind = p.media_kind().unwrap_or_default();
         if contract.modality(kind).is_none() {
-            return Err(MmError::bad(format!("unsupported content type for this model: {kind}")));
+            return Err(MmError::bad(format!(
+                "unsupported content type for this model: {kind}"
+            )));
         }
     }
     let prepared = {
         let contract = contract.clone();
-        let permit = media_permits().acquire().await.map_err(|e| MmError::busy(format!("media preprocessing unavailable: {e}")))?;
+        let permit = media_permits()
+            .acquire()
+            .await
+            .map_err(|e| MmError::busy(format!("media preprocessing unavailable: {e}")))?;
         tokio::task::spawn_blocking(move || {
             // Held by the blocking task itself: a dropped request must not free the slot early.
             let _permit = permit;
-            parts.iter().map(|p| prepare_one(p, &contract, &limits)).collect::<Result<Vec<_>, _>>()
+            parts
+                .iter()
+                .map(|p| prepare_one(p, &contract, &limits))
+                .collect::<Result<Vec<_>, _>>()
         })
         .await
         .map_err(|e| MmError::bad(format!("media preprocessing failed: {e}")))??
@@ -623,7 +760,16 @@ pub async fn expand(
             slots.push((pos, m));
         }
     }
-    let kinds: Vec<&str> = prepared.iter().map(|p| if matches!(p, Prepared::Image(..)) { "image" } else { "audio" }).collect();
+    let kinds: Vec<&str> = prepared
+        .iter()
+        .map(|p| {
+            if matches!(p, Prepared::Image(..)) {
+                "image"
+            } else {
+                "audio"
+            }
+        })
+        .collect();
     if slots.len() != kinds.len() || slots.iter().zip(&kinds).any(|((_, m), k)| m.kind != *k) {
         return Err(MmError::bad(format!(
             "the chat template rendered {} media placeholders for {} media parts; the prompt text must not contain \
@@ -672,10 +818,22 @@ pub async fn encode(mm: &MmModel, pending: Pending) -> Result<Box<MmJob>, MmErro
     }
     if !mm.slab.reserve(n) {
         mm.stats.slab_full.fetch_add(1, Ordering::Relaxed);
-        return Err(MmError::busy(format!("multimodal rows are full ({} rows in flight); retry", mm.slab.rows)));
+        return Err(MmError::busy(format!(
+            "multimodal rows are full ({} rows in flight); retry",
+            mm.slab.rows
+        )));
     }
-    let mut job = Box::new(MmJob { ids: Vec::new(), rows: Vec::new(), slab: Arc::clone(&mm.slab), reserved: n, staged: false });
-    let encode_err = |e: crate::RuntimeError| MmError { status: 500, message: format!("encoder failed: {e}") };
+    let mut job = Box::new(MmJob {
+        ids: Vec::new(),
+        rows: Vec::new(),
+        slab: Arc::clone(&mm.slab),
+        reserved: n,
+        staged: false,
+    });
+    let encode_err = |e: crate::RuntimeError| MmError {
+        status: 500,
+        message: format!("encoder failed: {e}"),
+    };
     // All images in one batch per launch rung, each clip on its own; both encoders start before
     // either is awaited.
     let mut image_index = Vec::new();
@@ -694,29 +852,44 @@ pub async fn encode(mm: &MmModel, pending: Pending) -> Result<Box<MmJob>, MmErro
     let image_rx = match images.is_empty() {
         true => None,
         false => {
-            let tx = mm.worker(contract.modality("image").unwrap()).await.map_err(encode_err)?;
+            let tx = mm
+                .worker(contract.modality("image").unwrap())
+                .await
+                .map_err(encode_err)?;
             let (reply, rx) = tokio::sync::oneshot::channel();
-            tx.send(Work::Images(images, reply)).map_err(|_| MmError::busy("image encoder is unavailable"))?;
+            tx.send(Work::Images(images, reply))
+                .map_err(|_| MmError::busy("image encoder is unavailable"))?;
             Some(rx)
         }
     };
     let mut clip_rx = Vec::with_capacity(clips.len());
     for (i, mel, tokens) in clips {
-        let tx = mm.worker(contract.modality("audio").unwrap()).await.map_err(encode_err)?;
+        let tx = mm
+            .worker(contract.modality("audio").unwrap())
+            .await
+            .map_err(encode_err)?;
         let (reply, rx) = tokio::sync::oneshot::channel();
-        tx.send(Work::Audio(mel, tokens, reply)).map_err(|_| MmError::busy("audio encoder is unavailable"))?;
+        tx.send(Work::Audio(mel, tokens, reply))
+            .map_err(|_| MmError::busy("audio encoder is unavailable"))?;
         clip_rx.push((i, rx));
     }
     let mut rows: Vec<Option<Vec<f32>>> = vec![None; ids.len()];
     if let Some(rx) = image_rx {
-        let out = rx.await.map_err(|_| MmError::busy("image encoder is unavailable"))?.map_err(encode_err)?;
+        let out = rx
+            .await
+            .map_err(|_| MmError::busy("image encoder is unavailable"))?
+            .map_err(encode_err)?;
         mm.stats.record(&mm.stats.image, started);
         for (i, r) in image_index.into_iter().zip(out) {
             rows[i] = Some(r);
         }
     }
     for (i, rx) in clip_rx {
-        rows[i] = Some(rx.await.map_err(|_| MmError::busy("audio encoder is unavailable"))?.map_err(encode_err)?);
+        rows[i] = Some(
+            rx.await
+                .map_err(|_| MmError::busy("audio encoder is unavailable"))?
+                .map_err(encode_err)?,
+        );
         mm.stats.record(&mm.stats.audio, started);
     }
     let hidden = contract.hidden as usize;
@@ -727,7 +900,11 @@ pub async fn encode(mm: &MmModel, pending: Pending) -> Result<Box<MmJob>, MmErro
         if r.len() != ids.len() * hidden {
             return Err(MmError {
                 status: 500,
-                message: format!("encoder returned {} values for {} soft tokens of width {hidden}", r.len(), ids.len()),
+                message: format!(
+                    "encoder returned {} values for {} soft tokens of width {hidden}",
+                    r.len(),
+                    ids.len()
+                ),
             });
         }
         job.ids.extend(ids);
@@ -741,20 +918,34 @@ mod tests {
     use super::*;
 
     fn contract() -> MmContract {
-        MmContract { version: 1, hidden: 2, pad_token: 0, slab_rows: 4, table_capacity: 8, modalities: Vec::new() }
+        MmContract {
+            version: 1,
+            hidden: 2,
+            pad_token: 0,
+            slab_rows: 4,
+            table_capacity: 8,
+            modalities: Vec::new(),
+        }
     }
 
     #[test]
     fn row_ids_are_content_keyed_and_tagged() {
         let a = row_ids(&digest("image", &[b"one"]), 3, false);
         let b = row_ids(&digest("image", &[b"two"]), 3, false);
-        assert!(a.iter().chain(&b).all(|&id| id & ROW_ID_BIT != 0 && id & SPAN_ID_BIT == 0 && id > TOMBSTONE));
+        assert!(a
+            .iter()
+            .chain(&b)
+            .all(|&id| id & ROW_ID_BIT != 0 && id & SPAN_ID_BIT == 0 && id > TOMBSTONE));
         assert_ne!(a, b);
         assert_eq!(a, row_ids(&digest("image", &[b"one"]), 3, false));
         assert_ne!(a[0], a[1]);
         let s = row_ids(&digest("image", &[b"one"]), 3, true);
         assert!(s.iter().all(|&id| plow_asset::multimodal::is_span_id(id)));
-        assert_eq!(s.iter().map(|id| id & !SPAN_ID_BIT).collect::<Vec<_>>(), a, "the span bit only tags");
+        assert_eq!(
+            s.iter().map(|id| id & !SPAN_ID_BIT).collect::<Vec<_>>(),
+            a,
+            "the span bit only tags"
+        );
     }
 
     #[test]
@@ -765,27 +956,47 @@ mod tests {
         let write = |t: &str, off: u64, b: &[u8]| -> crate::Result<()> {
             if t == TABLE_TENSOR {
                 let words: &[u32] = bytemuck::cast_slice(b);
-                table.borrow_mut()[off as usize / 4..off as usize / 4 + words.len()].copy_from_slice(words);
+                table.borrow_mut()[off as usize / 4..off as usize / 4 + words.len()]
+                    .copy_from_slice(words);
             } else {
                 let h: &[u16] = bytemuck::cast_slice(b);
-                slab_rows.borrow_mut()[off as usize / 2..off as usize / 2 + h.len()].copy_from_slice(h);
+                slab_rows.borrow_mut()[off as usize / 2..off as usize / 2 + h.len()]
+                    .copy_from_slice(h);
             }
             Ok(())
         };
         assert!(slab.reserve(2));
-        let mut a = MmJob { ids: vec![0x8000_0005, 0x8000_000d], rows: vec![1, 2, 3, 4], slab: slab.clone(), reserved: 2, staged: false };
+        let mut a = MmJob {
+            ids: vec![0x8000_0005, 0x8000_000d],
+            rows: vec![1, 2, 3, 4],
+            slab: slab.clone(),
+            reserved: 2,
+            staged: false,
+        };
         slab.stage(&mut a, &[], write).unwrap();
         // Both ids home at slot 5; the second probes to 6. Rows come off the free list from 0.
         assert_eq!(&table.borrow()[10..14], &[0x8000_0005, 0, 0x8000_000d, 1]);
         assert_eq!(&slab_rows.borrow()[0..4], &[1, 2, 3, 4]);
         assert!(slab.reserve(2));
         assert!(!slab.reserve(1));
-        let mut b = MmJob { ids: vec![0x8000_000d], rows: vec![3, 4], slab: slab.clone(), reserved: 2, staged: false };
+        let mut b = MmJob {
+            ids: vec![0x8000_000d],
+            rows: vec![3, 4],
+            slab: slab.clone(),
+            reserved: 2,
+            staged: false,
+        };
         slab.stage(&mut b, &[], write).unwrap();
         drop(a);
         // 0x...d is still held by `b`; 0x...5 is a tombstone at the next stage.
         assert!(slab.reserve(1));
-        let mut c = MmJob { ids: vec![0x8000_0105], rows: vec![9, 9], slab: slab.clone(), reserved: 1, staged: false };
+        let mut c = MmJob {
+            ids: vec![0x8000_0105],
+            rows: vec![9, 9],
+            slab: slab.clone(),
+            reserved: 1,
+            staged: false,
+        };
         slab.stage(&mut c, &[], write).unwrap();
         assert_eq!(table.borrow()[10], 0x8000_0105, "a freed slot is reused");
         drop(b);
@@ -816,7 +1027,13 @@ mod tests {
 
     fn job(slab: &Arc<Slab>, ids: &[u32]) -> MmJob {
         assert!(slab.reserve(ids.len() as u32));
-        MmJob { ids: ids.to_vec(), rows: vec![7; ids.len() * 2], slab: slab.clone(), reserved: ids.len() as u32, staged: false }
+        MmJob {
+            ids: ids.to_vec(),
+            rows: vec![7; ids.len() * 2],
+            slab: slab.clone(),
+            reserved: ids.len() as u32,
+            staged: false,
+        }
     }
 
     #[test]
@@ -845,7 +1062,11 @@ mod tests {
         let id = 0x8000_0005;
         let mut j = job(&rank0, &[id]);
         assert!(rank1.stage(&mut j, &[id, 1], write_to(&dev1)).is_err());
-        assert_eq!(dev1.borrow().0, vec![0; 16], "nothing reaches the other engine's table");
+        assert_eq!(
+            dev1.borrow().0,
+            vec![0; 16],
+            "nothing reaches the other engine's table"
+        );
         assert!(j.rebind(&rank1));
         assert!(rank0.reserve(4), "the old engine's reservation is returned");
         assert!(!rank1.reserve(4), "the new engine holds it");
@@ -854,18 +1075,33 @@ mod tests {
     }
 
     fn run<T>(f: impl std::future::Future<Output = T>) -> T {
-        tokio::runtime::Builder::new_current_thread().build().unwrap().block_on(f)
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(f)
     }
 
     #[test]
     fn slab_refusals_come_before_encoder_work_and_return_their_rows() {
         let mm = MmModel::new(Path::new("/nonexistent"), &contract(), 0);
-        let pending = |n: usize| Pending { prepared: Vec::new(), ids: vec![(0..n as u32).map(|k| ROW_ID_BIT | (k + 2)).collect()] };
+        let pending = |n: usize| Pending {
+            prepared: Vec::new(),
+            ids: vec![(0..n as u32).map(|k| ROW_ID_BIT | (k + 2)).collect()],
+        };
         let err = run(encode(&mm, pending(5))).err().unwrap();
-        assert_eq!(err.status, 400, "more rows than the slab holds never fit: {}", err.message);
+        assert_eq!(
+            err.status, 400,
+            "more rows than the slab holds never fit: {}",
+            err.message
+        );
         assert!(mm.slab.reserve(3));
         let err = run(encode(&mm, pending(2))).err().unwrap();
-        assert_eq!((err.status, mm.stats.slab_full.load(Ordering::Relaxed)), (503, 1), "{}", err.message);
+        assert_eq!(
+            (err.status, mm.stats.slab_full.load(Ordering::Relaxed)),
+            (503, 1),
+            "{}",
+            err.message
+        );
         mm.slab.release(&[], false, 3);
         // Admitted, then the encoder step fails (no rows here): the reservation is returned.
         let err = run(encode(&mm, pending(4))).err().unwrap();
@@ -894,7 +1130,9 @@ mod tests {
         let slab = Arc::new(Slab::new(&contract()));
         let dev = device();
         let mut j = job(&slab, &[0x8000_0005]);
-        let err = slab.stage(&mut j, &[1, 0x8000_0005, 0x8000_0009, 2], write_to(&dev)).unwrap_err();
+        let err = slab
+            .stage(&mut j, &[1, 0x8000_0005, 0x8000_0009, 2], write_to(&dev))
+            .unwrap_err();
         assert!(err.to_string().contains("0x80000009"), "{err}");
         drop(j);
         assert!(slab.reserve(4), "the failed job releases what it staged");
@@ -918,7 +1156,11 @@ mod tests {
             inner(t, off, b)
         };
         assert!(slab.stage(&mut j, &[], failing).is_err());
-        assert_eq!(slab.occupancy(), (4, 1, 4), "only the earlier job's row stays live");
+        assert_eq!(
+            slab.occupancy(),
+            (4, 1, 4),
+            "only the earlier job's row stays live"
+        );
         drop(j);
         drop(shared);
         assert_eq!(slab.occupancy(), (0, 0, 4));
@@ -927,8 +1169,22 @@ mod tests {
 
     #[test]
     fn image_digest_includes_dimensions() {
-        let wide = image_digest("image", &media::Rgb { width: 2, height: 1, data: vec![1; 6] });
-        let tall = image_digest("image", &media::Rgb { width: 1, height: 2, data: vec![1; 6] });
+        let wide = image_digest(
+            "image",
+            &media::Rgb {
+                width: 2,
+                height: 1,
+                data: vec![1; 6],
+            },
+        );
+        let tall = image_digest(
+            "image",
+            &media::Rgb {
+                width: 1,
+                height: 2,
+                data: vec![1; 6],
+            },
+        );
         assert_ne!(row_ids(&wide, 2, true), row_ids(&tall, 2, true));
     }
 

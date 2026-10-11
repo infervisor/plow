@@ -19,14 +19,32 @@ fn packed_admission_retries_after_retirement_and_preserves_waiter_priority() {
     }
     assert!(!ready.is_empty() && !waiting.is_empty());
     let epoch = e.kv_admission_epoch;
-    let created = e.vmm.as_ref().unwrap().kv.as_ref().unwrap().stats().blocks_created;
+    let created = e
+        .vmm
+        .as_ref()
+        .unwrap()
+        .kv
+        .as_ref()
+        .unwrap()
+        .stats()
+        .blocks_created;
     for _ in 0..16 {
         for &slot in &waiting {
             assert!(e.admit_packed_slot(slot, &[1, 2], total).unwrap().is_none());
         }
     }
     assert_eq!(e.kv_admission_epoch, epoch);
-    assert_eq!(e.vmm.as_ref().unwrap().kv.as_ref().unwrap().stats().blocks_created, created);
+    assert_eq!(
+        e.vmm
+            .as_ref()
+            .unwrap()
+            .kv
+            .as_ref()
+            .unwrap()
+            .stats()
+            .blocks_created,
+        created
+    );
     let freed = ready[0];
     e.retire_slot(freed, false);
     assert!(e
@@ -58,7 +76,10 @@ fn packed_runtime_tables_are_excluded_from_both_weight_consumers() {
         version: 1,
         max_request_rows: None,
         stage_rows: Some(1024),
-        stages: vec![plow_asset::packed_prefill::Stage { slot: 8, request: 9 }],
+        stages: vec![plow_asset::packed_prefill::Stage {
+            slot: 8,
+            request: 9,
+        }],
         slot: 4,
         request: 5,
         maps: vec![plow_asset::packed_prefill::Map {
@@ -300,9 +321,18 @@ fn admission_maps_the_rows_launches_can_write_and_no_more() {
     // Masked padding: prompt + max_tokens + one decode quantum, independent of the bucket.
     assert_eq!(admission_rows(9_000 + 128, 9_000, 9, None, 16_384), 9_137);
     // Unmasked padding: a prefilling prompt can be charged a whole bucket of pad rows.
-    assert_eq!(admission_rows(9_000 + 128, 9_000, 9, Some(4_224), 16_384), 13_224);
-    assert_eq!(admission_rows(100 + 8_000, 100, 9, Some(4_224), 16_384), 8_109);
+    assert_eq!(
+        admission_rows(9_000 + 128, 9_000, 9, Some(4_224), 16_384),
+        13_224
+    );
+    assert_eq!(
+        admission_rows(100 + 8_000, 100, 9, Some(4_224), 16_384),
+        8_109
+    );
     // Never past the compiled context.
     assert_eq!(admission_rows(16_384, 16_000, 9, None, 16_384), 16_384);
-    assert_eq!(admission_rows(16_000, 15_000, 9, Some(4_224), 16_384), 16_384);
+    assert_eq!(
+        admission_rows(16_000, 15_000, 9, Some(4_224), 16_384),
+        16_384
+    );
 }

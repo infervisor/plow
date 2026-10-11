@@ -476,7 +476,9 @@ pub(crate) fn weight_slab_enabled() -> bool {
 /// triage, not tuning.
 #[cfg(feature = "cuda")]
 pub(crate) fn weight_vmm_enabled() -> bool {
-    crate::config::RuntimeConfig::get().weight_vmm.unwrap_or(true)
+    crate::config::RuntimeConfig::get()
+        .weight_vmm
+        .unwrap_or(true)
 }
 
 /// `--nv-upload-direct false` / `PLOW_UPLOAD_DIRECT=0` forces the
@@ -500,7 +502,9 @@ pub(crate) fn upload_direct_enabled() -> bool {
 /// default only with a measurement on a gfx950 box.
 #[cfg(feature = "hsa")]
 pub(crate) fn weight_vmm_amd_enabled() -> bool {
-    crate::config::RuntimeConfig::get().weight_vmm.unwrap_or(false)
+    crate::config::RuntimeConfig::get()
+        .weight_vmm
+        .unwrap_or(false)
 }
 
 impl Prefetcher {

@@ -579,7 +579,11 @@ pub fn compile(src: &Source, opts: &Options) -> Result<Report, PlowcError> {
 }
 
 /// Compile with an explicit serving identity, independent of the network slug.
-pub fn compile_named(src: &Source, opts: &Options, served_name: Option<String>) -> Result<Report, PlowcError> {
+pub fn compile_named(
+    src: &Source,
+    opts: &Options,
+    served_name: Option<String>,
+) -> Result<Report, PlowcError> {
     let started = std::time::Instant::now();
     info!(
         network = %src.name(), target = %opts.gpu, output = %opts.out.display(),
@@ -958,7 +962,9 @@ pub fn compile_named(src: &Source, opts: &Options, served_name: Option<String>) 
         network: src.name(),
         served_name: served_name.or_else(|| match src {
             Source::HfDir(dir) => hf_config::hub_repo_id(dir),
-            Source::Model(id) if std::path::Path::new(id).is_dir() => hf_config::hub_repo_id(std::path::Path::new(id)),
+            Source::Model(id) if std::path::Path::new(id).is_dir() => {
+                hf_config::hub_repo_id(std::path::Path::new(id))
+            }
             Source::Model(id) => Some(id.clone()),
             Source::Net(_) => None,
         }),
@@ -1221,13 +1227,21 @@ fn flash_effects(
     cons: &rewrite::ConstraintSet,
     map: &schedule::AddressMap,
 ) -> schedule::memory::TensorTaskSets {
-    flash_ops(tasks, cons).into_iter().filter_map(|(op, layer)| {
-        let name = format!("kv_cache_L{layer}");
-        map.get(&name)?;
-        let ids: Vec<_> = tasks.tasks.iter().enumerate()
-            .filter(|(_, task)| task.op == op).map(|(id, _)| id).collect();
-        Some((name, (ids.clone(), ids)))
-    }).collect()
+    flash_ops(tasks, cons)
+        .into_iter()
+        .filter_map(|(op, layer)| {
+            let name = format!("kv_cache_L{layer}");
+            map.get(&name)?;
+            let ids: Vec<_> = tasks
+                .tasks
+                .iter()
+                .enumerate()
+                .filter(|(_, task)| task.op == op)
+                .map(|(id, _)| id)
+                .collect();
+            Some((name, (ids.clone(), ids)))
+        })
+        .collect()
 }
 
 /// Build the decode-phase KV read address sidecar. Returns `None` for
@@ -2167,18 +2181,24 @@ fn verify_A(bucket: &str) -> Result<bool, PlowcError> {
 pub fn rewrite_body_request(source: &str) -> Result<serde_json::Value, PlowcError> {
     fn term(value: rewrite::rule_body::Term) -> serde_json::Value {
         match value {
-            rewrite::rule_body::Term::Atom { kind, value } => serde_json::json!([kind,value,[]]),
-            rewrite::rule_body::Term::Call { head, args } =>
-                serde_json::json!(["call",head,args.into_iter().map(term).collect::<Vec<_>>()]),
+            rewrite::rule_body::Term::Atom { kind, value } => serde_json::json!([kind, value, []]),
+            rewrite::rule_body::Term::Call { head, args } => {
+                serde_json::json!(["call", head, args.into_iter().map(term).collect::<Vec<_>>()])
+            }
         }
     }
     let names = parse_rule_catalog(source)?;
     let bodies = rewrite::rule_body::parse(source).map_err(PlowcError::RuleCatalog)?;
     if names.len() != bodies.len() || names.is_empty() {
-        return Err(PlowcError::RuleCatalog("incomplete rewrite body catalog".into()));
+        return Err(PlowcError::RuleCatalog(
+            "incomplete rewrite body catalog".into(),
+        ));
     }
-    let bodies: Vec<_> = names.iter().zip(bodies).map(|(name,(lhs,rhs))|
-        serde_json::json!({"name":name,"lhs":term(lhs),"rhs":term(rhs)})).collect();
+    let bodies: Vec<_> = names
+        .iter()
+        .zip(bodies)
+        .map(|(name, (lhs, rhs))| serde_json::json!({"name":name,"lhs":term(lhs),"rhs":term(rhs)}))
+        .collect();
     Ok(serde_json::json!({"rules":names,"bodies":bodies,
         "source_sha256":plow_asset::decode_objects::image_sha256(source.as_bytes())}))
 }
@@ -2305,8 +2325,16 @@ fn verify_D(
     cons: &rewrite::ConstraintSet,
 ) -> Result<bool, PlowcError> {
     let request = schedule::lean_verify::build_schedule_request_with_effects(
-        tasks, sched, amap, task_sets, &flash_effects(tasks, cons, amap))
-        .map_err(|reason| PlowcError::LeanVerify { bucket: bucket.into(), reason })?;
+        tasks,
+        sched,
+        amap,
+        task_sets,
+        &flash_effects(tasks, cons, amap),
+    )
+    .map_err(|reason| PlowcError::LeanVerify {
+        bucket: bucket.into(),
+        reason,
+    })?;
     debug!(
         "[lean-verify:D] {bucket}: submitting — {n_tasks} tasks, {n_counters} counters, {n_entries} entries",
         n_tasks = request.task_graph.n,
@@ -2370,8 +2398,16 @@ fn verify_F(
     cons: &rewrite::ConstraintSet,
 ) -> Result<bool, PlowcError> {
     let request = schedule::lean_verify::build_schedule_request_with_effects(
-        tasks, sched, amap, task_sets, &flash_effects(tasks, cons, amap))
-        .map_err(|reason| PlowcError::LeanVerify { bucket: bucket.into(), reason })?;
+        tasks,
+        sched,
+        amap,
+        task_sets,
+        &flash_effects(tasks, cons, amap),
+    )
+    .map_err(|reason| PlowcError::LeanVerify {
+        bucket: bucket.into(),
+        reason,
+    })?;
     let started = std::time::Instant::now();
     dispatch_cert(
         bucket,

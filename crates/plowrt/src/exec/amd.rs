@@ -18,7 +18,6 @@ use super::kv_layout::kv_tensor_name;
 use crate::asset::devblob::{DevBlob, DevProg};
 use crate::device::hsa::{HsaBackend, HsaKernel, HsaPinned};
 use crate::device::{DeviceMem, Module};
-use crate::exec::tensor_bindings::{TensorBinding, TensorBindings};
 use crate::exec::amd::packed::validate_rows as validate_amd_packed_rows;
 use crate::exec::device_api::EngineDevice;
 use crate::exec::kvrow::{
@@ -26,9 +25,10 @@ use crate::exec::kvrow::{
     prefill_row_field, ragged_band_rows, ragged_band_views, rebase_band_rows, rebase_chunk_rows,
     RowField,
 };
+use crate::exec::tensor_bindings::{TensorBinding, TensorBindings};
 use crate::exec::{
-    amd_gemm_blk, amd_gemm_lt, amd_gemma4_glu, amd_index_tp, amd_mla_fold, amd_moe_aiter,
-    amd_sparse_mla, amd_mla_bf16, amd_index_fp8, amd_index_fp8_prefill,
+    amd_gemm_blk, amd_gemm_lt, amd_gemma4_glu, amd_index_fp8, amd_index_fp8_prefill, amd_index_tp,
+    amd_mla_bf16, amd_mla_fold, amd_moe_aiter, amd_sparse_mla,
 };
 use crate::memory::slab_carve;
 use crate::memory::vmm::{VmmGeometry, VmmKv, VmmOps, WeightSlab};
@@ -36,35 +36,32 @@ use crate::memory::vmm::{VmmGeometry, VmmKv, VmmOps, WeightSlab};
 use crate::memory::SLAB_ALIGN;
 use crate::{Result, RuntimeError};
 
+mod mla_prefill;
 mod object;
 mod packed;
 mod segment;
-mod mla_prefill;
 pub(super) use object::elf_symbol_names;
 use object::{
     build_requires, check_attn_res_f32mix_symbols, check_compiled_opcode_marker_set,
     check_compiled_opcode_markers, check_dec_stage_capacity, check_decode_object,
-    check_dsa_decode_batch, check_dsa_select_local, check_dsa_pf_arm, check_fp8_weight_arms,
-    check_xalltoall_heads,
-    check_gate_hier_object, check_gemv_capacity,
-    check_interpreter_waves,
-    check_k3_arms, check_kda_carry_regstate_symbols, check_kda_chunk, check_kda_conv_step_db,
+    check_dsa_decode_batch, check_dsa_pf_arm, check_dsa_select_local, check_fp8_weight_arms,
+    check_gate_hier_object, check_gemv_capacity, check_interpreter_waves, check_k3_arms,
+    check_kda_carry_regstate_symbols, check_kda_chunk, check_kda_conv_step_db,
     check_kda_intra_wave_items_symbols, check_kv_encoding, check_materialized_residual_input,
     check_mla_nope_arm, check_mla_v2_sv_raw_symbols, check_moe_ep_symbols, check_moe_gemma_arms,
     check_moe_pf_a4w4, check_packed_family_kv_encoding, check_packed_prefill_abi,
     check_packet_pairing_stamp, check_prefill_geometry, check_prefill_object, check_qwen_gdn_arms,
-    check_sparse_fp8_object,
-    check_sparse_fp8_packet, check_xargmax_capacity, elf_symbol_u32, first_op_in,
-    graph_phase_xreduce_segments, l2_pairing_refusal, log_gate_hier_status,
-    packet_decode_arm_requirements, packet_prefill_arm_requirements, read_attn_res_f32mix_object,
-    read_kda_carry_regstate_object, read_kda_intra_wave_items_object, required_gemv_m,
-    required_k3_op, required_kda_chunk, required_kda_conv_step_db, required_kv_op,
-    required_moe_pf_a4w4, required_moe_pf_accum, required_qwen_gdn_op, resolve_flash_object_load,
-    sparse_fp8, BF16_KV_OPS, FP8_KV_OPS, FP8_KV_SYM, FP8_WEIGHT_OPS, GATE_HIER_SYM,
-    KDA_CARRY_KEYFEED_MARKERS,
-    KDA_CARRY_REGSTATE_LDS, KDA_CHUNK_QPRE_SYM, KDA_CONV_STEP_DB_REPLACED_OPS, KDA_FAMILY_SEG_SYM,
-    KDA_WU_LEAN_LDS, KDA_WU_LEAN_MARKERS, L2_DISPATCH_SYM, MLA_PF_V2_FP8_SYM, MLA_PF_V2_SYM,
-    MOE_ENC_MXFP4, MOE_GEMMA_OPS, MOE_GEMMA_PF_OPS, PACKED_PREFILL_ABI_SYM, PACKED_PREFILL_BAND_SYM,
+    check_sparse_fp8_object, check_sparse_fp8_packet, check_xalltoall_heads,
+    check_xargmax_capacity, elf_symbol_u32, first_op_in, graph_phase_xreduce_segments,
+    l2_pairing_refusal, log_gate_hier_status, packet_decode_arm_requirements,
+    packet_prefill_arm_requirements, read_attn_res_f32mix_object, read_kda_carry_regstate_object,
+    read_kda_intra_wave_items_object, required_gemv_m, required_k3_op, required_kda_chunk,
+    required_kda_conv_step_db, required_kv_op, required_moe_pf_a4w4, required_moe_pf_accum,
+    required_qwen_gdn_op, resolve_flash_object_load, sparse_fp8, BF16_KV_OPS, FP8_KV_OPS,
+    FP8_KV_SYM, FP8_WEIGHT_OPS, GATE_HIER_SYM, KDA_CARRY_KEYFEED_MARKERS, KDA_CARRY_REGSTATE_LDS,
+    KDA_CHUNK_QPRE_SYM, KDA_CONV_STEP_DB_REPLACED_OPS, KDA_FAMILY_SEG_SYM, KDA_WU_LEAN_LDS,
+    KDA_WU_LEAN_MARKERS, L2_DISPATCH_SYM, MLA_PF_V2_FP8_SYM, MLA_PF_V2_SYM, MOE_ENC_MXFP4,
+    MOE_GEMMA_OPS, MOE_GEMMA_PF_OPS, PACKED_PREFILL_ABI_SYM, PACKED_PREFILL_BAND_SYM,
     PACKED_PREFILL_KDA_CHUNK_SEG_SYM, PACKED_PREFILL_KDA_SEG_SYM, PACKED_PREFILL_MLA_FLASH_SEG_SYM,
     PACKED_PREFILL_MLA_NORM_SEG_SYM, XR_ATTNRES_RESOURCE_SYM, XR_ATTNRES_SEG_SYM, XR_TAGGED_SYM,
 };
@@ -2794,9 +2791,13 @@ fn decode_segment_routes(
     for (seg, kind) in kinds.into_iter().enumerate() {
         let inst_ix = match kind {
             DecodeSegmentKind::IndexFp8 => {
-                routes.push(DecodeSegmentRoute::IndexFp8(index_fp8[seg].ok_or_else(|| {
-                    RuntimeError::Device("native FP8 indexer segment has no validated route".into())
-                })?));
+                routes.push(DecodeSegmentRoute::IndexFp8(index_fp8[seg].ok_or_else(
+                    || {
+                        RuntimeError::Device(
+                            "native FP8 indexer segment has no validated route".into(),
+                        )
+                    },
+                )?));
                 continue;
             }
             DecodeSegmentKind::MlaBf16 => {
@@ -3123,7 +3124,8 @@ fn derive_segments_for(prog: &DevProg, v2: bool) -> Result<Vec<u8>> {
             if (op == DevOp::FlashMlaPrefill as u16
                 && d.i[6] > 1
                 && d.t[7] == packet::dev::TENSOR_NONE16)
-                || sparse_fp8(d) || small_split
+                || sparse_fp8(d)
+                || small_split
             {
                 needs_v2.push((e.seg as usize, if small_split { d.fj[2] } else { d.i[6] }));
             }
@@ -3251,7 +3253,8 @@ fn derive_packed_segment_families(prog: &DevProg) -> Result<Vec<u8>> {
         }
     }
     if let Some((segment, rows)) = narrow_norm.iter().enumerate().find_map(|(segment, rows)| {
-        rows.filter(|_| family[segment].is_some()).map(|rows| (segment, rows))
+        rows.filter(|_| family[segment].is_some())
+            .map(|rows| (segment, rows))
     }) {
         return Err(RuntimeError::Device(format!(
             "program T={} segment {segment} mixes a {rows}-row norm (neither the batch nor the \
@@ -3337,11 +3340,7 @@ fn packed_family_segments_cover(prog: &DevProg, families: &[u8], wanted: &[u8]) 
         let norm = in_.op == DevOp::RmsNorm as u16
             || in_.op == DevOp::HeadNormRope as u16
             || in_.op == DevOp::HeadNormRopeFp8 as u16;
-        let expected = if norm
-            && packed
-            && in_.i[0] != prog.t
-            && Some(in_.i[0]) != band
-        {
+        let expected = if norm && packed && in_.i[0] != prog.t && Some(in_.i[0]) != band {
             0
         } else if norm {
             5
@@ -3372,9 +3371,14 @@ fn packed_family_segments_cover(prog: &DevProg, families: &[u8], wanted: &[u8]) 
 }
 
 fn native_ocp_fp8_weights(progs: &[DevProg]) -> std::collections::BTreeSet<u16> {
-    let native = |op| op == DevOp::GemmFp8Block128 as u16
-        || op == DevOp::GemmFp8Block128Split4 as u16 || op == DevOp::MlaBmmFp8 as u16;
-    let mut weights = progs.iter().flat_map(|p| &p.insts)
+    let native = |op| {
+        op == DevOp::GemmFp8Block128 as u16
+            || op == DevOp::GemmFp8Block128Split4 as u16
+            || op == DevOp::MlaBmmFp8 as u16
+    };
+    let mut weights = progs
+        .iter()
+        .flat_map(|p| &p.insts)
         .filter(|d| native(d.op))
         .map(|d| d.t[2])
         .filter(|&t| t != packet::dev::TENSOR_NONE16)
@@ -3521,9 +3525,9 @@ fn packed_sparse_refusal(
                 }
                 None => return Some("packed sparse prefill: the TP indexer is not loaded".into()),
             }
-            if !seg_of(ix).is_some_and(|seg| {
-                matches!(routes.get(seg), Some(PrefillSegmentRoute::IndexTp(_)))
-            }) {
+            if !seg_of(ix)
+                .is_some_and(|seg| matches!(routes.get(seg), Some(PrefillSegmentRoute::IndexTp(_))))
+            {
                 return Some(format!(
                     "packed sparse prefill: IndexTpPf instruction {ix} has no TP indexer route"
                 ));
@@ -4041,7 +4045,9 @@ fn rowband_twin_ids(tensors: &[crate::asset::devblob::DevTensor], n_gpu: u32) ->
         .map(|t| {
             n_gpu > 1
                 && packet::names::is_checkpoint_weight(&t.name)
-                && tensors.iter().any(|s| s.name == t.name && s.bytes * u64::from(n_gpu) == t.bytes)
+                && tensors
+                    .iter()
+                    .any(|s| s.name == t.name && s.bytes * u64::from(n_gpu) == t.bytes)
         })
         .collect()
 }
@@ -4054,9 +4060,17 @@ fn rowband_replicated_bytes(tensors: &[crate::asset::devblob::DevTensor], n_gpu:
         .filter(|t| {
             n_gpu > 1
                 && packet::names::is_checkpoint_weight(&t.name)
-                && tensors.iter().any(|s| s.name == t.name && s.bytes * u64::from(n_gpu) == t.bytes)
+                && tensors
+                    .iter()
+                    .any(|s| s.name == t.name && s.bytes * u64::from(n_gpu) == t.bytes)
         })
-        .map(|t| if t.name.ends_with("derived.v_absorb.weight") { 3 * t.bytes } else { t.bytes })
+        .map(|t| {
+            if t.name.ends_with("derived.v_absorb.weight") {
+                3 * t.bytes
+            } else {
+                t.bytes
+            }
+        })
         .sum()
 }
 
@@ -4382,13 +4396,17 @@ pub(super) fn shuffle_moe_weight_16x32(src: &[u8], rows: usize, kbytes: usize) -
 
 pub(super) fn resident_moe_scales(src: &[u8]) -> Result<Vec<u8>> {
     if src.len() != 96 * 4 {
-        return Err(RuntimeError::Device("resident MoE requires 96 f32 scales per projection".into()));
+        return Err(RuntimeError::Device(
+            "resident MoE requires 96 f32 scales per projection".into(),
+        ));
     }
     let mut out = Vec::with_capacity(src.len());
     for chunk in src.chunks_exact(4) {
         let scaled = 2.0 * f32::from_le_bytes(chunk.try_into().unwrap());
         if !scaled.is_finite() {
-            return Err(RuntimeError::Device("resident MoE scale overflows or is not finite".into()));
+            return Err(RuntimeError::Device(
+                "resident MoE scale overflows or is not finite".into(),
+            ));
         }
         out.extend_from_slice(&scaled.to_le_bytes());
     }
@@ -4567,7 +4585,11 @@ fn bind_packed_experts(
     do_prefault: bool,
     populate: bool,
     resident_tables: &[Option<u16>],
-) -> Result<(Vec<DeviceMem>, u64, Vec<(u16, amd_moe_aiter::ResidentWeights)>)> {
+) -> Result<(
+    Vec<DeviceMem>,
+    u64,
+    Vec<(u16, amd_moe_aiter::ResidentWeights)>,
+)> {
     // `_sf` is PLOW_GLM_MOE_SHARED_FOLD's spelling of the same `[E][3]` u64 table, one entry
     // longer, whose LAST entry is the shared expert rather than a routed one. The suffix is the
     // whole signal: the packet has already given up its `shared_experts.*` GEMM packets and its
@@ -4747,7 +4769,10 @@ fn bind_packed_experts(
                 // MXFP4: the checkpoint's own packed u8 payload + E8M0 scale, which no prep
                 // shadows; the scale must match the routed slot's too.
                 if en.microscaled() {
-                    for shared_name in [en.weight_of(n_exp - 1, j, true), en.scale_of(n_exp - 1, j, true)] {
+                    for shared_name in [
+                        en.weight_of(n_exp - 1, j, true),
+                        en.scale_of(n_exp - 1, j, true),
+                    ] {
                         let routed_name = if shared_name.ends_with(en.scale) {
                             en.scale_of(0, j, false)
                         } else {
@@ -4780,24 +4805,40 @@ fn bind_packed_experts(
                 }
             }
         }
-        if resident && (*ep_table || whole || n_gpu != 8 || !(256..=257).contains(&n_exp)
-            || i_moe != 256 || en.microscaled() || shape0 != [2048, 6144]
-            || w_stride != 256 * 6144 || s_stride != 96 * 4
-            || resident_tables[*i_ewt] != Some(i_est as u16))
+        if resident
+            && (*ep_table
+                || whole
+                || n_gpu != 8
+                || !(256..=257).contains(&n_exp)
+                || i_moe != 256
+                || en.microscaled()
+                || shape0 != [2048, 6144]
+                || w_stride != 256 * 6144
+                || s_stride != 96 * 4
+                || resident_tables[*i_ewt] != Some(i_est as u16))
         {
-            return Err(RuntimeError::Device(format!("{pfx}: resident MoE requires TP8 block-FP8 H6144/I256/E256 weights")));
+            return Err(RuntimeError::Device(format!(
+                "{pfx}: resident MoE requires TP8 block-FP8 H6144/I256/E256 weights"
+            )));
         }
         let t_alloc = Instant::now();
         let d_w = EngineDevice::alloc(be, (n_local * 3 * w_stride).max(1))?;
         let d_s = EngineDevice::alloc(be, (n_local * 3 * s_stride).max(1))?;
         LoadProf::add(&prof.alloc_ns, t_alloc);
         let (wtab, stab) = if resident {
-            resident_weights.push((*i_ewt as u16, amd_moe_aiter::ResidentWeights::new(d_w.base, d_s.base, n_local)));
-            (amd_moe_aiter::resident_expert_table(d_w.base, w_stride, n_local),
-             amd_moe_aiter::resident_expert_table(d_s.base, s_stride, n_local))
+            resident_weights.push((
+                *i_ewt as u16,
+                amd_moe_aiter::ResidentWeights::new(d_w.base, d_s.base, n_local),
+            ));
+            (
+                amd_moe_aiter::resident_expert_table(d_w.base, w_stride, n_local),
+                amd_moe_aiter::resident_expert_table(d_s.base, s_stride, n_local),
+            )
         } else {
-            (crate::orch::moe::packed_expert_table(d_w.base, w_stride, n_exp, owned.clone()),
-             crate::orch::moe::packed_expert_table(d_s.base, s_stride, n_exp, owned.clone()))
+            (
+                crate::orch::moe::packed_expert_table(d_w.base, w_stride, n_exp, owned.clone()),
+                crate::orch::moe::packed_expert_table(d_s.base, s_stride, n_exp, owned.clone()),
+            )
         };
         // PRESHUFFLED PREFILL SLAB (PLOW_MOE_PF_SHUF): the blob declaring
         // `{pfx}expert_weight_table_pf` is the emit-time opt-in. A SECOND slab holds every
@@ -4896,8 +4937,7 @@ fn bind_packed_experts(
         // preshuffled copy (scale entries, or the pf table not declared). Geometry per
         // projection: gate/up are [I_moe][K] row-major shards, down is [H][I_moe] — in both
         // cases the shard is [rows][kbytes] with rows*kbytes == w_stride.
-        let mut plan: Vec<ExpertEntry> =
-            Vec::with_capacity(owned.len() * 6);
+        let mut plan: Vec<ExpertEntry> = Vec::with_capacity(owned.len() * 6);
         for e in owned {
             // The shared-expert fold makes the LAST table entry the shared expert: same three
             // projections, same [128,128] block-fp8 grid, same TP slice — it is shape-identical
@@ -5300,7 +5340,11 @@ fn is_tp_collective(op: u16) -> bool {
 
 /// The table `plow_xctr_audit` scans: `insts` filtered to TP collectives, in program order.
 fn xaudit_insts(insts: &[DevInst64]) -> Vec<DevInst64> {
-    insts.iter().copied().filter(|d| is_tp_collective(d.op)).collect()
+    insts
+        .iter()
+        .copied()
+        .filter(|d| is_tp_collective(d.op))
+        .collect()
 }
 
 fn patch_tp_xaudit(insts: &mut [DevInst64], status_id: u32) {
@@ -5447,9 +5491,8 @@ pub(crate) fn chunk_steps_over(
         if c0 >= n_prompt {
             break;
         }
-        let prog = prog_for(ch).ok_or_else(|| {
-            RuntimeError::Device(format!("no compiled bucket for chunk T={ch}"))
-        })?;
+        let prog = prog_for(ch)
+            .ok_or_else(|| RuntimeError::Device(format!("no compiled bucket for chunk T={ch}")))?;
         out.push(ChunkStep {
             prog,
             c0,
@@ -5686,8 +5729,7 @@ impl AmdEngine {
         }
         for (row, r) in plan.rows.iter().enumerate() {
             s[ids_off + row * 4..ids_off + row * 4 + 4].copy_from_slice(&r.token.to_le_bytes());
-            s[pos_off + row * 4..pos_off + row * 4 + 4]
-                .copy_from_slice(&r.position.to_le_bytes());
+            s[pos_off + row * 4..pos_off + row * 4 + 4].copy_from_slice(&r.position.to_le_bytes());
             let active = u32::from(plan.parked[row] == 0);
             s[act_off + row * 4..act_off + row * 4 + 4].copy_from_slice(&active.to_le_bytes());
         }
@@ -6011,8 +6053,8 @@ struct AmdGq {
 
 mod mixed_step;
 mod prefix;
-mod shared_prefix;
 mod selected_routes;
+mod shared_prefix;
 pub use selected_routes::SelectedRouteManifest;
 mod token_batch;
 
@@ -6345,7 +6387,11 @@ fn discover_lowrung_tiers(hsaco_dir: &Path, object: &str) -> Option<String> {
         .filter_map(|entry| {
             let entry = entry.ok()?;
             let name = entry.file_name();
-            let width = name.to_str()?.strip_prefix("lowrung")?.parse::<u32>().ok()?;
+            let width = name
+                .to_str()?
+                .strip_prefix("lowrung")?
+                .parse::<u32>()
+                .ok()?;
             let dir = entry.path();
             (width > 0 && dir.join(object).is_file()).then_some((width, dir))
         })
@@ -6980,7 +7026,8 @@ impl AmdEngine {
         let has_mla_fold = |p: &DevProg| p.insts.iter().any(amd_mla_fold::native);
         let use_mla_fold = blob.progs.iter().any(has_mla_fold);
         if use_mla_fold
-            && (arch != "gfx942" || tp.is_none_or(|t| t.n_gpu != 8)
+            && (arch != "gfx942"
+                || tp.is_none_or(|t| t.n_gpu != 8)
                 || blob.decode_phase().any(has_mla_fold))
         {
             return Err(RuntimeError::Device(
@@ -6989,15 +7036,14 @@ impl AmdEngine {
         }
         let has_gemm_lt = |p: &DevProg| p.insts.iter().any(|d| d.op == DevOp::GemmLtPf as u16);
         let use_gemm_lt = blob.progs.iter().any(has_gemm_lt);
-        let gemma_gemm_lt = blob.progs.iter().flat_map(|p| &p.insts).any(|d| {
-            d.op == DevOp::GemmLtPf as u16 && d.i[3] == 3
-        });
+        let gemma_gemm_lt = blob
+            .progs
+            .iter()
+            .flat_map(|p| &p.insts)
+            .any(|d| d.op == DevOp::GemmLtPf as u16 && d.i[3] == 3);
         if use_gemm_lt
             && (arch != "gfx942"
-                || !amd_gemm_lt::topology_matches(
-                    &blob.progs,
-                    tp.as_ref().map(|b| b.n_gpu),
-                ))
+                || !amd_gemm_lt::topology_matches(&blob.progs, tp.as_ref().map(|b| b.n_gpu)))
         {
             return Err(RuntimeError::Device(
                 "hipBLASLt projection requires a qualified gfx942 topology and mode".into(),
@@ -7014,10 +7060,8 @@ impl AmdEngine {
                 "block-scale FP8 projection requires gfx942 TP8 prefill".into(),
             ));
         }
-        let wants_gemma4_glu = arch == "gfx942"
-            && blob
-                .prefill_phase()
-                .any(amd_gemma4_glu::program_candidate);
+        let wants_gemma4_glu =
+            arch == "gfx942" && blob.prefill_phase().any(amd_gemma4_glu::program_candidate);
         let wants_gemma4_glu_fp8 = arch == "gfx942"
             && blob
                 .prefill_phase()
@@ -7068,8 +7112,12 @@ impl AmdEngine {
             &arch,
             hsaco_dir.join(amd_sparse_mla::OBJECT16).exists(),
         )?;
-        check_dsa_select_local(&blob.progs, &blob.tensors, &arch,
-                               tp.is_some_and(|t| t.n_gpu == 8))?;
+        check_dsa_select_local(
+            &blob.progs,
+            &blob.tensors,
+            &arch,
+            tp.is_some_and(|t| t.n_gpu == 8),
+        )?;
         check_xalltoall_heads(&blob.progs, &blob.tensors, &arch)?;
         if use_sparse_mla && arch != "gfx942" {
             return Err(RuntimeError::Device(
@@ -7199,7 +7247,8 @@ impl AmdEngine {
                         hsaco_dir.display(),
                         match prefill_arm {
                             PrefillArm::MlaMoe => "PLOW_MOE_PREFILL=1",
-                            PrefillArm::MlaMoeA4w4 => "PLOW_MOE_PREFILL=1 PLOW_MOE_PF_A4W4=1 PLOW_MXFP4=1",
+                            PrefillArm::MlaMoeA4w4 =>
+                                "PLOW_MOE_PREFILL=1 PLOW_MOE_PF_A4W4=1 PLOW_MXFP4=1",
                             PrefillArm::Mla => "PLOW_MLA_PREFILL=1",
                             PrefillArm::K3 => "PLOW_K3=1 PLOW_MLA_PREFILL=1",
                             PrefillArm::K3Moe => {
@@ -7217,7 +7266,9 @@ impl AmdEngine {
                 }
             })?;
             check_interpreter_waves(
-                elf_symbol_u32(&image, "plow_geom_PLOW_WG_WAVES"), phase, &path,
+                elf_symbol_u32(&image, "plow_geom_PLOW_WG_WAVES"),
+                phase,
+                &path,
             )?;
             let syms = elf_symbol_names(&image);
             if phase == Phase::Prefill {
@@ -7566,13 +7617,21 @@ impl AmdEngine {
         if arch == "gfx942" && mla_pf_v2_enabled() {
             for p in blob.prefill_phase() {
                 let segments = derive_segments(p)?.len();
-                need_mla_small |= segment::small_mla_segments(p, segments).into_iter().any(|pure| pure);
+                need_mla_small |= segment::small_mla_segments(p, segments)
+                    .into_iter()
+                    .any(|pure| pure);
             }
         }
         let k_mla_small = if need_mla_small {
             Some(segment::load_small_mla(
-                &be, hsaco_dir, blob_path, &arch, sched_prefill,
-                variant == Variant::Fp8Kv, false, &mut modules,
+                &be,
+                hsaco_dir,
+                blob_path,
+                &arch,
+                sched_prefill,
+                variant == Variant::Fp8Kv,
+                false,
+                &mut modules,
             )?)
         } else {
             None
@@ -7584,7 +7643,14 @@ impl AmdEngine {
         }
         let k_mla_split = if need_mla_split {
             Some(segment::load_small_mla(
-                &be, hsaco_dir, blob_path, &arch, sched_prefill, true, true, &mut modules,
+                &be,
+                hsaco_dir,
+                blob_path,
+                &arch,
+                sched_prefill,
+                true,
+                true,
+                &mut modules,
             )?)
         } else {
             None
@@ -7714,7 +7780,9 @@ impl AmdEngine {
                     let syms = elf_symbol_names(&image);
                     check_mla_v2_sv_raw_symbols(&syms, &path, prefill_l2_placed)?;
                     check_interpreter_waves(
-                        elf_symbol_u32(&image, "plow_geom_PLOW_WG_WAVES"), Phase::Flash, &path,
+                        elf_symbol_u32(&image, "plow_geom_PLOW_WG_WAVES"),
+                        Phase::Flash,
+                        &path,
                     )?;
                     check_packet_pairing_stamp(&image, blob_path, &path)?;
                     let module = EngineDevice::module_load(&*be, &image)?;
@@ -7814,7 +7882,9 @@ impl AmdEngine {
                 return Err(RuntimeError::Device(l2_pairing_refusal(&path, phase)));
             }
             check_interpreter_waves(
-                elf_symbol_u32(&image, "plow_geom_PLOW_WG_WAVES"), phase, &path,
+                elf_symbol_u32(&image, "plow_geom_PLOW_WG_WAVES"),
+                phase,
+                &path,
             )?;
             check_compiled_opcode_marker_set(&syms, &path, required_ops.iter().copied())?;
             if let Some(want_fp8) = fp8_kv {
@@ -7920,10 +7990,26 @@ impl AmdEngine {
             );
             let suffix = sched_prefill.suffix();
             let missing: Vec<String> = [
-                ("interp_packed_mla_norm", needs_plain, k_packed_mla_norm.is_some()),
-                ("interp_packed_mla_flash", needs_plain, k_packed_mla_flash.is_some()),
-                ("interp_packed_mla_norm_tb", needs_tb, k_packed_mla_norm_tb.is_some()),
-                ("interp_packed_mla_flash_tb", needs_tb, k_packed_mla_flash_tb.is_some()),
+                (
+                    "interp_packed_mla_norm",
+                    needs_plain,
+                    k_packed_mla_norm.is_some(),
+                ),
+                (
+                    "interp_packed_mla_flash",
+                    needs_plain,
+                    k_packed_mla_flash.is_some(),
+                ),
+                (
+                    "interp_packed_mla_norm_tb",
+                    needs_tb,
+                    k_packed_mla_norm_tb.is_some(),
+                ),
+                (
+                    "interp_packed_mla_flash_tb",
+                    needs_tb,
+                    k_packed_mla_flash_tb.is_some(),
+                ),
             ]
             .into_iter()
             .filter(|&(_, needed, loaded)| needed && !loaded)
@@ -8888,45 +8974,81 @@ impl AmdEngine {
 
         let mut index_shape: Option<(u32, u32)> = None;
         for p in &blob.progs {
-            for d in p.insts.iter().filter(|d| d.op == DevOp::IndexFp8Decode as u16) {
+            for d in p
+                .insts
+                .iter()
+                .filter(|d| d.op == DevOp::IndexFp8Decode as u16)
+            {
                 if !p.role.is_decode_rung() {
-                    return Err(RuntimeError::Device("FP8 indexer native opcode requires a decode rung".into()));
+                    return Err(RuntimeError::Device(
+                        "FP8 indexer native opcode requires a decode rung".into(),
+                    ));
                 }
                 match index_shape {
                     Some((rows, ctx)) if ctx == d.i[1] => index_shape = Some((rows.max(p.t), ctx)),
                     None => index_shape = Some((p.t, d.i[1])),
-                    _ => return Err(RuntimeError::Device("FP8 indexer rungs have different cache strides".into())),
+                    _ => {
+                        return Err(RuntimeError::Device(
+                            "FP8 indexer rungs have different cache strides".into(),
+                        ))
+                    }
                 }
             }
         }
-        let index_fp8 = index_shape.map(|(rows, ctx)| {
-            amd_index_fp8::Indexer::load(&be, hsaco_dir, rows, ctx, &mut modules)
-        }).transpose()?;
+        let index_fp8 = index_shape
+            .map(|(rows, ctx)| {
+                amd_index_fp8::Indexer::load(&be, hsaco_dir, rows, ctx, &mut modules)
+            })
+            .transpose()?;
         let mut prefill_index_shape: Option<(u32, u32)> = None;
         for p in &blob.progs {
-            for d in p.insts.iter().filter(|d| d.op == DevOp::IndexFp8Prefill as u16) {
+            for d in p
+                .insts
+                .iter()
+                .filter(|d| d.op == DevOp::IndexFp8Prefill as u16)
+            {
                 if !p.role.is_prefill_bucket() {
-                    return Err(RuntimeError::Device("FP8 prefill indexer requires an ordinary prefill bucket".into()));
+                    return Err(RuntimeError::Device(
+                        "FP8 prefill indexer requires an ordinary prefill bucket".into(),
+                    ));
                 }
                 match prefill_index_shape {
-                    Some((rows, ctx)) if ctx == d.i[1] => prefill_index_shape = Some((rows.max(p.t), ctx)),
+                    Some((rows, ctx)) if ctx == d.i[1] => {
+                        prefill_index_shape = Some((rows.max(p.t), ctx))
+                    }
                     None => prefill_index_shape = Some((p.t, d.i[1])),
-                    _ => return Err(RuntimeError::Device("FP8 prefill indexer has inconsistent cache strides".into())),
+                    _ => {
+                        return Err(RuntimeError::Device(
+                            "FP8 prefill indexer has inconsistent cache strides".into(),
+                        ))
+                    }
                 }
             }
         }
-        let index_fp8_prefill = prefill_index_shape.map(|(rows, ctx)| {
-            amd_index_fp8_prefill::Indexer::load(&be, hsaco_dir, rows, ctx, &mut modules)
-        }).transpose()?;
-        let mla_bf16_rows = blob.decode_phase().filter_map(|p| {
-            decode_segment_kinds(p).ok().filter(|kinds| kinds.contains(&DecodeSegmentKind::MlaBf16)).map(|_| p.t)
-        }).max();
-        let mla_bf16 = mla_bf16_rows.map(|rows| {
-            if crate::config::RuntimeConfig::get().amd.mla_ns_live {
-                return Err(RuntimeError::Device("BF16 MLA excludes PLOW_MLA_NS_LIVE".into()));
-            }
-            amd_mla_bf16::PersistentMla::load(&be, hsaco_dir, rows, &mut modules)
-        }).transpose()?;
+        let index_fp8_prefill = prefill_index_shape
+            .map(|(rows, ctx)| {
+                amd_index_fp8_prefill::Indexer::load(&be, hsaco_dir, rows, ctx, &mut modules)
+            })
+            .transpose()?;
+        let mla_bf16_rows = blob
+            .decode_phase()
+            .filter_map(|p| {
+                decode_segment_kinds(p)
+                    .ok()
+                    .filter(|kinds| kinds.contains(&DecodeSegmentKind::MlaBf16))
+                    .map(|_| p.t)
+            })
+            .max();
+        let mla_bf16 = mla_bf16_rows
+            .map(|rows| {
+                if crate::config::RuntimeConfig::get().amd.mla_ns_live {
+                    return Err(RuntimeError::Device(
+                        "BF16 MLA excludes PLOW_MLA_NS_LIVE".into(),
+                    ));
+                }
+                amd_mla_bf16::PersistentMla::load(&be, hsaco_dir, rows, &mut modules)
+            })
+            .transpose()?;
         let sparse_mla_decode = match blob
             .decode_phase()
             .filter(|p| {
@@ -9090,13 +9212,18 @@ impl AmdEngine {
             .map(|td| slab_carve(td.bytes))
             .sum();
         let shared_requested = config.prefix_cache && config.amd.shared_prefix != Some(false);
-        let shared_layout = if shared_requested && arch == "gfx942" && be.has_vmm() && !config.fusion {
-            blob.tensors.iter().find(|t| t.name == "in.pos")
-                .and_then(|t| u32::try_from(t.bytes / 4).ok())
-                .and_then(|context| shared_prefix::Layout::from_blob(&blob, max_decode_batch as usize, context))
-        } else {
-            None
-        };
+        let shared_layout =
+            if shared_requested && arch == "gfx942" && be.has_vmm() && !config.fusion {
+                blob.tensors
+                    .iter()
+                    .find(|t| t.name == "in.pos")
+                    .and_then(|t| u32::try_from(t.bytes / 4).ok())
+                    .and_then(|context| {
+                        shared_prefix::Layout::from_blob(&blob, max_decode_batch as usize, context)
+                    })
+            } else {
+                None
+            };
         if shared_requested && config.amd.shared_prefix == Some(true) && shared_layout.is_none() {
             return Err(RuntimeError::Rejected(
                 "AMD shared prefixes require gfx942, ROCr VMM, no legacy fusion, and complete MLA cache writes with supported geometry on every rung".into()));
@@ -9117,12 +9244,17 @@ impl AmdEngine {
                  some rung. Set --amd-shared-prefix=true to turn this into a load-time refusal."
             );
         }
-        let mut shared_prefix = shared_layout.map(|layout| {
-            shared_prefix::SharedPrefix::new(be.clone(), layout,
-                config.prefix_cache_cap_bytes(be.vram_bytes()),
-                crate::memory::vmm::kv_pool_cap(),
-                config.vmm_cache_min_free_bytes(be.vram_bytes(), None))
-        }).transpose()?;
+        let mut shared_prefix = shared_layout
+            .map(|layout| {
+                shared_prefix::SharedPrefix::new(
+                    be.clone(),
+                    layout,
+                    config.prefix_cache_cap_bytes(be.vram_bytes()),
+                    crate::memory::vmm::kv_pool_cap(),
+                    config.vmm_cache_min_free_bytes(be.vram_bytes(), None),
+                )
+            })
+            .transpose()?;
         let vmm = if shared_prefix.is_none() {
             let serve_kv = checkpoint
                 .and_then(|c| crate::asset::serve::resolve(blob_path.parent()?, c).ok())
@@ -9138,12 +9270,20 @@ impl AmdEngine {
         } else {
             None
         };
-        let cache_va: Vec<_> = blob.tensors.iter().enumerate().map(|(id, tensor)| {
-            shared_prefix.as_ref().and_then(|v| v.tensor_va(id)).or_else(|| {
-                let (layer, role) = kv_tensor_name(&tensor.name)?;
-                vmm.as_ref()?.tensor_va(layer, role)
+        let cache_va: Vec<_> = blob
+            .tensors
+            .iter()
+            .enumerate()
+            .map(|(id, tensor)| {
+                shared_prefix
+                    .as_ref()
+                    .and_then(|v| v.tensor_va(id))
+                    .or_else(|| {
+                        let (layer, role) = kv_tensor_name(&tensor.name)?;
+                        vmm.as_ref()?.tensor_va(layer, role)
+                    })
             })
-        }).collect();
+            .collect();
 
         let prof = LoadProf::default();
         let do_prefault = profile_faults();
@@ -9390,7 +9530,10 @@ impl AmdEngine {
             }
             if let Some(twin) = twins[i].filter(|_| !matches!(weight_slab, WeightSlab::PerTensor)) {
                 let at = carve_at[twin].ok_or_else(|| {
-                    RuntimeError::Device(format!("{}: its full twin is not carved from the slab", td.name))
+                    RuntimeError::Device(format!(
+                        "{}: its full twin is not carved from the slab",
+                        td.name
+                    ))
                 })?;
                 let rank = u64::from(tp.map_or(0, |t| t.rank));
                 let off = at + rank * td.bytes;
@@ -9598,8 +9741,12 @@ impl AmdEngine {
                             Some(amd_gemm_blk::Bound::Scales) => {
                                 push(&mut ring, &amd_gemm_blk::prepare_scales(&slice)?, false)?
                             }
-                            None => push(&mut ring, &slice,
-                                c.is_fp8_e4m3(resolved) && !native_ocp_weights.contains(&(i as u16)))?,
+                            None => push(
+                                &mut ring,
+                                &slice,
+                                c.is_fp8_e4m3(resolved)
+                                    && !native_ocp_weights.contains(&(i as u16)),
+                            )?,
                         }
                         wbytes += td.bytes;
                         nweights += 1;
@@ -9661,7 +9808,14 @@ impl AmdEngine {
             slab.wait_mapped(slab_bytes)?;
             LoadProf::add(&prof.alloc_ns, t);
         }
-        super::amd_rope::bind(&be, hsaco_dir, &blob.gen, &blob.tensors, &devp, &mut modules)?;
+        super::amd_rope::bind(
+            &be,
+            hsaco_dir,
+            &blob.gen,
+            &blob.tensors,
+            &devp,
+            &mut modules,
+        )?;
         // The MoE half of the bind, and it has to be here: it needs the tensor
         // table (to find each layer's two pointer slots) and the staging ring
         // (which must outlive it — the C reference records that gathering a
@@ -9744,13 +9898,17 @@ impl AmdEngine {
                 "NO CHECKPOINT — weights are uninitialised; timings are real, tokens are not"
             );
         }
-        let mut tensor_bindings = TensorBindings::new(devp.iter()
-            .map(TensorBinding::whole).collect::<Result<Vec<_>>>()?)?;
+        let mut tensor_bindings = TensorBindings::new(
+            devp.iter()
+                .map(TensorBinding::whole)
+                .collect::<Result<Vec<_>>>()?,
+        )?;
         if let Some(cache) = &mut shared_prefix {
             cache.bind(&devp.iter().map(|m| m.base).collect::<Vec<_>>());
         }
         let d_tens = EngineDevice::alloc(&*be, (devp.len() * 8).max(1) as u64)?;
-        let table = tensor_bindings.upload(|bytes| EngineDevice::upload(&*be, &d_tens, 0, bytes))?;
+        let table =
+            tensor_bindings.upload(|bytes| EngineDevice::upload(&*be, &d_tens, 0, bytes))?;
         let kda_key_factor_half =
             if k_kda_key_factor_wu.is_some() && k_kda_key_factor_carry.is_some() {
                 kda_key_factor_scratch_half_bytes(blob.prefill_phase())?
@@ -9819,7 +9977,12 @@ impl AmdEngine {
                 .prefill_phase()
                 .filter(|p| rowband_on || !p.role.is_rowsplit_sibling());
             Some(amd_mla_fold::MlaFold::load(
-                &be, hsaco_dir, progs, &blob.tensors, &devp, &mut modules,
+                &be,
+                hsaco_dir,
+                progs,
+                &blob.tensors,
+                &devp,
+                &mut modules,
             )?)
         } else {
             None
@@ -9883,7 +10046,11 @@ impl AmdEngine {
                     );
                     let skippable = union_skip.iter().flatten().count();
                     if skippable != 0 {
-                        tracing::info!(prog = prog_ix, skippable, "index union segments unread on the active sparse route");
+                        tracing::info!(
+                            prog = prog_ix,
+                            skippable,
+                            "index union segments unread on the active sparse route"
+                        );
                     }
                     for (seg, route) in sparse.into_iter().enumerate() {
                         if let Some(route) = route {
@@ -9968,10 +10135,15 @@ impl AmdEngine {
                 }
                 if use_index_tp {
                     let span_aware = index_tp.as_ref().is_some_and(|k| k.span_aware());
-                    for (seg, route) in
-                        amd_index_tp::routes(p, &blob.tensors, seg_class.len(), tp.unwrap(), span_aware)?
-                            .into_iter()
-                            .enumerate()
+                    for (seg, route) in amd_index_tp::routes(
+                        p,
+                        &blob.tensors,
+                        seg_class.len(),
+                        tp.unwrap(),
+                        span_aware,
+                    )?
+                    .into_iter()
+                    .enumerate()
                     {
                         if let Some(route) = route {
                             if !matches!(prefill_routes[seg], PrefillSegmentRoute::Interpreter) {
@@ -9984,12 +10156,16 @@ impl AmdEngine {
                     }
                 }
                 if index_fp8_prefill.is_some() {
-                    for (seg, route) in amd_index_fp8_prefill::routes(p, &blob.tensors, &devp, seg_class.len())?
-                        .into_iter().enumerate()
+                    for (seg, route) in
+                        amd_index_fp8_prefill::routes(p, &blob.tensors, &devp, seg_class.len())?
+                            .into_iter()
+                            .enumerate()
                     {
                         if let Some(route) = route {
                             if !matches!(prefill_routes[seg], PrefillSegmentRoute::Interpreter) {
-                                return Err(RuntimeError::Device("FP8 prefill indexer overlaps another native route".into()));
+                                return Err(RuntimeError::Device(
+                                    "FP8 prefill indexer overlaps another native route".into(),
+                                ));
                             }
                             prefill_routes[seg] = PrefillSegmentRoute::IndexFp8(route);
                         }
@@ -10344,7 +10520,10 @@ impl AmdEngine {
             RuntimeError::Device("devblob: no decode rung in the program table".into())
         })?;
         let widths = |l: &[usize]| l.iter().map(|&p| blob.progs[p].t).collect::<Vec<_>>();
-        if !widths(&dense_exact_ladder).iter().all(|t| widths(&decode_ladder).contains(t)) {
+        if !widths(&dense_exact_ladder)
+            .iter()
+            .all(|t| widths(&decode_ladder).contains(t))
+        {
             return Err(RuntimeError::Device(format!(
                 "dense-exact decode rungs {:?} are not widths of the decode ladder {:?}",
                 widths(&dense_exact_ladder),
@@ -10364,14 +10543,18 @@ impl AmdEngine {
         let prefill_hier_armed =
             prefill_objects != 0 && prefill_objects_gate_hier == prefill_objects;
         let prefill_hier_firing = prefill_hier_armed
-            && blob.progs.iter().filter(|p| !p.role.is_decode_rung()).any(|p| {
-                p.l2_domains != 0
-                    && p.gq_stream.iter().any(|e| {
-                        let nper = (e.flags & packet::dev::SE_NPER_MASK)
-                            >> packet::dev::SE_NPER_SHIFT;
-                        nper > 1 && e.flags & (packet::dev::SE_FINE | SE_XCTR) == 0
-                    })
-            });
+            && blob
+                .progs
+                .iter()
+                .filter(|p| !p.role.is_decode_rung())
+                .any(|p| {
+                    p.l2_domains != 0
+                        && p.gq_stream.iter().any(|e| {
+                            let nper =
+                                (e.flags & packet::dev::SE_NPER_MASK) >> packet::dev::SE_NPER_SHIFT;
+                            nper > 1 && e.flags & (packet::dev::SE_FINE | SE_XCTR) == 0
+                        })
+                });
         tracing::info!(
             armed = prefill_hier_armed,
             firing = prefill_hier_firing,
@@ -10414,7 +10597,10 @@ impl AmdEngine {
             .iter()
             .find(|d| d.op == DevOp::FlashMlaDecodeFp8 as u16 && d.fj[1] != 0)
             .map_or(0, |d| d.i[6]);
-        let dense_exact_ladder = if crate::config::RuntimeConfig::get().amd.amd_decode_dense_exact {
+        let dense_exact_ladder = if crate::config::RuntimeConfig::get()
+            .amd
+            .amd_decode_dense_exact
+        {
             let refusal = if dense_exact_ladder.is_empty() || dense_exact_select == 0 {
                 Some("the packet carries no dense-exact decode rungs (PLOW_GLM_DECODE_DENSE_EXACT=1)")
             } else if batch == 1 {
@@ -10747,11 +10933,16 @@ impl AmdEngine {
                 }
                 let baked = baked?;
                 tracing::info!(
-                    rungs = rungs.len(), baked,
+                    rungs = rungs.len(),
+                    baked,
                     sites = rungs.iter().map(|r| r.sites.len()).sum::<usize>(),
                     "PLOW_MLA_NS_LIVE: MLA decode split count tracks the live kv_len"
                 );
-                Some(MlaNsplit { progs: rungs, baked, cur: baked })
+                Some(MlaNsplit {
+                    progs: rungs,
+                    baked,
+                    cur: baked,
+                })
             })
             .flatten();
 
@@ -10782,7 +10973,11 @@ impl AmdEngine {
         // Every GPU job logs what the load left free. `PLOW_GLM_ROWBAND_ATTN` replicates attention
         // projections on every rank, so a packet carrying them must leave that much again plus
         // 8 GiB, or the KV pool would absorb the cost silently.
-        let replicated = if rowband_on { rowband_replicated_bytes(&blob.tensors, n_gpu) } else { 0 };
+        let replicated = if rowband_on {
+            rowband_replicated_bytes(&blob.tensors, n_gpu)
+        } else {
+            0
+        };
         let free = VmmOps::free_bytes(&*be);
         tracing::info!(
             rank,
@@ -10813,8 +11008,8 @@ impl AmdEngine {
                 .sum();
             let rows = (max_ctx as u64).checked_mul(batch as u64)?;
             let per_token = kv_bytes.checked_div(rows).filter(|&b| b > 0)?;
-            let budget = (free as f64 * crate::config::RuntimeConfig::get().kv_admit_headroom())
-                as u64;
+            let budget =
+                (free as f64 * crate::config::RuntimeConfig::get().kv_admit_headroom()) as u64;
             tracing::info!(
                 rank,
                 per_token,
@@ -10849,7 +11044,9 @@ impl AmdEngine {
                     )))
                 }
                 Some(_) => {}
-                None => tracing::warn!("PLOW_GLM_ROWBAND_ATTN: free device memory is unknown; load not checked"),
+                None => tracing::warn!(
+                    "PLOW_GLM_ROWBAND_ATTN: free device memory is unknown; load not checked"
+                ),
             }
         }
         // P3 (coalesce the two decode scalar H2Ds into one) is only legal when
@@ -10937,7 +11134,8 @@ impl AmdEngine {
         }
         let mut engine = AmdEngine {
             selected_routes: SelectedRouteManifest::new(
-                plow_asset::decode_objects::image_sha256(&raw), tp.map_or(0, |tp| tp.rank),
+                plow_asset::decode_objects::image_sha256(&raw),
+                tp.map_or(0, |tp| tp.rank),
             ),
             mixed_step,
             token_batch_step,
@@ -11060,8 +11258,12 @@ impl AmdEngine {
             band_rows_bound: std::collections::HashMap::new(),
             carried_slot,
             prefix_snap: (0..batch).map(|_| None).collect(),
-            prefix_regions: prefix::snapshot_regions(&blob.tensors,
-                blob.progs.iter().flat_map(|p| &p.insts), batch, max_ctx),
+            prefix_regions: prefix::snapshot_regions(
+                &blob.tensors,
+                blob.progs.iter().flat_map(|p| &p.insts),
+                batch,
+                max_ctx,
+            ),
             prefix_used: vec![0; batch],
             prefix_rows: vec![0; batch],
             prefix_tick: 0,
@@ -11136,8 +11338,7 @@ impl AmdEngine {
                     }
                 },
                 None => {
-                    refusal
-                        .get_or_insert_with(|| "no packed-prefill topology sibling".to_string());
+                    refusal.get_or_insert_with(|| "no packed-prefill topology sibling".to_string());
                 }
             }
         }
@@ -11164,7 +11365,8 @@ impl AmdEngine {
                 objects_missing = ?missing,
                 "packed prefill armed"
             );
-        }    }
+        }
+    }
 
     pub fn arch(&self) -> &str {
         &self.arch
@@ -11537,7 +11739,12 @@ impl AmdEngine {
                 }
             })
             // Band 0 is not a band: the body carries no `Argmax` to sample it with.
-            .filter_map(|(i, p)| p.role.token_batch_band().filter(|&b| b > 0).map(|b| (i, p.t, b)))
+            .filter_map(|(i, p)| {
+                p.role
+                    .token_batch_band()
+                    .filter(|&b| b > 0)
+                    .map(|b| (i, p.t, b))
+            })
             .collect();
         out.sort_by_key(|&(_, rows, _)| rows);
         out
@@ -11656,7 +11863,8 @@ impl AmdEngine {
             }
             for span in spans {
                 let slot = span.slot as usize;
-                let current = u32::from_le_bytes(stage[slot * 4..slot * 4 + 4].try_into().expect("4"));
+                let current =
+                    u32::from_le_bytes(stage[slot * 4..slot * 4 + 4].try_into().expect("4"));
                 stage[slot * 4..slot * 4 + 4]
                     .copy_from_slice(&current.max(span.kv_len).to_le_bytes());
             }
@@ -11702,7 +11910,9 @@ impl AmdEngine {
             .checked_add(src.len() as u64)
             .is_none_or(|end| end > capacity)
         {
-            return Err(RuntimeError::Device(format!("upload exceeds tensor {name:?}")));
+            return Err(RuntimeError::Device(format!(
+                "upload exceeds tensor {name:?}"
+            )));
         }
         let i = self
             .tensor_names
@@ -11795,7 +12005,11 @@ impl AmdEngine {
         for (s, span) in plan.prefill_spans.iter().enumerate() {
             let _ = writeln!(text, "span {s}: {span:?}");
         }
-        let _ = writeln!(text, "commits={:?} mapped_ends={:?}", plan.commits, plan.mapped_ends);
+        let _ = writeln!(
+            text,
+            "commits={:?} mapped_ends={:?}",
+            plan.commits, plan.mapped_ends
+        );
         write("plan.txt".into(), text.as_bytes())?;
         let band = plan.decode_rows as usize;
         if let Some(t) = self.t_kvlen {
@@ -11826,7 +12040,9 @@ impl AmdEngine {
     /// FP8 scale, index keys) as raw files `dir/<tag>.slot<slot>.kv.<layer>.<kind>.bin`.
     pub fn dump_slot_kv(&self, dir: &Path, tag: &str, slot: usize, kv_len: u32) -> Result<()> {
         if slot >= self.batch || kv_len as usize > self.max_ctx {
-            return Err(RuntimeError::Device("kv dump: slot or length past capacity".into()));
+            return Err(RuntimeError::Device(
+                "kv dump: slot or length past capacity".into(),
+            ));
         }
         let io = |e: std::io::Error| RuntimeError::Device(format!("kv dump: {e}"));
         std::fs::create_dir_all(dir).map_err(io)?;
@@ -11855,12 +12071,22 @@ impl AmdEngine {
                     row_bytes * kv_len as u64
                 };
                 if bytes > slot_bytes {
-                    return Err(RuntimeError::Device("kv dump: packed prefix past slot".into()));
+                    return Err(RuntimeError::Device(
+                        "kv dump: packed prefix past slot".into(),
+                    ));
                 }
                 let mut buf = vec![0u8; bytes as usize];
-                EngineDevice::download(&*self.be, &self.devp[i], slot as u64 * slot_bytes, &mut buf)?;
-                std::fs::write(dir.join(format!("{tag}.slot{slot}.kv.{l}.{kind}.bin")), &buf)
-                    .map_err(io)?;
+                EngineDevice::download(
+                    &*self.be,
+                    &self.devp[i],
+                    slot as u64 * slot_bytes,
+                    &mut buf,
+                )?;
+                std::fs::write(
+                    dir.join(format!("{tag}.slot{slot}.kv.{l}.{kind}.bin")),
+                    &buf,
+                )
+                .map_err(io)?;
             }
         }
         Ok(())
@@ -11874,9 +12100,12 @@ impl AmdEngine {
     /// Build the kernarg block for program `p` at segment `seg`.
     fn kernarg(&self, p: usize, seg: u32) -> DevProgram {
         let g = &self.progs[p];
-        let binding = self
-            .packed_prefill
-            .filter(|_| !g.packed_plain_segment.get(seg as usize).copied().unwrap_or(false));
+        let binding = self.packed_prefill.filter(|_| {
+            !g.packed_plain_segment
+                .get(seg as usize)
+                .copied()
+                .unwrap_or(false)
+        });
         let (prefill_spans, prefill_parked, n_prefill_spans, n_prefill_rows) =
             packed_prefill_kernarg(
                 binding,
@@ -12132,9 +12361,13 @@ impl AmdEngine {
         // whether or not a packed binding is staged; the two sparse routes take the staged
         // spans (`stage_kv_spans`). An active binding used to skip every native route here and
         // hand the segment to the primary interpreter, which has no arm for these opcodes.
-        if let Some(PrefillSegmentRoute::IndexFp8(route)) = self.progs[p].prefill_routes.get(seg).copied() {
+        if let Some(PrefillSegmentRoute::IndexFp8(route)) =
+            self.progs[p].prefill_routes.get(seg).copied()
+        {
             if active {
-                return Err(RuntimeError::Device("FP8 prefill indexer has no packed-span route".into()));
+                return Err(RuntimeError::Device(
+                    "FP8 prefill indexer has no packed-span route".into(),
+                ));
             }
             let kernel = self.index_fp8_prefill.as_ref().ok_or_else(|| {
                 RuntimeError::Device("FP8 prefill indexer has no loaded kernels".into())
@@ -12225,7 +12458,12 @@ impl AmdEngine {
                 let sparse = self.sparse_mla.as_ref().ok_or_else(|| {
                     RuntimeError::Device("sparse MLA route has no loaded kernels".into())
                 })?;
-                self.seg_launches += sparse.enqueue(&self.be, route, &self.tens_table, self.tp.map_or(0, |t| t.rank))? as u64;
+                self.seg_launches += sparse.enqueue(
+                    &self.be,
+                    route,
+                    &self.tens_table,
+                    self.tp.map_or(0, |t| t.rank),
+                )? as u64;
                 return Ok(());
             }
             if route.split_row0 != 0 {
@@ -12544,7 +12782,11 @@ impl AmdEngine {
                 self.seg_launches += 4;
                 return Ok(());
             }
-            if let (Some(quant), Some((kernel, args_bytes)), Some(PrefillSegmentRoute::MoeStage1A4Reuse(route))) = (
+            if let (
+                Some(quant),
+                Some((kernel, args_bytes)),
+                Some(PrefillSegmentRoute::MoeStage1A4Reuse(route)),
+            ) = (
                 self.k_moe_stage1_a4_quant,
                 self.k_moe_stage1_a4_reuse,
                 self.progs[p].prefill_routes.get(seg).copied(),
@@ -12686,7 +12928,10 @@ impl AmdEngine {
         }
     }
 
-    pub(crate) fn preflight_decode_replay(&self, p: usize) -> Result<crate::device::kernarg_retirement::Admission> {
+    pub(crate) fn preflight_decode_replay(
+        &self,
+        p: usize,
+    ) -> Result<crate::device::kernarg_retirement::Admission> {
         if self.index_fp8.is_some() {
             // Refuse an unqualified domain before reserving otherwise unfillable AQL slots.
             for route in &self.progs[p].decode_routes {
@@ -12701,8 +12946,13 @@ impl AmdEngine {
         self.be.preflight_dispatch_chain(packets)
     }
 
-    pub(crate) fn begin_decode_replay_admitted(&self, ticket: crate::device::kernarg_retirement::Admission) -> Result<()> {
-        if let Some(kernel) = &self.mla_bf16 { kernel.reset_metadata(); }
+    pub(crate) fn begin_decode_replay_admitted(
+        &self,
+        ticket: crate::device::kernarg_retirement::Admission,
+    ) -> Result<()> {
+        if let Some(kernel) = &self.mla_bf16 {
+            kernel.reset_metadata();
+        }
         self.be.begin_dispatch_chain_admitted(ticket)
     }
 
@@ -12730,7 +12980,10 @@ impl AmdEngine {
         self.begin_graph_phase_replay_admitted(ticket)
     }
 
-    pub(crate) fn preflight_graph_phase_replay(&self, p: usize) -> Result<crate::device::kernarg_retirement::Admission> {
+    pub(crate) fn preflight_graph_phase_replay(
+        &self,
+        p: usize,
+    ) -> Result<crate::device::kernarg_retirement::Admission> {
         if !self.graph_phase_replay(p) {
             return Err(RuntimeError::Device(format!(
                 "program {p} has no graph-derived phase-object route"
@@ -12747,7 +13000,10 @@ impl AmdEngine {
         self.be.preflight_dispatch_chain(packets)
     }
 
-    pub(crate) fn begin_graph_phase_replay_admitted(&self, ticket: crate::device::kernarg_retirement::Admission) -> Result<()> {
+    pub(crate) fn begin_graph_phase_replay_admitted(
+        &self,
+        ticket: crate::device::kernarg_retirement::Admission,
+    ) -> Result<()> {
         self.be.begin_dispatch_chain_admitted(ticket)
     }
 
@@ -12791,14 +13047,18 @@ impl AmdEngine {
             };
         }
         match self.progs[p].prefill_routes.get(seg) {
-            Some(PrefillSegmentRoute::SparseMla(route)) if route.active => self.sparse_mla
-                .as_ref().map_or(1, |s| s.active_launches(*route)),
+            Some(PrefillSegmentRoute::SparseMla(route)) if route.active => self
+                .sparse_mla
+                .as_ref()
+                .map_or(1, |s| s.active_launches(*route)),
             Some(PrefillSegmentRoute::SparseMla(route)) if route.native_lo => self
                 .sparse_mla
                 .as_ref()
                 .map_or(1, |s| s.native_lo_launches(*route)),
             Some(PrefillSegmentRoute::SparseMla(route)) if route.split_row0 != 0 => self
-                .sparse_mla.as_ref().map_or(1, |s| s.split_launches(*route)),
+                .sparse_mla
+                .as_ref()
+                .map_or(1, |s| s.split_launches(*route)),
             Some(PrefillSegmentRoute::GemmLt(_)) => 1,
             Some(PrefillSegmentRoute::Gemma4Glu(_)) => 1,
             Some(PrefillSegmentRoute::GemmBlk(route)) => route.launches(),
@@ -12820,17 +13080,26 @@ impl AmdEngine {
         self.be.commit_dispatch_chain()
     }
 
-    pub(crate) fn preflight_segment_batch(&self, p: usize, seg: usize) -> Result<crate::device::kernarg_retirement::Admission> {
+    pub(crate) fn preflight_segment_batch(
+        &self,
+        p: usize,
+        seg: usize,
+    ) -> Result<crate::device::kernarg_retirement::Admission> {
         check_packed_prefill_dispatch(self.packed_prefill, p)?;
         if seg >= self.prog_dispatch(p).launches() {
-            return Err(RuntimeError::Rejected("prefill segment outside program".into()));
+            return Err(RuntimeError::Rejected(
+                "prefill segment outside program".into(),
+            ));
         }
-        self.be.preflight_dispatch_chain(self.prefill_segment_launches(p, seg))
+        self.be
+            .preflight_dispatch_chain(self.prefill_segment_launches(p, seg))
     }
 
     fn segment_csr_route(&self, p: usize, seg: usize) -> Option<amd_sparse_mla::Route> {
         if !prefill_segment_specialization_allowed(self.prog_dispatch(p))
-            || self.packed_prefill.is_some_and(|b| b.prog == p) || self.union_unread(p, seg) {
+            || self.packed_prefill.is_some_and(|b| b.prog == p)
+            || self.union_unread(p, seg)
+        {
             return None;
         }
         match self.progs[p].prefill_routes.get(seg).copied() {
@@ -12841,8 +13110,12 @@ impl AmdEngine {
 
     pub(crate) fn segment_needs_prepare(&self, p: usize, seg: usize) -> Result<bool> {
         match self.segment_csr_route(p, seg) {
-            Some(route) => self.sparse_mla.as_ref()
-                .ok_or_else(|| RuntimeError::Rejected("sparse MLA route has no loaded kernels".into()))?
+            Some(route) => self
+                .sparse_mla
+                .as_ref()
+                .ok_or_else(|| {
+                    RuntimeError::Rejected("sparse MLA route has no loaded kernels".into())
+                })?
                 .needs_prepare(route, self.tp.map_or(0, |t| t.rank)),
             None => Ok(false),
         }
@@ -12850,22 +13123,32 @@ impl AmdEngine {
 
     pub(crate) fn prepare_segment_quiescent(&self, p: usize, seg: usize) -> Result<()> {
         if let Some(route) = self.segment_csr_route(p, seg) {
-            self.sparse_mla.as_ref()
-                .ok_or_else(|| RuntimeError::Rejected("sparse MLA route has no loaded kernels".into()))?
+            self.sparse_mla
+                .as_ref()
+                .ok_or_else(|| {
+                    RuntimeError::Rejected("sparse MLA route has no loaded kernels".into())
+                })?
                 .prepare_quiescent(&self.be, route, self.tp.map_or(0, |t| t.rank))?;
         }
         Ok(())
     }
 
     pub(crate) fn replay_without_prepare(&self, p: usize) -> Result<bool> {
-        if crate::config::RuntimeConfig::get().amd.native_launch_timing { return Ok(false); }
+        if crate::config::RuntimeConfig::get().amd.native_launch_timing {
+            return Ok(false);
+        }
         for seg in 0..self.prog_dispatch(p).launches() {
-            if self.segment_needs_prepare(p, seg)? { return Ok(false); }
+            if self.segment_needs_prepare(p, seg)? {
+                return Ok(false);
+            }
         }
         Ok(true)
     }
 
-    pub(crate) fn begin_segment_batch(&self, ticket: crate::device::kernarg_retirement::Admission) -> Result<()> {
+    pub(crate) fn begin_segment_batch(
+        &self,
+        ticket: crate::device::kernarg_retirement::Admission,
+    ) -> Result<()> {
         self.be.begin_dispatch_batch_admitted(ticket)
     }
 
@@ -12886,9 +13169,12 @@ impl AmdEngine {
         })?;
         match route {
             DecodeSegmentRoute::IndexFp8(route) => {
-                self.index_fp8.as_ref().ok_or_else(|| {
-                    RuntimeError::Device("FP8 indexer route has no loaded kernels".into())
-                })?.enqueue(&self.be, route, &self.tens_table)?;
+                self.index_fp8
+                    .as_ref()
+                    .ok_or_else(|| {
+                        RuntimeError::Device("FP8 indexer route has no loaded kernels".into())
+                    })?
+                    .enqueue(&self.be, route, &self.tens_table)?;
                 self.seg_launches += 1;
             }
             DecodeSegmentRoute::MlaBf16(route) => {
@@ -13349,7 +13635,9 @@ impl AmdEngine {
         if let Some(kernel) = &self.mla_bf16 {
             kernel.reset_metadata();
         }
-        let hoist = crate::config::RuntimeConfig::get().amd.mla_bf16_metadata_hoist;
+        let hoist = crate::config::RuntimeConfig::get()
+            .amd
+            .mla_bf16_metadata_hoist;
         for prog in &mut self.progs {
             let mut previous_metadata = None;
             for route in &mut prog.decode_routes {
@@ -13394,7 +13682,10 @@ impl AmdEngine {
         // at most a handful of times per generation (the live count is a step
         // function of `kv_len`), so it is not a hot-path log.
         tracing::info!(
-            baked, from, to = want, kvlen,
+            baked,
+            from,
+            to = want,
+            kvlen,
             "MLA split count re-pointed at the live kv_len"
         );
         let sz = std::mem::size_of::<DevInst64>();
@@ -13611,9 +13902,14 @@ impl AmdEngine {
             self.progs[prog].t,
             bucket.or_else(|| self.ragged_bucket(prog)),
         );
-        if let (true, Some(tp)) = (crate::config::RuntimeConfig::get().amd_ragged_seams(), self.tp) {
+        if let (true, Some(tp)) = (
+            crate::config::RuntimeConfig::get().amd_ragged_seams(),
+            self.tp,
+        ) {
             let t = self.progs[prog].t;
-            let ragged = bucket.or_else(|| self.ragged_bucket(prog)).is_some_and(|b| clen < b);
+            let ragged = bucket
+                .or_else(|| self.ragged_bucket(prog))
+                .is_some_and(|b| clen < b);
             let b = if ragged && t > 1 && t % tp.n_gpu == 0 {
                 rebase_band_rows(insts, &self.tensor_names, clen, t, tp.n_gpu);
                 ragged_band_rows(clen, t, tp.n_gpu)
@@ -13631,7 +13927,9 @@ impl AmdEngine {
         };
         mla_prefill::rebase(&self.progs[prog].small_mla_split_sites, insts, c0 + rows)?;
         let row_split = crate::config::RuntimeConfig::get().amd.mla_pf_row_split;
-        let native_lo = crate::config::RuntimeConfig::get().amd.mla_pf_row_split_native_lo;
+        let native_lo = crate::config::RuntimeConfig::get()
+            .amd
+            .mla_pf_row_split_native_lo;
         for route in &mut self.progs[prog].prefill_routes {
             if let PrefillSegmentRoute::IndexFp8(route) = route {
                 route.arm_for_program(c0, clen, rows)?;
@@ -13749,9 +14047,11 @@ impl AmdEngine {
         if views.is_empty() {
             return Ok(());
         }
-        let updates = crate::exec::tensor_bindings::band_bindings(&self.devp, &self.tensor_names, &views)?;
-        self.tens_table = self.tensor_bindings.rebind(updates,
-            |bytes| EngineDevice::upload(&*self.be, &self.d_tens, 0, bytes))?;
+        let updates =
+            crate::exec::tensor_bindings::band_bindings(&self.devp, &self.tensor_names, &views)?;
+        self.tens_table = self.tensor_bindings.rebind(updates, |bytes| {
+            EngineDevice::upload(&*self.be, &self.d_tens, 0, bytes)
+        })?;
         self.band_rows_bound.insert(t, b);
         Ok(())
     }
@@ -13774,7 +14074,9 @@ impl AmdEngine {
         let prog = rowsplit_chunk_prog(step, self.progs[step.prog].t, sibling, rowband);
         if prog != step.prog {
             static SAID: std::sync::Once = std::sync::Once::new();
-            SAID.call_once(|| tracing::info!(prog, "PLOW_GLM_ROWSPLIT_ATTN: row-split sibling selected"));
+            SAID.call_once(|| {
+                tracing::info!(prog, "PLOW_GLM_ROWSPLIT_ATTN: row-split sibling selected")
+            });
         }
         ChunkStep { prog, ..step }
     }
@@ -14132,9 +14434,10 @@ impl AmdEngine {
                     self.devp.len()
                 ))
             })?;
-            let end = span.dst_off.checked_add(span.bytes).ok_or_else(|| {
-                RuntimeError::Device("head handoff span overflows".into())
-            })?;
+            let end = span
+                .dst_off
+                .checked_add(span.bytes)
+                .ok_or_else(|| RuntimeError::Device("head handoff span overflows".into()))?;
             if end > dst.len {
                 return Err(RuntimeError::Device(format!(
                     "head handoff writes {}+{} of `{}`, which holds {} bytes",
@@ -14166,12 +14469,14 @@ impl AmdEngine {
                 self.batch
             )));
         }
-        let updates = crate::exec::tensor_bindings::slot_bindings(&self.devp, &self.kv_slot_stride, slot)?;
+        let updates =
+            crate::exec::tensor_bindings::slot_bindings(&self.devp, &self.kv_slot_stride, slot)?;
         // One upload of the whole table (a few KiB) beats one per KV buffer:
         // there are 2-4 per layer and the submission, not the bytes, is the
         // cost. This is off the per-token path — it happens once per prefill.
-        self.tens_table = self.tensor_bindings.rebind(updates,
-            |bytes| EngineDevice::upload(&*self.be, &self.d_tens, 0, bytes))?;
+        self.tens_table = self.tensor_bindings.rebind(updates, |bytes| {
+            EngineDevice::upload(&*self.be, &self.d_tens, 0, bytes)
+        })?;
         self.kv_slot = slot;
         if tracing::enabled!(tracing::Level::DEBUG) {
             let (i, stride) = self.kv_slot_stride[0];
@@ -14199,7 +14504,11 @@ impl AmdEngine {
     }
 
     pub(crate) fn prefill_slot_cached(
-        &mut self, slot: usize, prompt: &[u32], resume: u32, arm: u32,
+        &mut self,
+        slot: usize,
+        prompt: &[u32],
+        resume: u32,
+        arm: u32,
     ) -> Result<u32> {
         self.kv_rebase(slot)?;
         let result = (|| {
@@ -14545,10 +14854,11 @@ impl AmdEngine {
 
     pub fn prefix_cache_capable(&self) -> bool {
         let cap = self.prefix_cache_cap();
-        self.shared_prefix.is_some() || (self.vmm.is_none()
-            && self.prefix_regions.as_ref().is_some_and(|regions| {
-                cap == 0 || regions.iter().map(prefix::Region::bytes).sum::<u64>() <= cap
-            }))
+        self.shared_prefix.is_some()
+            || (self.vmm.is_none()
+                && self.prefix_regions.as_ref().is_some_and(|regions| {
+                    cap == 0 || regions.iter().map(prefix::Region::bytes).sum::<u64>() <= cap
+                }))
     }
 
     pub fn shared_prefix_enabled(&self) -> bool {
@@ -14556,8 +14866,14 @@ impl AmdEngine {
     }
 
     pub fn attach_shared_prefixes(ranks: &mut [Self], slot: usize, prompt: &[u32]) -> Result<u32> {
-        if ranks.is_empty() || ranks.iter().any(|e| !e.shared_prefix_enabled() || slot >= e.batch) {
-            return Err(RuntimeError::Device("shared prefix attachment requires every rank and a valid slot".into()));
+        if ranks.is_empty()
+            || ranks
+                .iter()
+                .any(|e| !e.shared_prefix_enabled() || slot >= e.batch)
+        {
+            return Err(RuntimeError::Device(
+                "shared prefix attachment requires every rank and a valid slot".into(),
+            ));
         }
         shared_prefix::attach_ranks(ranks, slot, prompt, |rank| {
             rank.shared_prefix.as_mut().expect("validated above")
@@ -14571,7 +14887,12 @@ impl AmdEngine {
         Ok(())
     }
 
-    pub fn publish_shared_prefix(&mut self, slot: usize, prompt: &[u32], frontier: u32) -> Result<()> {
+    pub fn publish_shared_prefix(
+        &mut self,
+        slot: usize,
+        prompt: &[u32],
+        frontier: u32,
+    ) -> Result<()> {
         if let Some(cache) = &mut self.shared_prefix {
             cache.publish_completed_chunk(slot, prompt, frontier)?;
         }
@@ -14642,22 +14963,40 @@ impl AmdEngine {
             )));
         }
         self.sync_kda_conv_alt(slot)?;
-        let total = self.prefix_regions.as_ref().map_or_else(|| self.carried_bytes(),
-            |regions| regions.iter().map(prefix::Region::bytes).sum());
+        let total = self.prefix_regions.as_ref().map_or_else(
+            || self.carried_bytes(),
+            |regions| regions.iter().map(prefix::Region::bytes).sum(),
+        );
         if total == 0 {
             self.prefix_rows[slot] = rows;
             return Ok(());
         }
         if self.prefix_snap[slot].is_none() {
             let cap = self.prefix_cache_cap();
-            while cap > 0 && self.prefix_snap.iter().flatten().map(|m| m.len).sum::<u64>() + total > cap {
-                if !self.evict_prefix_snapshot(slot) { return Ok(()); }
+            while cap > 0
+                && self
+                    .prefix_snap
+                    .iter()
+                    .flatten()
+                    .map(|m| m.len)
+                    .sum::<u64>()
+                    + total
+                    > cap
+            {
+                if !self.evict_prefix_snapshot(slot) {
+                    return Ok(());
+                }
             }
             loop {
                 match EngineDevice::alloc(&*self.be, total) {
-                    Ok(mem) => { self.prefix_snap[slot] = Some(mem); break; }
+                    Ok(mem) => {
+                        self.prefix_snap[slot] = Some(mem);
+                        break;
+                    }
                     Err(RuntimeError::Oom(_)) => {
-                        if !self.evict_prefix_snapshot(slot) { return Ok(()); }
+                        if !self.evict_prefix_snapshot(slot) {
+                            return Ok(());
+                        }
                     }
                     Err(error) => return Err(error),
                 }
@@ -14687,8 +15026,12 @@ impl AmdEngine {
         restore: bool,
         dirty_rows: Option<u32>,
     ) -> Vec<(u64, u64, u64)> {
-        let capacity = self.prefix_regions.as_ref().map_or(self.carried_slot.len(),
-            |regions| regions.iter().map(prefix::Region::max_copies).sum());
+        let capacity = self
+            .prefix_regions
+            .as_ref()
+            .map_or(self.carried_slot.len(), |regions| {
+                regions.iter().map(prefix::Region::max_copies).sum()
+            });
         let mut pairs = Vec::with_capacity(capacity);
         let mut offset = 0;
         if let Some(regions) = &self.prefix_regions {
@@ -14696,7 +15039,11 @@ impl AmdEngine {
                 let base = self.devp[region.tensor].base + region.slot_bytes * slot as u64;
                 let mut add = |dst, src, bytes| {
                     let (snapshot, live) = (buffer + offset + dst, base + src);
-                    pairs.push(if restore { (live, snapshot, bytes) } else { (snapshot, live, bytes) });
+                    pairs.push(if restore {
+                        (live, snapshot, bytes)
+                    } else {
+                        (snapshot, live, bytes)
+                    });
                 };
                 if restore {
                     if let Some(dirty) = dirty_rows {
@@ -14711,8 +15058,15 @@ impl AmdEngine {
             }
         } else {
             for &(index, stride) in &self.carried_slot {
-                let (snapshot, live) = (buffer + offset, self.devp[index].base + stride * slot as u64);
-                pairs.push(if restore { (live, snapshot, stride) } else { (snapshot, live, stride) });
+                let (snapshot, live) = (
+                    buffer + offset,
+                    self.devp[index].base + stride * slot as u64,
+                );
+                pairs.push(if restore {
+                    (live, snapshot, stride)
+                } else {
+                    (snapshot, live, stride)
+                });
                 offset += stride;
             }
         }
@@ -14782,7 +15136,11 @@ impl AmdEngine {
         n_prompt: u32,
     ) -> Result<Vec<ChunkStep>> {
         chunk_steps_over(
-            |ch| self.prefill_rungs().find(|&(_, rows)| rows == ch).map(|(prog, _)| prog),
+            |ch| {
+                self.prefill_rungs()
+                    .find(|&(_, rows)| rows == ch)
+                    .map(|(prog, _)| prog)
+            },
             chunks,
             from,
             n_prompt,
@@ -14821,7 +15179,8 @@ impl AmdEngine {
             )));
         }
         if self.vmm.is_some() || self.shared_prefix.is_some() {
-            let tick = crate::obs::tick::on().then(|| (std::time::Instant::now(), self.kv_mappings()));
+            let tick =
+                crate::obs::tick::on().then(|| (std::time::Instant::now(), self.kv_mappings()));
             for (slot, &position) in pos.iter().enumerate() {
                 self.vmm_ensure(slot, position + 1)?;
             }
@@ -15132,7 +15491,10 @@ impl AmdEngine {
         if t < Self::DENSE_EXACT_MIN_RUNG || !self.decode_ladder.contains(&dp) {
             return None;
         }
-        self.dense_exact_ladder.iter().copied().find(|&p| self.progs[p].t == t)
+        self.dense_exact_ladder
+            .iter()
+            .copied()
+            .find(|&p| self.progs[p].t == t)
     }
 
     /// Narrower dense-exact rungs an older packet may carry are never dispatched (the emitter's

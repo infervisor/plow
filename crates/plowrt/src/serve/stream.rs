@@ -213,21 +213,43 @@ mod tests {
     }
 
     fn texts() -> Vec<String> {
-        let mut v: Vec<String> = ["", " the", "a\nb", "\n", "\"q\"\\", "tab\t", "\u{1}\u{1f}", "é日本\u{FFFD}", "</s>"]
-            .map(String::from)
-            .to_vec();
-        v.push((0..300u32).map(|i| char::from_u32(32 + (i * 37) % 900).unwrap_or('x')).collect());
+        let mut v: Vec<String> = [
+            "",
+            " the",
+            "a\nb",
+            "\n",
+            "\"q\"\\",
+            "tab\t",
+            "\u{1}\u{1f}",
+            "é日本\u{FFFD}",
+            "</s>",
+        ]
+        .map(String::from)
+        .to_vec();
+        v.push(
+            (0..300u32)
+                .map(|i| char::from_u32(32 + (i * 37) % 900).unwrap_or('x'))
+                .collect(),
+        );
         v
     }
 
     #[tokio::test]
     async fn frames_match_axum_events_byte_for_byte() {
-        use crate::serve::openai::{ChatChunk, ChunkChoice, CompletionChoice, CompletionResponse, Delta};
+        use crate::serve::openai::{
+            ChatChunk, ChunkChoice, CompletionChoice, CompletionResponse, Delta,
+        };
         let head = FrameHead::new("cmpl-\"1\"", "text_completion", 1_789_920_673, "gemma\n4");
         let chat_head = FrameHead::new("chatcmpl-9", "chat.completion.chunk", 7, "m");
         let (mut want, mut got) = (Vec::new(), Vec::new());
         for text in texts() {
-            let choice = CompletionChoice { index: 0, text: text.clone(), logprobs: None, finish_reason: None, x_plow_finish_reason: None };
+            let choice = CompletionChoice {
+                index: 0,
+                text: text.clone(),
+                logprobs: None,
+                finish_reason: None,
+                x_plow_finish_reason: None,
+            };
             let full = CompletionResponse {
                 id: "cmpl-\"1\"".into(),
                 object: "text_completion",
@@ -241,12 +263,24 @@ mod tests {
             got.push(head.frame(&choice));
             let c = ChunkChoice {
                 index: 0,
-                delta: Delta { role: Some("assistant"), content: Some(text.clone()), reasoning_content: None, tool_calls: None },
+                delta: Delta {
+                    role: Some("assistant"),
+                    content: Some(text.clone()),
+                    reasoning_content: None,
+                    tool_calls: None,
+                },
                 logprobs: None,
                 finish_reason: None,
                 x_plow_finish_reason: None,
             };
-            let full = ChatChunk { id: "chatcmpl-9".into(), object: "chat.completion.chunk", created: 7, model: "m".into(), choices: vec![c.clone()], usage: None };
+            let full = ChatChunk {
+                id: "chatcmpl-9".into(),
+                object: "chat.completion.chunk",
+                created: 7,
+                model: "m".into(),
+                choices: vec![c.clone()],
+                usage: None,
+            };
             want.push(Event::default().data(chunk_data(&full)));
             got.push(chat_head.frame(&c));
             want.push(Event::default().data(&text));
@@ -256,7 +290,16 @@ mod tests {
         got.push(sse_comment("server-timing ttft;dur=1.5"));
         want.push(Event::default().data(DONE));
         got.push(sse_data(DONE));
-        let axum = collect(Sse::new(futures::stream::iter(want.into_iter().map(Ok::<_, std::convert::Infallible>))).into_response()).await;
-        assert_eq!(collect(sse_response(futures::stream::iter(got))).await, axum);
+        let axum = collect(
+            Sse::new(futures::stream::iter(
+                want.into_iter().map(Ok::<_, std::convert::Infallible>),
+            ))
+            .into_response(),
+        )
+        .await;
+        assert_eq!(
+            collect(sse_response(futures::stream::iter(got))).await,
+            axum
+        );
     }
 }

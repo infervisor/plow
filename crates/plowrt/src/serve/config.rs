@@ -67,10 +67,6 @@ impl ServingConfig {
 mod tests {
     use super::*;
 
-
-
-
-
     #[test]
     fn a_checkpoint_without_a_generation_config_keeps_the_stock_defaults() {
         let cfg = ServingConfig::load(Path::new("/nonexistent"));

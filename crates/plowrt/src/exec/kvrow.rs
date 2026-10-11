@@ -391,7 +391,10 @@ pub(crate) fn rebase_chunk_rows(
         };
         // A sequence-parallel band packet (`<base>@band<T>` output) covers this rank's fixed
         // `T/tp` rows, not a prefix of the bucket; shrinking it would drop live band rows.
-        if names.get(d.t[0] as usize).is_some_and(|n| n.contains("@band")) {
+        if names
+            .get(d.t[0] as usize)
+            .is_some_and(|n| n.contains("@band"))
+        {
             continue;
         }
         match prefill_row_field(op) {
@@ -418,9 +421,21 @@ pub(crate) fn ragged_band_rows(clen: u32, t: u32, tp: u32) -> u32 {
 /// whole rows `[r*b, (r+1)*b)`, and every band packet (output `<base>@band<t>...`) goes from
 /// `t / tp` rows to `b`. Rows `clen..tp*b` are padding, computed and never read. The band views
 /// must be rebound to match: [`ragged_band_views`].
-pub(crate) fn rebase_band_rows(insts: &mut [DevInst64], names: &[String], clen: u32, t: u32, tp: u32) {
+pub(crate) fn rebase_band_rows(
+    insts: &mut [DevInst64],
+    names: &[String],
+    clen: u32,
+    t: u32,
+    tp: u32,
+) {
     let (tb, b) = (t / tp, ragged_band_rows(clen, t, tp));
-    let rescale = |v: u32, per: u32, to: u32| if v > 0 && v % per == 0 { v / per * to } else { v };
+    let rescale = |v: u32, per: u32, to: u32| {
+        if v > 0 && v % per == 0 {
+            v / per * to
+        } else {
+            v
+        }
+    };
     for d in insts.iter_mut() {
         if d.op == DevOp::XReduceScatter as u16 {
             d.i[0] = rescale(d.i[0], t, tp * b);
@@ -428,7 +443,10 @@ pub(crate) fn rebase_band_rows(insts: &mut [DevInst64], names: &[String], clen: 
             for k in 0..3 {
                 d.i[k] = rescale(d.i[k], t, tp * b);
             }
-        } else if names.get(d.t[0] as usize).is_some_and(|n| n.contains("@band")) {
+        } else if names
+            .get(d.t[0] as usize)
+            .is_some_and(|n| n.contains("@band"))
+        {
             match prefill_row_field(d.op) {
                 Some(RowField::Rows(f)) if d.i[f] == tb => d.i[f] = b,
                 Some(RowField::RowsTimes(f)) => d.i[f] = rescale(d.i[f], tb, b),
@@ -644,7 +662,10 @@ pub(crate) fn decode_dense_exact(kvlen: &[u32], parked: &[u32], select_width: u3
 /// * there are no MLA flash sites at all.
 pub(crate) fn derive_mla_nsplit(insts: &[DevInst64]) -> Option<(Vec<u32>, u32)> {
     let gather = DevOp::FlashGatherDecode as u16;
-    let flash = [DevOp::FlashMlaDecode as u16, DevOp::FlashMlaDecodeFp8 as u16];
+    let flash = [
+        DevOp::FlashMlaDecode as u16,
+        DevOp::FlashMlaDecodeFp8 as u16,
+    ];
     let merge = DevOp::MlaMergeFold as u16;
     let (mut sites, mut baked, mut n_flash, mut n_merge) = (Vec::new(), None, 0usize, 0usize);
     for (k, d) in insts.iter().enumerate() {
@@ -864,7 +885,11 @@ mod row_field_tests {
                 )),
             }
         }
-        assert!(wrong.is_empty(), "PREFILL_ROW_FIELDS disagrees with packet::slots:\n{}", wrong.join("\n"));
+        assert!(
+            wrong.is_empty(),
+            "PREFILL_ROW_FIELDS disagrees with packet::slots:\n{}",
+            wrong.join("\n")
+        );
     }
 
     /// No opcode listed twice: `prefill_row_field` takes the FIRST match, so a duplicate with a
@@ -956,7 +981,8 @@ mod row_field_tests {
         assert!(derive_nv_nsplit(&[d_flash, d_merge_bad], |_| true).is_none());
 
         // Fused merge (no FlashMerge) succeeds
-        let (sites_single, baked_single) = derive_nv_nsplit(&[d_flash], |_| true).expect("fused merge");
+        let (sites_single, baked_single) =
+            derive_nv_nsplit(&[d_flash], |_| true).expect("fused merge");
         assert_eq!(baked_single, 16);
         assert_eq!(sites_single.len(), 1);
         assert!(!sites_single[0].is_merge);
@@ -979,8 +1005,8 @@ mod row_field_tests {
         d_full.t[4] = 11;
 
         let insts = vec![d_sliding, d_full];
-        let (sites, baked) = derive_nv_nsplit(&insts, |h| h == 10 || h == 11)
-            .expect("derived full cache site");
+        let (sites, baked) =
+            derive_nv_nsplit(&insts, |h| h == 10 || h == 11).expect("derived full cache site");
         assert_eq!(baked, 16);
         assert_eq!(sites.len(), 1);
         assert_eq!(sites[0].inst_idx, 1);

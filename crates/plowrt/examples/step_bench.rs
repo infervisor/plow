@@ -75,7 +75,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (mut dump_names, mut dump_dir) = (None::<String>, None::<String>);
     while let Some(a) = args.next() {
         match a.as_str() {
-            "--max-segments" => max_segments = Some(args.next().ok_or("--max-segments N")?.parse()?),
+            "--max-segments" => {
+                max_segments = Some(args.next().ok_or("--max-segments N")?.parse()?)
+            }
             "--max-inst" => max_inst = Some(args.next().ok_or("--max-inst N")?.parse()?),
             "--same" => same = true,
             "--spread" => spread = true,
@@ -127,13 +129,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err("choose --max-inst or --max-segments".into());
     }
     let partial = max_inst.is_some() || max_segments.is_some();
-    if prefill_logits_dir.is_some() && (partial || dumps.is_some() || sweep.is_some() || multistep) {
+    if prefill_logits_dir.is_some() && (partial || dumps.is_some() || sweep.is_some() || multistep)
+    {
         return Err("--dump-prefill-logits captures prefill only".into());
     }
-    if partial
-        && (steps != 1 || warmup != 0 || multistep || sweep.is_some() || dumps.is_none())
-    {
-        return Err("partial capture requires one step, --warmup 0, tensor dumps, and no sweep/multistep".into());
+    if partial && (steps != 1 || warmup != 0 || multistep || sweep.is_some() || dumps.is_none()) {
+        return Err(
+            "partial capture requires one step, --warmup 0, tensor dumps, and no sweep/multistep"
+                .into(),
+        );
     }
 
     let ckpt = std::env::var("PLOW_CHECKPOINT")
@@ -183,12 +187,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 })
                 .collect();
         }
-        (0..ctx as u32).map(|i| 100 + ((i + 131 * bb) % 1000)).collect()
+        (0..ctx as u32)
+            .map(|i| 100 + ((i + 131 * bb) % 1000))
+            .collect()
     };
     if packed_prefill {
         use plowrt::exec::gpu::PfBatchReq;
         if slots == 0 || ctx == 0 || !e.pf_batch_enabled() || !e.has_packed_terminal() {
-            return Err("--packed-prefill requires nonempty prompts, packed prefill and compact terminal".into());
+            return Err(
+                "--packed-prefill requires nonempty prompts, packed prefill and compact terminal"
+                    .into(),
+            );
         }
         let prompts: Vec<_> = (0..slots).map(prompt_for).collect();
         let chunk = e.pf_request_max_rows().min(e.pf_max_rows()).min(pf_chunk);
@@ -212,9 +221,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let len = chunk.min(ctx - c0);
                 for first in (0..slots).step_by(width) {
                     let end = (first + width).min(slots);
-                    let requests: Vec<_> = (first..end).map(|slot| PfBatchReq {
-                        slot, prompt: &prompts[slot], c0, len,
-                    }).collect();
+                    let requests: Vec<_> = (first..end)
+                        .map(|slot| PfBatchReq {
+                            slot,
+                            prompt: &prompts[slot],
+                            c0,
+                            len,
+                        })
+                        .collect();
                     let t = Instant::now();
                     e.prefill_batched_complete(&requests, &mut completed)?;
                     println!("packed prefill: rep={rep} prefix={c0} chunk_rows={len} requests={} rows={} ms={:.3}",
@@ -227,8 +241,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
             }
-            println!("packed prompts consumed in {:.4} s (rep {rep}, first tokens {:?})",
-                     t0.elapsed().as_secs_f64(), &last[..slots.min(8)]);
+            println!(
+                "packed prompts consumed in {:.4} s (rep {rep}, first tokens {:?})",
+                t0.elapsed().as_secs_f64(),
+                &last[..slots.min(8)]
+            );
         }
     } else {
         for b in 0..slots {
@@ -264,15 +281,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     if let Some(dir) = &prefill_logits_dir {
-        std::fs::write(dir.join("manifest.json"), serde_json::to_vec_pretty(&serde_json::json!({
-            "schema": 1, "producer": "plow-step-bench-prefill", "name": "step-bench-prefill",
-            "vocab_size": e.vocab(), "cases": prefill_cases,
-        }))?)?;
+        std::fs::write(
+            dir.join("manifest.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "schema": 1, "producer": "plow-step-bench-prefill", "name": "step-bench-prefill",
+                "vocab_size": e.vocab(), "cases": prefill_cases,
+            }))?,
+        )?;
         return Ok(());
     }
 
     if let Some((rows, widths)) = &ride {
-        return ride_bench(&mut e, &last, ctx, steps, *rows, widths, ride_dump.as_deref());
+        return ride_bench(
+            &mut e,
+            &last,
+            ctx,
+            steps,
+            *rows,
+            widths,
+            ride_dump.as_deref(),
+        );
     }
 
     if let Some(segments) = max_segments {
@@ -311,7 +339,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut v: Vec<f64> = (0..steps)
                 .map(|_| {
                     let t0 = Instant::now();
-                    e.step_slots(&feeds_of(&last), &mut toks).map(|_| t0.elapsed().as_secs_f64() * 1e3)
+                    e.step_slots(&feeds_of(&last), &mut toks)
+                        .map(|_| t0.elapsed().as_secs_f64() * 1e3)
                 })
                 .collect::<Result<_, _>>()?;
             v.sort_by(f64::total_cmp);
@@ -336,11 +365,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut v: Vec<f64> = (0..steps)
                 .map(|_| {
                     let t0 = Instant::now();
-                    e.step_slots(&feeds_of(&last), &mut toks).map(|_| t0.elapsed().as_secs_f64() * 1e3)
+                    e.step_slots(&feeds_of(&last), &mut toks)
+                        .map(|_| t0.elapsed().as_secs_f64() * 1e3)
                 })
                 .collect::<Result<_, _>>()?;
             v.sort_by(f64::total_cmp);
-            println!("{{\"cap\":{},\"ms\":{:.4}}}", if cap == u32::MAX { -1 } else { cap as i64 }, v[v.len() / 2]);
+            println!(
+                "{{\"cap\":{},\"ms\":{:.4}}}",
+                if cap == u32::MAX { -1 } else { cap as i64 },
+                v[v.len() / 2]
+            );
         }
         return Ok(());
     }
@@ -391,7 +425,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         done += 1;
     }
     if !partial {
-        println!("TOK_STREAM slots={slots} ctx={ctx} fnv={digest:016x} slot0={:?}", streams[0]);
+        println!(
+            "TOK_STREAM slots={slots} ctx={ctx} fnv={digest:016x} slot0={:?}",
+            streams[0]
+        );
     }
     if same && !partial {
         let agree = streams.iter().filter(|s| **s == streams[0]).count();
@@ -482,12 +519,23 @@ fn ride_bench(
     use std::time::Instant;
     let first = last.len();
     let wmax = *widths.iter().max().ok_or("--ride needs a width")?;
-    let chunk = e.pf_request_max_rows().min(e.pf_max_rows()).min(rows).max(1);
-    let fills: Vec<usize> = (0..rows.div_ceil(chunk)).map(|i| chunk.min(rows - i * chunk)).collect();
+    let chunk = e
+        .pf_request_max_rows()
+        .min(e.pf_max_rows())
+        .min(rows)
+        .max(1);
+    let fills: Vec<usize> = (0..rows.div_ceil(chunk))
+        .map(|i| chunk.min(rows - i * chunk))
+        .collect();
     if !e.token_batch_enabled() || wmax > first || first + fills.len() > e.batch() {
-        return Err("--ride needs the token batch, widths <= slots, slots + prefill requests <= batch".into());
+        return Err(
+            "--ride needs the token batch, widths <= slots, slots + prefill requests <= batch"
+                .into(),
+        );
     }
-    let prompt: Vec<u32> = (0..2 * chunk as u32).map(|i| 1000 + (i * 7919) % 50000).collect();
+    let prompt: Vec<u32> = (0..2 * chunk as u32)
+        .map(|i| 1000 + (i * 7919) % 50000)
+        .collect();
     for i in 0..fills.len() {
         e.begin_slot(first + i, prompt.len() + 1)?;
     }
@@ -503,8 +551,9 @@ fn ride_bench(
         }
         Ok(())
     };
-    let generations: Vec<u32> =
-        (0..first + fills.len()).map(|s| e.slot_generation(s).expect("slot")).collect();
+    let generations: Vec<u32> = (0..first + fills.len())
+        .map(|s| e.slot_generation(s).expect("slot"))
+        .collect();
     let requests = |w: usize| {
         let request = |slot: usize, phase, tokens| Request {
             id: slot as u32,
@@ -521,7 +570,12 @@ fn ride_bench(
         };
         (0..w)
             .map(|b| request(b, Phase::Decode, std::slice::from_ref(&last[b])))
-            .chain(fills.iter().enumerate().map(|(i, &n)| request(first + i, Phase::Prefill, &prompt[..n])))
+            .chain(
+                fills
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &n)| request(first + i, Phase::Prefill, &prompt[..n])),
+            )
             .collect::<Vec<Request<'_>>>()
     };
     let feeds: Vec<(usize, u32)> = last.iter().copied().enumerate().collect();
@@ -530,7 +584,11 @@ fn ride_bench(
         v.sort_by(f64::total_cmp);
         v[v.len() / 2]
     };
-    let bf16 = |v: &[f32]| -> Vec<u8> { v.iter().flat_map(|x| ((x.to_bits() >> 16) as u16).to_le_bytes()).collect() };
+    let bf16 = |v: &[f32]| -> Vec<u8> {
+        v.iter()
+            .flat_map(|x| ((x.to_bits() >> 16) as u16).to_le_bytes())
+            .collect()
+    };
     let (mut pure, warm) = (Vec::new(), 4);
     for &w in widths {
         let (mut ride, mut step) = (Vec::new(), Vec::new());
@@ -586,7 +644,11 @@ fn ride_bench(
                         })
                         .sum();
                     kl_max = kl_max.max(kl);
-                    max_abs = rl.iter().zip(&logits).map(|(a, b)| (a - b).abs()).fold(max_abs, f32::max);
+                    max_abs = rl
+                        .iter()
+                        .zip(&logits)
+                        .map(|(a, b)| (a - b).abs())
+                        .fold(max_abs, f32::max);
                     if dump.is_some() {
                         raw_ride.extend(bf16(rl));
                         raw_step.extend(bf16(&logits));

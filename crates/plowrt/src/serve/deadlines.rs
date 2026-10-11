@@ -78,7 +78,8 @@ pub struct Ests {
 pub fn ests() -> Ests {
     let render1 = role_cost(&VOCODER, Op::Render { streams: 1 });
     Ests {
-        llm_first: role_cost(&LLM, Op::Prefill { rows: 0 }) + role_cost(&LLM, Op::DecodeTick { width: 0 }),
+        llm_first: role_cost(&LLM, Op::Prefill { rows: 0 })
+            + role_cost(&LLM, Op::DecodeTick { width: 0 }),
         tts_first: role_cost(&TTS_LM, Op::Prefill { rows: 0 })
             + role_cost(&TTS_LM, Op::DecodeTick { width: 0 }) * FIRST_CHUNK_TICKS
             + render1,
@@ -106,7 +107,11 @@ fn urgency(stage: Stage) -> Urgency {
 }
 
 fn turn_end(t: &TurnTimes, since: Instant) -> Instant {
-    let budget = if t.budget.is_zero() { DEFAULT_BUDGET } else { t.budget };
+    let budget = if t.budget.is_zero() {
+        DEFAULT_BUDGET
+    } else {
+        t.budget
+    };
     t.speech_end.unwrap_or(since) + budget
 }
 
@@ -143,7 +148,11 @@ pub fn claim_stage(stage: Stage, model: usize) {
 /// [`due`] for a caller holding the turn's times (cached per job) and the estimates; `cost` is
 /// the work's own remaining device time.
 pub fn stage_due(stage: Stage, t: &TurnTimes, e: &Ests, cost: Duration, since: Instant) -> Due {
-    Due { deadline: stage_deadline(stage, t, e, since).min(since + max_wait()), cost, band: urgency(stage).into() }
+    Due {
+        deadline: stage_deadline(stage, t, e, since).min(since + max_wait()),
+        cost,
+        band: urgency(stage).into(),
+    }
 }
 
 /// [`stage_due`] for `model`, registering it for the stage.
@@ -170,7 +179,12 @@ pub fn due(stage: Stage, key: Option<&TurnKey>, model: &str, since: Instant, _no
             claim_stage(stage, id);
             let e = ests();
             let tick = cost::estimate_id(id, Op::DecodeTick { width: 0 });
-            let cost = stage_cost(stage, cost::estimate_id(id, Op::Prefill { rows: 0 }), tick, &e);
+            let cost = stage_cost(
+                stage,
+                cost::estimate_id(id, Op::Prefill { rows: 0 }),
+                tick,
+                &e,
+            );
             stage_due(stage, &t, &e, cost, since)
         }
         None => Due::from_urgency(urgency(stage), since),
@@ -179,7 +193,11 @@ pub fn due(stage: Stage, key: Option<&TurnKey>, model: &str, since: Instant, _no
 
 /// A partial transcript pending since `since`: soft, the first work to give up under load.
 pub fn partial(since: Instant, cost: Duration) -> Due {
-    Due { deadline: since + PARTIAL_TARGET.min(max_wait()), cost, band: Band::Bulk }
+    Due {
+        deadline: since + PARTIAL_TARGET.min(max_wait()),
+        cost,
+        band: Band::Bulk,
+    }
 }
 
 /// A render of `streams` on the vocoder `model`, registering it as the turns' vocoder.
@@ -195,7 +213,11 @@ pub fn first_audio(t: &TurnTimes, since: Instant, cost: Duration) -> Due {
 
 /// A started stream's next window: due before its playback runs dry (`buffered` from now).
 pub fn playback(now: Instant, buffered: Duration, cost: Duration) -> Due {
-    Due { deadline: now + buffered.saturating_sub(PLAYBACK_MARGIN), cost, band: Band::Stream }
+    Due {
+        deadline: now + buffered.saturating_sub(PLAYBACK_MARGIN),
+        cost,
+        band: Band::Stream,
+    }
 }
 
 /// Overload level 2+: work this far ahead of its deadline (over two TBT targets of slack, i.e. a
@@ -209,7 +231,11 @@ mod tests {
     use super::*;
 
     fn times(speech_end: Instant, budget_ms: u64) -> TurnTimes {
-        TurnTimes { speech_end: Some(speech_end), budget: Duration::from_millis(budget_ms), ..Default::default() }
+        TurnTimes {
+            speech_end: Some(speech_end),
+            budget: Duration::from_millis(budget_ms),
+            ..Default::default()
+        }
     }
 
     fn ms(d: Duration) -> f64 {
@@ -224,16 +250,32 @@ mod tests {
         let long = times(t0, 60_000);
         let e = Ests::default();
         let zero = Duration::ZERO;
-        for (stage, kind) in [(Stage::AsrFinal, Kind::Asr), (Stage::LlmFirst, Kind::Llm), (Stage::TtsFirst, Kind::Tts)] {
-            assert_eq!(stage_due(stage, &t, &e, zero, late).deadline, late + kind.target() / 2, "{stage:?} past the budget");
-            assert_eq!(stage_due(stage, &long, &e, zero, t0).deadline, t0 + kind.target(), "{stage:?} budget to spare");
+        for (stage, kind) in [
+            (Stage::AsrFinal, Kind::Asr),
+            (Stage::LlmFirst, Kind::Llm),
+            (Stage::TtsFirst, Kind::Tts),
+        ] {
+            assert_eq!(
+                stage_due(stage, &t, &e, zero, late).deadline,
+                late + kind.target() / 2,
+                "{stage:?} past the budget"
+            );
+            assert_eq!(
+                stage_due(stage, &long, &e, zero, t0).deadline,
+                t0 + kind.target(),
+                "{stage:?} budget to spare"
+            );
         }
     }
 
     /// Roles are process-wide: only this test claims them, so the arithmetic is exact.
     #[test]
     fn back_scheduling_subtracts_downstream_costs() {
-        let (llm, lm, voc) = (cost::id("dl-test-llm"), cost::id("dl-test-tts-lm"), cost::id("dl-test-vocoder"));
+        let (llm, lm, voc) = (
+            cost::id("dl-test-llm"),
+            cost::id("dl-test-tts-lm"),
+            cost::id("dl-test-vocoder"),
+        );
         cost::record_id(llm, Op::Prefill { rows: 512 }, Duration::from_millis(30));
         cost::record_id(llm, Op::DecodeTick { width: 8 }, Duration::from_millis(10));
         cost::record_id(lm, Op::Prefill { rows: 300 }, Duration::from_millis(20));
@@ -253,12 +295,22 @@ mod tests {
         assert_eq!(tts.deadline, end);
         // est(TTS first) = 20 + 4 * 15 + 80 = 160 ms; est(LLM first) = 30 + 10 = 40 ms.
         assert!((ms(end - llm_first.deadline) - 160.0).abs() < 1e-3);
-        assert!((ms(end - asr.deadline) - 200.0).abs() < 1e-3, "{:?}", end - asr.deadline);
+        assert!(
+            (ms(end - asr.deadline) - 200.0).abs() < 1e-3,
+            "{:?}",
+            end - asr.deadline
+        );
         assert!(asr.deadline <= llm_first.deadline && llm_first.deadline <= tts.deadline);
 
         // A turn with no budget gets the default; a speech end in the past is honoured.
         let early = before(t0, Duration::from_millis(400));
-        let d = turn_due(Stage::TtsFirst, &times(early, 0), lm, zero, t0 + Duration::from_millis(500));
+        let d = turn_due(
+            Stage::TtsFirst,
+            &times(early, 0),
+            lm,
+            zero,
+            t0 + Duration::from_millis(500),
+        );
         assert_eq!(d.deadline, early + DEFAULT_BUDGET);
 
         // Decode: TBT pace until the TTS plays, loose after.
@@ -271,8 +323,17 @@ mod tests {
 
         // The starvation bound caps every turn deadline, however long the budget.
         let long = times(t0, 60_000);
-        for (stage, id) in [(Stage::AsrFinal, llm), (Stage::LlmFirst, llm), (Stage::LlmDecode, llm), (Stage::TtsFirst, lm), (Stage::TtsStream, lm)] {
-            assert!(turn_due(stage, &long, id, zero, t0).deadline <= t0 + max_wait(), "{stage:?}");
+        for (stage, id) in [
+            (Stage::AsrFinal, llm),
+            (Stage::LlmFirst, llm),
+            (Stage::LlmDecode, llm),
+            (Stage::TtsFirst, lm),
+            (Stage::TtsStream, lm),
+        ] {
+            assert!(
+                turn_due(stage, &long, id, zero, t0).deadline <= t0 + max_wait(),
+                "{stage:?}"
+            );
         }
         assert!(partial(t0, zero).deadline <= t0 + max_wait());
     }
@@ -293,13 +354,28 @@ mod tests {
     fn no_turn_falls_back_to_class_order() {
         let t0 = Instant::now();
         let at = |stage| due(stage, None, "dl-test-noturn", t0, t0);
-        for stage in [Stage::AsrFinal, Stage::LlmFirst, Stage::LlmDecode, Stage::TtsFirst, Stage::TtsStream] {
-            assert_eq!(at(stage).deadline, Due::from_urgency(urgency(stage), t0).deadline);
+        for stage in [
+            Stage::AsrFinal,
+            Stage::LlmFirst,
+            Stage::LlmDecode,
+            Stage::TtsFirst,
+            Stage::TtsStream,
+        ] {
+            assert_eq!(
+                at(stage).deadline,
+                Due::from_urgency(urgency(stage), t0).deadline
+            );
         }
         assert!(at(Stage::AsrFinal).slack(t0) < at(Stage::LlmFirst).slack(t0));
         assert!(at(Stage::LlmFirst).slack(t0) < at(Stage::LlmDecode).slack(t0));
         // An unknown turn key is no turn.
-        let key = TurnKey { session: "dl-test-none".into(), turn: "1".into() };
-        assert_eq!(due(Stage::LlmFirst, Some(&key), "dl-test-noturn", t0, t0).deadline, at(Stage::LlmFirst).deadline);
+        let key = TurnKey {
+            session: "dl-test-none".into(),
+            turn: "1".into(),
+        };
+        assert_eq!(
+            due(Stage::LlmFirst, Some(&key), "dl-test-noturn", t0, t0).deadline,
+            at(Stage::LlmFirst).deadline
+        );
     }
 }

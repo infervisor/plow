@@ -23,7 +23,11 @@ pub trait Tokenize: Send + Sync {
     /// Append `decode` (or `decode_keep_special`) of `ids` to `out`; the per-token detokenize
     /// calls this into reused buffers.
     fn decode_append(&self, ids: &[u32], keep_special: bool, out: &mut String) {
-        out.push_str(&if keep_special { self.decode_keep_special(ids) } else { self.decode(ids) });
+        out.push_str(&if keep_special {
+            self.decode_keep_special(ids)
+        } else {
+            self.decode(ids)
+        });
     }
     /// The text of every token `decode` drops as special.
     fn special_tokens(&self) -> Vec<String> {
@@ -95,10 +99,13 @@ pub fn load_tokenizer(dir: &Path) -> Arc<dyn Tokenize> {
 pub fn load_tokenizer_with(dir: &Path, checkpoint: &Path) -> Arc<dyn Tokenize> {
     #[cfg(feature = "hf-tokenizer")]
     {
-        let path = [dir.join("tokenizer.json"), checkpoint.join("tokenizer.json")]
-            .into_iter()
-            .find(|p| p.exists())
-            .unwrap_or_else(|| dir.join("tokenizer.json"));
+        let path = [
+            dir.join("tokenizer.json"),
+            checkpoint.join("tokenizer.json"),
+        ]
+        .into_iter()
+        .find(|p| p.exists())
+        .unwrap_or_else(|| dir.join("tokenizer.json"));
         if path.exists() {
             match HfTokenizer::from_file(&path) {
                 Ok(t) => {
@@ -176,8 +183,14 @@ static ENCODE_POOL: std::sync::OnceLock<Option<rayon::ThreadPool>> = std::sync::
 #[cfg(feature = "hf-tokenizer")]
 fn metaspace_bpe_split_safe(t: &tokenizers::Tokenizer) -> bool {
     let json = |v: Option<serde_json::Value>| v.unwrap_or_default();
-    let norm = json(t.get_normalizer().and_then(|n| serde_json::to_value(n).ok()));
-    let pre = json(t.get_pre_tokenizer().and_then(|p| serde_json::to_value(p).ok()));
+    let norm = json(
+        t.get_normalizer()
+            .and_then(|n| serde_json::to_value(n).ok()),
+    );
+    let pre = json(
+        t.get_pre_tokenizer()
+            .and_then(|p| serde_json::to_value(p).ok()),
+    );
     norm["type"] == "Replace"
         && norm["pattern"]["String"] == " "
         && norm["content"] == "\u{2581}"
@@ -199,7 +212,9 @@ fn split_safe(t: &tokenizers::Tokenizer) -> bool {
         .get_pre_tokenizer()
         .and_then(|p| serde_json::to_value(p).ok())
         .unwrap_or_default();
-    let steps = pre["pretokenizers"].as_array().map_or(&[][..], Vec::as_slice);
+    let steps = pre["pretokenizers"]
+        .as_array()
+        .map_or(&[][..], Vec::as_slice);
     let pre_ok = pre["type"] == "Sequence"
         && matches!(steps, [split, byte_level]
             if split["type"] == "Split"
@@ -212,7 +227,8 @@ fn split_safe(t: &tokenizers::Tokenizer) -> bool {
     ((pre_ok && t.get_normalizer().is_none()) || metaspace_bpe_split_safe(t))
         && t.get_truncation().is_none()
         && t.get_padding().is_none()
-        && t.get_post_processor().map_or(true, |p| p.added_tokens(false) == 0)
+        && t.get_post_processor()
+            .map_or(true, |p| p.added_tokens(false) == 0)
         && matches!(t.get_model(), tokenizers::models::ModelWrapper::BPE(b) if b.dropout.is_none())
         && t.get_added_tokens_decoder()
             .values()
@@ -260,7 +276,11 @@ fn encode_split(
     let ids: tokenizers::Result<Vec<Vec<u32>>> = pool.install(|| {
         pieces
             .par_iter()
-            .map(|p| inner.encode_fast(*p, add_special_tokens).map(|e| e.get_ids().to_vec()))
+            .map(|p| {
+                inner
+                    .encode_fast(*p, add_special_tokens)
+                    .map(|e| e.get_ids().to_vec())
+            })
             .collect()
     });
     Some(ids.map(|v| v.concat()).unwrap_or_default())
@@ -319,7 +339,11 @@ impl HfTokenizer {
             && metaspace_bpe_split_safe(&inner);
         let threads = rt.encode_threads.or(one_word.then_some(ONE_WORD_THREADS));
         let floor = rt.encode_split_min.map_or(
-            if one_word { ONE_WORD_SPLIT_MIN_BYTES } else { SPLIT_MIN_BYTES },
+            if one_word {
+                ONE_WORD_SPLIT_MIN_BYTES
+            } else {
+                SPLIT_MIN_BYTES
+            },
             |n| (n as usize).max(1),
         );
         let split = match threads.filter(|&n| n >= 2) {
@@ -341,8 +365,13 @@ impl HfTokenizer {
         };
         // A vocabulary string is never shorter than the input it covers (byte-level and `▁` encode
         // a byte as 1-3 bytes); the margin covers a normalizer that composes (NFKC Hangul is 3:1).
-        let max_token_bytes =
-            inner.get_vocab(true).keys().map(String::len).max().unwrap_or(1).saturating_mul(4);
+        let max_token_bytes = inner
+            .get_vocab(true)
+            .keys()
+            .map(String::len)
+            .max()
+            .unwrap_or(1)
+            .saturating_mul(4);
         HfTokenizer {
             vocab_size: inner.get_vocab_size(true),
             max_token_bytes,
@@ -489,7 +518,9 @@ mod tests {
             .enumerate()
             .map(|(i, c)| (c.to_string(), i.into()))
             .collect();
-        let merges = ["h e", "l l", "he ll", "Ġ w", "Ġw o", "o r", "Ġ a", "i t", "' s", "1 2"];
+        let merges = [
+            "h e", "l l", "he ll", "Ġ w", "Ġw o", "o r", "Ġ a", "i t", "' s", "1 2",
+        ];
         for m in merges {
             let n = vocab.len();
             vocab.insert(m.replace(' ', ""), n.into());
@@ -553,7 +584,10 @@ mod tests {
         let t = glm_like(false);
         assert!(split_safe(&t));
         assert!(!split_safe(&glm_like(true)));
-        let pool = rayon::ThreadPoolBuilder::new().num_threads(8).build().unwrap();
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(8)
+            .build()
+            .unwrap();
         for text in texts() {
             for special in [false, true] {
                 let whole = t.encode(text.as_str(), special).unwrap().get_ids().to_vec();
@@ -578,8 +612,16 @@ mod tests {
             .map(|(i, c)| (c.to_string(), i.into()))
             .collect();
         let mut merges = vec![
-            "h e", "l l", "he ll", "\u{2581} w", "\u{2581}w o", "o r", "\u{2581} a", "i t",
-            "\u{2581} \u{2581}", "1 2",
+            "h e",
+            "l l",
+            "he ll",
+            "\u{2581} w",
+            "\u{2581}w o",
+            "o r",
+            "\u{2581} a",
+            "i t",
+            "\u{2581} \u{2581}",
+            "1 2",
         ];
         if letter_space {
             merges.push("o \u{2581}");
@@ -610,11 +652,14 @@ mod tests {
         let t = gemma_like(false);
         assert!(split_safe(&t));
         assert!(!split_safe(&gemma_like(true)));
-        let pool = rayon::ThreadPoolBuilder::new().num_threads(8).build().unwrap();
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(8)
+            .build()
+            .unwrap();
         for text in texts() {
             let whole = t.encode(text.as_str(), false).unwrap().get_ids().to_vec();
-            let split = encode_split(&t, &pool, &text, false, SPLIT_MIN_BYTES)
-                .expect("long text splits");
+            let split =
+                encode_split(&t, &pool, &text, false, SPLIT_MIN_BYTES).expect("long text splits");
             assert_eq!(split, whole);
         }
     }

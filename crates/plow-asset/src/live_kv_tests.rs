@@ -310,13 +310,22 @@ fn an_unstaged_prefill_cache_has_one_writer() {
     read.i = [2, 2, 1, 1, 0, 0, 256, 0];
     read.fj = [0, 4, u32::MAX];
     validate_prefill(&[writer(2, 0), writer(3, 0), read]).unwrap();
-    assert!(validate_prefill(&[writer(2, 0), writer(3, 0), writer(2, 0), read])
-        .unwrap_err()
-        .contains("cache writer contract"));
+    assert!(
+        validate_prefill(&[writer(2, 0), writer(3, 0), writer(2, 0), read])
+            .unwrap_err()
+            .contains("cache writer contract")
+    );
     // Duplicate writer/reader pairs without a segment-ordered stage proof are not a staged prefill.
-    assert!(validate_prefill(&[writer(2, 0), writer(3, 0), read, writer(2, 0), writer(3, 0), read])
-        .unwrap_err()
-        .contains("cache writer contract"));
+    assert!(validate_prefill(&[
+        writer(2, 0),
+        writer(3, 0),
+        read,
+        writer(2, 0),
+        writer(3, 0),
+        read
+    ])
+    .unwrap_err()
+    .contains("cache writer contract"));
     // Repeated readers over one writer pair (KV sharing) stay valid.
     validate_prefill(&[writer(2, 0), writer(3, 0), read, read]).unwrap();
 }

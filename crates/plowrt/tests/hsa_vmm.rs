@@ -337,7 +337,9 @@ fn unmap_release_cost_range_unmap_and_concurrency() {
     let va = VmmOps::reserve(be, span).expect("reserve");
 
     let t = Instant::now();
-    let handles: Vec<u64> = (0..reps).map(|_| VmmOps::create(be, gran).expect("create")).collect();
+    let handles: Vec<u64> = (0..reps)
+        .map(|_| VmmOps::create(be, gran).expect("create"))
+        .collect();
     let create_us = t.elapsed().as_secs_f64() * 1e6 / reps as f64;
     let t = Instant::now();
     for (i, &h) in handles.iter().enumerate() {
@@ -369,7 +371,9 @@ fn unmap_release_cost_range_unmap_and_concurrency() {
     // `VmmOps::unmap` swallows the status, so success is judged by re-mapping:
     // a VA still mapped refuses the second map.
     let n = 8u64;
-    let first: Vec<u64> = (0..n).map(|_| VmmOps::create(be, gran).expect("create")).collect();
+    let first: Vec<u64> = (0..n)
+        .map(|_| VmmOps::create(be, gran).expect("create"))
+        .collect();
     for (i, &h) in first.iter().enumerate() {
         VmmOps::map(be, va + i as u64 * gran, gran, h).expect("map");
         VmmOps::set_access(be, va + i as u64 * gran, gran).expect("set_access");
@@ -377,7 +381,9 @@ fn unmap_release_cost_range_unmap_and_concurrency() {
     let t = Instant::now();
     VmmOps::unmap(be, va, n * gran);
     let range_us = t.elapsed().as_secs_f64() * 1e6;
-    let second: Vec<u64> = (0..n).map(|_| VmmOps::create(be, gran).expect("create")).collect();
+    let second: Vec<u64> = (0..n)
+        .map(|_| VmmOps::create(be, gran).expect("create"))
+        .collect();
     let mut remapped = 0u64;
     for (i, &h) in second.iter().enumerate() {
         match VmmOps::map(be, va + i as u64 * gran, gran, h) {
@@ -404,7 +410,9 @@ fn unmap_release_cost_range_unmap_and_concurrency() {
     // Concurrency: `threads` threads each unmap a disjoint run of `per` granules.
     for threads in [2u64, 8] {
         let per = reps / threads;
-        let hs: Vec<u64> = (0..reps).map(|_| VmmOps::create(be, gran).expect("create")).collect();
+        let hs: Vec<u64> = (0..reps)
+            .map(|_| VmmOps::create(be, gran).expect("create"))
+            .collect();
         for (i, &h) in hs.iter().enumerate() {
             VmmOps::map(be, va + i as u64 * gran, gran, h).expect("map");
             VmmOps::set_access(be, va + i as u64 * gran, gran).expect("set_access");
@@ -476,7 +484,11 @@ fn free_bytes_is_live_and_moves_with_physical_allocation() {
     VmmOps::set_access(be, va, big).expect("set_access");
 
     let free1 = VmmOps::free_bytes(be).expect("free_bytes after commit");
-    println!("free_bytes after committing {} MiB: {free1} B ({} MiB)", big / MIB, free1 / MIB);
+    println!(
+        "free_bytes after committing {} MiB: {free1} B ({} MiB)",
+        big / MIB,
+        free1 / MIB
+    );
     assert!(
         free1 + big / 2 <= free0,
         "committing {big} B did not measurably reduce free_bytes ({free0} -> {free1}) — \
@@ -508,15 +520,19 @@ fn small_vmem_handles_probe_sub_granule_sharing() {
     let _env = common::env_guard();
     let be = backend();
     let gran = VmmOps::granularity(be).expect("granularity");
-    println!("driver-recommended granule (REC_GRANULE): {gran} B ({} KiB)", gran >> 10);
+    println!(
+        "driver-recommended granule (REC_GRANULE): {gran} B ({} KiB)",
+        gran >> 10
+    );
 
     for &size in &[64 * 1024u64, 256 * 1024, 512 * 1024] {
         let n = 16u64;
         let free_before = VmmOps::free_bytes(be).expect("free_bytes before");
 
         let t = Instant::now();
-        let handles: Vec<u64> =
-            (0..n).map(|_| VmmOps::create(be, size).expect("create at sub-granule size")).collect();
+        let handles: Vec<u64> = (0..n)
+            .map(|_| VmmOps::create(be, size).expect("create at sub-granule size"))
+            .collect();
         let create_us = t.elapsed().as_secs_f64() * 1e6 / n as f64;
 
         let va = VmmOps::reserve(be, size * n).expect("reserve");
@@ -533,11 +549,16 @@ fn small_vmem_handles_probe_sub_granule_sharing() {
         // requested handles into one real page/granule.
         let probe_len = (size as usize).min(4096);
         for i in 0..n {
-            let pattern: Vec<u8> = (0..probe_len).map(|b| ((b as u64 * 31 + i * 7 + 3) % 256) as u8).collect();
+            let pattern: Vec<u8> = (0..probe_len)
+                .map(|b| ((b as u64 * 31 + i * 7 + 3) % 256) as u8)
+                .collect();
             be.memcpy_htod(va + i * size, &pattern).expect("H2D");
             let mut back = vec![0u8; probe_len];
             d2h(be, va + i * size, &mut back);
-            assert_eq!(back, pattern, "handle {i} at size {size} B did not round-trip in isolation");
+            assert_eq!(
+                back, pattern,
+                "handle {i} at size {size} B did not round-trip in isolation"
+            );
         }
 
         let free_after = VmmOps::free_bytes(be).expect("free_bytes after");
@@ -574,7 +595,10 @@ fn vmem_swap_serial_vs_parallel_across_devices() {
         eprintln!("skipped: set PLOW_GPU_TEST=1");
         return;
     }
-    let n: u8 = std::env::var("PLOW_VMM_PROBE_NGPU").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
+    let n: u8 = std::env::var("PLOW_VMM_PROBE_NGPU")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1);
     if n < 2 {
         eprintln!("skipped: set PLOW_VMM_PROBE_NGPU >= 2");
         return;
@@ -596,7 +620,9 @@ fn vmem_swap_serial_vs_parallel_across_devices() {
         .map(|be| {
             let va = VmmOps::reserve(&**be, blocks * gran).expect("reserve");
             let sets = [0, 1].map(|_| {
-                (0..blocks).map(|_| VmmOps::create(&**be, gran).expect("create")).collect::<Vec<_>>()
+                (0..blocks)
+                    .map(|_| VmmOps::create(&**be, gran).expect("create"))
+                    .collect::<Vec<_>>()
             });
             for (i, &h) in sets[0].iter().enumerate() {
                 VmmOps::map(&**be, va + i as u64 * gran, gran, h).expect("map");
@@ -624,12 +650,19 @@ fn vmem_swap_serial_vs_parallel_across_devices() {
     }
     let per_call = |v: &[(f64, f64)]| {
         let calls = (v.len() as u64 * blocks) as f64;
-        (v.iter().map(|x| x.0).sum::<f64>() / calls, v.iter().map(|x| x.1).sum::<f64>() / calls)
+        (
+            v.iter().map(|x| x.0).sum::<f64>() / calls,
+            v.iter().map(|x| x.1).sum::<f64>() / calls,
+        )
     };
     let (mut serial, mut parallel) = (Vec::new(), Vec::new());
     for round in 0..8 {
         let t = Instant::now();
-        let s: Vec<_> = bes.iter().zip(devs.iter_mut()).map(|(be, dev)| swap(be, dev, blocks, gran)).collect();
+        let s: Vec<_> = bes
+            .iter()
+            .zip(devs.iter_mut())
+            .map(|(be, dev)| swap(be, dev, blocks, gran))
+            .collect();
         let serial_ms = t.elapsed().as_secs_f64() * 1e3;
         let t = Instant::now();
         let p: Vec<_> = std::thread::scope(|sc| {
@@ -682,7 +715,10 @@ fn vmem_copy_into_mapped_spares_serial_vs_parallel_across_devices() {
         eprintln!("skipped: set PLOW_GPU_TEST=1");
         return;
     }
-    let n: u8 = std::env::var("PLOW_VMM_PROBE_NGPU").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
+    let n: u8 = std::env::var("PLOW_VMM_PROBE_NGPU")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1);
     if n < 2 {
         eprintln!("skipped: set PLOW_VMM_PROBE_NGPU >= 2");
         return;
@@ -702,7 +738,9 @@ fn vmem_copy_into_mapped_spares_serial_vs_parallel_across_devices() {
                 VmmOps::reserve(&**be, blocks * gran).expect("reserve"),
                 VmmOps::reserve(&**be, blocks * gran).expect("reserve"),
             );
-            let hs: Vec<u64> = (0..2 * blocks).map(|_| VmmOps::create(&**be, gran).expect("create")).collect();
+            let hs: Vec<u64> = (0..2 * blocks)
+                .map(|_| VmmOps::create(&**be, gran).expect("create"))
+                .collect();
             for i in 0..blocks {
                 for (va, h) in [(a, hs[i as usize]), (b, hs[(blocks + i) as usize])] {
                     VmmOps::map(&**be, va + i * gran, gran, h).expect("map");
@@ -713,7 +751,9 @@ fn vmem_copy_into_mapped_spares_serial_vs_parallel_across_devices() {
         })
         .collect();
     fn copy(be: &HsaBackend, src: u64, dst: u64, blocks: u64, gran: u64) {
-        let pairs: Vec<_> = (0..blocks).map(|i| (dst + i * gran, src + i * gran, gran)).collect();
+        let pairs: Vec<_> = (0..blocks)
+            .map(|i| (dst + i * gran, src + i * gran, gran))
+            .collect();
         for chunk in pairs.chunks(8) {
             VmmOps::copy_dtod_batch(be, chunk).expect("copy");
         }
@@ -769,7 +809,10 @@ fn vmem_copy_swap_serial_vs_parallel_across_devices() {
         eprintln!("skipped: set PLOW_GPU_TEST=1");
         return;
     }
-    let n: u8 = std::env::var("PLOW_VMM_PROBE_NGPU").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
+    let n: u8 = std::env::var("PLOW_VMM_PROBE_NGPU")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1);
     if n < 2 {
         eprintln!("skipped: set PLOW_VMM_PROBE_NGPU >= 2");
         return;
@@ -792,13 +835,22 @@ fn vmem_copy_swap_serial_vs_parallel_across_devices() {
         .map(|be| {
             let slot_va = VmmOps::reserve(&**be, blocks * gran).expect("reserve");
             let cache_va = VmmOps::reserve(&**be, blocks * gran).expect("reserve");
-            let mk = || (0..blocks).map(|_| VmmOps::create(&**be, gran).expect("create")).collect::<Vec<_>>();
+            let mk = || {
+                (0..blocks)
+                    .map(|_| VmmOps::create(&**be, gran).expect("create"))
+                    .collect::<Vec<_>>()
+            };
             let (slot, cache) = (mk(), mk());
             for (i, &h) in slot.iter().enumerate() {
                 VmmOps::map(&**be, slot_va + i as u64 * gran, gran, h).expect("map");
                 VmmOps::set_access(&**be, slot_va + i as u64 * gran, gran).expect("set_access");
             }
-            Dev { slot_va, cache_va, slot, cache }
+            Dev {
+                slot_va,
+                cache_va,
+                slot,
+                cache,
+            }
         })
         .collect();
     // (map+set_access µs, copy µs) for the device's blocks; the cache VA is left mapped.
@@ -809,14 +861,23 @@ fn vmem_copy_swap_serial_vs_parallel_across_devices() {
             VmmOps::set_access(be, dev.cache_va + i * gran, gran).expect("set_access");
         }
         let t1 = Instant::now();
-        let pairs: Vec<_> = (0..blocks).map(|i| (dev.cache_va + i * gran, dev.slot_va + i * gran, gran)).collect();
+        let pairs: Vec<_> = (0..blocks)
+            .map(|i| (dev.cache_va + i * gran, dev.slot_va + i * gran, gran))
+            .collect();
         VmmOps::copy_dtod_batch(be, &pairs).expect("copy");
-        ((t1 - t).as_secs_f64() * 1e6, t1.elapsed().as_secs_f64() * 1e6)
+        (
+            (t1 - t).as_secs_f64() * 1e6,
+            t1.elapsed().as_secs_f64() * 1e6,
+        )
     }
     let (mut serial, mut parallel) = (Vec::new(), Vec::new());
     for round in 0..8 {
         let t = Instant::now();
-        let s: Vec<_> = bes.iter().zip(&devs).map(|(be, dev)| copy_swap(be, dev, blocks, gran)).collect();
+        let s: Vec<_> = bes
+            .iter()
+            .zip(&devs)
+            .map(|(be, dev)| copy_swap(be, dev, blocks, gran))
+            .collect();
         let serial_ms = t.elapsed().as_secs_f64() * 1e3;
         for (be, dev) in bes.iter().zip(&devs) {
             VmmOps::unmap(&**be, dev.cache_va, blocks * gran);
@@ -838,7 +899,10 @@ fn vmem_copy_swap_serial_vs_parallel_across_devices() {
         println!(
             "round {round}: serial {serial_ms:.2} ms (maps {:.2} ms, copies {:.2} ms summed) | \
              parallel {parallel_ms:.2} ms (maps {:.2} ms, copies {:.2} ms summed)",
-            sum(&s, |x| x.0), sum(&s, |x| x.1), sum(&p, |x| x.0), sum(&p, |x| x.1)
+            sum(&s, |x| x.0),
+            sum(&s, |x| x.1),
+            sum(&p, |x| x.0),
+            sum(&p, |x| x.1)
         );
         if round > 0 {
             serial.push(serial_ms);
@@ -884,8 +948,12 @@ fn vmem_call_cost_vs_live_mappings() {
     };
     let shared = VmmOps::create(be, gran).expect("create");
     let chunk = 64 * 1024u64;
-    let bufs: Vec<u64> = (0..2).map(|_| VmmOps::alloc(be, 64 * chunk).expect("alloc")).collect();
-    let pairs: Vec<_> = (0..64).map(|i| (bufs[1] + i * chunk, bufs[0] + i * chunk, chunk)).collect();
+    let bufs: Vec<u64> = (0..2)
+        .map(|_| VmmOps::alloc(be, 64 * chunk).expect("alloc"))
+        .collect();
+    let pairs: Vec<_> = (0..64)
+        .map(|i| (bufs[1] + i * chunk, bufs[0] + i * chunk, chunk))
+        .collect();
     let probe_va = VmmOps::reserve(be, gran).expect("reserve");
     let probe_h = VmmOps::create(be, gran).expect("create");
     let mut regions: Vec<(u64, u64)> = Vec::new();
@@ -939,7 +1007,9 @@ fn vmem_call_cost_vs_live_mappings() {
     let t = Instant::now();
     VmmOps::unmap(be, va, span);
     let range_us = t.elapsed().as_secs_f64() * 1e6;
-    let remapped = (0..78).take_while(|&i| VmmOps::map(be, va + i * gran, gran, shared).is_ok()).count();
+    let remapped = (0..78)
+        .take_while(|&i| VmmOps::map(be, va + i * gran, gran, shared).is_ok())
+        .count();
     println!("RANGEUNMAP granules=78 one_call_us={range_us:.1} remapped={remapped}/78");
     for i in 0..78 {
         VmmOps::unmap(be, va + i * gran, gran);

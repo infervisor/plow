@@ -424,31 +424,54 @@ pub struct AmdTpGroup {
 impl AmdTpGroup {
     fn phase_replay_for(&self, prog: usize) -> Result<bool> {
         let selected = self.ranks[0].graph_phase_replay(prog);
-        if self.ranks.iter().any(|rank| rank.graph_phase_replay(prog) != selected) {
-            return Err(RuntimeError::Device("graph phase-object selection differs across TP ranks".into()));
+        if self
+            .ranks
+            .iter()
+            .any(|rank| rank.graph_phase_replay(prog) != selected)
+        {
+            return Err(RuntimeError::Device(
+                "graph phase-object selection differs across TP ranks".into(),
+            ));
         }
-        if !selected { return Ok(false); }
+        if !selected {
+            return Ok(false);
+        }
         for rank in &self.ranks {
-            if !rank.replay_without_prepare(prog)? { return Ok(false); }
+            if !rank.replay_without_prepare(prog)? {
+                return Ok(false);
+            }
         }
         Ok(true)
     }
 
     fn enqueue_segment_all(&mut self, prog: usize, seg: usize) -> Result<()> {
         let skipped = self.ranks[0].prefill_segment_launches(prog, seg) == 0;
-        if self.ranks.iter().any(|rank| (rank.prefill_segment_launches(prog, seg) == 0) != skipped) {
-            for rank in &self.ranks { rank.abort_replay(); }
-            return Err(RuntimeError::Rejected("TP segment skip differs across ranks".into()));
+        if self
+            .ranks
+            .iter()
+            .any(|rank| (rank.prefill_segment_launches(prog, seg) == 0) != skipped)
+        {
+            for rank in &self.ranks {
+                rank.abort_replay();
+            }
+            return Err(RuntimeError::Rejected(
+                "TP segment skip differs across ranks".into(),
+            ));
         }
-        if skipped { return Ok(()); }
+        if skipped {
+            return Ok(());
+        }
         let prepared = super::chain_admission::prepare_all(
-            self.ranks.len(), crate::config::RuntimeConfig::get().amd.native_launch_timing,
+            self.ranks.len(),
+            crate::config::RuntimeConfig::get().amd.native_launch_timing,
             |rank| self.ranks[rank].segment_needs_prepare(prog, seg),
             |rank| self.ranks[rank].drain(),
             |rank| self.ranks[rank].prepare_segment_quiescent(prog, seg),
         );
         if let Err(error) = prepared {
-            for rank in &self.ranks { rank.abort_replay(); }
+            for rank in &self.ranks {
+                rank.abort_replay();
+            }
             return Err(error);
         }
         let admitted = super::chain_admission::reserve_all(
@@ -460,25 +483,38 @@ impl AmdTpGroup {
         if let Err(error) = admitted {
             // Earlier segments may still use the rebased tensor tables. Refuse
             // subsequent device writes; cancellation is not kernel completion.
-            for rank in &self.ranks { rank.abort_replay(); }
+            for rank in &self.ranks {
+                rank.abort_replay();
+            }
             return Err(error);
         }
         let result = (|| -> Result<()> {
-            for rank in &mut self.ranks { rank.enqueue_segment_prepared(prog, seg)?; }
-            for rank in &self.ranks { rank.preflight_replay_commit()?; }
-            for rank in &self.ranks { rank.commit_graph_phase_replay()?; }
+            for rank in &mut self.ranks {
+                rank.enqueue_segment_prepared(prog, seg)?;
+            }
+            for rank in &self.ranks {
+                rank.preflight_replay_commit()?;
+            }
+            for rank in &self.ranks {
+                rank.commit_graph_phase_replay()?;
+            }
             Ok(())
         })();
         if result.is_err() {
-            for rank in &self.ranks { rank.abort_replay(); }
+            for rank in &self.ranks {
+                rank.abort_replay();
+            }
         }
         result
     }
 
     fn finish_ranks(&self) -> Result<()> {
-        let result = super::chain_admission::finish_all(self.ranks.len(), |rank| self.ranks[rank].drain());
+        let result =
+            super::chain_admission::finish_all(self.ranks.len(), |rank| self.ranks[rank].drain());
         if result.is_err() {
-            for rank in &self.ranks { rank.abort_replay(); }
+            for rank in &self.ranks {
+                rank.abort_replay();
+            }
         }
         result
     }
@@ -785,8 +821,12 @@ impl AmdTpGroup {
             gate_expect,
             audit: !crate::config::RuntimeConfig::get().amd.tp_no_audit,
             audit_direct: crate::config::RuntimeConfig::get().amd.tp_audit_direct,
-            prefill_audit_direct: crate::config::RuntimeConfig::get().amd.tp_prefill_audit_direct,
-            prefill_audit_pinned: crate::config::RuntimeConfig::get().amd.tp_prefill_audit_pinned,
+            prefill_audit_direct: crate::config::RuntimeConfig::get()
+                .amd
+                .tp_prefill_audit_direct,
+            prefill_audit_pinned: crate::config::RuntimeConfig::get()
+                .amd
+                .tp_prefill_audit_pinned,
             audit_compact,
             index_tp_status,
             agree_every,
@@ -948,7 +988,9 @@ impl AmdTpGroup {
         use crate::obs::dstep;
         let rows = (self.ranks[0].prog_t(self.cur_dp) as usize).min(batch);
         if let Err(error) = self.ranks[0].enqueue_token_capture(step, quantum, rows) {
-            for rank in &self.ranks { rank.abort_replay(); }
+            for rank in &self.ranks {
+                rank.abort_replay();
+            }
             return Err(error);
         }
         self.drain_and_audit()?;
@@ -1150,9 +1192,12 @@ impl AmdTpGroup {
                         .collect();
                     let mut fill_error = None;
                     for handle in handles {
-                        let result = handle.join().map_err(|_| {
-                            RuntimeError::Device("decode replay fill thread panicked".into())
-                        }).and_then(|result| result);
+                        let result = handle
+                            .join()
+                            .map_err(|_| {
+                                RuntimeError::Device("decode replay fill thread panicked".into())
+                            })
+                            .and_then(|result| result);
                         if let Err(error) = result {
                             fill_error.get_or_insert(error);
                         }
@@ -1172,7 +1217,9 @@ impl AmdTpGroup {
             Ok(())
         })();
         if let Err(error) = replay_result {
-            for rank in &*ranks { rank.abort_replay(); }
+            for rank in &*ranks {
+                rank.abort_replay();
+            }
             return Err(error);
         }
         if let Some(z) = launched_at {
@@ -1189,7 +1236,11 @@ impl AmdTpGroup {
             }
         }
         if let Some(enqueued) = in_flight_enqueued {
-            crate::obs::tick::decode_in_flight(enqueued, self.ranks[0].in_flight(), n_segments as u32);
+            crate::obs::tick::decode_in_flight(
+                enqueued,
+                self.ranks[0].in_flight(),
+                n_segments as u32,
+            );
         }
         Ok(())
     }
@@ -1252,9 +1303,7 @@ impl AmdTpGroup {
         use crate::obs::dstep;
         // The decode is on the GPU: a prefix publish deferred from this tick's chunk runs here.
         let published = self.flush_deferred_publish();
-        dstep::timed(&dstep::DRAIN, || -> Result<()> {
-            self.finish_ranks()
-        })?;
+        dstep::timed(&dstep::DRAIN, || -> Result<()> { self.finish_ranks() })?;
         if self.audit {
             // The rung that actually launched, not the widest — a narrow rung emits fewer
             // collectives and auditing it against the widest program's expectations would
@@ -1262,15 +1311,19 @@ impl AmdTpGroup {
             let dp = self.cur_dp;
             dstep::timed(&dstep::AUDIT, || {
                 if self.audit_compact {
-                    let submitted = self.ranks.iter().zip(self.group.ranks()).try_for_each(|(e, r)| {
-                        e.enqueue_xaudit(
-                            dp,
-                            r.xctr(),
-                            self.group.layout().n_xctr,
-                            self.group.n_gpu(),
-                            r.xstatus(),
-                        )
-                    });
+                    let submitted =
+                        self.ranks
+                            .iter()
+                            .zip(self.group.ranks())
+                            .try_for_each(|(e, r)| {
+                                e.enqueue_xaudit(
+                                    dp,
+                                    r.xctr(),
+                                    self.group.layout().n_xctr,
+                                    self.group.n_gpu(),
+                                    r.xstatus(),
+                                )
+                            });
                     let finished = self.finish_ranks();
                     submitted.and(finished)?;
                     match self.group.audit_xstatus_direct() {
@@ -1384,7 +1437,10 @@ impl AmdTpGroup {
             for e in &mut self.ranks {
                 e.prepare_device_state_clear(slot)?;
             }
-            let submitted = self.ranks.iter().try_for_each(|e| e.enqueue_state_clear(slot));
+            let submitted = self
+                .ranks
+                .iter()
+                .try_for_each(|e| e.enqueue_state_clear(slot));
             let finished = self.finish_ranks();
             submitted.and(finished)?;
             return Ok(());
@@ -1446,7 +1502,12 @@ impl AmdTpGroup {
         AmdEngine::attach_shared_prefixes(&mut self.ranks, slot, prompt)
     }
 
-    pub fn publish_shared_prefix(&mut self, slot: usize, prompt: &[u32], frontier: u32) -> Result<()> {
+    pub fn publish_shared_prefix(
+        &mut self,
+        slot: usize,
+        prompt: &[u32],
+        frontier: u32,
+    ) -> Result<()> {
         for rank in &mut self.ranks {
             rank.publish_shared_prefix(slot, prompt, frontier)?;
         }
@@ -1551,7 +1612,11 @@ impl AmdTpGroup {
             return Vec::new();
         };
         let bodies = first.token_batch_bodies();
-        if self.ranks.iter().all(|rank| rank.token_batch_bodies() == bodies) {
+        if self
+            .ranks
+            .iter()
+            .all(|rank| rank.token_batch_bodies() == bodies)
+        {
             bodies
         } else {
             Vec::new()
@@ -1645,7 +1710,9 @@ impl AmdTpGroup {
                             self.ranks[rank].commit_graph_phase_replay()?;
                         }
                         BodyLaunch::Drain(rank) => {
-                            if rank == 0 { self.finish_ranks()?; }
+                            if rank == 0 {
+                                self.finish_ranks()?;
+                            }
                         }
                     }
                 }
@@ -1653,7 +1720,9 @@ impl AmdTpGroup {
             })();
             if let Err(error) = replay_result {
                 if phase_replay {
-                    for rank in &self.ranks { rank.abort_replay(); }
+                    for rank in &self.ranks {
+                        rank.abort_replay();
+                    }
                 }
                 return Err(error);
             }
@@ -1664,11 +1733,7 @@ impl AmdTpGroup {
         if let Some(dir) = crate::config::RuntimeConfig::get().amd.tb_dump.as_ref() {
             static TICK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
             let tick = TICK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            self.ranks[0].token_batch_dump(
-                dir.as_path(),
-                &format!("step{tick:04}"),
-                plan,
-            )?;
+            self.ranks[0].token_batch_dump(dir.as_path(), &format!("step{tick:04}"), plan)?;
         }
         let ids = self.ranks[0].read_sampled_batched(band as usize)?;
         if agreement_due(&mut self.agree_tick, self.agree_every) {
@@ -1900,24 +1965,34 @@ impl AmdTpGroup {
             }
             for (seg, rank) in segment_major_order(launches, n_ranks) {
                 if !phase_replay {
-                    if rank == 0 { self.enqueue_segment_all(step.prog, seg)?; }
+                    if rank == 0 {
+                        self.enqueue_segment_all(step.prog, seg)?;
+                    }
                     continue;
                 }
                 if let Err(e) = self.ranks[rank].enqueue_segment(step.prog, seg) {
                     // Partial reserved chains cannot be drained or rolled back.
                     // Poison every rank before a caller can attempt table rebinding.
-                    for rank in &self.ranks { rank.abort_replay(); }
+                    for rank in &self.ranks {
+                        rank.abort_replay();
+                    }
                     return Err(e);
                 }
             }
             if phase_replay {
                 let committed = (|| -> Result<()> {
-                    for rank in &self.ranks { rank.preflight_replay_commit()?; }
-                    for rank in &self.ranks { rank.commit_graph_phase_replay()?; }
+                    for rank in &self.ranks {
+                        rank.preflight_replay_commit()?;
+                    }
+                    for rank in &self.ranks {
+                        rank.commit_graph_phase_replay()?;
+                    }
                     Ok(())
                 })();
                 if let Err(error) = committed {
-                    for rank in &self.ranks { rank.abort_replay(); }
+                    for rank in &self.ranks {
+                        rank.abort_replay();
+                    }
                     return Err(error);
                 }
             }
@@ -1949,7 +2024,9 @@ impl AmdTpGroup {
                 }
             }
             if let Some(err) = drain_err {
-                for rank in &self.ranks { rank.abort_replay(); }
+                for rank in &self.ranks {
+                    rank.abort_replay();
+                }
                 return Err(err);
             }
             let ns = t.elapsed().as_nanos() as u64;
@@ -1981,8 +2058,10 @@ impl AmdTpGroup {
             if tick_log {
                 let (prep_vmm, prep_patch) = crate::obs::tick::take_prepare();
                 let ms = |ns: u64| ns as f64 / 1e6;
-                let ranks: Vec<String> =
-                    rank_drain_ns.iter().map(|&d| format!("{:.1}", ms(d))).collect();
+                let ranks: Vec<String> = rank_drain_ns
+                    .iter()
+                    .map(|&d| format!("{:.1}", ms(d)))
+                    .collect();
                 eprintln!(
                     "PFSEG bucket={} c0={} clen={} launches={launches} prepare={:.3} prepare_maps={} prepare_vmm={:.3} prepare_patch={:.3} rearm={:.3} xctr={:.3} enqueue={:.3} map_ahead={:.3} map_ahead_maps={} publish_deferred={:.3} drain={:.3} audit={:.3} rank_drain_cum=[{}]",
                     self.ranks[0].prog_t(step.prog),
@@ -2104,7 +2183,11 @@ impl AmdTpGroup {
             let n = self.group.layout().n_xctr as usize;
             let expect = &self.gate_expect[prog];
             for (e, r) in self.ranks.iter_mut().zip(self.group.ranks()) {
-                check_xstate(r.rank(), e.read_xstate_pinned(r.xctr(), n * XCTR_STRIDE + 4)?, expect)?;
+                check_xstate(
+                    r.rank(),
+                    e.read_xstate_pinned(r.xctr(), n * XCTR_STRIDE + 4)?,
+                    expect,
+                )?;
             }
             Ok(())
         } else if self.prefill_audit_direct {
@@ -2438,12 +2521,18 @@ fn check_rowsplit_attn(blob: &DevBlob, seq_par_slots: u64) -> Result<u64> {
 fn check_dcp_gather(blob: &DevBlob, slots: u64, slot_bytes: u64) -> Result<u64> {
     use packet::dev::DevOp;
     const REC_BYTES: u64 = 656;
-    let canonical = blob.progs.iter().flat_map(|p| &p.insts).any(|d| {
-        d.op == DevOp::IndexSelect as u16 && d.i[4] == 3
-    });
-    if !canonical && blob.progs.iter().flat_map(|p| &p.insts).any(|d| {
-        d.op == DevOp::DcpKvPack as u16 && u32::from(d.t[0]) != packet::TENSOR_NONE
-    }) {
+    let canonical = blob
+        .progs
+        .iter()
+        .flat_map(|p| &p.insts)
+        .any(|d| d.op == DevOp::IndexSelect as u16 && d.i[4] == 3);
+    if !canonical
+        && blob
+            .progs
+            .iter()
+            .flat_map(|p| &p.insts)
+            .any(|d| d.op == DevOp::DcpKvPack as u16 && u32::from(d.t[0]) != packet::TENSOR_NONE)
+    {
         return Err(RuntimeError::Device(
             "DCP decode requires canonical selection before owner pack".into(),
         ));
@@ -2476,7 +2565,11 @@ fn check_dcp_gather(blob: &DevBlob, slots: u64, slot_bytes: u64) -> Result<u64> 
             }
         }
     }
-    Ok(if any { PeerLayout::dcp_slots(slots) } else { slots })
+    Ok(if any {
+        PeerLayout::dcp_slots(slots)
+    } else {
+        slots
+    })
 }
 
 fn count_xgates(blob: &DevBlob) -> u32 {
@@ -2614,7 +2707,8 @@ mod tests {
 
     #[test]
     fn pick_decode_prog_counts_only_unparked_rows() {
-        let pick = |kvlen: &[u32], parked: &[u32]| pick_decode_prog(7, Some(3), kvlen, parked, 4, 2048);
+        let pick =
+            |kvlen: &[u32], parked: &[u32]| pick_decode_prog(7, Some(3), kvlen, parked, 4, 2048);
         assert_eq!(pick(&[2047, 9000, 2048, 5000], &[0, 1, 0, 1]), 3);
         assert_eq!(pick(&[2047, 9000, 2049, 5000], &[0, 1, 0, 1]), 7);
         assert_eq!(pick(&[2049, 2047, 2048, 2048], &[1, 0, 0, 0]), 3);
@@ -2623,7 +2717,10 @@ mod tests {
         // A mask shorter than the rung leaves its tail advanced.
         assert_eq!(pick(&[9000, 2048, 2049, 1], &[1, 0]), 7);
         assert_eq!(pick(&[9000, 2048, 2048, 1], &[1]), 3);
-        assert_eq!(pick_decode_prog(7, Some(3), &[1, 1, 9000], &[0, 0, 0], 2, 2048), 3);
+        assert_eq!(
+            pick_decode_prog(7, Some(3), &[1, 1, 9000], &[0, 0, 0], 2, 2048),
+            3
+        );
         assert_eq!(pick_decode_prog(7, None, &[1, 1], &[0, 1], 2, 2048), 7);
     }
 
@@ -2649,10 +2746,22 @@ mod tests {
         // Complete counts, bailed collective: only the status word shows it.
         assert!(err(buf([8, 0, 0, 64], 0xdead_0005)).contains("0xdead0005"));
         let kind = |b: Vec<u8>| check_xstate(3, &b, &expect).unwrap_err();
-        assert!(matches!(kind(buf([8, 0, 0, 64], 0xdead_0005)), RuntimeError::CollectiveBail(_)));
-        assert!(matches!(kind(buf([7, 0, 0, 64], 0)), RuntimeError::CollectiveBail(_)));
-        assert!(matches!(kind(buf([8, 0, 0, 72], 0)), RuntimeError::Device(_)));
-        assert!(matches!(kind(buf([8, 0, 0, 64], 0x1)), RuntimeError::Device(_)));
+        assert!(matches!(
+            kind(buf([8, 0, 0, 64], 0xdead_0005)),
+            RuntimeError::CollectiveBail(_)
+        ));
+        assert!(matches!(
+            kind(buf([7, 0, 0, 64], 0)),
+            RuntimeError::CollectiveBail(_)
+        ));
+        assert!(matches!(
+            kind(buf([8, 0, 0, 72], 0)),
+            RuntimeError::Device(_)
+        ));
+        assert!(matches!(
+            kind(buf([8, 0, 0, 64], 0x1)),
+            RuntimeError::Device(_)
+        ));
     }
 
     /// The tagged one-shot's blob contract (`check_xr_tagged_blob`): the decode program's
@@ -2972,7 +3081,11 @@ mod tests {
         local.i[6] = 16;
         local.i[7] = 1;
         blob.progs[0].insts.push(local);
-        assert_eq!(count_xgates(&blob), 17, "the local band keeps its three gate ids reserved");
+        assert_eq!(
+            count_xgates(&blob),
+            17,
+            "the local band keeps its three gate ids reserved"
+        );
         let e = gate_expectations(&blob, 8, 17);
         assert_eq!(&e[0][11..14], &[Some(8), Some(8), Some(8)]);
         assert_eq!(
@@ -3082,18 +3195,24 @@ mod tests {
         assert!(check_dcp_gather(&blob([32, 8192, 0, 6, 3, six, 7, 8]), 6, slot).is_err());
         assert!(check_dcp_gather(&blob([32, 2048, 0, 6, 3, six, 7, 8]), 9, slot).is_err());
         let mut decode = blob([32, 2048, 0, 6, 3, six, 7, 8]);
-        decode.progs[0].insts.insert(0, DevInst64 {
-            op: DevOp::DcpKvPack as u16,
-            t: [0, 65535, 65535, 65535, 65535, 65535, 65535, 65535],
-            i: [32, 2048, 0, 6, 3, six, 0, 0],
-            ..Default::default()
-        });
+        decode.progs[0].insts.insert(
+            0,
+            DevInst64 {
+                op: DevOp::DcpKvPack as u16,
+                t: [0, 65535, 65535, 65535, 65535, 65535, 65535, 65535],
+                i: [32, 2048, 0, 6, 3, six, 0, 0],
+                ..Default::default()
+            },
+        );
         assert!(check_dcp_gather(&decode, 6, slot).is_err());
-        decode.progs[0].insts.insert(0, DevInst64 {
-            op: DevOp::IndexSelect as u16,
-            i: [0, 2048, 0, 0, 3, 0, 0, 0],
-            ..Default::default()
-        });
+        decode.progs[0].insts.insert(
+            0,
+            DevInst64 {
+                op: DevOp::IndexSelect as u16,
+                i: [0, 2048, 0, 0, 3, 0, 0, 0],
+                ..Default::default()
+            },
+        );
         assert_eq!(check_dcp_gather(&decode, 6, slot).unwrap(), 7);
         let mut plain = blob([0; 8]);
         plain.progs[0].insts.clear();

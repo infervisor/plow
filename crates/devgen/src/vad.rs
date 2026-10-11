@@ -35,8 +35,15 @@ pub const POLICY: VadContract = VadContract {
         max_speech_ms: 0,
         min_silence_at_max_speech_ms: 98,
     },
-    gate: VadGate { min_speech_ms: 150, min_silence_ms: 150, speech_pad_ms: 0, min_total_speech_ms: 250 },
-    bounds: VadBounds { max_duration_ms: 600_000 },
+    gate: VadGate {
+        min_speech_ms: 150,
+        min_silence_ms: 150,
+        speech_pad_ms: 0,
+        min_total_speech_ms: 250,
+    },
+    bounds: VadBounds {
+        max_duration_ms: 600_000,
+    },
 };
 
 pub const INPUT: &str = "in.vad.window";
@@ -62,11 +69,22 @@ pub fn lower(n_cu: u32) -> Result<VadPackets, String> {
         tensors = program.tensors.clone();
         progs.push(program);
     }
-    for t in tensors.iter_mut().filter(|t| t.name.starts_with("state.vad.")) {
+    for t in tensors
+        .iter_mut()
+        .filter(|t| t.name.starts_with("state.vad."))
+    {
         t.init = Some(vec![0; t.bytes as usize]);
     }
     Ok(VadPackets {
-        model: Model { n_cu, target: 0, tensors, progs, prog_t: vec![1, 1], kv_row_insts: Vec::new(), gen: Vec::new() },
+        model: Model {
+            n_cu,
+            target: 0,
+            tensors,
+            progs,
+            prog_t: vec![1, 1],
+            kv_row_insts: Vec::new(),
+            gen: Vec::new(),
+        },
         steps: [0, 1],
     })
 }
@@ -124,7 +142,9 @@ fn emit_step(b: &mut Builder, source: usize) {
         (input, rows) = (output, out_rows);
     }
 
-    let state = |b: &mut Builder, kind: &str, bank: usize| b.tensor(&format!("state.vad.{kind}.{bank}"), f32s(HIDDEN));
+    let state = |b: &mut Builder, kind: &str, bank: usize| {
+        b.tensor(&format!("state.vad.{kind}.{bank}"), f32s(HIDDEN))
+    };
     let (h_source, c_source) = (state(b, "h", source), state(b, "c", source));
     let (h_target, c_target) = (state(b, "h", target), state(b, "c", target));
     let gates = b.tensor("act.vad.gates", f32s(4 * HIDDEN));
@@ -132,7 +152,10 @@ fn emit_step(b: &mut Builder, source: usize) {
     let projections: Vec<u32> = [(gates, input, "ih"), (recurrent, h_source, "hh")]
         .into_iter()
         .map(|(out, x, kind)| {
-            let weight = b.tensor(&format!("vad.lstm.weight_{kind}"), f32s(4 * HIDDEN * HIDDEN));
+            let weight = b.tensor(
+                &format!("vad.lstm.weight_{kind}"),
+                f32s(4 * HIDDEN * HIDDEN),
+            );
             let bias = b.tensor(&format!("vad.lstm.bias_{kind}"), f32s(4 * HIDDEN));
             b.emit(DevOp::DenseGemmF32, b.all(), &[dep], |d| {
                 d.t[..4].copy_from_slice(&[out, x, weight, bias]);
@@ -169,12 +192,20 @@ fn emit_step(b: &mut Builder, source: usize) {
 }
 
 impl VadPackets {
-    pub fn embed_weights(&mut self, mut resolve: impl FnMut(&str) -> Result<Vec<u8>, String>) -> Result<(), String> {
+    pub fn embed_weights(
+        &mut self,
+        mut resolve: impl FnMut(&str) -> Result<Vec<u8>, String>,
+    ) -> Result<(), String> {
         for tensor in &mut self.model.tensors {
             if packet::names::is_checkpoint_weight(&tensor.name) && tensor.init.is_none() {
                 let bytes = resolve(&tensor.name)?;
                 if bytes.len() as u64 != tensor.bytes {
-                    return Err(format!("tensor {} has {} bytes, expected {}", tensor.name, bytes.len(), tensor.bytes));
+                    return Err(format!(
+                        "tensor {} has {} bytes, expected {}",
+                        tensor.name,
+                        bytes.len(),
+                        tensor.bytes
+                    ));
                 }
                 tensor.init = Some(bytes);
             }
@@ -183,23 +214,41 @@ impl VadPackets {
     }
 
     pub fn pipeline_section(&self) -> Result<SectionData, String> {
-        use plow_asset::packet_pipeline::{PacketPipeline, PacketPipelines, PipelineDType, PipelineTensor, SECTION, VERSION};
+        use plow_asset::packet_pipeline::{
+            PacketPipeline, PacketPipelines, PipelineDType, PipelineTensor, SECTION, VERSION,
+        };
         use std::collections::BTreeMap;
 
-        let f32_tensor = |name: &str, elements: u64| PipelineTensor { name: name.into(), dtype: PipelineDType::F32, shape: vec![elements] };
+        let f32_tensor = |name: &str, elements: u64| PipelineTensor {
+            name: name.into(),
+            dtype: PipelineDType::F32,
+            shape: vec![elements],
+        };
         let mut tensors = BTreeMap::from([
             ("input".to_string(), f32_tensor(INPUT, u64::from(WINDOW))),
             ("probability".to_string(), f32_tensor(PROBABILITY, 1)),
         ]);
-        for (index, state) in self.model.tensors.iter().filter(|t| t.name.starts_with("state.vad.")).enumerate() {
-            tensors.insert(format!("state.{index}"), f32_tensor(&state.name, state.bytes / 4));
+        for (index, state) in self
+            .model
+            .tensors
+            .iter()
+            .filter(|t| t.name.starts_with("state.vad."))
+            .enumerate()
+        {
+            tensors.insert(
+                format!("state.{index}"),
+                f32_tensor(&state.name, state.bytes / 4),
+            );
         }
         let metadata = PacketPipelines {
             version: VERSION,
             pipelines: vec![PacketPipeline {
                 name: "vad".into(),
                 driver: DRIVER.into(),
-                programs: BTreeMap::from([("step.0".into(), self.steps[0] as u32), ("step.1".into(), self.steps[1] as u32)]),
+                programs: BTreeMap::from([
+                    ("step.0".into(), self.steps[0] as u32),
+                    ("step.1".into(), self.steps[1] as u32),
+                ]),
                 tensors,
                 parameters: {
                     use plow_asset::speech_contract::{CONTRACT, EXECUTOR_HOST, VAD_CONTRACT};
@@ -218,7 +267,11 @@ impl VadPackets {
             }],
         };
         metadata.validate(self.model.progs.len(), |name| {
-            self.model.tensors.iter().find(|t| t.name == name).map(|t| t.bytes)
+            self.model
+                .tensors
+                .iter()
+                .find(|t| t.name == name)
+                .map(|t| t.bytes)
         })?;
         Ok(SectionData {
             kind: packet::devbuild::SECT_METADATA,
@@ -249,9 +302,16 @@ mod tests {
         ]
         .iter()
         .any(|&allowed| allowed as u16 == op)));
-        let states: Vec<_> = packets.model.tensors.iter().filter(|t| t.name.starts_with("state.vad.")).collect();
+        let states: Vec<_> = packets
+            .model
+            .tensors
+            .iter()
+            .filter(|t| t.name.starts_with("state.vad."))
+            .collect();
         assert_eq!(states.len(), 4);
-        assert!(states.iter().all(|t| t.init.as_deref() == Some(&[0u8; 512][..])));
+        assert!(states
+            .iter()
+            .all(|t| t.init.as_deref() == Some(&[0u8; 512][..])));
         assert!(packets.pipeline_section().is_ok());
     }
 }

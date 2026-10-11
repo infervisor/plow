@@ -132,7 +132,11 @@ pub(super) fn segments(
             .get(bounds[0] as usize..bounds[1] as usize)
             .ok_or_else(fail)?;
         let glu = entries.first().ok_or_else(fail)?.inst as usize;
-        if program.insts.get(glu).is_some_and(|g| g.op == DevOp::MoeGroupGluGemmaPfW8a8 as u16) {
+        if program
+            .insts
+            .get(glu)
+            .is_some_and(|g| g.op == DevOp::MoeGroupGluGemmaPfW8a8 as u16)
+        {
             routes[segment] =
                 Some(w8a8_segment(program, tensors, segment, entries, glu).ok_or_else(fail)?);
             continue;
@@ -149,7 +153,11 @@ pub(super) fn segments(
         let bytes = |handle: u16| tensors.get(handle as usize).map_or(0, |t| t.bytes);
         let capacity = bytes(g.t[0]) / (u64::from(inter.max(1)) * 2);
         let none = packet::dev::TENSOR_NONE16;
-        let last = entries.iter().map(|e| e.inst as usize).max().ok_or_else(fail)?;
+        let last = entries
+            .iter()
+            .map(|e| e.inst as usize)
+            .max()
+            .ok_or_else(fail)?;
         let members = glu..=last;
         let pf_tail = match last.checked_sub(down) {
             Some(0) => None,
@@ -159,7 +167,9 @@ pub(super) fn segments(
         if align.op != DevOp::MoeAlignGemmaPf as u16
             || g.op != DevOp::MoeGroupGluGemmaPf as u16
             || d.op != DevOp::MoeGroupDownGemmaPf as u16
-            || entries.iter().any(|e| !members.contains(&(e.inst as usize)))
+            || entries
+                .iter()
+                .any(|e| !members.contains(&(e.inst as usize)))
             || program
                 .stream
                 .iter()
@@ -185,7 +195,9 @@ pub(super) fn segments(
             || capacity > u64::from(u32::MAX)
             || bytes(g.t[2]) != u64::from(experts) * 16
             || bytes(g.t[3]) < (3 * u64::from(experts) + 1) * 4
-            || [g.t[4], d.t[4], d.t[5]].iter().any(|&t| bytes(t) < capacity * 4)
+            || [g.t[4], d.t[4], d.t[5]]
+                .iter()
+                .any(|&t| bytes(t) < capacity * 4)
         {
             return Err(fail());
         }
@@ -199,7 +211,9 @@ pub(super) fn segments(
             capacity: capacity as u32,
             average_rows: (u64::from(program.t) * u64::from(align.i[2]) / u64::from(experts))
                 as u32,
-            handles: [g.t[2], g.t[3], g.t[4], d.t[4], d.t[5], g.t[1], g.t[0], d.t[0]],
+            handles: [
+                g.t[2], g.t[3], g.t[4], d.t[4], d.t[5], g.t[1], g.t[0], d.t[0],
+            ],
             norm: None,
             tail: None,
             pf_tail,
@@ -221,7 +235,11 @@ fn w8a8_segment(
     glu: usize,
 ) -> Option<MoeLtSegment> {
     let insts = &program.insts;
-    let (align, aq, g) = (insts.get(glu.checked_sub(2)?)?, insts.get(glu - 1)?, insts.get(glu)?);
+    let (align, aq, g) = (
+        insts.get(glu.checked_sub(2)?)?,
+        insts.get(glu - 1)?,
+        insts.get(glu)?,
+    );
     let (q, d) = (insts.get(glu + 1)?, insts.get(glu + 2)?);
     let pf_tail = prefill_tail(program, tensors, glu + 2)?;
     let members = glu..=glu + 3;
@@ -274,7 +292,9 @@ fn w8a8_segment(
         && bytes(g.t[2]) == u64::from(experts) * 16
         && bytes(g.t[6]) == u64::from(experts) * 16
         && bytes(g.t[3]) >= (3 * u64::from(experts) + 1) * 4
-        && [g.t[4], d.t[4], d.t[5], d.t[7]].iter().all(|&t| bytes(t) >= capacity * 4)
+        && [g.t[4], d.t[4], d.t[5], d.t[7]]
+            .iter()
+            .all(|&t| bytes(t) >= capacity * 4)
         && bytes(g.t[1]) >= tokens * u64::from(hidden)
         && bytes(g.t[5]) >= tokens * 4
         && bytes(d.t[0]) >= tokens * u64::from(TAIL_TOP_K) * 4)
@@ -287,7 +307,9 @@ fn w8a8_segment(
             act: g.i[5],
             capacity: capacity as u32,
             average_rows: (tokens * u64::from(TAIL_TOP_K) / u64::from(experts)) as u32,
-            handles: [g.t[2], g.t[3], g.t[4], d.t[4], d.t[5], g.t[1], g.t[0], d.t[0]],
+            handles: [
+                g.t[2], g.t[3], g.t[4], d.t[4], d.t[5], g.t[1], g.t[0], d.t[0],
+            ],
             norm: None,
             tail: None,
             pf_tail: Some(pf_tail),
@@ -337,7 +359,11 @@ pub(super) fn decode_segments(
             .min(u64::from(rows) * u64::from(k) + u64::from(experts) * ALIGN_PAD);
         let none = packet::dev::TENSOR_NONE16;
         let row_bytes = u64::from(rows) * u64::from(hidden) * 2;
-        let last = entries.iter().map(|e| e.inst as usize).max().ok_or_else(fail)?;
+        let last = entries
+            .iter()
+            .map(|e| e.inst as usize)
+            .max()
+            .ok_or_else(fail)?;
         let members = glu..=last;
         let tail = match last - down {
             0 => None,
@@ -347,7 +373,9 @@ pub(super) fn decode_segments(
         if align.op != DevOp::MoeAlignGemmaPf as u16
             || g.op != DevOp::MoeExpertGluNormGemma as u16
             || d.op != DevOp::MoeExpertDownGemma as u16
-            || entries.iter().any(|e| !members.contains(&(e.inst as usize)))
+            || entries
+                .iter()
+                .any(|e| !members.contains(&(e.inst as usize)))
             || program
                 .stream
                 .iter()
@@ -356,8 +384,10 @@ pub(super) fn decode_segments(
                 let c = &program.insts[t.combine];
                 c.t[1] != d.t[0] || [c.i[1], c.i[2]] != [k, g.i[5]] || k != TAIL_TOP_K
             })
-            || [g.t[0], g.t[1], g.t[3], g.t[4], g.t[5], g.t[6], g.t[7], d.t[0], d.t[6], d.t[7]]
-                .contains(&none)
+            || [
+                g.t[0], g.t[1], g.t[3], g.t[4], g.t[5], g.t[6], g.t[7], d.t[0], d.t[6], d.t[7],
+            ]
+            .contains(&none)
             || [align.i[0], align.i[1], align.i[2], align.i[3]] != [rows, experts, k, min]
             || min == 0
             || rows < min
@@ -377,7 +407,9 @@ pub(super) fn decode_segments(
             || capacity > u64::from(u32::MAX)
             || bytes(g.t[3]) != u64::from(experts) * 16
             || bytes(g.t[6]) < (3 * u64::from(experts) + 1) * 4
-            || [g.t[7], d.t[6], d.t[7]].iter().any(|&t| bytes(t) < capacity * 4)
+            || [g.t[7], d.t[6], d.t[7]]
+                .iter()
+                .any(|&t| bytes(t) < capacity * 4)
             || bytes(g.t[1]) < row_bytes
             || bytes(g.t[5]) < row_bytes
             || bytes(g.t[4]) < u64::from(hidden) * 2
@@ -394,7 +426,9 @@ pub(super) fn decode_segments(
             act: g.i[4],
             capacity: capacity as u32,
             average_rows: ((u64::from(rows) * u64::from(k)) / u64::from(experts)).max(1) as u32,
-            handles: [g.t[3], g.t[6], g.t[7], d.t[6], d.t[7], g.t[5], g.t[0], d.t[0]],
+            handles: [
+                g.t[3], g.t[6], g.t[7], d.t[6], d.t[7], g.t[5], g.t[0], d.t[0],
+            ],
             norm: Some(Norm {
                 x: g.t[1],
                 gamma: g.t[4],
@@ -431,7 +465,9 @@ fn decode_tail(
         && [n.i[0], n.i[1]] == [rows, hidden]
         && [n.t[1], n.t[2], n.t[3]] == [x, x, c.t[0]]
         && ![c.t[0], c.t[2], c.t[3], n.t[0]].contains(&none)
-        && [c.t[0], c.t[2], n.t[0], x].iter().all(|&t| bytes(t) >= row_bytes)
+        && [c.t[0], c.t[2], n.t[0], x]
+            .iter()
+            .all(|&t| bytes(t) >= row_bytes)
         && bytes(c.t[3]) >= u64::from(hidden) * 2
         && weight(n.t[4])
         && weight(n.t[5]))
@@ -678,8 +714,16 @@ impl MoeLt {
         fu: u64,
     ) -> Result<()> {
         let be = &self.be;
-        let (h, i, e) = (u64::from(self.hidden), u64::from(self.inter), u64::from(self.experts));
-        let counts = skewed_rows(self.experts, u64::from(average_rows.max(1)), self.xs.len / (h * 2));
+        let (h, i, e) = (
+            u64::from(self.hidden),
+            u64::from(self.inter),
+            u64::from(self.experts),
+        );
+        let counts = skewed_rows(
+            self.experts,
+            u64::from(average_rows.max(1)),
+            self.xs.len / (h * 2),
+        );
         be.upload(&self.tables, 0, bytemuck::cast_slice(&counts))?;
         let (xs, gu) = (self.xs.base, self.gu.base);
         let mut offsets = Vec::with_capacity(counts.len());
@@ -689,11 +733,20 @@ impl MoeLt {
             row += count as u64;
         }
         let element = if self.fp8 { 1 } else { 2 };
-        let pointers: Vec<u64> = [(xs, h * element), (gu, i * 4), (fu, i * element), (xs, h * 2)]
-            .into_iter()
-            .flat_map(|(base, width)| offsets.iter().map(move |&o| base + o * width))
-            .collect();
-        be.upload(&self.tables, self.pointers(0) - self.tables.base, bytemuck::cast_slice(&pointers))?;
+        let pointers: Vec<u64> = [
+            (xs, h * element),
+            (gu, i * 4),
+            (fu, i * element),
+            (xs, h * 2),
+        ]
+        .into_iter()
+        .flat_map(|(base, width)| offsets.iter().map(move |&o| base + o * width))
+        .collect();
+        be.upload(
+            &self.tables,
+            self.pointers(0) - self.tables.base,
+            bytemuck::cast_slice(&pointers),
+        )?;
         let stream = be.stream_create()?;
         be.memset_d8_async(xs, 0x3c, self.xs.len as usize, &stream)?;
         be.memset_d8_async(gu, 0x3c, self.gu.len as usize, &stream)?;
@@ -803,7 +856,11 @@ impl MoeLt {
         }
         let base = |handle: u16| devp[handle as usize].base;
         let weight = |handle: u16| {
-            if handle == packet::dev::TENSOR_NONE16 { 0 } else { base(handle) }
+            if handle == packet::dev::TENSOR_NONE16 {
+                0
+            } else {
+                base(handle)
+            }
         };
         let [ewt, meta, row_token, row_partidx, row_gate, xn2, fu, part] = segment.handles;
         let weights = self.weights(&devp[ewt as usize])?;
@@ -817,7 +874,14 @@ impl MoeLt {
             tail: segment.tail.map(|t| {
                 let [hn, comb, h1, g_pf2, g_po, gn] = t.handles;
                 (
-                    [base(hn), base(comb), base(h1), base(g_pf2), weight(g_po), weight(gn)],
+                    [
+                        base(hn),
+                        base(comb),
+                        base(h1),
+                        base(g_pf2),
+                        weight(g_po),
+                        weight(gn),
+                    ],
                     [t.eps_comb_bits, t.eps_bits, t.scale_bits].map(f32::from_bits),
                 )
             }),
@@ -944,7 +1008,14 @@ impl MoeLtRoute {
                     arg32(&mut hidden),
                     arg32(&mut blocks),
                 ];
-                o.be.launch_kernel(gather_inv, o.blocks, GLUE_THREADS, 0, &mut params, Some(stream))?;
+                o.be.launch_kernel(
+                    gather_inv,
+                    o.blocks,
+                    GLUE_THREADS,
+                    0,
+                    &mut params,
+                    Some(stream),
+                )?;
             } else {
                 let mut params = [
                     arg(&mut xs),
@@ -955,7 +1026,14 @@ impl MoeLtRoute {
                     arg32(&mut hidden),
                     arg32(&mut blocks),
                 ];
-                o.be.launch_kernel(o.gather, o.blocks, GLUE_THREADS, 0, &mut params, Some(stream))?;
+                o.be.launch_kernel(
+                    o.gather,
+                    o.blocks,
+                    GLUE_THREADS,
+                    0,
+                    &mut params,
+                    Some(stream),
+                )?;
             }
         }
         self.plans[0].run(o.pointers(0), self.weights.base, o.pointers(1), stream)?;
@@ -979,7 +1057,8 @@ impl MoeLtRoute {
             (self.tail, o.combine_nrn)
         {
             let (mut x, _, rows, _) = self.norm.expect("a decode tail rides a decode route");
-            let (mut hn, mut comb, mut h1, mut g_pf2, mut g_po, mut gn) = (hn, comb, h1, g_pf2, g_po, gn);
+            let (mut hn, mut comb, mut h1, mut g_pf2, mut g_po, mut gn) =
+                (hn, comb, h1, g_pf2, g_po, gn);
             let (mut eps_comb, mut eps, mut scale) = (eps_comb, eps, scale);
             let argf = |value: &mut f32| (value as *mut f32).cast::<std::ffi::c_void>();
             let mut params = [
@@ -1000,7 +1079,9 @@ impl MoeLtRoute {
                 argf(&mut eps),
                 argf(&mut scale),
             ];
-            return o.be.launch_kernel(tail, rows, GLUE_THREADS, 0, &mut params, Some(stream));
+            return o
+                .be
+                .launch_kernel(tail, rows, GLUE_THREADS, 0, &mut params, Some(stream));
         }
         if let (Some(([out, h1, gamma], tokens, capacity, eps)), Some(combine)) =
             (self.pf_tail, o.combine_pf)
@@ -1019,7 +1100,9 @@ impl MoeLtRoute {
                 arg32(&mut capacity),
                 (&mut eps as *mut f32).cast::<std::ffi::c_void>(),
             ];
-            return o.be.launch_kernel(combine, tokens, GLUE_THREADS, 0, &mut params, Some(stream));
+            return o
+                .be
+                .launch_kernel(combine, tokens, GLUE_THREADS, 0, &mut params, Some(stream));
         }
         let mut params = [
             arg(&mut part),
@@ -1031,7 +1114,14 @@ impl MoeLtRoute {
             arg32(&mut hidden),
             arg32(&mut blocks),
         ];
-        o.be.launch_kernel(o.scatter, o.blocks, GLUE_THREADS, 0, &mut params, Some(stream))
+        o.be.launch_kernel(
+            o.scatter,
+            o.blocks,
+            GLUE_THREADS,
+            0,
+            &mut params,
+            Some(stream),
+        )
     }
 }
 
@@ -1050,7 +1140,10 @@ fn skewed_rows(experts: u32, average: u64, capacity: u64) -> Vec<i32> {
         .collect();
     let sum: f64 = loads.iter().sum();
     let total = (average * u64::from(experts)).min(capacity) as f64;
-    loads.iter().map(|l| (l / sum * total).floor() as i32).collect()
+    loads
+        .iter()
+        .map(|l| (l / sum * total).floor() as i32)
+        .collect()
 }
 
 impl MoeLtRoute {
@@ -1149,7 +1242,12 @@ impl MoeLtRoute {
 
 /// The widest gathered-row capacity among `segments` (0 when none routes).
 pub(super) fn max_capacity(segments: &[Option<MoeLtSegment>]) -> u32 {
-    segments.iter().flatten().map(|s| s.capacity).max().unwrap_or(0)
+    segments
+        .iter()
+        .flatten()
+        .map(|s| s.capacity)
+        .max()
+        .unwrap_or(0)
 }
 
 /// The routed decode object (`<decode stem>_routed.cubin`, `PLOW_NV_DECODE_ROUTED`): the decode
@@ -1173,7 +1271,10 @@ impl RoutedDecode {
         grid: u32,
     ) -> Result<Option<Arc<Self>>> {
         let kv_abi = be.module_global_u32(main, "plow_fp8_kv_abi")?;
-        let file = format!("{stem}_routed{}.cubin", if kv_abi == Some(1) { "_fp8kv" } else { "" });
+        let file = format!(
+            "{stem}_routed{}.cubin",
+            if kv_abi == Some(1) { "_fp8kv" } else { "" }
+        );
         let Ok(image) = std::fs::read(assets.join(&file)) else {
             return Ok(None);
         };
@@ -1183,10 +1284,17 @@ impl RoutedDecode {
             )));
         }
         let module = DecodeModule::load(be, &image)?;
-        let function =
-            be.get_function(&module, &format!("_Z{}{stem}_routed11PlowProgram", stem.len() + 7))?;
+        let function = be.get_function(
+            &module,
+            &format!("_Z{}{stem}_routed11PlowProgram", stem.len() + 7),
+        )?;
         GpuEngine::check_packet_pairing_suffix(be, &module, assets, "_routed")?;
-        for symbol in ["plow_block", "plow_dyn_kvrow", "plow_segment_gq_abi", "plow_gemv_mm_cap"] {
+        for symbol in [
+            "plow_block",
+            "plow_dyn_kvrow",
+            "plow_segment_gq_abi",
+            "plow_gemv_mm_cap",
+        ] {
             if be.module_global_u32(&module, &format!("{symbol}_routed"))?
                 != be.module_global_u32(main, symbol)?
             {
@@ -1259,7 +1367,9 @@ pub(super) fn decode_routes(
                     )?);
                 }
                 let moe = owner.as_ref().expect("loaded above");
-                Some(super::cublaslt::LibraryRoute::Moe(moe.route(segment, insts, devp)?))
+                Some(super::cublaslt::LibraryRoute::Moe(
+                    moe.route(segment, insts, devp)?,
+                ))
             }
             None => None,
         };
@@ -1380,13 +1490,22 @@ mod tests {
         program.gq_stream[3].seg = 1;
         program.gq_seg_ofs = vec![0, 1, 4];
         let roles = [0, ROLE];
-        assert_eq!(packet_role_segments(&program, &roles, &tensors).unwrap(), roles);
+        assert_eq!(
+            packet_role_segments(&program, &roles, &tensors).unwrap(),
+            roles
+        );
         let route = segments(&program, &tensors, &roles).unwrap()[1].expect("routed tail");
         let tail = route.pf_tail.expect("prefill combine");
-        assert_eq!((tail.combine, tail.handles, tail.tokens), (3, [9, 10, 11], 1024));
+        assert_eq!(
+            (tail.combine, tail.handles, tail.tokens),
+            (3, [9, 10, 11], 1024)
+        );
         assert_eq!(instructions(&[None, Some(route)]), [(1, 1), (1, 2), (1, 3)]);
         // The combine must read the down op's part, at k = 8.
-        for edit in [|p: &mut DevProg| p.insts[3].t[1] = 1, |p: &mut DevProg| p.insts[3].i[1] = 4] {
+        for edit in [
+            |p: &mut DevProg| p.insts[3].t[1] = 1,
+            |p: &mut DevProg| p.insts[3].i[1] = 4,
+        ] {
             let saved = program.insts[3];
             edit(&mut program);
             assert!(segments(&program, &tensors, &roles).is_err());
@@ -1477,12 +1596,21 @@ mod tests {
             l2_domains: 0,
         };
         let roles = [0, ROLE];
-        assert_eq!(packet_role_segments(&program, &roles, &tensors).unwrap(), roles);
+        assert_eq!(
+            packet_role_segments(&program, &roles, &tensors).unwrap(),
+            roles
+        );
         let route = segments(&program, &tensors, &roles).unwrap()[1].expect("routed chain");
         assert_eq!((route.glu, route.down), (2, 4));
-        assert_eq!(route.fp8.map(|f| (f.quant, f.handles)), Some((3, [9, 10, 12])));
+        assert_eq!(
+            route.fp8.map(|f| (f.quant, f.handles)),
+            Some((3, [9, 10, 12]))
+        );
         assert_eq!(route.pf_tail.map(|t| t.combine), Some(5));
-        assert_eq!(instructions(&[None, Some(route)]), [(1, 2), (1, 4), (1, 5), (1, 3)]);
+        assert_eq!(
+            instructions(&[None, Some(route)]),
+            [(1, 2), (1, 4), (1, 5), (1, 3)]
+        );
         // The fu quant must feed the DOWN, and the DOWN must read the GLU's scale table. The
         // activation quant must write the GLU's xq and ascale over [tokens, hidden], unfolded,
         // in an earlier segment.
@@ -1584,7 +1712,13 @@ mod tests {
         let route = routes[1].expect("routed pair");
         assert_eq!((route.glu, route.down), (1, 2));
         assert_eq!(
-            (route.hidden, route.inter, route.experts, route.average_rows, route.act),
+            (
+                route.hidden,
+                route.inter,
+                route.experts,
+                route.average_rows,
+                route.act
+            ),
             (2816, 704, 128, 1, 0)
         );
         assert_eq!(u64::from(route.capacity), 16 * 8 + 128 * ALIGN_PAD);
@@ -1619,11 +1753,13 @@ mod tests {
         let (mut program, mut tensors) = decode_fixture();
         // Handles: 11 comb, 12 h1, 13 g_pf2, 14 hn, 15 g_po, 16 gn.
         let row = 16 * 2816 * 2;
-        tensors.extend([row, row, 2816 * 2, row, 2816 * 2, 2816 * 2].map(|bytes| DevTensor {
-            name: "act".into(),
-            bytes,
-            init: None,
-        }));
+        tensors.extend(
+            [row, row, 2816 * 2, row, 2816 * 2, 2816 * 2].map(|bytes| DevTensor {
+                name: "act".into(),
+                bytes,
+                init: None,
+            }),
+        );
         let nop = program.insts[3];
         program.insts.splice(3..3, [nop, nop]);
         let comb = &mut program.insts[3];
@@ -1669,7 +1805,10 @@ mod tests {
             })
         );
         assert_eq!(instructions(&routes), [(1, 1), (1, 2), (1, 3), (1, 4)]);
-        assert_eq!(packet_role_segments(&program, &roles, &tensors).unwrap(), roles);
+        assert_eq!(
+            packet_role_segments(&program, &roles, &tensors).unwrap(),
+            roles
+        );
         // A prefill segment never carries the decode tail (four instructions pass the role
         // validator only as the W8A8 chain, which the route checks).
         assert!(segments(&program, &tensors, &[0, ROLE, 0]).is_err());

@@ -1,11 +1,11 @@
+pub mod audio_lm;
 pub mod conformer;
 pub mod endpoint;
 pub mod frontend;
-pub mod numerals;
 #[cfg(feature = "gguf")]
 pub mod nemotron;
+pub mod numerals;
 mod packet;
-pub mod audio_lm;
 pub mod rnnt;
 pub mod serving;
 pub mod subsampling;
@@ -84,9 +84,16 @@ pub trait Transcriber: Send {
 
     /// Append audio to stream `id`; returns the transcript of the audio decoded so far (it trails
     /// the audio by the encoder's lookahead), reporting each growth through `on_text`.
-    fn stream_push(&mut self, id: u64, samples: &[f32], on_text: &mut dyn FnMut(&str)) -> crate::Result<String> {
+    fn stream_push(
+        &mut self,
+        id: u64,
+        samples: &[f32],
+        on_text: &mut dyn FnMut(&str),
+    ) -> crate::Result<String> {
         let _ = (id, samples, on_text);
-        Err(crate::RuntimeError::Rejected("this ASR engine has no incremental stream".into()))
+        Err(crate::RuntimeError::Rejected(
+            "this ASR engine has no incremental stream".into(),
+        ))
     }
 
     fn stream_close(&mut self, id: u64) {
@@ -155,7 +162,12 @@ impl<T: Transcriber + ?Sized> Transcriber for Box<T> {
         (**self).stream_open()
     }
 
-    fn stream_push(&mut self, id: u64, samples: &[f32], on_text: &mut dyn FnMut(&str)) -> crate::Result<String> {
+    fn stream_push(
+        &mut self,
+        id: u64,
+        samples: &[f32],
+        on_text: &mut dyn FnMut(&str),
+    ) -> crate::Result<String> {
         (**self).stream_push(id, samples, on_text)
     }
 
@@ -220,6 +232,7 @@ fn load_causal_transcriber(
     tokenizer: &Path,
     backend: &str,
 ) -> crate::Result<(Box<dyn Transcriber>, &'static str)> {
-    let (engine, loaded_backend) = audio_lm::AudioLmAsr::load_with_backend(packet, tokenizer, backend)?;
+    let (engine, loaded_backend) =
+        audio_lm::AudioLmAsr::load_with_backend(packet, tokenizer, backend)?;
     Ok((Box::new(engine), loaded_backend))
 }

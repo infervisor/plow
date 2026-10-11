@@ -55,10 +55,16 @@ pub(super) struct ArgmaxFold {
 }
 
 /// An lm_head `segment` that cuBLASLt serves through the head kernel (see HeadTail).
-fn head_tail(segment: &DecodeSegment, backend: &ProjectionBackend, head: Option<&HeadKernel>) -> Option<HeadKernel> {
-    head.filter(|_| segment.n % 16 != 0 && segment.n > 16 && matches!(backend, ProjectionBackend::Lt(_)))
-        .filter(|h| u64::from(segment.m) * u64::from(segment.n & !15) * 2 <= h.scratch.len)
-        .cloned()
+fn head_tail(
+    segment: &DecodeSegment,
+    backend: &ProjectionBackend,
+    head: Option<&HeadKernel>,
+) -> Option<HeadKernel> {
+    head.filter(|_| {
+        segment.n % 16 != 0 && segment.n > 16 && matches!(backend, ProjectionBackend::Lt(_))
+    })
+    .filter(|h| u64::from(segment.m) * u64::from(segment.n & !15) * 2 <= h.scratch.len)
+    .cloned()
 }
 
 /// The Argmax/ArgmaxFin segments of `g` that directly follow a head-kernel lm_head and read
@@ -70,7 +76,9 @@ pub(super) fn argmax_folds(
     backend: &ProjectionBackend,
     head: Option<&HeadKernel>,
 ) -> Vec<ArgmaxFold> {
-    if !crate::config::RuntimeConfig::get().nv.decode_head_argmax || head.is_none_or(|h| h.amax.is_none()) {
+    if !crate::config::RuntimeConfig::get().nv.decode_head_argmax
+        || head.is_none_or(|h| h.amax.is_none())
+    {
         return Vec::new();
     }
     let mut out = Vec::new();
@@ -100,7 +108,13 @@ pub(super) fn argmax_folds(
             && df.t[1] == da.t[0]
             && df.i[1] == segment.m
         {
-            out.push(ArgmaxFold { segment: seg, head_segment: index, argmax: a, fin: f, ids: devp[df.t[0] as usize].base });
+            out.push(ArgmaxFold {
+                segment: seg,
+                head_segment: index,
+                argmax: a,
+                fin: f,
+                ids: devp[df.t[0] as usize].base,
+            });
         }
     }
     out
@@ -108,7 +122,10 @@ pub(super) fn argmax_folds(
 
 /// `(segment, instruction)` of every instruction a folded argmax segment skips.
 pub(super) fn fold_instructions(folds: &[ArgmaxFold]) -> Vec<(usize, usize)> {
-    folds.iter().flat_map(|f| [(f.segment, f.argmax), (f.segment, f.fin)]).collect()
+    folds
+        .iter()
+        .flat_map(|f| [(f.segment, f.argmax), (f.segment, f.fin)])
+        .collect()
 }
 
 impl CublasLtDecodeRoute {
@@ -140,9 +157,14 @@ impl CublasLtDecodeRoute {
             &mut best as *mut u64 as *mut std::ffi::c_void,
             &mut ctr as *mut u64 as *mut std::ffi::c_void,
         ];
-        tail.kernel
-            .be
-            .launch_kernel(tail.kernel.function, tail.rows * 8, BLOCK, 0, &mut params, Some(stream))
+        tail.kernel.be.launch_kernel(
+            tail.kernel.function,
+            tail.rows * 8,
+            BLOCK,
+            0,
+            &mut params,
+            Some(stream),
+        )
     }
 
     /// Executed by the previous segment's paired call.
@@ -229,7 +251,11 @@ impl LightOp {
             }
         };
         // `fj[2]` names the merge fold's tensors on FlashDecode only.
-        let fold = if d.op == DevOp::FlashDecode as u16 { d.fj[2] } else { 0 };
+        let fold = if d.op == DevOp::FlashDecode as u16 {
+            d.fj[2]
+        } else {
+            0
+        };
         Self {
             d: *d,
             t: d.t.map(at),
@@ -351,20 +377,27 @@ pub(super) fn light_functions(
     }
     let arch = stem.trim_start_matches("interp_");
     let single = be.get_function(module, &format!("plow_{arch}_light"))?;
-    let norm_quant = be.get_function(module, &format!("plow_{arch}_light_norm_quant")).ok();
+    let norm_quant = be
+        .get_function(module, &format!("plow_{arch}_light_norm_quant"))
+        .ok();
     let attn = match be.module_global_u32(module, "plow_light_attn_hd")? {
         Some(hd) => {
             let f = be.get_function(module, &format!("plow_{arch}_light_attn"))?;
             // A wider light hd512 head group than the interpreter's claims its own smem.
-            let smem = be.module_global_u32(module, "plow_light_attn_smem")?.map_or(smem, |s| s.max(smem));
+            let smem = be
+                .module_global_u32(module, "plow_light_attn_smem")?
+                .map_or(smem, |s| s.max(smem));
             be.set_max_dynamic_smem(f, smem)?;
-            let hd2 = be.module_global_u32(module, "plow_light_attn_hd2")?.unwrap_or(hd);
+            let hd2 = be
+                .module_global_u32(module, "plow_light_attn_hd2")?
+                .unwrap_or(hd);
             Some((f, smem, [hd, hd2]))
         }
         _ => None,
     };
     let gemma = be.module_global_u32(module, "plow_light_gemma")? == Some(1);
-    let fp8_attn = abi == Some(2) && be.module_global_u32(module, "plow_light_fp8_attn")? == Some(1);
+    let fp8_attn =
+        abi == Some(2) && be.module_global_u32(module, "plow_light_fp8_attn")? == Some(1);
     let fp8_flash256 = match be.module_global_u32(module, "plow_light_fp8_flash256_smem")? {
         Some(bytes) if fp8_attn => {
             let f = be.get_function(module, &format!("plow_{arch}_light_fp8_flash256"))?;
@@ -373,7 +406,9 @@ pub(super) fn light_functions(
         }
         _ => None,
     };
-    let head = be.get_function(module, &format!("plow_{arch}_light_head")).ok();
+    let head = be
+        .get_function(module, &format!("plow_{arch}_light_head"))
+        .ok();
     let flash = match be.module_global_u32(module, "plow_light_flash_smem")? {
         Some(bytes) if crate::config::RuntimeConfig::get().nv.decode_light_flash => {
             let f = be.get_function(module, &format!("plow_{arch}_light_flash"))?;
@@ -387,12 +422,14 @@ pub(super) fn light_functions(
         .ok()
         .filter(|_| crate::config::RuntimeConfig::get().nv.prefill_light);
     let tail = if abi == Some(2) {
-        be.get_function(module, &format!("plow_{arch}_light_tail")).ok()
+        be.get_function(module, &format!("plow_{arch}_light_tail"))
+            .ok()
     } else {
         None
     };
     let capmax = if abi == Some(2) {
-        be.get_function(module, &format!("plow_{arch}_light_capmax")).ok()
+        be.get_function(module, &format!("plow_{arch}_light_capmax"))
+            .ok()
     } else {
         None
     };
@@ -403,7 +440,21 @@ pub(super) fn light_functions(
         }
         _ => None,
     };
-    Ok(Some(LightFunctions { single, norm_quant, gemma, fp8_attn, direct: abi == Some(2), tail, capmax, attn, attn_s, fp8_flash256, head, flash, prefill }))
+    Ok(Some(LightFunctions {
+        single,
+        norm_quant,
+        gemma,
+        fp8_attn,
+        direct: abi == Some(2),
+        tail,
+        capmax,
+        attn,
+        attn_s,
+        fp8_flash256,
+        head,
+        flash,
+        prefill,
+    }))
 }
 
 fn fp8_attention_tail(d: &packet::dev::DevInst64) -> bool {
@@ -419,20 +470,27 @@ fn norm_quant_pair(g: &DevProg, entries: &[packet::dev::StreamEnt]) -> Option<(u
     let first = entries.first()?;
     let n = first.inst as usize;
     let q = n + 1;
-    let (Some(norm), Some(quant)) = (g.insts.get(n), g.insts.get(q)) else { return None };
+    let (Some(norm), Some(quant)) = (g.insts.get(n), g.insts.get(q)) else {
+        return None;
+    };
     let blocks = usize::from(norm.blocks);
     if blocks == 0 || entries.len() != 2 * blocks {
         return None;
     }
     let none = packet::dev::TENSOR_NONE16;
-    let grouped = entries[..blocks].iter().enumerate().all(|(slice, e)| {
-        e.inst as usize == n && e.slice as usize == slice
-    }) && entries[blocks..].iter().enumerate().all(|(slice, e)| {
-        e.inst as usize == q && e.slice as usize == slice
-    });
+    let grouped = entries[..blocks]
+        .iter()
+        .enumerate()
+        .all(|(slice, e)| e.inst as usize == n && e.slice as usize == slice)
+        && entries[blocks..]
+            .iter()
+            .enumerate()
+            .all(|(slice, e)| e.inst as usize == q && e.slice as usize == slice);
     let interleaved = entries.chunks_exact(2).enumerate().all(|(slice, pair)| {
-        pair[0].inst as usize == n && pair[1].inst as usize == q
-            && pair[0].slice as usize == slice && pair[1].slice as usize == slice
+        pair[0].inst as usize == n
+            && pair[1].inst as usize == q
+            && pair[0].slice as usize == slice
+            && pair[1].slice as usize == slice
     });
     (quant.blocks == norm.blocks
         && norm.op == DevOp::NormResidualNorm as u16
@@ -447,7 +505,7 @@ fn norm_quant_pair(g: &DevProg, entries: &[packet::dev::StreamEnt]) -> Option<(u
         && quant.t[3] == none
         && quant.t[4] == none
         && (grouped || interleaved))
-    .then_some((n, q))
+        .then_some((n, q))
 }
 
 /// Each light-routable interpreter segment of `g`: `(segment, levels)`, a level being a
@@ -490,7 +548,11 @@ pub(super) fn light_segments(
                     && own.len() == d.blocks as usize
                     && own.iter().enumerate().all(|(i, e)| e.slice as usize == i)
             });
-            let distinct = insts.iter().collect::<std::collections::BTreeSet<_>>().len() == insts.len();
+            let distinct = insts
+                .iter()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len()
+                == insts.len();
             if !whole || !distinct {
                 return None;
             }
@@ -499,7 +561,10 @@ pub(super) fn light_segments(
             if functions.gemma
                 && functions.tail.is_some()
                 && insts.iter().all(|&i| {
-                    matches!(op(i), Some(DevOp::SoftCap | DevOp::Argmax | DevOp::ArgmaxFin))
+                    matches!(
+                        op(i),
+                        Some(DevOp::SoftCap | DevOp::Argmax | DevOp::ArgmaxFin)
+                    )
                 })
             {
                 return Some((seg, insts.iter().map(|&i| (i, 0)).collect()));
@@ -522,13 +587,16 @@ pub(super) fn light_segments(
                     match op(inst) {
                         Some(DevOp::HeadNormRope) => attn_hd(d.i[2]) && d.i[5] == 0,
                         Some(DevOp::HeadNormRopeFp8) => {
-                            functions.fp8_attn && attn_hd(d.i[2]) && d.i[5] == 0
+                            functions.fp8_attn
+                                && attn_hd(d.i[2])
+                                && d.i[5] == 0
                                 && d.t[6] != packet::dev::TENSOR_NONE16
                                 && d.t[7] == packet::dev::TENSOR_NONE16
                         }
                         Some(DevOp::FlashDecode) => attn_hd(d.i[6]),
                         Some(DevOp::FlashDecodeFp8) => {
-                            functions.fp8_attn && attn_hd(d.i[6])
+                            functions.fp8_attn
+                                && attn_hd(d.i[6])
                                 && d.t[6] != packet::dev::TENSOR_NONE16
                                 && d.t[7] != packet::dev::TENSOR_NONE16
                         }
@@ -537,12 +605,14 @@ pub(super) fn light_segments(
                 });
             if !attn
                 || (insts.iter().any(|&i| fp8_attention_tail(&g.insts[i]))
-                    && !insts.iter().any(|&i| matches!(op(i), Some(DevOp::FlashDecode | DevOp::FlashDecodeFp8))))
+                    && !insts.iter().any(|&i| {
+                        matches!(op(i), Some(DevOp::FlashDecode | DevOp::FlashDecodeFp8))
+                    }))
             {
                 return None;
             }
-            let split_fp8_attention = functions.fp8_attn
-                && insts.iter().any(|&i| fp8_attention_tail(&g.insts[i]));
+            let split_fp8_attention =
+                functions.fp8_attn && insts.iter().any(|&i| fp8_attention_tail(&g.insts[i]));
             let mut levels: Vec<(usize, usize)> = Vec::new();
             for &inst in &insts {
                 if fp8_attention_tail(&g.insts[inst]) {
@@ -557,7 +627,9 @@ pub(super) fn light_segments(
                 let joins = levels.last().is_some_and(|&(lo, n)| {
                     lo + n == inst
                         && !(functions.direct && n >= 4)
-                        && waits_of(inst).iter().all(|&w| !(lo..lo + n).contains(&(w as usize)))
+                        && waits_of(inst)
+                            .iter()
+                            .all(|&w| !(lo..lo + n).contains(&(w as usize)))
                 });
                 match levels.last_mut() {
                     Some((_, n)) if joins => *n += 1,
@@ -572,7 +644,10 @@ pub(super) fn light_segments(
 /// A prefill bucket's interpreter segments of at most three RmsNorm / Residual / SiLU Glu
 /// instructions (`plow_<arch>_light_pf`, one launch each in program order), skipping `library`
 /// segments.
-pub(super) fn prefill_light_segments(g: &DevProg, library: &[Option<usize>]) -> Vec<(usize, Vec<usize>)> {
+pub(super) fn prefill_light_segments(
+    g: &DevProg,
+    library: &[Option<usize>],
+) -> Vec<(usize, Vec<usize>)> {
     (0..g.gq_seg_ofs.len().saturating_sub(1))
         .filter(|&seg| library.get(seg).copied().flatten().is_none())
         .filter_map(|seg| {
@@ -712,8 +787,7 @@ pub(super) fn prefill_glu_quant_route(
 fn glu_output_unread(g: &DevProg, inst: usize) -> bool {
     let output = g.insts[inst].t[1];
     output != packet::dev::TENSOR_NONE16
-        && g
-            .insts
+        && g.insts
             .iter()
             .enumerate()
             .all(|(i, d)| i == inst || !d.t.contains(&output))
@@ -738,7 +812,9 @@ pub(super) fn prefill_norm_rms_segments(g: &DevProg) -> Vec<(usize, Vec<usize>)>
             let none = packet::dev::TENSOR_NONE16;
             let matches = nr.op == DevOp::NormResidual as u16
                 && rn.op == DevOp::RmsNorm as u16
-                && entries.iter().all(|e| e.inst as usize == n || e.inst as usize == n + 1)
+                && entries
+                    .iter()
+                    .all(|e| e.inst as usize == n || e.inst as usize == n + 1)
                 && complete(n, nr.blocks)
                 && complete(n + 1, rn.blocks)
                 && rn.i[..3] == [nr.i[0], nr.i[1], 0]
@@ -801,9 +877,15 @@ pub(super) fn qkv_fusions(
     let t = |inst: usize, slot: usize| g.insts[inst].t[slot] as usize;
     let mut out = Vec::new();
     for (seg, window) in segments.windows(3).enumerate() {
-        let [Some(q), Some(k), Some(v)] = window else { continue };
-        let Some((_, levels)) = light.iter().find(|(s, _)| *s == seg + 3) else { continue };
-        let Some(&(lo, n)) = levels.first() else { continue };
+        let [Some(q), Some(k), Some(v)] = window else {
+            continue;
+        };
+        let Some((_, levels)) = light.iter().find(|(s, _)| *s == seg + 3) else {
+            continue;
+        };
+        let Some(&(lo, n)) = levels.first() else {
+            continue;
+        };
         let [iq, ik, iv] = [q.instruction, k.instruction, v.instruction];
         let weight = |i: usize| devp[t(i, 2)].base;
         let input = |i: usize| devp[t(i, 1)].base;
@@ -826,7 +908,9 @@ pub(super) fn qkv_fusions(
                     && g.insts[i].i[7] == 0
             })
         };
-        let (Some(hq), Some(hk), Some(hv)) = (hnr(iq), hnr(ik), hnr(iv)) else { continue };
+        let (Some(hq), Some(hk), Some(hv)) = (hnr(iq), hnr(ik), hnr(iv)) else {
+            continue;
+        };
         // Until the next write of the producer's output (activations are reused per layer).
         let sole_reader = |producer: usize, reader: usize| {
             let out = t(producer, 0);
@@ -871,7 +955,9 @@ fn streamed_flash(d: &DevInst64) -> bool {
 /// reads exactly their outputs and is the only reader of the roped q. Returns the flash
 /// instruction and the q, k, v instructions.
 fn folded_hnr(g: &DevProg, levels: &[(usize, usize)]) -> Option<(usize, [u32; 4])> {
-    let [(lo, 3), (fi, 1)] = levels[..] else { return None };
+    let [(lo, 3), (fi, 1)] = levels[..] else {
+        return None;
+    };
     let f = &g.insts[fi];
     let none = packet::dev::TENSOR_NONE16;
     if !streamed_flash(f) || f.t[6] != none {
@@ -900,7 +986,11 @@ fn folded_hnr(g: &DevProg, levels: &[(usize, usize)]) -> Option<(usize, [u32; 4]
     let (q, k, v) = (q?, k?, v?);
     let [dq, dk, dv] = [&g.insts[q], &g.insts[k], &g.insts[v]];
     let kv_ok = |d: &DevInst64| {
-        d.i[1] == f.i[2] && d.i[6] == f.i[0] && d.fj[1] == f.i[3] && d.fj[2] == u32::MAX && d.t[5] == dq.t[5]
+        d.i[1] == f.i[2]
+            && d.i[6] == f.i[0]
+            && d.fj[1] == f.i[3]
+            && d.fj[2] == u32::MAX
+            && d.t[5] == dq.t[5]
     };
     let q_out = dq.t[0];
     // Nothing but the flash reads the roped q before it is next written.
@@ -937,9 +1027,14 @@ pub(super) fn add_light_routes(
     devp: &[DeviceMem],
 ) {
     if functions.fp8_attn {
-        let attention_segments = light.iter().filter(|(_, levels)| {
-            levels.iter().any(|&(inst, _)| g.insts[inst].op == DevOp::FlashDecodeFp8 as u16)
-        }).count();
+        let attention_segments = light
+            .iter()
+            .filter(|(_, levels)| {
+                levels
+                    .iter()
+                    .any(|&(inst, _)| g.insts[inst].op == DevOp::FlashDecodeFp8 as u16)
+            })
+            .count();
         tracing::info!(attention_segments, "FP8 attention light routes prepared");
     }
     for fold in folds {
@@ -956,7 +1051,10 @@ pub(super) fn add_light_routes(
     for (seg, levels) in light {
         if let (Some(function), [(n, 1), (q, 1)]) = (functions.norm_quant, levels.as_slice()) {
             if g.insts[*n].op == DevOp::NormResidualNorm as u16 {
-                let mut span = LightSpan { count: 2, ..Default::default() };
+                let mut span = LightSpan {
+                    count: 2,
+                    ..Default::default()
+                };
                 span.op[0] = LightOp::resolve(&g.insts[*n], devp);
                 span.op[1] = LightOp::resolve(&g.insts[*q], devp);
                 if routes.len() <= *seg {
@@ -980,26 +1078,31 @@ pub(super) fn add_light_routes(
                 continue;
             }
         }
-        let fused = fusions.iter().find(|f| f.segment + 3 == *seg).zip(scratch).map(|(f, s)| {
-            LightX {
+        let fused = fusions
+            .iter()
+            .find(|f| f.segment + 3 == *seg)
+            .zip(scratch)
+            .map(|(f, s)| LightX {
                 base: s.base,
                 ..f.xs
-            }
-        });
+            });
         if routes.len() <= *seg {
             routes.resize_with(seg + 1, || None);
         }
         let flash = |inst: usize, xs: LightX, hnr: [u32; 4]| {
-            functions.flash.filter(|_| streamed_flash(&g.insts[inst])).map(|(function, smem)| LightLaunch {
-                function,
-                xs,
-                kind: LightKind::Flash(hnr),
-                instruction: inst as u32,
-                blocks: u32::from(g.insts[inst].blocks),
-                block: FLASH_BLOCK,
-                smem,
-                direct: None,
-            })
+            functions
+                .flash
+                .filter(|_| streamed_flash(&g.insts[inst]))
+                .map(|(function, smem)| LightLaunch {
+                    function,
+                    xs,
+                    kind: LightKind::Flash(hnr),
+                    instruction: inst as u32,
+                    blocks: u32::from(g.insts[inst].blocks),
+                    block: FLASH_BLOCK,
+                    smem,
+                    direct: None,
+                })
         };
         let folded = folded_hnr(g, levels)
             .and_then(|(inst, hnr)| flash(inst, fused.unwrap_or_default(), hnr));
@@ -1018,10 +1121,15 @@ pub(super) fn add_light_routes(
                         return launch;
                     }
                     let direct = functions.direct.then(|| {
-                        let mut span = LightSpan { count: n as u32, ..Default::default() };
+                        let mut span = LightSpan {
+                            count: n as u32,
+                            ..Default::default()
+                        };
                         for (j, i) in (inst..inst + n.max(1)).enumerate() {
                             span.op[j] = LightOp::resolve(&g.insts[i], devp);
-                            if let Some(k) = (0..3).find(|&k| xs.base != 0 && xs.inst[k] == i as u32) {
+                            if let Some(k) =
+                                (0..3).find(|&k| xs.base != 0 && xs.inst[k] == i as u32)
+                            {
                                 span.op[j].t[1] = xs.base + u64::from(xs.col[k]) * 2;
                                 span.x_row[j] = xs.row;
                             }
@@ -1041,9 +1149,10 @@ pub(super) fn add_light_routes(
                         },
                         _ => LightLaunch {
                             function: match (functions.tail, DevOp::from_u16(g.insts[inst].op)) {
-                                (Some(tail), Some(DevOp::SoftCap | DevOp::Argmax | DevOp::ArgmaxFin)) => {
-                                    tail
-                                }
+                                (
+                                    Some(tail),
+                                    Some(DevOp::SoftCap | DevOp::Argmax | DevOp::ArgmaxFin),
+                                ) => tail,
                                 _ => functions.single,
                             },
                             xs,
@@ -1084,12 +1193,30 @@ pub(super) fn add_light_routes(
             _ => launches,
         };
         if functions.fp8_attn && light.first().is_some_and(|(first, _)| first == seg) {
-            let spans: Vec<_> = launches.iter().filter_map(|l| l.direct.as_ref()).map(|s| {
-                (s.count, s.fused, s.op.iter().map(|o| (o.d.op, o.d.blocks, o.d.i[0], o.d.i[1])).collect::<Vec<_>>())
-            }).collect();
-            tracing::info!(segment = seg, ?levels, ?spans, "FP8 attention first light launch spans");
+            let spans: Vec<_> = launches
+                .iter()
+                .filter_map(|l| l.direct.as_ref())
+                .map(|s| {
+                    (
+                        s.count,
+                        s.fused,
+                        s.op.iter()
+                            .map(|o| (o.d.op, o.d.blocks, o.d.i[0], o.d.i[1]))
+                            .collect::<Vec<_>>(),
+                    )
+                })
+                .collect();
+            tracing::info!(
+                segment = seg,
+                ?levels,
+                ?spans,
+                "FP8 attention first light launch spans"
+            );
         }
-        let launches = launches.into_iter().map(|l| sliding(functions, l)).collect();
+        let launches = launches
+            .into_iter()
+            .map(|l| sliding(functions, l))
+            .collect();
         routes[*seg] = Some(LibraryRoute::Light(LightRoute {
             be: Arc::clone(be),
             kernarg,
@@ -1104,14 +1231,24 @@ const ATTN_S_SMEM: u32 = 16 << 10;
 
 fn fp8_flash256_blocks(span: &LightSpan, original_blocks: u32) -> Option<u32> {
     let d = &span.op[0].d;
-    if span.count != 1 || span.fused != 0 || d.op != DevOp::FlashDecodeFp8 as u16
-        || d.i[6] != 256 || d.i[0] != 128 || d.i[1] != 16 || d.i[2] != 8
-        || d.i[5] != 1 || d.blocks == 0 || original_blocks == 0
+    if span.count != 1
+        || span.fused != 0
+        || d.op != DevOp::FlashDecodeFp8 as u16
+        || d.i[6] != 256
+        || d.i[0] != 128
+        || d.i[1] != 16
+        || d.i[2] != 8
+        || d.i[5] != 1
+        || d.blocks == 0
+        || original_blocks == 0
     {
         return None;
     }
     let work = d.i[0] * (d.i[1] / 2) * d.i[5];
-    Some(work.min(original_blocks.saturating_mul(8)).min(u32::from(u16::MAX)))
+    Some(
+        work.min(original_blocks.saturating_mul(8))
+            .min(u32::from(u16::MAX)),
+    )
 }
 
 /// An hd256 attention launch on `light_attn_s`, at twice the blocks (two per SM).
@@ -1122,19 +1259,31 @@ fn sliding(functions: &LightFunctions, launch: LightLaunch) -> LightLaunch {
         if let Some(blocks) = fp8_flash256_blocks(span, launch.blocks) {
             let mut span = **span;
             span.op[0].d.blocks = blocks as u16;
-            return LightLaunch { function, blocks, smem, direct: Some(Box::new(span)), ..launch };
+            return LightLaunch {
+                function,
+                blocks,
+                smem,
+                direct: Some(Box::new(span)),
+                ..launch
+            };
         }
     }
-    let (Some(function), LightKind::Attn(_), Some(span)) = (functions.attn_s, launch.kind, launch.direct.as_ref())
+    let (Some(function), LightKind::Attn(_), Some(span)) =
+        (functions.attn_s, launch.kind, launch.direct.as_ref())
     else {
         return launch;
     };
     let ops = &span.op[..span.count as usize];
     let hd256 = ops.iter().all(|o| {
         let d = &o.d;
-        d.op == DevOp::HeadNormRope as u16 && d.i[2] == 256 || d.op == DevOp::FlashDecode as u16 && d.i[6] == 256
+        d.op == DevOp::HeadNormRope as u16 && d.i[2] == 256
+            || d.op == DevOp::FlashDecode as u16 && d.i[6] == 256
     });
-    let Some(blocks) = launch.blocks.checked_mul(2).filter(|&b| b <= u32::from(u16::MAX)) else {
+    let Some(blocks) = launch
+        .blocks
+        .checked_mul(2)
+        .filter(|&b| b <= u32::from(u16::MAX))
+    else {
         return launch;
     };
     if !hd256 || ops.iter().any(|o| o.d.blocks == 0) {
@@ -1154,12 +1303,19 @@ fn sliding(functions: &LightFunctions, launch: LightLaunch) -> LightLaunch {
 }
 
 fn clone_launch(l: &LightLaunch) -> LightLaunch {
-    LightLaunch { direct: l.direct.clone(), ..*l }
+    LightLaunch {
+        direct: l.direct.clone(),
+        ..*l
+    }
 }
 
 /// An in-place SoftCap on the logits followed by the batched Argmax over them, as one
 /// `light_capmax` launch of `rows x G` blocks (G chunks per row, at most the part stride).
-fn capmax(functions: &LightFunctions, cap: &LightLaunch, amax: &LightLaunch) -> Option<LightLaunch> {
+fn capmax(
+    functions: &LightFunctions,
+    cap: &LightLaunch,
+    amax: &LightLaunch,
+) -> Option<LightLaunch> {
     let function = functions.capmax?;
     let (c, a) = (&cap.direct.as_ref()?.op[0], &amax.direct.as_ref()?.op[0]);
     let (n, rows, parts) = (a.d.i[0], a.d.i[1], u32::from(a.d.blocks));
@@ -1174,7 +1330,10 @@ fn capmax(functions: &LightFunctions, cap: &LightLaunch, amax: &LightLaunch) -> 
         return None;
     }
     let chunks = (512 / rows).clamp(1, parts);
-    let mut span = LightSpan { count: 2, ..Default::default() };
+    let mut span = LightSpan {
+        count: 2,
+        ..Default::default()
+    };
     span.op[0] = *c;
     span.op[1] = *a;
     Some(LightLaunch {
@@ -1242,7 +1401,9 @@ pub(super) fn merge_routes(
         return Ok(moe);
     }
     if projections.len() != moe.len() {
-        return Err(RuntimeError::Rejected("projection and MoE decode segments disagree".into()));
+        return Err(RuntimeError::Rejected(
+            "projection and MoE decode segments disagree".into(),
+        ));
     }
     projections
         .into_iter()
@@ -1256,7 +1417,9 @@ pub(super) fn merge_routes(
         .collect()
 }
 
-pub(super) fn library_routes(routes: Vec<Option<CublasLtDecodeRoute>>) -> Vec<Option<LibraryRoute>> {
+pub(super) fn library_routes(
+    routes: Vec<Option<CublasLtDecodeRoute>>,
+) -> Vec<Option<LibraryRoute>> {
     routes
         .into_iter()
         .map(|route| route.map(LibraryRoute::Projection))
@@ -1287,7 +1450,6 @@ impl ProjectionPlan {
     }
 }
 
-
 /// `[output, input, weight]` of a routed projection, checked aligned and nonaliasing.
 fn operands(segment: &DecodeSegment, insts: &[DevInst64], devp: &[DeviceMem]) -> Result<[u64; 3]> {
     let d = &insts[segment.instruction];
@@ -1304,8 +1466,8 @@ fn operands(segment: &DecodeSegment, insts: &[DevInst64], devp: &[DeviceMem]) ->
     let output_end = end(output, segment.output_bytes)?;
     let input_end = end(input, segment.input_bytes)?;
     let weight_end = end(weight, segment.weight_bytes)?;
-    let overlaps_output = (output < input_end && input < output_end)
-        || (output < weight_end && weight < output_end);
+    let overlaps_output =
+        (output < input_end && input < output_end) || (output < weight_end && weight < output_end);
     if [input, weight, output].iter().any(|p| p % 16 != 0) || overlaps_output {
         return Err(RuntimeError::Rejected(
             "cuBLASLt decode requires aligned, nonaliasing tensors".into(),
@@ -1464,7 +1626,9 @@ pub(super) fn prepare_routes(
             ) if next.folded() => match route.plan.as_ref() {
                 ProjectionPlan::Lt(_) if !pin => Ok(Some(None)),
                 ProjectionPlan::Lt(plan) => Ok(Some(Some(plan.as_ref()))),
-                _ => Err(RuntimeError::Rejected("decode projection backend changed".into())),
+                _ => Err(RuntimeError::Rejected(
+                    "decode projection backend changed".into(),
+                )),
             },
             _ => Ok(None),
         }
@@ -1485,30 +1649,54 @@ pub(super) fn prepare_routes(
         let tail = head_tail(&segment, backend, head);
         let fold = folds.iter().find(|f| f.head_segment == index);
         if fold.is_some() && tail.is_none() {
-            return Err(RuntimeError::Rejected("folded argmax without its head kernel".into()));
+            return Err(RuntimeError::Rejected(
+                "folded argmax without its head kernel".into(),
+            ));
         }
         let key = (
             segment.m,
-            if tail.is_some() { segment.n & !15 } else { segment.n },
+            if tail.is_some() {
+                segment.n & !15
+            } else {
+                segment.n
+            },
             segment.k,
         );
         let ops = operands(&segment, insts, devp)?;
         let [output, input, weight] = ops;
         let op = &insts[segment.instruction];
-        if matches!(DevOp::from_u16(op.op), Some(DevOp::GemmFp8 | DevOp::GemmMedFp8 | DevOp::GemmSmallFp8)) {
+        if matches!(
+            DevOp::from_u16(op.op),
+            Some(DevOp::GemmFp8 | DevOp::GemmMedFp8 | DevOp::GemmSmallFp8)
+        ) {
             let ProjectionBackend::Lt(lt) = backend else {
-                return Err(RuntimeError::Rejected("FP8 projection requires cuBLASLt".into()));
+                return Err(RuntimeError::Rejected(
+                    "FP8 projection requires cuBLASLt".into(),
+                ));
             };
             if tail.is_some() || fold.is_some() {
-                return Err(RuntimeError::Rejected("FP8 projection cannot fold an output head".into()));
+                return Err(RuntimeError::Rejected(
+                    "FP8 projection cannot fold an output head".into(),
+                ));
             }
             let mut scales = [0; 2];
-            for (index, (handle, elements)) in [(op.t[3], segment.m), (op.t[4], segment.n)].into_iter().enumerate() {
-                let mem = devp.get(handle as usize).ok_or_else(|| RuntimeError::Rejected("missing FP8 scale vector".into()))?;
+            for (index, (handle, elements)) in [(op.t[3], segment.m), (op.t[4], segment.n)]
+                .into_iter()
+                .enumerate()
+            {
+                let mem = devp
+                    .get(handle as usize)
+                    .ok_or_else(|| RuntimeError::Rejected("missing FP8 scale vector".into()))?;
                 let bytes = u64::from(elements) * 4;
-                let end = mem.base.checked_add(bytes).ok_or_else(|| RuntimeError::Rejected("FP8 scale range overflow".into()))?;
-                if mem.base == 0 || mem.base % 16 != 0 || mem.len < bytes
-                    || (mem.base < output + segment.output_bytes && output < end) {
+                let end = mem
+                    .base
+                    .checked_add(bytes)
+                    .ok_or_else(|| RuntimeError::Rejected("FP8 scale range overflow".into()))?;
+                if mem.base == 0
+                    || mem.base % 16 != 0
+                    || mem.len < bytes
+                    || (mem.base < output + segment.output_bytes && output < end)
+                {
                     return Err(RuntimeError::Rejected("invalid FP8 scale vector".into()));
                 }
                 scales[index] = mem.base;
@@ -1545,7 +1733,11 @@ pub(super) fn prepare_routes(
             fp8_plans += 1;
             insts[segment.instruction].op = DevOp::Nop as u16;
             routes.push(Some(CublasLtDecodeRoute {
-                plan: Arc::new(plan), input, weight, output, tail: None,
+                plan: Arc::new(plan),
+                input,
+                weight,
+                output,
+                tail: None,
             }));
             index += 1;
             continue;
@@ -1560,16 +1752,34 @@ pub(super) fn prepare_routes(
                 .map(|routes| match routes.get(index) {
                     Some(Some(LibraryRoute::Projection(route))) => match route.plan.as_ref() {
                         ProjectionPlan::Lt(p) => Ok(p.as_ref()),
-                        _ => Err(RuntimeError::Rejected("decode projection backend changed".into())),
+                        _ => Err(RuntimeError::Rejected(
+                            "decode projection backend changed".into(),
+                        )),
                     },
-                    _ => Err(RuntimeError::Rejected("cuBLASLt rung template route missing".into())),
+                    _ => Err(RuntimeError::Rejected(
+                        "cuBLASLt rung template route missing".into(),
+                    )),
                 })
                 .transpose()?;
             if u64::from(segment.m) * u64::from(fusion.n_total) * 2 > scratch.len {
-                return Err(RuntimeError::Rejected("fused q|k|v scratch too small".into()));
+                return Err(RuntimeError::Rejected(
+                    "fused q|k|v scratch too small".into(),
+                ));
             }
-            let ns: Vec<u32> = segments[index..index + 3].iter().flatten().map(|s| s.n).collect();
-            let plan = lt.plan(segment.m, fusion.n_total, segment.k, weight, template.filter(|_| pin), rows, &ns)?;
+            let ns: Vec<u32> = segments[index..index + 3]
+                .iter()
+                .flatten()
+                .map(|s| s.n)
+                .collect();
+            let plan = lt.plan(
+                segment.m,
+                fusion.n_total,
+                segment.k,
+                weight,
+                template.filter(|_| pin),
+                rows,
+                &ns,
+            )?;
             for next in segments[index + 1..index + 3].iter().flatten() {
                 insts[next.instruction].op = DevOp::Nop as u16;
             }
@@ -1608,9 +1818,17 @@ pub(super) fn prepare_routes(
             if let Some((next, (w0, o0, p))) = paired {
                 let plan = match pair_plans.entry((key, p.w_stride, p.c_stride)) {
                     std::collections::hash_map::Entry::Occupied(e) => Arc::clone(e.get()),
-                    std::collections::hash_map::Entry::Vacant(e) => Arc::clone(e.insert(Arc::new(
-                        ProjectionPlan::Lt(lt.pair_plan(key.0, key.1, key.2, w0, p, pair_template, rows)?),
-                    ))),
+                    std::collections::hash_map::Entry::Vacant(e) => {
+                        Arc::clone(e.insert(Arc::new(ProjectionPlan::Lt(lt.pair_plan(
+                            key.0,
+                            key.1,
+                            key.2,
+                            w0,
+                            p,
+                            pair_template,
+                            rows,
+                        )?))))
+                    }
                 };
                 insts[next.instruction].op = DevOp::Nop as u16;
                 routes.push(Some(CublasLtDecodeRoute {
@@ -1653,7 +1871,15 @@ pub(super) fn prepare_routes(
                                 )),
                             })
                             .transpose()?;
-                        ProjectionPlan::Lt(lt.plan(key.0, key.1, key.2, weight, template.filter(|_| pin), rows, &[segment.n])?)
+                        ProjectionPlan::Lt(lt.plan(
+                            key.0,
+                            key.1,
+                            key.2,
+                            weight,
+                            template.filter(|_| pin),
+                            rows,
+                            &[segment.n],
+                        )?)
                     }
                     ProjectionBackend::Native(native) => {
                         let template = template
@@ -1790,8 +2016,13 @@ impl GpuEngine {
 
     /// Capture a partial widest-rung decode for tensor inspection. Later outputs are stale.
     pub fn capture_debug_decode_prefix(&mut self, segments: usize) -> Result<()> {
-        let total = self.cublaslt_decode.len().max(self.decode_packet_roles.len());
-        if segments == 0 || segments > total || !self.cublaslt_decode_capture
+        let total = self
+            .cublaslt_decode
+            .len()
+            .max(self.decode_packet_roles.len());
+        if segments == 0
+            || segments > total
+            || !self.cublaslt_decode_capture
             || self.decode_contexts.is_some()
         {
             return Err(RuntimeError::Rejected(
@@ -1799,9 +2030,9 @@ impl GpuEngine {
             ));
         }
         self.be.stream_synchronize(&self.stream)?;
-        let graph = self.be.graph_capture(&self.stream, || {
-            self.enqueue_decode_segments(segments)
-        })?;
+        let graph = self
+            .be
+            .graph_capture(&self.stream, || self.enqueue_decode_segments(segments))?;
         if let Some(old) = self.cublaslt_decode_graph.replace(graph) {
             self.be.graph_destroy(old);
         }
@@ -1810,7 +2041,10 @@ impl GpuEngine {
 
     fn enqueue_decode_chain(&self) -> Result<()> {
         self.enqueue_decode_segments(
-            self.cublaslt_decode.len().max(self.decode_packet_roles.len()).max(1),
+            self.cublaslt_decode
+                .len()
+                .max(self.decode_packet_roles.len())
+                .max(1),
         )
     }
 
@@ -1943,19 +2177,28 @@ fn projection_segments(
         }
         let instruction = entries[0].inst as usize;
         let op = program.insts.get(instruction).ok_or_else(fail)?;
-        let fp8 = matches!(DevOp::from_u16(op.op), Some(DevOp::GemmFp8 | DevOp::GemmMedFp8 | DevOp::GemmSmallFp8));
+        let fp8 = matches!(
+            DevOp::from_u16(op.op),
+            Some(DevOp::GemmFp8 | DevOp::GemmMedFp8 | DevOp::GemmSmallFp8)
+        );
         let valid_op = match phase {
-            ProjectionPhase::Decode => op.op == DevOp::Gemv as u16
-                || (fp8 && roles[segment] == plow_asset::segment_roles::CUBLASLT),
+            ProjectionPhase::Decode => {
+                op.op == DevOp::Gemv as u16
+                    || (fp8 && roles[segment] == plow_asset::segment_roles::CUBLASLT)
+            }
             ProjectionPhase::Prefill(profile) => {
                 if fp8 {
-                    plow_asset::segment_roles::cublaslt_prefill_fp8(profile, op.i[0], op.i[1], op.i[2])
-                } else { matches!(
-                    DevOp::from_u16(op.op),
-                    Some(DevOp::Gemm | DevOp::GemmMed | DevOp::GemmSmall)
-                ) && plow_asset::segment_roles::cublaslt_prefill_bf16(
-                    profile, op.i[0], op.i[1], op.i[2],
-                ) }
+                    plow_asset::segment_roles::cublaslt_prefill_fp8(
+                        profile, op.i[0], op.i[1], op.i[2],
+                    )
+                } else {
+                    matches!(
+                        DevOp::from_u16(op.op),
+                        Some(DevOp::Gemm | DevOp::GemmMed | DevOp::GemmSmall)
+                    ) && plow_asset::segment_roles::cublaslt_prefill_bf16(
+                        profile, op.i[0], op.i[1], op.i[2],
+                    )
+                }
             }
         };
         let valid_immediates = match phase {
@@ -1963,7 +2206,9 @@ fn projection_segments(
             ProjectionPhase::Prefill(_) => op.i[3..6].iter().all(|&value| value == 0),
         };
         if !valid_op
-            || op.t[if fp8 { 5 } else { 3 }..].iter().any(|&t| t != packet::dev::TENSOR_NONE16)
+            || op.t[if fp8 { 5 } else { 3 }..]
+                .iter()
+                .any(|&t| t != packet::dev::TENSOR_NONE16)
             || op.i[0] != rows
             || op.i[1] == 0
             || op.i[2] == 0
@@ -1988,11 +2233,20 @@ fn projection_segments(
         let input_bytes = bytes(m, k)? / if fp8 { 2 } else { 1 };
         let weight_bytes = bytes(n, k)? / if fp8 { 2 } else { 1 };
         if fp8 {
-            if op.t[..5].iter().copied().collect::<std::collections::BTreeSet<_>>().len() != 5 {
+            if op.t[..5]
+                .iter()
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len()
+                != 5
+            {
                 return Err(fail());
             }
             for (handle, required) in [(op.t[3], u64::from(m) * 4), (op.t[4], u64::from(n) * 4)] {
-                if tensors.get(handle as usize).is_none_or(|tensor| tensor.bytes < required) {
+                if tensors
+                    .get(handle as usize)
+                    .is_none_or(|tensor| tensor.bytes < required)
+                {
                     return Err(fail());
                 }
             }
@@ -2033,7 +2287,12 @@ mod tests {
     #[test]
     fn merge_routes_keeps_either_side_when_the_other_is_absent() {
         assert_eq!(merge_routes(vec![None, None], Vec::new()).unwrap().len(), 2);
-        assert_eq!(merge_routes(Vec::new(), vec![None, None, None]).unwrap().len(), 3);
+        assert_eq!(
+            merge_routes(Vec::new(), vec![None, None, None])
+                .unwrap()
+                .len(),
+            3
+        );
         assert!(merge_routes(vec![None], vec![None, None]).is_err());
     }
 
@@ -2054,12 +2313,24 @@ mod tests {
         quant.t.fill(none);
         quant.t[..3].copy_from_slice(&[3, 0, 4]);
         let entries: Vec<_> = (0..4)
-            .flat_map(|slice| [1, 2].map(move |inst| StreamEnt { inst, slice, ..Default::default() }))
+            .flat_map(|slice| {
+                [1, 2].map(move |inst| StreamEnt {
+                    inst,
+                    slice,
+                    ..Default::default()
+                })
+            })
             .collect();
         assert_eq!(norm_quant_pair(&g, &entries), Some((1, 2)));
         let grouped: Vec<_> = [1, 2]
             .into_iter()
-            .flat_map(|inst| (0..4).map(move |slice| StreamEnt { inst, slice, ..Default::default() }))
+            .flat_map(|inst| {
+                (0..4).map(move |slice| StreamEnt {
+                    inst,
+                    slice,
+                    ..Default::default()
+                })
+            })
             .collect();
         assert_eq!(norm_quant_pair(&g, &grouped), Some((1, 2)));
         let mut wrong_grouped = grouped.clone();
@@ -2087,7 +2358,10 @@ mod tests {
 
     #[test]
     fn fp8_attention_tail_rejects_fused_glu_and_packed_merge() {
-        let mut d = DevInst64 { op: DevOp::QuantFp8 as u16, ..Default::default() };
+        let mut d = DevInst64 {
+            op: DevOp::QuantFp8 as u16,
+            ..Default::default()
+        };
         d.t.fill(packet::dev::TENSOR_NONE16);
         assert!(fp8_attention_tail(&d));
         d.t[3] = 0;
@@ -2107,7 +2381,10 @@ mod tests {
 
     #[test]
     fn fp8_flash256_grid_stays_within_work_and_route() {
-        let mut span = LightSpan { count: 1, ..Default::default() };
+        let mut span = LightSpan {
+            count: 1,
+            ..Default::default()
+        };
         let d = &mut span.op[0].d;
         d.op = DevOp::FlashDecodeFp8 as u16;
         d.blocks = 132;
@@ -2221,19 +2498,31 @@ mod tests {
         assert_eq!(prefill_norm_rms_segments(&make()), vec![(1, vec![1, 2])]);
         let mut bad = make();
         bad.insts[2].t[1] = 7;
-        assert!(prefill_norm_rms_segments(&bad).is_empty(), "the RmsNorm reads another tensor");
+        assert!(
+            prefill_norm_rms_segments(&bad).is_empty(),
+            "the RmsNorm reads another tensor"
+        );
         let mut bad = make();
         bad.insts[2].i[2] = 64;
-        assert!(prefill_norm_rms_segments(&bad).is_empty(), "output row offset");
+        assert!(
+            prefill_norm_rms_segments(&bad).is_empty(),
+            "output row offset"
+        );
         let mut bad = make();
         bad.insts[2].op = DevOp::QuantFp8 as u16;
         assert!(prefill_norm_rms_segments(&bad).is_empty());
         let mut bad = make();
         bad.insts[2].blocks = 2;
-        assert!(prefill_norm_rms_segments(&bad).is_empty(), "a slice runs elsewhere");
+        assert!(
+            prefill_norm_rms_segments(&bad).is_empty(),
+            "a slice runs elsewhere"
+        );
         let mut bad = make();
         bad.gq_seg_ofs = vec![0, 1, 2, 3];
-        assert!(prefill_norm_rms_segments(&bad).is_empty(), "the pair spans two segments");
+        assert!(
+            prefill_norm_rms_segments(&bad).is_empty(),
+            "the pair spans two segments"
+        );
     }
 
     fn roles() -> [u8; 3] {
@@ -2333,7 +2622,8 @@ mod tests {
     fn accepts_only_measured_sm90_bf16_prefill_cells() {
         use plow_asset::segment_roles::{
             CUBLASLT_PREFILL_GEMMA4_26B_SHAPES, CUBLASLT_PREFILL_GEMMA4_31B_SHAPES,
-            CUBLASLT_PREFILL_GEMMA4_SHAPES, CUBLASLT_PREFILL_ROWS, CUBLASLT_PREFILL_SPEECH_ROWS, CUBLASLT_PREFILL_WIDE_ROWS,
+            CUBLASLT_PREFILL_GEMMA4_SHAPES, CUBLASLT_PREFILL_ROWS, CUBLASLT_PREFILL_SPEECH_ROWS,
+            CUBLASLT_PREFILL_WIDE_ROWS,
         };
         for &rows in CUBLASLT_PREFILL_ROWS
             .iter()
@@ -2436,8 +2726,15 @@ mod tests {
             op.t[3..5].copy_from_slice(&[3, 4]);
             tensors[1].bytes /= 2;
             tensors[2].bytes /= 2;
-            for (name, bytes) in [("input.scale", u64::from(rows) * 4), ("weight.scale", 3840 * 4)] {
-                tensors.push(DevTensor { name: name.into(), bytes, init: None });
+            for (name, bytes) in [
+                ("input.scale", u64::from(rows) * 4),
+                ("weight.scale", 3840 * 4),
+            ] {
+                tensors.push(DevTensor {
+                    name: name.into(),
+                    bytes,
+                    init: None,
+                });
             }
             let route = decode_segments(&program, &tensors, &roles()).unwrap()[1].unwrap();
             assert_eq!(route.input_bytes, u64::from(rows) * 15360);

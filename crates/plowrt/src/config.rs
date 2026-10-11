@@ -56,14 +56,32 @@ pub struct AsrPacket {
 #[test]
 fn asr_packet_specs_parse() {
     let p: AsrPacket = "nemo=/m/nemo.pkt,tokenizer=/m/t.gguf".parse().unwrap();
-    assert_eq!((p.name.as_str(), p.packet.to_str(), p.tokenizer.to_str(), p.backend.as_str()),
-        ("nemo", Some("/m/nemo.pkt"), Some("/m/t.gguf"), "cuda"));
+    assert_eq!(
+        (
+            p.name.as_str(),
+            p.packet.to_str(),
+            p.tokenizer.to_str(),
+            p.backend.as_str()
+        ),
+        ("nemo", Some("/m/nemo.pkt"), Some("/m/t.gguf"), "cuda")
+    );
     let p: AsrPacket = "q=/a/model.pkt,backend=cpu".parse().unwrap();
-    assert_eq!((p.tokenizer.to_str(), p.backend.as_str()), (Some("/a/checkpoint"), "cpu"));
+    assert_eq!(
+        (p.tokenizer.to_str(), p.backend.as_str()),
+        (Some("/a/checkpoint"), "cpu")
+    );
     let p: AsrPacket = "q=/a/model.pkt,checkpoint=/hf/qwen3-asr".parse().unwrap();
     assert_eq!(p.tokenizer.to_str(), Some("/hf/qwen3-asr"));
-    for bad in ["", "nemo", "=/x.pkt", "n=", "n=/x.pkt,tok=/y", "n=/x.pkt,tokenizer=", "n=/x.pkt,checkpoint=",
-        "n=/x.pkt,tokenizer=/a,checkpoint=/b"] {
+    for bad in [
+        "",
+        "nemo",
+        "=/x.pkt",
+        "n=",
+        "n=/x.pkt,tok=/y",
+        "n=/x.pkt,tokenizer=",
+        "n=/x.pkt,checkpoint=",
+        "n=/x.pkt,tokenizer=/a,checkpoint=/b",
+    ] {
         assert!(bad.parse::<AsrPacket>().is_err(), "{bad}");
     }
 }
@@ -75,12 +93,18 @@ impl std::str::FromStr for AsrPacket {
             format!("--asr-packet {s:?}: expected NAME=PATH.pkt[,tokenizer=PATH|,checkpoint=PATH][,backend=NAME]")
         };
         let mut fields = s.trim().split(',');
-        let (name, packet) = fields.next().and_then(|f| f.split_once('=')).ok_or_else(usage)?;
+        let (name, packet) = fields
+            .next()
+            .and_then(|f| f.split_once('='))
+            .ok_or_else(usage)?;
         if name.is_empty() || packet.is_empty() {
             return Err(usage());
         }
         let packet = std::path::PathBuf::from(packet);
-        let mut tokenizer = packet.parent().unwrap_or(std::path::Path::new(".")).join("checkpoint");
+        let mut tokenizer = packet
+            .parent()
+            .unwrap_or(std::path::Path::new("."))
+            .join("checkpoint");
         let mut named = false;
         let mut backend = "cuda".to_owned();
         for field in fields {
@@ -93,7 +117,12 @@ impl std::str::FromStr for AsrPacket {
                 _ => return Err(usage()),
             }
         }
-        Ok(AsrPacket { name: name.to_owned(), packet, tokenizer, backend })
+        Ok(AsrPacket {
+            name: name.to_owned(),
+            packet,
+            tokenizer,
+            backend,
+        })
     }
 }
 
@@ -173,7 +202,12 @@ pub struct RuntimeConfig {
 
     /// Frames of right context a speech stream's FIRST audio waits for (later windows keep the
     /// codec's own lookahead): Veena needs one frame fewer before it speaks. Capped by the codec's.
-    #[arg(long = "tts-first-lookahead", env = "PLOW_TTS_FIRST_LOOKAHEAD", default_value_t = 1, global = true)]
+    #[arg(
+        long = "tts-first-lookahead",
+        env = "PLOW_TTS_FIRST_LOOKAHEAD",
+        default_value_t = 1,
+        global = true
+    )]
     pub tts_first_lookahead: usize,
 
     /// Real-time admission of codec-LM speech (`tts::realtime`): a request starts only while the
@@ -182,19 +216,35 @@ pub struct RuntimeConfig {
     pub tts_realtime: bool,
 
     /// Longest a speech request waits for real-time admission before 429 + `Retry-After`.
-    #[arg(long = "tts-admit-wait-ms", env = "PLOW_TTS_ADMIT_WAIT_MS", default_value_t = 6000, global = true)]
+    #[arg(
+        long = "tts-admit-wait-ms",
+        env = "PLOW_TTS_ADMIT_WAIT_MS",
+        default_value_t = 6000,
+        global = true
+    )]
     pub tts_admit_wait_ms: u64,
 
     /// Share of a streaming ASR session's time its partial transcripts may keep the model busy:
     /// after a partial that took `t`, the session's appends answer the previous partial's text
     /// until `t * (1 / duty - 1)` has passed. Idle, partials take far less than the 1 s append
     /// cadence and all run; loaded, they stop crowding out finals. 1 = every append transcribes.
-    #[arg(long = "asr-partial-duty", env = "PLOW_ASR_PARTIAL_DUTY", hide = true, default_value_t = 0.5, global = true)]
+    #[arg(
+        long = "asr-partial-duty",
+        env = "PLOW_ASR_PARTIAL_DUTY",
+        hide = true,
+        default_value_t = 0.5,
+        global = true
+    )]
     pub asr_partial_duty: f64,
 
     /// Total deadline (ms) for one transcription, from its admission to its answer: past it the
     /// work is cancelled and the client gets 504 (HTTP) or a terminal error (WebSocket). 0 = none.
-    #[arg(long = "asr-request-timeout-ms", env = "PLOW_ASR_REQUEST_TIMEOUT_MS", default_value_t = 120_000, global = true)]
+    #[arg(
+        long = "asr-request-timeout-ms",
+        env = "PLOW_ASR_REQUEST_TIMEOUT_MS",
+        default_value_t = 120_000,
+        global = true
+    )]
     pub asr_request_timeout_ms: u64,
 
     /// Lean receipt qualification at packet load (`certificate_checks`): `off` keeps the
@@ -205,7 +255,12 @@ pub struct RuntimeConfig {
     /// Upper bound (tokens) on an audio-LM request's context (`prompt`). The context is otherwise
     /// sized per request to what the window leaves after the template, the audio and the output
     /// reserve, trimmed from its oldest words. 0 = no bound beyond the window.
-    #[arg(long = "asr-context-max-tokens", env = "PLOW_ASR_CONTEXT_MAX_TOKENS", default_value_t = 0, global = true)]
+    #[arg(
+        long = "asr-context-max-tokens",
+        env = "PLOW_ASR_CONTEXT_MAX_TOKENS",
+        default_value_t = 0,
+        global = true
+    )]
     pub asr_context_max_tokens: usize,
 
     /// A `vad.frame.v1` VAD packet (`asr_silero_vad_compile`), run on the CPU: it serves
@@ -222,31 +277,59 @@ pub struct RuntimeConfig {
     /// Languages (as the model's packet names them, its `languages` string) a transcript may be
     /// detected in when the request names none: a final transcript detected in another is
     /// transcribed again in the first of these. A deployment's choice; comma-separated; unset = any.
-    #[arg(long = "asr-auto-languages", env = "PLOW_ASR_AUTO_LANGUAGES", value_delimiter = ',', global = true)]
+    #[arg(
+        long = "asr-auto-languages",
+        env = "PLOW_ASR_AUTO_LANGUAGES",
+        value_delimiter = ',',
+        global = true
+    )]
     pub asr_auto_languages: Vec<String>,
 
     /// API keys a request must present as `Authorization: Bearer <key>` or `x-api-key: <key>`.
     /// Repeatable; the environment form is comma-separated. `/health` and `/healthz` stay open.
     /// Unset = no authentication.
-    #[arg(long = "api-key", env = "PLOW_API_KEYS", value_delimiter = ',', hide_env_values = true, global = true)]
+    #[arg(
+        long = "api-key",
+        env = "PLOW_API_KEYS",
+        value_delimiter = ',',
+        hide_env_values = true,
+        global = true
+    )]
     pub api_keys: Vec<ApiKey>,
 
     /// Packet ASR models `plowrt serve` hosts beside its registry, each on its own cohort engine
     /// and loaded before the VRAM planner sizes the rest: `NAME=PATH.pkt[,tokenizer=PATH]
     /// [,backend=NAME]`. Repeatable; the environment form is `;`-separated.
-    #[arg(long = "asr-packet", env = "PLOW_ASR_PACKETS", value_delimiter = ';', global = true)]
+    #[arg(
+        long = "asr-packet",
+        env = "PLOW_ASR_PACKETS",
+        value_delimiter = ';',
+        global = true
+    )]
     pub asr_packets: Vec<AsrPacket>,
 
     /// Under `--co-sched deadline`, most streams one vocoder render launch takes (0 = the packet's
     /// largest capacity). A launch is one cooperative grid that holds the device to its end (1.4 s
     /// at 64 streams, 0.45 s at 16), so this bounds how long ASR finals and prompts wait behind
     /// speech.
-    #[arg(long = "tts-turn-batch", env = "PLOW_TTS_TURN_BATCH", hide = true, default_value_t = 16, global = true)]
+    #[arg(
+        long = "tts-turn-batch",
+        env = "PLOW_TTS_TURN_BATCH",
+        hide = true,
+        default_value_t = 16,
+        global = true
+    )]
     pub tts_turn_batch: usize,
 
     /// Under `--co-sched deadline`, a vocoder render yields the device between CFM steps to a
     /// waiter whose slack is more than this many ms below the render's own.
-    #[arg(long = "render-yield-margin-ms", env = "PLOW_RENDER_YIELD_MARGIN_MS", hide = true, default_value_t = 5, global = true)]
+    #[arg(
+        long = "render-yield-margin-ms",
+        env = "PLOW_RENDER_YIELD_MARGIN_MS",
+        hide = true,
+        default_value_t = 5,
+        global = true
+    )]
     pub render_yield_margin_ms: u64,
 
     /// Overload control (`serve::overload`): degrade, then shed new sessions with 429, on
@@ -255,12 +338,24 @@ pub struct RuntimeConfig {
     pub overload: Option<bool>,
 
     /// Overload control's sliding window of deadline outcomes, ms.
-    #[arg(long = "overload-window-ms", env = "PLOW_OVERLOAD_WINDOW_MS", hide = true, default_value_t = 5000, global = true)]
+    #[arg(
+        long = "overload-window-ms",
+        env = "PLOW_OVERLOAD_WINDOW_MS",
+        hide = true,
+        default_value_t = 5000,
+        global = true
+    )]
     pub overload_window_ms: u64,
 
     /// Missed-deadline fractions entering overload levels 1, 2 and 3 (comma-separated); a level
     /// is left below half its entry fraction.
-    #[arg(long = "overload-miss", env = "PLOW_OVERLOAD_MISS", hide = true, default_value = "0.05,0.1,0.2", global = true)]
+    #[arg(
+        long = "overload-miss",
+        env = "PLOW_OVERLOAD_MISS",
+        hide = true,
+        default_value = "0.05,0.1,0.2",
+        global = true
+    )]
     pub overload_miss: String,
 
     /// Streams of a guided speech model render windows (new tokens + left context) on the
@@ -270,50 +365,105 @@ pub struct RuntimeConfig {
     pub tts_stream_windows: bool,
 
     /// Most images one multimodal request may carry (more answers 400).
-    #[arg(long = "mm-max-images", env = "PLOW_MM_MAX_IMAGES", default_value_t = 8, global = true)]
+    #[arg(
+        long = "mm-max-images",
+        env = "PLOW_MM_MAX_IMAGES",
+        default_value_t = 8,
+        global = true
+    )]
     pub mm_max_images: usize,
 
     /// Most audio clips one multimodal request may carry (more answers 400).
-    #[arg(long = "mm-max-audio", env = "PLOW_MM_MAX_AUDIO", default_value_t = 4, global = true)]
+    #[arg(
+        long = "mm-max-audio",
+        env = "PLOW_MM_MAX_AUDIO",
+        default_value_t = 4,
+        global = true
+    )]
     pub mm_max_audio: usize,
 
     /// Largest decoded image accepted, in pixels (larger answers 400 before resizing).
-    #[arg(long = "mm-max-image-pixels", env = "PLOW_MM_MAX_IMAGE_PIXELS", default_value_t = 40_000_000, global = true)]
+    #[arg(
+        long = "mm-max-image-pixels",
+        env = "PLOW_MM_MAX_IMAGE_PIXELS",
+        default_value_t = 40_000_000,
+        global = true
+    )]
     pub mm_max_image_pixels: u64,
 
     /// Longest audio clip accepted, in seconds (also capped by the model's processor).
-    #[arg(long = "mm-max-audio-seconds", env = "PLOW_MM_MAX_AUDIO_SECONDS", default_value_t = 30, global = true)]
+    #[arg(
+        long = "mm-max-audio-seconds",
+        env = "PLOW_MM_MAX_AUDIO_SECONDS",
+        default_value_t = 30,
+        global = true
+    )]
     pub mm_max_audio_seconds: u64,
 
     /// How long a finished `X-Session-Id` request's KV (and an ASR session's audio and encoder
     /// windows) stays retained for the session's next request, in ms. 0 disables retention.
-    #[arg(long = "session-ttl-ms", env = "PLOW_SESSION_TTL_MS", default_value_t = 60_000, global = true)]
+    #[arg(
+        long = "session-ttl-ms",
+        env = "PLOW_SESSION_TTL_MS",
+        default_value_t = 60_000,
+        global = true
+    )]
     pub session_ttl_ms: u64,
 
     /// Retained session sequences per model; 0 = bounded by the slots (a live request that needs a
     /// slot always evicts the least recently used one).
-    #[arg(long = "session-max", env = "PLOW_SESSION_MAX", default_value_t = 0, global = true)]
+    #[arg(
+        long = "session-max",
+        env = "PLOW_SESSION_MAX",
+        default_value_t = 0,
+        global = true
+    )]
     pub session_max: usize,
 
     /// Slots a live request may be seated past because retained sessions hold the ones below:
     /// decode launches cover every slot up to the highest live one, so by default (0) retention
     /// never widens the launch the live requests already run; a request seated higher evicts the
     /// least recently used retained slot below it.
-    #[arg(long = "session-slack", env = "PLOW_SESSION_SLACK", default_value_t = 0, global = true)]
+    #[arg(
+        long = "session-slack",
+        env = "PLOW_SESSION_SLACK",
+        default_value_t = 0,
+        global = true
+    )]
     pub session_slack: usize,
 
     /// Voice turn budget, ms: end of user speech to first agent audio, when the client sends no
     /// `X-Turn-Budget-Ms` (`serve::turns`).
-    #[arg(long = "turn-budget-ms", env = "PLOW_TURN_BUDGET_MS", default_value_t = 1500, global = true)]
+    #[arg(
+        long = "turn-budget-ms",
+        env = "PLOW_TURN_BUDGET_MS",
+        default_value_t = 1500,
+        global = true
+    )]
     pub turn_budget_ms: u64,
 
     /// Stage targets, ms, for `Server-Timing` slack and `plowrt_deadline_slack_seconds`: ASR final
     /// transcript, LLM first token, TTS first audio, each from its own request's arrival.
-    #[arg(long = "turn-asr-final-ms", env = "PLOW_TURN_ASR_FINAL_MS", default_value_t = 500, global = true)]
+    #[arg(
+        long = "turn-asr-final-ms",
+        env = "PLOW_TURN_ASR_FINAL_MS",
+        default_value_t = 500,
+        global = true
+    )]
     pub turn_asr_final_ms: u64,
-    #[arg(long = "turn-llm-ttft-ms", env = "PLOW_TURN_LLM_TTFT_MS", default_value_t = 800, global = true)]
+    #[arg(
+        long = "turn-llm-ttft-ms",
+        env = "PLOW_TURN_LLM_TTFT_MS",
+        default_value_t = 800,
+        global = true
+    )]
     pub turn_llm_ttft_ms: u64,
-    #[arg(long = "turn-tts-ttfa-ms", env = "PLOW_TURN_TTS_TTFA_MS", default_value_t = 800, global = true)]
+    #[arg(
+        long = "turn-tts-ttfa-ms",
+        env = "PLOW_TURN_TTS_TTFA_MS",
+        default_value_t = 800,
+        global = true
+    )]
     pub turn_tts_ttfa_ms: u64,
 
     /// Tokenize prompts without computing offsets (same ids).
@@ -331,7 +481,11 @@ pub struct RuntimeConfig {
     /// thread count, is what caps the parallelism of a given prompt: the split encode takes
     /// `min(len / this, threads)` pieces, so an 8192-token prompt (~32 KB) uses at most 8 threads
     /// at the default no matter how large the pool is.
-    #[arg(long = "encode-split-min", env = "PLOW_ENCODE_SPLIT_MIN", global = true)]
+    #[arg(
+        long = "encode-split-min",
+        env = "PLOW_ENCODE_SPLIT_MIN",
+        global = true
+    )]
     pub encode_split_min: Option<u32>,
 
     /// Optional soft cap on prefix blocks and boundary snapshots as a fraction of the device's
@@ -359,7 +513,11 @@ pub struct RuntimeConfig {
     /// (the default) derives 4% of the device; `=0` is the rollback to the static byte budget
     /// as the only trim trigger. Needs the backend to report free device memory cheaply
     /// (`VmmOps::free_bytes`); a backend that cannot degrades to the static budget unchanged.
-    #[arg(long = "vmm-cache-min-free-mib", env = "PLOW_VMM_CACHE_MIN_FREE_MIB", global = true)]
+    #[arg(
+        long = "vmm-cache-min-free-mib",
+        env = "PLOW_VMM_CACHE_MIN_FREE_MIB",
+        global = true
+    )]
     pub vmm_cache_min_free_mib: Option<u32>,
 
     /// Share content below the shared-prefix cache's physical block floor (the 2 MiB VMM
@@ -369,7 +527,11 @@ pub struct RuntimeConfig {
     /// coarsest cache group's own block size evenly for every group in one `SharedPrefix` to
     /// agree on the same matched row count (`AmdSharedPrefix::new` picks one shared value
     /// for every group, never a group's own finer native granularity).
-    #[arg(long = "amd-prefix-fine-rows", env = "PLOW_AMD_PREFIX_FINE_ROWS", global = true)]
+    #[arg(
+        long = "amd-prefix-fine-rows",
+        env = "PLOW_AMD_PREFIX_FINE_ROWS",
+        global = true
+    )]
     pub amd_prefix_fine_rows: Option<u32>,
 
     /// VMM sharing block size (MiB) for the prefix pools on either vendor. 2 MiB ≈ 4096 tokens
@@ -391,12 +553,22 @@ pub struct RuntimeConfig {
 
     /// Serving objective: `latency`, `throughput`, or `auto` (per tick, from live decode width
     /// and queue depth). Every scheduling mechanism is derived from it (`serve::policy`).
-    #[arg(long = "objective", env = "PLOW_OBJECTIVE", default_value = "auto", global = true)]
+    #[arg(
+        long = "objective",
+        env = "PLOW_OBJECTIVE",
+        default_value = "auto",
+        global = true
+    )]
     pub objective: crate::serve::policy::Objective,
 
     /// Expert: prefill rows admitted per tick while requests decode. Unset or 0 = the widest
     /// compiled prefill launch.
-    #[arg(long = "pf-interleave", env = "PLOW_PF_INTERLEAVE", hide = true, global = true)]
+    #[arg(
+        long = "pf-interleave",
+        env = "PLOW_PF_INTERLEAVE",
+        hide = true,
+        global = true
+    )]
     pub pf_interleave: Option<u32>,
 
     /// Expert: per-request prefill chunk-row cap; AMD also rotates isolated admission across
@@ -461,17 +633,29 @@ pub struct RuntimeConfig {
 
     /// How long a request waits (ms) for another model switch to release the switch lock before
     /// it is shed with 503 + Retry-After. 0 = unbounded; unset = 600 000.
-    #[arg(long = "switch-timeout-ms", env = "PLOW_SWITCH_TIMEOUT_MS", global = true)]
+    #[arg(
+        long = "switch-timeout-ms",
+        env = "PLOW_SWITCH_TIMEOUT_MS",
+        global = true
+    )]
     pub switch_timeout_ms: Option<u64>,
 
     /// HTTP/1 request-head deadline (ms), also the idle keep-alive bound: hyper arms it whenever
     /// a connection waits for the next request. 0 = off; unset = 30 000.
-    #[arg(long = "http-header-timeout-ms", env = "PLOW_HTTP_HEADER_TIMEOUT_MS", global = true)]
+    #[arg(
+        long = "http-header-timeout-ms",
+        env = "PLOW_HTTP_HEADER_TIMEOUT_MS",
+        global = true
+    )]
     pub http_header_timeout_ms: Option<u64>,
 
     /// Concurrent HTTP connections per listener; past it accepting pauses. 0 = unbounded;
     /// unset = 4096.
-    #[arg(long = "http-max-connections", env = "PLOW_HTTP_MAX_CONNECTIONS", global = true)]
+    #[arg(
+        long = "http-max-connections",
+        env = "PLOW_HTTP_MAX_CONNECTIONS",
+        global = true
+    )]
     pub http_max_connections: Option<usize>,
 
     /// Device ordinals to serve on, e.g. `--devices 0,1,2,3`. Unset = every
@@ -539,11 +723,20 @@ pub struct RuntimeConfig {
 
     /// Expert: `--co-sched deadline` starvation bound, ms: a model waiting this long for the
     /// device is due now. Unset = `serve::cosched::MAX_WAIT` (2000).
-    #[arg(long = "cosched-max-wait-ms", env = "PLOW_COSCHED_MAX_WAIT_MS", hide = true, global = true)]
+    #[arg(
+        long = "cosched-max-wait-ms",
+        env = "PLOW_COSCHED_MAX_WAIT_MS",
+        hide = true,
+        global = true
+    )]
     pub cosched_max_wait_ms: Option<u32>,
 
     /// `serve --max-queued-requests` when that flag is 0 (a packet serve default lands here).
-    #[arg(long = "serve-max-queued-requests", env = "PLOW_MAX_QUEUED_REQUESTS", global = true)]
+    #[arg(
+        long = "serve-max-queued-requests",
+        env = "PLOW_MAX_QUEUED_REQUESTS",
+        global = true
+    )]
     pub serve_max_queued_requests: Option<usize>,
 
     /// Directories under which `POST /v1/models/load` may take an assets dir.
@@ -629,7 +822,12 @@ pub struct RuntimeConfig {
     #[arg(long = "glm-rowband", env = "PLOW_GLM_ROWBAND", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub glm_rowband: bool,
     /// Expert: widest decode rung a serving engine admits; unset = no ceiling.
-    #[arg(long = "decode-max-rung", env = "PLOW_DECODE_MAX_RUNG", hide = true, global = true)]
+    #[arg(
+        long = "decode-max-rung",
+        env = "PLOW_DECODE_MAX_RUNG",
+        hide = true,
+        global = true
+    )]
     pub decode_max_rung: Option<u32>,
 
     // ──────────────────────────────────────────────────────────────────────────
@@ -983,7 +1181,11 @@ pub struct NvidiaRuntimeConfig {
     /// `--vmm-live-rings=true` for these served names only (`<name>[,...]`), over
     /// `--vmm-live-rings`: a co-served packet with a VMM prefix layout allocates its sliding
     /// rings per live slot while the others keep theirs.
-    #[arg(long = "vmm-live-rings-models", env = "PLOW_VMM_LIVE_RINGS_MODELS", global = true)]
+    #[arg(
+        long = "vmm-live-rings-models",
+        env = "PLOW_VMM_LIVE_RINGS_MODELS",
+        global = true
+    )]
     pub vmm_live_rings_models: Option<String>,
 
     /// Track NV dense decode KV-split count from the LIVE `kv_len` instead of
@@ -1131,14 +1333,24 @@ pub struct NvidiaRuntimeConfig {
 
     /// Query rows per score tile of `--pf-attn-gemm` (capped at the widest routed bucket).
     /// Scratch = rows x heads x max_ctx x 2 B.
-    #[arg(long = "pf-attn-gemm-tile", env = "PLOW_PF_ATTN_GEMM_TILE", default_value_t = 2048, global = true)]
+    #[arg(
+        long = "pf-attn-gemm-tile",
+        env = "PLOW_PF_ATTN_GEMM_TILE",
+        default_value_t = 2048,
+        global = true
+    )]
     pub pf_attn_gemm_tile: u32,
 
     /// `--pf-attn-gemm` routes a bucket of at least this many rows, and a launch only when some
     /// request in its pack has at least this many query rows; a pack of short slices keeps its
     /// segment graph, which beats three library launches per request at short lengths
     /// (128-token cells +0.8-4 ms at C1/C4 and +8% at C16 when routed).
-    #[arg(long = "pf-attn-gemm-min-rows", env = "PLOW_PF_ATTN_GEMM_MIN_ROWS", default_value_t = 1024, global = true)]
+    #[arg(
+        long = "pf-attn-gemm-min-rows",
+        env = "PLOW_PF_ATTN_GEMM_MIN_ROWS",
+        default_value_t = 1024,
+        global = true
+    )]
     pub pf_attn_gemm_min_rows: u32,
 
     /// `--pf-attn-gemm` keeps the scores in f32 between the GEMM and the softmax (twice the
@@ -1148,7 +1360,12 @@ pub struct NvidiaRuntimeConfig {
 
     /// Softmax launch grid of `--pf-attn-gemm`, in blocks per SM (8 fills the SM: one score row
     /// per warp, latency-bound below that; measured 1.33 -> 0.83 ms at 12K KV from 1 to 4).
-    #[arg(long = "pf-attn-gemm-grid", env = "PLOW_PF_ATTN_GEMM_GRID", default_value_t = 8, global = true)]
+    #[arg(
+        long = "pf-attn-gemm-grid",
+        env = "PLOW_PF_ATTN_GEMM_GRID",
+        default_value_t = 8,
+        global = true
+    )]
     pub pf_attn_gemm_grid: u32,
 
     /// `--pf-attn-gemm` serves every request of a launch with one grouped cuBLASLt call per
@@ -1209,14 +1426,22 @@ pub struct NvidiaRuntimeConfig {
     /// gate 374 -> 331 us; down (K 15360) unchanged with 2x the rel-L2, hence the K bound.
     /// cuBLASLt decode rungs keep promoted accumulation (no measured gain at B=64); the CUTLASS
     /// decode route (`--cutlass-fp8-decode`) applies the same K bound.
-    #[arg(long = "lt-fp8-fast-accum-max-k", env = "PLOW_LT_FP8_FAST_ACCUM_MAX_K", global = true)]
+    #[arg(
+        long = "lt-fp8-fast-accum-max-k",
+        env = "PLOW_LT_FP8_FAST_ACCUM_MAX_K",
+        global = true
+    )]
     pub lt_fp8_fast_accum_max_k: Option<u32>,
 
     /// `<cubin sha256>:<host library sha256>` of `cutlass_fp8_decode_sm90.cubin` and its Params
     /// marshaller `libplow_cutlass_fp8_decode_sm90.so` in `--pf-seg-dir`: routed FP8 W8A8 decode
     /// projections with M <= 128 run those CUTLASS swap-AB kernels instead of cuBLASLt (no ~13 us
     /// small-M floor). Other bytes are rejected. Unset = cuBLASLt.
-    #[arg(long = "cutlass-fp8-decode", env = "PLOW_CUTLASS_FP8_DECODE", global = true)]
+    #[arg(
+        long = "cutlass-fp8-decode",
+        env = "PLOW_CUTLASS_FP8_DECODE",
+        global = true
+    )]
     pub cutlass_fp8_decode: Option<String>,
 
     /// A routed decode rung's one-instruction AddNorm / Glu segments run as ordinary launches
@@ -1346,7 +1571,10 @@ impl RuntimeConfig {
     /// non-finite value counts as unset.
     pub fn slo_targets(&self) -> crate::sched::slo::Targets {
         let valid = |v: Option<f64>| v.filter(|ms| ms.is_finite() && *ms > 0.0);
-        crate::sched::slo::Targets { tbt_ms: valid(self.tbt_slo_ms), ttft_ms: valid(self.ttft_slo_ms) }
+        crate::sched::slo::Targets {
+            tbt_ms: valid(self.tbt_slo_ms),
+            ttft_ms: valid(self.ttft_slo_ms),
+        }
     }
 
     /// Narrowest decode rung a TP engine selects. Unset → 8: on GLM-5.3 TP8 a lone row on the
@@ -1540,7 +1768,12 @@ pub struct AmdRuntimeConfig {
     /// Where the AMD engine thread runs: `auto` pins it to the CPU socket holding rank 0's GPU
     /// (from the device's sysfs NUMA node), `off` leaves it to the scheduler, or a CPU list
     /// such as `72-95,264-287`.
-    #[arg(long = "amd-engine-affinity", env = "PLOW_AMD_ENGINE_AFFINITY", default_value = "auto", global = true)]
+    #[arg(
+        long = "amd-engine-affinity",
+        env = "PLOW_AMD_ENGINE_AFFINITY",
+        default_value = "auto",
+        global = true
+    )]
     pub engine_affinity: String,
 
     /// Share completed MLA prefixes through ROCr VMM (auto on supported gfx942 packets).
@@ -1622,19 +1855,32 @@ pub struct AmdRuntimeConfig {
 
     /// Expert: narrowest decode rung a serving engine admits; `1` = no floor. A TP engine reads
     /// it through `RuntimeConfig::amd_decode_min_rung`, which supplies its default of 8.
-    #[arg(long = "decode-min-rung", env = "PLOW_DECODE_MIN_RUNG", hide = true, global = true)]
+    #[arg(
+        long = "decode-min-rung",
+        env = "PLOW_DECODE_MIN_RUNG",
+        hide = true,
+        global = true
+    )]
     pub decode_min_rung: Option<u32>,
 
     /// Prior-context floor (rows) above which a request's DENSE final chunk is planned into
     /// the sparse (DSA) prefill bucket instead of the smallest bucket that holds it; `0` = off
     /// (the tail stays in the smallest bucket). Read through `RuntimeConfig::amd_tail_sparse_ctx`,
     /// which supplies the default. See `serve::engine::retarget_dense_tail`.
-    #[arg(long = "amd-tail-sparse-ctx", env = "PLOW_AMD_TAIL_SPARSE_CTX", global = true)]
+    #[arg(
+        long = "amd-tail-sparse-ctx",
+        env = "PLOW_AMD_TAIL_SPARSE_CTX",
+        global = true
+    )]
     pub tail_sparse_ctx: Option<u32>,
 
     /// With the tail-sparse floor: the dense final chunk moves only when `prior x tail rows` (the
     /// query-key pairs its dense attention scores) reaches this many; unset = no pair floor.
-    #[arg(long = "amd-tail-sparse-min-pairs", env = "PLOW_AMD_TAIL_SPARSE_MIN_PAIRS", global = true)]
+    #[arg(
+        long = "amd-tail-sparse-min-pairs",
+        env = "PLOW_AMD_TAIL_SPARSE_MIN_PAIRS",
+        global = true
+    )]
     pub tail_sparse_min_pairs: Option<u32>,
 
     /// Unified token batch: keep the WIDE dense-GEMM rungs plowc chose per shape.
@@ -1977,7 +2223,11 @@ impl RuntimeConfig {
     /// name is listed in `--vmm-live-rings-models`.
     #[cfg(feature = "cuda")]
     pub(crate) fn nv_vmm_live_rings_for(&self, assets_dir: &std::path::Path) -> Option<bool> {
-        let spec = self.nv.vmm_live_rings_models.clone().or_else(|| Self::env_nonempty("PLOW_VMM_LIVE_RINGS_MODELS"));
+        let spec = self
+            .nv
+            .vmm_live_rings_models
+            .clone()
+            .or_else(|| Self::env_nonempty("PLOW_VMM_LIVE_RINGS_MODELS"));
         let listed = spec.is_some_and(|spec| {
             served_name(assets_dir).is_some_and(|slug| spec.split(',').any(|m| m.trim() == slug))
         });
@@ -1998,15 +2248,19 @@ impl RuntimeConfig {
     }
 
     pub fn live_ctx(&self) -> Option<u32> {
-        self.amd.live_ctx.or_else(|| {
-            Self::env_nonempty("PLOW_LIVE_CTX").and_then(|v| v.parse().ok())
-        })
+        self.amd
+            .live_ctx
+            .or_else(|| Self::env_nonempty("PLOW_LIVE_CTX").and_then(|v| v.parse().ok()))
     }
 
     /// Live bound for the packet in `assets_dir`: its served name's `--live-ctx-models` entry,
     /// else [`Self::live_ctx`].
     pub fn live_ctx_for(&self, assets_dir: &std::path::Path) -> Option<u32> {
-        let spec = self.amd.live_ctx_models.clone().or_else(|| Self::env_nonempty("PLOW_LIVE_CTX_MODELS"));
+        let spec = self
+            .amd
+            .live_ctx_models
+            .clone()
+            .or_else(|| Self::env_nonempty("PLOW_LIVE_CTX_MODELS"));
         let per_model = spec.and_then(|spec| {
             let slug = served_name(assets_dir)?;
             spec.split(',').find_map(|kv| {
@@ -2106,9 +2360,9 @@ impl RuntimeConfig {
                     Some(free) => {
                         let vllm =
                             (device_bytes as f64 * Self::VMM_CACHE_MIN_FREE_FRACTION_LOADED) as u64;
-                        let room = self.prefix_cache_cap_bytes(device_bytes).max(
-                            (device_bytes as f64 * Self::VMM_CACHE_MIN_ROOM_FRACTION) as u64,
-                        );
+                        let room = self
+                            .prefix_cache_cap_bytes(device_bytes)
+                            .max((device_bytes as f64 * Self::VMM_CACHE_MIN_ROOM_FRACTION) as u64);
                         if free.saturating_sub(vllm) >= room {
                             vllm.min(free / 2)
                         } else {
@@ -2268,7 +2522,11 @@ impl RuntimeConfig {
     }
 
     pub(crate) fn glm_rowband(&self) -> bool {
-        select_compat(self.glm_rowband, Self::env_bool("PLOW_GLM_ROWBAND"), !Self::is_initialized())
+        select_compat(
+            self.glm_rowband,
+            Self::env_bool("PLOW_GLM_ROWBAND"),
+            !Self::is_initialized(),
+        )
     }
 
     pub fn drain_timeout_ms(&self) -> Option<u64> {
@@ -2349,7 +2607,11 @@ pub fn serve_replay(m: &clap::ArgMatches) -> std::collections::BTreeMap<String, 
                     .join(",")
             })
             .unwrap_or_default();
-        let val = if is_secret_env(&env) { "<redacted>".into() } else { val };
+        let val = if is_secret_env(&env) {
+            "<redacted>".into()
+        } else {
+            val
+        };
         out.insert(env, val);
     }
     out
@@ -2359,8 +2621,12 @@ pub fn serve_replay(m: &clap::ArgMatches) -> std::collections::BTreeMap<String, 
 pub fn is_secret_env(name: &str) -> bool {
     // Suffix tests for KEY/TOKEN: `PLOW_TOKEN_BATCH` and friends are knobs, not credentials.
     let upper = name.to_ascii_uppercase();
-    ["API_KEY", "SECRET", "PASSWORD", "CREDENTIAL"].iter().any(|needle| upper.contains(needle))
-        || ["_KEY", "_KEYS", "_TOKEN", "_TOKENS"].iter().any(|suffix| upper.ends_with(suffix))
+    ["API_KEY", "SECRET", "PASSWORD", "CREDENTIAL"]
+        .iter()
+        .any(|needle| upper.contains(needle))
+        || ["_KEY", "_KEYS", "_TOKEN", "_TOKENS"]
+            .iter()
+            .any(|suffix| upper.ends_with(suffix))
 }
 
 #[cfg(test)]
@@ -2381,7 +2647,10 @@ mod tests {
         assert_eq!(unset.nv.moe_dec_lt_min_rows(Some(4)), Some(4));
         assert_eq!(unset.nv.moe_dec_lt_min_rows(None), None);
         let pinned = parse(&["test", "--moe-pf-lt=1", "--moe-dec-lt=4"]);
-        assert_eq!(pinned.nv.moe_pf_lt_min_rows(), unset.nv.moe_pf_lt_min_rows());
+        assert_eq!(
+            pinned.nv.moe_pf_lt_min_rows(),
+            unset.nv.moe_pf_lt_min_rows()
+        );
         assert_eq!(
             pinned.nv.moe_dec_lt_min_rows(Some(4)),
             unset.nv.moe_dec_lt_min_rows(Some(4))
@@ -2493,7 +2762,9 @@ mod tests {
         let command = super::RuntimeConfig::augment_args(clap::Command::new("test"));
         let parse = |args: &[&str]| {
             let matches = command.clone().try_get_matches_from(args).unwrap();
-            super::RuntimeConfig::from_arg_matches(&matches).unwrap().slo_targets()
+            super::RuntimeConfig::from_arg_matches(&matches)
+                .unwrap()
+                .slo_targets()
         };
         assert!(!parse(&["test"]).active());
         assert_eq!(parse(&["test"]), crate::sched::slo::Targets::default());
@@ -2550,7 +2821,14 @@ mod tests {
         assert!(!defaults.fusion && !defaults.pf_defer_decode);
         assert!(!defaults.pf_rotate());
         assert_eq!(defaults.objective, crate::serve::policy::Objective::Auto);
-        assert_eq!((defaults.nv.multistep, defaults.nv.decode_pipeline, defaults.co_sched), (None, None, None));
+        assert_eq!(
+            (
+                defaults.nv.multistep,
+                defaults.nv.decode_pipeline,
+                defaults.co_sched
+            ),
+            (None, None, None)
+        );
         assert_eq!(defaults.amd.packed_prefill_route, None);
         assert!(!defaults.amd.token_batch_wide_tiles);
 
@@ -2645,36 +2923,77 @@ mod tests {
         )
         .unwrap();
         let four_pct = ((80u64 << 30) as f64 * 0.04) as u64 >> 20 << 20;
-        assert_eq!(config.vmm_cache_min_free_bytes(80 << 30, None), Some(four_pct));
+        assert_eq!(
+            config.vmm_cache_min_free_bytes(80 << 30, None),
+            Some(four_pct)
+        );
         let two_pct = ((80u64 << 30) as f64 * 0.02) as u64 >> 20 << 20;
-        assert_eq!(config.vmm_cache_min_free_bytes(80 << 30, Some(60 << 30)), Some(two_pct));
+        assert_eq!(
+            config.vmm_cache_min_free_bytes(80 << 30, Some(60 << 30)),
+            Some(two_pct)
+        );
         // A card whose rings leave 5 GiB free keeps an eighth of it, not 10% of the device.
-        assert_eq!(config.vmm_cache_min_free_bytes(80 << 30, Some(5 << 30)), Some(640 << 20));
-        assert_eq!(config.vmm_cache_min_free_bytes(80 << 30, Some(14546 << 20)), Some(two_pct));
+        assert_eq!(
+            config.vmm_cache_min_free_bytes(80 << 30, Some(5 << 30)),
+            Some(640 << 20)
+        );
+        assert_eq!(
+            config.vmm_cache_min_free_bytes(80 << 30, Some(14546 << 20)),
+            Some(two_pct)
+        );
         // 5.4 GiB free cannot hold 2% plus 5% of cache room: an eighth.
-        assert_eq!(config.vmm_cache_min_free_bytes(80 << 30, Some(5530 << 20)), Some(691 << 20));
+        assert_eq!(
+            config.vmm_cache_min_free_bytes(80 << 30, Some(5530 << 20)),
+            Some(691 << 20)
+        );
         let config = super::RuntimeConfig::from_arg_matches(
-            &command.clone().try_get_matches_from(["test", "--vmm-cache-min-free-mib=100"]).unwrap(),
+            &command
+                .clone()
+                .try_get_matches_from(["test", "--vmm-cache-min-free-mib=100"])
+                .unwrap(),
         )
         .unwrap();
-        assert_eq!(config.vmm_cache_min_free_bytes(80 << 30, Some(5 << 30)), Some(100 << 20));
+        assert_eq!(
+            config.vmm_cache_min_free_bytes(80 << 30, Some(5 << 30)),
+            Some(100 << 20)
+        );
         let config = super::RuntimeConfig::from_arg_matches(
-            &command.try_get_matches_from(["test", "--vmm-cache-min-free-mib=0"]).unwrap(),
+            &command
+                .try_get_matches_from(["test", "--vmm-cache-min-free-mib=0"])
+                .unwrap(),
         )
         .unwrap();
-        assert_eq!(config.vmm_cache_min_free_bytes(80 << 30, Some(5 << 30)), None);
+        assert_eq!(
+            config.vmm_cache_min_free_bytes(80 << 30, Some(5 << 30)),
+            None
+        );
     }
 
     #[test]
     fn amd_shared_prefix_defaults_to_auto_and_accepts_explicit_overrides() {
         use clap::{Args, FromArgMatches};
         let command = super::RuntimeConfig::augment_args(clap::Command::new("test"));
-        assert!(command.get_arguments().find(|arg| arg.get_id() == "shared_prefix")
-            .unwrap().get_default_values().is_empty());
-        for (flag, expected) in [("--amd-shared-prefix", true), ("--amd-shared-prefix=false", false)] {
-            let matches = command.clone().try_get_matches_from(["test", flag]).unwrap();
-            assert_eq!(super::RuntimeConfig::from_arg_matches(&matches).unwrap().amd.shared_prefix,
-                Some(expected));
+        assert!(command
+            .get_arguments()
+            .find(|arg| arg.get_id() == "shared_prefix")
+            .unwrap()
+            .get_default_values()
+            .is_empty());
+        for (flag, expected) in [
+            ("--amd-shared-prefix", true),
+            ("--amd-shared-prefix=false", false),
+        ] {
+            let matches = command
+                .clone()
+                .try_get_matches_from(["test", flag])
+                .unwrap();
+            assert_eq!(
+                super::RuntimeConfig::from_arg_matches(&matches)
+                    .unwrap()
+                    .amd
+                    .shared_prefix,
+                Some(expected)
+            );
         }
     }
 
@@ -2682,16 +3001,17 @@ mod tests {
     fn amd_vmm_kv_defaults_to_auto_and_accepts_explicit_overrides() {
         use clap::{Args, FromArgMatches};
         let command = super::AmdRuntimeConfig::augment_args(clap::Command::new("test"));
-        assert!(
-            command
-                .get_arguments()
-                .find(|arg| arg.get_id() == "vmm_kv")
-                .unwrap()
-                .get_default_values()
-                .is_empty()
-        );
+        assert!(command
+            .get_arguments()
+            .find(|arg| arg.get_id() == "vmm_kv")
+            .unwrap()
+            .get_default_values()
+            .is_empty());
         for (flag, expected) in [("--amd-vmm-kv", true), ("--amd-vmm-kv=false", false)] {
-            let matches = command.clone().try_get_matches_from(["test", flag]).unwrap();
+            let matches = command
+                .clone()
+                .try_get_matches_from(["test", flag])
+                .unwrap();
             assert_eq!(
                 super::AmdRuntimeConfig::from_arg_matches(&matches)
                     .unwrap()
@@ -2768,7 +3088,9 @@ mod tests {
             .try_get_matches_from(["test", "--vmm-live-rings=false"])
             .unwrap();
         assert_eq!(
-            super::NvidiaRuntimeConfig::from_arg_matches(&matches).unwrap().vmm_live_rings,
+            super::NvidiaRuntimeConfig::from_arg_matches(&matches)
+                .unwrap()
+                .vmm_live_rings,
             Some(false)
         );
     }
@@ -2779,21 +3101,48 @@ mod tests {
         use clap::Args;
         let command = super::RuntimeConfig::augment_args(clap::Command::new("plowrt"));
         let matches = command
-            .try_get_matches_from(["plowrt", "--api-key", "sk-live-123", "--session-ttl-ms", "5000"])
+            .try_get_matches_from([
+                "plowrt",
+                "--api-key",
+                "sk-live-123",
+                "--session-ttl-ms",
+                "5000",
+            ])
             .unwrap();
         let replay = super::serve_replay(&matches);
-        assert_eq!(replay.get("PLOW_API_KEYS").map(String::as_str), Some("<redacted>"));
-        assert_eq!(replay.get("PLOW_SESSION_TTL_MS").map(String::as_str), Some("5000"));
+        assert_eq!(
+            replay.get("PLOW_API_KEYS").map(String::as_str),
+            Some("<redacted>")
+        );
+        assert_eq!(
+            replay.get("PLOW_SESSION_TTL_MS").map(String::as_str),
+            Some("5000")
+        );
         assert!(!format!("{replay:?}").contains("sk-live-123"));
         let exit = super::RuntimeConfig::augment_args(clap::Command::new("plowrt"));
         use clap::FromArgMatches;
-        let parse = |args: &[&str]| super::RuntimeConfig::from_arg_matches(&exit.clone().try_get_matches_from(args).unwrap()).unwrap();
+        let parse = |args: &[&str]| {
+            super::RuntimeConfig::from_arg_matches(
+                &exit.clone().try_get_matches_from(args).unwrap(),
+            )
+            .unwrap()
+        };
         assert!(!parse(&["plowrt"]).exit_on_engine_death);
         assert!(parse(&["plowrt", "--exit-on-engine-death"]).exit_on_engine_death);
-        for secret in ["PLOW_API_KEYS", "HF_TOKEN", "AWS_SECRET_ACCESS_KEY", "DB_PASSWORD", "X_KEY"] {
+        for secret in [
+            "PLOW_API_KEYS",
+            "HF_TOKEN",
+            "AWS_SECRET_ACCESS_KEY",
+            "DB_PASSWORD",
+            "X_KEY",
+        ] {
             assert!(super::is_secret_env(secret), "{secret}");
         }
-        for knob in ["PLOW_TOKEN_BATCH", "PLOW_SESSION_TTL_MS", "PLOW_KV_POOL_MIB"] {
+        for knob in [
+            "PLOW_TOKEN_BATCH",
+            "PLOW_SESSION_TTL_MS",
+            "PLOW_KV_POOL_MIB",
+        ] {
             assert!(!super::is_secret_env(knob), "{knob}");
         }
     }
@@ -2807,18 +3156,42 @@ mod tests {
             #[command(flatten)]
             cfg: super::RuntimeConfig,
         }
-        let root = std::env::temp_dir().join(format!("plow-live-rings-models-{}", std::process::id()));
+        let root =
+            std::env::temp_dir().join(format!("plow-live-rings-models-{}", std::process::id()));
         let (llm, tts) = (root.join("llm"), root.join("tts"));
         for (dir, name) in [(&llm, "gemma-4-e4b"), (&tts, "chatterbox-mtl")] {
             std::fs::create_dir_all(dir).unwrap();
-            std::fs::write(dir.join("weights.json"), format!(r#"{{"served_name": "{name}"}}"#)).unwrap();
+            std::fs::write(
+                dir.join("weights.json"),
+                format!(r#"{{"served_name": "{name}"}}"#),
+            )
+            .unwrap();
         }
-        let cfg = Cli::parse_from(["plowrt", "--vmm-live-rings-models", "qwen3-asr, gemma-4-e4b", "--vmm-live-rings=false"]).cfg;
+        let cfg = Cli::parse_from([
+            "plowrt",
+            "--vmm-live-rings-models",
+            "qwen3-asr, gemma-4-e4b",
+            "--vmm-live-rings=false",
+        ])
+        .cfg;
         assert_eq!(cfg.nv_vmm_live_rings_for(&llm), Some(true));
-        assert_eq!(cfg.nv_vmm_live_rings_for(&tts), Some(false), "an unlisted model keeps the global setting");
-        assert_eq!(cfg.nv_vmm_live_rings_for(&root.join("missing")), Some(false));
+        assert_eq!(
+            cfg.nv_vmm_live_rings_for(&tts),
+            Some(false),
+            "an unlisted model keeps the global setting"
+        );
+        assert_eq!(
+            cfg.nv_vmm_live_rings_for(&root.join("missing")),
+            Some(false)
+        );
         assert!(!cfg.nv.pin_resident);
-        let cfg = Cli::parse_from(["plowrt", "--pin-resident", "--live-ctx-models", "chatterbox-mtl=512"]).cfg;
+        let cfg = Cli::parse_from([
+            "plowrt",
+            "--pin-resident",
+            "--live-ctx-models",
+            "chatterbox-mtl=512",
+        ])
+        .cfg;
         assert!(cfg.nv.pin_resident);
         assert_eq!(cfg.nv.vmm_live_rings_models, None);
         assert_eq!(cfg.live_ctx_for(&tts), Some(512));
@@ -2930,7 +3303,10 @@ mod tests {
         let capped = cfg(&["test", "--pf-interleave=512"]);
         assert_eq!(capped.pf_interleave_rows(), 512);
         assert_eq!(capped.pf_interleave_amd(), 512);
-        assert_eq!(cfg(&["test", "--pf-interleave=0"]).pf_interleave_rows(), usize::MAX);
+        assert_eq!(
+            cfg(&["test", "--pf-interleave=0"]).pf_interleave_rows(),
+            usize::MAX
+        );
     }
 
     #[test]

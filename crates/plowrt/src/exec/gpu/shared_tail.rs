@@ -118,8 +118,14 @@ impl SharedTail {
             }
             // Every signal the prefix makes, counted: the slab exactly as the prefix leaves it.
             let mut image = vec![0u32; bucket.ctr_bytes / 4];
-            for s in program.gq_stream.iter().filter(|s| (s.inst as usize) < mark) {
-                for &c in &program.succs[s.succ_ofs as usize..(s.succ_ofs + u32::from(s.succ_len)) as usize] {
+            for s in program
+                .gq_stream
+                .iter()
+                .filter(|s| (s.inst as usize) < mark)
+            {
+                for &c in &program.succs
+                    [s.succ_ofs as usize..(s.succ_ofs + u32::from(s.succ_len)) as usize]
+                {
                     image[c as usize * CTR_STRIDE as usize] += 1;
                 }
             }
@@ -135,7 +141,9 @@ impl SharedTail {
         let rows_handle = u16::try_from(pointers.len() + manifest.carried.len())
             .ok()
             .filter(|&h| h < TENSOR_NONE16)
-            .ok_or_else(|| RuntimeError::Rejected("kv-shared tail: tensor handles exhausted".into()))?;
+            .ok_or_else(|| {
+                RuntimeError::Rejected("kv-shared tail: tensor handles exhausted".into())
+            })?;
         let blocks = u16::try_from(capacity)
             .map_err(|_| RuntimeError::Rejected("kv-shared tail: capacity".into()))?;
         let mut carried = Vec::with_capacity(manifest.carried.len());
@@ -143,7 +151,10 @@ impl SharedTail {
         for c in &manifest.carried {
             let tensor = c.tensor as usize;
             let bytes = u64::from(c.row_bytes);
-            if e.devp.get(tensor).is_none_or(|m| m.len < e.pf_max_rows() as u64 * bytes) {
+            if e.devp
+                .get(tensor)
+                .is_none_or(|m| m.len < e.pf_max_rows() as u64 * bytes)
+            {
                 return Err(RuntimeError::Rejected(format!(
                     "kv-shared tail: carried tensor {tensor} is not [rows][{bytes}]"
                 )));
@@ -237,7 +248,10 @@ fn decode_tails(
         // Through the rung's own lm_head/argmax: the ids and logits land in rows 0..n, where
         // the packed terminal would have put them.
         let end = rung.host_insts.len();
-        let head = rung.host_insts.iter().any(|d| d.t[0] as usize == e.t_logits)
+        let head = rung
+            .host_insts
+            .iter()
+            .any(|d| d.t[0] as usize == e.t_logits)
             && rung.host_insts.iter().any(|d| d.t[0] as usize == e.t_ids);
         if mark == 0 || mark >= end || !head {
             continue;
@@ -288,7 +302,11 @@ fn decode_tails(
             upload(pod_bytes(&[0u32, stream.len() as u32]))?,
         ];
         let image = e.be.alloc(0, rung.counter_bytes as u64)?;
-        e.be.upload(&image, 0, pod_bytes(&prefix_image(g, mark, rung.counter_bytes)))?;
+        e.be.upload(
+            &image,
+            0,
+            pod_bytes(&prefix_image(g, mark, rung.counter_bytes)),
+        )?;
         let kernarg = DevProgram {
             insts: tables[0].base,
             gq_stream: tables[1].base,
@@ -329,7 +347,9 @@ impl GpuEngine {
         let mut tail = self.shared_tail.take().expect("caller checked");
         let result = (|| -> Result<()> {
             if !tail.fits(n) || rows.iter().any(|r| r.0 as usize >= live) {
-                return Err(RuntimeError::Rejected("kv-shared tail rows out of bounds".into()));
+                return Err(RuntimeError::Rejected(
+                    "kv-shared tail rows out of bounds".into(),
+                ));
             }
             // 1. Gather the carried rows into scratch, then back to rows 0..n.
             tail.host_rows.clear();
@@ -341,8 +361,11 @@ impl GpuEngine {
             // SAFETY: both sources live on `tail` until the stream drains (the host
             // copies from pageable memory before returning).
             unsafe {
-                self.be
-                    .memcpy_htod_async(tail.rows.base, pod_bytes(&tail.host_rows), &self.stream)?;
+                self.be.memcpy_htod_async(
+                    tail.rows.base,
+                    pod_bytes(&tail.host_rows),
+                    &self.stream,
+                )?;
                 self.be.memcpy_htod_async(
                     tail.gather_arg.insts,
                     pod_bytes(&tail.gather_insts),
@@ -376,7 +399,12 @@ impl GpuEngine {
 
             // 2a. A decode rung holding n rows runs the tail as a decode step: row r reads slot
             // rows[r].1's cache at kvlen position+1. Pad rows read one row of the first slot.
-            if let Some(d) = tail.decode.iter().filter(|d| d.rows >= n).min_by_key(|d| d.rows) {
+            if let Some(d) = tail
+                .decode
+                .iter()
+                .filter(|d| d.rows >= n)
+                .min_by_key(|d| d.rows)
+            {
                 let (slot0, rows_d) = (rows[0].1 as i32, d.rows);
                 tail.positions.clear();
                 tail.slots.clear();
@@ -426,7 +454,11 @@ impl GpuEngine {
                     object.map_or(self.grid, |o| o.grid),
                     object.map_or(BLOCK, |o| o.block),
                     object.map_or(
-                        if rung.group_arena { self.smem } else { self.smem_narrow },
+                        if rung.group_arena {
+                            self.smem
+                        } else {
+                            self.smem_narrow
+                        },
                         |o| o.smem,
                     ),
                     &mut params,
@@ -464,10 +496,16 @@ impl GpuEngine {
                     bytemuck::cast_slice(&tail.positions),
                     &self.stream,
                 )?;
-                self.be
-                    .memcpy_htod_async(pb.d_slot.base, bytemuck::cast_slice(&tail.slots), &self.stream)?;
-                self.be
-                    .memcpy_htod_async(pb.d_req.base, bytemuck::cast_slice(&tail.table), &self.stream)?;
+                self.be.memcpy_htod_async(
+                    pb.d_slot.base,
+                    bytemuck::cast_slice(&tail.slots),
+                    &self.stream,
+                )?;
+                self.be.memcpy_htod_async(
+                    pb.d_req.base,
+                    bytemuck::cast_slice(&tail.table),
+                    &self.stream,
+                )?;
                 self.be.memcpy_htod_async(
                     self.devp[self.t_kvlen].base,
                     bytemuck::cast_slice(&kvlen),
@@ -520,9 +558,9 @@ impl GpuEngine {
                 let mut start = 0u32;
                 chunks.iter().find_map(|chunk| {
                     let len = chunk.tokens.len() as u32;
-                    let hit = (start..start + len).contains(&row).then(|| {
-                        (row, chunk.slot as u32, (chunk.c0 as u32) + row - start)
-                    });
+                    let hit = (start..start + len)
+                        .contains(&row)
+                        .then(|| (row, chunk.slot as u32, (chunk.c0 as u32) + row - start));
                     start += len;
                     hit
                 })

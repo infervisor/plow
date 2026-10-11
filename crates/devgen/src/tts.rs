@@ -94,50 +94,89 @@ pub fn t3_pipeline_section(
 ) -> Result<SectionData, String> {
     use plow_asset::packet_pipeline::{PipelineDType, PipelineTensor};
     let causal = causal_pipeline_section(model, spec)?;
-    let mut meta: PacketPipelines = serde_json::from_slice(&causal.data).map_err(|e| e.to_string())?;
-    let pipe = meta.pipelines.first_mut().ok_or("causal section has no pipeline")?;
+    let mut meta: PacketPipelines =
+        serde_json::from_slice(&causal.data).map_err(|e| e.to_string())?;
+    let pipe = meta
+        .pipelines
+        .first_mut()
+        .ok_or("causal section has no pipeline")?;
     pipe.driver = GUIDED_LM_DRIVER.into();
-    let t = model.tensors.get(pos_base as usize).ok_or("T3 pos_base tensor is missing")?;
+    let t = model
+        .tensors
+        .get(pos_base as usize)
+        .ok_or("T3 pos_base tensor is missing")?;
     pipe.tensors.insert(
         "pos_base".into(),
-        PipelineTensor { name: t.name.clone(), dtype: PipelineDType::U32, shape: vec![u64::from(spec.decode_capacity)] },
+        PipelineTensor {
+            name: t.name.clone(),
+            dtype: PipelineDType::U32,
+            shape: vec![u64::from(spec.decode_capacity)],
+        },
     );
     for (k, v) in params {
-        let k = if k == "s3_valid_below" { "valid_below" } else { k.as_str() };
+        let k = if k == "s3_valid_below" {
+            "valid_below"
+        } else {
+            k.as_str()
+        };
         pipe.parameters.insert(format!("lm.{k}"), *v);
     }
     // Prefill layout: [voice rows][start_text, text..., stop_text: table + position][BOS x2];
     // the unconditional CFG member keeps positions but drops the text table.
-    pipe.strings.insert("vocoder.packet".into(), crate::s3gen::PACKET.into());
+    pipe.strings
+        .insert("vocoder.packet".into(), crate::s3gen::PACKET.into());
     pipe.parameters.insert("prompt.bos_repeat".into(), 2);
     pipe.parameters.insert("cfg.uncond_drops_text".into(), 1);
     match t3_text_frontend(dir)? {
         Some(f) => {
             pipe.strings.insert("text.rules".into(), f.rules);
             for (code, rules) in f.languages {
-                pipe.strings.insert(format!("text.rules.lang.{code}"), rules);
+                pipe.strings
+                    .insert(format!("text.rules.lang.{code}"), rules);
             }
-            pipe.strings.insert("text.default_language".into(), f.default_language);
+            pipe.strings
+                .insert("text.default_language".into(), f.default_language);
         }
         None => {
-            pipe.strings.insert("text.rules".into(), T3_TEXT_RULES.into());
+            pipe.strings
+                .insert("text.rules".into(), T3_TEXT_RULES.into());
         }
     }
-    for t in model.tensors.iter().filter(|t| t.name.starts_with("in.prompt.")) {
+    for t in model
+        .tensors
+        .iter()
+        .filter(|t| t.name.starts_with("in.prompt."))
+    {
         pipe.tensors.insert(
             t.name.clone(),
-            PipelineTensor { name: t.name.clone(), dtype: PipelineDType::F32, shape: vec![t.bytes / 4] },
+            PipelineTensor {
+                name: t.name.clone(),
+                dtype: PipelineDType::F32,
+                shape: vec![t.bytes / 4],
+            },
         );
     }
-    meta.validate(model.progs.len(), |name| model.tensors.iter().find(|t| t.name == name).map(|t| t.bytes))?;
-    Ok(SectionData { kind: causal.kind, name: SECTION.into(), data: serde_json::to_vec(&meta).map_err(|e| e.to_string())? })
+    meta.validate(model.progs.len(), |name| {
+        model
+            .tensors
+            .iter()
+            .find(|t| t.name == name)
+            .map(|t| t.bytes)
+    })?;
+    Ok(SectionData {
+        kind: causal.kind,
+        name: SECTION.into(),
+        data: serde_json::to_vec(&meta).map_err(|e| e.to_string())?,
+    })
 }
 
 pub fn profile(name: &str) -> Result<&'static SpeechProfile, String> {
     match name {
         "veena" => Ok(&VEENA),
         "orpheus" => Ok(&ORPHEUS),
-        other => Err(format!("unknown tts profile {other:?} (known: veena, orpheus)")),
+        other => Err(format!(
+            "unknown tts profile {other:?} (known: veena, orpheus)"
+        )),
     }
 }
 
@@ -151,21 +190,33 @@ pub fn speech_pipeline_section(
         return Err("tts profile audio codes exceed the vocabulary".into());
     }
     let causal = causal_pipeline_section(model, spec)?;
-    let mut meta: PacketPipelines = serde_json::from_slice(&causal.data).map_err(|e| e.to_string())?;
-    let pipe = meta.pipelines.first_mut().ok_or("causal section has no pipeline")?;
+    let mut meta: PacketPipelines =
+        serde_json::from_slice(&causal.data).map_err(|e| e.to_string())?;
+    let pipe = meta
+        .pipelines
+        .first_mut()
+        .ok_or("causal section has no pipeline")?;
     pipe.name = "speech".into();
     pipe.driver = DRIVER.into();
-    pipe.strings.insert("prompt.template".into(), p.prompt_template.into());
-    pipe.strings.insert("prompt.voice_token".into(), p.voice_token.into());
+    pipe.strings
+        .insert("prompt.template".into(), p.prompt_template.into());
+    pipe.strings
+        .insert("prompt.voice_token".into(), p.voice_token.into());
     if !p.voices.is_empty() {
-        pipe.strings.insert("prompt.voices".into(), p.voices.join("\n"));
+        pipe.strings
+            .insert("prompt.voices".into(), p.voices.join("\n"));
     }
-    pipe.strings.insert("codec.packet".into(), CODEC_PACKET.into());
+    pipe.strings
+        .insert("codec.packet".into(), CODEC_PACKET.into());
     let params = &mut pipe.parameters;
     let mut put = |k: String, v: u64| {
         params.insert(k, v);
     };
-    for (list, key) in [(p.prefix, "prompt.prefix"), (p.suffix, "prompt.suffix"), (p.stops, "stop")] {
+    for (list, key) in [
+        (p.prefix, "prompt.prefix"),
+        (p.suffix, "prompt.suffix"),
+        (p.stops, "stop"),
+    ] {
         put(format!("{key}.count"), list.len() as u64);
         for (i, &id) in list.iter().enumerate() {
             put(format!("{key}.{i}"), id);
@@ -176,12 +227,22 @@ pub fn speech_pipeline_section(
     put("codec.codebook".into(), p.codebook);
     put("codec.frame_samples".into(), p.frame_samples);
     put("audio.token_base".into(), p.audio_token_base);
-    put("tokens.per_char_frames_f32".into(), u64::from(p.per_char_frames.to_bits()));
+    put(
+        "tokens.per_char_frames_f32".into(),
+        u64::from(p.per_char_frames.to_bits()),
+    );
     put("tokens.max_new_cap".into(), p.max_new_tokens_cap);
-    put("sampling.temperature_f32".into(), u64::from(p.temperature.to_bits()));
+    put(
+        "sampling.temperature_f32".into(),
+        u64::from(p.temperature.to_bits()),
+    );
     put("sampling.top_p_f32".into(), u64::from(p.top_p.to_bits()));
     meta.validate(model.progs.len(), |name| {
-        model.tensors.iter().find(|t| t.name == name).map(|t| t.bytes)
+        model
+            .tensors
+            .iter()
+            .find(|t| t.name == name)
+            .map(|t| t.bytes)
     })?;
     Ok(SectionData {
         kind: causal.kind,
@@ -193,14 +254,21 @@ pub fn speech_pipeline_section(
 /// Host-side tables of a guided speech LM whose prefill rows are embeddings (T3): text token
 /// and text position tables, the speech BOS row, and one conditioning block per voice. Embedded
 /// in the packet (`in.prompt.*` tensors) so the runtime assembles prefill rows from packet data only.
-pub fn t3_host_tables(dir: &std::path::Path, hidden: u32) -> Result<Vec<packet::devbuild::TensorDecl>, String> {
+pub fn t3_host_tables(
+    dir: &std::path::Path,
+    hidden: u32,
+) -> Result<Vec<packet::devbuild::TensorDecl>, String> {
     let reader = crate::checkpoint::TensorReader::open(dir)?;
     let f32_tensor = |name: &str, out: &str| -> Result<packet::devbuild::TensorDecl, String> {
         let (dtype, bytes) = reader.read(name)?;
         if dtype != "F32" || bytes.len() % (hidden as usize * 4) != 0 {
             return Err(format!("{name}: expected f32 rows of {hidden}"));
         }
-        Ok(packet::devbuild::TensorDecl { name: out.into(), bytes: bytes.len() as u64, init: Some(bytes) })
+        Ok(packet::devbuild::TensorDecl {
+            name: out.into(),
+            bytes: bytes.len() as u64,
+            init: Some(bytes),
+        })
     };
     let mut tables = vec![
         f32_tensor("t3.text_emb.weight", "in.prompt.text_table")?,
@@ -219,8 +287,15 @@ pub fn t3_host_tables(dir: &std::path::Path, hidden: u32) -> Result<Vec<packet::
         if bytes.is_empty() || bytes.len() % (hidden as usize * 4) != 0 {
             return Err(format!("{}: not [rows][{hidden}] f32", path.display()));
         }
-        let name = format!("in.prompt.voice.{}", path.file_stem().unwrap_or_default().to_string_lossy());
-        tables.push(packet::devbuild::TensorDecl { name, bytes: bytes.len() as u64, init: Some(bytes) });
+        let name = format!(
+            "in.prompt.voice.{}",
+            path.file_stem().unwrap_or_default().to_string_lossy()
+        );
+        tables.push(packet::devbuild::TensorDecl {
+            name,
+            bytes: bytes.len() as u64,
+            init: Some(bytes),
+        });
     }
     Ok(tables)
 }
@@ -240,7 +315,8 @@ fn t3_text_frontend(dir: &std::path::Path) -> Result<Option<TextFrontend>, Strin
         return Ok(None);
     }
     let raw = std::fs::read(&p).map_err(|e| format!("{}: {e}", p.display()))?;
-    let v: serde_json::Value = serde_json::from_slice(&raw).map_err(|e| format!("{}: {e}", p.display()))?;
+    let v: serde_json::Value =
+        serde_json::from_slice(&raw).map_err(|e| format!("{}: {e}", p.display()))?;
     let bad = |k: &str| format!("{}: bad or missing {k}", p.display());
     let s = |k: &str| v[k].as_str().map(str::to_string).ok_or_else(|| bad(k));
     Ok(Some(TextFrontend {
@@ -249,7 +325,11 @@ fn t3_text_frontend(dir: &std::path::Path) -> Result<Option<TextFrontend>, Strin
             .as_object()
             .ok_or_else(|| bad("languages"))?
             .iter()
-            .map(|(k, r)| r.as_str().map(|r| (k.clone(), r.to_string())).ok_or_else(|| bad("languages")))
+            .map(|(k, r)| {
+                r.as_str()
+                    .map(|r| (k.clone(), r.to_string()))
+                    .ok_or_else(|| bad("languages"))
+            })
             .collect::<Result<_, _>>()?,
         default_language: s("default_language")?,
         tables: v["tables"]
@@ -264,7 +344,9 @@ fn t3_text_frontend(dir: &std::path::Path) -> Result<Option<TextFrontend>, Strin
 /// The frontend's tables as the `text_tables.v1` metadata section (host data: repeated
 /// `u32 name_len, name, u64 len, data`), or `None` without a frontend.
 pub fn t3_text_tables_section(dir: &std::path::Path) -> Result<Option<SectionData>, String> {
-    let Some(f) = t3_text_frontend(dir)? else { return Ok(None) };
+    let Some(f) = t3_text_frontend(dir)? else {
+        return Ok(None);
+    };
     let mut data = Vec::new();
     for name in &f.tables {
         let p = dir.join("text_tables").join(name);
@@ -274,7 +356,11 @@ pub fn t3_text_tables_section(dir: &std::path::Path) -> Result<Option<SectionDat
         data.extend((t.len() as u64).to_le_bytes());
         data.extend(t);
     }
-    Ok(Some(SectionData { kind: packet::devbuild::SECT_METADATA, name: "text_tables.v1".into(), data }))
+    Ok(Some(SectionData {
+        kind: packet::devbuild::SECT_METADATA,
+        name: "text_tables.v1".into(),
+        data,
+    }))
 }
 
 /// Chatterbox's `punc_norm` plus its `[SPACE]` tokenizer convention, as generic text rules

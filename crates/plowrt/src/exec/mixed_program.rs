@@ -345,7 +345,9 @@ pub(crate) fn synthesize(
                 ]);
                 gather.i[..3].copy_from_slice(&[dcap, inst.i[1], source.t]);
                 let selected_bytes = bytes(&[dcap, inst.i[1], 2])?;
-                let selected_spec = specs.get_mut(&selected).expect("selected tensor registered");
+                let selected_spec = specs
+                    .get_mut(&selected)
+                    .expect("selected tensor registered");
                 selected_spec.bytes = selected_spec.bytes.max(selected_bytes);
                 instructions.push(gather);
                 inst.t[1] = selected;

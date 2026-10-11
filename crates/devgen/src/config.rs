@@ -313,14 +313,19 @@ pub(crate) fn cfg_from(dir: &Path) -> Cfg {
     }
     let mut c = cfg_llama_qwen(&v, arch);
     if let Some(t3) = v.get("chatterbox_t3") {
-        c.encoder_overlay_rows = t3["overlay_rows"].as_u64().expect("chatterbox_t3.overlay_rows") as u32;
-        c.speech_pos_rows = t3["speech_pos_rows"].as_u64().expect("chatterbox_t3.speech_pos_rows") as u32;
+        c.encoder_overlay_rows = t3["overlay_rows"]
+            .as_u64()
+            .expect("chatterbox_t3.overlay_rows") as u32;
+        c.speech_pos_rows = t3["speech_pos_rows"]
+            .as_u64()
+            .expect("chatterbox_t3.speech_pos_rows") as u32;
         assert!(c.encoder_overlay_rows > 0 && c.speech_pos_rows > 0);
         for (k, v) in t3.as_object().expect("chatterbox_t3 object") {
             if let Some(n) = v.as_u64() {
                 c.speech_params.push((k.clone(), n));
             } else if let Some(f) = v.as_f64() {
-                c.speech_params.push((format!("{k}_f32"), u64::from((f as f32).to_bits())));
+                c.speech_params
+                    .push((format!("{k}_f32"), u64::from((f as f32).to_bits())));
             }
         }
     }
@@ -629,7 +634,10 @@ fn cfg_bert(v: &Value) -> Cfg {
     let g = |k: &str| v[k].as_u64().unwrap() as u32;
     let hidden = g("hidden_size");
     let heads = g("num_attention_heads");
-    let hd = v["head_dim"].as_u64().map(|x| x as u32).unwrap_or(hidden / heads);
+    let hd = v["head_dim"]
+        .as_u64()
+        .map(|x| x as u32)
+        .unwrap_or(hidden / heads);
     let layers = g("num_hidden_layers");
     let eps = v["layer_norm_eps"].as_f64().unwrap_or(1e-12) as f32;
     let vocab = g("vocab_size");
@@ -660,7 +668,11 @@ fn cfg_bert(v: &Value) -> Cfg {
         has_v_norm: false,
         k_eq_v: false,
         tied: v["tie_word_embeddings"].as_bool().unwrap_or(true),
-        prefix: if v.get("bert").is_some() { "bert.".into() } else { "model.".into() },
+        prefix: if v.get("bert").is_some() {
+            "bert.".into()
+        } else {
+            "model.".into()
+        },
         encoder_overlay_rows: 0,
         mm_slab_rows: 0,
         mm_pad: 0,
@@ -682,14 +694,29 @@ fn cfg_modernbert(v: &Value) -> Cfg {
     let g = |k: &str| v[k].as_u64().unwrap() as u32;
     let hidden = g("hidden_size");
     let heads = g("num_attention_heads");
-    let hd = v["head_dim"].as_u64().map(|x| x as u32).unwrap_or(hidden / heads);
+    let hd = v["head_dim"]
+        .as_u64()
+        .map(|x| x as u32)
+        .unwrap_or(hidden / heads);
     let layers = g("num_hidden_layers");
-    let kvh = v["num_key_value_heads"].as_u64().map(|x| x as u32).unwrap_or(heads);
-    let eps = v["norm_eps"].as_f64().or_else(|| v["layer_norm_eps"].as_f64()).unwrap_or(1e-5) as f32;
+    let kvh = v["num_key_value_heads"]
+        .as_u64()
+        .map(|x| x as u32)
+        .unwrap_or(heads);
+    let eps = v["norm_eps"]
+        .as_f64()
+        .or_else(|| v["layer_norm_eps"].as_f64())
+        .unwrap_or(1e-5) as f32;
     let vocab = g("vocab_size");
     let inter = g("intermediate_size");
-    let window = v["sliding_window"].as_u64().map(|x| x as u32).unwrap_or(128);
-    let theta = v["global_rope_theta"].as_f64().or_else(|| v["rope_theta"].as_f64()).unwrap_or(160000.0);
+    let window = v["sliding_window"]
+        .as_u64()
+        .map(|x| x as u32)
+        .unwrap_or(128);
+    let theta = v["global_rope_theta"]
+        .as_f64()
+        .or_else(|| v["rope_theta"].as_f64())
+        .unwrap_or(160000.0);
     let is_full: Vec<bool> = (0..layers).map(|l| (l + 1) % 3 == 0).collect();
     Cfg {
         arch: Arch::ModernBert,

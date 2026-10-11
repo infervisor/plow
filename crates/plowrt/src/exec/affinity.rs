@@ -52,7 +52,10 @@ impl CorePlan {
 /// an error. "There is no room for a head on this box" is a configuration, not
 /// a failure: the caller declines to arm and serves exactly as before.
 pub fn plan_cores(cores: &[Core], explicit: Option<&[u32]>, reserve: usize) -> CorePlan {
-    let all: Vec<u32> = cores.iter().flat_map(|c| c.siblings.iter().copied()).collect();
+    let all: Vec<u32> = cores
+        .iter()
+        .flat_map(|c| c.siblings.iter().copied())
+        .collect();
     if let Some(want) = explicit {
         let head: Vec<u32> = all.iter().copied().filter(|c| want.contains(c)).collect();
         let serving: Vec<u32> = all.iter().copied().filter(|c| !head.contains(c)).collect();
@@ -88,11 +91,7 @@ pub fn plan() -> &'static CorePlan {
             return CorePlan::default();
         }
         let topo = super::cpu::topology::Topology::detect();
-        let plan = plan_cores(
-            &topo.cores,
-            explicit.as_deref(),
-            cfg.reserve_cores as usize,
-        );
+        let plan = plan_cores(&topo.cores, explicit.as_deref(), cfg.reserve_cores as usize);
         tracing::info!(
             serving = plan.serving.len(),
             head = plan.head.len(),
@@ -195,9 +194,7 @@ mod tests {
     /// Two nodes, four physical cores each with one SMT sibling — the EPYC
     /// numbering where sibling(i) = i + n_cores.
     fn smt_box() -> Vec<Core> {
-        (0..4)
-            .map(|i| core(i, i / 2, &[i, i + 4]))
-            .collect()
+        (0..4).map(|i| core(i, i / 2, &[i, i + 4])).collect()
     }
 
     #[test]

@@ -114,7 +114,14 @@ fn string(s: &str, ensure_ascii: bool, out: &mut String) {
 /// is in `-4..16`, otherwise `d.ddde+XX`.
 fn float_repr(f: f64) -> String {
     if !f.is_finite() {
-        return if f.is_nan() { "NaN" } else if f > 0.0 { "Infinity" } else { "-Infinity" }.into();
+        return if f.is_nan() {
+            "NaN"
+        } else if f > 0.0 {
+            "Infinity"
+        } else {
+            "-Infinity"
+        }
+        .into();
     }
     // `{:e}` is the shortest round-trip form: `d.ddde<exp>`.
     let sci = format!("{f:e}");
@@ -147,7 +154,11 @@ fn float_repr(f: f64) -> String {
             out.push('.');
             out.push_str(&digits[1..]);
         }
-        out.push_str(&format!("e{}{:02}", if exp < 0 { '-' } else { '+' }, exp.abs()));
+        out.push_str(&format!(
+            "e{}{:02}",
+            if exp < 0 { '-' } else { '+' },
+            exp.abs()
+        ));
     }
     out
 }
@@ -170,12 +181,30 @@ mod tests {
             "{\"a\": {\"k\": null, \"t\": true}, \"b\": [1, 2.5, \"x\"], \"u\": \"Z\\u00fcrich \\\"q\\\"\\n\"}"
         );
         assert_eq!(
-            dumps(&json!({"a": [1, {}], "b": []}), &Opts { indent: Some(2), ..Default::default() }),
+            dumps(
+                &json!({"a": [1, {}], "b": []}),
+                &Opts {
+                    indent: Some(2),
+                    ..Default::default()
+                }
+            ),
             "{\n  \"a\": [\n    1,\n    {}\n  ],\n  \"b\": []\n}"
         );
-        let compact = Opts { separators: Some((",".into(), ":".into())), ..Default::default() };
+        let compact = Opts {
+            separators: Some((",".into(), ":".into())),
+            ..Default::default()
+        };
         assert_eq!(dumps(&json!({"a": [1, 2]}), &compact), r#"{"a":[1,2]}"#);
-        assert_eq!(dumps(&json!("😀\u{1}"), &Opts { ensure_ascii: true, ..Default::default() }), "\"\\ud83d\\ude00\\u0001\"");
+        assert_eq!(
+            dumps(
+                &json!("😀\u{1}"),
+                &Opts {
+                    ensure_ascii: true,
+                    ..Default::default()
+                }
+            ),
+            "\"\\ud83d\\ude00\\u0001\""
+        );
     }
 
     #[test]

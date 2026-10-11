@@ -131,7 +131,11 @@ impl Quantile {
         if !(x.is_finite() && x > 0.0) {
             return;
         }
-        self.q *= if x > self.q { (self.eta * self.tau).exp() } else { (-self.eta * (1.0 - self.tau)).exp() };
+        self.q *= if x > self.q {
+            (self.eta * self.tau).exp()
+        } else {
+            (-self.eta * (1.0 - self.tau)).exp()
+        };
     }
 
     pub fn get(&self) -> f64 {
@@ -159,7 +163,13 @@ impl<const N: usize> Rls<N> {
             p[i][i] = (prior_sd[i] / noise_sd).powi(2);
         }
         let trace0 = (0..N).map(|i| p[i][i]).sum();
-        Self { theta, p, trace0, lambda, samples: 0 }
+        Self {
+            theta,
+            p,
+            trace0,
+            lambda,
+            samples: 0,
+        }
     }
 
     fn predict(&self, x: &[f64; N]) -> f64 {
@@ -271,7 +281,10 @@ impl TickCost {
     }
 
     fn launch_model(&self, bucket: u32) -> Option<&Rls<LAUNCH_DIM>> {
-        self.launches.iter().find(|(b, _)| *b == bucket).map(|(_, m)| m)
+        self.launches
+            .iter()
+            .find(|(b, _)| *b == bucket)
+            .map(|(_, m)| m)
     }
 
     pub fn observe_launch(&mut self, bucket: u32, rows: u32, prior: u32, fresh: bool, ms: f64) {
@@ -296,7 +309,8 @@ impl TickCost {
     pub fn observe_decode(&mut self, rows: u32, after_prefill: bool, ms: f64) {
         let i = usize::from(after_prefill);
         if after_prefill && self.decode[1].samples == 0 {
-            self.decode[1] = Rls::new(DECODE_PRIOR[1], DECODE_PRIOR_SD, 10.0, 0.98).scaled(self.speed());
+            self.decode[1] =
+                Rls::new(DECODE_PRIOR[1], DECODE_PRIOR_SD, 10.0, 0.98).scaled(self.speed());
         }
         self.decode[i].update(&decode_x(rows), ms);
     }
@@ -386,7 +400,11 @@ impl SloCandidate {
     /// The most rows this tick may give it: its planned chunk, or for a fresh request what the
     /// engine's first plan against the full budget would hold.
     fn max_rows(&self, full_budget: u32) -> u32 {
-        let natural = if self.base.planned { self.base.span.n_rows } else { self.remaining };
+        let natural = if self.base.planned {
+            self.base.span.n_rows
+        } else {
+            self.remaining
+        };
         natural.min(full_budget)
     }
 }
@@ -431,7 +449,14 @@ pub fn plan_tick(
 ) -> (Plan, SloOutcome) {
     if !targets.active() {
         let base: Vec<Candidate> = candidates.iter().map(|c| c.base).collect();
-        let plan = step::plan(backend, tick, decodes, &base, program_rows, program_span_limit);
+        let plan = step::plan(
+            backend,
+            tick,
+            decodes,
+            &base,
+            program_rows,
+            program_span_limit,
+        );
         return (plan, SloOutcome::default());
     }
     let decodes: Vec<u32> = decodes.into_iter().collect();
@@ -455,7 +480,10 @@ pub fn plan_tick(
             f64::INFINITY
         }
     };
-    let mut outcome = SloOutcome { budget_ms: room(TickClass::Plain, 0.0), ..SloOutcome::default() };
+    let mut outcome = SloOutcome {
+        budget_ms: room(TickClass::Plain, 0.0),
+        ..SloOutcome::default()
+    };
     let order = order(targets, tick, candidates, ladder, cost, full_budget);
     let mut launches = Vec::new();
     let mut class = TickClass::Plain;
@@ -469,7 +497,13 @@ pub fn plan_tick(
         let whole = c.max_rows(full_budget);
         let rows = if binding {
             let max_rows = whole.min(left_rows);
-            rows_within(c, max_rows, room(class.max(c.class(max_rows)), spent_ms), ladder, cost)
+            rows_within(
+                c,
+                max_rows,
+                room(class.max(c.class(max_rows)), spent_ms),
+                ladder,
+                cost,
+            )
         } else {
             // No target binds: a planned chunk runs whole or waits, as in `step::plan`.
             (whole <= left_rows && whole > 0).then_some(whole)
@@ -521,7 +555,11 @@ pub fn plan_tick(
 /// `K` of the progress rule: the fewest ticks whose slack pays for the smallest chunk.
 pub fn progress_k(p_min_ms: f64, slack_ms: f64) -> u32 {
     if slack_ms <= 0.0 || !slack_ms.is_finite() {
-        return if slack_ms.is_infinite() && slack_ms > 0.0 { 1 } else { MAX_SKIP_TICKS };
+        return if slack_ms.is_infinite() && slack_ms > 0.0 {
+            1
+        } else {
+            MAX_SKIP_TICKS
+        };
     }
     let k = (p_min_ms / slack_ms).ceil();
     if k.is_finite() {
@@ -602,8 +640,12 @@ fn order(
     };
     let widest = ladder.widest().max(1);
     let key = |c: &SloCandidate| {
-        let per_row = cost.launch_ms(ladder.bucket_for(widest, c.prior).unwrap_or(widest), widest, c.prior, false)
-            / f64::from(widest);
+        let per_row = cost.launch_ms(
+            ladder.bucket_for(widest, c.prior).unwrap_or(widest),
+            widest,
+            c.prior,
+            false,
+        ) / f64::from(widest);
         let slack = ttft - c.age_ms - f64::from(c.remaining) * per_row;
         let completes = c.remaining <= c.max_rows(full_budget);
         let tier = match (slack >= 0.0, completes) {
@@ -660,7 +702,11 @@ mod tests {
 
     impl CostModel for Fake {
         fn launch_ms(&self, bucket: u32, rows: u32, prior: u32, _fresh: bool) -> f64 {
-            let deep = if bucket < 8192 && prior >= 16384 { self.dense_deep } else { 0.0 };
+            let deep = if bucket < 8192 && prior >= 16384 {
+                self.dense_deep
+            } else {
+                0.0
+            };
             self.fixed + self.per_row * f64::from(rows) + deep
         }
         fn decode_ms(&self, _rows: u32, _after: bool) -> f64 {
@@ -672,7 +718,12 @@ mod tests {
     }
 
     fn glm() -> Fake {
-        Fake { fixed: 150.0, per_row: 0.09, dense_deep: 1200.0, decode: 110.0 }
+        Fake {
+            fixed: 150.0,
+            per_row: 0.09,
+            dense_deep: 1200.0,
+            decode: 110.0,
+        }
     }
 
     fn ladder() -> Ladder {
@@ -684,14 +735,33 @@ mod tests {
     }
 
     fn amd() -> Backend {
-        Backend { step_budget: 8192, packing: true, split_spans: false, decode_rows_join_prefill: false, span_policy: None }
+        Backend {
+            step_budget: 8192,
+            packing: true,
+            split_spans: false,
+            decode_rows_join_prefill: false,
+            span_policy: None,
+        }
     }
 
     fn tick() -> Tick {
-        Tick { cap_rows: u32::MAX, packing: true, rotate: false, turn: 0, slots: 32 }
+        Tick {
+            cap_rows: u32::MAX,
+            packing: true,
+            rotate: false,
+            turn: 0,
+            slots: 32,
+        }
     }
 
-    fn cand(slot: u32, arrival: u64, prior: u32, rows: u32, remaining: u32, age_ms: f64) -> SloCandidate {
+    fn cand(
+        slot: u32,
+        arrival: u64,
+        prior: u32,
+        rows: u32,
+        remaining: u32,
+        age_ms: f64,
+    ) -> SloCandidate {
         SloCandidate {
             base: Candidate {
                 span: PrefillSpan {
@@ -714,15 +784,37 @@ mod tests {
         }
     }
 
-    fn run(targets: Targets, cands: &[SloCandidate], decodes: u32, state: &mut SloState) -> (Plan, SloOutcome) {
-        plan_tick(targets, amd(), tick(), 0..decodes, cands, &ladder(), &glm(), &mut state.skipped, |_| None, |_| u32::MAX)
+    fn run(
+        targets: Targets,
+        cands: &[SloCandidate],
+        decodes: u32,
+        state: &mut SloState,
+    ) -> (Plan, SloOutcome) {
+        plan_tick(
+            targets,
+            amd(),
+            tick(),
+            0..decodes,
+            cands,
+            &ladder(),
+            &glm(),
+            &mut state.skipped,
+            |_| None,
+            |_| u32::MAX,
+        )
     }
 
     fn rows(plan: &Plan) -> Vec<(u32, u32)> {
-        plan.launches.iter().map(|l| (l.spans[0].slot, l.spans[0].n_rows)).collect()
+        plan.launches
+            .iter()
+            .map(|l| (l.spans[0].slot, l.spans[0].n_rows))
+            .collect()
     }
 
-    const TBT500: Targets = Targets { tbt_ms: Some(500.0), ttft_ms: None };
+    const TBT500: Targets = Targets {
+        tbt_ms: Some(500.0),
+        ttft_ms: None,
+    };
 
     #[test]
     fn the_bucket_mirror_moves_a_shrunk_deep_chunk_to_the_sparse_rung_at_real_rows() {
@@ -732,9 +824,16 @@ mod tests {
         assert_eq!(l.bucket_for(3000, 0), Some(8192));
         assert_eq!(l.bucket_for(100, 16383), Some(128));
         assert_eq!(l.bucket_for(9000, 0), None);
-        let off = Ladder { tail_sparse_ctx: None, ..ladder() };
+        let off = Ladder {
+            tail_sparse_ctx: None,
+            ..ladder()
+        };
         assert_eq!(off.bucket_for(1500, 65536), Some(2048));
-        let pairs = Ladder { tail_sparse_ctx: Some(2048), tail_sparse_min_pairs: Some(1_500_000), ..ladder() };
+        let pairs = Ladder {
+            tail_sparse_ctx: Some(2048),
+            tail_sparse_min_pairs: Some(1_500_000),
+            ..ladder()
+        };
         assert_eq!(pairs.bucket_for(512, 2112), Some(512));
         assert_eq!(pairs.bucket_for(512, 4160), Some(8192));
         assert_eq!(pairs.bucket_for(100, 6208), Some(128));
@@ -748,7 +847,10 @@ mod tests {
         let (plan, out) = run(TBT500, &[cand(3, 0, 65536, 8192, 20000, 0.0)], 19, &mut s);
         assert_eq!(plan.decodes.len(), 19);
         assert_eq!(rows(&plan), [(3, 2560)]);
-        assert!(out.predicted_ms <= 500.0 && out.predicted_ms > 490.0, "{out:?}");
+        assert!(
+            out.predicted_ms <= 500.0 && out.predicted_ms > 490.0,
+            "{out:?}"
+        );
         assert!(!out.progress);
     }
 
@@ -756,13 +858,22 @@ mod tests {
     #[test]
     fn several_requests_fill_the_budget_in_order() {
         let mut s = SloState::default();
-        let cands = [cand(0, 1, 65536, 8192, 20000, 0.0), cand(1, 2, 65536, 8192, 20000, 0.0)];
-        let t = Targets { tbt_ms: Some(1000.0), ttft_ms: None };
+        let cands = [
+            cand(0, 1, 65536, 8192, 20000, 0.0),
+            cand(1, 2, 65536, 8192, 20000, 0.0),
+        ];
+        let t = Targets {
+            tbt_ms: Some(1000.0),
+            ttft_ms: None,
+        };
         let (plan, out) = run(t, &cands, 5, &mut s);
         // 890 ms: slot 0 takes its whole 8192 chunk? 150 + 737 = 887 fits; slot 1 gets nothing.
         assert_eq!(rows(&plan), [(0, 8192)]);
         assert!(out.predicted_ms <= 1000.0);
-        let short = [cand(0, 1, 65536, 1000, 1000, 0.0), cand(1, 2, 65536, 8192, 20000, 0.0)];
+        let short = [
+            cand(0, 1, 65536, 1000, 1000, 0.0),
+            cand(1, 2, 65536, 8192, 20000, 0.0),
+        ];
         let (plan, _) = run(t, &short, 5, &mut s);
         // slot 0: 150 + 90 = 240; slot 1 gets 890 - 240 = 650 -> 150 + 0.09 n <= 650 -> 5504.
         assert_eq!(rows(&plan), [(0, 1000), (1, 5504)]);
@@ -782,7 +893,10 @@ mod tests {
     /// the mean tick over the pair is (110 + 110 + 276.7) / 2 <= 250.
     #[test]
     fn the_progress_rule_runs_one_chunk_every_k_ticks_and_the_mean_meets_the_target() {
-        let t = Targets { tbt_ms: Some(250.0), ttft_ms: None };
+        let t = Targets {
+            tbt_ms: Some(250.0),
+            ttft_ms: None,
+        };
         let c = [cand(0, 0, 65536, 8192, 60000, 0.0)];
         let mut s = SloState::default();
         let mut ticks = Vec::new();
@@ -809,10 +923,15 @@ mod tests {
         assert_eq!(progress_k(100.0, 140.0), 1);
         assert_eq!(progress_k(160.0, -5.0), MAX_SKIP_TICKS);
         assert_eq!(progress_k(10_000.0, 1.0), MAX_SKIP_TICKS);
-        let t = Targets { tbt_ms: Some(100.0), ttft_ms: None };
+        let t = Targets {
+            tbt_ms: Some(100.0),
+            ttft_ms: None,
+        };
         let mut s = SloState::default();
         let c = [cand(0, 0, 65536, 8192, 60000, 0.0)];
-        let runs: Vec<bool> = (0..3 * MAX_SKIP_TICKS).map(|_| run(t, &c, 20, &mut s).1.progress).collect();
+        let runs: Vec<bool> = (0..3 * MAX_SKIP_TICKS)
+            .map(|_| run(t, &c, 20, &mut s).1.progress)
+            .collect();
         assert_eq!(runs.iter().filter(|&&p| p).count(), 3);
         assert!(runs[MAX_SKIP_TICKS as usize - 1]);
     }
@@ -820,17 +939,30 @@ mod tests {
     /// EDF: a prompt finishing this tick first, then by slack, the doomed last by arrival.
     #[test]
     fn a_ttft_target_orders_by_slack_with_completing_prompts_first_and_doomed_last() {
-        let t = Targets { tbt_ms: None, ttft_ms: Some(10_000.0) };
+        let t = Targets {
+            tbt_ms: None,
+            ttft_ms: Some(10_000.0),
+        };
         let cands = [
             // arrival order would pick slot 0 first
             cand(0, 0, 8192, 8192, 50000, 9_000.0), // needs ~5.5 s, 1 s left: doomed
-            cand(1, 1, 8192, 8192, 30000, 2_000.0),  // needs ~3.4 s, slack ~4.6 s
-            cand(2, 2, 8192, 8192, 60000, 1_000.0),  // needs ~6.7 s, slack ~2.3 s
-            cand(3, 3, 65536, 700, 700, 500.0),      // a prefix-hit suffix: completes now
+            cand(1, 1, 8192, 8192, 30000, 2_000.0), // needs ~3.4 s, slack ~4.6 s
+            cand(2, 2, 8192, 8192, 60000, 1_000.0), // needs ~6.7 s, slack ~2.3 s
+            cand(3, 3, 65536, 700, 700, 500.0),     // a prefix-hit suffix: completes now
         ];
         let o = order(t, tick(), &cands, &ladder(), &glm(), 8192);
         assert_eq!(o, [3, 2, 1, 0]);
-        let fifo = order(Targets { tbt_ms: Some(500.0), ttft_ms: None }, tick(), &cands, &ladder(), &glm(), 8192);
+        let fifo = order(
+            Targets {
+                tbt_ms: Some(500.0),
+                ttft_ms: None,
+            },
+            tick(),
+            &cands,
+            &ladder(),
+            &glm(),
+            8192,
+        );
         assert_eq!(fifo, [0, 1, 2, 3]);
     }
 
@@ -839,7 +971,9 @@ mod tests {
     #[test]
     fn unset_targets_plan_exactly_what_the_step_planner_plans() {
         for seed in 0..300u64 {
-            let mut x = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            let mut x = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             let mut next = move || {
                 x ^= x << 13;
                 x ^= x >> 7;
@@ -852,7 +986,14 @@ mod tests {
                 .map(|i| {
                     let rows = [128, 512, 1024, 2048, 8192][(next() % 5) as usize];
                     let planned = next() % 4 != 0;
-                    let mut c = cand(d + i, next() % 50, 4096, if planned { rows } else { u32::MAX }, 9000, 0.0);
+                    let mut c = cand(
+                        d + i,
+                        next() % 50,
+                        4096,
+                        if planned { rows } else { u32::MAX },
+                        9000,
+                        0.0,
+                    );
                     c.base.planned = planned;
                     c.base.packable = next() % 2 == 0;
                     c.base.span.program = 3;
@@ -860,12 +1001,29 @@ mod tests {
                 })
                 .collect();
             let cap = [u32::MAX, 8192, 4096, 2048][(next() % 4) as usize];
-            let t = Tick { cap_rows: cap, packing: true, rotate: next() % 2 == 0, turn: (next() % 20) as usize, slots: 32 };
+            let t = Tick {
+                cap_rows: cap,
+                packing: true,
+                rotate: next() % 2 == 0,
+                turn: (next() % 20) as usize,
+                slots: 32,
+            };
             let rungs = |p: u32| (p == 3).then_some(2048);
             let base: Vec<Candidate> = cands.iter().map(|c| c.base).collect();
             let want = step::plan(amd(), t, 0..d, &base, rungs, |_| u32::MAX);
             let mut s = SloState::default();
-            let (got, out) = plan_tick(Targets::default(), amd(), t, 0..d, &cands, &ladder(), &glm(), &mut s.skipped, rungs, |_| u32::MAX);
+            let (got, out) = plan_tick(
+                Targets::default(),
+                amd(),
+                t,
+                0..d,
+                &cands,
+                &ladder(),
+                &glm(),
+                &mut s.skipped,
+                rungs,
+                |_| u32::MAX,
+            );
             assert_eq!(got, want, "seed={seed}");
             assert_eq!(out, SloOutcome::default());
             assert_eq!(s.skipped, 0);
@@ -876,19 +1034,45 @@ mod tests {
     /// shrunk (possibly retargeted) chunk never meets `packed_span_admissible` at all.
     #[test]
     fn a_target_plans_isolated_launches_even_for_packable_candidates() {
-        let mut cands: Vec<SloCandidate> = (0..4).map(|s| cand(s, u64::from(s), 4096, 512, 5000, 0.0)).collect();
+        let mut cands: Vec<SloCandidate> = (0..4)
+            .map(|s| cand(s, u64::from(s), 4096, 512, 5000, 0.0))
+            .collect();
         for c in &mut cands {
             c.base.packable = true;
             c.base.span.program = 3;
         }
         let mut s = SloState::default();
-        let t = Targets { tbt_ms: Some(10_000.0), ttft_ms: None };
-        let (plan, _) = plan_tick(t, amd(), tick(), 0..2, &cands, &ladder(), &glm(), &mut s.skipped, |p| (p == 3).then_some(2048), |_| u32::MAX);
+        let t = Targets {
+            tbt_ms: Some(10_000.0),
+            ttft_ms: None,
+        };
+        let (plan, _) = plan_tick(
+            t,
+            amd(),
+            tick(),
+            0..2,
+            &cands,
+            &ladder(),
+            &glm(),
+            &mut s.skipped,
+            |p| (p == 3).then_some(2048),
+            |_| u32::MAX,
+        );
         assert_eq!(plan.launches.len(), 4);
         assert!(plan.launches.iter().all(|l| !l.is_pack()));
         let base: Vec<Candidate> = cands.iter().map(|c| c.base).collect();
-        let unset = step::plan(amd(), tick(), 0..2, &base, |p| (p == 3).then_some(2048), |_| u32::MAX);
-        assert!(unset.launches[0].is_pack(), "the same candidates do pack without a target");
+        let unset = step::plan(
+            amd(),
+            tick(),
+            0..2,
+            &base,
+            |p| (p == 3).then_some(2048),
+            |_| u32::MAX,
+        );
+        assert!(
+            unset.launches[0].is_pack(),
+            "the same candidates do pack without a target"
+        );
     }
 
     #[test]
@@ -908,9 +1092,16 @@ mod tests {
         }
         // U[1, 2): p90 = 1.9. The tracker jitters by about eta * q around it; what the planner
         // relies on is the coverage, one sample in ten above the margin.
-        assert!((q.get() - 1.9).abs() < 0.06, "p90 of U[1,2) is 1.9, got {}", q.get());
+        assert!(
+            (q.get() - 1.9).abs() < 0.06,
+            "p90 of U[1,2) is 1.9, got {}",
+            q.get()
+        );
         let share = f64::from(above) / 50_000.0;
-        assert!((share - 0.10).abs() < 0.01, "share above the tracked p90: {share}");
+        assert!(
+            (share - 0.10).abs() < 0.01,
+            "share above the tracked p90: {share}"
+        );
 
         struct Wide(Fake, f64);
         impl CostModel for Wide {
@@ -930,7 +1121,18 @@ mod tests {
         let mut s = SloState::default();
         let c = [cand(3, 0, 65536, 8192, 20000, 0.0)];
         let wide = Wide(glm(), 1.25);
-        let (plan, out) = plan_tick(TBT500, amd(), tick(), 0..19, &c, &ladder(), &wide, &mut s.skipped, |_| None, |_| u32::MAX);
+        let (plan, out) = plan_tick(
+            TBT500,
+            amd(),
+            tick(),
+            0..19,
+            &c,
+            &ladder(),
+            &wide,
+            &mut s.skipped,
+            |_| None,
+            |_| u32::MAX,
+        );
         // 500 / 1.25 = 400: 290 ms of prefill -> 150 + 0.09 n <= 290 -> n = 1555 -> 1536.
         assert_eq!(rows(&plan), [(3, 1536)]);
         assert_eq!((out.class, out.margin), (TickClass::Plain, 1.25));
@@ -940,7 +1142,10 @@ mod tests {
     #[test]
     fn a_tick_is_classed_by_its_riskiest_launch() {
         let mut s = SloState::default();
-        let t = Targets { tbt_ms: Some(2000.0), ttft_ms: None };
+        let t = Targets {
+            tbt_ms: Some(2000.0),
+            ttft_ms: None,
+        };
         let mut fresh = cand(1, 2, 0, u32::MAX, 9000, 0.0);
         fresh.base.planned = false;
         let cands = [cand(0, 1, 65536, 700, 700, 0.0), fresh];
@@ -979,7 +1184,9 @@ mod tests {
     #[test]
     #[ignore]
     fn replay_tick_logs() {
-        let Ok(paths) = std::env::var("PLOW_SLO_REPLAY_LOGS") else { return };
+        let Ok(paths) = std::env::var("PLOW_SLO_REPLAY_LOGS") else {
+            return;
+        };
         let kv = |s: &str| -> std::collections::HashMap<String, String> {
             s.split_whitespace()
                 .filter_map(|w| w.split_once('='))
@@ -991,7 +1198,9 @@ mod tests {
         };
         let pct = |v: &mut Vec<f64>, q: f64| -> f64 {
             v.sort_by(f64::total_cmp);
-            v.get(((v.len().max(1) - 1) as f64 * q).round() as usize).copied().unwrap_or(f64::NAN)
+            v.get(((v.len().max(1) - 1) as f64 * q).round() as usize)
+                .copied()
+                .unwrap_or(f64::NAN)
         };
         let (mut all_mixed, mut all_decode) = (Vec::new(), Vec::new());
         let (mut covered, mut over) = (Vec::<f64>::new(), Vec::new());
@@ -1006,10 +1215,21 @@ mod tests {
                 if let Some(i) = line.find("PFCHUNK ") {
                     let m = kv(&line[i..]);
                     let last = m.get("last").is_some_and(|v| v == "true");
-                    launches.push((f(&m, "bucket") as u32, f(&m, "clen") as u32, f(&m, "c0") as u32, f(&m, "total"), last));
+                    launches.push((
+                        f(&m, "bucket") as u32,
+                        f(&m, "clen") as u32,
+                        f(&m, "c0") as u32,
+                        f(&m, "total"),
+                        last,
+                    ));
                 } else if let Some(i) = line.find("TICK n=") {
                     let m = kv(&line[i..]);
-                    let (total, pf, dec, rows) = (f(&m, "total"), f(&m, "pf"), f(&m, "dec"), f(&m, "dec_rows") as u32);
+                    let (total, pf, dec, rows) = (
+                        f(&m, "total"),
+                        f(&m, "pf"),
+                        f(&m, "dec"),
+                        f(&m, "dec_rows") as u32,
+                    );
                     let after = !launches.is_empty();
                     if rows > 0 {
                         let pred = launches
@@ -1048,9 +1268,15 @@ mod tests {
                     launches.clear();
                 }
             }
-            margins.push([TickClass::Plain, TickClass::Completing, TickClass::Fresh].map(|c| cost.margin(c)));
+            margins.push(
+                [TickClass::Plain, TickClass::Completing, TickClass::Fresh].map(|c| cost.margin(c)),
+            );
             let n = mixed.len();
-            println!("{path}: {n} prefill+decode ticks, |err| p50 {:.1}% p90 {:.1}%", 100.0 * pct(&mut mixed, 0.5), 100.0 * pct(&mut mixed, 0.9));
+            println!(
+                "{path}: {n} prefill+decode ticks, |err| p50 {:.1}% p90 {:.1}%",
+                100.0 * pct(&mut mixed, 0.5),
+                100.0 * pct(&mut mixed, 0.9)
+            );
             all_mixed.extend(mixed);
         }
         let (nm, nd) = (all_mixed.len(), all_decode.len());
@@ -1106,7 +1332,12 @@ mod tests {
                     };
                     if let Some(i) = line.find("PFCHUNK ") {
                         let l = &line[i..];
-                        launches.push((kv(l, "bucket") as u32, kv(l, "clen") as u32, kv(l, "c0") as u32, kv(l, "total")));
+                        launches.push((
+                            kv(l, "bucket") as u32,
+                            kv(l, "clen") as u32,
+                            kv(l, "c0") as u32,
+                            kv(l, "total"),
+                        ));
                     } else if let Some(i) = line.find("TICK n=") {
                         let l = &line[i..];
                         let rows = kv(l, "dec_rows") as u32;
@@ -1129,23 +1360,32 @@ mod tests {
         let mut x = 7u64;
         let lens: Vec<u32> = (0..20)
             .map(|_| {
-                x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                x = x
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
                 60_200 + ((x >> 33) % 19_601) as u32
             })
             .collect();
         const OUT: u32 = 700;
         let l = ladder();
         for &target in &targets {
-            let t = Targets { tbt_ms: (target > 0.0).then_some(target), ttft_ms: None };
+            let t = Targets {
+                tbt_ms: (target > 0.0).then_some(target),
+                ttft_ms: None,
+            };
             // (frontier, planned step end, planned, tokens out, first token time, itls)
-            let mut reqs: Vec<(u32, u32, bool, u32, f64, Vec<f64>)> =
-                lens.iter().map(|_| (0, 0, false, 0, 0.0, Vec::new())).collect();
+            let mut reqs: Vec<(u32, u32, bool, u32, f64, Vec<f64>)> = lens
+                .iter()
+                .map(|_| (0, 0, false, 0, 0.0, Vec::new()))
+                .collect();
             let (mut now, mut skipped, mut ticks) = (0.0f64, 0u32, 0u32);
             while reqs.iter().any(|r| r.3 < OUT) {
                 ticks += 1;
                 assert!(ticks < 2_000_000, "simulation did not finish");
-                let decodes: Vec<u32> =
-                    (0..20).filter(|&i| reqs[i].0 == lens[i] && reqs[i].3 < OUT).map(|i| i as u32).collect();
+                let decodes: Vec<u32> = (0..20)
+                    .filter(|&i| reqs[i].0 == lens[i] && reqs[i].3 < OUT)
+                    .map(|i| i as u32)
+                    .collect();
                 let cands: Vec<SloCandidate> = (0..20)
                     .filter(|&i| reqs[i].0 < lens[i])
                     .map(|i| {
@@ -1156,7 +1396,18 @@ mod tests {
                         c
                     })
                     .collect();
-                let (plan, _) = plan_tick(t, amd(), tick(), decodes.iter().copied(), &cands, &l, &truth, &mut skipped, |_| None, |_| u32::MAX);
+                let (plan, _) = plan_tick(
+                    t,
+                    amd(),
+                    tick(),
+                    decodes.iter().copied(),
+                    &cands,
+                    &l,
+                    &truth,
+                    &mut skipped,
+                    |_| None,
+                    |_| u32::MAX,
+                );
                 let mut dt = 0.0;
                 let mut finished = Vec::new();
                 for launch in &plan.launches {
@@ -1222,6 +1473,8 @@ mod tests {
     #[test]
     fn the_yardstick_counts_launches_and_decode_passes() {
         let ticks = [(1, 19), (1, 0), (0, 20), (2, 20)];
-        assert!((seconds_removed(&ticks, 25.0, 10.0) - (4.0 * 25.0 + 3.0 * 10.0) / 1e3).abs() < 1e-12);
+        assert!(
+            (seconds_removed(&ticks, 25.0, 10.0) - (4.0 * 25.0 + 3.0 * 10.0) / 1e3).abs() < 1e-12
+        );
     }
 }

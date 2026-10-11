@@ -68,14 +68,23 @@ pub(super) struct Riders {
     max_kv: u32,
 }
 
-fn rider_functions(be: &CudaBackend, module: &Module, arch: &str, fp8: bool) -> Option<[(KernelFn, u32); 3]> {
+fn rider_functions(
+    be: &CudaBackend,
+    module: &Module,
+    arch: &str,
+    fp8: bool,
+) -> Option<[(KernelFn, u32); 3]> {
     let global = |name: &str| be.module_global_u32(module, name).ok().flatten();
     if global("plow_rider_fp8_kv") != Some(u32::from(fp8)) {
         return None;
     }
     let f = |name: &str| be.get_function(module, &format!("plow_{arch}_{name}")).ok();
     let (s256, s512) = (global("plow_rider_smem256")?, global("plow_rider_smem512")?);
-    let (f256, f512, merge) = (f("rider_flash256")?, f("rider_flash512")?, f("rider_merge")?);
+    let (f256, f512, merge) = (
+        f("rider_flash256")?,
+        f("rider_flash512")?,
+        f("rider_merge")?,
+    );
     be.set_max_dynamic_smem(f256, s256).ok()?;
     be.set_max_dynamic_smem(f512, s512).ok()?;
     Some([(f256, s256), (f512, s512), (merge, 0)])
@@ -86,15 +95,21 @@ impl Riders {
     /// kernels and every attention site's operands match the widest decode rung's (same cache,
     /// window, ring and scale: the rows riders attend are exactly what a decode step would read).
     pub(super) fn load(e: &GpuEngine, blob: &DevBlob) -> Result<Option<Self>> {
-        if !RuntimeConfig::get().nv.tb_split_attn || e.packed_prefill.is_none() || e.seg_pf.is_none() {
+        if !RuntimeConfig::get().nv.tb_split_attn
+            || e.packed_prefill.is_none()
+            || e.seg_pf.is_none()
+        {
             return Ok(None);
         }
         let Some(decode) = blob.decode_progs().last().copied() else {
             return Ok(None);
         };
         let flash_ops = [DevOp::FlashDecode as u16, DevOp::FlashDecodeFp8 as u16];
-        let decode_sites: Vec<&DevInst64> =
-            decode.insts.iter().filter(|d| flash_ops.contains(&d.op)).collect();
+        let decode_sites: Vec<&DevInst64> = decode
+            .insts
+            .iter()
+            .filter(|d| flash_ops.contains(&d.op))
+            .collect();
         let Some(first) = decode_sites.first() else {
             return Ok(None);
         };
@@ -105,15 +120,22 @@ impl Riders {
         let Some([flash256, flash512, (merge, _)]) =
             rider_functions(&e.be, &e.module, profile.tag, fp8)
         else {
-            tracing::info!(route = "token-batch-split-attention", ready = false, "decode object has no rider kernels");
+            tracing::info!(
+                route = "token-batch-split-attention",
+                ready = false,
+                "decode object has no rider kernels"
+            );
             return Ok(None);
         };
-        let gf512 = e
-            .be
-            .module_global_u32(&e.module, "plow_rider_gf512")?
-            .unwrap_or(1)
-            .max(1);
-        let ptr = |h: u16| (h != TENSOR_NONE16).then(|| e.devp[h as usize].base).unwrap_or(0);
+        let gf512 =
+            e.be.module_global_u32(&e.module, "plow_rider_gf512")?
+                .unwrap_or(1)
+                .max(1);
+        let ptr = |h: u16| {
+            (h != TENSOR_NONE16)
+                .then(|| e.devp[h as usize].base)
+                .unwrap_or(0)
+        };
         let (mut max_heads, mut max_hd) = (0u64, 0u64);
         let mut sites = Vec::with_capacity(e.prefill.len());
         for bucket in &e.prefill {
@@ -125,14 +147,21 @@ impl Riders {
                 .filter(|&pc| bucket.stage_of.get(pc).copied().flatten().unwrap_or(0) == 0)
                 .collect();
             let Some(bucket_sites) = (|| {
-                if !uses_segmented_prefill(true, false, bucket.seg_class.len(), &bucket.packet_segment_roles)
-                    || !bucket.qwen_segments.is_empty()
+                if !uses_segmented_prefill(
+                    true,
+                    false,
+                    bucket.seg_class.len(),
+                    &bucket.packet_segment_roles,
+                ) || !bucket.qwen_segments.is_empty()
                     || flash_sites.len() != decode_sites.len()
                 {
                     return None;
                 }
                 let segment_of = |pc: usize| {
-                    bucket.segment_sites.iter().position(|s| s.iter().any(|&(i, _)| i == pc))
+                    bucket
+                        .segment_sites
+                        .iter()
+                        .position(|s| s.iter().any(|&(i, _)| i == pc))
                 };
                 let mut out = Vec::with_capacity(flash_sites.len());
                 for (&pc, d) in flash_sites.iter().zip(&decode_sites) {
@@ -144,9 +173,13 @@ impl Riders {
                         .position(|n| n.t.contains(&p.t[5]))
                         .and_then(|k| segment_of(pc + 1 + k));
                     // Riders read Q and write O after this segment: nothing later in it may touch them.
-                    let shares_segment = bucket.segment_sites[seg]
-                        .iter()
-                        .any(|&(i, _)| i > pc && bucket.h_inst[i].t.iter().any(|&t| t == p.t[2] || t == p.t[5]));
+                    let shares_segment = bucket.segment_sites[seg].iter().any(|&(i, _)| {
+                        i > pc
+                            && bucket.h_inst[i]
+                                .t
+                                .iter()
+                                .any(|&t| t == p.t[2] || t == p.t[5])
+                    });
                     let pfp8 = p.op == DevOp::FlashPrefillFp8 as u16;
                     if pfp8 != fp8
                         || d.op != first.op
@@ -194,7 +227,11 @@ impl Riders {
             sites.push(bucket_sites);
         }
         if sites.iter().all(Vec::is_empty) {
-            tracing::info!(route = "token-batch-split-attention", ready = false, "no bucket's attention sites qualify");
+            tracing::info!(
+                route = "token-batch-split-attention",
+                ready = false,
+                "no bucket's attention sites qualify"
+            );
             return Ok(None);
         }
         let batch = e.batch;
@@ -251,7 +288,9 @@ impl Riders {
             return Ok(());
         }
         if n > self.batch {
-            return Err(RuntimeError::Rejected("token-batch riders exceed the slot count".into()));
+            return Err(RuntimeError::Rejected(
+                "token-batch riders exceed the slot count".into(),
+            ));
         }
         for (i, (slot, kv_len)) in riders.enumerate() {
             self.host[i] = kv_len as i32;
@@ -271,7 +310,11 @@ impl Riders {
         let dynamic = [n as i32, split(256), split(512)];
         self.host[2 * self.batch..].copy_from_slice(&dynamic);
         unsafe {
-            be.memcpy_htod_async(self.tables.base, bytemuck::cast_slice(&self.host[..n]), stream)?;
+            be.memcpy_htod_async(
+                self.tables.base,
+                bytemuck::cast_slice(&self.host[..n]),
+                stream,
+            )?;
             be.memcpy_htod_async(
                 self.tables.base + (self.batch * 4) as u64,
                 bytemuck::cast_slice(&self.host[self.batch..self.batch + n]),
@@ -296,7 +339,11 @@ impl Riders {
     fn nsplit(&self, a: &RiderArgs) -> u32 {
         let gf = if a.hd == 256 { 2 } else { self.gf512 };
         let groups = u64::from(self.rows) * u64::from((a.n_head / gf).max(1));
-        let span = if a.window > 0 { self.max_kv.min(a.window) } else { self.max_kv };
+        let span = if a.window > 0 {
+            self.max_kv.min(a.window)
+        } else {
+            self.max_kv
+        };
         let row_bytes = u64::from(self.rows) * u64::from(a.n_head) * u64::from(a.hd) * 4;
         (4 * u64::from(self.sms))
             .div_ceil(groups.max(1))
@@ -325,7 +372,11 @@ impl Riders {
             dynamic: self.tables.base + (self.batch * 8) as u64,
             ..site.args
         };
-        let (function, smem) = if site.args.hd == 256 { self.flash256 } else { self.flash512 };
+        let (function, smem) = if site.args.hd == 256 {
+            self.flash256
+        } else {
+            self.flash512
+        };
         let grid = self.sms * 4;
         let mut params = [&mut args as *mut RiderArgs as *mut std::ffi::c_void];
         be.launch_kernel(function, grid, BLOCK, smem, &mut params, Some(stream))?;
@@ -340,7 +391,10 @@ impl Riders {
     /// Segments `start..end` (a graph piece between routed attention segments) cut after each
     /// rider site inside it.
     pub(super) fn split(&self, bucket: usize, start: usize, end: usize) -> Vec<(usize, usize)> {
-        let afters = self.sites[bucket].iter().map(|s| s.after).filter(|&a| a >= start && a + 1 < end);
+        let afters = self.sites[bucket]
+            .iter()
+            .map(|s| s.after)
+            .filter(|&a| a >= start && a + 1 < end);
         split_after(afters.map(|a| a - start), end - start)
             .into_iter()
             .map(|(a, b)| (a + start, b + start))
@@ -372,7 +426,11 @@ impl Riders {
             nsplit,
             ..*a
         };
-        let (function, smem) = if a.hd == 256 { self.flash256 } else { self.flash512 };
+        let (function, smem) = if a.hd == 256 {
+            self.flash256
+        } else {
+            self.flash512
+        };
         let items = groups * u64::from(nsplit);
         let grid = items.min(u64::from(self.sms) * 4) as u32;
         let mut params = [&mut args as *mut RiderArgs as *mut std::ffi::c_void];

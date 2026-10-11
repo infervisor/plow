@@ -58,7 +58,10 @@ pub fn should_yield(
 /// render thread is serial, so a stream that turns due while it waits (a first audio) waits
 /// behind this launch.
 pub fn serial_due(mine: crate::serve::cosched::Due) -> crate::serve::cosched::Due {
-    crate::serve::cosched::Due { band: mine.band.min(Band::First), ..mine }
+    crate::serve::cosched::Due {
+        band: mine.band.min(Band::First),
+        ..mine
+    }
 }
 
 /// [`should_yield`]'s margin: `PLOW_RENDER_YIELD_MARGIN_MS` (default 5 ms).
@@ -68,15 +71,21 @@ pub fn yield_margin_ns() -> i64 {
 
 /// The render's turn and its launch's own `Due` (before [`serial_due`]) while a launch runs;
 /// empty between launches.
-pub type HeldTurn = std::sync::Arc<Mutex<Option<(crate::serve::cosched::Turn, crate::serve::cosched::Due)>>>;
+pub type HeldTurn =
+    std::sync::Arc<Mutex<Option<(crate::serve::cosched::Turn, crate::serve::cosched::Due)>>>;
 
 /// A yield hook handing the render's held turn to a tighter waiter ([`should_yield`]) and taking
 /// it back by [`serial_due`] before the next segment.
-pub fn turn_yield(dt: std::sync::Arc<crate::serve::cosched::DeviceTurn>, held: HeldTurn) -> YieldHook {
+pub fn turn_yield(
+    dt: std::sync::Arc<crate::serve::cosched::DeviceTurn>,
+    held: HeldTurn,
+) -> YieldHook {
     let margin = yield_margin_ns();
     std::sync::Arc::new(move || {
         let mut held = held.lock();
-        let Some((turn, due)) = held.as_mut() else { return };
+        let Some((turn, due)) = held.as_mut() else {
+            return;
+        };
         let now = std::time::Instant::now();
         if !should_yield(dt.tightest_waiter(), due, now, margin) {
             return;
@@ -164,10 +173,17 @@ impl Codec {
 
     /// As [`Self::load`], on CUDA device `device`.
     pub fn load_on(assets: &Path, device: u8) -> Result<Self, String> {
-        let path = crate::exec::packet_runtime::stage_packet(&assets.join("model.pkt"), "codec.packet", PACKET)
-            .map_err(|e| e.to_string())?;
+        let path = crate::exec::packet_runtime::stage_packet(
+            &assets.join("model.pkt"),
+            "codec.packet",
+            PACKET,
+        )
+        .map_err(|e| e.to_string())?;
         if !path.is_file() {
-            return Err(format!("{} missing: emit it with PLOW_TTS_CODEC_DIR (docs/runtime/tts.md)", path.display()));
+            return Err(format!(
+                "{} missing: emit it with PLOW_TTS_CODEC_DIR (docs/runtime/tts.md)",
+                path.display()
+            ));
         }
         Self::load_packet_on(&path, device)
     }
@@ -192,7 +208,13 @@ impl Codec {
                 bound.yield_hook = hook;
                 let max_window = bound.cached.iter().map(|c| c.1).max().unwrap_or(0);
                 let info = (
-                    bound.capacities.iter().chain(&bound.cached).map(|c| c.0).max().unwrap_or(1),
+                    bound
+                        .capacities
+                        .iter()
+                        .chain(&bound.cached)
+                        .map(|c| c.0)
+                        .max()
+                        .unwrap_or(1),
                     bound.capacities.iter().map(|c| c.1).max().unwrap_or(0),
                     bound.capacities.iter().map(|c| c.1).min().unwrap_or(0),
                     bound.frame_codes,
@@ -208,8 +230,19 @@ impl Codec {
                 run(rx, bound);
             })
             .map_err(|e| e.to_string())?;
-        let (max_batch, max_frames, min_frames, frame_codes, frame_samples, window, lookahead, voices, parameters, max_window, window_capacities) =
-            ready_rx.recv().map_err(|e| e.to_string())??;
+        let (
+            max_batch,
+            max_frames,
+            min_frames,
+            frame_codes,
+            frame_samples,
+            window,
+            lookahead,
+            voices,
+            parameters,
+            max_window,
+            window_capacities,
+        ) = ready_rx.recv().map_err(|e| e.to_string())??;
         Ok(Codec {
             tx: Mutex::new(tx),
             yield_hook,
@@ -243,18 +276,42 @@ impl Codec {
     }
 
     /// `frames * frame_codes` codebook ids -> `frames * frame_samples` samples.
-    pub async fn decode(&self, codes: Vec<i32>, frames: usize, seed: u64, urgency: Urgency) -> Result<Vec<f32>, String> {
-        self.decode_as(codes, frames, seed, 0, urgency, None).await.map(|d| d.pcm)
+    pub async fn decode(
+        &self,
+        codes: Vec<i32>,
+        frames: usize,
+        seed: u64,
+        urgency: Urgency,
+    ) -> Result<Vec<f32>, String> {
+        self.decode_as(codes, frames, seed, 0, urgency, None)
+            .await
+            .map(|d| d.pcm)
     }
 
     /// [`Self::decode`] for the packet's voice `voice` (an index into [`Self::voices`]).
-    pub async fn decode_voice(&self, codes: Vec<i32>, frames: usize, seed: u64, voice: u32) -> Result<Vec<f32>, String> {
-        self.decode_as(codes, frames, seed, voice, Urgency::Stream, None).await.map(|d| d.pcm)
+    pub async fn decode_voice(
+        &self,
+        codes: Vec<i32>,
+        frames: usize,
+        seed: u64,
+        voice: u32,
+    ) -> Result<Vec<f32>, String> {
+        self.decode_as(codes, frames, seed, voice, Urgency::Stream, None)
+            .await
+            .map(|d| d.pcm)
     }
 
     /// A stream window on the cached capacities (`max_window > 0`).
-    pub async fn decode_window(&self, codes: Vec<i32>, frames: usize, seed: u64, voice: u32, window: Window) -> Result<Decoded, String> {
-        self.decode_as(codes, frames, seed, voice, Urgency::Stream, Some(window)).await
+    pub async fn decode_window(
+        &self,
+        codes: Vec<i32>,
+        frames: usize,
+        seed: u64,
+        voice: u32,
+        window: Window,
+    ) -> Result<Decoded, String> {
+        self.decode_as(codes, frames, seed, voice, Urgency::Stream, Some(window))
+            .await
     }
 
     async fn decode_as(
@@ -270,9 +327,19 @@ impl Codec {
         let _work = self.credit.as_ref().map(|c| c.work());
         self.tx
             .lock()
-            .send(Job { codes, frames, seed, voice, urgency, window, reply, _work })
+            .send(Job {
+                codes,
+                frames,
+                seed,
+                voice,
+                urgency,
+                window,
+                reply,
+                _work,
+            })
             .map_err(|_| "codec worker stopped".to_string())?;
-        rx.await.map_err(|_| "codec worker dropped the job".to_string())?
+        rx.await
+            .map_err(|_| "codec worker dropped the job".to_string())?
     }
 }
 
@@ -283,13 +350,18 @@ fn bind(path: &Path, device: u8) -> Result<Bound, String> {
     let asset = PacketAsset::load(path).map_err(e)?;
     let pipeline = asset.bind_driver(DRIVER, runtime.as_ref()).map_err(e)?;
     let param = |k: &str| pipeline.parameter(k).map(|v| v as usize).map_err(e);
-    let mut sequences: std::collections::BTreeMap<(usize, usize), Vec<(usize, usize)>> = Default::default();
-    let mut cached: std::collections::BTreeMap<(usize, usize), Vec<(usize, usize)>> = Default::default();
+    let mut sequences: std::collections::BTreeMap<(usize, usize), Vec<(usize, usize)>> =
+        Default::default();
+    let mut cached: std::collections::BTreeMap<(usize, usize), Vec<(usize, usize)>> =
+        Default::default();
     let mut prefill: std::collections::BTreeMap<u32, Vec<(usize, usize)>> = Default::default();
     for (role, program) in pipeline.programs() {
         let parts: Vec<&str> = role.split('.').collect();
         let dims = |b: &str, u: &str, bp: &str, up: &str| {
-            Some((b.strip_prefix(bp)?.parse::<usize>().ok()?, u.strip_prefix(up)?.parse::<usize>().ok()?))
+            Some((
+                b.strip_prefix(bp)?.parse::<usize>().ok()?,
+                u.strip_prefix(up)?.parse::<usize>().ok()?,
+            ))
         };
         match parts.as_slice() {
             ["decode", b, f] => {
@@ -299,12 +371,19 @@ fn bind(path: &Path, device: u8) -> Result<Bound, String> {
             }
             ["synth", b, t, stage] | ["csynth", b, t, stage] => {
                 if let (Some(key), Ok(stage)) = (dims(b, t, "b", "t"), stage.parse::<usize>()) {
-                    let family = if parts[0] == "synth" { &mut sequences } else { &mut cached };
+                    let family = if parts[0] == "synth" {
+                        &mut sequences
+                    } else {
+                        &mut cached
+                    };
                     family.entry(key).or_default().push((stage, program));
                 }
             }
             ["prefill", v, stage] => {
-                if let (Some(v), Ok(stage)) = (v.strip_prefix('v').and_then(|v| v.parse::<u32>().ok()), stage.parse::<usize>()) {
+                if let (Some(v), Ok(stage)) = (
+                    v.strip_prefix('v').and_then(|v| v.parse::<u32>().ok()),
+                    stage.parse::<usize>(),
+                ) {
                     prefill.entry(v).or_default().push((stage, program));
                 }
             }
@@ -315,11 +394,15 @@ fn bind(path: &Path, device: u8) -> Result<Bound, String> {
         stages.sort();
         stages.into_iter().map(|(_, p)| p).collect()
     };
-    let family = |seqs: std::collections::BTreeMap<(usize, usize), Vec<(usize, usize)>>| -> Vec<Capacity> {
-        let mut caps: Vec<Capacity> = seqs.into_iter().map(|((b, f), stages)| (b, f, ordered(stages))).collect();
-        caps.sort_by_key(|&(b, f, _)| (b * f, f));
-        caps
-    };
+    let family =
+        |seqs: std::collections::BTreeMap<(usize, usize), Vec<(usize, usize)>>| -> Vec<Capacity> {
+            let mut caps: Vec<Capacity> = seqs
+                .into_iter()
+                .map(|((b, f), stages)| (b, f, ordered(stages)))
+                .collect();
+            caps.sort_by_key(|&(b, f, _)| (b * f, f));
+            caps
+        };
     let capacities = family(sequences);
     let cached = family(cached);
     if capacities.is_empty() {
@@ -332,9 +415,18 @@ fn bind(path: &Path, device: u8) -> Result<Bound, String> {
     for (_, _, programs) in capacities.iter().chain(&cached) {
         runtime.run_sequence(programs).map_err(e)?;
     }
-    tracing::info!(capacities = capacities.len() + cached.len(), ms = t.elapsed().as_millis() as u64, "codec graphs warmed");
+    tracing::info!(
+        capacities = capacities.len() + cached.len(),
+        ms = t.elapsed().as_millis() as u64,
+        "codec graphs warmed"
+    );
     let lengths = (0..param("lengths.count")?)
-        .map(|k| Ok((pipeline.tensor(&format!("lengths.{k}")).map_err(e)?, param(&format!("lengths.{k}.rows_per_frame"))?)))
+        .map(|k| {
+            Ok((
+                pipeline.tensor(&format!("lengths.{k}")).map_err(e)?,
+                param(&format!("lengths.{k}.rows_per_frame"))?,
+            ))
+        })
         .collect::<Result<Vec<_>, String>>()?;
     let seed = pipeline.tensor("seed").map_err(e)?;
     let voice = pipeline.tensor("voice").ok();
@@ -356,14 +448,20 @@ fn bind(path: &Path, device: u8) -> Result<Bound, String> {
         }
     }
     let phase = ["phase", "phase_out", "seam", "next_seam"].map(|k| pipeline.tensor(k).ok());
-    let phase = phase.iter().all(Option::is_some).then(|| phase.map(Option::unwrap));
+    let phase = phase
+        .iter()
+        .all(Option::is_some)
+        .then(|| phase.map(Option::unwrap));
     if !cached.is_empty() && phase.is_none() {
         return Err("cached codec capacities without the window phase tensors".into());
     }
     Ok(Bound {
         cached,
         phase,
-        harmonics: pipeline.parameter("vocoder.harmonics").map(|v| v as usize).unwrap_or(0),
+        harmonics: pipeline
+            .parameter("vocoder.harmonics")
+            .map(|v| v as usize)
+            .unwrap_or(0),
         codes: pipeline.tensor("codes").map_err(e)?,
         seed,
         pcm: pipeline.tensor("pcm").map_err(e)?,
@@ -372,7 +470,10 @@ fn bind(path: &Path, device: u8) -> Result<Bound, String> {
         window: param("stream.window_frames")?,
         lookahead: param("stream.lookahead_frames")?,
         voice,
-        voices: pipeline.optional_string("voices").map(|v| v.lines().map(str::to_owned).collect()).unwrap_or_default(),
+        voices: pipeline
+            .optional_string("voices")
+            .map(|v| v.lines().map(str::to_owned).collect())
+            .unwrap_or_default(),
         parameters: asset
             .pipelines()
             .iter()
@@ -383,7 +484,10 @@ fn bind(path: &Path, device: u8) -> Result<Bound, String> {
         capacities,
         runtime,
         yield_hook: Default::default(),
-        yield_programs: pipeline.parameter("render.yield_programs").map(|v| v as usize).unwrap_or(0),
+        yield_programs: pipeline
+            .parameter("render.yield_programs")
+            .map(|v| v as usize)
+            .unwrap_or(0),
     })
 }
 
@@ -391,7 +495,11 @@ impl Bound {
     /// The smallest capacity (of the window family when `window`) holding `batch` items of
     /// `frames` frames.
     fn capacity(&self, window: bool, batch: usize, frames: usize) -> Option<&Capacity> {
-        let family = if window { &self.cached } else { &self.capacities };
+        let family = if window {
+            &self.cached
+        } else {
+            &self.capacities
+        };
         family.iter().find(|&&(b, f, _)| b >= batch && f >= frames)
     }
 
@@ -401,7 +509,12 @@ impl Bound {
         let (cb, cf, programs) = self
             .capacity(window, jobs.len(), frames)
             .cloned()
-            .ok_or_else(|| format!("{} x {frames} frames exceeds every codec capacity", jobs.len()))?;
+            .ok_or_else(|| {
+                format!(
+                    "{} x {frames} frames exceeds every codec capacity",
+                    jobs.len()
+                )
+            })?;
         let fc = self.frame_codes;
         let t0 = std::time::Instant::now();
         // Only the capacity's region of the (widest-capacity) input and output tensors moves: the
@@ -413,25 +526,33 @@ impl Bound {
             }
         }
         let e = |x: crate::RuntimeError| x.to_string();
-        self.runtime.write_tensor_at(self.codes, 0, bytemuck::cast_slice(&codes)).map_err(e)?;
+        self.runtime
+            .write_tensor_at(self.codes, 0, bytemuck::cast_slice(&codes))
+            .map_err(e)?;
         for &(tensor, per_frame) in &self.lengths {
             let mut len = vec![0u32; tensor.bytes / 4];
             for (i, j) in jobs.iter().enumerate() {
                 len[i] = (j.frames * per_frame) as u32;
             }
-            self.runtime.write_tensor(tensor, bytemuck::cast_slice(&len)).map_err(e)?;
+            self.runtime
+                .write_tensor(tensor, bytemuck::cast_slice(&len))
+                .map_err(e)?;
         }
         let mut seeds = vec![0u64; self.seed.bytes / 8];
         for (i, j) in jobs.iter().enumerate() {
             seeds[i] = j.seed;
         }
-        self.runtime.write_tensor(self.seed, bytemuck::cast_slice(&seeds)).map_err(e)?;
+        self.runtime
+            .write_tensor(self.seed, bytemuck::cast_slice(&seeds))
+            .map_err(e)?;
         if let Some(voice) = self.voice {
             let mut v = vec![0u32; voice.bytes / 4];
             for (i, j) in jobs.iter().enumerate() {
                 v[i] = j.voice;
             }
-            self.runtime.write_tensor(voice, bytemuck::cast_slice(&v)).map_err(e)?;
+            self.runtime
+                .write_tensor(voice, bytemuck::cast_slice(&v))
+                .map_err(e)?;
         }
         let nh = self.harmonics;
         let windows = if window { self.phase } else { None };
@@ -439,12 +560,19 @@ impl Bound {
             let mut p = vec![0f32; phase.bytes / 4];
             let (mut s, mut ns) = (vec![0u32; seam.bytes / 4], vec![0u32; next_seam.bytes / 4]);
             for (i, w) in jobs.iter().filter_map(|j| j.window.as_ref()).enumerate() {
-                p[i * nh..][..w.phase.len().min(nh)].copy_from_slice(&w.phase[..w.phase.len().min(nh)]);
+                p[i * nh..][..w.phase.len().min(nh)]
+                    .copy_from_slice(&w.phase[..w.phase.len().min(nh)]);
                 (s[i], ns[i]) = (w.seam, w.next_seam);
             }
-            self.runtime.write_tensor(phase, bytemuck::cast_slice(&p)).map_err(e)?;
-            self.runtime.write_tensor(seam, bytemuck::cast_slice(&s)).map_err(e)?;
-            self.runtime.write_tensor(next_seam, bytemuck::cast_slice(&ns)).map_err(e)?;
+            self.runtime
+                .write_tensor(phase, bytemuck::cast_slice(&p))
+                .map_err(e)?;
+            self.runtime
+                .write_tensor(seam, bytemuck::cast_slice(&s))
+                .map_err(e)?;
+            self.runtime
+                .write_tensor(next_seam, bytemuck::cast_slice(&ns))
+                .map_err(e)?;
         }
         let t1 = std::time::Instant::now();
         let hook = self.yield_hook.lock().clone();
@@ -466,11 +594,15 @@ impl Bound {
         }
         let t2 = std::time::Instant::now();
         let mut pcm = vec![0f32; cb * cf * self.frame_samples];
-        self.runtime.read_tensor_at(self.pcm, 0, bytemuck::cast_slice_mut(&mut pcm)).map_err(e)?;
+        self.runtime
+            .read_tensor_at(self.pcm, 0, bytemuck::cast_slice_mut(&mut pcm))
+            .map_err(e)?;
         let mut phase_out = Vec::new();
         if let Some([_, out, _, _]) = windows {
             phase_out = vec![0f32; out.bytes / 4];
-            self.runtime.read_tensor(out, bytemuck::cast_slice_mut(&mut phase_out)).map_err(e)?;
+            self.runtime
+                .read_tensor(out, bytemuck::cast_slice_mut(&mut phase_out))
+                .map_err(e)?;
         }
         tracing::debug!(
             target: "plowrt::tts::codec_launch",
@@ -492,14 +624,24 @@ impl Bound {
             .enumerate()
             .map(|(i, j)| Decoded {
                 pcm: pcm[i * per..i * per + j.frames * self.frame_samples].to_vec(),
-                phase: if window { phase_out[i * nh..(i + 1) * nh].to_vec() } else { Vec::new() },
+                phase: if window {
+                    phase_out[i * nh..(i + 1) * nh].to_vec()
+                } else {
+                    Vec::new()
+                },
             })
             .collect())
     }
 }
 
 fn run(rx: mpsc::Receiver<Job>, mut codec: Bound) {
-    let max_batch = codec.capacities.iter().chain(&codec.cached).map(|c| c.0).max().unwrap_or(1);
+    let max_batch = codec
+        .capacities
+        .iter()
+        .chain(&codec.cached)
+        .map(|c| c.0)
+        .max()
+        .unwrap_or(1);
     let mut pending: Vec<Job> = Vec::new();
     while let Ok(first) = rx.recv() {
         pending.push(first);
@@ -519,7 +661,10 @@ fn run(rx: mpsc::Receiver<Job>, mut codec: Bound) {
                 if j.window.is_some() != window {
                     continue;
                 }
-                if codec.capacity(window, take.len() + 1, frames.max(j.frames)).is_none() {
+                if codec
+                    .capacity(window, take.len() + 1, frames.max(j.frames))
+                    .is_none()
+                {
                     break;
                 }
                 frames = frames.max(j.frames);
@@ -527,9 +672,15 @@ fn run(rx: mpsc::Receiver<Job>, mut codec: Bound) {
             }
             let mut batch: Vec<Job> = take.iter().rev().map(|&k| pending.remove(k)).collect();
             batch.reverse();
-            if frames == 0 || batch.iter().any(|j| j.codes.len() != j.frames * codec.frame_codes) {
+            if frames == 0
+                || batch
+                    .iter()
+                    .any(|j| j.codes.len() != j.frames * codec.frame_codes)
+            {
                 for j in batch {
-                    let _ = j.reply.send(Err("codec job has no frames or a partial frame".into()));
+                    let _ = j
+                        .reply
+                        .send(Err("codec job has no frames or a partial frame".into()));
                 }
                 continue;
             }
@@ -559,33 +710,84 @@ mod tests {
     fn render_yields_only_to_an_outranking_first_output_or_near_miss() {
         let now = Instant::now();
         let at = |ms: i64, band| Due {
-            deadline: if ms >= 0 { now + Duration::from_millis(ms as u64) } else { now - Duration::from_millis(-ms as u64) },
+            deadline: if ms >= 0 {
+                now + Duration::from_millis(ms as u64)
+            } else {
+                now - Duration::from_millis(-ms as u64)
+            },
             cost: Duration::ZERO,
             band,
         };
         let m = 5_000_000;
         let stream = at(100, Band::Stream);
         assert!(!should_yield(None, &stream, now, m));
-        assert!(should_yield(Some(at(20, Band::Stream)), &stream, now, m), "about to miss");
-        assert!(!should_yield(Some(at(40, Band::Stream)), &stream, now, m), "decode, not urgent");
+        assert!(
+            should_yield(Some(at(20, Band::Stream)), &stream, now, m),
+            "about to miss"
+        );
+        assert!(
+            !should_yield(Some(at(40, Band::Stream)), &stream, now, m),
+            "decode, not urgent"
+        );
         assert!(!should_yield(Some(at(200, Band::Stream)), &stream, now, m));
-        assert!(should_yield(Some(at(-50, Band::Stream)), &at(-10, Band::Stream), now, m), "both late: the later one first");
-        assert!(!should_yield(Some(at(-5, Band::Stream)), &at(-10, Band::Stream), now, m), "within the margin");
+        assert!(
+            should_yield(Some(at(-50, Band::Stream)), &at(-10, Band::Stream), now, m),
+            "both late: the later one first"
+        );
+        assert!(
+            !should_yield(Some(at(-5, Band::Stream)), &at(-10, Band::Stream), now, m),
+            "within the margin"
+        );
         // A first output takes the device from window renders, not from an urgent one or a
         // tighter first audio.
         assert!(should_yield(Some(at(700, Band::First)), &stream, now, m));
-        assert!(!should_yield(Some(at(700, Band::First)), &at(20, Band::Stream), now, m));
-        assert!(!should_yield(Some(at(700, Band::First)), &at(400, Band::First), now, m));
-        assert!(!should_yield(Some(at(10, Band::Stream)), &at(5, Band::Stream), now, m));
+        assert!(!should_yield(
+            Some(at(700, Band::First)),
+            &at(20, Band::Stream),
+            now,
+            m
+        ));
+        assert!(!should_yield(
+            Some(at(700, Band::First)),
+            &at(400, Band::First),
+            now,
+            m
+        ));
+        assert!(!should_yield(
+            Some(at(10, Band::Stream)),
+            &at(5, Band::Stream),
+            now,
+            m
+        ));
         assert!(!should_yield(Some(at(10, Band::Bulk)), &stream, now, m));
         // A window render takes the device as a first output; a first output stays one.
         assert_eq!(super::serial_due(stream).band, Band::First);
         assert_eq!(super::serial_due(at(400, Band::First)).band, Band::First);
         // An ASR final takes the device from any render that is not urgent; late, it competes with
         // an urgent render by slack.
-        assert!(should_yield(Some(at(480, Band::Final)), &at(300, Band::First), now, m));
-        assert!(!should_yield(Some(at(480, Band::Final)), &at(20, Band::Stream), now, m));
-        assert!(!should_yield(Some(at(-10, Band::Final)), &at(-300, Band::Stream), now, m));
-        assert!(should_yield(Some(at(-300, Band::Final)), &at(-10, Band::Stream), now, m));
+        assert!(should_yield(
+            Some(at(480, Band::Final)),
+            &at(300, Band::First),
+            now,
+            m
+        ));
+        assert!(!should_yield(
+            Some(at(480, Band::Final)),
+            &at(20, Band::Stream),
+            now,
+            m
+        ));
+        assert!(!should_yield(
+            Some(at(-10, Band::Final)),
+            &at(-300, Band::Stream),
+            now,
+            m
+        ));
+        assert!(should_yield(
+            Some(at(-300, Band::Final)),
+            &at(-10, Band::Stream),
+            now,
+            m
+        ));
     }
 }

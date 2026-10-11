@@ -96,7 +96,13 @@ struct StepFit {
 
 impl StepFit {
     fn add(&mut self, w: f64, y: f64) {
-        for s in [&mut self.s0, &mut self.sx, &mut self.sy, &mut self.sxx, &mut self.sxy] {
+        for s in [
+            &mut self.s0,
+            &mut self.sx,
+            &mut self.sy,
+            &mut self.sxx,
+            &mut self.sxy,
+        ] {
             *s *= DECAY;
         }
         self.s0 += 1.0;
@@ -109,7 +115,11 @@ impl StepFit {
             self.by_width.resize(i + 1, (0.0, 0));
         }
         let (m, n) = &mut self.by_width[i];
-        *m = if *n == 0 { y } else { (1.0 - WIDTH_ALPHA) * *m + WIDTH_ALPHA * y };
+        *m = if *n == 0 {
+            y
+        } else {
+            (1.0 - WIDTH_ALPHA) * *m + WIDTH_ALPHA * y
+        };
         *n += 1;
     }
 
@@ -126,12 +136,21 @@ impl StepFit {
         if let Some(own) = self.by_width.get(w as usize).and_then(trusted) {
             return Some(own);
         }
-        Some(self.by_width.iter().take(w as usize + 1).filter_map(trusted).fold(line, f64::max))
+        Some(
+            self.by_width
+                .iter()
+                .take(w as usize + 1)
+                .filter_map(trusted)
+                .fold(line, f64::max),
+        )
     }
 
     /// The widest width whose own step is trusted (0: none).
     fn explored(&self) -> usize {
-        self.by_width.iter().rposition(|&(_, n)| n >= WIDTH_MIN_SAMPLES).unwrap_or(0)
+        self.by_width
+            .iter()
+            .rposition(|&(_, n)| n >= WIDTH_MIN_SAMPLES)
+            .unwrap_or(0)
     }
 }
 
@@ -176,7 +195,11 @@ impl Live {
     fn lead(&self, epoch: Instant, now: Instant) -> Option<f64> {
         let first = self.first_audio.load(Relaxed).checked_sub(1)?;
         let played = now.saturating_duration_since(epoch).as_secs_f64() - first as f64 * 1e-9;
-        let join = if self.seg.load(Relaxed) + 1 < self.chars.len() { JOIN_S } else { 0.0 };
+        let join = if self.seg.load(Relaxed) + 1 < self.chars.len() {
+            JOIN_S
+        } else {
+            0.0
+        };
         Some(f64::from_bits(self.audio_s.load(Relaxed)) - played - GUARD_S - join)
     }
 }
@@ -229,31 +252,55 @@ fn fits(inner: &Inner, width: usize, need: &Need, rt: (f64, f64, Instant), now: 
     if width + 1 > inner.fit.explored() + RAMP_WIDTH {
         return false;
     }
-    let Some(p) = inner.frame_s(width + 1, frame_codes) else { return true };
+    let Some(p) = inner.frame_s(width + 1, frame_codes) else {
+        return true;
+    };
     let a = audio_per_frame;
     if p <= a {
         return true;
     }
     let fpc = inner.fpc.high();
-    for (_, s) in inner.active.iter().filter(|(_, s)| s.stream && !s.lm_done.load(Relaxed)) {
-        let Some(lead) = s.lead(epoch, now) else { continue };
+    for (_, s) in inner
+        .active
+        .iter()
+        .filter(|(_, s)| s.stream && !s.lm_done.load(Relaxed))
+    {
+        let Some(lead) = s.lead(epoch, now) else {
+            continue;
+        };
         if s.remaining_frames(fpc) * (p - a) > lead {
             return false;
         }
     }
-    let frames: f64 = need.chars.iter().zip(&need.budget).map(|(&c, &b)| projected(c, b, fpc)).sum();
+    let frames: f64 = need
+        .chars
+        .iter()
+        .zip(&need.budget)
+        .map(|(&c, &b)| projected(c, b, fpc))
+        .sum();
     !need.stream || frames * (p - a) <= MAX_HOLD_S * a / p
 }
 
 impl RealTime {
     pub fn new(audio_per_frame: f64, frame_codes: usize) -> Arc<Self> {
         let rt = crate::config::RuntimeConfig::get();
-        Self::with(audio_per_frame, frame_codes, rt.tts_realtime, Duration::from_millis(rt.tts_admit_wait_ms))
+        Self::with(
+            audio_per_frame,
+            frame_codes,
+            rt.tts_realtime,
+            Duration::from_millis(rt.tts_admit_wait_ms),
+        )
     }
 
     fn with(audio_per_frame: f64, frame_codes: usize, enabled: bool, wait: Duration) -> Arc<Self> {
         Arc::new(RealTime {
-            inner: Mutex::new(Inner { next: 0, active: Vec::new(), queue: VecDeque::new(), fit: StepFit::default(), fpc: Fpc::default() }),
+            inner: Mutex::new(Inner {
+                next: 0,
+                active: Vec::new(),
+                queue: VecDeque::new(),
+                fit: StepFit::default(),
+                fpc: Fpc::default(),
+            }),
             width: AtomicUsize::new(0),
             epoch: Instant::now(),
             changed: tokio::sync::Notify::new(),
@@ -271,9 +318,20 @@ impl RealTime {
     /// Wait in arrival order for admission; `Err` is the `Retry-After` of a refusal. Disabled,
     /// every request is admitted at once and nothing is tracked.
     pub async fn admit(self: &Arc<Self>, need: Need) -> Result<Ticket, Duration> {
-        let live = |need: Need| Arc::new(Live { stream: need.stream, chars: need.chars, budget: need.budget, ..Live::default() });
+        let live = |need: Need| {
+            Arc::new(Live {
+                stream: need.stream,
+                chars: need.chars,
+                budget: need.budget,
+                ..Live::default()
+            })
+        };
         if !self.enabled {
-            return Ok(Ticket { rt: Arc::clone(self), id: 0, live: live(need) });
+            return Ok(Ticket {
+                rt: Arc::clone(self),
+                id: 0,
+                live: live(need),
+            });
         }
         let id = {
             let mut g = self.inner.lock();
@@ -292,31 +350,55 @@ impl RealTime {
                 let mut g = self.inner.lock();
                 let head = g.queue.front() == Some(&id);
                 let width = self.width.load(Relaxed);
-                if head && fits(&g, width, &need, (self.audio_per_frame, self.frame_codes, self.epoch), now) {
+                if head
+                    && fits(
+                        &g,
+                        width,
+                        &need,
+                        (self.audio_per_frame, self.frame_codes, self.epoch),
+                        now,
+                    )
+                {
                     g.queue.pop_front();
                     let l = live(need);
                     g.active.push((id, Arc::clone(&l)));
                     self.width.fetch_add(1, Relaxed);
                     drop(g);
                     self.changed.notify_waiters();
-                    return Ok(Ticket { rt: Arc::clone(self), id, live: l });
+                    return Ok(Ticket {
+                        rt: Arc::clone(self),
+                        id,
+                        live: l,
+                    });
                 }
                 if now >= deadline {
                     let retry = self.retry_after(&g);
-                    tracing::debug!(retry_s = retry.as_secs(), "tts: admission wait exceeded; refusing");
+                    tracing::debug!(
+                        retry_s = retry.as_secs(),
+                        "tts: admission wait exceeded; refusing"
+                    );
                     return Err(retry);
                 }
             }
-            let poll = deadline.saturating_duration_since(now).min(Duration::from_millis(20));
+            let poll = deadline
+                .saturating_duration_since(now)
+                .min(Duration::from_millis(20));
             let _ = tokio::time::timeout(poll, changed).await;
         }
     }
 
     /// Until the soonest generating request is projected to finish, 1..=30 s.
     fn retry_after(&self, g: &Inner) -> Duration {
-        let p = g.frame_s(self.width.load(Relaxed), self.frame_codes).unwrap_or(self.audio_per_frame);
+        let p = g
+            .frame_s(self.width.load(Relaxed), self.frame_codes)
+            .unwrap_or(self.audio_per_frame);
         let fpc = g.fpc.high();
-        let soonest = g.active.iter().map(|(_, s)| s.remaining_frames(fpc) * p).filter(|&t| t > 0.0).fold(f64::INFINITY, f64::min);
+        let soonest = g
+            .active
+            .iter()
+            .map(|(_, s)| s.remaining_frames(fpc) * p)
+            .filter(|&t| t > 0.0)
+            .fold(f64::INFINITY, f64::min);
         Duration::from_secs(soonest.ceil().clamp(1.0, 30.0) as u64)
     }
 }
@@ -383,7 +465,8 @@ impl Ticket {
         let t = self.rt.since_epoch(now);
         l.sample_at.store(t, Relaxed);
         l.since_sample.store(0, Relaxed);
-        let step = t.saturating_sub(at) as f64 * 1e-9 / (SAMPLE_FRAMES as f64 * self.rt.frame_codes);
+        let step =
+            t.saturating_sub(at) as f64 * 1e-9 / (SAMPLE_FRAMES as f64 * self.rt.frame_codes);
         let width = self.rt.width.load(Relaxed);
         self.rt.inner.lock().fit.add(width as f64, step);
     }
@@ -418,7 +501,10 @@ impl Ticket {
     pub fn first_audio(&self) {
         if self.tracked() {
             let t = self.rt.since_epoch(Instant::now());
-            let _ = self.live.first_audio.compare_exchange(0, t, Relaxed, Relaxed);
+            let _ = self
+                .live
+                .first_audio
+                .compare_exchange(0, t, Relaxed, Relaxed);
         }
     }
 
@@ -459,16 +545,32 @@ mod tests {
         for _ in 0..FPC_MIN_SAMPLES {
             fpc.add(1.0);
         }
-        Inner { next: 0, active: Vec::new(), queue: VecDeque::new(), fit, fpc }
+        Inner {
+            next: 0,
+            active: Vec::new(),
+            queue: VecDeque::new(),
+            fit,
+            fpc,
+        }
     }
 
     /// A request whose budget (2 frames per character) never binds the 1.0 learnt rate.
     fn need(stream: bool, chars: Vec<usize>) -> Need {
-        Need { stream, budget: chars.iter().map(|c| 2 * c).collect(), chars }
+        Need {
+            stream,
+            budget: chars.iter().map(|c| 2 * c).collect(),
+            chars,
+        }
     }
 
     fn live(chars: Vec<usize>, budget: Vec<usize>, frames: usize) -> Live {
-        Live { stream: true, chars, budget, seg_frames: AtomicUsize::new(frames), ..Live::default() }
+        Live {
+            stream: true,
+            chars,
+            budget,
+            seg_frames: AtomicUsize::new(frames),
+            ..Live::default()
+        }
     }
 
     struct Bench {
@@ -480,26 +582,45 @@ mod tests {
     impl Bench {
         fn new(step_at: impl Fn(f64) -> f64) -> Self {
             let epoch = Instant::now();
-            Bench { inner: inner(step_at), epoch, now: epoch + Duration::from_secs(100) }
+            Bench {
+                inner: inner(step_at),
+                epoch,
+                now: epoch + Duration::from_secs(100),
+            }
         }
 
         /// A stream that generated `frames` (all sent) and has played `played_s`.
         fn play(&mut self, chars: usize, frames: usize, played_s: f64) -> Arc<Live> {
             let l = live(vec![chars], vec![2 * chars], frames);
             l.audio_s.store((frames as f64 * A).to_bits(), Relaxed);
-            let first = (self.now - Duration::from_secs_f64(played_s)).saturating_duration_since(self.epoch).as_nanos() as u64 + 1;
+            let first = (self.now - Duration::from_secs_f64(played_s))
+                .saturating_duration_since(self.epoch)
+                .as_nanos() as u64
+                + 1;
             l.first_audio.store(first, Relaxed);
             let l = Arc::new(l);
-            self.inner.active.push((self.inner.active.len() as u64 + 1, Arc::clone(&l)));
+            self.inner
+                .active
+                .push((self.inner.active.len() as u64 + 1, Arc::clone(&l)));
             l
         }
 
         fn width(&self) -> usize {
-            self.inner.active.iter().filter(|(_, l)| !l.lm_done.load(Relaxed)).count()
+            self.inner
+                .active
+                .iter()
+                .filter(|(_, l)| !l.lm_done.load(Relaxed))
+                .count()
         }
 
         fn fits(&self, need: &Need) -> bool {
-            fits(&self.inner, self.width(), need, (A, 7.0, self.epoch), self.now)
+            fits(
+                &self.inner,
+                self.width(),
+                need,
+                (A, 7.0, self.epoch),
+                self.now,
+            )
         }
     }
 
@@ -538,13 +659,20 @@ mod tests {
             f.add(33.0, rung(33.0));
         }
         assert!(f.predict(33.0).unwrap() >= 18.4e-3 && f.predict(40.0).unwrap() >= 18.4e-3);
-        assert!(f.predict(16.0).unwrap() < 12e-3, "narrower widths keep their own step");
+        assert!(
+            f.predict(16.0).unwrap() < 12e-3,
+            "narrower widths keep their own step"
+        );
     }
 
     #[test]
     fn segments_project_at_the_tail_capped_by_their_budget() {
         let mut f = Fpc::default();
-        assert_eq!(projected(100, 180, f.high()), 180.0, "no samples: the budget");
+        assert_eq!(
+            projected(100, 180, f.high()),
+            180.0,
+            "no samples: the budget"
+        );
         // Orpheus-like: 85% speak at ~1.1 frames per character, 15% run to the 1.8 budget.
         for i in 0..200 {
             f.add(if i % 20 < 3 { 1.8 } else { 1.1 });
@@ -667,14 +795,19 @@ mod tests {
         blocker.first_audio();
         let mut held = Vec::new();
         for _ in 0..40 {
-            let r = tokio::time::timeout(Duration::from_millis(50), rt.admit(need(false, vec![40]))).await;
+            let r =
+                tokio::time::timeout(Duration::from_millis(50), rt.admit(need(false, vec![40])))
+                    .await;
             match r {
                 Ok(t) => held.push(t.unwrap()),
                 Err(_) => break,
             }
         }
         assert!(held.len() < 40, "the blocker never filled");
-        assert!(rt.inner.lock().queue.is_empty(), "the timed-out waiter left the queue");
+        assert!(
+            rt.inner.lock().queue.is_empty(),
+            "the timed-out waiter left the queue"
+        );
         drop(held);
         assert!(rt.admit(need(false, vec![40])).await.is_ok());
     }
@@ -683,12 +816,17 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn disabled_admits_all_and_tracks_nothing() {
         let rt = RealTime::with(A, 7, false, Duration::from_millis(10));
-        let held: Vec<_> = futures::future::join_all((0..100).map(|_| rt.admit(need(true, vec![1000])))).await;
+        let held: Vec<_> =
+            futures::future::join_all((0..100).map(|_| rt.admit(need(true, vec![1000])))).await;
         assert!(held.iter().all(Result::is_ok));
         let t = held[0].as_ref().unwrap();
         t.frame();
         t.sent(1.0);
-        assert!(rt.inner.lock().active.is_empty() && rt.width.load(Relaxed) == 0 && t.remaining_frames() == 0.0);
+        assert!(
+            rt.inner.lock().active.is_empty()
+                && rt.width.load(Relaxed) == 0
+                && t.remaining_frames() == 0.0
+        );
     }
 
     /// The per-frame path stays O(1): its cost does not grow with the number of streams.
@@ -715,7 +853,14 @@ mod tests {
             t0.elapsed().as_secs_f64() / 20_000.0
         };
         let (narrow, wide) = (per_frame(2), per_frame(128));
-        assert!(wide < 4.0 * narrow + 2e-6, "{narrow:e} vs {wide:e} s per frame");
-        eprintln!("per-frame bookkeeping: {:.0} ns (2 streams) / {:.0} ns (128 streams)", narrow * 1e9, wide * 1e9);
+        assert!(
+            wide < 4.0 * narrow + 2e-6,
+            "{narrow:e} vs {wide:e} s per frame"
+        );
+        eprintln!(
+            "per-frame bookkeeping: {:.0} ns (2 streams) / {:.0} ns (128 streams)",
+            narrow * 1e9,
+            wide * 1e9
+        );
     }
 }

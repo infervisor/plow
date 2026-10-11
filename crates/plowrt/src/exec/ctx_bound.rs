@@ -91,8 +91,11 @@ pub fn rescale(
 ) -> Result<u32> {
     let err = |s: String| RuntimeError::Device(s);
     let ceiling = declared_ctx(blob).ok_or_else(|| {
-        err("PLOW_LIVE_CTX: this packet declares no `in.pos`, so it carries no context to \
-             rescale".into())
+        err(
+            "PLOW_LIVE_CTX: this packet declares no `in.pos`, so it carries no context to \
+             rescale"
+                .into(),
+        )
     })?;
     if want == ceiling {
         return Ok(ceiling);
@@ -237,20 +240,28 @@ pub fn rescale(
         }
         let resized = if scaling == Scaling::IndexerBlock16 {
             let mut seen = false;
-            for d in blob.progs.iter().flat_map(|p| &p.insts)
+            for d in blob
+                .progs
+                .iter()
+                .flat_map(|p| &p.insts)
                 .filter(|d| h16.is_some_and(|h| d.t.contains(&h)))
             {
                 seen = true;
-                if (d.op != DevOp::IndexFp8Decode as u16 && d.op != DevOp::IndexFp8Prefill as u16) || Some(d.t[4]) != h16
+                if (d.op != DevOp::IndexFp8Decode as u16 && d.op != DevOp::IndexFp8Prefill as u16)
+                    || Some(d.t[4]) != h16
                     || d.i[1] != ceiling
                 {
                     return Err(err(format!(
-                        "PLOW_LIVE_CTX: `{}` has an unsupported packed indexer use or stride", t.name
+                        "PLOW_LIVE_CTX: `{}` has an unsupported packed indexer use or stride",
+                        t.name
                     )));
                 }
             }
             if !seen {
-                return Err(err(format!("PLOW_LIVE_CTX: `{}` has no packed indexer owner", t.name)));
+                return Err(err(format!(
+                    "PLOW_LIVE_CTX: `{}` has no packed indexer owner",
+                    t.name
+                )));
             }
             ctx_bound::indexer_rescaled_bytes(t.bytes, ceiling, want)
         } else {
@@ -305,7 +316,8 @@ pub fn rescale(
                     "PLOW_LIVE_CTX: program T={} instruction {k} (op {op}) addresses a rewritten \
                      cache and holds stale mask {} (emitted ctx - 1) in {slot:?}. \
                      Widening would leave it masking or wrapping with the un-widened bound",
-                    p.t, ceiling - 1
+                    p.t,
+                    ceiling - 1
                 )));
             }
         }
@@ -343,7 +355,8 @@ pub fn rescale(
 
     if want < ceiling && want < POLICY_SATURATION_CTX {
         tracing::warn!(
-            live = want, ceiling,
+            live = want,
+            ceiling,
             "PLOW_LIVE_CTX below {POLICY_SATURATION_CTX}: the packet keeps the MLA split \
              count, the DSA union capacity and the sparse-decode arm the emitter chose for \
              its ceiling. Set PLOW_MLA_NS_LIVE=1 to track the split count from the live \
@@ -351,7 +364,9 @@ pub fn rescale(
         );
     }
     tracing::info!(
-        live = want, ceiling, stride_sites = sites,
+        live = want,
+        ceiling,
+        stride_sites = sites,
         "PLOW_LIVE_CTX: packet re-declared at the live context bound"
     );
     Ok(want)
@@ -480,8 +495,10 @@ mod tests {
 
     #[test]
     fn narrowing_preserves_device_rope_precision_and_capacity() {
-        use packet::rope::{GEN_AMD_ROPE_BF16_COS, GEN_AMD_ROPE_BF16_SIN,
-            GEN_AMD_ROPE_IDX_BF16_COS, GEN_AMD_ROPE_IDX_BF16_SIN};
+        use packet::rope::{
+            GEN_AMD_ROPE_BF16_COS, GEN_AMD_ROPE_BF16_SIN, GEN_AMD_ROPE_IDX_BF16_COS,
+            GEN_AMD_ROPE_IDX_BF16_SIN,
+        };
         let mut b = mla_blob(CEILING);
         b.gen[0].kind = GEN_AMD_ROPE_BF16_COS;
         b.gen[0].theta = 8000000.0;
@@ -496,11 +513,20 @@ mod tests {
             init: None,
         });
         b.gen.push(sin);
-        for (kind, name) in [(GEN_AMD_ROPE_IDX_BF16_COS, "in.icos"),
-            (GEN_AMD_ROPE_IDX_BF16_SIN, "in.isin")] {
-            let g = GenTensor { tensor: b.tensors.len() as u32, kind,
-                ..GenTensor::rope_idx_pair(CEILING, 64, 128, 8000000.0)[0] };
-            b.tensors.push(DevTensor { name: name.into(), bytes: g.byte_len(), init: None });
+        for (kind, name) in [
+            (GEN_AMD_ROPE_IDX_BF16_COS, "in.icos"),
+            (GEN_AMD_ROPE_IDX_BF16_SIN, "in.isin"),
+        ] {
+            let g = GenTensor {
+                tensor: b.tensors.len() as u32,
+                kind,
+                ..GenTensor::rope_idx_pair(CEILING, 64, 128, 8000000.0)[0]
+            };
+            b.tensors.push(DevTensor {
+                name: name.into(),
+                bytes: g.byte_len(),
+                init: None,
+            });
             b.gen.push(g);
         }
         assert_eq!(narrow(&mut b, 2048).unwrap(), 2048);
@@ -508,7 +534,10 @@ mod tests {
             assert_eq!(g.ctx, 2048);
             assert!(g.amd_rope_bf16());
             assert!(g.generate().is_none());
-            assert_eq!(b.tensors[g.tensor as usize].bytes, 2048 * (g.hd as u64 / 2) * 4);
+            assert_eq!(
+                b.tensors[g.tensor as usize].bytes,
+                2048 * (g.hd as u64 / 2) * 4
+            );
         }
     }
 
@@ -524,7 +553,11 @@ mod tests {
         assert_eq!(bytes_of(&b, "in.ids"), 2048 * 4);
         assert_eq!(bytes_of(&b, "kv.0.ckv"), BATCH * 2048 * 512);
         assert_eq!(bytes_of(&b, "kv.0.krot"), BATCH * 2048 * 128);
-        assert_eq!(bytes_of(&b, "layers.0.wq"), 4096, "a weight is not a context");
+        assert_eq!(
+            bytes_of(&b, "layers.0.wq"),
+            4096,
+            "a weight is not a context"
+        );
         // The recipe moved with the declaration, so the bind-time expansion
         // still produces exactly the declared bytes.
         assert_eq!(b.gen[0].ctx, 2048);
@@ -532,7 +565,10 @@ mod tests {
         let insts = &b.progs[0].insts;
         assert_eq!(insts[0].fj[1], 2048, "latent writer out_stride");
         assert_eq!(insts[1].i[2], 2048, "flash kv_stride");
-        assert_eq!(insts[2].i[1], CEILING, "an all-gather count is not a stride");
+        assert_eq!(
+            insts[2].i[1], CEILING,
+            "an all-gather count is not a stride"
+        );
     }
 
     /// `d = identity`: a bound at or above the emitted ceiling changes nothing,
@@ -636,7 +672,10 @@ mod tests {
             let before: Vec<_> = b.tensors.iter().map(|t| t.bytes).collect();
             let insts = b.progs[0].insts.clone();
             assert!(narrow(&mut b, want).is_err(), "case {bad}");
-            assert_eq!(before, b.tensors.iter().map(|t| t.bytes).collect::<Vec<_>>());
+            assert_eq!(
+                before,
+                b.tensors.iter().map(|t| t.bytes).collect::<Vec<_>>()
+            );
             assert_eq!(insts, b.progs[0].insts);
         }
     }
@@ -653,9 +692,17 @@ mod tests {
 
     #[test]
     fn a_bound_under_the_selection_width_is_refused_on_an_indexer_packet() {
-        assert_eq!(narrow(&mut mla_blob(CEILING), 1024).unwrap(), 1024, "no indexer, no floor");
+        assert_eq!(
+            narrow(&mut mla_blob(CEILING), 1024).unwrap(),
+            1024,
+            "no indexer, no floor"
+        );
         let mut b = mla_blob(CEILING);
-        b.tensors.push(DevTensor { name: "layers.0.kidx".into(), bytes: 64, init: None });
+        b.tensors.push(DevTensor {
+            name: "layers.0.kidx".into(),
+            bytes: 64,
+            init: None,
+        });
         let e = narrow(&mut b, 1024).unwrap_err().to_string();
         assert!(e.contains("floor"), "{e}");
     }
@@ -714,19 +761,9 @@ mod tests {
                 [0, 0, 0],
             ),
             // Flash prefill: kv_stride in j[0] (= fj[1])
-            inst(
-                DevOp::FlashPrefill,
-                0,
-                [0; 8],
-                [0, ctx, u32::MAX],
-            ),
+            inst(DevOp::FlashPrefill, 0, [0; 8], [0, ctx, u32::MAX]),
             // HeadNormRope: out_stride in j[0] (= fj[1])
-            inst(
-                DevOp::HeadNormRope,
-                3,
-                [0; 8],
-                [0, ctx, u32::MAX],
-            ),
+            inst(DevOp::HeadNormRope, 3, [0; 8], [0, ctx, u32::MAX]),
         ];
         let blob = DevBlob {
             n_cu: 1,

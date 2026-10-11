@@ -5456,7 +5456,10 @@ mod tests {
         };
 
         {
-            let _scope = crate::test_env::EnvScope::set(&[("PLOW_TUNE_IGNORE_DIGEST", "0"), ("PLOW_GEMM_WIDE_C8","0")]);
+            let _scope = crate::test_env::EnvScope::set(&[
+                ("PLOW_TUNE_IGNORE_DIGEST", "0"),
+                ("PLOW_GEMM_WIDE_C8", "0"),
+            ]);
             let inst = emit(8192, 1536, 7168);
             let selected =
                 crate::gfx950_prefill_tile(8192, 1536, 7168, 256, kernelcaps::QuantScheme::None);
@@ -5479,7 +5482,10 @@ mod tests {
             assert_eq!(inst.blocks, 256);
         }
         {
-            let _scope = crate::test_env::EnvScope::set(&[("PLOW_TUNE_IGNORE_DIGEST", "0"), ("PLOW_GEMM_WIDE_C8","1")]);
+            let _scope = crate::test_env::EnvScope::set(&[
+                ("PLOW_TUNE_IGNORE_DIGEST", "0"),
+                ("PLOW_GEMM_WIDE_C8", "1"),
+            ]);
             let inst = emit(8192, 1536, 7168);
             if crate::gfx950_c8_is_measured_winner(8192, 1536, 7168) {
                 assert_eq!(inst.op, DevOp::GemmWide as u16);
@@ -5506,7 +5512,10 @@ mod tests {
         crate::set_amd_target("MI350X");
         let buckets = [128, 512, 1024, 2048, 4096, 8192];
         let emit = |c8: &str| {
-            let _scope = crate::test_env::EnvScope::set(&[("PLOW_TUNE_IGNORE_DIGEST", "0"), ("PLOW_GEMM_WIDE_C8",c8)]);
+            let _scope = crate::test_env::EnvScope::set(&[
+                ("PLOW_TUNE_IGNORE_DIGEST", "0"),
+                ("PLOW_GEMM_WIDE_C8", c8),
+            ]);
             crate::tune_demand::reset_tally();
             crate::tune_demand::start_recording();
             let programs: Vec<_> = buckets.iter().map(|&t| build_full_t(8, t)).collect();

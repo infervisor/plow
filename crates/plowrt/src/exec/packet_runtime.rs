@@ -32,7 +32,9 @@ pub trait PacketRuntime: Send {
         let mut all = vec![0; tensor.bytes];
         self.read_tensor(tensor, &mut all)?;
         all.get_mut(offset..offset.saturating_add(bytes.len()))
-            .ok_or_else(|| RuntimeError::Device("packet tensor write is outside its bounds".into()))?
+            .ok_or_else(|| {
+                RuntimeError::Device("packet tensor write is outside its bounds".into())
+            })?
             .copy_from_slice(bytes);
         self.write_tensor(tensor, &all)
     }
@@ -42,7 +44,9 @@ pub trait PacketRuntime: Send {
         self.read_tensor(tensor, &mut all)?;
         bytes.copy_from_slice(
             all.get(offset..offset.saturating_add(bytes.len()))
-                .ok_or_else(|| RuntimeError::Device("packet tensor read is outside its bounds".into()))?,
+                .ok_or_else(|| {
+                    RuntimeError::Device("packet tensor read is outside its bounds".into())
+                })?,
         );
         Ok(())
     }
@@ -58,7 +62,9 @@ pub trait PacketRuntime: Send {
     /// bytes between it and packet tensors. Unsupported by default.
     fn create_tensor(&mut self, bytes: usize) -> Result<PacketTensor> {
         let _ = bytes;
-        Err(RuntimeError::Rejected("this packet backend cannot create tensors".into()))
+        Err(RuntimeError::Rejected(
+            "this packet backend cannot create tensors".into(),
+        ))
     }
     fn run(&mut self, program: usize) -> Result<()>;
     fn run_sequence(&mut self, programs: &[usize]) -> Result<()> {
@@ -237,7 +243,11 @@ pub fn load_packet_runtime(path: &Path, requested: &str) -> Result<LoadedPacketR
 }
 
 /// As [`load_packet_runtime`], with a CUDA runtime on device `device` (other backends ignore it).
-pub fn load_packet_runtime_on(path: &Path, requested: &str, device: u8) -> Result<LoadedPacketRuntime> {
+pub fn load_packet_runtime_on(
+    path: &Path,
+    requested: &str,
+    device: u8,
+) -> Result<LoadedPacketRuntime> {
     let _ = (path, device);
     if requested == "auto" {
         #[cfg(all(feature = "metal", target_os = "macos"))]
@@ -251,11 +261,19 @@ pub fn load_packet_runtime_on(path: &Path, requested: &str, device: u8) -> Resul
         {
             return load_packet_runtime_on(path, "cpu", device);
         }
-        #[cfg(all(feature = "cuda", not(feature = "cpu"), not(all(feature = "metal", target_os = "macos"))))]
+        #[cfg(all(
+            feature = "cuda",
+            not(feature = "cpu"),
+            not(all(feature = "metal", target_os = "macos"))
+        ))]
         {
             return load_packet_runtime_on(path, "cuda", device);
         }
-        #[cfg(not(any(feature = "cpu", feature = "cuda", all(feature = "metal", target_os = "macos"))))]
+        #[cfg(not(any(
+            feature = "cpu",
+            feature = "cuda",
+            all(feature = "metal", target_os = "macos")
+        )))]
         {
             return Err(RuntimeError::Rejected(
                 "no packet execution backend is compiled in".into(),
@@ -276,7 +294,9 @@ pub fn load_packet_runtime_on(path: &Path, requested: &str, device: u8) -> Resul
         #[cfg(feature = "cuda")]
         "cuda" => Ok(LoadedPacketRuntime {
             backend: "cuda",
-            runtime: Box::new(crate::exec::gpu::packet_exec::CudaPacketRuntime::load(path, device)?),
+            runtime: Box::new(crate::exec::gpu::packet_exec::CudaPacketRuntime::load(
+                path, device,
+            )?),
         }),
         #[cfg(all(feature = "metal", target_os = "macos"))]
         "metal" => Ok(LoadedPacketRuntime {
@@ -343,7 +363,10 @@ impl PacketAsset {
                 sections.insert(name.to_owned(), data.to_vec());
             }
         }
-        Ok(Self { pipelines, sections })
+        Ok(Self {
+            pipelines,
+            sections,
+        })
     }
 
     /// A speech-contract metadata section of the packet.
@@ -362,11 +385,16 @@ impl PacketAsset {
         match named {
             None => Ok(legacy.to_string()),
             Some(name)
-                if !name.is_empty() && !name.contains(['/', '\\']) && name != "." && name != ".." =>
+                if !name.is_empty()
+                    && !name.contains(['/', '\\'])
+                    && name != "."
+                    && name != ".." =>
             {
                 Ok(name.clone())
             }
-            Some(name) => Err(RuntimeError::Rejected(format!("{key} {name:?} is not a file name beside the packet"))),
+            Some(name) => Err(RuntimeError::Rejected(format!(
+                "{key} {name:?} is not a file name beside the packet"
+            ))),
         }
     }
 
@@ -461,7 +489,9 @@ impl BoundPacketPipeline {
 
     /// Every program role and its program index.
     pub fn programs(&self) -> impl Iterator<Item = (&str, usize)> {
-        self.programs.iter().map(|(role, &program)| (role.as_str(), program))
+        self.programs
+            .iter()
+            .map(|(role, &program)| (role.as_str(), program))
     }
 
     pub fn driver(&self) -> &str {
@@ -908,7 +938,10 @@ mod tests {
             kv_row_insts: vec![],
             gen: vec![],
         };
-        let path = std::env::temp_dir().join(format!("plow-packet-no-pipelines-{}.plowdev", std::process::id()));
+        let path = std::env::temp_dir().join(format!(
+            "plow-packet-no-pipelines-{}.plowdev",
+            std::process::id()
+        ));
         std::fs::write(&path, model.to_blob()).unwrap();
         let present = PacketAsset::load_if_present(&path);
         let strict = PacketAsset::load(&path);

@@ -181,7 +181,14 @@ pub trait Exec: Send + Sync {
     /// Warm up to `lines` more cache lines of what slice `slice` of `inst` will stream, from byte
     /// `cursor` of that stream; called while the worker waits on the entry's gates. Returns false
     /// once nothing is left to warm.
-    fn prefetch(&self, _inst: &DevInst64, _slice: u32, _nblk: u32, _cursor: &mut usize, _lines: usize) -> bool {
+    fn prefetch(
+        &self,
+        _inst: &DevInst64,
+        _slice: u32,
+        _nblk: u32,
+        _cursor: &mut usize,
+        _lines: usize,
+    ) -> bool {
         false
     }
 }
@@ -450,7 +457,13 @@ pub fn run_static(
                     if warm {
                         let ent = next.unwrap();
                         let inst = &prog.insts[ent.inst as usize];
-                        warm = exec.prefetch(inst, ent.slice, inst.blocks as u32, &mut cursor, GATE_PF_LINES);
+                        warm = exec.prefetch(
+                            inst,
+                            ent.slice,
+                            inst.blocks as u32,
+                            &mut cursor,
+                            GATE_PF_LINES,
+                        );
                     }
                     heads.iter().any(|&(h, e)| {
                         h < e && {

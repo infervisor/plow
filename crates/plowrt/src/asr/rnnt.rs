@@ -201,14 +201,18 @@ impl PacketRnnt {
                     .collect::<Result<Vec<_>>>()?;
                 let tensor = pipeline.tensor("joint.duration_ids")?;
                 if durations.is_empty() || tensor.bytes != ids.bytes {
-                    return Err(RuntimeError::Rejected("packet TDT geometry is inconsistent".into()));
+                    return Err(RuntimeError::Rejected(
+                        "packet TDT geometry is inconsistent".into(),
+                    ));
                 }
                 (Some(tensor), durations)
             }
         };
         let valid_rows = pipeline.tensor("encoder.valid_rows").ok();
         if valid_rows.is_some_and(|tensor| tensor.bytes != std::mem::size_of::<u32>()) {
-            return Err(RuntimeError::Rejected("packet encoder valid-rows tensor is not a u32".into()));
+            return Err(RuntimeError::Rejected(
+                "packet encoder valid-rows tensor is not a u32".into(),
+            ));
         }
         let stream = if backend == "cuda" && pipeline.program("stream.init").is_ok() {
             let usize_param = |name| usize_parameter(&pipeline, name);
@@ -233,10 +237,13 @@ impl PacketRnnt {
             if binding.rows == 0
                 || binding.rows > frames
                 || bins == 0
-                || binding.step_input_frames.max(binding.first_input_frames) * bins * 4 > input_tensor.bytes
+                || binding.step_input_frames.max(binding.first_input_frames) * bins * 4
+                    > input_tensor.bytes
                 || binding.key_start.bytes != 4
             {
-                return Err(RuntimeError::Rejected("packet stream geometry is invalid".into()));
+                return Err(RuntimeError::Rejected(
+                    "packet stream geometry is invalid".into(),
+                ));
             }
             // The per-layer position projections are input independent: fill them once.
             runtime.run(pipeline.program("stream.init")?)?;
@@ -250,7 +257,12 @@ impl PacketRnnt {
             Some(_) => {
                 let vocabulary = asset
                     .metadata(speech_contract::VOCABULARY_SECTION)
-                    .ok_or_else(|| RuntimeError::Rejected(format!("packet is missing {}", speech_contract::VOCABULARY_SECTION)))?;
+                    .ok_or_else(|| {
+                        RuntimeError::Rejected(format!(
+                            "packet is missing {}",
+                            speech_contract::VOCABULARY_SECTION
+                        ))
+                    })?;
                 let output = TokenOutput::from_pipeline(
                     |name| pipeline.optional_parameter(name),
                     |name| pipeline.optional_string(name).map(str::to_owned),
@@ -258,7 +270,9 @@ impl PacketRnnt {
                 )
                 .map_err(RuntimeError::Rejected)?;
                 if output.word_boundary.is_empty() {
-                    return Err(RuntimeError::Rejected("ASR output word boundary is empty".into()));
+                    return Err(RuntimeError::Rejected(
+                        "ASR output word boundary is empty".into(),
+                    ));
                 }
                 Some(output)
             }
@@ -316,7 +330,10 @@ impl PacketRnnt {
 
     /// Open a stream: zeroed caches and predictor, the decoder at the blank token.
     pub fn stream_open(&mut self) -> Result<RnntStream> {
-        let binding = self.stream.as_mut().ok_or_else(|| RuntimeError::Rejected("packet has no encoder stream".into()))?;
+        let binding = self
+            .stream
+            .as_mut()
+            .ok_or_else(|| RuntimeError::Rejected("packet has no encoder stream".into()))?;
         let saved = match binding.pool.pop() {
             Some(saved) => {
                 for &tensor in &saved {
@@ -330,7 +347,12 @@ impl PacketRnnt {
                 .map(|state| self.runtime.create_tensor(state.bytes))
                 .collect::<Result<_>>()?,
         };
-        Ok(RnntStream { saved, previous_token: self.blank_id, active_bank: 0, steps: 0 })
+        Ok(RnntStream {
+            saved,
+            previous_token: self.blank_id,
+            active_bank: 0,
+            steps: 0,
+        })
     }
 
     pub fn stream_close(&mut self, stream: RnntStream) {
@@ -349,7 +371,10 @@ impl PacketRnnt {
         window: &[f32],
         on_emit: &mut dyn FnMut(&[u32]),
     ) -> Result<Vec<u32>> {
-        let binding = self.stream.take().ok_or_else(|| RuntimeError::Rejected("packet has no encoder stream".into()))?;
+        let binding = self
+            .stream
+            .take()
+            .ok_or_else(|| RuntimeError::Rejected("packet has no encoder stream".into()))?;
         self.runtime.begin_execution()?;
         let result = self.stream_step_active(&binding, stream, window, on_emit);
         let ended = self.runtime.end_execution();
@@ -368,7 +393,11 @@ impl PacketRnnt {
         on_emit: &mut dyn FnMut(&[u32]),
     ) -> Result<Vec<u32>> {
         let first = stream.steps == 0;
-        let frames = if first { binding.first_input_frames } else { binding.step_input_frames };
+        let frames = if first {
+            binding.first_input_frames
+        } else {
+            binding.step_input_frames
+        };
         if window.len() != frames * binding.bins || stream.saved.len() != binding.states.len() {
             return Err(RuntimeError::Rejected(format!(
                 "stream window has {} values, expected {}",
@@ -376,15 +405,21 @@ impl PacketRnnt {
                 frames * binding.bins
             )));
         }
-        self.runtime.write_tensor_at(binding.input, 0, bytemuck::cast_slice(window))?;
+        self.runtime
+            .write_tensor_at(binding.input, 0, bytemuck::cast_slice(window))?;
         for (&live, &saved) in binding.states.iter().zip(&stream.saved) {
             self.runtime.copy_tensor(saved, 0, live, 0, live.bytes)?;
         }
         // Keys before this window row are not filled yet: the stream's first chunks.
-        let key_start = binding.left_rows.saturating_sub(stream.steps.saturating_mul(binding.rows)) as u32;
-        self.runtime.write_tensor(binding.key_start, &key_start.to_ne_bytes())?;
+        let key_start = binding
+            .left_rows
+            .saturating_sub(stream.steps.saturating_mul(binding.rows))
+            as u32;
+        self.runtime
+            .write_tensor(binding.key_start, &key_start.to_ne_bytes())?;
         let started = Instant::now();
-        self.runtime.run_sequence(if first { &binding.first } else { &binding.step })?;
+        self.runtime
+            .run_sequence(if first { &binding.first } else { &binding.step })?;
         let encoder_us = self.runtime.last_run_us();
         let encoder_wall = started.elapsed();
         let mut execution = PacketRnntExecution {
@@ -405,7 +440,8 @@ impl PacketRnnt {
             profile: None,
         };
         // The predictor reruns from the saved bank each step (idempotent), so only its banks persist.
-        let mut decoder = GreedyRnnt::new(self.blank_id, self.max_symbols_per_frame)?.with_tdt_durations(&self.tdt_durations);
+        let mut decoder = GreedyRnnt::new(self.blank_id, self.max_symbols_per_frame)?
+            .with_tdt_durations(&self.tdt_durations);
         decoder.previous_token = stream.previous_token;
         let tokens = decoder.decode_with(&mut execution, on_emit)?;
         stream.active_bank = execution.active_bank;
@@ -456,7 +492,11 @@ impl PacketRnnt {
         )
     }
 
-    pub fn transcribe_input_frames(&mut self, input: &[f32], valid_input_frames: usize) -> Result<Vec<u32>> {
+    pub fn transcribe_input_frames(
+        &mut self,
+        input: &[f32],
+        valid_input_frames: usize,
+    ) -> Result<Vec<u32>> {
         self.transcribe_input_frames_with(input, valid_input_frames, &mut |_| {})
     }
 
@@ -517,7 +557,8 @@ impl PacketRnnt {
         if let Some(valid_rows) = self.valid_rows {
             let valid = u32::try_from(frames)
                 .map_err(|_| RuntimeError::Rejected("encoder frame count overflows".into()))?;
-            self.runtime.write_tensor(valid_rows, &valid.to_ne_bytes())?;
+            self.runtime
+                .write_tensor(valid_rows, &valid.to_ne_bytes())?;
         }
         self.runtime
             .run_sequence(&self.encoder_programs[encoder].1)?;
@@ -542,8 +583,9 @@ impl PacketRnnt {
             all_durations: vec![0; self.joint_batch_max],
             profile: profile.as_mut(),
         };
-        let result =
-            GreedyRnnt::new(self.blank_id, self.max_symbols_per_frame)?.with_tdt_durations(&self.tdt_durations).decode_with(&mut execution, on_emit);
+        let result = GreedyRnnt::new(self.blank_id, self.max_symbols_per_frame)?
+            .with_tdt_durations(&self.tdt_durations)
+            .decode_with(&mut execution, on_emit);
         self.last_profile = profile;
         result
     }
@@ -849,16 +891,22 @@ impl GreedyRnnt {
             }
             let window = frame;
             let evaluated = execution.joint_argmax(window, &mut ids[..frames - window])?;
-            if evaluated == 0 || evaluated > frames - window || execution.joint_durations().len() < evaluated {
-                return Err(RuntimeError::Device("TDT joint returned an invalid frame count".into()));
+            if evaluated == 0
+                || evaluated > frames - window
+                || execution.joint_durations().len() < evaluated
+            {
+                return Err(RuntimeError::Device(
+                    "TDT joint returned an invalid frame count".into(),
+                ));
             }
             while frame < window + evaluated {
                 let row = frame - window;
                 let skip = *self
                     .tdt_durations
                     .get(execution.joint_durations()[row] as usize)
-                    .ok_or_else(|| RuntimeError::Device("TDT duration index is out of range".into()))?
-                    as usize;
+                    .ok_or_else(|| {
+                        RuntimeError::Device("TDT duration index is out of range".into())
+                    })? as usize;
                 let token = ids[row];
                 // NeMo counts every step at a frame, blanks included; a step that lands on the
                 // limit advances one frame more than its duration.
@@ -1011,18 +1059,26 @@ mod tests {
             calls: Vec::new(),
             durations: Vec::new(),
         };
-        let mut decoder = GreedyRnnt::new(B, 10).unwrap().with_tdt_durations(&[0, 1, 2, 3, 4]);
+        let mut decoder = GreedyRnnt::new(B, 10)
+            .unwrap()
+            .with_tdt_durations(&[0, 1, 2, 3, 4]);
         assert_eq!(decoder.decode(&mut execution).unwrap(), [7, 8]);
         assert_eq!(execution.calls, [0, 2, 3]);
 
         // A zero-duration token at the symbol limit moves one frame on.
         let mut limited = ScriptedTdt {
-            rows: vec![vec![(4, 0), (B, 4)], vec![(4, 0), (B, 4)], vec![(4, 0), (B, 4)]],
+            rows: vec![
+                vec![(4, 0), (B, 4)],
+                vec![(4, 0), (B, 4)],
+                vec![(4, 0), (B, 4)],
+            ],
             prediction: 0,
             calls: Vec::new(),
             durations: Vec::new(),
         };
-        let mut decoder = GreedyRnnt::new(B, 2).unwrap().with_tdt_durations(&[0, 1, 2, 3, 4]);
+        let mut decoder = GreedyRnnt::new(B, 2)
+            .unwrap()
+            .with_tdt_durations(&[0, 1, 2, 3, 4]);
         assert_eq!(decoder.decode(&mut limited).unwrap(), [4, 4]);
         assert_eq!(limited.calls, [0, 0, 1]);
     }
@@ -1050,7 +1106,10 @@ mod tests {
             "<en-US>".into(),
         ];
         assert_eq!(
-            detokenize(&TokenOutput::sentencepiece(vocabulary, &[".", "?", "!"]), &[0, 1, 2, 3]),
+            detokenize(
+                &TokenOutput::sentencepiece(vocabulary, &[".", "?", "!"]),
+                &[0, 1, 2, 3]
+            ),
             "hello world!"
         );
     }

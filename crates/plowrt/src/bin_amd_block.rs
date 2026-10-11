@@ -8,10 +8,17 @@ use plowrt::{
 
 type Error = Box<dyn std::error::Error>;
 
-fn activation_prefix_bytes(capacity: u64, allocated_rows: usize, live_rows: usize) -> Result<usize, Error> {
+fn activation_prefix_bytes(
+    capacity: u64,
+    allocated_rows: usize,
+    live_rows: usize,
+) -> Result<usize, Error> {
     let capacity = usize::try_from(capacity)?;
-    if allocated_rows == 0 || live_rows == 0 || live_rows > allocated_rows
-        || capacity == 0 || capacity % allocated_rows != 0
+    if allocated_rows == 0
+        || live_rows == 0
+        || live_rows > allocated_rows
+        || capacity == 0
+        || capacity % allocated_rows != 0
     {
         return Err("invalid block activation row capacity".into());
     }
@@ -25,8 +32,12 @@ fn carried_state_layout(
     max_ctx: usize,
     ctx: u32,
 ) -> Result<(usize, usize), Error> {
-    if batch == 0 || max_ctx == 0 || ctx == 0 || ctx as usize > max_ctx
-        || capacity == 0 || capacity % batch != 0
+    if batch == 0
+        || max_ctx == 0
+        || ctx == 0
+        || ctx as usize > max_ctx
+        || capacity == 0
+        || capacity % batch != 0
     {
         return Err("invalid carried-state capacity or context".into());
     }
@@ -35,9 +46,7 @@ fn carried_state_layout(
         == packet::ctx_bound::Scaling::IndexerBlock16
     {
         let max_ctx = u32::try_from(max_ctx)?;
-        if max_ctx % 16 != 0
-            || stride as u64 != packet::ctx_bound::indexer_prefix_bytes(max_ctx)
-        {
+        if max_ctx % 16 != 0 || stride as u64 != packet::ctx_bound::indexer_prefix_bytes(max_ctx) {
             return Err("invalid packed indexer carried-state capacity".into());
         }
         usize::try_from(packet::ctx_bound::indexer_prefix_bytes(ctx))?
@@ -135,7 +144,11 @@ pub fn run(
     if batch == 0 || batch > 64 {
         return Err("capture batch must be in 1..=64".into());
     }
-    let allocated_rows = parsed.progs.iter().map(|p| p.role.rows() as usize).max()
+    let allocated_rows = parsed
+        .progs
+        .iter()
+        .map(|p| p.role.rows() as usize)
+        .max()
         .ok_or("block has no programs")?;
     let mut operands = Vec::new();
     for entry in std::fs::read_dir(&inputs)? {
@@ -301,7 +314,8 @@ pub fn run(
             for tensor in parsed.tensors.iter().filter(|t| {
                 t.name.ends_with(".self_attn.o_proj.weight_fp8")
                     || t.name.ends_with(".self_attn.fused_qkv_a_proj.weight_fp8")
-                    || t.name.ends_with(".self_attn.fused_qkv_a_proj.weight_scale_inv")
+                    || t.name
+                        .ends_with(".self_attn.fused_qkv_a_proj.weight_scale_inv")
                     || t.name.ends_with(".self_attn.q_b_proj.weight")
                     || t.name.ends_with(".self_attn.q_b_proj.weight_scale_inv")
                     || t.name.contains(".self_attn.indexer.")
@@ -310,7 +324,8 @@ pub fn run(
                     || t.name.ends_with(".self_attn.kv_a_layernorm.weight")
                     || t.name.ends_with(".self_attn.o_proj.weight_scale_inv")
                     || (t.name.contains(".mlp.shared_experts.")
-                        && (t.name.ends_with(".weight_fp8") || t.name.ends_with(".weight_scale_inv")))
+                        && (t.name.ends_with(".weight_fp8")
+                            || t.name.ends_with(".weight_scale_inv")))
             }) {
                 let mut bytes = vec![0; tensor.bytes as usize];
                 engine.read_tensor(&tensor.name, &mut bytes)?;
@@ -365,9 +380,8 @@ pub fn run(
             for (name, bytes) in &operands {
                 if name.starts_with("kv.") {
                     let capacity = engine.tensor_bytes(name).ok_or("missing KV tensor")? as usize;
-                    let (stride, prefix) = carried_state_layout(
-                        name, capacity, batch, engine.max_ctx(), ctx,
-                    )?;
+                    let (stride, prefix) =
+                        carried_state_layout(name, capacity, batch, engine.max_ctx(), ctx)?;
                     if bytes.len() != prefix * batch {
                         return Err(format!(
                             "{name}: capture must cover exactly {batch} rows of context {ctx}"
@@ -419,7 +433,8 @@ pub fn run(
     } else {
         group = AmdTpGroup::load(backends.clone(), &blob, &hsaco, checkpoint.as_deref())?;
         selected_routes = (0..tp as usize)
-            .map(|rank| group.rank(rank).selected_route_evidence().clone()).collect::<Vec<_>>();
+            .map(|rank| group.rank(rank).selected_route_evidence().clone())
+            .collect::<Vec<_>>();
         if !group.counter_audit_enabled() {
             return Err("block measurements require the TP counter audit".into());
         }
@@ -511,8 +526,11 @@ mod tests {
     fn block_oracle_uses_live_decode_rows_not_prefill_capacity() {
         for allocated in [1, 8, 64, 128, 8192] {
             for live in [1, 8, 16, 32, 64].into_iter().filter(|r| *r <= allocated) {
-                assert_eq!(activation_prefix_bytes((allocated * 6144 * 2) as u64, allocated, live).unwrap(),
-                           live * 6144 * 2);
+                assert_eq!(
+                    activation_prefix_bytes((allocated * 6144 * 2) as u64, allocated, live)
+                        .unwrap(),
+                    live * 6144 * 2
+                );
             }
         }
         for (bytes, allocated, live) in [(0, 1, 1), (2, 0, 1), (2, 1, 0), (2, 1, 2), (3, 2, 1)] {
@@ -526,24 +544,30 @@ mod tests {
             let max_ctx = 131072;
             for ctx in [1, 15, 16, 17, 8192, 8193, 8194, 8195, 8196, 71681, 131072] {
                 let capacity = batch * max_ctx * 132;
-                let (stride, prefix) = carried_state_layout(
-                    "kv.6.kidx_fp8", capacity, batch, max_ctx, ctx,
-                ).unwrap();
+                let (stride, prefix) =
+                    carried_state_layout("kv.6.kidx_fp8", capacity, batch, max_ctx, ctx).unwrap();
                 assert_eq!(stride, max_ctx * 132);
                 assert_eq!(prefix, (ctx as usize).div_ceil(16) * 2112);
                 assert!(prefix <= stride);
                 if ctx % 16 != 0 {
                     assert!(prefix > ctx as usize * 132);
                 }
-                assert_eq!(carried_state_layout(
-                    "kv.6.ckv", batch * max_ctx * 1024, batch, max_ctx, ctx,
-                ).unwrap(), (max_ctx * 1024, ctx as usize * 1024));
+                assert_eq!(
+                    carried_state_layout("kv.6.ckv", batch * max_ctx * 1024, batch, max_ctx, ctx,)
+                        .unwrap(),
+                    (max_ctx * 1024, ctx as usize * 1024)
+                );
             }
         }
         for (capacity, batch, max_ctx, ctx) in [
-            (0, 1, 16, 1), (2112, 0, 16, 1), (2112, 1, 0, 1),
-            (2112, 1, 16, 0), (2112, 1, 16, 17), (2112, 3, 16, 1),
-            (2111, 1, 16, 1), (2244, 1, 17, 1),
+            (0, 1, 16, 1),
+            (2112, 0, 16, 1),
+            (2112, 1, 0, 1),
+            (2112, 1, 16, 0),
+            (2112, 1, 16, 17),
+            (2112, 3, 16, 1),
+            (2111, 1, 16, 1),
+            (2244, 1, 17, 1),
         ] {
             assert!(carried_state_layout("kv.6.kidx_fp8", capacity, batch, max_ctx, ctx).is_err());
         }

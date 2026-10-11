@@ -29,15 +29,15 @@ pub mod serve;
 #[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu"))]
 pub use checkpoint::Checkpoint;
 pub mod devblob;
+/// The DSA lightning indexer's fp8 -> bf16 upcast. Gated with `checkpoint` for the same
+/// reason `shard` is: it is a rule about how a checkpoint tensor becomes a bound one.
+#[cfg(any(feature = "cuda", feature = "hsa"))]
+pub mod dsa_indexer;
 /// Packet extensions: finding `extension.pkt` beside a serving directory and applying the
 /// six-rule load contract in `plow_asset::extension` (docs/arch/19, phases 2 and 3).
 pub mod extension;
 #[cfg(feature = "gguf")]
 pub mod gguf;
-/// The DSA lightning indexer's fp8 -> bf16 upcast. Gated with `checkpoint` for the same
-/// reason `shard` is: it is a rule about how a checkpoint tensor becomes a bound one.
-#[cfg(any(feature = "cuda", feature = "hsa"))]
-pub mod dsa_indexer;
 /// Megatron weight sharding. Gated with `checkpoint` — it is the rule for which
 /// slice of a checkpoint tensor a rank binds, and useless without one.
 #[cfg(any(feature = "cuda", feature = "hsa"))]
@@ -92,7 +92,9 @@ impl ModelBundle {
                 let text = c.template.clone()?;
                 crate::serve::template::ChatTemplate::compile(
                     text,
-                    c.source.clone().unwrap_or_else(|| "model.pkt serve.json".into()),
+                    c.source
+                        .clone()
+                        .unwrap_or_else(|| "model.pkt serve.json".into()),
                     c.bos_token.clone(),
                     c.eos_token.clone(),
                 )
@@ -101,7 +103,8 @@ impl ModelBundle {
             crate::serve::template::ChatTemplate::load(&dir)
                 .or_else(|| crate::serve::template::ChatTemplate::load(&checkpoint))
         };
-        let serving = crate::serve::config::ServingConfig::from_defaults(serve.manifest.sampling.as_ref());
+        let serving =
+            crate::serve::config::ServingConfig::from_defaults(serve.manifest.sampling.as_ref());
         tracing::info!(
             temperature = serving.default_sampling.temperature,
             top_p = serving.default_sampling.top_p,
@@ -109,7 +112,9 @@ impl ModelBundle {
             "serving config resolved from the checkpoint"
         );
         match &chat_template {
-            Some(t) => tracing::info!(source = %t.source, from_packet = serve.from_packet, "chat template loaded"),
+            Some(t) => {
+                tracing::info!(source = %t.source, from_packet = serve.from_packet, "chat template loaded")
+            }
             None if serve.from_packet => tracing::info!(
                 dir = %dir.display(),
                 builtin = ?serve.manifest.chat.as_ref().and_then(|c| c.builtin.as_deref()),
@@ -122,7 +127,10 @@ impl ModelBundle {
             ),
         }
 
-        let reasoning = crate::serve::reasoning::ReasoningMode::resolve(&serve, chat_template.as_ref().and_then(|t| t.reasoning));
+        let reasoning = crate::serve::reasoning::ReasoningMode::resolve(
+            &serve,
+            chat_template.as_ref().and_then(|t| t.reasoning),
+        );
         Ok(ModelBundle {
             dir,
             manifest,
@@ -139,8 +147,11 @@ impl ModelBundle {
 
     /// The tokenizer's special-token text, for stripping after tool-call parsing.
     pub fn special_text(&self) -> &Arc<crate::serve::tools::SpecialText> {
-        self.special_text
-            .get_or_init(|| Arc::new(crate::serve::tools::SpecialText::new(self.tokenizer.special_tokens())))
+        self.special_text.get_or_init(|| {
+            Arc::new(crate::serve::tools::SpecialText::new(
+                self.tokenizer.special_tokens(),
+            ))
+        })
     }
 
     /// Whether the reasoning markers are special tokens: the generation must then be decoded with

@@ -23,9 +23,19 @@ fn main() {
         }
     }
     let j: serde_json::Value = serde_json::from_slice(&std::fs::read(reference).unwrap()).unwrap();
-    let case = j["cases"].as_array().unwrap().iter().find(|c| c["id"] == id.as_str()).expect("case");
+    let case = j["cases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["id"] == id.as_str())
+        .expect("case");
     let ids = |key: &str| -> Vec<u32> {
-        case[key].as_array().unwrap().iter().map(|v| v.as_u64().unwrap() as u32).collect()
+        case[key]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_u64().unwrap() as u32)
+            .collect()
     };
     let (prompt, cont) = (ids("prompt_ids"), ids("cont"));
     let mut eng = CpuEngine::load(&blob, &ckpt, &CpuEngineOpts::default()).expect("load");
@@ -36,9 +46,16 @@ fn main() {
         assert!(eng.logits_row(0, &mut lg));
         let m = lg.iter().copied().fold(f32::NEG_INFINITY, f32::max) as f64;
         let lse = m + lg.iter().map(|&x| (x as f64 - m).exp()).sum::<f64>().ln();
-        let mut top: Vec<(usize, f64)> = lg.iter().enumerate().map(|(t, &x)| (t, x as f64 - lse)).collect();
+        let mut top: Vec<(usize, f64)> = lg
+            .iter()
+            .enumerate()
+            .map(|(t, &x)| (t, x as f64 - lse))
+            .collect();
         top.sort_by(|a, b| b.1.total_cmp(&a.1));
-        let top: Vec<String> = top[..20].iter().map(|(t, l)| format!("[{t},{l:.6}]")).collect();
+        let top: Vec<String> = top[..20]
+            .iter()
+            .map(|(t, l)| format!("[{t},{l:.6}]"))
+            .collect();
         println!("{{\"k\":{k},\"top\":[{}]}}", top.join(","));
     }
 }

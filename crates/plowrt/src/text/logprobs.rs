@@ -40,7 +40,9 @@ impl RowStats {
             let mut floor = f32::NEG_INFINITY;
             for (c, chunk) in logits.chunks(LANES).enumerate() {
                 // Most chunks hold nothing above the current k-th value: one vector compare.
-                if top.len() == k && chunk.iter().fold(floor, |m, &x| if x > m { x } else { m }) <= floor {
+                if top.len() == k
+                    && chunk.iter().fold(floor, |m, &x| if x > m { x } else { m }) <= floor
+                {
                     continue;
                 }
                 for (j, &x) in chunk.iter().enumerate() {
@@ -56,12 +58,20 @@ impl RowStats {
                 }
             }
         }
-        RowStats { lse, raw_logits: req.raw_logits, top }
+        RowStats {
+            lse,
+            raw_logits: req.raw_logits,
+            top,
+        }
     }
 
     /// Statistics computed elsewhere (the device kernel): `top` best first.
     pub fn from_parts(lse: f32, raw_logits: bool, top: Vec<(u32, f32)>) -> Self {
-        RowStats { lse, raw_logits, top }
+        RowStats {
+            lse,
+            raw_logits,
+            top,
+        }
     }
 
     /// The entry for the chosen `token`, whose raw logit is `logit`.
@@ -105,7 +115,11 @@ fn log_sum_exp_body(row: &[f32]) -> f32 {
             *m = if x > *m { x } else { *m };
         }
     }
-    let max = tail.iter().chain(&lanes).copied().fold(f32::NEG_INFINITY, f32::max);
+    let max = tail
+        .iter()
+        .chain(&lanes)
+        .copied()
+        .fold(f32::NEG_INFINITY, f32::max);
     if !max.is_finite() {
         return max;
     }
@@ -119,7 +133,10 @@ fn log_sum_exp_body(row: &[f32]) -> f32 {
                 *a += exp_nonpos(x - max);
             }
         }
-        sum += tail.iter().map(|&x| f64::from(exp_nonpos(x - max))).sum::<f64>();
+        sum += tail
+            .iter()
+            .map(|&x| f64::from(exp_nonpos(x - max)))
+            .sum::<f64>();
         sum += acc.iter().map(|&a| f64::from(a)).sum::<f64>();
     }
     max + sum.ln() as f32
@@ -136,7 +153,15 @@ fn exp_nonpos(x: f32) -> f32 {
     let f = t - (v - MAGIC);
     let n = v.to_bits() as i32 - MAGIC.to_bits() as i32;
     // 2^f on [-0.5, 0.5]: Taylor in f*ln2 through degree 6.
-    const C: [f32; 7] = [1.0, 0.693_147_2, 0.240_226_5, 0.055_504_11, 0.009_618_129, 0.001_333_355_8, 0.000_154_035_3];
+    const C: [f32; 7] = [
+        1.0,
+        0.693_147_2,
+        0.240_226_5,
+        0.055_504_11,
+        0.009_618_129,
+        0.001_333_355_8,
+        0.000_154_035_3,
+    ];
     let p = C[0] + f * (C[1] + f * (C[2] + f * (C[3] + f * (C[4] + f * (C[5] + f * C[6])))));
     p * f32::from_bits(((n + 127) << 23) as u32)
 }
@@ -148,13 +173,26 @@ mod tests {
     #[test]
     fn logprobs_normalize_and_rank() {
         let logits = [1.0f32, 3.0, 2.0, 3.0, -1.0];
-        let s = RowStats::of(&logits, LogprobRequest { top: 3, raw_logits: false });
+        let s = RowStats::of(
+            &logits,
+            LogprobRequest {
+                top: 3,
+                raw_logits: false,
+            },
+        );
         let t = s.finish(logits[2]);
         let z: f32 = logits.iter().map(|x| x.exp()).sum();
         assert!((t.logprob - (2.0f32.exp() / z).ln()).abs() < 1e-6);
         let ids: Vec<u32> = t.top.iter().map(|x| x.0).collect();
         assert_eq!(ids, [1, 3, 2]);
-        let raw = RowStats::of(&logits, LogprobRequest { top: 1, raw_logits: true }).finish(1.0);
+        let raw = RowStats::of(
+            &logits,
+            LogprobRequest {
+                top: 1,
+                raw_logits: true,
+            },
+        )
+        .finish(1.0);
         assert_eq!((raw.logprob, raw.top.clone()), (1.0, vec![(1, 3.0)]));
     }
 
@@ -171,8 +209,17 @@ mod tests {
             .collect();
         row[7] = f32::NEG_INFINITY;
         let max = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-        let exact = f64::from(max) + row.iter().map(|&x| (f64::from(x) - f64::from(max)).exp()).sum::<f64>().ln();
-        assert!((f64::from(log_sum_exp(&row)) - exact).abs() < 2e-5, "{} vs {exact}", log_sum_exp(&row));
+        let exact = f64::from(max)
+            + row
+                .iter()
+                .map(|&x| (f64::from(x) - f64::from(max)).exp())
+                .sum::<f64>()
+                .ln();
+        assert!(
+            (f64::from(log_sum_exp(&row)) - exact).abs() < 2e-5,
+            "{} vs {exact}",
+            log_sum_exp(&row)
+        );
         for x in [0.0f32, -1e-3, -0.5, -1.0, -7.25, -30.0, -80.0] {
             assert!((exp_nonpos(x) / x.exp() - 1.0).abs() < 4e-6, "{x}");
         }

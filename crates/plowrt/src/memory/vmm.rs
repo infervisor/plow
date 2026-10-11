@@ -56,7 +56,9 @@ use crate::{Result, RuntimeError};
 /// (Drop has no error channel; implementations log).
 pub trait VmmOps: Send + Sync {
     fn allocation_provenance(
-        &self, _va: u64, _bytes: u64,
+        &self,
+        _va: u64,
+        _bytes: u64,
     ) -> Option<crate::device::provenance::MemoryRegion> {
         None
     }
@@ -166,14 +168,27 @@ impl VmmGeometry {
     /// Parse the checkpoint's `config.json` (`plow_asset::serve_manifest::KvGeometry::from_config`):
     /// the legacy source for a packet without `serve.json`.
     pub fn from_config(checkpoint_dir: &std::path::Path, max_ctx: u32, batch: u32) -> Option<Self> {
-        Self::from_kv(&plow_asset::serve_manifest::KvGeometry::from_config(checkpoint_dir)?, max_ctx, batch)
+        Self::from_kv(
+            &plow_asset::serve_manifest::KvGeometry::from_config(checkpoint_dir)?,
+            max_ctx,
+            batch,
+        )
     }
 
     /// The packet's KV geometry. `None` when it is not a usable shape — the caller then leaves
     /// VMM off.
-    pub fn from_kv(kv: &plow_asset::serve_manifest::KvGeometry, max_ctx: u32, batch: u32) -> Option<Self> {
-        let (kvh_full, hd_full, kvh_slide, hd_slide, window) =
-            (kv.kv_heads_full, kv.head_dim_full, kv.kv_heads_slide, kv.head_dim_slide, kv.window);
+    pub fn from_kv(
+        kv: &plow_asset::serve_manifest::KvGeometry,
+        max_ctx: u32,
+        batch: u32,
+    ) -> Option<Self> {
+        let (kvh_full, hd_full, kvh_slide, hd_slide, window) = (
+            kv.kv_heads_full,
+            kv.head_dim_full,
+            kv.kv_heads_slide,
+            kv.head_dim_slide,
+            kv.window,
+        );
         let slide = !kv.slide_layers.is_empty();
         if kv.full_layers.is_empty()
             || kvh_full == 0
@@ -394,7 +409,11 @@ impl VmmRings {
 
     /// Device bytes [`Self::new_idle_backed`] commits before any slot is claimed: one idle unit
     /// per distinct per-slot span, plus windows whose slots share units, committed whole.
-    pub fn idle_backed_startup_bytes(tensors: &[LiveRingTensor], batch: usize, granularity: u64) -> u64 {
+    pub fn idle_backed_startup_bytes(
+        tensors: &[LiveRingTensor],
+        batch: usize,
+        granularity: u64,
+    ) -> u64 {
         let mut idle: Vec<u64> = Vec::new();
         let mut pinned = 0u64;
         for t in tensors {
@@ -716,7 +735,8 @@ impl LiveKvLayout {
             if c.window == 0 {
                 if full_shape.is_some_and(|shape| shape != (c.heads, c.hd, elem)) {
                     return Err(RuntimeError::Rejected(
-                        "LIVE allocator requires uniform full-cache head geometry and encoding".into(),
+                        "LIVE allocator requires uniform full-cache head geometry and encoding"
+                            .into(),
                     ));
                 }
                 full_shape = Some((c.heads, c.hd, elem));
@@ -1237,7 +1257,12 @@ impl VmmKv {
         tensors: Option<&[(u32, u32)]>,
     ) -> Result<Self> {
         let tensors = tensors.map_or_else(
-            || geo.full_layers.iter().flat_map(|&layer| [(layer, 0), (layer, 1)]).collect(),
+            || {
+                geo.full_layers
+                    .iter()
+                    .flat_map(|&layer| [(layer, 0), (layer, 1)])
+                    .collect()
+            },
             <[_]>::to_vec,
         );
         let mut unique = rustc_hash::FxHashSet::default();
@@ -1246,7 +1271,9 @@ impl VmmKv {
                 !geo.full_layers.contains(&layer) || !unique.insert((layer, tensor))
             })
         {
-            return Err(RuntimeError::Rejected("vmm: invalid or duplicate cache tensor tracks".into()));
+            return Err(RuntimeError::Rejected(
+                "vmm: invalid or duplicate cache tensor tracks".into(),
+            ));
         }
         let gran = ops.granularity()?;
         let row_bytes = geo.row_bytes();
@@ -1364,7 +1391,11 @@ impl VmmKv {
                 while let Ok(job) = rx.recv() {
                     let s = &premap_shared;
                     match job {
-                        Job::Premap { seq, pos, generation } => {
+                        Job::Premap {
+                            seq,
+                            pos,
+                            generation,
+                        } => {
                             // The next block only once decode is within an eighth of a block
                             // of it (256 steps at 2048 rows, vs a ~7 ms map): mapping it as
                             // soon as a block starts held one idle column per slot (32 MiB on
@@ -1404,7 +1435,9 @@ impl VmmKv {
         // The VA window, so a device fault address can be attributed to the KV pool (or ruled out).
         let (va_lo, va_hi) = {
             let inner = shared.inner.lock();
-            inner.tracks.iter().fold((u64::MAX, 0u64), |(lo, hi), t| (lo.min(t.va), hi.max(t.va + span)))
+            inner.tracks.iter().fold((u64::MAX, 0u64), |(lo, hi), t| {
+                (lo.min(t.va), hi.max(t.va + span))
+            })
         };
         tracing::info!(
             va_lo = format_args!("{va_lo:#x}"),
@@ -1493,7 +1526,9 @@ impl VmmKv {
     /// backend degrades to today's behaviour rather than disabling eviction outright.
     /// Off by default (`min_free_bytes == 0`): every existing caller is unaffected.
     pub fn enable_pressure_eviction(&mut self, min_free_bytes: u64) {
-        self.shared.cache_min_free.store(min_free_bytes, Ordering::Relaxed);
+        self.shared
+            .cache_min_free
+            .store(min_free_bytes, Ordering::Relaxed);
     }
 
     /// Give memory back for an allocation outside this pool that failed for lack of it (a
@@ -1508,9 +1543,16 @@ impl VmmKv {
             s.ops.release(handle);
             freed = true;
         }
-        let target = s.cache_min_free.load(Ordering::Relaxed).saturating_add(bytes);
+        let target = s
+            .cache_min_free
+            .load(Ordering::Relaxed)
+            .saturating_add(bytes);
         let queued = inner.release_queued;
-        while s.ops.free_bytes().is_some_and(|free| free + (inner.release_queued - queued) < target) {
+        while s
+            .ops
+            .free_bytes()
+            .is_some_and(|free| free + (inner.release_queued - queued) < target)
+        {
             if !evict_one(s, &mut inner, false) {
                 break;
             }
@@ -1618,13 +1660,20 @@ impl VmmKv {
                 let mut i = 0;
                 while i < list.len() {
                     let snap = &list[i];
-                    let common = snap.tail.iter().zip(&chain[start.min(chain.len())..])
+                    let common = snap
+                        .tail
+                        .iter()
+                        .zip(&chain[start.min(chain.len())..])
                         .take_while(|(a, b)| a == b)
                         .count();
                     // A never-attached turn end whose prompt the chain extends but whose reply
                     // differs: the next prompt re-rendered the reply to other token ids (and
                     // dropped generation-prompt rows), so it can never attach.
-                    let end = if snap.rows >= snap.prompt_rows { snap.prompt_rows } else { snap.rows };
+                    let end = if snap.rows >= snap.prompt_rows {
+                        snap.prompt_rows
+                    } else {
+                        snap.rows
+                    };
                     let stale_turn_end = snap.attaches == 0
                         && common + TURN_END_SLACK >= (end as usize).saturating_sub(start);
                     let awaited = snap.tail.is_empty()
@@ -1692,7 +1741,10 @@ impl VmmKv {
             return;
         }
         let generation = s.generation[seq].load(Ordering::Acquire);
-        let job = Job::CopyOut { seq: seq as u32, generation };
+        let job = Job::CopyOut {
+            seq: seq as u32,
+            generation,
+        };
         if inner.jobs.as_ref().is_some_and(|tx| tx.send(job).is_ok()) {
             inner.copying[seq] = true;
         }
@@ -1755,7 +1807,11 @@ impl VmmKv {
     pub fn advise(&self, seq: usize, pos: u32) {
         if let Some(tx) = &self.premap_tx {
             let generation = self.shared.generation[seq].load(Ordering::Acquire);
-            let _ = tx.send(Job::Premap { seq: seq as u32, pos, generation });
+            let _ = tx.send(Job::Premap {
+                seq: seq as u32,
+                pos,
+                generation,
+            });
         }
     }
 
@@ -1769,7 +1825,8 @@ impl VmmKv {
         if self.release_retire {
             // A queued copy-out finishing costs copies; the inline swap it saves is ~12 ms of
             // serialized ioctls. Outside the engine section, so the job's own driver calls run.
-            let wait = std::time::Duration::from_micros(s.admission_wait_us.load(Ordering::Relaxed));
+            let wait =
+                std::time::Duration::from_micros(s.admission_wait_us.load(Ordering::Relaxed));
             let deadline = std::time::Instant::now() + wait;
             let mut inner = s.inner.lock();
             while inner.copying[seq] && !s.copy_cv.wait_until(&mut inner, deadline).timed_out() {}
@@ -1853,7 +1910,8 @@ impl VmmKv {
 
     /// A [`PrefixProbe`] for the serve layer's admission order (`None` without prefix reuse).
     pub fn prefix_probe(&self) -> Option<PrefixProbe> {
-        self.prefix_reuse.then(|| PrefixProbe(Arc::clone(&self.shared)))
+        self.prefix_reuse
+            .then(|| PrefixProbe(Arc::clone(&self.shared)))
     }
 
     pub fn try_attach(&self, seq: usize, prompt: &[u32]) -> Result<Option<Attach>> {
@@ -1862,7 +1920,12 @@ impl VmmKv {
 
     /// [`Self::try_attach`] with the prompt's block hashes already computed (by the DP router);
     /// a key for another block size or prompt is ignored and the prompt hashed here.
-    pub fn try_attach_keyed(&self, seq: usize, prompt: &[u32], key: Option<PrefixKey>) -> Result<Option<Attach>> {
+    pub fn try_attach_keyed(
+        &self,
+        seq: usize,
+        prompt: &[u32],
+        key: Option<PrefixKey>,
+    ) -> Result<Option<Attach>> {
         if !self.prefix_reuse {
             return Ok(None);
         }
@@ -1898,7 +1961,12 @@ impl VmmKv {
                 }
             }
         }
-        note_share(&mut inner, seq, prompt, chosen.map_or(0, |(_, _, rows)| rows));
+        note_share(
+            &mut inner,
+            seq,
+            prompt,
+            chosen.map_or(0, |(_, _, rows)| rows),
+        );
         let Some((pick, snap_key, rows)) = chosen else {
             inner.stats.attach_misses += 1;
             inner.cache.release(&hashes, m.blocks);
@@ -1931,14 +1999,24 @@ impl VmmKv {
         };
         inner.snapshot_tick += 1;
         let tick = inner.snapshot_tick;
-        let snap = inner.published.get_mut(&snap_key.node).unwrap()
-            .iter_mut().find(|s| s.va == snap_key.va).unwrap();
+        let snap = inner
+            .published
+            .get_mut(&snap_key.node)
+            .unwrap()
+            .iter_mut()
+            .find(|s| s.va == snap_key.va)
+            .unwrap();
         snap.users += 1;
         snap.last_used = tick;
         snap.referenced = true;
         snap.reusable_prompt = true;
         snap.attaches += 1;
-        let attach = Attach { rows, snap_va: snap.va, snap_bytes: snap.bytes, segments: Vec::new() };
+        let attach = Attach {
+            rows,
+            snap_va: snap.va,
+            snap_bytes: snap.bytes,
+            segments: Vec::new(),
+        };
 
         // COMMIT the whole attach under the lock — slot table, refcounts,
         // frontier — but only COLLECT the driver work. The map/set_access
@@ -2178,10 +2256,18 @@ impl VmmKv {
                     other.tokens.get(k * br..(k + 1) * br) == prompt.get(k * br..(k + 1) * br)
                 })
                 .count();
-            let reachable = other.prompt_rows.saturating_sub(lookback as usize).div_ceil(br);
-            let block_rows = if shared >= reachable { (shared * br) as u32 } else { 0 };
+            let reachable = other
+                .prompt_rows
+                .saturating_sub(lookback as usize)
+                .div_ceil(br);
+            let block_rows = if shared >= reachable {
+                (shared * br) as u32
+            } else {
+                0
+            };
             // The shared-prefix end, 32-row aligned like `note_share`'s.
-            let common = other.tokens[..other.prompt_rows.saturating_sub(1).min(other.tokens.len())]
+            let common = other.tokens
+                [..other.prompt_rows.saturating_sub(1).min(other.tokens.len())]
                 .iter()
                 .zip(&prompt[..prompt.len() - 1])
                 .take_while(|(a, b)| a == b)
@@ -2339,7 +2425,13 @@ impl VmmKv {
         inner.fine_ceiling = ceiling;
         inner.fine_cache = Some(
             PrefixCache::new(
-                GrowablePool { base: 0, kv_factor: 1, kv_heads: 1, max_seqs: u32::MAX, head_slot_bytes: 1 << 32 },
+                GrowablePool {
+                    base: 0,
+                    kv_factor: 1,
+                    kv_heads: 1,
+                    max_seqs: u32::MAX,
+                    head_slot_bytes: 1 << 32,
+                },
                 fine_rows as u64,
                 1,
             )
@@ -2517,20 +2609,24 @@ impl VmmKv {
                 s.ops.free(va); // raced: a concurrent publish already covers this index
                 continue;
             }
-            inner.fine_published.entry(Some((pid, idx as u32))).or_default().push(Snap {
-                va,
-                bytes: chunk_bytes,
-                rows: fine_rows,
-                tail: Vec::new(),
-                users: 0,
-                last_used: 0,
-                referenced: false,
-                reusable_prompt: false,
-                attaches: 0,
-                session: false,
-                prompt_rows: 0,
-                share: false,
-            });
+            inner
+                .fine_published
+                .entry(Some((pid, idx as u32)))
+                .or_default()
+                .push(Snap {
+                    va,
+                    bytes: chunk_bytes,
+                    rows: fine_rows,
+                    tail: Vec::new(),
+                    users: 0,
+                    last_used: 0,
+                    referenced: false,
+                    reusable_prompt: false,
+                    attaches: 0,
+                    session: false,
+                    prompt_rows: 0,
+                    share: false,
+                });
             // Counts toward the same budget whole blocks and boundary snapshots do, so
             // `trim_cache` (both the static `cache_cap` and pressure-eviction branches) sees
             // fine chunks too, and `evict_one_fine` can reclaim them under real pressure.
@@ -2567,7 +2663,9 @@ impl PrefixProbe {
     /// [`Self::cached_rows`] reusing `key` when it was hashed for this block size and prompt.
     pub fn cached_rows_keyed(&self, prompt: &[u32], key: Option<&PrefixKey>) -> u32 {
         match key {
-            Some(k) if k.fits(self.0.block_rows, prompt) => rows_for(&self.0, &self.0.inner.lock(), prompt, &k.hashes),
+            Some(k) if k.fits(self.0.block_rows, prompt) => {
+                rows_for(&self.0, &self.0.inner.lock(), prompt, &k.hashes)
+            }
             _ => cached_rows(&self.0, prompt),
         }
     }
@@ -2584,7 +2682,10 @@ impl PrefixProbe {
 
     /// [`Self::cached_rows_keyed`] for many prompts under one lock.
     pub fn rows_locked(&self) -> PrefixRows<'_> {
-        PrefixRows { s: &self.0, inner: self.0.inner.lock() }
+        PrefixRows {
+            s: &self.0,
+            inner: self.0.inner.lock(),
+        }
     }
 
     /// Leading prompt rows whose blocks this cache holds (whole blocks; an upper bound on what an
@@ -2617,8 +2718,15 @@ impl PrefixRows<'_> {
     /// Rows `prompt` attaches; hashes it (under the lock) unless `key` fits.
     pub fn rows(&self, prompt: &[u32], key: Option<&PrefixKey>) -> u32 {
         match key {
-            Some(k) if k.fits(self.s.block_rows, prompt) => rows_for(self.s, &self.inner, prompt, &k.hashes),
-            _ => rows_for(self.s, &self.inner, prompt, &hash_blocks(prompt, self.s.block_rows)),
+            Some(k) if k.fits(self.s.block_rows, prompt) => {
+                rows_for(self.s, &self.inner, prompt, &k.hashes)
+            }
+            _ => rows_for(
+                self.s,
+                &self.inner,
+                prompt,
+                &hash_blocks(prompt, self.s.block_rows),
+            ),
         }
     }
 }
@@ -2634,7 +2742,11 @@ pub struct PrefixKey {
 
 impl PrefixKey {
     pub fn new(prompt: &[u32], block_rows: u32) -> Self {
-        PrefixKey { block_rows, prompt_len: prompt.len(), hashes: hash_blocks(prompt, block_rows) }
+        PrefixKey {
+            block_rows,
+            prompt_len: prompt.len(),
+            hashes: hash_blocks(prompt, block_rows),
+        }
     }
 
     pub fn block_rows(&self) -> u32 {
@@ -2739,7 +2851,9 @@ fn note_share(inner: &mut Inner, seq: usize, prompt: &[u32], attached: u32) {
     if inner.recent.len() == RECENT_PROMPTS {
         inner.recent.pop_front();
     }
-    inner.recent.push_back(prompt[..prompt.len().min(RECENT_ROWS)].into());
+    inner
+        .recent
+        .push_back(prompt[..prompt.len().min(RECENT_ROWS)].into());
 }
 
 fn alloc_snapshot(s: &Shared, bytes: u64) -> Result<u64> {
@@ -2771,13 +2885,17 @@ fn publish_locked(
         || rows.div_ceil(s.block_rows) > inner.seq_blocks[seq]
         || snap_bytes == 0
     {
-        return Err(RuntimeError::Rejected("vmm: unpublished rows or empty snapshot".into()));
+        return Err(RuntimeError::Rejected(
+            "vmm: unpublished rows or empty snapshot".into(),
+        ));
     }
     cache_changed(s);
     let prior = &inner.seqs[seq].tokens;
     let overlap = prior.len().min(tokens.len());
     if tokens[..overlap] != prior[..overlap] {
-        return Err(RuntimeError::Rejected("vmm: published tokens changed the attached stream".into()));
+        return Err(RuntimeError::Rejected(
+            "vmm: published tokens changed the attached stream".into(),
+        ));
     }
     let hashes = hash_blocks(&tokens[..rows as usize], s.block_rows);
     let n_pub = hashes.len();
@@ -2809,7 +2927,9 @@ fn publish_locked(
     // consistent; same-conversation growth across turns is exactly that case.)
     if inner.strict_publish && m.blocks > inner.seqs[seq].held {
         inner.cache.release(&hashes, m.blocks);
-        return Ok(PublishLocked::Done { unused_snapshot: snapshot });
+        return Ok(PublishLocked::Done {
+            unused_snapshot: snapshot,
+        });
     }
     let matched_key = if n_pub == 0 {
         Some(None)
@@ -2820,7 +2940,8 @@ fn publish_locked(
     };
     let snapshot_exists = matched_key.is_some_and(|key| {
         inner.published.get(&key).is_some_and(|list| {
-            list.iter().any(|snap| snap.rows == rows && snap.tail == tail)
+            list.iter()
+                .any(|snap| snap.rows == rows && snap.tail == tail)
         })
     });
     if snapshot.is_none() && !snapshot_exists {
@@ -2833,7 +2954,9 @@ fn publish_locked(
     let n_ok = inner.cache.insert(&hashes, tokens, pid, m.blocks);
     if n_ok != n_pub {
         inner.cache.release(&hashes, m.blocks);
-        return Err(RuntimeError::Rejected("vmm: prefix publication collided".into()));
+        return Err(RuntimeError::Rejected(
+            "vmm: prefix publication collided".into(),
+        ));
     }
 
     let kvh = s.geo.kvh_full as usize;
@@ -2874,9 +2997,10 @@ fn publish_locked(
     };
     inner.snapshot_tick += 1;
     let tick = inner.snapshot_tick;
-    let unused_snapshot = if let Some(snap) = inner.published.get_mut(&bkey)
-        .and_then(|list| list.iter_mut().find(|snap| snap.rows == rows && snap.tail == tail))
-    {
+    let unused_snapshot = if let Some(snap) = inner.published.get_mut(&bkey).and_then(|list| {
+        list.iter_mut()
+            .find(|snap| snap.rows == rows && snap.tail == tail)
+    }) {
         snap.last_used = tick;
         snap.reusable_prompt |= reusable_prompt;
         snap.share |= share;
@@ -2941,7 +3065,11 @@ fn try_attach_fine(inner: &mut Inner, seq: usize, prompt: &[u32]) -> Result<Opti
 
     let mut segments = Vec::with_capacity(m.blocks);
     for i in 0..m.blocks {
-        match inner.fine_published.get(&Some(m.placed[i])).and_then(|v| v.first()) {
+        match inner
+            .fine_published
+            .get(&Some(m.placed[i]))
+            .and_then(|v| v.first())
+        {
             Some(snap) => segments.push((snap.va, snap.bytes)),
             None => break, // an evicted node: everything past it is untrusted, stop here
         }
@@ -2980,7 +3108,12 @@ fn try_attach_fine(inner: &mut Inner, seq: usize, prompt: &[u32]) -> Result<Opti
         fine_hashes: hashes[..pick].to_vec(),
         fine_held: pick,
     };
-    Ok(Some(Attach { rows, snap_va: 0, snap_bytes, segments }))
+    Ok(Some(Attach {
+        rows,
+        snap_va: 0,
+        snap_bytes,
+        segments,
+    }))
 }
 
 fn stats_of(s: &Shared) -> VmmStats {
@@ -3040,7 +3173,8 @@ impl Drop for VmmKv {
                         s.ops.release(handle);
                     }
                 }
-                s.ops.address_free(*va, u64::from(COPY_REGION) * s.block_bytes);
+                s.ops
+                    .address_free(*va, u64::from(COPY_REGION) * s.block_bytes);
             }
         }
     }
@@ -3106,10 +3240,13 @@ fn ensure_rows(s: &Shared, seq: usize, rows: u32, generation: Option<u64>) -> Re
                 }
                 let mapped = create_block(s, &mut inner).and_then(|id| {
                     let handle = inner.blocks[id as usize].handle;
-                    s.ops.map(va, s.block_bytes, handle).map(|()| id).map_err(|error| {
-                        deref_block(s, &mut inner, id);
-                        error
-                    })
+                    s.ops
+                        .map(va, s.block_bytes, handle)
+                        .map(|()| id)
+                        .map_err(|error| {
+                            deref_block(s, &mut inner, id);
+                            error
+                        })
                 });
                 match mapped {
                     Ok(id) => run.push((k, id)),
@@ -3147,7 +3284,8 @@ fn ensure_rows(s: &Shared, seq: usize, rows: u32, generation: Option<u64>) -> Re
 /// Unmap and drop blocks [`ensure_rows`] mapped but never granted access; their slots stay empty.
 fn unwind_run(s: &Shared, inner: &mut Inner, t: usize, seq: usize, h: u32, run: &[(u32, u32)]) {
     for &(k, id) in run {
-        s.ops.unmap(slot_va(s, &inner.tracks[t], seq, h, k), s.block_bytes);
+        s.ops
+            .unmap(slot_va(s, &inner.tracks[t], seq, h, k), s.block_bytes);
         deref_block(s, inner, id);
     }
 }
@@ -3167,13 +3305,27 @@ fn create_block(s: &Shared, inner: &mut Inner) -> Result<u32> {
             inner.stats.blocks_pooled -= 1;
             inner.stats.blocks_reused += 1;
             inner.stats.blocks_live += 1;
-            return Ok(install_block(inner, Block { handle, refs: 1, copy: None }));
+            return Ok(install_block(
+                inner,
+                Block {
+                    handle,
+                    refs: 1,
+                    copy: None,
+                },
+            ));
         }
         match s.ops.create(s.block_bytes) {
             Ok(handle) => {
                 inner.stats.blocks_created += 1;
                 inner.stats.blocks_live += 1;
-                return Ok(install_block(inner, Block { handle, refs: 1, copy: None }));
+                return Ok(install_block(
+                    inner,
+                    Block {
+                        handle,
+                        refs: 1,
+                        copy: None,
+                    },
+                ));
             }
             Err(e) => {
                 // A fatal fault (poisoned context) is not memory pressure —
@@ -3197,12 +3349,18 @@ fn steal_stale(s: &Shared, inner: &mut Inner) -> bool {
         return false;
     }
     let found = inner.tracks.iter().enumerate().find_map(|(t, track)| {
-        track.slots.iter().enumerate().find_map(|(slot, state)| match *state {
-            Slot::Stale(id) if inner.blocks[id as usize].refs == 1 => Some((t, slot, id)),
-            _ => None,
-        })
+        track
+            .slots
+            .iter()
+            .enumerate()
+            .find_map(|(slot, state)| match *state {
+                Slot::Stale(id) if inner.blocks[id as usize].refs == 1 => Some((t, slot, id)),
+                _ => None,
+            })
     });
-    let Some((t, slot, id)) = found else { return false };
+    let Some((t, slot, id)) = found else {
+        return false;
+    };
     let va = inner.tracks[t].va
         + (slot as u64 / s.bph as u64) * s.head_span
         + (slot as u64 % s.bph as u64) * s.block_bytes;
@@ -3260,8 +3418,13 @@ fn trim_cache(s: &Shared, inner: &mut Inner) {
 
 fn release_snapshot_hold(inner: &mut Inner, seq: usize) {
     if let Some(key) = inner.seqs[seq].snapshot.take() {
-        let snap = inner.published.get_mut(&key.node).unwrap()
-            .iter_mut().find(|snap| snap.va == key.va).unwrap();
+        let snap = inner
+            .published
+            .get_mut(&key.node)
+            .unwrap()
+            .iter_mut()
+            .find(|snap| snap.va == key.va)
+            .unwrap();
         snap.users -= 1;
     }
     // The fine-chain counterpart: like the snapshot hold above (not like the native radix
@@ -3327,7 +3490,10 @@ fn evict_one_fine(s: &Shared, inner: &mut Inner) -> bool {
 /// matched depth, so no request can use it again. Frees its blocks.
 fn evict_dead_leaf(s: &Shared, inner: &mut Inner) -> bool {
     let published = &inner.published;
-    let Some(key) = inner.cache.evict_lru_where(|key| !published.contains_key(&Some(key))) else {
+    let Some(key) = inner
+        .cache
+        .evict_lru_where(|key| !published.contains_key(&Some(key)))
+    else {
         return false;
     };
     cache_changed(s);
@@ -3356,8 +3522,15 @@ fn evict_one(s: &Shared, inner: &mut Inner, preserve_hot: bool) -> bool {
     }
     // Output-only boundaries cannot replay the original prompt. Reclaim them
     // before removing prompt snapshots or the KV blocks those snapshots need.
-    if let Some((node, index)) = inner.published.iter()
-        .flat_map(|(&node, snaps)| snaps.iter().enumerate().map(move |(i, snap)| (node, i, snap)))
+    if let Some((node, index)) = inner
+        .published
+        .iter()
+        .flat_map(|(&node, snaps)| {
+            snaps
+                .iter()
+                .enumerate()
+                .map(move |(i, snap)| (node, i, snap))
+        })
         .filter(|(_, _, snap)| snap.users == 0 && !snap.reusable_prompt)
         .min_by_key(|(_, _, snap)| snap.last_used)
         .map(|(node, index, _)| (node, index))
@@ -3369,9 +3542,13 @@ fn evict_one(s: &Shared, inner: &mut Inner, preserve_hot: bool) -> bool {
     // restoring an attachment. Protect the most recently reused snapshot
     // against unique-tail bursts; the rest remain LRU so new prefixes fit.
     // A session's own boundary attached once is spent, not hot.
-    let protected = inner.published.values().flatten()
+    let protected = inner
+        .published
+        .values()
+        .flatten()
         .filter(|snap| {
-            snap.users == 0 && snap.referenced
+            snap.users == 0
+                && snap.referenced
                 && (!snap.session || snap.tail.is_empty() || snap.attaches >= 2)
         })
         .max_by_key(|snap| snap.last_used)
@@ -3386,22 +3563,43 @@ fn evict_one(s: &Shared, inner: &mut Inner, preserve_hot: bool) -> bool {
     // a shared-prefix end (a system prompt below one block sits on no pinnable node) just
     // before it.
     let pinned = inner.cache.pinned();
-    if let Some((node, index)) = inner.published.iter()
+    if let Some((node, index)) = inner
+        .published
+        .iter()
         .flat_map(|(&node, snaps)| {
             let checkpoint = node.is_some() && snaps.iter().any(|snap| snap.tail.is_empty());
-            let tailed = snaps.iter().any(|snap| snap.session && !snap.tail.is_empty());
+            let tailed = snaps
+                .iter()
+                .any(|snap| snap.session && !snap.tail.is_empty());
             let pin = node.is_some_and(|key| pinned.contains(&key));
             snaps.iter().enumerate().map(move |(i, snap)| {
                 let covered = checkpoint && !snap.tail.is_empty() && !snap.session;
                 let spent = snap.session
                     && (!snap.tail.is_empty() && snap.attaches == 1
                         || snap.tail.is_empty() && tailed && snap.attaches == 0);
-                (node, i, snap, pin, if covered { 0u8 } else if spent { 1 } else { 2 })
+                (
+                    node,
+                    i,
+                    snap,
+                    pin,
+                    if covered {
+                        0u8
+                    } else if spent {
+                        1
+                    } else {
+                        2
+                    },
+                )
             })
         })
         .filter(|(_, _, snap, ..)| snap.users == 0 && Some(snap.va) != protected)
         .min_by_key(|(_, _, snap, pin, rank)| {
-            (snap.attaches >= 2, *pin || snap.share, *rank, snap.last_used)
+            (
+                snap.attaches >= 2,
+                *pin || snap.share,
+                *rank,
+                snap.last_used,
+            )
         })
         .map(|(node, index, ..)| (node, index))
     {
@@ -3413,22 +3611,33 @@ fn evict_one(s: &Shared, inner: &mut Inner, preserve_hot: bool) -> bool {
         }
         inner.stats.eviction_units += 1;
         inner.stats.eviction_unit_bytes += before - inner.stats.cache_bytes;
-        tracing::debug!(freed = before - inner.stats.cache_bytes, blocks, "vmm prefix eviction unit");
+        tracing::debug!(
+            freed = before - inner.stats.cache_bytes,
+            blocks,
+            "vmm prefix eviction unit"
+        );
         return true;
     }
     let Some(key) = inner.cache.evict_lru() else {
-        let Some((node, index)) = inner.published.iter()
-                .flat_map(|(&node, snaps)| snaps.iter().enumerate().map(move |(i, snap)| (node, i, snap)))
-                .filter(|(_, _, snap)| snap.users == 0)
-                .min_by_key(|(_, _, snap)| (
-                    Some(snap.va) == protected,
-                    snap.last_used,
-                ))
-                .map(|(node, index, _)| (node, index))
-        else { return false };
+        let Some((node, index)) = inner
+            .published
+            .iter()
+            .flat_map(|(&node, snaps)| {
+                snaps
+                    .iter()
+                    .enumerate()
+                    .map(move |(i, snap)| (node, i, snap))
+            })
+            .filter(|(_, _, snap)| snap.users == 0)
+            .min_by_key(|(_, _, snap)| (Some(snap.va) == protected, snap.last_used))
+            .map(|(node, index, _)| (node, index))
+        else {
+            return false;
+        };
         // Active radix leases can exceed the soft budget. Keep their hot
         // snapshot until retirement, but allow OOM reclamation to remove it.
-        if preserve_hot && inner.stats.cache_blocks > 0
+        if preserve_hot
+            && inner.stats.cache_blocks > 0
             && Some(inner.published[&node][index].va) == protected
         {
             return false;
@@ -3444,7 +3653,9 @@ fn evict_one(s: &Shared, inner: &mut Inner, preserve_hot: bool) -> bool {
         }
     }
     if let Some(snapshots) = inner.published.remove(&Some(key)) {
-        for snap in snapshots { free_snapshot(s, inner, snap); }
+        for snap in snapshots {
+            free_snapshot(s, inner, snap);
+        }
     }
     inner.stats.nodes_evicted += 1;
     true
@@ -3453,7 +3664,9 @@ fn evict_one(s: &Shared, inner: &mut Inner, preserve_hot: bool) -> bool {
 fn remove_snapshot(s: &Shared, inner: &mut Inner, node: Option<(u32, u32)>, index: usize) {
     cache_changed(s);
     let snap = inner.published.get_mut(&node).unwrap().swap_remove(index);
-    if inner.published[&node].is_empty() { inner.published.remove(&node); }
+    if inner.published[&node].is_empty() {
+        inner.published.remove(&node);
+    }
     free_snapshot(s, inner, snap);
 }
 
@@ -3579,7 +3792,8 @@ fn retire_window(s: &Shared, inner: &mut Inner, seq: usize) -> u32 {
                 }
                 Slot::Live(_) | Slot::Stale(_) => {
                     let id = take_slot(inner, t, slot).unwrap();
-                    s.ops.unmap(slot_va(s, &inner.tracks[t], seq, h, 0), s.block_bytes);
+                    s.ops
+                        .unmap(slot_va(s, &inner.tracks[t], seq, h, 0), s.block_bytes);
                     deref_block(s, inner, id);
                     unmapped += 1;
                     column0_live = false;
@@ -3650,7 +3864,11 @@ fn claim_copy_slot(
         }
     };
     copy[r].1[i] = CopySlot::Busy;
-    Some((r as u32 * COPY_REGION + i as u32, copy[r].0 + i as u64 * s.block_bytes, None))
+    Some((
+        r as u32 * COPY_REGION + i as u32,
+        copy[r].0 + i as u64 * s.block_bytes,
+        None,
+    ))
 }
 
 /// [`Job::DropSpare`]: unmap and release one spare while the pool holds more than its spare cap.
@@ -3659,7 +3877,9 @@ fn drop_spare(s: &Shared, track: usize, slot: u32) {
     let _turn = reclaim_turn();
     let (va, handle) = {
         let mut inner = s.inner.lock();
-        let CopySlot::Spare(handle) = *copy_slot(&mut inner, track, slot) else { return };
+        let CopySlot::Spare(handle) = *copy_slot(&mut inner, track, slot) else {
+            return;
+        };
         if inner.spares as usize <= spare_cap(s, &inner) {
             return;
         }
@@ -3676,7 +3896,9 @@ fn drop_spare(s: &Shared, track: usize, slot: u32) {
 
 fn spares_on(track: &Track) -> u32 {
     let slots = track.copy.iter().flat_map(|(_, slots)| slots);
-    slots.filter(|slot| matches!(slot, CopySlot::Spare(_))).count() as u32
+    slots
+        .filter(|slot| matches!(slot, CopySlot::Spare(_)))
+        .count() as u32
 }
 
 /// [`Job::Refill`]: map spares until every track holds [`spare_target`], so a copy-out lands in a
@@ -3690,7 +3912,9 @@ fn refill_spares(s: &Shared) {
             let mut guard = s.inner.lock();
             let inner = &mut *guard;
             let target = spare_target(s, inner);
-            let Some(track) = inner.tracks.iter().position(|t| spares_on(t) < target) else { return };
+            let Some(track) = inner.tracks.iter().position(|t| spares_on(t) < target) else {
+                return;
+            };
             let pooled = inner.pooled.pop();
             if pooled.is_some() {
                 inner.stats.blocks_pooled -= 1;
@@ -3796,7 +4020,9 @@ fn copy_out(s: &Shared, seq: usize, generation: u64) {
                 }
             }
             for (track, head, node, index, old) in found {
-                let Some((slot, dst, spare)) = claim_copy_slot(s, inner, track, true) else { continue };
+                let Some((slot, dst, spare)) = claim_copy_slot(s, inner, track, true) else {
+                    continue;
+                };
                 let src = slot_va(s, &inner.tracks[track], seq, head, 0);
                 let (handle, pooled) = match spare {
                     Some(handle) => (Some(handle), false),
@@ -3903,10 +4129,21 @@ fn copy_out(s: &Shared, seq: usize, generation: u64) {
                 && e.mapped
                 && inner.tracks[e.track].slots[slot_index(s, seq, e.head, 0)] == Slot::Live(e.old)
                 && inner.blocks[e.old as usize].refs == 2
-                && inner.node_blocks.get(&e.node).and_then(|ids| ids.get(e.index)) == Some(&e.old)
+                && inner
+                    .node_blocks
+                    .get(&e.node)
+                    .and_then(|ids| ids.get(e.index))
+                    == Some(&e.old)
             {
                 let copy = Some((e.track as u32, e.slot));
-                let id = install_block(inner, Block { handle, refs: 1, copy });
+                let id = install_block(
+                    inner,
+                    Block {
+                        handle,
+                        refs: 1,
+                        copy,
+                    },
+                );
                 *copy_slot(inner, e.track, e.slot) = CopySlot::Held(id);
                 inner.node_blocks.get_mut(&e.node).unwrap()[e.index] = id;
                 inner.blocks[e.old as usize].refs -= 1;
@@ -3939,7 +4176,10 @@ fn copy_out(s: &Shared, seq: usize, generation: u64) {
                         }
                         if matches!(slot, CopySlot::Spare(_)) {
                             let slot = r as u32 * COPY_REGION + i as u32;
-                            let _ = tx.send(Job::DropSpare { track: t as u32, slot });
+                            let _ = tx.send(Job::DropSpare {
+                                track: t as u32,
+                                slot,
+                            });
                             excess -= 1;
                         }
                     }
@@ -4001,8 +4241,11 @@ fn reclaim_stale(s: &Shared, seq: usize) {
                 }
             }
         }
-        let Some((t, h, k, slot, id)) = next else { return };
-        s.ops.unmap(slot_va(s, &inner.tracks[t], seq, h, k), s.block_bytes);
+        let Some((t, h, k, slot, id)) = next else {
+            return;
+        };
+        s.ops
+            .unmap(slot_va(s, &inner.tracks[t], seq, h, k), s.block_bytes);
         inner.tracks[t].slots[slot] = Slot::Empty;
         inner.stats.blocks_stale -= 1;
         inner.stats.blocks_reclaimed += 1;
@@ -4217,13 +4460,19 @@ impl VmmSlab {
     }
 
     pub fn view(&self, offset: u64, bytes: u64) -> Result<crate::device::DeviceMem> {
-        let end = offset.checked_add(bytes).filter(|end| *end <= self.bytes)
+        let end = offset
+            .checked_add(bytes)
+            .filter(|end| *end <= self.bytes)
             .ok_or_else(|| RuntimeError::Rejected("VMM slab view out of bounds".into()))?;
-        let va = self.va.checked_add(offset)
+        let va = self
+            .va
+            .checked_add(offset)
             .ok_or_else(|| RuntimeError::Rejected("VMM slab view address overflow".into()))?;
         self.wait_mapped(end)?;
         Ok(crate::device::DeviceMem::mapped_view(
-            va, bytes, self.ops.allocation_provenance(va, bytes),
+            va,
+            bytes,
+            self.ops.allocation_provenance(va, bytes),
         ))
     }
 
@@ -4648,15 +4897,23 @@ mod tests {
         // 512 KiB heads: one slot's single head is not whole granules either.
         assert!(layout.slot_granular_full(&blob, gran, hint).is_none());
         // Block-mappable heads keep the row-granular pool.
-        assert!(layout.slot_granular_full(&blob, 512 << 10, 512 << 10).is_none());
+        assert!(layout
+            .slot_granular_full(&blob, 512 << 10, 512 << 10)
+            .is_none());
         // Qwen3-ASR shape: 8 heads x 2048 rows x hd128 bf16 = 4 MiB per slot.
-        (layout.geometry.kvh_full, layout.geometry.hd_full, layout.geometry.max_ctx) = (8, 128, 2048);
+        (
+            layout.geometry.kvh_full,
+            layout.geometry.hd_full,
+            layout.geometry.max_ctx,
+        ) = (8, 128, 2048);
         for t in [1, 2] {
             blob.tensors[t].bytes = 4 * 8 * 2048 * 128 * 2;
         }
         let full = layout.slot_granular_full(&blob, gran, hint).unwrap();
         assert_eq!(
-            full.iter().map(|t| (t.tensor, t.slot_bytes)).collect::<Vec<_>>(),
+            full.iter()
+                .map(|t| (t.tensor, t.slot_bytes))
+                .collect::<Vec<_>>(),
             [(1, 4 << 20), (2, 4 << 20)]
         );
         blob.tensors[2].bytes += 4;
@@ -4840,13 +5097,18 @@ mod tests {
             if us == 0 {
                 return;
             }
-            let _driver = (which < 2).then(|| MODEL_DRIVER.lock().unwrap_or_else(|e| e.into_inner()));
+            let _driver =
+                (which < 2).then(|| MODEL_DRIVER.lock().unwrap_or_else(|e| e.into_inner()));
             std::thread::sleep(std::time::Duration::from_micros(us));
         }
     }
 
     impl VmmOps for MockVmm {
-        fn allocation_provenance(&self, va: u64, bytes: u64) -> Option<crate::device::provenance::MemoryRegion> {
+        fn allocation_provenance(
+            &self,
+            va: u64,
+            bytes: u64,
+        ) -> Option<crate::device::provenance::MemoryRegion> {
             self.provenance.lock().region(va, bytes)
         }
         fn granularity(&self) -> Result<u64> {
@@ -5036,10 +5298,19 @@ mod tests {
         for failure in 1..=3 {
             let ops = Arc::new(MockVmm::default());
             ops.fail_reserves.store(failure, Ordering::SeqCst);
-            assert!(VmmKv::new_tensors(ops.clone(), geometry.clone(), 64, 0,
-                &[(3, 0), (3, 1), (3, 2)]).is_err());
+            assert!(VmmKv::new_tensors(
+                ops.clone(),
+                geometry.clone(),
+                64,
+                0,
+                &[(3, 0), (3, 1), (3, 2)]
+            )
+            .is_err());
             assert_eq!(ops.reserves.load(Ordering::SeqCst), (failure - 1) as u64);
-            assert_eq!(ops.address_frees.load(Ordering::SeqCst), (failure - 1) as u64);
+            assert_eq!(
+                ops.address_frees.load(Ordering::SeqCst),
+                (failure - 1) as u64
+            );
             assert_eq!(ops.creates.load(Ordering::SeqCst), 0);
         }
     }
@@ -5063,9 +5334,8 @@ mod tests {
         for tensors in [&[][..], &[(0, 0), (0, 0)][..], &[(3, 0)][..]] {
             assert!(VmmKv::new_tensors(ops.clone(), geometry.clone(), 64, 0, tensors).is_err());
         }
-        let p = VmmKv::new_tensors(
-            ops.clone(), geometry, 64, 0, &[(0, 0), (1, 0), (2, 0)],
-        ).unwrap();
+        let p =
+            VmmKv::new_tensors(ops.clone(), geometry, 64, 0, &[(0, 0), (1, 0), (2, 0)]).unwrap();
         for layer in 0..3 {
             assert!(p.tensor_va(layer, 0).is_some());
             assert!(p.tensor_va(layer, 1).is_none());
@@ -5086,9 +5356,18 @@ mod tests {
         p.begin_seq(1);
         assert_eq!(p.stats().blocks_live, 6);
         drop(p);
-        assert_eq!(ops.creates.load(Ordering::SeqCst), ops.releases.load(Ordering::SeqCst));
-        assert_eq!(ops.maps.load(Ordering::SeqCst), ops.unmaps.load(Ordering::SeqCst));
-        assert_eq!(ops.allocs.load(Ordering::SeqCst), ops.frees.load(Ordering::SeqCst));
+        assert_eq!(
+            ops.creates.load(Ordering::SeqCst),
+            ops.releases.load(Ordering::SeqCst)
+        );
+        assert_eq!(
+            ops.maps.load(Ordering::SeqCst),
+            ops.unmaps.load(Ordering::SeqCst)
+        );
+        assert_eq!(
+            ops.allocs.load(Ordering::SeqCst),
+            ops.frees.load(Ordering::SeqCst)
+        );
     }
 
     /// Uniform full-attention geometry (Qwen-family): no rings, window 0.
@@ -5158,20 +5437,38 @@ mod tests {
             })
             .collect();
         let br = pools[0].block_rows();
-        let set = DpSet::new("m", (0..8).map(|r| (r, r as usize, Arc::new(crate::obs::Metrics::default()))).collect());
+        let set = DpSet::new(
+            "m",
+            (0..8)
+                .map(|r| (r, r as usize, Arc::new(crate::obs::Metrics::default())))
+                .collect(),
+        );
         for (r, p) in pools.iter().enumerate() {
-            set.ranks[r].metrics.slots_capacity.store(16, Ordering::Relaxed);
+            set.ranks[r]
+                .metrics
+                .slots_capacity
+                .store(16, Ordering::Relaxed);
             set.ranks[r].set_up(true);
             set.set_probe(r, p.prefix_probe());
         }
         println!("block_rows {br}");
-        println!("{:>6} {:>16} {:>16} {:>16} {:>18}", "prompt", "hash p50/p99", "route p50/p99", "+probe p50/p99", "probe-hash p50/p99");
+        println!(
+            "{:>6} {:>16} {:>16} {:>16} {:>18}",
+            "prompt", "hash p50/p99", "route p50/p99", "+probe p50/p99", "probe-hash p50/p99"
+        );
         for len in [1024usize, 8192, 32768] {
-            let mut prompt: Vec<u32> = (0..len as u32).map(|i| (i ^ len as u32).wrapping_mul(2654435761) % 150_000).collect();
+            let mut prompt: Vec<u32> = (0..len as u32)
+                .map(|i| (i ^ len as u32).wrapping_mul(2654435761) % 150_000)
+                .collect();
             let half = (len / 2) as u32 / br * br;
             pools[3].ensure_rows(0, half + 1).unwrap();
-            assert!(pools[3].try_attach(0, &prompt[..half as usize + 1]).unwrap().is_none());
-            pools[3].publish_at(0, &prompt, half, 4, |_| Ok(())).unwrap();
+            assert!(pools[3]
+                .try_attach(0, &prompt[..half as usize + 1])
+                .unwrap()
+                .is_none());
+            pools[3]
+                .publish_at(0, &prompt, half, 4, |_| Ok(()))
+                .unwrap();
             let cfg = RouteCfg::default();
             let n = 2000;
             let time = |f: &mut dyn FnMut()| -> Vec<u64> {
@@ -5200,12 +5497,23 @@ mod tests {
                 hit += usize::from(r.rank == 3);
             });
             assert_eq!(hit, n, "the rank holding the prefix wins");
-            let net: Vec<u64> = probed.iter().zip(&hash).map(|(p, h)| p.saturating_sub(*h)).collect();
+            let net: Vec<u64> = probed
+                .iter()
+                .zip(&hash)
+                .map(|(p, h)| p.saturating_sub(*h))
+                .collect();
             let (h, p, q, d) = (pct(hash), pct(plain), pct(probed), pct(net));
-            println!("{len:>6} {:>7}/{:<8} {:>7}/{:<8} {:>7}/{:<8} {:>8}/{:<9}", h.0, h.1, p.0, p.1, q.0, q.1, d.0, d.1);
+            println!(
+                "{len:>6} {:>7}/{:<8} {:>7}/{:<8} {:>7}/{:<8} {:>8}/{:<9}",
+                h.0, h.1, p.0, p.1, q.0, q.1, d.0, d.1
+            );
             pools[3].begin_seq(0);
         }
-        println!("probes {} contended {}", set.stats.probes.load(Ordering::Relaxed), set.stats.probe_contended.load(Ordering::Relaxed));
+        println!(
+            "probes {} contended {}",
+            set.stats.probes.load(Ordering::Relaxed),
+            set.stats.probe_contended.load(Ordering::Relaxed)
+        );
     }
 
     /// The DP router's keyed probe answers what `cached_rows` answers, never trusts a key hashed
@@ -5231,7 +5539,10 @@ mod tests {
             assert_eq!(probe.try_matched_rows(&key, &pr), None);
         }
         p.ensure_rows(1, 1).unwrap();
-        let a = p.try_attach_keyed(1, &pr, Some(key)).unwrap().expect("keyed attach");
+        let a = p
+            .try_attach_keyed(1, &pr, Some(key))
+            .unwrap()
+            .expect("keyed attach");
         assert_eq!(a.rows, 16);
     }
 
@@ -5247,20 +5558,48 @@ mod tests {
         let pr = prompt(17);
         let job = |prompt: Vec<u32>, prefix| {
             let (respond, rx) = crate::serve::stream::channel();
-            let opts = JobOpts { prefix, ..Default::default() };
-            ((Job { prompt_ids: prompt, gen: Default::default(), arrived: std::time::Instant::now(), respond, opts }, std::time::Instant::now()), rx)
+            let opts = JobOpts {
+                prefix,
+                ..Default::default()
+            };
+            (
+                (
+                    Job {
+                        prompt_ids: prompt,
+                        gen: Default::default(),
+                        arrived: std::time::Instant::now(),
+                        respond,
+                        opts,
+                    },
+                    std::time::Instant::now(),
+                ),
+                rx,
+            )
         };
         let (a, _ra) = job(pr.clone(), Some(probe.key(&pr)));
         let (b, _rb) = job(prompt(9), None);
         let mut waiting: std::collections::VecDeque<_> = [a, b].into_iter().collect();
         let g0 = probe.generation();
         refresh_cached_rows(&mut waiting, &probe);
-        assert_eq!(waiting.iter().map(|(j, _)| j.opts.cached).collect::<Vec<_>>(), [Some((g0, 0)), Some((g0, 0))]);
-        assert!(waiting[1].0.opts.prefix.is_some(), "an unkeyed waiter is hashed once and keeps the key");
+        assert_eq!(
+            waiting
+                .iter()
+                .map(|(j, _)| j.opts.cached)
+                .collect::<Vec<_>>(),
+            [Some((g0, 0)), Some((g0, 0))]
+        );
+        assert!(
+            waiting[1].0.opts.prefix.is_some(),
+            "an unkeyed waiter is hashed once and keeps the key"
+        );
 
         assert!(p.try_attach(0, &pr).unwrap().is_none());
         p.ensure_rows(0, 17).unwrap();
-        assert_eq!(probe.generation(), g0, "attaching and mapping change nothing a probe matches");
+        assert_eq!(
+            probe.generation(),
+            g0,
+            "attaching and mapping change nothing a probe matches"
+        );
         p.publish(0, &pr, 4, |_va| Ok(())).unwrap();
         let g1 = probe.generation();
         assert_ne!(g1, g0);
@@ -5300,7 +5639,10 @@ mod tests {
             v.sort_by(|a, b| a.total_cmp(b));
             v[v.len() / 2]
         };
-        println!("{:>5} {:>6} {:>12} {:>14} {:>12}", "n", "len", "rehash_us", "unchanged_us", "moved_us");
+        println!(
+            "{:>5} {:>6} {:>12} {:>14} {:>12}",
+            "n", "len", "rehash_us", "unchanged_us", "moved_us"
+        );
         for (n, len) in [(128, 1024), (256, 2048), (512, 2048), (256, 8192)] {
             let mut keep = Vec::new();
             let mut waiting: std::collections::VecDeque<_> = (0..n)
@@ -5309,16 +5651,36 @@ mod tests {
                     keep.push(rx);
                     let mut toks = prompt(len);
                     toks[len - 1] = i as u32;
-                    let opts = JobOpts { prefix: Some(probe.key(&toks)), ..Default::default() };
-                    let job = Job { prompt_ids: toks, gen: Default::default(), arrived: std::time::Instant::now(), respond, opts };
+                    let opts = JobOpts {
+                        prefix: Some(probe.key(&toks)),
+                        ..Default::default()
+                    };
+                    let job = Job {
+                        prompt_ids: toks,
+                        gen: Default::default(),
+                        arrived: std::time::Instant::now(),
+                        respond,
+                        opts,
+                    };
                     (job, std::time::Instant::now())
                 })
                 .collect();
             let time = |f: &mut dyn FnMut()| {
-                median((0..15).map(|_| { let t = std::time::Instant::now(); f(); t.elapsed().as_secs_f64() * 1e6 }).collect())
+                median(
+                    (0..15)
+                        .map(|_| {
+                            let t = std::time::Instant::now();
+                            f();
+                            t.elapsed().as_secs_f64() * 1e6
+                        })
+                        .collect(),
+                )
             };
             let rehash = time(&mut || {
-                let rows: Vec<u32> = waiting.iter().map(|(j, _)| probe.cached_rows_keyed(&j.prompt_ids, None)).collect();
+                let rows: Vec<u32> = waiting
+                    .iter()
+                    .map(|(j, _)| probe.cached_rows_keyed(&j.prompt_ids, None))
+                    .collect();
                 std::hint::black_box(rows);
             });
             refresh_cached_rows(&mut waiting, &probe);
@@ -5342,24 +5704,36 @@ mod tests {
         let pr = prompt(32);
         assert!(p.try_attach(0, &pr).unwrap().is_none());
         p.ensure_rows(0, 32).unwrap();
-        p.publish_at(0, &pr, 20, 4, |_| panic!("first sighting must not snapshot")).unwrap();
+        p.publish_at(0, &pr, 20, 4, |_| {
+            panic!("first sighting must not snapshot")
+        })
+        .unwrap();
         assert_eq!(p.stats().publishes_skipped, 1);
         assert_eq!(p.stats().cache_blocks, 0);
         p.begin_seq(0);
         p.ensure_rows(1, 1).unwrap();
-        assert!(p.try_attach(1, &pr).unwrap().is_none(), "nothing published on first sighting");
+        assert!(
+            p.try_attach(1, &pr).unwrap().is_none(),
+            "nothing published on first sighting"
+        );
         p.ensure_rows(1, 32).unwrap();
         p.publish_at(1, &pr, 20, 4, |_| Ok(())).unwrap();
         assert_eq!(p.stats().publishes_skipped, 1);
         p.ensure_rows(0, 1).unwrap();
-        let a = p.try_attach(0, &pr).unwrap().expect("second sighting published");
+        let a = p
+            .try_attach(0, &pr)
+            .unwrap()
+            .expect("second sighting published");
         assert_eq!(a.rows, 20);
         p.begin_seq(0);
         let other: Vec<u32> = pr.iter().map(|t| t + 1).collect();
         p.ensure_rows(0, 1).unwrap();
         assert!(p.try_attach(0, &other).unwrap().is_none());
         p.ensure_rows(0, 32).unwrap();
-        p.publish_at(0, &other, 20, 4, |_| panic!("unseen lead must not snapshot")).unwrap();
+        p.publish_at(0, &other, 20, 4, |_| {
+            panic!("unseen lead must not snapshot")
+        })
+        .unwrap();
         assert_eq!(p.stats().publishes_skipped, 2);
     }
 
@@ -5377,7 +5751,13 @@ mod tests {
         assert_eq!(p.stats().publishes_skipped, 0);
         p.begin_seq(0);
         p.ensure_rows(1, 1).unwrap();
-        assert_eq!(p.try_attach(1, &pr).unwrap().expect("session tail published").rows, 20);
+        assert_eq!(
+            p.try_attach(1, &pr)
+                .unwrap()
+                .expect("session tail published")
+                .rows,
+            20
+        );
     }
 
     /// A session keeps only its newest boundary: publishing it frees the session's earlier
@@ -5399,14 +5779,27 @@ mod tests {
         p.publish_at(1, &pr, 20, 4, |_| Ok(())).unwrap();
         p.publish_at(1, &pr, 28, 4, |_| Ok(())).unwrap();
         assert_eq!(p.stats().snapshot_bytes, 12);
-        assert_eq!(p.retire_superseded(&pr, 28), 4, "only the session's 20-row boundary");
+        assert_eq!(
+            p.retire_superseded(&pr, 28),
+            4,
+            "only the session's 20-row boundary"
+        );
         assert_eq!(p.stats().snapshot_bytes, 8);
         p.begin_seq(1);
         p.ensure_rows(0, 1).unwrap();
-        assert_eq!(p.try_attach(0, &pr[..26]).unwrap().expect("shared lead stays").rows, 12);
+        assert_eq!(
+            p.try_attach(0, &pr[..26])
+                .unwrap()
+                .expect("shared lead stays")
+                .rows,
+            12
+        );
         p.begin_seq(0);
         p.ensure_rows(0, 1).unwrap();
-        assert_eq!(p.try_attach(0, &pr).unwrap().expect("newest boundary").rows, 28);
+        assert_eq!(
+            p.try_attach(0, &pr).unwrap().expect("newest boundary").rows,
+            28
+        );
     }
 
     /// A never-attached session turn end whose last rows the next prompt re-rendered to other
@@ -5424,7 +5817,10 @@ mod tests {
         p.publish_at(0, &turn_end, 20, 4, |_| Ok(())).unwrap();
         p.begin_seq(0);
         p.ensure_rows(1, 1).unwrap();
-        assert!(p.try_attach(1, &a).unwrap().is_none(), "the re-rendered prompt cannot attach");
+        assert!(
+            p.try_attach(1, &a).unwrap().is_none(),
+            "the re-rendered prompt cannot attach"
+        );
         p.ensure_rows(1, 30).unwrap();
         p.note_session(1, &a);
         p.publish_at(1, &a, 28, 4, |_| Ok(())).unwrap();
@@ -5470,7 +5866,11 @@ mod tests {
         p.ensure_rows(1, 336).unwrap();
         p.note_session(1, &t2);
         p.publish_at(1, &t2, 320, 4, |_| Ok(())).unwrap();
-        assert_eq!(p.retire_superseded(&t2, 320), 8, "the prompt end and the re-rendered turn end");
+        assert_eq!(
+            p.retire_superseded(&t2, 320),
+            8,
+            "the prompt end and the re-rendered turn end"
+        );
         assert_eq!(p.stats().snapshot_bytes, 4);
     }
 
@@ -5486,7 +5886,11 @@ mod tests {
         p.note_session(0, &t1);
         p.publish_at(0, &t1, 8, 48, |_| Ok(())).unwrap();
         p.publish_at(0, &t1, 9, 48, |_| Ok(())).unwrap();
-        assert_eq!(p.retire_superseded(&t1, 9), 48, "the checkpoint inside the prompt");
+        assert_eq!(
+            p.retire_superseded(&t1, 9),
+            48,
+            "the checkpoint inside the prompt"
+        );
         let mut end = t1.clone();
         end.extend([500, 501]);
         p.publish_at(0, &end, 15, 48, |_| Ok(())).unwrap();
@@ -5542,11 +5946,17 @@ mod tests {
         let mut end = t1.clone();
         end.extend([500, 501]);
         p.publish_at(0, &end, 15, 48, |_| Ok(())).unwrap();
-        p.publish_at(0, &end, 9, 48, |_| panic!("a surviving boundary is not copied")).unwrap();
+        p.publish_at(0, &end, 9, 48, |_| {
+            panic!("a surviving boundary is not copied")
+        })
+        .unwrap();
         {
             let mut inner = p.shared.inner.lock();
             assert!(evict_one(&p.shared, &mut inner, true), "the turn end");
-            assert!(evict_one(&p.shared, &mut inner, true), "the other prefix, now LRU");
+            assert!(
+                evict_one(&p.shared, &mut inner, true),
+                "the other prefix, now LRU"
+            );
             assert_eq!(inner.stats.snapshot_bytes, 48);
             assert!(evict_one(&p.shared, &mut inner, true));
         }
@@ -5566,7 +5976,10 @@ mod tests {
         p.ensure_rows(seq, 13).unwrap();
         p.note_session(seq, pr);
         p.publish_at(seq, pr, 12, 48, |_| Ok(())).unwrap();
-        p.pin_prefix(pr, std::time::Instant::now() + std::time::Duration::from_secs(600));
+        p.pin_prefix(
+            pr,
+            std::time::Instant::now() + std::time::Duration::from_secs(600),
+        );
     }
 
     /// A session boundary already attached (its session runs that turn) goes before an older
@@ -5589,7 +6002,11 @@ mod tests {
         }
         p.begin_seq(0);
         p.ensure_rows(1, 1).unwrap();
-        assert_eq!(p.try_attach(1, &b).unwrap().map(|x| x.rows), Some(12), "the idle boundary stays");
+        assert_eq!(
+            p.try_attach(1, &b).unwrap().map(|x| x.rows),
+            Some(12),
+            "the idle boundary stays"
+        );
     }
 
     /// A request waiting on a session's in-flight prompt keeps the whole-block checkpoint it
@@ -5606,11 +6023,18 @@ mod tests {
         p.note_session(0, &o);
         assert_eq!(p.inflight_prefix(1, &w, u32::MAX, &[]), Some((0, 8)));
         assert!(p.checkpoint_awaited(&o, 8));
-        assert!(!p.checkpoint_awaited(&o, 16), "nobody waits on the 16-row checkpoint");
+        assert!(
+            !p.checkpoint_awaited(&o, 16),
+            "nobody waits on the 16-row checkpoint"
+        );
         p.publish_at(0, &o, 8, 4, |_| Ok(())).unwrap();
         p.publish_at(0, &o, 16, 4, |_| Ok(())).unwrap();
         p.publish_at(0, &o, 28, 4, |_| Ok(())).unwrap();
-        assert_eq!(p.retire_superseded(&o, 28), 4, "only the unwaited 16-row checkpoint");
+        assert_eq!(
+            p.retire_superseded(&o, 28),
+            4,
+            "only the unwaited 16-row checkpoint"
+        );
         p.prefill_done(0);
         p.ensure_rows(1, 1).unwrap();
         assert_eq!(p.try_attach(1, &w).unwrap().map(|a| a.rows), Some(8));
@@ -5631,7 +6055,10 @@ mod tests {
                 p.ensure_rows(seq, 30).unwrap();
                 p.publish_at(seq, pr, 28, 4, |_| Ok(())).unwrap();
                 if pin {
-                    p.pin_prefix(pr, std::time::Instant::now() + std::time::Duration::from_secs(600));
+                    p.pin_prefix(
+                        pr,
+                        std::time::Instant::now() + std::time::Duration::from_secs(600),
+                    );
                 }
                 p.begin_seq(seq);
             }
@@ -5640,7 +6067,10 @@ mod tests {
         let full = run(0).stats().cache_bytes;
         let p = run(full - 1);
         p.ensure_rows(0, 1).unwrap();
-        assert!(p.try_attach(0, &a).unwrap().is_some(), "pinned session prefix evicted first");
+        assert!(
+            p.try_attach(0, &a).unwrap().is_some(),
+            "pinned session prefix evicted first"
+        );
     }
 
     /// A system prompt shorter than one block ends on the root, which no session pins: its
@@ -5662,14 +6092,23 @@ mod tests {
         p.ensure_rows(0, 16).unwrap();
         p.note_session(0, &b);
         p.publish_at(0, &b, 12, 48, |_| Ok(())).unwrap();
-        p.pin_prefix(&b, std::time::Instant::now() + std::time::Duration::from_secs(600));
+        p.pin_prefix(
+            &b,
+            std::time::Instant::now() + std::time::Duration::from_secs(600),
+        );
         p.begin_seq(0);
-        assert!(p.try_attach(1, &c).unwrap().map(|x| x.rows) == Some(6), "the system prompt");
+        assert!(
+            p.try_attach(1, &c).unwrap().map(|x| x.rows) == Some(6),
+            "the system prompt"
+        );
         p.finish_attach(1);
         p.ensure_rows(1, 16).unwrap();
         p.note_session(1, &c);
         p.publish_at(1, &c, 12, 48, |_| Ok(())).unwrap();
-        p.pin_prefix(&c, std::time::Instant::now() + std::time::Duration::from_secs(600));
+        p.pin_prefix(
+            &c,
+            std::time::Instant::now() + std::time::Duration::from_secs(600),
+        );
         p.begin_seq(1);
         // The most recently attached snapshot is protected: make it the second session's.
         assert_eq!(p.try_attach(1, &c).unwrap().map(|x| x.rows), Some(12));
@@ -5681,7 +6120,11 @@ mod tests {
         }
         let d: Vec<u32> = sys.iter().copied().chain(400..410).collect();
         p.ensure_rows(1, 1).unwrap();
-        assert_eq!(p.try_attach(1, &d).unwrap().map(|x| x.rows), Some(6), "LRU took the session's");
+        assert_eq!(
+            p.try_attach(1, &d).unwrap().map(|x| x.rows),
+            Some(6),
+            "LRU took the session's"
+        );
     }
 
     /// The second prompt sharing a 300-row head with a recent one names the shared end
@@ -5691,7 +6134,12 @@ mod tests {
         let ops = Arc::new(MockVmm::default());
         let p = uniform_pool(ops);
         let head = prompt(300);
-        let with = |tail: u32| -> Vec<u32> { head.iter().copied().chain((0..40).map(|i| tail + i)).collect() };
+        let with = |tail: u32| -> Vec<u32> {
+            head.iter()
+                .copied()
+                .chain((0..40).map(|i| tail + i))
+                .collect()
+        };
         assert!(p.try_attach(0, &with(100_000)).unwrap().is_none());
         assert_eq!(p.share_rows(0), 0);
         p.begin_seq(0);
@@ -5699,32 +6147,63 @@ mod tests {
         assert_eq!(p.share_rows(1), 288);
         p.begin_seq(1);
         assert!(p.try_attach(1, &prompt(100)).unwrap().is_none());
-        assert_eq!(p.share_rows(1), 0, "a 100-row common head is below SHARE_MIN_ROWS");
+        assert_eq!(
+            p.share_rows(1),
+            0,
+            "a 100-row common head is below SHARE_MIN_ROWS"
+        );
     }
 
     /// A burst of prompts sharing a system prompt far below their prompt ends: later ones wait
     /// for the prefilling owner's shared-prefix boundary instead of each recomputing it.
     #[test]
     fn inflight_prefix_waits_for_the_owners_shared_prefix_end() {
-        let geo = VmmGeometry { max_ctx: 512, ..uniform_pool(Arc::new(MockVmm::default())).geometry().clone() };
+        let geo = VmmGeometry {
+            max_ctx: 512,
+            ..uniform_pool(Arc::new(MockVmm::default()))
+                .geometry()
+                .clone()
+        };
         let p = VmmKv::new(Arc::new(MockVmm::default()), geo, 64, 0).expect("pool");
         let head = prompt(300);
-        let with = |tail: u32| -> Vec<u32> { head.iter().copied().chain((0..40).map(|i| tail + i)).collect() };
+        let with = |tail: u32| -> Vec<u32> {
+            head.iter()
+                .copied()
+                .chain((0..40).map(|i| tail + i))
+                .collect()
+        };
         let (a, b) = (with(100_000), with(200_000));
         assert!(p.try_attach(0, &a).unwrap().is_none());
         assert_eq!(p.share_rows(0), 0, "no recent prompt yet");
-        assert_eq!(p.inflight_prefix(1, &b, 16, &[296]), None, "the owner passed the shared end");
+        assert_eq!(
+            p.inflight_prefix(1, &b, 16, &[296]),
+            None,
+            "the owner passed the shared end"
+        );
         assert_eq!(p.share_rows(0), 0);
         assert_eq!(p.inflight_prefix(1, &b, 16, &[0]), Some((0, 288)));
-        assert_eq!(p.share_rows(0), 288, "the owner now publishes where the prompts diverge");
+        assert_eq!(
+            p.share_rows(0),
+            288,
+            "the owner now publishes where the prompts diverge"
+        );
         p.ensure_rows(0, 340).unwrap();
         p.publish_at(0, &a, 288, 4, |_| Ok(())).unwrap();
-        assert_eq!(p.inflight_prefix(1, &b, 16, &[288]), None, "the boundary is attachable now");
+        assert_eq!(
+            p.inflight_prefix(1, &b, 16, &[288]),
+            None,
+            "the boundary is attachable now"
+        );
         p.ensure_rows(1, 1).unwrap();
         assert_eq!(p.try_attach(1, &b).unwrap().unwrap().rows, 288);
 
         // Prompts shorter than one KV block (FP8 KV on H100: 4096-row blocks).
-        let geo = VmmGeometry { max_ctx: 2048, ..uniform_pool(Arc::new(MockVmm::default())).geometry().clone() };
+        let geo = VmmGeometry {
+            max_ctx: 2048,
+            ..uniform_pool(Arc::new(MockVmm::default()))
+                .geometry()
+                .clone()
+        };
         let p = VmmKv::new(Arc::new(MockVmm::default()), geo, 64 << 10, 0).expect("pool");
         assert!(p.block_rows() as usize > a.len());
         assert!(p.try_attach(0, &a).unwrap().is_none());
@@ -5753,7 +6232,10 @@ mod tests {
             p.publish_at(0, &a, 28, 4, |_| Ok(())).unwrap();
             p.begin_seq(0);
             p.ensure_rows(1, 1).unwrap();
-            assert_eq!(p.try_attach(1, &b).unwrap().expect("shared prefix").rows, 16);
+            assert_eq!(
+                p.try_attach(1, &b).unwrap().expect("shared prefix").rows,
+                16
+            );
             p.finish_attach(1);
             p.ensure_rows(1, 30).unwrap();
             p.note_session(1, &b);
@@ -5765,13 +6247,28 @@ mod tests {
         let p = run(full - 1);
         let s = p.stats();
         assert_eq!(s.eviction_units, 1);
-        assert!(s.eviction_unit_bytes > 4, "the unit takes the dead block with the boundary");
+        assert!(
+            s.eviction_unit_bytes > 4,
+            "the unit takes the dead block with the boundary"
+        );
         assert_eq!(s.cache_bytes, full - s.eviction_unit_bytes);
         p.ensure_rows(0, 1).unwrap();
-        assert_eq!(p.try_attach(0, &a).unwrap().expect("shared prefix stays").rows, 16);
+        assert_eq!(
+            p.try_attach(0, &a)
+                .unwrap()
+                .expect("shared prefix stays")
+                .rows,
+            16
+        );
         p.begin_seq(0);
         p.ensure_rows(0, 1).unwrap();
-        assert_eq!(p.try_attach(0, &b).unwrap().expect("other session stays").rows, 28);
+        assert_eq!(
+            p.try_attach(0, &b)
+                .unwrap()
+                .expect("other session stays")
+                .rows,
+            28
+        );
     }
 
     /// A whole-block boundary has no tail: it is what the second request sharing a prefix
@@ -5785,13 +6282,20 @@ mod tests {
         assert!(p.try_attach(0, &pr).unwrap().is_none());
         p.ensure_rows(0, 21).unwrap();
         p.publish_at(0, &pr, 16, 4, |_| Ok(())).unwrap();
-        p.publish_at(0, &pr, 20, 4, |_| panic!("tailed end of a first sighting")).unwrap();
+        p.publish_at(0, &pr, 20, 4, |_| panic!("tailed end of a first sighting"))
+            .unwrap();
         assert_eq!(p.stats().publishes_skipped, 1);
         p.begin_seq(0);
         let mut next = prompt(16);
         next.extend([901, 902]);
         p.ensure_rows(1, 1).unwrap();
-        assert_eq!(p.try_attach(1, &next).unwrap().expect("second sighting hits").rows, 16);
+        assert_eq!(
+            p.try_attach(1, &next)
+                .unwrap()
+                .expect("second sighting hits")
+                .rows,
+            16
+        );
     }
 
     /// An admission check that finds no owner to wait on must not count the prompt: its own
@@ -5806,7 +6310,8 @@ mod tests {
         p.begin_seq(0);
         assert!(p.try_attach(0, &pr).unwrap().is_none());
         p.ensure_rows(0, 21).unwrap();
-        p.publish_at(0, &pr, 20, 4, |_| panic!("counted twice")).unwrap();
+        p.publish_at(0, &pr, 20, 4, |_| panic!("counted twice"))
+            .unwrap();
         assert_eq!(p.stats().publishes_skipped, 1);
     }
 
@@ -5922,20 +6427,44 @@ mod tests {
         assert_eq!(p.inflight_prefix(1, &b, u32::MAX, &[]), Some((0, 16)));
         let mut c = prompt(8);
         c.extend((0..9).map(|i| 700 + i));
-        assert_eq!(p.inflight_prefix(1, &c, u32::MAX, &[]), Some((0, 8)), "shares the first block only");
+        assert_eq!(
+            p.inflight_prefix(1, &c, u32::MAX, &[]),
+            Some((0, 8)),
+            "shares the first block only"
+        );
         let d: Vec<u32> = (0..17).map(|i| 100_000 + i).collect();
-        assert_eq!(p.inflight_prefix(1, &d, u32::MAX, &[]), None, "nothing shared");
-        assert_eq!(p.inflight_prefix(1, &prompt(8), u32::MAX, &[]), None, "no row left to recompute");
-        assert_eq!(p.inflight_prefix(0, &b, u32::MAX, &[]), None, "never waits on itself");
+        assert_eq!(
+            p.inflight_prefix(1, &d, u32::MAX, &[]),
+            None,
+            "nothing shared"
+        );
+        assert_eq!(
+            p.inflight_prefix(1, &prompt(8), u32::MAX, &[]),
+            None,
+            "no row left to recompute"
+        );
+        assert_eq!(
+            p.inflight_prefix(0, &b, u32::MAX, &[]),
+            None,
+            "never waits on itself"
+        );
         // The owner's rings keep 4 rows behind its 17-row prompt end: it can publish the
         // boundary at 16 but not the one at 8.
         assert_eq!(p.inflight_prefix(1, &b, 4, &[]), Some((0, 16)));
-        assert_eq!(p.inflight_prefix(1, &c, 4, &[]), None, "the shared boundary is unpublishable");
+        assert_eq!(
+            p.inflight_prefix(1, &c, 4, &[]),
+            None,
+            "the shared boundary is unpublishable"
+        );
 
         p.ensure_rows(0, 17).unwrap();
         p.publish(0, &a, 128, |_| Ok(())).unwrap();
         p.prefill_done(0);
-        assert_eq!(p.inflight_prefix(1, &b, u32::MAX, &[]), None, "the checkpoint is attachable now");
+        assert_eq!(
+            p.inflight_prefix(1, &b, u32::MAX, &[]),
+            None,
+            "the checkpoint is attachable now"
+        );
         p.ensure_rows(1, 1).unwrap();
         assert_eq!(p.try_attach(1, &b).unwrap().unwrap().rows, 16);
     }
@@ -5982,7 +6511,11 @@ mod tests {
         p.publish_at(0, &a, 32, 4, |_| Ok(())).unwrap();
         p.publish_at(0, &a, 40, 4, |_| Ok(())).unwrap();
         p.publish_at(0, &a, 36, 4, |_| Ok(())).unwrap();
-        assert_eq!(p.stats().publishes_skipped, 0, "the waiter's sighting publishes the tailed end");
+        assert_eq!(
+            p.stats().publishes_skipped,
+            0,
+            "the waiter's sighting publishes the tailed end"
+        );
         p.prefill_done(0);
         p.ensure_rows(1, 1).unwrap();
         assert_eq!(p.try_attach(1, &b).unwrap().unwrap().rows, 32);
@@ -6118,7 +6651,10 @@ mod tests {
         assert_eq!(ops.maps.load(Ordering::SeqCst), 4);
         p.begin_seq(0);
         assert_eq!(p.stats().blocks_live, 0);
-        assert_eq!(ops.maps.load(Ordering::SeqCst), ops.unmaps.load(Ordering::SeqCst));
+        assert_eq!(
+            ops.maps.load(Ordering::SeqCst),
+            ops.unmaps.load(Ordering::SeqCst)
+        );
     }
 
     #[test]
@@ -6165,7 +6701,11 @@ mod tests {
         assert_eq!(ops.creates.load(Ordering::SeqCst), 8);
         assert_eq!(ops.maps.load(Ordering::SeqCst), 8);
         assert_eq!(p.mapped_rows(0), 16);
-        assert_eq!(p.stats().blocks_live, 8, "exactly one block per track ahead of the chunk");
+        assert_eq!(
+            p.stats().blocks_live,
+            8,
+            "exactly one block per track ahead of the chunk"
+        );
 
         // The same tick's decode, then the next chunk's prefill_prepare: both free.
         p.ensure_rows(0, 9).unwrap();
@@ -6213,14 +6753,30 @@ mod tests {
                 assert!(p.mapped_rows(0) <= 32, "never past the plan's last row");
                 let before = ops.maps.load(Ordering::SeqCst);
                 p.ensure_rows(0, end + 1).unwrap();
-                assert_eq!(ops.maps.load(Ordering::SeqCst), before, "the decode maps nothing");
+                assert_eq!(
+                    ops.maps.load(Ordering::SeqCst),
+                    before,
+                    "the decode maps nothing"
+                );
             }
-            (prepare_maps, ops.creates.load(Ordering::SeqCst), p.stats().blocks_live)
+            (
+                prepare_maps,
+                ops.creates.load(Ordering::SeqCst),
+                p.stats().blocks_live,
+            )
         };
         let (control, control_creates, control_live) = run(false);
         let (ahead, ahead_creates, ahead_live) = run(true);
-        assert_eq!(control, vec![8, 4], "the second chunk's prepare maps its second block");
-        assert_eq!(ahead, vec![8, 0], "with the next chunk mapped ahead it maps nothing");
+        assert_eq!(
+            control,
+            vec![8, 4],
+            "the second chunk's prepare maps its second block"
+        );
+        assert_eq!(
+            ahead,
+            vec![8, 0],
+            "with the next chunk mapped ahead it maps nothing"
+        );
         assert_eq!((ahead_creates, ahead_live), (control_creates, control_live));
     }
 
@@ -6356,14 +6912,22 @@ mod tests {
         p.try_attach(0, &a).unwrap();
         p.ensure_rows(0, 17).unwrap();
         p.publish(0, &a, 192, |_| Ok(())).unwrap();
-        assert!(ops.allocs.load(Ordering::SeqCst) > 0, "the first publish must allocate a snapshot");
+        assert!(
+            ops.allocs.load(Ordering::SeqCst) > 0,
+            "the first publish must allocate a snapshot"
+        );
 
         // Surgically evict just the snapshot, leaving the (still node_blocks-referenced)
         // whole blocks in place -- simulating exactly what `evict_one`'s snapshot-only
         // fallback can do under pressure, without engineering the full eviction-order dance.
         {
             let mut inner = p.shared.inner.lock();
-            let node = inner.published.keys().next().copied().expect("a snapshot was published");
+            let node = inner
+                .published
+                .keys()
+                .next()
+                .copied()
+                .expect("a snapshot was published");
             remove_snapshot(&p.shared, &mut inner, node, 0);
             assert!(inner.published.get(&node).is_none_or(|v| v.is_empty()));
             assert!(!inner.node_blocks.is_empty(), "blocks must still be cached");
@@ -6380,7 +6944,10 @@ mod tests {
         // sourced from seq 1's own live window; the fix must decline before ever touching the
         // `fill` closure (a device copy), not merely discard its result afterward.
         let allocs_before = ops.allocs.load(Ordering::SeqCst);
-        p.publish(1, &a, 192, |_| panic!("must not fill a snapshot for this hazard")).unwrap();
+        p.publish(1, &a, 192, |_| {
+            panic!("must not fill a snapshot for this hazard")
+        })
+        .unwrap();
         assert_eq!(
             ops.allocs.load(Ordering::SeqCst), allocs_before,
             "declined: no new snapshot allocated over blocks this sequence did not itself attach to"
@@ -6408,10 +6975,18 @@ mod tests {
 
         {
             let mut inner = p.shared.inner.lock();
-            let node = inner.published.keys().next().copied().expect("a snapshot was published");
+            let node = inner
+                .published
+                .keys()
+                .next()
+                .copied()
+                .expect("a snapshot was published");
             remove_snapshot(&p.shared, &mut inner, node, 0);
         }
-        assert!(p.try_attach(1, &a).unwrap().is_none(), "blocks survive but no snapshot: today's accepted miss");
+        assert!(
+            p.try_attach(1, &a).unwrap().is_none(),
+            "blocks survive but no snapshot: today's accepted miss"
+        );
         p.ensure_rows(1, 17).unwrap();
 
         assert!(
@@ -6425,7 +7000,10 @@ mod tests {
             Ok(())
         })
         .unwrap();
-        assert!(filled, "hazard resolved: this publish must create a fresh snapshot from seq 1's own prefill");
+        assert!(
+            filled,
+            "hazard resolved: this publish must create a fresh snapshot from seq 1's own prefill"
+        );
 
         // `pool`'s test geometry has `batch: 2` (only slots 0/1 exist); slot 0 is free again
         // (its hold was released above), so reuse it for the third, independent attacher.
@@ -6494,7 +7072,11 @@ mod tests {
         p.ensure_rows(0, 17).unwrap();
         p.publish(0, &a, 192, |_| Ok(())).unwrap();
         p.begin_seq(0);
-        assert_eq!(p.stats().cache_bytes, 448, "cache_cap=64 must not fire while pressure mode reports ample free memory");
+        assert_eq!(
+            p.stats().cache_bytes,
+            448,
+            "cache_cap=64 must not fire while pressure mode reports ample free memory"
+        );
         assert_eq!(ops.frees.load(Ordering::SeqCst), 0);
     }
 
@@ -6511,7 +7093,11 @@ mod tests {
         p.ensure_rows(0, 17).unwrap();
         p.publish(0, &a, 192, |_| Ok(())).unwrap();
         p.begin_seq(0);
-        assert_eq!(p.stats().cache_bytes, 0, "a scarce-memory report must evict although cache_cap was nowhere near its limit");
+        assert_eq!(
+            p.stats().cache_bytes,
+            0,
+            "a scarce-memory report must evict although cache_cap was nowhere near its limit"
+        );
         assert_eq!(ops.frees.load(Ordering::SeqCst), 1);
     }
 
@@ -6550,7 +7136,10 @@ mod tests {
         p.ensure_rows(0, 17).unwrap();
         p.publish(0, &a, 192, |_| Ok(())).unwrap();
         p.begin_seq(0);
-        assert!(p.stats().cache_bytes <= 64, "no free_bytes support: must fall back to trimming by cache_cap");
+        assert!(
+            p.stats().cache_bytes <= 64,
+            "no free_bytes support: must fall back to trimming by cache_cap"
+        );
         assert_eq!(ops.frees.load(Ordering::SeqCst), 1);
     }
 
@@ -6572,7 +7161,10 @@ mod tests {
 
         let mut b = shared;
         b.extend(prompt(9).into_iter().map(|t| t + 2000)); // a DIFFERENT divergence
-        let attach = p.try_attach(1, &b).unwrap().expect("shares the first 6 rows with `a`");
+        let attach = p
+            .try_attach(1, &b)
+            .unwrap()
+            .expect("shares the first 6 rows with `a`");
         assert_eq!(attach.rows, 6);
         assert_eq!(attach.segments.len(), 3);
         assert_eq!(attach.snap_bytes, 3 * 8);
@@ -6618,8 +7210,14 @@ mod tests {
         let mut b = shared;
         b.push(9); // diverges at row 6, same as `a` up to there
         b.push(9);
-        let attach = p.try_attach(1, &b).unwrap().expect("the aligned 6-row prefix still matches");
-        assert_eq!(attach.rows, 6, "must not credit rows 6-7, published only as part of an unaligned remainder");
+        let attach = p
+            .try_attach(1, &b)
+            .unwrap()
+            .expect("the aligned 6-row prefix still matches");
+        assert_eq!(
+            attach.rows, 6,
+            "must not credit rows 6-7, published only as part of an unaligned remainder"
+        );
     }
 
     /// Dedup: two sequences publishing the IDENTICAL shared prefix must not double-allocate
@@ -6642,7 +7240,8 @@ mod tests {
         p.try_attach(1, &b).unwrap();
         p.publish_fine(&b, 2, 3, 8, |_, _| Ok(())).unwrap();
         assert_eq!(
-            ops.allocs.load(Ordering::SeqCst), 3,
+            ops.allocs.load(Ordering::SeqCst),
+            3,
             "publishing the identical 3-chunk prefix again must allocate nothing new"
         );
     }
@@ -6656,8 +7255,15 @@ mod tests {
         let p = pool(ops.clone());
         let a = prompt(6);
         p.publish_fine(&a, 2, 3, 8, |_, _| Ok(())).unwrap();
-        assert_eq!(ops.allocs.load(Ordering::SeqCst), 0, "fine matching is off: publish_fine must do nothing");
-        assert!(p.try_attach(0, &a).unwrap().is_none(), "nothing published on the (unchanged) native path either");
+        assert_eq!(
+            ops.allocs.load(Ordering::SeqCst),
+            0,
+            "fine matching is off: publish_fine must do nothing"
+        );
+        assert!(
+            p.try_attach(0, &a).unwrap().is_none(),
+            "nothing published on the (unchanged) native path either"
+        );
     }
 
     /// Fine chunks count toward `cache_cap` and get evicted LRU under it, exactly like whole
@@ -6687,14 +7293,29 @@ mod tests {
             p.try_attach(0, content).unwrap();
             p.publish_fine(content, 2, 1, 8, |_, _| Ok(())).unwrap();
         }
-        assert_eq!(p.stats().cache_bytes, 24, "3 distinct chunks fit exactly at the cap");
-        assert_eq!(ops.frees.load(Ordering::SeqCst), 0, "cap not yet exceeded: nothing evicted");
+        assert_eq!(
+            p.stats().cache_bytes,
+            24,
+            "3 distinct chunks fit exactly at the cap"
+        );
+        assert_eq!(
+            ops.frees.load(Ordering::SeqCst),
+            0,
+            "cap not yet exceeded: nothing evicted"
+        );
 
         let d = vec![40_000u32, 40_001];
         p.try_attach(0, &d).unwrap();
         p.publish_fine(&d, 2, 1, 8, |_, _| Ok(())).unwrap();
-        assert!(p.stats().cache_bytes <= 24, "still bounded after a 4th distinct chunk");
-        assert_eq!(ops.frees.load(Ordering::SeqCst), 1, "the LRU chunk (a, published first) was evicted");
+        assert!(
+            p.stats().cache_bytes <= 24,
+            "still bounded after a 4th distinct chunk"
+        );
+        assert_eq!(
+            ops.frees.load(Ordering::SeqCst),
+            1,
+            "the LRU chunk (a, published first) was evicted"
+        );
 
         // An attach must leave at least one token for prefill to recompute (the same
         // invariant the native path enforces), so query with one extra trailing token beyond
@@ -6704,8 +7325,14 @@ mod tests {
         a_query.push(1);
         let mut d_query = d.clone();
         d_query.push(1);
-        assert!(p.try_attach(0, &a_query).unwrap().is_none(), "a's only chunk was evicted: must miss now");
-        assert!(p.try_attach(0, &d_query).unwrap().is_some(), "d is the most recent: must still hit");
+        assert!(
+            p.try_attach(0, &a_query).unwrap().is_none(),
+            "a's only chunk was evicted: must miss now"
+        );
+        assert!(
+            p.try_attach(0, &d_query).unwrap().is_some(),
+            "d is the most recent: must still hit"
+        );
     }
 
     #[test]
@@ -6893,7 +7520,10 @@ mod tests {
         p.publish_at(0, &generated, 18, 48, |_| Ok(())).unwrap();
         p.publish_at(0, &generated, 20, 48, |_| Ok(())).unwrap();
         p.begin_seq(1);
-        let attached = p.try_attach(1, &long).unwrap().expect("prompt boundary retained");
+        let attached = p
+            .try_attach(1, &long)
+            .unwrap()
+            .expect("prompt boundary retained");
         assert_eq!(attached.rows, 16);
         assert!(p.stats().cache_bytes <= 400);
         assert_eq!(p.stats().snapshots_evicted, 1);
@@ -7008,7 +7638,9 @@ mod tests {
         p.ensure_rows(0, 7).unwrap();
         p.publish_at(0, &b, 6, 48, |_| Ok(())).unwrap();
         let inner = p.shared.inner.lock();
-        assert!(inner.published[&None].iter().any(|snap| snap.va == hit.snap_va && snap.users == 1));
+        assert!(inner.published[&None]
+            .iter()
+            .any(|snap| snap.va == hit.snap_va && snap.users == 1));
         drop(inner);
         p.finish_attach(1);
         p.release_prefix(1);
@@ -7028,9 +7660,11 @@ mod tests {
         let mut changed = tokens.clone();
         changed[0] ^= 1;
         assert!(p.publish_at(0, &changed, 15, 48, |_| Ok(())).is_err());
-        assert!(p.publish_at(0, &tokens, 15, 48, |_| {
-            Err(RuntimeError::Device("snapshot copy failed".into()))
-        }).is_err());
+        assert!(p
+            .publish_at(0, &tokens, 15, 48, |_| {
+                Err(RuntimeError::Device("snapshot copy failed".into()))
+            })
+            .is_err());
         assert_eq!(p.stats().snapshot_bytes, 0);
         assert_eq!(ops.frees.load(Ordering::SeqCst), 1);
         p.begin_seq(0);
@@ -7046,7 +7680,8 @@ mod tests {
         p.publish_at(0, &tokens, 15, 48, |_| {
             assert!(p.shared.inner.try_lock().is_some());
             Ok(())
-        }).unwrap();
+        })
+        .unwrap();
     }
 
     #[test]
@@ -7063,7 +7698,8 @@ mod tests {
                     p.publish_at(0, &tokens, 15, 48, |_| {
                         barrier.wait();
                         Ok(())
-                    }).unwrap();
+                    })
+                    .unwrap();
                 });
             }
         });
@@ -7195,7 +7831,10 @@ mod tests {
             assert!(slab.view(0, 16).is_err());
             assert!(ops.allocation_provenance(slab.base(), 16).is_none());
             drop(slab);
-            assert_eq!(ops.creates.load(Ordering::SeqCst), ops.releases.load(Ordering::SeqCst));
+            assert_eq!(
+                ops.creates.load(Ordering::SeqCst),
+                ops.releases.load(Ordering::SeqCst)
+            );
         }
     }
 
@@ -7373,22 +8012,37 @@ mod tests {
         let st = p.stats();
         assert_eq!(st.blocks_kept, 4, "column 0 handed over in place");
         assert_eq!(p.mapped_rows(0), 8, "row 0 writable before any ensure_rows");
-        assert_eq!(st.blocks_live, 16, "nothing dereferenced on the caller's thread");
+        assert_eq!(
+            st.blocks_live, 16,
+            "nothing dereferenced on the caller's thread"
+        );
         p.ensure_rows(0, 1).unwrap();
-        assert_eq!(ops.maps.load(Ordering::SeqCst), 16, "begin_slot's pre-map is free");
+        assert_eq!(
+            ops.maps.load(Ordering::SeqCst),
+            16,
+            "begin_slot's pre-map is free"
+        );
         assert_eq!(ops.creates.load(Ordering::SeqCst), 16);
 
         p.sync_reclaim();
         let st = p.stats();
         assert_eq!(st.blocks_stale, 0);
         assert_eq!(st.blocks_reclaimed, 12);
-        assert_eq!(ops.unmaps.load(Ordering::SeqCst), 12, "columns 1..3 unmapped by the reclaimer");
+        assert_eq!(
+            ops.unmaps.load(Ordering::SeqCst),
+            12,
+            "columns 1..3 unmapped by the reclaimer"
+        );
         assert_eq!(st.blocks_pooled, 12);
         assert_eq!(st.blocks_live, 4);
         assert_eq!(ops.releases.load(Ordering::SeqCst), 0);
 
         p.ensure_rows(0, 32).unwrap();
-        assert_eq!(ops.creates.load(Ordering::SeqCst), 16, "regrowth draws the pool, no new HBM");
+        assert_eq!(
+            ops.creates.load(Ordering::SeqCst),
+            16,
+            "regrowth draws the pool, no new HBM"
+        );
         assert_eq!(p.stats().blocks_reused, 12);
         assert_eq!(p.stats().blocks_live, 16);
         drop(p);
@@ -7404,7 +8058,11 @@ mod tests {
         let p = uniform_pool(ops.clone());
         p.ensure_rows(0, 32).unwrap(); // 4 columns x 4 tracks
         assert_eq!(ops.maps.load(Ordering::SeqCst), 16);
-        assert_eq!(ops.accesses.load(Ordering::SeqCst), 4, "one grant per (track, head)");
+        assert_eq!(
+            ops.accesses.load(Ordering::SeqCst),
+            4,
+            "one grant per (track, head)"
+        );
         assert_eq!(p.mapped_rows(0), 32);
         p.ensure_rows(1, 9).unwrap(); // 2 columns
         assert_eq!(ops.accesses.load(Ordering::SeqCst), 8);
@@ -7421,7 +8079,11 @@ mod tests {
         ops.fail_access.store(2, Ordering::SeqCst); // the second (track, head) run
         assert!(p.ensure_rows(0, 32).is_err());
         assert_eq!(p.mapped_rows(0), 0);
-        assert_eq!(ops.unmaps.load(Ordering::SeqCst), 4, "the ungranted run only");
+        assert_eq!(
+            ops.unmaps.load(Ordering::SeqCst),
+            4,
+            "the ungranted run only"
+        );
         assert_eq!(p.stats().blocks_live, 4, "the granted run stays mapped");
         p.ensure_rows(0, 32).unwrap();
         assert_eq!(p.mapped_rows(0), 32);
@@ -7440,10 +8102,18 @@ mod tests {
         p.ensure_rows(0, 32).unwrap();
         p.begin_seq(0);
         p.sync_reclaim();
-        assert_eq!(ops.unmaps.load(Ordering::SeqCst), 0, "private columns kept mapped");
+        assert_eq!(
+            ops.unmaps.load(Ordering::SeqCst),
+            0,
+            "private columns kept mapped"
+        );
         assert_eq!(p.stats().blocks_stale, 12);
         p.ensure_rows(0, 32).unwrap();
-        assert_eq!(ops.maps.load(Ordering::SeqCst), 16, "regrowth reuses in place");
+        assert_eq!(
+            ops.maps.load(Ordering::SeqCst),
+            16,
+            "regrowth reuses in place"
+        );
         assert_eq!(p.stats().blocks_stale, 0);
         assert_eq!(p.stats().blocks_live, 16);
     }
@@ -7461,7 +8131,10 @@ mod tests {
         p.begin_seq(0);
         p.sync_reclaim();
         let st = p.stats();
-        assert_eq!(st.blocks_stale, 0, "a retire that does not fit is reclaimed as before");
+        assert_eq!(
+            st.blocks_stale, 0,
+            "a retire that does not fit is reclaimed as before"
+        );
         assert_eq!(ops.unmaps.load(Ordering::SeqCst), 12);
         assert_eq!(st.blocks_pooled, 8);
     }
@@ -7504,18 +8177,29 @@ mod tests {
         assert_eq!(ops.creates.load(Ordering::SeqCst), 12);
 
         p.begin_seq(0);
-        assert_eq!(ops.unmaps.load(Ordering::SeqCst), 4, "only column 0 on the caller's thread");
+        assert_eq!(
+            ops.unmaps.load(Ordering::SeqCst),
+            4,
+            "only column 0 on the caller's thread"
+        );
         assert_eq!(p.stats().blocks_kept, 0);
         assert_eq!(p.mapped_rows(0), 0);
         p.ensure_rows(0, 1).unwrap();
-        assert_eq!(ops.creates.load(Ordering::SeqCst), 16, "fresh private column 0");
+        assert_eq!(
+            ops.creates.load(Ordering::SeqCst),
+            16,
+            "fresh private column 0"
+        );
         assert_eq!(p.mapped_rows(0), 8);
 
         p.sync_reclaim();
         let st = p.stats();
         assert_eq!(ops.unmaps.load(Ordering::SeqCst), 12);
         assert_eq!(st.blocks_stale, 0);
-        assert_eq!(st.cache_blocks, 8, "the published prefix survives the recycle");
+        assert_eq!(
+            st.cache_blocks, 8,
+            "the published prefix survives the recycle"
+        );
         assert_eq!(st.blocks_live, 8 + 4, "cache blocks + the new column 0");
         assert_eq!(st.blocks_pooled, 4, "the private tail column parked");
         assert_eq!(ops.releases.load(Ordering::SeqCst), 0);
@@ -7551,7 +8235,11 @@ mod tests {
         // block stays private; column 1 becomes shared; column 2 stays private.
         p.publish(0, &prompt(17), 4, |_| Ok(())).unwrap();
         p.begin_seq(0);
-        assert_eq!(ops.unmaps.load(Ordering::SeqCst), 4, "private column 0 kept again");
+        assert_eq!(
+            ops.unmaps.load(Ordering::SeqCst),
+            4,
+            "private column 0 kept again"
+        );
         assert_eq!(p.stats().blocks_kept, 12);
         assert_eq!(p.stats().blocks_stale, 8);
         p.ensure_rows(0, 24).unwrap();
@@ -7605,7 +8293,7 @@ mod tests {
         let mut p = pool_with_cap(ops.clone(), 64); // cache soft cap: one block
         p.enable_deferred_reclaim();
         p.ensure_rows(0, 9).unwrap(); // 2 columns × 2 tracks
-        // Column 0 shared: 128 B of cache over a 64 B cap, pinned by the lease.
+                                      // Column 0 shared: 128 B of cache over a 64 B cap, pinned by the lease.
         p.publish(0, &prompt(9), 4, |_| Ok(())).unwrap();
         assert_eq!(p.stats().cache_blocks, 2);
 
@@ -7805,11 +8493,19 @@ mod tests {
         assert_eq!(st.blocks_copied_out, 4, "column 0 of every track");
         assert_eq!(ops.copies.load(Ordering::SeqCst), 4);
         assert_eq!(st.cache_blocks, 8);
-        assert_eq!(ops.unmaps.load(Ordering::SeqCst), 0, "copies stay mapped at their copy slot");
+        assert_eq!(
+            ops.unmaps.load(Ordering::SeqCst),
+            0,
+            "copies stay mapped at their copy slot"
+        );
         assert!(!p.shared.inner.lock().copying[0]);
 
         p.begin_seq(0);
-        assert_eq!(ops.unmaps.load(Ordering::SeqCst), 0, "row 0 kept, nothing unmapped inline");
+        assert_eq!(
+            ops.unmaps.load(Ordering::SeqCst),
+            0,
+            "row 0 kept, nothing unmapped inline"
+        );
         assert_eq!(p.stats().blocks_kept, 4);
         assert_eq!(p.mapped_rows(0), 8);
         p.ensure_rows(1, 1).unwrap();
@@ -7878,7 +8574,11 @@ mod tests {
             let maps = ops.maps.load(Ordering::SeqCst);
             copy_out(&p.shared, 0, p.shared.generation[0].load(Ordering::Acquire));
             let want = if round < 2 { 0 } else { 4 };
-            assert_eq!(ops.maps.load(Ordering::SeqCst) - maps, want, "round {round}");
+            assert_eq!(
+                ops.maps.load(Ordering::SeqCst) - maps,
+                want,
+                "round {round}"
+            );
         }
         assert_eq!(p.stats().blocks_copied_out, 12);
         assert_eq!(spares(&p), 0);
@@ -7898,7 +8598,9 @@ mod tests {
         let mut p = uniform_pool(ops.clone());
         let stalled = p.stall_reclaim();
         let generation = released_with_shared_row_zero(&mut p, &prompt(17));
-        p.shared.admission_wait_us.store(10_000_000, Ordering::Relaxed);
+        p.shared
+            .admission_wait_us
+            .store(10_000_000, Ordering::Relaxed);
         let shared = Arc::clone(&p.shared);
         let job = std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_millis(20));
@@ -7982,9 +8684,16 @@ mod tests {
         println!("C1 model: worst begin_seq across ranks {worst:?}");
         for (ops, p) in ranks {
             p.sync_reclaim();
-            assert_eq!(p.stats().blocks_copied_out, 8 * 78, "every finish committed on every rank");
+            assert_eq!(
+                p.stats().blocks_copied_out,
+                8 * 78,
+                "every finish committed on every rank"
+            );
             drop(p);
-            assert_eq!(ops.releases.load(Ordering::SeqCst), ops.creates.load(Ordering::SeqCst));
+            assert_eq!(
+                ops.releases.load(Ordering::SeqCst),
+                ops.creates.load(Ordering::SeqCst)
+            );
         }
     }
 
@@ -8016,7 +8725,9 @@ mod tests {
         refill_spares(&p.shared);
         assert_eq!(spares(&p), 8);
         let drops = |rx: &std::sync::mpsc::Receiver<Job>| {
-            rx.try_iter().filter(|job| matches!(job, Job::DropSpare { .. })).count()
+            rx.try_iter()
+                .filter(|job| matches!(job, Job::DropSpare { .. }))
+                .count()
         };
         drops(&stalled);
         for request in 0..6u32 {
@@ -8031,7 +8742,10 @@ mod tests {
             refill_spares(&p.shared);
             let (queued, mapped) = (drops(&stalled), ops.maps.load(Ordering::SeqCst) - maps);
             if request >= 1 {
-                assert!(p.stats().nodes_evicted > 0, "request {request}: the cache must be full");
+                assert!(
+                    p.stats().nodes_evicted > 0,
+                    "request {request}: the cache must be full"
+                );
                 assert_eq!(queued, 0, "request {request}: spare drops queued");
                 assert_eq!(mapped, 0, "request {request}: copy-out or refill mapped");
             }
@@ -8070,7 +8784,9 @@ mod tests {
         p.enable_release_retire();
         refill_spares(&p.shared);
         let drops = |rx: &std::sync::mpsc::Receiver<Job>| {
-            rx.try_iter().filter(|job| matches!(job, Job::DropSpare { .. })).count()
+            rx.try_iter()
+                .filter(|job| matches!(job, Job::DropSpare { .. }))
+                .count()
         };
         for request in 0..3u32 {
             p.begin_seq(0);
@@ -8096,8 +8812,16 @@ mod tests {
             copy_out(&p.shared, 1, p.shared.generation[1].load(Ordering::Acquire));
             per_publish.push(drops(&stalled));
         }
-        assert_eq!(p.stats().blocks_copied_out, 12, "snapshot-only publishes copy nothing");
-        assert_eq!(per_publish, vec![0, 4, 4], "slack column first, then one drop per track per evicted prefix");
+        assert_eq!(
+            p.stats().blocks_copied_out,
+            12,
+            "snapshot-only publishes copy nothing"
+        );
+        assert_eq!(
+            per_publish,
+            vec![0, 4, 4],
+            "slack column first, then one drop per track per evicted prefix"
+        );
         drop(stalled);
         drop(p);
         assert_balanced(&ops);
@@ -8124,7 +8848,10 @@ mod tests {
             (0..inner.tracks.len())
                 .find_map(|t| {
                     let slots = inner.tracks[t].copy.first()?;
-                    let i = slots.1.iter().position(|s| matches!(s, CopySlot::Spare(_)))?;
+                    let i = slots
+                        .1
+                        .iter()
+                        .position(|s| matches!(s, CopySlot::Spare(_)))?;
                     Some((t, i as u32))
                 })
                 .expect("a spare")
@@ -8134,7 +8861,11 @@ mod tests {
         let shared = Arc::clone(&p.shared);
         let job = std::thread::spawn(move || drop_spare(&shared, track, slot));
         std::thread::sleep(std::time::Duration::from_millis(30));
-        assert_eq!(ops.unmaps.load(Ordering::SeqCst), unmaps, "drop unmapped inside the section");
+        assert_eq!(
+            ops.unmaps.load(Ordering::SeqCst),
+            unmaps,
+            "drop unmapped inside the section"
+        );
         drop(section);
         job.join().unwrap();
         assert_eq!(ops.unmaps.load(Ordering::SeqCst), unmaps + 1);
@@ -8159,7 +8890,10 @@ mod tests {
         *ops.copy_hook.lock().unwrap() = Some(Box::new(move |src| {
             entered_tx.send(shared.inner.try_lock().is_some()).unwrap();
             std::thread::sleep(std::time::Duration::from_millis(50));
-            assert!(mock.mapped.lock().unwrap().contains(&src), "copy source unmapped mid-copy");
+            assert!(
+                mock.mapped.lock().unwrap().contains(&src),
+                "copy source unmapped mid-copy"
+            );
         }));
         let shared = Arc::clone(&p.shared);
         let job = std::thread::spawn(move || copy_out(&shared, 0, generation));
@@ -8167,7 +8901,11 @@ mod tests {
         p.begin_seq(0);
         job.join().expect("copy source stayed mapped");
         assert_eq!(p.stats().blocks_copied_out, 0, "the new generation won");
-        assert_eq!(ops.unmaps.load(Ordering::SeqCst), 4, "shared row 0 swapped inline after the chunk");
+        assert_eq!(
+            ops.unmaps.load(Ordering::SeqCst),
+            4,
+            "shared row 0 swapped inline after the chunk"
+        );
         assert_eq!(spares(&p), 4);
         assert!(!p.shared.inner.lock().copy_reading[0]);
         drop(stalled);
@@ -8185,11 +8923,24 @@ mod tests {
         let pr = prompt(17);
         let generation = released_with_shared_row_zero(&mut p, &pr);
         p.begin_seq(0);
-        assert_eq!(ops.unmaps.load(Ordering::SeqCst), 4, "shared row 0 unmapped inline");
+        assert_eq!(
+            ops.unmaps.load(Ordering::SeqCst),
+            4,
+            "shared row 0 unmapped inline"
+        );
         p.ensure_rows(0, 1).unwrap();
-        let calls = (ops.maps.load(Ordering::SeqCst), ops.unmaps.load(Ordering::SeqCst));
+        let calls = (
+            ops.maps.load(Ordering::SeqCst),
+            ops.unmaps.load(Ordering::SeqCst),
+        );
         copy_out(&p.shared, 0, generation);
-        assert_eq!((ops.maps.load(Ordering::SeqCst), ops.unmaps.load(Ordering::SeqCst)), calls);
+        assert_eq!(
+            (
+                ops.maps.load(Ordering::SeqCst),
+                ops.unmaps.load(Ordering::SeqCst)
+            ),
+            calls
+        );
         assert_eq!(ops.copies.load(Ordering::SeqCst), 0);
         assert_eq!(p.stats().blocks_copied_out, 0);
         assert!(!p.shared.inner.lock().copying[0]);
@@ -8216,10 +8967,18 @@ mod tests {
         assert_eq!(ops.copies.load(Ordering::SeqCst), 0);
         assert_eq!(st.blocks_copied_out, 0);
         assert_eq!(st.cache_blocks, 8);
-        assert_eq!(spares(&p), 4, "the unused copy targets stay mapped as spares");
+        assert_eq!(
+            spares(&p),
+            4,
+            "the unused copy targets stay mapped as spares"
+        );
         assert_eq!(ops.unmaps.load(Ordering::SeqCst), 0);
         p.begin_seq(0);
-        assert_eq!(ops.unmaps.load(Ordering::SeqCst), 4, "shared row 0 inline, as without the knob");
+        assert_eq!(
+            ops.unmaps.load(Ordering::SeqCst),
+            4,
+            "shared row 0 inline, as without the knob"
+        );
         drop(stalled);
         drop(p);
         assert_balanced(&ops);
@@ -8265,9 +9024,16 @@ mod tests {
         let generation = released_with_shared_row_zero(&mut p, &pr);
         copy_out(&p.shared, 0, generation);
         p.begin_seq(0);
-        let (maps, unmaps) = (ops.maps.load(Ordering::SeqCst), ops.unmaps.load(Ordering::SeqCst));
+        let (maps, unmaps) = (
+            ops.maps.load(Ordering::SeqCst),
+            ops.unmaps.load(Ordering::SeqCst),
+        );
         assert_eq!(p.try_attach(0, &pr).unwrap().expect("hit").rows, 16);
-        assert_eq!(ops.unmaps.load(Ordering::SeqCst) - unmaps, 4, "the private row 0");
+        assert_eq!(
+            ops.unmaps.load(Ordering::SeqCst) - unmaps,
+            4,
+            "the private row 0"
+        );
         assert_eq!(ops.maps.load(Ordering::SeqCst) - maps, 4, "the copies");
         assert_eq!(p.stats().blocks_attach_kept, 4, "column 1 kept in place");
         p.finish_attach(0);
@@ -8300,7 +9066,11 @@ mod tests {
         assert_eq!(spares(&p), 4);
         let unmaps = ops.unmaps.load(Ordering::SeqCst);
         p.begin_seq(0);
-        assert_eq!(ops.unmaps.load(Ordering::SeqCst), unmaps, "row 0 private after the eviction");
+        assert_eq!(
+            ops.unmaps.load(Ordering::SeqCst),
+            unmaps,
+            "row 0 private after the eviction"
+        );
         drop(stalled);
         drop(p);
         assert_balanced(&ops);

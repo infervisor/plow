@@ -83,9 +83,7 @@ fn native(inst: &DevInst64) -> bool {
     if (model, kind, precision(inst)) == (Model::Gemma12, Kind::Output, Some(Precision::Fp8)) {
         return false;
     }
-    if (model, kind) == (Model::Gemma31, Kind::Output)
-        && !matches!(inst.i[0], 4096 | 8192)
-    {
+    if (model, kind) == (Model::Gemma31, Kind::Output) && !matches!(inst.i[0], 4096 | 8192) {
         return false;
     }
     match (kind, precision(inst)) {

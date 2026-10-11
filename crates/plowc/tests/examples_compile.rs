@@ -83,11 +83,18 @@ fn all_examples_compile_to_packets() {
 fn explicit_serving_identity_is_written_without_renaming_the_network() {
     let net: NetConfig = serde_json::from_str(
         &std::fs::read_to_string(examples_dir().join("mlp_block.json")).unwrap(),
-    ).unwrap();
+    )
+    .unwrap();
     let network = net.name.clone();
     let out = std::env::temp_dir().join(format!("plowc-identity-{}", std::process::id()));
-    let report = plowc::compile_named(&Source::Net(net), &opts(out.clone()), Some("org/model-v1".into())).unwrap();
-    let manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(out.join("weights.json")).unwrap()).unwrap();
+    let report = plowc::compile_named(
+        &Source::Net(net),
+        &opts(out.clone()),
+        Some("org/model-v1".into()),
+    )
+    .unwrap();
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(out.join("weights.json")).unwrap()).unwrap();
     assert_eq!(report.network, network);
     assert_eq!(manifest["network"], network);
     assert_eq!(manifest["served_name"], "org/model-v1");

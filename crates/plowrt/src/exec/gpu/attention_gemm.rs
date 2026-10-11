@@ -68,7 +68,10 @@ pub(super) fn object(assets_dir: &Path) -> Option<std::path::PathBuf> {
 /// Query rows per score tile: the knob, capped at the widest routed bucket (no tile is longer
 /// than its request).
 fn tile_rows(max_rows: u32) -> u32 {
-    crate::config::RuntimeConfig::get().nv.pf_attn_gemm_tile.clamp(1, max_rows.max(1))
+    crate::config::RuntimeConfig::get()
+        .nv
+        .pf_attn_gemm_tile
+        .clamp(1, max_rows.max(1))
 }
 
 /// KV columns the score scratch is sized for. A longer extent runs proportionally shorter tiles
@@ -83,7 +86,11 @@ pub(super) fn scratch_ctx(max_ctx: usize) -> usize {
 
 /// The score scratch `load` allocates: one tile of every head at the widest KV pitch it holds.
 pub(super) fn scratch_bytes(max_heads: u32, max_ctx: usize, max_rows: u32) -> u64 {
-    let element = if crate::config::RuntimeConfig::get().nv.pf_attn_gemm_s32 { 4 } else { 2 };
+    let element = if crate::config::RuntimeConfig::get().nv.pf_attn_gemm_s32 {
+        4
+    } else {
+        2
+    };
     let pitch = (scratch_ctx(max_ctx) as u64).next_multiple_of(u64::from(PITCH));
     u64::from(tile_rows(max_rows)) * u64::from(max_heads) * pitch * element
 }
@@ -171,7 +178,10 @@ pub(super) fn sites(
     let count = program.gq_seg_ofs.len().saturating_sub(1);
     let mut out = vec![None; count];
     for (segment, bounds) in program.gq_seg_ofs.windows(2).enumerate() {
-        let Some(entries) = program.gq_stream.get(bounds[0] as usize..bounds[1] as usize) else {
+        let Some(entries) = program
+            .gq_stream
+            .get(bounds[0] as usize..bounds[1] as usize)
+        else {
             continue;
         };
         let Some(instruction) = entries.first().map(|e| e.inst as usize) else {
@@ -206,7 +216,9 @@ pub(super) fn sites(
         let head_bytes = u64::from(kv_stride) * u64::from(head_dim) * 2;
         let slot_bytes = u64::from(kv_heads) * head_bytes;
         let fits = |handle: u16, bytes: u64| {
-            tensors.get(handle as usize).is_some_and(|t| t.bytes >= bytes)
+            tensors
+                .get(handle as usize)
+                .is_some_and(|t| t.bytes >= bytes)
                 && devp.get(handle as usize).is_some()
         };
         if !fits(op.t[2], u64::from(rows) * row_bytes)
@@ -342,9 +354,11 @@ type GroupedKey = (Gemm, usize, u32, u32, u32, u32);
 /// Measured grouped-attention picks by device model: every engine of one GPU model in the
 /// process (DP ranks) runs the first one's pick, so their outputs agree; timing near-tied
 /// candidates on each made temperature-0 output differ by rank.
-fn grouped_selections() -> &'static parking_lot::Mutex<std::collections::HashMap<(String, GroupedKey), [u64; 8]>> {
-    static S: std::sync::OnceLock<parking_lot::Mutex<std::collections::HashMap<(String, GroupedKey), [u64; 8]>>> =
-        std::sync::OnceLock::new();
+fn grouped_selections(
+) -> &'static parking_lot::Mutex<std::collections::HashMap<(String, GroupedKey), [u64; 8]>> {
+    static S: std::sync::OnceLock<
+        parking_lot::Mutex<std::collections::HashMap<(String, GroupedKey), [u64; 8]>>,
+    > = std::sync::OnceLock::new();
     S.get_or_init(Default::default)
 }
 
@@ -365,10 +379,7 @@ impl AttentionGemm {
     ) -> Result<Self> {
         let config = &crate::config::RuntimeConfig::get().nv;
         let image = std::fs::read(object).map_err(|e| {
-            RuntimeError::Rejected(format!(
-                "PLOW_PF_ATTN_GEMM needs {}: {e}",
-                object.display()
-            ))
+            RuntimeError::Rejected(format!("PLOW_PF_ATTN_GEMM needs {}: {e}", object.display()))
         })?;
         let module = be.module_load(&image)?;
         let abi = be.module_global_u32(&module, "plow_attn_softmax_abi")?;
@@ -385,7 +396,11 @@ impl AttentionGemm {
         let scores_f32 = config.pf_attn_gemm_s32;
         let softmax = be.get_function(
             &module,
-            if scores_f32 { SOFTMAX_ENTRY_F32 } else { SOFTMAX_ENTRY },
+            if scores_f32 {
+                SOFTMAX_ENTRY_F32
+            } else {
+                SOFTMAX_ENTRY
+            },
         )?;
         let tile_rows = tile_rows(max_rows);
         let scratch = be.alloc(0, scratch_bytes(max_heads, max_ctx, max_rows))?;
@@ -396,7 +411,10 @@ impl AttentionGemm {
             } else {
                 SOFTMAX_GROUPED_ENTRY
             };
-            Some([be.get_function(&module, entry)?, be.get_function(&module, ZERO_ENTRY)?])
+            Some([
+                be.get_function(&module, entry)?,
+                be.get_function(&module, ZERO_ENTRY)?,
+            ])
         } else {
             None
         };
@@ -407,8 +425,8 @@ impl AttentionGemm {
             );
         }
         // Every request adds at most one partial tile to the launch's whole tiles.
-        let max_groups = (batch + max_rows.div_ceil(tile_rows) as usize)
-            .clamp(1, kernel_groups.max(1));
+        let max_groups =
+            (batch + max_rows.div_ceil(tile_rows) as usize).clamp(1, kernel_groups.max(1));
         let dims_bytes = WAVES * DIMS * max_groups * 4;
         let pointer_bytes = WAVES * (max_groups * 16 + 16)
             + max_sites * WAVES * max_groups * 32
@@ -491,8 +509,15 @@ impl AttentionGemm {
             self.plans.clear();
         }
         // P is bf16 at the start of each score row: its pitch counts the f32 row in bf16 units.
-        let pitch = if self.scores_f32 && kind == Gemm::Values { 2 * pitch } else { pitch };
-        match self.plans.entry((kind, m, n, pitch, head_dim, group, heads)) {
+        let pitch = if self.scores_f32 && kind == Gemm::Values {
+            2 * pitch
+        } else {
+            pitch
+        };
+        match self
+            .plans
+            .entry((kind, m, n, pitch, head_dim, group, heads))
+        {
             std::collections::hash_map::Entry::Occupied(e) => Ok(e.into_mut()),
             std::collections::hash_map::Entry::Vacant(e) => Ok(e.insert(self.lt.attention_plan(
                 kind,
@@ -540,7 +565,11 @@ impl AttentionGemm {
                 let tile = self.tile(site.heads, past + done, qlen - done, element);
                 let m = tile * site.heads;
                 // One GEMM batch: every head's rows, or one query head's of a KV head's group.
-                let (gm, batch) = if site.kv_heads == 1 { (m, 1) } else { (tile, group) };
+                let (gm, batch) = if site.kv_heads == 1 {
+                    (m, 1)
+                } else {
+                    (tile, group)
+                };
                 let n = past + done + tile;
                 // The padded score columns are masked: their K rows are either the request's own
                 // rows below kvlen or whatever lies past it (slot_rows is 8-aligned), never read
@@ -558,14 +587,22 @@ impl AttentionGemm {
                 let q_head = u64::from(group) * u64::from(site.head_dim) * 2;
                 let s_head = u64::from(group) * u64::from(pitch) * element;
                 for h in 0..u64::from(site.kv_heads) {
-                    self.plan(Gemm::Scores, gm, n8, pitch, site.head_dim, batch, site.heads)?
-                        .matmul(
-                            site.scale * LOG2_E,
-                            k + h * site.head_bytes,
-                            site.q + offset + h * q_head,
-                            scratch + h * s_head,
-                            stream,
-                        )?;
+                    self.plan(
+                        Gemm::Scores,
+                        gm,
+                        n8,
+                        pitch,
+                        site.head_dim,
+                        batch,
+                        site.heads,
+                    )?
+                    .matmul(
+                        site.scale * LOG2_E,
+                        k + h * site.head_bytes,
+                        site.q + offset + h * q_head,
+                        scratch + h * s_head,
+                        stream,
+                    )?;
                 }
                 let mut args = SoftmaxArgs {
                     scores: scratch,
@@ -577,8 +614,14 @@ impl AttentionGemm {
                     pad: 0,
                 };
                 let mut params = [&mut args as *mut SoftmaxArgs as *mut std::ffi::c_void];
-                self.be
-                    .launch_kernel(self.softmax, self.grid, BLOCK, 0, &mut params, Some(stream))?;
+                self.be.launch_kernel(
+                    self.softmax,
+                    self.grid,
+                    BLOCK,
+                    0,
+                    &mut params,
+                    Some(stream),
+                )?;
                 // V rows below kvlen are the request's own; past it they may hold anything.
                 let aligned = if n8 > kvlen { n & !(TAIL_ROWS - 1) } else { n8 };
                 for h in 0..u64::from(site.kv_heads) {
@@ -821,9 +864,18 @@ impl AttentionGemm {
                 let members = &groups[wave.groups.clone()];
                 offsets.push(at as u64);
                 let pointers: [Vec<u64>; 4] = [
-                    members.iter().map(|g| site.q + u64::from(g.row0) * site.row_bytes()).collect(),
-                    members.iter().map(|g| site.k + u64::from(g.slot) * site.slot_bytes).collect(),
-                    members.iter().map(|g| site.v + u64::from(g.slot) * site.slot_bytes).collect(),
+                    members
+                        .iter()
+                        .map(|g| site.q + u64::from(g.row0) * site.row_bytes())
+                        .collect(),
+                    members
+                        .iter()
+                        .map(|g| site.k + u64::from(g.slot) * site.slot_bytes)
+                        .collect(),
+                    members
+                        .iter()
+                        .map(|g| site.v + u64::from(g.slot) * site.slot_bytes)
+                        .collect(),
                     members
                         .iter()
                         .map(|g| site.output + u64::from(g.row0) * site.row_bytes())
@@ -983,7 +1035,10 @@ impl AttentionGemm {
         let (ms, index) = best.filter(|(ms, _)| ms.is_finite()).ok_or_else(|| {
             RuntimeError::Device("no runnable grouped attention candidate".into())
         })?;
-        grouped_selections().lock().entry(memo_key).or_insert(plan.candidate_algo(index));
+        grouped_selections()
+            .lock()
+            .entry(memo_key)
+            .or_insert(plan.candidate_algo(index));
         plan.select(index);
         tracing::info!(
             ?key,
@@ -1011,9 +1066,10 @@ impl AttentionGemm {
 
     /// Routed segment `index` (the order `begin_launch` saw its sites) of the staged launch.
     pub(super) fn run_site(&mut self, index: usize, stream: &CudaStream) -> Result<()> {
-        let launch = self.launch.take().ok_or_else(|| {
-            RuntimeError::Rejected("attention route: no staged launch".into())
-        })?;
+        let launch = self
+            .launch
+            .take()
+            .ok_or_else(|| RuntimeError::Rejected("attention route: no staged launch".into()))?;
         let result = self.run_site_of(&launch, index, stream);
         self.launch = Some(launch);
         result
@@ -1138,9 +1194,7 @@ mod tests {
         let devp = tensors
             .iter()
             .enumerate()
-            .map(|(index, tensor)| {
-                DeviceMem::view(0x1000_0000 * (index as u64 + 1), tensor.bytes)
-            })
+            .map(|(index, tensor)| DeviceMem::view(0x1000_0000 * (index as u64 + 1), tensor.bytes))
             .collect();
         (
             DevProg {
@@ -1170,7 +1224,10 @@ mod tests {
         let site = found[1].expect("global attention site");
         assert_eq!((site.instruction, site.heads, site.head_dim), (1, 16, 512));
         assert_eq!(site.slot_bytes, 1024 * 512 * 2);
-        assert_eq!((site.row_bytes(), site.kv_row_bytes(), site.slot_rows()), (16384, 1024, 1024));
+        assert_eq!(
+            (site.row_bytes(), site.kv_row_bytes(), site.slot_rows()),
+            (16384, 1024, 1024)
+        );
         assert_eq!((site.kv_heads, site.group()), (1, 16));
 
         // Two KV heads: a slot holds both heads' `[kv_stride][hd]` blocks.
@@ -1178,8 +1235,14 @@ mod tests {
             let (mut program, tensors, devp) = fixture();
             program.insts[1].i[3] = 2;
             let site = sites(&program, &tensors, &devp, 2)[1].expect("GQA attention site");
-            assert_eq!((site.kv_heads, site.group(), site.slot_rows()), (2, 8, 1024));
-            assert_eq!((site.head_bytes, site.slot_bytes), (1024 * 512 * 2, 2 * 1024 * 512 * 2));
+            assert_eq!(
+                (site.kv_heads, site.group(), site.slot_rows()),
+                (2, 8, 1024)
+            );
+            assert_eq!(
+                (site.head_bytes, site.slot_bytes),
+                (1024 * 512 * 2, 2 * 1024 * 512 * 2)
+            );
             assert!(sites(&program, &tensors, &devp, 4)[1].is_none());
         }
 
@@ -1221,6 +1284,9 @@ mod tests {
         assert_eq!(table.put_u64(8, [3]).unwrap(), 16);
         assert_eq!(table.end, 16);
         assert!(table.put_u64(24, [1, 2]).is_err());
-        assert_eq!(&bytes[..16], &[1, 0, 0, 0, 254, 255, 255, 255, 3, 0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(
+            &bytes[..16],
+            &[1, 0, 0, 0, 254, 255, 255, 255, 3, 0, 0, 0, 0, 0, 0, 0]
+        );
     }
 }

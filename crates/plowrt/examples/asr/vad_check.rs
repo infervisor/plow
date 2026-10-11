@@ -20,9 +20,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut out = serde_json::Map::new();
             for path in &args[4..] {
                 let bytes = std::fs::read(path)?;
-                let audio: Vec<f32> = bytes.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+                let audio: Vec<f32> = bytes
+                    .chunks_exact(4)
+                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                    .collect();
                 let mut stream = vad.open();
-                let probs: Vec<f32> = audio.chunks_exact(frame).map(|f| vad.step(&mut stream, f)).collect();
+                let probs: Vec<f32> = audio
+                    .chunks_exact(frame)
+                    .map(|f| vad.step(&mut stream, f))
+                    .collect();
                 out.insert(path.clone(), probs.into());
             }
             std::fs::write(&args[3], serde_json::to_vec(&out)?)?;
@@ -41,7 +47,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 })
                 .collect();
             let mut ticks = Vec::with_capacity(frames);
-            let mut sets: Vec<Vec<_>> = (0..threads).map(|t| (t..streams).step_by(threads).map(|_| vad.open()).collect()).collect();
+            let mut sets: Vec<Vec<_>> = (0..threads)
+                .map(|t| (t..streams).step_by(threads).map(|_| vad.open()).collect())
+                .collect();
             for f in 0..frames {
                 let chunk = &audio[(f % 64) * frame..(f % 64 + 1) * frame];
                 let t = std::time::Instant::now();

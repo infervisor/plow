@@ -328,7 +328,9 @@ impl IndexTp {
             kernels.push(kernel);
         }
         let local = match EngineDevice::get_function(be, &module, "plow_dsa_tp_local") {
-            Ok(k) if [64, 320].contains(&k.kernarg_size()) && k.private_segment_size() == 0 => Some(k),
+            Ok(k) if [64, 320].contains(&k.kernarg_size()) && k.private_segment_size() == 0 => {
+                Some(k)
+            }
             Ok(_) => {
                 return Err(RuntimeError::Device(
                     "TP indexer resource ABI mismatch for plow_dsa_tp_local".into(),
@@ -358,7 +360,7 @@ impl IndexTp {
         route: Route,
         tensor_table: &[u8],
         tp: TpBind,
-            spans: Option<KvSpanTable>,
+        spans: Option<KvSpanTable>,
     ) -> Result<()> {
         let addr = |handle: u16| {
             let at = usize::from(handle) * 8;
@@ -538,11 +540,21 @@ mod tests {
 
     #[test]
     fn select_threshold_requires_the_abi2_symbol() {
-        let with = ["plow_dsa_tp_abi_2", "plow_dsa_tp_select", "plow_dsa_tp_select_thr"];
+        let with = [
+            "plow_dsa_tp_abi_2",
+            "plow_dsa_tp_select",
+            "plow_dsa_tp_select_thr",
+        ];
         let without = ["plow_dsa_tp_abi_2", "plow_dsa_tp_select"];
-        assert_eq!(select_kernel(2, false, &without).unwrap(), "plow_dsa_tp_select");
+        assert_eq!(
+            select_kernel(2, false, &without).unwrap(),
+            "plow_dsa_tp_select"
+        );
         assert_eq!(select_kernel(1, false, &[]).unwrap(), "plow_dsa_tp_select");
-        assert_eq!(select_kernel(2, true, &with).unwrap(), "plow_dsa_tp_select_thr");
+        assert_eq!(
+            select_kernel(2, true, &with).unwrap(),
+            "plow_dsa_tp_select_thr"
+        );
         assert!(select_kernel(2, true, &without).is_err());
         assert!(select_kernel(1, true, &with).is_err());
     }
@@ -564,9 +576,15 @@ mod tests {
     #[test]
     fn local_band_is_the_row_split_sibling_form_with_three_launches() {
         let (mut p, t, tp) = fixture();
-        assert_eq!(routes(&p, &t, 1, tp, false).unwrap()[0].unwrap().launches(), 4);
+        assert_eq!(
+            routes(&p, &t, 1, tp, false).unwrap()[0].unwrap().launches(),
+            4
+        );
         p.insts[0].i[7] = 1;
-        assert!(routes(&p, &t, 1, tp, false).is_err(), "an ordinary bucket gathers every band");
+        assert!(
+            routes(&p, &t, 1, tp, false).is_err(),
+            "an ordinary bucket gathers every band"
+        );
         p.role = packet::devbuild::ProgramRole::RowSplitSibling { of_rows: p.t };
         let route = routes(&p, &t, 1, tp, false).unwrap()[0].unwrap();
         assert!(route.local_band());

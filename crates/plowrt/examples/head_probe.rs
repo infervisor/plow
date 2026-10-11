@@ -20,8 +20,14 @@ fn main() {
         .init();
 
     let mut args = std::env::args().skip(1);
-    let twin: PathBuf = args.next().expect("usage: head_probe <twin.pkt> <ckpt>").into();
-    let ckpt: PathBuf = args.next().expect("usage: head_probe <twin.pkt> <ckpt>").into();
+    let twin: PathBuf = args
+        .next()
+        .expect("usage: head_probe <twin.pkt> <ckpt>")
+        .into();
+    let ckpt: PathBuf = args
+        .next()
+        .expect("usage: head_probe <twin.pkt> <ckpt>")
+        .into();
     let n_cores: usize = args.next().map(|s| s.parse().unwrap()).unwrap_or(8);
     let cores: Vec<u32> = (0..n_cores as u32).collect();
 

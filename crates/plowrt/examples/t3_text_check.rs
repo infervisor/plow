@@ -15,8 +15,12 @@ fn main() {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     use plowrt::tts::guided_lm::{GuidedLmContract, PromptTables};
     let mut args = std::env::args().skip(1);
-    let assets = std::path::PathBuf::from(args.next().ok_or("usage: t3_text_check <assets> <ref.json>")?);
-    let rows: Vec<serde_json::Value> = serde_json::from_slice(&std::fs::read(args.next().ok_or("ref.json")?)?)?;
+    let assets = std::path::PathBuf::from(
+        args.next()
+            .ok_or("usage: t3_text_check <assets> <ref.json>")?,
+    );
+    let rows: Vec<serde_json::Value> =
+        serde_json::from_slice(&std::fs::read(args.next().ok_or("ref.json")?)?)?;
     let c = GuidedLmContract::load(&assets)?.ok_or("no guided LM pipeline")?;
     let t0 = std::time::Instant::now();
     let tables = PromptTables::load(&assets, c.hidden)?;
@@ -35,7 +39,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             e.0 += 1;
         } else {
             let at = got.iter().zip(&want).take_while(|(a, b)| a == b).count();
-            println!("MISMATCH {lang} at {at}: {:?}\n  got  {:?}\n  want {:?}", text, &got[at.saturating_sub(3)..got.len().min(at + 8)], &want[at.saturating_sub(3)..want.len().min(at + 8)]);
+            println!(
+                "MISMATCH {lang} at {at}: {:?}\n  got  {:?}\n  want {:?}",
+                text,
+                &got[at.saturating_sub(3)..got.len().min(at + 8)],
+                &want[at.saturating_sub(3)..want.len().min(at + 8)]
+            );
         }
     }
     let ms = t0.elapsed().as_secs_f64() * 1e3 / rows.len().max(1) as f64;
@@ -45,6 +54,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ok += a;
         n += b;
     }
-    println!("TOTAL {ok}/{n} exact ({ms:.3} ms/text)\nGATE {}", if ok == n { "PASS" } else { "FAIL" });
+    println!(
+        "TOTAL {ok}/{n} exact ({ms:.3} ms/text)\nGATE {}",
+        if ok == n { "PASS" } else { "FAIL" }
+    );
     Ok(())
 }

@@ -103,7 +103,9 @@ pub fn check_memory_effects(
     effects: &MemoryEffects,
 ) -> Result<Certificate, VerifyError> {
     let mut payload = serde_json::to_value(req).map_err(VerifyError::SerializeRequest)?;
-    payload["address_paths"] = serde_json::to_value(paths).map_err(VerifyError::SerializeRequest)?;
-    payload["memory_effects"] = serde_json::to_value(effects).map_err(VerifyError::SerializeRequest)?;
+    payload["address_paths"] =
+        serde_json::to_value(paths).map_err(VerifyError::SerializeRequest)?;
+    payload["memory_effects"] =
+        serde_json::to_value(effects).map_err(VerifyError::SerializeRequest)?;
     call("D", payload)
 }

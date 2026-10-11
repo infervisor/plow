@@ -38,17 +38,33 @@ impl TraceParent {
     /// `version-traceid-parentid-flags`, lowercase hex. Invalid → `None` (W3C: restart the trace).
     pub fn parse(value: &str) -> Option<Self> {
         let tc = svid::TraceContext::parse(value.trim()).ok()?;
-        Some(Self { trace_id: tc.trace_id.as_u128(), parent: tc.parent_id.as_u64(), flags: tc.flags })
+        Some(Self {
+            trace_id: tc.trace_id.as_u128(),
+            parent: tc.parent_id.as_u64(),
+            flags: tc.flags,
+        })
     }
 
     /// OpenRouter's body `trace` object: `trace_id` (32 hex) and `parent_span_id` (16 hex).
     fn from_body(trace: &serde_json::Value) -> Option<Self> {
         let field = |k: &str, len: usize| {
-            trace.get(k)?.as_str().map(str::trim).filter(|s| s.len() == len && s.bytes().all(|c| c.is_ascii_hexdigit()))
+            trace
+                .get(k)?
+                .as_str()
+                .map(str::trim)
+                .filter(|s| s.len() == len && s.bytes().all(|c| c.is_ascii_hexdigit()))
         };
-        let trace_id = u128::from_str_radix(field("trace_id", 32)?, 16).ok().filter(|&x| x != 0)?;
-        let parent = field("parent_span_id", 16).and_then(|p| u64::from_str_radix(p, 16).ok()).unwrap_or(0);
-        Some(Self { trace_id, parent, flags: 0 })
+        let trace_id = u128::from_str_radix(field("trace_id", 32)?, 16)
+            .ok()
+            .filter(|&x| x != 0)?;
+        let parent = field("parent_span_id", 16)
+            .and_then(|p| u64::from_str_radix(p, 16).ok())
+            .unwrap_or(0);
+        Some(Self {
+            trace_id,
+            parent,
+            flags: 0,
+        })
     }
 }
 
@@ -99,7 +115,11 @@ fn valid_id(value: &str, max: usize) -> bool {
 }
 
 fn budget_ms(value: &str) -> Option<u32> {
-    value.trim().parse::<u32>().ok().filter(|&ms| (1..=600_000).contains(&ms))
+    value
+        .trim()
+        .parse::<u32>()
+        .ok()
+        .filter(|&ms| (1..=600_000).contains(&ms))
 }
 
 impl RequestIds {
@@ -107,8 +127,13 @@ impl RequestIds {
     /// session id 1..=256. An invalid `traceparent` or `X-Playback` is ignored.
     pub fn from_headers(headers: &HeaderMap) -> Result<Self, String> {
         let read = |name: &HeaderName, max: usize| -> Result<Option<Arc<str>>, String> {
-            let Some(value) = headers.get(name) else { return Ok(None) };
-            let value = value.to_str().map_err(|_| format!("{name} must be visible ASCII"))?.trim();
+            let Some(value) = headers.get(name) else {
+                return Ok(None);
+            };
+            let value = value
+                .to_str()
+                .map_err(|_| format!("{name} must be visible ASCII"))?
+                .trim();
             if !valid_id(value, max) {
                 return Err(format!("{name} must be 1..={max} visible ASCII characters"));
             }
@@ -116,7 +141,10 @@ impl RequestIds {
         };
         let text = |name: &HeaderName| headers.get(name).and_then(|v| v.to_str().ok());
         let budget_ms = match text(&TURN_BUDGET_HEADER) {
-            Some(v) => Some(budget_ms(v).ok_or_else(|| format!("{TURN_BUDGET_HEADER} must be 1..=600000 ms"))?),
+            Some(v) => Some(
+                budget_ms(v)
+                    .ok_or_else(|| format!("{TURN_BUDGET_HEADER} must be 1..=600000 ms"))?,
+            ),
             None => None,
         };
         let session = read(&SESSION_HEADER, MAX_SESSION_BYTES)?;
@@ -143,7 +171,9 @@ impl RequestIds {
         if let Some(s) = &body.session_id {
             let s = s.trim();
             if !valid_id(s, MAX_SESSION_BYTES) {
-                return Err(format!("session_id must be 1..={MAX_SESSION_BYTES} visible ASCII characters"));
+                return Err(format!(
+                    "session_id must be 1..={MAX_SESSION_BYTES} visible ASCII characters"
+                ));
             }
             self.session = Some(s.into());
             self.tenant = Some(tenant_of(0, s.as_bytes()));
@@ -159,7 +189,9 @@ impl RequestIds {
             }
         };
         if self.turn.is_none() {
-            self.turn = meta("turn_id").filter(|t| valid_id(t, MAX_ID_BYTES)).map(Into::into);
+            self.turn = meta("turn_id")
+                .filter(|t| valid_id(t, MAX_ID_BYTES))
+                .map(Into::into);
         }
         if self.budget_ms.is_none() {
             self.budget_ms = meta("turn_budget_ms").as_deref().and_then(budget_ms);
@@ -169,25 +201,42 @@ impl RequestIds {
 
     /// The client's turn budget.
     pub fn budget(&self) -> Option<Duration> {
-        self.budget_ms.map(|ms| Duration::from_millis(u64::from(ms)))
+        self.budget_ms
+            .map(|ms| Duration::from_millis(u64::from(ms)))
     }
 
     /// A generated request id and no session.
     pub fn generated() -> Self {
-        Self { request: generate_id().into(), session: None, trace: None, turn: None, budget_ms: None, playback: None, turn_key: None, tenant: None }
+        Self {
+            request: generate_id().into(),
+            session: None,
+            trace: None,
+            turn: None,
+            budget_ms: None,
+            playback: None,
+            turn_key: None,
+            tenant: None,
+        }
     }
 
     /// The same identity under a fresh request id (one request of a multi-request connection).
     pub fn with_new_request(&self) -> Self {
-        Self { request: generate_id().into(), turn_key: None, ..self.clone() }
+        Self {
+            request: generate_id().into(),
+            turn_key: None,
+            ..self.clone()
+        }
     }
 
     /// The response headers echoing this identity.
     pub fn header_pairs(&self) -> impl Iterator<Item = (HeaderName, HeaderValue)> + '_ {
-        [Some((REQUEST_HEADER, &self.request)), self.session.as_ref().map(|s| (SESSION_HEADER, s))]
-            .into_iter()
-            .flatten()
-            .filter_map(|(name, value)| Some((name, HeaderValue::from_str(value).ok()?)))
+        [
+            Some((REQUEST_HEADER, &self.request)),
+            self.session.as_ref().map(|s| (SESSION_HEADER, s)),
+        ]
+        .into_iter()
+        .flatten()
+        .filter_map(|(name, value)| Some((name, HeaderValue::from_str(value).ok()?)))
     }
 
     pub fn stamp(&self, response: &mut axum::response::Response) {
@@ -216,12 +265,23 @@ impl RequestIds {
     /// admission reused.
     pub fn ticket(&self, keys: Vec<u64>, report: Option<Report>) -> Option<Box<SessionTicket>> {
         let session = self.session.clone()?;
-        (retention_ttl() > Duration::ZERO)
-            .then(|| Box::new(SessionTicket { session, request: self.request.clone(), keys, report }))
+        (retention_ttl() > Duration::ZERO).then(|| {
+            Box::new(SessionTicket {
+                session,
+                request: self.request.clone(),
+                keys,
+                report,
+            })
+        })
     }
 
     /// A report channel when this request has a session.
-    pub fn report(&self) -> (Option<Report>, Option<tokio::sync::oneshot::Receiver<CacheOutcome>>) {
+    pub fn report(
+        &self,
+    ) -> (
+        Option<Report>,
+        Option<tokio::sync::oneshot::Receiver<CacheOutcome>>,
+    ) {
         match self.session {
             Some(_) => {
                 let (tx, rx) = tokio::sync::oneshot::channel();
@@ -274,7 +334,11 @@ pub struct CacheOutcome {
 }
 
 impl CacheOutcome {
-    pub const OFF: Self = Self { status: CacheStatus::Off, rows: 0, at: None };
+    pub const OFF: Self = Self {
+        status: CacheStatus::Off,
+        rows: 0,
+        at: None,
+    };
 
     /// `X-Session-Cache` and `X-Session-Cached-Tokens`.
     pub fn stamp(&self, response: &mut axum::response::Response) {
@@ -284,7 +348,9 @@ impl CacheOutcome {
     }
 
     /// Await a request's report (a job refused before admission reports nothing: `Off`).
-    pub async fn received(rx: Option<tokio::sync::oneshot::Receiver<CacheOutcome>>) -> Option<Self> {
+    pub async fn received(
+        rx: Option<tokio::sync::oneshot::Receiver<CacheOutcome>>,
+    ) -> Option<Self> {
         Some(rx?.await.unwrap_or(Self::OFF))
     }
 }
@@ -292,7 +358,10 @@ impl CacheOutcome {
 pub type Report = tokio::sync::oneshot::Sender<CacheOutcome>;
 
 /// Keep `guard` alive until `response`'s body is sent: a streamed body outlives its handler.
-pub fn hold_until_sent<G: Send + Sync + 'static>(response: axum::response::Response, guard: G) -> axum::response::Response {
+pub fn hold_until_sent<G: Send + Sync + 'static>(
+    response: axum::response::Response,
+    guard: G,
+) -> axum::response::Response {
     use futures::StreamExt;
     let (parts, body) = response.into_parts();
     let body = axum::body::Body::from_stream(body.into_data_stream().map(move |chunk| {
@@ -305,7 +374,8 @@ pub fn hold_until_sent<G: Send + Sync + 'static>(response: axum::response::Respo
 type SessionKey = (Arc<str>, Arc<str>);
 
 fn in_flight() -> &'static Mutex<FxHashMap<SessionKey, FxHashSet<Arc<str>>>> {
-    static M: std::sync::OnceLock<Mutex<FxHashMap<SessionKey, FxHashSet<Arc<str>>>>> = std::sync::OnceLock::new();
+    static M: std::sync::OnceLock<Mutex<FxHashMap<SessionKey, FxHashSet<Arc<str>>>>> =
+        std::sync::OnceLock::new();
     M.get_or_init(Default::default)
 }
 
@@ -314,7 +384,9 @@ pub struct InFlight(Option<(SessionKey, Arc<str>)>);
 
 impl Drop for InFlight {
     fn drop(&mut self) {
-        let Some((key, request)) = self.0.take() else { return };
+        let Some((key, request)) = self.0.take() else {
+            return;
+        };
         let mut map = in_flight().lock();
         if let Some(set) = map.get_mut(&key) {
             set.remove(&request);
@@ -398,7 +470,10 @@ pub fn row_hash(row: &[f32]) -> u64 {
     let mut h = row.len() as u64;
     let mut words = row.chunks_exact(2);
     for pair in &mut words {
-        h = fold(h, u64::from(pair[0].to_bits()) | u64::from(pair[1].to_bits()) << 32);
+        h = fold(
+            h,
+            u64::from(pair[0].to_bits()) | u64::from(pair[1].to_bits()) << 32,
+        );
     }
     if let [last] = words.remainder() {
         h = fold(h, u64::from(last.to_bits()));
@@ -466,14 +541,40 @@ pub struct Seat {
 }
 
 impl Seat {
-    pub fn new(ticket: Box<SessionTicket>, slot: usize, pair: bool, speech: bool, inbox: RetireInbox) -> Self {
+    pub fn new(
+        ticket: Box<SessionTicket>,
+        slot: usize,
+        pair: bool,
+        speech: bool,
+        inbox: RetireInbox,
+    ) -> Self {
         let prompt_rows = ticket.keys.len();
-        Self { ticket, slot, pair, speech, prompt_rows, valid: 0, last: None, inbox: Some(inbox), pin: Duration::ZERO }
+        Self {
+            ticket,
+            slot,
+            pair,
+            speech,
+            prompt_rows,
+            valid: 0,
+            last: None,
+            inbox: Some(inbox),
+            pin: Duration::ZERO,
+        }
     }
 
     /// A seat whose rows the VMM prefix cache keeps, pinned for `ttl` when the sequence retires.
     fn pinned(ticket: Box<SessionTicket>, slot: usize, ttl: Duration) -> Self {
-        Self { ticket, slot, pair: false, speech: false, prompt_rows: 0, valid: 0, last: None, inbox: None, pin: ttl }
+        Self {
+            ticket,
+            slot,
+            pair: false,
+            speech: false,
+            prompt_rows: 0,
+            valid: 0,
+            last: None,
+            inbox: None,
+            pin: ttl,
+        }
     }
 
     /// How long the engine should pin this sequence's published prefix (`None`: slot retention).
@@ -496,13 +597,20 @@ impl Seat {
 
 impl Drop for Seat {
     fn drop(&mut self) {
-        let Some(inbox) = self.inbox.take() else { return };
+        let Some(inbox) = self.inbox.take() else {
+            return;
+        };
         if self.valid == 0 {
             return;
         }
         let mut keys = std::mem::take(&mut self.ticket.keys);
         keys.truncate(self.valid);
-        inbox.lock().push(Retired { session: self.ticket.session.clone(), slot: self.slot, pair: self.pair, keys });
+        inbox.lock().push(Retired {
+            session: self.ticket.session.clone(),
+            slot: self.slot,
+            pair: self.pair,
+            keys,
+        });
     }
 }
 
@@ -547,14 +655,21 @@ const MAX_GONE: usize = 4096;
 impl RetainTable {
     /// `max` = 0: bounded only by the slots.
     pub fn new(ttl: Duration, max: usize) -> Self {
-        Self { entries: Vec::new(), ttl, max, gone: Default::default(), evictions: 0 }
+        Self {
+            entries: Vec::new(),
+            ttl,
+            max,
+            gone: Default::default(),
+            evictions: 0,
+        }
     }
 
     fn evicted(&mut self, e: Entry, now: Instant) {
         self.evictions += 1;
         if self.gone.len() >= MAX_GONE {
             let ttl = self.ttl;
-            self.gone.retain(|_, t| now.saturating_duration_since(*t) < ttl);
+            self.gone
+                .retain(|_, t| now.saturating_duration_since(*t) < ttl);
             if self.gone.len() >= MAX_GONE {
                 self.gone.clear();
             }
@@ -574,7 +689,11 @@ impl RetainTable {
             (false, true) => CacheStatus::Evicted,
             (false, false) => CacheStatus::Miss,
         };
-        CacheOutcome { status, rows: resumed, at: None }
+        CacheOutcome {
+            status,
+            rows: resumed,
+            at: None,
+        }
     }
 
     pub fn enabled(&self) -> bool {
@@ -623,9 +742,17 @@ impl RetainTable {
             return;
         }
         self.entries.retain(|e| {
-            e.session != retired.session && !e.holds(retired.slot) && !(retired.pair && e.holds(retired.slot + 1))
+            e.session != retired.session
+                && !e.holds(retired.slot)
+                && !(retired.pair && e.holds(retired.slot + 1))
         });
-        self.entries.push(Entry { session: retired.session, slot: retired.slot, pair: retired.pair, keys: retired.keys, used: now });
+        self.entries.push(Entry {
+            session: retired.session,
+            slot: retired.slot,
+            pair: retired.pair,
+            keys: retired.keys,
+            used: now,
+        });
         while self.max > 0 && self.entries.len() > self.max {
             self.evict_lru(usize::MAX, None);
         }
@@ -634,9 +761,19 @@ impl RetainTable {
     /// Where `session`'s request keyed `keys` resumes: its entry when live, of the same shape
     /// (`pair`), under `limit`, and sharing at least one row. At least one prompt row is always
     /// left to prefill (the first token needs its logits).
-    pub fn lookup(&self, session: &str, keys: &[u64], pair: bool, limit: usize, now: Instant) -> Option<Resume> {
+    pub fn lookup(
+        &self,
+        session: &str,
+        keys: &[u64],
+        pair: bool,
+        limit: usize,
+        now: Instant,
+    ) -> Option<Resume> {
         let e = self.entries.iter().find(|e| &*e.session == session)?;
-        if now.saturating_duration_since(e.used) >= self.ttl || e.pair != pair || e.slot + pair as usize >= limit {
+        if now.saturating_duration_since(e.used) >= self.ttl
+            || e.pair != pair
+            || e.slot + pair as usize >= limit
+        {
             return None;
         }
         let shared = e.keys.iter().zip(keys).take_while(|(a, b)| a == b).count();
@@ -651,7 +788,10 @@ impl RetainTable {
 
     /// Each entry's retained rows, except `session`'s.
     pub fn rows_except<'a>(&'a self, session: Option<&'a str>) -> impl Iterator<Item = u64> + 'a {
-        self.entries.iter().filter(move |e| Some(&*e.session) != session).map(Entry::rows)
+        self.entries
+            .iter()
+            .filter(move |e| Some(&*e.session) != session)
+            .map(Entry::rows)
     }
 
     /// Evict the least recently used entry holding a slot below `limit`, other than `keep`'s;
@@ -695,14 +835,20 @@ impl Retention {
     /// Armed from `PLOW_SESSION_TTL_MS` / `PLOW_SESSION_MAX` when the engine keeps a finished
     /// sequence's rows in its slot; otherwise nothing is ever retained.
     pub fn new(supported: bool, prefix_cache: bool, bytes_per_row: u64, widths: &[u32]) -> Self {
-        let ttl = if supported { retention_ttl() } else { Duration::ZERO };
+        let ttl = if supported {
+            retention_ttl()
+        } else {
+            Duration::ZERO
+        };
         let config = crate::config::RuntimeConfig::get();
         Self {
             table: RetainTable::new(ttl, config.session_max),
             inbox: Default::default(),
             bytes_per_row,
             evictions_reported: 0,
-            prefix_pin: (!supported && prefix_cache).then(retention_ttl).filter(|t| !t.is_zero()),
+            prefix_pin: (!supported && prefix_cache)
+                .then(retention_ttl)
+                .filter(|t| !t.is_zero()),
             widths: widths.into(),
             slack: config.session_slack,
         }
@@ -713,13 +859,26 @@ impl Retention {
     }
 
     pub fn with_table(table: RetainTable, widths: &[u32], slack: usize) -> Self {
-        Self { table, inbox: Default::default(), bytes_per_row: 0, evictions_reported: 0, prefix_pin: None, widths: widths.into(), slack }
+        Self {
+            table,
+            inbox: Default::default(),
+            bytes_per_row: 0,
+            evictions_reported: 0,
+            prefix_pin: None,
+            widths: widths.into(),
+            slack,
+        }
     }
 
     /// The lowest slot a live request may be pushed to by retained slots below it: past the decode
     /// width the live `extent` already runs, or the slack, it would widen every decode launch.
     pub fn floor(&self, extent: usize) -> usize {
-        let width = self.widths.iter().map(|&w| w as usize).find(|&w| w >= extent.max(1)).unwrap_or(extent);
+        let width = self
+            .widths
+            .iter()
+            .map(|&w| w as usize)
+            .find(|&w| w >= extent.max(1))
+            .unwrap_or(extent);
         width.max(self.slack)
     }
 
@@ -737,7 +896,11 @@ impl Retention {
         let mut ticket = ticket?;
         if let Some(ttl) = self.prefix_pin {
             if let Some(report) = ticket.report.take() {
-                let _ = report.send(CacheOutcome { status: CacheStatus::Prefix, rows: 0, at: Some(Instant::now()) });
+                let _ = report.send(CacheOutcome {
+                    status: CacheStatus::Prefix,
+                    rows: 0,
+                    at: Some(Instant::now()),
+                });
             }
             return Some(Seat::pinned(ticket, slot, ttl));
         }
@@ -745,18 +908,26 @@ impl Retention {
         let m = &metrics.serving;
         match outcome.status {
             CacheStatus::Hit => {
-                m.session_hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                m.session_reused_rows.fetch_add(resumed as u64, std::sync::atomic::Ordering::Relaxed);
+                m.session_hits
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                m.session_reused_rows
+                    .fetch_add(resumed as u64, std::sync::atomic::Ordering::Relaxed);
             }
             CacheStatus::Miss | CacheStatus::Evicted => {
-                m.session_misses.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                m.session_misses
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
             CacheStatus::Prefix | CacheStatus::Off => {}
         }
         if let Some(report) = ticket.report.take() {
-            let _ = report.send(CacheOutcome { at: Some(Instant::now()), ..outcome });
+            let _ = report.send(CacheOutcome {
+                at: Some(Instant::now()),
+                ..outcome
+            });
         }
-        self.table.enabled().then(|| Seat::new(ticket, slot, pair, speech, self.inbox.clone()))
+        self.table
+            .enabled()
+            .then(|| Seat::new(ticket, slot, pair, speech, self.inbox.clone()))
     }
 
     /// Export the table's size and evictions.
@@ -766,12 +937,14 @@ impl Retention {
         }
         use std::sync::atomic::Ordering::Relaxed;
         let m = &metrics.serving;
-        m.session_evictions.fetch_add(self.table.evictions - self.evictions_reported, Relaxed);
+        m.session_evictions
+            .fetch_add(self.table.evictions - self.evictions_reported, Relaxed);
         self.evictions_reported = self.table.evictions;
         let rows = self.table.rows();
         m.session_retained.store(self.table.len() as u64, Relaxed);
         m.session_retained_rows.store(rows, Relaxed);
-        m.session_retained_bytes.store(rows * self.bytes_per_row, Relaxed);
+        m.session_retained_bytes
+            .store(rows * self.bytes_per_row, Relaxed);
     }
 
     /// Move retired seats into the table and drop idle entries.
@@ -791,7 +964,12 @@ mod tests {
     use super::*;
 
     fn retired(session: &str, slot: usize, keys: &[u64]) -> Retired {
-        Retired { session: session.into(), slot, pair: false, keys: keys.to_vec() }
+        Retired {
+            session: session.into(),
+            slot,
+            pair: false,
+            keys: keys.to_vec(),
+        }
     }
 
     #[test]
@@ -800,10 +978,20 @@ mod tests {
         let mut t = RetainTable::new(Duration::from_secs(60), 0);
         t.insert(retired("a", 3, &[1, 2, 3, 4]), now);
         assert!(t.holds(3) && !t.holds(2));
-        assert_eq!(t.lookup("a", &[1, 2, 9, 9, 9], false, 8, now), Some(Resume { slot: 3, rows: 2 }));
+        assert_eq!(
+            t.lookup("a", &[1, 2, 9, 9, 9], false, 8, now),
+            Some(Resume { slot: 3, rows: 2 })
+        );
         // An identical prompt still prefills its last row (the first token needs its logits).
-        assert_eq!(t.lookup("a", &[1, 2, 3, 4], false, 8, now), Some(Resume { slot: 3, rows: 3 }));
-        assert_eq!(t.lookup("a", &[7, 2, 3, 4], false, 8, now), None, "no shared row: recompute");
+        assert_eq!(
+            t.lookup("a", &[1, 2, 3, 4], false, 8, now),
+            Some(Resume { slot: 3, rows: 3 })
+        );
+        assert_eq!(
+            t.lookup("a", &[7, 2, 3, 4], false, 8, now),
+            None,
+            "no shared row: recompute"
+        );
         t.forget("a");
         assert!(t.is_empty());
     }
@@ -815,7 +1003,10 @@ mod tests {
         t.insert(retired("a", 0, &[1, 2, 3]), now);
         t.insert(retired("b", 1, &[1, 2, 3]), now);
         assert_eq!(t.lookup("c", &[1, 2, 3, 4], false, 8, now), None);
-        assert_eq!(t.lookup("b", &[1, 2, 3, 4], false, 8, now), Some(Resume { slot: 1, rows: 3 }));
+        assert_eq!(
+            t.lookup("b", &[1, 2, 3, 4], false, 8, now),
+            Some(Resume { slot: 1, rows: 3 })
+        );
         assert_eq!(t.rows_except(Some("b")).collect::<Vec<_>>(), [3]);
         t.forget("b");
         assert!(t.holds(0) && !t.holds(1));
@@ -827,7 +1018,16 @@ mod tests {
         let mut t = RetainTable::new(Duration::from_millis(50), 0);
         t.insert(retired("a", 0, &[1, 2, 3]), now);
         t.insert(retired("b", 1, &[1, 2, 3]), now + Duration::from_millis(40));
-        assert_eq!(t.lookup("a", &[1, 2, 3, 4], false, 8, now + Duration::from_millis(60)), None);
+        assert_eq!(
+            t.lookup(
+                "a",
+                &[1, 2, 3, 4],
+                false,
+                8,
+                now + Duration::from_millis(60)
+            ),
+            None
+        );
         t.sweep(now + Duration::from_millis(80));
         assert_eq!(t.len(), 1);
         t.sweep(now + Duration::from_millis(100));
@@ -868,12 +1068,31 @@ mod tests {
     fn pairs_hold_both_slots_and_resume_only_as_pairs() {
         let now = Instant::now();
         let mut t = RetainTable::new(Duration::from_secs(60), 0);
-        t.insert(Retired { session: "a".into(), slot: 2, pair: true, keys: vec![1, 2, 3] }, now);
+        t.insert(
+            Retired {
+                session: "a".into(),
+                slot: 2,
+                pair: true,
+                keys: vec![1, 2, 3],
+            },
+            now,
+        );
         assert!(t.holds(2) && t.holds(3));
         assert_eq!(t.rows(), 6);
-        assert_eq!(t.lookup("a", &[1, 2, 3, 4], false, 8, now), None, "a lone request never takes a pair");
-        assert_eq!(t.lookup("a", &[1, 2, 3, 4], true, 3, now), None, "partner above the admission limit");
-        assert_eq!(t.lookup("a", &[1, 2, 3, 4], true, 4, now), Some(Resume { slot: 2, rows: 3 }));
+        assert_eq!(
+            t.lookup("a", &[1, 2, 3, 4], false, 8, now),
+            None,
+            "a lone request never takes a pair"
+        );
+        assert_eq!(
+            t.lookup("a", &[1, 2, 3, 4], true, 3, now),
+            None,
+            "partner above the admission limit"
+        );
+        assert_eq!(
+            t.lookup("a", &[1, 2, 3, 4], true, 4, now),
+            Some(Resume { slot: 2, rows: 3 })
+        );
     }
 
     #[test]
@@ -886,17 +1105,40 @@ mod tests {
         assert_eq!(ka[..2], kb[..2]);
         assert_ne!(ka[2], kb[2], "same ids, different audio: a different row");
         assert_eq!(ka[3], token_key(6));
-        assert_ne!(ka[1], token_key(0), "an overlay row is not its placeholder token");
+        assert_ne!(
+            ka[1],
+            token_key(0),
+            "an overlay row is not its placeholder token"
+        );
         // A CFG pair keys both members' rows.
-        assert_ne!(row_keys(&ids, &[1, 2], &[&a, &a])[2], row_keys(&ids, &[1, 2], &[&a, &b])[2]);
+        assert_ne!(
+            row_keys(&ids, &[1, 2], &[&a, &a])[2],
+            row_keys(&ids, &[1, 2], &[&a, &b])[2]
+        );
     }
 
     #[test]
     fn seats_retain_prompt_rows_for_speech_and_prompt_plus_output_for_text() {
         let inbox: RetireInbox = Default::default();
-        let ticket = |keys: &[u64]| Box::new(SessionTicket { session: "s".into(), request: "r".into(), keys: keys.to_vec(), report: None });
-        drop(Seat::new(ticket(&[1, 2, 3]), 0, false, false, inbox.clone()));
-        assert!(inbox.lock().is_empty(), "no token: nothing is known written");
+        let ticket = |keys: &[u64]| {
+            Box::new(SessionTicket {
+                session: "s".into(),
+                request: "r".into(),
+                keys: keys.to_vec(),
+                report: None,
+            })
+        };
+        drop(Seat::new(
+            ticket(&[1, 2, 3]),
+            0,
+            false,
+            false,
+            inbox.clone(),
+        ));
+        assert!(
+            inbox.lock().is_empty(),
+            "no token: nothing is known written"
+        );
         let mut text = Seat::new(ticket(&[1, 2, 3]), 1, false, false, inbox.clone());
         for t in [10, 11, 12] {
             text.on_token(t);
@@ -908,12 +1150,19 @@ mod tests {
         drop(speech);
         let got = std::mem::take(&mut *inbox.lock());
         assert_eq!(got[0].keys, [1, 2, 3, token_key(10), token_key(11)]);
-        assert_eq!((got[1].slot, got[1].pair, got[1].keys.as_slice()), (2, true, &[1u64, 2][..]));
+        assert_eq!(
+            (got[1].slot, got[1].pair, got[1].keys.as_slice()),
+            (2, true, &[1u64, 2][..])
+        );
     }
 
     #[test]
     fn duplicate_request_ids_are_refused_only_while_in_flight_in_the_same_session() {
-        let ids = |r: &str, s: Option<&str>| RequestIds { request: r.into(), session: s.map(Into::into), ..RequestIds::generated() };
+        let ids = |r: &str, s: Option<&str>| RequestIds {
+            request: r.into(),
+            session: s.map(Into::into),
+            ..RequestIds::generated()
+        };
         let first = ids("r1", Some("dup-s")).begin("m").expect("first");
         assert!(ids("r1", Some("dup-s")).begin("m").is_none());
         assert!(ids("r1", Some("dup-s")).begin("other-model").is_some());
@@ -930,14 +1179,26 @@ mod tests {
         let got = RequestIds::from_headers(&h).unwrap();
         assert_eq!(got.request.len(), 11);
         assert!(got.session.is_none());
-        assert_ne!(RequestIds::generated().request, RequestIds::generated().request);
+        assert_ne!(
+            RequestIds::generated().request,
+            RequestIds::generated().request
+        );
         h.insert(REQUEST_HEADER, HeaderValue::from_static("abc"));
         h.insert(SESSION_HEADER, HeaderValue::from_static("s-1"));
         let got = RequestIds::from_headers(&h).unwrap();
-        assert_eq!((&*got.request, got.session.as_deref()), ("abc", Some("s-1")));
-        h.insert(SESSION_HEADER, HeaderValue::from_str(&"x".repeat(256)).unwrap());
+        assert_eq!(
+            (&*got.request, got.session.as_deref()),
+            ("abc", Some("s-1"))
+        );
+        h.insert(
+            SESSION_HEADER,
+            HeaderValue::from_str(&"x".repeat(256)).unwrap(),
+        );
         assert!(RequestIds::from_headers(&h).is_ok());
-        h.insert(SESSION_HEADER, HeaderValue::from_str(&"x".repeat(257)).unwrap());
+        h.insert(
+            SESSION_HEADER,
+            HeaderValue::from_str(&"x".repeat(257)).unwrap(),
+        );
         assert!(RequestIds::from_headers(&h).is_err());
         h.remove(SESSION_HEADER);
         h.insert(TURN_BUDGET_HEADER, HeaderValue::from_static("soon"));
@@ -946,7 +1207,8 @@ mod tests {
 
     #[test]
     fn traceparent_parses_w3c_and_rejects_invalid() {
-        let t = TraceParent::parse("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01").unwrap();
+        let t =
+            TraceParent::parse("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01").unwrap();
         assert_eq!(t.trace_id, 0x4bf92f3577b34da6a3ce929d0e0e4736);
         assert_eq!((t.parent, t.flags), (0x00f067aa0ba902b7, 1));
         for bad in [
@@ -961,7 +1223,10 @@ mod tests {
             assert_eq!(TraceParent::parse(bad), None, "{bad}");
         }
         // A later version may carry more fields.
-        assert!(TraceParent::parse("01-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01-xyz").is_some());
+        assert!(
+            TraceParent::parse("01-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01-xyz")
+                .is_some()
+        );
     }
 
     #[test]
@@ -984,7 +1249,10 @@ mod tests {
         .unwrap();
         assert_eq!(ids.session.as_deref(), Some("body"));
         assert_eq!(ids.turn.as_deref(), Some("t-hdr"));
-        assert_eq!(ids.trace.unwrap().trace_id, 0x4bf92f3577b34da6a3ce929d0e0e4736);
+        assert_eq!(
+            ids.trace.unwrap().trace_id,
+            0x4bf92f3577b34da6a3ce929d0e0e4736
+        );
         assert_eq!(ids.budget(), Some(Duration::from_millis(900)));
         // Body trace and metadata when no headers.
         let mut h2 = HeaderMap::new();
@@ -998,12 +1266,20 @@ mod tests {
         assert_eq!(ids.session.as_deref(), Some("hdr"));
         assert_eq!(ids.turn.as_deref(), Some("3"));
         let t = ids.trace.unwrap();
-        assert_eq!((t.trace_id, t.parent), (0x0af7651916cd43dd8448eb211c80319c, 0xb7ad6b7169203331));
+        assert_eq!(
+            (t.trace_id, t.parent),
+            (0x0af7651916cd43dd8448eb211c80319c, 0xb7ad6b7169203331)
+        );
         // prompt_cache_key is no session; an invalid body session_id is refused.
         let mut ids = RequestIds::from_headers(&HeaderMap::new()).unwrap();
-        ids.apply_body(&body(serde_json::json!({"prompt_cache_key": "pck"}))).unwrap();
+        ids.apply_body(&body(serde_json::json!({"prompt_cache_key": "pck"})))
+            .unwrap();
         assert_eq!(ids.session, None);
-        assert!(ids.apply_body(&body(serde_json::json!({"session_id": "has space"}))).is_err());
-        assert!(ids.apply_body(&body(serde_json::json!({"session_id": "x".repeat(257)}))).is_err());
+        assert!(ids
+            .apply_body(&body(serde_json::json!({"session_id": "has space"})))
+            .is_err());
+        assert!(ids
+            .apply_body(&body(serde_json::json!({"session_id": "x".repeat(257)})))
+            .is_err());
     }
 }

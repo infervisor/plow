@@ -23,9 +23,10 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
 
 use crate::pipeline::{
-    h16_prefix_floats, Activation, AttentionF32Stage, AttentionPrefix, BinaryF32Stage, BinaryOp, Conv1dF32Stage, CopyColsF32Stage, CumSumF64Stage,
-    Emitted, GatherRowsF32Stage, LayerNormRowsF32Stage, PacketPrefix, PadMode, RandCoord, RandF32Stage,
-    StageProgram, TensorRef, UnaryF32Stage,
+    h16_prefix_floats, Activation, AttentionF32Stage, AttentionPrefix, BinaryF32Stage, BinaryOp,
+    Conv1dF32Stage, CopyColsF32Stage, CumSumF64Stage, Emitted, GatherRowsF32Stage,
+    LayerNormRowsF32Stage, PacketPrefix, PadMode, RandCoord, RandF32Stage, StageProgram, TensorRef,
+    UnaryF32Stage,
 };
 use crate::rewrite_lower::{ActAt, ConvFusions};
 use crate::RewriteSites;
@@ -39,12 +40,34 @@ pub const PACKET: &str = "s3gen.pkt";
 /// gain throughput; every item pays the capacity's token count, so the wide batches get finer
 /// token steps (streaming first chunks are ~20 tokens, whole utterances ~100).
 pub const S3GEN_CAPACITIES: &[(u32, u32)] = &[
-    (1, 32), (1, 64), (1, 128), (1, 256), (1, 512), (1, 1000),
-    (2, 128), (2, 256), (2, 512),
-    (4, 64), (4, 128), (4, 256),
-    (8, 32), (8, 64), (8, 96), (8, 128), (8, 192), (8, 256),
-    (16, 32), (16, 64), (16, 96), (16, 128), (16, 192), (16, 256),
-    (32, 32), (32, 64), (32, 96), (32, 128),
+    (1, 32),
+    (1, 64),
+    (1, 128),
+    (1, 256),
+    (1, 512),
+    (1, 1000),
+    (2, 128),
+    (2, 256),
+    (2, 512),
+    (4, 64),
+    (4, 128),
+    (4, 256),
+    (8, 32),
+    (8, 64),
+    (8, 96),
+    (8, 128),
+    (8, 192),
+    (8, 256),
+    (16, 32),
+    (16, 64),
+    (16, 96),
+    (16, 128),
+    (16, 192),
+    (16, 256),
+    (32, 32),
+    (32, 64),
+    (32, 96),
+    (32, 128),
 ];
 
 /// Cached-prompt capacities (`csynth`): the CFM runs only the item's own tokens and attends to
@@ -52,12 +75,23 @@ pub const S3GEN_CAPACITIES: &[(u32, u32)] = &[
 /// prompt rows do not attend to the tokens, unlike the reference). A streaming window then costs
 /// its own tokens instead of prompt + prefix. The encoder still sees prompt + tokens.
 pub const S3GEN_CACHED_CAPACITIES: &[(u32, u32)] = &[
-    (1, 32), (1, 64), (1, 128), (1, 256),
-    (4, 32), (4, 64),
-    (8, 32), (8, 64), (8, 128),
-    (16, 32), (16, 64), (16, 128),
-    (32, 32), (32, 64), (32, 128),
-    (64, 32), (64, 64),
+    (1, 32),
+    (1, 64),
+    (1, 128),
+    (1, 256),
+    (4, 32),
+    (4, 64),
+    (8, 32),
+    (8, 64),
+    (8, 128),
+    (16, 32),
+    (16, 64),
+    (16, 128),
+    (32, 32),
+    (32, 64),
+    (32, 128),
+    (64, 32),
+    (64, 64),
 ];
 
 const D_ENC: u32 = 512;
@@ -100,11 +134,23 @@ struct Config {
 impl Config {
     fn parse(v: &serde_json::Value) -> Result<Self, String> {
         let u = |v: &serde_json::Value, k: &str| -> Result<u32, String> {
-            v[k].as_u64().and_then(|x| u32::try_from(x).ok()).ok_or(format!("s3gen config: {k}"))
+            v[k].as_u64()
+                .and_then(|x| u32::try_from(x).ok())
+                .ok_or(format!("s3gen config: {k}"))
         };
-        let f = |k: &str| -> Result<f32, String> { v[k].as_f64().map(|x| x as f32).ok_or(format!("s3gen config: {k}")) };
+        let f = |k: &str| -> Result<f32, String> {
+            v[k].as_f64()
+                .map(|x| x as f32)
+                .ok_or(format!("s3gen config: {k}"))
+        };
         let list = |v: &serde_json::Value| -> Vec<u32> {
-            v.as_array().map(|a| a.iter().filter_map(|x| x.as_u64().map(|x| x as u32)).collect()).unwrap_or_default()
+            v.as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|x| x.as_u64().map(|x| x as u32))
+                        .collect()
+                })
+                .unwrap_or_default()
         };
         let triples = |k: &str| -> Result<Vec<[u32; 3]>, String> {
             v[k].as_array()
@@ -117,18 +163,33 @@ impl Config {
             v[k].as_array()
                 .ok_or(format!("s3gen config: {k}"))?
                 .iter()
-                .map(|x| Ok((x[0].as_u64().ok_or(format!("s3gen config: {k}"))? as u32, list(&x[1]))))
+                .map(|x| {
+                    Ok((
+                        x[0].as_u64().ok_or(format!("s3gen config: {k}"))? as u32,
+                        list(&x[1]),
+                    ))
+                })
                 .collect()
         };
         let rows = list(&v["relpos_rows"]);
         Ok(Self {
             sampling_rate: u(v, "sampling_rate")?,
             vocab: u(v, "vocab")?,
-            voices: v["voices"].as_array().ok_or("s3gen config: voices")?.iter().filter_map(|x| x.as_str().map(String::from)).collect(),
+            voices: v["voices"]
+                .as_array()
+                .ok_or("s3gen config: voices")?
+                .iter()
+                .filter_map(|x| x.as_str().map(String::from))
+                .collect(),
             prompt: u(v, "prompt_tokens")?,
             max_tokens: u(v, "max_tokens")?,
             relpos_rows: <[u32; 2]>::try_from(rows).map_err(|_| "s3gen config: relpos_rows")?,
-            t_span: v["t_span"].as_array().ok_or("s3gen config: t_span")?.iter().filter_map(|x| x.as_f64().map(|x| x as f32)).collect(),
+            t_span: v["t_span"]
+                .as_array()
+                .ok_or("s3gen config: t_span")?
+                .iter()
+                .filter_map(|x| x.as_f64().map(|x| x as f32))
+                .collect(),
             cfg_rate: f("cfg_rate")?,
             upsample: triples("upsample")?,
             source_downs: triples("source_downs")?,
@@ -166,7 +227,15 @@ struct Lengths {
 
 impl Lengths {
     fn all(&self) -> [u32; 7] {
-        [self.tok, self.mel, self.gen, self.stage[0], self.stage[1], self.stage[2], self.wav]
+        [
+            self.tok,
+            self.mel,
+            self.gen,
+            self.stage[0],
+            self.stage[1],
+            self.stage[2],
+            self.wav,
+        ]
     }
 }
 
@@ -175,7 +244,15 @@ fn length_scales(cfg: &Config) -> [(u32, u32); 7] {
     let p = cfg.prompt;
     let (u0, u1, u2) = (cfg.upsample[0][0], cfg.upsample[1][0], cfg.upsample[2][0]);
     // Two mel frames per token; the last HiFT stage is reflection-padded by one frame.
-    [(1, p), (2, 2 * p), (2, 0), (2 * u0, 0), (2 * u0 * u1, 0), (2 * u0 * u1 * u2, 1), (2 * cfg.frame_samples(), 0)]
+    [
+        (1, p),
+        (2, 2 * p),
+        (2, 0),
+        (2 * u0, 0),
+        (2 * u0 * u1, 0),
+        (2 * u0 * u1 * u2, 1),
+        (2 * cfg.frame_samples(), 0),
+    ]
 }
 
 /// `s3gen.pkt` (model + pipeline section) for the S3Gen export in `dir` (scripts/tts/s3gen_export.py), with the rewrite's
@@ -188,8 +265,11 @@ pub fn lower_s3gen(
     attn_h16: bool,
 ) -> Result<(packet::devbuild::Model, packet::devbuild::SectionData), String> {
     let mut cfg = Config::parse(
-        &serde_json::from_slice(&std::fs::read(dir.join("config.json")).map_err(|e| format!("{}: {e}", dir.display()))?)
-            .map_err(|e| format!("s3gen config: {e}"))?,
+        &serde_json::from_slice(
+            &std::fs::read(dir.join("config.json"))
+                .map_err(|e| format!("{}: {e}", dir.display()))?,
+        )
+        .map_err(|e| format!("s3gen config: {e}"))?,
     )?;
     if cfg.upsample.len() != 3
         || cfg.source_downs.len() != 3
@@ -203,11 +283,32 @@ pub fn lower_s3gen(
         return Err("unsupported S3Gen export".into());
     }
     cfg.attn_h16 = attn_h16;
-    let caps: Vec<(u32, u32)> = S3GEN_CAPACITIES.iter().copied().filter(|&(_, n)| n <= cfg.max_tokens).collect();
-    let cached: Vec<(u32, u32)> = S3GEN_CACHED_CAPACITIES.iter().copied().filter(|&(_, n)| n <= cfg.max_tokens).collect();
-    let bmax = caps.iter().chain(&cached).map(|c| c.0).max().ok_or("no S3Gen capacity fits max_tokens")?;
+    let caps: Vec<(u32, u32)> = S3GEN_CAPACITIES
+        .iter()
+        .copied()
+        .filter(|&(_, n)| n <= cfg.max_tokens)
+        .collect();
+    let cached: Vec<(u32, u32)> = S3GEN_CACHED_CAPACITIES
+        .iter()
+        .copied()
+        .filter(|&(_, n)| n <= cfg.max_tokens)
+        .collect();
+    let bmax = caps
+        .iter()
+        .chain(&cached)
+        .map(|c| c.0)
+        .max()
+        .ok_or("no S3Gen capacity fits max_tokens")?;
     let nmax = caps.iter().chain(&cached).map(|c| c.1).max().unwrap_or(1);
-    let mut model = packet::devbuild::Model { n_cu, target, tensors: Vec::new(), progs: Vec::new(), kv_row_insts: Vec::new(), prog_t: Vec::new(), gen: Vec::new() };
+    let mut model = packet::devbuild::Model {
+        n_cu,
+        target,
+        tensors: Vec::new(),
+        progs: Vec::new(),
+        kv_row_insts: Vec::new(),
+        prog_t: Vec::new(),
+        gen: Vec::new(),
+    };
     let mut builder = packet::devbuild::Builder::new(n_cu);
     builder.set_tensor_dedup(true);
     let inputs = Inputs {
@@ -220,23 +321,53 @@ pub fn lower_s3gen(
         next_seam: builder.tensor("in.s3gen.next_seam", u64::from(bmax) * 4),
         nmax,
         lengths: {
-            let h: Vec<u32> = (0..7).map(|k| builder.tensor(&format!("act.s3gen.len.{k}"), u64::from(bmax) * 4)).collect();
-            Lengths { tok: h[0], mel: h[1], gen: h[2], stage: [h[3], h[4], h[5]], wav: h[6] }
+            let h: Vec<u32> = (0..7)
+                .map(|k| builder.tensor(&format!("act.s3gen.len.{k}"), u64::from(bmax) * 4))
+                .collect();
+            Lengths {
+                tok: h[0],
+                mel: h[1],
+                gen: h[2],
+                stage: [h[3], h[4], h[5]],
+                wav: h[6],
+            }
         },
     };
     let samples_per_token = length_scales(&cfg)[6].0;
-    builder.tensor("act.s3gen.pcm", u64::from(bmax * nmax * samples_per_token) * 4);
+    builder.tensor(
+        "act.s3gen.pcm",
+        u64::from(bmax * nmax * samples_per_token) * 4,
+    );
     model.tensors = builder.tensors();
-    let mut prefix = PacketPrefix { model, programs: Vec::new(), input: inputs.tokens, output: inputs.tokens, input_shape: vec![u64::from(bmax * nmax)] };
+    let mut prefix = PacketPrefix {
+        model,
+        programs: Vec::new(),
+        input: inputs.tokens,
+        output: inputs.tokens,
+        input_shape: vec![u64::from(bmax * nmax)],
+    };
     let mut names = HashMap::new();
     let mut roles = BTreeMap::new();
     let layouts = RefCell::new(HashMap::new());
     // Prefill programs first: they declare the voice caches the cached capacities read.
     let voices = (0..cfg.voices.len() as u32).map(|v| (1, 0, Mode::Prefill(v)));
-    let family = |list: &[(u32, u32)], mode: Mode| list.iter().map(move |&(b, n)| (b, n, mode)).collect::<Vec<_>>();
-    let all: Vec<(u32, u32, Mode)> = voices.chain(family(&caps, Mode::Full)).chain(family(&cached, Mode::Cached)).collect();
+    let family = |list: &[(u32, u32)], mode: Mode| {
+        list.iter()
+            .map(move |&(b, n)| (b, n, mode))
+            .collect::<Vec<_>>()
+    };
+    let all: Vec<(u32, u32, Mode)> = voices
+        .chain(family(&caps, Mode::Full))
+        .chain(family(&cached, Mode::Cached))
+        .collect();
     for (batch, tokens, mode) in all {
-        let lo = Lowering { cfg: &cfg, inputs, b: batch, n: tokens, mode };
+        let lo = Lowering {
+            cfg: &cfg,
+            inputs,
+            b: batch,
+            n: tokens,
+            mode,
+        };
         let role = match mode {
             Mode::Full => format!("synth.b{batch}.t{tokens}"),
             Mode::Cached => format!("csynth.b{batch}.t{tokens}"),
@@ -248,7 +379,12 @@ pub fn lower_s3gen(
                        body: &dyn Fn(&mut Ops) -> Result<(), String>|
          -> Result<PacketPrefix, String> {
             let program = prefix.model.progs.len() as u32;
-            let mut ops = Ops::new(prefix.program(), std::mem::take(names), ConvFusions(sites), &layouts);
+            let mut ops = Ops::new(
+                prefix.program(),
+                std::mem::take(names),
+                ConvFusions(sites),
+                &layouts,
+            );
             body(&mut ops)?;
             let (prefix, n) = ops.finish((batch * tokens).max(1));
             *names = n;
@@ -268,12 +404,25 @@ pub fn lower_s3gen(
         }
     }
     let reader = crate::checkpoint::TensorReader::open(dir)?;
-    let mut derived = Derived { reader: &reader, cfg: &cfg, nmax, cache: HashMap::new() };
+    let mut derived = Derived {
+        reader: &reader,
+        cfg: &cfg,
+        nmax,
+        cache: HashMap::new(),
+    };
     let layouts = layouts.into_inner();
     for tensor in &mut prefix.model.tensors {
         if let Some(name) = tensor.name.strip_prefix("w.") {
             let mut bytes = derived.bytes(name)?;
-            if let Some(&WeightLayout { cout, cin, k, stride, tap_major, split }) = layouts.get(&tensor.name) {
+            if let Some(&WeightLayout {
+                cout,
+                cin,
+                k,
+                stride,
+                tap_major,
+                split,
+            }) = layouts.get(&tensor.name)
+            {
                 if tap_major {
                     bytes = if stride > 0 {
                         crate::codec::to_phase_major(&bytes, cin, cout, k, stride)
@@ -286,7 +435,11 @@ pub fn lower_s3gen(
                 }
             }
             if bytes.len() as u64 != tensor.bytes {
-                return Err(format!("{name}: {} bytes, expected {}", bytes.len(), tensor.bytes));
+                return Err(format!(
+                    "{name}: {} bytes, expected {}",
+                    bytes.len(),
+                    tensor.bytes
+                ));
             }
             tensor.init = Some(bytes);
         }
@@ -352,7 +505,14 @@ impl<'s> Ops<'s> {
         fuse: ConvFusions<'s>,
         layouts: &'s RefCell<HashMap<String, WeightLayout>>,
     ) -> Self {
-        Self { p, names, writer: HashMap::new(), readers: HashMap::new(), fuse, layouts }
+        Self {
+            p,
+            names,
+            writer: HashMap::new(),
+            readers: HashMap::new(),
+            fuse,
+            layouts,
+        }
     }
 
     fn finish(self, tag: u32) -> (PacketPrefix, HashMap<String, u32>) {
@@ -366,14 +526,18 @@ impl<'s> Ops<'s> {
         emit: impl FnOnce(&mut StageProgram, TensorRef<'_>, &[u32]) -> Result<Emitted, String>,
     ) -> Result<u32, String> {
         let target = self.names.get(out).copied();
-        let mut deps: Vec<u32> = reads.iter().filter_map(|r| self.writer.get(r).copied()).collect();
+        let mut deps: Vec<u32> = reads
+            .iter()
+            .filter_map(|r| self.writer.get(r).copied())
+            .collect();
         if let Some(t) = target {
             deps.extend(self.writer.get(&t).copied());
             deps.extend(self.readers.get(&t).into_iter().flatten().copied());
         }
         deps.sort_unstable();
         deps.dedup();
-        let e = emit(&mut self.p, TensorRef::Named(out), &deps).map_err(|err| format!("{out}: {err}"))?;
+        let e = emit(&mut self.p, TensorRef::Named(out), &deps)
+            .map_err(|err| format!("{out}: {err}"))?;
         self.names.insert(out.to_string(), e.output);
         for r in reads {
             self.readers.entry(*r).or_default().push(e.done);
@@ -384,7 +548,11 @@ impl<'s> Ops<'s> {
     }
 
     fn name_of(&self, h: u32) -> String {
-        self.names.iter().find(|(_, &v)| v == h).map(|(k, _)| k.clone()).expect("tensor declared by name")
+        self.names
+            .iter()
+            .find(|(_, &v)| v == h)
+            .map(|(k, _)| k.clone())
+            .expect("tensor declared by name")
     }
 
     /// `c` with the fusions [`Self::fuse`] decides; an unfused piece runs as its own `UnaryF32` /
@@ -403,19 +571,27 @@ impl<'s> Ops<'s> {
         let mut x = x;
         if act_in && !fuse_in {
             let (rows, param) = (c.batch * c.rows, c.alpha.map(|a| format!("w.{a}")));
-            let target = if c.input_is_temp { self.name_of(x) } else { "act.s3gen.pre".to_string() };
+            let target = if c.input_is_temp {
+                self.name_of(x)
+            } else {
+                "act.s3gen.pre".to_string()
+            };
             x = self.op(&[x], &target, |p, output, deps| {
-                p.unary_f32(x, deps, UnaryF32Stage {
-                    output,
-                    param: param.as_deref().map(TensorRef::Named),
-                    rows,
-                    width: c.cin,
-                    stride: 0,
-                    col0: 0,
-                    kind: c.act_in,
-                    p0: c.slope,
-                    p1: 0.0,
-                })
+                p.unary_f32(
+                    x,
+                    deps,
+                    UnaryF32Stage {
+                        output,
+                        param: param.as_deref().map(TensorRef::Named),
+                        rows,
+                        width: c.cin,
+                        stride: 0,
+                        col0: 0,
+                        kind: c.act_in,
+                        p0: c.slope,
+                        p1: 0.0,
+                    },
+                )
             })?;
             (raw.act_in, raw.alpha) = (Activation::None, None);
         }
@@ -435,7 +611,14 @@ impl<'s> Ops<'s> {
             self.unary(y, c.batch * out_rows, c.cout, 0, 0, c.act_out, c.slope, 0.0)?;
         }
         if let Some(r) = c.residual.filter(|_| !fuse_res) {
-            self.binary(y, r, BinaryOp::Add, (1, c.batch * out_rows, c.cout), (0, c.cout, 1), None)?;
+            self.binary(
+                y,
+                r,
+                BinaryOp::Add,
+                (1, c.batch * out_rows, c.cout),
+                (0, c.cout, 1),
+                None,
+            )?;
         }
         Ok(y)
     }
@@ -445,7 +628,10 @@ impl<'s> Ops<'s> {
         reads.extend(c.residual);
         reads.extend(c.lengths);
         let weight = format!("w.{}.w", c.w);
-        let bias = c.bias.then(|| c.bias_name.map_or_else(|| format!("w.{}.b", c.w), |b| format!("w.{b}")));
+        let bias = c.bias.then(|| {
+            c.bias_name
+                .map_or_else(|| format!("w.{}.b", c.w), |b| format!("w.{b}"))
+        });
         let alpha = c.alpha.map(|a| format!("w.{a}"));
         // Non-transposed k-tap convs with 16-byte channel runs take the split-bf16 wide tile, which
         // reads (tap, channel) columns contiguously from tap-major weights; transposed ones read
@@ -458,45 +644,68 @@ impl<'s> Ops<'s> {
         let split = !c.transpose && c.groups == 1 && c.cin % 4 == 0 && (c.k == 1 || tap_major);
         if tap_major || split {
             let stride = if c.transpose { c.stride } else { 0 };
-            let layout = WeightLayout { cout: c.cout, cin: c.cin, k: c.k, stride, tap_major, split };
+            let layout = WeightLayout {
+                cout: c.cout,
+                cin: c.cin,
+                k: c.k,
+                stride,
+                tap_major,
+                split,
+            };
             let prev = self.layouts.borrow_mut().insert(weight.clone(), layout);
             if prev.is_some_and(|p| p != layout) {
                 return Err(format!("{weight}: used with two conv shapes"));
             }
         }
         self.op(&reads, out, |p, output, deps| {
-            p.conv1d_f32(x, c.transpose, deps, Conv1dF32Stage {
-                output,
-                weight: TensorRef::Named(&weight),
-                bias: bias.as_deref().map(TensorRef::Named),
-                alpha: alpha.as_deref().map(TensorRef::Named),
-                residual: c.residual,
-                lengths: c.lengths,
-                batch: c.batch,
-                in_rows: c.rows,
-                in_channels: c.cin,
-                out_channels: c.cout,
-                kernel: c.k,
-                stride: c.stride,
-                dilation_or_output_padding: c.dil,
-                groups: c.groups,
-                pad_before: c.pad.0,
-                pad_after: c.pad.1,
-                pad_mode: c.mode,
-                input_activation: c.act_in,
-                output_activation: c.act_out,
-                slope: c.slope,
-                weight_f16: false,
-                split_bf16: !c.transpose,
-                weight_tap_major: tap_major,
-                wgmma: true,
-                weight_split: split,
-            })
+            p.conv1d_f32(
+                x,
+                c.transpose,
+                deps,
+                Conv1dF32Stage {
+                    output,
+                    weight: TensorRef::Named(&weight),
+                    bias: bias.as_deref().map(TensorRef::Named),
+                    alpha: alpha.as_deref().map(TensorRef::Named),
+                    residual: c.residual,
+                    lengths: c.lengths,
+                    batch: c.batch,
+                    in_rows: c.rows,
+                    in_channels: c.cin,
+                    out_channels: c.cout,
+                    kernel: c.k,
+                    stride: c.stride,
+                    dilation_or_output_padding: c.dil,
+                    groups: c.groups,
+                    pad_before: c.pad.0,
+                    pad_after: c.pad.1,
+                    pad_mode: c.mode,
+                    input_activation: c.act_in,
+                    output_activation: c.act_out,
+                    slope: c.slope,
+                    weight_f16: false,
+                    split_bf16: !c.transpose,
+                    weight_tap_major: tap_major,
+                    wgmma: true,
+                    weight_split: split,
+                },
+            )
         })
     }
 
     /// Row-wise linear layer `out = x W^T (+ b) (+ residual)` over `rows` rows.
-    fn linear(&mut self, x: u32, out: &str, w: &str, rows: u32, cin: u32, cout: u32, bias: bool, act: Activation, residual: Option<u32>) -> Result<u32, String> {
+    fn linear(
+        &mut self,
+        x: u32,
+        out: &str,
+        w: &str,
+        rows: u32,
+        cin: u32,
+        cout: u32,
+        bias: bool,
+        act: Activation,
+        residual: Option<u32>,
+    ) -> Result<u32, String> {
         let mut c = Conv::new(w, 1, rows, cin, cout, 1);
         c.bias = bias;
         c.act_out = act;
@@ -504,95 +713,193 @@ impl<'s> Ops<'s> {
         self.conv(x, out, c)
     }
 
-    fn layer_norm(&mut self, x: u32, out: &str, w: &str, rows: u32, width: u32, epsilon: f32) -> Result<u32, String> {
+    fn layer_norm(
+        &mut self,
+        x: u32,
+        out: &str,
+        w: &str,
+        rows: u32,
+        width: u32,
+        epsilon: f32,
+    ) -> Result<u32, String> {
         self.layer_norm_act(x, out, w, rows, width, epsilon, Activation::None, None)
     }
 
     /// `layer_norm`, then `act`, then `+ add` (a `[width]` weight row), in one op.
-    fn layer_norm_act(&mut self, x: u32, out: &str, w: &str, rows: u32, width: u32, epsilon: f32, act: Activation, add: Option<&str>) -> Result<u32, String> {
+    fn layer_norm_act(
+        &mut self,
+        x: u32,
+        out: &str,
+        w: &str,
+        rows: u32,
+        width: u32,
+        epsilon: f32,
+        act: Activation,
+        add: Option<&str>,
+    ) -> Result<u32, String> {
         let (g, b) = (format!("w.{w}.g"), format!("w.{w}.b"));
         let add = add.map(|a| format!("w.{a}"));
         self.op(&[x], out, |p, output, deps| {
-            p.layer_norm_f32(x, deps, LayerNormRowsF32Stage {
-                output,
-                gamma: Some(TensorRef::Named(&g)),
-                beta: Some(TensorRef::Named(&b)),
-                rows,
-                width,
-                epsilon,
-                activation: act,
-                add_row: add.as_deref().map(TensorRef::Named),
-            })
+            p.layer_norm_f32(
+                x,
+                deps,
+                LayerNormRowsF32Stage {
+                    output,
+                    gamma: Some(TensorRef::Named(&g)),
+                    beta: Some(TensorRef::Named(&b)),
+                    rows,
+                    width,
+                    epsilon,
+                    activation: act,
+                    add_row: add.as_deref().map(TensorRef::Named),
+                },
+            )
         })
     }
 
     /// In-place `x = f(x)` on `rows x width` at row stride `stride` from `col0`.
-    fn unary(&mut self, x: u32, rows: u32, width: u32, stride: u32, col0: u32, kind: Activation, p0: f32, p1: f32) -> Result<u32, String> {
+    fn unary(
+        &mut self,
+        x: u32,
+        rows: u32,
+        width: u32,
+        stride: u32,
+        col0: u32,
+        kind: Activation,
+        p0: f32,
+        p1: f32,
+    ) -> Result<u32, String> {
         let out = self.name_of(x);
         self.unary_to(x, &out, rows, width, stride, col0, kind, p0, p1)
     }
 
-    fn unary_to(&mut self, x: u32, out: &str, rows: u32, width: u32, stride: u32, col0: u32, kind: Activation, p0: f32, p1: f32) -> Result<u32, String> {
+    fn unary_to(
+        &mut self,
+        x: u32,
+        out: &str,
+        rows: u32,
+        width: u32,
+        stride: u32,
+        col0: u32,
+        kind: Activation,
+        p0: f32,
+        p1: f32,
+    ) -> Result<u32, String> {
         self.op(&[x], out, |p, output, deps| {
-            p.unary_f32(x, deps, UnaryF32Stage { output, param: None, rows, width, stride, col0, kind, p0, p1 })
+            p.unary_f32(
+                x,
+                deps,
+                UnaryF32Stage {
+                    output,
+                    param: None,
+                    rows,
+                    width,
+                    stride,
+                    col0,
+                    kind,
+                    p0,
+                    p1,
+                },
+            )
         })
     }
 
     /// In-place `a = scale * (a op b[i*bs.0 + r*bs.1 + c*bs.2])` over `[items][rows][width]`.
-    fn binary(&mut self, a: u32, b: u32, op: BinaryOp, dims: (u32, u32, u32), bs: (u32, u32, u32), scale: Option<f32>) -> Result<u32, String> {
+    fn binary(
+        &mut self,
+        a: u32,
+        b: u32,
+        op: BinaryOp,
+        dims: (u32, u32, u32),
+        bs: (u32, u32, u32),
+        scale: Option<f32>,
+    ) -> Result<u32, String> {
         let out = self.name_of(a);
         self.op(&[a, b], &out, |p, output, deps| {
-            p.binary_f32(a, b, deps, BinaryF32Stage {
-                output,
-                op,
-                items: dims.0,
-                rows: dims.1,
-                width: dims.2,
-                b_item_stride: bs.0,
-                b_row_stride: bs.1,
-                b_col_stride: bs.2,
-                scale,
-            })
+            p.binary_f32(
+                a,
+                b,
+                deps,
+                BinaryF32Stage {
+                    output,
+                    op,
+                    items: dims.0,
+                    rows: dims.1,
+                    width: dims.2,
+                    b_item_stride: bs.0,
+                    b_row_stride: bs.1,
+                    b_col_stride: bs.2,
+                    scale,
+                },
+            )
         })
     }
 
     /// `out[i][r][c] (at out strides) = x[i][r][c] (at in strides)`; strides `(item, row, offset)`.
-    fn copy(&mut self, x: u32, out: &str, dims: (u32, u32, u32), src: (u32, u32, u32), dst: (u32, u32, u32)) -> Result<u32, String> {
+    fn copy(
+        &mut self,
+        x: u32,
+        out: &str,
+        dims: (u32, u32, u32),
+        src: (u32, u32, u32),
+        dst: (u32, u32, u32),
+    ) -> Result<u32, String> {
         self.op(&[x], out, |p, output, deps| {
-            p.copy_cols_f32(x, deps, CopyColsF32Stage {
-                output,
-                items: dims.0,
-                rows: dims.1,
-                cols: dims.2,
-                in_item_stride: src.0,
-                in_stride: src.1,
-                in_offset: src.2,
-                out_item_stride: dst.0,
-                out_stride: dst.1,
-                out_offset: dst.2,
-            })
+            p.copy_cols_f32(
+                x,
+                deps,
+                CopyColsF32Stage {
+                    output,
+                    items: dims.0,
+                    rows: dims.1,
+                    cols: dims.2,
+                    in_item_stride: src.0,
+                    in_stride: src.1,
+                    in_offset: src.2,
+                    out_item_stride: dst.0,
+                    out_stride: dst.1,
+                    out_offset: dst.2,
+                },
+            )
         })
     }
 
     /// [`StageProgram::format_prefix_h16`]: `dst` = (block stride, first block offset).
-    fn format_prefix(&mut self, x: u32, out: &str, dims: (u32, u32, u32), src: (u32, u32, u32), dst: (u32, u32)) -> Result<u32, String> {
+    fn format_prefix(
+        &mut self,
+        x: u32,
+        out: &str,
+        dims: (u32, u32, u32),
+        src: (u32, u32, u32),
+        dst: (u32, u32),
+    ) -> Result<u32, String> {
         self.op(&[x], out, |p, output, deps| {
-            p.format_prefix_h16(x, deps, CopyColsF32Stage {
-                output,
-                items: dims.0,
-                rows: dims.1,
-                cols: dims.2,
-                in_item_stride: src.0,
-                in_stride: src.1,
-                in_offset: src.2,
-                out_item_stride: dst.0,
-                out_stride: 0,
-                out_offset: dst.1,
-            })
+            p.format_prefix_h16(
+                x,
+                deps,
+                CopyColsF32Stage {
+                    output,
+                    items: dims.0,
+                    rows: dims.1,
+                    cols: dims.2,
+                    in_item_stride: src.0,
+                    in_stride: src.1,
+                    in_offset: src.2,
+                    out_item_stride: dst.0,
+                    out_stride: 0,
+                    out_offset: dst.1,
+                },
+            )
         })
     }
 
-    fn gather(&mut self, table: Table<'_>, index: Option<u32>, out: &str, g: Gather) -> Result<u32, String> {
+    fn gather(
+        &mut self,
+        table: Table<'_>,
+        index: Option<u32>,
+        out: &str,
+        g: Gather,
+    ) -> Result<u32, String> {
         let mut reads: Vec<u32> = index.into_iter().collect();
         let named;
         let (table, table_rows) = match table {
@@ -606,44 +913,68 @@ impl<'s> Ops<'s> {
             }
         };
         self.op(&reads, out, |p, output, deps| {
-            p.gather_rows_f32(deps, GatherRowsF32Stage {
-                output,
-                table,
-                table_rows,
-                index,
-                rows: g.rows,
-                width: g.width,
-                vocab: g.vocab,
-                rows_per_item: g.per_item,
-                repeat: g.repeat,
-                index_item_stride: g.index_stride,
-                table_item_stride: g.table_stride,
-                table_f16: false,
-                accumulate: g.accumulate,
-                out_stride: g.out_stride,
-                out_col0: g.out_col0,
-            })
+            p.gather_rows_f32(
+                deps,
+                GatherRowsF32Stage {
+                    output,
+                    table,
+                    table_rows,
+                    index,
+                    rows: g.rows,
+                    width: g.width,
+                    vocab: g.vocab,
+                    rows_per_item: g.per_item,
+                    repeat: g.repeat,
+                    index_item_stride: g.index_stride,
+                    table_item_stride: g.table_stride,
+                    table_f16: false,
+                    accumulate: g.accumulate,
+                    out_stride: g.out_stride,
+                    out_col0: g.out_col0,
+                },
+            )
         })
     }
 
-    fn rand(&mut self, seed: u32, out: &str, dims: (u32, u32, u32), stream: u32, normal: bool, scale: f32, offset: f32) -> Result<u32, String> {
+    fn rand(
+        &mut self,
+        seed: u32,
+        out: &str,
+        dims: (u32, u32, u32),
+        stream: u32,
+        normal: bool,
+        scale: f32,
+        offset: f32,
+    ) -> Result<u32, String> {
         self.op(&[seed], out, |p, output, deps| {
-            p.rand_f32(seed, deps, RandF32Stage {
-                output,
-                items: dims.0,
-                rows: dims.1,
-                width: dims.2,
-                stream,
-                stream_shift: 56,
-                a: if stream == 1 { RandCoord::Row } else { RandCoord::Column },
-                b: if stream == 1 { RandCoord::Column } else { RandCoord::Row },
-                a_offset: 0,
-                b_offset: 0,
-                normal,
-                shared_seed: false,
-                scale,
-                offset,
-            })
+            p.rand_f32(
+                seed,
+                deps,
+                RandF32Stage {
+                    output,
+                    items: dims.0,
+                    rows: dims.1,
+                    width: dims.2,
+                    stream,
+                    stream_shift: 56,
+                    a: if stream == 1 {
+                        RandCoord::Row
+                    } else {
+                        RandCoord::Column
+                    },
+                    b: if stream == 1 {
+                        RandCoord::Column
+                    } else {
+                        RandCoord::Row
+                    },
+                    a_offset: 0,
+                    b_offset: 0,
+                    normal,
+                    shared_seed: false,
+                    scale,
+                    offset,
+                },
+            )
         })
     }
 }
@@ -756,12 +1087,20 @@ impl Lowering<'_> {
 
     /// CFM rows per item.
     fn tc(&self) -> u32 {
-        if self.mode == Mode::Cached { PROMPT_TAIL_ROWS + self.gen() } else { self.t1() }
+        if self.mode == Mode::Cached {
+            PROMPT_TAIL_ROWS + self.gen()
+        } else {
+            self.t1()
+        }
     }
 
     /// The first generated mel row among the CFM rows.
     fn mel0(&self) -> u32 {
-        if self.mode == Mode::Cached { PROMPT_TAIL_ROWS } else { 2 * self.cfg.prompt }
+        if self.mode == Mode::Cached {
+            PROMPT_TAIL_ROWS
+        } else {
+            2 * self.cfg.prompt
+        }
     }
 
     /// Prompt mel rows whose attention K/V come from the voice cache.
@@ -788,8 +1127,28 @@ impl Lowering<'_> {
         let mut c = Conv::new(&qw, 1, r, D_ENC, D_ENC, 1);
         c.bias_name = Some(&qb);
         let q = o.conv(a, "act.s3gen.q", c)?;
-        let k = o.linear(a, "act.s3gen.k", &format!("{p}.k"), r, D_ENC, D_ENC, true, Activation::None, None)?;
-        let v = o.linear(a, "act.s3gen.v", &format!("{p}.v"), r, D_ENC, D_ENC, true, Activation::None, None)?;
+        let k = o.linear(
+            a,
+            "act.s3gen.k",
+            &format!("{p}.k"),
+            r,
+            D_ENC,
+            D_ENC,
+            true,
+            Activation::None,
+            None,
+        )?;
+        let v = o.linear(
+            a,
+            "act.s3gen.v",
+            &format!("{p}.v"),
+            r,
+            D_ENC,
+            D_ENC,
+            true,
+            Activation::None,
+            None,
+        )?;
         // Table rows per head, padded to a multiple of 4 (the grouped GEMM's column groups).
         let m = (2 * t - 1).next_multiple_of(4);
         let rel = format!("{p}.relpos.t{t}");
@@ -798,32 +1157,72 @@ impl Lowering<'_> {
         let bd = o.conv(q, "act.s3gen.bd", c)?;
         // Score (b*8 + h, r, j) adds bd[r][b*8 + h][t - 1 - r + j] (relative position r - j), read in
         // place by the attention, whose keys stop at the item's length.
-        let att = o.op(&[q, k, v, bd, lengths], "act.s3gen.att", |pp, output, deps| {
-            pp.attention_f32(q, k, v, deps, AttentionF32Stage {
-                output,
-                key_lengths: Some(lengths),
-                bias: Some(TensorRef::Handle(bd)),
-                batch: 1,
-                q_rows: t,
-                kv_rows: t,
-                heads: HEADS * b,
-                head_width: D_ENC / HEADS,
-                in_stride: 0,
-                k_col0: 0,
-                v_col0: 0,
-                causal: false,
-                scale: 1.0 / ((D_ENC / HEADS) as f32).sqrt(),
-                bias_head_stride: m,
-                relative: true,
-                key_length_heads: HEADS,
-                prefix: None,
-            })
-        })?;
+        let att = o.op(
+            &[q, k, v, bd, lengths],
+            "act.s3gen.att",
+            |pp, output, deps| {
+                pp.attention_f32(
+                    q,
+                    k,
+                    v,
+                    deps,
+                    AttentionF32Stage {
+                        output,
+                        key_lengths: Some(lengths),
+                        bias: Some(TensorRef::Handle(bd)),
+                        batch: 1,
+                        q_rows: t,
+                        kv_rows: t,
+                        heads: HEADS * b,
+                        head_width: D_ENC / HEADS,
+                        in_stride: 0,
+                        k_col0: 0,
+                        v_col0: 0,
+                        causal: false,
+                        scale: 1.0 / ((D_ENC / HEADS) as f32).sqrt(),
+                        bias_head_stride: m,
+                        relative: true,
+                        key_length_heads: HEADS,
+                        prefix: None,
+                    },
+                )
+            },
+        )?;
         let xn = o.name_of(x);
-        o.linear(att, &xn, &format!("{p}.out"), r, D_ENC, D_ENC, true, Activation::None, Some(x))?;
+        o.linear(
+            att,
+            &xn,
+            &format!("{p}.out"),
+            r,
+            D_ENC,
+            D_ENC,
+            true,
+            Activation::None,
+            Some(x),
+        )?;
         let a = o.layer_norm(x, "act.s3gen.a", &format!("{p}.ln_ff"), r, D_ENC, 1e-12)?;
-        let h = o.linear(a, "act.s3gen.ff", &format!("{p}.ff1"), r, D_ENC, 4 * D_ENC, true, Activation::Silu, None)?;
-        o.linear(h, &xn, &format!("{p}.ff2"), r, 4 * D_ENC, D_ENC, true, Activation::None, Some(x))?;
+        let h = o.linear(
+            a,
+            "act.s3gen.ff",
+            &format!("{p}.ff1"),
+            r,
+            D_ENC,
+            4 * D_ENC,
+            true,
+            Activation::Silu,
+            None,
+        )?;
+        o.linear(
+            h,
+            &xn,
+            &format!("{p}.ff2"),
+            r,
+            4 * D_ENC,
+            D_ENC,
+            true,
+            Activation::None,
+            Some(x),
+        )?;
         Ok(())
     }
 
@@ -842,19 +1241,77 @@ impl Lowering<'_> {
         let nv = cfg.voices.len() as u32;
         for k in 0..inp.lengths.all().len() {
             let table = format!("s3gen.len.{k}");
-            let g = Gather { rows: b, width: 1, vocab: inp.nmax + 1, per_item: 1, repeat: 1, index_stride: 1, ..Default::default() };
-            o.gather(Table::Weight(&table, inp.nmax + 1), Some(inp.count), &format!("act.s3gen.len.{k}"), g)?;
+            let g = Gather {
+                rows: b,
+                width: 1,
+                vocab: inp.nmax + 1,
+                per_item: 1,
+                repeat: 1,
+                index_stride: 1,
+                ..Default::default()
+            };
+            o.gather(
+                Table::Weight(&table, inp.nmax + 1),
+                Some(inp.count),
+                &format!("act.s3gen.len.{k}"),
+                g,
+            )?;
         }
         // Token ids [b][prompt | tokens] (u32 bit patterns moved by the f32 copy / gather).
         if n > 0 {
-            o.copy(inp.tokens, "act.s3gen.idx", (b, 1, n), (n, n, 0), (t0, t0, p))?;
+            o.copy(
+                inp.tokens,
+                "act.s3gen.idx",
+                (b, 1, n),
+                (n, n, 0),
+                (t0, t0, p),
+            )?;
         }
-        let idx = o.gather(Table::Weight("voice.prompt_token", nv), Some(inp.voice), "act.s3gen.idx", Gather { rows: b, width: p, vocab: nv, per_item: 1, repeat: 1, index_stride: 1, out_stride: t0, ..Default::default() })?;
-        let e0 = o.gather(Table::Weight("emb", cfg.vocab), Some(idx), "act.s3gen.e0", Gather { rows: b * t0, width: D_ENC, vocab: cfg.vocab, per_item: t0, repeat: 1, index_stride: t0, ..Default::default() })?;
-        let e1 = o.linear(e0, "act.s3gen.e1", "enc.embed", b * t0, D_ENC, D_ENC, true, Activation::None, None)?;
+        let idx = o.gather(
+            Table::Weight("voice.prompt_token", nv),
+            Some(inp.voice),
+            "act.s3gen.idx",
+            Gather {
+                rows: b,
+                width: p,
+                vocab: nv,
+                per_item: 1,
+                repeat: 1,
+                index_stride: 1,
+                out_stride: t0,
+                ..Default::default()
+            },
+        )?;
+        let e0 = o.gather(
+            Table::Weight("emb", cfg.vocab),
+            Some(idx),
+            "act.s3gen.e0",
+            Gather {
+                rows: b * t0,
+                width: D_ENC,
+                vocab: cfg.vocab,
+                per_item: t0,
+                repeat: 1,
+                index_stride: t0,
+                ..Default::default()
+            },
+        )?;
+        let e1 = o.linear(
+            e0,
+            "act.s3gen.e1",
+            "enc.embed",
+            b * t0,
+            D_ENC,
+            D_ENC,
+            true,
+            Activation::None,
+            None,
+        )?;
         let e0 = o.layer_norm(e1, "act.s3gen.e0", "enc.embed.ln", b * t0, D_ENC, 1e-5)?;
         // leaky(0.01) between the two pre-lookahead convs.
-        let leaky = o.fuse.between("w.enc.la1.w", "w.enc.la2.w", 3, ActAt::ProducerOutput);
+        let leaky = o
+            .fuse
+            .between("w.enc.la1.w", "w.enc.la2.w", 3, ActAt::ProducerOutput);
         let mut c = Conv::new("enc.la1", b, t0, D_ENC, D_ENC, 4);
         c.pad = (0, 3);
         if leaky != ActAt::ConsumerInput {
@@ -878,71 +1335,256 @@ impl Lowering<'_> {
         }
         let e2 = self.to_item_major(o, x, "act.s3gen.e2", t0, D_ENC)?;
         // Nearest x2, then a causal k5 convolution.
-        let e1 = o.gather(Table::Tensor(e2, b * t0), None, "act.s3gen.e1", Gather { rows: b * t1, width: D_ENC, vocab: t0, per_item: t1, repeat: 2, table_stride: t0, ..Default::default() })?;
+        let e1 = o.gather(
+            Table::Tensor(e2, b * t0),
+            None,
+            "act.s3gen.e1",
+            Gather {
+                rows: b * t1,
+                width: D_ENC,
+                vocab: t0,
+                per_item: t1,
+                repeat: 2,
+                table_stride: t0,
+                ..Default::default()
+            },
+        )?;
         let mut c = Conv::new("enc.up", b, t1, D_ENC, D_ENC, 5);
         c.pad = (4, 0);
         c.lengths = Some(inp.lengths.mel);
         let e0 = o.conv(e1, "act.s3gen.e0", c)?;
-        let e1 = o.linear(e0, "act.s3gen.e1", "enc.up_embed", b * t1, D_ENC, D_ENC, true, Activation::None, None)?;
+        let e1 = o.linear(
+            e0,
+            "act.s3gen.e1",
+            "enc.up_embed",
+            b * t1,
+            D_ENC,
+            D_ENC,
+            true,
+            Activation::None,
+            None,
+        )?;
         let e0 = o.layer_norm(e1, "act.s3gen.e0", "enc.up_embed.ln", b * t1, D_ENC, 1e-5)?;
         let x = self.to_time_major(o, e0, "act.s3gen.x", t1, D_ENC)?;
         for i in 0..ENC_LAYERS.1 {
             self.conformer(o, ENC_LAYERS.0 + i, x, t1, inp.lengths.mel)?;
         }
         let a = o.layer_norm(x, "act.s3gen.a", "enc.after_ln", t1 * b, D_ENC, 1e-5)?;
-        let mu = o.linear(a, "act.s3gen.mu", "enc.proj", t1 * b, D_ENC, MEL, true, Activation::None, None)?;
+        let mu = o.linear(
+            a,
+            "act.s3gen.mu",
+            "enc.proj",
+            t1 * b,
+            D_ENC,
+            MEL,
+            true,
+            Activation::None,
+            None,
+        )?;
         // Estimator input [2b][tc][x | mu | spks | cond] over the CFM rows (the last tc of t1);
         // the unconditional half's context is 0.
         let (w, tc) = (4 * MEL, self.tc());
-        o.copy(mu, "act.s3gen.x320", (b, tc, MEL), (MEL, b * MEL, (t1 - tc) * b * MEL), (tc * w, w, MEL))?;
-        o.gather(Table::Weight("voice.spks", nv), Some(inp.voice), "act.s3gen.x320", Gather { rows: b * tc, width: MEL, vocab: nv, per_item: tc, repeat: tc, index_stride: 1, out_stride: w, out_col0: 2 * MEL, ..Default::default() })?;
-        let zeros = o.gather(Table::Weight("const.zeros", 1), None, "act.s3gen.zeros", Gather { rows: 1, width: w, vocab: 1, per_item: 1, repeat: 1, ..Default::default() })?;
+        o.copy(
+            mu,
+            "act.s3gen.x320",
+            (b, tc, MEL),
+            (MEL, b * MEL, (t1 - tc) * b * MEL),
+            (tc * w, w, MEL),
+        )?;
+        o.gather(
+            Table::Weight("voice.spks", nv),
+            Some(inp.voice),
+            "act.s3gen.x320",
+            Gather {
+                rows: b * tc,
+                width: MEL,
+                vocab: nv,
+                per_item: tc,
+                repeat: tc,
+                index_stride: 1,
+                out_stride: w,
+                out_col0: 2 * MEL,
+                ..Default::default()
+            },
+        )?;
+        let zeros = o.gather(
+            Table::Weight("const.zeros", 1),
+            None,
+            "act.s3gen.zeros",
+            Gather {
+                rows: 1,
+                width: w,
+                vocab: 1,
+                per_item: 1,
+                repeat: 1,
+                ..Default::default()
+            },
+        )?;
         if self.mode == Mode::Cached {
             let r = PROMPT_TAIL_ROWS;
-            o.gather(Table::Weight("voice.prompt_tail", nv), Some(inp.voice), "act.s3gen.cond", Gather { rows: b, width: r * MEL, vocab: nv, per_item: 1, repeat: 1, index_stride: 1, out_stride: tc * MEL, ..Default::default() })?;
-            let cond = o.copy(zeros, "act.s3gen.cond", (b, tc - r, MEL), (0, 0, 0), (tc * MEL, MEL, r * MEL))?;
-            o.copy(cond, "act.s3gen.x320", (b, tc, MEL), (tc * MEL, MEL, 0), (tc * w, w, 3 * MEL))?;
+            o.gather(
+                Table::Weight("voice.prompt_tail", nv),
+                Some(inp.voice),
+                "act.s3gen.cond",
+                Gather {
+                    rows: b,
+                    width: r * MEL,
+                    vocab: nv,
+                    per_item: 1,
+                    repeat: 1,
+                    index_stride: 1,
+                    out_stride: tc * MEL,
+                    ..Default::default()
+                },
+            )?;
+            let cond = o.copy(
+                zeros,
+                "act.s3gen.cond",
+                (b, tc - r, MEL),
+                (0, 0, 0),
+                (tc * MEL, MEL, r * MEL),
+            )?;
+            o.copy(
+                cond,
+                "act.s3gen.x320",
+                (b, tc, MEL),
+                (tc * MEL, MEL, 0),
+                (tc * w, w, 3 * MEL),
+            )?;
         } else {
             let pf = 2 * p;
-            let cond = o.gather(Table::Weight("voice.prompt_feat", nv), Some(inp.voice), "act.s3gen.cond", Gather { rows: b, width: pf * MEL, vocab: nv, per_item: 1, repeat: 1, index_stride: 1, out_stride: t1 * MEL, ..Default::default() })?;
+            let cond = o.gather(
+                Table::Weight("voice.prompt_feat", nv),
+                Some(inp.voice),
+                "act.s3gen.cond",
+                Gather {
+                    rows: b,
+                    width: pf * MEL,
+                    vocab: nv,
+                    per_item: 1,
+                    repeat: 1,
+                    index_stride: 1,
+                    out_stride: t1 * MEL,
+                    ..Default::default()
+                },
+            )?;
             if t1 > pf {
-                o.copy(zeros, "act.s3gen.cond", (b, t1 - pf, MEL), (0, 0, 0), (t1 * MEL, MEL, pf * MEL))?;
+                o.copy(
+                    zeros,
+                    "act.s3gen.cond",
+                    (b, t1 - pf, MEL),
+                    (0, 0, 0),
+                    (t1 * MEL, MEL, pf * MEL),
+                )?;
             }
-            o.copy(cond, "act.s3gen.x320", (b, t1, MEL), (t1 * MEL, MEL, 0), (t1 * w, w, 3 * MEL))?;
+            o.copy(
+                cond,
+                "act.s3gen.x320",
+                (b, t1, MEL),
+                (t1 * MEL, MEL, 0),
+                (t1 * w, w, 3 * MEL),
+            )?;
         }
-        o.copy(zeros, "act.s3gen.x320", (1, b * tc, w), (0, 0, 0), (0, w, b * tc * w))?;
+        o.copy(
+            zeros,
+            "act.s3gen.x320",
+            (1, b * tc, w),
+            (0, 0, 0),
+            (0, w, b * tc * w),
+        )?;
         // CFM state x = z ~ N(0, 1) (stream 1, keyed by mel frame and bin).
         o.rand(inp.seed, "act.s3gen.xt", (b, tc, MEL), 1, true, 1.0, 0.0)?;
         // Guidance lengths (valid CFM rows): the unconditional half repeats the conditional one.
         if self.mode == Mode::Cached {
             for half in 0..2 {
-                let g = Gather { rows: b, width: 1, vocab: inp.nmax + 1, per_item: 1, repeat: 1, index_stride: 1, out_stride: 1, out_col0: half * b, ..Default::default() };
-                o.gather(Table::Weight("s3gen.len.cfm", inp.nmax + 1), Some(inp.count), "act.s3gen.len2", g)?;
+                let g = Gather {
+                    rows: b,
+                    width: 1,
+                    vocab: inp.nmax + 1,
+                    per_item: 1,
+                    repeat: 1,
+                    index_stride: 1,
+                    out_stride: 1,
+                    out_col0: half * b,
+                    ..Default::default()
+                };
+                o.gather(
+                    Table::Weight("s3gen.len.cfm", inp.nmax + 1),
+                    Some(inp.count),
+                    "act.s3gen.len2",
+                    g,
+                )?;
             }
         } else {
-            o.copy(inp.lengths.mel, "act.s3gen.len2", (1, 1, b), (0, 0, 0), (0, 0, 0))?;
-            o.copy(inp.lengths.mel, "act.s3gen.len2", (1, 1, b), (0, 0, 0), (0, 0, b))?;
+            o.copy(
+                inp.lengths.mel,
+                "act.s3gen.len2",
+                (1, 1, b),
+                (0, 0, 0),
+                (0, 0, 0),
+            )?;
+            o.copy(
+                inp.lengths.mel,
+                "act.s3gen.len2",
+                (1, 1, b),
+                (0, 0, 0),
+                (0, 0, b),
+            )?;
         }
         if self.mode == Mode::Cached {
             // Keys: the prompt's cached rows then the item's own, prompt + tokens mel rows in all.
-            o.copy(inp.lengths.mel, "act.s3gen.klen2", (1, 1, b), (0, 0, 0), (0, 0, 0))?;
-            o.copy(inp.lengths.mel, "act.s3gen.klen2", (1, 1, b), (0, 0, 0), (0, 0, b))?;
+            o.copy(
+                inp.lengths.mel,
+                "act.s3gen.klen2",
+                (1, 1, b),
+                (0, 0, 0),
+                (0, 0, 0),
+            )?;
+            o.copy(
+                inp.lengths.mel,
+                "act.s3gen.klen2",
+                (1, 1, b),
+                (0, 0, 0),
+                (0, 0, b),
+            )?;
             // Cache row of each guidance item: 2 * voice (+ 1 for the unconditional half).
             for half in 0..2 {
-                let g = Gather { rows: b, width: 1, vocab: nv, per_item: 1, repeat: 1, index_stride: 1, out_stride: 1, out_col0: half * b, ..Default::default() };
-                o.gather(Table::Weight(&format!("s3gen.kvidx.{half}"), nv), Some(inp.voice), "act.s3gen.kvidx", g)?;
+                let g = Gather {
+                    rows: b,
+                    width: 1,
+                    vocab: nv,
+                    per_item: 1,
+                    repeat: 1,
+                    index_stride: 1,
+                    out_stride: 1,
+                    out_col0: half * b,
+                    ..Default::default()
+                };
+                o.gather(
+                    Table::Weight(&format!("s3gen.kvidx.{half}"), nv),
+                    Some(inp.voice),
+                    "act.s3gen.kvidx",
+                    g,
+                )?;
             }
         }
         Ok(())
     }
-
 
     fn len2(o: &Ops) -> u32 {
         o.names["act.s3gen.len2"]
     }
 
     /// CausalResnetBlock1D `j` of Euler step `step` on `x` (`cin` channels) into `out`.
-    fn resnet(&self, o: &mut Ops, step: usize, j: u32, x: u32, cin: u32, out: &str) -> Result<u32, String> {
+    fn resnet(
+        &self,
+        o: &mut Ops,
+        step: usize,
+        j: u32,
+        x: u32,
+        cin: u32,
+        out: &str,
+    ) -> Result<u32, String> {
         let (b2, t1) = (2 * self.b, self.tc());
         let (r, len2) = (b2 * t1, Self::len2(o));
         let p = format!("cfm.r{j}");
@@ -952,12 +1594,30 @@ impl Lowering<'_> {
         c.lengths = Some(len2);
         let y1 = o.conv(x, "act.s3gen.y1", c)?;
         let tv = format!("cfm.tvec.s{step}.r{j}");
-        o.layer_norm_act(y1, "act.s3gen.y1", &format!("{p}.ln1"), r, D_CFM, 1e-5, Activation::Mish, Some(&tv))?;
+        o.layer_norm_act(
+            y1,
+            "act.s3gen.y1",
+            &format!("{p}.ln1"),
+            r,
+            D_CFM,
+            1e-5,
+            Activation::Mish,
+            Some(&tv),
+        )?;
         let mut c = Conv::new(&c2, b2, t1, D_CFM, D_CFM, 3);
         c.pad = (2, 0);
         c.lengths = Some(len2);
         let y2 = o.conv(y1, "act.s3gen.y2", c)?;
-        o.layer_norm_act(y2, "act.s3gen.y2", &format!("{p}.ln2"), r, D_CFM, 1e-5, Activation::Mish, None)?;
+        o.layer_norm_act(
+            y2,
+            "act.s3gen.y2",
+            &format!("{p}.ln2"),
+            r,
+            D_CFM,
+            1e-5,
+            Activation::Mish,
+            None,
+        )?;
         let mut c = Conv::new(&res, b2, t1, cin, D_CFM, 1);
         c.lengths = Some(len2);
         c.residual = Some(y2);
@@ -972,26 +1632,97 @@ impl Lowering<'_> {
         let p = format!("cfm.tb{k}");
         let hn = o.name_of(h);
         let a = o.layer_norm(h, "act.s3gen.a", &format!("{p}.ln1"), r, D_CFM, 1e-5)?;
-        let qkv = o.linear(a, "act.s3gen.qkv", &format!("{p}.qkv"), r, D_CFM, 3 * inner, false, Activation::None, None)?;
+        let qkv = o.linear(
+            a,
+            "act.s3gen.qkv",
+            &format!("{p}.qkv"),
+            r,
+            D_CFM,
+            3 * inner,
+            false,
+            Activation::None,
+            None,
+        )?;
         let (pp, nv2) = (self.cached_rows(), 2 * self.cfg.voices.len() as u32);
         let cache = kv_cache(step, k);
         if let Mode::Prefill(v) = self.mode {
             // Both guidance halves' cached prompt rows (K | V columns) into blocks 2v, 2v + 1.
             if self.cfg.attn_h16 {
-                let block = u32::try_from(h16_prefix_floats(HEADS, pp)).map_err(|_| "s3gen voice cache overflows")?;
-                o.format_prefix(qkv, &cache, (2, pp, 2 * inner), (t1 * 3 * inner, 3 * inner, inner), (block, 2 * v * block))?;
+                let block = u32::try_from(h16_prefix_floats(HEADS, pp))
+                    .map_err(|_| "s3gen voice cache overflows")?;
+                o.format_prefix(
+                    qkv,
+                    &cache,
+                    (2, pp, 2 * inner),
+                    (t1 * 3 * inner, 3 * inner, inner),
+                    (block, 2 * v * block),
+                )?;
             } else {
                 let row = pp * 2 * inner;
-                o.copy(qkv, &cache, (2, pp, 2 * inner), (t1 * 3 * inner, 3 * inner, inner), (row, 2 * inner, 2 * v * row))?;
+                o.copy(
+                    qkv,
+                    &cache,
+                    (2, pp, 2 * inner),
+                    (t1 * 3 * inner, 3 * inner, inner),
+                    (row, 2 * inner, 2 * v * row),
+                )?;
             }
         }
         if self.mode == Mode::Cached {
             // Keys: the voice's cached prompt rows (block kvidx[item]), then the item's own.
-            let (table, idx, klen) = (o.names[cache.as_str()], o.names["act.s3gen.kvidx"], o.names["act.s3gen.klen2"]);
-            let att = o.op(&[qkv, klen, table, idx], "act.s3gen.att", |pp_, output, deps| {
-                pp_.attention_f32(qkv, qkv, qkv, deps, AttentionF32Stage {
+            let (table, idx, klen) = (
+                o.names[cache.as_str()],
+                o.names["act.s3gen.kvidx"],
+                o.names["act.s3gen.klen2"],
+            );
+            let att = o.op(
+                &[qkv, klen, table, idx],
+                "act.s3gen.att",
+                |pp_, output, deps| {
+                    pp_.attention_f32(
+                        qkv,
+                        qkv,
+                        qkv,
+                        deps,
+                        AttentionF32Stage {
+                            output,
+                            key_lengths: Some(klen),
+                            bias: None,
+                            batch: b2,
+                            q_rows: t1,
+                            kv_rows: t1,
+                            heads: HEADS,
+                            head_width: 64,
+                            in_stride: 3 * inner,
+                            k_col0: inner,
+                            v_col0: 2 * inner,
+                            causal: false,
+                            scale: 0.125,
+                            bias_head_stride: 0,
+                            relative: false,
+                            key_length_heads: 0,
+                            prefix: Some(AttentionPrefix {
+                                table,
+                                index: idx,
+                                blocks: nv2,
+                                rows: pp,
+                                h16: self.cfg.attn_h16,
+                            }),
+                        },
+                    )
+                },
+            )?;
+            return self.tblock_tail(o, &p, att, h, &hn, r);
+        }
+        let att = o.op(&[qkv, len2], "act.s3gen.att", |pp, output, deps| {
+            pp.attention_f32(
+                qkv,
+                qkv,
+                qkv,
+                deps,
+                AttentionF32Stage {
                     output,
-                    key_lengths: Some(klen),
+                    key_lengths: Some(len2),
                     bias: None,
                     batch: b2,
                     q_rows: t1,
@@ -1006,42 +1737,58 @@ impl Lowering<'_> {
                     bias_head_stride: 0,
                     relative: false,
                     key_length_heads: 0,
-                    prefix: Some(AttentionPrefix { table, index: idx, blocks: nv2, rows: pp, h16: self.cfg.attn_h16 }),
-                })
-            })?;
-            return self.tblock_tail(o, &p, att, h, &hn, r);
-        }
-        let att = o.op(&[qkv, len2], "act.s3gen.att", |pp, output, deps| {
-            pp.attention_f32(qkv, qkv, qkv, deps, AttentionF32Stage {
-                output,
-                key_lengths: Some(len2),
-                bias: None,
-                batch: b2,
-                q_rows: t1,
-                kv_rows: t1,
-                heads: HEADS,
-                head_width: 64,
-                in_stride: 3 * inner,
-                k_col0: inner,
-                v_col0: 2 * inner,
-                causal: false,
-                scale: 0.125,
-                bias_head_stride: 0,
-                relative: false,
-                key_length_heads: 0,
-                prefix: None,
-            })
+                    prefix: None,
+                },
+            )
         })?;
         self.tblock_tail(o, &p, att, h, &hn, r)
     }
 
     /// Attention output projection and feed-forward of block `p`, in place on `h`.
-    fn tblock_tail(&self, o: &mut Ops, p: &str, att: u32, h: u32, hn: &str, r: u32) -> Result<(), String> {
+    fn tblock_tail(
+        &self,
+        o: &mut Ops,
+        p: &str,
+        att: u32,
+        h: u32,
+        hn: &str,
+        r: u32,
+    ) -> Result<(), String> {
         let inner = HEADS * 64;
-        o.linear(att, hn, &format!("{p}.out"), r, inner, D_CFM, true, Activation::None, Some(h))?;
+        o.linear(
+            att,
+            hn,
+            &format!("{p}.out"),
+            r,
+            inner,
+            D_CFM,
+            true,
+            Activation::None,
+            Some(h),
+        )?;
         let a = o.layer_norm(h, "act.s3gen.a", &format!("{p}.ln3"), r, D_CFM, 1e-5)?;
-        let f = o.linear(a, "act.s3gen.ff", &format!("{p}.ff1"), r, D_CFM, 4 * D_CFM, true, Activation::GeluErf, None)?;
-        o.linear(f, hn, &format!("{p}.ff2"), r, 4 * D_CFM, D_CFM, true, Activation::None, Some(h))?;
+        let f = o.linear(
+            a,
+            "act.s3gen.ff",
+            &format!("{p}.ff1"),
+            r,
+            D_CFM,
+            4 * D_CFM,
+            true,
+            Activation::GeluErf,
+            None,
+        )?;
+        o.linear(
+            f,
+            hn,
+            &format!("{p}.ff2"),
+            r,
+            4 * D_CFM,
+            D_CFM,
+            true,
+            Activation::None,
+            Some(h),
+        )?;
         Ok(())
     }
 
@@ -1049,12 +1796,24 @@ impl Lowering<'_> {
     /// `x += dt * ((1 + cfg) v_cond - cfg v_uncond)`: the first starts from the state, each runs its
     /// share of the mid blocks, the last ends with the update. `h` carries the hidden state's
     /// tensor between parts.
-    fn cfm_part(&self, o: &mut Ops, step: usize, part: u32, h: &std::cell::Cell<u32>) -> Result<(), String> {
+    fn cfm_part(
+        &self,
+        o: &mut Ops,
+        step: usize,
+        part: u32,
+        h: &std::cell::Cell<u32>,
+    ) -> Result<(), String> {
         let (b, t1) = (self.b, self.tc());
         let (b2, r, w) = (2 * b, 2 * b * t1, 4 * MEL);
         let len2 = Self::len2(o);
         let xt = o.names["act.s3gen.xt"];
-        let other = |o: &Ops, h: u32| if o.name_of(h) == "act.s3gen.h0" { "act.s3gen.h1" } else { "act.s3gen.h0" };
+        let other = |o: &Ops, h: u32| {
+            if o.name_of(h) == "act.s3gen.h0" {
+                "act.s3gen.h1"
+            } else {
+                "act.s3gen.h0"
+            }
+        };
         let causal = |w: &'static str, x: u32, o: &mut Ops, out: &str| -> Result<u32, String> {
             let mut c = Conv::new(w, b2, t1, D_CFM, D_CFM, 3);
             c.pad = (2, 0);
@@ -1062,13 +1821,31 @@ impl Lowering<'_> {
             o.conv(x, out, c)
         };
         if part == 0 {
-            o.copy(xt, "act.s3gen.x320", (b, t1, MEL), (t1 * MEL, MEL, 0), (t1 * w, w, 0))?;
-            let x320 = o.copy(xt, "act.s3gen.x320", (b, t1, MEL), (t1 * MEL, MEL, 0), (t1 * w, w, b * t1 * w))?;
+            o.copy(
+                xt,
+                "act.s3gen.x320",
+                (b, t1, MEL),
+                (t1 * MEL, MEL, 0),
+                (t1 * w, w, 0),
+            )?;
+            let x320 = o.copy(
+                xt,
+                "act.s3gen.x320",
+                (b, t1, MEL),
+                (t1 * MEL, MEL, 0),
+                (t1 * w, w, b * t1 * w),
+            )?;
             let x = self.resnet(o, step, 0, x320, w, "act.s3gen.h0")?;
             for i in 0..TBLOCKS {
                 self.tblock(o, step, i, x)?;
             }
-            o.copy(x, "act.s3gen.cat", (1, r, D_CFM), (0, D_CFM, 0), (0, 2 * D_CFM, D_CFM))?;
+            o.copy(
+                x,
+                "act.s3gen.cat",
+                (1, r, D_CFM),
+                (0, D_CFM, 0),
+                (0, 2 * D_CFM, D_CFM),
+            )?;
             h.set(causal("cfm.down", x, o, "act.s3gen.h1")?);
         }
         for j in MID_BLOCKS * part / CFM_PARTS + 1..=MID_BLOCKS * (part + 1) / CFM_PARTS {
@@ -1082,7 +1859,13 @@ impl Lowering<'_> {
             return Ok(());
         }
         let mut h = h.get();
-        let cat = o.copy(h, "act.s3gen.cat", (1, r, D_CFM), (0, D_CFM, 0), (0, 2 * D_CFM, 0))?;
+        let cat = o.copy(
+            h,
+            "act.s3gen.cat",
+            (1, r, D_CFM),
+            (0, D_CFM, 0),
+            (0, 2 * D_CFM, 0),
+        )?;
         let out = other(o, h);
         h = self.resnet(o, step, MID_BLOCKS + 1, cat, 2 * D_CFM, out)?;
         for i in 0..TBLOCKS {
@@ -1099,9 +1882,24 @@ impl Lowering<'_> {
         let d = o.conv(y, "act.s3gen.d", c)?;
         let rows = b * t1;
         let cfg = self.cfg.cfg_rate;
-        let du = o.copy(d, "act.s3gen.du", (1, rows, MEL), (0, MEL, rows * MEL), (0, MEL, 0))?;
+        let du = o.copy(
+            d,
+            "act.s3gen.du",
+            (1, rows, MEL),
+            (0, MEL, rows * MEL),
+            (0, MEL, 0),
+        )?;
         o.unary(du, rows, MEL, 0, 0, Activation::ScaleShift, cfg as f32, 0.0)?;
-        o.unary(d, rows, MEL, 0, 0, Activation::ScaleShift, (1.0 + cfg) as f32, 0.0)?;
+        o.unary(
+            d,
+            rows,
+            MEL,
+            0,
+            0,
+            Activation::ScaleShift,
+            (1.0 + cfg) as f32,
+            0.0,
+        )?;
         o.binary(d, du, BinaryOp::Sub, (1, rows, MEL), (0, MEL, 1), None)?;
         let dt = self.cfg.t_span[step + 1] - self.cfg.t_span[step];
         o.unary(d, rows, MEL, 0, 0, Activation::ScaleShift, dt, 0.0)?;
@@ -1111,25 +1909,45 @@ impl Lowering<'_> {
 
     /// HiFT ResBlock: for each dilation `x += conv2(snake(conv1(snake(x))))`; the result lands in `out`.
     #[allow(clippy::too_many_arguments)]
-    fn resblock(&self, o: &mut Ops, pre: &str, x: u32, out: &str, k: u32, dils: &[u32], ch: u32, rows: u32, len: u32) -> Result<u32, String> {
+    fn resblock(
+        &self,
+        o: &mut Ops,
+        pre: &str,
+        x: u32,
+        out: &str,
+        k: u32,
+        dils: &[u32],
+        ch: u32,
+        rows: u32,
+        len: u32,
+    ) -> Result<u32, String> {
         let mut cur = x;
         for (j, &d) in dils.iter().enumerate() {
-            let (c1, a1, c2, a2) = (format!("{pre}.d{j}.c1"), format!("{pre}.d{j}.a1"), format!("{pre}.d{j}.c2"), format!("{pre}.d{j}.a2"));
+            let (c1, a1, c2, a2) = (
+                format!("{pre}.d{j}.c1"),
+                format!("{pre}.d{j}.a1"),
+                format!("{pre}.d{j}.c2"),
+                format!("{pre}.d{j}.a2"),
+            );
             // snake(cur) in one pass (cur stays the residual); conv1 applies conv2's snake as its
             // output activation, so conv2 reads its input as is.
             let a1n = format!("w.{a1}");
             let pre = o.op(&[cur], "act.s3gen.pre", |p, output, deps| {
-                p.unary_f32(cur, deps, UnaryF32Stage {
-                    output,
-                    param: Some(TensorRef::Named(&a1n)),
-                    rows: self.b * rows,
-                    width: ch,
-                    stride: 0,
-                    col0: 0,
-                    kind: Activation::Snake,
-                    p0: 0.0,
-                    p1: 0.0,
-                })
+                p.unary_f32(
+                    cur,
+                    deps,
+                    UnaryF32Stage {
+                        output,
+                        param: Some(TensorRef::Named(&a1n)),
+                        rows: self.b * rows,
+                        width: ch,
+                        stride: 0,
+                        col0: 0,
+                        kind: Activation::Snake,
+                        p0: 0.0,
+                        p1: 0.0,
+                    },
+                )
             })?;
             let mut c = Conv::new(&c1, self.b, rows, ch, ch, k);
             c.dil = d;
@@ -1161,7 +1979,13 @@ impl Lowering<'_> {
         let f = rows_out[2];
         let (lg, lf, lw) = (inp.lengths.gen, inp.lengths.stage[2], inp.lengths.wav);
         let xt = o.names["act.s3gen.xt"];
-        let mel = o.copy(xt, "act.s3gen.mel", (b, g, MEL), (tc * MEL, MEL, self.mel0() * MEL), (g * MEL, MEL, 0))?;
+        let mel = o.copy(
+            xt,
+            "act.s3gen.mel",
+            (b, g, MEL),
+            (tc * MEL, MEL, self.mel0() * MEL),
+            (g * MEL, MEL, 0),
+        )?;
         // F0 predictor.
         let mut v = mel;
         let mut cin = MEL;
@@ -1170,7 +1994,12 @@ impl Lowering<'_> {
             let w = format!("hift.f0.c{i}");
             // ELU after each conv; the last one's only candidate host is this conv.
             let elu = if i + 1 < F0_CONVS {
-                o.fuse.between(&format!("w.{w}.w"), &format!("w.hift.f0.c{}.w", i + 1), 3, ActAt::ProducerOutput)
+                o.fuse.between(
+                    &format!("w.{w}.w"),
+                    &format!("w.hift.f0.c{}.w", i + 1),
+                    3,
+                    ActAt::ProducerOutput,
+                )
             } else {
                 ActAt::ProducerOutput
             };
@@ -1183,7 +2012,15 @@ impl Lowering<'_> {
                 c.act_out = Activation::Elu;
             }
             c.lengths = Some(lg);
-            v = o.conv(v, if i % 2 == 0 { "act.s3gen.va" } else { "act.s3gen.vb" }, c)?;
+            v = o.conv(
+                v,
+                if i % 2 == 0 {
+                    "act.s3gen.va"
+                } else {
+                    "act.s3gen.vb"
+                },
+                c,
+            )?;
             elu_in = elu == ActAt::ConsumerInput;
             cin = 512;
         }
@@ -1195,47 +2032,125 @@ impl Lowering<'_> {
         // initial phases (stream 2, harmonic 0 at 0) and noise (stream 3); voiced where F0 > 10.
         let fs = cfg.frame_samples();
         let nh = cfg.harmonics;
-        let f0up = o.gather(Table::Tensor(f0, b * g), None, "act.s3gen.f0up", Gather { rows: b * wav, width: 1, vocab: g, per_item: wav, repeat: fs, table_stride: g, ..Default::default() })?;
-        let uv = o.unary_to(f0, "act.s3gen.uv", b * g, 1, 0, 0, Activation::ScaleShift, 1.0, -cfg.voiced_threshold)?;
+        let f0up = o.gather(
+            Table::Tensor(f0, b * g),
+            None,
+            "act.s3gen.f0up",
+            Gather {
+                rows: b * wav,
+                width: 1,
+                vocab: g,
+                per_item: wav,
+                repeat: fs,
+                table_stride: g,
+                ..Default::default()
+            },
+        )?;
+        let uv = o.unary_to(
+            f0,
+            "act.s3gen.uv",
+            b * g,
+            1,
+            0,
+            0,
+            Activation::ScaleShift,
+            1.0,
+            -cfg.voiced_threshold,
+        )?;
         o.unary(uv, b * g, 1, 0, 0, Activation::ScaleShift, 1e30, 0.0)?;
         o.unary(uv, b * g, 1, 0, 0, Activation::Clamp, 0.0, 1.0)?;
         let third = cfg.sine_amp / 3.0;
-        let amp = o.unary_to(uv, "act.s3gen.amp", b * g, 1, 0, 0, Activation::ScaleShift, cfg.noise_std - third, third)?;
+        let amp = o.unary_to(
+            uv,
+            "act.s3gen.amp",
+            b * g,
+            1,
+            0,
+            0,
+            Activation::ScaleShift,
+            cfg.noise_std - third,
+            third,
+        )?;
         let (_, per_sample) = harmonic_scale(cfg.sampling_rate);
         let sine = o.op(&[f0up, lw], "act.s3gen.sine", |pp, output, deps| {
-            pp.cumsum_f64(f0up, deps, CumSumF64Stage {
-                output,
-                column_scale: Some(TensorRef::Named("w.s3gen.harm")),
-                lengths: Some(lw),
-                items: b,
-                rows: wav,
-                width: nh,
-                x_width: 1,
-                exclusive: false,
-                wrap: true,
-                f64_output: false,
-                scale: per_sample,
-                post_scale: std::f32::consts::TAU,
-            })
+            pp.cumsum_f64(
+                f0up,
+                deps,
+                CumSumF64Stage {
+                    output,
+                    column_scale: Some(TensorRef::Named("w.s3gen.harm")),
+                    lengths: Some(lw),
+                    items: b,
+                    rows: wav,
+                    width: nh,
+                    x_width: 1,
+                    exclusive: false,
+                    wrap: true,
+                    f64_output: false,
+                    scale: per_sample,
+                    post_scale: std::f32::consts::TAU,
+                },
+            )
         })?;
         if self.mode == Mode::Cached {
             // A window continues its stream's source: phase = the host's phase at sample `seam`
             // plus the window's own increments from there; the phase at `next_seam` goes back.
-            let at = Gather { rows: b, width: nh, vocab: wav, per_item: 1, repeat: 1, index_stride: 1, table_stride: wav, ..Default::default() };
-            let c0 = o.gather(Table::Tensor(sine, b * wav), Some(inp.seam), "act.s3gen.pv", at)?;
+            let at = Gather {
+                rows: b,
+                width: nh,
+                vocab: wav,
+                per_item: 1,
+                repeat: 1,
+                index_stride: 1,
+                table_stride: wav,
+                ..Default::default()
+            };
+            let c0 = o.gather(
+                Table::Tensor(sine, b * wav),
+                Some(inp.seam),
+                "act.s3gen.pv",
+                at,
+            )?;
             o.binary(c0, inp.phase, BinaryOp::Sub, (1, b, nh), (0, nh, 1), None)?;
             o.binary(sine, c0, BinaryOp::Sub, (b, wav, nh), (nh, 0, 1), None)?;
-            o.gather(Table::Tensor(sine, b * wav), Some(inp.next_seam), "act.s3gen.phase_out", at)?;
+            o.gather(
+                Table::Tensor(sine, b * wav),
+                Some(inp.next_seam),
+                "act.s3gen.phase_out",
+                at,
+            )?;
         } else {
-            let pv = o.rand(inp.seed, "act.s3gen.pv", (b, 1, nh), 2, false, std::f32::consts::TAU, -0.5)?;
+            let pv = o.rand(
+                inp.seed,
+                "act.s3gen.pv",
+                (b, 1, nh),
+                2,
+                false,
+                std::f32::consts::TAU,
+                -0.5,
+            )?;
             o.unary(pv, b, 1, nh, 0, Activation::ScaleShift, 0.0, 0.0)?;
             o.binary(sine, pv, BinaryOp::Add, (b, wav, nh), (nh, 0, 1), None)?;
         }
         o.unary(sine, b * wav, nh, 0, 0, Activation::Sin, 0.0, 0.0)?;
-        o.binary(sine, uv, BinaryOp::Mul, (b * g, fs, nh), (1, 0, 0), Some(cfg.sine_amp))?;
+        o.binary(
+            sine,
+            uv,
+            BinaryOp::Mul,
+            (b * g, fs, nh),
+            (1, 0, 0),
+            Some(cfg.sine_amp),
+        )?;
         let noise = o.rand(inp.seed, "act.s3gen.noise", (b, wav, nh), 3, true, 1.0, 0.0)?;
         o.binary(noise, amp, BinaryOp::Mul, (b * g, fs, nh), (1, 0, 0), None)?;
-        o.binary(sine, noise, BinaryOp::Add, (1, b * wav, nh), (0, nh, 1), None)?;
+        o.binary(
+            sine,
+            noise,
+            BinaryOp::Add,
+            (1, b * wav, nh),
+            (0, nh, 1),
+            None,
+        )?;
         let mut c = Conv::new("hift.src", b, wav, nh, 1, 1);
         c.act_out = Activation::Tanh;
         c.lengths = Some(lw);
@@ -1251,7 +2166,12 @@ impl Lowering<'_> {
         let stft = o.conv(src, "act.s3gen.stft", c)?;
         // Mel -> waveform.
         // leaky(0.1) between the pre conv and the first upsampling.
-        let leaky0 = o.fuse.between("w.hift.pre.w", "w.hift.up0.w", cfg.upsample[0][1], ActAt::ConsumerInput);
+        let leaky0 = o.fuse.between(
+            "w.hift.pre.w",
+            "w.hift.up0.w",
+            cfg.upsample[0][1],
+            ActAt::ConsumerInput,
+        );
         let mut c = Conv::new("hift.pre", b, g, MEL, 512, 7);
         c.pad = (3, 3);
         if leaky0 != ActAt::ConsumerInput {
@@ -1275,7 +2195,17 @@ impl Lowering<'_> {
             c.lengths = Some(lf);
             let sd = o.conv(stft, "act.s3gen.sd", c)?;
             let (rk, dils) = &cfg.source_resblocks[i];
-            let si = self.resblock(o, &format!("hift.sr{i}"), sd, "act.s3gen.si", *rk, dils, co, rows, len)?;
+            let si = self.resblock(
+                o,
+                &format!("hift.sr{i}"),
+                sd,
+                "act.s3gen.si",
+                *rk,
+                dils,
+                co,
+                rows,
+                len,
+            )?;
             // leaky-ReLU 0.1 -> ConvTranspose; the last stage is reflection-padded by one frame on
             // the left: crop one frame less there and copy frame 2 over frame 0.
             let last = i == 2;
@@ -1293,18 +2223,45 @@ impl Lowering<'_> {
             c.residual = (!last).then_some(si);
             let xu = o.conv(x, "act.s3gen.xu", c)?;
             if last {
-                o.copy(xu, "act.s3gen.xu", (b, 1, co), (rows * co, co, 2 * co), (rows * co, co, 0))?;
+                o.copy(
+                    xu,
+                    "act.s3gen.xu",
+                    (b, 1, co),
+                    (rows * co, co, 2 * co),
+                    (rows * co, co, 0),
+                )?;
                 o.binary(xu, si, BinaryOp::Add, (1, b * rows, co), (0, co, 1), None)?;
             }
             let mut acc = 0;
             for j in 0..3 {
                 let (rk, dils) = &cfg.resblocks[3 * i + j];
-                let out = if j == 0 { "act.s3gen.acc" } else { "act.s3gen.rbo" };
-                let y = self.resblock(o, &format!("hift.rb{}", 3 * i + j), xu, out, *rk, dils, co, rows, len)?;
+                let out = if j == 0 {
+                    "act.s3gen.acc"
+                } else {
+                    "act.s3gen.rbo"
+                };
+                let y = self.resblock(
+                    o,
+                    &format!("hift.rb{}", 3 * i + j),
+                    xu,
+                    out,
+                    *rk,
+                    dils,
+                    co,
+                    rows,
+                    len,
+                )?;
                 if j == 0 {
                     acc = y;
                 } else {
-                    o.binary(acc, y, BinaryOp::Add, (1, b * rows, co), (0, co, 1), (j == 2).then_some(1.0 / 3.0))?;
+                    o.binary(
+                        acc,
+                        y,
+                        BinaryOp::Add,
+                        (1, b * rows, co),
+                        (0, co, 1),
+                        (j == 2).then_some(1.0 / 3.0),
+                    )?;
                 }
             }
             x = acc;
@@ -1322,7 +2279,13 @@ impl Lowering<'_> {
         o.unary(post, b * f, nb, spec, 0, Activation::Exp, 0.0, 0.0)?;
         o.unary(post, b * f, nb, spec, 0, Activation::Clamp, f32::MIN, 100.0)?;
         o.unary(post, b * f, nb, spec, nb, Activation::Sin, 0.0, 0.0)?;
-        let ri = o.copy(post, "act.s3gen.ri", (b * f, 2, nb), (spec, 0, nb), (spec, nb, 0))?;
+        let ri = o.copy(
+            post,
+            "act.s3gen.ri",
+            (b * f, 2, nb),
+            (spec, 0, nb),
+            (spec, nb, 0),
+        )?;
         o.unary(ri, b * f, nb, spec, 0, Activation::Cos, 0.0, 0.0)?;
         o.unary(ri, b * f, nb, spec, nb, Activation::Sin, 0.0, 0.0)?;
         o.binary(ri, post, BinaryOp::Mul, (b * f, 2, nb), (spec, 0, 1), None)?;
@@ -1337,16 +2300,61 @@ impl Lowering<'_> {
             c
         };
         let pcm = o.conv(ri, "act.s3gen.pcm", synth("hift.istft", spec))?;
-        let ones = o.gather(Table::Weight("const.one", 1), None, "act.s3gen.ones", Gather { rows: b * f, width: 1, vocab: 1, per_item: f, repeat: f, ..Default::default() })?;
+        let ones = o.gather(
+            Table::Weight("const.one", 1),
+            None,
+            "act.s3gen.ones",
+            Gather {
+                rows: b * f,
+                width: 1,
+                vocab: 1,
+                per_item: f,
+                repeat: f,
+                ..Default::default()
+            },
+        )?;
         let env = o.conv(ones, "act.s3gen.env", synth("hift.env", 1))?;
         o.unary(env, b * wav, 1, 0, 0, Activation::Clamp, 1e-11, f32::MAX)?;
         o.binary(pcm, env, BinaryOp::Div, (1, b * wav, 1), (0, 1, 0), None)?;
-        o.unary(pcm, b * wav, 1, 0, 0, Activation::Clamp, -cfg.audio_limit, cfg.audio_limit)?;
+        o.unary(
+            pcm,
+            b * wav,
+            1,
+            0,
+            0,
+            Activation::Clamp,
+            -cfg.audio_limit,
+            cfg.audio_limit,
+        )?;
         let trim = cfg.trim;
-        let fade = o.copy(pcm, "act.s3gen.fade", (b, 1, trim), (wav, 0, 0), (trim, 0, 0))?;
-        let window = o.gather(Table::Weight("hift.fade", 1), None, "act.s3gen.fadew", Gather { rows: 1, width: trim, vocab: 1, per_item: 1, repeat: 1, ..Default::default() })?;
+        let fade = o.copy(
+            pcm,
+            "act.s3gen.fade",
+            (b, 1, trim),
+            (wav, 0, 0),
+            (trim, 0, 0),
+        )?;
+        let window = o.gather(
+            Table::Weight("hift.fade", 1),
+            None,
+            "act.s3gen.fadew",
+            Gather {
+                rows: 1,
+                width: trim,
+                vocab: 1,
+                per_item: 1,
+                repeat: 1,
+                ..Default::default()
+            },
+        )?;
         o.binary(fade, window, BinaryOp::Mul, (b, 1, trim), (0, 0, 1), None)?;
-        o.copy(fade, "act.s3gen.pcm", (b, 1, trim), (trim, 0, 0), (wav, 0, 0))?;
+        o.copy(
+            fade,
+            "act.s3gen.pcm",
+            (b, 1, trim),
+            (trim, 0, 0),
+            (wav, 0, 0),
+        )?;
         Ok(())
     }
 }
@@ -1402,7 +2410,10 @@ impl Derived<'_> {
             if dtype != "F32" {
                 return Err(format!("{name}: {dtype}, expected F32"));
             }
-            let v = bytes.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+            let v = bytes
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect();
             self.cache.insert(name.to_string(), v);
         }
         Ok(&self.cache[name])
@@ -1414,38 +2425,80 @@ impl Derived<'_> {
             "const.zeros" => return Ok(le_bytes(&[0.0; 4 * MEL as usize])),
             "s3gen.harm" => {
                 let (a, _) = harmonic_scale(self.cfg.sampling_rate);
-                return Ok(le_bytes(&(1..=self.cfg.harmonics).map(|i| i as f32 * a).collect::<Vec<_>>()));
+                return Ok(le_bytes(
+                    &(1..=self.cfg.harmonics)
+                        .map(|i| i as f32 * a)
+                        .collect::<Vec<_>>(),
+                ));
             }
             "voice.prompt_tail" => {
-                let (pf, r) = (2 * self.cfg.prompt as usize * MEL as usize, (PROMPT_TAIL_ROWS * MEL) as usize);
+                let (pf, r) = (
+                    2 * self.cfg.prompt as usize * MEL as usize,
+                    (PROMPT_TAIL_ROWS * MEL) as usize,
+                );
                 let feat = self.f32s("voice.prompt_feat")?;
-                return Ok(feat.chunks_exact(pf).flat_map(|v| le_bytes(&v[pf - r..])).collect());
+                return Ok(feat
+                    .chunks_exact(pf)
+                    .flat_map(|v| le_bytes(&v[pf - r..]))
+                    .collect());
             }
-            "s3gen.len.cfm" => return Ok((0..=self.nmax).flat_map(|n| (2 * n + PROMPT_TAIL_ROWS).to_le_bytes()).collect()),
+            "s3gen.len.cfm" => {
+                return Ok((0..=self.nmax)
+                    .flat_map(|n| (2 * n + PROMPT_TAIL_ROWS).to_le_bytes())
+                    .collect())
+            }
             "s3gen.kvidx.0" | "s3gen.kvidx.1" => {
                 let half = u32::from(name.ends_with('1'));
-                return Ok((0..self.cfg.voices.len() as u32).flat_map(|v| (2 * v + half).to_le_bytes()).collect());
+                return Ok((0..self.cfg.voices.len() as u32)
+                    .flat_map(|v| (2 * v + half).to_le_bytes())
+                    .collect());
             }
             "voice.prompt_token" => {
                 let (dtype, bytes) = self.reader.read(name)?;
-                return if dtype == "I32" { Ok(bytes) } else { Err(format!("{name}: {dtype}, expected I32")) };
+                return if dtype == "I32" {
+                    Ok(bytes)
+                } else {
+                    Err(format!("{name}: {dtype}, expected I32"))
+                };
             }
             _ => {}
         }
-        if let Some(k) = name.strip_prefix("s3gen.len.").and_then(|k| k.parse::<usize>().ok()) {
-            let (per, offset) = *length_scales(self.cfg).get(k).ok_or(format!("{name}: no such resolution"))?;
-            return Ok((0..=self.nmax).flat_map(|n| (n * per + offset).to_le_bytes()).collect());
+        if let Some(k) = name
+            .strip_prefix("s3gen.len.")
+            .and_then(|k| k.parse::<usize>().ok())
+        {
+            let (per, offset) = *length_scales(self.cfg)
+                .get(k)
+                .ok_or(format!("{name}: no such resolution"))?;
+            return Ok((0..=self.nmax)
+                .flat_map(|n| (n * per + offset).to_le_bytes())
+                .collect());
         }
-        if let Some((step, block)) = name.strip_prefix("cfm.tvec.s").and_then(|r| r.split_once(".r")) {
-            let (step, block): (usize, usize) = (step.parse().map_err(|_| name.to_string())?, block.parse().map_err(|_| name.to_string())?);
+        if let Some((step, block)) = name
+            .strip_prefix("cfm.tvec.s")
+            .and_then(|r| r.split_once(".r"))
+        {
+            let (step, block): (usize, usize) = (
+                step.parse().map_err(|_| name.to_string())?,
+                block.parse().map_err(|_| name.to_string())?,
+            );
             let width = D_CFM as usize;
             let tv = self.f32s("cfm.tvec")?;
             let at = (step * (MID_BLOCKS as usize + 2) + block) * width;
-            return tv.get(at..at + width).map(le_bytes).ok_or(format!("{name}: out of range"));
+            return tv
+                .get(at..at + width)
+                .map(le_bytes)
+                .ok_or(format!("{name}: out of range"));
         }
-        if let Some((layer, rest)) = name.strip_prefix("enc.L").and_then(|r| r.split_once(".relpos.t")) {
+        if let Some((layer, rest)) = name
+            .strip_prefix("enc.L")
+            .and_then(|r| r.split_once(".relpos.t"))
+        {
             let (t, part) = rest.split_once('.').ok_or(name.to_string())?;
-            let (layer, t): (u32, u32) = (layer.parse().map_err(|_| name.to_string())?, t.parse().map_err(|_| name.to_string())?);
+            let (layer, t): (u32, u32) = (
+                layer.parse().map_err(|_| name.to_string())?,
+                t.parse().map_err(|_| name.to_string())?,
+            );
             return self.relpos(layer, t, part == "b").map(|v| le_bytes(&v));
         }
         let (dtype, bytes) = self.reader.read(name)?;
@@ -1461,7 +2514,9 @@ impl Derived<'_> {
     fn relpos(&mut self, layer: u32, t: u32, bias: bool) -> Result<Vec<f32>, String> {
         let rows = self.cfg.relpos_rows[usize::from(layer >= ENC_LAYERS.0)];
         if t > rows {
-            return Err(format!("layer {layer}: {t} rows exceed the exported position table ({rows})"));
+            return Err(format!(
+                "layer {layer}: {t} rows exceed the exported position table ({rows})"
+            ));
         }
         let vu = self.f32s(&format!("enc.L{layer}.pos_vu"))?.clone();
         let table = self.f32s(&format!("enc.L{layer}.relpos"))?;
@@ -1473,7 +2528,12 @@ impl Derived<'_> {
             for r in 0..m {
                 let row = &table[(first + r) * width + h * dk..][..dk];
                 if bias {
-                    out.push(row.iter().zip(&vu[h * dk..]).map(|(&p, &q)| f64::from(p) * f64::from(q)).sum::<f64>() as f32);
+                    out.push(
+                        row.iter()
+                            .zip(&vu[h * dk..])
+                            .map(|(&p, &q)| f64::from(p) * f64::from(q))
+                            .sum::<f64>() as f32,
+                    );
                 } else {
                     out.extend_from_slice(row);
                 }
@@ -1493,21 +2553,40 @@ fn pipeline_section(
     nmax: u32,
     names: &HashMap<String, u32>,
 ) -> Result<packet::devbuild::SectionData, String> {
-    use plow_asset::packet_pipeline::{PacketPipeline, PacketPipelines, PipelineDType, PipelineTensor, SECTION, VERSION};
+    use plow_asset::packet_pipeline::{
+        PacketPipeline, PacketPipelines, PipelineDType, PipelineTensor, SECTION, VERSION,
+    };
     let t = |h: u32| prefix.model.tensors[h as usize].name.clone();
-    let u32s = |h: u32, n: u64| PipelineTensor { name: t(h), dtype: PipelineDType::U32, shape: vec![n] };
-    let pcm = *names.get("act.s3gen.pcm").ok_or("act.s3gen.pcm is not declared")?;
+    let u32s = |h: u32, n: u64| PipelineTensor {
+        name: t(h),
+        dtype: PipelineDType::U32,
+        shape: vec![n],
+    };
+    let pcm = *names
+        .get("act.s3gen.pcm")
+        .ok_or("act.s3gen.pcm is not declared")?;
     let samples = length_scales(cfg)[6].0;
     let tensors = BTreeMap::from([
         ("codes".into(), u32s(inputs.tokens, u64::from(bmax * nmax))),
         ("voice".into(), u32s(inputs.voice, u64::from(bmax))),
         ("seed".into(), u32s(inputs.seed, u64::from(bmax) * 2)),
         ("lengths.0".into(), u32s(inputs.count, u64::from(bmax))),
-        ("pcm".into(), PipelineTensor { name: t(pcm), dtype: PipelineDType::F32, shape: vec![u64::from(bmax * nmax * samples)] }),
+        (
+            "pcm".into(),
+            PipelineTensor {
+                name: t(pcm),
+                dtype: PipelineDType::F32,
+                shape: vec![u64::from(bmax * nmax * samples)],
+            },
+        ),
     ]);
     let mut tensors = tensors;
     if let Some(&out) = names.get("act.s3gen.phase_out") {
-        let f32s = |h: u32, n: u64| PipelineTensor { name: t(h), dtype: PipelineDType::F32, shape: vec![n] };
+        let f32s = |h: u32, n: u64| PipelineTensor {
+            name: t(h),
+            dtype: PipelineDType::F32,
+            shape: vec![n],
+        };
         let nh = u64::from(bmax * cfg.harmonics);
         tensors.insert("phase".into(), f32s(inputs.phase, nh));
         tensors.insert("phase_out".into(), f32s(out, nh));
@@ -1549,9 +2628,23 @@ fn pipeline_section(
     let strings = BTreeMap::from([("voices".into(), cfg.voices.join("\n"))]);
     let metadata = PacketPipelines {
         version: VERSION,
-        pipelines: vec![PacketPipeline { name: PIPELINE.into(), driver: "codec.v1".into(), programs: roles, tensors, parameters, strings }],
+        pipelines: vec![PacketPipeline {
+            name: PIPELINE.into(),
+            driver: "codec.v1".into(),
+            programs: roles,
+            tensors,
+            parameters,
+            strings,
+        }],
     };
-    metadata.validate(prefix.model.progs.len(), |name| prefix.model.tensors.iter().find(|x| x.name == name).map(|x| x.bytes))?;
+    metadata.validate(prefix.model.progs.len(), |name| {
+        prefix
+            .model
+            .tensors
+            .iter()
+            .find(|x| x.name == name)
+            .map(|x| x.bytes)
+    })?;
     Ok(packet::devbuild::SectionData {
         kind: packet::devbuild::SECT_METADATA,
         name: SECTION.into(),

@@ -238,7 +238,11 @@ fn the_tensor_digest_separates_order_size_init_and_tp() {
 
     let mut resized = tensors();
     resized[0].bytes += 1;
-    assert_ne!(base, tensor_table_digest(&resized, 8), "bytes (dtype/shape)");
+    assert_ne!(
+        base,
+        tensor_table_digest(&resized, 8),
+        "bytes (dtype/shape)"
+    );
 
     let mut reinit = tensors();
     reinit[1].initialized = false;
@@ -370,8 +374,16 @@ fn rule4_refuses_a_windowed_model_by_name() {
     let r = refusal(merge(&p, &[e]));
     assert_eq!(r.rule, Rule::KvRingInvariant);
     assert_eq!(r.extension, "assets.ext/bucket-4096");
-    assert!(r.detail.contains("16384-row prefill bucket"), "{}", r.detail);
-    assert!(r.detail.contains("32768"), "names the ring it needs: {}", r.detail);
+    assert!(
+        r.detail.contains("16384-row prefill bucket"),
+        "{}",
+        r.detail
+    );
+    assert!(
+        r.detail.contains("32768"),
+        "names the ring it needs: {}",
+        r.detail
+    );
 }
 
 #[test]
@@ -417,7 +429,10 @@ fn rule4_does_not_arm_on_anything_but_a_wider_bucket() {
         vec![ProgramRole::PrefillBucket { rows: 4096 }],
         vec![ProgramRole::DecodeRung { rows: 12 }],
         vec![ProgramRole::PackedSibling { of_rows: 2048 }],
-        vec![ProgramRole::TokenBatchBody { band: 32, rows: 512 }],
+        vec![ProgramRole::TokenBatchBody {
+            band: 32,
+            rows: 512,
+        }],
     ] {
         let mut e = ext(&p);
         e.programs = programs;
@@ -445,7 +460,11 @@ fn rule5_refuses_a_duplicate_prefill_bucket() {
     e.programs = vec![ProgramRole::PrefillBucket { rows: 2048 }];
     let r = refusal(merge(&p, &[e]));
     assert_eq!(r.rule, Rule::LadderWellFormedness);
-    assert!(r.detail.contains("duplicate prefill bucket at 2048"), "{}", r.detail);
+    assert!(
+        r.detail.contains("duplicate prefill bucket at 2048"),
+        "{}",
+        r.detail
+    );
     assert!(r.detail.contains("may only ADD"));
 }
 
@@ -456,7 +475,11 @@ fn rule5_refuses_a_duplicate_decode_rung() {
     e.programs = vec![ProgramRole::DecodeRung { rows: 8 }];
     let r = refusal(merge(&p, &[e]));
     assert_eq!(r.rule, Rule::LadderWellFormedness);
-    assert!(r.detail.contains("duplicate decode rung at 8"), "{}", r.detail);
+    assert!(
+        r.detail.contains("duplicate decode rung at 8"),
+        "{}",
+        r.detail
+    );
 }
 
 #[test]
@@ -466,7 +489,11 @@ fn rule5_refuses_a_decode_rung_above_the_band() {
     e.programs = vec![ProgramRole::DecodeRung { rows: 64 }];
     let r = refusal(merge(&p, &[e]));
     assert_eq!(r.rule, Rule::LadderWellFormedness);
-    assert!(r.detail.contains("outside the decode band 1..=32"), "{}", r.detail);
+    assert!(
+        r.detail.contains("outside the decode band 1..=32"),
+        "{}",
+        r.detail
+    );
 }
 
 #[test]
@@ -483,7 +510,10 @@ fn rule5_refuses_a_sibling_or_body_naming_a_bucket_nobody_has() {
     let p = parent();
     for role in [
         ProgramRole::PackedSibling { of_rows: 4096 },
-        ProgramRole::TokenBatchBody { band: 32, rows: 4096 },
+        ProgramRole::TokenBatchBody {
+            band: 32,
+            rows: 4096,
+        },
     ] {
         let mut e = ext(&p);
         e.programs = vec![role];
@@ -501,7 +531,10 @@ fn rule5_admits_a_sibling_and_body_that_come_with_their_bucket() {
     e.programs = vec![
         ProgramRole::PrefillBucket { rows: 4096 },
         ProgramRole::PackedSibling { of_rows: 4096 },
-        ProgramRole::TokenBatchBody { band: 32, rows: 4096 },
+        ProgramRole::TokenBatchBody {
+            band: 32,
+            rows: 4096,
+        },
     ];
     let m = merge(&p, &[e]).unwrap();
     assert_eq!(m.prefill_widths(), vec![512, 2048, 4096, 8192]);
@@ -522,7 +555,11 @@ fn rule5_names_the_extension_that_broke_the_ladder_not_the_last_one() {
     let r = refusal(merge(&p, &[good, bad, trailing]));
     assert_eq!(r.rule, Rule::LadderWellFormedness);
     assert_eq!(r.extension, "assets.ext/bucket-4096-again");
-    assert!(r.detail.contains("assets.ext/bucket-4096 already has one"), "{}", r.detail);
+    assert!(
+        r.detail.contains("assets.ext/bucket-4096 already has one"),
+        "{}",
+        r.detail
+    );
 }
 
 #[test]
@@ -631,7 +668,10 @@ fn requires_json_round_trips_and_yields_the_rows_to_build() {
     let s = serde_json::to_string(&r).unwrap();
     assert_eq!(serde_json::from_str::<Requires>(&s).unwrap(), r);
     assert_eq!(r.rows(), vec![4096]);
-    assert_eq!(parse_pairing_hash(&r.pairing_hash), Some(0xfeed_face_cafe_beef));
+    assert_eq!(
+        parse_pairing_hash(&r.pairing_hash),
+        Some(0xfeed_face_cafe_beef)
+    );
 }
 
 #[test]
@@ -671,8 +711,14 @@ fn the_object_stamp_must_name_the_extension_not_the_parent() {
     let ext_hash = 0xfeed_face_cafe_beef_u64;
     let parent_hash = 0x0123_4567_89ab_cdef_u64;
 
-    check_object_stamp("ext", "interp_prefill", Some(ext_hash), ext_hash, Some(parent_hash))
-        .expect("the extension's own stamp pairs");
+    check_object_stamp(
+        "ext",
+        "interp_prefill",
+        Some(ext_hash),
+        ext_hash,
+        Some(parent_hash),
+    )
+    .expect("the extension's own stamp pairs");
 
     let r = check_object_stamp(
         "ext",
@@ -683,18 +729,36 @@ fn the_object_stamp_must_name_the_extension_not_the_parent() {
     )
     .unwrap_err();
     assert_eq!(r.rule, Rule::ConfigCompatibility);
-    assert!(r.detail.contains("stamps the PARENT packet"), "{}", r.detail);
+    assert!(
+        r.detail.contains("stamps the PARENT packet"),
+        "{}",
+        r.detail
+    );
     assert!(r.detail.contains("none of this extension's arms"));
 
-    let r = check_object_stamp("ext", "interp_prefill", Some(7), ext_hash, Some(parent_hash))
-        .unwrap_err();
-    assert!(r.detail.contains("stamps packet 0x0000000000000007"), "{}", r.detail);
+    let r = check_object_stamp(
+        "ext",
+        "interp_prefill",
+        Some(7),
+        ext_hash,
+        Some(parent_hash),
+    )
+    .unwrap_err();
+    assert!(
+        r.detail.contains("stamps packet 0x0000000000000007"),
+        "{}",
+        r.detail
+    );
 
     // An UNSTAMPED object is accepted beside a parent (it is a general object) but never
     // beside an extension: nothing then shows it has the arms this bucket needs.
-    let r = check_object_stamp("ext", "interp_prefill", None, ext_hash, Some(parent_hash))
-        .unwrap_err();
-    assert!(r.detail.contains("carries no packet-pairing stamp"), "{}", r.detail);
+    let r =
+        check_object_stamp("ext", "interp_prefill", None, ext_hash, Some(parent_hash)).unwrap_err();
+    assert!(
+        r.detail.contains("carries no packet-pairing stamp"),
+        "{}",
+        r.detail
+    );
 }
 
 // --- misc --------------------------------------------------------------------

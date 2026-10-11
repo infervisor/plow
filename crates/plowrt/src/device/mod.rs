@@ -17,9 +17,9 @@ pub mod cpu;
 pub mod cuda;
 #[cfg(feature = "hsa")]
 pub mod hsa;
+pub(crate) mod kernarg_retirement;
 pub mod provenance;
 pub(crate) mod retirement;
-pub(crate) mod kernarg_retirement;
 
 pub(crate) fn retirement_error(error: retirement::RetirementError) -> crate::RuntimeError {
     crate::RuntimeError::Rejected(format!("retirement admission: {error:?}"))

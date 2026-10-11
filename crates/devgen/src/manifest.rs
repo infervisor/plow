@@ -528,13 +528,20 @@ fn shapes(m: &Model) -> Shapes {
                         }
                         if hd == 256 && kvh > 0 {
                             let g = nh / kvh;
-                            s.gqa_hd256 = if s.gqa_hd256 == 0 || s.gqa_hd256 == g { g } else { u32::MAX };
+                            s.gqa_hd256 = if s.gqa_hd256 == 0 || s.gqa_hd256 == g {
+                                g
+                            } else {
+                                u32::MAX
+                            };
                         }
                     }
                 }
                 // `… i2=n_head i3=n_kv_head … i6=hd`
                 DevOp::FlashPrefill | DevOp::FlashPrefillFp8 => {
-                    if m.tensors.get(inst.t[1] as usize).is_some_and(|t| t.name == "act.fa_ws") {
+                    if m.tensors
+                        .get(inst.t[1] as usize)
+                        .is_some_and(|t| t.name == "act.fa_ws")
+                    {
                         s.fa_ws_slots = m.n_cu;
                     }
                     s.hd.insert(inst.i[6]);
@@ -1039,7 +1046,11 @@ fn tuning(s: &Shapes, arch: &str) -> Map<String, Value> {
     // (GV_MM_MAX=128 is 0x19610 bytes); rungs above it walk ceil(B / 32) weight passes.
     // AMD objects size their GEMV walk from PLOW_GEMV_MM, not GV_MM_MAX: uncapped there.
     let gv_mm_max = next_pow2(s.decode_batch.max(1));
-    let gv_mm_max = if arch.starts_with("gfx") { gv_mm_max } else { gv_mm_max.min(32) };
+    let gv_mm_max = if arch.starts_with("gfx") {
+        gv_mm_max
+    } else {
+        gv_mm_max.min(32)
+    };
     t.insert("gv_mm_max".into(), json!(gv_mm_max));
     // * `fa_rg`: hd128 decode on the row-group flash body, which the merge fold requires
     //   (nv_decode_merge_fold; PLOW_NV_FA_FOLD opt-in).
@@ -1107,8 +1118,14 @@ fn tuning(s: &Shapes, arch: &str) -> Map<String, Value> {
         && s.hd.iter().all(|&h| h <= 128)
         && !s.ops_present.iter().any(|op| op.starts_with("Moe"));
     if sm90a && !s.decode_gemv_k.is_empty() {
-        t.insert("xreg_k".into(), json!(s.decode_gemv_k.iter().collect::<Vec<_>>()));
-        if s.moe_down_inter == 0 && s.decode_batch >= 2 && s.decode_gemv_k.iter().all(|k| k % 32 == 0) {
+        t.insert(
+            "xreg_k".into(),
+            json!(s.decode_gemv_k.iter().collect::<Vec<_>>()),
+        );
+        if s.moe_down_inter == 0
+            && s.decode_batch >= 2
+            && s.decode_gemv_k.iter().all(|k| k % 32 == 0)
+        {
             // Small dense GEMVs keep the classic B=1 kernels, as the MoE 26B does: Veena
             // (Llama-3.2-3B, K 3072/8192) on h200 B=1 3.106 -> 2.979 ms with the walk off.
             // The E-series (`GluStrided`) measured the same way.
@@ -1128,7 +1145,8 @@ fn tuning(s: &Shapes, arch: &str) -> Map<String, Value> {
         //   B=1/2/8/16/32 6.87/6.82/7.40/8.50/10.22 -> 6.93/6.25/6.82/7.97/9.65 ms, B>=48 unchanged.
         //   The other hd256/512 packets are unmeasured and keep the classic walk.
         let k8_small_hd = dense_tune;
-        let k8_ple = s.ops_present.contains(&op_name(DevOp::GluStrided)) && s.hd.iter().all(|&h| h <= 512);
+        let k8_ple =
+            s.ops_present.contains(&op_name(DevOp::GluStrided)) && s.hd.iter().all(|&h| h <= 512);
         if s.moe_down_inter == 0
             && !s.moe_dec_group
             && s.decode_batch >= 2
@@ -1165,7 +1183,10 @@ fn tuning(s: &Shapes, arch: &str) -> Map<String, Value> {
         }
         // * `fa_rgm`: hd128 row-group flash decode on the mma.sync item fed by per-warp bulk-copy
         //   rings (PLOW_NV_FA_RGM).
-        if s.hd.iter().all(|&h| h <= 128) && s.hd.contains(&128) && crate::emit_config::active().nv_fa_mma_hd128 {
+        if s.hd.iter().all(|&h| h <= 128)
+            && s.hd.contains(&128)
+            && crate::emit_config::active().nv_fa_mma_hd128
+        {
             t.insert("fa_rg".into(), json!(1));
             t.insert("fa_rgm".into(), json!(1));
         }
@@ -1238,7 +1259,10 @@ fn tuning(s: &Shapes, arch: &str) -> Map<String, Value> {
         t.insert("gf_full".into(), json!(gf));
         // The routed rungs' light hd512 attention may carry a wider group than the interpreter.
         if let Some(light) = crate::emit_config::active().fa_gf_light512 {
-            assert!(matches!(light, 8 | 16), "PLOW_FA_GF_LIGHT512 must be 8 or 16, got {light}");
+            assert!(
+                matches!(light, 8 | 16),
+                "PLOW_FA_GF_LIGHT512 must be 8 or 16, got {light}"
+            );
             if light != gf && s.gqa % light == 0 {
                 t.insert("gf_light512".into(), json!(light));
             }
@@ -1392,7 +1416,11 @@ fn backend_nvcc(f: &Map<String, Value>, t: &Map<String, Value>, s: &Shapes) -> V
         req.push("PLOW_NV_FA_GF=2".into());
     } else if s.hd.iter().all(|&h| h <= 128) && s.gqa > 1 && s.gqa % 4 != 0 {
         // The hd128 flash-decode arm defaults to GF 4 and traps unless GF | gqa.
-        let gf = if s.gqa % 2 == 0 { 2 } else { crate::odd_group_gf(s.gqa) };
+        let gf = if s.gqa % 2 == 0 {
+            2
+        } else {
+            crate::odd_group_gf(s.gqa)
+        };
         req.push(format!("PLOW_NV_FA_GF={gf}"));
     }
     if on("w8a8") {
@@ -1537,10 +1565,14 @@ fn backend_amd(
     if has("Sum4Bf16") {
         req.push("PLOW_HAS_SUM4_BF16=1".into());
     }
-    for (op, define) in [("MoeGluFp8Block128", "PLOW_HAS_MOE_GLU_FP8_BLOCK128=1"),
+    for (op, define) in [
+        ("MoeGluFp8Block128", "PLOW_HAS_MOE_GLU_FP8_BLOCK128=1"),
         ("MoeQuantFp8Block128", "PLOW_HAS_MOE_QUANT_FP8_BLOCK128=1"),
-        ("MoeDownFp8Block128", "PLOW_HAS_MOE_DOWN_FP8_BLOCK128=1")] {
-        if has(op) { req.push(define.into()); }
+        ("MoeDownFp8Block128", "PLOW_HAS_MOE_DOWN_FP8_BLOCK128=1"),
+    ] {
+        if has(op) {
+            req.push(define.into());
+        }
     }
     if on("w8a8") {
         req.push("PLOW_W8A8=1".into());
@@ -2590,7 +2622,12 @@ fn l2_placement(m: &Model) -> Value {
     let domains = m.progs.iter().map(|p| p.l2_domains).max().unwrap_or(0);
     // Dense-exact twins sit below the ladder index but are decode programs.
     let decode = |i: usize| i >= dec_lo || packet::devbuild::is_dense_exact_program(m.prog_t[i]);
-    let placed = |want: bool| m.progs.iter().enumerate().any(|(i, p)| decode(i) == want && p.l2_domains != 0);
+    let placed = |want: bool| {
+        m.progs
+            .iter()
+            .enumerate()
+            .any(|(i, p)| decode(i) == want && p.l2_domains != 0)
+    };
     json!({
         "domains": domains,
         "decode": placed(true),
@@ -3030,16 +3067,22 @@ pub fn config_header(manifest: &Value) -> String {
                 ));
             }
             if t.get("gemv_mma_b1").is_some() {
-                out.push_str("#ifndef PLOW_NV_GEMV_MMA_B1\n#define PLOW_NV_GEMV_MMA_B1 1\n#endif\n");
+                out.push_str(
+                    "#ifndef PLOW_NV_GEMV_MMA_B1\n#define PLOW_NV_GEMV_MMA_B1 1\n#endif\n",
+                );
             }
             if t.get("gemv_mma_pair").is_some() {
-                out.push_str("#ifndef PLOW_NV_GEMV_MMA_PAIR\n#define PLOW_NV_GEMV_MMA_PAIR 1\n#endif\n");
+                out.push_str(
+                    "#ifndef PLOW_NV_GEMV_MMA_PAIR\n#define PLOW_NV_GEMV_MMA_PAIR 1\n#endif\n",
+                );
             }
             if t.get("gemv_wide").is_some() {
                 out.push_str("#ifndef PLOW_NV_GEMV_WIDE\n#define PLOW_NV_GEMV_WIDE 1\n#endif\n");
             }
             if t.get("fp8_lt_decode").and_then(Value::as_bool) == Some(true) {
-                out.push_str("#ifndef PLOW_NV_FP8_LT_DECODE\n#define PLOW_NV_FP8_LT_DECODE 1\n#endif\n");
+                out.push_str(
+                    "#ifndef PLOW_NV_FP8_LT_DECODE\n#define PLOW_NV_FP8_LT_DECODE 1\n#endif\n",
+                );
             }
             if t.get("fp8_decode_tc64").and_then(Value::as_bool) == Some(true) {
                 out.push_str("#if defined(PLOW_NV_GW_OBJECT) && PLOW_NV_GW_OBJECT\n#ifndef PLOW_NV_FP8_DECODE_TC64\n#define PLOW_NV_FP8_DECODE_TC64 1\n#endif\n#endif\n");
@@ -3109,7 +3152,9 @@ pub fn config_header(manifest: &Value) -> String {
             if t.get("gf_full").and_then(Value::as_u64) == Some(16)
                 || t.get("gf_light512").and_then(Value::as_u64) == Some(16)
             {
-                out.push_str("#ifndef PLOW_NV_FA_GF16_BENCH\n#define PLOW_NV_FA_GF16_BENCH 1\n#endif\n");
+                out.push_str(
+                    "#ifndef PLOW_NV_FA_GF16_BENCH\n#define PLOW_NV_FA_GF16_BENCH 1\n#endif\n",
+                );
             }
         }
     }
@@ -3208,9 +3253,8 @@ mod tests {
         shapes.decode_fp8_gemv_rows.insert(96);
         assert!(std::panic::catch_unwind(|| tuning(&shapes, "sm_90a")).is_err());
         shapes.decode_fp8_gemv_rows.remove(&96);
-        let _all_routed = crate::test_env::EnvScope::set(&[
-            ("PLOW_EMIT_DECODE_CUBLASLT_MIN_ROWS", "64"),
-        ]);
+        let _all_routed =
+            crate::test_env::EnvScope::set(&[("PLOW_EMIT_DECODE_CUBLASLT_MIN_ROWS", "64")]);
         assert!(std::panic::catch_unwind(|| tuning(&shapes, "sm_90a")).is_err());
     }
 
@@ -3374,12 +3418,17 @@ mod tests {
             inst(DevOp::Gemv, [0; 8]),
         ])];
         let mask = speech_ops(&sidecar);
-        assert_eq!(mask, 1 << (DevOp::LayerNormF32 as u16 - 163) | 1 << (DevOp::AttentionF32 as u16 - 163));
+        assert_eq!(
+            mask,
+            1 << (DevOp::LayerNormF32 as u16 - 163) | 1 << (DevOp::AttentionF32 as u16 - 163)
+        );
         let plain = build(&model(), "sm_90a");
         let mut man = plain.clone();
         man["speech_ops"] = mask.into();
         assert_eq!(pairing_hash(&man), pairing_hash(&plain));
-        assert!(config_header(&man).contains(&format!("#ifndef PLOW_SPEECH_OPS\n#define PLOW_SPEECH_OPS 0x{mask:x}ull\n#endif\n")));
+        assert!(config_header(&man).contains(&format!(
+            "#ifndef PLOW_SPEECH_OPS\n#define PLOW_SPEECH_OPS 0x{mask:x}ull\n#endif\n"
+        )));
         assert!(!config_header(&plain).contains("PLOW_SPEECH_OPS"));
     }
 
@@ -3584,13 +3633,22 @@ mod tests {
         assert_eq!(build(&m, "gfx942")["l2_placement"]["prefill"], true);
 
         let mut m = model();
-        m.progs.insert(1, prog(vec![inst(DevOp::FlashDecodeFp8, [8, 8, 1, 0, 0, 0, 512, 0])]));
+        m.progs.insert(
+            1,
+            prog(vec![inst(
+                DevOp::FlashDecodeFp8,
+                [8, 8, 1, 0, 0, 0, 512, 0],
+            )]),
+        );
         m.prog_t = vec![1024, packet::devbuild::dense_exact_program_t(8), 8];
         m.progs[1].l2_domains = 8;
         m.progs[2].l2_domains = 8;
         let twin = build(&m, "gfx942")["l2_placement"].clone();
         assert_eq!(twin["decode"], true);
-        assert_eq!(twin["prefill"], false, "a placed dense-exact twin is decode-side");
+        assert_eq!(
+            twin["prefill"], false,
+            "a placed dense-exact twin is decode-side"
+        );
     }
 
     /// Per-program arm sets, keyed on (kind, bucket|batch, segment).
@@ -3665,8 +3723,10 @@ mod tests {
         let roles = |role: u8| packet::devbuild::SectionData {
             kind: packet::devbuild::SECT_METADATA,
             name: plow_asset::segment_roles::SECTION.into(),
-            data: format!(r#"{{"version":1,"objects":{{}},"programs":[{{"index":0,"roles":[0,{role},0]}}]}}"#)
-                .into_bytes(),
+            data: format!(
+                r#"{{"version":1,"objects":{{}},"programs":[{{"index":0,"roles":[0,{role},0]}}]}}"#
+            )
+            .into_bytes(),
         };
         let plain = build_for_packet(&model(), "sm_90a", &lean, &[]);
         assert!(plain["objects"].get("routed_decode").is_none());
@@ -3856,8 +3916,11 @@ mod tests {
         assert_eq!(man["precision"]["act_enc"], "mixed");
         assert_eq!(man["features"]["w8a8"], false);
         assert_eq!(man["features"]["w8a8_block128"], true);
-        assert!(man["backends"]["gfx950"]["requires"].as_array().unwrap()
-            .iter().any(|v| v == "PLOW_FP8=1"));
+        assert!(man["backends"]["gfx950"]["requires"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v == "PLOW_FP8=1"));
     }
 
     /// The gfx950 backend renders the defines a covering object must carry. On AMD a missing arm
@@ -4285,7 +4348,9 @@ mod tests {
             .join("runtime/amd/interp.hip");
         let src = std::fs::read_to_string(path).unwrap();
         let case = src.find("        case PLOW_DOP_GEMM_F32:").unwrap();
-        let prefill = src.find("#if PLOW_BUCKET_PREFILL || PLOW_MIXED_STEP").unwrap();
+        let prefill = src
+            .find("#if PLOW_BUCKET_PREFILL || PLOW_MIXED_STEP")
+            .unwrap();
         assert!(
             case < prefill,
             "decode router must not silently leave zero logits"
@@ -4295,10 +4360,17 @@ mod tests {
     #[test]
     fn paired_batched_decode_arms_grouped_experts() {
         let src = include_str!("../../../runtime/amd/interp.hip");
-        let guard = src.find("#if PLOW_BUCKET_DECODE && PLOW_DECODE_INVENTORY_PRUNE && \\\n").unwrap();
+        let guard = src
+            .find("#if PLOW_BUCKET_DECODE && PLOW_DECODE_INVENTORY_PRUNE && \\\n")
+            .unwrap();
         let enabled = src[guard..].find("\n#define PLOW_MOE_PREFILL 1").unwrap() + guard;
-        for op in ["MOE_ROUTER_TOPK_PF", "MOE_ALIGN_PF", "MOE_GROUP_GLU_PF",
-                   "MOE_GROUP_DOWN_PF", "MOE_COMBINE_PF"] {
+        for op in [
+            "MOE_ROUTER_TOPK_PF",
+            "MOE_ALIGN_PF",
+            "MOE_GROUP_GLU_PF",
+            "MOE_GROUP_DOWN_PF",
+            "MOE_COMBINE_PF",
+        ] {
             assert!(src[guard..enabled].contains(&format!("PLOW_HAS_{op}")));
         }
         let capability = src.find("#if PLOW_MOE_PREFILL\nextern").unwrap();
@@ -4340,9 +4412,8 @@ mod tests {
                 op.c_name().replace("PLOW_DOP_", "PLOW_HAS_")
             );
             let direct = format!("{guard}\n{case}");
-            let named_bound = format!(
-                "{guard}\n#define PLOW_GEMM_F32_STANDARD_DECODE_MAX_ROWS 32u\n{case}"
-            );
+            let named_bound =
+                format!("{guard}\n#define PLOW_GEMM_F32_STANDARD_DECODE_MAX_ROWS 32u\n{case}");
             assert!(
                 src.contains(&direct) || (op == DevOp::GemmF32 && src.contains(&named_bound)),
                 "{} is not inventory-gated",
@@ -4954,11 +5025,14 @@ mod tests {
         assert_eq!(man["lean"]["verified"], json!(true));
         assert_eq!(man["lean"]["oracle"], json!(true));
         assert_eq!(man["lean"]["reason"], Value::Null);
-        assert_eq!(man["lean"]["qualification"], json!({
-            "floating_point_implementation": false,
-            "memory_effect_completeness": false,
-            "empirical_performance": false,
-        }));
+        assert_eq!(
+            man["lean"]["qualification"],
+            json!({
+                "floating_point_implementation": false,
+                "memory_effect_completeness": false,
+                "empirical_performance": false,
+            })
+        );
     }
 
     /// The two subsystems are INDEPENDENT (Correction 1). Disabling the

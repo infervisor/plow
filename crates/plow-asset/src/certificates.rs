@@ -150,7 +150,9 @@ impl ExecutionIdentity {
             if !matches!(path.next(), Some(std::path::Component::Normal(_)))
                 || path.next().is_some()
                 || object.file.as_bytes().contains(&0)
-                || files.insert(&object.file, &object.sha256).is_some_and(|sha| sha != &object.sha256)
+                || files
+                    .insert(&object.file, &object.sha256)
+                    .is_some_and(|sha| sha != &object.sha256)
                 || !objects.insert((&object.sha256, &object.entry))
                 || object.entry.is_empty()
                 || object.entry.as_bytes().contains(&0)
@@ -174,17 +176,30 @@ impl ExecutionIdentity {
         let mut sites = BTreeSet::new();
         let mut covered = BTreeSet::new();
         for launch in &self.launches {
-            let object = self.objects.iter().find(|object|
-                object.sha256 == launch.object_sha256 && object.entry == launch.entry)
+            let object = self
+                .objects
+                .iter()
+                .find(|object| {
+                    object.sha256 == launch.object_sha256 && object.entry == launch.entry
+                })
                 .ok_or("launch references an unknown object/symbol")?;
             if launch.abi_sha256 != object.abi_sha256
                 || launch.domain as usize >= self.rungs.len()
-                || !sites.insert((launch.program, launch.segment, launch.dispatch, launch.domain))
+                || !sites.insert((
+                    launch.program,
+                    launch.segment,
+                    launch.dispatch,
+                    launch.domain,
+                ))
                 || launch.grid.contains(&0)
-                || launch.threads == 0 || launch.threads > 1024
+                || launch.threads == 0
+                || launch.threads > 1024
                 || launch.threads % object.wave_size != 0
                 || launch.occupancy.is_none_or(|n| n == 0)
-                || object.static_lds_bytes.checked_add(launch.dynamic_lds_bytes).is_none()
+                || object
+                    .static_lds_bytes
+                    .checked_add(launch.dynamic_lds_bytes)
+                    .is_none()
             {
                 return Err("invalid, incomplete or duplicate launch/domain/ABI binding".into());
             }
@@ -377,7 +392,10 @@ pub struct SidecarCheckReceipts {
 }
 
 pub fn sidecar_checks_file(packet: &std::path::Path) -> std::path::PathBuf {
-    let stem = packet.file_stem().and_then(|s| s.to_str()).unwrap_or("packet");
+    let stem = packet
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("packet");
     packet.with_file_name(format!("{stem}.{PACKET_CHECKS_FILE}"))
 }
 
@@ -400,13 +418,26 @@ impl SidecarCheckReceipts {
                 || !is_sha256(&check.verifier_sha256)
                 || check.request_sha256 != request_sha256(&check.request)?
                 || !digests.insert(&check.request_sha256)
-                || check.response.get("ok").and_then(serde_json::Value::as_bool) != Some(true)
-                || check.response.get("checkpoint").and_then(serde_json::Value::as_str) != Some("D")
+                || check
+                    .response
+                    .get("ok")
+                    .and_then(serde_json::Value::as_bool)
+                    != Some(true)
+                || check
+                    .response
+                    .get("checkpoint")
+                    .and_then(serde_json::Value::as_str)
+                    != Some("D")
             {
                 return Err("invalid, unreferenced or duplicated sidecar check receipt".into());
             }
         }
-        if self.program_checks.iter().flatten().any(|&i| i >= self.checks.len()) {
+        if self
+            .program_checks
+            .iter()
+            .flatten()
+            .any(|&i| i >= self.checks.len())
+        {
             return Err("sidecar program check out of range".into());
         }
         Ok(())
@@ -424,12 +455,20 @@ impl PacketCheckReceipts {
         let mut obligations = BTreeSet::new();
         for check in &self.checks {
             let supported = match check.scope {
-                SemanticScope::RewriteBodyExpansion => check.checkpoint == "A"
-                    && check.program.is_none()
-                    && check.request.get("bodies").and_then(serde_json::Value::as_array)
-                        .is_some_and(|bodies| !bodies.is_empty())
-                    && check.request.get("source_sha256").and_then(serde_json::Value::as_str)
-                        .is_some_and(is_sha256),
+                SemanticScope::RewriteBodyExpansion => {
+                    check.checkpoint == "A"
+                        && check.program.is_none()
+                        && check
+                            .request
+                            .get("bodies")
+                            .and_then(serde_json::Value::as_array)
+                            .is_some_and(|bodies| !bodies.is_empty())
+                        && check
+                            .request
+                            .get("source_sha256")
+                            .and_then(serde_json::Value::as_str)
+                            .is_some_and(is_sha256)
+                }
                 SemanticScope::CoarseDependencyPreservation => {
                     check.checkpoint == "D"
                         && check.program.is_some()
@@ -448,11 +487,17 @@ impl PacketCheckReceipts {
                             .and_then(serde_json::Value::as_array)
                             .is_some_and(|r| !r.is_empty())
                 }
-                SemanticScope::SelectedGemmPolicy => check.checkpoint == "R"
-                    && check.program.is_some() && check.request.get("wire_binding").is_some(),
+                SemanticScope::SelectedGemmPolicy => {
+                    check.checkpoint == "R"
+                        && check.program.is_some()
+                        && check.request.get("wire_binding").is_some()
+                }
                 SemanticScope::LayoutMapping => check.checkpoint == "L" && check.program.is_some(),
-                SemanticScope::LogicalTensorEffects => check.checkpoint == "D"
-                    && check.program.is_some() && check.request.get("memory_effects").is_some(),
+                SemanticScope::LogicalTensorEffects => {
+                    check.checkpoint == "D"
+                        && check.program.is_some()
+                        && check.request.get("memory_effects").is_some()
+                }
                 _ => false,
             };
             if !supported
@@ -497,7 +542,9 @@ impl VerificationPolicy {
             "off" => Ok(Self::Off),
             "report" => Ok(Self::Report),
             "strict" => Ok(Self::Strict),
-            other => Err(format!("unknown verification policy {other:?} (off, report, strict)")),
+            other => Err(format!(
+                "unknown verification policy {other:?} (off, report, strict)"
+            )),
         }
     }
 }
@@ -521,8 +568,10 @@ pub struct ApprovedVerifiers {
     pub verifiers: Vec<ApprovedVerifier>,
 }
 
-pub const APPROVED_VERIFIERS_JSON: &str =
-    include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../lean-plow/approved-verifiers.json"));
+pub const APPROVED_VERIFIERS_JSON: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../lean-plow/approved-verifiers.json"
+));
 
 pub fn approved_verifiers() -> Result<ApprovedVerifiers, String> {
     let list: ApprovedVerifiers =
@@ -592,16 +641,21 @@ impl Qualification {
 
     fn satisfy(&mut self, obligation: Obligation, what: &str) {
         if !self.required.contains(&obligation) {
-            self.gaps.push(format!("{what}: unused receipt {obligation:?}"));
+            self.gaps
+                .push(format!("{what}: unused receipt {obligation:?}"));
         } else if !self.satisfied.insert(obligation.clone()) {
-            self.gaps.push(format!("{what}: duplicate receipt {obligation:?}"));
+            self.gaps
+                .push(format!("{what}: duplicate receipt {obligation:?}"));
         }
     }
 
     fn missing(&mut self, packet: &crate::program::Packet<'_>) {
         let mut by_scope: BTreeMap<SemanticScope, Vec<Option<usize>>> = BTreeMap::new();
         for obligation in self.required.difference(&self.satisfied) {
-            by_scope.entry(obligation.scope).or_default().push(obligation.program);
+            by_scope
+                .entry(obligation.scope)
+                .or_default()
+                .push(obligation.program);
         }
         for (scope, programs) in by_scope {
             let reason = match (scope, programs.iter().flatten().next()) {
@@ -610,7 +664,10 @@ impl Qualification {
                 }
                 _ => None,
             };
-            let programs: Vec<_> = programs.iter().map(|p| p.map_or(-1, |p| p as i64)).collect();
+            let programs: Vec<_> = programs
+                .iter()
+                .map(|p| p.map_or(-1, |p| p as i64))
+                .collect();
             self.gaps.push(format!(
                 "{scope:?} missing for {} of {} programs {programs:?}{}",
                 programs.len(),
@@ -647,7 +704,12 @@ pub fn required_packet_obligations(packet: &crate::program::Packet<'_>) -> BTree
             (SemanticScope::CoarseDependencyPreservation, "D"),
             (SemanticScope::LogicalTensorEffects, "D"),
         ] {
-            required.insert(Obligation { scope, checkpoint, program: Some(p), site: None });
+            required.insert(Obligation {
+                scope,
+                checkpoint,
+                program: Some(p),
+                site: None,
+            });
         }
         for site in layout_sites(program) {
             required.insert(Obligation {
@@ -669,10 +731,21 @@ pub fn bind_packet_receipt(
 ) -> Result<Option<Obligation>, String> {
     let program = match check.program {
         None => None,
-        Some(index) => Some((index, packet.programs.get(index).ok_or("receipt program is absent from packet")?)),
+        Some(index) => Some((
+            index,
+            packet
+                .programs
+                .get(index)
+                .ok_or("receipt program is absent from packet")?,
+        )),
     };
     let obligation = |scope, checkpoint, site| {
-        Ok(Some(Obligation { scope, checkpoint, program: check.program, site }))
+        Ok(Some(Obligation {
+            scope,
+            checkpoint,
+            program: check.program,
+            site,
+        }))
     };
     match (check.scope, program) {
         (SemanticScope::RewriteBodyExpansion, None) => obligation(check.scope, "A", None),
@@ -687,7 +760,10 @@ pub fn bind_packet_receipt(
         (SemanticScope::CoarseDependencyPreservation, Some((_, program))) => {
             let expected = crate::logical_effects::coarse_protocol(program)?;
             if check.request.get("protocol") != Some(&expected)
-                || check.request.pointer("/task_graph/n").and_then(serde_json::Value::as_u64)
+                || check
+                    .request
+                    .pointer("/task_graph/n")
+                    .and_then(serde_json::Value::as_u64)
                     != Some(program.insts.len() as u64)
             {
                 return Err("dependency receipt differs from loaded wire counters".into());
@@ -722,7 +798,9 @@ pub fn bind_packet_receipt(
             }
             obligation(check.scope, "L", Some(site))
         }
-        (scope, _) => Err(format!("unsupported receipt scope {scope:?} for this program binding")),
+        (scope, _) => Err(format!(
+            "unsupported receipt scope {scope:?} for this program binding"
+        )),
     }
 }
 
@@ -733,7 +811,11 @@ pub fn qualify_packet(
     raw: &[u8],
     packet: &crate::program::Packet<'_>,
 ) -> Qualification {
-    let mut q = Qualification::new(raw, packet.programs.len(), required_packet_obligations(packet));
+    let mut q = Qualification::new(
+        raw,
+        packet.programs.len(),
+        required_packet_obligations(packet),
+    );
     let Some(receipts) = receipts else {
         q.gaps.push("no compiler check receipts".into());
         q.missing(packet);
@@ -745,10 +827,16 @@ pub fn qualify_packet(
         return q;
     }
     for (index, check) in receipts.checks.iter().enumerate() {
-        let what = format!("receipt {index} ({:?}, program {:?})", check.scope, check.program);
+        let what = format!(
+            "receipt {index} ({:?}, program {:?})",
+            check.scope, check.program
+        );
         q.receipt_verifiers.insert(check.verifier_sha256.clone());
         if !is_approved_verifier(&check.verifier_sha256) {
-            q.gaps.push(format!("{what}: verifier {} is not approved", check.verifier_sha256));
+            q.gaps.push(format!(
+                "{what}: verifier {} is not approved",
+                check.verifier_sha256
+            ));
         }
         match bind_packet_receipt(packet, check) {
             Ok(Some(obligation)) => q.satisfy(obligation, &what),
@@ -796,12 +884,22 @@ pub fn qualify_sidecar(
     for check in &receipts.checks {
         q.receipt_verifiers.insert(check.verifier_sha256.clone());
         if !is_approved_verifier(&check.verifier_sha256) {
-            q.gaps.push(format!("sidecar verifier {} is not approved", check.verifier_sha256));
+            q.gaps.push(format!(
+                "sidecar verifier {} is not approved",
+                check.verifier_sha256
+            ));
         }
     }
-    for (p, entry) in receipts.program_checks.iter().enumerate().take(packet.programs.len()) {
+    for (p, entry) in receipts
+        .program_checks
+        .iter()
+        .enumerate()
+        .take(packet.programs.len())
+    {
         let Some(index) = *entry else { continue };
-        let Some(check) = receipts.checks.get(index) else { continue };
+        let Some(check) = receipts.checks.get(index) else {
+            continue;
+        };
         match crate::logical_effects::obligation(packet, p) {
             Ok(request) if request == check.request => q.satisfy(
                 Obligation {
@@ -812,7 +910,9 @@ pub fn qualify_sidecar(
                 },
                 &format!("program {p}"),
             ),
-            Ok(_) => q.gaps.push(format!("program {p}: check {index} is not this program's obligation")),
+            Ok(_) => q.gaps.push(format!(
+                "program {p}: check {index} is not this program's obligation"
+            )),
             Err(error) => q.gaps.push(format!("program {p}: {error}")),
         }
     }
@@ -899,15 +999,12 @@ impl BoundCertificates {
 mod tests {
     #[test]
     fn request_digest_is_independent_of_json_map_order() {
-        let first: serde_json::Value = serde_json::from_str(
-            r#"{"z":[{"b":2,"a":1}],"a":{"d":4,"c":3}}"#,
-        ).unwrap();
-        let second: serde_json::Value = serde_json::from_str(
-            r#"{"a":{"c":3,"d":4},"z":[{"a":1,"b":2}]}"#,
-        ).unwrap();
-        let expected = crate::decode_objects::image_sha256(
-            br#"{"a":{"c":3,"d":4},"z":[{"a":1,"b":2}]}"#,
-        );
+        let first: serde_json::Value =
+            serde_json::from_str(r#"{"z":[{"b":2,"a":1}],"a":{"d":4,"c":3}}"#).unwrap();
+        let second: serde_json::Value =
+            serde_json::from_str(r#"{"a":{"c":3,"d":4},"z":[{"a":1,"b":2}]}"#).unwrap();
+        let expected =
+            crate::decode_objects::image_sha256(br#"{"a":{"c":3,"d":4},"z":[{"a":1,"b":2}]}"#);
         assert_eq!(super::request_sha256(&first).unwrap(), expected);
         assert_eq!(super::request_sha256(&second).unwrap(), expected);
         let mut changed = second;
@@ -947,9 +1044,15 @@ mod tests {
                 static_lds_bytes: 0,
             }],
             launches: vec![LaunchBinding {
-                program: 0, segment: 0, dispatch: 0, domain: 0,
-                object_sha256: sha.clone(), entry: "kernel".into(), abi_sha256: sha,
-                grid: [256, 1, 1], threads: 256,
+                program: 0,
+                segment: 0,
+                dispatch: 0,
+                domain: 0,
+                object_sha256: sha.clone(),
+                entry: "kernel".into(),
+                abi_sha256: sha,
+                grid: [256, 1, 1],
+                threads: 256,
                 dynamic_lds_bytes: 0,
                 occupancy: Some(4),
             }],
@@ -1025,7 +1128,10 @@ mod tests {
         assert!(id.validate().is_ok());
         let json = serde_json::to_value(&id).unwrap();
         assert!(json["objects"][0].get("grid").is_none());
-        assert_eq!(serde_json::from_value::<ExecutionIdentity>(json).unwrap(), id);
+        assert_eq!(
+            serde_json::from_value::<ExecutionIdentity>(json).unwrap(),
+            id
+        );
         id.launches.push(id.launches[1].clone());
         assert!(id.validate().is_err());
     }
@@ -1041,7 +1147,11 @@ mod tests {
                 3 => id.launches[0].domain = 1,
                 4 => id.launches[0].threads = 33,
                 5 => id.launches[0].grid[1] = 0,
-                _ => { let mut d = id.rungs[0].clone(); d.rows = 32; id.rungs.push(d); }
+                _ => {
+                    let mut d = id.rungs[0].clone();
+                    d.rows = 32;
+                    id.rungs.push(d);
+                }
             }
             assert!(id.validate().is_err(), "mutation {mutation}");
         }
@@ -1165,7 +1275,12 @@ mod tests {
         approved_verifiers().unwrap().verifiers[0].sha256.clone()
     }
 
-    fn receipt(program: Option<usize>, scope: SemanticScope, checkpoint: &str, request: serde_json::Value) -> CompileCheckReceipt {
+    fn receipt(
+        program: Option<usize>,
+        scope: SemanticScope,
+        checkpoint: &str,
+        request: serde_json::Value,
+    ) -> CompileCheckReceipt {
         CompileCheckReceipt {
             program,
             scope,
@@ -1181,15 +1296,30 @@ mod tests {
         let raw = model.to_blob();
         let rewrite = serde_json::json!({"rules": ["r"], "source_sha256": "c".repeat(64),
             "bodies": [{"name": "r", "lhs": [], "rhs": []}]});
-        let mut checks = vec![receipt(None, SemanticScope::RewriteBodyExpansion, "A", rewrite)];
+        let mut checks = vec![receipt(
+            None,
+            SemanticScope::RewriteBodyExpansion,
+            "A",
+            rewrite,
+        )];
         crate::program::with_model(model, |packet| {
             for (p, program) in packet.programs.iter().enumerate() {
                 let coarse = serde_json::json!({"task_graph": {"n": program.insts.len(), "edges": []},
                     "protocol": crate::logical_effects::coarse_protocol(program).unwrap(),
                     "dependency_paths": [], "address_map": []});
-                checks.push(receipt(Some(p), SemanticScope::CoarseDependencyPreservation, "D", coarse));
+                checks.push(receipt(
+                    Some(p),
+                    SemanticScope::CoarseDependencyPreservation,
+                    "D",
+                    coarse,
+                ));
                 let effects = crate::logical_effects::obligation(packet, p).unwrap();
-                checks.push(receipt(Some(p), SemanticScope::LogicalTensorEffects, "D", effects));
+                checks.push(receipt(
+                    Some(p),
+                    SemanticScope::LogicalTensorEffects,
+                    "D",
+                    effects,
+                ));
             }
         });
         let receipts = PacketCheckReceipts {
@@ -1201,7 +1331,11 @@ mod tests {
         (raw, receipts)
     }
 
-    fn qualify(model: &packet::devbuild::Model, raw: &[u8], receipts: Option<&PacketCheckReceipts>) -> Qualification {
+    fn qualify(
+        model: &packet::devbuild::Model,
+        raw: &[u8],
+        receipts: Option<&PacketCheckReceipts>,
+    ) -> Qualification {
         crate::program::with_model(model, |packet| qualify_packet(receipts, raw, packet))
     }
 
@@ -1216,7 +1350,9 @@ mod tests {
         for mutation in 0..8 {
             let mut bad = receipts.clone();
             match mutation {
-                0 => { bad.checks.pop(); }
+                0 => {
+                    bad.checks.pop();
+                }
                 1 => bad.checks[2].program = Some(7),
                 2 => bad.checks[1].verifier_sha256 = "b".repeat(64),
                 3 => {
@@ -1238,15 +1374,20 @@ mod tests {
                     bad.checks.remove(4);
                 }
             }
-            assert!(!qualify(&model, &raw, Some(&bad)).qualified(), "mutation {mutation}");
+            assert!(
+                !qualify(&model, &raw, Some(&bad)).qualified(),
+                "mutation {mutation}"
+            );
         }
         let mut changed = two_program_model();
         changed.progs[1].insts[2].t[0] = changed.progs[1].insts[2].t[1];
         let raw = changed.to_blob();
         let mut rebound = receipts;
         rebound.packet_sha256 = crate::decode_objects::image_sha256(&raw);
-        assert!(!qualify(&changed, &raw, Some(&rebound)).qualified(),
-            "an updated packet hash cannot reuse receipts for changed operands");
+        assert!(
+            !qualify(&changed, &raw, Some(&rebound)).qualified(),
+            "an updated packet hash cannot reuse receipts for changed operands"
+        );
     }
 
     #[test]
@@ -1254,8 +1395,16 @@ mod tests {
         let model = two_program_model();
         let raw = model.to_blob();
         let checks = crate::program::with_model(&model, |packet| {
-            (0..2).map(|p| receipt(Some(p), SemanticScope::LogicalTensorEffects, "D",
-                crate::logical_effects::obligation(packet, p).unwrap())).collect::<Vec<_>>()
+            (0..2)
+                .map(|p| {
+                    receipt(
+                        Some(p),
+                        SemanticScope::LogicalTensorEffects,
+                        "D",
+                        crate::logical_effects::obligation(packet, p).unwrap(),
+                    )
+                })
+                .collect::<Vec<_>>()
         });
         let receipts = SidecarCheckReceipts {
             schema: 1,
@@ -1267,13 +1416,19 @@ mod tests {
         let q = |r: Option<&SidecarCheckReceipts>| {
             crate::program::with_model(&model, |packet| qualify_sidecar(r, &raw, packet))
         };
-        assert!(q(Some(&receipts)).qualified(), "{:?}", q(Some(&receipts)).gaps);
+        assert!(
+            q(Some(&receipts)).qualified(),
+            "{:?}",
+            q(Some(&receipts)).gaps
+        );
         assert!(!q(None).qualified());
         for mutation in 0..4 {
             let mut bad = receipts.clone();
             match mutation {
                 0 => bad.program_checks[1] = None,
-                1 => { bad.program_checks.pop(); }
+                1 => {
+                    bad.program_checks.pop();
+                }
                 2 => bad.program_checks = vec![Some(1), Some(0)],
                 _ => bad.checks[1].verifier_sha256 = "b".repeat(64),
             }
@@ -1296,9 +1451,15 @@ mod tests {
     #[test]
     fn approved_verifier_list_is_well_formed() {
         let list = approved_verifiers().unwrap();
-        assert!(list.verifiers.iter().all(|v| is_approved_verifier(&v.sha256)));
+        assert!(list
+            .verifiers
+            .iter()
+            .all(|v| is_approved_verifier(&v.sha256)));
         assert!(!is_approved_verifier(&"0".repeat(64)));
-        assert_eq!(VerificationPolicy::parse("strict"), Ok(VerificationPolicy::Strict));
+        assert_eq!(
+            VerificationPolicy::parse("strict"),
+            Ok(VerificationPolicy::Strict)
+        );
         assert!(VerificationPolicy::parse("on").is_err());
     }
 

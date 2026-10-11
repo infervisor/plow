@@ -619,8 +619,9 @@ fn gpu_decode_rungs_match_widest_full_logits() {
     check_gpu_decode_rungs(false);
 }
 
-const GEMMA4_PREFILL_RUNGS: [usize; 14] =
-    [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192];
+const GEMMA4_PREFILL_RUNGS: [usize; 14] = [
+    1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192,
+];
 const GEMMA4_DECODE_RUNGS: [usize; 5] = [1, 2, 4, 8, 16];
 const GEMMA4_VOCAB: usize = 262_144;
 
@@ -641,7 +642,10 @@ fn diagnostic_engine(be: &Arc<CudaBackend>, assets: &std::path::Path) -> GpuEngi
     let e = GpuEngine::load(Arc::clone(be), assets, &assets.join("checkpoint")).unwrap();
     assert_eq!(e.vocab(), GEMMA4_VOCAB);
     assert!(e.multistep.is_none(), "disable multistep for this gate");
-    assert!(!e.vmm_prefix_enabled(), "disable VMM prefix reuse for this gate");
+    assert!(
+        !e.vmm_prefix_enabled(),
+        "disable VMM prefix reuse for this gate"
+    );
     e
 }
 
@@ -673,18 +677,9 @@ fn full_logit_record(
 ) -> serde_json::Value {
     assert_eq!(actual.len(), snapshots);
     assert_eq!(expected.len(), snapshots);
-    let bitwise_equal = actual
-        .iter()
-        .zip(expected)
-        .all(|(a, b)| a.bits == b.bits);
-    let token_equal = actual
-        .iter()
-        .zip(expected)
-        .all(|(a, b)| a.token == b.token);
-    let all_finite = actual
-        .iter()
-        .chain(expected)
-        .all(|frame| frame.all_finite);
+    let bitwise_equal = actual.iter().zip(expected).all(|(a, b)| a.bits == b.bits);
+    let token_equal = actual.iter().zip(expected).all(|(a, b)| a.token == b.token);
+    let all_finite = actual.iter().chain(expected).all(|frame| frame.all_finite);
     serde_json::json!({
         "profile_key": format!("full-logit/{phase}/r{rung}"),
         "phase": phase,
@@ -785,8 +780,7 @@ fn assert_diagnostic_packet(expected: &str, actual: &str) {
 fn gpu_isolated_prefill_rungs_match_widest_logits() {
     assert_eq!(std::env::var("TEST_PREFILL_RUNG_GPU").as_deref(), Ok("1"));
     let assets = std::path::PathBuf::from(std::env::var("TEST_PREFILL_RUNG_ASSETS").unwrap());
-    let baseline =
-        std::path::PathBuf::from(std::env::var("TEST_PREFILL_RUNG_BASELINE").unwrap());
+    let baseline = std::path::PathBuf::from(std::env::var("TEST_PREFILL_RUNG_BASELINE").unwrap());
     let expected_sha256 = std::env::var("TEST_RUNG_PACKET_SHA256").unwrap();
     let (candidate_blob, candidate_sha256) = diagnostic_packet(&assets);
     let (reference_blob, reference_sha256) = diagnostic_packet(&baseline);
@@ -830,7 +824,10 @@ fn gpu_isolated_prefill_rungs_match_widest_logits() {
     let mut records = Vec::with_capacity(GEMMA4_PREFILL_RUNGS.len());
     for (index, &rows) in GEMMA4_PREFILL_RUNGS.iter().enumerate() {
         let selected = e.pick_prefill_bucket(rows, usize::MAX);
-        assert_eq!(e.prefill[selected].t as usize, rows, "M={rows} did not select its exact rung");
+        assert_eq!(
+            e.prefill[selected].t as usize, rows,
+            "M={rows} did not select its exact rung"
+        );
         let prompt = diagnostic_prompt(rows, rows);
         e.begin_slot(0, rows + 1).unwrap();
         let token = e.prefill_slot(0, &prompt).unwrap();
@@ -846,7 +843,11 @@ fn gpu_isolated_prefill_rungs_match_widest_logits() {
         ));
         e.retire_slot(0, false);
     }
-    write_full_logit_records("TEST_PREFILL_RUNG_LOGITS_OUT", GEMMA4_PREFILL_RUNGS.len(), &records);
+    write_full_logit_records(
+        "TEST_PREFILL_RUNG_LOGITS_OUT",
+        GEMMA4_PREFILL_RUNGS.len(),
+        &records,
+    );
     assert!(records.iter().all(|r| r["correct"] == true));
 }
 
@@ -962,8 +963,7 @@ fn gpu_prefill_roles_match_control_logits() {
 fn gpu_isolated_decode_rungs_match_widest_logits() {
     assert_eq!(std::env::var("TEST_DECODE_RUNG_GPU").as_deref(), Ok("1"));
     let assets = std::path::PathBuf::from(std::env::var("TEST_DECODE_RUNG_ASSETS").unwrap());
-    let baseline =
-        std::path::PathBuf::from(std::env::var("TEST_DECODE_RUNG_BASELINE").unwrap());
+    let baseline = std::path::PathBuf::from(std::env::var("TEST_DECODE_RUNG_BASELINE").unwrap());
     let expected_sha256 = std::env::var("TEST_RUNG_PACKET_SHA256").unwrap();
     let (candidate_blob, candidate_sha256) = diagnostic_packet(&assets);
     let (reference_blob, reference_sha256) = diagnostic_packet(&baseline);
@@ -990,7 +990,12 @@ fn gpu_isolated_decode_rungs_match_widest_logits() {
         .prefill_progs()
         .iter()
         .map(|p| p.t as usize)
-        .filter(|rows| candidate_blob.prefill_progs().iter().any(|p| p.t as usize == *rows))
+        .filter(|rows| {
+            candidate_blob
+                .prefill_progs()
+                .iter()
+                .any(|p| p.t as usize == *rows)
+        })
         .max()
         .expect("candidate and reference need a common prefill rung");
     drop((candidate_blob, reference_blob));
@@ -1053,7 +1058,11 @@ fn gpu_isolated_decode_rungs_match_widest_logits() {
             &references[index],
         ));
     }
-    write_full_logit_records("TEST_DECODE_RUNG_LOGITS_OUT", GEMMA4_DECODE_RUNGS.len(), &records);
+    write_full_logit_records(
+        "TEST_DECODE_RUNG_LOGITS_OUT",
+        GEMMA4_DECODE_RUNGS.len(),
+        &records,
+    );
     assert!(records.iter().all(|r| r["correct"] == true));
 }
 
@@ -1225,7 +1234,16 @@ fn gpu_fp8_kv_cached_rungs_match_uncached_suffix_logits() {
         let mut reference = Vec::new();
         for (pass, slot) in [15, 0, 1, 3, 7, 15].into_iter().enumerate() {
             e.begin_slot(slot, length + 8).unwrap();
-            assert_eq!(e.vmm.as_ref().unwrap().kv.as_ref().unwrap().mapped_rows(slot), 0);
+            assert_eq!(
+                e.vmm
+                    .as_ref()
+                    .unwrap()
+                    .kv
+                    .as_ref()
+                    .unwrap()
+                    .mapped_rows(slot),
+                0
+            );
             let cached = e.attach_prompt(slot, &prompt).unwrap();
             assert_eq!(cached, if pass == 0 { 0 } else { (length - 1) / 32 * 32 });
             let mut next = e.prefill_slot(slot, &prompt).unwrap();
@@ -1655,7 +1673,16 @@ fn rung_patch_images_preserve_uploaded_mutated_insts() {
     let g_insts = vec![
         DevInst64 {
             op: DevOp::FlashDecode as u16,
-            t: [0, TENSOR_NONE16, TENSOR_NONE16, 3, 4, TENSOR_NONE16, TENSOR_NONE16, TENSOR_NONE16],
+            t: [
+                0,
+                TENSOR_NONE16,
+                TENSOR_NONE16,
+                3,
+                4,
+                TENSOR_NONE16,
+                TENSOR_NONE16,
+                TENSOR_NONE16,
+            ],
             i: [1, 8, 0, 1024, 0, 16, 256, u32::MAX],
             ..Default::default()
         },
@@ -1675,8 +1702,9 @@ fn rung_patch_images_preserve_uploaded_mutated_insts() {
     mutated_host_insts[1].i[0] = 9999; // Route mutation
 
     let full_set: std::collections::HashSet<u16> = [3, 4].into_iter().collect();
-    let (sites, baked) = crate::exec::kvrow::derive_nv_nsplit(&mutated_host_insts, |h| full_set.contains(&h))
-        .expect("derived with merge");
+    let (sites, baked) =
+        crate::exec::kvrow::derive_nv_nsplit(&mutated_host_insts, |h| full_set.contains(&h))
+            .expect("derived with merge");
     assert_eq!(baked, 16);
     let (lo, hi) = crate::exec::kvrow::nv_split_span(&sites).expect("span");
     assert_eq!(lo, 0);
@@ -1699,7 +1727,12 @@ fn rung_patch_images_preserve_uploaded_mutated_insts() {
 
     assert_eq!(image[0].i[5], 8, "FlashDecode patched");
     assert_eq!(image[2].i[2], 8, "FlashMerge patched");
-    assert_eq!(image[1].i[0], 9999, "cuBLASLt route mutation retained after patch");
-    assert_ne!(image[1].i[0], g_insts[1].i[0], "does not revert to raw blob insts");
+    assert_eq!(
+        image[1].i[0], 9999,
+        "cuBLASLt route mutation retained after patch"
+    );
+    assert_ne!(
+        image[1].i[0], g_insts[1].i[0],
+        "does not revert to raw blob insts"
+    );
 }
-

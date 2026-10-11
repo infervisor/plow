@@ -330,8 +330,7 @@ pub(super) fn upload_program(
     let cursor_offset = counter_only.max(4);
     let cursor_bytes = CTR_STRIDE as usize * 4;
     let counter_bytes = cursor_offset + cursor_bytes;
-    let (d_counter, [counter_view, cursor_view]) =
-        slab_carve(be, [cursor_offset, cursor_bytes])?;
+    let (d_counter, [counter_view, cursor_view]) = slab_carve(be, [cursor_offset, cursor_bytes])?;
     let kernarg = DevProgram {
         insts: d_inst.base,
         stream: d_stream.base,

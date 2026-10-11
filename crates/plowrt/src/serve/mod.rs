@@ -2,17 +2,15 @@
 
 pub mod admin;
 pub mod auth;
-#[cfg(feature = "cpu")]
-pub mod portable;
 pub mod bench;
 pub mod chat;
 pub mod completion;
 pub mod config;
 pub mod cosched;
-pub mod deadlines;
-pub mod dp;
 #[cfg(feature = "cpu")]
 pub mod cpu_serve;
+pub mod deadlines;
+pub mod dp;
 /// The loaded device engine behind a slug, as one type over both backends —
 /// the seam that lets `serve` stop being CUDA-only.
 #[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu"))]
@@ -22,21 +20,23 @@ pub mod engine;
 #[cfg(feature = "cpu")]
 #[allow(dead_code)]
 pub mod head;
-pub mod policy;
+pub mod logprobs;
 #[cfg(feature = "cuda")]
 pub mod manager;
-pub mod logprobs;
 pub mod mm;
 pub mod models;
 pub mod mux;
 pub mod openai;
 pub mod overload;
 pub mod placement;
+pub mod policy;
+#[cfg(feature = "cpu")]
+pub mod portable;
 pub mod reasoning;
-pub mod stream;
 pub mod session;
 #[cfg(all(test, any(feature = "hsa", feature = "cpu")))]
 mod step_lowering_tests;
+pub mod stream;
 pub mod template;
 pub mod tokenize;
 pub mod tools;
@@ -105,7 +105,11 @@ pub(crate) fn default_max_tokens(default: usize, max_ctx: Option<usize>, n_promp
 /// Refuse up front a request whose prompt plus budget cannot fit the context. The CUDA engine
 /// refuses it at seating; the AMD batch only noticed when the slot's position ran past the
 /// context, and that failed every request in the batch.
-pub(crate) fn context_overflow(max_ctx: Option<usize>, n_prompt: usize, max_tokens: usize) -> Option<RuntimeError> {
+pub(crate) fn context_overflow(
+    max_ctx: Option<usize>,
+    n_prompt: usize,
+    max_tokens: usize,
+) -> Option<RuntimeError> {
     let ctx = max_ctx?;
     let total = n_prompt.saturating_add(max_tokens.max(1));
     (total > ctx).then(|| {
@@ -117,10 +121,16 @@ pub(crate) fn context_overflow(max_ctx: Option<usize>, n_prompt: usize, max_toke
 
 /// Refuse, before encoding, a prompt too long for the context under any tokenization: it has more
 /// than `max_ctx` tokens once no token can cover all `max_token_bytes` of its share.
-pub(crate) fn prompt_bytes_overflow(max_ctx: Option<usize>, max_token_bytes: usize, bytes: usize) -> Option<RuntimeError> {
+pub(crate) fn prompt_bytes_overflow(
+    max_ctx: Option<usize>,
+    max_token_bytes: usize,
+    bytes: usize,
+) -> Option<RuntimeError> {
     let ctx = max_ctx?;
     (bytes / max_token_bytes.max(1) > ctx).then(|| {
-        RuntimeError::ContextLength(format!("prompt ({bytes} bytes) has more tokens than the context {ctx}"))
+        RuntimeError::ContextLength(format!(
+            "prompt ({bytes} bytes) has more tokens than the context {ctx}"
+        ))
     })
 }
 
@@ -180,8 +190,14 @@ mod tests {
     fn prompt_plus_budget_past_the_context_is_a_context_error() {
         use super::context_overflow;
         assert!(context_overflow(Some(16384), 14000, 2384).is_none());
-        assert!(matches!(context_overflow(Some(16384), 14000, 2385), Some(RuntimeError::ContextLength(_))));
-        assert!(matches!(context_overflow(Some(16384), 16384, 4096), Some(RuntimeError::ContextLength(_))));
+        assert!(matches!(
+            context_overflow(Some(16384), 14000, 2385),
+            Some(RuntimeError::ContextLength(_))
+        ));
+        assert!(matches!(
+            context_overflow(Some(16384), 16384, 4096),
+            Some(RuntimeError::ContextLength(_))
+        ));
         assert!(context_overflow(None, 1 << 30, 1 << 30).is_none());
     }
 
@@ -191,7 +207,10 @@ mod tests {
         let byte = crate::text::tokenizer::ByteTokenizer;
         let tok: &dyn crate::text::tokenizer::Tokenize = &byte;
         assert!(prompt_bytes_overflow(Some(8), tok.max_token_bytes(), 8).is_none());
-        assert!(matches!(prompt_bytes_overflow(Some(8), tok.max_token_bytes(), 9), Some(RuntimeError::ContextLength(_))));
+        assert!(matches!(
+            prompt_bytes_overflow(Some(8), tok.max_token_bytes(), 9),
+            Some(RuntimeError::ContextLength(_))
+        ));
         assert!(prompt_bytes_overflow(Some(8), 400, 8 * 400 + 399).is_none());
         assert!(prompt_bytes_overflow(Some(8), 400, 9 * 400).is_some());
         assert!(prompt_bytes_overflow(Some(8), usize::MAX, usize::MAX).is_none());
@@ -203,8 +222,14 @@ mod tests {
         let long = "a".repeat(super::BLOCKING_ENCODE_BYTES + 1);
         let tok = crate::text::tokenizer::ByteTokenizer;
         use crate::text::tokenizer::Tokenize;
-        assert_eq!(super::encode_prompt(&long, |t| tok.encode(t)).len(), long.len());
-        assert_eq!(super::encode_prompt("hi", |t| tok.encode(t)), vec![104, 105]);
+        assert_eq!(
+            super::encode_prompt(&long, |t| tok.encode(t)).len(),
+            long.len()
+        );
+        assert_eq!(
+            super::encode_prompt("hi", |t| tok.encode(t)),
+            vec![104, 105]
+        );
     }
 
     fn fault(fatal: bool) -> RuntimeError {
@@ -619,7 +644,8 @@ impl AppState {
 
     fn refresh_up(&self, key: &str) {
         if let Some((set, r)) = self.dp_rank(key) {
-            set.ranks[r].set_up(self.muxes.read().contains_key(key) && self.residency(key).admits());
+            set.ranks[r]
+                .set_up(self.muxes.read().contains_key(key) && self.residency(key).admits());
         }
     }
 
@@ -633,12 +659,19 @@ impl AppState {
         session: Option<&str>,
         prompt: Option<&[u32]>,
         mut exclude: u32,
-    ) -> Option<(usize, mux::ModelMux, Option<crate::memory::vmm::PrefixKey>, dp::Pick<'s>)> {
+    ) -> Option<(
+        usize,
+        mux::ModelMux,
+        Option<crate::memory::vmm::PrefixKey>,
+        dp::Pick<'s>,
+    )> {
         let cfg = self.dp.get()?.cfg;
         loop {
             let routed = set.route(&cfg, session, prompt, exclude)?;
             match self.mux(&set.ranks[routed.rank].key) {
-                Some(m) if !m.preempted() => return Some((routed.rank, m, routed.key, routed.pick)),
+                Some(m) if !m.preempted() => {
+                    return Some((routed.rank, m, routed.key, routed.pick))
+                }
                 _ => exclude |= 1 << routed.rank,
             }
         }
@@ -680,7 +713,10 @@ impl AppState {
             };
             // Media rows are staged into the serving engine's own slab: move the reservation.
             if let Some(mm) = job.opts.mm.as_mut() {
-                if !self.mm_model(&set.ranks[r].key).is_some_and(|m| mm.rebind(m.slab())) {
+                if !self
+                    .mm_model(&set.ranks[r].key)
+                    .is_some_and(|m| mm.rebind(m.slab()))
+                {
                     return Err(mux::SubmitError::Full(job));
                 }
             }
@@ -699,7 +735,9 @@ impl AppState {
         }
         let mut last = manager::EnsureError::Unloaded;
         for r in set.ranks.iter().filter(|r| self.residency(&r.key).admits()) {
-            let Some(mgr) = self.manager_for(&r.key) else { continue };
+            let Some(mgr) = self.manager_for(&r.key) else {
+                continue;
+            };
             match mgr.ensure_resident(&r.key).await {
                 Ok(()) => return Ok(()),
                 Err(e) => last = e,
@@ -720,8 +758,12 @@ impl AppState {
             .write()
             .insert(slug.clone(), engine.honours_sampling());
         if let Some((set, r)) = self.dp_rank(&slug) {
-            self.max_ctx.write().insert(set.model.clone(), engine.max_ctx());
-            self.sampling_honoured.write().insert(set.model.clone(), engine.honours_sampling());
+            self.max_ctx
+                .write()
+                .insert(set.model.clone(), engine.max_ctx());
+            self.sampling_honoured
+                .write()
+                .insert(set.model.clone(), engine.honours_sampling());
             #[cfg(feature = "cuda")]
             set.set_probe(r, engine.vmm_prefix_probe());
             #[cfg(not(feature = "cuda"))]
@@ -736,8 +778,17 @@ impl AppState {
     }
 
     /// Give instance `key` its own multimodal runtime on `device`, replacing any earlier one.
-    pub fn install_mm(&self, key: &str, dir: &std::path::Path, contract: &plow_asset::multimodal::MmContract, device: u8) {
-        self.mm.write().insert(key.to_string(), Arc::new(mm::MmModel::new(dir, contract, device)));
+    pub fn install_mm(
+        &self,
+        key: &str,
+        dir: &std::path::Path,
+        contract: &plow_asset::multimodal::MmContract,
+        device: u8,
+    ) {
+        self.mm.write().insert(
+            key.to_string(),
+            Arc::new(mm::MmModel::new(dir, contract, device)),
+        );
     }
 
     /// Instance `key`'s multimodal runtime, while its engine is installed.
@@ -769,7 +820,11 @@ impl AppState {
     /// `true` when no engine is installed — the CPU reference path samples on
     /// the host, so there is nothing to warn about.
     pub fn sampling_honoured(&self, slug: &str) -> bool {
-        self.sampling_honoured.read().get(slug).copied().unwrap_or(true)
+        self.sampling_honoured
+            .read()
+            .get(slug)
+            .copied()
+            .unwrap_or(true)
     }
 
     /// The GPU engine serving `slug`, when one was installed.
@@ -871,7 +926,9 @@ impl AppState {
     /// `slug`'s downstream credit (created on first use; unlimited until a stage sets a limit).
     pub fn downstream(&self, slug: &str) -> Arc<crate::sched::admission::DownstreamCredit> {
         let known = self.downstream.read().get(slug).cloned();
-        let credit = known.unwrap_or_else(|| Arc::clone(self.downstream.write().entry(slug.to_string()).or_default()));
+        let credit = known.unwrap_or_else(|| {
+            Arc::clone(self.downstream.write().entry(slug.to_string()).or_default())
+        });
         if credit.device_turn().is_none() {
             if let Some(turn) = self.device_turn(slug) {
                 credit.set_device_turn(turn);
@@ -1010,7 +1067,9 @@ impl AppState {
         }
         let mut models = self.model_metrics.write();
         models.retain(|name, metrics| {
-            let keep = self.registry.contains(name) || Arc::strong_count(metrics) > 1 || self.dp_rank(name).is_some();
+            let keep = self.registry.contains(name)
+                || Arc::strong_count(metrics) > 1
+                || self.dp_rank(name).is_some();
             if !keep {
                 self.metrics.accumulate_counters(metrics);
             }
@@ -1266,7 +1325,8 @@ pub fn app(state: Arc<AppState>) -> Router {
         .layer(axum::extract::DefaultBodyLimit::max(MAX_BODY_BYTES))
         .with_state(Arc::clone(&state));
     #[cfg(feature = "cuda")]
-    let router = router.merge(crate::asr::serving::AsrServer::for_serve(state).transcription_router(true));
+    let router =
+        router.merge(crate::asr::serving::AsrServer::for_serve(state).transcription_router(true));
     router
 }
 
@@ -1282,18 +1342,27 @@ async fn healthz(
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
 ) -> (axum::http::StatusCode, String) {
     if *state.shutdown.borrow() {
-        return (axum::http::StatusCode::SERVICE_UNAVAILABLE, "shutting down".into());
+        return (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "shutting down".into(),
+        );
     }
     let (dead, degraded) = dead_engines(&state);
     if dead.is_empty() && !degraded.is_empty() {
-        return (axum::http::StatusCode::OK, format!("degraded: DP ranks dead: {}", degraded.join(",")));
+        return (
+            axum::http::StatusCode::OK,
+            format!("degraded: DP ranks dead: {}", degraded.join(",")),
+        );
     }
     if dead.is_empty() {
         (axum::http::StatusCode::OK, "ok".into())
     } else {
         (
             axum::http::StatusCode::SERVICE_UNAVAILABLE,
-            format!("engine dead (fatal device fault or ASR encoder exit): {}", dead.join(",")),
+            format!(
+                "engine dead (fatal device fault or ASR encoder exit): {}",
+                dead.join(",")
+            ),
         )
     }
 }
@@ -1325,53 +1394,129 @@ fn dp_metrics(out: &mut String, router: &dp::DpRouter, state: &AppState) {
     use std::sync::atomic::Ordering::Relaxed;
     let mut sets: Vec<_> = router.sets().collect();
     sets.sort_unstable_by(|a, b| a.model.cmp(&b.model));
-    family(out, "plowrt_dp_rank_info", "gauge", "DP rank placement: the device its group starts at.");
+    family(
+        out,
+        "plowrt_dp_rank_info",
+        "gauge",
+        "DP rank placement: the device its group starts at.",
+    );
     for set in &sets {
         for r in &set.ranks {
             let m = escape_label(&set.model);
-            let _ = writeln!(out, "plowrt_dp_rank_info{{model_name=\"{m}\",engine=\"{}\",device=\"{}\"}} 1", r.rank, r.ordinal);
+            let _ = writeln!(
+                out,
+                "plowrt_dp_rank_info{{model_name=\"{m}\",engine=\"{}\",device=\"{}\"}} 1",
+                r.rank, r.ordinal
+            );
         }
     }
-    family(out, "plowrt_dp_rank_up", "gauge", "DP rank has a dispatcher and admits requests.");
+    family(
+        out,
+        "plowrt_dp_rank_up",
+        "gauge",
+        "DP rank has a dispatcher and admits requests.",
+    );
     for set in &sets {
         for r in &set.ranks {
             let m = escape_label(&set.model);
-            let _ = writeln!(out, "plowrt_dp_rank_up{{model_name=\"{m}\",engine=\"{}\"}} {}", r.rank, u8::from(r.is_up() && state.residency(&r.key).admits()));
+            let _ = writeln!(
+                out,
+                "plowrt_dp_rank_up{{model_name=\"{m}\",engine=\"{}\"}} {}",
+                r.rank,
+                u8::from(r.is_up() && state.residency(&r.key).admits())
+            );
         }
     }
-    family(out, "plowrt_dp_rank_load", "gauge", "DP router load signal: (queued + active) / slots + KV pressure.");
+    family(
+        out,
+        "plowrt_dp_rank_load",
+        "gauge",
+        "DP router load signal: (queued + active) / slots + KV pressure.",
+    );
     for set in &sets {
         for r in &set.ranks {
             let m = escape_label(&set.model);
-            let _ = writeln!(out, "plowrt_dp_rank_load{{model_name=\"{m}\",engine=\"{}\"}} {}", r.rank, dp::load(&r.cand()));
+            let _ = writeln!(
+                out,
+                "plowrt_dp_rank_load{{model_name=\"{m}\",engine=\"{}\"}} {}",
+                r.rank,
+                dp::load(&r.cand())
+            );
         }
     }
-    family(out, "plowrt_dp_route_decisions_total", "counter", "DP routing decisions by the rule that chose the rank.");
+    family(
+        out,
+        "plowrt_dp_route_decisions_total",
+        "counter",
+        "DP routing decisions by the rule that chose the rank.",
+    );
     for set in &sets {
         for reason in dp::Reason::ALL {
             let m = escape_label(&set.model);
-            let _ = writeln!(out, "plowrt_dp_route_decisions_total{{model_name=\"{m}\",reason=\"{}\"}} {}", reason.as_str(), set.stats.decisions[reason as usize].load(Relaxed));
+            let _ = writeln!(
+                out,
+                "plowrt_dp_route_decisions_total{{model_name=\"{m}\",reason=\"{}\"}} {}",
+                reason.as_str(),
+                set.stats.decisions[reason as usize].load(Relaxed)
+            );
         }
     }
     for (name, help, read) in [
-        ("plowrt_dp_route_retries_total", "Requests resubmitted to another rank after the first closed.", (|s: &dp::DpStats| s.retries.load(Relaxed)) as fn(&dp::DpStats) -> u64),
-        ("plowrt_route_probes_total", "Prefix-cache probes the DP router made.", |s| s.probes.load(Relaxed)),
-        ("plowrt_route_probe_contended_total", "Prefix-cache probes skipped because the cache lock was held.", |s| s.probe_contended.load(Relaxed)),
+        (
+            "plowrt_dp_route_retries_total",
+            "Requests resubmitted to another rank after the first closed.",
+            (|s: &dp::DpStats| s.retries.load(Relaxed)) as fn(&dp::DpStats) -> u64,
+        ),
+        (
+            "plowrt_route_probes_total",
+            "Prefix-cache probes the DP router made.",
+            |s| s.probes.load(Relaxed),
+        ),
+        (
+            "plowrt_route_probe_contended_total",
+            "Prefix-cache probes skipped because the cache lock was held.",
+            |s| s.probe_contended.load(Relaxed),
+        ),
     ] {
         family(out, name, "counter", help);
         for set in &sets {
-            let _ = writeln!(out, "{name}{{model_name=\"{}\"}} {}", escape_label(&set.model), read(&set.stats));
+            let _ = writeln!(
+                out,
+                "{name}{{model_name=\"{}\"}} {}",
+                escape_label(&set.model),
+                read(&set.stats)
+            );
         }
     }
-    family(out, "plowrt_dp_route_seconds", "gauge", "DP route wall time, upper bound of the log2 bucket at the quantile.");
+    family(
+        out,
+        "plowrt_dp_route_seconds",
+        "gauge",
+        "DP route wall time, upper bound of the log2 bucket at the quantile.",
+    );
     for set in &sets {
         for q in [0.5, 0.99, 0.999] {
-            let _ = writeln!(out, "plowrt_dp_route_seconds{{model_name=\"{}\",quantile=\"{q}\"}} {}", escape_label(&set.model), set.stats.route_ns_quantile(q) as f64 * 1e-9);
+            let _ = writeln!(
+                out,
+                "plowrt_dp_route_seconds{{model_name=\"{}\",quantile=\"{q}\"}} {}",
+                escape_label(&set.model),
+                set.stats.route_ns_quantile(q) as f64 * 1e-9
+            );
         }
     }
-    family(out, "plowrt_dp_sessions", "gauge", "Sessions pinned to a DP rank.");
+    family(
+        out,
+        "plowrt_dp_sessions",
+        "gauge",
+        "Sessions pinned to a DP rank.",
+    );
     for set in &sets {
-        let _ = writeln!(out, "plowrt_dp_sessions{{model_name=\"{}\"}} {}", escape_label(&set.model), set.sessions());
+        let _ = writeln!(
+            out,
+            "plowrt_dp_sessions{{model_name=\"{}\"}} {}",
+            escape_label(&set.model),
+            set.sessions()
+        );
     }
 }
 
@@ -1381,7 +1526,9 @@ fn dead_rank(m: &Metrics) -> bool {
 
 fn packet_model(slug: &str) -> bool {
     #[cfg(feature = "cuda")]
-    return crate::asr::serving::packet_model_names().iter().any(|n| n == slug);
+    return crate::asr::serving::packet_model_names()
+        .iter()
+        .any(|n| n == slug);
     #[cfg(not(feature = "cuda"))]
     {
         let _ = slug;
@@ -1390,37 +1537,42 @@ fn packet_model(slug: &str) -> bool {
 }
 
 fn metrics_models(state: &AppState) -> Vec<(String, Arc<Metrics>, bool)> {
-        let mut metrics = state.model_metrics.write();
-        for slug in state.registry.slugs() {
-            match state.dp_set(&slug) {
-                Some(set) => {
-                    for r in &set.ranks {
-                        metrics.entry(r.key.clone()).or_insert_with(|| Arc::clone(&r.metrics));
-                    }
+    let mut metrics = state.model_metrics.write();
+    for slug in state.registry.slugs() {
+        match state.dp_set(&slug) {
+            Some(set) => {
+                for r in &set.ranks {
+                    metrics
+                        .entry(r.key.clone())
+                        .or_insert_with(|| Arc::clone(&r.metrics));
                 }
-                None => {
-                    metrics.entry(slug).or_default();
-                }
+            }
+            None => {
+                metrics.entry(slug).or_default();
             }
         }
-        metrics.retain(|slug, metrics| {
-            let keep = state.registry.contains(slug) && state.dp_set(slug).is_none()
-                || Arc::strong_count(metrics) > 1
-                || state.dp_rank(slug).is_some();
-            if !keep {
-                state.metrics.accumulate_counters(metrics);
-            }
-            keep
-        });
-        let mut models: Vec<_> = metrics.iter().map(|(slug, m)| {
+    }
+    metrics.retain(|slug, metrics| {
+        let keep = state.registry.contains(slug) && state.dp_set(slug).is_none()
+            || Arc::strong_count(metrics) > 1
+            || state.dp_rank(slug).is_some();
+        if !keep {
+            state.metrics.accumulate_counters(metrics);
+        }
+        keep
+    });
+    let mut models: Vec<_> = metrics
+        .iter()
+        .map(|(slug, m)| {
             (
                 slug.clone(),
                 Arc::clone(m),
                 state.mux(slug).is_some() && state.residency(slug).admits() || packet_model(slug),
             )
-        }).collect();
-        models.sort_unstable_by(|a, b| a.0.cmp(&b.0));
-        models
+        })
+        .collect();
+    models.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+    models
 }
 
 async fn metrics_snapshot_handler(
@@ -1434,19 +1586,40 @@ fn mm_metrics(out: &mut String, state: &AppState) {
     use std::fmt::Write;
     use std::sync::atomic::Ordering::Relaxed;
     let mm = state.mm.read();
-    let mut engines: Vec<_> = mm.iter().map(|(k, m)| (crate::obs::serving::model_labels(k), m)).collect();
+    let mut engines: Vec<_> = mm
+        .iter()
+        .map(|(k, m)| (crate::obs::serving::model_labels(k), m))
+        .collect();
     if engines.is_empty() {
         return;
     }
     engines.sort_unstable_by(|a, b| a.0.cmp(&b.0));
     type Value = fn(&mm::MmModel) -> u64;
     let plain: [(&str, &str, &str, Value); 4] = [
-        ("plowrt_mm_slab_rows", "gauge", "Soft-token rows the engine's multimodal slab holds.", |m| m.slab().occupancy().2.into()),
-        ("plowrt_mm_slab_rows_reserved", "gauge", "Slab rows reserved by admitted media requests.", |m| m.slab().occupancy().0.into()),
-        ("plowrt_mm_slab_rows_staged", "gauge", "Slab rows staged on the device for in-flight prompts.", |m| m.slab().occupancy().1.into()),
-        ("plowrt_mm_slab_full_total", "counter", "Media requests refused with 503 because the slab had no room.", |m| {
-            m.stats.slab_full.load(Relaxed)
-        }),
+        (
+            "plowrt_mm_slab_rows",
+            "gauge",
+            "Soft-token rows the engine's multimodal slab holds.",
+            |m| m.slab().occupancy().2.into(),
+        ),
+        (
+            "plowrt_mm_slab_rows_reserved",
+            "gauge",
+            "Slab rows reserved by admitted media requests.",
+            |m| m.slab().occupancy().0.into(),
+        ),
+        (
+            "plowrt_mm_slab_rows_staged",
+            "gauge",
+            "Slab rows staged on the device for in-flight prompts.",
+            |m| m.slab().occupancy().1.into(),
+        ),
+        (
+            "plowrt_mm_slab_full_total",
+            "counter",
+            "Media requests refused with 503 because the slab had no room.",
+            |m| m.stats.slab_full.load(Relaxed),
+        ),
     ];
     for (name, kind, help, value) in plain {
         crate::obs::serving::family(out, name, kind, help);
@@ -1454,10 +1627,19 @@ fn mm_metrics(out: &mut String, state: &AppState) {
             let _ = writeln!(out, "{name}{{{labels}}} {}", value(m));
         }
     }
-    crate::obs::serving::family(out, "plowrt_mm_encode_total", "counter", "Encoder calls (one image batch or one audio clip).");
+    crate::obs::serving::family(
+        out,
+        "plowrt_mm_encode_total",
+        "counter",
+        "Encoder calls (one image batch or one audio clip).",
+    );
     for (labels, m) in &engines {
         for (kind, s) in [("image", &m.stats.image), ("audio", &m.stats.audio)] {
-            let _ = writeln!(out, "plowrt_mm_encode_total{{{labels},kind=\"{kind}\"}} {}", s.calls.load(Relaxed));
+            let _ = writeln!(
+                out,
+                "plowrt_mm_encode_total{{{labels},kind=\"{kind}\"}} {}",
+                s.calls.load(Relaxed)
+            );
         }
     }
     crate::obs::serving::family(
@@ -1468,7 +1650,11 @@ fn mm_metrics(out: &mut String, state: &AppState) {
     );
     for (labels, m) in &engines {
         for (kind, s) in [("image", &m.stats.image), ("audio", &m.stats.audio)] {
-            let _ = writeln!(out, "plowrt_mm_encode_seconds_total{{{labels},kind=\"{kind}\"}} {}", s.micros.load(Relaxed) as f64 / 1e6);
+            let _ = writeln!(
+                out,
+                "plowrt_mm_encode_seconds_total{{{labels},kind=\"{kind}\"}} {}",
+                s.micros.load(Relaxed) as f64 / 1e6
+            );
         }
     }
 }
@@ -1486,7 +1672,11 @@ async fn metrics_handler(
     let mut out = aggregate.to_prometheus();
     for (index, (slug, metrics, _)) in models.iter().enumerate() {
         let label = crate::obs::serving::model_labels(slug);
-        for line in metrics.to_prometheus().replace("plowrt_", "plowrt_model_").lines() {
+        for line in metrics
+            .to_prometheus()
+            .replace("plowrt_", "plowrt_model_")
+            .lines()
+        {
             if line.starts_with('#') {
                 if index == 0 {
                     out.push_str(line);
@@ -1510,22 +1700,70 @@ async fn metrics_handler(
     // under sustained inference (only the pool mutex is taken, µs holds).
     #[cfg(feature = "cuda")]
     for (name, kind, help) in [
-        ("attach_hits_total", "counter", "Successful prefix attach requests."),
-        ("attach_misses_total", "counter", "Prefix attach requests without a reusable prefix."),
-        ("tokens_queried_total", "counter", "Prompt tokens queried for prefix cache reuse."),
-        ("tokens_attached_total", "counter", "Tokens attached from reusable prefix blocks."),
-        ("hash_collisions_total", "counter", "Prefix hash collisions detected."),
-        ("blocks_shared_mapped_total", "counter", "Shared prefix blocks mapped."),
-        ("nodes_evicted_total", "counter", "Prefix tree nodes evicted."),
+        (
+            "attach_hits_total",
+            "counter",
+            "Successful prefix attach requests.",
+        ),
+        (
+            "attach_misses_total",
+            "counter",
+            "Prefix attach requests without a reusable prefix.",
+        ),
+        (
+            "tokens_queried_total",
+            "counter",
+            "Prompt tokens queried for prefix cache reuse.",
+        ),
+        (
+            "tokens_attached_total",
+            "counter",
+            "Tokens attached from reusable prefix blocks.",
+        ),
+        (
+            "hash_collisions_total",
+            "counter",
+            "Prefix hash collisions detected.",
+        ),
+        (
+            "blocks_shared_mapped_total",
+            "counter",
+            "Shared prefix blocks mapped.",
+        ),
+        (
+            "nodes_evicted_total",
+            "counter",
+            "Prefix tree nodes evicted.",
+        ),
         ("blocks_live", "gauge", "Live prefix pool blocks."),
-        ("blocks_stale", "gauge", "Retired-window blocks still mapped, awaiting the reclaimer."),
-        ("blocks_pooled", "gauge", "Zero-reference blocks parked in the reuse pool."),
+        (
+            "blocks_stale",
+            "gauge",
+            "Retired-window blocks still mapped, awaiting the reclaimer.",
+        ),
+        (
+            "blocks_pooled",
+            "gauge",
+            "Zero-reference blocks parked in the reuse pool.",
+        ),
         ("cache_blocks", "gauge", "Prefix cache blocks."),
         ("cache_bytes", "gauge", "Prefix cache bytes."),
         ("snapshot_bytes", "gauge", "Prefix snapshot bytes."),
-        ("snapshots_evicted_total", "counter", "Prefix snapshots evicted."),
-        ("eviction_units_total", "counter", "Suffix evictions: a boundary plus the blocks only it kept attachable."),
-        ("eviction_unit_bytes_total", "counter", "Bytes freed by suffix evictions."),
+        (
+            "snapshots_evicted_total",
+            "counter",
+            "Prefix snapshots evicted.",
+        ),
+        (
+            "eviction_units_total",
+            "counter",
+            "Suffix evictions: a boundary plus the blocks only it kept attachable.",
+        ),
+        (
+            "eviction_unit_bytes_total",
+            "counter",
+            "Bytes freed by suffix evictions.",
+        ),
     ] {
         crate::obs::serving::family(&mut out, &format!("plowrt_prefix_{name}"), kind, help);
     }
@@ -1570,7 +1808,11 @@ async fn metrics_handler(
             s.eviction_unit_bytes,
         );
     }
-    ([("content-type", "text/plain; version=0.0.4; charset=utf-8")], out).into_response()
+    (
+        [("content-type", "text/plain; version=0.0.4; charset=utf-8")],
+        out,
+    )
+        .into_response()
 }
 
 /// Build an OpenAI-shaped error response: `{"error": {message, type, code}}`.
@@ -1616,12 +1858,23 @@ mod mm_state_tests {
     use std::sync::Arc;
 
     fn state() -> AppState {
-        let backend: Arc<dyn crate::device::Backend> = Arc::new(crate::device::cpu::CpuBackend::new(1));
-        AppState::new(crate::orch::Registry::new(), Arc::new(crate::exec::ExecutorSet::bringup(backend).unwrap()))
+        let backend: Arc<dyn crate::device::Backend> =
+            Arc::new(crate::device::cpu::CpuBackend::new(1));
+        AppState::new(
+            crate::orch::Registry::new(),
+            Arc::new(crate::exec::ExecutorSet::bringup(backend).unwrap()),
+        )
     }
 
     fn contract() -> plow_asset::multimodal::MmContract {
-        plow_asset::multimodal::MmContract { version: 1, hidden: 2, pad_token: 0, slab_rows: 4, table_capacity: 8, modalities: Vec::new() }
+        plow_asset::multimodal::MmContract {
+            version: 1,
+            hidden: 2,
+            pad_token: 0,
+            slab_rows: 4,
+            table_capacity: 8,
+            modalities: Vec::new(),
+        }
     }
 
     /// Each rank's encoders sit on its own device and its slab mirrors its own table.
@@ -1631,7 +1884,10 @@ mod mm_state_tests {
         let dir = std::path::Path::new("/assets/m");
         state.install_mm("m@dp0", dir, &contract(), 1);
         state.install_mm("m@dp1", dir, &contract(), 3);
-        let (r0, r1) = (state.mm_model("m@dp0").unwrap(), state.mm_model("m@dp1").unwrap());
+        let (r0, r1) = (
+            state.mm_model("m@dp0").unwrap(),
+            state.mm_model("m@dp1").unwrap(),
+        );
         assert_eq!((r0.device(), r1.device()), (1, 3));
         assert!(!Arc::ptr_eq(r0.slab(), r1.slab()));
         assert!(state.mm_model("m").is_none());
@@ -1648,7 +1904,10 @@ mod mm_state_tests {
         let slab = Arc::downgrade(state.mm_model("m@dp0").unwrap().slab());
         assert!(state.remove_gpu_engine("m@dp0").is_none());
         assert!(state.mm_model("m@dp0").is_none());
-        assert!(model.upgrade().is_none(), "encoders are owned by the instance and drop with it");
+        assert!(
+            model.upgrade().is_none(),
+            "encoders are owned by the instance and drop with it"
+        );
         assert!(slab.upgrade().is_none());
         assert!(state.mm_model("m@dp1").is_some(), "other ranks keep theirs");
     }
@@ -1664,7 +1923,8 @@ mod health_tests {
     /// orchestrator keeps routing traffic to an instance that can never answer.
     #[tokio::test]
     async fn health_reports_a_dead_engine() {
-        let backend: Arc<dyn crate::device::Backend> = Arc::new(crate::device::cpu::CpuBackend::new(1));
+        let backend: Arc<dyn crate::device::Backend> =
+            Arc::new(crate::device::cpu::CpuBackend::new(1));
         let execset = Arc::new(crate::exec::ExecutorSet::bringup(backend).unwrap());
         let state = Arc::new(AppState::new(crate::orch::Registry::new(), execset));
         let metrics = state.model_metrics("m");
@@ -1682,20 +1942,35 @@ mod health_tests {
     /// One dead DP rank degrades the model; only every rank dead fails `/health`.
     #[tokio::test]
     async fn health_is_degraded_until_every_dp_rank_is_dead() {
-        let backend: Arc<dyn crate::device::Backend> = Arc::new(crate::device::cpu::CpuBackend::new(1));
+        let backend: Arc<dyn crate::device::Backend> =
+            Arc::new(crate::device::cpu::CpuBackend::new(1));
         let execset = Arc::new(crate::exec::ExecutorSet::bringup(backend).unwrap());
         let state = Arc::new(AppState::new(crate::orch::Registry::new(), execset));
         let mut router = super::dp::DpRouter::new(Default::default());
-        router.add(super::dp::DpSet::new("g", (0..2).map(|r| (r, r as usize, state.model_metrics(&format!("g#{r}")))).collect()));
+        router.add(super::dp::DpSet::new(
+            "g",
+            (0..2)
+                .map(|r| (r, r as usize, state.model_metrics(&format!("g#{r}"))))
+                .collect(),
+        ));
         state.install_dp(router);
         let set = Arc::clone(state.dp_set("g").unwrap());
-        set.ranks[0].metrics.engine_dead.store(true, Ordering::Relaxed);
+        set.ranks[0]
+            .metrics
+            .engine_dead
+            .store(true, Ordering::Relaxed);
         let (code, body) = healthz(axum::extract::State(Arc::clone(&state))).await;
         assert_eq!(code, StatusCode::OK);
-        assert!(body.starts_with("degraded") && body.contains("g#0"), "{body}");
+        assert!(
+            body.starts_with("degraded") && body.contains("g#0"),
+            "{body}"
+        );
         // A degraded DP set still serves: no exit for it.
         assert!(super::dead_engines(&state).0.is_empty());
-        set.ranks[1].metrics.engine_dead.store(true, Ordering::Relaxed);
+        set.ranks[1]
+            .metrics
+            .engine_dead
+            .store(true, Ordering::Relaxed);
         let (code, _) = healthz(axum::extract::State(state)).await;
         assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE);
     }

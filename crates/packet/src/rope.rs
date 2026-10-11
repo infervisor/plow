@@ -325,14 +325,20 @@ impl GenTensor {
     pub fn amd_rope_bf16(&self) -> bool {
         let geometry = match self.kind {
             GEN_AMD_ROPE_BF16_COS | GEN_AMD_ROPE_BF16_SIN => self.hd == 64 && self.aux == 0,
-            GEN_AMD_ROPE_IDX_BF16_COS | GEN_AMD_ROPE_IDX_BF16_SIN => self.hd == 128 && self.aux == 64,
+            GEN_AMD_ROPE_IDX_BF16_COS | GEN_AMD_ROPE_IDX_BF16_SIN => {
+                self.hd == 128 && self.aux == 64
+            }
             _ => false,
         };
         geometry
             && (1..=131072).contains(&self.ctx)
-            && self.theta == 8000000.0 && self.frac == 1.0
+            && self.theta == 8000000.0
+            && self.frac == 1.0
             && self.scale == ROPE_SCALE_NONE
-            && self.factor == 0.0 && self.low == 0.0 && self.high == 0.0 && self.orig == 0.0
+            && self.factor == 0.0
+            && self.low == 0.0
+            && self.high == 0.0
+            && self.orig == 0.0
     }
 
     /// Byte size of the table this recipe produces — `ctx` rows of `hd/2` f32 for the
@@ -514,11 +520,7 @@ impl GenTensor {
             scale: v_target,
             theta: 0.0,
             frac: n_kv_head as f64,
-            factor: if box_rows == 32 {
-                0.0
-            } else {
-                box_rows as f64
-            },
+            factor: if box_rows == 32 { 0.0 } else { box_rows as f64 },
             low: 0.0,
             high: 0.0,
             orig: 0.0,
@@ -580,21 +582,44 @@ mod tests {
         g.kind = GEN_AMD_ROPE_BF16_COS;
         assert!(g.amd_rope_bf16());
         assert!(g.generate().is_none());
-        for bad in [GenTensor { ctx: 0, ..g }, GenTensor { ctx: 131073, ..g },
-            GenTensor { hd: 128, ..g }, GenTensor { theta: 10000.0, ..g },
-            GenTensor { frac: 0.5, ..g }, GenTensor { scale: ROPE_SCALE_LINEAR, ..g },
-            GenTensor { aux: 64, ..g }, GenTensor { low: f64::NAN, ..g }] {
+        for bad in [
+            GenTensor { ctx: 0, ..g },
+            GenTensor { ctx: 131073, ..g },
+            GenTensor { hd: 128, ..g },
+            GenTensor {
+                theta: 10000.0,
+                ..g
+            },
+            GenTensor { frac: 0.5, ..g },
+            GenTensor {
+                scale: ROPE_SCALE_LINEAR,
+                ..g
+            },
+            GenTensor { aux: 64, ..g },
+            GenTensor { low: f64::NAN, ..g },
+        ] {
             assert!(!bad.amd_rope_bf16());
             assert!(bad.generate().is_none());
         }
         for kind in [GEN_AMD_ROPE_IDX_BF16_COS, GEN_AMD_ROPE_IDX_BF16_SIN] {
-            let idx = GenTensor { kind, ..GenTensor::rope_idx_pair(131072, 64, 128, 8000000.0)[0] };
+            let idx = GenTensor {
+                kind,
+                ..GenTensor::rope_idx_pair(131072, 64, 128, 8000000.0)[0]
+            };
             assert!(idx.amd_rope_bf16());
             assert!(idx.generate().is_none());
             assert_eq!(idx.byte_len(), 131072 * 64 * 4);
-            for bad in [GenTensor { hd: 64, ..idx }, GenTensor { aux: 128, ..idx },
-                GenTensor { ctx: 0, ..idx }, GenTensor { ctx: 131073, ..idx },
-                GenTensor { theta: 10000.0, ..idx }, GenTensor { frac: 0.5, ..idx }] {
+            for bad in [
+                GenTensor { hd: 64, ..idx },
+                GenTensor { aux: 128, ..idx },
+                GenTensor { ctx: 0, ..idx },
+                GenTensor { ctx: 131073, ..idx },
+                GenTensor {
+                    theta: 10000.0,
+                    ..idx
+                },
+                GenTensor { frac: 0.5, ..idx },
+            ] {
                 assert!(!bad.amd_rope_bf16());
                 assert!(bad.generate().is_none());
             }

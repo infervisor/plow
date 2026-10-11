@@ -362,7 +362,16 @@ fn lower_inner(
             repeated_cus(n_cu, attention_blocks),
             &[qd, kd, vd, pos],
             |d| {
-                d.t[..8].copy_from_slice(&[d1, q, k, v, position, bu, bv, valid_rows.unwrap_or(TENSOR_NONE)]);
+                d.t[..8].copy_from_slice(&[
+                    d1,
+                    q,
+                    k,
+                    v,
+                    position,
+                    bu,
+                    bv,
+                    valid_rows.unwrap_or(TENSOR_NONE),
+                ]);
                 d.i[..5].copy_from_slice(&[
                     spec.frames,
                     spec.width,
@@ -429,7 +438,10 @@ fn lower_inner(
             (activated, d1)
         } else {
             // `large` is free once the GLU has read it.
-            (emit_centred_depthwise(&mut b, spec, layer.convolution, large, d1, glu, valid_rows), large)
+            (
+                emit_centred_depthwise(&mut b, spec, layer.convolution, large, d1, glu, valid_rows),
+                large,
+            )
         };
         let convolution = emit_q8(
             &mut b,
@@ -532,18 +544,25 @@ fn emit_centred_depthwise(
     let (k, width) = (spec.convolution_kernel, spec.width);
     let weight = b.tensor(weights.depthwise, u64::from(width) * u64::from(k) * 4);
     let bias = b.tensor(
-        weights.depthwise_bias.expect("validated: a centred convolution has a folded bias"),
+        weights
+            .depthwise_bias
+            .expect("validated: a centred convolution has a folded bias"),
         u64::from(width) * 4,
     );
     let pad = (k - 1) / 2;
     // Depthwise Conv1dF32: one block per 64 output rows x 64 channels.
     let blocks = spec.frames.div_ceil(64) * width.div_ceil(64);
-    b.emit(DevOp::Conv1dF32, repeated_cus(b.n_cu(), blocks), &[dep], |d| {
-        d.t[..4].copy_from_slice(&[output, input, weight, bias]);
-        d.t[6] = valid_rows.unwrap_or(TENSOR_NONE);
-        d.i = [1, spec.frames, width, width, k, 1, 1, width];
-        d.j = [pad | (pad << 16), packet::dev::ACT_SILU << 8];
-    })
+    b.emit(
+        DevOp::Conv1dF32,
+        repeated_cus(b.n_cu(), blocks),
+        &[dep],
+        |d| {
+            d.t[..4].copy_from_slice(&[output, input, weight, bias]);
+            d.t[6] = valid_rows.unwrap_or(TENSOR_NONE);
+            d.i = [1, spec.frames, width, width, k, 1, 1, width];
+            d.j = [pad | (pad << 16), packet::dev::ACT_SILU << 8];
+        },
+    )
 }
 
 fn emit_norm(
@@ -584,7 +603,11 @@ fn emit_q8(
 ) -> u32 {
     let weight = b.tensor(weight_name, u64::from(n) * u64::from(k / 32) * 34);
     // At most 8 rows the kernel walks columns warp by warp (SPQ_GEMV_ROWS): every CU takes a share.
-    let tiles = if m <= 8 { b.n_cu() } else { m.div_ceil(64) * n.div_ceil(64) };
+    let tiles = if m <= 8 {
+        b.n_cu()
+    } else {
+        m.div_ceil(64) * n.div_ceil(64)
+    };
     b.emit(
         DevOp::Q8GemmF32,
         repeated_cus(b.n_cu(), tiles),
@@ -664,7 +687,10 @@ fn validate(
     let centred_ok = |layer: &ConformerLayerWeights<'_>| {
         layer.convolution.depthwise_bias.is_some() && spec.convolution_kernel % 2 == 1
     };
-    if spec.causal_convolution && layers.iter().any(|l| l.convolution.depthwise_bias.is_some())
+    if spec.causal_convolution
+        && layers
+            .iter()
+            .any(|l| l.convolution.depthwise_bias.is_some())
         || !spec.causal_convolution && !layers.iter().all(centred_ok)
     {
         return Err("a centred convolution needs an odd kernel and a folded bias per layer; a causal one none".into());
@@ -703,13 +729,17 @@ pub fn append_stream_step(
 ) -> Result<PacketPrefix, String> {
     validate(spec, layers, prefix.model.n_cu)?;
     if !spec.causal_convolution || spec.left_chunks == u32::MAX {
-        return Err("a cache-aware stream needs causal convolutions and chunk-limited attention".into());
+        return Err(
+            "a cache-aware stream needs causal convolutions and chunk-limited attention".into(),
+        );
     }
     let left = stream_left_rows(&spec);
     let window = left + rows;
     let tail = spec.convolution_kernel - 1;
     if rows == 0 || rows % spec.chunk_size != 0 || left == 0 || keep_row0 + rows > spec.frames {
-        return Err("stream step rows must be whole attention chunks inside the prefix output".into());
+        return Err(
+            "stream step rows must be whole attention chunks inside the prefix output".into(),
+        );
     }
     if spec.position_center < window || spec.position_center + window > spec.position_count + 1 {
         return Err("relative position table does not cover the stream window".into());
@@ -720,7 +750,10 @@ pub fn append_stream_step(
     b.adopt_tensors(prefix.model.tensors.clone());
     let w = spec.width;
     let row_bytes = u64::from(w) * 4;
-    let rs = ConformerSpec { frames: rows, ..spec };
+    let rs = ConformerSpec {
+        frames: rows,
+        ..spec
+    };
     let x = b.tensor("act.stream.x", u64::from(rows) * row_bytes);
     let d0 = b.tensor("act.stream.d0", u64::from(rows) * row_bytes);
     let d1 = b.tensor("act.stream.d1", u64::from(rows) * row_bytes);
@@ -728,22 +761,39 @@ pub fn append_stream_step(
         "act.stream.large",
         u64::from(rows) * u64::from(spec.feed_forward_width.max(2 * w)) * 4,
     );
-    let [q, k, v] = ["q", "k", "v"].map(|n| b.tensor(&format!("act.stream.{n}"), u64::from(rows) * row_bytes));
-    let [qw, kw, vw, ctx] =
-        ["qw", "kw", "vw", "ctx"].map(|n| b.tensor(&format!("act.stream.{n}"), u64::from(window) * row_bytes));
+    let [q, k, v] =
+        ["q", "k", "v"].map(|n| b.tensor(&format!("act.stream.{n}"), u64::from(rows) * row_bytes));
+    let [qw, kw, vw, ctx] = ["qw", "kw", "vw", "ctx"]
+        .map(|n| b.tensor(&format!("act.stream.{n}"), u64::from(window) * row_bytes));
     let gw = b.tensor("act.stream.gw", u64::from(tail + rows) * row_bytes);
     let cw = b.tensor("act.stream.cw", u64::from(tail + rows) * row_bytes);
     let key_start = b.tensor(STREAM_KEY_START, 4);
-    let mut dep = Some(copy_rows(&mut b, x, 0, prefix.output, keep_row0, rows, w, None));
+    let mut dep = Some(copy_rows(
+        &mut b,
+        x,
+        0,
+        prefix.output,
+        keep_row0,
+        rows,
+        w,
+        None,
+    ));
     for (l, layer) in layers.iter().enumerate() {
         let k_cache = b.tensor(&format!("state.stream.k.{l}"), u64::from(left) * row_bytes);
         let v_cache = b.tensor(&format!("state.stream.v.{l}"), u64::from(left) * row_bytes);
-        let conv_cache = b.tensor(&format!("state.stream.conv.{l}"), u64::from(tail) * row_bytes);
+        let conv_cache = b.tensor(
+            &format!("state.stream.conv.{l}"),
+            u64::from(tail) * row_bytes,
+        );
         let position = b.tensor(&stream_position(l), u64::from(2 * window - 1) * row_bytes);
         dep = Some(feed_forward(&mut b, rs, *layer, x, d0, large, dep, true));
         let norm = emit_norm(&mut b, rs, x, d0, layer.attention.norm, dep);
         let mut last = norm;
-        for (out, weight) in [(q, layer.attention.query), (k, layer.attention.key), (v, layer.attention.value)] {
+        for (out, weight) in [
+            (q, layer.attention.query),
+            (k, layer.attention.key),
+            (v, layer.attention.value),
+        ] {
             last = emit_q8(&mut b, out, d0, weight, rows, w, w, 0, 0, Some(last));
         }
         last = copy_rows(&mut b, kw, 0, k_cache, 0, left, w, Some(last));
@@ -760,17 +810,46 @@ pub fn append_stream_step(
             &[last],
             |d| {
                 d.t[..8].copy_from_slice(&[ctx, qw, kw, vw, position, bu, bv, key_start]);
-                d.i[..6].copy_from_slice(&[window, w, spec.heads, spec.chunk_size, spec.left_chunks, left]);
+                d.i[..6].copy_from_slice(&[
+                    window,
+                    w,
+                    spec.heads,
+                    spec.chunk_size,
+                    spec.left_chunks,
+                    left,
+                ]);
             },
         );
         last = copy_rows(&mut b, k_cache, 0, kw, rows, left, w, Some(last));
         last = copy_rows(&mut b, v_cache, 0, vw, rows, left, w, Some(last));
         last = copy_rows(&mut b, d1, 0, ctx, left, rows, w, Some(last));
-        last = emit_q8(&mut b, d0, d1, layer.attention.output, rows, w, w, 0, 0, Some(last));
+        last = emit_q8(
+            &mut b,
+            d0,
+            d1,
+            layer.attention.output,
+            rows,
+            w,
+            w,
+            0,
+            0,
+            Some(last),
+        );
         dep = Some(emit_add(&mut b, rs, x, x, d0, 1.0, Some(last)));
 
         let norm = emit_norm(&mut b, rs, x, d0, layer.convolution.norm, dep);
-        let pointwise = emit_q8(&mut b, large, d0, layer.convolution.pointwise_in, rows, w * 2, w, 0, 0, Some(norm));
+        let pointwise = emit_q8(
+            &mut b,
+            large,
+            d0,
+            layer.convolution.pointwise_in,
+            rows,
+            w * 2,
+            w,
+            0,
+            0,
+            Some(norm),
+        );
         let glu = b.emit(DevOp::GluF32, b.all(), &[pointwise], |d| {
             d.t[0] = d1;
             d.t[1] = large;
@@ -789,12 +868,30 @@ pub fn append_stream_step(
         });
         last = copy_rows(&mut b, conv_cache, 0, gw, rows, tail, w, Some(last));
         last = copy_rows(&mut b, d0, 0, cw, tail, rows, w, Some(last));
-        let channel_norm = emit_norm(&mut b, rs, d0, d1, layer.convolution.channel_norm, Some(last));
+        let channel_norm = emit_norm(
+            &mut b,
+            rs,
+            d0,
+            d1,
+            layer.convolution.channel_norm,
+            Some(last),
+        );
         let activated = b.emit(DevOp::SiluF32, b.all(), &[channel_norm], |d| {
             d.t[..2].copy_from_slice(&[d1, d1]);
             d.i[0] = rows * w;
         });
-        let convolution = emit_q8(&mut b, d0, d1, layer.convolution.pointwise_out, rows, w, w, 0, 0, Some(activated));
+        let convolution = emit_q8(
+            &mut b,
+            d0,
+            d1,
+            layer.convolution.pointwise_out,
+            rows,
+            w,
+            w,
+            0,
+            0,
+            Some(activated),
+        );
         dep = Some(emit_add(&mut b, rs, x, x, d0, 1.0, Some(convolution)));
         dep = Some(feed_forward(&mut b, rs, *layer, x, d0, large, dep, false));
         dep = Some(emit_norm(&mut b, rs, x, x, layer.output_norm, dep));
@@ -808,7 +905,13 @@ pub fn append_stream_step(
     model.prog_t.push(rows);
     let mut programs = prefix.programs;
     programs.push(index);
-    Ok(PacketPrefix { model, programs, input: prefix.input, output: x, input_shape: prefix.input_shape })
+    Ok(PacketPrefix {
+        model,
+        programs,
+        input: prefix.input,
+        output: x,
+        input_shape: prefix.input_shape,
+    })
 }
 
 /// The stream's per-layer relative-position projections: input independent, so one program fills
@@ -820,7 +923,9 @@ pub fn stream_init(
     n_cu: u32,
 ) -> Result<Model, String> {
     if !spec.causal_convolution || spec.left_chunks == u32::MAX {
-        return Err("a cache-aware stream needs causal convolutions and chunk-limited attention".into());
+        return Err(
+            "a cache-aware stream needs causal convolutions and chunk-limited attention".into(),
+        );
     }
     let window = stream_left_rows(&spec) + rows;
     if spec.position_center < window || spec.position_center + window > spec.position_count + 1 {
@@ -828,10 +933,16 @@ pub fn stream_init(
     }
     let mut b = Builder::new(n_cu);
     b.set_tensor_dedup(true);
-    let table = b.tensor(spec.position_table, u64::from(spec.position_count) * u64::from(spec.width) * 4);
+    let table = b.tensor(
+        spec.position_table,
+        u64::from(spec.position_count) * u64::from(spec.width) * 4,
+    );
     let mut dep = None;
     for (l, layer) in layers.iter().enumerate() {
-        let position = b.tensor(&stream_position(l), u64::from(2 * window - 1) * u64::from(spec.width) * 4);
+        let position = b.tensor(
+            &stream_position(l),
+            u64::from(2 * window - 1) * u64::from(spec.width) * 4,
+        );
         dep = Some(emit_q8(
             &mut b,
             position,
@@ -847,7 +958,15 @@ pub fn stream_init(
     }
     let tensors = b.tensors();
     let program = b.finish();
-    Ok(Model { n_cu, target: 0, tensors, progs: vec![program], prog_t: vec![1], kv_row_insts: Vec::new(), gen: Vec::new() })
+    Ok(Model {
+        n_cu,
+        target: 0,
+        tensors,
+        progs: vec![program],
+        prog_t: vec![1],
+        kv_row_insts: Vec::new(),
+        gen: Vec::new(),
+    })
 }
 
 fn stream_position(layer: usize) -> String {
@@ -856,10 +975,27 @@ fn stream_position(layer: usize) -> String {
 
 /// `out[out_row0..+rows] = x[x_row0..+rows]` (`width` FP32 columns per row).
 #[allow(clippy::too_many_arguments)]
-fn copy_rows(b: &mut Builder, out: u32, out_row0: u32, x: u32, x_row0: u32, rows: u32, width: u32, dep: Option<u32>) -> u32 {
+fn copy_rows(
+    b: &mut Builder,
+    out: u32,
+    out_row0: u32,
+    x: u32,
+    x_row0: u32,
+    rows: u32,
+    width: u32,
+    dep: Option<u32>,
+) -> u32 {
     b.emit(DevOp::CopyColsF32, b.all(), &deps(dep), |d| {
         d.t[..2].copy_from_slice(&[out, x]);
-        d.i[..7].copy_from_slice(&[1, rows, width, width, x_row0 * width, width, out_row0 * width]);
+        d.i[..7].copy_from_slice(&[
+            1,
+            rows,
+            width,
+            width,
+            x_row0 * width,
+            width,
+            out_row0 * width,
+        ]);
     })
 }
 
@@ -925,16 +1061,31 @@ mod tests {
         let mut layer = layer();
         layer.convolution.depthwise = "encoder.conv.dw.folded";
         layer.convolution.depthwise_bias = Some("encoder.conv.dw.folded_bias");
-        let spec = ConformerSpec { causal_convolution: false, left_chunks: u32::MAX, ..spec() };
+        let spec = ConformerSpec {
+            causal_convolution: false,
+            left_chunks: u32::MAX,
+            ..spec()
+        };
         let packets = lower(spec, &[layer], 4).unwrap();
         let insts = &packets.model.progs[0].insts;
-        let ops: Vec<_> = insts.iter().map(|d| DevOp::from_u16(d.op).unwrap()).collect();
+        let ops: Vec<_> = insts
+            .iter()
+            .map(|d| DevOp::from_u16(d.op).unwrap())
+            .collect();
         assert_eq!(ops.len(), 23);
-        assert!(!ops.iter().any(|op| matches!(op, DevOp::CausalDepthwiseConv1dF32 | DevOp::SiluF32)));
-        let conv = insts.iter().find(|d| d.op == DevOp::Conv1dF32 as u16).unwrap();
+        assert!(!ops
+            .iter()
+            .any(|op| matches!(op, DevOp::CausalDepthwiseConv1dF32 | DevOp::SiluF32)));
+        let conv = insts
+            .iter()
+            .find(|d| d.op == DevOp::Conv1dF32 as u16)
+            .unwrap();
         assert_eq!(conv.i, [1, 8, 32, 32, 3, 1, 1, 32]);
         assert_eq!(conv.j, [1 | (1 << 16), packet::dev::ACT_SILU << 8]);
-        let attention = insts.iter().find(|d| d.op == DevOp::RelativeAttentionF32 as u16).unwrap();
+        let attention = insts
+            .iter()
+            .find(|d| d.op == DevOp::RelativeAttentionF32 as u16)
+            .unwrap();
         assert_eq!(attention.i[4], u32::MAX);
         // One host-written valid-row count masks both the attention keys and the conv input.
         let valid = attention.t[7];
@@ -942,10 +1093,17 @@ mod tests {
         assert_eq!(conv.t[6], valid);
         // A stream over full context, a window wider than the kernel's key bound, and a centred
         // convolution without a folded bias are all refused.
-        let prefix = lower(self::spec(), &[self::layer()], 4).unwrap().into_prefix();
+        let prefix = lower(self::spec(), &[self::layer()], 4)
+            .unwrap()
+            .into_prefix();
         assert!(append_stream_step(spec, &[layer], prefix, 0, 4).is_err());
         let max = FULL_CONTEXT_MAX_KEYS;
-        let wide = ConformerSpec { frames: max + 1, position_count: 2 * max + 1, position_center: max + 1, ..spec };
+        let wide = ConformerSpec {
+            frames: max + 1,
+            position_count: 2 * max + 1,
+            position_center: max + 1,
+            ..spec
+        };
         assert!(lower(wide, &[layer], 4).is_err());
         layer.convolution.depthwise_bias = None;
         assert!(lower(spec, &[layer], 4).is_err());

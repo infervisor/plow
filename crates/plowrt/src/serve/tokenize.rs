@@ -51,7 +51,11 @@ pub async fn tokenize(
     match state.registry.get(&req.model) {
         Ok(bundle) => {
             let tok = bundle.tokenizer();
-            if let Some(e) = crate::serve::prompt_bytes_overflow(state.max_ctx(&req.model), tok.max_token_bytes(), req.prompt.len()) {
+            if let Some(e) = crate::serve::prompt_bytes_overflow(
+                state.max_ctx(&req.model),
+                tok.max_token_bytes(),
+                req.prompt.len(),
+            ) {
                 return crate::serve::api_error_for(&e);
             }
             let tokens = crate::serve::encode_prompt(&req.prompt, |p| {

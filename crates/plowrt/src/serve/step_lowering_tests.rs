@@ -70,7 +70,9 @@ impl SeqEngine for Mock {
         slots.sort_unstable();
         slots.dedup();
         if slots.len() != members.len() {
-            return Err(RuntimeError::Rejected("packed prefill slot appears twice".into()));
+            return Err(RuntimeError::Rejected(
+                "packed prefill slot appears twice".into(),
+            ));
         }
         let rows: u32 = members
             .iter()
@@ -99,7 +101,10 @@ impl SeqEngine for Mock {
         _prompt: &[u32],
         tick_max_bucket: u32,
     ) -> Result<Option<u32>> {
-        let rows = self.cursors.get(&slot).map_or(tick_max_bucket.min(8192), |c| c.0);
+        let rows = self
+            .cursors
+            .get(&slot)
+            .map_or(tick_max_bucket.min(8192), |c| c.0);
         if rows > tick_max_bucket {
             return Err(RuntimeError::Rejected(format!(
                 "chunk of {rows} rows exceeds the tick cap {tick_max_bucket}"
@@ -141,12 +146,25 @@ fn lower(e: &mut dyn SeqEngine, step: &Plan, tick_max: u32) -> Result<()> {
 }
 
 /// The mux's candidate construction, in shape.
-fn candidates(e: &dyn SeqEngine, pending: &[(usize, u64)], full_budget: u32, pf_batch: bool) -> Vec<Candidate> {
+fn candidates(
+    e: &dyn SeqEngine,
+    pending: &[(usize, u64)],
+    full_budget: u32,
+    pf_batch: bool,
+) -> Vec<Candidate> {
     pending
         .iter()
         .map(|&(slot, arrival)| {
-            if let Some(span) = pf_batch.then(|| e.packable_prefill_span(slot, full_budget)).flatten() {
-                return Candidate { span, arrival, packable: true, planned: true };
+            if let Some(span) = pf_batch
+                .then(|| e.packable_prefill_span(slot, full_budget))
+                .flatten()
+            {
+                return Candidate {
+                    span,
+                    arrival,
+                    packable: true,
+                    planned: true,
+                };
             }
             let planned = e.next_prefill_rows(slot);
             let rows = planned.unwrap_or(u32::MAX);
@@ -208,7 +226,13 @@ fn run(backend: Backend, pf_batch: bool, cap_rows: u32) -> (usize, usize) {
         let cands = candidates(&e, &pending, full_budget, pf_batch);
         let step = plan(
             backend,
-            Tick { cap_rows, packing: pf_batch, rotate: false, turn: 0, slots: 32 },
+            Tick {
+                cap_rows,
+                packing: pf_batch,
+                rotate: false,
+                turn: 0,
+                slots: 32,
+            },
             0..d,
             &cands,
             |p| e.prefill_prog_t(p as usize),
@@ -279,7 +303,9 @@ fn a_pack_handed_to_a_non_packing_engine_is_refused_by_name() {
     };
     let foreign = Plan {
         decodes: Vec::new(),
-        launches: vec![crate::sched::step::Launch { spans: vec![span(0), span(1)] }],
+        launches: vec![crate::sched::step::Launch {
+            spans: vec![span(0), span(1)],
+        }],
         budget_left: 0,
     };
     let err = lower(&mut cpu, &foreign, u32::MAX).unwrap_err().to_string();

@@ -17,11 +17,11 @@ use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use plowrt::config::RuntimeConfig;
 use plowrt::device::{self, Backend};
 
-#[path = "bin_dist.rs"]
-mod dist_cmd;
 #[cfg(feature = "hsa")]
 #[path = "bin_amd_block.rs"]
 mod amd_block_cmd;
+#[path = "bin_dist.rs"]
+mod dist_cmd;
 use plowrt::exec::ExecutorSet;
 use plowrt::orch::Registry;
 use plowrt::serve::mux::{self, MuxConfig};
@@ -753,7 +753,11 @@ fn apply_asset_env_defaults() -> Vec<(String, String, String)> {
     let Cmd::Serve { assets, .. } = &cli.cmd else {
         return Vec::new();
     };
-    let assets = match assets.iter().map(|a| plowrt::asset::serve::take_asset_arg(a)).collect::<Result<Vec<_>, _>>() {
+    let assets = match assets
+        .iter()
+        .map(|a| plowrt::asset::serve::take_asset_arg(a))
+        .collect::<Result<Vec<_>, _>>()
+    {
         Ok(assets) => assets,
         Err(e) => {
             eprintln!("plowrt serve: {e}");
@@ -776,7 +780,9 @@ fn apply_asset_env_defaults() -> Vec<(String, String, String)> {
     }
 }
 
-async fn async_main(asset_defaults: Vec<(String, String, String)>) -> Result<(), Box<dyn std::error::Error>> {
+async fn async_main(
+    asset_defaults: Vec<(String, String, String)>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let matches = Cli::command().get_matches();
     let cli = Cli::from_arg_matches(&matches).unwrap_or_else(|err| err.exit());
     let filter =
@@ -785,7 +791,9 @@ async fn async_main(asset_defaults: Vec<(String, String, String)>) -> Result<(),
     // `op-audit --format json` writes a document to stdout; the startup banner
     // would land inside it. Same reason `bench` logs to stderr.
     let structured_output = match &cli.cmd {
-        Cmd::Bench { .. } | Cmd::OpAudit { .. } | Cmd::KnobScope { .. } | Cmd::Qualify { .. } => true,
+        Cmd::Bench { .. } | Cmd::OpAudit { .. } | Cmd::KnobScope { .. } | Cmd::Qualify { .. } => {
+            true
+        }
         #[cfg(any(
             all(feature = "cpu", feature = "gguf"),
             all(feature = "metal", target_os = "macos"),
@@ -1020,8 +1028,14 @@ async fn async_main(asset_defaults: Vec<(String, String, String)>) -> Result<(),
             model,
             out,
             scope_json,
-        } => knob_scope_cmd(base, variant, knob, values, workload, model, out, scope_json),
-        Cmd::Qualify { assets, no_replay, format } => qualify_cmd(assets, !no_replay, &format),
+        } => knob_scope_cmd(
+            base, variant, knob, values, workload, model, out, scope_json,
+        ),
+        Cmd::Qualify {
+            assets,
+            no_replay,
+            format,
+        } => qualify_cmd(assets, !no_replay, &format),
         Cmd::Devices {
             tp,
             hidden,
@@ -1063,7 +1077,9 @@ async fn async_main(asset_defaults: Vec<(String, String, String)>) -> Result<(),
             assets,
             objects,
             out,
-        } => dist_cmd::report(dist_cmd::cmd_pack(&bundle, &objset, &assets, &objects, &out)),
+        } => dist_cmd::report(dist_cmd::cmd_pack(
+            &bundle, &objset, &assets, &objects, &out,
+        )),
         #[cfg(feature = "hsa")]
         Cmd::AmdBench {
             blob,
@@ -1176,14 +1192,18 @@ async fn async_main(asset_defaults: Vec<(String, String, String)>) -> Result<(),
             report,
         } => {
             if let Some(inputs) = input_dir {
-                amd_block_cmd::run(blob, hsaco, checkpoint, inputs, ctx, repeat, warmup, tp, dump, report)
+                amd_block_cmd::run(
+                    blob, hsaco, checkpoint, inputs, ctx, repeat, warmup, tp, dump, report,
+                )
             } else {
                 if tp != 1 || ctx != 1 || repeat != 1 || warmup != 0 || report.is_some() {
-                    return Err("block timing requires --input-dir with captured block operands".into());
+                    return Err(
+                        "block timing requires --input-dir with captured block operands".into(),
+                    );
                 }
                 amd_block(blob, hsaco, checkpoint, prompt, inspect, list_tensors, dump)
             }
-        },
+        }
         #[cfg(not(feature = "hsa"))]
         Cmd::AmdBlock { .. } => Err("plowrt was built without --features hsa".into()),
     }
@@ -1235,7 +1255,8 @@ mod amd_bench_cli_tests {
         let prompt = "1,2,3; 7,8\n";
         let expected = vec![vec![1, 2, 3], vec![7, 8]];
         assert_eq!(super::batched_prompt_ids(prompt).unwrap(), expected);
-        let path = std::env::temp_dir().join(format!("plow-batched-prompt-{}.txt", std::process::id()));
+        let path =
+            std::env::temp_dir().join(format!("plow-batched-prompt-{}.txt", std::process::id()));
         let mut file = std::fs::File::create_new(&path).unwrap();
         file.write_all(prompt.as_bytes()).unwrap();
         drop(file);
@@ -1257,9 +1278,27 @@ mod amd_bench_cli_tests {
 
     #[test]
     fn serve_can_bind_a_private_interface() {
-        let cli = Cli::try_parse_from(["plowrt", "serve", "--assets", "model", "--bind", "10.77.0.2"]).unwrap();
-        assert!(matches!(cli.cmd, super::Cmd::Serve { bind, .. } if bind.to_string() == "10.77.0.2"));
-        assert!(Cli::try_parse_from(["plowrt", "serve", "--assets", "model", "--bind", "not-an-address"]).is_err());
+        let cli = Cli::try_parse_from([
+            "plowrt",
+            "serve",
+            "--assets",
+            "model",
+            "--bind",
+            "10.77.0.2",
+        ])
+        .unwrap();
+        assert!(
+            matches!(cli.cmd, super::Cmd::Serve { bind, .. } if bind.to_string() == "10.77.0.2")
+        );
+        assert!(Cli::try_parse_from([
+            "plowrt",
+            "serve",
+            "--assets",
+            "model",
+            "--bind",
+            "not-an-address"
+        ])
+        .is_err());
     }
 
     #[test]
@@ -1282,11 +1321,38 @@ mod amd_bench_cli_tests {
     ))]
     #[test]
     fn asr_names_packet_and_tokenizer_inputs() {
-        let named = Cli::try_parse_from(["plowrt", "asr", "--packet", "model.pkt",
-            "--tokenizer", "tokens", "--port", "8080", "--served-model-name", "nemotron-asr-0.6b"]).unwrap();
-        assert!(matches!(named.cmd, super::Cmd::Asr { served_model_name: Some(name), bind, .. } if name == "nemotron-asr-0.6b" && bind.is_loopback()));
-        let remote = Cli::try_parse_from(["plowrt", "asr", "--packet", "model.pkt", "--tokenizer", "tokens", "--port", "8080", "--bind", "10.77.0.2"]).unwrap();
-        assert!(matches!(remote.cmd, super::Cmd::Asr { bind, .. } if bind.to_string() == "10.77.0.2"));
+        let named = Cli::try_parse_from([
+            "plowrt",
+            "asr",
+            "--packet",
+            "model.pkt",
+            "--tokenizer",
+            "tokens",
+            "--port",
+            "8080",
+            "--served-model-name",
+            "nemotron-asr-0.6b",
+        ])
+        .unwrap();
+        assert!(
+            matches!(named.cmd, super::Cmd::Asr { served_model_name: Some(name), bind, .. } if name == "nemotron-asr-0.6b" && bind.is_loopback())
+        );
+        let remote = Cli::try_parse_from([
+            "plowrt",
+            "asr",
+            "--packet",
+            "model.pkt",
+            "--tokenizer",
+            "tokens",
+            "--port",
+            "8080",
+            "--bind",
+            "10.77.0.2",
+        ])
+        .unwrap();
+        assert!(
+            matches!(remote.cmd, super::Cmd::Asr { bind, .. } if bind.to_string() == "10.77.0.2")
+        );
         for args in [
             ["--packet", "model.pkt", "--tokenizer", "tokens"],
             ["--blob", "model.pkt", "--checkpoint", "tokens"],
@@ -2032,7 +2098,8 @@ fn batched_prompt_ids(prompt: &str) -> Result<Vec<Vec<u32>>, Box<dyn std::error:
         Some(path) => std::fs::read_to_string(path)?,
         None => prompt.to_owned(),
     };
-    Ok(text.split(';')
+    Ok(text
+        .split(';')
         .map(|one| one.split(',').map(|s| s.trim().parse::<u32>()).collect())
         .collect::<Result<_, _>>()?)
 }
@@ -2152,7 +2219,11 @@ fn amd_bench_tp(
                     for rank in 0..if all { g.n_gpu() } else { 1 } {
                         let mut buf = vec![0u8; limit.map_or(n, |l| l.min(n))];
                         g.rank(rank).read_tensor(name, &mut buf)?;
-                        let rk = if all { format!(".rk{rank}") } else { String::new() };
+                        let rk = if all {
+                            format!(".rk{rank}")
+                        } else {
+                            String::new()
+                        };
                         std::fs::write(format!("{path}{rk}.{tag}.bin"), &buf)?;
                     }
                 }
@@ -2161,7 +2232,8 @@ fn amd_bench_tp(
         if let Some(dir) = plowrt::config::RuntimeConfig::get().amd.dump_kv.as_ref() {
             let mut len = [0u8; 4];
             g.rank(0).read_tensor("in.kvlen", &mut len)?;
-            g.rank(0).dump_slot_kv(dir, tag, 0, u32::from_le_bytes(len))?;
+            g.rank(0)
+                .dump_slot_kv(dir, tag, 0, u32::from_le_bytes(len))?;
         }
         let Some(dir) = &dump_logits else {
             return Ok(());
@@ -2795,19 +2867,35 @@ fn knob_routes(
     Err("the route trace plans the AMD serve: build plowrt with --features hsa".into())
 }
 
-fn qualify_cmd(dirs: Vec<PathBuf>, replay: bool, format: &str) -> Result<(), Box<dyn std::error::Error>> {
+fn qualify_cmd(
+    dirs: Vec<PathBuf>,
+    replay: bool,
+    format: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
     let mut report = Vec::new();
     let mut failed = 0;
     for dir in &dirs {
         for (packet, q) in plowrt::certificate_checks::qualify_dir(dir, replay)? {
             failed += usize::from(!q.qualified());
             if format == "json" {
-                report.push(serde_json::json!({"packet": packet, "qualified": q.qualified(),
-                    "replayed": replay, "qualification": q}));
+                report.push(
+                    serde_json::json!({"packet": packet, "qualified": q.qualified(),
+                    "replayed": replay, "qualification": q}),
+                );
             } else {
-                println!("{} {}: {}/{} obligations, {} policy receipts, verifiers {:?}",
-                    if q.qualified() { "QUALIFIED  " } else { "UNQUALIFIED" }, packet.display(),
-                    q.satisfied.len(), q.required.len(), q.policy_receipts, q.receipt_verifiers);
+                println!(
+                    "{} {}: {}/{} obligations, {} policy receipts, verifiers {:?}",
+                    if q.qualified() {
+                        "QUALIFIED  "
+                    } else {
+                        "UNQUALIFIED"
+                    },
+                    packet.display(),
+                    q.satisfied.len(),
+                    q.required.len(),
+                    q.policy_receipts,
+                    q.receipt_verifiers
+                );
                 for gap in &q.gaps {
                     println!("    gap: {gap}");
                 }
@@ -2838,9 +2926,17 @@ fn knob_scope_cmd(
         Some(v) => v.split_once(',').ok_or("--values wants OFF,ON")?,
         None => ("", ""),
     };
-    let delta: Vec<String> = if off != on { vec![knob.clone()] } else { Vec::new() };
+    let delta: Vec<String> = if off != on {
+        vec![knob.clone()]
+    } else {
+        Vec::new()
+    };
     let a = ks::extract(&base)?;
-    let b = if variant == base { None } else { Some(ks::extract(&variant)?) };
+    let b = if variant == base {
+        None
+    } else {
+        Some(ks::extract(&variant)?)
+    };
     let b = b.as_ref().unwrap_or(&a);
     let model = model
         .or_else(|| a.model.clone())
@@ -2852,8 +2948,13 @@ fn knob_scope_cmd(
             knob_routes(&knob, (off, on), &a, b, &w)?
         }
     };
-    let mut payload =
-        ks::payload(&model, &delta, ks::declared_scope(&knob), ks::pairs(&a, b)?, routes);
+    let mut payload = ks::payload(
+        &model,
+        &delta,
+        ks::declared_scope(&knob),
+        ks::pairs(&a, b)?,
+        routes,
+    );
     if let Some(p) = scope_json {
         payload["scope"] = serde_json::from_slice(&std::fs::read(p)?)?;
     }
@@ -2870,7 +2971,11 @@ fn knob_scope_cmd(
     if cert.ok {
         Ok(())
     } else {
-        Err(format!("checkpoint S rejected {knob}: {}", cert.reason.unwrap_or_default()).into())
+        Err(format!(
+            "checkpoint S rejected {knob}: {}",
+            cert.reason.unwrap_or_default()
+        )
+        .into())
     }
 }
 
@@ -3410,7 +3515,11 @@ async fn bringup_runtime(
             Err(e) => tracing::warn!(%e, "cuBLASLt not loadable"),
         }
         for dir in &assets {
-            plowrt::asset::serve::check_runtime(dir, &plowrt::asset::serve::runtime_requires(dir)?, &lt)?;
+            plowrt::asset::serve::check_runtime(
+                dir,
+                &plowrt::asset::serve::runtime_requires(dir)?,
+                &lt,
+            )?;
         }
         plowrt::asr::vad::configured()?;
         // Packet ASR models load first, on device 0: the planner then sees the memory they took.
@@ -3420,16 +3529,24 @@ async fn bringup_runtime(
             let free_before = cuda.mem_info()?.0;
             for p in packets {
                 if state.registry.contains(&p.name) || state.registry.resolve(&p.name).is_some() {
-                    return Err(format!("--asr-packet {}: a registry model already has that name", p.name).into());
+                    return Err(format!(
+                        "--asr-packet {}: a registry model already has that name",
+                        p.name
+                    )
+                    .into());
                 }
-                let loaded = plowrt::asr::load_packet_transcriber(&p.packet, &p.tokenizer, &p.backend)?;
+                let loaded =
+                    plowrt::asr::load_packet_transcriber(&p.packet, &p.tokenizer, &p.backend)?;
                 tracing::info!(name = %p.name, packet = %p.packet.display(), driver = %loaded.driver,
                     backend = loaded.backend, "asr: packet model loaded");
                 plowrt::asr::serving::host_packet_model(&state, p.name.clone(), loaded.engine);
             }
             packet_bytes = free_before.saturating_sub(cuda.mem_info()?.0);
-            tracing::info!(models = packets.len(), used_mib = packet_bytes >> 20,
-                "asr: packet models resident; device 0's planner capacity reduced by their memory");
+            tracing::info!(
+                models = packets.len(),
+                used_mib = packet_bytes >> 20,
+                "asr: packet models resident; device 0's planner capacity reduced by their memory"
+            );
         }
 
         let mut models: Vec<(String, PathBuf, PathBuf)> = Vec::new();
@@ -3563,7 +3680,10 @@ async fn bringup_runtime(
             let dp = placement::parse_dp(&RuntimeConfig::get().dp)
                 .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
             if let Some(m) = dp.named().find(|m| !specs.iter().any(|s| s.slug == *m)) {
-                return Err(format!("--dp {m}=… names a model this server does not serve on the GPU").into());
+                return Err(format!(
+                    "--dp {m}=… names a model this server does not serve on the GPU"
+                )
+                .into());
             }
             let mut dp_models: Vec<(String, usize)> = Vec::new();
             let mut ranked_specs = Vec::with_capacity(specs.len());
@@ -3576,15 +3696,27 @@ async fn bringup_runtime(
                     continue;
                 }
                 if spec.tp > 1 {
-                    return Err(format!("{}: --dp {n} over a TP{} bundle is not supported", spec.slug, spec.tp).into());
+                    return Err(format!(
+                        "{}: --dp {n} over a TP{} bundle is not supported",
+                        spec.slug, spec.tp
+                    )
+                    .into());
                 }
                 if n > plowrt::serve::dp::MAX_DP {
-                    return Err(format!("{}: --dp {n} exceeds {} ranks", spec.slug, plowrt::serve::dp::MAX_DP).into());
+                    return Err(format!(
+                        "{}: --dp {n} exceeds {} ranks",
+                        spec.slug,
+                        plowrt::serve::dp::MAX_DP
+                    )
+                    .into());
                 }
                 for r in 0..n {
                     let key = plowrt::serve::dp::rank_key(&spec.slug, r);
                     ranked_models.push((key.clone(), dir.clone(), ckpt.clone()));
-                    ranked_specs.push(ModelSpec { slug: key, ..spec.clone() });
+                    ranked_specs.push(ModelSpec {
+                        slug: key,
+                        ..spec.clone()
+                    });
                 }
                 dp_models.push((spec.slug, n));
             }
@@ -3598,7 +3730,9 @@ async fn bringup_runtime(
             for (slug, ordinal) in placement::parse_pins(&RuntimeConfig::get().pin)
                 .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?
             {
-                let unpinned = specs.iter().position(|s| (s.slug == slug || s.model == slug) && s.device.is_none());
+                let unpinned = specs
+                    .iter()
+                    .position(|s| (s.slug == slug || s.model == slug) && s.device.is_none());
                 match unpinned.or_else(|| specs.iter().position(|s| s.slug == slug)) {
                     Some(i) => specs[i].device = Some(ordinal),
                     None => {
@@ -3620,17 +3754,27 @@ async fn bringup_runtime(
                     let ranks: Vec<_> = (0..*n)
                         .map(|r| {
                             let key = rank_key(model, r);
-                            let i = specs.iter().position(|s| s.slug == key).expect("expanded above");
+                            let i = specs
+                                .iter()
+                                .position(|s| s.slug == key)
+                                .expect("expanded above");
                             let g = layout.assignment[i];
                             (layout.groups[g].first(), g, state.model_metrics(&key))
                         })
                         .collect();
                     let mut set = DpSet::new(model, ranks);
                     for r in &mut set.ranks {
-                        let be = backends.iter().find(|(d, _)| *d == r.ordinal).map(|(_, b)| b);
-                        if let Some((node, _, cpus)) = be
-                            .and_then(|b| b.pci_bdf())
-                            .and_then(|bdf| plowrt::exec::engine_affinity::socket_cpus_of_pci(std::path::Path::new("/sys"), &bdf.to_ascii_lowercase()))
+                        let be = backends
+                            .iter()
+                            .find(|(d, _)| *d == r.ordinal)
+                            .map(|(_, b)| b);
+                        if let Some((node, _, cpus)) =
+                            be.and_then(|b| b.pci_bdf()).and_then(|bdf| {
+                                plowrt::exec::engine_affinity::socket_cpus_of_pci(
+                                    std::path::Path::new("/sys"),
+                                    &bdf.to_ascii_lowercase(),
+                                )
+                            })
                         {
                             tracing::info!(key = %r.key, device = r.ordinal, numa_node = node, cpus = cpus.len(), "dp: rank dispatcher placed on its GPU's socket");
                             r.cpus = cpus;
@@ -3749,7 +3893,9 @@ async fn bringup_runtime(
             }
         }
         if co_resident > 1
-            && cfg.co_sched.is_some_and(|mode| mode != plowrt::serve::cosched::CoSched::Rr)
+            && cfg
+                .co_sched
+                .is_some_and(|mode| mode != plowrt::serve::cosched::CoSched::Rr)
         {
             return Err("AMD co-resident models require --co-sched rr; separate HSA queues do not guarantee whole-grid residency".into());
         }
@@ -4099,7 +4245,8 @@ async fn serve(
     tracing::info!(%tcp_addr, "plowrt serving OpenAI API over TCP");
     let tcp_router = plowrt::serve::auth::require(router.clone(), keys);
     let tcp_http = HttpConns::from_config("TCP");
-    let mut conn_slots: Vec<(Arc<tokio::sync::Semaphore>, usize)> = tcp_http.slots().into_iter().collect();
+    let mut conn_slots: Vec<(Arc<tokio::sync::Semaphore>, usize)> =
+        tcp_http.slots().into_iter().collect();
     let tcp_task = tokio::spawn(async move {
         let svc = hyper_util::service::TowerToHyperService::new(tcp_router);
         loop {
@@ -4137,7 +4284,12 @@ async fn serve(
             std::fs::set_permissions(&path, perm)?;
         }
         tracing::info!(socket = %path.display(), "plowrt serving OpenAI API over UDS");
-        let uds_router = plowrt::serve::auth::require(router.clone().merge(plowrt::serve::admin_app(Arc::clone(&state))), keys);
+        let uds_router = plowrt::serve::auth::require(
+            router
+                .clone()
+                .merge(plowrt::serve::admin_app(Arc::clone(&state))),
+            keys,
+        );
         let http = HttpConns::from_config("UDS");
         conn_slots.extend(http.slots());
         Some(tokio::spawn(async move {
@@ -4166,7 +4318,8 @@ async fn serve(
         }
         let listener = tokio::net::TcpListener::bind(addr).await?;
         tracing::info!(%addr, "plowrt serving model control over TCP");
-        let control_router = plowrt::serve::auth::require(plowrt::serve::admin_app(Arc::clone(&state)), keys);
+        let control_router =
+            plowrt::serve::auth::require(plowrt::serve::admin_app(Arc::clone(&state)), keys);
         let http = HttpConns::from_config("CTL");
         conn_slots.extend(http.slots());
         Some(tokio::spawn(async move {
@@ -4318,7 +4471,11 @@ async fn serve_asr(
         task.abort();
     }
     let deadline = tokio::time::Instant::now()
-        + std::time::Duration::from_millis(plowrt::config::RuntimeConfig::get().drain_timeout_ms().unwrap_or(30_000));
+        + std::time::Duration::from_millis(
+            plowrt::config::RuntimeConfig::get()
+                .drain_timeout_ms()
+                .unwrap_or(30_000),
+        );
     while !server.idle() && tokio::time::Instant::now() < deadline {
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
@@ -4341,25 +4498,43 @@ struct HttpConns {
 impl HttpConns {
     fn from_config(listener: &str) -> Self {
         let rt = plowrt::config::RuntimeConfig::get();
-        Self::new(listener, rt.http_header_timeout_ms.unwrap_or(30_000), rt.http_max_connections.unwrap_or(4096))
+        Self::new(
+            listener,
+            rt.http_header_timeout_ms.unwrap_or(30_000),
+            rt.http_max_connections.unwrap_or(4096),
+        )
     }
 
     fn new(listener: &str, header_ms: u64, max: usize) -> Self {
-        let mut builder = hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new());
+        let mut builder =
+            hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new());
         builder
             .http1()
             .timer(hyper_util::rt::TokioTimer::new())
-            .header_read_timeout((header_ms > 0).then(|| std::time::Duration::from_millis(header_ms)));
-        tracing::info!(listener, header_timeout_ms = header_ms, max_connections = max, "HTTP connection limits");
+            .header_read_timeout(
+                (header_ms > 0).then(|| std::time::Duration::from_millis(header_ms)),
+            );
+        tracing::info!(
+            listener,
+            header_timeout_ms = header_ms,
+            max_connections = max,
+            "HTTP connection limits"
+        );
         HttpConns {
             builder: Arc::new(builder),
-            open: (max > 0).then(|| Arc::new(tokio::sync::Semaphore::new(max.min(tokio::sync::Semaphore::MAX_PERMITS)))),
+            open: (max > 0).then(|| {
+                Arc::new(tokio::sync::Semaphore::new(
+                    max.min(tokio::sync::Semaphore::MAX_PERMITS),
+                ))
+            }),
         }
     }
 
     /// The connection slots and their count, for the shutdown flush.
     fn slots(&self) -> Option<(Arc<tokio::sync::Semaphore>, usize)> {
-        self.open.as_ref().map(|s| (Arc::clone(s), s.available_permits()))
+        self.open
+            .as_ref()
+            .map(|s| (Arc::clone(s), s.available_permits()))
     }
 
     /// Wait for a free connection slot; at the cap the listener stops accepting.
@@ -4382,7 +4557,10 @@ impl HttpConns {
         tokio::spawn(async move {
             let _permit = permit;
             // Upgrades: the ASR websocket route.
-            if let Err(e) = builder.serve_connection_with_upgrades(hyper_util::rt::TokioIo::new(io), svc).await {
+            if let Err(e) = builder
+                .serve_connection_with_upgrades(hyper_util::rt::TokioIo::new(io), svc)
+                .await
+            {
                 tracing::debug!(error = %e, "HTTP connection ended");
             }
         });
@@ -4416,15 +4594,30 @@ mod http_conn_tests {
     async fn a_silent_or_idle_connection_is_closed_at_the_header_timeout() {
         let addr = server(HttpConns::new("test", 100, 16)).await;
         let mut slow = tokio::net::TcpStream::connect(addr).await.unwrap();
-        slow.write_all(b"GET / HTTP/1.1\r\nHost: x\r\n").await.unwrap();
+        slow.write_all(b"GET / HTTP/1.1\r\nHost: x\r\n")
+            .await
+            .unwrap();
         let mut buf = Vec::new();
-        let read = tokio::time::timeout(std::time::Duration::from_secs(5), slow.read_to_end(&mut buf)).await;
+        let read = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            slow.read_to_end(&mut buf),
+        )
+        .await;
         assert!(read.is_ok(), "the half-sent request was not cut");
 
         let mut idle = tokio::net::TcpStream::connect(addr).await.unwrap();
-        idle.write_all(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n").await.unwrap();
-        let read = tokio::time::timeout(std::time::Duration::from_secs(5), idle.read_to_end(&mut buf)).await;
-        assert!(read.is_ok(), "the idle keep-alive connection was not closed");
+        idle.write_all(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n")
+            .await
+            .unwrap();
+        let read = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            idle.read_to_end(&mut buf),
+        )
+        .await;
+        assert!(
+            read.is_ok(),
+            "the idle keep-alive connection was not closed"
+        );
         assert!(String::from_utf8_lossy(&buf).contains("200 OK"));
     }
 
@@ -4434,19 +4627,35 @@ mod http_conn_tests {
         let addr = server(HttpConns::new("test", 0, 1)).await;
         let first = tokio::net::TcpStream::connect(addr).await.unwrap();
         let mut second = tokio::net::TcpStream::connect(addr).await.unwrap();
-        second.write_all(b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").await.unwrap();
+        second
+            .write_all(b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
         let mut buf = Vec::new();
-        let early = tokio::time::timeout(std::time::Duration::from_millis(200), second.read_to_end(&mut buf)).await;
+        let early = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            second.read_to_end(&mut buf),
+        )
+        .await;
         assert!(early.is_err(), "served past the cap");
         drop(first);
-        tokio::time::timeout(std::time::Duration::from_secs(5), second.read_to_end(&mut buf)).await.unwrap().unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            second.read_to_end(&mut buf),
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert!(String::from_utf8_lossy(&buf).contains("200 OK"));
     }
 }
 
 async fn accept_failed(listener: &str, e: &std::io::Error) {
     use std::io::ErrorKind::{ConnectionAborted, ConnectionRefused, ConnectionReset};
-    if matches!(e.kind(), ConnectionAborted | ConnectionRefused | ConnectionReset) {
+    if matches!(
+        e.kind(),
+        ConnectionAborted | ConnectionRefused | ConnectionReset
+    ) {
         return;
     }
     // EMFILE and friends persist; retrying at once spins a core and floods the log.
@@ -4458,7 +4667,10 @@ async fn shutdown_signal() -> &'static str {
     #[cfg(unix)]
     {
         use tokio::signal::unix::{signal, SignalKind};
-        let (Ok(mut term), Ok(mut int)) = (signal(SignalKind::terminate()), signal(SignalKind::interrupt())) else {
+        let (Ok(mut term), Ok(mut int)) = (
+            signal(SignalKind::terminate()),
+            signal(SignalKind::interrupt()),
+        ) else {
             return std::future::pending().await;
         };
         tokio::select! {
@@ -4476,7 +4688,10 @@ async fn shutdown_signal() -> &'static str {
 /// After the drain the muxes have queued every final chunk, but the connection tasks may not have
 /// written them yet: wait until every connection closed, or `grace` (an idle keep-alive connection
 /// holds its slot until the header timeout). Without a connection cap there is nothing to count.
-async fn flush_connections(slots: &[(Arc<tokio::sync::Semaphore>, usize)], grace: std::time::Duration) {
+async fn flush_connections(
+    slots: &[(Arc<tokio::sync::Semaphore>, usize)],
+    grace: std::time::Duration,
+) {
     let deadline = tokio::time::Instant::now() + grace;
     if slots.is_empty() {
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
@@ -4493,7 +4708,9 @@ async fn flush_connections(slots: &[(Arc<tokio::sync::Semaphore>, usize)], grace
 /// when unset), then close whatever is still running with what it produced.
 async fn drain_for_shutdown(state: &Arc<AppState>) {
     let deadline = std::time::Duration::from_millis(
-        plowrt::config::RuntimeConfig::get().drain_timeout_ms().unwrap_or(30_000),
+        plowrt::config::RuntimeConfig::get()
+            .drain_timeout_ms()
+            .unwrap_or(30_000),
     );
     let muxes = state.all_muxes();
     let started = tokio::time::Instant::now();

@@ -121,7 +121,11 @@ pub fn decode_prog(rung: u32, dense_exact: bool) {
         return;
     }
     DEC_RUNG.with(|c| c.set(rung));
-    let (tick, total) = if dense_exact { (&DEC_DX, &DX_TOTAL) } else { (&DEC_DSA, &DSA_TOTAL) };
+    let (tick, total) = if dense_exact {
+        (&DEC_DX, &DX_TOTAL)
+    } else {
+        (&DEC_DSA, &DSA_TOTAL)
+    };
     tick.with(|c| c.set(c.get() + 1));
     total.with(|c| c.set(c.get() + 1));
 }
@@ -144,7 +148,10 @@ pub fn prepare_patch(ns: u64) {
 
 /// `(vmm_ns, patch_ns)` accumulated since the last call, all ranks; resets both.
 pub fn take_prepare() -> (u64, u64) {
-    (PREP_VMM_NS.with(|c| c.replace(0)), PREP_PATCH_NS.with(|c| c.replace(0)))
+    (
+        PREP_VMM_NS.with(|c| c.replace(0)),
+        PREP_PATCH_NS.with(|c| c.replace(0)),
+    )
 }
 
 /// A prefix publish spent `ns` copying its snapshot (one rank, one cache group).
@@ -201,7 +208,11 @@ impl Drop for TickGuard {
             DEC_DSA.with(Cell::get),
         );
         if seq % 1000 == 0 {
-            eprintln!("TICKDX n={seq} dx={} dsa={}", DX_TOTAL.with(Cell::get), DSA_TOTAL.with(Cell::get));
+            eprintln!(
+                "TICKDX n={seq} dx={} dsa={}",
+                DX_TOTAL.with(Cell::get),
+                DSA_TOTAL.with(Cell::get)
+            );
         }
         LAST_END.with(|l| l.set(Some(end)));
     }

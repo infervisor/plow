@@ -37,11 +37,18 @@ fn device_cfg_draw_matches_host() {
         .arg(&src)
         .output()
         .expect("nvcc");
-    assert!(out.status.success(), "nvcc: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "nvcc: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let be = CudaBackend::new(0).expect("CUDA backend");
     let module = be.module_load(&std::fs::read(&cubin).unwrap()).unwrap();
     let f = be.get_function(&module, "plow_sample_cfg").unwrap();
-    let threads = be.module_global_u32(&module, "plow_sample_threads").unwrap().unwrap_or(256);
+    let threads = be
+        .module_global_u32(&module, "plow_sample_threads")
+        .unwrap()
+        .unwrap_or(256);
     let stream = be.stream_create().unwrap();
 
     let b = 2 * PAIRS;
@@ -53,7 +60,11 @@ fn device_cfg_draw_matches_host() {
     for p in 0..PAIRS {
         for i in 0..V {
             let r = rng.unit();
-            let head = if r < 0.006 { 8.0 + 6.0 * rng.unit() } else { 0.0 };
+            let head = if r < 0.006 {
+                8.0 + 6.0 * rng.unit()
+            } else {
+                0.0
+            };
             let c = head + 2.0 * rng.unit() - 1.0;
             let u = c + 1.5 * (rng.unit() - 0.5);
             logits[2 * p * V + i] = bf16(c);
@@ -69,13 +80,32 @@ fn device_cfg_draw_matches_host() {
     }
     let f32_of = |bits: u16| f32::from_bits(u32::from(bits) << 16);
     let cases = [
-        CfgParams { cfg_weight: 0.5, temperature: 0.8, min_p: 0.05, top_p: 1.0, repetition_penalty: 1.2 },
-        CfgParams { cfg_weight: 0.3, temperature: 1.0, min_p: 0.0, top_p: 1.0, repetition_penalty: 1.0 },
-        CfgParams { cfg_weight: 0.5, temperature: 0.8, min_p: 0.02, top_p: 0.9, repetition_penalty: 1.3 },
+        CfgParams {
+            cfg_weight: 0.5,
+            temperature: 0.8,
+            min_p: 0.05,
+            top_p: 1.0,
+            repetition_penalty: 1.2,
+        },
+        CfgParams {
+            cfg_weight: 0.3,
+            temperature: 1.0,
+            min_p: 0.0,
+            top_p: 1.0,
+            repetition_penalty: 1.0,
+        },
+        CfgParams {
+            cfg_weight: 0.5,
+            temperature: 0.8,
+            min_p: 0.02,
+            top_p: 0.9,
+            repetition_penalty: 1.3,
+        },
     ];
 
     let d_logits = be.alloc(0, (b * V * 2) as u64).unwrap();
-    be.upload(&d_logits, 0, bytemuck::cast_slice(&logits)).unwrap();
+    be.upload(&d_logits, 0, bytemuck::cast_slice(&logits))
+        .unwrap();
     let d_ids = be.alloc(0, (b * 4) as u64).unwrap();
     let d_prm = be.alloc(0, (6 * b * 4) as u64).unwrap();
     let d_rng = be.alloc(0, (b * 4) as u64).unwrap();
@@ -95,9 +125,16 @@ fn device_cfg_draw_matches_host() {
             let mut us = vec![0f32; b];
             for q in 0..PAIRS {
                 let o = 2 * q;
-                for (j, v) in [1.0, p.cfg_weight, p.repetition_penalty, if greedy { 0.0 } else { p.temperature }, p.top_p, p.min_p]
-                    .into_iter()
-                    .enumerate()
+                for (j, v) in [
+                    1.0,
+                    p.cfg_weight,
+                    p.repetition_penalty,
+                    if greedy { 0.0 } else { p.temperature },
+                    p.top_p,
+                    p.min_p,
+                ]
+                .into_iter()
+                .enumerate()
                 {
                     prm[j * b + o] = v;
                 }
@@ -105,8 +142,14 @@ fn device_cfg_draw_matches_host() {
             }
             be.upload(&d_prm, 0, bytemuck::cast_slice(&prm)).unwrap();
             be.upload(&d_rng, 0, bytemuck::cast_slice(&us)).unwrap();
-            let (mut a0, mut a1, mut a2, mut a3, mut a4, mut a5) =
-                (d_logits.base, d_ids.base, d_prm.base, d_rng.base, d_cnt.base, d_es.base);
+            let (mut a0, mut a1, mut a2, mut a3, mut a4, mut a5) = (
+                d_logits.base,
+                d_ids.base,
+                d_prm.base,
+                d_rng.base,
+                d_cnt.base,
+                d_es.base,
+            );
             let (mut av, mut ab) = (V as u32, b as u32);
             let mut args = [
                 &mut a0 as *mut u64 as *mut std::ffi::c_void,
@@ -118,23 +161,35 @@ fn device_cfg_draw_matches_host() {
                 &mut av as *mut u32 as *mut std::ffi::c_void,
                 &mut ab as *mut u32 as *mut std::ffi::c_void,
             ];
-            be.launch_kernel(f, b as u32, threads, 0, &mut args, Some(&stream)).unwrap();
+            be.launch_kernel(f, b as u32, threads, 0, &mut args, Some(&stream))
+                .unwrap();
             be.stream_synchronize(&stream).unwrap();
             let mut ids = vec![0i32; b];
-            be.download(&d_ids, 0, bytemuck::cast_slice_mut(&mut ids)).unwrap();
+            be.download(&d_ids, 0, bytemuck::cast_slice_mut(&mut ids))
+                .unwrap();
             let mut cnt_after = vec![0u32; b * V];
-            be.download(&d_cnt, 0, bytemuck::cast_slice_mut(&mut cnt_after)).unwrap();
+            be.download(&d_cnt, 0, bytemuck::cast_slice_mut(&mut cnt_after))
+                .unwrap();
 
             let mut same = 0;
             let mut scratch = Vec::new();
             for q in 0..PAIRS {
                 let o = 2 * q;
-                let cond: Vec<f32> = logits[o * V..(o + 1) * V].iter().map(|&x| f32_of(x)).collect();
-                let unc: Vec<f32> = logits[(o + 1) * V..(o + 2) * V].iter().map(|&x| f32_of(x)).collect();
+                let cond: Vec<f32> = logits[o * V..(o + 1) * V]
+                    .iter()
+                    .map(|&x| f32_of(x))
+                    .collect();
+                let unc: Vec<f32> = logits[(o + 1) * V..(o + 2) * V]
+                    .iter()
+                    .map(|&x| f32_of(x))
+                    .collect();
                 let u = (!greedy).then_some(us[o]);
                 let host = sample_cfg(p, &cond, &unc, hist[q].iter().copied(), u, &mut scratch);
                 assert_eq!(ids[o], ids[o + 1], "pair {q}: both members get the token");
-                assert_eq!(cnt_after[o * V + ids[o] as usize], counts[o * V + ids[o] as usize] + 1);
+                assert_eq!(
+                    cnt_after[o * V + ids[o] as usize],
+                    counts[o * V + ids[o] as usize] + 1
+                );
                 same += (ids[o] as u32 == host) as usize;
             }
             eprintln!("case {ci} greedy={greedy}: {same}/{PAIRS} device == host");

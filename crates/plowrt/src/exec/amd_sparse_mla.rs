@@ -17,7 +17,11 @@ use crate::{Result, RuntimeError};
 pub(crate) const SPAN_MIN_PRIOR: u32 = 2047;
 
 fn window_launches(rows: u32, fp8: bool, single_pack: bool, csr: bool) -> usize {
-    if (rows >= 512 || csr) && fp8 && single_pack { 2 } else { 3 }
+    if (rows >= 512 || csr) && fp8 && single_pack {
+        2
+    } else {
+        3
+    }
 }
 
 /// `PLOW_NATIVE_LAUNCH_TIMING`: drain after each launch of a native route and report the split.
@@ -47,8 +51,14 @@ impl SplitTimer {
 
     pub fn report(&self, route: &str, rows: u32) {
         if let Some((_, laps)) = &self.laps {
-            let parts: Vec<String> = laps.iter().map(|(n, us)| format!("{n}_us={us:.1}")).collect();
-            eprintln!("PLOW_NATIVE_LAUNCH_TIMING route={route} rows={rows} {}", parts.join(" "));
+            let parts: Vec<String> = laps
+                .iter()
+                .map(|(n, us)| format!("{n}_us={us:.1}"))
+                .collect();
+            eprintln!(
+                "PLOW_NATIVE_LAUNCH_TIMING route={route} rows={rows} {}",
+                parts.join(" ")
+            );
         }
     }
 }
@@ -118,7 +128,8 @@ pub(super) fn unread_unions(prog: &DevProg, routes: &[Option<Route>]) -> Vec<Opt
                 d.t.contains(&u.t[0]) || d.t.contains(&u.t[1]) || union_handle(d) == Some(table)
             })
             .all(|(k, d)| {
-                let routed = owner[ix + 1 + k].filter(|&f| routes.get(f).is_some_and(Option::is_some));
+                let routed =
+                    owner[ix + 1 + k].filter(|&f| routes.get(f).is_some_and(Option::is_some));
                 first = first.or(routed);
                 union_handle(d) == Some(table) && !d.t.contains(&u.t[1]) && routed.is_some()
             });
@@ -148,7 +159,11 @@ pub(crate) fn skippable_unions(prog: &DevProg, tensors: &[DevTensor]) -> Result<
 }
 
 /// [`unread_unions`] when `PLOW_AMD_UNION_SKIP` is on; otherwise no segment is skippable.
-pub(super) fn union_skip_table(on: bool, prog: &DevProg, routes: &[Option<Route>]) -> Vec<Option<usize>> {
+pub(super) fn union_skip_table(
+    on: bool,
+    prog: &DevProg,
+    routes: &[Option<Route>],
+) -> Vec<Option<usize>> {
     if on {
         unread_unions(prog, routes)
     } else {
@@ -173,7 +188,13 @@ pub(super) struct Route {
 }
 
 impl Route {
-    pub fn rebase(&mut self, rows: u32, prior: u32, row_split: bool, native_lo: bool) -> Result<()> {
+    pub fn rebase(
+        &mut self,
+        rows: u32,
+        prior: u32,
+        row_split: bool,
+        native_lo: bool,
+    ) -> Result<()> {
         // Row-split (nh=64, a row-split sibling program): `rows` is the bucket-wide count, `i[4]`
         // this rank's band. The runtime selects the sibling only for a full chunk whose every band
         // has a key plan (`rowsplit_chunk_prog`, `band_keys`); anything else has no route here.
@@ -237,24 +258,40 @@ impl Route {
     }
 
     pub fn split_launches(&self, single_pack: bool) -> usize {
-        1 + window_launches(self.rows - self.split_row0, self.scale.is_some(), single_pack, false)
+        1 + window_launches(
+            self.rows - self.split_row0,
+            self.scale.is_some(),
+            single_pack,
+            false,
+        )
     }
 
     fn csr_key(&self, rank: u32) -> Result<Option<(u32, u32)>> {
         if self.active && self.is_rowsplit() {
-            let prior = self.rows.checked_mul(8).and_then(|n| self.kv_len.checked_sub(n))
+            let prior = self
+                .rows
+                .checked_mul(8)
+                .and_then(|n| self.kv_len.checked_sub(n))
                 .ok_or_else(|| RuntimeError::Rejected("invalid row-band CSR bounds".into()))?;
             return match band_keys(prior, rank, self.rows) {
                 Some(BandKeys::Selection) => Ok(None),
                 Some(BandKeys::Identity { band_prior }) => Ok(Some((band_prior, self.rows))),
-                None => Err(RuntimeError::Rejected("row-band CSR straddles fixed-width boundary".into())),
+                None => Err(RuntimeError::Rejected(
+                    "row-band CSR straddles fixed-width boundary".into(),
+                )),
             };
         }
         if !self.active && self.split_row0 != 0 && self.native_lo {
-            let prior = self.kv_len.checked_sub(self.rows)
+            let prior = self
+                .kv_len
+                .checked_sub(self.rows)
                 .ok_or_else(|| RuntimeError::Rejected("invalid lower-half CSR bounds".into()))?;
-            if self.split_row0 >= self.rows || prior.checked_add(self.split_row0) != Some(SPAN_MIN_PRIOR) {
-                return Err(RuntimeError::Rejected("invalid lower-half CSR split".into()));
+            if self.split_row0 >= self.rows
+                || prior.checked_add(self.split_row0) != Some(SPAN_MIN_PRIOR)
+            {
+                return Err(RuntimeError::Rejected(
+                    "invalid lower-half CSR split".into(),
+                ));
             }
             return Ok(Some((prior, self.split_row0)));
         }
@@ -264,7 +301,11 @@ impl Route {
     /// `(flash, union, rows)`: the instructions whose row count the interpreter half runs with.
     pub fn split_patch(&self) -> Option<(usize, usize, u32)> {
         let union = self.union_ix?;
-        (self.split_row0 != 0 && !self.native_lo).then_some((self.ix as usize, union as usize, self.split_row0))
+        (self.split_row0 != 0 && !self.native_lo).then_some((
+            self.ix as usize,
+            union as usize,
+            self.split_row0,
+        ))
     }
 }
 
@@ -280,15 +321,29 @@ mod tests {
                 for loaded in [false, true] {
                     for csr in [false, true] {
                         let single = (rows >= 512 || csr) && fp8 && loaded;
-                        assert_eq!(window_launches(rows, fp8, loaded, csr), if single { 2 } else { 3 });
+                        assert_eq!(
+                            window_launches(rows, fp8, loaded, csr),
+                            if single { 2 } else { 3 }
+                        );
                     }
                 }
             }
         }
         let mut route = Route {
-            inst: DevInst64 { i: [1, 8, 8192, 0, 512, 0, 0, 0], ..Default::default() },
-            index: 8, scale: Some(9), rows: 512, kv_len: 4096, active: true,
-            ix: 0, union_ix: None, split_row0: 0, native_lo: false, local_index: false,
+            inst: DevInst64 {
+                i: [1, 8, 8192, 0, 512, 0, 0, 0],
+                ..Default::default()
+            },
+            index: 8,
+            scale: Some(9),
+            rows: 512,
+            kv_len: 4096,
+            active: true,
+            ix: 0,
+            union_ix: None,
+            split_row0: 0,
+            native_lo: false,
+            local_index: false,
         };
         assert_eq!(route.active_launches(true), 2);
         assert_eq!(route.active_launches(false), 3);
@@ -312,9 +367,20 @@ mod tests {
     #[test]
     fn csr_preparation_keys_follow_actual_row_band_and_lower_half_routes() {
         let mut route = Route {
-            inst: DevInst64 { i: [1, 8, 8192, 0, 4096, 0, 0, 0], ..Default::default() },
-            index: 8, scale: Some(9), rows: 4096, kv_len: 4096, active: false,
-            ix: 0, union_ix: Some(0), split_row0: 2047, native_lo: true, local_index: false,
+            inst: DevInst64 {
+                i: [1, 8, 8192, 0, 4096, 0, 0, 0],
+                ..Default::default()
+            },
+            index: 8,
+            scale: Some(9),
+            rows: 4096,
+            kv_len: 4096,
+            active: false,
+            ix: 0,
+            union_ix: Some(0),
+            split_row0: 2047,
+            native_lo: true,
+            local_index: false,
         };
         assert_eq!(route.csr_key(0).unwrap(), Some((0, 2047)));
         route.kv_len += 1;
@@ -749,13 +815,19 @@ mod tests {
             assert_eq!((route.index, route.scale), (8, Some(9)));
         }
         prog.role = packet::devbuild::ProgramRole::PrefillBucket { rows: prog.t };
-        assert!(routes(&prog, &tensors, 2).is_err(), "ordinary programs keep the union");
+        assert!(
+            routes(&prog, &tensors, 2).is_err(),
+            "ordinary programs keep the union"
+        );
         prog.role = packet::devbuild::ProgramRole::PackedSibling { of_rows: prog.t };
         prog.insts[0].i[1] = 65536;
         assert!(routes(&prog, &tensors, 2).is_err(), "ctx must agree");
         prog.insts[0].i[1] = 81920;
         prog.insts[0].t[5] = 5;
-        assert!(routes(&prog, &tensors, 2).is_err(), "kv_len operand must agree");
+        assert!(
+            routes(&prog, &tensors, 2).is_err(),
+            "kv_len operand must agree"
+        );
     }
 
     #[test]
@@ -776,11 +848,17 @@ mod tests {
         let route = routes(&prog, &tensors, 2).unwrap()[1].unwrap();
         assert!(route.local_index && route.is_rowsplit());
         prog.insts[0].i[7] = 0;
-        assert!(routes(&prog, &tensors, 2).is_err(), "the sibling's selection must be local");
+        assert!(
+            routes(&prog, &tensors, 2).is_err(),
+            "the sibling's selection must be local"
+        );
         prog.insts[0].i[7] = 1;
         prog.insts[1].i[1] = 8;
         prog.insts[1].i[4] = prog.t;
-        assert!(routes(&prog, &tensors, 2).is_err(), "only the row-split flash reads a local band");
+        assert!(
+            routes(&prog, &tensors, 2).is_err(),
+            "only the row-split flash reads a local band"
+        );
     }
 
     #[test]
@@ -819,13 +897,20 @@ mod tests {
                 panic!("row-split chunk at c0={c0} refused: {e}");
             });
             assert!(route.active, "c0={c0} must take the whole-sparse route");
-            assert_eq!((route.rows, route.kv_len), (1024, c0 + 8192), "the rank's own band");
+            assert_eq!(
+                (route.rows, route.kv_len),
+                (1024, c0 + 8192),
+                "the rank's own band"
+            );
             assert_eq!((route.split_row0, route.split_patch()), (0, None));
         }
         // No interpreter or split fallback exists for the 64-head instruction: a chunk the
         // runtime would not select the sibling for is refused, never patched.
         for (rows, c0) in [(8192u32, 1u32), (8192, 2046), (4096, 65536), (8191, 65536)] {
-            assert!(route.rebase(rows, c0, true, true).is_err(), "rows={rows} c0={c0}");
+            assert!(
+                route.rebase(rows, c0, true, true).is_err(),
+                "rows={rows} c0={c0}"
+            );
         }
     }
 
@@ -858,22 +943,38 @@ mod tests {
         let mut checked = 0;
         for path in list.split(',').filter(|s| !s.is_empty()) {
             let blob =
-                crate::asset::devblob::DevBlob::parse_l2(&std::fs::read(path).unwrap(), true).unwrap();
+                crate::asset::devblob::DevBlob::parse_l2(&std::fs::read(path).unwrap(), true)
+                    .unwrap();
             let Some(sibling) = blob.progs.iter().find(|p| p.role.is_rowsplit_sibling()) else {
                 continue;
             };
             let bucket = blob
                 .progs
                 .iter()
-                .find(|p| p.role == packet::devbuild::ProgramRole::PrefillBucket { rows: sibling.t })
+                .find(|p| {
+                    p.role == packet::devbuild::ProgramRole::PrefillBucket { rows: sibling.t }
+                })
                 .expect("the sibling's bucket");
             let n = |p: &DevProg| skippable_unions(p, &blob.tensors).unwrap().len();
-            eprintln!("{path}: skippable unions bucket={} sibling={}", n(bucket), n(sibling));
+            eprintln!(
+                "{path}: skippable unions bucket={} sibling={}",
+                n(bucket),
+                n(sibling)
+            );
             assert!(n(bucket) > 0);
-            assert!(sibling.insts.iter().all(|d| d.op != DevOp::IndexUnionPf as u16), "{path}");
+            assert!(
+                sibling
+                    .insts
+                    .iter()
+                    .all(|d| d.op != DevOp::IndexUnionPf as u16),
+                "{path}"
+            );
             checked += 1;
         }
-        assert!(checked > 0, "no packet in PLOW_LT_PACKETS carries a row-split sibling");
+        assert!(
+            checked > 0,
+            "no packet in PLOW_LT_PACKETS carries a row-split sibling"
+        );
     }
 
     #[test]
@@ -929,7 +1030,11 @@ mod tests {
             (8192, 0, true, false, 2048, false),
         ] {
             route.rebase(rows, prior, split, lo).unwrap();
-            assert_eq!((route.split_row0, route.native_lo), (row0, native), "rows={rows} prior={prior}");
+            assert_eq!(
+                (route.split_row0, route.native_lo),
+                (row0, native),
+                "rows={rows} prior={prior}"
+            );
             assert_eq!(route.split_patch().is_some(), row0 != 0 && !native);
         }
     }
@@ -942,7 +1047,10 @@ mod tests {
             assert_eq!(kp.len(), rows as usize + 1);
             for t in 0..rows as usize {
                 let row = &idx[kp[t] as usize..kp[t + 1] as usize];
-                assert!(row.iter().copied().eq(0..=prior + t as u32), "prior={prior} t={t}");
+                assert!(
+                    row.iter().copied().eq(0..=prior + t as u32),
+                    "prior={prior} t={t}"
+                );
             }
             assert!(idx.len() as u64 <= LO_KEYS && (kp.len() as u64) * 4 <= LO_IDX_OFF);
         }
@@ -1049,8 +1157,14 @@ pub(super) fn routes(
             producer.t[0]
         };
         let local_index = producer.op == DevOp::IndexTpPf as u16 && producer.i[7] == 1;
-        if local_index != (rowsplit && prog.role.is_rowsplit_sibling() && producer.op == DevOp::IndexTpPf as u16) {
-            return Err(err("a local-band TP selection feeds exactly the row-split sibling's flash"));
+        if local_index
+            != (rowsplit
+                && prog.role.is_rowsplit_sibling()
+                && producer.op == DevOp::IndexTpPf as u16)
+        {
+            return Err(err(
+                "a local-band TP selection feeds exactly the row-split sibling's flash",
+            ));
         }
         let ctx = u64::from(inst.i[2]);
         let rows = u64::from(inst.i[4]);
@@ -1204,7 +1318,9 @@ impl LoCsr {
 
     fn require(&self, prior: u32, rows: u32) -> Result<()> {
         if !self.matches(prior, rows) {
-            return Err(RuntimeError::Rejected("sparse CSR was not prepared before admission".into()));
+            return Err(RuntimeError::Rejected(
+                "sparse CSR was not prepared before admission".into(),
+            ));
         }
         Ok(())
     }
@@ -1401,10 +1517,13 @@ mod rowsplit_scratch_tests {
 
 impl SparseMla {
     pub fn needs_prepare(&self, route: Route, rank: u32) -> Result<bool> {
-        let clear = route.active && route.is_rowsplit()
+        let clear = route.active
+            && route.is_rowsplit()
             && crate::config::RuntimeConfig::get().amd.glm_rowband_clear_ws;
         let missing = match route.csr_key(rank)? {
-            Some((prior, rows)) => !self.lo.as_ref()
+            Some((prior, rows)) => !self
+                .lo
+                .as_ref()
                 .ok_or_else(|| RuntimeError::Rejected("sparse CSR allocation missing".into()))?
                 .matches(prior, rows),
             None => false,
@@ -1415,11 +1534,15 @@ impl SparseMla {
     pub fn prepare_quiescent(&self, be: &HsaBackend, route: Route, rank: u32) -> Result<()> {
         be.require_quiescent()?;
         let key = route.csr_key(rank)?;
-        if route.active && route.is_rowsplit() && crate::config::RuntimeConfig::get().amd.glm_rowband_clear_ws {
+        if route.active
+            && route.is_rowsplit()
+            && crate::config::RuntimeConfig::get().amd.glm_rowband_clear_ws
+        {
             self.clear_workspace_quiescent(be)?;
         }
         if let Some((prior, rows)) = key {
-            self.lo.as_ref()
+            self.lo
+                .as_ref()
                 .ok_or_else(|| RuntimeError::Rejected("sparse CSR allocation missing".into()))?
                 .stage_quiescent(be, prior, rows)?;
         }
@@ -1504,7 +1627,9 @@ impl SparseMla {
         });
         let [q, kv, part, lse, qp, kp, last, splits] = offsets;
         // The row-band sibling's bands below row 2047 read the same identity CSR.
-        let lo = if crate::config::RuntimeConfig::get().amd.mla_pf_row_split_native_lo
+        let lo = if crate::config::RuntimeConfig::get()
+            .amd
+            .mla_pf_row_split_native_lo
             || attention16.is_some()
         {
             Some(LoCsr {
@@ -1559,7 +1684,9 @@ impl SparseMla {
     /// the packet's max rows is hundreds of MB of H2D per dispatch.
     fn clear_workspace_quiescent(&self, be: &HsaBackend) -> Result<()> {
         be.require_quiescent()?;
-        if let Some(lo) = self.lo.as_ref() { lo.forget(); }
+        if let Some(lo) = self.lo.as_ref() {
+            lo.forget();
+        }
         const CHUNK: usize = 4 << 20;
         let zeros = vec![0u8; CHUNK];
         for mem in std::iter::once(&self._scratch).chain(self.lo.as_ref().map(|l| &l.mem)) {
@@ -1576,7 +1703,13 @@ impl SparseMla {
         Ok(())
     }
 
-    pub fn enqueue(&self, be: &HsaBackend, route: Route, tensor_table: &[u8], rank: u32) -> Result<usize> {
+    pub fn enqueue(
+        &self,
+        be: &HsaBackend,
+        route: Route,
+        tensor_table: &[u8],
+        rank: u32,
+    ) -> Result<usize> {
         let one = SpanWindow {
             row0: 0,
             rows: route.rows,
@@ -1590,7 +1723,12 @@ impl SparseMla {
     }
 
     /// Native half of a row-split chunk: rows `[split_row0, rows)`, each with all 2048 causal keys.
-    pub fn enqueue_split(&self, be: &HsaBackend, route: Route, tensor_table: &[u8]) -> Result<usize> {
+    pub fn enqueue_split(
+        &self,
+        be: &HsaBackend,
+        route: Route,
+        tensor_table: &[u8],
+    ) -> Result<usize> {
         let window = SpanWindow {
             row0: route.split_row0,
             rows: route.rows - route.split_row0,
@@ -1602,7 +1740,12 @@ impl SparseMla {
 
     /// Rows `[0, split_row0)` of a native-lo chunk, every causal key through the ragged identity
     /// CSR. Single split only: the pinned kernel mis-merges ragged rows at ns=2.
-    pub fn enqueue_split_lo(&self, be: &HsaBackend, route: Route, tensor_table: &[u8]) -> Result<usize> {
+    pub fn enqueue_split_lo(
+        &self,
+        be: &HsaBackend,
+        route: Route,
+        tensor_table: &[u8],
+    ) -> Result<usize> {
         let lo = self.lo.as_ref().ok_or_else(|| {
             RuntimeError::Device("native lower half CSR was not allocated".into())
         })?;
@@ -1626,8 +1769,17 @@ impl SparseMla {
 
     /// Launches of [`Self::enqueue_split_lo`] plus [`Self::enqueue_split`].
     pub fn native_lo_launches(&self, route: Route) -> usize {
-        window_launches(route.split_row0, route.scale.is_some(), self.pack_fp8_single.is_some(), true)
-            + window_launches(route.rows - route.split_row0, route.scale.is_some(), self.pack_fp8_single.is_some(), false)
+        window_launches(
+            route.split_row0,
+            route.scale.is_some(),
+            self.pack_fp8_single.is_some(),
+            true,
+        ) + window_launches(
+            route.rows - route.split_row0,
+            route.scale.is_some(),
+            self.pack_fp8_single.is_some(),
+            false,
+        )
     }
 
     /// The AQL packets [`Self::enqueue_spans`] emits for `spans` (each span is its own
@@ -1636,7 +1788,12 @@ impl SparseMla {
         spans
             .iter()
             .map(|s| {
-                window_launches(s.n_rows, route.scale.is_some(), self.pack_fp8_single.is_some(), false)
+                window_launches(
+                    s.n_rows,
+                    route.scale.is_some(),
+                    self.pack_fp8_single.is_some(),
+                    false,
+                )
             })
             .sum()
     }
@@ -1704,7 +1861,8 @@ impl SparseMla {
         let fp8 = route.scale.is_some();
         let row0 = u64::from(w.row0);
         let mut timer = SplitTimer::start(be)?;
-        let single = window_launches(w.rows, fp8, self.pack_fp8_single.is_some(), csr.is_some()) == 2;
+        let single =
+            window_launches(w.rows, fp8, self.pack_fp8_single.is_some(), csr.is_some()) == 2;
         if csr.is_some() && !single {
             return Err(RuntimeError::Device(
                 "sparse MLA ragged CSR requires the single-pass FP8 pack (ns=1)".into(),
@@ -1754,7 +1912,11 @@ impl SparseMla {
         }
         timer.lap(be, "pack")?;
         let mut args = [0u64; 40];
-        args[0] = if single { addr(t[0]) + row0 * 8 * 512 * 4 } else { self.part };
+        args[0] = if single {
+            addr(t[0]) + row0 * 8 * 512 * 4
+        } else {
+            self.part
+        };
         args[2] = self.lse;
         args[4] = self.q;
         args[6] = self.kv;
@@ -1777,7 +1939,14 @@ impl SparseMla {
         )?;
         timer.lap(be, "attention")?;
         if single {
-            timer.report(if csr.is_some() { "sparse_mla_lo" } else { "sparse_mla_single" }, w.rows);
+            timer.report(
+                if csr.is_some() {
+                    "sparse_mla_lo"
+                } else {
+                    "sparse_mla_single"
+                },
+                w.rows,
+            );
             return Ok(2);
         }
         let reduce = ReduceArgs {
@@ -1811,13 +1980,15 @@ impl SparseMla {
         rank: u32,
     ) -> Result<usize> {
         if let Some((prior, rows)) = route.csr_key(rank)? {
-            self.lo.as_ref()
+            self.lo
+                .as_ref()
                 .ok_or_else(|| RuntimeError::Rejected("row-band CSR allocation missing".into()))?
                 .require(prior, rows)?;
         }
         let (Some(scale), Some(pack)) = (route.scale, self.pack_fp8_single) else {
             return Err(RuntimeError::Device(
-                "row-split sparse MLA requires the FP8 latent cache and the single-pass pack".into(),
+                "row-split sparse MLA requires the FP8 latent cache and the single-pass pack"
+                    .into(),
             ));
         };
         let attention16 = self.attention16.ok_or_else(|| {
@@ -1861,7 +2032,11 @@ impl SparseMla {
         };
         be.launch(pack, 304, 256, 0, bytemuck::bytes_of(&args))?;
         timer.lap(be, "pack")?;
-        let index_row0 = if route.local_index { 0 } else { u64::from(rank) * u64::from(route.rows) };
+        let index_row0 = if route.local_index {
+            0
+        } else {
+            u64::from(rank) * u64::from(route.rows)
+        };
         let prior = w.kv_len - w.rows * (NH / 8);
         // Every quantity the row-band dispatch derives, per rank. `rbfault19` showed that on a
         // poisoned server ALL EIGHT bands are wrong, which rules out either arm of `band_keys`
@@ -1892,7 +2067,9 @@ impl SparseMla {
             Some(BandKeys::Selection) => None,
             Some(BandKeys::Identity { band_prior }) => {
                 let lo = self.lo.as_ref().ok_or_else(|| {
-                    RuntimeError::Device("row-band identity keys need the lower-half CSR buffer".into())
+                    RuntimeError::Device(
+                        "row-band identity keys need the lower-half CSR buffer".into(),
+                    )
                 })?;
                 lo.require(band_prior, w.rows)?;
                 Some((lo.mem.base, lo.mem.base + LO_IDX_OFF))
@@ -1920,7 +2097,12 @@ impl SparseMla {
             args[22] = a.q_head_stride_bytes;
             args[26] = self.qp;
             args[28] = self.qp;
-            be.launch_3d(attention16, [1, w.rows, 1], 256, bytemuck::cast_slice(&args))?;
+            be.launch_3d(
+                attention16,
+                [1, w.rows, 1],
+                256,
+                bytemuck::cast_slice(&args),
+            )?;
         }
         timer.lap(be, "attention16")?;
         timer.report("sparse_mla_rowsplit", w.rows);
@@ -1997,9 +2179,21 @@ mod rowsplit_addressing_tests {
         let (rows, total_h, mqa, vd) = (1024u32, 64u32, 16u32, 512u32);
         for g in 0..4u32 {
             let a = rowsplit_launch_args(g, mqa, total_h, rows, vd, 1);
-            assert_eq!(a.out_off_elems, u64::from(g) * u64::from(rows * mqa * vd), "group {g}");
-            assert_eq!(a.lse_off_elems, u64::from(g) * u64::from(rows * mqa), "group {g}");
-            assert_eq!(a.q_off_vec16, u64::from(g) * u64::from(mqa) * 72, "group {g}");
+            assert_eq!(
+                a.out_off_elems,
+                u64::from(g) * u64::from(rows * mqa * vd),
+                "group {g}"
+            );
+            assert_eq!(
+                a.lse_off_elems,
+                u64::from(g) * u64::from(rows * mqa),
+                "group {g}"
+            );
+            assert_eq!(
+                a.q_off_vec16,
+                u64::from(g) * u64::from(mqa) * 72,
+                "group {g}"
+            );
             assert_eq!(a.q_row_stride_bytes, u64::from(total_h) * 576 * 2);
             assert_eq!(a.q_head_stride_bytes, 576 * 2);
             assert_eq!(a.mqa, 16);
@@ -2069,7 +2263,10 @@ mod band_key_tests {
         for prior in [0u32, 1023, 1024, 2047, 8192, 65536] {
             assert!(rowsplit_prior_ok(prior, 1024), "prior={prior}");
         }
-        assert_eq!(band_keys(1024, 0, 1024), Some(BandKeys::Identity { band_prior: 1024 }));
+        assert_eq!(
+            band_keys(1024, 0, 1024),
+            Some(BandKeys::Identity { band_prior: 1024 })
+        );
         assert_eq!(band_keys(1023, 1, 1024), Some(BandKeys::Selection));
     }
 

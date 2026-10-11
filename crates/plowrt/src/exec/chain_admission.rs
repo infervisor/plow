@@ -148,7 +148,11 @@ mod tests {
                 |_| Ok(true),
                 |r| {
                     finished.borrow_mut().push(r);
-                    if r == 1 { Err(1) } else { Ok(()) }
+                    if r == 1 {
+                        Err(1)
+                    } else {
+                        Ok(())
+                    }
                 },
                 |_| panic!("failed completion cannot authorize writes")
             ),
@@ -164,7 +168,11 @@ mod tests {
                 |_| Ok(()),
                 |r| {
                     prepared.borrow_mut().push(r);
-                    if r == 1 { Err(1) } else { Ok(()) }
+                    if r == 1 {
+                        Err(1)
+                    } else {
+                        Ok(())
+                    }
                 }
             ),
             Err(1)
@@ -338,7 +346,11 @@ mod tests {
             |rank| ranks[rank].preflight(1, 4, || 0),
             |rank, ticket| {
                 ranks[rank].reserve_admitted(ticket)?;
-                if rank == 1 { Err(Error::Stale) } else { Ok(()) }
+                if rank == 1 {
+                    Err(Error::Stale)
+                } else {
+                    Ok(())
+                }
             },
             |rank| ranks[rank].cancel(),
         );

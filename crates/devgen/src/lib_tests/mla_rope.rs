@@ -149,7 +149,10 @@ fn an_unsupported_mla_geometry_is_refused_at_the_config_parse() {
     // WHY it is not a config knob — an operator who reads only "unsupported" will try to make it
     // supported by editing the config.
     let m = bad(384, 64, 128);
-    assert!(m.contains("384") && m.contains("512"), "names both widths: {m}");
+    assert!(
+        m.contains("384") && m.contains("512"),
+        "names both widths: {m}"
+    );
     assert!(m.contains("TEMPLATE ARGUMENT"), "says why it is fixed: {m}");
     assert!(m.contains("op_attention.h"), "names the fix site: {m}");
 
@@ -158,7 +161,10 @@ fn an_unsupported_mla_geometry_is_refused_at_the_config_parse() {
     // "impossible", and points at the coverage that would qualify it.
     let m = bad(512, 96, 128);
     assert!(m.contains("96"), "names the value: {m}");
-    assert!(m.contains("mla_gfx950_test.c"), "names the coverage to add: {m}");
+    assert!(
+        m.contains("mla_gfx950_test.c"),
+        "names the coverage to add: {m}"
+    );
 
     // A v_head_dim that makes the fold's fast map unreachable in every arm. Correct output, 7.7x
     // slower, and completely silent about it — which is why it is refused rather than tolerated.

@@ -143,7 +143,11 @@ pub fn submitted(prompt: usize, pre_submit: Duration) {
 
 /// Handler: the first SSE frame of a request is being yielded (`ttft` from handler entry).
 pub fn first_frame(prompt: usize, ttft: Duration) {
-    tracing::info!(prompt, ttft_us = ttft.as_micros() as u64, "HOSTT first frame");
+    tracing::info!(
+        prompt,
+        ttft_us = ttft.as_micros() as u64,
+        "HOSTT first frame"
+    );
 }
 
 #[cfg(test)]

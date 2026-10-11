@@ -219,11 +219,9 @@ pub fn load_one(dir: &Path, l2_dispatch_ok: bool) -> Result<LoadedExtension> {
         source,
     })?;
     let blob = DevBlob::parse_extension(&image, l2_dispatch_ok)?;
-    let parent = blob.parent.clone().ok_or_else(|| {
-        RuntimeError::Packet {
-            path: pkt.clone(),
-            reason: "extension container carries no parent reference".into(),
-        }
+    let parent = blob.parent.clone().ok_or_else(|| RuntimeError::Packet {
+        path: pkt.clone(),
+        reason: "extension container carries no parent reference".into(),
     })?;
 
     let requires: Requires = crate::asset::read_json(&dir.join(extension::REQUIRES_FILE))?;
@@ -308,7 +306,8 @@ pub fn load(
     let dirs = discover(assets)?;
     let parent = parent_facts(assets, image, blob)?;
     if dirs.is_empty() {
-        let merged = extension::merge(&parent, &[]).map_err(|r| RuntimeError::Rejected(r.to_string()))?;
+        let merged =
+            extension::merge(&parent, &[]).map_err(|r| RuntimeError::Rejected(r.to_string()))?;
         return Ok((merged, Vec::new()));
     }
     let loaded: Vec<LoadedExtension> = dirs

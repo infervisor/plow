@@ -100,14 +100,43 @@ pub fn op_classes(op: DevOp) -> &'static [&'static str] {
         | MoeGluMx
         | MoeDownMx
         | MoeGluMxPf
-        | MoeDownMxPf | MoeGluFp8Block128 | MoeQuantFp8Block128 | MoeDownFp8Block128 => &["moe"],
+        | MoeDownMxPf
+        | MoeGluFp8Block128
+        | MoeQuantFp8Block128
+        | MoeDownFp8Block128 => &["moe"],
         MoeAiterFp8Pf => &["moe", "native_route"],
 
-        Gemm | GemmNorm | GemmSmall | GemmMed | GemmGlu | GemmFp8 | GemmMedFp8 | GemmSmallFp8
-        | GemmGluFp8 | GemmMxfp4 | GemmWide | GemmC5 | GemmMedMxfp4 | GemmSmallMxfp4
-        | GemmWideMxfp4 | GemmC5Mxfp4 | GemmWideFp8 | GemmC5Fp8 | GemmFp8Blk | GemmGluMxfp4
-        | GemmSplitK | GemmF32 | DenseGluFp8Blk | GemmAffineQ4 | Q8GemmF32 | DenseGemmF32
-        | Conv2dF32 | GemmFp8Block128 | GemmFp8Block128Split4 | MlaBmmFp8 | Conv1dF32
+        Gemm
+        | GemmNorm
+        | GemmSmall
+        | GemmMed
+        | GemmGlu
+        | GemmFp8
+        | GemmMedFp8
+        | GemmSmallFp8
+        | GemmGluFp8
+        | GemmMxfp4
+        | GemmWide
+        | GemmC5
+        | GemmMedMxfp4
+        | GemmSmallMxfp4
+        | GemmWideMxfp4
+        | GemmC5Mxfp4
+        | GemmWideFp8
+        | GemmC5Fp8
+        | GemmFp8Blk
+        | GemmGluMxfp4
+        | GemmSplitK
+        | GemmF32
+        | DenseGluFp8Blk
+        | GemmAffineQ4
+        | Q8GemmF32
+        | DenseGemmF32
+        | Conv2dF32
+        | GemmFp8Block128
+        | GemmFp8Block128Split4
+        | MlaBmmFp8
+        | Conv1dF32
         | ConvTranspose1dF32 => &["gemm"],
         GemmLtPf | GemmBlkPf => &["gemm", "native_route"],
 
@@ -118,18 +147,39 @@ pub fn op_classes(op: DevOp) -> &'static [&'static str] {
         RmsNorm | RowRms | NormResidual | AddNorm | NormResidualNorm | LayerNorm | QwenRmsNorm
         | QwenGatedNorm | KdaGatedNorm | LayerNormF32 | RowStatsF32 | RmsNormF32 => &["norm"],
 
-        KdaConv | KdaGate | Mamba2Scan | KdaStateStep | KdaConv3 | KdaStateStepG
-        | KdaConvStateStepG | KdaChunkPrepare | KdaChunkIntra | KdaChunkWu | KdaChunkCarry
-        | KdaDecodeFused | QwenGdnConv | QwenGdnStep | QwenQGateSplit | QwenSigmoidGate
-        | QwenGdnConvPrefill | QwenGdnQkvPrep | QwenGdnGatePrep | QwenGdnPrefill | HyperConnPre
-        | HyperConnPost | CausalDepthwiseConv1dF32 | LstmCellF32 | CumSumF64 => &["recurrent"],
+        KdaConv
+        | KdaGate
+        | Mamba2Scan
+        | KdaStateStep
+        | KdaConv3
+        | KdaStateStepG
+        | KdaConvStateStepG
+        | KdaChunkPrepare
+        | KdaChunkIntra
+        | KdaChunkWu
+        | KdaChunkCarry
+        | KdaDecodeFused
+        | QwenGdnConv
+        | QwenGdnStep
+        | QwenQGateSplit
+        | QwenSigmoidGate
+        | QwenGdnConvPrefill
+        | QwenGdnQkvPrep
+        | QwenGdnGatePrep
+        | QwenGdnPrefill
+        | HyperConnPre
+        | HyperConnPost
+        | CausalDepthwiseConv1dF32
+        | LstmCellF32
+        | CumSumF64 => &["recurrent"],
 
         Argmax | ArgmaxFin | GemvArgmax | RowGather | ArgmaxF32 => &["sample"],
 
-        Nop | Residual | Sum4Bf16 | Glu | Embed | SoftCap | QuantFp8 | SituGlu | ZeroF32 | CastF32Bf16
-        | PerLayerInput | GluStrided | ScaledAddF32 | GluF32 | SiluF32 | ReluF32 | BroadcastAddF32 | EmbedF16F32
-        | EmbedOverlayBf16 | EmbedPosBf16 | PackNcfwRowsF32 | QuantFp8Block128 | GatherRowsF32
-        | CopyColsF32 | UnaryF32 | BinaryF32 | RandF32 | RopeAxialF32 | MmRowsBf16 | MmSpanExtent => &["elementwise"],
+        Nop | Residual | Sum4Bf16 | Glu | Embed | SoftCap | QuantFp8 | SituGlu | ZeroF32
+        | CastF32Bf16 | PerLayerInput | GluStrided | ScaledAddF32 | GluF32 | SiluF32 | ReluF32
+        | BroadcastAddF32 | EmbedF16F32 | EmbedOverlayBf16 | EmbedPosBf16 | PackNcfwRowsF32
+        | QuantFp8Block128 | GatherRowsF32 | CopyColsF32 | UnaryF32 | BinaryF32 | RandF32
+        | RopeAxialF32 | MmRowsBf16 | MmSpanExtent => &["elementwise"],
     }
 }
 

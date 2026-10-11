@@ -299,7 +299,9 @@ async fn load_inner(state: Arc<AppState>, mut req: LoadRequest) -> Response {
                 // The pairing is recorded first so the bundle's pin check and every HF-file read
                 // at load see the requested checkpoint.
                 if let Some(c) = &req.checkpoint {
-                    if let Err(e) = crate::asset::serve::set_checkpoint(&dir, std::path::Path::new(c)) {
+                    if let Err(e) =
+                        crate::asset::serve::set_checkpoint(&dir, std::path::Path::new(c))
+                    {
                         return err(StatusCode::CONFLICT, e);
                     }
                 }
@@ -379,7 +381,10 @@ async fn unload_inner(state: Arc<AppState>, mut req: UnloadRequest) -> Response 
     #[cfg(feature = "cuda")]
     if let Some(keys) = dp_targets(&state, &req.model, req.rank, req.device) {
         if req.deregister {
-            return err(StatusCode::BAD_REQUEST, "a data-parallel model cannot be deregistered while serving");
+            return err(
+                StatusCode::BAD_REQUEST,
+                "a data-parallel model cannot be deregistered while serving",
+            );
         }
         return match keys {
             Ok(keys) => dp_unload(&state, keys).await,
@@ -452,7 +457,10 @@ fn dp_targets(
         .map(|r| r.key.clone())
         .collect();
     Some(if keys.is_empty() {
-        Err(err(StatusCode::NOT_FOUND, format_args!("{model} has no DP rank matching rank {rank:?} device {device:?}")))
+        Err(err(
+            StatusCode::NOT_FOUND,
+            format_args!("{model} has no DP rank matching rank {rank:?} device {device:?}"),
+        ))
     } else {
         Ok(keys)
     })
@@ -465,21 +473,42 @@ async fn dp_load(state: &Arc<AppState>, keys: Vec<String>, evict: bool) -> Respo
     for key in &keys {
         let _control = state.control_lock(key).await;
         let Some(mgr) = state.manager_for(key).cloned() else {
-            return err(StatusCode::NOT_FOUND, format_args!("no model manager serves {key:?}"));
+            return err(
+                StatusCode::NOT_FOUND,
+                format_args!("no model manager serves {key:?}"),
+            );
         };
         match mgr.load(key, evict).await {
             Ok(ms) => load_ms = load_ms.max(ms),
-            Err(e @ (EnsureError::WontFit { .. } | EnsureError::Unloaded)) => return err(StatusCode::CONFLICT, format_args!("{key}: {e}")),
-            Err(e @ EnsureError::SwitchTimeout(_)) => return err(StatusCode::SERVICE_UNAVAILABLE, format_args!("{key}: {e}")),
-            Err(EnsureError::Load(e)) => return err(StatusCode::INTERNAL_SERVER_ERROR, format_args!("{key}: {e}")),
+            Err(e @ (EnsureError::WontFit { .. } | EnsureError::Unloaded)) => {
+                return err(StatusCode::CONFLICT, format_args!("{key}: {e}"))
+            }
+            Err(e @ EnsureError::SwitchTimeout(_)) => {
+                return err(StatusCode::SERVICE_UNAVAILABLE, format_args!("{key}: {e}"))
+            }
+            Err(EnsureError::Load(e)) => {
+                return err(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format_args!("{key}: {e}"),
+                )
+            }
         }
     }
-    Json(LoadResponse { model: keys.join(","), state: "resident", load_ms }).into_response()
+    Json(LoadResponse {
+        model: keys.join(","),
+        state: "resident",
+        load_ms,
+    })
+    .into_response()
 }
 
 #[cfg(feature = "cuda")]
 async fn dp_unload(state: &Arc<AppState>, keys: Vec<String>) -> Response {
-    let bound = std::time::Duration::from_millis(crate::config::RuntimeConfig::get().drain_timeout_ms().unwrap_or(30_000));
+    let bound = std::time::Duration::from_millis(
+        crate::config::RuntimeConfig::get()
+            .drain_timeout_ms()
+            .unwrap_or(30_000),
+    );
     let mut total = UnloadResponse {
         model: keys.join(","),
         state: "unloaded",
@@ -492,7 +521,10 @@ async fn dp_unload(state: &Arc<AppState>, keys: Vec<String>) -> Response {
     for key in &keys {
         let _control = state.control_lock(key).await;
         let Some(mgr) = state.manager_for(key).cloned() else {
-            return err(StatusCode::NOT_FOUND, format_args!("no model manager serves {key:?}"));
+            return err(
+                StatusCode::NOT_FOUND,
+                format_args!("no model manager serves {key:?}"),
+            );
         };
         match mgr.unload_rank(key, bound).await {
             Ok(r) => {
@@ -501,7 +533,12 @@ async fn dp_unload(state: &Arc<AppState>, keys: Vec<String>) -> Response {
                 total.freed_mib += r.freed / MIB;
                 total.pool_trimmed_mib += r.pool_trimmed / MIB;
             }
-            Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, format_args!("{key}: {e}")),
+            Err(e) => {
+                return err(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format_args!("{key}: {e}"),
+                )
+            }
         }
     }
     Json(total).into_response()
@@ -550,7 +587,9 @@ pub async fn status(State(state): State<Arc<AppState>>) -> Response {
         #[cfg(feature = "cuda")]
         if let Some(set) = dp {
             let mgr = state.manager_for(&set.ranks[0].key);
-            entry.required_mib = mgr.and_then(|m| m.required(&set.ranks[0].key)).map(|b| b / MIB);
+            entry.required_mib = mgr
+                .and_then(|m| m.required(&set.ranks[0].key))
+                .map(|b| b / MIB);
             entry.devices = Some(set.ranks.iter().map(|r| r.ordinal).collect());
             models.push(entry);
             continue;
@@ -587,10 +626,34 @@ pub async fn status(State(state): State<Arc<AppState>>) -> Response {
     }
 
     #[allow(unused_mut)]
-    let mut capabilities = ControlCapabilities { load: false, unload: false, register: false, eviction: false };
-    #[cfg(feature="cuda")]
-    if !state.managers().is_empty() { capabilities = ControlCapabilities {load:true,unload:true,register:true,eviction:true}; }
-    #[cfg(feature="cpu")]
-    if state.portable_manager().is_some() { capabilities = ControlCapabilities {load:true,unload:true,register:true,eviction:false}; }
-    Json(StatusResponse { capabilities, models, groups }).into_response()
+    let mut capabilities = ControlCapabilities {
+        load: false,
+        unload: false,
+        register: false,
+        eviction: false,
+    };
+    #[cfg(feature = "cuda")]
+    if !state.managers().is_empty() {
+        capabilities = ControlCapabilities {
+            load: true,
+            unload: true,
+            register: true,
+            eviction: true,
+        };
+    }
+    #[cfg(feature = "cpu")]
+    if state.portable_manager().is_some() {
+        capabilities = ControlCapabilities {
+            load: true,
+            unload: true,
+            register: true,
+            eviction: false,
+        };
+    }
+    Json(StatusResponse {
+        capabilities,
+        models,
+        groups,
+    })
+    .into_response()
 }

@@ -1491,9 +1491,16 @@ fn mla_full_prefill_uses_direct_dense_mxfp4_gemm() {
         PrefillScope::Full,
         MoeEnc::Mxfp4,
     );
-    let down = m.tensors.iter().position(|t| t.name == "model.layers.0.mlp.down_proj.weight").unwrap() as u32;
+    let down = m
+        .tensors
+        .iter()
+        .position(|t| t.name == "model.layers.0.mlp.down_proj.weight")
+        .unwrap() as u32;
     assert!(m.progs[0].insts.iter().any(|d| d.t[2] == down));
-    assert!(!m.progs[0].insts.iter().any(|d| d.op == DevOp::MoeGroupDownPf as u16));
+    assert!(!m.progs[0]
+        .insts
+        .iter()
+        .any(|d| d.op == DevOp::MoeGroupDownPf as u16));
 }
 
 /// The DSA gate does NOT reach for `FlashGatherPrefill`, even armed. A gathered prefill wants

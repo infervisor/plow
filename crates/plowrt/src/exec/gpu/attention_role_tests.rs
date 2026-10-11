@@ -402,22 +402,24 @@ fn accepts_exact_hd512_px4_bq64_resource_contract() {
     let object = hd512_px4_bq64_object();
     let geometry = [Some(512), Some(64), Some(16), Some(16)];
     check_attention_hd512_role("sm90a", &object, Some(5), Some(512), geometry).unwrap();
-    assert!(
-        check_attention_hd512_role("sm90a", &object, Some(2), Some(512), geometry).is_err()
-    );
-    assert!(
-        check_attention_hd512_role("sm90a", &object, Some(5), Some(256), geometry).is_err()
-    );
+    assert!(check_attention_hd512_role("sm90a", &object, Some(2), Some(512), geometry).is_err());
+    assert!(check_attention_hd512_role("sm90a", &object, Some(5), Some(256), geometry).is_err());
 }
 
 #[test]
 fn generated_packet_role_takes_any_heads_but_only_fused_flash() {
     let roles = [0, 0, plow_asset::segment_roles::GENERATED_FIRST, 0, 0];
     let (mut program, tensors) = hd512_px4_fixture();
-    assert_eq!(packet_role_segments(&program, &roles, &tensors).unwrap(), roles);
+    assert_eq!(
+        packet_role_segments(&program, &roles, &tensors).unwrap(),
+        roles
+    );
     // Heads are a runtime operand of the generated object.
     program.insts[2].i[2] = 8;
-    assert_eq!(packet_role_segments(&program, &roles, &tensors).unwrap(), roles);
+    assert_eq!(
+        packet_role_segments(&program, &roles, &tensors).unwrap(),
+        roles
+    );
     // Window and KV ring mask are matched at emit by the catalog signature.
     program.insts[2].i[7] = 2;
     assert!(packet_role_segments(&program, &roles, &tensors).is_err());
@@ -467,7 +469,10 @@ fn attention_shape_descriptor_replaces_the_legacy_gemma_geometry() {
     let objects = std::collections::BTreeMap::from([(px4, object)]);
     assert!(packet_role_segments_with(&program, &roles, &tensors, &objects).is_err());
     program.insts[2].i[2] = 8;
-    assert_eq!(packet_role_segments_with(&program, &roles, &tensors, &objects).unwrap(), roles);
+    assert_eq!(
+        packet_role_segments_with(&program, &roles, &tensors, &objects).unwrap(),
+        roles
+    );
     assert!(packet_role_segments(&program, &roles, &tensors).is_err());
     assert!(packet_role_segments_with(
         &program,
@@ -502,11 +507,17 @@ fn attention_shape_descriptor_replaces_the_legacy_gemma_geometry() {
         rows: None,
     });
     let objects = std::collections::BTreeMap::from([(gqa2, object)]);
-    assert_eq!(packet_role_segments_with(&program, &roles, &tensors, &objects).unwrap(), roles);
+    assert_eq!(
+        packet_role_segments_with(&program, &roles, &tensors, &objects).unwrap(),
+        roles
+    );
     assert!(packet_role_segments(&program, &roles, &tensors).is_err());
     program.insts[2].i[5] = 1024;
     assert!(packet_role_segments_with(&program, &roles, &tensors, &objects).is_err());
-    assert_eq!(packet_role_segments(&program, &roles, &tensors).unwrap(), roles);
+    assert_eq!(
+        packet_role_segments(&program, &roles, &tensors).unwrap(),
+        roles
+    );
 }
 
 #[test]
@@ -528,8 +539,7 @@ fn accepts_exact_hd256_bkv64_contract_and_rejects_drift() {
         [Some(256), Some(64), Some(64), Some(4)],
     ] {
         assert!(
-            check_attention_hd256_role("sm90a", &object, Some(1), 1, Some(256), geometry)
-                .is_err()
+            check_attention_hd256_role("sm90a", &object, Some(1), 1, Some(256), geometry).is_err()
         );
     }
 }
@@ -552,15 +562,9 @@ fn accepts_exact_hd256_bkv32_contract_and_rejects_drift() {
         [Some(256), Some(64), Some(64), Some(8)],
         [Some(256), Some(64), Some(32), Some(4)],
     ] {
-        assert!(check_attention_hd256_role(
-            "sm90a",
-            &object,
-            Some(1),
-            1,
-            Some(256),
-            geometry,
-        )
-        .is_err());
+        assert!(
+            check_attention_hd256_role("sm90a", &object, Some(1), 1, Some(256), geometry,).is_err()
+        );
     }
 }
 

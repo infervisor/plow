@@ -137,9 +137,8 @@ impl HeadPool {
         //
         // Every prefill program is checked, not just one: a packet can reach
         // the caches through more than one program.
-        let bytes = std::fs::read(twin).map_err(|e| {
-            RuntimeError::Device(format!("CPU twin {}: {e}", twin.display()))
-        })?;
+        let bytes = std::fs::read(twin)
+            .map_err(|e| RuntimeError::Device(format!("CPU twin {}: {e}", twin.display())))?;
         let blob = crate::asset::devblob::DevBlob::parse(&bytes)?;
         let names: Vec<String> = blob.tensors.iter().map(|t| t.name.clone()).collect();
         let mut pools = Vec::new();
@@ -271,7 +270,8 @@ impl HeadPool {
                 });
             }
             let ch = next_chunk(&self.buckets, rows, done, u32::MAX);
-            self.eng.prefill_slot_chunk(slot, &prompt[..rows as usize], ch)?;
+            self.eng
+                .prefill_slot_chunk(slot, &prompt[..rows as usize], ch)?;
             done += ch.clen;
         }
         Ok(Head {
@@ -317,10 +317,7 @@ fn restrict(topo: &Topology, cores: &[u32]) -> Topology {
     let mut nodes: Vec<u32> = keep.iter().map(|c| c.node).collect();
     nodes.sort_unstable();
     nodes.dedup();
-    Topology {
-        cores: keep,
-        nodes,
-    }
+    Topology { cores: keep, nodes }
 }
 
 #[cfg(test)]

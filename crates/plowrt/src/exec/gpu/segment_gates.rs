@@ -43,7 +43,8 @@ pub(super) fn segment_local(g: &DevProg, waits: &[Wait]) -> Option<SegmentGates>
             return None;
         }
     }
-    let list = |e: &StreamEnt| waits.get(e.wait_ofs as usize..e.wait_ofs as usize + e.wait_len as usize);
+    let list =
+        |e: &StreamEnt| waits.get(e.wait_ofs as usize..e.wait_ofs as usize + e.wait_len as usize);
     let kept = |e: &StreamEnt, w: &Wait| {
         w.threshold != 0 && placement.get(w.id as usize).copied().flatten() == Some(e.seg)
     };
@@ -68,11 +69,13 @@ pub(super) fn segment_local(g: &DevProg, waits: &[Wait]) -> Option<SegmentGates>
         for e in src {
             let mut r = *e;
             let old = list(e)?;
-            let (ofs, len) = *lists.entry((e.wait_ofs, e.wait_len, e.seg)).or_insert_with(|| {
-                let ofs = out.waits.len() as u32;
-                out.waits.extend(old.iter().filter(|w| kept(e, w)).copied());
-                (ofs, out.waits.len() as u32 - ofs)
-            });
+            let (ofs, len) = *lists
+                .entry((e.wait_ofs, e.wait_len, e.seg))
+                .or_insert_with(|| {
+                    let ofs = out.waits.len() as u32;
+                    out.waits.extend(old.iter().filter(|w| kept(e, w)).copied());
+                    (ofs, out.waits.len() as u32 - ofs)
+                });
             out.dropped_waits += e.wait_len as usize - len as usize;
             r.wait_ofs = ofs;
             r.wait_len = len as u16;

@@ -31,13 +31,21 @@ fn main() {
     while let Some(a) = args.next() {
         match a.as_str() {
             "--lens" => {
-                lens = args.next().unwrap().split(',').map(|x| x.parse().unwrap()).collect()
+                lens = args
+                    .next()
+                    .unwrap()
+                    .split(',')
+                    .map(|x| x.parse().unwrap())
+                    .collect()
             }
             "--steps" => steps = args.next().unwrap().parse().unwrap(),
             // `--gate <prompts.json> <id,id,..>`: the FP32-gate cases' token ids instead of `--lens`.
             "--gate" => {
                 let f = args.next().unwrap().into();
-                gate = Some((f, args.next().unwrap().split(',').map(String::from).collect()))
+                gate = Some((
+                    f,
+                    args.next().unwrap().split(',').map(String::from).collect(),
+                ))
             }
             other => panic!("unknown arg {other}"),
         }
@@ -52,29 +60,39 @@ fn main() {
         let cases = j["cases"].as_array().unwrap();
         ids.iter()
             .map(|id| {
-                let c = cases.iter().find(|c| c["id"] == id.as_str()).expect("gate case id");
-                c["prompt_ids"].as_array().unwrap().iter().map(|v| v.as_u64().unwrap() as u32).collect()
+                let c = cases
+                    .iter()
+                    .find(|c| c["id"] == id.as_str())
+                    .expect("gate case id");
+                c["prompt_ids"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|v| v.as_u64().unwrap() as u32)
+                    .collect()
             })
             .collect()
     } else {
-        lens
-        .iter()
-        .enumerate()
-        .map(|(i, &n)| {
-            let mut ids = vec![2u32];
-            let mut k = i * 13;
-            while ids.len() < n {
-                ids.push(base[k % base.len()]);
-                k += 1 + i;
-            }
-            ids
-        })
-        .collect()
+        lens.iter()
+            .enumerate()
+            .map(|(i, &n)| {
+                let mut ids = vec![2u32];
+                let mut k = i * 13;
+                while ids.len() < n {
+                    ids.push(base[k % base.len()]);
+                    k += 1 + i;
+                }
+                ids
+            })
+            .collect()
     };
     lens = prompts.iter().map(Vec::len).collect();
 
     let mut eng = CpuEngine::load(&blob, &ckpt, &CpuEngineOpts::default()).expect("load");
-    assert!(eng.pack_rows().is_some(), "this packet has no packed prefill route (see the load log)");
+    assert!(
+        eng.pack_rows().is_some(),
+        "this packet has no packed prefill route (see the load log)"
+    );
     let batch = eng.model().batch;
     let n = prompts.len();
     assert!(n <= batch, "{n} prompts but {batch} slots");
@@ -95,7 +113,9 @@ fn main() {
         let mut out = vec![Vec::new(); n];
         for _ in 0..steps {
             let kv: Vec<u32> = pos.iter().map(|p| p + 1).collect();
-            let next = eng.decode_step_batched_at(&pos, &kv, &ids, dp).expect("decode");
+            let next = eng
+                .decode_step_batched_at(&pos, &kv, &ids, dp)
+                .expect("decode");
             for i in 0..n {
                 out[i].push(next[i]);
                 ids[i] = next[i];
@@ -104,7 +124,12 @@ fn main() {
         }
         out
     };
-    let diff = |a: &[f32], b: &[f32]| a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
+    let diff = |a: &[f32], b: &[f32]| {
+        a.iter()
+            .zip(b)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max)
+    };
     let kl = |a: &[f32], b: &[f32]| {
         let lse = |v: &[f32]| {
             let m = v.iter().copied().fold(f32::NEG_INFINITY, f32::max) as f64;
@@ -136,7 +161,9 @@ fn main() {
     let mut groups: Vec<Vec<usize>> = Vec::new();
     for (i, p) in prompts.iter().enumerate() {
         match groups.last_mut() {
-            Some(g) if g.iter().map(|&j| prompts[j].len()).sum::<usize>() + p.len() <= cap => g.push(i),
+            Some(g) if g.iter().map(|&j| prompts[j].len()).sum::<usize>() + p.len() <= cap => {
+                g.push(i)
+            }
             _ => groups.push(vec![i]),
         }
     }
@@ -144,9 +171,20 @@ fn main() {
     let mut lg_b = vec![Vec::new(); n];
     let t = Instant::now();
     for g in &groups {
-        let m: Vec<PackMember> =
-            g.iter().map(|&i| PackMember { slot: i, c0: 0, rows: &prompts[i], sample: true }).collect();
-        for (j, (&i, tok)) in g.iter().zip(eng.prefill_packed(&m).expect("packed prefill")).enumerate() {
+        let m: Vec<PackMember> = g
+            .iter()
+            .map(|&i| PackMember {
+                slot: i,
+                c0: 0,
+                rows: &prompts[i],
+                sample: true,
+            })
+            .collect();
+        for (j, (&i, tok)) in g
+            .iter()
+            .zip(eng.prefill_packed(&m).expect("packed prefill"))
+            .enumerate()
+        {
             tok_b[i] = tok;
             lg_b[i] = logits(&eng, j);
         }
@@ -166,29 +204,72 @@ fn main() {
     };
     let (p0, cut) = (&prompts[0], prompts[0].len() / 2);
     for (c0, clen) in [(0, cut), (cut, p0.len() - cut)] {
-        let ch = Chunk { prog: solo(&eng, clen), c0: c0 as u32, clen: clen as u32 };
+        let ch = Chunk {
+            prog: solo(&eng, clen),
+            c0: c0 as u32,
+            clen: clen as u32,
+        };
         eng.prefill_slot_chunk(0, p0, ch).expect("solo chunk");
     }
     let (tok_c0, lg_c0) = (eng.last_token().unwrap(), logits(&eng, 0));
-    fn fill<'a>(head: PackMember<'a>, parity: usize, prompts: &'a [Vec<u32>], cap: usize) -> Vec<PackMember<'a>> {
+    fn fill<'a>(
+        head: PackMember<'a>,
+        parity: usize,
+        prompts: &'a [Vec<u32>],
+        cap: usize,
+    ) -> Vec<PackMember<'a>> {
         let mut v = vec![head];
         let mut rows = head.rows.len();
-        for (i, p) in prompts.iter().enumerate().skip(1).filter(|(i, _)| i % 2 == parity) {
+        for (i, p) in prompts
+            .iter()
+            .enumerate()
+            .skip(1)
+            .filter(|(i, _)| i % 2 == parity)
+        {
             if rows + p.len() <= cap {
                 rows += p.len();
-                v.push(PackMember { slot: i, c0: 0, rows: p.as_slice(), sample: true });
+                v.push(PackMember {
+                    slot: i,
+                    c0: 0,
+                    rows: p.as_slice(),
+                    sample: true,
+                });
             }
         }
         v
     }
-    let first = fill(PackMember { slot: 0, c0: 0, rows: &p0[..cut], sample: false }, 1, &prompts, cap);
-    let second = fill(PackMember { slot: 0, c0: cut as u32, rows: &p0[cut..], sample: true }, 0, &prompts, cap);
+    let first = fill(
+        PackMember {
+            slot: 0,
+            c0: 0,
+            rows: &p0[..cut],
+            sample: false,
+        },
+        1,
+        &prompts,
+        cap,
+    );
+    let second = fill(
+        PackMember {
+            slot: 0,
+            c0: cut as u32,
+            rows: &p0[cut..],
+            sample: true,
+        },
+        0,
+        &prompts,
+        cap,
+    );
     let mut c_ok = true;
     for pack in [&first, &second] {
         let toks = eng.prefill_packed(pack).expect("pack C");
         for (j, (m, tok)) in pack.iter().filter(|m| m.sample).zip(toks).enumerate() {
             let lg = logits(&eng, j);
-            let (rt, rl) = if m.slot == 0 { (tok_c0, &lg_c0) } else { (tok_a[m.slot], &lg_a[m.slot]) };
+            let (rt, rl) = if m.slot == 0 {
+                (tok_c0, &lg_c0)
+            } else {
+                (tok_a[m.slot], &lg_a[m.slot])
+            };
             c_ok &= tok == rt && diff(&lg, rl) == 0.0;
         }
     }
@@ -199,10 +280,19 @@ fn main() {
     let mut tok_d = Vec::new();
     let mut lg_w = Vec::new();
     for (i, p) in prompts.iter().enumerate() {
-        let m = [PackMember { slot: i, c0: 0, rows: p, sample: true }];
+        let m = [PackMember {
+            slot: i,
+            c0: 0,
+            rows: p,
+            sample: true,
+        }];
         tok_d.push(eng.prefill_packed(&m).expect("single pack")[0]);
         lg_d.push(logits(&eng, 0));
-        let ch = Chunk { prog: wide, c0: 0, clen: p.len() as u32 };
+        let ch = Chunk {
+            prog: wide,
+            c0: 0,
+            clen: p.len() as u32,
+        };
         eng.prefill_slot_chunk(i, p, ch).expect("wide prefill");
         lg_w.push(logits(&eng, 0));
     }
@@ -217,7 +307,10 @@ fn main() {
     let mut ok = c_ok && chunked_exact;
     for i in 0..n {
         let exact = tok_b[i] == tok_a[i] && diff(&lg_b[i], &lg_a[i]) == 0.0 && dec_b[i] == dec_a[i];
-        ok &= exact && tok_d[i] == tok_a[i] && diff(&lg_d[i], &lg_a[i]) == 0.0 && diff(&lg_w[i], &lg_a[i]) == 0.0;
+        ok &= exact
+            && tok_d[i] == tok_a[i]
+            && diff(&lg_d[i], &lg_a[i]) == 0.0
+            && diff(&lg_w[i], &lg_a[i]) == 0.0;
         println!(
             "prompt {i} len {:>5}: first A/B {}/{}  B vs A max|dlogit| {:.4} decode {}  D vs A {:.4}  W vs A {:.4} KL {:.2e}",
             prompts[i].len(),
@@ -230,9 +323,22 @@ fn main() {
             kl(&lg_a[i], &lg_w[i]),
         );
     }
-    println!("split-chunk packs (C): {}", if c_ok { "exact" } else { "DIFFER" });
-    println!("prompt 0 in two chunks vs whole: {}", if chunked_exact { "exact" } else { "DIFFER" });
-    println!("{}", if ok { "PACK_CHECK OK" } else { "PACK_CHECK MISMATCH" });
+    println!(
+        "split-chunk packs (C): {}",
+        if c_ok { "exact" } else { "DIFFER" }
+    );
+    println!(
+        "prompt 0 in two chunks vs whole: {}",
+        if chunked_exact { "exact" } else { "DIFFER" }
+    );
+    println!(
+        "{}",
+        if ok {
+            "PACK_CHECK OK"
+        } else {
+            "PACK_CHECK MISMATCH"
+        }
+    );
     std::process::exit(if ok { 0 } else { 1 });
 }
 

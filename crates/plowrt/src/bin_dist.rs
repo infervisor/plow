@@ -312,12 +312,16 @@ pub fn cmd_pack(
     let bundle_bytes = std::fs::read(bundle_path)?;
     let bundle: Bundle = serde_json::from_slice(&bundle_bytes)
         .map_err(|e| format!("{}: {e}", bundle_path.display()))?;
-    bundle.validate().map_err(|e| format!("{}: {e}", bundle_path.display()))?;
+    bundle
+        .validate()
+        .map_err(|e| format!("{}: {e}", bundle_path.display()))?;
 
     let objset_bytes = std::fs::read(objset_path)?;
     let objset: ObjSet = serde_json::from_slice(&objset_bytes)
         .map_err(|e| format!("{}: {e}", objset_path.display()))?;
-    objset.validate().map_err(|e| format!("{}: {e}", objset_path.display()))?;
+    objset
+        .validate()
+        .map_err(|e| format!("{}: {e}", objset_path.display()))?;
     objset
         .pairs_with(bundle.pairing_hash.as_deref())
         .map_err(|e| format!("{}: {e}", objset_path.display()))?;

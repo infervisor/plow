@@ -131,10 +131,16 @@ fn device_copy_batch_drains_submitted_copies_on_rejection() {
     let zeros = vec![0; pattern.len()];
     for rejected in 0..=3 {
         be.memcpy_htod(destination.base, &zeros).unwrap();
-        let mut pairs: Vec<_> = (0..3).map(|i| {
-            let offset = (i * CHUNK) as u64;
-            (destination.base + offset, source.base + offset, CHUNK as u64)
-        }).collect();
+        let mut pairs: Vec<_> = (0..3)
+            .map(|i| {
+                let offset = (i * CHUNK) as u64;
+                (
+                    destination.base + offset,
+                    source.base + offset,
+                    CHUNK as u64,
+                )
+            })
+            .collect();
         if rejected < 3 {
             // ROCr specifies synchronous INVALID_ARGUMENT for a null destination.
             pairs[rejected].0 = 0;

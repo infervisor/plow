@@ -101,19 +101,43 @@ pub enum PlacementError {
     NoDevices,
     /// A model's TP degree does not divide the visible device count, so no
     /// contiguous run of that width exists.
-    NoRunOfWidth { slug: String, tp: u32, visible: usize },
+    NoRunOfWidth {
+        slug: String,
+        tp: u32,
+        visible: usize,
+    },
     /// An explicit `--device` named an ordinal with no group starting there.
-    UnknownDevice { slug: String, device: u32 },
+    UnknownDevice {
+        slug: String,
+        device: u32,
+    },
     /// `--place explicit` and a model did not name a device.
-    MissingDevice { slug: String },
+    MissingDevice {
+        slug: String,
+    },
     /// A TP model was pinned to a group of the wrong width.
-    DegreeMismatch { slug: String, tp: u32, degree: u32 },
+    DegreeMismatch {
+        slug: String,
+        tp: u32,
+        degree: u32,
+    },
     /// Nothing on the node has room for this model, even empty.
-    WontFitAnywhere { slug: String, required: u64, capacity: u64 },
+    WontFitAnywhere {
+        slug: String,
+        required: u64,
+        capacity: u64,
+    },
     /// More DP ranks than device groups: two would share a GPU.
-    TooManyRanks { model: String, dp: usize, groups: usize },
+    TooManyRanks {
+        model: String,
+        dp: usize,
+        groups: usize,
+    },
     /// Two DP ranks of one model pinned to the same group.
-    RanksShareDevice { model: String, device: u32 },
+    RanksShareDevice {
+        model: String,
+        device: u32,
+    },
 }
 
 impl fmt::Display for PlacementError {
@@ -198,7 +222,11 @@ pub fn assign(
         }
         let dp = models.iter().filter(|o| o.model == m.model).count();
         if dp > groups.len() {
-            return Err(PlacementError::TooManyRanks { model: m.model.clone(), dp, groups: groups.len() });
+            return Err(PlacementError::TooManyRanks {
+                model: m.model.clone(),
+                dp,
+                groups: groups.len(),
+            });
         }
     }
     let mut assignment = vec![usize::MAX; models.len()];
@@ -207,7 +235,10 @@ pub fn assign(
     let mut used = vec![0u64; groups.len()];
     // A group already holding a rank of this model is not a candidate for another.
     let taken = |assignment: &[usize], model: &str, g: usize| {
-        models.iter().zip(assignment).any(|(o, &a)| a == g && o.model == model)
+        models
+            .iter()
+            .zip(assignment)
+            .any(|(o, &a)| a == g && o.model == model)
     };
 
     // Pass 1: explicit pins.
@@ -228,7 +259,10 @@ pub fn assign(
             });
         }
         if taken(&assignment, &m.model, g) {
-            return Err(PlacementError::RanksShareDevice { model: m.model.clone(), device: dev });
+            return Err(PlacementError::RanksShareDevice {
+                model: m.model.clone(),
+                device: dev,
+            });
         }
         assignment[i] = g;
         used[g] += m.required;
@@ -370,7 +404,9 @@ pub fn parse_dp(entries: &[String]) -> Result<DpSpec, String> {
         "all" => Ok(Dp::All),
         n => match n.parse::<usize>() {
             Ok(n) if n >= 1 => Ok(Dp::N(n)),
-            _ => Err(format!("--dp {entry:?}: {v:?} is not a rank count or \"all\"")),
+            _ => Err(format!(
+                "--dp {entry:?}: {v:?} is not a rank count or \"all\""
+            )),
         },
     };
     let mut spec = DpSpec::default();
@@ -457,7 +493,11 @@ mod tests {
 
     #[test]
     fn spread_puts_each_model_on_its_own_device() {
-        let models = vec![spec("a", 20 * GIB), spec("b", 20 * GIB), spec("c", 20 * GIB)];
+        let models = vec![
+            spec("a", 20 * GIB),
+            spec("b", 20 * GIB),
+            spec("c", 20 * GIB),
+        ];
         let l = assign(&models, &groups(4, 80 * GIB), Place::Spread).unwrap();
         assert_eq!(l.assignment, vec![0, 1, 2]);
     }
@@ -481,7 +521,11 @@ mod tests {
 
     #[test]
     fn pack_fills_a_device_before_moving_on() {
-        let models = vec![spec("a", 30 * GIB), spec("b", 30 * GIB), spec("c", 30 * GIB)];
+        let models = vec![
+            spec("a", 30 * GIB),
+            spec("b", 30 * GIB),
+            spec("c", 30 * GIB),
+        ];
         let l = assign(&models, &groups(2, 80 * GIB), Place::Pack).unwrap();
         // a+b = 60 ≤ 80 so both land on 0; c would make 90, so it moves to 1.
         assert_eq!(l.assignment, vec![0, 0, 1]);
@@ -492,7 +536,10 @@ mod tests {
     fn spread_and_pack_disagree_on_the_same_input() {
         let models = vec![spec("a", 10 * GIB), spec("b", 10 * GIB)];
         let g = groups(2, 80 * GIB);
-        assert_eq!(assign(&models, &g, Place::Spread).unwrap().assignment, [0, 1]);
+        assert_eq!(
+            assign(&models, &g, Place::Spread).unwrap().assignment,
+            [0, 1]
+        );
         assert_eq!(assign(&models, &g, Place::Pack).unwrap().assignment, [0, 0]);
     }
 
@@ -556,7 +603,11 @@ mod tests {
     /// switches models within a group, so "does not all fit at once" is normal.
     #[test]
     fn pack_still_places_everything_when_nothing_has_room_to_spare() {
-        let models = vec![spec("a", 70 * GIB), spec("b", 70 * GIB), spec("c", 70 * GIB)];
+        let models = vec![
+            spec("a", 70 * GIB),
+            spec("b", 70 * GIB),
+            spec("c", 70 * GIB),
+        ];
         let l = assign(&models, &groups(2, 80 * GIB), Place::Pack).unwrap();
         assert!(l.assignment.iter().all(|&g| g < 2));
     }
@@ -673,13 +724,21 @@ mod tests {
 
     fn ranks(model: &str, n: usize, required: u64) -> Vec<ModelSpec> {
         (0..n)
-            .map(|r| ModelSpec { slug: format!("{model}#{r}"), ..spec(model, required) })
+            .map(|r| ModelSpec {
+                slug: format!("{model}#{r}"),
+                ..spec(model, required)
+            })
             .collect()
     }
 
     #[test]
     fn dp_ranks_take_one_group_each() {
-        let l = assign(&ranks("g", 8, 10 * GIB), &groups(8, 48 * GIB), Place::Spread).unwrap();
+        let l = assign(
+            &ranks("g", 8, 10 * GIB),
+            &groups(8, 48 * GIB),
+            Place::Spread,
+        )
+        .unwrap();
         let mut got = l.assignment.clone();
         got.sort_unstable();
         assert_eq!(got, (0..8).collect::<Vec<_>>());
@@ -694,7 +753,11 @@ mod tests {
     fn more_ranks_than_groups_is_refused() {
         assert_eq!(
             assign(&ranks("g", 9, GIB), &groups(8, 48 * GIB), Place::Spread).unwrap_err(),
-            PlacementError::TooManyRanks { model: "g".into(), dp: 9, groups: 8 }
+            PlacementError::TooManyRanks {
+                model: "g".into(),
+                dp: 9,
+                groups: 8
+            }
         );
     }
 
@@ -709,7 +772,10 @@ mod tests {
         m[1].device = Some(5);
         assert_eq!(
             assign(&m, &groups(8, 48 * GIB), Place::Spread).unwrap_err(),
-            PlacementError::RanksShareDevice { model: "g".into(), device: 5 }
+            PlacementError::RanksShareDevice {
+                model: "g".into(),
+                device: 5
+            }
         );
     }
 
@@ -739,7 +805,14 @@ mod tests {
         assert_eq!((d.ranks("gemma", 3), d.ranks("other", 3)), (3, 1));
         assert_eq!(d.named().collect::<Vec<_>>(), vec!["gemma"]);
         assert_eq!(s(&[]).unwrap().ranks("x", 8), 1);
-        for bad in [&["0"][..], &["x"], &["2", "3"], &["=2"], &["a=2", "a=3"], &["a=0"]] {
+        for bad in [
+            &["0"][..],
+            &["x"],
+            &["2", "3"],
+            &["=2"],
+            &["a=2", "a=3"],
+            &["a=0"],
+        ] {
             assert!(s(bad).is_err(), "{bad:?}");
         }
     }

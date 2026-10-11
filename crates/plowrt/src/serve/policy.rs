@@ -32,7 +32,9 @@ impl std::str::FromStr for Objective {
             "latency" => Ok(Objective::Latency),
             "throughput" => Ok(Objective::Throughput),
             "auto" => Ok(Objective::Auto),
-            other => Err(format!("unknown objective `{other}` (latency | throughput | auto)")),
+            other => Err(format!(
+                "unknown objective `{other}` (latency | throughput | auto)"
+            )),
         }
     }
 }
@@ -109,11 +111,19 @@ pub struct Load {
 /// The whole decision, as a pure function of the state and one tick's signals at `now` ms: the
 /// class in force afterwards and the calm start that goes with it.
 fn decide(current: Class, calm_since: u64, now: u64, load: Load) -> (Class, u64) {
-    let Load { width, queued, kv_used } = load;
+    let Load {
+        width,
+        queued,
+        kv_used,
+    } = load;
     if width >= WIDE_ENTER || queued > 0 || kv_used >= KV_ENTER {
         (Class::HighConcurrency, NOT_CALM)
     } else if width <= WIDE_LEAVE && kv_used < KV_LEAVE && current == Class::HighConcurrency {
-        let since = if calm_since == NOT_CALM { now } else { calm_since };
+        let since = if calm_since == NOT_CALM {
+            now
+        } else {
+            calm_since
+        };
         if now.saturating_sub(since) >= CALM_MS {
             (Class::Realtime, NOT_CALM)
         } else {
@@ -196,11 +206,20 @@ pub struct PrefillLoad {
 }
 
 fn decide_prefill(wide: bool, calm_since: u64, now: u64, load: PrefillLoad) -> (bool, u64) {
-    let PrefillLoad { overflow_rows, queued, top_rows, kv_used } = load;
+    let PrefillLoad {
+        overflow_rows,
+        queued,
+        top_rows,
+        kv_used,
+    } = load;
     if overflow_rows >= top_rows || kv_used >= KV_ENTER {
         (true, NOT_CALM)
     } else if wide && queued == 0 && kv_used < KV_LEAVE {
-        let since = if calm_since == NOT_CALM { now } else { calm_since };
+        let since = if calm_since == NOT_CALM {
+            now
+        } else {
+            calm_since
+        };
         if now.saturating_sub(since) >= CALM_MS {
             (false, NOT_CALM)
         } else {
@@ -279,7 +298,10 @@ fn decode_k_for(class: Class, amd: bool, token_group: usize) -> u32 {
 
 /// The quantum an engine is built for: the widest any class may ask for.
 pub fn decode_k_capacity() -> u32 {
-    crate::config::RuntimeConfig::get().nv.multistep.unwrap_or_else(throughput_k)
+    crate::config::RuntimeConfig::get()
+        .nv
+        .multistep
+        .unwrap_or_else(throughput_k)
 }
 
 /// Queue-sized prefill packing: the oldest prompt runs whole and later ones join only while that
@@ -340,12 +362,20 @@ mod tests {
     use super::*;
 
     fn load(width: usize, queued: usize, kv_used: f64) -> Load {
-        Load { width, queued, kv_used }
+        Load {
+            width,
+            queued,
+            kv_used,
+        }
     }
 
     #[test]
     fn load_enters_throughput_at_once() {
-        for l in [load(WIDE_ENTER, 0, 0.0), load(1, 3, 0.0), load(2, 0, KV_ENTER)] {
+        for l in [
+            load(WIDE_ENTER, 0, 0.0),
+            load(1, 3, 0.0),
+            load(2, 0, KV_ENTER),
+        ] {
             let (c, calm) = decide(Class::Realtime, NOT_CALM, 10, l);
             assert_eq!((c, calm), (Class::HighConcurrency, NOT_CALM), "{l:?}");
         }
@@ -354,25 +384,56 @@ mod tests {
     #[test]
     fn kv_pressure_holds_throughput_until_it_drains_below_the_band() {
         let (c, _) = decide(Class::HighConcurrency, 0, 10 * CALM_MS, load(2, 0, 0.8));
-        assert_eq!(c, Class::HighConcurrency, "0.8 is inside [{KV_LEAVE}, {KV_ENTER})");
+        assert_eq!(
+            c,
+            Class::HighConcurrency,
+            "0.8 is inside [{KV_LEAVE}, {KV_ENTER})"
+        );
         let (c, calm) = decide(Class::HighConcurrency, NOT_CALM, 1_000, load(2, 0, 0.5));
-        assert_eq!((c, calm), (Class::HighConcurrency, 1_000), "calm starts below the band");
-        let (c, _) = decide(Class::HighConcurrency, calm, 1_000 + CALM_MS, load(2, 0, 0.5));
+        assert_eq!(
+            (c, calm),
+            (Class::HighConcurrency, 1_000),
+            "calm starts below the band"
+        );
+        let (c, _) = decide(
+            Class::HighConcurrency,
+            calm,
+            1_000 + CALM_MS,
+            load(2, 0, 0.5),
+        );
         assert_eq!(c, Class::Realtime);
         let (c, _) = decide(Class::Realtime, NOT_CALM, 10, load(2, 0, 0.8));
-        assert_eq!(c, Class::Realtime, "the band does not enter throughput either");
+        assert_eq!(
+            c,
+            Class::Realtime,
+            "the band does not enter throughput either"
+        );
     }
 
     #[test]
     fn throughput_leaves_only_after_the_window_stays_narrow() {
         let (c, calm) = decide(Class::HighConcurrency, NOT_CALM, 1_000, load(2, 0, 0.0));
         assert_eq!((c, calm), (Class::HighConcurrency, 1_000), "calm starts");
-        let (c, _) = decide(Class::HighConcurrency, calm, 1_000 + CALM_MS - 1, load(2, 0, 0.0));
+        let (c, _) = decide(
+            Class::HighConcurrency,
+            calm,
+            1_000 + CALM_MS - 1,
+            load(2, 0, 0.0),
+        );
         assert_eq!(c, Class::HighConcurrency, "not calm for long enough");
-        let (c, _) = decide(Class::HighConcurrency, calm, 1_000 + CALM_MS, load(2, 0, 0.0));
+        let (c, _) = decide(
+            Class::HighConcurrency,
+            calm,
+            1_000 + CALM_MS,
+            load(2, 0, 0.0),
+        );
         assert_eq!(c, Class::Realtime);
         let (c, calm) = decide(Class::HighConcurrency, calm, 1_500, load(16, 0, 0.0));
-        assert_eq!((c, calm), (Class::HighConcurrency, NOT_CALM), "a wide tick resets calm");
+        assert_eq!(
+            (c, calm),
+            (Class::HighConcurrency, NOT_CALM),
+            "a wide tick resets calm"
+        );
     }
 
     #[test]
@@ -384,35 +445,76 @@ mod tests {
     }
 
     fn pf(overflow_rows: usize, queued: usize, kv_used: f64) -> PrefillLoad {
-        PrefillLoad { overflow_rows, queued, top_rows: 8192, kv_used }
+        PrefillLoad {
+            overflow_rows,
+            queued,
+            top_rows: 8192,
+            kv_used,
+        }
     }
 
     #[test]
     fn overflow_of_one_widest_launch_or_kv_pressure_widens_prefill_at_once() {
         for l in [pf(8192, 8, 0.0), pf(0, 0, KV_ENTER)] {
-            assert_eq!(decide_prefill(false, NOT_CALM, 10, l), (true, NOT_CALM), "{l:?}");
+            assert_eq!(
+                decide_prefill(false, NOT_CALM, 10, l),
+                (true, NOT_CALM),
+                "{l:?}"
+            );
         }
-        assert_eq!(decide_prefill(false, NOT_CALM, 10, pf(8191, 8, 0.0)), (false, NOT_CALM));
-        assert_eq!(decide_prefill(false, NOT_CALM, 10, pf(0, 64, 0.0)).0, false, "a rung hold is not overflow");
+        assert_eq!(
+            decide_prefill(false, NOT_CALM, 10, pf(8191, 8, 0.0)),
+            (false, NOT_CALM)
+        );
+        assert_eq!(
+            decide_prefill(false, NOT_CALM, 10, pf(0, 64, 0.0)).0,
+            false,
+            "a rung hold is not overflow"
+        );
     }
 
     #[test]
     fn wide_prefill_narrows_only_after_no_request_waits() {
-        assert_eq!(decide_prefill(true, NOT_CALM, 10 * CALM_MS, pf(0, 1, 0.0)).0, true, "a queue below overflow");
-        assert_eq!(decide_prefill(true, NOT_CALM, 10 * CALM_MS, pf(0, 0, 0.8)).0, true, "KV band");
+        assert_eq!(
+            decide_prefill(true, NOT_CALM, 10 * CALM_MS, pf(0, 1, 0.0)).0,
+            true,
+            "a queue below overflow"
+        );
+        assert_eq!(
+            decide_prefill(true, NOT_CALM, 10 * CALM_MS, pf(0, 0, 0.8)).0,
+            true,
+            "KV band"
+        );
         let (w, calm) = decide_prefill(true, NOT_CALM, 1_000, pf(0, 0, 0.0));
         assert_eq!((w, calm), (true, 1_000), "calm starts");
-        assert_eq!(decide_prefill(true, calm, 1_000 + CALM_MS - 1, pf(0, 0, 0.0)).0, true);
-        assert_eq!(decide_prefill(true, calm, 1_000 + CALM_MS, pf(0, 0, 0.0)), (false, NOT_CALM));
-        assert_eq!(decide_prefill(true, calm, 1_200, pf(0, 1, 0.0)), (true, NOT_CALM), "a waiter resets calm");
-        assert_eq!(decide_prefill(false, NOT_CALM, 10, pf(4_000, 4, 0.8)).0, false, "the bands do not widen");
+        assert_eq!(
+            decide_prefill(true, calm, 1_000 + CALM_MS - 1, pf(0, 0, 0.0)).0,
+            true
+        );
+        assert_eq!(
+            decide_prefill(true, calm, 1_000 + CALM_MS, pf(0, 0, 0.0)),
+            (false, NOT_CALM)
+        );
+        assert_eq!(
+            decide_prefill(true, calm, 1_200, pf(0, 1, 0.0)),
+            (true, NOT_CALM),
+            "a waiter resets calm"
+        );
+        assert_eq!(
+            decide_prefill(false, NOT_CALM, 10, pf(4_000, 4, 0.8)).0,
+            false,
+            "the bands do not widen"
+        );
     }
 
     #[test]
     fn pinned_objectives_ignore_the_observed_class() {
         for observed in [0, 1] {
             assert_eq!(class_for(Objective::Latency, observed), Class::Realtime);
-            assert_eq!(class_for(Objective::Throughput, observed), Class::HighConcurrency);
+            assert_eq!(
+                class_for(Objective::Throughput, observed),
+                Class::HighConcurrency
+            );
         }
         assert_eq!(class_for(Objective::Auto, 0), Class::Realtime);
         assert_eq!(class_for(Objective::Auto, 1), Class::HighConcurrency);
@@ -421,7 +523,11 @@ mod tests {
     #[test]
     fn decode_quantum_per_class_and_backend() {
         assert_eq!(decode_k_for(Class::Realtime, false, 1), 1);
-        assert_eq!(decode_k_for(Class::Realtime, false, 7), 7, "one Veena frame");
+        assert_eq!(
+            decode_k_for(Class::Realtime, false, 7),
+            7,
+            "one Veena frame"
+        );
         assert_eq!(decode_k_for(Class::Realtime, true, 1), AMD_LATENCY_K);
         assert_eq!(decode_k_for(Class::HighConcurrency, false, 7), THROUGHPUT_K);
         assert_eq!(decode_k_for(Class::HighConcurrency, true, 1), THROUGHPUT_K);

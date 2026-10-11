@@ -184,27 +184,46 @@ pub(super) fn load_gemv_wide(
         return Ok(None);
     };
     if cubin::global_u32(&image, "plow_fp8_kv_abi") != kv_abi {
-        return Err(reject(&format!("{file}: FP8 KV capability differs from the decode object")));
+        return Err(reject(&format!(
+            "{file}: FP8 KV capability differs from the decode object"
+        )));
     }
     let module = DecodeModule::load(be, &image)?;
-    let function = be.get_function(&module, &format!("_Z{}{stem}_gw11PlowProgram", stem.len() + 3))?;
+    let function = be.get_function(
+        &module,
+        &format!("_Z{}{stem}_gw11PlowProgram", stem.len() + 3),
+    )?;
     GpuEngine::check_packet_pairing_suffix(be, &module, assets, "_gw")?;
     for symbol in ["plow_block", "plow_dyn_kvrow", "plow_gemv_mm_cap"] {
-        if be.module_global_u32(&module, &format!("{symbol}_gw"))? != be.module_global_u32(main, symbol)? {
-            return Err(reject(&format!("{file}: {symbol} differs from the decode object")));
+        if be.module_global_u32(&module, &format!("{symbol}_gw"))?
+            != be.module_global_u32(main, symbol)?
+        {
+            return Err(reject(&format!(
+                "{file}: {symbol} differs from the decode object"
+            )));
         }
     }
-    let smem = be.module_global_u32(&module, "plow_arena_bytes_gw")?.unwrap_or(12352);
+    let smem = be
+        .module_global_u32(&module, "plow_arena_bytes_gw")?
+        .unwrap_or(12352);
     let narrow = be
         .module_global_u32(&module, "plow_arena_bytes_narrow_gw")?
         .map_or(smem, |narrow| narrow.min(smem));
     be.set_max_dynamic_smem(function, smem)?;
     if be.occupancy_blocks_per_sm(function, BLOCK, smem as usize)? * be.sm_count() < grid {
-        return Err(reject(&format!("{file}: cannot hold the decode grid {grid}")));
+        return Err(reject(&format!(
+            "{file}: cannot hold the decode grid {grid}"
+        )));
     }
     tracing::info!(file, smem, narrow, "batched-rung decode object loaded");
     let object = |smem| {
-        Arc::new(BoundDecodeObject { function, grid, block: BLOCK, smem, _module: Arc::clone(&module) })
+        Arc::new(BoundDecodeObject {
+            function,
+            grid,
+            block: BLOCK,
+            smem,
+            _module: Arc::clone(&module),
+        })
     };
     Ok(Some((object(narrow), object(smem))))
 }
@@ -338,9 +357,7 @@ pub(super) fn bind(
             .programs
             .iter()
             .filter(|p| p.object == id)
-            .any(|p| {
-                super::dsa_decode_batch_required(std::slice::from_ref(&blob.progs[p.index]))
-            });
+            .any(|p| super::dsa_decode_batch_required(std::slice::from_ref(&blob.progs[p.index])));
         super::check_dsa_decode_batch_arm(
             requires_dsa_batch,
             be.module_global_u32(&module, "plow_dsa_decode_batch_arm")?,

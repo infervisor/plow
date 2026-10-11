@@ -121,10 +121,7 @@ pub fn causal_pipeline_section(
                 ("hidden".into(), u64::from(spec.hidden)),
                 ("decode_capacity".into(), u64::from(spec.decode_capacity)),
                 ("overlay_rows".into(), u64::from(spec.overlay_rows)),
-                (
-                    "ordered_dispatch".into(),
-                    u64::from(spec.ordered_dispatch),
-                ),
+                ("ordered_dispatch".into(), u64::from(spec.ordered_dispatch)),
                 ("prefill_program_count".into(), prefill_count as u64),
                 (
                     "decode_program_count".into(),
@@ -459,7 +456,11 @@ pub struct Conv1dF32Stage<'a> {
 /// of `n` rows padded to 128, each row 128 bytes whose 16-byte chunk `c` sits at `c ^ (row & 7)`.
 pub fn wgmma_weight_split(weights: &[u8], n: u32, k: u32) -> Vec<u8> {
     let (n, k) = (n as usize, k as usize);
-    let (base, np, tiles) = (weights.len().next_multiple_of(1024), n.next_multiple_of(128), k.div_ceil(64));
+    let (base, np, tiles) = (
+        weights.len().next_multiple_of(1024),
+        n.next_multiple_of(128),
+        k.div_ceil(64),
+    );
     let mut out = weights.to_vec();
     out.resize(base + tiles * 2 * np * 128, 0);
     for (r, row) in weights.chunks_exact(4 * k).enumerate().take(n) {
@@ -467,7 +468,11 @@ pub fn wgmma_weight_split(weights: &[u8], n: u32, k: u32) -> Vec<u8> {
             let v = f32::from_le_bytes([v[0], v[1], v[2], v[3]]);
             let hi = crate::config::bf16_round(v);
             let lo = crate::config::bf16_round(v - hi);
-            let at = base + (j / 64) * 2 * np * 128 + r * 128 + ((j % 64 / 8) ^ (r & 7)) * 16 + j % 8 * 2;
+            let at = base
+                + (j / 64) * 2 * np * 128
+                + r * 128
+                + ((j % 64 / 8) ^ (r & 7)) * 16
+                + j % 8 * 2;
             out[at..at + 2].copy_from_slice(&((hi.to_bits() >> 16) as u16).to_le_bytes());
             let at = at + np * 128;
             out[at..at + 2].copy_from_slice(&((lo.to_bits() >> 16) as u16).to_le_bytes());
@@ -477,7 +482,8 @@ pub fn wgmma_weight_split(weights: &[u8], n: u32, k: u32) -> Vec<u8> {
 }
 
 fn wgmma_weight_split_bytes(f32_bytes: u64, n: u32, k: u32) -> u64 {
-    f32_bytes.next_multiple_of(1024) + u64::from(k.div_ceil(64)) * 2 * u64::from(n.next_multiple_of(128)) * 128
+    f32_bytes.next_multiple_of(1024)
+        + u64::from(k.div_ceil(64)) * 2 * u64::from(n.next_multiple_of(128)) * 128
 }
 
 impl Conv1dF32Stage<'_> {
@@ -493,7 +499,8 @@ impl Conv1dF32Stage<'_> {
             let span = u64::from(self.dilation_or_output_padding)
                 * u64::from(self.kernel.checked_sub(1)?)
                 + 1;
-            (u64::from(self.in_rows) + before + after).checked_sub(span)? / u64::from(self.stride) + 1
+            (u64::from(self.in_rows) + before + after).checked_sub(span)? / u64::from(self.stride)
+                + 1
         };
         u32::try_from(rows).ok().filter(|&rows| rows > 0)
     }
@@ -726,7 +733,8 @@ impl PacketPrefix {
             .unwrap_or(packet::dev::TENSOR_NONE);
         let activation = u32::from(stage.activation == DenseActivation::Relu);
         let ln_round = stage.layer_norm.is_some_and(|ln| ln.round_bf16);
-        let tensor_cores = (stage.input_bf16_exact || ln_round) && stage.weight_type == DenseWeight::Bf16;
+        let tensor_cores =
+            (stage.input_bf16_exact || ln_round) && stage.weight_type == DenseWeight::Bf16;
         let flags = u32::from(stage.round_bf16)
             | (u32::from(stage.activation == DenseActivation::GeluErfBf16) << 1)
             | (u32::from(stage.weight_type == DenseWeight::Bf16) << 2)
@@ -735,17 +743,29 @@ impl PacketPrefix {
             | (u32::from(ln_round) << 6);
         let prologue = match stage.layer_norm {
             Some(ln) => {
-                if ln.stats as usize >= builder.n_tensors() || builder.tensor_bytes(ln.stats) < tensor_bytes(rows, 2, 4)? {
+                if ln.stats as usize >= builder.n_tensors()
+                    || builder.tensor_bytes(ln.stats) < tensor_bytes(rows, 2, 4)?
+                {
                     return Err("dense layer-norm stats tensor is missing or short".into());
                 }
                 let width = u64::from(stage.input_width) * 4;
                 let affine = |b: &mut Builder, t: Option<TensorRef<'_>>| match t {
                     Some(TensorRef::Named(name)) => Ok(b.tensor(name, width)),
-                    Some(TensorRef::Handle(h)) if (h as usize) < b.n_tensors() && b.tensor_bytes(h) >= width => Ok(h),
-                    Some(TensorRef::Handle(_)) => Err("dense layer-norm affine tensor is missing".to_string()),
+                    Some(TensorRef::Handle(h))
+                        if (h as usize) < b.n_tensors() && b.tensor_bytes(h) >= width =>
+                    {
+                        Ok(h)
+                    }
+                    Some(TensorRef::Handle(_)) => {
+                        Err("dense layer-norm affine tensor is missing".to_string())
+                    }
                     None => Ok(packet::dev::TENSOR_NONE),
                 };
-                [ln.stats, affine(&mut builder, ln.gamma)?, affine(&mut builder, ln.beta)?]
+                [
+                    ln.stats,
+                    affine(&mut builder, ln.gamma)?,
+                    affine(&mut builder, ln.beta)?,
+                ]
             }
             None => [packet::dev::TENSOR_NONE; 3],
         };
@@ -764,7 +784,9 @@ impl PacketPrefix {
                 || rows_ref as usize >= builder.n_tensors()
                 || builder.tensor_bytes(rows_ref) < u64::from(rows) * 4
             {
-                return Err("reference split needs bf16 tensor cores, no prologue and a row table".into());
+                return Err(
+                    "reference split needs bf16 tensor cores, no prologue and a row table".into(),
+                );
             }
         }
         // Declared under either split, so both lowerings share one tensor table.
@@ -1065,7 +1087,9 @@ impl PacketPrefix {
 }
 
 fn f32_bytes(elements: u64) -> Result<u64, String> {
-    elements.checked_mul(4).ok_or_else(|| "tensor size overflows".into())
+    elements
+        .checked_mul(4)
+        .ok_or_else(|| "tensor size overflows".into())
 }
 
 fn product(values: &[u32]) -> Result<u64, String> {
@@ -1076,7 +1100,14 @@ fn product(values: &[u32]) -> Result<u64, String> {
 }
 
 /// Elements a strided `[items][rows][cols]` view spans: the last element's offset plus one.
-fn strided_span(items: u32, item_stride: u32, rows: u32, stride: u32, offset: u32, cols: u32) -> u64 {
+fn strided_span(
+    items: u32,
+    item_stride: u32,
+    rows: u32,
+    stride: u32,
+    offset: u32,
+    cols: u32,
+) -> u64 {
     u64::from(items.saturating_sub(1)) * u64::from(item_stride)
         + u64::from(rows.saturating_sub(1)) * u64::from(stride)
         + u64::from(offset)
@@ -1096,10 +1127,14 @@ impl StageProgram {
     }
 
     fn input(&self, handle: u32, bytes: u64, what: &str) -> Result<u32, String> {
-        if (handle as usize) < self.builder.n_tensors() && self.builder.tensor_bytes(handle) >= bytes {
+        if (handle as usize) < self.builder.n_tensors()
+            && self.builder.tensor_bytes(handle) >= bytes
+        {
             Ok(handle)
         } else {
-            Err(format!("{what}: tensor {handle} is missing or smaller than {bytes} bytes"))
+            Err(format!(
+                "{what}: tensor {handle} is missing or smaller than {bytes} bytes"
+            ))
         }
     }
 
@@ -1165,7 +1200,11 @@ impl StageProgram {
         deps: &[u32],
         stage: GatherRowsF32Stage<'_>,
     ) -> Result<Emitted, String> {
-        let per_item = if stage.rows_per_item == 0 { stage.rows } else { stage.rows_per_item };
+        let per_item = if stage.rows_per_item == 0 {
+            stage.rows
+        } else {
+            stage.rows_per_item
+        };
         if stage.rows == 0 || stage.width == 0 || per_item == 0 {
             return Err("invalid row-gather geometry".into());
         }
@@ -1180,30 +1219,40 @@ impl StageProgram {
                 + 1;
             self.input(index, span * 4, "row-gather index")?;
         }
-        let out_stride = if stage.out_stride == 0 { stage.width } else { stage.out_stride };
+        let out_stride = if stage.out_stride == 0 {
+            stage.width
+        } else {
+            stage.out_stride
+        };
         let span = strided_span(1, 0, stage.rows, out_stride, stage.out_col0, stage.width);
         let output = self.resolve(stage.output, f32_bytes(span)?, "row-gather output")?;
         let elements = product(&[stage.rows, stage.width])?;
         u32_elements(elements, "row gather")?;
         let flags = u32::from(stage.table_f16) | (u32::from(stage.accumulate) << 1);
-        self.emit(DevOp::GatherRowsF32, elements.div_ceil(2048), deps, output, |d| {
-            d.t[..3].copy_from_slice(&[
-                output,
-                table,
-                stage.index.unwrap_or(packet::dev::TENSOR_NONE),
-            ]);
-            d.i = [
-                stage.rows,
-                stage.width,
-                stage.vocab,
-                stage.rows_per_item,
-                stage.repeat,
-                stage.index_item_stride,
-                stage.table_item_stride,
-                flags,
-            ];
-            d.j = [stage.out_stride, stage.out_col0];
-        })
+        self.emit(
+            DevOp::GatherRowsF32,
+            elements.div_ceil(2048),
+            deps,
+            output,
+            |d| {
+                d.t[..3].copy_from_slice(&[
+                    output,
+                    table,
+                    stage.index.unwrap_or(packet::dev::TENSOR_NONE),
+                ]);
+                d.i = [
+                    stage.rows,
+                    stage.width,
+                    stage.vocab,
+                    stage.rows_per_item,
+                    stage.repeat,
+                    stage.index_item_stride,
+                    stage.table_item_stride,
+                    flags,
+                ];
+                d.j = [stage.out_stride, stage.out_col0];
+            },
+        )
     }
 
     pub fn copy_cols_f32(
@@ -1235,26 +1284,37 @@ impl StageProgram {
         let output = self.resolve(stage.output, f32_bytes(span)?, "column-copy output")?;
         let elements = product(&[stage.items, stage.rows, stage.cols])?;
         u32_elements(elements, "column copy")?;
-        self.emit(DevOp::CopyColsF32, elements.div_ceil(2048), deps, output, |d| {
-            d.t[..2].copy_from_slice(&[output, x]);
-            d.i[..7].copy_from_slice(&[
-                stage.items,
-                stage.rows,
-                stage.cols,
-                stage.in_stride,
-                stage.in_offset,
-                stage.out_stride,
-                stage.out_offset,
-            ]);
-            d.j = [stage.in_item_stride, stage.out_item_stride];
-        })
+        self.emit(
+            DevOp::CopyColsF32,
+            elements.div_ceil(2048),
+            deps,
+            output,
+            |d| {
+                d.t[..2].copy_from_slice(&[output, x]);
+                d.i[..7].copy_from_slice(&[
+                    stage.items,
+                    stage.rows,
+                    stage.cols,
+                    stage.in_stride,
+                    stage.in_offset,
+                    stage.out_stride,
+                    stage.out_offset,
+                ]);
+                d.j = [stage.in_item_stride, stage.out_item_stride];
+            },
+        )
     }
 
     /// [`DevOp::CopyColsF32`] format mode: `items` blocks of `rows` keys (`cols` = K | V of
     /// `cols / 128` heads of width 64) from the column-copy source geometry into an attention
     /// prefix table for [`AttentionPrefix::h16`]; block `b` at `b * out_item_stride + out_offset`
     /// (`out_stride` unused).
-    pub fn format_prefix_h16(&mut self, x: u32, deps: &[u32], stage: CopyColsF32Stage<'_>) -> Result<Emitted, String> {
+    pub fn format_prefix_h16(
+        &mut self,
+        x: u32,
+        deps: &[u32],
+        stage: CopyColsF32Stage<'_>,
+    ) -> Result<Emitted, String> {
         if stage.items == 0 || stage.rows == 0 || stage.cols == 0 || stage.cols % 128 != 0 {
             return Err("invalid prefix-format geometry".into());
         }
@@ -1263,14 +1323,32 @@ impl StageProgram {
         if u64::from(stage.out_item_stride) < block {
             return Err("prefix-format blocks overlap".into());
         }
-        let span = strided_span(stage.items, stage.in_item_stride, stage.rows, stage.in_stride, stage.in_offset, stage.cols);
+        let span = strided_span(
+            stage.items,
+            stage.in_item_stride,
+            stage.rows,
+            stage.in_stride,
+            stage.in_offset,
+            stage.cols,
+        );
         self.input(x, f32_bytes(span)?, "prefix-format source")?;
-        let span = u64::from(stage.out_offset) + u64::from(stage.items - 1) * u64::from(stage.out_item_stride) + block;
+        let span = u64::from(stage.out_offset)
+            + u64::from(stage.items - 1) * u64::from(stage.out_item_stride)
+            + block;
         let output = self.resolve(stage.output, f32_bytes(span)?, "prefix-format output")?;
         let units = product(&[stage.items, heads, stage.rows.div_ceil(16)])?.div_ceil(2);
         self.emit(DevOp::CopyColsF32, units, deps, output, |d| {
             d.t[..2].copy_from_slice(&[output, x]);
-            d.i = [stage.items, stage.rows, stage.cols, stage.in_stride, stage.in_offset, 0, stage.out_offset, 1];
+            d.i = [
+                stage.items,
+                stage.rows,
+                stage.cols,
+                stage.in_stride,
+                stage.in_offset,
+                0,
+                stage.out_offset,
+                1,
+            ];
             d.j = [stage.in_item_stride, stage.out_item_stride];
         })
     }
@@ -1294,7 +1372,8 @@ impl StageProgram {
         stage: Conv1dF32Stage<'_>,
         row_scale: u32,
     ) -> Result<Emitted, String> {
-        let valid_activation = |a: Activation| !matches!(a, Activation::Clamp | Activation::ScaleShift);
+        let valid_activation =
+            |a: Activation| !matches!(a, Activation::Clamp | Activation::ScaleShift);
         if stage.batch == 0
             || stage.kernel == 0
             || stage.stride == 0
@@ -1319,7 +1398,9 @@ impl StageProgram {
         {
             return Err("invalid convolution geometry".into());
         }
-        let out_rows = stage.out_rows(transpose).ok_or("convolution output is empty")?;
+        let out_rows = stage
+            .out_rows(transpose)
+            .ok_or("convolution output is empty")?;
         let out_elements = product(&[stage.batch, out_rows, stage.out_channels])?;
         u32_elements(out_elements, "convolution output")?;
         self.input(
@@ -1332,14 +1413,21 @@ impl StageProgram {
         } else {
             stage.kernel
         };
-        let mut weight_bytes = product(&[stage.out_channels, stage.in_channels / stage.groups, taps])?
-            * if stage.weight_f16 { 2 } else { 4 };
+        let mut weight_bytes =
+            product(&[stage.out_channels, stage.in_channels / stage.groups, taps])?
+                * if stage.weight_f16 { 2 } else { 4 };
         if stage.weight_split {
-            weight_bytes = wgmma_weight_split_bytes(weight_bytes, stage.out_channels, stage.in_channels * stage.kernel);
+            weight_bytes = wgmma_weight_split_bytes(
+                weight_bytes,
+                stage.out_channels,
+                stage.in_channels * stage.kernel,
+            );
         }
         let weight = self.resolve(stage.weight, weight_bytes, "convolution weight")?;
         let bias = match stage.bias {
-            Some(bias) => self.resolve(bias, u64::from(stage.out_channels) * 4, "convolution bias")?,
+            Some(bias) => {
+                self.resolve(bias, u64::from(stage.out_channels) * 4, "convolution bias")?
+            }
             None => packet::dev::TENSOR_NONE,
         };
         let alpha = match stage.alpha {
@@ -1372,7 +1460,11 @@ impl StageProgram {
             | (u32::from(stage.weight_tap_major) << 15)
             | (u32::from(stage.wgmma && stage.split_bf16) << 17)
             | (u32::from(stage.weight_split) << 18);
-        let op = if transpose { DevOp::ConvTranspose1dF32 } else { DevOp::Conv1dF32 };
+        let op = if transpose {
+            DevOp::ConvTranspose1dF32
+        } else {
+            DevOp::Conv1dF32
+        };
         let units = conv1d_units(&stage, transpose, out_rows, self.builder.n_cu());
         self.emit(op, units, deps, output, |d| {
             d.t[..7].copy_from_slice(&[
@@ -1401,12 +1493,28 @@ impl StageProgram {
     }
 
     /// In place when `output` is `TensorRef::Handle(x)`.
-    pub fn unary_f32(&mut self, x: u32, deps: &[u32], stage: UnaryF32Stage<'_>) -> Result<Emitted, String> {
+    pub fn unary_f32(
+        &mut self,
+        x: u32,
+        deps: &[u32],
+        stage: UnaryF32Stage<'_>,
+    ) -> Result<Emitted, String> {
         if stage.rows == 0 || stage.width == 0 {
             return Err("invalid unary geometry".into());
         }
-        let stride = if stage.stride == 0 { stage.width } else { stage.stride };
-        let bytes = f32_bytes(strided_span(1, 0, stage.rows, stride, stage.col0, stage.width))?;
+        let stride = if stage.stride == 0 {
+            stage.width
+        } else {
+            stage.stride
+        };
+        let bytes = f32_bytes(strided_span(
+            1,
+            0,
+            stage.rows,
+            stride,
+            stage.col0,
+            stage.width,
+        ))?;
         self.input(x, bytes, "unary input")?;
         let output = self.resolve(stage.output, bytes, "unary output")?;
         let param = match stage.param {
@@ -1415,11 +1523,23 @@ impl StageProgram {
         };
         let elements = product(&[stage.rows, stage.width])?;
         u32_elements(elements, "unary")?;
-        self.emit(DevOp::UnaryF32, elements.div_ceil(2048), deps, output, |d| {
-            d.t[..3].copy_from_slice(&[output, x, param]);
-            d.i[..5].copy_from_slice(&[stage.rows, stage.width, stage.kind.code(), stage.stride, stage.col0]);
-            d.f = [stage.p0, stage.p1];
-        })
+        self.emit(
+            DevOp::UnaryF32,
+            elements.div_ceil(2048),
+            deps,
+            output,
+            |d| {
+                d.t[..3].copy_from_slice(&[output, x, param]);
+                d.i[..5].copy_from_slice(&[
+                    stage.rows,
+                    stage.width,
+                    stage.kind.code(),
+                    stage.stride,
+                    stage.col0,
+                ]);
+                d.f = [stage.p0, stage.p1];
+            },
+        )
     }
 
     pub fn binary_f32(
@@ -1449,28 +1569,47 @@ impl StageProgram {
             BinaryOp::Max => 4,
             BinaryOp::Min => 5,
         };
-        self.emit(DevOp::BinaryF32, elements.div_ceil(2048), deps, output, |d| {
-            d.t[..3].copy_from_slice(&[output, a, b]);
-            d.i = [
-                stage.items,
-                stage.rows,
-                stage.width,
-                op,
-                stage.b_item_stride,
-                stage.b_row_stride,
-                stage.b_col_stride,
-                u32::from(stage.scale.is_some()),
-            ];
-            d.f[0] = stage.scale.unwrap_or(1.0);
-        })
+        self.emit(
+            DevOp::BinaryF32,
+            elements.div_ceil(2048),
+            deps,
+            output,
+            |d| {
+                d.t[..3].copy_from_slice(&[output, a, b]);
+                d.i = [
+                    stage.items,
+                    stage.rows,
+                    stage.width,
+                    op,
+                    stage.b_item_stride,
+                    stage.b_row_stride,
+                    stage.b_col_stride,
+                    u32::from(stage.scale.is_some()),
+                ];
+                d.f[0] = stage.scale.unwrap_or(1.0);
+            },
+        )
     }
 
-    pub fn cumsum_f64(&mut self, x: u32, deps: &[u32], stage: CumSumF64Stage<'_>) -> Result<Emitted, String> {
-        let x_width = if stage.x_width == 0 { stage.width } else { stage.x_width };
+    pub fn cumsum_f64(
+        &mut self,
+        x: u32,
+        deps: &[u32],
+        stage: CumSumF64Stage<'_>,
+    ) -> Result<Emitted, String> {
+        let x_width = if stage.x_width == 0 {
+            stage.width
+        } else {
+            stage.x_width
+        };
         if stage.items == 0 || stage.rows == 0 || stage.width == 0 {
             return Err("invalid prefix-sum geometry".into());
         }
-        self.input(x, f32_bytes(product(&[stage.items, stage.rows, x_width])?)?, "prefix-sum input")?;
+        self.input(
+            x,
+            f32_bytes(product(&[stage.items, stage.rows, x_width])?)?,
+            "prefix-sum input",
+        )?;
         let elements = product(&[stage.items, stage.rows, stage.width])?;
         let output = self.resolve(
             stage.output,
@@ -1478,13 +1617,17 @@ impl StageProgram {
             "prefix-sum output",
         )?;
         let column_scale = match stage.column_scale {
-            Some(scale) => self.resolve(scale, u64::from(stage.width) * 4, "prefix-sum column scale")?,
+            Some(scale) => {
+                self.resolve(scale, u64::from(stage.width) * 4, "prefix-sum column scale")?
+            }
             None => packet::dev::TENSOR_NONE,
         };
         if let Some(lengths) = stage.lengths {
             self.input(lengths, u64::from(stage.items) * 4, "prefix-sum lengths")?;
         }
-        let flags = u32::from(stage.exclusive) | (u32::from(stage.wrap) << 1) | (u32::from(stage.f64_output) << 2);
+        let flags = u32::from(stage.exclusive)
+            | (u32::from(stage.wrap) << 1)
+            | (u32::from(stage.f64_output) << 2);
         let units = product(&[stage.items, stage.width])?;
         self.emit(DevOp::CumSumF64, units, deps, output, |d| {
             d.t[..4].copy_from_slice(&[
@@ -1498,7 +1641,12 @@ impl StageProgram {
         })
     }
 
-    pub fn rand_f32(&mut self, seed: u32, deps: &[u32], stage: RandF32Stage<'_>) -> Result<Emitted, String> {
+    pub fn rand_f32(
+        &mut self,
+        seed: u32,
+        deps: &[u32],
+        stage: RandF32Stage<'_>,
+    ) -> Result<Emitted, String> {
         if stage.items == 0 || stage.rows == 0 || stage.width == 0 || stage.stream_shift > 63 {
             return Err("invalid random geometry".into());
         }
@@ -1546,21 +1694,54 @@ impl StageProgram {
         {
             return Err("invalid attention geometry".into());
         }
-        let width = stage.heads.checked_mul(stage.head_width).ok_or("attention width overflows")?;
-        let stride = if stage.in_stride == 0 { width } else { stage.in_stride };
-        let q_total = u32_elements(product(&[stage.batch, stage.q_rows])?, "attention query rows")?;
-        let kv_total = u32_elements(product(&[stage.batch, stage.kv_rows])?, "attention key rows")?;
-        self.input(query, f32_bytes(strided_span(1, 0, q_total, stride, 0, width))?, "attention query")?;
-        for (tensor, col0, what) in [(key, stage.k_col0, "attention key"), (value, stage.v_col0, "attention value")] {
-            self.input(tensor, f32_bytes(strided_span(1, 0, kv_total, stride, col0, width))?, what)?;
+        let width = stage
+            .heads
+            .checked_mul(stage.head_width)
+            .ok_or("attention width overflows")?;
+        let stride = if stage.in_stride == 0 {
+            width
+        } else {
+            stage.in_stride
+        };
+        let q_total = u32_elements(
+            product(&[stage.batch, stage.q_rows])?,
+            "attention query rows",
+        )?;
+        let kv_total = u32_elements(
+            product(&[stage.batch, stage.kv_rows])?,
+            "attention key rows",
+        )?;
+        self.input(
+            query,
+            f32_bytes(strided_span(1, 0, q_total, stride, 0, width))?,
+            "attention query",
+        )?;
+        for (tensor, col0, what) in [
+            (key, stage.k_col0, "attention key"),
+            (value, stage.v_col0, "attention value"),
+        ] {
+            self.input(
+                tensor,
+                f32_bytes(strided_span(1, 0, kv_total, stride, col0, width))?,
+                what,
+            )?;
         }
         let groups = match stage.key_length_heads {
             0 => 1,
             g if g <= 255 && stage.heads % g == 0 => stage.heads / g,
-            _ => return Err("attention key length groups must divide the heads (at most 255 per group)".into()),
+            _ => {
+                return Err(
+                    "attention key length groups must divide the heads (at most 255 per group)"
+                        .into(),
+                )
+            }
         };
         if let Some(lengths) = stage.key_lengths {
-            self.input(lengths, u64::from(stage.batch) * u64::from(groups) * 4, "attention key lengths")?;
+            self.input(
+                lengths,
+                u64::from(stage.batch) * u64::from(groups) * 4,
+                "attention key lengths",
+            )?;
         }
         if stage.relative
             && (stage.bias.is_none()
@@ -1569,17 +1750,24 @@ impl StageProgram {
                 || stage.q_rows <= 112
                 || stage.bias_head_stride < 2 * stage.kv_rows - 1)
         {
-            return Err("relative attention: a table bias, q_rows == kv_rows > 112, head_width 64".into());
+            return Err(
+                "relative attention: a table bias, q_rows == kv_rows > 112, head_width 64".into(),
+            );
         }
         if stage.key_length_heads != 0 && (!stage.relative || stage.q_rows <= 112) {
             return Err("attention key length groups: relative attention only".into());
         }
         if let Some(p) = stage.prefix {
             if stage.bias.is_some() || stage.causal || p.rows == 0 {
-                return Err("attention prefix: no bias or causal mask, and at least one row".into());
+                return Err(
+                    "attention prefix: no bias or causal mask, and at least one row".into(),
+                );
             }
             if p.h16 && (stage.head_width != 64 || stage.q_rows.div_ceil(16) < 4) {
-                return Err("pre-formatted attention prefix: head_width 64 and at least 4 query tiles".into());
+                return Err(
+                    "pre-formatted attention prefix: head_width 64 and at least 4 query tiles"
+                        .into(),
+                );
             }
             let floats = if p.h16 {
                 u64::from(p.blocks) * h16_prefix_floats(stage.heads, p.rows)
@@ -1587,7 +1775,11 @@ impl StageProgram {
                 product(&[p.blocks, p.rows, 2 * width])?
             };
             self.input(p.table, f32_bytes(floats)?, "attention prefix")?;
-            self.input(p.index, u64::from(stage.batch) * 4, "attention prefix index")?;
+            self.input(
+                p.index,
+                u64::from(stage.batch) * 4,
+                "attention prefix index",
+            )?;
         }
         let bias = match stage.bias {
             Some(bias) => {
@@ -1609,7 +1801,10 @@ impl StageProgram {
         let n16 = stage.q_rows.div_ceil(16);
         let units = match (tc, n16 >= 2) {
             (true, true) => {
-                let tiles = stage.heads.checked_mul(n16).ok_or("attention tiles overflow")?;
+                let tiles = stage
+                    .heads
+                    .checked_mul(n16)
+                    .ok_or("attention tiles overflow")?;
                 product(&[stage.batch, tiles.div_ceil(8)])?
             }
             (true, false) => product(&[stage.batch, stage.heads])?,
@@ -1669,9 +1864,16 @@ impl StageProgram {
         deps: &[u32],
         stage: LayerNormRowsF32Stage<'_>,
     ) -> Result<Emitted, String> {
-        let parameterless =
-            !matches!(stage.activation, Activation::LeakyRelu | Activation::Snake | Activation::Clamp | Activation::ScaleShift);
-        if stage.rows == 0 || stage.width == 0 || !stage.epsilon.is_finite() || stage.epsilon <= 0.0 || !parameterless {
+        let parameterless = !matches!(
+            stage.activation,
+            Activation::LeakyRelu | Activation::Snake | Activation::Clamp | Activation::ScaleShift
+        );
+        if stage.rows == 0
+            || stage.width == 0
+            || !stage.epsilon.is_finite()
+            || stage.epsilon <= 0.0
+            || !parameterless
+        {
             return Err("invalid layer-normalization stage".into());
         }
         let bytes = f32_bytes(product(&[stage.rows, stage.width])?)?;
@@ -1685,62 +1887,116 @@ impl StageProgram {
         let beta = affine(stage.beta, "layer-norm beta")?;
         let add = affine(stage.add_row, "layer-norm row")?;
         // One warp per row, eight warps per slice.
-        self.emit(DevOp::LayerNormF32, u64::from(stage.rows).div_ceil(8), deps, output, |d| {
-            d.t[..5].copy_from_slice(&[output, x, gamma, beta, add]);
-            d.i[..3].copy_from_slice(&[stage.rows, stage.width, stage.activation.code() << 4]);
-            d.f[0] = stage.epsilon;
-        })
+        self.emit(
+            DevOp::LayerNormF32,
+            u64::from(stage.rows).div_ceil(8),
+            deps,
+            output,
+            |d| {
+                d.t[..5].copy_from_slice(&[output, x, gamma, beta, add]);
+                d.i[..3].copy_from_slice(&[stage.rows, stage.width, stage.activation.code() << 4]);
+                d.f[0] = stage.epsilon;
+            },
+        )
     }
 }
 
 impl StageProgram {
     /// RowStatsF32: `[rows][2]` = LayerNormF32's (mean, inverse std) per row.
-    pub fn row_stats_f32(&mut self, x: u32, deps: &[u32], stage: RowStatsF32Stage<'_>) -> Result<Emitted, String> {
-        if stage.rows == 0 || stage.width == 0 || !stage.epsilon.is_finite() || stage.epsilon <= 0.0 {
+    pub fn row_stats_f32(
+        &mut self,
+        x: u32,
+        deps: &[u32],
+        stage: RowStatsF32Stage<'_>,
+    ) -> Result<Emitted, String> {
+        if stage.rows == 0 || stage.width == 0 || !stage.epsilon.is_finite() || stage.epsilon <= 0.0
+        {
             return Err("invalid row-statistics stage".into());
         }
-        self.input(x, f32_bytes(product(&[stage.rows, stage.width])?)?, "row-statistics input")?;
-        let output = self.resolve(stage.output, f32_bytes(product(&[stage.rows, 2])?)?, "row statistics")?;
+        self.input(
+            x,
+            f32_bytes(product(&[stage.rows, stage.width])?)?,
+            "row-statistics input",
+        )?;
+        let output = self.resolve(
+            stage.output,
+            f32_bytes(product(&[stage.rows, 2])?)?,
+            "row statistics",
+        )?;
         // One warp per row, eight warps per slice (LayerNormF32's decomposition).
-        self.emit(DevOp::RowStatsF32, u64::from(stage.rows).div_ceil(8), deps, output, |d| {
-            d.t[..2].copy_from_slice(&[output, x]);
-            d.i[..3].copy_from_slice(&[stage.rows, stage.width, u32::from(stage.ordered_statistics) << 1]);
-            d.f[0] = stage.epsilon;
-        })
+        self.emit(
+            DevOp::RowStatsF32,
+            u64::from(stage.rows).div_ceil(8),
+            deps,
+            output,
+            |d| {
+                d.t[..2].copy_from_slice(&[output, x]);
+                d.i[..3].copy_from_slice(&[
+                    stage.rows,
+                    stage.width,
+                    u32::from(stage.ordered_statistics) << 1,
+                ]);
+                d.f[0] = stage.epsilon;
+            },
+        )
     }
 
     /// DenseGemmF32, optionally with the LayerNorm prologue.
-    pub fn dense_f32(&mut self, x: u32, deps: &[u32], stage: DenseF32ProgramStage<'_>) -> Result<Emitted, String> {
+    pub fn dense_f32(
+        &mut self,
+        x: u32,
+        deps: &[u32],
+        stage: DenseF32ProgramStage<'_>,
+    ) -> Result<Emitted, String> {
         if stage.rows == 0 || stage.input_width == 0 || stage.output_width == 0 {
             return Err("invalid dense geometry".into());
         }
-        self.input(x, f32_bytes(product(&[stage.rows, stage.input_width])?)?, "dense input")?;
+        self.input(
+            x,
+            f32_bytes(product(&[stage.rows, stage.input_width])?)?,
+            "dense input",
+        )?;
         let esize = match stage.weight_type {
             DenseWeight::F32 => 4,
             DenseWeight::Bf16 => 2,
         };
-        let weight =
-            self.resolve(stage.weight, product(&[stage.output_width, stage.input_width])? * esize, "dense weight")?;
+        let weight = self.resolve(
+            stage.weight,
+            product(&[stage.output_width, stage.input_width])? * esize,
+            "dense weight",
+        )?;
         let bias = match stage.bias {
             Some(b) => self.resolve(b, u64::from(stage.output_width) * 4, "dense bias")?,
             None => packet::dev::TENSOR_NONE,
         };
         let prologue = match stage.layer_norm {
             Some(ln) => {
-                self.input(ln.stats, f32_bytes(product(&[stage.rows, 2])?)?, "dense layer-norm stats")?;
+                self.input(
+                    ln.stats,
+                    f32_bytes(product(&[stage.rows, 2])?)?,
+                    "dense layer-norm stats",
+                )?;
                 let width = u64::from(stage.input_width) * 4;
                 let mut affine = |t: Option<TensorRef<'_>>, what| match t {
                     Some(t) => self.resolve(t, width, what),
                     None => Ok(packet::dev::TENSOR_NONE),
                 };
-                [ln.stats, affine(ln.gamma, "dense layer-norm gamma")?, affine(ln.beta, "dense layer-norm beta")?]
+                [
+                    ln.stats,
+                    affine(ln.gamma, "dense layer-norm gamma")?,
+                    affine(ln.beta, "dense layer-norm beta")?,
+                ]
             }
             None => [packet::dev::TENSOR_NONE; 3],
         };
-        let output =
-            self.resolve(stage.output, f32_bytes(product(&[stage.rows, stage.output_width])?)?, "dense output")?;
+        let output = self.resolve(
+            stage.output,
+            f32_bytes(product(&[stage.rows, stage.output_width])?)?,
+            "dense output",
+        )?;
         let ln_round = stage.layer_norm.is_some_and(|ln| ln.round_bf16);
-        let tensor_cores = stage.operands_bf16_exact || (ln_round && stage.weight_type == DenseWeight::Bf16);
+        let tensor_cores =
+            stage.operands_bf16_exact || (ln_round && stage.weight_type == DenseWeight::Bf16);
         let flags = u32::from(stage.round_bf16)
             | (u32::from(stage.activation == DenseActivation::GeluErfBf16) << 1)
             | (u32::from(stage.weight_type == DenseWeight::Bf16) << 2)
@@ -1776,7 +2032,11 @@ impl StageProgram {
         row_scale: u32,
     ) -> Result<Emitted, String> {
         let out_rows = stage.out_rows(false).ok_or("convolution output is empty")?;
-        self.input(row_scale, f32_bytes(product(&[stage.batch, out_rows])?)?, "convolution row scale")?;
+        self.input(
+            row_scale,
+            f32_bytes(product(&[stage.batch, out_rows])?)?,
+            "convolution row scale",
+        )?;
         self.conv1d_f32_with(x, false, deps, stage, row_scale)
     }
 }
@@ -1821,7 +2081,11 @@ impl PacketPrefix {
         self.append_one(stage.in_rows, |p| p.conv1d_f32(x, false, &[], stage))
     }
 
-    pub fn append_conv_transpose1d_f32(self, x: u32, stage: Conv1dF32Stage<'_>) -> Result<Self, String> {
+    pub fn append_conv_transpose1d_f32(
+        self,
+        x: u32,
+        stage: Conv1dF32Stage<'_>,
+    ) -> Result<Self, String> {
         self.append_one(stage.in_rows, |p| p.conv1d_f32(x, true, &[], stage))
     }
 
@@ -1829,7 +2093,12 @@ impl PacketPrefix {
         self.append_one(stage.rows, |p| p.unary_f32(x, &[], stage))
     }
 
-    pub fn append_binary_f32(self, a: u32, b: u32, stage: BinaryF32Stage<'_>) -> Result<Self, String> {
+    pub fn append_binary_f32(
+        self,
+        a: u32,
+        b: u32,
+        stage: BinaryF32Stage<'_>,
+    ) -> Result<Self, String> {
         self.append_one(stage.rows, |p| p.binary_f32(a, b, &[], stage))
     }
 
@@ -1848,7 +2117,9 @@ impl PacketPrefix {
         value: u32,
         stage: AttentionF32Stage<'_>,
     ) -> Result<Self, String> {
-        self.append_one(stage.q_rows, |p| p.attention_f32(query, key, value, &[], stage))
+        self.append_one(stage.q_rows, |p| {
+            p.attention_f32(query, key, value, &[], stage)
+        })
     }
 }
 
@@ -1875,13 +2146,21 @@ fn conv1d_units(stage: &Conv1dF32Stage<'_>, transpose: bool, out_rows: u32, n_cu
     let phases = if transpose { stage.stride } else { 1 };
     let per_phase = u64::from(out_rows.div_ceil(phases));
     let tiles = |tile: u64| {
-        u64::from(stage.groups) * u64::from(phases) * (batch * per_phase).div_ceil(tile) * u64::from(ng).div_ceil(tile)
+        u64::from(stage.groups)
+            * u64::from(phases)
+            * (batch * per_phase).div_ceil(tile)
+            * u64::from(ng).div_ceil(tile)
     };
     // 3xTF32 on 64x64 tiles, except FP32 FFMA on 128x128 tiles when those fill the machine for
     // a transposed conv or one with an input activation.
-    let ffma = ((transpose && !stage.weight_tap_major) || (!transpose && stage.input_activation != Activation::None))
+    let ffma = ((transpose && !stage.weight_tap_major)
+        || (!transpose && stage.input_activation != Activation::None))
         && tiles(128) >= u64::from(n_cu);
-    if ffma { tiles(128) } else { tiles(64) }
+    if ffma {
+        tiles(128)
+    } else {
+        tiles(64)
+    }
 }
 
 /// Split-K scratch shared by every tensor-core DenseGemmF32 (each in its own program, so they
@@ -2164,7 +2443,10 @@ mod tests {
 
     fn prefix_with(tensors: &[(&str, u64)]) -> (PacketPrefix, Vec<u32>) {
         let mut builder = Builder::new(4);
-        let handles: Vec<u32> = tensors.iter().map(|&(name, bytes)| builder.tensor(name, bytes)).collect();
+        let handles: Vec<u32> = tensors
+            .iter()
+            .map(|&(name, bytes)| builder.tensor(name, bytes))
+            .collect();
         let model = Model {
             n_cu: 4,
             target: 0,
@@ -2217,9 +2499,21 @@ mod tests {
             weight_split: false,
         };
         let mut p = prefix.program();
-        let a = p.conv1d_f32(x, false, &[], conv("h", "w1", 7, 3, 9, Activation::Snake, None)).unwrap();
+        let a = p
+            .conv1d_f32(
+                x,
+                false,
+                &[],
+                conv("h", "w1", 7, 3, 9, Activation::Snake, None),
+            )
+            .unwrap();
         let b = p
-            .conv1d_f32(a.output, false, &[a.done], conv("y", "w2", 1, 1, 0, Activation::Snake, Some(x)))
+            .conv1d_f32(
+                a.output,
+                false,
+                &[a.done],
+                conv("y", "w2", 1, 1, 0, Activation::Snake, Some(x)),
+            )
             .unwrap();
         let up = p
             .conv1d_f32(
@@ -2289,10 +2583,19 @@ mod tests {
         assert_eq!(prefix.output, mixed.output);
         let insts = &prefix.model.progs[0].insts;
         assert_eq!(insts.len(), 5);
-        let ops: Vec<_> = insts.iter().map(|i| DevOp::from_u16(i.op).unwrap()).collect();
+        let ops: Vec<_> = insts
+            .iter()
+            .map(|i| DevOp::from_u16(i.op).unwrap())
+            .collect();
         assert_eq!(
             ops,
-            [DevOp::Conv1dF32, DevOp::Conv1dF32, DevOp::ConvTranspose1dF32, DevOp::RandF32, DevOp::BinaryF32]
+            [
+                DevOp::Conv1dF32,
+                DevOp::Conv1dF32,
+                DevOp::ConvTranspose1dF32,
+                DevOp::RandF32,
+                DevOp::BinaryF32
+            ]
         );
         let c = &insts[0];
         assert_eq!(c.i, [2, 100, 64, 64, 7, 1, 3, 1]);
@@ -2303,8 +2606,14 @@ mod tests {
         let t = &insts[2];
         assert_eq!(t.f[0], 0.1);
         assert_eq!(t.j[1], packet::dev::ACT_LEAKY_RELU << 4 | 1 << 13);
-        assert_eq!(prefix.model.tensors[up.output as usize].bytes, 2 * 800 * 32 * 4);
-        assert_eq!(prefix.model.tensors[insts[2].t[2] as usize].bytes, 64 * 32 * 16 * 4);
+        assert_eq!(
+            prefix.model.tensors[up.output as usize].bytes,
+            2 * 800 * 32 * 4
+        );
+        assert_eq!(
+            prefix.model.tensors[insts[2].t[2] as usize].bytes,
+            64 * 32 * 16 * 4
+        );
         assert_eq!(insts[3].i[5], 2);
         assert_eq!(insts[3].j[1], 3);
         assert_eq!(insts[4].t[0], insts[4].t[1]);
@@ -2316,7 +2625,10 @@ mod tests {
         let (b, rows, pre, heads) = (2u32, 72u32, 306u32, 8u32);
         let width = heads * 64;
         let block = u32::try_from(h16_prefix_floats(heads, pre)).unwrap();
-        let (prefix, h) = prefix_with(&[("qkv", u64::from(pre * 3 * width) * 4), ("idx", u64::from(b) * 4)]);
+        let (prefix, h) = prefix_with(&[
+            ("qkv", u64::from(pre * 3 * width) * 4),
+            ("idx", u64::from(b) * 4),
+        ]);
         let mut p = prefix.program();
         let copy = |output| CopyColsF32Stage {
             output,
@@ -2330,7 +2642,9 @@ mod tests {
             out_stride: 0,
             out_offset: 0,
         };
-        let f = p.format_prefix_h16(h[0], &[], copy(TensorRef::Named("cache"))).unwrap();
+        let f = p
+            .format_prefix_h16(h[0], &[], copy(TensorRef::Named("cache")))
+            .unwrap();
         let attention = |rows, h16| AttentionF32Stage {
             output: TensorRef::Named("ctx"),
             key_lengths: None,
@@ -2348,14 +2662,29 @@ mod tests {
             bias_head_stride: 0,
             relative: false,
             key_length_heads: 0,
-            prefix: Some(AttentionPrefix { table: f.output, index: h[1], blocks: 2, rows: pre, h16 }),
+            prefix: Some(AttentionPrefix {
+                table: f.output,
+                index: h[1],
+                blocks: 2,
+                rows: pre,
+                h16,
+            }),
         };
-        assert!(p.attention_f32(h[0], h[0], h[0], &[f.done], attention(48, true)).is_err());
-        p.attention_f32(h[0], h[0], h[0], &[f.done], attention(rows, true)).unwrap();
+        assert!(p
+            .attention_f32(h[0], h[0], h[0], &[f.done], attention(48, true))
+            .is_err());
+        p.attention_f32(h[0], h[0], h[0], &[f.done], attention(rows, true))
+            .unwrap();
         let prefix = p.finish(0);
         let insts = &prefix.model.progs[0].insts;
-        assert_eq!(prefix.model.tensors[f.output as usize].bytes, 2 * u64::from(block) * 4);
-        assert_eq!((DevOp::from_u16(insts[0].op), insts[0].i[7]), (Some(DevOp::CopyColsF32), 1));
+        assert_eq!(
+            prefix.model.tensors[f.output as usize].bytes,
+            2 * u64::from(block) * 4
+        );
+        assert_eq!(
+            (DevOp::from_u16(insts[0].op), insts[0].i[7]),
+            (Some(DevOp::CopyColsF32), 1)
+        );
         assert_eq!(insts[1].i[6], 2 | 16);
     }
 
@@ -2410,7 +2739,10 @@ mod tests {
         let a = &prefix.model.progs[0].insts[0];
         assert_eq!(DevOp::from_u16(a.op), Some(DevOp::AttentionF32));
         assert_eq!(a.i[6], 1 | 2);
-        assert_eq!(prefix.model.tensors[prefix.output as usize].bytes, 2 * 480 * 9 * 4);
+        assert_eq!(
+            prefix.model.tensors[prefix.output as usize].bytes,
+            2 * 480 * 9 * 4
+        );
         let c = &prefix.model.progs[1].insts[0];
         assert_eq!(c.i[..5], [2, 480, 9, 1, 2]);
         let error = prefix

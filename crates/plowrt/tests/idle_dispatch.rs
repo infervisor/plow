@@ -35,7 +35,10 @@ async fn a_burst_of_three_ends_the_hold_when_the_third_arrives() {
     let backend: Arc<dyn Backend> = Arc::new(CpuBackend::new(4));
     let registry = Registry::new();
     registry.load(&dir, None).unwrap();
-    let state = Arc::new(AppState::new(registry, Arc::new(ExecutorSet::bringup(backend).unwrap())));
+    let state = Arc::new(AppState::new(
+        registry,
+        Arc::new(ExecutorSet::bringup(backend).unwrap()),
+    ));
     let m = mux::spawn(
         "idle-model".into(),
         state.registry.get("idle-model").unwrap(),
@@ -67,7 +70,13 @@ async fn a_burst_of_three_ends_the_hold_when_the_third_arrives() {
             other => panic!("job 1 produced nothing: {:?}", other.is_err()),
         }
     };
-    assert!(first >= third, "dispatched before the burst arrived: {first:?} < {third:?}");
-    assert!(first < Duration::from_millis(1000), "held to the 2000 ms deadline: {first:?}");
+    assert!(
+        first >= third,
+        "dispatched before the burst arrived: {first:?} < {third:?}"
+    );
+    assert!(
+        first < Duration::from_millis(1000),
+        "held to the 2000 ms deadline: {first:?}"
+    );
     std::fs::remove_dir_all(&dir).ok();
 }

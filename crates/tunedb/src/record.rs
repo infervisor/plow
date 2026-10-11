@@ -38,8 +38,14 @@ impl Digests {
         if self.execution != want.execution {
             out.push("execution");
         }
-        if self.execution.as_ref().is_some_and(|identity| identity.validate().is_err())
-            || want.execution.as_ref().is_some_and(|identity| identity.validate().is_err())
+        if self
+            .execution
+            .as_ref()
+            .is_some_and(|identity| identity.validate().is_err())
+            || want
+                .execution
+                .as_ref()
+                .is_some_and(|identity| identity.validate().is_err())
         {
             out.push("invalid_execution");
         }
@@ -132,8 +138,14 @@ impl KernelMeasurement {
     /// Kept separate from the act of promoting so the reasons can be reported.
     pub fn qualification_blockers(&self) -> Vec<String> {
         let mut blockers = blockers_for(&self.correctness, self.stats.samples);
-        if [self.stats.min_ns, self.stats.p10_ns, self.stats.median_ns, self.stats.p90_ns]
-            .iter().any(|v| !v.is_finite() || *v <= 0.0)
+        if [
+            self.stats.min_ns,
+            self.stats.p10_ns,
+            self.stats.median_ns,
+            self.stats.p90_ns,
+        ]
+        .iter()
+        .any(|v| !v.is_finite() || *v <= 0.0)
             || self.stats.min_ns > self.stats.p10_ns
             || self.stats.p10_ns > self.stats.median_ns
             || self.stats.median_ns > self.stats.p90_ns
@@ -141,8 +153,12 @@ impl KernelMeasurement {
             blockers.push("invalid kernel timing distribution".into());
         }
         if let Some(identity) = &self.digests.execution {
-            if let Err(reason) = identity.validate() { blockers.push(reason); }
-            if identity.hardware != self.hardware { blockers.push("execution hardware differs".into()); }
+            if let Err(reason) = identity.validate() {
+                blockers.push(reason);
+            }
+            if identity.hardware != self.hardware {
+                blockers.push("execution hardware differs".into());
+            }
         }
         blockers
     }
@@ -355,7 +371,10 @@ mod tests {
                 3 => record.stats.p10_ns = record.stats.median_ns + 1.0,
                 _ => record.stats.min_ns = record.stats.p10_ns + 1.0,
             }
-            assert!(!record.qualification_blockers().is_empty(), "mutation {mutation}");
+            assert!(
+                !record.qualification_blockers().is_empty(),
+                "mutation {mutation}"
+            );
         }
     }
 }

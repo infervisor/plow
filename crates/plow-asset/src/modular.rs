@@ -1,5 +1,5 @@
-use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 /// The architectural building blocks of a transformer model.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -222,14 +222,19 @@ mod scope_tests {
     #[test]
     fn abstract_and_structural_checks_do_not_serialize_as_full_qualification() {
         let correctness = ModularLeanCorrectness {
-            ordering_verified: true, lds_fit_verified: true,
-            rewrite_name_catalog_checked: true, reason: None,
+            ordering_verified: true,
+            lds_fit_verified: true,
+            rewrite_name_catalog_checked: true,
+            reason: None,
         };
         let value = serde_json::to_value(correctness).unwrap();
         assert_eq!(value["rewrite_name_catalog_checked"], true);
         assert!(value.get("rewrite_soundness_verified").is_none());
-        let summary = ModularLeanSummary { all_abstract_checks_passed: true,
-            all_structural_bounds_certified: true, ..Default::default() };
+        let summary = ModularLeanSummary {
+            all_abstract_checks_passed: true,
+            all_structural_bounds_certified: true,
+            ..Default::default()
+        };
         let value = serde_json::to_value(summary).unwrap();
         assert!(value.get("all_correctness_verified").is_none());
         assert!(value.get("all_performance_certified").is_none());

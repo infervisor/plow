@@ -233,7 +233,9 @@ type Reader = fn(&RuntimeConfig) -> Val<'_>;
 const READERS: &[(&str, Reader)] = &[
     ("rt.pf_seg_dir", |c| opt_str(&c.nv.pf_seg_dir)),
     ("rt.pf_seg_gemm_small", |c| opt_str(&c.nv.pf_seg_gemm_small)),
-    ("rt.cutlass_fp8_decode", |c| opt_str(&c.nv.cutlass_fp8_decode)),
+    ("rt.cutlass_fp8_decode", |c| {
+        opt_str(&c.nv.cutlass_fp8_decode)
+    }),
     ("rt.mla_pf_v2", |c| Val::Bool(c.amd.mla_pf_v2)),
     ("rt.serial", |c| Val::Bool(c.apple.serial)),
     ("rt.ane_mlp", |c| Val::Bool(c.apple.ane_mlp)),
@@ -277,19 +279,42 @@ fn has_scoped_perf_claim(rungs: Option<&Value>) -> bool {
     };
     let mut seen = std::collections::BTreeSet::new();
     rungs.iter().all(|rung| {
-        let Some(name) = rung.get("rung").and_then(Value::as_str).filter(|s| !s.is_empty()) else {
+        let Some(name) = rung
+            .get("rung")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+        else {
             return false;
         };
-        seen.insert(name) && rung.get("perf_cert").and_then(Value::as_array)
-            .filter(|certs| !certs.is_empty()).is_some_and(|certs| certs.iter().all(|cert| {
-                cert.get("checkpoint").and_then(Value::as_str) == Some("P")
-                    && cert.get("ok").and_then(Value::as_bool) == Some(true)
-                    && cert.get("scope").and_then(Value::as_str) == Some("knob_rung")
-                    && cert.get("knob").and_then(Value::as_str).is_some_and(|s| !s.is_empty())
-                    && matches!(cert.get("basis").and_then(Value::as_str), Some("measured" | "carry_over"))
-                    && cert.get("cert_sha256").and_then(Value::as_str).is_some_and(|s|
-                        s.len() == 64 && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)))
-            }))
+        seen.insert(name)
+            && rung
+                .get("perf_cert")
+                .and_then(Value::as_array)
+                .filter(|certs| !certs.is_empty())
+                .is_some_and(|certs| {
+                    certs.iter().all(|cert| {
+                        cert.get("checkpoint").and_then(Value::as_str) == Some("P")
+                            && cert.get("ok").and_then(Value::as_bool) == Some(true)
+                            && cert.get("scope").and_then(Value::as_str) == Some("knob_rung")
+                            && cert
+                                .get("knob")
+                                .and_then(Value::as_str)
+                                .is_some_and(|s| !s.is_empty())
+                            && matches!(
+                                cert.get("basis").and_then(Value::as_str),
+                                Some("measured" | "carry_over")
+                            )
+                            && cert
+                                .get("cert_sha256")
+                                .and_then(Value::as_str)
+                                .is_some_and(|s| {
+                                    s.len() == 64
+                                        && s.bytes().all(|b| {
+                                            b.is_ascii_digit() || (b'a'..=b'f').contains(&b)
+                                        })
+                                })
+                    })
+                })
     })
 }
 
@@ -1030,12 +1055,16 @@ mod tests {
         (
             "metal.rs",
             "requires PLOW_TEST_BLOB, PLOW_TEST_CHECKPOINT and PLOW_TEST_AUDIO_DIR",
-            Site::NotAConstraint("an #[ignore] reason naming the Qwen3-ASR Metal test's fixture paths"),
+            Site::NotAConstraint(
+                "an #[ignore] reason naming the Qwen3-ASR Metal test's fixture paths",
+            ),
         ),
         (
             "gpu.rs",
             "widening context via PLOW_LIVE_CTX requires PLOW_VMM_LIVE=1 or PLOW_VMM_PREFIX=1",
-            Site::NotAConstraint("widening past packet compiled max_ctx requires VMM; narrowing does not"),
+            Site::NotAConstraint(
+                "widening past packet compiled max_ctx requires VMM; narrowing does not",
+            ),
         ),
     ];
 
@@ -1367,7 +1396,14 @@ mod tests {
 
     #[test]
     fn declared_scopes_name_known_kinds_and_classes() {
-        const KINDS: &[&str] = &["prefill", "decode", "packed", "token_batch", "modular", "global"];
+        const KINDS: &[&str] = &[
+            "prefill",
+            "decode",
+            "packed",
+            "token_batch",
+            "modular",
+            "global",
+        ];
         let known = |c: &str| {
             packet::opclass::CLASSES.contains(&c)
                 || c.strip_prefix("op:")
@@ -1376,9 +1412,17 @@ mod tests {
         };
         for k in registry() {
             for a in k.scope {
-                assert!(!a.fields.is_empty(), "{}: an allowance with no field allows nothing", k.id);
+                assert!(
+                    !a.fields.is_empty(),
+                    "{}: an allowance with no field allows nothing",
+                    k.id
+                );
                 for kind in a.kinds {
-                    assert!(KINDS.contains(kind), "{}: unknown program kind {kind}", k.id);
+                    assert!(
+                        KINDS.contains(kind),
+                        "{}: unknown program kind {kind}",
+                        k.id
+                    );
                 }
                 if let OpSel::In(cs) | OpSel::NotIn(cs) = a.ops {
                     for c in cs {
@@ -1522,16 +1566,26 @@ mod tests {
         assert!(!has_scoped_perf_claim(Some(
             &serde_json::json!([{"rung": "packet"}])
         )));
-        for invalid in [serde_json::json!(null), serde_json::json!([]),
-            serde_json::json!([{"checkpoint":"P"}]), serde_json::json!([false])] {
-            assert!(!has_scoped_perf_claim(Some(&serde_json::json!([{"rung":"packet", "perf_cert":invalid}]))));
+        for invalid in [
+            serde_json::json!(null),
+            serde_json::json!([]),
+            serde_json::json!([{"checkpoint":"P"}]),
+            serde_json::json!([false]),
+        ] {
+            assert!(!has_scoped_perf_claim(Some(
+                &serde_json::json!([{"rung":"packet", "perf_cert":invalid}])
+            )));
         }
         for field in ["checkpoint", "ok", "scope", "knob", "basis", "cert_sha256"] {
             let mut incomplete = cert.clone();
             incomplete.as_object_mut().unwrap().remove(field);
-            assert!(!has_scoped_perf_claim(Some(&serde_json::json!([{"rung":"packet", "perf_cert":[incomplete]}]))));
+            assert!(!has_scoped_perf_claim(Some(
+                &serde_json::json!([{"rung":"packet", "perf_cert":[incomplete]}])
+            )));
         }
-        assert!(!has_scoped_perf_claim(Some(&serde_json::json!([rungs[0], rungs[0]]))));
+        assert!(!has_scoped_perf_claim(Some(&serde_json::json!([
+            rungs[0], rungs[0]
+        ]))));
     }
 
     /// Absent and skipped warn and load; failed and a violated constraint refuse.

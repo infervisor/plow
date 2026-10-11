@@ -227,9 +227,14 @@ mod tests {
     #[test]
     fn descriptor_plan_replaces_the_measured_table() {
         let plan = [[8, 2048, 2048, 128, 1], [32, 2816, 4096, 256, 4]];
-        assert_eq!(selection(&plan, 8, 2048, 2048).unwrap(), (0, 1, 3 * 72 * 136 * 2));
-        assert_eq!(selection(&plan, 32, 2816, 4096).unwrap(), (5, 4, 2 * 96 * 264 * 2));
+        assert_eq!(
+            selection(&plan, 8, 2048, 2048).unwrap(),
+            (0, 1, 3 * 72 * 136 * 2)
+        );
+        assert_eq!(
+            selection(&plan, 32, 2816, 4096).unwrap(),
+            (5, 4, 2 * 96 * 264 * 2)
+        );
         assert!(selection(&plan, 8, 512, 3840).is_err());
     }
 }
-

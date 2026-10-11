@@ -19,7 +19,10 @@ fn map_ahead_rows_covers_the_decode_row_and_the_next_chunk() {
     assert_eq!(map_ahead_rows(8192, false, Some(16384), max), Some(16384));
     assert_eq!(map_ahead_rows(8192, false, None, max), None);
     // A chunk that ends the context has no decode row and no next chunk to map.
-    assert_eq!(map_ahead_rows(max as u32, true, Some(max as u32 + 8192), max), None);
+    assert_eq!(
+        map_ahead_rows(max as u32, true, Some(max as u32 + 8192), max),
+        None
+    );
 }
 
 #[test]
@@ -520,7 +523,10 @@ fn native_ocp_weights_preserve_bytes_only_without_legacy_consumers() {
         d.t = [packet::dev::TENSOR_NONE16; 8];
         d.t[2] = 7;
     }
-    assert_eq!(native_ocp_fp8_weights(std::slice::from_ref(&p)), [7].into_iter().collect());
+    assert_eq!(
+        native_ocp_fp8_weights(std::slice::from_ref(&p)),
+        [7].into_iter().collect()
+    );
     let mut other = segmented_prog(&[DevOp::GemvFp8Blk], &[0]);
     other.insts[0].t = [packet::dev::TENSOR_NONE16; 8];
     other.insts[0].t[2] = 7;
@@ -532,8 +538,11 @@ fn native_ocp_weights_preserve_bytes_only_without_legacy_consumers() {
 #[test]
 fn routed_block128_requires_markers_and_valid_geometry() {
     let path = Path::new("routed.elf");
-    let syms = ["plow_opcode_moe_glu_fp8_block128_1", "plow_opcode_moe_quant_fp8_block128_1",
-        "plow_opcode_moe_down_fp8_block128_1"];
+    let syms = [
+        "plow_opcode_moe_glu_fp8_block128_1",
+        "plow_opcode_moe_quant_fp8_block128_1",
+        "plow_opcode_moe_down_fp8_block128_1",
+    ];
     for (op, dims) in [
         (DevOp::MoeGluFp8Block128, [256, 6144, 256, 16, 0, 0, 0, 0]),
         (DevOp::MoeQuantFp8Block128, [256, 256, 8, 16, 6144, 0, 0, 0]),
@@ -559,7 +568,9 @@ fn block_fp8_m16_requires_its_object_marker() {
     let base = "plow_opcode_gemm_fp8_block128_1";
     assert!(check_compiled_opcode_markers(&[base], path, [&p]).is_ok());
     p.insts[0].i[3] = 16;
-    assert!(check_compiled_opcode_markers(&[base], path, [&p]).unwrap_err().to_string()
+    assert!(check_compiled_opcode_markers(&[base], path, [&p])
+        .unwrap_err()
+        .to_string()
         .contains("plow_gemm_fp8_block128_m16_1"));
     let syms = [base, "plow_gemm_fp8_block128_m16_1"];
     assert!(check_compiled_opcode_markers(&syms, path, [&p]).is_ok());
@@ -574,7 +585,9 @@ fn rounded_silu_requires_its_object_marker() {
     p.insts[0].i[1] = 1;
     assert!(check_compiled_opcode_markers(&[], path, [&p]).is_ok());
     p.insts[0].i[1] = 5;
-    assert!(check_compiled_opcode_markers(&[], path, [&p]).unwrap_err().to_string()
+    assert!(check_compiled_opcode_markers(&[], path, [&p])
+        .unwrap_err()
+        .to_string()
         .contains("plow_glu_silu_bf16_1"));
     assert!(check_compiled_opcode_markers(&["plow_glu_silu_bf16_1"], path, [&p]).is_ok());
 }
@@ -582,19 +595,35 @@ fn rounded_silu_requires_its_object_marker() {
 #[test]
 fn block_fp8_split3_requires_marker_and_geometry() {
     let path = Path::new("interp_decode_gq.elf");
-    let syms = ["plow_opcode_gemm_fp8_block128_1", "plow_gemm_fp8_block128_m16_1",
-        "plow_gemm_fp8_block128_split3_1"];
+    let syms = [
+        "plow_opcode_gemm_fp8_block128_1",
+        "plow_gemm_fp8_block128_m16_1",
+        "plow_gemm_fp8_block128_split3_1",
+    ];
     let mut p = segmented_prog(&[DevOp::GemmFp8Block128], &[0]);
     let dims = [16, 2624, 6144, 16, 2048, 512, 0, 0];
     p.insts[0].i = dims;
     p.insts[0].t = [0, 1, 2, 3, 4, 5, 6, packet::dev::TENSOR_NONE16];
     assert!(check_compiled_opcode_markers(&syms, path, [&p]).is_ok());
     assert!(check_compiled_opcode_markers(&syms[..2], path, [&p]).is_err());
-    for (slot, value) in [(0, 0), (0, u32::MAX), (1, 2560), (2, 6143),
-        (3, 0), (4, 0), (4, u32::MAX), (5, 0), (6, 1), (7, 1)] {
+    for (slot, value) in [
+        (0, 0),
+        (0, u32::MAX),
+        (1, 2560),
+        (2, 6143),
+        (3, 0),
+        (4, 0),
+        (4, u32::MAX),
+        (5, 0),
+        (6, 1),
+        (7, 1),
+    ] {
         p.insts[0].i = dims;
         p.insts[0].i[slot] = value;
-        assert!(check_compiled_opcode_markers(&syms, path, [&p]).is_err(), "slot{slot}={value}");
+        assert!(
+            check_compiled_opcode_markers(&syms, path, [&p]).is_err(),
+            "slot{slot}={value}"
+        );
     }
     p.insts[0].i = dims;
     for slot in 0..7 {
@@ -613,12 +642,29 @@ fn mla_fp8_requires_marker_valid_geometry_and_ocp_bytes() {
     let mut p = segmented_prog(&[DevOp::MlaBmmFp8], &[0]);
     for dims in [[16, 8, 512, 192, 1, 0, 0, 0], [16, 8, 256, 512, 0, 0, 0, 0]] {
         p.insts[0].i = dims;
-        p.insts[0].t = [0, 1, 2, 3, 4, packet::dev::TENSOR_NONE16,
-            packet::dev::TENSOR_NONE16, packet::dev::TENSOR_NONE16];
+        p.insts[0].t = [
+            0,
+            1,
+            2,
+            3,
+            4,
+            packet::dev::TENSOR_NONE16,
+            packet::dev::TENSOR_NONE16,
+            packet::dev::TENSOR_NONE16,
+        ];
         assert!(check_compiled_opcode_markers(&syms, path, [&p]).is_ok());
         assert!(check_compiled_opcode_markers(&[], path, [&p]).is_err());
-        for (slot, value) in [(0, 0), (0, u32::MAX), (1, 16), (2, 255),
-            (3, 128), (4, 2), (5, 1), (6, 1), (7, 1)] {
+        for (slot, value) in [
+            (0, 0),
+            (0, u32::MAX),
+            (1, 16),
+            (2, 255),
+            (3, 128),
+            (4, 2),
+            (5, 1),
+            (6, 1),
+            (7, 1),
+        ] {
             p.insts[0].i = dims;
             p.insts[0].i[slot] = value;
             assert!(check_compiled_opcode_markers(&syms, path, [&p]).is_err());
@@ -629,7 +675,10 @@ fn mla_fp8_requires_marker_valid_geometry_and_ocp_bytes() {
             assert!(check_compiled_opcode_markers(&syms, path, [&p]).is_err());
             p.insts[0].t[slot] = slot as u16;
         }
-        assert_eq!(native_ocp_fp8_weights(std::slice::from_ref(&p)), [2].into_iter().collect());
+        assert_eq!(
+            native_ocp_fp8_weights(std::slice::from_ref(&p)),
+            [2].into_iter().collect()
+        );
     }
 }
 
@@ -639,8 +688,16 @@ fn mla_strided_wv_requires_exact_shape_and_new_object_abi() {
     let syms = ["plow_opcode_mla_bmm_fp8_1", "plow_mla_bmm_head_stride_1"];
     let mut p = segmented_prog(&[DevOp::MlaBmmFp8], &[0]);
     p.insts[0].i = [16, 8, 256, 512, 0, 1024, 0, 0];
-    p.insts[0].t = [0, 1, 2, 3, packet::dev::TENSOR_NONE16,
-        packet::dev::TENSOR_NONE16, packet::dev::TENSOR_NONE16, packet::dev::TENSOR_NONE16];
+    p.insts[0].t = [
+        0,
+        1,
+        2,
+        3,
+        packet::dev::TENSOR_NONE16,
+        packet::dev::TENSOR_NONE16,
+        packet::dev::TENSOR_NONE16,
+        packet::dev::TENSOR_NONE16,
+    ];
     assert!(check_compiled_opcode_markers(&syms, path, [&p]).is_ok());
     assert!(check_compiled_opcode_markers(&syms[..1], path, [&p]).is_err());
     for (slot, value) in [(0, 32), (1, 16), (2, 512), (3, 192), (4, 1), (5, 512)] {
@@ -654,17 +711,37 @@ fn mla_strided_wv_requires_exact_shape_and_new_object_abi() {
 #[test]
 fn block_fp8_qb_requires_marker_and_geometry() {
     let path = Path::new("interp_decode_gq.elf");
-    let syms = ["plow_opcode_gemm_fp8_block128_1", "plow_gemm_fp8_block128_m16_1",
-        "plow_gemm_fp8_block128_qb_1"];
+    let syms = [
+        "plow_opcode_gemm_fp8_block128_1",
+        "plow_gemm_fp8_block128_m16_1",
+        "plow_gemm_fp8_block128_qb_1",
+    ];
     let mut p = segmented_prog(&[DevOp::GemmFp8Block128], &[0]);
     let dims = [16, 2048, 2048, 16, 0, 0, 1, 0];
     p.insts[0].i = dims;
-    p.insts[0].t = [0, 1, 2, 3, 4, packet::dev::TENSOR_NONE16,
-        packet::dev::TENSOR_NONE16, packet::dev::TENSOR_NONE16];
+    p.insts[0].t = [
+        0,
+        1,
+        2,
+        3,
+        4,
+        packet::dev::TENSOR_NONE16,
+        packet::dev::TENSOR_NONE16,
+        packet::dev::TENSOR_NONE16,
+    ];
     assert!(check_compiled_opcode_markers(&syms, path, [&p]).is_ok());
     assert!(check_compiled_opcode_markers(&syms[..2], path, [&p]).is_err());
-    for (slot, value) in [(0, 0), (0, u32::MAX), (1, 1024), (2, 2047),
-        (3, 0), (4, 1), (5, 1), (6, 2), (7, 1)] {
+    for (slot, value) in [
+        (0, 0),
+        (0, u32::MAX),
+        (1, 1024),
+        (2, 2047),
+        (3, 0),
+        (4, 1),
+        (5, 1),
+        (6, 2),
+        (7, 1),
+    ] {
         p.insts[0].i = dims;
         p.insts[0].i[slot] = value;
         assert!(check_compiled_opcode_markers(&syms, path, [&p]).is_err());
@@ -680,17 +757,38 @@ fn block_fp8_qb_requires_marker_and_geometry() {
 #[test]
 fn block_fp8_oproj_split8_requires_exact_m1_shape() {
     let path = Path::new("interp_decode_gq.elf");
-    let syms = ["plow_opcode_gemm_fp8_block128_1", "plow_gemm_fp8_block128_m16_1",
-        "plow_gemm_fp8_block128_qb_1"];
+    let syms = [
+        "plow_opcode_gemm_fp8_block128_1",
+        "plow_gemm_fp8_block128_m16_1",
+        "plow_gemm_fp8_block128_qb_1",
+    ];
     let mut p = segmented_prog(&[DevOp::GemmFp8Block128], &[0]);
     let dims = [1, 6144, 2048, 16, 0, 0, 2, 0];
     p.insts[0].i = dims;
-    p.insts[0].t = [0, 1, 2, 3, 4, packet::dev::TENSOR_NONE16,
-        packet::dev::TENSOR_NONE16, packet::dev::TENSOR_NONE16];
+    p.insts[0].t = [
+        0,
+        1,
+        2,
+        3,
+        4,
+        packet::dev::TENSOR_NONE16,
+        packet::dev::TENSOR_NONE16,
+        packet::dev::TENSOR_NONE16,
+    ];
     assert!(check_compiled_opcode_markers(&syms, path, [&p]).is_ok());
     assert!(check_compiled_opcode_markers(&syms[..2], path, [&p]).is_err());
-    for (slot, value) in [(0, 0), (0, 8), (1, 2048), (2, 4096), (3, 0),
-                           (4, 1), (5, 1), (6, 1), (6, 3), (7, 1)] {
+    for (slot, value) in [
+        (0, 0),
+        (0, 8),
+        (1, 2048),
+        (2, 4096),
+        (3, 0),
+        (4, 1),
+        (5, 1),
+        (6, 1),
+        (6, 3),
+        (7, 1),
+    ] {
         p.insts[0].i = dims;
         p.insts[0].i[slot] = value;
         assert!(check_compiled_opcode_markers(&syms, path, [&p]).is_err());
@@ -702,7 +800,12 @@ fn interpreter_wave_geometry_rejects_missing_or_swapped_phase_objects() {
     for phase in [Phase::Prefill, Phase::Decode, Phase::Flash] {
         let expected = phase.interpreter_threads() / 64;
         assert!(check_interpreter_waves(Some(expected), phase, Path::new("phase.elf")).is_ok());
-        for waves in [None, Some(0), Some(2), Some(if expected == 4 { 8 } else { 4 })] {
+        for waves in [
+            None,
+            Some(0),
+            Some(2),
+            Some(if expected == 4 { 8 } else { 4 }),
+        ] {
             let error = check_interpreter_waves(waves, phase, Path::new("phase.elf"))
                 .expect_err("a filename cannot establish a compatible launch geometry");
             assert!(error.to_string().contains("plow_geom_PLOW_WG_WAVES"));
@@ -1454,7 +1557,10 @@ fn token_batch_body_keeps_xcd_placement_without_static_hierarchy_count() {
     placed.n_counter = 1000;
     assert_eq!(program_hier_base(&placed), 976);
 
-    placed.role = packet::devbuild::ProgramRole::TokenBatchBody { band: 32, rows: 128 };
+    placed.role = packet::devbuild::ProgramRole::TokenBatchBody {
+        band: 32,
+        rows: 128,
+    };
     assert_eq!(placed.l2_domains, 8);
     assert_eq!(program_hier_base(&placed), 0);
 }
@@ -1526,14 +1632,8 @@ fn grouped_decode_requires_its_accumulation_arm() {
 fn dcp_canonical_select_refuses_an_old_decode_object() {
     let requires = vec!["PLOW_DCP_INDEX_CANON=1".to_owned()];
     let obj = Path::new("interp_decode_fp8kv_gq.elf");
-    assert!(check_decode_object(
-        &["plow_dcp_gather_1"], obj, &requires, false, false
-    )
-    .is_err());
-    assert!(check_decode_object(
-        &["plow_dcp_index_canon_1"], obj, &requires, false, false
-    )
-    .is_ok());
+    assert!(check_decode_object(&["plow_dcp_gather_1"], obj, &requires, false, false).is_err());
+    assert!(check_decode_object(&["plow_dcp_index_canon_1"], obj, &requires, false, false).is_ok());
 }
 
 fn segmented_prog(ops: &[DevOp], segs: &[u16]) -> DevProg {
@@ -1794,7 +1894,10 @@ fn lean_moe_stage1_route_requires_exact_shape_and_align() {
     let PrefillSegmentRoute::MoeStage1Mxfp4(glm_route) = glm[1] else {
         panic!("GLM stage-1 packet must route to the native object")
     };
-    assert_eq!((glm_route.args.inter_dim, glm_route.args.model_dim), (256, 6144));
+    assert_eq!(
+        (glm_route.args.inter_dim, glm_route.args.model_dim),
+        (256, 6144)
+    );
 
     // PLOW_GLM_MOE_SHARED_FOLD: 257 experts at top-9, and only as a pair.
     prog.insts[0].i[1..3].copy_from_slice(&[257, 9]);
@@ -2411,7 +2514,10 @@ fn small_mla_family_requires_pure_dense_ordinary_segments() {
         prog.insts[1].t[7] = packet::dev::TENSOR_NONE16;
         for rows in [1, 4, 8, 16, 20, 128, 512, 1024] {
             prog.t = rows;
-            assert_eq!(segment::small_mla_segments(&prog, 4), [false, true, false, false]);
+            assert_eq!(
+                segment::small_mla_segments(&prog, 4),
+                [false, true, false, false]
+            );
             assert_eq!(derive_segments_for(&prog, false).unwrap(), [8, 8, 8]);
         }
         prog.role = packet::devbuild::ProgramRole::PackedSibling { of_rows: prog.t };
@@ -2446,10 +2552,24 @@ fn small_mla_split_fixture() -> (DevProg, Vec<crate::asset::devblob::DevTensor>)
     prog.insts[0].fj[2] = 16;
     prog.insts[1].t = [8, 0, 1, 9, 0, 0, 0, 0];
     prog.insts[1].i = [128, 8, 256, 0, 16, 0, 0, 0];
-    let tensors = [128*8*16*512*4, 128*8*16*2*4, 128*8*512*2, 128*8*64*2,
-        81920*512, 81920*64*2, 4, 81920*4].into_iter().enumerate().map(|(i, bytes)| {
-            crate::asset::devblob::DevTensor { name: format!("test.{i}"), bytes, init: None }
-        }).collect();
+    let tensors = [
+        128 * 8 * 16 * 512 * 4,
+        128 * 8 * 16 * 2 * 4,
+        128 * 8 * 512 * 2,
+        128 * 8 * 64 * 2,
+        81920 * 512,
+        81920 * 64 * 2,
+        4,
+        81920 * 4,
+    ]
+    .into_iter()
+    .enumerate()
+    .map(|(i, bytes)| crate::asset::devblob::DevTensor {
+        name: format!("test.{i}"),
+        bytes,
+        init: None,
+    })
+    .collect();
     (prog, tensors)
 }
 
@@ -2461,14 +2581,22 @@ fn small_mla_splits_follow_live_context_and_patch_both_sides() {
     assert_eq!(derive_segments_for(&prog, true).unwrap(), [4, 8]);
     assert!(derive_segments_for(&prog, false).is_err());
     assert_eq!(segment::small_mla_segments(&prog, 2), [false, false]);
-    for (rows, ctx, ns) in [(1,1,1), (4,32,1), (20,33,2), (128,128,4),
-        (128,1024,16), (128,70000,16), (4,70000,32), (128,128,4)] {
+    for (rows, ctx, ns) in [
+        (1, 1, 1),
+        (4, 32, 1),
+        (20, 33, 2),
+        (128, 128, 4),
+        (128, 1024, 16),
+        (128, 70000, 16),
+        (4, 70000, 32),
+        (128, 128, 4),
+    ] {
         prog.insts[0].i[4] = rows;
         prog.insts[1].i[0] = rows;
         mla_prefill::rebase(&sites, &mut prog.insts, ctx).unwrap();
         assert_eq!((prog.insts[0].fj[2], prog.insts[1].i[4]), (ns, ns));
     }
-    for (rows, ctx) in [(0,128), (129,70000), (128,127)] {
+    for (rows, ctx) in [(0, 128), (129, 70000), (128, 127)] {
         prog.insts[0].i[4] = rows;
         assert!(mla_prefill::rebase(&sites, &mut prog.insts, ctx).is_err());
     }
@@ -2476,16 +2604,27 @@ fn small_mla_splits_follow_live_context_and_patch_both_sides() {
 
 #[test]
 fn small_mla_append_context_matrix_stays_inside_partial_storage() {
-    for capacity in [1u32,2,4,8,16,20,32,64,128,256,512,1024] {
-        let split_cap = (304 / (capacity.div_ceil(64) * 8)).clamp(1,32);
+    for capacity in [1u32, 2, 4, 8, 16, 20, 32, 64, 128, 256, 512, 1024] {
+        let split_cap = (304 / (capacity.div_ceil(64) * 8)).clamp(1, 32);
         let partial_rows = capacity * (1 << split_cap.ilog2());
-        for rows in [1,2,4,8,16,20,31,32,33,63,64,65,127,128,129,256,512,1024] {
-            if rows > capacity { continue; }
-            for ctx in [32,33,128,129,512,1024,4096,16384,32768,65536,70000,81920] {
-                if ctx < rows { continue; }
+        for rows in [
+            1, 2, 4, 8, 16, 20, 31, 32, 33, 63, 64, 65, 127, 128, 129, 256, 512, 1024,
+        ] {
+            if rows > capacity {
+                continue;
+            }
+            for ctx in [
+                32, 33, 128, 129, 512, 1024, 4096, 16384, 32768, 65536, 70000, 81920,
+            ] {
+                if ctx < rows {
+                    continue;
+                }
                 let ns = mla_prefill::live_splits(partial_rows, rows, ctx);
                 assert!(ns.is_power_of_two() && ns <= 32);
-                assert!(rows * ns <= partial_rows, "capacity={capacity} rows={rows} ctx={ctx}");
+                assert!(
+                    rows * ns <= partial_rows,
+                    "capacity={capacity} rows={rows} ctx={ctx}"
+                );
                 assert!(ns <= ctx.div_ceil(32));
                 assert!(rows.div_ceil(64) * 8 * ns <= 304);
             }
@@ -2511,7 +2650,10 @@ fn small_mla_split_layout_refuses_unsafe_pairings() {
             10 => prog.insts[0].i[6] = 1,
             _ => prog.insts[1].i[5] = 1,
         }
-        assert!(mla_prefill::split_sites(&prog, &tensors).is_err(), "case {kind}");
+        assert!(
+            mla_prefill::split_sites(&prog, &tensors).is_err(),
+            "case {kind}"
+        );
     }
 }
 
@@ -3293,11 +3435,21 @@ fn prefill_arm_detect_selects_the_right_variant() {
     assert_eq!(PrefillArm::detect(&a4w4), PrefillArm::MlaMoeA4w4);
     assert_eq!(Variant::detect(&a4w4), Variant::Mxfp4);
     assert_eq!(
-        object_name(Phase::Prefill, Variant::Mxfp4, PrefillArm::MlaMoeA4w4, Sched::GlobalQueue),
+        object_name(
+            Phase::Prefill,
+            Variant::Mxfp4,
+            PrefillArm::MlaMoeA4w4,
+            Sched::GlobalQueue
+        ),
         "interp_prefill_mla_moe_a4w4_full_gq.elf"
     );
     assert_eq!(
-        object_name(Phase::Decode, Variant::Mxfp4, PrefillArm::MlaMoeA4w4, Sched::GlobalQueue),
+        object_name(
+            Phase::Decode,
+            Variant::Mxfp4,
+            PrefillArm::MlaMoeA4w4,
+            Sched::GlobalQueue
+        ),
         "interp_decode_mxfp4_gq.elf"
     );
 
@@ -3308,11 +3460,19 @@ fn prefill_arm_detect_selects_the_right_variant() {
         DevOp::MlaMergeFold,
     ])];
     assert_eq!(PrefillArm::detect(&mla_progs), PrefillArm::Mla);
-    let mxfp4_mla = vec![prog_with_ops(&[DevOp::FlashMlaPrefill, DevOp::GemmSmallMxfp4])];
+    let mxfp4_mla = vec![prog_with_ops(&[
+        DevOp::FlashMlaPrefill,
+        DevOp::GemmSmallMxfp4,
+    ])];
     assert_eq!(Variant::detect(&mxfp4_mla), Variant::Mxfp4);
     assert_eq!(PrefillArm::detect(&mxfp4_mla), PrefillArm::Mla);
     assert_eq!(
-        object_name(Phase::Prefill, Variant::Mxfp4, PrefillArm::Mla, Sched::GlobalQueue),
+        object_name(
+            Phase::Prefill,
+            Variant::Mxfp4,
+            PrefillArm::Mla,
+            Sched::GlobalQueue
+        ),
         "interp_prefill_mxfp4_mla_gq.elf"
     );
 
@@ -3890,13 +4050,25 @@ fn xalltoall_heads_geometry_checks_shape_object_and_arch() {
     // heads_per_group must divide nh_total and be a multiple of nh_l; the row-split O side
     // (4 groups of 16) is exactly as valid as the degenerate one-group case.
     prog.insts[0].fj[1] = 16;
-    assert!(ok(&prog, &tensors, "gfx942"), "group-major O source, 4 groups of 16");
+    assert!(
+        ok(&prog, &tensors, "gfx942"),
+        "group-major O source, 4 groups of 16"
+    );
     prog.insts[0].fj[1] = 0;
-    assert!(!ok(&prog, &tensors, "gfx942"), "heads_per_group must be nonzero");
+    assert!(
+        !ok(&prog, &tensors, "gfx942"),
+        "heads_per_group must be nonzero"
+    );
     prog.insts[0].fj[1] = 24;
-    assert!(!ok(&prog, &tensors, "gfx942"), "24 does not divide nh_total=64");
+    assert!(
+        !ok(&prog, &tensors, "gfx942"),
+        "24 does not divide nh_total=64"
+    );
     prog.insts[0].fj[1] = 12;
-    assert!(!ok(&prog, &tensors, "gfx942"), "12 is not a multiple of nh_l=8");
+    assert!(
+        !ok(&prog, &tensors, "gfx942"),
+        "12 is not a multiple of nh_l=8"
+    );
     prog.insts[0].fj[1] = 64;
 
     // The destination tensor must be bound and large enough.
@@ -4886,7 +5058,11 @@ fn ragged_rows_leave_sequence_parallel_band_packets_alone() {
 
     rebase_chunk_rows(&mut insts, &names, 0, CLEN, T, Some(T));
 
-    assert_eq!(insts[0].i[0], CLEN * H, "a full-width residual still shrinks");
+    assert_eq!(
+        insts[0].i[0],
+        CLEN * H,
+        "a full-width residual still shrinks"
+    );
     for k in 1..insts.len() {
         assert_eq!(insts[k].i, before[k].i, "instruction {k} was rewritten");
     }
@@ -4926,26 +5102,53 @@ fn ragged_seams_size_bands_and_split_collectives_by_live_rows() {
             inst(DevOp::GemmSmall, 3, [T / TP, 2048, H, 0, 0, 0, 0, 0]),
             inst(DevOp::MoeRouterTopkPf, 4, [0, 256, 8, 0, T / TP, 0, 1, 1]),
             inst(DevOp::XReduceScatter, 0, [T * H, TP, 0, 3, 0, 0, 0, 0]),
-            inst(DevOp::XAllGather, 5, [T * H, T * 512, T * 8 * 4, 4, TP, 0, 0, 0]),
+            inst(
+                DevOp::XAllGather,
+                5,
+                [T * H, T * 512, T * 8 * 4, 4, TP, 0, 0, 0],
+            ),
         ];
         rebase_chunk_rows(&mut insts, &names, 0, clen, T, Some(T));
         rebase_band_rows(&mut insts, &names, clen, T, TP);
         assert_eq!(ragged_band_rows(clen, T, TP), b, "clen={clen}");
-        assert!(TP * b >= clen && (b == 1 || TP * (b - 1) < clen), "clen={clen}");
-        assert_eq!(insts[0].i[0], clen * H, "a full-width packet shrinks to live rows");
+        assert!(
+            TP * b >= clen && (b == 1 || TP * (b - 1) < clen),
+            "clen={clen}"
+        );
+        assert_eq!(
+            insts[0].i[0],
+            clen * H,
+            "a full-width packet shrinks to live rows"
+        );
         assert_eq!(insts[1].i[0], b * H, "band residual, clen={clen}");
         assert_eq!(insts[2].i[..2], [b, H], "band norm, clen={clen}");
         assert_eq!(insts[3].i[..3], [b, 2048, H], "band GEMM, clen={clen}");
         assert_eq!(insts[4].i[4], b, "band top-k, clen={clen}");
-        assert_eq!(insts[5].i[..2], [TP * b * H, TP], "reduce-scatter, clen={clen}");
-        assert_eq!(insts[6].i[..5], [TP * b * H, TP * b * 512, TP * b * 32, 4, TP], "all-gather");
+        assert_eq!(
+            insts[5].i[..2],
+            [TP * b * H, TP],
+            "reduce-scatter, clen={clen}"
+        );
+        assert_eq!(
+            insts[6].i[..5],
+            [TP * b * H, TP * b * 512, TP * b * 32, 4, TP],
+            "all-gather"
+        );
         let n = insts[5].i[0] as u64;
         for r in 0..TP as u64 {
-            assert_eq!(n * r / TP as u64, r * b as u64 * H as u64, "rank {r}'s slice starts its band");
+            assert_eq!(
+                n * r / TP as u64,
+                r * b as u64 * H as u64,
+                "rank {r}'s slice starts its band"
+            );
         }
     }
     // A full chunk is left exactly as compiled.
-    let mut full = vec![inst(DevOp::XReduceScatter, 0, [T * H, TP, 0, 3, 0, 0, 0, 0])];
+    let mut full = vec![inst(
+        DevOp::XReduceScatter,
+        0,
+        [T * H, TP, 0, 3, 0, 0, 0, 0],
+    )];
     rebase_band_rows(&mut full, &names, T, T, TP);
     assert_eq!(full[0].i[0], T * H);
 }
@@ -4969,7 +5172,13 @@ fn ragged_seams_rebind_band_views_to_the_live_band() {
     .collect();
     let bases = [0x1000_0000u64, 0x9000_0000, 0, 0, 0];
     let row = [6144u64 * 2, 2048 * 2];
-    let lens = [T as u64 * row[0], T as u64 * 6144 * 2, (T / TP) as u64 * row[0], (T / TP) as u64 * row[1], 0];
+    let lens = [
+        T as u64 * row[0],
+        T as u64 * 6144 * 2,
+        (T / TP) as u64 * row[0],
+        (T / TP) as u64 * row[1],
+        0,
+    ];
     for rank in 0..TP {
         for b in [1u32, 2, 510, T / TP] {
             let v = ragged_band_views(&names, &bases, &lens, T, TP, rank, b);
@@ -4977,7 +5186,11 @@ fn ragged_seams_rebind_band_views_to_the_live_band() {
             assert_eq!(v[0], (2, bases[0] + (rank * b) as u64 * row[0]));
             assert_eq!(v[1], (3, bases[1] + (rank * b) as u64 * row[1]));
             if b == T / TP {
-                assert_eq!(v[0].1, bases[0] + rank as u64 * lens[2], "load-time binding");
+                assert_eq!(
+                    v[0].1,
+                    bases[0] + rank as u64 * lens[2],
+                    "load-time binding"
+                );
             }
         }
     }
@@ -5017,7 +5230,10 @@ fn ragged_seams_band_view_memo_is_keyed_by_band_family_not_program() {
         let ragged = ragged_band_views(&names, &bases, &lens, T, TP, rank, RAGGED);
         let loaded = ragged_band_views(&names, &bases, &lens, T, TP, rank, LOADED);
         assert_ne!(ragged[0].1, loaded[0].1, "rank {rank}");
-        assert_eq!(ragged[0].0, loaded[0].0, "one tensor slot, so one overwrites the other");
+        assert_eq!(
+            ragged[0].0, loaded[0].0,
+            "one tensor slot, so one overwrites the other"
+        );
     }
 
     // `rebind_band_views`'s decision, over the sequence that poisons: the ordinary program binds
@@ -5030,7 +5246,10 @@ fn ragged_seams_band_view_memo_is_keyed_by_band_family_not_program() {
         needed
     }
     let mut bound = std::collections::HashMap::new();
-    assert!(rebind(&mut bound, T, RAGGED), "the ragged ordinary chunk binds the shared views");
+    assert!(
+        rebind(&mut bound, T, RAGGED),
+        "the ragged ordinary chunk binds the shared views"
+    );
     assert!(
         rebind(&mut bound, T, LOADED),
         "the sibling MUST restore them, though it wants the load-time band"
@@ -5041,9 +5260,19 @@ fn ragged_seams_band_view_memo_is_keyed_by_band_family_not_program() {
     );
 
     // A different bucket is a different `@band{t}` family and is unaffected either way.
-    assert!(!rebind(&mut bound, 2048, 2048 / TP), "an exact 2048 rung never rebinds");
-    assert!(rebind(&mut bound, 2048, 64), "a ragged 2048 chunk binds its own family");
-    assert_eq!(bound.get(&T).copied(), Some(LOADED), "the 8192 family is untouched by it");
+    assert!(
+        !rebind(&mut bound, 2048, 2048 / TP),
+        "an exact 2048 rung never rebinds"
+    );
+    assert!(
+        rebind(&mut bound, 2048, 64),
+        "a ragged 2048 chunk binds its own family"
+    );
+    assert_eq!(
+        bound.get(&T).copied(),
+        Some(LOADED),
+        "the 8192 family is untouched by it"
+    );
 }
 
 #[test]
@@ -5833,7 +6062,10 @@ fn native_moe_decode_keeps_ordered_xcd_boundaries() {
 fn native_index_fp8_decode_keeps_ordered_boundaries() {
     let mut p = segmented_decode_probe();
     p.insts[1].op = DevOp::IndexFp8Decode as u16;
-    assert_eq!(decode_segment_kinds(&p).unwrap()[1], DecodeSegmentKind::IndexFp8);
+    assert_eq!(
+        decode_segment_kinds(&p).unwrap()[1],
+        DecodeSegmentKind::IndexFp8
+    );
     validate_decode_dispatch([(0, &p)]).unwrap();
     for bad in 0..4 {
         let mut p = segmented_decode_probe();
@@ -5963,16 +6195,44 @@ fn packed_prefill_predicate_admits_native_moe_and_gemm_lt_and_refuses_sparse_sel
         assert!(!token_batch_body_compatible(&sparse, true), "{refused:?}");
     }
     let spans = [
-        PrefillSpan { row0: 20, n_rows: 100, slot: 3, kv_row0: 4096, kv_len: 4196, ..Default::default() },
-        PrefillSpan { row0: 120, n_rows: 8, slot: 0, kv_row0: 2047, kv_len: 2055, ..Default::default() },
+        PrefillSpan {
+            row0: 20,
+            n_rows: 100,
+            slot: 3,
+            kv_row0: 4096,
+            kv_len: 4196,
+            ..Default::default()
+        },
+        PrefillSpan {
+            row0: 120,
+            n_rows: 8,
+            slot: 0,
+            kv_row0: 2047,
+            kv_len: 2055,
+            ..Default::default()
+        },
     ];
     let table = kv_span_table(&spans, 81920).unwrap();
     assert_eq!(
         table[0],
-        KvSpan { row0: 20, n_rows: 100, kv_row0: 4096, kv_len: 4196, kv_base: 3 * 81920, _pad: [0; 3] }
+        KvSpan {
+            row0: 20,
+            n_rows: 100,
+            kv_row0: 4096,
+            kv_len: 4196,
+            kv_base: 3 * 81920,
+            _pad: [0; 3]
+        }
     );
     assert_eq!((table[1].kv_base, table[1].kv_len), (0, 2055));
-    assert!(kv_span_table(&[PrefillSpan { slot: u32::MAX, ..Default::default() }], 81920).is_err());
+    assert!(kv_span_table(
+        &[PrefillSpan {
+            slot: u32::MAX,
+            ..Default::default()
+        }],
+        81920
+    )
+    .is_err());
 }
 
 /// A token-batch body whose one segment is the hipBLASLt projection `emit_glm_lt_gemm` emits at
@@ -6029,8 +6289,8 @@ fn token_batch_body_refuses_a_native_only_packet_without_its_route() {
     let route = crate::exec::amd_gemm_lt::routes(&prog, &tensors, 1).unwrap()[0]
         .expect("a GemmLtPf segment derives its hipBLASLt route");
     assert!(token_batch_body_native_routes(&prog, &[PrefillSegmentRoute::GemmLt(route)]).is_ok());
-    let err = token_batch_body_native_routes(&prog, &[PrefillSegmentRoute::Interpreter])
-        .unwrap_err();
+    let err =
+        token_batch_body_native_routes(&prog, &[PrefillSegmentRoute::Interpreter]).unwrap_err();
     assert!(err.contains("GemmLtPf"), "{err}");
     // The function ignores the body flag (a plain program is flagged too); `AmdProg` stores
     // `Ok(())` for non-body programs, which is where the check is scoped to bodies.
@@ -6063,11 +6323,15 @@ fn token_batch_seam_norms_stay_on_the_primary_object() {
         t: 8192,
         role,
         n_counter: 0,
-        stream: segs.iter().enumerate().map(|(i, &seg)| StreamEnt {
-            inst: i as u32,
-            seg,
-            ..Default::default()
-        }).collect(),
+        stream: segs
+            .iter()
+            .enumerate()
+            .map(|(i, &seg)| StreamEnt {
+                inst: i as u32,
+                seg,
+                ..Default::default()
+            })
+            .collect(),
         insts,
         stream_ofs: vec![],
         stream_len: vec![],
@@ -6077,24 +6341,30 @@ fn token_batch_seam_norms_stay_on_the_primary_object() {
         gq_seg_ofs: vec![],
         l2_domains: 0,
     };
-    let insts = || vec![
-        inst(DevOp::RmsNorm, 8192),
-        inst(DevOp::HeadNormRope, 32),
-        inst(DevOp::RmsNorm, 1024),
-        inst(DevOp::FlashMlaPrefillFp8, 8192),
-    ];
-    let body = ProgramRole::TokenBatchBody { band: 32, rows: 8192 };
+    let insts = || {
+        vec![
+            inst(DevOp::RmsNorm, 8192),
+            inst(DevOp::HeadNormRope, 32),
+            inst(DevOp::RmsNorm, 1024),
+            inst(DevOp::FlashMlaPrefillFp8, 8192),
+        ]
+    };
+    let body = ProgramRole::TokenBatchBody {
+        band: 32,
+        rows: 8192,
+    };
     let body_prog = prog(body, insts(), &[0, 1, 2, 3]);
     let body_families = derive_packed_segment_families(&body_prog).unwrap();
-    assert_eq!(
-        body_families,
-        [5, 5, 0, 6]
-    );
+    assert_eq!(body_families, [5, 5, 0, 6]);
     assert_eq!(
         derive_packed_plain_segments(&body_prog).unwrap(),
         [false, false, true, false]
     );
-    assert!(packed_family_segments_cover(&body_prog, &body_families, &[5, 6]));
+    assert!(packed_family_segments_cover(
+        &body_prog,
+        &body_families,
+        &[5, 6]
+    ));
     let mixed = prog(
         body,
         vec![inst(DevOp::RmsNorm, 1024), inst(DevOp::HeadNormRope, 8192)],
@@ -6104,8 +6374,14 @@ fn token_batch_seam_norms_stay_on_the_primary_object() {
     assert_eq!(derive_packed_plain_segments(&mixed).unwrap(), [false]);
     let plain = ProgramRole::PrefillBucket { rows: 8192 };
     let plain_prog = prog(plain, insts(), &[0, 1, 2, 3]);
-    assert_eq!(derive_packed_segment_families(&plain_prog).unwrap(), [5, 5, 5, 6]);
-    assert_eq!(derive_packed_plain_segments(&plain_prog).unwrap(), [false; 4]);
+    assert_eq!(
+        derive_packed_segment_families(&plain_prog).unwrap(),
+        [5, 5, 5, 6]
+    );
+    assert_eq!(
+        derive_packed_plain_segments(&plain_prog).unwrap(),
+        [false; 4]
+    );
 }
 
 #[test]
@@ -6119,7 +6395,11 @@ fn rowsplit_sibling_runs_only_full_chunks_with_every_key() {
         (at(65536, 4096), Some(7), 3),
         (at(65536, 8192), None, 3),
     ] {
-        assert_eq!(rowsplit_chunk_prog(step, 8192, sibling, false), want, "{step:?} {sibling:?}");
+        assert_eq!(
+            rowsplit_chunk_prog(step, 8192, sibling, false),
+            want,
+            "{step:?} {sibling:?}"
+        );
     }
 }
 
@@ -6137,24 +6417,44 @@ fn rowband_sibling_also_runs_full_chunks_whose_low_bands_read_every_key() {
         (at(65536, 8192), 7),
         (at(0, 4096), 3),
     ] {
-        assert_eq!(rowsplit_chunk_prog(step, 8192, Some(7), true), want, "{step:?}");
+        assert_eq!(
+            rowsplit_chunk_prog(step, 8192, Some(7), true),
+            want,
+            "{step:?}"
+        );
     }
 }
 
 #[test]
 fn column_shards_bind_as_views_of_their_full_twin() {
-    let t = |name: &str, bytes| crate::asset::devblob::DevTensor { name: name.into(), bytes, init: None };
+    let t = |name: &str, bytes| crate::asset::devblob::DevTensor {
+        name: name.into(),
+        bytes,
+        init: None,
+    };
     let qa = "model.layers.3.self_attn.derived.q_absorb.weight";
     let o = "model.layers.3.self_attn.o_proj.weight";
     let uv = "model.layers.3.self_attn.derived.v_absorb.weight";
-    let tensors = [t(qa, 100), t(o, 50), t(uv, 30), t("act.qa", 100), t(qa, 800), t(o, 400), t(uv, 240)];
+    let tensors = [
+        t(qa, 100),
+        t(o, 50),
+        t(uv, 30),
+        t("act.qa", 100),
+        t(qa, 800),
+        t(o, 400),
+        t(uv, 240),
+    ];
     assert_eq!(
         column_twins(&tensors, 8),
         [Some(4), None, Some(6), None, None, None, None],
         "column shards view their full twin wherever it is declared; row shards and activations copy"
     );
     assert_eq!(column_twins(&tensors, 1), [None; 7], "tp=1 binds whole");
-    assert_eq!(column_twins(&tensors[..4], 8), [None; 4], "no twin, no view");
+    assert_eq!(
+        column_twins(&tensors[..4], 8),
+        [None; 4],
+        "no twin, no view"
+    );
     assert_eq!(rowband_replicated_bytes(&tensors, 8), 800 + 400 + 3 * 240);
     assert_eq!(rowband_replicated_bytes(&tensors[..4], 8), 0);
 }
@@ -6164,18 +6464,38 @@ fn column_shards_bind_as_views_of_their_full_twin() {
 /// Only the FULL-width declaration is a twin — the shard it shadows still needs its own storage.
 #[test]
 fn rowband_twins_are_the_full_width_declarations_only() {
-    let t = |name: &str, bytes| crate::asset::devblob::DevTensor { name: name.into(), bytes, init: None };
+    let t = |name: &str, bytes| crate::asset::devblob::DevTensor {
+        name: name.into(),
+        bytes,
+        init: None,
+    };
     let qa = "model.layers.3.self_attn.derived.q_absorb.weight";
     let o = "model.layers.3.self_attn.o_proj.weight";
     let uv = "model.layers.3.self_attn.derived.v_absorb.weight";
-    let tensors = [t(qa, 100), t(o, 50), t(uv, 30), t("act.qa", 100), t(qa, 800), t(o, 400), t(uv, 240)];
+    let tensors = [
+        t(qa, 100),
+        t(o, 50),
+        t(uv, 30),
+        t("act.qa", 100),
+        t(qa, 800),
+        t(o, 400),
+        t(uv, 240),
+    ];
     assert_eq!(
         rowband_twin_ids(&tensors, 8),
         [false, false, false, false, true, true, true],
         "the 1/n_gpu shards and activations are bound as usual; only the full twins are skippable"
     );
-    assert_eq!(rowband_twin_ids(&tensors, 1), [false; 7], "tp=1 declares no twins");
-    assert_eq!(rowband_twin_ids(&tensors[..4], 8), [false; 4], "no full declaration, nothing to skip");
+    assert_eq!(
+        rowband_twin_ids(&tensors, 1),
+        [false; 7],
+        "tp=1 declares no twins"
+    );
+    assert_eq!(
+        rowband_twin_ids(&tensors[..4], 8),
+        [false; 4],
+        "no full declaration, nothing to skip"
+    );
     // The skippable bytes are exactly what the load-time refusal prices, minus the fold's FP32 copy
     // (made at run time, not declared), so the two views of the cost cannot drift apart.
     let skipped: u64 = tensors

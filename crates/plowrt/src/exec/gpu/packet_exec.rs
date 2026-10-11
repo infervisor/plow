@@ -18,13 +18,22 @@ use crate::{Result, RuntimeError};
 /// The speech object and its entry symbol for a compute capability.
 fn speech_object(cc: (u32, u32)) -> (&'static str, &'static str) {
     match cc {
-        (8, 9) => ("interp_sm89_speech.cubin", "_Z18interp_sm89_speech11PlowProgram"),
-        _ => ("interp_sm90a_speech.cubin", "_Z19interp_sm90a_speech11PlowProgram"),
+        (8, 9) => (
+            "interp_sm89_speech.cubin",
+            "_Z18interp_sm89_speech11PlowProgram",
+        ),
+        _ => (
+            "interp_sm90a_speech.cubin",
+            "_Z19interp_sm90a_speech11PlowProgram",
+        ),
     }
 }
 fn in_range(mem: &DeviceMem, offset: usize, bytes: usize) -> Result<()> {
     if offset as u64 + bytes as u64 > mem.len {
-        return Err(RuntimeError::Device(format!("packet transfer out of range: off {offset} + {bytes} > {}", mem.len)));
+        return Err(RuntimeError::Device(format!(
+            "packet transfer out of range: off {offset} + {bytes} > {}",
+            mem.len
+        )));
     }
     Ok(())
 }
@@ -43,7 +52,10 @@ fn speech_ops(blob: &DevBlob) -> u64 {
 
 fn missing_speech_ops(required: u64, compiled: u64) -> Vec<u32> {
     let missing = required & !compiled;
-    (0..64).filter(|b| missing >> b & 1 != 0).map(|b| b + SPEECH_OP0).collect()
+    (0..64)
+        .filter(|b| missing >> b & 1 != 0)
+        .map(|b| b + SPEECH_OP0)
+        .collect()
 }
 
 #[cfg(test)]
@@ -113,16 +125,25 @@ impl CudaPacketRuntime {
 
     pub fn load_on(be: Arc<CudaBackend>, path: &Path) -> Result<Self> {
         let ordinal = be.device_ordinal;
-        let raw = std::fs::read(path).map_err(|source| RuntimeError::Io { path: path.to_path_buf(), source })?;
+        let raw = std::fs::read(path).map_err(|source| RuntimeError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
         let blob = DevBlob::parse(&raw)?;
         crate::certificate_checks::check_sidecar(path, &raw, &blob)?;
         if !blob.gen.is_empty() || blob.tp.is_some() {
-            return Err(RuntimeError::Rejected(format!("{}: generated tensors or TP are not supported by the CUDA packet runtime", path.display())));
+            return Err(RuntimeError::Rejected(format!(
+                "{}: generated tensors or TP are not supported by the CUDA packet runtime",
+                path.display()
+            )));
         }
         let dir = path.parent().unwrap_or(Path::new("."));
         let (file, symbol) = speech_object(be.compute_capability());
         let object = dir.join(file);
-        let image = std::fs::read(&object).map_err(|source| RuntimeError::Io { path: object.clone(), source })?;
+        let image = std::fs::read(&object).map_err(|source| RuntimeError::Io {
+            path: object.clone(),
+            source,
+        })?;
         let module = be.module_load(&image)?;
         let function = be.get_function(&module, symbol)?;
         if let (Some(lo), Some(hi)) = (
@@ -138,16 +159,25 @@ impl CudaPacketRuntime {
                 )));
             }
         }
-        let smem = be.module_global_u32(&module, "plow_arena_bytes_speech")?.unwrap_or(49152);
+        let smem = be
+            .module_global_u32(&module, "plow_arena_bytes_speech")?
+            .unwrap_or(49152);
         if let Some(limit) = crate::config::RuntimeConfig::debug_max_inst() {
             if be.module_global_set_u32(&module, "plow_debug_max_inst_speech", limit)? {
-                tracing::warn!(limit, "packet runtime: instructions at or past the limit are skipped");
+                tracing::warn!(
+                    limit,
+                    "packet runtime: instructions at or past the limit are skipped"
+                );
             }
         }
         be.set_max_dynamic_smem(function, smem)?;
         let capacity = be.occupancy_blocks_per_sm(function, BLOCK, smem as usize)? * be.sm_count();
         if blob.n_cu == 0 || blob.n_cu > capacity {
-            return Err(RuntimeError::Rejected(format!("{}: n_cu {} exceeds cooperative capacity {capacity}", path.display(), blob.n_cu)));
+            return Err(RuntimeError::Rejected(format!(
+                "{}: n_cu {} exceeds cooperative capacity {capacity}",
+                path.display(),
+                blob.n_cu
+            )));
         }
 
         let mut tensors = Vec::with_capacity(blob.tensors.len());
@@ -168,16 +198,25 @@ impl CudaPacketRuntime {
             .iter()
             .map(|p| {
                 let segments = p.gq_seg_ofs.len().saturating_sub(1);
-                ((p.n_counter as usize * CTR_STRIDE as usize * 4).max(4), segments * CTR_STRIDE as usize * 4)
+                (
+                    (p.n_counter as usize * CTR_STRIDE as usize * 4).max(4),
+                    segments * CTR_STRIDE as usize * 4,
+                )
             })
             .collect();
-        let slab_bytes: usize = regions.iter().map(|&(c, k)| (c + k).next_multiple_of(256)).sum();
+        let slab_bytes: usize = regions
+            .iter()
+            .map(|&(c, k)| (c + k).next_multiple_of(256))
+            .sum();
         let counter_slab = be.alloc(0, slab_bytes.max(4) as u64)?;
         let mut slab_offset = 0u64;
         let mut programs = Vec::with_capacity(blob.progs.len());
         for (p, &(counter_only, cursor_bytes)) in blob.progs.iter().zip(&regions) {
             if p.gq_seg_ofs.len() < 2 || p.l2_domains != 0 {
-                return Err(RuntimeError::Rejected(format!("{}: program needs an unplaced global-queue stream", path.display())));
+                return Err(RuntimeError::Rejected(format!(
+                    "{}: program needs an unplaced global-queue stream",
+                    path.display()
+                )));
             }
             let segments = p.gq_seg_ofs.len() - 1;
             let upload = |bytes: &[u8]| -> Result<DeviceMem> {
@@ -231,7 +270,16 @@ impl CudaPacketRuntime {
                 segments,
                 counters,
                 counter_bytes: counter_only + cursor_bytes,
-                _tables: vec![d_inst, d_stream, d_sofs, d_slen, d_waits, d_succs, d_gq_stream, d_gq_seg],
+                _tables: vec![
+                    d_inst,
+                    d_stream,
+                    d_sofs,
+                    d_slen,
+                    d_waits,
+                    d_succs,
+                    d_gq_stream,
+                    d_gq_seg,
+                ],
             });
         }
         // The init copies and memsets ran on the legacy stream, which the non-blocking packet
@@ -257,7 +305,9 @@ impl CudaPacketRuntime {
             last_us: 0.0,
             _resident: {
                 let token = Arc::new(());
-                residents().lock().push((dir.to_path_buf(), ordinal, Arc::downgrade(&token)));
+                residents()
+                    .lock()
+                    .push((dir.to_path_buf(), ordinal, Arc::downgrade(&token)));
                 token
             },
         })
@@ -265,7 +315,8 @@ impl CudaPacketRuntime {
 
     /// Skip every instruction at or past `limit` (per-instruction cost by caps).
     pub fn set_debug_max_inst(&self, limit: u32) -> Result<bool> {
-        self.be.module_global_set_u32(&self.module, "plow_debug_max_inst_speech", limit)
+        self.be
+            .module_global_set_u32(&self.module, "plow_debug_max_inst_speech", limit)
     }
 
     pub fn backend(&self) -> &Arc<CudaBackend> {
@@ -279,22 +330,32 @@ impl CudaPacketRuntime {
 
     fn enqueue(&self, programs: &[usize]) -> Result<()> {
         let consecutive = programs.windows(2).all(|w| w[1] == w[0] + 1);
-        if let (true, Some(&first), Some(&last)) = (consecutive, programs.first(), programs.last()) {
+        if let (true, Some(&first), Some(&last)) = (consecutive, programs.first(), programs.last())
+        {
             let (first, last) = (&self.programs[first], &self.programs[last]);
             let bytes = (last.counters + last.counter_bytes as u64 - first.counters) as usize;
-            self.be.memset_d8_async(first.counters, 0, bytes, &self.stream)?;
+            self.be
+                .memset_d8_async(first.counters, 0, bytes, &self.stream)?;
         }
         for &program in programs {
             let p = &self.programs[program];
             if !consecutive {
-                self.be.memset_d8_async(p.counters, 0, p.counter_bytes, &self.stream)?;
+                self.be
+                    .memset_d8_async(p.counters, 0, p.counter_bytes, &self.stream)?;
             }
             for seg in 0..p.segments {
                 let mut arg = p.kernarg;
                 arg.gq_seg_ofs += (seg * 4) as u64;
                 arg.gq_cursor += (seg * CTR_STRIDE as usize * 4) as u64;
                 let mut params = [&mut arg as *mut DevProgram as *mut std::ffi::c_void];
-                self.be.launch_cooperative(self.function, self.grid, BLOCK, self.smem, &mut params, Some(&self.stream))?;
+                self.be.launch_cooperative(
+                    self.function,
+                    self.grid,
+                    BLOCK,
+                    self.smem,
+                    &mut params,
+                    Some(&self.stream),
+                )?;
             }
         }
         Ok(())
@@ -305,26 +366,37 @@ impl CudaPacketRuntime {
     fn upload(&self, mem: &DeviceMem, offset: usize, bytes: &[u8]) -> Result<()> {
         in_range(mem, offset, bytes.len())?;
         // SAFETY: `bytes` outlives the copy (synchronized below); the range is inside `mem`.
-        unsafe { self.be.memcpy_htod_async(mem.base + offset as u64, bytes, &self.stream)? };
+        unsafe {
+            self.be
+                .memcpy_htod_async(mem.base + offset as u64, bytes, &self.stream)?
+        };
         self.be.stream_synchronize(&self.stream)
     }
 
     fn download(&self, mem: &DeviceMem, offset: usize, bytes: &mut [u8]) -> Result<()> {
         in_range(mem, offset, bytes.len())?;
         // SAFETY: as `upload`.
-        unsafe { self.be.memcpy_dtoh_async(bytes, mem.base + offset as u64, &self.stream)? };
+        unsafe {
+            self.be
+                .memcpy_dtoh_async(bytes, mem.base + offset as u64, &self.stream)?
+        };
         self.be.stream_synchronize(&self.stream)
     }
 
     fn mem(&self, t: PacketTensor) -> Result<&DeviceMem> {
-        self.tensors.get(t.handle).ok_or_else(|| RuntimeError::Device(format!("packet tensor handle {} is missing", t.handle)))
+        self.tensors.get(t.handle).ok_or_else(|| {
+            RuntimeError::Device(format!("packet tensor handle {} is missing", t.handle))
+        })
     }
 }
 
 impl PacketRuntime for CudaPacketRuntime {
     fn tensor(&self, name: &str) -> Option<PacketTensor> {
         let handle = self.names.iter().position(|n| n == name)?;
-        Some(PacketTensor { handle, bytes: self.tensors[handle].len as usize })
+        Some(PacketTensor {
+            handle,
+            bytes: self.tensors[handle].len as usize,
+        })
     }
 
     fn write_tensor(&mut self, tensor: PacketTensor, bytes: &[u8]) -> Result<()> {
@@ -360,18 +432,35 @@ impl PacketRuntime for CudaPacketRuntime {
         bytes: usize,
     ) -> Result<()> {
         let (s, t) = (self.mem(source)?, self.mem(target)?);
-        check_copy(source, s.len as usize, source_offset, target, t.len as usize, target_offset, bytes)?;
-        self.be.memcpy_dtod_async(t.base + target_offset as u64, s.base + source_offset as u64, bytes as u64, &self.stream)
+        check_copy(
+            source,
+            s.len as usize,
+            source_offset,
+            target,
+            t.len as usize,
+            target_offset,
+            bytes,
+        )?;
+        self.be.memcpy_dtod_async(
+            t.base + target_offset as u64,
+            s.base + source_offset as u64,
+            bytes as u64,
+            &self.stream,
+        )
     }
 
     fn create_tensor(&mut self, bytes: usize) -> Result<PacketTensor> {
         let mem = self.be.alloc(0, (bytes as u64).max(4))?;
-        self.be.memset_d8_async(mem.base, 0, mem.len as usize, &self.stream)?;
+        self.be
+            .memset_d8_async(mem.base, 0, mem.len as usize, &self.stream)?;
         self.be.stream_synchronize(&self.stream)?;
         self.tensors.push(mem);
         // Unnamed: `tensor(name)` never resolves it; only its handle does.
         self.names.push(String::new());
-        Ok(PacketTensor { handle: self.tensors.len() - 1, bytes })
+        Ok(PacketTensor {
+            handle: self.tensors.len() - 1,
+            bytes,
+        })
     }
 
     fn run(&mut self, program: usize) -> Result<()> {
@@ -382,10 +471,15 @@ impl PacketRuntime for CudaPacketRuntime {
     /// CUDA graph after the first run of a sequence; one sync.
     fn run_sequence(&mut self, programs: &[usize]) -> Result<()> {
         if let Some(&bad) = programs.iter().find(|&&p| p >= self.programs.len()) {
-            return Err(RuntimeError::Rejected(format!("packet program {bad} is missing")));
+            return Err(RuntimeError::Rejected(format!(
+                "packet program {bad} is missing"
+            )));
         }
         if !self.graphs.contains_key(programs) {
-            let graph = match self.be.graph_capture(&self.stream, || self.enqueue(programs)) {
+            let graph = match self
+                .be
+                .graph_capture(&self.stream, || self.enqueue(programs))
+            {
                 Ok(g) => Some(g),
                 Err(error) => {
                     tracing::warn!(%error, programs = programs.len(), "packet sequence graph capture failed; launching directly");

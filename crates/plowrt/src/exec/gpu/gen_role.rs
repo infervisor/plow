@@ -39,7 +39,10 @@ pub(super) fn load_generated_role(
     }
     let module = DecodeModule::load(be, &image)?;
     for (name, want) in [
-        ("plow_gen_flash_prefill_abi", if abi.fp8_kv() { 2 } else { 1 }),
+        (
+            "plow_gen_flash_prefill_abi",
+            if abi.fp8_kv() { 2 } else { 1 },
+        ),
         ("plow_gen_block", abi.block),
         ("plow_gen_arena_bytes", abi.smem),
         ("plow_attention_head_dim", attention.head_dim),

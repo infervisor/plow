@@ -19,11 +19,35 @@ pub(crate) fn outputs(d: &DevInst64) -> Result<&'static [usize], String> {
         AddNorm | NormResidualNorm | MlaBmmFp8 => 4,
         GemmFp8Block128 => 5,
         // Generic speech FP32 ops (runtime/nvidia/op_speech_f32.cuh): out = t0, inputs after it.
-        Q8GemmF32 | LayerNormF32 | ScaledAddF32 | GluF32 | CausalDepthwiseConv1dF32
-        | RelativeAttentionF32 | SiluF32 | DenseGemmF32 | EmbedF16F32 | ArgmaxF32 | ReluF32
-        | BroadcastAddF32 | Conv2dF32 | PackNcfwRowsF32 | GroupedAttentionF32 | EmbedOverlayBf16
-        | GemmF32 | GatherRowsF32 | CopyColsF32 | Conv1dF32 | ConvTranspose1dF32 | UnaryF32
-        | BinaryF32 | CumSumF64 | RandF32 | AttentionF32 | RowStatsF32 | RmsNormF32 | RopeAxialF32 => 2,
+        Q8GemmF32
+        | LayerNormF32
+        | ScaledAddF32
+        | GluF32
+        | CausalDepthwiseConv1dF32
+        | RelativeAttentionF32
+        | SiluF32
+        | DenseGemmF32
+        | EmbedF16F32
+        | ArgmaxF32
+        | ReluF32
+        | BroadcastAddF32
+        | Conv2dF32
+        | PackNcfwRowsF32
+        | GroupedAttentionF32
+        | EmbedOverlayBf16
+        | GemmF32
+        | GatherRowsF32
+        | CopyColsF32
+        | Conv1dF32
+        | ConvTranspose1dF32
+        | UnaryF32
+        | BinaryF32
+        | CumSumF64
+        | RandF32
+        | AttentionF32
+        | RowStatsF32
+        | RmsNormF32
+        | RopeAxialF32 => 2,
         ChunkAttentionF32 => 5,
         LstmCellF32 => 3,
         _ => return Err(format!("unaudited logical effects for {op:?}")),
@@ -44,11 +68,35 @@ pub(crate) fn outputs(d: &DevInst64) -> Result<&'static [usize], String> {
         // The split-K workspace (tickets + partials) is written by every DenseGemmF32 sharing it.
         DenseGemmF32 if d.t[4] != TENSOR_NONE16 => Ok(&[0, 4]),
         LstmCellF32 => Ok(&[0, 1]),
-        Q8GemmF32 | LayerNormF32 | ScaledAddF32 | GluF32 | CausalDepthwiseConv1dF32
-        | RelativeAttentionF32 | SiluF32 | DenseGemmF32 | EmbedF16F32 | ArgmaxF32 | ReluF32
-        | BroadcastAddF32 | Conv2dF32 | PackNcfwRowsF32 | GroupedAttentionF32 | EmbedOverlayBf16
-        | GemmF32 | GatherRowsF32 | CopyColsF32 | Conv1dF32 | ConvTranspose1dF32 | UnaryF32
-        | BinaryF32 | CumSumF64 | RandF32 | AttentionF32 | RowStatsF32 | RmsNormF32 | RopeAxialF32
+        Q8GemmF32
+        | LayerNormF32
+        | ScaledAddF32
+        | GluF32
+        | CausalDepthwiseConv1dF32
+        | RelativeAttentionF32
+        | SiluF32
+        | DenseGemmF32
+        | EmbedF16F32
+        | ArgmaxF32
+        | ReluF32
+        | BroadcastAddF32
+        | Conv2dF32
+        | PackNcfwRowsF32
+        | GroupedAttentionF32
+        | EmbedOverlayBf16
+        | GemmF32
+        | GatherRowsF32
+        | CopyColsF32
+        | Conv1dF32
+        | ConvTranspose1dF32
+        | UnaryF32
+        | BinaryF32
+        | CumSumF64
+        | RandF32
+        | AttentionF32
+        | RowStatsF32
+        | RmsNormF32
+        | RopeAxialF32
         | ChunkAttentionF32 => Ok(&[0]),
         op => Err(format!("unaudited logical effects for {op:?}")),
     }
@@ -66,8 +114,11 @@ struct Band {
 fn band(d: &DevInst64, slot: usize) -> Option<Band> {
     let make = |stride: u32, offset: u32, cols: u32, item_stride: u32| {
         let hi = offset.checked_add(cols)?;
-        (stride > 0 && cols > 0 && hi <= stride && item_stride % stride == 0)
-            .then_some(Band { stride, lo: offset, hi })
+        (stride > 0 && cols > 0 && hi <= stride && item_stride % stride == 0).then_some(Band {
+            stride,
+            lo: offset,
+            hi,
+        })
     };
     match (DevOp::from_u16(d.op)?, slot) {
         // out[b*j1 + r*i5 + i6 + c], x[b*j0 + r*i3 + i4 + c], c < i2 (the prefix format, i7
@@ -75,9 +126,12 @@ fn band(d: &DevInst64, slot: usize) -> Option<Band> {
         (DevOp::CopyColsF32, 0) if d.i[7] & 1 == 0 => make(d.i[5], d.i[6], d.i[2], d.fj[2]),
         (DevOp::CopyColsF32, 1) => make(d.i[3], d.i[4], d.i[2], d.fj[1]),
         // out[r*(j0 or width) + j1 + c], c < width.
-        (DevOp::GatherRowsF32, 0) => {
-            make(if d.fj[1] == 0 { d.i[1] } else { d.fj[1] }, d.fj[2], d.i[1], 0)
-        }
+        (DevOp::GatherRowsF32, 0) => make(
+            if d.fj[1] == 0 { d.i[1] } else { d.fj[1] },
+            d.fj[2],
+            d.i[1],
+            0,
+        ),
         _ => None,
     }
 }
@@ -178,8 +232,10 @@ pub fn coarse_protocol(program: &Program<'_>) -> Result<Value, String> {
     for (source, target) in edges {
         waits[target].push(source);
     }
-    Ok(json!({"waits":waits,"succs":(0..n).map(|i|vec![i]).collect::<Vec<_>>(),
-        "resource":(0..n).collect::<Vec<_>>(),"stream_idx":vec![0;n],"threshold":{}}))
+    Ok(
+        json!({"waits":waits,"succs":(0..n).map(|i|vec![i]).collect::<Vec<_>>(),
+        "resource":(0..n).collect::<Vec<_>>(),"stream_idx":vec![0;n],"threshold":{}}),
+    )
 }
 
 /// One task per complete instruction, plus entry/exit sentinels. Each tensor
@@ -226,7 +282,9 @@ pub fn obligation(packet: &Packet<'_>, index: usize) -> Result<Value, String> {
                 .entry(handle)
                 .or_default()
                 .entry(pc + 1)
-                .and_modify(|prior| *prior = (prior.0 | write, prior.1.filter(|b| Some(*b) == band)))
+                .and_modify(|prior| {
+                    *prior = (prior.0 | write, prior.1.filter(|b| Some(*b) == band))
+                })
                 .or_insert((write, band));
         }
     }
@@ -256,9 +314,9 @@ pub fn obligation(packet: &Packet<'_>, index: usize) -> Result<Value, String> {
         // Bands are comparable only under one stride, and a whole-tensor access covers every
         // residue only when the stride fits the tensor.
         let mut strides = tasks.values().filter_map(|(_, b)| b.map(|b| b.stride));
-        let banded = strides.next().filter(|&s| {
-            strides.all(|t| t == s) && u64::from(s) * 4 <= tensor.bytes
-        });
+        let banded = strides
+            .next()
+            .filter(|&s| strides.all(|t| t == s) && u64::from(s) * 4 <= tensor.bytes);
         let extent = |band: Option<Band>| match band.filter(|_| banded.is_some()) {
             Some(b) => (u64::from(b.lo) * 4, u64::from(b.hi - b.lo) * 4),
             None => (0, tensor.bytes),

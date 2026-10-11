@@ -1009,7 +1009,8 @@ pub(super) fn run(
             false,
             true,
         ));
-        let manifest = modular::build_modular_manifest(c.layers, modular_progs, &buckets, &[dbatch]);
+        let manifest =
+            modular::build_modular_manifest(c.layers, modular_progs, &buckets, &[dbatch]);
         sections.push(modular::modular_pipeline_section(&manifest));
     }
     modular::update_section_with_lean(&mut sections, &lean);

@@ -28,7 +28,10 @@ pub enum ReasoningMode {
     /// `<think>` … `</think>`, opened by the prompt or by the generation.
     ThinkTag,
     /// Another marker pair, from the packet's `serve.json` (leaked once per loaded model).
-    Tags { open: &'static str, close: &'static str },
+    Tags {
+        open: &'static str,
+        close: &'static str,
+    },
 }
 
 const OPEN: &str = "<think>";
@@ -41,7 +44,12 @@ impl ReasoningMode {
         if !serve.from_packet {
             return ReasoningMode::ThinkTag;
         }
-        match serve.manifest.chat.as_ref().and_then(|c| c.reasoning.as_ref()) {
+        match serve
+            .manifest
+            .chat
+            .as_ref()
+            .and_then(|c| c.reasoning.as_ref())
+        {
             None => ReasoningMode::None,
             Some(t) if t.open == OPEN && t.close == CLOSE => ReasoningMode::ThinkTag,
             Some(t) if !t.open.is_empty() && !t.close.is_empty() => ReasoningMode::Tags {
@@ -77,7 +85,8 @@ impl ReasoningMode {
     pub fn prompt_opens(self, prompt: &str) -> bool {
         // Whitespace after the marker is the template's (Qwen3.5 `<think>\n`, Gemma 4
         // `<|channel>thought\n`).
-        self.markers().is_some_and(|(open, _)| prompt.trim_end().ends_with(open))
+        self.markers()
+            .is_some_and(|(open, _)| prompt.trim_end().ends_with(open))
     }
 
     /// The marker that closes a trace, when the mode splits one.
@@ -87,11 +96,21 @@ impl ReasoningMode {
 
     /// The packet's declared framing, else the one the chat template's model writes (a packet
     /// that declares none and whose template has a known trace channel, e.g. Gemma 4).
-    pub fn resolve(serve: &crate::asset::serve::ServeInfo, template: Option<(&'static str, &'static str)>) -> Self {
-        let declared = serve.from_packet && serve.manifest.chat.as_ref().is_some_and(|c| c.reasoning.is_some());
+    pub fn resolve(
+        serve: &crate::asset::serve::ServeInfo,
+        template: Option<(&'static str, &'static str)>,
+    ) -> Self {
+        let declared = serve.from_packet
+            && serve
+                .manifest
+                .chat
+                .as_ref()
+                .is_some_and(|c| c.reasoning.is_some());
         match template {
             // `<think>` stays the packet's call: its emit reads the tokenizer for it.
-            Some((open, close)) if !declared && (open, close) != (OPEN, CLOSE) => ReasoningMode::Tags { open, close },
+            Some((open, close)) if !declared && (open, close) != (OPEN, CLOSE) => {
+                ReasoningMode::Tags { open, close }
+            }
             _ => Self::from_serve(serve),
         }
     }
@@ -496,7 +515,10 @@ mod tests {
 
     #[test]
     fn packet_declared_markers_split_the_trace() {
-        let mode = ReasoningMode::Tags { open: "<|think|>", close: "<|/think|>" };
+        let mode = ReasoningMode::Tags {
+            open: "<|think|>",
+            close: "<|/think|>",
+        };
         assert!(mode.prompt_opens("...<|think|>"));
         assert!(!ReasoningMode::None.prompt_opens("...<think>"));
         let (r, c) = split(mode, false, "<|think|>plan<|/think|>answer");

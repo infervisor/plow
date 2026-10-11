@@ -85,12 +85,20 @@ pub fn carried_reads(
 impl Manifest {
     pub fn validate(&self, prefill_programs: usize) -> Result<(), String> {
         if self.version != VERSION {
-            return Err(format!("kv-shared tail: version {} unsupported", self.version));
+            return Err(format!(
+                "kv-shared tail: version {} unsupported",
+                self.version
+            ));
         }
         if self.boundaries.len() != prefill_programs {
             return Err("kv-shared tail: one boundary per prefill program required".into());
         }
-        if self.carried.is_empty() || self.carried.iter().any(|c| c.row_bytes == 0 || c.row_bytes % 16 != 0) {
+        if self.carried.is_empty()
+            || self
+                .carried
+                .iter()
+                .any(|c| c.row_bytes == 0 || c.row_bytes % 16 != 0)
+        {
             return Err("kv-shared tail: carried rows must be non-empty 16-byte multiples".into());
         }
         Ok(())

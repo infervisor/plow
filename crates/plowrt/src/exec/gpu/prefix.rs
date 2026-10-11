@@ -271,7 +271,9 @@ impl GpuEngine {
             .map(|c| c as u32)
             .unwrap_or(packet_max_ctx)
             .min(packet_max_ctx);
-        let Some(mut geo) = kv.and_then(|kv| crate::memory::vmm::VmmGeometry::from_kv(kv, max_ctx, batch)) else {
+        let Some(mut geo) =
+            kv.and_then(|kv| crate::memory::vmm::VmmGeometry::from_kv(kv, max_ctx, batch))
+        else {
             tracing::warn!("vmm off: no usable KV geometry in the serve manifest");
             return None;
         };
@@ -434,7 +436,10 @@ impl GpuEngine {
                         .iter()
                         .flat_map(|&(k, v)| [(k, scale_stride), (v, scale_stride)]),
                 )
-                .map(|(tensor, slot_bytes)| crate::memory::vmm::LiveRingTensor { tensor, slot_bytes })
+                .map(|(tensor, slot_bytes)| crate::memory::vmm::LiveRingTensor {
+                    tensor,
+                    slot_bytes,
+                })
                 .collect();
             let rings = crate::memory::vmm::VmmRings::new_idle_backed(
                 Arc::clone(be) as Arc<dyn crate::memory::vmm::VmmOps>,
@@ -517,7 +522,9 @@ impl GpuEngine {
     /// ordered by absolute position `p_a-window..p_a`; each head is at most
     /// two runs (ring wrap).
     pub(super) fn vmm_slide_copy(&self, b: usize, p_a: u32, buf: u64, to_snap: bool) -> Result<()> {
-        let (v, kv) = self.vmm_prefix().expect("vmm_slide_copy without prefix vmm");
+        let (v, kv) = self
+            .vmm_prefix()
+            .expect("vmm_slide_copy without prefix vmm");
         if v.slide.is_empty() {
             return Ok(());
         }
@@ -564,7 +571,9 @@ impl GpuEngine {
     /// cudaMalloc `[batch][kvh][max_ctx]` f32 and slot reuse overwrites them,
     /// so the shared prefix's scales can only survive in the snapshot.
     pub(super) fn vmm_scale_copy(&self, b: usize, p_a: u32, buf: u64, to_snap: bool) -> Result<()> {
-        let (v, kv) = self.vmm_prefix().expect("vmm_scale_copy without prefix vmm");
+        let (v, kv) = self
+            .vmm_prefix()
+            .expect("vmm_scale_copy without prefix vmm");
         let g = kv.geometry();
         let ring = v.ring;
         let mut off = buf;
@@ -606,7 +615,9 @@ impl GpuEngine {
     /// Bytes region 3 occupies for a boundary at `p_a` rows (0 unless the
     /// full layers are fp8).
     pub(super) fn vmm_full_scale_bytes(&self, p_a: u32) -> u64 {
-        let Some((v, kv)) = self.vmm_prefix() else { return 0 };
+        let Some((v, kv)) = self.vmm_prefix() else {
+            return 0;
+        };
         let g = kv.geometry();
         v.full_scale.len() as u64 * 2 * g.kvh_full as u64 * p_a as u64 * 4
     }
@@ -685,7 +696,12 @@ impl GpuEngine {
     /// Consult the prefix cache for slot `b`'s prompt and attach a published
     /// prefix: multi-map the shared full-layer blocks, restore the sliding
     /// windows and private partial block, then advance the prefill frontier.
-    pub(super) fn vmm_attach(&mut self, b: usize, prompt: &[u32], key: Option<crate::memory::vmm::PrefixKey>) -> Result<()> {
+    pub(super) fn vmm_attach(
+        &mut self,
+        b: usize,
+        prompt: &[u32],
+        key: Option<crate::memory::vmm::PrefixKey>,
+    ) -> Result<()> {
         let staged = self.staged_prefix[b].take();
         let Some((_, kv)) = self.vmm_prefix() else {
             return Ok(());
@@ -693,7 +709,13 @@ impl GpuEngine {
         let att = kv.try_attach_keyed(b, prompt, key.or(staged))?;
         let attached = att.is_some();
         let att_rows = att.as_ref().map(|a| a.rows).unwrap_or(0);
-        tracing::info!(slot = b, prompt = prompt.len(), attached, att_rows, "vmm_attach query");
+        tracing::info!(
+            slot = b,
+            prompt = prompt.len(),
+            attached,
+            att_rows,
+            "vmm_attach query"
+        );
         let Some(a) = att else {
             return Ok(());
         };
@@ -732,7 +754,10 @@ impl GpuEngine {
 
     /// VMM prefix-sharing counters; `None` when `PLOW_VMM_PREFIX` is off.
     pub fn vmm_stats(&self) -> Option<crate::memory::vmm::VmmStats> {
-        self.vmm.as_ref().and_then(|v| v.kv.as_ref()).map(|kv| kv.stats())
+        self.vmm
+            .as_ref()
+            .and_then(|v| v.kv.as_ref())
+            .map(|kv| kv.stats())
     }
 
     pub fn live_ring_stats(&self) -> Option<crate::memory::vmm::LiveRingStats> {
@@ -745,12 +770,17 @@ impl GpuEngine {
     /// Engine-lock-free stats reader for `/metrics`; `None` when
     /// `PLOW_VMM_PREFIX` is off.
     pub fn vmm_stats_handle(&self) -> Option<crate::memory::vmm::VmmStatsHandle> {
-        self.vmm.as_ref().and_then(|v| v.kv.as_ref()).map(|kv| kv.stats_handle())
+        self.vmm
+            .as_ref()
+            .and_then(|v| v.kv.as_ref())
+            .map(|kv| kv.stats_handle())
     }
 
     /// Engine-lock-free attach probe for the mux's admission order; `None` without prefix reuse.
     pub fn vmm_prefix_probe(&self) -> Option<crate::memory::vmm::PrefixProbe> {
-        self.vmm.as_ref().and_then(|v| v.kv.as_ref()?.prefix_probe())
+        self.vmm
+            .as_ref()
+            .and_then(|v| v.kv.as_ref()?.prefix_probe())
     }
 
     /// Rows slot `b`'s current sequence attached from the prefix cache
@@ -773,7 +803,12 @@ impl GpuEngine {
     }
 
     /// [`Self::attach_prompt`] with the prompt's block hashes already computed.
-    pub fn attach_prompt_keyed(&mut self, b: usize, prompt: &[u32], key: Option<crate::memory::vmm::PrefixKey>) -> Result<usize> {
+    pub fn attach_prompt_keyed(
+        &mut self,
+        b: usize,
+        prompt: &[u32],
+        key: Option<crate::memory::vmm::PrefixKey>,
+    ) -> Result<usize> {
         if self.pos[b] == 0 && self.vmm_prefix_enabled() {
             self.vmm_attach(b, prompt, key)?;
         }
@@ -804,7 +839,11 @@ impl GpuEngine {
             return false;
         }
         if !kv.resolve_prefix_hazard(b, toks, p_a) {
-            tracing::debug!(slot = b, p_a, "vmm: publish_boundary skipped: orphaned blocks");
+            tracing::debug!(
+                slot = b,
+                p_a,
+                "vmm: publish_boundary skipped: orphaned blocks"
+            );
             return false;
         }
         let snap_bytes = self.vmm_snap_bytes(p_a);
@@ -834,7 +873,11 @@ impl GpuEngine {
         let session = self.session_pin[b].is_some();
         let prompt = kv.prompt_rows(b);
         let prompt_end = is_prompt_end(rows, max_rows, prompt);
-        let max_rows = if session && prompt_end { session_prompt_end(prompt) } else { max_rows };
+        let max_rows = if session && prompt_end {
+            session_prompt_end(prompt)
+        } else {
+            max_rows
+        };
         let p_a = (rows.min(max_rows) / 32) * 32;
         tracing::info!(
             slot = b,
@@ -847,7 +890,12 @@ impl GpuEngine {
             "vmm_publish entered"
         );
         if rows == 0 || toks.len() != rows as usize {
-            tracing::info!(slot = b, rows, toks_len = toks.len(), "vmm_publish skipped: rows/toks mismatch");
+            tracing::info!(
+                slot = b,
+                rows,
+                toks_len = toks.len(),
+                "vmm_publish skipped: rows/toks mismatch"
+            );
             return;
         }
         if p_a == 0 {
@@ -885,7 +933,12 @@ impl GpuEngine {
             kv.pin_prefix(&toks[..p_a as usize], std::time::Instant::now() + ttl);
             let freed = kv.retire_superseded(toks, p_a);
             if freed > 0 {
-                tracing::debug!(slot = b, p_a, freed, "vmm: session retired superseded snapshots");
+                tracing::debug!(
+                    slot = b,
+                    p_a,
+                    freed,
+                    "vmm: session retired superseded snapshots"
+                );
             }
         }
         // Turn end: pressure may have evicted the prompt end (the next turn's attach point)
@@ -964,8 +1017,14 @@ fn session_prompt_end(prompt: u32) -> u32 {
 #[cfg(test)]
 #[test]
 fn prompt_end_covers_the_withheld_last_token() {
-    assert!(is_prompt_end(3000, 2999, 3000), "whole prompt, last row held back");
-    assert!(is_prompt_end(2999, 2999, 3000), "packed pass withheld the last prompt token");
+    assert!(
+        is_prompt_end(3000, 2999, 3000),
+        "whole prompt, last row held back"
+    );
+    assert!(
+        is_prompt_end(2999, 2999, 3000),
+        "packed pass withheld the last prompt token"
+    );
     assert!(!is_prompt_end(2048, 2047, 3000), "chunk end");
     assert!(!is_prompt_end(2999, 2048, 3000), "chunk-capped publish");
     assert!(!is_prompt_end(3100, 3099, 3000), "turn end");

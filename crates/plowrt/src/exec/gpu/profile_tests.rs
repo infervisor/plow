@@ -93,10 +93,7 @@ fn discovers_fp8_decode_after_generic_profile_file() {
     let profile = interpreter_profile((9, 0)).unwrap();
     let bf16 = cubin::synthetic_elf(profile.decode_symbol, &[], 90);
     let fp8 = cubin::synthetic_elf(profile.decode_symbol, &[("plow_fp8_kv_abi", 1)], 90);
-    let dir = std::env::temp_dir().join(format!(
-        "plow-fp8-kv-discovery-{}",
-        std::process::id()
-    ));
+    let dir = std::env::temp_dir().join(format!("plow-fp8-kv-discovery-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join(profile.decode_file), bf16).unwrap();
     std::fs::write(dir.join("interp_sm90a_fp8kv.cubin"), &fp8).unwrap();
@@ -161,9 +158,11 @@ fn auxiliary_packed_object_cannot_win_ordinary_prefill_discovery() {
         interp_candidate(&ordinary, &profile, 90, Role::Prefill, false).unwrap(),
         profile.prefill_symbol
     );
-    assert!(interp_candidate(&packed, &profile, 90, Role::Prefill, false)
-        .unwrap_err()
-        .contains("packed-prefill auxiliary object"));
+    assert!(
+        interp_candidate(&packed, &profile, 90, Role::Prefill, false)
+            .unwrap_err()
+            .contains("packed-prefill auxiliary object")
+    );
 }
 
 #[test]
@@ -200,8 +199,16 @@ fn embedded_mixed_object_is_skipped_for_ordinary_prefill() {
         parent: None,
     };
     let mut rejected = Vec::new();
-    let selected =
-        embedded_interp_image(&blob, &raw, &profile, 90, Role::Prefill, false, &mut rejected).unwrap();
+    let selected = embedded_interp_image(
+        &blob,
+        &raw,
+        &profile,
+        90,
+        Role::Prefill,
+        false,
+        &mut rejected,
+    )
+    .unwrap();
     assert_eq!(selected.image, ordinary);
     assert_eq!(selected.source, "embedded section 'ordinary'");
     assert!(rejected[0].contains("mixed-step auxiliary object"));

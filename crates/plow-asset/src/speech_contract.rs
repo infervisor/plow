@@ -66,21 +66,41 @@ impl TokenOutput {
     }
 
     /// The contract parameter and strings, into a pipeline.
-    pub fn apply(&self, parameters: &mut BTreeMap<String, u64>, strings: &mut BTreeMap<String, String>) {
+    pub fn apply(
+        &self,
+        parameters: &mut BTreeMap<String, u64>,
+        strings: &mut BTreeMap<String, String>,
+    ) {
         parameters.insert(CONTRACT.into(), ASR_CONTRACT);
-        parameters.insert("output.skip_bracketed".into(), u64::from(self.skip_bracketed));
-        strings.insert("output.detokenizer".into(), DETOKENIZER_SENTENCEPIECE.into());
+        parameters.insert(
+            "output.skip_bracketed".into(),
+            u64::from(self.skip_bracketed),
+        );
+        strings.insert(
+            "output.detokenizer".into(),
+            DETOKENIZER_SENTENCEPIECE.into(),
+        );
         strings.insert("output.word_boundary".into(), self.word_boundary.clone());
-        strings.insert("output.no_space_before".into(), self.no_space_before.join("\n"));
+        strings.insert(
+            "output.no_space_before".into(),
+            self.no_space_before.join("\n"),
+        );
         if let Some(language) = &self.language {
             strings.insert("language".into(), language.clone());
-            let aliases: Vec<String> = self.language_aliases.iter().map(|(a, l)| format!("{a}={l}")).collect();
+            let aliases: Vec<String> = self
+                .language_aliases
+                .iter()
+                .map(|(a, l)| format!("{a}={l}"))
+                .collect();
             strings.insert("language.aliases".into(), aliases.join("\n"));
         }
     }
 
     pub fn vocabulary_section(&self) -> Vec<u8> {
-        serde_json::to_vec(&Vocabulary { pieces: self.pieces.clone() }).expect("strings serialize")
+        serde_json::to_vec(&Vocabulary {
+            pieces: self.pieces.clone(),
+        })
+        .expect("strings serialize")
     }
 
     /// Read back from a pipeline's strings and its vocabulary section.
@@ -89,11 +109,18 @@ impl TokenOutput {
         string: impl Fn(&str) -> Option<String>,
         vocabulary: &[u8],
     ) -> Result<Self, String> {
-        let text = |name: &str| string(name).ok_or_else(|| format!("ASR output string {name} is missing"));
+        let text =
+            |name: &str| string(name).ok_or_else(|| format!("ASR output string {name} is missing"));
         if text("output.detokenizer")? != DETOKENIZER_SENTENCEPIECE {
             return Err("unsupported ASR output detokenizer".into());
         }
-        let lines = |value: String| value.lines().filter(|l| !l.is_empty()).map(str::to_owned).collect::<Vec<_>>();
+        let lines = |value: String| {
+            value
+                .lines()
+                .filter(|l| !l.is_empty())
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        };
         let vocabulary: Vocabulary =
             serde_json::from_slice(vocabulary).map_err(|e| format!("{VOCABULARY_SECTION}: {e}"))?;
         let language = string("language");
@@ -101,14 +128,20 @@ impl TokenOutput {
             None => Vec::new(),
             Some(_) => lines(text("language.aliases")?)
                 .into_iter()
-                .map(|l| l.split_once('=').map(|(a, b)| (a.to_owned(), b.to_owned())).ok_or("malformed language alias"))
+                .map(|l| {
+                    l.split_once('=')
+                        .map(|(a, b)| (a.to_owned(), b.to_owned()))
+                        .ok_or("malformed language alias")
+                })
                 .collect::<Result<_, _>>()?,
         };
         Ok(Self {
             pieces: vocabulary.pieces,
             word_boundary: text("output.word_boundary")?,
             no_space_before: lines(text("output.no_space_before")?),
-            skip_bracketed: parameter("output.skip_bracketed").ok_or("output.skip_bracketed is missing")? == 1,
+            skip_bracketed: parameter("output.skip_bracketed")
+                .ok_or("output.skip_bracketed is missing")?
+                == 1,
             language,
             language_aliases,
         })
@@ -129,15 +162,33 @@ pub struct AudioLmPolicy {
 impl AudioLmPolicy {
     pub fn to_parameters(&self, out: &mut BTreeMap<String, u64>) {
         out.insert(CONTRACT.into(), ASR_CONTRACT);
-        out.insert("finalize.padding_samples".into(), u64::from(self.final_padding_samples));
-        out.insert("finalize.padding_amplitude_f32".into(), f32_param(self.final_padding_amplitude));
-        out.insert("output.reserve_per_row".into(), u64::from(self.output_reserve_per_row));
-        out.insert("output.reserve_extra".into(), u64::from(self.output_reserve_extra));
+        out.insert(
+            "finalize.padding_samples".into(),
+            u64::from(self.final_padding_samples),
+        );
+        out.insert(
+            "finalize.padding_amplitude_f32".into(),
+            f32_param(self.final_padding_amplitude),
+        );
+        out.insert(
+            "output.reserve_per_row".into(),
+            u64::from(self.output_reserve_per_row),
+        );
+        out.insert(
+            "output.reserve_extra".into(),
+            u64::from(self.output_reserve_extra),
+        );
     }
 
     pub fn from_parameters(parameter: impl Fn(&str) -> Option<u64>) -> Result<Self, String> {
-        let get = |name: &str| parameter(name).ok_or_else(|| format!("audio LM parameter {name} is missing"));
-        let u32_of = |name: &str| get(name).and_then(|v| u32::try_from(v).map_err(|_| format!("audio LM parameter {name} overflows")));
+        let get = |name: &str| {
+            parameter(name).ok_or_else(|| format!("audio LM parameter {name} is missing"))
+        };
+        let u32_of = |name: &str| {
+            get(name).and_then(|v| {
+                u32::try_from(v).map_err(|_| format!("audio LM parameter {name} overflows"))
+            })
+        };
         Ok(Self {
             final_padding_samples: u32_of("finalize.padding_samples")?,
             final_padding_amplitude: param_f32(get("finalize.padding_amplitude_f32")?)
@@ -153,7 +204,9 @@ impl AudioLmPolicy {
 pub fn check_contract(parameter: Option<u64>, implemented: u64, what: &str) -> Result<u64, String> {
     let version = parameter.unwrap_or(0);
     if version > implemented {
-        return Err(format!("{what} packet contract {version}; this plowrt implements {implemented}"));
+        return Err(format!(
+            "{what} packet contract {version}; this plowrt implements {implemented}"
+        ));
     }
     if version < implemented {
         return Err(format!(
@@ -170,7 +223,10 @@ pub fn f32_param(value: f32) -> u64 {
 }
 
 pub fn param_f32(value: u64) -> Option<f32> {
-    u32::try_from(value).ok().map(f32::from_bits).filter(|v| v.is_finite())
+    u32::try_from(value)
+        .ok()
+        .map(f32::from_bits)
+        .filter(|v| v.is_finite())
 }
 
 /// Speech-segment policy of a VAD packet (`policy.*`): the model's recommended defaults for
@@ -225,24 +281,45 @@ impl VadContract {
             ("policy.min_silence_ms", u64::from(p.min_silence_ms)),
             ("policy.speech_pad_ms", u64::from(p.speech_pad_ms)),
             ("policy.max_speech_ms", u64::from(p.max_speech_ms)),
-            ("policy.min_silence_at_max_speech_ms", u64::from(p.min_silence_at_max_speech_ms)),
+            (
+                "policy.min_silence_at_max_speech_ms",
+                u64::from(p.min_silence_at_max_speech_ms),
+            ),
             ("gate.min_speech_ms", u64::from(self.gate.min_speech_ms)),
             ("gate.min_silence_ms", u64::from(self.gate.min_silence_ms)),
             ("gate.speech_pad_ms", u64::from(self.gate.speech_pad_ms)),
-            ("gate.min_total_speech_ms", u64::from(self.gate.min_total_speech_ms)),
-            ("bounds.max_duration_ms", u64::from(self.bounds.max_duration_ms)),
+            (
+                "gate.min_total_speech_ms",
+                u64::from(self.gate.min_total_speech_ms),
+            ),
+            (
+                "bounds.max_duration_ms",
+                u64::from(self.bounds.max_duration_ms),
+            ),
         ] {
             out.insert(name.into(), value);
         }
     }
 
     pub fn from_parameters(parameter: impl Fn(&str) -> Option<u64>) -> Result<Self, String> {
-        let get = |name: &str| parameter(name).ok_or_else(|| format!("VAD parameter {name} is missing"));
-        let ms = |name: &str| get(name).and_then(|v| u32::try_from(v).map_err(|_| format!("VAD parameter {name} overflows")));
+        let get =
+            |name: &str| parameter(name).ok_or_else(|| format!("VAD parameter {name} is missing"));
+        let ms = |name: &str| {
+            get(name).and_then(|v| {
+                u32::try_from(v).map_err(|_| format!("VAD parameter {name} overflows"))
+            })
+        };
         let unit = |name: &str| {
             get(name)
-                .and_then(|v| param_f32(v).ok_or_else(|| format!("VAD parameter {name} is not a finite f32")))
-                .and_then(|v| (0.0..=1.0).contains(&v).then_some(v).ok_or_else(|| format!("VAD parameter {name} is outside 0..=1")))
+                .and_then(|v| {
+                    param_f32(v).ok_or_else(|| format!("VAD parameter {name} is not a finite f32"))
+                })
+                .and_then(|v| {
+                    (0.0..=1.0)
+                        .contains(&v)
+                        .then_some(v)
+                        .ok_or_else(|| format!("VAD parameter {name} is outside 0..=1"))
+                })
         };
         let contract = Self {
             policy: VadPolicy {
@@ -261,13 +338,21 @@ impl VadContract {
                 speech_pad_ms: ms("gate.speech_pad_ms")?,
                 min_total_speech_ms: ms("gate.min_total_speech_ms")?,
             },
-            bounds: VadBounds { max_duration_ms: ms("bounds.max_duration_ms")? },
+            bounds: VadBounds {
+                max_duration_ms: ms("bounds.max_duration_ms")?,
+            },
         };
         let p = &contract.policy;
         let max = contract.bounds.max_duration_ms;
-        if [p.min_speech_ms, p.min_silence_ms, p.speech_pad_ms, p.max_speech_ms, p.min_silence_at_max_speech_ms]
-            .iter()
-            .any(|&v| v > max)
+        if [
+            p.min_speech_ms,
+            p.min_silence_ms,
+            p.speech_pad_ms,
+            p.max_speech_ms,
+            p.min_silence_at_max_speech_ms,
+        ]
+        .iter()
+        .any(|&v| v > max)
         {
             return Err("VAD policy default exceeds its declared bound".into());
         }
@@ -292,12 +377,22 @@ mod tests {
                 max_speech_ms: 0,
                 min_silence_at_max_speech_ms: 98,
             },
-            gate: VadGate { min_speech_ms: 150, min_silence_ms: 150, speech_pad_ms: 0, min_total_speech_ms: 250 },
-            bounds: VadBounds { max_duration_ms: 600_000 },
+            gate: VadGate {
+                min_speech_ms: 150,
+                min_silence_ms: 150,
+                speech_pad_ms: 0,
+                min_total_speech_ms: 250,
+            },
+            bounds: VadBounds {
+                max_duration_ms: 600_000,
+            },
         };
         let mut params = BTreeMap::new();
         contract.to_parameters(&mut params);
-        assert_eq!(VadContract::from_parameters(|n| params.get(n).copied()).unwrap(), contract);
+        assert_eq!(
+            VadContract::from_parameters(|n| params.get(n).copied()).unwrap(),
+            contract
+        );
         params.insert("bounds.max_duration_ms".into(), 10);
         assert!(VadContract::from_parameters(|n| params.get(n).copied()).is_err());
         params.remove("policy.threshold_f32");
@@ -306,22 +401,37 @@ mod tests {
 
     #[test]
     fn contracts_fail_closed_on_other_versions() {
-        assert_eq!(check_contract(Some(ASR_CONTRACT), ASR_CONTRACT, "x"), Ok(ASR_CONTRACT));
-        assert!(check_contract(None, ASR_CONTRACT, "x").unwrap_err().contains("asr_packet_upgrade"));
+        assert_eq!(
+            check_contract(Some(ASR_CONTRACT), ASR_CONTRACT, "x"),
+            Ok(ASR_CONTRACT)
+        );
+        assert!(check_contract(None, ASR_CONTRACT, "x")
+            .unwrap_err()
+            .contains("asr_packet_upgrade"));
         assert!(check_contract(Some(ASR_CONTRACT + 1), ASR_CONTRACT, "x").is_err());
     }
 
     #[test]
     fn token_output_round_trips() {
-        let mut output = TokenOutput::sentencepiece(vec!["\u{2581}a".into(), "<b>".into()], &[".", "?"]);
+        let mut output =
+            TokenOutput::sentencepiece(vec!["\u{2581}a".into(), "<b>".into()], &[".", "?"]);
         output.language = Some("en-US".into());
         output.language_aliases = vec![("en".into(), "en-US".into())];
         let (mut params, mut strings) = (BTreeMap::new(), BTreeMap::new());
         output.apply(&mut params, &mut strings);
         assert_eq!(params[CONTRACT], ASR_CONTRACT);
-        let back = TokenOutput::from_pipeline(|n| params.get(n).copied(), |n| strings.get(n).cloned(), &output.vocabulary_section());
+        let back = TokenOutput::from_pipeline(
+            |n| params.get(n).copied(),
+            |n| strings.get(n).cloned(),
+            &output.vocabulary_section(),
+        );
         assert_eq!(back.unwrap(), output);
         strings.insert("output.detokenizer".into(), "bpe".into());
-        assert!(TokenOutput::from_pipeline(|n| params.get(n).copied(), |n| strings.get(n).cloned(), &output.vocabulary_section()).is_err());
+        assert!(TokenOutput::from_pipeline(
+            |n| params.get(n).copied(),
+            |n| strings.get(n).cloned(),
+            &output.vocabulary_section()
+        )
+        .is_err());
     }
 }

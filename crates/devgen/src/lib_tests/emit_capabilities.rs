@@ -58,14 +58,26 @@ fn production_defaults_are_capability_and_target_driven() {
         ])
         .unwrap()
         .emit;
-        apply_production_defaults(&mut disabled, emit_capabilities(model_type), "sm_90a", 1, 304);
+        apply_production_defaults(
+            &mut disabled,
+            emit_capabilities(model_type),
+            "sm_90a",
+            1,
+            304,
+        );
         assert_eq!(disabled.decode_rungs(), [1]);
         assert!(!disabled.decode_ladder_default);
         assert!(!disabled.packed_prefill_on());
     }
 
     let mut unsupported = EmitArgsForTest::try_parse_from(["test"]).unwrap().emit;
-    apply_production_defaults(&mut unsupported, emit_capabilities("qwen3_5"), "sm_90a", 1, 304);
+    apply_production_defaults(
+        &mut unsupported,
+        emit_capabilities("qwen3_5"),
+        "sm_90a",
+        1,
+        304,
+    );
     assert_eq!(unsupported.decode_rungs(), [1]);
     assert!(!unsupported.packed_prefill_on());
 
@@ -84,7 +96,13 @@ fn production_defaults_are_capability_and_target_driven() {
     assert!(!amd.packed_prefill_on());
 
     let mut other_target = EmitArgsForTest::try_parse_from(["test"]).unwrap().emit;
-    apply_production_defaults(&mut other_target, emit_capabilities("gemma4"), "gfx950", 1, 304);
+    apply_production_defaults(
+        &mut other_target,
+        emit_capabilities("gemma4"),
+        "gfx950",
+        1,
+        304,
+    );
     assert_eq!(other_target.decode_rungs(), [1]);
     assert!(!other_target.packed_prefill_on());
 }
@@ -92,8 +110,9 @@ fn production_defaults_are_capability_and_target_driven() {
 #[test]
 fn pure_gemm_default_is_scoped_to_sm90a_gemma_native_dtypes() {
     let _guard = crate::test_env::env_guard();
-    let mut qualified =
-        EmitArgsForTest::try_parse_from(["test", "--w8a8"]).unwrap().emit;
+    let mut qualified = EmitArgsForTest::try_parse_from(["test", "--w8a8"])
+        .unwrap()
+        .emit;
     apply_production_defaults(
         &mut qualified,
         emit_capabilities("gemma4"),
@@ -109,29 +128,14 @@ fn pure_gemm_default_is_scoped_to_sm90a_gemma_native_dtypes() {
     );
 
     let mut bf16 = EmitArgsForTest::try_parse_from(["test"]).unwrap().emit;
-    apply_production_defaults(
-        &mut bf16,
-        emit_capabilities("gemma4"),
-        "sm_90a",
-        1,
-        132,
-    );
+    apply_production_defaults(&mut bf16, emit_capabilities("gemma4"), "sm_90a", 1, 132);
     assert_eq!(bf16.seg_pure_gemm.as_deref(), Some("1"));
 
-    let mut disabled = EmitArgsForTest::try_parse_from([
-        "test",
-        "--w8a8",
-        "--emit-pure-gemm-segments=0",
-    ])
-    .unwrap()
-    .emit;
-    apply_production_defaults(
-        &mut disabled,
-        emit_capabilities("gemma4"),
-        "sm_90a",
-        1,
-        132,
-    );
+    let mut disabled =
+        EmitArgsForTest::try_parse_from(["test", "--w8a8", "--emit-pure-gemm-segments=0"])
+            .unwrap()
+            .emit;
+    apply_production_defaults(&mut disabled, emit_capabilities("gemma4"), "sm_90a", 1, 132);
     assert_eq!(disabled.seg_pure_gemm.as_deref(), Some("0"));
 
     for (model, arch, tp, dtype_flag) in [
@@ -218,7 +222,6 @@ fn cublaslt_emission_rejects_unloadable_combinations() {
     }
 }
 
-
 /// The nine `glm_*` knobs of the qualified gfx942 TP8 recipe are ON by default for GLM on that
 /// target and OFF everywhere else.
 ///
@@ -239,7 +242,10 @@ fn glm_qualified_recipe_defaults_the_lt_groups_and_decode_gemm_group() {
     };
     let cfg = qualified(&["test"]);
     assert!(cfg.glm_decode_gemm_group());
-    assert_eq!(cfg.glm_gemm_lt_pf_ext_spec(), emit_config::GLM_GEMM_LT_PF_EXT_QUALIFIED);
+    assert_eq!(
+        cfg.glm_gemm_lt_pf_ext_spec(),
+        emit_config::GLM_GEMM_LT_PF_EXT_QUALIFIED
+    );
     assert!(!cfg.glm_gemm_lt_pf_ext_spec().contains("router"));
 
     // Not the qualified target: both stay off, so a TP1 or gfx950 emit is unchanged.
@@ -249,7 +255,12 @@ fn glm_qualified_recipe_defaults_the_lt_groups_and_decode_gemm_group() {
     assert_eq!(tp1.glm_gemm_lt_pf_ext_spec(), "");
 
     // Per-knob rollback.
-    let off = qualified(&["test", "--glm-decode-gemm-group=false", "--glm-gemm-lt-pf-ext", ""]);
+    let off = qualified(&[
+        "test",
+        "--glm-decode-gemm-group=false",
+        "--glm-gemm-lt-pf-ext",
+        "",
+    ]);
     assert!(!off.glm_decode_gemm_group());
     assert_eq!(off.glm_gemm_lt_pf_ext_spec(), "");
 }
@@ -311,13 +322,7 @@ fn glm_token_batch_production_recipe_disables_replayed_sequence_parallel_arms() 
     ])
     .unwrap()
     .emit;
-    apply_production_defaults(
-        &mut cfg,
-        emit_capabilities("glm_moe_dsa"),
-        "gfx942",
-        8,
-        304,
-    );
+    apply_production_defaults(&mut cfg, emit_capabilities("glm_moe_dsa"), "gfx942", 8, 304);
     assert!(cfg.token_batch_tp);
     assert!(!cfg.glm_seq_par());
     assert!(!cfg.glm_seq_par_proj());
@@ -413,10 +418,8 @@ fn glm_recipe_precedence_is_cli_then_env_then_production_default() {
 #[test]
 fn glm_recipe_cli_beats_env() {
     let _guard = crate::test_env::env_guard();
-    let _env = crate::test_env::EnvScope::set(&[
-        ("PLOW_GLM_GEMM_LT", "0"),
-        ("PLOW_GLM_MOE_AITER", "1"),
-    ]);
+    let _env =
+        crate::test_env::EnvScope::set(&[("PLOW_GLM_GEMM_LT", "0"), ("PLOW_GLM_MOE_AITER", "1")]);
     let (cfg, rec) = resolve_like_plowc(
         &["test", "--glm-gemm-lt=true", "--glm-moe-aiter=false"],
         "glm_moe_dsa",
@@ -458,7 +461,10 @@ fn glm_seq_par_and_fold_defaults_roll_back_per_knob() {
         std::thread::spawn(move || {
             let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
             let (cfg, rec) = resolve_like_plowc(&argv, &model, "gfx942", 8, 304);
-            ((cfg.glm_seq_par(), cfg.glm_seq_par_proj(), cfg.glm_fold_lt()), rec)
+            (
+                (cfg.glm_seq_par(), cfg.glm_seq_par_proj(), cfg.glm_fold_lt()),
+                rec,
+            )
         })
         .join()
         .unwrap()
@@ -481,12 +487,22 @@ fn glm_seq_par_and_fold_defaults_roll_back_per_knob() {
     let (on, rec) = glm(&["test", "--glm-seq-par=false"]);
     assert_eq!(on, (false, false, true));
     assert_eq!(rec["glm_seq_par"], ("false".into(), "cli"));
-    assert_eq!(rec["glm_seq_par_proj"], ("false".into(), "production_default"));
+    assert_eq!(
+        rec["glm_seq_par_proj"],
+        ("false".into(), "production_default")
+    );
 
-    for argv in [&["test", "--glm-xr-res=true"][..], &["test", "--glm-xr-band", "4"][..]] {
+    for argv in [
+        &["test", "--glm-xr-res=true"][..],
+        &["test", "--glm-xr-band", "4"][..],
+    ] {
         let (on, rec) = glm(argv);
         assert_eq!(on, (false, false, true), "{argv:?}");
-        assert_eq!(rec["glm_seq_par"], ("false".into(), "production_default"), "{argv:?}");
+        assert_eq!(
+            rec["glm_seq_par"],
+            ("false".into(), "production_default"),
+            "{argv:?}"
+        );
     }
 
     let (on, rec) = resolve(&["test"], "gemma4");
@@ -502,7 +518,8 @@ fn glm_seq_par_and_fold_defaults_roll_back_per_knob() {
 fn gemma4_hopper_defaults_follow_config_caps() {
     let caps = |cfg: Value| emit_capabilities("gemma4").with_config(Some(&cfg));
     let dense = caps(serde_json::json!({"text_config": {"global_head_dim": 512}}));
-    let moe = caps(serde_json::json!({"text_config": {"global_head_dim": 512, "num_experts": 128}}));
+    let moe =
+        caps(serde_json::json!({"text_config": {"global_head_dim": 512, "num_experts": 128}}));
     assert_eq!(dense.caps().last(), Some(&"full_attn_hd512"));
     assert!(moe.caps().contains(&"moe"));
     let defaults = |caps: EmitCapabilities, argv: &[&str], arch: &str, tp: u32| {
@@ -523,7 +540,12 @@ fn gemma4_hopper_defaults_follow_config_caps() {
     assert!(!cfg.tma_gemm && cfg.moe_pf_lt && cfg.moe_dec_lt && !cfg.gemv_prefetch);
     assert_eq!(cfg.gemma_moe_dec_group, Some(4));
 
-    let cfg = defaults(moe, &["test", "--gemma-moe-dec-group=8", "--emit-seg-fa512=0"], "sm_90a", 1);
+    let cfg = defaults(
+        moe,
+        &["test", "--gemma-moe-dec-group=8", "--emit-seg-fa512=0"],
+        "sm_90a",
+        1,
+    );
     assert_eq!(cfg.gemma_moe_dec_group, Some(8));
     assert_eq!(cfg.seg_fa512.as_deref(), Some("0"));
 

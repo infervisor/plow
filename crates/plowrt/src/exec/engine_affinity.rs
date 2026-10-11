@@ -54,15 +54,21 @@ pub fn parse_cpulist(s: &str) -> Option<Vec<usize>> {
 /// read from `sysfs` (`/sys` in production). `None` when the device reports no NUMA node.
 pub fn socket_cpus_of_pci(sysfs: &Path, bdf: &str) -> Option<(u32, u32, Vec<usize>)> {
     let read = |rel: &str| std::fs::read_to_string(sysfs.join(rel)).ok();
-    let node: i64 = read(&format!("bus/pci/devices/{bdf}/numa_node"))?.trim().parse().ok()?;
+    let node: i64 = read(&format!("bus/pci/devices/{bdf}/numa_node"))?
+        .trim()
+        .parse()
+        .ok()?;
     let node = u32::try_from(node).ok()?;
     let package = |cpu: usize| -> Option<u32> {
-        read(&format!("devices/system/cpu/cpu{cpu}/topology/physical_package_id"))?
-            .trim()
-            .parse()
-            .ok()
+        read(&format!(
+            "devices/system/cpu/cpu{cpu}/topology/physical_package_id"
+        ))?
+        .trim()
+        .parse()
+        .ok()
     };
-    let first = *parse_cpulist(&read(&format!("devices/system/node/node{node}/cpulist"))?)?.first()?;
+    let first =
+        *parse_cpulist(&read(&format!("devices/system/node/node{node}/cpulist"))?)?.first()?;
     let socket = package(first)?;
     let cpus: Vec<usize> = parse_cpulist(&read("devices/system/cpu/online")?)?
         .into_iter()
@@ -100,7 +106,10 @@ mod tests {
         assert_eq!(parse_cpulist("a"), None);
         assert_eq!(EngineAffinity::parse("auto"), Ok(EngineAffinity::Auto));
         assert_eq!(EngineAffinity::parse("off"), Ok(EngineAffinity::Off));
-        assert_eq!(EngineAffinity::parse("72-73,264"), Ok(EngineAffinity::Cpus(vec![72, 73, 264])));
+        assert_eq!(
+            EngineAffinity::parse("72-73,264"),
+            Ok(EngineAffinity::Cpus(vec![72, 73, 264]))
+        );
         assert!(EngineAffinity::parse("near").is_err());
         assert!(EngineAffinity::parse(",").is_err());
     }
@@ -122,7 +131,13 @@ mod tests {
         write("bus/pci/devices/0000:99:00.0/numa_node", "-1\n");
         write("devices/system/cpu/online", "0-31\n");
         for node in 0..8usize {
-            let cpus = format!("{}-{},{}-{}", 2 * node, 2 * node + 1, 16 + 2 * node, 17 + 2 * node);
+            let cpus = format!(
+                "{}-{},{}-{}",
+                2 * node,
+                2 * node + 1,
+                16 + 2 * node,
+                17 + 2 * node
+            );
             write(&format!("devices/system/node/node{node}/cpulist"), &cpus);
             for cpu in parse_cpulist(&cpus).unwrap() {
                 write(
@@ -133,12 +148,24 @@ mod tests {
         }
         let (node, socket, cpus) = socket_cpus_of_pci(&root, "0000:05:00.0").unwrap();
         assert_eq!((node, socket), (3, 0));
-        assert_eq!(cpus, [(0..8).collect::<Vec<_>>(), (16..24).collect()].concat());
+        assert_eq!(
+            cpus,
+            [(0..8).collect::<Vec<_>>(), (16..24).collect()].concat()
+        );
         let (node, socket, cpus) = socket_cpus_of_pci(&root, "0000:85:00.0").unwrap();
         assert_eq!((node, socket), (7, 1));
-        assert_eq!(cpus, [(8..16).collect::<Vec<_>>(), (24..32).collect()].concat());
-        assert!(socket_cpus_of_pci(&root, "0000:99:00.0").is_none(), "no NUMA node, no pin");
-        assert!(socket_cpus_of_pci(&root, "0000:aa:00.0").is_none(), "unknown device, no pin");
+        assert_eq!(
+            cpus,
+            [(8..16).collect::<Vec<_>>(), (24..32).collect()].concat()
+        );
+        assert!(
+            socket_cpus_of_pci(&root, "0000:99:00.0").is_none(),
+            "no NUMA node, no pin"
+        );
+        assert!(
+            socket_cpus_of_pci(&root, "0000:aa:00.0").is_none(),
+            "unknown device, no pin"
+        );
         std::fs::remove_dir_all(&root).unwrap();
     }
 

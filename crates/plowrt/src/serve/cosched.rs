@@ -180,7 +180,14 @@ impl Due {
             Band::Final => 0,
             _ => (2 * self.cost).max(URGENT_SLACK).as_nanos() as i64,
         };
-        (if slack <= urgent { Band::Urgent } else { self.band }, slack)
+        (
+            if slack <= urgent {
+                Band::Urgent
+            } else {
+                self.band
+            },
+            slack,
+        )
     }
 
     /// Whether `self`, waiting, should take the device from a holder due `mine`: a lower band; or
@@ -188,7 +195,10 @@ impl Due {
     /// the holder's next tick (`mine.cost`).
     pub fn outranks(&self, mine: &Due, now: Instant, margin_ns: i64) -> bool {
         let ((b, s), (mb, my)) = (self.rank(now), mine.rank(now));
-        b < mb || (b == mb && (s < my.saturating_sub(margin_ns) || (s < my && s < mine.cost.as_nanos() as i64)))
+        b < mb
+            || (b == mb
+                && (s < my.saturating_sub(margin_ns)
+                    || (s < my && s < mine.cost.as_nanos() as i64)))
     }
 
     /// The class callers' deadlines, for work pending since `since`. Final and Deadline are the
@@ -201,7 +211,11 @@ impl Due {
             Urgency::Normal => max_wait(),
             Urgency::Bulk => 4 * max_wait(),
         };
-        Due { deadline: since + after, cost: Duration::ZERO, band: u.into() }
+        Due {
+            deadline: since + after,
+            cost: Duration::ZERO,
+            band: u.into(),
+        }
     }
 }
 
@@ -220,7 +234,11 @@ impl Waiter {
     fn due(&self, now: Instant, max_wait: Duration) -> Due {
         let cap = self.since + max_wait;
         if now >= cap {
-            Due { deadline: self.due.deadline.min(cap), band: Band::Urgent, ..self.due }
+            Due {
+                deadline: self.due.deadline.min(cap),
+                band: Band::Urgent,
+                ..self.due
+            }
         } else {
             self.due
         }
@@ -237,11 +255,21 @@ struct PrioState {
 
 impl PrioState {
     fn new() -> PrioState {
-        PrioState { held: false, seq: 0, max_wait: max_wait(), waiters: Vec::new() }
+        PrioState {
+            held: false,
+            seq: 0,
+            max_wait: max_wait(),
+            waiters: Vec::new(),
+        }
     }
 
     fn tightest(&self, now: Instant) -> Option<usize> {
-        (0..self.waiters.len()).min_by_key(|&i| (self.waiters[i].due(now, self.max_wait).rank(now), self.waiters[i].seq))
+        (0..self.waiters.len()).min_by_key(|&i| {
+            (
+                self.waiters[i].due(now, self.max_wait).rank(now),
+                self.waiters[i].seq,
+            )
+        })
     }
 
     /// Give the device to the best-ranked waiter, or mark it free.
@@ -293,7 +321,12 @@ impl PrioHold {
             let (wake, rx) = oneshot::channel();
             s.seq += 1;
             let seq = s.seq;
-            s.waiters.push(Waiter { due, since: Instant::now(), seq, wake });
+            s.waiters.push(Waiter {
+                due,
+                since: Instant::now(),
+                seq,
+                wake,
+            });
             (seq, rx)
         };
         // A cancelled wait (the dispatcher's preempt select) must not strand a hand-off: leave
@@ -405,7 +438,8 @@ impl Turn {
 
     /// [`Self::take`] for a model whose most urgent work, starting now, is `urgency`.
     pub async fn take_at(&mut self, turn: &DeviceTurn, urgency: Urgency) {
-        self.take_due(turn, Due::from_urgency(urgency, Instant::now())).await
+        self.take_due(turn, Due::from_urgency(urgency, Instant::now()))
+            .await
     }
 
     /// [`Self::take`] for a model whose most urgent work is `due` ([`CoSched::Deadline`]).
@@ -627,11 +661,20 @@ mod tests {
     fn queue(s: &mut PrioState, due: Due, since: Instant) {
         s.seq += 1;
         let seq = s.seq;
-        s.waiters.push(Waiter { due, since, seq, wake: oneshot::channel().0 });
+        s.waiters.push(Waiter {
+            due,
+            since,
+            seq,
+            wake: oneshot::channel().0,
+        });
     }
 
     fn due_in(now: Instant, ms: u64, cost_ms: u64) -> Due {
-        Due { deadline: now + Duration::from_millis(ms), cost: Duration::from_millis(cost_ms), band: Band::Stream }
+        Due {
+            deadline: now + Duration::from_millis(ms),
+            cost: Duration::from_millis(cost_ms),
+            band: Band::Stream,
+        }
     }
 
     fn tightest_seq(s: &PrioState, now: Instant) -> u64 {
@@ -642,7 +685,10 @@ mod tests {
     fn slack_counts_cost_and_goes_negative() {
         let now = Instant::now();
         assert_eq!(due_in(now, 100, 30).slack(now), 70_000_000);
-        let late = Due { deadline: now, ..due_in(now, 0, 5) };
+        let late = Due {
+            deadline: now,
+            ..due_in(now, 0, 5)
+        };
         assert_eq!(late.slack(now + Duration::from_millis(10)), -15_000_000);
     }
 
@@ -667,7 +713,12 @@ mod tests {
     fn from_urgency_keeps_class_order_for_same_time_arrivals() {
         let now = Instant::now();
         let mut s = PrioState::new();
-        for u in [Urgency::Bulk, Urgency::Normal, Urgency::Deadline, Urgency::Final] {
+        for u in [
+            Urgency::Bulk,
+            Urgency::Normal,
+            Urgency::Deadline,
+            Urgency::Final,
+        ] {
             queue(&mut s, Due::from_urgency(u, now), now);
         }
         let mut order = Vec::new();
@@ -710,12 +761,21 @@ mod tests {
 
         let mut s = PrioState::new();
         queue(&mut s, due_in(now, 50, 0), now);
-        assert!(s.should_yield(mine, fresh, now), "tighter by more than the margin");
+        assert!(
+            s.should_yield(mine, fresh, now),
+            "tighter by more than the margin"
+        );
 
         let mut s = PrioState::new();
         queue(&mut s, due_in(now, 90, 0), now);
-        assert!(!s.should_yield(mine, fresh, now), "a tie keeps the device within the quantum");
-        assert!(s.should_yield(mine, spent, now), "a tie hands over after the quantum");
+        assert!(
+            !s.should_yield(mine, fresh, now),
+            "a tie keeps the device within the quantum"
+        );
+        assert!(
+            s.should_yield(mine, spent, now),
+            "a tie hands over after the quantum"
+        );
 
         let mut s = PrioState::new();
         queue(&mut s, due_in(now, 60, 0), now);
@@ -723,12 +783,21 @@ mod tests {
         // Both urgent (slack under twice the cost): within the band, the slack rule.
         let mut s = PrioState::new();
         queue(&mut s, due_in(now, 60, 20), now); // slack 40
-        assert!(s.should_yield(due_in(now, 130, 80), fresh, now), "would go negative during my tick");
-        assert!(!s.should_yield(due_in(now, 110, 80), fresh, now), "the holder is tighter still");
+        assert!(
+            s.should_yield(due_in(now, 130, 80), fresh, now),
+            "would go negative during my tick"
+        );
+        assert!(
+            !s.should_yield(due_in(now, 110, 80), fresh, now),
+            "the holder is tighter still"
+        );
     }
 
     fn due_band(now: Instant, ms: u64, cost_ms: u64, band: Band) -> Due {
-        Due { band, ..due_in(now, ms, cost_ms) }
+        Due {
+            band,
+            ..due_in(now, ms, cost_ms)
+        }
     }
 
     /// A first output goes ahead of decode however much tighter the decode's deadline, and a
@@ -746,17 +815,27 @@ mod tests {
         while let Some(i) = s.tightest(now) {
             order.push(s.waiters.swap_remove(i).seq);
         }
-        assert_eq!(order, vec![4, 3, 2, 1, 5], "ASR final, first outputs by slack, decode, partial");
+        assert_eq!(
+            order,
+            vec![4, 3, 2, 1, 5],
+            "ASR final, first outputs by slack, decode, partial"
+        );
 
         let mut s = PrioState::new();
         queue(&mut s, due_band(now, 800, 100, Band::First), now);
         assert!(s.should_yield(due_band(now, 90, 10, Band::Stream), now, now));
-        assert!(!s.should_yield(due_band(now, 500, 20, Band::First), now, now), "tighter first output keeps it");
+        assert!(
+            !s.should_yield(due_band(now, 500, 20, Band::First), now, now),
+            "tighter first output keeps it"
+        );
         // An ASR final takes the device from a tighter first output (a render boosted to First).
         let mut s = PrioState::new();
         queue(&mut s, due_band(now, 500, 20, Band::Final), now);
         assert!(s.should_yield(due_band(now, 450, 100, Band::First), now, now));
-        assert!(!s.should_yield(due_band(now, 100, 60, Band::First), now, now), "an urgent holder keeps it");
+        assert!(
+            !s.should_yield(due_band(now, 100, 60, Band::First), now, now),
+            "an urgent holder keeps it"
+        );
     }
 
     /// A stream about to underrun (slack under twice its render) preempts a first output, and so
@@ -785,7 +864,9 @@ mod tests {
         // Everything late (overload): urgent work by slack alone, an ASR final included.
         let dry = due_band(now, 0, 300, Band::Stream); // slack -300
         let final_ = due_band(now, 0, 20, Band::Final); // slack -20
-        assert!(dry.outranks(&final_, now, YIELD_MARGIN) && !final_.outranks(&dry, now, YIELD_MARGIN));
+        assert!(
+            dry.outranks(&final_, now, YIELD_MARGIN) && !final_.outranks(&dry, now, YIELD_MARGIN)
+        );
         // A final turns urgent only past its deadline: until then its band is ahead of the rest.
         assert_eq!(due_band(now, 50, 40, Band::Final).rank(now).0, Band::Final);
         assert_eq!(due_band(now, 30, 40, Band::Final).rank(now).0, Band::Urgent);
@@ -795,7 +876,11 @@ mod tests {
     fn free_and_rr_never_report_waiters() {
         for mode in [CoSched::Free, CoSched::Rr] {
             let dt = DeviceTurn::new(mode, 4);
-            queue(&mut dt.prio.lock(), due_in(Instant::now(), 0, 0), Instant::now());
+            queue(
+                &mut dt.prio.lock(),
+                due_in(Instant::now(), 0, 0),
+                Instant::now(),
+            );
             assert!(dt.tightest_waiter().is_none());
             assert!(!dt.outranked_due(due_in(Instant::now(), 1000, 0)));
         }
@@ -821,7 +906,10 @@ mod tests {
             }));
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
-        assert_eq!(dt.tightest_waiter().map(|d| d.deadline), Some(now + Duration::from_millis(200)));
+        assert_eq!(
+            dt.tightest_waiter().map(|d| d.deadline),
+            Some(now + Duration::from_millis(200))
+        );
         assert!(dt.outranked_due(due_in(now, 5000, 0)));
         assert!(!dt.outranked_due(due_in(now, 100, 0)));
         holder.release();
@@ -852,5 +940,4 @@ mod tests {
             .await
             .expect("the device was stranded");
     }
-
 }

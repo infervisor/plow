@@ -775,7 +775,10 @@ mod tests {
     fn emit_gap_list_marks_dspark_optional() {
         let msg = released().unimplemented();
         let d = msg.find("DSpark").expect("DSpark named");
-        assert!(msg[d..].contains("OPTIONAL"), "DSpark must be marked optional: {msg}");
+        assert!(
+            msg[d..].contains("OPTIONAL"),
+            "DSpark must be marked optional: {msg}"
+        );
         assert!(msg[d..].contains("forward_spec"), "and say why: {msg}");
     }
 

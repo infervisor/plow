@@ -123,7 +123,9 @@ impl GpuEngine {
         let mut body_enqueued = false;
         // Multimodal soft-token rows (bit 31): the prefill buckets this batch runs replace them
         // from the slab (MmRowsBf16).
-        let mm_rows = self.handle_of(plow_asset::multimodal::TABLE_TENSOR).is_some();
+        let mm_rows = self
+            .handle_of(plow_asset::multimodal::TABLE_TENSOR)
+            .is_some();
         let result = (|| {
             if requests.iter().any(|request| {
                 request.state_slot != request.slot
@@ -207,7 +209,12 @@ impl GpuEngine {
             // that computed them lands, not after the owner's whole prompt.
             let chunk_ends: smallvec::SmallVec<[(usize, u32); 16]> = match RuntimeConfig::get()
                 .prefix_chunk_publish()
-                .then(|| self.vmm.as_ref().and_then(|v| v.kv.as_ref()).map(|kv| kv.block_rows()))
+                .then(|| {
+                    self.vmm
+                        .as_ref()
+                        .and_then(|v| v.kv.as_ref())
+                        .map(|kv| kv.block_rows())
+                })
                 .flatten()
             {
                 Some(br) => plan

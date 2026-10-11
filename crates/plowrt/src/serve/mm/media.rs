@@ -9,7 +9,9 @@ pub type MediaResult<T> = std::result::Result<T, String>;
 
 /// `data:<mime>;base64,<payload>` -> (mime, bytes).
 pub fn data_url(url: &str) -> MediaResult<(String, Vec<u8>)> {
-    let rest = url.strip_prefix("data:").ok_or("only data: URLs are accepted for media")?;
+    let rest = url
+        .strip_prefix("data:")
+        .ok_or("only data: URLs are accepted for media")?;
     let (meta, payload) = rest.split_once(',').ok_or("malformed data URL")?;
     let mime = meta.split(';').next().unwrap_or("").to_ascii_lowercase();
     if !meta.split(';').any(|p| p.eq_ignore_ascii_case("base64")) {
@@ -19,7 +21,10 @@ pub fn data_url(url: &str) -> MediaResult<(String, Vec<u8>)> {
 }
 
 pub fn base64_decode(payload: &str) -> MediaResult<Vec<u8>> {
-    let clean: String = payload.chars().filter(|c| !c.is_ascii_whitespace()).collect();
+    let clean: String = payload
+        .chars()
+        .filter(|c| !c.is_ascii_whitespace())
+        .collect();
     base64::engine::general_purpose::STANDARD
         .decode(clean.as_bytes())
         .or_else(|_| base64::engine::general_purpose::STANDARD_NO_PAD.decode(clean.as_bytes()))
@@ -38,9 +43,13 @@ pub fn decode_image(bytes: &[u8], max_pixels: u64) -> MediaResult<Rgb> {
     let reader = image::ImageReader::new(std::io::Cursor::new(bytes))
         .with_guessed_format()
         .map_err(|e| format!("unreadable image: {e}"))?;
-    let (w, h) = reader.into_dimensions().map_err(|e| format!("unreadable image: {e}"))?;
+    let (w, h) = reader
+        .into_dimensions()
+        .map_err(|e| format!("unreadable image: {e}"))?;
     if w == 0 || h == 0 || u64::from(w) * u64::from(h) > max_pixels {
-        return Err(format!("image is {w}x{h}; at most {max_pixels} pixels are accepted"));
+        return Err(format!(
+            "image is {w}x{h}; at most {max_pixels} pixels are accepted"
+        ));
     }
     let img = image::ImageReader::new(std::io::Cursor::new(bytes))
         .with_guessed_format()
@@ -48,7 +57,11 @@ pub fn decode_image(bytes: &[u8], max_pixels: u64) -> MediaResult<Rgb> {
         .decode()
         .map_err(|e| format!("unreadable image: {e}"))?;
     let rgb = img.to_rgb8();
-    Ok(Rgb { width: rgb.width(), height: rgb.height(), data: rgb.into_raw() })
+    Ok(Rgb {
+        width: rgb.width(),
+        height: rgb.height(),
+        data: rgb.into_raw(),
+    })
 }
 
 /// Parameters of the `aspect_patches` processor (contract `image` modality).
@@ -93,7 +106,9 @@ pub fn aspect_size(height: u32, width: u32, p: &PatchParams) -> MediaResult<(u32
         ));
     }
     if th * tw > target_px {
-        return Err(format!("image of {height}x{width} does not fit the patch budget"));
+        return Err(format!(
+            "image of {height}x{width} does not fit the patch budget"
+        ));
     }
     Ok((th as u32, tw as u32))
 }
@@ -130,7 +145,12 @@ pub fn image_patches(img: &Rgb, p: &PatchParams) -> MediaResult<Patches> {
             }
         }
     }
-    Ok(Patches { values, positions, grid: (ph, pw), soft_tokens: ph * pw / (p.pool * p.pool) })
+    Ok(Patches {
+        values,
+        positions,
+        grid: (ph, pw),
+        soft_tokens: ph * pw / (p.pool * p.pool),
+    })
 }
 
 /// Pillow's `Image.resize(BICUBIC)` on 8-bit RGB: separable, support scaled by the downscale
@@ -159,7 +179,9 @@ pub fn resize_bicubic(src: &[u8], w: u32, h: u32, tw: u32, th: u32) -> Vec<u8> {
                 let ss = 1.0 / filterscale;
                 let xmin = ((center - support + 0.5) as i64).max(0) as usize;
                 let xmax = ((center + support + 0.5) as i64).min(i64::from(in_size)) as usize;
-                let mut k: Vec<f64> = (xmin..xmax).map(|x| cubic((x as f64 - center + 0.5) * ss)).collect();
+                let mut k: Vec<f64> = (xmin..xmax)
+                    .map(|x| cubic((x as f64 - center + 0.5) * ss))
+                    .collect();
                 let ww: f64 = k.iter().sum();
                 if ww != 0.0 {
                     k.iter_mut().for_each(|v| *v /= ww);
@@ -200,7 +222,11 @@ pub fn resize_bicubic(src: &[u8], w: u32, h: u32, tw: u32, th: u32) -> Vec<u8> {
         }
         out
     };
-    let mid = if tw != w { horizontal(src, h, &coeffs(w as u32, tw as u32)) } else { src.to_vec() };
+    let mid = if tw != w {
+        horizontal(src, h, &coeffs(w as u32, tw as u32))
+    } else {
+        src.to_vec()
+    };
     if th == h {
         return mid;
     }
@@ -222,13 +248,15 @@ pub fn resize_bicubic(src: &[u8], w: u32, h: u32, tw: u32, th: u32) -> Vec<u8> {
 
 /// Decode a WAV (PCM 8/16/24/32-bit or float) to mono f32 in [-1, 1] and its sample rate.
 pub fn decode_wav(bytes: &[u8]) -> MediaResult<(Vec<f32>, u32)> {
-    let mut reader = hound::WavReader::new(std::io::Cursor::new(bytes)).map_err(|e| format!("unreadable WAV: {e}"))?;
+    let mut reader = hound::WavReader::new(std::io::Cursor::new(bytes))
+        .map_err(|e| format!("unreadable WAV: {e}"))?;
     let spec = reader.spec();
     let channels = usize::from(spec.channels.max(1));
     let interleaved: Vec<f32> = match spec.sample_format {
-        hound::SampleFormat::Float => {
-            reader.samples::<f32>().collect::<Result<_, _>>().map_err(|e| format!("unreadable WAV: {e}"))?
-        }
+        hound::SampleFormat::Float => reader
+            .samples::<f32>()
+            .collect::<Result<_, _>>()
+            .map_err(|e| format!("unreadable WAV: {e}"))?,
         hound::SampleFormat::Int => {
             let scale = 1.0 / (1u64 << (spec.bits_per_sample.clamp(1, 32) - 1)) as f32;
             reader
@@ -238,7 +266,10 @@ pub fn decode_wav(bytes: &[u8]) -> MediaResult<(Vec<f32>, u32)> {
                 .map_err(|e| format!("unreadable WAV: {e}"))?
         }
     };
-    let mono = interleaved.chunks(channels).map(|c| c.iter().sum::<f32>() / c.len() as f32).collect();
+    let mono = interleaved
+        .chunks(channels)
+        .map(|c| c.iter().sum::<f32>() / c.len() as f32)
+        .collect();
     Ok((mono, audio_rate(spec.sample_rate, "WAV")?))
 }
 
@@ -250,7 +281,11 @@ fn audio_rate(rate: u32, format: &str) -> MediaResult<u32> {
     if AUDIO_RATES.contains(&rate) {
         Ok(rate)
     } else {
-        Err(format!("{format} audio sample rate {rate} Hz is outside {}..={} Hz", AUDIO_RATES.start(), AUDIO_RATES.end()))
+        Err(format!(
+            "{format} audio sample rate {rate} Hz is outside {}..={} Hz",
+            AUDIO_RATES.start(),
+            AUDIO_RATES.end()
+        ))
     }
 }
 
@@ -283,14 +318,22 @@ pub fn decode_audio(bytes: &[u8], format: &str, max_seconds: f64) -> MediaResult
     match format {
         "wav" => decode_wav(bytes),
         "mp3" | "flac" | "ogg" => decode_compressed(bytes, format, max_seconds),
-        other => Err(format!("input_audio format {other:?} is not supported; send wav, mp3, flac or ogg (vorbis)")),
+        other => Err(format!(
+            "input_audio format {other:?} is not supported; send wav, mp3, flac or ogg (vorbis)"
+        )),
     }
 }
 
 fn decode_compressed(bytes: &[u8], format: &str, max_seconds: f64) -> MediaResult<(Vec<f32>, u32)> {
-    use symphonia::core::{audio::SampleBuffer, codecs::DecoderOptions, errors::Error, io::MediaSourceStream, probe::Hint};
+    use symphonia::core::{
+        audio::SampleBuffer, codecs::DecoderOptions, errors::Error, io::MediaSourceStream,
+        probe::Hint,
+    };
     let unreadable = |e: Error| format!("unreadable {format} audio: {e}");
-    let mss = MediaSourceStream::new(Box::new(std::io::Cursor::new(bytes.to_vec())), Default::default());
+    let mss = MediaSourceStream::new(
+        Box::new(std::io::Cursor::new(bytes.to_vec())),
+        Default::default(),
+    );
     let mut hint = Hint::new();
     hint.with_extension(format);
     let probed = symphonia::default::get_probe()
@@ -301,11 +344,17 @@ fn decode_compressed(bytes: &[u8], format: &str, max_seconds: f64) -> MediaResul
         .tracks()
         .iter()
         .find(|t| t.codec_params.codec != symphonia::core::codecs::CODEC_TYPE_NULL)
-        .ok_or_else(|| format!("{format} audio has no decodable track (ogg carries vorbis only, not opus)"))?;
+        .ok_or_else(|| {
+            format!("{format} audio has no decodable track (ogg carries vorbis only, not opus)")
+        })?;
     let (id, mut rate) = (track.id, track.codec_params.sample_rate.unwrap_or(0));
     let mut decoder = symphonia::default::get_codecs()
         .make(&track.codec_params, &DecoderOptions::default())
-        .map_err(|e| format!("{format} audio codec is not supported (ogg carries vorbis only, not opus): {e}"))?;
+        .map_err(|e| {
+            format!(
+                "{format} audio codec is not supported (ogg carries vorbis only, not opus): {e}"
+            )
+        })?;
     let mut mono: Vec<f32> = Vec::new();
     let mut buf: Option<SampleBuffer<f32>> = None;
     loop {
@@ -331,7 +380,11 @@ fn decode_compressed(bytes: &[u8], format: &str, max_seconds: f64) -> MediaResul
             _ => buf.insert(SampleBuffer::new(decoded.capacity() as u64, spec)),
         };
         b.copy_interleaved_ref(decoded);
-        mono.extend(b.samples().chunks(channels).map(|c| c.iter().sum::<f32>() / channels as f32));
+        mono.extend(
+            b.samples()
+                .chunks(channels)
+                .map(|c| c.iter().sum::<f32>() / channels as f32),
+        );
         if mono.len() as f64 > max_seconds * f64::from(rate.max(1)) {
             return Err(format!("audio clip is longer than {max_seconds:.1} s"));
         }
@@ -379,9 +432,17 @@ pub fn resample(x: &[f32], from: u32, to: u32) -> MediaResult<Vec<f32>> {
             for j in lo..=hi {
                 let d = t - j as f64;
                 let arg = d * cutoff;
-                let sinc = if arg.abs() < 1e-12 { 1.0 } else { (std::f64::consts::PI * arg).sin() / (std::f64::consts::PI * arg) };
+                let sinc = if arg.abs() < 1e-12 {
+                    1.0
+                } else {
+                    (std::f64::consts::PI * arg).sin() / (std::f64::consts::PI * arg)
+                };
                 let r = d / half;
-                let win = if r.abs() >= 1.0 { 0.0 } else { bessel_i0(beta * (1.0 - r * r).sqrt()) / norm };
+                let win = if r.abs() >= 1.0 {
+                    0.0
+                } else {
+                    bessel_i0(beta * (1.0 - r * r).sqrt()) / norm
+                };
                 acc += f64::from(x[j as usize]) * sinc * win * cutoff;
             }
             acc as f32
@@ -423,9 +484,13 @@ pub fn mel_filters(p: &MelParams) -> Vec<f64> {
     let bins = p.fft_length / 2 + 1;
     let (lo, hi) = (hz_to_mel(p.min_frequency), hz_to_mel(p.max_frequency));
     let n = p.mel_bins;
-    let filter_freqs: Vec<f64> = (0..n + 2).map(|i| mel_to_hz(lo + (hi - lo) * i as f64 / (n + 1) as f64)).collect();
+    let filter_freqs: Vec<f64> = (0..n + 2)
+        .map(|i| mel_to_hz(lo + (hi - lo) * i as f64 / (n + 1) as f64))
+        .collect();
     let nyquist = f64::from(p.sample_rate / 2);
-    let fft_freqs: Vec<f64> = (0..bins).map(|i| nyquist * i as f64 / (bins - 1) as f64).collect();
+    let fft_freqs: Vec<f64> = (0..bins)
+        .map(|i| nyquist * i as f64 / (bins - 1) as f64)
+        .collect();
     let mut out = vec![0f64; bins * n];
     for (b, &f) in fft_freqs.iter().enumerate() {
         for m in 0..n {
@@ -446,7 +511,11 @@ pub fn log_mel(samples: &[f32], p: &MelParams) -> Mel {
     let pad_left = p.frame_length / 2;
     let total = pad_left + padded;
     let size = p.frame_length + 1;
-    let frames = if total >= size { (total - size) / p.hop_length + 1 } else { 0 };
+    let frames = if total >= size {
+        (total - size) / p.hop_length + 1
+    } else {
+        0
+    };
     let window: Vec<f64> = (0..p.frame_length)
         .map(|i| {
             // np.hanning(frame_length + 1)[:-1]
@@ -474,7 +543,10 @@ pub fn log_mel(samples: &[f32], p: &MelParams) -> Mel {
         buf.iter_mut().for_each(|c| *c = Complex::new(0.0, 0.0));
         for i in 0..p.frame_length {
             // float32 frames * float32 window, as numpy does before the float64 FFT.
-            buf[i] = Complex::new(f64::from((sample(start + i) as f32) * (window[i] as f32)), 0.0);
+            buf[i] = Complex::new(
+                f64::from((sample(start + i) as f32) * (window[i] as f32)),
+                0.0,
+            );
         }
         fft.process(&mut buf);
         for b in 0..bins {
@@ -492,7 +564,11 @@ pub fn log_mel(samples: &[f32], p: &MelParams) -> Mel {
             valid_frames += 1;
         }
     }
-    Mel { values, frames, valid_frames }
+    Mel {
+        values,
+        frames,
+        valid_frames,
+    }
 }
 
 /// Raw-sample frames (encoder-free audio): `ceil(len / frame)` rows of `frame` samples, the last
@@ -501,7 +577,11 @@ pub fn waveform_frames(samples: &[f32], frame: usize) -> Mel {
     let frames = samples.len().div_ceil(frame);
     let mut values = samples.to_vec();
     values.resize(frames * frame, 0.0);
-    Mel { values, frames, valid_frames: frames }
+    Mel {
+        values,
+        frames,
+        valid_frames: frames,
+    }
 }
 
 /// Soft tokens of `valid_frames` after `subsample` (a power of two) halvings of stride-2 convs.
@@ -520,7 +600,15 @@ mod tests {
     use super::*;
 
     fn params() -> PatchParams {
-        PatchParams { patch: 16, pool: 3, max_soft_tokens: 280, rescale: 1.0 / 255.0, normalize: false, mean: [0.0; 3], std: [1.0; 3] }
+        PatchParams {
+            patch: 16,
+            pool: 3,
+            max_soft_tokens: 280,
+            rescale: 1.0 / 255.0,
+            normalize: false,
+            mean: [0.0; 3],
+            std: [1.0; 3],
+        }
     }
 
     #[test]
@@ -539,24 +627,47 @@ mod tests {
         // make the horizontal pass of a 1x40M image allocate h * tw * 3 = 5.8 GB.
         assert_eq!(aspect_size(1, 280, &p).unwrap(), (48, 13440));
         assert_eq!(aspect_size(280, 1, &p).unwrap(), (13440, 48));
-        for (h, w) in [(1, 281), (281, 1), (40_000_000, 1), (1, 40_000_000), (120_000, 300)] {
+        for (h, w) in [
+            (1, 281),
+            (281, 1),
+            (40_000_000, 1),
+            (1, 40_000_000),
+            (120_000, 300),
+        ] {
             let err = aspect_size(h, w, &p).unwrap_err();
             assert!(err.contains("too elongated"), "{h}x{w}: {err}");
         }
         for (h, w) in [(100_000, 1), (1, 100_000)] {
-            let img = Rgb { width: w, height: h, data: vec![7; (w * h * 3) as usize] };
+            let img = Rgb {
+                width: w,
+                height: h,
+                data: vec![7; (w * h * 3) as usize],
+            };
             let t = std::time::Instant::now();
-            assert!(image_patches(&img, &p).err().is_some_and(|e| e.contains("too elongated")));
+            assert!(image_patches(&img, &p)
+                .err()
+                .is_some_and(|e| e.contains("too elongated")));
             assert!(t.elapsed() < std::time::Duration::from_secs(1));
         }
         // Accepted shapes: the intermediate of the separable resize (`h * tw` pixels, horizontal
         // pass first) never exceeds sqrt(input px * target px), i.e. ~5.1 Mpx at 40 Mpx input.
         let target = f64::from(p.max_soft_tokens * p.pool * p.pool * p.patch * p.patch);
-        for (h, w) in [(378, 105_000), (105_000, 378), (6324, 6324), (480, 640), (1, 280), (280, 1), (30_000, 1333)] {
+        for (h, w) in [
+            (378, 105_000),
+            (105_000, 378),
+            (6324, 6324),
+            (480, 640),
+            (1, 280),
+            (280, 1),
+            (30_000, 1333),
+        ] {
             let (_, tw) = aspect_size(h, w, &p).unwrap_or_else(|e| panic!("{h}x{w}: {e}"));
             let intermediate = f64::from(h) * f64::from(tw);
             let bound = (f64::from(h) * f64::from(w) * target).sqrt();
-            assert!(intermediate <= bound * 1.001, "{h}x{w}: {intermediate} > {bound}");
+            assert!(
+                intermediate <= bound * 1.001,
+                "{h}x{w}: {intermediate} > {bound}"
+            );
         }
     }
 
@@ -567,7 +678,15 @@ mod tests {
         assert_eq!(resize_bicubic(&data, w, h, w, h), data);
         let mut p = params();
         p.max_soft_tokens = 2; // 18 patches budget: 48x96 -> 3x6 patches of 16
-        let pt = image_patches(&Rgb { width: w, height: h, data: data.clone() }, &p).unwrap();
+        let pt = image_patches(
+            &Rgb {
+                width: w,
+                height: h,
+                data: data.clone(),
+            },
+            &p,
+        )
+        .unwrap();
         assert_eq!(pt.grid, (3, 6));
         assert_eq!(pt.soft_tokens, 2);
         // Patch (row 1, col 2), pixel (py 3, px 4), channel 1.
@@ -601,27 +720,50 @@ mod tests {
     }
 
     fn fixture(name: &str) -> Vec<u8> {
-        std::fs::read(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/audio").join(name)).unwrap()
+        std::fs::read(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/audio")
+                .join(name),
+        )
+        .unwrap()
     }
 
     /// 0.4 s of a 0.5-amplitude 440 Hz tone (libsndfile 1.2.2): RMS 0.354, 880 zero crossings/s.
     fn assert_tone(samples: &[f32], rate: u32, what: &str) {
         let seconds = samples.len() as f64 / f64::from(rate);
-        assert!((0.38..0.56).contains(&seconds), "{what}: {seconds} s (codec padding at most ~0.15 s)");
-        let rms = (samples.iter().map(|v| f64::from(*v).powi(2)).sum::<f64>() / samples.len() as f64).sqrt();
+        assert!(
+            (0.38..0.56).contains(&seconds),
+            "{what}: {seconds} s (codec padding at most ~0.15 s)"
+        );
+        let rms = (samples.iter().map(|v| f64::from(*v).powi(2)).sum::<f64>()
+            / samples.len() as f64)
+            .sqrt();
         assert!((0.25..0.40).contains(&rms), "{what}: rms {rms}");
         // Over the middle half: codec padding at the edges is near-silent noise.
         let mid = &samples[samples.len() / 4..samples.len() * 3 / 4];
-        let crossings = mid.windows(2).filter(|w| (w[0] < 0.0) != (w[1] < 0.0)).count() as f64 * 2.0 / seconds;
-        assert!((700.0..900.0).contains(&crossings), "{what}: {crossings} crossings/s");
+        let crossings = mid
+            .windows(2)
+            .filter(|w| (w[0] < 0.0) != (w[1] < 0.0))
+            .count() as f64
+            * 2.0
+            / seconds;
+        assert!(
+            (700.0..900.0).contains(&crossings),
+            "{what}: {crossings} crossings/s"
+        );
     }
 
     #[test]
     fn compressed_audio_decodes_by_label_and_by_sniffing() {
-        for (file, format) in [("tone.mp3", "mp3"), ("tone.flac", "flac"), ("tone.ogg", "ogg")] {
+        for (file, format) in [
+            ("tone.mp3", "mp3"),
+            ("tone.flac", "flac"),
+            ("tone.ogg", "ogg"),
+        ] {
             let bytes = fixture(file);
             for label in [format, ""] {
-                let (samples, rate) = decode_audio(&bytes, label, 30.0).unwrap_or_else(|e| panic!("{file} {label:?}: {e}"));
+                let (samples, rate) = decode_audio(&bytes, label, 30.0)
+                    .unwrap_or_else(|e| panic!("{file} {label:?}: {e}"));
                 assert_eq!(rate, 16_000, "{file}");
                 assert_tone(&samples, rate, file);
             }
@@ -630,13 +772,22 @@ mod tests {
         let (samples, rate) = decode_audio(&fixture("tone_stereo44k.mp3"), "mp3", 30.0).unwrap();
         assert_eq!(rate, 44_100);
         assert_tone(&samples, rate, "stereo mp3");
-        assert_tone(&resample(&samples, rate, 16_000).unwrap(), 16_000, "stereo mp3 at 16 kHz");
+        assert_tone(
+            &resample(&samples, rate, 16_000).unwrap(),
+            16_000,
+            "stereo mp3 at 16 kHz",
+        );
     }
 
     #[test]
     fn zero_and_absurd_sample_rates_are_refused() {
         let mut wav = std::io::Cursor::new(Vec::new());
-        let spec = hound::WavSpec { channels: 1, sample_rate: 16_000, bits_per_sample: 16, sample_format: hound::SampleFormat::Int };
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 16_000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
         let mut w = hound::WavWriter::new(&mut wav, spec).unwrap();
         for _ in 0..4 {
             w.write_sample(1000i16).unwrap();
@@ -650,7 +801,9 @@ mod tests {
         assert!(err.contains("sample rate 0 Hz"), "{err}");
         bytes[24..28].copy_from_slice(&1_000_000u32.to_le_bytes());
         bytes[28..32].copy_from_slice(&2_000_000u32.to_le_bytes());
-        assert!(decode_wav(&bytes).unwrap_err().contains("sample rate 1000000 Hz"));
+        assert!(decode_wav(&bytes)
+            .unwrap_err()
+            .contains("sample rate 1000000 Hz"));
         assert!(resample(&[0.5; 4], 0, 16_000).is_err());
         assert!(resample(&[0.5; 4], 16_000, 0).is_err());
         assert!(resample(&[0.5; 4], 1, 16_000).is_err());
@@ -660,12 +813,24 @@ mod tests {
     #[test]
     fn unsupported_corrupt_and_long_audio_is_refused() {
         let mp3 = fixture("tone.mp3");
-        assert!(decode_audio(&mp3, "opus", 30.0).unwrap_err().contains("send wav, mp3, flac or ogg"));
-        assert!(decode_audio(b"not audio at all", "", 30.0).unwrap_err().contains("unrecognized audio"));
-        assert!(decode_audio(b"not audio at all", "mp3", 30.0).unwrap_err().contains("unreadable mp3"));
+        assert!(decode_audio(&mp3, "opus", 30.0)
+            .unwrap_err()
+            .contains("send wav, mp3, flac or ogg"));
+        assert!(decode_audio(b"not audio at all", "", 30.0)
+            .unwrap_err()
+            .contains("unrecognized audio"));
+        assert!(decode_audio(b"not audio at all", "mp3", 30.0)
+            .unwrap_err()
+            .contains("unreadable mp3"));
         // A mislabelled clip decodes as what it is: the label is a hint, the container decides.
-        assert_tone(&decode_audio(&mp3, "flac", 30.0).unwrap().0, 16_000, "mp3 labelled flac");
-        assert!(decode_audio(&fixture("tone.flac"), "flac", 0.1).unwrap_err().contains("longer than 0.1 s"));
+        assert_tone(
+            &decode_audio(&mp3, "flac", 30.0).unwrap().0,
+            16_000,
+            "mp3 labelled flac",
+        );
+        assert!(decode_audio(&fixture("tone.flac"), "flac", 0.1)
+            .unwrap_err()
+            .contains("longer than 0.1 s"));
         assert_eq!(mime_audio_format("audio/mpeg"), "mp3");
         assert_eq!(mime_audio_format("audio/x-wav"), "wav");
         assert_eq!(mime_audio_format("application/octet-stream"), "");

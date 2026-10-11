@@ -15,14 +15,17 @@ fn batched_logprob_stats_match_the_per_row_kernel() {
     let slots = e.batch.min(8);
     let mut feeds = Vec::new();
     for b in 0..slots {
-        let prompt: Vec<u32> = (0..48u32).map(|i| 100 + (i * 7 + 131 * b as u32) % 1000).collect();
+        let prompt: Vec<u32> = (0..48u32)
+            .map(|i| 100 + (i * 7 + 131 * b as u32) % 1000)
+            .collect();
         e.begin_slot(b, 64).unwrap();
         feeds.push((b, e.prefill_slot(b, &prompt).unwrap()));
     }
     let mut toks = Vec::new();
     e.step_slots(&feeds, &mut toks).unwrap();
-    let reqs: Vec<(u32, u32, u32)> =
-        (0..slots).map(|b| (b as u32, toks[b], [0u32, 1, 5, 20][b % 4])).collect();
+    let reqs: Vec<(u32, u32, u32)> = (0..slots)
+        .map(|b| (b as u32, toks[b], [0u32, 1, 5, 20][b % 4]))
+        .collect();
     let mut rows = Vec::new();
     assert!(e.logprob_stats_rows(&reqs, &mut rows).unwrap());
     assert_eq!(rows.len(), slots);

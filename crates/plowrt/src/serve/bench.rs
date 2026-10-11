@@ -350,7 +350,11 @@ pub struct SloReport {
     pub goodput_rps: f64,
 }
 
-fn slo_report(targets: crate::sched::slo::Targets, results: &[RequestResult], secs: f64) -> Option<SloReport> {
+fn slo_report(
+    targets: crate::sched::slo::Targets,
+    results: &[RequestResult],
+    secs: f64,
+) -> Option<SloReport> {
     if !targets.active() {
         return None;
     }
@@ -737,7 +741,11 @@ pub async fn run(state: &AppState, cfg: Config) -> Result<Report> {
         tpot_ms: distribution(tpot),
         itl_ms: distribution(itl),
         e2e_ms: distribution(e2e).expect("one result"),
-        slo: slo_report(crate::config::RuntimeConfig::get().slo_targets(), &results, secs),
+        slo: slo_report(
+            crate::config::RuntimeConfig::get().slo_targets(),
+            &results,
+            secs,
+        ),
         output_checksum: checksum(&results),
         artifacts,
         runtime: cfg.runtime,

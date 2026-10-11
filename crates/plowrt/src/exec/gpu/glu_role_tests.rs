@@ -20,10 +20,27 @@ fn bf16(rows: u32, n: u32, k: u32) -> (DevInst64, Vec<DevTensor>) {
     let inst = DevInst64 {
         op: DevOp::GemmGlu as u16,
         i: [rows, n, k, 4, 0, 0, 5, 6],
-        t: [0, 1, 2, TENSOR_NONE16, TENSOR_NONE16, 3, TENSOR_NONE16, TENSOR_NONE16],
+        t: [
+            0,
+            1,
+            2,
+            TENSOR_NONE16,
+            TENSOR_NONE16,
+            3,
+            TENSOR_NONE16,
+            TENSOR_NONE16,
+        ],
         ..Default::default()
     };
-    let sizes = [m * n64 * 2, m * k64 * 2, n64 * k64 * 2, n64 * k64 * 2, 128, 128, 128];
+    let sizes = [
+        m * n64 * 2,
+        m * k64 * 2,
+        n64 * k64 * 2,
+        n64 * k64 * 2,
+        128,
+        128,
+        128,
+    ];
     (inst, tensors(&sizes))
 }
 
@@ -67,7 +84,11 @@ fn glu_roles_check_the_descriptor_shape_or_the_legacy_gemma_shape() {
                 validate_gemma4_w8a8_glu_role_inst(&inst, inst.i[0], &tensors, gemm)
             }
         };
-        let build = if role == BF16_PREFILL_GEMM_GLU_GEMMA4 { bf16 } else { w8a8 };
+        let build = if role == BF16_PREFILL_GEMM_GLU_GEMMA4 {
+            bf16
+        } else {
+            w8a8
+        };
         for rows in [4096, 8192] {
             check(build(rows, 15360, 3840), &legacy).unwrap();
             assert!(check(build(rows, 15360, 3840), &shaped).is_err());

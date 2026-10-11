@@ -12,21 +12,39 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_writer(std::io::stderr)
         .init();
     let args: Vec<_> = std::env::args().collect();
-    let split = args.iter().position(|a| a == "--").ok_or("usage: asr_stream_check PACKET TOKENIZER [BACKEND] [CHUNK_MS] -- AUDIO.wav...")?;
+    let split = args
+        .iter()
+        .position(|a| a == "--")
+        .ok_or("usage: asr_stream_check PACKET TOKENIZER [BACKEND] [CHUNK_MS] -- AUDIO.wav...")?;
     if split < 3 {
-        return Err("usage: asr_stream_check PACKET TOKENIZER [BACKEND] [CHUNK_MS] -- AUDIO.wav...".into());
+        return Err(
+            "usage: asr_stream_check PACKET TOKENIZER [BACKEND] [CHUNK_MS] -- AUDIO.wav...".into(),
+        );
     }
-    let backend = args.get(3).filter(|_| split > 3).map_or("auto", String::as_str);
-    let chunk_ms: usize = args.get(4).filter(|_| split > 4).map_or(Ok(320), |v| v.parse())?;
+    let backend = args
+        .get(3)
+        .filter(|_| split > 3)
+        .map_or("auto", String::as_str);
+    let chunk_ms: usize = args
+        .get(4)
+        .filter(|_| split > 4)
+        .map_or(Ok(320), |v| v.parse())?;
     let mut loaded = load_packet_transcriber(Path::new(&args[1]), Path::new(&args[2]), backend)?;
     let cancel = AtomicBool::new(false);
     let words = |s: &str| -> Vec<String> {
-        s.to_lowercase().split(|c: char| !c.is_alphanumeric() && c != '\'').filter(|w| !w.is_empty()).map(str::to_owned).collect()
+        s.to_lowercase()
+            .split(|c: char| !c.is_alphanumeric() && c != '\'')
+            .filter(|w| !w.is_empty())
+            .map(str::to_owned)
+            .collect()
     };
     for path in &args[split + 1..] {
         let samples = decode_wav(&std::fs::read(path)?)?;
         let offline = loaded.engine.transcribe(&samples, None, "", &cancel)?.text;
-        let id = loaded.engine.stream_open()?.ok_or("packet has no encoder stream")?;
+        let id = loaded
+            .engine
+            .stream_open()?
+            .ok_or("packet has no encoder stream")?;
         let (mut pushes, mut worst_ms, mut total_ms, mut first_text_s) = (0usize, 0f64, 0f64, None);
         let mut text = String::new();
         for (index, piece) in samples.chunks(16 * chunk_ms).enumerate() {

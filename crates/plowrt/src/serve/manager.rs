@@ -82,7 +82,10 @@ fn pinned_misfit(slug: &str, need: u64, free: u64) -> String {
 
 /// Run a switch's blocking step on a thread of its own: the blocking pool can be saturated by
 /// the very request load that needs this switch to finish.
-async fn on_own_thread<T: Send + 'static>(name: &str, f: impl FnOnce() -> T + Send + 'static) -> Result<T> {
+async fn on_own_thread<T: Send + 'static>(
+    name: &str,
+    f: impl FnOnce() -> T + Send + 'static,
+) -> Result<T> {
     let (tx, rx) = tokio::sync::oneshot::channel();
     std::thread::Builder::new()
         .name(name.into())
@@ -90,7 +93,8 @@ async fn on_own_thread<T: Send + 'static>(name: &str, f: impl FnOnce() -> T + Se
             let _ = tx.send(f());
         })
         .map_err(|e| RuntimeError::Msg(format!("{name} thread: {e}")))?;
-    rx.await.map_err(|_| RuntimeError::Msg(format!("{name} thread panicked")))
+    rx.await
+        .map_err(|_| RuntimeError::Msg(format!("{name} thread panicked")))
 }
 
 /// A load or bind that failed for device memory, however the layer below spelled it.
@@ -308,17 +312,19 @@ impl BlobPlan {
                     * u64::from(geo.kvh_full)
                     * layout.full_tensors.len() as u64
                     * 2;
-                let demand_virtual_bytes = virtual_bytes.checked_add(ring_virtual_bytes).ok_or_else(
-                    || RuntimeError::Rejected("live KV virtual byte overflow".into()),
-                )?;
-                plan.kv_bytes = plan
-                    .kv_bytes
-                    .checked_sub(demand_virtual_bytes)
+                let demand_virtual_bytes = virtual_bytes
+                    .checked_add(ring_virtual_bytes)
                     .ok_or_else(|| {
-                        RuntimeError::Rejected("live KV plan tensor classification".into())
-                    })?
-                    + resident
-                    + crate::memory::vmm::kv_pool_cap();
+                        RuntimeError::Rejected("live KV virtual byte overflow".into())
+                    })?;
+                plan.kv_bytes =
+                    plan.kv_bytes
+                        .checked_sub(demand_virtual_bytes)
+                        .ok_or_else(|| {
+                            RuntimeError::Rejected("live KV plan tensor classification".into())
+                        })?
+                        + resident
+                        + crate::memory::vmm::kv_pool_cap();
             } else if let Some(layout) = prefix_layout {
                 let geo = &layout.geo;
                 geo.block_bytes(granularity, u64::from(config.vmm_block_mib()) << 20)?;
@@ -369,13 +375,17 @@ fn sidecar_bytes(pkt: &Path) -> Result<u64> {
         if !path.is_file() {
             continue;
         }
-        let raw = std::fs::read(&path).map_err(|source| RuntimeError::Io { path: path.clone(), source })?;
+        let raw = std::fs::read(&path).map_err(|source| RuntimeError::Io {
+            path: path.clone(),
+            source,
+        })?;
         let blob = DevBlob::parse_l2(&raw, true)?;
         let ctr = u64::from(packet::dev::CTR_STRIDE) * 4;
         let mut counters = 0u64;
         for p in &blob.progs {
             let segments = p.gq_seg_ofs.len().saturating_sub(1) as u64;
-            counters += (u64::from(p.n_counter) * ctr).max(4).next_multiple_of(256) + segments * ctr;
+            counters +=
+                (u64::from(p.n_counter) * ctr).max(4).next_multiple_of(256) + segments * ctr;
             total += [
                 std::mem::size_of_val(&p.insts[..]),
                 std::mem::size_of_val(&p.stream[..]),
@@ -709,7 +719,11 @@ impl ModelManager {
             .filter(|v| v.slug != target && self.is_resident(&v.slug))
             .map(|v| v.slug.clone())
             .collect();
-        let idle: Vec<String> = victims.iter().filter(|v| self.is_idle(v)).cloned().collect();
+        let idle: Vec<String> = victims
+            .iter()
+            .filter(|v| self.is_idle(v))
+            .cloned()
+            .collect();
         let last_use = self.last_use.lock();
         pick_victim(&idle, &last_use).or_else(|| pick_victim(&victims, &last_use))
     }
@@ -717,8 +731,14 @@ impl ModelManager {
     /// No request queued, tokenizing, in an engine slot or in a downstream stage, and none
     /// arrived for [`IDLE_GRACE`] (an ASR request encodes before it reaches the mux).
     fn is_idle(&self, slug: &str) -> bool {
-        let Some(state) = self.state.upgrade() else { return false };
-        let recent = self.last_use.lock().get(slug).is_some_and(|t| t.elapsed() < IDLE_GRACE);
+        let Some(state) = self.state.upgrade() else {
+            return false;
+        };
+        let recent = self
+            .last_use
+            .lock()
+            .get(slug)
+            .is_some_and(|t| t.elapsed() < IDLE_GRACE);
         !recent
             && state.mux(slug).is_none_or(|m| !m.in_flight())
             && state.downstream(slug).pending() == 0
@@ -729,7 +749,9 @@ impl ModelManager {
     /// skipped while a switch holds the lock (that switch changes residency anyway).
     pub fn request_growth(self: &Arc<Self>, slug: &str) {
         use std::sync::atomic::Ordering;
-        if crate::config::RuntimeConfig::get().nv.pin_resident || self.growing.swap(true, Ordering::AcqRel) {
+        if crate::config::RuntimeConfig::get().nv.pin_resident
+            || self.growing.swap(true, Ordering::AcqRel)
+        {
             return;
         }
         let Some(runtime) = self.runtime.clone() else {
@@ -798,7 +820,9 @@ impl ModelManager {
             .read()
             .iter()
             .filter(|m| self.is_resident(&m.slug))
-            .map(|m| m.plan.tensor_total() + overhead.get(&m.slug).copied().unwrap_or(DEFAULT_OVERHEAD))
+            .map(|m| {
+                m.plan.tensor_total() + overhead.get(&m.slug).copied().unwrap_or(DEFAULT_OVERHEAD)
+            })
             .sum();
         Ok(cap.saturating_sub(planned))
     }
@@ -1011,7 +1035,11 @@ impl ModelManager {
 
     /// Unload a DP rank: in-flight work drains for up to `bound` (new work already routes to the
     /// other ranks), then the rest is stopped.
-    pub async fn unload_rank(&self, key: &str, bound: Duration) -> std::result::Result<UnloadReport, EnsureError> {
+    pub async fn unload_rank(
+        &self,
+        key: &str,
+        bound: Duration,
+    ) -> std::result::Result<UnloadReport, EnsureError> {
         let _g = self.switch.lock().await;
         self.unload_locked(key, Stop::Bounded(bound)).await
     }
@@ -1038,7 +1066,11 @@ impl ModelManager {
         Ok(report)
     }
 
-    async fn unload_locked(&self, slug: &str, stop: Stop) -> std::result::Result<UnloadReport, EnsureError> {
+    async fn unload_locked(
+        &self,
+        slug: &str,
+        stop: Stop,
+    ) -> std::result::Result<UnloadReport, EnsureError> {
         if !self.manages(slug) {
             return Err(EnsureError::Load(RuntimeError::UnknownModel(slug.into())));
         }
@@ -1274,7 +1306,10 @@ impl ModelManager {
     /// spawn its dispatcher. Calibrates the overhead cache on first load.
     async fn load_model(&self, m: &Managed) -> std::result::Result<(), EnsureError> {
         let state = self.state()?;
-        let bundle = state.registry.get(state.model_of(&m.slug)).map_err(EnsureError::Load)?;
+        let bundle = state
+            .registry
+            .get(state.model_of(&m.slug))
+            .map_err(EnsureError::Load)?;
         if bundle.tokenizer().is_byte_fallback() {
             return Err(EnsureError::Load(RuntimeError::Msg(format!(
                 "{}: GPU engine requires a real tokenizer.json in {}",
@@ -1316,11 +1351,12 @@ impl ModelManager {
         let pool_before = VmmOps::pool_bytes(&*self.be);
         let be = Arc::clone(&self.be);
         let (dir, ckpt) = (m.dir.clone(), m.ckpt.clone());
-        let engine =
-            on_own_thread("plow-load", move || crate::exec::gpu::GpuEngine::load(be, &dir, &ckpt))
-                .await
-                .and_then(|engine| engine)
-                .map_err(EnsureError::Load)?;
+        let engine = on_own_thread("plow-load", move || {
+            crate::exec::gpu::GpuEngine::load(be, &dir, &ckpt)
+        })
+        .await
+        .and_then(|engine| engine)
+        .map_err(EnsureError::Load)?;
         mux::check_speech_packet(&engine).map_err(EnsureError::Load)?;
         let (free_after, _) = self.be.mem_info().map_err(EnsureError::Load)?;
         let pool_after = VmmOps::pool_bytes(&*self.be);
@@ -1404,7 +1440,9 @@ fn drain_timeout_ms() -> Option<u64> {
 
 /// `--switch-timeout-ms` / `PLOW_SWITCH_TIMEOUT_MS` (600 s when unset, 0 = unbounded).
 fn switch_timeout() -> Option<Duration> {
-    let ms = crate::config::RuntimeConfig::get().switch_timeout_ms.unwrap_or(600_000);
+    let ms = crate::config::RuntimeConfig::get()
+        .switch_timeout_ms
+        .unwrap_or(600_000);
     (ms > 0).then(|| Duration::from_millis(ms))
 }
 
@@ -1433,7 +1471,10 @@ mod tests {
 
     #[test]
     fn the_switch_lock_wait_is_bounded_by_default() {
-        if crate::config::RuntimeConfig::get().switch_timeout_ms.is_none() {
+        if crate::config::RuntimeConfig::get()
+            .switch_timeout_ms
+            .is_none()
+        {
             assert_eq!(switch_timeout(), Some(Duration::from_secs(600)));
         }
         let e = EnsureError::SwitchTimeout(Duration::from_secs(600));
@@ -1460,7 +1501,11 @@ mod tests {
         assert_eq!(p.other_bytes, 28);
         assert_eq!(p.tensor_total(), 238);
         p.sidecar_bytes = 12;
-        assert_eq!(p.tensor_total(), 250, "sibling packets are part of the footprint");
+        assert_eq!(
+            p.tensor_total(),
+            250,
+            "sibling packets are part of the footprint"
+        );
         assert_eq!(p.slab_reusable(), 178, "but never ride the weight slab");
     }
 
@@ -1534,4 +1579,3 @@ fn same_path(a: &Path, b: &Path) -> bool {
             .zip(b.canonicalize().ok())
             .is_some_and(|(a, b)| a == b)
 }
-

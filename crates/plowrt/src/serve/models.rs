@@ -28,7 +28,14 @@ fn card(state: &AppState, id: String, canonical: &str) -> ModelCard {
             .get(canonical)
             .ok()
             .filter(|_| state.has_gpu_engine(canonical))
-            .and_then(|b| b.serve().multimodal.as_ref().map(|c| c.modalities.iter().map(|m| m.kind.clone()).collect::<Vec<_>>()))
+            .and_then(|b| {
+                b.serve().multimodal.as_ref().map(|c| {
+                    c.modalities
+                        .iter()
+                        .map(|m| m.kind.clone())
+                        .collect::<Vec<_>>()
+                })
+            })
             .unwrap_or_default();
         std::iter::once("text".to_string()).chain(media).collect()
     } else {
@@ -57,7 +64,9 @@ pub(crate) fn endpoints(state: &AppState, canonical: &str) -> Vec<&'static str> 
         // A speech LM's tokens are codec / speech ids: it serves audio, not text.
         return vec!["audio/speech"];
     } else if crate::asr::serving::serves_audio(state, canonical)
-        || crate::asr::serving::packet_model_names().iter().any(|n| n == canonical)
+        || crate::asr::serving::packet_model_names()
+            .iter()
+            .any(|n| n == canonical)
     {
         // An audio LM's prompt contract needs audio: transcription only, as a packet ASR card.
         return vec!["audio/transcriptions", "audio/transcriptions/stream"];
@@ -78,7 +87,10 @@ pub(crate) fn unserved(model: &str, endpoint: &str, served: &[&str]) -> Response
     let served: Vec<String> = served.iter().map(|e| format!("/v1/{e}")).collect();
     crate::serve::api_error(
         axum::http::StatusCode::BAD_REQUEST,
-        format!("model '{model}' does not serve /v1/{endpoint}; it serves {}", served.join(", ")),
+        format!(
+            "model '{model}' does not serve /v1/{endpoint}; it serves {}",
+            served.join(", ")
+        ),
         "invalid_request_error",
         Some("model_not_supported_for_endpoint"),
         Some("model".into()),
@@ -124,7 +136,11 @@ pub async fn list_models(State(state): State<Arc<AppState>>) -> Json<ModelList> 
             .map(|(alias, canonical)| card(&state, alias, &canonical)),
     );
     #[cfg(feature = "cuda")]
-    data.extend(crate::asr::serving::packet_model_names().into_iter().map(|name| audio_card(&state, name)));
+    data.extend(
+        crate::asr::serving::packet_model_names()
+            .into_iter()
+            .map(|name| audio_card(&state, name)),
+    );
     Json(ModelList {
         object: "list",
         data,

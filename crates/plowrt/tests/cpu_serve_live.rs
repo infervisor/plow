@@ -150,10 +150,16 @@ fn live_token_batch_matches_isolated_paths() {
     let b = prompt("What is the capital of Germany? Answer in one word.");
     let c = prompt("What is the capital of Italy? Answer in one word.");
     let mut opts = CpuEngineOpts::default();
-    opts.threads = std::env::var("PLOW_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(16);
+    opts.threads = std::env::var("PLOW_THREADS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(16);
     let mut e = CpuServe::load(&blob, &ckpt, &opts).expect("load");
     assert!(e.batch() >= 3, "blob must serve >= 3 slots");
-    assert!(e.token_batch_rows(1, 0, 1).is_some(), "packet has no packed prefill bucket");
+    assert!(
+        e.token_batch_rows(1, 0, 1).is_some(),
+        "packet has no packed prefill bucket"
+    );
 
     let ref_b = e.prefill(1, &b).expect("prefill b");
     SeqEngine::release(&mut e, 1);
@@ -169,22 +175,41 @@ fn live_token_batch_matches_isolated_paths() {
     let t0 = e.prefill(0, &a).expect("prefill a");
     let mut out = Vec::new();
     for (s, p) in [(1, &b), (2, &c)] {
-        e.prepare_packed_prefill_slot(s, p, u32::MAX).expect("prepare");
+        e.prepare_packed_prefill_slot(s, p, u32::MAX)
+            .expect("prepare");
     }
     let cut = (b.len() / 2) as u32;
-    e.token_batch_step(0, &[(0, t0)], &[(1, &b, cut), (2, &c, c.len() as u32)], &mut out)
-        .expect("token batch 1");
+    e.token_batch_step(
+        0,
+        &[(0, t0)],
+        &[(1, &b, cut), (2, &c, c.len() as u32)],
+        &mut out,
+    )
+    .expect("token batch 1");
     eprintln!("token batch 1 -> {out:?}");
     assert_eq!(out.len(), 2, "feed + completed prompt");
     assert_eq!(out[0].0, 0);
-    assert_eq!(out[1], (2, ref_c), "completed prompt samples its whole-prefill token");
+    assert_eq!(
+        out[1],
+        (2, ref_c),
+        "completed prompt samples its whole-prefill token"
+    );
     assert_eq!(e.prefill_frontier(1), Some(cut as usize));
     let (o0, o2) = (out[0].1, out[1].1);
-    e.token_batch_step(0, &[(0, o0), (2, o2)], &[(1, &b, b.len() as u32 - cut)], &mut out)
-        .expect("token batch 2");
+    e.token_batch_step(
+        0,
+        &[(0, o0), (2, o2)],
+        &[(1, &b, b.len() as u32 - cut)],
+        &mut out,
+    )
+    .expect("token batch 2");
     eprintln!("token batch 2 -> {out:?}");
     assert_eq!(out.len(), 3);
-    assert_eq!(out[2], (1, ref_b), "a prompt split across launches samples its whole-prefill token");
+    assert_eq!(
+        out[2],
+        (1, ref_b),
+        "a prompt split across launches samples its whole-prefill token"
+    );
 
     let mut ids = vec![t0, o0, out[0].1];
     let mut feeds: Vec<(usize, u32)> = out.iter().map(|&(s, t)| (s as usize, t)).collect();
@@ -194,7 +219,10 @@ fn live_token_batch_matches_isolated_paths() {
         feeds = o;
     }
     eprintln!("slot 0 text: {:?}", tok.decode(&ids));
-    assert_eq!(ids, ref_a, "decode rows inside a token batch keep the isolated greedy sequence");
+    assert_eq!(
+        ids, ref_a,
+        "decode rows inside a token batch keep the isolated greedy sequence"
+    );
 }
 
 /// Token-batch cost on a real packet: a decode step of every slot, a prefill chunk alone, the
@@ -206,9 +234,15 @@ fn live_token_batch_cost() {
         eprintln!("PLOW_LADDER_BLOB / PLOW_CKPT unset — skipping");
         return;
     };
-    let rows: u32 = std::env::var("PLOW_TB_ROWS").ok().and_then(|v| v.parse().ok()).unwrap_or(1024);
+    let rows: u32 = std::env::var("PLOW_TB_ROWS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1024);
     let mut opts = CpuEngineOpts::default();
-    opts.threads = std::env::var("PLOW_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(96);
+    opts.threads = std::env::var("PLOW_THREADS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(96);
     let mut e = CpuServe::load(&blob, &ckpt, &opts).expect("load");
     let b = e.batch();
     let live = b - 2;
@@ -235,25 +269,47 @@ fn live_token_batch_cost() {
     let mut reset = |e: &mut CpuServe| {
         SeqEngine::release(e, pa);
         SeqEngine::release(e, pb);
-        e.prepare_packed_prefill_slot(pa, &long, u32::MAX).expect("prep");
-        e.prepare_packed_prefill_slot(pb, &long[..rows as usize / 2], u32::MAX).expect("prep");
+        e.prepare_packed_prefill_slot(pa, &long, u32::MAX)
+            .expect("prep");
+        e.prepare_packed_prefill_slot(pb, &long[..rows as usize / 2], u32::MAX)
+            .expect("prep");
     };
     time(&format!("chunk alone, {rows} rows, no sample"), &mut || {
         reset(&mut e);
-        e.token_batch_step(0, &[], &[(pa, &long, rows)], &mut out).expect("chunk");
+        e.token_batch_step(0, &[], &[(pa, &long, rows)], &mut out)
+            .expect("chunk");
     });
     time(&format!("chunk + {live} decode feeds"), &mut || {
         reset(&mut e);
-        e.token_batch_step(0, &feeds, &[(pa, &long, rows - live as u32)], &mut out).expect("tb");
+        e.token_batch_step(0, &feeds, &[(pa, &long, rows - live as u32)], &mut out)
+            .expect("tb");
         feeds = out.iter().map(|&(s, t)| (s as usize, t)).collect();
     });
-    time(&format!("chunk + {live} feeds + completing prompt (head on {} rows)", live + 1), &mut || {
-        reset(&mut e);
-        let half = rows / 2;
-        e.token_batch_step(0, &feeds, &[(pa, &long, half - live as u32), (pb, &long[..half as usize], half)], &mut out)
+    time(
+        &format!(
+            "chunk + {live} feeds + completing prompt (head on {} rows)",
+            live + 1
+        ),
+        &mut || {
+            reset(&mut e);
+            let half = rows / 2;
+            e.token_batch_step(
+                0,
+                &feeds,
+                &[
+                    (pa, &long, half - live as u32),
+                    (pb, &long[..half as usize], half),
+                ],
+                &mut out,
+            )
             .expect("tb2");
-        feeds = out.iter().filter(|o| (o.0 as usize) < live).map(|&(s, t)| (s as usize, t)).collect();
-    });
+            feeds = out
+                .iter()
+                .filter(|o| (o.0 as usize) < live)
+                .map(|&(s, t)| (s as usize, t))
+                .collect();
+        },
+    );
 }
 
 /// Whole-prompt prefill time of one `PLOW_PF_TOKENS`-token prompt (default 12288), for profiling
@@ -265,15 +321,24 @@ fn live_long_prefill_time() {
         eprintln!("PLOW_LADDER_BLOB / PLOW_CKPT unset — skipping");
         return;
     };
-    let n: usize = std::env::var("PLOW_PF_TOKENS").ok().and_then(|v| v.parse().ok()).unwrap_or(12288);
+    let n: usize = std::env::var("PLOW_PF_TOKENS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(12288);
     let mut opts = CpuEngineOpts::default();
-    opts.threads = std::env::var("PLOW_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(96);
+    opts.threads = std::env::var("PLOW_THREADS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(96);
     let mut e = CpuServe::load(&blob, &ckpt, &opts).expect("load");
     let prompt: Vec<u32> = (0..n as u32).map(|i| 2000 + (i * 7919) % 30000).collect();
     for run in 0..2 {
         let t = Instant::now();
         e.prefill(0, &prompt).expect("prefill");
-        eprintln!("prefill {n} tokens (run {run}): {:.0} ms", t.elapsed().as_secs_f64() * 1e3);
+        eprintln!(
+            "prefill {n} tokens (run {run}): {:.0} ms",
+            t.elapsed().as_secs_f64() * 1e3
+        );
         SeqEngine::release(&mut e, 0);
     }
 }

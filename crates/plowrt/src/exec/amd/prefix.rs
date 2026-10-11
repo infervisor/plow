@@ -117,8 +117,8 @@ pub(super) fn snapshot_regions<'a>(
                 != packet::ctx_bound::Scaling::IndexerBlock16
                 || ctx % 16 != 0
                 || d.i[1] != ctx
-                || tensor.bytes != packet::ctx_bound::indexer_prefix_bytes(ctx)
-                    .checked_mul(batch as u64)?
+                || tensor.bytes
+                    != packet::ctx_bound::indexer_prefix_bytes(ctx).checked_mul(batch as u64)?
             {
                 return None;
             }
@@ -126,10 +126,12 @@ pub(super) fn snapshot_regions<'a>(
             known[index] = true;
             continue;
         }
-        if d.t.iter().any(|&h| tensors.get(h as usize).is_some_and(|t| {
-            packet::ctx_bound::tensor_scaling(&t.name)
-                == packet::ctx_bound::Scaling::IndexerBlock16
-        })) {
+        if d.t.iter().any(|&h| {
+            tensors.get(h as usize).is_some_and(|t| {
+                packet::ctx_bound::tensor_scaling(&t.name)
+                    == packet::ctx_bound::Scaling::IndexerBlock16
+            })
+        }) {
             return None;
         }
         let dst = d.t[0] as usize;
@@ -236,11 +238,15 @@ mod tests {
         d.op = DevOp::IndexFp8Decode as u16;
         d.t[4] = 0;
         d.i[1] = 64;
-        assert!(snapshot_regions(&tensors, [d, d].iter(), 4, 64).unwrap().is_empty());
+        assert!(snapshot_regions(&tensors, [d, d].iter(), 4, 64)
+            .unwrap()
+            .is_empty());
         let mut prefill = d;
         prefill.op = DevOp::IndexFp8Prefill as u16;
         prefill.i[2] = 1;
-        assert!(snapshot_regions(&tensors, [d, prefill].iter(), 4, 64).unwrap().is_empty());
+        assert!(snapshot_regions(&tensors, [d, prefill].iter(), 4, 64)
+            .unwrap()
+            .is_empty());
         assert!(snapshot_regions(&tensors, [].iter(), 4, 64).is_none());
         let mut unknown = d;
         unknown.op = DevOp::RmsNorm as u16;
