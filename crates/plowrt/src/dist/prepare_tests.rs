@@ -250,3 +250,30 @@ fn a_directory_that_is_not_a_checkpoint_says_what_is_needed() {
         let _ = std::fs::remove_dir_all(p);
     }
 }
+
+/// A `dist` revision is a label a publisher may reuse with new content, so
+/// a rebuilt farm holds the new snapshot's shards and nothing from before.
+#[test]
+fn a_rebuilt_farm_keeps_no_shard_from_the_previous_snapshot() {
+    let store = tmp("store-rebuild");
+    let bdir = tmp("bundle-rebuild");
+    std::fs::write(bdir.join("model.pkt"), b"pkt").unwrap();
+    let b = bundle(from_checkpoint(), vec![packet_file()]);
+
+    let old = snapshot("snap-old", 3, &["tokenizer.json"]);
+    let farm = build(&store, &b, &bdir, &old).unwrap();
+    assert!(farm.dir.join("model-00003-of-00003.safetensors").exists());
+
+    let new = snapshot("snap-new", 2, &["tokenizer.json"]);
+    let farm = build(&store, &b, &bdir, &new).unwrap();
+    let shards = std::fs::read_dir(&farm.dir)
+        .unwrap()
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().ends_with(".safetensors"))
+        .count();
+    assert_eq!(shards, 2, "a stale shard would load beside the new ones");
+    assert!(
+        old.join("model-00003-of-00003.safetensors").exists(),
+        "targets untouched"
+    );
+}

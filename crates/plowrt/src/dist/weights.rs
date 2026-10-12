@@ -66,10 +66,11 @@ pub fn checkpoint_key(bundle: &Bundle) -> String {
 /// Where a `dist` checkpoint's snapshot lives:
 /// `snapshots/dist--<namespace>--<name>@<revision>/`. The revision is
 /// validated as one path component with the bundle; the namespace and name
-/// are checked here, because they become path components too.
+/// are checked here too (also by `Bundle::validate`), because they become
+/// path components, and a `--` inside one would make two models' keys equal.
 pub fn dist_snapshot_path(store_root: &Path, bundle: &Bundle) -> Result<PathBuf> {
     for part in [&bundle.namespace, &bundle.name] {
-        if !safe_repo_path(part) || part.contains('/') {
+        if !safe_repo_path(part) || part.contains('/') || part.contains("--") {
             return Err(RuntimeError::Dist(format!(
                 "{}/{}: not a namespace and name a snapshot can be stored under",
                 bundle.namespace, bundle.name

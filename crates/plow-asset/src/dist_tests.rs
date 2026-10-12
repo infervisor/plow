@@ -661,6 +661,12 @@ fn a_dist_checkpoint_lists_safe_files_matching_its_shard_count() {
         assert!(b.validate().is_err(), "accepted revision {rev:?}");
     }
 
+    for (ns, name) in [("a--b", "c"), ("a", "b--c"), ("a", "..")] {
+        let mut b = dist.clone();
+        (b.namespace, b.name) = (ns.into(), name.into());
+        assert!(b.validate().is_err(), "accepted {ns}/{name}");
+    }
+
     let mut hf = bundle();
     hf.checkpoint.files = vec![file("model.safetensors")];
     let err = hf.validate().unwrap_err();

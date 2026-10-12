@@ -76,6 +76,10 @@ pub fn build(
         )));
     }
     let dir = farm_path(store_root, bundle);
+    // Rebuilt from empty: a `dist` revision is a label a publisher may reuse,
+    // and a shard left from the previous content would load beside the new
+    // ones. The farm holds only links, so nothing it points at is removed.
+    let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).map_err(|source| RuntimeError::Io {
         path: dir.clone(),
         source,

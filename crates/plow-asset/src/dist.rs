@@ -796,6 +796,20 @@ impl Bundle {
             }
         }
         self.checkpoint.validate()?;
+        // A `dist` checkpoint is stored as `dist--<namespace>--<name>@<rev>`:
+        // each part one path component, and no `--` inside one, or two models
+        // (`a--b/c`, `a/b--c`) would share a snapshot.
+        if self.checkpoint.source == DIST_SOURCE {
+            for part in [&self.namespace, &self.name] {
+                if !is_plain_name(part) || part.contains("--") {
+                    return Err(format!(
+                        "bundle: a `{DIST_SOURCE}` checkpoint is stored under its namespace and \
+                         name, which must be plain names without `--`; got {}/{}",
+                        self.namespace, self.name
+                    ));
+                }
+            }
+        }
         let mut rungs = std::collections::BTreeSet::new();
         for l in self.objset.iter().flat_map(|o| &o.lowrung) {
             if l.max == 0 || !rungs.insert(l.max) {
