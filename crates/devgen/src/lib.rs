@@ -5502,9 +5502,9 @@ fn emit_phase(
             && emit_config::active().fuse_hnr;
         // Every model this dense emitter serves (Gemma, Llama, Qwen, Chatterbox T3) rotates
         // NeoX-style (rotate_half). HEADNORM_ROPE's legacy pairing is GPT-J interleaved at hd 64
-        // (GLM/Kimi k_rope, emitted elsewhere), so hd 64 must force the half split. The AMD
-        // interpreter has no half-split hd64 arm yet, so its packets do not claim one.
-        let rope_pair = if hd == 64 && !amd {
+        // (GLM/Kimi k_rope, emitted elsewhere), so hd 64 must force the half split, on AMD too
+        // (its hd-64 half-split arm pairs across lanes, lane ^ 32).
+        let rope_pair = if hd == 64 {
             packet::dev::ROPE_PAIR_HALF
         } else {
             0
