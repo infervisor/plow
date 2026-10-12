@@ -78,8 +78,17 @@ env = { PLOW_DECODE_BATCH = "128", PLOW_GEMV_WALK = "1", PLOW_GEMV_MM = "4", PLO
 # FP32-reference gate on the 65536 packet (cap-plow-v6, prefix cache on, 2026-10-12): PASS,
 # kl_mean 0.0140 (vLLM 0.0368), kl_p99 0.23 (0.55), top1_decisive 0.996 (0.987), needles 18/18.
 # validate-v6: streams equal the FP32 continuation at rungs 1/8/32/128.
+# `PLOW_MLA_PF_V2 = "1"` (read at emit, packet/src/devbuild.rs) isolates FlashMlaPrefill in its own
+# segment, so the 2048/8192 buckets run the NoPE V2 MFMA arm on the 4-wave flash object instead of
+# the scalar decode body on the 8-wave interpreter (without it the program was one segment).
+# `PLOW_GLM_PF_NS = "2"` splits each (q-tile, head) item's causal range in two, as the gfx942
+# GLM-5.3 recipe does; its packet requires PLOW_MLA_PF_NS=1, so objects are rebuilt for it.
+# Measured 2026-10-12 (amd-bench TP8): FlashMlaPrefill at 4k 11 x 5.55 -> 11 x 1.13 ms; prefill
+# 1k/4k/8k/16k/32k 167/382/803/2081/6431 -> 147/333/598/1269/2767 ms. The nat-pride-1024 and
+# 4096-token synthetic streams equal v6's (ns=1 flipped the synthetic one at its second token).
+# The FP32-reference gate has not been rerun on this packet.
 [emit]
-env = { PLOW_MLA_PREFILL = "full:128,512,2048,8192", PLOW_DECODE_BATCH_LADDER = "1,8,32,128", PLOW_GLM_DECODE_GEMM_ROWS = "32", PLOW_GLM_DSA = "0", PLOW_GLM_SEQ_PAR = "1", PLOW_GLM_SEQ_PAR_PROJ = "0" }
+env = { PLOW_MLA_PREFILL = "full:128,512,2048,8192", PLOW_MLA_PF_V2 = "1", PLOW_GLM_PF_NS = "2", PLOW_DECODE_BATCH_LADDER = "1,8,32,128", PLOW_GLM_DECODE_GEMM_ROWS = "32", PLOW_GLM_DSA = "0", PLOW_GLM_SEQ_PAR = "1", PLOW_GLM_SEQ_PAR_PROJ = "0" }
 args = [
   "--emit", "devblob",
   "--arch", "gfx950",
