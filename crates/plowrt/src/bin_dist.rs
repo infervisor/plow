@@ -444,8 +444,10 @@ pub struct PublishTo<'a> {
 }
 
 #[cfg(feature = "dist")]
-/// `pack` into a temporary archive, then upload it to the registry's publish
-/// API. 409 means the registry already holds that `label@g<n>`.
+/// `pack` into a temporary archive, then publish it through the registry's
+/// staged upload: ask for an upload target, `PUT` the zip there, publish it.
+/// The target is a presigned bucket URL when the registry has one, so a large
+/// archive never passes the API's request limit.
 pub fn cmd_publish(
     bundle_path: &std::path::Path,
     objset_path: Option<&std::path::Path>,
@@ -453,50 +455,196 @@ pub fn cmd_publish(
     objects: Option<&std::path::Path>,
     to: &PublishTo,
 ) -> Result<(), Err> {
-    let zip_path = std::env::temp_dir().join(format!("plowrt-publish-{}.zip", std::process::id()));
-    let packed = cmd_pack(bundle_path, objset_path, assets, objects, &zip_path);
-    let sent = packed.and_then(|()| upload(&zip_path, to));
-    let _ = std::fs::remove_file(&zip_path);
+    let dir = private_temp_dir()?;
+    let sent = (|| {
+        let Some(bundle) = next_generation(bundle_path, to.url)? else {
+            return Ok(());
+        };
+        let bundle_out = dir.join("bundle.json");
+        std::fs::write(&bundle_out, serde_json::to_vec_pretty(&bundle)?)?;
+        let zip_path = dir.join("bundle.zip");
+        cmd_pack(&bundle_out, objset_path, assets, objects, &zip_path)?;
+        upload(&zip_path, to, &bundle)
+    })();
+    let _ = std::fs::remove_dir_all(&dir);
     sent
 }
 
+/// The bundle as the registry's next generation of its label, as
+/// `publish_dist.py` numbers one; `None` when the newest generation already
+/// carries exactly these files and objset (a re-run publishes nothing).
 #[cfg(feature = "dist")]
-fn upload(zip_path: &std::path::Path, to: &PublishTo) -> Result<(), Err> {
-    let url = format!(
-        "{}/api/v1/admin/registry/publish/zip",
-        to.url.trim_end_matches('/')
-    );
+fn next_generation(
+    bundle_path: &std::path::Path,
+    registry: &str,
+) -> Result<Option<plow_asset::dist::Bundle>, Err> {
+    use plow_asset::dist::{Bundle, ModelIndex};
+    let mut bundle: Bundle = serde_json::from_slice(&std::fs::read(bundle_path)?)
+        .map_err(|e| format!("{}: {e}", bundle_path.display()))?;
+    let f = dist::fetch::transport(registry)?;
+    let model_dir = format!("v1/{}/{}", bundle.namespace, bundle.name);
+    let index: Option<ModelIndex> = f
+        .get(&format!("{model_dir}/index.json"))?
+        .map(|raw| serde_json::from_slice(&raw))
+        .transpose()
+        .map_err(|e| format!("{}: {model_dir}/index.json: {e}", f.describe()))?;
+    let newest = index
+        .iter()
+        .flat_map(|i| &i.variants)
+        .filter(|v| v.label == bundle.label)
+        .max_by_key(|v| v.generation);
+    if let Some(v) = newest {
+        let raw = f
+            .get(&format!("{model_dir}/{}", v.manifest))?
+            .ok_or_else(|| format!("{}: {model_dir}/{} is missing", f.describe(), v.manifest))?;
+        let published: Bundle = serde_json::from_slice(&raw)
+            .map_err(|e| format!("{}: {}: {e}", f.describe(), v.manifest))?;
+        let digests = |b: &Bundle| {
+            let mut d: Vec<_> = b.files.iter().map(|f| f.sha256.clone()).collect();
+            d.sort();
+            (d, b.objset.as_ref().map(|o| o.objset_id.clone()))
+        };
+        if digests(&published) == digests(&bundle) {
+            println!(
+                "already published: {}/{}:{}@g{} has these files",
+                bundle.namespace, bundle.name, bundle.label, v.generation
+            );
+            return Ok(None);
+        }
+    }
+    bundle.generation = newest.map_or(1, |v| v.generation + 1);
+    bundle.variant_id = variant_id(&bundle);
+    Ok(Some(bundle))
+}
+
+/// `publish_dist.py`'s `variant_id`: 12 hex of the sha256 over the full key,
+/// the build included, so two generations of one label never collide.
+#[cfg(feature = "dist")]
+fn variant_id(b: &plow_asset::dist::Bundle) -> String {
+    let parts = [
+        b.namespace.clone(),
+        b.name.clone(),
+        b.label.clone(),
+        b.generation.to_string(),
+        b.target.isa.clone(),
+        b.target.sku.clone(),
+        b.target.units.to_string(),
+        format!("{}{}", b.parallel.mode, b.parallel.n),
+        b.max_ctx.to_string(),
+        b.plow_git.clone(),
+        b.objset
+            .as_ref()
+            .map(|o| o.objset_id.clone())
+            .unwrap_or_default(),
+    ];
+    let digest = dist::Digest::of(parts.join("\x1f").as_bytes());
+    digest.as_str()[..12].to_string()
+}
+
+/// A new directory only this user can enter. `create_dir` refuses a path
+/// that exists, symlink or not, so nothing another user planted is written
+/// through.
+#[cfg(feature = "dist")]
+fn private_temp_dir() -> Result<PathBuf, Err> {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
+    for attempt in 0..16u32 {
+        let dir = std::env::temp_dir().join(format!(
+            "plowrt-publish-{}-{stamp}-{attempt}",
+            std::process::id()
+        ));
+        let mut builder = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+        match builder.create(&dir) {
+            Ok(()) => return Ok(dir),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(format!("{}: {e}", dir.display()).into()),
+        }
+    }
+    Err("could not create a private temporary directory".into())
+}
+
+#[cfg(feature = "dist")]
+fn upload(
+    zip_path: &std::path::Path,
+    to: &PublishTo,
+    bundle: &plow_asset::dist::Bundle,
+) -> Result<(), Err> {
+    #[derive(serde::Deserialize)]
+    struct UploadTarget {
+        id: String,
+        upload_url: String,
+    }
+    let base = to.url.trim_end_matches('/');
+    let auth = format!("Bearer {}", to.api_key);
     let agent = ureq::AgentBuilder::new()
         .timeout_connect(std::time::Duration::from_secs(20))
         .build();
-    let mut req = agent
-        .post(&url)
-        .set("Authorization", &format!("Bearer {}", to.api_key))
-        .set("Content-Type", "application/zip");
+    let failed = |url: &str, e: ureq::Error| -> Err {
+        match e {
+            ureq::Error::Status(code, resp) => {
+                format!("{url}: {code}: {}", resp.into_string().unwrap_or_default()).into()
+            }
+            // ureq's transport error already names the URL.
+            e => e.to_string().into(),
+        }
+    };
+
+    // 1. Where to put it.
+    let uploads = format!("{base}/api/v1/admin/registry/uploads");
+    let created = agent
+        .post(&uploads)
+        .set("Authorization", &auth)
+        .call()
+        .map_err(|e| failed(&uploads, e))?;
+    let target: UploadTarget =
+        serde_json::from_reader(created.into_reader()).map_err(|e| format!("{uploads}: {e}"))?;
+
+    // 2. The zip. An absolute URL is a presigned bucket and takes no
+    // credentials; a relative one is the registry itself.
+    let file = std::fs::File::open(zip_path)?;
+    let len = file.metadata()?.len().to_string();
+    let put_url = if target.upload_url.starts_with('/') {
+        format!("{base}{}", target.upload_url)
+    } else {
+        target.upload_url.clone()
+    };
+    let mut put = agent
+        .put(&put_url)
+        .set("Content-Type", "application/zip")
+        .set("Content-Length", &len);
+    if target.upload_url.starts_with('/') {
+        put = put.set("Authorization", &auth);
+    }
+    put.send(file).map_err(|e| failed(&put_url, e))?;
+
+    // 3. Publish it.
+    let publish = format!("{uploads}/{}/publish", target.id);
+    let mut req = agent.post(&publish).set("Authorization", &auth);
     if let Some(s) = to.status {
         req = req.query("status", s);
     }
     if let Some(d) = to.description {
         req = req.query("description", d);
     }
-    let file = std::fs::File::open(zip_path)?;
-    match req.send(file) {
+    match req.call() {
         Ok(resp) => {
             println!("published: {}", resp.into_string()?);
             Ok(())
         }
-        Err(ureq::Error::Status(409, resp)) => {
-            println!(
-                "already published: {}",
-                resp.into_string().unwrap_or_default()
-            );
-            Ok(())
-        }
-        Err(ureq::Error::Status(code, resp)) => {
-            Err(format!("{url}: {code}: {}", resp.into_string().unwrap_or_default()).into())
-        }
-        // ureq's transport error already names the URL.
-        Err(e) => Err(e.to_string().into()),
+        // Generations are immutable: another publish took this one first.
+        Err(ureq::Error::Status(409, resp)) => Err(format!(
+            "{}@g{} was published by someone else while this ran; run again for the next \
+             generation ({})",
+            bundle.label,
+            bundle.generation,
+            resp.into_string().unwrap_or_default()
+        )
+        .into()),
+        Err(e) => Err(failed(&publish, e)),
     }
 }
 
@@ -551,4 +699,23 @@ pub fn resolve_local(model: &str) -> Result<PathBuf, Err> {
         .into());
     }
     Ok(dir)
+}
+
+#[cfg(all(test, feature = "dist"))]
+mod tests {
+    #[test]
+    fn variant_id_is_publish_dists() {
+        // `publish_dist.py`'s `variant_id(bundle, 1)` for this bundle.
+        let b: plow_asset::dist::Bundle = serde_json::from_value(serde_json::json!({
+            "schema": "plow.dist.bundle.v1", "namespace": "infervisor", "name": "smollm2-360m",
+            "label": "metal3-apple-m4-pro-tp1-0k", "generation": 1, "variant_id": "",
+            "plow_git": "fa87c478", "network": "smollm2-360m-instruct",
+            "target": {"vendor": "apple", "isa": "metal3", "sku": "Apple M4 Pro", "units": 16, "mem_bytes": 19069665280u64},
+            "parallel": {"mode": "tp", "n": 1}, "max_ctx": 0, "files": [],
+            "tokenizer": {"file": "tokenizer.json", "generator": "plow", "sha256": "9ca9acddb6525a194ec8ac7a87f24fbba7232a9a15ffa1af0c1224fcd888e47c", "source": "derived", "verified": false},
+            "checkpoint": {"source": "hf:HuggingFaceTB/SmolLM2-360M-Instruct", "revision": "main", "shards": 0, "layout": "hf-safetensors", "bytes": 0}
+        }))
+        .unwrap();
+        assert_eq!(super::variant_id(&b), "b49b5c9cf598");
+    }
 }

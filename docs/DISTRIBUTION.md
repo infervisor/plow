@@ -202,10 +202,15 @@ PLOW_API_KEY=… plowrt publish --bundle bundle.json --assets <dir> \
   [--objset objset.json --objects <dir>] --to https://<registry>
 ```
 
-It posts to `<to>/api/v1/admin/registry/publish/zip`. The registry checks
-every file against its digest and assigns nothing: the bundle's own
-`label@g<n>` is published, and one the registry already holds is reported,
-not overwritten.
+Like `publish_dist.py`, it numbers the build against the live index: the
+next generation of its label, or nothing at all when the newest generation
+already carries exactly these files and objset, so a re-run is a no-op. The
+archive goes through the registry's staged upload (`POST
+<to>/api/v1/admin/registry/uploads`, `PUT` the zip to the returned URL, then
+`POST …/uploads/<id>/publish`), so a large build goes straight to the bucket
+past the API's request limit. The registry checks every file against its
+digest; a generation someone else published meanwhile is refused (409) and
+the command says to run again.
 
 ## Recipes
 
