@@ -2737,6 +2737,13 @@ __device__ __forceinline__ bf16v8 mpf_ld_w8(const unsigned char* p) {
 #ifndef PLOW_MOE_PF_SCHED
 #define PLOW_MOE_PF_SCHED 0
 #endif
+/* PLOW_MOE_PF_BRAW (single-stage loop, opt-in build axis): hold the next k-tile's fp8 B bytes raw
+ * across this k-tile's MFMAs and decode them at the LDS commit. Decoding at fetch puts a VALU
+ * consumer right behind the loads, so the k-loop waited out the whole B load before its MFMAs.
+ * Same decode, same bytes to the same LDS cells: bit-identical. */
+#ifndef PLOW_MOE_PF_BRAW
+#define PLOW_MOE_PF_BRAW 0
+#endif
 #if PLOW_CDNA4
 #define MPF_W_HALF 0
 /* CDNA4 twins of the halved helpers below, SAME signatures and element order, so the fetch
@@ -3216,6 +3223,7 @@ __device__ void d_moe_group_pf_t(void* __restrict__ Cout, const bf16* __restrict
 #else
         __align__(16) bf16 ra[APT], rb[BPT];
 #endif
+        fp8v16 rbw[BPASS / 2 > 0 ? BPASS / 2 : 1]; /* PLOW_MOE_PF_BRAW staging */
 
 /* Stage A: GLU gathers row_token[rowbase+r] out of xn2; DOWN reads fu_g contiguously from
  * rowbase. An UNUSED (pad) row zero-fills, which contributes nothing to any live output. */
@@ -3296,11 +3304,15 @@ __device__ void d_moe_group_pf_t(void* __restrict__ Cout, const bf16* __restrict
                     shuf ? MPF_SHUF_WP(wsrc, k0, el, kk, r)                                     \
                          : wsrc + (size_t)r * K + kk;                                           \
                 const fp8v16 w = ld_glob_fp8v16(wp);                                            \
-                if constexpr (MPF_W_HALF)                                                       \
+                if constexpr (PLOW_MOE_PF_BRAW)                                                 \
+                    rbw[it] = w;                                                                \
+                else if constexpr (MPF_W_HALF)                                                  \
                     mpf_fp8v16_to_bf16_h(w, *(bf16v8*)&rb[it * 16], *(bf16v8*)&rb[it * 16 + 8]); \
                 else                                                                            \
                     fp8_to_bf16v8(w, *(bf16v8*)&rb[it * 16], *(bf16v8*)&rb[it * 16 + 8]);       \
-            } else                                                                              \
+            } else if constexpr (PLOW_MOE_PF_BRAW)                                              \
+                rbw[it] = (fp8v16)(0u);                                                         \
+            else                                                                                \
                 _Pragma("unroll") for (int j = 0; j < 16; j++) rb[it * 16 + j] = 0;             \
         }                                                                                       \
     } else {                                                                                    \
@@ -3347,10 +3359,21 @@ __device__ void d_moe_group_pf_t(void* __restrict__ Cout, const bf16* __restrict
         _Pragma("unroll") for (int it = 0; it < BPASS / 2; it++) {                              \
             const unsigned el = threadIdx.x * 16 + it * (PLOW_THREADS * 16);                    \
             const unsigned br = el / MPF_BK, kk = el % MPF_BK;                                  \
+            if constexpr (PLOW_MOE_PF_BRAW) {                                                   \
+                bf16v8 blo, bhi;                                                                \
+                if constexpr (MPF_W_HALF)                                                       \
+                    mpf_fp8v16_to_bf16_h(rbw[it], blo, bhi);                                    \
+                else                                                                            \
+                    fp8_to_bf16v8(rbw[it], blo, bhi);                                           \
+                __builtin_memcpy(&MPF_BSM(buf)[br * MPF_STRIDE + MPF_XORSWZ(br, kk)], &blo, 16); \
+                __builtin_memcpy(&MPF_BSM(buf)[br * MPF_STRIDE + MPF_XORSWZ(br, kk + 8)], &bhi, \
+                                 16);                                                           \
+            } else {                                                                            \
             __builtin_memcpy(&MPF_BSM(buf)[br * MPF_STRIDE + MPF_XORSWZ(br, kk)],               \
                              &rb[it * 16], 16);                                                 \
             __builtin_memcpy(&MPF_BSM(buf)[br * MPF_STRIDE + MPF_XORSWZ(br, kk + 8)],           \
                              &rb[it * 16 + 8], 16);                                             \
+            }                                                                                   \
         }                                                                                       \
     } else {                                                                                    \
         _Pragma("unroll") for (int it = 0; it < BPASS; it++) {                                  \

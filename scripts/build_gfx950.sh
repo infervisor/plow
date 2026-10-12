@@ -976,16 +976,21 @@ BUILD_GEMMA_MOE=0; [ "${PLOW_GEMMA_MOE:-0}" = 1 ] && BUILD_GEMMA_MOE=1
 # MLA+MoE prefill object and the decode object under their K3 names. The paired config header
 # already derives PLOW_K3 / PLOW_KDA_CHUNK from the packet; -DPLOW_K3=1 restates it as the
 # gfx942 rows do.
+# K3_PF_MOE: grouped-MoE prefill axes, all value-identical (op_moe.h notes). GLM-5.3-Flash TP8
+# 4k prefill, MI350X: GroupDownPf 58.6 -> 20.2 ms, GroupGluPf 36.4 -> 24.3 ms (tile binsearch over
+# 288 experts, down-epilogue row-metadata hoist, raw fp8 B held across the MFMAs), CombinePf
+# 23.2 -> 6.3 ms (vector arm).
+K3_PF_MOE="-DPLOW_MOE_TILE_BINSEARCH=1 -DPLOW_MOE_PF_EPI=1 -DPLOW_MOE_PF_BRAW=1 -DPLOW_COMBINE_VEC=1"
 K3_ELFS=""
 if [ -n "${PLOW_HSACO_CONFIG:-}" ] &&
    grep -Eq '^#define PLOW_PACKET_OBJECT_REQUIRES "([^"]* )?PLOW_K3=1( |")' "$PLOW_HSACO_CONFIG"; then
-  genco "-DPLOW_BUCKET_DECODE=0 -DPLOW_MLA_PREFILL=1 -DPLOW_MOE_PREFILL=1 -DPLOW_K3=1" i_prefill_k3_moe.co
+  genco "-DPLOW_BUCKET_DECODE=0 -DPLOW_MLA_PREFILL=1 -DPLOW_MOE_PREFILL=1 -DPLOW_K3=1 $K3_PF_MOE" i_prefill_k3_moe.co
   unbundle i_prefill_k3_moe.co interp_prefill_k3_moe.elf
   genco "$DEC -DPLOW_K3=1" i_decode_k3.co
   unbundle i_decode_k3.co interp_decode_k3.elf
   K3_ELFS="interp_prefill_k3_moe.elf interp_decode_k3.elf"
   if [ "$BUILD_GQ" = 1 ]; then
-    genco "-DPLOW_BUCKET_DECODE=0 -DPLOW_MLA_PREFILL=1 -DPLOW_MOE_PREFILL=1 -DPLOW_K3=1 -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB $L2D $HIERPF" i_prefill_k3_moe_gq.co
+    genco "-DPLOW_BUCKET_DECODE=0 -DPLOW_MLA_PREFILL=1 -DPLOW_MOE_PREFILL=1 -DPLOW_K3=1 -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB $L2D $HIERPF $K3_PF_MOE" i_prefill_k3_moe_gq.co
     unbundle i_prefill_k3_moe_gq.co interp_prefill_k3_moe_gq.elf
     genco "$DEC $L2D $HIERD -DPLOW_K3=1 -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB" i_decode_k3_gq.co
     unbundle i_decode_k3_gq.co interp_decode_k3_gq.elf

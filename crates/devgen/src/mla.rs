@@ -1077,10 +1077,20 @@ pub(crate) fn glm53_emit_full(
     // blob's tensor table actually contains them, matching `k3_build_model`'s identical pattern
     // (`kimi_k3.rs`) for the same `emit_kda_mixer_ex` scratch. Without this, ops referencing those
     // handles point past the end of the serialized tensor table -> a null device address at load.
+    let gfx950 = crate::emit_is_amd() && crate::amd_target::active().1 == hwspec::IsaLevel::Gfx950;
+    let ec = emit_config::active();
     for &rows in &pf {
         let mut b = Builder::new(n_cu);
         b.set_tensor_dedup(true);
         b.adopt_tensors(tensors.clone());
+        // The exact BT64/D128 KDA chunk objects K3 ships (bit-identical to the interpreter arms).
+        b.set_kda_intra_wave_items_segments(gfx950 && ec.kda_intra_wave_items);
+        b.set_lean_kda_key_factor_segments(gfx950 && ec.kda_key_factor);
+        b.set_kda_carry_regstate_segments(gfx950 && ec.kda_chunk_qpre && ec.kda_carry_regstate);
+        b.set_kda_wu_lean_segments(
+            gfx950 && ec.kda_chunk_qpre && (ec.kda_wu_lean || ec.kda_carry_keyfeed),
+        );
+        b.set_kda_carry_keyfeed_segments(ec.kda_carry_keyfeed);
         emit_glm53_program(&mut b, &c, &n, &s, ctx, rows, dbatch, enc, true);
         let prog = b.finish();
         tensors = prog.tensors.clone();
