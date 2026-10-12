@@ -609,12 +609,22 @@ impl Emitter<'_> {
             } else {
                 vec![db]
             };
-            self.b.emit(DevOp::QwenGdnStep, self.b.all(), &deps, |d| {
+            let step = self.b.emit(DevOp::QwenGdnStep, self.b.all(), &deps, |d| {
                 d.t.copy_from_slice(&[core, conv, a, beta, alog, dt, state, self.active]);
                 d.i[..5].copy_from_slice(&[c.hk, c.hv, c.dk, c.dv, self.batch]);
                 d.f[0] = 1.0 / (c.dk as f32).sqrt();
                 d.f[1] = 1e-6;
-            })
+            });
+            // PLOW_QWEN_GDN_ISOLATE: the step gets its own segment on rungs from this many rows,
+            // so the runtime can launch it at its own occupancy (gen_decode.rs) instead of inside
+            // the interpreter window (B32: 144 vs 76 us per layer).
+            if emit_config::active()
+                .qwen_gdn_isolate
+                .is_some_and(|rows| self.batch >= rows)
+            {
+                self.b.isolate(step);
+            }
+            step
         };
         let deps = if self.projection_dag {
             vec![ds, dz]

@@ -17,6 +17,9 @@ pub(super) enum GenSeg {
     Decode { inst: usize, merge: usize },
     /// The merge's own segment: nothing to launch.
     Merge(usize),
+    /// A lone `QwenGdnStep` (devgen PLOW_QWEN_GDN_ISOLATE): the decode object's GDN step kernel
+    /// at its own occupancy grid instead of the interpreter window's.
+    Gdn(usize),
 }
 
 /// The one instruction segment `seg` holds, if it holds exactly one and all of it.
@@ -116,6 +119,83 @@ pub(super) fn decode_segments(
     Ok(out)
 }
 
+/// Marks every lone `QwenGdnStep` segment at the rung's rows (row b steps slot b, gated by
+/// `in.active`) for the GDN step kernel.
+pub(super) fn mark_gdn_steps(g: &DevProg, segments: &mut [Option<GenSeg>]) {
+    for (seg, site) in segments.iter_mut().enumerate() {
+        if site.is_some() {
+            continue;
+        }
+        let Some(inst) = lone(g, seg) else { continue };
+        let d = &g.insts[inst];
+        if DevOp::from_u16(d.op) == Some(DevOp::QwenGdnStep)
+            && d.i[4] == g.t
+            && d.t[7] != TENSOR_NONE16
+        {
+            *site = Some(GenSeg::Gdn(inst));
+        }
+    }
+}
+
+/// Mirrors `PlowGdnRide` (interp_sm120.cu).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(super) struct GdnStepArgs {
+    pub(super) out: u64,
+    pub(super) qkv: u64,
+    pub(super) a: u64,
+    pub(super) b: u64,
+    pub(super) alog: u64,
+    pub(super) dt_bias: u64,
+    pub(super) state: u64,
+    pub(super) table: u64,
+    pub(super) n: u32,
+    pub(super) tstride: u32,
+    pub(super) hk: u32,
+    pub(super) hv: u32,
+    pub(super) kdim: u32,
+    pub(super) vdim: u32,
+    pub(super) alog_f32: u32,
+    pub(super) pad: u32,
+    pub(super) scale: f32,
+    pub(super) eps: f32,
+    pub(super) active: u64,
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct GdnStepKernel {
+    pub(super) function: KernelFn,
+    pub(super) grid: u32,
+    pub(super) block: u32,
+    pub(super) smem: u32,
+}
+
+/// One isolated decode GDN step.
+pub(super) struct GdnStepRoute {
+    be: Arc<CudaBackend>,
+    kernel: GdnStepKernel,
+    args: GdnStepArgs,
+}
+
+impl GdnStepRoute {
+    pub(super) fn run(&self, stream: &CudaStream) -> Result<()> {
+        let mut args = self.args;
+        let mut params = [&mut args as *mut GdnStepArgs as *mut std::ffi::c_void];
+        self.be.launch_kernel_grid(
+            self.kernel.function,
+            [self.kernel.grid, 1, 1],
+            self.kernel.block,
+            self.kernel.smem,
+            &mut params,
+            Some(stream),
+        )
+    }
+
+    pub(super) fn function(&self) -> KernelFn {
+        self.kernel.function
+    }
+}
+
 /// `(segment, instruction)` of every instruction the routes execute (for `ordered_waits_for`).
 pub(super) fn instructions(segments: &[Option<GenSeg>]) -> Vec<(usize, usize)> {
     segments
@@ -123,7 +203,7 @@ pub(super) fn instructions(segments: &[Option<GenSeg>]) -> Vec<(usize, usize)> {
         .enumerate()
         .filter_map(|(seg, site)| {
             site.map(|site| match site {
-                GenSeg::Decode { inst, .. } | GenSeg::Merge(inst) => (seg, inst),
+                GenSeg::Decode { inst, .. } | GenSeg::Merge(inst) | GenSeg::Gdn(inst) => (seg, inst),
             })
         })
         .collect()
@@ -229,6 +309,7 @@ pub(super) fn routes(
     g: &DevProg,
     segments: &[Option<GenSeg>],
     devp: &[DeviceMem],
+    gdn: Option<GdnStepKernel>,
 ) -> Result<Vec<Option<LibraryRoute>>> {
     let ptr = |t: u16| devp[t as usize].base;
     segments
@@ -236,6 +317,37 @@ pub(super) fn routes(
         .map(|site| match *site {
             None => Ok(None),
             Some(GenSeg::Merge(_)) => Ok(Some(LibraryRoute::Skip)),
+            Some(GenSeg::Gdn(inst)) => {
+                let kernel = gdn.ok_or_else(|| {
+                    RuntimeError::Rejected("GDN step segment without the step kernel".into())
+                })?;
+                let d = &g.insts[inst];
+                Ok(Some(LibraryRoute::GdnStep(GdnStepRoute {
+                    be: Arc::clone(be),
+                    kernel,
+                    args: GdnStepArgs {
+                        out: ptr(d.t[0]),
+                        qkv: ptr(d.t[1]),
+                        a: ptr(d.t[2]),
+                        b: ptr(d.t[3]),
+                        alog: ptr(d.t[4]),
+                        dt_bias: ptr(d.t[5]),
+                        state: ptr(d.t[6]),
+                        table: 0,
+                        n: d.i[4],
+                        tstride: 0,
+                        hk: d.i[0],
+                        hv: d.i[1],
+                        kdim: d.i[2],
+                        vdim: d.i[3],
+                        alog_f32: d.i[5],
+                        pad: 0,
+                        scale: f32::from_bits(d.fj[0]),
+                        eps: f32::from_bits(d.fj[1]),
+                        active: ptr(d.t[7]),
+                    },
+                })))
+            }
             Some(GenSeg::Decode { inst, merge }) => {
                 let d = &g.insts[inst];
                 if d.i[6] != launch.head_dim || d.i[1] != d.i[2] * launch.gqa {

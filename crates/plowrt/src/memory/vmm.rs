@@ -2653,6 +2653,16 @@ impl VmmKv {
         self.shared.block_bytes
     }
 
+    /// Sequences by mapped block columns: `[0, 1, 2, 3+]` (diagnostics).
+    pub fn seq_blocks_hist(&self) -> [u32; 4] {
+        let inner = self.shared.inner.lock();
+        let mut hist = [0u32; 4];
+        for &blocks in &inner.seq_blocks {
+            hist[(blocks as usize).min(3)] += 1;
+        }
+        hist
+    }
+
     /// Cloneable stats reader for exporters. Takes only the POOL mutex
     /// (µs-scale holds), never the engine mutex — a metrics scrape must not
     /// queue behind a running tick. Reads after the pool drops return the

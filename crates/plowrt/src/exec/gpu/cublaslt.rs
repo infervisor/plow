@@ -180,6 +180,8 @@ pub(super) enum LibraryRoute {
     Light(LightRoute),
     /// The generated flash-decode object on an isolated FlashDecode segment (`gen_decode.rs`).
     Gen(super::gen_decode::GenDecodeRoute),
+    /// The decode object's GDN step kernel on an isolated QwenGdnStep segment (`gen_decode.rs`).
+    GdnStep(super::gen_decode::GdnStepRoute),
     /// A segment an earlier route already executed (the FlashMerge the object folds in).
     Skip,
 }
@@ -191,6 +193,7 @@ impl LibraryRoute {
             Self::Moe(route) => route.run(stream),
             Self::Light(route) => route.run(stream),
             Self::Gen(route) => route.run(stream),
+            Self::GdnStep(route) => route.run(stream),
             Self::Skip => Ok(()),
         }
     }
@@ -1450,6 +1453,7 @@ fn glue_kernels<'a>(routes: impl Iterator<Item = &'a LibraryRoute>) -> Vec<Kerne
             LibraryRoute::Moe(route) => Some(route.glue().collect::<Vec<_>>()),
             LibraryRoute::Light(route) => Some(route.launches.iter().map(|l| l.function).collect()),
             LibraryRoute::Gen(route) => Some(vec![route.function()]),
+            LibraryRoute::GdnStep(route) => Some(vec![route.function()]),
             LibraryRoute::Skip => Some(Vec::new()),
             LibraryRoute::Projection(_) => None,
         })

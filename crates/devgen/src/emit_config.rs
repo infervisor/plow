@@ -1399,6 +1399,9 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_QWEN_AB_BLOCKS")]
     pub qwen_ab_blocks: Option<u32>,
 
+    #[arg(long, env = "PLOW_QWEN_GDN_ISOLATE")]
+    pub qwen_gdn_isolate: Option<u32>,
+
     #[arg(long, env = "PLOW_QWEN_PREFILL")]
     pub qwen_prefill: Option<String>,
 
@@ -1788,6 +1791,7 @@ impl EmitConfig {
             qwen_ab_blocks: std::env::var("PLOW_QWEN_AB_BLOCKS")
                 .ok()
                 .map(|v| v.parse().expect("Qwen a/b block count")),
+            qwen_gdn_isolate: env_u32("PLOW_QWEN_GDN_ISOLATE"),
             qwen_prefill: std::env::var("PLOW_QWEN_PREFILL").ok(),
             pf_gfuse: env_bool("PLOW_PF_GFUSE"),
             uniseg_max_t: env_u32("PLOW_UNISEG_MAX_T"),

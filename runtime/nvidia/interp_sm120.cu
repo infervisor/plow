@@ -4605,11 +4605,14 @@ struct PlowGdnRide {
     const int* table;
     unsigned n, tstride, hk, hv, kdim, vdim, alog_f32, pad;
     float scale, eps;
+    /* Null for riders; the decode step's `in.active` when the kernel serves an isolated decode
+     * QwenGdnStep segment (table null: row b is slot b). */
+    const int* active;
 };
 extern "C" __global__ void __launch_bounds__(PLOW_NV_THREADS)
     PLOW_SYM(plow_sm120_gdn_ride)(const __grid_constant__ PlowGdnRide a) {
     extern __shared__ float arena[];
-    d_qwen_gdn_step<true>(a.out, a.qkv, a.a, a.b, a.alog, a.dt_bias, a.state, nullptr, a.hk, a.hv,
+    d_qwen_gdn_step<true>(a.out, a.qkv, a.a, a.b, a.alog, a.dt_bias, a.state, a.active, a.hk, a.hv,
         a.kdim, a.vdim, a.n, a.scale, a.eps, a.alog_f32, blockIdx.x, gridDim.x, arena,
         (blockDim.x >> 5) * 8u * 128u, a.table, a.tstride);
 }

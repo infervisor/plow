@@ -5434,6 +5434,26 @@ impl GpuEngine {
             }
             _ => None,
         };
+        // The decode object's GDN step kernel, for isolated decode QwenGdnStep segments.
+        let gdn_step = be
+            .get_function(&module, &format!("plow_{}_gdn_ride", profile.tag))
+            .ok()
+            .map(|function| {
+                let per_sm = be
+                    .occupancy_blocks_per_sm(function, BLOCK, GDN_RIDE_SMEM as usize)
+                    .unwrap_or(1)
+                    .max(1);
+                gen_decode::GdnStepKernel {
+                    function,
+                    grid: per_sm * be.sm_count(),
+                    block: BLOCK,
+                    smem: GDN_RIDE_SMEM,
+                }
+            });
+        let mut gen_segments = gen_segments;
+        if gdn_step.is_some() && !gen_segments.is_empty() {
+            gen_decode::mark_gdn_steps(g, &mut gen_segments);
+        }
         let gen_routed_widest =
             gen_decode_launch.is_some() && !gen_segments.is_empty() && g.t >= gen_decode_step;
         let ordered_waits = if cublaslt_enabled {
@@ -5509,10 +5529,20 @@ impl GpuEngine {
                 g,
                 &gen_segments,
                 &devp,
+                gdn_step,
             )?;
             tracing::info!(
                 rows = g.t,
-                sites = gen_segments.iter().flatten().count() / 2,
+                sites = gen_segments
+                    .iter()
+                    .flatten()
+                    .filter(|s| matches!(s, gen_decode::GenSeg::Decode { .. }))
+                    .count(),
+                gdn_steps = gen_segments
+                    .iter()
+                    .flatten()
+                    .filter(|s| matches!(s, gen_decode::GenSeg::Gdn(_)))
+                    .count(),
                 "decode attention routed to the generated flash-decode object"
             );
             routes
@@ -5847,7 +5877,10 @@ impl GpuEngine {
                         .map(|p| &p.roles)
                     {
                         let objects = &segment_roles.as_ref().expect("declared").objects;
-                        let segments = gen_decode::decode_segments(g, roles, objects)?;
+                        let mut segments = gen_decode::decode_segments(g, roles, objects)?;
+                        if gdn_step.is_some() && !segments.is_empty() {
+                            gen_decode::mark_gdn_steps(g, &mut segments);
+                        }
                         match &gen_decode_launch {
                             Some(launch) if g.t >= gen_decode_step && !segments.is_empty() => {
                                 let none = vec![None; segments.len()];
@@ -5856,7 +5889,8 @@ impl GpuEngine {
                                     &none,
                                     &gen_decode::instructions(&segments),
                                 )?;
-                                let routes = gen_decode::routes(&be, launch, g, &segments, &devp)?;
+                                let routes =
+                                    gen_decode::routes(&be, launch, g, &segments, &devp, gdn_step)?;
                                 let mut rung = DecodeRung::upload_with_insts(
                                     &be,
                                     g,
@@ -5869,7 +5903,16 @@ impl GpuEngine {
                                     .map_or((f, smem), |object| (object.function, object.smem));
                                 tracing::info!(
                                     rows = g.t,
-                                    sites = segments.iter().flatten().count() / 2,
+                                    sites = segments
+                                        .iter()
+                                        .flatten()
+                                        .filter(|s| matches!(s, gen_decode::GenSeg::Decode { .. }))
+                                        .count(),
+                                    gdn_steps = segments
+                                        .iter()
+                                        .flatten()
+                                        .filter(|s| matches!(s, gen_decode::GenSeg::Gdn(_)))
+                                        .count(),
                                     "decode attention routed to the generated flash-decode object"
                                 );
                                 rung.library = Some(cublaslt::CublasLtDecodeGraph::direct(
@@ -7492,6 +7535,8 @@ impl GpuEngine {
                 pooled = st.blocks_pooled,
                 stale = st.blocks_stale,
                 cache = st.cache_blocks,
+                seq_cols = ?kv.seq_blocks_hist(),
+                active = self.vmm_active.iter().filter(|&&a| a).count(),
                 free_mib = free >> 20,
                 budget_mib = budget.budget_bytes >> 20,
                 "kv admission budget"
@@ -11722,31 +11767,10 @@ impl GpuEngine {
         for &(slot, _) in pack {
             qwen_state_slot(state, slot, self.batch)?;
         }
-        // Mirrors `PlowGdnRide` (interp_sm120.cu); the table row is {q0, qlen, slot, kvlen}
-        // after the request count, so the slot column starts 12 bytes in.
-        #[repr(C)]
-        struct GdnRideArgs {
-            out: u64,
-            qkv: u64,
-            a: u64,
-            b: u64,
-            alog: u64,
-            dt_bias: u64,
-            state: u64,
-            table: u64,
-            n: u32,
-            tstride: u32,
-            hk: u32,
-            hv: u32,
-            kdim: u32,
-            vdim: u32,
-            alog_f32: u32,
-            pad: u32,
-            scale: f32,
-            eps: f32,
-        }
+        // The table row is {q0, qlen, slot, kvlen} after the request count, so the slot column
+        // starts 12 bytes in.
         let at = |h: u16| self.devp[h as usize].base;
-        let mut args = GdnRideArgs {
+        let mut args = gen_decode::GdnStepArgs {
             out: at(t[0]),
             qkv: at(ops[0]),
             a: at(ops[1]),
@@ -11765,8 +11789,9 @@ impl GpuEngine {
             pad: 0,
             scale: 1.0 / 128_f32.sqrt(),
             eps: 1e-6,
+            active: 0,
         };
-        let mut params = [&mut args as *mut GdnRideArgs as *mut std::ffi::c_void];
+        let mut params = [&mut args as *mut gen_decode::GdnStepArgs as *mut std::ffi::c_void];
         self.be.launch_kernel_grid(
             f,
             [grid, 1, 1],

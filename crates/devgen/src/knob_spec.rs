@@ -1336,6 +1336,7 @@ pub const EMIT: &[KnobSpec] = &[
     KnobSpec::new("emit.qwen_fuse_mlp", Some("PLOW_QWEN_FUSE_MLP"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.qwen_fold_norm", Some("PLOW_QWEN_FOLD_NORM"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.qwen_fold_max", Some("PLOW_QWEN_FOLD_MAX"), Layer::Emit, U32, UNSET, OPT_IN),
+    KnobSpec::new("emit.qwen_gdn_isolate", Some("PLOW_QWEN_GDN_ISOLATE"), Layer::Emit, U32, UNSET, OPT_IN),
     KnobSpec::new("emit.qwen_projection_dag", Some("PLOW_QWEN_PROJECTION_DAG"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.qwen_share_quant", Some("PLOW_QWEN_SHARE_QUANT"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.qwen_ab_blocks", Some("PLOW_QWEN_AB_BLOCKS"), Layer::Emit, U32, UNSET, OPT_IN),
