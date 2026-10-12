@@ -1200,6 +1200,14 @@ on a non-CUDA backend are rejected.
 Model load/unload/status routes are privileged and are served only on the
 owner-only Unix socket (`--socket`), not the public TCP listener. For example:
 `curl --unix-socket /tmp/plow.sock http://localhost/v1/models/status`.
+`GET /v1/models/available` (same listeners, same keys) lists what `load` would
+accept under the `--models-root` dirs, rescanned per request:
+`{"models": [{"ref", "model", "dir", "bytes", "loaded"}]}`. A root that is a
+`$PLOW_HOME` store, or its `bundles/`, lists its pins with their
+`<ns>/<name>:<label>@g<n>` ref; any other root lists itself and its immediate
+subdirectories that hold a `weights.json`, with `ref: null`. `model` is the slug
+the bundle registers under, `loaded` whether this server registered it from that
+dir.
 A platform on another host reaches them through `--control-bind IP:PORT`, a
 second TCP listener carrying only these routes behind the API keys
 (`--api-key` / `PLOW_API_KEYS`); plowrt refuses to start with `--control-bind`

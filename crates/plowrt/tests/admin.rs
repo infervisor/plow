@@ -152,6 +152,53 @@ async fn load_refuses_an_assets_dir_when_no_models_root_is_configured() {
     assert!(body_string(resp).await.contains("models-root"));
 }
 
+/// `available` lists what `load` would accept under the roots, and marks the
+/// one this server already registered from its directory.
+#[tokio::test]
+async fn available_lists_bundles_under_the_models_roots() {
+    let n = DIR_SEQ.fetch_add(1, Ordering::Relaxed);
+    let root = std::env::temp_dir().join(format!("plowrt_available_{}_{n}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    common::write_bundle(&root.join("served"), "served-model");
+    common::write_bundle(&root.join("pulled"), "pulled-model");
+
+    let backend: Arc<dyn Backend> = Arc::new(CpuBackend::new(2));
+    let execset = Arc::new(ExecutorSet::bringup(backend).unwrap());
+    let registry = Registry::new();
+    registry.load(root.join("served"), None).unwrap();
+    let state = Arc::new(AppState::new(registry, execset));
+    state.install_models_roots([root.clone()]);
+
+    let resp = plowrt::serve::admin_app(state)
+        .oneshot(
+            Request::builder()
+                .uri("/v1/models/available")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let models = v["models"].as_array().expect("models array");
+    let by = |slug: &str| models.iter().find(|m| m["model"] == slug).cloned();
+    let pulled = by("pulled-model").expect("pulled-model listed");
+    assert_eq!(
+        pulled["ref"],
+        serde_json::Value::Null,
+        "a plain dir is no pin"
+    );
+    assert_eq!(pulled["loaded"], false);
+    assert!(pulled["bytes"].as_u64().unwrap() > 0);
+    let canon = root.join("pulled").canonicalize().unwrap();
+    assert_eq!(pulled["dir"], canon.to_str().unwrap());
+    assert_eq!(
+        by("served-model").expect("served-model listed")["loaded"],
+        true
+    );
+    let _ = std::fs::remove_dir_all(root);
+}
+
 /// `GET /v1/models` is the OpenAI catalogue and must keep listing a slug
 /// whatever its residency — clients must not see models appear and disappear
 /// because of a placement decision.
@@ -196,6 +243,7 @@ async fn public_router_does_not_expose_model_control() {
         ("POST", "/v1/models/load"),
         ("POST", "/v1/models/unload"),
         ("GET", "/v1/models/status"),
+        ("GET", "/v1/models/available"),
     ] {
         let response = app(state.clone())
             .oneshot(
