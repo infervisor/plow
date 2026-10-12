@@ -193,6 +193,20 @@ Publication order is the safety property: **blobs, then manifests, then the
 index**. An interrupted publish leaves the previous generation completely
 servable.
 
+**To a registry with a publish API** (inferos runs one), `plowrt publish`
+packs the build exactly as `plowrt pack` does and uploads the archive with an
+API key, so anyone with a key the registry accepts can submit a build:
+
+```
+PLOW_API_KEY=… plowrt publish --bundle bundle.json --assets <dir> \
+  [--objset objset.json --objects <dir>] --to https://<registry>
+```
+
+It posts to `<to>/api/v1/admin/registry/publish/zip`. The registry checks
+every file against its digest and assigns nothing: the bundle's own
+`label@g<n>` is published, and one the registry already holds is reported,
+not overwritten.
+
 ## Recipes
 
 `recipes/<namespace>/<name>/<label>.toml` is consumed by builds and publishing;

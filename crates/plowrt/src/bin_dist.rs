@@ -1,5 +1,5 @@
 //! The `plowrt` distribution subcommands: `pull`, `load`, `show`, `ls`,
-//! `upgrade`, `prepare`, `rm`, `pack`.
+//! `upgrade`, `prepare`, `rm`, `pack`, `publish`.
 //!
 //! These run the network; `serve` does not. `resolve_local` is the one entry
 //! point `serve` uses, and it reads only the local store — an unpulled model is
@@ -432,6 +432,72 @@ pub fn cmd_pack(
         pull::human(total_bytes)
     );
     Ok(())
+}
+
+#[cfg(feature = "dist")]
+/// Where `publish` sends a packed bundle.
+pub struct PublishTo<'a> {
+    pub url: &'a str,
+    pub api_key: &'a str,
+    pub status: Option<&'a str>,
+    pub description: Option<&'a str>,
+}
+
+#[cfg(feature = "dist")]
+/// `pack` into a temporary archive, then upload it to the registry's publish
+/// API. 409 means the registry already holds that `label@g<n>`.
+pub fn cmd_publish(
+    bundle_path: &std::path::Path,
+    objset_path: Option<&std::path::Path>,
+    assets: &std::path::Path,
+    objects: Option<&std::path::Path>,
+    to: &PublishTo,
+) -> Result<(), Err> {
+    let zip_path = std::env::temp_dir().join(format!("plowrt-publish-{}.zip", std::process::id()));
+    let packed = cmd_pack(bundle_path, objset_path, assets, objects, &zip_path);
+    let sent = packed.and_then(|()| upload(&zip_path, to));
+    let _ = std::fs::remove_file(&zip_path);
+    sent
+}
+
+#[cfg(feature = "dist")]
+fn upload(zip_path: &std::path::Path, to: &PublishTo) -> Result<(), Err> {
+    let url = format!(
+        "{}/api/v1/admin/registry/publish/zip",
+        to.url.trim_end_matches('/')
+    );
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(std::time::Duration::from_secs(20))
+        .build();
+    let mut req = agent
+        .post(&url)
+        .set("Authorization", &format!("Bearer {}", to.api_key))
+        .set("Content-Type", "application/zip");
+    if let Some(s) = to.status {
+        req = req.query("status", s);
+    }
+    if let Some(d) = to.description {
+        req = req.query("description", d);
+    }
+    let file = std::fs::File::open(zip_path)?;
+    match req.send(file) {
+        Ok(resp) => {
+            println!("published: {}", resp.into_string()?);
+            Ok(())
+        }
+        Err(ureq::Error::Status(409, resp)) => {
+            println!(
+                "already published: {}",
+                resp.into_string().unwrap_or_default()
+            );
+            Ok(())
+        }
+        Err(ureq::Error::Status(code, resp)) => {
+            Err(format!("{url}: {code}: {}", resp.into_string().unwrap_or_default()).into())
+        }
+        // ureq's transport error already names the URL.
+        Err(e) => Err(e.to_string().into()),
+    }
 }
 
 pub fn cmd_prepare(model: &str, checkpoint: Option<PathBuf>) -> Result<(), Err> {

@@ -709,6 +709,39 @@ enum Cmd {
         #[arg(long)]
         out: PathBuf,
     },
+
+    /// Package a built bundle exactly as `pack` does and publish it to a
+    /// registry's publish API (`POST <to>/api/v1/admin/registry/publish/zip`),
+    /// authenticated by an API key. A generation the registry already holds
+    /// is reported and not an error: generations are immutable.
+    #[cfg(feature = "dist")]
+    Publish {
+        /// Bundle manifest, as written by `pack_bundle.py`.
+        #[arg(long)]
+        bundle: PathBuf,
+        /// Objset manifest; omitted for a runtime-compiled target (Apple).
+        #[arg(long)]
+        objset: Option<PathBuf>,
+        /// Directory `bundle.json`'s `files[]` live in.
+        #[arg(long)]
+        assets: PathBuf,
+        /// Directory `objset.json`'s `objects[]` live in.
+        #[arg(long)]
+        objects: Option<PathBuf>,
+        /// The registry's API base URL.
+        #[arg(long, env = "PLOW_PUBLISH_URL")]
+        to: String,
+        /// API key allowed to publish, sent as a Bearer token.
+        #[arg(long = "key", env = "PLOW_API_KEY", hide_env_values = true)]
+        api_key: String,
+        /// Status to publish at (`emits` or `validated`); the registry's
+        /// default when omitted.
+        #[arg(long)]
+        status: Option<String>,
+        /// One line describing the model, for the registry's catalog.
+        #[arg(long)]
+        description: Option<String>,
+    },
 }
 
 /// Narrowing shared by `pull` and `load`. Everything not constrained here is
@@ -1093,6 +1126,28 @@ async fn async_main(
             &assets,
             objects.as_deref(),
             &out,
+        )),
+        #[cfg(feature = "dist")]
+        Cmd::Publish {
+            bundle,
+            objset,
+            assets,
+            objects,
+            to,
+            api_key,
+            status,
+            description,
+        } => dist_cmd::report(dist_cmd::cmd_publish(
+            &bundle,
+            objset.as_deref(),
+            &assets,
+            objects.as_deref(),
+            &dist_cmd::PublishTo {
+                url: &to,
+                api_key: &api_key,
+                status: status.as_deref(),
+                description: description.as_deref(),
+            },
         )),
         #[cfg(feature = "hsa")]
         Cmd::AmdBench {
