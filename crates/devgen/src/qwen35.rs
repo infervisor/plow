@@ -52,8 +52,15 @@ fn segment_roles(m: &Model) -> Option<packet::devbuild::SectionData> {
         );
         programs.push(serde_json::json!({"index":index,"roles":roles}));
     }
-    if decode_cublaslt {
-        let index = m.progs.len() - 1;
+    let min_rows = cfg.decode_cublaslt_min_rows.unwrap_or(1);
+    let decode_lo = if m.prog_t.len() == m.progs.len() {
+        packet::devbuild::decode_rung_lo(&m.prog_t)
+    } else {
+        m.progs.len() - 1
+    };
+    for index in (decode_lo..m.progs.len())
+        .filter(|&index| decode_cublaslt && m.prog_t.get(index).is_none_or(|&t| t >= min_rows))
+    {
         let p = &m.progs[index];
         let mut roles = vec![plow_asset::segment_roles::INTERPRETER; p.gq_seg_ofs.len() - 1];
         for (ix, inst) in p.insts.iter().enumerate() {
@@ -973,14 +980,17 @@ fn phase(
     let [gc, gs] = GenTensor::rope_pair(ctx, c.rotary, c.theta, 1.0, RopeScale::None);
     let cos = b.tensor_gen("in.cos_full", gc.byte_len(), gc);
     let sin = b.tensor_gen("in.sin_full", gs.byte_len(), gs);
-    let decode_cublaslt = !prefill && emit_config::active().decode_cublaslt;
-    let fuse_ab = !prefill && emit_config::active().qwen_fuse_ab;
-    let fuse_mlp = !prefill && emit_config::active().qwen_fuse_mlp;
+    // Rungs below PLOW_EMIT_DECODE_CUBLASLT_MIN_ROWS stay native (fusions on, one segment).
+    let decode_cublaslt = !prefill
+        && emit_config::active().decode_cublaslt
+        && batch >= emit_config::active().decode_cublaslt_min_rows.unwrap_or(1);
+    let fuse_ab = !prefill && !decode_cublaslt && emit_config::active().qwen_fuse_ab;
+    let fuse_mlp = !prefill && !decode_cublaslt && emit_config::active().qwen_fuse_mlp;
     assert!(
         !fuse_mlp || (!fp8 && !decode_cublaslt),
         "Qwen MLP projection fusion requires native BF16 decode"
     );
-    let projection_dag = !prefill && emit_config::active().qwen_projection_dag;
+    let projection_dag = !prefill && !decode_cublaslt && emit_config::active().qwen_projection_dag;
     assert!(
         !projection_dag || (!fp8 && !decode_cublaslt),
         "Qwen projection DAG requires native BF16 decode"
