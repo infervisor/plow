@@ -655,6 +655,10 @@ fn a_dist_checkpoint_lists_safe_files_matching_its_shard_count() {
     let mut b = dist.clone();
     b.checkpoint.files.push(file("config.json"));
     assert!(b.validate().is_err(), "a duplicate file");
+    let mut b = dist.clone();
+    b.checkpoint.files.push(file("config.json/extra"));
+    let err = b.validate().unwrap_err();
+    assert!(err.contains("also a file"), "{err}");
     for rev in ["", "..", "a/b"] {
         let mut b = dist.clone();
         b.checkpoint.revision = rev.into();

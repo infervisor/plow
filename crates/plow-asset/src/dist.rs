@@ -870,6 +870,17 @@ impl BundleCheckpoint {
                 return Err(format!("bundle: duplicate checkpoint file {}", f.name));
             }
         }
+        // `a` and `a/b` cannot both be written: one is a file, the other needs
+        // it to be a directory.
+        for f in &self.files {
+            let mut parents = f.name.match_indices('/').map(|(i, _)| &f.name[..i]);
+            if let Some(p) = parents.find(|p| seen.contains(p)) {
+                return Err(format!(
+                    "bundle: checkpoint file {} sits under {p}, which is also a file",
+                    f.name
+                ));
+            }
+        }
         // `prepare` globs `*.safetensors` in the snapshot's top level only.
         let shards = self
             .files
