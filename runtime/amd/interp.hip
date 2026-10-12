@@ -1695,13 +1695,13 @@ __device__ __forceinline__ void exec_flash_decode(CInst in, CTens T,
      * not required and `t6` stays free for the fp8-KV scale it means on the dense emit path.
      * The span table is narrowed to the DECODE partition here and to its complement in the
      * flash-prefill arm; both call plow_tb_decode_spans, so the two cannot disagree. */
-#define PLOW_AMD_FLASH_DECODE(DD)                                                               \
+#define PLOW_AMD_FLASH_DECODE(DD, GG)                                                           \
     do {                                                                                        \
         const PlowTokenBatchView tbv_ = plow_tb_view(tbprog);                                   \
         const PlowTokenBatchView dec_ =                                                         \
             plow_tb_span_range(tbv_, 0u, plow_tb_decode_spans(tbv_));                           \
         if (dec_.n_spans)                                                                       \
-            d_flash_decode<DD, PLOW_FA_GF(DD), false, false, /*SLOTMAP=*/false, /*TB=*/true>(   \
+            d_flash_decode<DD, GG, false, false, /*SLOTMAP=*/false, /*TB=*/true>(   \
                 (float*)TEN(0), (float*)TEN(1), (const bf16*)TEN(2), (const bf16*)TEN(3),       \
                 (const bf16*)TEN(4), (const int*)TEN(5), dec_.n_spans, in->i[1], in->i[2],     \
                 in->i[3], in->i[4], in->fj[0].f, in->i[5], in->i[7], slice, nblk, lds, nullptr, \
@@ -1709,28 +1709,41 @@ __device__ __forceinline__ void exec_flash_decode(CInst in, CTens T,
                 nullptr, nullptr, nullptr, dec_);                                               \
     } while (0)
 #else
-#define PLOW_AMD_FLASH_DECODE(DD)                                                               \
+#define PLOW_AMD_FLASH_DECODE(DD, GG)                                                           \
     do {                                                                                        \
         if (TEN(6))                                                                             \
-            d_flash_decode_slots<DD, PLOW_FA_GF(DD)>(                                           \
+            d_flash_decode_slots<DD, GG>(                                                       \
                 (float*)TEN(0), (float*)TEN(1), (const bf16*)TEN(2), (const bf16*)TEN(3),       \
                 (const bf16*)TEN(4), (const int*)TEN(5), n_batch_runtime, in->i[1], in->i[2],         \
                 in->i[3], in->i[4], in->fj[0].f, in->i[5], in->i[7], slice, nblk, lds,         \
                 (const int*)TEN(6));                                                            \
         else                                                                                    \
-            d_flash_decode<DD, PLOW_FA_GF(DD)>(                                                 \
+            d_flash_decode<DD, GG>(                                                             \
                 (float*)TEN(0), (float*)TEN(1), (const bf16*)TEN(2), (const bf16*)TEN(3),       \
                 (const bf16*)TEN(4), (const int*)TEN(5), n_batch_runtime, in->i[1], in->i[2],         \
                 in->i[3], in->i[4], in->fj[0].f, in->i[5], in->i[7], slice, nblk, lds);         \
     } while (0)
 #endif
-    if (hd == 128) PLOW_AMD_FLASH_DECODE(128);
-    else if (hd == 256) PLOW_AMD_FLASH_DECODE(256);
-    else if (hd == 512) PLOW_AMD_FLASH_DECODE(512);
+    /* A work item's GF heads share ONE KV head (h0 / gqa), which needs GF | gqa. A group the
+     * kernel's GF does not divide — MHA (gqa 1: Llama-68M, SmolLM2) or an odd group (gqa 3) —
+     * runs GF=1, as plowc already sized nsplit for at gqa < 2; GF=2 there attended every odd
+     * head over its even neighbour's KV. */
+    const unsigned gqa = in->i[1] / in->i[2];
+#define PLOW_AMD_FLASH_DECODE_GQA(DD)                                                           \
+    do {                                                                                        \
+        if (gqa % PLOW_FA_GF(DD))                                                               \
+            PLOW_AMD_FLASH_DECODE(DD, 1);                                                       \
+        else                                                                                    \
+            PLOW_AMD_FLASH_DECODE(DD, PLOW_FA_GF(DD));                                          \
+    } while (0)
+    if (hd == 128) PLOW_AMD_FLASH_DECODE_GQA(128);
+    else if (hd == 256) PLOW_AMD_FLASH_DECODE_GQA(256);
+    else if (hd == 512) PLOW_AMD_FLASH_DECODE_GQA(512);
 #if !PLOW_FP8_KV
-    else if (hd == 64) PLOW_AMD_FLASH_DECODE(64); /* GPT-OSS; see exec_flash_prefill */
+    else if (hd == 64) PLOW_AMD_FLASH_DECODE_GQA(64); /* GPT-OSS; see exec_flash_prefill */
 #endif
     else __builtin_trap(); /* see the head-dim refusal note in exec_flash_prefill */
+#undef PLOW_AMD_FLASH_DECODE_GQA
 #undef PLOW_AMD_FLASH_DECODE
 #undef TEN
 }
