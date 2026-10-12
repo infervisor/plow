@@ -1567,7 +1567,9 @@ __device__ void d_kda_state_step_t(bf16* __restrict__ o, const bf16* __restrict_
                 /* Column j = wave + PLOW_WAVES * c, so the workgroup's waves walk the head's
                  * [v][k] state as one contiguous PLOW_WAVES x 512 B band per step. */
                 constexpr unsigned CPW = PL * PLOW_WAVE / PLOW_WAVES;
-                constexpr unsigned CB = CPW < 16u ? CPW : 16u;
+                /* 4, not 16: sc[16][PL] pushed the megakernel's private segment 1060 -> 1380 B
+                 * and tripled this op's workgroup body (204 -> 624 us). */
+                constexpr unsigned CB = CPW < 4u ? CPW : 4u;
                 static_assert(CPW % CB == 0, "wide KDA column batch must tile the wave's columns");
                 float* st_t = st_h + (size_t)t * bstride;
                 for (unsigned c0 = 0; c0 < CPW; c0 += CB) {

@@ -192,17 +192,19 @@ __device__ void d_rmsnorm(bf16* __restrict__ out, const bf16* __restrict__ x,
     const auto* gg = as_glob(gamma);
     auto* og = as_glob(out);
 #if PLOW_BUCKET_DECODE
-    /* WIDE DECODE ARM: ONE WAVE PER ROW. A batched decode norm has rows independent rows and
-     * the packet's block count is fixed, so the single-row loop below ran them one dependent
-     * HBM round trip at a time per workgroup (128 rows on a one-block packet = 128 round trips).
-     * Here the workgroup's PLOW_WAVES waves each own a row, striped across blocks first so a
-     * packet with blocks >= rows keeps one row per CU.
+    /* WIDE DECODE ARM: ONE WAVE PER ROW, for a batched decode norm whose packet has fewer
+     * blocks than rows (the 1-block xn/qlat norms of the 128-row program). There the single-row
+     * loop below ran the rows one dependent HBM round trip at a time on one workgroup; here
+     * the workgroup's PLOW_WAVES waves each own a row. blocks >= rows keeps the workgroup path,
+     * which is faster per row (measured 17 vs 27 us on the 128-block packets).
+     * Two passes, no row held in registers (the megakernel has none to spare): sum, then
+     * re-read the row from L2 to scale it.
      * BIT-IDENTICAL to the workgroup path: lane l stands in for threads w*64+l, w = 0..WAVES-1,
      * with the same `rn_index` element map and the same per-thread accumulation order, and
      * `block_sum`'s tree (a wave butterfly per wave, then the wave partials added in order)
      * is replayed as WAVES wave_sums added in order. rows == 1 (the B=1 program) and every
      * prefill object (PLOW_BUCKET_DECODE=0) never enter it. */
-    if (rows > 1u && fits && !xq && out_row0 == 0u && rn_groups == 1
+    if (rows > nblk && fits && !xq && out_row0 == 0u && rn_groups == 1
 #if PLOW_PACKED_PREFILL_MLA_NORM_CONSUMERS || PLOW_PACKED_PREFILL_DENSE_CONSUMERS
         && !plow_packed_prefill_enabled(packed) && packed_slot_stride == 0
 #endif
@@ -210,30 +212,20 @@ __device__ void d_rmsnorm(bf16* __restrict__ out, const bf16* __restrict__ x,
         const unsigned wave = threadIdx.x >> 6, lane = threadIdx.x & (PLOW_WAVE - 1);
         for (unsigned row = slice + wave * nblk; row < rows; row += nblk * PLOW_WAVES) {
             const size_t base = (size_t)row * feat;
-            bf16v8 v[PLOW_WAVES][RN_VEC], w[PLOW_WAVES][RN_VEC];
-#pragma unroll
-            for (unsigned vw = 0; vw < PLOW_WAVES; vw++)
-#pragma unroll
-                for (unsigned c = 0; c < RN_VEC; c++) {
-                    const unsigned i = (vw * PLOW_WAVE + lane + c * rn_threads) * 8;
-                    v[vw][c] = bf16v8_zero();
-                    w[vw][c] = bf16v8_zero();
-                    if (i < feat) {
-                        v[vw][c] = ld_glob8(xg + base + i);
-                        if (gamma) w[vw][c] = ld_glob8(gg + i);
-                    }
-                }
             float sum = 0.0f;
 #pragma unroll
             for (unsigned vw = 0; vw < PLOW_WAVES; vw++) {
                 float ss = 0.0f;
 #pragma unroll
-                for (unsigned c = 0; c < RN_VEC; c++)
+                for (unsigned c = 0; c < RN_VEC; c++) {
+                    const unsigned i = (vw * PLOW_WAVE + lane + c * rn_threads) * 8;
+                    const bf16v8 v = i < feat ? ld_glob8(xg + base + i) : bf16v8_zero();
 #pragma unroll
                     for (unsigned j = 0; j < 8; j++) {
-                        const float f = bf2f(v[vw][c][j]);
+                        const float f = bf2f(v[j]);
                         ss += f * f;
                     }
+                }
                 sum += wave_sum(ss);
             }
             const float inv = rsqrtf(rn_ss(sum) / (float)feat + eps);
@@ -243,11 +235,13 @@ __device__ void d_rmsnorm(bf16* __restrict__ out, const bf16* __restrict__ x,
                 for (unsigned c = 0; c < RN_VEC; c++) {
                     const unsigned i = (vw * PLOW_WAVE + lane + c * rn_threads) * 8;
                     if (i < feat) {
+                        const bf16v8 v = ld_glob8(xg + base + i);
+                        const bf16v8 w = gamma ? ld_glob8(gg + i) : bf16v8_zero();
                         bf16v8 o;
 #pragma unroll
                         for (unsigned j = 0; j < 8; j++) {
-                            const float g = gamma ? bf2f(w[vw][c][j]) : 1.0f;
-                            o[j] = f2bf(bf2f(v[vw][c][j]) * inv * g);
+                            const float g = gamma ? bf2f(w[j]) : 1.0f;
+                            o[j] = f2bf(bf2f(v[j]) * inv * g);
                         }
                         st_glob8(og + base + i, o);
                     }
