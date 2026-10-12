@@ -12830,6 +12830,10 @@ impl GpuEngine {
                     rings.ensure_slot(slot)?;
                 }
                 v.ensure_rows(slot, end)?;
+                // A chunk ending near a block boundary (a prompt of exactly 4096 rows): the
+                // pre-mapper maps the next block during the launch, not the first decode step's
+                // synchronous backstop (~6 ms of idle GPU per admitted 4K request).
+                v.advise(slot, end);
             }
         }
         self.ensure_batch_patch(bi)?;
