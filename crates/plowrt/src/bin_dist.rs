@@ -1,5 +1,5 @@
 //! The `plowrt` distribution subcommands: `pull`, `load`, `show`, `ls`,
-//! `upgrade`, `prepare`, `rm`, `pack`.
+//! `upgrade`, `prepare`, `rm`, `pack`, `publish`.
 //!
 //! These run the network; `serve` does not. `resolve_local` is the one entry
 //! point `serve` uses, and it reads only the local store — an unpulled model is
@@ -492,6 +492,253 @@ fn copy_hashed(path: &std::path::Path, w: &mut impl Write) -> Result<(String, u6
     Ok((format!("{:x}", h.finalize()), n))
 }
 
+#[cfg(feature = "dist")]
+/// Where `publish` sends a packed bundle.
+pub struct PublishTo<'a> {
+    pub url: &'a str,
+    pub api_key: &'a str,
+    pub status: Option<&'a str>,
+    pub description: Option<&'a str>,
+    pub tok_s: Option<f64>,
+    pub concurrency: Option<u32>,
+}
+
+#[cfg(feature = "dist")]
+/// `pack` into a temporary archive, then publish it through the registry's
+/// staged upload: ask for an upload target, `PUT` the zip there, publish it.
+/// The target is a presigned bucket URL when the registry has one, so a large
+/// archive never passes the API's request limit.
+pub fn cmd_publish(
+    bundle_path: &std::path::Path,
+    objset_path: Option<&std::path::Path>,
+    assets: &std::path::Path,
+    objects: Option<&std::path::Path>,
+    checkpoint_dir: Option<&std::path::Path>,
+    to: &PublishTo,
+) -> Result<(), Err> {
+    // The registry's index would hold a variant clients refuse to read.
+    if to.status == Some("validated") && to.tok_s.is_none() {
+        return Err("--status validated needs the measurement: pass --tok-s".into());
+    }
+    let dir = private_temp_dir()?;
+    let sent = (|| {
+        let Some(bundle) = next_generation(bundle_path, to.url)? else {
+            return Ok(());
+        };
+        let bundle_out = dir.join("bundle.json");
+        std::fs::write(&bundle_out, serde_json::to_vec_pretty(&bundle)?)?;
+        let zip_path = dir.join("bundle.zip");
+        cmd_pack(
+            &bundle_out,
+            objset_path,
+            assets,
+            objects,
+            checkpoint_dir,
+            &zip_path,
+        )?;
+        upload(&zip_path, to, &bundle)
+    })();
+    let _ = std::fs::remove_dir_all(&dir);
+    sent
+}
+
+/// The bundle as the registry's next generation of its label, as
+/// `publish_dist.py` numbers one; `None` when the newest generation already
+/// carries exactly these files and objset (a re-run publishes nothing).
+#[cfg(feature = "dist")]
+fn next_generation(
+    bundle_path: &std::path::Path,
+    registry: &str,
+) -> Result<Option<plow_asset::dist::Bundle>, Err> {
+    use plow_asset::dist::{Bundle, ModelIndex};
+    let mut bundle: Bundle = serde_json::from_slice(&std::fs::read(bundle_path)?)
+        .map_err(|e| format!("{}: {e}", bundle_path.display()))?;
+    let f = dist::fetch::transport(registry)?;
+    let model_dir = format!("v1/{}/{}", bundle.namespace, bundle.name);
+    let index: Option<ModelIndex> = f
+        .get(&format!("{model_dir}/index.json"))?
+        .map(|raw| serde_json::from_slice(&raw))
+        .transpose()
+        .map_err(|e| format!("{}: {model_dir}/index.json: {e}", f.describe()))?;
+    let newest = index
+        .iter()
+        .flat_map(|i| &i.variants)
+        .filter(|v| v.label == bundle.label)
+        .max_by_key(|v| v.generation);
+    if let Some(v) = newest {
+        let raw = f
+            .get(&format!("{model_dir}/{}", v.manifest))?
+            .ok_or_else(|| format!("{}: {model_dir}/{} is missing", f.describe(), v.manifest))?;
+        let published: Bundle = serde_json::from_slice(&raw)
+            .map_err(|e| format!("{}: {}: {e}", f.describe(), v.manifest))?;
+        if same_build(&published, &bundle) {
+            println!(
+                "already published: {}/{}:{}@g{} is this build",
+                bundle.namespace, bundle.name, bundle.label, v.generation
+            );
+            return Ok(None);
+        }
+    }
+    bundle.generation = newest.map_or(1, |v| v.generation + 1);
+    bundle.variant_id = variant_id(&bundle);
+    Ok(Some(bundle))
+}
+
+/// Whether two manifests describe the same build: equal in everything but
+/// what publishing assigns (the generation, the variant id, and the objset
+/// manifest's digest, which the registry records as it stores it).
+#[cfg(feature = "dist")]
+fn same_build(published: &plow_asset::dist::Bundle, local: &plow_asset::dist::Bundle) -> bool {
+    let mut p = published.clone();
+    p.generation = local.generation;
+    p.variant_id = local.variant_id.clone();
+    if let (Some(po), Some(lo)) = (p.objset.as_mut(), local.objset.as_ref()) {
+        po.sha256 = lo.sha256.clone();
+    }
+    p == *local
+}
+
+/// `publish_dist.py`'s `variant_id`: 12 hex of the sha256 over the full key,
+/// the build included, so two generations of one label never collide.
+#[cfg(feature = "dist")]
+fn variant_id(b: &plow_asset::dist::Bundle) -> String {
+    let parts = [
+        b.namespace.clone(),
+        b.name.clone(),
+        b.label.clone(),
+        b.generation.to_string(),
+        b.target.isa.clone(),
+        b.target.sku.clone(),
+        b.target.units.to_string(),
+        format!("{}{}", b.parallel.mode, b.parallel.n),
+        b.max_ctx.to_string(),
+        b.plow_git.clone(),
+        b.objset
+            .as_ref()
+            .map(|o| o.objset_id.clone())
+            .unwrap_or_default(),
+    ];
+    let digest = dist::Digest::of(parts.join("\x1f").as_bytes());
+    digest.as_str()[..12].to_string()
+}
+
+/// A new directory only this user can enter. `create_dir` refuses a path
+/// that exists, symlink or not, so nothing another user planted is written
+/// through.
+#[cfg(feature = "dist")]
+fn private_temp_dir() -> Result<PathBuf, Err> {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
+    for attempt in 0..16u32 {
+        let dir = std::env::temp_dir().join(format!(
+            "plowrt-publish-{}-{stamp}-{attempt}",
+            std::process::id()
+        ));
+        let mut builder = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+        match builder.create(&dir) {
+            Ok(()) => return Ok(dir),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(format!("{}: {e}", dir.display()).into()),
+        }
+    }
+    Err("could not create a private temporary directory".into())
+}
+
+#[cfg(feature = "dist")]
+fn upload(
+    zip_path: &std::path::Path,
+    to: &PublishTo,
+    bundle: &plow_asset::dist::Bundle,
+) -> Result<(), Err> {
+    #[derive(serde::Deserialize)]
+    struct UploadTarget {
+        id: String,
+        upload_url: String,
+    }
+    let base = to.url.trim_end_matches('/');
+    let auth = format!("Bearer {}", to.api_key);
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(std::time::Duration::from_secs(20))
+        .build();
+    let failed = |url: &str, e: ureq::Error| -> Err {
+        match e {
+            ureq::Error::Status(code, resp) => {
+                format!("{url}: {code}: {}", resp.into_string().unwrap_or_default()).into()
+            }
+            // Not ureq's own text: it repeats the URL, query string and all.
+            ureq::Error::Transport(t) => {
+                format!("{url}: {} {}", t.kind(), t.message().unwrap_or_default()).into()
+            }
+        }
+    };
+
+    // 1. Where to put it.
+    let uploads = format!("{base}/api/v1/admin/registry/uploads");
+    let created = agent
+        .post(&uploads)
+        .set("Authorization", &auth)
+        .call()
+        .map_err(|e| failed(&uploads, e))?;
+    let target: UploadTarget =
+        serde_json::from_reader(created.into_reader()).map_err(|e| format!("{uploads}: {e}"))?;
+
+    // 2. The zip. An absolute URL is a presigned bucket and takes no
+    // credentials; a relative one is the registry itself.
+    let file = std::fs::File::open(zip_path)?;
+    let len = file.metadata()?.len().to_string();
+    let put_url = if target.upload_url.starts_with('/') {
+        format!("{base}{}", target.upload_url)
+    } else {
+        target.upload_url.clone()
+    };
+    let mut put = agent
+        .put(&put_url)
+        .set("Content-Type", "application/zip")
+        .set("Content-Length", &len);
+    if target.upload_url.starts_with('/') {
+        put = put.set("Authorization", &auth);
+    }
+    // A presigned URL's query string is a credential: never print it.
+    let shown = put_url.split('?').next().unwrap_or_default();
+    put.send(file).map_err(|e| failed(shown, e))?;
+
+    // 3. Publish it.
+    let publish = format!("{uploads}/{}/publish", target.id);
+    let mut req = agent.post(&publish).set("Authorization", &auth);
+    if let Some(s) = to.status {
+        req = req.query("status", s);
+    }
+    if let Some(d) = to.description {
+        req = req.query("description", d);
+    }
+    if let Some(t) = to.tok_s {
+        req = req.query("tok_s", &t.to_string());
+    }
+    if let Some(c) = to.concurrency {
+        req = req.query("concurrency", &c.to_string());
+    }
+    match req.call() {
+        Ok(resp) => {
+            println!("published: {}", resp.into_string()?);
+            Ok(())
+        }
+        // Generations are immutable: another publish took this one first.
+        Err(ureq::Error::Status(409, resp)) => Err(format!(
+            "{}@g{} was published by someone else while this ran; run again for the next \
+             generation ({})",
+            bundle.label,
+            bundle.generation,
+            resp.into_string().unwrap_or_default()
+        )
+        .into()),
+        Err(e) => Err(failed(&publish, e)),
+    }
+}
+
 pub fn cmd_prepare(model: &str, checkpoint: Option<PathBuf>) -> Result<(), Err> {
     let r = parse(model)?;
     let st = store()?;
@@ -543,4 +790,45 @@ pub fn resolve_local(model: &str) -> Result<PathBuf, Err> {
         .into());
     }
     Ok(dir)
+}
+
+#[cfg(all(test, feature = "dist"))]
+mod tests {
+    #[test]
+    fn variant_id_is_publish_dists() {
+        // `publish_dist.py`'s `variant_id(bundle, 1)` for this bundle.
+        let b: plow_asset::dist::Bundle = serde_json::from_value(serde_json::json!({
+            "schema": "plow.dist.bundle.v1", "namespace": "infervisor", "name": "smollm2-360m",
+            "label": "metal3-apple-m4-pro-tp1-0k", "generation": 1, "variant_id": "",
+            "plow_git": "fa87c478", "network": "smollm2-360m-instruct",
+            "target": {"vendor": "apple", "isa": "metal3", "sku": "Apple M4 Pro", "units": 16, "mem_bytes": 19069665280u64},
+            "parallel": {"mode": "tp", "n": 1}, "max_ctx": 0, "files": [],
+            "tokenizer": {"file": "tokenizer.json", "generator": "plow", "sha256": "9ca9acddb6525a194ec8ac7a87f24fbba7232a9a15ffa1af0c1224fcd888e47c", "source": "derived", "verified": false},
+            "checkpoint": {"source": "hf:HuggingFaceTB/SmolLM2-360M-Instruct", "revision": "main", "shards": 0, "layout": "hf-safetensors", "bytes": 0}
+        }))
+        .unwrap();
+        assert_eq!(super::variant_id(&b), "b49b5c9cf598");
+    }
+
+    #[test]
+    fn same_build_ignores_only_what_publishing_assigns() {
+        let local: plow_asset::dist::Bundle = serde_json::from_value(serde_json::json!({
+            "schema": "plow.dist.bundle.v1", "namespace": "infervisor", "name": "m",
+            "label": "l", "generation": 0, "variant_id": "", "plow_git": "abc", "network": "m",
+            "target": {"vendor": "apple", "isa": "metal3", "sku": "Apple M4 Pro", "units": 16, "mem_bytes": 1},
+            "parallel": {"mode": "tp", "n": 1}, "max_ctx": 2048, "files": [],
+            "tokenizer": {"file": "t", "generator": "plow", "sha256": "0", "source": "derived", "verified": false},
+            "checkpoint": {"source": "hf:o/m", "revision": "main", "shards": 0, "layout": "x", "bytes": 0}
+        }))
+        .unwrap();
+        let mut published = local.clone();
+        published.generation = 3;
+        published.variant_id = "abcdef012345".into();
+        assert!(super::same_build(&published, &local));
+        published.max_ctx = 4096;
+        assert!(
+            !super::same_build(&published, &local),
+            "a metadata change is a new build"
+        );
+    }
 }

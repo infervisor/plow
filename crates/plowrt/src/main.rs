@@ -717,6 +717,47 @@ enum Cmd {
         #[arg(long)]
         out: PathBuf,
     },
+
+    /// Package a built bundle exactly as `pack` does and publish it to a
+    /// registry's publish API (`POST <to>/api/v1/admin/registry/publish/zip`),
+    /// authenticated by an API key. A generation the registry already holds
+    /// is reported and not an error: generations are immutable.
+    #[cfg(feature = "dist")]
+    Publish {
+        /// Bundle manifest, as written by `pack_bundle.py`.
+        #[arg(long)]
+        bundle: PathBuf,
+        /// Objset manifest; omitted for a runtime-compiled target (Apple).
+        #[arg(long)]
+        objset: Option<PathBuf>,
+        /// Directory `bundle.json`'s `files[]` live in.
+        #[arg(long)]
+        assets: PathBuf,
+        /// Directory `objset.json`'s `objects[]` live in.
+        #[arg(long)]
+        objects: Option<PathBuf>,
+        /// Directory a `dist` checkpoint's `files[]` live in, as for `pack`.
+        #[arg(long)]
+        checkpoint_dir: Option<PathBuf>,
+        /// The registry's API base URL.
+        #[arg(long, env = "PLOW_PUBLISH_URL")]
+        to: String,
+        /// API key allowed to publish, sent as a Bearer token.
+        #[arg(long = "key", env = "PLOW_API_KEY", hide_env_values = true)]
+        api_key: String,
+        /// Status to publish at; the registry's default when omitted.
+        #[arg(long, value_parser = ["emits", "validated"])]
+        status: Option<String>,
+        /// One line describing the model, for the registry's catalog.
+        #[arg(long)]
+        description: Option<String>,
+        /// Measured decode throughput; required for `--status validated`.
+        #[arg(long)]
+        tok_s: Option<f64>,
+        /// The concurrency `--tok-s` was measured at.
+        #[arg(long)]
+        concurrency: Option<u32>,
+    },
 }
 
 /// Narrowing shared by `pull` and `load`. Everything not constrained here is
@@ -1105,6 +1146,34 @@ async fn async_main(
             objects.as_deref(),
             checkpoint_dir.as_deref(),
             &out,
+        )),
+        #[cfg(feature = "dist")]
+        Cmd::Publish {
+            bundle,
+            objset,
+            assets,
+            objects,
+            checkpoint_dir,
+            to,
+            api_key,
+            status,
+            description,
+            tok_s,
+            concurrency,
+        } => dist_cmd::report(dist_cmd::cmd_publish(
+            &bundle,
+            objset.as_deref(),
+            &assets,
+            objects.as_deref(),
+            checkpoint_dir.as_deref(),
+            &dist_cmd::PublishTo {
+                url: &to,
+                api_key: &api_key,
+                status: status.as_deref(),
+                description: description.as_deref(),
+                tok_s,
+                concurrency,
+            },
         )),
         #[cfg(feature = "hsa")]
         Cmd::AmdBench {
