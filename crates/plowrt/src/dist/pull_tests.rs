@@ -405,9 +405,13 @@ fn a_dist_checkpoint_is_pulled_as_blobs_and_linked_into_its_snapshot() {
     assert_eq!(t.fetched_blobs, 2 + ckpt.len());
 
     let snap = crate::dist::weights::dist_snapshot_path(store.root(), &resolved.bundle).unwrap();
+    let rev = crate::dist::weights::checkpoint_revision(&resolved.bundle);
+    assert!(rev.starts_with("v1-") && rev.len() == 15, "{rev}");
     assert_eq!(
         snap,
-        store.root().join("snapshots/dist--infervisor--kimi-k3@v1")
+        store
+            .root()
+            .join(format!("snapshots/dist+infervisor--kimi-k3@{rev}"))
     );
     for (name, content) in &ckpt {
         assert_eq!(&std::fs::read(snap.join(name)).unwrap(), content, "{name}");
@@ -428,14 +432,51 @@ fn a_dist_checkpoint_is_pulled_as_blobs_and_linked_into_its_snapshot() {
         farm.dir,
         store
             .root()
-            .join("checkpoints/dist--infervisor--kimi-k3@v1")
+            .join(format!("checkpoints/dist+infervisor--kimi-k3@{rev}"))
     );
     assert!(dir.join("checkpoint/model.safetensors").is_file());
 
-    // A second pull moves nothing and relinks the same snapshot.
+    // A second pull moves nothing and keeps the same snapshot.
     let (_, t2) = pull(&store, &*f.fetch(), &resolved).unwrap();
     assert_eq!(t2.fetched_blobs, 0);
     assert!(snap.join("onnx/extra.bin").is_file());
+
+    // The size `ls` reports is the build's, not the weights'.
+    store
+        .pin(&r.pin_key(), &resolved.variant.variant_id)
+        .unwrap();
+    let listed = store.list();
+    let weights: u64 = ckpt.iter().map(|(_, c)| c.len() as u64).sum();
+    let all: u64 = std::fs::read_to_string(dir.join(".plow-blobs"))
+        .unwrap()
+        .lines()
+        .map(|l| {
+            std::fs::metadata(store.blob_path(&Digest::parse(l.trim()).unwrap()))
+                .unwrap()
+                .len()
+        })
+        .sum();
+    assert_eq!(
+        listed[0].bytes,
+        all - weights,
+        "the checkpoint is not the build"
+    );
+
+    // Reusing the revision label for new weights is a different snapshot:
+    // the old one is untouched.
+    let mut reused = resolved.bundle.clone();
+    reused.checkpoint.files[0].sha256 = "0".repeat(64);
+    let other = crate::dist::weights::dist_snapshot_path(store.root(), &reused).unwrap();
+    assert_ne!(other, snap);
+
+    // With the bundle gone, gc takes the snapshot and the space with it.
+    std::fs::remove_dir_all(&dir).unwrap();
+    let (_, freed) = store.gc().unwrap();
+    assert!(!snap.exists(), "an unused dist snapshot survived gc");
+    assert!(
+        freed >= weights,
+        "freed {freed}, the weights alone are {weights}"
+    );
 }
 
 /// The property the whole layout exists for: a generation that changes only the

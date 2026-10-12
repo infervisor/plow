@@ -806,7 +806,7 @@ impl Bundle {
             }
         }
         self.checkpoint.validate()?;
-        // A `dist` checkpoint is stored as `dist--<namespace>--<name>@<rev>`:
+        // A `dist` checkpoint is stored as `dist+<namespace>--<name>@<rev>-<hash>`:
         // each part one path component, and no `--` inside one, or two models
         // (`a--b/c`, `a/b--c`) would share a snapshot.
         if self.checkpoint.source == DIST_SOURCE {

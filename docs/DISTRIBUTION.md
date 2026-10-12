@@ -174,7 +174,7 @@ The exception is a checkpoint with no Hugging Face repository to fetch from
 (private, or for an air-gapped node): `checkpoint.source = "dist"` lists every
 file as `files: [{name, sha256, bytes}]`, published under `v1/blobs/sha256/`
 like a bundle file, and `revision` is a free version label. `pull` fetches those
-blobs with the bundle and links them into `snapshots/dist--<ns>--<name>@<rev>/`,
+blobs with the bundle and links them into `snapshots/dist+<ns>--<name>@<rev>-<hash>/`,
 which `load` prepares without `--fetch-weights`. `pack_bundle.py
 --checkpoint-dir <dir> --revision <label>` writes such a manifest (instead of
 `--hf`), and `plowrt pack --checkpoint-dir <dir>` zips the files as
@@ -224,7 +224,7 @@ packs the build exactly as `plowrt pack` does and uploads the archive with an
 API key, so anyone with a key the registry accepts can submit a build:
 
 ```
-PLOW_API_KEY=… plowrt publish --bundle bundle.json --assets <dir> \
+PLOW_PUBLISH_KEY=… plowrt publish --bundle bundle.json --assets <dir> \
   [--objset objset.json --objects <dir>] [--checkpoint-dir <dir> --hf <org>/<repo>] \
   --to https://<registry>
 ```

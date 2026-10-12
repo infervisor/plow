@@ -50,7 +50,7 @@ pub fn farm_path(store_root: &Path, bundle: &Bundle) -> PathBuf {
     store_root.join("checkpoints").join(format!(
         "{}@{}",
         super::weights::checkpoint_key(bundle),
-        bundle.checkpoint.revision
+        super::weights::checkpoint_revision(bundle)
     ))
 }
 
@@ -76,10 +76,20 @@ pub fn build(
         )));
     }
     let dir = farm_path(store_root, bundle);
-    // Rebuilt from empty: a `dist` revision is a label a publisher may reuse,
-    // and a shard left from the previous content would load beside the new
-    // ones. The farm holds only links, so nothing it points at is removed.
-    let _ = std::fs::remove_dir_all(&dir);
+    // Not emptied: other bundles on this checkpoint keep their derived
+    // sidecars here. But a base shard from another snapshot (an operator's
+    // `--checkpoint` that changed) would load beside the new ones, so every
+    // shard link that does not point into a bundle goes before relinking.
+    let bundles = store_root.join("bundles");
+    if let Ok(rd) = std::fs::read_dir(&dir) {
+        for e in rd.flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            let into_bundle = std::fs::read_link(e.path()).is_ok_and(|t| t.starts_with(&bundles));
+            if name.ends_with(".safetensors") && !into_bundle {
+                let _ = std::fs::remove_file(e.path());
+            }
+        }
+    }
     std::fs::create_dir_all(&dir).map_err(|source| RuntimeError::Io {
         path: dir.clone(),
         source,

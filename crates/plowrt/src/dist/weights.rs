@@ -50,12 +50,13 @@ pub fn snapshot_path(store_root: &Path, repo: &str, revision: &str) -> Result<Pa
 
 /// The directory name a checkpoint's snapshot and farm go by in the store,
 /// before `@<revision>`: `<org>--<repo>` for `hf:`, and
-/// `dist--<namespace>--<name>` for a `dist` checkpoint, whose revision is a
+/// `dist+<namespace>--<name>` for a `dist` checkpoint (`+` is not allowed in a
+/// Hugging Face name, so no `hf:` key can equal it), whose revision is a
 /// free label and so must be scoped to its model.
 pub fn checkpoint_key(bundle: &Bundle) -> String {
     let c = &bundle.checkpoint;
     if c.source == DIST_SOURCE {
-        return format!("dist--{}--{}", bundle.namespace, bundle.name);
+        return format!("dist+{}--{}", bundle.namespace, bundle.name);
     }
     c.source
         .strip_prefix("hf:")
@@ -63,8 +64,28 @@ pub fn checkpoint_key(bundle: &Bundle) -> String {
         .replace('/', "--")
 }
 
+/// The revision a checkpoint is stored under. A Hugging Face revision is the
+/// publisher's; a `dist` revision is a free label a publisher may reuse for
+/// new weights, so it is qualified by a hash of the files' digests. A key
+/// then never names two contents: an older pin keeps its weights, and two
+/// bundles share a snapshot or farm only when they share the checkpoint.
+pub fn checkpoint_revision(bundle: &Bundle) -> String {
+    let c = &bundle.checkpoint;
+    if c.source != DIST_SOURCE {
+        return c.revision.clone();
+    }
+    let mut files: Vec<String> = c
+        .files
+        .iter()
+        .map(|f| format!("{}:{}", f.name, f.sha256))
+        .collect();
+    files.sort();
+    let digest = Digest::of(files.join("\n").as_bytes());
+    format!("{}-{}", c.revision, &digest.as_str()[..12])
+}
+
 /// Where a `dist` checkpoint's snapshot lives:
-/// `snapshots/dist--<namespace>--<name>@<revision>/`. The revision is
+/// `snapshots/dist+<namespace>--<name>@<revision>-<files hash>/`. The revision is
 /// validated as one path component with the bundle; the namespace and name
 /// are checked here too (also by `Bundle::validate`), because they become
 /// path components, and a `--` inside one would make two models' keys equal.
@@ -80,18 +101,21 @@ pub fn dist_snapshot_path(store_root: &Path, bundle: &Bundle) -> Result<PathBuf>
     Ok(store_root.join("snapshots").join(format!(
         "{}@{}",
         checkpoint_key(bundle),
-        bundle.checkpoint.revision
+        checkpoint_revision(bundle)
     )))
 }
 
 /// Link a `dist` checkpoint's blobs, already in the store, into its snapshot,
 /// which `prepare::build` then takes exactly as it takes a Hugging Face one.
 ///
-/// Rebuilt on every pull rather than reused: a `dist` revision is a label a
-/// publisher chose, not a content hash, and links are cheap. Staged and
+/// Its path names its content ([`checkpoint_revision`]), so one that exists
+/// is complete and is never rewritten under a server reading it. Staged and
 /// renamed, like [`fetch`], so a reader never sees a partial snapshot.
 pub fn link_dist(store: &Store, bundle: &Bundle) -> Result<PathBuf> {
     let dir = dist_snapshot_path(store.root(), bundle)?;
+    if dir.is_dir() {
+        return Ok(dir);
+    }
     let staging = dir.with_extension(format!("partial-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&staging);
     std::fs::create_dir_all(&staging).map_err(io(&staging))?;
@@ -116,8 +140,13 @@ pub fn link_dist(store: &Store, bundle: &Bundle) -> Result<PathBuf> {
     if let Some(parent) = dir.parent() {
         std::fs::create_dir_all(parent).map_err(io(parent))?;
     }
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::rename(&staging, &dir).map_err(io(&dir))?;
+    if let Err(e) = std::fs::rename(&staging, &dir) {
+        let _ = std::fs::remove_dir_all(&staging);
+        // Another pull linked the same content first; anything else failed.
+        if !dir.is_dir() {
+            return Err(io(&dir)(e));
+        }
+    }
     Ok(dir)
 }
 
@@ -214,8 +243,10 @@ pub fn fetch(store_root: &Path, source: &str, revision: &str, shards: u32) -> Re
     if let Some(parent) = dir.parent() {
         std::fs::create_dir_all(parent).map_err(io(parent))?;
     }
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::rename(&staging, &dir).map_err(io(&dir))?;
+    if std::fs::rename(&staging, &dir).is_err() && dir.is_dir() {
+        // Another pull linked the same content first.
+        let _ = std::fs::remove_dir_all(&staging);
+    }
     Ok(dir)
 }
 

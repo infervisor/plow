@@ -523,7 +523,7 @@ pub fn cmd_publish(
     }
     let dir = private_temp_dir()?;
     let sent = (|| {
-        let Some(bundle) = next_generation(bundle_path, to.url)? else {
+        let Some(bundle) = next_generation(bundle_path, to)? else {
             return Ok(());
         };
         if bundle.checkpoint.source == "dist" && to.hf.is_none() {
@@ -549,13 +549,16 @@ pub fn cmd_publish(
 }
 
 /// The bundle as the registry's next generation of its label, as
-/// `publish_dist.py` numbers one; `None` when the newest generation already
-/// carries exactly these files and objset (a re-run publishes nothing).
+/// `publish_dist.py` numbers one; `None` when the newest generation is already
+/// this build at the status and measurement asked for (a re-run publishes
+/// nothing). A new status or measurement for the same build is a new
+/// generation, since a published one is immutable.
 #[cfg(feature = "dist")]
 fn next_generation(
     bundle_path: &std::path::Path,
-    registry: &str,
+    to: &PublishTo,
 ) -> Result<Option<plow_asset::dist::Bundle>, Err> {
+    let registry = to.url;
     use plow_asset::dist::{Bundle, ModelIndex};
     let mut bundle: Bundle = serde_json::from_slice(&std::fs::read(bundle_path)?)
         .map_err(|e| format!("{}: {e}", bundle_path.display()))?;
@@ -577,7 +580,16 @@ fn next_generation(
             .ok_or_else(|| format!("{}: {model_dir}/{} is missing", f.describe(), v.manifest))?;
         let published: Bundle = serde_json::from_slice(&raw)
             .map_err(|e| format!("{}: {}: {e}", f.describe(), v.manifest))?;
-        if same_build(&published, &bundle) {
+        let status_kept = to.status.is_none_or(|s| {
+            serde_json::to_value(v.status)
+                .ok()
+                .and_then(|j| j.as_str().map(|j| j == s))
+                == Some(true)
+        });
+        let measure_kept = to
+            .tok_s
+            .is_none_or(|t| v.measured.as_ref().is_some_and(|m| m.tok_s == t));
+        if same_build(&published, &bundle) && status_kept && measure_kept {
             println!(
                 "already published: {}/{}:{}@g{} is this build",
                 bundle.namespace, bundle.name, bundle.label, v.generation

@@ -392,10 +392,19 @@ impl Store {
     /// objects alike. Read from the record rather than by walking the
     /// directory, which would also follow `checkpoint` into the weights.
     fn bundle_bytes(&self, dir: &Path) -> u64 {
+        // A `dist` checkpoint's shards are kept by the bundle too; they are
+        // weights, not the build, and an `hf:` bundle's are not counted.
+        let weights: std::collections::BTreeSet<String> = std::fs::read(dir.join(BUNDLE_MANIFEST))
+            .ok()
+            .and_then(|raw| serde_json::from_slice::<plow_asset::dist::Bundle>(&raw).ok())
+            .map(|b| b.checkpoint.files.into_iter().map(|f| f.sha256).collect())
+            .unwrap_or_default();
         std::fs::read_to_string(dir.join(BUNDLE_BLOBS))
             .unwrap_or_default()
             .lines()
-            .filter_map(|l| Digest::parse(l.trim()).ok())
+            .map(str::trim)
+            .filter(|l| !weights.contains(*l))
+            .filter_map(|l| Digest::parse(l).ok())
             .filter_map(|d| std::fs::metadata(self.blob_path(&d)).ok())
             .map(|m| m.len())
             .sum()
@@ -451,8 +460,78 @@ impl Store {
                 freed += size;
             }
         }
-        Ok((n, freed))
+        let (sn, sfreed) = self.gc_dist_snapshots();
+        Ok((n + sn, freed + sfreed))
     }
+
+    /// Remove the `dist` snapshots no bundle uses. Their files are hard links
+    /// to blobs, so the blobs `gc` just removed still hold their space until
+    /// the snapshot goes too. A bundle with no recorded manifest might use any
+    /// of them: then none is removed.
+    fn gc_dist_snapshots(&self) -> (usize, u64) {
+        let mut live = std::collections::BTreeSet::new();
+        if let Ok(rd) = std::fs::read_dir(self.root.join("bundles")) {
+            for dir in rd.flatten().filter(|d| d.path().is_dir()) {
+                let Some(bundle) = std::fs::read(dir.path().join(BUNDLE_MANIFEST))
+                    .ok()
+                    .and_then(|raw| serde_json::from_slice::<plow_asset::dist::Bundle>(&raw).ok())
+                else {
+                    return (0, 0);
+                };
+                if bundle.checkpoint.source == plow_asset::dist::DIST_SOURCE {
+                    if let Ok(p) = super::weights::dist_snapshot_path(&self.root, &bundle) {
+                        live.insert(p);
+                    }
+                }
+            }
+        }
+        let (mut n, mut freed) = (0usize, 0u64);
+        let Ok(rd) = std::fs::read_dir(self.root.join("snapshots")) else {
+            return (0, 0);
+        };
+        for snap in rd.flatten() {
+            let path = snap.path();
+            let name = snap.file_name().to_string_lossy().into_owned();
+            if !name.starts_with("dist+") || !path.is_dir() || live.contains(&path) {
+                continue;
+            }
+            // Space comes back only for files nothing else links to.
+            let (files, bytes) = last_links(&path);
+            if std::fs::remove_dir_all(&path).is_ok() {
+                n += files;
+                freed += bytes;
+            }
+        }
+        (n, freed)
+    }
+}
+
+/// Files under `dir` with no other hard link, and their size.
+fn last_links(dir: &Path) -> (usize, u64) {
+    let (mut n, mut bytes) = (0usize, 0u64);
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return (0, 0);
+    };
+    for e in rd.flatten() {
+        let Ok(m) = std::fs::symlink_metadata(e.path()) else {
+            continue;
+        };
+        if m.is_dir() {
+            let (sn, sb) = last_links(&e.path());
+            n += sn;
+            bytes += sb;
+        } else if m.is_file() {
+            #[cfg(unix)]
+            let last = std::os::unix::fs::MetadataExt::nlink(&m) == 1;
+            #[cfg(not(unix))]
+            let last = true;
+            if last {
+                n += 1;
+                bytes += m.len();
+            }
+        }
+    }
+    (n, bytes)
 }
 
 /// A path that stays inside the bundle: relative, no `..`, no root, no prefix.

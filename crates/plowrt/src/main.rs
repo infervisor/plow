@@ -718,10 +718,11 @@ enum Cmd {
         out: PathBuf,
     },
 
-    /// Package a built bundle exactly as `pack` does and publish it to a
-    /// registry's publish API (`POST <to>/api/v1/admin/registry/publish/zip`),
-    /// authenticated by an API key. A generation the registry already holds
-    /// is reported and not an error: generations are immutable.
+    /// Publish a built bundle to a registry with an API key: number it as its
+    /// label's next generation from the registry's index, package it exactly
+    /// as `pack` does, and send it through the registry's staged upload
+    /// (`<to>/api/v1/admin/registry/uploads`). When the newest generation is
+    /// already this build, nothing is sent.
     #[cfg(feature = "dist")]
     Publish {
         /// Bundle manifest, as written by `pack_bundle.py`.
@@ -739,12 +740,13 @@ enum Cmd {
         /// Directory a `dist` checkpoint's `files[]` live in, as for `pack`.
         #[arg(long)]
         checkpoint_dir: Option<PathBuf>,
-        /// The registry's API base URL.
-        #[arg(long, env = "PLOW_PUBLISH_URL")]
-        to: String,
-        /// API key allowed to publish, sent as a Bearer token.
-        #[arg(long = "key", env = "PLOW_API_KEY", hide_env_values = true)]
-        api_key: String,
+        /// The registry's API base URL; `PLOW_PUBLISH_URL` when omitted.
+        #[arg(long)]
+        to: Option<String>,
+        /// API key allowed to publish, sent as a Bearer token;
+        /// `PLOW_PUBLISH_KEY` when omitted (preferred: a flag shows in `ps`).
+        #[arg(long = "key")]
+        api_key: Option<String>,
         /// Status to publish at; the registry's default when omitted.
         #[arg(long, value_parser = ["emits", "validated"])]
         status: Option<String>,
@@ -1165,22 +1167,29 @@ async fn async_main(
             hf,
             tok_s,
             concurrency,
-        } => dist_cmd::report(dist_cmd::cmd_publish(
-            &bundle,
-            objset.as_deref(),
-            &assets,
-            objects.as_deref(),
-            checkpoint_dir.as_deref(),
-            &dist_cmd::PublishTo {
-                url: &to,
-                api_key: &api_key,
-                status: status.as_deref(),
-                description: description.as_deref(),
-                hf: hf.as_deref(),
-                tok_s,
-                concurrency,
-            },
-        )),
+        } => dist_cmd::report((|| {
+            let (env_url, env_key) = plowrt::config::RuntimeConfig::publish_env();
+            let to = to.or(env_url).ok_or("give --to or set PLOW_PUBLISH_URL")?;
+            let api_key = api_key
+                .or(env_key)
+                .ok_or("set PLOW_PUBLISH_KEY (or --key) to an API key allowed to publish")?;
+            dist_cmd::cmd_publish(
+                &bundle,
+                objset.as_deref(),
+                &assets,
+                objects.as_deref(),
+                checkpoint_dir.as_deref(),
+                &dist_cmd::PublishTo {
+                    url: &to,
+                    api_key: &api_key,
+                    status: status.as_deref(),
+                    description: description.as_deref(),
+                    hf: hf.as_deref(),
+                    tok_s,
+                    concurrency,
+                },
+            )
+        })()),
         #[cfg(feature = "hsa")]
         Cmd::AmdBench {
             blob,
