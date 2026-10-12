@@ -231,14 +231,13 @@ pub fn pull(
             t.reused_bytes += bytes;
             continue;
         }
-        let raw = fetch::blob(f, digest)?;
-        // `put` re-hashes and refuses a mismatch, so a corrupted transfer never
-        // reaches the store under a name that promises its content.
-        store
-            .put(digest, &raw)
+        // Streamed: a checkpoint shard may not fit in memory. The store hashes
+        // as it writes and refuses a mismatch, so a corrupted transfer never
+        // reaches it under a name that promises its content.
+        fetch::blob_into(f, digest, store)
             .map_err(|e| RuntimeError::Dist(format!("{name}: {e}")))?;
         t.fetched_blobs += 1;
-        t.fetched_bytes += raw.len() as u64;
+        t.fetched_bytes += bytes;
     }
     let flat: Vec<(String, Digest)> = files.into_iter().map(|(n, d, _)| (n, d)).collect();
     let dir = store.materialize(&resolved.variant.variant_id, &flat)?;

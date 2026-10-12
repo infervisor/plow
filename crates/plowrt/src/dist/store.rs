@@ -154,6 +154,51 @@ impl Store {
         Ok(true)
     }
 
+    /// [`Store::put`] for a stream: hashed as it is written to a staged file,
+    /// renamed into place only when the digest matches.
+    pub fn put_reader(&self, want: &Digest, r: &mut dyn std::io::Read) -> Result<bool> {
+        use sha2::Digest as _;
+        let final_path = self.blob_path(want);
+        if final_path.is_file() {
+            return Ok(false);
+        }
+        let tmp = final_path.with_extension(format!("part{}", std::process::id()));
+        let io = |path: &Path| {
+            let path = path.to_path_buf();
+            move |source| RuntimeError::Io { path, source }
+        };
+        let mut out = std::io::BufWriter::new(std::fs::File::create(&tmp).map_err(io(&tmp))?);
+        let (mut h, mut n, mut buf) = (sha2::Sha256::new(), 0u64, vec![0u8; 1 << 20]);
+        let copied = (|| -> std::io::Result<()> {
+            loop {
+                let k = r.read(&mut buf)?;
+                if k == 0 {
+                    return std::io::Write::flush(&mut out);
+                }
+                h.update(&buf[..k]);
+                std::io::Write::write_all(&mut out, &buf[..k])?;
+                n += k as u64;
+            }
+        })();
+        drop(out);
+        let got = format!("{:x}", h.finalize());
+        if let Err(source) = copied {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(RuntimeError::Dist(format!(
+                "blob {want}: transfer failed: {source}"
+            )));
+        }
+        if got != want.as_str() {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(RuntimeError::Dist(format!(
+                "digest mismatch: expected {want}, content hashes to {got} ({n} bytes). \
+                 The blob was corrupted in transit or the manifest is wrong; nothing was stored."
+            )));
+        }
+        std::fs::rename(&tmp, &final_path).map_err(io(&final_path))?;
+        Ok(true)
+    }
+
     pub fn get(&self, d: &Digest) -> Result<Vec<u8>> {
         let p = self.blob_path(d);
         let bytes = std::fs::read(&p).map_err(|source| RuntimeError::Io {
@@ -397,7 +442,18 @@ impl Store {
         let weights: std::collections::BTreeSet<String> = std::fs::read(dir.join(BUNDLE_MANIFEST))
             .ok()
             .and_then(|raw| serde_json::from_slice::<plow_asset::dist::Bundle>(&raw).ok())
-            .map(|b| b.checkpoint.files.into_iter().map(|f| f.sha256).collect())
+            .map(|b| {
+                // Only what is weights alone: a build file the checkpoint
+                // also carries is still the build's.
+                let build: std::collections::BTreeSet<&str> =
+                    b.files.iter().map(|f| f.sha256.as_str()).collect();
+                b.checkpoint
+                    .files
+                    .iter()
+                    .filter(|f| !build.contains(f.sha256.as_str()))
+                    .map(|f| f.sha256.clone())
+                    .collect()
+            })
             .unwrap_or_default();
         std::fs::read_to_string(dir.join(BUNDLE_BLOBS))
             .unwrap_or_default()
