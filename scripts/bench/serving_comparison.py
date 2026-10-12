@@ -341,8 +341,12 @@ def arm(root, prov, cell, tags, errors):
             runs.append(r)
     if len(runs) != len(tags):
         return None
-    for k in ("io_key", "traffic"):
-        if len({r[k] for r in runs}) > 1:
+    # Repeats draw their own prompts (llm_grid.sh seeds per cell and repeat), so they must agree
+    # on the mean shape, not on every request's token count: one prompt of a 192-request repeat
+    # re-tokenising to 1026 instead of 1024 on BOTH stacks is the same cell. The arms are still
+    # matched on the exact per-request lists (`io_key`, below) — they replay the same prompts.
+    for k in ("io", "traffic"):
+        if len({r[k].removesuffix(" (mean)") for r in runs}) > 1:
             errors.append(f"{root}: {cell} repeats differ in {k}")
     traffic = runs[0]["traffic"]
     if "extra" in runs[0]:  # one seed per repeat; the arms must replay the same plans

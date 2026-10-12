@@ -386,6 +386,17 @@ The packet from config + index alone (no weights) is 70 MB: 4 prefill buckets + 
   logits row, concurrency 16, 46 cases / 88 requests): kl_mean 0.0134 (vLLM 0.0368), kl_p99
   0.184 (0.549), kl_max 0.70 (1.84), top1_decisive 0.9967 (0.9868), cont_frac 0.754 (0.730),
   needles 18/18 (18/18). Gate dir /home/lava/bench/glm53flash/fp32ref/gate-v4b.
+- 17:35 UTC, E6 prefix cache: served with `PLOW_PREFIX_CACHE` unset, the engine logs "prefix
+  cache requested but not built; serving with slot-local KV and a permanent 0% hit rate.
+  Layout::from_blob refused this packet: a pooled indexer (index_kpool > 1), a DCP degree above
+  1, or an unsupported cache geometry on some rung" (has_vmm=true). The packet is DSA=0 but
+  declares the pooled indexer tensors. Not available on this packet; the recipe keeps
+  `PLOW_PREFIX_CACHE=0`.
+- 17:35 UTC, E10 TP4 bench (packet pkt-glm53flash-tp4-ladder-v4, 4 GPUs, real prompt, streams
+  exact at every rung): scalar (rung 8) 55.5 ms, B=8 51.4, B=32 63.3, B=64 74.6 ms (858 tok/s
+  per group); prefill 1k 204 ms (TP8 173). Two such groups (DP2xTP4) would serve 128 streams at
+  ~1715 tok/s / 75 ms vs TP8's 1408 tok/s / 91 ms at B=128 — a +22% throughput lever at c128,
+  but plowrt has no data-parallel serving on AMD (two engines behind one router); hand-off.
 
 ## 5. Results
 
