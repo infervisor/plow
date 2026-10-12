@@ -491,6 +491,8 @@ fn slab_carve(be: &CudaBackend, sections: [usize; 2]) -> Result<(DeviceMem, [Dev
 
 /// One block per executor, 8 worker warps — `dev_isa.h` workgroup geometry.
 const BLOCK: u32 = 256;
+/// `plow_<arch>_gdn_ride` stages 8 V rows x 128 floats per warp.
+const GDN_RIDE_SMEM: u32 = (BLOCK / 32) * 8 * 128 * 4;
 /// Weight-upload staging chunk (pinned), as in the harness.
 const STAGE: usize = 64 << 20;
 /// Prefill dynamic-smem default: the union arena is the hd=256 flash tile,
@@ -2726,7 +2728,9 @@ pub struct GpuEngine {
     state_copy: Option<KernelFn>,
     /// `plow_<arch>_gdn_ride` of the decode object: a packed launch's riders step their slot
     /// states with the decode kernel instead of joining the chunked scan (None: they scan).
-    gdn_ride: Option<KernelFn>,
+    /// Launched at its own occupancy grid: on the interpreter's one block per SM the warp-tiles
+    /// ran serially at ~2x the byte floor (B16: 76.7 vs 40 us per layer, gdnbench).
+    gdn_ride: Option<(KernelFn, u32)>,
     /// Leading single-row decode requests of the next packed body that ride it as riders.
     pf_riders: usize,
     /// Leading single-row decode requests of the packed Qwen chain being launched, taken by
@@ -7100,10 +7104,16 @@ impl GpuEngine {
                     .ok()
             });
             engine.gdn_ride = profile.and_then(|p| {
-                engine
+                let f = engine
                     .be
                     .get_function(&engine.module, &format!("plow_{}_gdn_ride", p.tag))
-                    .ok()
+                    .ok()?;
+                let per_sm = engine
+                    .be
+                    .occupancy_blocks_per_sm(f, BLOCK, GDN_RIDE_SMEM as usize)
+                    .unwrap_or(1)
+                    .max(1);
+                Some((f, per_sm * engine.be.sm_count()))
             });
             tracing::info!(
                 route = "packed-gdn-state-copy",
@@ -11679,7 +11689,7 @@ impl GpuEngine {
         state: &DeviceMem,
         pack: &[(usize, u32)],
     ) -> Result<()> {
-        let f = self
+        let (f, grid) = self
             .gdn_ride
             .ok_or_else(|| RuntimeError::Rejected("GDN ride kernel is not loaded".into()))?;
         let table = self
@@ -11736,14 +11746,12 @@ impl GpuEngine {
             scale: 1.0 / 128_f32.sqrt(),
             eps: 1e-6,
         };
-        // The step stages 8 V rows x 128 floats per warp.
-        const RIDE_SMEM: u32 = (BLOCK / 32) * 8 * 128 * 4;
         let mut params = [&mut args as *mut GdnRideArgs as *mut std::ffi::c_void];
         self.be.launch_kernel_grid(
             f,
-            [self.grid, 1, 1],
+            [grid, 1, 1],
             BLOCK,
-            RIDE_SMEM,
+            GDN_RIDE_SMEM,
             &mut params,
             Some(&self.stream),
         )
