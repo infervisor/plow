@@ -34,6 +34,11 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 TOP = 20
+# Stop ids of a reference whose meta carries none (Gemma's, before `reference` read them from the
+# checkpoint). A reference's continuation ends at its first stop token, and scoring stops there too:
+# a served stack never produces the tokens after it, and the post-stop distribution is ill-conditioned
+# (Qwen3.8 kept emitting <|im_start|><|im_end|> for 36 tokens past <|im_end|>, where FP32 was decisive
+# with 1.6 nats and bf16 stacks disagreed by up to 1.2 nats of KL).
 EOS = (1, 50, 106)
 DEFAULTS = dict(tie_margin=1.0, kl_ratio_max=1.25, kl_slack_max=0.002, top1_drop_max=0.01,
                 cont_drop_max=0.05, cont_decisive_drop_max=0.0, needle_drop_max=0.0, needle_min=0.9,
@@ -92,29 +97,52 @@ def agree_len(free, cont):
     return n
 
 
+def model_eos(hf):
+    """The checkpoint's stop ids: generation_config.json's eos_token_id (an id or a list), else config.json's."""
+    for name in ("generation_config.json", "config.json"):
+        p = Path(hf) / name
+        if p.is_file():
+            e = json.loads(p.read_text()).get("eos_token_id")
+            if e is not None:
+                return sorted({int(x) for x in (e if isinstance(e, list) else [e])})
+    raise SystemExit(f"{hf}: no eos_token_id in generation_config.json or config.json")
+
+
+def scored_len(cont, eos):
+    """Positions scored of a reference continuation: through its first stop token, else all of them."""
+    for i, t in enumerate(cont):
+        if t in eos:
+            return i + 1
+    return len(cont)
+
+
 def score(ref, cap, tie_margin=DEFAULTS["tie_margin"], kl_trim_frac=DEFAULTS["kl_trim_frac"],
-          kl_over_at=DEFAULTS["kl_over_at"]):
+          kl_over_at=DEFAULTS["kl_over_at"], eos=None):
     """Metrics of one capture against the FP32 reference, overall and per prompt kind.
 
-    The scored positions are the reference's teacher-forced positions, the same set for every arm;
-    a position the capture lacks counts as missing (and fails the gate), never as a smaller sample.
+    The scored positions are the reference's teacher-forced positions through its first stop token
+    (`eos`, else the reference's meta, else EOS), the same set for every arm; a position the capture
+    lacks counts as missing (and fails the gate), never as a smaller sample.
     """
     if cap.get("ref_sha256") != ref["sha256"]:
         raise ValueError(f"capture {cap.get('arm')} was taken against another reference")
+    eos = set(eos if eos is not None else ref.get("meta", {}).get("eos", EOS))
     groups = {}
     missing = 0
     for case in ref["cases"]:
         c = cap["cases"].get(case["id"])
         g = groups.setdefault(case["kind"], dict(kl=[], dec=0, dec_ok=0, cont=[], cont_dec=[], full=0, n=0, needle=[]))
         g["n"] += 1
+        L = scored_len(case["cont"], eos)
+        cont, pos = case["cont"][:L], case["pos"][:L]
         if c is None or c.get("error"):
-            missing += len(case["pos"])
+            missing += L
             g["cont"].append(0.0)
             g["cont_dec"].append(False)
             if "expect" in case:
                 g["needle"].append(False)
             continue
-        for k, p in enumerate(case["pos"]):
+        for k, p in enumerate(pos):
             top = c["pos"].get(str(k))
             if top is None:
                 missing += 1
@@ -123,13 +151,13 @@ def score(ref, cap, tie_margin=DEFAULTS["tie_margin"], kl_trim_frac=DEFAULTS["kl
             if p["margin"] > tie_margin:
                 g["dec"] += 1
                 g["dec_ok"] += top[0][0] == p["top"][0][0]
-        n = agree_len(c["free"], case["cont"])
-        g["cont"].append(n / len(case["cont"]))
-        g["full"] += n == len(case["cont"])
+        n = agree_len(c["free"], cont)
+        g["cont"].append(n / L)
+        g["full"] += n == L
         # A free-run divergence at a near tie (FP32 top-1/top-2 margin <= tie_margin) is rounding
         # luck, and greedy decoding makes everything after it incomparable; a divergence where FP32
         # was decisive is a real disagreement at an identical history.
-        g["cont_dec"].append(n >= len(case["cont"]) or case["pos"][n]["margin"] <= tie_margin)
+        g["cont_dec"].append(n >= L or pos[n]["margin"] <= tie_margin)
         if "expect" in case:
             g["needle"].append(case["expect"] in c["free_text"])
 
@@ -562,6 +590,7 @@ def cmd_reference(a):
     torch.set_float32_matmul_precision("highest")
     from transformers import AutoTokenizer
     tok = AutoTokenizer.from_pretrained(a.hf, local_files_only=True)
+    eos = model_eos(a.hf)
     prompts = json.loads(Path(a.prompts).read_text())
     model, weights = load_fp32(a.hf, a.device, headroom_gib=a.offload_headroom_gib)
     # HF's sliding cache keeps its last-window slice as a view of the whole prefill K/V, so every
@@ -592,7 +621,7 @@ def cmd_reference(a):
             while True:
                 t = int(out.logits[0, -1].argmax())
                 cont.append(t)
-                if t in EOS or len(cont) == c["max_new"]:
+                if t in eos or len(cont) == c["max_new"]:
                     break
                 out = model(input_ids=torch.tensor([[t]], device=dev), past_key_values=out.past_key_values,
                             attention_mask=masks, use_cache=True)
@@ -618,7 +647,7 @@ def cmd_reference(a):
                 weights=weights, dtype="float32", tf32=False, attention="fp32 chunked math",
                 dequant="fp8_e4m3 weight x per-channel scale in fp32", torch=torch.__version__,
                 transformers=transformers.__version__, device=(torch.cuda.get_device_name() + (" + host offload" if a.device == "offload" else "")) if dev == "cuda" else f"cpu ({torch.get_num_threads()} threads)",
-                utc=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), top=TOP)
+                utc=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), top=TOP, eos=eos)
     Path(a.out).write_text(json.dumps(dict(meta=meta, cases=cases)))
     print(f"reference: {len(cases)} cases -> {a.out} sha256 {file_sha(a.out)}")
 
@@ -725,12 +754,15 @@ def table(scores):
 
 
 def thresholds(a):
-    return {k: getattr(a, k) for k in DEFAULTS if getattr(a, k, None) is not None}
+    th = {k: getattr(a, k) for k in DEFAULTS if getattr(a, k, None) is not None}
+    if getattr(a, "eos", None):
+        th["eos"] = [int(x) for x in a.eos.split(",")]
+    return th
 
 
 def score_with(ref, cap, th):
-    """score() under a threshold dict (tie margin, trim fraction, outlier level)."""
-    return score(ref, cap, th["tie_margin"], th["kl_trim_frac"], th["kl_over_at"])
+    """score() under a threshold dict (tie margin, trim fraction, outlier level, stop ids)."""
+    return score(ref, cap, th["tie_margin"], th["kl_trim_frac"], th["kl_over_at"], th.get("eos"))
 
 
 def cmd_score(a):
@@ -797,6 +829,7 @@ def main():
     sc.add_argument("--ref", required=True)
     for k in ("tie_margin", "kl_trim_frac", "kl_over_at"):
         sc.add_argument("--" + k.replace("_", "-"), type=float, dest=k)
+    sc.add_argument("--eos", help="comma-separated stop ids for a reference whose meta carries none")
     sc.add_argument("captures", nargs="+")
     sc.set_defaults(f=cmd_score)
     ga = sp.add_parser("gate")
@@ -806,6 +839,7 @@ def main():
     ga.add_argument("--out")
     for k in DEFAULTS:
         ga.add_argument("--" + k.replace("_", "-"), type=float, dest=k)
+    ga.add_argument("--eos", help="comma-separated stop ids for a reference whose meta carries none")
     ga.set_defaults(f=cmd_gate)
     a = p.parse_args()
     return a.f(a) or 0

@@ -71,6 +71,7 @@ mod decode_context;
 mod decode_object;
 use decode_object::{BoundDecodeObject, DecodeModule};
 mod decode_rung;
+mod gen_decode;
 mod mixed_step;
 mod moe_lt;
 mod native_decode;
@@ -83,7 +84,8 @@ mod token_batch;
 use cublaslt::{CublasLtDecodeRoute, LibraryRoute};
 use decode_rung::{
     decode_rung_index, decode_selection, effective_decode_widths, validate_cublaslt_ladder,
-    validate_decode_ladder, validate_moe_lt_ladder, DecodeRung, DecodeSelection,
+    validate_decode_ladder, validate_gen_decode_ladder, validate_moe_lt_ladder, DecodeRung,
+    DecodeSelection,
 };
 
 /// Whether the packet's full caches can be VMM-mapped block by block: a cache head smaller than
@@ -800,7 +802,8 @@ impl SegmentRoleValidation for SegmentRoles {
                         | plow_asset::segment_roles::PREFILL_ATTENTION_HD256_GQA2_BKV32
                         | plow_asset::segment_roles::BF16_PREFILL_GEMM_GLU_GEMMA4
                         | plow_asset::segment_roles::W8A8_PREFILL_GEMM_GLU_GEMMA4
-                ) || plow_asset::segment_roles::is_generated(role)
+                ) || (plow_asset::segment_roles::is_generated(role)
+                    && !gen_decode::is_generated_decode(role, &value.objects))
                 {
                     let g = &blob.progs[program.index];
                     let pc = g.gq_stream[g.gq_seg_ofs[seg] as usize].inst as usize;
@@ -844,7 +847,11 @@ impl SegmentRoleValidation for SegmentRoles {
             let moe_decode = decode
                 && p.roles
                     .contains(&plow_asset::segment_roles::MOE_DECODE_CUBLASLT);
-            let library_decode = decode && (projection_roles || moe_decode);
+            let generated_decode = decode
+                && p.roles
+                    .iter()
+                    .any(|&role| gen_decode::is_generated_decode(role, &self.objects));
+            let library_decode = decode && (projection_roles || moe_decode || generated_decode);
             let library_prefill = !decode && p.roles.contains(&plow_asset::segment_roles::CUBLASLT);
             if !seen.insert(p.index)
                 || (p.roles.contains(&plow_asset::segment_roles::FP8_M1)
@@ -865,7 +872,7 @@ impl SegmentRoleValidation for SegmentRoles {
                                     | plow_asset::segment_roles::CUBLASLT
                                     | plow_asset::segment_roles::NATIVE_DECODE_TC
                                     | plow_asset::segment_roles::MOE_DECODE_CUBLASLT
-                            )
+                            ) && !gen_decode::is_generated_decode(role, &self.objects)
                         })))
                 || (!decode
                     && (p.roles.iter().any(|&role| {
@@ -902,6 +909,9 @@ impl SegmentRoleValidation for SegmentRoles {
             if moe_decode {
                 moe_lt::decode_segments(g, tensors, &p.roles)?;
             }
+            if generated_decode {
+                gen_decode::decode_segments(g, &p.roles, &self.objects)?;
+            }
             used.extend(
                 p.roles
                     .iter()
@@ -909,7 +919,15 @@ impl SegmentRoleValidation for SegmentRoles {
                     .filter(|&role| plow_asset::segment_roles::requires_object(role)),
             );
         }
-        if used != self.objects.keys().copied().collect() {
+        // A generated decode object is launched by the runtime alone (riders), so it may be
+        // declared without a program use; every other object needs one.
+        let required = self.objects.iter().filter(|(_, object)| {
+            !plow_asset::segment_roles::GeneratedAbi::parse(&object.abi)
+                .is_some_and(|abi| abi.decode())
+        });
+        if !used.iter().all(|role| self.objects.contains_key(role))
+            || !required.into_iter().all(|(id, _)| used.contains(id))
+        {
             return Err(RuntimeError::Rejected(
                 "packet role object declaration does not match use".into(),
             ));
@@ -1758,6 +1776,15 @@ fn packet_role_segments_with(
                 if d.op != DevOp::GemmFp8 as u16 || d.i[0] != g.t || d.i[6] == 0 || d.i[7] == 0 {
                     return Err(RuntimeError::Rejected(
                         "FP8 GEMM role requires mapped GEMMs".into(),
+                    ));
+                }
+            } else if gen_decode::is_generated_decode(role, objects) {
+                if !matches!(
+                    DevOp::from_u16(d.op),
+                    Some(DevOp::FlashDecode | DevOp::FlashMerge)
+                ) {
+                    return Err(RuntimeError::Rejected(
+                        "generated flash-decode role requires a FlashDecode or its FlashMerge".into(),
                     ));
                 }
             } else if plow_asset::segment_roles::is_generated(role)
@@ -2690,6 +2717,10 @@ pub struct GpuEngine {
     token_batch: Option<token_batch::CudaTokenBatch>,
     /// Split attention for decode rows riding a packed prefill launch (`riders.rs`).
     riders: Option<riders::Riders>,
+    /// The packet's generated flash-decode object (`gen_role.rs`), runtime-launched.
+    gen_decode: Option<gen_role::GenDecode>,
+    /// Its shared launch state when decode rungs route their attention pairs to it.
+    gen_decode_launch: Option<Arc<gen_decode::GenDecodeLaunch>>,
     /// `plow_<arch>_state_copy` of the decode object: the packed GDN launch's state gather and
     /// scatter in one launch per layer (None: one memcpy per request).
     state_copy: Option<KernelFn>,
@@ -3470,12 +3501,17 @@ struct PfBatch {
     /// Per-row seq-slot map `i32[max bucket t]` — consumed by the KV-writing
     /// `HeadNormRope` sites (each packed row writes its own slot's ring).
     d_slot: DeviceMem,
-    /// Request table `i32[1 + 4B]`: `[R, {q0, qlen, slot, kvlen} x R]` —
-    /// consumed by the `FlashPrefill` sites (per-request-serial attention).
+    /// Request table `i32[1 + 4B]`: `[R, {q0, qlen, slot, kvlen} x R]` — every request of the
+    /// launch, consumed by the recurrent chain's per-request sites (conv prefill, GDN ride,
+    /// state copy).
     d_req: DeviceMem,
-    /// Tensor-table handles of the two buffers (blob handle count, +1).
+    /// The attention's copy of the request table: the same rows minus the riders, which attend
+    /// through `Riders` instead of the `FlashPrefill` sites bound to it.
+    d_req_attn: DeviceMem,
+    /// Tensor-table handles of the slot map and the attention table (runtime-appended; the
+    /// chain's sites bind the packet's own request handle).
     h_slot: u32,
-    h_req: u32,
+    h_req_attn: u32,
     /// `(t5, hd)` per flash site, harvested from a fused (`ns==1`) bucket —
     /// the per-layer `n.at` handles that turn a non-fused bucket's flash into
     /// the fused epilogue (its merge op is neutered).
@@ -3483,6 +3519,7 @@ struct PfBatch {
     /// Host staging reused across launches (hot path — no per-launch alloc).
     slot_buf: Vec<i32>,
     req_buf: Vec<i32>,
+    req_attn_buf: Vec<i32>,
     kvlen_buf: Vec<i32>,
     /// Per stage of a staged packet: its slot mask, then its span table.
     stage_buf: Vec<Vec<i32>>,
@@ -4111,6 +4148,24 @@ impl GpuEngine {
                 "MoE decode cuBLASLt segments cannot mix with other decode roles".into(),
             ));
         }
+        // Decode programs declaring the generated decode role on isolated attention pairs
+        // (`gen_decode.rs`): routed per rung from PLOW_GEN_DECODE_STEP rows.
+        let gen_decode_declared = segment_roles.as_ref().is_some_and(|roles| {
+            roles.programs.iter().any(|program| {
+                program.index >= blob.prefill_progs().len()
+                    && program
+                        .roles
+                        .iter()
+                        .any(|&role| gen_decode::is_generated_decode(role, &roles.objects))
+            })
+        });
+        if gen_decode_declared
+            && (moe_lt_decode_roles || cublaslt_enabled || !decode_packet_roles.is_empty())
+        {
+            return Err(RuntimeError::Rejected(
+                "generated decode segments cannot mix with other decode routes".into(),
+            ));
+        }
         // Rungs of at least this many rows route; the rest run their program as one launch.
         let moe_lt_decode_min = nv_config
             .moe_dec_lt_min_rows(moe_lt_decode_packet_min(&blob, segment_roles.as_ref()))
@@ -4130,6 +4185,7 @@ impl GpuEngine {
             || prepared_contexts.is_some()
             || !decode_packet_roles.is_empty()
             || cublaslt_every_rung
+            || gen_decode_declared
             || recurrent.is_some();
         let effective_multistep = if multistep_disabled_by_decode {
             if configured_multistep > 1 {
@@ -4169,6 +4225,8 @@ impl GpuEngine {
             validate_cublaslt_ladder(&blob, segment_roles.as_ref().expect("library roles"))?
         } else if moe_lt_decode_roles {
             validate_moe_lt_ladder(&blob, segment_roles.as_ref().expect("MoE decode roles"))?
+        } else if gen_decode_declared {
+            validate_gen_decode_ladder(&blob, segment_roles.as_ref().expect("generated roles"))?
         } else {
             single_bound_decode || validate_decode_ladder(&blob)?
         };
@@ -4971,6 +5029,10 @@ impl GpuEngine {
             )),
             None => None,
         };
+        let pf_req_attn = match &pf_bufs {
+            Some((_, r)) => Some(be.alloc(0, r.len)?),
+            None => None,
+        };
 
         // ---- GEN_TMAP_BF16 re-encode (sm_90a TMA prefill GEMM) ----
         // The upload loop staged these tensors' 128-byte ZERO placeholders (a tensormap
@@ -5012,19 +5074,23 @@ impl GpuEngine {
             map.encode_slot(&be, &ptrs, 0, &devp[map.tensor])?;
         }
         let pf_handles = pf_bufs.as_ref().map(|(s, r)| {
-            if let Some(p) = &packed_prefill {
-                return (u32::from(p.slot), u32::from(p.request));
-            }
-            let h_slot = ptrs.len() as u32;
+            let (h_slot, h_req) = if let Some(p) = &packed_prefill {
+                (u32::from(p.slot), u32::from(p.request))
+            } else {
+                let h_slot = ptrs.len() as u32;
+                ptrs.push(s.base);
+                ptrs.push(r.base);
+                (h_slot, h_slot + 1)
+            };
             // These runtime-appended handles are patched into u16 wire slots
             // (`DevInst64::t`), which the compiler's pack-time assert cannot see.
+            let h_req_attn = ptrs.len() as u32;
             assert!(
-                h_slot + 1 < TENSOR_NONE16 as u32,
+                h_req_attn < TENSOR_NONE16 as u32,
                 "tensor table overflows u16 handles"
             );
-            ptrs.push(s.base);
-            ptrs.push(r.base);
-            (h_slot, h_slot + 1)
+            ptrs.push(pf_req_attn.as_ref().expect("allocated with pf_bufs").base);
+            (h_slot, h_req, h_req_attn)
         });
         let d_tens = be.alloc(0, (ptrs.len() * 8) as u64)?;
         let base_bindings = || -> Result<Vec<TensorBinding>> {
@@ -5037,6 +5103,9 @@ impl GpuEngine {
                     slots.push(TensorBinding::whole(s)?);
                     slots.push(TensorBinding::whole(r)?);
                 }
+            }
+            if let Some(r) = &pf_req_attn {
+                slots.push(TensorBinding::whole(r)?);
             }
             Ok(slots)
         };
@@ -5091,6 +5160,24 @@ impl GpuEngine {
             ));
         }
         let widest_moe = decode_roles.contains(&plow_asset::segment_roles::MOE_DECODE_CUBLASLT);
+        let gen_segments = if gen_decode_declared
+            && segment_roles
+                .as_ref()
+                .is_some_and(|roles| roles.program(blob.progs.len() - 1).is_some())
+        {
+            if be.module_global_u32(&module, "plow_cublaslt_decode_abi")? != Some(1) {
+                return Err(RuntimeError::Rejected(
+                    "generated decode segments require a paired GQ interpreter".into(),
+                ));
+            }
+            gen_decode::decode_segments(
+                g,
+                &decode_roles,
+                &segment_roles.as_ref().expect("declared").objects,
+            )?
+        } else {
+            Vec::new()
+        };
         let cublaslt_segments = if cublaslt_enabled {
             if be.module_global_u32(&module, "plow_cublaslt_decode_abi")? != Some(1) {
                 return Err(RuntimeError::Rejected(
@@ -5099,7 +5186,7 @@ impl GpuEngine {
             }
             cublaslt::decode_segments(g, &blob.tensors, &decode_roles)?
         } else {
-            if decode_packet_roles.is_empty() && !widest_moe {
+            if decode_packet_roles.is_empty() && !widest_moe && gen_segments.is_empty() {
                 g.check_coarse_single_segment()?;
             }
             Vec::new()
@@ -5119,6 +5206,8 @@ impl GpuEngine {
             cublaslt_segments.len() + 1
         } else if widest_moe {
             moe_lt_segments.len() + 1
+        } else if !gen_segments.is_empty() {
+            gen_segments.len() + 1
         } else if g.l2_domains != 0 {
             g.l2_domains as usize + 1
         } else {
@@ -5308,6 +5397,41 @@ impl GpuEngine {
                 "cuBLASLt projections beside MoE decode segments need the MoE route".into(),
             ));
         }
+        // The packet's generated flash-decode object, loaded ahead of the rungs that route to
+        // it; `gen_decode_launch` carries the shared buffers when any rung may route.
+        let gen_decode = segment_roles
+            .as_ref()
+            .and_then(|roles| {
+                roles.objects.iter().find(|(&id, object)| {
+                    plow_asset::segment_roles::is_generated(id)
+                        && plow_asset::segment_roles::GeneratedAbi::parse(&object.abi)
+                            .is_some_and(|abi| abi.decode())
+                })
+            })
+            .map(|(_, object)| gen_role::load_generated_decode(&be, assets_dir, object, profile.tag))
+            .transpose()?;
+        let gen_decode_step = nv_config.gen_decode_step;
+        let gen_decode_launch = match (&gen_decode, gen_decode_declared && gen_decode_step > 0) {
+            (Some(object), true) => {
+                let (mut rows, mut n_head, mut n_kv_head) = (0u32, 0u32, 0u32);
+                for program in blob.decode_progs() {
+                    for d in &program.insts {
+                        if d.op == DevOp::FlashDecode as u16 && d.i[6] == object.head_dim {
+                            rows = rows.max(d.i[0]);
+                            n_head = n_head.max(d.i[1]);
+                            n_kv_head = n_kv_head.max(d.i[2]);
+                        }
+                    }
+                }
+                (rows > 0 && n_head > 0 && n_kv_head > 0)
+                    .then(|| gen_decode::GenDecodeLaunch::new(&be, object, rows, n_head, n_kv_head))
+                    .transpose()?
+                    .map(Arc::new)
+            }
+            _ => None,
+        };
+        let gen_routed_widest =
+            gen_decode_launch.is_some() && !gen_segments.is_empty() && g.t >= gen_decode_step;
         let ordered_waits = if cublaslt_enabled {
             Some(cublaslt::ordered_waits(
                 g,
@@ -5325,6 +5449,13 @@ impl GpuEngine {
                 g,
                 &none,
                 &moe_lt::instructions(&moe_lt_segments),
+            )?)
+        } else if gen_routed_widest {
+            let none = vec![None; gen_segments.len()];
+            Some(cublaslt::ordered_waits_for(
+                g,
+                &none,
+                &gen_decode::instructions(&gen_segments),
             )?)
         } else {
             None
@@ -5367,6 +5498,20 @@ impl GpuEngine {
                 "MoE decode experts routed to cuBLASLt grouped matmuls"
             );
             cublaslt::merge_routes(projection_decode, routes)?
+        } else if gen_routed_widest {
+            let routes = gen_decode::routes(
+                &be,
+                gen_decode_launch.as_ref().expect("routed"),
+                g,
+                &gen_segments,
+                &devp,
+            )?;
+            tracing::info!(
+                rows = g.t,
+                sites = gen_segments.iter().flatten().count() / 2,
+                "decode attention routed to the generated flash-decode object"
+            );
+            routes
         } else {
             projection_decode
         };
@@ -5383,11 +5528,13 @@ impl GpuEngine {
         let d_gq_stream = upload_pod(pod_bytes(&g.gq_stream))?;
         // Declared but unrouted MoE segments run as one launch over the merged window.
         let merged_window = [0u32, g.gq_stream.len() as u32];
-        let d_gq_seg = upload_pod(pod_bytes(if widest_moe && !moe_lt_routed {
-            &merged_window[..]
-        } else {
-            &g.gq_seg_ofs[..]
-        }))?;
+        let d_gq_seg = upload_pod(pod_bytes(
+            if (widest_moe && !moe_lt_routed) || (!gen_segments.is_empty() && !gen_routed_widest) {
+                &merged_window[..]
+            } else {
+                &g.gq_seg_ofs[..]
+            },
+        ))?;
         // The decode counter block and the GQ cursor share a lifecycle (both
         // re-zeroed before every launch), so they share one allocation: the
         // cursor sits at the counter block's tail and ONE memset re-arms both.
@@ -5688,6 +5835,55 @@ impl GpuEngine {
                             DecodeRung::upload_with_insts(
                                 &be, g, kernarg, &g.insts, &g.waits, &merged,
                             )?
+                        }
+                    } else if let Some(roles) = segment_roles
+                        .as_ref()
+                        .filter(|_| gen_decode_declared)
+                        .and_then(|r| r.program(program))
+                        .map(|p| &p.roles)
+                    {
+                        let objects = &segment_roles.as_ref().expect("declared").objects;
+                        let segments = gen_decode::decode_segments(g, roles, objects)?;
+                        match &gen_decode_launch {
+                            Some(launch) if g.t >= gen_decode_step && !segments.is_empty() => {
+                                let none = vec![None; segments.len()];
+                                let waits = cublaslt::ordered_waits_for(
+                                    g,
+                                    &none,
+                                    &gen_decode::instructions(&segments),
+                                )?;
+                                let routes = gen_decode::routes(&be, launch, g, &segments, &devp)?;
+                                let mut rung = DecodeRung::upload_with_insts(
+                                    &be,
+                                    g,
+                                    kernarg,
+                                    &g.insts,
+                                    &waits,
+                                    &g.gq_seg_ofs,
+                                )?;
+                                let (function, smem) = wide_object(g.t as usize)
+                                    .map_or((f, smem), |object| (object.function, object.smem));
+                                tracing::info!(
+                                    rows = g.t,
+                                    sites = segments.iter().flatten().count() / 2,
+                                    "decode attention routed to the generated flash-decode object"
+                                );
+                                rung.library = Some(cublaslt::CublasLtDecodeGraph::direct(
+                                    &be,
+                                    rung.kernarg,
+                                    function,
+                                    grid,
+                                    smem,
+                                    routes,
+                                ));
+                                rung
+                            }
+                            _ => {
+                                let merged = [0u32, g.gq_stream.len() as u32];
+                                DecodeRung::upload_with_insts(
+                                    &be, g, kernarg, &g.insts, &g.waits, &merged,
+                                )?
+                            }
                         }
                     } else {
                         DecodeRung::upload(&be, g, kernarg)?
@@ -6087,6 +6283,12 @@ impl GpuEngine {
                 ));
             }
             if plow_asset::segment_roles::is_generated(id) {
+                // The decode family was loaded ahead of the decode rungs (`gen_decode`).
+                if plow_asset::segment_roles::GeneratedAbi::parse(&object.abi)
+                    .is_some_and(|abi| abi.decode())
+                {
+                    continue;
+                }
                 packet_roles[id as usize - 1] = Some(load_generated_role(
                     &be,
                     assets_dir,
@@ -6556,7 +6758,7 @@ impl GpuEngine {
         // ---- Cross-request prefill mode (finalized once the prefill object is up) ----
         // A validated manifest selects its packet-defined chain without a runtime knob.
         let pf_batch: Option<PfBatch> = match (pf_bufs, pf_handles) {
-            (Some((d_slot, d_req)), Some((h_slot, h_req)))
+            (Some((d_slot, d_req)), Some((h_slot, _, h_req_attn)))
                 if f_pf.is_some() && !prefill.is_empty() =>
             {
                 if (vmm.as_ref().is_some_and(|v| v.prefix_kv().is_some()) && !packed_prefix)
@@ -6571,11 +6773,13 @@ impl GpuEngine {
                 Some(PfBatch {
                     d_slot,
                     d_req,
+                    d_req_attn: pf_req_attn.expect("allocated with pf_bufs"),
                     h_slot,
-                    h_req,
+                    h_req_attn,
                     at_sites: Vec::new(),
                     slot_buf: vec![0; pf_max_t_blob],
                     req_buf: Vec::with_capacity(1 + 4 * dbatch_blob),
+                    req_attn_buf: Vec::with_capacity(1 + 4 * dbatch_blob),
                     kvlen_buf: vec![0],
                     stage_buf: Vec::new(),
                 })
@@ -6766,9 +6970,10 @@ impl GpuEngine {
             packet_roles,
             cublaslt_decode,
             cublaslt_decode_graph: None,
-            cublaslt_decode_capture: !decode_packet_roles.is_empty()
+            cublaslt_decode_capture: (!decode_packet_roles.is_empty()
                 || cublaslt_enabled
-                || moe_lt_routed,
+                || moe_lt_routed)
+                && !gen_routed_widest,
             moe_lt_decode: moe_lt_routed,
             routed_decode: routed_widest,
             _routed_object: routed_decode,
@@ -6860,6 +7065,8 @@ impl GpuEngine {
             mixed_step,
             token_batch: None,
             riders: None,
+            gen_decode,
+            gen_decode_launch,
             state_copy: None,
             gdn_ride: None,
             pf_riders: 0,
@@ -7660,6 +7867,11 @@ impl GpuEngine {
     }
 
     fn patch_nv_nsplit(&mut self, kvlen: u32) -> Result<()> {
+        if let Some(launch) = &self.gen_decode_launch {
+            launch
+                .max_kv
+                .store(kvlen, std::sync::atomic::Ordering::Relaxed);
+        }
         let Some(ns) = &mut self.nv_nsplit else {
             return Ok(());
         };
@@ -11625,16 +11837,17 @@ impl GpuEngine {
         // cuLaunchCooperativeKernel snapshots the param buffer at enqueue, so mutating
         // `arg.cur_seg` between launches is sound.
         let seg_class = self.prefill[bi].seg_class.clone();
-        // Rows armed by `Riders::arm` attend only through the segmented chains below.
+        // Rows armed by `Riders::arm` attend only through the segmented chains below (the Qwen
+        // chain's own loop calls `launch_after` before each segment).
         let riding = self.riders.as_ref().is_some_and(|r| r.rows() > 0);
         if riding
-            && (!self.prefill[bi].qwen_segments.is_empty()
-                || !uses_segmented_prefill(
-                    self.seg_pf.is_some(),
-                    false,
-                    seg_class.len(),
-                    &self.prefill[bi].packet_segment_roles,
-                ))
+            && self.prefill[bi].qwen_segments.is_empty()
+            && !uses_segmented_prefill(
+                self.seg_pf.is_some(),
+                false,
+                seg_class.len(),
+                &self.prefill[bi].packet_segment_roles,
+            )
         {
             return Err(RuntimeError::Rejected(
                 "token-batch riders need a segmented prefill chain".into(),
@@ -11648,6 +11861,12 @@ impl GpuEngine {
             let seg_time = crate::config::RuntimeConfig::get().nv.pf_seg_time;
             let mut evs: Vec<(usize, u8, CudaEvent, CudaEvent)> = Vec::new();
             for (seg, external) in self.prefill[bi].qwen_segments.iter().enumerate() {
+                // The riders of the attention site whose segment just completed attend before
+                // its consumer segment starts (`Riders::load` placed every site this way).
+                if riding {
+                    let riders = self.riders.as_ref().expect("riding");
+                    riders.launch_after(&self.be, bi, seg, &self.stream)?;
+                }
                 let mut e0 = if seg_time {
                     let e = self.be.event_create(true)?;
                     self.be.event_record(&e, &self.stream)?;
@@ -12305,9 +12524,19 @@ impl GpuEngine {
             if let Some(terminal) = &self.packed_terminal {
                 terminal.patch_discarded_tail(b, true);
             }
+            let h_req_attn = self.pf_batch.as_ref().map(|pb| pb.h_req_attn);
             for &pc in b.rope_sites.iter().chain(&b.flash_sites) {
                 let stage = b.stage_of.get(pc).copied().flatten();
                 pack.bind_request_stage(&mut b.h_inst[pc], true, stage);
+                // An unstaged flash site attends the attention table (riders left out).
+                if let (Some(h), None) = (h_req_attn, stage) {
+                    let d = &mut b.h_inst[pc];
+                    if d.op == DevOp::FlashPrefill as u16 {
+                        d.t[6] = h as u16;
+                    } else if d.op == DevOp::FlashPrefillFp8 as u16 {
+                        d.i[4] = plow_asset::packed_prefill::FP8_REQUEST_TAG | h;
+                    }
+                }
             }
             for &pc in &b.merge_sites {
                 pack.bind_request(&mut b.h_inst[pc], true);
@@ -12329,9 +12558,9 @@ impl GpuEngine {
             b.batch_patched = true;
             return Ok(());
         }
-        let (h_slot, h_req, at_sites) = {
+        let (h_slot, h_req_attn, at_sites) = {
             let pb = self.pf_batch.as_ref().expect("pf_batch checked by caller");
-            (pb.h_slot, pb.h_req, pb.at_sites.clone())
+            (pb.h_slot, pb.h_req_attn, pb.at_sites.clone())
         };
         let sz = std::mem::size_of::<DevInst64>();
         let b = &mut self.prefill[bi];
@@ -12354,7 +12583,7 @@ impl GpuEngine {
             if b.h_inst[ix].t[5] == TENSOR_NONE16 {
                 b.h_inst[ix].t[5] = t5 as u16;
             }
-            b.h_inst[ix].t[6] = h_req as u16;
+            b.h_inst[ix].t[6] = h_req_attn as u16;
         }
         for &ix in &b.rope_sites {
             b.h_inst[ix].t[6] = h_slot as u16;
@@ -12616,11 +12845,6 @@ impl GpuEngine {
                 self.pf_pos.copy_from_slice(&plan.positions);
                 pb.slot_buf.copy_from_slice(&plan.slots);
                 pb.req_buf.clone_from(&plan.table);
-                // Riders leave the prefill attention's request table; they attend in `riders`.
-                if riding > 0 {
-                    pb.req_buf.drain(1..1 + 4 * riding);
-                    pb.req_buf[0] -= riding as i32;
-                }
                 // A staged bucket's sliding layers write and attend stage by stage. Riders write
                 // in stage 0 (one row each) and leave every stage's span table.
                 let stages = self.prefill[bi].stages;
@@ -12639,6 +12863,13 @@ impl GpuEngine {
                         pb.stage_buf[2 * k + 1] = table;
                     }
                 }
+            }
+            // Riders leave the attention's request table (they attend in `riders`); the chain's
+            // other per-request sites keep every request.
+            pb.req_attn_buf.clone_from(&pb.req_buf);
+            if riding > 0 {
+                pb.req_attn_buf.drain(1..1 + 4 * riding);
+                pb.req_attn_buf[0] -= riding as i32;
             }
             if let Some(riders) = self.riders.as_mut() {
                 riders.arm(
@@ -12669,6 +12900,11 @@ impl GpuEngine {
                 self.be.memcpy_htod_async(
                     pb.d_req.base,
                     bytemuck::cast_slice(&pb.req_buf),
+                    &self.stream,
+                )?;
+                self.be.memcpy_htod_async(
+                    pb.d_req_attn.base,
+                    bytemuck::cast_slice(&pb.req_attn_buf),
                     &self.stream,
                 )?;
                 self.be.memcpy_htod_async(
@@ -12753,15 +12989,13 @@ impl GpuEngine {
                 q0 += len;
             }
         }
-        // The Qwen3.5 chain's requests (slot, rows): its conv and GDN segments run one
-        // sequence per request; `launch_prefill_chain` takes the list.
+        // The Qwen3.5 chain's requests (slot, rows), riders included: its conv and GDN
+        // segments run one sequence per request (riders step their GDN state through
+        // `gdn_ride` and attend through `Riders`); `launch_prefill_chain` takes the list.
         self.qwen_pack.clear();
         if !self.prefill[bi].qwen_segments.is_empty() {
-            self.qwen_pack.extend(
-                reqs[riding..]
-                    .iter()
-                    .map(|r| (r.slot, r.tokens.len() as u32)),
-            );
+            self.qwen_pack
+                .extend(reqs.iter().map(|r| (r.slot, r.tokens.len() as u32)));
         }
         // One async fill re-arms the bucket's counters AND its tail GQ cursor.
         let launched = (|| -> Result<()> {
@@ -12773,9 +13007,9 @@ impl GpuEngine {
                     .as_ref()
                     .filter(|_| self.pf_seg_prefix)
                     .map(|tail| 0..tail.boundary_segment(bi));
-                // The Qwen chain's leading decode rows (not riders: `Riders::load` declines the
-                // chain) take the GDN step kernel instead of the scan.
-                self.qwen_ride = if riding == 0 { decode_rows } else { 0 };
+                // The Qwen chain's leading decode rows take the GDN step kernel instead of the
+                // scan, whether or not they also ride the attention through `Riders`.
+                self.qwen_ride = decode_rows;
                 let chain = self.launch_prefill_chain(
                     bi,
                     arg,

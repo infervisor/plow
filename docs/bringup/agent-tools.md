@@ -393,7 +393,13 @@ KL mean, 0.006 in top-1 and 0.021 in agreement. vLLM gated against its own repea
 directions. Results are in the [gemma12b comparison](results/gemma12b-fp8-20260930/comparison.md#fp32-reference-quality-gate).
 The in-lease vLLM server needs `nvcc` (CUDA toolkit on `PATH`, or `CUDA_HOME`), so run it inside
 `nix develop` or set it in `[gates.llm_fp32_ref.env]`. Captures send `ignore_eos`, because plowrt
-leaves a stop token out of completions logprobs.
+leaves a stop token out of completions logprobs. A case is scored through the reference's first
+stop token and no further: a server never produces the tokens after it, and the post-stop
+distribution is ill-conditioned (Qwen3.8's FP32 continuation kept emitting
+`<|im_start|><|im_end|>` for 36 tokens past `<|im_end|>`, with 1.6-nat decisive margins that bf16
+stacks missed by 0.6-1.2 nats of KL; a c1 gate failed `cont_decisive_frac` there). `reference`
+records the checkpoint's `eos_token_id` in the reference's meta; a reference made before that
+(Gemma's ids were hard-coded) takes `eos = [248046, 248044]` in `[gates.llm_fp32_ref]`.
 
 Unit tests: `cd scripts/llm && python3 -m unittest test_fp32_ref_gate`.
 

@@ -7,6 +7,17 @@ static __device__ __forceinline__ float qwen_warp_sum(float v) {
     for (int d = 16; d; d >>= 1) v += __shfl_down_sync(0xffffffffu, v, d);
     return __shfl_sync(0xffffffffu, v, 0);
 }
+// Eight independent qwen_warp_sum reductions with their shuffle stages interleaved: the same
+// tree per value (bit-identical), one pipelined pass instead of eight dependent ones.
+static __device__ __forceinline__ void qwen_warp_sum8(float (&v)[8]) {
+#pragma unroll
+    for (int d = 16; d; d >>= 1) {
+#pragma unroll
+        for (int r = 0; r < 8; r++) v[r] += __shfl_down_sync(0xffffffffu, v[r], d);
+    }
+#pragma unroll
+    for (int r = 0; r < 8; r++) v[r] = __shfl_sync(0xffffffffu, v[r], 0);
+}
 // Lanes 0..15 and 16..31 reduce separately; every lane of a half gets its half's total.
 static __device__ __forceinline__ float qwen_half_sum(float v) {
 #pragma unroll
@@ -54,6 +65,32 @@ static __device__ __forceinline__ void qwen_bf_unpack4(const uint2 v, float (&f)
 }
 static __device__ __forceinline__ uint2 qwen_bf_pack4(const float (&f)[4]) {
     return make_uint2(qwen_bf_pack(f[0], f[1]), qwen_bf_pack(f[2], f[3]));
+}
+// x / (1 + expf(-x)) (SiLU) and 1 / (1 + expf(-x)) (sigmoid) as the IEEE fast path ptxas emits
+// for div.rn.f32 (MUFU.RCP, one Newton step, the quotient, one remainder correction) written out
+// without the slow-path branch: the compiler wraps every quotient in a convergence barrier and
+// a conditional call, and the barriers serialized the conv prefill's eight channel chains
+// (light conv 71 us per 1024-row site at 11% DRAM / 17% SM, ~14 us byte floor; H100 27B). The
+// slow path only rescales huge denominators; here a denominator above 2^125 (x < -86.6) and
+// its numerator are scaled by 2^-64 (exact) into the fast path's range, and a denominator of
+// +inf (expf overflow, x < -88.73) gives the division's x * 0. Bit-identical to the division on
+// every bf16 input and 2^28 fp32 samples (silu_test, H100).
+static __device__ __forceinline__ float qwen_div_pos(float x, float d) {
+    const float s = d >= 0x1p125f ? 0x1p-64f : 1.f;
+    const float ds = fminf(d, 3.4028235e38f) * s, xs = x * s;
+    float r;
+    asm("rcp.approx.ftz.f32 %0, %1;" : "=f"(r) : "f"(ds));
+    r = fmaf(r, fmaf(-ds, r, 1.f), r);
+    const float q = xs * r;
+    const float out = fmaf(r, fmaf(-ds, q, xs), q);
+    return d == INFINITY ? x * 0.f : out;
+}
+static __device__ __forceinline__ float qwen_silu(float x) {
+    const float out = qwen_div_pos(x, 1.f + expf(-x));
+    return x == 0.f || x == INFINITY ? x : out;
+}
+static __device__ __forceinline__ float qwen_sigmoid(float x) {
+    return qwen_div_pos(1.f, 1.f + expf(-x));
 }
 
 static __device__ void d_qwen_gdn_conv(__nv_bfloat16* out, const __nv_bfloat16* in,
@@ -106,6 +143,10 @@ __device__ __forceinline__ void qwen_cp16(void* smem, const void* gmem) {
 
 // `stage`/`stage_floats`: the shared arena and its capacity; the body loads straight from the
 // state when the arena cannot hold warps x 8 x kdim floats (or is null).
+// `TWO_PHASE`: the staged tile's eight rows in two batched phases (standalone gdn_ride entry
+// only: inside the decode interpreter the 24 live accumulators spilled, stack 320 -> 832 B,
+// B1 step 23.9 -> 24.9 ms; H100 27B build65).
+template <bool TWO_PHASE = false>
 static __device__ void d_qwen_gdn_step(__nv_bfloat16* out, const __nv_bfloat16* qkv,
     const __nv_bfloat16* a, const __nv_bfloat16* b, const void* a_log,
     const __nv_bfloat16* dt_bias, float* state, const int* active,
@@ -175,6 +216,55 @@ static __device__ void d_qwen_gdn_step(__nv_bfloat16* out, const __nv_bfloat16* 
         if (buf) {
             asm volatile("cp.async.wait_group 0;\n" ::: "memory");
             __syncwarp();
+        }
+        if (TWO_PHASE && buf) {
+            // The staged tile in two phases over all eight rows (the rows of one time step are
+            // independent): the projections, one interleaved reduction, the deltas; then the
+            // updates, one interleaved reduction, the outputs. Serial rows ran two dependent
+            // reductions each, 76 us per layer at B16 vs a ~30 us byte floor. Same per-element
+            // arithmetic and reduction tree as the serial loop: bit-identical (ride 1008+16:
+            // per rider 0.615 -> 0.540 ms).
+            const unsigned nrows = vdim - first_v < 8u ? vdim - first_v : 8u;
+            const unsigned row0 = (slot * hv + head) * vdim + first_v;
+            const size_t srow0 = ((size_t)sslot * hv + head) * vdim + first_v;
+            float proj[8], delta[8], result[8];
+#pragma unroll
+            for (unsigned r = 0; r < 8; r++) {
+                proj[r] = 0.f;
+                if (r < nrows) {
+                    const float* src = buf + r * kdim;
+#pragma unroll
+                    for (unsigned j = 0; j < 4; j++) proj[r] += (src[lane + 32 * j] * decay) * k[j];
+                }
+            }
+            qwen_warp_sum8(proj);
+#pragma unroll
+            for (unsigned r = 0; r < 8; r++) {
+                const float value = r < nrows
+                    ? __bfloat162float(x[2 * hk * kdim + head * vdim + first_v + r]) : 0.f;
+                delta[r] = (value - proj[r]) * beta;
+            }
+#pragma unroll
+            for (unsigned r = 0; r < 8; r++) {
+                result[r] = 0.f;
+                if (r < nrows) {
+                    const float* src = buf + r * kdim;
+                    float* dst = state + (srow0 + r) * kdim;
+#pragma unroll
+                    for (unsigned j = 0; j < 4; j++) {
+                        const float hj = fmaf(delta[r], k[j], src[lane + 32 * j] * decay);
+                        dst[lane + 32 * j] = hj;
+                        result[r] += hj * q[j];
+                    }
+                }
+            }
+            qwen_warp_sum8(result);
+            if (lane == 0) {
+#pragma unroll
+                for (unsigned r = 0; r < 8; r++)
+                    if (r < nrows) out[row0 + r] = __float2bfloat16(result[r]);
+            }
+            continue;
         }
 #pragma unroll 1
         for (unsigned vcol = first_v; vcol < vdim && vcol < first_v + 8u; vcol++) {
@@ -283,7 +373,7 @@ static __device__ void d_qwen_gated_norm(__nv_bfloat16* out, const __nv_bfloat16
                 qwen_bf_unpack4(z2[r], g);
                 const float inv = rsqrtf(qwen_warp_sum(qwen_strided_sq4(v, lane)) / dim + eps);
 #pragma unroll
-                for (int j = 0; j < 4; j++) v[j] = v[j] * inv * gm[j] * (g[j] / (1.f + expf(-g[j])));
+                for (int j = 0; j < 4; j++) v[j] = v[j] * inv * gm[j] * qwen_silu(g[j]);
                 if (on[r]) *(uint2*)(out + (size_t)(row0 + r) * dim + lane * 4u) = qwen_bf_pack4(v);
             }
         }
@@ -305,7 +395,7 @@ static __device__ void d_qwen_gated_norm(__nv_bfloat16* out, const __nv_bfloat16
             for (int j = 0; j < 4; j++) {
                 const unsigned d = lane + 32 * j;
                 const float g = __bfloat162float(z[off + d]);
-                out[off + d] = __float2bfloat16(v[j] * inv * __bfloat162float(gamma[d]) * (g / (1.f + expf(-g))));
+                out[off + d] = __float2bfloat16(v[j] * inv * __bfloat162float(gamma[d]) * qwen_silu(g));
             }
         }
         return;
@@ -322,7 +412,7 @@ static __device__ void d_qwen_gated_norm(__nv_bfloat16* out, const __nv_bfloat16
         for (unsigned d = lane; d < dim; d += 32) {
             float v = __bfloat162float(core[off + d]) * inv * __bfloat162float(gamma[d]);
             float gate = __bfloat162float(z[off + d]);
-            out[off + d] = __float2bfloat16(v * (gate / (1.f + expf(-gate))));
+            out[off + d] = __float2bfloat16(v * qwen_silu(gate));
         }
     }
 }
@@ -367,7 +457,7 @@ static __device__ void d_qwen_sigmoid_gate(__nv_bfloat16* out, const __nv_bfloat
             __nv_bfloat16 o[8];
 #pragma unroll
             for (int j = 0; j < 8; j++) {
-                const float g = __bfloat162float(__float2bfloat16(1.f / (1.f + expf(-__bfloat162float(pg[j])))));
+                const float g = __bfloat162float(__float2bfloat16(qwen_sigmoid(__bfloat162float(pg[j]))));
                 o[j] = __float2bfloat16(__bfloat162float(pi[j]) * g);
             }
             *(uint4*)(out + i) = *(const uint4*)o;
@@ -376,7 +466,7 @@ static __device__ void d_qwen_sigmoid_gate(__nv_bfloat16* out, const __nv_bfloat
     }
     for (unsigned i = slice * blockDim.x + threadIdx.x; i < batch * cols; i += nblk * blockDim.x) {
         if (active && active[i / cols] <= 0) continue;
-        float g = __bfloat162float(__float2bfloat16(1.f / (1.f + expf(-__bfloat162float(gate[i])))));
+        float g = __bfloat162float(__float2bfloat16(qwen_sigmoid(__bfloat162float(gate[i]))));
         out[i] = __float2bfloat16(__bfloat162float(in[i]) * g);
     }
 }
@@ -389,6 +479,10 @@ static __device__ void d_qwen_sigmoid_gate(__nv_bfloat16* out, const __nv_bfloat
 // over `in` (the residual stream, in place as the separate Residual instruction wrote it) and
 // normalized: the same rounding as the Residual + QwenRmsNorm pair, one grid-wide dependency
 // round fewer (128 pairs per program). Each lane reads back only the elements it wrote.
+// `WIDE` (the light entry only): the warp-per-row path stages S chunks per lane and splits a row
+// over up to four warps; inside the interpreter objects the staged chunks alone grew the decode
+// entry's stack 320 -> 800 B at the 255-register cap, so they keep the one-chunk walk.
+template <bool WIDE = false>
 static __device__ void d_qwen_rmsnorm(__nv_bfloat16* out, const __nv_bfloat16* in,
     const __nv_bfloat16* gamma, const int* active, unsigned dim, unsigned batch,
     float eps, float offset, unsigned slice, unsigned nblk, float* part,
@@ -397,37 +491,83 @@ static __device__ void d_qwen_rmsnorm(__nv_bfloat16* out, const __nv_bfloat16* i
     if (batch > nblk && (dim & 7u) == 0) {
         // Prefill rows: one warp per row with 16-byte loads (block-per-row ran 4096 rows as 31
         // serial block reductions per block: 0.45 ms per norm). Decode rows keep the block body.
-        // Four chunks per lane staged before the math ran slower (13.7 -> 16.5 ms per 127 norms
-        // at 4096 rows) and grew the decode entry's stack; this walk stays.
+        // S chunks per lane are loaded before their math: with one row per warp (the 1024-row
+        // serving chunk on the light grid) the one-chunk walk was a 20-step dependent load chain
+        // per pass, 45 us per norm (128 per chunk) for a ~10 us op.
+        constexpr unsigned S = WIDE ? 5 : 1;
         const unsigned lane = threadIdx.x & 31u, warp = threadIdx.x >> 5, warps = blockDim.x >> 5;
-        for (unsigned row = slice * warps + warp; row < batch; row += nblk * warps) {
-            if (active && active[row] <= 0) continue;
+        // Warps per row: 4 when the grid holds four per row (the 1024-row serving chunk on the
+        // 528-block light grid: one warp per row used 128 of the 528 blocks, 2.5 KB in flight per
+        // row, 36-60 us per norm for a ~12 us byte floor), else 2, else 1 — the fat prefill
+        // window's 8192-row walk, unchanged. The group's partial sums combine through `part`
+        // (block-uniform loop and syncs; a different summation order than one warp per row).
+        const unsigned wpr = !WIDE ? 1u
+            : batch * 4u <= nblk * warps ? 4u : batch * 2u <= nblk * warps ? 2u : 1u;
+        const unsigned groups = warps / wpr, g = warp / wpr, sub = warp - g * wpr;
+        const unsigned lstride = 256u * wpr;
+        for (unsigned r0 = slice * groups; r0 < batch; r0 += nblk * groups) {
+            const unsigned row = r0 + g;
+            const bool live = row < batch && !(active && active[row] <= 0);
             const size_t base = (size_t)row * dim;
             float sum = 0.f;
-            for (unsigned d = lane * 8u; d < dim; d += 256u) {
-                uint4 v = *(const uint4*)(in + base + d);
-                __nv_bfloat16* p = (__nv_bfloat16*)&v;
-                if (radd) {
-                    const uint4 a = *(const uint4*)(radd + base + d);
-                    const __nv_bfloat16* pa = (const __nv_bfloat16*)&a;
+            if (live) for (unsigned d0 = (sub * 32u + lane) * 8u; d0 < dim; d0 += lstride * S) {
+                uint4 v[S], a[S];
 #pragma unroll
-                    for (int j = 0; j < 8; j++)
-                        p[j] = __float2bfloat16(__bfloat162float(p[j]) + __bfloat162float(pa[j]));
-                    *(uint4*)(rout + base + d) = v;
+                for (unsigned s = 0; s < S; s++) {
+                    const unsigned d = d0 + s * lstride;
+                    if (d < dim) {
+                        v[s] = *(const uint4*)(in + base + d);
+                        if (radd) a[s] = *(const uint4*)(radd + base + d);
+                    }
                 }
 #pragma unroll
-                for (int j = 0; j < 8; j++) { const float f = __bfloat162float(p[j]); sum += f * f; }
-            }
-            const float inv = rsqrtf(qwen_warp_sum(sum) / dim + eps);
-            for (unsigned d = lane * 8u; d < dim; d += 256u) {
-                const uint4 v = *(const uint4*)(in + base + d), g = *(const uint4*)(gamma + d);
-                const __nv_bfloat16* p = (const __nv_bfloat16*)&v;
-                const __nv_bfloat16* pg = (const __nv_bfloat16*)&g;
-                __nv_bfloat16 o[8];
+                for (unsigned s = 0; s < S; s++) {
+                    const unsigned d = d0 + s * lstride;
+                    if (d >= dim) continue;
+                    __nv_bfloat16* p = (__nv_bfloat16*)&v[s];
+                    if (radd) {
+                        const __nv_bfloat16* pa = (const __nv_bfloat16*)&a[s];
 #pragma unroll
-                for (int j = 0; j < 8; j++)
-                    o[j] = __float2bfloat16(__bfloat162float(p[j]) * inv * (__bfloat162float(pg[j]) + offset));
-                *(uint4*)(out + base + d) = *(const uint4*)o;
+                        for (int j = 0; j < 8; j++)
+                            p[j] = __float2bfloat16(__bfloat162float(p[j]) + __bfloat162float(pa[j]));
+                        *(uint4*)(rout + base + d) = v[s];
+                    }
+#pragma unroll
+                    for (int j = 0; j < 8; j++) { const float f = __bfloat162float(p[j]); sum += f * f; }
+                }
+            }
+            sum = qwen_warp_sum(sum);
+            if (wpr > 1) {
+                __syncthreads();
+                if (lane == 0) part[warp] = sum;
+                __syncthreads();
+                sum = 0.f;
+                for (unsigned w = 0; w < wpr; w++) sum += part[g * wpr + w];
+            }
+            if (!live) continue;
+            const float inv = rsqrtf(sum / dim + eps);
+            for (unsigned d0 = (sub * 32u + lane) * 8u; d0 < dim; d0 += lstride * S) {
+                uint4 v[S], gm[S];
+#pragma unroll
+                for (unsigned s = 0; s < S; s++) {
+                    const unsigned d = d0 + s * lstride;
+                    if (d < dim) {
+                        v[s] = *(const uint4*)(in + base + d);
+                        gm[s] = *(const uint4*)(gamma + d);
+                    }
+                }
+#pragma unroll
+                for (unsigned s = 0; s < S; s++) {
+                    const unsigned d = d0 + s * lstride;
+                    if (d >= dim) continue;
+                    const __nv_bfloat16* p = (const __nv_bfloat16*)&v[s];
+                    const __nv_bfloat16* pg = (const __nv_bfloat16*)&gm[s];
+                    __nv_bfloat16 o[8];
+#pragma unroll
+                    for (int j = 0; j < 8; j++)
+                        o[j] = __float2bfloat16(__bfloat162float(p[j]) * inv * (__bfloat162float(pg[j]) + offset));
+                    *(uint4*)(out + base + d) = *(const uint4*)o;
+                }
             }
         }
         return;
@@ -593,7 +733,10 @@ static __device__ void d_qwen_headnorm_rope(__nv_bfloat16* out, const __nv_bfloa
 
 // One sequence of `tokens` rows: taps before row 0 come from `history` (this slot's last
 // width-1 rows), which is rewritten from the sequence's last rows.
-template <bool PF>
+// `DEPTH`: rows of the width-4 fast path per loop group, with the next group's rows loaded
+// during this one (2 x DEPTH in flight). 4 on the prefill interpreter; 2 on the 128-register
+// light entry (per 1024-row site: 4 -> 43 us, 2 -> 39, 1 -> 43 before the double buffering).
+template <bool PF, unsigned DEPTH = 4>
 static __device__ void d_qwen_gdn_conv_prefill_seq(__nv_bfloat16* out, const __nv_bfloat16* in,
     const __nv_bfloat16* weight, __nv_bfloat16* history, unsigned channels,
     unsigned width, unsigned tokens, unsigned slice, unsigned nblk) {
@@ -615,7 +758,7 @@ static __device__ void d_qwen_gdn_conv_prefill_seq(__nv_bfloat16* out, const __n
         // tile) ran 83 vs 234 us at 4096 x 8192 and 24 vs 38 us at 1024 rows (one op, H100);
         // 8-token tiles were slower again. Same fmaf chain and sigmoid per output as the serial
         // walk below.
-        constexpr unsigned VT = 16, PF = 8;
+        constexpr unsigned VT = 16, PF = DEPTH;
         const unsigned cg = channels >> 3, ntiles = (tokens + VT - 1) / VT;
         for (unsigned i = slice * blockDim.x + threadIdx.x; i < cg * ntiles; i += nblk * blockDim.x) {
             const unsigned c0 = (i % cg) * 8u, tile = i / cg;
@@ -641,14 +784,26 @@ static __device__ void d_qwen_gdn_conv_prefill_seq(__nv_bfloat16* out, const __n
                 qwen_bf_unpack8(*(const uint4*)(in + (size_t)(t0 - 2) * channels + c0), r1);
                 qwen_bf_unpack8(*(const uint4*)(in + (size_t)(t0 - 1) * channels + c0), r2);
             }
+            // Rolled groups of PF rows with the next group's loads in flight: unrolled, the
+            // 128 sigmoids of a tile were ~4000 straight-line instructions (64 KB) that every
+            // warp streamed once, and ncu put 46% of the light conv's warp stalls on
+            // instruction fetch (no_instruction; 61 us per 1024-row site against a ~14 us byte
+            // floor, flat in the grid size); rolled, the row loads showed (long_scoreboard 23%:
+            // the two blocks' warps load in lockstep). 1024-row site, light entry: 61 -> 43
+            // (rolled, 4 rows) -> 39 us (2 rows).
+            uint4 nx[PF];
 #pragma unroll
+            for (unsigned u = 0; u < PF; u++)
+                nx[u] = u < nt ? *(const uint4*)(in + (size_t)(t0 + u) * channels + c0)
+                               : make_uint4(0u, 0u, 0u, 0u);
+#pragma unroll 1
             for (unsigned t = 0; t < VT; t += PF) {
                 if (t >= nt) break;
-                uint4 nx[PF];
+                uint4 nn[PF];
 #pragma unroll
                 for (unsigned u = 0; u < PF; u++)
-                    nx[u] = t + u < nt ? *(const uint4*)(in + (size_t)(t0 + t + u) * channels + c0)
-                                       : make_uint4(0u, 0u, 0u, 0u);
+                    nn[u] = t + PF + u < nt ? *(const uint4*)(in + (size_t)(t0 + t + PF + u) * channels + c0)
+                                            : make_uint4(0u, 0u, 0u, 0u);
 #pragma unroll
                 for (unsigned u = 0; u < PF; u++) {
                     float x[8], o[8];
@@ -659,11 +814,13 @@ static __device__ void d_qwen_gdn_conv_prefill_seq(__nv_bfloat16* out, const __n
                         sum = fmaf(r1[ch], wf[1][ch], sum);
                         sum = fmaf(r2[ch], wf[2][ch], sum);
                         sum = fmaf(x[ch], wf[3][ch], sum);
-                        o[ch] = sum / (1.f + expf(-sum));
+                        o[ch] = qwen_silu(sum);
                         r0[ch] = r1[ch]; r1[ch] = r2[ch]; r2[ch] = x[ch];
                     }
                     if (t + u < nt) *(uint4*)(out + (size_t)(t0 + t + u) * channels + c0) = qwen_bf_pack8(o);
                 }
+#pragma unroll
+                for (unsigned u = 0; u < PF; u++) nx[u] = nn[u];
             }
             if (tile == 0) {
 #pragma unroll
@@ -696,7 +853,7 @@ static __device__ void d_qwen_gdn_conv_prefill_seq(__nv_bfloat16* out, const __n
                 float sum = 0.f;
                 for (unsigned j = 0; j + 1 < width; j++) sum = fmaf(win[j], wf[j], sum);
                 sum = fmaf(x, wf[width - 1], sum);
-                out[(size_t)t * channels + c] = __float2bfloat16(sum / (1.f + expf(-sum)));
+                out[(size_t)t * channels + c] = __float2bfloat16(qwen_silu(sum));
                 for (unsigned j = 0; j + 2 < width; j++) win[j] = win[j + 1];
                 win[width - 2] = x;
             }
@@ -717,7 +874,7 @@ static __device__ void d_qwen_gdn_conv_prefill_seq(__nv_bfloat16* out, const __n
                     : __bfloat162float(in[(size_t)source * channels + c]);
                 sum = fmaf(x, __bfloat162float(w[j]), sum);
             }
-            out[(size_t)t * channels + c] = __float2bfloat16(sum / (1.f + expf(-sum)));
+            out[(size_t)t * channels + c] = __float2bfloat16(qwen_silu(sum));
         }
         for (unsigned j = 0; j + 1 < width; j++) {
             int source = (int)tokens + (int)j - (int)(width - 1);
@@ -730,7 +887,7 @@ static __device__ void d_qwen_gdn_conv_prefill_seq(__nv_bfloat16* out, const __n
 // rows' outputs are zeroed so the layers after the conv see finite activations. `req` (packed
 // prefill): the request table [n, (row0, len, slot, end) x n]; each request is its own sequence
 // with its slot's history (history is the unshifted per-slot tensor), tokens = the real rows.
-template <bool PF>
+template <bool PF, unsigned DEPTH = 4>
 static __device__ void d_qwen_gdn_conv_prefill(__nv_bfloat16* out, const __nv_bfloat16* in,
     const __nv_bfloat16* weight, __nv_bfloat16* history, unsigned channels,
     unsigned width, unsigned tokens, unsigned rows, unsigned slice, unsigned nblk,
@@ -742,7 +899,7 @@ static __device__ void d_qwen_gdn_conv_prefill(__nv_bfloat16* out, const __nv_bf
             out[i] = __float2bfloat16(0.f);
     }
     if (!req) {
-        d_qwen_gdn_conv_prefill_seq<PF>(out, in, weight, history, channels, width, tokens, slice, nblk);
+        d_qwen_gdn_conv_prefill_seq<PF, DEPTH>(out, in, weight, history, channels, width, tokens, slice, nblk);
         return;
     }
     const unsigned n = (unsigned)req[0];
@@ -750,7 +907,7 @@ static __device__ void d_qwen_gdn_conv_prefill(__nv_bfloat16* out, const __nv_bf
         const unsigned row0 = (unsigned)req[1 + 4 * r], len = (unsigned)req[2 + 4 * r];
         const unsigned slot = (unsigned)req[3 + 4 * r];
         if (!len || row0 + len > tokens) { if (threadIdx.x == 0) __trap(); return; }
-        d_qwen_gdn_conv_prefill_seq<PF>(out + (size_t)row0 * channels, in + (size_t)row0 * channels, weight,
+        d_qwen_gdn_conv_prefill_seq<PF, DEPTH>(out + (size_t)row0 * channels, in + (size_t)row0 * channels, weight,
             history + (size_t)slot * channels * (width - 1), channels, width, len, slice, nblk);
     }
 }

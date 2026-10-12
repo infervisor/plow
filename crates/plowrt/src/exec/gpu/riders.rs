@@ -8,6 +8,7 @@
 //! merge into the same output rows (`plow_<arch>_rider_*`, `runtime/nvidia/interp_sm120.cu`).
 //! The AMD route does the same with `FlashDecode` + `FlashMerge` (Part II of
 //! docs/arch/17-unified-token-batch.md).
+use super::gen_role::GenDecodeArgs;
 use super::*;
 
 /// `PlowRiderAttn` (interp_sm120.cu).
@@ -38,6 +39,22 @@ struct RiderArgs {
     pad: u32,
 }
 
+/// The packet's generated flash-decode object serving the hd256 sites: one launch per site on
+/// a (kv heads x nsplit, rows) grid, partials and merge inside the kernel.
+struct GenRider {
+    function: KernelFn,
+    block: u32,
+    smem: u32,
+    head_dim: u32,
+    gqa: u32,
+    kv_tile: u32,
+    nsplit_max: u32,
+    opart: DeviceMem,
+    mlpart: DeviceMem,
+    /// `[batch][kv heads]` split arrivals; the kernel leaves every entry at zero.
+    ctr: DeviceMem,
+}
+
 /// One attention layer of a prefill bucket: its rider launches follow segment `after`.
 #[derive(Clone, Copy)]
 struct Site {
@@ -54,6 +71,7 @@ pub(super) struct Riders {
     flash512: (KernelFn, u32),
     merge: KernelFn,
     gf512: u32,
+    gen: Option<GenRider>,
     /// Per prefill bucket, in segment order; empty = the bucket keeps riders in its prefill FA.
     sites: Vec<Vec<Site>>,
     opart: DeviceMem,
@@ -95,10 +113,7 @@ impl Riders {
     /// kernels and every attention site's operands match the widest decode rung's (same cache,
     /// window, ring and scale: the rows riders attend are exactly what a decode step would read).
     pub(super) fn load(e: &GpuEngine, blob: &DevBlob) -> Result<Option<Self>> {
-        if !RuntimeConfig::get().nv.tb_split_attn
-            || e.packed_prefill.is_none()
-            || e.seg_pf.is_none()
-        {
+        if !RuntimeConfig::get().nv.tb_split_attn || e.packed_prefill.is_none() {
             return Ok(None);
         }
         let Some(decode) = blob.decode_progs().last().copied() else {
@@ -147,12 +162,16 @@ impl Riders {
                 .filter(|&pc| bucket.stage_of.get(pc).copied().flatten().unwrap_or(0) == 0)
                 .collect();
             let Some(bucket_sites) = (|| {
-                if !uses_segmented_prefill(
-                    true,
-                    false,
-                    bucket.seg_class.len(),
-                    &bucket.packet_segment_roles,
-                ) || !bucket.qwen_segments.is_empty()
+                // The Qwen chain runs its own segment loop (`launch_prefill_chain`) and calls
+                // `launch_after` before each segment; other packets need the segmented objects.
+                let chain = !bucket.qwen_segments.is_empty();
+                if (!chain
+                    && !uses_segmented_prefill(
+                        e.seg_pf.is_some(),
+                        false,
+                        bucket.seg_class.len(),
+                        &bucket.packet_segment_roles,
+                    ))
                     || flash_sites.len() != decode_sites.len()
                 {
                     return None;
@@ -240,10 +259,51 @@ impl Riders {
         // An hd256 site may split twice as wide in the same opart bytes.
         let mlpart = e.be.alloc(0, partials * (max_hd / 256).max(1) * 2 * 4)?;
         let tables = e.be.alloc(0, (batch * 2 * 4 + 16) as u64)?;
+        // The generated decode object takes every site at its head width whose GQA ratio it
+        // was compiled for (bf16 KV only); the rider kernels keep the rest.
+        let gen = match e.gen_decode.as_ref() {
+            Some(g) if !fp8 && RuntimeConfig::get().nv.tb_gen_decode => {
+                let served = sites.iter().flatten().filter(|s| s.args.hd == g.head_dim);
+                let mut heads = 0u64;
+                let mut kv_heads = 0u64;
+                let mut any = false;
+                for s in served {
+                    if s.args.n_head != s.args.n_kv_head * g.gqa {
+                        return Err(RuntimeError::Rejected(
+                            "generated decode object GQA ratio differs from the packet's".into(),
+                        ));
+                    }
+                    heads = heads.max(u64::from(s.args.n_head));
+                    kv_heads = kv_heads.max(u64::from(s.args.n_kv_head));
+                    any = true;
+                }
+                any.then(|| -> Result<GenRider> {
+                    let splits = batch as u64 * heads * u64::from(g.nsplit_max);
+                    let ctr_bytes = batch as u64 * kv_heads * 4;
+                    let ctr = e.be.alloc(0, ctr_bytes)?;
+                    e.be.memset_d8(ctr.base, 0, ctr_bytes as usize)?;
+                    Ok(GenRider {
+                        function: g.function,
+                        block: g.block,
+                        smem: g.smem,
+                        head_dim: g.head_dim,
+                        gqa: g.gqa,
+                        kv_tile: g.kv_tile,
+                        nsplit_max: g.nsplit_max,
+                        opart: e.be.alloc(0, splits * u64::from(g.head_dim) * 4)?,
+                        mlpart: e.be.alloc(0, splits * 2 * 4)?,
+                        ctr,
+                    })
+                })
+                .transpose()?
+            }
+            _ => None,
+        };
         tracing::info!(
             route = "token-batch-split-attention",
             ready = true,
             fp8_kv = fp8,
+            generated = gen.is_some(),
             buckets = sites.iter().filter(|s| !s.is_empty()).count(),
             sites = sites.iter().map(Vec::len).max().unwrap_or(0),
             "decode rows riding packed prefill launches attend through split-KV flash decode"
@@ -253,6 +313,7 @@ impl Riders {
             flash512,
             merge,
             gf512,
+            gen,
             sites,
             opart,
             mlpart,
@@ -414,6 +475,51 @@ impl Riders {
         };
         let rows = self.rows;
         let a = &site.args;
+        if let Some(g) = self.gen.as_ref().filter(|g| g.head_dim == a.hd) {
+            // Splits per (row, kv head): cover the SMs, at most two KV tiles per split
+            // (build_catalog.py `pick_nsplit`, which the tuning classes were measured with).
+            let span = if a.window > 0 {
+                self.max_kv.min(a.window)
+            } else {
+                self.max_kv
+            };
+            let tiles = span.div_ceil(g.kv_tile.max(1)).max(1);
+            let nsplit = self
+                .sms
+                .div_ceil((rows * a.n_kv_head).max(1))
+                .clamp(1, g.nsplit_max)
+                .min((tiles / 2).max(1));
+            let mut args = GenDecodeArgs {
+                opart: g.opart.base,
+                mlpart: g.mlpart.base,
+                q: a.q,
+                k: a.k,
+                v: a.v,
+                kv_len: self.tables.base,
+                slot: self.tables.base + (self.batch * 4) as u64,
+                out: a.out,
+                ctr: g.ctr.base,
+                rows,
+                n_head: a.n_head,
+                n_kv_head: a.n_kv_head,
+                kv_stride: a.kv_stride,
+                window: a.window,
+                nsplit,
+                kv_mask: a.kv_mask,
+                hd: a.hd,
+                scale: a.scale,
+                pad: 0,
+            };
+            let mut params = [&mut args as *mut GenDecodeArgs as *mut std::ffi::c_void];
+            return be.launch_kernel_grid(
+                g.function,
+                [a.n_kv_head * nsplit, rows, 1],
+                g.block,
+                g.smem,
+                &mut params,
+                Some(stream),
+            );
+        }
         let gf = if a.hd == 256 { 2 } else { self.gf512 };
         let groups = u64::from(rows) * u64::from((a.n_head / gf).max(1));
         let nsplit = self.nsplit(a);
@@ -470,5 +576,6 @@ mod tests {
     #[test]
     fn rider_args_match_the_device_layout() {
         assert_eq!(std::mem::size_of::<super::RiderArgs>(), 11 * 8 + 10 * 4);
+        assert_eq!(std::mem::size_of::<super::GenDecodeArgs>(), 9 * 8 + 10 * 4);
     }
 }

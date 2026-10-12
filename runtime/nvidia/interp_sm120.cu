@@ -4006,7 +4006,7 @@ extern "C" __global__ void PLOW_LIGHT_PF_BOUNDS PLOW_SYM(plow_sm120_light_pf)(Pl
             (const __nv_bfloat16*)LIGHT_TEN(2), (const int*)LIGHT_TEN(3), in->i[0], in->i[1], slice, nblk);
         break;
     case PLOW_DOP_QWEN_RMSNORM:
-        d_qwen_rmsnorm((__nv_bfloat16*)LIGHT_TEN(0), (const __nv_bfloat16*)LIGHT_TEN(1),
+        d_qwen_rmsnorm<true>((__nv_bfloat16*)LIGHT_TEN(0), (const __nv_bfloat16*)LIGHT_TEN(1),
             (const __nv_bfloat16*)LIGHT_TEN(2), (const int*)LIGHT_TEN(3), in->i[0], in->i[1],
             in->fj[0].f, in->fj[1].f, slice, nblk, part, (const __nv_bfloat16*)LIGHT_TEN(4));
         break;
@@ -4018,7 +4018,7 @@ extern "C" __global__ void PLOW_LIGHT_PF_BOUNDS PLOW_SYM(plow_sm120_light_pf)(Pl
             (const int*)LIGHT_TEN(7));
         break;
     case PLOW_DOP_QWEN_GDN_CONV_PREFILL:
-        d_qwen_gdn_conv_prefill<true>((__nv_bfloat16*)LIGHT_TEN(0), (const __nv_bfloat16*)LIGHT_TEN(1),
+        d_qwen_gdn_conv_prefill<true, 2>((__nv_bfloat16*)LIGHT_TEN(0), (const __nv_bfloat16*)LIGHT_TEN(1),
             (const __nv_bfloat16*)LIGHT_TEN(2), (__nv_bfloat16*)LIGHT_TEN(3), in->i[0], in->i[1],
             in->i[2], in->i[3], slice, nblk, (const int*)LIGHT_TEN(5));
         break;
@@ -4609,7 +4609,7 @@ struct PlowGdnRide {
 extern "C" __global__ void __launch_bounds__(PLOW_NV_THREADS)
     PLOW_SYM(plow_sm120_gdn_ride)(const __grid_constant__ PlowGdnRide a) {
     extern __shared__ float arena[];
-    d_qwen_gdn_step(a.out, a.qkv, a.a, a.b, a.alog, a.dt_bias, a.state, nullptr, a.hk, a.hv,
+    d_qwen_gdn_step<true>(a.out, a.qkv, a.a, a.b, a.alog, a.dt_bias, a.state, nullptr, a.hk, a.hv,
         a.kdim, a.vdim, a.n, a.scale, a.eps, a.alog_f32, blockIdx.x, gridDim.x, arena,
         (blockDim.x >> 5) * 8u * 128u, a.table, a.tstride);
 }

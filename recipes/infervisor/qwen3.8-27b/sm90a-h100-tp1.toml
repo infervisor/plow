@@ -13,7 +13,10 @@
 # 0.826 / 0.854; needles 1.0). c1 numerics equal the single-slot packet 949474c1acaffbd9 to the digit
 # (the first token comes from the prefill launch in both). The served comparison (campaign.py report
 # vs vLLM 0.28 BF16) is in docs/bringup/results/qwen38-27b-h100/comparison.md. Re-qualified with the
-# row-group decode attention (plowrt 7ae76221, build48, gate48: c1/c8/c32 PASS, see the route).
+# row-group decode attention (plowrt 7ae76221, build48, gate48: c1/c8/c32 PASS, see the route), and
+# 2026-10-12 with the generated decode object, light launches and riders (build77, gate77 c1/c8/c32
+# PASS at the 1084 positions through each case's first stop token: c1 trimmed mean 0.00047 vs vLLM
+# 0.00034, p95 0.0025 vs 0.0017, continuation 0.830 vs 0.861, no decisive divergence).
 #
 # Routes (per-rung evidence: plans/qwen38-27b-h100.md, step_bench ctx 1K):
 #   prefill projections   cuBLASLt segments on every bucket, the 48-wide GDN a/b included (the
@@ -52,6 +55,15 @@
 #                         FP32 gate (gate48) c1/c8/c32 PASS: continuation 0.832 / 0.830 / 0.849 vs the
 #                         vLLM peers 0.845 / 0.826 / 0.854, p95 0.0040 / 0.0034 / 0.0036. The ring-staged
 #                         body (FA_RGT, build49) and the wide body alone (build44) were slower.
+#   decode attn >= 4 rows generated attn_dec_hd256_gqa6 object (TileLang, one launch per FlashDecode +
+#                         FlashMerge pair, PLOW_GEN_DECODE_STEP default 4): B4/8 x 4K 26.9/28.2 ->
+#                         26.5/27.4 ms, B8 x 15K 31.8 -> 29.4, B16/32 x 4K -1.9/-4.5; at B1/B2 the
+#                         interpreter pair is as fast or faster (build72 ab72_mid2, ab71)
+#   prefill interleave    1024-row chunks with the decode rows riding each (gdn_ride + rider attention;
+#                         PLOW_PF_INTERLEAVE = 1024 below); the chain's pointwise segments of a chunk run
+#                         as light launches on the decode object (PLOW_QWEN_LIGHT_OCC 4; branch-free
+#                         sigmoid/SiLU, rolled conv tile: light table 11.6 -> 9.9 ms per chunk, prefill
+#                         digest unchanged); 4K c16/c32/c64 tok/s 7032 / 8536 / 8841 (build77)
 #   step ms B1/8/16/32/48 23.8/27.2/31.0/38.8/48.0 (ctx 1K, build48; build32 23.75/27.46/31.43/
 #                         40.26/50.17; the morning's packet 24.2/31.5/38.7/58.1/66.8)
 #   not taken             the K-split walk on rungs 1..4 (gemv_k8 at B1: -0.9 ms): passes bulk KL but
@@ -108,6 +120,19 @@ script = "scripts/gen_kernels/build_catalog.py"
 python = "python3"
 args = ["build", "{out}/assets", "--entries", "attn_pf_hd256_causal"]
 
+# The hd256 GQA-6 generated flash-decode role (one launch per FlashDecode + FlashMerge pair from
+# four rows, PLOW_GEN_DECODE_STEP). A TileLang entry: needs a Python with the pinned TileLang
+# 0.1.12 (`nix develop .#tilelang`, or PYREF with the lab TileLang — the object is byte-stable:
+# 1b26123c… from the tuned build, the campaign build and a plain rebuild). No GPU.
+[[prep]]
+name = "gen-decode"
+script = "scripts/gen_kernels/build_catalog.py"
+python = "{env:PYREF}"
+args = ["build", "{out}/assets", "--entries", "attn_dec_hd256_gqa6"]
+[prep.env]
+TILELANG_DISABLE_CACHE = "1"
+TVM_FFI_DISABLE_TORCH_C_DLPACK = "1"
+
 [emit]
 emit = "devblob+cubin"
 args = []
@@ -116,7 +141,7 @@ PLOW_QWEN_PREFILL = "128,1024,4096"
 PLOW_DECODE_BATCH = "4"
 PLOW_DECODE_BATCH_LADDER = "1,2,4,8,16,32,48"
 PLOW_EMIT_PREFILL_CUBLASLT = "1"
-PLOW_EMIT_GEN_KERNELS = "attn_pf_hd256_causal"
+PLOW_EMIT_GEN_KERNELS = "attn_pf_hd256_causal,attn_dec_hd256_gqa6"
 # Packed prefill for the hybrid chain: the packet declares the packed section (masked padding, pad
 # rows carry slot -1, requests chunk at the widest bucket), the per-row slot / request tables and
 # the LIVE KV contract; the head is emitted as a tiled GEMM so the compact terminal can run it at
@@ -136,6 +161,11 @@ PLOW_NV_FA_RG_U = "8"
 [serve.env]
 PLOW_VMM_LIVE = "1"
 PLOW_PREFIX_CACHE = "0"
+# Prefill in 1024-row chunks with the decode rows riding each chunk (gdn_ride + rider attention):
+# the 4K / 15K serving grids (lc43 plow4k_k1 / plow15k_k1, build64) ran here; the chain's
+# pointwise segments of a chunk are light launches (PLOW_QWEN_LIGHT_OCC default 4) and the decode
+# attention from four rows the generated flash-decode object (PLOW_GEN_DECODE_STEP default 4).
+PLOW_PF_INTERLEAVE = "1024"
 
 [bench]
 backend = "openai"
@@ -179,5 +209,8 @@ nprompt = 384
 python = "{env:PYREF}"
 [gates.llm_fp32_ref]
 reference = "{env:QWEN38_FP32_REF}"
+# The reference predates `reference` recording the stop ids: <|im_end|>, <|endoftext|>. Scoring
+# stops at the reference's first stop token (chat-code ran 36 tokens past it).
+eos = [248046, 248044]
 concurrency = [1, 8, 32]
 vllm_capture = { c1 = "{env:QWEN38_FP32_VLLM}", c8 = "{env:QWEN38_FP32_VLLM_C8}", c32 = "{env:QWEN38_FP32_VLLM_C32}" }

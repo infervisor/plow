@@ -735,6 +735,16 @@ impl Emitter<'_> {
         // no FlashMerge), the contract of a generated flash-prefill role (gen_flash_prefill.cu);
         // the interpreter's hd256 body honours the same operands when no role binds the rung.
         let gen_attention = self.prefill && emit_config::active().gen_kernels.is_some();
+        // A decode entry in the list: the FlashDecode + FlashMerge pair gets its own segments,
+        // so the runtime can replace the pair with one launch of the generated decode object
+        // (gen_kernels::bind_decode records the role) or run the untouched interpreter pair.
+        let gen_decode = !self.prefill
+            && emit_config::active()
+                .gen_kernels
+                .as_deref()
+                .is_some_and(|list| {
+                    crate::gen_kernels::parse(list).is_ok_and(|entries| entries.iter().any(|e| e.decode))
+                });
         // HD256 uses the slide GF selector in the Hopper interpreter even for full attention.
         let ns = if gen_attention {
             1
@@ -808,10 +818,11 @@ impl Emitter<'_> {
                 },
             )
         };
-        if self.prefill
-            && !gen_attention
-            && (emit_config::active().attention_pf_isolate
-                || emit_config::active().attention_pf_role)
+        if gen_decode
+            || (self.prefill
+                && !gen_attention
+                && (emit_config::active().attention_pf_isolate
+                    || emit_config::active().attention_pf_role))
         {
             self.b.isolate(da);
             self.b.isolate(dm);
@@ -2263,6 +2274,123 @@ mod tests {
                 program.roles.iter().filter(|&&r| r == role).count(),
                 full_layers
             );
+        }
+        std::fs::remove_dir_all(&directory).ok();
+    }
+    // A decode entry in PLOW_EMIT_GEN_KERNELS: the decode programs keep their instructions, but
+    // every FlashDecode + FlashMerge pair sits in two single-instruction segments, and the
+    // packet records the generated decode role on both of them for every decode program.
+    #[test]
+    fn gen_kernels_isolate_the_decode_attention_pair_and_bind_the_decode_role() {
+        let _env = crate::test_env::env_guard();
+        let _target = EmitAmdGuard::set(false);
+        let original = emit_config::active().clone();
+        // Two full-attention layers: the pairs reuse the partial tensors, so one layer cannot
+        // tell a per-layer merge search from a whole-program one.
+        let mut v = fixture();
+        v["text_config"]["num_hidden_layers"] = serde_json::json!(8);
+        v["text_config"]["layer_types"] = serde_json::json!((0..8)
+            .map(|l| if l % 4 == 3 { "full_attention" } else { "linear_attention" })
+            .collect::<Vec<_>>());
+        let c = Config::parse(&v);
+        let plain = model(&c, 32768, 132, 0, false, 4);
+        let mut cfg = original.clone();
+        cfg.gen_kernels = Some("attn_dec_hd256_gqa6".into());
+        emit_config::install(cfg);
+        let mut m = model(&c, 32768, 132, 0, false, 4);
+        emit_config::install(original);
+        let entry = crate::gen_kernels::CATALOG
+            .iter()
+            .find(|e| e.name == "attn_dec_hd256_gqa6")
+            .unwrap();
+        let lo = packet::devbuild::decode_rung_lo(&m.prog_t);
+        let full_layers = c.layers.iter().filter(|&&full| full).count();
+        assert!(lo < m.progs.len());
+        let mut expected_pairs = Vec::new();
+        for (index, program) in m.progs.iter().enumerate() {
+            assert_eq!(program.insts, plain.progs[index].insts);
+            if index < lo {
+                assert_eq!(program.gq_seg_ofs, plain.progs[index].gq_seg_ofs);
+                continue;
+            }
+            let sites: Vec<_> = program
+                .insts
+                .iter()
+                .enumerate()
+                .filter(|(_, op)| entry.matches(op))
+                .collect();
+            assert_eq!(sites.len(), full_layers);
+            let mut pair_segments = Vec::new();
+            for (ix, op) in sites {
+                let merge = program
+                    .insts
+                    .iter()
+                    .enumerate()
+                    .skip(ix + 1)
+                    .find(|(_, m)| m.op == DevOp::FlashMerge as u16 && m.t[1] == op.t[0])
+                    .map(|(m, _)| m)
+                    .unwrap();
+                let seg = crate::gen_kernels::lone_segment(program, ix).unwrap();
+                let merge_seg = crate::gen_kernels::lone_segment(program, merge).unwrap();
+                assert!(seg < merge_seg);
+                pair_segments.push((seg, merge_seg));
+            }
+            assert!(program.gq_seg_ofs.len() > 2 * full_layers);
+            expected_pairs.push((index, pair_segments));
+        }
+        let directory =
+            std::env::temp_dir().join(format!("plow-qwen-gen-dec-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let globals = [
+            ("plow_gen_flash_decode_abi", 1),
+            ("plow_gen_block", 128),
+            ("plow_gen_arena_bytes", 75_776),
+            ("plow_attention_head_dim", 256),
+            ("plow_attention_query_tile", 6),
+            ("plow_attention_kv_tile", 32),
+            ("plow_attention_warps", 4),
+            ("plow_gen_decode_gqa", 6),
+            ("plow_gen_decode_nsplit_max", 8),
+        ];
+        let image = plow_asset::cubin::synthetic_elf(
+            crate::gen_kernels::DECODE_ENTRY_SYMBOL,
+            &globals,
+            90,
+        );
+        std::fs::write(directory.join(&entry.file), image).unwrap();
+        let mut sections = Vec::new();
+        crate::gen_kernels::apply_output_objects(
+            &mut m,
+            &mut sections,
+            "sm_90a",
+            &directory.join("model.pkt"),
+            "h100",
+            false,
+            "attn_dec_hd256_gqa6",
+            false,
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        let roles = plow_asset::segment_roles::SegmentRoles::from_bytes(&sections[0].data).unwrap();
+        assert!(roles.objects[&entry.role]
+            .abi
+            .starts_with("gen_flash_decode_v1:attn_dec_hd256_gqa6:"));
+        assert!(roles.programs.iter().all(|p| p.index >= lo));
+        for (index, pairs) in expected_pairs {
+            let p = roles.programs.iter().find(|p| p.index == index).unwrap();
+            assert_eq!(p.roles.len(), m.progs[index].gq_seg_ofs.len() - 1);
+            // Every layer's pair carries the role (a whole-program merge search found layer 0's
+            // merge for every layer: one merge role, the runtime rejecting the rest).
+            let bound: Vec<usize> = p
+                .roles
+                .iter()
+                .enumerate()
+                .filter(|(_, &r)| r == entry.role)
+                .map(|(seg, _)| seg)
+                .collect();
+            let mut expected: Vec<usize> = pairs.iter().flat_map(|&(d, m)| [d, m]).collect();
+            expected.sort_unstable();
+            assert_eq!(bound, expected);
+            assert_eq!(bound.len(), 2 * full_layers);
         }
         std::fs::remove_dir_all(&directory).ok();
     }

@@ -1596,6 +1596,8 @@ def gate_score(key: str, g: dict, d: Path) -> dict:
             return {"pass": False, "why": [f"missing {', '.join(sorted(set(absent)))} (see plow*.log / vllm*.log)"]}
         ref = mod.load_ref(g["reference"])
         th = dict(mod.DEFAULTS, **{k: g[k] for k in mod.DEFAULTS if k in g})
+        if "eos" in g:  # stop ids for a reference made before `reference` recorded them
+            th["eos"] = [int(x) for x in g["eos"]]
         metrics = ("kl_mean", "kl_trim_mean", "kl_p95", "kl_p99", "kl_over", "top1_decisive", "cont_frac", "needle_acc")
         table, by_c = {}, {}
         for i, (c, cand_p, peer_p, note) in enumerate(plan):

@@ -132,6 +132,21 @@ pub(super) fn validate_cublaslt_ladder(blob: &DevBlob, metadata: &SegmentRoles) 
 /// served on its own (routed, or run as one merged window), so unlike the dense library ladder
 /// the rungs' dependencies may differ: a rung below the grouped threshold does not wait on the
 /// align op.
+/// A ladder whose rungs declare the generated decode role on their isolated attention pairs
+/// (`gen_decode.rs`). Every rung is served on its own (routed, or run as one merged window).
+pub(super) fn validate_gen_decode_ladder(blob: &DevBlob, metadata: &SegmentRoles) -> Result<bool> {
+    let start = blob.progs.len() - blob.decode_progs().len();
+    for (index, program) in blob.progs.iter().enumerate().skip(start) {
+        match metadata.program(index) {
+            Some(roles) => {
+                super::gen_decode::decode_segments(program, &roles.roles, &metadata.objects)?;
+            }
+            None => program.check_coarse_single_segment()?,
+        }
+    }
+    validate_decode_ladder_impl(blob, true, &[])
+}
+
 pub(super) fn validate_moe_lt_ladder(blob: &DevBlob, metadata: &SegmentRoles) -> Result<bool> {
     let start = blob.progs.len() - blob.decode_progs().len();
     for (index, program) in blob.progs.iter().enumerate().skip(start) {

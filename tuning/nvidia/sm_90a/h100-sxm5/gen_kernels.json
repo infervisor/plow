@@ -1,5 +1,302 @@
 {
  "entries": {
+  "attn_dec_hd256_gqa6": {
+   "body_sha256": "275ace46d0d567ea17ca410438c73155b071f42789d938cced5d0e385ef13f0d",
+   "classes": {
+    "h24kv4_b16_ctx15000": {
+     "best": {
+      "bn": 32,
+      "stages": 2,
+      "threads": 128
+     },
+     "measured": [
+      {
+       "config": {
+        "bn": 64,
+        "stages": 2,
+        "threads": 128
+       },
+       "floor_us": 293.4,
+       "nsplit": 3,
+       "rel_l2": 0.00228,
+       "us": 373.2
+      },
+      {
+       "config": {
+        "bn": 64,
+        "stages": 3,
+        "threads": 128
+       },
+       "floor_us": 293.4,
+       "nsplit": 3,
+       "rel_l2": 0.00228,
+       "us": 370.8
+      },
+      {
+       "config": {
+        "bn": 32,
+        "stages": 2,
+        "threads": 128
+       },
+       "floor_us": 293.4,
+       "nsplit": 3,
+       "rel_l2": 0.00228,
+       "us": 352.3
+      },
+      {
+       "config": {
+        "bn": 32,
+        "stages": 3,
+        "threads": 128
+       },
+       "floor_us": 293.4,
+       "nsplit": 3,
+       "rel_l2": 0.00228,
+       "us": 356.0
+      }
+     ]
+    },
+    "h24kv4_b16_ctx8192": {
+     "best": {
+      "bn": 32,
+      "stages": 2,
+      "threads": 128
+     },
+     "measured": [
+      {
+       "config": {
+        "bn": 64,
+        "stages": 2,
+        "threads": 128
+       },
+       "floor_us": 160.3,
+       "nsplit": 3,
+       "rel_l2": 0.00226,
+       "us": 208.5
+      },
+      {
+       "config": {
+        "bn": 64,
+        "stages": 3,
+        "threads": 128
+       },
+       "floor_us": 160.3,
+       "nsplit": 3,
+       "rel_l2": 0.00226,
+       "us": 209.4
+      },
+      {
+       "config": {
+        "bn": 32,
+        "stages": 2,
+        "threads": 128
+       },
+       "floor_us": 160.3,
+       "nsplit": 3,
+       "rel_l2": 0.00226,
+       "us": 200.0
+      },
+      {
+       "config": {
+        "bn": 32,
+        "stages": 3,
+        "threads": 128
+       },
+       "floor_us": 160.3,
+       "nsplit": 3,
+       "rel_l2": 0.00226,
+       "us": 201.4
+      }
+     ]
+    },
+    "h24kv4_b1_ctx15000": {
+     "best": {
+      "bn": 64,
+      "stages": 2,
+      "threads": 128
+     },
+     "measured": [
+      {
+       "config": {
+        "bn": 64,
+        "stages": 2,
+        "threads": 128
+       },
+       "floor_us": 18.3,
+       "nsplit": 8,
+       "rel_l2": 0.00229,
+       "us": 65.8
+      },
+      {
+       "config": {
+        "bn": 64,
+        "stages": 3,
+        "threads": 128
+       },
+       "floor_us": 18.3,
+       "nsplit": 8,
+       "rel_l2": 0.00229,
+       "us": 66.6
+      },
+      {
+       "config": {
+        "bn": 32,
+        "stages": 2,
+        "threads": 128
+       },
+       "floor_us": 18.3,
+       "nsplit": 8,
+       "rel_l2": 0.00228,
+       "us": 93.8
+      },
+      {
+       "config": {
+        "bn": 32,
+        "stages": 3,
+        "threads": 128
+       },
+       "floor_us": 18.3,
+       "nsplit": 8,
+       "rel_l2": 0.00228,
+       "us": 92.9
+      }
+     ]
+    },
+    "h24kv4_b48_ctx4096": {
+     "best": {
+      "bn": 32,
+      "stages": 2,
+      "threads": 128
+     },
+     "measured": [
+      {
+       "config": {
+        "bn": 64,
+        "stages": 2,
+        "threads": 128
+       },
+       "floor_us": 240.4,
+       "nsplit": 1,
+       "rel_l2": 0.00227,
+       "us": 306.5
+      },
+      {
+       "config": {
+        "bn": 64,
+        "stages": 3,
+        "threads": 128
+       },
+       "floor_us": 240.4,
+       "nsplit": 1,
+       "rel_l2": 0.00227,
+       "us": 307.3
+      },
+      {
+       "config": {
+        "bn": 32,
+        "stages": 2,
+        "threads": 128
+       },
+       "floor_us": 240.4,
+       "nsplit": 1,
+       "rel_l2": 0.00226,
+       "us": 288.1
+      },
+      {
+       "config": {
+        "bn": 32,
+        "stages": 3,
+        "threads": 128
+       },
+       "floor_us": 240.4,
+       "nsplit": 1,
+       "rel_l2": 0.00226,
+       "us": 290.9
+      }
+     ]
+    },
+    "h24kv4_b8_ctx4096": {
+     "best": {
+      "bn": 32,
+      "stages": 2,
+      "threads": 128
+     },
+     "measured": [
+      {
+       "config": {
+        "bn": 64,
+        "stages": 2,
+        "threads": 128
+       },
+       "floor_us": 40.1,
+       "nsplit": 5,
+       "rel_l2": 0.0022,
+       "us": 71.3
+      },
+      {
+       "config": {
+        "bn": 64,
+        "stages": 3,
+        "threads": 128
+       },
+       "floor_us": 40.1,
+       "nsplit": 5,
+       "rel_l2": 0.0022,
+       "us": 71.1
+      },
+      {
+       "config": {
+        "bn": 32,
+        "stages": 2,
+        "threads": 128
+       },
+       "floor_us": 40.1,
+       "nsplit": 5,
+       "rel_l2": 0.00221,
+       "us": 59.3
+      },
+      {
+       "config": {
+        "bn": 32,
+        "stages": 3,
+        "threads": 128
+       },
+       "floor_us": 40.1,
+       "nsplit": 5,
+       "rel_l2": 0.00221,
+       "us": 67.8
+      }
+     ]
+    }
+   },
+   "config": {
+    "bn": 32,
+    "stages": 2,
+    "threads": 128
+   },
+   "object": "gen_sm90a_attn_dec_hd256_gqa6.cubin",
+   "packed_check": {
+    "rel_l2": 0.0021,
+    "tail_zero": true
+   },
+   "selection": "min total us over classes",
+   "signature": {
+    "arch": "sm_90a",
+    "dtype": "bf16",
+    "gqa": [
+     6,
+     6
+    ],
+    "head_dim": 256,
+    "kv_dtype": "bf16",
+    "nsplit_max": 8,
+    "op": "flash_decode",
+    "ring_kv": true,
+    "window": 0,
+    "window_any": true
+   },
+   "spill_bytes": 0
+  },
   "attn_pf_hd256_causal": {
    "body_sha256": "51d22b9fe138947d741efed068f3fe57bf68186fda207c3e4906928a4e54ffa0",
    "classes": {},

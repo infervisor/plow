@@ -1462,6 +1462,26 @@ pub struct NvidiaRuntimeConfig {
     #[arg(long = "tb-split-attn", env = "PLOW_TB_SPLIT_ATTN", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub tb_split_attn: bool,
 
+    /// Riders attend through the packet's generated flash-decode object (catalog
+    /// `gen_flash_decode_v1`, one launch per site) when it carries one at the site's geometry;
+    /// `=false` keeps the decode object's `rider_*` split-KV kernels.
+    #[arg(long = "tb-gen-decode", env = "PLOW_TB_GEN_DECODE", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub tb_gen_decode: bool,
+
+    /// Decode rungs of at least this many rows run each attention pair the packet declares
+    /// with the generated decode role (an isolated FlashDecode + FlashMerge) as one launch of
+    /// the generated flash-decode object between interpreter windows; narrower rungs, and 0,
+    /// run the untouched interpreter pair in one launch. 4: the object wins from four rows
+    /// (Qwen3.8-27B H100, knob_spec evidence); at one or two rows the interpreter's single
+    /// launch is as fast or faster.
+    #[arg(
+        long = "gen-decode-step",
+        env = "PLOW_GEN_DECODE_STEP",
+        default_value_t = 4,
+        global = true
+    )]
+    pub gen_decode_step: u32,
+
     /// Gemma hd256 light attention levels run `plow_<arch>_light_attn_s` (hd256 bodies only,
     /// two blocks per SM, twice the blocks): E4B B=64/128 ctx 1024 7.63/9.70 -> 7.56/9.54 ms,
     /// digests equal. Off: they run `light_attn`, one block per SM.

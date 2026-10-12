@@ -21,10 +21,23 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]
 TABLE = REPO / "tuning/nvidia/sm_90a/h100-sxm5/gen_kernels.json"
-WRAPPERS = {"flash_prefill": REPO / "runtime/nvidia/gen_flash_prefill.cu"}
-# A role object must hold its SM alone (plowrt: role occupancy == packet grid).
+WRAPPERS = {"flash_prefill": REPO / "runtime/nvidia/gen_flash_prefill.cu",
+            "flash_decode": REPO / "runtime/nvidia/gen_flash_decode.cu"}
+# A persistent role object must hold its SM alone (plowrt: role occupancy == packet grid).
 MIN_ARENA = 116 * 1024
 BF16_PEAK_TFLOPS = 989.0
+HBM_BYTES_PER_S = 3.35e12
+H100_SMS = 132
+
+
+def entry_op(name):
+    return ENTRIES[name]["signature"]["op"]
+
+
+def pick_nsplit(rows, kvh, tiles, nsplit_max, sms=H100_SMS):
+    """Splits per (row, kv head) for a flash-decode launch: enough items to cover the SMs, at
+    most two tiles per split. plowrt mirrors this (exec/gpu/riders.rs)."""
+    return max(1, min(nsplit_max, -(-sms // max(1, rows * kvh)), max(1, tiles // 2)))
 
 
 def flash_prefill_body(D, BM, BN, stages, threads):
@@ -212,9 +225,9 @@ for _path in sorted(Path(__file__).resolve().parent.glob("catalog_*.py")):
 PASS_CONFIGS_KEYS = ("TL_DISABLE_TMA_LOWER", "TL_DISABLE_WARP_SPECIALIZED")
 
 
-def tilelang_compile(func):
+def tilelang_compile(func, extra=()):
     import tilelang
-    cfg = {getattr(tilelang.PassConfigKey, k): True for k in PASS_CONFIGS_KEYS}
+    cfg = {getattr(tilelang.PassConfigKey, k): True for k in (*PASS_CONFIGS_KEYS, *extra)}
     return tilelang.compile(func, target={"kind": "cuda", "arch": "sm_90a"}, pass_configs=cfg)
 
 
@@ -222,7 +235,7 @@ def generate(name, cfg):
     """TileLang source for one config -> the wrapper's body header and the arena it claims."""
     import tilelang
     os.environ.setdefault("TILELANG_DISABLE_CACHE", "1")
-    kern = tilelang_compile(ENTRIES[name]["body"](cfg))
+    kern = tilelang_compile(ENTRIES[name]["body"](cfg), ENTRIES[name].get("pass_configs", ()))
     src = kern.get_kernel_source()
     funcs = list(kern.adapter.device_mod.functions.items())
     assert len(funcs) == 1, "one device kernel per entry"
@@ -239,13 +252,27 @@ def generate(name, cfg):
         + defn[0].group(3) + ")") + src[defn[0].end():]
     body = "\n".join(l for l in body.splitlines() if not head.match(l.strip()) or "{" in l)
     body = body.replace("blockIdx.x", "plow_bx").replace("blockIdx.y", "plow_by")
+    sig = ENTRIES[name]["signature"]
+    if sig["op"] == "flash_decode":
+        # gen_flash_decode.cu: a plain (kv heads x nsplit, rows) grid, no persistent loop.
+        names = ["K", "ML", "O", "Opart", "Q", "V", "ctr", "kv_len", "slot", "batch", "kv_mask",
+                 "kv_stride", "kvh", "nsplit", "scale", "window"]
+        args = {n: n + "_" for n in names}
+        assert set(params) <= set(args), f"unexpected body params {params}"
+        hdr = [f"// generated: {name} {json.dumps(cfg, sort_keys=True)} tilelang {tilelang.__version__}",
+               f"#define PLOW_GEN_HEAD_DIM {sig['head_dim']}",
+               f"#define PLOW_GEN_GQA {sig['gqa'][0]}", f"#define PLOW_GEN_BN {cfg['bn']}",
+               f"#define PLOW_GEN_THREADS {cfg['threads']}", f"#define PLOW_GEN_ARENA {arena}",
+               f"#define PLOW_GEN_NSPLIT_MAX {sig['nsplit_max']}"]
+        call = (f"#define plow_gen_call_decode(bx, by, {', '.join(args[n] for n in names)}) "
+                f"plow_gen_body(bx, by, {', '.join(args[p] for p in params)})")
+        return "\n".join(hdr) + "\n" + body + "\n" + call + "\n", arena, tilelang.__version__
     args = {"Q": "Q_", "K": "K_", "V": "V_", "O": "O_", "heads": "heads_", "qlen": "qlen_",
             "kvlen": "kvlen_", "scale": "scale_", "window": "window_", "kv_mask": "kv_mask_"}
     fp8 = ENTRIES[name].get("fp8", False)
     if fp8:
         args.update(KS="KS_", VS="VS_")
     assert set(params) <= set(args), f"unexpected body params {params}"
-    sig = ENTRIES[name]["signature"]
     hdr = [f"// generated: {name} {json.dumps(cfg, sort_keys=True)} tilelang {tilelang.__version__}",
            f"#define PLOW_GEN_HEAD_DIM {sig['head_dim']}",
            f"#define PLOW_GEN_BM {cfg['bm']}", f"#define PLOW_GEN_BN {cfg['bn']}",
@@ -380,7 +407,8 @@ class Driver:
         buf = ctypes.create_string_buffer(bytes(args), len(args))
         params = (ctypes.c_void_p * 1)(ctypes.addressof(buf))
         stream = ctypes.c_void_p(self.torch.cuda.current_stream().cuda_stream)
-        self.check(self.cu.cuLaunchKernel(fn, grid, 1, 1, block, 1, 1, smem, stream, params,
+        gx, gy = grid if isinstance(grid, tuple) else (grid, 1)
+        self.check(self.cu.cuLaunchKernel(fn, gx, gy, 1, block, 1, 1, smem, stream, params,
                                           None), "cuLaunchKernel")
         self._keep = (buf, params)
 
@@ -497,6 +525,103 @@ def run_gen(drv, fn, smem, block, case):
     drv.launch(fn, 132, block, smem, case.gen_args())
 
 
+class DecodeCase:
+    """Packet-shaped decode buffers: Q/O [B][H][D], K/V [slots][KVH][kv_stride][D], kv_len and a
+    slot table (a permutation, so the table is exercised), split-KV scratch at NSPLIT_MAX."""
+
+    def __init__(self, drv, H, KVH, D, B, ctx, ns_max, seed=0, window=0, ring=False):
+        torch = drv.torch
+        g = torch.Generator(device="cuda").manual_seed(seed)
+        self.H, self.KVH, self.D, self.B, self.window = H, KVH, D, B, window
+        self.kv_stride = 1 << (ctx - 1).bit_length() if ring else ctx
+        self.kv_mask = self.kv_stride - 1 if ring else 0xFFFFFFFF
+        bf = torch.bfloat16
+        self.q = (torch.randn(B, H, D, device="cuda", generator=g) * D ** -0.5).to(bf)
+        self.k = torch.randn(B, KVH, self.kv_stride, D, device="cuda", dtype=bf, generator=g)
+        self.v = torch.randn(B, KVH, self.kv_stride, D, device="cuda", dtype=bf, generator=g)
+        self.lens = torch.tensor([ctx - (b % 7) for b in range(B)], device="cuda",
+                                 dtype=torch.int32)
+        self.slot = torch.tensor([(b * 5 + 3) % B for b in range(B)], device="cuda",
+                                 dtype=torch.int32)
+        self.o = torch.full((B, H, D), float("nan"), device="cuda", dtype=bf)
+        self.opart = torch.zeros(B, H, ns_max, D, device="cuda", dtype=torch.float32)
+        self.ml = torch.zeros(B, H, ns_max, 2, device="cuda", dtype=torch.float32)
+        self.ctr = torch.zeros(B, KVH, device="cuda", dtype=torch.int32)
+
+    def args(self, nsplit):
+        p = lambda t: ("p", t.data_ptr())
+        return pack_args([p(self.opart), p(self.ml), p(self.q), p(self.k), p(self.v),
+                          p(self.lens), p(self.slot), p(self.o), p(self.ctr), ("u", self.B),
+                          ("u", self.H), ("u", self.KVH), ("u", self.kv_stride),
+                          ("u", self.window), ("u", nsplit), ("u", self.kv_mask), ("u", self.D),
+                          ("f", 1.0), ("u", 0)])
+
+    def reference(self):
+        import torch
+        out, got = [], []
+        for b in range(0, self.B, max(1, self.B // 6)):
+            n = int(self.lens[b])
+            lo = max(0, n - self.window) if self.window else 0
+            rows = torch.arange(lo, n, device="cuda") & self.kv_mask
+            s = int(self.slot[b])
+            for h in range(self.H):
+                kv = h // (self.H // self.KVH)
+                k = self.k[s, kv, rows].float()
+                v = self.v[s, kv, rows].float()
+                sc = k @ self.q[b, h].float()
+                out.append(sc.softmax(0) @ v)
+                got.append(self.o[b, h].float())
+        r, o = torch.stack(out), torch.stack(got)
+        return ((o - r).norm() / r.norm()).item()
+
+
+def bench_decode_entry(drv, name, image, arena, block, classes, check_pack=True):
+    """Flash-decode entries: us per launch at each (heads, kv heads, rows, context) class with
+    the runtime's split policy; `packed_check` = a ring KV with a window at a permuted slot table."""
+    torch = drv.torch
+    _, fn = drv.function(image, "plow_gen_flash_decode", arena)
+    sig = ENTRIES[name]["signature"]
+    D, ns_max, bn = sig["head_dim"], sig["nsplit_max"], None
+    row = load_table()["entries"].get(name)
+    res = {}
+    for H, KVH, B, ctx in classes:
+        per = B * KVH * ctx * D * 2 * 2
+        n = max(2, min(8, math.ceil(160e6 / per)))
+        cases = [DecodeCase(drv, H, KVH, D, B, ctx, ns_max, seed=s) for s in range(n)]
+        nsplit = pick_nsplit(B, KVH, -(-ctx // 64), ns_max)
+        launch = lambda c, ns=nsplit: drv.launch(fn, (KVH * ns, B), block, arena, c.args(ns))
+        launch(cases[0])
+        torch.cuda.synchronize()
+        err = cases[0].reference()
+        us = graph_time(torch, [(lambda c=c: launch(c)) for c in cases])
+        res[f"h{H}kv{KVH}_b{B}_ctx{ctx}"] = {"us": round(us, 1), "rel_l2": float(f"{err:.2e}"),
+                                             "nsplit": nsplit,
+                                             "floor_us": round(per / HBM_BYTES_PER_S * 1e6, 1)}
+        del cases
+        torch.cuda.empty_cache()
+    if check_pack:
+        H, KVH = classes[0][:2]
+        c = DecodeCase(drv, H, KVH, D, 5, 3000, ns_max, seed=7, window=1024, ring=True)
+        drv.launch(fn, (KVH * ns_max, 5), block, arena, c.args(ns_max))
+        torch.cuda.synchronize()
+        res["packed_check"] = {"rel_l2": float(f"{c.reference():.2e}"),
+                               "tail_zero": bool((c.ctr == 0).all().item())}
+    return res
+
+
+def class_key(name, cls):
+    if entry_op(name) == "flash_decode":
+        H, KVH, B, ctx = cls
+        return f"h{H}kv{KVH}_b{B}_ctx{ctx}"
+    H, KVH, rows, *past = cls
+    return f"h{H}kv{KVH}_rows{rows}" + (f"_past{past[0]}" if past else "")
+
+
+def bench_any(drv, name, image, arena, block, classes):
+    bench = bench_decode_entry if entry_op(name) == "flash_decode" else bench_entry
+    return bench(drv, name, image, arena, block, classes)
+
+
 def bench_entry(drv, name, image, arena, block, classes, check_pack=True):
     torch = drv.torch
     _, fn = drv.function(image, "plow_gen_flash_prefill_direct", arena)
@@ -591,7 +716,7 @@ def cmd_tune(a):
                     out = Path(tmp) / e["object"]
                     log, spills = nvcc_compile(name, header, out)
                     image = out.read_bytes()
-                res = bench_entry(drv, name, image, arena, cfg["threads"], e["classes"])
+                res = bench_any(drv, name, image, arena, cfg["threads"], e["classes"])
                 spill = max(int(s) + int(l) for s, l in spills)
                 res["spill_bytes"] = spill
                 ok = (res["packed_check"]["tail_zero"]
@@ -607,8 +732,8 @@ def cmd_tune(a):
         total = lambda t: sum(v["us"] for k, v in t[2].items() if k.startswith("h"))
         best = min(good, key=total)
         classes = {}
-        for H, KVH, rows, *past in e["classes"]:
-            key = f"h{H}kv{KVH}_rows{rows}" + (f"_past{past[0]}" if past else "")
+        for cls in e["classes"]:
+            key = class_key(name, cls)
             meas = [{"config": c, **r[key]} for c, _, r, ok in good]
             classes[key] = {"best": min(meas, key=lambda m: m["us"])["config"],
                             "measured": meas}
@@ -633,10 +758,12 @@ def cmd_bench(a):
         image = (Path(a.objdir) / row["object"]).read_bytes()
         header, arena, _ = generate(name, row["config"])
         H, KVH = ENTRIES[name]["classes"][0][:2]
-        classes = ENTRIES[name]["classes"] + [(H, KVH, int(x)) for x in a.rows]
+        classes = ENTRIES[name]["classes"]
+        if entry_op(name) != "flash_decode":
+            classes = classes + [(H, KVH, int(x)) for x in a.rows]
         rows = [c[2] for c in classes]
-        print(name, json.dumps(bench_entry(drv, name, image, arena, row["config"]["threads"],
-                                           classes), indent=1))
+        print(name, json.dumps(bench_any(drv, name, image, arena, row["config"]["threads"],
+                                         classes), indent=1))
         if a.px4:
             for r in rows:
                 if r % 64 == 0:

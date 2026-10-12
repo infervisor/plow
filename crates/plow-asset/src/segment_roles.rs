@@ -44,8 +44,14 @@ pub const GENERATED_FLASH_PREFILL_ABI: &str = "gen_flash_prefill_v1";
 /// with the k/v scale vectors in the partial-output slots, and the packed request table taken
 /// from the op's i[4] handle.
 pub const GENERATED_FLASH_PREFILL_FP8KV_ABI: &str = "gen_flash_prefill_fp8kv_v1";
+/// A generated flash-decode object: one-query-row GQA attention over the KV cache through a slot
+/// table, split-KV with an in-kernel merge, launched by the runtime on a plain
+/// (kv heads x nsplit, rows) grid between its own launches (riders, routed decode rungs). The
+/// capability's `query_tile` is the GQA ratio the body is compiled for; no packet segment binds it.
+pub const GENERATED_FLASH_DECODE_ABI: &str = "gen_flash_decode_v1";
 
-/// `<family>:<catalog entry>:block=<threads>:smem=<dynamic bytes>`; the grid is the packet grid.
+/// `<family>:<catalog entry>:block=<threads>:smem=<dynamic bytes>`; the grid is the packet grid
+/// (prefill families) or the runtime's (the decode family).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GeneratedAbi {
     pub family: String,
@@ -67,7 +73,8 @@ impl GeneratedAbi {
                 .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_');
         (parts.next().is_none()
             && (family == GENERATED_FLASH_PREFILL_ABI
-                || family == GENERATED_FLASH_PREFILL_FP8KV_ABI)
+                || family == GENERATED_FLASH_PREFILL_FP8KV_ABI
+                || family == GENERATED_FLASH_DECODE_ABI)
             && valid_entry
             && block > 0
             && block % 32 == 0
@@ -88,6 +95,10 @@ impl GeneratedAbi {
     /// Whether the object reads an e4m3 KV cache (`FlashPrefillFp8`).
     pub fn fp8_kv(&self) -> bool {
         self.family == GENERATED_FLASH_PREFILL_FP8KV_ABI
+    }
+    /// Whether the object is a flash-decode role (runtime-launched, not bound to a segment).
+    pub fn decode(&self) -> bool {
+        self.family == GENERATED_FLASH_DECODE_ABI
     }
 }
 
@@ -799,7 +810,14 @@ impl SegmentRoles {
                     .filter(|&role| requires_object(role)),
             );
         }
-        if used != self.objects.keys().copied().collect() {
+        // A generated decode object may be launched by the runtime alone (riders, decode steps),
+        // so it is declared with or without a program use; every other object needs one.
+        let required = self.objects.iter().filter(|(_, object)| {
+            !GeneratedAbi::parse(&object.abi).is_some_and(|abi| abi.decode())
+        });
+        if !used.iter().all(|role| self.objects.contains_key(role))
+            || !required.into_iter().all(|(id, _)| used.contains(id))
+        {
             return Err("packet segment declarations do not match use".into());
         }
         Ok(())
@@ -1060,6 +1078,14 @@ mod tests {
         };
         assert!(GeneratedAbi::parse(&fp8_abi.format()).is_some_and(|abi| abi.fp8_kv()));
         assert!(!abi.fp8_kv());
+        let decode = raw.replace(GENERATED_FLASH_PREFILL_ABI, GENERATED_FLASH_DECODE_ABI);
+        let roles = SegmentRoles::from_bytes(decode.as_bytes()).unwrap();
+        let abi = GeneratedAbi::parse(&roles.objects[&18].abi).unwrap();
+        assert!(abi.decode() && !abi.fp8_kv());
+        // Runtime-launched: declared without a program use; a prefill object still needs one.
+        let unused = decode.replace("0,18,0", "0,0");
+        SegmentRoles::from_bytes(unused.as_bytes()).unwrap();
+        assert!(SegmentRoles::from_bytes(raw.replace("0,18,0", "0,0").as_bytes()).is_err());
         for bad in [
             raw.replace(&"a".repeat(64), "bad"),
             raw.replace("\"warps\":8", "\"warps\":4"),

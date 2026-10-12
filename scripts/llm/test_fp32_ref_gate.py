@@ -185,6 +185,21 @@ class VerdictTests(unittest.TestCase):
         self.assertEqual(s["kl_p95"], 0.0)
         self.assertGreater(s["kl_p99"], 0.0)
 
+    def test_scoring_stops_at_the_reference_stop_token(self):
+        # cont = [5, 7(stop), 9]: the position after the stop token is neither scored nor part of the
+        # continuation; a free-run divergence there is not a decisive divergence.
+        pos = [dict(top=dist((5, 0.9), (9, 0.1)), margin=2.2), dict(top=dist((7, 0.9), (9, 0.1)), margin=2.2),
+               dict(top=dist((9, 0.9), (5, 0.1)), margin=2.2)]
+        ref = dict(sha256="x", meta=dict(eos=[7]), cases=[dict(id="a", kind="chat", prompt_ids=[1], cont=[5, 7, 9], pos=pos)])
+        cap = dict(arm="a", ref_sha256="x", cases={"a": dict(
+            free=[5, 7, 5], free_text="", pos={"0": pos[0]["top"], "1": pos[1]["top"], "2": dist((5, 0.9), (9, 0.1))})})
+        s = g.score(ref, cap)
+        self.assertEqual((s["positions"], s["kl_over"], s["cont_frac"], s["cont_decisive_frac"]), (2, 0, 1.0, 1.0))
+        self.assertEqual(g.score(ref, cap, eos=[9])["positions"], 3)  # an override scores through its own stop
+        self.assertEqual(g.score(dict(ref, meta={}), cap)["positions"], 3)  # no stop id: every position
+        self.assertEqual(g.scored_len([5, 7, 9], {7}), 2)
+        self.assertEqual(g.scored_len([5, 9], {7}), 2)
+
     def test_needle_floor_is_absolute(self):
         peer = dict(self.peer, needle_acc=0.5)
         self.assertTrue(any("needle_min" in w for w in g.verdict(dict(peer), peer)))
