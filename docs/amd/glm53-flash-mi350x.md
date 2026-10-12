@@ -418,6 +418,39 @@ The packet from config + index alone (no weights) is 70 MB: 4 prefill buckets + 
   verdict), fp32cap-plow-v6 (prefix on), vLLM isl 61440 c1/c8, v6 grids 1024/4096 (c1..c128)
   and 16384/32768/61440 (c1/c8). The long cell is 61440 not 65536: the grid's prompt + 128
   output tokens must fit the packet's 65536 context (vLLM's max-model-len is isl + 2176).
+- 18:05 UTC, FP32-reference gate on v5 with the prefix cache ON (`fp32cap-plow-v5-pfx`, c16):
+  PASS, kl_mean 0.01415 (off: 0.01388), kl_p99 0.235 (0.205), top1_decisive 0.9956 (0.9978),
+  cont_frac 0.748 (0.770), needles 18/18 — within run-to-run noise of the prefix-off capture.
+  Caveat: the capture took 80 s against 75 s off, so its teacher-forced request pairs did not
+  hit (at c16 the pair's second request lands on another slot; the snapshot is per slot). The
+  hit path's correctness is checked directly by `prefix-check-v6` (queued before the grids):
+  every natural/chat gate prompt <= 8k cold, then again (hit), then prompt + 8 output tokens
+  (hit past the snapshot), streams compared token-for-token; then c8 re-sends. vLLM long
+  baselines (TP8, c1/c8): isl 32768 TTFT 706/3392 ms, TPOT 6.95/28.7 ms, 78/142 tok/s; isl
+  65536 TTFT 1439/5619 ms, TPOT 6.81/50.4 ms, 53/82 tok/s.
+- 18:17 UTC, validate-v6 (packet sha 7649e082…, max-ctx 65536, prefix cache on): streams exact
+  (= FP32 continuation) at rung 1 (27.8 ms), B=8 (47.2), B=32 (59.2), B=128 (98.8 ms, 1295
+  tok/s; v5 at 16k: 90.7 — the 64k packet costs +9% on the widest rung). Long synthetic prompts
+  (`seq` ids, no reference) run through the chunk loop without error: 16k/32k/60k prefill then
+  one-row decode at 28.1/28.4/29.2 ms — decode is flat in context. Prefill sweep 1k/2k/4k/8k/
+  16k/32k = 150/212/382/802/2081/6309 ms: quadratic above 8k (FlashMlaPrefill at ~1% of MFMA
+  peak, §6a), so plow's 32k TTFT is ~9x vLLM's 706 ms. Long-context correctness is judged by
+  the needle pair (queued), not by these garbage-in streams.
+- 18:35 UTC, DeepSeek-V4.1-Flash vLLM TP4 baseline isl 1024 (repeat 1; out tok/s, TTFT p50,
+  TPOT p50): c1 162 / 84 ms / 4.27 ms, c8 132 / 1600 ms / 5.37 ms (TTFT outlier: first cell
+  after JIT warmup), c32 1160 / 875 / 11.3, c64 2237 / 1174 / 19.7, c128 2990 / 1202 / 33.2.
+  Load took 24 min (510 GB). Results /home/lava/bench/dsv41flash/vllm-tp4/isl1024.
+- 18:35 UTC, needle-plow-v6 first run failed before any request: the probe needs
+  `transformers` for the chat frame and the default shell has none; the needle scripts now run
+  it under `nix develop .#quantize` (transformers 5.5.4). Re-queued after prefix-check-v6.
+- 18:30 UTC, FP32-reference gate on v6 (65536 packet, prefix cache ON, c16): PASS, kl_mean
+  0.01401 (vLLM 0.03677), kl_p99 0.225 (0.549), kl_max 0.52 (1.84), top1_decisive 0.9956
+  (0.9868), cont_frac 0.743 (0.730), needles 18/18. Gate dir fp32ref/gate-v6.
+- 18:30 UTC, needle-vllm-v6 first run: 0/36 — every answer is reasoning text ("The user has
+  pasted a huge amount of repeated text..."): GLM-5.3-Flash's template opens a reasoning block
+  even with thinking off, and 16 tokens never reach the answer. The FP32 gate's needles append
+  `</think>` (`--gen-suffix`); `scripts/glm53_needle_probe.py` now takes the same `--gen-suffix`
+  and both arms re-run with it.
 - 17:35 UTC, E10 TP4 bench (packet pkt-glm53flash-tp4-ladder-v4, 4 GPUs, real prompt, streams
   exact at every rung): scalar (rung 8) 55.5 ms, B=8 51.4, B=32 63.3, B=64 74.6 ms (858 tok/s
   per group); prefill 1k 204 ms (TP8 173). Two such groups (DP2xTP4) would serve 128 streams at

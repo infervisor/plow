@@ -75,8 +75,9 @@ env = { PLOW_DECODE_BATCH = "128", PLOW_GEMV_WALK = "1", PLOW_GEMV_MM = "4", PLO
 # (hyper-connection ops on each rank's row band, reduce-scatter + all-gather seams): prefill
 # 1k/2k/4k/8k 173/256/471/995 -> 151/212/381/806 ms, streams unchanged. `PLOW_GLM_SEQ_PAR_PROJ`
 # stays off: the band projections are unvalidated with the mHC seam.
-# FP32-reference gate on this knob set at 16k (cap-plow-v5, 2026-10-12): PASS, kl_mean 0.0139
-# (vLLM 0.0368), kl_p99 0.20 (0.55), top1_decisive 0.998 (0.987), needles 18/18.
+# FP32-reference gate on the 65536 packet (cap-plow-v6, prefix cache on, 2026-10-12): PASS,
+# kl_mean 0.0140 (vLLM 0.0368), kl_p99 0.23 (0.55), top1_decisive 0.996 (0.987), needles 18/18.
+# validate-v6: streams equal the FP32 continuation at rungs 1/8/32/128.
 [emit]
 env = { PLOW_MLA_PREFILL = "full:128,512,2048,8192", PLOW_DECODE_BATCH_LADDER = "1,8,32,128", PLOW_GLM_DECODE_GEMM_ROWS = "32", PLOW_GLM_DSA = "0", PLOW_GLM_SEQ_PAR = "1", PLOW_GLM_SEQ_PAR_PROJ = "0" }
 args = [
