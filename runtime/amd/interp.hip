@@ -3905,7 +3905,7 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
             break;
 #endif /* PLOW_HAS_KDA_GATED_NORM */
         case PLOW_DOP_HYPER_CONN_PRE:
-#if !PLOW_BUCKET_DECODE && !PLOW_HC_SINKHORN_RCP
+#if !PLOW_HC_SINKHORN_RCP
             if (in->i[1] == 4u && in->i[2] % 8u == 0u) {
                 d_hyperconn_pre_rows((float*)TEN(0), (float*)TEN(1), (bf16*)TEN(2),
                                      (const float*)TEN(3), (const bf16*)TEN(4),
