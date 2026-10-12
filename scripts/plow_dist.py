@@ -236,12 +236,14 @@ def write_atomic(path: Path, data: bytes) -> None:
     tmp.replace(path)
 
 
-def copy_atomic(path: Path, src: Path) -> None:
-    """`write_atomic` from a file, streamed rather than read whole."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + f".part{os.getpid()}")
-    shutil.copyfile(src, tmp)
-    tmp.replace(path)
+def copy_hashed(src: Path, dst: Path) -> str:
+    """Copy `src` to `dst` in chunks; the sha256 of exactly the bytes written."""
+    h = hashlib.sha256()
+    with src.open("rb") as r, dst.open("wb") as w:
+        for chunk in iter(lambda: r.read(1 << 20), b""):
+            h.update(chunk)
+            w.write(chunk)
+    return h.hexdigest()
 
 
 def load_json(path: Path):

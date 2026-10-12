@@ -462,8 +462,29 @@ fn a_dist_checkpoint_is_pulled_as_blobs_and_linked_into_its_snapshot() {
     let other = crate::dist::weights::dist_snapshot_path(store.root(), &reused).unwrap();
     assert_ne!(other, snap);
 
-    // With the bundle gone, gc takes the snapshot and the space with it.
+    // Another bundle prepared with `--checkpoint` at this snapshot (its own
+    // manifest names another checkpoint) keeps it alive through its farm.
+    let other = store.root().join("bundles/other");
+    std::fs::create_dir_all(&other).unwrap();
+    std::fs::write(other.join(".plow-blobs"), "").unwrap();
+    let mut elsewhere = resolved.bundle.clone();
+    elsewhere.checkpoint.source = "hf:org/model".into();
+    elsewhere.checkpoint.files.clear();
+    std::fs::write(
+        other.join("bundle.json"),
+        serde_json::to_vec(&elsewhere).unwrap(),
+    )
+    .unwrap();
+    std::os::unix::fs::symlink(&farm.dir, other.join("checkpoint")).unwrap();
     std::fs::remove_dir_all(&dir).unwrap();
+    store.gc().unwrap();
+    assert!(
+        snap.exists(),
+        "gc took a snapshot a surviving bundle's farm links into"
+    );
+    std::fs::remove_dir_all(&other).unwrap();
+
+    // With no bundle on it, gc takes the snapshot and the space with it.
     let (_, freed) = store.gc().unwrap();
     assert!(!snap.exists(), "an unused dist snapshot survived gc");
     assert!(

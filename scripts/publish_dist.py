@@ -203,23 +203,29 @@ def run() -> None:
     # 1. Blobs first: a manifest must never name bytes that are not there.
     for digest, _ in sorted(missing.items()):
         # Streamed, never read whole: a checkpoint shard may not fit in memory.
+        # Copied once into a private staging file and hashed as it is copied, so
+        # what is published is exactly what was verified, even if the source
+        # changes meanwhile.
         src = source_path_for(digest, bundle, objset, assets, objdir, ckdir)
-        got = pd.sha256_file(src)
-        if got != digest:
-            pd.die(f"{src}: hashes to {got}, manifest says {digest}")
         dst = pd.blob_path(store, digest)
         dst.parent.mkdir(parents=True, exist_ok=True)
+        plain = dst.with_name(dst.name + f".part{os.getpid()}")
+        got = pd.copy_hashed(src, plain)
+        if got != digest:
+            plain.unlink(missing_ok=True)
+            pd.die(f"{src}: hashes to {got}, manifest says {digest}")
         zst = dst.with_name(dst.name + ".zst")
-        staged = zst.with_suffix(zst.suffix + f".part{os.getpid()}")
+        packed = zst.with_name(zst.name + f".part{os.getpid()}")
         if (
             not args.no_compress
-            and pd.compress_file(src, staged)
-            and staged.stat().st_size < src.stat().st_size
+            and pd.compress_file(plain, packed)
+            and packed.stat().st_size < plain.stat().st_size
         ):
-            staged.replace(zst)
+            packed.replace(zst)
+            plain.unlink()
         else:
-            staged.unlink(missing_ok=True)
-            pd.copy_atomic(dst, src)
+            packed.unlink(missing_ok=True)
+            plain.replace(dst)
 
     # 2. Immutable manifests.
     if objset is not None:

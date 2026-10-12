@@ -549,8 +549,30 @@ impl Store {
                 }
             }
         }
+        // A bundle prepared with `--checkpoint` at some other snapshot links
+        // into it through its farm without its manifest saying so: live too.
+        let snapshots = self.root.join("snapshots");
+        if let Ok(bundles) = std::fs::read_dir(self.root.join("bundles")) {
+            for bundle in bundles.flatten() {
+                let Ok(farm) = std::fs::read_link(bundle.path().join("checkpoint")) else {
+                    continue;
+                };
+                let Ok(links) = std::fs::read_dir(bundle.path().join(&farm)) else {
+                    continue;
+                };
+                for l in links.flatten() {
+                    if let Ok(target) = std::fs::read_link(l.path()) {
+                        if let Ok(rest) = target.strip_prefix(&snapshots) {
+                            if let Some(first) = rest.components().next() {
+                                live.insert(snapshots.join(first));
+                            }
+                        }
+                    }
+                }
+            }
+        }
         let (mut n, mut freed) = (0usize, 0u64);
-        let Ok(rd) = std::fs::read_dir(self.root.join("snapshots")) else {
+        let Ok(rd) = std::fs::read_dir(&snapshots) else {
             return (0, 0);
         };
         for snap in rd.flatten() {
