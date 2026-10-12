@@ -83,7 +83,7 @@ namespace = "infervisor"
 name = "qwen3.8-27b"
 label = "sm90a-h100-tp1"
 status = "validated"
-plow_git = "90eff806"
+plow_git = "cf7edf5f"
 network = "qwen3.5"
 
 [target]
