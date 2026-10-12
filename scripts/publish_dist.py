@@ -23,6 +23,7 @@ from __future__ import annotations
 import argparse
 import datetime as _dt
 import json
+import os
 from pathlib import Path
 
 import plow_dist as pd
@@ -201,17 +202,24 @@ def run() -> None:
 
     # 1. Blobs first: a manifest must never name bytes that are not there.
     for digest, _ in sorted(missing.items()):
+        # Streamed, never read whole: a checkpoint shard may not fit in memory.
         src = source_path_for(digest, bundle, objset, assets, objdir, ckdir)
-        data = src.read_bytes()
-        got = pd.sha256_bytes(data)
+        got = pd.sha256_file(src)
         if got != digest:
             pd.die(f"{src}: hashes to {got}, manifest says {digest}")
         dst = pd.blob_path(store, digest)
-        packed = None if args.no_compress else pd.compress(data)
-        if packed is not None and len(packed) < len(data):
-            pd.write_atomic(dst.with_name(dst.name + ".zst"), packed)
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        zst = dst.with_name(dst.name + ".zst")
+        staged = zst.with_suffix(zst.suffix + f".part{os.getpid()}")
+        if (
+            not args.no_compress
+            and pd.compress_file(src, staged)
+            and staged.stat().st_size < src.stat().st_size
+        ):
+            staged.replace(zst)
         else:
-            pd.write_atomic(dst, data)
+            staged.unlink(missing_ok=True)
+            pd.copy_atomic(dst, src)
 
     # 2. Immutable manifests.
     if objset is not None:

@@ -370,6 +370,8 @@ fn a_dist_checkpoint_is_pulled_as_blobs_and_linked_into_its_snapshot() {
         ("tokenizer.json", b"{}".to_vec()),
         ("config.json", b"{\"model_type\": \"k3\"}".to_vec()),
         ("onnx/extra.bin", b"nested".to_vec()),
+        // The same bytes as the packet: one blob, both build and weights.
+        ("shared.bin", vec![7u8; 4096]),
     ];
     let mut b = bundle(LABEL, 1, &pkt_sha, pkt_len, "obj-g1");
     b.objset.as_mut().unwrap().sha256 = set_sha;
@@ -400,9 +402,9 @@ fn a_dist_checkpoint_is_pulled_as_blobs_and_linked_into_its_snapshot() {
     let store = f.store();
     let r = reference::parse("kimi-k3").unwrap();
     let resolved = resolve(&*f.fetch(), &r, &live(), Constraints::default()).unwrap();
-    assert_eq!(resolved.plan(&store).unwrap().fetched_blobs, 2 + ckpt.len());
+    assert_eq!(resolved.plan(&store).unwrap().fetched_blobs, 1 + ckpt.len());
     let (dir, t) = pull(&store, &*f.fetch(), &resolved).unwrap();
-    assert_eq!(t.fetched_blobs, 2 + ckpt.len());
+    assert_eq!(t.fetched_blobs, 1 + ckpt.len());
 
     let snap = crate::dist::weights::dist_snapshot_path(store.root(), &resolved.bundle).unwrap();
     let rev = crate::dist::weights::checkpoint_revision(&resolved.bundle);
@@ -447,19 +449,10 @@ fn a_dist_checkpoint_is_pulled_as_blobs_and_linked_into_its_snapshot() {
         .unwrap();
     let listed = store.list();
     let weights: u64 = ckpt.iter().map(|(_, c)| c.len() as u64).sum();
-    let all: u64 = std::fs::read_to_string(dir.join(".plow-blobs"))
-        .unwrap()
-        .lines()
-        .map(|l| {
-            std::fs::metadata(store.blob_path(&Digest::parse(l.trim()).unwrap()))
-                .unwrap()
-                .len()
-        })
-        .sum();
     assert_eq!(
         listed[0].bytes,
-        all - weights,
-        "the checkpoint is not the build"
+        pkt_len + obj_len,
+        "the size is the build's: the packet once, the objects, no weights"
     );
 
     // Reusing the revision label for new weights is a different snapshot:

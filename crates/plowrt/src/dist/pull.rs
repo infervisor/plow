@@ -109,8 +109,10 @@ impl Resolved {
     /// Split the file list by what the store already has. No network.
     pub fn plan(&self, store: &Store) -> Result<Transfer> {
         let mut t = Transfer::default();
+        // A blob both the build and the checkpoint name moves once, as in `pull`.
+        let mut seen = std::collections::BTreeSet::new();
         for (_, d, bytes) in self.files()?.into_iter().chain(self.checkpoint_files()?) {
-            if store.has(&d) {
+            if store.has(&d) || !seen.insert(d.as_str().to_string()) {
                 t.reused_blobs += 1;
                 t.reused_bytes += bytes;
             } else {

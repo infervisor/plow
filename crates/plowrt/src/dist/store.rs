@@ -460,6 +460,9 @@ impl Store {
             .lines()
             .map(str::trim)
             .filter(|l| !weights.contains(*l))
+            // `keep` may list a build file the checkpoint shares a second time.
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
             .filter_map(|l| Digest::parse(l).ok())
             .filter_map(|d| std::fs::metadata(self.blob_path(&d)).ok())
             .map(|m| m.len())
