@@ -496,6 +496,18 @@ The packet from config + index alone (no weights) is 70 MB: 4 prefill buckets + 
   B=32, B=128, 4k/16k/32k/60k prompts), step r1 27.9, B=8 46.0 (v6 47.2), B=32 56.6 (59.2),
   B=128 84.3 ms (98.8; 1519 tok/s). Same numerics, so the v6 FP32 gate and needles carry
   over. The v6 grids now run on v6k objects; the recipe's objects are this source.
+- 20:50 UTC, final packet v7 = v6 + `PLOW_MLA_PF_V2=1 PLOW_GLM_PF_NS=2` (subagent finding: the
+  v6 emit had no PLOW_MLA_PF_V2, so programs were one uniform segment and every NoPE
+  FlashMlaPrefill ran the scalar decode body on the 8-wave interpreter; V2 isolates it on the
+  4-wave V2 MFMA flash arm). Packet sha 451b1b07…, objects from the 81490ae3 sources with tiers.
+  FlashMlaPrefill at 4k: 11 x 5.55 ms -> 12.4 ms total. validate-v7: streams exact at rungs
+  1/8/32/128; prefill sweep 1k/2k/4k/8k/16k/32k = 164/217/335/599/1273/2752 ms (v6 32k 6309).
+  The 128-row decode program is byte-identical to v6k's (disasm --stream diff empty); its step
+  measured 113.6 ms in this run against 84.3 in validate-v6k — the same bimodal B=128 step
+  seen in the kernel A/Bs (85 vs 98-103 ms runs in both arms), not a v7 change; unexplained.
+  FP32-reference gate v7 (prefix on): PASS, kl_mean 0.01396 (vLLM 0.03677), kl_p99 0.233
+  (0.549), top1_decisive 0.9967 (0.9868), cont_frac 0.756 (0.730), needles 18/18. Long-context
+  needles v7: 36/36 at 4k-61k. The v7 grids replace the v6 grids (stopped).
 - 17:35 UTC, E10 TP4 bench (packet pkt-glm53flash-tp4-ladder-v4, 4 GPUs, real prompt, streams
   exact at every rung): scalar (rung 8) 55.5 ms, B=8 51.4, B=32 63.3, B=64 74.6 ms (858 tok/s
   per group); prefill 1k 204 ms (TP8 173). Two such groups (DP2xTP4) would serve 128 streams at
