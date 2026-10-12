@@ -16,7 +16,9 @@
 # row-group decode attention (plowrt 7ae76221, build48, gate48: c1/c8/c32 PASS, see the route), and
 # 2026-10-12 with the generated decode object, light launches and riders (build77, gate77 c1/c8/c32
 # PASS at the 1084 positions through each case's first stop token: c1 trimmed mean 0.00047 vs vLLM
-# 0.00034, p95 0.0025 vs 0.0017, continuation 0.830 vs 0.861, no decisive divergence).
+# 0.00034, p95 0.0025 vs 0.0017, continuation 0.830 vs 0.861, no decisive divergence), and with the
+# TMA-staged prefill attention (build78, gate78i: c1/c8 PASS, c32 continuation 0.816 / 0.858 / 0.841
+# over three captures vs the 0.820 floor, every KL criterion passing; the known c32 spread).
 #
 # Routes (per-rung evidence: plans/qwen38-27b-h100.md, step_bench ctx 1K):
 #   prefill projections   cuBLASLt segments on every bucket, the 48-wide GDN a/b included (the
@@ -27,7 +29,12 @@
 #                         162 -> 93 ms; the 1024 / 4096-row prefill 122 -> 99 / 419 -> 355 ms of segments
 #                         (served 1000-token TTFT p99 135 -> 111 ms)
 #   prefill hd256 causal  generated attn_pf_hd256_causal role (interpreter body: ~8 TFLOP/s,
-#                         50 / 427 ms of the prefill at 1024 / 4096 rows -> 1.0 / 8.6 ms)
+#                         50 / 427 ms of the prefill at 1024 / 4096 rows -> 1.0 / 8.6 ms); K/V
+#                         staged by TMA through the packet's GEN_TMAP_KV_PAIR (per-slot map table
+#                         when packed; build78): 8192 x 15K launch 5.84 -> 4.19 ms, 15K prefill
+#                         1.409 -> 1.364 s, bit-identical to the cp.async staging (swap78); 15K
+#                         c16/32/64 tok/s +2.2-2.6%, 4K +0.5-1.9%. The TileLang hd256 body (K5,
+#                         tlpf) ran 25-32% slower than this hand role at every class
 #   prefill GDN scan      host-side FlashInfer CuTe DSL kernel (libplow_gdn_prefill.so); prompts pad
 #                         to the bucket like every model (plowrt 851bbc8d: 1000-token TTFT 2853 -> 131 ms)
 #   packed prefill        concurrent prompts share one bucket launch (masked padding, slot -1 pads;

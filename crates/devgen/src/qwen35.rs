@@ -776,11 +776,23 @@ impl Emitter<'_> {
         } else {
             vec![dv]
         };
+        // The hd256 role stages K/V through TMA when t[7] carries a GEN_TMAP_KV_PAIR (the
+        // runtime encodes one descriptor pair per slot over [kv_heads][ctx][hd]); without it the
+        // role falls back to cp.async staging at ~0.75x (hand harness, 24/4, a 1024-row chunk
+        // over 14K context: 689 us with maps, 929 without). bf16 KV only: t[7] is the FP8-KV
+        // V-scale slot.
+        let fa_tm = (gen_attention && c.hd == 256).then(|| {
+            let g = GenTensor::tmap_kv_pair_box(kc, vc, self.ctx, c.hd, c.kv_heads, 32);
+            self.b.tensor_gen(&format!("tmap.kv.{kc}"), g.byte_len(), g)
+        });
         let da = if self.prefill {
             self.b.emit(DevOp::FlashPrefill, self.b.all(), &[dv], |d| {
                 d.t[..5].copy_from_slice(&[opart, mlpart, q, kc, vc]);
                 if gen_attention {
                     d.t[5] = at;
+                }
+                if let Some(h) = fa_tm {
+                    d.t[7] = h;
                 }
                 d.i.copy_from_slice(&[self.batch, self.batch, c.heads, c.kv_heads, 0, 0, c.hd, ns]);
                 d.j[0] = self.ctx;
@@ -1504,6 +1516,15 @@ pub(super) fn run(
             .copied()
             .max()
             .expect("prefill buckets");
+        // The prefill attention's GEN_TMAP_KV_PAIR maps get a per-slot pointer table each: a
+        // packed launch binds the table at t[7] (packed_prefill::bind_request), the role indexes
+        // it by the request's slot.
+        let originals: Vec<u16> = m
+            .gen
+            .iter()
+            .filter(|g| g.kind == packet::rope::GEN_TMAP_KV_PAIR)
+            .map(|g| g.tensor as u16)
+            .collect();
         let mut declare = |name: String, bytes: u64| {
             assert!(m.tensors.len() < packet::dev::TENSOR_NONE16 as usize);
             let h = m.tensors.len() as u16;
@@ -1516,6 +1537,13 @@ pub(super) fn run(
         };
         let slot = declare("pf.request.slot".into(), u64::from(max_rows) * 4);
         let request = declare("pf.request.table".into(), (1 + 4 * u64::from(batch)) * 4);
+        let maps: Vec<_> = originals
+            .into_iter()
+            .map(|original| plow_asset::packed_prefill::Map {
+                original,
+                slots: declare(format!("pf.request.maps.{original}"), 8 * u64::from(batch)),
+            })
+            .collect();
         let manifest = plow_asset::program::with_model(&m, |p| -> Result<_, String> {
             let live = plow_asset::live_kv::emit(p)?;
             let request = plow_asset::packed_prefill::Manifest {
@@ -1527,7 +1555,7 @@ pub(super) fn run(
                 stages: Vec::new(),
                 slot,
                 request,
-                maps: Vec::new(),
+                maps: maps.clone(),
                 programs: p.programs[..p.prefill_count]
                     .iter()
                     .map(plow_asset::live_kv::program_digest)
@@ -2229,6 +2257,14 @@ mod tests {
                 assert_ne!(op.t[5], TENSOR_NONE);
                 assert!(op.t[..5].iter().all(|&t| t != op.t[5]));
                 assert_eq!(op.i[7], 1);
+                // The role's TMA K/V staging: t[7] names the layer's GEN_TMAP_KV_PAIR.
+                let map = m
+                    .gen
+                    .iter()
+                    .find(|g| g.tensor == op.t[7])
+                    .unwrap_or_else(|| panic!("no KV map for {op:?}"));
+                assert_eq!(map.kind, packet::rope::GEN_TMAP_KV_PAIR);
+                assert_eq!((map.aux, map.scale, map.hd, map.ctx), (op.t[3], op.t[4], 256, 16384));
             }
             assert!(!program
                 .insts
@@ -2236,7 +2272,17 @@ mod tests {
                 .any(|op| op.op == DevOp::FlashMerge as u16));
             check_operand_dependencies(program);
         }
-        assert_eq!(m.progs[3].insts, plain.progs[3].insts);
+        // Decode unchanged, modulo the tensor handles the prefill map declarations shift.
+        assert_eq!(m.progs[3].insts.len(), plain.progs[3].insts.len());
+        let mut renumber = std::collections::BTreeMap::new();
+        for (gen, base) in m.progs[3].insts.iter().zip(&plain.progs[3].insts) {
+            let mut same = *gen;
+            same.t = base.t;
+            assert_eq!(same, *base);
+            for (&g, &b) in gen.t.iter().zip(&base.t) {
+                assert_eq!(*renumber.entry(b).or_insert(g), g, "{gen:?} vs {base:?}");
+            }
+        }
         let directory = std::env::temp_dir().join(format!("plow-qwen-gen-{}", std::process::id()));
         std::fs::create_dir_all(&directory).unwrap();
         let globals = [
