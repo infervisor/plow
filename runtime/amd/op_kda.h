@@ -1430,7 +1430,21 @@ __device__ void d_kda_state_step_t(bf16* __restrict__ o, const bf16* __restrict_
      * sat idle. The batched-decode design doc asked for "an OUTER slot dimension"; what shipped
      * first was the per-row STRIDE without the axis. */
     const unsigned trep = bstride ? T : 1u;
-    const unsigned nitem = items * trep;
+#if PLOW_BUCKET_DECODE
+    /* WIDE BATCHED DECODE (T > 1 independent rows): one item per (row, head) with the head's
+     * whole column loop inside, instead of one per (row, head, tile). The per-tile map staged
+     * this head's q/k/g and ran two block reductions ntile (= 16) times per row-head, and each
+     * wave then touched ONE 512 B state column per item: 64 serial items of 4 dependent round
+     * trips per workgroup on a 256-block packet. Here a workgroup stages once per row-head and
+     * each wave streams D/PLOW_WAVES columns with CB of them in flight. The per-column
+     * arithmetic is the body below, verbatim, so o and the state are bit-identical; only the
+     * column -> (wave, time) assignment moves. T == 1 (the B=1 program) and a prefill
+     * (bstride == 0, and every PLOW_BUCKET_DECODE=0 object) keep the per-tile map. */
+    const bool wide = bstride != 0 && T > 1u;
+#else
+    constexpr bool wide = false;
+#endif
+    const unsigned nitem = wide ? T * H : items * trep;
 
     float* l_q = lds;         /* [D] */
     float* l_k = lds + D;     /* [D] */
@@ -1443,10 +1457,10 @@ __device__ void d_kda_state_step_t(bf16* __restrict__ o, const bf16* __restrict_
     for (unsigned it = slice; it < nitem; it += nblk) {
         /* Row-major over (row, h, tile), so consecutive slices stay inside one row's state when
          * the row axis is folded in — the same locality the un-folded map had. */
-        const unsigned row = bstride ? it / items : 0u;
+        const unsigned row = wide ? it / H : (bstride ? it / items : 0u);
         const unsigned base = bstride ? it % items : it;
-        const unsigned h = base / ntile;
-        const unsigned tile = base % ntile;
+        const unsigned h = wide ? it % H : base / ntile;
+        const unsigned tile = wide ? 0u : base % ntile;
         float* st_h = state + (size_t)h * D * D;
 
         /* dt_bias is [H,D] row-major and A_log is PER HEAD — different ranks, and swapping them is
@@ -1548,6 +1562,52 @@ __device__ void d_kda_state_step_t(bf16* __restrict__ o, const bf16* __restrict_
              * plausible output, which is why op 89's note says so twice. */
             const float b = GATE ? kda_sigmoid(bf2f(beta_raw[(size_t)t * H + h]))
                                  : beta[(size_t)t * H + h];
+#if PLOW_BUCKET_DECODE
+            if (wide) {
+                /* Column j = wave + PLOW_WAVES * c, so the workgroup's waves walk the head's
+                 * [v][k] state as one contiguous PLOW_WAVES x 512 B band per step. */
+                constexpr unsigned CPW = PL * PLOW_WAVE / PLOW_WAVES;
+                constexpr unsigned CB = CPW < 16u ? CPW : 16u;
+                static_assert(CPW % CB == 0, "wide KDA column batch must tile the wave's columns");
+                float* st_t = st_h + (size_t)t * bstride;
+                for (unsigned c0 = 0; c0 < CPW; c0 += CB) {
+                    float sc[CB][PL];
+#pragma unroll
+                    for (unsigned cb = 0; cb < CB; cb++) {
+                        const float* col = st_t + (size_t)(wave + PLOW_WAVES * (c0 + cb)) * D;
+#pragma unroll
+                        for (unsigned r = 0; r < PL; r++) sc[cb][r] = col[r * PLOW_WAVE + lane];
+                    }
+#pragma unroll
+                    for (unsigned cb = 0; cb < CB; cb++) {
+                        const unsigned j = wave + PLOW_WAVES * (c0 + cb);
+                        float* col = st_t + (size_t)j * D;
+                        float pk = 0.0f;
+#pragma unroll
+                        for (unsigned r = 0; r < PL; r++) {
+                            const unsigned d = r * PLOW_WAVE + lane;
+                            sc[cb][r] *= l_g[d];
+                            pk += sc[cb][r] * l_k[d];
+                        }
+                        pk = wave_sum(pk);
+                        const float u = bf2f(v[hd + j]) - pk;
+                        const float bu = b * u;
+                        float pq = 0.0f;
+#pragma unroll
+                        for (unsigned r = 0; r < PL; r++) {
+                            const unsigned d = r * PLOW_WAVE + lane;
+                            sc[cb][r] += bu * l_k[d];
+                            col[d] = sc[cb][r];
+                            pq += sc[cb][r] * l_q[d];
+                        }
+                        pq = wave_sum(pq);
+                        if (lane == 0) o[hd + j] = f2bf(pq);
+                    }
+                }
+                __syncthreads(); /* l_q/l_k/l_g are rewritten by the next item */
+                continue;
+            }
+#endif
             for (unsigned c = 0; c < cols_per_wave; c++) {
                 const unsigned j = tile * BV + wave * cols_per_wave + c; /* value column */
                 /* PER-ROW STATE. `bstride` is 0 for a PREFILL program, where the T rows are
