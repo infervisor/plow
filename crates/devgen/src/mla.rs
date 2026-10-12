@@ -10360,7 +10360,7 @@ fn emit_glm_moe_ffn_rows(
         c,
         enc,
         rows,
-        [n.shared, n.shfu, w.shd],
+        [if raw_output { n.attn } else { n.shared }, n.shfu, w.shd],
         [h, imoe_l],
         &[c_shglu],
     ) {
@@ -10372,7 +10372,12 @@ fn emit_glm_moe_ffn_rows(
             glm_decode_gemm_tile(rows, h, imoe_l, b.n_cu()).unwrap_or(DevOp::Gemv)
         };
         b.emit(shd_op, all.clone(), &[c_shglu], |d| {
-            d.t[0] = n.shared;
+            // The combine below reads the shared partial from `n.attn` under `raw_output`
+            // (the fp8/W8A8 arms above already write there); the bf16 arm wrote `n.shared`,
+            // so every rung wider than one row summed the attention output instead of the
+            // shared expert — first token right, garbage after it. Same fix as the one-row
+            // decode block.
+            d.t[0] = if raw_output { n.attn } else { n.shared };
             d.t[1] = n.shfu;
             d.t[2] = w.shd;
             if enc == MoeEnc::Mxfp4 {

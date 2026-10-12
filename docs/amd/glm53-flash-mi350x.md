@@ -262,7 +262,56 @@ The packet from config + index alone (no weights) is 70 MB: 4 prefill buckets + 
   **88.9 ms** (1440 tok/s aggregate; was 50.8 / 71.3 / 162). B=128 top spans: GemmSmall
   28.5, MoE down 9.6, RmsNorm 11.8 (one block per row, 54 us tails), KDA step 11.3, GemvF32
   9.2, XReduce 8.6, KDA conv 8.5, flash 8.1, merge 7.5. Serving grids on v3b queued.
-- (to be continued: v3b grid, FP32 gate, report.)
+- 15:10 UTC, served v3b grid at isl1024 (two passes agree within 1%): c1 TPOT 50.9 ms / TTFT
+  176 ms / 19 tok/s, c8 58.9 / 128, c32 102 / 292, c64 178 / 333, c128 269 ms / **428 tok/s**
+  (p50; means: c128 241 ms, 427 tok/s). Against the 16-row GEMV objects: c32 +14%, c64 +42%,
+  c128 +32%. The served c128 step (241 ms) is 2.7x the bench step (89 ms) because each
+  admitted request's whole 173 ms prefill stalls the batch; 384 prefills per cell. vLLM at the
+  same cell: 25.9 ms, 3900 tok/s.
+- 14:50 UTC, served v3b grid at isl4096 (two passes within 2%): c1 TPOT 50.9 ms / TTFT 456 ms,
+  c8 71.7 / 101 tok/s, c32 168 / 179, c64 317 / 190, c128 543 ms / 222 tok/s (p50). vLLM:
+  7.0 / 11.0 / 20.9 / 36.2 / 69.3 ms and 130 / 556 / 1089 / 1322 / 1463 tok/s. At c128 the
+  cell is 384 x 471 ms of single-request prefill = 181 s of the ~220 s run; the decode batch
+  is idle while a prefill runs. FP32 reference started 14:50 (1 GPU).
+- Runtime parity on gfx950 (task "NVIDIA-side advancements"): working here — HSA global-queue
+  interpreter (`PLOW_GLOBAL_QUEUE`, on), decode ladder rungs with per-slot state, segmented
+  prefill with the ragged-row table, TP8 two-shot XReduce, greedy top-k logprobs (added this
+  campaign), `PLOW_TRACE_RAW` / `PLOW_DUMP_ACT` diagnostics. Fail closed or absent on this
+  packet — unified token batch / mixed step (prefill rows packed into the decode step; the one
+  mechanism that would remove the prefill stalls above), shared prefix cache, the hipBLASLt /
+  AITER native GEMM routes (gfx942 GLM-5.2 shapes only), decode lookahead pipelining
+  (`PLOW_DECODE_PIPELINE`, CUDA only), sampling (argmax only; every cell runs greedy).
+- 15:26 UTC, FP32 reference done in 37 min on one MI350X (offload): 46 cases (20 natural, 8
+  chat, 18 needle up to 15,872 tokens), 1030 scored positions, 18/18 needles correct,
+  teacher-forcing mismatch 0; `ref.json` sha256 45c79250. vLLM and plow (v3b) captures queued.
+- 15:45 UTC, FP32 gate on the served v3b packet (capture at concurrency 16): **FAIL** — KL
+  mean 4.75 vs vLLM 0.037, top-1 agreement at decisive positions 14% vs 99%, continuation
+  agreement 12% vs 73%, needles 0/18 vs 18/18. The free runs show the first token right and
+  garbage after it ("breakfast set Interr setam...", "77-, ,,"), i.e. the batched decode rungs
+  are wrong on real prompts. The batched amd-bench check that "validated" v2y/v3/v3b used a
+  synthetic prompt (ids 100..1123) whose continuation degenerates to one repeated token, so
+  it could not see this. Diagnostic queued: the same 1024-token Pride-and-Prejudice prompt
+  through the single-rung packet (B=1), the GEMV ladder (B=8/32) and the GEMM ladder (B=8/32),
+  16 steps each, against the FP32 continuation.
+- 16:00-16:20 UTC, batched-rung bug found and fixed. Dumps on the real prompt: the ladder's
+  rung-1 program is exact, every rung wider than one row is wrong from the first decode step,
+  and the per-layer dump put the first divergence at layer 3's block input, i.e. layer 3 — the
+  first *routed-MoE* layer (layers 0-2 are dense FFN). A 4-layer ladder packet showed the MLA
+  attention chain matching at rung 8 (q path, latent cache, flash partials, merge, o_proj,
+  post-attention norm), the shared-expert output not. Cause: `emit_glm_moe_ffn_rows` (the
+  rows > 1 decode FFN, which takes the grouped prefill MoE family) wrote the bf16 shared
+  expert's down-projection to `act.shared` while its combine reads the shared partial from
+  `act.attn` under the hyper-connection — the same destination mismatch fixed for the one-row
+  block in 2b890c19, in the other function. Fixed in mla.rs (both the GEMM-rows and the
+  hipBLASLt-segment arms). Packet v4 (objects unchanged, v3b): real-prompt amd-bench streams
+  equal the FP32 continuation for 16 steps in every slot at B=8, 32 and 128; steps 51.0 /
+  59.8 / 91.2 ms (1403 tok/s aggregate at B=128). Lesson recorded: a correctness gate must
+  use a real prompt and must cover a routed-MoE layer; the earlier synthetic-prompt check and
+  the 4-layer/first-3-layers dumps could not see this layer class at all.
+- 16:20 UTC, served v4 grids (1024/4096), the plow FP32 capture and the gate are queued;
+  decode tier objects (`lowrung1/`, `lowrung8/`, narrower GEMV bodies for rungs 1 and 8 — the
+  loader logged "no decode tiers", so every rung ran the 128-wide object: c1 51 ms vs 28 ms on
+  the single-rung packet) are building for a follow-up grid.
 
 ## 5. Results
 
