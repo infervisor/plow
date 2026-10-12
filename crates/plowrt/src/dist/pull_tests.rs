@@ -139,6 +139,7 @@ fn bundle(label: &str, gen: u32, pkt_sha: &str, pkt_bytes: u64, objset_id: &str)
             shards: 96,
             layout: "native-mxfp4".into(),
             bytes: 1_590_000_000_000,
+            files: vec![],
         },
         objset: Some(BundleObjset {
             objset_id: objset_id.into(),
@@ -266,6 +267,44 @@ fn a_full_pull_materializes_a_servable_directory() {
     assert_eq!(t2.reused_blobs, 2);
 }
 
+/// `ls --json` names a pin by the label and generation its manifest carries,
+/// sizes it by the blobs it links, and skips a pin it could not serve.
+#[test]
+fn the_store_lists_each_pulled_pin_with_its_manifest_identity() {
+    let f = Fixture::new("list");
+    let store = f.store();
+    assert!(store.list().is_empty(), "an empty store lists nothing");
+
+    let pkt = vec![7u8; 4096];
+    let obj = b"objset g1".to_vec();
+    write_index(&f, vec![publish(&f, LABEL, 1, &pkt, &obj)]);
+    let r = reference::parse("kimi-k3").unwrap();
+    let resolved = resolve(&*f.fetch(), &r, &live(), Constraints::default()).unwrap();
+    let (dir, _) = pull(&store, &*f.fetch(), &resolved).unwrap();
+    store
+        .pin(&r.pin_key(), &resolved.variant.variant_id)
+        .unwrap();
+    // A pin whose bundle was removed from under it cannot be served as is.
+    store
+        .pin("file:///elsewhere/infervisor/gone", "gone-g1")
+        .unwrap();
+
+    let listed = store.list();
+    assert_eq!(listed.len(), 1, "{listed:?}");
+    let p = &listed[0];
+    assert_eq!(p.reference, format!("infervisor/kimi-k3:{LABEL}@g1"));
+    assert_eq!((p.label.as_str(), p.generation), (LABEL, 1));
+    assert_eq!(p.variant_id, resolved.variant.variant_id);
+    assert_eq!(p.bytes, pkt.len() as u64 + obj.len() as u64);
+    assert_eq!(p.dir, std::fs::canonicalize(&dir).unwrap());
+    assert!(!p.prepared, "no checkpoint farm yet");
+
+    std::os::unix::fs::symlink(&f.root, dir.join("checkpoint")).unwrap();
+    assert!(store.list()[0].prepared);
+    let json = serde_json::to_value(&store.list()).unwrap();
+    assert_eq!(json[0]["ref"], p.reference.as_str());
+}
+
 /// An Apple bundle names no objset: the pull fetches the files alone and
 /// lays nothing under `hsaco/`, and the live Metal target selects it.
 #[test]
@@ -314,6 +353,154 @@ fn a_runtime_compiled_bundle_pulls_its_files_and_no_objects() {
     assert_eq!(t.fetched_blobs, 1);
     assert_eq!(std::fs::read(dir.join("model.pkt")).unwrap(), pkt);
     assert!(!dir.join("hsaco").exists());
+}
+
+/// A `dist` checkpoint travels as blobs: the pull fetches them with the
+/// bundle, links them into a snapshot rather than the bundle, keeps them
+/// reachable for `gc`, and `prepare` builds the farm from that snapshot.
+#[test]
+fn a_dist_checkpoint_is_pulled_as_blobs_and_linked_into_its_snapshot() {
+    let f = Fixture::new("dist-weights");
+    let (pkt_sha, pkt_len) = f.blob(&[7u8; 4096]);
+    let (obj_sha, obj_len) = f.blob(b"objset g1");
+    let set = objset("obj-g1", &obj_sha, obj_len, Some("0x9fd0e880fb6fbf09"));
+    let set_sha = f.write("v1/objsets/obj-g1.json", &serde_json::to_vec(&set).unwrap());
+    let ckpt: Vec<(&str, Vec<u8>)> = vec![
+        ("model.safetensors", vec![3u8; 2048]),
+        ("tokenizer.json", b"{}".to_vec()),
+        ("config.json", b"{\"model_type\": \"k3\"}".to_vec()),
+        ("onnx/extra.bin", b"nested".to_vec()),
+        // The same bytes as the packet: one blob, both build and weights.
+        ("shared.bin", vec![7u8; 4096]),
+    ];
+    let mut b = bundle(LABEL, 1, &pkt_sha, pkt_len, "obj-g1");
+    b.objset.as_mut().unwrap().sha256 = set_sha;
+    b.checkpoint = BundleCheckpoint {
+        source: DIST_SOURCE.into(),
+        revision: "v1".into(),
+        shards: 1,
+        layout: "hf-safetensors".into(),
+        bytes: ckpt.iter().map(|(_, c)| c.len() as u64).sum(),
+        files: ckpt
+            .iter()
+            .map(|(name, content)| {
+                let (sha256, bytes) = f.blob(content);
+                CheckpointFile {
+                    name: name.to_string(),
+                    sha256,
+                    bytes,
+                }
+            })
+            .collect(),
+    };
+    let manifest_sha = f.write(
+        &format!("v1/infervisor/kimi-k3/manifests/{LABEL}@g1"),
+        &serde_json::to_vec(&b).unwrap(),
+    );
+    write_index(&f, vec![variant(LABEL, 1, &manifest_sha, "obj-g1")]);
+
+    let store = f.store();
+    let r = reference::parse("kimi-k3").unwrap();
+    let resolved = resolve(&*f.fetch(), &r, &live(), Constraints::default()).unwrap();
+    assert_eq!(resolved.plan(&store).unwrap().fetched_blobs, 1 + ckpt.len());
+    let (dir, t) = pull(&store, &*f.fetch(), &resolved).unwrap();
+    assert_eq!(t.fetched_blobs, 1 + ckpt.len());
+
+    let snap = crate::dist::weights::dist_snapshot_path(store.root(), &resolved.bundle).unwrap();
+    let rev = crate::dist::weights::checkpoint_revision(&resolved.bundle);
+    assert!(rev.starts_with("v1-") && rev.len() == 15, "{rev}");
+    assert_eq!(
+        snap,
+        store
+            .root()
+            .join(format!("snapshots/dist+infervisor--kimi-k3@{rev}"))
+    );
+    for (name, content) in &ckpt {
+        assert_eq!(&std::fs::read(snap.join(name)).unwrap(), content, "{name}");
+    }
+    assert!(
+        !dir.join("model.safetensors").exists(),
+        "the weights are the snapshot's, not bundle files"
+    );
+    let (collected, _) = store.gc().unwrap();
+    assert_eq!(
+        collected, 0,
+        "a live bundle's checkpoint blobs are reachable"
+    );
+
+    let farm = crate::dist::prepare::build(store.root(), &resolved.bundle, &dir, &snap).unwrap();
+    assert_eq!(farm.shards, 1);
+    assert_eq!(
+        farm.dir,
+        store
+            .root()
+            .join(format!("checkpoints/dist+infervisor--kimi-k3@{rev}"))
+    );
+    assert!(dir.join("checkpoint/model.safetensors").is_file());
+
+    // A second pull moves nothing and keeps the same snapshot.
+    let (_, t2) = pull(&store, &*f.fetch(), &resolved).unwrap();
+    assert_eq!(t2.fetched_blobs, 0);
+    assert!(snap.join("onnx/extra.bin").is_file());
+
+    // The size `ls` reports is the build's, not the weights'.
+    store
+        .pin(&r.pin_key(), &resolved.variant.variant_id)
+        .unwrap();
+    let listed = store.list();
+    let weights: u64 = ckpt.iter().map(|(_, c)| c.len() as u64).sum();
+    assert_eq!(
+        listed[0].bytes,
+        pkt_len + obj_len,
+        "the size is the build's: the packet once, the objects, no weights"
+    );
+
+    // Reusing the revision label for new weights is a different snapshot:
+    // the old one is untouched.
+    let mut reused = resolved.bundle.clone();
+    reused.checkpoint.files[0].sha256 = "0".repeat(64);
+    let other = crate::dist::weights::dist_snapshot_path(store.root(), &reused).unwrap();
+    assert_ne!(other, snap);
+
+    // Another bundle prepared with `--checkpoint` at this snapshot (its own
+    // manifest names another checkpoint) keeps it alive through its farm.
+    let other = store.root().join("bundles/other");
+    std::fs::create_dir_all(&other).unwrap();
+    std::fs::write(other.join(".plow-blobs"), "").unwrap();
+    let mut elsewhere = resolved.bundle.clone();
+    elsewhere.checkpoint.source = "hf:org/model".into();
+    elsewhere.checkpoint.files.clear();
+    std::fs::write(
+        other.join("bundle.json"),
+        serde_json::to_vec(&elsewhere).unwrap(),
+    )
+    .unwrap();
+    // Its `--checkpoint` reached the snapshot through a symlink.
+    let alias = store.root().join("alias-to-snapshot");
+    std::os::unix::fs::symlink(&snap, &alias).unwrap();
+    let other_farm = store.root().join("other-farm");
+    std::fs::create_dir_all(&other_farm).unwrap();
+    std::os::unix::fs::symlink(
+        alias.join("model.safetensors"),
+        other_farm.join("model.safetensors"),
+    )
+    .unwrap();
+    std::os::unix::fs::symlink(&other_farm, other.join("checkpoint")).unwrap();
+    std::fs::remove_dir_all(&dir).unwrap();
+    store.gc().unwrap();
+    assert!(
+        snap.exists(),
+        "gc took a snapshot a surviving bundle's farm links into"
+    );
+    std::fs::remove_dir_all(&other).unwrap();
+
+    // With no bundle on it, gc takes the snapshot and the space with it.
+    let (_, freed) = store.gc().unwrap();
+    assert!(!snap.exists(), "an unused dist snapshot survived gc");
+    assert!(
+        freed >= weights,
+        "freed {freed}, the weights alone are {weights}"
+    );
 }
 
 /// The property the whole layout exists for: a generation that changes only the

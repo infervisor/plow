@@ -1,7 +1,8 @@
 //! `plowrt load --fetch-weights`: the Hugging Face snapshot a bundle was built
 //! against, downloaded into the store so the checkpoint farm can be built
-//! from it. The distribution carries no weights; this is the consent step
-//! that gets them.
+//! from it. An `hf:` checkpoint is not in the distribution; this is the
+//! consent step that gets it. A `dist` checkpoint is, and `pull` links its
+//! blobs into a snapshot of the same shape ([`link_dist`]).
 //!
 //! Only `hf:<org>/<repo>` sources can be fetched. The whole repository at the
 //! bundle's revision is downloaded through `hf-hub` (its cache under
@@ -13,6 +14,9 @@
 
 use std::path::{Path, PathBuf};
 
+use plow_asset::dist::{Bundle, DIST_SOURCE};
+
+use super::{Digest, Store};
 use crate::{Result, RuntimeError};
 
 /// The repo behind an `hf:` source; anything else cannot be fetched.
@@ -44,15 +48,113 @@ pub fn snapshot_path(store_root: &Path, repo: &str, revision: &str) -> Result<Pa
         .join(format!("{}@{revision}", repo.replace('/', "--"))))
 }
 
+/// The directory name a checkpoint's snapshot and farm go by in the store,
+/// before `@<revision>`: `<org>--<repo>` for `hf:`, and
+/// `dist+<namespace>--<name>` for a `dist` checkpoint (`+` is not allowed in a
+/// Hugging Face name, so no `hf:` key can equal it), whose revision is a
+/// free label and so must be scoped to its model.
+pub fn checkpoint_key(bundle: &Bundle) -> String {
+    let c = &bundle.checkpoint;
+    if c.source == DIST_SOURCE {
+        return format!("dist+{}--{}", bundle.namespace, bundle.name);
+    }
+    c.source
+        .strip_prefix("hf:")
+        .unwrap_or(&c.source)
+        .replace('/', "--")
+}
+
+/// The revision a checkpoint is stored under. A Hugging Face revision is the
+/// publisher's; a `dist` revision is a free label a publisher may reuse for
+/// new weights, so it is qualified by a hash of the files' digests. A key
+/// then never names two contents: an older pin keeps its weights, and two
+/// bundles share a snapshot or farm only when they share the checkpoint.
+pub fn checkpoint_revision(bundle: &Bundle) -> String {
+    let c = &bundle.checkpoint;
+    if c.source != DIST_SOURCE {
+        return c.revision.clone();
+    }
+    let mut files: Vec<String> = c
+        .files
+        .iter()
+        .map(|f| format!("{}:{}", f.name, f.sha256))
+        .collect();
+    files.sort();
+    let digest = Digest::of(files.join("\n").as_bytes());
+    format!("{}-{}", c.revision, &digest.as_str()[..12])
+}
+
+/// Where a `dist` checkpoint's snapshot lives:
+/// `snapshots/dist+<namespace>--<name>@<revision>-<files hash>/`. The revision is
+/// validated as one path component with the bundle; the namespace and name
+/// are checked here too (also by `Bundle::validate`), because they become
+/// path components, and a `--` inside one would make two models' keys equal.
+pub fn dist_snapshot_path(store_root: &Path, bundle: &Bundle) -> Result<PathBuf> {
+    for part in [&bundle.namespace, &bundle.name] {
+        if !safe_repo_path(part) || part.contains('/') || part.contains("--") {
+            return Err(RuntimeError::Dist(format!(
+                "{}/{}: not a namespace and name a snapshot can be stored under",
+                bundle.namespace, bundle.name
+            )));
+        }
+    }
+    Ok(store_root.join("snapshots").join(format!(
+        "{}@{}",
+        checkpoint_key(bundle),
+        checkpoint_revision(bundle)
+    )))
+}
+
+/// Link a `dist` checkpoint's blobs, already in the store, into its snapshot,
+/// which `prepare::build` then takes exactly as it takes a Hugging Face one.
+///
+/// Its path names its content ([`checkpoint_revision`]), so one that exists
+/// is complete and is never rewritten under a server reading it. Staged and
+/// renamed, like [`fetch`], so a reader never sees a partial snapshot.
+pub fn link_dist(store: &Store, bundle: &Bundle) -> Result<PathBuf> {
+    let dir = dist_snapshot_path(store.root(), bundle)?;
+    if dir.is_dir() {
+        return Ok(dir);
+    }
+    let staging = dir.with_extension(format!("partial-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&staging);
+    std::fs::create_dir_all(&staging).map_err(io(&staging))?;
+    for f in &bundle.checkpoint.files {
+        let digest = Digest::parse(&f.sha256)?;
+        if !store.has(&digest) || !safe_repo_path(&f.name) {
+            return Err(RuntimeError::Dist(format!(
+                "{}: checkpoint blob {digest} is not in the store, or its name escapes the \
+                 snapshot",
+                f.name
+            )));
+        }
+        let src = store.blob_path(&digest);
+        let dst = staging.join(&f.name);
+        if let Some(parent) = dst.parent() {
+            std::fs::create_dir_all(parent).map_err(io(parent))?;
+        }
+        if std::fs::hard_link(&src, &dst).is_err() {
+            std::fs::copy(&src, &dst).map_err(io(&dst))?;
+        }
+    }
+    if let Some(parent) = dir.parent() {
+        std::fs::create_dir_all(parent).map_err(io(parent))?;
+    }
+    if let Err(e) = std::fs::rename(&staging, &dir) {
+        let _ = std::fs::remove_dir_all(&staging);
+        // Another pull linked the same content first; anything else failed.
+        if !dir.is_dir() {
+            return Err(io(&dir)(e));
+        }
+    }
+    Ok(dir)
+}
+
 /// A repository path that may be written under the snapshot: relative,
-/// nothing that escapes it.
+/// nothing that escapes it. The rule a `dist` checkpoint's file names are
+/// validated by, so both sources write the same set of paths.
 pub fn safe_repo_path(name: &str) -> bool {
-    !name.is_empty()
-        && !name.starts_with('/')
-        && !name.contains('\\')
-        && name
-            .split('/')
-            .all(|seg| !seg.is_empty() && seg != "." && seg != "..")
+    plow_asset::dist::is_safe_relative_path(name)
 }
 
 /// A full 40-hex git commit id: the only revision whose content cannot move.
@@ -141,8 +243,17 @@ pub fn fetch(store_root: &Path, source: &str, revision: &str, shards: u32) -> Re
     if let Some(parent) = dir.parent() {
         std::fs::create_dir_all(parent).map_err(io(parent))?;
     }
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::rename(&staging, &dir).map_err(io(&dir))?;
+    // An incomplete snapshot is what this download repairs: it goes.
+    if dir.is_dir() && count_shards(&dir) < shards as usize {
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    if let Err(e) = std::fs::rename(&staging, &dir) {
+        let _ = std::fs::remove_dir_all(&staging);
+        // Another pull completed the same snapshot first; anything else failed.
+        if !(dir.is_dir() && count_shards(&dir) >= shards as usize) {
+            return Err(io(&dir)(e));
+        }
+    }
     Ok(dir)
 }
 

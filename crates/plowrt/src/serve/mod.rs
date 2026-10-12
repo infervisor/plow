@@ -2050,5 +2050,6 @@ pub fn admin_app(state: Arc<AppState>) -> Router {
         .route("/v1/models/load", post(admin::load))
         .route("/v1/models/unload", post(admin::unload))
         .route("/v1/models/status", get(admin::status))
+        .route("/v1/models/available", get(admin::available))
         .with_state(state)
 }

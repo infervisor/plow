@@ -79,6 +79,22 @@ snapshots/<org>--<repo>@<rev>/     a snapshot `load --fetch-weights` downloaded
 A blob's digest always names the **uncompressed** bytes, so a store may hold
 `.zst`, plain, or both and every client stays correct.
 
+A pulled bundle directory also holds its manifest as `bundle.json`, which is
+where `plowrt ls --json` reads each pin's label and generation from. The
+array it prints on stdout (logs go to stderr) is what a node reports:
+
+```
+[{"ref": "infervisor/kimi-k3:gfx942-mi325x-tp8-32k@g3", "namespace": "infervisor",
+  "name": "kimi-k3", "label": "gfx942-mi325x-tp8-32k", "generation": 3,
+  "variant_id": "a793020a5026", "bytes": 412316860,
+  "dir": "/home/op/.plow/bundles/a793020a5026", "prepared": true}]
+```
+
+`bytes` counts the blobs the bundle links (files and objects, not the
+checkpoint); `prepared` means the checkpoint farm is linked in, so `dir` serves
+as is. A pin pulled before the manifest was recorded is skipped with a warning
+until `plowrt load` re-materializes it.
+
 ## Why content addressing
 
 A generation that changes only the code objects shares its packet, manifests and
@@ -154,6 +170,16 @@ store, as `huggingface-cli download` would. Never implicit: a checkpoint can
 be terabytes. The bundle's revision must be a full commit hash; a branch can
 move after the build, so `--fetch-weights` refuses one.
 
+The exception is a checkpoint with no Hugging Face repository to fetch from
+(private, or for an air-gapped node): `checkpoint.source = "dist"` lists every
+file as `files: [{name, sha256, bytes}]`, published under `v1/blobs/sha256/`
+like a bundle file, and `revision` is a free version label. `pull` fetches those
+blobs with the bundle and links them into `snapshots/dist+<ns>--<name>@<rev>-<hash>/`,
+which `load` prepares without `--fetch-weights`. `pack_bundle.py
+--checkpoint-dir <dir> --revision <label>` writes such a manifest (instead of
+`--hf`), and `plowrt pack --checkpoint-dir <dir>` zips the files as
+`checkpoint/<name>`.
+
 ## Producing a release
 
 Producers use nix; the HTTPS store is generated from its outputs. Nothing on a
@@ -192,6 +218,26 @@ generation.
 Publication order is the safety property: **blobs, then manifests, then the
 index**. An interrupted publish leaves the previous generation completely
 servable.
+
+**To a registry with a publish API** (inferos runs one), `plowrt publish`
+packs the build exactly as `plowrt pack` does and uploads the archive with an
+API key, so anyone with a key the registry accepts can submit a build:
+
+```
+PLOW_PUBLISH_KEY=… plowrt publish --bundle bundle.json --assets <dir> \
+  [--objset objset.json --objects <dir>] [--checkpoint-dir <dir> --hf <org>/<repo>] \
+  --to https://<registry>
+```
+
+Like `publish_dist.py`, it numbers the build against the live index: the
+next generation of its label, or nothing at all when the newest generation
+already carries exactly these files and objset, so a re-run is a no-op. The
+archive goes through the registry's staged upload (`POST
+<to>/api/v1/admin/registry/uploads`, `PUT` the zip to the returned URL, then
+`POST …/uploads/<id>/publish`), so a large build goes straight to the bucket
+past the API's request limit. The registry checks every file against its
+digest; a generation someone else published meanwhile is refused (409) and
+the command says to run again.
 
 ## Recipes
 

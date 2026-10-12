@@ -636,6 +636,10 @@ enum Cmd {
         /// Check the registry for a newer generation of each pinned model.
         #[arg(long, default_value_t = false)]
         upgradable: bool,
+        /// Print the pins as a JSON array on stdout (logs go to stderr): ref,
+        /// namespace, name, label, generation, variant_id, bytes, dir, prepared.
+        #[arg(long, default_value_t = false, conflicts_with = "upgradable")]
+        json: bool,
     },
 
     /// This machine as the registry sees it: the target a published variant
@@ -705,9 +709,60 @@ enum Cmd {
         /// Directory `objset.json`'s `objects[]` live in.
         #[arg(long)]
         objects: Option<PathBuf>,
+        /// Directory a `dist` checkpoint's `files[]` live in. Required exactly
+        /// when the bundle carries its checkpoint.
+        #[arg(long)]
+        checkpoint_dir: Option<PathBuf>,
         /// Output archive path.
         #[arg(long)]
         out: PathBuf,
+    },
+
+    /// Publish a built bundle to a registry with an API key: number it as its
+    /// label's next generation from the registry's index, package it exactly
+    /// as `pack` does, and send it through the registry's staged upload
+    /// (`<to>/api/v1/admin/registry/uploads`). When the newest generation is
+    /// already this build, nothing is sent.
+    #[cfg(feature = "dist")]
+    Publish {
+        /// Bundle manifest, as written by `pack_bundle.py`.
+        #[arg(long)]
+        bundle: PathBuf,
+        /// Objset manifest; omitted for a runtime-compiled target (Apple).
+        #[arg(long)]
+        objset: Option<PathBuf>,
+        /// Directory `bundle.json`'s `files[]` live in.
+        #[arg(long)]
+        assets: PathBuf,
+        /// Directory `objset.json`'s `objects[]` live in.
+        #[arg(long)]
+        objects: Option<PathBuf>,
+        /// Directory a `dist` checkpoint's `files[]` live in, as for `pack`.
+        #[arg(long)]
+        checkpoint_dir: Option<PathBuf>,
+        /// The registry's API base URL; `PLOW_PUBLISH_URL` when omitted.
+        #[arg(long)]
+        to: Option<String>,
+        /// API key allowed to publish, sent as a Bearer token;
+        /// `PLOW_PUBLISH_KEY` when omitted (preferred: a flag shows in `ps`).
+        #[arg(long = "key")]
+        api_key: Option<String>,
+        /// Status to publish at; the registry's default when omitted.
+        #[arg(long, value_parser = ["emits", "validated"])]
+        status: Option<String>,
+        /// One line describing the model, for the registry's catalog.
+        #[arg(long)]
+        description: Option<String>,
+        /// `<org>/<repo>` on Hugging Face, the model's identity in the index.
+        /// Required for a `dist` checkpoint, which names none itself.
+        #[arg(long)]
+        hf: Option<String>,
+        /// Measured decode throughput; required for `--status validated`.
+        #[arg(long)]
+        tok_s: Option<f64>,
+        /// The concurrency `--tok-s` was measured at.
+        #[arg(long)]
+        concurrency: Option<u32>,
     },
 }
 
@@ -803,6 +858,8 @@ async fn async_main(
         Cmd::Bench { .. } | Cmd::OpAudit { .. } | Cmd::KnobScope { .. } | Cmd::Qualify { .. } => {
             true
         }
+        // A node's check-in parses this array; the banner must not precede it.
+        Cmd::Ls { json: true, .. } => true,
         #[cfg(any(
             all(feature = "cpu", feature = "gguf"),
             all(feature = "metal", target_os = "macos"),
@@ -1069,7 +1126,7 @@ async fn async_main(
             fetch_weights,
         )),
         Cmd::Show { model } => dist_cmd::report(dist_cmd::cmd_show(&model)),
-        Cmd::Ls { upgradable } => dist_cmd::report(dist_cmd::cmd_ls(upgradable)),
+        Cmd::Ls { upgradable, json } => dist_cmd::report(dist_cmd::cmd_ls(upgradable, json)),
         Cmd::Target { json } => dist_cmd::report(dist_cmd::cmd_target(json)),
         Cmd::Upgrade {
             model,
@@ -1086,14 +1143,53 @@ async fn async_main(
             objset,
             assets,
             objects,
+            checkpoint_dir,
             out,
         } => dist_cmd::report(dist_cmd::cmd_pack(
             &bundle,
             objset.as_deref(),
             &assets,
             objects.as_deref(),
+            checkpoint_dir.as_deref(),
             &out,
         )),
+        #[cfg(feature = "dist")]
+        Cmd::Publish {
+            bundle,
+            objset,
+            assets,
+            objects,
+            checkpoint_dir,
+            to,
+            api_key,
+            status,
+            description,
+            hf,
+            tok_s,
+            concurrency,
+        } => dist_cmd::report((|| {
+            let (env_url, env_key) = plowrt::config::RuntimeConfig::publish_env();
+            let to = to.or(env_url).ok_or("give --to or set PLOW_PUBLISH_URL")?;
+            let api_key = api_key
+                .or(env_key)
+                .ok_or("set PLOW_PUBLISH_KEY (or --key) to an API key allowed to publish")?;
+            dist_cmd::cmd_publish(
+                &bundle,
+                objset.as_deref(),
+                &assets,
+                objects.as_deref(),
+                checkpoint_dir.as_deref(),
+                &dist_cmd::PublishTo {
+                    url: &to,
+                    api_key: &api_key,
+                    status: status.as_deref(),
+                    description: description.as_deref(),
+                    hf: hf.as_deref(),
+                    tok_s,
+                    concurrency,
+                },
+            )
+        })()),
         #[cfg(feature = "hsa")]
         Cmd::AmdBench {
             blob,

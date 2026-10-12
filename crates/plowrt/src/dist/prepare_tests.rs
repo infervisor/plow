@@ -45,6 +45,7 @@ fn bundle(tokenizer: TokenizerRef, files: Vec<FileRef>) -> Bundle {
             shards: 2,
             layout: "native-mxfp4".into(),
             bytes: 1_590_000_000_000,
+            files: vec![],
         },
         objset: Some(BundleObjset {
             objset_id: "o".into(),
@@ -248,4 +249,50 @@ fn a_directory_that_is_not_a_checkpoint_says_what_is_needed() {
     for p in [store, empty, bdir] {
         let _ = std::fs::remove_dir_all(p);
     }
+}
+
+/// A `dist` revision is a label a publisher may reuse with new content, so
+/// a rebuilt farm holds the new snapshot's shards and nothing from before.
+#[test]
+fn a_rebuilt_farm_keeps_no_shard_from_the_previous_snapshot() {
+    let store = tmp("store-rebuild");
+    let bdir = tmp("bundle-rebuild");
+    std::fs::write(bdir.join("model.pkt"), b"pkt").unwrap();
+    let b = bundle(from_checkpoint(), vec![packet_file()]);
+
+    let old = snapshot("snap-old", 3, &["tokenizer.json"]);
+    let farm = build(&store, &b, &bdir, &old).unwrap();
+    assert!(farm.dir.join("model-00003-of-00003.safetensors").exists());
+
+    let new = snapshot("snap-new", 2, &["tokenizer.json"]);
+    let farm = build(&store, &b, &bdir, &new).unwrap();
+    let shards = std::fs::read_dir(&farm.dir)
+        .unwrap()
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().ends_with(".safetensors"))
+        .count();
+    assert_eq!(shards, 2, "a stale shard would load beside the new ones");
+    assert!(
+        old.join("model-00003-of-00003.safetensors").exists(),
+        "targets untouched"
+    );
+}
+
+#[test]
+fn a_refused_snapshot_leaves_the_farm_as_it_was() {
+    let store = tmp("store-refused");
+    let bdir = tmp("bundle-refused");
+    std::fs::write(bdir.join("model.pkt"), b"pkt").unwrap();
+    let b = bundle(from_checkpoint(), vec![packet_file()]);
+    let good = snapshot("snap-good", 3, &["tokenizer.json"]);
+    let farm = build(&store, &b, &bdir, &good).unwrap();
+
+    let empty = tmp("snap-empty");
+    assert!(build(&store, &b, &bdir, &empty).is_err());
+    let shards = std::fs::read_dir(&farm.dir)
+        .unwrap()
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().ends_with(".safetensors"))
+        .count();
+    assert_eq!(shards, 3, "a refused rebuild removed the working shards");
 }

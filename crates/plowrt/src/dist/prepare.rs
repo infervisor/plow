@@ -1,9 +1,9 @@
 //! Build the checkpoint farm a bundle needs, on the target.
 //!
-//! The distribution never carries weights. What it carries is what plow
-//! produced; the checkpoint comes from the operator's HuggingFace snapshot or a
-//! local directory. `prepare` joins the two into the flat, sorted directory the
-//! loader expects.
+//! A bundle carries what plow produced; the checkpoint comes from the
+//! operator's HuggingFace snapshot, a local directory, or — for a `dist`
+//! checkpoint — the snapshot `pull` linked from the distribution's own blobs.
+//! `prepare` joins the two into the flat, sorted directory the loader expects.
 //!
 //! `Checkpoint::open` globs `*.safetensors` in **one non-recursive sorted
 //! directory** and lets the last writer win, which is how a derived sidecar
@@ -46,14 +46,12 @@ fn link(src: &Path, dst: &Path) -> Result<()> {
 }
 
 /// Where a checkpoint's farm lives in the store.
-pub fn farm_path(store_root: &Path, source: &str, revision: &str) -> PathBuf {
-    let repo = source
-        .strip_prefix("hf:")
-        .unwrap_or(source)
-        .replace('/', "--");
-    store_root
-        .join("checkpoints")
-        .join(format!("{repo}@{revision}"))
+pub fn farm_path(store_root: &Path, bundle: &Bundle) -> PathBuf {
+    store_root.join("checkpoints").join(format!(
+        "{}@{}",
+        super::weights::checkpoint_key(bundle),
+        super::weights::checkpoint_revision(bundle)
+    ))
 }
 
 /// Assemble the farm: the snapshot's shards, the bundle's derived sidecar if it
@@ -77,11 +75,7 @@ pub fn build(
             bundle.checkpoint.revision
         )));
     }
-    let dir = farm_path(
-        store_root,
-        &bundle.checkpoint.source,
-        &bundle.checkpoint.revision,
-    );
+    let dir = farm_path(store_root, bundle);
     std::fs::create_dir_all(&dir).map_err(|source| RuntimeError::Io {
         path: dir.clone(),
         source,
@@ -93,10 +87,11 @@ pub fn build(
         source,
     })?;
     let mut names: Vec<String> = Vec::new();
+    let mut sources = Vec::new();
     for e in rd.flatten() {
         let name = e.file_name().to_string_lossy().into_owned();
         if name.ends_with(".safetensors") {
-            link(&e.path(), &dir.join(&name))?;
+            sources.push(e.path());
             names.push(name);
             shards += 1;
         }
@@ -114,6 +109,25 @@ pub fn build(
             snapshot.display(),
             bundle.checkpoint.shards
         )));
+    }
+
+    // Checked first, so a refused snapshot leaves the farm as it was.
+    // The farm is not emptied: other bundles on this checkpoint keep their derived
+    // sidecars here. But a base shard from another snapshot (an operator's
+    // `--checkpoint` that changed) would load beside the new ones, so every
+    // shard link that does not point into a bundle goes before relinking.
+    let bundles = store_root.join("bundles");
+    if let Ok(rd) = std::fs::read_dir(&dir) {
+        for e in rd.flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            let into_bundle = std::fs::read_link(e.path()).is_ok_and(|t| t.starts_with(&bundles));
+            if name.ends_with(".safetensors") && !into_bundle {
+                let _ = std::fs::remove_file(e.path());
+            }
+        }
+    }
+    for (src, name) in sources.iter().zip(&names) {
+        link(src, &dir.join(name))?;
     }
 
     for f in SIDECAR_FILES {

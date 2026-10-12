@@ -23,6 +23,7 @@ from __future__ import annotations
 import argparse
 import datetime as _dt
 import json
+import os
 from pathlib import Path
 
 import plow_dist as pd
@@ -60,6 +61,8 @@ def blob_inventory(bundle: dict, objset: dict | None) -> dict[str, int]:
     inv = {f["sha256"]: f["bytes"] for f in bundle["files"]}
     for o in (objset or {}).get("objects", []):
         inv[o["sha256"]] = o["bytes"]
+    for c in bundle["checkpoint"].get("files", []):
+        inv[c["sha256"]] = c["bytes"]
     return inv
 
 
@@ -83,13 +86,18 @@ def find_predecessor(idx: dict | None, label: str, generation: int) -> dict | No
     return max(prior, key=lambda v: v["generation"]) if prior else None
 
 
-def source_path_for(digest: str, bundle: dict, objset: dict | None, assets: Path, objdir: Path | None) -> Path:
+def source_path_for(
+    digest: str, bundle: dict, objset: dict | None, assets: Path, objdir: Path | None, ckdir: Path | None
+) -> Path:
     for f in bundle["files"]:
         if f["sha256"] == digest:
             return assets / f["name"]
     for o in (objset or {}).get("objects", []):
         if o["sha256"] == digest:
             return objdir / o["name"]
+    for c in bundle["checkpoint"].get("files", []):
+        if c["sha256"] == digest and ckdir is not None:
+            return ckdir / c["name"]
     pd.die(f"no source file for blob {digest}")
 
 
@@ -99,6 +107,7 @@ def run() -> None:
     ap.add_argument("--objset")
     ap.add_argument("--assets", help="directory the bundle files live in")
     ap.add_argument("--objects", help="directory the .elf objects live in")
+    ap.add_argument("--checkpoint-dir", help="directory a `dist` checkpoint's files live in")
     ap.add_argument("--store", help="destination store root")
     ap.add_argument("--status", choices=["validated", "emits", "refused"], default="emits")
     ap.add_argument("--tok-s", type=float, help="measured aggregate throughput")
@@ -132,6 +141,11 @@ def run() -> None:
     store = Path(args.store)
     assets = Path(args.assets) if args.assets else Path(args.bundle).parent
     objdir = Path(args.objects) if args.objects else (Path(args.objset).parent if args.objset else None)
+    ckdir = Path(args.checkpoint_dir) if args.checkpoint_dir else None
+    # A `dist` checkpoint names no Hugging Face repo, and the index needs one
+    # as the model's identity root.
+    if bundle["checkpoint"]["source"] == "dist" and not args.hf:
+        pd.die("the bundle's checkpoint is `dist`: pass --hf <org>/<repo> for the index")
 
     if args.status == "validated" and args.tok_s is None:
         pd.die(
@@ -188,17 +202,30 @@ def run() -> None:
 
     # 1. Blobs first: a manifest must never name bytes that are not there.
     for digest, _ in sorted(missing.items()):
-        src = source_path_for(digest, bundle, objset, assets, objdir)
-        data = src.read_bytes()
-        got = pd.sha256_bytes(data)
-        if got != digest:
-            pd.die(f"{src}: hashes to {got}, manifest says {digest}")
+        # Streamed, never read whole: a checkpoint shard may not fit in memory.
+        # Copied once into a private staging file and hashed as it is copied, so
+        # what is published is exactly what was verified, even if the source
+        # changes meanwhile.
+        src = source_path_for(digest, bundle, objset, assets, objdir, ckdir)
         dst = pd.blob_path(store, digest)
-        packed = None if args.no_compress else pd.compress(data)
-        if packed is not None and len(packed) < len(data):
-            pd.write_atomic(dst.with_name(dst.name + ".zst"), packed)
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        plain = dst.with_name(dst.name + f".part{os.getpid()}")
+        got = pd.copy_hashed(src, plain)
+        if got != digest:
+            plain.unlink(missing_ok=True)
+            pd.die(f"{src}: hashes to {got}, manifest says {digest}")
+        zst = dst.with_name(dst.name + ".zst")
+        packed = zst.with_name(zst.name + f".part{os.getpid()}")
+        if (
+            not args.no_compress
+            and pd.compress_file(plain, packed)
+            and packed.stat().st_size < plain.stat().st_size
+        ):
+            packed.replace(zst)
+            plain.unlink()
         else:
-            pd.write_atomic(dst, data)
+            packed.unlink(missing_ok=True)
+            plain.replace(dst)
 
     # 2. Immutable manifests.
     if objset is not None:

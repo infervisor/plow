@@ -57,6 +57,27 @@ impl std::fmt::Display for Digest {
 /// `gc` reads this instead of re-hashing the bundle.
 const BUNDLE_BLOBS: &str = ".plow-blobs";
 
+pub use plow_asset::dist::BUNDLE_MANIFEST;
+
+/// One pin, as `plowrt ls --json` prints it.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct Pinned {
+    /// `<namespace>/<name>:<label>@g<generation>`.
+    #[serde(rename = "ref")]
+    pub reference: String,
+    pub namespace: String,
+    pub name: String,
+    pub label: String,
+    pub generation: u32,
+    pub variant_id: String,
+    /// Every blob the bundle links, files and objects.
+    pub bytes: u64,
+    /// The materialized bundle: what `serve --assets` and `/v1/models/load` take.
+    pub dir: PathBuf,
+    /// The checkpoint farm is built and linked in, so the bundle serves as is.
+    pub prepared: bool,
+}
+
 pub struct Store {
     root: PathBuf,
 }
@@ -130,6 +151,51 @@ impl Store {
             path: final_path.clone(),
             source,
         })?;
+        Ok(true)
+    }
+
+    /// [`Store::put`] for a stream: hashed as it is written to a staged file,
+    /// renamed into place only when the digest matches.
+    pub fn put_reader(&self, want: &Digest, r: &mut dyn std::io::Read) -> Result<bool> {
+        use sha2::Digest as _;
+        let final_path = self.blob_path(want);
+        if final_path.is_file() {
+            return Ok(false);
+        }
+        let tmp = final_path.with_extension(format!("part{}", std::process::id()));
+        let io = |path: &Path| {
+            let path = path.to_path_buf();
+            move |source| RuntimeError::Io { path, source }
+        };
+        let mut out = std::io::BufWriter::new(std::fs::File::create(&tmp).map_err(io(&tmp))?);
+        let (mut h, mut n, mut buf) = (sha2::Sha256::new(), 0u64, vec![0u8; 1 << 20]);
+        let copied = (|| -> std::io::Result<()> {
+            loop {
+                let k = r.read(&mut buf)?;
+                if k == 0 {
+                    return std::io::Write::flush(&mut out);
+                }
+                h.update(&buf[..k]);
+                std::io::Write::write_all(&mut out, &buf[..k])?;
+                n += k as u64;
+            }
+        })();
+        drop(out);
+        let got = format!("{:x}", h.finalize());
+        if let Err(source) = copied {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(RuntimeError::Dist(format!(
+                "blob {want}: transfer failed: {source}"
+            )));
+        }
+        if got != want.as_str() {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(RuntimeError::Dist(format!(
+                "digest mismatch: expected {want}, content hashes to {got} ({n} bytes). \
+                 The blob was corrupted in transit or the manifest is wrong; nothing was stored."
+            )));
+        }
+        std::fs::rename(&tmp, &final_path).map_err(io(&final_path))?;
         Ok(true)
     }
 
@@ -212,6 +278,24 @@ impl Store {
         Ok(dir)
     }
 
+    /// Add blobs to a materialized bundle's record without linking them into
+    /// it. A `dist` checkpoint's files are linked into its snapshot instead,
+    /// and `gc` reads only bundle records, so without this it would collect
+    /// the weights of a bundle that still needs them.
+    pub fn keep(&self, dir: &Path, digests: &[Digest]) -> Result<()> {
+        use std::io::Write;
+        let mpath = dir.join(BUNDLE_BLOBS);
+        let lines: String = digests.iter().map(|d| format!("{d}\n")).collect();
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&mpath)
+            .and_then(|mut f| f.write_all(lines.as_bytes()))
+            .map_err(|source| RuntimeError::Io {
+                path: mpath,
+                source,
+            })
+    }
+
     /// A pin's filename: a digest of the reference, not the reference itself.
     ///
     /// A reference contains `://` and `/`, and using it as a path both nests
@@ -284,6 +368,105 @@ impl Store {
         out
     }
 
+    /// Write a pulled bundle's manifest beside its files, as `bundle.json` —
+    /// the name a `plowc` assets directory already carries it under.
+    ///
+    /// A pin records only the variant id, which is a hash; the label and
+    /// generation a person (or a node's check-in) names the model by live
+    /// only in the manifest. Staged and renamed, because `dir` is full of hard
+    /// links into `blobs/` and writing through one would rewrite a blob.
+    pub fn record_bundle(&self, dir: &Path, bundle: &plow_asset::dist::Bundle) -> Result<()> {
+        let path = dir.join(BUNDLE_MANIFEST);
+        let bytes = serde_json::to_vec_pretty(bundle).map_err(|source| RuntimeError::Json {
+            path: path.clone(),
+            source,
+        })?;
+        let tmp = path.with_extension(format!("part{}", std::process::id()));
+        std::fs::write(&tmp, bytes).map_err(|source| RuntimeError::Io {
+            path: tmp.clone(),
+            source,
+        })?;
+        std::fs::rename(&tmp, &path).map_err(|source| RuntimeError::Io { path, source })
+    }
+
+    /// Every pin with what a caller needs to serve it: `plowrt ls --json`.
+    ///
+    /// A pin whose bundle directory or manifest is missing is skipped with a
+    /// warning rather than reported half-known: it cannot be served as it is,
+    /// and `plowrt load` re-materializes it.
+    pub fn list(&self) -> Vec<Pinned> {
+        let mut out = Vec::new();
+        for (reference, variant_id) in self.pins() {
+            match self.pinned_bundle(&variant_id) {
+                Ok(p) => out.push(p),
+                Err(e) => tracing::warn!(%reference, %variant_id, "skipped: {e}"),
+            }
+        }
+        out
+    }
+
+    fn pinned_bundle(&self, variant_id: &str) -> Result<Pinned> {
+        let dir = self.root.join("bundles").join(variant_id);
+        let path = dir.join(BUNDLE_MANIFEST);
+        let raw = std::fs::read(&path).map_err(|source| RuntimeError::Io {
+            path: path.clone(),
+            source,
+        })?;
+        let b: plow_asset::dist::Bundle =
+            serde_json::from_slice(&raw).map_err(|source| RuntimeError::Json {
+                path: path.clone(),
+                source,
+            })?;
+        let dir = std::fs::canonicalize(&dir).unwrap_or(dir);
+        Ok(Pinned {
+            reference: format!("{}/{}:{}@g{}", b.namespace, b.name, b.label, b.generation),
+            bytes: self.bundle_bytes(&dir),
+            // `prepare::build` links the farm in as `checkpoint` last, so its
+            // presence is what "ready to serve" means.
+            prepared: dir.join("checkpoint").is_dir(),
+            namespace: b.namespace,
+            name: b.name,
+            label: b.label,
+            generation: b.generation,
+            variant_id: variant_id.to_string(),
+            dir,
+        })
+    }
+
+    /// The bundle's size in the store: every blob its record names, files and
+    /// objects alike. Read from the record rather than by walking the
+    /// directory, which would also follow `checkpoint` into the weights.
+    fn bundle_bytes(&self, dir: &Path) -> u64 {
+        // `keep` appends a `dist` checkpoint's digests to the record: weights,
+        // not the build (an `hf:` bundle's are not counted either). A digest
+        // the record lists more often than the checkpoint does is also a build
+        // file or object, and counts once.
+        let mut count: std::collections::BTreeMap<String, i64> = Default::default();
+        for l in std::fs::read_to_string(dir.join(BUNDLE_BLOBS))
+            .unwrap_or_default()
+            .lines()
+        {
+            *count.entry(l.trim().to_string()).or_default() += 1;
+        }
+        if let Some(b) = std::fs::read(dir.join(BUNDLE_MANIFEST))
+            .ok()
+            .and_then(|raw| serde_json::from_slice::<plow_asset::dist::Bundle>(&raw).ok())
+        {
+            for f in &b.checkpoint.files {
+                if let Some(n) = count.get_mut(&f.sha256) {
+                    *n -= 1;
+                }
+            }
+        }
+        count
+            .into_iter()
+            .filter(|(_, n)| *n > 0)
+            .filter_map(|(l, _)| Digest::parse(&l).ok())
+            .filter_map(|d| std::fs::metadata(self.blob_path(&d)).ok())
+            .map(|m| m.len())
+            .sum()
+    }
+
     /// Remove blobs no live bundle directory references.
     ///
     /// Reachability is computed from the materialized bundles rather than from
@@ -328,13 +511,128 @@ impl Store {
             if live.contains(&name) {
                 continue;
             }
-            let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+            // A blob still linked from a `dist` snapshot frees its space only
+            // when the snapshot goes; `gc_dist_snapshots` counts it then.
+            let size = entry
+                .metadata()
+                .map(|m| if last_link(&m) { m.len() } else { 0 })
+                .unwrap_or(0);
             if std::fs::remove_file(entry.path()).is_ok() {
                 n += 1;
                 freed += size;
             }
         }
-        Ok((n, freed))
+        let (sn, sfreed) = self.gc_dist_snapshots();
+        Ok((n + sn, freed + sfreed))
+    }
+
+    /// Remove the `dist` snapshots no bundle uses. Their files are hard links
+    /// to blobs, so the blobs `gc` just removed still hold their space until
+    /// the snapshot goes too. A bundle with no recorded manifest might use any
+    /// of them: then none is removed.
+    fn gc_dist_snapshots(&self) -> (usize, u64) {
+        let mut live = std::collections::BTreeSet::new();
+        if let Ok(rd) = std::fs::read_dir(self.root.join("bundles")) {
+            for dir in rd.flatten().filter(|d| d.path().is_dir()) {
+                let Some(bundle) = std::fs::read(dir.path().join(BUNDLE_MANIFEST))
+                    .ok()
+                    .and_then(|raw| serde_json::from_slice::<plow_asset::dist::Bundle>(&raw).ok())
+                else {
+                    return (0, 0);
+                };
+                if bundle.checkpoint.source == plow_asset::dist::DIST_SOURCE {
+                    if let Ok(p) = super::weights::dist_snapshot_path(&self.root, &bundle) {
+                        live.insert(p);
+                    }
+                }
+            }
+        }
+        // A bundle prepared with `--checkpoint` at some other snapshot links
+        // into it through its farm without its manifest saying so: live too.
+        let snapshots = self.root.join("snapshots");
+        // Compared resolved: a `--checkpoint` may reach a snapshot through a
+        // symlink, or the store root itself may be one.
+        let resolved_root = std::fs::canonicalize(&snapshots).unwrap_or_else(|_| snapshots.clone());
+        if let Ok(bundles) = std::fs::read_dir(self.root.join("bundles")) {
+            for bundle in bundles.flatten() {
+                let Ok(farm) = std::fs::read_link(bundle.path().join("checkpoint")) else {
+                    continue;
+                };
+                let Ok(links) = std::fs::read_dir(bundle.path().join(&farm)) else {
+                    continue;
+                };
+                for l in links.flatten() {
+                    if let Ok(target) = std::fs::canonicalize(l.path()) {
+                        if let Ok(rest) = target.strip_prefix(&resolved_root) {
+                            if let Some(first) = rest.components().next() {
+                                live.insert(snapshots.join(first));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let (mut n, mut freed) = (0usize, 0u64);
+        let Ok(rd) = std::fs::read_dir(&snapshots) else {
+            return (0, 0);
+        };
+        for snap in rd.flatten() {
+            let path = snap.path();
+            let name = snap.file_name().to_string_lossy().into_owned();
+            if !name.starts_with("dist+") || !path.is_dir() || live.contains(&path) {
+                continue;
+            }
+            // Space comes back only for files nothing else links to.
+            // Its files are links to blobs `gc` counted already: only the
+            // space comes back now.
+            let (_, bytes) = last_links(&path);
+            if std::fs::remove_dir_all(&path).is_ok() {
+                freed += bytes;
+            }
+        }
+        (n, freed)
+    }
+}
+
+/// Whether removing this file frees its bytes: no other hard link to it.
+fn last_link(m: &std::fs::Metadata) -> bool {
+    #[cfg(unix)]
+    return std::os::unix::fs::MetadataExt::nlink(m) == 1;
+    #[cfg(not(unix))]
+    return true;
+}
+
+/// Files under `dir` whose every hard link is inside it, and their size:
+/// what removing `dir` frees. One file linked twice inside counts once.
+fn last_links(dir: &Path) -> (usize, u64) {
+    let mut inodes: std::collections::HashMap<(u64, u64), (u64, u64, u64)> = Default::default();
+    collect_inodes(dir, &mut inodes);
+    inodes
+        .values()
+        .filter(|(_, nlink, seen)| seen >= nlink)
+        .fold((0, 0), |(n, b), (len, _, _)| (n + 1, b + len))
+}
+
+fn collect_inodes(dir: &Path, inodes: &mut std::collections::HashMap<(u64, u64), (u64, u64, u64)>) {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for e in rd.flatten() {
+        let Ok(m) = std::fs::symlink_metadata(e.path()) else {
+            continue;
+        };
+        if m.is_dir() {
+            collect_inodes(&e.path(), inodes);
+        } else if m.is_file() {
+            #[cfg(unix)]
+            let (key, nlink) = {
+                use std::os::unix::fs::MetadataExt;
+                ((m.dev(), m.ino()), m.nlink())
+            };
+            #[cfg(not(unix))]
+            let (key, nlink) = ((0, inodes.len() as u64), 1);
+            inodes.entry(key).or_insert((m.len(), nlink, 0)).2 += 1;
+        }
     }
 }
 

@@ -740,6 +740,8 @@ pub const RAW_ENV: &[KnobSpec] = &[
     KnobSpec::new("env.PLOW_RUNG_FAST_PROBE", Some("PLOW_RUNG_FAST_PROBE"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
     KnobSpec::new("env.PLOW_SERVE_POLICY", Some("PLOW_SERVE_POLICY"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
     KnobSpec::new("env.PLOW_TOKEN_BATCH_SOLO", Some("PLOW_TOKEN_BATCH_SOLO"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
+    KnobSpec::new("env.PLOW_PUBLISH_URL", Some("PLOW_PUBLISH_URL"), Layer::RawEnv, Domain::Str, UNSET, OPT_IN),
+    KnobSpec::new("env.PLOW_PUBLISH_KEY", Some("PLOW_PUBLISH_KEY"), Layer::RawEnv, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("env.PLOW_DEBUG_MAX_INST", Some("PLOW_DEBUG_MAX_INST"), Layer::RawEnv, Domain::Str, UNSET, DIAG),
     KnobSpec::new("env.PLOW_THROUGHPUT_K", Some("PLOW_THROUGHPUT_K"), Layer::RawEnv, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("env.PLOW_DEV_SAMPLE", Some("PLOW_DEV_SAMPLE"), Layer::RawEnv, Domain::Str, UNSET, DIAG),

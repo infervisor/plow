@@ -186,6 +186,19 @@ def compress(data: bytes, level: int = 19) -> bytes | None:
     return out.stdout
 
 
+def compress_file(src: Path, dst: Path, level: int = 19) -> bool:
+    """`compress` for a file, file to file: a checkpoint shard may not fit in
+    memory. False when no compressor is available or it failed."""
+    if not shutil.which("zstd"):
+        return False
+    out = subprocess.run(
+        ["zstd", f"-{level}", "-T0", "-q", "-f", "-o", str(dst), str(src)],
+        capture_output=True,
+        check=False,
+    )
+    return out.returncode == 0
+
+
 def human(n: int) -> str:
     v = float(n)
     for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
@@ -221,6 +234,16 @@ def write_atomic(path: Path, data: bytes) -> None:
     tmp = path.with_suffix(path.suffix + f".part{os.getpid()}")
     tmp.write_bytes(data)
     tmp.replace(path)
+
+
+def copy_hashed(src: Path, dst: Path) -> str:
+    """Copy `src` to `dst` in chunks; the sha256 of exactly the bytes written."""
+    h = hashlib.sha256()
+    with src.open("rb") as r, dst.open("wb") as w:
+        for chunk in iter(lambda: r.read(1 << 20), b""):
+            h.update(chunk)
+            w.write(chunk)
+    return h.hexdigest()
 
 
 def load_json(path: Path):

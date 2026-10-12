@@ -20,6 +20,14 @@ pub trait Fetch: Send + Sync {
     /// which is how an optional `.zst` sibling is probed.
     fn get(&self, path: &str) -> Result<Option<Vec<u8>>>;
 
+    /// The same bytes as a stream, for a blob too large to hold in memory (a
+    /// checkpoint shard). Buffered through [`Fetch::get`] unless overridden.
+    fn open(&self, path: &str) -> Result<Option<Box<dyn std::io::Read + '_>>> {
+        Ok(self
+            .get(path)?
+            .map(|b| Box::new(std::io::Cursor::new(b)) as Box<dyn std::io::Read>))
+    }
+
     /// Human description, for error messages.
     fn describe(&self) -> String;
 }
@@ -43,6 +51,15 @@ impl Fetch for FileFetch {
         let p = self.root.join(path);
         match std::fs::read(&p) {
             Ok(b) => Ok(Some(b)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(source) => Err(RuntimeError::Io { path: p, source }),
+        }
+    }
+
+    fn open(&self, path: &str) -> Result<Option<Box<dyn std::io::Read + '_>>> {
+        let p = self.root.join(path);
+        match std::fs::File::open(&p) {
+            Ok(f) => Ok(Some(Box::new(std::io::BufReader::new(f)))),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(source) => Err(RuntimeError::Io { path: p, source }),
         }
@@ -84,6 +101,19 @@ impl Fetch for HttpFetch {
                     .map_err(|e| RuntimeError::Dist(format!("{url}: body read failed: {e}")))?;
                 Ok(Some(buf))
             }
+            Err(ureq::Error::Status(404, _)) => Ok(None),
+            Err(ureq::Error::Status(code, resp)) => Err(RuntimeError::Dist(format!(
+                "{url}: HTTP {code} {}",
+                resp.status_text()
+            ))),
+            Err(e) => Err(RuntimeError::Dist(format!("{url}: {e}"))),
+        }
+    }
+
+    fn open(&self, path: &str) -> Result<Option<Box<dyn std::io::Read + '_>>> {
+        let url = format!("{}/{path}", self.base.trim_end_matches('/'));
+        match self.agent.get(&url).call() {
+            Ok(resp) => Ok(Some(Box::new(resp.into_reader()))),
             Err(ureq::Error::Status(404, _)) => Ok(None),
             Err(ureq::Error::Status(code, resp)) => Err(RuntimeError::Dist(format!(
                 "{url}: HTTP {code} {}",
@@ -149,6 +179,45 @@ pub fn blob(f: &dyn Fetch, digest: &super::Digest) -> Result<Vec<u8>> {
     }
 }
 
+/// Fetch one blob straight into the store, never whole in memory: a
+/// checkpoint shard can be larger than the host's RAM. Same `.zst`-first rule
+/// as [`blob`]; [`super::Store::put_reader`] verifies the digest as it writes.
+pub fn blob_into(f: &dyn Fetch, digest: &super::Digest, store: &super::Store) -> Result<()> {
+    let plain = format!("v1/blobs/sha256/{digest}");
+    let zst = format!("{plain}.zst");
+    if let Some(compressed) = f.open(&zst)? {
+        let mut decoded = decoder(compressed, digest)?;
+        return store.put_reader(digest, &mut decoded).map(|_| ());
+    }
+    match f.open(&plain)? {
+        Some(mut r) => store.put_reader(digest, &mut r).map(|_| ()),
+        None => Err(RuntimeError::Dist(format!(
+            "{}: blob {digest} is not published (tried {zst} and {plain})",
+            f.describe()
+        ))),
+    }
+}
+
+#[cfg(feature = "dist")]
+fn decoder<'a>(
+    r: Box<dyn std::io::Read + 'a>,
+    digest: &super::Digest,
+) -> Result<Box<dyn std::io::Read + 'a>> {
+    zstd::stream::read::Decoder::new(r)
+        .map(|d| Box::new(d) as Box<dyn std::io::Read>)
+        .map_err(|e| RuntimeError::Dist(format!("blob {digest}: zstd stream is damaged: {e}")))
+}
+
+#[cfg(not(feature = "dist"))]
+fn decoder<'a>(
+    _r: Box<dyn std::io::Read + 'a>,
+    digest: &super::Digest,
+) -> Result<Box<dyn std::io::Read + 'a>> {
+    Err(RuntimeError::Dist(format!(
+        "blob {digest} is zstd-compressed and this plowrt was built without the `dist` feature"
+    )))
+}
+
 #[cfg(feature = "dist")]
 fn decompress(compressed: &[u8], digest: &super::Digest) -> Result<Vec<u8>> {
     zstd::stream::decode_all(compressed)
@@ -191,6 +260,28 @@ mod tests {
             f.get("v1/absent").unwrap().is_none(),
             "missing is None, not an error"
         );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(feature = "dist")]
+    #[test]
+    fn a_compressed_blob_streams_into_the_store_and_a_wrong_one_does_not() {
+        let root = tmp();
+        let bytes = vec![7u8; 3 << 20];
+        let d = Digest::of(&bytes);
+        let packed = zstd::stream::encode_all(&bytes[..], 3).unwrap();
+        std::fs::write(root.join(format!("v1/blobs/sha256/{d}.zst")), &packed).unwrap();
+        let store = super::super::Store::open(root.join("store")).unwrap();
+        let f = FileFetch::new(&root);
+        blob_into(&f, &d, &store).unwrap();
+        assert_eq!(store.get(&d).unwrap(), bytes);
+
+        // Published under a digest its content does not hash to: refused,
+        // and nothing is left under that name.
+        let lie = Digest::of(b"something else");
+        std::fs::write(root.join(format!("v1/blobs/sha256/{lie}")), &bytes).unwrap();
+        assert!(blob_into(&f, &lie, &store).is_err());
+        assert!(!store.has(&lie));
         let _ = std::fs::remove_dir_all(root);
     }
 

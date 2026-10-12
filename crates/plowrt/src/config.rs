@@ -2170,6 +2170,16 @@ impl RuntimeConfig {
         std::env::var(var).ok().filter(|value| !value.is_empty())
     }
 
+    /// `PLOW_PUBLISH_URL` and `PLOW_PUBLISH_KEY`: the registry `plowrt publish`
+    /// sends a build to and the API key it sends. Publish settings, not serve
+    /// knobs, so they have no flag here (`publish --to/--key` override them).
+    pub fn publish_env() -> (Option<String>, Option<String>) {
+        (
+            Self::env_nonempty("PLOW_PUBLISH_URL"),
+            Self::env_nonempty("PLOW_PUBLISH_KEY"),
+        )
+    }
+
     /// `PLOW_THROUGHPUT_K`: the decode quantum under the throughput objective (default 8); a
     /// packet's `serve.json` can carry the model's measured value.
     pub(crate) fn throughput_k() -> Option<u32> {

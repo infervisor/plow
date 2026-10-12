@@ -657,3 +657,227 @@ pub async fn status(State(state): State<Arc<AppState>>) -> Response {
     })
     .into_response()
 }
+
+/// One loadable bundle under a `--models-root`.
+#[derive(Debug, PartialEq, Eq, Serialize)]
+pub struct AvailableModel {
+    /// `<namespace>/<name>:<label>@g<n>` for a pin in a `$PLOW_HOME` store;
+    /// `None` for a plain assets directory.
+    #[serde(rename = "ref")]
+    pub reference: Option<String>,
+    /// The slug `POST /v1/models/load` registers it under when none is
+    /// given: the manifest's `served_name`, else its `network`.
+    pub model: String,
+    pub dir: PathBuf,
+    pub bytes: u64,
+    /// Registered in this server from this directory.
+    pub loaded: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AvailableResponse {
+    pub models: Vec<AvailableModel>,
+}
+
+/// `GET /v1/models/available` — the bundles under `--models-root` that
+/// `load` would accept, so a caller can offer a pulled model without knowing
+/// the node's disk layout. Scanned on every request: a `plowrt load` run
+/// beside the server shows up without a restart.
+pub async fn available(State(state): State<Arc<AppState>>) -> Response {
+    let registered: Vec<PathBuf> = state
+        .registry
+        .slugs()
+        .iter()
+        .filter_map(|s| state.registry.get(s).ok())
+        .filter_map(|b| b.dir.canonicalize().ok())
+        .collect();
+    let roots = state.models_roots().to_vec();
+    match tokio::task::spawn_blocking(move || scan_models_roots(&roots, &registered)).await {
+        Ok(models) => Json(AvailableResponse { models }).into_response(),
+        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e),
+    }
+}
+
+/// Every loadable bundle under `roots` (already canonical, as
+/// `install_models_roots` leaves them).
+///
+/// A root that is a `$PLOW_HOME` store (or its `bundles/`) lists its pins,
+/// with their refs; any other root lists itself and its immediate subdirectories that hold a
+/// `weights.json` the registry can read. Each candidate is canonicalized and
+/// must still sit under a root — the same test `resolve_assets` applies — so
+/// a symlink cannot advertise a directory `load` would then refuse.
+pub fn scan_models_roots(roots: &[PathBuf], registered: &[PathBuf]) -> Vec<AvailableModel> {
+    let mut found: Vec<(Option<String>, PathBuf, Option<u64>)> = Vec::new();
+    for root in roots {
+        if let Some(store) = store_of(root) {
+            if let Ok(store) = crate::dist::Store::open(store) {
+                for p in store.list() {
+                    found.push((Some(p.reference), p.dir, Some(p.bytes)));
+                }
+            }
+            continue;
+        }
+        found.push((None, root.clone(), None));
+        let Ok(rd) = std::fs::read_dir(root) else {
+            continue;
+        };
+        let mut children: Vec<PathBuf> = rd
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.is_dir())
+            .collect();
+        children.sort();
+        found.extend(children.into_iter().map(|p| (None, p, None)));
+    }
+
+    let mut out: Vec<AvailableModel> = Vec::new();
+    for (reference, dir, bytes) in found {
+        let Ok(dir) = dir.canonicalize() else {
+            continue;
+        };
+        if !roots.iter().any(|r| dir.starts_with(r)) || out.iter().any(|m| m.dir == dir) {
+            continue;
+        }
+        let Some(model) = served_slug(&dir) else {
+            continue;
+        };
+        out.push(AvailableModel {
+            reference,
+            model,
+            bytes: bytes.unwrap_or_else(|| dir_bytes(&dir)),
+            loaded: registered.contains(&dir),
+            dir,
+        });
+    }
+    out
+}
+
+/// The `$PLOW_HOME` store `root` is, or whose `bundles/` it is — the root
+/// `serve --model` adds, as the parent of the bundle it started with.
+fn store_of(root: &std::path::Path) -> Option<&std::path::Path> {
+    let is_store = |p: &std::path::Path| p.join("refs").is_dir() && p.join("bundles").is_dir();
+    if is_store(root) {
+        return Some(root);
+    }
+    root.parent()
+        .filter(|p| root.file_name() == Some("bundles".as_ref()) && is_store(p))
+}
+
+/// The slug `Registry::load` would give `dir`, or `None` when it has no
+/// readable `weights.json` and so could not be registered at all.
+fn served_slug(dir: &std::path::Path) -> Option<String> {
+    let m: plow_asset::Manifest = crate::asset::read_json(&dir.join("weights.json")).ok()?;
+    Some(m.served_name.unwrap_or(m.network))
+}
+
+/// Bytes of the regular files under `dir`. Symlinks are not followed: an
+/// assets directory links its `checkpoint` in, and the weights are not the
+/// bundle.
+fn dir_bytes(dir: &std::path::Path) -> u64 {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    rd.flatten()
+        .map(|e| match e.file_type() {
+            Ok(t) if t.is_dir() => dir_bytes(&e.path()),
+            Ok(t) if t.is_file() => e.metadata().map(|m| m.len()).unwrap_or(0),
+            _ => 0,
+        })
+        .sum()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tmp(tag: &str) -> PathBuf {
+        let p = std::env::temp_dir().join(format!("plow-available-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&p);
+        std::fs::create_dir_all(&p).unwrap();
+        p.canonicalize().unwrap()
+    }
+
+    fn weights(network: &str) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "network": network, "gpu": "Apple M4 Pro", "num_gpus": 1, "parallel": "tp",
+            "weight_shared": false, "buckets": []
+        }))
+        .unwrap()
+    }
+
+    /// A pin in a `$PLOW_HOME` store: the bundle `plowrt load` leaves.
+    fn pull_into(store_root: &std::path::Path, network: &str) -> PathBuf {
+        use crate::dist::{Digest, Store};
+        let st = Store::open(store_root).unwrap();
+        let w = weights(network);
+        let d = Digest::of(&w);
+        st.put(&d, &w).unwrap();
+        let dir = st
+            .materialize("vid0", &[("weights.json".into(), d)])
+            .unwrap();
+        let bundle = serde_json::json!({
+            "schema": plow_asset::dist::BUNDLE_SCHEMA, "namespace": "infervisor",
+            "name": network, "label": "metal3-apple-m4-pro-tp1-2k", "generation": 2,
+            "variant_id": "vid0", "plow_git": "0", "network": network,
+            "target": {"vendor": "apple", "isa": "metal3", "sku": "Apple M4 Pro",
+                       "units": 16, "mem_bytes": 1},
+            "parallel": {"mode": "tp", "n": 1}, "max_ctx": 2048, "files": [],
+            "tokenizer": {"source": "checkpoint", "file": "tokenizer.json"},
+            "checkpoint": {"source": "hf:Qwen/Qwen3-0.6B", "revision": "r", "shards": 1,
+                           "layout": "hf-safetensors", "bytes": 1}
+        });
+        st.record_bundle(&dir, &serde_json::from_value(bundle).unwrap())
+            .unwrap();
+        st.pin("file:///r/infervisor/qwen3-0.6b", "vid0").unwrap();
+        dir.canonicalize().unwrap()
+    }
+
+    #[test]
+    fn a_plain_root_lists_its_loadable_subdirectories_and_nothing_outside() {
+        let root = tmp("plain");
+        let outside = tmp("outside");
+        std::fs::create_dir_all(root.join("m1/hsaco")).unwrap();
+        std::fs::write(root.join("m1/weights.json"), weights("m1")).unwrap();
+        std::fs::write(root.join("m1/hsaco/a.elf"), [0u8; 10]).unwrap();
+        // The farm link is the checkpoint, not the bundle: not counted.
+        std::os::unix::fs::symlink(&outside, root.join("m1/checkpoint")).unwrap();
+        std::fs::create_dir_all(root.join("notamodel")).unwrap();
+        // A link out of the root is advertised nowhere: load would refuse it.
+        std::fs::write(outside.join("weights.json"), weights("escaped")).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("escape")).unwrap();
+
+        let m1 = root.join("m1");
+        let got = scan_models_roots(&[root.clone()], &[m1.clone()]);
+        let m1_bytes = weights("m1").len() as u64 + 10;
+        assert_eq!(
+            got,
+            vec![AvailableModel {
+                reference: None,
+                model: "m1".into(),
+                dir: m1,
+                bytes: m1_bytes,
+                loaded: true,
+            }]
+        );
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(outside);
+    }
+
+    #[test]
+    fn a_store_root_lists_its_pins_by_reference() {
+        let root = tmp("store");
+        let dir = pull_into(&root, "qwen3-0.6b");
+        let want = vec![AvailableModel {
+            reference: Some("infervisor/qwen3-0.6b:metal3-apple-m4-pro-tp1-2k@g2".into()),
+            model: "qwen3-0.6b".into(),
+            dir,
+            bytes: weights("qwen3-0.6b").len() as u64,
+            loaded: false,
+        }];
+        assert_eq!(scan_models_roots(&[root.clone()], &[]), want);
+        // `serve --model` adds the store's `bundles/` as a root.
+        assert_eq!(scan_models_roots(&[root.join("bundles")], &[]), want);
+        assert!(scan_models_roots(&[], &[]).is_empty(), "no roots, nothing");
+        let _ = std::fs::remove_dir_all(root);
+    }
+}

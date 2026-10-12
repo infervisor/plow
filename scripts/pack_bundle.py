@@ -161,13 +161,7 @@ def build(args) -> dict:
         "max_ctx": args.max_ctx,
         "files": files,
         "tokenizer": tokenizer,
-        "checkpoint": {
-            "source": f"hf:{args.hf}",
-            "revision": args.revision,
-            "shards": args.shards,
-            "layout": args.layout,
-            "bytes": args.checkpoint_bytes,
-        },
+        "checkpoint": build_checkpoint(args),
         "runtime_env": parse_env(args.serve_env),
     }
     if objset is not None:
@@ -182,6 +176,48 @@ def build(args) -> dict:
     if args.recipe:
         doc["recipe"] = args.recipe
     return doc
+
+
+def build_checkpoint(args) -> dict:
+    """The checkpoint the bundle is joined to: an `hf:` repository the node
+    fetches, or — with `--checkpoint-dir` — a `dist` checkpoint whose files
+    travel as blobs beside the bundle's, for a private or air-gapped model.
+    """
+    if not args.checkpoint_dir:
+        return {
+            "source": f"hf:{args.hf}",
+            "revision": args.revision,
+            "shards": args.shards,
+            "layout": args.layout,
+            "bytes": args.checkpoint_bytes,
+        }
+    root = Path(args.checkpoint_dir)
+    if not root.is_dir():
+        pd.die(f"--checkpoint-dir {root} is not a directory")
+    # The revision names the snapshot directory on the node: one path component.
+    if not args.revision or "/" in args.revision or args.revision in (".", ".."):
+        pd.die("--checkpoint-dir needs --revision <label>, usable as a directory name")
+    files = []
+    for p in sorted(root.rglob("*")):
+        rel = p.relative_to(root)
+        # Hidden entries are tool state (`.cache/huggingface/`), not the checkpoint.
+        if not p.is_file() or any(part.startswith(".") for part in rel.parts):
+            continue
+        files.append({"name": rel.as_posix(), "sha256": pd.sha256_file(p), "bytes": p.stat().st_size})
+    # `prepare` globs `*.safetensors` in the snapshot's top level only.
+    shards = sum(1 for f in files if "/" not in f["name"] and f["name"].endswith(".safetensors"))
+    if shards == 0:
+        pd.die(f"{root}: no top-level *.safetensors — that is not a checkpoint")
+    if args.shards and args.shards != shards:
+        pd.die(f"{root}: {shards} top-level safetensors shards, --shards says {args.shards}")
+    return {
+        "source": "dist",
+        "revision": args.revision,
+        "shards": shards,
+        "layout": args.layout,
+        "bytes": sum(f["bytes"] for f in files),
+        "files": files,
+    }
 
 
 def build_lowrung(specs) -> list:
@@ -253,6 +289,11 @@ def run() -> None:
     ap.add_argument("--network", help="serving slug; defaults to weights.json's")
     ap.add_argument("--label", help="variant label; derived from the target when omitted")
     ap.add_argument("--hf", help="<org>/<repo> on HuggingFace")
+    ap.add_argument(
+        "--checkpoint-dir",
+        help="carry the checkpoint in the distribution (source `dist`) instead of naming --hf: "
+        "every file under it becomes a blob; --revision is its version label",
+    )
     ap.add_argument("--revision", default="")
     ap.add_argument("--shards", type=int, default=0)
     ap.add_argument("--layout", default="hf-safetensors")
@@ -280,9 +321,11 @@ def run() -> None:
         print("pack_bundle selftest: PASS")
         return
 
-    for need in ("assets", "name", "hf"):
+    for need in ("assets", "name"):
         if not getattr(args, need):
             pd.die(f"--{need.replace('_', '-')} is required")
+    if bool(args.hf) == bool(args.checkpoint_dir):
+        pd.die("pass exactly one of --hf (fetched from Hugging Face) or --checkpoint-dir (distributed)")
     if args.plow_git is None:
         args.plow_git = pd.git_commit(Path(__file__).resolve().parent.parent)
 
@@ -352,6 +395,7 @@ def self_test() -> None:
             lowrung=None,
             recipe=None,
             plow_git="a" * 40,
+            checkpoint_dir=None,
         )
         doc = build(argparse.Namespace(**base))
         assert doc["network"] == "kimi-k3", "the slug comes from weights.json"
@@ -423,6 +467,36 @@ def self_test() -> None:
             raise AssertionError("accepted both --objset and --target-json")
         except pd.Fail:
             pass
+
+        # A distributed checkpoint lists every file, nested ones included, and
+        # counts its own top-level shards.
+        assert "files" not in doc["checkpoint"], "an hf: checkpoint lists no files"
+        ck = d / "ckpt"
+        (ck / "onnx").mkdir(parents=True)
+        (ck / ".cache").mkdir()
+        (ck / "model-00001-of-00002.safetensors").write_bytes(b"a" * 8)
+        (ck / "model-00002-of-00002.safetensors").write_bytes(b"b" * 8)
+        (ck / "config.json").write_text("{}")
+        (ck / "onnx" / "model.safetensors").write_bytes(b"c")
+        (ck / ".cache" / "lock").write_text("")
+        dist = dict(base, hf=None, checkpoint_dir=str(ck), shards=0)
+        doc = build(argparse.Namespace(**dist))
+        c = doc["checkpoint"]
+        assert c["source"] == "dist" and c["revision"] == "rev1" and c["shards"] == 2, c
+        names = [f["name"] for f in c["files"]]
+        assert names == [
+            "config.json",
+            "model-00001-of-00002.safetensors",
+            "model-00002-of-00002.safetensors",
+            "onnx/model.safetensors",
+        ], names
+        assert c["bytes"] == 2 + 8 + 8 + 1, c
+        for bad in (dict(dist, shards=3), dict(dist, revision=""), dict(dist, revision="a/b")):
+            try:
+                build(argparse.Namespace(**bad))
+                raise AssertionError(f"accepted {bad['shards']}, {bad['revision']!r}")
+            except pd.Fail:
+                pass
 
 
 main = pd.main_guard(run)
