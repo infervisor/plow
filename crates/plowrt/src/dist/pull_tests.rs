@@ -475,7 +475,17 @@ fn a_dist_checkpoint_is_pulled_as_blobs_and_linked_into_its_snapshot() {
         serde_json::to_vec(&elsewhere).unwrap(),
     )
     .unwrap();
-    std::os::unix::fs::symlink(&farm.dir, other.join("checkpoint")).unwrap();
+    // Its `--checkpoint` reached the snapshot through a symlink.
+    let alias = store.root().join("alias-to-snapshot");
+    std::os::unix::fs::symlink(&snap, &alias).unwrap();
+    let other_farm = store.root().join("other-farm");
+    std::fs::create_dir_all(&other_farm).unwrap();
+    std::os::unix::fs::symlink(
+        alias.join("model.safetensors"),
+        other_farm.join("model.safetensors"),
+    )
+    .unwrap();
+    std::os::unix::fs::symlink(&other_farm, other.join("checkpoint")).unwrap();
     std::fs::remove_dir_all(&dir).unwrap();
     store.gc().unwrap();
     assert!(

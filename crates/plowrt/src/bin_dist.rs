@@ -594,7 +594,16 @@ fn next_generation(
                     .as_ref()
                     .is_some_and(|m| m.concurrency == Some(c))
             });
-        if same_build(&published, &bundle) && status_kept && measure_kept {
+        let hf_kept = to
+            .hf
+            .is_none_or(|h| index.as_ref().is_some_and(|i| i.hf == h));
+        if same_build(&published, &bundle) && status_kept && measure_kept && hf_kept {
+            if to.description.is_some() {
+                println!(
+                    "note: --description was not applied; it is recorded with a new generation, \
+                     and this build is already published"
+                );
+            }
             println!(
                 "already published: {}/{}:{}@g{} is this build",
                 bundle.namespace, bundle.name, bundle.label, v.generation

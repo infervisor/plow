@@ -552,6 +552,9 @@ impl Store {
         // A bundle prepared with `--checkpoint` at some other snapshot links
         // into it through its farm without its manifest saying so: live too.
         let snapshots = self.root.join("snapshots");
+        // Compared resolved: a `--checkpoint` may reach a snapshot through a
+        // symlink, or the store root itself may be one.
+        let resolved_root = std::fs::canonicalize(&snapshots).unwrap_or_else(|_| snapshots.clone());
         if let Ok(bundles) = std::fs::read_dir(self.root.join("bundles")) {
             for bundle in bundles.flatten() {
                 let Ok(farm) = std::fs::read_link(bundle.path().join("checkpoint")) else {
@@ -561,8 +564,8 @@ impl Store {
                     continue;
                 };
                 for l in links.flatten() {
-                    if let Ok(target) = std::fs::read_link(l.path()) {
-                        if let Ok(rest) = target.strip_prefix(&snapshots) {
+                    if let Ok(target) = std::fs::canonicalize(l.path()) {
+                        if let Ok(rest) = target.strip_prefix(&resolved_root) {
                             if let Some(first) = rest.components().next() {
                                 live.insert(snapshots.join(first));
                             }
