@@ -751,6 +751,10 @@ enum Cmd {
         /// One line describing the model, for the registry's catalog.
         #[arg(long)]
         description: Option<String>,
+        /// `<org>/<repo>` on Hugging Face, the model's identity in the index.
+        /// Required for a `dist` checkpoint, which names none itself.
+        #[arg(long)]
+        hf: Option<String>,
         /// Measured decode throughput; required for `--status validated`.
         #[arg(long)]
         tok_s: Option<f64>,
@@ -1158,6 +1162,7 @@ async fn async_main(
             api_key,
             status,
             description,
+            hf,
             tok_s,
             concurrency,
         } => dist_cmd::report(dist_cmd::cmd_publish(
@@ -1171,6 +1176,7 @@ async fn async_main(
                 api_key: &api_key,
                 status: status.as_deref(),
                 description: description.as_deref(),
+                hf: hf.as_deref(),
                 tok_s,
                 concurrency,
             },

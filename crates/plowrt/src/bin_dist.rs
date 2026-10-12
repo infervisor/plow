@@ -499,6 +499,7 @@ pub struct PublishTo<'a> {
     pub api_key: &'a str,
     pub status: Option<&'a str>,
     pub description: Option<&'a str>,
+    pub hf: Option<&'a str>,
     pub tok_s: Option<f64>,
     pub concurrency: Option<u32>,
 }
@@ -525,6 +526,11 @@ pub fn cmd_publish(
         let Some(bundle) = next_generation(bundle_path, to.url)? else {
             return Ok(());
         };
+        if bundle.checkpoint.source == "dist" && to.hf.is_none() {
+            return Err(
+                "the bundle's checkpoint is `dist`: pass --hf <org>/<repo> for the index".into(),
+            );
+        }
         let bundle_out = dir.join("bundle.json");
         std::fs::write(&bundle_out, serde_json::to_vec_pretty(&bundle)?)?;
         let zip_path = dir.join("bundle.zip");
@@ -714,6 +720,9 @@ fn upload(
     }
     if let Some(d) = to.description {
         req = req.query("description", d);
+    }
+    if let Some(h) = to.hf {
+        req = req.query("hf", h);
     }
     if let Some(t) = to.tok_s {
         req = req.query("tok_s", &t.to_string());

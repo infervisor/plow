@@ -225,7 +225,8 @@ API key, so anyone with a key the registry accepts can submit a build:
 
 ```
 PLOW_API_KEY=… plowrt publish --bundle bundle.json --assets <dir> \
-  [--objset objset.json --objects <dir>] --to https://<registry>
+  [--objset objset.json --objects <dir>] [--checkpoint-dir <dir> --hf <org>/<repo>] \
+  --to https://<registry>
 ```
 
 Like `publish_dist.py`, it numbers the build against the live index: the
