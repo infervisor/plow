@@ -753,6 +753,80 @@ static __device__ __forceinline__ void d_qwen_gdn_conv_serial_channel(__nv_bfloa
     }
 }
 
+// One (8-channel group, 16-token tile) item of the width-4 fast path below.
+template <unsigned DEPTH>
+static __device__ __forceinline__ void d_qwen_gdn_conv4_tile(__nv_bfloat16* out,
+    const __nv_bfloat16* in, const __nv_bfloat16* weight, __nv_bfloat16* history,
+    unsigned channels, unsigned tokens, unsigned c0, unsigned tile) {
+    constexpr unsigned VT = 16, PD = DEPTH;
+    const unsigned t0 = tile * VT, t1 = min(t0 + VT, tokens), nt = t1 - t0;
+    float wf[4][8];
+#pragma unroll
+    for (int ch = 0; ch < 8; ch++) {
+        const __nv_bfloat16* w = weight + (size_t)(c0 + ch) * 4u;
+#pragma unroll
+        for (int j = 0; j < 4; j++) wf[j][ch] = __bfloat162float(w[j]);
+    }
+    float r0[8], r1[8], r2[8];
+    if (tile == 0) {
+#pragma unroll
+        for (int ch = 0; ch < 8; ch++) {
+            const __nv_bfloat16* h = history + (size_t)(c0 + ch) * 3u;
+            r0[ch] = __bfloat162float(h[0]);
+            r1[ch] = __bfloat162float(h[1]);
+            r2[ch] = __bfloat162float(h[2]);
+        }
+    } else {
+        qwen_bf_unpack8(*(const uint4*)(in + (size_t)(t0 - 3) * channels + c0), r0);
+        qwen_bf_unpack8(*(const uint4*)(in + (size_t)(t0 - 2) * channels + c0), r1);
+        qwen_bf_unpack8(*(const uint4*)(in + (size_t)(t0 - 1) * channels + c0), r2);
+    }
+    // Rolled groups of PD rows with the next group's loads in flight: unrolled, the
+    // 128 sigmoids of a tile were ~4000 straight-line instructions (64 KB) that every
+    // warp streamed once, and ncu put 46% of the light conv's warp stalls on
+    // instruction fetch (no_instruction; 61 us per 1024-row site against a ~14 us byte
+    // floor, flat in the grid size); rolled, the row loads showed (long_scoreboard 23%:
+    // the two blocks' warps load in lockstep). 1024-row site, light entry: 61 -> 43
+    // (rolled, 4 rows) -> 39 us (2 rows).
+    uint4 nx[PD];
+#pragma unroll
+    for (unsigned u = 0; u < PD; u++)
+        nx[u] = u < nt ? *(const uint4*)(in + (size_t)(t0 + u) * channels + c0)
+                       : make_uint4(0u, 0u, 0u, 0u);
+#pragma unroll 1
+    for (unsigned t = 0; t < VT; t += PD) {
+        if (t >= nt) break;
+        uint4 nn[PD];
+#pragma unroll
+        for (unsigned u = 0; u < PD; u++)
+            nn[u] = t + PD + u < nt ? *(const uint4*)(in + (size_t)(t0 + t + PD + u) * channels + c0)
+                                    : make_uint4(0u, 0u, 0u, 0u);
+#pragma unroll
+        for (unsigned u = 0; u < PD; u++) {
+            float x[8], o[8];
+            qwen_bf_unpack8(nx[u], x);
+#pragma unroll
+            for (int ch = 0; ch < 8; ch++) {
+                float sum = fmaf(r0[ch], wf[0][ch], 0.f);
+                sum = fmaf(r1[ch], wf[1][ch], sum);
+                sum = fmaf(r2[ch], wf[2][ch], sum);
+                sum = fmaf(x[ch], wf[3][ch], sum);
+                o[ch] = qwen_silu(sum);
+                r0[ch] = r1[ch]; r1[ch] = r2[ch]; r2[ch] = x[ch];
+            }
+            if (t + u < nt) *(uint4*)(out + (size_t)(t0 + t + u) * channels + c0) = qwen_bf_pack8(o);
+        }
+#pragma unroll
+        for (unsigned u = 0; u < PD; u++) nx[u] = nn[u];
+    }
+    if (tile == 0) {
+#pragma unroll
+        for (int j = 0; j < 3; j++)
+            for (int ch = 0; ch < 8; ch++)
+                history[(size_t)(c0 + ch) * 3u + j] = in[(size_t)(tokens + j - 3) * channels + c0 + ch];
+    }
+}
+
 // One sequence of `tokens` rows: taps before row 0 come from `history` (this slot's last
 // width-1 rows), which is rewritten from the sequence's last rows.
 // `DEPTH`: rows of the width-4 fast path per loop group, with the next group's rows loaded
@@ -780,77 +854,10 @@ static __device__ void d_qwen_gdn_conv_prefill_seq(__nv_bfloat16* out, const __n
         // tile) ran 83 vs 234 us at 4096 x 8192 and 24 vs 38 us at 1024 rows (one op, H100);
         // 8-token tiles were slower again. Same fmaf chain and sigmoid per output as the serial
         // walk below.
-        constexpr unsigned VT = 16, PD = DEPTH;
+        constexpr unsigned VT = 16;
         const unsigned cg = channels >> 3, ntiles = (tokens + VT - 1) / VT;
-        for (unsigned i = slice * blockDim.x + threadIdx.x; i < cg * ntiles; i += nblk * blockDim.x) {
-            const unsigned c0 = (i % cg) * 8u, tile = i / cg;
-            const unsigned t0 = tile * VT, t1 = min(t0 + VT, tokens), nt = t1 - t0;
-            float wf[4][8];
-#pragma unroll
-            for (int ch = 0; ch < 8; ch++) {
-                const __nv_bfloat16* w = weight + (size_t)(c0 + ch) * 4u;
-#pragma unroll
-                for (int j = 0; j < 4; j++) wf[j][ch] = __bfloat162float(w[j]);
-            }
-            float r0[8], r1[8], r2[8];
-            if (tile == 0) {
-#pragma unroll
-                for (int ch = 0; ch < 8; ch++) {
-                    const __nv_bfloat16* h = history + (size_t)(c0 + ch) * 3u;
-                    r0[ch] = __bfloat162float(h[0]);
-                    r1[ch] = __bfloat162float(h[1]);
-                    r2[ch] = __bfloat162float(h[2]);
-                }
-            } else {
-                qwen_bf_unpack8(*(const uint4*)(in + (size_t)(t0 - 3) * channels + c0), r0);
-                qwen_bf_unpack8(*(const uint4*)(in + (size_t)(t0 - 2) * channels + c0), r1);
-                qwen_bf_unpack8(*(const uint4*)(in + (size_t)(t0 - 1) * channels + c0), r2);
-            }
-            // Rolled groups of PD rows with the next group's loads in flight: unrolled, the
-            // 128 sigmoids of a tile were ~4000 straight-line instructions (64 KB) that every
-            // warp streamed once, and ncu put 46% of the light conv's warp stalls on
-            // instruction fetch (no_instruction; 61 us per 1024-row site against a ~14 us byte
-            // floor, flat in the grid size); rolled, the row loads showed (long_scoreboard 23%:
-            // the two blocks' warps load in lockstep). 1024-row site, light entry: 61 -> 43
-            // (rolled, 4 rows) -> 39 us (2 rows).
-            uint4 nx[PD];
-#pragma unroll
-            for (unsigned u = 0; u < PD; u++)
-                nx[u] = u < nt ? *(const uint4*)(in + (size_t)(t0 + u) * channels + c0)
-                               : make_uint4(0u, 0u, 0u, 0u);
-#pragma unroll 1
-            for (unsigned t = 0; t < VT; t += PD) {
-                if (t >= nt) break;
-                uint4 nn[PD];
-#pragma unroll
-                for (unsigned u = 0; u < PD; u++)
-                    nn[u] = t + PD + u < nt ? *(const uint4*)(in + (size_t)(t0 + t + PD + u) * channels + c0)
-                                            : make_uint4(0u, 0u, 0u, 0u);
-#pragma unroll
-                for (unsigned u = 0; u < PD; u++) {
-                    float x[8], o[8];
-                    qwen_bf_unpack8(nx[u], x);
-#pragma unroll
-                    for (int ch = 0; ch < 8; ch++) {
-                        float sum = fmaf(r0[ch], wf[0][ch], 0.f);
-                        sum = fmaf(r1[ch], wf[1][ch], sum);
-                        sum = fmaf(r2[ch], wf[2][ch], sum);
-                        sum = fmaf(x[ch], wf[3][ch], sum);
-                        o[ch] = qwen_silu(sum);
-                        r0[ch] = r1[ch]; r1[ch] = r2[ch]; r2[ch] = x[ch];
-                    }
-                    if (t + u < nt) *(uint4*)(out + (size_t)(t0 + t + u) * channels + c0) = qwen_bf_pack8(o);
-                }
-#pragma unroll
-                for (unsigned u = 0; u < PD; u++) nx[u] = nn[u];
-            }
-            if (tile == 0) {
-#pragma unroll
-                for (int j = 0; j < 3; j++)
-                    for (int ch = 0; ch < 8; ch++)
-                        history[(size_t)(c0 + ch) * 3u + j] = in[(size_t)(tokens + j - 3) * channels + c0 + ch];
-            }
-        }
+        for (unsigned i = slice * blockDim.x + threadIdx.x; i < cg * ntiles; i += nblk * blockDim.x)
+            d_qwen_gdn_conv4_tile<DEPTH>(out, in, weight, history, channels, tokens, (i % cg) * 8u, i / cg);
         return;
     }
     }
@@ -909,10 +916,37 @@ static __device__ void d_qwen_gdn_conv_prefill(__nv_bfloat16* out, const __nv_bf
         return;
     }
     const unsigned n = (unsigned)req[0];
+    unsigned tiles = 0;
     for (unsigned r = 0; r < n; r++) {
         const unsigned row0 = (unsigned)req[1 + 4 * r], len = (unsigned)req[2 + 4 * r];
-        const unsigned slot = (unsigned)req[3 + 4 * r];
         if (!len || row0 + len > tokens) { if (threadIdx.x == 0) __trap(); return; }
+        if (len + 1 >= width) tiles += (len + 15) / 16;
+    }
+    if constexpr (PF) {
+    if (width == 4 && (channels & 7u) == 0) {
+        // All requests' (tile, channel group) items in one pass: a pass per request left the grid
+        // ~30% busy on the 512 + 501-row ticks of 4K c32 serving (66 us per conv vs 39 for one
+        // 1013-row request). Same per-tile walk.
+        const unsigned cg = channels >> 3;
+        for (unsigned i = slice * blockDim.x + threadIdx.x; i < cg * tiles; i += nblk * blockDim.x) {
+            unsigned tile = i / cg, r = 0, len = 0;
+            for (;; r++) {
+                len = (unsigned)req[2 + 4 * r];
+                if (len + 1 < width) continue;
+                const unsigned nt = (len + 15) / 16;
+                if (tile < nt) break;
+                tile -= nt;
+            }
+            const unsigned row0 = (unsigned)req[1 + 4 * r], slot = (unsigned)req[3 + 4 * r];
+            d_qwen_gdn_conv4_tile<DEPTH>(out + (size_t)row0 * channels, in + (size_t)row0 * channels,
+                weight, history + (size_t)slot * channels * 3u, channels, len, (i % cg) * 8u, tile);
+        }
+        tiles = 0;
+    }
+    }
+    for (unsigned r = 0; tiles && r < n; r++) {
+        const unsigned row0 = (unsigned)req[1 + 4 * r], len = (unsigned)req[2 + 4 * r];
+        const unsigned slot = (unsigned)req[3 + 4 * r];
         if (len + 1 < width) continue;
         d_qwen_gdn_conv_prefill_seq<PF, DEPTH>(out + (size_t)row0 * channels, in + (size_t)row0 * channels, weight,
             history + (size_t)slot * channels * (width - 1), channels, width, len, slice, nblk);
