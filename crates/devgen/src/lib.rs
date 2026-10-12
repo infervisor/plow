@@ -8714,9 +8714,14 @@ pub fn run_verified(args: EmitArgs, verify: Option<VerifyHook>) {
     let mut emit_cfg = _emit_cfg.unwrap_or_else(emit_config::EmitConfig::from_env);
     apply_production_defaults(&mut emit_cfg, capabilities, &arch, tp, n_cu);
     let mut knob_caps = capabilities.caps();
+    // GLM-5.3-Flash nests the text geometry under `text_config`.
     if model_config
         .as_ref()
-        .and_then(|v| v.get("index_kpool")?.as_u64())
+        .and_then(|v| {
+            v.get("index_kpool")
+                .or_else(|| v.get("text_config")?.get("index_kpool"))?
+                .as_u64()
+        })
         .is_some_and(|k| k > 1)
     {
         knob_caps.push("indexer_pooled");

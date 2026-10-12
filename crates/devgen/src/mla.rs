@@ -101,6 +101,9 @@ pub(crate) struct GlmCfg {
     // (the dense MLA path), reusing the same emit as GLM below the crossover.
     has_dsa: bool,
     quark_mixed: bool,
+    // `swiglu_limit` (GLM-5.3-Flash: 10.0): every GLU is `silu(min(g, L)) * clamp(u, ±L)`. None =
+    // plain SiLU (GLM-5.2 / Kimi), byte-identical to the emit before the field existed.
+    swiglu_limit: Option<f32>,
 }
 impl GlmCfg {
     fn expert_shard_layout(&self) -> Option<packet::moe_ep::Moe2dLayout> {
@@ -466,6 +469,26 @@ fn cfg_glm(dir: &Path) -> GlmCfg {
     // tested for that use; what is missing is the wiring, because `kv_lora` currently reaches
     // the manifest only through `BlockDims`, not through the feature scan that builds
     // `requires`. See docs/amd/mla-arm-coverage-gfx942.md, hole 3.
+    if glm53 {
+        // The mHC emit hard-codes 4 streams, 20 Sinkhorn iterations and eps 1e-6
+        // (`declare_glm53`, `emit_glm53_hc_pre`), and the pooled indexer always compresses and
+        // appends the tail (`DsaPoolCompress`/`DsaPoolExpand`): refuse a checkpoint that says
+        // otherwise rather than emit the wrong model.
+        assert_eq!(v["mhc"].as_bool(), Some(true), "glm5_next requires mhc=true");
+        assert_eq!(v["hc_mult"].as_u64(), Some(4), "glm5_next mHC emit is n=4 streams only");
+        assert_eq!(
+            v["hc_sinkhorn_iters"].as_u64(),
+            Some(20),
+            "glm5_next mHC emit is 20 Sinkhorn iterations only"
+        );
+        let hc_eps = v["hc_eps"].as_f64().expect("glm5_next text_config.hc_eps");
+        assert!((hc_eps - 1e-6).abs() < 1e-12, "glm5_next mHC emit is hc_eps=1e-6 only");
+        assert!(
+            v["index_kpool_compress"].as_bool().unwrap_or(true)
+                && v["index_kpool_always_select_tail"].as_bool().unwrap_or(true),
+            "glm5_next pooled indexer emit always compresses and selects the tail"
+        );
+    }
     GlmCfg {
         layers: g("num_hidden_layers"),
         hidden: g("hidden_size"),
@@ -520,6 +543,15 @@ fn cfg_glm(dir: &Path) -> GlmCfg {
         },
         has_dsa: true, // GLM-5.2 (glm_moe_dsa) has the DSA lightning indexer.
         quark_mixed: v["quantization_config"]["quant_method"].as_str() == Some("quark"),
+        swiglu_limit: if glm53 {
+            Some(
+                v["swiglu_limit"]
+                    .as_f64()
+                    .expect("glm5_next text_config.swiglu_limit") as f32,
+            )
+        } else {
+            None
+        },
     }
 }
 
@@ -602,10 +634,15 @@ fn declare_glm53(b: &mut Builder, c: &GlmCfg, rows: u32, dbatch: u32, pos: u32) 
             // and the `dst.starts_with("kv.")` checks). A different prefix falls through to
             // checkpoint lookup and fails with "MISSING WEIGHT" -- matches k3.rs's own
             // "kv.{l}." convention for the identical declare_kda_state{,_db} call.
-            let state = if crate::emit_config::active().k3_kda_conv_step_db {
+            // One carried state per decode SLOT (`dbatch`), as k3_build_model sizes it: a
+            // batched decode program's rows are independent sequences (`seq_rows`), and a
+            // single-slot state would make every row read and write the same recurrence.
+            // The Conv3/state double-bank fusion is B1-only.
+            let slots = u64::from(dbatch.max(1));
+            let state = if crate::emit_config::active().k3_kda_conv_step_db && slots == 1 {
                 crate::kda::declare_kda_state_db(b, &kc, &format!("kv.{l}."), 1, pos)
             } else {
-                crate::kda::declare_kda_state(b, &kc, &format!("kv.{l}."), 1)
+                crate::kda::declare_kda_state(b, &kc, &format!("kv.{l}."), slots)
             };
             kda_s.push(Some(state));
         }
@@ -1643,6 +1680,7 @@ fn emit_glm_oproj_w8a8(
 
 fn emit_glm_shared_w8a8_glu(
     b: &mut Builder,
+    c: &GlmCfg,
     cus: &[u32],
     n: &GlmTn,
     w: &GlmLW,
@@ -1674,12 +1712,19 @@ fn emit_glm_shared_w8a8_glu(
         });
     b.emit(DevOp::Glu, elem_cus(cus, rows * inter), &halves, |d| {
         d.t[..3].copy_from_slice(&[n.shfu, n.sh_gate, n.shfu_up]);
-        d.i[..2].copy_from_slice(&[rows * inter, 5]); // BF16 SiLU result before the up multiply.
+        // 5 = BF16 SiLU result before the up multiply; the clamped form has no bf16-rounded twin.
+        let (act, limit) = match c.swiglu_limit {
+            Some(limit) => (packet::dev::ACT_SWIGLU_CLAMP, limit),
+            None => (5, 0.0),
+        };
+        d.i[..2].copy_from_slice(&[rows * inter, act]);
+        d.f[1] = limit;
     })
 }
 
 fn emit_glm_routed_w8a8(
     b: &mut Builder,
+    c: &GlmCfg,
     n: &GlmTn,
     w: &GlmLW,
     rows: u32,
@@ -1690,6 +1735,13 @@ fn emit_glm_routed_w8a8(
     norm: u32,
     aligned: u32,
 ) -> u32 {
+    // `MoeGluFp8Block128` carries no act code (SiLU in the kernel).
+    assert!(
+        c.swiglu_limit.is_none(),
+        "the routed W8A8 arm (MoeGluFp8Block128) has no clamped-SwiGLU epilogue; swiglu_limit={:?} \
+         needs the block-fp8 MoE arms",
+        c.swiglu_limit
+    );
     let all = b.all();
     let quant = b.emit(
         DevOp::QuantFp8Block128,
@@ -2049,6 +2101,26 @@ const GLM_ROUTER_FLAGS: u32 =
     router_flag::SIGMOID | router_flag::NORM_TOPK | router_flag::BIAS | router_flag::F32_LOGIT;
 /// Expert/shared GLU activation = SiLU (SwiGLU). Mirrors ACT in the B4 harness.
 const GLM_ACT_SILU: u32 = 1;
+
+/// `(act, f1)` for this checkpoint's GLUs: the clamped pair form when the config carries
+/// `swiglu_limit`, plain SiLU (and an untouched `f1`) otherwise.
+fn glm_glu_act(c: &GlmCfg) -> (u32, f32) {
+    match c.swiglu_limit {
+        Some(limit) => (packet::dev::ACT_SWIGLU_CLAMP, limit),
+        None => (GLM_ACT_SILU, 0.0),
+    }
+}
+
+/// The bf16 / MXFP4 GEMM and GEMV GLU epilogues are gate-only (`act_gate_only`,
+/// op_gemm_common.h) and poison the clamp code to NaN, so a clamped checkpoint must not reach them.
+fn glm_require_gate_only_act(c: &GlmCfg, op: DevOp) {
+    assert!(
+        c.swiglu_limit.is_none(),
+        "{op:?} cannot apply swiglu_limit={:?}: its GLU epilogue is gate-only; route this GLU \
+         through a block-fp8 or MoE pair-form op",
+        c.swiglu_limit
+    );
+}
 
 /// Per-layer GLM weights. Derived (absorbed / rope-folded) tensors are bf16 and named under a
 /// `.derived.` segment the host weight-prep writes; the block-fp8 projections, router, and experts
@@ -9017,7 +9089,7 @@ fn emit_glm_moe_ffn_prefill(
     let c_shglu = if fold {
         c_rn2
     } else if emit_config::active().glm_shared_w8a8 {
-        emit_glm_shared_w8a8_glu(b, &all, n, w, t, h, imoe_l, c_rn2)
+        emit_glm_shared_w8a8_glu(b, c, &all, n, w, t, h, imoe_l, c_rn2)
     } else if enc == MoeEnc::Mxfp4 && glu_fusion_wins_mxfp4(t, imoe_l, h, n_cu) {
         b.emit(DevOp::GemmGluMxfp4, all.clone(), &[c_rn2], |d| {
             d.t[0] = n.shfu;
@@ -9029,6 +9101,7 @@ fn emit_glm_moe_ffn_prefill(
             d.i[0] = t;
             d.i[1] = imoe_l;
             d.i[2] = h;
+            glm_require_gate_only_act(c, DevOp::GemmGluMxfp4);
             d.i[5] = GLM_ACT_SILU;
         })
     } else if enc == MoeEnc::Mxfp4 || lin_fp8 || shared_lt.is_some() {
@@ -9072,7 +9145,9 @@ fn emit_glm_moe_ffn_prefill(
             d.t[1] = n.shfu;
             d.t[2] = n.shfu_up;
             d.i[0] = t * imoe_l;
-            d.i[1] = GLM_ACT_SILU;
+            let (act, limit) = glm_glu_act(c);
+            d.i[1] = act;
+            d.f[1] = limit;
         })
     } else {
         b.emit(DevOp::GemmGlu, all.clone(), &[c_rn2], |d| {
@@ -9083,6 +9158,7 @@ fn emit_glm_moe_ffn_prefill(
             d.i[0] = t;
             d.i[1] = imoe_l;
             d.i[2] = h;
+            glm_require_gate_only_act(c, DevOp::GemmGlu);
             d.i[5] = GLM_ACT_SILU;
         })
     };
@@ -9123,7 +9199,7 @@ fn emit_glm_moe_ffn_prefill(
     //    have. i[3] picks the block-fp8 or bf16 weight arm from the same tables decode uses.
     let routed_w8a8 = emit_config::active().glm_routed_w8a8;
     let c_d = if routed_w8a8 {
-        emit_glm_routed_w8a8(b, n, w, t, h, imoe_e, e, tk, c_rn2, c_align)
+        emit_glm_routed_w8a8(b, c, n, w, t, h, imoe_e, e, tk, c_rn2, c_align)
     } else if native_moe {
         let aiter_deps = [c_align, c_rn2, c_shd];
         let aiter_deps = &aiter_deps[..2 + usize::from(seed)];
@@ -9176,7 +9252,9 @@ fn emit_glm_moe_ffn_prefill(
             d.i[1] = h;
             d.i[2] = e_all;
             d.i[MoeEnc::PREFILL_SLOT] = enc.code();
-            d.i[5] = GLM_ACT_SILU;
+            let (act, limit) = glm_glu_act(c);
+            d.i[5] = act;
+            d.f[1] = limit;
         });
         // 19 grouped down + gate-scale + SCATTER into part[T*k, H]. row_partidx carries each gathered
         //    row's fixed destination, so the align op's nondeterministic within-expert row ORDER does
@@ -9380,6 +9458,7 @@ fn emit_glm_dense_mxfp4_rows(
         b.emit(DevOp::GemmGluMxfp4, all.clone(), &[c_rn2], |d| {
             d.t[..6].copy_from_slice(&[n.dfu, n.xn2, w.dgate, w.dgate_s, w.dup_s, w.dup]);
             d.i[..3].copy_from_slice(&[rows, di_l, h]);
+            glm_require_gate_only_act(c, DevOp::GemmGluMxfp4);
             d.i[5] = GLM_ACT_SILU;
         })
     } else {
@@ -9399,7 +9478,9 @@ fn emit_glm_dense_mxfp4_rows(
         b.emit(DevOp::Glu, elem_cus(&all, rows * di_l), &[gate, up], |d| {
             d.t[..3].copy_from_slice(&[n.dfu, n.dfu, n.dfu_up]);
             d.i[0] = rows * di_l;
-            d.i[1] = GLM_ACT_SILU;
+            let (act, limit) = glm_glu_act(c);
+            d.i[1] = act;
+            d.f[1] = limit;
         })
     };
     let no_xr = c.tp > 1 && emit_config::active().no_xreduce;
@@ -9556,7 +9637,9 @@ fn emit_glm_dense_block_prefill(
         d.i[1] = h;
         d.i[2] = DENSE_N_EXP;
         d.i[MoeEnc::PREFILL_SLOT] = enc.code();
-        d.i[5] = GLM_ACT_SILU;
+        let (act, limit) = glm_glu_act(c);
+        d.i[5] = act;
+        d.f[1] = limit;
     });
     // down + scatter. Row-parallel (di_l input) => a PARTIAL [T,H] under TP. row_gate is all 1s, so
     // the DOWN op's unconditional gate multiply is the identity here.
@@ -9699,7 +9782,12 @@ fn mla_ckpt_enc(dir: &Path) -> Option<MoeEnc> {
         Some("glm5_next") | Some("kimi_k25") => root.get("text_config").unwrap_or(root),
         _ => root,
     };
-    let q = v.get("quantization_config")?;
+    // GLM-5.3-Flash keeps `quantization_config` at the ROOT of its wrapper config (the quantizer
+    // writes it beside `text_config`, with `modules_to_not_convert` spelled on the wrapper's module
+    // names), so the nested probe alone answers "unquantized" for a block-fp8 checkpoint.
+    let q = v
+        .get("quantization_config")
+        .or_else(|| root.get("quantization_config"))?;
     let method = q.get("quant_method").and_then(|m| m.as_str()).unwrap_or("");
     let fmt = q.get("fmt").and_then(|m| m.as_str()).unwrap_or("");
     // The block-fp8 the expert/dense arms implement: e4m3 with a [128,128] scale grid. The 128 is
@@ -10118,7 +10206,7 @@ fn emit_glm_moe_ffn_rows(
     let c_shglu = if dfold {
         c_routes
     } else if emit_config::active().glm_shared_w8a8 {
-        emit_glm_shared_w8a8_glu(b, &all, n, w, rows, h, imoe_l, c_rn2)
+        emit_glm_shared_w8a8_glu(b, c, &all, n, w, rows, h, imoe_l, c_rn2)
     } else if lin_fp8 {
         let gemv_half = |b: &mut Builder, out: u32, wt: u32, ws: u32| {
             b.emit(DevOp::GemvFp8Blk, all.clone(), &[c_rn2], |d| {
@@ -10139,7 +10227,9 @@ fn emit_glm_moe_ffn_rows(
             d.t[1] = n.shfu;
             d.t[2] = n.shfu_up;
             d.i[0] = rows * imoe_l;
-            d.i[1] = GLM_ACT_SILU;
+            let (act, limit) = glm_glu_act(c);
+            d.i[1] = act;
+            d.f[1] = limit;
         })
     } else if (rows as u64) * (h as u64) > crate::gm_lds_halves() {
         // TASK-9 FIT GATE, GemvGlu leg: gemv_glu_rows is in op_gemm.h's always-staged family
@@ -10186,7 +10276,9 @@ fn emit_glm_moe_ffn_rows(
             d.t[1] = n.shfu;
             d.t[2] = n.shfu_up;
             d.i[0] = rows * imoe_l;
-            d.i[1] = GLM_ACT_SILU;
+            let (act, limit) = glm_glu_act(c);
+            d.i[1] = act;
+            d.f[1] = limit;
         })
     } else {
         let shglu_op = if enc == MoeEnc::Mxfp4 {
@@ -10206,6 +10298,7 @@ fn emit_glm_moe_ffn_rows(
             d.i[0] = rows;
             d.i[1] = imoe_l;
             d.i[2] = h;
+            glm_require_gate_only_act(c, DevOp::GemvGlu);
             d.i[5] = GLM_ACT_SILU;
         })
     };
@@ -10266,7 +10359,7 @@ fn emit_glm_moe_ffn_rows(
 
     let routed_w8a8 = emit_config::active().glm_routed_w8a8;
     let c_d = if routed_w8a8 {
-        emit_glm_routed_w8a8(b, n, w, rows, h, imoe_e, e, tk, c_rn2, c_routes)
+        emit_glm_routed_w8a8(b, c, n, w, rows, h, imoe_e, e, tk, c_rn2, c_routes)
     } else if flat {
         let counter = b.emit(DevOp::MoeAiterFp8Pf, one.clone(), &[c_routes, c_rn2], |d| {
             d.t = [
@@ -10299,7 +10392,9 @@ fn emit_glm_moe_ffn_rows(
             d.i[1] = h;
             d.i[2] = e_route;
             d.i[MoeEnc::PREFILL_SLOT] = enc.code();
-            d.i[5] = GLM_ACT_SILU;
+            let (act, limit) = glm_glu_act(c);
+            d.i[5] = act;
+            d.f[1] = limit;
         });
         b.emit(DevOp::MoeGroupDownPf, all.clone(), &[c_g], |d| {
             d.t[0] = n.part;
@@ -10586,7 +10681,7 @@ pub(crate) fn emit_glm_moe_ffn(
     // same operand slots (t2/t5 weights, t3/t4 grids on 47; t5 grid on 44) and same i[] meanings.
     // Op 47 is i0=N i1=K where GemvGlu is i0=M i1=N i2=K, which is why this is a separate emit.
     let c_shglu = if emit_config::active().glm_shared_w8a8 {
-        emit_glm_shared_w8a8_glu(b, &shared_cus, n, w, 1, h, imoe_l, c_rn2)
+        emit_glm_shared_w8a8_glu(b, c, &shared_cus, n, w, 1, h, imoe_l, c_rn2)
     } else if glu_split {
         // GLM_SHARED_GLU_SPLIT (see `glm_shared_glu_split`): op 47 leaves 192 of 256 workgroups
         // empty at N=imoe_l and keeps one load in flight per wave. Run gate and up as two
@@ -10617,7 +10712,9 @@ pub(crate) fn emit_glm_moe_ffn(
             d.t[1] = n.shfu;
             d.t[2] = n.shfu_up;
             d.i[0] = imoe_l;
-            d.i[1] = GLM_ACT_SILU;
+            let (act, limit) = glm_glu_act(c);
+            d.i[1] = act;
+            d.f[1] = limit;
         })
     } else if lin_fp8 {
         b.emit(DevOp::DenseGluFp8Blk, shared_cus.clone(), &[c_rn2], |d| {
@@ -10629,7 +10726,9 @@ pub(crate) fn emit_glm_moe_ffn(
             d.t[4] = w.shu_s;
             d.i[0] = imoe_l;
             d.i[1] = h;
-            d.i[5] = GLM_ACT_SILU;
+            let (act, limit) = glm_glu_act(c);
+            d.i[5] = act;
+            d.f[1] = limit;
         })
     } else {
         let shglu_op = if enc == MoeEnc::Mxfp4 {
@@ -10649,6 +10748,7 @@ pub(crate) fn emit_glm_moe_ffn(
             d.i[0] = 1;
             d.i[1] = imoe_l;
             d.i[2] = h;
+            glm_require_gate_only_act(c, DevOp::GemvGlu);
             d.i[5] = GLM_ACT_SILU;
         })
     };
@@ -10711,7 +10811,9 @@ pub(crate) fn emit_glm_moe_ffn(
             d.i[1] = imoe_e;
             d.i[2] = h;
             d.i[3] = e;
-            d.i[5] = GLM_ACT_SILU;
+            let (act, limit) = glm_glu_act(c);
+            d.i[5] = act;
+            d.f[1] = limit;
             d.i[MoeEnc::DECODE_SLOT] = enc.code(); // NOT the prefill slot — see MoeEnc::DECODE_SLOT
         });
         let c_d = b.emit(DevOp::MoeGroupDownFp8Blk, all.clone(), &[c_g], |d| {
@@ -10759,7 +10861,9 @@ pub(crate) fn emit_glm_moe_ffn(
                 d.i[1] = imoe_e;
                 d.i[2] = h;
                 d.i[3] = e;
-                d.i[5] = GLM_ACT_SILU;
+                let (act, limit) = glm_glu_act(c);
+                d.i[5] = act;
+                d.f[1] = limit;
                 d.i[MoeEnc::DECODE_SLOT] = enc.code();
             });
             let c_d = b.emit(down_op, ecus, &[c_g], |d| {
@@ -10936,6 +11040,7 @@ pub(crate) fn emit_glm_dense_ffn(
             d.i[0] = 1;
             d.i[1] = di_l;
             d.i[2] = h;
+            glm_require_gate_only_act(c, DevOp::GemvGlu);
             d.i[5] = GLM_ACT_SILU;
         })
     } else if enc == MoeEnc::Mxfp4 {
@@ -10949,6 +11054,7 @@ pub(crate) fn emit_glm_dense_ffn(
             d.i[0] = 1;
             d.i[1] = di_l;
             d.i[2] = h;
+            glm_require_gate_only_act(c, DevOp::GemvGluMxfp4);
             d.i[5] = GLM_ACT_SILU;
         })
     } else {
@@ -10961,7 +11067,9 @@ pub(crate) fn emit_glm_dense_ffn(
             d.t[4] = w.dup_s;
             d.i[0] = di_l;
             d.i[1] = h;
-            d.i[5] = GLM_ACT_SILU;
+            let (act, limit) = glm_glu_act(c);
+            d.i[5] = act;
+            d.f[1] = limit;
         })
     };
     // dense down (block-fp8 GEMV, op 44) — row-parallel (di_l input). Under TP writes a PARTIAL into
@@ -11128,7 +11236,9 @@ fn emit_glm_dense_ffn_rows(
         d.i[1] = h;
         d.i[2] = DENSE_N_EXP;
         d.i[MoeEnc::PREFILL_SLOT] = enc.code();
-        d.i[5] = GLM_ACT_SILU;
+        let (act, limit) = glm_glu_act(c);
+        d.i[5] = act;
+        d.f[1] = limit;
     });
     let c_d = b.emit(DevOp::MoeGroupDownPf, all.clone(), &[c_g], |d| {
         d.t[0] = n.part;

@@ -2303,6 +2303,10 @@ pub const ACT_ROUND_BF16: u32 = 18;
 /// GLU-family `act` code for GPT-OSS's `swiglu_oai` (pair form, `f0 = alpha`, `f1 = limit`).
 /// Codes 0/1/2 are gelu_tanh / silu / situ; see [`DevOp::Glu`].
 pub const ACT_SWIGLU_OAI: u32 = 3;
+/// GLU-family `act` code for the clamped SwiGLU `silu(min(g, L)) * clamp(u, ±L)` (pair form,
+/// `f1 = L`): DeepSeek-V4 and GLM-5.3-Flash `swiglu_limit`. Only the pair-form epilogues
+/// (`moe_glu`, `act_glu_pair`) serve it; the gate-only GEMM/GEMV GLU epilogues poison it to NaN.
+pub const ACT_SWIGLU_CLAMP: u32 = 4;
 /// [`DevOp::HeadNormRope`] `i5 = pair_mode`: force half-split (NeoX) pairing at every `hd`.
 pub const ROPE_PAIR_HALF: u32 = 2;
 /// [`DevOp::HeadNormRope`] `i5 = pair_mode`: the DSA indexer key prep (PLOW_DSA_PREP) — LayerNorm

@@ -1,0 +1,75 @@
+# GLM-5.3-Flash (glm5_next: 34 KDA + 11 NoPE sparse-MLA layers, mHC, 288x8 MoE) on 8x MI350X.
+#
+# The devblob emitter is `mla::glm53_emit_full` (crates/devgen/src/mla.rs). This file records
+# the configuration a packet is built from; `scripts/check_recipe.py` asserts it against what a
+# build produced. Status `emits`: it compiles, builds objects and loads; the correctness and
+# serving gates below are what promote it. See plans/glm53-flash-dsv41-mi350x.md for the campaign.
+
+schema = "plow.recipe.v1"
+namespace = "infervisor"
+name = "glm-5.3-flash"
+label = "gfx950-mi350x-tp8-16k-fp8"
+network = "glm-5.3-flash"
+status = "emits"
+plow_git = "9f1ca46899b2f0297a022beb1046ba53f2976734"
+doc = "docs/amd/glm53-flash-mi350x.md"
+
+[target]
+vendor = "amd"
+isa = "gfx950"
+sku = "MI350X"
+units = 256
+num_gpus = 8
+parallel = "tp"
+max_ctx = 16384
+toolchain = "rocm-7.14.1-nix"
+
+# The PREPPED directory: the snapshot symlinked plus `zz-plow-glm53-derived.safetensors`, which
+# carries the absorbed MLA weights (`derived.q_absorb` / `v_absorb` / `kv_a_latent`, bf16), the
+# f32 mHC `hc_*_fn`, the f32 KDA conv/o_norm, the f32 indexer `weights_proj` / `ape` and the
+# bf16-dequantised shared experts. Routed experts, dense FFNs and the MLA projections stay
+# block-FP8 e4m3 [128,128] from the snapshot (`quantization_config` at the root of config.json).
+[checkpoint]
+source = "hf:zai-org/GLM-5.3-Flash"
+shards = 62
+layout = "plow-glm53-flash"
+
+[tokenizer]
+source = "checkpoint"
+
+[[prepare]]
+tool = "scripts/glm53_prep.py"
+shell = "nix develop .#quantize"
+args = ["--model", "$CKPT", "--out", "$WORK/glm53-flash-prepped"]
+produces = ["zz-plow-glm53-derived.safetensors"]
+
+# The objects take the packet's `plow_config.h` (PLOW_HSACO_CONFIG): `PLOW_K3` and the eight
+# GLM-5.3-Flash opcodes (HyperConnPre/Post, DsaPool*, DsaQQuant, IndexScoreKpool, GemvF32) are
+# derived from the packet's feature scan, not set here.
+[objects]
+script = "scripts/build_gfx950.sh"
+env = { PLOW_DECODE_BATCH = "1", JOBS = "32" }
+
+# Decode ladder is 1 until the pooled-DSA batched-decode arm exists (mla.rs refuses
+# `index_kpool > 1` with rows > 1 once the sparse arm is armed); below the 64k DSA crossover
+# the dense MLA path serves, so this packet is dense-attention at every rung.
+[emit]
+env = { PLOW_MLA_PREFILL = "full:128,512,2048,8192", PLOW_DECODE_BATCH_LADDER = "1", PLOW_GLM_DSA = "0" }
+args = [
+  "--emit", "devblob",
+  "--arch", "gfx950",
+  "--gpu", "MI350X",
+  "--num-gpus", "8",
+  "--parallel", "tp",
+  "--max-ctx", "16384",
+  "--n-cu", "256",
+]
+
+# Prefix cache off: AMD's shared prefix pool is gfx942-only and the KDA state has no per-slot
+# snapshot yet. State clear so a reused slot never inherits a previous sequence's recurrence.
+[serve]
+env = { PLOW_PREFIX_CACHE = "0", PLOW_STATE_CLEAR_DEVICE = "1", PLOW_TP_AGREE_EVERY = "1" }
+
+[[gates]]
+name = "smoke"
+cmd = "scripts/serve_test/smoke.sh"

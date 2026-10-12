@@ -1251,6 +1251,7 @@ fn glm_ref_cfg() -> GlmCfg {
         softmax_layers: vec![],
         has_dsa: true,
         quark_mixed: false,
+        swiglu_limit: None,
     }
 }
 
@@ -4533,6 +4534,7 @@ fn glm53_ref_cfg() -> GlmCfg {
         softmax_layers: vec![false, false], // both layers KDA, no MLA layer needed here
         has_dsa: false,
         quark_mixed: false,
+        swiglu_limit: None,
     }
 }
 
@@ -8172,4 +8174,61 @@ fn glm_mla_strided_wv_preserves_bf16_boundary_and_rung_domain() {
         assert_eq!(p.insts[merge + 1].op, DevOp::MlaBmmFp8 as u16);
         assert_eq!(p.insts[merge + 1].i, [rows, 8, 256, 512, 0, stride, 0, 0]);
     }
+}
+
+/// GLM-5.3-Flash keeps `quantization_config` beside `text_config`, not inside it, and carries
+/// `swiglu_limit`: the cfg must see block-fp8 experts and the clamped GLU, and the dense FFN
+/// must emit the clamp code with the limit in `f1` (GLM-5.2 stays on SiLU, `f1` untouched).
+#[test]
+fn glm5_next_cfg_reads_root_quantization_and_clamped_swiglu() {
+    let _guard = crate::test_env::env_guard();
+    let dir = std::env::temp_dir().join(format!("plow-glm5-next-cfg-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let config = serde_json::json!({
+        "model_type": "glm5_next",
+        "quantization_config": {"quant_method": "fp8", "fmt": "e4m3",
+                                "activation_scheme": "dynamic", "weight_block_size": [128, 128]},
+        "text_config": {
+            "model_type": "glm5_next_text", "num_hidden_layers": 2,
+            "hidden_size": 4096, "num_attention_heads": 64,
+            "kv_lora_rank": 512, "q_lora_rank": 1536,
+            "qk_nope_head_dim": 256, "qk_rope_head_dim": 0, "v_head_dim": 256,
+            "mla_use_nope": true, "vocab_size": 128, "rms_norm_eps": 1e-5,
+            "n_routed_experts": 288, "num_experts_per_tok": 8,
+            "moe_intermediate_size": 2048, "intermediate_size": 12288,
+            "first_k_dense_replace": 2, "routed_scaling_factor": 2.5,
+            "swiglu_limit": 10.0, "index_kpool": 4,
+            "mhc": true, "hc_mult": 4, "hc_sinkhorn_iters": 20, "hc_eps": 1e-6,
+            "linear_attn_config": {"full_attn_layers": [1]}
+        }
+    });
+    std::fs::write(dir.join("config.json"), config.to_string()).unwrap();
+    let c = cfg_glm(&dir);
+    assert_eq!(c.swiglu_limit, Some(10.0));
+    assert_eq!(c.prefix, "model.language_model.");
+    assert_eq!(c.softmax_layers, vec![false, true]);
+    assert_eq!(mla_ckpt_enc(&dir), Some(MoeEnc::Fp8Blk));
+    assert_eq!(glm_glu_act(&c), (packet::dev::ACT_SWIGLU_CLAMP, 10.0));
+
+    let mut b = Builder::new(256);
+    let n = declare_glm_rows_batched(&mut b, &c, 1, &[0], 1, 1, MoeEnc::Fp8Blk);
+    let all = b.all();
+    let norm = b.emit(DevOp::RmsNorm, all.clone(), &[], |d| {
+        d.t[0] = n.xn2;
+        d.t[1] = n.x;
+        d.t[2] = n.lw[0].gpost;
+        d.i[0] = 1;
+        d.i[1] = c.hidden;
+        d.f[0] = c.eps;
+    });
+    emit_glm_dense_ffn(&mut b, &c, &n, 0, 1, MoeEnc::Fp8Blk, n.xnext, norm, &mut 0, &all, false);
+    let p = b.finish();
+    let glu = p
+        .insts
+        .iter()
+        .find(|d| d.op == DevOp::DenseGluFp8Blk as u16)
+        .expect("block-fp8 dense GLU");
+    assert_eq!(glu.i[5], packet::dev::ACT_SWIGLU_CLAMP);
+    assert_eq!(glu.f[1], 10.0);
+    std::fs::remove_dir_all(&dir).ok();
 }

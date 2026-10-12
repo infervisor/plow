@@ -48,6 +48,7 @@ fn kimi_ref_cfg() -> GlmCfg {
         softmax_layers: vec![],
         has_dsa: false,
         quark_mixed: false,
+        swiglu_limit: None,
     }
 }
 

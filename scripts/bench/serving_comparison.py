@@ -126,8 +126,22 @@ def gpus():
     try:
         names = subprocess.run(cmd, capture_output=True, text=True, timeout=60, check=True).stdout.split("\n")
     except (OSError, subprocess.SubprocessError):
-        return None, None
+        return amd_gpus()
     names = [n.strip() for n in names if n.strip()]
+    return (" + ".join(sorted(set(names))), len(names)) if names else (None, None)
+
+
+def amd_gpus():
+    """(market name, count) from amd-smi, honoring ROCR_VISIBLE_DEVICES / HIP_VISIBLE_DEVICES."""
+    cmd = ["amd-smi", "static", "--asic", "--json"]
+    visible = os.environ.get("ROCR_VISIBLE_DEVICES") or os.environ.get("HIP_VISIBLE_DEVICES")
+    if visible:
+        cmd += ["-g", *visible.split(",")]
+    try:
+        out = subprocess.run(cmd, capture_output=True, text=True, timeout=60, check=True).stdout
+        names = [g["asic"]["market_name"] for g in json.loads(out)["gpu_data"]]
+    except (OSError, subprocess.SubprocessError, ValueError, KeyError, TypeError):
+        return None, None
     return (" + ".join(sorted(set(names))), len(names)) if names else (None, None)
 
 

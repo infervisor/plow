@@ -8,9 +8,11 @@
 
 mod deepseek;
 mod deepseek_v4;
+mod deepseek_v41;
 mod gemma;
 mod gemma4_multimodal;
 mod glm;
+mod glm5_next;
 mod kimi;
 mod kimi_k3;
 mod llama;
@@ -27,9 +29,16 @@ pub use deepseek::DeepSeekConfig;
 pub use deepseek_v4::{
     DeepSeekV4Config, DeepSeekV4QuantizationConfig, DeepSeekV4RopeScaling, V4Attn, MXFP4_GROUP,
 };
+pub use deepseek_v41::{
+    DeepSeekV41Config, DeepSeekV41QuantizationConfig, DeepSeekV41TextConfig, V41Attn,
+};
 pub use gemma::{GemmaConfig, RopeParameters, RopeSpec};
 pub use gemma4_multimodal::{Gemma4MultimodalConfig, MmProjectorConfig};
 pub use glm::GlmConfig;
+pub use glm5_next::{
+    Glm5NextConfig, Glm5NextLayer, Glm5NextLinearAttnConfig, Glm5NextQuantizationConfig,
+    Glm5NextTextConfig,
+};
 pub use kimi::KimiConfig;
 pub use kimi_k3::{K3Layer, KimiK3Config, KimiK3TextConfig, LinearAttnConfig};
 pub use llama::LlamaConfig;
@@ -76,6 +85,12 @@ pub enum ModelConfig {
     /// 512-wide latent, a grouped output LoRA, MXFP4 routed experts beside
     /// block-FP8 projections, and an attached DSpark speculative module.
     DeepSeekV4(DeepSeekV4Config),
+    /// DeepSeek-V4.1-Flash: V4's block under a CED/CSA2 schedule (cross-layer
+    /// KV/index sharing, ratio 1/2 compressors), block-32 fp8, engram tables.
+    DeepSeekV41(DeepSeekV41Config),
+    /// GLM-5.3-Flash: hybrid KDA / NoPE sparse-MLA, mHC residuals, pooled
+    /// indexer, clamped-SwiGLU MoE. Served by the devblob emitter, not nn-graph.
+    Glm5Next(Glm5NextConfig),
     Siglip(SiglipConfig),
     QwenVl(QwenVlVisionConfig),
     QwenImageDit(QwenImageDitConfig),
@@ -195,6 +210,8 @@ impl ModelConfig {
             "qwen3_5_text" => parse_qwen35(v),
             "deepseek" | "deepseek_v2" | "deepseek_v3" => parse_deepseek(v),
             "deepseek_v4" => parse_deepseek_v4(v),
+            "deepseek_v41" => parse_deepseek_v41(v),
+            "deepseek_v41_text" => parse_deepseek_v41(wrap_text_config(v)),
             "muse_glimmer" | "muse_glimmer_text" | "muse_glimmer_vision" => {
                 Err(ConfigError::Unsupported(
                     "muse_glimmer (Muse Glimmer text uses alternating sliding/NoPE attention, \
@@ -203,6 +220,10 @@ impl ModelConfig {
                         .to_string(),
                 ))
             }
+            // Claimed BY NAME: the `Glm*` architecture prefix would otherwise
+            // hand GLM-5.3-Flash to the glm_moe_dsa MLA builder.
+            "glm5_next" => parse_glm5_next(v),
+            "glm5_next_text" => parse_glm5_next(wrap_text_config(v)),
             "glm_moe_dsa" | "glm" | "glm4" => {
                 let cfg: GlmConfig = serde_json::from_value(v)?;
                 cfg.validate()?;
@@ -274,6 +295,38 @@ fn parse_deepseek_v4(v: serde_json::Value) -> Result<ModelConfig, ConfigError> {
     Ok(ModelConfig::DeepSeekV4(cfg))
 }
 
+fn parse_deepseek_v41(v: serde_json::Value) -> Result<ModelConfig, ConfigError> {
+    let cfg: DeepSeekV41Config = serde_json::from_value(v)?;
+    cfg.validate()?;
+    Ok(ModelConfig::DeepSeekV41(cfg))
+}
+
+fn parse_glm5_next(v: serde_json::Value) -> Result<ModelConfig, ConfigError> {
+    let cfg: Glm5NextConfig = serde_json::from_value(v)?;
+    cfg.validate()?;
+    Ok(ModelConfig::Glm5Next(cfg))
+}
+
+/// A bare text tower (what `build_text_generation_from_config_json_at` hands
+/// over, with the root `dtype` / `quantization_config` already lifted into
+/// it): re-wrap so there is one wrapper shape to validate, with those root
+/// fields hoisted back and `vision_config` unambiguously absent.
+fn wrap_text_config(text: serde_json::Value) -> serde_json::Value {
+    let mut root = serde_json::Map::new();
+    for key in [
+        "quantization_config",
+        "dtype",
+        "torch_dtype",
+        "image_token_id",
+    ] {
+        if let Some(value) = text.get(key) {
+            root.insert(key.into(), value.clone());
+        }
+    }
+    root.insert("text_config".into(), text);
+    serde_json::Value::Object(root)
+}
+
 fn parse_deepseek(v: serde_json::Value) -> Result<ModelConfig, ConfigError> {
     let cfg: DeepSeekConfig = serde_json::from_value(v)?;
     cfg.validate().map_err(ConfigError::Unsupported)?;
@@ -298,8 +351,10 @@ fn model_type(v: &serde_json::Value) -> Option<String> {
         .and_then(|a| a.as_str())?;
     let mapped = match arch {
         a if a.starts_with("Gemma") => "gemma3",
+        a if a.starts_with("DeepseekV41") => "deepseek_v41",
         a if a.starts_with("DeepseekV4") => "deepseek_v4",
         a if a.starts_with("DeepseekV3") || a.starts_with("DeepseekV2") => "deepseek_v3",
+        a if a.starts_with("Glm5Next") => "glm5_next",
         a if a.starts_with("GlmMoeDsa") || a.starts_with("Glm") => "glm_moe_dsa",
         // `KimiLinear*` is Kimi-K3, NOT K2, and the two share almost no
         // geometry: K3 runs KDA (linear attention) on 69 of its 93 layers, a
