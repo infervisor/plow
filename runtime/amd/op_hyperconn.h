@@ -193,9 +193,21 @@ __device__ void d_hyperconn_pre(float* __restrict__ post_mix, float* __restrict_
         /* Reduction 1 (full workgroup): sum of squares of `residual`, over n*hidden — this
          * scales the LOGITS (`mixes`), not `residual` itself; see mhc_pre_torch. */
         float ss = 0.0f;
-        for (unsigned i = threadIdx.x; i < nh; i += PLOW_THREADS) {
-            const float x = bf2f(rrow[i]);
-            ss += x * x;
+        if ((nh & 7u) == 0u) {
+            /* 16 B loads: the 2 B walk was 64 dependent-looking scalar loads per thread. */
+            for (unsigned i = threadIdx.x * 8u; i < nh; i += PLOW_THREADS * 8u) {
+                const bf16v8 v = ld_glob8(rrow + i);
+#pragma unroll
+                for (unsigned e = 0; e < 8; e++) {
+                    const float x = bf2f(v[e]);
+                    ss += x * x;
+                }
+            }
+        } else {
+            for (unsigned i = threadIdx.x; i < nh; i += PLOW_THREADS) {
+                const float x = bf2f(rrow[i]);
+                ss += x * x;
+            }
         }
         const float inv = rsqrtf(block_sum(ss, part) / (float)nh + rms_eps);
 
@@ -284,10 +296,32 @@ __device__ void d_hyperconn_pre(float* __restrict__ post_mix, float* __restrict_
          * scalar per stream, broadcast from LDS): layer_input[d] = sum_i pre_mix[i] *
          * residual[i][d], parallel over d. UNNORMED — the caller chains a plain RmsNorm
          * with the block's real layernorm weight afterward, same as KDA's `prenormed`. */
-        for (unsigned d = threadIdx.x; d < hidden; d += PLOW_THREADS) {
-            float acc = 0.0f;
-            for (unsigned i = 0; i < n; i++) acc += logits[i] * bf2f(rrow[(size_t)i * hidden + d]);
-            layer_input[(size_t)t * hidden + d] = f2bf(acc);
+        if (n == 4u && (hidden & 7u) == 0u) {
+            const float l0 = logits[0], l1 = logits[1], l2 = logits[2], l3 = logits[3];
+            for (unsigned d = threadIdx.x * 8u; d < hidden; d += PLOW_THREADS * 8u) {
+                const bf16v8 r0 = ld_glob8(rrow + d);
+                const bf16v8 r1 = ld_glob8(rrow + (size_t)hidden + d);
+                const bf16v8 r2 = ld_glob8(rrow + 2 * (size_t)hidden + d);
+                const bf16v8 r3 = ld_glob8(rrow + 3 * (size_t)hidden + d);
+                bf16v8 o;
+#pragma unroll
+                for (unsigned e = 0; e < 8; e++) {
+                    float acc = 0.0f;
+                    acc += l0 * bf2f(r0[e]);
+                    acc += l1 * bf2f(r1[e]);
+                    acc += l2 * bf2f(r2[e]);
+                    acc += l3 * bf2f(r3[e]);
+                    o[e] = f2bf(acc);
+                }
+                st_glob8(layer_input + (size_t)t * hidden + d, o);
+            }
+        } else {
+            for (unsigned d = threadIdx.x; d < hidden; d += PLOW_THREADS) {
+                float acc = 0.0f;
+                for (unsigned i = 0; i < n; i++)
+                    acc += logits[i] * bf2f(rrow[(size_t)i * hidden + d]);
+                layer_input[(size_t)t * hidden + d] = f2bf(acc);
+            }
         }
         __syncthreads(); /* `part`/`logits`/`comb_lds` reused by the next token this workgroup handles */
     }
@@ -326,6 +360,37 @@ __device__ void d_hyperconn_post(bf16* __restrict__ new_residual, const bf16* __
         const float* pm = post_mix + (size_t)t * n;
         const float* cm = comb_mix + (size_t)t * n * n;
         bf16* orow = new_residual + (size_t)t * n * hidden;
+        if (n == 4u && (hidden & 7u) == 0u) {
+            /* n = 4 (every mHC checkpoint): the 20 mix scalars live in registers for the row and
+             * each thread moves 8 channels per step with 16 B loads/stores. The scalar walk
+             * below re-read the 20 scalars per element and issued 2 B loads: 1.76 ms per packet
+             * at T=8192 (92 per prefill), ~40x its byte floor. Same arithmetic, same order. */
+            float c[16], p[4];
+#pragma unroll
+            for (unsigned k = 0; k < 16; k++) c[k] = cm[k];
+#pragma unroll
+            for (unsigned k = 0; k < 4; k++) p[k] = pm[k];
+            for (unsigned d = threadIdx.x * 8u; d < hidden; d += PLOW_THREADS * 8u) {
+                const bf16v8 xv = ld_glob8(xrow + d);
+                bf16v8 r[4];
+#pragma unroll
+                for (unsigned i = 0; i < 4; i++) r[i] = ld_glob8(rrow + (size_t)i * hidden + d);
+#pragma unroll
+                for (unsigned j = 0; j < 4; j++) {
+                    bf16v8 o;
+#pragma unroll
+                    for (unsigned e = 0; e < 8; e++) {
+                        float acc = 0.0f;
+#pragma unroll
+                        for (unsigned i = 0; i < 4; i++) acc += c[i * 4 + j] * bf2f(r[i][e]);
+                        acc += p[j] * bf2f(xv[e]);
+                        o[e] = f2bf(acc);
+                    }
+                    st_glob8(orow + (size_t)j * hidden + d, o);
+                }
+            }
+            continue;
+        }
         for (unsigned d = threadIdx.x; d < hidden; d += PLOW_THREADS) {
             const float xv = bf2f(xrow[d]);
             for (unsigned j = 0; j < n; j++) {

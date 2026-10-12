@@ -296,6 +296,12 @@ pub(crate) const PREFILL_ROW_FIELDS: &[(DevOp, RowField)] = &[
     (DevOp::MoeCombineNormGemmaPf, RowField::Rows(2)),
     (DevOp::XReduce, RowField::RowsTimes(0)),
     (DevOp::XReduceTwoShot, RowField::RowsTimes(0)),
+    // GLM-5.3-Flash's hyper-connection chain, three per layer: `T` in i0 for both HyperConn ops
+    // and `M` for the mix projection GemvF32. Unpatched, a 4096-token prompt in the 8192 bucket
+    // ran all three over 8192 rows — 408 of the 763 ms prefill on gfx950 (per-op trace).
+    (DevOp::HyperConnPre, RowField::Rows(0)),
+    (DevOp::HyperConnPost, RowField::Rows(0)),
+    (DevOp::GemvF32, RowField::Rows(0)),
 ];
 
 pub(crate) fn prefill_row_field(op: u16) -> Option<RowField> {
