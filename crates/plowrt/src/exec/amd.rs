@@ -9234,15 +9234,26 @@ impl AmdEngine {
         // properties land here -- a pooled indexer (`index_kpool > 1`) and a DCP degree above 1
         // each make `Layout::from_blob` refuse -- so say so rather than leave it to be inferred.
         if shared_requested && shared_layout.is_none() {
-            tracing::warn!(
-                arch,
-                has_vmm = be.has_vmm(),
-                fusion = config.fusion,
-                "prefix cache requested but not built; serving with slot-local KV and a \
-                 permanent 0% hit rate. Layout::from_blob refused this packet: a pooled indexer \
-                 (index_kpool > 1), a DCP degree above 1, or an unsupported cache geometry on \
-                 some rung. Set --amd-shared-prefix=true to turn this into a load-time refusal."
-            );
+            if arch == "gfx942" && be.has_vmm() && !config.fusion {
+                tracing::warn!(
+                    arch,
+                    "shared prefix pool requested but not built; the prefix cache falls back to \
+                     per-slot snapshots (see 'prefix snapshot route'). Layout::from_blob refused \
+                     this packet: a pooled indexer (index_kpool > 1), a DCP degree above 1, or an \
+                     unsupported cache geometry on some rung. Set --amd-shared-prefix=true to \
+                     turn this into a load-time refusal."
+                );
+            } else {
+                // Not a refusal of the packet: the pool is gfx942-only, needs ROCr VMM and no
+                // legacy fusion. The per-slot snapshot route serves the prefix cache instead.
+                tracing::info!(
+                    arch,
+                    has_vmm = be.has_vmm(),
+                    fusion = config.fusion,
+                    "shared prefix pool is gfx942-only (ROCr VMM, no legacy fusion); the prefix \
+                     cache serves per-slot snapshots (see 'prefix snapshot route')"
+                );
+            }
         }
         let mut shared_prefix = shared_layout
             .map(|layout| {
@@ -10740,6 +10751,31 @@ impl AmdEngine {
                 "carried recurrent state (prefix-snapshot size per slot)"
             );
         }
+        let prefix_regions = prefix::snapshot_regions(
+            &blob.tensors,
+            blob.progs.iter().flat_map(|p| &p.insts),
+            batch,
+            max_ctx,
+        );
+        // The serve engine refuses the prefix cache without this route or the shared pool, so
+        // say which it is: an absent route otherwise reads like a workload with no shared
+        // prefixes.
+        match &prefix_regions {
+            Some(regions) => tracing::info!(
+                regions = regions.len(),
+                per_slot_mib =
+                    regions.iter().map(prefix::Region::bytes).sum::<u64>() / (1024 * 1024),
+                shared_pool = shared_prefix.is_some(),
+                "prefix snapshot route: per-slot snapshots of the carried state and \
+                 sliding-window rows"
+            ),
+            None => tracing::warn!(
+                shared_pool = shared_prefix.is_some(),
+                "prefix snapshot route unavailable: a kv tensor is written by an op the region \
+                 scan does not know, or a sliding-window cache has no decode flash to size it; \
+                 without the shared pool the prefix cache is refused"
+            ),
+        }
 
         let mut kv_slot_stride: Vec<(usize, u64)> = Vec::new();
         if batch > 1 {
@@ -11258,12 +11294,7 @@ impl AmdEngine {
             band_rows_bound: std::collections::HashMap::new(),
             carried_slot,
             prefix_snap: (0..batch).map(|_| None).collect(),
-            prefix_regions: prefix::snapshot_regions(
-                &blob.tensors,
-                blob.progs.iter().flat_map(|p| &p.insts),
-                batch,
-                max_ctx,
-            ),
+            prefix_regions,
             prefix_used: vec![0; batch],
             prefix_rows: vec![0; batch],
             prefix_tick: 0,

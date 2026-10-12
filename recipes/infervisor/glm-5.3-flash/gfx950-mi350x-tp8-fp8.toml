@@ -1,0 +1,109 @@
+# GLM-5.3-Flash (glm5_next: 34 KDA + 11 NoPE sparse-MLA layers, mHC, 288x8 MoE) on 8x MI350X.
+#
+# The ONE production recipe for this model/GPU/precision: every context-specific choice lives in
+# this file, not in per-context twins. The devblob emitter is `mla::glm53_emit_full`
+# (crates/devgen/src/mla.rs). `scripts/check_recipe.py` asserts this file against what a build
+# produced. Status `emits`: it compiles, builds objects and loads; the correctness and serving
+# gates below are what promote it. See plans/glm53-flash-dsv41-mi350x.md for the campaign and
+# docs/amd/glm53-flash-mi350x.md for the measurements behind each choice.
+
+schema = "plow.recipe.v1"
+namespace = "infervisor"
+name = "glm-5.3-flash"
+label = "gfx950-mi350x-tp8-fp8"
+network = "glm-5.3-flash"
+status = "emits"
+plow_git = "77929debd6d3a7a8ca5c6e34b1d02a3b73c3fd42"
+doc = "docs/amd/glm53-flash-mi350x.md"
+
+# max_ctx 65536: the model's recurrent (KDA) state carries at every length, so long prompts are
+# a correctness probe, not just a capacity one; the dense-MLA path (`PLOW_GLM_DSA = "0"`) serves
+# below the 64k DSA crossover. The 16k packet took ~84 GiB/GPU at batch 128 (41 GiB weights);
+# the 64k KV (11 layers x 128 slots x 64k x 1 KiB = 88 GiB/rank) fits the 288 GB card, 128k would
+# not at this batch. Shorter contexts are the same packet: the serve engine buckets prefill at
+# 128/512/2048/8192 rows and the decode ladder is context-independent.
+[target]
+vendor = "amd"
+isa = "gfx950"
+sku = "MI350X"
+units = 256
+num_gpus = 8
+parallel = "tp"
+max_ctx = 65536
+toolchain = "rocm-7.14.1-nix"
+
+# The PREPPED directory: the snapshot symlinked plus `zz-plow-glm53-derived.safetensors`, which
+# carries the absorbed MLA weights (`derived.q_absorb` / `v_absorb` / `kv_a_latent`, bf16), the
+# f32 mHC `hc_*_fn`, the f32 KDA conv/o_norm, the f32 indexer `weights_proj` / `ape` and the
+# bf16-dequantised shared experts. Routed experts, dense FFNs and the MLA projections stay
+# block-FP8 e4m3 [128,128] from the snapshot (`quantization_config` at the root of config.json).
+[checkpoint]
+source = "hf:zai-org/GLM-5.3-Flash"
+shards = 62
+layout = "plow-glm53-flash"
+
+[tokenizer]
+source = "checkpoint"
+
+[[prepare]]
+tool = "scripts/glm53_prep.py"
+shell = "nix develop .#quantize"
+args = ["--model", "$CKPT", "--out", "$WORK/glm53-flash-prepped"]
+produces = ["zz-plow-glm53-derived.safetensors"]
+
+# The objects take the packet's `plow_config.h` (PLOW_HSACO_CONFIG): `PLOW_K3` and the eight
+# GLM-5.3-Flash opcodes (HyperConnPre/Post, DsaPool*, DsaQQuant, IndexScoreKpool, GemvF32) are
+# derived from the packet's feature scan, not set here.
+# `PLOW_DECODE_BATCH` is the ladder's widest rung; the wide object's GEMV body is a 4-row pass
+# that `PLOW_GEMV_WALK=1` loops (rungs 32/128 run their projections as GEMM tiles, see [emit]).
+# `PLOW_DECODE_TIERS = "1,8"` builds `lowrung1/` and `lowrung8/` decode objects (one GEMV pass of
+# 1 and 8 rows) from the same packet config; plowrt serves rungs 1 and 8 from them. Measured
+# 2026-10-12 (doc §4): the rung-1 program on the wide object stepped 51 ms, on its tier 27 ms;
+# the decode object body depends on PLOW_GEMV_MM / PLOW_GEMV_WALK, not on PLOW_DECODE_BATCH, so
+# a tier without its own MM is the wide object again.
+[objects]
+script = "scripts/build_gfx950.sh"
+env = { PLOW_DECODE_BATCH = "128", PLOW_GEMV_WALK = "1", PLOW_GEMV_MM = "4", PLOW_DECODE_TIERS = "1,8", JOBS = "32" }
+
+# Dense attention at every rung (`PLOW_GLM_DSA = "0"`; the pooled-DSA batched-decode arm does not
+# exist, and below the 64k DSA crossover the dense MLA path serves). The ladder rungs 32/128
+# route their bf16 projections through the prefill GEMM tiles (`PLOW_GLM_DECODE_GEMM_ROWS`):
+# the row-bucketed GEMV walk made a 128-row step 162 ms, the tiles 89 ms, token-identical to
+# the one-row packet in the batched amd-bench (ranks agree). Rung 8 keeps its GEMVs on the
+# 8-row tier (B=8 step 46 ms against 49 on the tiles). The one-row rung is unchanged.
+# `PLOW_GLM_SEQ_PAR = "1"`: the mHC sequence-parallel seam on the 2048/8192 prefill buckets
+# (hyper-connection ops on each rank's row band, reduce-scatter + all-gather seams): prefill
+# 1k/2k/4k/8k 173/256/471/995 -> 151/212/381/806 ms, streams unchanged. `PLOW_GLM_SEQ_PAR_PROJ`
+# stays off: the band projections are unvalidated with the mHC seam.
+# FP32-reference gate on this knob set at 16k (cap-plow-v5, 2026-10-12): PASS, kl_mean 0.0139
+# (vLLM 0.0368), kl_p99 0.20 (0.55), top1_decisive 0.998 (0.987), needles 18/18.
+[emit]
+env = { PLOW_MLA_PREFILL = "full:128,512,2048,8192", PLOW_DECODE_BATCH_LADDER = "1,8,32,128", PLOW_GLM_DECODE_GEMM_ROWS = "32", PLOW_GLM_DSA = "0", PLOW_GLM_SEQ_PAR = "1", PLOW_GLM_SEQ_PAR_PROJ = "0" }
+args = [
+  "--emit", "devblob",
+  "--arch", "gfx950",
+  "--gpu", "MI350X",
+  "--num-gpus", "8",
+  "--parallel", "tp",
+  "--max-ctx", "65536",
+  "--n-cu", "256",
+]
+
+# Prefix cache ON (the runtime default; never set `PLOW_PREFIX_CACHE = "0"` here). On gfx950 it
+# is the per-slot snapshot route: at a chunk boundary of each prompt the engine snapshots the
+# slot's carried KDA state (34 x state + conv windows, 18 MiB/slot/rank) and resumes a prompt
+# sharing that prefix from the snapshot; the MLA KV rows below the resume point are intact in
+# the slot. The gfx942 shared pool (cross-slot, VMM-backed) is not built on gfx950. Probe
+# 2026-10-12 (doc §4): same 1k prompt TTFT 453 -> 273 ms, 1984/4096 prompt tokens cached.
+# `PLOW_STATE_CLEAR_DEVICE = "1"`: a miss clears the slot's recurrence on the device so a reused
+# slot never inherits a previous sequence's state. `PLOW_DECODE_MIN_RUNG = "1"` lets one live
+# request decode on the one-row rung (TP engines default to 8: c1 TPOT 51 -> 27 ms).
+# `PLOW_PF_INTERLEAVE = "4096"` dispatches a decode step after at most 4096 prefill rows so
+# waiting decodes do not stall behind a whole admission burst; no `PLOW_PF_CHUNK` cap — a 512-row
+# cap ran every prompt as 512-bucket chunks and cost 25% of throughput at c32+ (doc §4, 17:05).
+[serve]
+env = { PLOW_STATE_CLEAR_DEVICE = "1", PLOW_TP_AGREE_EVERY = "1", PLOW_DECODE_MIN_RUNG = "1", PLOW_PF_INTERLEAVE = "4096" }
+
+[[gates]]
+name = "smoke"
+cmd = "scripts/serve_test/smoke.sh"

@@ -386,12 +386,38 @@ The packet from config + index alone (no weights) is 70 MB: 4 prefill buckets + 
   logits row, concurrency 16, 46 cases / 88 requests): kl_mean 0.0134 (vLLM 0.0368), kl_p99
   0.184 (0.549), kl_max 0.70 (1.84), top1_decisive 0.9967 (0.9868), cont_frac 0.754 (0.730),
   needles 18/18 (18/18). Gate dir /home/lava/bench/glm53flash/fp32ref/gate-v4b.
-- 17:35 UTC, E6 prefix cache: served with `PLOW_PREFIX_CACHE` unset, the engine logs "prefix
-  cache requested but not built; serving with slot-local KV and a permanent 0% hit rate.
-  Layout::from_blob refused this packet: a pooled indexer (index_kpool > 1), a DCP degree above
-  1, or an unsupported cache geometry on some rung" (has_vmm=true). The packet is DSA=0 but
-  declares the pooled indexer tensors. Not available on this packet; the recipe keeps
-  `PLOW_PREFIX_CACHE=0`.
+- 17:35 UTC, E6 prefix cache, first reading (WRONG, corrected at 17:50): the load-time warning
+  "prefix cache requested but not built; serving with slot-local KV and a permanent 0% hit rate.
+  Layout::from_blob refused this packet" was read as the cache being unavailable.
+- 17:50 UTC, E6 prefix cache, corrected: the warning describes only the gfx942 shared pool
+  (`exec/amd.rs`: `shared_layout` is attempted only when `arch == "gfx942"`); the same log has
+  "AMD prefix cache selection requested=true selected=true" and the probe hit: same 1024-token
+  prompt TTFT 453 -> 273 ms, prompt + 0 tokens 290 ms, one token changed at position 512 465 ms
+  (the snapshot was armed at row 992, above the 512-row common prefix, so a miss that re-arms
+  at 512); /metrics prefix_cache_queries_total 4096, hits 1984 (2 x 992). The route is the
+  per-slot snapshot (`exec/amd/prefix.rs::snapshot_regions`): this packet's `kv.N.state` and
+  `kv.N.conv_state.{q,k,v}` (136 tensors, 18 MiB/slot/rank) are the carried regions; the MLA
+  `kv.N.ckv` rows are full-context (`HeadNormRope` kv_mask u32::MAX, stride = max_ctx) so they
+  need no copy. plowrt now says so at load ("shared prefix pool is gfx942-only ...; the prefix
+  cache serves per-slot snapshots" + "prefix snapshot route: regions=136 per_slot_mib=18") and
+  the "0% hit rate" warning is reserved for gfx942 refusals. The recipe serves with the cache
+  ON (the runtime default); the grid/capture/validate scripts default it on; the prefix-on
+  gate capture of v5 (`fp32cap-plow-v5-pfx`) is queued — teacher-forced re-requests share
+  prefixes, so it exercises the restore path on every case.
+- 17:50 UTC, FP32-reference gate PASS on the v5 packet (sha e5007402…, prefix cache off, c16):
+  kl_mean 0.0139 (vLLM 0.0368), kl_p99 0.205 (0.549), kl_max 0.59 (1.84), top1_decisive 0.9978
+  (0.9868), cont_frac 0.770 (0.730), needles 18/18. Gate dir fp32ref/gate-v5. The v5 knob set
+  (ladder 1/8/32/128, GEMM rows 32, mHC seam, tiers) is the final configuration.
+- 17:55 UTC, final packet v6 = v5 knobs at `--max-ctx 65536` (user: one production recipe,
+  `recipes/infervisor/glm-5.3-flash/gfx950-mi350x-tp8-fp8.toml`, context-specific choices
+  inside it; probe long context because the KDA recurrence only shows at length). Emit 11 s
+  (sha 7649e082…), objects + tiers building. Queued after the vLLM 64k baseline and the
+  DeepSeek grids: validate-v6 (streams at every rung, 4k, 16k, 32k and 60k synthetic prompts
+  through the 8192-bucket chunk loop, prefill sweep to 32k), needle-plow-v6 and needle-vllm-v6
+  (`scripts/glm53_needle_probe.py`, exact lengths 4k/16k/32k/60k at depths 0.1/0.5/0.9, paired
+  verdict), fp32cap-plow-v6 (prefix on), vLLM isl 61440 c1/c8, v6 grids 1024/4096 (c1..c128)
+  and 16384/32768/61440 (c1/c8). The long cell is 61440 not 65536: the grid's prompt + 128
+  output tokens must fit the packet's 65536 context (vLLM's max-model-len is isl + 2176).
 - 17:35 UTC, E10 TP4 bench (packet pkt-glm53flash-tp4-ladder-v4, 4 GPUs, real prompt, streams
   exact at every rung): scalar (rung 8) 55.5 ms, B=8 51.4, B=32 63.3, B=64 74.6 ms (858 tok/s
   per group); prefill 1k 204 ms (TP8 173). Two such groups (DP2xTP4) would serve 128 streams at
