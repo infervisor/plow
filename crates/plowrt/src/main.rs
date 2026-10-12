@@ -741,6 +741,12 @@ enum Cmd {
         /// One line describing the model, for the registry's catalog.
         #[arg(long)]
         description: Option<String>,
+        /// Measured decode throughput; required for `--status validated`.
+        #[arg(long)]
+        tok_s: Option<f64>,
+        /// The concurrency `--tok-s` was measured at.
+        #[arg(long)]
+        concurrency: Option<u32>,
     },
 }
 
@@ -1137,6 +1143,8 @@ async fn async_main(
             api_key,
             status,
             description,
+            tok_s,
+            concurrency,
         } => dist_cmd::report(dist_cmd::cmd_publish(
             &bundle,
             objset.as_deref(),
@@ -1147,6 +1155,8 @@ async fn async_main(
                 api_key: &api_key,
                 status: status.as_deref(),
                 description: description.as_deref(),
+                tok_s,
+                concurrency,
             },
         )),
         #[cfg(feature = "hsa")]

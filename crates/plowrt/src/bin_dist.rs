@@ -441,6 +441,8 @@ pub struct PublishTo<'a> {
     pub api_key: &'a str,
     pub status: Option<&'a str>,
     pub description: Option<&'a str>,
+    pub tok_s: Option<f64>,
+    pub concurrency: Option<u32>,
 }
 
 #[cfg(feature = "dist")]
@@ -455,6 +457,10 @@ pub fn cmd_publish(
     objects: Option<&std::path::Path>,
     to: &PublishTo,
 ) -> Result<(), Err> {
+    // The registry's index would hold a variant clients refuse to read.
+    if to.status == Some("validated") && to.tok_s.is_none() {
+        return Err("--status validated needs the measurement: pass --tok-s".into());
+    }
     let dir = private_temp_dir()?;
     let sent = (|| {
         let Some(bundle) = next_generation(bundle_path, to.url)? else {
@@ -597,8 +603,10 @@ fn upload(
             ureq::Error::Status(code, resp) => {
                 format!("{url}: {code}: {}", resp.into_string().unwrap_or_default()).into()
             }
-            // ureq's transport error already names the URL.
-            e => e.to_string().into(),
+            // Not ureq's own text: it repeats the URL, query string and all.
+            ureq::Error::Transport(t) => {
+                format!("{url}: {} {}", t.kind(), t.message().unwrap_or_default()).into()
+            }
         }
     };
 
@@ -628,7 +636,9 @@ fn upload(
     if target.upload_url.starts_with('/') {
         put = put.set("Authorization", &auth);
     }
-    put.send(file).map_err(|e| failed(&put_url, e))?;
+    // A presigned URL's query string is a credential: never print it.
+    let shown = put_url.split('?').next().unwrap_or_default();
+    put.send(file).map_err(|e| failed(shown, e))?;
 
     // 3. Publish it.
     let publish = format!("{uploads}/{}/publish", target.id);
@@ -638,6 +648,12 @@ fn upload(
     }
     if let Some(d) = to.description {
         req = req.query("description", d);
+    }
+    if let Some(t) = to.tok_s {
+        req = req.query("tok_s", &t.to_string());
+    }
+    if let Some(c) = to.concurrency {
+        req = req.query("concurrency", &c.to_string());
     }
     match req.call() {
         Ok(resp) => {
