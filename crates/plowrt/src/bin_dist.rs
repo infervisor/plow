@@ -239,8 +239,12 @@ pub fn cmd_show(model: &str) -> Result<(), Err> {
     Ok(())
 }
 
-pub fn cmd_ls(upgradable: bool) -> Result<(), Err> {
+pub fn cmd_ls(upgradable: bool, json: bool) -> Result<(), Err> {
     let st = store()?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&st.list())?);
+        return Ok(());
+    }
     let pins = st.pins();
     if pins.is_empty() {
         println!("no models pulled — try `plowrt load <model>`");

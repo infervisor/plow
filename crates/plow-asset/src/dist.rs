@@ -16,6 +16,11 @@ pub const INDEX_SCHEMA: &str = "plow.dist.model.v1";
 pub const BUNDLE_SCHEMA: &str = "plow.dist.bundle.v1";
 pub const OBJSET_SCHEMA: &str = "plow.dist.objset.v1";
 
+/// The name a bundle's manifest goes by beside its files: in a `plowc` assets
+/// directory and in a bundle `plowrt pull` materialized. Reserved, so no
+/// shipped file may take it.
+pub const BUNDLE_MANIFEST: &str = "bundle.json";
+
 /// How far a variant has been taken. Ranked, so an unmeasured build can be
 /// published without being presented as equivalent to a measured one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -718,6 +723,11 @@ impl Bundle {
             }
             if !seen.insert(f.name.as_str()) {
                 return Err(format!("bundle: duplicate file {}", f.name));
+            }
+            if f.name == BUNDLE_MANIFEST {
+                return Err(format!(
+                    "bundle: `{BUNDLE_MANIFEST}` is the manifest, not a file it ships"
+                ));
             }
         }
         if !self.files.iter().any(|f| f.role == "packet") {

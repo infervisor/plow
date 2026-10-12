@@ -57,6 +57,27 @@ impl std::fmt::Display for Digest {
 /// `gc` reads this instead of re-hashing the bundle.
 const BUNDLE_BLOBS: &str = ".plow-blobs";
 
+pub use plow_asset::dist::BUNDLE_MANIFEST;
+
+/// One pin, as `plowrt ls --json` prints it.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct Pinned {
+    /// `<namespace>/<name>:<label>@g<generation>`.
+    #[serde(rename = "ref")]
+    pub reference: String,
+    pub namespace: String,
+    pub name: String,
+    pub label: String,
+    pub generation: u32,
+    pub variant_id: String,
+    /// Every blob the bundle links, files and objects.
+    pub bytes: u64,
+    /// The materialized bundle: what `serve --assets` and `/v1/models/load` take.
+    pub dir: PathBuf,
+    /// The checkpoint farm is built and linked in, so the bundle serves as is.
+    pub prepared: bool,
+}
+
 pub struct Store {
     root: PathBuf,
 }
@@ -282,6 +303,84 @@ impl Store {
         }
         out.sort();
         out
+    }
+
+    /// Write a pulled bundle's manifest beside its files, as `bundle.json` —
+    /// the name a `plowc` assets directory already carries it under.
+    ///
+    /// A pin records only the variant id, which is a hash; the label and
+    /// generation a person (or a node's check-in) names the model by live
+    /// only in the manifest. Staged and renamed, because `dir` is full of hard
+    /// links into `blobs/` and writing through one would rewrite a blob.
+    pub fn record_bundle(&self, dir: &Path, bundle: &plow_asset::dist::Bundle) -> Result<()> {
+        let path = dir.join(BUNDLE_MANIFEST);
+        let bytes = serde_json::to_vec_pretty(bundle).map_err(|source| RuntimeError::Json {
+            path: path.clone(),
+            source,
+        })?;
+        let tmp = path.with_extension(format!("part{}", std::process::id()));
+        std::fs::write(&tmp, bytes).map_err(|source| RuntimeError::Io {
+            path: tmp.clone(),
+            source,
+        })?;
+        std::fs::rename(&tmp, &path).map_err(|source| RuntimeError::Io { path, source })
+    }
+
+    /// Every pin with what a caller needs to serve it: `plowrt ls --json`.
+    ///
+    /// A pin whose bundle directory or manifest is missing is skipped with a
+    /// warning rather than reported half-known: it cannot be served as it is,
+    /// and `plowrt load` re-materializes it.
+    pub fn list(&self) -> Vec<Pinned> {
+        let mut out = Vec::new();
+        for (reference, variant_id) in self.pins() {
+            match self.pinned_bundle(&variant_id) {
+                Ok(p) => out.push(p),
+                Err(e) => tracing::warn!(%reference, %variant_id, "skipped: {e}"),
+            }
+        }
+        out
+    }
+
+    fn pinned_bundle(&self, variant_id: &str) -> Result<Pinned> {
+        let dir = self.root.join("bundles").join(variant_id);
+        let path = dir.join(BUNDLE_MANIFEST);
+        let raw = std::fs::read(&path).map_err(|source| RuntimeError::Io {
+            path: path.clone(),
+            source,
+        })?;
+        let b: plow_asset::dist::Bundle =
+            serde_json::from_slice(&raw).map_err(|source| RuntimeError::Json {
+                path: path.clone(),
+                source,
+            })?;
+        let dir = std::fs::canonicalize(&dir).unwrap_or(dir);
+        Ok(Pinned {
+            reference: format!("{}/{}:{}@g{}", b.namespace, b.name, b.label, b.generation),
+            bytes: self.bundle_bytes(&dir),
+            // `prepare::build` links the farm in as `checkpoint` last, so its
+            // presence is what "ready to serve" means.
+            prepared: dir.join("checkpoint").is_dir(),
+            namespace: b.namespace,
+            name: b.name,
+            label: b.label,
+            generation: b.generation,
+            variant_id: variant_id.to_string(),
+            dir,
+        })
+    }
+
+    /// The bundle's size in the store: every blob its record names, files and
+    /// objects alike. Read from the record rather than by walking the
+    /// directory, which would also follow `checkpoint` into the weights.
+    fn bundle_bytes(&self, dir: &Path) -> u64 {
+        std::fs::read_to_string(dir.join(BUNDLE_BLOBS))
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|l| Digest::parse(l.trim()).ok())
+            .filter_map(|d| std::fs::metadata(self.blob_path(&d)).ok())
+            .map(|m| m.len())
+            .sum()
     }
 
     /// Remove blobs no live bundle directory references.

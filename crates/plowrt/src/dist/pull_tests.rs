@@ -266,6 +266,44 @@ fn a_full_pull_materializes_a_servable_directory() {
     assert_eq!(t2.reused_blobs, 2);
 }
 
+/// `ls --json` names a pin by the label and generation its manifest carries,
+/// sizes it by the blobs it links, and skips a pin it could not serve.
+#[test]
+fn the_store_lists_each_pulled_pin_with_its_manifest_identity() {
+    let f = Fixture::new("list");
+    let store = f.store();
+    assert!(store.list().is_empty(), "an empty store lists nothing");
+
+    let pkt = vec![7u8; 4096];
+    let obj = b"objset g1".to_vec();
+    write_index(&f, vec![publish(&f, LABEL, 1, &pkt, &obj)]);
+    let r = reference::parse("kimi-k3").unwrap();
+    let resolved = resolve(&*f.fetch(), &r, &live(), Constraints::default()).unwrap();
+    let (dir, _) = pull(&store, &*f.fetch(), &resolved).unwrap();
+    store
+        .pin(&r.pin_key(), &resolved.variant.variant_id)
+        .unwrap();
+    // A pin whose bundle was removed from under it cannot be served as is.
+    store
+        .pin("file:///elsewhere/infervisor/gone", "gone-g1")
+        .unwrap();
+
+    let listed = store.list();
+    assert_eq!(listed.len(), 1, "{listed:?}");
+    let p = &listed[0];
+    assert_eq!(p.reference, format!("infervisor/kimi-k3:{LABEL}@g1"));
+    assert_eq!((p.label.as_str(), p.generation), (LABEL, 1));
+    assert_eq!(p.variant_id, resolved.variant.variant_id);
+    assert_eq!(p.bytes, pkt.len() as u64 + obj.len() as u64);
+    assert_eq!(p.dir, std::fs::canonicalize(&dir).unwrap());
+    assert!(!p.prepared, "no checkpoint farm yet");
+
+    std::os::unix::fs::symlink(&f.root, dir.join("checkpoint")).unwrap();
+    assert!(store.list()[0].prepared);
+    let json = serde_json::to_value(&store.list()).unwrap();
+    assert_eq!(json[0]["ref"], p.reference.as_str());
+}
+
 /// An Apple bundle names no objset: the pull fetches the files alone and
 /// lays nothing under `hsaco/`, and the live Metal target selects it.
 #[test]

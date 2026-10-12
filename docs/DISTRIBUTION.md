@@ -79,6 +79,22 @@ snapshots/<org>--<repo>@<rev>/     a snapshot `load --fetch-weights` downloaded
 A blob's digest always names the **uncompressed** bytes, so a store may hold
 `.zst`, plain, or both and every client stays correct.
 
+A pulled bundle directory also holds its manifest as `bundle.json`, which is
+where `plowrt ls --json` reads each pin's label and generation from. The
+array it prints on stdout (logs go to stderr) is what a node reports:
+
+```
+[{"ref": "infervisor/kimi-k3:gfx942-mi325x-tp8-32k@g3", "namespace": "infervisor",
+  "name": "kimi-k3", "label": "gfx942-mi325x-tp8-32k", "generation": 3,
+  "variant_id": "a793020a5026", "bytes": 412316860,
+  "dir": "/home/op/.plow/bundles/a793020a5026", "prepared": true}]
+```
+
+`bytes` counts the blobs the bundle links (files and objects, not the
+checkpoint); `prepared` means the checkpoint farm is linked in, so `dir` serves
+as is. A pin pulled before the manifest was recorded is skipped with a warning
+until `plowrt load` re-materializes it.
+
 ## Why content addressing
 
 A generation that changes only the code objects shares its packet, manifests and

@@ -636,6 +636,10 @@ enum Cmd {
         /// Check the registry for a newer generation of each pinned model.
         #[arg(long, default_value_t = false)]
         upgradable: bool,
+        /// Print the pins as a JSON array on stdout (logs go to stderr): ref,
+        /// namespace, name, label, generation, variant_id, bytes, dir, prepared.
+        #[arg(long, default_value_t = false, conflicts_with = "upgradable")]
+        json: bool,
     },
 
     /// This machine as the registry sees it: the target a published variant
@@ -803,6 +807,8 @@ async fn async_main(
         Cmd::Bench { .. } | Cmd::OpAudit { .. } | Cmd::KnobScope { .. } | Cmd::Qualify { .. } => {
             true
         }
+        // A node's check-in parses this array; the banner must not precede it.
+        Cmd::Ls { json: true, .. } => true,
         #[cfg(any(
             all(feature = "cpu", feature = "gguf"),
             all(feature = "metal", target_os = "macos"),
@@ -1069,7 +1075,7 @@ async fn async_main(
             fetch_weights,
         )),
         Cmd::Show { model } => dist_cmd::report(dist_cmd::cmd_show(&model)),
-        Cmd::Ls { upgradable } => dist_cmd::report(dist_cmd::cmd_ls(upgradable)),
+        Cmd::Ls { upgradable, json } => dist_cmd::report(dist_cmd::cmd_ls(upgradable, json)),
         Cmd::Target { json } => dist_cmd::report(dist_cmd::cmd_target(json)),
         Cmd::Upgrade {
             model,

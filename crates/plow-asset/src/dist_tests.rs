@@ -631,7 +631,13 @@ fn bundle_rejects_structural_damage() {
         "a bundle with no packet is not a bundle"
     );
 
-    for name in ["", "../model.pkt", "/model.pkt", "dir/model.pkt"] {
+    for name in [
+        "",
+        "../model.pkt",
+        "/model.pkt",
+        "dir/model.pkt",
+        "bundle.json",
+    ] {
         let mut b = base.clone();
         b.files[0].name = name.into();
         assert!(b.validate().is_err(), "accepted path {name}");
