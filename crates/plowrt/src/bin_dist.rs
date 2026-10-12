@@ -499,14 +499,9 @@ fn next_generation(
             .ok_or_else(|| format!("{}: {model_dir}/{} is missing", f.describe(), v.manifest))?;
         let published: Bundle = serde_json::from_slice(&raw)
             .map_err(|e| format!("{}: {}: {e}", f.describe(), v.manifest))?;
-        let digests = |b: &Bundle| {
-            let mut d: Vec<_> = b.files.iter().map(|f| f.sha256.clone()).collect();
-            d.sort();
-            (d, b.objset.as_ref().map(|o| o.objset_id.clone()))
-        };
-        if digests(&published) == digests(&bundle) {
+        if same_build(&published, &bundle) {
             println!(
-                "already published: {}/{}:{}@g{} has these files",
+                "already published: {}/{}:{}@g{} is this build",
                 bundle.namespace, bundle.name, bundle.label, v.generation
             );
             return Ok(None);
@@ -515,6 +510,20 @@ fn next_generation(
     bundle.generation = newest.map_or(1, |v| v.generation + 1);
     bundle.variant_id = variant_id(&bundle);
     Ok(Some(bundle))
+}
+
+/// Whether two manifests describe the same build: equal in everything but
+/// what publishing assigns (the generation, the variant id, and the objset
+/// manifest's digest, which the registry records as it stores it).
+#[cfg(feature = "dist")]
+fn same_build(published: &plow_asset::dist::Bundle, local: &plow_asset::dist::Bundle) -> bool {
+    let mut p = published.clone();
+    p.generation = local.generation;
+    p.variant_id = local.variant_id.clone();
+    if let (Some(po), Some(lo)) = (p.objset.as_mut(), local.objset.as_ref()) {
+        po.sha256 = lo.sha256.clone();
+    }
+    p == *local
 }
 
 /// `publish_dist.py`'s `variant_id`: 12 hex of the sha256 over the full key,
@@ -717,5 +726,27 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(super::variant_id(&b), "b49b5c9cf598");
+    }
+
+    #[test]
+    fn same_build_ignores_only_what_publishing_assigns() {
+        let local: plow_asset::dist::Bundle = serde_json::from_value(serde_json::json!({
+            "schema": "plow.dist.bundle.v1", "namespace": "infervisor", "name": "m",
+            "label": "l", "generation": 0, "variant_id": "", "plow_git": "abc", "network": "m",
+            "target": {"vendor": "apple", "isa": "metal3", "sku": "Apple M4 Pro", "units": 16, "mem_bytes": 1},
+            "parallel": {"mode": "tp", "n": 1}, "max_ctx": 2048, "files": [],
+            "tokenizer": {"file": "t", "generator": "plow", "sha256": "0", "source": "derived", "verified": false},
+            "checkpoint": {"source": "hf:o/m", "revision": "main", "shards": 0, "layout": "x", "bytes": 0}
+        }))
+        .unwrap();
+        let mut published = local.clone();
+        published.generation = 3;
+        published.variant_id = "abcdef012345".into();
+        assert!(super::same_build(&published, &local));
+        published.max_ctx = 4096;
+        assert!(
+            !super::same_build(&published, &local),
+            "a metadata change is a new build"
+        );
     }
 }
