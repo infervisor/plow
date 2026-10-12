@@ -227,6 +227,93 @@ pub(super) fn snapshot_regions<'a>(
     }
     Some(regions)
 }
+/// A full-context KV tensor's per-slot layout `[heads][stride_rows][row_bytes]`, as its
+/// `HeadNormRope` writer addresses it: the first `rows` rows of every head are a prompt prefix.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct CloneSpan {
+    pub tensor: usize,
+    pub slot_bytes: u64,
+    heads: u32,
+    stride_rows: u32,
+    row_bytes: u64,
+}
+impl CloneSpan {
+    pub fn copy_spans(&self, rows: u32, mut copy: impl FnMut(u64, u64)) {
+        let head_bytes = u64::from(self.stride_rows) * self.row_bytes;
+        let bytes = u64::from(rows.min(self.stride_rows)) * self.row_bytes;
+        for head in 0..u64::from(self.heads) {
+            copy(head * head_bytes, bytes);
+        }
+    }
+}
+
+/// The KV a prompt prefix occupies outside the snapshot regions: every `kv.*` tensor that is
+/// neither carried state nor a snapshot region must be a full-context cache with one
+/// `HeadNormRope` geometry, so a prefix can be copied from one slot to another. `None` (no
+/// cross-slot reuse) for anything else: rings, pooled indexers, unknown writers.
+pub(super) fn clone_spans<'a>(
+    tensors: &[DevTensor],
+    instructions: impl Iterator<Item = &'a DevInst64>,
+    regions: &[Region],
+    batch: usize,
+) -> Option<Vec<CloneSpan>> {
+    if batch == 0 {
+        return None;
+    }
+    let mut spans: Vec<CloneSpan> = Vec::new();
+    for d in instructions {
+        let fp8 = d.op == DevOp::HeadNormRopeFp8 as u16;
+        if !fp8 && d.op != DevOp::HeadNormRope as u16 {
+            continue;
+        }
+        let elem = if fp8 { 1 } else { 2 };
+        let mut add = |index: usize, row_bytes: u64| -> Option<()> {
+            let tensor = tensors.get(index)?;
+            if !tensor.name.starts_with("kv.") || d.fj[2] != u32::MAX {
+                return Some(());
+            }
+            let (heads, stride_rows) = (d.i[1], d.fj[1]);
+            let slot_bytes = tensor.bytes / batch as u64;
+            if heads == 0
+                || stride_rows == 0
+                || row_bytes == 0
+                || tensor.bytes % batch as u64 != 0
+                || slot_bytes != u64::from(heads) * u64::from(stride_rows) * row_bytes
+            {
+                return None;
+            }
+            let span = CloneSpan {
+                tensor: index,
+                slot_bytes,
+                heads,
+                stride_rows,
+                row_bytes,
+            };
+            match spans.iter().find(|s| s.tensor == index) {
+                Some(prior) if prior != &span => None,
+                Some(_) => Some(()),
+                None => {
+                    spans.push(span);
+                    Some(())
+                }
+            }
+        };
+        add(d.t[0] as usize, u64::from(d.i[2]) * elem)?;
+        if fp8 {
+            add(d.t[6] as usize, 4)?;
+        }
+    }
+    for (i, t) in tensors.iter().enumerate() {
+        if t.name.starts_with("kv.")
+            && !super::is_carried_state(&t.name)
+            && !regions.iter().any(|r| r.tensor == i)
+            && !spans.iter().any(|s| s.tensor == i)
+        {
+            return None;
+        }
+    }
+    Some(spans)
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -393,6 +480,32 @@ mod tests {
             );
         }
         std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn full_context_kv_clones_by_head_prefix_and_unknown_kv_refuses() {
+        let tensors = [tensor("kv.3.ckv", 4 * 2 * 64 * 1024), tensor("kv.0.state", 4 * 256)];
+        let mut d = DevInst64::default();
+        d.op = DevOp::HeadNormRope as u16;
+        d.t[0] = 0;
+        d.i[1] = 2;
+        d.i[2] = 512;
+        d.fj[1] = 64;
+        d.fj[2] = u32::MAX;
+        let regions = snapshot_regions(&tensors, [d].iter(), 4, 64).unwrap();
+        let spans = clone_spans(&tensors, [d].iter(), &regions, 4).unwrap();
+        assert_eq!(spans.len(), 1);
+        let mut copies = Vec::new();
+        spans[0].copy_spans(10, |off, bytes| copies.push((off, bytes)));
+        assert_eq!(copies, [(0, 10 * 1024), (64 * 1024, 10 * 1024)]);
+        let extra = [
+            tensor("kv.3.ckv", 4 * 2 * 64 * 1024),
+            tensor("kv.0.state", 4 * 256),
+            tensor("kv.5.kidx", 4 * 64),
+        ];
+        assert!(clone_spans(&extra, [d].iter(), &regions, 4).is_none());
+        let mut ring = d;
+        ring.fj[2] = 63;
+        assert!(clone_spans(&tensors, [ring].iter(), &[], 4).is_none());
     }
     fn tensor(name: &str, bytes: u64) -> DevTensor {
         DevTensor {

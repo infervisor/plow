@@ -636,6 +636,27 @@ mod amd_serve {
             }
         }
 
+        fn clone_prefix(&mut self, src: usize, dst: usize) -> Result<bool> {
+            match self {
+                Self::One(e) => e.clone_prefix(src, dst),
+                Self::Tp(g) => g.clone_prefix(src, dst),
+            }
+        }
+
+        fn prefix_clone_capable(&self) -> bool {
+            match self {
+                Self::One(e) => e.prefix_clone_capable(),
+                Self::Tp(g) => (0..g.n_gpu()).all(|rank| g.rank(rank).prefix_clone_capable()),
+            }
+        }
+
+        fn has_snapshot(&self, slot: usize) -> bool {
+            match self {
+                Self::One(e) => e.has_snapshot(slot),
+                Self::Tp(g) => g.has_snapshot(slot),
+            }
+        }
+
         fn snapshot_carried(&mut self, slot: usize, rows: u32) -> Result<()> {
             match self {
                 Self::One(e) => e.snapshot_carried(slot, rows),
@@ -868,6 +889,8 @@ mod amd_serve {
         /// recurrent state is snapshotted. Invariant: the snapshot corresponds to
         /// `cached_prompt[..snap_at]`, so a new prompt matching that span may resume from it.
         prefix_cache: bool,
+        /// Per-slot snapshots can move between slots ([`Self::adopt_prefix`]).
+        prefix_clone: bool,
         cached_prompt: Vec<Vec<u32>>,
         snap_at: Vec<u32>,
         cached_rows: Vec<u32>,
@@ -1599,9 +1622,11 @@ mod amd_serve {
                 && !crate::config::RuntimeConfig::get().fusion
                 && ranks.prefix_cache_capable()
                 && has_prefill;
+            let prefix_clone = prefix_cache && ranks.prefix_clone_capable();
             tracing::info!(
                 requested = crate::config::RuntimeConfig::get().prefix_cache,
                 selected = prefix_cache,
+                cross_slot = prefix_clone,
                 "AMD prefix cache selection"
             );
             let token_batch_tp = match &ranks {
@@ -1656,6 +1681,7 @@ mod amd_serve {
                 decode_only: !has_prefill,
                 max_ctx,
                 prefix_cache,
+                prefix_clone,
                 cached_prompt: vec![Vec::new(); batch],
                 snap_at: vec![0; batch],
                 cached_rows: vec![0; batch],
@@ -1874,6 +1900,7 @@ mod amd_serve {
                 }
                 last
             } else {
+                self.adopt_prefix(slot, prompt)?;
                 let (resume, arm) = self.plan_prefix(slot, prompt);
                 self.cached_rows[slot] = resume;
                 if resume == 0 {
@@ -1945,6 +1972,47 @@ mod amd_serve {
         ///
         /// Both are clamped to `len - 1`: a chunk with `clen == 0` would set the lm_head's
         /// `a_row0 = clen - 1` to `u32::MAX`, and an identical prompt must still produce a token.
+        /// Cross-slot prefix reuse. A slot's snapshot only serves prompts seated on that slot,
+        /// and admission seats on the lowest free slot, so under concurrency a shared prefix
+        /// almost never meets its snapshot. When another slot holds a longer armed prefix of
+        /// `prompt` than `slot` does, copy it in (KV rows + carried-state snapshot) and record it
+        /// as `slot`'s own, so the plan below resumes from it. The seat does not move, so the
+        /// decode rung is unchanged.
+        fn adopt_prefix(&mut self, slot: usize, prompt: &[u32]) -> Result<()> {
+            if !self.prefix_cache || !self.prefix_clone {
+                return Ok(());
+            }
+            let cap = prompt.len().saturating_sub(1);
+            let covered = |cached: &[u32], snap: u32| {
+                snap > 0 && snap as usize <= common_prefix_len(cached, prompt).min(cap)
+            };
+            let own = if self.ranks.has_snapshot(slot)
+                && covered(&self.cached_prompt[slot], self.snap_at[slot])
+            {
+                self.snap_at[slot]
+            } else {
+                0
+            };
+            let Some(donor) = (0..self.batch)
+                .filter(|&d| {
+                    d != slot
+                        && self.snap_at[d] > own
+                        && covered(&self.cached_prompt[d], self.snap_at[d])
+                        && self.ranks.has_snapshot(d)
+                })
+                .max_by_key(|&d| self.snap_at[d])
+            else {
+                return Ok(());
+            };
+            let snap = self.snap_at[donor];
+            if self.ranks.clone_prefix(donor, slot)? {
+                tracing::debug!(donor, slot, snap, "amd: prefix adopted from another slot");
+                self.cached_prompt[slot] = self.cached_prompt[donor][..snap as usize].to_vec();
+                self.snap_at[slot] = snap;
+            }
+            Ok(())
+        }
+
         fn plan_prefix(&self, slot: usize, prompt: &[u32]) -> (u32, u32) {
             if !self.prefix_cache {
                 return (0, 0);
@@ -2068,6 +2136,7 @@ mod amd_serve {
                 let (resume, arm) = if shared {
                     (self.ranks.attach_shared_prefix(slot, prompt)?, 0)
                 } else {
+                    self.adopt_prefix(slot, prompt)?;
                     self.plan_prefix(slot, prompt)
                 };
                 self.cursor_split_ns = (clear_ns, t_attach.elapsed().as_nanos() as u64);

@@ -1782,6 +1782,16 @@ impl AmdTpGroup {
                 .all(|rank| rank.packed_prefill_prog_capable(prog))
     }
 
+    /// [`AmdEngine::clone_prefix`] on every rank; `true` only if every rank took it (a rank that
+    /// did not has no snapshot, so `has_snapshot` keeps the group from resuming).
+    pub fn clone_prefix(&mut self, src: usize, dst: usize) -> Result<bool> {
+        let mut all = true;
+        for e in &mut self.ranks {
+            all &= e.clone_prefix(src, dst)?;
+        }
+        Ok(all)
+    }
+
     pub fn has_snapshot(&self, slot: usize) -> bool {
         self.ranks.iter().all(|e| e.has_snapshot(slot))
     }

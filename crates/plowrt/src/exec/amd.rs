@@ -6324,6 +6324,7 @@ pub struct AmdEngine {
     /// Per-slot snapshot of recurrent state and sliding KV at a prefix boundary.
     prefix_snap: Vec<Option<DeviceMem>>,
     prefix_regions: Option<Vec<prefix::Region>>,
+    prefix_clone: Option<Vec<prefix::CloneSpan>>,
     prefix_rows: Vec<u32>,
     prefix_used: Vec<u64>,
     prefix_tick: u64,
@@ -10760,9 +10761,18 @@ impl AmdEngine {
         // The serve engine refuses the prefix cache without this route or the shared pool, so
         // say which it is: an absent route otherwise reads like a workload with no shared
         // prefixes.
+        let prefix_clone = prefix_regions.as_ref().and_then(|regions| {
+            prefix::clone_spans(
+                &blob.tensors,
+                blob.progs.iter().flat_map(|p| &p.insts),
+                regions,
+                batch,
+            )
+        });
         match &prefix_regions {
             Some(regions) => tracing::info!(
                 regions = regions.len(),
+                cross_slot = prefix_clone.is_some(),
                 per_slot_mib =
                     regions.iter().map(prefix::Region::bytes).sum::<u64>() / (1024 * 1024),
                 shared_pool = shared_prefix.is_some(),
@@ -11295,6 +11305,7 @@ impl AmdEngine {
             carried_slot,
             prefix_snap: (0..batch).map(|_| None).collect(),
             prefix_regions,
+            prefix_clone,
             prefix_used: vec![0; batch],
             prefix_rows: vec![0; batch],
             prefix_tick: 0,
@@ -14979,9 +14990,9 @@ impl AmdEngine {
         }
     }
 
-    fn evict_prefix_snapshot(&mut self, keep: usize) -> bool {
+    fn evict_prefix_snapshot(&mut self, keep: usize, also_keep: usize) -> bool {
         let victim = (0..self.batch)
-            .filter(|&slot| slot != keep && self.prefix_snap[slot].is_some())
+            .filter(|&slot| slot != keep && slot != also_keep && self.prefix_snap[slot].is_some())
             .min_by_key(|&slot| self.prefix_used[slot]);
         if let Some(slot) = victim {
             self.prefix_snap[slot] = None;
@@ -15019,36 +15030,8 @@ impl AmdEngine {
             self.prefix_rows[slot] = rows;
             return Ok(());
         }
-        if self.prefix_snap[slot].is_none() {
-            let cap = self.prefix_cache_cap();
-            while cap > 0
-                && self
-                    .prefix_snap
-                    .iter()
-                    .flatten()
-                    .map(|m| m.len)
-                    .sum::<u64>()
-                    + total
-                    > cap
-            {
-                if !self.evict_prefix_snapshot(slot) {
-                    return Ok(());
-                }
-            }
-            loop {
-                match EngineDevice::alloc(&*self.be, total) {
-                    Ok(mem) => {
-                        self.prefix_snap[slot] = Some(mem);
-                        break;
-                    }
-                    Err(RuntimeError::Oom(_)) => {
-                        if !self.evict_prefix_snapshot(slot) {
-                            return Ok(());
-                        }
-                    }
-                    Err(error) => return Err(error),
-                }
-            }
+        if !self.alloc_prefix_snap(slot, slot, total)? {
+            return Ok(());
         }
         self.prefix_tick += 1;
         self.prefix_used[slot] = self.prefix_tick;
@@ -15064,6 +15047,96 @@ impl AmdEngine {
         self.prefix_rows[slot] = rows;
         crate::obs::pfx::SNAP.add(t.elapsed().as_nanos() as u64);
         Ok(())
+    }
+
+    /// Give `slot` a snapshot buffer of `total` bytes, evicting least recently used snapshots
+    /// other than `slot`'s and `also_keep`'s. `false` when nothing more can be evicted.
+    fn alloc_prefix_snap(&mut self, slot: usize, also_keep: usize, total: u64) -> Result<bool> {
+        if self.prefix_snap[slot].is_some() {
+            return Ok(true);
+        }
+        let cap = self.prefix_cache_cap();
+        while cap > 0
+            && self
+                .prefix_snap
+                .iter()
+                .flatten()
+                .map(|m| m.len)
+                .sum::<u64>()
+                + total
+                > cap
+        {
+            if !self.evict_prefix_snapshot(slot, also_keep) {
+                return Ok(false);
+            }
+        }
+        loop {
+            match EngineDevice::alloc(&*self.be, total) {
+                Ok(mem) => {
+                    self.prefix_snap[slot] = Some(mem);
+                    return Ok(true);
+                }
+                Err(RuntimeError::Oom(_)) => {
+                    if !self.evict_prefix_snapshot(slot, also_keep) {
+                        return Ok(false);
+                    }
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    /// Can a prefix move between slots ([`AmdEngine::clone_prefix`])?
+    pub fn prefix_clone_capable(&self) -> bool {
+        self.prefix_clone.is_some() && self.shared_prefix.is_none()
+    }
+
+    /// Copy `src`'s armed prefix into `dst`: its snapshot of the carried state (into `dst`'s own
+    /// snapshot buffer) and the first `prefix_rows[src]` rows of every full-context KV cache. The
+    /// live carried state of `dst` is untouched, so a `false` (no snapshot to copy, no buffer, no
+    /// clone geometry) leaves `dst` exactly as a miss would. On `true`, `dst` holds `src`'s
+    /// prefix as if it had prefilled it, and the usual resume restores the state.
+    ///
+    /// Safe against a live `src`: its rows below the snapshot are never written again (decode and
+    /// throwaway rows land at or past its position, and a reprefill invalidates the snapshot
+    /// first), and the snapshot buffer only changes on `src`'s own arm.
+    pub fn clone_prefix(&mut self, src: usize, dst: usize) -> Result<bool> {
+        if src == dst || src >= self.batch || dst >= self.batch || !self.has_snapshot(src) {
+            return Ok(false);
+        }
+        let Some(spans) = self.prefix_clone.clone() else {
+            return Ok(false);
+        };
+        let rows = self.prefix_rows[src];
+        self.prefix_rows[dst] = 0;
+        let mut pairs = Vec::new();
+        if let Some(src_mem) = &self.prefix_snap[src] {
+            let (src_base, total) = (src_mem.base, src_mem.len);
+            if !self.alloc_prefix_snap(dst, src, total)? {
+                return Ok(false);
+            }
+            let dst_mem = self.prefix_snap[dst].as_ref().expect("just allocated");
+            if dst_mem.len != total {
+                return Ok(false);
+            }
+            pairs.push((dst_mem.base, src_base, total));
+        }
+        for span in &spans {
+            let base = self.devp[span.tensor].base;
+            let (from, to) = (
+                base + span.slot_bytes * src as u64,
+                base + span.slot_bytes * dst as u64,
+            );
+            span.copy_spans(rows, |offset, bytes| pairs.push((to + offset, from + offset, bytes)));
+        }
+        let t = std::time::Instant::now();
+        self.be.memcpy_dtod_batch(&pairs)?;
+        crate::obs::pfx::SNAP.add(t.elapsed().as_nanos() as u64);
+        self.prefix_tick += 1;
+        self.prefix_used[src] = self.prefix_tick;
+        self.prefix_used[dst] = self.prefix_tick;
+        self.prefix_rows[dst] = rows;
+        Ok(true)
     }
 
     fn prefix_copy_pairs(

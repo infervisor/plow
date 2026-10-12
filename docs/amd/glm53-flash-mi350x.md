@@ -451,6 +451,42 @@ The packet from config + index alone (no weights) is 70 MB: 4 prefill buckets + 
   even with thinking off, and 16 tokens never reach the answer. The FP32 gate's needles append
   `</think>` (`--gen-suffix`); `scripts/glm53_needle_probe.py` now takes the same `--gen-suffix`
   and both arms re-run with it.
+- 18:55 UTC, long-context needles with `</think>` (exact lengths 4096/16384/32768/61440, depths
+  0.1/0.5/0.9, three needles, served v6 with prefix cache on): plow 36/36, vLLM 36/36, paired
+  verdict PASS (no regressions). The KDA recurrence carries correctly through the chunk loop to
+  60k tokens.
+- 18:55 UTC, prefix-check-v6 (v6, prefix cache on, gate natural/chat prompts): every same-prompt
+  hit stream equals its cold stream (22/22); cached tokens 992/4064/8160 of 1024/4096/8192;
+  hit TTFT ~0.71 s flat vs cold 0.87/1.10/1.51 s. The "prompt + 8 output tokens" re-requests
+  differ from the cold continuation in 9/22, including `nat-code-128` with 0 cached tokens: a
+  prefill of 8 tokens is not bit-equal to 8 one-row decode steps (KDA chunk vs step), not a
+  cache effect. The concurrent phase (c8, each prompt twice) had 0 cached tokens: per-slot
+  snapshots only serve a prompt seated on the same slot, admission seats on the lowest free
+  slot, so a shared prefix at concurrency never meets its snapshot; its stream differences
+  vs the sequential run are rung-8 vs rung-1 numerics (also at 0 cached).
+- 19:00 UTC, cross-slot prefix reuse (plowrt, uncommitted until checked): `prefix::clone_spans`
+  derives each full-context KV cache's per-slot `[heads][ctx][row]` layout from its
+  `HeadNormRope` writer (refuses rings, pooled indexers, unknown kv tensors);
+  `AmdEngine::clone_prefix(src, dst)` copies the donor's carried-state snapshot into the
+  destination's snapshot buffer and the first `snap` rows of every full-context cache, never
+  touching the destination's live state; `AmdServe::adopt_prefix` picks the slot with the
+  longest armed prefix of the new prompt before planning, so the ordinary resume restores it.
+  Seats do not move (decode rung unchanged). Check `prefix-check2-v6`: 8 prompts at c8, then
+  reversed (each on another slot), then + 8 tokens, cache off vs on, streams compared.
+- 19:00 UTC, kernel A/B (subagent, wide-rung RmsNorm wave-per-row + KdaStateStepG per (row,
+  head)), B=128 on nat-pride-1024, streams exact (128/128) in all four runs: new 103.5 / traced
+  86.1 ms vs base 91.9 / 92.4 ms. Inconsistent between the two new runs; analysis pending.
+- 19:15 UTC, prefix-check2-v6 (cross-slot reuse, c8, cache off vs on on one lease): the
+  cross-slot hits are exact — with the cache on, every phase-B stream (the same 8 prompts
+  re-sent in reversed order, each on another slot) equals its phase-A cold stream, 8/8, and the
+  four 4096-token prompts each took 4064 cached tokens from another slot (B wall 6.0-6.2 s vs
+  7.1-7.4 s off). Phase C (prompt + 8 tokens) hit 8160 rows on three 8192 prompts (3.3-3.9 s
+  vs 5.8-8.9 s off). The 8192 prompts missed in B: one snapshot per slot, and the 4096 prompts'
+  hits replaced the 8192 donors' snapshots on the slots they were seated on — a capacity limit,
+  not a correctness one. Three off-vs-on stream differences are near-tie numerics: one is in
+  phase A with 0 cached tokens (`nat-docs-4096` token 9, the same 95496/564 tie seen at c8 in
+  prefix-check-v6), the others diverge at tokens 9 and 14 and their on-arm hit streams equal
+  the on-arm cold streams. The script's strict off-vs-on rule cancelled the grids; re-queued.
 - 17:35 UTC, E10 TP4 bench (packet pkt-glm53flash-tp4-ladder-v4, 4 GPUs, real prompt, streams
   exact at every rung): scalar (rung 8) 55.5 ms, B=8 51.4, B=32 63.3, B=64 74.6 ms (858 tok/s
   per group); prefill 1k 204 ms (TP8 173). Two such groups (DP2xTP4) would serve 128 streams at
