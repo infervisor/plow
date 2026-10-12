@@ -487,6 +487,15 @@ The packet from config + index alone (no weights) is 70 MB: 4 prefill buckets + 
   phase A with 0 cached tokens (`nat-docs-4096` token 9, the same 95496/564 tie seen at c8 in
   prefix-check-v6), the others diverge at tokens 9 and 14 and their on-arm hit streams equal
   the on-arm cold streams. The script's strict off-vs-on rule cancelled the grids; re-queued.
+- 19:40 UTC, wide-rung decode kernels (subagent; commits 0b6d807c + 81490ae3, `op_norm.h`
+  wave-per-row RmsNorm when rows > blocks, `op_kda.h` one KdaStateStepG item per (row, head)
+  with the column loop inside; decode objects only, bit-identical arithmetic). Trace, B=128
+  rank 0: KdaStateStepG span 11.2 -> 7.3 ms (body 200 -> 86 us/packet; floor ~21 us), RmsNorm
+  span 11.7 -> 10.3 ms (the 22 one-block packets 178 -> 118 us; more blocks needs the emitter).
+  Objects v6k (v6 packet, tiers 1/8) validate-v6k: every stream line identical to v6's (r1, B=8,
+  B=32, B=128, 4k/16k/32k/60k prompts), step r1 27.9, B=8 46.0 (v6 47.2), B=32 56.6 (59.2),
+  B=128 84.3 ms (98.8; 1519 tok/s). Same numerics, so the v6 FP32 gate and needles carry
+  over. The v6 grids now run on v6k objects; the recipe's objects are this source.
 - 17:35 UTC, E10 TP4 bench (packet pkt-glm53flash-tp4-ladder-v4, 4 GPUs, real prompt, streams
   exact at every rung): scalar (rung 8) 55.5 ms, B=8 51.4, B=32 63.3, B=64 74.6 ms (858 tok/s
   per group); prefill 1k 204 ms (TP8 173). Two such groups (DP2xTP4) would serve 128 streams at
