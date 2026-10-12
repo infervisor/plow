@@ -533,7 +533,10 @@ class DecodeCase:
         torch = drv.torch
         g = torch.Generator(device="cuda").manual_seed(seed)
         self.H, self.KVH, self.D, self.B, self.window = H, KVH, D, B, window
-        self.kv_stride = 1 << (ctx - 1).bit_length() if ring else ctx
+        # The body stages whole KV tiles (rows past kv_len are masked after the load): the slot
+        # stride is a multiple of the widest tile, as the packet's page-granular KV is (plowrt
+        # rejects a stride the object's tile does not divide).
+        self.kv_stride = 1 << (ctx - 1).bit_length() if ring else -(-ctx // 64) * 64
         self.kv_mask = self.kv_stride - 1 if ring else 0xFFFFFFFF
         bf = torch.bfloat16
         self.q = (torch.randn(B, H, D, device="cuda", generator=g) * D ** -0.5).to(bf)

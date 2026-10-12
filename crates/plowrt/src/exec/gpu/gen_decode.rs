@@ -243,6 +243,14 @@ pub(super) fn routes(
                         "generated decode route: site geometry differs from the object".into(),
                     ));
                 }
+                // The body stages whole KV tiles (rows past kv_len are masked after the load):
+                // a slot stride the tile divides keeps the last tile inside the slot's rows.
+                if d.i[3] % launch.kv_tile.max(1) != 0 {
+                    return Err(RuntimeError::Rejected(
+                        "generated decode route: KV stride is not a multiple of the object's KV tile"
+                            .into(),
+                    ));
+                }
                 Ok(Some(LibraryRoute::Gen(GenDecodeRoute {
                     be: Arc::clone(be),
                     launch: Arc::clone(launch),

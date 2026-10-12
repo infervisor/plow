@@ -200,6 +200,20 @@ class VerdictTests(unittest.TestCase):
         self.assertEqual(g.scored_len([5, 7, 9], {7}), 2)
         self.assertEqual(g.scored_len([5, 9], {7}), 2)
 
+    def test_trimming_keeps_a_position(self):
+        # one scored position (an immediate stop token): trimming never empties the sample, and
+        # the capture scores against itself; a zero fraction trims nothing.
+        pos = [dict(top=dist((7, 0.9), (9, 0.1)), margin=2.2)]
+        ref = dict(sha256="x", meta=dict(eos=[7]), cases=[dict(id="a", kind="chat", prompt_ids=[1], cont=[7], pos=pos)])
+        cap = dict(arm="a", ref_sha256="x", cases={"a": dict(free=[7], free_text="", pos={"0": pos[0]["top"]})})
+        s = g.score(ref, cap)
+        self.assertEqual((s["positions"], s["kl_trim_mean"], s["kl_mean"]), (1, 0.0, 0.0))
+        self.assertEqual(g.verdict(s, s), [])
+        ref["cases"][0].update(cont=[5, 7], pos=[dict(top=dist((5, 0.6), (9, 0.4)), margin=0.4), pos[0]])
+        cap["cases"]["a"].update(free=[5, 7], pos={"0": dist((9, 0.9), (5, 0.1)), "1": pos[0]["top"]})
+        self.assertGreater(g.score(ref, cap, kl_trim_frac=0.0)["kl_trim_mean"], 0.0)  # nothing trimmed
+        self.assertEqual(g.score(ref, cap, kl_trim_frac=0.01)["kl_trim_mean"], 0.0)  # the one outlier
+
     def test_needle_floor_is_absolute(self):
         peer = dict(self.peer, needle_acc=0.5)
         self.assertTrue(any("needle_min" in w for w in g.verdict(dict(peer), peer)))
@@ -270,10 +284,19 @@ class CampaignScoreTests(unittest.TestCase):
             self.assertFalse(res["by_concurrency"]["c8"]["pass"])
             self.assertTrue(all(w.startswith("c8:") for w in res["why"]), res["why"])
             self.assertEqual(res["top1_decisive"], 1.0)  # headline = c1
-            # a missing same-concurrency peer falls back to c1 and says so
+            # a missing same-concurrency peer fails the gate (a c1 peer is not the c8 distribution)
             cfg["vllm_capture"] = {"c1": str(Path(tmp) / "v1.json")}
             res = campaign.gate_score("llm_fp32_ref", cfg, d)
-            self.assertIn("missing in vllm_capture", res["by_concurrency"]["c8"]["note"])
+            self.assertFalse(res["pass"])
+            self.assertEqual(res["why"], ["peer at c8 missing in vllm_capture"])
+            # a capture recorded at another concurrency than the one it is scored as fails
+            cfg["vllm_capture"] = {"c1": str(Path(tmp) / "v1.json"), "c8": str(Path(tmp) / "v8.json")}
+            (d / "plow-c8.json").write_text(json.dumps(dict(make_cap(ref, "plow-c8"), concurrency=1)))
+            res = campaign.gate_score("llm_fp32_ref", cfg, d)
+            self.assertFalse(res["pass"])
+            self.assertEqual(res["why"], ["c8: plow-c8.json captured at c1, scored as c8"])
+            (d / "plow-c8.json").write_text(json.dumps(dict(make_cap(ref, "plow-c8"), concurrency=8)))
+            self.assertTrue(campaign.gate_score("llm_fp32_ref", cfg, d)["pass"])
 
 
 class ScaledTensorTests(unittest.TestCase):

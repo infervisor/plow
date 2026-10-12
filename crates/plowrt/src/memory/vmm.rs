@@ -2641,9 +2641,12 @@ impl VmmKv {
         stats_of(&self.shared)
     }
 
-    /// Device bytes of every physical block alive now (mapped, cached, pooled).
+    /// Device bytes of every physical block alive now (mapped, cached, pooled). A retired block
+    /// leaves the live count for the pool but keeps its device memory: admission counts it here,
+    /// or it is neither held nor free and a request the pool could serve is refused.
     pub fn mapped_bytes(&self) -> u64 {
-        stats_of(&self.shared).blocks_live * self.shared.block_bytes
+        let s = stats_of(&self.shared);
+        (s.blocks_live + s.blocks_pooled) * self.shared.block_bytes
     }
 
     pub fn block_bytes(&self) -> u64 {

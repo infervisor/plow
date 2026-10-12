@@ -758,7 +758,7 @@ static __device__ void d_qwen_gdn_conv_prefill_seq(__nv_bfloat16* out, const __n
         // tile) ran 83 vs 234 us at 4096 x 8192 and 24 vs 38 us at 1024 rows (one op, H100);
         // 8-token tiles were slower again. Same fmaf chain and sigmoid per output as the serial
         // walk below.
-        constexpr unsigned VT = 16, PF = DEPTH;
+        constexpr unsigned VT = 16, PD = DEPTH;
         const unsigned cg = channels >> 3, ntiles = (tokens + VT - 1) / VT;
         for (unsigned i = slice * blockDim.x + threadIdx.x; i < cg * ntiles; i += nblk * blockDim.x) {
             const unsigned c0 = (i % cg) * 8u, tile = i / cg;
@@ -784,28 +784,28 @@ static __device__ void d_qwen_gdn_conv_prefill_seq(__nv_bfloat16* out, const __n
                 qwen_bf_unpack8(*(const uint4*)(in + (size_t)(t0 - 2) * channels + c0), r1);
                 qwen_bf_unpack8(*(const uint4*)(in + (size_t)(t0 - 1) * channels + c0), r2);
             }
-            // Rolled groups of PF rows with the next group's loads in flight: unrolled, the
+            // Rolled groups of PD rows with the next group's loads in flight: unrolled, the
             // 128 sigmoids of a tile were ~4000 straight-line instructions (64 KB) that every
             // warp streamed once, and ncu put 46% of the light conv's warp stalls on
             // instruction fetch (no_instruction; 61 us per 1024-row site against a ~14 us byte
             // floor, flat in the grid size); rolled, the row loads showed (long_scoreboard 23%:
             // the two blocks' warps load in lockstep). 1024-row site, light entry: 61 -> 43
             // (rolled, 4 rows) -> 39 us (2 rows).
-            uint4 nx[PF];
+            uint4 nx[PD];
 #pragma unroll
-            for (unsigned u = 0; u < PF; u++)
+            for (unsigned u = 0; u < PD; u++)
                 nx[u] = u < nt ? *(const uint4*)(in + (size_t)(t0 + u) * channels + c0)
                                : make_uint4(0u, 0u, 0u, 0u);
 #pragma unroll 1
-            for (unsigned t = 0; t < VT; t += PF) {
+            for (unsigned t = 0; t < VT; t += PD) {
                 if (t >= nt) break;
-                uint4 nn[PF];
+                uint4 nn[PD];
 #pragma unroll
-                for (unsigned u = 0; u < PF; u++)
-                    nn[u] = t + PF + u < nt ? *(const uint4*)(in + (size_t)(t0 + t + PF + u) * channels + c0)
+                for (unsigned u = 0; u < PD; u++)
+                    nn[u] = t + PD + u < nt ? *(const uint4*)(in + (size_t)(t0 + t + PD + u) * channels + c0)
                                             : make_uint4(0u, 0u, 0u, 0u);
 #pragma unroll
-                for (unsigned u = 0; u < PF; u++) {
+                for (unsigned u = 0; u < PD; u++) {
                     float x[8], o[8];
                     qwen_bf_unpack8(nx[u], x);
 #pragma unroll
@@ -820,7 +820,7 @@ static __device__ void d_qwen_gdn_conv_prefill_seq(__nv_bfloat16* out, const __n
                     if (t + u < nt) *(uint4*)(out + (size_t)(t0 + t + u) * channels + c0) = qwen_bf_pack8(o);
                 }
 #pragma unroll
-                for (unsigned u = 0; u < PF; u++) nx[u] = nn[u];
+                for (unsigned u = 0; u < PD; u++) nx[u] = nn[u];
             }
             if (tile == 0) {
 #pragma unroll

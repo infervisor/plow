@@ -1550,17 +1550,24 @@ def fp32_capture_name(arm: str, c: int, concs: list[int]) -> str:
     return arm if len(concs) == 1 else f"{arm}-c{c}"
 
 
-def fp32_peer_path(g: dict, c: int, concs: list[int], d: Path) -> tuple[Path, str]:
-    """(peer capture for concurrency c, note when it is not the same-concurrency peer)."""
+def fp32_peer_path(g: dict, c: int, concs: list[int], d: Path) -> tuple[Path | None, str]:
+    """(peer capture for concurrency c, note). The peer is the same-concurrency vLLM capture: a
+    `vllm_capture` table lacking c{c} yields None (the gate fails; a c1 peer is a different,
+    quieter distribution and must not stand in), one path for several concurrencies is noted."""
     vc = g.get("vllm_capture")
     if isinstance(vc, dict):
         if f"c{c}" in vc:
             return Path(vc[f"c{c}"]), ""
-        fallback = vc.get("c1") or next(iter(vc.values()))
-        return Path(fallback), f"peer at c{c} missing in vllm_capture; scored against {Path(fallback).name}"
+        return None, f"peer at c{c} missing in vllm_capture"
     if vc:
         return Path(vc), "" if len(concs) == 1 else f"one vllm_capture for every concurrency ({Path(vc).name})"
     return d / f"{fp32_capture_name('vllm', c, concs)}.json", ""
+
+
+def fp32_capture_concurrency(cap: dict, c: int, name: str) -> list[str]:
+    """Why a capture is not the c{c} arm it is scored as (captures record their concurrency)."""
+    rec = cap.get("concurrency")
+    return [f"{name} captured at c{rec}, scored as c{c}"] if rec is not None and int(rec) != c else []
 
 
 def fp32_ref_module():
@@ -1590,6 +1597,9 @@ def gate_score(key: str, g: dict, d: Path) -> dict:
         mod = fp32_ref_module()
         concs = fp32_concurrencies(g)
         plan = [(c, d / f"{fp32_capture_name('plow', c, concs)}.json", *fp32_peer_path(g, c, concs, d)) for c in concs]
+        no_peer = [note for _, _, peer, note in plan if peer is None]
+        if no_peer:
+            return {"pass": False, "why": no_peer}
         absent = [str(p) for p in [Path(g["reference"]), *(p for _, cand, peer, _ in plan for p in (cand, peer))]
                   if not p.is_file()]
         if absent:
@@ -1601,8 +1611,10 @@ def gate_score(key: str, g: dict, d: Path) -> dict:
         metrics = ("kl_mean", "kl_trim_mean", "kl_p95", "kl_p99", "kl_over", "top1_decisive", "cont_frac", "needle_acc")
         table, by_c = {}, {}
         for i, (c, cand_p, peer_p, note) in enumerate(plan):
-            cand, vllm = (mod.score_with(ref, json.loads(p.read_text()), th) for p in (cand_p, peer_p))
+            caps = [json.loads(p.read_text()) for p in (cand_p, peer_p)]
+            cand, vllm = (mod.score_with(ref, cap, th) for cap in caps)
             bad = mod.verdict(cand, vllm, th)
+            bad += fp32_capture_concurrency(caps[0], c, cand_p.name) + fp32_capture_concurrency(caps[1], c, peer_p.name)
             why += [f"c{c}: {w}" for w in bad] if len(concs) > 1 else bad
             row = {m: cand.get(m) for m in metrics} | {"vllm_" + m: vllm.get(m) for m in metrics}
             row.update({"pass": not bad, "why": bad, "peer": str(peer_p), **({"note": note} if note else {})})

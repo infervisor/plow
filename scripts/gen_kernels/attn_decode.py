@@ -8,18 +8,22 @@ heads. `nsplit` is a launch operand (grid x = kvh * nsplit, at most NSPLIT_MAX):
 write f32 partials and the last split to arrive merges them (no second launch; `ctr[b, kvh]`
 counts arrivals and is left at zero).
 """
-import tilelang
-import tilelang.language as T
-
-PASS_CONFIGS = {
-    tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
-    tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
-    tilelang.PassConfigKey.TL_DISABLE_SAFE_MEMORY_ACCESS: True,
-}
 NSPLIT_MAX = 8
 
 
+def pass_configs():
+    """TileLang is imported on first use: the catalog imports this module for its entry's
+    signature (`check`, hand-entry builds) on machines without it."""
+    import tilelang
+    return {
+        tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
+        tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
+        tilelang.PassConfigKey.TL_DISABLE_SAFE_MEMORY_ACCESS: True,
+    }
+
+
 def build(hd, gqa, block_n, stages, threads=128):
+    import tilelang.language as T
     g = gqa
     batch, slots, kv_stride, kvh = T.dynamic("batch, slots, kv_stride, kvh")
     heads = kvh * gqa
@@ -154,6 +158,7 @@ def build(hd, gqa, block_n, stages, threads=128):
 
 
 def compile(hd, gqa, block_n, stages, threads=128, target=None):
+    import tilelang
     return tilelang.compile(build(hd, gqa, block_n, stages, threads),
                             target=target or {"kind": "cuda", "arch": "sm_90a"},
-                            pass_configs=PASS_CONFIGS)
+                            pass_configs=pass_configs())

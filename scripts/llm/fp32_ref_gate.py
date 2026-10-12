@@ -168,7 +168,10 @@ def score(ref, cap, tie_margin=DEFAULTS["tie_margin"], kl_trim_frac=DEFAULTS["kl
         cont_dec = [x for g in gs for x in g["cont_dec"]]
         needle = [x for g in gs for x in g["needle"]]
         srt = sorted(kl)
-        trim = srt[: len(srt) - max(1, round(kl_trim_frac * len(srt)))] if srt else []
+        # At least one position trimmed when a fraction is asked for, none at 0, and never the
+        # last one (a one-position reference, e.g. an immediate stop token, still scores).
+        cut = 0 if kl_trim_frac <= 0 else max(1, round(kl_trim_frac * len(srt)))
+        trim = srt[: len(srt) - min(cut, len(srt) - 1)] if srt else []
         over = sum(x > kl_over_at for x in kl)
         out = dict(positions=len(kl), kl_mean=sum(kl) / len(kl) if kl else float("nan"),
                    kl_trim_mean=sum(trim) / len(trim) if trim else float("nan"),
