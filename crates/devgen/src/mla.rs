@@ -662,6 +662,58 @@ fn declare_glm53(b: &mut Builder, c: &GlmCfg, rows: u32, dbatch: u32, pos: u32) 
     }
 }
 
+/// mHC sequence-parallel seam (GLM-5.3-Flash prefill buckets under [`glm_sp`]): the four
+/// residual streams, the mixes and the layer input live on this rank's `t/tp` row band and
+/// every hyper-connection op runs on the band. The block input is all-gathered (the attention's
+/// input norm or the FFN norm writes its band into peer slot 3; a KDA layer's HyperConnPre
+/// writes slot 3 directly), and the block output is reduce-scattered in place into the
+/// partial's own slot (`og_tp` / `dg_tp`), whose band is the HyperConnPost's raw input. The
+/// ordering of a slot's next writer behind every peer's read is the existing seam argument:
+/// each gather is followed by a reduce-scatter rendezvous before the slot is written again.
+struct Glm53Band {
+    rows: u32,
+    residual: [u32; 2],
+    layer_input: u32,
+    h2: u32,
+    mixes: u32,
+    post_mix: u32,
+    comb_mix: u32,
+    x: u32,
+    og: u32,
+    dg: u32,
+}
+
+impl Glm53Band {
+    fn declare(b: &mut Builder, c: &GlmCfg, n: &GlmTn, s: &Glm53State, t: u32) -> Self {
+        let (tp, h) = (c.tp, c.hidden as u64);
+        Self {
+            rows: t / tp,
+            residual: [
+                glm_band(b, s.residual[0], t, tp, 4 * h * 2),
+                glm_band(b, s.residual[1], t, tp, 4 * h * 2),
+            ],
+            layer_input: glm_band(b, s.layer_input, t, tp, h * 2),
+            h2: glm_band(b, n.h2_tp, t, tp, h * 2),
+            mixes: glm_band(b, s.mixes, t, tp, 24 * 4),
+            post_mix: glm_band(b, s.post_mix, t, tp, 4 * 4),
+            comb_mix: glm_band(b, s.comb_mix, t, tp, 16 * 4),
+            x: glm_band(b, n.x, t, tp, h * 2),
+            og: glm_band(b, n.og_tp, t, tp, h * 2),
+            dg: glm_band(b, n.dg_tp, t, tp, h * 2),
+        }
+    }
+
+    fn res(&self, s: &Glm53State, residual: u32) -> u32 {
+        if residual == s.residual[0] {
+            self.residual[0]
+        } else {
+            self.residual[1]
+        }
+    }
+}
+
+/// `peer_input`: write the layer input into this rank's band of peer slot 3 (for a following
+/// all-gather) instead of the local band.
 #[allow(clippy::too_many_arguments)]
 fn emit_glm53_hc_pre(
     b: &mut Builder,
@@ -672,10 +724,23 @@ fn emit_glm53_hc_pre(
     layer: usize,
     rows: u32,
     dep: u32,
+    band: Option<&Glm53Band>,
+    peer_input: bool,
 ) -> u32 {
     let w = &s.hc[layer];
+    let (residual, mixes, post_mix, comb_mix, layer_input, rows) = match band {
+        Some(v) => (
+            v.res(s, residual),
+            v.mixes,
+            v.post_mix,
+            v.comb_mix,
+            if peer_input { v.h2 } else { v.layer_input },
+            v.rows,
+        ),
+        None => (residual, s.mixes, s.post_mix, s.comb_mix, s.layer_input, rows),
+    };
     let cm = b.emit(DevOp::GemvF32, b.all(), &[dep], |d| {
-        d.t[0] = s.mixes;
+        d.t[0] = mixes;
         d.t[1] = residual;
         d.t[2] = if ffn { w.ffn_fn } else { w.attn_fn };
         d.i[0] = rows;
@@ -687,10 +752,10 @@ fn emit_glm53_hc_pre(
         (0..rows.min(b.n_cu())).collect(),
         &[cm],
         |d| {
-            d.t[0] = s.post_mix;
-            d.t[1] = s.comb_mix;
-            d.t[2] = s.layer_input;
-            d.t[3] = s.mixes;
+            d.t[0] = post_mix;
+            d.t[1] = comb_mix;
+            d.t[2] = layer_input;
+            d.t[3] = mixes;
             d.t[4] = residual;
             d.t[5] = if ffn { w.ffn_scale } else { w.attn_scale };
             d.t[6] = if ffn { w.ffn_base } else { w.attn_base };
@@ -704,6 +769,9 @@ fn emit_glm53_hc_pre(
     )
 }
 
+/// `raw` is the block output: the TP-summed `n.attn`, or under the band seam this rank's band
+/// of the reduce-scattered partial (the caller passes the band view).
+#[allow(clippy::too_many_arguments)]
 fn emit_glm53_hc_post(
     b: &mut Builder,
     c: &GlmCfg,
@@ -713,7 +781,12 @@ fn emit_glm53_hc_post(
     residual: u32,
     rows: u32,
     dep: u32,
+    band: Option<&Glm53Band>,
 ) -> u32 {
+    let (out, residual, post_mix, comb_mix, rows) = match band {
+        Some(v) => (v.res(s, out), v.res(s, residual), v.post_mix, v.comb_mix, v.rows),
+        None => (out, residual, s.post_mix, s.comb_mix, rows),
+    };
     b.emit(
         DevOp::HyperConnPost,
         (0..rows.min(b.n_cu())).collect(),
@@ -722,8 +795,8 @@ fn emit_glm53_hc_post(
             d.t[0] = out;
             d.t[1] = raw;
             d.t[2] = residual;
-            d.t[3] = s.post_mix;
-            d.t[4] = s.comb_mix;
+            d.t[3] = post_mix;
+            d.t[4] = comb_mix;
             d.i[0] = rows;
             d.i[1] = 4;
             d.i[2] = c.hidden;
@@ -746,6 +819,11 @@ fn emit_glm53_program(
     let all = b.all();
     let xr = xr_cus_capped(b.n_cu(), &all);
     let mut xgate = 0;
+    // mHC sequence-parallel seam (prefill buckets of >= GLM_SP_MIN_ROWS rows under
+    // PLOW_GLM_SEQ_PAR): see `Glm53Band`.
+    let band = (prefill && glm_sp(c, n, b, rows)).then(|| Glm53Band::declare(b, c, n, s, rows));
+    let bv = band.as_ref();
+    let rows_b = bv.map_or(rows, |v| v.rows);
     let emb = b.emit(DevOp::Embed, all.clone(), &[], |d| {
         d.t[0] = n.x;
         d.t[1] = n.emb;
@@ -756,12 +834,12 @@ fn emit_glm53_program(
     });
     let mut dep = b.emit(
         DevOp::HyperConnPost,
-        (0..rows.min(b.n_cu())).collect(),
+        (0..rows_b.min(b.n_cu())).collect(),
         &[emb],
         |d| {
-            d.t[0] = s.residual[0];
-            d.t[1] = n.x;
-            d.i[0] = rows;
+            d.t[0] = bv.map_or(s.residual[0], |v| v.residual[0]);
+            d.t[1] = bv.map_or(n.x, |v| v.x);
+            d.i[0] = rows_b;
             d.i[1] = 4;
             d.i[2] = c.hidden;
             d.i[3] = 1;
@@ -781,7 +859,10 @@ fn emit_glm53_program(
     for l in 0..c.layers as usize {
         let residual = s.residual[ri];
         let next = s.residual[ri ^ 1];
-        let c_pre = emit_glm53_hc_pre(b, c, s, residual, false, l, rows, dep);
+        // A KDA layer reads the full layer input: its HyperConnPre writes the band into peer
+        // slot 3 and the gather below assembles it. An MLA layer gathers its own input norm.
+        let peer_input = bv.is_some() && !c.is_softmax(l as u32);
+        let c_pre = emit_glm53_hc_pre(b, c, s, residual, false, l, rows, dep, bv, peer_input);
         let c_attn = if c.is_softmax(l as u32) {
             if prefill {
                 emit_glm_mla_prefill(
@@ -818,6 +899,18 @@ fn emit_glm53_program(
             }
         } else {
             let dst = if c.tp > 1 { n.og_tp } else { n.attn };
+            let c_in = if bv.is_some() {
+                crate::emit_xall_gather(
+                    b,
+                    &mut xgate,
+                    &xr,
+                    &[c_pre],
+                    &[(s.layer_input, rows * c.hidden, 3 * n.slot_b)],
+                    c.tp,
+                )
+            } else {
+                c_pre
+            };
             let (co, _) = crate::kda::emit_kda_mixer(
                 b,
                 &kc,
@@ -829,10 +922,23 @@ fn emit_glm53_program(
                 Some(dst),
                 b.n_cu(),
                 false,
-                &[c_pre],
+                &[c_in],
                 !prefill && (rows > 1 || emit_config::active().decode_ladder_on()),
             );
-            if c.tp > 1 {
+            if bv.is_some() {
+                crate::emit_xreduce_scatter(
+                    b,
+                    &mut xgate,
+                    &xr,
+                    &[co],
+                    n.og_tp,
+                    rows * c.hidden,
+                    c.tp,
+                    0,
+                    None,
+                    None,
+                )
+            } else if c.tp > 1 {
                 emit_xreduce(
                     b,
                     &mut xgate,
@@ -848,24 +954,42 @@ fn emit_glm53_program(
                 co
             }
         };
-        let c_post = emit_glm53_hc_post(b, c, s, next, n.attn, residual, rows, c_attn);
+        let raw = bv.map_or(n.attn, |v| v.og);
+        let c_post = emit_glm53_hc_post(b, c, s, next, raw, residual, rows, c_attn, bv);
         ri ^= 1;
         let residual = s.residual[ri];
         let next = s.residual[ri ^ 1];
-        let c_pre_ffn = emit_glm53_hc_pre(b, c, s, residual, true, l, rows, c_post);
-        let c_norm = b.emit(
-            DevOp::RmsNorm,
-            pf_wide_cus(b.n_cu(), rows),
-            &[c_pre_ffn],
-            |d| {
-                d.t[0] = n.xn2;
-                d.t[1] = s.layer_input;
-                d.t[2] = n.lw[l].gpost;
-                d.i[0] = rows;
-                d.i[1] = c.hidden;
-                d.f[0] = c.eps;
-            },
-        );
+        let c_pre_ffn = emit_glm53_hc_pre(b, c, s, residual, true, l, rows, c_post, bv, false);
+        let c_norm = if bv.is_some() {
+            glm_sp_norm_gather(
+                b,
+                n,
+                rows,
+                c.tp,
+                c.hidden,
+                c.eps,
+                n.xn2,
+                s.layer_input,
+                n.lw[l].gpost,
+                &[c_pre_ffn],
+                &mut xgate,
+                &xr,
+            )
+        } else {
+            b.emit(
+                DevOp::RmsNorm,
+                pf_wide_cus(b.n_cu(), rows),
+                &[c_pre_ffn],
+                |d| {
+                    d.t[0] = n.xn2;
+                    d.t[1] = s.layer_input;
+                    d.t[2] = n.lw[l].gpost;
+                    d.i[0] = rows;
+                    d.i[1] = c.hidden;
+                    d.f[0] = c.eps;
+                },
+            )
+        };
         let c_ffn = if c.is_dense(l as u32) {
             emit_glm_dense_ffn(
                 b, c, n, l, rows, enc, n.xnext, c_norm, &mut xgate, &xr, true,
@@ -883,17 +1007,20 @@ fn emit_glm53_program(
                 b, c, n, l, rows, enc, n.xnext, c_norm, &mut xgate, &xr, true,
             )
         };
-        dep = emit_glm53_hc_post(b, c, s, next, n.attn, residual, rows, c_ffn);
+        let raw = bv.map_or(n.attn, |v| v.dg);
+        dep = emit_glm53_hc_post(b, c, s, next, raw, residual, rows, c_ffn, bv);
         ri ^= 1;
     }
+    // Under the band seam `n.x` is valid on this rank's band only; the tail's final norm
+    // runs on the band and gathers.
     let contract = b.emit(
         DevOp::HyperConnPost,
-        (0..rows.min(b.n_cu())).collect(),
+        (0..rows_b.min(b.n_cu())).collect(),
         &[dep],
         |d| {
-            d.t[0] = n.x;
-            d.t[2] = s.residual[ri];
-            d.i[0] = rows;
+            d.t[0] = bv.map_or(n.x, |v| v.x);
+            d.t[2] = bv.map_or(s.residual[ri], |v| v.res(s, s.residual[ri]));
+            d.i[0] = rows_b;
             d.i[1] = 4;
             d.i[2] = c.hidden;
             d.i[3] = 2;
@@ -7804,7 +7931,10 @@ pub(crate) fn emit_glm_mla_prefill(
     let idx_chain = w.iwk != TENSOR_NONE && (sparse || (c.dsa(ctx) && c.index_kpool == 1));
 
     // 1 input_layernorm, T rows (on the band + all-gather under the sequence-parallel seams).
-    let sp = !raw_output && glm_sp(c, n, b, t);
+    // Under `raw_output` (GLM-5.3's hyper-connection program) the seam is the mHC band seam:
+    // `x_in` is valid on this rank's band only and the o_proj partial is reduce-scattered,
+    // not residualised — see `Glm53Band`.
+    let sp = glm_sp(c, n, b, t);
     // The row-band fold writes `rb.oat`, but the o_proj that reads it lives inside the `sp`
     // arm; with `sp` off, o_proj reads `n.oat` and nothing wrote it that layer — legal,
     // deterministic, wrong. Fail the emit instead of shipping silent long-context corruption.
@@ -8598,6 +8728,7 @@ pub(crate) fn emit_glm_mla_prefill(
         if rowband {
             // Row-band arm: the fold already wrote this rank's `[T/8][nh][vd]` rows, so the
             // full-width o_proj writes the band the reduce-scatter would have left in `og_tp`.
+            assert!(!raw_output, "row-band attention has no raw_output (mHC) arm");
             let rb = rb.as_ref().expect("declared with the arm");
             let og_band = glm_band(b, n.og_tp, t, tp, h as u64 * 2);
             let c_p = emit_glm_lt_ext(
@@ -8640,6 +8771,10 @@ pub(crate) fn emit_glm_mla_prefill(
             None,
             None,
         );
+        if raw_output {
+            // mHC band seam: the caller reads this rank's band of `og_tp`.
+            return c_rs;
+        }
         if emit_config::active().glm_fuse_seam_rn {
             let c_n =
                 glm_sp_residual_norm(b, n, t, tp, h, eps, n.xmid, x_in, n.og_tp, w.gpost, &[c_rs]);
@@ -9326,8 +9461,9 @@ fn emit_glm_moe_ffn_prefill(
         let kb = xr_band_k(t, "moe");
         let rows = t / kb;
         // Sequence-parallel FFN seam: reduce-scatter, then the residual on the owned band only;
-        // the next layer's input norm (or the tail's final norm) gathers.
-        let sp = !raw_output && glm_sp(c, n, b, t);
+        // the next layer's input norm (or the tail's final norm) gathers. Under `raw_output`
+        // (mHC band seam) the reduce-scatter is the result: the caller reads its `dg_tp` band.
+        let sp = glm_sp(c, n, b, t);
         assert!(
             !sp || kb == 1,
             "PLOW_GLM_SEQ_PAR cannot combine with PLOW_GLM_XR_BAND"
@@ -9403,20 +9539,21 @@ fn emit_glm_moe_ffn_prefill(
                 )
             })
             .collect();
-        if sp {
-            glm_sp_residual(b, t, tp, h, x_out, n.xmid, n.dg_tp, &xr_deps)
-        } else if raw_output {
-            // Mirrors emit_glm_mla_prefill's own raw_output tail exactly: n.attn already holds
-            // the correct zero-residual TP-summed result (the per-band MoeCombinePf above always
-            // passes a null residual), so there is nothing left to add — just join every band's
-            // completion into one dep for the caller to wait on. A single band returns its own
-            // dep directly; more than one needs an explicit (data-free) fan-in, since nothing
-            // else here depends on every band the way the Residual op below does.
+        if raw_output {
+            // Mirrors emit_glm_mla_prefill's own raw_output tail exactly: n.attn (this rank's
+            // band of `dg_tp` under `sp`) already holds the correct zero-residual TP-summed
+            // result (the per-band MoeCombinePf above always passes a null residual), so there
+            // is nothing left to add — just join every band's completion into one dep for the
+            // caller to wait on. A single band returns its own dep directly; more than one
+            // needs an explicit (data-free) fan-in, since nothing else here depends on every
+            // band the way the Residual op below does.
             if xr_deps.len() == 1 {
                 xr_deps[0]
             } else {
                 b.emit(DevOp::Nop, vec![0], &xr_deps, |_| {})
             }
+        } else if sp {
+            glm_sp_residual(b, t, tp, h, x_out, n.xmid, n.dg_tp, &xr_deps)
         } else if kb == 1 && xr_res_fold() {
             // XR+Residual fold — the collective wrote x_out = xmid + reduced itself.
             xr_deps[0]
@@ -11338,6 +11475,21 @@ fn emit_glm_dense_ffn_rows(
             d.i[1] = DENSE_TOP_K;
             d.i[2] = rows;
         });
+        if raw_output && glm_sp(c, n, b, rows) {
+            // mHC band seam (prefill buckets only): the caller reads its band of `dg_tp`.
+            return crate::emit_xreduce_scatter(
+                b,
+                xgate,
+                xr_cus,
+                &[c_cmb],
+                n.dg_tp,
+                rows * h,
+                tp,
+                n.slot_b,
+                None,
+                None,
+            );
+        }
         let c_xr = emit_xreduce(
             b,
             xgate,

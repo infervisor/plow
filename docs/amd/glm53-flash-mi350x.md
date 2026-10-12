@@ -312,6 +312,60 @@ The packet from config + index alone (no weights) is 70 MB: 4 prefill buckets + 
   decode tier objects (`lowrung1/`, `lowrung8/`, narrower GEMV bodies for rungs 1 and 8 — the
   loader logged "no decode tiers", so every rung ran the 128-wide object: c1 51 ms vs 28 ms on
   the single-rung packet) are building for a follow-up grid.
+- 16:50 UTC, E8 mHC sequence-parallel prefill seam (mla.rs, pending validation). On this
+  model `PLOW_GLM_SEQ_PAR` was inert: `glm_sp` was consulted only under `!raw_output`, and the
+  hyper-connection program makes every seam `raw_output` (the v4sp packet differed from v4 by
+  one `XAllGather` per 2048/8192 bucket). Now, for prefill buckets with t >= 2048 and the knob
+  on, `Glm53Band` declares `@band<t>` views of the four residual streams, the mixes, the layer
+  input, `x`, `og_tp` and `dg_tp`; every hyper-connection op (expand/contract HyperConnPost,
+  mix GemvF32, HyperConnPre, both HyperConnPost per layer) runs on this rank's t/tp rows; the
+  block inputs are all-gathered (MLA layers through the prefill's existing band input-norm arm,
+  KDA layers from a HyperConnPre that writes peer slot 3, the FFN through `glm_sp_norm_gather`);
+  the o_proj / KDA / MoE / dense partials are reduce-scattered in place (new `raw_output` arms
+  at the three seams) and the HyperConnPost reads the band. Same collective bytes as the
+  all-reduce; the per-op trace at 4k put ~130 of 471 ms in these row-local ops, so the expected
+  TTFT gain is ~24% at 4k and 8k (the 128/512 buckets are unchanged). `cargo test -p devgen
+  --lib mla` 208 pass. Packet v4sp2 (`PLOW_GLM_SEQ_PAR=1 PLOW_GLM_SEQ_PAR_PROJ=0`, GEMMs
+  byte-identical), objects = v4sp (`PLOW_HAS_XALLGATHER=1`). Validation queued behind the FP32
+  capture: real-prompt streams at the 2048 bucket (ragged), v4 vs v4sp2 at a 4096-token prompt
+  (8192 bucket), prefill sweep 1k/2k/4k/8k.
+- 17:00 UTC, v4 FP32 gate scored (capture at concurrency 16, 46 cases / 88 requests): FAIL,
+  but now kl_mean 0.43 (was 4.75), needles 18/18 (was 0/18), cont_frac 0.754 (vLLM 0.730).
+  Per-position KL: 5.3 at position 0 (the first token after prefill), 0.0-0.26 after; the 35
+  "decode" positions with KL > 1 all sit where teacher-forcing re-issued a request, i.e. they
+  are prefill first tokens too. At those positions the sampled token is right and the reported
+  top-k is another distribution (token ids 0, 3, 9, 13 at the top). Cause: `AmdServe::logits_row`
+  read row `slot` of `act.logits`, but a per-slot prefill tail writes ONE logit row at row 0
+  (`i[0] = 1`, `a_row0 = clen - 1`); only decode rows are slot-indexed. Fix (serve/engine.rs):
+  a per-slot `lp_row` as the CPU engine keeps — 0 after a prefill, the slot after a decode
+  dispatch, unknown (logprobs refused) for token-batch body rows. Re-capture queued
+  (`fp32cap-plow-v4b`, same v4 packet, tiered objects). The model math was never the problem:
+  the decode positions are already at KL ~0.2 vs vLLM's 0.03, which is the next thing to look at
+  if the gate still fails on kl_mean after the fix.
+- 17:00 UTC, tiered objects validated (`validate-v4t`): streams exact at B=8/32/128; steps
+  B=8 49.3 ms (128-wide object 51.0), B=32 58.5 (59.8), B=128 97.5 (91.2, noise or the tier
+  pick). Rung 8 stays ~50 ms because the ladder emits its GEMVs as `GemmSmall` from
+  `PLOW_GLM_DECODE_GEMM_ROWS=8`; c1 at 27 ms needs rung 1 (`PLOW_DECODE_MIN_RUNG=1`, in the
+  running v4t grid). The first E8 validation refused to load: the sp2 object dir carried the v4
+  tier links, which stamp the v4 packet hash; tiers are being rebuilt from the sp2 config and
+  the validation re-queued without them.
+- 17:05 UTC, served grid v4t (tiers + `PLOW_DECODE_MIN_RUNG=1` + `PLOW_PF_INTERLEAVE=512` +
+  `PLOW_PF_CHUNK=512`), isl 1024 rep 1: c1 TPOT 27.2 ms (v4: 51.0; the rung-1 program on the
+  rung-1 tier) / TTFT 267 (176); c8 55.2 (59.5) / 1704; c32 82.0 (105) / 7057; c64 147 (180) /
+  14900, out tok/s 242 (326). Rung-1 admission is the c1 win; the 512-row chunk cap is a loss:
+  every prompt runs as 512-bucket chunks with a decode step between them, so TTFT and prefill
+  throughput collapse at c32+. Next grid v4t2: tiers + MIN_RUNG=1 + `PLOW_PF_INTERLEAVE=4096`,
+  no chunk cap (bucket-shaped prefill, a decode step after at most 4096 prefill rows).
+- 17:05 UTC, decode numerics are not the gate's problem: at the 868 pure decode positions of
+  the v4 capture (every scored position that is not a request's first token) plow's KL against
+  the FP32 reference is mean 0.013 / p50 0.0003 / p99 0.17 / max 0.70, against vLLM's 0.036 /
+  0.0008 / 0.56 / 1.84 on the same positions; by prompt length plow is tighter at every length.
+  The 162 request-first positions carry mean 2.65 (vLLM 0.04) — the logits-row bug above.
+- 17:15 UTC, E8 validated (`validate-sp2b`, packet v4sp2 + its own tiers): real prompt
+  nat-pride-1024 (2048 bucket, ragged) scalar and B=8 streams equal the FP32 continuation; a
+  4096-token prompt (8192 bucket, ragged) gives the same 16-token stream as v4. amd-bench
+  prefill sweep, median of 3 (v4 → v4sp2): T=1024 173 → 151 ms, 2048 256 → 212, 4096 471 → 381,
+  8192 995 → 806 (−13/−17/−19/−19%). Decode unchanged (same programs below T=2048).
 
 ## 5. Results
 
