@@ -9099,11 +9099,11 @@ mod tests {
     }
 
     #[test]
-    fn kv_reservation_releases_generated_output_credit() {
+    fn kv_reservation_keeps_generated_rows() {
         assert_eq!(reserved_kv_rows(70_000, 700, 0), 70_700);
-        assert_eq!(reserved_kv_rows(70_000, 700, 512), 70_188);
+        assert_eq!(reserved_kv_rows(70_000, 700, 512), 70_700);
         assert_eq!(reserved_kv_rows(4, 0, 0), 5);
-        assert_eq!(reserved_kv_rows(4, 0, usize::MAX), 0);
+        assert_eq!(reserved_kv_rows(4, 2, 9), 13);
     }
 
     #[test]

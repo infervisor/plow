@@ -7476,6 +7476,14 @@ impl GpuEngine {
         let avail = RuntimeConfig::get().kv_admit_live(free, total, self.kv_admit_reserve);
         if let Some(kv) = vmm.kv.as_ref() {
             budget.budget_bytes = kv.mapped_bytes() + avail.max(kv.block_bytes());
+            tracing::debug!(
+                target: "plowrt::kv_budget",
+                mapped_mib = kv.mapped_bytes() >> 20,
+                free_mib = free >> 20,
+                avail_mib = avail >> 20,
+                budget_mib = budget.budget_bytes >> 20,
+                "kv admission budget"
+            );
         } else if let Some(rings) = vmm.rings.as_ref() {
             let slot = rings.slot_charge();
             let held = rings.stats().mapped_slots as u64 * slot + rings.spare_bytes();
