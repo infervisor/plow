@@ -9104,7 +9104,9 @@ fn emit_glm_moe_ffn_prefill(
             glm_require_gate_only_act(c, DevOp::GemmGluMxfp4);
             d.i[5] = GLM_ACT_SILU;
         })
-    } else if enc == MoeEnc::Mxfp4 || lin_fp8 || shared_lt.is_some() {
+    } else if enc == MoeEnc::Mxfp4 || lin_fp8 || shared_lt.is_some() || c.swiglu_limit.is_some() {
+        // A clamped checkpoint (swiglu_limit) cannot take the gate-only GemmGlu epilogue below:
+        // the bf16 shared expert unfuses into two GEMMs and the pair-form Glu carries the clamp.
         let (c_g, c_u) = if let Some(pair) = shared_lt {
             pair
         } else if lin_fp8 {
@@ -10231,7 +10233,8 @@ fn emit_glm_moe_ffn_rows(
             d.i[1] = act;
             d.f[1] = limit;
         })
-    } else if (rows as u64) * (h as u64) > crate::gm_lds_halves() {
+    } else if (rows as u64) * (h as u64) > crate::gm_lds_halves() || c.swiglu_limit.is_some() {
+        // A clamped checkpoint takes this split unconditionally: GemvGlu's epilogue is gate-only.
         // TASK-9 FIT GATE, GemvGlu leg: gemv_glu_rows is in op_gemm.h's always-staged family
         // ("read x ONLY through LDS"), so the fused form carries the same rows*K promise the
         // GemvQkv gate above enforces. Past the fit, split into two GEMV halves + Glu.
@@ -10728,6 +10731,40 @@ pub(crate) fn emit_glm_moe_ffn(
             d.i[1] = h;
             let (act, limit) = glm_glu_act(c);
             d.i[5] = act;
+            d.f[1] = limit;
+        })
+    } else if c.swiglu_limit.is_some() {
+        // A clamped checkpoint: the fused GemvGlu epilogue is gate-only, so gate and up run as two
+        // bf16 (or MXFP4) GEMVs on disjoint halves of the shared slice and the pair-form Glu clamps,
+        // on the slice's first CU as the fp8 split above.
+        let (sh_g, sh_u) = glm_glu_halves(&shared_cus);
+        let gemv_half = |b: &mut Builder, cus: Vec<u32>, out: u32, wt: u32, ws: u32| {
+            let op = if enc == MoeEnc::Mxfp4 {
+                DevOp::GemvMxfp4
+            } else {
+                DevOp::Gemv
+            };
+            b.emit(op, cus, &[c_rn2], |d| {
+                d.t[0] = out;
+                d.t[1] = n.xn2;
+                d.t[2] = wt;
+                if enc == MoeEnc::Mxfp4 {
+                    d.t[3] = ws;
+                }
+                d.i[0] = 1;
+                d.i[1] = imoe_l;
+                d.i[2] = h;
+            })
+        };
+        let c_g = gemv_half(b, sh_g, n.shfu, w.shg, w.shg_s);
+        let c_u = gemv_half(b, sh_u, n.shfu_up, w.shu, w.shu_s);
+        b.emit(DevOp::Glu, shared_cus[..1].to_vec(), &[c_g, c_u], |d| {
+            d.t[0] = n.shfu;
+            d.t[1] = n.shfu;
+            d.t[2] = n.shfu_up;
+            d.i[0] = imoe_l;
+            let (act, limit) = glm_glu_act(c);
+            d.i[1] = act;
             d.f[1] = limit;
         })
     } else {

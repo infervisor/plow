@@ -31,6 +31,7 @@ afterwards. Changes made here before the first serve on this box:
 | `index_kpool` capability probe also reads `text_config` | `crates/devgen/src/lib.rs` | the `indexer_pooled` knob cap never registered for the nested config |
 | mHC constants and pooled-indexer flags asserted against the config | `cfg_glm` | the emit hard-codes n=4 / 20 iterations / 1e-6 and always compresses + appends the tail |
 | KDA carried state sized to the decode ladder (`dbatch` slots), as Kimi-K3 does | `declare_glm53` | one slot made every batched decode row share one recurrence |
+| bf16 shared expert GLU split into two GEMM/GEMV halves + the pair-form clamped `Glu` when a limit is set (prefill, batched decode, ladder-1 decode) | shared-expert sites in `mla.rs` | the prep dequantises the shared expert to bf16, whose fused `GemmGlu`/`GemvGlu` epilogue is gate-only and has no clamp arm; `GLM_LINEAR_FP8` (fp8 shared expert) hung on gfx942 in the GLM-5.3 campaign, so it stays a later lever |
 
 Test: `cargo test -p devgen --lib glm5_next_cfg_reads_root_quantization_and_clamped_swiglu`.
 
@@ -56,6 +57,9 @@ The packet from config + index alone (no weights) is 70 MB: 4 prefill buckets + 
 
 - 10:41 UTC: first packet emitted from the config/index stub; objects built (bf16 expert ops —
   the root-quantization bug above, found by reading `plow_config.h`).
+- 11:09 UTC: emitter changes committed (00244f7e) and pushed. Emit from the stub with the fixed
+  plowc hit the shared-expert gate-only GLU refusal (fixed by the split above); emit needs
+  `PLOW_VERIFY_BIN` (the worktree has no lean-plow build; the main checkout's is used).
 - (to be continued: prep, serve, smoke, correctness gate, grid.)
 
 ## 5. Results
