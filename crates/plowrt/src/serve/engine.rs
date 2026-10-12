@@ -892,6 +892,13 @@ mod amd_serve {
         /// the prefix cache already produces, so it joins at the same seam
         /// rather than adding a second notion of "already prefilled".
         head_rows: Vec<u32>,
+        /// The `act.logits` row holding each slot's most recent sampled token: 0 after a
+        /// per-slot prefill (the prefill tail writes ONE logit row, `i[0] = 1`), the slot after a
+        /// decode dispatch (slot-indexed rows), `usize::MAX` when no readable row exists (a
+        /// token-batch body samples its band rows). Reading row `slot` after a prefill served
+        /// another slot's stale decode logits as the first token's logprobs (FP32 gate: KL 5.3
+        /// at position 0, 0.2 after).
+        lp_row: Vec<usize>,
         /// Width of the decode rung the last dispatch ran, so a rung CHANGE can be logged
         /// once instead of every step. It is the only externally visible evidence that the
         /// ladder is engaging, and a measurement that cannot show that is not a measurement.
@@ -1661,6 +1668,7 @@ mod amd_serve {
                 },
                 prefill_turn: 0,
                 head_rows: vec![0; batch],
+                lp_row: (0..batch).collect(),
                 last_rung: 0,
                 cursor_split_ns: (0, 0),
                 token_batch_tp,
@@ -1964,11 +1972,14 @@ mod amd_serve {
                 return false;
             };
             let row = total as usize / self.batch;
-            if slot >= self.batch || row == 0 || row % elem != 0 {
+            let Some(&at) = self.lp_row.get(slot) else {
+                return false;
+            };
+            if at >= self.batch || row == 0 || row % elem != 0 {
                 return false;
             }
             let mut bytes = vec![0u8; row];
-            if let Err(err) = e.read_tensor_range("act.logits", (slot * row) as u64, &mut bytes) {
+            if let Err(err) = e.read_tensor_range("act.logits", (at * row) as u64, &mut bytes) {
                 tracing::warn!(error = %err, slot, "amd: logits row readback failed");
                 return false;
             }
@@ -2280,6 +2291,7 @@ mod amd_serve {
                 return Ok((None, ran));
             }
             let tok = g.read_prefill_token()?;
+            self.lp_row[slot] = 0;
             tracing::debug!(slot, tok, n = prompt.len(), "pf complete");
             let n = prompt.len() as u32;
             let (resume, arm) = (cur.resume, cur.arm);
@@ -2841,6 +2853,13 @@ mod amd_serve {
                         .step(g, rows, &requests, generations, frontiers, max_ctx, output),
                 },
             )?;
+            // The body samples band rows; no slot-indexed logits row exists for these tokens.
+            for &(slot, _) in feeds {
+                self.lp_row[slot] = usize::MAX;
+            }
+            for &(slot, _, _) in members {
+                self.lp_row[slot] = usize::MAX;
+            }
             if self.prefix_cache {
                 // As the terminal-prefill path does, except that no second transformer pass
                 // produced the first token.
@@ -3349,6 +3368,9 @@ mod amd_serve {
             }
             self.advance_stage = advance;
             result?;
+            for &(s, _) in feeds {
+                self.lp_row[s] = s;
+            }
             Ok(quantum)
         }
 
@@ -3382,6 +3404,9 @@ mod amd_serve {
             }
             self.advance_stage = advance;
             let out = result?;
+            for &(s, _) in feeds {
+                self.lp_row[s] = s;
+            }
             Ok(feeds.iter().map(|&(s, _)| (s, out[s])).collect())
         }
 
@@ -3491,7 +3516,9 @@ mod amd_serve {
 
         /// One dispatch that advances only `slot`, returning its token.
         fn dispatch(&mut self, slot: usize) -> Result<u32> {
-            Ok(self.dispatch_all(&[slot])?[slot])
+            let tok = self.dispatch_all(&[slot])?[slot];
+            self.lp_row[slot] = slot;
+            Ok(tok)
         }
 
         /// ONE decode dispatch advancing all `batch` rows on the device;

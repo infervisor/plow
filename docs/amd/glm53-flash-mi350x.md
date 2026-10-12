@@ -366,6 +366,26 @@ The packet from config + index alone (no weights) is 70 MB: 4 prefill buckets + 
   4096-token prompt (8192 bucket, ragged) gives the same 16-token stream as v4. amd-bench
   prefill sweep, median of 3 (v4 → v4sp2): T=1024 173 → 151 ms, 2048 256 → 212, 4096 471 → 381,
   8192 995 → 806 (−13/−17/−19/−19%). Decode unchanged (same programs below T=2048).
+- 17:20 UTC, E1b (`validate-g32`, packet v4g32 = v4 with `PLOW_GLM_DECODE_GEMM_ROWS=32`, rung-8
+  tier at `PLOW_GEMV_MM=8`): the rung-8 program carries 444 Gemv + 22 GemvQkv instead of 477
+  GemmSmall; streams exact at rungs 1/8/32/128; steps rung 1 26.6 ms, B=8 46.2 (49.3 with the
+  GEMM route), B=32 58.1, B=128 90.9. Taken into the final packet. The build_gfx950.sh
+  `PLOW_DECODE_TIERS` loop reproduces the hand-built rung-1 tier byte for byte; the hand-built
+  rung-8 tier (MM=4 + walk) was byte-identical to the wide object, i.e. the decode object depends
+  on MM/WALK and not on PLOW_DECODE_BATCH — which is why that tier gained nothing at rung 8.
+- 17:20 UTC, decode op-count knob scan (emit only): FUSE_ROPE, FUSE_B1, GLM_FUSE_XRN,
+  DECODE_GEMM_GROUP, KDA_FB_FOLD, KDA_DECODE_FUSED_ARM, XR_COMBINE_FOLD, DECODE_GLUE_CUS,
+  K3_KDA_CONV_STEP_DB, FUSE_SEAM_RN, XR_RES, MOE_CORESIDENT=2, MOE_SHARED_SEED leave the T=1
+  program at 1846 ops; FUSE_SEAM removes 11; FUSE_QNORM aborts the emit ("no structurally
+  eligible KDA graph"). The c1 dispatch floor on this model is structural (per-expert MoE ops,
+  34 KDA layers' chains), not a knob.
+- 17:20 UTC, final candidate packet v5 = v4 + mHC seam + GEMM rows 32, objects with the tier
+  loop; validation, FP32 capture and the served grids (tiers, `PLOW_DECODE_MIN_RUNG=1`,
+  `PLOW_PF_INTERLEAVE=4096`, no chunk cap) queued.
+- 17:25 UTC, FP32-reference gate PASS on the v4 packet (sha c30dc0b7…, capture with the fixed
+  logits row, concurrency 16, 46 cases / 88 requests): kl_mean 0.0134 (vLLM 0.0368), kl_p99
+  0.184 (0.549), kl_max 0.70 (1.84), top1_decisive 0.9967 (0.9868), cont_frac 0.754 (0.730),
+  needles 18/18 (18/18). Gate dir /home/lava/bench/glm53flash/fp32ref/gate-v4b.
 
 ## 5. Results
 

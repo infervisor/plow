@@ -1266,3 +1266,22 @@ fi
 # Freshness is the whole point of this script: print it, every time.
 ls -l --time-style=+%H:%M:%S $ALL_ELFS chat \
   | awk '{print "   ", $NF, $5"B", $6}'
+
+# Low-rung decode tiers (PLOW_DECODE_TIERS=<w,...>, as build_gfx942.sh): plowrt serves a decode
+# rung t <= w from `lowrung<w>/interp_decode*.elf` beside the object dir, so a one-row rung does
+# not run the widest object's GEMV body. Each tier is this script again at PLOW_DECODE_BATCH=w,
+# one GEMV pass of w rows (PLOW_GEMV_MM=min(w,16)), from the same packet config — a tier stamps
+# the packet hash and is refused under any other packet. Only its decode objects are kept.
+if [ -n "${PLOW_DECODE_TIERS:-}" ] && [ -z "${PLOW_DECODE_TIER:-}" ]; then
+  for w in ${PLOW_DECODE_TIERS//,/ }; do
+    case "$w" in ''|*[!0-9]*) echo "PLOW_DECODE_TIERS must be a comma list of widths" >&2; exit 1;; esac
+    if [ "$w" -ge "${PLOW_DECODE_BATCH:-1}" ]; then continue; fi  # the wide object serves it
+    mm=$w; [ "$mm" -gt 16 ] && mm=16
+    echo ""
+    echo ">>> low-rung decode tier: width $w -> $OUT/lowrung$w"
+    ( unset PLOW_DECODE_TIERS
+      PLOW_DECODE_TIER="$w" PLOW_DECODE_BATCH="$w" PLOW_GEMV_MM="$mm" PLOW_GEMV_WALK="${PLOW_GEMV_WALK:-1}" \
+        "$REPO/scripts/build_gfx950.sh" "$OUT/lowrung$w" ) || exit 1
+    find "$OUT/lowrung$w" -maxdepth 1 -type f ! -name 'interp_decode*' -delete
+  done
+fi
