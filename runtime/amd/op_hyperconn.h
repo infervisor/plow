@@ -89,6 +89,67 @@ __device__ __forceinline__ void hc_normalize(float* v, unsigned base, unsigned s
 }
 #endif
 
+/* The n = 4 combine matrix's softmax + Sinkhorn in REGISTERS, one lane, fully unrolled. The
+ * LDS form below is the same arithmetic in the same order (plain division, so arm 0 only), but
+ * every one of its ~1300 reads and writes is a dependent LDS round trip on a single lane, which
+ * made this op ~110 us per token — the longest link of the serial mHC chain at decode (90 per
+ * step) and 15% of an 8192-token prefill. Results are bit-identical. */
+#if !PLOW_HC_SINKHORN_RCP
+__device__ __forceinline__ void hc_sinkhorn4_reg(const float* __restrict__ mrow, float inv,
+                                                 float scale, const float* __restrict__ base,
+                                                 float hc_eps, unsigned sinkhorn_repeat,
+                                                 float* __restrict__ comb_out) {
+    float c[16];
+#pragma unroll
+    for (unsigned i = 0; i < 4; i++) {
+        float m = -3.0e38f;
+#pragma unroll
+        for (unsigned j = 0; j < 4; j++) {
+            const float v = (mrow[8 + i * 4 + j] * inv) * scale + base[i * 4 + j];
+            c[i * 4 + j] = v;
+            m = fmaxf(m, v);
+        }
+        float s = 0.0f;
+#pragma unroll
+        for (unsigned j = 0; j < 4; j++) {
+            const float e = expf(c[i * 4 + j] - m);
+            c[i * 4 + j] = e;
+            s += e;
+        }
+#pragma unroll
+        for (unsigned j = 0; j < 4; j++) c[i * 4 + j] = c[i * 4 + j] / s + hc_eps;
+    }
+#pragma unroll
+    for (unsigned j = 0; j < 4; j++) {
+        float s = 0.0f;
+#pragma unroll
+        for (unsigned i = 0; i < 4; i++) s += c[i * 4 + j];
+#pragma unroll
+        for (unsigned i = 0; i < 4; i++) c[i * 4 + j] = c[i * 4 + j] / (s + hc_eps);
+    }
+    for (unsigned r = 1; r < sinkhorn_repeat; r++) {
+#pragma unroll
+        for (unsigned i = 0; i < 4; i++) {
+            float s = 0.0f;
+#pragma unroll
+            for (unsigned j = 0; j < 4; j++) s += c[i * 4 + j];
+#pragma unroll
+            for (unsigned j = 0; j < 4; j++) c[i * 4 + j] = c[i * 4 + j] / (s + hc_eps);
+        }
+#pragma unroll
+        for (unsigned j = 0; j < 4; j++) {
+            float s = 0.0f;
+#pragma unroll
+            for (unsigned i = 0; i < 4; i++) s += c[i * 4 + j];
+#pragma unroll
+            for (unsigned i = 0; i < 4; i++) c[i * 4 + j] = c[i * 4 + j] / (s + hc_eps);
+        }
+    }
+#pragma unroll
+    for (unsigned k = 0; k < 16; k++) comb_out[k] = c[k];
+}
+#endif
+
 /* op 121 — hyper-connections pre-block. See the file header for the shape of the whole
  * thing; this computes `(post_mix, comb_mix, layer_input)` from `mixes` (an ordinary
  * Gemv/Gemm's output — the projection itself is NOT this op's job) and `residual`.
@@ -156,6 +217,13 @@ __device__ void d_hyperconn_pre(float* __restrict__ post_mix, float* __restrict_
             /* comb_mix: softmax over the LAST axis (dim=-1, fixed row i, varying column j),
              * then one dim=-2 (column) normalize, then (sinkhorn_repeat-1) more (dim=-1,
              * dim=-2) pairs — exactly mhc_pre_torch's loop, not a reordering of it. */
+#if !PLOW_HC_SINKHORN_RCP
+            if (n == 4u) {
+                hc_sinkhorn4_reg(mrow, inv, hc_scale[2], hc_base + 2 * n, hc_eps, sinkhorn_repeat,
+                                 comb_mix + (size_t)t * n * n);
+            } else
+#endif
+            {
             for (unsigned i = 0; i < n; i++) {
                 float m = -3.0e38f;
                 for (unsigned j = 0; j < n; j++) {
@@ -208,6 +276,7 @@ __device__ void d_hyperconn_pre(float* __restrict__ post_mix, float* __restrict_
                 }
             }
             for (unsigned k = 0; k < n * n; k++) comb_mix[(size_t)t * n * n + k] = comb_lds[k];
+            }
         }
         __syncthreads(); /* logits[0..n) (pre_mix) must be visible before reduction 2 reads it */
 

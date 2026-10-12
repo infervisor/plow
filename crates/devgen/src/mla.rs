@@ -10815,7 +10815,11 @@ pub(crate) fn emit_glm_moe_ffn(
             DevOp::Gemv
         };
         b.emit(shd_op, shared_cus.clone(), &[c_shglu], |d| {
-            d.t[0] = n.shared;
+            // Same destination rule as the fp8/W8A8 arms above: the combine below reads the
+            // shared partial from `n.attn` under `raw_output`. A bf16 shared expert
+            // (GLM-5.3-Flash) wrote `n.shared` here and the combine summed the attention
+            // output instead — plausible first token, garbage from the second.
+            d.t[0] = if raw_output { n.attn } else { n.shared };
             d.t[1] = n.shfu;
             d.t[2] = w.shd;
             if enc == MoeEnc::Mxfp4 {

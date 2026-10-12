@@ -103,7 +103,71 @@ The packet from config + index alone (no weights) is 70 MB: 4 prefill buckets + 
   gfx950 never set it). `build_gfx950.sh` now adds `-DPLOW_MLA_PF2_NOPE_ARM=1` to the flash
   objects when the packet requires it. Lesson: the gfx950 script keys only a few requirement
   flags off `PLOW_PACKET_OBJECT_REQUIRES`; each unmapped one costs a GPU round trip.
-- (to be continued: smoke, correctness gate, grid.)
+- 11:53 UTC: third smoke SERVES (TP8, load fast, requests answered). Reproduces the known bug
+  exactly: first token right (" Paris"; logprob -0.65 vs -2.71 for the runner-up) and every
+  later token garbage on all three prompts. HSA host logprobs validated: all 8 served top-1
+  entries equal the device argmax tokens. Decode bisect under way (`PLOW_LAYERS` truncations,
+  prefill-vs-decode consistency, opcode ablation).
+- 12:12 UTC: first plow rung numbers (amd-bench, TP8, packet v2, dense attention, ladder 1):
+
+  | rung | plow | vLLM (same box) | roofline floor |
+  |---|---:|---:|---:|
+  | prefill T=128 | 857 ms | - | ~1 ms |
+  | prefill T=512 | 3.1 s | - | - |
+  | prefill T=1024 / 2048 (bucket 2048) | 12.5 s / 12.6 s | TTFT 90 ms @1k | 10.8 ms @2048 |
+  | prefill T=4096 / 8192 (bucket 8192) | 70.6 s / 71.0 s | - | 34.7 ms @8192 |
+  | decode M=1, ctx 1k / 8k | 47.0 / 46.8 ms per token | TPOT 6.9 ms @c1 | 0.73 ms bytes; ~37 ms at 20 us/op |
+
+  Decode is context-independent at ~47 ms: ~25 us per op over 1846 ops, the dispatch floor
+  predicted in §6. Prefill is three orders of magnitude off its byte/compute floor and runs the
+  whole bucket (1024 and 2048 cost the same): a per-op pathology, not bandwidth. Both need the
+  per-op device trace before any kernel work. All 8 ranks agree on every token.
+- 12:20 UTC: decode-vs-prefill consistency (amd-bench `--dump-logits`, prompt P = "The capital
+  of France is"): prefill of P gives " Paris" (16.75), prefill of P+" Paris" gives "." (18.00),
+  both sane; the decode row for " Paris" after P (the same computation on the T=1 program) has
+  cos 0.31 against that prefill row and argmax 'es'. The mismatch is already present in a
+  1-layer packet (`PLOW_LAYERS=1`: one KDA layer + dense MLP, cos 0.32), so it is in the KDA /
+  dense / head T=1 path, not in MLA or MoE. `PLOW_STATE_CLEAR_DEVICE` makes no difference.
+  The runtime does patch the KDA ops' row count to the real prompt length (`KDA_ROW_COUNT_OPS`),
+  so pad rows are not the cause. Next: per-op activation dumps (`PLOW_DUMP_ACT`) on the 1-layer
+  packet, row 5 of the 6-token prefill against row 0 of the decode step.
+- 12:30 UTC: prefill attributed from the 8192-token device trace (`PLOW_TRACE_RAW`, read with
+  `scripts/glm53_trace_attrib.py`): of 71.7 s, **65.7 s is `GemvF32`**, the mHC mix projection
+  (`[T,16384] x [24,16384]^T`, 90 per pass), ~800 ms per packet. `d_gemv_f32` was written for the
+  DSA indexer's 32-wide output at M=1: it walked only the N columns across waves and ran M
+  serially, so 3 of 256 CUs did all the work at T=8192. Fixed to one wave per (row, column)
+  output (M=1 mapping unchanged, so decode/indexer results are bit-identical). Second item is
+  `XReduceTwoShot`: 4.5 s over 87 packets (52 ms per 64 MB), to be re-measured after the fix.
+- 12:30 UTC: prefill after the `d_gemv_f32` fix (same sweep): T=128 113 ms, 512 183 ms,
+  1024 431 ms, 2048 494 ms, 4096 1.64 s, 8192 2.05 s (was 71.0 s). Remaining 8192 trace: still
+  `GemvF32` 747 ms (90 x 8.3 ms, latency-bound scalar K walk), `HyperConnPre` 327 ms (90 x 3.6 ms:
+  the one-lane Sinkhorn through LDS costs ~110 us per ROW), `FlashMlaPrefill` 240 ms (11 x 22 ms),
+  `HyperConnPost` 162 ms, `MoeGroupDownPf` 154 ms, `XReduceTwoShot` 58 ms (the earlier 4.5 s was
+  peer skew behind the GEMV, not the fabric).
+- 12:45 UTC: **decode bug found by per-op dumps.** `PLOW_DUMP_ACT` on the full packet, row 5 of a
+  6-token prefill against row 0 of the decode step that computes the same token: every KDA layer
+  tensor (pre-norm input, q/k/v raw and post-conv, gate, recurrent and conv states, gated-norm
+  output) is bit-identical; every KDA layer's own pre-norm input matches through layer 2 and
+  diverges at layer 4, i.e. after layer 3 — the first MLA **and** first sparse-MoE layer. On the
+  4-layer packet (its shared MLA/MoE buffers hold layer 3 at the end) the MLA chain matches to
+  1e-5 (q latent, absorbed q, the KV row prefill wrote and the row decode wrote, attention output,
+  o_proj partial), the router logits and the shared expert match, and the MoE partial `dg_tp` is
+  3.3x too large. Cause (`crates/devgen/src/mla.rs`, decode shared-expert down): under
+  `raw_output` (the mHC packet) the combine reads the shared partial from `n.attn` and the fp8 and
+  W8A8 shared arms write it there, but the **bf16 arm wrote `n.shared`** — GLM-5.3-Flash's shared
+  expert is bf16, so the combine added the attention output and dropped the shared expert. One-line
+  fix; packet v2d re-emitted (plow_config.h unchanged, objects reused).
+- Decode trace (ctx 8k, 1846 packets, 45 ms): the serial mHC chain dominates —
+  `GemvF32` ~130 us x 90 (one dependent scalar load pair per step, 256 steps), `HyperConnPre`
+  ~113 us x 90 (one-lane LDS Sinkhorn), router `GemmF32` ~78 us x 42 (same scalar walk); the
+  routed experts are ~70 us per layer in parallel. Kernel fixes queued as objects v2e: 8-wide
+  vector loads with 4 steps in flight in `d_gemv_f32` and `d_gemv_bf16_f32`, and a
+  register-resident n=4 Sinkhorn in `d_hyperconn_pre` (bit-identical arithmetic). Expected: the
+  three chains fall from ~25 ms to ~2 ms of the 45 ms step; prefill `GemvF32`/`HyperConnPre`
+  (1.07 s of the 2.05 s at 8192) by a similar factor.
+- Parked: `GLM_LINEAR_FP8=1` (routed-W8A8 packet v3rw) refuses to load — it expects
+  `self_attn.o_proj.weight_fp8` tensors the prep did not produce.
+- (to be continued: v2d correctness, v2e rungs, FP32 gate, grid.)
 
 ## 5. Results
 

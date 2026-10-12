@@ -240,6 +240,7 @@ def cmd_prompts(a):
     import glm53_needle_probe as needle
     tok = AutoTokenizer.from_pretrained(a.hf, local_files_only=True)
     enc = lambda s: tok(s, add_special_tokens=False)["input_ids"]
+    bos = [] if tok.bos_token_id is None else [tok.bos_token_id]  # GLM-5.3-Flash has no BOS
     corpora, sources = {}, {}
     for spec in a.corpus:
         name, path = spec.split("=", 1)
@@ -257,12 +258,13 @@ def cmd_prompts(a):
     for name in a.natural:
         for i, n in enumerate(lens):
             off = (i + 1) * 20011 % max(len(corpora[name]) - n, 1)  # distinct windows: no shared prefixes
-            ids = [tok.bos_token_id] + corpora[name][off:off + n - 1]
+            ids = bos + corpora[name][off:off + n - len(bos)]
             cases.append(dict(id=f"nat-{name}-{n}", kind="natural", prompt_ids=ids, max_new=a.natural_new))
     for cid, (msgs, tools) in chats(text_of).items():
         text = tok.apply_chat_template(msgs, tools=tools, add_generation_prompt=True, tokenize=False, enable_thinking=False)
-        cases.append(dict(id=cid, kind="chat", prompt_ids=enc(text), max_new=a.chat_new))
+        cases.append(dict(id=cid, kind="chat", prompt_ids=enc(text + a.gen_suffix), max_new=a.chat_new))
     prefix, ending = needle.chat_frame(a.hf)
+    ending += a.gen_suffix
     for n in [int(x) for x in a.needle_lens.split(",")]:
         for d in [float(x) for x in a.needle_depths.split(",")]:
             for nid, sentence, question, expect in needle.NEEDLES:
@@ -279,7 +281,8 @@ def cmd_prompts(a):
         if len(c["prompt_ids"]) + c["max_new"] > a.max_ctx:
             raise SystemExit(f"{c['id']}: {len(c['prompt_ids'])} + {c['max_new']} exceeds --max-ctx {a.max_ctx}")
         c["prompt_sha256_u32le"] = ids_sha(c["prompt_ids"])
-    out = dict(schema="plow.fp32ref.prompts.v1", tokenizer=str(Path(a.hf).resolve()), sources=sources, cases=cases)
+    out = dict(schema="plow.fp32ref.prompts.v1", tokenizer=str(Path(a.hf).resolve()), sources=sources,
+               gen_suffix=a.gen_suffix, cases=cases)
     Path(a.out).write_text(json.dumps(out))
     for c in cases:
         print(f"{c['id']:<28} {c['kind']:<8} {len(c['prompt_ids']):>6} +{c['max_new']}")
@@ -680,7 +683,9 @@ def cmd_reference(a):
     # materialize a q x kv mask per layer type, 64 GiB at 262144 tokens.
     no_masks = {t: None for t in set(getattr(model.config, "layer_types", None) or ["full_attention"])}
     eos_cfg = model.config.eos_token_id
-    eos = set(EOS) | set(eos_cfg if isinstance(eos_cfg, list) else [eos_cfg] if eos_cfg is not None else [])
+    eos = set(eos_cfg if isinstance(eos_cfg, list) else [eos_cfg] if eos_cfg is not None else []) | {tok.eos_token_id} - {None}
+    if model.config.model_type.startswith("gemma"):  # EOS holds Gemma-4 ids; they are ordinary tokens elsewhere ('"', 'S' in GLM)
+        eos |= set(EOS)
     cases = []
     t0 = time.time()
     with torch.no_grad():
@@ -874,6 +879,10 @@ def main():
     pr.add_argument("--needle-lens", default="4096,15872")
     pr.add_argument("--needle-depths", default="0.1,0.5,0.9")
     pr.add_argument("--needle-new", type=int, default=16)
+    pr.add_argument("--gen-suffix", default="",
+                    help="appended after the generation prompt of chat and needle cases, e.g. '</think>' for "
+                         "GLM-5.3-Flash, whose template always opens a reasoning block (needles must answer "
+                         "within --needle-new tokens)")
     pr.add_argument("--max-ctx", type=int, default=16384)
     pr.add_argument("--drop-over-ctx", action="store_true",
                     help="drop (and list) cases longer than --max-ctx instead of failing")
