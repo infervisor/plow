@@ -376,15 +376,7 @@ pub fn cmd_pack(
         (Some((objset, _)), Some(dir)) => objset.objects.iter().map(|o| (o, dir)).collect(),
         (None, _) => Vec::new(),
     };
-    let checkpoint_in = match (bundle.checkpoint.files.is_empty(), checkpoint_dir) {
-        (false, None) => {
-            return Err("the bundle carries its checkpoint: pass --checkpoint-dir".into())
-        }
-        (true, Some(p)) => {
-            return Err(format!("{}: the bundle's checkpoint lists no files", p.display()).into())
-        }
-        (_, dir) => dir,
-    };
+    let checkpoint_in = checkpoint_arg(&bundle, checkpoint_dir)?;
 
     let file = std::fs::File::create(out)?;
     let mut zip = zip::ZipWriter::new(file);
@@ -492,6 +484,21 @@ fn copy_hashed(path: &std::path::Path, w: &mut impl Write) -> Result<(String, u6
     Ok((format!("{:x}", h.finalize()), n))
 }
 
+/// `--checkpoint-dir`, given exactly when the bundle carries its checkpoint.
+#[cfg(feature = "dist")]
+fn checkpoint_arg<'a>(
+    bundle: &plow_asset::dist::Bundle,
+    checkpoint_dir: Option<&'a std::path::Path>,
+) -> Result<Option<&'a std::path::Path>, Err> {
+    match (bundle.checkpoint.files.is_empty(), checkpoint_dir) {
+        (false, None) => Err("the bundle carries its checkpoint: pass --checkpoint-dir".into()),
+        (true, Some(p)) => {
+            Err(format!("{}: the bundle's checkpoint lists no files", p.display()).into())
+        }
+        (_, dir) => Ok(dir),
+    }
+}
+
 #[cfg(feature = "dist")]
 /// Where `publish` sends a packed bundle.
 pub struct PublishTo<'a> {
@@ -521,16 +528,21 @@ pub fn cmd_publish(
     if to.status == Some("validated") && to.tok_s.is_none() {
         return Err("--status validated needs the measurement: pass --tok-s".into());
     }
+    // Every argument is checked before the registry is asked anything: a
+    // wrong one must fail, not read as "already published".
+    let local: plow_asset::dist::Bundle = serde_json::from_slice(&std::fs::read(bundle_path)?)
+        .map_err(|e| format!("{}: {e}", bundle_path.display()))?;
+    checkpoint_arg(&local, checkpoint_dir)?;
+    if local.checkpoint.source == "dist" && to.hf.is_none() {
+        return Err(
+            "the bundle's checkpoint is `dist`: pass --hf <org>/<repo> for the index".into(),
+        );
+    }
     let dir = private_temp_dir()?;
     let sent = (|| {
         let Some(bundle) = next_generation(bundle_path, to)? else {
             return Ok(());
         };
-        if bundle.checkpoint.source == "dist" && to.hf.is_none() {
-            return Err(
-                "the bundle's checkpoint is `dist`: pass --hf <org>/<repo> for the index".into(),
-            );
-        }
         let bundle_out = dir.join("bundle.json");
         std::fs::write(&bundle_out, serde_json::to_vec_pretty(&bundle)?)?;
         let zip_path = dir.join("bundle.zip");
@@ -848,6 +860,35 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(super::variant_id(&b), "b49b5c9cf598");
+    }
+
+    #[test]
+    fn publish_checks_its_arguments_before_the_registry() {
+        // An hf-sourced bundle handed a checkpoint dir, against a registry
+        // that is not there: refused for the argument, never "already published".
+        let dir = std::env::temp_dir().join(format!("plowrt-publish-args-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let bundle = dir.join("bundle.json");
+        std::fs::write(&bundle, serde_json::to_vec(&serde_json::json!({
+            "schema": "plow.dist.bundle.v1", "namespace": "infervisor", "name": "m",
+            "label": "l", "generation": 0, "variant_id": "", "plow_git": "abc", "network": "m",
+            "target": {"vendor": "apple", "isa": "metal3", "sku": "Apple M4 Pro", "units": 16, "mem_bytes": 1},
+            "parallel": {"mode": "tp", "n": 1}, "max_ctx": 2048, "files": [],
+            "tokenizer": {"file": "t", "generator": "plow", "sha256": "0", "source": "derived", "verified": false},
+            "checkpoint": {"source": "hf:o/m", "revision": "main", "shards": 0, "layout": "x", "bytes": 0}
+        })).unwrap()).unwrap();
+        let to = super::PublishTo {
+            url: "http://127.0.0.1:9",
+            api_key: "k",
+            status: None,
+            description: None,
+            hf: None,
+            tok_s: None,
+            concurrency: None,
+        };
+        let err = super::cmd_publish(&bundle, None, &dir, None, Some(&dir), &to).unwrap_err();
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(err.to_string().contains("lists no files"), "{err}");
     }
 
     #[test]
