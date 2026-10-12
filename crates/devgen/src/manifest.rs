@@ -1214,6 +1214,11 @@ fn tuning(s: &Shapes, arch: &str) -> Map<String, Value> {
             t.insert("fa_rg".into(), json!(1));
             t.insert("fa_rg_wide".into(), json!(1));
         }
+        // * `kv_ilv` (PLOW_QWEN_KV_INTERLEAVE): head-interleaved KV rows on every object (the
+        //   cache writer and the row-group decode body; other attention arms trap under it).
+        if crate::emit_config::active().qwen_kv_interleave {
+            t.insert("kv_ilv".into(), json!(1));
+        }
         // Row-group body candidates (PLOW_NV_FA_RG_U / PLOW_NV_FA_RGT): defines on the objects that
         // take the body; a recipe opts in after its gate.
         if t.contains_key("fa_rg") {
@@ -3111,6 +3116,9 @@ pub fn config_header(manifest: &Value) -> String {
         }
         if t.get("fa_rgt").is_some() {
             out.push_str("#ifndef PLOW_NV_FA_RGT\n#define PLOW_NV_FA_RGT 1\n#endif\n");
+        }
+        if t.get("kv_ilv").is_some() {
+            out.push_str("#ifndef PLOW_NV_KV_ILV\n#define PLOW_NV_KV_ILV 1\n#endif\n");
         }
         if manifest.get("arch").and_then(Value::as_str) == Some("sm_90a") {
             if let Some(ks) = t.get("xreg_k").and_then(Value::as_array) {

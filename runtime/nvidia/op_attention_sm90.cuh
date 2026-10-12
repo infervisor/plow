@@ -61,6 +61,13 @@
 #endif
 
 #include "sm90_wgmma.cuh"
+#ifndef PLOW_NV_KV_ILV
+#define PLOW_NV_KV_ILV 0
+#endif
+#ifndef KV_ILV_TRAP
+/* A body that addresses head-major KV rows: unreachable on a PLOW_NV_KV_ILV object. */
+#define KV_ILV_TRAP() do { if (PLOW_NV_KV_ILV) __trap(); } while (0)
+#endif
 
 /* Default K/V pipeline uses two slots, with tile t+1 loading under tile t's math. */
 #define FA_SM90_NS 2
@@ -254,6 +261,7 @@ __device__ void d_flash_prefill_sm90_wgitem(
     unsigned n_kv_head, unsigned q_pos0, unsigned window, unsigned nsplit, unsigned kv_stride,
     unsigned kv_mask, float scale, unsigned slice, unsigned nblk, float* lds,
     const int* __restrict__ req, const void* __restrict__ mapkv) {
+    KV_ILV_TRAP();
     static_assert(HD == 256 && BQ == 64 && (BKV == 32 || BKV == 64),
                   "wgitem body is the <256,64,32|64> shape");
     constexpr int NSUB = HD / 64;
@@ -619,6 +627,7 @@ __device__ void d_flash_prefill_sm90(float* __restrict__ Opart, float* __restric
                                      unsigned slice, unsigned nblk, float* lds,
                                      const int* __restrict__ req,
                                      const void* __restrict__ mapkv = nullptr) {
+    KV_ILV_TRAP();
 #if PLOW_NV_FA_WGITEM
     /* BKV=64 reuses this body unchanged: the math is already written against BKV (S[BKV/2],
      * fa90_wgmma_score<BKV>, fa90_cm_off<BKV>, KS1/NB0, the 16*BKV descriptor stride), and at

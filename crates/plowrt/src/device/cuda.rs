@@ -884,7 +884,8 @@ impl CudaBackend {
 
     /// Rank-3 bf16 map over a `[n_kv_head][ring_rows][hd]` KV cache tensor: globalDim
     /// {hd, ring_rows, n_kv_head}, box {64, box_rows, 1}, 128 B swizzle — the flash-prefill
-    /// TMA stager's recipe (`GEN_TMAP_KV_PAIR`, one such map per K and per V).
+    /// TMA stager's recipe (`GEN_TMAP_KV_PAIR`, one such map per K and per V). `interleaved`:
+    /// a `[ring_rows][n_kv_head][hd]` tensor as {hd, n_kv_head, ring_rows}, box {64, 1, box_rows}.
     pub fn encode_tmap_kv3(
         &self,
         base: u64,
@@ -892,6 +893,7 @@ impl CudaBackend {
         hd: u32,
         n_kv_head: u32,
         box_rows: u32,
+        interleaved: bool,
     ) -> Result<[u8; 128]> {
         let f = self.tmap_encode.ok_or_else(|| {
             RuntimeError::Device(
@@ -907,9 +909,19 @@ impl CudaBackend {
         #[repr(C, align(128))]
         struct Buf([u8; 128]);
         let mut m = Buf([0u8; 128]);
-        let gd = [hd as u64, ring_rows as u64, n_kv_head as u64];
-        let gs = [hd as u64 * 2, ring_rows as u64 * hd as u64 * 2];
-        let bd = [64u32, box_rows, 1u32];
+        let (gd, gs, bd) = if interleaved {
+            (
+                [hd as u64, n_kv_head as u64, ring_rows as u64],
+                [hd as u64 * 2, n_kv_head as u64 * hd as u64 * 2],
+                [64u32, 1u32, box_rows],
+            )
+        } else {
+            (
+                [hd as u64, ring_rows as u64, n_kv_head as u64],
+                [hd as u64 * 2, ring_rows as u64 * hd as u64 * 2],
+                [64u32, box_rows, 1u32],
+            )
+        };
         let es = [1u32, 1u32, 1u32];
         self.check(
             unsafe { bind_context(&self.api, self.ctx, self.freer.context_id) },

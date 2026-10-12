@@ -27,6 +27,7 @@ pub(super) fn load_generated_role(
     profile: &str,
     n_cu: u32,
     packed: Option<&plow_asset::packed_prefill::Manifest>,
+    kv_layout: u32,
 ) -> Result<PacketRole> {
     let reject =
         |why: &str| RuntimeError::Rejected(format!("generated role {}: {why}", object.abi));
@@ -63,6 +64,13 @@ pub(super) fn load_generated_role(
             return Err(reject("cubin geometry differs from the packet declaration"));
         }
     }
+    if be
+        .module_global_u32(&module, "plow_gen_kv_layout")?
+        .unwrap_or(0)
+        != kv_layout
+    {
+        return Err(reject("KV layout differs from the packet's cache writers"));
+    }
     let function = be.get_function(&module, "plow_gen_flash_prefill")?;
     let direct = be.get_function(&module, "plow_gen_flash_prefill_direct")?;
     let media_span = be.module_global_u32(&module, "plow_attention_media_span")? == Some(1);
@@ -75,7 +83,7 @@ pub(super) fn load_generated_role(
     tracing::info!(abi = %object.abi, object = %path.display(), "generated role object loaded");
     Ok(PacketRole {
         function,
-        direct_gen: Some((direct, attention.head_dim, abi.fp8_kv())),
+        direct_gen: Some((direct, attention.head_dim, abi.fp8_kv(), kv_layout)),
         media_span,
         direct_hd512: None,
         direct_hd256_gqa2: None,
@@ -99,6 +107,8 @@ pub(super) struct GenDecode {
     pub(super) gqa: u32,
     pub(super) kv_tile: u32,
     pub(super) nsplit_max: u32,
+    /// The launch's `pad`: the object traps unless it is the layout it was compiled for.
+    pub(super) kv_layout: u32,
     _module: Arc<DecodeModule>,
 }
 
@@ -133,6 +143,7 @@ pub(super) fn load_generated_decode(
     dir: &std::path::Path,
     object: &SegmentObject,
     profile: &str,
+    kv_layout: u32,
 ) -> Result<GenDecode> {
     let reject =
         |why: &str| RuntimeError::Rejected(format!("generated decode role {}: {why}", object.abi));
@@ -163,6 +174,13 @@ pub(super) fn load_generated_decode(
         .module_global_u32(&module, "plow_gen_decode_nsplit_max")?
         .filter(|&n| n > 0)
         .ok_or_else(|| reject("no split width"))?;
+    if be
+        .module_global_u32(&module, "plow_gen_kv_layout")?
+        .unwrap_or(0)
+        != kv_layout
+    {
+        return Err(reject("KV layout differs from the packet's cache writers"));
+    }
     let function = be.get_function(&module, "plow_gen_flash_decode")?;
     be.set_max_dynamic_smem(function, abi.smem)?;
     if be.occupancy_blocks_per_sm(function, abi.block, abi.smem as usize)? == 0 {
@@ -177,6 +195,7 @@ pub(super) fn load_generated_decode(
         gqa: attention.query_tile,
         kv_tile: attention.kv_tile,
         nsplit_max,
+        kv_layout,
         _module: module,
     })
 }

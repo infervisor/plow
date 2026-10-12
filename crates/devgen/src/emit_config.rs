@@ -1402,6 +1402,9 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_QWEN_GDN_ISOLATE")]
     pub qwen_gdn_isolate: Option<u32>,
 
+    #[arg(long, env = "PLOW_QWEN_KV_INTERLEAVE", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub qwen_kv_interleave: bool,
+
     #[arg(long, env = "PLOW_QWEN_PREFILL")]
     pub qwen_prefill: Option<String>,
 
@@ -1792,6 +1795,7 @@ impl EmitConfig {
                 .ok()
                 .map(|v| v.parse().expect("Qwen a/b block count")),
             qwen_gdn_isolate: env_u32("PLOW_QWEN_GDN_ISOLATE"),
+            qwen_kv_interleave: env_bool("PLOW_QWEN_KV_INTERLEAVE"),
             qwen_prefill: std::env::var("PLOW_QWEN_PREFILL").ok(),
             pf_gfuse: env_bool("PLOW_PF_GFUSE"),
             uniseg_max_t: env_u32("PLOW_UNISEG_MAX_T"),

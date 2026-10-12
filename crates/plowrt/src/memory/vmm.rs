@@ -732,14 +732,20 @@ impl LiveKvLayout {
         for c in &m.caches {
             cache_tensors.extend(c.pair.map(usize::from));
             let elem = if c.scales.is_some() { 1 } else { 2 };
+            // A row-interleaved cache is one `heads * hd` head window per slot: a row maps as one
+            // unit, so the allocator charges whole rows instead of a block per head.
+            let (heads, hd) = match c.layout {
+                plow_asset::live_kv::LAYOUT_ROW_INTERLEAVED => (1, c.heads * c.hd),
+                _ => (c.heads, c.hd),
+            };
             if c.window == 0 {
-                if full_shape.is_some_and(|shape| shape != (c.heads, c.hd, elem)) {
+                if full_shape.is_some_and(|shape| shape != (heads, hd, elem)) {
                     return Err(RuntimeError::Rejected(
                         "LIVE allocator requires uniform full-cache head geometry and encoding"
                             .into(),
                     ));
                 }
-                full_shape = Some((c.heads, c.hd, elem));
+                full_shape = Some((heads, hd, elem));
                 full_tensors.push(c.pair.map(usize::from));
             } else {
                 for tensor in c.pair.map(usize::from) {
@@ -4909,6 +4915,21 @@ mod tests {
         assert_eq!(layout.geometry.kvh_full, 1);
         assert_eq!(layout.geometry.hd_full, 256);
         assert_eq!(layout.geometry.full_tensor_bytes(), 4 * 1024 * 256 * 2);
+    }
+
+    // A row-interleaved cache maps one heads*hd row per position: one head window per slot.
+    #[test]
+    fn row_interleaved_caches_are_one_head_window() {
+        let blob = live_blob();
+        let mut m = blob.with_packet_view(plow_asset::live_kv::emit).unwrap();
+        for c in &mut m.caches {
+            (c.heads, c.hd, c.layout) = (4, 64, plow_asset::live_kv::LAYOUT_ROW_INTERLEAVED);
+        }
+        let g = LiveKvLayout::from_validated_manifest(&blob, &m)
+            .unwrap()
+            .geometry;
+        assert_eq!((g.kvh_full, g.hd_full, g.row_bytes()), (1, 256, 512));
+        assert_eq!(g.full_tensor_bytes(), 4 * 1024 * 4 * 64 * 2);
     }
 
     #[test]

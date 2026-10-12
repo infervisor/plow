@@ -34,4 +34,17 @@ ENTRIES = {
         "classes": [(24, 4, 8, 4096), (24, 4, 16, 8192), (24, 4, 16, 15000), (24, 4, 48, 4096),
                     (24, 4, 1, 15000)],
     },
+    # The gqa6 body over head-interleaved KV rows (PLOW_QWEN_KV_INTERLEAVE); the gqa6 config.
+    "attn_dec_hd256_gqa6_ilv": {
+        "signature": {"op": "flash_decode", "head_dim": 256, "gqa": [6, 6], "window": 0,
+                      "window_any": True, "ring_kv": True, "nsplit_max": NSPLIT_MAX,
+                      "dtype": "bf16", "kv_dtype": "bf16", "kv_layout": "row_interleaved",
+                      "arch": "sm_90a"},
+        "object": "gen_sm90a_attn_dec_hd256_gqa6_ilv.cubin",
+        "pass_configs": ("TL_DISABLE_SAFE_MEMORY_ACCESS",),
+        "tol": 4e-3,
+        "defines": ("-DPLOW_GEN_KV_ILV=1",),
+        "body": lambda c: _mod.build(256, 6, c["bn"], c["stages"], c["threads"], ilv=True),
+        "classes": [(24, 4, 16, 8192), (24, 4, 48, 4096)],
+    },
 }

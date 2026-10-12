@@ -21,6 +21,14 @@ extern "C" __device__ unsigned plow_attention_kv_tile = PLOW_GEN_BN;
 extern "C" __device__ unsigned plow_attention_warps = PLOW_GEN_THREADS / 32;
 extern "C" __device__ unsigned plow_gen_decode_gqa = PLOW_GEN_GQA;
 extern "C" __device__ unsigned plow_gen_decode_nsplit_max = PLOW_GEN_NSPLIT_MAX;
+// PLOW_GEN_KV_ILV: the body reads head-interleaved KV ([slots][kv_stride][n_kv_head][hd],
+// op_attention.cuh PLOW_NV_KV_ILV); the launch's `pad` carries the layout.
+#ifndef PLOW_GEN_KV_ILV
+#define PLOW_GEN_KV_ILV 0
+#endif
+#if PLOW_GEN_KV_ILV
+extern "C" __device__ unsigned plow_gen_kv_layout = PLOW_GEN_KV_ILV;
+#endif
 
 // Mirrored by exec/gpu/riders.rs `GenDecodeArgs`.
 typedef struct {
@@ -43,7 +51,11 @@ extern "C" __global__ __launch_bounds__(PLOW_GEN_THREADS, 1)
 void plow_gen_flash_decode(const __grid_constant__ PlowGenFlashDecode a) {
     if (a.hd != PLOW_GEN_HEAD_DIM || a.n_kv_head == 0 || a.n_head != a.n_kv_head * PLOW_GEN_GQA ||
         a.nsplit == 0 || a.nsplit > PLOW_GEN_NSPLIT_MAX || gridDim.x != a.n_kv_head * a.nsplit ||
-        gridDim.y != a.rows) {
+        gridDim.y != a.rows
+#if PLOW_GEN_KV_ILV
+        || a.pad != PLOW_GEN_KV_ILV
+#endif
+        ) {
         __trap();
         return;
     }

@@ -312,8 +312,8 @@ def nvcc_compile(name, header, out):
         cmd = [nvcc, "-std=c++20", "-arch=sm_90a", "-O3", "-cubin", "-w", "-Xcudafe",
                "--diag_suppress=177", "-Xptxas=-v", f"-I{env.TILELANG_TEMPLATE_PATH}",
                f"-I{env.CUTLASS_INCLUDE_DIR}", f"-I{REPO / 'runtime/common'}",
-               f"-I{REPO / 'runtime/nvidia'}", f'-DPLOW_GEN_BODY="{hpath}"', "-o", str(out),
-               str(wrapper)]
+               f"-I{REPO / 'runtime/nvidia'}", f'-DPLOW_GEN_BODY="{hpath}"',
+               *ENTRIES[name].get("defines", ()), "-o", str(out), str(wrapper)]
         res = subprocess.run(cmd, capture_output=True, text=True)
         if res.returncode:
             sys.exit(f"nvcc failed for {name}:\n{res.stderr[-4000:]}")

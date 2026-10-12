@@ -1,6 +1,7 @@
 """TileLang GQA decode attention (one query row per sequence) over plow's KV ring layout.
 
-K/V: [slots][kv_heads][kv_stride][hd] bf16; logical position p lives in row p & kv_mask. Q/O:
+K/V: [slots][kv_heads][kv_stride][hd] bf16 (`ilv`: head-interleaved [slots][kv_stride][kv_heads][hd],
+op_attention.cuh PLOW_NV_KV_ILV); logical position p lives in row p & kv_mask. Q/O:
 [batch][heads][hd] bf16. Query position = kv_len[b] - 1; window > 0 keeps the last `window`
 positions. Row b reads the KV of physical slot `slot[b]` (the decode step's identity map or the
 riders' slot table). One block per (kv head, split, sequence) handles the kv head's `gqa` query
@@ -22,7 +23,7 @@ def pass_configs():
     }
 
 
-def build(hd, gqa, block_n, stages, threads=128):
+def build(hd, gqa, block_n, stages, threads=128, ilv=False):
     import tilelang.language as T
     g = gqa
     batch, slots, kv_stride, kvh = T.dynamic("batch, slots, kv_stride, kvh")
@@ -31,12 +32,13 @@ def build(hd, gqa, block_n, stages, threads=128):
     dt, acc = "bfloat16", "float"
     log2e = 1.44269504
     ns_max = NSPLIT_MAX
+    kv_shape = (slots, kv_stride, kvh, hd) if ilv else (slots, kvh, kv_stride, hd)
 
     @T.prim_func
     def attn_decode(
         Q: T.Tensor((batch, heads, hd), dt),
-        K: T.Tensor((slots, kvh, kv_stride, hd), dt),
-        V: T.Tensor((slots, kvh, kv_stride, hd), dt),
+        K: T.Tensor(kv_shape, dt),
+        V: T.Tensor(kv_shape, dt),
         kv_len: T.Tensor((batch,), "int32"),
         slot: T.Tensor((batch,), "int32"),
         O: T.Tensor((batch, heads, hd), dt),
@@ -82,7 +84,10 @@ def build(hd, gqa, block_n, stages, threads=128):
             for t in T.Pipelined(T.max(tb - ta, 0), num_stages=stages):
                 ls = (ta + t) * block_n
                 ph = ls & kv_mask
-                T.copy(K[s, hk, ph:ph + block_n, :], K_s)
+                if ilv:
+                    T.copy(K[s, ph:ph + block_n, hk, :], K_s)
+                else:
+                    T.copy(K[s, hk, ph:ph + block_n, :], K_s)
                 T.gemm(Q_s, K_s, S, transpose_B=True, clear_accum=True,
                        policy=T.GemmWarpPolicy.FullCol)
                 for i, j in T.Parallel(mp, block_n):
@@ -100,7 +105,10 @@ def build(hd, gqa, block_n, stages, threads=128):
                 for i, j in T.Parallel(mp, hd):
                     Oacc[i, j] *= corr[i]
                 T.copy(S, P)
-                T.copy(V[s, hk, ph:ph + block_n, :], V_s)
+                if ilv:
+                    T.copy(V[s, ph:ph + block_n, hk, :], V_s)
+                else:
+                    T.copy(V[s, hk, ph:ph + block_n, :], V_s)
                 T.gemm(P, V_s, Oacc, policy=T.GemmWarpPolicy.FullCol)
             if nsplit == 1:
                 for i, j in T.Parallel(mp, hd):

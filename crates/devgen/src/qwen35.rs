@@ -675,6 +675,11 @@ impl Emitter<'_> {
                     normalize as u32,
                 ]);
                 d.i[6] = self.prefill as u32;
+                d.i[7] = if cache && emit_config::active().qwen_kv_interleave {
+                    plow_asset::live_kv::LAYOUT_ROW_INTERLEAVED
+                } else {
+                    plow_asset::live_kv::LAYOUT_HEAD_MAJOR
+                };
                 d.f[0] = self.c.eps;
                 d.f[1] = if normalize { 1.0 } else { 0.0 };
             })
@@ -799,7 +804,10 @@ impl Emitter<'_> {
         // over 14K context: 689 us with maps, 929 without). bf16 KV only: t[7] is the FP8-KV
         // V-scale slot.
         let fa_tm = (gen_attention && c.hd == 256).then(|| {
-            let g = GenTensor::tmap_kv_pair_box(kc, vc, self.ctx, c.hd, c.kv_heads, 32);
+            let mut g = GenTensor::tmap_kv_pair_box(kc, vc, self.ctx, c.hd, c.kv_heads, 32);
+            if emit_config::active().qwen_kv_interleave {
+                g.low = plow_asset::live_kv::LAYOUT_ROW_INTERLEAVED as f64;
+            }
             self.b.tensor_gen(&format!("tmap.kv.{kc}"), g.byte_len(), g)
         });
         let da = if self.prefill {
@@ -2245,6 +2253,55 @@ mod tests {
         );
         assert!(cache.scales.is_none());
         assert_eq!(live.programs.len(), m.progs.len());
+    }
+    // PLOW_QWEN_KV_INTERLEAVE: the cache writers, the KV maps and the live_kv manifest declare the
+    // row-interleaved layout, and only the `_ilv` catalog twin binds the prefill flash.
+    #[test]
+    fn kv_interleave_declares_the_layout_and_binds_the_twin() {
+        let _env = crate::test_env::env_guard();
+        let _target = EmitAmdGuard::set(false);
+        let original = emit_config::active().clone();
+        let c = Config::parse(&fixture());
+        let mut cfg = original.clone();
+        cfg.gen_kernels = Some("attn_pf_hd256_causal_ilv".into());
+        cfg.qwen_kv_interleave = true;
+        emit_config::install(cfg);
+        let m = model_prefill(&c, 16384, 132, 0, &[128, 1024], 2, false);
+        let twin = |name: &str| {
+            crate::gen_kernels::CATALOG
+                .iter()
+                .find(|e| e.name == name)
+                .unwrap()
+        };
+        for program in &m.progs[..2] {
+            for op in program
+                .insts
+                .iter()
+                .filter(|op| op.op == DevOp::FlashPrefill as u16)
+            {
+                assert!(twin("attn_pf_hd256_causal_ilv").matches(op), "{op:?}");
+                assert!(!twin("attn_pf_hd256_causal").matches(op), "{op:?}");
+                let map = m.gen.iter().find(|g| g.tensor == op.t[7]).unwrap();
+                assert_eq!(map.low, plow_asset::live_kv::LAYOUT_ROW_INTERLEAVED as f64);
+            }
+        }
+        emit_config::install(original);
+        for program in &m.progs {
+            for op in program
+                .insts
+                .iter()
+                .filter(|op| op.op == DevOp::QwenHeadNormRope as u16)
+            {
+                let cache = op.i[4] != 0;
+                assert_eq!(op.i[7], cache as u32, "{op:?}");
+            }
+        }
+        let live = plow_asset::program::with_model(&m, plow_asset::live_kv::emit)
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert!(live
+            .caches
+            .iter()
+            .all(|c| c.layout == plow_asset::live_kv::LAYOUT_ROW_INTERLEAVED));
     }
     // PLOW_EMIT_GEN_KERNELS: the prefill flash takes the generated role's contract (one split,
     // fused bf16 output, no merge) and attn_pf_hd256_causal binds every bucket; decode unchanged.

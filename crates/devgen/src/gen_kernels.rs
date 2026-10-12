@@ -71,6 +71,9 @@ pub(crate) struct Entry {
     pub gqa: [u32; 2],
     /// Decode entries: the widest split-KV launch the object merges in one pass.
     pub nsplit_max: u32,
+    /// KV row layout the object addresses (0 head-major, 1 head-interleaved): it binds only when
+    /// the packet's layout (PLOW_QWEN_KV_INTERLEAVE) is the same.
+    pub kv_layout: u32,
 }
 
 /// The table build_catalog.py builds from and `tune` writes: the one source of every entry's
@@ -79,7 +82,7 @@ const TABLE: &str = include_str!("../../../tuning/nvidia/sm_90a/h100-sxm5/gen_ke
 
 /// Devgen's binding policy per table entry, which the table does not carry: the role ID (a new
 /// entry takes the next generated ID) and the smallest prefill rung it binds.
-const POLICY: [(&str, u8, u32); 7] = [
+const POLICY: [(&str, u8, u32); 9] = [
     ("attn_pf_hd512", GENERATED_FIRST, 1024),
     ("attn_pf_hd256_sliding", GENERATED_FIRST + 1, 1024),
     ("attn_pf_hd256_sliding_fp8kv", GENERATED_FIRST + 2, 128),
@@ -91,6 +94,10 @@ const POLICY: [(&str, u8, u32); 7] = [
     // hd256 GQA6 decode attention (the same layers): the runtime launches it for riders and
     // routed decode rungs (interpreter FlashDecode 3.8x the HBM floor at B16 x 8K; this 1.2x).
     ("attn_dec_hd256_gqa6", GENERATED_FIRST + 6, 0),
+    // The same two objects over head-interleaved KV rows (PLOW_QWEN_KV_INTERLEAVE): a packet binds
+    // one layout, so each twin shares its counterpart's role ID.
+    ("attn_pf_hd256_causal_ilv", GENERATED_FIRST + 5, 128),
+    ("attn_dec_hd256_gqa6_ilv", GENERATED_FIRST + 6, 0),
 ];
 
 fn table_entry(
@@ -123,6 +130,11 @@ fn table_entry(
         "bf16" => KvDtype::Bf16,
         "fp8_e4m3_rowscale" => KvDtype::Fp8,
         other => return Err(format!("{name}: unknown kv_dtype {other:?}")),
+    };
+    let kv_layout = match text("kv_layout") {
+        "" | "head_major" => 0,
+        "row_interleaved" => 1,
+        other => return Err(format!("{name}: unknown kv_layout {other:?}")),
     };
     let gqa = if decode {
         let gqa = sig["gqa"]
@@ -158,6 +170,7 @@ fn table_entry(
         decode,
         gqa,
         nsplit_max: if decode { number("nsplit_max")? } else { 0 },
+        kv_layout,
     })
 }
 
@@ -373,6 +386,9 @@ impl Entry {
     /// `FlashDecode` at its head width and GQA ratio (window i[4], ring mask i[7] are runtime
     /// operands of the object).
     pub(crate) fn matches(&self, op: &DevInst) -> bool {
+        if self.kv_layout != crate::emit_config::active().qwen_kv_interleave as u32 {
+            return false;
+        }
         if self.decode {
             return op.op == DevOp::FlashDecode as u16
                 && op.i[6] == self.head_dim
@@ -654,7 +670,7 @@ mod tests {
         let mut roles = BTreeSet::new();
         for entry in CATALOG.iter() {
             assert!(plow_asset::segment_roles::is_generated(entry.role));
-            assert!(roles.insert(entry.role));
+            assert!(roles.insert((entry.role, entry.kv_layout)));
         }
     }
 
@@ -741,6 +757,26 @@ mod tests {
                 (
                     "attn_dec_hd256_gqa6",
                     "gen_sm90a_attn_dec_hd256_gqa6.cubin",
+                    KvDtype::Bf16,
+                    256,
+                    ANY_SLIDING,
+                    true,
+                    false,
+                    false
+                ),
+                (
+                    "attn_pf_hd256_causal_ilv",
+                    "gen_sm90a_attn_pf_hd256_causal_ilv.cubin",
+                    KvDtype::Bf16,
+                    256,
+                    0,
+                    false,
+                    true,
+                    false
+                ),
+                (
+                    "attn_dec_hd256_gqa6_ilv",
+                    "gen_sm90a_attn_dec_hd256_gqa6_ilv.cubin",
                     KvDtype::Bf16,
                     256,
                     ANY_SLIDING,

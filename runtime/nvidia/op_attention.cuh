@@ -803,14 +803,29 @@ __device__ __noinline__ void fa_fold_tail(__nv_bfloat16* __restrict__ out,
 #ifndef PLOW_NV_FA_RG_WIDE
 #define PLOW_NV_FA_RG_WIDE 0
 #endif
+/* PLOW_NV_KV_ILV (manifest `kv_ilv`): a slot's KV rows are head-interleaved, [slot][ctx][kvh][D],
+ * so one 2 MiB VMM block holds 1024 rows of all four Qwen KV heads instead of 4096 rows of one
+ * (head-major [slot][kvh][ctx][D]). Only the bf16 row-group body reads it; every other decode
+ * body traps. */
+#ifndef PLOW_NV_KV_ILV
+#define PLOW_NV_KV_ILV 0
+#endif
+#ifndef KV_ILV_TRAP
+/* A body that addresses head-major KV rows: unreachable on a PLOW_NV_KV_ILV object. */
+#define KV_ILV_TRAP() do { if (PLOW_NV_KV_ILV) __trap(); } while (0)
+#endif
+#if PLOW_NV_KV_ILV && (PLOW_NV_FA_RGT || PLOW_NV_FA_RGM)
+#error "PLOW_NV_KV_ILV: the RGT / RGM bulk copies assume head-major rows"
+#endif
 template <int D, int GF>
 __device__ __forceinline__ void fa_decode_rg_item(
     float* __restrict__ Opart, float* __restrict__ mlpart, __nv_bfloat16* __restrict__ out,
     const __nv_bfloat16* __restrict__ Q, const __nv_bfloat16* __restrict__ kbase,
     const __nv_bfloat16* __restrict__ vbase, unsigned b, unsigned n_head, unsigned h0,
     unsigned nsplit, unsigned sp, unsigned lo, unsigned hi, unsigned kv_mask, float scale,
-    float* lds, unsigned* __restrict__ ctr) {
-    /* D > 256: a warp owns a row and each lane NCH 8-element chunks, 256 elements apart. */
+    float* lds, unsigned* __restrict__ ctr, unsigned rs = (unsigned)D) {
+    /* D > 256: a warp owns a row and each lane NCH 8-element chunks, 256 elements apart.
+     * `rs`: elements between consecutive KV rows (D head-major, kvh * D interleaved). */
     constexpr unsigned NCH = D > 256 ? D / 256 : 1;
     constexpr unsigned LPR = D / (8 * NCH), GPW = 32u / LPR, NGRP = PLOW_NV_WARPS * GPW;
     constexpr int U = D > 256 ? (PLOW_NV_FA_RG_U > 2 ? 2 : PLOW_NV_FA_RG_U) : PLOW_NV_FA_RG_U;
@@ -841,7 +856,7 @@ __device__ __forceinline__ void fa_decode_rg_item(
             const unsigned r = min(r0 + NGRP * (unsigned)u, hi - 1u);
 #pragma unroll
             for (int c = 0; c < (int)NCH; c++) {
-                const size_t off = (size_t)(r & kv_mask) * D + c * LPR * 8u + sub * 8u;
+                const size_t off = (size_t)(r & kv_mask) * rs + c * LPR * 8u + sub * 8u;
                 k8[u][c] = ld_glob8_cs(kbase + off);
                 v8[u][c] = ld_glob8_cs(vbase + off);
             }
@@ -1013,6 +1028,7 @@ __device__ void d_flash_decode_stream(__nv_bfloat16* __restrict__ out, const __n
                                       unsigned n_head, unsigned n_kv_head, unsigned kv_stride,
                                       float scale, unsigned slice, unsigned nblk,
                                       unsigned char* smem, FaStHnr hnr = {}) {
+    KV_ILV_TRAP();
     constexpr unsigned LPR = D / 8, GPW = 32u / LPR, NGRP = PLOW_NV_WARPS * GPW;
     constexpr int U = PLOW_NV_FA_RG_U;
     constexpr unsigned NST = PLOW_NV_FA_ST_STAGES, TR = FA_ST_TR;
@@ -1883,9 +1899,17 @@ __device__ void d_flash_decode(float* __restrict__ Opart, float* __restrict__ ml
         }
 #endif
         const size_t kv_batch = slot;
+#if PLOW_NV_KV_ILV
+        if constexpr (!RG) __trap();
+        const __nv_bfloat16* kbase = K + (kv_batch * kv_stride * n_kv_head + hkv) * (size_t)D;
+        const __nv_bfloat16* vbase = V + (kv_batch * kv_stride * n_kv_head + hkv) * (size_t)D;
+        const unsigned kv_rs = n_kv_head * D;
+#else
         const __nv_bfloat16* kbase = K + (kv_batch * n_kv_head + hkv) * (size_t)kv_stride * D;
         const __nv_bfloat16* vbase = V + (kv_batch * n_kv_head + hkv) * (size_t)kv_stride * D;
-        if constexpr (PLOW_NV_FA_D64W && D == 64 && GF == 1 && !FP8KV && !SZKV) {
+        const unsigned kv_rs = D;
+#endif
+        if constexpr (PLOW_NV_FA_D64W && D == 64 && GF == 1 && !FP8KV && !SZKV && !PLOW_NV_KV_ILV) {
             const size_t oi = (size_t)(b * n_head + h0) * nsplit + sp;
             fa_decode_d64_item(Opart + oi * D, mlpart + oi * 2, Q + ((size_t)b * n_head + h0) * D,
                                kbase, vbase, lo, hi, kv_mask, scale, lds);
@@ -1927,7 +1951,7 @@ __device__ void d_flash_decode(float* __restrict__ Opart, float* __restrict__ ml
 #else
             fa_decode_rg_item<D, GF>(Opart, mlpart, out, Q, kbase, vbase, b, n_head, h0, nsplit,
                                      sp, lo, hi, kv_mask, scale, lds,
-                                     merge_ctr ? merge_ctr + b * n_grp + hg : nullptr);
+                                     merge_ctr ? merge_ctr + b * n_grp + hg : nullptr, kv_rs);
 #endif
             continue;
         }
@@ -2899,6 +2923,7 @@ __device__ void d_flash_prefill(float* __restrict__ Opart, float* __restrict__ m
                                 const float* __restrict__ k_scale = nullptr,
                                 const float* __restrict__ v_scale = nullptr,
                                 const unsigned* __restrict__ span = nullptr) {
+    KV_ILV_TRAP();
     /* `span` (MmSpanExtent, indexed by this call's query row): row r also attends keys up to
      * min(q + span[r], seq_kv - 1), i.e. the rest of its media item. Null = causal. */
     static_assert(HD % 32 == 0, "HD must be a multiple of the warp width");
@@ -3266,6 +3291,7 @@ __device__ void d_flash_prefill_px4(float* __restrict__ Opart, float* __restrict
                                     float* lds, const float* __restrict__ k_scale = nullptr,
                                     const float* __restrict__ v_scale = nullptr,
                                     const void* tma_maps = nullptr) {
+    KV_ILV_TRAP();
     static_assert(HD == 512 && (BQ == 32 || BQ == 64) && BKV == 16,
                   "px4 arm requires the hd512/BKV16 tiling");
     static_assert(THREADS == BQ * 8, "px4 needs one warp per query/kv/hd partition");
@@ -4056,6 +4082,7 @@ __device__ void d_flash_prefill_px8(float* __restrict__ Opart, float* __restrict
                                     unsigned kv_mask, float scale, unsigned slice, unsigned nblk,
                                     float* lds, const float* __restrict__ k_scale = nullptr,
                                     const float* __restrict__ v_scale = nullptr) {
+    KV_ILV_TRAP();
     static_assert(HD == 512 && BQ == 32 && BKV == 32, "px8 arm is the hd512 e4m3-P.V tiling");
     static_assert((int)PLOW_NV_WARPS == 8, "px8 warp grids assume 8 warps");
     static_assert(FP8KV, "px8 is an fp8-KV arm");
@@ -4397,6 +4424,7 @@ __device__ void d_flash_prefill_px23(float* __restrict__ Opart, float* __restric
                                      unsigned kv_mask, float scale, unsigned slice, unsigned nblk,
                                      float* lds, const float* __restrict__ k_scale,
                                      const float* __restrict__ v_scale) {
+    KV_ILV_TRAP();
     static_assert(HD == 256 && BQ == 64 && BKV == 32, "px23 arm is the hd256 SLIDING-layer tiling");
     static_assert((int)PLOW_NV_WARPS == 8 && (int)PLOW_NV_THREADS == 256,
                   "px23 warp grids assume 8 warps / 256 threads");
@@ -4804,6 +4832,7 @@ __device__ void d_flash_prefill(float* __restrict__ Opart, float* __restrict__ m
                                 unsigned kv_stride, unsigned kv_mask, float scale, unsigned slice,
                                 unsigned nblk, float* lds, const int* __restrict__ req = nullptr,
                                 const void* __restrict__ mapkv = nullptr) {
+    KV_ILV_TRAP();
 #if defined(PLOW_NV_HOPPER)
     /* sm_90a FORK first: when the wgmma arm claims the shape (always for <256,64,32>; for
      * <512,64,16> under PLOW_NV_FA512_WG) it beats the px4 mma.sync arm below. */
@@ -5224,6 +5253,7 @@ __device__ void d_flash_prefill_mux(const int* __restrict__ req, float* __restri
                                     unsigned window, unsigned nsplit, unsigned kv_stride,
                                     unsigned kv_mask, float scale, unsigned slice, unsigned nblk,
                                     float* lds, const void* __restrict__ mapkv = nullptr) {
+    KV_ILV_TRAP();
 #if PLOW_NV_PACKED_REQUEST
     if (req) {
         const unsigned count=(unsigned)req[0];
@@ -5350,6 +5380,7 @@ __device__ void d_flash_prefill_fp8_mux(
     unsigned q_pos0, unsigned window, unsigned nsplit, unsigned kv_stride,
     unsigned kv_mask, float scale, unsigned slice, unsigned nblk, float* lds,
     const unsigned* __restrict__ span = nullptr) {
+    KV_ILV_TRAP();
     const unsigned count = req ? (unsigned)req[0] : 1;
 #if PLOW_NV_FA_PIPE
     if (span) __trap(); /* bidirectional media spans: only the PIPE=0 arm masks them */
@@ -5444,6 +5475,7 @@ __device__ void d_flash_prefill_mixed(const PlowProgram* prog, float* __restrict
                                      unsigned nsplit, unsigned kv_stride, unsigned kv_mask,
                                      float scale, unsigned slice, unsigned nblk, float* lds,
                                      const void* __restrict__ mapkv = nullptr) {
+    KV_ILV_TRAP();
     if (!plow_mixed_step_enabled(prog) || seq_q != prog->n_prefill_rows || nsplit != 1u || !O)
         __trap();
     for (unsigned si = 0; si < prog->n_prefill_spans; ++si) {

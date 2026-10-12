@@ -49,6 +49,7 @@ struct GenRider {
     gqa: u32,
     kv_tile: u32,
     nsplit_max: u32,
+    kv_layout: u32,
     opart: DeviceMem,
     mlpart: DeviceMem,
     /// `[batch][kv heads]` split arrivals; the kernel leaves every entry at zero.
@@ -290,6 +291,7 @@ impl Riders {
                         gqa: g.gqa,
                         kv_tile: g.kv_tile,
                         nsplit_max: g.nsplit_max,
+                        kv_layout: g.kv_layout,
                         opart: e.be.alloc(0, splits * u64::from(g.head_dim) * 4)?,
                         mlpart: e.be.alloc(0, splits * 2 * 4)?,
                         ctr,
@@ -508,7 +510,7 @@ impl Riders {
                 kv_mask: a.kv_mask,
                 hd: a.hd,
                 scale: a.scale,
-                pad: 0,
+                pad: g.kv_layout,
             };
             let mut params = [&mut args as *mut GenDecodeArgs as *mut std::ffi::c_void];
             return be.launch_kernel_grid(

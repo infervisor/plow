@@ -88,6 +88,15 @@ use decode_rung::{
     DecodeSelection,
 };
 
+/// The live-KV row layout the packet's cache writers declare (`live_kv::Cache::layout`); every
+/// object that addresses KV must be compiled for it (`plow_kv_layout` / `plow_gen_kv_layout`).
+pub(crate) fn packet_kv_layout(blob: &DevBlob) -> u32 {
+    blob.with_packet_view(plow_asset::live_kv::emit)
+        .ok()
+        .and_then(|m| m.caches.iter().map(|c| c.layout).max())
+        .unwrap_or(plow_asset::live_kv::LAYOUT_HEAD_MAJOR)
+}
+
 /// Whether the packet's full caches can be VMM-mapped block by block: a cache head smaller than
 /// one granule cannot, and such a KV is small enough to keep resident.
 pub(crate) fn live_kv_mappable(
@@ -945,7 +954,8 @@ struct PacketRole {
     function: KernelFn,
     /// Generated flash-prefill direct entry, the head width its packet ops must carry, and
     /// whether it reads an FP8 KV cache (`FlashPrefillFp8` operands).
-    direct_gen: Option<(KernelFn, u32, bool)>,
+    /// (entry, head dim, FP8 KV, KV layout).
+    direct_gen: Option<(KernelFn, u32, bool, u32)>,
     /// The generated object masks media spans (`plow_attention_media_span`; `FlashPrefillFp8` i7
     /// high half, passed in the direct ABI's 8th pointer).
     media_span: bool,
@@ -1985,6 +1995,7 @@ struct KvTensorMap {
     hd: u32,
     heads: u32,
     box_rows: u32,
+    interleaved: bool,
     stride: u64,
     batch: usize,
 }
@@ -2017,6 +2028,11 @@ fn kv_tensor_maps(
         } else {
             return Err(reject());
         };
+        let interleaved = match g.low {
+            0.0 => false,
+            1.0 => true,
+            _ => return Err(reject()),
+        };
         if batch == 0
             || g.ctx == 0
             || g.hd == 0
@@ -2047,7 +2063,11 @@ fn kv_tensor_maps(
                 .is_none_or(|t| t.bytes % batch as u64 != 0 || t.bytes != bytes)
         }) || maps.iter().any(|map| {
             map.pair.iter().any(|id| pair.contains(id))
-                && (map.pair != pair || map.rows != g.ctx || map.hd != g.hd || map.heads != heads)
+                && (map.pair != pair
+                    || map.rows != g.ctx
+                    || map.hd != g.hd
+                    || map.heads != heads
+                    || map.interleaved != interleaved)
         }) {
             return Err(reject());
         }
@@ -2058,6 +2078,7 @@ fn kv_tensor_maps(
             hd: g.hd,
             heads,
             box_rows,
+            interleaved,
             stride,
             batch,
         });
@@ -2102,7 +2123,14 @@ impl KvTensorMap {
     ) -> Result<[(usize, u64); 3]> {
         let bindings = self.slot_bindings(ptrs, slot, descriptor.base)?;
         for (i, &(_, base)) in bindings[1..].iter().enumerate() {
-            let bytes = be.encode_tmap_kv3(base, self.rows, self.hd, self.heads, self.box_rows)?;
+            let bytes = be.encode_tmap_kv3(
+                base,
+                self.rows,
+                self.hd,
+                self.heads,
+                self.box_rows,
+                self.interleaved,
+            )?;
             be.upload(descriptor, (i * 128) as u64, &bytes)?;
         }
         Ok(bindings)
@@ -4308,6 +4336,16 @@ impl GpuEngine {
                 let dec_source = dec.source.clone();
                 let module = DecodeModule::load(&be, &image)?;
                 check_norm_weight_offset(&be, &module, &blob)?;
+                if be
+                    .module_global_u32(&module, "plow_kv_layout")?
+                    .unwrap_or(0)
+                    != packet_kv_layout(&blob)
+                {
+                    return Err(RuntimeError::Rejected(
+                        "decode interpreter KV layout differs from the packet's cache writers"
+                            .into(),
+                    ));
+                }
                 let kname = crate::config::RuntimeConfig::get()
                     .nv
                     .kernel
@@ -5412,7 +5450,15 @@ impl GpuEngine {
                             .is_some_and(|abi| abi.decode())
                 })
             })
-            .map(|(_, object)| gen_role::load_generated_decode(&be, assets_dir, object, profile.tag))
+            .map(|(_, object)| {
+                gen_role::load_generated_decode(
+                    &be,
+                    assets_dir,
+                    object,
+                    profile.tag,
+                    packet_kv_layout(&blob),
+                )
+            })
             .transpose()?;
         let gen_decode_step = nv_config.gen_decode_step;
         let gen_decode_launch = match (&gen_decode, gen_decode_declared && gen_decode_step > 0) {
@@ -6343,6 +6389,7 @@ impl GpuEngine {
                     profile.tag,
                     blob.n_cu,
                     packed_prefill.as_ref(),
+                    packet_kv_layout(&blob),
                 )?);
                 continue;
             }
@@ -10253,6 +10300,7 @@ impl GpuEngine {
                 && seg_mode
                 && seg_class.len() > 1
                 && qwen_segments.is_empty()
+                && packet_kv_layout(&blob) == plow_asset::live_kv::LAYOUT_HEAD_MAJOR
             {
                 let mut sites =
                     attention_gemm::sites(g, &blob.tensors, devp, blob.decode_prog()?.t as usize);
@@ -11244,14 +11292,14 @@ impl GpuEngine {
         // bf16 op in t[6].
         if role
             .direct_gen
-            .is_some_and(|(_, _, fp8)| fp8 != (inst.op == DevOp::FlashPrefillFp8 as u16))
+            .is_some_and(|(_, _, fp8, _)| fp8 != (inst.op == DevOp::FlashPrefillFp8 as u16))
         {
             return Err(RuntimeError::Rejected(
                 "generated role KV dtype differs from its packet op".into(),
             ));
         }
         let fp8_requests = match role.direct_gen {
-            Some((_, _, true)) => {
+            Some((_, _, true, _)) => {
                 if inst.i[4] & (1 << 31) == 0 {
                     return Ok(None);
                 }
@@ -11278,7 +11326,7 @@ impl GpuEngine {
         let entries = arg.gq_stream
             + u64::from(self.prefill[bi].segment_gq_lo[seg])
                 * std::mem::size_of::<packet::dev::StreamEnt>() as u64;
-        if let Some((function, _, _)) = role.direct_gen {
+        if let Some((function, _, _, kv_layout)) = role.direct_gen {
             if let Some(requests) = fp8_requests {
                 let span = packet::dev::flash_span(inst.i[7]);
                 if span.is_some() && !role.media_span {
@@ -11354,7 +11402,7 @@ impl GpuEngine {
                     n_head: inst.i[2],
                     n_kv_head: inst.i[3],
                     window: inst.i[5],
-                    reserved: 0,
+                    reserved: kv_layout,
                 }),
             )));
         }

@@ -1222,6 +1222,10 @@ extern "C" __device__ unsigned PLOW_SYM(plow_packet_hash_hi) =
     (unsigned)((PLOW_PACKET_HASH >> 32) & 0xFFFFFFFFull);
 #endif
 #endif
+#if PLOW_NV_KV_ILV
+/* The KV row layout this object addresses (op_attention.cuh); absent = head-major. */
+extern "C" __device__ unsigned PLOW_SYM(plow_kv_layout) = 1;
+#endif
 
 /* ---- the op dispatch -------------------------------------------------------------------
  * Mirrors runtime/amd/interp.hip's switch. Operand slots are taken from the EMITTER

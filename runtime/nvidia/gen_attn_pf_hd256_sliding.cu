@@ -63,6 +63,14 @@ extern "C" __device__ unsigned plow_attention_head_dim = hd256::HD;
 extern "C" __device__ unsigned plow_attention_query_tile = hd256::BM;
 extern "C" __device__ unsigned plow_attention_kv_tile = hd256::BN;
 extern "C" __device__ unsigned plow_attention_warps = hd256::THREADS / 32;
+// GEN_KV_ILV: head-interleaved KV rows ([slot][ctx][kvh][HD], op_attention.cuh PLOW_NV_KV_ILV);
+// the launch's `reserved` must carry the same layout.
+#ifndef GEN_KV_ILV
+#define GEN_KV_ILV 0
+#endif
+#if GEN_KV_ILV
+extern "C" __device__ unsigned plow_gen_kv_layout = GEN_KV_ILV;
+#endif
 
 typedef struct {
     const int* requests;
@@ -120,7 +128,8 @@ __device__ __forceinline__ void bar_expect_tx(uint32_t b, unsigned bytes) {
                  : "memory");
 }
 // TMA through a GEN_TMAP_KV_PAIR map: rank 3 {256, kv_stride, n_kv_head}, box {64, 32, 1},
-// 128B swizzle (role 14's staging contract).
+// 128B swizzle (role 14's staging contract); GEN_KV_ILV maps {256, n_kv_head, kv_stride} with
+// box {64, 1, 32}, the same shared-memory image.
 __device__ __forceinline__ void tma3d(uint32_t dst, const void* map, int c0, int c1, int c2,
                                       uint32_t bar) {
     asm volatile("cp.async.bulk.tensor.3d.shared::cluster.global.mbarrier::complete_tx::bytes"
@@ -329,12 +338,15 @@ template <bool TMA>
 __device__ __forceinline__ void produce(const PlowGenFlashPrefill& a, uint32_t base, Bars b,
                                         unsigned tid) {
     const size_t kv_head_elems = (size_t)a.kv_stride * HD;
+    const size_t rs = GEN_KV_ILV ? (size_t)a.n_kv_head * HD : HD;
     // Each producer thread owns one 16 B column chunk `c` of rows r0, r0 + 4, ...
     const unsigned c = tid % 32, r0 = tid / 32;
     unsigned kvit = 0, qph = 0;
     Item it;
     for (unsigned round = 0; item_at(a, round, it); ++round) {
-        const size_t head = ((size_t)it.slot * a.n_kv_head + it.hk) * kv_head_elems + c * 8;
+        const size_t head = GEN_KV_ILV
+            ? ((size_t)it.slot * a.kv_stride * a.n_kv_head + it.hk) * HD + c * 8
+            : ((size_t)it.slot * a.n_kv_head + it.hk) * kv_head_elems + c * 8;
         // Packed launches carry a per-slot table of map pairs; an unpacked one the pair itself.
         const char* map = static_cast<const char*>(
             a.requests ? reinterpret_cast<const void*>(
@@ -369,8 +381,13 @@ __device__ __forceinline__ void produce(const PlowGenFlashPrefill& a, uint32_t b
                         for (int blk = 0; blk < HD / 64; ++blk)
 #pragma unroll
                             for (int hb = 0; hb < BN / 32; ++hb)
+#if GEN_KV_ILV
+                                tma3d(tile + blk * (BN * 128) + hb * 32 * 128, m, blk * 64,
+                                      (int)it.hk, row + hb * 32, full);
+#else
                                 tma3d(tile + blk * (BN * 128) + hb * 32 * 128, m, blk * 64,
                                       row + hb * 32, (int)it.hk, full);
+#endif
                     } else {
                         bar_arrive(full);
                     }
@@ -384,7 +401,7 @@ __device__ __forceinline__ void produce(const PlowGenFlashPrefill& a, uint32_t b
                     const unsigned pos = t * BN + r;
                     const bool ok = pos >= it.lo && pos < it.kvlen;
                     cp16((dst + r * 128) ^ ((r & 7) << 4),
-                         ok ? g + (size_t)(pos & a.kv_mask) * HD : a.k, ok ? 16 : 0);
+                         ok ? g + (size_t)(pos & a.kv_mask) * rs : a.k, ok ? 16 : 0);
                 }
                 bar_arrive_copies(full);
             }
@@ -562,7 +579,11 @@ __device__ __forceinline__ bool valid(const PlowGenFlashPrefill& a) {
            a.n_kv_head &&
            a.n_head % (2 * a.n_kv_head) == 0 &&
            (a.kv_mask == 0xffffffffu || ((a.kv_mask + 1) & a.kv_mask) == 0) &&
-           (a.kv_mask == 0xffffffffu || a.kv_mask + 1 >= (unsigned)BN);
+           (a.kv_mask == 0xffffffffu || a.kv_mask + 1 >= (unsigned)BN)
+#if GEN_KV_ILV
+           && a.reserved == GEN_KV_ILV
+#endif
+           ;
 }
 
 __device__ __forceinline__ uint8_t* arena() {
@@ -625,6 +646,10 @@ void plow_gen_flash_prefill(PlowProgram prog) {
         a.n_head = in->i[2];
         a.n_kv_head = in->i[3];
         a.window = in->i[5];
+#if GEN_KV_ILV
+        // The packet carries no layout operand; plowrt matched plow_gen_kv_layout at load.
+        a.reserved = GEN_KV_ILV;
+#endif
     }
     __syncthreads();
     if (in->op != PLOW_DOP_FLASH_PREFILL || in->i[6] != hd256::HD || in->i[7] != 1 ||

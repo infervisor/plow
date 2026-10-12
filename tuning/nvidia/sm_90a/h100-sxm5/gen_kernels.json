@@ -297,8 +297,36 @@
    },
    "spill_bytes": 0
   },
+  "attn_dec_hd256_gqa6_ilv": {
+   "body_sha256": "79f54ddb297e50f2728f6699ef29e81658efd7195e966ab3709e951c41733d95",
+   "classes": {},
+   "config": {
+    "bn": 32,
+    "stages": 2,
+    "threads": 128
+   },
+   "object": "gen_sm90a_attn_dec_hd256_gqa6_ilv.cubin",
+   "selection": "attn_dec_hd256_gqa6 config (head-interleaved KV twin)",
+   "signature": {
+    "arch": "sm_90a",
+    "dtype": "bf16",
+    "gqa": [
+     6,
+     6
+    ],
+    "head_dim": 256,
+    "kv_dtype": "bf16",
+    "kv_layout": "row_interleaved",
+    "nsplit_max": 8,
+    "op": "flash_decode",
+    "ring_kv": true,
+    "window": 0,
+    "window_any": true
+   },
+   "spill_bytes": 0
+  },
   "attn_pf_hd256_causal": {
-   "body_sha256": "51d22b9fe138947d741efed068f3fe57bf68186fda207c3e4906928a4e54ffa0",
+   "body_sha256": "0474900ee1d54109f57cb292b2b00ab15de5213da9e5d922d9484bd13dc2e648",
    "classes": {},
    "config": {
     "bn": 64,
@@ -325,8 +353,37 @@
    },
    "spill_bytes": 0
   },
+  "attn_pf_hd256_causal_ilv": {
+   "body_sha256": "183333a0f8a6a0daf1d6680d7a5bd5ff0c1596920a4b0f5486603872f7d18992",
+   "classes": {},
+   "config": {
+    "bn": 64,
+    "kstages": 3,
+    "preg": 56,
+    "vstages": 2
+   },
+   "object": "gen_sm90a_attn_pf_hd256_causal_ilv.cubin",
+   "selection": "attn_pf_hd256_causal config (head-interleaved KV twin)",
+   "signature": {
+    "arch": "sm_90a",
+    "dtype": "bf16",
+    "gqa": [
+     2,
+     16
+    ],
+    "gqa_even": true,
+    "head_dim": 256,
+    "kv_dtype": "bf16",
+    "kv_layout": "row_interleaved",
+    "mask": "causal",
+    "op": "flash_prefill",
+    "ring_kv": false,
+    "window": 0
+   },
+   "spill_bytes": 0
+  },
   "attn_pf_hd256_sliding": {
-   "body_sha256": "51d22b9fe138947d741efed068f3fe57bf68186fda207c3e4906928a4e54ffa0",
+   "body_sha256": "0474900ee1d54109f57cb292b2b00ab15de5213da9e5d922d9484bd13dc2e648",
    "classes": {
     "h16kv8_w1024_rows1024": {
      "best": {

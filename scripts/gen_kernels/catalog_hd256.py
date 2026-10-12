@@ -36,6 +36,17 @@ ENTRIES = {
         "tune": _mod.tune_row,
         "classes": [(24, 4, 1024), (24, 4, 4096)],
     },
+    # The causal entry over head-interleaved KV rows ([slots][kv_stride][kv heads][hd],
+    # PLOW_QWEN_KV_INTERLEAVE): GEN_KV_ILV=1, the causal entry's config.
+    "attn_pf_hd256_causal_ilv": {
+        "signature": {"op": "flash_prefill", "head_dim": 256, "mask": "causal", "window": 0,
+                      "gqa": [2, 16], "gqa_even": True, "ring_kv": False,
+                      "dtype": "bf16", "kv_dtype": "bf16", "kv_layout": "row_interleaved",
+                      "arch": "sm_90a"},
+        "object": "gen_sm90a_attn_pf_hd256_causal_ilv.cubin",
+        "build": lambda cfg, out: _mod.catalog_build(cfg, out, ilv=True),
+        "classes": [(24, 4, 1024), (24, 4, 4096)],
+    },
     # The FlashPrefillFp8 twin: e4m3 K/V with one f32 scale per (position, KV head) row
     # (crates/devgen/src/gen_kernels.rs KvDtype::Fp8). Same schedule; no tensor maps.
     "attn_pf_hd256_sliding_fp8kv": {

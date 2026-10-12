@@ -220,6 +220,7 @@ pub(super) struct GenDecodeLaunch {
     gqa: u32,
     kv_tile: u32,
     nsplit_max: u32,
+    pub(super) kv_layout: u32,
     sms: u32,
     opart: DeviceMem,
     mlpart: DeviceMem,
@@ -252,6 +253,7 @@ impl GenDecodeLaunch {
             gqa: g.gqa,
             kv_tile: g.kv_tile,
             nsplit_max: g.nsplit_max,
+            kv_layout: g.kv_layout,
             sms: be.sm_count().max(1),
             opart: be.alloc(0, splits * u64::from(g.head_dim) * 4)?,
             mlpart: be.alloc(0, splits * 2 * 4)?,
@@ -385,7 +387,7 @@ pub(super) fn routes(
                         kv_mask: d.i[7],
                         hd: d.i[6],
                         scale: f32::from_bits(d.fj[0]),
-                        pad: 0,
+                        pad: launch.kv_layout,
                     },
                 })))
             }

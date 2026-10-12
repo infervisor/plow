@@ -689,6 +689,9 @@ static __device__ void d_qwen_fold_norm(__nv_bfloat16* hn, __nv_bfloat16* resid_
     }
 }
 
+#ifndef PLOW_NV_KV_ILV
+#define PLOW_NV_KV_ILV 0  /* op_attention.cuh: head-interleaved KV rows */
+#endif
 static __device__ void d_qwen_headnorm_rope(__nv_bfloat16* out, const __nv_bfloat16* in,
     const __nv_bfloat16* gamma, const float* cos, const float* sin, const int* positions,
     const int* active, unsigned heads, unsigned dim, unsigned rotary, unsigned batch,
@@ -724,8 +727,13 @@ static __device__ void d_qwen_headnorm_rope(__nv_bfloat16* out, const __nv_bfloa
             float lo = x[0], hi = x[1];
             x[0] = lo * c - hi * s; x[1] = hi * c + lo * s;
         }
+#if PLOW_NV_KV_ILV
+        size_t dest = context ? (((size_t)kvslot * context + pos) * heads + head) * dim
+                              : (size_t)row * dim;
+#else
         size_t dest = context ? ((size_t)kvslot * heads + head) * context * dim + (size_t)pos * dim
                               : (size_t)row * dim;
+#endif
 #pragma unroll
         for (unsigned j = 0; j < 8; j++) out[dest + lane + j * 32] = __float2bfloat16(x[j]);
     }
