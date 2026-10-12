@@ -140,6 +140,16 @@ const PRESSURE_EVICTION_DEFAULT: Status = Status::Candidate {
     ],
 };
 
+/// The Qwen3.5 chain's pointwise prefill segments as light launches of the prefill object, four
+/// blocks per SM. The interpreter window runs one 256-thread block per SM (its entry is at the
+/// register cap), which left the issue-bound pointwise arms at 10-30% of their byte floors.
+const QWEN_LIGHT_DEFAULT: Status = Status::Candidate {
+    evidence: &[
+        "plans/qwen38-27b-h100.md (segtime62, build59): the chain's pointwise class 24.4 / 74.2 ms per 1024 / 4096 rows as interpreter windows, 16.7 / 52.0 as light launches at occ 2 or 4 (two blocks per SM, the chunk's own tensor table); digests B1 / B8 = build50",
+        "`=0` is the rollback to interpreter windows",
+    ],
+};
+
 /// Runtime knobs change no packet byte; their scope is the route a workload takes.
 /// G1 (review log #85) skips union segments inside the sparse prefill programs; the packet does not
 /// change, so the route is its whole scope.
@@ -586,6 +596,7 @@ pub const RUNTIME: &[KnobSpec] = &[
     KnobSpec::new("rt.decode_light_attn_s", Some("PLOW_DECODE_LIGHT_ATTN_S"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
     KnobSpec::new("rt.decode_head_argmax", Some("PLOW_DECODE_HEAD_ARGMAX"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
     KnobSpec::new("rt.prefill_light", Some("PLOW_PREFILL_LIGHT"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
+    KnobSpec::new("rt.qwen_light_occ", Some("PLOW_QWEN_LIGHT_OCC"), Layer::Runtime, U32, Default::Static(Val::Nat(4)), QWEN_LIGHT_DEFAULT),
     KnobSpec::new("rt.decode_lt_qkv", Some("PLOW_DECODE_LT_QKV"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
     KnobSpec::new("rt.moe_pf_lt", Some("PLOW_MOE_PF_LT"), Layer::Runtime, U32, UNSET, MOE_LT_QUALIFIED),
     KnobSpec::new("rt.moe_dec_lt", Some("PLOW_MOE_DEC_LT"), Layer::Runtime, U32, UNSET, MOE_LT_QUALIFIED),

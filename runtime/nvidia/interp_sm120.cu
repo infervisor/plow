@@ -1319,7 +1319,7 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
             in->fj[1].f, in->i[5], slice, nblk, arena, PLOW_NV_ARENA_FLOATS);
         break;
     case PLOW_DOP_QWEN_GATED_NORM:
-        d_qwen_gated_norm((__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1),
+        d_qwen_gated_norm<PLOW_NV_PREFILL != 0>((__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1),
             (const __nv_bfloat16*)TEN(2), (const __nv_bfloat16*)TEN(3), (const int*)TEN(4),
             in->i[0], in->i[1], in->i[2], in->fj[0].f, slice, nblk);
         break;
@@ -1345,12 +1345,12 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
             (const int*)TEN(7));
         break;
     case PLOW_DOP_QWEN_GDN_CONV_PREFILL:
-        d_qwen_gdn_conv_prefill((__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1),
+        d_qwen_gdn_conv_prefill<PLOW_NV_PREFILL != 0>((__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1),
             (const __nv_bfloat16*)TEN(2), (__nv_bfloat16*)TEN(3), in->i[0], in->i[1],
             in->i[2], in->i[3], slice, nblk, (const int*)TEN(5));
         break;
     case PLOW_DOP_QWEN_GDN_QKV_PREP:
-        d_qwen_gdn_qkv_prep((__nv_bfloat16*)TEN(0), (__nv_bfloat16*)TEN(1),
+        d_qwen_gdn_qkv_prep<PLOW_NV_PREFILL != 0>((__nv_bfloat16*)TEN(0), (__nv_bfloat16*)TEN(1),
             (__nv_bfloat16*)TEN(2), (const __nv_bfloat16*)TEN(3), in->i[0], in->i[1],
             in->i[2], in->i[3], in->i[4], in->fj[0].f, slice, nblk);
         break;
@@ -3954,8 +3954,16 @@ extern "C" __global__ void __launch_bounds__(PLOW_NV_THREADS) PLOW_SYM(plow_sm12
 /* A prefill bucket's lone RmsNorm / Residual / SiLU Glu, as an ordinary launch like
  * plow_sm120_light: the prefill object's bodies (RmsNorm takes its warp-per-row path from 32
  * rows, as the prefill object does), so the outputs are the interpreter window's. */
-extern "C" __global__ void __launch_bounds__(PLOW_NV_THREADS) PLOW_SYM(plow_sm120_light_pf)(PlowProgram prog,
-                                                                                       unsigned inst) {
+#if PLOW_NV_QWEN_GDN
+/* Two blocks per SM: the Qwen3.5 pointwise arms are latency-bound and their widest (the conv
+ * prefill window) fits 128 registers without spilling; at one block per SM (188 registers) the
+ * conv ran 116 vs 83 us at 4096 rows. */
+#define PLOW_LIGHT_PF_BOUNDS __launch_bounds__(PLOW_NV_THREADS, 2)
+#else
+#define PLOW_LIGHT_PF_BOUNDS __launch_bounds__(PLOW_NV_THREADS)
+#endif
+extern "C" __global__ void PLOW_LIGHT_PF_BOUNDS PLOW_SYM(plow_sm120_light_pf)(PlowProgram prog,
+                                                                              unsigned inst) {
     __shared__ float part[32];
     const PlowDevInst* in = prog.insts + inst;
     void* const* T = prog.tensors;
@@ -3977,6 +3985,54 @@ extern "C" __global__ void __launch_bounds__(PLOW_NV_THREADS) PLOW_SYM(plow_sm12
         d_glu((__nv_bfloat16*)LIGHT_TEN(0), (const __nv_bfloat16*)LIGHT_TEN(1), (const __nv_bfloat16*)LIGHT_TEN(2),
               in->i[0], in->i[1], slice, nblk);
         break;
+#if PLOW_NV_QWEN_GDN
+    /* The Qwen3.5 chain's prefill pointwise arms (exec/gpu.rs qwen_light_segments): the same
+     * bodies and operands as the prefill interpreter window (the <true> fast-path
+     * instantiations, in this DECODE object), on this kernel's own register budget and a wider
+     * grid. The host keeps nblk below the bucket's rows so QwenRmsNorm's warp-per-row choice
+     * (batch > nblk) is the window's, and launches on the chunk's own tensor table. */
+    case PLOW_DOP_QWEN_GATED_NORM:
+        d_qwen_gated_norm<true>((__nv_bfloat16*)LIGHT_TEN(0), (const __nv_bfloat16*)LIGHT_TEN(1),
+            (const __nv_bfloat16*)LIGHT_TEN(2), (const __nv_bfloat16*)LIGHT_TEN(3), (const int*)LIGHT_TEN(4),
+            in->i[0], in->i[1], in->i[2], in->fj[0].f, slice, nblk);
+        break;
+    case PLOW_DOP_QWEN_Q_GATE_SPLIT:
+        d_qwen_q_gate_split((__nv_bfloat16*)LIGHT_TEN(0), (__nv_bfloat16*)LIGHT_TEN(1),
+            (const __nv_bfloat16*)LIGHT_TEN(2), (const int*)LIGHT_TEN(3),
+            in->i[0], in->i[1], in->i[2], slice, nblk);
+        break;
+    case PLOW_DOP_QWEN_SIGMOID_GATE:
+        d_qwen_sigmoid_gate((__nv_bfloat16*)LIGHT_TEN(0), (const __nv_bfloat16*)LIGHT_TEN(1),
+            (const __nv_bfloat16*)LIGHT_TEN(2), (const int*)LIGHT_TEN(3), in->i[0], in->i[1], slice, nblk);
+        break;
+    case PLOW_DOP_QWEN_RMSNORM:
+        d_qwen_rmsnorm((__nv_bfloat16*)LIGHT_TEN(0), (const __nv_bfloat16*)LIGHT_TEN(1),
+            (const __nv_bfloat16*)LIGHT_TEN(2), (const int*)LIGHT_TEN(3), in->i[0], in->i[1],
+            in->fj[0].f, in->fj[1].f, slice, nblk, part, (const __nv_bfloat16*)LIGHT_TEN(4));
+        break;
+    case PLOW_DOP_QWEN_HEADNORM_ROPE:
+        d_qwen_headnorm_rope((__nv_bfloat16*)LIGHT_TEN(0), (const __nv_bfloat16*)LIGHT_TEN(1),
+            (const __nv_bfloat16*)LIGHT_TEN(2), (const float*)LIGHT_TEN(3), (const float*)LIGHT_TEN(4),
+            (const int*)LIGHT_TEN(5), (const int*)LIGHT_TEN(6), in->i[0], in->i[1], in->i[2],
+            in->i[3], in->i[4], in->i[5], in->fj[0].f, in->fj[1].f, slice, nblk, in->i[6],
+            (const int*)LIGHT_TEN(7));
+        break;
+    case PLOW_DOP_QWEN_GDN_CONV_PREFILL:
+        d_qwen_gdn_conv_prefill<true>((__nv_bfloat16*)LIGHT_TEN(0), (const __nv_bfloat16*)LIGHT_TEN(1),
+            (const __nv_bfloat16*)LIGHT_TEN(2), (__nv_bfloat16*)LIGHT_TEN(3), in->i[0], in->i[1],
+            in->i[2], in->i[3], slice, nblk, (const int*)LIGHT_TEN(5));
+        break;
+    case PLOW_DOP_QWEN_GDN_QKV_PREP:
+        d_qwen_gdn_qkv_prep<true>((__nv_bfloat16*)LIGHT_TEN(0), (__nv_bfloat16*)LIGHT_TEN(1),
+            (__nv_bfloat16*)LIGHT_TEN(2), (const __nv_bfloat16*)LIGHT_TEN(3), in->i[0], in->i[1],
+            in->i[2], in->i[3], in->i[4], in->fj[0].f, slice, nblk);
+        break;
+    case PLOW_DOP_QWEN_GDN_GATE_PREP:
+        d_qwen_gdn_gate_prep((float*)LIGHT_TEN(0), (float*)LIGHT_TEN(1), (const __nv_bfloat16*)LIGHT_TEN(2),
+            (const __nv_bfloat16*)LIGHT_TEN(3), (const __nv_bfloat16*)LIGHT_TEN(4),
+            (const __nv_bfloat16*)LIGHT_TEN(5), in->i[0], in->i[1], slice, nblk);
+        break;
+#endif
     default:
         __trap();
     }
@@ -4502,6 +4558,61 @@ extern "C" __device__ unsigned PLOW_SYM(plow_rider_smem512) =
     FA_DEC_SMEM_FLOATS(512, PLOW_NV_FA_GF_FULL) * sizeof(float);
 extern "C" __device__ unsigned PLOW_SYM(plow_rider_fp8_kv) = PLOW_FP8_KV;
 extern "C" __device__ unsigned PLOW_SYM(plow_rider_gf512) = PLOW_NV_FA_GF_FULL;
+#endif
+/* Packed recurrent-state gather / scatter (exec/gpu.rs launch_prefill_chain): request i's slot
+ * state (slot = table[tstride * i + tslot], `units` 16-byte units per state) copies to or from
+ * the i-th state of a contiguous scratch, every request in one launch. One memcpy per request
+ * and layer cost a 1024-row launch with 14 riders 1,400 copies (7 ms of its 112). Layout is
+ * mirrored by `StateCopyArgs`. */
+struct PlowStateCopy {
+    uint4* scratch;
+    uint4* slots;
+    const int* table;
+    unsigned n, units, to_scratch, tstride, tslot, pad;
+};
+extern "C" __global__ void __launch_bounds__(PLOW_NV_THREADS)
+    PLOW_SYM(plow_sm120_state_copy)(const __grid_constant__ PlowStateCopy a) {
+    const unsigned i = blockIdx.y;
+    if (i >= a.n) return;
+    const int slot = a.table[(size_t)a.tstride * i + a.tslot];
+    if (slot < 0) __trap();
+    uint4* sc = a.scratch + (size_t)i * a.units;
+    uint4* sl = a.slots + (size_t)slot * a.units;
+    uint4* dst = a.to_scratch ? sc : sl;
+    const uint4* src = a.to_scratch ? sl : sc;
+    const unsigned step = gridDim.x * blockDim.x * 4u;
+    for (unsigned j0 = (blockIdx.x * blockDim.x + threadIdx.x) * 4u; j0 < a.units; j0 += step) {
+        uint4 v[4];
+#pragma unroll
+        for (unsigned u = 0; u < 4; u++) if (j0 + u < a.units) v[u] = src[j0 + u];
+#pragma unroll
+        for (unsigned u = 0; u < 4; u++) if (j0 + u < a.units) dst[j0 + u] = v[u];
+    }
+}
+#if PLOW_NV_QWEN_GDN && !PLOW_NV_GEMM_ONLY && !PLOW_NV_FA_ONLY
+/* Riders of a packed Qwen launch (exec/gpu.rs packed_gdn_ride): row i steps the recurrent state
+ * of slot table[tstride * i] with the decode step body, so a one-row request costs a decode row
+ * instead of a 64-row chunk of the prefill scan plus two 3 MB state copies. The staging slice is
+ * the step's own (8 V rows per warp). Layout is mirrored by `GdnRideArgs`. */
+struct PlowGdnRide {
+    __nv_bfloat16* out;
+    const __nv_bfloat16* qkv;
+    const __nv_bfloat16* a;
+    const __nv_bfloat16* b;
+    const void* alog;
+    const __nv_bfloat16* dt_bias;
+    float* state;
+    const int* table;
+    unsigned n, tstride, hk, hv, kdim, vdim, alog_f32, pad;
+    float scale, eps;
+};
+extern "C" __global__ void __launch_bounds__(PLOW_NV_THREADS)
+    PLOW_SYM(plow_sm120_gdn_ride)(const __grid_constant__ PlowGdnRide a) {
+    extern __shared__ float arena[];
+    d_qwen_gdn_step(a.out, a.qkv, a.a, a.b, a.alog, a.dt_bias, a.state, nullptr, a.hk, a.hv,
+        a.kdim, a.vdim, a.n, a.scale, a.eps, a.alog_f32, blockIdx.x, gridDim.x, arena,
+        (blockDim.x >> 5) * 8u * 128u, a.table, a.tstride);
+}
 #endif
 extern "C" __device__ unsigned PLOW_SYM(plow_light_abi) = PLOW_NV_GEMMA ? 2 : 1;
 #endif

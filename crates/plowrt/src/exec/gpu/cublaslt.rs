@@ -282,6 +282,12 @@ struct LightLaunch {
 
 impl LightRoute {
     pub(super) fn run(&self, stream: &CudaStream) -> Result<()> {
+        self.run_with(stream, self.kernarg.tensors)
+    }
+
+    /// `tensors`: the launch's tensor table. A per-slot prefill chunk selects slot b's shifted
+    /// table (kv.*, recurrent state) through its kernarg; the route's own copy is slot 0's.
+    pub(super) fn run_with(&self, stream: &CudaStream, tensors: u64) -> Result<()> {
         for launch in &self.launches {
             if let Some(span) = &launch.direct {
                 let mut span = **span;
@@ -301,6 +307,7 @@ impl LightRoute {
                 continue;
             }
             let mut arg = self.kernarg;
+            arg.tensors = tensors;
             let mut instruction = launch.instruction;
             let (mut count, mut hnr) = match launch.kind {
                 LightKind::Attn(n) => (n, [0; 4]),
@@ -648,6 +655,47 @@ pub(super) fn prefill_light_segments(
     g: &DevProg,
     library: &[Option<usize>],
 ) -> Vec<(usize, Vec<usize>)> {
+    let none = packet::dev::TENSOR_NONE16;
+    light_segments_matching(g, library, 3, |d| match DevOp::from_u16(d.op) {
+        Some(DevOp::RmsNorm) => d.t[3] == none && d.t[4] == none,
+        Some(DevOp::Residual) => true,
+        Some(DevOp::Glu) => d.i[1] == 1,
+        _ => false,
+    })
+}
+
+/// The Qwen3.5 chain's interpreter segments made only of its prefill pointwise arms (and SiLU
+/// Glu / Residual), at most four instructions: `plow_<arch>_light_pf` of the PREFILL object runs
+/// them one launch each in program order (`qwen_light_route`).
+pub(super) fn qwen_light_segments(
+    g: &DevProg,
+    library: &[Option<usize>],
+) -> Vec<(usize, Vec<usize>)> {
+    light_segments_matching(g, library, 4, |d| match DevOp::from_u16(d.op) {
+        Some(
+            DevOp::QwenRmsNorm
+            | DevOp::QwenGatedNorm
+            | DevOp::QwenQGateSplit
+            | DevOp::QwenSigmoidGate
+            | DevOp::QwenHeadNormRope
+            | DevOp::QwenGdnConvPrefill
+            | DevOp::QwenGdnQkvPrep
+            | DevOp::QwenGdnGatePrep
+            | DevOp::Residual,
+        ) => true,
+        Some(DevOp::Glu) => d.i[1] == 1,
+        _ => false,
+    })
+}
+
+/// Segments of 1..=`max` whole instructions (every slice, ascending, in program order) that
+/// `allow` accepts, skipping `library` segments.
+fn light_segments_matching(
+    g: &DevProg,
+    library: &[Option<usize>],
+    max: usize,
+    allow: impl Fn(&DevInst64) -> bool,
+) -> Vec<(usize, Vec<usize>)> {
     (0..g.gq_seg_ofs.len().saturating_sub(1))
         .filter(|&seg| library.get(seg).copied().flatten().is_none())
         .filter_map(|seg| {
@@ -658,8 +706,7 @@ pub(super) fn prefill_light_segments(
                     insts.push(e.inst as usize);
                 }
             }
-            let none = packet::dev::TENSOR_NONE16;
-            let ok = (1..=3).contains(&insts.len())
+            let ok = (1..=max).contains(&insts.len())
                 && insts.windows(2).all(|w| w[0] < w[1])
                 && insts.iter().all(|&inst| {
                     let d = &g.insts[inst];
@@ -667,12 +714,7 @@ pub(super) fn prefill_light_segments(
                     d.blocks != 0
                         && own.len() == d.blocks as usize
                         && own.iter().enumerate().all(|(i, e)| e.slice as usize == i)
-                        && match DevOp::from_u16(d.op) {
-                            Some(DevOp::RmsNorm) => d.t[3] == none && d.t[4] == none,
-                            Some(DevOp::Residual) => true,
-                            Some(DevOp::Glu) => d.i[1] == 1,
-                            _ => false,
-                        }
+                        && allow(d)
                 });
             ok.then_some((seg, insts))
         })
@@ -758,6 +800,24 @@ pub(super) fn prefill_light_route(
             .collect(),
         _scratch: None,
     }
+}
+
+/// `prefill_light_route` on `grid` blocks per launch instead of the instruction's one per SM:
+/// the Qwen pointwise bodies stride by gridDim, and the interpreter's one 256-thread block per
+/// SM (its entry sits at the register cap) left them issue-bound.
+pub(super) fn qwen_light_route(
+    be: &Arc<CudaBackend>,
+    function: KernelFn,
+    kernarg: DevProgram,
+    g: &DevProg,
+    insts: &[usize],
+    grid: u32,
+) -> LightRoute {
+    let mut route = prefill_light_route(be, function, kernarg, g, insts);
+    for launch in &mut route.launches {
+        launch.blocks = grid;
+    }
+    route
 }
 
 /// The cached GLU quant kernel strides rows by `gridDim`: one CTA per row instead of the

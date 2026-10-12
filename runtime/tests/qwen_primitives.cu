@@ -77,7 +77,7 @@ switch(op) {
             in->fj[1].f, in->i[5], slice, nblk, (float*)arena, 8192u);
         break;
     case PLOW_DOP_QWEN_GATED_NORM:
-        d_qwen_gated_norm((__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1),
+        d_qwen_gated_norm<false>((__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1),
             (const __nv_bfloat16*)TEN(2), (const __nv_bfloat16*)TEN(3), (const int*)TEN(4),
             in->i[0], in->i[1], in->i[2], in->fj[0].f, slice, nblk);
         break;
@@ -102,12 +102,12 @@ switch(op) {
             in->i[3], in->i[4], in->i[5], in->fj[0].f, in->fj[1].f, slice, nblk, in->i[6]);
         break;
     case PLOW_DOP_QWEN_GDN_CONV_PREFILL:
-        d_qwen_gdn_conv_prefill((__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1),
+        d_qwen_gdn_conv_prefill<false>((__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1),
             (const __nv_bfloat16*)TEN(2), (__nv_bfloat16*)TEN(3), in->i[0], in->i[1],
             in->i[2], in->i[3], slice, nblk);
         break;
     case PLOW_DOP_QWEN_GDN_QKV_PREP:
-        d_qwen_gdn_qkv_prep((__nv_bfloat16*)TEN(0), (__nv_bfloat16*)TEN(1),
+        d_qwen_gdn_qkv_prep<false>((__nv_bfloat16*)TEN(0), (__nv_bfloat16*)TEN(1),
             (__nv_bfloat16*)TEN(2), (const __nv_bfloat16*)TEN(3), in->i[0], in->i[1],
             in->i[2], in->i[3], in->i[4], in->fj[0].f, slice, nblk);
         break;

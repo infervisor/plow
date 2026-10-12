@@ -1478,6 +1478,17 @@ pub struct NvidiaRuntimeConfig {
     #[arg(long = "prefill-light", env = "PLOW_PREFILL_LIGHT", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub prefill_light: bool,
 
+    /// The Qwen3.5 chain's pointwise prefill segments (buckets of >= 1024 rows) run as launches
+    /// of the prefill object's `plow_<arch>_light_pf` kernel on this many blocks per SM instead
+    /// of interpreter windows. 0 = windows.
+    #[arg(
+        long = "qwen-light-occ",
+        env = "PLOW_QWEN_LIGHT_OCC",
+        default_value_t = 4,
+        global = true
+    )]
+    pub qwen_light_occ: u32,
+
     /// A routed decode rung's q, k and v projections run as one cuBLASLt matmul when their
     /// weights are contiguous and a light attention launch reads the three outputs.
     #[arg(long = "decode-lt-qkv", env = "PLOW_DECODE_LT_QKV", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
@@ -2389,7 +2400,18 @@ impl RuntimeConfig {
     /// KV admission budget from the device's `free`/`total` bytes after load: the headroom share
     /// of free, capped by `--kv-mem-util` of the device when that is set.
     pub(crate) fn kv_admit_budget(&self, free: u64, total: u64) -> u64 {
-        let budget = (free as f64 * self.kv_admit_headroom()) as u64;
+        self.kv_admit_capped((free as f64 * self.kv_admit_headroom()) as u64, free, total)
+    }
+
+    /// The live admission share of `free`: everything above the absolute `reserve` fixed at load
+    /// (free-after-load minus the load-time budget). A fraction of the *current* free would hand
+    /// out 90% of whatever is left on every re-read and leave no margin for the blocks already
+    /// promised to live sequences; the reserve keeps that margin constant.
+    pub(crate) fn kv_admit_live(&self, free: u64, total: u64, reserve: u64) -> u64 {
+        self.kv_admit_capped(free.saturating_sub(reserve), free, total)
+    }
+
+    fn kv_admit_capped(&self, budget: u64, free: u64, total: u64) -> u64 {
         let util = select_compat(
             self.amd.kv_mem_util,
             Self::env_parse("PLOW_KV_MEM_UTIL"),

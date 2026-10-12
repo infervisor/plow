@@ -2641,6 +2641,15 @@ impl VmmKv {
         stats_of(&self.shared)
     }
 
+    /// Device bytes of every physical block alive now (mapped, cached, pooled).
+    pub fn mapped_bytes(&self) -> u64 {
+        stats_of(&self.shared).blocks_live * self.shared.block_bytes
+    }
+
+    pub fn block_bytes(&self) -> u64 {
+        self.shared.block_bytes
+    }
+
     /// Cloneable stats reader for exporters. Takes only the POOL mutex
     /// (µs-scale holds), never the engine mutex — a metrics scrape must not
     /// queue behind a running tick. Reads after the pool drops return the
