@@ -712,7 +712,14 @@ __device__ void d_headnorm_rope(bf16* __restrict__ out, const bf16* __restrict__
             constexpr unsigned H2 = HD >> 1;
             const size_t p = (size_t)position * H2;
             float r[E];
-            if constexpr (!INTERLEAVE) {
+            if constexpr (!INTERLEAVE && HD == 64) {
+                /* hd 64: one element per lane, so the half-split partner (i +- 32) is in ANOTHER
+                 * lane, lane ^ 32: the one width where the pair leaves the lane. */
+                const unsigned j = lane & 31u;
+                const float c = cg[p + j], s = sg[p + j];
+                const float partner = __shfl_xor(v[0], 32, PLOW_WAVE);
+                r[0] = (lane < 32u) ? (v[0] * c - partner * s) : (v[0] * c + partner * s);
+            } else if constexpr (!INTERLEAVE) {
                 constexpr unsigned EH = H2 >> 6; /* lane-local stride to the half-split partner */
 #pragma unroll
                 for (unsigned e = 0; e < E; e++) {
