@@ -950,6 +950,14 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_GLM_GEMM_LT_DECODE_EXT", value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub glm_gemm_lt_decode_ext: Option<bool>,
 
+    /// Decode rungs of at least this many rows route their BF16 projections (KDA/MLA
+    /// projections, shared expert, router, lm_head) through the prefill GEMM tile family
+    /// (`pick_tile`) instead of the row-bucketed GEMV walk, whose per-row VALU cost made a
+    /// 128-row GLM-5.3-Flash step spend 126 of 162 ms in GEMV on gfx950. Unset = off (every
+    /// packet byte-identical); the one-row rung is never routed.
+    #[arg(long, env = "PLOW_GLM_DECODE_GEMM_ROWS")]
+    pub glm_decode_gemm_rows: Option<u32>,
+
     /// Use native gfx942 FP32 MLA fold GEMMs during prefill.
     /// On by default for GLM on gfx942 TP8; `=false` is the rollback.
     #[arg(long, env = "PLOW_GLM_FOLD_LT", value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
@@ -1675,6 +1683,7 @@ impl EmitConfig {
             glm_gemm_lt: env_bool_opt("PLOW_GLM_GEMM_LT"),
             glm_gemm_lt_decode: env_bool_opt("PLOW_GLM_GEMM_LT_DECODE"),
             glm_gemm_lt_decode_ext: env_bool_opt("PLOW_GLM_GEMM_LT_DECODE_EXT"),
+            glm_decode_gemm_rows: env_u32("PLOW_GLM_DECODE_GEMM_ROWS"),
             glm_fold_lt: env_bool_opt("PLOW_GLM_FOLD_LT"),
             glm_gemm_blk: env_str("PLOW_GLM_GEMM_BLK"),
             glm_gemm_lt_pf_ext: env_str("PLOW_GLM_GEMM_LT_PF_EXT"),
@@ -1934,6 +1943,12 @@ impl EmitConfig {
     pub fn glm_gemm_lt_decode(&self) -> bool {
         self.glm_gemm_lt_decode
             .unwrap_or(self.glm_production_defaults)
+    }
+
+    /// `PLOW_GLM_DECODE_GEMM_ROWS`: does a `rows`-row decode rung take the GEMM tile family?
+    /// Never at one row, where the GEMV is the measured floor and the blob stays byte-identical.
+    pub fn glm_decode_gemm_rows_on(&self, rows: u32) -> bool {
+        rows > 1 && self.glm_decode_gemm_rows.is_some_and(|thr| rows >= thr.max(2))
     }
 
     pub fn glm_decode_gemm_group(&self) -> bool {

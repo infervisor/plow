@@ -830,7 +830,7 @@ fn emit_glm53_program(
                 b.n_cu(),
                 false,
                 &[c_pre],
-                !prefill && rows > 1,
+                !prefill && (rows > 1 || emit_config::active().decode_ladder_on()),
             );
             if c.tp > 1 {
                 emit_xreduce(
@@ -4441,6 +4441,23 @@ pub(crate) fn blocked_gemv_cus_tuned(cus: &[u32], n: u32, k: u32) -> Vec<u32> {
     scoped
 }
 
+/// `PLOW_GLM_DECODE_GEMM_ROWS`: the prefill GEMM tile a `rows`-row decode projection of
+/// `[n, k]` takes instead of the row-bucketed GEMV, or `None` when the rung is not routed.
+/// Row-pure ops: a decode row is a sequence here and a token at prefill, and the tile reads
+/// rows `0..rows` of `x` either way. Restricted to the tiles the decode object's LDS arena
+/// (`PLOW_GM_ARENA` = max of the default and 64x128 rungs) is sized for.
+pub(crate) fn glm_decode_gemm_tile(rows: u32, n: u32, k: u32, n_cu: u32) -> Option<DevOp> {
+    if !crate::emit_is_amd() || !emit_config::active().glm_decode_gemm_rows_on(rows) {
+        return None;
+    }
+    let op = crate::pick_tile(rows, n, k, n_cu, kernelcaps::QuantScheme::None);
+    Some(if matches!(op, DevOp::GemmSmall | DevOp::GemmMed | DevOp::Gemm) {
+        op
+    } else {
+        DevOp::GemmSmall
+    })
+}
+
 fn glm_decode_gemv_cus(cus: &[u32], op: DevOp, n: u32, k: u32) -> Vec<u32> {
     if matches!(op, DevOp::Gemv | DevOp::GemmF32)
         && emit_config::active().gemv_wg_for(n, k).is_some()
@@ -4575,6 +4592,18 @@ pub(crate) fn emit_glm_mla(
         {
             return counter;
         }
+        if enc != MoeEnc::Mxfp4 {
+            if let Some(tile) = glm_decode_gemm_tile(rows, nn, k, b.n_cu()) {
+                return b.emit(tile, all.clone(), deps, |d| {
+                    d.t[0] = out;
+                    d.t[1] = x;
+                    d.t[2] = wt;
+                    d.i[0] = rows;
+                    d.i[1] = nn;
+                    d.i[2] = k;
+                });
+            }
+        }
         b.emit(op, glm_decode_gemv_cus(&all, op, nn, k), deps, |d| {
             d.t[0] = out;
             d.t[1] = x;
@@ -4610,8 +4639,9 @@ pub(crate) fn emit_glm_mla(
     // body has its own per-op fit fallback and is correct at any M. rows=1 fits both products
     // on every arch in the tree, so single-row emits stay byte-identical.
     let lds_fit = crate::gm_lds_halves();
-    let fuse_a = (crate::gemv_staged_rows(rows) as u64) * (h as u64) <= lds_fit;
-    let fuse_g = (rows as u64) * (ql as u64) <= lds_fit;
+    let tile_route = emit_config::active().glm_decode_gemm_rows_on(rows) && !mx;
+    let fuse_a = (crate::gemv_staged_rows(rows) as u64) * (h as u64) <= lds_fit && !tile_route;
+    let fuse_g = (rows as u64) * (ql as u64) <= lds_fit && !tile_route;
     // B1 defaults OFF (opt-in): AddNorm reduces over the un-rounded a+b sum, so unlike A/G it is NOT
     // byte-identical to the split Residual+RmsNorm — a reorder-level fp diff that flips one early
     // greedy argmax and cascades. Ship it only behind the HF-coherence gate; PLOW_GLM_FUSE_B1=1 opts in.
@@ -10090,7 +10120,7 @@ fn emit_glm_moe_ffn_rows(
     } else if enc == MoeEnc::Mxfp4 {
         DevOp::GemvMxfp4
     } else {
-        DevOp::Gemv
+        glm_decode_gemm_tile(rows, e, h, b.n_cu()).unwrap_or(DevOp::Gemv)
     };
     let c_score = b.emit(
         score_op,
@@ -10243,7 +10273,7 @@ fn emit_glm_moe_ffn_rows(
             let op = if enc == MoeEnc::Mxfp4 {
                 DevOp::GemvMxfp4
             } else {
-                DevOp::Gemv
+                glm_decode_gemm_tile(rows, imoe_l, h, b.n_cu()).unwrap_or(DevOp::Gemv)
             };
             b.emit(
                 op,
@@ -10339,7 +10369,7 @@ fn emit_glm_moe_ffn_rows(
         let shd_op = if enc == MoeEnc::Mxfp4 {
             DevOp::GemvMxfp4
         } else {
-            DevOp::Gemv
+            glm_decode_gemm_tile(rows, h, imoe_l, b.n_cu()).unwrap_or(DevOp::Gemv)
         };
         b.emit(shd_op, all.clone(), &[c_shglu], |d| {
             d.t[0] = n.shared;
@@ -11942,6 +11972,17 @@ fn emit_glm_tail(
         })
     } else if let Some(counter) = lt {
         counter
+    } else if let Some(tile) =
+        (nb > 0).then(|| glm_decode_gemm_tile(rows, vocab_l, c.hidden, b.n_cu())).flatten()
+    {
+        b.emit(tile, all, &[c_f], |d| {
+            d.t[0] = n.logits;
+            d.t[1] = n.xn;
+            d.t[2] = n.head;
+            d.i[0] = rows;
+            d.i[1] = vocab_l;
+            d.i[2] = c.hidden;
+        })
     } else {
         b.emit(DevOp::Gemv, all, &[c_f], |d| {
             d.t[0] = n.logits;

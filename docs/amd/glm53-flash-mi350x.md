@@ -167,7 +167,102 @@ The packet from config + index alone (no weights) is 70 MB: 4 prefill buckets + 
   (1.07 s of the 2.05 s at 8192) by a similar factor.
 - Parked: `GLM_LINEAR_FP8=1` (routed-W8A8 packet v3rw) refuses to load — it expects
   `self_attn.o_proj.weight_fp8` tensors the prep did not produce.
-- (to be continued: v2d correctness, v2e rungs, FP32 gate, grid.)
+- 13:05 UTC: **decode correct** on packet v2d (commit 2b890c19). "The capital of France is" ->
+  " Paris. ... , Paris is"; the 6-token prefill reproduces the decode continuation token for
+  token; served smoke coherent, logprob top-1 = device argmax on 8/8 tokens.
+- 13:15 UTC: rungs on objects v2e (vector-load GEMVs + register Sinkhorn), amd-bench TP8:
+
+  | rung | v2 (12:12) | v2c | v2e | vLLM |
+  |---|---:|---:|---:|---:|
+  | prefill T=128 | 857 ms | 113 ms | 95 ms | - |
+  | prefill T=1024 | 12.5 s | 431 ms | 252 ms | TTFT 90 ms |
+  | prefill T=2048 | 12.6 s | 494 ms | 316 ms | - |
+  | prefill T=4096 | 70.6 s | 1.64 s | 762 ms | TTFT 105 ms |
+  | prefill T=8192 | 71.0 s | 2.05 s | 1.19 s | - |
+  | decode M=1 | 47.0 ms | 46.6 ms | **31.0 ms** | TPOT 6.9 ms |
+
+  Decode trace at 31 ms: 1846 packets at ~17 us each on the critical path, no single op above
+  10% — the interpreter's per-packet floor (12 us measured on K3) times the packet count. The
+  c1 TPOT gap to vLLM (4.5x) is a packet-count problem (W8A8 route 1384, KDA fused 1778, ...)
+  and is not closable in this campaign; prefill/TTFT (2.8x at 1k, 7x at 4k) is where the
+  remaining kernel work goes. 8192 prefill now: FlashMlaPrefill 238 ms (11 x 22 ms),
+  HyperConnPost 162 ms, GemvF32 121 ms (now L2-bound: x re-read per column), HyperConnPre
+  124 ms, MoeGroupDownPf 101 ms, KdaChunkCarry 76 ms, XReduceTwoShot 57 ms.
+- Numerics note: v2e's reassociated GEMVs move the logits by cos 0.996-0.999 / max 1.1 on the
+  same tokens (routing near-tie flips across 42 MoE layers); the 300-token README prompt's
+  greedy continuation changed at a 0.25-logit tie. The FP32 gate (queued) adjudicates.
+- 14:10 UTC: objects v2f (commit c6135217: HyperConnPre/Post/GemvF32 in the ragged-row table,
+  16 B walks in both HyperConn kernels): prefill T=128 91 ms, 512 130, 1024 **173**, 2048 273,
+  4096 **471**, 8192 994; decode M=1 **27.3 ms**. `PLOW_XR_SCHED=aiter` (v2g) is within noise.
+  1024-token trace (175 ms): GemmSmall 23 ms (367 x 63 us), MoeGroupDownPf 26 + GluPf 19 +
+  CombinePf 7 (the routed experts are ~2-3x their weight-read floor), XReduceTwoShot 14,
+  GemvF32 16 (L2-bound x re-reads), HyperConnPre 12 (one-lane Sinkhorn per row), KDA chunk
+  ops ~37 (carry runs on 64 CUs), router GemmF32 7.5. No single op is above 15%: reaching
+  vLLM's 90 ms TTFT at 1k needs every one of these halved, which is not a 24 h job.
+- Assessment at 14:20 UTC. plow c1: TPOT 27 ms vs 6.9 (dispatch-bound packet count), TTFT 173
+  vs 90 ms at 1k, 471 vs 105 ms at 4k. Neither c1 cell is winnable this campaign. vLLM's own
+  numbers fall steeply with context and concurrency (c128: 3900 tok/s at 1k, 1463 tok/s at
+  4k with TPOT 69 ms) while plow's step cost is nearly context-independent, so the candidate
+  cells are high concurrency at 4k+; the decode ladder (1,8,32,128; `PLOW_GEMV_WALK=1`
+  objects) grid at 1024/4096 is running.
+- 13:10 UTC: the ladder grid (1,8,32,128; walk objects) refused at load: "PLOW_DECODE_BATCH = 128
+  with a recurrent-state tensor `kv.0.state` whose decode rung T=1 does NOT carry
+  PLOW_KDA_F_SEQ_ROWS". `emit_glm53_program` passed `seq_rows = !prefill && rows > 1` to the KDA
+  mixer, so the one-row rung addressed a one-slot state while `declare_glm53` sized it 128 slots
+  wide (the K3 path already uses `ladder_on || t > 1`). Fixed in `mla.rs`; the T=1 rung now carries
+  flags=3 and the parked-slot tensor. Under `seq_rows` the one-row rung loses the f_b fold and the
+  fused-arm KDA step, so the ladder packet's c1 decode is a little slower than the single-rung
+  packet; c1 is not a candidate cell. Ladder packet v2y re-emitted (only `PLOW_PACKET_HASH`
+  changed in `plow_config.h`), objects rebuilt for the hash.
+- 13:40 UTC, ladder grid at isl1024 (objects `PLOW_DECODE_BATCH=128 PLOW_GEMV_WALK=1`, GEMV row
+  body at the 16-row cap): c1 TPOT 52 ms / TTFT 174 ms, c8 60 ms / 124 tok/s, c32 117 ms / 256,
+  c64 250 ms / 235, c128 342 ms / 323 tok/s. vLLM at the same cells: 6.9 / 9.2 / 12.8 / 16.6 /
+  25.9 ms, 3900 tok/s at c128. A 4-row GEMV body (`PLOW_GEMV_MM=4`, walk) changes nothing
+  (c1 49, c8 56, c32 113 ms). c1 runs on the rung-8 program (`PLOW_DECODE_MIN_RUNG` = 8 on TP
+  engines), hence 52 ms against the single-rung packet's 27.
+- Batched amd-bench steps (1024-token prompts, every slot token-identical, ranks agree):
+  B=8 50.8 ms, B=32 71 ms, B=128 162 ms. Per-op at B=128: GEMV 126 ms of the 162 (477 packets,
+  ~265 us each; the row-bucketed GEMV body pays per row on the VALU and the walk re-reads the
+  weights every 16 rows), everything else under 12 ms. The served c128 step (342 ms) is twice
+  the bench step: new requests' prefills (173 ms each, 384 per cell) stall the decode batch.
+  The 128-row PREFILL bucket runs the same projections as `GemmSmall` tiles in 91 ms for the
+  whole forward, so the batched rungs were simply on the wrong GEMM family: the native
+  batched-decode GEMM route (`emit_glm_decode_gemm_lt`) is hard-wired to GLM-5.2's shapes on
+  gfx942, and `emit_k3_linear_rows` takes the GEMV arm for every sequence-row rung.
+- Fix: `PLOW_GLM_DECODE_GEMM_ROWS=N` (devgen knob, unset = byte-identical packets). Decode
+  rungs with at least N rows route their bf16 projections (KDA q/k/v/o/f_a/f_b/beta, MLA
+  q/kv/o, shared expert, router, lm_head) through `pick_tile` (`GemmSmall` at these shapes;
+  the decode object compiles it because the packet's decode inventory now lists it, and its
+  LDS arena already covers the 64x128 tile). The fused `GemvQkv` arms yield to the split tiles.
+  Packet v3 = ladder (1,8,32,128) with N=8: rungs 8/32/128 carry 477 tiles and no `Gemv`.
+- 14:05 UTC, v3 batched amd-bench: B=8 44.8 ms (was 50.8), B=32 55.6 (71.3), B=128 90.6 (162);
+  `GemmSmall` 28.5 ms where `Gemv` was 126. But every decode step sampled token 0: the
+  interpreter's `case PLOW_DOP_GEMM_SMALL` lives in the `#if PLOW_BUCKET_PREFILL ||
+  PLOW_MIXED_STEP` region, so a decode object dispatches nothing for it (the `default:` the
+  K3 emitter warns about). Fixed in `interp.hip`: the decode region gets the case when the
+  packet's decode inventory lists the op (`PLOW_DECODE_INVENTORY_PRUNE && PLOW_HAS_GEMM_SMALL`),
+  so objects for packets without such a rung are byte-identical. Objects v3b.
+- The FP32-gate captures teacher-force on `ref.json`, so both wait for the reference run; the
+  vLLM capture queued ahead of it failed on the missing file. Order from here: v3b trace, v3b
+  grids 1024/4096, FP32 reference (1 GPU, 2-3 h), vLLM capture, plow capture, score.
+- 14:25 UTC, c1 decode (single-rung packet v2d/v2f, 26.4 ms wall, 1846 packets, span sum
+  85 ms = 3.2x overlap): per-op tails — GEMV 342 x 23 us, per-expert `MoeExpertDownFp8Blk`
+  336 x 38 us and `GluFp8Blk` 336 x 31 us (8 experts x 42 layers, 32 CUs each, concurrent
+  within a layer), GemvF32 90 x 40, HyperConnPre 90 x 32 (ONE workgroup), router GemmF32
+  42 x 42, GemvQkv 56 x 30, XReduce 90 x 17, RmsNorm 113 x 8. The layer's serial chain is ~16
+  packets (hc_pre, norm, qkv, conv, step, norm, o, xreduce, hc_post, hc_pre, norm, router,
+  topk, expert glu, expert down, combine, xreduce, hc_post) at 25-40 us each = ~590 us/layer
+  x 45; vLLM's 6.9 ms is ~150 us/layer. CPU op-count sweep of every decode fusion knob
+  (`PLOW_KDA_DECODE_FUSED[_ARM]`, `PLOW_KDA_FB_FOLD`, `PLOW_GLM_FUSE_B1/SEAM`, `GLM_FUSE_XRN`,
+  `PLOW_GLM_MOE_FLAT_DECODE`, `GLM_SHARD_HEAD`): 1846 -> 1733 packets all together (-6%);
+  B1/XRN/FLAT/SHARD_HEAD change nothing on this model. The c1 gap is the per-packet latency
+  of a serial chain, not fusable by existing knobs; it needs a per-layer megakernel.
+- 14:35 UTC, v3b (packet v3 + objects with the decode `GemmSmall` case) batched amd-bench:
+  every slot streams the GEMV packet's tokens, ranks agree; B=8 48.9 ms, B=32 63.4, B=128
+  **88.9 ms** (1440 tok/s aggregate; was 50.8 / 71.3 / 162). B=128 top spans: GemmSmall
+  28.5, MoE down 9.6, RmsNorm 11.8 (one block per row, 54 us tails), KDA step 11.3, GemvF32
+  9.2, XReduce 8.6, KDA conv 8.5, flash 8.1, merge 7.5. Serving grids on v3b queued.
+- (to be continued: v3b grid, FP32 gate, report.)
 
 ## 5. Results
 
@@ -198,3 +293,32 @@ the grouped MoE GLU/down (priced at the MXFP4 contract; the packet streams fp8, 
 `PLOW_GLM_MOE_FLAT_DECODE`, `GLM_SHARD_HEAD`), then prefill seq-par collectives
 (`PLOW_GLM_SEQ_PAR`). Each is an op-count experiment first (CPU emit + disasm), then a smoke, then
 a cell. Measured per-op times replace the 20 us assumption once the smoke serves.
+
+### 6a. Measured worklist (after the traces, 13:50 UTC)
+
+Per-op spans from `PLOW_TRACE_RAW` on the final objects (v2f single-rung, v2y ladder), per
+rank, TP8. "Floor" is the weight/activation byte floor at 6.2 TB/s or the fabric floor for the
+collectives; the gap column is what a kernel change can win at most.
+
+| phase | op | measured | floor | gap | lever |
+|---|---|---:|---:|---:|---|
+| decode B=1 | whole step (1846 packets) | 27.3 ms | 0.73 ms bytes, ~22 ms dispatch (12 us/packet) | packet count | fewer packets per layer: fused KDA step arm (`PLOW_KDA_DECODE_FUSED_ARM`, off under the ladder), fold HC_PRE/Post into neighbours (3 of 41 packets/layer), fold XReduce into the consumer. No kernel is above 10% of the step. |
+| decode B=128 | GEMV (477) | 126 ms | ~6 ms (weights once + 128 rows of x) | 20x | DONE in packet v3: route to `GemmSmall` (`PLOW_GLM_DECODE_GEMM_ROWS=8`). |
+| decode B=128 | KdaStateStepG (34) | 11.7 ms | 34 x 64 MB state r+w = 0.7 ms | 16x | state in registers across the B axis is the prefill carry design; one block per (row, head) with the tile loop inside. |
+| decode B=128 | RmsNorm (102) | 11.0 ms | 0.3 ms | 30x | `pf_wide_cus` gives 101 blocks for 128 rows; fuse into the consumer GEMM prologue, or 1 wave/row. |
+| decode B=128 | XReduce (90) | 8.8 ms | 90 x 1 MB over xGMI ~ 3 ms | 3x | two-shot form (prefill already uses it); or `GLM_FUSE_XRN`. |
+| decode B=128 | FlashMlaDecode (11) + MlaMergeFold (11) | 15.2 ms | 11 x 128 rows x 1 K ctx x 576 B = 0.8 GB -> 0.13 ms | 100x | the decode flash is one block per (row, head-group) at 1 K context; at 128 rows it needs the prefill-style row tiling. Largest post-v3 item at long contexts. |
+| prefill 4 K | GemvF32 hyper-conn mix (90) | 72 ms | 90 x 4096 x 16384 x 4 B x re-reads; LDS-tiled ~6 ms | 12x | LDS-tile the 24 mix columns per row block; the op is 15% of the 4 K forward. |
+| prefill 4 K | MoeGroupDownPf / GluPf (45+45) | 58 + 36 ms | fp8 weight stream 2 x 1.06 GB -> 0.35 ms; tokens x top-8 x 2 x 4096 x 2048 MACs ~ 20 ms MFMA | 2-3x | the grouped kernels are at ~35% of MFMA peak at this shape; the A4W4/fp8 tile binsearch (`PLOW_MOE_TILE_BINSEARCH`) is the knob to sweep. |
+| prefill 4 K | FlashMlaPrefill (11) | 59 ms | 11 x 4096^2/2 x 8 heads x 576 B ~ 0.4 TFLOP -> 0.4 ms | 100x | the NoPE flash prefill runs at ~1% of MFMA peak: it is the full:128..8192 bucket path with `PLOW_GLM_DSA=0`; the V2 raw-MLA object (`PLOW_MLA_PF_V2`) is the qualified gfx942 route and was not brought up here. |
+| prefill 4 K | HyperConnPre (90) | 37 ms | 90 x 4096 rows x 16 KB -> 1 ms | 30x | one-lane Sinkhorn per row; row-parallel 4x4 Sinkhorn on a wave (designed, not implemented). |
+| prefill 4 K | XReduceTwoShot (87) | 36 ms | 87 x 32 MB / 8 ranks over xGMI ~ 25 ms | 1.4x | at the fabric floor; only `PLOW_GLM_SEQ_PAR` (sequence-parallel seams) removes bytes. |
+| prefill 4 K | KDA chunk carry (34) | 36 ms | runs on 64 of 256 CUs | 4x | spread the carry over the head x chunk grid. |
+| serving c128 | prefill stalls | step 162 -> TPOT 342 ms | - | 2x | chunked prefill co-scheduled with the decode batch (vLLM does this); plow admits whole prefills between decode quanta. |
+
+What this says about the campaign goal: vLLM's c1 TPOT (6.9 ms) is below plow's dispatch
+floor (1846 packets x 12 us); vLLM's 4 K TTFT (105 ms) needs every prefill op above halved
+at once; and at c128 the served throughput is bounded by prefill rate (4096 tokens / 471 ms =
+8.7 K tok/s per request stream vs vLLM's ~39 K), so no (context, concurrency) cell is winnable
+on this packet. The v3 batched rungs are still worth measuring: GEMV was 78% of the B=128
+step.

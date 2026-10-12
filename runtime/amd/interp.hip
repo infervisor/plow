@@ -4792,6 +4792,16 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
 #endif
 #endif
 #if !PLOW_BUCKET_PREFILL || PLOW_MIXED_STEP
+/* A batched-decode rung whose projections take the prefill tile family
+ * (PLOW_GLM_DECODE_GEMM_ROWS). The GEMM_SMALL arm above is prefill-only, and without this case
+ * a decode object's `default:` writes NOTHING: the run completes, every row is zero. Gated on
+ * the packet's decode inventory, so an object for a packet without such a rung is byte-identical.
+ * The mixed-step object compiles the prefill arm and must not carry the label twice. */
+#if !PLOW_MIXED_STEP && PLOW_DECODE_INVENTORY_PRUNE && PLOW_HAS_GEMM_SMALL
+        case PLOW_DOP_GEMM_SMALL:
+            exec_gemm_small(in, T, slice, nblk, sm->gm);
+            break;
+#endif
 #if !PLOW_DECODE_INVENTORY_PRUNE || PLOW_HAS_GEMV
         case PLOW_DOP_GEMV:
             exec_gemv(in, T, slice, nblk, sm->gm);

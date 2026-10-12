@@ -1261,6 +1261,7 @@ pub const EMIT: &[KnobSpec] = &[
     KnobSpec::new("emit.glm_gemm_lt", Some("PLOW_GLM_GEMM_LT"), Layer::Emit, Domain::Bool, GLM_RECIPE_ON, GLM_RECIPE),
     KnobSpec::new("emit.glm_gemm_lt_decode", Some("PLOW_GLM_GEMM_LT_DECODE"), Layer::Emit, Domain::Bool, GLM_RECIPE_ON, GLM_RECIPE),
     KnobSpec::new("emit.glm_gemm_lt_decode_ext", Some("PLOW_GLM_GEMM_LT_DECODE_EXT"), Layer::Emit, Domain::Bool, GLM_RECIPE_ON, GLM_RECIPE),
+    KnobSpec::new("emit.glm_decode_gemm_rows", Some("PLOW_GLM_DECODE_GEMM_ROWS"), Layer::Emit, U32, UNSET, OPT_IN),
     KnobSpec::new("emit.glm_fold_lt", Some("PLOW_GLM_FOLD_LT"), Layer::Emit, Domain::Bool, GLM_RECIPE_ON, GLM_RECIPE),
     KnobSpec::new("emit.glm_gemm_blk", Some("PLOW_GLM_GEMM_BLK"), Layer::Emit, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("emit.glm_gemm_lt_pf_ext", Some("PLOW_GLM_GEMM_LT_PF_EXT"), Layer::Emit, Domain::Str, GLM_GEMM_LT_PF_EXT_DEFAULT, GLM_RECIPE_PF_EXT),
