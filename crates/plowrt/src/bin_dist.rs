@@ -781,8 +781,13 @@ pub fn cmd_prepare(model: &str, checkpoint: Option<PathBuf>) -> Result<(), Err> 
     let bundle_json = dir.join("bundle.json");
     let bundle: plow_asset::dist::Bundle = serde_json::from_slice(&std::fs::read(&bundle_json)?)
         .map_err(|e| format!("{}: {e}", bundle_json.display()))?;
+    // A `dist` checkpoint came with the pull, as for `load`.
+    let dist_snapshot = (bundle.checkpoint.source == plow_asset::dist::DIST_SOURCE)
+        .then(|| dist::weights::dist_snapshot_path(st.root(), &bundle))
+        .transpose()?;
     let ckpt = checkpoint
         .or_else(|| RuntimeConfig::get().checkpoint.clone().map(PathBuf::from))
+        .or(dist_snapshot)
         .ok_or("pass --checkpoint <dir> (or set PLOW_CHECKPOINT)")?;
     let farm = prepare::build(st.root(), &bundle, &dir, &ckpt)?;
     println!("{}: {} shards at {}", r, farm.shards, farm.dir.display());
