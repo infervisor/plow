@@ -734,9 +734,8 @@ enum Cmd {
         /// API key allowed to publish, sent as a Bearer token.
         #[arg(long = "key", env = "PLOW_API_KEY", hide_env_values = true)]
         api_key: String,
-        /// Status to publish at (`emits` or `validated`); the registry's
-        /// default when omitted.
-        #[arg(long)]
+        /// Status to publish at; the registry's default when omitted.
+        #[arg(long, value_parser = ["emits", "validated"])]
         status: Option<String>,
         /// One line describing the model, for the registry's catalog.
         #[arg(long)]
