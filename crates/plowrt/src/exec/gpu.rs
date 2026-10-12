@@ -7465,6 +7465,11 @@ impl GpuEngine {
     /// what is free above the load-time reserve, so buffers other models or this engine's own
     /// routes allocate after load (lazily, on their first launch) shrink the budget instead of
     /// competing with it. At least one unit, so a request never looks larger than the device.
+    ///
+    /// Derived from `free + held` (the device as if this cache held nothing), never `held` plus a
+    /// clamped `free - reserve`: once mapping dipped into the reserve the clamp made the budget
+    /// track `held`, and every block mapped past the commitments admitted another sequence
+    /// (Qwen3.8-27B 4K c32 at PLOW_KV_MEM_UTIL 0.91: an 11.3 GiB budget ratcheted to 15.9 GiB).
     pub fn kv_admission(&self) -> Option<crate::sched::admission::KvBudget> {
         let mut budget = self.kv_admission?;
         let Some(vmm) = self.vmm.as_ref() else {
@@ -7473,21 +7478,28 @@ impl GpuEngine {
         let Ok((free, total)) = self.be.mem_info() else {
             return Some(budget);
         };
-        let avail = RuntimeConfig::get().kv_admit_live(free, total, self.kv_admit_reserve);
+        let capacity = |held: u64| {
+            RuntimeConfig::get().kv_admit_live(free + held, total, self.kv_admit_reserve)
+        };
         if let Some(kv) = vmm.kv.as_ref() {
-            budget.budget_bytes = kv.mapped_bytes() + avail.max(kv.block_bytes());
+            let held = kv.mapped_bytes();
+            budget.budget_bytes = capacity(held).max(kv.block_bytes());
+            let st = kv.stats();
             tracing::debug!(
                 target: "plowrt::kv_budget",
-                mapped_mib = kv.mapped_bytes() >> 20,
+                mapped_mib = held >> 20,
+                live = st.blocks_live,
+                pooled = st.blocks_pooled,
+                stale = st.blocks_stale,
+                cache = st.cache_blocks,
                 free_mib = free >> 20,
-                avail_mib = avail >> 20,
                 budget_mib = budget.budget_bytes >> 20,
                 "kv admission budget"
             );
         } else if let Some(rings) = vmm.rings.as_ref() {
             let slot = rings.slot_charge();
             let held = rings.stats().mapped_slots as u64 * slot + rings.spare_bytes();
-            budget.budget_bytes = held + avail.max(slot);
+            budget.budget_bytes = capacity(held).max(slot);
         }
         Some(budget)
     }

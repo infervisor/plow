@@ -731,6 +731,28 @@ static __device__ void d_qwen_headnorm_rope(__nv_bfloat16* out, const __nv_bfloa
     }
 }
 
+// Channel `c` of a sequence shorter than width-1 rows, walked serially.
+static __device__ __forceinline__ void d_qwen_gdn_conv_serial_channel(__nv_bfloat16* out,
+    const __nv_bfloat16* in, const __nv_bfloat16* weight, __nv_bfloat16* history,
+    unsigned channels, unsigned width, unsigned tokens, unsigned c) {
+    const __nv_bfloat16* w = weight + (size_t)c * width;
+    __nv_bfloat16* h = history + (size_t)c * (width - 1);
+    for (unsigned t = 0; t < tokens; t++) {
+        float sum = 0.f;
+        for (unsigned j = 0; j < width; j++) {
+            int source = (int)t + (int)j - (int)(width - 1);
+            float x = source < 0 ? __bfloat162float(h[t + j])
+                : __bfloat162float(in[(size_t)source * channels + c]);
+            sum = fmaf(x, __bfloat162float(w[j]), sum);
+        }
+        out[(size_t)t * channels + c] = __float2bfloat16(qwen_silu(sum));
+    }
+    for (unsigned j = 0; j + 1 < width; j++) {
+        int source = (int)tokens + (int)j - (int)(width - 1);
+        h[j] = source < 0 ? h[tokens + j] : in[(size_t)source * channels + c];
+    }
+}
+
 // One sequence of `tokens` rows: taps before row 0 come from `history` (this slot's last
 // width-1 rows), which is rewritten from the sequence's last rows.
 // `DEPTH`: rows of the width-4 fast path per loop group, with the next group's rows loaded
@@ -863,24 +885,8 @@ static __device__ void d_qwen_gdn_conv_prefill_seq(__nv_bfloat16* out, const __n
         }
         return;
     }
-    for (unsigned c = slice * blockDim.x + threadIdx.x; c < channels; c += nblk * blockDim.x) {
-        const __nv_bfloat16* w = weight + (size_t)c * width;
-        __nv_bfloat16* h = history + (size_t)c * (width - 1);
-        for (unsigned t = 0; t < tokens; t++) {
-            float sum = 0.f;
-            for (unsigned j = 0; j < width; j++) {
-                int source = (int)t + (int)j - (int)(width - 1);
-                float x = source < 0 ? __bfloat162float(h[t + j])
-                    : __bfloat162float(in[(size_t)source * channels + c]);
-                sum = fmaf(x, __bfloat162float(w[j]), sum);
-            }
-            out[(size_t)t * channels + c] = __float2bfloat16(qwen_silu(sum));
-        }
-        for (unsigned j = 0; j + 1 < width; j++) {
-            int source = (int)tokens + (int)j - (int)(width - 1);
-            h[j] = source < 0 ? h[tokens + j] : in[(size_t)source * channels + c];
-        }
-    }
+    for (unsigned c = slice * blockDim.x + threadIdx.x; c < channels; c += nblk * blockDim.x)
+        d_qwen_gdn_conv_serial_channel(out, in, weight, history, channels, width, tokens, c);
 }
 
 // `rows` > `tokens`: a padded chunk (plowrt patches tokens = real rows, rows = bucket); the pad
@@ -907,8 +913,20 @@ static __device__ void d_qwen_gdn_conv_prefill(__nv_bfloat16* out, const __nv_bf
         const unsigned row0 = (unsigned)req[1 + 4 * r], len = (unsigned)req[2 + 4 * r];
         const unsigned slot = (unsigned)req[3 + 4 * r];
         if (!len || row0 + len > tokens) { if (threadIdx.x == 0) __trap(); return; }
+        if (len + 1 < width) continue;
         d_qwen_gdn_conv_prefill_seq<PF, DEPTH>(out + (size_t)row0 * channels, in + (size_t)row0 * channels, weight,
             history + (size_t)slot * channels * (width - 1), channels, width, len, slice, nblk);
+    }
+    // Requests shorter than width-1 rows (the riders' one-row decode requests) in one flat pass:
+    // one serial pass per request cost a dependent-load round trip each, 25 riders ~50 us on a
+    // ~37 us 1024-row conv (Qwen3.8-27B 4K c32 serving). Same per-channel walk.
+    for (unsigned i = slice * blockDim.x + threadIdx.x; i < n * channels; i += nblk * blockDim.x) {
+        const unsigned r = i / channels, c = i - r * channels;
+        const unsigned row0 = (unsigned)req[1 + 4 * r], len = (unsigned)req[2 + 4 * r];
+        if (len + 1 >= width) continue;
+        const unsigned slot = (unsigned)req[3 + 4 * r];
+        d_qwen_gdn_conv_serial_channel(out + (size_t)row0 * channels, in + (size_t)row0 * channels, weight,
+            history + (size_t)slot * channels * (width - 1), channels, width, len, c);
     }
 }
 
