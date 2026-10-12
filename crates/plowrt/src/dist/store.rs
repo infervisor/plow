@@ -57,8 +57,7 @@ impl std::fmt::Display for Digest {
 /// `gc` reads this instead of re-hashing the bundle.
 const BUNDLE_BLOBS: &str = ".plow-blobs";
 
-/// Written into each materialized bundle: its manifest (see [`Store::record_bundle`]).
-pub const BUNDLE_MANIFEST: &str = "bundle.json";
+pub use plow_asset::dist::BUNDLE_MANIFEST;
 
 /// One pin, as `plowrt ls --json` prints it.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
