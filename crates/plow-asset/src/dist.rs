@@ -232,11 +232,30 @@ pub struct Bundle {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BundleCheckpoint {
-    /// `hf:<org>/<repo>`.
+    /// `hf:<org>/<repo>`, fetched from Hugging Face; or [`DIST_SOURCE`], carried
+    /// by the distribution itself as `files`.
     pub source: String,
+    /// A commit for `hf:`; for `dist`, a version label naming the snapshot.
     pub revision: String,
     pub shards: u32,
     pub layout: String,
+    pub bytes: u64,
+    /// The checkpoint's files as blobs, for a `dist` source only: a private or
+    /// air-gapped checkpoint that has no Hugging Face repository to fetch from.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub files: Vec<CheckpointFile>,
+}
+
+/// The checkpoint source whose files travel in the distribution.
+pub const DIST_SOURCE: &str = "dist";
+
+/// One checkpoint file, published under `v1/blobs/sha256/<hex>` like a bundle
+/// file. `name` is its path in the snapshot, so it may nest.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CheckpointFile {
+    pub name: String,
+    pub sha256: String,
     pub bytes: u64,
 }
 
@@ -603,6 +622,18 @@ fn is_plain_name(s: &str) -> bool {
     matches!(c.next(), Some(std::path::Component::Normal(_))) && c.next().is_none()
 }
 
+/// A path that stays under the directory it is joined to: relative, `/`
+/// separated, no empty, `.` or `..` segment, no Windows separator. A
+/// checkpoint file nests (`onnx/model.onnx`); a bundle file may not.
+pub fn is_safe_relative_path(name: &str) -> bool {
+    !name.is_empty()
+        && !name.starts_with('/')
+        && !name.contains('\\')
+        && name
+            .split('/')
+            .all(|seg| !seg.is_empty() && seg != "." && seg != "..")
+}
+
 impl Variant {
     pub fn validate(&self) -> Result<(), String> {
         if self.label.is_empty() || self.variant_id.is_empty() || !is_sha256(&self.sha256) {
@@ -774,11 +805,20 @@ impl Bundle {
                 }
             }
         }
-        if !self.checkpoint.source.starts_with("hf:") {
-            return Err(format!(
-                "bundle: checkpoint source must be `hf:<org>/<repo>`, got {}",
-                self.checkpoint.source
-            ));
+        self.checkpoint.validate()?;
+        // A `dist` checkpoint is stored as `dist--<namespace>--<name>@<rev>`:
+        // each part one path component, and no `--` inside one, or two models
+        // (`a--b/c`, `a/b--c`) would share a snapshot.
+        if self.checkpoint.source == DIST_SOURCE {
+            for part in [&self.namespace, &self.name] {
+                if !is_plain_name(part) || part.contains("--") {
+                    return Err(format!(
+                        "bundle: a `{DIST_SOURCE}` checkpoint is stored under its namespace and \
+                         name, which must be plain names without `--`; got {}/{}",
+                        self.namespace, self.name
+                    ));
+                }
+            }
         }
         let mut rungs = std::collections::BTreeSet::new();
         for l in self.objset.iter().flat_map(|o| &o.lowrung) {
@@ -792,6 +832,77 @@ impl Bundle {
                     l.max
                 ));
             }
+        }
+        Ok(())
+    }
+}
+
+impl BundleCheckpoint {
+    /// An `hf:` checkpoint is fetched whole from its repository and lists no
+    /// files; a `dist` one lists every file it carries, and its shard count
+    /// is the one `prepare` will hold the snapshot to.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.source.starts_with("hf:") {
+            if !self.files.is_empty() {
+                return Err(
+                    "bundle: an `hf:` checkpoint is fetched from its repository and lists no \
+                     `files`"
+                        .into(),
+                );
+            }
+            return Ok(());
+        }
+        if self.source != DIST_SOURCE {
+            return Err(format!(
+                "bundle: checkpoint source must be `hf:<org>/<repo>` or `{DIST_SOURCE}`, got {}",
+                self.source
+            ));
+        }
+        // The revision names the snapshot directory in the store.
+        if !is_plain_name(&self.revision) {
+            return Err(format!(
+                "bundle: a `{DIST_SOURCE}` checkpoint needs a revision usable as a directory \
+                 name, got {:?}",
+                self.revision
+            ));
+        }
+        if self.files.is_empty() {
+            return Err(format!(
+                "bundle: a `{DIST_SOURCE}` checkpoint lists the files it carries"
+            ));
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        for f in &self.files {
+            if !is_safe_relative_path(&f.name) || !is_sha256(&f.sha256) {
+                return Err(format!("bundle: bad checkpoint file entry {}", f.name));
+            }
+            if !seen.insert(f.name.as_str()) {
+                return Err(format!("bundle: duplicate checkpoint file {}", f.name));
+            }
+        }
+        // `a` and `a/b` cannot both be written: one is a file, the other needs
+        // it to be a directory.
+        for f in &self.files {
+            let mut parents = f.name.match_indices('/').map(|(i, _)| &f.name[..i]);
+            if let Some(p) = parents.find(|p| seen.contains(p)) {
+                return Err(format!(
+                    "bundle: checkpoint file {} sits under {p}, which is also a file",
+                    f.name
+                ));
+            }
+        }
+        // `prepare` globs `*.safetensors` in the snapshot's top level only.
+        let shards = self
+            .files
+            .iter()
+            .filter(|f| !f.name.contains('/') && f.name.ends_with(".safetensors"))
+            .count();
+        if shards != self.shards as usize {
+            return Err(format!(
+                "bundle: the checkpoint lists {shards} top-level safetensors shards but declares \
+                 {}",
+                self.shards
+            ));
         }
         Ok(())
     }

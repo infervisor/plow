@@ -515,6 +515,7 @@ fn bundle() -> Bundle {
             shards: 96,
             layout: "native-mxfp4".into(),
             bytes: 1_590_000_000_000,
+            files: vec![],
         },
         objset: Some(BundleObjset {
             objset_id: "obj0".into(),
@@ -609,6 +610,80 @@ fn a_checkpoint_tokenizer_must_not_be_shipped() {
     });
     let err = b.validate().unwrap_err();
     assert!(err.contains("must not be shipped"), "{err}");
+}
+
+/// A `dist` checkpoint carries every file it needs as a blob; an `hf:` one
+/// is fetched whole from its repository and lists none.
+#[test]
+fn a_dist_checkpoint_lists_safe_files_matching_its_shard_count() {
+    let file = |name: &str| CheckpointFile {
+        name: name.into(),
+        sha256: "d".repeat(64),
+        bytes: 1,
+    };
+    let mut dist = bundle();
+    dist.checkpoint.source = DIST_SOURCE.into();
+    dist.checkpoint.revision = "2026-10-12".into();
+    dist.checkpoint.shards = 2;
+    dist.checkpoint.files = vec![
+        file("model-00001-of-00002.safetensors"),
+        file("model-00002-of-00002.safetensors"),
+        file("config.json"),
+        // Nested: not a shard `prepare` would glob.
+        file("onnx/model.safetensors"),
+    ];
+    dist.validate().unwrap();
+
+    let mut b = dist.clone();
+    b.checkpoint.files.clear();
+    let err = b.validate().unwrap_err();
+    assert!(err.contains("lists the files"), "{err}");
+
+    let mut b = dist.clone();
+    b.checkpoint.shards = 3;
+    let err = b.validate().unwrap_err();
+    assert!(err.contains("2 top-level safetensors shards"), "{err}");
+
+    for name in ["", "../x", "/etc/passwd", "a//b", "a/./b", "a\\b"] {
+        let mut b = dist.clone();
+        b.checkpoint.files[2].name = name.into();
+        assert!(b.validate().is_err(), "accepted path {name:?}");
+    }
+    let mut b = dist.clone();
+    b.checkpoint.files[2].sha256 = "D".repeat(64);
+    assert!(b.validate().is_err(), "an uppercase digest");
+    let mut b = dist.clone();
+    b.checkpoint.files.push(file("config.json"));
+    assert!(b.validate().is_err(), "a duplicate file");
+    let mut b = dist.clone();
+    b.checkpoint.files.push(file("config.json/extra"));
+    let err = b.validate().unwrap_err();
+    assert!(err.contains("also a file"), "{err}");
+    for rev in ["", "..", "a/b"] {
+        let mut b = dist.clone();
+        b.checkpoint.revision = rev.into();
+        assert!(b.validate().is_err(), "accepted revision {rev:?}");
+    }
+
+    for (ns, name) in [("a--b", "c"), ("a", "b--c"), ("a", "..")] {
+        let mut b = dist.clone();
+        (b.namespace, b.name) = (ns.into(), name.into());
+        assert!(b.validate().is_err(), "accepted {ns}/{name}");
+    }
+
+    let mut hf = bundle();
+    hf.checkpoint.files = vec![file("model.safetensors")];
+    let err = hf.validate().unwrap_err();
+    assert!(err.contains("lists no"), "{err}");
+
+    let mut other = bundle();
+    other.checkpoint.source = "s3://bucket/k3".into();
+    let err = other.validate().unwrap_err();
+    assert!(err.contains("hf:") && err.contains("`dist`"), "{err}");
+
+    // An `hf:` manifest is unchanged on the wire.
+    let json = serde_json::to_value(bundle()).unwrap();
+    assert!(json["checkpoint"].get("files").is_none());
 }
 
 #[test]

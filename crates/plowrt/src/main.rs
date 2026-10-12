@@ -709,6 +709,10 @@ enum Cmd {
         /// Directory `objset.json`'s `objects[]` live in.
         #[arg(long)]
         objects: Option<PathBuf>,
+        /// Directory a `dist` checkpoint's `files[]` live in. Required exactly
+        /// when the bundle carries its checkpoint.
+        #[arg(long)]
+        checkpoint_dir: Option<PathBuf>,
         /// Output archive path.
         #[arg(long)]
         out: PathBuf,
@@ -1092,12 +1096,14 @@ async fn async_main(
             objset,
             assets,
             objects,
+            checkpoint_dir,
             out,
         } => dist_cmd::report(dist_cmd::cmd_pack(
             &bundle,
             objset.as_deref(),
             &assets,
             objects.as_deref(),
+            checkpoint_dir.as_deref(),
             &out,
         )),
         #[cfg(feature = "hsa")]

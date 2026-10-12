@@ -1,9 +1,9 @@
 //! Build the checkpoint farm a bundle needs, on the target.
 //!
-//! The distribution never carries weights. What it carries is what plow
-//! produced; the checkpoint comes from the operator's HuggingFace snapshot or a
-//! local directory. `prepare` joins the two into the flat, sorted directory the
-//! loader expects.
+//! A bundle carries what plow produced; the checkpoint comes from the
+//! operator's HuggingFace snapshot, a local directory, or — for a `dist`
+//! checkpoint — the snapshot `pull` linked from the distribution's own blobs.
+//! `prepare` joins the two into the flat, sorted directory the loader expects.
 //!
 //! `Checkpoint::open` globs `*.safetensors` in **one non-recursive sorted
 //! directory** and lets the last writer win, which is how a derived sidecar
@@ -46,14 +46,12 @@ fn link(src: &Path, dst: &Path) -> Result<()> {
 }
 
 /// Where a checkpoint's farm lives in the store.
-pub fn farm_path(store_root: &Path, source: &str, revision: &str) -> PathBuf {
-    let repo = source
-        .strip_prefix("hf:")
-        .unwrap_or(source)
-        .replace('/', "--");
-    store_root
-        .join("checkpoints")
-        .join(format!("{repo}@{revision}"))
+pub fn farm_path(store_root: &Path, bundle: &Bundle) -> PathBuf {
+    store_root.join("checkpoints").join(format!(
+        "{}@{}",
+        super::weights::checkpoint_key(bundle),
+        bundle.checkpoint.revision
+    ))
 }
 
 /// Assemble the farm: the snapshot's shards, the bundle's derived sidecar if it
@@ -77,11 +75,11 @@ pub fn build(
             bundle.checkpoint.revision
         )));
     }
-    let dir = farm_path(
-        store_root,
-        &bundle.checkpoint.source,
-        &bundle.checkpoint.revision,
-    );
+    let dir = farm_path(store_root, bundle);
+    // Rebuilt from empty: a `dist` revision is a label a publisher may reuse,
+    // and a shard left from the previous content would load beside the new
+    // ones. The farm holds only links, so nothing it points at is removed.
+    let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).map_err(|source| RuntimeError::Io {
         path: dir.clone(),
         source,
