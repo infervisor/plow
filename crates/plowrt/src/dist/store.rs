@@ -437,33 +437,31 @@ impl Store {
     /// objects alike. Read from the record rather than by walking the
     /// directory, which would also follow `checkpoint` into the weights.
     fn bundle_bytes(&self, dir: &Path) -> u64 {
-        // A `dist` checkpoint's shards are kept by the bundle too; they are
-        // weights, not the build, and an `hf:` bundle's are not counted.
-        let weights: std::collections::BTreeSet<String> = std::fs::read(dir.join(BUNDLE_MANIFEST))
-            .ok()
-            .and_then(|raw| serde_json::from_slice::<plow_asset::dist::Bundle>(&raw).ok())
-            .map(|b| {
-                // Only what is weights alone: a build file the checkpoint
-                // also carries is still the build's.
-                let build: std::collections::BTreeSet<&str> =
-                    b.files.iter().map(|f| f.sha256.as_str()).collect();
-                b.checkpoint
-                    .files
-                    .iter()
-                    .filter(|f| !build.contains(f.sha256.as_str()))
-                    .map(|f| f.sha256.clone())
-                    .collect()
-            })
-            .unwrap_or_default();
-        std::fs::read_to_string(dir.join(BUNDLE_BLOBS))
+        // `keep` appends a `dist` checkpoint's digests to the record: weights,
+        // not the build (an `hf:` bundle's are not counted either). A digest
+        // the record lists more often than the checkpoint does is also a build
+        // file or object, and counts once.
+        let mut count: std::collections::BTreeMap<String, i64> = Default::default();
+        for l in std::fs::read_to_string(dir.join(BUNDLE_BLOBS))
             .unwrap_or_default()
             .lines()
-            .map(str::trim)
-            .filter(|l| !weights.contains(*l))
-            // `keep` may list a build file the checkpoint shares a second time.
-            .collect::<std::collections::BTreeSet<_>>()
+        {
+            *count.entry(l.trim().to_string()).or_default() += 1;
+        }
+        if let Some(b) = std::fs::read(dir.join(BUNDLE_MANIFEST))
+            .ok()
+            .and_then(|raw| serde_json::from_slice::<plow_asset::dist::Bundle>(&raw).ok())
+        {
+            for f in &b.checkpoint.files {
+                if let Some(n) = count.get_mut(&f.sha256) {
+                    *n -= 1;
+                }
+            }
+        }
+        count
             .into_iter()
-            .filter_map(|l| Digest::parse(l).ok())
+            .filter(|(_, n)| *n > 0)
+            .filter_map(|(l, _)| Digest::parse(&l).ok())
             .filter_map(|d| std::fs::metadata(self.blob_path(&d)).ok())
             .map(|m| m.len())
             .sum()
@@ -604,28 +602,38 @@ fn last_link(m: &std::fs::Metadata) -> bool {
     return true;
 }
 
-/// Files under `dir` with no other hard link, and their size.
+/// Files under `dir` whose every hard link is inside it, and their size:
+/// what removing `dir` frees. One file linked twice inside counts once.
 fn last_links(dir: &Path) -> (usize, u64) {
-    let (mut n, mut bytes) = (0usize, 0u64);
+    let mut inodes: std::collections::HashMap<(u64, u64), (u64, u64, u64)> = Default::default();
+    collect_inodes(dir, &mut inodes);
+    inodes
+        .values()
+        .filter(|(_, nlink, seen)| seen >= nlink)
+        .fold((0, 0), |(n, b), (len, _, _)| (n + 1, b + len))
+}
+
+fn collect_inodes(dir: &Path, inodes: &mut std::collections::HashMap<(u64, u64), (u64, u64, u64)>) {
     let Ok(rd) = std::fs::read_dir(dir) else {
-        return (0, 0);
+        return;
     };
     for e in rd.flatten() {
         let Ok(m) = std::fs::symlink_metadata(e.path()) else {
             continue;
         };
         if m.is_dir() {
-            let (sn, sb) = last_links(&e.path());
-            n += sn;
-            bytes += sb;
+            collect_inodes(&e.path(), inodes);
         } else if m.is_file() {
-            if last_link(&m) {
-                n += 1;
-                bytes += m.len();
-            }
+            #[cfg(unix)]
+            let (key, nlink) = {
+                use std::os::unix::fs::MetadataExt;
+                ((m.dev(), m.ino()), m.nlink())
+            };
+            #[cfg(not(unix))]
+            let (key, nlink) = ((0, inodes.len() as u64), 1);
+            inodes.entry(key).or_insert((m.len(), nlink, 0)).2 += 1;
         }
     }
-    (n, bytes)
 }
 
 /// A path that stays inside the bundle: relative, no `..`, no root, no prefix.
