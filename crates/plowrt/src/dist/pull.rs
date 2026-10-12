@@ -227,6 +227,7 @@ pub fn pull(
     }
     let flat: Vec<(String, Digest)> = files.into_iter().map(|(n, d, _)| (n, d)).collect();
     let dir = store.materialize(&resolved.variant.variant_id, &flat)?;
+    store.record_bundle(&dir, &resolved.bundle)?;
     Ok((dir, t))
 }
 
