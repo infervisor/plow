@@ -8,7 +8,7 @@ __device__ void d_moe_group_glu_fp8_block128_m16(
     bf16* fu, const unsigned char* xq, const float* xscale,
     const unsigned long long* wtab, const unsigned long long* stab,
     const int* meta, const unsigned* row_token, unsigned I, unsigned H,
-    unsigned n_exp, unsigned T, unsigned slice, unsigned nblk) {
+    unsigned n_exp, unsigned T, unsigned slice, unsigned nblk, float glu_limit) {
     const int* tilep = meta + 2u * n_exp;
     const unsigned nt = (I + 16u * PLOW_WAVES - 1) / (16u * PLOW_WAVES);
     for (unsigned lin = slice; lin < (unsigned)tilep[n_exp] * nt; lin += nblk) {
@@ -26,14 +26,15 @@ __device__ void d_moe_group_glu_fp8_block128_m16(
             if (T == 1 && I == 256 && H == 6144 && n_exp == 256) {
                 d_gemm_fp8_block128_m16<true, true, false, false, false, false, 1, false, false, 4>(
                     fu + (size_t)row * I, xq, gate, xscale, gs, count, I, H, nc, nt,
-                    up, us, row_token + row, T);
+                    up, us, row_token + row, T, nullptr, 0, nullptr, nullptr, 0, 0, nullptr, glu_limit);
             } else if (T == 8 && I == 256 && H == 6144 && n_exp == 256) {
                 d_gemm_fp8_block128_m16<true, true, false, false, false, false, 1, false, false, 24>(
                     fu + (size_t)row * I, xq, gate, xscale, gs, count, I, H, nc, nt,
-                    up, us, row_token + row, T);
+                    up, us, row_token + row, T, nullptr, 0, nullptr, nullptr, 0, 0, nullptr, glu_limit);
             } else {
                 d_gemm_fp8_block128_m16<true, true>(fu + (size_t)row * I, xq, gate, xscale,
-                    gs, count, I, H, nc, nt, up, us, row_token + row, T);
+                    gs, count, I, H, nc, nt, up, us, row_token + row, T, nullptr, 0, nullptr,
+                    nullptr, 0, 0, nullptr, glu_limit);
             }
         } else {
             count = 0;

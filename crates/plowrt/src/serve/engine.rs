@@ -901,6 +901,10 @@ mod amd_serve {
         /// The TP token-batch route: staging for the slot-band plan plus the body programs the
         /// group carries. `None` when the blob has no bodies or the route is not requested.
         token_batch_tp: Option<TokenBatchTp>,
+        /// Element width of one `act.logits` row (2 = bf16, 4 = f32) when the decode programs
+        /// leave a full-vocab row per slot behind the device argmax; `None` keeps host logprobs
+        /// refused (sharded lm_head fold, fused argmax, or no row writer found).
+        logits_elem: Option<usize>,
         diagnostics: Option<EngineDiagnostics>,
         counter_snapshot_dir: Option<PathBuf>,
         tensor_snapshot: Option<TensorSnapshotConfig>,
@@ -1434,6 +1438,38 @@ mod amd_serve {
             .min(max_ctx.saturating_sub(1) as u32)
     }
 
+    /// Element width of the `act.logits` row the decode programs write, when host logprobs can
+    /// read it: a `Gemv` (bf16) or `GemvF32` / `GemmF32` (f32) lm_head writing `act.logits`, and
+    /// no sharded-head fold (`XArgmaxFin`) or fused `GemvArgmax` in any decode program.
+    fn logits_row_elem(blob: &crate::asset::devblob::DevBlob) -> Option<usize> {
+        use packet::dev::DevOp;
+        let logits = blob.tensors.iter().position(|t| t.name == "act.logits")? as u16;
+        let mut elem = None;
+        for prog in blob.decode_progs() {
+            for d in &prog.insts {
+                if d.op == DevOp::XArgmaxFin as u16 || d.op == DevOp::GemvArgmax as u16 {
+                    return None;
+                }
+                if d.t[0] != logits {
+                    continue;
+                }
+                let w = if d.op == DevOp::Gemv as u16 {
+                    2
+                } else if d.op == DevOp::GemvF32 as u16 || d.op == DevOp::GemmF32 as u16 {
+                    4
+                } else {
+                    continue;
+                };
+                match elem {
+                    None => elem = Some(w),
+                    Some(prev) if prev != w => return None,
+                    Some(_) => {}
+                }
+            }
+        }
+        elem
+    }
+
     fn slot_decode_position(pos: u32, live: bool, cursor: Option<&PfCursor>, prefix: bool) -> u32 {
         cursor.map_or(if live || prefix { pos } else { 0 }, |cur| cur.frontier)
     }
@@ -1453,11 +1489,10 @@ mod amd_serve {
             // then drops the blob; it never dispatches. The L2-placement guard belongs to the
             // engine (which checks the code object for `plow_l2_place_dispatch_1`), so refusing
             // here just blocked `serve` on every placed blob before the engine saw it.
-            let n_gpu = crate::asset::devblob::DevBlob::parse_l2(&raw, true)?
-                .tp
-                .map(|t| t.n_gpu)
-                .unwrap_or(1)
-                .max(1);
+            let meta = crate::asset::devblob::DevBlob::parse_l2(&raw, true)?;
+            let n_gpu = meta.tp.map(|t| t.n_gpu).unwrap_or(1).max(1);
+            let logits_elem = logits_row_elem(&meta);
+            drop(meta);
             drop(raw);
 
             let stop_ids = Arc::new(match checkpoint {
@@ -1629,6 +1664,7 @@ mod amd_serve {
                 last_rung: 0,
                 cursor_split_ns: (0, 0),
                 token_batch_tp,
+                logits_elem,
                 diagnostics: None,
                 counter_snapshot_dir,
                 tensor_snapshot,
@@ -1914,6 +1950,42 @@ mod amd_serve {
 
         pub fn cached_rows(&self, slot: usize) -> usize {
             self.cached_rows.get(slot).copied().unwrap_or(0) as usize
+        }
+
+        /// `slot`'s most recent full-vocab logits row, read back from rank 0 (every rank holds
+        /// the same replicated row behind its device argmax; `in.ids` and `act.logits` are both
+        /// slot-indexed). `false` when the packet keeps no such row (see `logits_elem`).
+        pub fn logits_row(&self, slot: usize, out: &mut Vec<f32>) -> bool {
+            let Some(elem) = self.logits_elem else {
+                return false;
+            };
+            let e = self.ranks.rank0();
+            let Some(total) = e.tensor_bytes("act.logits") else {
+                return false;
+            };
+            let row = total as usize / self.batch;
+            if slot >= self.batch || row == 0 || row % elem != 0 {
+                return false;
+            }
+            let mut bytes = vec![0u8; row];
+            if let Err(err) = e.read_tensor_range("act.logits", (slot * row) as u64, &mut bytes) {
+                tracing::warn!(error = %err, slot, "amd: logits row readback failed");
+                return false;
+            }
+            out.clear();
+            out.reserve(row / elem);
+            if elem == 2 {
+                out.extend(bytes.chunks_exact(2).map(|c| {
+                    f32::from_bits(u32::from(u16::from_le_bytes([c[0], c[1]])) << 16)
+                }));
+            } else {
+                out.extend(
+                    bytes
+                        .chunks_exact(4)
+                        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])),
+                );
+            }
+            true
         }
 
         /// A miss is about to overwrite this slot's KV from row zero. Make the old snapshot
@@ -4636,6 +4708,9 @@ impl SeqEngine for AmdServe {
     }
     fn cached_rows(&self, slot: usize) -> usize {
         AmdServe::cached_rows(self, slot)
+    }
+    fn logits_row(&self, slot: usize, out: &mut Vec<f32>) -> bool {
+        AmdServe::logits_row(self, slot, out)
     }
     fn prefill_chunked_at_most(
         &mut self,

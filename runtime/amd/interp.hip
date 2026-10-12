@@ -4215,7 +4215,8 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
             d_moe_group_glu_fp8_block128_m16((bf16*)TEN(0), (const unsigned char*)TEN(1),
                 (const float*)TEN(2), (const unsigned long long*)TEN(3),
                 (const unsigned long long*)TEN(4), (const int*)TEN(5), (const unsigned*)TEN(6),
-                in->i[0], in->i[1], in->i[2], PLOW_RUNTIME_ROWS(in->i[3]), slice, nblk);
+                in->i[0], in->i[1], in->i[2], PLOW_RUNTIME_ROWS(in->i[3]), slice, nblk,
+                in->fj[1].f);
             break;
 #endif
 #if PLOW_CDNA4 && PLOW_HAS_MOE_QUANT_FP8_BLOCK128

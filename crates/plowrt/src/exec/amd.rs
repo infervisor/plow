@@ -11960,6 +11960,23 @@ impl AmdEngine {
         EngineDevice::download(&*self.be, &self.devp[i], 0, dst)
     }
 
+    /// Read `dst.len()` bytes of a named tensor from byte `offset`.
+    pub fn read_tensor_range(&self, name: &str, offset: u64, dst: &mut [u8]) -> Result<()> {
+        let i = self
+            .tensor_names
+            .iter()
+            .position(|x| x == name)
+            .ok_or_else(|| RuntimeError::Device(format!("no tensor {name:?}")))?;
+        if offset + dst.len() as u64 > self.devp[i].len {
+            return Err(RuntimeError::Device(format!(
+                "{name}: range {offset}+{} past {} bytes",
+                dst.len(),
+                self.devp[i].len
+            )));
+        }
+        EngineDevice::download(&*self.be, &self.devp[i], offset, dst)
+    }
+
     /// Byte size the blob declares for a tensor.
     pub fn tensor_bytes(&self, name: &str) -> Option<u64> {
         self.tensor_names

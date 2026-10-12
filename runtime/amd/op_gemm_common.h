@@ -1670,7 +1670,7 @@ __device__ void d_gemm_fp8_block128_m16(bf16* C, const unsigned char* A,
                                      const float* row_weight = nullptr, unsigned topk = 0,
                                      bf16* C1 = nullptr, bf16* C2 = nullptr,
                                      unsigned n_first = 0, unsigned n_second = 0,
-                                     bf16* C3 = nullptr) {
+                                     bf16* C3 = nullptr, float glu_limit = 0.0f) {
     static_assert(!GLU || !WEIGHTED, "routed weights apply after the down GEMM");
     static_assert(!SCATTER || GATHER, "scatter uses the gathered row map");
     static_assert(!ATOMIC || (SCATTER && WEIGHTED), "atomic reduction requires weighted slot rows");
@@ -1788,9 +1788,19 @@ __device__ void d_gemm_fp8_block128_m16(bf16* C, const unsigned char* A,
         for (unsigned e = 0; e < 4; e++) {
             const unsigned m = m0 + (lane / 16) * 4 + e, n = n0 + lane % 16;
             // CK rounds the reciprocal before either FP32 multiply.
-            if constexpr (GLU_KGROUPS != 0)
-                acc[e] = (acc[e] * __builtin_amdgcn_rcpf(1.0f + expf(-acc[e]))) * up[e];
-            else if constexpr (GLU) acc[e] = (acc[e] * (1.0f / (1.0f + expf(-acc[e])))) * up[e];
+            if constexpr (GLU) {
+                // glu_limit > 0: the clamped SwiGLU (GLM-5.3-Flash swiglu_limit), gate upper
+                // clamp only and up to [-limit, limit], as moe_glu's act 4.
+                float g = acc[e], u = up[e];
+                if (glu_limit > 0.0f) {
+                    g = fminf(g, glu_limit);
+                    u = fminf(fmaxf(u, -glu_limit), glu_limit);
+                }
+                if constexpr (GLU_KGROUPS != 0)
+                    acc[e] = (g * __builtin_amdgcn_rcpf(1.0f + expf(-g))) * u;
+                else
+                    acc[e] = (g * (1.0f / (1.0f + expf(-g)))) * u;
+            }
             if (m < M && n < N) {
                 if constexpr (WEIGHTED) acc[e] *= row_weight[m];
                 const unsigned dst = SCATTER ? scale_row[e] : m;

@@ -1735,13 +1735,7 @@ fn emit_glm_routed_w8a8(
     norm: u32,
     aligned: u32,
 ) -> u32 {
-    // `MoeGluFp8Block128` carries no act code (SiLU in the kernel).
-    assert!(
-        c.swiglu_limit.is_none(),
-        "the routed W8A8 arm (MoeGluFp8Block128) has no clamped-SwiGLU epilogue; swiglu_limit={:?} \
-         needs the block-fp8 MoE arms",
-        c.swiglu_limit
-    );
+    // `MoeGluFp8Block128` carries no act code: SiLU in the kernel, clamped when f[1] > 0.
     let all = b.all();
     let quant = b.emit(
         DevOp::QuantFp8Block128,
@@ -1767,6 +1761,7 @@ fn emit_glm_routed_w8a8(
                 n.row_token,
             ]);
             d.i[..4].copy_from_slice(&[inter, h, experts, rows]);
+            d.f[1] = c.swiglu_limit.unwrap_or(0.0);
         },
     );
     let hidden = b.emit(DevOp::MoeQuantFp8Block128, all.clone(), &[glu], |d| {

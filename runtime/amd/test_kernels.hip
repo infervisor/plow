@@ -362,7 +362,7 @@ __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void moe_group_glu_a8w8_block128
     const int* meta, const unsigned* row_token, unsigned I, unsigned H,
     unsigned n_exp, unsigned T) {
     d_moe_group_glu_fp8_block128_m16(fu, xq, xscale, wtab, stab, meta, row_token,
-        I, H, n_exp, T, blockIdx.x, gridDim.x);
+        I, H, n_exp, T, blockIdx.x, gridDim.x, 0.0f);
 }
 extern "C" __global__ __attribute__((flatten))
 __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void moe_group_down_a8w8_block128_m16(
