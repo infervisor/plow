@@ -12,8 +12,8 @@ namespace = "infervisor"
 name = "glm-5.3-flash"
 label = "gfx950-mi350x-tp8-fp8"
 network = "glm-5.3-flash"
-status = "emits"
-plow_git = "77929debd6d3a7a8ca5c6e34b1d02a3b73c3fd42"
+status = "validated"
+plow_git = "ca89f76dbdb0ed173e343c255f6e3af380266e3b"
 doc = "docs/amd/glm53-flash-mi350x.md"
 
 # max_ctx 65536: the model's recurrent (KDA) state carries at every length, so long prompts are
@@ -117,3 +117,40 @@ env = { PLOW_STATE_CLEAR_DEVICE = "1", PLOW_TP_AGREE_EVERY = "1", PLOW_DECODE_MI
 [[gates]]
 name = "smoke"
 cmd = "scripts/serve_test/smoke.sh"
+
+# FP32-reference gate (scripts/llm/fp32_ref_gate.py, 46 cases incl. 18 needles to 15872 tokens,
+# served c16, prefix cache on) on packet 451b1b07: PASS, kl_mean 0.01396 (vLLM 0.03677 on the same
+# reference), kl_p99 0.233 (0.549), top1_decisive 0.9967 (0.9868), needles 18/18.
+[[gates]]
+name = "llm_fp32_ref"
+cmd = "scripts/llm/fp32_ref_gate.py"
+expect = "PASS"
+
+# Long-context needles (scripts/glm53_needle_probe.py --exact-lengths --gen-suffix '</think>',
+# 4096/16384/32768/61440 tokens x depths 0.1/0.5/0.9 x 3 needles): 36/36, vLLM 36/36, paired pass.
+[[gates]]
+name = "needle-long-context"
+cmd = "scripts/glm53_needle_probe.py"
+expect = "36/36"
+
+# One serving cell for orientation; the full grid (isl 1024/4096/16384 at c1..c128, 32768/61440 at
+# c1/c8) and the strict comparison against vLLM are docs/bringup/results/glm53flash-mi350x-2026-10-12.
+# No cell beats vLLM on throughput (0.07-0.26x); see docs/amd/glm53-flash-mi350x.md.
+[measured]
+tok_s = 32.29
+p50_tpot_ms = 27.26
+p50_ttft_ms = 412.23
+concurrency = 1
+input_len = 4096
+output_len = 128
+client = "vllm 0.31.1rc1 bench serve (scripts/bench/llm_grid.sh)"
+
+# Reproduction gates at THIS commit, checkpoint and nix lock.
+[artifacts]
+"plowrt" = "f24205a4a8f15fd3aa4b926237fad63d747763086486f24d41aa415dbafa56e8"
+"model.pkt" = "451b1b079b143d72fb0252a558b2a46e7a45b13de263b532cf946d2f4013769e"
+"interp_decode_k3_gq.elf" = "28a26207b736e582f6d950ba54d06602d004e3475ddbf249d416cbef8729b3a7"
+"lowrung1/interp_decode_k3_gq.elf" = "2ef19046326a7c3987e9374df4486588cd74bf3c6afb1998431f537137362797"
+"lowrung8/interp_decode_k3_gq.elf" = "6cd8a74a39399ff90f8417a085c64518f2d75cf06b7a5c8df9adeaf17d680c1c"
+"interp_prefill_k3_moe_gq.elf" = "daad489336760971d75ab0b17bec9492e61427f6fe098b1d6c71ce54745175e5"
+"interp_flash_gq.elf" = "25bb2d8ead882a26fe53f1714ff2161b757e3d81fb656d98cb211a4f58d6041a"
