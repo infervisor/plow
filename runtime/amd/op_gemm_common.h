@@ -5611,6 +5611,78 @@ __device__ void d_gemv_f32(float* __restrict__ C, const bf16* __restrict__ x,
     }
 }
 
+/* d_gemv_f32 for prefill-sized M: one wave per R x CN output tile instead of per output, so x is
+ * read N/CN times and W M/R times instead of N and M times, with the next k step's operands loaded
+ * while this one accumulates (GLM-5.3 mHC mix, N=24, K=16384, 512 rows: 65 -> 28 us standalone).
+ * Each output keeps d_gemv_f32's lane-to-k map and term order. d_gemv_f32 compiles to rounded
+ * products and in-order adds (no FMA), so contraction is off here: fused terms would not be
+ * bit-identical. Requires M % R == 0, N % CN == 0, K % (8 * PLOW_WAVE) == 0. */
+template <unsigned R, unsigned CN>
+__device__ void d_gemv_f32_tile(float* __restrict__ C, const bf16* __restrict__ x,
+                                const float* __restrict__ W, unsigned M, unsigned N, unsigned K,
+                                unsigned slice, unsigned nblk) {
+#pragma clang fp contract(off)
+    const unsigned wave = threadIdx.x / PLOW_WAVE;
+    const unsigned lane = threadIdx.x % PLOW_WAVE;
+    const unsigned nb = N / CN, tiles = (M / R) * nb;
+    for (unsigned tile = slice * PLOW_WAVES + wave; tile < tiles; tile += nblk * PLOW_WAVES) {
+        const unsigned m0 = (tile / nb) * R, n0 = (tile % nb) * CN;
+        const bf16* const xm = x + (size_t)m0 * K;
+        const float* const wn = W + (size_t)n0 * K;
+        float acc[R][CN];
+#pragma unroll
+        for (unsigned r = 0; r < R; r++)
+#pragma unroll
+            for (unsigned c = 0; c < CN; c++) acc[r][c] = 0.0f;
+        bf16v8 xn[R];
+        float4 wn0[CN], wn1[CN];
+        unsigned k = lane * 8u;
+#pragma unroll
+        for (unsigned r = 0; r < R; r++) xn[r] = ld_glob8(xm + (size_t)r * K + k);
+#pragma unroll
+        for (unsigned c = 0; c < CN; c++) {
+            wn0[c] = *(const float4*)(wn + (size_t)c * K + k);
+            wn1[c] = *(const float4*)(wn + (size_t)c * K + k + 4);
+        }
+        for (; k < K; k += PLOW_WAVE * 8u) {
+            bf16v8 xv[R];
+            float4 w0[CN], w1[CN];
+#pragma unroll
+            for (unsigned r = 0; r < R; r++) xv[r] = xn[r];
+#pragma unroll
+            for (unsigned c = 0; c < CN; c++) {
+                w0[c] = wn0[c];
+                w1[c] = wn1[c];
+            }
+            const unsigned kn = k + PLOW_WAVE * 8u;
+            if (kn < K) {
+#pragma unroll
+                for (unsigned r = 0; r < R; r++) xn[r] = ld_glob8(xm + (size_t)r * K + kn);
+#pragma unroll
+                for (unsigned c = 0; c < CN; c++) {
+                    wn0[c] = *(const float4*)(wn + (size_t)c * K + kn);
+                    wn1[c] = *(const float4*)(wn + (size_t)c * K + kn + 4);
+                }
+            }
+#pragma unroll
+            for (unsigned c = 0; c < CN; c++)
+#pragma unroll
+                for (unsigned r = 0; r < R; r++)
+                    acc[r][c] += bf2f(xv[r][0]) * w0[c].x + bf2f(xv[r][1]) * w0[c].y +
+                                 bf2f(xv[r][2]) * w0[c].z + bf2f(xv[r][3]) * w0[c].w +
+                                 bf2f(xv[r][4]) * w1[c].x + bf2f(xv[r][5]) * w1[c].y +
+                                 bf2f(xv[r][6]) * w1[c].z + bf2f(xv[r][7]) * w1[c].w;
+        }
+#pragma unroll
+        for (unsigned r = 0; r < R; r++)
+#pragma unroll
+            for (unsigned c = 0; c < CN; c++) {
+                const float t = wave_sum(acc[r][c]);
+                if (lane == 0) C[(size_t)(m0 + r) * N + n0 + c] = t;
+            }
+    }
+}
+
 __device__ void d_gemv_bf16_f32(float* __restrict__ C, const bf16* __restrict__ x,
                                 const bf16* __restrict__ W, unsigned M, unsigned N, unsigned K,
                                 unsigned slice, unsigned nblk) {

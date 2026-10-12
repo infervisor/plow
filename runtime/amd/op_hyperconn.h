@@ -327,6 +327,111 @@ __device__ void d_hyperconn_pre(float* __restrict__ post_mix, float* __restrict_
     }
 }
 
+#if !PLOW_HC_SINKHORN_RCP
+/* Prefill form of d_hyperconn_pre (n = 4, hidden % 8 == 0, not head_only): a workgroup's tokens
+ * are taken HC_PRE_G at a time; each token's lane-0 tail (gates + softmax + Sinkhorn) runs
+ * on 16 lanes, one combine element per lane, and the group's tokens run side by side. Every
+ * value is computed with d_hyperconn_pre's operations in its order (block_sum unrolled into
+ * `wsum`, row/column sums formed per lane in hc_sinkhorn4_reg's order), so the outputs are
+ * bit-identical. 512 rows: 52 -> 13 us standalone. */
+#define HC_PRE_G 16u
+__device__ void d_hyperconn_pre_rows(float* __restrict__ post_mix, float* __restrict__ comb_mix,
+                                     bf16* __restrict__ layer_input, const float* __restrict__ mixes,
+                                     const bf16* __restrict__ residual,
+                                     const float* __restrict__ hc_scale,
+                                     const float* __restrict__ hc_base, unsigned T, unsigned hidden,
+                                     unsigned sinkhorn_repeat, float rms_eps, float hc_eps,
+                                     unsigned slice, unsigned nblk) {
+    const unsigned nh = 4u * hidden;
+    const unsigned wave = threadIdx.x / PLOW_WAVE, lane = threadIdx.x % PLOW_WAVE;
+    __shared__ float wsum[HC_PRE_G][PLOW_WAVES];
+    __shared__ float gate[HC_PRE_G][4];
+    for (unsigned t0 = slice; t0 < T; t0 += nblk * HC_PRE_G) {
+        const unsigned cnt = min(HC_PRE_G, (T - t0 + nblk - 1) / nblk);
+        for (unsigned g = 0; g < cnt; g++) {
+            const bf16* rrow = residual + (size_t)(t0 + g * nblk) * nh;
+            float ss = 0.0f;
+            for (unsigned i = threadIdx.x * 8u; i < nh; i += PLOW_THREADS * 8u) {
+                const bf16v8 v = ld_glob8(rrow + i);
+#pragma unroll
+                for (unsigned e = 0; e < 8; e++) {
+                    const float x = bf2f(v[e]);
+                    ss += x * x;
+                }
+            }
+            ss = wave_sum(ss);
+            if (lane == 0) wsum[g][wave] = ss;
+        }
+        __syncthreads();
+        if (threadIdx.x < cnt * 16u) {
+            /* 16 lanes per token, lane e = 4i + j holds comb[i][j]. Every lane forms each row or
+             * column sum itself, in hc_sinkhorn4_reg's order, so the values are its values. */
+            const unsigned g = threadIdx.x >> 4, e = threadIdx.x & 15u, t = t0 + g * nblk;
+            const unsigned rb = (lane & ~15u) | (e & ~3u), cb = (lane & ~15u) | (e & 3u);
+            float s = 0.0f;
+#pragma unroll
+            for (int i = 0; i < PLOW_WAVES; i++) s += wsum[g][i];
+            const float inv = rsqrtf(s / (float)nh + rms_eps);
+            const float* mrow = mixes + (size_t)t * 24u;
+            if (e < 4u) {
+                const float v = (mrow[e] * inv) * hc_scale[0] + hc_base[e];
+                gate[g][e] = 1.0f / (1.0f + expf(-v)) + hc_eps;
+                const float w = (mrow[4 + e] * inv) * hc_scale[1] + hc_base[4 + e];
+                post_mix[(size_t)t * 4u + e] = (1.0f / (1.0f + expf(-w))) * PLOW_HC_POST_MULT;
+            }
+            float c = (mrow[8 + e] * inv) * hc_scale[2] + hc_base[8 + e];
+            float m = -3.0e38f;
+#pragma unroll
+            for (unsigned q = 0; q < 4; q++) m = fmaxf(m, __shfl(c, rb + q, PLOW_WAVE));
+            c = expf(c - m);
+            s = 0.0f;
+#pragma unroll
+            for (unsigned q = 0; q < 4; q++) s += __shfl(c, rb + q, PLOW_WAVE);
+            c = c / s + hc_eps;
+            s = 0.0f;
+#pragma unroll
+            for (unsigned q = 0; q < 4; q++) s += __shfl(c, cb + 4u * q, PLOW_WAVE);
+            c = c / (s + hc_eps);
+            for (unsigned r = 1; r < sinkhorn_repeat; r++) {
+                s = 0.0f;
+#pragma unroll
+                for (unsigned q = 0; q < 4; q++) s += __shfl(c, rb + q, PLOW_WAVE);
+                c = c / (s + hc_eps);
+                s = 0.0f;
+#pragma unroll
+                for (unsigned q = 0; q < 4; q++) s += __shfl(c, cb + 4u * q, PLOW_WAVE);
+                c = c / (s + hc_eps);
+            }
+            comb_mix[(size_t)t * 16u + e] = c;
+        }
+        __syncthreads();
+        for (unsigned g = 0; g < cnt; g++) {
+            const size_t t = t0 + g * nblk;
+            const bf16* rrow = residual + t * nh;
+            const float l0 = gate[g][0], l1 = gate[g][1], l2 = gate[g][2], l3 = gate[g][3];
+            for (unsigned d = threadIdx.x * 8u; d < hidden; d += PLOW_THREADS * 8u) {
+                const bf16v8 r0 = ld_glob8(rrow + d);
+                const bf16v8 r1 = ld_glob8(rrow + (size_t)hidden + d);
+                const bf16v8 r2 = ld_glob8(rrow + 2 * (size_t)hidden + d);
+                const bf16v8 r3 = ld_glob8(rrow + 3 * (size_t)hidden + d);
+                bf16v8 o;
+#pragma unroll
+                for (unsigned e = 0; e < 8; e++) {
+                    float acc = 0.0f;
+                    acc += l0 * bf2f(r0[e]);
+                    acc += l1 * bf2f(r1[e]);
+                    acc += l2 * bf2f(r2[e]);
+                    acc += l3 * bf2f(r3[e]);
+                    o[e] = f2bf(acc);
+                }
+                st_glob8(layer_input + t * hidden + d, o);
+            }
+        }
+        __syncthreads(); /* wsum/gate are rewritten by the next group */
+    }
+}
+#endif
+
 /* op 122 — hyper-connections post-block, paired with op 121.
  * `new_residual[j][d] = sum_i comb_mix[i][j] * residual[i][d]  +  post_mix[j] * x_out[d]`
  * — an n x n combine (n=4) plus a broadcast multiply-add. Fully parallel over `d` with no

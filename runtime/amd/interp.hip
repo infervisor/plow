@@ -3905,6 +3905,15 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
             break;
 #endif /* PLOW_HAS_KDA_GATED_NORM */
         case PLOW_DOP_HYPER_CONN_PRE:
+#if !PLOW_BUCKET_DECODE && !PLOW_HC_SINKHORN_RCP
+            if (in->i[1] == 4u && in->i[2] % 8u == 0u) {
+                d_hyperconn_pre_rows((float*)TEN(0), (float*)TEN(1), (bf16*)TEN(2),
+                                     (const float*)TEN(3), (const bf16*)TEN(4),
+                                     (const float*)TEN(5), (const float*)TEN(6), in->i[0],
+                                     in->i[2], in->i[3], in->fj[0].f, in->fj[1].f, slice, nblk);
+                break;
+            }
+#endif
             d_hyperconn_pre((float*)TEN(0), (float*)TEN(1), (bf16*)TEN(2), (const float*)TEN(3),
                             (const bf16*)TEN(4), (const float*)TEN(5), (const float*)TEN(6),
                             in->i[0], in->i[1], in->i[2], in->i[3], in->fj[0].f, in->fj[1].f, slice,
@@ -3945,6 +3954,16 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
                                      (uint8_t*)sm->raw);
             break;
         case PLOW_DOP_GEMV_F32:
+#if !PLOW_BUCKET_DECODE
+            /* Prefill rows: R x CN output tiles, bit-identical (d_gemv_f32_tile). Below 256 rows
+             * the per-output walk fills more waves and is faster. */
+            if (in->i[0] >= 256u && in->i[0] % 2u == 0u && in->i[1] % 3u == 0u &&
+                in->i[2] % (8u * PLOW_WAVE) == 0u) {
+                d_gemv_f32_tile<2, 3>((float*)TEN(0), (const bf16*)TEN(1), (const float*)TEN(2),
+                                      in->i[0], in->i[1], in->i[2], slice, nblk);
+                break;
+            }
+#endif
             d_gemv_f32((float*)TEN(0), (const bf16*)TEN(1), (const float*)TEN(2), in->i[0], in->i[1],
                        in->i[2], slice, nblk);
             break;
