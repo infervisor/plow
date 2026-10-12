@@ -151,16 +151,15 @@ pub fn cmd_load(
     let (dir, t) = pull::pull(&st, &*f, &resolved)?;
     println!("transferred: {t}");
 
-    // Weights are never distributed. Resolve them, or say precisely what to do.
+    // A `dist` checkpoint came with the pull, linked into its snapshot. An
+    // `hf:` one is not distributed: resolve it, or say precisely what to do.
+    let dist_snapshot = (resolved.bundle.checkpoint.source == plow_asset::dist::DIST_SOURCE)
+        .then(|| dist::weights::dist_snapshot_path(st.root(), &resolved.bundle))
+        .transpose()?;
     let ckpt = checkpoint
         .or_else(|| RuntimeConfig::get().checkpoint.clone().map(PathBuf::from))
-        .unwrap_or_else(|| {
-            prepare::farm_path(
-                st.root(),
-                &resolved.bundle.checkpoint.source,
-                &resolved.bundle.checkpoint.revision,
-            )
-        });
+        .or(dist_snapshot)
+        .unwrap_or_else(|| prepare::farm_path(st.root(), &resolved.bundle));
     let ckpt = if ckpt.is_dir() {
         ckpt
     } else if fetch_weights {
@@ -324,14 +323,16 @@ pub fn cmd_upgrade(model: Option<&str>, all: bool, dry_run: bool) -> Result<(), 
 /// Package a built variant into one `.zip`: `bundle.json`, `objset.json`,
 /// and every file they reference, under `assets/` and `objects/`
 /// respectively so a bundle file and an objset object can never collide on
-/// name. Does not build the manifests — `pack_bundle.py`/`pack_objset.py`
-/// still do that; this only packages what they already produced.
+/// name — and a `dist` checkpoint's files under `checkpoint/`. Does not build
+/// the manifests — `pack_bundle.py`/`pack_objset.py` still do that; this only
+/// packages what they already produced.
 #[cfg(feature = "dist")]
 pub fn cmd_pack(
     bundle_path: &std::path::Path,
     objset_path: Option<&std::path::Path>,
     assets: &std::path::Path,
     objects: Option<&std::path::Path>,
+    checkpoint_dir: Option<&std::path::Path>,
     out: &std::path::Path,
 ) -> Result<(), Err> {
     use plow_asset::dist::{Bundle, ObjSet};
@@ -370,6 +371,15 @@ pub fn cmd_pack(
         (Some(_), None) => return Err("the objset's objects need --objects".into()),
         (Some((objset, _)), Some(dir)) => objset.objects.iter().map(|o| (o, dir)).collect(),
         (None, _) => Vec::new(),
+    };
+    let checkpoint_in = match (bundle.checkpoint.files.is_empty(), checkpoint_dir) {
+        (false, None) => {
+            return Err("the bundle carries its checkpoint: pass --checkpoint-dir".into())
+        }
+        (true, Some(p)) => {
+            return Err(format!("{}: the bundle's checkpoint lists no files", p.display()).into())
+        }
+        (_, dir) => dir,
     };
 
     let file = std::fs::File::create(out)?;
@@ -424,6 +434,29 @@ pub fn cmd_pack(
         total_files += 1;
     }
 
+    // Weights are stored, not deflated: safetensors barely compress, and a
+    // shard can pass 4 GiB, which needs a zip64 entry.
+    if let Some(dir) = checkpoint_in {
+        for c in &bundle.checkpoint.files {
+            let path = dir.join(&c.name);
+            let stored = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored)
+                .large_file(c.bytes >= u32::MAX as u64);
+            zip.start_file(format!("checkpoint/{}", c.name), stored)?;
+            let (got, n) = copy_hashed(&path, &mut zip)?;
+            if got != c.sha256 {
+                return Err(format!(
+                    "{}: hashes to {got}, bundle.json says {}",
+                    path.display(),
+                    c.sha256
+                )
+                .into());
+            }
+            total_bytes += n;
+            total_files += 1;
+        }
+    }
+
     zip.finish()?;
     println!(
         "{}: {} file(s), {} packaged",
@@ -432,6 +465,27 @@ pub fn cmd_pack(
         pull::human(total_bytes)
     );
     Ok(())
+}
+
+/// Stream a file into `w`, returning its sha256 and length. A checkpoint
+/// shard is gigabytes; reading it whole, as the bundle files are, would hold
+/// all of it in memory.
+#[cfg(feature = "dist")]
+fn copy_hashed(path: &std::path::Path, w: &mut impl Write) -> Result<(String, u64), Err> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+    let mut f = std::fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let (mut h, mut n, mut buf) = (Sha256::new(), 0u64, vec![0u8; 1 << 20]);
+    loop {
+        let k = f.read(&mut buf)?;
+        if k == 0 {
+            break;
+        }
+        h.update(&buf[..k]);
+        w.write_all(&buf[..k])?;
+        n += k as u64;
+    }
+    Ok((format!("{:x}", h.finalize()), n))
 }
 
 pub fn cmd_prepare(model: &str, checkpoint: Option<PathBuf>) -> Result<(), Err> {

@@ -154,6 +154,16 @@ store, as `huggingface-cli download` would. Never implicit: a checkpoint can
 be terabytes. The bundle's revision must be a full commit hash; a branch can
 move after the build, so `--fetch-weights` refuses one.
 
+The exception is a checkpoint with no Hugging Face repository to fetch from
+(private, or for an air-gapped node): `checkpoint.source = "dist"` lists every
+file as `files: [{name, sha256, bytes}]`, published under `v1/blobs/sha256/`
+like a bundle file, and `revision` is a free version label. `pull` fetches those
+blobs with the bundle and links them into `snapshots/dist--<ns>--<name>@<rev>/`,
+which `load` prepares without `--fetch-weights`. `pack_bundle.py
+--checkpoint-dir <dir> --revision <label>` writes such a manifest (instead of
+`--hf`), and `plowrt pack --checkpoint-dir <dir>` zips the files as
+`checkpoint/<name>`.
+
 ## Producing a release
 
 Producers use nix; the HTTPS store is generated from its outputs. Nothing on a

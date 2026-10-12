@@ -212,6 +212,24 @@ impl Store {
         Ok(dir)
     }
 
+    /// Add blobs to a materialized bundle's record without linking them into
+    /// it. A `dist` checkpoint's files are linked into its snapshot instead,
+    /// and `gc` reads only bundle records, so without this it would collect
+    /// the weights of a bundle that still needs them.
+    pub fn keep(&self, dir: &Path, digests: &[Digest]) -> Result<()> {
+        use std::io::Write;
+        let mpath = dir.join(BUNDLE_BLOBS);
+        let lines: String = digests.iter().map(|d| format!("{d}\n")).collect();
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&mpath)
+            .and_then(|mut f| f.write_all(lines.as_bytes()))
+            .map_err(|source| RuntimeError::Io {
+                path: mpath,
+                source,
+            })
+    }
+
     /// A pin's filename: a digest of the reference, not the reference itself.
     ///
     /// A reference contains `://` and `/`, and using it as a path both nests

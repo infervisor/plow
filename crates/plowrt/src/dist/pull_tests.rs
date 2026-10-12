@@ -139,6 +139,7 @@ fn bundle(label: &str, gen: u32, pkt_sha: &str, pkt_bytes: u64, objset_id: &str)
             shards: 96,
             layout: "native-mxfp4".into(),
             bytes: 1_590_000_000_000,
+            files: vec![],
         },
         objset: Some(BundleObjset {
             objset_id: objset_id.into(),
@@ -314,6 +315,89 @@ fn a_runtime_compiled_bundle_pulls_its_files_and_no_objects() {
     assert_eq!(t.fetched_blobs, 1);
     assert_eq!(std::fs::read(dir.join("model.pkt")).unwrap(), pkt);
     assert!(!dir.join("hsaco").exists());
+}
+
+/// A `dist` checkpoint travels as blobs: the pull fetches them with the
+/// bundle, links them into a snapshot rather than the bundle, keeps them
+/// reachable for `gc`, and `prepare` builds the farm from that snapshot.
+#[test]
+fn a_dist_checkpoint_is_pulled_as_blobs_and_linked_into_its_snapshot() {
+    let f = Fixture::new("dist-weights");
+    let (pkt_sha, pkt_len) = f.blob(&[7u8; 4096]);
+    let (obj_sha, obj_len) = f.blob(b"objset g1");
+    let set = objset("obj-g1", &obj_sha, obj_len, Some("0x9fd0e880fb6fbf09"));
+    let set_sha = f.write("v1/objsets/obj-g1.json", &serde_json::to_vec(&set).unwrap());
+    let ckpt: Vec<(&str, Vec<u8>)> = vec![
+        ("model.safetensors", vec![3u8; 2048]),
+        ("tokenizer.json", b"{}".to_vec()),
+        ("config.json", b"{\"model_type\": \"k3\"}".to_vec()),
+        ("onnx/extra.bin", b"nested".to_vec()),
+    ];
+    let mut b = bundle(LABEL, 1, &pkt_sha, pkt_len, "obj-g1");
+    b.objset.as_mut().unwrap().sha256 = set_sha;
+    b.checkpoint = BundleCheckpoint {
+        source: DIST_SOURCE.into(),
+        revision: "v1".into(),
+        shards: 1,
+        layout: "hf-safetensors".into(),
+        bytes: ckpt.iter().map(|(_, c)| c.len() as u64).sum(),
+        files: ckpt
+            .iter()
+            .map(|(name, content)| {
+                let (sha256, bytes) = f.blob(content);
+                CheckpointFile {
+                    name: name.to_string(),
+                    sha256,
+                    bytes,
+                }
+            })
+            .collect(),
+    };
+    let manifest_sha = f.write(
+        &format!("v1/infervisor/kimi-k3/manifests/{LABEL}@g1"),
+        &serde_json::to_vec(&b).unwrap(),
+    );
+    write_index(&f, vec![variant(LABEL, 1, &manifest_sha, "obj-g1")]);
+
+    let store = f.store();
+    let r = reference::parse("kimi-k3").unwrap();
+    let resolved = resolve(&*f.fetch(), &r, &live(), Constraints::default()).unwrap();
+    assert_eq!(resolved.plan(&store).unwrap().fetched_blobs, 2 + ckpt.len());
+    let (dir, t) = pull(&store, &*f.fetch(), &resolved).unwrap();
+    assert_eq!(t.fetched_blobs, 2 + ckpt.len());
+
+    let snap = crate::dist::weights::dist_snapshot_path(store.root(), &resolved.bundle).unwrap();
+    assert_eq!(
+        snap,
+        store.root().join("snapshots/dist--infervisor--kimi-k3@v1")
+    );
+    for (name, content) in &ckpt {
+        assert_eq!(&std::fs::read(snap.join(name)).unwrap(), content, "{name}");
+    }
+    assert!(
+        !dir.join("model.safetensors").exists(),
+        "the weights are the snapshot's, not bundle files"
+    );
+    let (collected, _) = store.gc().unwrap();
+    assert_eq!(
+        collected, 0,
+        "a live bundle's checkpoint blobs are reachable"
+    );
+
+    let farm = crate::dist::prepare::build(store.root(), &resolved.bundle, &dir, &snap).unwrap();
+    assert_eq!(farm.shards, 1);
+    assert_eq!(
+        farm.dir,
+        store
+            .root()
+            .join("checkpoints/dist--infervisor--kimi-k3@v1")
+    );
+    assert!(dir.join("checkpoint/model.safetensors").is_file());
+
+    // A second pull moves nothing and relinks the same snapshot.
+    let (_, t2) = pull(&store, &*f.fetch(), &resolved).unwrap();
+    assert_eq!(t2.fetched_blobs, 0);
+    assert!(snap.join("onnx/extra.bin").is_file());
 }
 
 /// The property the whole layout exists for: a generation that changes only the

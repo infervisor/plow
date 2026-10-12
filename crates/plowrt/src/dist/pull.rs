@@ -93,10 +93,23 @@ impl Resolved {
         Ok(out)
     }
 
+    /// A `dist` checkpoint's files, as `(path within the snapshot, digest,
+    /// bytes)`. Empty for an `hf:` checkpoint, which the distribution does not
+    /// carry. These are fetched with the bundle but linked into the snapshot,
+    /// not the bundle directory.
+    pub fn checkpoint_files(&self) -> Result<Vec<(String, Digest, u64)>> {
+        self.bundle
+            .checkpoint
+            .files
+            .iter()
+            .map(|f| Ok((f.name.clone(), Digest::parse(&f.sha256)?, f.bytes)))
+            .collect()
+    }
+
     /// Split the file list by what the store already has. No network.
     pub fn plan(&self, store: &Store) -> Result<Transfer> {
         let mut t = Transfer::default();
-        for (_, d, bytes) in self.files()? {
+        for (_, d, bytes) in self.files()?.into_iter().chain(self.checkpoint_files()?) {
             if store.has(&d) {
                 t.reused_blobs += 1;
                 t.reused_bytes += bytes;
@@ -202,15 +215,17 @@ pub fn resolve(
     })
 }
 
-/// Fetch every missing blob, verify it, and materialize the bundle directory.
+/// Fetch every missing blob, verify it, and materialize the bundle directory —
+/// and, for a `dist` checkpoint, its snapshot (see [`super::weights::link_dist`]).
 pub fn pull(
     store: &Store,
     f: &dyn Fetch,
     resolved: &Resolved,
 ) -> Result<(std::path::PathBuf, Transfer)> {
     let files = resolved.files()?;
+    let checkpoint = resolved.checkpoint_files()?;
     let mut t = Transfer::default();
-    for (name, digest, bytes) in &files {
+    for (name, digest, bytes) in files.iter().chain(&checkpoint) {
         if store.has(digest) {
             t.reused_blobs += 1;
             t.reused_bytes += bytes;
@@ -227,6 +242,11 @@ pub fn pull(
     }
     let flat: Vec<(String, Digest)> = files.into_iter().map(|(n, d, _)| (n, d)).collect();
     let dir = store.materialize(&resolved.variant.variant_id, &flat)?;
+    if !checkpoint.is_empty() {
+        let digests: Vec<Digest> = checkpoint.into_iter().map(|(_, d, _)| d).collect();
+        store.keep(&dir, &digests)?;
+        super::weights::link_dist(store, &resolved.bundle)?;
+    }
     Ok((dir, t))
 }
 

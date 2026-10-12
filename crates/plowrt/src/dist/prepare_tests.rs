@@ -45,6 +45,7 @@ fn bundle(tokenizer: TokenizerRef, files: Vec<FileRef>) -> Bundle {
             shards: 2,
             layout: "native-mxfp4".into(),
             bytes: 1_590_000_000_000,
+            files: vec![],
         },
         objset: Some(BundleObjset {
             objset_id: "o".into(),
