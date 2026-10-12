@@ -454,7 +454,12 @@ impl Store {
             if live.contains(&name) {
                 continue;
             }
-            let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+            // A blob still linked from a `dist` snapshot frees its space only
+            // when the snapshot goes; `gc_dist_snapshots` counts it then.
+            let size = entry
+                .metadata()
+                .map(|m| if last_link(&m) { m.len() } else { 0 })
+                .unwrap_or(0);
             if std::fs::remove_file(entry.path()).is_ok() {
                 n += 1;
                 freed += size;
@@ -496,14 +501,23 @@ impl Store {
                 continue;
             }
             // Space comes back only for files nothing else links to.
-            let (files, bytes) = last_links(&path);
+            // Its files are links to blobs `gc` counted already: only the
+            // space comes back now.
+            let (_, bytes) = last_links(&path);
             if std::fs::remove_dir_all(&path).is_ok() {
-                n += files;
                 freed += bytes;
             }
         }
         (n, freed)
     }
+}
+
+/// Whether removing this file frees its bytes: no other hard link to it.
+fn last_link(m: &std::fs::Metadata) -> bool {
+    #[cfg(unix)]
+    return std::os::unix::fs::MetadataExt::nlink(m) == 1;
+    #[cfg(not(unix))]
+    return true;
 }
 
 /// Files under `dir` with no other hard link, and their size.
@@ -521,11 +535,7 @@ fn last_links(dir: &Path) -> (usize, u64) {
             n += sn;
             bytes += sb;
         } else if m.is_file() {
-            #[cfg(unix)]
-            let last = std::os::unix::fs::MetadataExt::nlink(&m) == 1;
-            #[cfg(not(unix))]
-            let last = true;
-            if last {
+            if last_link(&m) {
                 n += 1;
                 bytes += m.len();
             }

@@ -277,3 +277,22 @@ fn a_rebuilt_farm_keeps_no_shard_from_the_previous_snapshot() {
         "targets untouched"
     );
 }
+
+#[test]
+fn a_refused_snapshot_leaves_the_farm_as_it_was() {
+    let store = tmp("store-refused");
+    let bdir = tmp("bundle-refused");
+    std::fs::write(bdir.join("model.pkt"), b"pkt").unwrap();
+    let b = bundle(from_checkpoint(), vec![packet_file()]);
+    let good = snapshot("snap-good", 3, &["tokenizer.json"]);
+    let farm = build(&store, &b, &bdir, &good).unwrap();
+
+    let empty = tmp("snap-empty");
+    assert!(build(&store, &b, &bdir, &empty).is_err());
+    let shards = std::fs::read_dir(&farm.dir)
+        .unwrap()
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().ends_with(".safetensors"))
+        .count();
+    assert_eq!(shards, 3, "a refused rebuild removed the working shards");
+}

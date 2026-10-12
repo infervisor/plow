@@ -76,20 +76,6 @@ pub fn build(
         )));
     }
     let dir = farm_path(store_root, bundle);
-    // Not emptied: other bundles on this checkpoint keep their derived
-    // sidecars here. But a base shard from another snapshot (an operator's
-    // `--checkpoint` that changed) would load beside the new ones, so every
-    // shard link that does not point into a bundle goes before relinking.
-    let bundles = store_root.join("bundles");
-    if let Ok(rd) = std::fs::read_dir(&dir) {
-        for e in rd.flatten() {
-            let name = e.file_name().to_string_lossy().into_owned();
-            let into_bundle = std::fs::read_link(e.path()).is_ok_and(|t| t.starts_with(&bundles));
-            if name.ends_with(".safetensors") && !into_bundle {
-                let _ = std::fs::remove_file(e.path());
-            }
-        }
-    }
     std::fs::create_dir_all(&dir).map_err(|source| RuntimeError::Io {
         path: dir.clone(),
         source,
@@ -101,10 +87,11 @@ pub fn build(
         source,
     })?;
     let mut names: Vec<String> = Vec::new();
+    let mut sources = Vec::new();
     for e in rd.flatten() {
         let name = e.file_name().to_string_lossy().into_owned();
         if name.ends_with(".safetensors") {
-            link(&e.path(), &dir.join(&name))?;
+            sources.push(e.path());
             names.push(name);
             shards += 1;
         }
@@ -122,6 +109,25 @@ pub fn build(
             snapshot.display(),
             bundle.checkpoint.shards
         )));
+    }
+
+    // Checked first, so a refused snapshot leaves the farm as it was.
+    // The farm is not emptied: other bundles on this checkpoint keep their derived
+    // sidecars here. But a base shard from another snapshot (an operator's
+    // `--checkpoint` that changed) would load beside the new ones, so every
+    // shard link that does not point into a bundle goes before relinking.
+    let bundles = store_root.join("bundles");
+    if let Ok(rd) = std::fs::read_dir(&dir) {
+        for e in rd.flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            let into_bundle = std::fs::read_link(e.path()).is_ok_and(|t| t.starts_with(&bundles));
+            if name.ends_with(".safetensors") && !into_bundle {
+                let _ = std::fs::remove_file(e.path());
+            }
+        }
+    }
+    for (src, name) in sources.iter().zip(&names) {
+        link(src, &dir.join(name))?;
     }
 
     for f in SIDECAR_FILES {

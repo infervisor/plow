@@ -588,7 +588,12 @@ fn next_generation(
         });
         let measure_kept = to
             .tok_s
-            .is_none_or(|t| v.measured.as_ref().is_some_and(|m| m.tok_s == t));
+            .is_none_or(|t| v.measured.as_ref().is_some_and(|m| m.tok_s == t))
+            && to.concurrency.is_none_or(|c| {
+                v.measured
+                    .as_ref()
+                    .is_some_and(|m| m.concurrency == Some(c))
+            });
         if same_build(&published, &bundle) && status_kept && measure_kept {
             println!(
                 "already published: {}/{}:{}@g{} is this build",

@@ -243,9 +243,16 @@ pub fn fetch(store_root: &Path, source: &str, revision: &str, shards: u32) -> Re
     if let Some(parent) = dir.parent() {
         std::fs::create_dir_all(parent).map_err(io(parent))?;
     }
-    if std::fs::rename(&staging, &dir).is_err() && dir.is_dir() {
-        // Another pull linked the same content first.
+    // An incomplete snapshot is what this download repairs: it goes.
+    if dir.is_dir() && count_shards(&dir) < shards as usize {
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    if let Err(e) = std::fs::rename(&staging, &dir) {
         let _ = std::fs::remove_dir_all(&staging);
+        // Another pull completed the same snapshot first; anything else failed.
+        if !(dir.is_dir() && count_shards(&dir) >= shards as usize) {
+            return Err(io(&dir)(e));
+        }
     }
     Ok(dir)
 }
