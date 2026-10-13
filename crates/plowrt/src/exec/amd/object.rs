@@ -406,6 +406,8 @@ pub(super) const PREFILL_ARM_MARKERS: &[(&str, &[&str])] = &[
     // W8A8 grouped MoE prefill (ops 85/86 i[7] >= 2), a build axis the packet's plow_config.h
     // turns on. Without it the shipped body reads fp8 rows as bf16 (or i[7] as part16). Refuse.
     ("PLOW_MOE_PF_W8A8", &["plow_moe_pf_w8a8_arm"]),
+    // i[7] >= 4: the two-term SPLIT arm. An object predating it runs i[7] = 4 as W8A16 on fp8 rows.
+    ("PLOW_MOE_PF_W8A8_SPLIT", &["plow_moe_pf_w8a8_split_arm"]),
     // DSA indexer prep (HeadNormRope pair_mode 3). An object without the arm runs it as the plain
     // rope on the un-normed key: no trap. A BUILD axis (`#if PLOW_DSA_PREP`).
     ("PLOW_DSA_PREP", &["plow_dsa_prep_arm"]),
@@ -1184,6 +1186,9 @@ pub(super) fn packet_prefill_arm_requirements<'a>(
     }
     if insts().any(|inst| inst.op == DevOp::MoeGroupGluPf as u16 && inst.i[7] != 0 && !w8a8(inst)) {
         requires.push("PLOW_MOE_PF_A8=1".to_owned());
+    }
+    if insts().any(|inst| w8a8(inst) && inst.i[7] >= 4) {
+        requires.push("PLOW_MOE_PF_W8A8_SPLIT=1".to_owned());
     }
     if insts().any(|inst| w8a8(inst)) {
         requires.push("PLOW_MOE_PF_W8A8=1".to_owned());

@@ -1283,6 +1283,12 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_MOE_PF_W8A8", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub moe_pf_w8a8: bool,
 
+    /// Two-term FP8 activations for `PLOW_MOE_PF_W8A8` (ops 85/86 i[7]=4/5): x ~= s*(hi + lo/16),
+    /// split in the GLU's staging from the bf16 rows (no QuantFp8Block128), the GLU output stored as
+    /// [hi | lo] rows for DOWN. ~bf16 activation precision at fp8 MFMA rate. Requires PLOW_MOE_PF_W8A8.
+    #[arg(long, env = "PLOW_MOE_PF_W8A8_SPLIT", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub moe_pf_w8a8_split: bool,
+
     /// Build the lean gfx950 MoE stage-1 A4-reuse object with the K256 register-B body
     /// (`-DPLOW_MOE1_BODY=1`, bit-identical output). Opt-in; packets are unchanged, the
     /// manifest config header carries the object request.
@@ -1784,6 +1790,7 @@ impl EmitConfig {
             attnres_f32mix: env_opt_out("PLOW_ATTNRES_F32MIX"),
             moe_pf_det: env_bool("PLOW_MOE_PF_DET"),
             moe_pf_w8a8: env_bool("PLOW_MOE_PF_W8A8"),
+            moe_pf_w8a8_split: env_bool("PLOW_MOE_PF_W8A8_SPLIT"),
             moe_stage1_body: env_bool("PLOW_MOE_STAGE1_BODY"),
             moe_stage2_body: env_bool("PLOW_MOE_STAGE2_BODY"),
             no_glu_fuse: env_bool("PLOW_NO_GLU_FUSE"),
