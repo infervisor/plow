@@ -455,6 +455,12 @@ struct Shapes {
     /// Any `GemvF32` with `i[4] == 2` — the mix split over workgroups (PLOW_GLM_HC_MIX_SPLIT).
     /// A pre-arm object runs the unsplit mix on the narrowed grid and never the pre. Refuse.
     glm_hc_mix_split: bool,
+    /// Any `GemvF32` with `i[4] == 3` — the batched decode post + mix + pre fold
+    /// (PLOW_GLM_HC_FUSE_DEC). A pre-arm object never runs the pre. Refuse.
+    glm_hc_fuse_dec: bool,
+    /// Any `GemmSmall` with `i[7] >= 3` — grouped projections (PLOW_GLM_KDA_PROJ_GROUP). An
+    /// object without the arm runs segment 0 only. Refuse.
+    gemm_small_group: bool,
     /// Any `GemmSmall` with `i[6] > 1` — decode split-K (PLOW_GLM_DEC_SPLITK). A BUILD axis
     /// (`#if PLOW_GEMM_SMALL_SPLITK`); an object without it runs the unsplit tile (correct).
     gemm_small_splitk: bool,
@@ -672,10 +678,15 @@ fn shapes(m: &Model) -> Shapes {
                 DevOp::AddNorm if inst.i[2] == 1 => s.glm_fuse_seam_rn = true,
                 DevOp::HyperConnPre if inst.i[4] == 1 => s.glm_hc_norm_fold = true,
                 DevOp::GemmSmall if inst.i[6] > 1 => s.gemm_small_splitk = true,
+                DevOp::GemmSmall if inst.i[7] >= 3 => {
+                    s.gemm_small_splitk = true;
+                    s.gemm_small_group = true;
+                }
                 DevOp::GemvF32 if inst.i[3] == 1 || inst.i[4] != 0 => {
                     s.glm_hc_post_fold |= inst.i[3] == 1;
                     s.glm_hc_pre_tail |= inst.i[4] != 0;
                     s.glm_hc_mix_split |= inst.i[4] == 2;
+                    s.glm_hc_fuse_dec |= inst.i[4] == 3;
                 }
                 DevOp::Gemm | DevOp::GemmMed | DevOp::GemmSmall | DevOp::Gemv => {
                     if op == DevOp::GemmMed && inst.t[5] != packet::TENSOR_NONE {
@@ -1060,6 +1071,12 @@ fn encoding_features(f: &mut Map<String, Value>, s: &Shapes) {
     }
     if s.glm_hc_mix_split {
         f.insert("glm_hc_mix_split".into(), json!(true));
+    }
+    if s.glm_hc_fuse_dec {
+        f.insert("glm_hc_fuse_dec".into(), json!(true));
+    }
+    if s.gemm_small_group {
+        f.insert("gemm_small_group".into(), json!(true));
     }
     if s.gemm_small_splitk {
         f.insert("gemm_small_splitk".into(), json!(true));
@@ -1801,6 +1818,12 @@ fn backend_amd(
     }
     if on("glm_hc_mix_split") {
         req.push("PLOW_GLM_HC_MIX_SPLIT=1".into());
+    }
+    if on("glm_hc_fuse_dec") {
+        req.push("PLOW_GLM_HC_FUSE_DEC=1".into());
+    }
+    if on("gemm_small_group") {
+        req.push("PLOW_GLM_KDA_PROJ_GROUP=1".into());
     }
     if on("glm_fuse_seam_rn") {
         req.push("PLOW_GLM_FUSE_SEAM_RN=1".into());

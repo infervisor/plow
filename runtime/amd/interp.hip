@@ -2532,8 +2532,79 @@ __device__ __forceinline__ void exec_flash_mla_prefill(CInst in, CTens T, unsign
  * degrades to flat and the call frames spill. The register pressure it was papering
  * over had two real causes (a runtime bucket switch in d_gemv, and the d_gemm_cfg
  * tile switch), both of which are now compile-time. */
+#if PLOW_GEMM_SMALL_SPLITK
+/* PLOW_GLM_KDA_PROJ_GROUP: several decode GemmSmall projections as ONE partials packet (i7 = 3)
+ * and ONE reduce packet (i7 = 4) instead of a partials + reduce pair each, which the all-workgroup
+ * packets ran one after another. t7 = u32 descriptor [nseg, {C, A, B, N, K, S, part} x nseg]
+ * (tensor handles; i0 = M). A segment's items run d_gemm_small_splitk_part's tile body over its
+ * K slices (S = 1: d_gemm_small's tile straight into C) and its elements d_gemm_small_splitk_reduce,
+ * so every output is bit-identical to the per-projection packets. */
+extern "C" __device__ unsigned plow_gemm_small_group_arm = 1;
+#define PLOW_GSG_W 7u
+__device__ __forceinline__ void exec_gemm_small_group(CInst in, CTens T, unsigned slice,
+                                                                unsigned nblk, bf16* lds) {
+    constexpr int BM = GM_SM_BM, BN = GM_SM_BN, BK = GM_SM_BK;
+    const unsigned* d = (const unsigned*)T[in->t[7]];
+    const unsigned nseg = d[0], M = in->i[0];
+    if (nseg == 0u || nseg > 8u) __builtin_trap();
+    if (in->i[7] == 4u) {
+        for (unsigned g = 0; g < nseg; g++) {
+            const unsigned* e = d + 1u + PLOW_GSG_W * g;
+            if (e[5] > 1u)
+                d_gemm_small_splitk_reduce((bf16*)T[e[0]], (const float*)T[e[6]], M, e[3], e[5],
+                                           slice, nblk);
+        }
+        return;
+    }
+    unsigned total = 0;
+    for (unsigned g = 0; g < nseg; g++) {
+        const unsigned* e = d + 1u + PLOW_GSG_W * g;
+        total += ((M + BM - 1) / BM) * ((e[3] + BN - 1) / BN) * e[5];
+    }
+    for (unsigned it = slice; it < total; it += nblk) {
+        unsigned g = 0, b0 = 0, nt = 0;
+        for (; g < nseg; g++) {
+            const unsigned* e = d + 1u + PLOW_GSG_W * g;
+            nt = ((M + BM - 1) / BM) * ((e[3] + BN - 1) / BN);
+            if (it < b0 + nt * e[5]) break;
+            b0 += nt * e[5];
+        }
+        const unsigned* e = d + 1u + PLOW_GSG_W * g;
+        const unsigned N = e[3], K = e[4], S = e[5], local = it - b0;
+        const bf16* A = (const bf16*)T[e[1]];
+        const bf16* B = (const bf16*)T[e[2]];
+        if (S == 1u) {
+            d_gemm_t<BM, BN, BK, GM_WM, GM_WN, false>((bf16*)T[e[0]], A, B, nullptr, nullptr, M, N,
+                                                      K, local, nt, lds);
+        } else {
+            const unsigned ks = K / S, t = local / S, s = local % S;
+            if (S > 16u || ks * S != K || ks % BK != 0u) __builtin_trap();
+            float* part = (float*)T[e[6]];
+            d_gemm_t<BM, BN, BK, GM_WM, GM_WN, false, GM_SWZ, GM_WGM, (GM_PP != 0), true, false,
+                     false, false, true
+#if PLOW_GLM_FUSE_POST
+                     , false
+#endif
+                     , true>((bf16*)(part + (size_t)s * M * N), A + (size_t)s * ks,
+                             B + (size_t)s * ks, nullptr, nullptr, M, N, ks, t, nt, lds, nullptr, 0,
+                             nullptr, nullptr, nullptr
+#if PLOW_GLM_FUSE_POST
+                             , nullptr, nullptr, nullptr, 0
+#endif
+                             , K);
+        }
+        __syncthreads();
+    }
+}
+#endif
 __device__ __forceinline__ void exec_gemm_small(CInst in, CTens T,
                                                unsigned slice, unsigned nblk, bf16* lds) {
+#if PLOW_GEMM_SMALL_SPLITK
+    if (in->i[7] >= 3u) {
+        exec_gemm_small_group(in, T, slice, nblk, lds);
+        return;
+    }
+#endif
 #define TEN(k) (in->t[k] == PLOW_TENSOR_NONE ? nullptr : T[in->t[k]])
 #if PLOW_DSA_PREP_ARM
     if (in->t[4] != PLOW_TENSOR_NONE) { /* dual form: t3 = C1, t4 = B1, i3 = N1 (dsa_prep.h) */
@@ -3302,6 +3373,109 @@ __device__ __forceinline__ void exec_hc_pre_tail(CInst in, CTens T, unsigned nbl
     d_hyperconn_pre(post, comb, lin, mixes, res, hsc, hbs, 1u, 4u, hidden, sink, eps, hceps, 0u,
                     1u, sm->part);
 }
+
+/* PLOW_GLM_HC_FUSE_DEC (GemvF32 i3 = 1, i4 = 3; batched decode): HyperConnPost + mix + the
+ * HyperConnPre (and its folded RmsNorm) in one packet. i5 = 0: d_gemv_f32_wg_hcpost, a workgroup
+ * per output (rows * 24 <= workgroups), 24 arrivals per row; i5 = R: d_gemv_f32_hcpost_rows, a
+ * workgroup per (R rows, 8 outputs), 3 arrivals per row group. The descriptor counter is an array
+ * (one u32 per row group, loader-zeroed, never reset: `old % arrivals`); the last arrival runs the
+ * HyperConnPre case body for each of its rows, one row per call as the separate packet ran it
+ * (a workgroup per row), so every output is bit-identical. */
+extern "C" __device__ unsigned plow_glm_hc_fuse_dec_arm = 1;
+__device__ __forceinline__ void hc_fuse_tail(CInst in, CTens T, unsigned group, unsigned rows,
+                                             unsigned arrivals, unsigned row0, unsigned nrows,
+                                             plow_smem* sm, const PlowProgram* prog_meta) {
+    const unsigned* desc = (const unsigned*)T[in->t[7]];
+    __shared__ unsigned hcf_last;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        const unsigned old = __hip_atomic_fetch_add((unsigned*)T[desc[PLOW_HCT_CTR]] + group, 1u,
+                                                    __ATOMIC_ACQ_REL, __HIP_MEMORY_SCOPE_AGENT);
+        hcf_last = (old % arrivals) == arrivals - 1u;
+    }
+    __syncthreads();
+    if (!hcf_last) return;
+    asm volatile("buffer_inv" ::: "memory");
+    __syncthreads();
+    const unsigned hidden = desc[PLOW_HCT_HIDDEN], sink = desc[PLOW_HCT_SINK];
+    const float eps = __uint_as_float(desc[PLOW_HCT_EPS]);
+    const float hceps = __uint_as_float(desc[PLOW_HCT_HCEPS]);
+    for (unsigned m = row0; m < row0 + nrows && m < rows; m++) {
+        d_hyperconn_pre_rows((float*)T[desc[PLOW_HCT_POST]] + (size_t)m * 4u,
+                             (float*)T[desc[PLOW_HCT_COMB]] + (size_t)m * 16u,
+                             (bf16*)T[desc[PLOW_HCT_LIN]] + (size_t)m * hidden,
+                             (const float*)T[in->t[0]] + (size_t)m * 24u,
+                             (const bf16*)T[in->t[1]] + (size_t)m * 4u * hidden,
+                             (const float*)T[desc[PLOW_HCT_SCALE]],
+                             (const float*)T[desc[PLOW_HCT_BASE]], 1u, hidden, sink, eps, hceps,
+                             0u, 1u);
+        if (desc[PLOW_HCT_NORM] == 1u) {
+            __syncthreads();
+            asm volatile("buffer_inv" ::: "memory");
+            __syncthreads();
+            d_rmsnorm((bf16*)T[desc[PLOW_HCT_NOUT]] + (size_t)m * hidden,
+                      (const bf16*)T[desc[PLOW_HCT_LIN]] + (size_t)m * hidden,
+                      (const bf16*)T[desc[PLOW_HCT_GAMMA]], 1u, hidden, eps, 0u, 0u, 1u,
+                      sm->part, nullptr, nullptr
+#if PLOW_PACKED_PREFILL_MLA_NORM_CONSUMERS || PLOW_PACKED_PREFILL_DENSE_CONSUMERS
+                      , prog_meta, 0u
+#endif
+                      );
+        }
+        __syncthreads();
+    }
+}
+#define HCF_TEN(k) (in->t[k] == PLOW_TENSOR_NONE ? nullptr : T[in->t[k]])
+__device__ __attribute__((noinline)) void exec_hc_fuse_dec(CInst in, CTens T, unsigned slice,
+                                                          unsigned nblk, plow_smem* sm, const PlowProgram* prog_meta) {
+    const unsigned M = in->i[0], N = in->i[1], K = in->i[2], R = in->i[5];
+    const unsigned* desc = (const unsigned*)T[in->t[7]];
+#if !PLOW_HC_SINKHORN_RCP
+    const bool shape_ok = N == 24u && K % (8u * PLOW_WAVE) == 0u &&
+                          desc[PLOW_HCT_HIDDEN] * 4u == K && K % (8u * PLOW_THREADS) == 0u;
+#else
+    const bool shape_ok = false;
+#endif
+    if (!shape_ok || !HCF_TEN(3) || !HCF_TEN(4) || !HCF_TEN(5) || !HCF_TEN(6) || PLOW_WAVES * 3u != N)
+        __builtin_trap();
+    if (R == 0u) {
+        if ((size_t)K / 8u * sizeof(float) > sizeof(sm->raw) || (size_t)M * N > nblk)
+            __builtin_trap();
+        if (slice >= M * N) return;
+        d_gemv_f32_wg_hcpost((float*)HCF_TEN(0), (bf16*)HCF_TEN(1), (const float*)HCF_TEN(2),
+                             (const bf16*)HCF_TEN(3), (const bf16*)HCF_TEN(4), (const float*)HCF_TEN(5),
+                             (const float*)HCF_TEN(6), M, N, K, slice, M * N, (float*)sm->raw);
+        hc_fuse_tail(in, T, slice / N, M, N, slice / N, 1u, sm, prog_meta);
+        return;
+    }
+    if ((size_t)R * K * sizeof(bf16) > sizeof(sm->raw)) __builtin_trap();
+    const unsigned units = (M + R - 1u) / R * 3u;
+    for (unsigned unit = slice; unit < units; unit += nblk) {
+        switch (R) {
+            case 1u:
+                d_gemv_f32_hcpost_rows<1>((float*)HCF_TEN(0), (bf16*)HCF_TEN(1), (const float*)HCF_TEN(2),
+                                          (const bf16*)HCF_TEN(3), (const bf16*)HCF_TEN(4),
+                                          (const float*)HCF_TEN(5), (const float*)HCF_TEN(6), M, K, unit,
+                                          sm->raw);
+                break;
+            case 2u:
+                d_gemv_f32_hcpost_rows<2>((float*)HCF_TEN(0), (bf16*)HCF_TEN(1), (const float*)HCF_TEN(2),
+                                          (const bf16*)HCF_TEN(3), (const bf16*)HCF_TEN(4),
+                                          (const float*)HCF_TEN(5), (const float*)HCF_TEN(6), M, K, unit,
+                                          sm->raw);
+                break;
+            case 4u:
+                d_gemv_f32_hcpost_rows<4>((float*)HCF_TEN(0), (bf16*)HCF_TEN(1), (const float*)HCF_TEN(2),
+                                          (const bf16*)HCF_TEN(3), (const bf16*)HCF_TEN(4),
+                                          (const float*)HCF_TEN(5), (const float*)HCF_TEN(6), M, K, unit,
+                                          sm->raw);
+                break;
+            default: __builtin_trap();
+        }
+        hc_fuse_tail(in, T, unit / 3u, M, 3u, unit / 3u * R, R, sm, prog_meta);
+    }
+}
+#undef HCF_TEN
 #endif
 
 /* gfx950 K3 decode objects inline `plow_exec` into the dispatch loop. As a call, its prologue
@@ -4362,6 +4536,10 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
             /* PLOW_GLM_HC_POST_FOLD (i3 = 1): the preceding HyperConnPost folded in. t1 is its
              * new_residual (written here), t3 = x_out, t4 = residual, t5 = post_mix,
              * t6 = comb_mix. See d_gemv_f32_wg_hcpost. */
+            if (in->i[3] == 1u && in->i[4] == 3u) {
+                exec_hc_fuse_dec(in, T, slice, nblk, sm, prog_meta);
+                break;
+            }
             if (in->i[3] == 1u) {
                 if (in->i[2] % (8u * PLOW_WAVE) != 0u || in->i[2] % 4u != 0u ||
                     (size_t)in->i[2] / 8u * sizeof(float) > sizeof(sm->raw) ||

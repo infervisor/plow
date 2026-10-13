@@ -1030,6 +1030,28 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_GLM_HC_MIX_SPLIT")]
     pub glm_hc_mix_split: Option<u32>,
 
+    /// GLM-5.3-Flash batched decode (rows > 1): HyperConnPost + mHC mix GemvF32 + HyperConnPre
+    /// (+ its folded RmsNorm) in one packet; the pre runs per row group on the mix's
+    /// last-arriving workgroup. Two packets less per sublayer. Bit-identical.
+    #[arg(long, env = "PLOW_GLM_HC_FUSE_DEC", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub glm_hc_fuse_dec: bool,
+
+    /// GLM-5.3-Flash batched decode: a KDA layer's eight split-K GemmSmall projections as two
+    /// grouped packet pairs (q/k/v/g_a/f_a/b from x, then g_b/f_b) instead of eight pairs that
+    /// the all-workgroup packets ran back to back. Same split per projection: bit-identical.
+    #[arg(long, env = "PLOW_GLM_KDA_PROJ_GROUP", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub glm_kda_proj_group: bool,
+
+    /// GLM-5.3-Flash one-row decode: with PLOW_GLM_HC_FUSE_DEC, the folded mHC mix + pre tail runs
+    /// on its 24 output workgroups only (one counter per row) instead of the whole grid. Bit-identical.
+    #[arg(long, env = "PLOW_GLM_HC_FUSE_R1", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub glm_hc_fuse_r1: bool,
+
+    /// PLOW_GLM_KDA_PROJ_GROUP split override: every grouped projection splits K by the largest
+    /// power of two <= this (fewer fp32 partials than the per-projection split-K). NOT bit-identical.
+    #[arg(long, env = "PLOW_GLM_KDA_PROJ_GROUP_S")]
+    pub glm_kda_proj_group_s: Option<u32>,
+
 
     /// GLM-5.3-Flash batched decode (rows > 1): largest split-K factor for the bf16 GemmSmall
     /// projections whose 64x128 tiles leave most workgroups idle (0 = off). NOT bit-identical.
@@ -1781,6 +1803,10 @@ impl EmitConfig {
             glm53_sp_router: env_bool("PLOW_GLM53_SP_ROUTER"),
             glm53_sp_kda_norm: env_bool("PLOW_GLM53_SP_KDA_NORM"),
             glm_hc_mix_split: env_u32("PLOW_GLM_HC_MIX_SPLIT"),
+            glm_hc_fuse_dec: env_bool("PLOW_GLM_HC_FUSE_DEC"),
+            glm_kda_proj_group: env_bool("PLOW_GLM_KDA_PROJ_GROUP"),
+            glm_hc_fuse_r1: env_bool("PLOW_GLM_HC_FUSE_R1"),
+            glm_kda_proj_group_s: env_u32("PLOW_GLM_KDA_PROJ_GROUP_S"),
             glm_dec_splitk: env_u32("PLOW_GLM_DEC_SPLITK"),
             glm_dec_splitk_max_rows: env_u32("PLOW_GLM_DEC_SPLITK_MAX_ROWS"),
             glm_dec_splitk_2p: env_bool("PLOW_GLM_DEC_SPLITK_2P"),

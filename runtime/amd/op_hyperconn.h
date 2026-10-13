@@ -675,4 +675,73 @@ __device__ void hc_mix_split_reduce(float* __restrict__ C, const float* __restri
     }
 }
 
+/* PLOW_GLM_HC_FUSE_DEC, batched decode rows (GemvF32 i3 = 1, i4 = 3, i5 = R): the post-folded
+ * mix with one workgroup per unit = (R rows, 8 outputs). The R rows' new residual (hc_post4_8) is
+ * formed once into LDS `xs` (R * K halves) and each wave walks one output's K steps for the R rows
+ * with W loaded once. Each output keeps d_gemv_f32_wg's lane-to-k map, term expression and
+ * step-order adds before the same wave_sum: mixes and new_residual are bit-identical. */
+template <unsigned R>
+__device__ void d_gemv_f32_hcpost_rows(float* __restrict__ C, bf16* __restrict__ new_residual,
+                                       const float* __restrict__ W,
+                                       const bf16* __restrict__ x_out,
+                                       const bf16* __restrict__ residual,
+                                       const float* __restrict__ post_mix,
+                                       const float* __restrict__ comb_mix, unsigned M,
+                                       unsigned K, unsigned unit, bf16* __restrict__ xs) {
+#pragma clang fp contract(off)
+    const unsigned wave = threadIdx.x / PLOW_WAVE;
+    const unsigned lane = threadIdx.x % PLOW_WAVE;
+    const unsigned steps = K / (PLOW_WAVE * 8u), hidden = K / 4u;
+    const unsigned m0 = (unit / 3u) * R, og = unit % 3u;
+#pragma unroll
+    for (unsigned r = 0; r < R; r++) {
+        const unsigned m = m0 + r;
+        if (m >= M) break;
+        const bf16* const rrow = residual + (size_t)m * K;
+        const bf16* const xrow = x_out + (size_t)m * hidden;
+        float c[16], p[4];
+#pragma unroll
+        for (unsigned k = 0; k < 16; k++) c[k] = comb_mix[(size_t)m * 16u + k];
+#pragma unroll
+        for (unsigned k = 0; k < 4; k++) p[k] = post_mix[(size_t)m * 4u + k];
+        for (unsigned d = threadIdx.x * 8u; d < hidden; d += PLOW_THREADS * 8u) {
+            bf16v8 rv[4];
+#pragma unroll
+            for (unsigned i = 0; i < 4; i++) rv[i] = ld_glob8(rrow + (size_t)i * hidden + d);
+            const bf16v8 xo = ld_glob8(xrow + d);
+#pragma unroll
+            for (unsigned j = 0; j < 4; j++) {
+                const bf16v8 xv = hc_post4_8(c, p, j, rv, xo);
+                *(bf16v8*)(xs + (size_t)r * K + (size_t)j * hidden + d) = xv;
+                if (og == 0u) st_glob8(new_residual + (size_t)m * K + (size_t)j * hidden + d, xv);
+            }
+        }
+    }
+    __syncthreads();
+    const unsigned n = og * PLOW_WAVES + wave;
+    const float* const wn = W + (size_t)n * K;
+    float acc[R];
+#pragma unroll
+    for (unsigned r = 0; r < R; r++) acc[r] = 0.0f;
+#pragma unroll 4
+    for (unsigned s = 0; s < steps; s++) {
+        const unsigned k = s * (PLOW_WAVE * 8u) + lane * 8u;
+        const float4 w0 = *(const float4*)(wn + k);
+        const float4 w1 = *(const float4*)(wn + k + 4);
+#pragma unroll
+        for (unsigned r = 0; r < R; r++) {
+            const bf16v8 xv = ld_lds8(xs + (size_t)r * K + k);
+            acc[r] += bf2f(xv[0]) * w0.x + bf2f(xv[1]) * w0.y + bf2f(xv[2]) * w0.z +
+                      bf2f(xv[3]) * w0.w + bf2f(xv[4]) * w1.x + bf2f(xv[5]) * w1.y +
+                      bf2f(xv[6]) * w1.z + bf2f(xv[7]) * w1.w;
+        }
+    }
+#pragma unroll
+    for (unsigned r = 0; r < R; r++) {
+        const float t = wave_sum(acc[r]);
+        if (lane == 0 && m0 + r < M) C[(size_t)(m0 + r) * 24u + n] = t;
+    }
+    __syncthreads(); /* xs is rewritten by the workgroup's next unit */
+}
+
 #endif /* PLOW_OP_HYPERCONN_H */

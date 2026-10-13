@@ -760,9 +760,35 @@ fn emit_glm53_hc_pre(
                 && steps % sp == 0
                 && rows * 24 * sp <= b.n_cu()
         });
-    let tail = (band.is_none() && rows == 1 && emit_config::active().glm_hc_pre_tail).then(|| {
+    // PLOW_GLM_HC_FUSE_DEC (batched decode, post folded): the pre runs per row group on the
+    // mix's last-arriving workgroup. fuse_r = 0: a workgroup per output (rows * 24 <= CUs);
+    // R > 0: a workgroup per (R rows, 8 outputs) with ceil(rows / R) * 3 <= CUs.
+    // PLOW_GLM_HC_FUSE_R1: the one-row program takes the same arm (24 workgroups, the 232 idle
+    // ones no longer bump the tail counter) instead of the pre tail on the whole grid.
+    let fuse_r = (band.is_none()
+        && (rows > 1 || emit_config::active().glm_hc_fuse_r1)
+        && post_fold.is_some()
+        && emit_config::active().glm_hc_fuse_dec
+        && c.hidden % 512 == 0)
+        .then(|| {
+            if rows * 24 <= b.n_cu() {
+                Some(0)
+            } else {
+                [1u32, 2, 4].into_iter().find(|&r| rows.div_ceil(r) * 3 <= b.n_cu())
+            }
+        })
+        .flatten();
+    let tail = (band.is_none()
+        && ((rows == 1 && emit_config::active().glm_hc_pre_tail) || fuse_r.is_some()))
+    .then(|| {
         let side = if ffn { "ffn" } else { "attn" };
-        let ctr = b.tensor(&format!("act.hc_pre_tail.{layer}.{side}.ctr"), 4);
+        let ctr = match fuse_r {
+            None => b.tensor(&format!("act.hc_pre_tail.{layer}.{side}.ctr"), 4),
+            Some(r) => b.tensor(
+                &format!("act.hc_fuse.{rows}.{layer}.{side}.ctr"),
+                u64::from(rows.div_ceil(r.max(1))) * 4,
+            ),
+        };
         let (fold, nout, gamma) = norm_fold.map_or((0, 0, 0), |(o, g)| (1, o, g));
         let words = [
             post_mix,
@@ -786,12 +812,18 @@ fn emit_glm53_hc_pre(
             words.extend([part, sp]);
         }
         let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
-        b.tensor_init(&format!("act.hc_pre_tail.{layer}.{side}.desc"), bytes)
+        let name = match fuse_r {
+            None => format!("act.hc_pre_tail.{layer}.{side}.desc"),
+            Some(_) => format!("act.hc_fuse.{rows}.{layer}.{side}.desc"),
+        };
+        b.tensor_init(&name, bytes)
     });
     // PLOW_GLM_HC_MIX_SPLIT=S: a folded mix packet runs on the workgroups that own an output
     // (rows * 24) instead of the whole grid; with the one-row pre tail each output's K steps are
     // also split over S workgroups (i4 = 2) and reduced in step order by the last one.
     let cus = match (split, tail, post_fold) {
+        _ if fuse_r == Some(0) => (0..rows * 24).collect(),
+        _ if fuse_r.is_some() => (0..rows.div_ceil(fuse_r.unwrap_or(1)) * 3).collect(),
         (Some(sp), Some(_), Some(_)) => (0..24 * sp).collect(),
         (Some(_), None, Some(_)) => (0..rows * 24).collect(),
         _ => b.all(),
@@ -814,6 +846,10 @@ fn emit_glm53_hc_pre(
         }
         if let Some(desc) = tail {
             d.i[4] = if split.is_some() && post_fold.is_some() { 2 } else { 1 };
+            if let Some(r) = fuse_r {
+                d.i[4] = 3;
+                d.i[5] = r;
+            }
             d.t[7] = desc;
         }
     });
@@ -988,7 +1024,7 @@ fn emit_glm53_program(
     let post_fold_on = !prefill
         && bv.is_none()
         && emit_config::active().glm_hc_post_fold
-        && rows * 24 <= b.n_cu();
+        && (rows * 24 <= b.n_cu() || (rows > 1 && emit_config::active().glm_hc_fuse_dec));
     let mut pending_post: Option<(u32, u32)> = None;
     let xr_hcpost = !prefill && bv.is_none() && c.tp > 1 && emit_config::active().glm_xr_hcpost;
     for l in 0..c.layers as usize {
@@ -1416,6 +1452,7 @@ pub(crate) fn glm53_emit_full(
             b.set_gemm_small_splitk(ec.glm_dec_splitk.unwrap_or(0));
             b.set_gemm_small_splitk_2p(ec.glm_dec_splitk_2p);
         }
+        b.set_gemm_small_group_s(ec.glm_kda_proj_group_s.unwrap_or(0));
         emit_glm53_program(&mut b, &c, &n, &s, ctx, rows, dbatch, enc, false);
         let prog = b.finish();
         tensors = prog.tensors.clone();
@@ -10886,9 +10923,24 @@ fn emit_glm_moe_ffn_rows(
                 },
             )
         };
-        let [c_g, c_u] = match pre_gu {
-            Some(pre) => pre,
-            None => [
+        // PLOW_GLM_KDA_PROJ_GROUP: the shared gate/up GemmSmall pair as one grouped packet pair.
+        let group = (pre_gu.is_none()
+            && emit_config::active().glm_kda_proj_group
+            && enc != MoeEnc::Mxfp4
+            && !glm_decode_lt_routes(rows, [imoe_l, h])
+            && glm_decode_gemm_tile(rows, imoe_l, h, b.n_cu()) == Some(DevOp::GemmSmall))
+        .then(|| {
+            b.emit_gemm_small_group(
+                rows,
+                &[(n.shfu, n.xn2, w.shg, imoe_l, h), (n.shfu_up, n.xn2, w.shu, imoe_l, h)],
+                &[c_rn2],
+            )
+        })
+        .flatten();
+        let [c_g, c_u] = match (pre_gu, group) {
+            (Some(pre), _) => pre,
+            (None, Some(g)) => [g, g],
+            (None, None) => [
                 gemv_half(b, n.shfu, w.shg, w.shg_s),
                 gemv_half(b, n.shfu_up, w.shu, w.shu_s),
             ],
