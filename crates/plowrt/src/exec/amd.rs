@@ -1621,6 +1621,10 @@ fn rebase_kda_key_factor_routes(routes: &mut [PrefillSegmentRoute], t: u32) {
             PrefillSegmentRoute::KdaChunkCarryRegstate { args, .. } => args.t = t,
             PrefillSegmentRoute::KdaChunkWuLean { args, .. } => args.t = t,
             PrefillSegmentRoute::KdaChunkCarryKeyfeed { args, .. } => args.t = t,
+            // The intra objects anchor each diagonal block's gate at a row inside the chunk's
+            // valid rows; at the bucket width a ragged last chunk anchors on stale rows.
+            PrefillSegmentRoute::KdaChunkIntraCached { args, .. } => args.t = t,
+            PrefillSegmentRoute::KdaChunkIntraWaveItems { args, .. } => args.t = t,
             _ => {}
         }
     }
@@ -12595,9 +12599,13 @@ impl AmdEngine {
                 self.seg_launches += 1;
                 return Ok(());
             }
+            // Like the regstate carry, the intra objects cover `t >= 512` only (the kernels
+            // return early below it); a shorter chunk stays on the interpreter.
             if let (Some(kernel), Some(PrefillSegmentRoute::KdaChunkIntraCached { args, grid })) = (
                 self.k_kda_chunk_intra_cached,
-                self.progs[p].prefill_routes.get(seg).copied(),
+                self.progs[p].prefill_routes.get(seg).copied().filter(|r| {
+                    matches!(r, PrefillSegmentRoute::KdaChunkIntraCached { args, .. } if args.t >= 512)
+                }),
             ) {
                 EngineDevice::launch_kernel(
                     &*self.be,
@@ -12612,7 +12620,9 @@ impl AmdEngine {
                 return Ok(());
             }
             if let Some(PrefillSegmentRoute::KdaChunkIntraWaveItems { args, grid }) =
-                self.progs[p].prefill_routes.get(seg).copied()
+                self.progs[p].prefill_routes.get(seg).copied().filter(|r| {
+                    matches!(r, PrefillSegmentRoute::KdaChunkIntraWaveItems { args, .. } if args.t >= 512)
+                })
             {
                 let kernel = self.k_kda_chunk_intra_wave_items.ok_or_else(|| {
                     RuntimeError::Device(

@@ -2225,6 +2225,11 @@ fn cached_kda_intra_route_requires_a_pure_bt64_d128_segment() {
         routes[1],
         PrefillSegmentRoute::KdaChunkIntraWaveItems { grid: 256, .. }
     ));
+    rebase_kda_key_factor_routes(&mut routes, 600);
+    assert!(matches!(
+        routes[1],
+        PrefillSegmentRoute::KdaChunkIntraWaveItems { args, .. } if args.t == 600
+    ));
 
     prog.insts[1].i[2] = 64;
     let fallback = moe_mxfp4_routes(&prog, &tensors, &devp).unwrap();
