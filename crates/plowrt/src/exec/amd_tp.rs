@@ -1472,10 +1472,7 @@ impl AmdTpGroup {
     /// one at the same point in the token stream — a rank that skipped it would resume from a
     /// state one prefix behind its peers and the group would disagree from the first token.
     pub fn snapshot_carried(&mut self, slot: usize, rows: u32) -> Result<()> {
-        for e in &mut self.ranks {
-            e.snapshot_carried(slot, rows)?;
-        }
-        Ok(())
+        self.each_rank_parallel(|e| e.snapshot_carried(slot, rows))
     }
 
     pub fn restore_carried(&mut self, slot: usize) -> Result<()> {
@@ -1486,10 +1483,35 @@ impl AmdTpGroup {
     }
 
     pub fn restore_carried_since(&mut self, slot: usize, dirty_until: u32) -> Result<()> {
-        for e in &mut self.ranks {
-            e.restore_carried_since(slot, dirty_until)?;
-        }
-        Ok(())
+        self.each_rank_parallel(|e| e.restore_carried_since(slot, dirty_until))
+    }
+
+    /// Run `f` on every rank at once. Each rank's snapshot copy is a batch of ~300 small DMA
+    /// copies behind one blocking completion wait (~1.6 ms); serial over eight ranks that wait
+    /// was ~13 ms of every prefix-armed prompt.
+    fn each_rank_parallel(
+        &mut self,
+        f: impl Fn(&mut AmdEngine) -> Result<()> + Sync,
+    ) -> Result<()> {
+        let f = &f;
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = self
+                .ranks
+                .iter_mut()
+                .map(|e| scope.spawn(move || f(e)))
+                .collect();
+            let mut first = None;
+            for handle in handles {
+                let result = handle
+                    .join()
+                    .map_err(|_| RuntimeError::Device("rank thread panicked".into()))
+                    .and_then(|result| result);
+                if let Err(error) = result {
+                    first.get_or_insert(error);
+                }
+            }
+            first.map_or(Ok(()), Err)
+        })
     }
 
     /// `all`, not `any`: `attach_shared_prefixes` requires every rank to carry the cache, so a

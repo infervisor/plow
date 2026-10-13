@@ -587,6 +587,19 @@ pub struct RuntimeConfig {
     #[arg(long = "pf-defer-decode", env = "PLOW_PF_DEFER_DECODE", hide = true, default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub pf_defer_decode: bool,
 
+    /// Expert (AMD): keep launching prefill chunks within one tick — a prompt's remaining chunks
+    /// and further waiting prompts — until the tick's `PLOW_PF_INTERLEAVE` row budget is spent,
+    /// then run the decode step. Off: one chunk per slot and one fresh prompt per tick.
+    #[arg(long = "pf-back-to-back", env = "PLOW_PF_BACK_TO_BACK", hide = true, default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub pf_back_to_back: bool,
+
+    /// Expert (AMD prefix cache): a prompt sharing no cached prefix snapshots its recurrent state
+    /// after its LAST chunk instead of at a split 32 rows before the end, so a cold prompt runs
+    /// no extra tail launch. A continuation (prompt + reply + ...) resumes at the full prompt; an
+    /// identical re-sent prompt misses once and arms the old split point for the next one.
+    #[arg(long = "prefix-arm-end", env = "PLOW_PREFIX_ARM_END", hide = true, default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub prefix_arm_end: bool,
+
     /// Runtime max context override. If set, limits or configures the maximum sequence length at runtime.
     /// If unset, defaults to the context length declared by the packet.
     #[arg(long = "rt-max-ctx", env = "PLOW_RT_MAX_CTX", global = true)]

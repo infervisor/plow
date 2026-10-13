@@ -207,6 +207,16 @@ pub trait SeqEngine {
     ) -> crate::Result<()> {
         Ok(())
     }
+    /// Build `slot`'s prefill cursor without running a chunk, so a back-to-back tick
+    /// (`PLOW_PF_BACK_TO_BACK`) knows the first chunk's rows before admitting it.
+    fn prepare_prefill_slot(
+        &mut self,
+        _slot: usize,
+        _prompt: &[u32],
+        _max_rows: u32,
+    ) -> crate::Result<()> {
+        Ok(())
+    }
     fn terminal_prefill_ready(&self, _slot: usize, _prompt: &[u32]) -> bool {
         false
     }
@@ -1443,7 +1453,13 @@ mod amd_serve {
         a.iter().zip(b).take_while(|(x, y)| x == y).count()
     }
 
-    fn prefix_plan(cached: &[u32], snap: u32, armed: bool, prompt: &[u32]) -> (u32, u32) {
+    fn prefix_plan(
+        cached: &[u32],
+        snap: u32,
+        armed: bool,
+        prompt: &[u32],
+        arm_end: bool,
+    ) -> (u32, u32) {
         let cap = prompt.len().saturating_sub(1) as u32;
         let lcp = (common_prefix_len(cached, prompt) as u32).min(cap);
         if armed && snap > 0 && snap <= lcp {
@@ -1453,6 +1469,8 @@ mod amd_serve {
                 0,
                 if lcp >= MIN_PREFIX {
                     lcp
+                } else if arm_end {
+                    prompt.len() as u32
                 } else {
                     cap / 32 * 32
                 },
@@ -2021,7 +2039,13 @@ mod amd_serve {
                 Ranks::One(e) => e.has_snapshot(slot),
                 Ranks::Tp(g) => g.has_snapshot(slot),
             };
-            prefix_plan(&self.cached_prompt[slot], self.snap_at[slot], armed, prompt)
+            prefix_plan(
+                &self.cached_prompt[slot],
+                self.snap_at[slot],
+                armed,
+                prompt,
+                crate::config::RuntimeConfig::get().prefix_arm_end,
+            )
         }
 
         pub fn cached_rows(&self, slot: usize) -> usize {
@@ -2182,7 +2206,8 @@ mod amd_serve {
                         (plan(resume, n)?, None)
                     } else if arm > 0 {
                         let head = plan(0, arm)?;
-                        let tail = plan(arm, n)?;
+                        // An end arm (`PLOW_PREFIX_ARM_END`) snapshots after the last chunk.
+                        let tail = if arm < n { plan(arm, n)? } else { Vec::new() };
                         let cut = head.len();
                         let mut all = head;
                         all.extend(tail);
@@ -2390,6 +2415,21 @@ mod amd_serve {
                 Ranks::One(e) => e.mixed_step_rows(decode_rows, prefill_rows),
                 Ranks::Tp(_) => None,
             }
+        }
+
+        pub fn prepare_prefill_slot(
+            &mut self,
+            slot: usize,
+            prompt: &[u32],
+            max_rows: u32,
+        ) -> Result<()> {
+            let chunked = (self.chunk_prefill || self.ranks.shared_prefix_enabled())
+                && !self.decode_only
+                && prompt.len() > 1;
+            if !chunked || self.live.get(slot) != Some(&false) {
+                return Ok(());
+            }
+            self.prepare_prefill_cursor(slot, prompt, max_rows)
         }
 
         pub fn prepare_packed_prefill_slot(
@@ -4389,17 +4429,21 @@ mod amd_serve {
         #[test]
         fn prefix_admission_preserves_replay_row_and_rejects_evicted_or_changed_state() {
             let prompt: Vec<u32> = (0..1024).collect();
-            assert_eq!(super::prefix_plan(&[], 0, false, &prompt), (0, 992));
-            assert_eq!(super::prefix_plan(&prompt, 992, true, &prompt), (992, 0));
-            assert_eq!(super::prefix_plan(&prompt, 992, false, &prompt), (0, 1023));
+            assert_eq!(super::prefix_plan(&[], 0, false, &prompt, false), (0, 992));
+            assert_eq!(super::prefix_plan(&prompt, 992, true, &prompt, false), (992, 0));
+            assert_eq!(super::prefix_plan(&prompt, 992, false, &prompt, false), (0, 1023));
             let mut changed = prompt.clone();
             changed[0] = 9999;
-            assert_eq!(super::prefix_plan(&prompt, 992, true, &changed), (0, 992));
+            assert_eq!(super::prefix_plan(&prompt, 992, true, &changed, false), (0, 992));
             assert_eq!(
-                super::prefix_plan(&prompt, 992, true, &prompt[..128]),
+                super::prefix_plan(&prompt, 992, true, &prompt[..128], false),
                 (0, 0)
             );
-            assert_eq!(super::prefix_plan(&[], 0, false, &prompt[..1]), (0, 0));
+            assert_eq!(super::prefix_plan(&[], 0, false, &prompt[..1], false), (0, 0));
+            assert_eq!(super::prefix_plan(&[], 0, false, &prompt, true), (0, 1024));
+            let next: Vec<u32> = (0..1030).collect();
+            assert_eq!(super::prefix_plan(&prompt, 1024, true, &next, true), (1024, 0));
+            assert_eq!(super::prefix_plan(&prompt, 1024, true, &prompt, true), (0, 1023));
         }
 
         #[test]
@@ -4855,6 +4899,14 @@ impl SeqEngine for AmdServe {
         max_rows: u32,
     ) -> crate::Result<()> {
         AmdServe::prepare_packed_prefill_slot(self, slot, prompt, max_rows)
+    }
+    fn prepare_prefill_slot(
+        &mut self,
+        slot: usize,
+        prompt: &[u32],
+        max_rows: u32,
+    ) -> crate::Result<()> {
+        AmdServe::prepare_prefill_slot(self, slot, prompt, max_rows)
     }
     fn terminal_prefill_ready(&self, slot: usize, prompt: &[u32]) -> bool {
         AmdServe::terminal_prefill_ready(self, slot, prompt)
