@@ -1065,6 +1065,23 @@ case "${PLOW_MOE_PF_HDR:-1}" in
   1) K3_PF_MOE="$K3_PF_MOE -DPLOW_MOE_PF_HDR=1" ;;
   *) echo "PLOW_MOE_PF_HDR must be 0 or 1" >&2; exit 2 ;;
 esac
+# PLOW_GEMM_PF_REPICK (default 1 here, =0 rolls back): a dense prefill GEMM whose emitted rung fills
+# under PLOW_GEMM_PF_FILL_PCT (75) of its workgroups at the chunk's live M takes the largest rung
+# that does (interp.hip gemm_pf_repick; bit-identical, the same MFMA and k order).
+case "${PLOW_GEMM_PF_REPICK:-1}" in
+  0) ;;
+  1) K3_PF_MOE="$K3_PF_MOE -DPLOW_GEMM_PF_REPICK=1 -DPLOW_GEMM_PF_FILL_PCT=${PLOW_GEMM_PF_FILL_PCT:-75}" ;;
+  *) echo "PLOW_GEMM_PF_REPICK must be 0 or 1" >&2; exit 2 ;;
+esac
+# PLOW_GEMM_PF_SM_BK=128: the 64x128 GemmSmall rung (and its fp32 router twin) at BK=128 in the K3
+# prefill objects only -- half the k-tiles for the N<=256, K=4096 projections that run on 64-128
+# workgroups. Arithmetic-preserving (BK only moves the k-tile barriers; op_gemm_common.h). Default
+# 64 until gemm_tile_sweep prices e2 (64x128x128) against c4 on gfx950.
+case "${PLOW_GEMM_PF_SM_BK:-64}" in
+  64) ;;
+  128) K3_PF_MOE="$K3_PF_MOE -DGM_SM_BK=128" ;;
+  *) echo "PLOW_GEMM_PF_SM_BK must be 64 or 128" >&2; exit 2 ;;
+esac
 K3_ELFS=""
 if [ -n "${PLOW_HSACO_CONFIG:-}" ] &&
    grep -Eq '^#define PLOW_PACKET_OBJECT_REQUIRES "([^"]* )?PLOW_K3=1( |")' "$PLOW_HSACO_CONFIG"; then

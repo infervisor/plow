@@ -2989,6 +2989,82 @@ __device__ __forceinline__ void exec_flash_mla_prefill_v2_packed(
 #endif
 #endif
 
+/* PLOW_GEMM_PF_REPICK: the dense prefill GEMM rung is chosen at emit for the BUCKET's M, but the
+ * ragged chunk runs the bucket with its live M (a 4096-token prompt is M=4096 on the 8192 rung),
+ * where the emitted tile can leave most workgroups idle: GemmWide 128x256 at M=4096 N=1024 is 128
+ * tiles on 256 workgroups, the 256x256 router GemmF32 at N=288 is 32. When the emitted rung fills
+ * less than PLOW_GEMM_PF_FILL_PCT of its last wave of workgroups, take the largest rung that does.
+ * Bit-identical: every rung is d_gemm_t over the same 32x32x16 MFMA and BK, so each output element
+ * is still one workgroup's f32 sum over k ascending with one bf16 round; only the tile->workgroup
+ * map changes. Only plain packets move (t3..t7 absent, i3/i6/i7 zero): no fused RoPE, dual form or
+ * C8 tag. The live M is the packet's i0 here (ragged chunks rewrite it). */
+#ifndef PLOW_GEMM_PF_REPICK
+#define PLOW_GEMM_PF_REPICK 0
+#endif
+#ifndef PLOW_GEMM_PF_FILL_PCT
+#define PLOW_GEMM_PF_FILL_PCT 75
+#endif
+#if PLOW_GEMM_PF_REPICK && PLOW_BUCKET_PREFILL && !PLOW_TOKEN_BATCH && !PLOW_MIXED_STEP &&       \
+    !defined(PLOW_BUCKET_FLASH) &&                                                                 \
+    (!PLOW_DECODE_INVENTORY_PRUNE ||                                                               \
+     (PLOW_HAS_GEMM && PLOW_HAS_GEMM_SMALL && PLOW_HAS_GEMM_MED && PLOW_HAS_GEMM_WIDE))
+#define PLOW_GEMM_PF_REPICK_ON 1
+#else
+#define PLOW_GEMM_PF_REPICK_ON 0
+#endif
+#if PLOW_GEMM_PF_REPICK_ON
+extern "C" __device__ unsigned plow_gemm_pf_repick_arm = PLOW_GEMM_PF_FILL_PCT;
+__device__ __forceinline__ unsigned gemm_pf_tiles(unsigned M, unsigned N, unsigned bm,
+                                                  unsigned bn) {
+    return ((M + bm - 1u) / bm) * ((N + bn - 1u) / bn);
+}
+/* A rung qualifies when it fills PLOW_GEMM_PF_FILL_PCT of the workgroups of its last wave of
+ * tiles and needs no more waves than `waves` (so one wave of large tiles is never traded for
+ * several waves of small ones). */
+__device__ __forceinline__ bool gemm_pf_fills(unsigned M, unsigned N, unsigned bm, unsigned bn,
+                                              unsigned nblk, unsigned waves) {
+    const unsigned tiles = gemm_pf_tiles(M, N, bm, bn);
+    const unsigned w = (tiles + nblk - 1u) / nblk;
+    return w <= waves && tiles * 100u >= w * nblk * (unsigned)PLOW_GEMM_PF_FILL_PCT;
+}
+/* Largest-first rung of {256x256, 128x256, 128x128, 64x128} that qualifies against the emitted
+ * (bm, bn); 0 = keep the emitted rung. `f32` limits the ladder to the CF32 instantiations GemmF32
+ * carries (256x256, 128x128, 64x128). */
+__device__ __forceinline__ unsigned gemm_pf_ladder(unsigned M, unsigned N, unsigned bm,
+                                                   unsigned bn, unsigned nblk, bool f32) {
+    const unsigned waves = (gemm_pf_tiles(M, N, bm, bn) + nblk - 1u) / nblk;
+    if (!M || !N || gemm_pf_fills(M, N, bm, bn, nblk, waves)) return 0u;
+    if (gemm_pf_fills(M, N, GM_BM, GM_BN, nblk, waves)) return PLOW_DOP_GEMM;
+    if (!f32 && gemm_pf_fills(M, N, GM_WD_BM, GM_WD_BN, nblk, waves)) return PLOW_DOP_GEMM_WIDE;
+    if (gemm_pf_fills(M, N, GM_MD_BM, GM_MD_BN, nblk, waves)) return PLOW_DOP_GEMM_MED;
+    if (gemm_pf_fills(M, N, GM_SM_BM, GM_SM_BN, nblk, waves)) return PLOW_DOP_GEMM_SMALL;
+    /* Nothing fills (e.g. the router's N=288 at M=2048: 16 tiles at 256x256): the smallest rung
+     * still spreads the same waves over at least twice the workgroups. */
+    const unsigned ts = gemm_pf_tiles(M, N, GM_SM_BM, GM_SM_BN);
+    if ((ts + nblk - 1u) / nblk <= waves && ts >= 2u * gemm_pf_tiles(M, N, bm, bn))
+        return PLOW_DOP_GEMM_SMALL;
+    return 0u;
+}
+__device__ __forceinline__ unsigned gemm_pf_repick(CInst in, unsigned nblk) {
+    const unsigned op = in->op;
+    unsigned bm, bn;
+    switch (op) {
+        case PLOW_DOP_GEMM: bm = GM_BM; bn = GM_BN; break;
+        case PLOW_DOP_GEMM_SMALL: bm = GM_SM_BM; bn = GM_SM_BN; break;
+        case PLOW_DOP_GEMM_MED: bm = GM_MD_BM; bn = GM_MD_BN; break;
+        case PLOW_DOP_GEMM_WIDE: bm = GM_WD_BM; bn = GM_WD_BN; break;
+        case PLOW_DOP_GEMM_C5: bm = GM_C5_BM; bn = GM_C5_BN; break;
+        default: return op;
+    }
+    if (in->t[3] != PLOW_TENSOR_NONE || in->t[4] != PLOW_TENSOR_NONE ||
+        in->t[5] != PLOW_TENSOR_NONE || in->t[6] != PLOW_TENSOR_NONE ||
+        in->t[7] != PLOW_TENSOR_NONE || in->i[3] || in->i[6] || in->i[7])
+        return op;
+    const unsigned pick = gemm_pf_ladder(in->i[0], in->i[1], bm, bn, nblk, false);
+    return pick ? pick : op;
+}
+#endif
+
 /* gfx950 K3 decode objects inline `plow_exec` into the dispatch loop. As a call, its prologue
  * saves ~110 VGPR dwords per lane to scratch (and restores them) before it selects an op, on
  * every packet in every workgroup -- including the workgroups a narrow packet leaves idle.
@@ -3486,7 +3562,11 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
             __builtin_trap();
     }
 #else
+#if PLOW_GEMM_PF_REPICK_ON
+    switch (gemm_pf_repick(in, nblk)) {
+#else
     switch (in->op) {
+#endif
 #if !PLOW_DECODE_INVENTORY_PRUNE || PLOW_HAS_RMSNORM
         case PLOW_DOP_RMSNORM:
             if (in->i[3] == 1) {
@@ -4279,10 +4359,22 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
             }
 #endif
 #if PLOW_BUCKET_PREFILL || PLOW_MIXED_STEP
-            if (PLOW_RUNTIME_ROWS(in->i[0]) > PLOW_GEMM_F32_STANDARD_DECODE_MAX_ROWS)
+            if (PLOW_RUNTIME_ROWS(in->i[0]) > PLOW_GEMM_F32_STANDARD_DECODE_MAX_ROWS) {
+#if PLOW_GEMM_PF_REPICK_ON
+                const unsigned rung = gemm_pf_ladder(in->i[0], in->i[1], GM_BM, GM_BN, nblk, true);
+                if (rung == PLOW_DOP_GEMM_MED)
+                    d_gemm_f32_t<GM_MD_BM, GM_MD_BN, GM_MD_BK>(
+                        (float*)TEN(0), (const bf16*)TEN(1), (const bf16*)TEN(2), in->i[0],
+                        in->i[1], in->i[2], slice, nblk, sm->gm);
+                else if (rung == PLOW_DOP_GEMM_SMALL)
+                    d_gemm_f32_t<GM_SM_BM, GM_SM_BN, GM_SM_BK>(
+                        (float*)TEN(0), (const bf16*)TEN(1), (const bf16*)TEN(2), in->i[0],
+                        in->i[1], in->i[2], slice, nblk, sm->gm);
+                else
+#endif
                 d_gemm_f32((float*)TEN(0), (const bf16*)TEN(1), (const bf16*)TEN(2),
                            PLOW_RUNTIME_ROWS(in->i[0]), in->i[1], in->i[2], slice, nblk, sm->gm);
-            else
+            } else
 #endif
                 d_gemv_bf16_f32((float*)TEN(0), (const bf16*)TEN(1), (const bf16*)TEN(2),
                                  PLOW_RUNTIME_ROWS(in->i[0]), in->i[1], in->i[2], slice, nblk);

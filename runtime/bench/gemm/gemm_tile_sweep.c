@@ -244,6 +244,10 @@ int main(int argc, char** argv) {
     bf16* hC = plow_hsa_alloc_host(H, nC * 2);
     bf16* hC2 = mx ? NULL : malloc(nC * sizeof(*hC2));
     int have_c2 = 0;
+    /* bf16 ladder: every tile's output against the FIRST tile run, byte for byte. All rungs are
+     * d_gemm_t over the same MFMA and k order, so a re-pick between them must not move a bit. */
+    bf16* hRef = (mx || f8) ? NULL : malloc(nC * sizeof(*hRef));
+    int have_ref = 0;
     if ((!f8 && !hA) || (!mx && !f8 && (!hB || !hC2)) || (mx && (!hW || !hS)) ||
         (f8 && (!hAq || !hAs || !hW || !hWs || !hC2)) || !hC) {
         fprintf(stderr, "host allocation failed\n");
@@ -433,13 +437,21 @@ int main(int argc, char** argv) {
             if (fabs(g - acc) / (fabs(acc) + 1e-3) > 0.03) bad++;
         }
 
+        const char* biteq = "";
+        if (hRef && !have_ref) {
+            memcpy(hRef, hC, nC * sizeof(*hRef));
+            have_ref = 1;
+            biteq = " bitref";
+        } else if (hRef) {
+            biteq = memcmp(hRef, hC, nC * sizeof(*hRef)) == 0 ? " biteq" : " BITDIFF";
+        }
         const unsigned ntile = ((M + tbm - 1) / tbm) * ((N + tbn - 1) / tbn);
         char bxb[24];
         snprintf(bxb, sizeof bxb, "%ux%ux%u", tbm, tbn, tbk);
-        printf("  %-10s %-14s %6u %5.1f%%   %9.4f %9.1f %6.1f%% %6.1f%%  %s\n", sym,
+        printf("  %-10s %-14s %6u %5.1f%%   %9.4f %9.1f %6.1f%% %6.1f%%  %s%s\n", sym,
                bxb, ntile, 100.0 * (ntile < NCU ? ntile : NCU) / NCU, dt * 1e3, tf,
                100.0 * tf / PEAK_TFLOPS, 100.0 * mem_floor_ms / (dt * 1e3),
-               bad ? "MISMATCH!" : "ok");
+               bad ? "MISMATCH!" : "ok", biteq);
 
         if (jf) {
             /* A FAILING spot-check is written too, marked failed. `tunedb` will not qualify
@@ -462,5 +474,6 @@ int main(int argc, char** argv) {
     if (dWs) plow_hsa_free(H, dWs);
     plow_hsa_free(H, dC);
     free(hC2);
+    free(hRef);
     return 0;
 }
