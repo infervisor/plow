@@ -591,6 +591,17 @@ The packet from config + index alone (no weights) is 70 MB: 4 prefill buckets + 
   wide 6 -> 198): r1 24.1 -> 12.3-12.9, B8 42.1 -> 31.2, B32 54.4 -> 53.0 ms, B128 82.0-86.1 vs
   82.3-91.3 (bimodal, within noise), 4k/16k r1 23.5/23.7 -> 13.0/13.1 ms. A GEMV-only direct
   arm instead gave r1 19.4 ms. Serving cells not re-run.
+- 08:35 UTC (10-13), DP2xTP4 serve (branch serve-dp2tp4-amd, 640f2794): `PLOW_DP=2` on an AMD
+  serve loads the TP4 packet twice (GPUs 0-3, 4-7) as `slug#0/#1`, each with its own dispatcher,
+  per-slot prefix cache and socket-pinned engine thread, behind the existing DP router
+  (least-loaded; continuation affinity; the cross-request prefix probe is CUDA-VMM only).
+  TP4 packet = v9 [emit].env, `--num-gpus 4`, ladder 1,8,32,64 (64 slots/group), max-ctx 65536
+  (5fd6b2ca; 141 GiB free per GPU after load). amd-bench, both groups at once, nat-pride-1024:
+  r1/B8/B32/B64 13.1/33.9/61.2/81.0 ms, every slot equal to the FP32 continuation; 4k/16k
+  synthetic prompts keep TP8's first token and then differ (repetition near-ties). Serve: load
+  2 x 12 s; c1 greedy pairs (one copy per group) equal 8/8; vs TP8 serve 7/8, the eighth at a
+  TP8 exact tie (gap 0.0); needles 4k/16k 18/18 (cache on); FP32 gate PASS kl_mean 0.01258,
+  kl_p99 0.172, top1_decisive 0.9967, needles 18/18 (v9 TP8: 0.01384 / 0.237 / 0.9989).
 
 ## 5. Results
 
