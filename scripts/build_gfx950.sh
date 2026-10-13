@@ -606,7 +606,8 @@ if [ "$ARCH" = gfx950 ] && [ "$need_kda_carry_keyfeed" = 1 ]; then
 fi
 
 # PLOW_MLA_PF_DENSE=1: the dedicated NoPE MLA flash-prefill object plowrt routes eligible flash
-# segments to when served with PLOW_MLA_PF_DENSE=1 (exec/amd_mla_pf_dense.rs).
+# segments to when served with PLOW_MLA_PF_DENSE=1 (exec/amd_mla_pf_dense.rs). iterative-ilp keeps
+# the QK fragment loads in flight (measured 8k chunk 0.826 -> 0.809 ms/layer, 16k 2.267 -> 2.223).
 MLA_PF_DENSE_ELFS=""
 case "${PLOW_MLA_PF_DENSE:-0}" in
   0|1) ;;
@@ -620,7 +621,7 @@ if [ "$ARCH" = gfx950 ] && [ "${PLOW_MLA_PF_DENSE:-0}" = 1 ]; then
   bash "$R/cmake/hipcc_hsaco.sh" hipcc "$BUN" "$ARCH" \
     "$OUT/mla_pf_dense_gfx950.elf" plow_mla_pf_dense_gfx950 512 1 \
     $INC -DPLOW_LEAN_OBJECT=1 -DPLOW_NO_SPILL=1 -DPLOW_NO_SGPR_SPILL=1 \
-    -DPLOW_REQUIRED_MARKER=plow_mla_pf_dense_abi_1 \
+    -DPLOW_REQUIRED_MARKER=plow_mla_pf_dense_abi_1 -mllvm -amdgpu-sched-strategy=iterative-ilp \
     "$R/amd/mla_pf_dense_gfx950.hip"
   MLA_PF_DENSE_ELFS="mla_pf_dense_gfx950.elf"
 fi

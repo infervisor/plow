@@ -12625,6 +12625,8 @@ impl AmdEngine {
                 }
                 args.spans = self.d_kv_spans.base;
                 args.n_spans = self.packed_spans.len() as u32;
+                // No spans must not fall back to the kernel's single-sequence form.
+                args.n_tok = 0;
                 amd_mla_pf_dense::span_grid(&self.packed_spans, args.ns)
             } else {
                 if self.kv_slot != 0 {
