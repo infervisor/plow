@@ -282,6 +282,15 @@ if [ -n "$NOPE_FLASH" ] && [ -z "${PLOW_MLA_PF_TR16:-}" ] &&
    grep -Eq '^#define PLOW_PACKET_OBJECT_REQUIRES "([^"]* )?PLOW_K3=1( |")' "$PLOW_HSACO_CONFIG"; then
   FLASH_TR16="-DPLOW_MLA_PF_SV=1 -DPLOW_MLA_PF_TR16=1 $FLASH_TR16"
 fi
+# GLM-5.3-Flash (NoPE + K3 packet) gets the arms qualified on it alone. PLOW_GEMV_F32_VEC: the
+# 8-wide GEMV walks (op_gemm_common.h) reassociate the f32 sums of every object's mHC mix and
+# router GEMVs, so they are qualified per model.
+GLM53_FLASH=0
+if [ -n "$NOPE_FLASH" ] &&
+   grep -Eq '^#define PLOW_PACKET_OBJECT_REQUIRES "([^"]* )?PLOW_K3=1( |")' "$PLOW_HSACO_CONFIG"; then
+  GLM53_FLASH=1
+  INC="$INC -DPLOW_GEMV_F32_VEC=1"
+fi
 if [ -n "${PLOW_HSACO_CONFIG:-}" ] && [ "${PLOW_DSA_PREP:-0}" = 0 ] &&
    grep -Eq '^#define PLOW_PACKET_OBJECT_REQUIRES "([^"]* )?PLOW_DSA_PREP=1( |")' "$PLOW_HSACO_CONFIG"; then
   A4W4_BK="$A4W4_BK -DPLOW_DSA_PREP=1"
