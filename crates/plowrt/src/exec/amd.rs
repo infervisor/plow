@@ -748,9 +748,9 @@ struct GemmGroupArgs {
     x: u64,
     w: u64,
     c: [u64; 6],
+    n: [u32; 6],
     t: u32,
     k: u32,
-    n: [u32; 6],
 }
 
 const _: () = assert!(std::mem::size_of::<GemmGroupArgs>() == 96);
@@ -1833,16 +1833,10 @@ fn promote_kda_carry_regstate_routes(
     Ok(())
 }
 
-/// Workgroups of a [`DevOp::GemmGroupPf`] launch at `t` rows: the kernel's tiles per group (the
-/// interpreter's GemmWide tile for N >= 512, GemmSmall below, gfx950).
+/// Workgroups of a [`DevOp::GemmGroupPf`] launch at `t` rows: one per 128x384 tile of the
+/// concatenated width.
 fn gemm_group_grid(t: u32, n: &[u32; 6]) -> u32 {
-    n.iter()
-        .take_while(|&&n| n != 0)
-        .map(|&n| {
-            let (bm, bn) = if n >= 512 { (128, 256) } else { (64, 128) };
-            t.div_ceil(bm) * n.div_ceil(bn)
-        })
-        .sum()
+    t.div_ceil(128) * n.iter().sum::<u32>().div_ceil(384)
 }
 
 fn promote_gemm_group_routes(

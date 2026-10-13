@@ -279,6 +279,28 @@ pub struct KdaWeights {
     pub in_cat: u32,
 }
 
+/// One bf16 prefill projection `out[t, n] = x[t, k] . w[n, k]^T` as its own [`DevOp::GemmGroupPf`]
+/// segment (one group).
+#[allow(clippy::too_many_arguments)]
+pub fn emit_pf_gemm_route(
+    b: &mut Builder,
+    out: u32,
+    x: u32,
+    w: u32,
+    t: u32,
+    n: u32,
+    k: u32,
+    deps: &[u32],
+) -> u32 {
+    let c = b.emit(DevOp::GemmGroupPf, vec![0], deps, |d| {
+        d.t[..3].copy_from_slice(&[x, w, out]);
+        d.t[3..].fill(crate::TENSOR_NONE);
+        d.i[..3].copy_from_slice(&[t, k, n]);
+    });
+    b.isolate(c);
+    c
+}
+
 /// `PLOW_KDA_PF_GROUP_GEMM`: a prefill (`t > 1`, not batched decode) low-rank-gate KDA layer runs
 /// its six input projections as ONE [`DevOp::GemmGroupPf`] segment over [`KdaWeights::in_cat`].
 pub fn pf_group_gemm(c: &KdaCfg) -> bool {
@@ -1348,7 +1370,11 @@ fn emit_kda_mixer_ex(
     });
 
     // P12 — out projection. The residual is NOT here: see `emit_kda_layer`.
-    let c_o = gemv(b, attn, y, w.o_proj, hi, p, c_norm);
+    let c_o = if group.is_some() {
+        emit_pf_gemm_route(b, attn, y, w.o_proj, t, hi, p, &[c_norm])
+    } else {
+        gemv(b, attn, y, w.o_proj, hi, p, c_norm)
+    };
     (c_o, attn)
 }
 

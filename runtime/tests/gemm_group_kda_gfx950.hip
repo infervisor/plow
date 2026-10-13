@@ -19,6 +19,31 @@
 constexpr unsigned M = 8192, K = 4096, NG = 6;
 constexpr unsigned NS[NG] = {1024, 1024, 1024, 128, 128, 8};
 
+/* Host mirror of gemm_group_pf.hip's GemmGroupArgs (PlowGemmRoute is device-header only). */
+struct TRoute { bf16* c[6]; unsigned n[6]; };
+struct GemmGroupArgs { const bf16* x; const bf16* w; TRoute r; unsigned t, k; };
+/* Same body as plow_gemm_group_pf_gfx950. */
+extern "C" __global__ __launch_bounds__(PLOW_THREADS) void k_routed(GemmGroupArgs a) {
+#ifdef __HIP_DEVICE_COMPILE__
+    __shared__ bf16 lds[GM_LDS_HALVES_T(GM_C8_BM, GM_C8_BN, GM_C8_BK)];
+    unsigned n = 0;
+    for (unsigned g = 0; g < 6; g++) n += a.r.n[g];
+    const unsigned tiles = ((a.t + GM_C8_BM - 1) / GM_C8_BM) * ((n + GM_C8_BN - 1) / GM_C8_BN);
+    d_gemm_t<GM_C8_BM, GM_C8_BN, GM_C8_BK, GM_WM, GM_WN, false, GM_SWZ, GM_WGM, (GM_PP != 0), true,
+             false, false, false, false
+#if PLOW_GLM_FUSE_POST
+             , false
+#endif
+             , false, true>(nullptr, a.x, a.w, nullptr, nullptr, a.t, n, a.k, blockIdx.x,
+                            gridDim.x < tiles ? gridDim.x : tiles, lds, nullptr, 0, nullptr,
+                            nullptr, nullptr
+#if PLOW_GLM_FUSE_POST
+                            , nullptr, nullptr, nullptr, 0
+#endif
+                            , 0, reinterpret_cast<const PlowGemmRoute*>(&a.r));
+#endif
+}
+
 struct Group {
     bf16* c[NG];
     const bf16* w[NG];
@@ -120,6 +145,28 @@ int main() {
     time(sep, "separate");
     time(grp, "grouped");
     printf("grouped tiles %u\n", total_tiles);
+    {
+        /* The production route: one routed GEMM over the stacked weight on the 128x384 tile. */
+        size_t rows = 0; for (unsigned i = 0; i < NG; i++) rows += NS[i];
+        bf16* Ws; CK(hipMalloc(&Ws, rows * K * 2));
+        size_t r0 = 0;
+        GemmGroupArgs ga{};
+        ga.x = A; ga.w = Ws; ga.t = M; ga.k = K;
+        for (unsigned i = 0; i < NG; i++) {
+            CK(hipMemcpy(Ws + r0 * K, W[i], (size_t)NS[i] * K * 2, hipMemcpyDeviceToDevice));
+            r0 += NS[i]; ga.r.c[i] = C1[i]; ga.r.n[i] = NS[i];
+            CK(hipMemset(C1[i], 0xff, (size_t)M * NS[i] * 2));
+        }
+        const unsigned tiles = (M / 128) * (unsigned)((rows + 383) / 384);
+        time([&] { k_routed<<<tiles, PLOW_THREADS>>>(ga); }, "routed");
+        for (unsigned i = 0; i < NG; i++) {
+            std::vector<unsigned short> a((size_t)M * NS[i]), b(a.size());
+            CK(hipMemcpy(a.data(), C0[i], a.size() * 2, hipMemcpyDeviceToHost));
+            CK(hipMemcpy(b.data(), C1[i], b.size() * 2, hipMemcpyDeviceToHost));
+            size_t diff = 0; for (size_t j = 0; j < a.size(); j++) diff += a[j] != b[j];
+            printf("routed group %u N=%u differing=%zu\n", i, NS[i], diff);
+        }
+    }
     {
         bf16 *Wc, *Cc;
         CK(hipMalloc(&Wc, (size_t)3072 * K * 2));
