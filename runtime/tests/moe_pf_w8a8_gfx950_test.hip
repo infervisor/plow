@@ -79,6 +79,28 @@ void t_down_w8(void* part, const unsigned char* fq, const float* fs, const unsig
 #endif
 }
 
+extern "C" __global__ __launch_bounds__(PLOW_THREADS, PLOW_WAVES/4)
+void t_glu_sp(unsigned char* fq, float* fs, const bf16* x, unsigned T,
+              const unsigned long long* wtab, const unsigned long long* stab, const int* meta,
+              const unsigned* rt, unsigned I, unsigned H, unsigned n_exp, float lim) {
+    __shared__ __attribute__((aligned(16))) unsigned char lds[MW8_LDS_BYTES];
+#if PLOW_CDNA4
+    d_moe_pf_w8a8<true, true>(fq, fs, (const unsigned char*)x, nullptr, T, wtab, stab, meta, rt,
+                              nullptr, I, H, n_exp, PLOW_MOE_ACT_SWIGLU_CLAMP, 0.0f, lim, 0,
+                              blockIdx.x, gridDim.x, lds);
+#endif
+}
+extern "C" __global__ __launch_bounds__(PLOW_THREADS, PLOW_WAVES/4)
+void t_down_sp(void* part, const unsigned char* fq, const float* fs, const unsigned long long* wtab,
+               const unsigned long long* stab, const int* meta, const unsigned* rp, const float* rg,
+               unsigned H, unsigned I, unsigned n_exp, unsigned part16) {
+    __shared__ __attribute__((aligned(16))) unsigned char lds[MW8_LDS_BYTES];
+#if PLOW_CDNA4
+    d_moe_pf_w8a8<false, true>(part, nullptr, fq, fs, 0, wtab, stab, meta, rp, rg, H, I, n_exp, 0,
+                               0.0f, 0.0f, part16, blockIdx.x, gridDim.x, lds);
+#endif
+}
+
 static float fp8d(unsigned char b) {
     const unsigned s = b >> 7, e = (b >> 3) & 15u, m = b & 7u;
     float v = e == 0 ? ldexpf((float)m, -9) : ldexpf(1.0f + m / 8.0f, (int)e - 7);
@@ -267,12 +289,15 @@ int main(int argc, char** argv) {
     HC(hipMalloc(&dpart16, (size_t)T * K * H * 2));
     HC(hipMalloc(&dxq, (size_t)T * H)); HC(hipMalloc(&dxs, (size_t)T * KBH * 4));
     HC(hipMalloc(&dfq, (size_t)rows * I)); HC(hipMalloc(&dfs, (size_t)rows * KBI * 4));
+    unsigned char* dfq2; float* dfs2; HC(hipMalloc(&dfq2, (size_t)rows * I * 2)); HC(hipMalloc(&dfs2, (size_t)rows * KBI * 4));
 
-    const unsigned G = 512;
+    const unsigned G = getenv("MW8_G") ? (unsigned)atoi(getenv("MW8_G")) : 512u;
     auto run_base_glu = [&] { hipLaunchKernelGGL(t_glu_base, dim3(G), dim3(PLOW_THREADS), 0, 0, dfu, dx, dwt, dst, dmeta, drt, I, H, E, lim); };
     auto run_base_down = [&] { hipLaunchKernelGGL(t_down_base, dim3(G), dim3(PLOW_THREADS), 0, 0, dpart, dfu, dwt, dst, dmeta, drp, drg, H, I, E); };
     auto run_quant = [&] { hipLaunchKernelGGL(t_quant, dim3(G), dim3(PLOW_THREADS), 0, 0, dxq, dx, dxs, T, H); };
     auto run_w8_glu = [&] { hipLaunchKernelGGL(t_glu_w8, dim3(G), dim3(PLOW_THREADS), 0, 0, dfq, dfs, dxq, dxs, T, dwt, dst, dmeta, drt, I, H, E, lim); };
+    auto run_sp_glu = [&] { hipLaunchKernelGGL(t_glu_sp, dim3(G), dim3(PLOW_THREADS), 0, 0, dfq2, dfs2, dx, T, dwt, dst, dmeta, drt, I, H, E, lim); };
+    auto run_sp_down = [&](unsigned p16) { hipLaunchKernelGGL(t_down_sp, dim3(G), dim3(PLOW_THREADS), 0, 0, p16 ? dpart16 : (void*)dpart, dfq2, dfs2, dwt, dst, dmeta, drp, drg, H, I, E, p16); };
     auto run_w8_down = [&](unsigned p16) { hipLaunchKernelGGL(t_down_w8, dim3(G), dim3(PLOW_THREADS), 0, 0, p16 ? dpart16 : (void*)dpart, dfq, dfs, dwt, dst, dmeta, drp, drg, H, I, E, p16); };
 
     /* ---- FP32 reference on sampled slots */
@@ -314,6 +339,13 @@ int main(int argc, char** argv) {
     std::vector<float> part_w((size_t)T * K * H); HC(hipMemcpy(part_w.data(), dpart, part_w.size() * 4, hipMemcpyDeviceToHost));
     run_w8_down(1); HC(hipDeviceSynchronize());
     std::vector<unsigned short> part_w16((size_t)T * K * H); HC(hipMemcpy(part_w16.data(), dpart16, part_w16.size() * 2, hipMemcpyDeviceToHost));
+    HC(hipMemset(dpart, 0xff, (size_t)T * K * H * 4));
+    run_sp_glu(); run_sp_down(0); HC(hipDeviceSynchronize());
+    std::vector<unsigned char> fq2_h((size_t)rows * I * 2); HC(hipMemcpy(fq2_h.data(), dfq2, fq2_h.size(), hipMemcpyDeviceToHost));
+    std::vector<float> fs2_h((size_t)rows * KBI); HC(hipMemcpy(fs2_h.data(), dfs2, fs2_h.size() * 4, hipMemcpyDeviceToHost));
+    std::vector<float> part_s((size_t)T * K * H); HC(hipMemcpy(part_s.data(), dpart, part_s.size() * 4, hipMemcpyDeviceToHost));
+    run_sp_down(1); HC(hipDeviceSynchronize());
+    std::vector<unsigned short> part_s16((size_t)T * K * H); HC(hipMemcpy(part_s16.data(), dpart16, part_s16.size() * 2, hipMemcpyDeviceToHost));
 
     /* quantized-input check: xq*xs vs x */
     {
@@ -328,7 +360,8 @@ int main(int argc, char** argv) {
         printf("quantized input x (1x128 fp8) vs bf16 x:\n");
         report("x  ordinary tokens", sx); report("x  outlier tokens", sxo);
     }
-    Stat gb, gw, gbo, gwo, db, dw, dbo, dwo, dw16;
+    Stat gb, gw, gbo, gwo, db, dw, dbo, dwo, dw16, gs, gso, ds, dso, ds16;
+    unsigned nan_s = 0;
     std::vector<float> a(H);
     unsigned nan_w = 0;
     for (size_t si = 0; si < samp.size(); si++) {
@@ -343,14 +376,25 @@ int main(int argc, char** argv) {
         acc_row(o ? dwo : dw, &part_w[(size_t)slot * H], &yref[si * H], H);
         for (unsigned n = 0; n < H; n++) a[n] = bf(part_w16[(size_t)slot * H + n]);
         acc_row(dw16, a.data(), &yref[si * H], H);
+        for (unsigned n = 0; n < I; n++)
+            a[n] = (fp8d(fq2_h[(size_t)r * 2 * I + n]) + fp8d(fq2_h[(size_t)r * 2 * I + I + n]) / 16.0f) * fs2_h[(size_t)r * KBI + n / 128];
+        acc_row(o ? gso : gs, a.data(), &href[si * I], I);
+        for (unsigned n = 0; n < H; n++) nan_s += std::isnan(part_s[(size_t)slot * H + n]);
+        acc_row(o ? dso : ds, &part_s[(size_t)slot * H], &yref[si * H], H);
+        for (unsigned n = 0; n < H; n++) a[n] = bf(part_s16[(size_t)slot * H + n]);
+        acc_row(ds16, a.data(), &yref[si * H], H);
     }
     printf("GLU intermediate h vs FP32:\n");
     report("W8A16 bf16 fu   ordinary", gb); report("W8A8  fq*fs     ordinary", gw);
     report("W8A16 bf16 fu   outlier tok", gbo); report("W8A8  fq*fs     outlier tok", gwo);
+    report("SPLIT (hi+lo/16)*fs ordinary", gs); report("SPLIT (hi+lo/16)*fs outlier", gso);
     printf("DOWN output (gate * h.Wd) vs FP32:\n");
     report("W8A16 part f32  ordinary", db); report("W8A8  part f32  ordinary", dw);
     report("W8A16 part f32  outlier tok", dbo); report("W8A8  part f32  outlier tok", dwo);
     report("W8A8  part bf16 all", dw16);
+    report("SPLIT part f32  ordinary", ds); report("SPLIT part f32  outlier tok", dso);
+    report("SPLIT part bf16 all", ds16);
+    printf("  SPLIT NaN in sampled rows: %u\n", nan_s);
     /* every live slot written (no NaN poison left), pad rows untouched */
     unsigned unwritten = 0;
     for (size_t i = 0; i < part_w.size(); i += 61) unwritten += std::isnan(part_w[i]);
@@ -377,6 +421,11 @@ int main(int argc, char** argv) {
     const double w1 = timeit("W8A8 GLU+quant", run_w8_glu, fg);
     const double w2 = timeit("W8A8 DOWN f32 part", [&] { run_w8_down(0); }, fd);
     const double w3 = timeit("W8A8 DOWN bf16 part", [&] { run_w8_down(1); }, fd);
+    const double s1 = timeit("SPLIT GLU (bf16 in)", run_sp_glu, fg);
+    const double s2 = timeit("SPLIT DOWN f32 part", [&] { run_sp_down(0); }, fd);
+    const double s3 = timeit("SPLIT DOWN bf16 part", [&] { run_sp_down(1); }, fd);
+    printf("  pair: W8A16 %.1f us -> SPLIT %.1f us = %.2fx ; bf16 part %.1f us = %.2fx\n", b1 + b2,
+           s1 + s2, (b1 + b2) / (s1 + s2), s1 + s3, (b1 + b2) / (s1 + s3));
     printf("  pair: W8A16 %.1f us  ->  W8A8 %.1f us (quant incl.)  = %.2fx ; bf16 part %.1f us\n",
            b1 + b2, w0 + w1 + w2, (b1 + b2) / (w0 + w1 + w2), w0 + w1 + w3);
     return 0;

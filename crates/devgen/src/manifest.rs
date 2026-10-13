@@ -452,6 +452,9 @@ struct Shapes {
     /// Any `GemvF32` (op 135) with `i[4] == 1` — the one-row HyperConnPre tail
     /// (PLOW_GLM_HC_PRE_TAIL). A pre-arm object never runs the pre. Refuse.
     glm_hc_pre_tail: bool,
+    /// Any `GemvF32` with `i[4] == 2` — the mix split over workgroups (PLOW_GLM_HC_MIX_SPLIT).
+    /// A pre-arm object runs the unsplit mix on the narrowed grid and never the pre. Refuse.
+    glm_hc_mix_split: bool,
     /// Any `GemmSmall` with `i[6] > 1` — decode split-K (PLOW_GLM_DEC_SPLITK). A BUILD axis
     /// (`#if PLOW_GEMM_SMALL_SPLITK`); an object without it runs the unsplit tile (correct).
     gemm_small_splitk: bool,
@@ -669,9 +672,10 @@ fn shapes(m: &Model) -> Shapes {
                 DevOp::AddNorm if inst.i[2] == 1 => s.glm_fuse_seam_rn = true,
                 DevOp::HyperConnPre if inst.i[4] == 1 => s.glm_hc_norm_fold = true,
                 DevOp::GemmSmall if inst.i[6] > 1 => s.gemm_small_splitk = true,
-                DevOp::GemvF32 if inst.i[3] == 1 || inst.i[4] == 1 => {
+                DevOp::GemvF32 if inst.i[3] == 1 || inst.i[4] != 0 => {
                     s.glm_hc_post_fold |= inst.i[3] == 1;
-                    s.glm_hc_pre_tail |= inst.i[4] == 1;
+                    s.glm_hc_pre_tail |= inst.i[4] != 0;
+                    s.glm_hc_mix_split |= inst.i[4] == 2;
                 }
                 DevOp::Gemm | DevOp::GemmMed | DevOp::GemmSmall | DevOp::Gemv => {
                     if op == DevOp::GemmMed && inst.t[5] != packet::TENSOR_NONE {
@@ -1053,6 +1057,9 @@ fn encoding_features(f: &mut Map<String, Value>, s: &Shapes) {
     f.insert("glm_hc_post_fold".into(), json!(s.glm_hc_post_fold));
     if s.glm_hc_pre_tail {
         f.insert("glm_hc_pre_tail".into(), json!(true));
+    }
+    if s.glm_hc_mix_split {
+        f.insert("glm_hc_mix_split".into(), json!(true));
     }
     if s.gemm_small_splitk {
         f.insert("gemm_small_splitk".into(), json!(true));
@@ -1791,6 +1798,9 @@ fn backend_amd(
     }
     if on("glm_hc_pre_tail") {
         req.push("PLOW_GLM_HC_PRE_TAIL=1".into());
+    }
+    if on("glm_hc_mix_split") {
+        req.push("PLOW_GLM_HC_MIX_SPLIT=1".into());
     }
     if on("glm_fuse_seam_rn") {
         req.push("PLOW_GLM_FUSE_SEAM_RN=1".into());

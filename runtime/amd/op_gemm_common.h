@@ -1304,7 +1304,7 @@ __device__ void d_gemm_small_splitk(bf16* C, const bf16* A, const bf16* B, unsig
     constexpr int BM = GM_SM_BM, BN = GM_SM_BN, BK = GM_SM_BK;
     const unsigned tm = (M + BM - 1) / BM, tn = (N + BN - 1) / BN, nt = tm * tn;
     const unsigned ks = S ? K / S : 0u;
-    if (S < 2u || ks * S != K || ks % BK != 0u || part == nullptr || ctr == nullptr)
+    if (S < 2u || S > 16u || ks * S != K || ks % BK != 0u || part == nullptr || ctr == nullptr)
         __builtin_trap();
     __shared__ unsigned sk_last;
     for (unsigned it = slice; it < nt * S; it += nblk) {
@@ -1342,6 +1342,51 @@ __device__ void d_gemm_small_splitk(bf16* C, const bf16* A, const bf16* B, unsig
             st_act1(&C[o], f2bf(v));
         }
         __syncthreads();
+    }
+}
+/* PLOW_GLM_DEC_SPLITK_2P, packet 1 (i7 = 1): the tile items of d_gemm_small_splitk, partials
+ * only. The interpreter gate between this packet and the reduce publishes them once. */
+__device__ void d_gemm_small_splitk_part(const bf16* A, const bf16* B, unsigned M, unsigned N,
+                                         unsigned K, unsigned S, float* part, unsigned slice,
+                                         unsigned nblk, bf16* lds) {
+    constexpr int BM = GM_SM_BM, BN = GM_SM_BN, BK = GM_SM_BK;
+    const unsigned tm = (M + BM - 1) / BM, tn = (N + BN - 1) / BN, nt = tm * tn;
+    const unsigned ks = S ? K / S : 0u;
+    if (S < 2u || S > 16u || ks * S != K || ks % BK != 0u || part == nullptr) __builtin_trap();
+    for (unsigned it = slice; it < nt * S; it += nblk) {
+        const unsigned t = it / S, s = it % S;
+        d_gemm_t<BM, BN, BK, GM_WM, GM_WN, false, GM_SWZ, GM_WGM, (GM_PP != 0), true, false, false,
+                 false, true
+#if PLOW_GLM_FUSE_POST
+                 , false
+#endif
+                 , true>((bf16*)(part + (size_t)s * M * N), A + (size_t)s * ks, B + (size_t)s * ks,
+                         nullptr, nullptr, M, N, ks, t, nt, lds, nullptr, 0, nullptr, nullptr,
+                         nullptr
+#if PLOW_GLM_FUSE_POST
+                         , nullptr, nullptr, nullptr, 0
+#endif
+                         , K);
+        __syncthreads();
+    }
+}
+/* Packet 2 (i7 = 2): C = sum over s of part[s], in slice order (d_gemm_small_splitk's sum), over
+ * every workgroup, all S loads of an element in flight before the adds. */
+__device__ void d_gemm_small_splitk_reduce(bf16* C, const float* part, unsigned M, unsigned N,
+                                           unsigned S, unsigned slice, unsigned nblk) {
+    if (S < 2u || S > 16u || part == nullptr) __builtin_trap();
+    const size_t MN = (size_t)M * N;
+    for (size_t o = (size_t)slice * PLOW_THREADS + threadIdx.x; o < MN;
+         o += (size_t)nblk * PLOW_THREADS) {
+        float p[16];
+#pragma unroll
+        for (unsigned q = 0; q < 16u; q++)
+            if (q < S) p[q] = part[q * MN + o];
+        float v = p[0];
+#pragma unroll
+        for (unsigned q = 1; q < 16u; q++)
+            if (q < S) v += p[q];
+        st_act1(&C[o], f2bf(v));
     }
 }
 #endif
@@ -5822,6 +5867,52 @@ __device__ void d_gemv_bf16_f32(float* __restrict__ C, const bf16* __restrict__ 
         }
         acc = wave_sum(acc);
         if (lane == 0) C[output] = acc;
+    }
+}
+
+/* d_gemv_bf16_f32 for wide decode rungs: one wave per R x CN output tile, so x is read N/CN times
+ * and W M/R times from L2 instead of N and M times (GLM-5.3-Flash router M=128 N=288 K=4096:
+ * ~600 MB of L2 traffic per packet on the per-output walk). Each output keeps the walk's lane-to-k
+ * map, product order and wave_sum, so it is bit-identical to d_gemv_bf16_f32's vector arm.
+ * Requires M % R == 0, N % CN == 0, K % (8 * PLOW_WAVE) == 0. */
+template <unsigned R, unsigned CN>
+__device__ void d_gemv_bf16_f32_tile(float* __restrict__ C, const bf16* __restrict__ x,
+                                     const bf16* __restrict__ W, unsigned M, unsigned N,
+                                     unsigned K, unsigned slice, unsigned nblk) {
+    const unsigned wave = threadIdx.x / PLOW_WAVE;
+    const unsigned lane = threadIdx.x % PLOW_WAVE;
+    const unsigned nb = N / CN, tiles = (M / R) * nb;
+    for (unsigned tile = slice * PLOW_WAVES + wave; tile < tiles; tile += nblk * PLOW_WAVES) {
+        const unsigned m0 = (tile / nb) * R, n0 = (tile % nb) * CN;
+        const bf16* const xm = x + (size_t)m0 * K;
+        const bf16* const wn = W + (size_t)n0 * K;
+        float acc[R][CN];
+#pragma unroll
+        for (unsigned r = 0; r < R; r++)
+#pragma unroll
+            for (unsigned c = 0; c < CN; c++) acc[r][c] = 0.0f;
+#pragma unroll 2
+        for (unsigned k = lane * 8u; k < K; k += PLOW_WAVE * 8u) {
+            bf16v8 xv[R], wv[CN];
+#pragma unroll
+            for (unsigned r = 0; r < R; r++) xv[r] = ld_glob8(xm + (size_t)r * K + k);
+#pragma unroll
+            for (unsigned c = 0; c < CN; c++) wv[c] = ld_glob8(wn + (size_t)c * K + k);
+#pragma unroll
+            for (unsigned r = 0; r < R; r++)
+#pragma unroll
+                for (unsigned c = 0; c < CN; c++)
+#pragma unroll
+                    for (unsigned j = 0; j < 8; j++)
+                        acc[r][c] += bf2f(xv[r][j]) * bf2f(wv[c][j]);
+        }
+#pragma unroll
+        for (unsigned r = 0; r < R; r++)
+#pragma unroll
+            for (unsigned c = 0; c < CN; c++) {
+                const float t = wave_sum(acc[r][c]);
+                if (lane == 0) C[(size_t)(m0 + r) * N + n0 + c] = t;
+            }
     }
 }
 

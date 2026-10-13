@@ -646,6 +646,8 @@ pub const RUNTIME: &[KnobSpec] = &[
     KnobSpec::new("rt.tb_dump", Some("PLOW_TB_DUMP"), Layer::Runtime, Domain::Str, UNSET, DIAG),
     KnobSpec::new("rt.trace_allranks", Some("PLOW_TRACE_ALLRANKS"), Layer::Runtime, Domain::Bool, OFF, DIAG),
     KnobSpec::new("rt.attnres_f32mix_grid", Some("PLOW_ATTNRES_F32MIX_GRID"), Layer::Runtime, U32, UNSET, DIAG),
+    KnobSpec::new("rt.seg_geom", Some("PLOW_SEG_GEOM"), Layer::Runtime, Domain::Str, UNSET, DIAG),
+    KnobSpec::new("rt.seg_alt_dir", Some("PLOW_SEG_ALT_DIR"), Layer::Runtime, Domain::Str, UNSET, DIAG),
     KnobSpec::new("rt.moe_prefill_ep_max_extra_bytes", Some("PLOW_MOE_PREFILL_EP_MAX_EXTRA_BYTES"), Layer::Runtime, USIZE, UNSET, DIAG),
     KnobSpec::new("rt.phase_objects", Some("PLOW_PHASE_OBJECTS"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("rt.live_ctx", Some("PLOW_LIVE_CTX"), Layer::Runtime, U32, UNSET, OPT_IN),
@@ -654,7 +656,7 @@ pub const RUNTIME: &[KnobSpec] = &[
     KnobSpec::new("rt.kv_map_ahead", Some("PLOW_KV_MAP_AHEAD"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
     KnobSpec::new("rt.kv_map_next_chunk", Some("PLOW_KV_MAP_NEXT_CHUNK"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
     KnobSpec::new("rt.publish_defer", Some("PLOW_AMD_PUBLISH_DEFER"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
-    KnobSpec::new("rt.hsa_drain_blocked", Some("PLOW_HSA_DRAIN_BLOCKED"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
+    KnobSpec::new("rt.hsa_drain_blocked", Some("PLOW_HSA_DRAIN_BLOCKED"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
     KnobSpec::new("rt.engine_affinity", Some("PLOW_AMD_ENGINE_AFFINITY"), Layer::Runtime, Domain::Str, Default::Static(Val::Str("auto")), OPT_IN),
     KnobSpec::new("rt.shared_prefix", Some("PLOW_AMD_SHARED_PREFIX"), Layer::Runtime, Domain::Bool, UNSET, OPT_IN),
     KnobSpec::new("rt.upload_slots", Some("PLOW_UPLOAD_SLOTS"), Layer::Runtime, U32, Default::Static(Val::Nat(1)), OPT_IN),
@@ -962,6 +964,11 @@ mod tests {
     /// Every `cannot combine` / `requires PLOW_` site in devgen and plowrt, and what encodes it.
     /// The asserts stay as defence; this keeps a new one from landing unencoded.
     const ASSERT_SITES: &[(&str, &str, Site)] = &[
+        (
+            "mla.rs",
+            "PLOW_MOE_PF_W8A8_SPLIT requires PLOW_MOE_PF_W8A8",
+            Site::Encoded("moe_pf_w8a8_split_contract"),
+        ),
         (
             "mla.rs",
             "PLOW_GLM_INDEXER_WQ_W8A8 requires PLOW_GLM_MLA_W8A8",
