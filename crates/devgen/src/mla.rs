@@ -10709,22 +10709,39 @@ fn emit_glm_moe_ffn_rows(
     } else {
         glm_decode_gemm_tile(rows, e, h, b.n_cu()).unwrap_or(DevOp::Gemv)
     };
-    let c_score = b.emit(
-        score_op,
-        glm_decode_gemv_cus(&all, score_op, e, h),
-        &[c_rn2],
-        |d| {
-            d.t[0] = n.rlogit;
-            d.t[1] = n.xn2;
-            d.t[2] = w.wr;
-            if enc == MoeEnc::Mxfp4 && !c.quark_mixed {
-                d.t[3] = w.wr_s;
-            }
-            d.i[0] = rows;
-            d.i[1] = e;
-            d.i[2] = h;
-        },
-    );
+    // PLOW_GLM_ROUTER_DEC: score GEMV + top-k + align as one standalone boundary (op 211); the
+    // flat / deterministic-accumulator MoE routes keep the packets.
+    let router_dec = emit_config::active().glm_router_dec
+        && score_op == DevOp::GemmF32
+        && !emit_config::active().glm_moe_resident()
+        && !(emit_config::active().glm_moe_flat_decode && matches!(rows, 2 | 4 | 8))
+        && moe_pf_fuse(tk) != MoePfFuse::Det
+        && rows >= 8
+        && rows % 4 == 0
+        && e % 32 == 0
+        && h % 512 == 0
+        && w.bias != packet::dev::TENSOR_NONE_I
+        && GLM_ROUTER_FLAGS & 8 != 0;
+    let c_score = if router_dec {
+        c_rn2
+    } else {
+        b.emit(
+            score_op,
+            glm_decode_gemv_cus(&all, score_op, e, h),
+            &[c_rn2],
+            |d| {
+                d.t[0] = n.rlogit;
+                d.t[1] = n.xn2;
+                d.t[2] = w.wr;
+                if enc == MoeEnc::Mxfp4 && !c.quark_mixed {
+                    d.t[3] = w.wr_s;
+                }
+                d.i[0] = rows;
+                d.i[1] = e;
+                d.i[2] = h;
+            },
+        )
+    };
     // PLOW_GLM_DECODE_GEMM_GROUP: the shared gate/up read only `xn2`, so emit them straight after
     // the router GEMM. The three native GEMMs become adjacent (one overlap run under
     // PLOW_AMD_DECODE_GEMM_OVERLAP) and top-k and Glu share one interpreter segment.
@@ -10783,7 +10800,37 @@ fn emit_glm_moe_ffn_rows(
     } else {
         all.clone()
     };
-    let c_router = b.emit(DevOp::MoeRouterTopkPf, router_cus, &[c_score], |d| {
+    let c_router = if router_dec {
+        let maps = b.tensor_init(
+            "glm.router_dec.rows",
+            [n.row_token, n.row_partidx, n.row_gate]
+                .iter()
+                .flat_map(|h| h.to_le_bytes())
+                .collect(),
+        );
+        let counters = b.tensor_init("glm.router_dec.ctr", vec![0u8; 4 * (rows as usize / 4 + 1)]);
+        b.emit(DevOp::MoeRouterDec, all.clone(), &[c_rn2], |d| {
+            d.t[0] = n.rlogit;
+            d.t[1] = n.xn2;
+            d.t[2] = w.wr;
+            d.t[3] = w.bias;
+            d.t[4] = n.tab;
+            d.t[5] = n.meta;
+            d.t[6] = counters;
+            d.t[7] = maps;
+            d.i[0] = rows;
+            d.i[1] = e;
+            d.i[2] = h;
+            d.i[3] = tk;
+            d.i[4] = GLM_ROUTER_FLAGS;
+            d.i[5] = u32::from(dfold);
+            d.i[6] = c.n_group;
+            d.i[7] = c.topk_group;
+            d.f[0] = c.route_scale;
+            d.j[1] = e_route | tk_route << 16;
+        })
+    } else {
+        b.emit(DevOp::MoeRouterTopkPf, router_cus, &[c_score], |d| {
         d.t[0] = n.tab;
         d.t[1] = n.rlogit;
         d.t[3] = w.bias;
@@ -10799,8 +10846,9 @@ fn emit_glm_moe_ffn_rows(
         d.i[6] = c.n_group;
         d.i[7] = c.topk_group;
         d.f[0] = c.route_scale;
-    });
-    let c_routes = if flat {
+        })
+    };
+    let c_routes = if flat || router_dec {
         c_router
     } else {
         b.emit(DevOp::MoeAlignPf, one.clone(), &[c_router], |d| {

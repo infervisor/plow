@@ -530,6 +530,7 @@ pub fn classify(op: DevOp) -> OpClass {
         DevOp::MoeRouterTopkPf => a_rows("i4=T"),
         DevOp::MoeRouterGemmaPf => a_rows("i3=T"),
         DevOp::MoeAlignPf => b("i0=T; builds row_token / row_partidx / row_gate maps"),
+        DevOp::MoeRouterDec => cls_c("native decode-only router + top-k + align boundary; no packed-prefill route"),
         DevOp::MoeAlignGemmaPf => b("i0=T; builds row_token / row_partidx / row_gate maps"),
         DevOp::MoeGroupGluPf => b("t5=row_token gathers the source token per gathered row"),
         DevOp::MoeGroupDownPf => b("t6=row_partidx / t7=row_gate scatter per gathered row"),
