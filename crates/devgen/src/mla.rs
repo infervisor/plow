@@ -1879,7 +1879,8 @@ fn glm_linear_fp8(enc: MoeEnc) -> bool {
 }
 
 /// `PLOW_GLM53F_MLA_W8A8`: GLM-5.3-Flash (NoPE MLA) binds the checkpoint's block-FP8 q_a|kv_a and
-/// o_proj and runs them W8A8 (vLLM's a8w8 block-scale numerics); it implies both arms below.
+/// o_proj and runs them W8A8; it implies both arms below. NOT vLLM-equivalent: vLLM dequantizes these
+/// to bf16 at load. Off by default: FP32 gate passes (kl 0.0144) but B=128 decode 40 -> 71 ms/step.
 fn glm53f_mla_w8a8() -> bool {
     emit_config::active().glm53f_mla_w8a8
 }
