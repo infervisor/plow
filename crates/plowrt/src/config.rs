@@ -1698,6 +1698,11 @@ pub struct AmdRuntimeConfig {
     #[arg(long = "amd-packed-seg-major", env = "PLOW_AMD_PACKED_SEG_MAJOR", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub packed_seg_major: bool,
 
+    /// A planned prefill pack filling less than 3/4 of its rung runs as packs that each fit the
+    /// next narrower rung (four 1024-row chunks: two 2048 packs, not one half-empty 8192 pack).
+    #[arg(long = "amd-pack-fill", env = "PLOW_AMD_PACK_FILL", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub pack_fill: bool,
+
     /// Per-segment all-rank barrier timing for prefill (diagnostic; disables segment-major).
     #[arg(long = "amd-prefill-seg-timing", env = "PLOW_PREFILL_SEG_TIMING", hide = true, default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub prefill_seg_timing: bool,

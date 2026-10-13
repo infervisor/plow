@@ -141,6 +141,10 @@ pub trait SeqEngine {
     fn pack_pays(&self, _rows: &[u32]) -> bool {
         true
     }
+    /// Consecutive group sizes a planned pack of chunks `rows` runs as (`PLOW_AMD_PACK_FILL`).
+    fn pack_groups(&self, rows: &[u32]) -> Vec<usize> {
+        vec![rows.len()]
+    }
     /// [`Self::advance_packed_prefill`] with decode `feeds` riding as one-row spans;
     /// `output[i]` receives feed `i`'s next token; `Ok(false)` if they did not ride.
     fn advance_packed_mixed(
@@ -1189,6 +1193,42 @@ mod amd_serve {
         steps.extend(plan(c0 + rows, end)?);
         split_pending_prefill(cur, steps);
         Ok(())
+    }
+
+    /// Consecutive group sizes for a pack of chunks `rows` on a prefill ladder `rungs` (ascending).
+    /// A pack filling less than 3/4 of its rung runs as groups that each fit the next narrower
+    /// rung: four 1024-row chunks fill half the 8192 rung but exactly two 2048 rungs.
+    fn split_pack(rows: &[u32], rungs: &[u32]) -> Vec<usize> {
+        let whole = vec![rows.len()];
+        let total: u64 = rows.iter().map(|&r| r as u64).sum();
+        let Some(rung) = rungs.iter().copied().find(|&w| w as u64 >= total) else {
+            return whole;
+        };
+        if total * 4 >= rung as u64 * 3 {
+            return whole;
+        }
+        let Some(lower) = rungs.iter().copied().filter(|&w| w < rung).max() else {
+            return whole;
+        };
+        if rows.iter().any(|&r| r > lower) {
+            return whole;
+        }
+        let mut groups = Vec::new();
+        let (mut n, mut sum) = (0usize, 0u32);
+        for &r in rows {
+            if n > 0 && sum + r > lower {
+                groups.push(n);
+                (n, sum) = (0, 0);
+            }
+            n += 1;
+            sum += r;
+        }
+        groups.push(n);
+        if groups.len() == 1 {
+            whole
+        } else {
+            groups
+        }
     }
 
     /// `(program, decode rows ride)` for a mixed pack: `combined` covers the prefill spans plus
@@ -3427,6 +3467,17 @@ mod amd_serve {
             }
         }
 
+        /// [`split_pack`] over this packet's prefill ladder under `PLOW_AMD_PACK_FILL`.
+        pub fn pack_groups(&self, rows: &[u32]) -> Vec<usize> {
+            if !crate::config::RuntimeConfig::get().amd.pack_fill {
+                return vec![rows.len()];
+            }
+            let mut rungs: Vec<u32> =
+                self.ranks.rank0().prefill_rungs().map(|(_, width)| width).collect();
+            rungs.sort_unstable();
+            split_pack(rows, &rungs)
+        }
+
         /// Whether the live decode rows may ride a packed prefill launch (`PLOW_AMD_MIXED_PACK`).
         pub fn mixed_pack_ready(&self) -> bool {
             crate::config::RuntimeConfig::get().amd_mixed_pack
@@ -4285,7 +4336,7 @@ mod amd_serve {
     mod tests {
         use super::{
             body_respects_plan, cap_chunks_to_bodies, commit_mixed_prefill, commit_packed_prefill,
-            invalidate_prefix_metadata, mixed_cursor_rows, mixed_pack_route,
+            invalidate_prefix_metadata, mixed_cursor_rows, mixed_pack_route, split_pack,
             mixed_prefill_continuation_fits,
             mixed_prefill_padding_fits, multistep_feeds_armable, packable_prefill_step,
             parse_snapshot_tensors, slot_decode_position, snapshot_file_component,
@@ -4294,6 +4345,18 @@ mod amd_serve {
             DEFAULT_SNAPSHOT_TENSORS, MAX_SNAPSHOT_TENSORS,
         };
         use crate::exec::amd::ChunkStep;
+
+        #[test]
+        fn split_pack_fills_the_narrower_rung() {
+            let rungs = [128, 512, 2048, 8192];
+            assert_eq!(split_pack(&[1024; 4], &rungs), vec![2, 2]);
+            assert_eq!(split_pack(&[1024; 3], &rungs), vec![2, 1]);
+            assert_eq!(split_pack(&[1024; 6], &rungs), vec![6]);
+            assert_eq!(split_pack(&[1024; 2], &rungs), vec![2]);
+            assert_eq!(split_pack(&[4096, 1024], &rungs), vec![2]);
+            assert_eq!(split_pack(&[300, 300], &rungs), vec![1, 1]);
+            assert_eq!(split_pack(&[9000], &rungs), vec![1]);
+        }
 
         #[test]
         fn a_body_runs_only_the_attention_kind_its_member_was_planned_on() {
@@ -5349,6 +5412,9 @@ impl SeqEngine for AmdServe {
     }
     fn pack_pays(&self, rows: &[u32]) -> bool {
         AmdServe::pack_pays(self, rows)
+    }
+    fn pack_groups(&self, rows: &[u32]) -> Vec<usize> {
+        AmdServe::pack_groups(self, rows)
     }
     fn advance_packed_mixed(
         &mut self,

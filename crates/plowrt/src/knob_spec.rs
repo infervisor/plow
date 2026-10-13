@@ -637,6 +637,7 @@ pub const RUNTIME: &[KnobSpec] = &[
     KnobSpec::new("rt.seg_window", Some("PLOW_SEG_WINDOW"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
     KnobSpec::new("rt.tp_prefill_segment_major", Some("PLOW_TP_PREFILL_SEGMENT_MAJOR"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
     KnobSpec::new("rt.packed_seg_major", Some("PLOW_AMD_PACKED_SEG_MAJOR"), Layer::Runtime, Domain::Bool, OFF, DIAG),
+    KnobSpec::new("rt.pack_fill", Some("PLOW_AMD_PACK_FILL"), Layer::Runtime, Domain::Bool, OFF, DIAG),
     KnobSpec::new("rt.prefill_seg_timing", Some("PLOW_PREFILL_SEG_TIMING"), Layer::Runtime, Domain::Bool, OFF, DIAG),
     KnobSpec::new("rt.native_launch_timing", Some("PLOW_NATIVE_LAUNCH_TIMING"), Layer::Runtime, Domain::Bool, OFF, DIAG),
     KnobSpec::new("rt.union_skip", Some("PLOW_AMD_UNION_SKIP"), Layer::Runtime, Domain::Bool, ON, UNION_SKIP_QUALIFIED).scoped(UNION_SKIP_SCOPE),

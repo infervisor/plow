@@ -4780,21 +4780,33 @@ fn run_one_tick(
                         |program| e.packed_prefill_span_limit(program as usize),
                     )
                 };
-                // A pack wider than its members' isolated rungs together runs as lone launches.
+                // A pack wider than its members' isolated rungs together runs as lone launches;
+                // PLOW_AMD_PACK_FILL first splits a mostly empty pack into narrower full ones.
                 let launches: Vec<crate::sched::step::Launch> = step
                     .launches
                     .iter()
                     .flat_map(|launch| {
-                        let rows: Vec<u32> = launch.spans.iter().map(|s| s.n_rows).collect();
-                        if !launch.is_pack() || e.pack_pays(&rows) {
-                            vec![launch.clone()]
-                        } else {
-                            launch
-                                .spans
-                                .iter()
-                                .map(|&span| crate::sched::step::Launch { spans: vec![span] })
-                                .collect()
+                        if !launch.is_pack() {
+                            return vec![launch.clone()];
                         }
+                        let rows: Vec<u32> = launch.spans.iter().map(|s| s.n_rows).collect();
+                        let mut out = Vec::new();
+                        let mut at = 0usize;
+                        for n in e.pack_groups(&rows) {
+                            let spans = &launch.spans[at..at + n];
+                            let group_rows = &rows[at..at + n];
+                            at += n;
+                            if spans.len() == 1 || e.pack_pays(group_rows) {
+                                out.push(crate::sched::step::Launch {
+                                    spans: spans.to_vec(),
+                                });
+                            } else {
+                                out.extend(spans.iter().map(|&span| crate::sched::step::Launch {
+                                    spans: vec![span],
+                                }));
+                            }
+                        }
+                        out
                     })
                     .collect();
                 for launch in &launches {
