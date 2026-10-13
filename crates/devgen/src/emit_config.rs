@@ -593,6 +593,9 @@ pub struct EmitConfig {
     /// Experimental TP8 CDNA4 original Q-B and FP8 MLA projections.
     #[arg(long, env = "PLOW_GLM_MLA_W8A8", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub glm_mla_w8a8: bool,
+    /// GLM-5.3-Flash NoPE MLA: checkpoint block-FP8 q_a|kv_a and o_proj run W8A8.
+    #[arg(long, env = "PLOW_GLM53F_MLA_W8A8", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub glm53f_mla_w8a8: bool,
     /// MLA W8A8 prefill in the expanded (MHA) form vLLM runs: kv_b GEMM + D=256 flash.
     #[arg(long, env = "PLOW_GLM_MLA_MHA", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub glm_mla_mha: bool,
@@ -1637,6 +1640,7 @@ impl EmitConfig {
             glm_oproj_w8a8: env_bool("PLOW_GLM_OPROJ_W8A8"),
             glm_qkva_w8a8: env_bool("PLOW_GLM_QKVA_W8A8"),
             glm_mla_w8a8: env_bool("PLOW_GLM_MLA_W8A8"),
+            glm53f_mla_w8a8: env_bool("PLOW_GLM53F_MLA_W8A8"),
             glm_mla_mha: env_bool("PLOW_GLM_MLA_MHA"),
             glm_decode_shared_fold: env_bool("PLOW_GLM_DECODE_SHARED_FOLD"),
             glm_norm_q128: env_bool("PLOW_GLM_NORM_Q128"),

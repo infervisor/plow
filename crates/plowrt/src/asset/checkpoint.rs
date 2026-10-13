@@ -326,7 +326,14 @@ impl Checkpoint {
 
     /// Tensor bytes **and** shape — what a row-parallel shard needs.
     pub fn tensor_ex(&self, name: &str) -> Option<(&[u8], &[usize])> {
-        let e = self.index.get(name)?;
+        let Some(e) = self.index.get(name) else {
+            // A `.weight_fp8` name with no published twin binds the checkpoint's own block-FP8
+            // `.weight` bytes, even under a BF16 dequant shadow (GLM-5.3-Flash prepped dir).
+            return name
+                .strip_suffix("_fp8")
+                .filter(|w| w.ends_with(".weight"))
+                .and_then(|w| self.fp8_tensor_ex(w));
+        };
         let (map, off) = &self.shards[e.shard];
         let bytes = map.get(off + e.range.start..off + e.range.end)?;
         Some((bytes, &e.shape))

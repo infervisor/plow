@@ -1878,6 +1878,20 @@ fn glm_linear_fp8(enc: MoeEnc) -> bool {
     enc == MoeEnc::Fp8Blk && emit_config::active().glm_linear_fp8
 }
 
+/// `PLOW_GLM53F_MLA_W8A8`: GLM-5.3-Flash (NoPE MLA) binds the checkpoint's block-FP8 q_a|kv_a and
+/// o_proj and runs them W8A8 (vLLM's a8w8 block-scale numerics); it implies both arms below.
+fn glm53f_mla_w8a8() -> bool {
+    emit_config::active().glm53f_mla_w8a8
+}
+
+fn glm_qkva_w8a8() -> bool {
+    emit_config::active().glm_qkva_w8a8 || glm53f_mla_w8a8()
+}
+
+fn glm_oproj_w8a8() -> bool {
+    emit_config::active().glm_oproj_w8a8 || glm53f_mla_w8a8()
+}
+
 fn glm_oproj_split4(rows: u32, width: u32, k: u32) -> bool {
     // Pinned gfx950 AITER CK kernel 8 uses 1 << splitK (splitK=2) at these shapes.
     matches!(rows, 8 | 16) && width == 6144 && k == 2048
@@ -3483,8 +3497,8 @@ fn declare_glm_rows_batched_for_prefill(
         !blk.any() || (enc != MoeEnc::Mxfp4 && !lin_fp8 && !glm_ofold(enc)),
         "PLOW_GLM_GEMM_BLK excludes MXFP4, GLM_LINEAR_FP8 and PLOW_GLM_OFOLD"
     );
-    let oproj_w8a8 = emit_config::active().glm_oproj_w8a8;
-    let qkva_w8a8 = emit_config::active().glm_qkva_w8a8;
+    let oproj_w8a8 = glm_oproj_w8a8();
+    let qkva_w8a8 = glm_qkva_w8a8();
     let mla_w8a8 = emit_config::active().glm_mla_w8a8;
     let indexer_wq_w8a8 = emit_config::active().glm_indexer_wq_w8a8;
     let indexer_fp8 = emit_config::active().glm_indexer_fp8;
@@ -3555,16 +3569,21 @@ fn declare_glm_rows_batched_for_prefill(
     } else {
         [TENSOR_NONE; 3]
     };
+    let f53 = glm53f_mla_w8a8();
+    assert!(
+        !f53 || (dr == 0 && !mla_w8a8 && enc != MoeEnc::Mxfp4 && !c.quark_mixed && !blk.any()),
+        "PLOW_GLM53F_MLA_W8A8 requires the NoPE (GLM-5.3-Flash) block-FP8 MLA checkpoint"
+    );
     assert!(
         !qkva_w8a8
-            || ((lin_fp8 || c.quark_mixed)
+            || ((lin_fp8 || c.quark_mixed || f53)
                 && crate::emit_is_amd()
                 && crate::amd_target::active().1 == hwspec::IsaLevel::Gfx950
                 && h % 128 == 0
                 && ql > 0
                 && ql % 128 == 0
                 && dk > 0
-                && dr > 0),
+                && (dr > 0 || f53)),
         "PLOW_GLM_QKVA_W8A8 requires gfx950, block-FP8 QKV-A weights and aligned geometry"
     );
     assert!(
@@ -3581,7 +3600,7 @@ fn declare_glm_rows_batched_for_prefill(
     };
     assert!(
         !oproj_w8a8
-            || ((lin_fp8 || c.quark_mixed)
+            || ((lin_fp8 || c.quark_mixed || f53)
                 && crate::emit_is_amd()
                 && crate::amd_target::active().1 == hwspec::IsaLevel::Gfx950),
         "PLOW_GLM_OPROJ_W8A8 requires gfx950 block-FP8 o-projection weights"
@@ -3927,7 +3946,7 @@ fn declare_glm_rows_batched_for_prefill(
             },
             wo_s: if !mla || (c.quark_mixed && !oproj_w8a8) {
                 TENSOR_NONE
-            } else if lin_fp8 || (c.quark_mixed && oproj_w8a8) {
+            } else if lin_fp8 || (c.quark_mixed && oproj_w8a8) || f53 {
                 q8s(b, "self_attn.o_proj", h as u64, (nh_l * vd) as u64)
             } else {
                 mxs(b, "self_attn.o_proj.weight", h as u64, (nh_l * vd) as u64)
@@ -4045,7 +4064,7 @@ fn declare_glm_rows_batched_for_prefill(
             },
             wo: if !mla {
                 TENSOR_NONE
-            } else if lin_fp8 || (c.quark_mixed && oproj_w8a8) {
+            } else if lin_fp8 || (c.quark_mixed && oproj_w8a8) || f53 {
                 q8(b, "self_attn.o_proj", h as u64, (nh_l * vd) as u64)
             } else {
                 attn_tw(b, "self_attn.o_proj.weight", h as u64, (nh_l * vd) as u64)
@@ -5120,7 +5139,7 @@ pub(crate) fn emit_glm_mla(
     // returns None for the last slot, so the two ends of the seam agree by construction).
     let seam_fold = slot > 0 && glm_fuse_seam(b, tp, w.gin);
     let dec_norm_q = emit_config::active().glm_norm_q128
-        && emit_config::active().glm_qkva_w8a8
+        && glm_qkva_w8a8()
         && !seam_fold
         && h % 128 == 0;
     let c_rn1 = if seam_fold {
@@ -5152,7 +5171,7 @@ pub(crate) fn emit_glm_mla(
     //   their output columns concatenate into ONE GemvQkv (Nq=ql q_a, Nk=dk kv_a, Nv=dr k_rope) that
     //   fills every wave (fixing the k_rope/kv_a CU-starvation) and deletes 2 gates/layer. Byte-exact
     //   to the three Gemvs. Legal: M*K = h fits GM_LDS_HALVES.
-    let (c_qad, c_ckvd, c_krr) = if emit_config::active().glm_qkva_w8a8 {
+    let (c_qad, c_ckvd, c_krr) = if glm_qkva_w8a8() {
         let done = emit_glm_qkva_w8a8(b, &all, n, w, rows, h, ql, dk, dr, c_rn1, dec_norm_q);
         (done, done, done)
     } else if fuse_a {
@@ -5809,7 +5828,7 @@ pub(crate) fn emit_glm_mla(
     // fp8 arm it goes through GEMV_FP8_BLK (44) reading the checkpoint's own [128,128] grid from
     // t5 — the same opcode/slot the dense-FFN down projection already uses (`dense_down_op`).
     let o_gemv = |b: &mut Builder, out: u32, deps: &[u32]| -> u32 {
-        if emit_config::active().glm_oproj_w8a8 {
+        if glm_oproj_w8a8() {
             emit_glm_oproj_w8a8(b, &all, n, out, w.wo, w.wo_s, rows, h, nh_l * vd, deps)
         } else if lin_fp8 {
             b.emit(DevOp::GemvFp8Blk, all.clone(), deps, |d| {
@@ -8293,7 +8312,7 @@ pub(crate) fn emit_glm_mla_prefill(
     // Band projections: `widx` rides slot 0, whose next writer (this layer's o_proj) is ordered
     // behind every peer's gather only by the TP indexer's rendezvous.
     let sp_proj = sp
-        && !emit_config::active().glm_qkva_w8a8
+        && !glm_qkva_w8a8()
         && (!band_indexer || sparse)
         && n.ug_tp != TENSOR_NONE
         && dr > 0
@@ -8429,7 +8448,7 @@ pub(crate) fn emit_glm_mla_prefill(
         && ql % 128 == 0;
     let (c_ckvd, c_krr, c_rnq) = if let Some((g, _)) = proj_g {
         (g, g, g)
-    } else if emit_config::active().glm_qkva_w8a8 {
+    } else if glm_qkva_w8a8() {
         let done = emit_glm_qkva_w8a8(b, &all, n, w, t, h, ql, dk, dr, c_rn1, false);
         let norm = b.emit(DevOp::RmsNorm, pf_wide_cus(n_cu, t), &[done], |d| {
             d.t[..3].copy_from_slice(&[n.qlat, n.qlr, w.gqa]);
@@ -9036,7 +9055,7 @@ pub(crate) fn emit_glm_mla_prefill(
             deps,
         ) {
             counter
-        } else if emit_config::active().glm_oproj_w8a8 {
+        } else if glm_oproj_w8a8() {
             emit_glm_oproj_w8a8(b, &all, n, out, w.wo, w.wo_s, t, h, nh_l * vd, deps)
         } else if lin_fp8 {
             emit_pf_gemm_fp8_blk(b, &all, out, n.oat, w.wo, w.wo_s, t, h, nh_l * vd, deps)
@@ -9056,7 +9075,7 @@ pub(crate) fn emit_glm_mla_prefill(
         || enc == MoeEnc::Mxfp4
         || ofold
         || blk_oproj
-        || emit_config::active().glm_oproj_w8a8
+        || glm_oproj_w8a8()
     {
         1
     } else {

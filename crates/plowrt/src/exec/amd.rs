@@ -5209,6 +5209,41 @@ fn kv_skips_zeroing(name: &str) -> bool {
 /// bf16 would round away most of what the multiply just computed, and the packet
 /// declares f32 for that reason. There is no TP axis here — `[hidden]` is
 /// replicated on every rank — so this runs identically at any `--num-gpus`.
+/// `…fused_qkv_a_proj.{weight_fp8,weight_scale_inv}` for a checkpoint that stores `q_a_proj` and
+/// `kv_a_proj_with_mqa` as separate block-FP8 tensors (GLM-5.3-Flash): the `[N,K]` rows
+/// concatenate, and so do the `[N/128][K/128]` scale grids because q_a's N is a multiple of 128.
+/// `None` when the name is not this pattern or a prep already published the fused tensor.
+fn fused_qkv_a_fp8(c: &crate::asset::checkpoint::Checkpoint, name: &str) -> Option<Result<Vec<u8>>> {
+    let (stem, scale) = match name.strip_suffix("fused_qkv_a_proj.weight_fp8") {
+        Some(s) => (s, false),
+        None => (name.strip_suffix("fused_qkv_a_proj.weight_scale_inv")?, true),
+    };
+    if c.tensor_ex(name).is_some() {
+        return None;
+    }
+    let mut out = Vec::new();
+    for proj in ["q_a_proj", "kv_a_proj_with_mqa"] {
+        let src = format!("{stem}{proj}.weight");
+        let got = if scale {
+            c.tensor_ex(&format!("{src}_scale_inv"))
+        } else {
+            c.fp8_tensor_ex(&src)
+        };
+        let Some((bytes, shape)) = got else {
+            return Some(Err(RuntimeError::Device(format!(
+                "MISSING WEIGHT: {name} is DERIVED from block-FP8 `{src}` and its scale grid"
+            ))));
+        };
+        if proj == "q_a_proj" && !scale && shape.first().is_none_or(|n| n % 128 != 0) {
+            return Some(Err(RuntimeError::Device(format!(
+                "{name}: q_a rows {shape:?} are not a multiple of 128"
+            ))));
+        }
+        out.extend_from_slice(bytes);
+    }
+    Some(Ok(out))
+}
+
 fn fold_res_score(c: &crate::asset::checkpoint::Checkpoint, name: &str) -> Option<Result<Vec<u8>>> {
     let stem = name.strip_suffix("_res_score.weight")?;
     let bf16 = |n: &str| -> Option<Vec<f32>> {
@@ -5283,7 +5318,9 @@ fn preflight_weights(
         // DERIVED, and in no checkpoint by design — `fold_res_score` builds it from a norm
         // and a proj. Without this exemption a Kimi-K3 load reports 186 false MISSING
         // WEIGHTs before it starts.
-        if stripped.ends_with("_res_score.weight") {
+        if stripped.ends_with("_res_score.weight")
+            || (stripped.contains(".fused_qkv_a_proj.") && c.tensor_ex(stripped).is_none())
+        {
             continue;
         }
         let Some((src, shape)) = c.tensor_ex(&td.name).or_else(|| c.tensor_ex(stripped)) else {
@@ -9698,7 +9735,9 @@ impl AmdEngine {
                 // tensor, and skipping it would shift every later tensor's index
                 // against the table the packet was compiled with.
                 let folded = match src_ckpt {
-                    Some(c) => fold_res_score(c, &td.name).transpose()?,
+                    Some(c) => fold_res_score(c, &td.name)
+                        .or_else(|| fused_qkv_a_fp8(c, &td.name))
+                        .transpose()?,
                     None => None,
                 };
                 if let Some(folded) = folded {

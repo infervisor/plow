@@ -1228,6 +1228,7 @@ pub const EMIT: &[KnobSpec] = &[
     KnobSpec::new("emit.glm_oproj_w8a8", Some("PLOW_GLM_OPROJ_W8A8"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.glm_qkva_w8a8", Some("PLOW_GLM_QKVA_W8A8"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.glm_mla_w8a8", Some("PLOW_GLM_MLA_W8A8"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
+    KnobSpec::new("emit.glm53f_mla_w8a8", Some("PLOW_GLM53F_MLA_W8A8"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.glm_mla_mha", Some("PLOW_GLM_MLA_MHA"), Layer::Emit, Domain::Bool, OFF, OPT_IN).with(C_MLA_MHA),
     KnobSpec::new("emit.glm_decode_shared_fold", Some("PLOW_GLM_DECODE_SHARED_FOLD"), Layer::Emit, Domain::Bool, OFF, OPT_IN).with(C_DECODE_SHARED_FOLD),
     KnobSpec::new("emit.glm_norm_q128", Some("PLOW_GLM_NORM_Q128"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
