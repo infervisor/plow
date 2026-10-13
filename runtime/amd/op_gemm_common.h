@@ -1078,6 +1078,14 @@ __device__ void d_gemm_f32(float* C, const bf16* A, const bf16* B, unsigned M, u
              false, false, false, true>((bf16*)C, A, B, nullptr, nullptr, M, N, K, slice, nblk,
                                         lds);
 }
+/* The 128x128 / 64x128 fp32-output rungs PLOW_GEMM_PF_REPICK takes when the 256x256 tile leaves
+ * the machine idle (the router's N=288 at a live M of 4096 is 32 tiles). Same MFMA, same k order. */
+template <int BM, int BN, int BK>
+__device__ void d_gemm_f32_t(float* C, const bf16* A, const bf16* B, unsigned M, unsigned N,
+                             unsigned K, unsigned slice, unsigned nblk, bf16* lds) {
+    d_gemm_t<BM, BN, BK, GM_WM, GM_WN, false, GM_SWZ, GM_WGM, (GM_PP != 0), true, false, false,
+             false, true>((bf16*)C, A, B, nullptr, nullptr, M, N, K, slice, nblk, lds);
+}
 
 /* MXFP4 (w4a16) PREFILL GEMM. A is bf16 activations, W is packed-2/byte fp4 weights (row stride
  * K/2 bytes) with E8M0 scale rows `wscale` (K/32 bytes/row). Reuses the entire bf16 d_gemm_t —
