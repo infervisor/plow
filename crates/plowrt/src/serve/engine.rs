@@ -903,6 +903,13 @@ mod amd_serve {
         prefix_clone: bool,
         cached_prompt: Vec<Vec<u32>>,
         snap_at: Vec<u32>,
+        /// Under an end arm (`PLOW_PREFIX_ARM_END`) the snapshot sits after the prompt's last
+        /// row, so a resume there has no row left to produce the first token. Per slot: the
+        /// token that prefill sampled after `cached_prompt[..snap_at]` and its raw `act.logits`
+        /// row (empty when the packet keeps none), so an identical prompt resumes at its end and
+        /// goes straight to decode. `None` whenever the snapshot is not an end arm.
+        end_tok: Vec<Option<u32>>,
+        end_logits: Vec<Vec<u8>>,
         cached_rows: Vec<u32>,
         /// Per-slot generation, bumped on release. Carried on every token-batch request and
         /// re-checked by the planner and the commit, so a slot recycled mid-step cannot be
@@ -1418,6 +1425,9 @@ mod amd_serve {
     /// Shortest prefix worth caching. Below this the snapshot/restore pair costs more than the
     /// prefill it skips, and it churns the slot's cached prompt for nothing.
     const MIN_PREFIX: u32 = 128;
+    /// `lp_row` of a slot whose first token came from an end resume: its logits are the host
+    /// copy in `end_logits`.
+    const END_LOGITS_ROW: usize = usize::MAX - 1;
 
     fn stage_parked(parked: &mut [u32], advance: &[usize]) {
         parked.fill(1);
@@ -1459,10 +1469,15 @@ mod amd_serve {
         armed: bool,
         prompt: &[u32],
         arm_end: bool,
+        end_hit: bool,
     ) -> (u32, u32) {
         let cap = prompt.len().saturating_sub(1) as u32;
-        let lcp = (common_prefix_len(cached, prompt) as u32).min(cap);
-        if armed && snap > 0 && snap <= lcp {
+        let full = common_prefix_len(cached, prompt) as u32;
+        let lcp = full.min(cap);
+        // `end_hit`: the snapshot is an end arm with its first token kept, so a prompt equal to
+        // `cached[..snap]` resumes at its last row and runs no chunk.
+        let whole = end_hit && snap as usize == prompt.len() && full == snap;
+        if armed && snap > 0 && (snap <= lcp || whole) {
             (snap, 0)
         } else if cap >= MIN_PREFIX {
             (
@@ -1704,6 +1719,8 @@ mod amd_serve {
                 prefix_clone,
                 cached_prompt: vec![Vec::new(); batch],
                 snap_at: vec![0; batch],
+                end_tok: vec![None; batch],
+                end_logits: vec![Vec::new(); batch],
                 cached_rows: vec![0; batch],
                 slot_generation: vec![0; batch],
                 pf: (0..batch).map(|_| None).collect(),
@@ -1921,7 +1938,8 @@ mod amd_serve {
                 last
             } else {
                 self.adopt_prefix(slot, prompt)?;
-                let (resume, arm) = self.plan_prefix(slot, prompt);
+                // Whole-prompt prefill always runs a chunk, so it cannot take an end resume.
+                let (resume, arm) = self.plan_prefix(slot, prompt, false);
                 self.cached_rows[slot] = resume;
                 if resume == 0 {
                     self.invalidate_prefix(slot);
@@ -1966,10 +1984,9 @@ mod amd_serve {
                     // it valid (the new prompt agrees over that span); an arm replaces it;
                     // anything else makes it stale, so drop it.
                     self.cached_prompt[slot] = prompt.to_vec();
-                    if arm > 0 {
+                    if arm > 0 || resume == 0 {
                         self.snap_at[slot] = arm;
-                    } else if resume == 0 {
-                        self.snap_at[slot] = 0;
+                        self.end_tok[slot] = None;
                     }
                 }
                 self.pos[slot] = prompt.len() as u32;
@@ -2003,12 +2020,18 @@ mod amd_serve {
                 return Ok(());
             }
             let cap = prompt.len().saturating_sub(1);
-            let covered = |cached: &[u32], snap: u32| {
-                snap > 0 && snap as usize <= common_prefix_len(cached, prompt).min(cap)
+            let covered = |cached: &[u32], snap: u32, end: bool| {
+                let lcp = common_prefix_len(cached, prompt);
+                snap > 0
+                    && (snap as usize <= lcp.min(cap)
+                        || (end && snap as usize == prompt.len() && lcp >= prompt.len()))
             };
             let own = if self.ranks.has_snapshot(slot)
-                && covered(&self.cached_prompt[slot], self.snap_at[slot])
-            {
+                && covered(
+                    &self.cached_prompt[slot],
+                    self.snap_at[slot],
+                    self.end_tok[slot].is_some(),
+                ) {
                 self.snap_at[slot]
             } else {
                 0
@@ -2017,7 +2040,11 @@ mod amd_serve {
                 .filter(|&d| {
                     d != slot
                         && self.snap_at[d] > own
-                        && covered(&self.cached_prompt[d], self.snap_at[d])
+                        && covered(
+                            &self.cached_prompt[d],
+                            self.snap_at[d],
+                            self.end_tok[d].is_some(),
+                        )
                         && self.ranks.has_snapshot(d)
                 })
                 .max_by_key(|&d| self.snap_at[d])
@@ -2029,11 +2056,17 @@ mod amd_serve {
                 tracing::debug!(donor, slot, snap, "amd: prefix adopted from another slot");
                 self.cached_prompt[slot] = self.cached_prompt[donor][..snap as usize].to_vec();
                 self.snap_at[slot] = snap;
+                self.end_tok[slot] = self.end_tok[donor];
+                let src = std::mem::take(&mut self.end_logits[donor]);
+                self.end_logits[slot].clone_from(&src);
+                self.end_logits[donor] = src;
             }
             Ok(())
         }
 
-        fn plan_prefix(&self, slot: usize, prompt: &[u32]) -> (u32, u32) {
+        /// `end_resume`: the caller can complete a prompt without running a chunk (see
+        /// `end_tok`), so an end-armed snapshot may serve the identical prompt.
+        fn plan_prefix(&self, slot: usize, prompt: &[u32], end_resume: bool) -> (u32, u32) {
             if !self.prefix_cache {
                 return (0, 0);
             }
@@ -2047,6 +2080,7 @@ mod amd_serve {
                 armed,
                 prompt,
                 crate::config::RuntimeConfig::get().prefix_arm_end,
+                end_resume && self.end_tok[slot].is_some(),
             )
         }
 
@@ -2069,20 +2103,30 @@ mod amd_serve {
             let Some(&at) = self.lp_row.get(slot) else {
                 return false;
             };
-            if at >= self.batch || row == 0 || row % elem != 0 {
-                return false;
+            let mut bytes;
+            if at == END_LOGITS_ROW {
+                bytes = self.end_logits[slot].clone();
+            } else {
+                if at >= self.batch || row == 0 || row % elem != 0 {
+                    return false;
+                }
+                bytes = vec![0u8; row];
+                if let Err(err) = e.read_tensor_range("act.logits", (at * row) as u64, &mut bytes) {
+                    tracing::warn!(error = %err, slot, "amd: logits row readback failed");
+                    return false;
+                }
             }
-            let mut bytes = vec![0u8; row];
-            if let Err(err) = e.read_tensor_range("act.logits", (at * row) as u64, &mut bytes) {
-                tracing::warn!(error = %err, slot, "amd: logits row readback failed");
+            if bytes.len() != row || row % elem != 0 {
                 return false;
             }
             out.clear();
             out.reserve(row / elem);
             if elem == 2 {
-                out.extend(bytes.chunks_exact(2).map(|c| {
-                    f32::from_bits(u32::from(u16::from_le_bytes([c[0], c[1]])) << 16)
-                }));
+                out.extend(
+                    bytes
+                        .chunks_exact(2)
+                        .map(|c| f32::from_bits(u32::from(u16::from_le_bytes([c[0], c[1]])) << 16)),
+                );
             } else {
                 out.extend(
                     bytes
@@ -2097,6 +2141,7 @@ mod amd_serve {
         /// ineligible before the first write so cancellation or a device error cannot later pair
         /// old recurrent state with the newly overwritten KV rows.
         fn invalidate_prefix(&mut self, slot: usize) {
+            self.end_tok[slot] = None;
             invalidate_prefix_metadata(
                 self.prefix_cache,
                 &mut self.cached_prompt,
@@ -2163,7 +2208,9 @@ mod amd_serve {
                     (self.ranks.attach_shared_prefix(slot, prompt)?, 0)
                 } else {
                     self.adopt_prefix(slot, prompt)?;
-                    self.plan_prefix(slot, prompt)
+                    // A token-batch member must take rows, so that route keeps end resumes off.
+                    let end_resume = self.token_batch_rows(1, 0, 1).is_none();
+                    self.plan_prefix(slot, prompt, end_resume)
                 };
                 self.cursor_split_ns = (clear_ns, t_attach.elapsed().as_nanos() as u64);
                 if shared {
@@ -2204,7 +2251,11 @@ mod amd_serve {
                     )
                 };
                 let (steps, snap_after) = {
-                    if resume > 0 {
+                    if resume == n {
+                        // An end resume: no rows left, `prefill_chunk_rows` completes it with the
+                        // kept first token.
+                        (Vec::new(), None)
+                    } else if resume > 0 {
                         (plan(resume, n)?, None)
                     } else if arm > 0 {
                         let head = plan(0, arm)?;
@@ -2274,6 +2325,14 @@ mod amd_serve {
             let t_all = std::time::Instant::now();
             self.prepare_prefill_cursor(slot, prompt, tick_max_bucket)?;
             let cursor_ns = t_all.elapsed().as_nanos() as u64;
+            if self.pf[slot]
+                .as_ref()
+                .is_some_and(|cur| cur.steps.is_empty())
+            {
+                return self
+                    .finish_end_resume(slot, prompt)
+                    .map(|t| (Some(t), None));
+            }
             let g = &mut self.ranks;
             let max_bucket = self.prefill_chunk_rows.min(tick_max_bucket);
             let pending = {
@@ -2400,10 +2459,12 @@ mod amd_serve {
                 // else makes it stale.
                 self.cached_prompt[slot].clear();
                 self.cached_prompt[slot].extend_from_slice(prompt);
-                if arm > 0 {
+                if arm > 0 || resume == 0 {
                     self.snap_at[slot] = arm;
-                } else if resume == 0 {
-                    self.snap_at[slot] = 0;
+                    self.end_tok[slot] = None;
+                }
+                if arm == n {
+                    self.keep_end_token(slot, tok)?;
                 }
             }
             Ok((Some(tok), ran))
@@ -2417,6 +2478,43 @@ mod amd_serve {
                 Ranks::One(e) => e.mixed_step_rows(decode_rows, prefill_rows),
                 Ranks::Tp(_) => None,
             }
+        }
+
+        /// Keep `tok` and the logits row behind it with `slot`'s end-arm snapshot.
+        fn keep_end_token(&mut self, slot: usize, tok: u32) -> Result<()> {
+            self.end_tok[slot] = Some(tok);
+            let row = &mut self.end_logits[slot];
+            row.clear();
+            if self.logits_elem.is_none() {
+                return Ok(());
+            }
+            let e = self.ranks.rank0();
+            let Some(total) = e.tensor_bytes("act.logits") else {
+                return Ok(());
+            };
+            row.resize(total as usize / self.batch, 0);
+            // The prefill tail wrote its one logits row at row 0 (`lp_row`).
+            e.read_tensor_range("act.logits", 0, row)
+        }
+
+        /// Complete an end resume: the KV rows and the restored recurrence already hold the
+        /// whole prompt, so the first token is the one the arming prefill sampled.
+        fn finish_end_resume(&mut self, slot: usize, prompt: &[u32]) -> Result<u32> {
+            let tok = self.end_tok[slot].ok_or_else(|| {
+                RuntimeError::Device(format!("slot {slot}: end resume without a kept token"))
+            })?;
+            self.pf[slot] = None;
+            self.pos[slot] = prompt.len() as u32;
+            self.live[slot] = true;
+            self.lp_row[slot] = if self.end_logits[slot].is_empty() {
+                usize::MAX
+            } else {
+                END_LOGITS_ROW
+            };
+            self.cached_prompt[slot].clear();
+            self.cached_prompt[slot].extend_from_slice(prompt);
+            tracing::debug!(slot, tok, n = prompt.len(), "pf end resume");
+            Ok(tok)
         }
 
         pub fn prepare_prefill_slot(
@@ -2978,10 +3076,9 @@ mod amd_serve {
                     let prompt = members.iter().find(|m| m.0 == slot).unwrap().1;
                     self.cached_prompt[slot].clear();
                     self.cached_prompt[slot].extend_from_slice(prompt);
-                    if cur.arm > 0 {
+                    if cur.arm > 0 || cur.resume == 0 {
                         self.snap_at[slot] = cur.arm;
-                    } else if cur.resume == 0 {
-                        self.snap_at[slot] = 0;
+                        self.end_tok[slot] = None;
                     }
                 }
             }
@@ -2992,7 +3089,8 @@ mod amd_serve {
         /// exists. The mux's step budget admits an isolated chunk only when this fits.
         pub fn next_prefill_rows(&self, slot: usize) -> Option<u32> {
             let cur = self.pf.get(slot)?.as_ref()?;
-            cur.steps.get(cur.next).map(|step| step.clen)
+            // An end resume runs no rows; 1 keeps it a planned, always-fitting candidate.
+            Some(cur.steps.get(cur.next).map_or(1, |step| step.clen))
         }
 
         /// The AMD arm as the step planner sees it: the budget is the widest compiled prefill
@@ -4431,23 +4529,79 @@ mod amd_serve {
         #[test]
         fn prefix_admission_preserves_replay_row_and_rejects_evicted_or_changed_state() {
             let prompt: Vec<u32> = (0..1024).collect();
-            assert_eq!(super::prefix_plan(&[], 0, false, &prompt, false), (0, 992));
-            assert_eq!(super::prefix_plan(&prompt, 992, true, &prompt, false), (992, 0));
-            assert_eq!(super::prefix_plan(&prompt, 992, false, &prompt, false), (0, 1023));
+            assert_eq!(
+                super::prefix_plan(&[], 0, false, &prompt, false, false),
+                (0, 992)
+            );
+            assert_eq!(
+                super::prefix_plan(&prompt, 992, true, &prompt, false, false),
+                (992, 0)
+            );
+            assert_eq!(
+                super::prefix_plan(&prompt, 992, false, &prompt, false, false),
+                (0, 1023)
+            );
             let mut changed = prompt.clone();
             changed[0] = 9999;
-            assert_eq!(super::prefix_plan(&prompt, 992, true, &changed, false), (0, 992));
             assert_eq!(
-                super::prefix_plan(&prompt, 992, true, &prompt[..128], false),
+                super::prefix_plan(&prompt, 992, true, &changed, false, false),
+                (0, 992)
+            );
+            assert_eq!(
+                super::prefix_plan(&prompt, 992, true, &prompt[..128], false, false),
                 (0, 0)
             );
-            assert_eq!(super::prefix_plan(&[], 0, false, &prompt[..1], false), (0, 0));
-            assert_eq!(super::prefix_plan(&[], 0, false, &prompt, true), (0, 1024));
+            assert_eq!(
+                super::prefix_plan(&[], 0, false, &prompt[..1], false, false),
+                (0, 0)
+            );
+            assert_eq!(
+                super::prefix_plan(&[], 0, false, &prompt, true, false),
+                (0, 1024)
+            );
             let next: Vec<u32> = (0..1030).collect();
-            assert_eq!(super::prefix_plan(&prompt, 1024, true, &next, true), (1024, 0));
-            assert_eq!(super::prefix_plan(&prompt, 1024, true, &prompt, true), (0, 1024));
-            assert_eq!(super::prefix_plan(&next, 1030, true, &prompt, true), (0, 1024));
-            assert_eq!(super::prefix_plan(&next, 1030, true, &next[..600], true), (0, 600));
+            assert_eq!(
+                super::prefix_plan(&prompt, 1024, true, &next, true, false),
+                (1024, 0)
+            );
+            assert_eq!(
+                super::prefix_plan(&prompt, 1024, true, &prompt, true, false),
+                (0, 1024)
+            );
+            assert_eq!(
+                super::prefix_plan(&next, 1030, true, &prompt, true, false),
+                (0, 1024)
+            );
+            assert_eq!(
+                super::prefix_plan(&next, 1030, true, &next[..600], true, false),
+                (0, 600)
+            );
+            // An end arm that kept its first token: the identical prompt resumes at its end, a
+            // continuation still resumes there, a shorter prefix still runs cold.
+            assert_eq!(
+                super::prefix_plan(&prompt, 1024, true, &prompt, true, true),
+                (1024, 0)
+            );
+            assert_eq!(
+                super::prefix_plan(&prompt, 1024, true, &next, true, true),
+                (1024, 0)
+            );
+            assert_eq!(
+                super::prefix_plan(&next, 1024, true, &prompt, true, true),
+                (1024, 0)
+            );
+            assert_eq!(
+                super::prefix_plan(&prompt, 1024, false, &prompt, true, true),
+                (0, 1024)
+            );
+            assert_eq!(
+                super::prefix_plan(&prompt, 1024, true, &prompt[..1000], true, true),
+                (0, 1000)
+            );
+            assert_eq!(
+                super::prefix_plan(&prompt, 1024, true, &changed, true, true),
+                (0, 1024)
+            );
         }
 
         #[test]

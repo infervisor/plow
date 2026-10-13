@@ -4925,7 +4925,9 @@ fn run_one_tick(
                                 .observe_launch(ran.bucket, ran.clen, ran.c0, fresh, ms);
                         }
                         let frontier = e.prefill_frontier(i).unwrap_or(slot_ref.prompt_ids.len());
-                        let ran_rows = frontier.saturating_sub(slot_ref.pf_pos) as u32;
+                        // Prefix-cache rows were resumed, not run (an end resume runs none).
+                        let ran_rows =
+                            frontier.saturating_sub(slot_ref.pf_pos.max(e.cached_rows(i))) as u32;
                         b2b_used = b2b_used.saturating_add(ran_rows);
                         crate::obs::tick::prefill(t_pf.elapsed().as_nanos() as u64, ran_rows);
                         if let Some(s) = slots[i].as_mut() {

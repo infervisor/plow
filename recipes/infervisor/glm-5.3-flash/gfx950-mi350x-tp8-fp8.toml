@@ -120,7 +120,8 @@ args = [
 # a prompt sharing no cached prefix snapshots after its last chunk instead of at a split 32 rows
 # before the end, so a cold prompt is one launch (the 32-row tail cost 62 ms of ~190 at 1k).
 # Continuations (prompt + reply) resume at the full prompt and a shared prefix still arms at the
-# common prefix; an identical re-sent prompt now runs cold (no hit), streaming what the first did.
+# common prefix; an identical re-sent prompt resumes at its end too, taking the first token and
+# logits row kept with the snapshot (no launch; c1 re-sends stream and logprob what the first did).
 # Served 2026-10-13 (doc §4), total tok/s v8 -> this: isl1024 c32/c128 2427/2861 -> 3106/5199,
 # isl4096 6303/6330 -> 7661/10218; TTFT p99 c128 45.4 -> 17.1 s (1k), 78.7 -> 46.7 s (4k);
 # TPOT p99 c128 191 -> 213 ms (1k), 217 -> 384 ms (4k).

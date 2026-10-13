@@ -555,6 +555,17 @@ The packet from config + index alone (no weights) is 70 MB: 4 prefill buckets + 
   phase C hits (8192 cached) equal the cache-off streams, FP32 gate PASS kl_mean 0.0143, kl_p99
   0.240, top1_decisive 0.9967, needles 18/18. Phase B (identical re-sends on other slots) no
   longer hits: the cost of the end arm. Recipe [serve] takes both knobs.
+- 04:45 UTC (10-13), end-armed re-sends hit again (branch serve-prefix-end-resend). An end-arm
+  snapshot now also keeps the sampled first token and rank 0's `act.logits` row (host copy, only
+  when the packet keeps one); an identical prompt (on its slot or adopted cross-slot) restores the
+  snapshot at n, runs no chunk and goes straight to decode with that token; logprobs read the kept
+  row. Resumed rows no longer count against the back-to-back tick budget. No new knob. v8b, recipe
+  env: c1 re-sends cached = prompt for all 8 prompts >= 128 rows (339..8192), streams and
+  logprobs equal to the cold run 11/11 and to the cache-off run 22/22; re-send wall 1.0-1.15 s ->
+  0.78-0.80 s for 32 tokens; prefix-check2 phase B 4/8 hit with 4096 cached (the other four lose
+  their donor slots to those adoptions: the per-slot design), B equal A 8/8; the only off-vs-on
+  differences (one per phase) sit at exact top-2 ties (gap 0.0) that the cache-off control also
+  flips between A and B; long needles 36/36.
 - 17:35 UTC, E10 TP4 bench (packet pkt-glm53flash-tp4-ladder-v4, 4 GPUs, real prompt, streams
   exact at every rung): scalar (rung 8) 55.5 ms, B=8 51.4, B=32 63.3, B=64 74.6 ms (858 tok/s
   per group); prefill 1k 204 ms (TP8 173). Two such groups (DP2xTP4) would serve 128 streams at

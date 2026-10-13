@@ -596,7 +596,8 @@ pub struct RuntimeConfig {
     /// Expert (AMD prefix cache): a prompt sharing no cached prefix snapshots its recurrent state
     /// after its LAST chunk instead of at a split 32 rows before the end, so a cold prompt runs
     /// no extra tail launch. A continuation (prompt + reply + ...) resumes at the full prompt; an
-    /// identical re-sent prompt runs cold and unsplit again (same stream, no hit).
+    /// identical re-sent prompt resumes there too and takes the first token (and its logits row)
+    /// kept with the snapshot, running no chunk.
     #[arg(long = "prefix-arm-end", env = "PLOW_PREFIX_ARM_END", hide = true, default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub prefix_arm_end: bool,
 
