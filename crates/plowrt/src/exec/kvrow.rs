@@ -383,7 +383,8 @@ pub(crate) fn rebase_chunk_rows(
         } else if op == DevOp::DsaPoolCompress as u16 {
             let pool_size = d.i[1].max(1);
             d.i[0] = clen / pool_size;
-        } else if op == DevOp::DsaPoolStash as u16 {
+        } else if op == DevOp::DsaPoolStash as u16 && d.i[4] != 1 {
+            // `i[4] = 1` is the per-span packed form; it addresses rows through the span table.
             let pool_size = d.i[0].max(1);
             let pad = t.saturating_sub(clen);
             let complete = (clen / pool_size) * pool_size;

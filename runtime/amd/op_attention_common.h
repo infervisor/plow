@@ -5124,6 +5124,38 @@ __device__ void d_index_score_kpool(float* __restrict__ Score, const uint8_t* __
     const auto* const Wg = as_glob(W);
     const unsigned tid = threadIdx.x;
     const unsigned HI = index_heads;
+    /* Batched decode: (row, PLOW_THREADS-pool chunk) items spread over the workgroups instead of
+     * every workgroup walking every row. Same per-element arithmetic as the loop below. */
+    if (!prefill && n_batch > 1u && !FAKEQ) {
+        const unsigned nch = (pool_stride + PLOW_THREADS - 1u) / PLOW_THREADS;
+        for (unsigned it = slice; it < n_batch * nch; it += nblk) {
+            const unsigned b = it / nch, p0 = (it % nch) * PLOW_THREADS;
+            const unsigned len = (unsigned)kv_len[b] / pool_size;
+            if (p0 >= len) continue;
+            __syncthreads();
+            for (unsigned i = tid; i < HI * (unsigned)DI; i += PLOW_THREADS)
+                qlds[i] = Qg[(size_t)b * HI * DI + i];
+            __syncthreads();
+            const unsigned p = p0 + tid;
+            if (p >= len) continue;
+            const auto* wb = Wg + (size_t)b * HI;
+            const auto* qs = Qs + (size_t)b * HI;
+            const size_t kbatch = (size_t)b * pool_stride;
+            const auto* kp = Kg + (kbatch + p) * DI;
+            const float ks = Ks[kbatch + p];
+            float s = 0.0f;
+            for (unsigned h = 0; h < HI; h++) {
+                float d = 0.0f;
+                const uint8_t* qh = qlds + (size_t)h * DI;
+                for (int i = 0; i < DI; i++) d += dequant_fp8(qh[i]) * dequant_fp8(kp[i]);
+                d = bf2f(f2bf(d));
+                d *= ks;
+                s += wb[h] * qs[h] * (d > 0.0f ? d : 0.0f);
+            }
+            Sc[kbatch + p] = s * scale;
+        }
+        return;
+    }
     for (unsigned b = 0; b < n_batch; b++) {
         const unsigned token_len = prefill ? (unsigned)(kv_len[0] - (int)n_batch + (int)b + 1)
                                            : (unsigned)kv_len[b];

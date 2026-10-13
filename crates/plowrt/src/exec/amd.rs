@@ -3450,6 +3450,10 @@ fn check_packed_dense_program(insts: &[DevInst64]) -> Result<()> {
 /// The class-C prefill selectors with no per-span form: they run on the primary interpreter,
 /// which reads every row's position from `kv_len[0]`, so a packed program may not carry them.
 fn packed_class_c_selector(d: &DevInst64) -> bool {
+    // `i[6] = 1`: DsaPoolCompress's per-span form (pool-cache write from the span table).
+    if d.op == DevOp::DsaPoolCompress as u16 && d.i[6] == 1 {
+        return false;
+    }
     matches!(
         DevOp::from_u16(d.op),
         Some(
