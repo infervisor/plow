@@ -2528,7 +2528,12 @@ __device__ void d_flash_mla_decode(float* __restrict__ Opart, float* __restrict_
             const unsigned ksub = lane % KL, krl = lane / KL;
 #pragma unroll FA_MLA_KUNROLL
             for (unsigned p = 0; p < KPASS; p++) {
-                const unsigned rl = wave * KRW + p * KR + krl;
+                /* FA_DEC_ILV: d_flash_decode's interleaved map (a short split's rows spread over
+                 * ceil(per/KR) waves instead of all landing in wave 0). Same bijection onto the
+                 * tile and the same per-row dot, so bit-identical; at KL=1 KPASS is 1 and the two
+                 * maps coincide. */
+                const unsigned rl = FA_DEC_ILV ? (p * (PLOW_WAVES * KR) + wave * KR + krl)
+                                               : (wave * KRW + p * KR + krl);
                 const unsigned kv = kv0 + rl;
                 /* dense: cache row (kv & kv_mask); gather: the selected index ibase[kv]. */
                 const unsigned row = GATHER ? (kv < hi ? (unsigned)ibase[kv] : 0u) : (kv & kv_mask);

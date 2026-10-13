@@ -1470,6 +1470,19 @@ pub(crate) fn glm_nsplit(ctx: u32, heads: u32) -> u32 {
         .filter(|&v| v >= 1)
         .unwrap_or(ns)
 }
+/// `PLOW_GLM_MLA_NS_ROWS`: the dense decode split count of a batched rung. `glm_nsplit` sizes the
+/// split for ONE row at max_ctx (64 at 65536), so a 128-row rung ran 128 x 2 x 64 = 16384 items
+/// of 16 KV rows at 1k context on 256 workgroups, each paying the item's fixed cost (Q staging,
+/// six barriers, the latent-wide epilogue; ~22 us measured) 64 times per workgroup: 1.40 ms per
+/// layer, 15.4 ms of an 82 ms step. The rows already fill the machine, so split only to one item
+/// per CU: the largest power of two with `rows * (nh_l / GF) * ns <= n_cu`, never above the
+/// single-row count. Same KV bytes, 64x fewer items at B=128.
+fn glm_rows_nsplit(ctx: u32, rows: u32, nh_l: u32, n_cu: u32) -> u32 {
+    let n_grp = (nh_l / glm_gf(ctx, nh_l).max(1)).max(1);
+    let fill = (n_cu / (rows.max(1) * n_grp)).max(1);
+    (1u32 << fill.ilog2()).min(glm_nsplit(ctx, nh_l)).max(1)
+}
+
 /// Weight encoding for the MoE expert path — the `i[3]` field ops 85/86 dispatch on.
 ///
 /// A runtime FIELD, not an opcode or a rebuild, and that is the measured design: the kernel side
@@ -5372,6 +5385,8 @@ pub(crate) fn emit_glm_mla(
     //   ONLY the top_k rows via n.iidx (constant work ~ top_k regardless of ctx).
     let ns_attn = if dsa {
         glm_dsa_decode_nsplit(rows, nh_l, glm_gf(ctx, nh_l), b.n_cu())
+    } else if rows > 1 && emit_config::active().glm_mla_ns_rows {
+        glm_rows_nsplit(ctx, rows, nh_l, b.n_cu())
     } else {
         glm_nsplit(ctx, nh_l)
     };

@@ -6424,6 +6424,17 @@ __attribute__((amdgpu_waves_per_eu(PLOW_WPE, PLOW_WPE))) void PLOW_INTERP_NAME(P
             const uint32_t xr_tag_off =
                 (uint32_t)((const char*)PLOW_CTR(prog.xctr, in->fj[2].u) -
                            (const char*)prog.peer_scratch[prog.rank]);
+            /* A batched rung's [rows, hidden] message outgrows the slot; it keeps the gate
+             * one-shot. `check_xr_tagged_insts` applies the same predicate at load. */
+            if (!xrt_fits(in->i[0]))
+                d_xreduce_mega((bf16*)tens[in->t[0]], prog.peer_scratch, prog.n_gpu, prog.rank,
+                               in->i[0], in->i[2], xoff, in->i[3], PLOW_XCTR_DEADLINE_TICKS,
+                               xaudit, e.slice, in->blocks, in->i[4], in->i[5], in->i[6]
+#if PLOW_XR_TRACE_PHASES
+                               , prog.trace ? &prog.trace[base + ix] : nullptr
+#endif
+                               );
+            else
             d_xreduce_tagged_mega((bf16*)tens[in->t[0]], prog.peer_scratch, prog.n_gpu,
                                   prog.rank, in->i[0], in->i[2], xoff, in->i[3],
                                   PLOW_XCTR_DEADLINE_TICKS, xaudit, e.slice, in->blocks,

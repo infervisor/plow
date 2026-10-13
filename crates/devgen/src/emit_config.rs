@@ -461,6 +461,11 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_XR_DEC_CUS")]
     pub xr_dec_cus: Option<u32>,
 
+    /// DECODE all-reduces of at least N elements (a batched rung's [rows, hidden]) take the
+    /// two-shot (reduce-scatter + all-gather) instead of the one-shot. Bit-identical.
+    #[arg(long, env = "PLOW_XR_DEC_TWOSHOT_MIN")]
+    pub xr_dec_twoshot_min: Option<u32>,
+
     /// Use reduce-scatter/all-gather for complete folded-gather collectives. The second
     /// partial is added while the reduced slices are gathered. Default on; `=0` is the
     /// rollback to the one-shot collective.
@@ -550,6 +555,12 @@ pub struct EmitConfig {
     /// Pin the MLA head-fusion factor.
     #[arg(long, env = "PLOW_GLM_GF")]
     pub glm_gf: Option<u32>,
+
+    /// Batched dense MLA decode rungs split the KV only to one work item per CU (rows x
+    /// head-groups x nsplit <= n_cu) instead of the max-ctx split count. Not bit-identical
+    /// (the online-softmax partials regroup); rung 1 is unchanged.
+    #[arg(long, env = "PLOW_GLM_MLA_NS_ROWS", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub glm_mla_ns_rows: bool,
 
     /// Vocab-column-parallel lm_head.
     #[arg(long, env = "GLM_SHARD_HEAD", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
@@ -1572,6 +1583,7 @@ impl EmitConfig {
             xr_cus: env_u32("PLOW_XR_CUS"),
             glm_pf_small_cus: env_str("PLOW_GLM_PF_SMALL_CUS"),
             xr_dec_cus: env_u32("PLOW_XR_DEC_CUS"),
+            xr_dec_twoshot_min: env_u32("PLOW_XR_DEC_TWOSHOT_MIN"),
             xr2_gather: env_opt_out("PLOW_XR2_GATHER"),
             no_xreduce: env_bool("PLOW_NO_XREDUCE"),
             moe_prefill: env_str("PLOW_MOE_PREFILL"),
@@ -1589,6 +1601,7 @@ impl EmitConfig {
             glm_dsa: env_str("PLOW_GLM_DSA"),
             glm_gf: env_u32("PLOW_GLM_GF"),
             glm_shard_head: env_bool("GLM_SHARD_HEAD"),
+            glm_mla_ns_rows: env_bool("PLOW_GLM_MLA_NS_ROWS"),
             glm_moe_coresident: env_u32("GLM_MOE_CORESIDENT"),
             glm_shared_cus: env_u32("GLM_SHARED_CUS"),
             glm_spine_cus: env_str("GLM_SPINE_CUS"),
