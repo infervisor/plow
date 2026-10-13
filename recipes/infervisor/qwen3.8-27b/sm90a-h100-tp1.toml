@@ -204,6 +204,11 @@ PLOW_PREFIX_CACHE = "0"
 # the 4K / 15K serving grids (lc43 plow4k_k1 / plow15k_k1, build64) ran here; the chain's
 # pointwise segments of a chunk are light launches (PLOW_QWEN_LIGHT_OCC default 4) and the decode
 # attention from four rows the generated flash-decode object (PLOW_GEN_DECODE_STEP default 4).
+# A packed chunk's chain replays as CUDA graph pieces between its per-tick launches
+# (PLOW_QWEN_PF_GRAPH default on; grid110 on the build106 packet: 4K tok/s 241.0/293.7/305.1,
+# TTFT p99 5865/11929/24524, TPOT p99 59.7/96.8/98.0; 15K 82.1/83.9/84.8, 22946/46136/92517,
+# 101.1/101.3/101.5; digests unchanged; gate110/110b/110c c1/c8/c32 PASS, c32 on the third serve
+# with a graphs-off control serve at 0.8572 cont_frac beside the 0.8402 pass).
 PLOW_PF_INTERLEAVE = "1024"
 
 [bench]

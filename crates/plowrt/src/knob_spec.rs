@@ -168,6 +168,17 @@ const QWEN_LIGHT_DEFAULT: Status = Status::Candidate {
         "`=0` is the rollback to interpreter windows",
     ],
 };
+/// The packed Qwen3.5 prefill chunk enqueues ~1120 launches per 1024-row tick with ~2.7 us of
+/// idle between them (3 ms of a 99 ms tick); its cuBLASLt, light and window launches take only
+/// per-bucket arguments (per-tick data goes through the instruction patch and device tables),
+/// so the runs between the external GDN segments and the rider attention replay as graphs.
+const QWEN_PF_GRAPH: Status = Status::Candidate {
+    evidence: &[
+        "plans/qwen38-27b-h100.md (srvprof_conv102, segtime108): 1122 launches and 3.0 ms of gaps per 4K c32 tick; the chain still returns to the host at every external GDN segment, so a chunk replays ~50 pieces",
+        "ab110 (build106): packed 2x512 / 8x512 digests and RIDE_VS_STEP identical graph on/off; twin110 4K c32 two reps: tok/s 292.1/291.8 vs 290.3/291.1, TPOT p99 96.9/97.3 vs 97.9/97.9, TTFT p99 within 50 ms",
+        "`=0` is the rollback to the per-segment enqueue loop",
+    ],
+};
 /// A cuBLASLt-routed decode rung's Qwen3.5 pointwise windows as light launches of the same
 /// `light_pf` kernel (block-per-row bodies: the window's outputs).
 const QWEN_LIGHT_DECODE: Status = Status::Candidate {
@@ -628,6 +639,7 @@ pub const RUNTIME: &[KnobSpec] = &[
     KnobSpec::new("rt.prefill_light", Some("PLOW_PREFILL_LIGHT"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
     KnobSpec::new("rt.qwen_light_occ", Some("PLOW_QWEN_LIGHT_OCC"), Layer::Runtime, U32, Default::Static(Val::Nat(4)), QWEN_LIGHT_DEFAULT),
     KnobSpec::new("rt.qwen_light_decode", Some("PLOW_QWEN_LIGHT_DECODE"), Layer::Runtime, Domain::Bool, ON, QWEN_LIGHT_DECODE),
+    KnobSpec::new("rt.qwen_pf_graph", Some("PLOW_QWEN_PF_GRAPH"), Layer::Runtime, Domain::Bool, ON, QWEN_PF_GRAPH),
     KnobSpec::new("rt.decode_lt_qkv", Some("PLOW_DECODE_LT_QKV"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
     KnobSpec::new("rt.moe_pf_lt", Some("PLOW_MOE_PF_LT"), Layer::Runtime, U32, UNSET, MOE_LT_QUALIFIED),
     KnobSpec::new("rt.moe_dec_lt", Some("PLOW_MOE_DEC_LT"), Layer::Runtime, U32, UNSET, MOE_LT_QUALIFIED),

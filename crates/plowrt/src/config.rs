@@ -1522,6 +1522,12 @@ pub struct NvidiaRuntimeConfig {
     #[arg(long = "qwen-light-decode", env = "PLOW_QWEN_LIGHT_DECODE", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub qwen_light_decode: bool,
 
+    /// A packed Qwen3.5 prefill chunk's segments between its per-tick launches (the external GDN
+    /// segments, the rider attention) replay as CUDA graph pieces captured once per bucket
+    /// (needs `--pf-seg-graph`).
+    #[arg(long = "qwen-pf-graph", env = "PLOW_QWEN_PF_GRAPH", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub qwen_pf_graph: bool,
+
     /// A routed decode rung's q, k and v projections run as one cuBLASLt matmul when their
     /// weights are contiguous and a light attention launch reads the three outputs.
     #[arg(long = "decode-lt-qkv", env = "PLOW_DECODE_LT_QKV", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]

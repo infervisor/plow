@@ -7410,6 +7410,18 @@ impl GpuEngine {
                 "prefill seg graphs warmed up"
             );
         }
+        if config.nv.pf_seg_graph && config.nv.qwen_pf_graph && !config.nv.pf_seg_time {
+            let t_warmup = std::time::Instant::now();
+            match engine.warm_qwen_seg_graphs() {
+                Ok(0) => {}
+                Ok(pieces) => tracing::info!(
+                    pieces,
+                    elapsed_ms = t_warmup.elapsed().as_millis(),
+                    "qwen chain graph pieces warmed up"
+                ),
+                Err(e) => tracing::warn!(error = %e, "qwen chain graph warmup failed"),
+            }
+        }
         Ok(engine)
     }
 
@@ -12057,6 +12069,295 @@ impl GpuEngine {
         Ok(())
     }
 
+    /// The graph pieces of a Qwen chain bucket: each external GDN segment starts a piece (its
+    /// host-side work runs before the piece, its Nop window inside it) and each rider site's
+    /// consumer segment starts one (`Riders::launch_after` runs before it).
+    fn qwen_chain_pieces(&self, bi: usize) -> Vec<(usize, usize)> {
+        let bucket = &self.prefill[bi];
+        let n = bucket.qwen_segments.len();
+        let mut cuts: Vec<usize> = bucket
+            .qwen_segments
+            .iter()
+            .enumerate()
+            .filter_map(|(seg, external)| external.is_some().then_some(seg))
+            .collect();
+        if let Some(riders) = &self.riders {
+            cuts.extend(riders.pieces(bi, n).into_iter().map(|(_, end)| end));
+        }
+        cuts.sort_unstable();
+        cuts.dedup();
+        let mut pieces = Vec::with_capacity(cuts.len() + 1);
+        let mut start = 0;
+        for cut in cuts {
+            if cut > start && cut < n {
+                pieces.push((start, cut));
+                start = cut;
+            }
+        }
+        if start < n {
+            pieces.push((start, n));
+        }
+        pieces
+    }
+
+    /// One Qwen chain segment on `stream`: its cuBLASLt route, its light launch, or its
+    /// interpreter / role window (an external GDN segment's host work is not here).
+    fn qwen_chain_segment(
+        &self,
+        bi: usize,
+        seg: usize,
+        arg: &mut DevProgram,
+        f_pf: KernelFn,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        let bucket = &self.prefill[bi];
+        if let Some(Some(route)) = bucket.cublaslt_segments.get(seg) {
+            return route.run(stream);
+        }
+        if let Some(Some(route)) = bucket.light_segments.get(seg) {
+            return route.run_with(stream, arg.tensors);
+        }
+        let role = packet_role_index(&bucket.packet_segment_roles, seg).map(|index| {
+            self.packet_roles[index]
+                .as_ref()
+                .expect("validated packet role object")
+        });
+        segment_window(arg, &bucket.kernarg, seg, role.is_some());
+        let mut params = [arg as *mut DevProgram as *mut std::ffi::c_void];
+        self.be
+            .launch_cooperative(
+                role.map_or(f_pf, |r| r.function),
+                role.map_or(self.grid_pf, |r| r.grid),
+                role.map_or(BLOCK, |r| r.block),
+                role.map_or(self.smem_pf, |r| r.smem),
+                &mut params,
+                Some(stream),
+            )
+            // Under CUDA_LAUNCH_BLOCKING a device fault surfaces here: name the segment.
+            .map_err(|e| {
+                tracing::warn!(
+                    seg,
+                    role = role.is_some(),
+                    error = %e,
+                    "qwen prefill segment launch failed"
+                );
+                e
+            })
+    }
+
+    /// Bit of the `seg_graphs` key's `end` that marks a Qwen chain piece.
+    const QWEN_GRAPH_BIT: usize = 1 << 30;
+
+    /// The graph of Qwen chain piece `range` for `arg.tensors`, captured on first use: every
+    /// launch inside takes per-bucket arguments only (per-tick data reaches the kernels through
+    /// the instruction patch and the device tables, both written on the stream ahead of it).
+    fn ensure_qwen_seg_graph(
+        &mut self,
+        bi: usize,
+        arg: &DevProgram,
+        f_pf: KernelFn,
+        range: std::ops::Range<usize>,
+    ) -> Result<()> {
+        let key = (
+            bi,
+            arg.tensors as u64,
+            range.start,
+            range.end | Self::QWEN_GRAPH_BIT,
+        );
+        if self.seg_graphs.contains_key(&key) {
+            return Ok(());
+        }
+        let capture_stream = self.be.stream_create()?;
+        let mut node_arg = *arg;
+        let g = self.be.graph_capture_hoisting(&capture_stream, &[], || {
+            for seg in range.clone() {
+                self.qwen_chain_segment(bi, seg, &mut node_arg, f_pf, &capture_stream)?;
+            }
+            Ok(())
+        })?;
+        self.seg_graphs.insert(key, g);
+        tracing::debug!(
+            nodes = range.len(),
+            first = range.start,
+            bucket = bi,
+            "qwen chain graph piece built"
+        );
+        Ok(())
+    }
+
+    /// Capture every piece of the packed Qwen chain buckets at load, so no tick pays for it.
+    fn warm_qwen_seg_graphs(&mut self) -> Result<usize> {
+        let Some(f_pf) = self.f_pf else {
+            return Ok(0);
+        };
+        let mut built = 0;
+        for bi in 0..self.prefill.len() {
+            if self.prefill[bi].qwen_segments.is_empty() {
+                continue;
+            }
+            let arg = self.prefill[bi].kernarg;
+            for (start, end) in self.qwen_chain_pieces(bi) {
+                self.ensure_qwen_seg_graph(bi, &arg, f_pf, start..end)?;
+                built += 1;
+            }
+        }
+        Ok(built)
+    }
+
+    /// An external GDN segment's host-side work: the pad-row memset, then the chunk's scan
+    /// (one sequence, or packed: the riders' decode step, gather, varlen scan, scatter).
+    #[allow(clippy::too_many_arguments)]
+    fn qwen_gdn_segment(
+        &mut self,
+        bi: usize,
+        seg: usize,
+        inst: DevInst64,
+        b: usize,
+        c0: usize,
+        n: usize,
+        tc: usize,
+        qwen_pack: &[(usize, u32)],
+        qwen_ride: usize,
+        synchronize: bool,
+    ) -> Result<()> {
+        let t = &inst.t;
+        // A padded chunk scans the real rows only: the recurrent state must end at
+        // the last prompt token. Pad rows of the output are zeroed so the layers
+        // after it see finite activations. A packed launch's real rows are its
+        // requests' rows, contiguous from row 0.
+        let real = if qwen_pack.is_empty() {
+            (n - c0).min(tc)
+        } else {
+            qwen_pack
+                .iter()
+                .map(|&(_, rows)| rows as usize)
+                .sum::<usize>()
+                .min(tc)
+        };
+        if real < tc {
+            const CORE_ROW_BYTES: usize = crate::device::cuda::qwen_gdn::CORE_ROW_BYTES as usize;
+            let core = &self.devp[t[0] as usize];
+            self.be.memset_d8_async(
+                core.base + (real * CORE_ROW_BYTES) as u64,
+                0,
+                (tc - real) * CORE_ROW_BYTES,
+                &self.stream,
+            )?;
+        }
+        let state = &self.devp[t[6] as usize];
+        if qwen_pack.is_empty() {
+            let native = self
+                .qwen_prefill
+                .as_mut()
+                .expect("validated Qwen prefill adapter");
+            let slot_state = qwen_state_slot(state, b, self.batch)?;
+            let tensors = [
+                &self.devp[t[1] as usize],
+                &self.devp[t[2] as usize],
+                &self.devp[t[3] as usize],
+                &self.devp[t[0] as usize],
+                &self.devp[t[4] as usize],
+                &self.devp[t[5] as usize],
+                &self.devp[t[7] as usize],
+                &slot_state,
+            ];
+            // Packet loading validates tensor extents and fixed kernel geometry.
+            unsafe {
+                native.launch(tensors, real, &self.stream)?;
+            }
+            return Ok(());
+        }
+        // Packed: the leading one-row decode requests (riders) step their own
+        // slot states with the decode kernel; the rest scan as N sequences over
+        // N contiguous state slots: gather the requests' slot states into the
+        // initial scratch, scan, scatter the finals back (stream order, so the
+        // next layer's gather is safe).
+        const STRIDE: u64 = crate::device::cuda::qwen_gdn::STATE_BYTES;
+        let ride_ops = self.prefill[bi].qwen_ride_ops.get(seg).copied().flatten();
+        let ride = match ride_ops {
+            Some(_) if self.gdn_ride.is_some() => qwen_ride.min(qwen_pack.len()),
+            _ => 0,
+        };
+        let ride = if qwen_pack[..ride].iter().all(|&(_, rows)| rows == 1) {
+            ride
+        } else {
+            0
+        };
+        if ride > 0 {
+            self.packed_gdn_ride(t, ride_ops.expect("checked"), state, &qwen_pack[..ride])?;
+            if synchronize {
+                self.be.stream_synchronize(&self.stream).map_err(|e| {
+                    tracing::warn!(error = %e, "packed GDN ride failed");
+                    e
+                })?;
+            }
+        }
+        let scan = &qwen_pack[ride..];
+        if scan.is_empty() {
+            return Ok(());
+        }
+        let nseq = scan.len() as u64;
+        let init = &self.devp[self
+            .qwen_initstate
+            .expect("packed Qwen chain has act.gdn.initstate")];
+        let out = &self.devp[t[7] as usize];
+        if init.len < nseq * STRIDE || out.len < nseq * STRIDE {
+            return Err(RuntimeError::Rejected(
+                "packed Qwen prefill exceeds the GDN state scratch".into(),
+            ));
+        }
+        self.packed_state_copy(init, state, scan, ride, true)?;
+        if synchronize {
+            self.be.stream_synchronize(&self.stream).map_err(|e| {
+                tracing::warn!(error = %e, "packed GDN gather failed");
+                e
+            })?;
+        }
+        let init_view = DeviceMem::view(init.base, nseq * STRIDE);
+        let out_view = DeviceMem::view(out.base, nseq * STRIDE);
+        // The scan's rows start after the riders' (row strides: q/k 4096 B,
+        // v and core 12288, alpha/beta 192, the extents
+        // `qwen_prefill_segments` checked).
+        let from = |h: u16, row: u64| {
+            let m = &self.devp[h as usize];
+            let skip = ride as u64 * row;
+            DeviceMem::view(m.base + skip, m.len.saturating_sub(skip))
+        };
+        let rows = [
+            from(t[1], 4096),
+            from(t[2], 4096),
+            from(t[3], 12288),
+            from(t[0], 12288),
+            from(t[4], 192),
+            from(t[5], 192),
+        ];
+        let lens: Vec<u32> = scan.iter().map(|&(_, rows)| rows).collect();
+        let native = self
+            .qwen_prefill
+            .as_mut()
+            .expect("validated Qwen prefill adapter");
+        let tensors = [
+            &rows[0], &rows[1], &rows[2], &rows[3], &rows[4], &rows[5], &out_view, &init_view,
+        ];
+        unsafe {
+            native.launch_varlen(tensors, &lens, &self.stream)?;
+        }
+        if synchronize {
+            self.be.stream_synchronize(&self.stream).map_err(|e| {
+                tracing::warn!(error = %e, "packed GDN scan failed");
+                e
+            })?;
+        }
+        self.packed_state_copy(out, state, scan, ride, false)?;
+        if synchronize {
+            self.be.stream_synchronize(&self.stream).map_err(|e| {
+                tracing::warn!(error = %e, "packed GDN scatter failed");
+                e
+            })?;
+        }
+        Ok(())
+    }
+
     fn launch_prefill_chain(
         &mut self,
         bi: usize,
@@ -12099,9 +12400,46 @@ impl GpuEngine {
         if !self.prefill[bi].qwen_segments.is_empty() {
             // PLOW_PF_SEG_TIME=1: one event pair per segment, classes 8 = cuBLASLt route,
             // 5 = host GDN kernel + its (Nop) interpreter segment, 4 = fat interpreter segment.
-            let seg_time = crate::config::RuntimeConfig::get().nv.pf_seg_time;
+            let rt = crate::config::RuntimeConfig::get();
+            let seg_time = rt.nv.pf_seg_time;
+            // Packed chunks replay the chain as graph pieces between the per-tick launches
+            // (`PLOW_QWEN_PF_GRAPH`); the per-segment loop below serves the unpacked chunks and
+            // the timing / synchronizing diagnostics.
+            if !qwen_pack.is_empty()
+                && !seg_time
+                && !synchronize
+                && rt.nv.pf_seg_graph
+                && rt.nv.qwen_pf_graph
+            {
+                for (start, end) in self.qwen_chain_pieces(bi) {
+                    if riding {
+                        let riders = self.riders.as_ref().expect("riding");
+                        riders.launch_after(&self.be, bi, start, &self.stream)?;
+                    }
+                    if let Some(inst) = self.prefill[bi].qwen_segments[start] {
+                        self.qwen_gdn_segment(
+                            bi,
+                            start,
+                            inst,
+                            b,
+                            c0,
+                            n,
+                            tc,
+                            &qwen_pack,
+                            qwen_ride,
+                            synchronize,
+                        )?;
+                    }
+                    self.ensure_qwen_seg_graph(bi, &arg, f_pf, start..end)?;
+                    let key = (bi, arg.tensors as u64, start, end | Self::QWEN_GRAPH_BIT);
+                    let graph = self.seg_graphs.get(&key).expect("built");
+                    self.be.graph_launch(graph, &self.stream)?;
+                }
+                return Ok(());
+            }
             let mut evs: Vec<(usize, u8, CudaEvent, CudaEvent)> = Vec::new();
-            for (seg, external) in self.prefill[bi].qwen_segments.iter().enumerate() {
+            for seg in 0..self.prefill[bi].qwen_segments.len() {
+                let external = self.prefill[bi].qwen_segments[seg];
                 // The riders of the attention site whose segment just completed attend before
                 // its consumer segment starts (`Riders::load` placed every site this way).
                 if riding {
@@ -12146,147 +12484,18 @@ impl GpuEngine {
                     continue;
                 }
                 if let Some(inst) = external {
-                    let t = &inst.t;
-                    // A padded chunk scans the real rows only: the recurrent state must end at
-                    // the last prompt token. Pad rows of the output are zeroed so the layers
-                    // after it see finite activations. A packed launch's real rows are its
-                    // requests' rows, contiguous from row 0.
-                    let real = if qwen_pack.is_empty() {
-                        (n - c0).min(tc)
-                    } else {
-                        qwen_pack
-                            .iter()
-                            .map(|&(_, rows)| rows as usize)
-                            .sum::<usize>()
-                            .min(tc)
-                    };
-                    if real < tc {
-                        const CORE_ROW_BYTES: usize =
-                            crate::device::cuda::qwen_gdn::CORE_ROW_BYTES as usize;
-                        let core = &self.devp[t[0] as usize];
-                        self.be.memset_d8_async(
-                            core.base + (real * CORE_ROW_BYTES) as u64,
-                            0,
-                            (tc - real) * CORE_ROW_BYTES,
-                            &self.stream,
-                        )?;
-                    }
-                    let state = &self.devp[t[6] as usize];
-                    if qwen_pack.is_empty() {
-                        let native = self
-                            .qwen_prefill
-                            .as_mut()
-                            .expect("validated Qwen prefill adapter");
-                        let slot_state = qwen_state_slot(state, b, self.batch)?;
-                        let tensors = [
-                            &self.devp[t[1] as usize],
-                            &self.devp[t[2] as usize],
-                            &self.devp[t[3] as usize],
-                            &self.devp[t[0] as usize],
-                            &self.devp[t[4] as usize],
-                            &self.devp[t[5] as usize],
-                            &self.devp[t[7] as usize],
-                            &slot_state,
-                        ];
-                        // Packet loading validates tensor extents and fixed kernel geometry.
-                        unsafe {
-                            native.launch(tensors, real, &self.stream)?;
-                        }
-                    } else {
-                        // Packed: the leading one-row decode requests (riders) step their own
-                        // slot states with the decode kernel; the rest scan as N sequences over
-                        // N contiguous state slots: gather the requests' slot states into the
-                        // initial scratch, scan, scatter the finals back (stream order, so the
-                        // next layer's gather is safe).
-                        const STRIDE: u64 = crate::device::cuda::qwen_gdn::STATE_BYTES;
-                        let ride_ops = self.prefill[bi].qwen_ride_ops.get(seg).copied().flatten();
-                        let ride = match ride_ops {
-                            Some(_) if self.gdn_ride.is_some() => qwen_ride.min(qwen_pack.len()),
-                            _ => 0,
-                        };
-                        let ride = if qwen_pack[..ride].iter().all(|&(_, rows)| rows == 1) {
-                            ride
-                        } else {
-                            0
-                        };
-                        if ride > 0 {
-                            self.packed_gdn_ride(
-                                t,
-                                ride_ops.expect("checked"),
-                                state,
-                                &qwen_pack[..ride],
-                            )?;
-                            if synchronize {
-                                self.be.stream_synchronize(&self.stream).map_err(|e| {
-                                    tracing::warn!(error = %e, "packed GDN ride failed");
-                                    e
-                                })?;
-                            }
-                        }
-                        let scan = &qwen_pack[ride..];
-                        if !scan.is_empty() {
-                            let nseq = scan.len() as u64;
-                            let init = &self.devp[self
-                                .qwen_initstate
-                                .expect("packed Qwen chain has act.gdn.initstate")];
-                            let out = &self.devp[t[7] as usize];
-                            if init.len < nseq * STRIDE || out.len < nseq * STRIDE {
-                                return Err(RuntimeError::Rejected(
-                                    "packed Qwen prefill exceeds the GDN state scratch".into(),
-                                ));
-                            }
-                            self.packed_state_copy(init, state, scan, ride, true)?;
-                            if synchronize {
-                                self.be.stream_synchronize(&self.stream).map_err(|e| {
-                                    tracing::warn!(error = %e, "packed GDN gather failed");
-                                    e
-                                })?;
-                            }
-                            let init_view = DeviceMem::view(init.base, nseq * STRIDE);
-                            let out_view = DeviceMem::view(out.base, nseq * STRIDE);
-                            // The scan's rows start after the riders' (row strides: q/k 4096 B,
-                            // v and core 12288, alpha/beta 192, the extents
-                            // `qwen_prefill_segments` checked).
-                            let from = |h: u16, row: u64| {
-                                let m = &self.devp[h as usize];
-                                let skip = ride as u64 * row;
-                                DeviceMem::view(m.base + skip, m.len.saturating_sub(skip))
-                            };
-                            let rows = [
-                                from(t[1], 4096),
-                                from(t[2], 4096),
-                                from(t[3], 12288),
-                                from(t[0], 12288),
-                                from(t[4], 192),
-                                from(t[5], 192),
-                            ];
-                            let lens: Vec<u32> = scan.iter().map(|&(_, rows)| rows).collect();
-                            let native = self
-                                .qwen_prefill
-                                .as_mut()
-                                .expect("validated Qwen prefill adapter");
-                            let tensors = [
-                                &rows[0], &rows[1], &rows[2], &rows[3], &rows[4], &rows[5],
-                                &out_view, &init_view,
-                            ];
-                            unsafe {
-                                native.launch_varlen(tensors, &lens, &self.stream)?;
-                            }
-                            if synchronize {
-                                self.be.stream_synchronize(&self.stream).map_err(|e| {
-                                    tracing::warn!(error = %e, "packed GDN scan failed");
-                                    e
-                                })?;
-                            }
-                            self.packed_state_copy(out, state, scan, ride, false)?;
-                            if synchronize {
-                                self.be.stream_synchronize(&self.stream).map_err(|e| {
-                                    tracing::warn!(error = %e, "packed GDN scatter failed");
-                                    e
-                                })?;
-                            }
-                        }
-                    }
+                    self.qwen_gdn_segment(
+                        bi,
+                        seg,
+                        inst,
+                        b,
+                        c0,
+                        n,
+                        tc,
+                        &qwen_pack,
+                        qwen_ride,
+                        synchronize,
+                    )?;
                 }
                 let role =
                     packet_role_index(&self.prefill[bi].packet_segment_roles, seg).map(|index| {
