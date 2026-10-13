@@ -874,7 +874,14 @@ async fn async_main(
             .with_writer(std::io::stderr)
             .init();
     } else {
-        tracing_subscriber::fmt().with_env_filter(filter).init();
+        // Serving logs must never block the engine thread on stdout (a pipe with a slow reader
+        // stalls the tick); ANSI escapes only when a terminal reads them.
+        use std::io::IsTerminal;
+        tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_ansi(std::io::stdout().is_terminal())
+            .with_writer(plowrt::obs::logwriter::NonBlockingStdout::spawn())
+            .init();
     }
 
     tracing::info!(
