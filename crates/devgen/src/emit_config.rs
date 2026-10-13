@@ -1036,6 +1036,16 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_GLM_DEC_SPLITK")]
     pub glm_dec_splitk: Option<u32>,
 
+    /// PLOW_GLM_DEC_SPLITK applies only to decode rungs of at most this many rows (unset = all).
+    /// Measured: B=32 gains, B=128 loses.
+    #[arg(long, env = "PLOW_GLM_DEC_SPLITK_MAX_ROWS")]
+    pub glm_dec_splitk_max_rows: Option<u32>,
+
+    /// PLOW_GLM_DEC_SPLITK as two packets: partials, then a gated all-workgroup reduce (same
+    /// values as the one-packet form, no per-item agent-scope acq_rel). Needs objects with the arm.
+    #[arg(long, env = "PLOW_GLM_DEC_SPLITK_2P", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub glm_dec_splitk_2p: bool,
+
     /// GLM-5.3-Flash batched decode (rungs the HyperConnPost fold does not cover): fold each
     /// HyperConnPost into the one-shot XReduce that produces its block output. Bit-identical.
     #[arg(long, env = "PLOW_GLM_XR_HCPOST", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
@@ -1766,6 +1776,8 @@ impl EmitConfig {
             glm53_sp_kda_norm: env_bool("PLOW_GLM53_SP_KDA_NORM"),
             glm_hc_mix_split: env_u32("PLOW_GLM_HC_MIX_SPLIT"),
             glm_dec_splitk: env_u32("PLOW_GLM_DEC_SPLITK"),
+            glm_dec_splitk_max_rows: env_u32("PLOW_GLM_DEC_SPLITK_MAX_ROWS"),
+            glm_dec_splitk_2p: env_bool("PLOW_GLM_DEC_SPLITK_2P"),
             glm_xr_hcpost: env_bool("PLOW_GLM_XR_HCPOST"),
             glm_decode_glu_rows: env_bool("PLOW_GLM_DECODE_GLU_ROWS"),
             glm_pf_ns: env_u32("PLOW_GLM_PF_NS"),
