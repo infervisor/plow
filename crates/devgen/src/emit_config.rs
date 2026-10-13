@@ -1264,6 +1264,11 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_MOE_COMBINE_LEAN", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub moe_combine_lean: bool,
 
+    /// Isolate block-fp8 W8A16 grouped-MoE prefill GLU / down / k=8 combine packets for the
+    /// dedicated gfx950 object (`moe_fp8_pf_gfx950.elf`, bit-identical to the interpreter arms).
+    #[arg(long, env = "PLOW_MOE_FP8_PF_LEAN", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub moe_fp8_pf_lean: bool,
+
     /// Emit prefill AttnRes packets with the f32-mix contract (separate output-norm epsilon in
     /// `f[1]`) and isolate them for the gfx950 `attn_res_f32mix` object. Default on; tokens
     /// differ from the BF16-seam contract by design. `=0` is the rollback to the interpreter
@@ -1821,6 +1826,7 @@ impl EmitConfig {
             moe_prefill_ep: env_bool("PLOW_MOE_PREFILL_EP"),
             moe_stage1_lean: env_opt_out("PLOW_MOE_STAGE1_LEAN"),
             moe_combine_lean: env_bool_default_true("PLOW_MOE_COMBINE_LEAN"),
+            moe_fp8_pf_lean: env_bool("PLOW_MOE_FP8_PF_LEAN"),
             attnres_f32mix: env_opt_out("PLOW_ATTNRES_F32MIX"),
             moe_pf_det: env_bool("PLOW_MOE_PF_DET"),
             moe_pf_w8a8: env_bool("PLOW_MOE_PF_W8A8"),

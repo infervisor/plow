@@ -700,6 +700,7 @@ pub const RUNTIME: &[KnobSpec] = &[
     KnobSpec::new("rt.moe_aiter_tile64", Some("PLOW_MOE_AITER_TILE64"), Layer::Runtime, Domain::Bool, UNSET, OPT_IN),
     KnobSpec::new("rt.moe_aiter_xcd", Some("PLOW_MOE_AITER_XCD"), Layer::Runtime, Domain::Bool, UNSET, OPT_IN),
     KnobSpec::new("rt.moe_stage1_a4_reuse", Some("PLOW_MOE_STAGE1_A4_REUSE"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
+    KnobSpec::new("rt.moe_fp8_pf", Some("PLOW_MOE_FP8_PF"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
     KnobSpec::new("rt.dump_act", Some("PLOW_DUMP_ACT"), Layer::Runtime, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("rt.dump_kv", Some("PLOW_DUMP_KV"), Layer::Runtime, Domain::Str, UNSET, DIAG),
     KnobSpec::new("rt.numa_host_pools", Some("PLOW_AMD_NUMA_HOST_POOLS"), Layer::Runtime, Domain::Bool, UNSET, OPT_IN),

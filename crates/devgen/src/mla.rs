@@ -12204,6 +12204,7 @@ fn glm_emit_full(
         pb.set_lean_moe_combine_segments(
             crate::emit_is_amd() && emit_config::active().moe_combine_lean,
         );
+        pb.set_lean_moe_fp8_segments(crate::emit_is_amd() && emit_config::active().moe_fp8_pf_lean);
         pb.set_moe_prefill_ep_degree(
             (crate::emit_is_amd() && emit_config::active().moe_prefill_ep).then_some(c.tp),
         );
@@ -12938,6 +12939,7 @@ fn glm_build_block_pf_rungs(
         pb.set_lean_moe_combine_segments(
             crate::emit_is_amd() && emit_config::active().moe_combine_lean,
         );
+        pb.set_lean_moe_fp8_segments(crate::emit_is_amd() && emit_config::active().moe_fp8_pf_lean);
         pb.set_moe_prefill_ep_degree(
             (crate::emit_is_amd() && emit_config::active().moe_prefill_ep).then_some(c.tp),
         );
