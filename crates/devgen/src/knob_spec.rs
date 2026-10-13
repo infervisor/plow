@@ -1416,7 +1416,7 @@ pub const RAW_ENV: &[KnobSpec] = &[
     KnobSpec::new("env.PLOW_K3_PF_ROUTER_WAVE", Some("PLOW_K3_PF_ROUTER_WAVE"), Layer::RawEnv, Domain::Bool, ON, OPT_IN),
     KnobSpec::new("env.PLOW_K3_PF_ALIGN_WAVES", Some("PLOW_K3_PF_ALIGN_WAVES"), Layer::RawEnv, Domain::Bool, ON, OPT_IN),
     KnobSpec::new("env.PLOW_K3_PF_XR_SCHED", Some("PLOW_K3_PF_XR_SCHED"), Layer::RawEnv, Domain::Str, UNSET, OPT_IN),
-    KnobSpec::new("env.PLOW_K3_PF_FOLD_TB", Some("PLOW_K3_PF_FOLD_TB"), Layer::RawEnv, U32, Default::Static(Val::Nat(8)), OPT_IN),
+    KnobSpec::new("env.PLOW_K3_PF_FOLD_TB", Some("PLOW_K3_PF_FOLD_TB"), Layer::RawEnv, U32, UNSET, OPT_IN),
     KnobSpec::new("env.PLOW_MOE_PF_DEEP", Some("PLOW_MOE_PF_DEEP"), Layer::RawEnv, Domain::Bool, ON, OPT_IN),
     KnobSpec::new("env.PLOW_MOE_PF_HDR", Some("PLOW_MOE_PF_HDR"), Layer::RawEnv, Domain::Bool, ON, OPT_IN),
     KnobSpec::new("env.PLOW_MOE_STAGE1_PIPE", Some("PLOW_MOE_STAGE1_PIPE"), Layer::RawEnv, Domain::Bool, OFF, OPT_IN),
