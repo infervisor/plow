@@ -686,7 +686,7 @@ fn shapes(m: &Model) -> Shapes {
                     s.glm_hc_post_fold |= inst.i[3] == 1;
                     s.glm_hc_pre_tail |= inst.i[4] != 0;
                     s.glm_hc_mix_split |= inst.i[4] == 2;
-                    s.glm_hc_fuse_dec |= inst.i[4] == 3;
+                    s.glm_hc_fuse_dec |= inst.i[4] == 3 || inst.i[4] == 4;
                 }
                 DevOp::Gemm | DevOp::GemmMed | DevOp::GemmSmall | DevOp::Gemv => {
                     if op == DevOp::GemmMed && inst.t[5] != packet::TENSOR_NONE {

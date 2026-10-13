@@ -625,6 +625,7 @@ pub fn emit_kda_mixer(
             crate::emit_is_amd() && crate::amd_target::active().1 == hwspec::IsaLevel::Gfx950
         }),
         crate::emit_config::active().kda_decode_fused
+            && t >= crate::emit_config::active().kda_decode_fused_min_rows.unwrap_or(1)
             && crate::amd_target::active().1 == hwspec::IsaLevel::Gfx950,
         seq_rows,
     )

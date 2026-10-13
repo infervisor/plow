@@ -1059,9 +1059,15 @@ pub struct EmitConfig {
 
     /// PLOW_GLM_HC_FUSE_DEC body variant bits: 1 = register-resident pre + norm tail, 2 = the
     /// rows arm walks W eight steps per load batch, 4 = one row per unit (units loop over the
-    /// grid) instead of two rows per tail. Bit-identical.
+    /// grid) instead of two rows per tail, 8 = rows arm without the tail (the pre stays its own
+    /// packet), 16 = rows * 24 <= CUs rungs above one row keep the unfused pre. Bit-identical.
     #[arg(long, env = "PLOW_GLM_HC_FUSE_VARIANT")]
     pub glm_hc_fuse_variant: Option<u32>,
+
+    /// PLOW_KDA_DECODE_FUSED only on programs with at least this many rows (GLM-5.3-Flash MI350X
+    /// TP8: the standalone object wins at B=8, the in-interpreter arm at one row).
+    #[arg(long, env = "PLOW_KDA_DECODE_FUSED_MIN_ROWS")]
+    pub kda_decode_fused_min_rows: Option<u32>,
 
 
     /// GLM-5.3-Flash batched decode (rows > 1): largest split-K factor for the bf16 GemmSmall
@@ -1820,6 +1826,7 @@ impl EmitConfig {
             glm_kda_proj_group_s: env_u32("PLOW_GLM_KDA_PROJ_GROUP_S"),
             glm_kda_qkvg_r1: env_bool("PLOW_GLM_KDA_QKVG_R1"),
             glm_hc_fuse_variant: env_u32("PLOW_GLM_HC_FUSE_VARIANT"),
+            kda_decode_fused_min_rows: env_u32("PLOW_KDA_DECODE_FUSED_MIN_ROWS"),
             glm_dec_splitk: env_u32("PLOW_GLM_DEC_SPLITK"),
             glm_dec_splitk_max_rows: env_u32("PLOW_GLM_DEC_SPLITK_MAX_ROWS"),
             glm_dec_splitk_2p: env_bool("PLOW_GLM_DEC_SPLITK_2P"),

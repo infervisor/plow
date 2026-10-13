@@ -772,7 +772,9 @@ fn emit_glm53_hc_pre(
         && c.hidden % 1024 == 0)
         .then(|| {
             if rows * 24 <= b.n_cu() {
-                Some(0)
+                // Variant bit 16: narrow batched rungs keep the post fold + pre packet.
+                let v = emit_config::active().glm_hc_fuse_variant.unwrap_or(0);
+                (rows == 1 || v & 16 == 0).then_some(0)
             } else {
                 // Variant bit 4: one row per unit even past the grid (units loop over
                 // workgroups), so no tail runs two rows serially.
@@ -783,8 +785,13 @@ fn emit_glm53_hc_pre(
             }
         })
         .flatten();
+    // Variant bit 8 (rows arm only): post + mix in the fused packet, the pre as its own packet
+    // (i4 = 4), so no workgroup bumps a tail counter and no tail runs rows serially.
+    let no_tail = fuse_r.is_some_and(|r| r > 0)
+        && emit_config::active().glm_hc_fuse_variant.unwrap_or(0) & 8 != 0;
     let tail = (band.is_none()
-        && ((rows == 1 && emit_config::active().glm_hc_pre_tail) || fuse_r.is_some()))
+        && ((rows == 1 && emit_config::active().glm_hc_pre_tail) || fuse_r.is_some())
+        && !no_tail)
     .then(|| {
         let side = if ffn { "ffn" } else { "attn" };
         let ctr = match fuse_r {
@@ -848,6 +855,11 @@ fn emit_glm53_hc_pre(
             d.t[4] = prev;
             d.t[5] = post_mix;
             d.t[6] = comb_mix;
+        }
+        if no_tail {
+            d.i[4] = 4;
+            d.i[5] = fuse_r.unwrap_or(1);
+            d.i[6] = emit_config::active().glm_hc_fuse_variant.unwrap_or(0) & 2;
         }
         if let Some(desc) = tail {
             d.i[4] = if split.is_some() && post_fold.is_some() { 2 } else { 1 };

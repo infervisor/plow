@@ -3449,10 +3449,13 @@ __device__ __forceinline__ void hc_fuse_tail(CInst in, CTens T, unsigned group, 
 __device__ __attribute__((noinline)) void exec_hc_fuse_dec(CInst in, CTens T, unsigned slice,
                                                           unsigned nblk, plow_smem* sm, const PlowProgram* prog_meta) {
     const unsigned M = in->i[0], N = in->i[1], K = in->i[2], R = in->i[5];
-    const unsigned* desc = (const unsigned*)T[in->t[7]];
+    const bool tail = in->i[4] == 3u;
+    const unsigned* desc = tail ? (const unsigned*)T[in->t[7]] : nullptr;
+    if (!tail && R == 0u) __builtin_trap();
 #if !PLOW_HC_SINKHORN_RCP
     const bool shape_ok = N == 24u && K % (8u * PLOW_WAVE) == 0u &&
-                          desc[PLOW_HCT_HIDDEN] * 4u == K && K % (8u * PLOW_THREADS) == 0u;
+                          (!tail || desc[PLOW_HCT_HIDDEN] * 4u == K) &&
+                          K % (8u * PLOW_THREADS) == 0u;
 #else
     const bool shape_ok = false;
 #endif
@@ -3513,7 +3516,8 @@ __device__ __attribute__((noinline)) void exec_hc_fuse_dec(CInst in, CTens T, un
                 break;
             default: __builtin_trap();
         }
-        hc_fuse_tail(in, T, unit / 3u, M, 3u, unit / 3u * R, R, sm, prog_meta);
+        /* i4 = 4: post + mix only; the HyperConnPre is its own packet (one workgroup per row). */
+        if (in->i[4] == 3u) hc_fuse_tail(in, T, unit / 3u, M, 3u, unit / 3u * R, R, sm, prog_meta);
     }
 }
 #undef HCF_TEN
@@ -4577,7 +4581,7 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
             /* PLOW_GLM_HC_POST_FOLD (i3 = 1): the preceding HyperConnPost folded in. t1 is its
              * new_residual (written here), t3 = x_out, t4 = residual, t5 = post_mix,
              * t6 = comb_mix. See d_gemv_f32_wg_hcpost. */
-            if (in->i[3] == 1u && in->i[4] == 3u) {
+            if (in->i[3] == 1u && (in->i[4] == 3u || in->i[4] == 4u)) {
                 exec_hc_fuse_dec(in, T, slice, nblk, sm, prog_meta);
                 break;
             }
