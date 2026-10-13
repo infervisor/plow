@@ -6,7 +6,8 @@
  * identical arithmetic and the outputs are bit-identical to the three interpreter packets. The
  * intermediates (mix q/k/v, o) still round-trip through their bf16 tensors; only the workgroup
  * that wrote them reads them. Unlike the interpreter (one 256-VGPR workgroup per CU, B*H/256
- * items serial per workgroup) every item is resident at once. */
+ * items serial per workgroup) every item is resident at once. The intermediates never cross a
+ * workgroup, so __syncthreads' workgroup-scope fences order them (no agent-scope L2 writeback). */
 #include "amd_common.h"
 #include "op_elementwise.h"
 #include "op_kda.h"
@@ -42,13 +43,11 @@ void plow_kda_decode_wide_v3(
                    (size_t)proj * conv_w, pk);
     kda_conv_range(mv + rp, v_raw + rp, wv, csv + rcs, 1u, proj, conv_w, 1u, c0, c1,
                    (size_t)proj * conv_w, pk);
-    __threadfence();
     __syncthreads();
     /* op 110, wide arm: grid == T*H items, so this workgroup's only item is `item`. */
     d_kda_state_step_g(o, mq, mk, mv, forget_raw, beta_raw, a_log, dt_bias, gate_mode,
                        lower_bound, state, rows, heads, dim, bv, flags, scale, item,
                        rows * heads, lds, (size_t)heads * dim * dim, parked);
-    __threadfence();
     __syncthreads();
     /* op 103 for row `item` (= row * H + h) on wave 0: d_kda_gated_norm's body. */
     if ((threadIdx.x >> 6) == 0u) {

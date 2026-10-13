@@ -10802,13 +10802,13 @@ fn emit_glm_moe_ffn_rows(
     };
     let c_router = if router_dec {
         let maps = b.tensor_init(
-            "glm.router_dec.rows",
+            &format!("act.router_dec.rows.{rows}"),
             [n.row_token, n.row_partidx, n.row_gate]
                 .iter()
                 .flat_map(|h| h.to_le_bytes())
                 .collect(),
         );
-        let counters = b.tensor_init("glm.router_dec.ctr", vec![0u8; 4 * (rows as usize / 4 + 1)]);
+        let counters = b.tensor_init(&format!("act.router_dec.ctr.{rows}"), vec![0u8; 4 * (rows as usize / 4 + 1)]);
         b.emit(DevOp::MoeRouterDec, all.clone(), &[c_rn2], |d| {
             d.t[0] = n.rlogit;
             d.t[1] = n.xn2;
