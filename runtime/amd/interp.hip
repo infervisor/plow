@@ -2989,8 +2989,19 @@ __device__ __forceinline__ void exec_flash_mla_prefill_v2_packed(
 #endif
 #endif
 
+/* gfx950 K3 decode objects inline `plow_exec` into the dispatch loop. As a call, its prologue
+ * saves ~110 VGPR dwords per lane to scratch (and restores them) before it selects an op, on
+ * every packet in every workgroup -- including the workgroups a narrow packet leaves idle.
+ * GLM-5.3-Flash MI350X, inlined: rung 1 24.1 -> 12.3-12.9 ms, B=8 42.1 -> 31.2, B=32/B=128 within
+ * noise, streams identical, although spills rise (tiers 0 -> 83, wide 6 -> 198). */
+#if defined(__gfx950__) && PLOW_K3 && PLOW_BUCKET_DECODE
+__device__ static __attribute__((always_inline)) void plow_exec(CInst in_v, unsigned slice,
+                                                                CTens T_v, plow_smem* sm,
+                                                                const PlowProgram* prog_meta) {
+#else
 __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_smem* sm,
                                  const PlowProgram* prog_meta) {
+#endif
     CInst in = plow_scalar_ptr(in_v);
     CTens T = plow_scalar_ptr(T_v);
 #define TEN(k) (in->t[k] == PLOW_TENSOR_NONE ? nullptr : T[in->t[k]])
