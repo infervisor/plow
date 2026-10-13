@@ -614,7 +614,7 @@ pub(super) fn check_compiled_opcode_markers<'a>(
                     || k % 128 != 0
                     || n0 == 0
                     || n1 == 0
-                    || n0.checked_add(n1).is_none_or(|s| s >= n)
+                    || n0.checked_add(n1).is_none_or(|s| s > n)
                     || m.checked_mul(n.max(k)).is_none()
                     || i6 != 0
                     || i7 != 0

@@ -1937,7 +1937,9 @@ fn emit_glm_qkva_w8a8(
     };
     b.emit(DevOp::GemmFp8Block128, cus.to_vec(), &[quant], |d| {
         d.t[..7].copy_from_slice(&[
-            n.qlr, n.qkva_xq, w.qkva, n.qkva_xs, w.qkva_s, n.ckvraw, n.krr,
+            n.qlr, n.qkva_xq, w.qkva, n.qkva_xs, w.qkva_s, n.ckvraw,
+            // NoPE: no column reaches the third output; a live handle keeps the operand check.
+            if dr == 0 { n.ckvraw } else { n.krr },
         ]);
         d.i[..6].copy_from_slice(&[rows, ql + dk + dr, h, 16, ql, dk]);
     })
