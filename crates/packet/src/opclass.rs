@@ -138,7 +138,7 @@ pub fn op_classes(op: DevOp) -> &'static [&'static str] {
         | MlaBmmFp8
         | Conv1dF32
         | ConvTranspose1dF32 => &["gemm"],
-        GemmLtPf | GemmBlkPf => &["gemm", "native_route"],
+        GemmLtPf | GemmBlkPf | GemmGroupPf => &["gemm", "native_route"],
 
         Gemv | GemvGlu | GemvQkv | GemvFp8 | GemvGluFp8 | GemvFp8Blk | GemvSz | GemvGluSz
         | GemvMxfp4 | GemvGluMxfp4 | GemvQkvg | GemvQkvMxfp4 | GemvQkvFp8 | GemvF32

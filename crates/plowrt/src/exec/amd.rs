@@ -61,7 +61,7 @@ use object::{
     required_qwen_gdn_op, resolve_flash_object_load, sparse_fp8, BF16_KV_OPS, FP8_KV_OPS,
     FP8_KV_SYM, FP8_WEIGHT_OPS, GATE_HIER_SYM, KDA_CARRY_KEYFEED_MARKERS, KDA_CARRY_REGSTATE_LDS,
     KDA_CHUNK_QPRE_SYM, KDA_CONV_STEP_DB_REPLACED_OPS, KDA_FAMILY_SEG_SYM, KDA_WU_LEAN_LDS,
-    KDA_WU_LEAN_MARKERS, L2_DISPATCH_SYM, MLA_PF_V2_FP8_SYM, MLA_PF_V2_SYM, MOE_ENC_MXFP4,
+    KDA_WU_LEAN_MARKERS, GEMM_GROUP_LDS, L2_DISPATCH_SYM, MLA_PF_V2_FP8_SYM, MLA_PF_V2_SYM, MOE_ENC_MXFP4,
     MOE_GEMMA_OPS, MOE_GEMMA_PF_OPS, PACKED_PREFILL_ABI_SYM, PACKED_PREFILL_BAND_SYM,
     PACKED_PREFILL_KDA_CHUNK_SEG_SYM, PACKED_PREFILL_KDA_SEG_SYM, PACKED_PREFILL_MLA_FLASH_SEG_SYM,
     PACKED_PREFILL_MLA_NOPE_SYM, PACKED_PREFILL_MLA_NORM_SEG_SYM, XR_ATTNRES_RESOURCE_SYM, XR_ATTNRES_SEG_SYM, XR_TAGGED_SYM,
@@ -741,6 +741,20 @@ struct KdaChunkWuLeanArgs {
 
 const _: () = assert!(std::mem::size_of::<KdaChunkWuLeanArgs>() == 104);
 
+/// Kernarg of `plow_gemm_group_pf_gfx950` (runtime/amd/gemm_group_pf.hip).
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+struct GemmGroupArgs {
+    x: u64,
+    w: u64,
+    c: [u64; 6],
+    t: u32,
+    k: u32,
+    n: [u32; 6],
+}
+
+const _: () = assert!(std::mem::size_of::<GemmGroupArgs>() == 96);
+
 #[derive(Clone, Copy, Debug)]
 #[repr(C)]
 struct KdaChunkCarryKeyfeedArgs {
@@ -1069,6 +1083,11 @@ enum PrefillSegmentRoute {
         args: KdaChunkWuLeanArgs,
         grid: u32,
         tens: [u16; 8],
+    },
+    /// [`DevOp::GemmGroupPf`]: grouped prefill projection, one workgroup per output tile.
+    GemmGroup {
+        args: GemmGroupArgs,
+        grid: u32,
     },
     /// The register-state carry fed with the preceding lean Wu's scaled-key pair.
     KdaChunkCarryKeyfeed {
@@ -1621,6 +1640,7 @@ fn rebase_kda_key_factor_routes(routes: &mut [PrefillSegmentRoute], t: u32) {
             PrefillSegmentRoute::KdaChunkKeyFactorCarry { args, .. } => args.t = t,
             PrefillSegmentRoute::KdaChunkCarryRegstate { args, .. } => args.t = t,
             PrefillSegmentRoute::KdaChunkWuLean { args, .. } => args.t = t,
+            PrefillSegmentRoute::GemmGroup { args, .. } => args.t = t,
             PrefillSegmentRoute::KdaChunkCarryKeyfeed { args, .. } => args.t = t,
             // The intra objects anchor each diagonal block's gate at a row inside the chunk's
             // valid rows; at the bucket width a ragged last chunk anchors on stale rows.
@@ -1808,6 +1828,78 @@ fn promote_kda_carry_regstate_routes(
             },
             grid: kda_carry_regstate_grid(d.i[1]),
             tens: d.t,
+        };
+    }
+    Ok(())
+}
+
+/// Workgroups of a [`DevOp::GemmGroupPf`] launch at `t` rows: the kernel's tiles per group (the
+/// interpreter's GemmWide tile for N >= 512, GemmSmall below, gfx950).
+fn gemm_group_grid(t: u32, n: &[u32; 6]) -> u32 {
+    n.iter()
+        .take_while(|&&n| n != 0)
+        .map(|&n| {
+            let (bm, bn) = if n >= 512 { (128, 256) } else { (64, 128) };
+            t.div_ceil(bm) * n.div_ceil(bn)
+        })
+        .sum()
+}
+
+fn promote_gemm_group_routes(
+    prog: &DevProg,
+    segments: usize,
+    devp: &[DeviceMem],
+    routes: &mut [PrefillSegmentRoute],
+) -> Result<()> {
+    let native = |i: &DevInst64| i.op == DevOp::GemmGroupPf as u16;
+    if !prog.insts.iter().any(native) {
+        return Ok(());
+    }
+    let owners = amd_gemm_lt::segment_owners(prog, segments, native)?;
+    let addr = |h: u16| -> Result<u64> {
+        devp.get(h as usize).map(|m| m.base).ok_or_else(|| {
+            RuntimeError::Device(format!("grouped GEMM operand handle {h} is invalid"))
+        })
+    };
+    for (ix, d) in prog.insts.iter().enumerate() {
+        if !native(d) {
+            continue;
+        }
+        let seg = owners[ix].ok_or_else(|| {
+            RuntimeError::Device(format!("grouped GEMM instruction {ix} has no segment"))
+        })?;
+        if !matches!(routes[seg], PrefillSegmentRoute::Interpreter) {
+            return Err(RuntimeError::Device(
+                "grouped GEMM overlaps another native route".into(),
+            ));
+        }
+        let n: [u32; 6] = d.i[2..8].try_into().unwrap();
+        let used = n.iter().take_while(|&&n| n != 0).count();
+        if d.i[0] == 0
+            || d.i[1] == 0
+            || d.i[1] % 64 != 0
+            || used == 0
+            || n[used..].iter().any(|&n| n != 0)
+            || d.t[..2 + used].contains(&packet::dev::TENSOR_NONE16)
+        {
+            return Err(RuntimeError::Device(format!(
+                "grouped GEMM instruction {ix} has invalid geometry/operands"
+            )));
+        }
+        let mut c = [0u64; 6];
+        for g in 0..used {
+            c[g] = addr(d.t[2 + g])?;
+        }
+        routes[seg] = PrefillSegmentRoute::GemmGroup {
+            args: GemmGroupArgs {
+                x: addr(d.t[0])?,
+                w: addr(d.t[1])?,
+                c,
+                t: d.i[0],
+                k: d.i[1],
+                n,
+            },
+            grid: gemm_group_grid(d.i[0], &n),
         };
     }
     Ok(())
@@ -5210,6 +5302,42 @@ fn kv_skips_zeroing(name: &str) -> bool {
 /// bf16 would round away most of what the multiply just computed, and the packet
 /// declares f32 for that reason. There is no TP axis here — `[hidden]` is
 /// replicated on every rank — so this runs identically at any `--num-gpus`.
+/// `PLOW_KDA_PF_GROUP_GEMM`'s `…derived.in_proj_cat.weight`: this rank's slices of q|k|v|g_a|f_a|b
+/// stacked by rows (`DevOp::GemmGroupPf`'s weight). Each part shards as its own checkpoint name.
+/// `None` unless `name` is that derived name.
+fn kda_in_proj_cat(
+    c: &crate::asset::checkpoint::Checkpoint,
+    name: &str,
+    rank: u32,
+    n_gpu: u32,
+) -> Option<Result<Vec<u8>>> {
+    use crate::asset::shard::{shard_of, slice_for, Shard};
+    let stem = name.strip_suffix("derived.in_proj_cat.weight")?;
+    let mut out = Vec::new();
+    for part in ["q_proj", "k_proj", "v_proj", "g_a_proj", "f_a_proj", "b_proj"] {
+        let pn = format!("{stem}{part}.weight");
+        let Some((src, shape)) = c.tensor_ex(&pn) else {
+            return Some(Err(RuntimeError::Device(format!(
+                "MISSING WEIGHT: {name} is DERIVED and needs `{pn}`"
+            ))));
+        };
+        let want = match shard_of(&pn) {
+            Shard::Replicated => src.len() as u64,
+            Shard::Column => src.len() as u64 / u64::from(n_gpu),
+            other => {
+                return Some(Err(RuntimeError::Device(format!(
+                    "{name}: part `{pn}` shards as {other:?}, not row-stackable"
+                ))))
+            }
+        };
+        match slice_for(&pn, src, shape, want, rank, n_gpu) {
+            Ok(slice) => out.extend_from_slice(&slice),
+            Err(e) => return Some(Err(e)),
+        }
+    }
+    Some(Ok(out))
+}
+
 fn fold_res_score(c: &crate::asset::checkpoint::Checkpoint, name: &str) -> Option<Result<Vec<u8>>> {
     let stem = name.strip_suffix("_res_score.weight")?;
     let bf16 = |n: &str| -> Option<Vec<f32>> {
@@ -5284,7 +5412,8 @@ fn preflight_weights(
         // DERIVED, and in no checkpoint by design — `fold_res_score` builds it from a norm
         // and a proj. Without this exemption a Kimi-K3 load reports 186 false MISSING
         // WEIGHTs before it starts.
-        if stripped.ends_with("_res_score.weight") {
+        if stripped.ends_with("_res_score.weight") || stripped.ends_with(".derived.in_proj_cat.weight")
+        {
             continue;
         }
         let Some((src, shape)) = c.tensor_ex(&td.name).or_else(|| c.tensor_ex(stripped)) else {
@@ -6187,6 +6316,7 @@ pub struct AmdEngine {
     /// One reusable `[hi | lo]` BF16 key-factor pair, sized for the widest eligible program.
     _kda_key_factor_scratch: Option<DeviceMem>,
     k_kda_chunk_wu_lean: Option<HsaKernel>,
+    k_gemm_group: Option<HsaKernel>,
     k_kda_chunk_wu_lean_keys: Option<HsaKernel>,
     k_kda_chunk_carry_keyfeed: Option<HsaKernel>,
     /// The lean Wu's `[hi | lo]` scaled-key pair for the key-fed carry.
@@ -6922,6 +7052,9 @@ impl AmdEngine {
             })
         };
         let need_kda_wu_lean = blob.prefill_phase().any(|p| marked_wu(p, false));
+        let need_gemm_group = blob
+            .prefill_phase()
+            .any(|p| p.insts.iter().any(|i| i.op == DevOp::GemmGroupPf as u16));
         let need_kda_carry_keyfeed = blob.prefill_phase().any(|p| marked_wu(p, true));
         if let Some(p) = blob
             .prefill_phase()
@@ -8471,6 +8604,18 @@ impl AmdEngine {
             modules.push(module);
             Ok(kernel)
         };
+        let k_gemm_group = if need_gemm_group {
+            Some(load_kda_lean(
+                "gemm_group_pf_gfx950.elf",
+                "plow_gemm_group_pf_gfx950",
+                "grouped prefill GEMM",
+                &["plow_gemm_group_pf_abi_1"],
+                std::mem::size_of::<GemmGroupArgs>() as u32,
+                GEMM_GROUP_LDS,
+            )?)
+        } else {
+            None
+        };
         let k_kda_chunk_wu_lean = if need_kda_wu_lean {
             Some(load_kda_lean(
                 "kda_chunk_wu_lean_gfx950.elf",
@@ -9722,7 +9867,9 @@ impl AmdEngine {
                 // tensor, and skipping it would shift every later tensor's index
                 // against the table the packet was compiled with.
                 let folded = match src_ckpt {
-                    Some(c) => fold_res_score(c, &td.name).transpose()?,
+                    Some(c) => fold_res_score(c, &td.name)
+                        .or_else(|| kda_in_proj_cat(c, &td.name, rank, n_gpu))
+                        .transpose()?,
                     None => None,
                 };
                 if let Some(folded) = folded {
@@ -10273,6 +10420,7 @@ impl AmdEngine {
                     &mut prefill_routes,
                     kda_keyfeed_scratch,
                 )?;
+                promote_gemm_group_routes(p, seg_class.len(), &devp, &mut prefill_routes)?;
                 for (seg, &class) in seg_class.iter().enumerate() {
                     let graph_phase = graph_phase_segments[prog_ix].contains(&seg);
                     if class == 19 || graph_phase {
@@ -11294,6 +11442,7 @@ impl AmdEngine {
             k_kda_key_factor_carry,
             _kda_key_factor_scratch: d_kda_key_factor_scratch,
             k_kda_chunk_wu_lean,
+            k_gemm_group,
             k_kda_chunk_wu_lean_keys,
             k_kda_chunk_carry_keyfeed,
             _kda_keyfeed_scratch: d_kda_keyfeed_scratch,
@@ -12820,6 +12969,25 @@ impl AmdEngine {
                     kernel,
                     grid,
                     256,
+                    0,
+                    as_bytes(std::slice::from_ref(&args)),
+                    None,
+                )?;
+                self.seg_launches += 1;
+                return Ok(());
+            }
+            if let Some(PrefillSegmentRoute::GemmGroup { args, grid }) =
+                self.progs[p].prefill_routes.get(seg).copied()
+            {
+                let kernel = self.k_gemm_group.ok_or_else(|| {
+                    RuntimeError::Device("grouped GEMM segment has no validated object".into())
+                })?;
+                let grid = self.seg_route_grid(p, seg, grid);
+                EngineDevice::launch_kernel(
+                    &*self.be,
+                    kernel,
+                    grid,
+                    512,
                     0,
                     as_bytes(std::slice::from_ref(&args)),
                     None,

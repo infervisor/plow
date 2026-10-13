@@ -571,6 +571,18 @@ if [ "$ARCH" = gfx950 ] && [ "$need_kda_wu_lean" = 1 ]; then
   KDA_WU_LEAN_ELFS="kda_chunk_wu_lean_gfx950.elf"
 fi
 
+# DevOp::GemmGroupPf: the grouped prefill projection segment (packet-required only).
+GEMM_GROUP_ELFS=""
+if [ "$ARCH" = gfx950 ] && [ -n "${PLOW_HSACO_CONFIG:-}" ] &&
+   grep -qx '#define PLOW_PACKET_REQUIRES_GEMM_GROUP_PF 1' "$PLOW_HSACO_CONFIG"; then
+  bash "$R/cmake/hipcc_hsaco.sh" hipcc "$BUN" "$ARCH" \
+    "$OUT/gemm_group_pf_gfx950.elf" \
+    plow_gemm_group_pf_gfx950 256 2 \
+    $INC -DPLOW_LEAN_OBJECT=1 -DPLOW_REQUIRED_MARKER=plow_gemm_group_pf_abi_1 \
+    "$R/amd/gemm_group_pf.hip"
+  GEMM_GROUP_ELFS="gemm_group_pf_gfx950.elf"
+fi
+
 KDA_CARRY_KEYFEED_ELFS=""
 case "${PLOW_KDA_CARRY_KEYFEED:-0}" in
   0|1) ;;
@@ -1445,7 +1457,7 @@ if [ "$BUILD_GEMMA_MOE" = 1 ]; then
   fi
 fi
 
-ALL_ELFS="interp_prefill.elf interp_decode.elf interp_flash.elf test_kernels.elf $K3_ELFS $DECODE_MLA_ELFS $KDA_FUSED_ELFS $KDA_INTRA_CACHED_ELFS $KDA_INTRA_WAVE_ITEMS_ELFS $ATTN_RES_F32MIX_ELFS $KDA_CARRY_REGSTATE_ELFS $KDA_WU_LEAN_ELFS $KDA_CARRY_KEYFEED_ELFS $KDA_KEY_FACTOR_ELFS $XR_ATTNRES_ELFS $MOE_STAGE1_ELFS $MOE_STAGE2_ELFS $MOE_COMBINE_ELFS $MOE_EP_ELFS $MOE_DECODE_GROUPED_ELFS $MLA_MATERIALIZED_ELFS $GQ_ELFS $FP8_ELFS $FP8KV_ELFS $MXFP4_ELFS $MLA_ELFS $MOE_ELFS $GMOE_ELFS"
+ALL_ELFS="interp_prefill.elf interp_decode.elf interp_flash.elf test_kernels.elf $K3_ELFS $DECODE_MLA_ELFS $KDA_FUSED_ELFS $KDA_INTRA_CACHED_ELFS $KDA_INTRA_WAVE_ITEMS_ELFS $ATTN_RES_F32MIX_ELFS $KDA_CARRY_REGSTATE_ELFS $KDA_WU_LEAN_ELFS $GEMM_GROUP_ELFS $KDA_CARRY_KEYFEED_ELFS $KDA_KEY_FACTOR_ELFS $XR_ATTNRES_ELFS $MOE_STAGE1_ELFS $MOE_STAGE2_ELFS $MOE_COMBINE_ELFS $MOE_EP_ELFS $MOE_DECODE_GROUPED_ELFS $MLA_MATERIALIZED_ELFS $GQ_ELFS $FP8_ELFS $FP8KV_ELFS $MXFP4_ELFS $MLA_ELFS $MOE_ELFS $GMOE_ELFS"
 
 # Every interpreter is compiled against the packed-prefill PlowProgram tail. This is an ABI
 # marker, not a claim that descriptor-consuming math arms are enabled.
