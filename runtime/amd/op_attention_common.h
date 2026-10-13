@@ -5128,7 +5128,7 @@ __device__ void d_index_score_kpool(float* __restrict__ Score, const uint8_t* __
     const unsigned HI = index_heads;
     /* Batched decode: (row, PLOW_THREADS-pool chunk) items spread over the workgroups instead of
      * every workgroup walking every row. Same per-element arithmetic as the loop below. */
-    if (!prefill && n_batch > 1u && !FAKEQ) {
+    if (!prefill && !FAKEQ) {
         const unsigned nch = (pool_stride + PLOW_THREADS - 1u) / PLOW_THREADS;
         for (unsigned it = slice; it < n_batch * nch; it += nblk) {
             const unsigned b = it / nch, p0 = (it % nch) * PLOW_THREADS;
@@ -5143,12 +5143,18 @@ __device__ void d_index_score_kpool(float* __restrict__ Score, const uint8_t* __
             const auto* wb = Wg + (size_t)b * HI;
             const auto* qs = Qs + (size_t)b * HI;
             const size_t kbatch = (size_t)b * pool_stride;
-            const auto* kp = Kg + (kbatch + p) * DI;
+            /* The key row once, 16-byte loads, into registers (it was re-read byte-wise per head). */
+            uint4 kr4[DI / 16];
+            const uint4* kp4 = (const uint4*)(Kg + (kbatch + p) * DI);
+#pragma unroll
+            for (int i = 0; i < DI / 16; i++) kr4[i] = kp4[i];
+            const uint8_t* kp = (const uint8_t*)kr4;
             const float ks = Ks[kbatch + p];
             float s = 0.0f;
             for (unsigned h = 0; h < HI; h++) {
                 float d = 0.0f;
                 const uint8_t* qh = qlds + (size_t)h * DI;
+#pragma unroll
                 for (int i = 0; i < DI; i++) d += dequant_fp8(qh[i]) * dequant_fp8(kp[i]);
                 d = bf2f(f2bf(d));
                 d *= ks;
