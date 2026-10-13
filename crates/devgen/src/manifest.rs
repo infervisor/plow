@@ -436,6 +436,13 @@ struct Shapes {
     /// A pre-arm object ignores both and stages `t[1]` verbatim, i.e. it runs the projection
     /// over an UNNORMED row and returns finite, fluent, wrong tokens. Refuse at load.
     glm_fuse_qnorm: bool,
+    /// Any `HyperConnPre` (op 128) with `i[4] == 1` — the decode RmsNorm fold
+    /// (PLOW_GLM_HC_NORM_FOLD): t7 = gamma, i5 = out handle. A pre-arm object never writes the
+    /// normed row and every consumer reads stale data. Refuse at load.
+    glm_hc_norm_fold: bool,
+    /// Any `GemvF32` (op 135) with `i[3] == 1` — the decode HyperConnPost fold
+    /// (PLOW_GLM_HC_POST_FOLD). A pre-arm object never writes the new residual stream. Refuse.
+    glm_hc_post_fold: bool,
     /// Any `GemmMed` (op 15) carrying a `t[5]` — the prefill q-rope fold (PLOW_GLM_FUSE_POST):
     /// t3/t4 = cos/sin, t5 = pos, i3 = the first roped column. An object without the arm stores
     /// the unroped projection and attention runs on it. Refuse at load.
@@ -645,6 +652,8 @@ fn shapes(m: &Model) -> Shapes {
                     }
                 }
                 DevOp::AddNorm if inst.i[2] == 1 => s.glm_fuse_seam_rn = true,
+                DevOp::HyperConnPre if inst.i[4] == 1 => s.glm_hc_norm_fold = true,
+                DevOp::GemvF32 if inst.i[3] == 1 => s.glm_hc_post_fold = true,
                 DevOp::Gemm | DevOp::GemmMed | DevOp::GemmSmall | DevOp::Gemv => {
                     if op == DevOp::GemmMed && inst.t[5] != packet::TENSOR_NONE {
                         s.glm_fuse_post = true;
@@ -1017,6 +1026,8 @@ fn encoding_features(f: &mut Map<String, Value>, s: &Shapes) {
     f.insert("mla_pf_nope".into(), json!(s.mla_pf_nope));
     f.insert("glm_fuse_rope".into(), json!(s.glm_fuse_rope));
     f.insert("glm_fuse_qnorm".into(), json!(s.glm_fuse_qnorm));
+    f.insert("glm_hc_norm_fold".into(), json!(s.glm_hc_norm_fold));
+    f.insert("glm_hc_post_fold".into(), json!(s.glm_hc_post_fold));
     if s.glm_fuse_post {
         f.insert("glm_fuse_post".into(), json!(true));
     }
@@ -1735,6 +1746,12 @@ fn backend_amd(
     }
     if on("glm_fuse_post") {
         req.push("PLOW_GLM_FUSE_POST=1".into());
+    }
+    if on("glm_hc_norm_fold") {
+        req.push("PLOW_GLM_HC_NORM_FOLD=1".into());
+    }
+    if on("glm_hc_post_fold") {
+        req.push("PLOW_GLM_HC_POST_FOLD=1".into());
     }
     if on("glm_fuse_seam_rn") {
         req.push("PLOW_GLM_FUSE_SEAM_RN=1".into());

@@ -5683,6 +5683,45 @@ __device__ void d_gemv_f32_tile(float* __restrict__ C, const bf16* __restrict__ 
     }
 }
 
+/* d_gemv_f32 for decode rows: one WORKGROUP per output. d_gemv_f32 gives each output one wave
+ * that walks K/512 dependent steps (K=16384: 32), ~17 us per packet on the serial mHC chain while
+ * at most 24 of 2048 waves work. Here the eight waves split the steps, each lane writes its
+ * per-step term to `part` (K/8 floats), and wave 0 adds them in step order before the same
+ * wave_sum: d_gemv_f32's lane-to-k map, term expression and add order, so bit-identical
+ * (contraction off as in d_gemv_f32_tile). Requires K % (8 * PLOW_WAVE) == 0. */
+__device__ void d_gemv_f32_wg(float* __restrict__ C, const bf16* __restrict__ x,
+                              const float* __restrict__ W, unsigned M, unsigned N, unsigned K,
+                              unsigned slice, unsigned nblk, float* __restrict__ part) {
+#pragma clang fp contract(off)
+    const unsigned wave = threadIdx.x / PLOW_WAVE;
+    const unsigned lane = threadIdx.x % PLOW_WAVE;
+    const unsigned steps = K / (PLOW_WAVE * 8u);
+    for (size_t output = slice; output < (size_t)M * N; output += nblk) {
+        const unsigned m = output / N, n = output % N;
+        const bf16* const xm = x + (size_t)m * K;
+        const float* const wn = W + (size_t)n * K;
+#pragma unroll 4
+        for (unsigned s = wave; s < steps; s += PLOW_WAVES) {
+            const unsigned k = s * (PLOW_WAVE * 8u) + lane * 8u;
+            const bf16v8 xv = ld_glob8(xm + k);
+            const float4 w0 = *(const float4*)(wn + k);
+            const float4 w1 = *(const float4*)(wn + k + 4);
+            part[s * PLOW_WAVE + lane] =
+                bf2f(xv[0]) * w0.x + bf2f(xv[1]) * w0.y + bf2f(xv[2]) * w0.z +
+                bf2f(xv[3]) * w0.w + bf2f(xv[4]) * w1.x + bf2f(xv[5]) * w1.y +
+                bf2f(xv[6]) * w1.z + bf2f(xv[7]) * w1.w;
+        }
+        __syncthreads();
+        if (wave == 0) {
+            float acc = 0.0f;
+            for (unsigned s = 0; s < steps; s++) acc += part[s * PLOW_WAVE + lane];
+            acc = wave_sum(acc);
+            if (lane == 0) C[output] = acc;
+        }
+        __syncthreads();
+    }
+}
+
 __device__ void d_gemv_bf16_f32(float* __restrict__ C, const bf16* __restrict__ x,
                                 const bf16* __restrict__ W, unsigned M, unsigned N, unsigned K,
                                 unsigned slice, unsigned nblk) {
