@@ -4772,6 +4772,7 @@ fn run_one_tick(
                             Vec::new()
                         };
                         let mut ride_tokens = vec![0u32; feeds.len()];
+                        let mut rode_now = false;
                         let pk_t = packlog::on().then(Instant::now);
                         for span in &packed {
                             let slot = slots[span.slot as usize]
@@ -4797,6 +4798,7 @@ fn run_one_tick(
                                 .collect();
                             if ride {
                                 e.advance_packed_mixed(&members, &feeds, &mut ride_tokens)
+                                    .map(|rode| rode_now = rode)
                             } else {
                                 e.advance_packed_prefill(&members)
                             }
@@ -4851,10 +4853,10 @@ fn run_one_tick(
                                 });
                                 tracing::debug!(
                                     spans = packed.len(),
-                                    decode = feeds.len(),
+                                    decode = if rode_now { feeds.len() } else { 0 },
                                     "AMD packed prefill advanced"
                                 );
-                                if ride {
+                                if rode_now {
                                     decoded_in_pack = true;
                                     for (row, &(i, _)) in feeds.iter().enumerate() {
                                         seq_host_logprobs(&*e, i, &mut slots[i], ride_tokens[row]);

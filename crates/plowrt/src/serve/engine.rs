@@ -138,13 +138,13 @@ pub trait SeqEngine {
         false
     }
     /// [`Self::advance_packed_prefill`] with decode `feeds` riding as one-row spans;
-    /// `output[i]` receives feed `i`'s next token.
+    /// `output[i]` receives feed `i`'s next token; `Ok(false)` if they did not ride.
     fn advance_packed_mixed(
         &mut self,
         _members: &[(usize, &[u32])],
         _feeds: &[(usize, u32)],
         _output: &mut [u32],
-    ) -> crate::Result<()> {
+    ) -> crate::Result<bool> {
         Err(crate::RuntimeError::Rejected(
             "mixed packed launch unavailable".into(),
         ))
@@ -3333,7 +3333,7 @@ mod amd_serve {
                     "packed prefill requires at least two cursors".into(),
                 ));
             }
-            self.advance_packed(members, &[], &mut [])
+            self.advance_packed(members, &[], &mut []).map(drop)
         }
 
         /// Whether the live decode rows may ride a packed prefill launch (`PLOW_AMD_MIXED_PACK`).
@@ -3348,13 +3348,14 @@ mod amd_serve {
         /// one-row spans ahead of the prefill spans — the H100 unified token batch's lowering
         /// (`exec/gpu/token_batch.rs`): each decode row is a span at `pos[slot]` on its own KV
         /// and recurrent state, and the packed tail samples it. `output[i]` receives feed `i`'s
-        /// next token; `pos` advances as a decode step would.
+        /// next token; `pos` advances as a decode step would. `Ok(false)`: the feeds would have
+        /// widened the rung or overflowed the span table, so only the prefill spans ran.
         pub fn advance_packed_mixed(
             &mut self,
             members: &[(usize, &[u32])],
             feeds: &[(usize, u32)],
             output: &mut [u32],
-        ) -> Result<()> {
+        ) -> Result<bool> {
             if !self.mixed_pack_ready()
                 || members.is_empty()
                 || feeds.is_empty()
@@ -3365,12 +3366,13 @@ mod amd_serve {
             self.advance_packed(members, feeds, output)
         }
 
+        /// `Ok(true)` iff the decode `feeds` rode the launch.
         fn advance_packed(
             &mut self,
             members: &[(usize, &[u32])],
-            feeds: &[(usize, u32)],
+            mut feeds: &[(usize, u32)],
             output: &mut [u32],
-        ) -> Result<()> {
+        ) -> Result<bool> {
             let terminal = self.packed_terminal();
             let n = feeds.len() + members.len();
             let mut spans = Vec::with_capacity(n);
@@ -3462,11 +3464,33 @@ mod amd_serve {
             }
 
             let lowest = spans.iter().map(|s| s.kv_row0).min();
-            let prog = self
+            let mut prog = self
                 .packed_prefill_program(row0, u32::MAX, false, lowest)
                 .ok_or_else(|| {
                     RuntimeError::Rejected(format!("no packed prefill rung covers {row0} rows"))
                 })?;
+            // The decode rows ride only when they fit the prefill spans' own rung and span
+            // table; otherwise the pack runs without them and the caller steps them separately.
+            let d0 = feeds.len();
+            if d0 > 0 {
+                let pf_rows = row0 - d0 as u32;
+                let pf_lowest = spans[d0..].iter().map(|s| s.kv_row0).min();
+                let pf_prog = self.packed_prefill_program(pf_rows, u32::MAX, false, pf_lowest);
+                let pf_width = pf_prog.and_then(|p| self.prefill_prog_t(p));
+                if pf_prog.is_some()
+                    && (pf_width != self.prefill_prog_t(prog)
+                        || spans.len() > self.packed_prefill_span_limit(prog) as usize)
+                {
+                    spans.drain(..d0);
+                    slices.drain(..d0);
+                    for span in &mut spans {
+                        span.row0 -= d0 as u32;
+                    }
+                    row0 = pf_rows;
+                    feeds = &[];
+                    prog = pf_prog.expect("checked above");
+                }
+            }
             if spans.len() > self.packed_prefill_span_limit(prog) as usize {
                 return Err(RuntimeError::Rejected(format!(
                     "packed prefill program {prog} takes fewer than {} spans",
@@ -3515,7 +3539,9 @@ mod amd_serve {
                     Ranks::Tp(g) => g.read_sampled_rows_agreed(sampled)?,
                 }
             };
-            output.copy_from_slice(&tokens[..d]);
+            if d > 0 {
+                output.copy_from_slice(&tokens[..d]);
+            }
             for (i, &(slot, _)) in feeds.iter().enumerate() {
                 self.pos[slot] += 1;
                 self.lp_row[slot] = i;
@@ -3544,7 +3570,7 @@ mod amd_serve {
                     });
                 }
             }
-            Ok(())
+            Ok(d > 0)
         }
 
         pub fn prefill_turn(&self) -> usize {
@@ -5214,7 +5240,7 @@ impl SeqEngine for AmdServe {
         members: &[(usize, &[u32])],
         feeds: &[(usize, u32)],
         output: &mut [u32],
-    ) -> crate::Result<()> {
+    ) -> crate::Result<bool> {
         AmdServe::advance_packed_mixed(self, members, feeds, output)
     }
     fn prefill_frontier(&self, slot: usize) -> Option<usize> {
