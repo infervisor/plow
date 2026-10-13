@@ -453,7 +453,15 @@ impl Manifest {
                 let span = (op == DevOp::FlashPrefillFp8)
                     .then(|| packet::dev::flash_span(d.i[7]))
                     .flatten();
-                for (slot, h) in d.t.iter().copied().enumerate().chain(span.map(|h| (8, h))) {
+                // `direct_operands` bounded the fold handles, so the narrowing is exact.
+                let fold = fold_handles(op, d);
+                for (slot, h) in
+                    d.t.iter()
+                        .copied()
+                        .enumerate()
+                        .chain(span.map(|h| (8, h)))
+                        .chain(fold.iter().map(|&h| (9, h as u16)))
+                {
                     require(
                         h == TENSOR_NONE16 || (h as usize) < packet.tensors.len(),
                         "operand handle out of range",
@@ -590,8 +598,39 @@ impl Manifest {
     }
 }
 
+/// Folded residual + RMSNorm prologue (devgen qwen35.rs `Fold::fields`, i[3] == 4): the residual
+/// stream in (Gemv i[5], GemvGlu i[4]), an optional addend (i[6], 0 = none) and gamma (i[7])
+/// ride in integer slots; the interpreter dereferences gamma without a NONE check.
+fn fold_handles(op: DevOp, d: &DevInst64) -> Vec<u32> {
+    let a = match op {
+        DevOp::Gemv if d.i[3] == 4 => d.i[5],
+        DevOp::GemvGlu if d.i[3] == 4 => d.i[4],
+        _ => return Vec::new(),
+    };
+    let mut handles = vec![a, d.i[7]];
+    if d.i[6] != 0 {
+        handles.push(d.i[6]);
+    }
+    handles
+}
+
 fn direct_operands(op: DevOp, d: &DevInst64, packet: &Packet<'_>) -> Result<()> {
     match op {
+        DevOp::Gemv | DevOp::GemvGlu if d.i[3] == 4 => {
+            let k = u64::from(d.i[2]) * 2;
+            let rows_k = u64::from(d.i[0]) * k;
+            let extent = |h: u32, bytes: u64| {
+                packet
+                    .tensors
+                    .get(h as usize)
+                    .is_some_and(|t| t.bytes >= bytes)
+            };
+            let [a, gamma] = [fold_handles(op, d)[0], d.i[7]];
+            require(
+                extent(a, rows_k) && (d.i[6] == 0 || extent(d.i[6], rows_k)) && extent(gamma, k),
+                "folded norm operands",
+            )?;
+        }
         DevOp::GemmFp8 | DevOp::GemmMedFp8 | DevOp::GemmSmallFp8 => {
             if d.i[6] == 0 && d.i[7] == 0 {
                 return Ok(());

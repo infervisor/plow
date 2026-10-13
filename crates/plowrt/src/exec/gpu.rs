@@ -7726,15 +7726,26 @@ impl GpuEngine {
         let Some(vmm) = self.vmm.as_ref() else {
             return Some(budget);
         };
+        // `held` is read before the device query: a block the pre-mapper maps between the two
+        // reads then counts in neither (free already shrank, held not yet grown), never in both.
+        let (held, floor) = if let Some(kv) = vmm.kv.as_ref() {
+            (kv.mapped_bytes(), kv.block_bytes())
+        } else if let Some(rings) = vmm.rings.as_ref() {
+            let slot = rings.slot_charge();
+            (
+                rings.stats().mapped_slots as u64 * slot + rings.spare_bytes(),
+                slot,
+            )
+        } else {
+            return Some(budget);
+        };
         let Ok((free, total)) = self.be.mem_info() else {
             return Some(budget);
         };
-        let capacity = |held: u64| {
-            RuntimeConfig::get().kv_admit_live(free + held, total, self.kv_admit_reserve)
-        };
+        budget.budget_bytes = RuntimeConfig::get()
+            .kv_admit_live(free + held, total, self.kv_admit_reserve)
+            .max(floor);
         if let Some(kv) = vmm.kv.as_ref() {
-            let held = kv.mapped_bytes();
-            budget.budget_bytes = capacity(held).max(kv.block_bytes());
             let st = kv.stats();
             tracing::debug!(
                 target: "plowrt::kv_budget",
@@ -7749,10 +7760,6 @@ impl GpuEngine {
                 budget_mib = budget.budget_bytes >> 20,
                 "kv admission budget"
             );
-        } else if let Some(rings) = vmm.rings.as_ref() {
-            let slot = rings.slot_charge();
-            let held = rings.stats().mapped_slots as u64 * slot + rings.spare_bytes();
-            budget.budget_bytes = capacity(held).max(slot);
         }
         Some(budget)
     }

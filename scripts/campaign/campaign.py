@@ -1541,8 +1541,12 @@ def gate_pre(key: str, g: dict, out: Path) -> list[str]:
 
 
 def fp32_concurrencies(g: dict) -> list[int]:
+    """An empty list would score nothing and pass; every arm must be a positive concurrency."""
     c = g.get("concurrency", 16)
-    return [int(x) for x in c] if isinstance(c, list) else [int(c)]
+    concs = [int(x) for x in c] if isinstance(c, list) else [int(c)]
+    if not concs or any(x <= 0 for x in concs):
+        die(f"[gates] concurrency must be a nonempty list of positive integers, got {c!r}")
+    return concs
 
 
 def fp32_capture_name(arm: str, c: int, concs: list[int]) -> str:

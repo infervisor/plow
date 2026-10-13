@@ -1217,6 +1217,12 @@ fn tuning(s: &Shapes, arch: &str) -> Map<String, Value> {
         // * `kv_ilv` (PLOW_QWEN_KV_INTERLEAVE): head-interleaved KV rows on every object (the
         //   cache writer and the row-group decode body; other attention arms trap under it).
         if crate::emit_config::active().qwen_kv_interleave {
+            assert!(
+                t.contains_key("fa_rg") && crate::emit_config::active().gen_kernels.is_some(),
+                "PLOW_QWEN_KV_INTERLEAVE=1 requires the row-group decode body (PLOW_NV_FA_RG_WIDE=1) \
+                 and the generated attention objects (PLOW_EMIT_GEN_KERNELS): the other attention \
+                 arms trap under interleaved KV"
+            );
             t.insert("kv_ilv".into(), json!(1));
         }
         // Row-group body candidates (PLOW_NV_FA_RG_U / PLOW_NV_FA_RGT): defines on the objects that

@@ -532,13 +532,15 @@ def run_gen(drv, fn, smem, block, case):
 
 
 class DecodeCase:
-    """Packet-shaped decode buffers: Q/O [B][H][D], K/V [slots][KVH][kv_stride][D], kv_len and a
-    slot table (a permutation, so the table is exercised), split-KV scratch at NSPLIT_MAX."""
+    """Packet-shaped decode buffers: Q/O [B][H][D], K/V [slots][KVH][kv_stride][D] (`ilv`: the
+    row-interleaved [slots][kv_stride][KVH][D] the entry was compiled for; the wrapper traps on
+    the other layout), kv_len and a slot table (a permutation, so the table is exercised),
+    split-KV scratch at NSPLIT_MAX."""
 
-    def __init__(self, drv, H, KVH, D, B, ctx, ns_max, seed=0, window=0, ring=False):
+    def __init__(self, drv, H, KVH, D, B, ctx, ns_max, seed=0, window=0, ring=False, ilv=False):
         torch = drv.torch
         g = torch.Generator(device="cuda").manual_seed(seed)
-        self.H, self.KVH, self.D, self.B, self.window = H, KVH, D, B, window
+        self.H, self.KVH, self.D, self.B, self.window, self.ilv = H, KVH, D, B, window, ilv
         # The body stages whole KV tiles (rows past kv_len are masked after the load): the slot
         # stride is a multiple of the widest tile, as the packet's page-granular KV is (plowrt
         # rejects a stride the object's tile does not divide).
@@ -546,8 +548,9 @@ class DecodeCase:
         self.kv_mask = self.kv_stride - 1 if ring else 0xFFFFFFFF
         bf = torch.bfloat16
         self.q = (torch.randn(B, H, D, device="cuda", generator=g) * D ** -0.5).to(bf)
-        self.k = torch.randn(B, KVH, self.kv_stride, D, device="cuda", dtype=bf, generator=g)
-        self.v = torch.randn(B, KVH, self.kv_stride, D, device="cuda", dtype=bf, generator=g)
+        kv_shape = (B, self.kv_stride, KVH, D) if ilv else (B, KVH, self.kv_stride, D)
+        self.k = torch.randn(*kv_shape, device="cuda", dtype=bf, generator=g)
+        self.v = torch.randn(*kv_shape, device="cuda", dtype=bf, generator=g)
         self.lens = torch.tensor([ctx - (b % 7) for b in range(B)], device="cuda",
                                  dtype=torch.int32)
         self.slot = torch.tensor([(b * 5 + 3) % B for b in range(B)], device="cuda",
@@ -563,7 +566,7 @@ class DecodeCase:
                           p(self.lens), p(self.slot), p(self.o), p(self.ctr), ("u", self.B),
                           ("u", self.H), ("u", self.KVH), ("u", self.kv_stride),
                           ("u", self.window), ("u", nsplit), ("u", self.kv_mask), ("u", self.D),
-                          ("f", 1.0), ("u", 0)])
+                          ("f", 1.0), ("u", 1 if self.ilv else 0)])
 
     def reference(self):
         import torch
@@ -575,8 +578,8 @@ class DecodeCase:
             s = int(self.slot[b])
             for h in range(self.H):
                 kv = h // (self.H // self.KVH)
-                k = self.k[s, kv, rows].float()
-                v = self.v[s, kv, rows].float()
+                k = (self.k[s, rows, kv] if self.ilv else self.k[s, kv, rows]).float()
+                v = (self.v[s, rows, kv] if self.ilv else self.v[s, kv, rows]).float()
                 sc = k @ self.q[b, h].float()
                 out.append(sc.softmax(0) @ v)
                 got.append(self.o[b, h].float())
@@ -591,12 +594,13 @@ def bench_decode_entry(drv, name, image, arena, block, classes, check_pack=True)
     _, fn = drv.function(image, "plow_gen_flash_decode", arena)
     sig = ENTRIES[name]["signature"]
     D, ns_max, bn = sig["head_dim"], sig["nsplit_max"], None
+    ilv = sig.get("kv_layout") == "row_interleaved"
     row = load_table()["entries"].get(name)
     res = {}
     for H, KVH, B, ctx in classes:
         per = B * KVH * ctx * D * 2 * 2
         n = max(2, min(8, math.ceil(160e6 / per)))
-        cases = [DecodeCase(drv, H, KVH, D, B, ctx, ns_max, seed=s) for s in range(n)]
+        cases = [DecodeCase(drv, H, KVH, D, B, ctx, ns_max, seed=s, ilv=ilv) for s in range(n)]
         nsplit = pick_nsplit(B, KVH, -(-ctx // 64), ns_max)
         launch = lambda c, ns=nsplit: drv.launch(fn, (KVH * ns, B), block, arena, c.args(ns))
         launch(cases[0])
@@ -610,7 +614,7 @@ def bench_decode_entry(drv, name, image, arena, block, classes, check_pack=True)
         torch.cuda.empty_cache()
     if check_pack:
         H, KVH = classes[0][:2]
-        c = DecodeCase(drv, H, KVH, D, 5, 3000, ns_max, seed=7, window=1024, ring=True)
+        c = DecodeCase(drv, H, KVH, D, 5, 3000, ns_max, seed=7, window=1024, ring=True, ilv=ilv)
         drv.launch(fn, (KVH * ns_max, 5), block, arena, c.args(ns_max))
         torch.cuda.synchronize()
         res["packed_check"] = {"rel_l2": float(f"{c.reference():.2e}"),

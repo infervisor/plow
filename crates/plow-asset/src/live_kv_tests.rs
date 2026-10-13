@@ -114,6 +114,44 @@ fn fp8_direct_operands_cannot_alias_cache() {
 }
 
 #[test]
+fn folded_norm_operands_are_audited() {
+    // Fixture: 2 = cache, 4 = 1024 B, 5 = 2048 B, 6 = 16 B. rows 2 x k 256 bf16 = 1024 B.
+    for (op, a_slot) in [(DevOp::Gemv, 5), (DevOp::GemvGlu, 4)] {
+        let fold = |a: u32, b: u32, gamma: u32| {
+            validate_all(None, |ops, _| {
+                let mut d = inst(op);
+                d.i[..3].copy_from_slice(&[2, 64, 256]);
+                d.i[3] = 4;
+                d.i[a_slot] = a;
+                d.i[6] = b;
+                d.i[7] = gamma;
+                ops.push(d);
+            })
+        };
+        fold(4, 0, 5).unwrap();
+        fold(4, 5, 5).unwrap();
+        for (a, b, gamma) in [(100, 0, 5), (4, 100, 5), (4, 0, 100), (4, 0, u32::MAX)] {
+            assert!(
+                fold(a, b, gamma)
+                    .unwrap_err()
+                    .contains("folded norm operands"),
+                "{op:?} {a} {b} {gamma}"
+            );
+        }
+        assert!(fold(6, 0, 5).unwrap_err().contains("folded norm operands"));
+        assert!(fold(4, 0, 6).unwrap_err().contains("folded norm operands"));
+        for (a, b, gamma) in [(2, 0, 5), (4, 2, 5), (4, 0, 2)] {
+            assert!(
+                fold(a, b, gamma)
+                    .unwrap_err()
+                    .contains("unsupported cache operand access"),
+                "{op:?} {a} {b} {gamma}"
+            );
+        }
+    }
+}
+
+#[test]
 fn fp8_indirect_operands_remain_rejected() {
     for (op, operands) in [
         (DevOp::GemmFp8, &[6, 7][..]),
