@@ -75,6 +75,10 @@ extern "C" __device__ unsigned plow_kda_fb_fold_1 = 1;
 #define PLOW_KDA_FB_CB 8
 #endif
 #endif
+/* Wide batched-decode StateStepG: prefetch the next column batch (bit-identical). */
+#ifndef PLOW_KDA_WIDE_PF
+#define PLOW_KDA_WIDE_PF 0
+#endif
 
 /* Gate activation modes, mirroring [fla]'s `safe_gate` switch (fla/ops/kda/gate.py:118-124). */
 enum { PLOW_KDA_GATE_SOFTPLUS = 0, PLOW_KDA_GATE_LOWER_BOUND = 1 };
@@ -1187,10 +1191,17 @@ __device__ __forceinline__ void kda_conv_range(bf16* __restrict__ out, const bf1
      * STORE move, not just the address: hoisting them out of the token loop is exactly what
      * makes the shared path correct, and exactly what makes it wrong for independent rows. */
     if (bstride) {
-        for (unsigned c = c0 + threadIdx.x; c < c1; c += PLOW_THREADS) {
+        /* One (row, channel) per thread: rows are independent here, and a thread walking all T
+         * rows of its channel made a batched step T dependent round trips long (B=128 GLM-5.3-
+         * Flash: 229 us per packet with 12 of 512 lanes live). Same per-element arithmetic. */
+        const unsigned nc = c1 - c0;
+        const unsigned n = nc * T;
+        for (unsigned i = threadIdx.x; i < n; i += PLOW_THREADS) {
+            const unsigned t = i / nc;
+            const unsigned c = c0 + (i - t * nc);
             enum { PLOW_KDA_WMAX_B = 8 };
             const unsigned Wc = W < PLOW_KDA_WMAX_B ? W : PLOW_KDA_WMAX_B;
-            for (unsigned t = 0; t < T; t++) {
+            {
                 /* Same contract as the recurrence's mask: a parked row must not have its
                  * convolution window shifted, or the sequence it belongs to resumes against a
                  * window holding tokens from nobody. */
@@ -1704,6 +1715,23 @@ __device__ void d_kda_state_step_t(bf16* __restrict__ o, const bf16* __restrict_
              * participates, so forgetting to publish one is safe by construction. */
             if (parked && parked[t]) continue;
             const size_t hd = (size_t)t * H * D + (size_t)h * D;
+#if PLOW_BUCKET_DECODE && PLOW_KDA_WIDE_PF
+            /* Wide rows: the first state column batch loads under the q/k/g staging below, and
+             * each later batch under the previous one's reduction. Same columns, same arithmetic,
+             * one exposed state round trip per item instead of CPW/CB + 1. */
+            constexpr unsigned KDA_WPF_CPW = PL * PLOW_WAVE / PLOW_WAVES;
+            constexpr unsigned KDA_WPF_CB = KDA_WPF_CPW < 4u ? KDA_WPF_CPW : 4u;
+            float scn[KDA_WPF_CB][PL];
+            if (wide) {
+                const float* st_t0 = st_h + (size_t)t * bstride;
+#pragma unroll
+                for (unsigned cb = 0; cb < KDA_WPF_CB; cb++) {
+                    const float* col = st_t0 + (size_t)(wave + PLOW_WAVES * cb) * D;
+#pragma unroll
+                    for (unsigned r = 0; r < PL; r++) scn[cb][r] = col[r * PLOW_WAVE + lane];
+                }
+            }
+#endif
 #if PLOW_KDA_FB_FOLD
             if (fb_fold) {
                 /* This head's D columns of f_b: row h*D+d of W_fb against f_a's row t, column
@@ -1781,14 +1809,34 @@ __device__ void d_kda_state_step_t(bf16* __restrict__ o, const bf16* __restrict_
                 constexpr unsigned CB = CPW < 4u ? CPW : 4u;
                 static_assert(CPW % CB == 0, "wide KDA column batch must tile the wave's columns");
                 float* st_t = st_h + (size_t)t * bstride;
+#if PLOW_KDA_WIDE_PF
+                static_assert(CB == KDA_WPF_CB, "prefetch batch mismatch");
+#endif
                 for (unsigned c0 = 0; c0 < CPW; c0 += CB) {
                     float sc[CB][PL];
+#if PLOW_KDA_WIDE_PF
+#pragma unroll
+                    for (unsigned cb = 0; cb < CB; cb++)
+#pragma unroll
+                        for (unsigned r = 0; r < PL; r++) sc[cb][r] = scn[cb][r];
+                    if (c0 + CB < CPW) {
+#pragma unroll
+                        for (unsigned cb = 0; cb < CB; cb++) {
+                            const float* col =
+                                st_t + (size_t)(wave + PLOW_WAVES * (c0 + CB + cb)) * D;
+#pragma unroll
+                            for (unsigned r = 0; r < PL; r++)
+                                scn[cb][r] = col[r * PLOW_WAVE + lane];
+                        }
+                    }
+#else
 #pragma unroll
                     for (unsigned cb = 0; cb < CB; cb++) {
                         const float* col = st_t + (size_t)(wave + PLOW_WAVES * (c0 + cb)) * D;
 #pragma unroll
                         for (unsigned r = 0; r < PL; r++) sc[cb][r] = col[r * PLOW_WAVE + lane];
                     }
+#endif
 #pragma unroll
                     for (unsigned cb = 0; cb < CB; cb++) {
                         const unsigned j = wave + PLOW_WAVES * (c0 + cb);

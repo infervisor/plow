@@ -10459,6 +10459,13 @@ fn emit_glm_moe_ffn_rows(
 
     // Shared expert at M = rows. The decode fused ops that cannot carry M (`DenseGluFp8Blk` is
     // i0=N) unfuse into their GEMV halves; the plain arm is `GemvGlu`, which takes M directly.
+    // PLOW_GLM_DECODE_GLU_ROWS: d_glu is a grid-stride map of 8 elements per thread, so the
+    // workgroup count changes only who computes each element.
+    let glu_cus = if emit_config::active().glm_decode_glu_rows {
+        elem_cus(&all, (rows * imoe_l).div_ceil(8))
+    } else {
+        one.clone()
+    };
     let c_shglu = if dfold {
         c_routes
     } else if emit_config::active().glm_shared_w8a8 {
@@ -10478,7 +10485,7 @@ fn emit_glm_moe_ffn_rows(
         };
         let c_g = gemv_half(b, n.shfu, w.shg, w.shg_s);
         let c_u = gemv_half(b, n.shfu_up, w.shu, w.shu_s);
-        b.emit(DevOp::Glu, one.clone(), &[c_g, c_u], |d| {
+        b.emit(DevOp::Glu, glu_cus.clone(), &[c_g, c_u], |d| {
             d.t[0] = n.shfu;
             d.t[1] = n.shfu;
             d.t[2] = n.shfu_up;
@@ -10528,7 +10535,7 @@ fn emit_glm_moe_ffn_rows(
                 gemv_half(b, n.shfu_up, w.shu, w.shu_s),
             ],
         };
-        b.emit(DevOp::Glu, one.clone(), &[c_g, c_u], |d| {
+        b.emit(DevOp::Glu, glu_cus.clone(), &[c_g, c_u], |d| {
             d.t[0] = n.shfu;
             d.t[1] = n.shfu;
             d.t[2] = n.shfu_up;

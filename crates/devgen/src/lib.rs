@@ -8559,6 +8559,19 @@ fn apply_production_defaults(
     // "explicitly false" different values — and each is recorded as `production_default` so
     // `build.json` says who decided, and so `replay` omits it and a replayed recipe follows the
     // tree's defaults rather than pinning today's.
+    // GLM on gfx950: the batched-decode RmsNorm and shared-expert Glu packets span their rows'
+    // workgroups instead of one (bit-identical; GLM-5.3-Flash MI350X B=128 104 -> 17 us per
+    // norm). `PLOW_GLM_DECODE_NORM_ROWS=0` / `PLOW_GLM_DECODE_GLU_ROWS=0` roll back.
+    if capabilities.glm && arch == "gfx950" {
+        if cfg.glm_decode_norm_rows.is_none() {
+            cfg.glm_decode_norm_rows = Some(true);
+            emit_config::note_production_default("glm_decode_norm_rows", "true".into());
+        }
+        if !emit_config::explicitly_set("glm_decode_glu_rows") {
+            cfg.glm_decode_glu_rows = true;
+            emit_config::note_production_default("glm_decode_glu_rows", "true".into());
+        }
+    }
     if capabilities.glm && arch == "gfx942" && tp == 8 && n_cu == 304 && !cfg.mxfp4 {
         cfg.glm_production_defaults = true;
         if cfg.decode_ladder.is_none() {
