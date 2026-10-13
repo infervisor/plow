@@ -3258,8 +3258,12 @@ mod amd_serve {
             max_rows: u32,
         ) -> Option<packet::dev::PrefillSpan> {
             let cur = self.pf.get(slot)?.as_ref()?;
-            let step = packable_prefill_step(cur, max_rows, self.packed_terminal())?;
-            let program = self.packed_prefill_program(step.clen, max_rows, true, Some(step.c0))?;
+            let terminal = self.packed_terminal();
+            let step = packable_prefill_step(cur, max_rows, terminal)?;
+            // A span-sampling pack runs ragged: the planner caps its live rows at `max_rows`, so
+            // the rung may be wider than the tick budget (four 1k prompts in the 8192 rung).
+            let cap = if terminal { u32::MAX } else { max_rows };
+            let program = self.packed_prefill_program(step.clen, cap, true, Some(step.c0))?;
             let mut span = self.prefill_span(slot, max_rows)?;
             span.program = u32::try_from(program).ok()?;
             Some(span)
@@ -3285,9 +3289,11 @@ mod amd_serve {
         /// Whether two prompts of `n` tokens fit one packed rung no wider than `max_rows`
         /// (a span-sampling tail packs whole prompts).
         fn packed_prompt_reachable(&self, n: u32, max_rows: u32) -> bool {
+            let rows = n.saturating_mul(2);
             self.packed_terminal()
+                && rows <= max_rows
                 && self
-                    .packed_prefill_program(n.saturating_mul(2), max_rows, true, None)
+                    .packed_prefill_program(rows, u32::MAX, true, None)
                     .is_some()
         }
 
