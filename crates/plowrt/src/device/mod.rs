@@ -230,6 +230,17 @@ pub trait PeerMemory: Send + Sync {
     /// for the 50× cheaper route where the platform allows it.
     fn zero_peer(&self, dptr: u64, bytes: u64) -> Result<()>;
 
+    /// [`PeerMemory::zero_peer`] split in two so a TP group can start every rank's copy before
+    /// waiting on any: submit, then [`PeerMemory::zero_peer_wait`] before the memory is used.
+    fn zero_peer_submit(&self, dptr: u64, bytes: u64) -> Result<()> {
+        self.zero_peer(dptr, bytes)
+    }
+
+    /// Wait for the last [`PeerMemory::zero_peer_submit`] on this device.
+    fn zero_peer_wait(&self) -> Result<()> {
+        Ok(())
+    }
+
     /// Whether a peer allocation from this backend is also mapped into the HOST
     /// address space, so `dptr` can be dereferenced by the host directly.
     ///
