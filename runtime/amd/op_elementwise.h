@@ -371,6 +371,41 @@ __device__ void d_argmax(unsigned long long* __restrict__ part, const bf16* __re
                          unsigned n, unsigned n_batch, unsigned slice, unsigned nblk,
                          unsigned long long* lds) {
     const auto* xg = as_glob(x);
+    if (n_batch > 1) {
+        /* One WAVE per (row, partial): the per-row block reduction serialised n_batch barrier
+         * rounds per block (B=128: 365 us for 40 MB). Partial s covers the contiguous range
+         * [s*chunk, s*chunk+chunk) instead of the block-strided set; the row max (and its
+         * lowest-index tie break) is the same u64 max over the same keys. */
+        const unsigned lane = threadIdx.x & 63u, wave = threadIdx.x >> 6;
+        const unsigned chunk = ((n + nblk - 1u) / nblk + 511u) & ~511u;
+        const bool vec = (n & 7u) == 0u && ((uintptr_t)x & 15u) == 0u;
+        for (unsigned it = slice * PLOW_WAVES + wave; it < n_batch * nblk;
+             it += nblk * PLOW_WAVES) {
+            const unsigned b = it / nblk, s = it % nblk;
+            const auto* xb = xg + (size_t)b * n;
+            const unsigned lo = s * chunk, hi = lo + chunk < n ? lo + chunk : n;
+            unsigned long long best = 0;
+            if (vec) {
+#pragma unroll 4
+                for (unsigned i = lo + lane * 8u; i < hi; i += 512u) {
+                    const bf16v8 v = ld_glob8(xb + i);
+#pragma unroll
+                    for (unsigned u = 0; u < 8u; u++) {
+                        const unsigned long long p = amax_pack(v[u], i + u);
+                        best = p > best ? p : best;
+                    }
+                }
+            } else {
+                for (unsigned i = lo + lane; i < hi; i += 64u) {
+                    const unsigned long long p = amax_pack(xb[i], i);
+                    best = p > best ? p : best;
+                }
+            }
+            best = wave_max_u64(best);
+            if (lane == 0) st_act<unsigned long long>(&as_glob(part)[(size_t)b * nblk + s], best);
+        }
+        return;
+    }
     const unsigned B = n_batch ? n_batch : 1u;
     for (unsigned b = 0; b < B; b++) {
         const auto* xb = xg + (size_t)b * n;
@@ -389,6 +424,19 @@ __device__ void d_argmax(unsigned long long* __restrict__ part, const bf16* __re
  * n_batch == 0/1 is byte-identical (ids[0] from part[0..nparts)). */
 __device__ void d_argmax_fin(int* __restrict__ ids, const unsigned long long* __restrict__ part,
                              unsigned nparts, unsigned n_batch, unsigned slice) {
+    if (n_batch > 1) {
+        /* One wave per row (B=128 was 8192 serial loads on one thread: 850 us). */
+        if (slice != 0) return;
+        const unsigned lane = threadIdx.x & 63u, wave = threadIdx.x >> 6;
+        for (unsigned b = wave; b < n_batch; b += PLOW_WAVES) {
+            const auto* pb = as_glob(part) + (size_t)b * nparts;
+            unsigned long long best = 0;
+            for (unsigned i = lane; i < nparts; i += 64u) best = pb[i] > best ? pb[i] : best;
+            best = wave_max_u64(best);
+            if (lane == 0) st_act<int>(&as_glob(ids)[b], (int)~(unsigned)(best & 0xFFFFFFFFull));
+        }
+        return;
+    }
     if (slice != 0 || threadIdx.x != 0) return;
     const auto* pg = as_glob(part);
     const unsigned B = n_batch ? n_batch : 1u;
