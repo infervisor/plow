@@ -55,6 +55,22 @@ case "${FA_MLA_PF2_DEFER:-}" in
 esac
 [ -z "${FA_MLA_PF2_FRAME:-}" ] || FLASH_TR16="$FLASH_TR16 -DFA_MLA_PF2_FRAME=$FA_MLA_PF2_FRAME"
 [ -z "${FA_MLA_PF2_FASTBF:-}" ] || FLASH_TR16="$FLASH_TR16 -DFA_MLA_PF2_FASTBF=$FA_MLA_PF2_FASTBF"
+# PLOW_MLA_PF2_DPP=1: the V2 softmax's 16-lane butterflies as DPP moves (bit-identical).
+case "${PLOW_MLA_PF2_DPP:-0}" in
+  0) ;;
+  1) FLASH_TR16="$FLASH_TR16 -DPLOW_MLA_PF2_DPP=1" ;;
+  *) echo "PLOW_MLA_PF2_DPP must be 0 or 1" >&2; exit 2 ;;
+esac
+# PLOW_KDA_CARRY_PIPE=1 / PLOW_KDA_CARRY_KTR16=1: regstate KDA carry load schedule and
+# transposed key-tile reads (op_kda_carry_regstate.h; both bit-identical).
+KDA_CARRY_DEFS=""
+for k in PLOW_KDA_CARRY_PIPE PLOW_KDA_CARRY_KTR16; do
+  case "${!k:-0}" in
+    0) ;;
+    1) KDA_CARRY_DEFS="$KDA_CARRY_DEFS -D$k=1" ;;
+    *) echo "$k must be 0 or 1" >&2; exit 2 ;;
+  esac
+done
 case "${PLOW_MLA_SPARSE:-0}" in
   0) ;;
   1) [ "${PLOW_MLA_PF_TR16:-0}" = 1 ] || { echo "PLOW_MLA_SPARSE=1 requires PLOW_MLA_PF_TR16=1" >&2; exit 2; }
@@ -483,7 +499,7 @@ if [ "$ARCH" = gfx950 ] && [ "$need_kda_carry_regstate" = 1 ]; then
     "$OUT/kda_chunk_carry_regstate_gfx950.elf" \
     plow_kda_chunk_carry_regstate_gfx950 256 1 \
     $INC -DPLOW_LEAN_OBJECT=1 -DPLOW_NO_SPILL=1 -DPLOW_NO_SGPR_SPILL=1 \
-    -DPLOW_REQUIRED_MARKER=plow_kda_carry_regstate_abi_1 \
+    -DPLOW_REQUIRED_MARKER=plow_kda_carry_regstate_abi_1 $KDA_CARRY_DEFS \
     "$R/amd/kda_chunk_carry_regstate.hip"
   KDA_CARRY_REGSTATE_ELFS="kda_chunk_carry_regstate_gfx950.elf"
 fi
@@ -545,7 +561,7 @@ if [ "$ARCH" = gfx950 ] && [ "$need_kda_carry_keyfeed" = 1 ]; then
     "$OUT/kda_chunk_carry_regstate_keyfeed_gfx950.elf" \
     plow_kda_chunk_carry_regstate_keyfeed_gfx950 256 1 \
     $INC -DPLOW_LEAN_OBJECT=1 -DPLOW_NO_SPILL=1 -DPLOW_NO_SGPR_SPILL=1 \
-    -DPLOW_REQUIRED_MARKER=plow_kda_carry_keyfeed_abi_1 \
+    -DPLOW_REQUIRED_MARKER=plow_kda_carry_keyfeed_abi_1 $KDA_CARRY_DEFS \
     "$R/amd/kda_chunk_carry_regstate_keyfeed.hip"
   KDA_CARRY_KEYFEED_ELFS="kda_chunk_wu_lean_keys_gfx950.elf kda_chunk_carry_regstate_keyfeed_gfx950.elf"
 fi
