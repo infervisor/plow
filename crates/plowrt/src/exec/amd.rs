@@ -28,7 +28,7 @@ use crate::exec::kvrow::{
 use crate::exec::tensor_bindings::{TensorBinding, TensorBindings};
 use crate::exec::{
     amd_gemm_blk, amd_gemm_lt, amd_gemma4_glu, amd_index_fp8, amd_index_fp8_prefill, amd_index_tp,
-    amd_mla_bf16, amd_mla_fold, amd_moe_aiter, amd_sparse_mla,
+    amd_mla_bf16, amd_mla_fold, amd_mla_pf_dense, amd_moe_aiter, amd_sparse_mla,
 };
 use crate::memory::slab_carve;
 use crate::memory::vmm::{VmmGeometry, VmmKv, VmmOps, WeightSlab};
@@ -1029,6 +1029,7 @@ enum PrefillSegmentRoute {
     GemmBlk(amd_gemm_blk::Route),
     Gemma4Glu(amd_gemma4_glu::Route),
     MlaFold(amd_mla_fold::Route),
+    MlaPfDense(amd_mla_pf_dense::Route),
     XReduceWaveRs,
     GraphPhaseXReduceWaveRs,
     XReduceAttnRes {
@@ -6182,6 +6183,7 @@ pub struct AmdEngine {
     /// One reusable `[hi | lo]` BF16 key-factor pair, sized for the widest eligible program.
     _kda_key_factor_scratch: Option<DeviceMem>,
     k_kda_chunk_wu_lean: Option<HsaKernel>,
+    k_mla_pf_dense: Option<HsaKernel>,
     k_kda_chunk_wu_lean_keys: Option<HsaKernel>,
     k_kda_chunk_carry_keyfeed: Option<HsaKernel>,
     /// The lean Wu's `[hi | lo]` scaled-key pair for the key-fed carry.
@@ -8481,6 +8483,57 @@ impl AmdEngine {
             (None, None)
         };
 
+        let need_mla_pf_dense = crate::config::RuntimeConfig::get().amd.mla_pf_dense
+            && blob
+                .prefill_phase()
+                .any(|p| p.insts.iter().any(amd_mla_pf_dense::eligible));
+        let k_mla_pf_dense = if need_mla_pf_dense {
+            use amd_mla_pf_dense::{MARKER, OBJECT, SYMBOL};
+            if arch != "gfx950" {
+                return Err(RuntimeError::Device(format!(
+                    "PLOW_MLA_PF_DENSE=1 requires gfx950, but this device is {arch}"
+                )));
+            }
+            let path = hsaco_dir.join(OBJECT);
+            let image = std::fs::read(&path).map_err(|e| {
+                RuntimeError::Device(format!(
+                    "PLOW_MLA_PF_DENSE=1 requires {} (build with PLOW_MLA_PF_DENSE=1): {e}",
+                    path.display()
+                ))
+            })?;
+            if !elf_symbol_names(&image).contains(&MARKER) {
+                return Err(RuntimeError::Device(format!(
+                    "{} lacks required ABI marker `{MARKER}`",
+                    path.display()
+                )));
+            }
+            check_packet_pairing_stamp(&image, blob_path, &path)?;
+            let module = EngineDevice::module_load(&*be, &image)?;
+            let kernel = EngineDevice::get_function(&*be, &module, SYMBOL)
+                .map_err(|e| RuntimeError::Device(format!("{OBJECT}: no symbol {SYMBOL}: {e}")))?;
+            let want = std::mem::size_of::<amd_mla_pf_dense::Args>() as u32;
+            let got = kernel.kernarg_size();
+            if got != want && got != want + 256 {
+                return Err(RuntimeError::Device(format!(
+                    "{OBJECT}: kernarg segment is {got} B; dense MLA prefill ABI needs {want} (or {} with COv5 implicit args)",
+                    want + 256
+                )));
+            }
+            let lds = HsaBackend::kernel_lds_bytes(&kernel);
+            let private = kernel.private_segment_size();
+            if lds > amd_mla_pf_dense::LDS_MAX || private != 0 {
+                return Err(RuntimeError::Device(format!(
+                    "{OBJECT}: resource gate failed: LDS={lds} (max {}), private={private} (required 0)",
+                    amd_mla_pf_dense::LDS_MAX
+                )));
+            }
+            tracing::info!(object = %path.display(), lds, "dense MLA prefill object accepted");
+            modules.push(module);
+            Some(kernel)
+        } else {
+            None
+        };
+
         let need_kda_key_factor = arch == "gfx950"
             && blob
                 .prefill_phase()
@@ -10249,6 +10302,24 @@ impl AmdEngine {
                     &mut prefill_routes,
                     kda_keyfeed_scratch,
                 )?;
+                if k_mla_pf_dense.is_some() {
+                    let mut promoted = 0usize;
+                    for (seg, route) in amd_mla_pf_dense::routes(p, &devp, seg_class.len())?
+                        .into_iter()
+                        .enumerate()
+                    {
+                        if let Some(route) = route {
+                            if !matches!(prefill_routes[seg], PrefillSegmentRoute::Interpreter) {
+                                return Err(RuntimeError::Device(
+                                    "dense MLA prefill overlaps another native route".into(),
+                                ));
+                            }
+                            prefill_routes[seg] = PrefillSegmentRoute::MlaPfDense(route);
+                            promoted += 1;
+                        }
+                    }
+                    tracing::info!(prog = prog_ix, promoted, "dense MLA prefill segments routed");
+                }
                 for (seg, &class) in seg_class.iter().enumerate() {
                     let graph_phase = graph_phase_segments[prog_ix].contains(&seg);
                     if class == 19 || graph_phase {
@@ -11268,6 +11339,7 @@ impl AmdEngine {
             k_kda_key_factor_carry,
             _kda_key_factor_scratch: d_kda_key_factor_scratch,
             k_kda_chunk_wu_lean,
+            k_mla_pf_dense,
             k_kda_chunk_wu_lean_keys,
             k_kda_chunk_carry_keyfeed,
             _kda_keyfeed_scratch: d_kda_keyfeed_scratch,
@@ -11630,7 +11702,13 @@ impl AmdEngine {
                     "packed-prefill MLA norm/cache segment requires interp_packed_mla_norm{suffix}"
                 )));
             }
-            if program.packed_seg_family.contains(&6) && !flash {
+            // A flash segment on the dense MLA prefill route never reaches the family object.
+            let interp_flash = program
+                .packed_seg_family
+                .iter()
+                .zip(&program.prefill_routes)
+                .any(|(&f, r)| f == 6 && !matches!(r, PrefillSegmentRoute::MlaPfDense(_)));
+            if interp_flash && !flash {
                 return Err(RuntimeError::Device(format!(
                     "packed-prefill MLA flash segment requires interp_packed_mla_flash{suffix}"
                 )));
@@ -12499,6 +12577,57 @@ impl AmdEngine {
             })?;
             kernel.enqueue(&self.be, route, &self.tens_table)?;
             self.seg_launches += route.launches() as u64;
+            return Ok(());
+        }
+        if let Some(PrefillSegmentRoute::MlaPfDense(route)) =
+            self.progs[p].prefill_routes.get(seg).copied()
+        {
+            let kernel = self.k_mla_pf_dense.ok_or_else(|| {
+                RuntimeError::Device("dense MLA prefill segment has no loaded object".into())
+            })?;
+            let mut args = route.args;
+            let grid = if active {
+                // Span rows address the slot-0-based cache through `kv_base = slot * max_ctx`.
+                if args.kv_stride as usize != self.max_ctx {
+                    return Err(RuntimeError::Device(format!(
+                        "dense MLA prefill spans need kv_stride {} == max_ctx {}",
+                        args.kv_stride, self.max_ctx
+                    )));
+                }
+                args.spans = self.d_kv_spans.base;
+                args.n_spans = self.packed_spans.len() as u32;
+                amd_mla_pf_dense::span_grid(&self.packed_spans, args.ns)
+            } else {
+                if self.kv_slot != 0 {
+                    let fields: [&mut u64; 5] = [
+                        &mut args.opart,
+                        &mut args.mlpart,
+                        &mut args.q,
+                        &mut args.ckv,
+                        &mut args.kv_len,
+                    ];
+                    for (id, field) in route.tens.iter().zip(fields) {
+                        if let Some(&(_, stride)) =
+                            self.kv_slot_stride.iter().find(|(i, _)| *i == *id as usize)
+                        {
+                            *field += stride * self.kv_slot as u64;
+                        }
+                    }
+                }
+                route.grid()
+            };
+            // Always one packet (the chain reservation counts it); an empty chunk launches one
+            // workgroup that finds no work item.
+            EngineDevice::launch_kernel(
+                &*self.be,
+                kernel,
+                grid.max(1),
+                amd_mla_pf_dense::THREADS,
+                0,
+                as_bytes(std::slice::from_ref(&args)),
+                None,
+            )?;
+            self.seg_launches += 1;
             return Ok(());
         }
         if let Some(PrefillSegmentRoute::MlaFold(route)) =
@@ -14090,6 +14219,13 @@ impl AmdEngine {
             }
             if let PrefillSegmentRoute::MlaFold(route) = route {
                 route.rebase(rows)?;
+            }
+            // The interpreter reads the flash's (ragged-patched) `i[4]`; read the same word.
+            if let PrefillSegmentRoute::MlaPfDense(route) = route {
+                let n_tok = insts.get(route.inst).map(|d| d.i[4]).ok_or_else(|| {
+                    RuntimeError::Device("dense MLA prefill instruction out of range".into())
+                })?;
+                route.rebase(n_tok);
             }
         }
         rebase_mla_materialized_routes(

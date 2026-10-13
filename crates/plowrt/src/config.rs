@@ -2129,6 +2129,12 @@ pub struct AmdRuntimeConfig {
     #[arg(long = "amd-mla-pf-aiter", env = "PLOW_MLA_PF_AITER", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub mla_pf_aiter: bool,
 
+    /// Run eligible NoPE bf16 MLA flash-prefill segments on the dedicated gfx950 object
+    /// `mla_pf_dense_gfx950.elf` (built with `PLOW_MLA_PF_DENSE=1`). Not bit-identical to the
+    /// interpreter flash; a missing object is a load error.
+    #[arg(long = "amd-mla-pf-dense", env = "PLOW_MLA_PF_DENSE", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub mla_pf_dense: bool,
+
     /// Split a sparse-rung prefill chunk that starts below 2047 prior keys: rows holding all 2048
     /// causal keys take the AITER sparse route, the earlier rows the interpreter gather arm.
     /// Default on (checkpoint P, perf-certs/rt.mla_pf_row_split.json); `=0` is the rollback.
