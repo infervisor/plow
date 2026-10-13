@@ -314,6 +314,20 @@ extern "C" __device__ unsigned plow_dsa_prep_arm = 1;
 #include "op_qwen_gdn.h"
 #endif
 #include "op_moe.h"
+/* PLOW_MOE_PF_W8A8: the W8A8 block-FP8 arm of ops 85/86 (packet i[7] >= 2). A build axis the
+ * packet's plow_config.h turns on, so an object built for any other packet is unchanged. */
+#ifndef PLOW_MOE_PF_W8A8
+#define PLOW_MOE_PF_W8A8 0
+#endif
+/* Prefill objects only: no decode program emits i[7] >= 2, and a decode megakernel pays for any
+ * body it carries. */
+#if PLOW_CDNA4 && PLOW_MOE_PF_W8A8 && PLOW_MOE_PREFILL && !PLOW_BUCKET_DECODE && \
+    !defined(PLOW_BUCKET_FLASH)
+#define PLOW_MOE_PF_W8A8_ARM 1
+#include "moe_pf_w8a8.h"
+#else
+#define PLOW_MOE_PF_W8A8_ARM 0
+#endif
 #if PLOW_CDNA4 && (PLOW_HAS_MOE_GLU_FP8_BLOCK128 || PLOW_HAS_MOE_QUANT_FP8_BLOCK128 || PLOW_HAS_MOE_DOWN_FP8_BLOCK128)
 #include "op_moe_fp8_block128.h"
 #endif
@@ -1261,6 +1275,10 @@ static_assert(FA_MLA_DEC_LDS_FLOATS(512, 64, (PLOW_GLM_GF8_ARM ? 8 : 4)) * sizeo
  * 64 KiB part exactly as GMPF_DBUF does; this pin is what keeps that true. */
 static_assert(MPF_LDS_HALVES * sizeof(bf16) <= sizeof(((plow_smem*)nullptr)->raw),
               "grouped-MoE prefill LDS tiles exceed the interpreter's shared allocation");
+#if PLOW_MOE_PF_W8A8_ARM
+static_assert(MW8_LDS_BYTES <= sizeof(((plow_smem*)nullptr)->raw),
+              "W8A8 grouped-MoE LDS exceeds the interpreter's shared allocation");
+#endif
 #if PLOW_MOE_PF_A4W4
 /* Same pin for the mxfp4 grouped arm (both the CDNA4 A4W4 plan and the CDNA3 simulated one --
  * MPF4_LDS_BYTES is arch-conditional). It had no assert because only 147 KiB arenas ever built
@@ -5693,6 +5711,19 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
          * arm also takes t6 (so the fused bridge can skip pad rows) and t7 = the E8M0 scale
          * rows it WRITES, since the bridge is its epilogue rather than a separate op. */
         case PLOW_DOP_MOE_GROUP_GLU_PF:
+#if PLOW_MOE_PF_W8A8_ARM
+            /* i7 = 2: W8A8. t0=fq(fp8 out) t1=xq t6=xs(f32[H/128][T]) t7=fs(out) i4=T. */
+            if (in->i[7] == 2u) {
+                d_moe_pf_w8a8<true>(TEN(0), (float*)TEN(7), (const unsigned char*)TEN(1),
+                                    (const float*)TEN(6), PLOW_RUNTIME_ROWS(in->i[4]),
+                                    (const unsigned long long*)TEN(2),
+                                    (const unsigned long long*)TEN(3), (const int*)TEN(4),
+                                    (const unsigned*)TEN(5), nullptr, in->i[0], in->i[1],
+                                    in->i[2], in->i[5], in->fj[0].f, in->fj[1].f, 0u, slice,
+                                    nblk, (unsigned char*)sm->raw);
+                break;
+            }
+#endif
             d_moe_group_glu_pf((bf16*)TEN(0), (const bf16*)TEN(1),
                                (const unsigned long long*)TEN(2),
                                (const unsigned long long*)TEN(3), (const int*)TEN(4),
@@ -5708,6 +5739,18 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
                                in->i[7]);
             break;
         case PLOW_DOP_MOE_GROUP_DOWN_PF:
+#if PLOW_MOE_PF_W8A8_ARM
+            /* i7 = 2 (f32 part) / 3 (bf16 part): W8A8. t1=fq t5=fs. */
+            if (in->i[7] >= 2u) {
+                d_moe_pf_w8a8<false>(TEN(0), nullptr, (const unsigned char*)TEN(1),
+                                     (const float*)TEN(5), 0u, (const unsigned long long*)TEN(2),
+                                     (const unsigned long long*)TEN(3), (const int*)TEN(4),
+                                     (const unsigned*)TEN(6), (const float*)TEN(7), in->i[0],
+                                     in->i[1], in->i[2], 0u, 0.0f, 0.0f, in->i[7] == 3u, slice,
+                                     nblk, (unsigned char*)sm->raw);
+                break;
+            }
+#endif
             d_moe_group_down_pf((float*)TEN(0), (const bf16*)TEN(1),
                                 (const unsigned long long*)TEN(2),
                                 (const unsigned long long*)TEN(3), (const int*)TEN(4),

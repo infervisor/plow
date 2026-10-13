@@ -403,6 +403,9 @@ pub(super) const PREFILL_ARM_MARKERS: &[(&str, &[&str])] = &[
     // ns packets at the nsplit=1 partial layout while the merge reads ns — refuse.
     ("PLOW_MLA_PF_NS", &["plow_mla_pf_ns_arm"]),
     ("PLOW_MOE_PF_A8", &["plow_moe_pf_a8_arm"]),
+    // W8A8 grouped MoE prefill (ops 85/86 i[7] >= 2), a build axis the packet's plow_config.h
+    // turns on. Without it the shipped body reads fp8 rows as bf16 (or i[7] as part16). Refuse.
+    ("PLOW_MOE_PF_W8A8", &["plow_moe_pf_w8a8_arm"]),
     // DSA indexer prep (HeadNormRope pair_mode 3). An object without the arm runs it as the plain
     // rope on the un-normed key: no trap. A BUILD axis (`#if PLOW_DSA_PREP`).
     ("PLOW_DSA_PREP", &["plow_dsa_prep_arm"]),
@@ -1159,14 +1162,23 @@ pub(super) fn packet_prefill_arm_requirements<'a>(
     }) {
         requires.push("PLOW_MOE_PREFILL=1".to_owned());
     }
+    // i[7] >= 2 on ops 85/86 is the W8A8 arm (PLOW_MOE_PF_W8A8), not part16/a8.
+    let w8a8 = |inst: &DevInst64| {
+        (inst.op == DevOp::MoeGroupGluPf as u16 || inst.op == DevOp::MoeGroupDownPf as u16)
+            && inst.i[7] >= 2
+    };
     if insts().any(|inst| {
         matches!(inst.op, op if op == DevOp::MoeGroupDownPf as u16 || op == DevOp::MoeCombinePf as u16)
             && inst.i[7] != 0
+            && !w8a8(inst)
     }) {
         requires.push("PLOW_MOE_PF_PART16=1".to_owned());
     }
-    if insts().any(|inst| inst.op == DevOp::MoeGroupGluPf as u16 && inst.i[7] != 0) {
+    if insts().any(|inst| inst.op == DevOp::MoeGroupGluPf as u16 && inst.i[7] != 0 && !w8a8(inst)) {
         requires.push("PLOW_MOE_PF_A8=1".to_owned());
+    }
+    if insts().any(|inst| w8a8(inst)) {
+        requires.push("PLOW_MOE_PF_W8A8=1".to_owned());
     }
     // The shared-expert fold's constant `k+1`th routing slot (op 83 i[5]). An object without the
     // arm writes only the top-k slots, so the shared expert — which every token passes through —
