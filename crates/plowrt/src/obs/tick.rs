@@ -482,9 +482,12 @@ impl Drop for TraceGuard {
             r.open = false;
             let mut out = String::with_capacity(256 + 200 * r.launches.len() + 32 * r.dec.len());
             let tid = std::thread::current().id();
+            let unix = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0.0, |d| d.as_secs_f64());
             let _ = write!(
                 out,
-                "{{\"n\":{seq},\"th\":\"{tid:?}\",\"t0\":{},\"t1\":{t1},\"ready_dec\":{},\"waiting\":{},\"waiting_rows\":{},\"held\":{},\"hits\":{},\"launches\":[",
+                "{{\"n\":{seq},\"th\":\"{tid:?}\",\"unix\":{unix:.6},\"t0\":{},\"t1\":{t1},\"ready_dec\":{},\"waiting\":{},\"waiting_rows\":{},\"held\":{},\"hits\":{},\"launches\":[",
                 r.t0, r.ready_dec, r.waiting, r.waiting_rows, r.held, r.hits
             );
             for (i, l) in r.launches.iter().enumerate() {
