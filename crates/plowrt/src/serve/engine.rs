@@ -133,6 +133,22 @@ pub trait SeqEngine {
     fn take_packed_tokens(&mut self) -> Vec<(usize, u32)> {
         Vec::new()
     }
+    /// Whether the live decode rows may ride a packed prefill launch as one-row spans.
+    fn mixed_pack_ready(&self) -> bool {
+        false
+    }
+    /// [`Self::advance_packed_prefill`] with decode `feeds` riding as one-row spans;
+    /// `output[i]` receives feed `i`'s next token.
+    fn advance_packed_mixed(
+        &mut self,
+        _members: &[(usize, &[u32])],
+        _feeds: &[(usize, u32)],
+        _output: &mut [u32],
+    ) -> crate::Result<()> {
+        Err(crate::RuntimeError::Rejected(
+            "mixed packed launch unavailable".into(),
+        ))
+    }
     /// Apply a retained session's resume before seeding pack cursors: this backend packs fresh
     /// prompts, so the isolated path (which otherwise resumes) may never see them.
     fn resume_before_pack(&self) -> bool {
@@ -2474,7 +2490,9 @@ mod amd_serve {
             tok: u32,
             row: usize,
         ) -> Result<()> {
-            let cur = self.pf[slot].take().expect("a finishing prompt has a cursor");
+            let cur = self.pf[slot]
+                .take()
+                .expect("a finishing prompt has a cursor");
             self.lp_row[slot] = row;
             tracing::debug!(slot, tok, n = prompt.len(), row, "pf complete");
             let n = prompt.len() as u32;
@@ -3307,20 +3325,83 @@ mod amd_serve {
         }
 
         /// Advance compatible, already-initialized prefill cursors in one packed dispatch.
-        /// Final chunks remain isolated because the current model prefill head exposes one
-        /// sampled token, not one result per span. Snapshot boundaries remain isolated too.
+        /// Final chunks pack only when the packed tail samples every span (`packed_terminal`);
+        /// otherwise they, and snapshot boundaries, remain isolated.
         pub fn advance_packed_prefill(&mut self, members: &[(usize, &[u32])]) -> Result<()> {
             if members.len() < 2 {
                 return Err(RuntimeError::Rejected(
                     "packed prefill requires at least two cursors".into(),
                 ));
             }
+            self.advance_packed(members, &[], &mut [])
+        }
 
+        /// Whether the live decode rows may ride a packed prefill launch (`PLOW_AMD_MIXED_PACK`).
+        pub fn mixed_pack_ready(&self) -> bool {
+            crate::config::RuntimeConfig::get().amd_mixed_pack
+                && self.chunk_prefill
+                && !self.decode_only
+                && self.packed_terminal()
+        }
+
+        /// [`Self::advance_packed_prefill`] with the decode `feeds` riding the same launch as
+        /// one-row spans ahead of the prefill spans — the H100 unified token batch's lowering
+        /// (`exec/gpu/token_batch.rs`): each decode row is a span at `pos[slot]` on its own KV
+        /// and recurrent state, and the packed tail samples it. `output[i]` receives feed `i`'s
+        /// next token; `pos` advances as a decode step would.
+        pub fn advance_packed_mixed(
+            &mut self,
+            members: &[(usize, &[u32])],
+            feeds: &[(usize, u32)],
+            output: &mut [u32],
+        ) -> Result<()> {
+            if !self.mixed_pack_ready()
+                || members.is_empty()
+                || feeds.is_empty()
+                || output.len() != feeds.len()
+            {
+                return Err(RuntimeError::Rejected("invalid AMD mixed pack".into()));
+            }
+            self.advance_packed(members, feeds, output)
+        }
+
+        fn advance_packed(
+            &mut self,
+            members: &[(usize, &[u32])],
+            feeds: &[(usize, u32)],
+            output: &mut [u32],
+        ) -> Result<()> {
             let terminal = self.packed_terminal();
-            let mut spans = Vec::with_capacity(members.len());
-            let mut slices = Vec::with_capacity(members.len());
+            let n = feeds.len() + members.len();
+            let mut spans = Vec::with_capacity(n);
+            let mut slices: Vec<&[u32]> = Vec::with_capacity(n);
             let mut completed = Vec::with_capacity(members.len());
             let mut row0 = 0u32;
+            for (i, &(slot, _)) in feeds.iter().enumerate() {
+                self.check_slot(slot)?;
+                if !self.live[slot]
+                    || self.pf[slot].is_some()
+                    || self.pos[slot] as usize + 1 >= self.max_ctx
+                    || feeds[..i].iter().any(|&(prior, _)| prior == slot)
+                {
+                    return Err(RuntimeError::Rejected(format!(
+                        "invalid mixed decode slot {slot}"
+                    )));
+                }
+                let pos = self.pos[slot];
+                spans.push(PrefillSpan {
+                    row0,
+                    n_rows: 1,
+                    slot: slot as u32,
+                    flags: 0,
+                    kv_row0: pos,
+                    kv_len: pos + 1,
+                    state_slot: slot as u32,
+                    program: 0,
+                });
+                slices.push(std::slice::from_ref(&feeds[i].1));
+                row0 += 1;
+            }
             for &(slot, prompt) in members {
                 if spans
                     .iter()
@@ -3386,6 +3467,12 @@ mod amd_serve {
                 .ok_or_else(|| {
                     RuntimeError::Rejected(format!("no packed prefill rung covers {row0} rows"))
                 })?;
+            if spans.len() > self.packed_prefill_span_limit(prog) as usize {
+                return Err(RuntimeError::Rejected(format!(
+                    "packed prefill program {prog} takes fewer than {} spans",
+                    spans.len()
+                )));
+            }
             for span in &mut spans {
                 span.program = prog as u32;
             }
@@ -3417,15 +3504,22 @@ mod amd_serve {
                 })
                 .map(|(s, _)| s)
                 .collect();
-            let tokens = if finishing.is_empty() {
+            // Decode feeds are spans `[0, D)`; prefill member `s` is span `D + s`.
+            let d = feeds.len();
+            let sampled = finishing.last().map_or(d, |&s| d + s + 1);
+            let tokens = if sampled == 0 {
                 Vec::new()
             } else {
-                let n = finishing.last().copied().unwrap_or(0) + 1;
                 match &mut self.ranks {
-                    Ranks::One(e) => e.read_sampled_batched(n)?,
-                    Ranks::Tp(g) => g.read_sampled_rows_agreed(n)?,
+                    Ranks::One(e) => e.read_sampled_batched(sampled)?,
+                    Ranks::Tp(g) => g.read_sampled_rows_agreed(sampled)?,
                 }
             };
+            output.copy_from_slice(&tokens[..d]);
+            for (i, &(slot, _)) in feeds.iter().enumerate() {
+                self.pos[slot] += 1;
+                self.lp_row[slot] = i;
+            }
             for &s in &finishing {
                 let (slot, step) = completed[s];
                 let cur = self.pf[slot].as_ref().expect("validated above");
@@ -3436,8 +3530,8 @@ mod amd_serve {
             commit_packed_prefill(&mut self.pf, &completed);
             for &s in &finishing {
                 let (slot, _) = completed[s];
-                let tok = tokens[s];
-                self.finish_packed_prompt(slot, members[s].1, tok, s)?;
+                let tok = tokens[d + s];
+                self.finish_packed_prompt(slot, members[s].1, tok, d + s)?;
                 self.packed_tokens.push((slot, tok));
             }
             if let Some(diagnostics) = self.diagnostics.as_mut() {
@@ -4934,15 +5028,24 @@ mod amd_serve {
                 arm: 0,
             };
             for terminal in [false, true] {
-                assert_eq!(packable_prefill_step(&cursor(0, None), 3, terminal), Some(step));
+                assert_eq!(
+                    packable_prefill_step(&cursor(0, None), 3, terminal),
+                    Some(step)
+                );
                 assert_eq!(packable_prefill_step(&cursor(0, None), 2, terminal), None);
-                assert_eq!(packable_prefill_step(&cursor(0, Some(0)), 3, terminal), None);
+                assert_eq!(
+                    packable_prefill_step(&cursor(0, Some(0)), 3, terminal),
+                    None
+                );
             }
             assert_eq!(packable_prefill_step(&cursor(1, None), 3, false), None);
             // A span-sampling tail packs the final chunk, end-arm snapshot included.
             let last = ChunkStep { c0: 7, ..step };
             assert_eq!(packable_prefill_step(&cursor(1, None), 3, true), Some(last));
-            assert_eq!(packable_prefill_step(&cursor(1, Some(1)), 3, true), Some(last));
+            assert_eq!(
+                packable_prefill_step(&cursor(1, Some(1)), 3, true),
+                Some(last)
+            );
             assert_eq!(packable_prefill_step(&cursor(1, Some(1)), 3, false), None);
         }
 
@@ -5102,6 +5205,17 @@ impl SeqEngine for AmdServe {
     }
     fn take_packed_tokens(&mut self) -> Vec<(usize, u32)> {
         AmdServe::take_packed_tokens(self)
+    }
+    fn mixed_pack_ready(&self) -> bool {
+        AmdServe::mixed_pack_ready(self)
+    }
+    fn advance_packed_mixed(
+        &mut self,
+        members: &[(usize, &[u32])],
+        feeds: &[(usize, u32)],
+        output: &mut [u32],
+    ) -> crate::Result<()> {
+        AmdServe::advance_packed_mixed(self, members, feeds, output)
     }
     fn prefill_frontier(&self, slot: usize) -> Option<usize> {
         AmdServe::prefill_frontier(self, slot)
