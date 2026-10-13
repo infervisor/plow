@@ -186,6 +186,17 @@ __device__ __forceinline__ const int* plow_packed_span_kv_len(const PlowProgram*
     return kv_len + s->slot;
 }
 
+/* Workgroup slice for the span whose work items start at `off` in the packet's running item
+ * count. Span loops run every span on every workgroup in turn; starting each span's item 0 on
+ * workgroup `off % nblk` instead of 0 spreads short spans (one-row decode spans) across the
+ * machine instead of piling them onto the first workgroups. A rotation is a permutation of
+ * slices, so each item still has exactly one owner. */
+__device__ __forceinline__ unsigned plow_packed_span_slice(unsigned slice, unsigned nblk,
+                                                          size_t off) {
+    const unsigned r = (unsigned)(off % nblk);
+    return slice >= r ? slice - r : slice + nblk - r;
+}
+
 __device__ __forceinline__ const PlowPrefillSpan* plow_packed_prefill_span(
     const PlowProgram* prog, uint32_t index) {
     if (!plow_packed_prefill_enabled(prog) || index >= prog->n_prefill_spans) __builtin_trap();

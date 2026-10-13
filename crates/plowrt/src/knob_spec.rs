@@ -128,6 +128,14 @@ const KV_ADMIT_DEFAULT: Status = Status::Candidate {
     ],
 };
 
+/// AMD mixed packed launches by default: decode rows ride the packed prefill launch.
+const AMD_MIXED_PACK_DEFAULT: Status = Status::Candidate {
+    evidence: &[
+        "serve/engine.rs advance_packed_mixed: the H100 unified token batch lowering (exec/gpu/token_batch.rs) on the AMD TP span-sampling packed siblings",
+        "inert without packed siblings in the packet (mixed_pack_ready needs packed_terminal); `=0` is the rollback to prefill launches then a decode step",
+    ],
+};
+
 /// Pressure eviction armed by default. The cache previously trimmed only on its static 5%
 /// budget, so it never reacted to real device pressure however little was free.
 const PRESSURE_EVICTION_DEFAULT: Status = Status::Candidate {
@@ -518,7 +526,7 @@ pub const RUNTIME: &[KnobSpec] = &[
     KnobSpec::new("rt.pf_chunk", Some("PLOW_PF_CHUNK"), Layer::Runtime, U32, Default::Static(Val::Nat(0)), DIAG),
     KnobSpec::new("rt.pf_defer_decode", Some("PLOW_PF_DEFER_DECODE"), Layer::Runtime, Domain::Bool, OFF, DIAG),
     KnobSpec::new("rt.pf_back_to_back", Some("PLOW_PF_BACK_TO_BACK"), Layer::Runtime, Domain::Bool, OFF, DIAG),
-    KnobSpec::new("rt.amd_mixed_pack", Some("PLOW_AMD_MIXED_PACK"), Layer::Runtime, Domain::Bool, OFF, DIAG),
+    KnobSpec::new("rt.amd_mixed_pack", Some("PLOW_AMD_MIXED_PACK"), Layer::Runtime, Domain::Bool, ON, AMD_MIXED_PACK_DEFAULT),
     KnobSpec::new("rt.prefix_arm_end", Some("PLOW_PREFIX_ARM_END"), Layer::Runtime, Domain::Bool, OFF, DIAG),
     KnobSpec::new("rt.rt_max_ctx", Some("PLOW_RT_MAX_CTX"), Layer::Runtime, USIZE, UNSET, OPT_IN),
     KnobSpec::new("rt.tbt_slo_ms", Some("PLOW_TBT_SLO_MS"), Layer::Runtime, Domain::Str, UNSET, OPT_IN),
