@@ -681,6 +681,9 @@ extern "C" __device__ unsigned plow_xr_tagged_1 = 1;
 __device__ __forceinline__ uint32_t xrt_words(uint32_t n) {
     return (n + PLOW_XRT_PER_WORD - 1u) / PLOW_XRT_PER_WORD;
 }
+__device__ __forceinline__ bool xrt_fits(uint32_t n) {
+    return xrt_words(n) * 8u <= PLOW_XR_TAG_SLOT_BYTES;
+}
 __device__ __forceinline__ uint64_t xrt_load(const uint64_t* p) {
     return __hip_atomic_load(as_glob(p), __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
 }

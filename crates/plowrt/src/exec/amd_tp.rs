@@ -2437,6 +2437,11 @@ fn check_xr_tagged_insts(pi: usize, insts: &[packet::dev::DevInst64], hidden: u3
                 continue;
             }
             let (n, gate, gcols, row_w) = (d.i[0], d.i[3], d.i[5], d.i[6]);
+            // A plain collective wider than the slot (a batched decode rung's [rows, hidden])
+            // runs the gate one-shot on the device (`xrt_fits`) and owns no tagged slot.
+            if n > PeerLayout::XR_TAG_MAX_WIDTH && gcols == 0 && d.i[7] == 0 {
+                continue;
+            }
             let bad = n == 0
                 || n > hidden
                 || hidden > PeerLayout::XR_TAG_MAX_WIDTH
@@ -2830,6 +2835,11 @@ mod tests {
         assert!(check_xr_tagged_insts(0, &[xr(7169, 0, 0, 0)], 7168).is_err());
         assert!(check_xr_tagged_insts(0, &[xr(7168, 0, 896, 14336)], 7168).is_err());
         assert!(check_xr_tagged_insts(0, &[xr(7168, 0xffff, 0, 0)], 7168).is_err());
+        // A batched rung's [rows, hidden] message is past the slot: the device keeps the gate
+        // one-shot for it, so it neither fails the width check nor takes part in the parity.
+        let rung8 = vec![xr(8 * 4096, 0, 0, 0), xr(8 * 4096, 2, 0, 0)];
+        assert!(check_xr_tagged_insts(0, &rung8, 4096).is_ok());
+        assert!(check_xr_tagged_insts(0, &[xr(8 * 4096, 0, 512, 8 * 4096)], 4096).is_err());
     }
 
     #[test]

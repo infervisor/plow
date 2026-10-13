@@ -3960,7 +3960,14 @@ fn emit_xreduce_gather(
     let xr2_gather = !decode
         && emit_config::active().xr2_gather
         && gather.is_some_and(|(_, gcols, row_w)| row_w == tp.saturating_mul(gcols));
-    if decode || (gather.is_some() && !xr2_gather) {
+    // PLOW_XR_DEC_TWOSHOT_MIN: a batched decode rung's [rows, hidden] message is bandwidth-bound
+    // like prefill's (B=128: 1 MB, every rank reading all 7 peers' copies in the one-shot).
+    let dec_twoshot = decode
+        && gather.is_none()
+        && emit_config::active()
+            .xr_dec_twoshot_min
+            .is_some_and(|m| xr_elems >= m.max(1));
+    if (decode && !dec_twoshot) || (gather.is_some() && !xr2_gather) {
         let gate = *xgate;
         *xgate += 1;
         let (gslot, gcols, row_w) = gather.unwrap_or((0, 0, 0));

@@ -104,6 +104,30 @@ case "${PLOW_MERGE_UNROLL4:-0}" in
   1) DEC_KNOBS="$DEC_KNOBS -DFA_MERGE_UNROLL4=1" ;;
   *) echo "PLOW_MERGE_UNROLL4 must be 0 or 1" >&2; exit 2 ;;
 esac
+# PLOW_XR_TAGGED=1: decode one-shot XReduce publishes tagged data words and spins on the tags
+# instead of the xctr gate (op_collective.h; the CMake build's default). Bit-identical. A message
+# wider than the tag slot (batched rungs) keeps the gate one-shot.
+case "${PLOW_XR_TAGGED:-0}" in
+  0) ;;
+  1) DEC_KNOBS="$DEC_KNOBS -DPLOW_XR_TAGGED=1" ;;
+  *) echo "PLOW_XR_TAGGED must be 0 or 1" >&2; exit 2 ;;
+esac
+# PLOW_XR_DEC_AGG=1: device-local aggregation of the two-shot's all-gather signal (PLOW_XR_AGG,
+# build_gfx942.sh's default) in the decode objects, for packets emitted with
+# PLOW_XR_DEC_TWOSHOT_MIN. Bit-identical; inert without decode two-shots.
+# PLOW_FA_DEC_KL=8: decode flash K-phase with eight lanes per KV row (gfx942's map; one 128-byte
+# line per row per instruction instead of 64 rows per instruction) plus the interleaved row->wave
+# map. NOT bit-identical (the per-row dot is summed in a different order); 1 = shipped map.
+case "${PLOW_FA_DEC_KL:-1}" in
+  1) ;;
+  8) DEC_KNOBS="$DEC_KNOBS -DFA_DEC_KL=8 -DFA_DEC_ILV=1" ;;
+  *) echo "PLOW_FA_DEC_KL must be 1 or 8" >&2; exit 2 ;;
+esac
+case "${PLOW_XR_DEC_AGG:-0}" in
+  0) ;;
+  1) DEC_KNOBS="$DEC_KNOBS -DPLOW_XR_AGG=1" ;;
+  *) echo "PLOW_XR_DEC_AGG must be 0 or 1" >&2; exit 2 ;;
+esac
 case "${PLOW_FP8_BLK_DMA:-0}" in
   0) ;;
   1) A4W4_BK="$A4W4_BK -DPLOW_FP8_BLK_DMA=1" ;;
