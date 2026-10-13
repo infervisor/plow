@@ -61,6 +61,15 @@ case "${PLOW_MLA_PF2_DPP:-0}" in
   1) FLASH_TR16="$FLASH_TR16 -DPLOW_MLA_PF2_DPP=1" ;;
   *) echo "PLOW_MLA_PF2_DPP must be 0 or 1" >&2; exit 2 ;;
 esac
+# PLOW_MLA_PF_SNAKE (default 1; =0 rolls back): the V2 MLA prefill deals its (q-tile, head, split)
+# items heaviest-first, rounds boustrophedon over the workgroups (op_attention_common.h; bit-identical,
+# item->WG map only). GLM-5.3-Flash TP8 MI350X: flash 29.6 -> 20.6 ms per 8k chunk at c0=0, 66.0 ->
+# 57.9 at c0=8k; 8k prefill 272.2 -> 264.0 ms, 16k 598.6 -> 583.4; streams byte-equal.
+case "${PLOW_MLA_PF_SNAKE:-1}" in
+  0) ;;
+  1) FLASH_TR16="$FLASH_TR16 -DPLOW_MLA_PF_SNAKE=1" ;;
+  *) echo "PLOW_MLA_PF_SNAKE must be 0 or 1" >&2; exit 2 ;;
+esac
 # PLOW_KDA_CARRY_PIPE=1 / PLOW_KDA_CARRY_KTR16=1: regstate KDA carry load schedule and
 # transposed key-tile reads (op_kda_carry_regstate.h; both bit-identical).
 KDA_CARRY_DEFS=""
