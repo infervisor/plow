@@ -32,6 +32,9 @@ class ClientMountTests(unittest.TestCase):
             argv = self.docker_argv(root, "probe.py", "--x", "1")
             script = argv[argv.index("python3") + 2]
             self.assertEqual(script, str(Path(root).resolve() / "probe.py"))
+            # Outside a checkout the script's own directory is mounted.
+            here = Path(root).resolve()
+            self.assertIn(f"{here}:{here}:ro", self.mounts(argv))
 
     def test_file_outputs_mount_their_parent(self):
         with tempfile.TemporaryDirectory() as root:

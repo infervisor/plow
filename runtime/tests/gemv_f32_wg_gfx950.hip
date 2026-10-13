@@ -81,7 +81,9 @@ int main() {
             den += (double)s[i] * s[i];
         }
         const double rel = den > 0 ? sqrt(num / den) : sqrt(num);
-        const int drift = rel > 1e-4;
+        bool finite = std::isfinite(rel);
+        for (size_t i = 0; i < s.size(); i++) finite = finite && std::isfinite(a[i]) && std::isfinite(s[i]);
+        const int drift = !finite || rel > 1e-4;
         bad += diff + drift;
         printf("M=%-2u scalar %.4f ms  wave %.4f ms  wg %.4f ms  %.2fx  %s  vs scalar rel-L2 %.3g %s\n",
                M, ts, t0, t1, t0 / t1, diff ? "MISMATCH" : "bit-exact", rel,

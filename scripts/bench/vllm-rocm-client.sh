@@ -46,7 +46,8 @@ else
     if [[ "${args[0]:-}" == *.py && -f "${args[0]}" ]]; then
         args[0]="$(realpath -- "${args[0]}")"
         repo="$(cd -- "$(dirname -- "${args[0]}")" && git rev-parse --show-toplevel 2>/dev/null || true)"
-        [ -n "$repo" ] && docker_args+=(-v "$repo:$repo:ro")
+        repo=${repo:-$(dirname -- "${args[0]}")}
+        docker_args+=(-v "$repo:$repo:ro")
     fi
     for ((i=0; i<${#args[@]}; i++)); do
         case "${args[i]}" in
