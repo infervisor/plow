@@ -184,7 +184,8 @@ PLOW_QWEN_GDN_ISOLATE = "16"
 # ms; gate105 c1/c8/c32 PASS on the robust metrics (the one decisive flip is nat-docs-1024 pos 30,
 # the known swing position); grid105 4K c16/c32/c64 tok/s 229.0/280.2/292.6 -> 232.2/288.1/298.7,
 # 15K 79.8/81.7/82.8 -> 81.0/82.8/83.9. build106 (light windows + conv arm + pinned capture, ab107):
-# B16/32/48 26.37/29.90/31.22 ms, digests unchanged.
+# B16/32/48 26.37/29.90/31.22 ms, digests unchanged; grid106 4K tok/s 240.0/290.9/302.3 (TPOT p99
+# c16 59.9, c64 99.1), 15K 81.4/83.2/84.0.
 PLOW_EMIT_DECODE_CUBLASLT = "1"
 PLOW_EMIT_DECODE_CUBLASLT_MIN_ROWS = "16"
 # Remainder split-K in the mma row-block walks; rungs 1..4 take the K8 tensor-core walk too
