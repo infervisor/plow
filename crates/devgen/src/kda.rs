@@ -849,7 +849,11 @@ fn emit_kda_mixer_ex(
             d.i[..8].copy_from_slice(&[t, hi, p, p, p, hd, hd, nh]);
         });
         b.isolate(c);
-        let c_gb = emit_pf_gemm_route(b, g_raw, ga, g_b_proj, t, p, hd, &[c]);
+        let c_gb = if crate::emit_config::active().pf_gemm_route_all {
+            emit_pf_gemm_route(b, g_raw, ga, g_b_proj, t, p, hd, &[c])
+        } else {
+            gemv(b, g_raw, ga, g_b_proj, p, hd, c)
+        };
         (c, c_gb)
     });
     let (c_q, c_k, c_v, c_g) = if let Some((c, c_gb)) = group {
@@ -945,7 +949,7 @@ fn emit_kda_mixer_ex(
     // gate is full rank; that asymmetry is `use_full_rank_gate`'s and it is easy to get backwards.
     let c_fb = if fb_fold {
         c_fa
-    } else if group.is_some() {
+    } else if group.is_some() && crate::emit_config::active().pf_gemm_route_all {
         emit_pf_gemm_route(b, f_raw, fa, w.f_b_proj, t, p, hd, &[c_fa])
     } else {
         gemv(b, f_raw, fa, w.f_b_proj, p, hd, c_fa)
@@ -1372,7 +1376,7 @@ fn emit_kda_mixer_ex(
     });
 
     // P12 — out projection. The residual is NOT here: see `emit_kda_layer`.
-    let c_o = if group.is_some() {
+    let c_o = if group.is_some() && crate::emit_config::active().pf_gemm_route_all {
         emit_pf_gemm_route(b, attn, y, w.o_proj, t, hi, p, &[c_norm])
     } else {
         gemv(b, attn, y, w.o_proj, hi, p, c_norm)

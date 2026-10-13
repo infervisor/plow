@@ -8633,7 +8633,8 @@ pub(crate) fn emit_glm_mla_prefill(
         .then(|| emit_glm_mla_query_w8a8(b, &all, n, w, t, c_rnq, mla_mha, pf_norm_q));
     let c_qa = match fp8_q.map(|(done, _)| (done, done)).or(rowband_q) {
         Some((c_qa, _)) => c_qa,
-        None if w.qkva_cat != TENSOR_NONE => crate::kda::emit_pf_gemm_route(
+        None if w.qkva_cat != TENSOR_NONE && emit_config::active().pf_gemm_route_all => {
+            crate::kda::emit_pf_gemm_route(
             b,
             n.qa,
             n.qlat,
@@ -8642,7 +8643,8 @@ pub(crate) fn emit_glm_mla_prefill(
             nh_l * dk,
             ql,
             &[c_rnq],
-        ),
+            )
+        }
         None => gemm(b, n.qa, n.qlat, w.wqa, w.wqa_s, nh_l * dk, ql, &[c_rnq]),
     };
     // PLOW_GLM_FUSE_POST: the q RoPE rides the q_rope `GemmMed` store (t3..t5, i3 = first roped
@@ -9154,7 +9156,7 @@ pub(crate) fn emit_glm_mla_prefill(
         } else if lt_ext.o_proj && enc != MoeEnc::Mxfp4 {
             emit_glm_lt_ext(b, c, out, n.oat, w.wo, t, t, [h, nh_l * vd], deps)
         } else {
-            if w.qkva_cat != TENSOR_NONE {
+            if w.qkva_cat != TENSOR_NONE && emit_config::active().pf_gemm_route_all {
                 crate::kda::emit_pf_gemm_route(b, out, n.oat, w.wo, t, h, nh_l * vd, deps)
             } else {
                 gemm(b, out, n.oat, w.wo, w.wo_s, h, nh_l * vd, deps)

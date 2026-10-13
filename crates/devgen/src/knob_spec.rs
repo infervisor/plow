@@ -1240,6 +1240,7 @@ pub const EMIT: &[KnobSpec] = &[
     KnobSpec::new("emit.glm_mla_w8a8", Some("PLOW_GLM_MLA_W8A8"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.kda_pf_group_gemm", Some("PLOW_KDA_PF_GROUP_GEMM"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.glm_pf_qkva_group", Some("PLOW_GLM_PF_QKVA_GROUP"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
+    KnobSpec::new("emit.pf_gemm_route_all", Some("PLOW_PF_GEMM_ROUTE_ALL"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.glm_mla_mha", Some("PLOW_GLM_MLA_MHA"), Layer::Emit, Domain::Bool, OFF, OPT_IN).with(C_MLA_MHA),
     KnobSpec::new("emit.glm_decode_shared_fold", Some("PLOW_GLM_DECODE_SHARED_FOLD"), Layer::Emit, Domain::Bool, OFF, OPT_IN).with(C_DECODE_SHARED_FOLD),
     KnobSpec::new("emit.glm_norm_q128", Some("PLOW_GLM_NORM_Q128"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
