@@ -2083,6 +2083,27 @@ impl PeerMemory for HsaBackend {
     /// a fine-grained (already agent-visible, unlockable) zero buffer and one
     /// signal removes both per-call costs.
     fn zero_peer(&self, dptr: u64, bytes: u64) -> Result<()> {
+        self.zero_peer_submit(dptr, bytes)?;
+        self.zero_peer_wait()
+    }
+
+    fn zero_peer_wait(&self) -> Result<()> {
+        let guard = self.zero_stage.lock();
+        if let Some(stage) = guard.as_ref() {
+            unsafe {
+                (self.shared.drv.hsa_signal_wait_scacquire)(
+                    stage.sig,
+                    HSA_SIGNAL_CONDITION_LT,
+                    1,
+                    u64::MAX,
+                    HSA_WAIT_STATE_BLOCKED,
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn zero_peer_submit(&self, dptr: u64, bytes: u64) -> Result<()> {
         if bytes == 0 {
             return Ok(());
         }
@@ -2154,15 +2175,6 @@ impl PeerMemory for HsaBackend {
                     self.device_ordinal
                 ),
             ));
-        }
-        unsafe {
-            (self.shared.drv.hsa_signal_wait_scacquire)(
-                stage.sig,
-                HSA_SIGNAL_CONDITION_LT,
-                1,
-                u64::MAX,
-                HSA_WAIT_STATE_BLOCKED,
-            );
         }
         Ok(())
     }

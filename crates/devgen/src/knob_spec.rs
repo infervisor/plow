@@ -1381,6 +1381,7 @@ pub const RAW_ENV: &[KnobSpec] = &[
     KnobSpec::new("env.PLOW_MLA_DEC_MINPER", Some("PLOW_MLA_DEC_MINPER"), Layer::RawEnv, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("env.PLOW_XR_TAGGED", Some("PLOW_XR_TAGGED"), Layer::RawEnv, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("env.PLOW_XR_DEC_AGG", Some("PLOW_XR_DEC_AGG"), Layer::RawEnv, Domain::Bool, OFF, OPT_IN),
+    KnobSpec::new("env.PLOW_XR_DEC_MLP", Some("PLOW_XR_DEC_MLP"), Layer::RawEnv, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("env.PLOW_FA_DEC_KL", Some("PLOW_FA_DEC_KL"), Layer::RawEnv, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("env.PLOW_MOE_GLU_KW", Some("PLOW_MOE_GLU_KW"), Layer::RawEnv, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("env.PLOW_DSA_SELECT_V2", Some("PLOW_DSA_SELECT_V2"), Layer::RawEnv, Domain::Bool, OFF, OPT_IN),

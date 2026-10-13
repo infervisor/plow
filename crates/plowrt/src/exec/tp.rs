@@ -623,13 +623,20 @@ impl TpGroup {
     /// [`TpGroup::launch_token`] is the only sanctioned way to get the order
     /// right.
     pub fn zero_xctr(&self) -> Result<()> {
+        // Every rank's copy is in flight before the first wait: the per-rank submit+completion
+        // round trip (~17 us) was paid n_gpu times in series on every token.
         for r in &self.ranks {
             r.backend
                 .peer()
                 .ok_or_else(|| {
                     RuntimeError::Device(format!("rank {} lost its peer facility", r.rank))
                 })?
-                .zero_peer(r.xctr, self.layout.xstate_bytes())?;
+                .zero_peer_submit(r.xctr, self.layout.xstate_bytes())?;
+        }
+        for r in &self.ranks {
+            if let Some(p) = r.backend.peer() {
+                p.zero_peer_wait()?;
+            }
         }
         Ok(())
     }

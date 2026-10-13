@@ -123,6 +123,15 @@ case "${PLOW_FA_DEC_KL:-1}" in
   8) DEC_KNOBS="$DEC_KNOBS -DFA_DEC_KL=8 -DFA_DEC_ILV=1" ;;
   *) echo "PLOW_FA_DEC_KL must be 1 or 8" >&2; exit 2 ;;
 esac
+# PLOW_XR_DEC_MLP=1: the peer-batched reduce (PLOW_XR_MLP, op_collective.h) in the decode objects
+# only. Measured null for gfx942's bandwidth-bound prefill reduce-scatter; a decode one-shot past
+# the tag slot (B=8: 64 KiB, one element per thread) is the latency-bound case it was written for.
+# Bit-identical.
+case "${PLOW_XR_DEC_MLP:-0}" in
+  0) ;;
+  1) DEC_KNOBS="$DEC_KNOBS -DPLOW_XR_MLP=1" ;;
+  *) echo "PLOW_XR_DEC_MLP must be 0 or 1" >&2; exit 2 ;;
+esac
 case "${PLOW_XR_DEC_AGG:-0}" in
   0) ;;
   1) DEC_KNOBS="$DEC_KNOBS -DPLOW_XR_AGG=1" ;;
