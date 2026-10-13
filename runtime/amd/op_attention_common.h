@@ -3867,7 +3867,7 @@ __device__ void d_flash_mla_prefill_v2(float* __restrict__ Opart, float* __restr
          * 1.18 at c0=8k; measured util 0.64). Items are independent partials, so only the
          * item->workgroup map moves. A partial last round keeps the forward order. */
         const unsigned rnd = w / nblk;
-        const unsigned wi = (!GATHER && (rnd & 1u) && (rnd + 1u) * nblk <= n_work)
+        const unsigned wi = (!GATHER && (rnd & 1u) && n_work - rnd * nblk >= nblk)
                                 ? rnd * nblk + (nblk - 1u - (w - rnd * nblk))
                                 : w;
 #else

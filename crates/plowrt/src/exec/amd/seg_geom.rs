@@ -148,6 +148,14 @@ impl super::AmdEngine {
                              per-CU streams need exactly n_cu workgroups; use the GQ objects"
                         )));
                     }
+                    // A placed program drains one window per physical XCD; a resized grid could
+                    // leave a domain without workers.
+                    if g.grid != 0 && self.progs[p].l2_domains != 0 {
+                        return Err(RuntimeError::Device(format!(
+                            "PLOW_SEG_GEOM grid on T{bucket} segment {seg} ({fam}): the program \
+                             is L2-domain placed"
+                        )));
+                    }
                     if g.alt {
                         let have = match fam {
                             "interpreter" => self.k_prefill_alt.is_some(),
