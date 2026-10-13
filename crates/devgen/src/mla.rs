@@ -749,6 +749,17 @@ fn emit_glm53_hc_pre(
     // PLOW_GLM_HC_PRE_TAIL (one-row decode): the HyperConnPre below runs on this GemvF32's
     // last-arriving workgroup, with its operands in a u32 descriptor (interp.hip
     // `exec_hc_pre_tail`). The separate pre packet was one workgroup, so this is the same call.
+    let steps = 4 * c.hidden / 512;
+    let split = emit_config::active()
+        .glm_hc_mix_split
+        .map(|sp| if rows == 1 { sp } else { 1 })
+        .filter(|&sp| {
+            band.is_none()
+                && post_fold.is_some()
+                && sp > 0
+                && steps % sp == 0
+                && rows * 24 * sp <= b.n_cu()
+        });
     let tail = (band.is_none() && rows == 1 && emit_config::active().glm_hc_pre_tail).then(|| {
         let side = if ffn { "ffn" } else { "attn" };
         let ctr = b.tensor(&format!("act.hc_pre_tail.{layer}.{side}.ctr"), 4);
@@ -768,10 +779,24 @@ fn emit_glm53_hc_pre(
             c.eps.to_bits(),
             1e-6f32.to_bits(),
         ];
+        let mut words = words.to_vec();
+        if let Some(sp) = split {
+            let k = 4 * c.hidden;
+            let part = b.tensor("act.hc_mix_part", 24 * (k as u64 / 8) * 4);
+            words.extend([part, sp]);
+        }
         let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
         b.tensor_init(&format!("act.hc_pre_tail.{layer}.{side}.desc"), bytes)
     });
-    let cm = b.emit(DevOp::GemvF32, b.all(), &[dep], |d| {
+    // PLOW_GLM_HC_MIX_SPLIT=S: a folded mix packet runs on the workgroups that own an output
+    // (rows * 24) instead of the whole grid; with the one-row pre tail each output's K steps are
+    // also split over S workgroups (i4 = 2) and reduced in step order by the last one.
+    let cus = match (split, tail, post_fold) {
+        (Some(sp), Some(_), Some(_)) => (0..24 * sp).collect(),
+        (Some(_), None, Some(_)) => (0..rows * 24).collect(),
+        _ => b.all(),
+    };
+    let cm = b.emit(DevOp::GemvF32, cus, &[dep], |d| {
         d.t[0] = mixes;
         d.t[1] = residual;
         d.t[2] = if ffn { w.ffn_fn } else { w.attn_fn };
@@ -788,7 +813,7 @@ fn emit_glm53_hc_pre(
             d.t[6] = comb_mix;
         }
         if let Some(desc) = tail {
-            d.i[4] = 1;
+            d.i[4] = if split.is_some() && post_fold.is_some() { 2 } else { 1 };
             d.t[7] = desc;
         }
     });

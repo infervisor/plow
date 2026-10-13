@@ -734,6 +734,8 @@ pub(super) const DECODE_ARM_MARKERS: &[(&str, &[&str])] = &[
     // The one-row HyperConnPre run by the mix GemvF32's last workgroup (op 135 i4 = 1). Same
     // silent class.
     ("PLOW_GLM_HC_PRE_TAIL", &["plow_glm_hc_pre_tail_arm"]),
+    // The mix split over S workgroups per output (op 135 i4 = 2). Same silent class.
+    ("PLOW_GLM_HC_MIX_SPLIT", &["plow_glm_hc_mix_split_arm"]),
     // The K3 latent MoeCombine folded into the tagged one-shot publish (XReduce t1 = part,
     // i7 = k). An object without the arm publishes the plain partial slot, which no packet
     // wrote — stale data, no trap. A BUILD axis (`#if PLOW_XR_COMBINE_FOLD`).

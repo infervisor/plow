@@ -1024,6 +1024,12 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_GLM53_SP_KDA_NORM", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub glm53_sp_kda_norm: bool,
 
+    /// GLM-5.3-Flash decode: the HyperConnPost-folded mHC mix GemvF32 runs only on the
+    /// workgroups that own an output, and under the one-row pre tail each output's K is split
+    /// over this many workgroups (partials reduced in step order by the last). Bit-identical.
+    #[arg(long, env = "PLOW_GLM_HC_MIX_SPLIT")]
+    pub glm_hc_mix_split: Option<u32>,
+
 
     /// GLM-5.3-Flash batched decode (rows > 1): largest split-K factor for the bf16 GemmSmall
     /// projections whose 64x128 tiles leave most workgroups idle (0 = off). NOT bit-identical.
@@ -1758,6 +1764,7 @@ impl EmitConfig {
             glm_hc_pre_tail: env_bool("PLOW_GLM_HC_PRE_TAIL"),
             glm53_sp_router: env_bool("PLOW_GLM53_SP_ROUTER"),
             glm53_sp_kda_norm: env_bool("PLOW_GLM53_SP_KDA_NORM"),
+            glm_hc_mix_split: env_u32("PLOW_GLM_HC_MIX_SPLIT"),
             glm_dec_splitk: env_u32("PLOW_GLM_DEC_SPLITK"),
             glm_xr_hcpost: env_bool("PLOW_GLM_XR_HCPOST"),
             glm_decode_glu_rows: env_bool("PLOW_GLM_DECODE_GLU_ROWS"),

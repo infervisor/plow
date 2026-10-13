@@ -611,4 +611,68 @@ __device__ void d_gemv_f32_wg_hcpost(float* __restrict__ C, bf16* __restrict__ n
     }
 }
 
+/* PLOW_GLM_HC_MIX_SPLIT: d_gemv_f32_wg_hcpost with each output's K steps split over S
+ * workgroups (slice = output * S + part). Every (step, lane) term is the one the unsplit body
+ * writes to LDS, written instead to `gpart[output][step][lane]` in global memory; the packet's
+ * last workgroup adds them in step order (hc_mix_split_reduce), so mixes and new_residual stay
+ * bit-identical. Requires (K / (8 * PLOW_WAVE)) % S == 0, K = 4 * hidden. */
+__device__ void d_gemv_f32_hcpost_split_part(float* __restrict__ gpart,
+                                             bf16* __restrict__ new_residual,
+                                             const float* __restrict__ W,
+                                             const bf16* __restrict__ x_out,
+                                             const bf16* __restrict__ residual,
+                                             const float* __restrict__ post_mix,
+                                             const float* __restrict__ comb_mix, unsigned N,
+                                             unsigned K, unsigned S, unsigned slice) {
+    const unsigned wave = threadIdx.x / PLOW_WAVE;
+    const unsigned lane = threadIdx.x % PLOW_WAVE;
+    const unsigned steps = K / (PLOW_WAVE * 8u), hidden = K / 4u, per = steps / S;
+    const unsigned output = slice / S, part = slice % S;
+    const unsigned m = output / N, n = output % N;
+    const float* const wn = W + (size_t)n * K;
+    const bf16* const rrow = residual + (size_t)m * K;
+    const bf16* const xrow = x_out + (size_t)m * hidden;
+    float* const gp = gpart + (size_t)output * steps * PLOW_WAVE;
+    float c[16], p[4];
+#pragma unroll
+    for (unsigned k = 0; k < 16; k++) c[k] = comb_mix[(size_t)m * 16u + k];
+#pragma unroll
+    for (unsigned k = 0; k < 4; k++) p[k] = post_mix[(size_t)m * 4u + k];
+    for (unsigned s = part * per + wave; s < (part + 1u) * per; s += PLOW_WAVES) {
+        const unsigned k = s * (PLOW_WAVE * 8u) + lane * 8u;
+        const unsigned j = k / hidden, d = k % hidden;
+        bf16v8 r[4];
+#pragma unroll
+        for (unsigned i = 0; i < 4; i++) r[i] = ld_glob8(rrow + (size_t)i * hidden + d);
+        const bf16v8 xo = ld_glob8(xrow + d);
+        const float4 w0 = *(const float4*)(wn + k);
+        const float4 w1 = *(const float4*)(wn + k + 4);
+        const bf16v8 xv = hc_post4_8(c, p, j, r, xo);
+        if (n == 0u) st_glob8(new_residual + (size_t)m * K + k, xv);
+        {
+#pragma clang fp contract(off)
+            gp[s * PLOW_WAVE + lane] =
+                bf2f(xv[0]) * w0.x + bf2f(xv[1]) * w0.y + bf2f(xv[2]) * w0.z +
+                bf2f(xv[3]) * w0.w + bf2f(xv[4]) * w1.x + bf2f(xv[5]) * w1.y +
+                bf2f(xv[6]) * w1.z + bf2f(xv[7]) * w1.w;
+        }
+    }
+}
+
+/* The unsplit body's wave-0 reduction, one wave per output: step-order adds, then wave_sum. */
+__device__ void hc_mix_split_reduce(float* __restrict__ C, const float* __restrict__ gpart,
+                                    unsigned outputs, unsigned K) {
+    const unsigned wave = threadIdx.x / PLOW_WAVE;
+    const unsigned lane = threadIdx.x % PLOW_WAVE;
+    const unsigned steps = K / (PLOW_WAVE * 8u);
+    for (unsigned o = wave; o < outputs; o += PLOW_WAVES) {
+#pragma clang fp contract(off)
+        const float* const gp = gpart + (size_t)o * steps * PLOW_WAVE;
+        float acc = 0.0f;
+        for (unsigned s = 0; s < steps; s++) acc += gp[s * PLOW_WAVE + lane];
+        acc = wave_sum(acc);
+        if (lane == 0) C[o] = acc;
+    }
+}
+
 #endif /* PLOW_OP_HYPERCONN_H */
