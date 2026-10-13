@@ -2631,6 +2631,8 @@ struct GlmLW {
     qad_s: u32,
     qkva: u32,
     qkva_s: u32,
+    /// `PLOW_GLM_PF_QKVA_GROUP`: `[q_a | kv_a_latent]` bf16 rows (loader-stacked), NoPE only.
+    qkva_cat: u32,
     qb: u32,
     qb_s: u32,
     wk: u32,
@@ -4399,6 +4401,24 @@ fn declare_glm_rows_batched_for_prefill(
                     "self_attn.fused_qkv_a_proj",
                     (ql + dk + dr) as u64,
                     h as u64,
+                )
+            } else {
+                TENSOR_NONE
+            },
+            qkva_cat: if mla
+                && emit_config::active().glm_pf_qkva_group
+                && dr == 0
+                && !qkva_w8a8
+                && !blk.any()
+                && enc != MoeEnc::Mxfp4
+                && !c.quark_mixed
+                && crate::emit_is_amd()
+                && crate::amd_target::active().1 == hwspec::IsaLevel::Gfx950
+            {
+                t(
+                    b,
+                    "self_attn.derived.qkv_a_cat.weight",
+                    (ql + dk) as u64 * h as u64 * BF16,
                 )
             } else {
                 TENSOR_NONE
@@ -8507,6 +8527,22 @@ pub(crate) fn emit_glm_mla_prefill(
             }
         });
         (done, done, norm)
+    } else if w.qkva_cat != TENSOR_NONE && t > 1 {
+        let g = b.emit(DevOp::GemmGroupPf, vec![0], &[c_rn1], |d| {
+            d.t[..4].copy_from_slice(&[n.xn, w.qkva_cat, n.qlr, n.ckvraw]);
+            d.t[4..].fill(TENSOR_NONE);
+            d.i[..4].copy_from_slice(&[t, h, ql, dk]);
+        });
+        b.isolate(g);
+        let c_rnq = b.emit(DevOp::RmsNorm, pf_wide_cus(n_cu, t), &[g], |d| {
+            d.t[0] = n.qlat;
+            d.t[1] = n.qlr;
+            d.t[2] = w.gqa;
+            d.i[0] = t;
+            d.i[1] = ql;
+            d.f[0] = eps;
+        });
+        (g, g, c_rnq)
     } else {
         let blk_qad = emit_glm_blk_gemm(
             b,

@@ -5312,9 +5312,14 @@ fn kda_in_proj_cat(
     n_gpu: u32,
 ) -> Option<Result<Vec<u8>>> {
     use crate::asset::shard::{shard_of, slice_for, Shard};
-    let stem = name.strip_suffix("derived.in_proj_cat.weight")?;
+    const KDA: &[&str] = &["q_proj", "k_proj", "v_proj", "g_a_proj", "f_a_proj", "b_proj"];
+    const QKVA: &[&str] = &["q_a_proj", "derived.kv_a_latent"];
+    let (stem, parts) = match name.strip_suffix("derived.in_proj_cat.weight") {
+        Some(stem) => (stem, KDA),
+        None => (name.strip_suffix("derived.qkv_a_cat.weight")?, QKVA),
+    };
     let mut out = Vec::new();
-    for part in ["q_proj", "k_proj", "v_proj", "g_a_proj", "f_a_proj", "b_proj"] {
+    for part in parts {
         let pn = format!("{stem}{part}.weight");
         let Some((src, shape)) = c.tensor_ex(&pn) else {
             return Some(Err(RuntimeError::Device(format!(
@@ -5412,7 +5417,9 @@ fn preflight_weights(
         // DERIVED, and in no checkpoint by design — `fold_res_score` builds it from a norm
         // and a proj. Without this exemption a Kimi-K3 load reports 186 false MISSING
         // WEIGHTs before it starts.
-        if stripped.ends_with("_res_score.weight") || stripped.ends_with(".derived.in_proj_cat.weight")
+        if stripped.ends_with("_res_score.weight")
+            || stripped.ends_with(".derived.in_proj_cat.weight")
+            || stripped.ends_with(".derived.qkv_a_cat.weight")
         {
             continue;
         }

@@ -30,21 +30,25 @@ static __device__ __forceinline__ unsigned gg_tiles(unsigned t, unsigned n) {
 
 extern "C" __global__ __launch_bounds__(PLOW_THREADS) void plow_gemm_group_pf_gfx950(GemmGroupArgs a) {
     __shared__ bf16 lds[GG_LDS_WIDE > GG_LDS_SMALL ? GG_LDS_WIDE : GG_LDS_SMALL];
-    unsigned b = blockIdx.x;
-    size_t row0 = 0;
-    for (unsigned g = 0; g < PLOW_GG_GROUPS; g++) {
-        const unsigned n = a.n[g];
-        if (!n) break;
-        const unsigned tiles = gg_tiles(a.t, n);
-        if (b < tiles) {
-            const bf16* w = a.w + row0 * a.k;
-            if (n >= 512)
-                d_gemm_wide(a.c[g], a.x, w, a.t, n, a.k, b, tiles, lds);
-            else
-                d_gemm_small(a.c[g], a.x, w, a.t, n, a.k, b, tiles, lds);
-            return;
+    /* Grid-stride over the concatenated tile space: a launch narrower than the tile count (a
+     * PLOW_SEG_GEOM override) still covers every tile. */
+    for (unsigned id = blockIdx.x;; id += gridDim.x) {
+        unsigned b = id;
+        size_t row0 = 0;
+        unsigned g = 0;
+        for (; g < PLOW_GG_GROUPS && a.n[g]; g++) {
+            const unsigned tiles = gg_tiles(a.t, a.n[g]);
+            if (b < tiles) break;
+            b -= tiles;
+            row0 += a.n[g];
         }
-        b -= tiles;
-        row0 += n;
+        if (g == PLOW_GG_GROUPS || !a.n[g]) return;
+        const unsigned n = a.n[g], tiles = gg_tiles(a.t, n);
+        const bf16* w = a.w + row0 * a.k;
+        if (n >= 512)
+            d_gemm_wide(a.c[g], a.x, w, a.t, n, a.k, b, tiles, lds);
+        else
+            d_gemm_small(a.c[g], a.x, w, a.t, n, a.k, b, tiles, lds);
+        __syncthreads();
     }
 }

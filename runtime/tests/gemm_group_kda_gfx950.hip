@@ -141,6 +141,15 @@ int main() {
                 }
                 printf("%s grid %u: %.3f ms %.0f TF/s\n", names[tl], grid, best, 2.0 * M * 3072 * K / best / 1e9);
             }
+            std::vector<unsigned short> cc((size_t)M * 3072), ref((size_t)M * 1024);
+            CK(hipMemcpy(cc.data(), Cc, cc.size() * 2, hipMemcpyDeviceToHost));
+            size_t diff = 0;
+            for (unsigned g = 0; g < 3; g++) {
+                CK(hipMemcpy(ref.data(), C0[g], ref.size() * 2, hipMemcpyDeviceToHost));
+                for (size_t r = 0; r < M; r++)
+                    for (size_t c = 0; c < 1024; c++) diff += cc[r * 3072 + g * 1024 + c] != ref[r * 1024 + c];
+            }
+            printf("%s vs separate wide: differing=%zu\n", names[tl], diff);
         }
     }
     for (unsigned i = 0; i < NG; i++) {
