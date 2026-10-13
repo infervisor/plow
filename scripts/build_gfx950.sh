@@ -171,7 +171,10 @@ esac
 case "${PLOW_XR_TAG_SLOT:-20480}" in
   20480) ;;
   *[!0-9]*) echo "PLOW_XR_TAG_SLOT must be a byte count" >&2; exit 2 ;;
-  *) DEC_KNOBS="$DEC_KNOBS -DPLOW_XR_TAG_SLOT_BYTES=${PLOW_XR_TAG_SLOT}u -DPLOW_XR_TAG_SLOT_BYTES_N=$PLOW_XR_TAG_SLOT" ;;
+  *) if [ $((PLOW_XR_TAG_SLOT % 256)) -ne 0 ] || [ "$PLOW_XR_TAG_SLOT" -lt 20480 ]; then
+       echo "PLOW_XR_TAG_SLOT must be a multiple of 256, >= 20480" >&2; exit 2
+     fi
+     DEC_KNOBS="$DEC_KNOBS -DPLOW_XR_TAG_SLOT_BYTES=${PLOW_XR_TAG_SLOT}u -DPLOW_XR_TAG_SLOT_BYTES_N=$PLOW_XR_TAG_SLOT" ;;
 esac
 case "${PLOW_XR_DEC_AGG:-1}" in
   0) ;;
