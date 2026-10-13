@@ -1849,6 +1849,22 @@ impl AmdTpGroup {
         self.ranks.iter_mut().map(|e| e.read_sampled()).collect()
     }
 
+    /// The first `n` sampled ids (a span-sampling packed prefill's per-span tokens), which every
+    /// rank must agree on.
+    pub fn read_sampled_rows_agreed(&mut self, n: usize) -> Result<Vec<u32>> {
+        let first = self.ranks[0].read_sampled_batched(n)?;
+        for rank in 1..self.ranks.len() {
+            let ids = self.ranks[rank].read_sampled_batched(n)?;
+            if let Some(i) = (0..n).find(|&i| ids[i] != first[i]) {
+                return Err(RuntimeError::Device(format!(
+                    "RANKS DISAGREE on packed span {i}: rank 0 sampled {}, rank {rank} sampled {}",
+                    first[i], ids[i]
+                )));
+            }
+        }
+        Ok(first)
+    }
+
     /// Run the prefill chunks covering `[from, to)` on every rank.
     fn prefill_span(&mut self, prompt: &[u32], from: u32, to: u32) -> Result<()> {
         if from >= to {

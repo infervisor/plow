@@ -910,6 +910,10 @@ mod amd_serve {
         /// goes straight to decode. `None` whenever the snapshot is not an end arm.
         end_tok: Vec<Option<u32>>,
         end_logits: Vec<Vec<u8>>,
+        /// `(slot, first token)` of each prompt the last packed prefill completed.
+        packed_tokens: Vec<(usize, u32)>,
+        /// [`Self::packed_terminal`], decided once from the loaded programs.
+        packed_terminal: std::cell::OnceCell<bool>,
         cached_rows: Vec<u32>,
         /// Per-slot generation, bumped on release. Carried on every token-batch request and
         /// re-checked by the planner and the commit, so a slot recycled mid-step cannot be
@@ -1206,10 +1210,18 @@ mod amd_serve {
         true
     }
 
-    fn packable_prefill_step(cur: &PfCursor, max_rows: u32) -> Option<crate::exec::amd::ChunkStep> {
+    /// `terminal`: the packed tail samples every span's last row, so a final chunk may pack —
+    /// including an end-arm snapshot boundary, which the pack takes after its launch. A snapshot
+    /// boundary inside the prompt stays isolated.
+    fn packable_prefill_step(
+        cur: &PfCursor,
+        max_rows: u32,
+        terminal: bool,
+    ) -> Option<crate::exec::amd::ChunkStep> {
         let step = *cur.steps.get(cur.next)?;
-        (cur.next + 1 < cur.steps.len()
-            && cur.snap_after != Some(cur.next)
+        let last = cur.next + 1 == cur.steps.len();
+        ((!last || terminal)
+            && (cur.snap_after != Some(cur.next) || (last && terminal))
             && step.clen <= max_rows)
             .then_some(step)
     }
@@ -1721,6 +1733,8 @@ mod amd_serve {
                 snap_at: vec![0; batch],
                 end_tok: vec![None; batch],
                 end_logits: vec![Vec::new(); batch],
+                packed_tokens: Vec::new(),
+                packed_terminal: std::cell::OnceCell::new(),
                 cached_rows: vec![0; batch],
                 slot_generation: vec![0; batch],
                 pf: (0..batch).map(|_| None).collect(),
@@ -2446,11 +2460,25 @@ mod amd_serve {
                 return Ok((None, ran));
             }
             let tok = g.read_prefill_token()?;
-            self.lp_row[slot] = 0;
-            tracing::debug!(slot, tok, n = prompt.len(), "pf complete");
+            self.finish_packed_prompt(slot, prompt, tok, 0)?;
+            Ok((Some(tok), ran))
+        }
+
+        /// A prompt's last chunk landed with first token `tok`, sampled from logits row `row`
+        /// (0 for an isolated chunk, the span index in a span-sampling pack): make the slot live
+        /// and do the prefix-cache bookkeeping.
+        fn finish_packed_prompt(
+            &mut self,
+            slot: usize,
+            prompt: &[u32],
+            tok: u32,
+            row: usize,
+        ) -> Result<()> {
+            let cur = self.pf[slot].take().expect("a finishing prompt has a cursor");
+            self.lp_row[slot] = row;
+            tracing::debug!(slot, tok, n = prompt.len(), row, "pf complete");
             let n = prompt.len() as u32;
             let (resume, arm) = (cur.resume, cur.arm);
-            self.pf[slot] = None;
             self.pos[slot] = n;
             self.live[slot] = true;
             if self.prefix_cache {
@@ -2464,10 +2492,10 @@ mod amd_serve {
                     self.end_tok[slot] = None;
                 }
                 if arm == n {
-                    self.keep_end_token(slot, tok)?;
+                    self.keep_end_token(slot, tok, row)?;
                 }
             }
-            Ok((Some(tok), ran))
+            Ok(())
         }
 
         pub fn mixed_step_rows(&self, decode_rows: usize, prefill_rows: usize) -> Option<u32> {
@@ -2481,7 +2509,7 @@ mod amd_serve {
         }
 
         /// Keep `tok` and the logits row behind it with `slot`'s end-arm snapshot.
-        fn keep_end_token(&mut self, slot: usize, tok: u32) -> Result<()> {
+        fn keep_end_token(&mut self, slot: usize, tok: u32, logits_row: usize) -> Result<()> {
             self.end_tok[slot] = Some(tok);
             let row = &mut self.end_logits[slot];
             row.clear();
@@ -2492,9 +2520,10 @@ mod amd_serve {
             let Some(total) = e.tensor_bytes("act.logits") else {
                 return Ok(());
             };
-            row.resize(total as usize / self.batch, 0);
-            // The prefill tail wrote its one logits row at row 0 (`lp_row`).
-            e.read_tensor_range("act.logits", 0, row)
+            let bytes = total as usize / self.batch;
+            row.resize(bytes, 0);
+            // The prefill tail wrote this prompt's logits at `logits_row` (`lp_row`).
+            e.read_tensor_range("act.logits", (logits_row * bytes) as u64, row)
         }
 
         /// Complete an end resume: the KV rows and the restored recurrence already hold the
@@ -2543,7 +2572,8 @@ mod amd_serve {
             if prompt.len() <= 1
                 || (self.mixed_step_rows(1, 1).is_none()
                     && self.token_batch_rows(1, 0, 1).is_none()
-                    && !self.packed_prefill_reachable(max_rows))
+                    && !self.packed_prefill_reachable(max_rows)
+                    && !self.packed_prompt_reachable(prompt.len() as u32, max_rows))
             {
                 return Ok(());
             }
@@ -3181,11 +3211,37 @@ mod amd_serve {
             max_rows: u32,
         ) -> Option<packet::dev::PrefillSpan> {
             let cur = self.pf.get(slot)?.as_ref()?;
-            let step = packable_prefill_step(cur, max_rows)?;
+            let step = packable_prefill_step(cur, max_rows, self.packed_terminal())?;
             let program = self.packed_prefill_program(step.clen, max_rows, true, Some(step.c0))?;
             let mut span = self.prefill_span(slot, max_rows)?;
             span.program = u32::try_from(program).ok()?;
             Some(span)
+        }
+
+        pub fn take_packed_tokens(&mut self) -> Vec<(usize, u32)> {
+            std::mem::take(&mut self.packed_tokens)
+        }
+
+        /// Whether every packed rung's tail samples each span's last row, so final chunks pack
+        /// and the pack returns their first tokens.
+        fn packed_terminal(&self) -> bool {
+            *self.packed_terminal.get_or_init(|| {
+                let e = self.ranks.rank0();
+                let mut rungs = e
+                    .prefill_rungs()
+                    .filter(|&(prog, _)| e.packed_prefill_prog_for(prog).is_some())
+                    .peekable();
+                rungs.peek().is_some() && rungs.all(|(prog, _)| e.packed_prefill_terms(prog) > 0)
+            })
+        }
+
+        /// Whether two prompts of `n` tokens fit one packed rung no wider than `max_rows`
+        /// (a span-sampling tail packs whole prompts).
+        fn packed_prompt_reachable(&self, n: u32, max_rows: u32) -> bool {
+            self.packed_terminal()
+                && self
+                    .packed_prefill_program(n.saturating_mul(2), max_rows, true, None)
+                    .is_some()
         }
 
         /// Whether a pack could form at all, i.e. whether two chunks of the configured size fit
@@ -3254,6 +3310,7 @@ mod amd_serve {
                 ));
             }
 
+            let terminal = self.packed_terminal();
             let mut spans = Vec::with_capacity(members.len());
             let mut slices = Vec::with_capacity(members.len());
             let mut completed = Vec::with_capacity(members.len());
@@ -3282,12 +3339,13 @@ mod amd_serve {
                         "packed prefill slot {slot} cursor is past its plan"
                     ))
                 })?;
-                if cur.next + 1 == cur.steps.len() {
+                let last = cur.next + 1 == cur.steps.len();
+                if last && !terminal {
                     return Err(RuntimeError::Rejected(format!(
                         "packed prefill slot {slot} is on its final chunk; use isolated prefill to collect its sampled token"
                     )));
                 }
-                if cur.snap_after == Some(cur.next) {
+                if cur.snap_after == Some(cur.next) && !(last && terminal) {
                     return Err(RuntimeError::Rejected(format!(
                         "packed prefill slot {slot} is on a prefix snapshot boundary; use isolated prefill"
                     )));
@@ -3341,7 +3399,41 @@ mod amd_serve {
                 Ranks::One(e) => e.prefill_packed_chunk(&spans, &slices, &parked)?,
                 Ranks::Tp(g) => g.prefill_packed_chunk(&spans, &slices, &parked)?,
             }
+            // Span `s` sampled into `in.ids[s]` and logits row `s`. Read them before the cursors
+            // move, so a failed read leaves every member re-runnable.
+            let finishing: Vec<usize> = completed
+                .iter()
+                .enumerate()
+                .filter(|&(_, &(slot, _))| {
+                    self.pf[slot]
+                        .as_ref()
+                        .is_some_and(|cur| cur.next + 1 == cur.steps.len())
+                })
+                .map(|(s, _)| s)
+                .collect();
+            let tokens = if finishing.is_empty() {
+                Vec::new()
+            } else {
+                let n = finishing.last().copied().unwrap_or(0) + 1;
+                match &mut self.ranks {
+                    Ranks::One(e) => e.read_sampled_batched(n)?,
+                    Ranks::Tp(g) => g.read_sampled_rows_agreed(n)?,
+                }
+            };
+            for &s in &finishing {
+                let (slot, step) = completed[s];
+                let cur = self.pf[slot].as_ref().expect("validated above");
+                if cur.snap_after == Some(cur.next) {
+                    self.ranks.snapshot_carried(slot, step.c0 + step.clen)?;
+                }
+            }
             commit_packed_prefill(&mut self.pf, &completed);
+            for &s in &finishing {
+                let (slot, _) = completed[s];
+                let tok = tokens[s];
+                self.finish_packed_prompt(slot, members[s].1, tok, s)?;
+                self.packed_tokens.push((slot, tok));
+            }
             if let Some(diagnostics) = self.diagnostics.as_mut() {
                 for &(slot, step) in &completed {
                     diagnostics.push_prefill(PrefillSelection {
@@ -4835,10 +4927,17 @@ mod amd_serve {
                 resume: 0,
                 arm: 0,
             };
-            assert_eq!(packable_prefill_step(&cursor(0, None), 3), Some(step));
-            assert_eq!(packable_prefill_step(&cursor(0, None), 2), None);
-            assert_eq!(packable_prefill_step(&cursor(0, Some(0)), 3), None);
-            assert_eq!(packable_prefill_step(&cursor(1, None), 3), None);
+            for terminal in [false, true] {
+                assert_eq!(packable_prefill_step(&cursor(0, None), 3, terminal), Some(step));
+                assert_eq!(packable_prefill_step(&cursor(0, None), 2, terminal), None);
+                assert_eq!(packable_prefill_step(&cursor(0, Some(0)), 3, terminal), None);
+            }
+            assert_eq!(packable_prefill_step(&cursor(1, None), 3, false), None);
+            // A span-sampling tail packs the final chunk, end-arm snapshot included.
+            let last = ChunkStep { c0: 7, ..step };
+            assert_eq!(packable_prefill_step(&cursor(1, None), 3, true), Some(last));
+            assert_eq!(packable_prefill_step(&cursor(1, Some(1)), 3, true), Some(last));
+            assert_eq!(packable_prefill_step(&cursor(1, Some(1)), 3, false), None);
         }
 
         #[test]
@@ -4994,6 +5093,9 @@ impl SeqEngine for AmdServe {
     }
     fn advance_packed_prefill(&mut self, members: &[(usize, &[u32])]) -> crate::Result<()> {
         AmdServe::advance_packed_prefill(self, members)
+    }
+    fn take_packed_tokens(&mut self) -> Vec<(usize, u32)> {
+        AmdServe::take_packed_tokens(self)
     }
     fn prefill_frontier(&self, slot: usize) -> Option<usize> {
         AmdServe::prefill_frontier(self, slot)

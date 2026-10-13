@@ -997,6 +997,34 @@ if [ -n "${PLOW_HSACO_CONFIG:-}" ] &&
     K3_ELFS="$K3_ELFS interp_prefill_k3_moe_gq.elf interp_decode_k3_gq.elf"
   fi
 fi
+# PACKED-PREFILL FAMILY OBJECTS (PLOW_PACKED_PREFILL_CONSUMERS=1, default off): the three lean
+# objects a packet with packed-prefill siblings opens by name (exec/amd.rs `load_packed_family`),
+# the gfx950 twins of build_gfx942.sh's rows. The flash object takes the NoPE V2 arm when the
+# packet requires it (marker `plow_packed_prefill_mla_nope_1`). Not in ALL_ELFS: the default-
+# object check there refuses consumer arms by design.
+PACKED_ELFS=""
+if [ "${PLOW_PACKED_PREFILL_CONSUMERS:-0}" = 1 ]; then
+  rm -f interp_packed_mla_norm*.elf interp_packed_mla_flash*.elf interp_packed_kda*.elf
+  PK_NORM="-DPLOW_BUCKET_DECODE=0 -DPLOW_MLA_PREFILL=1 -DPLOW_BUCKET_PACKED_MLA_NORM=1 -DPLOW_PACKED_PREFILL_MLA_NORM_CONSUMERS=1"
+  PK_FLASH="-DPLOW_BUCKET_DECODE=0 -DPLOW_BUCKET_FLASH -DPLOW_WG_WAVES=4 -DFA_DC=256 -DFA_DBUF=1 -DPLOW_MLA_PF_V2_ARM=1 $NOPE_FLASH $FLASH_TR16 -DPLOW_PACKED_PREFILL_MLA_FLASH_CONSUMERS=1"
+  PK_KDA="-DPLOW_BUCKET_DECODE=0 -DPLOW_K3=1 -DPLOW_BUCKET_PACKED_KDA=1 -DPLOW_PACKED_PREFILL_KDA_CONSUMERS=1"
+  for fam in norm flash kda; do
+    case $fam in
+      norm) AX="$PK_NORM"; S=interp_packed_mla_norm ;;
+      flash) AX="$PK_FLASH"; S=interp_packed_mla_flash ;;
+      kda) AX="$PK_KDA"; S=interp_packed_kda ;;
+    esac
+    genco "$AX" "i_pk_$fam.co"
+    unbundle "i_pk_$fam.co" "$S.elf"
+    PACKED_ELFS="$PACKED_ELFS $S.elf"
+    if [ "$BUILD_GQ" = 1 ]; then
+      genco "$AX -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB $L2D $HIERPF" "i_pk_${fam}_gq.co"
+      unbundle "i_pk_${fam}_gq.co" "${S}_gq.elf"
+      PACKED_ELFS="$PACKED_ELFS ${S}_gq.elf"
+    fi
+  done
+  echo "   packed-prefill family objects:$PACKED_ELFS"
+fi
 GMOE_ELFS=""
 if [ "$BUILD_GEMMA_MOE" = 1 ]; then
   # `if`, not `[ ... ] && GMD=...`: the file already records what that pattern costs under

@@ -1802,6 +1802,9 @@ pub(super) const PACKED_PREFILL_MLA_NORM_SEG_SYM: &str = "plow_packed_prefill_ml
 pub(super) const PACKED_PREFILL_BAND_SYM: &str = "plow_packed_prefill_band_1";
 pub(super) const PACKED_PREFILL_MLA_FLASH_SEG_SYM: &str =
     "plow_packed_prefill_mla_flash_segments_1";
+/// The packed V2 flash object runs NoPE (DR = 0) spans; required when the packet's packed
+/// programs carry NoPE `FlashMlaPrefill`.
+pub(super) const PACKED_PREFILL_MLA_NOPE_SYM: &str = "plow_packed_prefill_mla_nope_1";
 pub(super) const PACKED_PREFILL_KDA_SEG_SYM: &str = "plow_packed_prefill_kda_serial_segments_1";
 pub(super) const PACKED_PREFILL_KDA_CHUNK_SEG_SYM: &str =
     "plow_packed_prefill_kda_chunk_segments_1";
