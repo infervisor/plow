@@ -800,11 +800,16 @@ impl SelectArgs {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Before the runtime starts threads and before the CLI reads the environment.
     let asset_defaults = apply_asset_env_defaults();
-    tokio::runtime::Builder::new_multi_thread()
+    let result = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?
-        .block_on(async_main(asset_defaults))
+        .block_on(async_main(asset_defaults));
+    plowrt::obs::logwriter::flush(LOG_FLUSH_TIMEOUT);
+    result
 }
+
+/// How long an exit path waits for queued log lines to reach stdout.
+const LOG_FLUSH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// `serve --assets`: export each bundle's packet-carried serve-knob defaults (and its
 /// self-contained cuBLASLt table) unless the environment already sets them, so
@@ -874,7 +879,20 @@ async fn async_main(
             .with_writer(std::io::stderr)
             .init();
     } else {
-        tracing_subscriber::fmt().with_env_filter(filter).init();
+        // Serving logs must never block the engine thread on stdout (a pipe with a slow reader
+        // stalls the tick); ANSI escapes only when a terminal reads them.
+        use std::io::IsTerminal;
+        tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_ansi(std::io::stdout().is_terminal())
+            .with_writer(plowrt::obs::logwriter::NonBlockingStdout::install())
+            .init();
+        // A panic must not take the lines that explain it down with the process.
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            plowrt::obs::logwriter::flush(LOG_FLUSH_TIMEOUT);
+            previous(info);
+        }));
     }
 
     tracing::info!(
@@ -4492,6 +4510,7 @@ async fn serve(
             if let Some(path) = shutdown_socket {
                 let _ = std::fs::remove_file(path);
             }
+            plowrt::obs::logwriter::flush(LOG_FLUSH_TIMEOUT);
             std::process::exit(1);
         }
         signal = shutdown_signal() => {
@@ -4507,6 +4526,7 @@ async fn serve(
                 let _ = std::fs::remove_file(path);
             }
             tracing::info!("shutdown: drained");
+            plowrt::obs::logwriter::flush(LOG_FLUSH_TIMEOUT);
             // Engine threads and blocking tick tasks never finish on their own; the runtime's
             // drop would wait on them forever.
             std::process::exit(0);
@@ -4594,6 +4614,7 @@ async fn serve_asr(
         let _ = std::fs::remove_file(path);
     }
     tracing::info!(drained = server.idle(), "shutdown: done");
+    plowrt::obs::logwriter::flush(LOG_FLUSH_TIMEOUT);
     // The engine thread never returns on its own.
     std::process::exit(0);
 }
