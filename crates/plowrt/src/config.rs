@@ -1822,10 +1822,11 @@ pub struct AmdRuntimeConfig {
     #[arg(long = "amd-publish-defer", env = "PLOW_AMD_PUBLISH_DEFER", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub publish_defer: bool,
 
-    /// DIAGNOSTIC: drain with a blocked (interrupt-backed) wait on the queue's completion
-    /// signal instead of busy-polling it, so the host core stops contending for the line the
-    /// GPU decrements once per dispatch.
-    #[arg(long = "amd-hsa-drain-blocked", env = "PLOW_HSA_DRAIN_BLOCKED", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    /// Drain with a blocked (interrupt-backed) wait on the queue's completion signal instead of
+    /// busy-polling it, so the host core stops contending for the line the GPU decrements once
+    /// per dispatch. GLM-5.3-Flash TP8 MI350X: prefill 8k median 293 -> 272 ms (the ~18 ms
+    /// stall in a third of busy-polled chunks is gone), decode r1/b32/b128 -3%. `=0` rolls back.
+    #[arg(long = "amd-hsa-drain-blocked", env = "PLOW_HSA_DRAIN_BLOCKED", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub hsa_drain_blocked: bool,
 
     /// Where the AMD engine thread runs: `auto` pins it to the CPU socket holding rank 0's GPU
