@@ -6648,8 +6648,9 @@ const GLM_SP_MIN_ROWS: u32 = 2048;
 /// (rank 0's row band) need nothing special. Without them the 8192 body ran full-width two-shots
 /// and served +114 ms per middle chunk against the seams prefill program (tier 4, tb-t4). The
 /// GLM-5.3 packed siblings (KDA hybrid, `softmax_layers` non-empty) take them for the same
-/// reason: spans are packed from row 0, so a band's rows hold whole spans' rows or parked ones,
-/// and the packed norm arm's row mask, read at band-local rows, only ever skips parked rows.
+/// reason. A seam norm's rows are band-local, so the loader keeps it off the packed-norm object
+/// and gives its segment no span table or parked mask (`derive_packed_plain_segments`): it
+/// norms every band row, parked ones included.
 /// Other packed siblings without a band keep the two-shot seams.
 fn glm_sp(c: &GlmCfg, n: &GlmTn, b: &Builder, t: u32) -> bool {
     n.h2_tp != TENSOR_NONE
