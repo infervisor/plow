@@ -535,6 +535,26 @@ The packet from config + index alone (no weights) is 70 MB: 4 prefill buckets + 
   4/4 (off-vs-on differences also occur at 0 cached tokens: batch numerics). Strict reports,
   all 19 cells MATCHED/EQUIVALENT: plow total throughput 0.08-0.31x vLLM (v7 0.07-0.26x).
   Recipe moved to v8 (plow_git 84c775e9).
+- 03:00-04:15 UTC (10-13), serving scheduler (branch serve-packed-prefill-amd, a58ab5a4 +
+  1cdc536f). Tick log at isl1024 c128 on v8b: every cold prompt ran as a 992-row head (113 ms +
+  13 ms snapshot) plus a 32-row tail on the 128 bucket (62 ms) — the prefix cache's arm split —
+  and the planner advances a slot once per tick and admits a fresh prompt only into an untouched
+  budget, so a prompt took two ticks and the c128 decode batch settled near 64 of 128 slots.
+  True packing (several prompts in one bucket) is not reachable on this packet: `glm53_emit_full`
+  emits no packed-prefill siblings, the packed MLA flash refuses NoPE, and the lean KDA chunk
+  routes are single-sequence. Three runtime levers instead: `PLOW_PF_BACK_TO_BACK=1` (a tick keeps
+  launching chunks until its `PLOW_PF_INTERLEAVE` budget is spent), `PLOW_PREFIX_ARM_END=1` (a
+  cold prompt snapshots after its last chunk; continuations resume at the full prompt, identical
+  re-sends run cold), TP snapshot/restore on all ranks at once (13 -> ~2 ms). Served, 2 reps,
+  total tok/s / TTFT p99 / TPOT p99, v8 -> new: isl1024 c32 2427 / 9.3 s / 108 ms -> 3106 /
+  4.1 s / 91 ms, c128 2861 / 45.4 s / 191 ms -> 5199 / 17.1 s / 213 ms; isl4096 c32 6303 /
+  16.5 s / 152 ms -> 7661 / 10.5 s / 132 ms, c128 6330 / 78.7 s / 217 ms -> 10218 / 46.7 s /
+  384 ms; c1 TTFT p50 1k 205 -> 122 ms mean. Gates on the final binary: c1 greedy streams equal
+  v8 with the cache off 22/22 (cold prompts are now the unsplit plan; back-to-back alone equalled
+  v8 cache-on 22/22), needles 36/36 cache on and 36/36 with `PLOW_PF_CHUNK=512`, prefix-check2
+  phase C hits (8192 cached) equal the cache-off streams, FP32 gate PASS kl_mean 0.0143, kl_p99
+  0.240, top1_decisive 0.9967, needles 18/18. Phase B (identical re-sends on other slots) no
+  longer hits: the cost of the end arm. Recipe [serve] takes both knobs.
 - 17:35 UTC, E10 TP4 bench (packet pkt-glm53flash-tp4-ladder-v4, 4 GPUs, real prompt, streams
   exact at every rung): scalar (rung 8) 55.5 ms, B=8 51.4, B=32 63.3, B=64 74.6 ms (858 tok/s
   per group); prefill 1k 204 ms (TP8 173). Two such groups (DP2xTP4) would serve 128 streams at

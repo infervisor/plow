@@ -13,7 +13,7 @@ name = "glm-5.3-flash"
 label = "gfx950-mi350x-tp8-fp8"
 network = "glm-5.3-flash"
 status = "validated"
-plow_git = "84c775e9e2e97cd4d525500ca589aa36e389892e"
+plow_git = "1cdc536fa60fcfda6f3bc0c2fe4f4e3d9016eeeb"
 doc = "docs/amd/glm53-flash-mi350x.md"
 
 # max_ctx 65536: the model's recurrent (KDA) state carries at every length, so long prompts are
@@ -114,8 +114,18 @@ args = [
 # `PLOW_PF_INTERLEAVE = "4096"` dispatches a decode step after at most 4096 prefill rows so
 # waiting decodes do not stall behind a whole admission burst; no `PLOW_PF_CHUNK` cap — a 512-row
 # cap ran every prompt as 512-bucket chunks and cost 25% of throughput at c32+ (doc §4, 17:05).
+# `PLOW_PF_BACK_TO_BACK = "1"`: a tick keeps launching prefill chunks (a prompt's remaining
+# chunks, then further waiting prompts) until those 4096 rows are spent; before it each prompt
+# took two ticks and the c128 decode batch sat near 64 of 128 slots. `PLOW_PREFIX_ARM_END = "1"`:
+# a prompt sharing no cached prefix snapshots after its last chunk instead of at a split 32 rows
+# before the end, so a cold prompt is one launch (the 32-row tail cost 62 ms of ~190 at 1k).
+# Continuations (prompt + reply) resume at the full prompt and a shared prefix still arms at the
+# common prefix; an identical re-sent prompt now runs cold (no hit), streaming what the first did.
+# Served 2026-10-13 (doc §4), total tok/s v8 -> this: isl1024 c32/c128 2427/2861 -> 3106/5199,
+# isl4096 6303/6330 -> 7661/10218; TTFT p99 c128 45.4 -> 17.1 s (1k), 78.7 -> 46.7 s (4k);
+# TPOT p99 c128 191 -> 213 ms (1k), 217 -> 384 ms (4k).
 [serve]
-env = { PLOW_STATE_CLEAR_DEVICE = "1", PLOW_TP_AGREE_EVERY = "1", PLOW_DECODE_MIN_RUNG = "1", PLOW_PF_INTERLEAVE = "4096" }
+env = { PLOW_STATE_CLEAR_DEVICE = "1", PLOW_TP_AGREE_EVERY = "1", PLOW_DECODE_MIN_RUNG = "1", PLOW_PF_INTERLEAVE = "4096", PLOW_PF_BACK_TO_BACK = "1", PLOW_PREFIX_ARM_END = "1" }
 
 [[gates]]
 name = "smoke"
@@ -151,7 +161,7 @@ client = "vllm 0.31.1rc1 bench serve (scripts/bench/llm_grid.sh)"
 
 # Reproduction gates at THIS commit, checkpoint and nix lock.
 [artifacts]
-"plowrt" = "c56db3d414ccc4a0a65f14eddd77d60e428c1492efcc923daae964262bb0f2aa"
+"plowrt" = "a1ee9dfbe407741c7cdc9c44f73609c514ae8984c6540426be85577c10e0058e"
 "model.pkt" = "980625b39c5dab354185bf26cea81c3056e846e33a3c5df320bbe734c4dc3b55"
 "interp_decode_k3_gq.elf" = "e58ac62be984604ec2f7ca6df4cd59d4b562a2ef57ae659cbc8866b439a8f054"
 "lowrung1/interp_decode_k3_gq.elf" = "7894aef7fe85acf9dfc47388fd8dbc0bae740947b165fd10966e76e444561b78"
