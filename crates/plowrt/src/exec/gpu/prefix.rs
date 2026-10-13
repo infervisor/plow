@@ -910,25 +910,37 @@ impl GpuEngine {
         let step = crate::config::RuntimeConfig::get()
             .amd_prefix_fine_rows()
             .map_or(kv.block_rows(), |step| step.max(32));
-        // A session's next turn attaches to its prompt end, which retires every checkpoint and
-        // chunk end inside the prompt (`retire_superseded`), and its reply rows are re-rendered:
-        // those snapshots are transient, and each one's trim evicts another session's boundary.
-        // Publish them only for a request waiting on this prefill (`inflight_prefix`).
+        // A conversation's next turn attaches to its prompt end, with or without `X-Session-Id`;
+        // a whole-block checkpoint or chunk end inside the prompt only serves a request waiting
+        // on this prefill (`inflight_prefix`), and a shared prefix end publishes through
+        // `vmm_publish_shared`. Every other checkpoint is a private window copy
+        // (`vmm_snap_bytes`, ~100 MiB at Gemma-4 26B) whose trim evicts another conversation's
+        // prompt end: published unconditionally, a 6K-token chat turn wrote three such copies
+        // and the cache retained a prompt end for ~20 s against think times of minutes.
         let mut p = step;
         while p < p_a {
-            if !session || kv.checkpoint_awaited(toks, p) {
+            if kv.checkpoint_awaited(toks, p) {
                 self.publish_boundary(b, p);
             }
             p += step;
         }
-        if session && !prompt_end && rows < prompt && !kv.checkpoint_awaited(toks, p_a) {
+        if !prompt_end && rows < prompt && !kv.checkpoint_awaited(toks, p_a) {
             return;
         }
         // Only the prompt-end publish retires (a chunk-end publish also caps `max_rows` below
         // `rows`): the next turn's prompt re-renders this turn's reply, which need not
         // re-tokenize to the generated ids, so the turn-end boundary may not match it and the
         // prompt-end boundary must survive until then.
-        let published = self.publish_boundary(b, p_a);
+        // A turn end is an output-only boundary: the next prompt re-renders the reply and
+        // usually diverges before it (`Snap::reusable_prompt`), so without a session it is
+        // another private window copy published for nothing; the prompt end below is restored
+        // or touched instead.
+        let turn_end = rows > prompt;
+        let published = if turn_end && !session {
+            false
+        } else {
+            self.publish_boundary(b, p_a)
+        };
         if let Some(ttl) = self.session_pin[b].filter(|_| published && prompt_end) {
             // Pinned now, not at retire: while this turn decodes, other sessions' publishes
             // must not evict it ahead of idle sessions' boundaries.
