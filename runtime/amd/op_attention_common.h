@@ -3863,11 +3863,27 @@ __device__ void d_flash_mla_prefill_v2(float* __restrict__ Opart, float* __restr
     const unsigned n_work = GATHER ? n_batch * n_qt : n_batch * n_qt * n_head * nsp;
 
     for (unsigned w = slice; w < n_work; w += nblk) {
-        const unsigned sp = GATHER ? 0u : w % nsp;
-        const unsigned wq = GATHER ? w : w / nsp;
+#if PLOW_MLA_PF_SNAKE
+        /* Heaviest causal tile first, rounds dealt boustrophedon over the workgroups: the fold
+         * below leaves a workgroup's strided tiles correlated (max/mean 1.53 at 8k from row 0,
+         * 1.18 at c0=8k; measured util 0.64). Items are independent partials, so only the
+         * item->workgroup map moves. A partial last round keeps the forward order. */
+        const unsigned rnd = w / nblk;
+        const unsigned wi = (!GATHER && (rnd & 1u) && n_work - rnd * nblk >= nblk)
+                                ? rnd * nblk + (nblk - 1u - (w - rnd * nblk))
+                                : w;
+#else
+        const unsigned wi = w;
+#endif
+        const unsigned sp = GATHER ? 0u : wi % nsp;
+        const unsigned wq = GATHER ? w : wi / nsp;
         const unsigned h = GATHER ? 0u : wq % n_head;
         const unsigned rest = GATHER ? wq : wq / n_head;
+#if PLOW_MLA_PF_SNAKE
+        const unsigned qt = GATHER ? mla_pf_fold(rest % n_qt, n_qt) : n_qt - 1u - rest % n_qt;
+#else
         const unsigned qt = mla_pf_fold(rest % n_qt, n_qt);
+#endif
         const unsigned b = rest / n_qt;
 
         const unsigned len = (unsigned)kv_len[b];

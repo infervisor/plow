@@ -39,6 +39,7 @@ use crate::{Result, RuntimeError};
 mod mla_prefill;
 mod object;
 mod packed;
+mod seg_geom;
 mod segment;
 pub(super) use object::elf_symbol_names;
 use object::{
@@ -6020,6 +6021,10 @@ struct AmdProg {
     decode_routes: Vec<DecodeSegmentRoute>,
     /// Optional raw gfx950 route for a pure MXFP4 grouped-MoE Down+Combine segment.
     prefill_routes: Vec<PrefillSegmentRoute>,
+    /// `PLOW_SEG_GEOM` per segment: the interpreter launch's override, and the raw route's grid
+    /// (0 = shipped). Empty when unset.
+    seg_geom_interp: Vec<seg_geom::SegGeom>,
+    seg_geom_route: Vec<u32>,
     /// Per segment: the sparse flash segment whose active route leaves this `IndexUnionPf` unread.
     union_skip: Vec<Option<usize>>,
     /// Immutable device-side typed arguments for raw XR+AttnRes routes. Routes retain only their
@@ -6224,6 +6229,9 @@ pub struct AmdEngine {
     /// Task-13: low-rung decode tier ladder, ascending (max_rung, kernel).
     decode_tiers: Vec<(u32, HsaKernel)>,
     k_flash: Option<HsaKernel>,
+    /// `PLOW_SEG_ALT_DIR` twins of `k_prefill` / `k_flash` for `PLOW_SEG_GEOM` `alt` segments.
+    k_prefill_alt: Option<HsaKernel>,
+    k_flash_alt: Option<HsaKernel>,
     k_mla_small: Option<HsaKernel>,
     k_mla_split: Option<HsaKernel>,
     /// Dedicated scratch-free gfx950 V2+SV interpreter for pure bf16 MLA-flash segments.
@@ -7650,6 +7658,22 @@ impl AmdEngine {
         if let (None, Some(e)) = (&k_flash, flash_error) {
             tracing::info!(%e, "no flash object — flash segments run on the 8-wave interpreter");
         }
+        let seg_geom_rules = match crate::config::RuntimeConfig::get().amd.seg_geom.as_deref() {
+            Some(spec) => seg_geom::parse(spec)?,
+            None => Vec::new(),
+        };
+        let (k_prefill_alt, k_flash_alt) =
+            match crate::config::RuntimeConfig::get().amd.seg_alt_dir.as_deref() {
+                Some(dir) => {
+                    let (kp, _) = load_one_in(Phase::Prefill, sched_prefill, dir, None)?;
+                    let kf = match &k_flash {
+                        Some(_) => Some(load_one_in(Phase::Flash, sched_prefill, dir, None)?.0),
+                        None => None,
+                    };
+                    (Some(kp), kf)
+                }
+                None => (None, None),
+            };
         drop(load_one_in);
 
         let mut need_mla_small = false;
@@ -10511,6 +10535,8 @@ impl AmdEngine {
                 },
                 decode_routes,
                 prefill_routes,
+                seg_geom_interp: Vec::new(),
+                seg_geom_route: Vec::new(),
                 union_skip,
                 _xreduce_attnres_args: xreduce_attnres_args,
                 trace_records: p.stream.len(),
@@ -11305,6 +11331,8 @@ impl AmdEngine {
             d_token_ring,
             decode_tiers,
             k_flash,
+            k_prefill_alt,
+            k_flash_alt,
             k_mla_small,
             k_mla_split,
             k_mla_v2_sv_raw,
@@ -11378,6 +11406,7 @@ impl AmdEngine {
         };
         engine.selected_routes = engine.capture_selected_routes();
         engine.report_packed_prefill_route(hsaco_dir);
+        engine.apply_seg_geom(&seg_geom_rules)?;
         Ok(engine)
     }
 
@@ -12695,6 +12724,7 @@ impl AmdEngine {
                         "marked KDA-intra wave-item segment has no validated object".into(),
                     )
                 })?;
+                let grid = self.seg_route_grid(p, seg, grid);
                 EngineDevice::launch_kernel(
                     &*self.be,
                     kernel,
@@ -12814,6 +12844,7 @@ impl AmdEngine {
                         "marked KDA Wu lean segment has no validated object".into(),
                     )
                 })?;
+                let grid = self.seg_route_grid(p, seg, grid);
                 let mut args = args;
                 if self.kv_slot != 0 {
                     let fields: [&mut u64; 8] = [
@@ -13030,12 +13061,13 @@ impl AmdEngine {
                 return Ok(());
             }
         }
-        let (k, threads, _) = self.prefill_interpreter_kernel(p, seg)?;
+        let (k, threads, family) = self.prefill_interpreter_kernel(p, seg)?;
+        let (k, grid) = self.seg_interp_geom(p, seg, k, family);
         let arg = self.kernarg(p, seg as u32);
         EngineDevice::launch_cooperative(
             &*self.be,
             k,
-            self.n_cu,
+            grid,
             threads,
             0,
             kernarg_bytes(&arg),
