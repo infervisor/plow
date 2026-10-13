@@ -4745,7 +4745,24 @@ fn run_one_tick(
                         |program| e.packed_prefill_span_limit(program as usize),
                     )
                 };
-                for launch in &step.launches {
+                // A pack wider than its members' isolated rungs together runs as lone launches.
+                let launches: Vec<crate::sched::step::Launch> = step
+                    .launches
+                    .iter()
+                    .flat_map(|launch| {
+                        let rows: Vec<u32> = launch.spans.iter().map(|s| s.n_rows).collect();
+                        if !launch.is_pack() || e.pack_pays(&rows) {
+                            vec![launch.clone()]
+                        } else {
+                            launch
+                                .spans
+                                .iter()
+                                .map(|&span| crate::sched::step::Launch { spans: vec![span] })
+                                .collect()
+                        }
+                    })
+                    .collect();
+                for launch in &launches {
                     // PLOW_AMD_MIXED_PACK: the live decode rows ride the tick's first packed
                     // launch as one-row spans. A lone chunk stays on its isolated program, whose
                     // lean KDA objects the packed siblings lack: as a pack of one carrying the

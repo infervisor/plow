@@ -137,6 +137,10 @@ pub trait SeqEngine {
     fn mixed_pack_ready(&self) -> bool {
         false
     }
+    /// Whether one launch of chunks `rows` costs no more rung rows than running each alone.
+    fn pack_pays(&self, _rows: &[u32]) -> bool {
+        true
+    }
     /// [`Self::advance_packed_prefill`] with decode `feeds` riding as one-row spans;
     /// `output[i]` receives feed `i`'s next token; `Ok(false)` if they did not ride.
     fn advance_packed_mixed(
@@ -3336,6 +3340,26 @@ mod amd_serve {
             self.advance_packed(members, &[], &mut []).map(drop)
         }
 
+        /// A pack runs every row of its rung, parked ones included, so it pays only while its
+        /// rung is no wider than the members' isolated rungs together: four 1024-row chunks
+        /// fill the 8192 rung as four 2048-rung launches would, but two 2048-row chunks in the
+        /// 8192 rung run twice the rows of two 2048-rung launches.
+        pub fn pack_pays(&self, rows: &[u32]) -> bool {
+            let rung = |n: u32| {
+                self.ranks
+                    .rank0()
+                    .prefill_rungs()
+                    .map(|(_, width)| width)
+                    .filter(|&width| width >= n)
+                    .min()
+            };
+            let isolated: Option<u32> = rows.iter().map(|&n| rung(n)).sum();
+            match (rung(rows.iter().sum()), isolated) {
+                (Some(packed), Some(isolated)) => packed <= isolated,
+                _ => true,
+            }
+        }
+
         /// Whether the live decode rows may ride a packed prefill launch (`PLOW_AMD_MIXED_PACK`).
         pub fn mixed_pack_ready(&self) -> bool {
             crate::config::RuntimeConfig::get().amd_mixed_pack
@@ -5234,6 +5258,9 @@ impl SeqEngine for AmdServe {
     }
     fn mixed_pack_ready(&self) -> bool {
         AmdServe::mixed_pack_ready(self)
+    }
+    fn pack_pays(&self, rows: &[u32]) -> bool {
+        AmdServe::pack_pays(self, rows)
     }
     fn advance_packed_mixed(
         &mut self,
