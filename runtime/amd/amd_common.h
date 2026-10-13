@@ -479,13 +479,25 @@ __device__ __forceinline__ __amdgpu_buffer_rsrc_t buf_rsrc_fp8(const unsigned ch
 /* PROBE: force a wave-uniform base pointer into SGPRs so make_buffer_rsrc emits a SCALAR resource
  * (no per-load readfirstlane waterfall). Valid ONLY when `base` is genuinely uniform across the wave
  * (it is in the GEMV: base = W + n*K, n = wave index, uniform per wave). */
+/* PLOW_RSRC_SCALAR_N=1: num_records goes through readfirstlane too. With only the base made
+ * uniform, a VGPR-resident record count still leaves the descriptor divergent in the compiler's
+ * eyes, and gfx950's inlined decode objects kept the per-load waterfall (tier-8: 219 of them). */
+#ifndef PLOW_RSRC_SCALAR_N
+#define PLOW_RSRC_SCALAR_N 0
+#endif
+#if PLOW_RSRC_SCALAR_N
+#define PLOW_RSRC_N(n) __builtin_amdgcn_readfirstlane(n)
+#else
+#define PLOW_RSRC_N(n) (n)
+#endif
 __device__ __forceinline__ __amdgpu_buffer_rsrc_t buf_rsrc_fp8_u(const unsigned char* base,
                                                                  unsigned n_bytes) {
     unsigned long long u = (unsigned long long)(size_t)base;
     unsigned lo = __builtin_amdgcn_readfirstlane((unsigned)u);
     unsigned hi = __builtin_amdgcn_readfirstlane((unsigned)(u >> 32));
     const unsigned char* ub = (const unsigned char*)(size_t)(((unsigned long long)hi << 32) | lo);
-    return __builtin_amdgcn_make_buffer_rsrc((void*)ub, (short)0, n_bytes, PLOW_BUF_RSRC3);
+    return __builtin_amdgcn_make_buffer_rsrc((void*)ub, (short)0, PLOW_RSRC_N(n_bytes),
+                                             PLOW_BUF_RSRC3);
 }
 /* The bf16 twin of buf_rsrc_fp8_u, and the reason it is worth having is visible in the shipped
  * decode object: EVERY buffer_load_dwordx4 in d_gemv_qkv / d_gemv_glu / d_gemv_fp8_blk carries
@@ -507,7 +519,8 @@ __device__ __forceinline__ __amdgpu_buffer_rsrc_t buf_rsrc_u(const bf16* base, u
     unsigned lo = __builtin_amdgcn_readfirstlane((unsigned)u);
     unsigned hi = __builtin_amdgcn_readfirstlane((unsigned)(u >> 32));
     const bf16* ub = (const bf16*)(size_t)(((unsigned long long)hi << 32) | lo);
-    return __builtin_amdgcn_make_buffer_rsrc((void*)ub, (short)0, n_halves * 2u, PLOW_BUF_RSRC3);
+    return __builtin_amdgcn_make_buffer_rsrc((void*)ub, (short)0, PLOW_RSRC_N(n_halves * 2u),
+                                             PLOW_BUF_RSRC3);
 }
 /* `aux` = 3 (glc|slc): streaming/non-temporal, exactly as the bf16 weight stream — zero reuse. */
 __device__ __forceinline__ fp8v16 buf_ld_fp8(__amdgpu_buffer_rsrc_t r, unsigned byte_off) {

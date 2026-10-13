@@ -104,6 +104,29 @@ case "${PLOW_MERGE_UNROLL4:-0}" in
   1) DEC_KNOBS="$DEC_KNOBS -DFA_MERGE_UNROLL4=1" ;;
   *) echo "PLOW_MERGE_UNROLL4 must be 0 or 1" >&2; exit 2 ;;
 esac
+# PLOW_DECODE_BODIES (default 1; =0 rolls back): bit-identical decode-body axes. MoE down/GLU and bf16 GEMV
+# lane-group maps (op_moe.h [FP8-DECODE-DOWN-LG]/[FP8-DECODE-X2], op_gemm_common.h
+# [BF16-GEMV-NARROWK-LG]); the value-identical grouped-MoE axes the K3 prefill object ships plus
+# the A-gather hoist (the batched rungs run MoeGroup*Pf); GemmSmall at BK=128 (the batched rungs'
+# 16-64-workgroup projections are k-tile-latency bound; each output's MFMA k order is unchanged);
+# the prefill GemvF32 tile at the 128-row rung; the wide StateStepG column prefetch.
+# GLM-5.3-Flash MI350X TP8 (traced): B=8 30.4 -> 24.5 ms, B=128 82.2 -> 57.0 ms, rung 1 unchanged.
+case "${PLOW_DECODE_BODIES:-1}" in
+  0) ;;
+  1) DEC_KNOBS="$DEC_KNOBS -DPLOW_MOE_DEC_LG=1 -DPLOW_GEMV_LG=1 -DPLOW_MOE_DEC_X2=1 -DGM_SM_BK=128"
+     DEC_KNOBS="$DEC_KNOBS -DPLOW_MOE_TILE_BINSEARCH=1 -DPLOW_MOE_PF_EPI=1 -DPLOW_MOE_PF_BRAW=1 -DPLOW_COMBINE_VEC=1"
+     DEC_KNOBS="$DEC_KNOBS -DPLOW_MOE_PF_GH=2 -DPLOW_MOE_ALIGN_PAR_PREFIX=1 -DPLOW_GEMV_F32_TILE_DEC=128 -DPLOW_KDA_WIDE_PF=1"
+     # Uniform GEMV weight descriptors. The low-rung tiers also scalarize num_records, which
+     # removes the per-load readfirstlane waterfall (tier 8: 219 -> 0; B=8 GEMV 30.5 -> 23.3 us
+     # per hop). On the wide object that costs B=128 (64 -> 88 ms), and that object keeps DPP
+     # wave sums instead (GemmSmall 114 -> 67 us per hop against the bare set).
+     if [ -n "${PLOW_DECODE_TIER:-}" ]; then
+       DEC_KNOBS="$DEC_KNOBS -DGV_USCALAR=1 -DPLOW_RSRC_SCALAR_N=1"
+     else
+       DEC_KNOBS="$DEC_KNOBS -DGV_USCALAR=1 -DPLOW_WAVE_RED_DPP=1"
+     fi ;;
+  *) echo "PLOW_DECODE_BODIES must be 0 or 1" >&2; exit 2 ;;
+esac
 case "${PLOW_FP8_BLK_DMA:-0}" in
   0) ;;
   1) A4W4_BK="$A4W4_BK -DPLOW_FP8_BLK_DMA=1" ;;

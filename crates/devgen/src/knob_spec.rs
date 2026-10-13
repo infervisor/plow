@@ -212,6 +212,38 @@ const GLM_RECIPE_ON: Default = Default::Production {
     otherwise: Val::Unset,
 };
 
+/// No declared gfx950 GLM target yet, so the gfx950 width default is a candidate.
+const GLM_GFX950_ROWS: Status = Status::Candidate {
+    evidence: &[
+        "crates/devgen/src/lib.rs apply_production_defaults: d_glu is a grid-stride map; GLM-5.3-Flash MI350X TP8 streams identical at rungs 1/8/32/128",
+    ],
+};
+
+/// `apply_production_defaults`'s gfx950 GLM batched-decode width defaults.
+const GLM_GFX950: F = F::And(&[F::Target(T::Cap("glm")), F::Target(T::Arch("gfx950"))]);
+
+const GLM_NORM_ROWS_DEFAULT: Default = Default::Production {
+    cases: &[
+        DefaultCase {
+            when: GLM_TARGET,
+            value: TRUE,
+        },
+        DefaultCase {
+            when: GLM_GFX950,
+            value: TRUE,
+        },
+    ],
+    otherwise: Val::Unset,
+};
+
+const GLM_GLU_ROWS_DEFAULT: Default = Default::Production {
+    cases: &[DefaultCase {
+        when: GLM_GFX950,
+        value: TRUE,
+    }],
+    otherwise: FALSE,
+};
+
 /// `EmitConfig::glm_seq_par`: the default stands aside for the two-shot seams it replaces, and
 /// `glm_recipe_unset` records the resolved value either way.
 const GLM_SEQ_PAR_DEFAULT: Default = Default::Production {
@@ -1257,7 +1289,7 @@ pub const EMIT: &[KnobSpec] = &[
     KnobSpec::new("emit.glm_index_tp", Some("PLOW_GLM_INDEX_TP"), Layer::Emit, Domain::Bool, GLM_RECIPE_ON, GLM_RECIPE),
     KnobSpec::new("emit.glm_select_local", Some("PLOW_GLM_SELECT_LOCAL"), Layer::Emit, Domain::Bool, GLM_RECIPE_ON, GLM_RECIPE),
     KnobSpec::new("emit.glm_select_split", Some("PLOW_GLM_SELECT_SPLIT"), Layer::Emit, U32, UNSET, OPT_IN),
-    KnobSpec::new("emit.glm_decode_norm_rows", Some("PLOW_GLM_DECODE_NORM_ROWS"), Layer::Emit, Domain::Bool, GLM_RECIPE_ON, GLM_RECIPE),
+    KnobSpec::new("emit.glm_decode_norm_rows", Some("PLOW_GLM_DECODE_NORM_ROWS"), Layer::Emit, Domain::Bool, GLM_NORM_ROWS_DEFAULT, GLM_RECIPE),
     KnobSpec::new("emit.glm_gemm_lt", Some("PLOW_GLM_GEMM_LT"), Layer::Emit, Domain::Bool, GLM_RECIPE_ON, GLM_RECIPE),
     KnobSpec::new("emit.glm_gemm_lt_decode", Some("PLOW_GLM_GEMM_LT_DECODE"), Layer::Emit, Domain::Bool, GLM_RECIPE_ON, GLM_RECIPE),
     KnobSpec::new("emit.glm_gemm_lt_decode_ext", Some("PLOW_GLM_GEMM_LT_DECODE_EXT"), Layer::Emit, Domain::Bool, GLM_RECIPE_ON, GLM_RECIPE),
@@ -1269,6 +1301,7 @@ pub const EMIT: &[KnobSpec] = &[
     KnobSpec::new("emit.glm_ofold", Some("PLOW_GLM_OFOLD"), Layer::Emit, Domain::Bool, OFF, OPT_IN).with(C_OFOLD),
     KnobSpec::new("emit.glm_hc_norm_fold", Some("PLOW_GLM_HC_NORM_FOLD"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.glm_hc_post_fold", Some("PLOW_GLM_HC_POST_FOLD"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
+    KnobSpec::new("emit.glm_decode_glu_rows", Some("PLOW_GLM_DECODE_GLU_ROWS"), Layer::Emit, Domain::Bool, GLM_GLU_ROWS_DEFAULT, GLM_GFX950_ROWS),
     KnobSpec::new("emit.glm_pf_ns", Some("PLOW_GLM_PF_NS"), Layer::Emit, U32, UNSET, OPT_IN),
     KnobSpec::new("emit.glm_router_overlap", Some("PLOW_GLM_ROUTER_OVERLAP"), Layer::Emit, U32, UNSET, OPT_IN).scoped(ROUTER_OVERLAP_SCOPE),
     KnobSpec::new("emit.glm_dsa_pf_span", Some("PLOW_GLM_DSA_PF_SPAN"), Layer::Emit, U32, Default::Static(Val::Nat(1)), OPT_IN),
@@ -1384,6 +1417,7 @@ pub const RAW_ENV: &[KnobSpec] = &[
     KnobSpec::new("env.PLOW_DSA_SELECT_V3", Some("PLOW_DSA_SELECT_V3"), Layer::RawEnv, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("env.PLOW_HNR_ILP", Some("PLOW_HNR_ILP"), Layer::RawEnv, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("env.PLOW_MERGE_UNROLL4", Some("PLOW_MERGE_UNROLL4"), Layer::RawEnv, Domain::Bool, OFF, OPT_IN),
+    KnobSpec::new("env.PLOW_DECODE_BODIES", Some("PLOW_DECODE_BODIES"), Layer::RawEnv, Domain::Bool, ON, PROMOTED),
     KnobSpec::new("env.PLOW_XR_SCHED", Some("PLOW_XR_SCHED"), Layer::RawEnv, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("env.PLOW_MOE_TILE_BINSEARCH", Some("PLOW_MOE_TILE_BINSEARCH"), Layer::RawEnv, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("env.PLOW_MLA_P_BF16", Some("PLOW_MLA_P_BF16"), Layer::RawEnv, Domain::Bool, OFF, OPT_IN),
@@ -1783,6 +1817,7 @@ pub const OBJECT_DEFINES: &[KnobSpec] = &[
     KnobSpec::new("def.PLOW_KDA_FB_FOLD", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_KDA_PF_STATE_RESIDENT", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_KDA_SOFTPLUS_FLA_COMPAT", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
+    KnobSpec::new("def.PLOW_KDA_WIDE_PF", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_L2_PLACE_DISPATCH", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_LDS_MAX_BYTES", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_MATERIALIZED_RESIDUAL_INPUT", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
@@ -1798,6 +1833,7 @@ pub const OBJECT_DEFINES: &[KnobSpec] = &[
     KnobSpec::new("def.PLOW_FP8_BLK_DMA", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_FP8_BLK_KW", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_GEMV_F32_COL", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
+    KnobSpec::new("def.PLOW_GEMV_F32_TILE_DEC", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_MLA_DEC_MINPER", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_MOE_GLU_KW", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_MOE_PF_DOWN_SWEEP", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
@@ -2159,6 +2195,7 @@ pub const OBJECT_DEFINES: &[KnobSpec] = &[
     KnobSpec::new("def.PLOW_RESID_U", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_RN_ROWS", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_ROWSPLIT_A2A", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
+    KnobSpec::new("def.PLOW_RSRC_SCALAR_N", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_SEG_FA512", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_SEQ_PAR_SEAMS", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_SM120_CUBIN", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),

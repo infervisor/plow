@@ -995,6 +995,11 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_GLM_HC_POST_FOLD", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub glm_hc_post_fold: bool,
 
+    /// GLM batched decode: the shared expert's elementwise Glu spans rows * I / 512 workgroups
+    /// instead of one. Bit-identical.
+    #[arg(long, env = "PLOW_GLM_DECODE_GLU_ROWS", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub glm_decode_glu_rows: bool,
+
     /// Causal KV-split factor for the V2 MLA prefill flash (2..=8; unset/1 = unsplit).
     #[arg(long, env = "PLOW_GLM_PF_NS")]
     pub glm_pf_ns: Option<u32>,
@@ -1701,6 +1706,7 @@ impl EmitConfig {
             glm_ofold: env_bool("PLOW_GLM_OFOLD"),
             glm_hc_norm_fold: env_bool("PLOW_GLM_HC_NORM_FOLD"),
             glm_hc_post_fold: env_bool("PLOW_GLM_HC_POST_FOLD"),
+            glm_decode_glu_rows: env_bool("PLOW_GLM_DECODE_GLU_ROWS"),
             glm_pf_ns: env_u32("PLOW_GLM_PF_NS"),
             glm_router_overlap: env_u32("PLOW_GLM_ROUTER_OVERLAP"),
             glm_dsa_pf_span: env_u32("PLOW_GLM_DSA_PF_SPAN").unwrap_or(1),

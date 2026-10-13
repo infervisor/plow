@@ -942,6 +942,9 @@ extern "C" __device__ unsigned plow_dsa_idx_fp8_arm = 1;
 #ifndef PLOW_GEMV_F32_COL
 #define PLOW_GEMV_F32_COL 0
 #endif
+#ifndef PLOW_GEMV_F32_TILE_DEC
+#define PLOW_GEMV_F32_TILE_DEC 0
+#endif
 #ifndef PLOW_QKVA_WAVE1
 #define PLOW_QKVA_WAVE1 0
 #endif
@@ -3993,6 +3996,17 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
              * the per-output walk fills more waves and is faster. */
             if (in->i[0] >= 256u && in->i[0] % 2u == 0u && in->i[1] % 3u == 0u &&
                 in->i[2] % (8u * PLOW_WAVE) == 0u) {
+                d_gemv_f32_tile<2, 3>((float*)TEN(0), (const bf16*)TEN(1), (const float*)TEN(2),
+                                      in->i[0], in->i[1], in->i[2], slice, nblk);
+                break;
+            }
+#endif
+#if PLOW_BUCKET_DECODE && PLOW_GEMV_F32_TILE_DEC
+            /* Wide decode rung (M >= PLOW_GEMV_F32_TILE_DEC rows): the prefill tile arm above.
+             * The per-output walk re-reads x N times and W M times from L2 (GLM-5.3 mHC mix at
+             * M=128: 38 us per packet, 90 on the serial chain). Bit-identical, as above. */
+            if (in->i[3] == 0u && in->i[0] >= (unsigned)PLOW_GEMV_F32_TILE_DEC &&
+                in->i[0] % 2u == 0u && in->i[1] % 3u == 0u && in->i[2] % (8u * PLOW_WAVE) == 0u) {
                 d_gemv_f32_tile<2, 3>((float*)TEN(0), (const bf16*)TEN(1), (const float*)TEN(2),
                                       in->i[0], in->i[1], in->i[2], slice, nblk);
                 break;
