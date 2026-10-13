@@ -1202,6 +1202,9 @@ extern "C" __device__ unsigned plow_glm_hc_pre_tail_arm = 1;
 #ifndef PLOW_GEMM_SMALL_SPLITK
 #define PLOW_GEMM_SMALL_SPLITK 0
 #endif
+#ifndef PLOW_GEMM_F32_DEC_TILE
+#define PLOW_GEMM_F32_DEC_TILE 1
+#endif
 #if PLOW_GEMM_SMALL_SPLITK && !PLOW_BUCKET_DECODE
 #undef PLOW_GEMM_SMALL_SPLITK
 #define PLOW_GEMM_SMALL_SPLITK 0
@@ -2536,9 +2539,16 @@ __device__ __forceinline__ void exec_gemm_small(CInst in, CTens T,
 #if PLOW_GEMM_SMALL_SPLITK
     if (in->i[6] > 1u) { /* PLOW_GLM_DEC_SPLITK: t5 = fp32 partials, t6 = per-tile counters */
         if (in->i[4] != 0u || in->i[5] != 0u) __builtin_trap();
-        d_gemm_small_splitk((bf16*)TEN(0), (const bf16*)TEN(1), (const bf16*)TEN(2), in->i[0],
-                            in->i[1], in->i[2], in->i[6], (float*)TEN(5), (unsigned*)TEN(6), slice,
-                            nblk, lds);
+        if (in->i[7] == 1u) /* PLOW_GLM_DEC_SPLITK_2P: partials, then the reduce packet */
+            d_gemm_small_splitk_part((const bf16*)TEN(1), (const bf16*)TEN(2), in->i[0], in->i[1],
+                                     in->i[2], in->i[6], (float*)TEN(5), slice, nblk, lds);
+        else if (in->i[7] == 2u)
+            d_gemm_small_splitk_reduce((bf16*)TEN(0), (const float*)TEN(5), in->i[0], in->i[1],
+                                       in->i[6], slice, nblk);
+        else
+            d_gemm_small_splitk((bf16*)TEN(0), (const bf16*)TEN(1), (const bf16*)TEN(2), in->i[0],
+                                in->i[1], in->i[2], in->i[6], (float*)TEN(5), (unsigned*)TEN(6),
+                                slice, nblk, lds);
         return;
     }
 #endif
@@ -4621,8 +4631,22 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
                            PLOW_RUNTIME_ROWS(in->i[0]), in->i[1], in->i[2], slice, nblk, sm->gm);
             } else
 #endif
+            {
+#if PLOW_BUCKET_DECODE && PLOW_GEMV_F32_VEC && PLOW_GEMM_F32_DEC_TILE
+                /* Wide decode rung router: R x CN wave tiles (bit-identical, see
+                 * d_gemv_bf16_f32_tile). */
+                const unsigned rows = PLOW_RUNTIME_ROWS(in->i[0]);
+                if (rows >= 32u && rows % 4u == 0u && in->i[1] % 4u == 0u &&
+                    in->i[2] % (8u * PLOW_WAVE) == 0u) {
+                    d_gemv_bf16_f32_tile<4, 4>((float*)TEN(0), (const bf16*)TEN(1),
+                                               (const bf16*)TEN(2), rows, in->i[1], in->i[2],
+                                               slice, nblk);
+                    break;
+                }
+#endif
                 d_gemv_bf16_f32((float*)TEN(0), (const bf16*)TEN(1), (const bf16*)TEN(2),
                                  PLOW_RUNTIME_ROWS(in->i[0]), in->i[1], in->i[2], slice, nblk);
+            }
             break;
 #undef PLOW_GEMM_F32_STANDARD_DECODE_MAX_ROWS
 #endif

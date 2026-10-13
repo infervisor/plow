@@ -1358,8 +1358,9 @@ pub(crate) fn glm53_emit_full(
         let mut b = Builder::new(n_cu);
         b.set_tensor_dedup(true);
         b.adopt_tensors(tensors.clone());
-        if rows > 1 {
+        if rows > 1 && rows <= ec.glm_dec_splitk_max_rows.unwrap_or(u32::MAX) {
             b.set_gemm_small_splitk(ec.glm_dec_splitk.unwrap_or(0));
+            b.set_gemm_small_splitk_2p(ec.glm_dec_splitk_2p);
         }
         emit_glm53_program(&mut b, &c, &n, &s, ctx, rows, dbatch, enc, false);
         let prog = b.finish();

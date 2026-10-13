@@ -475,6 +475,8 @@ pub struct Builder {
     gemv_split: u32,
     /// Largest split-K factor for a `GemmSmall` (0/1 = off). See [`Builder::set_gemm_small_splitk`].
     gemm_small_splitk: u32,
+    /// Split-K as two packets (partials, then a gated reduce). See [`Builder::set_gemm_small_splitk_2p`].
+    gemm_small_splitk_2p: bool,
     /// Re-declaring a tensor name returns the existing handle instead of appending.
     /// `false` (default) ⇒ byte-identical. See [`Builder::set_tensor_dedup`].
     tensor_dedup: bool,
@@ -723,6 +725,7 @@ impl Builder {
             native_gemma4_glu_segments: false,
             gemv_split: 1,
             gemm_small_splitk: 0,
+            gemm_small_splitk_2p: false,
             tensor_dedup: false,
             cu_cap: None,
             tr_dropped: 0,
@@ -956,6 +959,14 @@ impl Builder {
         self.gemm_small_splitk = max_s.min(16);
     }
 
+    /// Split-K `GemmSmall` as TWO packets: the tile items write fp32 partials (`i7 = 1`, no
+    /// counter), then a second `GemmSmall` gated on the first sums them in slice order over all
+    /// its workgroups (`i7 = 2`). Same values as the one-packet form, whose per-item agent-scope
+    /// acq_rel counter costs a cache-wide L2 writeback + invalidate. `false` = one packet.
+    pub fn set_gemm_small_splitk_2p(&mut self, on: bool) {
+        self.gemm_small_splitk_2p = on;
+    }
+
     fn apply_gemm_small_splitk(&mut self, op: DevOp, slices: usize, inst: &mut DevInst) {
         if self.gemm_small_splitk < 2
             || op != DevOp::GemmSmall
@@ -965,6 +976,7 @@ impl Builder {
             || inst.i[4] != 0
             || inst.i[5] != 0
             || inst.i[6] != 0
+            || inst.i[7] != 0
         {
             return;
         }
@@ -989,6 +1001,9 @@ impl Builder {
         inst.t[5] = part;
         inst.t[6] = ctr;
         inst.i[6] = s;
+        if self.gemm_small_splitk_2p {
+            inst.i[7] = 1;
+        }
     }
 
     /// Re-declaring a name returns the EXISTING handle and grows it to the larger byte count,
@@ -1219,6 +1234,8 @@ impl Builder {
         // Uniform by default: an op that does not tell the builder its per-slice costs is
         // assumed balanced, which makes `select_granularity` fall back to coarse counters.
         let work = vec![1u32; cus.len()];
+        let reduce = (op == DevOp::GemmSmall && inst.i[7] == 1).then_some(inst);
+        let rcus = reduce.map(|_| cus.clone());
         self.ops.push(Op {
             inst,
             isolated: false,
@@ -1229,6 +1246,22 @@ impl Builder {
             counter,
             work,
         });
+        if let (Some(mut r), Some(rcus)) = (reduce, rcus) {
+            r.i[7] = 2;
+            let rc = self.ops.len() as u32;
+            let work = vec![1u32; rcus.len()];
+            self.ops.push(Op {
+                inst: r,
+                isolated: false,
+                keep_single_grid: false,
+                join: self.cur_join,
+                cus: rcus,
+                deps: vec![Dep::Coarse(counter)],
+                counter: rc,
+                work,
+            });
+            return rc;
+        }
         counter
     }
 
