@@ -2331,7 +2331,8 @@ __device__ void d_kda_decode_fused_arm_t(
     }
     /* A ladder's one-row program (SEQ_ROWS, T = 1): row 0 lives at offset 0 like the
      * single-sequence program. A parked row is skipped by every tile of every head alike, so no
-     * head counter is bumped and the round tags stay aligned; y is left as the chain leaves o. */
+     * head counter is bumped and the round tags stay aligned. y keeps its old value where the
+     * chain re-normed a stale o; a parked row is never sampled. */
     if ((flags & PLOW_KDA_F_SEQ_ROWS) && parked[0]) return;
 #if !PLOW_KDA_FB_FOLD
     if (fb_fold) __builtin_trap();

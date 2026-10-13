@@ -473,6 +473,8 @@ pub struct Builder {
     /// Slices per machine-filling decode GEMV, as a multiple of `n_cu`. 1 (default) ⇒
     /// byte-identical. See [`Builder::set_gemv_split`].
     gemv_split: u32,
+    /// Largest split-K factor for a `GemmSmall` (0/1 = off). See [`Builder::set_gemm_small_splitk`].
+    gemm_small_splitk: u32,
     /// Re-declaring a tensor name returns the existing handle instead of appending.
     /// `false` (default) ⇒ byte-identical. See [`Builder::set_tensor_dedup`].
     tensor_dedup: bool,
@@ -720,6 +722,7 @@ impl Builder {
             attn_res_f32mix_segments: false,
             native_gemma4_glu_segments: false,
             gemv_split: 1,
+            gemm_small_splitk: 0,
             tensor_dedup: false,
             cu_cap: None,
             tr_dropped: 0,
@@ -943,6 +946,51 @@ impl Builder {
         self.gemv_split = s.clamp(1, 16);
     }
 
+    /// Split-K for the plain bf16 `GemmSmall` (64x128 tile) packets emitted after this call:
+    /// a packet whose tile count leaves most of its workgroups idle gets `i6 = S` (the largest
+    /// power of two <= `max_s` with `tiles * S <= workgroups` and `K % (S * 128) == 0`), an fp32
+    /// partial workspace in `t5` and a per-tile counter row in `t6` (interp.hip
+    /// `d_gemm_small_splitk`). NOT bit-identical: S partial sums are added in slice order.
+    /// 0/1 = off, byte-identical.
+    pub fn set_gemm_small_splitk(&mut self, max_s: u32) {
+        self.gemm_small_splitk = max_s.min(16);
+    }
+
+    fn apply_gemm_small_splitk(&mut self, op: DevOp, slices: usize, inst: &mut DevInst) {
+        if self.gemm_small_splitk < 2
+            || op != DevOp::GemmSmall
+            || inst.t[3] != TENSOR_NONE
+            || inst.t[5] != TENSOR_NONE
+            || inst.t[6] != TENSOR_NONE
+            || inst.i[4] != 0
+            || inst.i[5] != 0
+            || inst.i[6] != 0
+        {
+            return;
+        }
+        let (m, n, k) = (inst.i[0], inst.i[1], inst.i[2]);
+        let tiles = m.div_ceil(64) * n.div_ceil(128);
+        let mut s = 1u32;
+        while s * 2 <= self.gemm_small_splitk
+            && tiles * s * 2 <= slices as u32
+            && k % (s * 2 * 128) == 0
+        {
+            s *= 2;
+        }
+        if s < 2 {
+            return;
+        }
+        let id = self.ops.len();
+        let part = self.tensor(
+            &format!("act.splitk.{id}.m{m}n{n}s{s}.part"),
+            u64::from(s) * u64::from(m) * u64::from(n) * 4,
+        );
+        let ctr = self.tensor(&format!("act.splitk.{id}.m{m}n{n}s{s}.ctr"), u64::from(tiles) * 4);
+        inst.t[5] = part;
+        inst.t[6] = ctr;
+        inst.i[6] = s;
+    }
+
     /// Re-declaring a name returns the EXISTING handle and grows it to the larger byte count,
     /// instead of appending a second entry under the same name.
     ///
@@ -1164,6 +1212,7 @@ impl Builder {
             j: [0; 2],
         };
         f(&mut inst);
+        self.apply_gemm_small_splitk(op, cus.len(), &mut inst);
         // AFTER the closure: the immediates do not exist until it has run.
         tune_dump_gemv(op, &inst);
         let counter = self.ops.len() as u32;

@@ -446,6 +446,9 @@ struct Shapes {
     /// Any `GemvF32` (op 135) with `i[4] == 1` — the one-row HyperConnPre tail
     /// (PLOW_GLM_HC_PRE_TAIL). A pre-arm object never runs the pre. Refuse.
     glm_hc_pre_tail: bool,
+    /// Any `GemmSmall` with `i[6] > 1` — decode split-K (PLOW_GLM_DEC_SPLITK). A BUILD axis
+    /// (`#if PLOW_GEMM_SMALL_SPLITK`); an object without it runs the unsplit tile (correct).
+    gemm_small_splitk: bool,
     /// Any `GemmMed` (op 15) carrying a `t[5]` — the prefill q-rope fold (PLOW_GLM_FUSE_POST):
     /// t3/t4 = cos/sin, t5 = pos, i3 = the first roped column. An object without the arm stores
     /// the unroped projection and attention runs on it. Refuse at load.
@@ -656,6 +659,7 @@ fn shapes(m: &Model) -> Shapes {
                 }
                 DevOp::AddNorm if inst.i[2] == 1 => s.glm_fuse_seam_rn = true,
                 DevOp::HyperConnPre if inst.i[4] == 1 => s.glm_hc_norm_fold = true,
+                DevOp::GemmSmall if inst.i[6] > 1 => s.gemm_small_splitk = true,
                 DevOp::GemvF32 if inst.i[3] == 1 || inst.i[4] == 1 => {
                     s.glm_hc_post_fold |= inst.i[3] == 1;
                     s.glm_hc_pre_tail |= inst.i[4] == 1;
@@ -1036,6 +1040,9 @@ fn encoding_features(f: &mut Map<String, Value>, s: &Shapes) {
     f.insert("glm_hc_post_fold".into(), json!(s.glm_hc_post_fold));
     if s.glm_hc_pre_tail {
         f.insert("glm_hc_pre_tail".into(), json!(true));
+    }
+    if s.gemm_small_splitk {
+        f.insert("gemm_small_splitk".into(), json!(true));
     }
     if s.glm_fuse_post {
         f.insert("glm_fuse_post".into(), json!(true));
@@ -2960,6 +2967,13 @@ pub fn config_header(manifest: &Value) -> String {
         "#ifndef PLOW_ATTNRES_DECODE_MWG\n#define PLOW_ATTNRES_DECODE_MWG {}\n#endif\n",
         if attnres_decode_mwg { 1 } else { 0 }
     ));
+    if manifest
+        .pointer("/features/gemm_small_splitk")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        out.push_str("#ifndef PLOW_GEMM_SMALL_SPLITK\n#define PLOW_GEMM_SMALL_SPLITK 1\n#endif\n");
+    }
     let kda_fb_fold = manifest
         .pointer("/features/kda_fb_fold")
         .and_then(Value::as_bool)

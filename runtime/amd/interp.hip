@@ -1108,6 +1108,18 @@ extern "C" __device__ unsigned plow_glm_hc_post_fold_arm = 1;
 /* GEMV_F32 i4 = 1: the following one-row HyperConnPre runs on the packet's last-arriving
  * workgroup (PLOW_GLM_HC_PRE_TAIL). An object without the arm never runs the pre: no trap. */
 extern "C" __device__ unsigned plow_glm_hc_pre_tail_arm = 1;
+#ifndef PLOW_GEMM_SMALL_SPLITK
+#define PLOW_GEMM_SMALL_SPLITK 0
+#endif
+#if PLOW_GEMM_SMALL_SPLITK && !PLOW_BUCKET_DECODE
+#undef PLOW_GEMM_SMALL_SPLITK
+#define PLOW_GEMM_SMALL_SPLITK 0
+#endif
+#if PLOW_GEMM_SMALL_SPLITK
+/* GEMM_SMALL i6 = S > 1: split-K with an ordered reduction (PLOW_GLM_DEC_SPLITK). A BUILD axis:
+ * an object without it runs the unsplit tile and ignores t5/t6 -- right answer, no split. */
+extern "C" __device__ unsigned plow_gemm_small_splitk_arm = 1;
+#endif
 
 typedef union __align__(16) {
     float part[PLOW_MIXED_STEP ? 8 : PLOW_WAVES]; /* mixed norms retain the 8-wave reduction */
@@ -2423,6 +2435,15 @@ __device__ __forceinline__ void exec_gemm_small(CInst in, CTens T,
     if (in->t[4] != PLOW_TENSOR_NONE) { /* dual form: t3 = C1, t4 = B1, i3 = N1 (dsa_prep.h) */
         d_gemm_small_dual((bf16*)TEN(0), (bf16*)TEN(3), (const bf16*)TEN(1), (const bf16*)TEN(2),
                           (const bf16*)TEN(4), in->i[0], in->i[1], in->i[3], in->i[2], slice, nblk, lds);
+        return;
+    }
+#endif
+#if PLOW_GEMM_SMALL_SPLITK
+    if (in->i[6] > 1u) { /* PLOW_GLM_DEC_SPLITK: t5 = fp32 partials, t6 = per-tile counters */
+        if (in->i[4] != 0u || in->i[5] != 0u) __builtin_trap();
+        d_gemm_small_splitk((bf16*)TEN(0), (const bf16*)TEN(1), (const bf16*)TEN(2), in->i[0],
+                            in->i[1], in->i[2], in->i[6], (float*)TEN(5), (unsigned*)TEN(6), slice,
+                            nblk, lds);
         return;
     }
 #endif
