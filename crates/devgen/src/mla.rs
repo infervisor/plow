@@ -849,6 +849,9 @@ fn emit_glm53_hc_pre(
             if let Some(r) = fuse_r {
                 d.i[4] = 3;
                 d.i[5] = r;
+                // PLOW_GLM_HC_FUSE_VARIANT bits: 1 = register-resident pre + norm tail,
+                // 2 = W walked 8 steps per batch (rows arm). Both bit-identical.
+                d.i[6] = emit_config::active().glm_hc_fuse_variant.unwrap_or(0);
             }
             d.t[7] = desc;
         }
@@ -5291,6 +5294,24 @@ pub(crate) fn emit_glm_mla(
             }
         });
         (c_fa, c_fa, c_fa)
+    } else if let Some(g) = (dr == 0
+        && !mx
+        && emit_config::active().glm_kda_proj_group
+        && !glm_decode_lt_routes(rows, [ql, h])
+        && !glm_decode_lt_routes(rows, [dk, h])
+        && glm_decode_gemm_tile(rows, ql, h, b.n_cu()) == Some(DevOp::GemmSmall)
+        && glm_decode_gemm_tile(rows, dk, h, b.n_cu()) == Some(DevOp::GemmSmall))
+    .then(|| {
+        // PLOW_GLM_KDA_PROJ_GROUP: the NoPE q_a / kv_a pair (both from xn) as one group.
+        b.emit_gemm_small_group(
+            rows,
+            &[(n.qlr, n.xn, w.qad, ql, h), (n.ckvraw, n.xn, w.ckvd, dk, h)],
+            &[c_rn1],
+        )
+    })
+    .flatten()
+    {
+        (g, g, g)
     } else {
         (
             gemv(b, n.qlr, n.xn, w.qad, w.qad_s, ql, h, &[c_rn1]),

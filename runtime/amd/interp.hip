@@ -3400,6 +3400,23 @@ __device__ __forceinline__ void hc_fuse_tail(CInst in, CTens T, unsigned group, 
     const unsigned hidden = desc[PLOW_HCT_HIDDEN], sink = desc[PLOW_HCT_SINK];
     const float eps = __uint_as_float(desc[PLOW_HCT_EPS]);
     const float hceps = __uint_as_float(desc[PLOW_HCT_HCEPS]);
+#if !PLOW_HC_SINKHORN_RCP
+    if ((in->i[6] & 1u) && hidden == 8u * PLOW_THREADS) {
+        for (unsigned m = row0; m < row0 + nrows && m < rows; m++)
+            hc_pre_norm_row_lean(
+                (float*)T[desc[PLOW_HCT_POST]] + (size_t)m * 4u,
+                (float*)T[desc[PLOW_HCT_COMB]] + (size_t)m * 16u,
+                (bf16*)T[desc[PLOW_HCT_LIN]] + (size_t)m * hidden,
+                desc[PLOW_HCT_NORM] == 1u ? (bf16*)T[desc[PLOW_HCT_NOUT]] + (size_t)m * hidden
+                                          : nullptr,
+                desc[PLOW_HCT_NORM] == 1u ? (const bf16*)T[desc[PLOW_HCT_GAMMA]] : nullptr,
+                (const float*)T[in->t[0]] + (size_t)m * 24u,
+                (const bf16*)T[in->t[1]] + (size_t)m * 4u * hidden,
+                (const float*)T[desc[PLOW_HCT_SCALE]], (const float*)T[desc[PLOW_HCT_BASE]],
+                hidden, sink, eps, hceps, sm->part);
+        return;
+    }
+#endif
     for (unsigned m = row0; m < row0 + nrows && m < rows; m++) {
         d_hyperconn_pre_rows((float*)T[desc[PLOW_HCT_POST]] + (size_t)m * 4u,
                              (float*)T[desc[PLOW_HCT_COMB]] + (size_t)m * 16u,
@@ -3453,18 +3470,39 @@ __device__ __attribute__((noinline)) void exec_hc_fuse_dec(CInst in, CTens T, un
     for (unsigned unit = slice; unit < units; unit += nblk) {
         switch (R) {
             case 1u:
+                if (in->i[6] & 2u)
+                    d_gemv_f32_hcpost_rows<1, 8>((float*)HCF_TEN(0), (bf16*)HCF_TEN(1),
+                                                  (const float*)HCF_TEN(2),
+                                                  (const bf16*)HCF_TEN(3), (const bf16*)HCF_TEN(4),
+                                                  (const float*)HCF_TEN(5),
+                                                  (const float*)HCF_TEN(6), M, K, unit, sm->raw);
+                else
                 d_gemv_f32_hcpost_rows<1>((float*)HCF_TEN(0), (bf16*)HCF_TEN(1), (const float*)HCF_TEN(2),
                                           (const bf16*)HCF_TEN(3), (const bf16*)HCF_TEN(4),
                                           (const float*)HCF_TEN(5), (const float*)HCF_TEN(6), M, K, unit,
                                           sm->raw);
                 break;
             case 2u:
+                if (in->i[6] & 2u)
+                    d_gemv_f32_hcpost_rows<2, 8>((float*)HCF_TEN(0), (bf16*)HCF_TEN(1),
+                                                  (const float*)HCF_TEN(2),
+                                                  (const bf16*)HCF_TEN(3), (const bf16*)HCF_TEN(4),
+                                                  (const float*)HCF_TEN(5),
+                                                  (const float*)HCF_TEN(6), M, K, unit, sm->raw);
+                else
                 d_gemv_f32_hcpost_rows<2>((float*)HCF_TEN(0), (bf16*)HCF_TEN(1), (const float*)HCF_TEN(2),
                                           (const bf16*)HCF_TEN(3), (const bf16*)HCF_TEN(4),
                                           (const float*)HCF_TEN(5), (const float*)HCF_TEN(6), M, K, unit,
                                           sm->raw);
                 break;
             case 4u:
+                if (in->i[6] & 2u)
+                    d_gemv_f32_hcpost_rows<4, 8>((float*)HCF_TEN(0), (bf16*)HCF_TEN(1),
+                                                  (const float*)HCF_TEN(2),
+                                                  (const bf16*)HCF_TEN(3), (const bf16*)HCF_TEN(4),
+                                                  (const float*)HCF_TEN(5),
+                                                  (const float*)HCF_TEN(6), M, K, unit, sm->raw);
+                else
                 d_gemv_f32_hcpost_rows<4>((float*)HCF_TEN(0), (bf16*)HCF_TEN(1), (const float*)HCF_TEN(2),
                                           (const bf16*)HCF_TEN(3), (const bf16*)HCF_TEN(4),
                                           (const float*)HCF_TEN(5), (const float*)HCF_TEN(6), M, K, unit,

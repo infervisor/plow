@@ -1052,6 +1052,16 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_GLM_KDA_PROJ_GROUP_S")]
     pub glm_kda_proj_group_s: Option<u32>,
 
+    /// GLM-5.3-Flash one-row decode: the KDA low-rank gate's g_a projection as GemvQkvg's fourth
+    /// stream next to q/k/v (one packet and one hop less per KDA layer).
+    #[arg(long, env = "PLOW_GLM_KDA_QKVG_R1", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub glm_kda_qkvg_r1: bool,
+
+    /// PLOW_GLM_HC_FUSE_DEC body variant bits: 1 = register-resident pre + norm tail, 2 = the
+    /// rows arm walks W eight steps per load batch. Bit-identical.
+    #[arg(long, env = "PLOW_GLM_HC_FUSE_VARIANT")]
+    pub glm_hc_fuse_variant: Option<u32>,
+
 
     /// GLM-5.3-Flash batched decode (rows > 1): largest split-K factor for the bf16 GemmSmall
     /// projections whose 64x128 tiles leave most workgroups idle (0 = off). NOT bit-identical.
@@ -1807,6 +1817,8 @@ impl EmitConfig {
             glm_kda_proj_group: env_bool("PLOW_GLM_KDA_PROJ_GROUP"),
             glm_hc_fuse_r1: env_bool("PLOW_GLM_HC_FUSE_R1"),
             glm_kda_proj_group_s: env_u32("PLOW_GLM_KDA_PROJ_GROUP_S"),
+            glm_kda_qkvg_r1: env_bool("PLOW_GLM_KDA_QKVG_R1"),
+            glm_hc_fuse_variant: env_u32("PLOW_GLM_HC_FUSE_VARIANT"),
             glm_dec_splitk: env_u32("PLOW_GLM_DEC_SPLITK"),
             glm_dec_splitk_max_rows: env_u32("PLOW_GLM_DEC_SPLITK_MAX_ROWS"),
             glm_dec_splitk_2p: env_bool("PLOW_GLM_DEC_SPLITK_2P"),

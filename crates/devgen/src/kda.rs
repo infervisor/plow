@@ -792,6 +792,7 @@ fn emit_kda_mixer_ex(
     // PLOW_GLM_KDA_PROJ_GROUP (batched decode rows): every projection takes the GemmSmall tile
     // and the split-K two-packet form (or no split), so the eight can run as two groups.
     let mut kda_group: Option<(u32, u32)> = None;
+    let mut return_qkvg: Option<(u32, u32)> = None;
     if let OutputGate::LowRank { .. } = w.gate {
         let small = |n: u32, k: u32| {
             crate::mla::glm_decode_gemm_tile(t, n, k, n_cu) == Some(DevOp::GemmSmall)
@@ -880,7 +881,33 @@ fn emit_kda_mixer_ex(
             // still fuse into ONE [`DevOp::GemvQkv`] under the same decode-only/LDS-arena bound
             // `fuse_qkvg` already checks — GemvQkv's arena is a strict subset of GemvQkvg's
             // (three streams, not four), so the same gate is conservative, not approximate.
-            let (cq, ck, cv) = if fuse_qkv {
+            let ga = bft(b, format!("{a}g_a"), tt * hd as u64);
+            // PLOW_GLM_KDA_QKVG_R1: the low-rank gate's down-projection g_a rides the q/k/v sweep
+            // as GemvQkvg's fourth stream (Ng = head_dim), so g_b no longer waits on its own packet.
+            if fuse_qkv && crate::emit_config::active().glm_kda_qkvg_r1 {
+                let f = b.emit(DevOp::GemvQkvg, all.clone(), &[c_ln], |d| {
+                    d.t[0] = raw[0];
+                    d.t[1] = x;
+                    d.t[2] = w.q_proj;
+                    d.t[3] = raw[1];
+                    d.t[4] = w.k_proj;
+                    d.t[5] = raw[2];
+                    d.t[6] = w.v_proj;
+                    d.t[7] = ga;
+                    d.i[0] = t;
+                    d.i[1] = p;
+                    d.i[2] = hi;
+                    d.i[3] = p;
+                    d.i[4] = p;
+                    d.i[5] = hd;
+                    d.i[6] = g_a_proj;
+                });
+                let c_gb = gemv(b, g_raw, ga, g_b_proj, p, hd, f);
+                return_qkvg = Some((f, c_gb));
+            }
+            let (cq, ck, cv) = if let Some((f, _)) = return_qkvg {
+                (f, f, f)
+            } else if fuse_qkv {
                 let f = b.emit(DevOp::GemvQkv, all.clone(), &[c_ln], |d| {
                     d.t[0] = raw[0];
                     d.t[1] = x;
@@ -904,9 +931,12 @@ fn emit_kda_mixer_ex(
                 )
             };
             // g_a: down-projection to head_dim, mirrors `fa`/`c_fa` below exactly.
-            let ga = bft(b, format!("{a}g_a"), tt * hd as u64);
-            let c_ga = gemv(b, ga, x, g_a_proj, hd, hi, c_ln);
-            let c_gb = gemv(b, g_raw, ga, g_b_proj, p, hd, c_ga);
+            let c_gb = if let Some((_, c_gb)) = return_qkvg {
+                c_gb
+            } else {
+                let c_ga = gemv(b, ga, x, g_a_proj, hd, hi, c_ln);
+                gemv(b, g_raw, ga, g_b_proj, p, hd, c_ga)
+            };
             (cq, ck, cv, c_gb)
         }
     };
