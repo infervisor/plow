@@ -386,4 +386,43 @@ __device__ __forceinline__ void dsa_pool_expand_row(int32_t* __restrict__ out,
     }
 }
 
+/* op 126, one WAVE per row (PLOW_DSA_QQUANT_WAVE): lane l holds dims l and l+64, so the six
+ * strides below 64 are lane shuffles and stride 64 is in-lane — no LDS, no block barriers, eight
+ * rows per workgroup in flight. Each butterfly output is the same a+b / a-b of the same operands as
+ * dsa_hadamard128_stage, and the absmax is a max: bit-identical to d_dsa_q_quant at head_dim 128. */
+__device__ void d_dsa_q_quant_wave(uint8_t* __restrict__ q_fp8, float* __restrict__ q_scale,
+                                   const bf16* __restrict__ q_raw, unsigned n_rows, unsigned slice,
+                                   unsigned nblk) {
+    const unsigned lane = threadIdx.x & 63u, wave = threadIdx.x >> 6;
+    constexpr unsigned NW = PLOW_THREADS / 64u;
+    for (unsigned row = slice * NW + wave; row < n_rows; row += nblk * NW) {
+        float x0 = bf2f(q_raw[(size_t)row * 128u + lane]);
+        float x1 = bf2f(q_raw[(size_t)row * 128u + 64u + lane]);
+#pragma unroll
+        for (unsigned s = 1u; s < 64u; s <<= 1) {
+            const float p0 = __shfl_xor(x0, (int)s, 64);
+            const float p1 = __shfl_xor(x1, (int)s, 64);
+            x0 = (lane & s) ? (p0 - x0) : (x0 + p0);
+            x1 = (lane & s) ? (p1 - x1) : (x1 + p1);
+        }
+        {
+            const float a = x0, b = x1;
+            x0 = a + b;
+            x1 = a - b;
+        }
+        x0 = bf2f(f2bf(x0 * 0.08838834764831845f));
+        x1 = bf2f(f2bf(x1 * 0.08838834764831845f));
+        float ax = fmaxf(fabsf(x0), fabsf(x1));
+#pragma unroll
+        for (int off = 32; off > 0; off >>= 1) ax = fmaxf(ax, __shfl_xor(ax, off, 64));
+        const float absmax = fmaxf(ax, 1e-4f);
+        float scale, inv_scale;
+        plow_round_scale(absmax, PLOW_FP8_E4M3_MAX, &scale, &inv_scale);
+        q_fp8[(size_t)row * 128u + lane] = quant_fp8(PLOW_QUANT_SCALE_DIV(x0, scale, inv_scale));
+        q_fp8[(size_t)row * 128u + 64u + lane] =
+            quant_fp8(PLOW_QUANT_SCALE_DIV(x1, scale, inv_scale));
+        if (lane == 0u) q_scale[row] = scale;
+    }
+}
+
 #endif /* PLOW_OP_DSA_POOL_H */

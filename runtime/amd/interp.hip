@@ -1211,6 +1211,9 @@ extern "C" __device__ unsigned plow_glm_hc_pre_tail_arm = 1;
 #ifndef PLOW_DSA_KPOOL_MFMA
 #define PLOW_DSA_KPOOL_MFMA 1
 #endif
+#ifndef PLOW_DSA_QQUANT_WAVE
+#define PLOW_DSA_QQUANT_WAVE 1
+#endif
 #ifndef PLOW_GEMM_F32_DEC_TILE
 #define PLOW_GEMM_F32_DEC_TILE 1
 #endif
@@ -4403,6 +4406,13 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
                              (const int*)TEN(4), in->i[0], in->i[1], in->i[2]);
             break;
         case PLOW_DOP_DSA_Q_QUANT:
+#if PLOW_DSA_QQUANT_WAVE
+            if (in->i[1] == 128u) {
+                d_dsa_q_quant_wave((uint8_t*)TEN(0), (float*)TEN(1), (const bf16*)TEN(2), in->i[0],
+                                   slice, nblk);
+                break;
+            }
+#endif
             d_dsa_q_quant((uint8_t*)TEN(0), (float*)TEN(1), (const bf16*)TEN(2), in->i[0], in->i[1],
                           slice, nblk, (float*)sm->raw, sm->part);
             break;
