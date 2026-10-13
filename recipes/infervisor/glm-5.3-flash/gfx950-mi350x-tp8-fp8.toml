@@ -13,7 +13,7 @@ name = "glm-5.3-flash"
 label = "gfx950-mi350x-tp8-fp8"
 network = "glm-5.3-flash"
 status = "validated"
-plow_git = "70fdf9ebd936d46c89e508cc1b0c7e4e0f49e8b4"
+plow_git = "927f76eb5025bf48d675f42035e1fd57cfa87c24"
 doc = "docs/amd/glm53-flash-mi350x.md"
 
 # max_ctx 65536: the model's recurrent (KDA) state carries at every length, so long prompts are
@@ -143,8 +143,9 @@ name = "smoke"
 cmd = "scripts/serve_test/smoke.sh"
 
 # FP32-reference gate (scripts/llm/fp32_ref_gate.py, 46 cases incl. 18 needles to 15872 tokens,
-# served c16, prefix cache on) on packet 1533860b (v9): PASS, kl_mean 0.01384 (vLLM 0.03677 on the same
-# reference), kl_p99 0.237 (0.549), top1_decisive 0.9989 (0.9868), needles 18/18; needles with
+# served c16, prefix cache on) on packet e4786a2c (v10, mixed prefill+decode on): PASS, kl_mean 0.01342
+# (vLLM 0.03677 on the same reference), kl_p99 0.205 (0.549), top1_decisive 0.9989 (0.9868), needles
+# 18/18 (DP2xTP4 on the TP4 packet 2beec26e: kl_mean 0.01295, PASS); needles with
 # PLOW_PF_CHUNK=512 18/18. Prefix reuse at c8 (identical re-sends 4096 cached, 53248 hit tokens):
 # cached streams equal their cold runs 4/4.
 [[gates]]
@@ -161,11 +162,11 @@ expect = "36/36"
 
 # One serving cell for orientation; the full grid (isl 1024/4096/16384 at c1..c128, 32768/61440 at
 # c1/c8) and the strict comparison against vLLM are docs/bringup/results/glm53flash-mi350x-2026-10-12.
-# No cell beats vLLM on throughput (v9: 0.14-0.56x); see docs/amd/glm53-flash-mi350x.md.
+# No cell beats vLLM on throughput (v10: 0.25-0.62x); see docs/amd/glm53-flash-mi350x.md.
 [measured]
-tok_s = 70.48
-p50_tpot_ms = 12.64
-p50_ttft_ms = 206.13
+tok_s = 77.78
+p50_tpot_ms = 11.54
+p50_ttft_ms = 176.97
 concurrency = 1
 input_len = 4096
 output_len = 128
@@ -173,10 +174,10 @@ client = "vllm 0.31.1rc1 bench serve (scripts/bench/llm_grid.sh)"
 
 # Reproduction gates at THIS commit, checkpoint and nix lock.
 [artifacts]
-"plowrt" = "bf5a1a85da7089d6d69de81bedec67e0cef8619c243e9d3f69fff91726bd47aa"
-"model.pkt" = "1533860b946b49cc4fc9264d0370539739f265e7e7f562db7aa8fe15d0e67805"
-"interp_decode_k3_gq.elf" = "d2c617e8720d40d80d12d5aa827d87fb72fcbb71d948dc51e7811e14064a8c82"
-"lowrung1/interp_decode_k3_gq.elf" = "a4f5c606f1c51f79019074741ff92746684a6c836f7d0033ea86669df8ca4db8"
-"lowrung8/interp_decode_k3_gq.elf" = "d1630c82fa4aa602701a849014212f67a30b6c11fb606a184d865f267918a521"
-"interp_prefill_k3_moe_gq.elf" = "10d60aec2d4ca279a58220b8abec7254a97b423caed625e1f6eb1ee42cb3b5e7"
-"interp_flash_gq.elf" = "692b6bbadfbdfd30f668d40994b9c7f5178efc99d01e3c84c23047f2fb4ebfae"
+"plowrt" = "2424aa825a8d53309041ec98589942e3f7a8475d8ac9e85daff2cd3a63ac6a10"
+"model.pkt" = "e4786a2ceab306ad1ab650c3d9036a07b96d221d3f2d59676c6908e6b35054ba"
+"interp_decode_k3_gq.elf" = "dcee1a0b2fc717e52dc2f2fa5182831f349cbdaed4861c692230b71d9a23e81e"
+"lowrung1/interp_decode_k3_gq.elf" = "a60a95484441fad26b614454850812871af14aaabff2192c60946bfd920e6b58"
+"lowrung8/interp_decode_k3_gq.elf" = "87b08547e1b54229de5303b3de5e737df6aca2fd631e038216cbdceaffefb8a5"
+"interp_prefill_k3_moe_gq.elf" = "978be772cb2cbd298fd85201d9f686787787ca84d3993756477443e31d74a3dc"
+"interp_flash_gq.elf" = "f9af8fbf0b90e66e302a6552df6b1a07b64f7eae1e09cd29ec915ed2964a762e"

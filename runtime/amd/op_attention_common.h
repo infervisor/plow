@@ -3685,6 +3685,30 @@ __device__ __forceinline__ bf16 mla_pf2_f2bf(float f) {
 #endif
 }
 
+/* PLOW_MLA_PF2_DPP — the V2 softmax's quarter-wave (16-lane) xor butterflies as DPP moves
+ * instead of ds_bpermute. Each step reads a partner that holds the SAME value as the xor partner:
+ * after the d=1,2 steps every lane of a quad is equal, so row_half_mirror (i -> 7-i) lands in
+ * the xor-4 partner's quad, and after d=4 every 8-lane half is equal, so row_mirror (i -> 15-i)
+ * lands in the xor-8 partner's half. Same operands, same order: bit-identical max and sum, with
+ * no LDS round trip on the per-tile dependency chain (8 per row per KV tile). The callers'
+ * loops run d = 1, 2, 4, 8 with a full wave active. */
+#ifndef PLOW_MLA_PF2_DPP
+#define PLOW_MLA_PF2_DPP 0
+#endif
+__device__ __forceinline__ float mla_pf2_xor16(float v, int d) {
+#if PLOW_MLA_PF2_DPP
+    const int x = __builtin_bit_cast(int, v);
+    int r;
+    if (d == 1) r = __builtin_amdgcn_update_dpp(0, x, 0xB1, 0xF, 0xF, false);       /* [1,0,3,2] */
+    else if (d == 2) r = __builtin_amdgcn_update_dpp(0, x, 0x4E, 0xF, 0xF, false);  /* [2,3,0,1] */
+    else if (d == 4) r = __builtin_amdgcn_update_dpp(0, x, 0x141, 0xF, 0xF, false); /* half mirror */
+    else r = __builtin_amdgcn_update_dpp(0, x, 0x140, 0xF, 0xF, false);             /* row mirror */
+    return __builtin_bit_cast(float, r);
+#else
+    return __shfl_xor(v, d, PLOW_WAVE);
+#endif
+}
+
 /* ------------------------------------------------------------------------------------
  * PLOW_MLA_PF_SV — the V-STAGE arm. OPT-IN, default OFF, BIT-IDENTICAL (it moves LDS
  * addresses and load ISSUE ORDER only; every MFMA sees the same operands in the same
@@ -4268,7 +4292,7 @@ __device__ void d_flash_mla_prefill_v2(float* __restrict__ Opart, float* __restr
                     float rmax = fmaxf(sv[0], sv[1]);
 #pragma unroll
                     for (int d = 1; d < 16; d <<= 1)
-                        rmax = fmaxf(rmax, __shfl_xor(rmax, d, PLOW_WAVE));
+                        rmax = fmaxf(rmax, mla_pf2_xor16(rmax, d));
                     const float fnew =
                         fmaxf(m_st[i], __builtin_ceilf(rmax) + (float)FA_MLA_PF2_FRAME);
                     const float corr = (m_st[i] == FA_NEG_INF) ? 0.0f : FA_EXP(m_st[i] - fnew);
@@ -4343,7 +4367,7 @@ __device__ void d_flash_mla_prefill_v2(float* __restrict__ Opart, float* __restr
                     rmax = fmaxf(rmax, sv[nt]);
                 }
 #pragma unroll
-                for (int d = 1; d < 16; d <<= 1) rmax = fmaxf(rmax, __shfl_xor(rmax, d, PLOW_WAVE));
+                for (int d = 1; d < 16; d <<= 1) rmax = fmaxf(rmax, mla_pf2_xor16(rmax, d));
                 const float mnew = fmaxf(m_st[i], rmax);
                 const float corr = (m_st[i] == FA_NEG_INF) ? 0.0f : FA_EXP(m_st[i] - mnew);
                 float lsum = 0.0f;
@@ -4354,7 +4378,7 @@ __device__ void d_flash_mla_prefill_v2(float* __restrict__ Opart, float* __restr
                     lsum += p;
                 }
 #pragma unroll
-                for (int d = 1; d < 16; d <<= 1) lsum += __shfl_xor(lsum, d, PLOW_WAVE);
+                for (int d = 1; d < 16; d <<= 1) lsum += mla_pf2_xor16(lsum, d);
                 l_st[i] = l_st[i] * corr + lsum;
                 m_st[i] = mnew;
 #pragma unroll
@@ -4462,7 +4486,7 @@ __device__ void d_flash_mla_prefill_v2(float* __restrict__ Opart, float* __restr
 #pragma unroll
         for (int i = 0; i < 4; i++) {
 #pragma unroll
-            for (int d = 1; d < 16; d <<= 1) l_st[i] += __shfl_xor(l_st[i], d, PLOW_WAVE);
+            for (int d = 1; d < 16; d <<= 1) l_st[i] += mla_pf2_xor16(l_st[i], d);
         }
 #endif
 #pragma unroll

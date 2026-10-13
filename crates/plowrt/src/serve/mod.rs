@@ -898,23 +898,30 @@ impl AppState {
 
     /// Install one co-tenant turn per device group (once, at startup).
     ///
-    /// Called by every backend path, not just CUDA: two AMD models on one agent
-    /// is a thing that already happens — the AMD startup loop installs an
-    /// engine per bundle and each opens the same ROCr agent — and HSA has no
-    /// cooperative-launch refusal to catch the resulting CU oversubscription.
-    /// The CPU engine gives every model its own worker pool, so turns bound
-    /// thread contention there.
+    /// Called by every backend path, not just CUDA: AMD models placed on one
+    /// group share its agents, and HSA has no cooperative-launch refusal to
+    /// catch the resulting CU oversubscription. The CPU engine gives every
+    /// model its own worker pool, so turns bound thread contention there.
     pub fn install_device_turns(&self, groups: usize, cuda: bool) {
+        let models = self.registry.slugs().len();
+        self.install_group_turns(&vec![models; groups.max(1)], cuda);
+    }
+
+    /// [`Self::install_device_turns`] with each group's own instance count: a group of one
+    /// shares nothing, so its turn stays free unless `--co-sched` says otherwise. The
+    /// process-wide mode ([`policy::installed_co_sched`]) is the most-shared group's.
+    pub fn install_group_turns(&self, tenants: &[usize], cuda: bool) {
         self.turns.get_or_init(|| {
-            let mode = policy::co_sched(self.registry.slugs().len(), !cuda);
-            policy::set_co_sched(mode);
-            let turns = (0..groups.max(1))
-                .map(|_| Arc::new(cosched::DeviceTurn::serving(mode)))
+            let busiest = tenants.iter().copied().max().unwrap_or(1);
+            policy::set_co_sched(policy::co_sched(busiest, !cuda));
+            let turns = tenants
+                .iter()
+                .map(|&t| Arc::new(cosched::DeviceTurn::serving(policy::co_sched(t, !cuda))))
                 .collect::<Vec<_>>();
             if let Some(first) = turns.first() {
                 tracing::info!(
                     groups = turns.len(),
-                    mode = ?first.mode(),
+                    modes = ?turns.iter().map(|t| t.mode()).collect::<Vec<_>>(),
                     quantum = first.quantum(),
                     "co-tenant scheduling installed"
                 );

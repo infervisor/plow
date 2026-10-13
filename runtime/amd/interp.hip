@@ -314,6 +314,20 @@ extern "C" __device__ unsigned plow_dsa_prep_arm = 1;
 #include "op_qwen_gdn.h"
 #endif
 #include "op_moe.h"
+/* PLOW_MOE_PF_W8A8: the W8A8 block-FP8 arm of ops 85/86 (packet i[7] >= 2). A build axis the
+ * packet's plow_config.h turns on, so an object built for any other packet is unchanged. */
+#ifndef PLOW_MOE_PF_W8A8
+#define PLOW_MOE_PF_W8A8 0
+#endif
+/* Prefill objects only: no decode program emits i[7] >= 2, and a decode megakernel pays for any
+ * body it carries. */
+#if PLOW_CDNA4 && PLOW_MOE_PF_W8A8 && PLOW_MOE_PREFILL && !PLOW_BUCKET_DECODE && \
+    !defined(PLOW_BUCKET_FLASH)
+#define PLOW_MOE_PF_W8A8_ARM 1
+#include "moe_pf_w8a8.h"
+#else
+#define PLOW_MOE_PF_W8A8_ARM 0
+#endif
 #if PLOW_CDNA4 && (PLOW_HAS_MOE_GLU_FP8_BLOCK128 || PLOW_HAS_MOE_QUANT_FP8_BLOCK128 || PLOW_HAS_MOE_DOWN_FP8_BLOCK128)
 #include "op_moe_fp8_block128.h"
 #endif
@@ -1182,6 +1196,21 @@ extern "C" __device__ unsigned plow_glm_hc_norm_fold_arm = 1;
 /* GEMV_F32 i3 = 1: the preceding HyperConnPost folded in (PLOW_GLM_HC_POST_FOLD). An object
  * without the arm never writes the new residual stream: stale data, no trap. */
 extern "C" __device__ unsigned plow_glm_hc_post_fold_arm = 1;
+/* GEMV_F32 i4 = 1: the following one-row HyperConnPre runs on the packet's last-arriving
+ * workgroup (PLOW_GLM_HC_PRE_TAIL). An object without the arm never runs the pre: no trap. */
+extern "C" __device__ unsigned plow_glm_hc_pre_tail_arm = 1;
+#ifndef PLOW_GEMM_SMALL_SPLITK
+#define PLOW_GEMM_SMALL_SPLITK 0
+#endif
+#if PLOW_GEMM_SMALL_SPLITK && !PLOW_BUCKET_DECODE
+#undef PLOW_GEMM_SMALL_SPLITK
+#define PLOW_GEMM_SMALL_SPLITK 0
+#endif
+#if PLOW_GEMM_SMALL_SPLITK
+/* GEMM_SMALL i6 = S > 1: split-K with an ordered reduction (PLOW_GLM_DEC_SPLITK). A BUILD axis:
+ * an object without it runs the unsplit tile and ignores t5/t6 -- right answer, no split. */
+extern "C" __device__ unsigned plow_gemm_small_splitk_arm = 1;
+#endif
 
 typedef union __align__(16) {
     float part[PLOW_MIXED_STEP ? 8 : PLOW_WAVES]; /* mixed norms retain the 8-wave reduction */
@@ -1323,6 +1352,10 @@ static_assert(FA_MLA_DEC_LDS_FLOATS(512, 64, (PLOW_GLM_GF8_ARM ? 8 : 4)) * sizeo
  * 64 KiB part exactly as GMPF_DBUF does; this pin is what keeps that true. */
 static_assert(MPF_LDS_HALVES * sizeof(bf16) <= sizeof(((plow_smem*)nullptr)->raw),
               "grouped-MoE prefill LDS tiles exceed the interpreter's shared allocation");
+#if PLOW_MOE_PF_W8A8_ARM
+static_assert(MW8_LDS_BYTES <= sizeof(((plow_smem*)nullptr)->raw),
+              "W8A8 grouped-MoE LDS exceeds the interpreter's shared allocation");
+#endif
 #if PLOW_MOE_PF_A4W4
 /* Same pin for the mxfp4 grouped arm (both the CDNA4 A4W4 plan and the CDNA3 simulated one --
  * MPF4_LDS_BYTES is arch-conditional). It had no assert because only 147 KiB arenas ever built
@@ -2500,6 +2533,15 @@ __device__ __forceinline__ void exec_gemm_small(CInst in, CTens T,
         return;
     }
 #endif
+#if PLOW_GEMM_SMALL_SPLITK
+    if (in->i[6] > 1u) { /* PLOW_GLM_DEC_SPLITK: t5 = fp32 partials, t6 = per-tile counters */
+        if (in->i[4] != 0u || in->i[5] != 0u) __builtin_trap();
+        d_gemm_small_splitk((bf16*)TEN(0), (const bf16*)TEN(1), (const bf16*)TEN(2), in->i[0],
+                            in->i[1], in->i[2], in->i[6], (float*)TEN(5), (unsigned*)TEN(6), slice,
+                            nblk, lds);
+        return;
+    }
+#endif
     d_gemm_small((bf16*)TEN(0) + (size_t)in->i[5] * in->i[1],
            (const bf16*)TEN(1) + (size_t)in->i[4] * in->i[2],
                  (const bf16*)TEN(2), in->i[0], in->i[1], in->i[2], slice, nblk, lds);
@@ -3172,6 +3214,66 @@ __device__ __forceinline__ unsigned gemm_pf_repick(CInst in, unsigned nblk) {
         return op;
     const unsigned pick = gemm_pf_ladder(in->i[0], in->i[1], bm, bn, nblk, false);
     return pick ? pick : op;
+}
+#endif
+
+#if PLOW_BUCKET_DECODE
+/* PLOW_GLM_HC_PRE_TAIL: GemvF32 (the mHC mix, t0 = mixes, t1 = residual) with i4 = 1 carries the
+ * following ONE-ROW HyperConnPre in t7 = a u32 descriptor `[post_mix, comb_mix, layer_input,
+ * scale, base, counter, norm_fold, norm_out, gamma, hidden, sinkhorn, eps_bits, hc_eps_bits]`.
+ * Every workgroup bumps the loader-zeroed counter after its gemv slice (acq_rel, agent scope);
+ * the one whose bump closes the packet's nblk bumps runs the HyperConnPre case body verbatim on
+ * slice 0 of 1, which is what the separate b=1 packet ran: bit-identical, one hop fewer. */
+enum {
+    PLOW_HCT_POST = 0, PLOW_HCT_COMB = 1, PLOW_HCT_LIN = 2, PLOW_HCT_SCALE = 3, PLOW_HCT_BASE = 4,
+    PLOW_HCT_CTR = 5, PLOW_HCT_NORM = 6, PLOW_HCT_NOUT = 7, PLOW_HCT_GAMMA = 8,
+    PLOW_HCT_HIDDEN = 9, PLOW_HCT_SINK = 10, PLOW_HCT_EPS = 11, PLOW_HCT_HCEPS = 12,
+};
+__device__ __forceinline__ void exec_hc_pre_tail(CInst in, CTens T, unsigned nblk,
+                                                 plow_smem* sm, const PlowProgram* prog_meta) {
+    const unsigned* desc = (const unsigned*)T[in->t[7]];
+    __shared__ unsigned hct_last;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        const unsigned old = __hip_atomic_fetch_add((unsigned*)T[desc[PLOW_HCT_CTR]], 1u,
+                                                    __ATOMIC_ACQ_REL, __HIP_MEMORY_SCOPE_AGENT);
+        hct_last = (old % nblk) == nblk - 1u;
+    }
+    __syncthreads();
+    if (!hct_last) return;
+    asm volatile("buffer_inv" ::: "memory");
+    __syncthreads();
+    float* post = (float*)T[desc[PLOW_HCT_POST]];
+    float* comb = (float*)T[desc[PLOW_HCT_COMB]];
+    bf16* lin = (bf16*)T[desc[PLOW_HCT_LIN]];
+    const float* mixes = (const float*)T[in->t[0]];
+    const bf16* res = (const bf16*)T[in->t[1]];
+    const float* hsc = (const float*)T[desc[PLOW_HCT_SCALE]];
+    const float* hbs = (const float*)T[desc[PLOW_HCT_BASE]];
+    const unsigned hidden = desc[PLOW_HCT_HIDDEN], sink = desc[PLOW_HCT_SINK];
+    const float eps = __uint_as_float(desc[PLOW_HCT_EPS]);
+    const float hceps = __uint_as_float(desc[PLOW_HCT_HCEPS]);
+#if !PLOW_HC_SINKHORN_RCP
+    if (hidden % 8u == 0u) {
+        d_hyperconn_pre_rows(post, comb, lin, mixes, res, hsc, hbs, 1u, hidden, sink, eps, hceps,
+                             0u, 1u);
+        if (desc[PLOW_HCT_NORM] == 1u) {
+            __syncthreads();
+            asm volatile("buffer_inv" ::: "memory");
+            __syncthreads();
+            d_rmsnorm((bf16*)T[desc[PLOW_HCT_NOUT]], lin, (const bf16*)T[desc[PLOW_HCT_GAMMA]],
+                      1u, hidden, eps, 0u, 0u, 1u, sm->part, nullptr, nullptr
+#if PLOW_PACKED_PREFILL_MLA_NORM_CONSUMERS || PLOW_PACKED_PREFILL_DENSE_CONSUMERS
+                      , prog_meta, 0u
+#endif
+                      );
+        }
+        return;
+    }
+    if (desc[PLOW_HCT_NORM] != 0u) __builtin_trap();
+#endif
+    d_hyperconn_pre(post, comb, lin, mixes, res, hsc, hbs, 1u, 4u, hidden, sink, eps, hceps, 0u,
+                    1u, sm->part);
 }
 #endif
 
@@ -4232,6 +4334,7 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
                                      (const bf16*)TEN(3), (const bf16*)TEN(4),
                                      (const float*)TEN(5), (const float*)TEN(6), in->i[0],
                                      in->i[1], in->i[2], slice, nblk, (float*)sm->raw);
+                if (in->i[4] == 1u) exec_hc_pre_tail(in, T, nblk, sm, prog_meta);
                 break;
             }
             if (in->i[2] % (8u * PLOW_WAVE) == 0u &&
@@ -4240,10 +4343,11 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
                 d_gemv_f32_wg((float*)TEN(0), (const bf16*)TEN(1), (const float*)TEN(2),
                               in->i[0], in->i[1], in->i[2], slice, nblk,
                               (float*)sm->raw);
+                if (in->i[4] == 1u) exec_hc_pre_tail(in, T, nblk, sm, prog_meta);
                 break;
             }
 #endif
-            if (in->i[3] != 0u) __builtin_trap();
+            if (in->i[3] != 0u || in->i[4] != 0u) __builtin_trap();
             d_gemv_f32((float*)TEN(0), (const bf16*)TEN(1), (const float*)TEN(2), in->i[0], in->i[1],
                        in->i[2], slice, nblk);
             break;
@@ -4313,7 +4417,7 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
              * object reads the bit; the loader refuses the packet on any other. */
             if (in->i[4] & PLOW_KDA_F_FUSED_ARM) {
                 const unsigned* desc = (const unsigned*)TEN(7);
-                if (in->i[0] != 1u || (in->i[4] & PLOW_KDA_F_SEQ_ROWS)) __builtin_trap();
+                if (in->i[0] != 1u) __builtin_trap();
 #pragma unroll
                 for (unsigned i = 0; i <= PLOW_KDA_FUSED_DESC_SCRATCH; ++i)
                     if (desc[i] == PLOW_TENSOR_NONE) __builtin_trap();
@@ -4333,7 +4437,8 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
                     in->i[3], desc[PLOW_KDA_FUSED_DESC_W], in->i[4], in->i[6], in->fj[0].f,
                     in->fj[1].f, __uint_as_float(desc[PLOW_KDA_FUSED_DESC_EPS]), slice, nblk,
                     (float*)sm->raw,
-                    (in->i[4] & PLOW_KDA_F_FB_FOLD) ? (const bf16*)T[in->fj[2].u] : nullptr);
+                    (in->i[4] & PLOW_KDA_F_FB_FOLD) ? (const bf16*)T[in->fj[2].u] : nullptr,
+                    (in->i[4] & PLOW_KDA_F_SEQ_ROWS) ? (const unsigned*)T[in->i[7]] : nullptr);
                 break;
             }
 #endif
@@ -5683,6 +5788,19 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
          * arm also takes t6 (so the fused bridge can skip pad rows) and t7 = the E8M0 scale
          * rows it WRITES, since the bridge is its epilogue rather than a separate op. */
         case PLOW_DOP_MOE_GROUP_GLU_PF:
+#if PLOW_MOE_PF_W8A8_ARM
+            /* i7 = 2: W8A8. t0=fq(fp8 out) t1=xq t6=xs(f32[H/128][T]) t7=fs(out) i4=T. */
+            if (in->i[7] == 2u) {
+                d_moe_pf_w8a8<true>(TEN(0), (float*)TEN(7), (const unsigned char*)TEN(1),
+                                    (const float*)TEN(6), PLOW_RUNTIME_ROWS(in->i[4]),
+                                    (const unsigned long long*)TEN(2),
+                                    (const unsigned long long*)TEN(3), (const int*)TEN(4),
+                                    (const unsigned*)TEN(5), nullptr, in->i[0], in->i[1],
+                                    in->i[2], in->i[5], in->fj[0].f, in->fj[1].f, 0u, slice,
+                                    nblk, (unsigned char*)sm->raw);
+                break;
+            }
+#endif
             d_moe_group_glu_pf((bf16*)TEN(0), (const bf16*)TEN(1),
                                (const unsigned long long*)TEN(2),
                                (const unsigned long long*)TEN(3), (const int*)TEN(4),
@@ -5698,6 +5816,18 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
                                in->i[7]);
             break;
         case PLOW_DOP_MOE_GROUP_DOWN_PF:
+#if PLOW_MOE_PF_W8A8_ARM
+            /* i7 = 2 (f32 part) / 3 (bf16 part): W8A8. t1=fq t5=fs. */
+            if (in->i[7] >= 2u) {
+                d_moe_pf_w8a8<false>(TEN(0), nullptr, (const unsigned char*)TEN(1),
+                                     (const float*)TEN(5), 0u, (const unsigned long long*)TEN(2),
+                                     (const unsigned long long*)TEN(3), (const int*)TEN(4),
+                                     (const unsigned*)TEN(6), (const float*)TEN(7), in->i[0],
+                                     in->i[1], in->i[2], 0u, 0.0f, 0.0f, in->i[7] == 3u, slice,
+                                     nblk, (unsigned char*)sm->raw);
+                break;
+            }
+#endif
             d_moe_group_down_pf((float*)TEN(0), (const bf16*)TEN(1),
                                 (const unsigned long long*)TEN(2),
                                 (const unsigned long long*)TEN(3), (const int*)TEN(4),

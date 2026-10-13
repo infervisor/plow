@@ -10,9 +10,12 @@
 //! per-backend tick body: how many sequences it serves, and what its stop set
 //! is. Everything richer stays inside the variant.
 //!
-//! What is deliberately NOT here: VMM/prefix sharing, the S1 `ModelManager`,
-//! and multi-model residency. Those are CUDA-only today and stay CUDA-only —
-//! an AMD serve is one model, B fixed sequence slots, no paging.
+//! The AMD engine is slotted too (B fixed sequence slots with per-slot prefix
+//! snapshots, packed prefill), and an AMD serve holds several engines: models
+//! and `--dp` ranks, each placed on its own TP group (`AmdServe::load_on`) by
+//! `serve::placement`, all resident. What stays CUDA-only: VMM paging and the
+//! cross-request VMM prefix probe, and the S1 `ModelManager` (VRAM-budgeted
+//! residency switching and eviction).
 
 use std::sync::Arc;
 
@@ -140,6 +143,10 @@ pub trait SeqEngine {
     /// Whether one launch of chunks `rows` costs no more rung rows than running each alone.
     fn pack_pays(&self, _rows: &[u32]) -> bool {
         true
+    }
+    /// Consecutive group sizes a planned pack of chunks `rows` runs as (`PLOW_AMD_PACK_FILL`).
+    fn pack_groups(&self, rows: &[u32]) -> Vec<usize> {
+        vec![rows.len()]
     }
     /// [`Self::advance_packed_prefill`] with decode `feeds` riding as one-row spans;
     /// `output[i]` receives feed `i`'s next token; `Ok(false)` if they did not ride.
@@ -1191,6 +1198,42 @@ mod amd_serve {
         Ok(())
     }
 
+    /// Consecutive group sizes for a pack of chunks `rows` on a prefill ladder `rungs` (ascending).
+    /// A pack filling less than 3/4 of its rung runs as groups that each fit the next narrower
+    /// rung: four 1024-row chunks fill half the 8192 rung but exactly two 2048 rungs.
+    fn split_pack(rows: &[u32], rungs: &[u32]) -> Vec<usize> {
+        let whole = vec![rows.len()];
+        let total: u64 = rows.iter().map(|&r| r as u64).sum();
+        let Some(rung) = rungs.iter().copied().find(|&w| w as u64 >= total) else {
+            return whole;
+        };
+        if total * 4 >= rung as u64 * 3 {
+            return whole;
+        }
+        let Some(lower) = rungs.iter().copied().filter(|&w| w < rung).max() else {
+            return whole;
+        };
+        if rows.iter().any(|&r| r > lower) {
+            return whole;
+        }
+        let mut groups = Vec::new();
+        let (mut n, mut sum) = (0usize, 0u32);
+        for &r in rows {
+            if n > 0 && sum + r > lower {
+                groups.push(n);
+                (n, sum) = (0, 0);
+            }
+            n += 1;
+            sum += r;
+        }
+        groups.push(n);
+        if groups.len() == 1 {
+            whole
+        } else {
+            groups
+        }
+    }
+
     /// `(program, decode rows ride)` for a mixed pack: `combined` covers the prefill spans plus
     /// the decode rows, `prefill_only` the prefill spans alone. The decode rows ride only on the
     /// prefill spans' own rung and within its span table; a pack whose decode rows would outgrow
@@ -2091,6 +2134,8 @@ mod amd_serve {
                     }
                 }
                 self.pos[slot] = prompt.len() as u32;
+                // The isolated prefill tail samples `in.ids[0]` from logits row 0.
+                self.lp_row[slot] = 0;
                 t
             };
             if let Some(diagnostics) = self.diagnostics.as_mut() {
@@ -3427,6 +3472,17 @@ mod amd_serve {
             }
         }
 
+        /// [`split_pack`] over this packet's prefill ladder under `PLOW_AMD_PACK_FILL`.
+        pub fn pack_groups(&self, rows: &[u32]) -> Vec<usize> {
+            if !crate::config::RuntimeConfig::get().amd.pack_fill {
+                return vec![rows.len()];
+            }
+            let mut rungs: Vec<u32> =
+                self.ranks.rank0().prefill_rungs().map(|(_, width)| width).collect();
+            rungs.sort_unstable();
+            split_pack(rows, &rungs)
+        }
+
         /// Whether the live decode rows may ride a packed prefill launch (`PLOW_AMD_MIXED_PACK`).
         pub fn mixed_pack_ready(&self) -> bool {
             crate::config::RuntimeConfig::get().amd_mixed_pack
@@ -4189,6 +4245,7 @@ mod amd_serve {
                         tracing::info!(rung = w, occupied = rows, "decode ladder rung");
                         self.last_rung = w;
                     }
+                    crate::obs::tick::trace_rung(w);
                     e.upload_parked(&self.parked_stage)?;
                     e.seed_ids(&self.next_id)?;
                     let started = measure_dispatch.then(std::time::Instant::now);
@@ -4209,6 +4266,7 @@ mod amd_serve {
                         tracing::info!(rung = w, occupied = rows, "decode ladder rung");
                         self.last_rung = w;
                     }
+                    crate::obs::tick::trace_rung(w);
                     let run = g.decode_prog_advancing(dp, &self.kvlen_stage, &self.parked_stage);
                     if g.rank(0).prog_dense_exact(run) {
                         park_kvlen(&mut self.kvlen_stage, &self.parked_stage);
@@ -4283,7 +4341,7 @@ mod amd_serve {
     mod tests {
         use super::{
             body_respects_plan, cap_chunks_to_bodies, commit_mixed_prefill, commit_packed_prefill,
-            invalidate_prefix_metadata, mixed_cursor_rows, mixed_pack_route,
+            invalidate_prefix_metadata, mixed_cursor_rows, mixed_pack_route, split_pack,
             mixed_prefill_continuation_fits,
             mixed_prefill_padding_fits, multistep_feeds_armable, packable_prefill_step,
             parse_snapshot_tensors, slot_decode_position, snapshot_file_component,
@@ -4292,6 +4350,18 @@ mod amd_serve {
             DEFAULT_SNAPSHOT_TENSORS, MAX_SNAPSHOT_TENSORS,
         };
         use crate::exec::amd::ChunkStep;
+
+        #[test]
+        fn split_pack_fills_the_narrower_rung() {
+            let rungs = [128, 512, 2048, 8192];
+            assert_eq!(split_pack(&[1024; 4], &rungs), vec![2, 2]);
+            assert_eq!(split_pack(&[1024; 3], &rungs), vec![2, 1]);
+            assert_eq!(split_pack(&[1024; 6], &rungs), vec![6]);
+            assert_eq!(split_pack(&[1024; 2], &rungs), vec![2]);
+            assert_eq!(split_pack(&[4096, 1024], &rungs), vec![2]);
+            assert_eq!(split_pack(&[300, 300], &rungs), vec![1, 1]);
+            assert_eq!(split_pack(&[9000], &rungs), vec![1]);
+        }
 
         #[test]
         fn a_body_runs_only_the_attention_kind_its_member_was_planned_on() {
@@ -5347,6 +5417,9 @@ impl SeqEngine for AmdServe {
     }
     fn pack_pays(&self, rows: &[u32]) -> bool {
         AmdServe::pack_pays(self, rows)
+    }
+    fn pack_groups(&self, rows: &[u32]) -> Vec<usize> {
+        AmdServe::pack_groups(self, rows)
     }
     fn advance_packed_mixed(
         &mut self,

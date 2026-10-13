@@ -687,23 +687,25 @@ fn emit_kda_mixer_ex(
     // L3 (`PLOW_KDA_FB_FOLD`): at decode the f_b GEMV folds into `KdaStateStepG`'s prologue.
     // Only the plain Conv3 -> StepG chain carries the arm; f_a's row rides the step's `t4`, the
     // weight its `j1`, and `f_raw` is never declared.
-    let fb_fold = t == 1
-        && !seq_rows
-        && fuse
-        && !chunk
-        && !decode_fused
-        && st.conv_state_alt.is_none()
-        && crate::emit_config::active().kda_fb_fold;
     // L7 (`PLOW_KDA_DECODE_FUSED_ARM`): the same chain as ONE packet on the step's slice map.
     // Composes with the f_b fold (bit 2 + bit 3); everything else the fold excludes, it excludes.
+    // A ladder's one-row program (`seq_rows`, t == 1) takes it too: row 0's state and windows sit
+    // at offset 0 exactly as in the single-sequence program, and the arm honours `parked[0]`.
     let fused_arm = t == 1
-        && !seq_rows
         && fuse
         && !chunk
         && !decode_fused
         && st.conv_state_alt.is_none()
         && crate::emit_config::active().kda_decode_fused_arm
         && c.supports_decode_fused_arm(n_cu);
+    // Under `seq_rows` the fold rides only the fused arm: the per-row StepG has no fold arm.
+    let fb_fold = t == 1
+        && (!seq_rows || fused_arm)
+        && fuse
+        && !chunk
+        && !decode_fused
+        && st.conv_state_alt.is_none()
+        && crate::emit_config::active().kda_fb_fold;
 
     // Activations. q, k and v stay three separate [T, H*D] buffers all the way through: the three
     // projections are independent packets, the three convs are independent packets, and the state
@@ -948,9 +950,13 @@ fn emit_kda_mixer_ex(
             d.i[3] = c.bv;
             // bit0 l2norm, bit2 (PLOW_KDA_F_FB_FOLD) t4 = f_a / j1 = W_fb, bit3
             // (PLOW_KDA_F_FUSED_ARM) the fused chain with t7 = the descriptor.
-            d.i[4] = 1 | if fb_fold { 4 } else { 0 } | 8;
+            d.i[4] = 1 | if seq_rows { 2 } else { 0 } | if fb_fold { 4 } else { 0 } | 8;
             d.i[5] = w.dt_bias;
             d.i[6] = gate_mode;
+            // bit1 (seq_rows, t == 1): `i[7]` is the parked mask, read only under that flag.
+            if let Some(pk) = parked {
+                d.i[7] = pk;
+            }
             d.f[0] = scale;
             d.f[1] = lower_bound;
             if fb_fold {

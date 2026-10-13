@@ -55,6 +55,22 @@ case "${FA_MLA_PF2_DEFER:-}" in
 esac
 [ -z "${FA_MLA_PF2_FRAME:-}" ] || FLASH_TR16="$FLASH_TR16 -DFA_MLA_PF2_FRAME=$FA_MLA_PF2_FRAME"
 [ -z "${FA_MLA_PF2_FASTBF:-}" ] || FLASH_TR16="$FLASH_TR16 -DFA_MLA_PF2_FASTBF=$FA_MLA_PF2_FASTBF"
+# PLOW_MLA_PF2_DPP=1: the V2 softmax's 16-lane butterflies as DPP moves (bit-identical).
+case "${PLOW_MLA_PF2_DPP:-0}" in
+  0) ;;
+  1) FLASH_TR16="$FLASH_TR16 -DPLOW_MLA_PF2_DPP=1" ;;
+  *) echo "PLOW_MLA_PF2_DPP must be 0 or 1" >&2; exit 2 ;;
+esac
+# PLOW_KDA_CARRY_PIPE=1 / PLOW_KDA_CARRY_KTR16=1: regstate KDA carry load schedule and
+# transposed key-tile reads (op_kda_carry_regstate.h; both bit-identical).
+KDA_CARRY_DEFS=""
+for k in PLOW_KDA_CARRY_PIPE PLOW_KDA_CARRY_KTR16; do
+  case "${!k:-0}" in
+    0) ;;
+    1) KDA_CARRY_DEFS="$KDA_CARRY_DEFS -D$k=1" ;;
+    *) echo "$k must be 0 or 1" >&2; exit 2 ;;
+  esac
+done
 case "${PLOW_MLA_SPARSE:-0}" in
   0) ;;
   1) [ "${PLOW_MLA_PF_TR16:-0}" = 1 ] || { echo "PLOW_MLA_SPARSE=1 requires PLOW_MLA_PF_TR16=1" >&2; exit 2; }
@@ -303,6 +319,15 @@ if [ -n "$NOPE_FLASH" ] && [ -z "${PLOW_MLA_PF_TR16:-}" ] &&
    grep -Eq '^#define PLOW_PACKET_OBJECT_REQUIRES "([^"]* )?PLOW_K3=1( |")' "$PLOW_HSACO_CONFIG"; then
   FLASH_TR16="-DPLOW_MLA_PF_SV=1 -DPLOW_MLA_PF_TR16=1 $FLASH_TR16"
 fi
+# GLM-5.3-Flash (NoPE + K3 packet) gets the arms qualified on it alone. PLOW_GEMV_F32_VEC: the
+# 8-wide GEMV walks (op_gemm_common.h) reassociate the f32 sums of every object's mHC mix and
+# router GEMVs, so they are qualified per model.
+GLM53_FLASH=0
+if [ -n "$NOPE_FLASH" ] &&
+   grep -Eq '^#define PLOW_PACKET_OBJECT_REQUIRES "([^"]* )?PLOW_K3=1( |")' "$PLOW_HSACO_CONFIG"; then
+  GLM53_FLASH=1
+  INC="$INC -DPLOW_GEMV_F32_VEC=1"
+fi
 if [ -n "${PLOW_HSACO_CONFIG:-}" ] && [ "${PLOW_DSA_PREP:-0}" = 0 ] &&
    grep -Eq '^#define PLOW_PACKET_OBJECT_REQUIRES "([^"]* )?PLOW_DSA_PREP=1( |")' "$PLOW_HSACO_CONFIG"; then
   A4W4_BK="$A4W4_BK -DPLOW_DSA_PREP=1"
@@ -504,7 +529,7 @@ if [ "$ARCH" = gfx950 ] && [ "$need_kda_carry_regstate" = 1 ]; then
     "$OUT/kda_chunk_carry_regstate_gfx950.elf" \
     plow_kda_chunk_carry_regstate_gfx950 256 1 \
     $INC -DPLOW_LEAN_OBJECT=1 -DPLOW_NO_SPILL=1 -DPLOW_NO_SGPR_SPILL=1 \
-    -DPLOW_REQUIRED_MARKER=plow_kda_carry_regstate_abi_1 \
+    -DPLOW_REQUIRED_MARKER=plow_kda_carry_regstate_abi_1 $KDA_CARRY_DEFS \
     "$R/amd/kda_chunk_carry_regstate.hip"
   KDA_CARRY_REGSTATE_ELFS="kda_chunk_carry_regstate_gfx950.elf"
 fi
@@ -566,7 +591,7 @@ if [ "$ARCH" = gfx950 ] && [ "$need_kda_carry_keyfeed" = 1 ]; then
     "$OUT/kda_chunk_carry_regstate_keyfeed_gfx950.elf" \
     plow_kda_chunk_carry_regstate_keyfeed_gfx950 256 1 \
     $INC -DPLOW_LEAN_OBJECT=1 -DPLOW_NO_SPILL=1 -DPLOW_NO_SGPR_SPILL=1 \
-    -DPLOW_REQUIRED_MARKER=plow_kda_carry_keyfeed_abi_1 \
+    -DPLOW_REQUIRED_MARKER=plow_kda_carry_keyfeed_abi_1 $KDA_CARRY_DEFS \
     "$R/amd/kda_chunk_carry_regstate_keyfeed.hip"
   KDA_CARRY_KEYFEED_ELFS="kda_chunk_wu_lean_keys_gfx950.elf kda_chunk_carry_regstate_keyfeed_gfx950.elf"
 fi
@@ -1099,10 +1124,10 @@ case "${PLOW_K3_PF_ALIGN_WAVES:-1}" in
 esac
 # PLOW_K3_PF_XR_SCHED=aiter (opt-in, default off): the 16-byte collective schedule (bit-identical
 # data movement, op_collective.h) on capped workgroups — two-shot NWG/NWG_RS, seam reduce-scatter
-# NWG_SRS, seam all-gather NWG_SAG. PLOW_K3_PF_FOLD_TB (default 8; 0 rolls back): the token-blocked
-# MlaMergeFold (op_attention_common.h). The gfx950 V=128 oracle saw packed-FMA rounding moves, so
-# it is qualified per model: GLM-5.3-Flash (V=256) validate streams byte-equal at every rung and
-# 4k-60k prompts, fold 9.8 -> 3.8 ms at 4k.
+# NWG_SRS, seam all-gather NWG_SAG. PLOW_K3_PF_FOLD_TB (default 8 on GLM-5.3-Flash packets, 0 on
+# other K3 packets; 0 rolls back): the token-blocked MlaMergeFold (op_attention_common.h). The
+# gfx950 V=128 oracle saw packed-FMA rounding moves, so it is qualified per model: GLM-5.3-Flash
+# (V=256) validate streams byte-equal at every rung and 4k-60k prompts, fold 9.8 -> 3.8 ms at 4k.
 case "${PLOW_K3_PF_XR_SCHED:-0}" in
   0) ;;
   aiter) K3_PF_MOE="$K3_PF_MOE -DPLOW_XR_SCHED_AITER=1 -DPLOW_XR_SCHED_NWG=${PLOW_XR_SCHED_NWG:-48} -DPLOW_XR_SCHED_NWG_RS=${PLOW_XR_SCHED_NWG_RS:-16} -DPLOW_XR_SCHED_NWG_SRS=${PLOW_XR_SCHED_NWG_SRS:-16} -DPLOW_XR_SCHED_NWG_SAG=${PLOW_XR_SCHED_NWG_SAG:-48}" ;;
@@ -1117,9 +1142,11 @@ case "${PLOW_K3_PF_SP_VEC:-0}" in
   2|4|8) K3_PF_MOE="$K3_PF_MOE -DPLOW_XR_SP_VEC=$PLOW_K3_PF_SP_VEC" ;;
   *) echo "PLOW_K3_PF_SP_VEC must be 0, 2, 4 or 8" >&2; exit 2 ;;
 esac
-case "${PLOW_K3_PF_FOLD_TB:-8}" in
+FOLD_TB_DEFAULT=0
+if [ "$GLM53_FLASH" = 1 ]; then FOLD_TB_DEFAULT=8; fi
+case "${PLOW_K3_PF_FOLD_TB:-$FOLD_TB_DEFAULT}" in
   0|1) ;;
-  2|4|8) K3_PF_MOE="$K3_PF_MOE -DPLOW_MLA_FOLD_TB=${PLOW_K3_PF_FOLD_TB:-8}" ;;
+  2|4|8) K3_PF_MOE="$K3_PF_MOE -DPLOW_MLA_FOLD_TB=${PLOW_K3_PF_FOLD_TB:-$FOLD_TB_DEFAULT}" ;;
   *) echo "PLOW_K3_PF_FOLD_TB must be 0, 2, 4 or 8" >&2; exit 2 ;;
 esac
 # PLOW_MOE_PF_DEEP (default 1; =0 rolls back): two raw register stages over the LDS ping-pong in
