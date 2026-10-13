@@ -2,6 +2,7 @@
 
 pub mod dstep;
 pub mod host;
+pub mod logwriter;
 pub mod pfx;
 pub mod serving;
 pub mod tick;

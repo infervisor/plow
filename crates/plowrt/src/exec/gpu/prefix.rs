@@ -709,7 +709,7 @@ impl GpuEngine {
         let att = kv.try_attach_keyed(b, prompt, key.or(staged))?;
         let attached = att.is_some();
         let att_rows = att.as_ref().map(|a| a.rows).unwrap_or(0);
-        tracing::info!(
+        tracing::debug!(
             slot = b,
             prompt = prompt.len(),
             attached,
@@ -743,7 +743,7 @@ impl GpuEngine {
         // appended by prefill completion (full prompt) or per decode feed.
         self.seq_tokens[b].clear();
         self.seq_tokens[b].extend_from_slice(&prompt[..a.rows as usize]);
-        tracing::info!(
+        tracing::debug!(
             slot = b,
             rows = a.rows,
             prompt = prompt.len(),
@@ -826,7 +826,7 @@ impl GpuEngine {
             return false;
         }
         if !v.slide.is_empty() && rows - p_a > v.ring as u32 - g.window {
-            tracing::info!(
+            tracing::debug!(
                 slot = b,
                 rows,
                 p_a,
@@ -850,10 +850,10 @@ impl GpuEngine {
         if let Err(e) = kv.publish_at(b, toks, p_a, snap_bytes, |dst| {
             self.vmm_snap_copy(b, p_a, dst, true)
         }) {
-            tracing::info!(error = %e, slot = b, p_a, "vmm: publish_boundary skipped");
+            tracing::debug!(error = %e, slot = b, p_a, "vmm: publish_boundary skipped");
             false
         } else {
-            tracing::info!(slot = b, p_a, snap_bytes, "vmm: published successfully");
+            tracing::debug!(slot = b, p_a, snap_bytes, "vmm: published successfully");
             true
         }
     }
@@ -873,13 +873,15 @@ impl GpuEngine {
         let session = self.session_pin[b].is_some();
         let prompt = kv.prompt_rows(b);
         let prompt_end = is_prompt_end(rows, max_rows, prompt);
-        let max_rows = if session && prompt_end {
+        // Every prompt end, not only a session's: a chat client's next turn re-renders the same
+        // last rows whether or not it names a session.
+        let max_rows = if prompt_end {
             session_prompt_end(prompt)
         } else {
             max_rows
         };
         let p_a = (rows.min(max_rows) / 32) * 32;
-        tracing::info!(
+        tracing::debug!(
             slot = b,
             rows,
             toks_len = toks.len(),
@@ -890,7 +892,7 @@ impl GpuEngine {
             "vmm_publish entered"
         );
         if rows == 0 || toks.len() != rows as usize {
-            tracing::info!(
+            tracing::debug!(
                 slot = b,
                 rows,
                 toks_len = toks.len(),
@@ -899,7 +901,7 @@ impl GpuEngine {
             return;
         }
         if p_a == 0 {
-            tracing::info!(slot = b, p_a, "vmm_publish skipped: p_a == 0");
+            tracing::debug!(slot = b, p_a, "vmm_publish skipped: p_a == 0");
             return;
         }
         if session {
@@ -943,9 +945,10 @@ impl GpuEngine {
         }
         // Turn end: pressure may have evicted the prompt end (the next turn's attach point)
         // while this turn decoded. The rings still hold its window, so restore it now, newest in
-        // LRU just before the session's next request; a surviving one is only touched.
+        // LRU just before the next request; a surviving one is only touched. A client without
+        // `X-Session-Id` continues its conversation the same way.
         let end = session_prompt_end(prompt) / 32 * 32;
-        if session && rows > prompt && end > 0 && end < p_a {
+        if rows > prompt && end > 0 && end < p_a {
             self.publish_boundary(b, end);
         }
     }
@@ -998,7 +1001,7 @@ impl GpuEngine {
     }
 }
 
-/// Rows a session's prompt-end boundary may cover: its next turn re-renders the last few prompt
+/// Rows a prompt-end boundary may cover: the next turn re-renders the last few prompt
 /// rows (Gemma 4 drops the generation prompt's empty thought channel, 4 tokens), so a boundary
 /// within them never attaches — about one turn in eight missed that way.
 const SESSION_PROMPT_REWRITE: u32 = 8;

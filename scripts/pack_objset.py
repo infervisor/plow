@@ -82,7 +82,9 @@ def build(args) -> dict:
     # Pinned vendor code objects (AITER fmoe / MLA `.co`) are loaded by plow's own adapters and are
     # part of the set: a set without the 64-row fmoe object serves the 32x256 MoE tile, and one
     # without the QH8 object refuses the sparse MLA routes. They carry no plow markers and no packet
-    # stamp (each adapter script pins its own sha256), so identity is the digest alone.
+    # stamp (each adapter script pins its own sha256), so identity is the digest alone. The entry
+    # is an ordinary object: `ObjSetObject` denies unknown fields, so a marker here would make the
+    # whole objset unreadable to `plowrt pack` and the registry.
     for p in sorted(p for p in objdir.glob("*.co") if p.is_file()):
         objects.append(
             {
@@ -90,7 +92,6 @@ def build(args) -> dict:
                 "sha256": pd.sha256_file(p),
                 "bytes": p.stat().st_size,
                 "arms": [],
-                "vendor": True,
             }
         )
 
@@ -231,7 +232,8 @@ def self_test() -> None:
             (d / "fmoe.co").write_bytes(b"\x7fELF-vendor")
             five = build(args)
             vendor = [o for o in five["objects"] if o["name"] == "fmoe.co"]
-            assert vendor and vendor[0]["vendor"] and vendor[0]["arms"] == [], five["objects"]
+            assert vendor and vendor[0]["arms"] == [], five["objects"]
+            assert set(vendor[0]) == {"name", "sha256", "bytes", "arms"}, "ObjSetObject's fields only"
             assert "packet_hash" not in vendor[0], "vendor objects carry no packet stamp"
             assert five["objset_id"] != one["objset_id"], "dropping a .co must change the id"
             (d / "fmoe.co").unlink()

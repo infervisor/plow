@@ -2091,6 +2091,8 @@ mod amd_serve {
                     }
                 }
                 self.pos[slot] = prompt.len() as u32;
+                // The isolated prefill tail samples `in.ids[0]` from logits row 0.
+                self.lp_row[slot] = 0;
                 t
             };
             if let Some(diagnostics) = self.diagnostics.as_mut() {
