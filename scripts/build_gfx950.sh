@@ -145,6 +145,9 @@ case "${PLOW_XR_DEC_MLP:-1}" in
 esac
 # PLOW_XR_DEC_VEC (default 0 = off; 2/4/8): the decode one-shot reduce loads that many bf16 per
 # peer per thread (PLOW_XR_VEC, op_collective.h) for the batched rungs' gate path. Bit-identical.
+# MEASURED SLOWER, keep 0 (tp_allreduce_bench cold, 8x MI350X, [128,4096] at 256 WGs: 52.3 us
+# scalar vs 59.6 (V=4) / 59.0 (V=8)). The lever there is fewer workgroups: PLOW_XR_DEC_CUS=64
+# gives 31.3 us (B=32 shape 27.1 -> 15.6, B=8 18.5 -> 11.5).
 case "${PLOW_XR_DEC_VEC:-0}" in
   0) ;;
   2|4|8) DEC_KNOBS="$DEC_KNOBS -DPLOW_XR_VEC=$PLOW_XR_DEC_VEC" ;;
@@ -152,6 +155,7 @@ case "${PLOW_XR_DEC_VEC:-0}" in
 esac
 # PLOW_XR_TAG_SLOT (default 20480; bytes, multiple of 256): the tagged one-shot slot of the decode
 # objects. 90112 lets B=8 x hidden 4096 take the tagged path. Serve with the same PLOW_XR_TAG_SLOT.
+# Bench (cold, 64 WGs): B=8 message 11.5 us gate -> 7.6 us tagged; B=32 15.9 -> 15.3 (no gain).
 case "${PLOW_XR_TAG_SLOT:-20480}" in
   20480) ;;
   *[!0-9]*) echo "PLOW_XR_TAG_SLOT must be a byte count" >&2; exit 2 ;;
@@ -1106,6 +1110,8 @@ case "${PLOW_K3_PF_XR_SCHED:-0}" in
 esac
 # PLOW_K3_PF_SP_VEC (default 0; 2/4/8): the seq-par seam reduce-scatter/all-gather (ops 25/26)
 # move that many bf16 per peer access (PLOW_XR_SP_VEC, op_collective.h). Bit-identical.
+# MEASURED, keep 0: rs+ag at 1024 rows 106.6 -> 94.0 us (V=8) but 4096 rows 244.6 -> 362.6 and
+# 8192 rows 416.7 -> 720.9 (tp_allreduce_prefill_bench TP_PHASES, hidden 4096, 256 WGs).
 case "${PLOW_K3_PF_SP_VEC:-0}" in
   0) ;;
   2|4|8) K3_PF_MOE="$K3_PF_MOE -DPLOW_XR_SP_VEC=$PLOW_K3_PF_SP_VEC" ;;
