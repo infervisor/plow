@@ -4805,9 +4805,15 @@ fn run_one_tick(
                         let pack_rows: u32 = packed.iter().map(|span| span.n_rows).sum();
                         b2b_used = b2b_used.saturating_add(pack_rows);
                         crate::obs::tick::prefill(t_pf.elapsed().as_nanos() as u64, pack_rows);
+                        // Prompts the pack completed have no cursor left; their sampled
+                        // tokens are handled below.
+                        let finished = e.take_packed_tokens();
                         if result.is_ok() {
                             match amd_packed_frontier_updates(
-                                packed.iter().map(|span| span.slot as usize),
+                                packed
+                                    .iter()
+                                    .map(|span| span.slot as usize)
+                                    .filter(|&i| finished.iter().all(|&(f, _)| f != i)),
                                 |i| e.prefill_frontier(i),
                             ) {
                                 Ok(updates) => {
@@ -4872,7 +4878,7 @@ fn run_one_tick(
                                         s.cached_tokens = e.cached_rows(i);
                                     }
                                 }
-                                for (i, token) in e.take_packed_tokens() {
+                                for (i, token) in finished {
                                     if let Some(s) = slots[i].as_mut() {
                                         s.pf_pos = s.prompt_ids.len();
                                     }

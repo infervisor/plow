@@ -498,6 +498,10 @@ const PACKED_PREFILL_DEFAULT: Default = Default::Production {
             ]),
             value: TRUE,
         },
+        DefaultCase {
+            when: F::And(&[F::Target(T::Cap("glm53")), F::Target(T::Arch("gfx950"))]),
+            value: TRUE,
+        },
     ],
     otherwise: Val::Unset,
 };

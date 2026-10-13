@@ -1069,6 +1069,7 @@ __device__ void d_kda_chunk_prepare_packed_bt64(
     bf16* q, bf16* k, float* g_prefix, float* beta, const bf16* g_raw,
     const bf16* beta_raw, const float* A_log, const float* dt_bias, unsigned H, unsigned D,
     unsigned mode, float lb, unsigned slice, unsigned nblk, const PlowProgram* prog) {
+    size_t off = 0;
     for (unsigned si = 0; si < prog->n_prefill_spans; ++si) {
         const PlowPrefillSpan* span = plow_packed_prefill_span(prog, si);
         const size_t rd = (size_t)span->row0 * H * D;
@@ -1076,7 +1077,8 @@ __device__ void d_kda_chunk_prepare_packed_bt64(
         d_kda_chunk_prepare_bt64(q + rd, k + rd, g_prefix + rd, beta + rh, g_raw + rd,
                                  beta_raw + rh, A_log, dt_bias, nullptr,
                                  (span->n_rows + 63u) / 64u, span->n_rows, H, D, mode, lb,
-                                 slice, nblk);
+                                 plow_packed_span_slice(slice, nblk, off), nblk);
+        off += ((size_t)span->n_rows * H + PLOW_WAVES - 1u) / PLOW_WAVES;
     }
 }
 
@@ -1084,6 +1086,7 @@ __device__ void d_kda_chunk_intra_packed_bt64(
     float* Aqk, float* Ainv, const bf16* q, const bf16* k, const float* g_prefix,
     const float* beta, unsigned H, unsigned D, float scale, unsigned slice, unsigned nblk,
     float* mat, const PlowProgram* prog) {
+    size_t off = 0;
     for (unsigned si = 0; si < prog->n_prefill_spans; ++si) {
         const PlowPrefillSpan* span = plow_packed_prefill_span(prog, si);
         const size_t rd = (size_t)span->row0 * H * D;
@@ -1091,7 +1094,9 @@ __device__ void d_kda_chunk_intra_packed_bt64(
         const size_t ra = (size_t)span->row0 * H * 64u;
         d_kda_chunk_intra_bt64(Aqk + ra, Ainv + ra, q + rd, k + rd, g_prefix + rd,
                                beta + rh, nullptr, (span->n_rows + 63u) / 64u,
-                               span->n_rows, H, D, scale, slice, nblk, mat);
+                               span->n_rows, H, D, scale,
+                               plow_packed_span_slice(slice, nblk, off), nblk, mat);
+        off += (size_t)((span->n_rows + 63u) / 64u) * H;
     }
 }
 
@@ -1099,6 +1104,8 @@ __device__ void d_kda_chunk_wu_packed_bt64(
     bf16* W, bf16* U, bf16* q, const float* Ainv, const bf16* k, const bf16* v,
     const float* g_prefix, const float* beta, unsigned H, unsigned D, unsigned V,
     float scale, bool q_precompute, unsigned slice, unsigned nblk, const PlowProgram* prog) {
+    const unsigned otiles = (D + 15u) / 16u + (V + 15u) / 16u;
+    size_t off = 0;
     for (unsigned si = 0; si < prog->n_prefill_spans; ++si) {
         const PlowPrefillSpan* span = plow_packed_prefill_span(prog, si);
         const size_t rd = (size_t)span->row0 * H * D;
@@ -1108,7 +1115,9 @@ __device__ void d_kda_chunk_wu_packed_bt64(
         d_kda_chunk_wu_bt64(W + rd, U + rv, q ? q + rd : nullptr, Ainv + ra, k + rd,
                             v + rv, g_prefix + rd, beta + rh, nullptr,
                             (span->n_rows + 63u) / 64u, span->n_rows, H, D, V, scale,
-                            q_precompute, slice, nblk);
+                            q_precompute, plow_packed_span_slice(slice, nblk, off), nblk);
+        off += ((size_t)((span->n_rows + 63u) / 64u) * H * 4u * otiles + PLOW_WAVES - 1u) /
+               PLOW_WAVES;
     }
 }
 
@@ -1122,8 +1131,10 @@ __device__ void d_kda_chunk_carry_packed_bt64(
     for (unsigned si = 0; si < prog->n_prefill_spans; ++si) {
         const PlowPrefillSpan* span = plow_packed_prefill_span(prog, si);
         float* ss = state + (size_t)span->state_slot * H * V * D;
+        /* The reset and the carry share one item map, so a tile is zeroed by its carrier. */
+        const unsigned rs = plow_packed_span_slice(slice, nblk, (size_t)si * H * vtiles);
         if (span->flags & PLOW_PREFILL_SPAN_RESET_STATE) {
-            for (size_t item = slice; item < (size_t)H * vtiles; item += nblk) {
+            for (size_t item = rs; item < (size_t)H * vtiles; item += nblk) {
                 const unsigned vt = (unsigned)(item % vtiles);
                 const unsigned vv = min(16u, V - vt * 16u);
                 const size_t base = ((item / vtiles) * V + vt * 16u) * D;
@@ -1136,7 +1147,7 @@ __device__ void d_kda_chunk_carry_packed_bt64(
         const size_t ra = (size_t)span->row0 * H * 64u;
         d_kda_chunk_carry_bt64<Q_PRECOMPUTED>(
             out + rv, ss, q + rd, k + rd, W + rd, U + rv, Aqk + ra, g_prefix + rd,
-            nullptr, (span->n_rows + 63u) / 64u, span->n_rows, H, D, V, scale, slice,
+            nullptr, (span->n_rows + 63u) / 64u, span->n_rows, H, D, V, scale, rs,
             nblk, st, vsm, osm);
     }
 }
@@ -1986,9 +1997,10 @@ __device__ void d_kda_state_step_packed(
     for (unsigned si = 0; si < prog->n_prefill_spans; ++si) {
         const PlowPrefillSpan* span = plow_packed_prefill_span(prog, si);
         float* ss = state + (size_t)span->state_slot * H * D * D;
+        const unsigned rs = plow_packed_span_slice(slice, nblk, (size_t)si * H * (D / BV));
         if (span->flags & PLOW_PREFILL_SPAN_RESET_STATE) {
             const unsigned vb = D / BV;
-            for (unsigned it = slice; it < H * vb; it += nblk) {
+            for (unsigned it = rs; it < H * vb; it += nblk) {
                 const unsigned h = it / vb, v0 = (it % vb) * BV;
                 for (unsigned d = threadIdx.x; d < D; d += PLOW_THREADS)
                     for (unsigned j = 0; j < BV; ++j)
@@ -2001,13 +2013,13 @@ __device__ void d_kda_state_step_packed(
         if constexpr (GATED)
             d_kda_state_step_g(o + rd, q + rd, k + rd, v + rd, g_raw + rd,
                                beta_raw + rh, a_log, dt_bias, gate_mode, lb, ss, span->n_rows,
-                               H, D, BV, flags & ~PLOW_KDA_F_SEQ_ROWS, scale, slice, nblk, lds,
+                               H, D, BV, flags & ~PLOW_KDA_F_SEQ_ROWS, scale, rs, nblk, lds,
                                0u, nullptr);
         else
             d_kda_state_step(o + rd, q + rd, k + rd, v + rd,
                              g ? g + rd : nullptr, beta ? beta + rh : nullptr, ss,
                              span->n_rows, H, D, BV, flags & ~PLOW_KDA_F_SEQ_ROWS, scale,
-                             slice, nblk, lds, 0u, nullptr);
+                             rs, nblk, lds, 0u, nullptr);
     }
 }
 #undef PLOW_KDA_STEP_RUNGS

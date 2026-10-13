@@ -1116,14 +1116,22 @@ fn emit_glm53_packed_tail(
     let vocab_l = glm_vocab_l(c);
     let term = b.tensor("in.pf_term", u64::from(terms) * 4);
     let xs = b.tensor("act.pf_term_x", u64::from(terms) * u64::from(c.hidden) * 2);
-    let c_f = b.emit(DevOp::RmsNorm, pf_wide_cus(b.n_cu(), rows), dep, |d| {
-        d.t[0] = n.xn;
-        d.t[1] = n.x;
-        d.t[2] = n.fin;
-        d.i[0] = rows;
-        d.i[1] = c.hidden;
-        d.f[0] = c.eps;
-    });
+    // Sequence-parallel seams: `n.x` is valid on this rank's band only.
+    let c_f = if glm_sp(c, n, b, rows) {
+        let xr = xr_cus_capped(b.n_cu(), &all);
+        glm_sp_norm_gather(
+            b, n, rows, c.tp, c.hidden, c.eps, n.xn, n.x, n.fin, dep, xgate, &xr,
+        )
+    } else {
+        b.emit(DevOp::RmsNorm, pf_wide_cus(b.n_cu(), rows), dep, |d| {
+            d.t[0] = n.xn;
+            d.t[1] = n.x;
+            d.t[2] = n.fin;
+            d.i[0] = rows;
+            d.i[1] = c.hidden;
+            d.f[0] = c.eps;
+        })
+    };
     let c_g = b.emit(DevOp::RowGather, all.clone(), &[c_f], |d| {
         d.t[0] = xs;
         d.t[1] = n.xn;
@@ -1244,8 +1252,8 @@ pub(crate) fn glm53_emit_full(
     // PACKED-PREFILL SIBLINGS (`PLOW_EMIT_PACKED_PREFILL=1`, as GLM-5.2 and K3 emit them): the
     // same buckets with the family segment split, so several prompts' chunks share one launch
     // (per-span KDA/MLA arms on the packed family objects) and every span's last row samples.
-    // The lean KDA chunk objects are single-sequence and the mHC seq-par seam is off under
-    // packing (`glm_sp`), so neither is asked for. Unset ⇒ byte-identical blob.
+    // The lean KDA chunk objects are single-sequence, so they are not asked for; the mHC seq-par
+    // seams stay on (`glm_sp`). Unset ⇒ byte-identical blob.
     if crate::emit_is_amd() && ec.packed_prefill_on() {
         for &rows in &pf {
             let mut b = Builder::new(n_cu);
@@ -6638,13 +6646,18 @@ const GLM_SP_MIN_ROWS: u32 = 2048;
 /// A token-batch body takes its bucket's seams: every seam op is row-local between the
 /// reduce-scatter and the all-gather, so rows of different requests and the leading decode band
 /// (rank 0's row band) need nothing special. Without them the 8192 body ran full-width two-shots
-/// and served +114 ms per middle chunk against the seams prefill program (tier 4, tb-t4). Packed
-/// prefill siblings without a band keep the two-shot seams.
+/// and served +114 ms per middle chunk against the seams prefill program (tier 4, tb-t4). The
+/// GLM-5.3 packed siblings (KDA hybrid, `softmax_layers` non-empty) take them for the same
+/// reason: spans are packed from row 0, so a band's rows hold whole spans' rows or parked ones,
+/// and the packed norm arm's row mask, read at band-local rows, only ever skips parked rows.
+/// Other packed siblings without a band keep the two-shot seams.
 fn glm_sp(c: &GlmCfg, n: &GlmTn, b: &Builder, t: u32) -> bool {
     n.h2_tp != TENSOR_NONE
         && t >= GLM_SP_MIN_ROWS
         && t % c.tp == 0
-        && (!b.packed_prefill_segments() || b.token_batch_band().is_some())
+        && (!b.packed_prefill_segments()
+            || b.token_batch_band().is_some()
+            || !c.softmax_layers.is_empty())
         && !emit_config::active().no_xreduce
 }
 

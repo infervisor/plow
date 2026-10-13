@@ -2983,8 +2983,11 @@ __device__ __forceinline__ void exec_flash_mla_prefill_v2_packed(
     const bool ofold = FP8 ? false : ((in->i[6] >> 8) & 1u) != 0u;
     if (ofold && ns != 1u) __builtin_trap();
     const unsigned window = DR == 0 ? (in->i[3] & 0x7fffffffu) : in->i[3];
+    size_t off = 0;
     for (unsigned si = 0; si < prog->n_prefill_spans; ++si) {
         const PlowPrefillSpan* s = plow_packed_prefill_span(prog, si);
+        const unsigned rs = plow_packed_span_slice(slice, nblk, off);
+        off += (size_t)((s->n_rows + 63u) / 64u) * in->i[1] * ns;
         const size_t prow = (size_t)s->row0 * in->i[1] * ns;
         /* The W_ofold epilogue writes bf16 rows into the same allocation. */
         float* op = ofold ? (float*)((bf16*)TEN(0) + prow * 512u) : (float*)TEN(0) + prow * 512u;
@@ -2998,7 +3001,7 @@ __device__ __forceinline__ void exec_flash_mla_prefill_v2_packed(
         const float* ks = FP8 ? (const float*)TEN(7) + (size_t)s->slot * in->i[2] : nullptr;
         d_flash_mla_prefill_v2<512, DR, /*GATHER=*/false, FP8>(
             op, ml, qa, qr, (const bf16*)ck, kr, plow_packed_span_kv_len(prog, s, (const int*)TEN(6)), 1u,
-            s->n_rows, in->i[1], in->i[2], window, in->fj[0].f, in->i[5], slice, nblk,
+            s->n_rows, in->i[1], in->i[2], window, in->fj[0].f, in->i[5], rs, nblk,
             lds, nullptr, 0u, ns, ofold, ks, FP8 ? in->i[6] : 0u);
     }
 #undef TEN

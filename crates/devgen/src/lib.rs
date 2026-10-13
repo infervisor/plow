@@ -8340,6 +8340,9 @@ struct EmitCapabilities {
     /// next family to grow it must not silently inherit a recipe qualified on GLM's weights,
     /// geometry and kernels.
     glm: bool,
+    /// GLM-5.3 (`glm5_next`, `mla::glm53_emit_full`): its gfx950 serve path mixes decode rows
+    /// into packed prefill launches, so the packed siblings are part of its default topology.
+    glm53: bool,
     /// Routed experts in `config.json` (`num_experts`, `num_local_experts`, `n_routed_experts`).
     moe: bool,
     /// Full-attention layers at head dim 512 (`config.json` `global_head_dim`): the hybrid
@@ -8358,6 +8361,7 @@ impl EmitCapabilities {
             ("decode_ladder", self.decode_ladder),
             ("packed_prefill_siblings", self.packed_prefill_siblings),
             ("glm", self.glm),
+            ("glm53", self.glm53),
             ("moe", self.moe),
             ("full_attn_hd512", self.full_attn_hd512),
         ]
@@ -8397,6 +8401,7 @@ fn emit_capabilities(model_type: &str) -> EmitCapabilities {
         decode_ladder: dense || model_type == "gpt_oss",
         packed_prefill_siblings: matches!(model_type, "glm_moe_dsa" | "glm5_next"),
         glm: matches!(model_type, "glm_moe_dsa" | "glm5_next"),
+        glm53: model_type == "glm5_next",
         moe: false,
         full_attn_hd512: false,
     }
@@ -8533,7 +8538,10 @@ fn apply_production_defaults(
     // ordinary programs are byte-identical with or without them (`glm_tests`), so the packet
     // can carry them by default. The serve side arms its packed route from their presence.
     // `--emit-packed-prefill=false` is the rollback and a replayed recipe keeps its own value.
-    if capabilities.packed_prefill_siblings && arch == "gfx942" {
+    // GLM-5.3 on gfx950 likewise: its serve path rides decode rows on the packed launches.
+    if capabilities.packed_prefill_siblings
+        && (arch == "gfx942" || (capabilities.glm53 && arch == "gfx950"))
+    {
         cfg.packed_prefill_default = true;
         if cfg.emit_packed_prefill.is_none() {
             emit_config::note_production_default("emit_packed_prefill", "true".into());

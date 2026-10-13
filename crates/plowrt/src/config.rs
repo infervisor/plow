@@ -593,10 +593,10 @@ pub struct RuntimeConfig {
     #[arg(long = "pf-back-to-back", env = "PLOW_PF_BACK_TO_BACK", hide = true, default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub pf_back_to_back: bool,
 
-    /// Expert (AMD TP, span-sampling packed prefill): the live decode rows ride the tick's first
-    /// packed prefill launch as one-row spans (the H100 unified token batch's lowering), and the
-    /// separate decode step is skipped for that tick. Off: prefill launches, then a decode step.
-    #[arg(long = "amd-mixed-pack", env = "PLOW_AMD_MIXED_PACK", hide = true, default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    /// AMD span-sampling packed prefill: the live decode rows ride the tick's packed prefill
+    /// launches as one-row spans (the H100 unified token batch's lowering), and the separate
+    /// decode step is skipped for that tick. `=0` rollback: prefill launches, then a decode step.
+    #[arg(long = "amd-mixed-pack", env = "PLOW_AMD_MIXED_PACK", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub amd_mixed_pack: bool,
 
     /// Expert (AMD prefix cache): a prompt sharing no cached prefix snapshots its recurrent state
