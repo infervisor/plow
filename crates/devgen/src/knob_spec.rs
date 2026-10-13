@@ -170,6 +170,16 @@ const C_INDEXER_WQ_W8A8: &[Constraint] = &[Constraint {
     check: Check::Site,
 }];
 
+const C_MOE_PF_W8A8_SPLIT: &[Constraint] = &[Constraint {
+    id: "moe_pf_w8a8_split_contract",
+    formula: F::Implies(
+        &F::Atom("emit.moe_pf_w8a8_split", Cmp::Eq, TRUE),
+        &F::Atom("emit.moe_pf_w8a8", Cmp::Eq, TRUE),
+    ),
+    site: "crates/devgen/src/mla.rs: PLOW_MOE_PF_W8A8_SPLIT requires PLOW_MOE_PF_W8A8",
+    check: Check::Site,
+}];
+
 const C_INDEXER_FP8: &[Constraint] = &[Constraint {
     id: "indexer_fp8_contract",
     formula: F::Implies(
@@ -1352,6 +1362,7 @@ pub const EMIT: &[KnobSpec] = &[
     KnobSpec::new("emit.moe_prefill_ep", Some("PLOW_MOE_PREFILL_EP"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.moe_pf_det", Some("PLOW_MOE_PF_DET"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.moe_pf_w8a8", Some("PLOW_MOE_PF_W8A8"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
+    KnobSpec::new("emit.moe_pf_w8a8_split", Some("PLOW_MOE_PF_W8A8_SPLIT"), Layer::Emit, Domain::Bool, OFF, OPT_IN).with(C_MOE_PF_W8A8_SPLIT),
     KnobSpec::new("emit.moe_stage1_body", Some("PLOW_MOE_STAGE1_BODY"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.moe_stage2_body", Some("PLOW_MOE_STAGE2_BODY"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.no_glu_fuse", Some("PLOW_NO_GLU_FUSE"), Layer::Emit, Domain::Bool, LT_GLU_DEFAULT, LT_GLU_QUALIFIED),

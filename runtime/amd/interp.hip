@@ -5856,6 +5856,18 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
         case PLOW_DOP_MOE_GROUP_GLU_PF:
 #if PLOW_MOE_PF_W8A8_ARM
             /* i7 = 2: W8A8. t0=fq(fp8 out) t1=xq t6=xs(f32[H/128][T]) t7=fs(out) i4=T. */
+            /* i7 = 4: SPLIT (PLOW_MOE_PF_W8A8_SPLIT). t1 = bf16 x, split hi/lo in staging; t0 =
+             * fq rows [hi I | lo I]. */
+            if (in->i[7] == 4u) {
+                d_moe_pf_w8a8<true, true>(TEN(0), (float*)TEN(7), (const unsigned char*)TEN(1),
+                                          nullptr, PLOW_RUNTIME_ROWS(in->i[4]),
+                                          (const unsigned long long*)TEN(2),
+                                          (const unsigned long long*)TEN(3), (const int*)TEN(4),
+                                          (const unsigned*)TEN(5), nullptr, in->i[0], in->i[1],
+                                          in->i[2], in->i[5], in->fj[0].f, in->fj[1].f, 0u, slice,
+                                          nblk, (unsigned char*)sm->raw);
+                break;
+            }
             if (in->i[7] == 2u) {
                 d_moe_pf_w8a8<true>(TEN(0), (float*)TEN(7), (const unsigned char*)TEN(1),
                                     (const float*)TEN(6), PLOW_RUNTIME_ROWS(in->i[4]),
@@ -5884,6 +5896,17 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
         case PLOW_DOP_MOE_GROUP_DOWN_PF:
 #if PLOW_MOE_PF_W8A8_ARM
             /* i7 = 2 (f32 part) / 3 (bf16 part): W8A8. t1=fq t5=fs. */
+            /* i7 = 4 (f32 part) / 5 (bf16 part): SPLIT, t1 = fq rows [hi I | lo I]. */
+            if (in->i[7] >= 4u) {
+                d_moe_pf_w8a8<false, true>(TEN(0), nullptr, (const unsigned char*)TEN(1),
+                                           (const float*)TEN(5), 0u,
+                                           (const unsigned long long*)TEN(2),
+                                           (const unsigned long long*)TEN(3), (const int*)TEN(4),
+                                           (const unsigned*)TEN(6), (const float*)TEN(7), in->i[0],
+                                           in->i[1], in->i[2], 0u, 0.0f, 0.0f, in->i[7] == 5u,
+                                           slice, nblk, (unsigned char*)sm->raw);
+                break;
+            }
             if (in->i[7] >= 2u) {
                 d_moe_pf_w8a8<false>(TEN(0), nullptr, (const unsigned char*)TEN(1),
                                      (const float*)TEN(5), 0u, (const unsigned long long*)TEN(2),
