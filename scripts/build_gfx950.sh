@@ -61,6 +61,15 @@ case "${PLOW_MLA_PF2_DPP:-0}" in
   1) FLASH_TR16="$FLASH_TR16 -DPLOW_MLA_PF2_DPP=1" ;;
   *) echo "PLOW_MLA_PF2_DPP must be 0 or 1" >&2; exit 2 ;;
 esac
+# PLOW_MLA_PF_SNAKE (default 1; =0 rolls back): the V2 MLA prefill deals its (q-tile, head, split)
+# items heaviest-first, rounds boustrophedon over the workgroups (op_attention_common.h; bit-identical,
+# item->WG map only). GLM-5.3-Flash TP8 MI350X: flash 29.6 -> 20.6 ms per 8k chunk at c0=0, 66.0 ->
+# 57.9 at c0=8k; 8k prefill 272.2 -> 264.0 ms, 16k 598.6 -> 583.4; streams byte-equal.
+case "${PLOW_MLA_PF_SNAKE:-1}" in
+  0) ;;
+  1) FLASH_TR16="$FLASH_TR16 -DPLOW_MLA_PF_SNAKE=1" ;;
+  *) echo "PLOW_MLA_PF_SNAKE must be 0 or 1" >&2; exit 2 ;;
+esac
 # PLOW_KDA_CARRY_PIPE=1 / PLOW_KDA_CARRY_KTR16=1: regstate KDA carry load schedule and
 # transposed key-tile reads (op_kda_carry_regstate.h; both bit-identical).
 KDA_CARRY_DEFS=""
@@ -1141,6 +1150,28 @@ case "${PLOW_K3_PF_SP_VEC:-0}" in
   0) ;;
   2|4|8) K3_PF_MOE="$K3_PF_MOE -DPLOW_XR_SP_VEC=$PLOW_K3_PF_SP_VEC" ;;
   *) echo "PLOW_K3_PF_SP_VEC must be 0, 2, 4 or 8" >&2; exit 2 ;;
+esac
+# PLOW_RN_ROWS (default 1 here; gfx942 ships 2): d_rmsnorm issues R rows of loads per workgroup
+# before reducing any (op_norm.h multi-row arm; same element map and tree, bit-identical). Plain
+# prefill rows only: a packed program keeps the single-row loop.
+case "${PLOW_RN_ROWS:-1}" in
+  0|1) ;;
+  2|4) K3_PF_MOE="$K3_PF_MOE -DPLOW_RN_ROWS=$PLOW_RN_ROWS" ;;
+  *) echo "PLOW_RN_ROWS must be 1, 2 or 4" >&2; exit 2 ;;
+esac
+# PLOW_HC_POST_ROWS (default 1): the mHC HyperConnPost issues R band rows of loads per workgroup
+# before storing (op_hyperconn.h; same arithmetic, bit-identical).
+case "${PLOW_HC_POST_ROWS:-1}" in
+  0|1) ;;
+  2|4) K3_PF_MOE="$K3_PF_MOE -DPLOW_HC_POST_ROWS=$PLOW_HC_POST_ROWS" ;;
+  *) echo "PLOW_HC_POST_ROWS must be 1, 2 or 4" >&2; exit 2 ;;
+esac
+# PLOW_GEMV_F32_PF_TILE=RxCN (default 2x3, the plain arm): the prefill GemvF32 (mHC mix, N = 24,
+# K = 16384) output tile per wave; each output keeps its lane-to-k map and term order (bit-identical).
+case "${PLOW_GEMV_F32_PF_TILE:-2x3}" in
+  2x3) ;;
+  4x3|2x6|4x6) K3_PF_MOE="$K3_PF_MOE -DPLOW_GEMV_F32_PF_R=${PLOW_GEMV_F32_PF_TILE%x*} -DPLOW_GEMV_F32_PF_CN=${PLOW_GEMV_F32_PF_TILE#*x}" ;;
+  *) echo "PLOW_GEMV_F32_PF_TILE must be 2x3, 4x3, 2x6 or 4x6" >&2; exit 2 ;;
 esac
 FOLD_TB_DEFAULT=0
 if [ "$GLM53_FLASH" = 1 ]; then FOLD_TB_DEFAULT=8; fi

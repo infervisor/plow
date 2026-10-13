@@ -749,6 +749,17 @@ fn emit_glm53_hc_pre(
     // PLOW_GLM_HC_PRE_TAIL (one-row decode): the HyperConnPre below runs on this GemvF32's
     // last-arriving workgroup, with its operands in a u32 descriptor (interp.hip
     // `exec_hc_pre_tail`). The separate pre packet was one workgroup, so this is the same call.
+    let steps = 4 * c.hidden / 512;
+    let split = emit_config::active()
+        .glm_hc_mix_split
+        .map(|sp| if rows == 1 { sp } else { 1 })
+        .filter(|&sp| {
+            band.is_none()
+                && post_fold.is_some()
+                && sp > 0
+                && steps % sp == 0
+                && rows * 24 * sp <= b.n_cu()
+        });
     let tail = (band.is_none() && rows == 1 && emit_config::active().glm_hc_pre_tail).then(|| {
         let side = if ffn { "ffn" } else { "attn" };
         let ctr = b.tensor(&format!("act.hc_pre_tail.{layer}.{side}.ctr"), 4);
@@ -768,10 +779,24 @@ fn emit_glm53_hc_pre(
             c.eps.to_bits(),
             1e-6f32.to_bits(),
         ];
+        let mut words = words.to_vec();
+        if let Some(sp) = split {
+            let k = 4 * c.hidden;
+            let part = b.tensor("act.hc_mix_part", 24 * (k as u64 / 8) * 4);
+            words.extend([part, sp]);
+        }
         let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
         b.tensor_init(&format!("act.hc_pre_tail.{layer}.{side}.desc"), bytes)
     });
-    let cm = b.emit(DevOp::GemvF32, b.all(), &[dep], |d| {
+    // PLOW_GLM_HC_MIX_SPLIT=S: a folded mix packet runs on the workgroups that own an output
+    // (rows * 24) instead of the whole grid; with the one-row pre tail each output's K steps are
+    // also split over S workgroups (i4 = 2) and reduced in step order by the last one.
+    let cus = match (split, tail, post_fold) {
+        (Some(sp), Some(_), Some(_)) => (0..24 * sp).collect(),
+        (Some(_), None, Some(_)) => (0..rows * 24).collect(),
+        _ => b.all(),
+    };
+    let cm = b.emit(DevOp::GemvF32, cus, &[dep], |d| {
         d.t[0] = mixes;
         d.t[1] = residual;
         d.t[2] = if ffn { w.ffn_fn } else { w.attn_fn };
@@ -788,7 +813,7 @@ fn emit_glm53_hc_pre(
             d.t[6] = comb_mix;
         }
         if let Some(desc) = tail {
-            d.i[4] = 1;
+            d.i[4] = if split.is_some() && post_fold.is_some() { 2 } else { 1 };
             d.t[7] = desc;
         }
     });
@@ -971,9 +996,17 @@ fn emit_glm53_program(
         let next = s.residual[ri ^ 1];
         // A KDA layer reads the full layer input: its HyperConnPre writes the band into peer
         // slot 3 and the gather below assembles it. An MLA layer gathers its own input norm.
-        let peer_input = bv.is_some() && !c.is_softmax(l as u32);
-        let kda_x = (hc_fold && !c.is_softmax(l as u32))
-            .then(|| b.tensor(&format!("act.glm53.{l}.x"), rows as u64 * c.hidden as u64 * 2));
+        // PLOW_GLM53_SP_KDA_NORM: a KDA layer norms its input on the band and gathers the normed
+        // rows (glm_sp_norm_gather, as the MLA and FFN seams do); the mixer takes them prenormed.
+        let sp_kda_norm =
+            bv.is_some() && !c.is_softmax(l as u32) && emit_config::active().glm53_sp_kda_norm;
+        let peer_input = bv.is_some() && !c.is_softmax(l as u32) && !sp_kda_norm;
+        let kda_x = (hc_fold && !c.is_softmax(l as u32)).then(|| {
+            b.tensor(
+                &format!("act.glm53.{l}.x"),
+                rows as u64 * c.hidden as u64 * 2,
+            )
+        });
         let kda_fold = kda_x.map(|x| (x, s.kda_w[l].as_ref().unwrap().ln_w));
         let c_pre = emit_glm53_hc_pre(
             b,
@@ -1025,7 +1058,28 @@ fn emit_glm53_program(
             }
         } else {
             let dst = if c.tp > 1 { n.og_tp } else { n.attn };
-            let c_in = if bv.is_some() {
+            let sp_x = sp_kda_norm.then(|| {
+                b.tensor(
+                    &format!("act.glm53.{l}.x"),
+                    rows as u64 * c.hidden as u64 * 2,
+                )
+            });
+            let c_in = if let Some(x) = sp_x {
+                glm_sp_norm_gather(
+                    b,
+                    n,
+                    rows,
+                    c.tp,
+                    c.hidden,
+                    c.eps,
+                    x,
+                    s.layer_input,
+                    s.kda_w[l].as_ref().unwrap().ln_w,
+                    &[c_pre],
+                    &mut xgate,
+                    &xr,
+                )
+            } else if bv.is_some() {
                 crate::emit_xall_gather(
                     b,
                     &mut xgate,
@@ -1044,10 +1098,10 @@ fn emit_glm53_program(
                 s.kda_s[l].as_ref().unwrap(),
                 &format!("act.glm53.{l}."),
                 rows,
-                kda_x.unwrap_or(s.layer_input),
+                sp_x.or(kda_x).unwrap_or(s.layer_input),
                 Some(dst),
                 b.n_cu(),
-                kda_x.is_some(),
+                kda_x.is_some() || sp_x.is_some(),
                 &[c_in],
                 !prefill && (rows > 1 || emit_config::active().decode_ladder_on()),
             );
@@ -1362,8 +1416,9 @@ pub(crate) fn glm53_emit_full(
         let mut b = Builder::new(n_cu);
         b.set_tensor_dedup(true);
         b.adopt_tensors(tensors.clone());
-        if rows > 1 {
+        if rows > 1 && rows <= ec.glm_dec_splitk_max_rows.unwrap_or(u32::MAX) {
             b.set_gemm_small_splitk(ec.glm_dec_splitk.unwrap_or(0));
+            b.set_gemm_small_splitk_2p(ec.glm_dec_splitk_2p);
         }
         emit_glm53_program(&mut b, &c, &n, &s, ctx, rows, dbatch, enc, false);
         let prog = b.finish();
@@ -9442,7 +9497,14 @@ fn emit_glm_moe_ffn_prefill(
     // PLOW_GLM_SEQ_PAR_PROJ: score and top-k on the owned band, then gather the route table out
     // of peer slot 5 (free between this layer's attention reduce-scatter and the next layer's
     // input seam). Needs `!det`: the det prologue zeroes an accumulator over all T rows.
-    let band_router = tp > 1 && !raw_output && !det && n.ug_tp != TENSOR_NONE && glm_sp(c, n, b, t);
+    // PLOW_GLM53_SP_ROUTER: the same band router on GLM-5.3's mHC seam, whose FFN partial is
+    // reduce-scattered (`raw_output`) and which leaves `ug_tp` undeclared.
+    let sp53_router = emit_config::active().glm53_sp_router;
+    let band_router = tp > 1
+        && (!raw_output || sp53_router)
+        && !det
+        && (n.ug_tp != TENSOR_NONE || sp53_router)
+        && glm_sp(c, n, b, t);
     // PLOW_GLM_ROUTER_OVERLAP: slot 3's band holds the bytes the hidden gather copies into
     // `xn2@band`, and its next writer is behind this layer's FFN reduce-scatter.
     let overlap = if band_router {
