@@ -2513,7 +2513,10 @@ template <bool SCATTER = false>
 __device__ void d_quant_fp8_block128(unsigned char* __restrict__ xq_,
                                     const bf16* __restrict__ x_, float* __restrict__ scale_,
                                     unsigned M, unsigned K, unsigned slice, unsigned nblk,
-                                    const unsigned* row_partidx = nullptr, unsigned slots = 0) {
+                                    const unsigned* row_partidx = nullptr, unsigned slots = 0,
+                                    unsigned pitch = 0) {
+    /* pitch: the scale grid's row stride when it must not follow M (0 = M). */
+    const unsigned spitch = SCATTER ? slots : (pitch ? pitch : M);
     const auto* x = as_glob(x_);
     auto* xq = as_glob(xq_);
     auto* scale = as_glob(scale_);
@@ -2537,7 +2540,7 @@ __device__ void d_quant_fp8_block128(unsigned char* __restrict__ xq_,
         amax = fmaxf(amax, __shfl_xor(amax, 2, 4));
         const float s = amax * (1.0f / 448.0f);
         const float inv = 1.0f / s;
-        if (lane == 0) st_act<float>(&scale[(size_t)(group % groups) * (SCATTER ? slots : M) + dst], s);
+        if (lane == 0) st_act<float>(&scale[(size_t)(group % groups) * spitch + dst], s);
 #pragma unroll
         for (unsigned j = 0; j < 32; j += 2) {
             const unsigned packed = PLOW_GM_FP8_PACK2(bf2f(values[j]) * inv, bf2f(values[j + 1]) * inv);
