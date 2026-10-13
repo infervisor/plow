@@ -11485,10 +11485,20 @@ impl GpuEngine {
         {
             return Ok(None);
         }
+        // The packed attention table is runtime-appended (`PfBatch::h_req_attn`), past `devp`.
+        let req_attn = self
+            .pf_batch
+            .as_ref()
+            .map(|pb| (pb.h_req_attn, pb.d_req_attn.base));
         let tensor = |handle: u16| {
             self.devp
                 .get(handle as usize)
                 .map(|memory| memory.base)
+                .or_else(|| {
+                    req_attn
+                        .filter(|(h, _)| *h == u32::from(handle))
+                        .map(|(_, base)| base)
+                })
                 .ok_or_else(|| RuntimeError::Rejected("direct attention tensor handle".into()))
         };
         let entries = arg.gq_stream
