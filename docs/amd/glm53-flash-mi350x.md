@@ -646,6 +646,25 @@ The packet from config + index alone (no weights) is 70 MB: 4 prefill buckets + 
   TP4 serve 8/8, one model at a time and both at once; needles 4k/16k 18/18 per model (cache on,
   both models at once); c64 per model, isl 1024 / osl 128: 6151 + 6163 = 12303 total tok/s,
   128/128 each; metrics carry `model_name` per model.
+- 20:00 UTC (10-13), sparse attention like vLLM (branch v12-dsa). vLLM's TP8 log runs
+  `ROCM_AITER_MLA_SPARSE` with the `DEEPSEEK_V32_INDEXER/KPOOL_TAIL` indexer
+  (`vllm/models/glm5next/amd/sparse_indexer.py`): kpool-4 softmax(gate+ape)-pooled, Hadamard,
+  power-of-2-scaled FP8 index keys; FP8 Hadamard queries; fp32 weights; top `2048/4 = 512` pools
+  per query row, expanded to tokens plus the incomplete-pool tail (<= 2051 indices); at prefill
+  AND decode; rows whose length is <= 2048 take every causal token (the identity). plow's pooled
+  ops were ported from the same kernels, so the selected SET is the same (tie order aside).
+  `PLOW_GLM_DSA=topk` arms it at every decode rung (batched arm added: per-slot ring/pool cache,
+  per-row radix, compact expand) and makes every prefill bucket write the pool cache (dense
+  buckets used to skip it; packed programs write it per span). Differences left: prefill
+  attention stays dense (`PLOW_GLM_DSA_PF=1` faults on a ragged 4096-row chunk in the 8192
+  bucket; a dense row is a superset of its selection), and a pool straddling an unaligned packed
+  span start is not compressed. Production (`PLOW_GLM_DSA=0`) packets are byte-identical.
+  Validate (packet caf12efe, `PLOW_GLM_DSA=topk`): nat-pride-1024 equals the FP32 continuation
+  in 1/8/32/128 of 1/8/32/128 slots; real 4k/16k prompts give the dense packet's stream at r1 and
+  in all 8 b8 slots; 32k/61k run. Not qualified: decode cost. ms/step sparse vs dense:
+  r1 26.2 vs 12.4, B8 39.8 vs 22.9, B32 85.6 vs 30.2, B128 263.7 vs 39.9 (1k ctx);
+  r1 at 4k/16k/61k 27.4/29.2/37.1 vs 11.5/11.6/12.6. Prefill (dense attention + pool writes)
+  4k/16k/32k/61k 164/601/1345/3053 ms. Needles and the FP32 gate not run.
 
 ## 5. Results
 
