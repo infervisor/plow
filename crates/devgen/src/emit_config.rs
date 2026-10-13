@@ -985,6 +985,16 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_GLM_OFOLD", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub glm_ofold: bool,
 
+    /// GLM-5.3-Flash decode: fold the RmsNorm after a KDA layer's and every FFN's
+    /// HyperConnPre into that packet (one packet less per sublayer). Bit-identical.
+    #[arg(long, env = "PLOW_GLM_HC_NORM_FOLD", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub glm_hc_norm_fold: bool,
+
+    /// GLM-5.3-Flash decode: fold each HyperConnPost that a HyperConnPre follows into that
+    /// pre's mHC mix GemvF32 (rows * 24 <= workgroups). Bit-identical.
+    #[arg(long, env = "PLOW_GLM_HC_POST_FOLD", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub glm_hc_post_fold: bool,
+
     /// Causal KV-split factor for the V2 MLA prefill flash (2..=8; unset/1 = unsplit).
     #[arg(long, env = "PLOW_GLM_PF_NS")]
     pub glm_pf_ns: Option<u32>,
@@ -1689,6 +1699,8 @@ impl EmitConfig {
             glm_gemm_lt_pf_ext: env_str("PLOW_GLM_GEMM_LT_PF_EXT"),
             glm_gemv_wg: env_u32("PLOW_GLM_GEMV_WG"),
             glm_ofold: env_bool("PLOW_GLM_OFOLD"),
+            glm_hc_norm_fold: env_bool("PLOW_GLM_HC_NORM_FOLD"),
+            glm_hc_post_fold: env_bool("PLOW_GLM_HC_POST_FOLD"),
             glm_pf_ns: env_u32("PLOW_GLM_PF_NS"),
             glm_router_overlap: env_u32("PLOW_GLM_ROUTER_OVERLAP"),
             glm_dsa_pf_span: env_u32("PLOW_GLM_DSA_PF_SPAN").unwrap_or(1),

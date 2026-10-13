@@ -1267,6 +1267,8 @@ pub const EMIT: &[KnobSpec] = &[
     KnobSpec::new("emit.glm_gemm_lt_pf_ext", Some("PLOW_GLM_GEMM_LT_PF_EXT"), Layer::Emit, Domain::Str, GLM_GEMM_LT_PF_EXT_DEFAULT, GLM_RECIPE_PF_EXT),
     KnobSpec::new("emit.glm_gemv_wg", Some("PLOW_GLM_GEMV_WG"), Layer::Emit, U32, UNSET, OPT_IN),
     KnobSpec::new("emit.glm_ofold", Some("PLOW_GLM_OFOLD"), Layer::Emit, Domain::Bool, OFF, OPT_IN).with(C_OFOLD),
+    KnobSpec::new("emit.glm_hc_norm_fold", Some("PLOW_GLM_HC_NORM_FOLD"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
+    KnobSpec::new("emit.glm_hc_post_fold", Some("PLOW_GLM_HC_POST_FOLD"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.glm_pf_ns", Some("PLOW_GLM_PF_NS"), Layer::Emit, U32, UNSET, OPT_IN),
     KnobSpec::new("emit.glm_router_overlap", Some("PLOW_GLM_ROUTER_OVERLAP"), Layer::Emit, U32, UNSET, OPT_IN).scoped(ROUTER_OVERLAP_SCOPE),
     KnobSpec::new("emit.glm_dsa_pf_span", Some("PLOW_GLM_DSA_PF_SPAN"), Layer::Emit, U32, Default::Static(Val::Nat(1)), OPT_IN),

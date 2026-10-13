@@ -432,6 +432,22 @@ __device__ void d_hyperconn_pre_rows(float* __restrict__ post_mix, float* __rest
 }
 #endif
 
+/* One 8-channel step of op 122's n = 4 vector path: output stream j at channels d..d+7. Shared
+ * with d_gemv_f32_wg_hcpost so the fold computes the residual with this exact code. */
+__device__ __forceinline__ bf16v8 hc_post4_8(const float* c, const float* p, unsigned j,
+                                            const bf16v8* r, const bf16v8 xv) {
+    bf16v8 o;
+#pragma unroll
+    for (unsigned e = 0; e < 8; e++) {
+        float acc = 0.0f;
+#pragma unroll
+        for (unsigned i = 0; i < 4; i++) acc += c[i * 4 + j] * bf2f(r[i][e]);
+        acc += p[j] * bf2f(xv[e]);
+        o[e] = f2bf(acc);
+    }
+    return o;
+}
+
 /* op 122 — hyper-connections post-block, paired with op 121.
  * `new_residual[j][d] = sum_i comb_mix[i][j] * residual[i][d]  +  post_mix[j] * x_out[d]`
  * — an n x n combine (n=4) plus a broadcast multiply-add. Fully parallel over `d` with no
@@ -481,18 +497,8 @@ __device__ void d_hyperconn_post(bf16* __restrict__ new_residual, const bf16* __
 #pragma unroll
                 for (unsigned i = 0; i < 4; i++) r[i] = ld_glob8(rrow + (size_t)i * hidden + d);
 #pragma unroll
-                for (unsigned j = 0; j < 4; j++) {
-                    bf16v8 o;
-#pragma unroll
-                    for (unsigned e = 0; e < 8; e++) {
-                        float acc = 0.0f;
-#pragma unroll
-                        for (unsigned i = 0; i < 4; i++) acc += c[i * 4 + j] * bf2f(r[i][e]);
-                        acc += p[j] * bf2f(xv[e]);
-                        o[e] = f2bf(acc);
-                    }
-                    st_glob8(orow + (size_t)j * hidden + d, o);
-                }
+                for (unsigned j = 0; j < 4; j++)
+                    st_glob8(orow + (size_t)j * hidden + d, hc_post4_8(c, p, j, r, xv));
             }
             continue;
         }
@@ -506,6 +512,64 @@ __device__ void d_hyperconn_post(bf16* __restrict__ new_residual, const bf16* __
                 orow[(size_t)j * hidden + d] = f2bf(acc);
             }
         }
+    }
+}
+
+/* PLOW_GLM_HC_POST_FOLD: op 135 (GemvF32, the mHC mix) with op 122 (mode 0, n = 4) folded in.
+ * x = new_residual is not read but formed per step from the HyperConnPost operands with
+ * hc_post4_8, and the workgroups of column 0 store it for the later readers. The dot product
+ * is d_gemv_f32_wg's (workgroup per output, per-step terms added in step order, contraction off),
+ * so mixes and new_residual are bit-identical to the HyperConnPost + GemvF32 pair.
+ * Requires K = 4 * hidden, K % (8 * PLOW_WAVE) == 0. */
+__device__ void d_gemv_f32_wg_hcpost(float* __restrict__ C, bf16* __restrict__ new_residual,
+                                     const float* __restrict__ W, const bf16* __restrict__ x_out,
+                                     const bf16* __restrict__ residual,
+                                     const float* __restrict__ post_mix,
+                                     const float* __restrict__ comb_mix, unsigned M, unsigned N,
+                                     unsigned K, unsigned slice, unsigned nblk,
+                                     float* __restrict__ part) {
+    const unsigned wave = threadIdx.x / PLOW_WAVE;
+    const unsigned lane = threadIdx.x % PLOW_WAVE;
+    const unsigned steps = K / (PLOW_WAVE * 8u), hidden = K / 4u;
+    for (size_t output = slice; output < (size_t)M * N; output += nblk) {
+        const unsigned m = output / N, n = output % N;
+        const float* const wn = W + (size_t)n * K;
+        const bf16* const rrow = residual + (size_t)m * K;
+        const bf16* const xrow = x_out + (size_t)m * hidden;
+        float c[16], p[4];
+#pragma unroll
+        for (unsigned k = 0; k < 16; k++) c[k] = comb_mix[(size_t)m * 16u + k];
+#pragma unroll
+        for (unsigned k = 0; k < 4; k++) p[k] = post_mix[(size_t)m * 4u + k];
+#pragma unroll 2
+        for (unsigned s = wave; s < steps; s += PLOW_WAVES) {
+            const unsigned k = s * (PLOW_WAVE * 8u) + lane * 8u;
+            const unsigned j = k / hidden, d = k % hidden;
+            bf16v8 r[4];
+#pragma unroll
+            for (unsigned i = 0; i < 4; i++) r[i] = ld_glob8(rrow + (size_t)i * hidden + d);
+            const bf16v8 xo = ld_glob8(xrow + d);
+            const float4 w0 = *(const float4*)(wn + k);
+            const float4 w1 = *(const float4*)(wn + k + 4);
+            const bf16v8 xv = hc_post4_8(c, p, j, r, xo);
+            if (n == 0u) st_glob8(new_residual + (size_t)m * K + k, xv);
+            {
+#pragma clang fp contract(off)
+                part[s * PLOW_WAVE + lane] =
+                    bf2f(xv[0]) * w0.x + bf2f(xv[1]) * w0.y + bf2f(xv[2]) * w0.z +
+                    bf2f(xv[3]) * w0.w + bf2f(xv[4]) * w1.x + bf2f(xv[5]) * w1.y +
+                    bf2f(xv[6]) * w1.z + bf2f(xv[7]) * w1.w;
+            }
+        }
+        __syncthreads();
+        if (wave == 0) {
+#pragma clang fp contract(off)
+            float acc = 0.0f;
+            for (unsigned s = 0; s < steps; s++) acc += part[s * PLOW_WAVE + lane];
+            acc = wave_sum(acc);
+            if (lane == 0) C[output] = acc;
+        }
+        __syncthreads();
     }
 }
 

@@ -1092,6 +1092,13 @@ extern "C" __device__ unsigned plow_mla_pf_ns_arm = 1;
  * the pairing instead of serving garbage. */
 extern "C" __device__ unsigned plow_t11_gluquant_arm = 1;
 
+/* HYPER_CONN_PRE i4 = 1: the following RMSNORM folded into the packet (PLOW_GLM_HC_NORM_FOLD).
+ * An object without the arm leaves the normed output unwritten: no trap, wrong tokens. */
+extern "C" __device__ unsigned plow_glm_hc_norm_fold_arm = 1;
+/* GEMV_F32 i3 = 1: the preceding HyperConnPost folded in (PLOW_GLM_HC_POST_FOLD). An object
+ * without the arm never writes the new residual stream: stale data, no trap. */
+extern "C" __device__ unsigned plow_glm_hc_post_fold_arm = 1;
+
 typedef union __align__(16) {
     float part[PLOW_MIXED_STEP ? 8 : PLOW_WAVES]; /* mixed norms retain the 8-wave reduction */
     bf16  gm[PLOW_GM_ARENA];          /* GEMM A|B tiles, x2 buffers */
@@ -3911,8 +3918,24 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
                                      (const float*)TEN(3), (const bf16*)TEN(4),
                                      (const float*)TEN(5), (const float*)TEN(6), in->i[0],
                                      in->i[2], in->i[3], in->fj[0].f, in->fj[1].f, slice, nblk);
+                /* PLOW_GLM_HC_NORM_FOLD (i4 = 1): the layer input's RMSNORM in this packet
+                 * (t7 = gamma, i5 = out handle, eps = f0, the pre's own rms_eps). The emitter
+                 * folds only when the
+                 * RMSNORM packet would have run each row on the workgroup that produced it,
+                 * so this is that packet's d_rmsnorm call on the same rows: bit-identical. */
+                if (in->i[4] == 1u) {
+                    if (TEN(7) == nullptr || in->i[5] == PLOW_TENSOR_NONE || in->i[0] > nblk)
+                        __builtin_trap();
+                    __syncthreads();
+                    asm volatile("buffer_inv" ::: "memory");
+                    __syncthreads();
+                    d_rmsnorm((bf16*)T[in->i[5]], (const bf16*)TEN(2), (const bf16*)TEN(7),
+                              PLOW_RUNTIME_ROWS(in->i[0]), in->i[2], in->fj[0].f, 0u, slice, nblk,
+                              sm->part, nullptr, nullptr PLOW_PACKED_NORM_ARGS);
+                }
                 break;
             }
+            if (in->i[4] != 0u) __builtin_trap();
 #endif
             d_hyperconn_pre((float*)TEN(0), (float*)TEN(1), (bf16*)TEN(2), (const float*)TEN(3),
                             (const bf16*)TEN(4), (const float*)TEN(5), (const float*)TEN(6),
@@ -3964,6 +3987,32 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
                 break;
             }
 #endif
+#if PLOW_BUCKET_DECODE
+            /* PLOW_GLM_HC_POST_FOLD (i3 = 1): the preceding HyperConnPost folded in. t1 is its
+             * new_residual (written here), t3 = x_out, t4 = residual, t5 = post_mix,
+             * t6 = comb_mix. See d_gemv_f32_wg_hcpost. */
+            if (in->i[3] == 1u) {
+                if (in->i[2] % (8u * PLOW_WAVE) != 0u || in->i[2] % 4u != 0u ||
+                    (size_t)in->i[2] / 8u * sizeof(float) > sizeof(sm->raw) ||
+                    (size_t)in->i[0] * in->i[1] > nblk || !TEN(3) || !TEN(4) || !TEN(5) ||
+                    !TEN(6))
+                    __builtin_trap();
+                d_gemv_f32_wg_hcpost((float*)TEN(0), (bf16*)TEN(1), (const float*)TEN(2),
+                                     (const bf16*)TEN(3), (const bf16*)TEN(4),
+                                     (const float*)TEN(5), (const float*)TEN(6), in->i[0],
+                                     in->i[1], in->i[2], slice, nblk, (float*)sm->raw);
+                break;
+            }
+            if (in->i[2] % (8u * PLOW_WAVE) == 0u &&
+                (size_t)in->i[2] / 8u * sizeof(float) <= sizeof(sm->raw) &&
+                (size_t)in->i[0] * in->i[1] <= nblk) {
+                d_gemv_f32_wg((float*)TEN(0), (const bf16*)TEN(1), (const float*)TEN(2),
+                              in->i[0], in->i[1], in->i[2], slice, nblk,
+                              (float*)sm->raw);
+                break;
+            }
+#endif
+            if (in->i[3] != 0u) __builtin_trap();
             d_gemv_f32((float*)TEN(0), (const bf16*)TEN(1), (const float*)TEN(2), in->i[0], in->i[1],
                        in->i[2], slice, nblk);
             break;

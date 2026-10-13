@@ -726,6 +726,8 @@ fn emit_glm53_hc_pre(
     dep: u32,
     band: Option<&Glm53Band>,
     peer_input: bool,
+    norm_fold: Option<(u32, u32)>,
+    post_fold: Option<(u32, u32)>,
 ) -> u32 {
     let w = &s.hc[layer];
     let (residual, mixes, post_mix, comb_mix, layer_input, rows) = match band {
@@ -746,6 +748,15 @@ fn emit_glm53_hc_pre(
         d.i[0] = rows;
         d.i[1] = 24;
         d.i[2] = 4 * c.hidden;
+        // PLOW_GLM_HC_POST_FOLD: the HyperConnPost that writes `residual` (from x_out = raw and
+        // the previous residual stream) runs in this packet.
+        if let Some((raw, prev)) = post_fold {
+            d.i[3] = 1;
+            d.t[3] = raw;
+            d.t[4] = prev;
+            d.t[5] = post_mix;
+            d.t[6] = comb_mix;
+        }
     });
     b.emit(
         DevOp::HyperConnPre,
@@ -765,6 +776,12 @@ fn emit_glm53_hc_pre(
             d.i[3] = 20;
             d.f[0] = c.eps;
             d.f[1] = 1e-6;
+            // PLOW_GLM_HC_NORM_FOLD: the layer input's RmsNorm (eps = f0) runs in this packet.
+            if let Some((out, gamma)) = norm_fold {
+                d.i[4] = 1;
+                d.i[5] = out;
+                d.t[7] = gamma;
+            }
         },
     )
 }
@@ -856,13 +873,45 @@ fn emit_glm53_program(
         bv: if c.tp >= 8 { 8 } else { 16 },
         full_rank_gate: false,
     };
+    // PLOW_GLM_HC_NORM_FOLD (decode): fold the RmsNorm after a KDA layer's and every FFN's
+    // HyperConnPre into that packet. Bit-identical only where the RmsNorm packet would run each
+    // row on the workgroup HyperConnPre gives it (row r on workgroup r, no wave-per-row arm).
+    let hc_fold = !prefill
+        && bv.is_none()
+        && emit_config::active().glm_hc_norm_fold
+        && rows <= b.n_cu()
+        && pf_wide_cus(b.n_cu(), rows).len() as u32 == rows
+        && crate::k3::norm_cus(&all, rows).len() as u32 >= rows;
+    // PLOW_GLM_HC_POST_FOLD (decode, rows * 24 mixes <= workgroups): every HyperConnPost that a
+    // HyperConnPre follows runs inside that pre's GemvF32 (d_gemv_f32_wg_hcpost). Bit-identical.
+    let post_fold_on = !prefill
+        && bv.is_none()
+        && emit_config::active().glm_hc_post_fold
+        && rows * 24 <= b.n_cu();
+    let mut pending_post: Option<(u32, u32)> = None;
     for l in 0..c.layers as usize {
         let residual = s.residual[ri];
         let next = s.residual[ri ^ 1];
         // A KDA layer reads the full layer input: its HyperConnPre writes the band into peer
         // slot 3 and the gather below assembles it. An MLA layer gathers its own input norm.
         let peer_input = bv.is_some() && !c.is_softmax(l as u32);
-        let c_pre = emit_glm53_hc_pre(b, c, s, residual, false, l, rows, dep, bv, peer_input);
+        let kda_x = (hc_fold && !c.is_softmax(l as u32))
+            .then(|| b.tensor(&format!("act.glm53.{l}.x"), rows as u64 * c.hidden as u64 * 2));
+        let kda_fold = kda_x.map(|x| (x, s.kda_w[l].as_ref().unwrap().ln_w));
+        let c_pre = emit_glm53_hc_pre(
+            b,
+            c,
+            s,
+            residual,
+            false,
+            l,
+            rows,
+            dep,
+            bv,
+            peer_input,
+            kda_fold,
+            pending_post.take(),
+        );
         let c_attn = if c.is_softmax(l as u32) {
             if prefill {
                 emit_glm_mla_prefill(
@@ -918,10 +967,10 @@ fn emit_glm53_program(
                 s.kda_s[l].as_ref().unwrap(),
                 &format!("act.glm53.{l}."),
                 rows,
-                s.layer_input,
+                kda_x.unwrap_or(s.layer_input),
                 Some(dst),
                 b.n_cu(),
-                false,
+                kda_x.is_some(),
                 &[c_in],
                 !prefill && (rows > 1 || emit_config::active().decode_ladder_on()),
             );
@@ -955,12 +1004,21 @@ fn emit_glm53_program(
             }
         };
         let raw = bv.map_or(n.attn, |v| v.og);
-        let c_post = emit_glm53_hc_post(b, c, s, next, raw, residual, rows, c_attn, bv);
+        let (c_post, attn_post) = if post_fold_on {
+            (c_attn, Some((raw, residual)))
+        } else {
+            (emit_glm53_hc_post(b, c, s, next, raw, residual, rows, c_attn, bv), None)
+        };
         ri ^= 1;
         let residual = s.residual[ri];
         let next = s.residual[ri ^ 1];
-        let c_pre_ffn = emit_glm53_hc_pre(b, c, s, residual, true, l, rows, c_post, bv, false);
-        let c_norm = if bv.is_some() {
+        let ffn_fold = hc_fold.then_some((n.xn2, n.lw[l].gpost));
+        let c_pre_ffn = emit_glm53_hc_pre(
+            b, c, s, residual, true, l, rows, c_post, bv, false, ffn_fold, attn_post,
+        );
+        let c_norm = if hc_fold {
+            c_pre_ffn
+        } else if bv.is_some() {
             glm_sp_norm_gather(
                 b,
                 n,
@@ -1008,7 +1066,12 @@ fn emit_glm53_program(
             )
         };
         let raw = bv.map_or(n.attn, |v| v.dg);
-        dep = emit_glm53_hc_post(b, c, s, next, raw, residual, rows, c_ffn, bv);
+        if post_fold_on && l + 1 < c.layers as usize {
+            pending_post = Some((raw, residual));
+            dep = c_ffn;
+        } else {
+            dep = emit_glm53_hc_post(b, c, s, next, raw, residual, rows, c_ffn, bv);
+        }
         ri ^= 1;
     }
     // Under the band seam `n.x` is valid on this rank's band only; the tail's final norm
