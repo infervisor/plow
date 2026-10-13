@@ -403,6 +403,9 @@ pub(super) const PREFILL_ARM_MARKERS: &[(&str, &[&str])] = &[
     // ns packets at the nsplit=1 partial layout while the merge reads ns — refuse.
     ("PLOW_MLA_PF_NS", &["plow_mla_pf_ns_arm"]),
     ("PLOW_MOE_PF_A8", &["plow_moe_pf_a8_arm"]),
+    // W8A8 grouped MoE prefill (ops 85/86 i[7] >= 2), a build axis the packet's plow_config.h
+    // turns on. Without it the shipped body reads fp8 rows as bf16 (or i[7] as part16). Refuse.
+    ("PLOW_MOE_PF_W8A8", &["plow_moe_pf_w8a8_arm"]),
     // DSA indexer prep (HeadNormRope pair_mode 3). An object without the arm runs it as the plain
     // rope on the un-normed key: no trap. A BUILD axis (`#if PLOW_DSA_PREP`).
     ("PLOW_DSA_PREP", &["plow_dsa_prep_arm"]),
@@ -728,10 +731,16 @@ pub(super) const DECODE_ARM_MARKERS: &[(&str, &[&str])] = &[
     ("PLOW_GLM_HC_NORM_FOLD", &["plow_glm_hc_norm_fold_arm"]),
     // The HyperConnPost folded into the mHC mix GemvF32 (op 135 i3 = 1). Same silent class.
     ("PLOW_GLM_HC_POST_FOLD", &["plow_glm_hc_post_fold_arm"]),
+    // The one-row HyperConnPre run by the mix GemvF32's last workgroup (op 135 i4 = 1). Same
+    // silent class.
+    ("PLOW_GLM_HC_PRE_TAIL", &["plow_glm_hc_pre_tail_arm"]),
     // The K3 latent MoeCombine folded into the tagged one-shot publish (XReduce t1 = part,
     // i7 = k). An object without the arm publishes the plain partial slot, which no packet
     // wrote — stale data, no trap. A BUILD axis (`#if PLOW_XR_COMBINE_FOLD`).
     ("PLOW_XR_COMBINE_FOLD", &["plow_xr_combine_fold_1"]),
+    // The GLM-5.3-Flash HyperConnPost folded into the batched decode XReduce (t2..t5, j0 =
+    // hidden). An object without the arm never writes the new residual stream. `#if PLOW_XR_HCPOST`.
+    ("PLOW_XR_HCPOST", &["plow_xr_hcpost_1"]),
     // The K3 f_b GEMV folded into KdaStateStepG's prologue (flags bit 2, t4 = f_a, j1 = W_fb).
     // An object without the arm reads f_a's 128 values as the head's gate logits — finite,
     // no trap, wrong. A BUILD axis (`#if PLOW_KDA_FB_FOLD`).
@@ -1117,6 +1126,11 @@ pub(super) fn packet_decode_arm_requirements<'a>(
     if insts().any(|inst| inst.op == DevOp::XReduce as u16 && inst.i[7] != 0) {
         requires.push("PLOW_XR_COMBINE_FOLD=1".to_owned());
     }
+    if insts()
+        .any(|inst| inst.op == DevOp::XReduce as u16 && inst.t[2] != packet::dev::TENSOR_NONE16)
+    {
+        requires.push("PLOW_XR_HCPOST=1".to_owned());
+    }
     if insts().any(|inst| inst.op == DevOp::KdaStateStepG as u16 && inst.i[4] & 4 != 0) {
         requires.push("PLOW_KDA_FB_FOLD=1".to_owned());
     }
@@ -1156,14 +1170,23 @@ pub(super) fn packet_prefill_arm_requirements<'a>(
     }) {
         requires.push("PLOW_MOE_PREFILL=1".to_owned());
     }
+    // i[7] >= 2 on ops 85/86 is the W8A8 arm (PLOW_MOE_PF_W8A8), not part16/a8.
+    let w8a8 = |inst: &DevInst64| {
+        (inst.op == DevOp::MoeGroupGluPf as u16 || inst.op == DevOp::MoeGroupDownPf as u16)
+            && inst.i[7] >= 2
+    };
     if insts().any(|inst| {
         matches!(inst.op, op if op == DevOp::MoeGroupDownPf as u16 || op == DevOp::MoeCombinePf as u16)
             && inst.i[7] != 0
+            && !w8a8(inst)
     }) {
         requires.push("PLOW_MOE_PF_PART16=1".to_owned());
     }
-    if insts().any(|inst| inst.op == DevOp::MoeGroupGluPf as u16 && inst.i[7] != 0) {
+    if insts().any(|inst| inst.op == DevOp::MoeGroupGluPf as u16 && inst.i[7] != 0 && !w8a8(inst)) {
         requires.push("PLOW_MOE_PF_A8=1".to_owned());
+    }
+    if insts().any(|inst| w8a8(inst)) {
+        requires.push("PLOW_MOE_PF_W8A8=1".to_owned());
     }
     // The shared-expert fold's constant `k+1`th routing slot (op 83 i[5]). An object without the
     // arm writes only the top-k slots, so the shared expert — which every token passes through —

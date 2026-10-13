@@ -1007,6 +1007,21 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_GLM_HC_POST_FOLD", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub glm_hc_post_fold: bool,
 
+    /// GLM-5.3-Flash one-row decode: run each HyperConnPre on the last-arriving workgroup of its
+    /// mHC mix GemvF32 (one packet and one hop less per sublayer). Bit-identical.
+    #[arg(long, env = "PLOW_GLM_HC_PRE_TAIL", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub glm_hc_pre_tail: bool,
+
+    /// GLM-5.3-Flash batched decode (rows > 1): largest split-K factor for the bf16 GemmSmall
+    /// projections whose 64x128 tiles leave most workgroups idle (0 = off). NOT bit-identical.
+    #[arg(long, env = "PLOW_GLM_DEC_SPLITK")]
+    pub glm_dec_splitk: Option<u32>,
+
+    /// GLM-5.3-Flash batched decode (rungs the HyperConnPost fold does not cover): fold each
+    /// HyperConnPost into the one-shot XReduce that produces its block output. Bit-identical.
+    #[arg(long, env = "PLOW_GLM_XR_HCPOST", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub glm_xr_hcpost: bool,
+
     /// GLM batched decode: the shared expert's elementwise Glu spans rows * I / 512 workgroups
     /// instead of one. Bit-identical.
     #[arg(long, env = "PLOW_GLM_DECODE_GLU_ROWS", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
@@ -1260,6 +1275,13 @@ pub struct EmitConfig {
     /// evidence measured only on GLM. Flip only alongside a Kimi/DeepSeek accuracy run.
     #[arg(long, env = "PLOW_MOE_PF_DET", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub moe_pf_det: bool,
+
+    /// W8A8 block-FP8 grouped MoE prefill on gfx950 (ops 85/86 i[7]=2): 1x128 FP8 activations
+    /// (`QuantFp8Block128` on the routed input, the GLU epilogue quantizes its output for DOWN),
+    /// fp8 x fp8 MFMA with the [128,128] weight scales, f32 part scatter. Needs `plow_moe_pf_w8a8_arm`
+    /// (the packet's plow_config.h sets `PLOW_MOE_PF_W8A8`). Opt-in: changes numerics.
+    #[arg(long, env = "PLOW_MOE_PF_W8A8", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub moe_pf_w8a8: bool,
 
     /// Build the lean gfx950 MoE stage-1 A4-reuse object with the K256 register-B body
     /// (`-DPLOW_MOE1_BODY=1`, bit-identical output). Opt-in; packets are unchanged, the
@@ -1720,6 +1742,9 @@ impl EmitConfig {
             glm_ofold: env_bool("PLOW_GLM_OFOLD"),
             glm_hc_norm_fold: env_bool("PLOW_GLM_HC_NORM_FOLD"),
             glm_hc_post_fold: env_bool("PLOW_GLM_HC_POST_FOLD"),
+            glm_hc_pre_tail: env_bool("PLOW_GLM_HC_PRE_TAIL"),
+            glm_dec_splitk: env_u32("PLOW_GLM_DEC_SPLITK"),
+            glm_xr_hcpost: env_bool("PLOW_GLM_XR_HCPOST"),
             glm_decode_glu_rows: env_bool("PLOW_GLM_DECODE_GLU_ROWS"),
             glm_pf_ns: env_u32("PLOW_GLM_PF_NS"),
             glm_router_overlap: env_u32("PLOW_GLM_ROUTER_OVERLAP"),
@@ -1758,6 +1783,7 @@ impl EmitConfig {
             moe_combine_lean: env_bool_default_true("PLOW_MOE_COMBINE_LEAN"),
             attnres_f32mix: env_opt_out("PLOW_ATTNRES_F32MIX"),
             moe_pf_det: env_bool("PLOW_MOE_PF_DET"),
+            moe_pf_w8a8: env_bool("PLOW_MOE_PF_W8A8"),
             moe_stage1_body: env_bool("PLOW_MOE_STAGE1_BODY"),
             moe_stage2_body: env_bool("PLOW_MOE_STAGE2_BODY"),
             no_glu_fuse: env_bool("PLOW_NO_GLU_FUSE"),

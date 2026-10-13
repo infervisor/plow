@@ -99,8 +99,9 @@ enum Cmd {
     #[command(group(clap::ArgGroup::new("model_source").required(true).multiple(true)
         .args(["assets", "model", "asr_packets"])))]
     Serve {
-        /// One or more compiled-model directories, each `DIR[,checkpoint=PATH]`: the HF
-        /// checkpoint defaults to `DIR/checkpoint`, then `PLOW_CHECKPOINT`.
+        /// One or more compiled-model directories, each `DIR[,checkpoint=PATH][,slug=NAME]`: the
+        /// HF checkpoint defaults to `DIR/checkpoint`, then `PLOW_CHECKPOINT`; the served model
+        /// name to the manifest's (one bundle may be served twice under two slugs).
         #[arg(long = "assets")]
         assets: Vec<PathBuf>,
         /// One or more model references, resolved from the LOCAL store.
@@ -966,16 +967,19 @@ async fn async_main(
             slo_ms,
             max_queued_requests,
         } => {
-            let mut assets = assets
+            let (mut assets, asset_slugs): (Vec<PathBuf>, Vec<Option<String>>) = assets
                 .iter()
-                .map(|a| plowrt::asset::serve::take_asset_arg(a))
-                .collect::<Result<Vec<_>, _>>()?;
+                .map(|a| plowrt::asset::serve::take_asset_spec(a))
+                .collect::<Result<Vec<_>, _>>()?
+                .into_iter()
+                .unzip();
             for m in &model {
                 assets.push(dist_cmd::resolve_local(m)?);
             }
             plowrt::asset::serve::log_checkpoints(&assets);
             tracing::info!(
                 assets = ?assets,
+                asset_slugs = ?asset_slugs,
                 port,
                 socket = ?socket,
                 executors,
@@ -998,6 +1002,7 @@ async fn async_main(
             );
             serve(
                 assets,
+                asset_slugs,
                 served_model_name,
                 port,
                 bind,
@@ -3446,6 +3451,7 @@ fn simulate(
 
 async fn bringup_runtime(
     assets: Vec<PathBuf>,
+    asset_slugs: Vec<Option<String>>,
     executors: u32,
     trace: bool,
     mux_cfg: MuxConfig,
@@ -3499,13 +3505,16 @@ async fn bringup_runtime(
     #[cfg(feature = "hsa")]
     let visible = backend.peer().map_or(1, |p| p.peer_agent_count()) as usize;
     let cfg = RuntimeConfig::get();
+    // AMD takes `--pin` / `--place` (groups over every visible agent, all models resident);
+    // the device subset and the VRAM residency budget stay CUDA's.
+    let placed_here = cfg!(feature = "hsa") && vendor == Some(hwspec::Vendor::Amd);
     if vendor != Some(hwspec::Vendor::Nvidia)
         && (!cfg.devices.is_empty()
-            || !cfg.pin.is_empty()
-            || cfg.place != plowrt::serve::placement::Place::Spread
-            || cfg.nv.vram_budget_mib.is_some())
+            || cfg.nv.vram_budget_mib.is_some()
+            || (!placed_here
+                && (!cfg.pin.is_empty() || cfg.place != plowrt::serve::placement::Place::Spread)))
     {
-        return Err("model placement and VRAM residency management currently require CUDA; use ROCR_VISIBLE_DEVICES to restrict AMD devices".into());
+        return Err("--devices and VRAM residency management require CUDA (model placement: CUDA or AMD); use ROCR_VISIBLE_DEVICES to restrict AMD devices".into());
     }
     if vendor.is_some() {
         tracing::info!(class = ?backend.class(), vendor = ?vendor, "backend ready — GPU accelerated");
@@ -3523,8 +3532,11 @@ async fn bringup_runtime(
     let execset = Arc::new(ExecutorSet::bringup(backend)?);
 
     let registry = Registry::new();
-    for dir in &assets {
-        let slug = registry.load(dir, None)?;
+    // CLI registration order (registry iteration is sorted by slug).
+    let mut registered: Vec<String> = Vec::with_capacity(assets.len());
+    for (i, dir) in assets.iter().enumerate() {
+        let slug = registry.load(dir, asset_slugs.get(i).cloned().flatten())?;
+        registered.push(slug.clone());
         let target = registry.get(&slug)?.manifest.gpu.clone();
         let target_vendor = hwspec::registry::lookup(&target).map(|s| s.vendor);
         if target_vendor.is_some() && target_vendor == vendor {
@@ -4001,47 +4013,27 @@ async fn bringup_runtime(
     #[allow(unused_mut)]
     let mut amd_dp: Vec<(String, usize)> = Vec::new();
 
-    // AMD/gfx950 engines. Deliberately NOT under the S1 `ModelManager`: that is
-    // the multi-model residency planner (VRAM planning, co-residency, evict-LRU)
-    // and it is CUDA-only. Every bundle is loaded once and stays up for the life
-    // of the process, so the install is a straight loop here.
+    // AMD/gfx950 engines. Not under the S1 `ModelManager` (CUDA VMM residency: VRAM planning,
+    // switching, evict-LRU): every bundle loads once and stays resident. Placement is the
+    // planner the CUDA path runs (`serve::placement`): each instance — a model, or `slug#r`
+    // for a `--dp` rank — gets a contiguous group of the widest packet's TP degree over the
+    // visible agents, by `--pin <instance>@<first ordinal>` or else `--place` (spread: one
+    // instance per group while groups last). Each instance is its own engine
+    // (`AmdServe::load_on`), dispatcher, prefix cache and engine thread (pinned to its rank 0's
+    // socket); requests route by model slug, and a DP model's through the DP router. Instances
+    // sharing a group share its agents, and HSA has no cooperative-launch refusal to turn the
+    // CU oversubscription into an error: those need `--co-sched rr`.
     //
-    // Note that this loop DOES install an engine per bundle, and each opens
-    // ordinal 0 — so two AMD models genuinely do share one agent, with no
-    // planner accounting for it. `--co-sched rr` is the only ordering available
-    // to them until the manager grows an AMD backend.
-    //
-    // A bundle qualifies exactly as on the CUDA side: its assets dir carries a
-    // PLOWDEV blob. It additionally needs the gfx950 code objects, whose dir is
-    // `--rt-hsaco` / `PLOW_HSACO` or `<assets>/hsaco`; the TP degree is read off
-    // the packet.
+    // A bundle qualifies exactly as on the CUDA side: its assets dir carries a PLOWDEV blob. Its
+    // gfx950 code objects come from `--rt-hsaco` / `PLOW_HSACO` (every bundle), else
+    // `<assets>/hsaco`, else the assets dir itself; the TP degree is read off the packet.
     #[cfg(feature = "hsa")]
     if vendor == Some(hwspec::Vendor::Amd) {
-        let slugs: Vec<String> = state.registry.slugs();
-        // Count the bundles that will actually reach the AMD engine. The loop
-        // below skips any without a PLOWDEV blob, so counting every registered
-        // slug refused a serve that pairs one AMD bundle with a CPU-reference
-        // one — two models registered, but only ever one on the agent.
-        let mut co_resident = 0usize;
-        for slug in &slugs {
-            let bundle = state.registry.get(slug)?;
-            if plowrt::asset::devblob::DevBlob::find_in_dir(&bundle.dir)?.is_some() {
-                co_resident += 1;
-            }
-        }
-        if co_resident > 1
-            && cfg
-                .co_sched
-                .is_some_and(|mode| mode != plowrt::serve::cosched::CoSched::Rr)
-        {
-            return Err("AMD co-resident models require --co-sched rr; separate HSA queues do not guarantee whole-grid residency".into());
-        }
-        // `--dp`: rank r of a TP-t packet runs on the visible ordinals r*t..(r+1)*t, as its own
-        // engine `slug#r` with its own dispatcher, prefix cache and engine thread (pinned to
-        // its rank 0's socket); the DP router picks a rank per request. Planned before any
-        // load so the router is installed when the engines register.
+        use plowrt::serve::dp::{rank_key, DpRouter, DpSet, RouteCfg};
+        use plowrt::serve::placement::{self, ModelSpec};
+        let slugs = registered.as_slice();
         let mut plan: Vec<(String, PathBuf, u32, usize)> = Vec::new();
-        for slug in &slugs {
+        for slug in slugs {
             let bundle = state.registry.get(slug)?;
             let Some(blob) = plowrt::asset::devblob::DevBlob::find_in_dir(&bundle.dir)? else {
                 continue;
@@ -4063,15 +4055,76 @@ async fn bringup_runtime(
         if let Some(m) = dp_spec.named().find(|m| !plan.iter().any(|p| p.0 == *m)) {
             return Err(format!("--dp {m}=… names a model this server does not serve on the GPU").into());
         }
-        {
-            use plowrt::serve::dp::{rank_key, DpRouter, DpSet, RouteCfg};
+        let instance = |slug: &str, n: usize, r: usize| {
+            if n > 1 {
+                rank_key(slug, r)
+            } else {
+                slug.to_string()
+            }
+        };
+        let mut specs: Vec<ModelSpec> = Vec::new();
+        for (slug, _, tp, n) in &plan {
+            for r in 0..*n {
+                specs.push(ModelSpec {
+                    slug: instance(slug, *n, r),
+                    model: slug.clone(),
+                    tp: *tp,
+                    // One unit per instance and unbounded groups: `spread` then balances
+                    // instance counts, `pack` fills the first group.
+                    required: 1,
+                    device: None,
+                });
+            }
+        }
+        // As on CUDA: `--pin slug@o` goes to the model's next unpinned rank, `slug#r@o` to that rank.
+        for (slug, ordinal) in placement::parse_pins(&cfg.pin)? {
+            let unpinned = specs
+                .iter()
+                .position(|s| (s.slug == slug || s.model == slug) && s.device.is_none());
+            match unpinned.or_else(|| specs.iter().position(|s| s.slug == slug)) {
+                Some(i) => specs[i].device = Some(ordinal),
+                None => {
+                    return Err(
+                        format!("--pin {slug}@{ordinal} names a model this server does not serve").into()
+                    )
+                }
+            }
+        }
+        if !specs.is_empty() {
+            let ordinals: Vec<u32> = (0..visible as u32).collect();
+            let width = placement::grouping_width(&specs, visible).map_err(|e| e.to_string())?;
+            let groups =
+                placement::plan_groups(&ordinals, width, u64::MAX).map_err(|e| e.to_string())?;
+            let layout = placement::assign(&specs, &groups, cfg.place).map_err(|e| e.to_string())?;
+            let tenants: Vec<usize> = (0..layout.groups.len())
+                .map(|g| layout.assignment.iter().filter(|&&a| a == g).count())
+                .collect();
+            if tenants.iter().any(|&t| t > 1)
+                && cfg
+                    .co_sched
+                    .is_some_and(|mode| mode != plowrt::serve::cosched::CoSched::Rr)
+            {
+                return Err("AMD models sharing a device group require --co-sched rr; separate HSA queues do not guarantee whole-grid residency".into());
+            }
+            let first_of = |key: &str| {
+                let i = specs.iter().position(|s| s.slug == key).expect("planned instance");
+                layout.groups[layout.assignment[i]].first()
+            };
+            for (i, s) in specs.iter().enumerate() {
+                let g = layout.assignment[i];
+                state.set_slug_group(&s.slug, g);
+                tracing::info!(
+                    instance = %s.slug, tp = s.tp, group = g,
+                    ordinals = ?layout.groups[g].ordinals.iter().take(s.tp as usize).collect::<Vec<_>>(),
+                    "placement: AMD instance"
+                );
+            }
             let mut router = DpRouter::new(RouteCfg::from_config());
             for (slug, _, tp, n) in plan.iter().filter(|p| p.3 > 1) {
                 let ranks = (0..*n)
                     .map(|r| {
                         let key = rank_key(slug, r);
-                        state.set_slug_group(&key, r);
-                        ((r as u32) * tp, r, state.model_metrics(&key))
+                        (first_of(&key), r, state.model_metrics(&key))
                     })
                     .collect();
                 tracing::info!(%slug, dp = n, tp, cfg = ?router.cfg, "dp: AMD ranks planned");
@@ -4080,54 +4133,57 @@ async fn bringup_runtime(
             }
             if !router.is_empty() {
                 state.install_dp(router);
-                state.install_device_turns(amd_dp.iter().map(|d| d.1).max().unwrap_or(1), false);
             }
-        }
-        for (slug, blob, tp, n) in plan {
-            let bundle = state.registry.get(&slug)?;
-            // Same refusal the CUDA path makes (`serve::manager::load_model`):
-            // a real model driven through the byte-fallback tokenizer produces
-            // fluent-looking GARBAGE, not an error, because the ids bear no
-            // relation to the checkpoint's vocab. Refuse loudly instead.
-            if bundle.tokenizer().is_byte_fallback() {
-                return Err(format!(
-                    "{slug}: the AMD engine requires a real tokenizer.json in {}",
-                    bundle.dir.display()
-                )
-                .into());
-            }
-            let hsaco = RuntimeConfig::get()
-                .amd
-                .hsaco
-                .clone()
-                .map(PathBuf::from)
-                .unwrap_or_else(|| bundle.dir.join("hsaco"));
-            let ckpt = plowrt::asset::serve::checkpoint_dir(&bundle.dir);
-            tracing::info!(
-                %slug, blob = %blob.display(), hsaco = %hsaco.display(),
-                checkpoint = %ckpt.display(), "loading AMD engine"
-            );
-            if n == 1 {
-                let t0 = std::time::Instant::now();
-                let eng = plowrt::serve::engine::AmdServe::load(&blob, &hsaco, Some(&ckpt))?;
+            // One co-tenant turn per group, before any dispatcher resolves its turn at spawn.
+            state.install_group_turns(&tenants, false);
+            for (slug, blob, tp, n) in &plan {
+                let bundle = state.registry.get(slug)?;
+                // Same refusal the CUDA path makes (`serve::manager::load_model`):
+                // a real model driven through the byte-fallback tokenizer produces
+                // fluent-looking GARBAGE, not an error, because the ids bear no
+                // relation to the checkpoint's vocab. Refuse loudly instead.
+                if bundle.tokenizer().is_byte_fallback() {
+                    return Err(format!(
+                        "{slug}: the AMD engine requires a real tokenizer.json in {}",
+                        bundle.dir.display()
+                    )
+                    .into());
+                }
+                let hsaco = RuntimeConfig::get()
+                    .amd
+                    .hsaco
+                    .clone()
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| {
+                        let own = bundle.dir.join("hsaco");
+                        if own.is_dir() {
+                            own
+                        } else {
+                            bundle.dir.clone()
+                        }
+                    });
+                let ckpt = plowrt::asset::serve::checkpoint_dir(&bundle.dir);
                 tracing::info!(
-                    %slug, secs = t0.elapsed().as_secs_f64(), max_ctx = eng.max_ctx(),
-                    "AMD engine loaded"
+                    %slug, blob = %blob.display(), hsaco = %hsaco.display(),
+                    checkpoint = %ckpt.display(), "loading AMD engine"
                 );
-                state.install_gpu_engine(slug, plowrt::serve::engine::ServeEngine::Amd(eng));
-                continue;
-            }
-            for r in 0..n {
-                let key = plowrt::serve::dp::rank_key(&slug, r);
-                let first = (r as u32 * tp) as u8;
-                let t0 = std::time::Instant::now();
-                let eng =
-                    plowrt::serve::engine::AmdServe::load_on(&blob, &hsaco, Some(&ckpt), first)?;
-                tracing::info!(
-                    %key, first_device = first, tp, secs = t0.elapsed().as_secs_f64(),
-                    max_ctx = eng.max_ctx(), "AMD DP rank loaded"
-                );
-                state.install_gpu_engine(key, plowrt::serve::engine::ServeEngine::Amd(eng));
+                for r in 0..*n {
+                    let key = instance(slug, *n, r);
+                    let first = u8::try_from(first_of(&key))
+                        .map_err(|_| format!("{key}: device ordinal out of range"))?;
+                    let t0 = std::time::Instant::now();
+                    let eng = plowrt::serve::engine::AmdServe::load_on(
+                        blob,
+                        &hsaco,
+                        Some(&ckpt),
+                        first,
+                    )?;
+                    tracing::info!(
+                        %key, first_device = first, tp, secs = t0.elapsed().as_secs_f64(),
+                        max_ctx = eng.max_ctx(), "AMD engine loaded"
+                    );
+                    state.install_gpu_engine(key, plowrt::serve::engine::ServeEngine::Amd(eng));
+                }
             }
         }
     }
@@ -4159,13 +4215,9 @@ async fn bringup_runtime(
         state.install_portable_manager(portable);
     }
 
-    // Backends other than the CUDA placement path serve ONE device set, so one
-    // turn covers it. A no-op when that path already installed the real group
-    // count. This is not CUDA-only for a reason: the AMD loop above installs an
-    // engine per bundle and each opens the same ROCr agent, so two AMD models
-    // on one card is a shape that already exists — and HSA has no
-    // cooperative-launch refusal to turn the resulting CU oversubscription into
-    // an error rather than a hang.
+    // Backends without a placement pass serve ONE device set, so one turn covers
+    // it. A no-op when the CUDA or AMD placement already installed the real group
+    // count.
     state.install_device_turns(1, false);
 
     // Spawn a per-model dispatcher: bucket-mux + arrival-rate batch formation.
@@ -4236,7 +4288,8 @@ async fn bench(
     )?;
     plowrt::serve::bench::validate_request_layout(&input, warmup_requests, requests)?;
     validate_token_audit_options(token_audit, &input, warmup_requests, requests, output_len)?;
-    let state = bringup_runtime(vec![assets], executors, false, mux_cfg, Vec::new()).await?;
+    let state =
+        bringup_runtime(vec![assets], Vec::new(), executors, false, mux_cfg, Vec::new()).await?;
     let models = state.registry.slugs();
     let [model] = models.as_slice() else {
         return Err(format!("bench requires exactly one model, loaded {}", models.len()).into());
@@ -4417,6 +4470,7 @@ fn parse_prefill_lengths(raw: &str) -> Result<Vec<usize>, Box<dyn std::error::Er
 
 async fn serve(
     assets: Vec<PathBuf>,
+    asset_slugs: Vec<Option<String>>,
     served_model_name: Vec<String>,
     port: u16,
     bind: std::net::IpAddr,
@@ -4426,7 +4480,8 @@ async fn serve(
     trace: bool,
     mux_cfg: MuxConfig,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let state = bringup_runtime(assets, executors, trace, mux_cfg, served_model_name).await?;
+    let state =
+        bringup_runtime(assets, asset_slugs, executors, trace, mux_cfg, served_model_name).await?;
     #[cfg(feature = "cuda")]
     {
         let state = Arc::clone(&state);

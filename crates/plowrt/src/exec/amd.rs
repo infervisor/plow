@@ -7358,6 +7358,23 @@ impl AmdEngine {
                         path.display()
                     )));
                 }
+                let slot = super::tp::PeerLayout::xr_tag_slot_cfg();
+                if slot % 256 != 0 || slot < super::tp::PeerLayout::XR_TAG_SLOT {
+                    return Err(RuntimeError::Device(format!(
+                        "PLOW_XR_TAG_SLOT={slot} must be a multiple of 256 and at least {}",
+                        super::tp::PeerLayout::XR_TAG_SLOT
+                    )));
+                }
+                let want = (slot != super::tp::PeerLayout::XR_TAG_SLOT)
+                    .then(|| format!("plow_xr_tag_slot_{slot}"));
+                let have = syms.iter().copied().find(|s| s.starts_with("plow_xr_tag_slot_"));
+                if have != want.as_deref() {
+                    return Err(RuntimeError::Device(format!(
+                        "{} ({XR_TAGGED_SYM}): object tag slot marker {have:?} does not match \
+                         PLOW_XR_TAG_SLOT={slot}; build the decode objects with the same value",
+                        path.display()
+                    )));
+                }
                 super::amd_tp::check_xr_tagged_blob(&blob.progs, blob.tp.map_or(0, |b| b.hidden))
                     .map_err(|e| {
                     RuntimeError::Device(format!("{} ({XR_TAGGED_SYM}): {e}", path.display()))

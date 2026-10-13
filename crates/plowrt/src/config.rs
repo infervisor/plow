@@ -711,7 +711,7 @@ pub struct RuntimeConfig {
     #[arg(long = "pin", env = "PLOW_PIN", value_delimiter = ',', global = true)]
     pub pin: Vec<String>,
 
-    /// Data-parallel ranks per model on one serve (CUDA, TP1 bundles): `--dp 8`, `--dp all`
+    /// Data-parallel ranks per model on one serve (CUDA TP1 bundles; AMD any TP): `--dp 8`, `--dp all`
     /// (one per device group), or per model `--dp gemma=4,asr=2`. Each rank is a full copy on its
     /// own device group; requests route by session, prefix cache and load. Unset = 1.
     #[arg(long = "dp", env = "PLOW_DP", value_delimiter = ',', global = true)]
@@ -1878,6 +1878,11 @@ pub struct AmdRuntimeConfig {
     /// Compact the exact TP counter audit on device, then read one status word per rank.
     #[arg(long = "amd-tp-audit-compact", env = "PLOW_TP_AUDIT_COMPACT", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub tp_audit_compact: bool,
+
+    /// Bytes per tagged one-shot XReduce slot; must equal the decode object's
+    /// `PLOW_XR_TAG_SLOT_BYTES` (a non-default object exports `plow_xr_tag_slot_<N>`).
+    #[arg(long = "amd-xr-tag-slot", env = "PLOW_XR_TAG_SLOT", default_value_t = 20480, global = true)]
+    pub xr_tag_slot: u32,
 
     /// Read each TP prefill chunk's exact counter audit through host-mapped large BAR instead
     /// of one D2H copy per rank. Same gates, same expectations.

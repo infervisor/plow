@@ -741,6 +741,36 @@ fn emit_glm53_hc_pre(
         ),
         None => (residual, s.mixes, s.post_mix, s.comb_mix, s.layer_input, rows),
     };
+    let (scale, base) = if ffn {
+        (w.ffn_scale, w.ffn_base)
+    } else {
+        (w.attn_scale, w.attn_base)
+    };
+    // PLOW_GLM_HC_PRE_TAIL (one-row decode): the HyperConnPre below runs on this GemvF32's
+    // last-arriving workgroup, with its operands in a u32 descriptor (interp.hip
+    // `exec_hc_pre_tail`). The separate pre packet was one workgroup, so this is the same call.
+    let tail = (band.is_none() && rows == 1 && emit_config::active().glm_hc_pre_tail).then(|| {
+        let side = if ffn { "ffn" } else { "attn" };
+        let ctr = b.tensor(&format!("act.hc_pre_tail.{layer}.{side}.ctr"), 4);
+        let (fold, nout, gamma) = norm_fold.map_or((0, 0, 0), |(o, g)| (1, o, g));
+        let words = [
+            post_mix,
+            comb_mix,
+            layer_input,
+            scale,
+            base,
+            ctr,
+            fold,
+            nout,
+            gamma,
+            c.hidden,
+            20,
+            c.eps.to_bits(),
+            1e-6f32.to_bits(),
+        ];
+        let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        b.tensor_init(&format!("act.hc_pre_tail.{layer}.{side}.desc"), bytes)
+    });
     let cm = b.emit(DevOp::GemvF32, b.all(), &[dep], |d| {
         d.t[0] = mixes;
         d.t[1] = residual;
@@ -757,7 +787,14 @@ fn emit_glm53_hc_pre(
             d.t[5] = post_mix;
             d.t[6] = comb_mix;
         }
+        if let Some(desc) = tail {
+            d.i[4] = 1;
+            d.t[7] = desc;
+        }
     });
+    if tail.is_some() {
+        return cm;
+    }
     b.emit(
         DevOp::HyperConnPre,
         (0..rows.min(b.n_cu())).collect(),
@@ -768,8 +805,8 @@ fn emit_glm53_hc_pre(
             d.t[2] = layer_input;
             d.t[3] = mixes;
             d.t[4] = residual;
-            d.t[5] = if ffn { w.ffn_scale } else { w.attn_scale };
-            d.t[6] = if ffn { w.ffn_base } else { w.attn_base };
+            d.t[5] = scale;
+            d.t[6] = base;
             d.i[0] = rows;
             d.i[1] = 4;
             d.i[2] = c.hidden;
@@ -819,6 +856,45 @@ fn emit_glm53_hc_post(
             d.i[2] = c.hidden;
         },
     )
+}
+
+/// PLOW_GLM_XR_HCPOST: fold the HyperConnPost of a batched decode block into the one-shot
+/// XReduce `dep` that wrote its `raw` input (t2..t5 = the post's operands, j0 = hidden).
+/// Only a plain gate one-shot qualifies (no gather, no combine fold, `rows > 1` so the message
+/// outgrows the tagged slot, `rows * hidden` elements). Returns the XReduce, now the post's completion.
+#[allow(clippy::too_many_arguments)]
+fn glm53_xr_hcpost(
+    b: &mut Builder,
+    c: &GlmCfg,
+    s: &Glm53State,
+    out: u32,
+    raw: u32,
+    residual: u32,
+    rows: u32,
+    dep: u32,
+) -> Option<u32> {
+    let d = b.inst(dep);
+    let fits = d.op == DevOp::XReduce as u16
+        && d.t[0] == raw
+        && d.t[1] == packet::TENSOR_NONE
+        && d.t[2] == packet::TENSOR_NONE
+        && d.i[5] == 0
+        && d.i[7] == 0
+        && d.j[0] == 0
+        && d.i[0] == rows * c.hidden
+        && rows > 1
+        && c.hidden % 8 == 0;
+    if !fits {
+        return None;
+    }
+    b.patch(dep, |d| {
+        d.t[2] = out;
+        d.t[3] = residual;
+        d.t[4] = s.post_mix;
+        d.t[5] = s.comb_mix;
+        d.j[0] = c.hidden;
+    });
+    Some(dep)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -889,6 +965,7 @@ fn emit_glm53_program(
         && emit_config::active().glm_hc_post_fold
         && rows * 24 <= b.n_cu();
     let mut pending_post: Option<(u32, u32)> = None;
+    let xr_hcpost = !prefill && bv.is_none() && c.tp > 1 && emit_config::active().glm_xr_hcpost;
     for l in 0..c.layers as usize {
         let residual = s.residual[ri];
         let next = s.residual[ri ^ 1];
@@ -1006,6 +1083,11 @@ fn emit_glm53_program(
         let raw = bv.map_or(n.attn, |v| v.og);
         let (c_post, attn_post) = if post_fold_on {
             (c_attn, Some((raw, residual)))
+        } else if let Some(x) = xr_hcpost
+            .then(|| glm53_xr_hcpost(b, c, s, next, raw, residual, rows, c_attn))
+            .flatten()
+        {
+            (x, None)
         } else {
             (emit_glm53_hc_post(b, c, s, next, raw, residual, rows, c_attn, bv), None)
         };
@@ -1069,6 +1151,11 @@ fn emit_glm53_program(
         if post_fold_on && l + 1 < c.layers as usize {
             pending_post = Some((raw, residual));
             dep = c_ffn;
+        } else if let Some(x) = xr_hcpost
+            .then(|| glm53_xr_hcpost(b, c, s, next, raw, residual, rows, c_ffn))
+            .flatten()
+        {
+            dep = x;
         } else {
             dep = emit_glm53_hc_post(b, c, s, next, raw, residual, rows, c_ffn, bv);
         }
@@ -1271,6 +1358,9 @@ pub(crate) fn glm53_emit_full(
         let mut b = Builder::new(n_cu);
         b.set_tensor_dedup(true);
         b.adopt_tensors(tensors.clone());
+        if rows > 1 {
+            b.set_gemm_small_splitk(ec.glm_dec_splitk.unwrap_or(0));
+        }
         emit_glm53_program(&mut b, &c, &n, &s, ctx, rows, dbatch, enc, false);
         let prog = b.finish();
         tensors = prog.tensors.clone();
@@ -2040,6 +2130,33 @@ fn emit_glm_shared_w8a8_glu(
         d.i[..2].copy_from_slice(&[rows * inter, act]);
         d.f[1] = limit;
     })
+}
+
+/// `PLOW_MOE_PF_W8A8` for one grouped prefill MoE (ops 85/86 `i[7] = 2`): 1x128 FP8 routed
+/// input, fp8 x fp8 MFMA against the [128,128] weight grid, GLU output re-quantized 1x128 for
+/// DOWN. Refuses rather than silently falling back when the knob meets a shape it cannot run.
+fn glm_moe_pf_w8a8(c: &GlmCfg, enc: MoeEnc, native_moe: bool, tk: u32, imoe_e: u32, h: u32) -> bool {
+    if !emit_config::active().moe_pf_w8a8 {
+        return false;
+    }
+    assert!(
+        enc == MoeEnc::Fp8Blk
+            && crate::emit_is_amd()
+            && crate::amd_target::active().1 == hwspec::IsaLevel::Gfx950,
+        "PLOW_MOE_PF_W8A8 requires gfx950 and block-FP8 experts"
+    );
+    assert!(
+        !c.ep
+            && !native_moe
+            && !emit_config::active().glm_routed_w8a8
+            && moe_pf_fuse(tk) == MoePfFuse::None,
+        "PLOW_MOE_PF_W8A8 excludes EP, vendor MoE, PLOW_GLM_ROUTED_W8A8 and fused reductions"
+    );
+    assert!(
+        imoe_e % 256 == 0 && h % 128 == 0,
+        "PLOW_MOE_PF_W8A8 needs intermediate % 256 == 0 and H % 128 == 0"
+    );
+    true
 }
 
 fn emit_glm_routed_w8a8(
@@ -3026,6 +3143,7 @@ fn declare_glm_rows_batched_for_prefill(
     let native_moe = enc == MoeEnc::Fp8Blk
         && (emit_config::active().glm_moe_aiter() || emit_config::active().glm_moe_resident());
     let has_dense = layer_ids.iter().copied().any(|l| c.is_dense(l));
+    let pf_w8a8 = rows > 1 && glm_moe_pf_w8a8(c, enc, native_moe, tk, imoe_e, h);
     let compact_native_scratch = native_moe
         && has_dense
         && !prefill_rows.is_empty()
@@ -3116,6 +3234,8 @@ fn declare_glm_rows_batched_for_prefill(
             ac(b, "moe_fug", fug_bytes),
             if enc == MoeEnc::Mxfp4 {
                 ac(b, "moe_fuscale", pad_rows * (imoe_e / MX_BLOCK) as u64)
+            } else if pf_w8a8 {
+                ac(b, "moe_fuscale", pad_rows * (imoe_e / 128) as u64 * F32)
             } else {
                 TENSOR_NONE
             },
@@ -3519,7 +3639,14 @@ fn declare_glm_rows_batched_for_prefill(
                 && moe_pf_fuse(tk) == MoePfFuse::None),
         "PLOW_GLM_ROUTED_W8A8 excludes EP, shared folding, vendor MoE and fixed-point reduction"
     );
-    let [routed_xq, routed_xs, routed_hq, routed_hs] = if routed_w8a8 {
+    let [routed_xq, routed_xs, routed_hq, routed_hs] = if pf_w8a8 {
+        [
+            ac(b, "routed_xq", rows * h as u64),
+            ac(b, "routed_xs", rows * (h / 128) as u64 * F32),
+            TENSOR_NONE,
+            TENSOR_NONE,
+        ]
+    } else if routed_w8a8 {
         [
             ac(b, "routed_xq", rows * h as u64),
             ac(b, "routed_xs", rows * (h / 128) as u64 * F32),
@@ -4770,12 +4897,24 @@ pub(crate) fn glm_decode_gemm_tile(rows: u32, n: u32, k: u32, n_cu: u32) -> Opti
     if !crate::emit_is_amd() || !emit_config::active().glm_decode_gemm_rows_on(rows) {
         return None;
     }
-    let op = crate::pick_tile(rows, n, k, n_cu, kernelcaps::QuantScheme::None);
-    Some(if matches!(op, DevOp::GemmSmall | DevOp::GemmMed | DevOp::Gemm) {
+    Some(glm_decode_tile_of(crate::pick_tile(
+        rows,
+        n,
+        k,
+        n_cu,
+        kernelcaps::QuantScheme::None,
+    )))
+}
+
+/// The decode object's tile for a prefill pick. Not GemmMed: the GLM_SHARD_HEAD B=128 shard
+/// (N = vocab/8) picked it, and on the gfx950 decode object it ran in 8 us (floor ~30 us) and
+/// every sequence sampled garbage. Nothing showed the failure to be specific to the head shape.
+fn glm_decode_tile_of(op: DevOp) -> DevOp {
+    if matches!(op, DevOp::GemmSmall | DevOp::Gemm) {
         op
     } else {
         DevOp::GemmSmall
-    })
+    }
 }
 
 fn glm_decode_gemv_cus(cus: &[u32], op: DevOp, n: u32, k: u32) -> Vec<u32> {
@@ -6648,8 +6787,9 @@ const GLM_SP_MIN_ROWS: u32 = 2048;
 /// (rank 0's row band) need nothing special. Without them the 8192 body ran full-width two-shots
 /// and served +114 ms per middle chunk against the seams prefill program (tier 4, tb-t4). The
 /// GLM-5.3 packed siblings (KDA hybrid, `softmax_layers` non-empty) take them for the same
-/// reason: spans are packed from row 0, so a band's rows hold whole spans' rows or parked ones,
-/// and the packed norm arm's row mask, read at band-local rows, only ever skips parked rows.
+/// reason. A seam norm's rows are band-local, so the loader keeps it off the packed-norm object
+/// and gives its segment no span table or parked mask (`derive_packed_plain_segments`): it
+/// norms every band row, parked ones included.
 /// Other packed siblings without a band keep the two-shot seams.
 fn glm_sp(c: &GlmCfg, n: &GlmTn, b: &Builder, t: u32) -> bool {
     n.h2_tp != TENSOR_NONE
@@ -9599,7 +9739,22 @@ fn emit_glm_moe_ffn_prefill(
         b.isolate(counter);
         counter
     } else {
-        let c_g = b.emit(DevOp::MoeGroupGluPf, all.clone(), &[c_align, c_rn2], |d| {
+        // Same predicate as the scratch declaration (`rows > 1`), or the tensors are absent.
+        let pf_w8a8 = t > 1 && glm_moe_pf_w8a8(c, enc, native_moe, tk, imoe_e, h);
+        let c_x = if pf_w8a8 {
+            b.emit(
+                DevOp::QuantFp8Block128,
+                glm_quant128_cus(&all, t, h),
+                &[c_rn2],
+                |d| {
+                    d.t[..3].copy_from_slice(&[n.routed_xq, n.xn2, n.routed_xs]);
+                    d.i[..2].copy_from_slice(&[t, h]);
+                },
+            )
+        } else {
+            c_rn2
+        };
+        let c_g = b.emit(DevOp::MoeGroupGluPf, all.clone(), &[c_align, c_x], |d| {
             d.t[0] = n.fu_g;
             d.t[1] = n.xn2;
             d.t[2] = w.ewt;
@@ -9621,6 +9776,15 @@ fn emit_glm_moe_ffn_prefill(
             let (act, limit) = glm_glu_act(c);
             d.i[5] = act;
             d.f[1] = limit;
+            // W8A8: A = the 1x128 fp8 rows + their [H/128][T] scales; the GLU writes fp8 `fu_g`
+            // and its own 1x128 scales into `fu_scale`.
+            if pf_w8a8 {
+                d.t[1] = n.routed_xq;
+                d.t[6] = n.routed_xs;
+                d.t[7] = n.fu_scale;
+                d.i[4] = t;
+                d.i[7] = 2;
+            }
         });
         // 19 grouped down + gate-scale + SCATTER into part[T*k, H]. row_partidx carries each gathered
         //    row's fixed destination, so the align op's nondeterministic within-expert row ORDER does
@@ -9648,6 +9812,10 @@ fn emit_glm_moe_ffn_prefill(
             // never read a blob emitted for the other as its own.
             if det {
                 d.i[5] = tk.trailing_zeros() + 1;
+            }
+            if pf_w8a8 {
+                d.t[5] = n.fu_scale;
+                d.i[7] = 2;
             }
         });
         c_d
@@ -12343,11 +12511,6 @@ fn emit_glm_tail(
     } else if let Some(tile) =
         (nb > 0).then(|| glm_decode_gemm_tile(rows, vocab_l, c.hidden, b.n_cu())).flatten()
     {
-        // GemmSmall only: the GLM_SHARD_HEAD B=128 shard (N = vocab/8) picked GemmMed, the one
-        // GemmMed in any decode program, and on the gfx950 decode object it ran in 8 us (floor
-        // ~30 us) and every sequence sampled garbage. The replicated head and the B=32 shard
-        // already take GemmSmall.
-        let tile = if tile == DevOp::GemmMed { DevOp::GemmSmall } else { tile };
         b.emit(tile, all, &[c_f], |d| {
             d.t[0] = n.logits;
             d.t[1] = n.xn;

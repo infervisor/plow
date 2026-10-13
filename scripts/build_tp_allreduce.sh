@@ -27,6 +27,7 @@ XR_DEF=()
 [ "${PLOW_XR_NOWAIT:-0}" = 1 ] && XR_DEF+=("-DPLOW_XR_NOWAIT=1")
 [ "${PLOW_XR_NOSIG:-0}" = 1 ] && XR_DEF+=("-DPLOW_XR_NOSIG=1")
 [ "${PLOW_XR_MLP:-0}" = 1 ] && XR_DEF+=("-DPLOW_XR_MLP=1")
+[ "${PLOW_XR_VEC:-0}" != 0 ] && XR_DEF+=("-DPLOW_XR_VEC=$PLOW_XR_VEC")
 XR_RS_U=${PLOW_XR_RS_U:-}
 if [ -z "$XR_RS_U" ]; then
   XR_RS_U=1

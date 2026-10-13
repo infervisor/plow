@@ -572,6 +572,12 @@ The packet from config + index alone (no weights) is 70 MB: 4 prefill buckets + 
   top1_decisive 0.9989; needles 36/36, split (PF_CHUNK=512) 18/18; prefix_check2 re-sends cached
   4096 = cold 4/4. Strict reports 19 cells MATCHED/EQUIVALENT: 0.14-0.56x vLLM (v8 0.08-0.31x).
   PLOW_PF_INTERLEAVE=2048 screen: -4..-18% throughput, kept 4096. Recipe moved to v9.
+- 10:40 UTC, v10 = v9 + decode bodies, collectives/attention defaults, prefill kernels, packed
+  multi-prompt prefill with decode rows riding (mixed prefill+decode, default on), DP2xTP4 serve,
+  Codex review fixes (packet e4786a2c, plowrt 927f76eb). Gates: validate r1/B8/B32/B128
+  12.4/22.9/30.2/40.3 ms ranks agree; FP32 PASS kl_mean 0.01342 (DP2xTP4 0.01295); needles 36/36,
+  split 18/18; prefix re-sends cached 4096 == cold 4/4. Strict TP8 reports 19 cells
+  MATCHED/EQUIVALENT: 0.25-0.62x vLLM (v9 0.14-0.56x). Recipe moved to v10.
 - 17:35 UTC, E10 TP4 bench (packet pkt-glm53flash-tp4-ladder-v4, 4 GPUs, real prompt, streams
   exact at every rung): scalar (rung 8) 55.5 ms, B=8 51.4, B=32 63.3, B=64 74.6 ms (858 tok/s
   per group); prefill 1k 204 ms (TP8 173). Two such groups (DP2xTP4) would serve 128 streams at
@@ -618,12 +624,22 @@ The packet from config + index alone (no weights) is 70 MB: 4 prefill buckets + 
   2 x 12 s; c1 greedy pairs (one copy per group) equal 8/8; vs TP8 serve 7/8, the eighth at a
   TP8 exact tie (gap 0.0); needles 4k/16k 18/18 (cache on); FP32 gate PASS kl_mean 0.01258,
   kl_p99 0.172, top1_decisive 0.9967, needles 18/18 (v9 TP8: 0.01384 / 0.237 / 0.9989).
+- 11:15 UTC (10-13), co-resident models on AMD (branch serve-multimodel-amd2): an AMD serve places
+  every bundle (and `--dp` rank) with `serve::placement` on its own TP group (`--pin S@first`,
+  else spread) and loads it there; `--assets DIR,slug=NAME` serves one packet under two names.
+  Each model keeps its own engine, dispatcher, per-slot prefix cache and socket-pinned engine
+  thread; turns stay free for a group of one. Launch: `plowrt serve --assets <tp4>,slug=glm-a
+  --pin glm-a@0 --assets <tp4>,slug=glm-b --pin glm-b@4`. v10 TP4 packet twice (GPUs 0-3, 4-7):
+  load 2 x 13 s; `/v1/models` lists both; c1 greedy streams of each model equal a single-model
+  TP4 serve 8/8, one model at a time and both at once; needles 4k/16k 18/18 per model (cache on,
+  both models at once); c64 per model, isl 1024 / osl 128: 6151 + 6163 = 12303 total tok/s,
+  128/128 each; metrics carry `model_name` per model.
 
 ## 5. Results
 
 Strict `campaign.py report` output per input length and the combined comparison.csv:
 [docs/bringup/results/glm53flash-mi350x-2026-10-12](../bringup/results/glm53flash-mi350x-2026-10-12/summary.md).
-No qualified win: plow total throughput 0.14-0.56x vLLM (v9).
+No qualified win: plow total throughput 0.25-0.62x vLLM (v10).
 
 ## 6. Roofline (CPU, before any plow GPU time)
 

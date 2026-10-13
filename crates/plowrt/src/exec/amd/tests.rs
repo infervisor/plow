@@ -6390,6 +6390,27 @@ fn token_batch_seam_norms_stay_on_the_primary_object() {
         derive_packed_plain_segments(&plain_prog).unwrap(),
         [false; 4]
     );
+    // A GLM-5.3 packed sibling's TP8 seam norm runs on a 1024-row band of the 8192 rung; its
+    // band-local rows are not packed rows, so it leaves the packed-norm object and its segment
+    // carries no span table or parked mask.
+    let sibling = ProgramRole::PackedSibling { of_rows: 8192 };
+    let sibling_prog = prog(
+        sibling,
+        vec![
+            inst(DevOp::RmsNorm, 8192),
+            inst(DevOp::RmsNorm, 1024),
+            inst(DevOp::FlashMlaPrefillFp8, 8192),
+        ],
+        &[0, 1, 2],
+    );
+    assert_eq!(
+        derive_packed_segment_families(&sibling_prog).unwrap(),
+        [5, 0, 6]
+    );
+    assert_eq!(
+        derive_packed_plain_segments(&sibling_prog).unwrap(),
+        [false, true, false]
+    );
 }
 
 #[test]

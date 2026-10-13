@@ -665,6 +665,7 @@ pub const RUNTIME: &[KnobSpec] = &[
     KnobSpec::new("rt.tp_no_audit", Some("PLOW_TP_NO_AUDIT"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("rt.tp_audit_direct", Some("PLOW_TP_AUDIT_DIRECT"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("rt.tp_audit_compact", Some("PLOW_TP_AUDIT_COMPACT"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
+    KnobSpec::new("rt.xr_tag_slot", Some("PLOW_XR_TAG_SLOT"), Layer::Runtime, U32, Default::Static(Val::Nat(20480)), OPT_IN),
     KnobSpec::new("rt.tp_prefill_audit_direct", Some("PLOW_TP_PREFILL_AUDIT_DIRECT"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
     KnobSpec::new("rt.tp_prefill_audit_pinned", Some("PLOW_TP_PREFILL_AUDIT_PINNED"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
     KnobSpec::new("rt.launch_rows", Some("PLOW_LAUNCH_ROWS"), Layer::Runtime, U32, UNSET, OPT_IN),

@@ -355,7 +355,7 @@ template <int BM, int BN, int BK, int WM, int WN, bool NORM, int SWZ = GM_SWZ, i
 #if PLOW_GLM_FUSE_POST
           , bool ROPE = false
 #endif
-          >
+          , bool SPLITK = false>
 __device__ void d_gemm_t(bf16* __restrict__ C, const bf16* __restrict__ A,
                          const bf16* __restrict__ B, const float* __restrict__ rms,
                          const bf16* __restrict__ gamma, unsigned M, unsigned N, unsigned K,
@@ -369,7 +369,11 @@ __device__ void d_gemm_t(bf16* __restrict__ C, const bf16* __restrict__ A,
                          const float* __restrict__ rsin = nullptr,
                          const int* __restrict__ rpos = nullptr, unsigned roff = 0
 #endif
-                         ) {
+                         , unsigned ldk = 0) {
+    /* SPLITK: A and B are already offset to this K slice and K is the slice length; the row
+     * stride stays the full K (`ldk`). Off, LDK folds to K and the codegen is unchanged. */
+    const unsigned LDK = SPLITK ? ldk : K;
+    (void)ldk;
 #if PLOW_GLM_FUSE_POST
     static_assert(!ROPE || (!NORM && !GLU && !WFP4 && !WFP8BLK), "the RoPE epilogue is bf16 only");
 #endif
@@ -611,7 +615,7 @@ __device__ void d_gemm_t(bf16* __restrict__ C, const bf16* __restrict__ A,
             const float sc = (r < M) ? rms[r] : 0.0f;                                         \
             __align__(16) bf16 tv[8], tg[8];                                                  \
             if (r < M) {                                                                      \
-                *(bf16v8*)tv = ld_glob8(as_glob(A) + (size_t)r * K + kk);                     \
+                *(bf16v8*)tv = ld_glob8(as_glob(A) + (size_t)r * LDK + kk);                     \
                 *(bf16v8*)tg = ld_glob8(as_glob(gamma) + kk);                                 \
                 _Pragma("unroll") for (int j = 0; j < 8; j++)                                 \
                     ra[it * 8 + j] = f2bf(bf2f(tv[j]) * sc * bf2f(tg[j]));                    \
@@ -619,14 +623,14 @@ __device__ void d_gemm_t(bf16* __restrict__ C, const bf16* __restrict__ A,
                 _Pragma("unroll") for (int j = 0; j < 8; j++) ra[it * 8 + j] = 0;             \
             }                                                                                 \
         } else if constexpr (KEXACT) {                                                        \
-            if (r < M) *(bf16v8*)&ra[it * 8] = ld_glob8(as_glob(A) + (size_t)r * K + kk);     \
+            if (r < M) *(bf16v8*)&ra[it * 8] = ld_glob8(as_glob(A) + (size_t)r * LDK + kk);     \
             else _Pragma("unroll") for (int j = 0; j < 8; j++) ra[it * 8 + j] = 0;            \
         } else {                                                                              \
             if (r < M && kk + 8u <= K)                                                        \
-                *(bf16v8*)&ra[it * 8] = ld_glob8(as_glob(A) + (size_t)r * K + kk);            \
+                *(bf16v8*)&ra[it * 8] = ld_glob8(as_glob(A) + (size_t)r * LDK + kk);            \
             else                                                                              \
                 _Pragma("unroll") for (int j = 0; j < 8; j++) ra[it * 8 + j] =                \
-                    (r < M && kk + j < K) ? A[(size_t)r * K + kk + j] : (bf16)0;              \
+                    (r < M && kk + j < K) ? A[(size_t)r * LDK + kk + j] : (bf16)0;              \
         }                                                                                     \
     }                                                                                         \
     _Pragma("unroll") for (int it = 0; it < BPASS; it++) {                                    \
@@ -669,14 +673,14 @@ __device__ void d_gemm_t(bf16* __restrict__ C, const bf16* __restrict__ A,
                     reinterpret_cast<const unsigned char*>(bsrc) + (size_t)r * K + kk));       \
             else _Pragma("unroll") for (int j = 0; j < 8; j++) rb[it * 8 + j] = 0;            \
         } else if constexpr (KEXACT) {                                                        \
-            if (r < N) *(bf16v8*)&rb[it * 8] = ld_glob8(as_glob(bsrc) + (size_t)r * K + kk);  \
+            if (r < N) *(bf16v8*)&rb[it * 8] = ld_glob8(as_glob(bsrc) + (size_t)r * LDK + kk);  \
             else _Pragma("unroll") for (int j = 0; j < 8; j++) rb[it * 8 + j] = 0;            \
         } else {                                                                              \
             if (r < N && kk + 8u <= K)                                                        \
-                *(bf16v8*)&rb[it * 8] = ld_glob8(as_glob(bsrc) + (size_t)r * K + kk);         \
+                *(bf16v8*)&rb[it * 8] = ld_glob8(as_glob(bsrc) + (size_t)r * LDK + kk);         \
             else                                                                              \
                 _Pragma("unroll") for (int j = 0; j < 8; j++) rb[it * 8 + j] =                \
-                    (r < N && kk + j < K) ? bsrc[(size_t)r * K + kk + j] : (bf16)0;           \
+                    (r < N && kk + j < K) ? bsrc[(size_t)r * LDK + kk + j] : (bf16)0;           \
         }                                                                                     \
     }
 
@@ -709,7 +713,7 @@ __device__ void d_gemm_t(bf16* __restrict__ C, const bf16* __restrict__ A,
         const unsigned Rloc = e / BK;                                                         \
         const unsigned r = m0 + Rloc;                                                         \
         const unsigned rc = (r < M) ? r : (M - 1);                                            \
-        cp_async16(as_glob(A) + (size_t)rc * K + (k0) + GM_XORSWZ(Rloc, e % BK),                 \
+        cp_async16(as_glob(A) + (size_t)rc * LDK + (k0) + GM_XORSWZ(Rloc, e % BK),                 \
                    &GM_ASM(buf)[(threadIdx.x & ~63u) * 8 + it * (THREADS * 8)]);              \
     }                                                                                         \
     _Pragma("unroll") for (int it = 0; it < BPASS; it++) {                                    \
@@ -717,7 +721,7 @@ __device__ void d_gemm_t(bf16* __restrict__ C, const bf16* __restrict__ A,
         const unsigned Rloc = e / BK;                                                         \
         const unsigned r = n0 + Rloc;                                                         \
         const unsigned rc = (r < N) ? r : (N - 1);                                            \
-        cp_async16(as_glob(B) + (size_t)rc * K + (k0) + GM_XORSWZ(Rloc, e % BK),                 \
+        cp_async16(as_glob(B) + (size_t)rc * LDK + (k0) + GM_XORSWZ(Rloc, e % BK),                 \
                    &GM_BSM(buf)[(threadIdx.x & ~63u) * 8 + it * (THREADS * 8)]);              \
     }
 
@@ -1287,6 +1291,60 @@ __device__ void d_gemm_small(bf16* C, const bf16* A, const bf16* B, unsigned M, 
     d_gemm_t<GM_SM_BM, GM_SM_BN, GM_SM_BK, GM_WM, GM_WN, false>(C, A, B, nullptr, nullptr, M, N, K,
                                                                 slice, nblk, lds);
 }
+#if PLOW_GEMM_SMALL_SPLITK
+/* Decode GemmSmall split-K (emit knob PLOW_GLM_DEC_SPLITK; NOT bit-identical to the unsplit
+ * tile: each output is S fp32 partial sums over consecutive K slices, added in slice order).
+ * Item (tile t, slice s) runs the unchanged 64x128 tile body over K slice s into the fp32
+ * workspace `part[s]` (CF32 epilogue); the workgroup whose bump closes tile t's S bumps sums the
+ * S partials in fixed order and rounds once to bf16, so the result does not depend on arrival
+ * order. `ctr` is one loader-zeroed word per tile (bumped S times per call). */
+__device__ void d_gemm_small_splitk(bf16* C, const bf16* A, const bf16* B, unsigned M,
+                                    unsigned N, unsigned K, unsigned S, float* part,
+                                    unsigned* ctr, unsigned slice, unsigned nblk, bf16* lds) {
+    constexpr int BM = GM_SM_BM, BN = GM_SM_BN, BK = GM_SM_BK;
+    const unsigned tm = (M + BM - 1) / BM, tn = (N + BN - 1) / BN, nt = tm * tn;
+    const unsigned ks = S ? K / S : 0u;
+    if (S < 2u || ks * S != K || ks % BK != 0u || part == nullptr || ctr == nullptr)
+        __builtin_trap();
+    __shared__ unsigned sk_last;
+    for (unsigned it = slice; it < nt * S; it += nblk) {
+        const unsigned t = it / S, s = it % S;
+        d_gemm_t<BM, BN, BK, GM_WM, GM_WN, false, GM_SWZ, GM_WGM, (GM_PP != 0), true, false, false,
+                 false, true
+#if PLOW_GLM_FUSE_POST
+                 , false
+#endif
+                 , true>((bf16*)(part + (size_t)s * M * N), A + (size_t)s * ks, B + (size_t)s * ks,
+                         nullptr, nullptr, M, N, ks, t, nt, lds, nullptr, 0, nullptr, nullptr,
+                         nullptr
+#if PLOW_GLM_FUSE_POST
+                         , nullptr, nullptr, nullptr, 0
+#endif
+                         , K);
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            const unsigned old = __hip_atomic_fetch_add(&ctr[t], 1u, __ATOMIC_ACQ_REL,
+                                                        __HIP_MEMORY_SCOPE_AGENT);
+            sk_last = (old % S) == S - 1u;
+        }
+        __syncthreads();
+        if (!sk_last) continue;
+        asm volatile("buffer_inv" ::: "memory");
+        __syncthreads();
+        const unsigned tile = gm_remap<GM_SWZ, GM_WGM>(t, nt, tm, tn);
+        const unsigned m0 = (tile / tn) * BM, n0 = (tile % tn) * BN;
+        for (unsigned e = threadIdx.x; e < (unsigned)(BM * BN); e += PLOW_THREADS) {
+            const unsigned mm = m0 + e / BN, nn = n0 + e % BN;
+            if (mm >= M || nn >= N) continue;
+            const size_t o = (size_t)mm * N + nn;
+            float v = part[o];
+            for (unsigned q = 1; q < S; q++) v += part[(size_t)q * M * N + o];
+            st_act1(&C[o], f2bf(v));
+        }
+        __syncthreads();
+    }
+}
+#endif
 __device__ void d_gemm_med(bf16* C, const bf16* A, const bf16* B, unsigned M, unsigned N,
                            unsigned K, unsigned slice, unsigned nblk, bf16* lds) {
     d_gemm_t<GM_MD_BM, GM_MD_BN, GM_MD_BK, GM_WM, GM_WN, false>(C, A, B, nullptr, nullptr, M, N, K,
@@ -5582,6 +5640,11 @@ __device__ void d_gemv(bf16* C, const bf16* x, const bf16* W, const float* rms,
  * legitimate fp32-vs-f64 reduction-order noise reads as a large relative error against a
  * true value close to zero from ~300-term cancellation; the absolute differences across
  * every output stayed under 4e-6). */
+/* PLOW_GEMV_F32_VEC=1: d_gemv_f32 and d_gemv_bf16_f32 walk K eight elements per lane when
+ * K % 8 == 0 (reassociated f32 sums). d_gemv_f32_tile and d_gemv_f32_wg reproduce that order. */
+#ifndef PLOW_GEMV_F32_VEC
+#define PLOW_GEMV_F32_VEC 0
+#endif
 __device__ void d_gemv_f32(float* __restrict__ C, const bf16* __restrict__ x,
                            const float* __restrict__ W, unsigned M, unsigned N, unsigned K,
                            unsigned slice, unsigned nblk) {
@@ -5590,18 +5653,20 @@ __device__ void d_gemv_f32(float* __restrict__ C, const bf16* __restrict__ x,
     /* One wave per (row, column) OUTPUT, row-major so a block's waves share one x row. The
      * column-only walk this replaced left every wave past the N-th idle and ran M serially:
      * GLM-5.3-Flash's mHC mix (N=24, K=16384) took ~800 ms per layer at T=8192, 92% of the
-     * prefill. M=1 maps exactly as before, so the decode and indexer results are bit-identical. */
+     * prefill. Each output keeps its lane-strided walk, so without PLOW_GEMV_F32_VEC the
+     * results are bit-identical to the column walk. */
     for (size_t output = slice * PLOW_WAVES + wave; output < (size_t)M * N;
          output += nblk * PLOW_WAVES) {
         const unsigned m = output / N, n = output % N;
         const bf16* const xm = x + (size_t)m * K;
         const float* const wn = W + (size_t)n * K;
         float acc = 0.0f;
-        if ((K & 7u) == 0u) {
+        if (PLOW_GEMV_F32_VEC && (K & 7u) == 0u) {
             /* 8 elements per lane per step with several steps in flight. The scalar walk below
              * issued one dependent 2 B + 4 B pair per step, K/64 steps deep: ~130 us per
              * packet at K=16384 (latency, not bandwidth), 90 packets on the serial mHC chain
-             * of every decode step. f32 accumulation, reassociated. */
+             * of every decode step. f32 accumulation, reassociated: a different sum than the
+             * scalar walk, so only packets qualified on it (GLM-5.3-Flash gfx950) build it. */
 #pragma unroll 4
             for (unsigned k = lane * 8u; k < K; k += PLOW_WAVE * 8u) {
                 const bf16v8 xv = ld_glob8(xm + k);
@@ -5742,7 +5807,7 @@ __device__ void d_gemv_bf16_f32(float* __restrict__ C, const bf16* __restrict__ 
         const bf16* const xm = x + (size_t)m * K;
         const bf16* const wn = W + (size_t)n * K;
         float acc = 0.0f;
-        if ((K & 7u) == 0u) {
+        if (PLOW_GEMV_F32_VEC && (K & 7u) == 0u) {
             /* Same latency argument as d_gemv_f32 above: the GLM router (N=288, K=4096)
              * spent ~78 us per packet on a 64-step dependent scalar walk. */
 #pragma unroll 4
