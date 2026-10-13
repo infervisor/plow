@@ -14,6 +14,9 @@ use crate::{Result, RuntimeError};
 pub(super) const OBJECT: &str = "mla_pf_dense_gfx950.elf";
 pub(super) const SYMBOL: &str = "plow_mla_pf_dense_gfx950";
 pub(super) const MARKER: &str = "plow_mla_pf_dense_abi_1";
+/// The DSA sparse (union-table gather) entry point in the same object.
+pub(super) const GATHER_SYMBOL: &str = "plow_mla_pf_gather_gfx950";
+pub(super) const GATHER_MARKER: &str = "plow_mla_pf_gather_abi_1";
 /// gfx950 LDS per CU; the object is static-LDS only.
 pub(super) const LDS_MAX: u32 = 160 * 1024;
 pub(super) const THREADS: u32 = 256;
@@ -42,6 +45,24 @@ pub(super) struct Args {
 
 const _: () = assert!(std::mem::size_of::<Args>() == 80);
 
+/// `plow_mla_pf_gather_gfx950` kernargs: single sequence, ns = 1, the per-8-query union table.
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+pub(super) struct GatherArgs {
+    pub opart: u64,
+    pub mlpart: u64,
+    pub q: u64,
+    pub ckv: u64,
+    pub uni: u64,
+    pub n_tok: u32,
+    pub cap: u32,
+    pub kv_mask: u32,
+    pub scale: f32,
+    pub _pad: [u32; 2],
+}
+
+const _: () = assert!(std::mem::size_of::<GatherArgs>() == 64);
+
 #[derive(Clone, Copy, Debug)]
 pub(super) struct Route {
     pub args: Args,
@@ -49,9 +70,27 @@ pub(super) struct Route {
     pub inst: usize,
     /// Packet tensor ids of `opart, mlpart, q, ckv, kv_len` for KV-slot rebasing.
     pub tens: [u16; 5],
+    /// DSA sparse prefill: (union table address, its packet tensor id, cap).
+    pub gather: Option<(u64, u16, u32)>,
 }
 
 impl Route {
+    pub fn gather_args(&self) -> Option<GatherArgs> {
+        let (uni, _, cap) = self.gather?;
+        Some(GatherArgs {
+            opart: self.args.opart,
+            mlpart: self.args.mlpart,
+            q: self.args.q,
+            ckv: self.args.ckv,
+            uni,
+            n_tok: self.args.n_tok,
+            cap,
+            kv_mask: self.args.kv_mask,
+            scale: self.args.scale,
+            _pad: [0; 2],
+        })
+    }
+
     /// Single-sequence grid: one workgroup per (8-token pack, split).
     pub fn grid(&self) -> u32 {
         self.args.n_tok.div_ceil(TOKENS_PER_ITEM) * self.args.ns
@@ -90,6 +129,24 @@ pub(super) fn eligible(d: &DevInst64) -> bool {
         && f32::from_bits(d.fj[0]).is_finite()
 }
 
+/// The DSA sparse prefill flash (t7 = the per-8-query union table, i6 = its cap): the gather
+/// entry point. Single sequence only; the packed topology emits no union table.
+pub(super) fn eligible_gather(d: &DevInst64) -> bool {
+    d.op == DevOp::FlashMlaPrefill as u16
+        && d.i[3] & 0x8000_0000 != 0
+        && d.i[3] & 0x7fff_ffff == 0
+        && d.i[0] == 1
+        && d.i[1] == HEADS
+        && d.i[4] != 0
+        && d.t[7] != TENSOR_NONE16
+        && d.i[6] != 0
+        && d.i[6] & 0x8000_0000 == 0
+        && [d.t[0], d.t[1], d.t[2], d.t[4], d.t[6]]
+            .iter()
+            .all(|&t| t != TENSOR_NONE16)
+        && f32::from_bits(d.fj[0]).is_finite()
+}
+
 /// Segments that are exactly one eligible flash with no counter obligations. Token-batch bodies
 /// and row-split siblings keep the interpreter (their rows are not a plain chunk or span set).
 pub(super) fn routes(
@@ -109,7 +166,10 @@ pub(super) fn routes(
         };
         let ok = e.wait_len == 0
             && e.succ_len == 0
-            && prog.insts.get(e.inst as usize).is_some_and(eligible);
+            && prog
+                .insts
+                .get(e.inst as usize)
+                .is_some_and(|d| eligible(d) || eligible_gather(d));
         *slot = match *slot {
             None if ok => Some(Some(e.inst as usize)),
             Some(Some(i)) if ok && i == e.inst as usize => Some(Some(i)),
@@ -126,7 +186,8 @@ pub(super) fn routes(
             continue;
         };
         let d = &prog.insts[ix];
-        let ns = (d.i[6] & 0xff).max(1);
+        let gather = eligible_gather(d);
+        let ns = if gather { 1 } else { (d.i[6] & 0xff).max(1) };
         out[seg] = Some(Route {
             args: Args {
                 opart: addr(d.t[0], "Opart")?,
@@ -142,10 +203,15 @@ pub(super) fn routes(
                 kv_mask: d.i[5],
                 ns,
                 scale: f32::from_bits(d.fj[0]),
-                flags: (d.i[6] >> 8) & 1,
+                flags: if gather { 0 } else { (d.i[6] >> 8) & 1 },
             },
             inst: ix,
             tens: [d.t[0], d.t[1], d.t[2], d.t[4], d.t[6]],
+            gather: if gather {
+                Some((addr(d.t[7], "union")?, d.t[7], d.i[6]))
+            } else {
+                None
+            },
         });
     }
     Ok(out)

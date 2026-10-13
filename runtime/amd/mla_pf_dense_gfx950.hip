@@ -27,6 +27,7 @@
 #if defined(__HIP_DEVICE_COMPILE__)
 extern "C" __device__ unsigned plow_mla_pf_dense_abi_1 = 1;
 extern "C" __device__ unsigned plow_mla_pf_dense_nope_h8_d512_1 = 1;
+extern "C" __device__ unsigned plow_mla_pf_gather_abi_1 = 1;
 #endif
 
 namespace mla_pfd {
@@ -36,11 +37,12 @@ constexpr unsigned SUB = BKV / 2 * PS;       // one 256-wide latent sub-tile (ha
 constexpr unsigned STAGE = 2 * SUB;          // halves
 constexpr unsigned PEX_B = 2 * STAGE * 2;    // byte offsets
 constexpr unsigned STATS_B = PEX_B + 4 * 2 * 64 * 16;
-constexpr unsigned LDS_BYTES = STATS_B + 4 * 32 * 4;  // 152,064
+constexpr unsigned MASK_B = STATS_B + 4 * 32 * 4;     // gather: per-stage key membership words
+constexpr unsigned LDS_BYTES = MASK_B + 2 * BKV * 4;  // 152,576
 typedef bf16_t bx4 __attribute__((ext_vector_type(4)));
 typedef float fx4 __attribute__((ext_vector_type(4)));
 }  // namespace mla_pfd
-static_assert(mla_pfd::LDS_BYTES == 152064u, "LDS footprint");
+static_assert(mla_pfd::LDS_BYTES == 152576u, "LDS footprint");
 /* LDS fragment loads kept in flight ahead of the consuming MFMA (QK and PV loops). */
 #ifndef PLOW_MLA_PFD_PF
 #define PLOW_MLA_PFD_PF 4
@@ -55,22 +57,24 @@ __device__ __forceinline__ mla_pfd::bx4 mla_pfd_tr16(const bf16* p) {
     return __builtin_amdgcn_ds_read_tr16_b64_v4bf16(lp);
 }
 
-extern "C" __global__ __launch_bounds__(256, 1) void plow_mla_pf_dense_gfx950(
+// G (gather): the DSA sparse prefill. `uni` is the IndexUnionPf table (pack = 8 queries): a
+// 256-B-padded u32 count per pack, then per pack [cap] i32 positions (ascending), [cap] u32 query
+// membership bits (bit q = pack query q selected the key), [cap] u32 high words (unused, 8 queries).
+// Single sequence, ns = 1; Ckv/Q/O addressing as the dense form.
+template <bool G>
+__device__ __forceinline__ void mla_pfd_body(
     float* __restrict__ Opart, float* __restrict__ mlpart, const bf16* __restrict__ Q,
     const bf16* __restrict__ Ckv, const int* __restrict__ kv_len,
-    const PlowKvSpan* __restrict__ spans, unsigned n_spans, unsigned n_tok, unsigned n_head,
-    unsigned kv_stride, unsigned kv_mask, unsigned ns, float scale, unsigned flags) {
-#if defined(__HIP_DEVICE_COMPILE__)
+    const PlowKvSpan* __restrict__ spans, unsigned n_spans, unsigned n_tok, unsigned kv_mask,
+    unsigned ns, float scale, unsigned flags, const unsigned char* __restrict__ uni, unsigned cap,
+    unsigned char* lds) {
     using namespace mla_pfd;
-    (void)n_head;
-    (void)kv_stride;
-    __shared__ __attribute__((aligned(16))) unsigned char lds[LDS_BYTES];
     const unsigned tid = threadIdx.x, lane = tid & 63u, wave = tid >> 6;
     const unsigned g = lane >> 5, r32 = lane & 31u;
     const unsigned g16 = (lane >> 4) & 1u, i16 = lane & 15u;
     const unsigned rt = wave & 1u, kh = wave >> 1, pw = wave ^ 2u;
     const float sl2 = scale * 1.4426950408889634f;
-    const unsigned nsp = ns ? ns : 1u;
+    const unsigned nsp = G ? 1u : (ns ? ns : 1u);
     bf16* const lh = (bf16*)lds;
     float* const stats = (float*)(lds + STATS_B);
     bf16x8* const pex = (bf16x8*)(lds + PEX_B);
@@ -80,7 +84,8 @@ extern "C" __global__ __launch_bounds__(256, 1) void plow_mla_pf_dense_gfx950(
     unsigned w = blockIdx.x;
     unsigned row0 = 0, rows = n_tok, qpos0 = 0, len = 0;
     const bf16* ck = Ckv;
-    if (n_spans == 0u) {
+    if (G) {
+    } else if (n_spans == 0u) {
         len = (unsigned)kv_len[0];
         qpos0 = len - n_tok;
     } else {
@@ -106,6 +111,15 @@ extern "C" __global__ __launch_bounds__(256, 1) void plow_mla_pf_dense_gfx950(
     const unsigned qlast = qt * QP + QP - 1u;
     unsigned kv_end = qpos0 + (qlast < rows ? qlast : rows - 1u) + 1u;
     if (kv_end > len) kv_end = len;
+    // Gather: the walk is over the pack's union entries [0, ucount).
+    const int* upos = nullptr;
+    const unsigned* umask = nullptr;
+    if (G) {
+        const unsigned hdr = (n_qt * 4u + 255u) / 256u * 256u;
+        kv_end = ((const unsigned*)uni)[qt];
+        upos = (const int*)(uni + hdr + (size_t)qt * cap * 12u);
+        umask = (const unsigned*)(uni + hdr + (size_t)qt * cap * 12u + (size_t)cap * 4u);
+    }
     const unsigned ntl = (kv_end + BKV - 1u) / BKV;
     const unsigned cpt = (ntl + nsp - 1u) / nsp;
     const unsigned walk_lo = sp * cpt * BKV;
@@ -121,12 +135,16 @@ extern "C" __global__ __launch_bounds__(256, 1) void plow_mla_pf_dense_gfx950(
 #pragma unroll
         for (unsigned k = 0; k < 8; k++) {
             const unsigned p = 8u * wave + k, row = 2u * p + (lane & 1u);
-            const unsigned kv = c0 + row < walk_end ? c0 + row : walk_lo;  // finite, masked below
+            unsigned kv = c0 + row < walk_end ? c0 + row : walk_lo;  // finite, masked below
+            if (G) kv = (unsigned)upos[kv];
             const size_t kr = (size_t)(kv & kv_mask) * DK;
 #pragma unroll
             for (unsigned u = 0; u < 2; u++)
                 cp_async16(cg + kr + u * 256u + 8u * (lane >> 1), st + u * SUB + p * PS);
         }
+        if (G && wave == 0u && lane < 16u)
+            cp_async16((const PLOW_GLOB bf16*)as_glob((const bf16*)(umask + c0) + lane * 8u),
+                       (bf16*)(lds + MASK_B + (c & 1u) * BKV * 4u));
     };
 
     if (nch) stage(0);
@@ -172,7 +190,17 @@ extern "C" __global__ __launch_bounds__(256, 1) void plow_mla_pf_dense_gfx950(
         }
         // key k = c0 + 32kh + 4g + (i&3) + 8(i>>2); only the diagonal / ragged chunks mask.
         float mx = -INFINITY;
-        if (c0 + BKV - 1u > qfirst || c0 + BKV > walk_end) {
+        if (G) {
+            const unsigned* msk = (const unsigned*)(lds + MASK_B + (c & 1u) * BKV * 4u);
+#pragma unroll
+            for (unsigned i = 0; i < 16; i++) {
+                const unsigned kc = 32u * kh + 4u * g + (i & 3u) + 8u * (i >> 2);
+                const bool on = c0 + kc < walk_end && ((msk[kc] >> ql) & 1u);
+                const float x = on ? s[i] * sl2 : -INFINITY;
+                s[i] = x;
+                mx = fmaxf(mx, x);
+            }
+        } else if (c0 + BKV - 1u > qfirst || c0 + BKV > walk_end) {
 #pragma unroll
             for (unsigned i = 0; i < 16; i++) {
                 const unsigned key = c0 + 32u * kh + 4u * g + (i & 3u) + 8u * (i >> 2);
@@ -241,7 +269,7 @@ extern "C" __global__ __launch_bounds__(256, 1) void plow_mla_pf_dense_gfx950(
     if (g == 0u) stats[wave * 32u + r32] = lrow;
     __syncthreads();
     const float lt = lrow + stats[pw * 32u + r32];
-    if (qv && (flags & 1u)) {
+    if (qv && !G && (flags & 1u)) {
         // W_ofold epilogue (ns == 1): normalized bf16 latent rows for the fused o-GEMM.
         const float inv = lt > 0.0f ? 1.0f / lt : 0.0f;
         bf16* orow = (bf16*)Opart + (((size_t)row0 + qi) * NH + hh) * DK + kh * 256u;
@@ -272,5 +300,31 @@ extern "C" __global__ __launch_bounds__(256, 1) void plow_mla_pf_dense_gfx950(
             ml[1] = lt;
         }
     }
+}
+
+extern "C" __global__ __launch_bounds__(256, 1) void plow_mla_pf_dense_gfx950(
+    float* __restrict__ Opart, float* __restrict__ mlpart, const bf16* __restrict__ Q,
+    const bf16* __restrict__ Ckv, const int* __restrict__ kv_len,
+    const PlowKvSpan* __restrict__ spans, unsigned n_spans, unsigned n_tok, unsigned n_head,
+    unsigned kv_stride, unsigned kv_mask, unsigned ns, float scale, unsigned flags) {
+#if defined(__HIP_DEVICE_COMPILE__)
+    (void)n_head;
+    (void)kv_stride;
+    __shared__ __attribute__((aligned(16))) unsigned char lds[mla_pfd::LDS_BYTES];
+    mla_pfd_body<false>(Opart, mlpart, Q, Ckv, kv_len, spans, n_spans, n_tok, kv_mask, ns, scale,
+                        flags, nullptr, 0u, lds);
+#endif
+}
+
+extern "C" __global__ __launch_bounds__(256, 1) void plow_mla_pf_gather_gfx950(
+    float* __restrict__ Opart, float* __restrict__ mlpart, const bf16* __restrict__ Q,
+    const bf16* __restrict__ Ckv, const unsigned char* __restrict__ uni, unsigned n_tok,
+    unsigned cap, unsigned kv_mask, float scale, unsigned pad0, unsigned pad1) {
+#if defined(__HIP_DEVICE_COMPILE__)
+    (void)pad0;
+    (void)pad1;
+    __shared__ __attribute__((aligned(16))) unsigned char lds[mla_pfd::LDS_BYTES];
+    mla_pfd_body<true>(Opart, mlpart, Q, Ckv, nullptr, nullptr, 0u, n_tok, kv_mask, 1u, scale, 0u,
+                       uni, cap, lds);
 #endif
 }
