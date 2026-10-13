@@ -6789,6 +6789,7 @@ __attribute__((amdgpu_waves_per_eu(PLOW_WPE, PLOW_WPE))) void PLOW_INTERP_NAME(P
                                       (const float*)tens[in->t[5]], in->fj[1].u);
             } else
 #endif
+            { /* the else-arm is this whole block: the tagged arm opens with its own `if` */
 #if PLOW_XR_TAGGED
             /* Tagged one-shot (op_collective.h): the arrival signal rides in the data. The
              * region sits right after the compact-audit status line, whose id the TP loader
@@ -6834,6 +6835,7 @@ __attribute__((amdgpu_waves_per_eu(PLOW_WPE, PLOW_WPE))) void PLOW_INTERP_NAME(P
 #endif
                            );
 #endif
+            }
         } else if (in->op == PLOW_DOP_XREDUCE_ADD_NORM) {
             /* Fused all-reduce + residual + RMSNorm (op 116, one workgroup):
              *   t0=out t1=resid t2=a t3=gamma  i0=feat i1=n_gpu i2=slot i3=gate  f0=eps */
