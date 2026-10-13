@@ -60,6 +60,23 @@ static __device__ __forceinline__ float qwen_strided_sq4(const float (&f)[4], un
     }
     return s;
 }
+// The same sum over a row still packed as a uint2 (lane L: elements 4L..4L+3): the bf16 pairs
+// move as 32-bit words (two shuffles per tap instead of four float shuffles and three selects)
+// and each lane converts its own element after the move. bf16 -> f32 is exact, so the squares,
+// the per-lane order and the warp tree are those of qwen_strided_sq4: bit-identical.
+static __device__ __forceinline__ float qwen_strided_sq4_pk(const uint2 v, unsigned lane) {
+    float s = 0.f;
+    const unsigned p = lane & 3u;
+#pragma unroll
+    for (unsigned j = 0; j < 4; j++) {
+        const unsigned src = (lane >> 2) + 8u * j;
+        const unsigned wx = __shfl_sync(0xffffffffu, v.x, src), wy = __shfl_sync(0xffffffffu, v.y, src);
+        const unsigned w = (p & 2u) ? wy : wx;
+        const float x = (p & 1u) ? qwen_bf_hi(w) : qwen_bf_lo(w);
+        s += x * x;
+    }
+    return s;
+}
 static __device__ __forceinline__ void qwen_bf_unpack4(const uint2 v, float (&f)[4]) {
     f[0] = qwen_bf_lo(v.x); f[1] = qwen_bf_hi(v.x); f[2] = qwen_bf_lo(v.y); f[3] = qwen_bf_hi(v.y);
 }
@@ -371,7 +388,7 @@ static __device__ void d_qwen_gated_norm(__nv_bfloat16* out, const __nv_bfloat16
                 float v[4], g[4];
                 qwen_bf_unpack4(c2[r], v);
                 qwen_bf_unpack4(z2[r], g);
-                const float inv = rsqrtf(qwen_warp_sum(qwen_strided_sq4(v, lane)) / dim + eps);
+                const float inv = rsqrtf(qwen_warp_sum(qwen_strided_sq4_pk(c2[r], lane)) / dim + eps);
 #pragma unroll
                 for (int j = 0; j < 4; j++) v[j] = v[j] * inv * gm[j] * qwen_silu(g[j]);
                 if (on[r]) *(uint2*)(out + (size_t)(row0 + r) * dim + lane * 4u) = qwen_bf_pack4(v);
@@ -1137,8 +1154,8 @@ static __device__ void d_qwen_gdn_qkv_prep(__nv_bfloat16* q, __nv_bfloat16* k,
                 float qf[4], kf[4];
                 qwen_bf_unpack4(q2[r], qf);
                 qwen_bf_unpack4(k2[r], kf);
-                const float qinv = rsqrtf(qwen_warp_sum(qwen_strided_sq4(qf, lane)) + eps);
-                const float kinv = rsqrtf(qwen_warp_sum(qwen_strided_sq4(kf, lane)) + eps);
+                const float qinv = rsqrtf(qwen_warp_sum(qwen_strided_sq4_pk(q2[r], lane)) + eps);
+                const float kinv = rsqrtf(qwen_warp_sum(qwen_strided_sq4_pk(k2[r], lane)) + eps);
 #pragma unroll
                 for (int j = 0; j < 4; j++) { qf[j] *= qinv; kf[j] *= kinv; }
                 if (row < total) {
