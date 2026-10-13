@@ -609,7 +609,7 @@ fn block_fp8_split3_requires_marker_and_geometry() {
     for (slot, value) in [
         (0, 0),
         (0, u32::MAX),
-        (1, 2560),
+        (1, 2559),
         (2, 6143),
         (3, 0),
         (4, 0),
