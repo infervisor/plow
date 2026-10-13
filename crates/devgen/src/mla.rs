@@ -11331,10 +11331,17 @@ pub(crate) fn emit_glm_moe_ffn(
             d.i[1] = e;
             d.i[2] = h;
         });
-        b.emit(DevOp::MoeRouterTopk, one.clone(), &[c_score], |d| {
+        // PLOW_GLM_ROUTER_WAVE: the one-row tail as op 83 at T = 1 (the same per-token body; on
+        // a PLOW_DEC_ROUTER_WAVE object the wave-per-token rank, byte-identical table).
+        let wave = emit_config::active().glm_router_wave;
+        let op = if wave { DevOp::MoeRouterTopkPf } else { DevOp::MoeRouterTopk };
+        b.emit(op, one.clone(), &[c_score], |d| {
             d.t[0] = n.tab;
             d.t[1] = n.rlogit;
             d.t[3] = w.bias;
+            if wave {
+                d.i[4] = 1;
+            }
             d.i[1] = e;
             d.i[2] = tk;
             d.i[3] = GLM_ROUTER_FLAGS;

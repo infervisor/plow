@@ -257,6 +257,13 @@ case "${PLOW_MOE_ROUTER_PF_WAVE:-0}" in
   1) A4W4_BK="$A4W4_BK -DPLOW_MOE_ROUTER_PF_WAVE=1" ;;
   *) echo "PLOW_MOE_ROUTER_PF_WAVE must be 0 or 1" >&2; exit 2 ;;
 esac
+# PLOW_DEC_ROUTER_WAVE=1: the decode objects' op-83 router tail wave-per-token too (byte-identical
+# table; the batched rungs and a PLOW_GLM_ROUTER_WAVE one-row packet run it).
+case "${PLOW_DEC_ROUTER_WAVE:-0}" in
+  0) ;;
+  1) DEC_KNOBS="$DEC_KNOBS -DPLOW_MOE_ROUTER_PF_WAVE=1" ;;
+  *) echo "PLOW_DEC_ROUTER_WAVE must be 0 or 1" >&2; exit 2 ;;
+esac
 # PLOW_DSA_SELECT_V2=1: DSA prefill top-k (op 118) through d_index_select_pf_v2 (same set).
 case "${PLOW_DSA_SELECT_V2:-0}" in
   0) ;;

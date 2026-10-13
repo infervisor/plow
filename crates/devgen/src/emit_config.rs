@@ -731,6 +731,11 @@ pub struct EmitConfig {
     #[arg(long = "emit-glm-router-dec", env = "PLOW_GLM_ROUTER_DEC", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub glm_router_dec: bool,
 
+    /// GLM one-row decode: emit the router top-k tail as `MoeRouterTopkPf` at T = 1, which a
+    /// `PLOW_DEC_ROUTER_WAVE=1` decode object runs wave-per-token. Byte-identical table.
+    #[arg(long = "emit-glm-router-wave", env = "PLOW_GLM_ROUTER_WAVE", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub glm_router_wave: bool,
+
     /// Materialize MLA Q/K/V and emit the standalone asymmetric gfx950 prefill boundary.
     /// Opt-in candidate: exact for the first chunk, continuation chunks still diverge.
     #[arg(long, env = "PLOW_MLA_MATERIALIZED_PREFILL", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
@@ -1737,6 +1742,7 @@ impl EmitConfig {
             kda_decode_fused: env_bool("PLOW_KDA_DECODE_FUSED"),
             kda_decode_wide: env_bool("PLOW_KDA_DECODE_WIDE"),
             glm_router_dec: env_bool("PLOW_GLM_ROUTER_DEC"),
+            glm_router_wave: env_bool("PLOW_GLM_ROUTER_WAVE"),
             mla_materialized_prefill: env_bool("PLOW_MLA_MATERIALIZED_PREFILL"),
             kda_chunk: env_bool_opt("PLOW_KDA_CHUNK"),
             kda_chunk_qpre: env_opt_out("PLOW_KDA_CHUNK_QPRE"),
