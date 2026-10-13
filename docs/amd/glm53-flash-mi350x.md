@@ -566,6 +566,12 @@ The packet from config + index alone (no weights) is 70 MB: 4 prefill buckets + 
   their donor slots to those adoptions: the per-slot design), B equal A 8/8; the only off-vs-on
   differences (one per phase) sit at exact top-2 ties (gap 0.0) that the cache-off control also
   flips between A and B; long needles 36/36.
+- 06:20 UTC, v9 = v8 + back-to-back prefill / end prefix arm / identical-resend hits (a58ab5a4,
+  1cdc536f, 21d004f6) + decode mHC folds and inlined plow_exec (packet 1533860b). Gates: validate
+  r1/B8/B32/B128 12.5/31.7/52.4/84.7 ms, ranks token-identical; FP32 PASS kl_mean 0.01384,
+  top1_decisive 0.9989; needles 36/36, split (PF_CHUNK=512) 18/18; prefix_check2 re-sends cached
+  4096 = cold 4/4. Strict reports 19 cells MATCHED/EQUIVALENT: 0.14-0.56x vLLM (v8 0.08-0.31x).
+  PLOW_PF_INTERLEAVE=2048 screen: -4..-18% throughput, kept 4096. Recipe moved to v9.
 - 17:35 UTC, E10 TP4 bench (packet pkt-glm53flash-tp4-ladder-v4, 4 GPUs, real prompt, streams
   exact at every rung): scalar (rung 8) 55.5 ms, B=8 51.4, B=32 63.3, B=64 74.6 ms (858 tok/s
   per group); prefill 1k 204 ms (TP8 173). Two such groups (DP2xTP4) would serve 128 streams at
@@ -590,7 +596,7 @@ The packet from config + index alone (no weights) is 70 MB: 4 prefill buckets + 
 
 Strict `campaign.py report` output per input length and the combined comparison.csv:
 [docs/bringup/results/glm53flash-mi350x-2026-10-12](../bringup/results/glm53flash-mi350x-2026-10-12/summary.md).
-No qualified win: plow total throughput 0.08-0.31x vLLM (v8).
+No qualified win: plow total throughput 0.14-0.56x vLLM (v9).
 
 ## 6. Roofline (CPU, before any plow GPU time)
 

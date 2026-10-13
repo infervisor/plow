@@ -13,7 +13,7 @@ name = "glm-5.3-flash"
 label = "gfx950-mi350x-tp8-fp8"
 network = "glm-5.3-flash"
 status = "validated"
-plow_git = "76d03d941eb41e07af806998e8cdfd07eb5b471c"
+plow_git = "70fdf9ebd936d46c89e508cc1b0c7e4e0f49e8b4"
 doc = "docs/amd/glm53-flash-mi350x.md"
 
 # max_ctx 65536: the model's recurrent (KDA) state carries at every length, so long prompts are
@@ -143,9 +143,10 @@ name = "smoke"
 cmd = "scripts/serve_test/smoke.sh"
 
 # FP32-reference gate (scripts/llm/fp32_ref_gate.py, 46 cases incl. 18 needles to 15872 tokens,
-# served c16, prefix cache on) on packet 980625b3: PASS, kl_mean 0.01424 (vLLM 0.03677 on the same
-# reference), kl_p99 0.233 (0.549), top1_decisive 0.9956 (0.9868), needles 18/18.
-# Cross-slot prefix reuse at c8 (4064/8160 tokens resumed): cached streams equal their cold runs.
+# served c16, prefix cache on) on packet 1533860b (v9): PASS, kl_mean 0.01384 (vLLM 0.03677 on the same
+# reference), kl_p99 0.237 (0.549), top1_decisive 0.9989 (0.9868), needles 18/18; needles with
+# PLOW_PF_CHUNK=512 18/18. Prefix reuse at c8 (identical re-sends 4096 cached, 53248 hit tokens):
+# cached streams equal their cold runs 4/4.
 [[gates]]
 name = "llm_fp32_ref"
 cmd = "scripts/llm/fp32_ref_gate.py"
@@ -160,11 +161,11 @@ expect = "36/36"
 
 # One serving cell for orientation; the full grid (isl 1024/4096/16384 at c1..c128, 32768/61440 at
 # c1/c8) and the strict comparison against vLLM are docs/bringup/results/glm53flash-mi350x-2026-10-12.
-# No cell beats vLLM on throughput (0.08-0.31x); see docs/amd/glm53-flash-mi350x.md.
+# No cell beats vLLM on throughput (v9: 0.14-0.56x); see docs/amd/glm53-flash-mi350x.md.
 [measured]
-tok_s = 35.56
-p50_tpot_ms = 25.50
-p50_ttft_ms = 283.65
+tok_s = 70.48
+p50_tpot_ms = 12.64
+p50_ttft_ms = 206.13
 concurrency = 1
 input_len = 4096
 output_len = 128
@@ -172,7 +173,7 @@ client = "vllm 0.31.1rc1 bench serve (scripts/bench/llm_grid.sh)"
 
 # Reproduction gates at THIS commit, checkpoint and nix lock.
 [artifacts]
-"plowrt" = "4cf847f81a59fefd19ec9d0eaa1e9ae65e75e389f9cbef2b240c05fc5fbda048"
+"plowrt" = "bf5a1a85da7089d6d69de81bedec67e0cef8619c243e9d3f69fff91726bd47aa"
 "model.pkt" = "1533860b946b49cc4fc9264d0370539739f265e7e7f562db7aa8fe15d0e67805"
 "interp_decode_k3_gq.elf" = "d2c617e8720d40d80d12d5aa827d87fb72fcbb71d948dc51e7811e14064a8c82"
 "lowrung1/interp_decode_k3_gq.elf" = "a4f5c606f1c51f79019074741ff92746684a6c836f7d0033ea86669df8ca4db8"
