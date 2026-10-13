@@ -670,7 +670,9 @@ The packet from config + index alone (no weights) is 70 MB: 4 prefill buckets + 
     the emitted 8 stays.
   - Kept: `PLOW_XR_TAG_SLOT=90112` (decode objects AND serve env; existing knob, bit-identical)
     lets B=8's [8,4096] message take the tagged one-shot: b8 22.80 -> 22.46 ms/step (three
-    alternating passes each, streams equal at r1/b8/b32/b128).
+    alternating passes each, streams equal at r1/b8/b32/b128 and 4k/16k prompts); other rungs
+    unchanged. Serve FP32 gate with the slot (c16, PF_INTERLEAVE 8192): PASS kl_mean 0.01297,
+    top1_decisive 0.9978, 0 errors, no cross-GPU gate faults.
   - Fusion: RS + HyperConnPost on the band does not pay (the RS runs on 16 fabric-bound
     workgroups; HC post moves 8x its bytes locally). The remaining decode lever is folding the
     tagged poll+reduce into the consumer mHC packet (removes the XReduce hop, ceiling ~0.6 ms/step
