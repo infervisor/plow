@@ -591,6 +591,22 @@ The packet from config + index alone (no weights) is 70 MB: 4 prefill buckets + 
   wide 6 -> 198): r1 24.1 -> 12.3-12.9, B8 42.1 -> 31.2, B32 54.4 -> 53.0 ms, B128 82.0-86.1 vs
   82.3-91.3 (bimodal, within noise), 4k/16k r1 23.5/23.7 -> 13.0/13.1 ms. A GEMV-only direct
   arm instead gave r1 19.4 ms. Serving cells not re-run.
+- 07:40 UTC (10-13), prefill toward roofline (branch kern-prefill-roofline). Per-segment timing
+  (`PLOW_PREFILL_SEG_TIMING`) on pkt-c: a 4k chunk is ~85% interpreter segments, then flash and
+  the lean KDA intra/carry; the first prefill after load pays ~140 ms of cold cost, so per-op
+  numbers below are warm chunks (rank-0 trace, ms per chunk, before -> after; floor at 8192):
+  FlashMlaPrefill 105.7 -> 78.5 (8192 chunk at 16k ctx; floor ~8), MoeGroupDownPf 56.7 -> 32.9
+  (~7.5), MoeGroupGluPf 44.4 -> 33.4 (~6.4), MlaMergeFold 19.4 -> 7.0, router top-k 18.7 -> 9.2,
+  GemmSmall 25.0 -> 19.1, GemmF32 8.7 -> 5.9, KdaConv3 8.4 -> 3.8, lean KDA intra 18.4 -> 11.9;
+  collectives unchanged (RS ~30, AG ~20 vs ~17.6 each at 300 GB/s). All bit-identical and code
+  defaults for GLM-5.3-Flash objects: 288-expert wave router + all-wave align, KDA intra solve /
+  conv3 rows / prepare ILP, MoE DEEP + HDR, GEMM rung re-pick + BK=128 small rung, TR16 flash,
+  token-blocked fold. Validate on the recipe-env objects: every stream byte-equal at rungs
+  1/8/32/128 and 4k/16k/32k/60k prompts; prefill sweep 1k/2k/4k/8k/16k/32k (min of 2)
+  112/139/198/359/759/1769 -> 94/116/167/283/625/1421 ms. Knobs left off: deferred-frame flash
+  softmax (`FA_MLA_PF2_DEFER=1`, 16k flash 79 -> 59 ms, streams differ at 16k), MFMA fold
+  (`PLOW_K3_PF_FOLD_MFMA=1`, streams differ), `PLOW_K3_PF_XR_SCHED=aiter` (~2%, quick streams
+  equal, no full validate yet).
 
 ## 5. Results
 
