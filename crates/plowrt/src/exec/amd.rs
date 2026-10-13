@@ -900,15 +900,20 @@ struct MoeFp8GluArgs {
     scale_table: u64,
     meta: u64,
     row_token: u64,
+    /// W8A8: `[H/128][x_pitch]` input scales and the `[rows][I/128]` output scales; 0 for W8A16.
+    x_scale: u64,
+    out_scale: u64,
     inter: u32,
     hidden: u32,
     experts: u32,
     act: u32,
     beta: f32,
     linear_beta: f32,
+    x_pitch: u32,
+    reserved: u32,
 }
 
-const _: () = assert!(std::mem::size_of::<MoeFp8GluArgs>() == 72);
+const _: () = assert!(std::mem::size_of::<MoeFp8GluArgs>() == 96);
 
 /// `plow_moe_fp8_down_pf_gfx950`.
 #[derive(Clone, Copy, Debug)]
@@ -921,13 +926,15 @@ struct MoeFp8DownArgs {
     meta: u64,
     row_partidx: u64,
     row_gate: u64,
+    /// W8A8: the GLU's `[rows][I/128]` scales; 0 for W8A16.
+    fu_scale: u64,
     hidden: u32,
     inter: u32,
     experts: u32,
     reserved: u32,
 }
 
-const _: () = assert!(std::mem::size_of::<MoeFp8DownArgs>() == 72);
+const _: () = assert!(std::mem::size_of::<MoeFp8DownArgs>() == 80);
 
 
 #[derive(Clone, Copy, Debug)]
@@ -1123,10 +1130,12 @@ enum PrefillSegmentRoute {
     MoeFp8Glu {
         args: MoeFp8GluArgs,
         grid: u32,
+        w8a8: bool,
     },
     MoeFp8Down {
         args: MoeFp8DownArgs,
         grid: u32,
+        w8a8: bool,
     },
     MoeEpAlign(MoeEpAlignRoute),
     MoeEpStage2(MoeStage2Mxfp4Route),
@@ -2134,12 +2143,13 @@ fn moe_fp8_glu_inst(d: &DevInst64) -> bool {
         && d.i[2] != 0
         && d.i[2] <= 512
         && d.i[3] == 1
-        && d.i[4] == 0
         && d.i[6] == 0
-        && d.i[7] == 0
         && d.t[..6].iter().all(|&t| t != NONE)
-        && d.t[6] == NONE
-        && d.t[7] == NONE
+        && match d.i[7] {
+            0 => d.i[4] == 0 && d.t[6] == NONE && d.t[7] == NONE,
+            2 => d.i[4] != 0 && d.t[6] != NONE && d.t[7] != NONE,
+            _ => false,
+        }
 }
 
 fn moe_fp8_down_inst(d: &DevInst64) -> bool {
@@ -2152,9 +2162,13 @@ fn moe_fp8_down_inst(d: &DevInst64) -> bool {
         && d.i[2] != 0
         && d.i[2] <= 512
         && d.i[3] == 1
-        && d.i[4..].iter().all(|&v| v == 0)
+        && d.i[4..7].iter().all(|&v| v == 0)
         && d.t[..5].iter().all(|&t| t != NONE)
-        && d.t[5] == NONE
+        && match d.i[7] {
+            0 => d.t[5] == NONE,
+            2 => d.t[5] != NONE,
+            _ => false,
+        }
         && d.t[6] != NONE
         && d.t[7] != NONE
 }
@@ -2190,12 +2204,20 @@ fn add_moe_fp8_pf_routes(
             RuntimeError::Device(format!("fp8 MoE prefill operand `{what}` handle {h} is invalid"))
         })
     };
+    let opt = |h: u16, what: &str| -> Result<u64> {
+        if h == packet::dev::TENSOR_NONE16 {
+            Ok(0)
+        } else {
+            addr(h, what)
+        }
+    };
     for (seg, set) in members.iter().enumerate() {
         if set.len() != 1 || !matches!(routes[seg], PrefillSegmentRoute::Interpreter) {
             continue;
         }
         let d = &prog.insts[*set.first().unwrap()];
         let grid = u32::from(d.blocks).max(1);
+        let w8a8 = d.i[7] == 2;
         if moe_fp8_glu_inst(d) {
             routes[seg] = PrefillSegmentRoute::MoeFp8Glu {
                 args: MoeFp8GluArgs {
@@ -2205,14 +2227,19 @@ fn add_moe_fp8_pf_routes(
                     scale_table: addr(d.t[3], "scale_table")?,
                     meta: addr(d.t[4], "meta")?,
                     row_token: addr(d.t[5], "row_token")?,
+                    x_scale: opt(d.t[6], "x_scale")?,
+                    out_scale: opt(d.t[7], "out_scale")?,
                     inter: d.i[0],
                     hidden: d.i[1],
                     experts: d.i[2],
                     act: d.i[5],
                     beta: f32::from_bits(d.fj[0]),
                     linear_beta: f32::from_bits(d.fj[1]),
+                    x_pitch: d.i[4],
+                    reserved: 0,
                 },
                 grid,
+                w8a8,
             };
         } else if moe_fp8_down_inst(d) {
             routes[seg] = PrefillSegmentRoute::MoeFp8Down {
@@ -2224,12 +2251,14 @@ fn add_moe_fp8_pf_routes(
                     meta: addr(d.t[4], "meta")?,
                     row_partidx: addr(d.t[6], "row_partidx")?,
                     row_gate: addr(d.t[7], "row_gate")?,
+                    fu_scale: opt(d.t[5], "fu_scale")?,
                     hidden: d.i[0],
                     inter: d.i[1],
                     experts: d.i[2],
                     reserved: 0,
                 },
                 grid,
+                w8a8,
             };
         }
     }
@@ -6360,8 +6389,8 @@ pub struct AmdEngine {
     _moe_stage1_a4_scratch: Option<DeviceMem>,
     k_moe_stage2_mxfp4: Option<HsaKernel>,
     k_moe_combine: Option<HsaKernel>,
-    /// GLU and down of `moe_fp8_pf_gfx950.elf`.
-    k_moe_fp8_pf: Option<[HsaKernel; 2]>,
+    /// GLU, down (W8A16), GLU, down (W8A8) of `moe_fp8_pf_gfx950.elf`.
+    k_moe_fp8_pf: Option<[HsaKernel; 4]>,
     /// The f32-mix AttnRes object and the workgroup size it advertises.
     k_attn_res_f32mix: Option<(HsaKernel, u32)>,
     k_moe_ep_align: Option<HsaKernel>,
@@ -8982,9 +9011,11 @@ impl AmdEngine {
 
         let k_moe_fp8_pf = if arch == "gfx950" && need_moe_fp8_pf {
             const NAME: &str = "moe_fp8_pf_gfx950.elf";
-            const SYMBOLS: [(&str, usize); 2] = [
+            const SYMBOLS: [(&str, usize); 4] = [
                 ("plow_moe_fp8_glu_pf_gfx950", std::mem::size_of::<MoeFp8GluArgs>()),
                 ("plow_moe_fp8_down_pf_gfx950", std::mem::size_of::<MoeFp8DownArgs>()),
+                ("plow_moe_w8a8_glu_pf_gfx950", std::mem::size_of::<MoeFp8GluArgs>()),
+                ("plow_moe_w8a8_down_pf_gfx950", std::mem::size_of::<MoeFp8DownArgs>()),
             ];
             let path = hsaco_dir.join(NAME);
             if !path.exists() {
@@ -8994,14 +9025,14 @@ impl AmdEngine {
                 let image = std::fs::read(&path).map_err(|e| {
                     RuntimeError::Device(format!("code object {}: {e}", path.display()))
                 })?;
-                if !elf_symbol_names(&image).contains(&"plow_moe_fp8_pf_abi_1") {
+                if !elf_symbol_names(&image).contains(&"plow_moe_fp8_pf_abi_2") {
                     return Err(RuntimeError::Device(format!(
-                        "{} lacks the plow_moe_fp8_pf_abi_1 marker",
+                        "{} lacks the plow_moe_fp8_pf_abi_2 marker",
                         path.display()
                     )));
                 }
                 let module = EngineDevice::module_load(&*be, &image)?;
-                let mut ks = Vec::with_capacity(2);
+                let mut ks = Vec::with_capacity(4);
                 for (sym, want) in SYMBOLS {
                     let kernel = EngineDevice::get_function(&*be, &module, sym).map_err(|e| {
                         RuntimeError::Device(format!("{NAME}: no symbol {sym}: {e}"))
@@ -9016,7 +9047,7 @@ impl AmdEngine {
                     ks.push(kernel);
                 }
                 modules.push(module);
-                Some([ks[0], ks[1]])
+                Some([ks[0], ks[1], ks[2], ks[3]])
             }
         } else {
             None
@@ -13221,10 +13252,10 @@ impl AmdEngine {
             if let Some(ks) = self.k_moe_fp8_pf {
                 let route = self.progs[p].prefill_routes.get(seg).copied();
                 let launched = match route {
-                    Some(PrefillSegmentRoute::MoeFp8Glu { args, grid }) => {
+                    Some(PrefillSegmentRoute::MoeFp8Glu { args, grid, w8a8 }) => {
                         EngineDevice::launch_kernel(
                             &*self.be,
-                            ks[0],
+                            ks[if w8a8 { 2 } else { 0 }],
                             grid,
                             512,
                             0,
@@ -13233,10 +13264,10 @@ impl AmdEngine {
                         )?;
                         true
                     }
-                    Some(PrefillSegmentRoute::MoeFp8Down { args, grid }) => {
+                    Some(PrefillSegmentRoute::MoeFp8Down { args, grid, w8a8 }) => {
                         EngineDevice::launch_kernel(
                             &*self.be,
-                            ks[1],
+                            ks[if w8a8 { 3 } else { 1 }],
                             grid,
                             512,
                             0,

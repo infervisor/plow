@@ -50,23 +50,32 @@ extern "C" __global__ __launch_bounds__(512, 1) void ref_down(
                         PLOW_MOE_ENC_FP8BLK, blockIdx.x, gridDim.x, sm);
 }
 
-#if PLOW_MOE_PF_DET || PLOW_MOE_PF_ATOMIC
-/* The interpreter's fused down -> combine arms (f64 fixed-point / f32 atomic into [T,H]). */
-extern "C" __global__ __launch_bounds__(512, 1) void ref_down_acc(
-    void* acc, const bf16* fu, const unsigned long long* wtab, const unsigned long long* stab,
-    const int* meta, const unsigned* row_partidx, const float* row_gate, unsigned H, unsigned I,
-    unsigned E) {
-    extern __shared__ __align__(16) bf16 sm[];
-    d_moe_group_down_pf((float*)acc, fu, wtab, stab, meta, row_partidx, row_gate, H, I, E,
-                        PLOW_MOE_ENC_FP8BLK, blockIdx.x, gridDim.x, sm, nullptr, 0, 0,
-#if PLOW_MOE_PF_ATOMIC
-                        4u
-#else
-                        4u
+#include "../../amd/moe_pf_w8a8.h"
+#define MFP_MW8_LDS (64u * 128u * 4u + 512u + 256u + 256u + 2048u + 512u)
+
+/* The interpreter's W8A8 arms (moe_pf_w8a8.h). */
+extern "C" __global__ __launch_bounds__(512, 1) void ref_glu8(
+    unsigned char* fq, float* fs, const unsigned char* xq, const float* xs, unsigned pitch,
+    const unsigned long long* wtab, const unsigned long long* stab, const int* meta,
+    const unsigned* row_token, unsigned I, unsigned H, unsigned E, unsigned act, float beta,
+    float lbeta) {
+#if PLOW_CDNA4
+    extern __shared__ __align__(16) unsigned char sm8[];
+    d_moe_pf_w8a8<true>(fq, fs, xq, xs, pitch, wtab, stab, meta, row_token, nullptr, I, H, E, act,
+                        beta, lbeta, 0u, blockIdx.x, gridDim.x, sm8);
 #endif
-    );
 }
+
+extern "C" __global__ __launch_bounds__(512, 1) void ref_down8(
+    float* part, const unsigned char* fq, const float* fs, const unsigned long long* wtab,
+    const unsigned long long* stab, const int* meta, const unsigned* row_partidx,
+    const float* row_gate, unsigned H, unsigned I, unsigned E) {
+#if PLOW_CDNA4
+    extern __shared__ __align__(16) unsigned char sm8[];
+    d_moe_pf_w8a8<false>(part, nullptr, fq, fs, 0u, wtab, stab, meta, row_partidx, row_gate, H, I,
+                         E, 0u, 0.0f, 0.0f, 0u, blockIdx.x, gridDim.x, sm8);
 #endif
+}
 
 extern "C" __global__ __launch_bounds__(512, 1) void ref_combine(bf16* out, const bf16* shared,
                                                                  const float* part, unsigned H,
@@ -84,6 +93,8 @@ int main(int argc, char** argv) {
     const unsigned T = argc > 1 ? (unsigned)atoi(argv[1]) : 8192u;
     const int reps = argc > 2 ? atoi(argv[2]) : 10;
     const double skew = argc > 3 ? atof(argv[3]) : 1.0;
+    const unsigned grid_n = argc > 4 ? (unsigned)atoi(argv[4]) : 256u;
+    const bool w8 = argc > 5 && std::strcmp(argv[5], "w8") == 0;
     const unsigned E = 288, K8 = 8, H = 4096, I = 256, BMP = 64;
     const unsigned act = PLOW_MOE_ACT_SWIGLU_CLAMP;
     const float beta = 0.0f, lbeta = 10.0f;
@@ -202,6 +213,8 @@ int main(int argc, char** argv) {
     const unsigned NCU = 256, ref_lds = 2 * (64 + 256) * 64 * 2;
     HC(hipFuncSetAttribute((const void*)ref_glu, hipFuncAttributeMaxDynamicSharedMemorySize, ref_lds));
     HC(hipFuncSetAttribute((const void*)ref_down, hipFuncAttributeMaxDynamicSharedMemorySize, ref_lds));
+    HC(hipFuncSetAttribute((const void*)ref_glu8, hipFuncAttributeMaxDynamicSharedMemorySize, MFP_MW8_LDS));
+    HC(hipFuncSetAttribute((const void*)ref_down8, hipFuncAttributeMaxDynamicSharedMemorySize, MFP_MW8_LDS));
     hipEvent_t e0, e1;
     HC(hipEventCreate(&e0));
     HC(hipEventCreate(&e1));
@@ -222,54 +235,56 @@ int main(int argc, char** argv) {
         std::printf("%-14s best %.4f ms  mean %.4f ms\n", name, best, sum / reps);
         return best;
     };
-    const unsigned grid_n = argc > 4 ? (unsigned)atoi(argv[4]) : NCU;
-    timeit("ref_glu", [&] { ref_glu<<<NCU, 512, ref_lds>>>(fu_r, dx, dwt, dst, dmeta, drt, I, H, E, act, beta, lbeta); });
-    timeit("new_glu", [&] { plow_moe_fp8_glu_pf_gfx950<<<grid_n, 512>>>(fu_n, dx, dwt, dst, dmeta, drt, I, H, E, act, beta, lbeta); });
-    timeit("ref_down", [&] { ref_down<<<NCU, 512, ref_lds>>>(part_r, fu_r, dwt, dst, dmeta, drp, drg, H, I, E); });
-    timeit("new_down", [&] { plow_moe_fp8_down_pf_gfx950<<<grid_n, 512>>>(part_n, fu_r, dwt, dst, dmeta, drp, drg, H, I, E, 0); });
-#if PLOW_MOE_PF_DET || PLOW_MOE_PF_ATOMIC
-    {
-        void* acc;
-        const size_t acc_b = (size_t)T * H * (PLOW_MOE_PF_DET ? 8 : 4);
-        HC(hipMalloc(&acc, acc_b));
-        HC(hipFuncSetAttribute((const void*)ref_down_acc, hipFuncAttributeMaxDynamicSharedMemorySize, ref_lds));
-        timeit("acc_memset", [&] { HC(hipMemsetAsync(acc, 0, acc_b)); });
-        timeit("ref_down_acc", [&] { ref_down_acc<<<NCU, 512, ref_lds>>>(acc, fu_r, dwt, dst, dmeta, drp, drg, H, I, E); });
-        HC(hipFree(acc));
+    auto cmp = [&](const char* name, const void* a, const void* b, size_t bytes, size_t unit) {
+        std::vector<unsigned char> ha(bytes), hb(bytes);
+        HC(hipMemcpy(ha.data(), a, bytes, hipMemcpyDeviceToHost));
+        HC(hipMemcpy(hb.data(), b, bytes, hipMemcpyDeviceToHost));
+        size_t d = 0;
+        for (size_t o = 0; o < bytes; o += unit) d += std::memcmp(&ha[o], &hb[o], unit) != 0;
+        std::printf("%s diff %zu / %zu\n", name, d, bytes / unit);
+        return d;
+    };
+    size_t bad = 0;
+    const size_t live_rows = (size_t)tiles * BMP;
+    if (!w8) {
+        timeit("ref_glu", [&] { ref_glu<<<NCU, 512, ref_lds>>>(fu_r, dx, dwt, dst, dmeta, drt, I, H, E, act, beta, lbeta); });
+        timeit("new_glu", [&] { plow_moe_fp8_glu_pf_gfx950<<<grid_n, 512>>>(fu_n, dx, dwt, dst, dmeta, drt, nullptr, nullptr, I, H, E, act, beta, lbeta, 0, 0); });
+        timeit("ref_down", [&] { ref_down<<<NCU, 512, ref_lds>>>(part_r, fu_r, dwt, dst, dmeta, drp, drg, H, I, E); });
+        timeit("new_down", [&] { plow_moe_fp8_down_pf_gfx950<<<grid_n, 512>>>(part_n, fu_r, dwt, dst, dmeta, drp, drg, nullptr, H, I, E, 0); });
+        timeit("ref_combine", [&] { ref_combine<<<NCU, 512>>>(out_r, dsh, part_r, H, K8, T); });
+        HC(hipDeviceSynchronize());
+        bad += cmp("fu_g", fu_r, fu_n, live_rows * I * 2, 2);
+        bad += cmp("part", part_r, part_n, part_b, 4);
+    } else {
+        /* W8A8 inputs: fp8 x rows and [H/128][T] scales (QuantFp8Block128's layout, pitch T). */
+        std::vector<unsigned char> xq((size_t)T * H);
+        for (auto& b : xq) b = fp8();
+        std::vector<float> xs((size_t)(H / 128) * T);
+        std::uniform_real_distribution<float> ua(1e-3f, 3e-2f);
+        for (auto& v : xs) v = ua(rng);
+        auto* dxq = (unsigned char*)up(xq.data(), xq.size());
+        auto* dxs = (float*)up(xs.data(), xs.size() * 4);
+        unsigned char *fq_r, *fq_n;
+        float *fs_r, *fs_n;
+        const size_t fq_b = (size_t)cap * I, fs_b = (size_t)cap * (I / 128) * 4;
+        HC(hipMalloc(&fq_r, fq_b));
+        HC(hipMalloc(&fq_n, fq_b));
+        HC(hipMalloc(&fs_r, fs_b));
+        HC(hipMalloc(&fs_n, fs_b));
+        HC(hipMemset(fq_r, 0x5a, fq_b));
+        HC(hipMemset(fq_n, 0x5a, fq_b));
+        HC(hipMemset(fs_r, 0, fs_b));
+        HC(hipMemset(fs_n, 0, fs_b));
+        timeit("ref_glu8", [&] { ref_glu8<<<NCU, 512, MFP_MW8_LDS>>>(fq_r, fs_r, dxq, dxs, T, dwt, dst, dmeta, drt, I, H, E, act, beta, lbeta); });
+        timeit("new_glu8", [&] { plow_moe_w8a8_glu_pf_gfx950<<<grid_n, 512>>>(fq_n, dxq, dwt, dst, dmeta, drt, dxs, fs_n, I, H, E, act, beta, lbeta, T, 0); });
+        timeit("ref_down8", [&] { ref_down8<<<NCU, 512, MFP_MW8_LDS>>>(part_r, fq_r, fs_r, dwt, dst, dmeta, drp, drg, H, I, E); });
+        timeit("new_down8", [&] { plow_moe_w8a8_down_pf_gfx950<<<grid_n, 512>>>(part_n, fq_r, dwt, dst, dmeta, drp, drg, fs_r, H, I, E, 0); });
+        HC(hipDeviceSynchronize());
+        bad += cmp("fq", fq_r, fq_n, live_rows * I, 1);
+        bad += cmp("fs", fs_r, fs_n, live_rows * (I / 128) * 4, 4);
+        bad += cmp("part", part_r, part_n, part_b, 4);
     }
-#endif
-    timeit("ref_combine", [&] { ref_combine<<<NCU, 512>>>(out_r, dsh, part_r, H, K8, T); });
-    timeit("ref_combine_n", [&] { ref_combine<<<NCU, 512>>>(out_n, dsh, part_n, H, K8, T); });
-    HC(hipDeviceSynchronize());
-
-    /* compare */
-    std::vector<unsigned short> hfr(fu_b / 2), hfn(fu_b / 2);
-    HC(hipMemcpy(hfr.data(), fu_r, fu_b, hipMemcpyDeviceToHost));
-    HC(hipMemcpy(hfn.data(), fu_n, fu_b, hipMemcpyDeviceToHost));
-    size_t fu_diff = 0, fu_live = 0;
-    for (unsigned r = 0; r < tiles * BMP; r++)
-        for (unsigned c = 0; c < I; c++) {
-            fu_live++;
-            fu_diff += hfr[(size_t)r * I + c] != hfn[(size_t)r * I + c];
-        }
-    std::vector<float> hpr(part_b / 4), hpn(part_b / 4);
-    HC(hipMemcpy(hpr.data(), part_r, part_b, hipMemcpyDeviceToHost));
-    HC(hipMemcpy(hpn.data(), part_n, part_b, hipMemcpyDeviceToHost));
-    size_t p_diff = 0;
-    double p_max = 0;
-    for (size_t i = 0; i < hpr.size(); i++)
-        if (std::memcmp(&hpr[i], &hpn[i], 4)) {
-            p_diff++;
-            p_max = std::max(p_max, (double)std::fabs(hpr[i] - hpn[i]));
-        }
-    std::vector<unsigned short> hor(out_b / 2), hon(out_b / 2);
-    HC(hipMemcpy(hor.data(), out_r, out_b, hipMemcpyDeviceToHost));
-    HC(hipMemcpy(hon.data(), out_n, out_b, hipMemcpyDeviceToHost));
-    size_t o_diff = 0;
-    for (size_t i = 0; i < hor.size(); i++) o_diff += hor[i] != hon[i];
-    std::printf("fu_g diff %zu / %zu   part diff %zu / %zu (max %.3g)   out diff %zu / %zu\n",
-                fu_diff, fu_live, p_diff, hpr.size(), p_max, o_diff, hor.size());
-    const bool ok = fu_diff == 0 && p_diff == 0 && o_diff == 0;
+    const bool ok = bad == 0;
     std::printf(ok ? "BITEXACT_OK\n" : "BITEXACT_FAIL\n");
     return ok ? 0 : 1;
 }

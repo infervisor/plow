@@ -593,8 +593,9 @@ fn lean_moe_stage1_inst(inst: &DevInst) -> bool {
         && inst.t[..8].iter().all(|&t| t != TENSOR_NONE)
 }
 
-/// Block-fp8 (i3 = 1) bf16-activation grouped GLU the dedicated object owns: dense TP layout
-/// (no EP, no preshuffle, no a8/W8A8 operands), I and H multiples of 128.
+/// Block-fp8 (i3 = 1) grouped GLU the dedicated object owns: dense TP layout (no EP, no
+/// preshuffle), I and H multiples of 128, bf16 activations (i7 = 0, t6/t7 absent) or 1x128 fp8
+/// activations (i7 = 2: t6 = input scales at pitch i4, t7 = output scales).
 pub fn lean_moe_fp8_glu_inst(d: &DevInst) -> bool {
     d.op == DevOp::MoeGroupGluPf as u16
         && d.i[0] != 0
@@ -604,15 +605,17 @@ pub fn lean_moe_fp8_glu_inst(d: &DevInst) -> bool {
         && d.i[2] != 0
         && d.i[2] <= 512
         && d.i[3] == 1
-        && d.i[4] == 0
         && d.i[6] == 0
-        && d.i[7] == 0
         && d.t[..6].iter().all(|&t| t != TENSOR_NONE)
-        && d.t[6] == TENSOR_NONE
-        && d.t[7] == TENSOR_NONE
+        && match d.i[7] {
+            0 => d.i[4] == 0 && d.t[6] == TENSOR_NONE && d.t[7] == TENSOR_NONE,
+            2 => d.i[4] != 0 && d.t[6] != TENSOR_NONE && d.t[7] != TENSOR_NONE,
+            _ => false,
+        }
 }
 
-/// The f32-scatter down twin: H % 256 == 0, I % 128 == 0 and I >= 256.
+/// The f32-scatter down twin: H % 256 == 0, I % 128 == 0 and I >= 256; i7 = 0 (bf16 A) or 2
+/// (fp8 A with its 1x128 scales in t5).
 pub fn lean_moe_fp8_down_inst(d: &DevInst) -> bool {
     d.op == DevOp::MoeGroupDownPf as u16
         && d.i[0] != 0
@@ -625,9 +628,12 @@ pub fn lean_moe_fp8_down_inst(d: &DevInst) -> bool {
         && d.i[4] == 0
         && d.i[5] == 0
         && d.i[6] == 0
-        && d.i[7] == 0
         && d.t[..5].iter().all(|&t| t != TENSOR_NONE)
-        && d.t[5] == TENSOR_NONE
+        && match d.i[7] {
+            0 => d.t[5] == TENSOR_NONE,
+            2 => d.t[5] != TENSOR_NONE,
+            _ => false,
+        }
         && d.t[6] != TENSOR_NONE
         && d.t[7] != TENSOR_NONE
 }

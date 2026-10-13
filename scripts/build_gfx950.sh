@@ -690,13 +690,13 @@ if [ "$ARCH" = gfx950 ]; then
   MOE_COMBINE_ELFS="moe_combine_gfx950.elf"
 fi
 
-# Dedicated block-fp8 W8A16 grouped-MoE prefill object (GLU / down / k=8 combine), routed for the
+# Dedicated block-fp8 grouped-MoE prefill object (GLU / down, W8A16 and W8A8), routed for the
 # segments PLOW_MOE_FP8_PF_LEAN=1 packets isolate; bit-identical to the interpreter arms.
 MOE_FP8_PF_ELFS=""
 if [ "$ARCH" = gfx950 ]; then
   bash "$R/cmake/hipcc_hsaco.sh" hipcc "$BUN" "$ARCH" \
     "$OUT/moe_fp8_pf_gfx950.elf" plow_moe_fp8_glu_pf_gfx950 256 1 \
-    $INC -DPLOW_LEAN_OBJECT=1 -DPLOW_REQUIRED_MARKER=plow_moe_fp8_pf_abi_1 \
+    $INC -DPLOW_LEAN_OBJECT=1 -DPLOW_REQUIRED_MARKER=plow_moe_fp8_pf_abi_2 \
     "$R/amd/moe_fp8_pf.hip"
   MOE_FP8_PF_ELFS="moe_fp8_pf_gfx950.elf"
 fi
