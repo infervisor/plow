@@ -362,4 +362,28 @@ __device__ void d_dsa_q_quant(uint8_t* __restrict__ q_fp8, float* __restrict__ q
     }
 }
 
+/* Decode pool expand for ONE row, COMPACT: the min(pools, n_groups) selected pools (the per-row
+ * radix pads -1 at the end) expand first, the incomplete-pool tail follows them, -1 after — so
+ * the gather's first min(width, kv_len) slots hold every selected token. Threads [t0, ..) step. */
+__device__ __forceinline__ void dsa_pool_expand_row(int32_t* __restrict__ out,
+                                                    const int32_t* __restrict__ pid, int len,
+                                                    unsigned ng, unsigned ps, unsigned t0,
+                                                    unsigned step) {
+    const unsigned cols = ng * ps + ps - 1u;
+    const int npool = len / (int)ps;
+    const int nv = npool < (int)ng ? npool : (int)ng;
+    const int tail0 = npool * (int)ps, ntail = len - tail0;
+    for (unsigned c = t0; c < cols; c += step) {
+        const int ci = (int)c;
+        int v = -1;
+        if (ci < nv * (int)ps) {
+            const int p = pid[ci / (int)ps];
+            v = p >= 0 ? p * (int)ps + ci % (int)ps : -1;
+        } else if (ci - nv * (int)ps < ntail) {
+            v = tail0 + (ci - nv * (int)ps);
+        }
+        out[c] = v;
+    }
+}
+
 #endif /* PLOW_OP_DSA_POOL_H */

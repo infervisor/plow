@@ -1291,6 +1291,7 @@ pub const EMIT: &[KnobSpec] = &[
     KnobSpec::new("emit.glm_dsa_pf_b8", Some("PLOW_GLM_DSA_PF_B8"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.glm_dsa_kprep", Some("PLOW_GLM_DSA_KPREP"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.glm_dsa_kw_dual", Some("PLOW_GLM_DSA_KW_DUAL"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
+    KnobSpec::new("emit.glm_dsa_fuse", Some("PLOW_GLM_DSA_FUSE"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.glm_dsa_sel_union", Some("PLOW_GLM_DSA_SEL_UNION"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.glm_fp8_kv", Some("PLOW_GLM_FP8_KV"), Layer::Emit, Domain::Bool, GLM_RECIPE_ON, GLM_RECIPE),
     KnobSpec::new("emit.glm_moe_aiter", Some("PLOW_GLM_MOE_AITER"), Layer::Emit, Domain::Bool, GLM_RECIPE_ON, GLM_RECIPE),

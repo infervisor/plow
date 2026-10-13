@@ -4324,10 +4324,21 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
             }
             /* Batched decode (i4 = rows > 1): row r is decode slot r — its ring, pos[r] and its
              * slot's pool cache (i5 = pools per slot). Per row, the single-row decode call. */
-            if (in->i[4] > 1u) {
+            /* i7 = 1 (PLOW_GLM_DSA_FUSE): the row's stash (t6 = cur_k, t7 = cur_score) runs
+             * here first, on the same workgroup, then the compress reads the ring back. */
+            if (in->i[4] > 1u || in->i[7] == 1u) {
                 const size_t ring = (size_t)in->i[1] * in->i[2];
-                for (unsigned r = slice; r < in->i[4]; r += nblk) {
+                const unsigned rows = in->i[4] > 1u ? in->i[4] : 1u;
+                for (unsigned r = slice; r < rows; r += nblk) {
                     __syncthreads();
+                    if (in->i[7] == 1u) {
+                        d_dsa_pool_stash((bf16*)TEN(2) + r * ring, (bf16*)TEN(3) + r * ring,
+                                         (const bf16*)TEN(6), (const bf16*)TEN(7),
+                                         (const int*)TEN(5), in->i[1], in->i[2], r);
+                        __syncthreads();
+                        asm volatile("buffer_inv" ::: "memory");
+                        __syncthreads();
+                    }
                     d_dsa_pool_compress((uint8_t*)TEN(0) + (size_t)r * in->i[5] * in->i[2],
                                         (float*)TEN(1) + (size_t)r * in->i[5],
                                         (const bf16*)TEN(2) + r * ring,
@@ -4349,26 +4360,11 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
              * selected token and any -1 is masked there. */
             if (in->i[3] == 1u) {
                 const unsigned ng = in->i[1], ps = in->i[2], cols = ng * ps + ps - 1u;
-                for (unsigned r = 0; r < in->i[0]; r++) {
-                    const int len = ((const int*)TEN(2))[r];
-                    const int npool = len / (int)ps;
-                    const int nv = npool < (int)ng ? npool : (int)ng;
-                    const int tail0 = npool * (int)ps, ntail = len - tail0;
-                    const int32_t* pid = (const int32_t*)TEN(1) + (size_t)r * ng;
-                    int32_t* out = (int32_t*)TEN(0) + (size_t)r * cols;
-                    for (unsigned c = slice * PLOW_THREADS + threadIdx.x; c < cols;
-                         c += nblk * PLOW_THREADS) {
-                        const int ci = (int)c;
-                        int v = -1;
-                        if (ci < nv * (int)ps) {
-                            const int p = pid[ci / (int)ps];
-                            v = p >= 0 ? p * (int)ps + ci % (int)ps : -1;
-                        } else if (ci - nv * (int)ps < ntail) {
-                            v = tail0 + (ci - nv * (int)ps);
-                        }
-                        out[c] = v;
-                    }
-                }
+                for (unsigned r = 0; r < in->i[0]; r++)
+                    dsa_pool_expand_row((int32_t*)TEN(0) + (size_t)r * cols,
+                                        (const int32_t*)TEN(1) + (size_t)r * ng,
+                                        ((const int*)TEN(2))[r], ng, ps,
+                                        slice * PLOW_THREADS + threadIdx.x, nblk * PLOW_THREADS);
                 break;
             }
             d_dsa_pool_expand((int32_t*)TEN(0), (const int32_t*)TEN(1), (const int32_t*)TEN(2),
@@ -5654,6 +5650,16 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
                                             (const float*)TEN(1) + (size_t)r * in->i[0],
                                             (const int*)TEN(4) + r, 1u, in->i[1], in->i[0], 0u, 1u,
                                             lh, lh + 256, pool_size);
+                    /* i6 = 1 (PLOW_GLM_DSA_FUSE): this row's compact expand into t5. */
+                    if (in->i[6] == 1u) {
+                        __syncthreads();
+                        asm volatile("buffer_inv" ::: "memory");
+                        __syncthreads();
+                        dsa_pool_expand_row((int*)TEN(5) + (size_t)r * (in->i[1] * pool_size + pool_size - 1u),
+                                            (const int*)TEN(0) + (size_t)r * in->i[1],
+                                            ((const int*)TEN(4))[r], in->i[1], pool_size,
+                                            threadIdx.x, PLOW_THREADS);
+                    }
                 }
                 break;
             }

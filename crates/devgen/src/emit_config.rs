@@ -855,6 +855,9 @@ pub struct EmitConfig {
     /// DSA indexer wk + weights_proj as one dual GemmSmall packet (objects need PLOW_DSA_PREP=1).
     #[arg(long, env = "PLOW_GLM_DSA_KW_DUAL", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub glm_dsa_kw_dual: bool,
+    /// Pooled DSA decode: stash folds into the pool compress and the expand into the per-row select.
+    #[arg(long, env = "PLOW_GLM_DSA_FUSE", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub glm_dsa_fuse: bool,
     /// DSA prefill: op 118 also writes op 119's union table (PLOW_DSA_SELECT_V3 objects) and the
     /// op 119 is marked skipped; objects without the arm run both ops as before.
     #[arg(long, env = "PLOW_GLM_DSA_SEL_UNION", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
@@ -1751,6 +1754,7 @@ impl EmitConfig {
             glm_dsa_pf_b8: env_bool("PLOW_GLM_DSA_PF_B8"),
             glm_dsa_kprep: env_bool("PLOW_GLM_DSA_KPREP"),
             glm_dsa_kw_dual: env_bool("PLOW_GLM_DSA_KW_DUAL"),
+            glm_dsa_fuse: env_bool("PLOW_GLM_DSA_FUSE"),
             glm_dsa_sel_union: env_bool("PLOW_GLM_DSA_SEL_UNION"),
             glm_production_defaults: false,
             glm_fp8_kv: env_bool_opt("PLOW_GLM_FP8_KV"),

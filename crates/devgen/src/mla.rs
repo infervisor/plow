@@ -6193,7 +6193,12 @@ fn emit_glm_dsa_decode_select(
                 d.i[1] = hi;
                 d.i[2] = h;
             });
-            let c_stash = b.emit(DevOp::DsaPoolStash, all.to_vec(), &[c_ki, c_gs], |d| {
+            let fuse = emit_config::active().glm_dsa_fuse;
+            let n_pools = ctx.div_ceil(c.index_kpool.max(1));
+            let c_stash = if fuse {
+                None
+            } else {
+                Some(b.emit(DevOp::DsaPoolStash, all.to_vec(), &[c_ki, c_gs], |d| {
                 d.t[0] = n.kidx_ring[slot];
                 d.t[1] = n.kidx_ring_score[slot];
                 d.t[2] = n.kidx_normed;
@@ -6204,14 +6209,18 @@ fn emit_glm_dsa_decode_select(
                 if rows > 1 {
                     d.i[3] = rows;
                 }
-            });
+            }))
+            };
+            let stash_deps = match c_stash {
+                Some(c_stash) => vec![c_stash],
+                None => vec![c_ki, c_gs],
+            };
             // Decode-mode DsaPoolCompress: n_pools=1 (per its own contract), gated on
             // `pos` — a no-op except at a pool boundary. Reads the ring the stash above
             // just wrote (dep), writes into this layer's GROWING pool cache at `pos`'s
             // pool slot (internal `pool_idx = pos/pool_size` addressing — see the kernel's
             // own doc comment for the historical bug this fixed).
-            let n_pools = ctx.div_ceil(c.index_kpool.max(1));
-            let c_compress = b.emit(DevOp::DsaPoolCompress, all.to_vec(), &[c_stash], |d| {
+            let c_compress = b.emit(DevOp::DsaPoolCompress, all.to_vec(), &stash_deps, |d| {
                 d.t[0] = n.kidx_pool[slot];
                 d.t[1] = n.kidx_pool_scale[slot];
                 d.t[2] = n.kidx_ring[slot];
@@ -6224,6 +6233,13 @@ fn emit_glm_dsa_decode_select(
                 if rows > 1 {
                     d.i[4] = rows;
                     d.i[5] = n_pools;
+                }
+                if fuse {
+                    d.t[6] = n.kidx_normed;
+                    d.t[7] = n.gate_score;
+                    d.i[4] = rows;
+                    d.i[5] = n_pools;
+                    d.i[7] = 1;
                 }
             });
             let c_qquant = b.emit(DevOp::DsaQQuant, all.to_vec(), &[c_qi], |d| {
@@ -6273,7 +6289,14 @@ fn emit_glm_dsa_decode_select(
                 d.i[2] = c.index_kpool;
                 d.i[4] = 4;
                 d.i[5] = rows;
+                if fuse {
+                    d.t[5] = n.iidx;
+                    d.i[6] = 1;
+                }
             });
+            if fuse {
+                return c_sel;
+            }
             // Pool ids -> token ids (+ trailing incomplete-pool tail-append), into `n.iidx`
             // ITSELF — its allocation already carries the `+ (index_kpool-1)` headroom this
             // needs (see its own declare-time comment), so the downstream flash-gather that
