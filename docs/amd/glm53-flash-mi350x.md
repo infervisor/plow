@@ -618,6 +618,16 @@ The packet from config + index alone (no weights) is 70 MB: 4 prefill buckets + 
   2 x 12 s; c1 greedy pairs (one copy per group) equal 8/8; vs TP8 serve 7/8, the eighth at a
   TP8 exact tie (gap 0.0); needles 4k/16k 18/18 (cache on); FP32 gate PASS kl_mean 0.01258,
   kl_p99 0.172, top1_decisive 0.9967, needles 18/18 (v9 TP8: 0.01384 / 0.237 / 0.9989).
+- 11:15 UTC (10-13), co-resident models on AMD (branch serve-multimodel-amd2): an AMD serve places
+  every bundle (and `--dp` rank) with `serve::placement` on its own TP group (`--pin S@first`,
+  else spread) and loads it there; `--assets DIR,slug=NAME` serves one packet under two names.
+  Each model keeps its own engine, dispatcher, per-slot prefix cache and socket-pinned engine
+  thread; turns stay free for a group of one. Launch: `plowrt serve --assets <tp4>,slug=glm-a
+  --pin glm-a@0 --assets <tp4>,slug=glm-b --pin glm-b@4`. v10 TP4 packet twice (GPUs 0-3, 4-7):
+  load 2 x 13 s; `/v1/models` lists both; c1 greedy streams of each model equal a single-model
+  TP4 serve 8/8, one model at a time and both at once; needles 4k/16k 18/18 per model (cache on,
+  both models at once); c64 per model, isl 1024 / osl 128: 6151 + 6163 = 12303 total tok/s,
+  128/128 each; metrics carry `model_name` per model.
 
 ## 5. Results
 
