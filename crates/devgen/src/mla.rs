@@ -4770,12 +4770,24 @@ pub(crate) fn glm_decode_gemm_tile(rows: u32, n: u32, k: u32, n_cu: u32) -> Opti
     if !crate::emit_is_amd() || !emit_config::active().glm_decode_gemm_rows_on(rows) {
         return None;
     }
-    let op = crate::pick_tile(rows, n, k, n_cu, kernelcaps::QuantScheme::None);
-    Some(if matches!(op, DevOp::GemmSmall | DevOp::GemmMed | DevOp::Gemm) {
+    Some(glm_decode_tile_of(crate::pick_tile(
+        rows,
+        n,
+        k,
+        n_cu,
+        kernelcaps::QuantScheme::None,
+    )))
+}
+
+/// The decode object's tile for a prefill pick. Not GemmMed: the GLM_SHARD_HEAD B=128 shard
+/// (N = vocab/8) picked it, and on the gfx950 decode object it ran in 8 us (floor ~30 us) and
+/// every sequence sampled garbage. Nothing showed the failure to be specific to the head shape.
+fn glm_decode_tile_of(op: DevOp) -> DevOp {
+    if matches!(op, DevOp::GemmSmall | DevOp::Gemm) {
         op
     } else {
         DevOp::GemmSmall
-    })
+    }
 }
 
 fn glm_decode_gemv_cus(cus: &[u32], op: DevOp, n: u32, k: u32) -> Vec<u32> {
@@ -12344,11 +12356,6 @@ fn emit_glm_tail(
     } else if let Some(tile) =
         (nb > 0).then(|| glm_decode_gemm_tile(rows, vocab_l, c.hidden, b.n_cu())).flatten()
     {
-        // GemmSmall only: the GLM_SHARD_HEAD B=128 shard (N = vocab/8) picked GemmMed, the one
-        // GemmMed in any decode program, and on the gfx950 decode object it ran in 8 us (floor
-        // ~30 us) and every sequence sampled garbage. The replicated head and the B=32 shard
-        // already take GemmSmall.
-        let tile = if tile == DevOp::GemmMed { DevOp::GemmSmall } else { tile };
         b.emit(tile, all, &[c_f], |d| {
             d.t[0] = n.logits;
             d.t[1] = n.xn;
