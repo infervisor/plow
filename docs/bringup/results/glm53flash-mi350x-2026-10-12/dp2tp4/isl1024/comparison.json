@@ -1,0 +1,890 @@
+{
+ "status": "MATCHED, EQUIVALENT",
+ "matched": true,
+ "equivalent": true,
+ "gate": {
+  "path": "/home/lava/bench/glm53flash/fp32ref/gate-dp-v10/gates.json",
+  "sha256": "50da8ab8413aca588017c6ed4af76eced5b125ecadb7caf8916ae7eb82b08f89",
+  "packet_sha256": "2beec26e536d94495cb8faa4cbfaad4ffb4a8a3af3e20ffc7abbc7d70fff79aa",
+  "passed": true,
+  "why": [],
+  "metrics": {
+   "kl_mean": 0.01294555929527209,
+   "vllm_kl_mean": 0.03677076234614275,
+   "kl_p99": 0.19320089132662782,
+   "vllm_kl_p99": 0.5493329922983649,
+   "top1_decisive": 0.9966960352422908,
+   "vllm_top1_decisive": 0.986784140969163,
+   "cont_frac": 0.7927049606845513,
+   "vllm_cont_frac": 0.7298814617197481,
+   "needle_acc": 1.0,
+   "vllm_needle_acc": 1.0
+  }
+ },
+ "cells": [
+  {
+   "cell": "g1",
+   "matched": true,
+   "mismatched": [],
+   "equivalent": true,
+   "spread_flagged": [
+    "Baseline TTFT P99 38.5%",
+    "Infervisor TTFT P99 23.2%",
+    "Infervisor TPOT P99 49.7%"
+   ],
+   "rows": [
+    [
+     "Model / version",
+     "GLM-5.3-Flash (config+weights ea5874f56d39)",
+     "Same as baseline"
+    ],
+    [
+     "Precision / quantization",
+     "weights fp8 (fmt=e4m3, activation_scheme=dynamic, weight_block_size=[128, 128]); KV cache bfloat16",
+     "Same as baseline"
+    ],
+    [
+     "Input / output length",
+     "1024 / 128 tokens",
+     "Same as baseline"
+    ],
+    [
+     "Traffic / concurrency",
+     "greedy (T=0), 16 prompts, request rate inf / concurrency 1",
+     "Same as baseline"
+    ],
+    [
+     "GPU type & count",
+     "8 x AMD Instinct MI350X",
+     "Same as baseline"
+    ],
+    [
+     "Serving stack",
+     "vLLM ok    nix dev shell (ROCM_PATH=/nix/store/xbd1f4xn2j6cry6np5wij7caz0ycrykz-rocm-therock-gfx94X-dcgpu-7.14.1 CUDA_PATH=/nix/store/p49i1vrhcaw5nf2r3bwgmwfz5x8zgb14-cuda-merged-12.9)\n0.31.1rc1.dev296+gfe4df3df0.rocm100 (--gpu-memory-utilization 0.90 --max-num-seqs 256 --tensor-parallel-size 4 --data-parallel-size 2 --trust-remote-code --max-model-len 3200 --max-num-seqs 256 --no-enable-prefix-caching --tool-call-parser glm47 --reasoning-parser glm47)",
+     "Infervisor (plowrt bf1d8b8bcc08, packet 2beec26e536d)"
+    ],
+    [
+     "Output quality / correctness",
+     "FP32-reference gate peer (kl_mean 0.03677, top1_decisive 0.9868, needle_acc 1)",
+     "Equivalent"
+    ],
+    [
+     "Peak GPU memory",
+     "2,136.2 GiB",
+     "1,203.8 GiB (0.56x)"
+    ],
+    [
+     "Total throughput",
+     "952 tok/s",
+     "686 tok/s (0.72x)"
+    ],
+    [
+     "Throughput / GPU",
+     "119 tok/s/GPU",
+     "86 tok/s/GPU (0.72x)"
+    ],
+    [
+     "TTFT P99",
+     "183.7 ms *",
+     "128.5 ms (0.70x) *"
+    ],
+    [
+     "TPOT P99",
+     "8.52 ms",
+     "15.74 ms (1.85x) *"
+    ]
+   ],
+   "repeats": 2,
+   "ratios": {
+    "peak_gib": 0.5635244889898292,
+    "total_tok_s": 0.7202497265365931,
+    "total_tok_s_gpu": 0.7202497265365931,
+    "ttft_p99_ms": 0.6994473658944405,
+    "tpot_p99_ms": 1.8477394865962813
+   },
+   "baseline": {
+    "mean": {
+     "peak_gib": 2136.1640625,
+     "total_tok_s": 952.1864515734424,
+     "total_tok_s_gpu": 119.0233064466803,
+     "ttft_p99_ms": 183.68889084958937,
+     "tpot_p99_ms": 8.518589287262966
+    },
+    "per_repeat": {
+     "peak_gib": [
+      2118.375,
+      2153.953125
+     ],
+     "total_tok_s": [
+      948.8413121120012,
+      955.5315910348834
+     ],
+     "total_tok_s_gpu": [
+      118.60516401400015,
+      119.44144887936042
+     ],
+     "ttft_p99_ms": [
+      219.0809925843496,
+      148.29678911482915
+     ],
+     "tpot_p99_ms": [
+      8.521571342089015,
+      8.515607232436919
+     ]
+    },
+    "spread_pct": {
+     "peak_gib": 1.6655146308548106,
+     "total_tok_s": 0.7026227806357456,
+     "total_tok_s_gpu": 0.7026227806357456,
+     "ttft_p99_ms": 38.53483089920823,
+     "tpot_p99_ms": 0.07001287949183667
+    },
+    "sources": [
+     "/home/lava/bench/glm53flash/vllm-dp2tp4/isl1024/g1.r1",
+     "/home/lava/bench/glm53flash/vllm-dp2tp4/isl1024/g1.r2"
+    ]
+   },
+   "infervisor": {
+    "mean": {
+     "peak_gib": 1203.78076171875,
+     "total_tok_s": 685.8120313576209,
+     "total_tok_s_gpu": 85.72650391970261,
+     "ttft_p99_ms": 128.48071084881667,
+     "tpot_p99_ms": 15.740133796171854
+    },
+    "per_repeat": {
+     "peak_gib": [
+      1188.8037109375,
+      1218.7578125
+     ],
+     "total_tok_s": [
+      657.8678674412635,
+      713.7561952739783
+     ],
+     "total_tok_s_gpu": [
+      82.23348343015793,
+      89.21952440924728
+     ],
+     "ttft_p99_ms": [
+      143.41476205445358,
+      113.54665964317974
+     ],
+     "tpot_p99_ms": [
+      19.648632851193707,
+      11.831634741150003
+     ]
+    },
+    "spread_pct": {
+     "peak_gib": 2.4883352945208843,
+     "total_tok_s": 8.149219505828635,
+     "total_tok_s_gpu": 8.149219505828635,
+     "ttft_p99_ms": 23.247149096504963,
+     "tpot_p99_ms": 49.66284411092408
+    },
+    "sources": [
+     "/home/lava/bench/glm53flash/plow-dp2tp4-v10/isl1024/g1.r1",
+     "/home/lava/bench/glm53flash/plow-dp2tp4-v10/isl1024/g1.r2"
+    ]
+   }
+  },
+  {
+   "cell": "g8",
+   "matched": true,
+   "mismatched": [],
+   "equivalent": true,
+   "spread_flagged": [
+    "Baseline Total throughput 63.0%",
+    "Baseline Throughput / GPU 63.0%",
+    "Baseline TTFT P99 149.5%",
+    "Baseline TPOT P99 81.1%"
+   ],
+   "rows": [
+    [
+     "Model / version",
+     "GLM-5.3-Flash (config+weights ea5874f56d39)",
+     "Same as baseline"
+    ],
+    [
+     "Precision / quantization",
+     "weights fp8 (fmt=e4m3, activation_scheme=dynamic, weight_block_size=[128, 128]); KV cache bfloat16",
+     "Same as baseline"
+    ],
+    [
+     "Input / output length",
+     "1024 / 128 tokens",
+     "Same as baseline"
+    ],
+    [
+     "Traffic / concurrency",
+     "greedy (T=0), 24 prompts, request rate inf / concurrency 8",
+     "Same as baseline"
+    ],
+    [
+     "GPU type & count",
+     "8 x AMD Instinct MI350X",
+     "Same as baseline"
+    ],
+    [
+     "Serving stack",
+     "vLLM ok    nix dev shell (ROCM_PATH=/nix/store/xbd1f4xn2j6cry6np5wij7caz0ycrykz-rocm-therock-gfx94X-dcgpu-7.14.1 CUDA_PATH=/nix/store/p49i1vrhcaw5nf2r3bwgmwfz5x8zgb14-cuda-merged-12.9)\n0.31.1rc1.dev296+gfe4df3df0.rocm100 (--gpu-memory-utilization 0.90 --max-num-seqs 256 --tensor-parallel-size 4 --data-parallel-size 2 --trust-remote-code --max-model-len 3200 --max-num-seqs 256 --no-enable-prefix-caching --tool-call-parser glm47 --reasoning-parser glm47)",
+     "Infervisor (plowrt bf1d8b8bcc08, packet 2beec26e536d)"
+    ],
+    [
+     "Output quality / correctness",
+     "FP32-reference gate peer (kl_mean 0.03677, top1_decisive 0.9868, needle_acc 1)",
+     "Equivalent"
+    ],
+    [
+     "Peak GPU memory",
+     "2,140.9 GiB",
+     "1,209.9 GiB (0.57x)"
+    ],
+    [
+     "Total throughput",
+     "4,017 tok/s *",
+     "2,510 tok/s (0.62x)"
+    ],
+    [
+     "Throughput / GPU",
+     "502 tok/s/GPU *",
+     "314 tok/s/GPU (0.62x)"
+    ],
+    [
+     "TTFT P99",
+     "1,654.5 ms *",
+     "483.7 ms (0.29x)"
+    ],
+    [
+     "TPOT P99",
+     "22.45 ms *",
+     "27.99 ms (1.25x)"
+    ]
+   ],
+   "repeats": 2,
+   "ratios": {
+    "peak_gib": 0.5651442597167535,
+    "total_tok_s": 0.6248711589628353,
+    "total_tok_s_gpu": 0.6248711589628353,
+    "ttft_p99_ms": 0.2923340535333872,
+    "tpot_p99_ms": 1.2471152635058902
+   },
+   "baseline": {
+    "mean": {
+     "peak_gib": 2140.9140625,
+     "total_tok_s": 4016.711570812624,
+     "total_tok_s_gpu": 502.088946351578,
+     "ttft_p99_ms": 1654.5272580024903,
+     "tpot_p99_ms": 22.44573988092607
+    },
+    "per_repeat": {
+     "peak_gib": [
+      2127.875,
+      2153.953125
+     ],
+     "total_tok_s": [
+      2750.545577268826,
+      5282.877564356421
+     ],
+     "total_tok_s_gpu": [
+      343.81819715860325,
+      660.3596955445527
+     ],
+     "ttft_p99_ms": [
+      2891.5929799340665,
+      417.461536070914
+     ],
+     "tpot_p99_ms": [
+      31.542945812734974,
+      13.348533949117163
+     ]
+    },
+    "spread_pct": {
+     "peak_gib": 1.2180836894287999,
+     "total_tok_s": 63.044904829332246,
+     "total_tok_s_gpu": 63.044904829332246,
+     "ttft_p99_ms": 149.53706153201549,
+     "tpot_p99_ms": 81.05953272263949
+    },
+    "sources": [
+     "/home/lava/bench/glm53flash/vllm-dp2tp4/isl1024/g8.r1",
+     "/home/lava/bench/glm53flash/vllm-dp2tp4/isl1024/g8.r2"
+    ]
+   },
+   "infervisor": {
+    "mean": {
+     "peak_gib": 1209.92529296875,
+     "total_tok_s": 2509.927214473115,
+     "total_tok_s_gpu": 313.74090180913936,
+     "ttft_p99_ms": 483.67466001334833,
+     "tpot_p99_ms": 27.992424806185785
+    },
+    "per_repeat": {
+     "peak_gib": [
+      1201.0927734375,
+      1218.7578125
+     ],
+     "total_tok_s": [
+      2486.349770470312,
+      2533.5046584759175
+     ],
+     "total_tok_s_gpu": [
+      310.793721308789,
+      316.6880823094897
+     ],
+     "ttft_p99_ms": [
+      506.61330199334776,
+      460.73601803334896
+     ],
+     "tpot_p99_ms": [
+      28.39403301164394,
+      27.590816600727628
+     ]
+    },
+    "spread_pct": {
+     "peak_gib": 1.4600107267082525,
+     "total_tok_s": 1.87873527701099,
+     "total_tok_s_gpu": 1.87873527701099,
+     "ttft_p99_ms": 9.485153503541554,
+     "tpot_p99_ms": 2.869406335741297
+    },
+    "sources": [
+     "/home/lava/bench/glm53flash/plow-dp2tp4-v10/isl1024/g8.r1",
+     "/home/lava/bench/glm53flash/plow-dp2tp4-v10/isl1024/g8.r2"
+    ]
+   }
+  },
+  {
+   "cell": "g32",
+   "matched": true,
+   "mismatched": [],
+   "equivalent": true,
+   "spread_flagged": [],
+   "rows": [
+    [
+     "Model / version",
+     "GLM-5.3-Flash (config+weights ea5874f56d39)",
+     "Same as baseline"
+    ],
+    [
+     "Precision / quantization",
+     "weights fp8 (fmt=e4m3, activation_scheme=dynamic, weight_block_size=[128, 128]); KV cache bfloat16",
+     "Same as baseline"
+    ],
+    [
+     "Input / output length",
+     "1024 / 128 tokens",
+     "Same as baseline"
+    ],
+    [
+     "Traffic / concurrency",
+     "greedy (T=0), 96 prompts, request rate inf / concurrency 32",
+     "Same as baseline"
+    ],
+    [
+     "GPU type & count",
+     "8 x AMD Instinct MI350X",
+     "Same as baseline"
+    ],
+    [
+     "Serving stack",
+     "vLLM ok    nix dev shell (ROCM_PATH=/nix/store/xbd1f4xn2j6cry6np5wij7caz0ycrykz-rocm-therock-gfx94X-dcgpu-7.14.1 CUDA_PATH=/nix/store/p49i1vrhcaw5nf2r3bwgmwfz5x8zgb14-cuda-merged-12.9)\n0.31.1rc1.dev296+gfe4df3df0.rocm100 (--gpu-memory-utilization 0.90 --max-num-seqs 256 --tensor-parallel-size 4 --data-parallel-size 2 --trust-remote-code --max-model-len 3200 --max-num-seqs 256 --no-enable-prefix-caching --tool-call-parser glm47 --reasoning-parser glm47)",
+     "Infervisor (plowrt bf1d8b8bcc08, packet 2beec26e536d)"
+    ],
+    [
+     "Output quality / correctness",
+     "FP32-reference gate peer (kl_mean 0.03677, top1_decisive 0.9868, needle_acc 1)",
+     "Equivalent"
+    ],
+    [
+     "Peak GPU memory",
+     "2,153.9 GiB",
+     "1,211.6 GiB (0.56x)"
+    ],
+    [
+     "Total throughput",
+     "13,516 tok/s",
+     "5,695 tok/s (0.42x)"
+    ],
+    [
+     "Throughput / GPU",
+     "1,689 tok/s/GPU",
+     "712 tok/s/GPU (0.42x)"
+    ],
+    [
+     "TTFT P99",
+     "1,284.0 ms",
+     "1,485.0 ms (1.16x)"
+    ],
+    [
+     "TPOT P99",
+     "19.91 ms",
+     "49.97 ms (2.51x)"
+    ]
+   ],
+   "repeats": 2,
+   "ratios": {
+    "peak_gib": 0.5625213516431726,
+    "total_tok_s": 0.4213374377561336,
+    "total_tok_s_gpu": 0.4213374377561336,
+    "ttft_p99_ms": 1.156527673303486,
+    "tpot_p99_ms": 2.509813968870292
+   },
+   "baseline": {
+    "mean": {
+     "peak_gib": 2153.93212890625,
+     "total_tok_s": 13515.603673992819,
+     "total_tok_s_gpu": 1689.4504592491023,
+     "ttft_p99_ms": 1284.0474452954368,
+     "tpot_p99_ms": 19.911156336416656
+    },
+    "per_repeat": {
+     "peak_gib": [
+      2153.9111328125,
+      2153.953125
+     ],
+     "total_tok_s": [
+      13452.125281958268,
+      13579.08206602737
+     ],
+     "total_tok_s_gpu": [
+      1681.5156602447835,
+      1697.3852582534212
+     ],
+     "ttft_p99_ms": [
+      1301.694963540649,
+      1266.3999270502245
+     ],
+     "tpot_p99_ms": [
+      19.97546343351475,
+      19.846849239318562
+     ]
+    },
+    "spread_pct": {
+     "peak_gib": 0.0019495594562361305,
+     "total_tok_s": 0.9393349134186,
+     "total_tok_s_gpu": 0.9393349134186,
+     "ttft_p99_ms": 2.7487330487467903,
+     "tpot_p99_ms": 0.6459403563667411
+    },
+    "sources": [
+     "/home/lava/bench/glm53flash/vllm-dp2tp4/isl1024/g32.r1",
+     "/home/lava/bench/glm53flash/vllm-dp2tp4/isl1024/g32.r2"
+    ]
+   },
+   "infervisor": {
+    "mean": {
+     "peak_gib": 1211.6328125,
+     "total_tok_s": 5694.62982172752,
+     "total_tok_s_gpu": 711.82872771594,
+     "ttft_p99_ms": 1485.0364043188165,
+     "tpot_p99_ms": 49.973298309498745
+    },
+    "per_repeat": {
+     "peak_gib": [
+      1204.5078125,
+      1218.7578125
+     ],
+     "total_tok_s": [
+      5610.964133051822,
+      5778.295510403218
+     ],
+     "total_tok_s_gpu": [
+      701.3705166314777,
+      722.2869388004023
+     ],
+     "ttft_p99_ms": [
+      1499.0466896764701,
+      1471.0261189611629
+     ],
+     "tpot_p99_ms": [
+      51.327437488935104,
+      48.61915913006239
+     ]
+    },
+    "spread_pct": {
+     "peak_gib": 1.1760988851562653,
+     "total_tok_s": 2.9384065793522445,
+     "total_tok_s_gpu": 2.9384065793522445,
+     "ttft_p99_ms": 1.8868608630614847,
+     "tpot_p99_ms": 5.4194508877512515
+    },
+    "sources": [
+     "/home/lava/bench/glm53flash/plow-dp2tp4-v10/isl1024/g32.r1",
+     "/home/lava/bench/glm53flash/plow-dp2tp4-v10/isl1024/g32.r2"
+    ]
+   }
+  },
+  {
+   "cell": "g64",
+   "matched": true,
+   "mismatched": [],
+   "equivalent": true,
+   "spread_flagged": [
+    "Baseline TTFT P99 23.9%"
+   ],
+   "rows": [
+    [
+     "Model / version",
+     "GLM-5.3-Flash (config+weights ea5874f56d39)",
+     "Same as baseline"
+    ],
+    [
+     "Precision / quantization",
+     "weights fp8 (fmt=e4m3, activation_scheme=dynamic, weight_block_size=[128, 128]); KV cache bfloat16",
+     "Same as baseline"
+    ],
+    [
+     "Input / output length",
+     "1024 / 128 tokens",
+     "Same as baseline"
+    ],
+    [
+     "Traffic / concurrency",
+     "greedy (T=0), 192 prompts, request rate inf / concurrency 64",
+     "Same as baseline"
+    ],
+    [
+     "GPU type & count",
+     "8 x AMD Instinct MI350X",
+     "Same as baseline"
+    ],
+    [
+     "Serving stack",
+     "vLLM ok    nix dev shell (ROCM_PATH=/nix/store/xbd1f4xn2j6cry6np5wij7caz0ycrykz-rocm-therock-gfx94X-dcgpu-7.14.1 CUDA_PATH=/nix/store/p49i1vrhcaw5nf2r3bwgmwfz5x8zgb14-cuda-merged-12.9)\n0.31.1rc1.dev296+gfe4df3df0.rocm100 (--gpu-memory-utilization 0.90 --max-num-seqs 256 --tensor-parallel-size 4 --data-parallel-size 2 --trust-remote-code --max-model-len 3200 --max-num-seqs 256 --no-enable-prefix-caching --tool-call-parser glm47 --reasoning-parser glm47)",
+     "Infervisor (plowrt bf1d8b8bcc08, packet 2beec26e536d)"
+    ],
+    [
+     "Output quality / correctness",
+     "FP32-reference gate peer (kl_mean 0.03677, top1_decisive 0.9868, needle_acc 1)",
+     "Equivalent"
+    ],
+    [
+     "Peak GPU memory",
+     "2,153.9 GiB",
+     "1,214.0 GiB (0.56x)"
+    ],
+    [
+     "Total throughput",
+     "20,483 tok/s",
+     "9,307 tok/s (0.45x)"
+    ],
+    [
+     "Throughput / GPU",
+     "2,560 tok/s/GPU",
+     "1,163 tok/s/GPU (0.45x)"
+    ],
+    [
+     "TTFT P99",
+     "1,718.4 ms *",
+     "2,793.6 ms (1.63x)"
+    ],
+    [
+     "TPOT P99",
+     "26.18 ms",
+     "60.07 ms (2.29x)"
+    ]
+   ],
+   "repeats": 2,
+   "ratios": {
+    "peak_gib": 0.5636215585889965,
+    "total_tok_s": 0.4543995391175988,
+    "total_tok_s_gpu": 0.4543995391175988,
+    "ttft_p99_ms": 1.625741779910186,
+    "tpot_p99_ms": 2.29461957677509
+   },
+   "baseline": {
+    "mean": {
+     "peak_gib": 2153.94140625,
+     "total_tok_s": 20482.72095678391,
+     "total_tok_s_gpu": 2560.3401195979886,
+     "ttft_p99_ms": 1718.3627918045386,
+     "tpot_p99_ms": 26.177174377023235
+    },
+    "per_repeat": {
+     "peak_gib": [
+      2153.9296875,
+      2153.953125
+     ],
+     "total_tok_s": [
+      21021.217375768723,
+      19944.224537799095
+     ],
+     "total_tok_s_gpu": [
+      2627.6521719710904,
+      2493.028067224887
+     ],
+     "ttft_p99_ms": [
+      1513.2767637132204,
+      1923.448819895857
+     ],
+     "tpot_p99_ms": [
+      25.810349877418655,
+      26.54399887662781
+     ]
+    },
+    "spread_pct": {
+     "peak_gib": 0.0010881215214115112,
+     "total_tok_s": 5.258055510505438,
+     "total_tok_s_gpu": 5.258055510505438,
+     "ttft_p99_ms": 23.869933528524236,
+     "tpot_p99_ms": 2.8026286895697514
+    },
+    "sources": [
+     "/home/lava/bench/glm53flash/vllm-dp2tp4/isl1024/g64.r1",
+     "/home/lava/bench/glm53flash/vllm-dp2tp4/isl1024/g64.r2"
+    ]
+   },
+   "infervisor": {
+    "mean": {
+     "peak_gib": 1214.0078125,
+     "total_tok_s": 9307.33896263699,
+     "total_tok_s_gpu": 1163.4173703296237,
+     "ttft_p99_ms": 2793.614183679747,
+     "tpot_p99_ms": 60.06665679017278
+    },
+    "per_repeat": {
+     "peak_gib": [
+      1209.2578125,
+      1218.7578125
+     ],
+     "total_tok_s": [
+      9342.081142429439,
+      9272.596782844543
+     ],
+     "total_tok_s_gpu": [
+      1167.7601428036799,
+      1159.0745978555678
+     ],
+     "ttft_p99_ms": [
+      2797.7016441023447,
+      2789.5267232571496
+     ],
+     "tpot_p99_ms": [
+      59.919872931566815,
+      60.21344064877874
+     ]
+    },
+    "spread_pct": {
+     "peak_gib": 0.782532031687399,
+     "total_tok_s": 0.7465545185775582,
+     "total_tok_s_gpu": 0.7465545185775582,
+     "ttft_p99_ms": 0.2926288423416856,
+     "tpot_p99_ms": 0.4887365685049374
+    },
+    "sources": [
+     "/home/lava/bench/glm53flash/plow-dp2tp4-v10/isl1024/g64.r1",
+     "/home/lava/bench/glm53flash/plow-dp2tp4-v10/isl1024/g64.r2"
+    ]
+   }
+  },
+  {
+   "cell": "g128",
+   "matched": true,
+   "mismatched": [],
+   "equivalent": true,
+   "spread_flagged": [],
+   "rows": [
+    [
+     "Model / version",
+     "GLM-5.3-Flash (config+weights ea5874f56d39)",
+     "Same as baseline"
+    ],
+    [
+     "Precision / quantization",
+     "weights fp8 (fmt=e4m3, activation_scheme=dynamic, weight_block_size=[128, 128]); KV cache bfloat16",
+     "Same as baseline"
+    ],
+    [
+     "Input / output length",
+     "1024 / 128 tokens",
+     "Same as baseline"
+    ],
+    [
+     "Traffic / concurrency",
+     "greedy (T=0), 384 prompts, request rate inf / concurrency 128",
+     "Same as baseline"
+    ],
+    [
+     "GPU type & count",
+     "8 x AMD Instinct MI350X",
+     "Same as baseline"
+    ],
+    [
+     "Serving stack",
+     "vLLM ok    nix dev shell (ROCM_PATH=/nix/store/xbd1f4xn2j6cry6np5wij7caz0ycrykz-rocm-therock-gfx94X-dcgpu-7.14.1 CUDA_PATH=/nix/store/p49i1vrhcaw5nf2r3bwgmwfz5x8zgb14-cuda-merged-12.9)\n0.31.1rc1.dev296+gfe4df3df0.rocm100 (--gpu-memory-utilization 0.90 --max-num-seqs 256 --tensor-parallel-size 4 --data-parallel-size 2 --trust-remote-code --max-model-len 3200 --max-num-seqs 256 --no-enable-prefix-caching --tool-call-parser glm47 --reasoning-parser glm47)",
+     "Infervisor (plowrt bf1d8b8bcc08, packet 2beec26e536d)"
+    ],
+    [
+     "Output quality / correctness",
+     "FP32-reference gate peer (kl_mean 0.03677, top1_decisive 0.9868, needle_acc 1)",
+     "Equivalent"
+    ],
+    [
+     "Peak GPU memory",
+     "2,154.0 GiB",
+     "1,218.8 GiB (0.57x)"
+    ],
+    [
+     "Total throughput",
+     "26,679 tok/s",
+     "12,247 tok/s (0.46x)"
+    ],
+    [
+     "Throughput / GPU",
+     "3,335 tok/s/GPU",
+     "1,531 tok/s/GPU (0.46x)"
+    ],
+    [
+     "TTFT P99",
+     "3,341.2 ms",
+     "5,781.5 ms (1.73x)"
+    ],
+    [
+     "TPOT P99",
+     "40.61 ms",
+     "92.63 ms (2.28x)"
+    ]
+   ],
+   "repeats": 2,
+   "ratios": {
+    "peak_gib": 0.5658227136465771,
+    "total_tok_s": 0.4590417562163016,
+    "total_tok_s_gpu": 0.4590417562163016,
+    "ttft_p99_ms": 1.7303465057252114,
+    "tpot_p99_ms": 2.2808016389588013
+   },
+   "baseline": {
+    "mean": {
+     "peak_gib": 2153.95703125,
+     "total_tok_s": 26678.82673431636,
+     "total_tok_s_gpu": 3334.853341789545,
+     "ttft_p99_ms": 3341.235695327341,
+     "tpot_p99_ms": 40.61455586776192
+    },
+    "per_repeat": {
+     "peak_gib": [
+      2153.953125,
+      2153.9609375
+     ],
+     "total_tok_s": [
+      26792.829107964597,
+      26564.82436066812
+     ],
+     "total_tok_s_gpu": [
+      3349.1036384955746,
+      3320.603045083515
+     ],
+     "ttft_p99_ms": [
+      3352.8911298071034,
+      3329.5802608475788
+     ],
+     "tpot_p99_ms": [
+      40.54867165449615,
+      40.680440081027704
+     ]
+    },
+    "spread_pct": {
+     "peak_gib": 0.00036270454269304495,
+     "total_tok_s": 0.8546280897847689,
+     "total_tok_s_gpu": 0.8546280897847689,
+     "ttft_p99_ms": 0.697672091559554,
+     "tpot_p99_ms": 0.3244364581028198
+    },
+    "sources": [
+     "/home/lava/bench/glm53flash/vllm-dp2tp4/isl1024/g128.r1",
+     "/home/lava/bench/glm53flash/vllm-dp2tp4/isl1024/g128.r2"
+    ]
+   },
+   "infervisor": {
+    "mean": {
+     "peak_gib": 1218.7578125,
+     "total_tok_s": 12246.695477911,
+     "total_tok_s_gpu": 1530.836934738875,
+     "ttft_p99_ms": 5781.495510214012,
+     "tpot_p99_ms": 92.63374558877518
+    },
+    "per_repeat": {
+     "peak_gib": [
+      1218.7578125,
+      1218.7578125
+     ],
+     "total_tok_s": [
+      12436.4878961985,
+      12056.9030596235
+     ],
+     "total_tok_s_gpu": [
+      1554.5609870248124,
+      1507.1128824529376
+     ],
+     "ttft_p99_ms": [
+      5690.072880357621,
+      5872.918140070402
+     ],
+     "tpot_p99_ms": [
+      89.03307393430201,
+      96.23441724324834
+     ]
+    },
+    "spread_pct": {
+     "peak_gib": 0.0,
+     "total_tok_s": 3.099487835389104,
+     "total_tok_s_gpu": 3.099487835389104,
+     "ttft_p99_ms": 3.1625945119174257,
+     "tpot_p99_ms": 7.773995602979214
+    },
+    "sources": [
+     "/home/lava/bench/glm53flash/plow-dp2tp4-v10/isl1024/g128.r1",
+     "/home/lava/bench/glm53flash/plow-dp2tp4-v10/isl1024/g128.r2"
+    ]
+   }
+  }
+ ],
+ "baseline": {
+  "dir": "/home/lava/bench/glm53flash/vllm-dp2tp4/isl1024",
+  "provenance": {
+   "side": "vllm",
+   "utc": "2026-10-13T07:41:45Z",
+   "hf": "/home/lava/models/GLM-5.3-Flash",
+   "model_version": "GLM-5.3-Flash (config+weights ea5874f56d39)",
+   "precision": "weights fp8 (fmt=e4m3, activation_scheme=dynamic, weight_block_size=[128, 128]); KV cache bfloat16",
+   "gpu_name": "AMD Instinct MI350X",
+   "gpu_count": 8,
+   "repeats": 2,
+   "sampled": "",
+   "server_args": "--gpu-memory-utilization 0.90 --max-num-seqs 256 --tensor-parallel-size 4 --data-parallel-size 2 --trust-remote-code --max-model-len 3200 --max-num-seqs 256 --no-enable-prefix-caching --tool-call-parser glm47 --reasoning-parser glm47",
+   "recorder_commit": "b111ad508f94",
+   "stack_version": "ok    nix dev shell (ROCM_PATH=/nix/store/xbd1f4xn2j6cry6np5wij7caz0ycrykz-rocm-therock-gfx94X-dcgpu-7.14.1 CUDA_PATH=/nix/store/p49i1vrhcaw5nf2r3bwgmwfz5x8zgb14-cuda-merged-12.9)\n0.31.1rc1.dev296+gfe4df3df0.rocm100",
+   "stack": "vLLM ok    nix dev shell (ROCM_PATH=/nix/store/xbd1f4xn2j6cry6np5wij7caz0ycrykz-rocm-therock-gfx94X-dcgpu-7.14.1 CUDA_PATH=/nix/store/p49i1vrhcaw5nf2r3bwgmwfz5x8zgb14-cuda-merged-12.9)\n0.31.1rc1.dev296+gfe4df3df0.rocm100 (--gpu-memory-utilization 0.90 --max-num-seqs 256 --tensor-parallel-size 4 --data-parallel-size 2 --trust-remote-code --max-model-len 3200 --max-num-seqs 256 --no-enable-prefix-caching --tool-call-parser glm47 --reasoning-parser glm47)"
+  }
+ },
+ "infervisor": {
+  "dir": "/home/lava/bench/glm53flash/plow-dp2tp4-v10/isl1024",
+  "provenance": {
+   "side": "plow",
+   "utc": "2026-10-13T10:35:29Z",
+   "hf": "/home/lava/models/GLM-5.3-Flash",
+   "model_version": "GLM-5.3-Flash (config+weights ea5874f56d39)",
+   "precision": "weights fp8 (fmt=e4m3, activation_scheme=dynamic, weight_block_size=[128, 128]); KV cache bfloat16",
+   "gpu_name": "AMD Instinct MI350X",
+   "gpu_count": 8,
+   "repeats": 2,
+   "sampled": "",
+   "server_args": "",
+   "recorder_commit": "bf1d8b8bcc08",
+   "plowrt_git_sha": "bf1d8b8bcc08",
+   "packet_sha256": "2beec26e536d94495cb8faa4cbfaad4ffb4a8a3af3e20ffc7abbc7d70fff79aa",
+   "plowrt_sha256": "2424aa825a8d53309041ec98589942e3f7a8475d8ac9e85daff2cd3a63ac6a10",
+   "assets": "/home/lava/.claude/jobs/ca91585b/tmp/v10/tp4/assets",
+   "plow_env": {
+    "PLOW_DECODE_MIN_RUNG": "1",
+    "PLOW_DP": "2",
+    "PLOW_PF_BACK_TO_BACK": "1",
+    "PLOW_PF_INTERLEAVE": "4096",
+    "PLOW_PREFIX_ARM_END": "1",
+    "PLOW_PREFIX_CACHE": "1",
+    "PLOW_STATE_CLEAR_DEVICE": "1",
+    "PLOW_TP_AGREE_EVERY": "1"
+   }
+  }
+ }
+}

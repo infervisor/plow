@@ -17,6 +17,15 @@ over isl 1024/4096/16384 at c1..c128 and 32768/61440 at c1/c8): 0.60-0.62x at c1
 strict format: TTFT p99 at isl 1024 c1 (111 vs 141 ms), isl 1024 c8 (729 vs 1765 ms), isl 4096 c1
 (184 vs 512 ms) and isl 4096 c8 (1973 vs 2291 ms).
 
+## DP2xTP4 (two TP4 groups behind one endpoint) vs vLLM DP2xTP4
+
+`PLOW_DP=2` on the TP4 packet (2beec26e) against vLLM `--tensor-parallel-size 4
+--data-parallel-size 2`, same client and cells (isl 1024/4096/16384 x c1..c128, two repeats),
+strict reports in [dp2tp4/](dp2tp4/), rows `dp2tp4-*` in [comparison.csv](comparison.csv). All 15
+cells MATCHED/EQUIVALENT; no qualified win: plowrt 0.72-0.75x at c1, 0.55-0.62x at c8, 0.42-0.53x
+at c32-c128. plowrt DP2xTP4 beats plowrt TP8 at c32+ (isl4096 c128 19827 vs 13926 tok/s); vLLM's
+own DP2xTP4 is 0.66-0.88x its TP8. TTFT p99 favours plowrt at c1/c8 (isl1024 c8 484 vs 1655 ms).
+
 ## Accuracy
 
 FP32-reference gate (46 cases incl. 18 needles to 15872 tokens, prefix cache on): PASS, plowrt
