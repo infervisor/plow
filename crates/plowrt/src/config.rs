@@ -711,7 +711,7 @@ pub struct RuntimeConfig {
     #[arg(long = "pin", env = "PLOW_PIN", value_delimiter = ',', global = true)]
     pub pin: Vec<String>,
 
-    /// Data-parallel ranks per model on one serve (CUDA, TP1 bundles): `--dp 8`, `--dp all`
+    /// Data-parallel ranks per model on one serve (CUDA TP1 bundles; AMD any TP): `--dp 8`, `--dp all`
     /// (one per device group), or per model `--dp gemma=4,asr=2`. Each rank is a full copy on its
     /// own device group; requests route by session, prefix cache and load. Unset = 1.
     #[arg(long = "dp", env = "PLOW_DP", value_delimiter = ',', global = true)]
