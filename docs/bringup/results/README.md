@@ -11,7 +11,7 @@ outside the repo (CLAUDE.md, "Performance campaign evidence and promotion").
 | Gemma-4 BF16 on Xeon 6975P-C (CPU engine) | [comparison.md](gemma4-xeon6-bf16-20261006/comparison.md) | E2B, E4B, 12B vs vLLM 0.30 CPU: [comparison.md](gemma4-xeon6-bf16-20261006/comparison.md), [comparison.csv](gemma4-xeon6-bf16-20261006/comparison.csv); 26B-A4B gate miss, 31B pending |
 | Qwen3-ASR | [qwen3-asr-h100/summary.md](qwen3-asr-h100/summary.md) | none (no recorded baseline) |
 | TTS (Veena, Chatterbox, Chatterbox MTL) | [tts-h100/summary.md](tts-h100/summary.md) | none (no strict speech report) |
-| GLM-5.3-Flash (MI350X, TP8) | [glm53flash-mi350x-2026-10-12/summary.md](glm53flash-mi350x-2026-10-12/summary.md) | none: TP8 0.25-0.62x, DP2xTP4 0.42-0.75x vLLM throughput (v10), [comparison.csv](glm53flash-mi350x-2026-10-12/comparison.csv); accuracy gate PASS |
+| GLM-5.3-Flash (MI350X, TP8) | [glm53flash-mi350x-2026-10-12/summary.md](glm53flash-mi350x-2026-10-12/summary.md) | none: TP8 0.28-0.61x (v11), DP2xTP4 0.42-0.75x (v10) vLLM throughput, [comparison.csv](glm53flash-mi350x-2026-10-12/comparison.csv); accuracy gate PASS |
 
 Each campaign keeps one `comparison.csv` for matched serving rows and a neighboring
 `comparison.md` for qualified wins only; a final comparison is rendered by `campaign.py report`

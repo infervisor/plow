@@ -578,6 +578,15 @@ The packet from config + index alone (no weights) is 70 MB: 4 prefill buckets + 
   12.4/22.9/30.2/40.3 ms ranks agree; FP32 PASS kl_mean 0.01342 (DP2xTP4 0.01295); needles 36/36,
   split 18/18; prefix re-sends cached 4096 == cold 4/4. Strict TP8 reports 19 cells
   MATCHED/EQUIVALENT: 0.25-0.62x vLLM (v9 0.14-0.56x). Recipe moved to v10.
+- 13:45 UTC, v11 (one-shot integration of the v11 branches; plowrt ac229648, packet 9328c621):
+  scheduler (tick trace, PLOW_PF_INTERLEAVE=8192 removes half-empty packed launches: +26% isl1024
+  c128), rung-1 hop fusions + sharded lm_head, bit-identical V2 flash softmax and KDA carry
+  schedule, Codex review fixes, AMD co-resident multi-model serving. Dropped: PLOW_GLM_XR_HCPOST +
+  PLOW_XR_DEC_CUS (serve fails "cross-GPU gate 0 reads 16, expected 8", with or without
+  PLOW_XR_TAG_SLOT; amd-bench passes) and W8A8 MoE prefill (1.35x on the expert GEMMs but ~25x the
+  FP32 error, relL2 4% vs 0.16%). Gates: validate r1/B8/B32/B128 12.7/22.7/30.4/40.1 ms, FP32 PASS
+  kl_mean 0.01475, needles 36/36, split 18/18, prefix re-sends cached == cold. Strict TP8 reports 19
+  cells MATCHED/EQUIVALENT: 0.28-0.61x vLLM (v10 0.25-0.62x; isl16384 c32 0.31 -> 0.49). Recipe -> v11.
 - 17:35 UTC, E10 TP4 bench (packet pkt-glm53flash-tp4-ladder-v4, 4 GPUs, real prompt, streams
   exact at every rung): scalar (rung 8) 55.5 ms, B=8 51.4, B=32 63.3, B=64 74.6 ms (858 tok/s
   per group); prefill 1k 204 ms (TP8 173). Two such groups (DP2xTP4) would serve 128 streams at
@@ -639,7 +648,7 @@ The packet from config + index alone (no weights) is 70 MB: 4 prefill buckets + 
 
 Strict `campaign.py report` output per input length and the combined comparison.csv:
 [docs/bringup/results/glm53flash-mi350x-2026-10-12](../bringup/results/glm53flash-mi350x-2026-10-12/summary.md).
-No qualified win: plow total throughput 0.25-0.62x vLLM (v10).
+No qualified win: plow total throughput 0.28-0.61x vLLM (v11).
 
 ## 6. Roofline (CPU, before any plow GPU time)
 
