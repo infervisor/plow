@@ -1261,6 +1261,13 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_MOE_PF_DET", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub moe_pf_det: bool,
 
+    /// W8A8 block-FP8 grouped MoE prefill on gfx950 (ops 85/86 i[7]=2): 1x128 FP8 activations
+    /// (`QuantFp8Block128` on the routed input, the GLU epilogue quantizes its output for DOWN),
+    /// fp8 x fp8 MFMA with the [128,128] weight scales, f32 part scatter. Needs `plow_moe_pf_w8a8_arm`
+    /// (the packet's plow_config.h sets `PLOW_MOE_PF_W8A8`). Opt-in: changes numerics.
+    #[arg(long, env = "PLOW_MOE_PF_W8A8", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub moe_pf_w8a8: bool,
+
     /// Build the lean gfx950 MoE stage-1 A4-reuse object with the K256 register-B body
     /// (`-DPLOW_MOE1_BODY=1`, bit-identical output). Opt-in; packets are unchanged, the
     /// manifest config header carries the object request.
@@ -1758,6 +1765,7 @@ impl EmitConfig {
             moe_combine_lean: env_bool_default_true("PLOW_MOE_COMBINE_LEAN"),
             attnres_f32mix: env_opt_out("PLOW_ATTNRES_F32MIX"),
             moe_pf_det: env_bool("PLOW_MOE_PF_DET"),
+            moe_pf_w8a8: env_bool("PLOW_MOE_PF_W8A8"),
             moe_stage1_body: env_bool("PLOW_MOE_STAGE1_BODY"),
             moe_stage2_body: env_bool("PLOW_MOE_STAGE2_BODY"),
             no_glu_fuse: env_bool("PLOW_NO_GLU_FUSE"),

@@ -2042,6 +2042,33 @@ fn emit_glm_shared_w8a8_glu(
     })
 }
 
+/// `PLOW_MOE_PF_W8A8` for one grouped prefill MoE (ops 85/86 `i[7] = 2`): 1x128 FP8 routed
+/// input, fp8 x fp8 MFMA against the [128,128] weight grid, GLU output re-quantized 1x128 for
+/// DOWN. Refuses rather than silently falling back when the knob meets a shape it cannot run.
+fn glm_moe_pf_w8a8(c: &GlmCfg, enc: MoeEnc, native_moe: bool, tk: u32, imoe_e: u32, h: u32) -> bool {
+    if !emit_config::active().moe_pf_w8a8 {
+        return false;
+    }
+    assert!(
+        enc == MoeEnc::Fp8Blk
+            && crate::emit_is_amd()
+            && crate::amd_target::active().1 == hwspec::IsaLevel::Gfx950,
+        "PLOW_MOE_PF_W8A8 requires gfx950 and block-FP8 experts"
+    );
+    assert!(
+        !c.ep
+            && !native_moe
+            && !emit_config::active().glm_routed_w8a8
+            && moe_pf_fuse(tk) == MoePfFuse::None,
+        "PLOW_MOE_PF_W8A8 excludes EP, vendor MoE, PLOW_GLM_ROUTED_W8A8 and fused reductions"
+    );
+    assert!(
+        imoe_e % 256 == 0 && h % 128 == 0,
+        "PLOW_MOE_PF_W8A8 needs intermediate % 256 == 0 and H % 128 == 0"
+    );
+    true
+}
+
 fn emit_glm_routed_w8a8(
     b: &mut Builder,
     c: &GlmCfg,
@@ -3026,6 +3053,7 @@ fn declare_glm_rows_batched_for_prefill(
     let native_moe = enc == MoeEnc::Fp8Blk
         && (emit_config::active().glm_moe_aiter() || emit_config::active().glm_moe_resident());
     let has_dense = layer_ids.iter().copied().any(|l| c.is_dense(l));
+    let pf_w8a8 = rows > 1 && glm_moe_pf_w8a8(c, enc, native_moe, tk, imoe_e, h);
     let compact_native_scratch = native_moe
         && has_dense
         && !prefill_rows.is_empty()
@@ -3116,6 +3144,8 @@ fn declare_glm_rows_batched_for_prefill(
             ac(b, "moe_fug", fug_bytes),
             if enc == MoeEnc::Mxfp4 {
                 ac(b, "moe_fuscale", pad_rows * (imoe_e / MX_BLOCK) as u64)
+            } else if pf_w8a8 {
+                ac(b, "moe_fuscale", pad_rows * (imoe_e / 128) as u64 * F32)
             } else {
                 TENSOR_NONE
             },
@@ -3519,7 +3549,14 @@ fn declare_glm_rows_batched_for_prefill(
                 && moe_pf_fuse(tk) == MoePfFuse::None),
         "PLOW_GLM_ROUTED_W8A8 excludes EP, shared folding, vendor MoE and fixed-point reduction"
     );
-    let [routed_xq, routed_xs, routed_hq, routed_hs] = if routed_w8a8 {
+    let [routed_xq, routed_xs, routed_hq, routed_hs] = if pf_w8a8 {
+        [
+            ac(b, "routed_xq", rows * h as u64),
+            ac(b, "routed_xs", rows * (h / 128) as u64 * F32),
+            TENSOR_NONE,
+            TENSOR_NONE,
+        ]
+    } else if routed_w8a8 {
         [
             ac(b, "routed_xq", rows * h as u64),
             ac(b, "routed_xs", rows * (h / 128) as u64 * F32),
@@ -9599,7 +9636,22 @@ fn emit_glm_moe_ffn_prefill(
         b.isolate(counter);
         counter
     } else {
-        let c_g = b.emit(DevOp::MoeGroupGluPf, all.clone(), &[c_align, c_rn2], |d| {
+        // Same predicate as the scratch declaration (`rows > 1`), or the tensors are absent.
+        let pf_w8a8 = t > 1 && glm_moe_pf_w8a8(c, enc, native_moe, tk, imoe_e, h);
+        let c_x = if pf_w8a8 {
+            b.emit(
+                DevOp::QuantFp8Block128,
+                glm_quant128_cus(&all, t, h),
+                &[c_rn2],
+                |d| {
+                    d.t[..3].copy_from_slice(&[n.routed_xq, n.xn2, n.routed_xs]);
+                    d.i[..2].copy_from_slice(&[t, h]);
+                },
+            )
+        } else {
+            c_rn2
+        };
+        let c_g = b.emit(DevOp::MoeGroupGluPf, all.clone(), &[c_align, c_x], |d| {
             d.t[0] = n.fu_g;
             d.t[1] = n.xn2;
             d.t[2] = w.ewt;
@@ -9621,6 +9673,15 @@ fn emit_glm_moe_ffn_prefill(
             let (act, limit) = glm_glu_act(c);
             d.i[5] = act;
             d.f[1] = limit;
+            // W8A8: A = the 1x128 fp8 rows + their [H/128][T] scales; the GLU writes fp8 `fu_g`
+            // and its own 1x128 scales into `fu_scale`.
+            if pf_w8a8 {
+                d.t[1] = n.routed_xq;
+                d.t[6] = n.routed_xs;
+                d.t[7] = n.fu_scale;
+                d.i[4] = t;
+                d.i[7] = 2;
+            }
         });
         // 19 grouped down + gate-scale + SCATTER into part[T*k, H]. row_partidx carries each gathered
         //    row's fixed destination, so the align op's nondeterministic within-expert row ORDER does
@@ -9648,6 +9709,10 @@ fn emit_glm_moe_ffn_prefill(
             // never read a blob emitted for the other as its own.
             if det {
                 d.i[5] = tk.trailing_zeros() + 1;
+            }
+            if pf_w8a8 {
+                d.t[5] = n.fu_scale;
+                d.i[7] = 2;
             }
         });
         c_d

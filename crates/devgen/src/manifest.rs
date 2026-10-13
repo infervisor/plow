@@ -362,6 +362,8 @@ struct Shapes {
     moe_pf_part16: bool,
     /// Any prefill GLU with `i[7]=1` — fp8 gathered activations (PLOW_MOE_PF_A8).
     moe_pf_a8: bool,
+    /// Any prefill GLU/DOWN with `i[7]>=2` — the W8A8 block-FP8 arm (PLOW_MOE_PF_W8A8).
+    moe_pf_w8a8: bool,
     /// Any decode one-shot XReduce with `i[7]!=0` — the K3 latent MoeCombine folded into the
     /// tagged publish (PLOW_XR_COMBINE_FOLD). An object without the arm publishes the unwritten
     /// plain slot: finite, stale, wrong.
@@ -579,7 +581,9 @@ fn shapes(m: &Model) -> Shapes {
                         ));
                     }
                     // i[7] carries the activation-side arms: a8 on GLU, part16 on DOWN.
-                    if inst.i[7] != 0 {
+                    if inst.i[7] >= 2 {
+                        s.moe_pf_w8a8 = true;
+                    } else if inst.i[7] != 0 {
                         if op == DevOp::MoeGroupGluPf {
                             s.moe_pf_a8 = true;
                         } else {
@@ -990,6 +994,7 @@ fn encoding_features(f: &mut Map<String, Value>, s: &Shapes) {
     f.insert("moe_aiter_fp8".into(), json!(s.moe_aiter_fp8));
     f.insert("moe_aiter_flat".into(), json!(s.moe_aiter_flat));
     f.insert("moe_pf_a8".into(), json!(s.moe_pf_a8));
+    f.insert("moe_pf_w8a8".into(), json!(s.moe_pf_w8a8));
     f.insert("xr_combine_fold".into(), json!(s.xr_combine_fold));
     f.insert("kda_fb_fold".into(), json!(s.kda_fb_fold));
     f.insert("kda_decode_fused_arm".into(), json!(s.kda_decode_fused_arm));
@@ -1647,6 +1652,10 @@ fn backend_amd(
     }
     if on("moe_pf_a8") {
         req.push("PLOW_MOE_PF_A8=1".into());
+    }
+    // W8A8 grouped MoE prefill: a BUILD axis (`#if PLOW_MOE_PF_W8A8`), set by plow_config.h.
+    if on("moe_pf_w8a8") {
+        req.push("PLOW_MOE_PF_W8A8=1".into());
     }
     // L4 combine fold: a BUILD axis of the tagged decode object (`#if PLOW_XR_COMBINE_FOLD`).
     if on("xr_combine_fold") {
@@ -2388,6 +2397,12 @@ fn build_inner(m: &Model, arch: &str, lean: &crate::LeanReport, packed_prefill: 
     };
     objects["lean"]["kda_wu_lean"] = json!({ "required": marked_wu(false) });
     objects["lean"]["kda_carry_keyfeed"] = json!({ "required": marked_wu(true) });
+    // PLOW_MOE_PF_W8A8: ops 85/86 with i[7] >= 2 need the W8A8 arm in the prefill object.
+    let moe_pf_w8a8 = m.progs.iter().flat_map(|p| &p.insts).any(|d| {
+        (d.op == DevOp::MoeGroupGluPf as u16 || d.op == DevOp::MoeGroupDownPf as u16)
+            && d.i[7] >= 2
+    });
+    objects["lean"]["moe_pf_w8a8"] = json!({ "required": moe_pf_w8a8 });
     let s = shapes(m);
     let mut ep_tables = BTreeSet::new();
     let ep_extra_resident_bytes_per_rank = m
@@ -2825,6 +2840,10 @@ pub fn config_header(manifest: &Value) -> String {
         .pointer("/objects/lean/moe_prefill_ep/required")
         .and_then(Value::as_bool)
         .unwrap_or(false);
+    let moe_pf_w8a8_required = manifest
+        .pointer("/objects/lean/moe_pf_w8a8/required")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     let attn_res_f32mix_required = manifest
         .pointer("/objects/lean/attn_res_f32mix/required")
         .and_then(Value::as_bool)
@@ -2872,6 +2891,11 @@ pub fn config_header(manifest: &Value) -> String {
         "#define PLOW_PACKET_REQUIRES_MOE_PREFILL_EP {}\n",
         if moe_prefill_ep_required { 1 } else { 0 }
     ));
+    if moe_pf_w8a8_required {
+        out.push_str(
+            "#define PLOW_PACKET_REQUIRES_MOE_PF_W8A8 1\n#ifndef PLOW_MOE_PF_W8A8\n#define PLOW_MOE_PF_W8A8 1\n#endif\n",
+        );
+    }
     let prefill_gemv_head = prefill_ops.contains("Gemv");
     out.push_str(&format!(
         "#define PLOW_PACKET_REQUIRES_PF_GEMV_HEAD {0}\n#ifndef PLOW_NV_PF_GEMV_HEAD\n#define PLOW_NV_PF_GEMV_HEAD {0}\n#endif\n",
