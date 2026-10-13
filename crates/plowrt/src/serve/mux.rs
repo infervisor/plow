@@ -4747,17 +4747,17 @@ fn run_one_tick(
                 };
                 for launch in &step.launches {
                     // PLOW_AMD_MIXED_PACK: the live decode rows ride the tick's first packed
-                    // launch as one-row spans (a lone packable chunk becomes a pack of one).
+                    // launch as one-row spans. A lone chunk stays on its isolated program, whose
+                    // lean KDA objects the packed siblings lack: as a pack of one carrying the
+                    // decode rows it measured 5-7% slower at isl4096 c32/c128.
                     let ride = mixed_pack
                         && !decoded_in_pack
+                        && launch.is_pack()
                         && slots[..cap].iter().any(|s| {
                             s.as_ref()
                                 .is_some_and(|s| s.parked_at.is_none() && !s.out_ids.is_empty())
-                        })
-                        && (launch.is_pack()
-                            || e.packable_prefill_span(launch.spans[0].slot as usize, full_budget)
-                                .is_some());
-                    if launch.is_pack() || ride {
+                        });
+                    if launch.is_pack() {
                         let packed = launch.spans.clone();
                         let feeds: Vec<(usize, u32)> = if ride {
                             slots[..cap]
