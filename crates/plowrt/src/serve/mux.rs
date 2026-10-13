@@ -4640,6 +4640,8 @@ fn run_one_tick(
             // so a prompt's chunks and further waiting prompts run before the decode step. Later
             // passes admit only cursors whose next chunk is known and fits what is left.
             let b2b = rt.pf_back_to_back && !slo_on;
+            let mixed_pack = has_decode && !slo_on && e.mixed_pack_ready();
+            let mut decoded_in_pack = false;
             let mut b2b_used = 0u32;
             let mut b2b_pass = 0u32;
             let mut b2b_failed = false;
@@ -4744,8 +4746,32 @@ fn run_one_tick(
                     )
                 };
                 for launch in &step.launches {
-                    if launch.is_pack() {
+                    // PLOW_AMD_MIXED_PACK: the live decode rows ride the tick's first packed
+                    // launch as one-row spans (a lone packable chunk becomes a pack of one).
+                    let ride = mixed_pack
+                        && !decoded_in_pack
+                        && slots[..cap].iter().any(|s| {
+                            s.as_ref()
+                                .is_some_and(|s| s.parked_at.is_none() && !s.out_ids.is_empty())
+                        })
+                        && (launch.is_pack()
+                            || e.packable_prefill_span(launch.spans[0].slot as usize, full_budget)
+                                .is_some());
+                    if launch.is_pack() || ride {
                         let packed = launch.spans.clone();
+                        let feeds: Vec<(usize, u32)> = if ride {
+                            slots[..cap]
+                                .iter()
+                                .enumerate()
+                                .filter_map(|(i, slot)| {
+                                    let slot = slot.as_ref().filter(|s| s.parked_at.is_none())?;
+                                    Some((i, *slot.out_ids.last()?))
+                                })
+                                .collect()
+                        } else {
+                            Vec::new()
+                        };
+                        let mut ride_tokens = vec![0u32; feeds.len()];
                         let pk_t = packlog::on().then(Instant::now);
                         for span in &packed {
                             let slot = slots[span.slot as usize]
@@ -4769,7 +4795,11 @@ fn run_one_tick(
                                     )
                                 })
                                 .collect();
-                            e.advance_packed_prefill(&members)
+                            if ride {
+                                e.advance_packed_mixed(&members, &feeds, &mut ride_tokens)
+                            } else {
+                                e.advance_packed_prefill(&members)
+                            }
                         };
                         crate::obs::ttft::PREFILL.add(t_pf.elapsed().as_nanos() as u64);
                         let pack_rows: u32 = packed.iter().map(|span| span.n_rows).sum();
@@ -4815,8 +4845,27 @@ fn run_one_tick(
                                 });
                                 tracing::debug!(
                                     spans = packed.len(),
+                                    decode = feeds.len(),
                                     "AMD packed prefill advanced"
                                 );
+                                if ride {
+                                    decoded_in_pack = true;
+                                    for (row, &(i, _)) in feeds.iter().enumerate() {
+                                        seq_host_logprobs(&*e, i, &mut slots[i], ride_tokens[row]);
+                                        handle_produced_token(
+                                            &mut slots[i],
+                                            &arena,
+                                            bundle,
+                                            ride_tokens[row],
+                                            1,
+                                            &mut tokens_this_tick,
+                                            Some(stop.as_slice()),
+                                        );
+                                        if slots[i].is_none() {
+                                            e.release(i);
+                                        }
+                                    }
+                                }
                                 for span in &packed {
                                     let i = span.slot as usize;
                                     if let Some(s) = slots[i].as_mut() {
@@ -4989,6 +5038,11 @@ fn run_one_tick(
                 if !b2b || b2b_failed || step.launches.is_empty() || b2b_used >= full_budget {
                     break;
                 }
+            }
+            if decoded_in_pack {
+                // The decode rows advanced inside a packed launch this tick. Like the mixed arm,
+                // its latency includes prefill and must not train decode-rung estimates.
+                return (slots, bufs, obs, tokens_this_tick, true, tick_fault, None);
             }
             if did_prefill {
                 let prefill_remains = slots[..b.min(slots.len())]

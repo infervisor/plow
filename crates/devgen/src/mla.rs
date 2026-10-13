@@ -1090,36 +1090,32 @@ fn emit_glm53_program(
         },
     );
     if prefill && b.packed_prefill_segments() {
-        emit_glm53_packed_tail(b, c, n, &[contract], rows, &mut xgate);
+        emit_glm53_packed_tail(b, c, n, &[contract], rows, dbatch, &mut xgate);
     } else {
         emit_glm_tail(b, c, n, n.x, &[contract], rows, !prefill, &mut xgate, None);
     }
 }
 
-/// Spans a GLM-5.3 packed-prefill sibling samples: its terminal-row table `in.pf_term` and the
-/// head GEMM carry this many rows, so a packed launch holds at most this many spans.
-pub(crate) const GLM53_PACKED_TERMS: u32 = 32;
-
 /// Packed-prefill tail: every span's last row samples. The host writes span `s`'s last packed
 /// row to `in.pf_term[s]` (unused entries repeat a live row); `RowGather` compacts those normed
 /// rows, the head runs as a tiled GEMM over them (prefill objects compile a one-row GEMV), and
-/// the argmax writes `in.ids[s]` and logits row `s`.
+/// the argmax writes `in.ids[s]` and logits row `s`. `terms` is the slot count (`dbatch`): a
+/// launch's spans are distinct slots, decode rows riding as one-row spans included, so it never
+/// carries more, and `act.logits` / `in.ids` already have that many rows.
 fn emit_glm53_packed_tail(
     b: &mut Builder,
     c: &GlmCfg,
     n: &GlmTn,
     dep: &[u32],
     rows: u32,
+    terms: u32,
     xgate: &mut u32,
 ) {
     let all = b.all();
-    let s = GLM53_PACKED_TERMS.min(rows);
+    let s = terms.min(rows);
     let vocab_l = glm_vocab_l(c);
-    let term = b.tensor("in.pf_term", u64::from(GLM53_PACKED_TERMS) * 4);
-    let xs = b.tensor(
-        "act.pf_term_x",
-        u64::from(GLM53_PACKED_TERMS) * u64::from(c.hidden) * 2,
-    );
+    let term = b.tensor("in.pf_term", u64::from(terms) * 4);
+    let xs = b.tensor("act.pf_term_x", u64::from(terms) * u64::from(c.hidden) * 2);
     let c_f = b.emit(DevOp::RmsNorm, pf_wide_cus(b.n_cu(), rows), dep, |d| {
         d.t[0] = n.xn;
         d.t[1] = n.x;

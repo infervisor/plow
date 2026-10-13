@@ -4614,7 +4614,7 @@ fn glm53_packed_sibling_tail_samples_every_span() {
         .filter(|d| d.op == DevOp::RowGather as u16)
         .collect();
     assert_eq!(gather.len(), 1);
-    assert_eq!(gather[0].i[0], GLM53_PACKED_TERMS);
+    assert_eq!(gather[0].i[0], 128);
     assert_eq!(gather[0].i[2], rows);
     let name = |h: u32| packed.tensors[h as usize].name.as_str();
     assert_eq!(name(gather[0].t[2]), "in.pf_term");
@@ -4624,13 +4624,13 @@ fn glm53_packed_sibling_tail_samples_every_span() {
         .find(|d| d.t[0] == n.logits)
         .expect("packed tail writes the logits");
     assert_ne!(head.op, DevOp::Gemv as u16);
-    assert_eq!((head.t[1], head.i[0]), (gather[0].t[0], GLM53_PACKED_TERMS));
+    assert_eq!((head.t[1], head.i[0]), (gather[0].t[0], 128));
     let argmax = packed
         .insts
         .iter()
         .find(|d| d.op == DevOp::Argmax as u16)
         .expect("argmax");
-    assert_eq!(argmax.i[1], GLM53_PACKED_TERMS);
+    assert_eq!(argmax.i[1], 128);
     for inst in &packed.insts {
         for &h in &inst.t {
             assert!(h == TENSOR_NONE || (h as usize) < packed.tensors.len());
