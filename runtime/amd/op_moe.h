@@ -2761,6 +2761,17 @@ __device__ __forceinline__ bf16v8 mpf_ld_w8(const unsigned char* p) {
 #ifndef PLOW_MOE_PF_DEEP
 #define PLOW_MOE_PF_DEEP 0
 #endif
+/* PLOW_MOE_PF_HDR (opt-in build axis): ops 85/86 find a tile's expert from a register copy of
+ * the tile prefix (one ballot per slot) instead of mpf_expert_of_tile's dependent loads (nine
+ * round trips per tile at 288 experts under the binary search). DOWN runs ~80 tiles per
+ * workgroup per 8192-row chunk with four k-tiles each, so the per-tile header chain was most of
+ * its time. Same expert for every tile: bit-identical. n_exp > 64 * MPF_HDR_Q keeps the search. */
+#ifndef PLOW_MOE_PF_HDR
+#define PLOW_MOE_PF_HDR 0
+#endif
+#ifndef MPF_HDR_Q
+#define MPF_HDR_Q 5
+#endif
 #if PLOW_MOE_PF_DEEP && !PLOW_MOE_PF_GH
 #error "PLOW_MOE_PF_DEEP needs PLOW_MOE_PF_GH (the A-gather index hoist)"
 #endif
@@ -2968,9 +2979,36 @@ __device__ void d_moe_group_pf_t(void* __restrict__ Cout, const bf16* __restrict
     }
 #endif
 
+#if PLOW_MOE_PF_HDR
+    /* PLOW_MOE_PF_HDR: the tile prefix lives in registers for the whole op (lane L, slot q holds
+     * tilep[L + 64q]); a tile's expert is a ballot count instead of a dependent binary search. */
+    const bool hdr_on = n_exp <= 64u * MPF_HDR_Q;
+    unsigned hdr_v[MPF_HDR_Q];
+#pragma unroll
+    for (int q = 0; q < MPF_HDR_Q; q++) {
+        const unsigned i = lane + 64u * (unsigned)q;
+        hdr_v[q] = (hdr_on && i < n_exp) ? (unsigned)as_glob(tilep)[i] : 0xFFFFFFFFu;
+    }
+#endif
+
     for (unsigned lin = slice; lin < n_tiles; lin += nblk) {
         const unsigned mt = lin / tn, nt = lin % tn;
+#if PLOW_MOE_PF_HDR
+        unsigned e;
+        if (hdr_on) {
+            /* tilep is nondecreasing and tilep[0] == 0, so #{i < n_exp : tilep[i] <= mt} - 1 is
+             * the last expert whose prefix is <= mt: mpf_expert_of_tile's answer exactly. */
+            unsigned c = 0;
+#pragma unroll
+            for (int q = 0; q < MPF_HDR_Q; q++)
+                c += (unsigned)__popcll(__ballot(hdr_v[q] <= mt));
+            e = __builtin_amdgcn_readfirstlane(c - 1u);
+        } else {
+            e = mpf_expert_of_tile(tilep, mt, n_exp);
+        }
+#else
         const unsigned e = mpf_expert_of_tile(tilep, mt, n_exp);
+#endif
         const unsigned rowbase = (unsigned)rowoff[e] + (mt - (unsigned)tilep[e]) * MPF_BM;
         const unsigned n0 = nt * NB;
 
